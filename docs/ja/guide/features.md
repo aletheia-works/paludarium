@@ -57,7 +57,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | seccomp | `seccomp`（下に書きます） |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
@@ -2333,16 +2333,38 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `SECCOMP_RET_TRAP` は `SIGSYS` を強制し、`SYS_SECCOMP`、`si_errno` のデータ、
   呼び出しのアドレス、番号、アーキテクチャを渡し、`rax` には呼び出しの番号を戻します。
   `SECCOMP_RET_ERRNO` はデータ（4095 まで）をエラーとして返します。
-  `SECCOMP_RET_TRACE` と `SECCOMP_RET_USER_NOTIF` は、トレーサーもリスナーも
-  ないときと同じく `ENOSYS` です。`SECCOMP_RET_LOG` と `SECCOMP_RET_ALLOW` は
-  呼び出しをそのまま行います。`SECCOMP_FILTER_FLAG_TSYNC` は新しいフィルターを
+  `SECCOMP_RET_TRACE` は、トレーサーがないときと同じく `ENOSYS` です。
+  `SECCOMP_RET_USER_NOTIF` はフィルターのリスナー（下に書きます）の答えを待ち、
+  フィルターにリスナーがなければ `ENOSYS` です。`SECCOMP_RET_LOG` と
+  `SECCOMP_RET_ALLOW` は呼び出しをそのまま行います。`SECCOMP_FILTER_FLAG_TSYNC` は新しいフィルターを
   すべてのスレッドに与えます。ただし、strict モードのスレッドや、呼び出し側の
   フィルターの元にならないフィルターを持つスレッドがあれば、そのスレッドの ID を
   返します（`SECCOMP_FILTER_FLAG_TSYNC_ESRCH` があれば `ESRCH`）。
   `SECCOMP_GET_ACTION_AVAIL` と `SECCOMP_GET_NOTIF_SIZES` は Linux と同じに
   答えます。新しいスレッドとプロセスはモードとフィルターを受け継ぎ、`execve` でも
   残ります。`/proc/<pid>/status` の `Seccomp` と `Seccomp_filters` に表れます。
-  リスナーは作りません（[制限事項](./limitations)を見てください）。
+  `SECCOMP_FILTER_FLAG_NEW_LISTENER` は、新しいフィルターのリスナーを close-on-exec
+  で返します（`anon_inode:seccomp notify`。スレッドのフィルターにリスナーは 1 つ
+  だけで、2 つ目は `EBUSY` です）。フィルターがそこへ送った呼び出しは、
+  `SECCOMP_IOCTL_NOTIF_RECV` が受け取り（まだ受け取られていない中でいちばん古い
+  もので、乱数から始まる ID、スレッドの ID、`seccomp_data` が渡ります）、
+  `SECCOMP_IOCTL_NOTIF_SEND` が値、エラー、または呼び出しをそのまま行わせる
+  `SECCOMP_USER_NOTIF_FLAG_CONTINUE` で答えるまで待ちます。その間に
+  `SECCOMP_IOCTL_NOTIF_ADDFD` は、リスナー側のファイルを、待っているスレッドの
+  空いているいちばん小さいディスクリプターか指定のディスクリプターに入れさせます。
+  `SECCOMP_ADDFD_FLAG_SEND` なら、呼び出しはそのディスクリプターを返します。
+  `SECCOMP_IOCTL_NOTIF_ID_VALID` と `SECCOMP_IOCTL_NOTIF_SET_FLAGS` は Linux と
+  同じに答えます。リスナーは、受け取られるのを待つ呼び出しがあれば読み込み可能、
+  受け取られて答えを待つ呼び出しがあれば書き込み可能、フィルターを使うスレッドが
+  いなくなればハングアップとして poll に表れます。待っている呼び出しはシグナルで
+  `EINTR` として戻ります。`SA_RESTART` のハンドラーか停止の後は、新しい呼び出しと
+  してもう一度行われます（Linux master の
+  `SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV` では、まだ受け取られていない呼び出し
+  なら、どのハンドラーの後でも行われます）。そのとき、その呼び出しの分の受け取りは、
+  Linux と同じく何も見つけません（`ENOENT`）。
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` では、受け取られた呼び出しは、致命的な
+  シグナル以外では戻らずに待ち続けます。リスナーを閉じると、待っている呼び出しには
+  すべて `ENOSYS` が返り、その後の呼び出しも `ENOSYS` です。
 - 起動の前にファイルを置けます。
 - 指定したときだけ、ホストのディレクトリをマウントできます（コマンドの `--mount`、
   Rust の `Config::mounts`）。操作はすべてそのディレクトリの中に閉じ込められ、

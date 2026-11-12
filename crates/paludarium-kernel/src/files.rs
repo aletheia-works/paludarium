@@ -441,7 +441,7 @@ impl Files {
     }
     /// Gives `d` the lowest free number from `min`, which must be below the
     /// RLIMIT_NOFILE soft limit `limit` (EMFILE).
-    fn allocate(&mut self, d: Descriptor, min: u32, limit: u64) -> Result<u32, Errno> {
+    pub(crate) fn allocate(&mut self, d: Descriptor, min: u32, limit: u64) -> Result<u32, Errno> {
         let mut fds = self.fds.lock().unwrap_or_else(PoisonError::into_inner);
         let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         let n = lowest_free(&fds, &reserved, min, limit)?;
@@ -5750,7 +5750,8 @@ fn reached(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, 
 }
 /// What a link in `/proc/self/fd` reads: the path of a file on a mount
 /// (marked ` (deleted)` once removed), `pipe:[<inode>]`, `socket:[<inode>]`,
-/// `anon_inode:[<kind>]` for a file of no type, a memfd's own name, or a
+/// `anon_inode:[<kind>]` for a file of no type (`anon_inode:inotify` and
+/// `anon_inode:seccomp notify` without brackets), a memfd's own name, or a
 /// POSIX message queue's path in its filesystem.
 fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     let any = d.file.as_any();
@@ -5767,6 +5768,10 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     // `anon_inode_getfd("inotify", ...)` names it without brackets.
     if any.is_some_and(|v| v.is::<crate::inotify::Instance>()) {
         return Ok(b"anon_inode:inotify".to_vec());
+    }
+    // So is a seccomp listener: "seccomp notify".
+    if crate::seccomp::is_listener(&d.file) {
+        return Ok(b"anon_inode:seccomp notify".to_vec());
     }
     let stat = d.file.stat()?;
     let anonymous = |kind: &str| format!("anon_inode:[{kind}]").into_bytes();

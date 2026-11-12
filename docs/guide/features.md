@@ -65,7 +65,7 @@ kernel.
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | seccomp | `seccomp` (see below) |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
@@ -2652,16 +2652,37 @@ one only with an `--allow-net`.
   `SECCOMP_RET_TRAP` forces a `SIGSYS` with `SYS_SECCOMP`, the data in
   `si_errno`, the call's address, number and architecture, and the call's
   number back in `rax`; `SECCOMP_RET_ERRNO` returns its data, at most 4095,
-  as an error; `SECCOMP_RET_TRACE` and `SECCOMP_RET_USER_NOTIF` give
-  `ENOSYS`, as with no tracer and no listener; `SECCOMP_RET_LOG` and
+  as an error; `SECCOMP_RET_TRACE` gives `ENOSYS`, as with no tracer;
+  `SECCOMP_RET_USER_NOTIF` waits for the filter's listener (below), or gives
+  `ENOSYS` when the filter has none; `SECCOMP_RET_LOG` and
   `SECCOMP_RET_ALLOW` run the call. `SECCOMP_FILTER_FLAG_TSYNC` gives the new
   filter to every thread, unless one is in strict mode or has a filter the
   caller's is not built on: then it returns that thread's ID, or `ESRCH` with
   `SECCOMP_FILTER_FLAG_TSYNC_ESRCH`. `SECCOMP_GET_ACTION_AVAIL` and
   `SECCOMP_GET_NOTIF_SIZES` answer as Linux. New threads and processes take
   the mode and the filters, `execve` keeps them, and `/proc/<pid>/status`
-  shows them in `Seccomp` and `Seccomp_filters`. A listener is not made (see
-  [Limitations](./limitations)).
+  shows them in `Seccomp` and `Seccomp_filters`.
+  `SECCOMP_FILTER_FLAG_NEW_LISTENER` returns the new filter's listener,
+  close-on-exec (`anon_inode:seccomp notify`; one to a thread's filters, else
+  `EBUSY`). A call the filter sends there waits until
+  `SECCOMP_IOCTL_NOTIF_RECV` takes it (the oldest not taken, with an id that
+  starts at random, the thread's ID and its `seccomp_data`) and
+  `SECCOMP_IOCTL_NOTIF_SEND` answers it with a value, an error or
+  `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which runs it. Meanwhile
+  `SECCOMP_IOCTL_NOTIF_ADDFD` has the waiting thread install one of the
+  listener's files, at its lowest free descriptor or at the one asked for,
+  and with `SECCOMP_ADDFD_FLAG_SEND` the call returns that descriptor;
+  `SECCOMP_IOCTL_NOTIF_ID_VALID` and `SECCOMP_IOCTL_NOTIF_SET_FLAGS` answer as
+  Linux. The listener polls readable while a call waits to be taken, writable
+  while one taken waits for its answer, and hung up once no thread runs the
+  filter. A signal takes a waiting call back with `EINTR`, which a
+  `SA_RESTART` handler or a stop runs again as a new call (and any handler,
+  for a call not taken yet, with Linux master's
+  `SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV`); a receive it was counted for
+  then finds nothing (`ENOENT`), as on Linux.
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` keeps a call taken waiting through
+  every signal but a fatal one. Closing the listener answers every waiting
+  call with `ENOSYS`, as later calls get.
 - Files can be placed before the start.
 - A host directory can be mounted when you ask for it (`--mount` on the
   command line, `Config::mounts` in Rust). Every operation stays inside that

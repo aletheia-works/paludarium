@@ -237,6 +237,7 @@
     {"name":"kcmp","binary":"process"},
     {"name":"mseal","binary":"process"},
     {"name":"seccomp","binary":"process"},
+    {"name":"seccomp-notify","binary":"process"},
     {"name":"process-vm","binary":"process"},
     {"name":"pidfd-getfd","binary":"process"},
     {"name":"ignored-signal-wait","binary":"process"},

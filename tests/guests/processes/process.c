@@ -7056,6 +7056,316 @@ static int seccomp_case(const char *self) {
     sc_wait("total", pid);
     return 0;
 }
+/* seccomp's user notification: a filter made with
+ * SECCOMP_FILTER_FLAG_NEW_LISTENER sends getppid to its listener, which the
+ * child hands to the parent. The parent receives each call with
+ * SECCOMP_IOCTL_NOTIF_RECV and answers it with SECCOMP_IOCTL_NOTIF_SEND or
+ * SECCOMP_IOCTL_NOTIF_ADDFD while the child waits; the two take turns over
+ * a socket, so that every line comes in one order. Ids start at random, so
+ * only their differences are shown. */
+struct sc_notif {
+    unsigned long long id;
+    unsigned pid, flags;
+    int nr;
+    unsigned arch;
+    unsigned long long ip, args[6];
+};
+struct sc_resp {
+    unsigned long long id;
+    long long val;
+    int error;
+    unsigned flags;
+};
+struct sc_addfd {
+    unsigned long long id;
+    unsigned flags, srcfd, newfd, newfd_flags;
+    unsigned long long more;
+};
+#define SC_RECV 0xc0502100u
+#define SC_SEND 0xc0182101u
+#define SC_ID_VALID 0x40082102u
+#define SC_ADDFD 0x40182103u
+#define SC_SET_FLAGS 0x40082104u
+#define SC_NOTIFY 0x7fc00000u
+static long sc_ioctl(int fd, unsigned long request, void *argument) {
+    return sc_err(ioctl(fd, request, argument));
+}
+static int sc_revents(int fd, int timeout) {
+    struct pollfd p = {.fd = fd, .events = POLLIN | POLLOUT};
+    int r = poll(&p, 1, timeout);
+    return r < 0 ? -errno : p.revents;
+}
+static long sc_receive(int fd, struct sc_notif *n) {
+    memset(n, 0, sizeof *n);
+    return sc_ioctl(fd, SC_RECV, n);
+}
+static long sc_answer(int fd, unsigned long long id, long long val, int error, unsigned flags) {
+    struct sc_resp r = {id, val, error, flags};
+    return sc_ioctl(fd, SC_SEND, &r);
+}
+static long sc_add(int fd, unsigned long request, unsigned long long id, unsigned flags, int src, unsigned newfd,
+                   unsigned newfd_flags, unsigned long long more) {
+    struct sc_addfd a = {id, flags, (unsigned)src, newfd, newfd_flags, more};
+    return sc_ioctl(fd, request, &a);
+}
+static int sc_signal_pipe[2];
+static void sc_handled(int sig) {
+    (void)sig;
+    char c = 'h';
+    write(sc_signal_pipe[1], &c, 1);
+}
+static void sc_handler(int sig, int flags) {
+    struct sigaction sa = {0};
+    sa.sa_handler = sc_handled;
+    sa.sa_flags = flags;
+    sigaction(sig, &sa, NULL);
+}
+/* One byte over the turn-taking socket. */
+static char sc_take(int sock) {
+    char c = 0;
+    if (read(sock, &c, 1) != 1) return 0;
+    return c;
+}
+/* What this side printed comes first. */
+static void sc_give(int sock, char c) {
+    fflush(stdout);
+    write(sock, &c, 1);
+}
+/* The child's side: a filter with a listener, then getppid(k) for each
+ * turn k the parent gives. */
+static void sc_notify_child(int sock) {
+    struct sc_insn notify[] = {SC_NR, SC_IF(SYS_getppid, SC_NOTIFY), SC_RET(SC_ALLOW)};
+    struct sc_insn allow[] = {SC_RET(SC_ALLOW)};
+    long parent = getppid();
+    /* The descriptor is taken first: EMFILE leaves no filter. */
+    int lowest = dup(0);
+    close(lowest);
+    struct rlimit old, few = {(rlim_t)lowest, 0};
+    getrlimit(RLIMIT_NOFILE, &old);
+    few.rlim_max = old.rlim_max;
+    setrlimit(RLIMIT_NOFILE, &few);
+    long emfile = sc_set(8, notify, SC_LEN(notify));
+    setrlimit(RLIMIT_NOFILE, &old);
+    sc_status("no-listener");
+    printf("seccomp listener emfile=%ld\n", emfile);
+    int fd = (int)sc_set(8, notify, SC_LEN(notify));
+    char link[64] = {0}, path[64], byte;
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    readlink(path, link, sizeof link - 1);
+    struct stat st;
+    fstat(fd, &st);
+    printf("seccomp listener fd=%d cloexec=%d fl=%#x mode=%o link=%s read=%ld write=%ld seek=%ld revents=%#x\n",
+           fd == lowest, fcntl(fd, F_GETFD), fcntl(fd, F_GETFL), st.st_mode, link, sc_err(read(fd, &byte, 1)),
+           sc_err(write(fd, "x", 1)), sc_err(lseek(fd, 0, SEEK_SET)), sc_revents(fd, 0));
+    /* One listener to a list of filters. */
+    long again = sc_set(8, allow, SC_LEN(allow));
+    long plain = sc_set(0, allow, SC_LEN(allow));
+    printf("seccomp listener again=%ld plain=%ld above=%ld\n", again, plain, sc_set(8, allow, SC_LEN(allow)));
+    sc_status("listener");
+    fflush(stdout);
+    send_fds(sock, "l", 1, &fd, 1);
+    close(fd);
+    sc_handler(SIGUSR1, SA_RESTART);
+    sc_handler(SIGUSR2, 0);
+    char turn;
+    while ((turn = sc_take(sock)) && turn != 'q') {
+        char got[8] = {0};
+        errno = 0;
+        long r = syscall(SYS_getppid, (long)(turn - '0'));
+        int e = errno;
+        char handled = 0;
+        switch (turn) {
+        case '1':
+            printf("seccomp notify value=%ld\n", r);
+            break;
+        case '2':
+            printf("seccomp notify error=%ld errno=%d\n", r, e);
+            break;
+        case '3':
+            printf("seccomp notify continue=%d\n", r == parent);
+            break;
+        case '4':
+            read((int)r, got, sizeof got - 1);
+            printf("seccomp notify addfd-send fd=%d cloexec=%d read=%s\n", r == lowest, fcntl((int)r, F_GETFD), got);
+            close((int)r);
+            break;
+        case '5':
+            read(40, got, sizeof got - 1);
+            printf("seccomp notify addfd-setfd ret=%ld cloexec=%d read=%s\n", r, fcntl(40, F_GETFD), got);
+            close(40);
+            break;
+        case '6':
+        case '7':
+            read(sc_signal_pipe[0], &handled, 1);
+            printf("seccomp notify signal ret=%ld errno=%d handled=%c\n", r, r < 0 ? e : 0, handled);
+            break;
+        case '8':
+            errno = 0;
+            long after = syscall(SYS_getppid, 9L);
+            printf("seccomp notify closed=%ld errno=%d after=%ld errno=%d\n", r, e, after, errno);
+            break;
+        }
+        fflush(stdout);
+        sc_give(sock, 'd');
+    }
+    _exit(0);
+}
+/* The parent's side of turn `k`: the call it receives. */
+static long sc_turn(int sock, int fd, char k, struct sc_notif *n, pid_t child) {
+    sc_give(sock, k);
+    int ready = sc_revents(fd, -1);
+    long r = sc_receive(fd, n);
+    printf("seccomp turn %c ready=%#x recv=%ld nr=%d arch=%#x arg=%llu pid=%d flags=%u ip=%d revents=%#x\n", k,
+           ready, r, n->nr, n->arch, n->args[0], n->pid == (unsigned)child, n->flags, n->ip != 0,
+           sc_revents(fd, 0));
+    return r;
+}
+static void seccomp_notify_parent(void) {
+    int pair[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+    pipe(sc_signal_pipe);
+    pid_t pid = sc_child();
+    if (pid == 0) {
+        close(pair[0]);
+        sc_notify_child(pair[1]);
+    }
+    close(pair[1]);
+    int sock = pair[0], fd = -1, got_flags;
+    char tag;
+    receive_fd(sock, &tag, 1, 0, &fd, &got_flags);
+    struct sc_notif n;
+    /* 1: a value. Wrong requests meanwhile. */
+    sc_turn(sock, fd, '1', &n, pid);
+    unsigned long long id = n.id;
+    char nonzero[80] = {1};
+    printf("seccomp ioctl id-valid=%ld other=%ld send-other=%ld send-flags=%ld continue-value=%ld\n",
+           sc_ioctl(fd, SC_ID_VALID, &id), sc_ioctl(fd, SC_ID_VALID, &(unsigned long long){id + 1000}),
+           sc_answer(fd, id + 1000, 0, 0, 0), sc_answer(fd, id, 0, 0, 2), sc_answer(fd, id, 1, 0, 1));
+    printf("seccomp ioctl recv-dirty=%ld recv-fault=%ld send-fault=%ld flags=%ld bad-flags=%ld unknown=%ld\n",
+           sc_ioctl(fd, SC_RECV, nonzero), sc_ioctl(fd, SC_RECV, NULL), sc_ioctl(fd, SC_SEND, NULL),
+           sc_err(ioctl(fd, SC_SET_FLAGS, 1UL)), sc_err(ioctl(fd, SC_SET_FLAGS, 2UL)),
+           sc_err(ioctl(fd, 0x40082109u, &id)));
+    printf("seccomp addfd small=%ld flags=%ld newfd=%ld newfd-flags=%ld src=%ld other=%ld big=%ld big-dirty=%ld\n",
+           sc_add(fd, 0x40102103u, id, 0, sock, 0, 0, 0), sc_add(fd, SC_ADDFD, id, 4, sock, 0, 0, 0),
+           sc_add(fd, SC_ADDFD, id, 0, sock, 9, 0, 0), sc_add(fd, SC_ADDFD, id, 0, sock, 0, O_NONBLOCK, 0),
+           sc_add(fd, SC_ADDFD, id, 0, -1, 0, 0, 0), sc_add(fd, SC_ADDFD, id + 1000, 0, sock, 0, 0, 0),
+           sc_add(fd, 0xc0202103u, id + 1000, 0, sock, 0, 0, 0), sc_add(fd, 0x40202103u, id, 0, sock, 0, 0, 1));
+    long answered = sc_answer(fd, id, 42, 0, 0);
+    printf("seccomp answer=%ld valid-after=%ld\n", answered, sc_ioctl(fd, SC_ID_VALID, &id));
+    sc_take(sock);
+    /* 2: an error. A call not received yet takes no answer. */
+    sc_give(sock, '2');
+    sc_revents(fd, -1);
+    unsigned long long next = id + 1;
+    printf("seccomp unreceived send=%ld addfd=%ld id-valid=%ld\n", sc_answer(fd, next, 0, 0, 0),
+           sc_add(fd, SC_ADDFD, next, 0, sock, 0, 0, 0), sc_ioctl(fd, SC_ID_VALID, &next));
+    long r = sc_receive(fd, &n);
+    printf("seccomp turn 2 recv=%ld arg=%llu next=%d answer=%ld\n", r, n.args[0], n.id == next,
+           sc_answer(fd, n.id, 99, -EPERM, 0));
+    id = n.id;
+    sc_take(sock);
+    /* 3: the call itself. */
+    sc_turn(sock, fd, '3', &n, pid);
+    printf("seccomp turn 3 next=%d answer=%ld\n", n.id == id + 1, sc_answer(fd, n.id, 0, 0, 1));
+    id = n.id;
+    sc_take(sock);
+    /* 4: a descriptor that answers the call. */
+    int p[2];
+    pipe(p);
+    write(p[1], "four", 4);
+    sc_turn(sock, fd, '4', &n, pid);
+    long added = sc_add(fd, SC_ADDFD, n.id, 2, p[0], 0, 0, 0);
+    printf("seccomp turn 4 addfd=%d revents=%#x\n", added >= 3, sc_revents(fd, 0));
+    sc_take(sock);
+    /* 5: a descriptor at 40, close-on-exec, then a value. */
+    write(p[1], "five", 4);
+    sc_turn(sock, fd, '5', &n, pid);
+    added = sc_add(fd, SC_ADDFD, n.id, 1, p[0], 40, O_CLOEXEC, 0);
+    printf("seccomp turn 5 addfd=%ld answer=%ld\n", added, sc_answer(fd, n.id, 40, 0, 0));
+    close(p[0]);
+    close(p[1]);
+    id = n.id;
+    sc_take(sock);
+    /* 6: a SA_RESTART handler takes the call back before it is received;
+     * it comes again with a new id, and the receive it was counted for
+     * finds nothing. */
+    char h;
+    sc_give(sock, '6');
+    sc_revents(fd, -1);
+    kill(pid, SIGUSR1);
+    read(sc_signal_pipe[0], &h, 1);
+    write(sc_signal_pipe[1], &h, 1);
+    int ready = sc_revents(fd, -1);
+    r = sc_receive(fd, &n);
+    long long ids = (long long)(n.id - id);
+    answered = sc_answer(fd, n.id, 6, 0, 0);
+    printf("seccomp turn 6 ready=%#x recv=%ld arg=%llu ids=%lld answer=%ld", ready, r, n.args[0], ids, answered);
+    printf(" stale=%ld\n", sc_receive(fd, &n));
+    sc_take(sock);
+    /* 7: a handler without SA_RESTART: EINTR. */
+    sc_give(sock, '7');
+    sc_revents(fd, -1);
+    kill(pid, SIGUSR2);
+    read(sc_signal_pipe[0], &h, 1);
+    write(sc_signal_pipe[1], &h, 1);
+    sc_take(sock);
+    r = sc_receive(fd, &n);
+    printf("seccomp turn 7 stale=%ld revents=%#x\n", r, sc_revents(fd, 0));
+    /* 8: closing the listener answers ENOSYS, and the filter has none. */
+    sc_give(sock, '8');
+    sc_revents(fd, -1);
+    close(fd);
+    sc_take(sock);
+    sc_give(sock, 'q');
+    sc_wait("notify", pid);
+    close(sock);
+}
+/* A listener with SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: once received, a
+ * call waits through a handled signal. Once the child is gone, its
+ * listener hangs up and a receive finds nothing. */
+static void seccomp_notify_killable(void) {
+    int pair[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+    pid_t pid = sc_child();
+    if (pid == 0) {
+        close(pair[0]);
+        struct sc_insn notify[] = {SC_NR, SC_IF(SYS_getppid, SC_NOTIFY), SC_RET(SC_ALLOW)};
+        int fd = (int)sc_set(8 | 32, notify, SC_LEN(notify));
+        send_fds(pair[1], "l", 1, &fd, 1);
+        close(fd);
+        sc_handler(SIGUSR1, 0);
+        sc_take(pair[1]);
+        errno = 0;
+        long r = syscall(SYS_getppid, 7L);
+        char handled = 0;
+        read(sc_signal_pipe[0], &handled, 1);
+        printf("seccomp killable ret=%ld errno=%d handled=%c\n", r, errno, handled);
+        fflush(stdout);
+        sc_give(pair[1], 'd');
+        _exit(0);
+    }
+    close(pair[1]);
+    int sock = pair[0], fd = -1, got_flags;
+    char tag;
+    receive_fd(sock, &tag, 1, 0, &fd, &got_flags);
+    struct sc_notif n;
+    sc_turn(sock, fd, '7', &n, pid);
+    kill(pid, SIGUSR1);
+    usleep(100000);
+    int waiting = sc_revents(fd, 0);
+    printf("seccomp killable waiting revents=%#x answer=%ld\n", waiting, sc_answer(fd, n.id, 7, 0, 0));
+    sc_take(sock);
+    sc_wait("killable", pid);
+    int gone = sc_revents(fd, 0);
+    printf("seccomp killable gone revents=%#x recv=%ld\n", gone, sc_receive(fd, &n));
+    close(fd);
+    close(sock);
+}
+static int seccomp_notify_case(void) {
+    seccomp_notify_parent();
+    seccomp_notify_killable();
+    return 0;
+}
 /* mseal, as Linux's mm/mseal.c: a sealed mapping is not unmapped, moved,
  * resized, given another protection, mapped over or (when anonymous and
  * read-only) discarded; each refusal is EPERM. */
@@ -19388,6 +19698,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mseal")) return mseal_case();
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
+    if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();

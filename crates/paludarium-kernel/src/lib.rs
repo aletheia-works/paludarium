@@ -238,6 +238,11 @@ pub struct ThreadState {
     /// The group's `SECCOMP_FILTER_FLAG_TSYNC` count when the thread last
     /// took its seccomp state from the group ([`ThreadGroup::take_seccomp`]).
     pub(crate) seccomp_sync: u64,
+    /// For a call a signal took back from a seccomp listener, which Linux
+    /// runs again whatever the call is: after a stop or a SA_RESTART
+    /// handler (ERESTARTSYS, `false`), or after any handler (ERESTARTNOINTR,
+    /// `true`). Taken with `restart`.
+    pub(crate) seccomp_restart: Option<bool>,
 }
 
 impl ThreadState {
@@ -520,7 +525,7 @@ impl Kernel {
         thread.state.restart = None;
         thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
         match verdict {
-            seccomp::Verdict::Allow => Next::Resume,
+            seccomp::Verdict::Allow | seccomp::Verdict::Notify(_) => Next::Resume,
             seccomp::Verdict::Return(value) => {
                 thread.cpu.gpr[reg::RAX] = value;
                 self.checkpoint(thread, mem)
@@ -551,6 +556,47 @@ impl Kernel {
                 }
             }
         }
+    }
+
+    /// A system call seccomp sends to a listener: it waits for the answer,
+    /// then runs (`None`) or returns what the listener says, or EINTR to be
+    /// run again when a signal ends the wait.
+    fn notify(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        number: u64,
+        notify: &seccomp::Notify,
+    ) -> Option<Next> {
+        signalfd::observe(&thread.state, &self.inbox, &self.group);
+        let mut ctx = syscalls::Context {
+            number,
+            tid: thread.tid,
+            host: &*self.host,
+            shared_host: &self.host,
+            files: &mut self.files,
+            process: &mut thread.state,
+            cpu: &mut thread.cpu,
+            mem,
+            cancellation: &self.cancellation,
+            inbox: &self.inbox,
+            group: &self.group,
+            processes: &self.processes,
+        };
+        let reply = seccomp::notify(&mut ctx, notify);
+        self.inbox.drain(&mut thread.state);
+        thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
+        thread.state.restart = None;
+        match reply {
+            seccomp::Reply::Continue => return None,
+            seccomp::Reply::Return(value) => thread.cpu.gpr[reg::RAX] = value,
+            seccomp::Reply::Interrupted { always } => {
+                thread.cpu.gpr[reg::RAX] = paludarium_types::Errno(4).to_syscall_return();
+                thread.state.restart = Some(number);
+                thread.state.seccomp_restart = Some(always);
+            }
+        }
+        Some(self.checkpoint(thread, mem))
     }
 
     /// Queues a signal in a thread's process-pending view (manual Kernel clients).
@@ -617,6 +663,7 @@ impl Kernel {
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // Only the checkpoint right after the syscall may restart it.
         let restart = thread.state.restart.take();
+        let seccomp_restart = thread.state.seccomp_restart.take();
         if self.group.retired(thread.tid) {
             return Next::Exit(ExitStatus::Exited(0));
         }
@@ -688,10 +735,12 @@ impl Kernel {
             thread.state.restart_block = None;
             // With SA_RESTART the frame resumes at the syscall instruction,
             // so the call runs again when the handler returns.
-            if action.flags & signals::SA_RESTART != 0 {
+            if action.flags & signals::SA_RESTART != 0 || seccomp_restart == Some(true) {
                 Self::rewind_restart(
                     thread,
-                    restart.filter(|&number| signals::restarts_with_handler(number)),
+                    restart.filter(|&number| {
+                        seccomp_restart.is_some() || signals::restarts_with_handler(number)
+                    }),
                 );
             }
             let delivery_mask = thread.state.signal_mask;
@@ -948,10 +997,14 @@ impl Kernel {
         ];
         self.group.take_seccomp(thread.tid, &mut thread.state);
         if thread.state.seccomp.mode != 0 {
-            let verdict =
-                seccomp::check(&thread.state.seccomp, number as u32, args, thread.cpu.rip.0);
-            if verdict != seccomp::Verdict::Allow {
-                return self.refuse(thread, mem, verdict);
+            match seccomp::check(&thread.state.seccomp, number as u32, args, thread.cpu.rip.0) {
+                seccomp::Verdict::Allow => {}
+                seccomp::Verdict::Notify(notify) => {
+                    if let Some(next) = self.notify(thread, mem, number, &notify) {
+                        return next;
+                    }
+                }
+                verdict => return self.refuse(thread, mem, verdict),
             }
         }
         arguments::narrow(number, &mut args);

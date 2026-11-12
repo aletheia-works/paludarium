@@ -2427,6 +2427,10 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if let Some(result) = crate::inotify::ioctl(c, &file, a[1], a[2]) {
             return result;
         }
+        // A seccomp listener's.
+        if let Some(result) = crate::seccomp::ioctl(c, &file, a[1], a[2]) {
+            return result;
+        }
         // SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCGIFINDEX and SIOCGIFNAME of a
         // socket's network, whose interface is its loopback: a `struct ifreq`
         // of 40 bytes, read whole and written back, as Linux's `dev_ioctl`

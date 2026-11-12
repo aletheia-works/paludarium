@@ -262,11 +262,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   スレッドが名前を変えると、確かめたファイルと開いたファイルが違うことがあります。
   `mount`、`umount2`、`pivot_root` はありません（`ENOSYS`）。Linux はドメインの中の
   スレッドにはこれらを断ります（`EPERM`）。
-- **seccomp**：リスナーは作りません。`SECCOMP_FILTER_FLAG_NEW_LISTENER` は、
-  フィルターに問題がないとわかった後で `EINVAL` になります（それがないときの
-  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` と、Linux master の
-  `SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV` も `EINVAL` です）。そのため
-  `SECCOMP_RET_USER_NOTIF` はいつも `ENOSYS` です。何も記録しません
+- **seccomp**：`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` でリスナーの答えを待ち
+  続ける呼び出しは、致命的なシグナルで起きるのではなく、10 ミリ秒ごとにそれを
+  確かめます。何も記録しません
   （`SECCOMP_FILTER_FLAG_LOG`、`SECCOMP_RET_LOG`）。strict モードでも、Linux の
   `TIF_NOTSC` のように `rdtsc` を例外にはしません。`SECCOMP_FILTER_FLAG_TSYNC` の
   後、ほかのスレッドの新しいフィルターが `/proc` に見えるのは、そのスレッドの次の

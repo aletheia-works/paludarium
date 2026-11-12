@@ -778,7 +778,7 @@ impl ThreadGroup {
         state: &mut ThreadState,
     ) {
         if state.seccomp_sync != threads.syncs {
-            if let Some(own) = threads.states.get(&tid) {
+            if let Some(own) = threads.get(tid) {
                 state.seccomp = own.clone();
             }
             state.seccomp_sync = threads.syncs;
@@ -793,27 +793,23 @@ impl ThreadGroup {
         child: u32,
     ) -> (crate::seccomp::Seccomp, u64) {
         let mut threads = self.seccomp_threads();
-        let state = threads
-            .states
-            .get(&parent)
-            .cloned()
-            .unwrap_or_else(|| own.clone());
-        threads.states.insert(parent, state.clone());
-        threads.states.insert(child, state.clone());
+        let state = threads.get(parent).cloned().unwrap_or_else(|| own.clone());
+        threads.insert(parent, state.clone());
+        threads.insert(child, state.clone());
         (state, threads.syncs)
     }
     /// After exec, thread `pid`, with `state`, is all there is.
     pub(crate) fn reset_seccomp(&self, pid: u32, state: &crate::seccomp::Seccomp) {
         let mut threads = self.seccomp_threads();
-        threads.states.clear();
+        threads.clear();
         if state.mode != 0 {
-            threads.states.insert(pid, state.clone());
+            threads.insert(pid, state.clone());
         }
     }
     /// Thread `tid` has ended, and no `SECCOMP_FILTER_FLAG_TSYNC` waits for
     /// it.
     pub(crate) fn forget_seccomp(&self, tid: u32) {
-        self.seccomp_threads().states.remove(&tid);
+        self.seccomp_threads().remove(tid);
     }
     /// Thread `tid`'s seccomp state, or `own` when the group has not
     /// recorded it.
@@ -823,8 +819,7 @@ impl ThreadGroup {
         own: &crate::seccomp::Seccomp,
     ) -> crate::seccomp::Seccomp {
         self.seccomp_threads()
-            .states
-            .get(&tid)
+            .get(tid)
             .cloned()
             .unwrap_or_else(|| own.clone())
     }
@@ -832,7 +827,7 @@ impl ThreadGroup {
     /// `own` when the group has not recorded it.
     pub(crate) fn seccomp_of(&self, tid: u32, own: &crate::seccomp::Seccomp) -> (u8, u32) {
         let threads = self.seccomp_threads();
-        let state = threads.states.get(&tid).unwrap_or(own);
+        let state = threads.get(tid).unwrap_or(own);
         (state.mode, state.filters())
     }
     /// Thread `tid` is gone, unless it led process `pid`.

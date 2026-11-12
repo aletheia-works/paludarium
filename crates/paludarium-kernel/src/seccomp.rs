@@ -3,21 +3,35 @@
 //! system call first runs the thread's classic BPF programs over its
 //! `seccomp_data`. The lowest action of all of them decides: kill the
 //! process or the thread with SIGSYS, a SIGSYS the thread may handle
-//! (TRAP), an errno, ENOSYS for TRACE (no tracer) and USER_NOTIF (no
-//! listener), or the call itself (LOG, ALLOW).
+//! (TRAP), an errno, ENOSYS for TRACE (no tracer), a wait for the filter's
+//! listener to answer (USER_NOTIF, ENOSYS once it has none), or the call
+//! itself (LOG, ALLOW).
 //!
 //! A thread keeps its mode and filters in [`ThreadState`]; a new thread or
 //! process takes its creator's, exec keeps them, and
 //! `SECCOMP_FILTER_FLAG_TSYNC` gives the caller's to every other thread
 //! through the group's [`Threads`], as Linux's `seccomp_sync_threads` does.
+//! The same [`Threads`] count each filter's users, the threads that run it,
+//! whose end a listener sees as a hang-up.
+//!
+//! A filter made with `SECCOMP_FILTER_FLAG_NEW_LISTENER` comes with a
+//! [`Listener`] file. A call the filter sends to it waits as a
+//! [`Notice`] until the listener's `SECCOMP_IOCTL_NOTIF_RECV` takes it and
+//! `SECCOMP_IOCTL_NOTIF_SEND` answers, as `seccomp_do_user_notification`
+//! does; `SECCOMP_IOCTL_NOTIF_ADDFD` meanwhile has the waiting thread
+//! install a file of the listener's process.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use paludarium_host::{FileHandle, FileStat};
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{Errno, GuestAddr};
 
 use crate::ThreadState;
+use crate::events::{IN, NONBLOCK, OUT, ReadinessHub};
+use crate::files::{Descriptor, Files};
 use crate::syscalls::{Context, Outcome};
 
 pub(crate) const MODE_STRICT: u8 = 1;
@@ -106,6 +120,69 @@ pub(crate) struct Filter {
     /// `SECCOMP_FILTER_FLAG_LOG`, which only changes what is logged.
     #[allow(dead_code)]
     log: bool,
+    /// Linux's `users`: the threads whose list has this filter on top, and
+    /// the filters on top of it that have users themselves. At 0 no thread
+    /// runs it any more.
+    users: AtomicUsize,
+    /// What its listener answers, for a filter made with one.
+    notifier: Option<Arc<Notifier>>,
+    /// `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`: a call the listener has
+    /// received waits for its answer through any signal but a fatal one.
+    wait_killable_recv: bool,
+    /// `SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV`: a call a signal takes back
+    /// before the listener has received it runs again after any handler.
+    restart_before_recv: bool,
+}
+
+impl Filter {
+    /// A filter of `program` on top of `prev`, which it keeps a user of.
+    fn new(program: Box<[Op]>, prev: Option<Arc<Filter>>, log: bool) -> Self {
+        if let Some(prev) = &prev {
+            prev.users.fetch_add(1, Ordering::SeqCst);
+        }
+        Self {
+            program,
+            prev,
+            log,
+            users: AtomicUsize::new(0),
+            notifier: None,
+            wait_killable_recv: false,
+            restart_before_recv: false,
+        }
+    }
+    /// Whether its listener is still open (Linux's `filter->notif`).
+    fn listens(&self) -> bool {
+        self.notifier.as_ref().is_some_and(|n| n.lock().open)
+    }
+}
+
+/// One user fewer of `filter`: at none, as Linux's
+/// `__seccomp_filter_orphan` does, its listener hangs up and the filter
+/// under it has a user fewer in turn.
+fn release(filter: Option<&Arc<Filter>>) {
+    let mut walker = filter.map(|f| &**f);
+    while let Some(filter) = walker {
+        let last = filter
+            .users
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |users| {
+                users.checked_sub(1)
+            })
+            .is_ok_and(|users| users == 1);
+        if !last {
+            break;
+        }
+        if let Some(notifier) = &filter.notifier {
+            notifier.lock().input += 1;
+            notifier.hub.changed();
+        }
+        walker = filter.prev.as_deref();
+    }
+}
+
+fn hold(state: &Seccomp) {
+    if let Some(filter) = &state.filter {
+        filter.users.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// A thread's seccomp mode and filters (Linux's `struct seccomp`).
@@ -139,18 +216,21 @@ impl Seccomp {
         count
     }
     /// `seccomp_run_filters`: every filter runs, and the lowest action wins,
-    /// the newest of equal ones giving the data.
-    fn run(&self, data: &[u8; 64]) -> u32 {
+    /// the newest of equal ones giving the data; with the filter it came
+    /// from (`match`).
+    fn run(&self, data: &[u8; 64]) -> (u32, Option<&Arc<Filter>>) {
         let mut ret = RET_ALLOW;
-        let mut walker = self.filter.as_deref();
+        let mut matched = None;
+        let mut walker = self.filter.as_ref();
         while let Some(filter) = walker {
             let current = execute(&filter.program, data);
             if action_only(current) < action_only(ret) {
                 ret = current;
+                matched = Some(filter);
             }
-            walker = filter.prev.as_deref();
+            walker = filter.prev.as_ref();
         }
-        ret
+        (ret, matched)
     }
     /// Whether `ancestor` is this list or one it was built on
     /// (`is_ancestor`); no filter is everyone's.
@@ -175,20 +255,63 @@ fn action_only(ret: u32) -> i32 {
     (ret & RET_ACTION_FULL).cast_signed()
 }
 
-/// The seccomp state of every thread of a process that may have other
-/// threads, which `SECCOMP_FILTER_FLAG_TSYNC` reads and changes; each thread
+/// The seccomp state of every thread of a process with filters or strict
+/// mode, which `SECCOMP_FILTER_FLAG_TSYNC` reads and changes; each thread
 /// takes a change made to its own when it next enters the kernel
-/// ([`crate::ThreadGroup::take_seccomp`]).
+/// ([`crate::ThreadGroup::take_seccomp`]). Each state is a user of its
+/// filter, from when it is recorded until its thread ends.
 #[derive(Default)]
 pub(crate) struct Threads {
-    pub states: BTreeMap<u32, Seccomp>,
+    states: BTreeMap<u32, Seccomp>,
     /// How many `SECCOMP_FILTER_FLAG_TSYNC` have changed other threads.
     pub syncs: u64,
+}
+
+impl Threads {
+    pub(crate) fn get(&self, tid: u32) -> Option<&Seccomp> {
+        self.states.get(&tid)
+    }
+    /// Thread `tid` has `state` now.
+    pub(crate) fn insert(&mut self, tid: u32, state: Seccomp) {
+        hold(&state);
+        if let Some(old) = self.states.insert(tid, state) {
+            release(old.filter.as_ref());
+        }
+    }
+    /// Thread `tid` has ended.
+    pub(crate) fn remove(&mut self, tid: u32) {
+        if let Some(old) = self.states.remove(&tid) {
+            release(old.filter.as_ref());
+        }
+    }
+    pub(crate) fn clear(&mut self) {
+        for (_, old) in std::mem::take(&mut self.states) {
+            release(old.filter.as_ref());
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = (&u32, &Seccomp)> {
+        self.states.iter()
+    }
+    /// Every thread recorded has `state` now, as TSYNC gives it.
+    fn assign_all(&mut self, state: &Seccomp) {
+        let tids: Vec<u32> = self.states.keys().copied().collect();
+        for tid in tids {
+            self.insert(tid, state.clone());
+        }
+    }
+}
+
+impl Drop for Threads {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
 /// What a system call does after the filters have seen it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
+    /// It waits for the listener of the filter that sent it there.
+    Notify(Notify),
     /// It runs.
     Allow,
     /// It does not run, and returns this value.
@@ -228,7 +351,7 @@ pub(crate) fn check(state: &Seccomp, number: u32, args: [u64; 6], rip: u64) -> V
             for (i, arg) in args.iter().enumerate() {
                 data[16 + i * 8..24 + i * 8].copy_from_slice(&arg.to_le_bytes());
             }
-            let ret = state.run(&data);
+            let (ret, matched) = state.run(&data);
             let value = ret & RET_DATA;
             match ret & RET_ACTION_FULL {
                 RET_ERRNO => {
@@ -237,7 +360,13 @@ pub(crate) fn check(state: &Seccomp, number: u32, args: [u64; 6], rip: u64) -> V
                     Verdict::Return(u64::from(errno).wrapping_neg())
                 }
                 RET_TRAP => Verdict::Trap(siginfo(number, value, rip)),
-                // No tracer, no listener.
+                RET_USER_NOTIF if let Some(filter) = matched.filter(|f| f.notifier.is_some()) => {
+                    Verdict::Notify(Notify {
+                        filter: Arc::clone(filter),
+                        data,
+                    })
+                }
+                // No tracer, or a filter made without a listener.
                 RET_TRACE | RET_USER_NOTIF => Verdict::Return(Errno::ENOSYS.to_syscall_return()),
                 RET_LOG | RET_ALLOW => Verdict::Allow,
                 action => Verdict::Kill {
@@ -448,6 +577,7 @@ pub(crate) fn sys_seccomp(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         mem: c.mem,
         group: c.group,
         processes: c.processes,
+        files: Some((&mut *c.files, c.host)),
     };
     Outcome::Return(
         operate(&mut caller, a[0] as u32, a[1] as u32, a[2])
@@ -462,6 +592,9 @@ pub(crate) struct Caller<'a> {
     pub mem: &'a AddressSpace,
     pub group: &'a crate::ThreadGroup,
     pub processes: &'a crate::processes::Processes,
+    /// Its files and host, which a listener needs; prctl, which makes
+    /// none, has neither.
+    pub files: Option<(&'a mut Files, &'a dyn paludarium_host::Host)>,
 }
 
 /// `prctl(PR_SET_SECCOMP, mode, filter)`, which has no flags and takes no
@@ -488,7 +621,7 @@ fn operate(c: &mut Caller<'_>, op: u32, flags: u32, args: u64) -> Result<u64, Er
                 return Err(Errno::EINVAL);
             }
             c.state.seccomp.mode = MODE_STRICT;
-            threads.states.insert(c.tid, c.state.seccomp.clone());
+            threads.insert(c.tid, c.state.seccomp.clone());
             Ok(0)
         }
         // SECCOMP_SET_MODE_FILTER
@@ -527,8 +660,8 @@ fn operate(c: &mut Caller<'_>, op: u32, flags: u32, args: u64) -> Result<u64, Er
     }
 }
 
-/// `seccomp_set_mode_filter`. A listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER`)
-/// is not made: once the filter is found good, that flag is EINVAL.
+/// `seccomp_set_mode_filter`: 0, or the listener's descriptor with
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 fn set_filter(c: &mut Caller<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     if flags & !FLAG_MASK != 0 {
         return Err(Errno::EINVAL);
@@ -574,14 +707,61 @@ fn set_filter(c: &mut Caller<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         })
         .collect();
     let program = prepare(&insns)?;
-    if flags & FLAG_NEW_LISTENER != 0 {
-        return Err(Errno::EINVAL);
+    // The listener's descriptor, close-on-exec, is taken before the
+    // filter is checked against the thread's (EMFILE first).
+    let listener = if flags & FLAG_NEW_LISTENER != 0 {
+        let (files, _) = c.files.as_mut().ok_or(Errno::EINVAL)?;
+        Some(files.reserve(c.group.nofile())?)
+    } else {
+        None
+    };
+    let result = attach(c, flags, program);
+    let (Some(fd), Some((files, _))) = (listener, c.files.as_mut()) else {
+        return result.map(|attached| attached.0);
+    };
+    match result {
+        Ok((0, Some(filter))) => {
+            let file = Arc::new(Listener {
+                filter,
+                flags: AtomicU32::new(2),
+            });
+            files.fill(fd, Descriptor::unnamed(file, true));
+            Ok(u64::from(fd))
+        }
+        Ok((tid, _)) => {
+            files.unreserve(fd);
+            Ok(tid)
+        }
+        Err(error) => {
+            files.unreserve(fd);
+            Err(error)
+        }
     }
+}
+
+/// The rest of `seccomp_set_mode_filter`: `program` goes on top of the
+/// thread's filters, and with TSYNC every other thread's. Gives 0 and the
+/// new filter, or the thread TSYNC cannot change.
+fn attach(
+    c: &mut Caller<'_>,
+    flags: u32,
+    program: Box<[Op]>,
+) -> Result<(u64, Option<Arc<Filter>>), Errno> {
     let mut threads = c.group.seccomp_threads();
     crate::ThreadGroup::refresh_seccomp(&threads, c.tid, c.state);
     let own = &c.state.seccomp;
     if !matches!(own.mode, 0 | MODE_FILTER) {
         return Err(Errno::EINVAL);
+    }
+    // One listener to a list (`has_duplicate_listener`).
+    if flags & FLAG_NEW_LISTENER != 0 {
+        let mut walker = own.filter.as_deref();
+        while let Some(filter) = walker {
+            if filter.listens() {
+                return Err(EBUSY);
+            }
+            walker = filter.prev.as_deref();
+        }
     }
     let mut total = program.len();
     let mut walker = own.filter.as_deref();
@@ -593,35 +773,51 @@ fn set_filter(c: &mut Caller<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         return Err(Errno::ENOMEM);
     }
     if flags & FLAG_TSYNC != 0
-        && let Some((&tid, _)) = threads.states.iter().find(|&(&tid, other)| {
+        && let Some((&tid, _)) = threads.iter().find(|&(&tid, other)| {
             tid != c.tid
                 && !(other.mode == 0 || other.mode == MODE_FILTER && own.descends_from(other))
         })
     {
         if flags & FLAG_TSYNC_ESRCH != 0 {
-            return Err(Errno(3));
+            return Err(ESRCH);
         }
-        return Ok(u64::from(c.group.namespaces(c.tid).pid.number(tid)));
+        return Ok((u64::from(c.group.namespaces(c.tid).pid.number(tid)), None));
     }
+    let mut filter = Filter::new(program, own.filter.clone(), flags & FLAG_LOG != 0);
+    if flags & FLAG_NEW_LISTENER != 0
+        && let Some((files, host)) = c.files.as_ref()
+    {
+        let mut start = [0u8; 8];
+        let _ = host.random_bytes(&mut start);
+        filter.notifier = Some(Arc::new(Notifier {
+            state: Mutex::new(Notifications {
+                open: true,
+                requests: 0,
+                next_id: u64::from_le_bytes(start),
+                flags: 0,
+                notices: Vec::new(),
+                input: 0,
+                output: 0,
+            }),
+            hub: Arc::clone(&files.readiness),
+        }));
+        filter.wait_killable_recv = flags & FLAG_WAIT_KILLABLE_RECV != 0;
+        filter.restart_before_recv = flags & FLAG_RESTART_BEFORE_RECV != 0;
+    }
+    let filter = Arc::new(filter);
     let new = Seccomp {
         mode: MODE_FILTER,
-        filter: Some(Arc::new(Filter {
-            program,
-            prev: own.filter.clone(),
-            log: flags & FLAG_LOG != 0,
-        })),
+        filter: Some(Arc::clone(&filter)),
     };
     c.state.seccomp = new.clone();
     if flags & FLAG_TSYNC != 0 {
-        for state in threads.states.values_mut() {
-            *state = new.clone();
-        }
+        threads.assign_all(&new);
         threads.syncs += 1;
         c.group.seccomp_synced(threads.syncs);
         c.state.seccomp_sync = threads.syncs;
     }
-    threads.states.insert(c.tid, new);
-    Ok(0)
+    threads.insert(c.tid, new);
+    Ok((0, Some(filter)))
 }
 
 /// The SIGSYS siginfo `Verdict::Kill` and `Verdict::Trap` carry, as the
@@ -630,6 +826,653 @@ pub(crate) fn full_siginfo(info: &[u8; 48]) -> [u8; 128] {
     let mut full = [0u8; 128];
     full[..48].copy_from_slice(info);
     full
+}
+
+/// A call a filter sends to its listener, with the `seccomp_data` the
+/// filters saw.
+#[derive(Debug)]
+pub(crate) struct Notify {
+    filter: Arc<Filter>,
+    data: [u8; 64],
+}
+
+/// The same filter and data.
+impl PartialEq for Notify {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.filter, &other.filter) && self.data == other.data
+    }
+}
+impl Eq for Notify {}
+
+/// `SECCOMP_IOCTL_NOTIF_RECV`, `_IOWR('!', 0, struct seccomp_notif)`.
+const NOTIF_RECV: u32 = 0xc050_2100;
+/// `SECCOMP_IOCTL_NOTIF_SEND`, `_IOWR('!', 1, struct seccomp_notif_resp)`.
+const NOTIF_SEND: u32 = 0xc018_2101;
+/// `SECCOMP_IOCTL_NOTIF_ID_VALID`, `_IOW('!', 2, __u64)`, and the `_IOR`
+/// it first was (`SECCOMP_IOCTL_NOTIF_ID_VALID_WRONG_DIR`).
+const NOTIF_ID_VALID: u32 = 0x4008_2102;
+const NOTIF_ID_VALID_WRONG_DIR: u32 = 0x8008_2102;
+/// `SECCOMP_IOCTL_NOTIF_SET_FLAGS`, `_IOW('!', 4, __u64)`.
+const NOTIF_SET_FLAGS: u32 = 0x4008_2104;
+/// `SECCOMP_IOCTL_NOTIF_ADDFD` without its direction and size, which an
+/// extensible argument may have any of.
+const NOTIF_ADDFD: u32 = 0x2103;
+/// `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
+const USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+/// `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP`.
+const USER_NOTIF_FD_SYNC_WAKE_UP: u64 = 1;
+/// `SECCOMP_ADDFD_FLAG_SETFD` and `SECCOMP_ADDFD_FLAG_SEND`.
+const ADDFD_FLAG_SETFD: u32 = 1;
+const ADDFD_FLAG_SEND: u32 = 2;
+/// `SECCOMP_NOTIFY_ADDFD_SIZE_VER0`.
+const ADDFD_SIZE: usize = 24;
+const O_CLOEXEC: u32 = 0x80000;
+const POLLRDNORM: u32 = 0x40;
+const POLLWRNORM: u32 = 0x100;
+const POLLHUP: u32 = 0x10;
+const ENOENT: Errno = Errno(2);
+const ESRCH: Errno = Errno(3);
+const EINTR: Errno = Errno(4);
+const EBUSY: Errno = Errno(16);
+const E2BIG: Errno = Errno(7);
+const EINPROGRESS: Errno = Errno(115);
+
+/// A filter's listener state (Linux's `struct notification` with the
+/// filter's `notify_lock`); the readiness hub stands for its `wqh`.
+pub(crate) struct Notifier {
+    state: Mutex<Notifications>,
+    hub: Arc<ReadinessHub>,
+}
+
+impl std::fmt::Debug for Notifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Notifier").finish_non_exhaustive()
+    }
+}
+
+impl Notifier {
+    fn lock(&self) -> MutexGuard<'_, Notifications> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+struct Notifications {
+    /// Whether the listener is open; once it is closed, the filter has none.
+    open: bool,
+    /// Linux's `requests`, a count of calls to receive that a call taken
+    /// back by a signal does not lower, so that the next receive finds
+    /// nothing (ENOENT).
+    requests: u64,
+    /// The id of the next call, from a random start.
+    next_id: u64,
+    /// `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP`, which only changes which CPU
+    /// a waiter wakes on.
+    flags: u64,
+    /// The calls waiting, in the order they came.
+    notices: Vec<Notice>,
+    /// Wake-ups of readers and of writers, as `wake_up_poll` with EPOLLIN
+    /// (a call, a hang-up) or EPOLLOUT (a call received) makes them: the
+    /// edges of an edge-triggered epoll.
+    input: u64,
+    output: u64,
+}
+
+impl Notifications {
+    fn find(&mut self, id: u64) -> Option<&mut Notice> {
+        self.notices.iter_mut().find(|n| n.id == id)
+    }
+}
+
+/// A call waiting for its answer (`struct seccomp_knotif`).
+struct Notice {
+    id: u64,
+    /// The waiting thread.
+    tid: u32,
+    data: [u8; 64],
+    state: State,
+    error: i32,
+    val: i64,
+    flags: u32,
+    /// What `SECCOMP_IOCTL_NOTIF_ADDFD` asks of the thread, the last asked
+    /// first, as Linux's list takes them.
+    addfd: VecDeque<Arc<AddFd>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum State {
+    Init,
+    Sent,
+    Replied,
+}
+
+/// A file for a waiting thread to install (`struct seccomp_kaddfd`).
+struct AddFd {
+    descriptor: Descriptor,
+    cloexec: bool,
+    /// The descriptor to put it at (`SECCOMP_ADDFD_FLAG_SETFD`), or the
+    /// lowest free one.
+    at: Option<u32>,
+    /// `SECCOMP_ADDFD_FLAG_SEND`: the descriptor answers the call.
+    send: bool,
+    /// The descriptor installed, once the thread has tried.
+    result: Mutex<Option<Result<u32, Errno>>>,
+}
+
+impl AddFd {
+    fn result(&self) -> Option<Result<u32, Errno>> {
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn finish(&self, result: Result<u32, Errno>) {
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+    }
+}
+
+/// A listener file, `anon_inode:seccomp notify`, which holds its filter.
+/// Closing its last descriptor answers every call waiting with ENOSYS and
+/// leaves the filter without a listener (`seccomp_notify_release`).
+pub(crate) struct Listener {
+    filter: Arc<Filter>,
+    flags: AtomicU32,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let Some(notifier) = &self.filter.notifier else {
+            return;
+        };
+        let mut s = notifier.lock();
+        for notice in &mut s.notices {
+            if notice.state != State::Replied {
+                notice.state = State::Replied;
+                notice.error = -Errno::ENOSYS.0;
+                notice.val = 0;
+            }
+        }
+        s.open = false;
+        drop(s);
+        notifier.hub.changed();
+    }
+}
+
+impl FileHandle for Listener {
+    /// `seccomp_notify_poll`: readable while a call waits to be received,
+    /// writable while one received waits for its answer, hung up once no
+    /// thread runs the filter.
+    fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        let Some(notifier) = &self.filter.notifier else {
+            return Ok((0, 0, 0));
+        };
+        let s = notifier.lock();
+        let mut mask = 0;
+        for notice in &s.notices {
+            match notice.state {
+                State::Init => mask |= IN | POLLRDNORM,
+                State::Sent => mask |= OUT | POLLWRNORM,
+                State::Replied => {}
+            }
+        }
+        if self.filter.users.load(Ordering::SeqCst) == 0 {
+            mask |= POLLHUP;
+        }
+        Ok((mask, s.input, s.output))
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    /// Its file operations have no `read` or `write`.
+    fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(Errno::EINVAL)
+    }
+    /// Nor `llseek`.
+    fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+        Err(Errno::ESPIPE)
+    }
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(FileStat {
+            mode: 0o600,
+            links: 1,
+            ..FileStat::default()
+        })
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::SeqCst)
+    }
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.flags.store(2 | flags & NONBLOCK, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Whether `file` is a listener, which `/proc/self/fd` names
+/// `anon_inode:seccomp notify`.
+pub(crate) fn is_listener(file: &Arc<dyn FileHandle>) -> bool {
+    file.as_any().is_some_and(|any| any.is::<Listener>())
+}
+
+/// What a call sent to a listener does (`seccomp_do_user_notification`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reply {
+    /// It runs (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`).
+    Continue,
+    /// It returns this.
+    Return(u64),
+    /// A signal ended the wait: EINTR, which runs the call again after a
+    /// stop or a SA_RESTART handler (ERESTARTSYS, whatever the call is),
+    /// or after any handler when `always` (ERESTARTNOINTR).
+    Interrupted { always: bool },
+}
+
+/// Thread `c` waits for the listener of `notify`'s filter to answer its
+/// call, installing what `SECCOMP_IOCTL_NOTIF_ADDFD` gives it meanwhile.
+/// ENOSYS if the listener has been closed.
+pub(crate) fn notify(c: &mut Context<'_>, notify: &Notify) -> Reply {
+    let filter = &notify.filter;
+    let Some(notifier) = &filter.notifier else {
+        return Reply::Return(Errno::ENOSYS.to_syscall_return());
+    };
+    let id = {
+        let mut s = notifier.lock();
+        if !s.open {
+            return Reply::Return(Errno::ENOSYS.to_syscall_return());
+        }
+        let id = s.next_id;
+        s.next_id = id.wrapping_add(1);
+        s.notices.push(Notice {
+            id,
+            tid: c.tid,
+            data: notify.data,
+            state: State::Init,
+            error: 0,
+            val: 0,
+            flags: 0,
+            addfd: VecDeque::new(),
+        });
+        s.requests += 1;
+        s.input += 1;
+        id
+    };
+    notifier.hub.changed();
+    let interrupted = loop {
+        let ticket = c.files.readiness.token.value();
+        let mut s = notifier.lock();
+        let Some(notice) = s.find(id) else {
+            break true;
+        };
+        if let Some(addfd) = notice.addfd.pop_front() {
+            let result = install(c, &addfd);
+            if addfd.send {
+                match result {
+                    Ok(fd) => {
+                        notice.flags = 0;
+                        notice.error = 0;
+                        notice.val = i64::from(fd);
+                    }
+                    Err(_) => notice.state = State::Sent,
+                }
+            }
+            addfd.finish(result);
+            drop(s);
+            notifier.hub.changed();
+            continue;
+        }
+        if notice.state == State::Replied {
+            break false;
+        }
+        let killable = filter.wait_killable_recv && notice.state >= State::Sent;
+        drop(s);
+        if killable {
+            if fatal_pending(c) {
+                break true;
+            }
+            wait_through_signals(c, ticket);
+        } else if crate::events::wait(c, ticket, None).is_err() {
+            // A wait that has become killable meanwhile goes on.
+            let mut s = notifier.lock();
+            if filter.wait_killable_recv && s.find(id).is_some_and(|n| n.state >= State::Sent) {
+                continue;
+            }
+            break true;
+        }
+    };
+    let mut s = notifier.lock();
+    let index = s.notices.iter().position(|n| n.id == id);
+    let notice = index.map(|index| s.notices.remove(index));
+    drop(s);
+    notifier.hub.changed();
+    let Some(notice) = notice else {
+        return Reply::Interrupted { always: false };
+    };
+    // Whatever else was asked of the thread finds it gone.
+    for addfd in &notice.addfd {
+        addfd.finish(Err(ESRCH));
+    }
+    if interrupted {
+        return Reply::Interrupted {
+            always: filter.restart_before_recv && notice.state == State::Init,
+        };
+    }
+    if notice.flags & USER_NOTIF_FLAG_CONTINUE != 0 {
+        return Reply::Continue;
+    }
+    // `syscall_set_return_value`: the error if there is one, else the value.
+    Reply::Return(if notice.error != 0 {
+        i64::from(notice.error) as u64
+    } else {
+        notice.val as u64
+    })
+}
+
+/// Whether a signal pending for `c` would end it, which ends a killable
+/// wait (`fatal_signal_pending`, as `complete_signal` turns such a signal
+/// into SIGKILL): SIGKILL, the group ending, or an unblocked signal whose
+/// default action, with no handler, ends the process.
+fn fatal_pending(c: &mut Context<'_>) -> bool {
+    c.inbox.drain(c.process);
+    c.group.drain_process(c.process);
+    if c.group.status().is_some()
+        || (!c.inbox.owns_wake(c.cancellation) && c.cancellation.load(Ordering::SeqCst))
+    {
+        return true;
+    }
+    c.process.pending.iter().any(|signal| {
+        let number = signal.number;
+        let action = c
+            .process
+            .signal_actions
+            .get(&number)
+            .copied()
+            .unwrap_or_default();
+        number == 9
+            || (c.process.signal_mask & (1u64 << (number - 1)) == 0
+                && action.handler == 0
+                && !matches!(number, 17..=23 | 28))
+    })
+}
+
+/// A wait that signals do not end: until the readiness ticket moves, or
+/// for a short while, after which the caller looks for a fatal signal.
+fn wait_through_signals(c: &Context<'_>, ticket: u32) {
+    let never = AtomicBool::new(false);
+    let clock = paludarium_host::ClockId::Monotonic;
+    let Ok(now) = c.host.clock(clock) else {
+        return;
+    };
+    let end = now.saturating_add(10_000_000);
+    if c.host
+        .wait_on(&c.files.readiness.token, ticket, Some((clock, end)), &never)
+        .is_err_and(|e| e == Errno::ENOSYS)
+    {
+        let _ = c.host.wait_until(clock, end, &never);
+    }
+}
+
+/// The waiting thread installs `addfd`'s file: at the lowest free
+/// descriptor (`receive_fd`), or at the one asked for, closing what was
+/// there (`receive_fd_replace`).
+fn install(c: &mut Context<'_>, addfd: &AddFd) -> Result<u32, Errno> {
+    let descriptor = addfd.descriptor.clone().received(addfd.cloexec);
+    let limit = c.group.nofile();
+    let Some(at) = addfd.at else {
+        return c.files.allocate(descriptor, 0, limit);
+    };
+    if u64::from(at) >= limit {
+        return Err(Errno::EBADF);
+    }
+    if let Some(closed) = c.files.replace(at, descriptor)? {
+        crate::record_locks::closed(c, &closed);
+        crate::mqueue::closed(c, &closed);
+        crate::inet::linger(c, &closed.file);
+    }
+    Ok(at)
+}
+
+/// A listener's own `ioctl` requests (`seccomp_notify_ioctl`), EINVAL for
+/// any other; `None` for any other file.
+pub(crate) fn ioctl(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    request: u64,
+    argument: u64,
+) -> Option<Result<u64, Errno>> {
+    let listener = file.as_any()?.downcast_ref::<Listener>()?;
+    let filter = Arc::clone(&listener.filter);
+    let notifier = Arc::clone(filter.notifier.as_ref()?);
+    let request = request as u32;
+    Some(match request {
+        NOTIF_RECV => receive(c, &filter, &notifier, argument),
+        NOTIF_SEND => answer(c, &notifier, argument),
+        NOTIF_ID_VALID | NOTIF_ID_VALID_WRONG_DIR => {
+            let id = c
+                .mem
+                .read_u64(GuestAddr(argument))
+                .map_err(|_| Errno::EFAULT);
+            id.and_then(|id| {
+                let mut s = notifier.lock();
+                match s.find(id) {
+                    Some(notice) if notice.state == State::Sent => Ok(0),
+                    _ => Err(ENOENT),
+                }
+            })
+        }
+        NOTIF_SET_FLAGS => {
+            if argument & !USER_NOTIF_FD_SYNC_WAKE_UP != 0 {
+                Err(Errno::EINVAL)
+            } else {
+                notifier.lock().flags = argument;
+                Ok(0)
+            }
+        }
+        _ if request & 0xffff == NOTIF_ADDFD => {
+            add_fd(c, &notifier, argument, (request >> 16 & 0x3fff) as usize)
+        }
+        _ => Err(Errno::EINVAL),
+    })
+}
+
+/// A wait of the listener's own a signal ended: EINTR, which a stop or a
+/// SA_RESTART handler runs again (ERESTARTSYS).
+fn interrupted(c: &mut Context<'_>) -> Result<u64, Errno> {
+    c.process.restart = Some(16);
+    Err(EINTR)
+}
+
+/// `SECCOMP_IOCTL_NOTIF_RECV` (`seccomp_notify_recv`): into a zeroed
+/// `struct seccomp_notif`, the oldest call not received yet, once one has
+/// come or no thread runs the filter.
+fn receive(
+    c: &mut Context<'_>,
+    filter: &Filter,
+    notifier: &Notifier,
+    at: u64,
+) -> Result<u64, Errno> {
+    let mut buffer = [0u8; 80];
+    c.mem
+        .read(GuestAddr(at), &mut buffer)
+        .map_err(|_| Errno::EFAULT)?;
+    if buffer.iter().any(|&b| b != 0) {
+        return Err(Errno::EINVAL);
+    }
+    loop {
+        let ticket = c.files.readiness.token.value();
+        {
+            let mut s = notifier.lock();
+            if filter.users.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            if s.requests > 0 {
+                s.requests -= 1;
+                break;
+            }
+        }
+        if crate::events::wait(c, ticket, None).is_err() {
+            return interrupted(c);
+        }
+    }
+    let mut s = notifier.lock();
+    let Some(notice) = s.notices.iter_mut().find(|n| n.state == State::Init) else {
+        return Err(ENOENT);
+    };
+    notice.state = State::Sent;
+    let (id, tid) = (notice.id, notice.tid);
+    buffer[0..8].copy_from_slice(&id.to_le_bytes());
+    buffer[16..80].copy_from_slice(&notice.data);
+    s.output += 1;
+    drop(s);
+    notifier.hub.changed();
+    // The thread as the listener's PID namespace numbers it, 0 if it does not.
+    let pid = c.group.namespaces(c.tid).pid.number(tid);
+    buffer[8..12].copy_from_slice(&pid.to_le_bytes());
+    if c.mem.write(GuestAddr(at), &buffer).is_err() {
+        // The call waits to be received again.
+        let mut s = notifier.lock();
+        if let Some(notice) = s.find(id) {
+            notice.state = State::Init;
+            s.requests += 1;
+            s.input += 1;
+        }
+        drop(s);
+        notifier.hub.changed();
+        return Err(Errno::EFAULT);
+    }
+    Ok(0)
+}
+
+/// `SECCOMP_IOCTL_NOTIF_SEND` (`seccomp_notify_send`): the one answer to a
+/// call received, an error, a value or `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
+fn answer(c: &Context<'_>, notifier: &Notifier, at: u64) -> Result<u64, Errno> {
+    let mut response = [0u8; 24];
+    c.mem
+        .read(GuestAddr(at), &mut response)
+        .map_err(|_| Errno::EFAULT)?;
+    let id = u64::from_le_bytes(response[0..8].try_into().unwrap_or_default());
+    let val = i64::from_le_bytes(response[8..16].try_into().unwrap_or_default());
+    let error = i32::from_le_bytes(response[16..20].try_into().unwrap_or_default());
+    let flags = u32::from_le_bytes(response[20..24].try_into().unwrap_or_default());
+    if flags & !USER_NOTIF_FLAG_CONTINUE != 0
+        || flags & USER_NOTIF_FLAG_CONTINUE != 0 && (error != 0 || val != 0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let mut s = notifier.lock();
+    let notice = s.find(id).ok_or(ENOENT)?;
+    if notice.state != State::Sent {
+        return Err(EINPROGRESS);
+    }
+    notice.state = State::Replied;
+    notice.error = error;
+    notice.val = val;
+    notice.flags = flags;
+    drop(s);
+    notifier.hub.changed();
+    Ok(0)
+}
+
+/// `SECCOMP_IOCTL_NOTIF_ADDFD` (`seccomp_notify_addfd`) with a `size`-byte
+/// `struct seccomp_notif_addfd`: the thread of a call received installs a
+/// file of the caller's, and the call returns the descriptor with
+/// `SECCOMP_ADDFD_FLAG_SEND`. Gives the descriptor once the thread has.
+fn add_fd(c: &mut Context<'_>, notifier: &Notifier, at: u64, size: usize) -> Result<u64, Errno> {
+    if !(ADDFD_SIZE..4096).contains(&size) {
+        return Err(Errno::EINVAL);
+    }
+    // `copy_struct_from_user`: what a newer, longer struct adds must be 0.
+    if size > ADDFD_SIZE {
+        let mut rest = vec![0u8; size - ADDFD_SIZE];
+        c.mem
+            .read(GuestAddr(at + ADDFD_SIZE as u64), &mut rest)
+            .map_err(|_| Errno::EFAULT)?;
+        if rest.iter().any(|&b| b != 0) {
+            return Err(E2BIG);
+        }
+    }
+    let mut raw = [0u8; ADDFD_SIZE];
+    c.mem
+        .read(GuestAddr(at), &mut raw)
+        .map_err(|_| Errno::EFAULT)?;
+    let word = |i: usize| u32::from_le_bytes(raw[i..i + 4].try_into().unwrap_or_default());
+    let id = u64::from_le_bytes(raw[0..8].try_into().unwrap_or_default());
+    let (flags, source, target, target_flags) = (word(8), word(12), word(16), word(20));
+    if target_flags & !O_CLOEXEC != 0 || flags & !(ADDFD_FLAG_SETFD | ADDFD_FLAG_SEND) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if target != 0 && flags & ADDFD_FLAG_SETFD == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let descriptor = c.files.descriptor(u64::from(source))?;
+    let send = flags & ADDFD_FLAG_SEND != 0;
+    let request = Arc::new(AddFd {
+        descriptor,
+        cloexec: target_flags & O_CLOEXEC != 0,
+        at: (flags & ADDFD_FLAG_SETFD != 0).then_some(target),
+        send,
+        result: Mutex::new(None),
+    });
+    {
+        let mut s = notifier.lock();
+        let notice = s.find(id).ok_or(ENOENT)?;
+        if notice.state != State::Sent {
+            return Err(EINPROGRESS);
+        }
+        if send {
+            if !notice.addfd.is_empty() {
+                return Err(EBUSY);
+            }
+            notice.state = State::Replied;
+        }
+        notice.addfd.push_front(Arc::clone(&request));
+    }
+    notifier.hub.changed();
+    loop {
+        let ticket = c.files.readiness.token.value();
+        if let Some(result) = request.result() {
+            return result.map(u64::from);
+        }
+        if crate::events::wait(c, ticket, None).is_err() {
+            let mut s = notifier.lock();
+            if let Some(result) = request.result() {
+                return result.map(u64::from);
+            }
+            if let Some(notice) = s.find(id) {
+                notice.addfd.retain(|other| !Arc::ptr_eq(other, &request));
+                if send {
+                    notice.state = State::Sent;
+                }
+            }
+            drop(s);
+            return interrupted(c);
+        }
+    }
+}
+
+/// Answers the oldest call waiting on listener `file` with `val`, as a
+/// receive and a send would; false if none waits.
+#[cfg(test)]
+pub(crate) fn answer_oldest(file: &Arc<dyn FileHandle>, val: i64) -> bool {
+    let Some(listener) = file.as_any().and_then(|any| any.downcast_ref::<Listener>()) else {
+        return false;
+    };
+    let Some(notifier) = &listener.filter.notifier else {
+        return false;
+    };
+    let mut s = notifier.lock();
+    let Some(notice) = s.notices.iter_mut().find(|n| n.state == State::Init) else {
+        return false;
+    };
+    notice.state = State::Replied;
+    notice.val = val;
+    s.requests -= 1;
+    drop(s);
+    notifier.hub.changed();
+    true
 }
 
 /// Strict mode or filters, for `PR_GET_SECCOMP`; strict mode never gets
@@ -650,11 +1493,7 @@ mod tests {
         let program = prepare(insns)?;
         let state = Seccomp {
             mode: MODE_FILTER,
-            filter: Some(Arc::new(Filter {
-                program,
-                prev: None,
-                log: false,
-            })),
+            filter: Some(Arc::new(Filter::new(program, None, false))),
         };
         let mut data = [0u8; 64];
         data[0..4].copy_from_slice(&number.to_le_bytes());
@@ -662,7 +1501,7 @@ mod tests {
         for (i, arg) in args.iter().enumerate() {
             data[16 + i * 8..24 + i * 8].copy_from_slice(&arg.to_le_bytes());
         }
-        Ok(state.run(&data))
+        Ok(state.run(&data).0)
     }
 
     #[test]
@@ -752,11 +1591,11 @@ mod tests {
     #[test]
     fn the_lowest_action_of_all_filters_decides() {
         let make = |ret: u32, prev: Option<Arc<Filter>>| {
-            Some(Arc::new(Filter {
-                program: prepare(&[insn(0x06, 0, 0, ret)]).unwrap(),
+            Some(Arc::new(Filter::new(
+                prepare(&[insn(0x06, 0, 0, ret)]).unwrap(),
                 prev,
-                log: false,
-            }))
+                false,
+            )))
         };
         let older = make(RET_ERRNO | 2, None);
         let state = Seccomp {

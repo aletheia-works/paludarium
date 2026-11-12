@@ -6374,6 +6374,49 @@ fn seccomp_filters_refuse_calls_by_their_action() {
     assert_eq!(f.call(186, &[]), Next::Exit(ExitStatus::Signaled(31)));
 }
 #[test]
+fn seccomp_listener_answers_a_waiting_call() {
+    let mut f = fixture();
+    // getpid goes to the listener, the rest is allowed.
+    seccomp_program(
+        &f,
+        &[
+            (0x20, 0, 0, 0),
+            (0x15, 0, 1, 39),
+            (0x06, 0, 0, 0x7fc0_0000),
+            (0x06, 0, 0, 0x7fff_0000),
+        ],
+    );
+    let fd = f.ret(317, &[1, 8, DATA]);
+    assert!((3..1024).contains(&fd), "{fd}");
+    // Close-on-exec, and one listener to a list of filters.
+    assert_eq!(f.ret(72, &[fd, 1]), 1);
+    assert_eq!(f.ret(317, &[1, 8, DATA]), errno(Errno(16)));
+    let file = f.kernel.files.descriptor(fd).unwrap().file;
+    let helper = std::thread::spawn(move || {
+        for _ in 0..10_000 {
+            if crate::seccomp::answer_oldest(&file, 77) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    });
+    assert_eq!(f.ret(39, &[]), 77);
+    assert!(helper.join().unwrap());
+    // A receive into a buffer that is not zeroed, and a request the
+    // listener does not know, are EINVAL.
+    f.mem.write(GuestAddr(DATA + 0x400), &[1u8; 80]).unwrap();
+    assert_eq!(
+        f.ret(16, &[fd, 0xc050_2100, DATA + 0x400]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(16, &[fd, 0x4008_2109, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(0, &[fd, DATA, 8]), errno(Errno::EINVAL));
+    // Once the listener is closed, the filter has none: ENOSYS.
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(39, &[]), errno(Errno::ENOSYS));
+}
+#[test]
 fn seccomp_strict_mode_allows_four_calls_and_kills_for_the_rest() {
     let mut f = fixture();
     assert_eq!(f.ret(317, &[0, 1, 0]), errno(Errno::EINVAL));

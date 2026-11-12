@@ -512,6 +512,7 @@ mod linux {
         processes_kcmp => ("kcmp","process"),
         processes_mseal => ("mseal","process"),
         processes_seccomp => ("seccomp","process"),
+        processes_seccomp_notify => ("seccomp-notify","process"),
         processes_process_vm => ("process-vm","process"),
         processes_pidfd_getfd => ("pidfd-getfd","process"),
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),

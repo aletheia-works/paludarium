@@ -2141,6 +2141,7 @@ impl Kernel {
                         mem,
                         group: &self.group,
                         processes: &self.processes,
+                        files: None,
                     },
                     a[1],
                     a[2],
@@ -2882,6 +2883,10 @@ impl Kernel {
             .group
             .seccomp_of_state(parent.tid, &parent.state.seccomp);
         state.seccomp_sync = 0;
+        // The child is a user of its filters until it ends.
+        if state.seccomp.mode != 0 {
+            group.seccomp_threads().insert(pid, state.seccomp.clone());
+        }
         state.clear_child_tid = if flags & 0x200000 != 0 { a[3] } else { 0 };
         if flags & 0x100 != 0 {
             state.alt_stack = crate::AltStack::default();

@@ -2056,6 +2056,7 @@ pub(crate) fn scatter(
 }
 /// `preadv2`'s and `pwritev2`'s flags (`RWF_*`). `RWF_HIPRI` (0x1), which
 /// polls for a direct transfer, changes nothing for these buffered ones.
+const RWF_HIPRI: u32 = 0x1;
 const RWF_DSYNC: u32 = 0x2;
 const RWF_SYNC: u32 = 0x4;
 const RWF_NOWAIT: u32 = 0x8;
@@ -2334,6 +2335,9 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     if file.flags() & 3 == 1 {
         return Err(Errno::EBADF);
     }
+    if let Some(instance) = crate::inotify::of(&file) {
+        return readv_instance(c, instance, a, flags);
+    }
     let segments = iovecs(c, a[1], a[2], true)?;
     let total = segments.iter().map(|(_, length)| length).sum::<usize>();
     let position = file.seek(0, 1).ok();
@@ -2349,6 +2353,39 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     let count = read_waiting(c, &file, &mut b, flags & RWF_NOWAIT != 0)?;
     scatter(c, &segments, &b[..count])?;
     Ok(count as u64)
+}
+
+/// [`readv`] of an inotify instance, which has no `read_iter`: Linux's
+/// `do_loop_readv_writev` reads each buffer in turn as [`read_guest`]
+/// (`crate::inotify::read_guest`) does, until one is not filled or fails;
+/// nothing to do for no bytes, and any flag but `RWF_HIPRI` `EOPNOTSUPP`.
+fn readv_instance(
+    c: &mut Context<'_>,
+    instance: &crate::inotify::Instance,
+    a: [u64; 6],
+    flags: u32,
+) -> Result<u64, Errno> {
+    let segments = iovecs_checked(c.mem, a[1], a[2], |_, _| Ok(()))?;
+    if segments.iter().all(|&(_, length)| length == 0) {
+        return Ok(0);
+    }
+    if flags & !RWF_HIPRI != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let mut done = 0;
+    for (base, length) in segments {
+        match crate::inotify::read_guest(c, instance, base, length) {
+            Ok(count) => {
+                done += count as u64;
+                if count != length {
+                    break;
+                }
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
 }
 
 /// `writev(fd, iov, count)`, and `pwritev2` at the file position, as
@@ -3086,6 +3123,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 requested
             };
+            // An inotify instance copies each record out as it takes it.
+            if n == 0
+                && let Some(d) = &d
+                && let Some(instance) = crate::inotify::of(&d.file)
+            {
+                crate::sockets::access_ok_u64(a[1], a[2])?;
+                return crate::inotify::read_guest(c, instance, a[1], len).map(|n| n as u64);
+            }
             if n == 1 {
                 c.mem
                     .check_read(GuestAddr(a[1]), len)
@@ -5154,6 +5199,12 @@ fn reopen(
     // `may_open` of the inode the link leads to.
     if !matches!(stat.mode & 0o170000, 0o040000 | 0o120000) {
         attributes::may_open(&stat, flags)?;
+    }
+    // A FIFO a path opened: its node opened again, at the same dentry.
+    if stat.mode & 0o170000 == 0o010000
+        && let Some(result) = crate::fifo::reopen(c, &d.file, &stat, flags)
+    {
+        return Ok((result?, d.path.clone()));
     }
     match stat.mode & 0o170000 {
         // A pipe or a standard stream: a description of its own, which

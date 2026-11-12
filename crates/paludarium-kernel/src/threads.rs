@@ -1458,6 +1458,7 @@ impl Kernel {
             processes: self.processes.clone(),
             spawn_memory: None,
             exec_memory: None,
+            exec_closes: None,
             vfork_release: self.vfork_release.clone(),
             vfork_wait: None,
             unimplemented: self.unimplemented.clone(),

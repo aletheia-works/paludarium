@@ -53,6 +53,11 @@ pub(crate) struct PageCaches {
     /// with, as their mappings hold theirs. They keep a removed file there
     /// for inotify too.
     holds: Mutex<HashMap<Key, usize>>,
+    /// The places of the open files the kernel keeps itself
+    /// ([`crate::inotify::Closing`]: a FIFO opened by its path, the files
+    /// exec opens), by their file, which renames move as they move a
+    /// description's, and which keep a removed file there too.
+    kept: Mutex<Vec<(Key, Weak<Mutex<Place>>)>>,
 }
 
 /// A hold on a file a process keeps without a description (a working
@@ -104,10 +109,18 @@ type Open = (Weak<dyn FileHandle>, Device, OnceLock<Key>);
 /// links resolved once a rename or a removal first looks at it, moved by
 /// each rename of the file or of a directory above it, and unlinked once an
 /// `unlink`, an `rmdir` or a rename onto it took that name away.
-struct Place {
+#[derive(Default)]
+pub(crate) struct Place {
     path: Vec<u8>,
     resolved: bool,
     unlinked: bool,
+}
+impl Place {
+    /// Where the file is now, and whether that name was taken away.
+    pub(crate) fn at(place: &Mutex<Self>) -> (Vec<u8>, bool) {
+        let place = place.lock().unwrap_or_else(PoisonError::into_inner);
+        (place.path.clone(), place.unlinked)
+    }
 }
 
 /// The places a rename looked at, and its two entries.
@@ -187,9 +200,33 @@ impl Drop for WriteAccess {
 }
 
 impl PageCaches {
+    /// The place of an open of file `key` the kernel keeps itself, at
+    /// `path`, which renames and removals move from now on, and which holds
+    /// the file while it lasts.
+    pub(crate) fn keep_place(&self, key: Key, path: &[u8]) -> Arc<Mutex<Place>> {
+        let place = Arc::new(Mutex::new(Place {
+            path: path.to_vec(),
+            resolved: false,
+            unlinked: false,
+        }));
+        self.kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((key, Arc::downgrade(&place)));
+        place
+    }
     /// Whether a description of file `key` is open, a [`Hold`] holds it,
-    /// or a program runs from it.
-    fn held(&self, key: Key) -> bool {
+    /// a program runs from it, or the kernel keeps an open of it.
+    pub(crate) fn held(&self, key: Key) -> bool {
+        let kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(known, place)| *known == key && place.strong_count() != 0);
+        kept || self.held_otherwise(key)
+    }
+    fn held_otherwise(&self, key: Key) -> bool {
         let opened = {
             let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
             opens.values().any(|(file, device, found)| {
@@ -231,6 +268,12 @@ impl PageCaches {
                 })
                 .collect()
         };
+        // The kernel's own opens are of the machine's one file system.
+        {
+            let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+            kept.retain(|(_, place)| place.strong_count() != 0);
+            places.extend(kept.iter().filter_map(|(_, place)| place.upgrade()));
+        }
         // `renamed` moves a place it sees twice twice.
         places.sort_by_key(|place| Arc::as_ptr(place).addr());
         places.dedup_by(|a, b| Arc::ptr_eq(a, b));
@@ -714,20 +757,39 @@ impl Drop for CoherentFile {
 }
 
 impl CoherentFile {
-    /// `inner`, with the device of its own (a memfd's).
+    /// `inner`, with the device of its own (a memfd's), listed among the
+    /// open descriptions, which keep the file there for inotify.
     pub(crate) fn with_device(
         inner: Arc<dyn FileHandle>,
         caches: Arc<PageCaches>,
         device: u64,
     ) -> Self {
-        CoherentFile {
+        let file = CoherentFile {
             inner,
             caches,
             device: Device::Fixed(device),
             key: OnceLock::new(),
             write: None,
             opened: None,
-        }
+        };
+        file.list();
+        file
+    }
+    /// Lists this description among the open ones.
+    fn list(&self) {
+        let id = Arc::as_ptr(&self.inner).cast::<()>().addr();
+        self.caches
+            .opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                id,
+                (
+                    Arc::downgrade(&self.inner),
+                    self.device.copy(),
+                    OnceLock::new(),
+                ),
+            );
     }
     /// The file's key, as `stat` names it, or none for a file that is not
     /// regular.
@@ -763,19 +825,7 @@ impl CoherentFile {
     /// This handle, as the guest's own open with `flags` makes it: its
     /// watches hear `IN_OPEN` (`fsnotify_open`), and will hear its close.
     fn opened(mut self, flags: u32) -> Self {
-        let id = Arc::as_ptr(&self.inner).cast::<()>().addr();
-        self.caches
-            .opens
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                id,
-                (
-                    Arc::downgrade(&self.inner),
-                    self.device.copy(),
-                    OnceLock::new(),
-                ),
-            );
+        self.list();
         if flags & O_PATH == 0 && crate::inotify::reported_open() {
             self.opened = Some(flags & 3 != 0);
             self.event(crate::inotify::OPEN);

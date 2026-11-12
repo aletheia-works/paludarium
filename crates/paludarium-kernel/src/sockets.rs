@@ -350,6 +350,11 @@ impl PipeEnd {
     pub(crate) fn notify_close(&self, closing: crate::inotify::Closing) {
         let _ = self.closing.set(closing);
     }
+    /// For a FIFO's description that a path opened, what tells its inotify
+    /// watches of its close.
+    pub(crate) fn closing(&self) -> Option<&crate::inotify::Closing> {
+        self.closing.get()
+    }
     /// [`FileHandle::reopen`], as the pipe end itself, which a FIFO keeps.
     pub(crate) fn open_again(&self, flags: u32) -> Result<Arc<Self>, Errno> {
         const ENXIO: Errno = Errno(6);

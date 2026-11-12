@@ -59,17 +59,31 @@ pub(crate) fn open(
     flags: u32,
 ) -> Result<Arc<dyn FileHandle>, Errno> {
     let description = join(c, key, node, flags)?;
-    if let Some(closing) = crate::inotify::Closing::opened(
-        &c.files.caches.notify,
-        &c.files.fs,
-        path,
-        key.0,
-        node,
-        flags,
-    ) {
+    if let Some(closing) =
+        crate::inotify::Closing::opened(&c.files.caches, &c.files.fs, path, key.0, node, flags)
+    {
         description.notify_close(closing);
     }
     Ok(description)
+}
+/// Opens again the FIFO a path opened as `file`, as an open of
+/// `/proc/self/fd` reaches its dentry: [`open`] of the node, whatever names
+/// it now, with its `IN_OPEN` at the same place. `None` for another file.
+pub(crate) fn reopen(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    node: &FileStat,
+    flags: u32,
+) -> Option<Result<Arc<dyn FileHandle>, Errno>> {
+    let end = file.as_any()?.downcast_ref::<PipeEnd>()?;
+    let closing = end.closing()?;
+    let key = (closing.device(), node.inode);
+    Some(join(c, key, node, flags).map(|description| {
+        if let Some(again) = closing.again(&c.files.caches, flags) {
+            description.notify_close(again);
+        }
+        description as Arc<dyn FileHandle>
+    }))
 }
 /// The description [`open`] makes, once the other end is there.
 fn join(

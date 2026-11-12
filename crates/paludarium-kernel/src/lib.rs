@@ -263,6 +263,9 @@ pub struct Kernel {
     processes: Arc<Processes>,
     spawn_memory: Option<Arc<AddressSpace>>,
     exec_memory: Option<Arc<AddressSpace>>,
+    /// The opens of the scripts an exec ran, which close once the image it
+    /// replaced has gone ([`Kernel::exec_finished`]).
+    exec_closes: Option<processes::ExecOpens>,
     vfork_release: Option<Arc<AtomicBool>>,
     vfork_wait: Option<Arc<AtomicBool>>,
     /// System-call numbers the guest called that are not in the table,
@@ -311,6 +314,7 @@ impl Kernel {
             processes,
             spawn_memory: None,
             exec_memory: None,
+            exec_closes: None,
             vfork_release: None,
             vfork_wait: None,
             unimplemented: Arc::default(),
@@ -707,6 +711,8 @@ impl Kernel {
     pub fn handle(&mut self, thread: &mut Thread, mem: &AddressSpace, reason: ExitReason) -> Next {
         // The thread runs no guest code until it takes a CPU again.
         self.leave_cpu();
+        // A caller that did not finish the last exec finishes it now.
+        self.exec_finished();
         self.group.register(thread.tid, Arc::clone(&self.inbox));
         let fault = match reason {
             ExitReason::PageFault {

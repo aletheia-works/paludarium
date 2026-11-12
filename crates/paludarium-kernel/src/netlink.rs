@@ -11,18 +11,20 @@
 //! routes, in parts as large as `netlink_dump` makes them, each receive
 //! that leaves room sending the next, then `NLMSG_DONE` in a part of its
 //! own (after the last IPv6 address or link, when it has room); an AF_INET6
-//! `RTM_GETLINK` dump shows the loopback as IPv6 does; `RTM_GETLINK` without a
-//! dump answers for `lo` by index or name, and `RTM_GETROUTE` without one
-//! looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and remove the
-//! loopback's addresses ([`crate::interface`]); `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
-//! down with `IFF_UP`, given `CAP_NET_ADMIN` in the user namespace that owns
-//! the network namespace. An error, or a success the request asks for with
-//! `NLM_F_ACK`, is answered with `NLMSG_ERROR`; any other request is
-//! `EOPNOTSUPP`. A socket with `NETLINK_GET_STRICT_CHK` has its dumps,
-//! link requests and route lookups checked as Linux checks them strictly,
-//! and its dumps narrowed as they ask. A datagram to another socket's port reaches it, and the
-//! members of a group hear of the changes to the link, addresses and
-//! routes as Linux tells them.
+//! `RTM_GETLINK` dump shows the loopback as IPv6 does, and an
+//! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table; `RTM_GETLINK`
+//! without a dump answers for `lo` by index or name, and `RTM_GETROUTE`
+//! without one looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and
+//! remove the loopback's addresses ([`crate::interface`]); `RTM_NEWLINK`
+//! and `RTM_SETLINK` bring it up or down with `IFF_UP`, given
+//! `CAP_NET_ADMIN` in the user namespace that owns the network namespace.
+//! An error, or a success the request asks for with `NLM_F_ACK`, is
+//! answered with `NLMSG_ERROR`; any other request is `EOPNOTSUPP`. A
+//! socket with `NETLINK_GET_STRICT_CHK` has its dumps, link requests and
+//! route lookups checked as Linux checks them strictly, and its dumps
+//! narrowed as they ask. A datagram to another socket's port reaches it,
+//! and the members of a group hear of the changes to the link, addresses
+//! and routes as Linux tells them.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::inet::Network;
 use crate::sockets::Timeout;
@@ -85,6 +87,15 @@ const IFA_F_TENTATIVE: u32 = 0x40;
 /// The multicast routing families, whose dumps find no route.
 const RTNL_FAMILY_IPMR: u8 = 128;
 const RTNL_FAMILY_IP6MR: u8 = 129;
+/// The attributes of an IPv4 multicast routing table (`IPMRA_TABLE_*`), in
+/// an `RTNL_FAMILY_IPMR` link dump's `IFLA_AF_SPEC`.
+const IPMRA_TABLE_ID: u16 = 1;
+const IPMRA_TABLE_CACHE_RES_QUEUE_LEN: u16 = 2;
+const IPMRA_TABLE_MROUTE_REG_VIF_NUM: u16 = 3;
+const IPMRA_TABLE_MROUTE_DO_ASSERT: u16 = 4;
+const IPMRA_TABLE_MROUTE_DO_PIM: u16 = 5;
+const IPMRA_TABLE_VIFS: u16 = 6;
+const IPMRA_TABLE_MROUTE_DO_WRVIFWHOLE: u16 = 7;
 const RTA_DST: u16 = 1;
 const RTA_SRC: u16 = 2;
 const RTA_IIF: u16 = 3;
@@ -861,8 +872,11 @@ impl NetlinkSocket {
                 // `rtnl_bridge_getlink` has no bridge port to show.
                 (RTM_GETLINK, AF_BRIDGE) => bridge_dump_check(payload, strict).map(|()| Vec::new()),
                 // `inet6_dump_ifinfo`: each device with IPv6, as IPv6 shows it.
-                (RTM_GETLINK, AF_INET6) => inet6_link_dump_check(payload, strict)
+                (RTM_GETLINK, AF_INET6) => bare_link_dump_check(payload, strict)
                     .map(|()| vec![inet6_link_message(network, seq, port, NLM_F_MULTI)]),
+                // `ipmr_rtm_dumplink`: each IPv4 multicast routing table.
+                (RTM_GETLINK, RTNL_FAMILY_IPMR) => bare_link_dump_check(payload, strict)
+                    .map(|()| vec![ipmr_link_message(seq, port)]),
                 (RTM_GETLINK, _) => link_dump(network, payload, seq, port, strict),
                 // `rtnl_dump_all` dumps each family's: IPv4's, then IPv6's.
                 (RTM_GETADDR, _) => {
@@ -1417,9 +1431,10 @@ fn bridge_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
     }
     Ok(())
 }
-/// Strictly, an AF_INET6 link dump (`inet6_valid_dump_ifinfo`) takes an
-/// `ifinfomsg` alone, with no type, flags, change mask or index (`EINVAL`).
-fn inet6_link_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
+/// Strictly, an AF_INET6 link dump (`inet6_valid_dump_ifinfo`) and an
+/// `RTNL_FAMILY_IPMR` one (`ipmr_valid_dumplink`) take an `ifinfomsg`
+/// alone, with no type, flags, change mask or index (`EINVAL`).
+fn bare_link_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
     // `nlmsg_attrlen`: nothing may follow the header.
     if strict && payload.len() > 16 {
         return Err(Errno::EINVAL);
@@ -1871,6 +1886,35 @@ fn inet6_link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec
     attribute(&mut body, IFLA_OPERSTATE, &[operstate]);
     attribute(&mut body, IFLA_PROTINFO, &inet6_settings(up, true));
     message(RTM_NEWLINK, flags, seq, port, &body)
+}
+/// `RTM_NEWLINK` for the IPv4 multicast routing table in an
+/// `RTNL_FAMILY_IPMR` link dump, as `ipmr_rtm_dumplink` gives it: an
+/// `ifinfomsg` with nothing but the family, then, in an `IFLA_AF_SPEC` that
+/// is not marked nested, what `ipmr_fill_table` tells of the table a
+/// namespace starts with, `RT_TABLE_DEFAULT`, which no socket has set up
+/// (no register VIF, assert, PIM or whole-packet `WRVIFWHOLE`, and nothing
+/// waiting to be resolved), and its VIFs, of which it has none.
+fn ipmr_link_message(seq: u32, port: u32) -> Vec<u8> {
+    let mut body = vec![RTNL_FAMILY_IPMR];
+    body.resize(16, 0);
+    let mut table = Vec::new();
+    attribute(&mut table, IPMRA_TABLE_ID, &RT_TABLE_DEFAULT.to_le_bytes());
+    attribute(
+        &mut table,
+        IPMRA_TABLE_CACHE_RES_QUEUE_LEN,
+        &0u32.to_le_bytes(),
+    );
+    attribute(
+        &mut table,
+        IPMRA_TABLE_MROUTE_REG_VIF_NUM,
+        &(-1i32).to_le_bytes(),
+    );
+    attribute(&mut table, IPMRA_TABLE_MROUTE_DO_ASSERT, &[0]);
+    attribute(&mut table, IPMRA_TABLE_MROUTE_DO_PIM, &[0]);
+    attribute(&mut table, IPMRA_TABLE_MROUTE_DO_WRVIFWHOLE, &[0]);
+    attribute(&mut table, IPMRA_TABLE_VIFS, &[]);
+    attribute(&mut body, IFLA_AF_SPEC, &table);
+    message(RTM_NEWLINK, NLM_F_MULTI, seq, port, &body)
 }
 /// The `IFLA_EXT_MASK` of a link request, past its `ifinfomsg`: 0 for
 /// none, or for a dump that sends only a family byte.
@@ -3070,6 +3114,63 @@ mod tests {
     }
 
     #[test]
+    fn an_ipmr_link_dump_shows_the_default_table() {
+        let link = ipmr_link_message(4, 7);
+        let header = Header::read(&link);
+        assert_eq!(
+            (header.len as usize, header.kind, header.flags, header.seq),
+            (88, RTM_NEWLINK, NLM_F_MULTI, 4)
+        );
+        assert_eq!(
+            &link[16..32],
+            &[
+                RTNL_FAMILY_IPMR,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ]
+        );
+        // `nla_nest_start_noflag`: IFLA_AF_SPEC without NLA_F_NESTED.
+        assert_eq!(&link[32..36], &[56, 0, IFLA_AF_SPEC as u8, 0]);
+        let table = attributes(&link[36..]);
+        assert_eq!(
+            table,
+            [
+                (IPMRA_TABLE_ID, &253u32.to_le_bytes()[..]),
+                (IPMRA_TABLE_CACHE_RES_QUEUE_LEN, &[0; 4][..]),
+                (IPMRA_TABLE_MROUTE_REG_VIF_NUM, &[0xff; 4][..]),
+                (IPMRA_TABLE_MROUTE_DO_ASSERT, &[0][..]),
+                (IPMRA_TABLE_MROUTE_DO_PIM, &[0][..]),
+                (IPMRA_TABLE_MROUTE_DO_WRVIFWHOLE, &[0][..]),
+                (IPMRA_TABLE_VIFS, &[][..]),
+            ]
+        );
+        // Strictly an ifinfomsg alone, as ipmr_valid_dumplink takes it.
+        let bare = ifinfo(RTNL_FAMILY_IPMR, 0, &[]);
+        assert_eq!(bare_link_dump_check(&bare, true), Ok(()));
+        let index = ifinfo(RTNL_FAMILY_IPMR, 1, &[]);
+        assert_eq!(bare_link_dump_check(&index, true), Err(Errno::EINVAL));
+        assert_eq!(bare_link_dump_check(&index, false), Ok(()));
+        assert_eq!(
+            bare_link_dump_check(&[RTNL_FAMILY_IPMR], true),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(bare_link_dump_check(&[RTNL_FAMILY_IPMR], false), Ok(()));
+    }
+
+    #[test]
     fn routes_follow_the_loopback_and_its_address() {
         let network = Network::isolated(crate::users::first());
         // None before the loopback has been up.
@@ -3263,14 +3364,14 @@ mod tests {
         assert_eq!(dump(&short, false), Ok(plain));
         // The other link dumps.
         assert_eq!(
-            inet6_link_dump_check(&ifinfo(AF_INET6, 0, &[]), true),
+            bare_link_dump_check(&ifinfo(AF_INET6, 0, &[]), true),
             Ok(())
         );
         let six = ifinfo(AF_INET6, 0, &[(IFLA_EXT_MASK, &skip)]);
-        assert_eq!(inet6_link_dump_check(&six, true), Err(Errno::EINVAL));
-        assert_eq!(inet6_link_dump_check(&six, false), Ok(()));
+        assert_eq!(bare_link_dump_check(&six, true), Err(Errno::EINVAL));
+        assert_eq!(bare_link_dump_check(&six, false), Ok(()));
         assert_eq!(
-            inet6_link_dump_check(&ifinfo(AF_INET6, 1, &[]), true),
+            bare_link_dump_check(&ifinfo(AF_INET6, 1, &[]), true),
             Err(Errno::EINVAL)
         );
         let bridge = ifinfo(AF_BRIDGE, 0, &[(IFLA_EXT_MASK, &skip)]);

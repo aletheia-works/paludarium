@@ -850,6 +850,10 @@ static int case_packet(void) {
     write(m, "\021", 1);
     show_drained("typed start", m, 1);
     write(m, "ab\003", 3);
+    /* Linux's line discipline takes the input in a worker, and sets ^C's
+       TIOCPKT_FLUSHWRITE and TIOCPKT_FLUSHREAD one after the other, waking
+       the master each time: let it finish, so they are read as one. */
+    usleep(100000);
     show_drained("interrupt", m, 1);
     /* A one-byte read of data gives the 0 byte alone. */
     write(s, "xy", 2);

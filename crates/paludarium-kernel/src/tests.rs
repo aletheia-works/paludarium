@@ -1669,6 +1669,109 @@ fn an_xattr_list_longer_than_linux_copies_is_too_big() {
 }
 
 #[test]
+fn xattrat_calls_take_a_directory_flags_and_struct_xattr_args() {
+    let mut f = fixture();
+    let (dir, file, name, value, args, out) = (
+        DATA + 0x100,
+        DATA + 0x140,
+        DATA + 0x180,
+        DATA + 0x1c0,
+        DATA + 0x200,
+        DATA + 0x800,
+    );
+    let (einval, ebadf, e2big) = (errno(Errno::EINVAL), errno(Errno::EBADF), errno(Errno(7)));
+    let (efault, erange) = (errno(Errno::EFAULT), errno(Errno(34)));
+    f.mem.write(GuestAddr(dir), b"/\0").unwrap();
+    f.mem.write(GuestAddr(file), b"xattrat-file\0").unwrap();
+    f.mem.write(GuestAddr(name), b"user.k\0").unwrap();
+    f.mem.write(GuestAddr(value), b"abc").unwrap();
+    let set_args = |f: &mut Fixture, value: u64, size: u32, flags: u32| {
+        f.mem.write_u64(GuestAddr(args), value).unwrap();
+        f.mem
+            .write(GuestAddr(args + 8), &size.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(args + 12), &flags.to_le_bytes())
+            .unwrap();
+    };
+    let root = f.ret(2, &[dir, 0o200000, 0]);
+    let path_fd = f.ret(2, &[dir, 0o10000000, 0]);
+    let fd = f.ret(257, &[root, file, 0o102, 0o644]);
+    assert!(fd < 1024, "{fd}");
+
+    // setxattrat from a directory descriptor, and getxattrat back.
+    set_args(&mut f, value, 3, 0);
+    assert_eq!(f.ret(463, &[root, file, 0, name, args, 16]), 0);
+    set_args(&mut f, out, 16, 0);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 16]), 3);
+    let mut got = [0; 3];
+    f.mem.read(GuestAddr(out), &mut got).unwrap();
+    assert_eq!(&got, b"abc");
+    // A larger struct is fine if what it adds is zero.
+    f.mem.write_u64(GuestAddr(args + 16), 0).unwrap();
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 24]), 3);
+    f.mem.write_u64(GuestAddr(args + 16), 1).unwrap();
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 24]), e2big);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 15]), einval);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 4097]), e2big);
+    assert_eq!(f.ret(464, &[root, file, 0, name, 0, 16]), efault);
+    // getxattrat takes no flags; neither call takes other at_flags.
+    set_args(&mut f, out, 16, 1);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 16]), einval);
+    set_args(&mut f, value, 3, 4);
+    assert_eq!(f.ret(463, &[root, file, 0, name, args, 16]), einval);
+    set_args(&mut f, out, 16, 0);
+    assert_eq!(f.ret(464, &[root, file, 0x400, name, args, 16]), einval);
+    assert_eq!(f.ret(465, &[root, file, 0x400, 0, 0]), einval);
+    assert_eq!(f.ret(466, &[root, file, 0x400, name]), einval);
+    // A size of 0 asks for the length only.
+    set_args(&mut f, out, 0, 0);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 16]), 3);
+    set_args(&mut f, out, 2, 0);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 16]), erange);
+
+    // AT_EMPTY_PATH: a null or empty path is the descriptor's file.
+    set_args(&mut f, out, 16, 0);
+    assert_eq!(f.ret(464, &[fd, 0, 0x1000, name, args, 16]), 3);
+    f.mem.write(GuestAddr(DATA + 0x300), b"\0").unwrap();
+    assert_eq!(f.ret(465, &[fd, DATA + 0x300, 0x1000, out, 64]), 7);
+    // Without it, an empty path is ENOENT.
+    assert_eq!(
+        f.ret(465, &[fd, DATA + 0x300, 0, out, 64]),
+        errno(Errno::ENOENT)
+    );
+    // An O_PATH descriptor names no file this way, but walks from one do.
+    assert_eq!(f.ret(465, &[path_fd, 0, 0x1000, out, 64]), ebadf);
+    assert_eq!(f.ret(465, &[path_fd, file, 0, out, 64]), 7);
+    // AT_FDCWD with an empty path: the working directory for set and get,
+    // EBADF for list and remove.
+    assert_eq!(
+        f.ret(464, &[(-100i64) as u64, 0, 0x1000, name, args, 16]),
+        errno(Errno(61))
+    );
+    assert_eq!(f.ret(465, &[(-100i64) as u64, 0, 0x1000, out, 64]), ebadf);
+    assert_eq!(f.ret(466, &[(-100i64) as u64, 0, 0x1000, name]), ebadf);
+    assert_eq!(
+        f.ret(464, &[(-1i64) as u64, 0, 0x1000, name, args, 16]),
+        ebadf
+    );
+
+    // The name is read before the file is found.
+    f.mem.write(GuestAddr(DATA + 0x340), b"\0").unwrap();
+    assert_eq!(
+        f.ret(466, &[(-1i64) as u64, 0, 0x1000, DATA + 0x340]),
+        erange
+    );
+    assert_eq!(f.ret(193, &[999, DATA + 0x340, 0, 0]), erange);
+    assert_eq!(f.ret(199, &[999, name]), ebadf);
+
+    // removexattrat, then it is gone.
+    assert_eq!(f.ret(466, &[root, file, 0, name]), 0);
+    assert_eq!(f.ret(466, &[root, file, 0, name]), errno(Errno(61)));
+    assert_eq!(f.ret(465, &[root, file, 0, out, 64]), 0);
+}
+
+#[test]
 fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
     let mut f = fixture();
     let (vec, page) = (DATA + 0x800, 4096);

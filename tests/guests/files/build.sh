@@ -4,7 +4,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:-$here/../../../target/guests/files}"
 mkdir -p "$out"
 # 60 and 61 are arguments.c's, below.
-for id in {0..59} 62 63 64 65 66 67 68 74; do
+for id in {0..59} 62 63 64 65 66 67 68 74 76; do
   musl-gcc -static -O1 -nostdlib -mgeneral-regs-only -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables -fcf-protection=none -mno-red-zone -fno-pie -no-pie -DCASE="$id" -o "$out/files-$id" "$here/files.c"
 done
 # 69 to 73 and 75 are splice.c's: splice, tee and vmsplice, and (73, 75) a

@@ -718,6 +718,82 @@ void _start(void) {
   ts[2]=2000;results[x++]=call(280,-100,(long)fdpath(fd),(long)ts,0,0,0);S(5,fd,st,0);results[x++]=MTIME();
   results[x++]=S(21,fdpath(fd),4,0);
   S(3,op,0,0);S(3,ol,0,0);S(3,dp,0,0);}
+ if(CASE==76){ /* setxattrat, getxattrat, listxattrat and removexattrat (Linux 6.13): a directory, at_flags and struct xattr_args */
+  static char d[]="/tmp/paludarium-files-xattrat",f[]="/tmp/paludarium-files-xattrat/f",base[]="f",k[]="user.k",empty[]="";
+  static unsigned long xa[4];
+  #define XA(v,size,flags) (xa[0]=(unsigned long)(v),xa[1]=(unsigned long)(size)|(unsigned long)(flags)<<32,(long)xa)
+  S(87,f,0,0);S(84,d,0,0);results[x++]=S(83,d,0755,0);
+  long dir=S(2,d,0200000,0),path=S(2,d,010000000,0);
+  long fd=call(257,dir,(long)base,0102,0644,0,0);results[x++]=fd>=0;
+  /* From a directory descriptor, and back. */
+  results[x++]=call(463,dir,(long)base,0,(long)k,XA("abc",3,0),16);
+  results[x++]=call(464,dir,(long)base,0,(long)k,XA(buf,16,0),16);results[x++]=buf[0];results[x++]=buf[2];
+  results[x++]=call(464,dir,(long)base,0,(long)k,XA(buf,0,0),16);
+  results[x++]=call(464,dir,(long)base,0,(long)k,XA(buf,2,0),16);
+  /* XATTR_CREATE and XATTR_REPLACE, and an unknown flag. */
+  results[x++]=call(463,dir,(long)base,0,(long)k,XA("x",1,1),16);
+  results[x++]=call(463,dir,(long)base,0,(long)"user.n",XA("x",1,2),16);
+  results[x++]=call(463,dir,(long)base,0,(long)k,XA("x",1,4),16);
+  /* struct xattr_args: too small, a page and more, longer with zeros, or not. */
+  XA(buf,16,0);xa[2]=0;xa[3]=0;
+  results[x++]=call(464,dir,(long)base,0,(long)k,(long)xa,32);
+  xa[3]=1;results[x++]=call(464,dir,(long)base,0,(long)k,(long)xa,32);
+  results[x++]=call(464,dir,(long)base,0,(long)k,XA(buf,16,0),15);
+  results[x++]=call(464,dir,(long)base,0,(long)k,XA(buf,16,0),4097);
+  results[x++]=call(464,dir,(long)base,0,(long)k,0,16);
+  results[x++]=call(463,dir,(long)base,0,(long)k,0,16);
+  /* getxattrat takes no flags; the four take no other at_flags. */
+  results[x++]=call(464,dir,(long)base,0,(long)k,XA(buf,16,1),16);
+  results[x++]=call(463,dir,(long)base,0x400,(long)k,XA("x",1,0),16);
+  results[x++]=call(464,dir,(long)base,0x400,(long)k,XA(buf,16,0),16);
+  results[x++]=call(465,dir,(long)base,0x400,(long)buf,64,0);
+  results[x++]=call(466,dir,(long)base,0x400,(long)k,0,0);
+  /* Of flags and args, the struct is first; of a name and a file, the name. */
+  results[x++]=call(463,dir,(long)base,0x400,(long)k,XA("x",1,0),4097);
+  results[x++]=call(464,-1,(long)empty,0x1000,(long)empty,XA(buf,16,0),16);
+  results[x++]=call(466,-1,(long)empty,0x1000,(long)empty,0,0);
+  results[x++]=call(193,-1,(long)empty,0,0,0,0);
+  results[x++]=call(190,-1,(long)empty,(long)"x",1,0,0);
+  results[x++]=call(199,-1,(long)empty,0,0,0,0);
+  /* AT_EMPTY_PATH: a null or empty path is the descriptor's file. */
+  results[x++]=call(464,fd,0,0x1000,(long)k,XA(buf,16,0),16);
+  results[x++]=call(465,fd,(long)empty,0x1000,(long)buf,64,0);
+  results[x++]=call(463,fd,(long)empty,0x1000,(long)"user.f",XA("ff",2,0),16);
+  results[x++]=call(466,fd,0,0x1000,(long)"user.f",0,0);
+  /* Without it, an empty path is ENOENT, and a null one EFAULT. */
+  results[x++]=call(465,fd,(long)empty,0,(long)buf,64,0);
+  results[x++]=call(465,fd,0,0,(long)buf,64,0);
+  /* An O_PATH descriptor holds no file for them, but a walk from it goes. */
+  results[x++]=call(465,path,0,0x1000,(long)buf,64,0);
+  results[x++]=call(464,path,0,0x1000,(long)k,XA(buf,16,0),16);
+  results[x++]=call(465,path,(long)base,0,(long)buf,64,0);
+  results[x++]=call(465,-1,(long)base,0,(long)buf,64,0);
+  results[x++]=call(465,-100,(long)f,0,(long)buf,64,0);
+  /* AT_FDCWD and an empty path: the working directory for set and get, no
+     descriptor for list and remove; another negative descriptor is none. */
+  S(80,d,0,0);
+  results[x++]=call(463,-100,0,0x1000,(long)k,XA("dd",2,0),16);
+  results[x++]=call(464,-100,(long)empty,0x1000,(long)k,XA(buf,16,0),16);results[x++]=buf[1];
+  results[x++]=call(191,(long)d,(long)k,0,0,0,0);
+  results[x++]=call(465,-100,0,0x1000,(long)buf,64,0);
+  results[x++]=call(466,-100,0,0x1000,(long)k,0,0);
+  results[x++]=call(464,-1,0,0x1000,(long)k,XA(buf,16,0),16);
+  /* A relative path goes from the working directory. */
+  results[x++]=call(464,-100,(long)base,0,(long)k,XA(buf,16,0),16);
+  /* A symbolic link: user.* is for files and directories. */
+  S(88,base,"link",0);
+  results[x++]=call(464,dir,(long)"link",0,(long)k,XA(buf,16,0),16);
+  results[x++]=call(464,dir,(long)"link",0x100,(long)k,XA(buf,16,0),16);
+  results[x++]=call(463,dir,(long)"link",0x100,(long)k,XA("x",1,0),16);
+  results[x++]=call(465,dir,(long)"link",0x100,(long)buf,64,0);
+  results[x++]=call(466,dir,(long)"link",0x100,(long)k,0,0);
+  S(87,"link",0,0);S(80,"/tmp",0,0);
+  /* removexattrat, then it is gone. */
+  results[x++]=call(466,dir,(long)base,0,(long)k,0,0);
+  results[x++]=call(466,dir,(long)base,0,(long)k,0,0);
+  results[x++]=call(465,dir,(long)base,0,(long)buf,64,0);
+  #undef XA
+  S(3,fd,0,0);S(3,dir,0,0);S(3,path,0,0);S(87,f,0,0);S(84,d,0,0);}
  if(CASE==65){ /* extended attributes through a link in /proc/self/fd */
   long op=S(2,p,010000000,0);
   results[x++]=call(188,(long)fdpath(op),(long)"user.k",(long)"v",1,0,0);

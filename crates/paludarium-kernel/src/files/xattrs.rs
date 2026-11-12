@@ -1,12 +1,12 @@
 //! Extended attributes, as Linux's `fs/xattr.c` handles them. They are kept
 //! with a file in memory; what holds no attributes, as a mounted host
 //! directory, behaves as a file system without them.
-use super::{Followed, O_PATH, generated_stat, looked_up, output};
+use super::{Followed, O_PATH, copy_struct, generated_stat, lookup, output, path};
 use crate::credentials::Credentials;
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat, Xattrs};
 use paludarium_types::{Errno, GuestAddr};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 const E2BIG: Errno = Errno(7);
 const ERANGE: Errno = Errno(34);
@@ -19,6 +19,12 @@ const XATTR_LIST_MAX: u64 = 65536;
 const NAMESPACES: [&[u8]; 3] = [b"user.", b"trusted.", b"security."];
 const MAY_READ: u32 = 4;
 const MAY_WRITE: u32 = 2;
+const AT_FDCWD: i32 = -100;
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_EMPTY_PATH: u64 = 0x1000;
+/// The size of `struct xattr_args` (`value`, `size`, `flags`) in its first
+/// version, `XATTR_ARGS_SIZE_VER0`.
+const XATTR_ARGS_SIZE_VER0: u64 = 16;
 
 /// What a call works on, found before its name and value are looked at.
 enum Target {
@@ -36,7 +42,11 @@ enum Target {
 }
 impl Target {
     fn at_path(c: &Context<'_>, ptr: u64, follow: bool) -> Result<Self, Errno> {
-        let (path, found) = looked_up(c, (-100i32) as u64, ptr, follow)?;
+        Self::at_name(c, AT_FDCWD as u64, path(c, ptr)?, follow)
+    }
+    /// What the path `raw` names from directory `dir`.
+    fn at_name(c: &Context<'_>, dir: u64, raw: Vec<u8>, follow: bool) -> Result<Self, Errno> {
+        let (path, found) = lookup(c, dir, raw, follow)?;
         // A link in `/proc/self/fd` leads to the descriptor's file, whatever
         // its access, as an `O_PATH` one has none.
         match super::followed(c, &path, follow)? {
@@ -48,6 +58,37 @@ impl Target {
             None => {}
         }
         Self::found(c, path, follow, found.file)
+    }
+    /// What the `*xattrat` calls work on, as Linux's `path_*xattrat` finds
+    /// it: the path at `ptr` from `dir`, the last symbolic link itself with
+    /// `AT_SYMLINK_NOFOLLOW`. With `AT_EMPTY_PATH`, a null or empty path
+    /// (`getname_maybe_null`) is descriptor `dir`'s file (EBADF if it has
+    /// none, or only `O_PATH`). Only `setxattrat` and `getxattrat` take a
+    /// negative `dir` as a directory to walk no further from: the working
+    /// directory for `AT_FDCWD`, and EBADF for any other.
+    fn at(c: &Context<'_>, [dir, ptr, flags]: [u64; 3], walks: bool) -> Result<Self, Errno> {
+        let raw = if flags & AT_EMPTY_PATH == 0 {
+            Some(path(c, ptr)?)
+        } else if ptr == 0 {
+            None
+        } else {
+            Some(path(c, ptr)?).filter(|raw| !raw.is_empty())
+        };
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        match raw {
+            Some(raw) => Self::at_name(c, dir, raw, follow),
+            None if !walks || dir as i64 >= 0 => Self::at_descriptor(c, dir),
+            None if dir as i64 == i64::from(AT_FDCWD) => {
+                let cwd = c
+                    .files
+                    .cwd
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                Self::found(c, cwd, follow, None)
+            }
+            None => Err(Errno::EBADF),
+        }
     }
     /// The file at `path`, of which a walk to it may have given the status.
     fn found(
@@ -150,8 +191,14 @@ fn permitted(creds: &Credentials, stat: &FileStat, name: &[u8], write: bool) -> 
     Ok(())
 }
 
-fn get(c: &Context<'_>, target: &Target, ptr: u64, addr: u64, size: u64) -> Result<u64, Errno> {
+/// `getxattr`: the name, then the file (as since Linux 6.13), then the value.
+fn get(
+    c: &Context<'_>,
+    target: impl FnOnce(&Context<'_>) -> Result<Target, Errno>,
+    [ptr, addr, size]: [u64; 3],
+) -> Result<u64, Errno> {
     let name = name(c, ptr)?;
+    let target = target(c)?;
     permitted(&c.process.credentials, target.stat(), &name, false)?;
     namespace(&name)?;
     let value = target
@@ -233,8 +280,14 @@ fn set(
     result
 }
 
-fn remove(c: &Context<'_>, target: &Target, ptr: u64) -> Result<u64, Errno> {
+/// `removexattr`: the name, then the file (as since Linux 6.13).
+fn remove(
+    c: &Context<'_>,
+    target: impl FnOnce(&Context<'_>) -> Result<Target, Errno>,
+    ptr: u64,
+) -> Result<u64, Errno> {
     let name = name(c, ptr)?;
+    let target = target(c)?;
     permitted(&c.process.credentials, target.stat(), &name, true)?;
     namespace(&name)?;
     let mut result = Err(ENODATA);
@@ -247,23 +300,73 @@ fn remove(c: &Context<'_>, target: &Target, ptr: u64) -> Result<u64, Errno> {
     result
 }
 
-/// The calls, with `n` from 188 to 199.
+/// `struct xattr_args` at `addr` of `size` bytes: its `value`, `size` and
+/// `flags`.
+fn args(c: &Context<'_>, addr: u64, size: u64) -> Result<[u64; 3], Errno> {
+    let args = copy_struct(c, addr, size, XATTR_ARGS_SIZE_VER0)?;
+    let field = |at: usize, width: usize| {
+        let mut bytes = [0; 8];
+        bytes[..width].copy_from_slice(&args[at..at + width]);
+        u64::from_le_bytes(bytes)
+    };
+    Ok([field(0, 8), field(8, 4), field(12, 4)])
+}
+
+/// `at_flags` of the `*xattrat` calls: only these two, or `EINVAL`.
+fn at_flags(flags: u64) -> Result<(), Errno> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// The calls, with `n` from 188 to 199 (which, as since Linux 6.13, read a
+/// name before they find the file), and `setxattrat` (463),
+/// `getxattrat` (464), `listxattrat` (465) and `removexattrat` (466) of
+/// Linux 6.13.
 pub(super) fn call(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
+    let at = [a[0], a[1], a[2]];
     match n {
         188 | 189 => set(
             c,
             |c| Target::at_path(c, a[0], n == 188),
             [a[1], a[2], a[3], a[4]],
         ),
-        190 => {
-            let target = Target::at_descriptor(c, a[0])?;
-            set(c, |_| Ok(target), [a[1], a[2], a[3], a[4]])
-        }
-        191 | 192 => get(c, &Target::at_path(c, a[0], n == 191)?, a[1], a[2], a[3]),
-        193 => get(c, &Target::at_descriptor(c, a[0])?, a[1], a[2], a[3]),
+        190 => set(
+            c,
+            |c| Target::at_descriptor(c, a[0]),
+            [a[1], a[2], a[3], a[4]],
+        ),
+        191 | 192 => get(
+            c,
+            |c| Target::at_path(c, a[0], n == 191),
+            [a[1], a[2], a[3]],
+        ),
+        193 => get(c, |c| Target::at_descriptor(c, a[0]), [a[1], a[2], a[3]]),
         194 | 195 => list(c, &Target::at_path(c, a[0], n == 194)?, a[1], a[2]),
         196 => list(c, &Target::at_descriptor(c, a[0])?, a[1], a[2]),
-        197 | 198 => remove(c, &Target::at_path(c, a[0], n == 197)?, a[1]),
-        _ => remove(c, &Target::at_descriptor(c, a[0])?, a[1]),
+        197 | 198 => remove(c, |c| Target::at_path(c, a[0], n == 197), a[1]),
+        199 => remove(c, |c| Target::at_descriptor(c, a[0]), a[1]),
+        463 => {
+            let [value, size, flags] = args(c, a[4], a[5])?;
+            at_flags(a[2])?;
+            set(c, |c| Target::at(c, at, true), [a[3], value, size, flags])
+        }
+        464 => {
+            let [value, size, flags] = args(c, a[4], a[5])?;
+            if flags != 0 {
+                return Err(Errno::EINVAL);
+            }
+            at_flags(a[2])?;
+            get(c, |c| Target::at(c, at, true), [a[3], value, size])
+        }
+        465 => {
+            at_flags(a[2])?;
+            list(c, &Target::at(c, at, false)?, a[3], a[4])
+        }
+        _ => {
+            at_flags(a[2])?;
+            remove(c, |c| Target::at(c, at, false), a[3])
+        }
     }
 }

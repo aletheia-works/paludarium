@@ -309,6 +309,10 @@ NAMES = {
     454: "futex_wake",
     455: "futex_wait",
     456: "futex_requeue",
+    463: "setxattrat",
+    464: "getxattrat",
+    465: "listxattrat",
+    466: "removexattrat",
 }
 
 

@@ -199,8 +199,8 @@ verified.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
   - `pwritev2`'s `RWF_NOAPPEND` cannot turn an `O_APPEND` file's append off
-    here, so it gives `EOPNOTSUPP` for such a file, where Linux writes at the
-    offset. `RWF_NOWAIT` behaves as on ext4 for every regular file: a read
+    on a Windows host, which gives `EOPNOTSUPP` for such a file there.
+    `RWF_NOWAIT` behaves as on ext4 for every regular file: a read
     takes it, a write gives `EOPNOTSUPP`, where tmpfs refuses both and other
     filesystems may take a write, and a read never finds its pages uncached
     (Linux's `EAGAIN`). `RWF_DONTCACHE` too is taken for every regular file

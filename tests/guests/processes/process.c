@@ -6031,6 +6031,27 @@ static int vector_flags_case(void) {
     memset(got, 0, sizeof got);
     r = pread(fd, got, sizeof got, 0);
     printf("contents=%.*s noappend=%ld\n", (int)(r > 0 ? r : 0), got, vf_pwritev2(fd, "n", 1, 0, 0x20));
+    /* RWF_NOAPPEND writes an O_APPEND file at the offset, or at its
+     * position, which then moves; without it, it appends. */
+    char again[32];
+    snprintf(again, sizeof again, "/proc/self/fd/%d", fd);
+    int app = open(again, O_RDWR | O_APPEND);
+    if (app < 0 || ftruncate(app, 0) || write(app, "abcdef", 6) != 6) return 85;
+    long na_at = vf_pwritev2(app, "XY", 2, 1, 0x20);
+    long na_pos = (long)lseek(app, 0, SEEK_CUR);
+    long na_past = vf_pwritev2(app, "Z", 1, 8, 0x20);
+    lseek(app, 2, SEEK_SET);
+    long na_here = vf_pwritev2(app, "MN", 2, -1, 0x20);
+    long na_moved = (long)lseek(app, 0, SEEK_CUR);
+    long plain_at = vf_pwritev2(app, "!", 1, 0, 0);
+    long na_read = vf_preadv2(app, got, 2, 0, 0x20);
+    char all[16] = {0};
+    r = pread(app, all, sizeof all - 1, 0);
+    for (long i = 0; i < r; i++)
+        if (!all[i]) all[i] = '.';
+    printf("noappend at=%ld pos=%ld past=%ld here=%ld moved=%ld plain=%ld read=%ld contents=%.*s\n",
+           na_at, na_pos, na_past, na_here, na_moved, plain_at, na_read, (int)(r > 0 ? r : 0), all);
+    close(app);
     close(fd);
     /* A pipe reads at the position only, and does not wait with NOWAIT. */
     int p[2];

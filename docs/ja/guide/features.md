@@ -83,6 +83,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   tmpfs のようなメモリ上のファイルシステムのもの）、カーネルが作るファイル（`/proc`）は
   `EOPNOTSUPP` です。`RWF_NOSIGNAL` は、Linux 6.18 からと同じく、読む側のない
   パイプやソケットへの書き込みで `SIGPIPE` を送りません（`EPIPE` は返します）。
+  `RWF_NOAPPEND` は、その呼び出しのあいだ `O_APPEND` の追記を止めます。書き込みは指定した
+  位置へ行き（末尾より先ならファイルを伸ばします）、-1 ならファイルの位置へ行って位置が進みます。
+  追記専用のファイル（`FS_APPEND_FL`）は、読み込みでも `EPERM` です。
   `RWF_APPEND` は通常のファイルの末尾に書き、`RWF_DSYNC` と
   `RWF_SYNC` は `fdatasync` と同じく書き出し、`RWF_HIPRI` は何も変えません。
 - `copy_file_range` は、同じマウントにある 2 つの通常のファイルの間でコピーし（マウントを

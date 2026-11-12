@@ -223,6 +223,10 @@ impl FileHandle for Memfd {
         let count = self.writable(start, buf.len())?;
         self.file.write_at(offset, &buf[..count])
     }
+    fn write_at_unappended(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
+        let count = self.writable(offset, buf.len())?;
+        self.file.write_at_unappended(offset, &buf[..count])
+    }
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
         self.file.allocate(offset, len)
     }

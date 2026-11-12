@@ -794,7 +794,7 @@ fn transfer(
                 || c.process.credentials.may_administer(),
         )?;
     }
-    let flags = crate::files::kiocb_rw_flags(file, iocb.rw_flags, write)?;
+    let flags = crate::files::kiocb_rw_flags(file, iocb.rw_flags)?;
     if file.flags() & 3 == if write { 0 } else { 1 } {
         return Err(Errno::EBADF);
     }

@@ -4306,14 +4306,50 @@ mod vectored_flags {
         f.mem.write_u64(GuestAddr(DATA + 0x200), u64::MAX).unwrap();
         f.mem.write_u64(GuestAddr(DATA + 0x208), u64::MAX).unwrap();
         assert_eq!(f.ret(160, &[1, DATA + 0x200]), 0);
-        // NOAPPEND changes nothing for a file without O_APPEND, and cannot
-        // turn an O_APPEND file's off here.
+        // NOAPPEND changes nothing for a file without O_APPEND.
         assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x20]), 2);
-        let appending = f.ret(2, &[DATA, 0o2002, 0]);
+    }
+    #[test]
+    fn noappend_writes_an_appending_file_at_the_offset_or_its_position() {
+        let mut f = fixture();
+        let (iov, buf) = (DATA + 0x300, DATA + 0x400);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        f.mem.write(GuestAddr(buf), b"abcdef").unwrap();
+        let fd = f.ret(2, &[DATA, 0o2102, 0o600]);
+        assert_eq!(f.ret(1, &[fd, buf, 6]), 6);
+        f.mem.write(GuestAddr(buf), b"XY").unwrap();
+        iovec(&f, iov, buf, 2);
+        // At an offset: there, and the position stays.
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 1, 0, 0x20]), 2);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 6);
+        assert_eq!(contents(&mut f, fd), b"aXYdef");
+        // Past the end: the file grows to it.
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 8, 0, 0x20]), 2);
+        assert_eq!(contents(&mut f, fd), b"aXYdef\0\0XY");
+        // At the position, which moves past it.
+        assert_eq!(f.ret(8, &[fd, 2, 0]), 2);
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, HERE, 0, 0x20]), 2);
+        assert_eq!(f.ret(8, &[fd, 0, 1]), 4);
+        assert_eq!(contents(&mut f, fd), b"aXXYef\0\0XY");
+        // Without it, O_APPEND appends wherever asked.
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0]), 2);
+        assert_eq!(contents(&mut f, fd), b"aXXYef\0\0XYXY");
+        // A read takes it too.
+        assert_eq!(f.ret(PREADV2, &[fd, iov, 1, 0, 0, 0x20]), 2);
+        // An append-only file always appends: EPERM, for a read too.
+        f.mem
+            .write(GuestAddr(DATA + 0x500), &0x20u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(16, &[fd, 0x4008_6602, DATA + 0x500]), 0);
         assert_eq!(
-            f.ret(PWRITEV2, &[appending, iov, 1, 0, 0, 0x20]),
-            errno(Errno::EOPNOTSUPP)
+            f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x20]),
+            errno(Errno::EPERM)
         );
+        assert_eq!(
+            f.ret(PREADV2, &[fd, iov, 1, 0, 0, 0x20]),
+            errno(Errno::EPERM)
+        );
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0]), 2);
     }
     #[test]
     fn nowait_needs_a_file_that_has_it_and_does_not_wait() {

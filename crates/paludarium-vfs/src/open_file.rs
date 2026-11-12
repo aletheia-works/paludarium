@@ -83,28 +83,10 @@ impl FileHandle for MemFile {
         Ok(contents.read(offset, b))
     }
     fn write_at(&self, offset: u64, b: &[u8]) -> Result<usize, Errno> {
-        let s = lock(&self.state);
-        if s.1 & 3 == 0 {
-            return Err(Errno::EBADF);
-        }
-        let mut n = lock(&self.node);
-        let modified = (n.clock)()?;
-        let Kind::File(contents) = &mut n.kind else {
-            return Err(Errno::EISDIR);
-        };
-        let pos = if s.1 & 1024 != 0 {
-            contents.len()
-        } else {
-            offset
-        };
-        pos.checked_add(b.len() as u64)
-            .filter(|&end| end <= i64::MAX as u64)
-            .ok_or(Errno::EINVAL)?;
-        contents.write(pos, b);
-        if !b.is_empty() {
-            n.mtime_ns = i128::from(modified);
-        }
-        Ok(b.len())
+        self.write_at_maybe_appending(offset, b, true)
+    }
+    fn write_at_unappended(&self, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+        self.write_at_maybe_appending(offset, b, false)
     }
     fn write(&self, b: &[u8]) -> Result<usize, Errno> {
         let mut s = lock(&self.state);
@@ -260,5 +242,38 @@ impl FileHandle for MemFile {
     /// Memory needs no synchronising; files and directories both succeed.
     fn sync(&self) -> Result<(), Errno> {
         Ok(())
+    }
+}
+impl MemFile {
+    /// A positioned write, at the end of an `O_APPEND` file when it
+    /// `appends`.
+    fn write_at_maybe_appending(
+        &self,
+        offset: u64,
+        b: &[u8],
+        appends: bool,
+    ) -> Result<usize, Errno> {
+        let s = lock(&self.state);
+        if s.1 & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        let mut n = lock(&self.node);
+        let modified = (n.clock)()?;
+        let Kind::File(contents) = &mut n.kind else {
+            return Err(Errno::EISDIR);
+        };
+        let pos = if appends && s.1 & 1024 != 0 {
+            contents.len()
+        } else {
+            offset
+        };
+        pos.checked_add(b.len() as u64)
+            .filter(|&end| end <= i64::MAX as u64)
+            .ok_or(Errno::EINVAL)?;
+        contents.write(pos, b);
+        if !b.is_empty() {
+            n.mtime_ns = i128::from(modified);
+        }
+        Ok(b.len())
     }
 }

@@ -522,6 +522,40 @@ impl FileHandle for NativeFile {
         file.seek(SeekFrom::Start(position)).map_err(err)?;
         result
     }
+    /// Under one lock, append is off for the write, as in
+    /// `write_in_place`, and the position and flags are put back; a host
+    /// that cannot turn it off refuses (`EOPNOTSUPP`).
+    fn write_at_unappended(&self, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+        if self.flags() & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(unix)]
+        let flags = rustix::fs::fcntl_getfl(&*file).map_err(|e| err(e.into()))?;
+        #[cfg(unix)]
+        let appending = flags.contains(rustix::fs::OFlags::APPEND);
+        #[cfg(unix)]
+        if appending {
+            rustix::fs::fcntl_setfl(&*file, flags - rustix::fs::OFlags::APPEND)
+                .map_err(|e| err(e.into()))?;
+        }
+        #[cfg(not(unix))]
+        if self.flags() & 1024 != 0 {
+            return Err(Errno(95));
+        }
+        let position = file.stream_position().map_err(err);
+        let result = position.and_then(|position| {
+            file.seek(SeekFrom::Start(offset)).map_err(err)?;
+            let result = file.write(b).map_err(err);
+            file.seek(SeekFrom::Start(position)).map_err(err)?;
+            result
+        });
+        #[cfg(unix)]
+        if appending {
+            rustix::fs::fcntl_setfl(&*file, flags).map_err(|e| err(e.into()))?;
+        }
+        result
+    }
     fn write(&self, b: &[u8]) -> Result<usize, Errno> {
         if self.flags() & 3 == 0 {
             return Err(Errno::EBADF);
@@ -1453,6 +1487,23 @@ mod files_tests {
             x.fs().open(b"a", 1025, 0).unwrap().zero_range(0, 1),
             Err(Errno(95))
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn write_at_unappended_writes_at_the_offset_and_keeps_appending() {
+        let x = Fixture::new();
+        let f = x.fs().open(b"a", 1090, 0o600).unwrap();
+        assert_eq!(f.write(b"abc"), Ok(3));
+        assert_eq!(f.write_at_unappended(1, b"XY"), Ok(2));
+        assert_eq!(f.write_at_unappended(5, b"!"), Ok(1)); // grows the file
+        assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"aXY\0\0!");
+        assert_eq!(f.seek(0, 1), Ok(3));
+        // The handle still appends afterwards, at a position or an offset.
+        assert_eq!(f.write(b"?"), Ok(1));
+        assert_eq!(f.write_at(0, b"#"), Ok(1));
+        assert_eq!(std::fs::read(x.base.join("root/a")).unwrap(), b"aXY\0\0!?#");
+        let read_only = x.fs().open(b"a", 0, 0).unwrap();
+        assert_eq!(read_only.write_at_unappended(0, b"x"), Err(Errno::EBADF));
     }
     #[cfg(unix)]
     #[test]

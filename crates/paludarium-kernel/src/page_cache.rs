@@ -942,6 +942,13 @@ impl FileHandle for CoherentFile {
         self.write_back();
         self.inner.read_at(offset, buf)
     }
+    fn write_at_unappended(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
+        let n = self.inner.write_at_unappended(offset, buf)?;
+        if let Some(cache) = self.cache() {
+            cache.wrote(offset, &buf[..n]);
+        }
+        Ok(n)
+    }
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
         let n = self.inner.write_at(offset, buf)?;
         if let Some(cache) = self.cache() {

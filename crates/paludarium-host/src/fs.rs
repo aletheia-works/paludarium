@@ -122,6 +122,18 @@ pub trait FileHandle: Send + Sync {
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, Errno> {
         Err(Errno::ENODEV)
     }
+    /// [`Self::write_at`] with `RWF_NOAPPEND`: at `offset` even in an
+    /// `O_APPEND` file, growing it as needed, without moving the file
+    /// position. A file that does not append writes as `write_at` does; an
+    /// appending one of a kind without it gives `ENODEV`, and one whose host
+    /// cannot turn its append off `EOPNOTSUPP`.
+    fn write_at_unappended(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
+        if self.flags() & 0o2000 == 0 {
+            self.write_at(offset, buf)
+        } else {
+            Err(Errno::ENODEV)
+        }
+    }
     /// `fallocate`'s `FALLOC_FL_PUNCH_HOLE`: the bytes from `offset` to
     /// `offset + len` read as zeros afterwards, at those offsets even in an
     /// `O_APPEND` file, and the size stays; a file with holes frees the pages

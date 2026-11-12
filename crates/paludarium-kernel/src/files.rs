@@ -1540,6 +1540,34 @@ fn size_limited(
     let room = size_room(c, start)?;
     Ok(len.min(usize::try_from(room).unwrap_or(usize::MAX)))
 }
+/// [`size_limited`] for a write that starts at `start` whatever the file's
+/// `O_APPEND` (`RWF_NOAPPEND`).
+fn size_limited_from(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    start: u64,
+    len: usize,
+) -> Result<usize, Errno> {
+    if c.group.fsize() == u64::MAX || len == 0 || file.stat()?.mode & 0o170000 != 0o100000 {
+        return Ok(len);
+    }
+    let room = size_room(c, start)?;
+    Ok(len.min(usize::try_from(room).unwrap_or(usize::MAX)))
+}
+/// A positioned write with `RWF_NOAPPEND`: at `offset` even in an
+/// `O_APPEND` file ([`FileHandle::write_at_unappended`]); a kind without it
+/// writes as [`write_at`] does.
+fn write_at_unappended(file: &Arc<dyn FileHandle>, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+    match file.write_at_unappended(offset, b) {
+        Err(e) if e == Errno::ENODEV => write_at(file, offset, b),
+        result => result,
+    }
+}
+/// Whether a write with `flags` turns its file's `O_APPEND` off
+/// (`RWF_NOAPPEND`, which clears `IOCB_APPEND`).
+fn unappended(file: &Arc<dyn FileHandle>, flags: u32) -> bool {
+    flags & RWF_NOAPPEND != 0 && file.flags() & O_APPEND != 0
+}
 /// The bytes RLIMIT_FSIZE lets a regular file take from `start`, as Linux's
 /// generic_write_check_limits: from the limit on none, raising SIGXFSZ and
 /// failing with EFBIG.
@@ -1999,7 +2027,7 @@ const O_APPEND: u32 = 0o2000;
 /// and the range, and then as ext4's `ext4_buffered_write_iter`, which
 /// refuses a regular file's buffered write with `RWF_NOWAIT`.
 fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, Errno> {
-    let flags = kiocb_rw_flags(file, flags, write)?;
+    let flags = kiocb_rw_flags(file, flags)?;
     if write && flags & RWF_NOWAIT != 0 && file.stat()?.mode & S_IFMT == S_IFREG {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -2014,14 +2042,11 @@ fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, 
 /// system with `FOP_DONTCACHE` ([`FileHandle::dontcache`]): a regular file
 /// on the host's own file system, as on ext4, and not a pipe, a socket, an
 /// in-memory file (a memfd, or a file of an in-memory file system, as
-/// tmpfs) or a file the kernel makes (`/proc`). `RWF_NOSIGNAL` is taken by any file (a write to a pipe or
-/// socket with no reader then raises no `SIGPIPE`). `RWF_NOAPPEND` cannot
-/// turn an `O_APPEND` file's append off here.
-pub(crate) fn kiocb_rw_flags(
-    file: &Arc<dyn FileHandle>,
-    flags: u32,
-    write: bool,
-) -> Result<u32, Errno> {
+/// tmpfs) or a file the kernel makes (`/proc`). `RWF_NOSIGNAL` is taken by
+/// any file (a write to a pipe or socket with no reader then raises no
+/// `SIGPIPE`). `RWF_NOAPPEND` turns an `O_APPEND` file's append off for the
+/// transfer, read or write, but not an append-only file's (`EPERM`).
+pub(crate) fn kiocb_rw_flags(file: &Arc<dyn FileHandle>, flags: u32) -> Result<u32, Errno> {
     if flags == 0 {
         return Ok(0);
     }
@@ -2050,12 +2075,8 @@ pub(crate) fn kiocb_rw_flags(
     if flags & RWF_DONTCACHE != 0 && (kind != S_IFREG || !file.dontcache()) {
         return Err(Errno::EOPNOTSUPP);
     }
-    if write && flags & RWF_NOAPPEND != 0 && file.flags() & O_APPEND != 0 {
-        // An append-only file always appends (EPERM).
-        if file.stat().is_ok_and(|stat| attributes::append_only(&stat)) {
-            return Err(Errno::EPERM);
-        }
-        return Err(Errno::EOPNOTSUPP);
+    if unappended(file, flags) && attributes::append_only(&file.stat()?) {
+        return Err(Errno::EPERM);
     }
     Ok(flags)
 }
@@ -2169,8 +2190,13 @@ fn aio_write(
         return Err(Errno::EOPNOTSUPP);
     }
     let start = appending(file, flags)?.unwrap_or(offset);
-    let len = size_limited(c, file, Some(start), bytes.len())?;
-    let written = write_at(file, start, &bytes[..len])?;
+    let written = if unappended(file, flags) {
+        let len = size_limited_from(c, file, start, bytes.len())?;
+        write_at_unappended(file, start, &bytes[..len])?
+    } else {
+        let len = size_limited(c, file, Some(start), bytes.len())?;
+        write_at(file, start, &bytes[..len])?
+    };
     if written > 0 {
         crate::permissions::remove_set_ids(&c.process.credentials, &**file);
     }
@@ -2253,6 +2279,18 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
         None
     };
     let result = (|| {
+        // RWF_NOAPPEND writes an O_APPEND regular file at its position, which
+        // then moves past what was written.
+        if unappended(&file, flags) && file.stat()?.mode & S_IFMT == S_IFREG {
+            let position = file.seek(0, 1)?;
+            let len = size_limited_from(c, &file, position, bytes.len())?;
+            let written = write_at_unappended(&file, position, &bytes[..len])?;
+            file.seek((position + written as u64) as i64, 0)?;
+            if written > 0 {
+                crate::permissions::remove_set_ids(&c.process.credentials, &*file);
+            }
+            return sync_written(&file, flags, written as u64);
+        }
         if let Some(end) = appending(&file, flags)? {
             file.seek(end as i64, 0)?;
         }
@@ -2299,7 +2337,11 @@ fn positioned_vector(
         return Ok(count as u64);
     }
     let offset = appending(&file, flags)?.unwrap_or(a[3]);
-    let len = size_limited(c, &file, Some(offset), len)?;
+    let len = if unappended(&file, flags) {
+        size_limited_from(c, &file, offset, len)?
+    } else {
+        size_limited(c, &file, Some(offset), len)?
+    };
     let mut b = Vec::new();
     b.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
     for &(base, length) in &segments {
@@ -2310,7 +2352,11 @@ fn positioned_vector(
             .map_err(|_| Errno::EFAULT)?;
     }
     b.truncate(len);
-    let written = write_at(&file, offset, &b)?;
+    let written = if unappended(&file, flags) {
+        write_at_unappended(&file, offset, &b)?
+    } else {
+        write_at(&file, offset, &b)?
+    };
     if written > 0 {
         crate::permissions::remove_set_ids(&c.process.credentials, &*file);
     }

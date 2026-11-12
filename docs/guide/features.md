@@ -96,9 +96,12 @@ kernel.
   file (a memfd, or one of an in-memory file system, as tmpfs) or a file the
   kernel makes (`/proc`) gives `EOPNOTSUPP`. `RWF_NOSIGNAL` spares a write to
   a pipe or socket with no reader its `SIGPIPE` (it still gives `EPIPE`), as
-  since Linux 6.18. `RWF_APPEND` writes a regular file at its end,
-  `RWF_DSYNC` and `RWF_SYNC` write it through as `fdatasync`, and
-  `RWF_HIPRI` changes nothing.
+  since Linux 6.18. `RWF_NOAPPEND` turns an `O_APPEND` file's append off
+  for the call: a write goes to the offset (growing the file past its end)
+  or, at -1, to the position, which then moves past it; an append-only file
+  (`FS_APPEND_FL`) gives `EPERM`, for a read too. `RWF_APPEND` writes a
+  regular file at its end, `RWF_DSYNC` and `RWF_SYNC` write it through as
+  `fdatasync`, and `RWF_HIPRI` changes nothing.
 - `copy_file_range` copies between two regular files on one mount (`EXDEV`
   across mounts), stopping at the input's end, with Linux's checks in order
   (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in

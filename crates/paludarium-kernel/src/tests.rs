@@ -4644,6 +4644,77 @@ mod inotify {
             .collect()
     }
     #[test]
+    fn the_files_exec_opens_are_heard_of() {
+        let mut f = fixture();
+        let files: [(&[u8], u32, &[u8]); 6] = [
+            (b"/tmp/x/shut", 0o644, b"#!/tmp/x/prog\n"),
+            (b"/tmp/x/empty", 0o755, b""),
+            (b"/tmp/x/junk", 0o755, b"junk"),
+            (b"/tmp/x/bad", 0o755, b"#!/tmp/x/junk\n"),
+            (b"/tmp/x/s", 0o755, b"#!/tmp/x/prog\n"),
+            (
+                b"/tmp/x/prog",
+                0o755,
+                &paludarium_loader::testing::tiny_exec(&[0x90], b""),
+            ),
+        ];
+        assert_eq!(f.ret(83, &[put(&f, DATA, b"/tmp/x"), 0o755]), 0);
+        for (path, mode, bytes) in files {
+            let file = f.kernel.files.fs.open(path, 0o101, mode).unwrap();
+            assert_eq!(file.write_at(0, bytes).unwrap(), bytes.len());
+        }
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let wd = f.ret(ADD, &[fd, put(&f, DATA, b"/tmp/x"), 0xfff]) as i32;
+        let exec = |f: &mut Fixture, path: &[u8]| f.ret(59, &[put(f, DATA, path), 0, 0]);
+        // Exec opens no file it may not run, and closes one it cannot run
+        // after reading what of it there is.
+        assert_eq!(exec(&mut f, b"/tmp/x/shut"), errno(Errno::EACCES));
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        assert_eq!(exec(&mut f, b"/tmp/x/empty"), errno(Errno(8)));
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x20, &b"empty"[..]), (wd, 0x10, b"empty")]
+        );
+        assert_eq!(exec(&mut f, b"/tmp/x/junk"), errno(Errno(8)));
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (wd, 0x20, &b"junk"[..]),
+                (wd, 1, b"junk"),
+                (wd, 0x10, b"junk")
+            ]
+        );
+        // A script's interpreter is opened while the script is, and the
+        // last opened closes first.
+        assert_eq!(exec(&mut f, b"/tmp/x/bad"), errno(Errno(8)));
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (wd, 0x20, &b"bad"[..]),
+                (wd, 1, b"bad"),
+                (wd, 0x20, b"junk"),
+                (wd, 1, b"junk"),
+                (wd, 0x10, b"junk"),
+                (wd, 0x10, b"bad"),
+            ]
+        );
+        // The script closes at the end of the exec, and the program once
+        // no process runs it.
+        assert_eq!(exec(&mut f, b"/tmp/x/s"), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (wd, 0x20, &b"s"[..]),
+                (wd, 1, b"s"),
+                (wd, 0x20, b"prog"),
+                (wd, 1, b"prog"),
+                (wd, 0x10, b"s"),
+            ]
+        );
+        f.kernel.group.set_exe_file(None);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x10, &b"prog"[..])]);
+    }
+    #[test]
     fn a_fifo_a_path_opened_and_splices_are_heard_of() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);

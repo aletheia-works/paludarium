@@ -1961,11 +1961,16 @@ kernel.
   (one that fails, such as a writer's `ENXIO`, is none), `IN_CLOSE_WRITE`
   or `IN_CLOSE_NOWRITE` at its description's last close, and its reads and
   writes for its own watches only, which Linux keeps from its directory's
-  (`d_is_special`). A watch with `IN_EXCL_UNLINK` does not
+  (`d_is_special`). The files exec runs are open files too: `IN_OPEN` as
+  `execve` or `execveat` opens the program, each script and the ELF
+  interpreter, `IN_ACCESS` as it reads their first bytes (none of an empty
+  file), and `IN_CLOSE_NOWRITE` once nothing uses them: a script at the end
+  of the call, the program when no process runs it, the interpreter when no
+  process maps it, and a file exec cannot run when it gives up, the last
+  opened first. A watch with `IN_EXCL_UNLINK` does not
   hear of the open, close, read or write of a file through a name unlinked
   since it was opened (by `unlink`, `rmdir` or a rename onto it), even while
-  another link keeps the file; `truncate`, `mknod` and starting a program
-  open nothing. A file's change reaches the watch of
+  another link keeps the file; `truncate` and `mknod` open nothing. A file's change reaches the watch of
   its directory, with its name, before its own (for an open file, the name
   it was opened at as renames of it and of the directories above it moved
   it, or the unlinked name it last had), and `IN_ISDIR` marks a

@@ -420,8 +420,8 @@ impl Kernel {
             (path.to_vec(), loaded),
             program,
             &mut true,
-            argv,
-            &mut budget,
+            (argv, &mut budget),
+            &mut processes::ExecOpens::default(),
         )?;
         let script = loaded != resolved;
         Ok((loaded, script))

@@ -145,6 +145,18 @@ pub(crate) struct WriteAccess {
     caches: Arc<PageCaches>,
     key: Key,
     change: i64,
+    /// For a running program's denial, exec's open of its file, which
+    /// closes with it (`exe_file`'s last `fput`).
+    closing: Option<crate::inotify::Closing>,
+}
+
+impl WriteAccess {
+    /// This denial, closing exec's open `closing` of the program when it
+    /// ends.
+    pub(crate) fn closing(mut self, closing: Option<crate::inotify::Closing>) -> Self {
+        self.closing = closing;
+        self
+    }
 }
 
 impl Drop for WriteAccess {
@@ -161,6 +173,8 @@ impl Drop for WriteAccess {
             }
         }
         drop(writes);
+        // `__fput` reports the close before it lets go of the dentry.
+        drop(self.closing.take());
         // A program a process ran holds its file (Linux's `exe_file`): a
         // removed one ends once no process runs it, as with a last close.
         if self.change < 0 && self.caches.notify.waiting() && !self.caches.held(self.key) {
@@ -350,6 +364,7 @@ impl PageCaches {
             caches: Arc::clone(self),
             key,
             change,
+            closing: None,
         })
     }
     /// The cache of `key`, if the file has one.

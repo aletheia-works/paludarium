@@ -181,6 +181,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - いくつかのメッセージのあとで `recvmmsg` を終わらせたエラーは捨てます。Linux はこれを
     ソケットのエラーとして残し、次の呼び出しと `SO_ERROR` で返します。また `recvmmsg` は、
     ソケットに残っているエラーを先に返しません。
+  - `memfd_secret` のファイルのページは `RLIMIT_MEMLOCK` に数えません。Linux では、それを
+    超えるページフォールトは `SIGBUS` です。また、そのマッピングの `MS_SYNC` の `msync` は
+    成功します。Linux では、ファイルに `fsync` がないので `EINVAL` です。
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は設定できません。
     Linux はこれを設定して `SIGVTALRM` と `SIGPROF` を送りますが、`setitimer` は `EINVAL` を
     返し、`getitimer` は設定されていないものとして見せます。

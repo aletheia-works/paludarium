@@ -320,6 +320,7 @@ mod linux {
         processes_personality_layout => ("personality-layout","process"),
         processes_landlock => ("landlock","process"),
         processes_mempolicy => ("mempolicy","process"),
+        processes_memfd_secret => ("memfd-secret","process"),
         processes_ids => ("ids","process"),
         processes_access => ("access","process"),
         processes_chown => ("chown","process"),

@@ -208,6 +208,10 @@ verified.
   - An error that ends `recvmmsg` after some messages is dropped, where
     Linux keeps it as the socket's error for the next call and
     `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.
+  - The pages of a `memfd_secret` file do not count against
+    `RLIMIT_MEMLOCK`, where Linux's fault past it raises `SIGBUS`, and
+    `msync` with `MS_SYNC` of its mapping succeeds, where Linux gives
+    `EINVAL` as the file has no `fsync`.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
     cannot be set: `setitimer` gives `EINVAL` for them, where Linux sets them
     and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.

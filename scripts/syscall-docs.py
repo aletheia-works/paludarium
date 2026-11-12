@@ -314,6 +314,7 @@ NAMES = {
     444: "landlock_create_ruleset",
     445: "landlock_add_rule",
     446: "landlock_restrict_self",
+    447: "memfd_secret",
     449: "futex_waitv",
     451: "cachestat",
     452: "fchmodat2",

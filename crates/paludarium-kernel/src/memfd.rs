@@ -42,21 +42,47 @@ pub(crate) struct Memfd {
     /// other, as Linux's inode lock and `i_mmap_writable` keep them apart.
     sealing: Arc<Mutex<()>>,
     name: Arc<[u8]>,
+    /// A `memfd_secret` file ([`memfd_secret`]): no reads or writes, a
+    /// size set once, shared mappings only, and its own name.
+    secret: bool,
 }
+/// secretmem's `statfs` type, `SECRETMEM_MAGIC`.
+pub(crate) const SECRETMEM_MAGIC: u64 = 0x5345_434d;
 impl Memfd {
+    /// Whether it is a `memfd_secret` file.
+    pub(crate) fn is_secret(&self) -> bool {
+        self.secret
+    }
+    /// The name `/proc/self/maps` shows for a mapping of it: its path, which
+    /// a secret file shows ` (deleted)` though it has a link, as every
+    /// pseudo file's `simple_dname` does.
+    pub(crate) fn mapped_name(&self) -> Vec<u8> {
+        if self.secret {
+            self.link_target()
+        } else {
+            self.path()
+        }
+    }
     /// What `/proc/self/fd` shows for it: `/memfd:<name> (deleted)`.
     pub(crate) fn link_target(&self) -> Vec<u8> {
         [&self.path()[..], b" (deleted)"].concat()
     }
     /// Its path, `/memfd:<name>`, which no name links.
     pub(crate) fn path(&self) -> Vec<u8> {
+        if self.secret {
+            return b"/secretmem".to_vec();
+        }
         [b"/memfd:", &self.name[..]].concat()
     }
     /// A new handle on the same file, as opening `/proc/self/fd/<n>` gives:
     /// with the new access mode and flags (`O_CREAT` and `O_EXCL` do nothing
     /// to an existing file). `O_TRUNC` empties it whatever the access mode,
     /// as Linux's open does, unless `F_SEAL_SHRINK` keeps a non-empty file.
+    /// A secret file's inode has no open of its own (`no_open`, `ENXIO`).
     pub(crate) fn reopen(&self, flags: u32) -> Result<Arc<Self>, Errno> {
+        if self.secret {
+            return Err(Errno(6)); // ENXIO
+        }
         if flags & 0o1000 != 0 && self.seals() & F_SEAL_SHRINK != 0 && self.file.stat()?.size > 0 {
             return Err(Errno::EPERM);
         }
@@ -68,6 +94,7 @@ impl Memfd {
             seals: Arc::clone(&self.seals),
             sealing: Arc::clone(&self.sealing),
             name: Arc::clone(&self.name),
+            secret: false,
         }))
     }
     pub(crate) fn seals(&self) -> u32 {
@@ -152,10 +179,18 @@ impl FileHandle for Memfd {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
+    /// A secret file has no `read_iter` (`FMODE_CAN_READ`, `EINVAL`), and
+    /// the same for writes.
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.secret {
+            return Err(Errno::EINVAL);
+        }
         self.file.read(buf)
     }
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
+        if self.secret {
+            return Err(Errno::EINVAL);
+        }
         let start = if self.flags() & 0o2000 != 0 {
             self.file.stat()?.size
         } else {
@@ -164,18 +199,31 @@ impl FileHandle for Memfd {
         let count = self.writable(start, buf.len())?;
         self.file.write(&buf[..count])
     }
+    /// A secret file has no `llseek` (`FMODE_LSEEK`, `ESPIPE`).
     fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
+        if self.secret {
+            return Err(Errno::ESPIPE);
+        }
         self.file.seek(offset, whence)
     }
+    /// A memfd has no link; a secret file's anonymous inode has one, and
+    /// counts no blocks.
     fn stat(&self) -> Result<FileStat, Errno> {
+        let stat = self.file.stat()?;
         Ok(FileStat {
             inode: self.inode,
-            links: 0,
-            ..self.file.stat()?
+            links: u64::from(self.secret),
+            blocks: if self.secret { Some(0) } else { stat.blocks },
+            ..stat
         })
     }
+    /// A secret file's size is set once: `secretmem_setattr` refuses any
+    /// other once it has one (`EINVAL`).
     fn truncate(&self, size: u64) -> Result<(), Errno> {
         let old = self.file.stat()?.size;
+        if self.secret && old != 0 {
+            return Err(Errno::EINVAL);
+        }
         let seals = self.seals();
         if (size < old && seals & F_SEAL_SHRINK != 0) || (size > old && seals & F_SEAL_GROW != 0) {
             return Err(Errno::EPERM);
@@ -213,15 +261,31 @@ impl FileHandle for Memfd {
     }
     /// A memfd is shmem's, which a tmpfs is.
     fn file_system(&self) -> Option<u64> {
-        Some(0x0102_1994)
+        Some(if self.secret {
+            SECRETMEM_MAGIC
+        } else {
+            0x0102_1994
+        })
     }
+    /// A secret file has no `fsync` (`EINVAL`).
     fn sync(&self) -> Result<(), Errno> {
+        if self.secret {
+            return Err(Errno::EINVAL);
+        }
         self.file.sync()
     }
+    /// For the guest's `pread` and the like; a mapping of a secret file
+    /// reads its pages from [`pages_source`].
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.secret {
+            return Err(Errno::EINVAL);
+        }
         self.file.read_at(offset, buf)
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
+        if self.secret {
+            return Err(Errno::EINVAL);
+        }
         let start = if self.flags() & 0o2000 != 0 {
             self.file.stat()?.size
         } else {
@@ -231,10 +295,17 @@ impl FileHandle for Memfd {
         self.file.write_at(offset, &buf[..count])
     }
     fn write_at_unappended(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
+        if self.secret {
+            return Err(Errno::EINVAL);
+        }
         let count = self.writable(offset, buf.len())?;
         self.file.write_at_unappended(offset, &buf[..count])
     }
+    /// A secret file has no `fallocate` (`EOPNOTSUPP`).
     fn allocate(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        if self.secret {
+            return Err(Errno::EOPNOTSUPP);
+        }
         self.file.allocate(offset, len)
     }
     /// A shared mapping's pages reach the file whatever the seals, as the
@@ -243,6 +314,9 @@ impl FileHandle for Memfd {
         self.file.write_back(offset, buf)
     }
     fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
+        if self.secret {
+            return Err(Errno::EOPNOTSUPP);
+        }
         if self.seals() & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
             return Err(Errno::EPERM);
         }
@@ -314,11 +388,62 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
         seals: Arc::new(AtomicU32::new(seals)),
         sealing: Arc::default(),
         name: name.into(),
+        secret: false,
     });
     let file =
         crate::page_cache::CoherentFile::with_device(memfd, Arc::clone(&c.files.caches), DEVICE);
     let fd = c
         .files
         .install(Arc::new(file), flags & MFD_CLOEXEC != 0, c.group.nofile())?;
+    Ok(u64::from(fd))
+}
+
+/// What a mapping of `file` reads its pages from and writes them back to:
+/// for a secret file the file itself, which the guest may not read or
+/// write; else `file`.
+pub(crate) fn pages_source(file: &Arc<dyn FileHandle>) -> Arc<dyn FileHandle> {
+    match file
+        .as_any()
+        .and_then(|any| any.downcast_ref::<Memfd>())
+        .filter(|memfd| memfd.secret)
+    {
+        Some(memfd) => Arc::clone(&memfd.file),
+        None => Arc::clone(file),
+    }
+}
+
+/// `memfd_secret(flags)`, as Linux's on x86-64, where secretmem is enabled:
+/// `O_CLOEXEC` is the only flag (`EINVAL`). The file is a regular file of
+/// size 0 and mode 0600, owned by the thread's filesystem IDs, open for
+/// reading and writing, on a pseudo filesystem of its own
+/// ([`SECRETMEM_MAGIC`]). Its size can be set once, by `ftruncate`, and it
+/// can only be mapped shared; it cannot be read, written, sought, synced,
+/// allocated, sealed or opened again ([`Memfd`]'s refusals).
+pub(crate) fn memfd_secret(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    const O_CLOEXEC: u32 = 0o2000000;
+    let flags = a[0] as u32;
+    if flags & !O_CLOEXEC != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fs = Arc::new(paludarium_vfs::MemFs::new());
+    drop(fs.open(PATH, 0o102, 0o600)?);
+    let file = fs.open(PATH, 0o100002, 0)?;
+    let credentials = &c.process.credentials;
+    file.set_owner(Some(credentials.fsuid), Some(credentials.fsgid))?;
+    let inode = crate::files::anonymous_inode();
+    let secret = Arc::new(Memfd {
+        file,
+        fs,
+        inode,
+        seals: Arc::new(AtomicU32::new(F_SEAL_SEAL)),
+        sealing: Arc::default(),
+        name: Arc::from(&b"secretmem"[..]),
+        secret: true,
+    });
+    let file =
+        crate::page_cache::CoherentFile::with_device(secret, Arc::clone(&c.files.caches), DEVICE);
+    let fd = c
+        .files
+        .install(Arc::new(file), flags & O_CLOEXEC != 0, c.group.nofile())?;
     Ok(u64::from(fd))
 }

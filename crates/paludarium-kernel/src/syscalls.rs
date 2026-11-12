@@ -1743,6 +1743,15 @@ fn check_mappable(
     if shared_write && write_sealed(file) {
         return Err(Errno::EPERM);
     }
+    // A secret file maps shared only (secretmem_mmap_prepare).
+    if flags & MAP_SHARED == 0
+        && file
+            .as_any()
+            .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+            .is_some_and(crate::memfd::Memfd::is_secret)
+    {
+        return Err(Errno::EINVAL);
+    }
     Ok(())
 }
 /// Whether `file` is a memfd sealed against writes, whose shared mappings
@@ -1781,7 +1790,7 @@ fn shared_file(
     }
     let may_write = file.flags() & 3 == 2 && !write_sealed(file.as_ref());
     let pages = file_cache(c, d, file)?.map(
-        file,
+        &crate::memfd::pages_source(file),
         crate::files::mapped_path(c, d),
         offset,
         len,

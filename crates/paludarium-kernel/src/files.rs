@@ -16,7 +16,7 @@ pub const NUMBERS: &[u64] = &[
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
     188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
     261, 262, 263, 264, 265, 266, 267, 268, 269, 275, 276, 277, 278, 280, 285, 292, 293, 295, 296,
-    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 451, 452, 463, 464, 465, 466, 468, 469,
+    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 447, 451, 452, 463, 464, 465, 466, 468, 469,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -791,6 +791,13 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
     }
     if crate::mqueue::is_queue(&*d.file) || d.path == b"/dev/mqueue" {
         return Ok(pseudo_fs(MQUEUE_MAGIC));
+    }
+    if d.file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+        .is_some_and(crate::memfd::Memfd::is_secret)
+    {
+        return Ok(pseudo_fs(crate::memfd::SECRETMEM_MAGIC));
     }
     Ok(match d.file.stat()?.mode & 0o170000 {
         0o010000 => pseudo_fs(0x5049_5045), // PIPEFS_MAGIC
@@ -1692,6 +1699,10 @@ fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         .file
         .as_any()
         .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
+    // A secret file has no `fallocate`.
+    if memfd.is_some_and(crate::memfd::Memfd::is_secret) {
+        return Err(Errno::EOPNOTSUPP);
+    }
     match mode & MODE_MASK {
         0 => {
             let grows = end > stat.size;
@@ -2330,10 +2341,22 @@ fn appending(file: &Arc<dyn FileHandle>, flags: u32) -> Result<Option<u64>, Errn
 /// `readv(fd, iov, count)`, and `preadv2` at the file position, as Linux's
 /// `vfs_readv`: the access mode, the vector, nothing to do for no bytes,
 /// the range, then the flags.
+/// Whether `file` has neither `read`/`read_iter` nor `write`/`write_iter`,
+/// so that Linux opens it without `FMODE_CAN_READ` and `FMODE_CAN_WRITE`
+/// and refuses `read`, `write` and their vectored forms (`EINVAL`) once
+/// the access mode allows them: a secret memfd.
+fn cannot_read_or_write(file: &Arc<dyn FileHandle>) -> bool {
+    file.as_any()
+        .and_then(|any| any.downcast_ref::<crate::memfd::Memfd>())
+        .is_some_and(crate::memfd::Memfd::is_secret)
+}
 fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     let file = c.files.descriptor(a[0])?.file;
     if file.flags() & 3 == 1 {
         return Err(Errno::EBADF);
+    }
+    if cannot_read_or_write(&file) {
+        return Err(Errno::EINVAL);
     }
     if let Some(instance) = crate::inotify::of(&file) {
         return readv_instance(c, instance, a, flags);
@@ -2395,6 +2418,9 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     let file = c.files.descriptor(a[0])?.file;
     if file.flags() & 3 == 0 {
         return Err(Errno::EBADF);
+    }
+    if cannot_read_or_write(&file) {
+        return Err(Errno::EINVAL);
     }
     let segments = iovecs(c, a[1], a[2], false)?;
     let total = segments.iter().map(|(_, length)| length).sum::<usize>();
@@ -3030,6 +3056,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         // `vfs_fallocate` gives, whatever sizes it changes.
         285 => crate::inotify::unnoticed(|| fallocate(c, a)),
         319 => crate::memfd::memfd_create(c, a),
+        447 => crate::memfd::memfd_secret(c, a),
         // pread64, pwrite64, preadv, pwritev: at an offset, leaving the file
         // position. On x86-64 the offset of preadv and pwritev is a[3] alone.
         17 => {
@@ -3103,6 +3130,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         0 | 1 => {
             let requested = usize::try_from(a[2].min(0x7fff_f000)).map_err(|_| Errno::EINVAL)?;
             let d = Some(c.files.descriptor(a[0])?);
+            if let Some(d) = &d
+                && cannot_read_or_write(&d.file)
+            {
+                return Err(Errno::EINVAL);
+            }
             let len = if n == 0 {
                 if let Some(d) = &d {
                     let metadata = d.file.stat()?;
@@ -3282,10 +3314,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 3 => Ok(u64::from(status_flags(&d))),
                 // F_ADD_SEALS and F_GET_SEALS, for memfds only.
                 1033 | 1034 => {
+                    // A secret file is no shmem file and has no seals.
                     let memfd = d
                         .file
                         .as_any()
-                        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
+                        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+                        .filter(|memfd| !memfd.is_secret());
                     match (a[1], memfd) {
                         (1034, Some(memfd)) => Ok(u64::from(memfd.seals())),
                         (1033, Some(memfd)) => {
@@ -5817,7 +5851,7 @@ pub(crate) fn mapped_path(c: &Context<'_>, d: &Descriptor) -> Option<Vec<u8>> {
         .as_any()
         .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
     {
-        return Some(memfd.path());
+        return Some(memfd.mapped_name());
     }
     let stat = d.file.stat().ok()?;
     Some(current_path(c.files, d, stat.inode).unwrap_or_else(|| opened_path(d)))

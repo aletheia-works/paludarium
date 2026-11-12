@@ -7588,6 +7588,84 @@ static int mmsg_case(void) {
            mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 2L, (long)MSG_DONTWAIT, NULL)));
     return 0;
 }
+/* memfd_secret (447), as Linux's secretmem: a file of its own that only a
+ * shared mapping shows, with no read, write, seek, sync, allocation or
+ * seals, whose size is set once. */
+static long secret_errno(long r) { return r < 0 ? -errno : r; }
+static int memfd_secret_case(void) {
+    long page = 4096;
+    char buf[64];
+    printf("bad-flag=%ld\n", secret_errno(syscall(447, 1L)));
+    printf("bad-flag-and-cloexec=%ld\n", secret_errno(syscall(447, (long)(O_CLOEXEC | 1))));
+    int fd = (int)syscall(447, (long)O_CLOEXEC);
+    if (fd < 0) {
+        printf("memfd_secret=%d\n", -errno);
+        return 0;
+    }
+    printf("cloexec=%d getfl=%#o\n", fcntl(fd, F_GETFD), fcntl(fd, F_GETFL));
+    struct stat st;
+    if (fstat(fd, &st)) return 80;
+    printf("mode=%o nlink=%ld size=%ld blocks=%ld owned=%d\n", st.st_mode, (long)st.st_nlink,
+           (long)st.st_size, (long)st.st_blocks, st.st_uid == geteuid() && st.st_gid == getegid());
+    struct statfs sf;
+    if (fstatfs(fd, &sf)) return 81;
+    printf("statfs type=%#lx bsize=%ld namelen=%ld\n", (long)sf.f_type, (long)sf.f_bsize,
+           (long)sf.f_namelen);
+    struct iovec iov = {buf, 1};
+    printf("read=%ld\n", secret_errno(read(fd, buf, 1)));
+    printf("read-empty=%ld\n", secret_errno(read(fd, buf, 0)));
+    printf("write=%ld\n", secret_errno(write(fd, buf, 1)));
+    printf("readv=%ld\n", secret_errno(readv(fd, &iov, 1)));
+    printf("readv-bad-vector=%ld\n", secret_errno(syscall(SYS_readv, fd, (void *)8, 1L)));
+    printf("writev=%ld\n", secret_errno(writev(fd, &iov, 1)));
+    printf("pread=%ld\n", secret_errno(pread(fd, buf, 1, 0)));
+    printf("pread-negative=%ld\n", secret_errno(syscall(SYS_pread64, fd, buf, 1L, -1L)));
+    printf("pwrite=%ld\n", secret_errno(pwrite(fd, buf, 1, 0)));
+    printf("preadv2-position=%ld\n", secret_errno(syscall(SYS_preadv2, fd, &iov, 1L, -1L, 0L, 0L)));
+    printf("lseek=%ld\n", secret_errno(lseek(fd, 0, SEEK_CUR)));
+    printf("fsync=%ld\n", secret_errno(fsync(fd)));
+    printf("fdatasync=%ld\n", secret_errno(fdatasync(fd)));
+    printf("fallocate=%ld\n", secret_errno(syscall(SYS_fallocate, fd, 0L, 0L, page)));
+    printf("get-seals=%ld\n", secret_errno(fcntl(fd, 1034)));
+    printf("add-seals=%ld\n", secret_errno(fcntl(fd, 1033, 1)));
+    /* The size, once; then shared mappings only. */
+    printf("truncate=%ld\n", secret_errno(ftruncate(fd, 2 * page)));
+    printf("truncate-again=%ld\n", secret_errno(ftruncate(fd, 2 * page)));
+    printf("truncate-shrink=%ld\n", secret_errno(ftruncate(fd, page)));
+    void *private = mmap(NULL, page, PROT_READ, MAP_PRIVATE, fd, 0);
+    printf("map-private=%ld\n", private == MAP_FAILED ? (long)-errno : 0L);
+    char *m = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) return 82;
+    printf("fresh=%d\n", m[0] + m[page]);
+    memcpy(m + page, "secret", 6);
+    maps_show("secret-map", m, NULL);
+    munmap(m, 2 * page);
+    char *again = mmap(NULL, 2 * page, PROT_READ, MAP_SHARED, fd, 0);
+    if (again == MAP_FAILED) return 83;
+    printf("kept=%.6s\n", again + page);
+    if (fstat(fd, &st)) return 84;
+    printf("after size=%ld blocks=%ld\n", (long)st.st_size, (long)st.st_blocks);
+    /* Past its end, a mapping raises SIGBUS. */
+    char *past = mmap(NULL, 3 * page, PROT_READ, MAP_SHARED, fd, 0);
+    if (past == MAP_FAILED) return 85;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        volatile char c = past[2 * page];
+        (void)c;
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("past-end signal=%d\n", WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    /* Its name, and no open of its own. */
+    char link[64], target[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, target, sizeof target);
+    printf("link=%.*s\n", n > 0 ? (int)n : 0, target);
+    printf("reopen=%ld\n", secret_errno(open(link, O_RDWR)));
+    return 0;
+}
 static int pkey_case(void) {
     long page = 4096;
     char *base = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -19387,6 +19465,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "kcmp")) return kcmp_case();
     if (!strcmp(mode, "mseal")) return mseal_case();
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
+    if (!strcmp(mode, "memfd-secret")) return memfd_secret_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();

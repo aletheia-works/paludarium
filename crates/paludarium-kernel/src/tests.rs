@@ -2646,6 +2646,61 @@ fn memfd_shared_mapping_and_the_write_seal() {
     assert_eq!(f.ret(10, &[at, 4096, 3]), errno(Errno::EACCES));
 }
 #[test]
+fn memfd_secret_maps_shared_only_and_refuses_reads_and_writes() {
+    let mut f = fixture();
+    let (einval, espipe, eopnotsupp) = (
+        errno(Errno::EINVAL),
+        errno(Errno::ESPIPE),
+        errno(Errno::EOPNOTSUPP),
+    );
+    let (stat, path, buf) = (DATA + 0x100, DATA + 0x300, DATA + 0x400);
+    assert_eq!(f.ret(447, &[1]), einval);
+    assert_eq!(f.ret(447, &[0o2000001]), einval);
+    let fd = f.ret(447, &[0o2000000]);
+    assert!(fd < 1 << 32);
+    assert_eq!(f.ret(72, &[fd, 1, 0]), 1); // FD_CLOEXEC
+    assert_eq!(f.ret(72, &[fd, 3, 0]), 0o100002); // O_RDWR | O_LARGEFILE
+    assert_eq!(f.ret(5, &[fd, stat]), 0);
+    let word = |f: &Fixture, at: u64| f.mem.read_u64(GuestAddr(stat + at)).unwrap();
+    assert_eq!(word(&f, 16), 1); // st_nlink
+    assert_eq!(word(&f, 24) & 0xffff_ffff, 0o100600); // st_mode
+    assert_eq!(word(&f, 48), 0); // st_size
+    // No reads, writes, seeks, syncs, allocation or seals.
+    assert_eq!(f.ret(0, &[fd, buf, 1]), einval);
+    assert_eq!(f.ret(1, &[fd, buf, 1]), einval);
+    assert_eq!(f.ret(19, &[fd, 8, 1]), einval); // before the iovecs
+    // No FMODE_PREAD or FMODE_PWRITE either, after a negative offset.
+    assert_eq!(f.ret(17, &[fd, buf, 1, u64::MAX]), einval);
+    assert_eq!(f.ret(17, &[fd, buf, 1, 0]), espipe);
+    assert_eq!(f.ret(18, &[fd, buf, 1, 0]), espipe);
+    assert_eq!(f.ret(8, &[fd, 0, 0]), espipe);
+    assert_eq!(f.ret(74, &[fd]), einval);
+    assert_eq!(f.ret(285, &[fd, 0, 0, 4096]), eopnotsupp);
+    assert_eq!(f.ret(72, &[fd, 1034, 0]), einval);
+    assert_eq!(f.ret(72, &[fd, 1033, 1]), einval);
+    assert_eq!(f.ret(138, &[fd, buf]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(buf)).unwrap(), 0x5345_434d);
+    // The size, once.
+    assert_eq!(f.ret(77, &[fd, 8192]), 0);
+    assert_eq!(f.ret(77, &[fd, 8192]), einval);
+    assert_eq!(f.ret(77, &[fd, 4096]), einval);
+    // Shared mappings only, which keep its pages.
+    let mmap = syscalls::nr::MMAP;
+    assert_eq!(f.ret(mmap, &[0, 4096, 3, 2, fd, 0]), einval);
+    let at = f.ret(mmap, &[0, 8192, 3, 1, fd, 0]);
+    f.mem.write(GuestAddr(at + 4096), b"secret").unwrap();
+    assert_eq!(f.ret(11, &[at, 8192]), 0);
+    let again = f.ret(mmap, &[0, 8192, 1, 1, fd, 0]);
+    assert_eq!(memory_bytes(&f, again + 4096, 6), b"secret");
+    // Its name, and no open of its own.
+    f.mem
+        .write(GuestAddr(path), format!("/proc/self/fd/{fd}\0").as_bytes())
+        .unwrap();
+    let n = f.ret(89, &[path, buf, 64]);
+    assert_eq!(memory_bytes(&f, buf, n as usize), b"/secretmem (deleted)");
+    assert_eq!(f.ret(2, &[path, 2]), errno(Errno(6))); // ENXIO
+}
+#[test]
 fn mremap_flags_and_msync_arguments() {
     let mut f = fixture();
     let (at, einval) = (0x6000_0000, errno(Errno::EINVAL));

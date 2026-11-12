@@ -172,9 +172,12 @@ runs:
         # apt.conf.d; a variant that apt.conf or anything else sets again stops the job below.
         config="$RUNNER_TEMP/apt-config"
         # Not in a command substitution, which would not stop the job when apt cannot parse its
-        # configuration and so prints no variant at all.
+        # configuration and so prints no variant at all. A cleared variant stays in the dump
+        # with an empty value (APT::Architecture-Variants "";), which --no-empty leaves out;
+        # one set again, alone or as a list entry (APT::Architecture-Variants:: "amd64v3";),
+        # still shows.
         variants() {
-          apt-config dump > "$config"
+          apt-config dump --no-empty > "$config"
           found="$(grep -iE '^APT::Architecture-Variants' "$config" || true)"
         }
         toolchain=()

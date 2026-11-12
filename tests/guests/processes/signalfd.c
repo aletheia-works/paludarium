@@ -395,10 +395,16 @@ static FILE *fdinfo(int fd) {
     return fopen(path, "r");
 }
 /* The lines after the four every descriptor has. */
+static int by_tfd(const void *a, const void *b) {
+    return atoi(*(char *const *)a + 6) - atoi(*(char *const *)b + 6);
+}
 static void show_extra(const char *label, int fd) {
     FILE *f = fdinfo(fd);
     char line[256];
     int n = 0;
+    /* An epoll's files, which Linux lists by their addresses: by descriptor. */
+    char *targets[16];
+    int count = 0;
     printf("%s:\n", label);
     while (f && fgets(line, sizeof line, f)) {
         if (n++ < 4) continue;
@@ -414,9 +420,11 @@ static void show_extra(const char *label, int fd) {
         if (sscanf(line, "tfd: %d events: %x data: %llx pos:%lli ino:%llx sdev:%x", &tfd, &events, &data, &pos, &ino, &sdev) == 6) {
             struct stat st;
             fstat(tfd, &st);
-            printf("  tfd=%d events=%#x data=%#llx pos=%lld ino=%s sdev=%s\n", tfd, events, data, pos,
-                   ino == st.st_ino ? "fstat" : "other",
-                   sdev == (major(st.st_dev) << 20 | minor(st.st_dev)) ? "fstat" : "other");
+            char *shown = malloc(160);
+            snprintf(shown, 160, "  tfd=%d events=%#x data=%#llx pos=%lld ino=%s sdev=%s\n", tfd, events, data, pos,
+                     ino == st.st_ino ? "fstat" : "other",
+                     sdev == (major(st.st_dev) << 20 | minor(st.st_dev)) ? "fstat" : "other");
+            if (count < 16) targets[count++] = shown;
             continue;
         }
         unsigned long long sec, nsec;
@@ -441,6 +449,11 @@ static void show_extra(const char *label, int fd) {
         printf("  %s", line);
     }
     if (f) fclose(f);
+    qsort(targets, count, sizeof targets[0], by_tfd);
+    for (int i = 0; i < count; i++) {
+        fputs(targets[i], stdout);
+        free(targets[i]);
+    }
 }
 static int lock_range(int fd, int cmd, short type, off_t start, off_t len) {
     struct flock l = {.l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = len};

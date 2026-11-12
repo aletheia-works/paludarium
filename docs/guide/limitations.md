@@ -422,18 +422,20 @@ verified.
   the rest are not); its `rta_cacheinfo` counts one reference, where
   Linux counts the other users of the cached route too. Notifications go
   out for the link, its IPv6 information, addresses and routes alone, not
-  for neighbours, netconf or the other groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
-  is not supported); IPv4's routes through `lo` go without one when it
-  goes down, as on Linux. `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the
-  other options not listed in the features are `ENOPROTOOPT`. MCTP is as
-  Ubuntu's kernel, built with `CONFIG_MCTP`, has it, where a kernel
-  without it gives a link no MCTP settings and, having no `AF_MCTP`
-  address dump, dumps IPv4's and IPv6's addresses for one; MCTP addresses
-  cannot be added (`RTM_NEWADDR` of `AF_MCTP` is `EOPNOTSUPP`). A link
-  message's statistics are zero, and its `IFLA_AF_SPEC` carries MCTP's
-  settings; its IPv4 and IPv6 settings are those of a kernel whose
-  sysctls are as built, where Linux's new namespace copies the host's, and IPv6's creation time is 0 and its reachable time 30 seconds,
-  where Linux's is random. An address's creation times are 0,
+  for neighbours, netconf or the other groups, nor to a socket in
+  another namespace (`NETLINK_LISTEN_ALL_NSID` is not supported); IPv4's
+  routes through `lo` go without one when it goes down, as on Linux.
+  `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
+  listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
+  built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
+  MCTP's settings and an `AF_MCTP` address dump has its own answer,
+  where a kernel without it gives no MCTP settings and dumps IPv4's and
+  IPv6's addresses for that dump; MCTP addresses cannot be added
+  (`RTM_NEWADDR` of `AF_MCTP` is `EOPNOTSUPP`). A link message's
+  statistics are zero; its IPv4 and IPv6 settings are those of a kernel
+  whose sysctls are as built, where Linux's new namespace copies the
+  host's, and IPv6's creation time is 0 and its reachable time 30
+  seconds, where Linux's is random. An address's creation times are 0,
   `NETLINK_EXT_ACK` adds no attributes to an error or to a dump's
   `NLMSG_DONE`. Strict checking does not check the attribute policies
   first, so of a request with a malformed attribute and another it

@@ -6430,14 +6430,30 @@ static int futex2_case(void) {
  * kernel/futex/requeue.c. */
 static _Alignas(8) volatile uint32_t rq_words[4];
 static long rq_results[4];
+/* Every wait and every loop that waits for a waiter gives up after
+   RQ_LIMIT seconds, so a wake-up that never comes shows as -ETIMEDOUT or
+   a short count in the output, at the step that lost it, rather than as
+   a run that never ends. */
+#define RQ_LIMIT 5
+static struct timespec rq_start;
+static void rq_begin(void) { clock_gettime(CLOCK_MONOTONIC, &rq_start); }
+static int rq_late(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec - rq_start.tv_sec > RQ_LIMIT;
+}
 static void *rq_old_waiter(void *arg) {
     long i = (long)arg;
-    rq_results[i] = f2_errno(syscall(SYS_futex, &rq_words[0], 128, 0, NULL, NULL, 0));
+    struct timespec limit = {RQ_LIMIT, 0};
+    rq_results[i] = f2_errno(syscall(SYS_futex, &rq_words[0], 128, 0, &limit, NULL, 0));
     return NULL;
 }
 static void *rq_new_waiter(void *arg) {
     (void)arg;
-    rq_results[3] = f2_wait((void *)&rq_words[2], 0, 1, F2_U32_PRIVATE, NULL, 0);
+    struct timespec until;
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    until.tv_sec += RQ_LIMIT;
+    rq_results[3] = f2_wait((void *)&rq_words[2], 0, 1, F2_U32_PRIVATE, &until, CLOCK_MONOTONIC);
     return NULL;
 }
 static long rq_old(long op, volatile uint32_t *from, long wake, long requeue, volatile uint32_t *to,
@@ -6456,7 +6472,8 @@ static int futex_requeue_case(void) {
     pthread_t t[3];
     for (long i = 0; i < 3; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
     long moved = 0;
-    while (moved < 3) {
+    rq_begin();
+    while (moved < 3 && !rq_late()) {
         long r = rq_old(4 | 128, a, 0, INT_MAX, b, 0);
         if (r < 0) return 80;
         moved += r;
@@ -6469,9 +6486,11 @@ static int futex_requeue_case(void) {
     for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
     printf("requeue moved=%ld woke-b=%ld back=%ld woke-a=%ld left-b=%ld results=%ld,%ld,%ld\n",
            moved, woke_b, back, woke_a, left_b, rq_results[0], rq_results[1], rq_results[2]);
-    /* Onto its own word: Linux's walk meets a moved waiter again. */
+    /* Onto its own word: Linux's requeue_futex leaves each waiter where it
+       is, so the walk counts each once. */
     for (long i = 0; i < 2; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
-    for (moved = 0; moved < 2;) {
+    rq_begin();
+    for (moved = 0; moved < 2 && !rq_late();) {
         long r = rq_old(4 | 128, a, 0, INT_MAX, b, 0);
         if (r < 0) return 81;
         moved += r;
@@ -6482,7 +6501,8 @@ static int futex_requeue_case(void) {
     long alone = rq_old(4 | 128, b, 0, 5, b, 0);
     long rest = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
     for (int i = 0; i < 2; i++) pthread_join(t[i], NULL);
-    printf("requeue same-word=%ld woke=%ld alone=%ld rest=%ld\n", same, alone_woke, alone, rest);
+    printf("requeue moved=%ld same-word=%ld woke=%ld alone=%ld rest=%ld results=%ld,%ld\n", moved, same,
+           alone_woke, alone, rest, rq_results[0], rq_results[1]);
 
     struct f2_waitv w[2] = {{0, (uintptr_t)&rq_words[2], F2_U32_PRIVATE, 0},
                             {0, (uintptr_t)&rq_words[3], F2_U32_PRIVATE, 0}};
@@ -6500,7 +6520,8 @@ static int futex_requeue_case(void) {
     pthread_t n;
     pthread_create(&n, NULL, rq_new_waiter, NULL);
     long r;
-    while ((r = f2_errno(syscall(456, w, 0L, 0L, 1L))) == 0) sched_yield();
+    rq_begin();
+    while ((r = f2_errno(syscall(456, w, 0L, 0L, 1L))) == 0 && !rq_late()) sched_yield();
     long woke = f2_wake((void *)&rq_words[3], 1, 1, F2_U32_PRIVATE);
     pthread_join(n, NULL);
     printf("futex_requeue moved=%ld woke=%ld result=%ld\n", r, woke, rq_results[3]);

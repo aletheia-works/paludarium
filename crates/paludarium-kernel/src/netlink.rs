@@ -12,18 +12,19 @@
 //! that leaves room sending the next, then `NLMSG_DONE` in a part of its
 //! own (after the last IPv6 address or link, when it has room); an AF_INET6
 //! `RTM_GETLINK` dump shows the loopback as IPv6 does, and an
-//! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table; `RTM_GETLINK` without a
-//! dump answers for `lo` by index or name, and `RTM_GETROUTE` without one
-//! looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and remove the
-//! loopback's addresses ([`crate::interface`]); `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
-//! down with `IFF_UP`, given `CAP_NET_ADMIN` in the user namespace that owns
-//! the network namespace. An error, or a success the request asks for with
-//! `NLM_F_ACK`, is answered with `NLMSG_ERROR`; any other request is
-//! `EOPNOTSUPP`. A socket with `NETLINK_GET_STRICT_CHK` has its dumps,
-//! link requests and route lookups checked as Linux checks them strictly,
-//! and its dumps narrowed as they ask. A datagram to another socket's port reaches it, and the
-//! members of a group hear of the changes to the link, addresses and
-//! routes as Linux tells them.
+//! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table; `RTM_GETLINK`
+//! without a dump answers for `lo` by index or name, and `RTM_GETROUTE`
+//! without one looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and
+//! remove the loopback's addresses ([`crate::interface`]); `RTM_NEWLINK`
+//! and `RTM_SETLINK` bring it up or down with `IFF_UP`, given
+//! `CAP_NET_ADMIN` in the user namespace that owns the network namespace.
+//! An error, or a success the request asks for with `NLM_F_ACK`, is
+//! answered with `NLMSG_ERROR`; any other request is `EOPNOTSUPP`. A
+//! socket with `NETLINK_GET_STRICT_CHK` has its dumps, link requests and
+//! route lookups checked as Linux checks them strictly, and its dumps
+//! narrowed as they ask. A datagram to another socket's port reaches it,
+//! and the members of a group hear of the changes to the link, addresses
+//! and routes as Linux tells them.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::inet::Network;
 use crate::sockets::Timeout;

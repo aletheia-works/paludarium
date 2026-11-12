@@ -1331,7 +1331,13 @@ kernel.
     Linux's details. An `AF_INET6` dump answers as `inet6_dump_ifinfo`
     does: `lo` with an `AF_INET6` `ifinfomsg`, its name, hardware address,
     MTU and state, and its IPv6 settings with their statistics in
-    `IFLA_PROTINFO`.
+    `IFLA_PROTINFO`. An `RTNL_FAMILY_IPMR` dump answers as
+    `ipmr_rtm_dumplink` does, with IPv4's multicast routing table
+    (`RT_TABLE_DEFAULT`, the only one a namespace has) in `IFLA_AF_SPEC`:
+    no register VIF, assert, PIM or whole-packet setting, nothing waiting
+    to be resolved, and no VIFs. Strictly it takes an `ifinfomsg` alone with
+    nothing in it, as `ipmr_valid_dumplink` does; an `RTNL_FAMILY_IP6MR`
+    dump has no handler of its own, so it is the ordinary link dump.
     `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`.
   - **Addresses:** `RTM_GETADDR` dumps `lo`'s addresses in Linux's orders:
     IPv4's primaries after those of a scope as wide or wider, secondaries

@@ -1274,6 +1274,24 @@ static void nl_link_attribute(unsigned short type, const unsigned char *v, int l
     case 23: printf(" stats64=%d", len); break;
     }
 }
+/* An RTNL_FAMILY_IPMR link's IFLA_AF_SPEC, for nl_answer: each table
+   attribute, as ipmr_fill_table gives them, its type and value. */
+static void nl_mr_attribute(unsigned short type, const unsigned char *v, int len) {
+    int value = 0;
+    if (len == 4) memcpy(&value, v, 4);
+    printf(" %u", type);
+    if (len == 4) printf("=%d", value);
+    else if (len == 1) printf("=%u", v[0]);
+    else printf(":%d", len);
+}
+static void nl_mr_link_attribute(unsigned short type, const unsigned char *v, int len) {
+    if (type != 26) {
+        printf(" %u:%d", type, len);
+        return;
+    }
+    printf(" spec=%d table", len);
+    nl_attributes(v, len, nl_mr_attribute);
+}
 /* The output interface of a route's attributes, for nl_answer. */
 static int nl_route_oif;
 static void nl_route_oif_attribute(unsigned short type, const unsigned char *v, int len) {
@@ -1343,6 +1361,8 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
                namespace, as its ipip and gre modules make them. */
             int index = 1;
             if ((h->type == 16 && body_len >= 16) || (h->type == 20 && body_len >= 8)) memcpy(&index, body + 4, 4);
+            /* A multicast routing table, which has no device. */
+            if (h->type == 16 && body_len >= 16 && body[0] == 128) index = 1;
             if (h->type == 24 && body_len >= 12) {
                 /* A route without a device, as a blackhole one is, too. */
                 nl_route_oif = 1;
@@ -1375,7 +1395,7 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
                 memcpy(&flags, body + 8, 4);
                 memcpy(&change, body + 12, 4);
                 printf(" family=%u arphrd=%u index=%d flags=%#x change=%#x", body[0], type, index, flags, change);
-                nl_attributes(body + 16, body_len - 16, nl_link_attribute);
+                nl_attributes(body + 16, body_len - 16, body[0] == 128 ? nl_mr_link_attribute : nl_link_attribute);
             } else if (h->type == 24 && body_len >= 12) {
                 unsigned flags;
                 memcpy(&flags, body + 8, 4);
@@ -9818,6 +9838,23 @@ int main(int argc, char **argv) {
             b = nl_body(7, 16);
             memcpy(b.bytes, &link, 16);
             nl_strict(fd, port, 18, 1, &b, "bridge index");
+            /* RTNL_FAMILY_IPMR (128) dumps its multicast routing tables
+               (ipmr_rtm_dumplink), given an ifinfomsg alone and nothing in
+               it; RTNL_FAMILY_IP6MR (129) has no link dump, so it has
+               rtnl_dump_ifinfo's, and neither has a get of its own. */
+            b = nl_body(128, 16);
+            nl_strict(fd, port, 18, 1, &b, "ipmr");
+            nl_put32(&b, 29, 8);
+            nl_strict(fd, port, 18, 1, &b, "ipmr ext mask");
+            link = (struct nl_link){.family = 128, .index = 1};
+            b = nl_body(128, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_strict(fd, port, 18, 1, &b, "ipmr index");
+            nl_strict(fd, port, 18, 0, &b, "ipmr get");
+            b = nl_body(128, 1);
+            nl_strict(fd, port, 18, 1, &b, "ipmr rtgenmsg");
+            b = nl_body(129, 16);
+            nl_strict(fd, port, 18, 1, &b, "ip6mr");
             /* Getting lo: no flags, and only names, IFLA_EXT_MASK and
                IFLA_TARGET_NETNSID. */
             link = (struct nl_link){.index = 1};
@@ -9950,6 +9987,13 @@ int main(int argc, char **argv) {
             b = nl_body(0, 16);
             nl_put(&b, 3, "lo", 3);
             nl_strict(loose, name.pid, 18, 1, &b, "loose link name");
+            b = nl_body(128, 1);
+            nl_strict(loose, name.pid, 18, 1, &b, "loose ipmr rtgenmsg");
+            link = (struct nl_link){.family = 128, .index = 1};
+            b = nl_body(128, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_put32(&b, 29, 8);
+            nl_strict(loose, name.pid, 18, 1, &b, "loose ipmr index");
             unsigned prefix = 0x800;
             b = nl_body(0, 12);
             memcpy(b.bytes + 8, &prefix, 4);

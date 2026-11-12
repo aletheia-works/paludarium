@@ -1,12 +1,13 @@
 # インストール
 
-paludarium は、crates.io の crate と、npm のパッケージとして公開しています。
+paludarium は、crates.io の crate と、npm と JSR のパッケージとして公開しています。
 
 | 使いたいもの | 入れるもの |
 |---|---|
 | コマンド | `cargo install paludarium` |
 | Rust のライブラリ | `cargo add paludarium` |
 | ブラウザ・Node.js | `npm install @aletheia-works/paludarium-wasm` |
+| 同じパッケージを JSR から | `npx jsr add @aletheia-works/paludarium-wasm` |
 
 ## Rust
 

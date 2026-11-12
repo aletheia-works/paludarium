@@ -256,7 +256,8 @@ the host's.
 
 ## Trusted Publishing only
 
-Releases go to crates.io and npm by Trusted Publishing (OIDC) only, with no
-long-lived token stored anywhere, and npm packages carry provenance. Published
+Releases go to crates.io and npm by Trusted Publishing (OIDC) only, and to
+JSR by the OIDC token of the repository linked to the package, with no
+long-lived token stored anywhere; npm and JSR packages carry provenance. Published
 versions cannot be deleted, so a problem is handled with a crates.io yank or an
 npm deprecation and a fixed release.

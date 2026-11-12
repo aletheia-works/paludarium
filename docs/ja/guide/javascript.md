@@ -10,6 +10,11 @@ Node.js（`worker_threads`）でも動きます。[デモ](../demo) もこのパ
 npm install @aletheia-works/paludarium-wasm
 ```
 
+0.14.0 の次のリリースから、同じファイルを JSR にも
+[`@aletheia-works/paludarium-wasm`](https://jsr.io/@aletheia-works/paludarium-wasm)
+として公開します。CI で確かめている環境は [対応環境](./platforms) のとおりで、
+Deno は含みません。
+
 ## プログラムを動かす
 
 ```js

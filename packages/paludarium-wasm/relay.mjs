@@ -1,3 +1,4 @@
+// @ts-self-types="./relay.d.ts"
 // The reference relay for a guest's network in a browser
 // (docs/guide/relay.md): a WebSocket server that resolves names and opens TCP
 // connections for the coordinator, within its own allow list, so that a page

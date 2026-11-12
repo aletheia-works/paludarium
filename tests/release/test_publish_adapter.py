@@ -17,11 +17,13 @@ import check
 import package
 import policy
 from test_check import CANARY
-from test_package import tar
+from test_package import deno_listing, jsr_fixture, tar
 from test_policy import ROOT
 
 # The real manifests' release version; Release Please bumps it on every release.
 VERSION = policy.inventory(ROOT)["version"]
+# The uploads that authenticate by their own OIDC exchange, not the crates.io token.
+OIDC = ("publish-npm", "publish-jsr")
 
 
 class PublishAdapterTests(unittest.TestCase):
@@ -37,9 +39,10 @@ class PublishAdapterTests(unittest.TestCase):
             "members"
         ]:
             sourcefiles[member + "/Cargo.toml"] = (ROOT / member / "Cargo.toml").read_bytes()
-        sourcefiles["packages/paludarium-wasm/package.json"] = (
-            ROOT / "packages/paludarium-wasm/package.json"
-        ).read_bytes()
+        for name in ("package.json", "jsr.json"):
+            sourcefiles["packages/paludarium-wasm/" + name] = (
+                ROOT / "packages/paludarium-wasm" / name
+            ).read_bytes()
         for n, b in sourcefiles.items():
             p = self.root / n
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -70,20 +73,8 @@ class PublishAdapterTests(unittest.TestCase):
                 name + "-" + VERSION,
             )
             self.crates.append(p)
-        files = {n: b"export {};" for n in package.REQUIRED_JS}
-        files.update(
-            {
-                "package.json": (
-                    '{"name":"@aletheia-works/paludarium-wasm","version":"' + VERSION + '"}'
-                ).encode(),
-                "paludarium.wasm": b"\0asm\x01\0\0\0",
-                "index.d.ts": b"export {};",
-                "relay.d.ts": b"export {};",
-                "LICENSE": b"Apache",
-                "THIRD-PARTY-NOTICES.txt": b"notices",
-                "README.md": b"usage",
-            }
-        )
+        files, config, _ = jsr_fixture()
+        self.jsr_files = package.jsr_files(files, config, VERSION)
         self.npm = self.art / "wasm.tgz"
         tar(self.npm, files)
         with zipfile.ZipFile(self.art / "source-snapshot.zip", "x") as z:
@@ -107,17 +98,21 @@ class PublishAdapterTests(unittest.TestCase):
             source_sha256=sourcehash,
             crates=package.inspect_crates(self.crates, self.inv),
             npm=package.inspect_npm(self.npm, expected),
+            jsr=dict(files=package.jsr_manifest(self.jsr_files)),
         )
         (self.out / "package-result.json").write_text(json.dumps(self.result))
         self.uploaded = set()
         self.env = dict(
             PALUDARIUM_TEST_NODE=sys.executable,
             PALUDARIUM_RELEASE_NPM=__file__,
+            PALUDARIUM_RELEASE_DENO=sys.executable,
             RELEASE_OIDC_CRATES_IO_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
         )
         self.envs = []
         self.yanked = set()
         self.dry_dir = "target/package/tmp-crate"
+        self.jsr_staged = []
+        self.jsr_yanked = False
 
     def request(self, url, timeout):
         if "crates.io/" in url:
@@ -135,6 +130,14 @@ class PublishAdapterTests(unittest.TestCase):
                     )
                 ).encode()
             )
+        if url == check.JSR_PACKAGE_URL + "/meta.json":
+            versions = {VERSION: dict(yanked=True) if self.jsr_yanked else {}}
+            return io.BytesIO(json.dumps(dict(versions=versions)).encode())
+        if url.startswith(check.JSR_PACKAGE_URL + "/"):
+            if "jsr" not in self.uploaded:
+                raise check.urllib.error.HTTPError(url, 404, "absent", {}, None)
+            manifest = package.jsr_manifest(self.jsr_files)
+            return io.BytesIO(json.dumps(dict(manifest=manifest)).encode())
         if "npm" not in self.uploaded:
             raise check.urllib.error.HTTPError(url, 404, "absent", {}, None)
         digest = (
@@ -153,6 +156,13 @@ class PublishAdapterTests(unittest.TestCase):
                 shutil.copyfile(original, target)
             else:
                 self.uploaded.add(name)
+        elif Path(output).name == "dry-jsr":
+            deno_listing(cwd, output)
+        elif Path(output).name == "publish-jsr":
+            self.jsr_staged.append(
+                {f.name: f.read_bytes() for f in Path(cwd).iterdir() if f.is_file()}
+            )
+            self.uploaded.add("jsr")
         else:
             self.uploaded.add("npm")
         return dict(exit=0, timeout=False, error=None, reaped=True)
@@ -169,11 +179,11 @@ class PublishAdapterTests(unittest.TestCase):
             return check.publish_artifacts(self.root, None)
 
     def test_mocked_upload_transport(self):
-        self.assertEqual(len(self.execute()["published"]), 13)
+        self.assertEqual(len(self.execute()["published"]), 14)
 
     def test_older_cargo_dry_run_location(self):
         self.dry_dir = "target/package"
-        self.assertEqual(len(self.execute()["published"]), 13)
+        self.assertEqual(len(self.execute()["published"]), 14)
 
     def test_upload_that_shows_up_late_is_waited_for(self):
         request = self.request
@@ -189,7 +199,7 @@ class PublishAdapterTests(unittest.TestCase):
 
         self.request = late
         with patch.object(check.time, "sleep", side_effect=sleeps.append):
-            self.assertEqual(len(self.execute()["published"]), 13)
+            self.assertEqual(len(self.execute()["published"]), 14)
         self.assertEqual(sleeps, [check.UPLOAD_POLL_SECONDS] * 5)
 
     def test_upload_that_never_shows_up_stops(self):
@@ -226,8 +236,47 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertEqual(self.uploaded, set())
 
     def test_existing_versions_are_not_uploaded(self):
-        self.uploaded = set(self.inv["order"]) | {"npm"}
-        self.assertEqual(len(self.execute()["published"]), 13)
+        self.uploaded = set(self.inv["order"]) | {"npm", "jsr"}
+        self.assertEqual(len(self.execute()["published"]), 14)
+        self.assertEqual(self.envs, [])
+
+    # JSR gets exactly the verified npm files, without package.json, plus jsr.json.
+    def test_jsr_upload_is_the_verified_files(self):
+        result = self.execute()
+        self.assertEqual(result["published"][-2:], [check.NPM_NAME, check.JSR_KEY])
+        self.assertEqual(self.jsr_staged, [self.jsr_files])
+        [env] = [e for n, e in self.envs if n == "publish-jsr"]
+        self.assertLessEqual(set(env), set(check.JSR_ENVIRONMENT))
+        self.assertEqual(env["DENO_DIR"], str(self.out / "deno-dir"))
+
+    def test_prepared_jsr_files_changed_stops_before_any_upload(self):
+        self.result["jsr"]["files"]["/README.md"]["size"] += 1
+        (self.out / "package-result.json").write_text(json.dumps(self.result))
+        with self.assertRaisesRegex(ValueError, "prepared JSR files changed"):
+            self.execute()
+        self.assertEqual(self.uploaded, set())
+        self.assertEqual(self.envs, [])
+
+    def test_jsr_version_with_other_files_stops(self):
+        request = self.request
+
+        def other(url, timeout):
+            if url.endswith("_meta.json") and "jsr" in self.uploaded:
+                return io.BytesIO(json.dumps(dict(manifest={})).encode())
+            return request(url, timeout)
+
+        self.request = other
+        with self.assertRaisesRegex(ValueError, "JSR version files differ"):
+            self.execute()
+        progress = json.loads((self.out / "publication-progress.json").read_text())
+        self.assertIn(check.JSR_KEY, progress["uploaded_but_possibly_unverified"])
+        self.assertNotIn(check.JSR_KEY, progress["completed"])
+
+    def test_yanked_jsr_version_is_not_published(self):
+        self.uploaded = set(self.inv["order"]) | {"npm", "jsr"}
+        self.jsr_yanked = True
+        with self.assertRaisesRegex(ValueError, "existing version is yanked"):
+            self.execute()
 
     def test_artifact_head_changed_before_upload(self):
         self.result["head"] = "b" * 40
@@ -248,10 +297,10 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertNotIn("authentication", result)
         token = CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"]
         dry = [e for n, e in self.envs if n.startswith("dry-")]
-        uploads = [e for n, e in self.envs if n.startswith("publish-") and n != "publish-npm"]
-        npm_env = [e for n, e in self.envs if n == "publish-npm"]
-        self.assertEqual((len(dry), len(uploads), len(npm_env)), (12, 12, 1))
-        self.assertTrue(all(token not in e.values() for e in dry + npm_env))
+        uploads = [e for n, e in self.envs if n.startswith("publish-") and n not in OIDC]
+        own = [e for n, e in self.envs if n in OIDC]
+        self.assertEqual((len(dry), len(uploads), len(own)), (13, 12, 2))
+        self.assertTrue(all(token not in e.values() for e in dry + own))
         self.assertTrue(all(e["CARGO_REGISTRY_TOKEN"] == token for e in uploads))
         recorded = json.dumps(result) + (self.out / "publication-progress.json").read_text()
         self.assertNotIn(token, recorded)
@@ -271,18 +320,15 @@ class PublishAdapterTests(unittest.TestCase):
         done = self.inv["order"][:3]
         self.uploaded = set(done)
         result = self.execute()
-        self.assertEqual(
-            result["published"], self.inv["order"] + ["@aletheia-works/paludarium-wasm"]
-        )
+        self.assertEqual(result["published"], [*self.inv["order"], check.NPM_NAME, check.JSR_KEY])
         names = [n for n, _ in self.envs]
         self.assertFalse([n for n in names if any(n.endswith("-" + d) for d in done)])
-        self.assertEqual(
-            len([n for n in names if n.startswith("publish-") and n != "publish-npm"]), 9
-        )
+        self.assertEqual(len([n for n in names if n.startswith("publish-") and n not in OIDC]), 9)
         self.assertIn("publish-npm", names)
+        self.assertIn("publish-jsr", names)
         progress = json.loads((self.out / "publication-progress.json").read_text())
         self.assertEqual(
-            progress["attempted"], [*self.inv["order"][3:], "@aletheia-works/paludarium-wasm"]
+            progress["attempted"], [*self.inv["order"][3:], check.NPM_NAME, check.JSR_KEY]
         )
         self.assertFalse(progress["automatic_retry"])
 
@@ -328,9 +374,11 @@ class PublishAdapterTests(unittest.TestCase):
             GITHUB_ACTIONS="true",
         )
         self.execute()
-        cargo = [e for n, e in self.envs if n != "publish-npm"]
+        cargo = [e for n, e in self.envs if n not in OIDC]
         npm = next(e for n, e in self.envs if n == "publish-npm")
-        self.assertEqual(len(cargo), 24)
+        jsr = next(e for n, e in self.envs if n == "publish-jsr")
+        # The 12 cargo dry runs and uploads, and JSR's dry run with the same environment.
+        self.assertEqual(len(cargo), 25)
         self.assertTrue(
             all(
                 not {
@@ -348,6 +396,11 @@ class PublishAdapterTests(unittest.TestCase):
             ("https://oidc.example.invalid", "true"),
         )
         self.assertNotIn("GH_TOKEN", npm)
+        self.assertEqual(
+            (jsr["ACTIONS_ID_TOKEN_REQUEST_URL"], jsr["GITHUB_ACTIONS"]),
+            ("https://oidc.example.invalid", "true"),
+        )
+        self.assertNotIn("GH_TOKEN", jsr)
 
     def test_oidc_mode_uses_oidc_token(self):
         self.execute()
@@ -355,14 +408,14 @@ class PublishAdapterTests(unittest.TestCase):
             all(
                 e["CARGO_REGISTRY_TOKEN"] == CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"]
                 for n, e in self.envs
-                if n.startswith("publish-") and n != "publish-npm"
+                if n.startswith("publish-") and n not in OIDC
             )
         )
         self.assertTrue(
             all(
                 "CARGO_REGISTRY_TOKEN" not in e
                 for n, e in self.envs
-                if n.startswith("dry-") or n == "publish-npm"
+                if n.startswith("dry-") or n in OIDC
             )
         )
 

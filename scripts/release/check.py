@@ -86,6 +86,7 @@ def run_command(argv, cwd, output, timeout=120, env=None):
             "CARGO_HOME",
             "PALUDARIUM_TEST_NODE",
             "PALUDARIUM_RELEASE_NPM",
+            "PALUDARIUM_RELEASE_DENO",
         )
         if k in selected
     }
@@ -192,6 +193,10 @@ REGISTRY_USER_AGENT = "paludarium-release (https://github.com/aletheia-works/pal
 CRATES_API = "https://crates.io/api/v1/crates/"
 NPM_NAME = "@aletheia-works/paludarium-wasm"
 NPM_PACKAGE_URL = "https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm"
+# The same name on JSR; this key keeps it apart from the npm package in records.
+JSR_KEY = "jsr:" + NPM_NAME
+JSR_PACKAGE_API = "https://api.jsr.io/scopes/aletheia-works/packages/paludarium-wasm"
+JSR_PACKAGE_URL = "https://jsr.io/@aletheia-works/paludarium-wasm"
 CARGO_TOKEN_NAMES = ("CARGO_REGISTRY_TOKEN", "RELEASE_OIDC_CRATES_IO_TOKEN")
 # Each publication child gets only the variables it needs (allow-list).
 COMMON_ENVIRONMENT = (
@@ -245,6 +250,29 @@ NPM_ENVIRONMENT = (
     "NPM_CONFIG_USERCONFIG",
     "NODE_AUTH_TOKEN",
 )
+# deno publish on GitHub Actions: the OIDC request JSR exchanges for a publish
+# token, and what cli/tools/publish/provenance.rs of denoland/deno reads for
+# the provenance statement. DENO_DIR is the job-local cache.
+JSR_ENVIRONMENT = (
+    *COMMON_ENVIRONMENT,
+    "CI",
+    "GITHUB_ACTIONS",
+    "ACTIONS_ID_TOKEN_REQUEST_URL",
+    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    "GITHUB_SERVER_URL",
+    "GITHUB_REPOSITORY",
+    "GITHUB_REPOSITORY_ID",
+    "GITHUB_REPOSITORY_OWNER_ID",
+    "GITHUB_WORKFLOW_REF",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_REF",
+    "GITHUB_SHA",
+    "GITHUB_RUN_ID",
+    "GITHUB_RUN_ATTEMPT",
+    "RUNNER_ENVIRONMENT",
+    "DENO_DIR",
+    "DENO_NO_UPDATE_CHECK",
+)
 
 
 def registry_request(url):
@@ -289,14 +317,29 @@ def registry_version(url):
     return body if isinstance(body, dict) else {}
 
 
+def jsr_linked():
+    """True when the JSR package exists; it must then be linked to this repository,
+    which is what lets the publish job's OIDC token publish it."""
+    body = registry_version(JSR_PACKAGE_API)
+    if body is None:
+        return False
+    repository = body.get("githubRepository") or {}
+    policy.require(
+        "{}/{}".format(repository.get("owner"), repository.get("name")) == policy.REPOSITORY,
+        "JSR package is not linked to " + policy.REPOSITORY + " (docs/release.md)",
+    )
+    return True
+
+
 def registry_presence(order):
-    """Which of the twelve crate names and @aletheia-works/paludarium-wasm exist on their registry."""
+    """Which of the twelve crate names, @aletheia-works/paludarium-wasm and its JSR
+    package exist on their registry."""
     urls = {name: CRATES_API + name for name in order}
     urls[NPM_NAME] = NPM_PACKAGE_URL
-    return dict(
-        present=sorted(name for name, url in sorted(urls.items()) if registry_present(url)),
-        checked=sorted(urls),
-    )
+    present = [name for name, url in sorted(urls.items()) if registry_present(url)]
+    if jsr_linked():
+        present.append(JSR_KEY)
+    return dict(present=sorted(present), checked=sorted([*urls, JSR_KEY]))
 
 
 def npm_integrity(raw):
@@ -308,9 +351,10 @@ def allowed(environ, names, **extra):
 
 
 def publication_environments(environ):
-    """(dry-run, cargo upload, npm upload) child environments, built from allow-lists.
-    Only the cargo upload gets the short-lived crates.io OIDC token; npm uses Trusted
-    Publishing itself and dry runs get none. Values never enter results, receipts or
+    """(dry-run, cargo upload, npm upload, JSR upload) child environments, built from
+    allow-lists. Only the cargo upload gets the short-lived crates.io OIDC token; npm
+    and JSR use their own OIDC exchange and dry runs get none. Values never enter
+    results, receipts or
     progress records (receipts keep only whitelisted non-secret keys)."""
     oidc = environ.get("RELEASE_OIDC_CRATES_IO_TOKEN", "")
     policy.require(bool(oidc), "crates.io OIDC token absent")
@@ -318,6 +362,7 @@ def publication_environments(environ):
         allowed(environ, CARGO_ENVIRONMENT),
         allowed(environ, CARGO_ENVIRONMENT, CARGO_REGISTRY_TOKEN=oidc),
         allowed(environ, NPM_ENVIRONMENT),
+        allowed(environ, JSR_ENVIRONMENT),
     )
 
 
@@ -547,7 +592,16 @@ def publish_artifacts(root, evidence):
         RUSTDOC=str(cargo.with_name("rustdoc")),
         PATH=str(cargo.parent) + os.pathsep + os.environ["PATH"],
     )
-    dry_env, cargo_env, npm_env = publication_environments(env)
+    # JSR gets the same verified files as npm, without package.json and with
+    # jsr.json from the verified source snapshot.
+    files = package.jsr_files(
+        package.members(tarballs[0], "package"),
+        (source / "packages/paludarium-wasm/jsr.json").read_bytes(),
+        approved["version"],
+    )
+    manifest = package.jsr_manifest(files)
+    policy.require(manifest == result["jsr"]["files"], "prepared JSR files changed")
+    dry_env, cargo_env, npm_env, jsr_env = publication_environments(env)
     completed = []
     attempted = []
     uploaded = []
@@ -670,6 +724,29 @@ def publish_artifacts(root, evidence):
             integrity,
         )
         completed.append("@aletheia-works/paludarium-wasm")
+        url = JSR_PACKAGE_URL + "/" + approved["version"] + "_meta.json"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                body = json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            deno = Path(os.environ["PALUDARIUM_RELEASE_DENO"])
+            # As for the crates: the dry run of the same stage must list exactly
+            # the approved files before anything is uploaded.
+            package.deno_publish(deno, files, directory / "dry-jsr", dry_env, dry_run=True)
+            attempted.append(JSR_KEY)
+            package.deno_publish(deno, files, directory / "publish-jsr", jsr_env, dry_run=False)
+            uploaded.append(JSR_KEY)
+            body = uploaded_metadata(url)
+        policy.require(body.get("manifest") == manifest, "JSR version files differ")
+        with urllib.request.urlopen(JSR_PACKAGE_URL + "/meta.json", timeout=30) as response:
+            versions = json.load(response).get("versions", {})
+        policy.require(approved["version"] in versions, "JSR version not listed")
+        policy.require(
+            versions[approved["version"]].get("yanked") is not True, "existing version is yanked"
+        )
+        completed.append(JSR_KEY)
         return dict(published=completed, head=approved["head"], version=approved["version"])
     finally:
         with (directory / "publication-progress.json").open("x") as f:

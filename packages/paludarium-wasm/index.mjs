@@ -1,3 +1,4 @@
+// @ts-self-types="./index.d.ts"
 import { isNode, spawnWorker, listen, stopWorker } from "./worker-support.mjs";
 import { decodeSnapshot } from "./filesystem-snapshot.mjs";
 export class PaludariumError extends Error {

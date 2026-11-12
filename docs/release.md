@@ -5,10 +5,12 @@
 Every release is listed on the
 [releases page](https://github.com/aletheia-works/paludarium/releases); the
 workspace version in `Cargo.toml` stays that of the latest release until the
-Release Please pull request raises it. The twelve crates and
-`@aletheia-works/paludarium-wasm` are published only by Trusted Publishing
-(OIDC) from `publish.yml`, after the same-head evidence of the head (steps 5
-and 6 below). Only the first release, `v0.1.0` (2026-10-20, tag on
+Release Please pull request raises it. The twelve crates,
+`@aletheia-works/paludarium-wasm` on npm and the same files on JSR are
+published only with OIDC from `publish.yml` (Trusted Publishing on crates.io
+and npm; on JSR, the GitHub repository linked to the package), after the
+same-head evidence of the head (steps 5 and 6 below). JSR is published from
+the first release after 0.14.0. Only the first release, `v0.1.0` (2026-10-20, tag on
 0f456d07), was published by hand with one-time scoped tokens, because
 crates.io lets a Trusted Publisher be registered only for a crate that
 already exists.
@@ -16,7 +18,8 @@ already exists.
 The twelve public crates are types, host, mmu, vfs, loader, decoder, cpu,
 jit, jit-native, kernel, runtime and paludarium, in the dependency order calculated from
 the manifests. They share the workspace version, which Release Please sets
-together with the internal dependency versions and the npm package version.
+together with the internal dependency versions and the npm package version
+(in its `package.json` and `jsr.json`).
 Harness, the Rust Wasm adapter and the fuzz crate have `publish = false`.
 
 The tested toolchain is the nightly pinned in `rust-toolchain.toml`. Every
@@ -43,7 +46,16 @@ builds a crate-external consumer from a temporary sparse registry, probes
 stable separately, and builds the production Wasm without diagnostic features.
 One npm tarball is inspected and used for all seven distribution boundary
 checks, including real Wasm hello, invalid guest cleanup, missing JS and a
-corrupt Wasm. A mock upload test is not a registry or OIDC test.
+corrupt Wasm. The JSR upload is that tarball's files without `package.json`,
+plus `packages/paludarium-wasm/jsr.json`, whose name, version, license,
+exports and `publish.include` must match `package.json` and those files; the
+whole upload must stay under JSR's 20 MiB limit (`MAX_TOTAL_FILE_SIZE` in
+jsr-io/jsr `api/src/tarball.rs`), and `index.mjs` and `relay.mjs` must name
+their `.d.ts` with `@ts-self-types`. `deno publish --dry-run` of exactly those
+files, staged in a temporary directory outside the checkout, must succeed and
+list each of them. It uses `PALUDARIUM_RELEASE_DENO`, else the `deno` on
+`PATH` (CI pins Deno 2.9.8 with setup-deno). A mock upload test is not a
+registry or OIDC test.
 
 `release-check.yml` is PR/manual/reusable and has no publication credentials.
 It measures the fixed policy/package/check/acceptance file population (four
@@ -192,8 +204,8 @@ itself.
    proposes is the one to publish, or let `release-merge.yml` merge it
    on Monday. `release.yml` (Release Please) keeps a
    release PR open from every push to main; it changes only the versions
-   (`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock`, `package.json`) and the
-   manifest; its body holds the release notes. Merging it starts the release in
+   (`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock`, `package.json`,
+   `jsr.json`) and the manifest; its body holds the release notes. Merging it starts the release in
    `publish.yml` (steps 5 and 6). Confirm: note
    the merge commit, the new main head SHA;
    `gh api repos/aletheia-works/paludarium/commits/<sha> --jq .commit.verification.verified`
@@ -210,8 +222,13 @@ itself.
    crate or npm package that is not on its registry yet is published once
    by hand (by its owner, from the release head, with a short-lived token
    that is revoked right after), and its Trusted Publisher is registered as
-   in step 4 before the next release. The evidence job of `publish.yml` stops before
-   any dispatch while a package is missing. crates.io also limits how many
+   in step 4 before the next release. Nothing is published by hand on JSR:
+   its owner creates `@aletheia-works/paludarium-wasm` in the
+   `@aletheia-works` scope on jsr.io and links it, in the package's
+   settings, to the GitHub repository `aletheia-works/paludarium`, which is
+   what lets the publish job's OIDC token publish it. The evidence job of
+   `publish.yml` stops before any dispatch while a package is missing or the
+   JSR package is linked to another repository. crates.io also limits how many
    new crates one account can create in a short time (the first
    publication stopped after five and resumed every ten minutes). Each
    cargo and npm child of the publish job gets only an allow-list of
@@ -220,7 +237,9 @@ itself.
    `GITHUB_TOKEN` or `ACTIONS_ID_TOKEN_REQUEST_*`, and `npm` receives only
    what `npm publish --provenance` needs (CI detection, the OIDC request
    variables, the GitHub context named in the provenance statement and
-   setup-node's `.npmrc`). Receipts and `publication-progress.json` record
+   setup-node's `.npmrc`), and `deno publish` receives only the OIDC request
+   variables and the GitHub context that Deno's provenance statement reads
+   (`JSR_ENVIRONMENT`). Receipts and `publication-progress.json` record
    no token value.
 4. **Register the Trusted Publishers.** For each of the twelve crates on
    crates.io and for `@aletheia-works/paludarium-wasm` on npm, register
@@ -232,13 +251,17 @@ itself.
    secrets. Confirm: each crate's and the npm package's Trusted Publishing
    settings show exactly that repository, workflow and environment. Without
    a registered Trusted Publisher, the publish job's OIDC token exchange
-   fails before any upload.
+   fails before any upload. JSR has no Trusted Publisher to register: the
+   repository link of step 3 takes its place. Confirm:
+   `https://api.jsr.io/scopes/aletheia-works/packages/paludarium-wasm`
+   shows `githubRepository` `aletheia-works/paludarium`.
 5. **Same-head evidence: automatic.**
    `.github/workflows/publish.yml` runs on every push to main. Its
    `evidence` job runs `scripts/release/evidence.py`: while tag
    `v<version>` of the workspace version does not exist and the main head
-   is that push, it first requires every crate and the npm package to exist
-   on its registry without this version: a missing package (step 3) or a
+   is that push, it first requires every crate, the npm package and the
+   JSR package (linked to this repository) to exist on their registry
+   without this version: a missing package (step 3) or a
    version already partly on a registry (re-run the stopped jobs of the
    earlier `Publish` run instead) stops it before any dispatch. It then
    waits for the `ci.yml` push run, dispatches `macos-quality.yml`,
@@ -272,7 +295,8 @@ itself.
    succeeded, the same `Publish` run continues with `preflight` (main,
    untagged version, signed head, environment), `packages` (the package
    check of that head) and `publish` (every crate and the npm package by
-   Trusted Publishing, without waiting for an approval). Only after all of
+   Trusted Publishing, then the same files on JSR, without waiting for an
+   approval). Only after all of
    them succeeded does its `tag` job create tag `v<version>` and the GitHub
    release (notes from the body of the merged release PR, whose merge commit
    that head must contain, with the commits after it added) on that head
@@ -282,12 +306,16 @@ itself.
    deleted or moved. Confirm: the run succeeded and
    `publication-progress.json` (in the run's artifact
    `publication-progress-attempt-<n>`) lists all twelve
-   crates and `@aletheia-works/paludarium-wasm`; then, independently, each crate's
+   crates, `@aletheia-works/paludarium-wasm` and
+   `jsr:@aletheia-works/paludarium-wasm`; then, independently, each crate's
    `https://crates.io/api/v1/crates/<name>/<version>` `checksum` equals the
    `.crate` SHA-256 in the `release-package` artifact, `npm view
    @aletheia-works/paludarium-wasm@<version> dist.integrity` equals the tarball's SHA-512
-   integrity, and the npm provenance attestation names the upstream
-   repository, `publish.yml` and that head.
+   integrity, the npm provenance attestation names the upstream
+   repository, `publish.yml` and that head, and each file listed in
+   `https://jsr.io/@aletheia-works/paludarium-wasm/<version>_meta.json` has
+   the size and SHA-256 of the same file in the tarball (`jsr.json`: in the
+   release head).
 
 The evidence document follows `policy.release_gate`: exact head/tag/repository,
 official completed successful quality run identities for every required
@@ -307,8 +335,9 @@ builds, publishes without waiting for an approval, and tags last.
 
 Only the publish job receives `id-token: write`. crates-io-auth-action
 obtains a short-lived crates.io token and revokes it in its post step, only
-the `cargo publish` children receive it, and npm uses Trusted Publishing
-with provenance. No registry token is stored anywhere. All
+the `cargo publish` children receive it, npm uses Trusted Publishing
+with provenance, and `deno publish` exchanges the job's OIDC token for a
+JSR publish token, also with provenance. No registry token is stored anywhere. All
 third-party actions are pinned to
 officially resolved commit SHAs. The fork is never substituted for upstream.
 
@@ -317,7 +346,11 @@ tarball. Cargo dry-run reassembly must have the approved byte digest before
 upload; original source/locks must remain unchanged. Existing versions are
 queried first: an equal digest is verified without re-upload, a different
 digest or unknown network result stops the sequence. The same npm tarball is
-uploaded. Registry checksums/integrity are checked after each upload; a
+uploaded. JSR gets that tarball's files and `jsr.json` (checked against the
+package check's list before any upload), after a dry run of the same files
+lists exactly them; its `<version>_meta.json` must then list exactly their
+sizes and SHA-256, and a JSR version already present is only verified that
+way and must not be yanked. Registry checksums/integrity are checked after each upload; a
 just-uploaded version that still answers 404 is asked again every 15 seconds
 for up to 15 minutes (the first npm upload took about five minutes to appear).
 
@@ -340,4 +373,6 @@ enough: registry retrieval/source/provenance verification is required.
 - [Current crates.io Trusted Publishing implementation documentation](https://github.com/rust-lang/crates.io/blob/8b4b7af90bf73b0bbb73b47a29b9de86ed702093/svelte/src/routes/docs/trusted-publishing/%2Bpage.svelte)
 - [crates.io authentication action](https://github.com/rust-lang/crates-io-auth-action)
 - [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
+- [Publishing packages to JSR](https://jsr.io/docs/publishing-packages)
+- [JSR quotas and limits](https://jsr.io/docs/quotas-and-limits)
 - [GitHub environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)

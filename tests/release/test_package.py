@@ -4,6 +4,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -171,6 +172,143 @@ class PackageTests(unittest.TestCase):
         paths, inv = self.crates()
         with self.assertRaises(ValueError):
             package.inspect_crates(paths[:-1], inv)
+
+
+def jsr_fixture():
+    """The real package.json and jsr.json with small stand-ins for the other npm files."""
+    manifest = (ROOT / "packages/paludarium-wasm/package.json").read_bytes()
+    config = (ROOT / "packages/paludarium-wasm/jsr.json").read_bytes()
+    files = {n: b"export {};" for n in package.REQUIRED_JS}
+    files.update(
+        {
+            "index.mjs": b'// @ts-self-types="./index.d.ts"\nexport {};',
+            "relay.mjs": b'// @ts-self-types="./relay.d.ts"\nexport {};',
+            "package.json": manifest,
+            "index.d.ts": b"export {};",
+            "relay.d.ts": b"export {};",
+            "paludarium.wasm": b"\0asm\x01\0\0\0",
+            "LICENSE": b"Apache-2.0",
+            "THIRD-PARTY-NOTICES.txt": b"notices",
+            "README.md": b"usage",
+        }
+    )
+    return files, config, json.loads(manifest)["version"]
+
+
+def deno_listing(cwd, output, skip=()):
+    """What `deno publish --dry-run` prints for the files staged in cwd."""
+    rows = "".join(
+        f"   \x1b[0m{Path(cwd).resolve().as_uri()}/{f.name} ({f.stat().st_size}B)\n"
+        for f in sorted(Path(cwd).iterdir())
+        if f.name not in skip
+    )
+    Path(output).mkdir()
+    (Path(output) / "stdout.bin").write_text("Simulating publish of x with files:\n" + rows)
+    (Path(output) / "stderr.bin").write_text("Success Dry run complete\n")
+
+
+class JsrTests(unittest.TestCase):
+    def setUp(self):
+        self.files, self.config, self.version = jsr_fixture()
+
+    def edited(self, **change):
+        settings = json.loads(self.config)
+        settings.update(change)
+        return json.dumps(settings).encode()
+
+    def test_the_npm_files_without_package_json_plus_jsr_json(self):
+        files = package.jsr_files(self.files, self.config, self.version)
+        self.assertEqual(set(files), (set(self.files) - {"package.json"}) | {"jsr.json"})
+        self.assertEqual(files["jsr.json"], self.config)
+        self.assertEqual(
+            package.jsr_manifest(files)["/jsr.json"],
+            dict(size=len(self.config), checksum="sha256-" + package.sha(self.config)),
+        )
+
+    def test_the_real_jsr_json_matches_the_real_package_json(self):
+        settings = json.loads(self.config)
+        manifest = json.loads(self.files["package.json"])
+        self.assertEqual(settings["version"], manifest["version"])
+        self.assertEqual(
+            sorted(settings["publish"]["include"]),
+            sorted([*manifest["files"], "jsr.json"]),
+        )
+
+    def test_identity_version_and_license(self):
+        for change in (
+            dict(name="@aletheia-works/other"),
+            dict(version="0.0.0"),
+            dict(license="MIT"),
+        ):
+            with self.subTest(change), self.assertRaisesRegex(ValueError, "identity"):
+                package.jsr_files(self.files, self.edited(**change), self.version)
+
+    def test_exports_follow_package_json(self):
+        with self.assertRaisesRegex(ValueError, "exports"):
+            package.jsr_files(self.files, self.edited(exports={".": "./index.mjs"}), self.version)
+
+    def test_include_must_be_exactly_the_files(self):
+        settings = json.loads(self.config)
+        for publish in (
+            dict(include=settings["publish"]["include"][1:]),
+            dict(include=[*settings["publish"]["include"], "package.json"]),
+            dict(include=settings["publish"]["include"], exclude=["README.md"]),
+        ):
+            with self.subTest(publish), self.assertRaisesRegex(ValueError, "publish.include"):
+                package.jsr_files(self.files, self.edited(publish=publish), self.version)
+
+    def test_size_limit(self):
+        self.files["paludarium.wasm"] = b"\0" * package.JSR_MAX_BYTES
+        with self.assertRaisesRegex(ValueError, "20 MiB"):
+            package.jsr_files(self.files, self.config, self.version)
+
+    def test_entry_points_name_their_types(self):
+        for name in ("index.mjs", "relay.mjs"):
+            with self.subTest(name):
+                files = dict(self.files, **{name: b"export {};"})
+                with self.assertRaisesRegex(ValueError, "types for JSR"):
+                    package.jsr_files(files, self.config, self.version)
+
+    def test_dry_run_of_exactly_those_files(self):
+        import check
+
+        temp = tempfile.TemporaryDirectory(dir=ROOT / "target/release-evidence")
+        self.addCleanup(temp.cleanup)
+        out = Path(temp.name)
+        tarball = out / "npm.tgz"
+        tar(tarball, self.files)
+        seen = []
+
+        def command(argv, cwd, output, timeout, env):
+            seen.append((argv, sorted(p.name for p in Path(cwd).iterdir()), Path(output).name, env))
+            self.assertFalse(Path(cwd).resolve().is_relative_to(ROOT))
+            deno_listing(cwd, output, self.unlisted)
+            return dict(exit=0, timeout=False, error=None, reaped=True)
+
+        self.unlisted = ()
+
+        with unittest.mock.patch.object(check, "run_command", side_effect=command):
+            result = package.jsr_check(
+                out, tarball, self.config, self.version, Path("/deno"), {"PATH": "/bin"}
+            )
+        files = package.jsr_files(self.files, self.config, self.version)
+        self.assertEqual(result["files"], package.jsr_manifest(files))
+        self.assertEqual(result["bytes"], sum(len(b) for b in files.values()))
+        [(argv, listed, output, env)] = seen
+        self.assertEqual(argv, [str(Path("/deno")), "publish", "--dry-run", "--allow-dirty"])
+        self.assertEqual(listed, sorted(files))
+        self.assertEqual(output, "jsr-dry-run")
+        self.assertEqual(env["DENO_DIR"], str(out / "deno-dir"))
+        self.assertEqual(env["PATH"], "/bin")
+        self.unlisted = ("paludarium.wasm",)
+        (out / "jsr-dry-run").rename(out / "first")
+        with (
+            unittest.mock.patch.object(check, "run_command", side_effect=command),
+            self.assertRaisesRegex(ValueError, "does not list exactly the files"),
+        ):
+            package.jsr_check(
+                out, tarball, self.config, self.version, Path("/deno"), {"PATH": "/bin"}
+            )
 
 
 if __name__ == "__main__":

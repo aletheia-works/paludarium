@@ -23,6 +23,8 @@ cargo-deny = "latest"
 "aqua:taiki-e/cargo-llvm-cov" = "latest"
 # The npm package, its tests and the documentation site.
 node = "latest"
+# The JSR publication of the npm package (deno publish).
+deno = "latest"
 bun = "latest"
 # Release and test scripts.
 python = "latest"

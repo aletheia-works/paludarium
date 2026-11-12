@@ -93,7 +93,7 @@ class Clock:
 
 
 INVENTORY = policy.inventory(ROOT)
-CHECKED = sorted(INVENTORY["order"] + [check.NPM_NAME])
+CHECKED = sorted(INVENTORY["order"] + [check.NPM_NAME, check.JSR_KEY])
 
 
 def published(order):
@@ -150,7 +150,12 @@ class Evidence(unittest.TestCase):
         self.assertEqual(api.posts, [])
 
     def test_a_package_not_on_a_registry_yet_stops_before_any_dispatch(self):
-        for present in (CHECKED[1:], [n for n in CHECKED if n != check.NPM_NAME], []):
+        for present in (
+            CHECKED[1:],
+            [n for n in CHECKED if n != check.NPM_NAME],
+            [n for n in CHECKED if n != check.JSR_KEY],
+            [],
+        ):
             with self.subTest(present=present):
                 api = FakeGitHub()
                 missing = sorted(set(CHECKED) - set(present))
@@ -197,8 +202,14 @@ class Evidence(unittest.TestCase):
         ):
             self.assertTrue(E.version_present("paludarium-cpu", "0.2.0"))
             self.assertTrue(E.version_present(check.NPM_NAME, "0.2.0"))
+            self.assertTrue(E.version_present(check.JSR_KEY, "0.2.0"))
         self.assertEqual(
-            asked, [check.CRATES_API + "paludarium-cpu/0.2.0", check.NPM_PACKAGE_URL + "/0.2.0"]
+            asked,
+            [
+                check.CRATES_API + "paludarium-cpu/0.2.0",
+                check.NPM_PACKAGE_URL + "/0.2.0",
+                check.JSR_PACKAGE_URL + "/0.2.0_meta.json",
+            ],
         )
 
     def test_a_run_a_person_already_dispatched_is_reused(self):

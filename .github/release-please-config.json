@@ -35,6 +35,11 @@
           "type": "json",
           "path": "packages/paludarium-wasm/package.json",
           "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "packages/paludarium-wasm/jsr.json",
+          "jsonpath": "$.version"
         }
       ]
     }

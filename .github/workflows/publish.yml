@@ -7,8 +7,8 @@ name: Publish
 #      waits for all of them (docs/release.md).
 #   2. preflight and packages: the signed head, the release environment and
 #      the package check of that head.
-#   3. publish: every crate and the npm package by Trusted Publishing (OIDC)
-#      only, without waiting for an approval.
+#   3. publish: every crate, the npm package and the same files on JSR by
+#      Trusted Publishing (OIDC) only, without waiting for an approval.
 #   4. tag: the tag and the GitHub release, only after all of it succeeded,
 #      so a version that was not published never gets a tag.
 # A stopped job is re-run in the same run; nothing is tagged until then.
@@ -100,6 +100,9 @@ jobs:
         with:
           node-version: 'latest'
           registry-url: https://registry.npmjs.org
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.9.8
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-package
@@ -126,7 +129,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_OIDC_CRATES_IO_TOKEN: ${{ steps.crates.outputs.token }}
         run: |
-          PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/release-evidence/tools/node_modules/npm/bin/npm-cli.js" python -B scripts/release/check.py --mode publish --evidence target/release-evidence/release-evidence.json
+          PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/release-evidence/tools/node_modules/npm/bin/npm-cli.js" PALUDARIUM_RELEASE_DENO="$(command -v deno)" python -B scripts/release/check.py --mode publish --evidence target/release-evidence/release-evidence.json
       # Keep the progress record and the command receipts after the
       # runner is gone, also when publishing stopped. They hold no token values (check.py records none).
       - name: Keep the publication progress and command receipts

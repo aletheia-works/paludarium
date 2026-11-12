@@ -107,6 +107,96 @@ def inspect_npm(path, expected):
     )
 
 
+JSR_NAME = "@aletheia-works/paludarium-wasm"
+# MAX_FILE_SIZE and MAX_TOTAL_FILE_SIZE in api/src/tarball.rs of jsr-io/jsr.
+JSR_MAX_BYTES = 20 * 1024 * 1024
+
+
+def jsr_files(npm_files, config, version):
+    """The JSR upload: the npm tarball's files without package.json, plus jsr.json."""
+    metadata = json.loads(npm_files["package.json"])
+    settings = json.loads(config)
+    policy.require(
+        settings.get("name") == JSR_NAME
+        and settings.get("version") == version
+        and settings.get("license") == metadata.get("license"),
+        "jsr.json identity/version/license differs",
+    )
+    policy.require(
+        settings.get("exports") == {k: v["import"] for k, v in metadata["exports"].items()},
+        "jsr.json exports differ from package.json",
+    )
+    files = {n: b for n, b in npm_files.items() if n != "package.json"}
+    files["jsr.json"] = config
+    policy.require(
+        sorted(settings.get("publish", {}).get("include", [])) == sorted(files)
+        and "exclude" not in settings.get("publish", {}),
+        "jsr.json publish.include differs from the npm files",
+    )
+    policy.require(
+        sum(len(b) for b in files.values()) < JSR_MAX_BYTES,
+        "JSR package reaches the 20 MiB limit",
+    )
+    for name in ("index.mjs", "relay.mjs"):
+        types = "./" + name[: -len(".mjs")] + ".d.ts"
+        policy.require(
+            files[name].startswith(b'// @ts-self-types="' + types.encode() + b'"'),
+            name + " does not name its types for JSR",
+        )
+    return files
+
+
+def jsr_manifest(files):
+    """What JSR's <version>_meta.json lists for exactly these files."""
+    return {"/" + n: dict(size=len(b), checksum="sha256-" + sha(b)) for n, b in files.items()}
+
+
+def write_files(directory, files):
+    for name, raw in files.items():
+        p = directory / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(raw)
+
+
+def deno_publish(deno, files, output, env, dry_run):
+    """`deno publish` of exactly these files; a dry run must list every one of them.
+
+    The files are staged in a temporary directory outside the checkout, so that
+    no .gitignore or deno configuration of the checkout can change what deno
+    publish picks up (JSR documents that the root .gitignore is honoured)."""
+    import tempfile
+    from pathlib import Path
+
+    import check
+
+    with tempfile.TemporaryDirectory() as stage:
+        write_files(Path(stage), files)
+        receipt = check.run_command(
+            [str(deno), "publish", *(["--dry-run"] if dry_run else []), "--allow-dirty"],
+            stage,
+            output,
+            300,
+            dict(env, DENO_DIR=str(Path(output).parent / "deno-dir"), DENO_NO_UPDATE_CHECK="1"),
+        )
+    check.require_success(receipt)
+    if dry_run:
+        text = b"".join((Path(output) / n).read_bytes() for n in ("stdout.bin", "stderr.bin"))
+        text = re.sub(rb"\x1b\[[0-9;]*m", b"", text).decode()
+        listed = set(re.findall(r"^\s+file:///\S*?/([^/\s]+) \(", text, re.MULTILINE))
+        policy.require(listed == set(files), "JSR dry run does not list exactly the files")
+    return receipt
+
+
+def jsr_check(out, tarball, config, version, deno, env):
+    """`deno publish --dry-run` of exactly the files publish_artifacts uploads."""
+    files = jsr_files(members(tarball, "package"), config, version)
+    deno_publish(deno, files, out / "jsr-dry-run", env, dry_run=True)
+    return dict(
+        files=jsr_manifest(files),
+        bytes=sum(len(b) for b in files.values()),
+    )
+
+
 def inspect_crates(paths, inventory):
     expected = inventory["packages"]
     policy.require(len(paths) == 12, "twelve crates required")
@@ -386,6 +476,16 @@ def package_check(root):
         )
         npm_result = inspect_npm(tarballs[0], expected)
         packed_cases = packed_checks(root, out, tarballs[0], node, npmenv)
+        stage = "jsr"
+        deno = Path(os.environ.get("PALUDARIUM_RELEASE_DENO") or shutil.which("deno") or "deno")
+        jsr_result = jsr_check(
+            out,
+            tarballs[0],
+            (copy / "packages/paludarium-wasm/jsr.json").read_bytes(),
+            inv["version"],
+            deno,
+            os.environ,
+        )
         result = dict(
             passed=True,
             output=str(out),
@@ -394,6 +494,7 @@ def package_check(root):
             source_sha256=source_hash,
             crates=crate_result,
             npm=npm_result,
+            jsr=jsr_result,
             packed_cases=packed_cases,
             stable_supported=stable_result["exit"] == 0,
             published=False,

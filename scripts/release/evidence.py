@@ -136,6 +136,8 @@ def tag_exists(api, version):
 
 
 def version_present(name, version):
+    if name == check.JSR_KEY:
+        return check.registry_present(check.JSR_PACKAGE_URL + "/" + version + "_meta.json")
     url = check.NPM_PACKAGE_URL if name == check.NPM_NAME else check.CRATES_API + name
     return check.registry_present(url + "/" + version)
 
@@ -146,8 +148,10 @@ def publishable(inv, presence=check.registry_presence, present=version_present):
     new = sorted(set(found["checked"]) - set(found["present"]))
     policy.require(
         not new,
-        "not on a registry yet: {}; publish it once by hand and register its Trusted Publisher "
-        "(docs/release.md)".format(", ".join(new)),
+        "not on a registry yet: {}; publish it once by hand and register its Trusted Publisher, "
+        "or create the JSR package and link it to the repository (docs/release.md)".format(
+            ", ".join(new)
+        ),
     )
     partial = [n for n in found["checked"] if present(n, inv["version"])]
     policy.require(

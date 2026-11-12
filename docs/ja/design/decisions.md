@@ -230,5 +230,6 @@ WebSocket を 1 本使い、多重化はしません。そのためどちらの�
 ## 公開は Trusted Publishing だけ
 
 crates.io と npm への公開は、長く有効なトークンを保存しない Trusted Publishing（OIDC）
-だけで行います。npm のパッケージには provenance を付けます。公開済みの版は消せないので、
+だけで行います。JSR へは、パッケージにリンクしたリポジトリの OIDC トークンで公開します。
+npm と JSR のパッケージには provenance を付けます。公開済みの版は消せないので、
 問題があれば crates.io の yank と npm の deprecate で対応し、修正版を出します。

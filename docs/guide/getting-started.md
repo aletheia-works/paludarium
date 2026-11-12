@@ -1,12 +1,13 @@
 # Install
 
-paludarium is published as crates on crates.io and as a package on npm.
+paludarium is published as crates on crates.io and as a package on npm and JSR.
 
 | You want | Install |
 |---|---|
 | the command | `cargo install paludarium` |
 | the Rust library | `cargo add paludarium` |
 | the browser or Node.js | `npm install @aletheia-works/paludarium-wasm` |
+| the same package from JSR | `npx jsr add @aletheia-works/paludarium-wasm` |
 
 ## Rust
 

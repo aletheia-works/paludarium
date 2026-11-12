@@ -15,8 +15,9 @@ release PR をマージするかどうかだけです。詳しい手順と、す
    （3 つの OS、4 つの WebAssembly の環境、JIT ありとなし、速さの測定）を動かし、
    受け入れの条件がそろったことを確かめます。
 4. **公開**：12 の crate を crates.io に、`@aletheia-works/paludarium-wasm` を npm に、
-   Trusted Publishing（OIDC）で公開します。npm には provenance を付けます。人の承認は
-   待ちません。
+   Trusted Publishing（OIDC）で公開します。続けて、npm と同じファイルを JSR に、
+   パッケージにリンクした GitHub リポジトリの OIDC で公開します（0.14.0 の次のリリースから）。
+   npm と JSR には provenance を付けます。人の承認は待ちません。
 5. **タグ**：すべての公開が成功した後で、最後にタグと GitHub Release を作ります。
    GitHub Release の本文には、マージした release PR の本文のリリースノートを使います。
    前の Publish の run が止まっている間に main が進むと、公開するのは release PR の

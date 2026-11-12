@@ -21,6 +21,7 @@ reference; no code is copied). Its first user is
 |---|---|
 | [`paludarium`](https://crates.io/crates/paludarium) (library and command) | `cargo +nightly install paludarium` / `cargo add paludarium` |
 | [`@aletheia-works/paludarium-wasm`](https://www.npmjs.com/package/@aletheia-works/paludarium-wasm) | `npm install @aletheia-works/paludarium-wasm` |
+| [`@aletheia-works/paludarium-wasm` on JSR](https://jsr.io/@aletheia-works/paludarium-wasm) | `npx jsr add @aletheia-works/paludarium-wasm` |
 
 ## Development
 

@@ -1,5 +1,6 @@
 import copy
 import io
+import json
 import os
 import re
 import sys
@@ -19,15 +20,16 @@ CANARY = {"RELEASE_OIDC_CRATES_IO_TOKEN": "canary-oidc-0001"}
 
 
 class Registry:
-    """In-memory crates.io/npm package presence; never reaches the network."""
+    """In-memory crates.io/npm/JSR package presence; never reaches the network."""
 
-    def __init__(self, present=(), status=None, unreachable=False):
+    def __init__(self, present=(), status=None, unreachable=False, linked=policy.REPOSITORY):
         self.present, self.status, self.unreachable, self.requests = (
             set(present),
             status,
             unreachable,
             [],
         )
+        self.linked = linked
 
     def __call__(self, request, timeout):
         self.requests.append(request)
@@ -36,6 +38,12 @@ class Registry:
             raise urllib.error.URLError("down")
         if self.status:
             raise urllib.error.HTTPError(url, self.status, "unavailable", {}, None)
+        if url == check.JSR_PACKAGE_API:
+            if check.JSR_KEY not in self.present:
+                raise urllib.error.HTTPError(url, 404, "absent", {}, None)
+            owner, _, name = (self.linked or "/").partition("/")
+            repository = dict(owner=owner, name=name) if self.linked else None
+            return io.BytesIO(json.dumps(dict(githubRepository=repository)).encode())
         name = check.NPM_NAME if url == check.NPM_PACKAGE_URL else url[len(check.CRATES_API) :]
         if name not in self.present:
             raise urllib.error.HTTPError(url, 404, "absent", {}, None)
@@ -159,8 +167,10 @@ class CheckTests(unittest.TestCase):
         registry = Registry()
         result = self.presence(registry)
         order = policy.inventory(ROOT)["order"]
-        self.assertEqual(result, dict(present=[], checked=sorted([*order, check.NPM_NAME])))
-        self.assertEqual(len(registry.requests), 13)
+        self.assertEqual(
+            result, dict(present=[], checked=sorted([*order, check.NPM_NAME, check.JSR_KEY]))
+        )
+        self.assertEqual(len(registry.requests), 14)
         self.assertTrue(
             all(
                 r.get_method() == "GET" and r.get_header("User-agent") == check.REGISTRY_USER_AGENT
@@ -169,22 +179,32 @@ class CheckTests(unittest.TestCase):
         )
         self.assertEqual(
             sorted(r.full_url for r in registry.requests),
-            sorted([check.CRATES_API + n for n in order] + [check.NPM_PACKAGE_URL]),
+            sorted(
+                [check.CRATES_API + n for n in order]
+                + [check.NPM_PACKAGE_URL, check.JSR_PACKAGE_API]
+            ),
         )
 
     def test_registry_name_present(self):
-        for name in ("paludarium-types", "@aletheia-works/paludarium-wasm"):
+        for name in ("paludarium-types", "@aletheia-works/paludarium-wasm", check.JSR_KEY):
             with self.subTest(name):
                 result = self.presence(Registry(present=[name]))
                 self.assertEqual(result["present"], [name])
-                self.assertEqual(len(result["checked"]), 13)
+                self.assertEqual(len(result["checked"]), 14)
                 self.assertIn(check.NPM_NAME, result["checked"])
+                self.assertIn(check.JSR_KEY, result["checked"])
 
     def test_registry_presence_all(self):
         order = policy.inventory(ROOT)["order"]
-        result = self.presence(Registry(present=[*order, check.NPM_NAME]))
+        result = self.presence(Registry(present=[*order, check.NPM_NAME, check.JSR_KEY]))
         self.assertEqual(result["present"], result["checked"])
-        self.assertEqual(len(result["present"]), 13)
+        self.assertEqual(len(result["present"]), 14)
+
+    # Only a JSR package linked to this repository accepts the publish job's OIDC token.
+    def test_jsr_package_linked_elsewhere_or_not_at_all_stops(self):
+        for linked in (None, "someone/paludarium", "aletheia-works/vivarium"):
+            with self.subTest(linked), self.assertRaisesRegex(ValueError, "not linked"):
+                self.presence(Registry(present=[check.JSR_KEY], linked=linked))
 
     def test_registry_presence_unknown(self):
         with self.assertRaisesRegex(ValueError, "503"):
@@ -198,10 +218,10 @@ class CheckTests(unittest.TestCase):
             RELEASE_OIDC_CRATES_IO_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
             CARGO_REGISTRY_TOKEN="stale",
         )
-        dry, cargo, npm = check.publication_environments(env)
+        dry, cargo, npm, jsr = check.publication_environments(env)
         self.assertEqual(cargo["CARGO_REGISTRY_TOKEN"], CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"])
         self.assertNotIn("RELEASE_OIDC_CRATES_IO_TOKEN", cargo)
-        for e in (dry, npm):
+        for e in (dry, npm, jsr):
             self.assertFalse(set(e) & {"CARGO_REGISTRY_TOKEN", "RELEASE_OIDC_CRATES_IO_TOKEN"})
             self.assertNotIn(CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"], e.values())
         with self.assertRaisesRegex(ValueError, "OIDC token absent"):
@@ -267,10 +287,11 @@ class CheckTests(unittest.TestCase):
             RUSTC="/toolchain/rustc",
             UNRELATED_SECRET="canary-other-0007",
             PALUDARIUM_RELEASE_NPM="/npm-cli.js",
+            PALUDARIUM_RELEASE_DENO="/deno",
         )
 
     def test_cargo_children_get_no_github_or_oidc_request_variables(self):
-        dry, cargo, _ = check.publication_environments(
+        dry, cargo, _, _ = check.publication_environments(
             dict(
                 self.job_environment(),
                 RELEASE_OIDC_CRATES_IO_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
@@ -313,6 +334,39 @@ class CheckTests(unittest.TestCase):
         ):
             self.assertNotIn(name, npm)
         self.assertEqual(npm["NODE_AUTH_TOKEN"], "XXXXX-XXXXX-XXXXX-XXXXX")
+
+    def test_jsr_child_gets_only_oidc_and_provenance_variables(self):
+        jsr = check.publication_environments(
+            dict(
+                self.job_environment(),
+                RELEASE_OIDC_CRATES_IO_TOKEN=CANARY["RELEASE_OIDC_CRATES_IO_TOKEN"],
+                NODE_AUTH_TOKEN="XXXXX-XXXXX-XXXXX-XXXXX",
+            )
+        )[3]
+        self.assertLessEqual(set(jsr), set(check.JSR_ENVIRONMENT))
+        for name in (
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "GITHUB_ACTIONS",
+            "GITHUB_REPOSITORY",
+            "GITHUB_WORKFLOW_REF",
+            "GITHUB_SHA",
+            "RUNNER_ENVIRONMENT",
+            "CI",
+        ):
+            self.assertIn(name, jsr)
+        for name in (
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "UNRELATED_SECRET",
+            "RUSTC",
+            "NPM_CONFIG_USERCONFIG",
+            "NODE_AUTH_TOKEN",
+            "PALUDARIUM_RELEASE_DENO",
+            "CARGO_REGISTRY_TOKEN",
+            "RELEASE_OIDC_CRATES_IO_TOKEN",
+        ):
+            self.assertNotIn(name, jsr)
 
 
 if __name__ == "__main__":

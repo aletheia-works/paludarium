@@ -9,6 +9,11 @@ modules run in browsers and in Node.js (`worker_threads`). The [live demo](../de
 npm install @aletheia-works/paludarium-wasm
 ```
 
+The same files are on JSR as
+[`@aletheia-works/paludarium-wasm`](https://jsr.io/@aletheia-works/paludarium-wasm),
+from the first release after 0.14.0. The platforms CI tests are those in
+[Platforms](./platforms); Deno is not among them.
+
 ## Run a program
 
 ```js

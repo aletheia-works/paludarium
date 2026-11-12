@@ -28,6 +28,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 'latest'
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.9.8
       - name: Fixed project-local verification tools
         run: |
           python -m venv .venv-release
@@ -39,9 +42,9 @@ jobs:
         run: .venv-release/bin/python -B -m coverage run --data-file=target/release-evidence/python.coverage --include='*/scripts/release/policy.py,*/scripts/release/package.py,*/scripts/release/check.py,*/scripts/release/acceptance.py' -m unittest discover -s tests/release -p 'test_*.py' -v
       - name: Static configuration
         run: .venv-release/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode validate
-      - name: Actual twelve crates, isolated registry and same npm tarball
+      - name: Actual twelve crates, isolated registry, same npm tarball and its JSR dry run
         run: |
-          PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/release-evidence/tools/node_modules/npm/bin/npm-cli.js" .venv-release/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode package-check --output target/release-evidence/package-result.json
+          PALUDARIUM_TEST_NODE="$(command -v node)" PALUDARIUM_RELEASE_NPM="$GITHUB_WORKSPACE/target/release-evidence/tools/node_modules/npm/bin/npm-cli.js" PALUDARIUM_RELEASE_DENO="$(command -v deno)" .venv-release/bin/python -B -m coverage run --append --data-file=target/release-evidence/python.coverage scripts/release/check.py --mode package-check --output target/release-evidence/package-result.json
       - name: Each fixed release component retains 80 percent
         run: |
           .venv-release/bin/python -m coverage json --data-file=target/release-evidence/python.coverage -o target/release-evidence/python-coverage.json

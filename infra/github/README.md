@@ -30,7 +30,9 @@ preflight require: administrator bypass off and deployments limited to
 required reviewer: publication waits for no approval, because the same-head
 evidence gate decides it. Publication is by
 Trusted Publishing (OIDC) only, so it holds no registry token; the Trusted
-Publisher of every crate and of the npm package names this environment.
+Publisher of every crate and of the npm package names this environment. JSR
+publishes through the GitHub repository linked in the package's settings on
+jsr.io, which is not managed here.
 
 ## CI workflows
 

@@ -1,0 +1,28 @@
+{
+  "name": "@aletheia-works/paludarium-wasm",
+  "version": "0.14.0",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./index.mjs",
+    "./relay": "./relay.mjs"
+  },
+  "publish": {
+    "include": [
+      "paludarium.wasm",
+      "index.mjs",
+      "index.d.ts",
+      "coordinator.mjs",
+      "execution.mjs",
+      "worker-support.mjs",
+      "jit-support.mjs",
+      "filesystem-snapshot.mjs",
+      "relay.mjs",
+      "relay-protocol.mjs",
+      "relay.d.ts",
+      "LICENSE",
+      "THIRD-PARTY-NOTICES.txt",
+      "README.md",
+      "jsr.json"
+    ]
+  }
+}

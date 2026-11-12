@@ -23,6 +23,7 @@
     {"name":"addresses","binary":"process"},
     {"name":"monitor","binary":"process"},
     {"name":"routes","binary":"process"},
+    {"name":"route-dump","binary":"process"},
     {"name":"link-attributes","binary":"process"},
     {"name":"generic-netlink","binary":"process"},
     {"name":"sock-diag","binary":"process"},

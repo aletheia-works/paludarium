@@ -56,6 +56,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
+| seccomp | `seccomp`（下に書きます） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -1869,8 +1870,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`execve` は、上に書いた場合のほかは、またダンプできるようにします）、
   `PR_SET_KEEPCAPS`（スレッドごとで、`execve` で消えます）、
   `PR_SET_CHILD_SUBREAPER`（`fork` では受け継がれず、`execve` では残ります）、
-  `PR_SET_NO_NEW_PRIVS` と、それぞれの `PR_GET_*` に対応します。ほかの指定には
-  `EINVAL` を返します。
+  `PR_SET_NO_NEW_PRIVS`、`PR_SET_SECCOMP`（下の seccomp を見てください）と、
+  それぞれの `PR_GET_*` に対応します。ほかの指定には `EINVAL` を返します。
 - プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって
   いない一番近い祖先に、いなければ PID 名前空間の init にあたる最初のプロセスに
   引き取られます。Linux の `forget_original_parent` と同じです。その後 `getppid` は
@@ -2292,6 +2293,36 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   ほかのスレッドに呼び出し元のドメインを与えます。-1 にほかのフラグを付けると `EBADF` です。
   スレッド、プロセス、`execve` はドメインを引き継ぎます。`O_PATH`、`stat`、制限の前に
   開いた記述子は確かめません。
+- seccomp は、Linux の `kernel/seccomp.c` と同じように、スレッドが使えるシステム
+  コールを制限します。strict モード（`SECCOMP_SET_MODE_STRICT`、または
+  `PR_SET_SECCOMP` の 1）で許されるのは `read`、`write`、`exit`、`rt_sigreturn`
+  だけです。ほかの呼び出しは、`exit_group` も含めて、スレッドを `SIGKILL` で
+  終わらせます。フィルターモード（`SECCOMP_SET_MODE_FILTER`。`no_new_privs` か
+  `CAP_SYS_ADMIN` が要ります）は、クラシック BPF のプログラムを足します。
+  プログラムは Linux と同じように確かめます。命令は 4096 個までで、seccomp が
+  受け付けるもの（`struct seccomp_data` からの 32 ビットの読み込み。`mod` は
+  使えません）だけです。ジャンプは前向きでプログラムの中に収まり、スクラッチの語は
+  どの道筋でも読む前に書かれ、最後の命令は戻る命令でなければなりません。そうでなければ
+  `EINVAL` です。スレッドのフィルターは合わせて 32768 命令まで（それぞれ 4 命令多く
+  数えます）で、超えると `ENOMEM` です。呼び出しの前に、すべてのフィルターが、
+  呼び出しの番号、`AUDIT_ARCH_X86_64`、`syscall` 命令の次のアドレス、6 つの引数の
+  レジスタ全体を見て、いちばん低いアクションが決めます。
+  `SECCOMP_RET_KILL_PROCESS` はプロセスを `SIGSYS` で終わらせます。
+  `SECCOMP_RET_KILL_THREAD` はスレッドを、最後のスレッドならプロセスを終わらせます
+  （X が 0 の割り算は 0 を返すので、このアクションになります）。
+  `SECCOMP_RET_TRAP` は `SIGSYS` を強制し、`SYS_SECCOMP`、`si_errno` のデータ、
+  呼び出しのアドレス、番号、アーキテクチャを渡し、`rax` には呼び出しの番号を戻します。
+  `SECCOMP_RET_ERRNO` はデータ（4095 まで）をエラーとして返します。
+  `SECCOMP_RET_TRACE` と `SECCOMP_RET_USER_NOTIF` は、トレーサーもリスナーも
+  ないときと同じく `ENOSYS` です。`SECCOMP_RET_LOG` と `SECCOMP_RET_ALLOW` は
+  呼び出しをそのまま行います。`SECCOMP_FILTER_FLAG_TSYNC` は新しいフィルターを
+  すべてのスレッドに与えます。ただし、strict モードのスレッドや、呼び出し側の
+  フィルターの元にならないフィルターを持つスレッドがあれば、そのスレッドの ID を
+  返します（`SECCOMP_FILTER_FLAG_TSYNC_ESRCH` があれば `ESRCH`）。
+  `SECCOMP_GET_ACTION_AVAIL` と `SECCOMP_GET_NOTIF_SIZES` は Linux と同じに
+  答えます。新しいスレッドとプロセスはモードとフィルターを受け継ぎ、`execve` でも
+  残ります。`/proc/<pid>/status` の `Seccomp` と `Seccomp_filters` に表れます。
+  リスナーは作りません（[制限事項](./limitations)を見てください）。
 - 起動の前にファイルを置けます。
 - 指定したときだけ、ホストのディレクトリをマウントできます（コマンドの `--mount`、
   Rust の `Config::mounts`）。操作はすべてそのディレクトリの中に閉じ込められ、

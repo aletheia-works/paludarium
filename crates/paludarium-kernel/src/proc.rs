@@ -532,6 +532,8 @@ pub(crate) struct Status<'a> {
     pub ignored: u64,
     pub caught: u64,
     pub no_new_privs: bool,
+    /// The seccomp mode and the number of filters.
+    pub seccomp: (u8, u32),
     pub credentials: &'a crate::credentials::Credentials,
     /// The reader's user namespace, which the IDs are shown in.
     pub reader: &'a crate::namespaces::Namespace,
@@ -589,7 +591,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
          SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
          CapEff:\t{:016x}\nCapBnd:\t{bounding:016x}\nCapAmb:\t{:016x}\n\
-         NoNewPrivs:\t{}\nSeccomp:\t0\nSeccomp_filters:\t0\n\
+         NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n\
          voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         s.parent,
         uid(c.uid),
@@ -613,6 +615,8 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         c.effective,
         0,
         u8::from(s.no_new_privs),
+        s.seccomp.0,
+        s.seccomp.1,
     )
     .into_bytes()
 }
@@ -1263,6 +1267,7 @@ mod tests {
             ignored: 1 << 12,
             caught: 1,
             no_new_privs: true,
+            seccomp: (2, 3),
             credentials: &crate::credentials::Credentials {
                 uid: 1,
                 euid: 2,
@@ -1296,7 +1301,7 @@ mod tests {
             "CapPrm:\t000001ffffffffff\n",
             "CapEff:\t0000000000000000\n",
             "CapBnd:\t000001ffffffffff\n",
-            "NoNewPrivs:\t1\n",
+            "NoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n",
         ] {
             assert!(text.contains(line), "{line:?} in {text}");
         }

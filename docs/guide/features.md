@@ -64,6 +64,7 @@ kernel.
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
+| seccomp | `seccomp` (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -2141,8 +2142,8 @@ kernel.
   parent exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
   again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
   by `execve`), `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
-  `execve`) and `PR_SET_NO_NEW_PRIVS` with their `PR_GET_*`; other options
-  give `EINVAL`.
+  `execve`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
+  with their `PR_GET_*`; other options give `EINVAL`.
 - When a process exits, its children go to the nearest ancestor that set
   `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,
   which acts as the init of a PID namespace, as Linux's
@@ -2607,6 +2608,35 @@ one only with an `--allow-net`.
   which then gives the others the caller's own domain; any other flag with
   -1 is `EBADF`. Threads, processes and `execve` keep the domain; `O_PATH`,
   `stat` and descriptors opened before are not checked.
+- seccomp limits the system calls a thread makes, as Linux's
+  `kernel/seccomp.c` does. Strict mode (`SECCOMP_SET_MODE_STRICT`, or
+  `PR_SET_SECCOMP` with 1) allows `read`, `write`, `exit` and `rt_sigreturn`;
+  any other call ends the thread by `SIGKILL`, `exit_group` too. Filter mode
+  (`SECCOMP_SET_MODE_FILTER`, which needs `no_new_privs` or `CAP_SYS_ADMIN`)
+  adds a classic BPF program, checked as Linux checks one: up to 4096
+  instructions, only the ones seccomp takes (32-bit loads of
+  `struct seccomp_data`, no `mod`), forward jumps inside the program, scratch
+  words written before they are read on every path, and a return at the end,
+  else `EINVAL`; all of a thread's filters may hold 32768 instructions, each
+  counting 4 more (`ENOMEM`). Before each call every filter runs over the
+  call's number, `AUDIT_ARCH_X86_64`, the address after its `syscall`
+  instruction and its six argument registers, whole, and the lowest action
+  decides. `SECCOMP_RET_KILL_PROCESS` ends the process by `SIGSYS`, and
+  `SECCOMP_RET_KILL_THREAD` the thread, or the process when it is the last
+  thread (a division by an X of 0 returns 0, which is this action);
+  `SECCOMP_RET_TRAP` forces a `SIGSYS` with `SYS_SECCOMP`, the data in
+  `si_errno`, the call's address, number and architecture, and the call's
+  number back in `rax`; `SECCOMP_RET_ERRNO` returns its data, at most 4095,
+  as an error; `SECCOMP_RET_TRACE` and `SECCOMP_RET_USER_NOTIF` give
+  `ENOSYS`, as with no tracer and no listener; `SECCOMP_RET_LOG` and
+  `SECCOMP_RET_ALLOW` run the call. `SECCOMP_FILTER_FLAG_TSYNC` gives the new
+  filter to every thread, unless one is in strict mode or has a filter the
+  caller's is not built on: then it returns that thread's ID, or `ESRCH` with
+  `SECCOMP_FILTER_FLAG_TSYNC_ESRCH`. `SECCOMP_GET_ACTION_AVAIL` and
+  `SECCOMP_GET_NOTIF_SIZES` answer as Linux. New threads and processes take
+  the mode and the filters, `execve` keeps them, and `/proc/<pid>/status`
+  shows them in `Seccomp` and `Seccomp_filters`. A listener is not made (see
+  [Limitations](./limitations)).
 - Files can be placed before the start.
 - A host directory can be mounted when you ask for it (`--mount` on the
   command line, `Config::mounts` in Rust). Every operation stays inside that

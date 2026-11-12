@@ -6697,6 +6697,345 @@ static pid_t kc_child(int dumpable) {
     close(ready[0]);
     return pid;
 }
+/* seccomp, as Linux's kernel/seccomp.c: strict mode, and classic BPF
+ * filters whose lowest action decides each call. Every filter is set in a
+ * child with no_new_privs, as filters last. */
+struct sc_insn {
+    unsigned short code;
+    unsigned char jt, jf;
+    unsigned int k;
+};
+struct sc_prog {
+    unsigned short len;
+    struct sc_insn *filter;
+};
+#define SC(c, t, f, k) {(c), (t), (f), (k)}
+#define SC_RET(k) SC(0x06, 0, 0, (k))
+#define SC_NR SC(0x20, 0, 0, 0)
+/* nr == x: return k, else the next instruction. */
+#define SC_IF(x, k) SC(0x15, 0, 1, (x)), SC_RET(k)
+#define SC_ALLOW 0x7fff0000u
+#define SC_LEN(p) ((unsigned short)(sizeof(p) / sizeof((p)[0])))
+#define SC_ERRNO(e) (0x00050000u | (e))
+static long sc_err(long r) { return r < 0 ? -errno : r; }
+static long sc_set(unsigned flags, struct sc_insn *p, unsigned short n) {
+    struct sc_prog prog = {n, p};
+    return sc_err(syscall(317, 1, flags, &prog));
+}
+static void sc_status(const char *who) {
+    FILE *f = fopen("/proc/self/status", "r");
+    int mode = -1, filters = -1;
+    char line[256];
+    while (f && fgets(line, sizeof line, f)) {
+        sscanf(line, "Seccomp: %d", &mode);
+        sscanf(line, "Seccomp_filters: %d", &filters);
+    }
+    if (f) fclose(f);
+    printf("seccomp %s prctl=%ld status=%d filters=%d\n", who, sc_err(prctl(PR_GET_SECCOMP)), mode, filters);
+}
+static void sc_wait(const char *what, pid_t pid) {
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) printf("seccomp %s signal=%d\n", what, WTERMSIG(status));
+    else printf("seccomp %s exit=%d\n", what, WEXITSTATUS(status));
+    fflush(stdout);
+}
+/* A child with no core dumps and no_new_privs. */
+static pid_t sc_child(void) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rlimit none = {0, 0};
+        setrlimit(RLIMIT_CORE, &none);
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    }
+    return pid;
+}
+static volatile long sc_trap[7];
+static void sc_sigsys(int sig, siginfo_t *si, void *uc) {
+    sc_trap[0] = sig;
+    sc_trap[1] = si->si_errno;
+    sc_trap[2] = si->si_code;
+    sc_trap[3] = si->si_syscall;
+    sc_trap[4] = si->si_arch;
+    sc_trap[5] = ((ucontext_t *)uc)->uc_mcontext.gregs[REG_RAX];
+    sc_trap[6] = (char *)si->si_call_addr - (char *)syscall;
+}
+static int sc_pipe[2];
+static long sc_thread_result, sc_thread_tid;
+static void *sc_waiter(void *arg) {
+    (void)arg;
+    char c;
+    read(sc_pipe[0], &c, 1);
+    sc_thread_result = sc_err(syscall(SYS_getppid));
+    return NULL;
+}
+static int sc_ready[2];
+/* A thread with a filter of its own on top, which then waits. */
+static void *sc_diverger(void *arg) {
+    (void)arg;
+    struct sc_insn own[] = {SC_NR, SC_IF(SYS_getppid, SC_ERRNO(4)), SC_RET(SC_ALLOW)};
+    sc_thread_tid = syscall(SYS_gettid);
+    sc_thread_result = sc_set(0, own, SC_LEN(own));
+    write(sc_ready[1], "r", 1);
+    char c;
+    read(sc_pipe[0], &c, 1);
+    return NULL;
+}
+static void *sc_getppid(void *arg) {
+    (void)arg;
+    syscall(SYS_getppid);
+    return NULL;
+}
+/* The threads /proc/self/status counts, once only `want` are left (or 5 s
+ * have passed): musl's pthread_join waits for a word the thread itself
+ * writes, which a killed thread never does. */
+static int sc_threads(int want) {
+    int threads = -1;
+    for (int i = 0; i < 5000; i++) {
+        FILE *f = fopen("/proc/self/status", "r");
+        char line[256];
+        while (f && fgets(line, sizeof line, f)) sscanf(line, "Threads: %d", &threads);
+        if (f) fclose(f);
+        if (threads == want) break;
+        usleep(1000);
+    }
+    return threads;
+}
+static struct sc_insn sc_big[4096];
+static int seccomp_exec_case(void) {
+    sc_status("exec");
+    printf("seccomp exec getpid=%ld\n", sc_err(syscall(SYS_getpid)));
+    return 0;
+}
+static int seccomp_case(const char *self) {
+    struct sc_insn allow[] = {SC_RET(SC_ALLOW)};
+    sc_status("none");
+    /* Operations and flags. */
+    unsigned action[] = {0x80000000u, 0, 0x30000, 0x50000, 0x7fc00000, 0x7ff00000, 0x7ffc0000, SC_ALLOW, 0x10000, 0x7fff0001};
+    printf("seccomp avail");
+    for (int i = 0; i < 10; i++) printf(" %ld", sc_err(syscall(317, 2, 0, &action[i])));
+    unsigned short sizes[3] = {0};
+    long got = sc_err(syscall(317, 3, 0, sizes));
+    printf(" flags=%ld fault=%ld sizes=%ld:%u,%u,%u sizes-flags=%ld\n", sc_err(syscall(317, 2, 1, &action[0])),
+           sc_err(syscall(317, 2, 0, NULL)), got, sizes[0], sizes[1], sizes[2], sc_err(syscall(317, 3, 1, sizes)));
+    struct sc_prog one = {1, allow}, empty = {0, allow}, huge = {4097, sc_big}, null = {1, NULL};
+    printf("seccomp args op=%ld strict-flags=%ld strict-args=%ld unknown-flag=%ld tsync-listener=%ld "
+           "killable=%ld restart=%ld fprog=%ld empty=%ld huge=%ld\n",
+           sc_err(syscall(317, 9, 0, &one)), sc_err(syscall(317, 0, 1, NULL)), sc_err(syscall(317, 0, 0, &one)),
+           sc_err(syscall(317, 1, 128, &one)), sc_err(syscall(317, 1, 1 | 8, &one)),
+           sc_err(syscall(317, 1, 32, &one)), sc_err(syscall(317, 1, 64, &one)),
+           sc_err(syscall(317, 1, 0, (void *)8)), sc_err(syscall(317, 1, 0, &empty)),
+           sc_err(syscall(317, 1, 0, &huge)));
+    printf("seccomp prctl mode=%ld\n", sc_err(prctl(PR_SET_SECCOMP, 3, 0, 0, 0)));
+    pid_t pid = sc_child();
+    if (pid == 0) {
+        /* Programs Linux refuses, each EINVAL. */
+        struct sc_insn no_ret[] = {SC(0x00, 0, 0, 0)};
+        struct sc_insn past[] = {SC(0x05, 0, 0, 1), SC_RET(SC_ALLOW)};
+        struct sc_insn cond_past[] = {SC(0x15, 1, 0, 0), SC_RET(SC_ALLOW)};
+        struct sc_insn div0[] = {SC(0x34, 0, 0, 0), SC_RET(SC_ALLOW)};
+        struct sc_insn shift[] = {SC(0x64, 0, 0, 32), SC_RET(SC_ALLOW)};
+        struct sc_insn mod[] = {SC(0x94, 0, 0, 2), SC_RET(SC_ALLOW)};
+        struct sc_insn half[] = {SC(0x28, 0, 0, 0), SC_RET(SC_ALLOW)};
+        struct sc_insn odd[] = {SC(0x20, 0, 0, 2), SC_RET(SC_ALLOW)};
+        struct sc_insn beyond[] = {SC(0x20, 0, 0, 64), SC_RET(SC_ALLOW)};
+        struct sc_insn unset[] = {SC(0x60, 0, 0, 0), SC_RET(SC_ALLOW)};
+        struct sc_insn one_path[] = {SC(0x15, 0, 1, 0), SC(0x02, 0, 0, 1), SC(0x60, 0, 0, 1), SC_RET(SC_ALLOW)};
+        struct sc_insn ind[] = {SC(0x40, 0, 0, 0), SC_RET(SC_ALLOW)};
+        struct sc_insn unknown[] = {SC(0xff, 0, 0, 0), SC_RET(SC_ALLOW)};
+        printf("seccomp refused %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld null=%ld fault=%ld\n",
+               sc_set(0, no_ret, SC_LEN(no_ret)), sc_set(0, past, SC_LEN(past)), sc_set(0, cond_past, SC_LEN(cond_past)), sc_set(0, div0, SC_LEN(div0)),
+               sc_set(0, shift, SC_LEN(shift)), sc_set(0, mod, SC_LEN(mod)), sc_set(0, half, SC_LEN(half)), sc_set(0, odd, SC_LEN(odd)),
+               sc_set(0, beyond, SC_LEN(beyond)), sc_set(0, unset, SC_LEN(unset)), sc_set(0, one_path, SC_LEN(one_path)), sc_set(0, ind, SC_LEN(ind)),
+               sc_set(0, unknown, SC_LEN(unknown)), sc_err(syscall(317, 1, 0, &null)),
+               sc_set(0, (struct sc_insn *)8, 1));
+        sc_status("refused");
+        /* A filter on the number, an argument's upper half and LEN. */
+        struct sc_insn first[] = {
+            SC(0x20, 0, 0, 4), SC(0x15, 1, 0, 0xc000003e), SC_RET(0x80000000u),
+            SC_NR,
+            SC_IF(SYS_getpid, SC_ERRNO(1)),
+            SC_IF(SYS_getppid, SC_ERRNO(5000)),
+            SC(0x15, 0, 3, SYS_dup),
+            SC(0x20, 0, 0, 20), SC(0x15, 0, 1, 1), SC_RET(SC_ERRNO(77)),
+            SC_IF(SYS_getuid, 0x7ff00000),
+            SC_IF(SYS_getgid, 0x7fc00000),
+            SC_IF(SYS_geteuid, 0x7ffc0000),
+            SC(0x15, 0, 3, SYS_getegid),
+            SC(0x80, 0, 0, 0), SC(0x15, 1, 0, 64), SC_RET(SC_ERRNO(9)),
+            SC_RET(SC_ALLOW),
+        };
+        long set = sc_set(0, first, SC_LEN(first));
+        int fd = (int)sc_err(syscall(SYS_dup, 1L));
+        if (fd > 0) close(fd);
+        printf("seccomp filter set=%ld getpid=%ld getppid=%ld dup-high=%ld dup=%d trace=%ld notify=%ld "
+               "log=%d len=%d\n",
+               set, sc_err(syscall(SYS_getpid)), sc_err(syscall(SYS_getppid)),
+               sc_err(syscall(SYS_dup, 1L | 1L << 32)), fd > 0, sc_err(syscall(SYS_getuid)),
+               sc_err(syscall(SYS_getgid)), sc_err(syscall(SYS_geteuid)) >= 0,
+               sc_err(syscall(SYS_getegid)) >= 0);
+        sc_status("one");
+        /* Strict mode is not for a thread with filters. */
+        printf("seccomp strict-after=%ld\n", sc_err(syscall(317, 0, 0, NULL)));
+        /* More filters: equal actions take the newest's data, a lower one
+         * wins whatever the order. */
+        struct sc_insn second[] = {SC_NR, SC_IF(SYS_getpid, SC_ERRNO(2)), SC_RET(SC_ALLOW)};
+        struct sc_insn third[] = {SC_NR, SC_IF(SYS_getppid, 0x30005), SC_RET(SC_ALLOW)};
+        long second_set = sc_set(0, second, SC_LEN(second));
+        long third_set = sc_set(2, third, SC_LEN(third));
+        long prctl_set = sc_err(prctl(PR_SET_SECCOMP, 2, &one, 0, 0));
+        printf("seccomp stack second=%ld third=%ld prctl=%ld getpid=%ld\n", second_set, third_set, prctl_set,
+               sc_err(syscall(SYS_getpid)));
+        sc_status("four");
+        /* TRAP: SIGSYS with the call, and the call's own rax back. */
+        struct sigaction sa = {0};
+        sa.sa_sigaction = sc_sigsys;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGSYS, &sa, NULL);
+        long r = syscall(SYS_getppid);
+        printf("seccomp trap ret=%ld signal=%ld errno=%ld code=%ld call=%ld arch=%lx rax=%ld at=%ld\n", r,
+               sc_trap[0], sc_trap[1], sc_trap[2], sc_trap[3], (unsigned long)sc_trap[4], sc_trap[5],
+               sc_trap[6] > 0 && sc_trap[6] < 256 ? 1L : sc_trap[6]);
+        /* A fork keeps the filters; so does exec. */
+        fflush(stdout);
+        pid_t inner = fork();
+        if (inner == 0) {
+            sc_status("fork");
+            fflush(stdout);
+            _exit(0);
+        }
+        sc_wait("fork", inner);
+        fflush(stdout);
+        inner = fork();
+        if (inner == 0) {
+            execl(self, self, "seccomp-exec", self, (char *)NULL);
+            _exit(70);
+        }
+        sc_wait("exec", inner);
+        /* A blocked SIGSYS is forced, and ends the process. */
+        fflush(stdout);
+        inner = fork();
+        if (inner == 0) {
+            sigset_t set;
+            sigemptyset(&set);
+            sigaddset(&set, SIGSYS);
+            sigprocmask(SIG_BLOCK, &set, NULL);
+            syscall(SYS_getppid);
+            _exit(0);
+        }
+        sc_wait("trap-blocked", inner);
+        fflush(stdout);
+        _exit(0);
+    }
+    sc_wait("filters", pid);
+    /* Kills: the process, the thread when it is the last, a division by a
+     * zero X (0 is KILL_THREAD), and a thread among others. */
+    struct sc_insn kill_process[] = {SC_NR, SC_IF(SYS_getppid, 0x80000000u), SC_RET(SC_ALLOW)};
+    struct sc_insn kill_thread[] = {SC_NR, SC_IF(SYS_getppid, 0), SC_RET(SC_ALLOW)};
+    struct sc_insn divide[] = {SC_NR, SC(0x15, 0, 4, SYS_getppid), SC(0x00, 0, 0, 7), SC(0x01, 0, 0, 0),
+                               SC(0x3c, 0, 0, 0), SC_RET(SC_ALLOW), SC_RET(SC_ALLOW)};
+    struct {
+        const char *name;
+        struct sc_insn *p;
+        unsigned short n;
+    } kills[] = {{"kill-process", kill_process, SC_LEN(kill_process)},
+                {"kill-thread", kill_thread, SC_LEN(kill_thread)},
+                {"divide", divide, SC_LEN(divide)}};
+    for (int i = 0; i < 3; i++) {
+        pid = sc_child();
+        if (pid == 0) {
+            sc_set(0, kills[i].p, kills[i].n);
+            syscall(SYS_getppid);
+            _exit(0);
+        }
+        sc_wait(kills[i].name, pid);
+    }
+    pid = sc_child();
+    if (pid == 0) {
+        sc_set(0, kill_thread, SC_LEN(kill_thread));
+        pthread_t t;
+        pthread_create(&t, NULL, sc_getppid, NULL);
+        int left = sc_threads(1);
+        printf("seccomp kill-thread-among-others threads=%d getpid=%d\n", left, syscall(SYS_getpid) > 0);
+        fflush(stdout);
+        _exit(4);
+    }
+    sc_wait("kill-thread-among-others", pid);
+    pid = sc_child();
+    if (pid == 0) {
+        sc_set(0, kill_process, SC_LEN(kill_process));
+        pthread_t t;
+        pthread_create(&t, NULL, sc_getppid, NULL);
+        pthread_join(t, NULL);
+        _exit(0);
+    }
+    sc_wait("kill-process-from-thread", pid);
+    /* Strict mode: read, write, exit and rt_sigreturn, and SIGKILL for the
+     * rest, exit_group too. */
+    pid = sc_child();
+    if (pid == 0) {
+        long r = sc_err(prctl(PR_SET_SECCOMP, 1, 0, 0, 0));
+        syscall(SYS_write, 1, r == 0 ? "seccomp strict write\n" : "seccomp strict failed\n", 21);
+        syscall(SYS_exit, 3);
+    }
+    sc_wait("strict-exit", pid);
+    pid = sc_child();
+    if (pid == 0) {
+        syscall(317, 0, 0, NULL);
+        syscall(SYS_getpid);
+        _exit(0);
+    }
+    sc_wait("strict-getpid", pid);
+    pid = sc_child();
+    if (pid == 0) {
+        syscall(317, 0, 0, NULL);
+        _exit(0);
+    }
+    sc_wait("strict-exit-group", pid);
+    /* TSYNC gives every thread the filter, unless one has a filter the
+     * caller's is not built on: then it names that thread, or is ESRCH. */
+    pid = sc_child();
+    if (pid == 0) {
+        struct sc_insn deny[] = {SC_NR, SC_IF(SYS_getppid, SC_ERRNO(3)), SC_RET(SC_ALLOW)};
+        pthread_t t;
+        pipe(sc_pipe);
+        pthread_create(&t, NULL, sc_waiter, NULL);
+        long sync = sc_set(1, deny, SC_LEN(deny));
+        write(sc_pipe[1], "g", 1);
+        pthread_join(t, NULL);
+        sc_status("tsync");
+        printf("seccomp tsync set=%ld thread=%ld\n", sync, sc_thread_result);
+        pipe(sc_ready);
+        pthread_create(&t, NULL, sc_diverger, NULL);
+        char c;
+        read(sc_ready[0], &c, 1);
+        long failed = sc_set(1, allow, SC_LEN(allow));
+        long esrch = sc_set(1 | 16, allow, SC_LEN(allow));
+        printf("seccomp tsync own=%ld failed-at-thread=%d esrch=%ld\n", sc_thread_result,
+               failed == sc_thread_tid, esrch);
+        sc_status("tsync-failed");
+        write(sc_pipe[1], "g", 1);
+        pthread_join(t, NULL);
+        fflush(stdout);
+        _exit(0);
+    }
+    sc_wait("tsync", pid);
+    /* At most 32768 instructions in all, each filter counting 4 more. */
+    pid = sc_child();
+    if (pid == 0) {
+        for (int i = 0; i < 4095; i++) sc_big[i] = (struct sc_insn)SC(0x00, 0, 0, 0);
+        sc_big[4095] = (struct sc_insn)SC_RET(SC_ALLOW);
+        int count = 0;
+        long r;
+        while ((r = sc_set(0, sc_big, 4096)) == 0) count++;
+        printf("seccomp total filters=%d then=%ld small=%ld\n", count, r, sc_set(0, allow, SC_LEN(allow)));
+        fflush(stdout);
+        _exit(0);
+    }
+    sc_wait("total", pid);
+    return 0;
+}
 /* mseal, as Linux's mm/mseal.c: a sealed mapping is not unmapped, moved,
  * resized, given another protection, mapped over or (when anonymous and
  * read-only) discarded; each refusal is EPERM. */
@@ -19003,6 +19342,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "futex-wake-op")) return futex_wake_op_case();
     if (!strcmp(mode, "kcmp")) return kcmp_case();
     if (!strcmp(mode, "mseal")) return mseal_case();
+    if (!strcmp(mode, "seccomp")) return seccomp_case(self);
+    if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();

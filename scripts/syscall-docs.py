@@ -285,6 +285,7 @@ NAMES = {
     314: "sched_setattr",
     315: "sched_getattr",
     316: "renameat2",
+    317: "seccomp",
     318: "getrandom",
     319: "memfd_create",
     322: "execveat",

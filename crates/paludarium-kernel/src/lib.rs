@@ -47,6 +47,7 @@ mod pty;
 mod record_locks;
 mod rseq;
 mod scheduling;
+mod seccomp;
 mod sem;
 mod shm;
 mod sockets;
@@ -231,6 +232,12 @@ pub struct ThreadState {
     /// The area is to be brought up to date before the thread runs again,
     /// as just registered (Linux's `rseq_set_notify_resume`).
     pub(crate) rseq_notify: bool,
+    /// The thread's seccomp mode and filters ([`seccomp`]), which a new
+    /// thread or process copies and exec keeps.
+    pub(crate) seccomp: seccomp::Seccomp,
+    /// The group's `SECCOMP_FILTER_FLAG_TSYNC` count when the thread last
+    /// took its seccomp state from the group ([`ThreadGroup::take_seccomp`]).
+    pub(crate) seccomp_sync: u64,
 }
 
 impl ThreadState {
@@ -494,6 +501,54 @@ impl Kernel {
         Next::Exit(status)
     }
 
+    /// A system call seccomp does not let run ([`seccomp::Verdict`]): it
+    /// returns what the filter says, or SIGSYS is forced with `rax` as the
+    /// call found it (Linux's `syscall_rollback`), or the thread ends. A
+    /// thread that is not the last ends alone, as Linux's `do_exit` does;
+    /// the last one ends the process, by SIGSYS with a core dump or, in
+    /// strict mode, by SIGKILL.
+    fn refuse(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        verdict: seccomp::Verdict,
+    ) -> Next {
+        thread.state.restart = None;
+        thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
+        match verdict {
+            seccomp::Verdict::Allow => Next::Resume,
+            seccomp::Verdict::Return(value) => {
+                thread.cpu.gpr[reg::RAX] = value;
+                self.checkpoint(thread, mem)
+            }
+            seccomp::Verdict::Trap(info) => {
+                signals::queue(
+                    &mut thread.state,
+                    signals::PendingSignal {
+                        synchronous: true,
+                        queued: Some(info),
+                        ..signals::PendingSignal::thread(signal::SIGSYS, 1)
+                    },
+                );
+                self.checkpoint(thread, mem)
+            }
+            seccomp::Verdict::Kill { process, siginfo } => {
+                if !process && self.group.active_threads() > 1 {
+                    Next::Exit(ExitStatus::Signaled(signal::SIGSYS))
+                } else {
+                    self.terminate_with(thread, signal::SIGSYS, seccomp::full_siginfo(&siginfo))
+                }
+            }
+            seccomp::Verdict::Strict => {
+                if self.group.active_threads() > 1 {
+                    Next::Exit(ExitStatus::Signaled(signal::SIGKILL))
+                } else {
+                    self.terminate(thread, signal::SIGKILL)
+                }
+            }
+        }
+    }
+
     /// Queues a signal in a thread's process-pending view (manual Kernel clients).
     pub fn queue_signal(
         &mut self,
@@ -541,6 +596,7 @@ impl Kernel {
                 credentials: state.credentials.clone(),
                 memory: Some(mem.view()),
                 files: self.files.view(),
+                seccomp: (state.seccomp.mode, state.seccomp.filters()),
             },
         );
         self.published = Some(Published {
@@ -884,6 +940,14 @@ impl Kernel {
             thread.cpu.gpr[reg::R8],
             thread.cpu.gpr[reg::R9],
         ];
+        self.group.take_seccomp(thread.tid, &mut thread.state);
+        if thread.state.seccomp.mode != 0 {
+            let verdict =
+                seccomp::check(&thread.state.seccomp, number as u32, args, thread.cpu.rip.0);
+            if verdict != seccomp::Verdict::Allow {
+                return self.refuse(thread, mem, verdict);
+            }
+        }
         arguments::narrow(number, &mut args);
         thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
         thread.state.restart = signals::restarts_without_handler(number, &args).then_some(number);

@@ -6099,3 +6099,85 @@ mod process_vm {
         assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 5);
     }
 }
+/// Writes `program` (code, jt, jf, k) at `DATA + 0x100` and its
+/// `sock_fprog` at `DATA`.
+fn seccomp_program(f: &Fixture, program: &[(u16, u8, u8, u32)]) {
+    for (i, &(code, jt, jf, k)) in program.iter().enumerate() {
+        let mut insn = [0u8; 8];
+        insn[0..2].copy_from_slice(&code.to_le_bytes());
+        insn[2] = jt;
+        insn[3] = jf;
+        insn[4..8].copy_from_slice(&k.to_le_bytes());
+        f.mem
+            .write(GuestAddr(DATA + 0x100 + i as u64 * 8), &insn)
+            .unwrap();
+    }
+    f.mem
+        .write_u64(GuestAddr(DATA), program.len() as u64)
+        .unwrap();
+    f.mem.write_u64(GuestAddr(DATA + 8), DATA + 0x100).unwrap();
+}
+#[test]
+fn seccomp_filters_refuse_calls_by_their_action() {
+    let mut f = fixture();
+    // getpid is ERRNO(EACCES), gettid TRAP, the rest allowed.
+    seccomp_program(
+        &f,
+        &[
+            (0x20, 0, 0, 0),
+            (0x15, 0, 1, 39),
+            (0x06, 0, 0, 0x0005_000d),
+            (0x15, 0, 1, 186),
+            (0x06, 0, 0, 0x0003_0005),
+            (0x06, 0, 0, 0x7fff_0000),
+        ],
+    );
+    // Without no_new_privs, only CAP_SYS_ADMIN may install one.
+    let root = f.thread.state.credentials.clone();
+    f.thread.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+    assert_eq!(f.ret(317, &[1, 0, DATA]), errno(Errno::EACCES));
+    f.thread.state.credentials = root;
+    assert_eq!(f.ret(317, &[1, 128, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(317, &[1, 8 | 1, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(317, &[1, 32, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(317, &[0, 0, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(317, &[4, 0, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(317, &[1, 0, 1]), errno(Errno::EFAULT));
+    // SECCOMP_GET_ACTION_AVAIL and SECCOMP_GET_NOTIF_SIZES.
+    f.mem
+        .write(GuestAddr(DATA + 0x400), &0x7fc0_0000u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(317, &[2, 0, DATA + 0x400]), 0);
+    f.mem
+        .write(GuestAddr(DATA + 0x400), &0x0001_0000u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(317, &[2, 0, DATA + 0x400]), errno(Errno::EOPNOTSUPP));
+    assert_eq!(f.ret(317, &[3, 0, DATA + 0x400]), 0);
+    let mut sizes = [0u8; 6];
+    f.mem.read(GuestAddr(DATA + 0x400), &mut sizes).unwrap();
+    assert_eq!(sizes, [80, 0, 24, 0, 64, 0]);
+    assert_eq!(f.ret(157, &[21]), 0); // PR_GET_SECCOMP
+    assert_eq!(f.ret(317, &[1, 0, DATA]), 0);
+    assert_eq!(f.ret(157, &[21]), 2);
+    // Strict mode is not for a thread with filters.
+    assert_eq!(f.ret(157, &[22, 1]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(39, &[]), errno(Errno::EACCES));
+    // A second filter through prctl; the lowest action wins.
+    seccomp_program(&f, &[(0x06, 0, 0, 0x7ffc_0000)]);
+    assert_eq!(f.ret(157, &[22, 2, DATA]), 0);
+    assert_eq!(f.ret(39, &[]), errno(Errno::EACCES));
+    assert_eq!(
+        f.kernel.group.seccomp_of(1, &f.thread.state.seccomp),
+        (2, 2)
+    );
+    // gettid: SIGSYS, which ends the process as nothing handles it.
+    assert_eq!(f.call(186, &[]), Next::Exit(ExitStatus::Signaled(31)));
+}
+#[test]
+fn seccomp_strict_mode_allows_four_calls_and_kills_for_the_rest() {
+    let mut f = fixture();
+    assert_eq!(f.ret(317, &[0, 1, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(157, &[22, 1, 99]), 0);
+    assert_eq!(f.ret(1, &[1, DATA, 0]), 0);
+    assert_eq!(f.call(231, &[0]), Next::Exit(ExitStatus::Signaled(9)));
+}

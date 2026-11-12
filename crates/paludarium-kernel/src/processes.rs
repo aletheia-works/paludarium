@@ -2125,6 +2125,21 @@ impl Kernel {
                 return Ok(0);
             }
             8 => return Err(Errno::EINVAL),
+            // PR_GET_SECCOMP, PR_SET_SECCOMP
+            21 => return Ok(crate::seccomp::mode(&thread.state)),
+            22 => {
+                return crate::seccomp::prctl_set(
+                    &mut crate::seccomp::Caller {
+                        state: &mut thread.state,
+                        tid: thread.tid,
+                        mem,
+                        group: &self.group,
+                        processes: &self.processes,
+                    },
+                    a[1],
+                    a[2],
+                );
+            }
             _ => {}
         }
         match self.processes.prctl(self.process.pid, a[0], a)? {
@@ -2855,6 +2870,12 @@ impl Kernel {
         state.timer = signals::RealTimer::default();
         // A new process has taken no `LANDLOCK_RESTRICT_SELF_TSYNC` of its own.
         state.credentials.landlock_sync = 0;
+        // Nor any `SECCOMP_FILTER_FLAG_TSYNC`; it starts with the parent's
+        // seccomp state as it is now.
+        state.seccomp = self
+            .group
+            .seccomp_of_state(parent.tid, &parent.state.seccomp);
+        state.seccomp_sync = 0;
         state.clear_child_tid = if flags & 0x200000 != 0 { a[3] } else { 0 };
         if flags & 0x100 != 0 {
             state.alt_stack = crate::AltStack::default();
@@ -3823,6 +3844,9 @@ impl Kernel {
             personality,
             arrivals: thread.state.arrivals,
             process_notices: thread.state.process_notices,
+            // exec keeps the seccomp mode and filters.
+            seccomp: std::mem::take(&mut thread.state.seccomp),
+            seccomp_sync: thread.state.seccomp_sync,
             ..ThreadState::default()
         };
         thread.state.name_after(&path);
@@ -3835,6 +3859,8 @@ impl Kernel {
             .executed_as(self.process.pid, dumpable, secure || changed, secure);
         self.group
             .reset_task_ids(self.process.pid, credentials.task_ids());
+        self.group
+            .reset_seccomp(self.process.pid, &thread.state.seccomp);
         self.group.reset_namespaces(self.process.pid, namespaces);
         thread.state.credentials = credentials;
         self.processes.mark_executed(self.process.pid);

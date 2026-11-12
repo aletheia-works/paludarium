@@ -156,6 +156,7 @@ pub mod signal {
     pub const SIGFPE: i32 = 8;
     pub const SIGKILL: i32 = 9;
     pub const SIGSEGV: i32 = 11;
+    pub const SIGSYS: i32 = 31;
 }
 
 /// Up to 15 raw instruction bytes, kept inline so [`ExitReason`] stays `Copy`.

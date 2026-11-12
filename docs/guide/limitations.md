@@ -300,6 +300,12 @@ verified.
   renaming the name in between can make the two differ. There is no `mount`,
   `umount2` or `pivot_root` (`ENOSYS`), which Linux refuses a thread in a
   domain (`EPERM`).
+- **seccomp**: no listener is made: `SECCOMP_FILTER_FLAG_NEW_LISTENER` is
+  `EINVAL` once the filter is found good, so `SECCOMP_RET_USER_NOTIF` always
+  gives `ENOSYS`. Nothing is logged (`SECCOMP_FILTER_FLAG_LOG`,
+  `SECCOMP_RET_LOG`). Strict mode does not make `rdtsc` fault, as Linux's
+  `TIF_NOTSC` does. After `SECCOMP_FILTER_FLAG_TSYNC`, `/proc` shows another
+  thread's new filter only after its next system call.
 - **Credentials**: the IDs and capabilities a thread takes are checked on
   files, signals, resource limits, priorities, socket credentials and core
   files but nowhere else yet. `F_SETOWN` records no sender's credentials, so

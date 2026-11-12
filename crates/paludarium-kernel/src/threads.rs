@@ -51,6 +51,11 @@ pub struct ThreadGroup {
     /// every thread takes when it next enters the kernel.
     landlock_syncs: AtomicU64,
     landlock_sync: Mutex<crate::landlock::Landlock>,
+    /// Every thread's seccomp state, for `SECCOMP_FILTER_FLAG_TSYNC`, and
+    /// how many of those there have been, which a thread entering the
+    /// kernel compares with the count it took last.
+    seccomp: Mutex<crate::seccomp::Threads>,
+    seccomp_syncs: AtomicU64,
     status: Mutex<Option<ExitStatus>>,
     /// The signal dispositions, which clone with `CLONE_SIGHAND` also shares
     /// with another process (Linux's `sighand_struct`).
@@ -111,6 +116,8 @@ pub(crate) struct PublicThread {
     pub credentials: crate::credentials::Credentials,
     pub memory: Option<paludarium_mmu::MemoryView>,
     pub files: crate::files::FilesView,
+    /// Its seccomp mode and number of filters.
+    pub seccomp: (u8, u32),
 }
 impl Default for ThreadGroup {
     fn default() -> Self {
@@ -130,6 +137,8 @@ impl Default for ThreadGroup {
             first_namespaces: Arc::default(),
             landlock_syncs: AtomicU64::new(0),
             landlock_sync: Mutex::default(),
+            seccomp: Mutex::default(),
+            seccomp_syncs: AtomicU64::new(0),
             status: Mutex::new(None),
             actions: Mutex::default(),
             process_inbox: Mutex::new(Arc::new(SignalInbox::default())),
@@ -744,6 +753,88 @@ impl ThreadGroup {
             credentials.landlock_sync = self.landlock_syncs.load(Ordering::SeqCst);
         }
     }
+    /// The seccomp state of every thread, locked while a seccomp operation
+    /// reads or changes it.
+    pub(crate) fn seccomp_threads(&self) -> std::sync::MutexGuard<'_, crate::seccomp::Threads> {
+        self.seccomp.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Records the count of `SECCOMP_FILTER_FLAG_TSYNC` operations, which
+    /// every other thread then takes the state of.
+    pub(crate) fn seccomp_synced(&self, syncs: u64) {
+        self.seccomp_syncs.store(syncs, Ordering::SeqCst);
+    }
+    /// A thread entering the kernel takes the seccomp state a
+    /// `SECCOMP_FILTER_FLAG_TSYNC` gave it, as Linux's threads see it on
+    /// their next call.
+    pub(crate) fn take_seccomp(&self, tid: u32, state: &mut ThreadState) {
+        if self.seccomp_syncs.load(Ordering::SeqCst) != state.seccomp_sync {
+            Self::refresh_seccomp(&self.seccomp_threads(), tid, state);
+        }
+    }
+    /// [`Self::take_seccomp`], with the states locked.
+    pub(crate) fn refresh_seccomp(
+        threads: &crate::seccomp::Threads,
+        tid: u32,
+        state: &mut ThreadState,
+    ) {
+        if state.seccomp_sync != threads.syncs {
+            if let Some(own) = threads.states.get(&tid) {
+                state.seccomp = own.clone();
+            }
+            state.seccomp_sync = threads.syncs;
+        }
+    }
+    /// The seccomp state a new thread `child` of thread `parent` starts
+    /// with: its creator's as it is now, recorded for both.
+    pub(crate) fn seccomp_for_thread(
+        &self,
+        parent: u32,
+        own: &crate::seccomp::Seccomp,
+        child: u32,
+    ) -> (crate::seccomp::Seccomp, u64) {
+        let mut threads = self.seccomp_threads();
+        let state = threads
+            .states
+            .get(&parent)
+            .cloned()
+            .unwrap_or_else(|| own.clone());
+        threads.states.insert(parent, state.clone());
+        threads.states.insert(child, state.clone());
+        (state, threads.syncs)
+    }
+    /// After exec, thread `pid`, with `state`, is all there is.
+    pub(crate) fn reset_seccomp(&self, pid: u32, state: &crate::seccomp::Seccomp) {
+        let mut threads = self.seccomp_threads();
+        threads.states.clear();
+        if state.mode != 0 {
+            threads.states.insert(pid, state.clone());
+        }
+    }
+    /// Thread `tid` has ended, and no `SECCOMP_FILTER_FLAG_TSYNC` waits for
+    /// it.
+    pub(crate) fn forget_seccomp(&self, tid: u32) {
+        self.seccomp_threads().states.remove(&tid);
+    }
+    /// Thread `tid`'s seccomp state, or `own` when the group has not
+    /// recorded it.
+    pub(crate) fn seccomp_of_state(
+        &self,
+        tid: u32,
+        own: &crate::seccomp::Seccomp,
+    ) -> crate::seccomp::Seccomp {
+        self.seccomp_threads()
+            .states
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| own.clone())
+    }
+    /// The seccomp mode and the number of filters of thread `tid`, or of
+    /// `own` when the group has not recorded it.
+    pub(crate) fn seccomp_of(&self, tid: u32, own: &crate::seccomp::Seccomp) -> (u8, u32) {
+        let threads = self.seccomp_threads();
+        let state = threads.states.get(&tid).unwrap_or(own);
+        (state.mode, state.filters())
+    }
     /// Thread `tid` is gone, unless it led process `pid`.
     fn forget_task_ids(&self, pid: u32, tid: u32) {
         if tid != pid {
@@ -1082,6 +1173,7 @@ impl Kernel {
         }
         self.group.forget_nice(tid);
         self.group.forget_task_ids(self.process.pid, tid);
+        self.group.forget_seccomp(tid);
         self.group.forget_public(self.process.pid, tid);
     }
     /// The time of day in seconds, for System V semaphores' times.
@@ -1175,6 +1267,7 @@ impl Kernel {
             self.group.forget_nice(thread.tid);
         }
         self.group.forget_task_ids(self.process.pid, thread.tid);
+        self.group.forget_seccomp(thread.tid);
         self.group.forget_public(self.process.pid, thread.tid);
     }
     fn clear_child_tid(group: &ThreadGroup, mem: &AddressSpace, addr: u64) {
@@ -1432,6 +1525,9 @@ impl Kernel {
         let mut state = parent.state.clone();
         self.group
             .set_task_ids(tid, parent.state.credentials.task_ids());
+        (state.seccomp, state.seccomp_sync) =
+            self.group
+                .seccomp_for_thread(parent.tid, &parent.state.seccomp, tid);
         self.group.set_namespaces(tid, child_namespaces);
         state.timer = signals::RealTimer::default();
         state.pending.clear();

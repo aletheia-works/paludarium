@@ -246,6 +246,7 @@ pub(super) fn content(
             ignored,
             caught,
             no_new_privs: task.view.no_new_privs,
+            seccomp: public.seccomp,
             credentials: &public.credentials,
             reader,
         }),

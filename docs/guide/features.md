@@ -1348,11 +1348,7 @@ kernel.
     (an address in a primary's subnet, with `IFA_F_SECONDARY`) last; IPv6's
     global ones first, the newest first. `127.0.0.1/8` comes with each time
     `lo` comes up (should it have been removed) and `::1/128` too; taking
-    `lo` down removes every IPv6 address (`keep_addr_on_down` is 0). An
-    `AF_MCTP` dump has MCTP's own handler, as `mctp_dump_addrinfo`, and
-    shows nothing, as `lo` has no MCTP address; strictly it needs only a
-    whole `ifaddrmsg` (`EINVAL`), whose index narrows it without
-    `NLM_F_DUMP_FILTERED`.
+    `lo` down removes every IPv6 address (`keep_addr_on_down` is 0).
     `RTM_NEWADDR` adds one, as `inet_rtm_newaddr` and `inet6_rtm_newaddr`
     do: `EEXIST` for one `lo` has, unless `NLM_F_REPLACE` without
     `NLM_F_EXCL`; `EINVAL` for an IPv4 one without `IFA_LOCAL` or a prefix
@@ -1363,6 +1359,24 @@ kernel.
     the first that has the `IFA_LOCAL`, `IFA_LABEL` and `IFA_ADDRESS` and
     prefix it names (`EADDRNOTAVAIL` for none), a primary with its
     secondaries; `127.0.0.1` and `::1` may go too.
+  - **MCTP addresses:** `lo` takes MCTP endpoint IDs, as a kernel built
+    with `CONFIG_MCTP` gives a loopback them. `RTM_NEWADDR` and
+    `RTM_DELADDR` of `AF_MCTP` add and remove one, as `mctp_rtm_newaddr`
+    and `mctp_rtm_deladdr` do. The request is parsed strictly whatever
+    the socket: a whole `ifaddrmsg` and one byte of `IFA_LOCAL` or else of
+    `IFA_ADDRESS`, with no other attribute (`EINVAL`), for `lo`'s index
+    (`ENODEV`). Adding takes IDs 8 to 254 (`EINVAL`), each once
+    (`EEXIST`); removing one `lo` has not is `ENOENT`. Each change goes to
+    `RTNLGRP_MCTP_IFADDR` (34) with the request's sequence number and
+    port, as `mctp_addr_notify` sends it. An `AF_MCTP` address dump has
+    MCTP's own handler, as `mctp_dump_addrinfo`: the IDs, the first added
+    first, each as `IFA_LOCAL` and `IFA_ADDRESS`; strictly it needs only a
+    whole `ifaddrmsg` (`EINVAL`), whose index narrows it without
+    `NLM_F_DUMP_FILTERED`. Each ID has a local route
+    (`mctp_route_add_local`), which an `AF_MCTP` route dump shows, the
+    newest first, as `mctp_dump_rtinfo` does, taking no filter. The
+    address and route dumps of every family (`rtnl_dump_all`) end with
+    MCTP's.
   - **Routes:** each family has its routing tables, as Linux's `fib_trie`
     and `ip6_fib` keep them; IPv4's local and main tables share one trie,
     as they do while there is no policy rule. The addresses' routes are the

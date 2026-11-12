@@ -1172,9 +1172,6 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     サブネットの中のアドレス。`IFA_F_SECONDARY` が付きます）は最後です。IPv6 はグローバルな
     ものが先で、新しいものが先です。`lo` が上がるたびに `127.0.0.1/8`（消されていれば）と
     `::1/128` が付き、落とすと IPv6 のアドレスはすべて消えます（`keep_addr_on_down` は 0）。
-    `AF_MCTP` のダンプは、`mctp_dump_addrinfo` と同じく MCTP 自身が扱い、`lo` には MCTP の
-    アドレスがないので何も返しません。検査するときに要るのは `ifaddrmsg` 全体だけで
-    （足りなければ `EINVAL`）、インデックスは `NLM_F_DUMP_FILTERED` を付けずに絞り込みます。
     `RTM_NEWADDR` は、`inet_rtm_newaddr` と `inet6_rtm_newaddr` と同じくアドレスを足します。
     `lo` がすでに持つものは、`NLM_F_EXCL` なしの `NLM_F_REPLACE` でなければ `EEXIST` です。
     `IFA_LOCAL` のない IPv4 のもの、32（IPv6 なら 128）を超える接頭辞、`IFA_LOCAL` も
@@ -1184,6 +1181,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `IFA_LOCAL`、`IFA_LABEL`、`IFA_ADDRESS` と接頭辞を持つ最初のものを消し（なければ
     `EADDRNOTAVAIL`）、プライマリならそのセカンダリも消します。`127.0.0.1` と `::1` も
     消せます。
+  - **MCTP のアドレス:** `CONFIG_MCTP` を組み込んだカーネルのループバックと同じく、`lo` は
+    MCTP のエンドポイント ID を持てます。`AF_MCTP` の `RTM_NEWADDR` と `RTM_DELADDR` は、
+    `mctp_rtm_newaddr` と `mctp_rtm_deladdr` と同じく ID を足し、消します。リクエストは
+    ソケットにかかわらず厳しく解釈します。`ifaddrmsg` 全体と、1 バイトの `IFA_LOCAL`
+    （なければ `IFA_ADDRESS`）が要り、ほかの属性は取りません（`EINVAL`）。インデックスは
+    `lo` のものです（ほかは `ENODEV`）。足せる ID は 8 から 254 で（ほかは `EINVAL`）、
+    同じものは一度だけです（`EEXIST`）。`lo` にないものを消そうとすると `ENOENT` です。
+    変更は、`mctp_addr_notify` と同じく、リクエストのシーケンス番号とポートを付けて
+    `RTNLGRP_MCTP_IFADDR`（34）に伝えます。`AF_MCTP` のアドレスのダンプは、
+    `mctp_dump_addrinfo` と同じく MCTP 自身が扱い、ID を足した順に、それぞれ `IFA_LOCAL` と
+    `IFA_ADDRESS` で返します。検査するときに要るのは `ifaddrmsg` 全体だけで（足りなければ
+    `EINVAL`）、インデックスは `NLM_F_DUMP_FILTERED` を付けずに絞り込みます。ID ごとに
+    ローカルの経路があり（`mctp_route_add_local`）、`AF_MCTP` の経路のダンプは、
+    `mctp_dump_rtinfo` と同じく絞り込みを取らずに、新しいものから返します。すべての
+    ファミリーのアドレスと経路のダンプ（`rtnl_dump_all`）は、最後に MCTP のものを返します。
   - **経路:** ファミリーごとに、Linux の `fib_trie` と `ip6_fib` と同じく経路の表を
     持ちます。IPv4 のローカルの表とメインの表は、ポリシーのルールがない間の Linux と同じく
     1 つのトライを分け合います。アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付ける

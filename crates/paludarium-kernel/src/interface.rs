@@ -392,6 +392,9 @@ pub(crate) struct Addresses {
     /// main and local ones from the start.
     tables4: Vec<u32>,
     tables6: Vec<u32>,
+    /// The loopback's MCTP endpoint IDs, the first added first, as
+    /// `mctp_dev`'s `addrs`; each has its local MCTP route.
+    pub mctp: Vec<u8>,
 }
 impl Addresses {
     /// The first namespace's: `127.0.0.1/8` and `::1`, up.
@@ -409,6 +412,7 @@ impl Addresses {
             routes6: Vec::new(),
             tables4: Vec::new(),
             tables6: vec![TABLE_MAIN, TABLE_LOCAL],
+            mctp: Vec::new(),
         }
     }
     /// The loopback comes up (`NETDEV_UP`), and what Linux tells of it, in

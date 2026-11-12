@@ -429,10 +429,12 @@ verified.
   `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
   listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
-  MCTP's settings and an `AF_MCTP` address dump has its own answer,
-  where a kernel without it gives no MCTP settings and dumps IPv4's and
-  IPv6's addresses for that dump; MCTP addresses cannot be added
-  (`RTM_NEWADDR` of `AF_MCTP` is `EOPNOTSUPP`). A link message's
+  MCTP's settings and `AF_MCTP` address and route dumps have their own
+  answers, where a kernel without it gives no MCTP settings, dumps
+  IPv4's and IPv6's addresses and routes for those dumps, and takes no
+  MCTP address; MCTP routes cannot be added or removed (`RTM_NEWROUTE`
+  and `RTM_DELROUTE` of `AF_MCTP` are `EOPNOTSUPP`), so there are only
+  the local routes of `lo`'s addresses. A link message's
   statistics are zero; its IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30

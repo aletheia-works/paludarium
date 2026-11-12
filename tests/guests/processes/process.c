@@ -1331,6 +1331,9 @@ static void nl_address_attribute(unsigned short type, const unsigned char *v, in
         unsigned lifetimes[2];
         memcpy(lifetimes, v, 8);
         printf("=%#x,%#x", lifetimes[0], lifetimes[1]);
+    } else if ((type == 1 || type == 2) && len == 1) {
+        /* An MCTP endpoint ID. */
+        printf("=%u", v[0]);
     }
 }
 /* Receives on `fd` until NLMSG_DONE or an error: prints each message of
@@ -1563,6 +1566,20 @@ static struct nl_body nl_body(unsigned char family, size_t len) {
 static void nl_strict(int fd, unsigned port, unsigned short type, int dump, const struct nl_body *b,
                       const char *label) {
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | (dump ? NL_F_DUMP : 0), b->bytes, b->len), port, label);
+}
+static int nl_quiet(int fd, unsigned short type, unsigned short flags, const void *request, size_t len);
+/* The netlink-strict case: an MCTP address request `type` on `fd` (at
+   `port`) for index `index`, with attribute `attr` (none for 0) of `len`
+   bytes of `eid`; prints its error and what `mon`, a member of
+   RTNLGRP_MCTP_IFADDR, hears of it. */
+static void nl_mctp_change(int fd, unsigned port, int mon, unsigned short type, unsigned index, unsigned short attr,
+                           int eid, int len, const char *label) {
+    struct nl_body b = nl_body(45, 8);
+    memcpy(b.bytes + 4, &index, 4);
+    unsigned char value[2] = {eid, eid};
+    if (attr) nl_put(&b, attr, value, len);
+    printf("%s: error=%d\n", label, nl_quiet(fd, type, 0, b.bytes, b.len));
+    nl_answer(mon, nl_seq, port, label);
 }
 /* The route-dump case: sends request `type` with `flags` and NLM_F_ACK,
    and takes its acknowledgement, giving its error. */
@@ -10349,6 +10366,48 @@ int main(int argc, char **argv) {
                 if (lookups[i].attribute) nl_put32(&b, lookups[i].attribute, lookups[i].value);
                 nl_strict(fd, port, 26, 0, &b, lookups[i].label);
             }
+            /* MCTP addresses of lo (mctp_rtm_newaddr, mctp_rtm_deladdr),
+               which a member of RTNLGRP_MCTP_IFADDR (34) hears of: endpoint
+               IDs 8 to 254, each once, as one byte of IFA_LOCAL or else of
+               IFA_ADDRESS, the request parsed strictly whatever the socket.
+               Each has a local route, which AF_MCTP's route dump shows, and
+               the dumps of every family end with them. */
+            int mctp_mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            bind(mctp_mon, (void *)&any, sizeof any);
+            int mctp_group = 34;
+            printf("mctp join=%d\n", setsockopt(mctp_mon, 270, 1, &mctp_group, sizeof mctp_group) < 0 ? -errno : 0);
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 8, 1, "mctp add 8");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 8, 1, "mctp add 8 again");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 1, 9, 1, "mctp add address 9");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 10, 1, "mctp add 10");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 7, 1, "mctp add reserved");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 255, 1, "mctp add broadcast");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 11, 2, "mctp add two bytes");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 11, 0, "mctp add no bytes");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 3, 11, 1, "mctp add label");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 0, 11, 1, "mctp add none");
+            nl_mctp_change(fd, port, mctp_mon, 20, 2, 2, 11, 1, "mctp add other index");
+            nl_mctp_change(fd, port, mctp_mon, 20, 0, 2, 11, 1, "mctp add index 0");
+            b = nl_body(45, 4);
+            printf("mctp add short: error=%d\n", nl_quiet(fd, 20, 0, b.bytes, b.len));
+            b = nl_body(45, 8);
+            nl_strict(fd, port, 22, 1, &b, "addr mctp added");
+            b = nl_body(45, 12);
+            nl_strict(fd, port, 26, 1, &b, "route mctp added");
+            b = nl_body(0, 8);
+            nl_strict(fd, port, 22, 1, &b, "addr all added");
+            b = nl_body(0, 12);
+            nl_strict(fd, port, 26, 1, &b, "route all added");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 1, 8, 1, "mctp del 8");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 8, 1, "mctp del 8 again");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 7, 1, "mctp del reserved");
+            nl_mctp_change(fd, port, mctp_mon, 21, 2, 2, 9, 1, "mctp del other index");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 10, 1, "mctp del 10");
+            b = nl_body(45, 8);
+            nl_strict(fd, port, 22, 1, &b, "addr mctp deleted");
+            b = nl_body(45, 12);
+            nl_strict(fd, port, 26, 1, &b, "route mctp deleted");
+            close(mctp_mon);
             /* Unchecked: an old rtgenmsg with IFLA_EXT_MASK after its 4
                bytes, IFLA_MASTER and IFLA_TARGET_NETNSID, and RTM_F_PREFIX. */
             int loose = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
@@ -10376,6 +10435,7 @@ int main(int argc, char **argv) {
             nl_strict(loose, name.pid, 18, 1, &b, "loose ipmr rtgenmsg");
             b = nl_body(45, 1);
             nl_strict(loose, name.pid, 22, 1, &b, "loose addr mctp rtgenmsg");
+            nl_strict(loose, name.pid, 26, 1, &b, "loose route mctp rtgenmsg");
             link = (struct nl_link){.family = 128, .index = 1};
             b = nl_body(128, 16);
             memcpy(b.bytes, &link, 16);

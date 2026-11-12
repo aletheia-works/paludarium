@@ -1519,6 +1519,67 @@ static void nl_route(int fd, unsigned port, unsigned short type, unsigned short 
     }
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, at), port, label);
 }
+/* The route-dump case: sends request `type` with `flags` and NLM_F_ACK,
+   and takes its acknowledgement, giving its error. */
+static int nl_quiet(int fd, unsigned short type, unsigned short flags, const void *request, size_t len) {
+    nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, len);
+    static char buf[4096];
+    long n = recv(fd, buf, sizeof buf, 0);
+    if (n < 0) return -errno;
+    int error = 1;
+    if (n >= 20 && ((struct nl_header *)buf)->type == 2) memcpy(&error, buf + 16, 4);
+    return error;
+}
+/* A /32 address of lo, `ip`, as `ip address add` makes it. */
+static int nl_local(int fd, const unsigned char ip[4]) {
+    unsigned char request[8 + 2 * 8] = {AF_INET, 32, 0, 0, 1};
+    for (int i = 0; i < 2; i++) {
+        unsigned short attribute[2] = {8, 2 - i};
+        memcpy(request + 8 + 8 * i, attribute, 4);
+        memcpy(request + 12 + 8 * i, ip, 4);
+    }
+    return nl_quiet(fd, 20, 0x600, request, sizeof request);
+}
+/* A blackhole route to `dst` of prefix `len` in the main table. */
+static int nl_blackhole(int fd, int family, const unsigned char *dst, int len) {
+    unsigned char request[12 + 20] = {family, len, 0, 0, 254, 3, 0, 6};
+    int size = family == AF_INET ? 4 : 16;
+    unsigned short attribute[2] = {4 + size, 1};
+    memcpy(request + 12, attribute, 4);
+    memcpy(request + 16, dst, size);
+    return nl_quiet(fd, 24, 0x600, request, 16 + size);
+}
+/* Dumps `type` of `family` through a new socket, receiving into `room`
+   bytes, and prints each datagram the dump comes in: its length, flags,
+   messages and whether NLMSG_DONE or NLMSG_ERROR, with its error, ends it. */
+static void nl_parts(const char *label, unsigned short type, unsigned char family, size_t room) {
+    int fd = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+    nl_send(fd, type, NL_F_REQUEST | NL_F_DUMP, &family, 1);
+    static char buf[65536];
+    for (int part = 0; part < 64; part++) {
+        struct iovec iov = {buf, room};
+        struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+        long n = recvmsg(fd, &msg, MSG_DONTWAIT);
+        if (n < 0) {
+            printf("%s room=%zu part %d: %d\n", label, room, part, -errno);
+            break;
+        }
+        int messages = 0, done = 0, error = 0;
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) break;
+            messages++;
+            if (h->type == 2 || h->type == 3) done = h->type, memcpy(&error, h + 1, 4);
+            at += (h->len + 3) & ~3;
+        }
+        printf("%s room=%zu part %d: n=%ld flags=%#x messages=%d done=%d", label, room, part, n, msg.msg_flags,
+               messages, done);
+        if (done) printf(" error=%d", error);
+        printf("\n");
+        if (done) break;
+    }
+    close(fd);
+}
 /* Route lookups for the routes case, as nl_lookups sends them. */
 static void routes_get(int fd, unsigned port, const char *when, const char *const *texts, size_t count,
                        unsigned flags) {
@@ -9187,6 +9248,47 @@ int main(int argc, char **argv) {
                    netns_lo(owned, SIOCSIFFLAGS, "lo", IFF_UP));
             printf("user: owned=%ld made=%ld here=%ld\n", netns_lo(owned, SIOCGIFFLAGS, "lo", 0),
                    netns_lo(made, SIOCGIFFLAGS, "lo", 0), netns_lo(here, SIOCGIFFLAGS, "lo", 0));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "route-dump")) {
+        /* A child makes a network namespace with lo up, 150 more addresses
+           and 300 blackhole routes, and prints the datagrams each address
+           and route dump comes in: a page's worth first, then as much as
+           the longest receive asked for, and NLMSG_DONE after them. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            int up = nl_quiet(ctl, 16, 0, &link, sizeof link), addresses = 0, routes4 = 0, routes6 = 0;
+            for (int i = 0; i < 150; i++) {
+                unsigned char ip[4] = {10, 30, i / 100, i % 100 + 1};
+                addresses += nl_local(ctl, ip) == 0;
+            }
+            for (int i = 0; i < 200; i++) {
+                unsigned char dst[16] = {10, 40, i, 0};
+                routes4 += nl_blackhole(ctl, AF_INET, dst, 24) == 0;
+            }
+            for (int i = 0; i < 100; i++) {
+                unsigned char dst[16] = {0x20, 0x01, 0x0d, 0xb8, 0, i};
+                routes6 += nl_blackhole(ctl, AF_INET6, dst, 48) == 0;
+            }
+            printf("added: up=%d addresses=%d routes4=%d routes6=%d\n", up, addresses, routes4, routes6);
+            static const struct {
+                unsigned short type;
+                unsigned char family;
+                const char *label;
+            } dumps[] = {{22, 0, "addr"},  {22, AF_INET, "addr4"},  {22, AF_INET6, "addr6"}, {26, 0, "route"},
+                         {26, AF_INET, "route4"}, {26, AF_INET6, "route6"}, {26, 128, "ipmr"}};
+            static const size_t rooms[] = {65536, 8192, 1024};
+            for (size_t i = 0; i < sizeof dumps / sizeof dumps[0]; i++)
+                for (size_t j = 0; j < sizeof rooms / sizeof rooms[0]; j++)
+                    nl_parts(dumps[i].label, dumps[i].type, dumps[i].family, rooms[j]);
             fflush(stdout);
             _exit(0);
         }

@@ -4118,6 +4118,21 @@ fn netlink_dumps_and_sets_a_new_namespaces_loopback() {
     let len = netlink_request(&f, DATA, 22, 0x301, 12, &[10]);
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
     assert_eq!(netlink_replies(&mut f, fd).len(), 2);
+    // That dump's NLMSG_DONE comes after `::1`, in its datagram, as
+    // `inet6_dump_ifaddr` is not split; AF_INET's comes in one of its own.
+    let receive = |f: &mut Fixture| f.ret(45, [fd, DATA + 0x1000, 0x1000, 0x40, 0, 0]);
+    for (seq, family, joined) in [(15, 10, true), (16, 2, false)] {
+        let len = netlink_request(&f, DATA, 22, 0x301, seq, &[family]);
+        assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+        let first = receive(&mut f);
+        let message = u64::from(read_u32(&f, DATA + 0x1000));
+        if joined {
+            assert_eq!(first, message + 20);
+        } else {
+            assert_eq!((first, receive(&mut f)), (message, 20));
+        }
+        assert_eq!(receive(&mut f), Errno::EAGAIN.to_syscall_return());
+    }
     // RTM_GETLINK by name answers once, unless the name is another's.
     let mut by_name = [0u8; 24];
     by_name[16..20].copy_from_slice(&[7, 0, 3, 0]);

@@ -1136,8 +1136,12 @@ kernel.
     room, or the socket congested, waits for room instead, or is `EAGAIN`
     with `MSG_DONTWAIT` or `O_NONBLOCK`, and overruns nothing.
   - **Requests:** the kernel, port 0, takes each message of a datagram as
-    `rtnetlink` does. A dump (`NLM_F_DUMP`) ends with `NLMSG_DONE` at the
-    next receive. An error, or a success with `NLM_F_ACK`, is answered with
+    `rtnetlink` does. A dump (`NLM_F_DUMP`) comes in parts as large as
+    Linux's `netlink_dump` makes them (a page's worth, or as much as the
+    longest receive so far asked for up to 32 KiB, the next as a receive
+    makes room), and ends with `NLMSG_DONE` in a part of its own; an
+    `AF_INET6` address dump's goes after its last address when that part
+    has room, as `inet6_dump_ifaddr` puts it. An error, or a success with `NLM_F_ACK`, is answered with
     `NLMSG_ERROR`, which carries the whole request with an error unless
     `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending

@@ -44,15 +44,23 @@ jobs:
             done
             "$@"
           }
+          # A fetch that hangs holds the job until its 35 minutes run out, so each one is bounded
+          # and tried again. The install itself runs from what was downloaded, without a limit:
+          # stopping dpkg would leave packages half installed.
+          bounded() { timeout --kill-after=10 "$@"; }
           # apt-get update exits 0 when a source is unreachable, so look for the package as well.
-          update_llvm_lists() { apt-get update && apt-cache show llvm-24 > /dev/null; }
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl
-          curl --fail --location --retry 5 --retry-delay 30 --retry-all-errors https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          update_lists() { bounded 120 apt-get update && apt-cache show "$1" > /dev/null; }
+          install_packages() {
+            retry bounded 300 apt-get install -y --no-install-recommends --download-only "$@"
+            apt-get install -y --no-install-recommends "$@"
+          }
+          retry update_lists curl
+          install_packages ca-certificates curl
+          curl --fail --location --max-time 60 --retry 5 --retry-delay 30 --retry-all-errors https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc
           printf '%s\n' 'deb https://apt.llvm.org/trixie/ llvm-toolchain-trixie main' > /etc/apt/sources.list.d/llvm-symbolizer.list
-          retry update_llvm_lists
+          retry update_lists llvm-24
           apt-cache policy llvm-24
-          retry apt-get install -y --no-install-recommends llvm-24
+          install_packages llvm-24
       - name: Fresh 600 second ASan and LSan observation
         shell: bash
         run: |

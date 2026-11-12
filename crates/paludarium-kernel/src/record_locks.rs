@@ -149,7 +149,16 @@ pub(crate) struct Locks {
     /// a stale wait behind, and two processes asking for each other's locks
     /// cannot both miss the cycle.
     table: Mutex<Table>,
+    /// The `flock` lock of each description that has one, for
+    /// `/proc/self/fdinfo` only: the file system keeps the lock itself and
+    /// decides its conflicts. Each has the kind and the process that set it
+    /// (Linux's `flc_pid`).
+    flocks: Mutex<Vec<Flock>>,
 }
+
+/// A description's `flock` lock: the description, the kind and the process
+/// that set it.
+type Flock = (Weak<dyn FileHandle>, Kind, u32);
 
 impl Locks {
     fn table(&self) -> std::sync::MutexGuard<'_, Table> {
@@ -324,6 +333,55 @@ impl Locks {
             .waiting
             .retain(|&waiter, w| waiter != pid && w.blocker != pid);
     }
+    /// Notes what `flock(op)` through `file` by process `pid` did, as
+    /// `flock_lock_inode` changes a description's lock: an unlock, or a
+    /// change of kind, drops the old lock first, even when the new one then
+    /// conflicts (`EAGAIN`); asking again for the kind it has keeps the lock
+    /// as it was, with the process that set it.
+    pub(crate) fn flocked(
+        &self,
+        file: &Arc<dyn FileHandle>,
+        pid: u32,
+        op: u32,
+        result: Result<(), Errno>,
+    ) {
+        const LOCK_SH: u32 = 1;
+        const LOCK_EX: u32 = 2;
+        const LOCK_UN: u32 = 8;
+        let kind = match op & !4 {
+            LOCK_SH => Some(Kind::Read),
+            LOCK_EX => Some(Kind::Write),
+            LOCK_UN => None,
+            _ => return,
+        };
+        if result.is_err_and(|e| e != Errno::EAGAIN) {
+            return;
+        }
+        let this = Arc::downgrade(file);
+        let mut flocks = self.flocks.lock().unwrap_or_else(PoisonError::into_inner);
+        flocks.retain(|(f, ..)| f.strong_count() > 0);
+        let had = flocks.iter().position(|(f, ..)| Weak::ptr_eq(f, &this));
+        if let (Some(i), Some(kind)) = (had, kind)
+            && flocks[i].1 == kind
+        {
+            return;
+        }
+        if let Some(i) = had {
+            flocks.remove(i);
+        }
+        if let (Some(kind), Ok(())) = (kind, result) {
+            flocks.push((this, kind, pid));
+        }
+    }
+    /// The `flock` lock description `file` has, and the process that set it.
+    fn flock_of(&self, file: &Arc<dyn FileHandle>) -> Option<(Kind, u32)> {
+        let this = Arc::downgrade(file);
+        let flocks = self.flocks.lock().unwrap_or_else(PoisonError::into_inner);
+        flocks
+            .iter()
+            .find(|(f, ..)| Weak::ptr_eq(f, &this))
+            .map(|&(_, kind, pid)| (kind, pid))
+    }
     /// Ends process `pid`'s wait, which a signal interrupted.
     pub(crate) fn stop_waiting(&self, pid: u32) {
         self.table().waiting.remove(&pid);
@@ -336,17 +394,11 @@ fn key(c: &Context<'_>, d: &Descriptor) -> Result<Key, Errno> {
 }
 
 /// The `lock:` lines `/proc/self/fdinfo` has for descriptor `d`, as Linux's
-/// `show_fd_locks`: the locks set through its description that this
-/// process or the description owns, numbered from 1, by where they start.
+/// `show_fd_locks`: the description's `flock` lock, then the record locks
+/// set through it that this process or the description owns, by where they
+/// start, numbered from 1 across both.
 pub(crate) fn fdinfo(c: &Context<'_>, d: &Descriptor) -> Vec<u8> {
     let Ok(key) = key(c, d) else {
-        return Vec::new();
-    };
-    let this = Arc::downgrade(&d.file);
-    let ours = Owner::Process(c.process.pid);
-    let locks = c.processes.locks();
-    let table = locks.table();
-    let Some(list) = table.files.get(&key) else {
         return Vec::new();
     };
     // `new_encode_dev` undone.
@@ -354,34 +406,46 @@ pub(crate) fn fdinfo(c: &Context<'_>, d: &Descriptor) -> Vec<u8> {
     let major = (device >> 8) & 0xfff;
     let minor = (device & 0xff) | ((device >> 12) & !0xff);
     let mut out = Vec::new();
+    let mut id = 0;
+    let mut line = |what: &str, kind: Kind, pid: i32, range: &str| {
+        id += 1;
+        let kind = if kind == Kind::Write { "WRITE" } else { "READ" };
+        out.extend_from_slice(
+            format!("lock:\t{id}: {what} {kind} {pid} {major:02x}:{minor:02x}:{inode} {range}\n")
+                .as_bytes(),
+        );
+    };
+    let locks = c.processes.locks();
+    if let Some((kind, pid)) = locks.flock_of(&d.file) {
+        line(
+            "FLOCK  ADVISORY ",
+            kind,
+            c.pid_space().number(pid) as i32,
+            "0 EOF",
+        );
+    }
+    let this = Arc::downgrade(&d.file);
+    let ours = Owner::Process(c.process.pid);
+    let table = locks.table();
+    let Some(list) = table.files.get(&key) else {
+        return out;
+    };
     let shown = list.iter().filter(|l| {
         l.owner.live()
             && l.file.as_ref().is_some_and(|f| Weak::ptr_eq(f, &this))
             && (l.owner.same(&ours) || l.owner.same(&Owner::Description(this.clone())))
     });
-    for (id, lock) in shown.enumerate() {
+    for lock in shown {
         let (what, pid) = match lock.owner {
-            Owner::Process(pid) => ("POSIX ", c.pid_space().number(pid) as i32),
-            Owner::Description(_) => ("OFDLCK", -1),
-        };
-        let kind = if lock.kind == Kind::Write {
-            "WRITE"
-        } else {
-            "READ"
+            Owner::Process(pid) => ("POSIX  ADVISORY ", c.pid_space().number(pid) as i32),
+            Owner::Description(_) => ("OFDLCK ADVISORY ", -1),
         };
         let end = if lock.end == OFFSET_MAX {
             "EOF".to_owned()
         } else {
             lock.end.to_string()
         };
-        out.extend_from_slice(
-            format!(
-                "lock:\t{}: {what} ADVISORY  {kind} {pid} {major:02x}:{minor:02x}:{inode} {} {end}\n",
-                id + 1,
-                lock.start
-            )
-            .as_bytes(),
-        );
+        line(what, lock.kind, pid, &format!("{} {end}", lock.start));
     }
     out
 }

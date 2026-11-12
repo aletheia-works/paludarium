@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/select.h>
 #include <sys/signalfd.h>
 #include <sys/sysmacros.h>
@@ -387,7 +388,7 @@ static int case_interrupt(void) {
 
 /* /proc/self/fdinfo of the other files whose kinds add lines: an eventfd's
  * count, an epoll's targets, a signalfd's mask, a timerfd's settings, and
- * the record locks set through a description. Numbers the system picks
+ * the flock and record locks set through a description. Numbers the system picks
  * (eventfd-id, inodes, devices, process IDs) are compared, not printed. */
 static FILE *fdinfo(int fd) {
     char path[64];
@@ -529,6 +530,24 @@ static int case_fdinfo(void) {
     show_extra("locks-ofd", second);
     say("unlock=%d", lock_range(file, F_SETLK, F_UNLCK, 2, 3));
     show_extra("locks-split", file);
+
+    /* A description's flock lock comes before its record locks. Asking
+       again for the kind it has keeps it; a change of kind that conflicts
+       drops it; a child's lock on a shared description shows its own pid. */
+    say("flock=%d", TRY(flock(file, LOCK_SH)));
+    show_extra("flock", file);
+    show_extra("flock-dup", same);
+    say("flock second=%d again=%d", TRY(flock(second, LOCK_SH | LOCK_NB)), TRY(flock(file, LOCK_SH)));
+    show_extra("flock-shared", second);
+    say("flock upgrade=%d", TRY(flock(file, LOCK_EX | LOCK_NB)));
+    show_extra("flock-dropped", file);
+    say("flock unlock=%d", TRY(flock(second, LOCK_UN)));
+    pid_t child = fork();
+    if (child == 0) _exit(flock(second, LOCK_EX | LOCK_NB) == 0 ? 0 : 1);
+    int status;
+    waitpid(child, &status, 0);
+    say("flock child=%d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    show_extra("flock-child", second);
     return 0;
 }
 

@@ -3328,7 +3328,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         73 => {
             let d = c.files.descriptor(a[0])?;
             loop {
-                match d.file.flock(a[1] as u32) {
+                let result = d.file.flock(a[1] as u32);
+                c.processes
+                    .locks()
+                    .flocked(&d.file, c.process.pid, a[1] as u32, result);
+                match result {
                     Ok(()) => return Ok(0),
                     Err(e) if e == Errno::EAGAIN && a[1] & 4 == 0 => pause_for_lock(c)?,
                     Err(e) => return Err(e),
@@ -6086,10 +6090,10 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
 /// `/proc/self/fdinfo/<n>` while descriptor `n` is open, as Linux's
 /// `seq_show` writes it: the description's position, its flags in octal
 /// (`F_GETFL`'s, and `O_CLOEXEC` for the descriptor), the ID of its mount
-/// (as `statx` gives it) and its inode; then a `lock:` line for each record
-/// lock on the file ([`crate::record_locks::fdinfo`]), and the
-/// lines of an inotify instance, an eventfd, a signalfd, a timerfd or an
-/// epoll. `flock` locks have no lines: the file system keeps them.
+/// (as `statx` gives it) and its inode; then a `lock:` line for the
+/// description's `flock` lock and each record lock set through it
+/// ([`crate::record_locks::fdinfo`]), and the lines of an inotify instance,
+/// an eventfd, a signalfd, a timerfd or an epoll.
 fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     const O_CLOEXEC: u32 = 0o2000000;
     let d = c.files.descriptor(u64::from(n)).ok()?;

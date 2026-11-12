@@ -360,8 +360,7 @@ verified.
 - **inotify, in part**: an instance's `/proc/self/fdinfo` lines end at
   `ignored_mask:0`, without the file handle Linux adds for a file system
   that can make one, and `IN_UNMOUNT` is never sent, as nothing is ever
-  unmounted (there is no `umount2`). `/proc/self/fdinfo` has no `flock`
-  lines (the file system keeps those locks), lists an epoll's files by
+  unmounted (there is no `umount2`). `/proc/self/fdinfo` lists an epoll's files by
   descriptor where Linux's order follows the files' addresses, and numbers
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and

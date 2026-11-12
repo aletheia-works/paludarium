@@ -1834,11 +1834,16 @@ kernel.
   `ino:` and `sdev:`, the file's inode and its file system's device as the
   kernel numbers it (`MKDEV`), and `mask:`, the mask it was given, in
   hexadecimal, then `ignored_mask:0`. The other kinds add Linux's lines
-  too. After the first four comes a `lock:` line for each record lock set
-  through the description that the process or the description owns
-  (`show_fd_locks`): `POSIX` or `OFDLCK`, `READ` or `WRITE`, the owner's
-  process ID (-1 for a description's), the device and inode, and the
-  range, numbered from 1 by where they start. A lock merged into another
+  too. After the first four come `lock:` lines (`show_fd_locks`): the
+  description's `flock` lock, then each record lock set through it that the
+  process or the description owns, by where they start, numbered from 1
+  across both. Each has `FLOCK`, `POSIX` or `OFDLCK`, `READ` or `WRITE`, the
+  process ID of its owner (for a `flock` lock, the process that set it;
+  -1 for a description's record lock), the device and inode, and the range
+  (`0 EOF` for a `flock` lock). Asking again for the kind of `flock` lock a
+  description has keeps it as it was, and a change of kind drops the old
+  one first, even when the new one conflicts, as `flock_lock_inode` does.
+  A lock merged into another
   stays with the description of the lock it extended, as
   `posix_lock_inode` keeps it. Then an eventfd's `eventfd-count`
   (hexadecimal), `eventfd-id` (the lowest number no other eventfd has, as

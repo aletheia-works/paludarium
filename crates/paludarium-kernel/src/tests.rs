@@ -5203,6 +5203,60 @@ mod inotify {
         );
     }
     #[test]
+    fn fdinfo_shows_a_descriptions_flock_lock_before_its_record_locks() {
+        let mut f = fixture();
+        let path = put(&f, DATA, b"/tmp/flocked");
+        let a = f.ret(2, &[path, 0o102, 0o600]);
+        let b = f.ret(2, &[path, 0o2, 0]);
+        let fs = &f.kernel.files.fs;
+        let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
+        let (major, minor) = (device >> 8 & 0xfff, device & 0xff | (device >> 12) & !0xff);
+        let ino = fs.metadata(b"/tmp/flocked", true).unwrap().inode;
+        let at = format!("{major:02x}:{minor:02x}:{ino}");
+        let flock = |kind: &str| format!("lock:\t1: FLOCK  ADVISORY  {kind} 1 {at} 0 EOF");
+        assert_eq!(f.ret(73, &[a, 1]), 0);
+        let mut raw = [0u8; 32];
+        raw[8..16].copy_from_slice(&5i64.to_le_bytes());
+        raw[16..24].copy_from_slice(&5i64.to_le_bytes());
+        f.mem.write(GuestAddr(DATA + 0x100), &raw).unwrap();
+        assert_eq!(f.ret(72, &[a, 6, DATA + 0x100]), 0);
+        assert_eq!(
+            extra(&mut f, a),
+            [
+                flock("READ"),
+                format!("lock:\t2: POSIX  ADVISORY  READ 1 {at} 5 9"),
+            ]
+        );
+        // A shared lock of the other description, and asking again for the
+        // kind it has, leave the first as it was.
+        assert_eq!(f.ret(73, &[b, 1 | 4]), 0);
+        assert_eq!(f.ret(73, &[a, 1]), 0);
+        assert_eq!(extra(&mut f, a)[0], flock("READ"));
+        assert_eq!(extra(&mut f, b), [flock("READ")]);
+        // A change of kind that conflicts drops the lock it had.
+        assert_eq!(f.ret(73, &[a, 2 | 4]), errno(Errno::EAGAIN));
+        assert_eq!(
+            extra(&mut f, a),
+            [format!("lock:\t1: POSIX  ADVISORY  READ 1 {at} 5 9")]
+        );
+        assert_eq!(f.ret(73, &[b, 2]), 0);
+        assert_eq!(extra(&mut f, b), [flock("WRITE")]);
+        // A duplicate shares the description, and its lock.
+        let c = f.ret(32, &[b]);
+        assert_eq!(extra(&mut f, c), [flock("WRITE")]);
+        assert_eq!(f.ret(73, &[c, 8]), 0);
+        assert!(extra(&mut f, b).is_empty());
+        // An invalid operation changes nothing.
+        assert_eq!(f.ret(73, &[b, 2]), 0);
+        assert_eq!(f.ret(73, &[b, 3]), errno(Errno::EINVAL));
+        assert_eq!(extra(&mut f, b), [flock("WRITE")]);
+        // Closed, the description's lock goes with it.
+        assert_eq!(f.ret(3, &[b]), 0);
+        assert_eq!(f.ret(3, &[c]), 0);
+        assert_eq!(f.ret(73, &[a, 2 | 4]), 0);
+        assert_eq!(extra(&mut f, a)[0], flock("WRITE"));
+    }
+    #[test]
     fn fdinfo_lists_the_watches_the_newest_first() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK | 0o2000000]);

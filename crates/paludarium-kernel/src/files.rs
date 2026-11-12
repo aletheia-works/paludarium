@@ -1,5 +1,6 @@
 //! Linux x86-64 file ABI and descriptor table. All guest memory is checked.
 use crate::syscalls::{Context, Outcome};
+pub(crate) mod attributes;
 mod splice;
 mod tasks;
 mod xattrs;
@@ -14,7 +15,7 @@ pub const NUMBERS: &[u64] = &[
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
     188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
     261, 262, 263, 264, 265, 266, 267, 268, 269, 275, 276, 277, 278, 280, 285, 292, 293, 295, 296,
-    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 452, 463, 464, 465, 466,
+    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 452, 463, 464, 465, 466, 468, 469,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -824,8 +825,11 @@ const UTIME_OMIT: u64 = (1 << 30) - 2;
 /// `utimensat(dirfd, path, times, flags)`, in the order Linux checks it.
 fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let now = || c.host.clock(ClockId::Realtime).map(i128::from);
-    // Setting both times to now (`ATTR_TOUCH`) needs less than setting them.
+    // Setting both times to now (`ATTR_TOUCH`) needs less than setting them,
+    // and leaving out or setting one to now less than giving one
+    // (`ATTR_TIMES_SET`).
     let mut touch = true;
+    let mut set = false;
     let (atime, mtime) = if a[2] == 0 {
         let now = now()?;
         (Some(now), Some(now))
@@ -840,6 +844,7 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         for (slot, i) in times.iter_mut().zip([0, 2]) {
             let (seconds, nanos) = (field(i) as i64, field(i + 1));
             touch &= nanos == UTIME_NOW;
+            set |= nanos != UTIME_NOW && nanos != UTIME_OMIT;
             *slot = match nanos {
                 UTIME_OMIT => None,
                 UTIME_NOW => Some(now()?),
@@ -853,7 +858,7 @@ fn utimensat(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         }
         (times[0], times[1])
     };
-    set_times_at(c, a, atime, mtime, touch)
+    set_times_at(c, a, atime, mtime, (touch, set))
 }
 /// Linux's `do_utimes`: the times of the file `a[1]` names from `a[0]`
 /// with the flags `a[3]`, or of descriptor `a[0]` for no path.
@@ -862,7 +867,7 @@ fn set_times_at(
     a: [u64; 6],
     atime: Option<i128>,
     mtime: Option<i128>,
-    touch: bool,
+    (touch, set): (bool, bool),
 ) -> Result<u64, Errno> {
     if a[3] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);
@@ -884,7 +889,7 @@ fn set_times_at(
         } else {
             c.files.descriptor(a[0])?.file
         };
-        crate::permissions::times(&c.process.credentials, &file.stat()?, touch)?;
+        crate::permissions::times(&c.process.credentials, &file.stat()?, touch, set)?;
         return file.set_times(atime, mtime).map(|()| 0);
     }
     let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
@@ -892,7 +897,7 @@ fn set_times_at(
     match reached(c, &p, follow)? {
         Some(Followed::Path { path, follow }) => {
             let stat = c.files.fs.metadata(&path, follow)?;
-            crate::permissions::times(&c.process.credentials, &stat, touch)?;
+            crate::permissions::times(&c.process.credentials, &stat, touch, set)?;
             return c
                 .files
                 .fs
@@ -900,13 +905,13 @@ fn set_times_at(
                 .map(|()| 0);
         }
         Some(Followed::File(d)) => {
-            crate::permissions::times(&c.process.credentials, &d.file.stat()?, touch)?;
+            crate::permissions::times(&c.process.credentials, &d.file.stat()?, touch, set)?;
             return d.file.set_times(atime, mtime).map(|()| 0);
         }
         None => {}
     }
     if let Some(stat) = found.file {
-        crate::permissions::times(&c.process.credentials, &stat, touch)?;
+        crate::permissions::times(&c.process.credentials, &stat, touch, set)?;
     }
     c.files.fs.set_times(&p, follow, atime, mtime).map(|()| 0)
 }
@@ -938,7 +943,7 @@ fn futimesat(c: &mut Context<'_>, dirfd: u64, path: u64, times: u64) -> Result<u
         [dirfd, path, 0, 0, 0, 0],
         Some(atime),
         Some(mtime),
-        touch,
+        (touch, !touch),
     )
 }
 /// `utime(path, times)`: a `struct utimbuf` of whole seconds (`EFAULT`), or
@@ -957,7 +962,7 @@ fn utime(c: &mut Context<'_>, path: u64, times: u64) -> Result<u64, Errno> {
         [AT_FDCWD, path, 0, 0, 0, 0],
         Some(atime),
         Some(mtime),
-        touch,
+        (touch, !touch),
     )
 }
 /// The owner and group of a `chown` call, as kernel IDs: -1 leaves one as
@@ -1207,6 +1212,12 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
             (landlock_named(c, &old), landlock_named(c, &new))
     {
         crate::landlock::refer(c, &old_path, &new_path, false, 0)?;
+    }
+    // `vfs_link`: no link to an append-only or immutable file (EPERM).
+    if let Some(source) = &source
+        && device(c, &old) == device(c, &new)
+    {
+        attributes::unchangeable(source)?;
     }
     c.files.fs.link(&old, &new)?;
     Ok(0)
@@ -1615,6 +1626,11 @@ fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(Errno::EBADF);
     }
     let stat = d.file.stat()?;
+    // `vfs_fallocate`: an append-only file only preallocates, and an
+    // immutable one not even that (EPERM), before the file's type.
+    if (mode & !KEEP_SIZE != 0 && attributes::append_only(&stat)) || attributes::immutable(&stat) {
+        return Err(Errno::EPERM);
+    }
     match stat.mode & 0o170000 {
         0o010000 => return Err(Errno::ESPIPE),
         DIRECTORY => return Err(Errno::EISDIR),
@@ -1718,6 +1734,10 @@ fn copy_file_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let same_mount = descriptor_device(c, &input) == descriptor_device(c, &output);
     if !same_mount {
         return Err(Errno(18));
+    }
+    // An immutable file is not written (`generic_copy_file_checks`).
+    if attributes::immutable(&target) {
+        return Err(Errno::EPERM);
     }
     // Offsets that wrap with the requested length, compared as unsigned (a
     // negative one wraps with a long enough request).
@@ -1999,6 +2019,10 @@ fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, 
         return Err(Errno::EOPNOTSUPP);
     }
     if write && flags & RWF_NOAPPEND != 0 && file.flags() & O_APPEND != 0 {
+        // An append-only file always appends (EPERM).
+        if file.stat().is_ok_and(|stat| attributes::append_only(&stat)) {
+            return Err(Errno::EPERM);
+        }
         return Err(Errno::EOPNOTSUPP);
     }
     // ext4_buffered_write_iter.
@@ -2243,6 +2267,9 @@ const STATX_MNT_ID: u32 = 0x1000;
 /// `stx_mnt_id` holds the mount's 64-bit ID that is never reused (Linux 6.8),
 /// numbered from 2^31 (Linux's `MNT_UNIQUE_ID_OFFSET`).
 const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+/// The attributes tmpfs's `shmem_getattr` reports: `STATX_ATTR_IMMUTABLE`,
+/// `STATX_ATTR_APPEND` and `STATX_ATTR_NODUMP`.
+const STATX_ATTR_FLAGS: u32 = 0x10 | 0x20 | 0x40;
 /// `statx(dirfd, path, flags, mask, buffer)`, with the checks of Linux's
 /// do_statx and vfs_statx. As since Linux 6.11, a null path with
 /// AT_EMPTY_PATH names the descriptor like an empty one.
@@ -2259,7 +2286,10 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0 {
         return Err(Errno::EINVAL);
     }
-    let (s, device, block_size) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    // Whether the file keeps inode flags, as a tmpfs one does, whose
+    // `shmem_getattr` gives them as attributes.
+    let noop = &mut |_: &mut u32| {};
+    let (s, device, block_size, kept) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dir as i32 == -100 {
             let cwd = c
                 .files
@@ -2271,6 +2301,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 c.files.fs.metadata(&cwd, true)?,
                 device(c, &cwd),
                 path_block_size(&cwd),
+                c.files.fs.with_attributes(&cwd, true, noop).is_ok(),
             )
         } else {
             let d = c.files.descriptor(dir)?;
@@ -2278,21 +2309,30 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 d.file.stat()?,
                 descriptor_device(c, &d),
                 descriptor_block_size(c, &d),
+                d.file.with_attributes(noop).is_ok(),
             )
         }
     } else {
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         let (p, _) = lookup(c, dir, raw, follow)?;
         match generated_stat(c, &p, follow)? {
-            Some(generated) => generated,
+            Some((stat, device, block_size)) => (stat, device, block_size, false),
             None => (
                 c.files.fs.metadata(&p, follow)?,
                 device(c, &p),
                 path_block_size(&p),
+                c.files.fs.with_attributes(&p, follow, noop).is_ok(),
             ),
         }
     };
+    let attributes = u64::from(s.attributes & STATX_ATTR_FLAGS);
     let mut b = encode_statx(shown(c, s), device, block_size)?;
+    // STATX_ATTR_IMMUTABLE, STATX_ATTR_APPEND and STATX_ATTR_NODUMP, which
+    // have the inode flags' values.
+    if kept {
+        b[8..16].copy_from_slice(&attributes.to_le_bytes());
+        b[56..64].copy_from_slice(&u64::from(STATX_ATTR_FLAGS).to_le_bytes());
+    }
     // As Linux's vfs_statx, the mount's ID whether or not it was asked for:
     // the unique one if that was, the one mountinfo shows otherwise. A
     // mount's minor number is its position in mountinfo, whose IDs start at
@@ -2930,6 +2970,17 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         76 | 77 => {
             let f = if n == 77 {
                 let file = io_descriptor(c, a[0])?;
+                // `do_ftruncate`: an append-only file is not truncated
+                // (EPERM), after the length and the description's
+                // EINVAL, before Landlock's right.
+                if a[1] <= i64::MAX as u64
+                    && file.flags() & 3 != 0
+                    && let Ok(stat) = file.stat()
+                    && stat.mode & 0o170000 == 0o100000
+                    && attributes::append_only(&stat)
+                {
+                    return Err(Errno::EPERM);
+                }
                 // Landlock's right kept from the open (`hook_file_truncate`),
                 // for a description open for writing.
                 if file.flags() & 3 != 0
@@ -3325,6 +3376,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         452 => fchmodat2(c, a),
         // Extended attributes.
         188..=199 | 463..=466 => xattrs::call(c, n, a),
+        468 | 469 => attributes::call(c, n, a),
         // chown, fchown, lchown, fchownat
         92 | 94 => {
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], n == 92)?;
@@ -3931,6 +3983,7 @@ impl FileHandle for StandardFile {
             mtime_ns: 0,
             rdev: 0,
             blocks: None,
+            attributes: 0,
         })
     }
     fn truncate(&self, _n: u64) -> Result<(), Errno> {
@@ -4770,6 +4823,10 @@ fn reopen(
         .as_any()
         .is_some_and(|v| v.is::<crate::processes::PidFd>());
     let stat = d.file.stat()?;
+    // `may_open` of the inode the link leads to.
+    if !matches!(stat.mode & 0o170000, 0o040000 | 0o120000) {
+        attributes::may_open(&stat, flags)?;
+    }
     match stat.mode & 0o170000 {
         // A pipe or a standard stream: a description of its own, which
         // checks the access it is opened with.

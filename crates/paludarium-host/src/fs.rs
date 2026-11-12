@@ -19,6 +19,9 @@ pub struct FileStat {
     /// The 512-byte blocks the file takes (`st_blocks`), when the file
     /// system counts them; otherwise its size rounded up to them.
     pub blocks: Option<u64>,
+    /// The inode flags `FS_IOC_GETFLAGS` gives (`FS_IMMUTABLE_FL`,
+    /// `FS_APPEND_FL`, ...), of a file system that keeps them; else 0.
+    pub attributes: u32,
 }
 /// What `statfs` reports about the filesystem holding a path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,6 +76,12 @@ pub trait FileHandle: Send + Sync {
     fn set_flags(&self, flags: u32) -> Result<(), Errno>;
     /// Runs `f` on the file's extended attributes; `EOPNOTSUPP` if it has none.
     fn with_xattrs(&self, _f: &mut dyn FnMut(&mut Xattrs)) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    /// Runs `f` on the file's inode flags (`FileStat::attributes`), as a
+    /// file system's `fileattr_get` and `fileattr_set` reach them;
+    /// `EOPNOTSUPP` if it keeps none.
+    fn with_attributes(&self, _f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
         Err(Errno::EOPNOTSUPP)
     }
     /// `fchmod`: replaces the permission bits with the low 12 bits of `mode`.
@@ -175,6 +184,16 @@ pub trait HostFs: Send + Sync {
         _path: &[u8],
         _follow: bool,
         _f: &mut dyn FnMut(&mut Xattrs),
+    ) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    /// As [`FileHandle::with_attributes`], for `path`; with `follow` false a
+    /// final symbolic link itself is meant.
+    fn with_attributes(
+        &self,
+        _path: &[u8],
+        _follow: bool,
+        _f: &mut dyn FnMut(&mut u32),
     ) -> Result<(), Errno> {
         Err(Errno::EOPNOTSUPP)
     }

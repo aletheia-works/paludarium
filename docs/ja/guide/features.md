@@ -54,9 +54,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
@@ -132,6 +132,41 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `struct xattr_args` で渡し、`copy_struct_from_user` と同じように確かめます。16 バイト
   未満は `EINVAL`、1 ページを超えるか 16 バイトより後ろに 0 でないバイトがあれば
   `E2BIG` で、`getxattrat` はフラグを受け付けません（`EINVAL`）。
+- メモリ上の通常のファイルとディレクトリは、tmpfs と同じ inode フラグを保持します。
+  `FS_IMMUTABLE_FL`、`FS_APPEND_FL`、`FS_NODUMP_FL`、`FS_NOATIME_FL` の 4 つです。
+  `file_getattr` と `file_setattr`（Linux 6.17）、`FS_IOC_GETFLAGS`・
+  `FS_IOC_SETFLAGS`・`FS_IOC_FSGETXATTR`・`FS_IOC_FSSETXATTR` の ioctl は、Linux の
+  `vfs_fileattr_set` と tmpfs の `shmem_fileattr_set` と同じようにこれを読み書きします。
+  - 変えられるのは所有者か `CAP_FOWNER` を持つスレッドだけで（`EPERM`）、最初の 2 つには
+    `CAP_LINUX_IMMUTABLE` も必要です（`EPERM`）。
+  - プロジェクト ID の -1 と、種類の合わないファイルへのエクステントサイズのフラグは
+    `EINVAL` です。tmpfs は保持しないので、それ以外のフラグ、プロジェクト ID、
+    エクステントサイズは `EOPNOTSUPP` です。
+  - `file_getattr` と `file_setattr` は `setxattrat` と同じようにファイルを探し、24 バイト
+    以上の `struct file_attr` を `copy_struct_from_user` と同じように確かめます。Linux の
+    知らないフラグは、ここでは `EINVAL`、`FS_IOC_FSSETXATTR` では `EOPNOTSUPP` です。
+  - 新しいファイルやディレクトリは、親ディレクトリの `FS_NODUMP_FL` と
+    `FS_NOATIME_FL` を受け継ぎます。`statx` は `STATX_ATTR_IMMUTABLE`、
+    `STATX_ATTR_APPEND`、`STATX_ATTR_NODUMP` を返します。
+  - マウントしたホストのディレクトリのファイル、`/proc` の下、シンボリックリンク、
+    特殊ファイルは保持しません。システムコールは `EOPNOTSUPP`、ioctl は `ENOTTY` です。
+  - 設定すると `IN_ATTRIB` が生じます。
+- フラグは、Linux が `IS_IMMUTABLE` と `IS_APPEND` を確かめるところで、root にも
+  適用します。
+  - 変更不可のファイルへの書き込みは、ほかのどの権限確認よりも先に `EPERM` です
+    （`inode_permission`）。書き込みや切り詰めのための open、`truncate`、`W_OK` の
+    `access`、変更不可のディレクトリでの名前の作成と削除がこれにあたります。
+  - 変更不可か追記のみのファイルは、削除も、名前の変更の元や上書き先になることも、
+    ハードリンクもできず、モード、所有者、拡張属性、指定した時刻も変わりません
+    （`EPERM`）。変更不可のファイルは、現在時刻にすることもできません。
+  - 追記のみのディレクトリからは何も削除できません。
+  - 追記のみのファイルは、書き込むなら `O_APPEND` 付きでしか開けず、`O_TRUNC` では
+    開けません。`O_APPEND` は外せません（`F_SETFL`、`RWF_NOAPPEND`：`EPERM`）。
+    `ftruncate` はできず、`fallocate` は事前割り当てだけです（`EPERM`）。書き込み用に
+    開いたものは共有でマップできません（`EACCES`）。
+  - `copy_file_range` は変更不可のファイルに書き込みません（`EPERM`）。
+  - tmpfs と同じく、フラグを設定する前に開いたものからは書き込めます。
+    アクセス時刻は保持しないので、`FS_NOATIME_FL` と `FS_NODUMP_FL` はほかに何も変えません。
 - `statx` は、`stat` にある項目（`STATX_BASIC_STATS`）と、デバイス番号としてマウントの
   `st_dev` を返します。flags と mask は Linux と同じように確かめます（`EINVAL`）。
   mask が何を求めても、Linux と同じくマウントの ID も返します。`/proc/self/mountinfo`

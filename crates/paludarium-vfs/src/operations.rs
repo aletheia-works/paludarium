@@ -114,6 +114,16 @@ impl HostFs for MemFs {
         f(&mut lock(&node).xattrs);
         Ok(())
     }
+    fn with_attributes(
+        &self,
+        path: &[u8],
+        follow: bool,
+        f: &mut dyn FnMut(&mut u32),
+    ) -> Result<(), Errno> {
+        let t = lock(&self.tree);
+        let node = t.node(t.resolve(path, follow)?)?;
+        lock(&node).with_attributes(f)
+    }
     fn set_mode(&self, path: &[u8], mode: u32) -> Result<(), Errno> {
         let t = lock(&self.tree);
         let node = t.node(t.resolve(path, true)?)?;

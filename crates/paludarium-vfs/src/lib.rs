@@ -151,6 +151,9 @@ struct Node {
     /// The owner and group, root's until `chown`.
     owner: (u32, u32),
     xattrs: paludarium_host::Xattrs,
+    /// tmpfs's inode flags (`FS_IOC_GETFLAGS`): `FS_IMMUTABLE_FL`,
+    /// `FS_APPEND_FL`, `FS_NODUMP_FL` and `FS_NOATIME_FL`.
+    attributes: u32,
     links: u64,
     locks: BTreeMap<u64, u32>,
     mtime_ns: i128,
@@ -175,6 +178,18 @@ impl Node {
             links: self.links,
             mtime_ns: self.mtime_ns,
             rdev: 0,
+            attributes: self.attributes,
+        }
+    }
+    /// Runs `f` on the flags of a regular file or a directory, the inodes
+    /// whose operations have tmpfs's `fileattr_get` and `fileattr_set`.
+    fn with_attributes(&mut self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
+        match self.kind {
+            Kind::File(_) | Kind::Dir(_) => {
+                f(&mut self.attributes);
+                Ok(())
+            }
+            Kind::Symlink(_) | Kind::Special => Err(Errno::EOPNOTSUPP),
         }
     }
 }
@@ -240,6 +255,7 @@ impl Tree {
                 mode,
                 owner: (0, 0),
                 xattrs: Default::default(),
+                attributes: 0,
                 links,
                 locks: BTreeMap::new(),
                 mtime_ns,
@@ -330,6 +346,8 @@ impl Tree {
         // inode_init_owner: in a set-group-ID directory a new file takes the
         // directory's group, and a new directory the bit as well.
         let group = (n.mode & 0o2000 != 0).then_some(n.owner.1);
+        // tmpfs's `SHMEM_FL_INHERITED`: FS_NODUMP_FL and FS_NOATIME_FL.
+        let inherited = n.attributes & (0x40 | 0x80);
         let Kind::Dir(children) = &mut n.kind else {
             return Err(Errno::ENOTDIR);
         };
@@ -338,6 +356,9 @@ impl Tree {
         }
         let directory = matches!(kind, Kind::Dir(_));
         let id = self.allocate(kind, mode)?;
+        if inherited != 0 {
+            lock(&*self.node(id)?).attributes = inherited;
+        }
         if let Some(group) = group {
             let node = self.node(id)?;
             let mut child = lock(&node);
@@ -370,6 +391,7 @@ impl MemFs {
             mode: 0o040755,
             owner: (0, 0),
             xattrs: Default::default(),
+            attributes: 0,
             links: 2,
             locks: BTreeMap::new(),
             mtime_ns: 0,

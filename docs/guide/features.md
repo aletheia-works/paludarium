@@ -62,9 +62,9 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
@@ -149,6 +149,46 @@ kernel.
   flags come in a `struct xattr_args`, checked as `copy_struct_from_user`
   checks one: below 16 bytes is `EINVAL`, above a page or with a nonzero
   byte past the 16 is `E2BIG`, and `getxattrat` takes no flags (`EINVAL`).
+- A regular file or directory in memory keeps tmpfs's inode flags:
+  `FS_IMMUTABLE_FL`, `FS_APPEND_FL`, `FS_NODUMP_FL` and `FS_NOATIME_FL`.
+  `file_getattr` and `file_setattr` (Linux 6.17) and the `FS_IOC_GETFLAGS`,
+  `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR` and `FS_IOC_FSSETXATTR` ioctls read
+  and change them, as Linux's `vfs_fileattr_set` and tmpfs's
+  `shmem_fileattr_set` do:
+  - Only the owner or `CAP_FOWNER` changes them (`EPERM`), and the first two
+    need `CAP_LINUX_IMMUTABLE` (`EPERM`).
+  - A project ID of -1, and an extent size flag on the wrong type of file,
+    are `EINVAL`. Any other flag, project ID or extent size is `EOPNOTSUPP`,
+    as tmpfs keeps none.
+  - `file_getattr` and `file_setattr` find the file as `setxattrat` does and
+    take a `struct file_attr` of 24 bytes or more, checked as
+    `copy_struct_from_user` checks one. A flag Linux does not know is
+    `EINVAL` there and `EOPNOTSUPP` in `FS_IOC_FSSETXATTR`.
+  - A new file or directory takes `FS_NODUMP_FL` and `FS_NOATIME_FL` from its
+    directory, and `statx` reports `STATX_ATTR_IMMUTABLE`,
+    `STATX_ATTR_APPEND` and `STATX_ATTR_NODUMP`.
+  - A file in a mounted host directory, under `/proc`, a symbolic link or a
+    special file keeps none: `EOPNOTSUPP` from the calls and `ENOTTY` from
+    the ioctls.
+  - Setting one generates `IN_ATTRIB`.
+- The flags are enforced where Linux checks `IS_IMMUTABLE` and `IS_APPEND`,
+  root included:
+  - Writing an immutable file is `EPERM` before any other permission check
+    (`inode_permission`): opening it to write or truncate, `truncate`,
+    `access` with `W_OK`, and creating or removing a name in an immutable
+    directory.
+  - An immutable or append-only file is not removed, renamed over or away,
+    or linked to, and its mode, owner, extended attributes and given times
+    do not change (`EPERM`). An immutable one is not touched to now either.
+  - Nothing is removed from an append-only directory.
+  - An append-only file opens to write only with `O_APPEND` and never with
+    `O_TRUNC`, and keeps `O_APPEND` (`F_SETFL`, `RWF_NOAPPEND`: `EPERM`). It
+    is not `ftruncate`d, and only preallocated by `fallocate` (`EPERM`).
+    Opened to write, it is not mapped shared (`EACCES`).
+  - `copy_file_range` does not write an immutable file (`EPERM`).
+  - A description opened before the flag was set still writes, as on tmpfs.
+    `FS_NOATIME_FL` and `FS_NODUMP_FL` change nothing else, as no access
+    time is kept.
 - `statx` reports the fields a `stat` has (`STATX_BASIC_STATS`) and the
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
   (`EINVAL`). Whatever the mask asks for, it also gives the mount's ID, as

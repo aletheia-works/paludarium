@@ -4,7 +4,7 @@
 //! capability and filesystem IDs of 0, passes every check but executing a
 //! file that no one may execute, so its calls skip them.
 use crate::credentials::Credentials;
-use crate::files::Files;
+use crate::files::{Files, attributes};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 
@@ -46,16 +46,21 @@ pub(crate) fn unchecked(creds: &Credentials) -> bool {
 }
 
 /// `inode_owner_or_capable`.
-fn owner_or_capable(creds: &Credentials, stat: &FileStat) -> bool {
+pub(crate) fn owner_or_capable(creds: &Credentials, stat: &FileStat) -> bool {
     creds.fsuid == stat.uid || capable(creds, stat, CAP_FOWNER)
 }
 
+/// `inode_permission`'s check of an immutable file, then
 /// `generic_permission`: the owner's bits for the owner, the group's for a
 /// member when they differ from the others', else the others'; then
 /// `CAP_DAC_READ_SEARCH` to read or search and `CAP_DAC_OVERRIDE` for the
 /// rest, but executing a file no one may execute (EACCES).
 pub(crate) fn permission(creds: &Credentials, stat: &FileStat, mask: u32) -> Result<(), Errno> {
     let mask = mask & 7;
+    // `inode_permission`: nobody may write an immutable file (EPERM).
+    if mask & MAY_WRITE != 0 && attributes::immutable(stat) {
+        return Err(Errno::EPERM);
+    }
     let mut mode = stat.mode;
     if creds.fsuid == stat.uid {
         mode >>= 6;
@@ -90,9 +95,13 @@ fn may_create(creds: &Credentials, parent: &FileStat) -> Result<(), Errno> {
 
 /// `may_delete`: writing and searching the directory, and in a sticky one
 /// (`check_sticky`) owning the file or the directory, or `CAP_FOWNER`
-/// (EPERM).
+/// (EPERM). Nothing goes from an append-only directory, nor goes an
+/// append-only or immutable file (EPERM).
 fn may_delete(creds: &Credentials, parent: &FileStat, file: &FileStat) -> Result<(), Errno> {
     permission(creds, parent, MAY_WRITE | MAY_EXEC)?;
+    if attributes::append_only(parent) {
+        return Err(Errno::EPERM);
+    }
     if parent.mode & 0o1000 != 0
         && creds.fsuid != file.uid
         && creds.fsuid != parent.uid
@@ -100,7 +109,7 @@ fn may_delete(creds: &Credentials, parent: &FileStat, file: &FileStat) -> Result
     {
         return Err(Errno::EPERM);
     }
-    Ok(())
+    attributes::unchangeable(file)
 }
 
 /// What a path walk found: the directory that holds the last component and
@@ -216,7 +225,8 @@ pub(crate) fn walk(
     })
 }
 
-/// [`walk`] with the thread's credentials, which root skips.
+/// [`walk`] with the thread's credentials, which root skips while no file
+/// may be immutable or append-only, which root is refused too.
 pub(crate) fn search(
     files: &Files,
     creds: &Credentials,
@@ -224,7 +234,7 @@ pub(crate) fn search(
     raw: &[u8],
     follow: bool,
 ) -> Result<Found, Errno> {
-    if unchecked(creds) {
+    if unchecked(creds) && !attributes::any_flagged() {
         return Ok(Found::default());
     }
     walk(files, creds, dir, raw, follow)
@@ -271,7 +281,10 @@ pub(crate) fn open(
                 // opened to write EISDIR, which open finds.
                 SYMLINK => Ok(None),
                 DIRECTORY if mask & MAY_WRITE != 0 => Ok(None),
-                _ => permission(creds, &file, mask).map(|()| None),
+                _ => {
+                    permission(creds, &file, mask)?;
+                    attributes::may_open(&file, flags).map(|()| None)
+                }
             }
         }
         _ => Ok(None),
@@ -383,10 +396,11 @@ pub(crate) fn may_mknod(creds: &Credentials) -> bool {
     creds.capable(1 << 27)
 }
 
-/// `chmod`'s check (`setattr_prepare`): the owner or `CAP_FOWNER`, else
-/// EPERM. Returns the mode to set, without the set-group-ID bit when the
+/// `chmod`'s checks (`may_setattr`, `setattr_prepare`): not an immutable
+/// or append-only file, then the owner or `CAP_FOWNER`, else EPERM. Returns the mode to set, without the set-group-ID bit when the
 /// thread is not in the file's group and lacks `CAP_FSETID`.
 pub(crate) fn chmod(creds: &Credentials, stat: &FileStat, mode: u32) -> Result<u32, Errno> {
+    attributes::unchangeable(stat)?;
     if unchecked(creds) {
         return Ok(mode);
     }
@@ -399,7 +413,8 @@ pub(crate) fn chmod(creds: &Credentials, stat: &FileStat, mode: u32) -> Result<u
     Ok(mode)
 }
 
-/// `chown`'s checks (`chown_ok`, `chgrp_ok`): a new owner only with
+/// `chown`'s checks (`may_setattr`, `chown_ok`, `chgrp_ok`): an owner or
+/// group to set on an immutable or append-only file is EPERM; a new owner only with
 /// `CAP_CHOWN` (the owner may name itself), a new group by the owner when
 /// it is a member, or with `CAP_CHOWN`; else EPERM. Returns whether a file
 /// keeps a set-group-ID bit without group execution
@@ -410,6 +425,9 @@ pub(crate) fn chown(
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> Result<bool, Errno> {
+    if uid.is_some() || gid.is_some() {
+        attributes::unchangeable(stat)?;
+    }
     let owner = creds.fsuid == stat.uid;
     let chown = capable(creds, stat, CAP_CHOWN);
     if uid.is_some_and(|uid| !(owner && uid == stat.uid) && !chown) {
@@ -455,10 +473,23 @@ pub(crate) fn connect(files: &Files, creds: &Credentials, raw: &[u8]) -> Result<
     }
 }
 
-/// `utimensat`'s check (`may_setattr`, `setattr_prepare`): the owner or
-/// `CAP_FOWNER` sets any time; anyone else may only `touch` it to now,
-/// with permission to write it (EACCES), and else gets EPERM.
-pub(crate) fn times(creds: &Credentials, stat: &FileStat, touch: bool) -> Result<(), Errno> {
+/// `utimensat`'s check (`may_setattr`, `setattr_prepare`): an immutable
+/// file is not touched, nor is a time `set` (not now nor left out) on an
+/// immutable or append-only one (EPERM); then the owner or `CAP_FOWNER`
+/// sets any time; anyone else may only `touch` it to now, with permission
+/// to write it (EACCES), and else gets EPERM.
+pub(crate) fn times(
+    creds: &Credentials,
+    stat: &FileStat,
+    touch: bool,
+    set: bool,
+) -> Result<(), Errno> {
+    if touch && attributes::immutable(stat) {
+        return Err(Errno::EPERM);
+    }
+    if set {
+        attributes::unchangeable(stat)?;
+    }
     if unchecked(creds) || owner_or_capable(creds, stat) {
         return Ok(());
     }
@@ -470,11 +501,17 @@ pub(crate) fn times(creds: &Credentials, stat: &FileStat, touch: bool) -> Result
 
 /// `truncate`'s checks (`vfs_truncate`), on a file found: a directory is
 /// EISDIR, any other file but a regular one EINVAL, and it needs
-/// permission to write.
+/// permission to write, and not to be append-only (EPERM).
 pub(crate) fn truncate(creds: &Credentials, stat: &FileStat) -> Result<(), Errno> {
     match stat.mode & TYPE {
         DIRECTORY => Err(Errno::EISDIR),
-        REGULAR => permission(creds, stat, MAY_WRITE),
+        REGULAR => {
+            permission(creds, stat, MAY_WRITE)?;
+            if attributes::append_only(stat) {
+                return Err(Errno::EPERM);
+            }
+            Ok(())
+        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -640,14 +677,14 @@ mod permissions_tests {
             chown(&Credentials::default(), &mine, Some(5), Some(5)),
             Ok(true)
         );
-        assert_eq!(times(&user, &mine, false), Ok(()));
-        assert_eq!(times(&user, &file(0o100666, 0, 0), true), Ok(()));
+        assert_eq!(times(&user, &mine, false, true), Ok(()));
+        assert_eq!(times(&user, &file(0o100666, 0, 0), true, false), Ok(()));
         assert_eq!(
-            times(&user, &file(0o100666, 0, 0), false),
+            times(&user, &file(0o100666, 0, 0), false, true),
             Err(Errno::EPERM)
         );
         assert_eq!(
-            times(&user, &file(0o100644, 0, 0), true),
+            times(&user, &file(0o100644, 0, 0), true, false),
             Err(Errno::EACCES)
         );
         assert_eq!(truncate(&user, &file(0o040777, 0, 0)), Err(Errno::EISDIR));

@@ -313,6 +313,8 @@ NAMES = {
     464: "getxattrat",
     465: "listxattrat",
     466: "removexattrat",
+    468: "file_getattr",
+    469: "file_setattr",
 }
 
 

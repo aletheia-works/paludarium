@@ -1772,6 +1772,147 @@ fn xattrat_calls_take_a_directory_flags_and_struct_xattr_args() {
 }
 
 #[test]
+fn inode_flags_read_back_and_refuse_what_linux_refuses() {
+    let mut f = fixture();
+    let (file, dir, inner, other, attr, out) = (
+        DATA + 0x100,
+        DATA + 0x140,
+        DATA + 0x180,
+        DATA + 0x1c0,
+        DATA + 0x400,
+        DATA + 0x800,
+    );
+    let (eperm, einval, eopnotsupp) = (
+        errno(Errno::EPERM),
+        errno(Errno::EINVAL),
+        errno(Errno::EOPNOTSUPP),
+    );
+    f.mem.write(GuestAddr(file), b"/flags-file\0").unwrap();
+    f.mem.write(GuestAddr(dir), b"/flags-dir\0").unwrap();
+    f.mem
+        .write(GuestAddr(inner), b"/flags-dir/inner\0")
+        .unwrap();
+    f.mem.write(GuestAddr(other), b"/flags-other\0").unwrap();
+    // struct file_attr: xflags, extsize, nextents, projid, cowextsize.
+    let set_attr = |f: &mut Fixture, xflags: u64, extsize: u32, projid: u32| {
+        let mut b = [0u8; 24];
+        b[..8].copy_from_slice(&xflags.to_le_bytes());
+        b[8..12].copy_from_slice(&extsize.to_le_bytes());
+        b[16..20].copy_from_slice(&projid.to_le_bytes());
+        f.mem.write(GuestAddr(attr), &b).unwrap();
+    };
+    let at = (-100i64) as u64;
+    let fd = f.ret(2, &[file, 0o102, 0o644]);
+    assert!(fd < 1024, "{fd}");
+    let getflags = |f: &mut Fixture, fd: u64| {
+        assert_eq!(f.ret(16, &[fd, 0x8008_6601, out]), 0);
+        f.mem.read_u64(GuestAddr(out)).unwrap() as u32
+    };
+    assert_eq!(getflags(&mut f, fd), 0);
+    assert_eq!(f.ret(468, &[at, file, attr, 24, 0]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(attr)).unwrap(), 0);
+
+    // FS_XFLAG_NODUMP is FS_NODUMP_FL, and statx shows it.
+    set_attr(&mut f, 0x80, 0, 0);
+    assert_eq!(f.ret(469, &[at, file, attr, 24, 0]), 0);
+    assert_eq!(getflags(&mut f, fd), 0x40);
+    assert_eq!(f.ret(332, &[at, file, 0, 0x7ff, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 8)).unwrap(), 0x40);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 56)).unwrap(), 0x70);
+    // What tmpfs does not keep, and what Linux does not know.
+    set_attr(&mut f, 0x20, 0, 0);
+    assert_eq!(f.ret(469, &[at, file, attr, 24, 0]), eopnotsupp);
+    set_attr(&mut f, 1 << 40, 0, 0);
+    assert_eq!(f.ret(469, &[at, file, attr, 24, 0]), einval);
+    set_attr(&mut f, 0x800, 4096, 0);
+    assert_eq!(f.ret(469, &[at, file, attr, 24, 0]), eopnotsupp);
+    set_attr(&mut f, 0, 0, u32::MAX);
+    assert_eq!(f.ret(469, &[at, file, attr, 24, 0]), einval);
+    set_attr(&mut f, 0, 0, 5);
+    assert_eq!(f.ret(469, &[at, file, attr, 24, 0]), eopnotsupp);
+    // FS_IOC_FSSETXATTR refuses an unknown flag with EOPNOTSUPP.
+    f.mem.write(GuestAddr(out), &[0; 28]).unwrap();
+    f.mem
+        .write(GuestAddr(out), &(1u32 << 22).to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(16, &[fd, 0x401c_5820, out]), eopnotsupp);
+    // A symbolic link keeps none.
+    f.mem
+        .write(GuestAddr(DATA + 0x300), b"/flags-link\0")
+        .unwrap();
+    assert_eq!(f.ret(88, &[file, DATA + 0x300]), 0);
+    assert_eq!(f.ret(468, &[at, DATA + 0x300, attr, 24, 0x100]), eopnotsupp);
+
+    // Immutable: nothing writes it, renames, links or removes it.
+    f.mem.write(GuestAddr(out), &0x50u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(16, &[fd, 0x4008_6602, out]), 0);
+    assert_eq!(getflags(&mut f, fd), 0x50);
+    assert_eq!(f.ret(2, &[file, 1, 0]), eperm);
+    assert!(f.ret(2, &[file, 0, 0]) < 1024);
+    assert_eq!(f.ret(76, &[file, 0]), eperm);
+    assert_eq!(f.ret(90, &[file, 0o600]), eperm);
+    assert_eq!(f.ret(87, &[file]), eperm);
+    assert_eq!(f.ret(86, &[file, other]), eperm);
+    assert_eq!(f.ret(82, &[file, other]), eperm);
+    assert_eq!(f.ret(280, &[at, file, 0, 0]), eperm);
+    assert_eq!(f.ret(21, &[file, 2]), eperm);
+    f.mem.write(GuestAddr(DATA + 0x340), b"user.a\0").unwrap();
+    assert_eq!(f.ret(188, &[file, DATA + 0x340, out, 1, 0]), eperm);
+    assert_eq!(f.ret(285, &[fd, 0, 0, 1]), eperm);
+    // A description open before writes on.
+    assert_eq!(f.ret(1, &[fd, out, 1]), 1);
+
+    // Append-only: opened to write only with O_APPEND, never truncated.
+    f.mem.write(GuestAddr(out), &0x20u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(16, &[fd, 0x4008_6602, out]), 0);
+    assert_eq!(f.ret(2, &[file, 1, 0]), eperm);
+    let appending = f.ret(2, &[file, 0o2001, 0]);
+    assert!(appending < 1024, "{appending}");
+    assert_eq!(f.ret(2, &[file, 0o3001, 0]), eperm);
+    assert_eq!(f.ret(77, &[appending, 0]), eperm);
+    assert_eq!(f.ret(72, &[appending, 4, 1]), eperm);
+    assert_eq!(f.ret(285, &[appending, 0, 0, 1]), 0);
+    assert_eq!(f.ret(285, &[appending, 3, 0, 1]), eperm);
+    assert_eq!(f.ret(87, &[file]), eperm);
+    assert_eq!(f.ret(280, &[at, file, 0, 0]), 0);
+    // Cleared, it goes.
+    f.mem.write(GuestAddr(out), &0u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(16, &[fd, 0x4008_6602, out]), 0);
+    assert_eq!(f.ret(87, &[file]), 0);
+
+    // A directory: its flags go to what is made in it, but for these two;
+    // an immutable one takes no new name, an append-only one loses none.
+    assert_eq!(f.ret(83, &[dir, 0o755]), 0);
+    let d = f.ret(2, &[dir, 0o200000, 0]);
+    f.mem.write(GuestAddr(out), &0xc0u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(16, &[d, 0x4008_6602, out]), 0);
+    let child = f.ret(2, &[inner, 0o102, 0o644]);
+    assert_eq!(getflags(&mut f, child), 0xc0);
+    f.mem.write(GuestAddr(out), &0x20u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(16, &[d, 0x4008_6602, out]), 0);
+    assert_eq!(f.ret(87, &[inner]), eperm);
+    f.mem.write(GuestAddr(out), &0x10u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(16, &[d, 0x4008_6602, out]), 0);
+    f.mem
+        .write(GuestAddr(DATA + 0x380), b"/flags-dir/new\0")
+        .unwrap();
+    assert_eq!(f.ret(83, &[DATA + 0x380, 0o755]), eperm);
+    f.mem.write(GuestAddr(out), &0u32.to_le_bytes()).unwrap();
+    assert_eq!(f.ret(16, &[d, 0x4008_6602, out]), 0);
+
+    // Only the owner changes flags, and the two need CAP_LINUX_IMMUTABLE.
+    let fd2 = f.ret(2, &[other, 0o102, 0o644]);
+    assert_eq!(f.ret(92, &[other, 1000, 1000]), 0);
+    assert_eq!(f.ret(nr::SETUID, &[1000]), 0);
+    set_attr(&mut f, 0x80, 0, 0);
+    assert_eq!(f.ret(469, &[at, other, attr, 24, 0]), 0);
+    set_attr(&mut f, 0x8, 0, 0);
+    assert_eq!(f.ret(469, &[at, other, attr, 24, 0]), eperm);
+    assert_eq!(f.ret(469, &[at, inner, attr, 24, 0]), eperm);
+    assert_eq!(getflags(&mut f, fd2), 0x40);
+}
+
+#[test]
 fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
     let mut f = fixture();
     let (vec, page) = (DATA + 0x800, 4096);

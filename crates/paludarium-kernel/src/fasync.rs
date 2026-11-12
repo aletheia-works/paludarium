@@ -162,6 +162,14 @@ pub(crate) fn set_flags(
         flags & !O_ASYNC
     };
     let before = file.flags();
+    // `setfl`: O_APPEND stays on an append-only file (EPERM).
+    if (before ^ flags) & 0o2000 != 0
+        && file
+            .stat()
+            .is_ok_and(|stat| crate::files::attributes::append_only(&stat))
+    {
+        return Err(Errno::EPERM);
+    }
     // A hung-up terminal's `fasync` refuses, and nothing changes.
     if (before ^ flags) & O_ASYNC != 0 && crate::pty::hung_up(file) {
         return Err(Errno::ENOTTY);

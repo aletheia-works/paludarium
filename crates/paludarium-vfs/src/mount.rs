@@ -354,6 +354,16 @@ impl HostFs for MountedFs {
         let (_, fs, relative) = self.route(&p)?;
         fs.with_xattrs(&relative, false, f)
     }
+    fn with_attributes(
+        &self,
+        p: &[u8],
+        follow: bool,
+        f: &mut dyn FnMut(&mut u32),
+    ) -> Result<(), Errno> {
+        let p = self.resolve(p, follow, false)?;
+        let (_, fs, relative) = self.route(&p)?;
+        fs.with_attributes(&relative, false, f)
+    }
     fn set_mode(&self, p: &[u8], mode: u32) -> Result<(), Errno> {
         let p = self.resolve(p, true, false)?;
         let (_, fs, relative) = self.route(&p)?;

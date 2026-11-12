@@ -242,6 +242,9 @@ impl FileHandle for MemFile {
         f(&mut lock(&self.node).xattrs);
         Ok(())
     }
+    fn with_attributes(&self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
+        lock(&self.node).with_attributes(f)
+    }
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         set_node_mode(&mut lock(&self.node), mode);
         Ok(())

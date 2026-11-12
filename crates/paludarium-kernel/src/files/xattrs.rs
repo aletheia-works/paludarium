@@ -27,7 +27,7 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const XATTR_ARGS_SIZE_VER0: u64 = 16;
 
 /// What a call works on, found before its name and value are looked at.
-enum Target {
+pub(super) enum Target {
     Path {
         path: Vec<u8>,
         follow: bool,
@@ -66,7 +66,11 @@ impl Target {
     /// none, or only `O_PATH`). Only `setxattrat` and `getxattrat` take a
     /// negative `dir` as a directory to walk no further from: the working
     /// directory for `AT_FDCWD`, and EBADF for any other.
-    fn at(c: &Context<'_>, [dir, ptr, flags]: [u64; 3], walks: bool) -> Result<Self, Errno> {
+    pub(super) fn at(
+        c: &Context<'_>,
+        [dir, ptr, flags]: [u64; 3],
+        walks: bool,
+    ) -> Result<Self, Errno> {
         let raw = if flags & AT_EMPTY_PATH == 0 {
             Some(path(c, ptr)?)
         } else if ptr == 0 {
@@ -118,9 +122,21 @@ impl Target {
         let stat = file.stat()?;
         Ok(Self::File { file, stat })
     }
-    fn stat(&self) -> &FileStat {
+    pub(super) fn stat(&self) -> &FileStat {
         match self {
             Self::Path { stat, .. } | Self::File { stat, .. } | Self::Generated { stat } => stat,
+        }
+    }
+    /// Runs `f` on the inode flags; `EOPNOTSUPP` if it keeps none.
+    pub(super) fn with_attributes(
+        &self,
+        c: &Context<'_>,
+        f: &mut dyn FnMut(&mut u32),
+    ) -> Result<(), Errno> {
+        match self {
+            Self::Path { path, follow, .. } => c.files.fs.with_attributes(path, *follow, f),
+            Self::File { file, .. } => file.with_attributes(f),
+            Self::Generated { .. } => Err(Errno::EOPNOTSUPP),
         }
     }
     /// Runs `f` on the attributes; `EOPNOTSUPP` if it holds none.
@@ -175,6 +191,10 @@ fn namespace(name: &[u8]) -> Result<(), Errno> {
 
 /// `xattr_permission`, then what `cap_inode_setxattr` asks of a change.
 fn permitted(creds: &Credentials, stat: &FileStat, name: &[u8], write: bool) -> Result<(), Errno> {
+    // `may_write_xattr`: not an immutable or append-only file (EPERM).
+    if write {
+        super::attributes::unchangeable(stat)?;
+    }
     let refused = if write { Errno::EPERM } else { ENODATA };
     if name.starts_with(b"trusted.") && !creds.may_administer() {
         return Err(refused);

@@ -1715,6 +1715,16 @@ fn check_mappable(
     if shared_write && access != 2 || access == 1 {
         return Err(Errno::EACCES);
     }
+    // Nor does an append-only file open for writing map shared, whatever
+    // the protection.
+    if flags & MAP_SHARED != 0
+        && access == 2
+        && file
+            .stat()
+            .is_ok_and(|stat| crate::files::attributes::append_only(&stat))
+    {
+        return Err(Errno::EACCES);
+    }
     // Neither a file that is not regular nor one that /proc generates can
     // be read at an offset, which a mapping needs.
     let readable = regular && file.read_at(0, &mut []) != Err(Errno::ENODEV);
@@ -2367,6 +2377,12 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 return Ok(0);
             }
             _ => {}
+        }
+        // FS_IOC_GETFLAGS, FS_IOC_SETFLAGS, FS_IOC_FSGETXATTR and
+        // FS_IOC_FSSETXATTR, which `do_vfs_ioctl` answers for a file whose
+        // file system keeps inode flags.
+        if let Some(result) = crate::files::attributes::ioctl(c, &*file, a[1] as u32, a[2]) {
+            return result;
         }
         // A pseudo-terminal's own requests.
         if let Some(result) = crate::pty::ioctl(c, &file, a[1], a[2]) {

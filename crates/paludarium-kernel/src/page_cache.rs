@@ -902,6 +902,13 @@ impl FileHandle for CoherentFile {
         }
         result
     }
+    fn with_attributes(&self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
+        let (result, changed) = crate::inotify::changing_xattrs(|| self.inner.with_attributes(f));
+        if result.is_ok() && changed {
+            self.changed(crate::inotify::ATTRIB);
+        }
+        result
+    }
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         self.inner.set_mode(mode)?;
         self.changed(crate::inotify::ATTRIB);
@@ -1134,6 +1141,21 @@ impl HostFs for CoherentFs {
     ) -> Result<(), Errno> {
         let (result, changed) =
             crate::inotify::changing_xattrs(|| self.inner.with_xattrs(path, follow, f));
+        if result.is_ok() && changed {
+            self.caches
+                .notify
+                .changed(&*self.inner, path, follow, crate::inotify::ATTRIB);
+        }
+        result
+    }
+    fn with_attributes(
+        &self,
+        path: &[u8],
+        follow: bool,
+        f: &mut dyn FnMut(&mut u32),
+    ) -> Result<(), Errno> {
+        let (result, changed) =
+            crate::inotify::changing_xattrs(|| self.inner.with_attributes(path, follow, f));
         if result.is_ok() && changed {
             self.caches
                 .notify

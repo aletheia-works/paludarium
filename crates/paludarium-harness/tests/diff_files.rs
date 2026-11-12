@@ -72,6 +72,8 @@ cases!(openat2=>62,host_openat2=>62,proc_fd_paths=>64,host_proc_fd_paths=>64);
 cases!(proc_fd_xattrs=>65);
 // Only in memory, as files_xattrs.
 cases!(xattrat=>76);
+// Only in memory: a mounted host directory keeps no inode flags here.
+cases!(fileattr=>77);
 cases!(path_descriptor_io=>66,host_path_descriptor_io=>66);
 cases!(wide_arguments=>60,host_wide_arguments=>60);
 // Only on the emulator's own host: the mounted run's recorded clock moves only

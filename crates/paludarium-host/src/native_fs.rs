@@ -243,6 +243,7 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             rdev: 0,
             // st_blocks is in 512-byte blocks on every Unix host.
             blocks: Some(m.blocks()),
+            attributes: 0,
         })
     }
     #[cfg(not(unix))]
@@ -274,6 +275,7 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
             mtime_ns,
             rdev: 0,
             blocks: None,
+            attributes: 0,
         })
     }
 }
@@ -1108,6 +1110,7 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             rdev: 0,
             // st_blocks is in 512-byte blocks on every Unix host.
             blocks: Some(m.blocks()),
+            attributes: 0,
         })
     }
     #[cfg(not(unix))]
@@ -1139,6 +1142,7 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
             mtime_ns,
             rdev: 0,
             blocks: None,
+            attributes: 0,
         })
     }
 }

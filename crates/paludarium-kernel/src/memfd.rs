@@ -191,6 +191,10 @@ impl FileHandle for Memfd {
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
         self.file.set_flags(flags)
     }
+    /// A memfd is a tmpfs file, with tmpfs's inode flags.
+    fn with_attributes(&self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
+        self.file.with_attributes(f)
+    }
     /// `F_SEAL_EXEC` keeps the execute bits as they are.
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         if self.seals() & F_SEAL_EXEC != 0 && (self.file.stat()?.mode ^ mode) & 0o111 != 0 {

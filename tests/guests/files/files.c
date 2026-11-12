@@ -718,6 +718,59 @@ void _start(void) {
   ts[2]=2000;results[x++]=call(280,-100,(long)fdpath(fd),(long)ts,0,0,0);S(5,fd,st,0);results[x++]=MTIME();
   results[x++]=S(21,fdpath(fd),4,0);
   S(3,op,0,0);S(3,ol,0,0);S(3,dp,0,0);}
+ if(CASE==77){ /* file_getattr, file_setattr (Linux 6.17) and FS_IOC_GETFLAGS/SETFLAGS/FSGETXATTR/FSSETXATTR, unprivileged and as ext4 and tmpfs both give them */
+  static char d[]="/tmp/paludarium-files-fileattr",f[]="/tmp/paludarium-files-fileattr/f",inner[]="/tmp/paludarium-files-fileattr/d",child[]="/tmp/paludarium-files-fileattr/d/c";
+  static unsigned long fa[5];static unsigned int word[8];
+  #define FATTR(x,p) (fa[0]=(unsigned long)(x),fa[1]=0,fa[2]=(unsigned int)(p),(long)fa)
+  #define GATTR(path,sz,fl) call(468,-100,(long)(path),(long)fa,sz,fl,0)
+  #define SATTR(path,x,sz,fl) call(469,-100,(long)(path),FATTR(x,0),sz,fl,0)
+  /* Root here, as the emulator runs guests, would have CAP_LINUX_IMMUTABLE: nobody's IDs instead. */
+  if(S(102,0,0,0)==0){S(106,65534,0,0);S(105,65534,0,0);}
+  S(87,child,0,0);S(84,inner,0,0);S(87,f,0,0);S(84,d,0,0);
+  results[x++]=S(83,d,0755,0);
+  long fd=S(2,f,0102,0644);results[x++]=fd>=0;
+  /* A new file has none of these flags. */
+  fa[0]=99;results[x++]=GATTR(f,24,0);results[x++]=fa[0];
+  results[x++]=S(16,fd,0x80086601,word);results[x++]=word[0]&0xf0;
+  /* FS_XFLAG_NODUMP is FS_NODUMP_FL, and statx shows it. */
+  results[x++]=SATTR(f,0x80,24,0);fa[0]=0;results[x++]=GATTR(f,24,0);results[x++]=fa[0];
+  word[0]=0;S(16,fd,0x80086601,word);results[x++]=word[0]&0xf0;
+  static unsigned char sx[256];results[x++]=call(332,-100,(long)f,0,0x7ff,(long)sx,0);results[x++]=*(unsigned long*)(sx+8)&0x70;
+  /* FS_IOC_SETFLAGS with FS_NOATIME_FL too, and FS_IOC_FSGETXATTR. */
+  word[0]=0xc0;results[x++]=S(16,fd,0x40086602,word);
+  for(int i=0;i<8;i++)word[i]=0xffffffff;results[x++]=S(16,fd,0x801c581f,word);results[x++]=word[0];results[x++]=word[3];
+  /* Immutable and append-only need CAP_LINUX_IMMUTABLE. */
+  results[x++]=SATTR(f,0x8,24,0);results[x++]=SATTR(f,0x10,24,0);
+  word[0]=0x10;results[x++]=S(16,fd,0x40086602,word);word[0]=0x20;results[x++]=S(16,fd,0x40086602,word);
+  /* The owner only. */
+  results[x++]=SATTR("/tmp",0x80,24,0);
+  /* Flags Linux does not know, a project ID of -1, FS_IOC_FSSETXATTR's unknown flag. */
+  results[x++]=SATTR(f,1L<<40,24,0);results[x++]=SATTR(f,1L<<21,24,0);
+  results[x++]=call(469,-100,(long)f,FATTR(0x80,0xffffffffL),24,0,0);
+  for(int i=0;i<8;i++)word[i]=0;word[0]=1<<22;results[x++]=S(16,fd,0x401c5820,word);
+  results[x++]=S(16,fd,0x40086602,0);
+  /* Sizes, at_flags and the struct. */
+  results[x++]=GATTR(f,23,0);results[x++]=GATTR(f,4097,0);results[x++]=GATTR(f,24,0x400);results[x++]=SATTR(f,0x80,23,0);results[x++]=SATTR(f,0x80,4097,0);results[x++]=SATTR(f,0x80,24,0x400);
+  results[x++]=call(468,-100,(long)f,0,24,0,0);results[x++]=call(469,-100,(long)f,0,24,0,0);
+  fa[3]=1;results[x++]=SATTR(f,0xc0,32,0);fa[3]=0;results[x++]=SATTR(f,0xc0,32,0);
+  fa[3]=~0UL;results[x++]=GATTR(f,32,0);results[x++]=fa[0];results[x++]=fa[3];
+  /* A descriptor's file with AT_EMPTY_PATH; an O_PATH one has none; a null path without it is EFAULT. */
+  results[x++]=call(468,fd,0,(long)fa,24,0x1000,0);results[x++]=fa[0];
+  long pathfd=S(2,f,010000000,0);results[x++]=call(468,pathfd,(long)"",(long)fa,24,0x1000,0);
+  results[x++]=call(468,-100,0,(long)fa,24,0,0);
+  results[x++]=GATTR("/tmp/paludarium-files-fileattr/missing",24,0);
+  /* What keeps no flags: /proc, and a pipe's ioctl. */
+  results[x++]=GATTR("/proc/self/status",24,0);results[x++]=SATTR("/proc/self/status",0x80,24,0);
+  int pp[2];S(22,pp,0,0);results[x++]=S(16,pp[0],0x80086601,word);S(3,pp[0],0,0);S(3,pp[1],0,0);
+  /* What a directory has, what is made in it takes. */
+  results[x++]=S(83,inner,0755,0);results[x++]=SATTR(inner,0xc0,24,0);
+  long cfd=S(2,child,0102,0644);results[x++]=cfd>=0;fa[0]=0;results[x++]=GATTR(child,24,0);results[x++]=fa[0];S(3,cfd,0,0);
+  /* Cleared again. */
+  results[x++]=SATTR(f,0,24,0);fa[0]=9;results[x++]=GATTR(f,24,0);results[x++]=fa[0];
+  #undef FATTR
+  #undef GATTR
+  #undef SATTR
+  S(3,fd,0,0);S(3,pathfd,0,0);S(87,child,0,0);S(84,inner,0,0);S(87,f,0,0);S(84,d,0,0);}
  if(CASE==76){ /* setxattrat, getxattrat, listxattrat and removexattrat (Linux 6.13): a directory, at_flags and struct xattr_args */
   static char d[]="/tmp/paludarium-files-xattrat",f[]="/tmp/paludarium-files-xattrat/f",base[]="f",k[]="user.k",empty[]="";
   static unsigned long xa[4];

@@ -3403,6 +3403,58 @@ impl MemoryView {
         self.with_data(|data| data.read(GuestAddr(addr), buf).is_ok())
             .unwrap_or(false)
     }
+    /// Copies the space's memory at `addr` into `buf`, as Linux's
+    /// `process_vm_readv` pins another task's pages: page by page, up to the
+    /// first page that is not mapped with `PROT_READ` (`VM_READ`, which
+    /// `PROT_WRITE` or `PROT_EXEC` alone does not give) or does not read.
+    /// How many bytes were copied, or `None` once the space is gone.
+    #[must_use]
+    pub fn read_pages(&self, addr: u64, buf: &mut [u8]) -> Option<usize> {
+        self.with_data(|data| {
+            let mut copied = 0;
+            for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
+                let readable = data
+                    .mapping_at(page)
+                    .is_some_and(|m| m.prot.contains(Prot::READ));
+                if !readable
+                    || data
+                        .read(GuestAddr(page + offset as u64), &mut buf[range.clone()])
+                        .is_err()
+                {
+                    break;
+                }
+                copied = range.end;
+            }
+            copied
+        })
+    }
+    /// Copies `buf` into the space at `addr`, as Linux's
+    /// `process_vm_writev` pins another task's pages for writing: page by
+    /// page, up to the first page that may not be written. How many bytes
+    /// were copied, or `None` once the space is gone.
+    #[must_use]
+    pub fn write_pages(&self, addr: u64, buf: &[u8]) -> Option<usize> {
+        let data = self.data.upgrade()?;
+        let serialization = lock_spinning(&self.serialization);
+        let mut guard = AddressSpaceGuard {
+            data: lock_spinning(&data),
+            _serialization: serialization,
+        };
+        let mut copied = 0;
+        for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
+            let at = GuestAddr(page + offset as u64);
+            match guard.write_with(at, &buf[range.clone()], Access::Write) {
+                Ok(first) => {
+                    if first {
+                        guard.mark_written(at, range.len() as u64);
+                    }
+                }
+                Err(_) => break,
+            }
+            copied = range.end;
+        }
+        Some(copied)
+    }
     /// The total length of the space's mappings and its initial break, or
     /// `None` once it is gone.
     #[must_use]

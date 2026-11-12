@@ -2004,6 +2004,8 @@ impl Kernel {
             434 => self.pidfd_open(thread, a),
             424 => self.pidfd_send_signal(thread, a),
             312 => self.kcmp(thread, mem, a),
+            310 | 311 => self.process_vm(thread, mem, a, n == 311),
+            438 => self.pidfd_getfd(thread, a),
             129 => self.sigqueueinfo(thread, mem, a),
             297 => self.tgsigqueueinfo(thread, mem, a),
             // The IDs these give are as the caller's PID namespace numbers
@@ -3164,6 +3166,111 @@ impl Kernel {
             a[2] as i32,
             [a[3], a[4]],
         )
+    }
+    /// `process_vm_readv(pid, lvec, liovcnt, rvec, riovcnt, flags)` and
+    /// `process_vm_writev`, as Linux's `process_vm_rw`: the iovecs are
+    /// checked first ([`crate::process_vm::segments`]), then `pid`, an
+    /// `int`, names a thread as the caller's PID namespace numbers them
+    /// (`ESRCH`, as `find_get_task_by_vpid`), which has memory (`ESRCH` for
+    /// a zombie, as `mm_access`), and which the caller may attach to unless
+    /// it shares the caller's memory (`EPERM`). Then
+    /// [`crate::process_vm::transfer`] copies.
+    fn process_vm(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+        write: bool,
+    ) -> Result<u64, Errno> {
+        let Some(segments) = crate::process_vm::segments(mem, a)? else {
+            return Ok(0);
+        };
+        let target = self.attachable(thread, mem, a[0] as i32)?;
+        crate::process_vm::transfer(mem, &target, &segments, write)
+    }
+    /// The memory of the thread the caller's PID namespace numbers
+    /// `number`, as Linux's `mm_access` with `PTRACE_MODE_ATTACH_REALCREDS`
+    /// gives it: `ESRCH` for no such thread or one without memory (a
+    /// zombie's), and `EPERM` unless it is the caller's own memory, the
+    /// thread is of the caller's process, or the caller may attach to it
+    /// ([`Self::may_attach`]).
+    fn attachable(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        number: i32,
+    ) -> Result<paludarium_mmu::MemoryView, Errno> {
+        let esrch = Errno(3);
+        let number = u32::try_from(number).ok().filter(|&n| n > 0).ok_or(esrch)?;
+        let tid = self.pid_space(thread.tid).task(number).ok_or(esrch)?;
+        if tid == thread.tid || self.group.has_member(tid) {
+            return Ok(mem.view());
+        }
+        let pid = match self.processes.view(tid) {
+            Some(_) => tid,
+            None => self.processes.thread_leader(tid).ok_or(esrch)?,
+        };
+        let view = self.processes.view(pid).ok_or(esrch)?;
+        let public = view.group.public(tid).ok_or(esrch)?;
+        let memory = public
+            .memory
+            .clone()
+            .filter(|_| !view.zombie)
+            .ok_or(esrch)?;
+        if !memory.is_of(mem) && !Self::may_attach(thread, &view, &public) {
+            return Err(Errno::EPERM);
+        }
+        Ok(memory)
+    }
+    /// Whether the caller may attach to a thread of another process, as
+    /// Linux's `__ptrace_may_access` with `PTRACE_MODE_ATTACH_REALCREDS`
+    /// decides ([`crate::credentials::Credentials::may_read_task`] with the
+    /// real IDs): no Yama restriction is applied on top.
+    fn may_attach(
+        thread: &Thread,
+        view: &ProcessView,
+        public: &crate::threads::PublicThread,
+    ) -> bool {
+        thread.state.credentials.may_read_task(
+            &public.credentials,
+            view.dumpable || view.zombie,
+            true,
+        )
+    }
+    /// `pidfd_getfd(pidfd, targetfd, flags)`, as Linux's: `flags` must be 0
+    /// (`EINVAL`) and `pidfd` a pidfd (`EBADF`); its process must not be
+    /// reaped (`ESRCH`), the caller must be able to attach to it (`EPERM`)
+    /// and it must not have exited (`ESRCH`); then `targetfd` must be open
+    /// in it (`EBADF`). The copy shares the open file description and gets
+    /// the lowest free number with `FD_CLOEXEC` set (`EMFILE`).
+    fn pidfd_getfd(&mut self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
+        if a[2] as u32 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let d = self.files.descriptor(u64::from(a[0] as u32))?;
+        let pidfd = d
+            .file
+            .as_any()
+            .and_then(|any| any.downcast_ref::<PidFd>())
+            .ok_or(Errno::EBADF)?;
+        let target = a[1] as u32;
+        let descriptor = if pidfd.pid == self.process.pid {
+            self.files.descriptor(u64::from(target))?
+        } else {
+            let esrch = Errno(3);
+            let view = self.processes.view(pidfd.pid).ok_or(esrch)?;
+            let public = view.group.public(pidfd.pid).ok_or(esrch)?;
+            if !Self::may_attach(thread, &view, &public) {
+                return Err(Errno::EPERM);
+            }
+            if view.zombie {
+                return Err(esrch);
+            }
+            public.files.descriptor(target).ok_or(Errno::EBADF)?
+        };
+        let n = self.files.reserve(self.group.nofile())?;
+        self.files.fill(n, descriptor.received(true));
+        Ok(u64::from(n))
     }
     /// `pidfd_open(pid, flags)`: a close-on-exec pidfd for a process.
     /// `PIDFD_THREAD` is accepted but still names the whole process.

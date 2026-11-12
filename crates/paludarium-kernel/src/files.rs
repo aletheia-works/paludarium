@@ -4,6 +4,7 @@ mod splice;
 mod tasks;
 mod xattrs;
 use paludarium_host::{ClockId, FileHandle, FileStat};
+use paludarium_mmu::AddressSpace;
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, HostFs, MemFs};
 use std::collections::{BTreeMap, BTreeSet};
@@ -180,6 +181,13 @@ impl FilesView {
         let fds = self.fds.upgrade()?;
         let fds = fds.lock().unwrap_or_else(PoisonError::into_inner);
         fds.get(&fd).map(|descriptor| Arc::clone(&descriptor.file))
+    }
+    /// Descriptor `fd`, which `pidfd_getfd` copies with its open file
+    /// description and path.
+    pub(crate) fn descriptor(&self, fd: u32) -> Option<Descriptor> {
+        let fds = self.fds.upgrade()?;
+        let fds = fds.lock().unwrap_or_else(PoisonError::into_inner);
+        fds.get(&fd).cloned()
     }
     /// One past the highest open descriptor.
     pub(crate) fn descriptors(&self) -> usize {
@@ -1878,7 +1886,7 @@ pub(crate) fn iovecs(
     count: u64,
     write: bool,
 ) -> Result<Vec<(u64, usize)>, Errno> {
-    iovecs_checked(c, at, count, |base, length| {
+    iovecs_checked(c.mem, at, count, |base, length| {
         if write {
             c.mem.check_write(GuestAddr(base), length)
         } else {
@@ -1896,7 +1904,7 @@ pub(crate) fn iovecs(
 /// lengths are cut so that the total is at most `MAX_RW_COUNT`. `check` then
 /// looks at each cut buffer in turn.
 pub(crate) fn iovecs_checked(
-    c: &Context<'_>,
+    mem: &AddressSpace,
     at: u64,
     count: u64,
     check: impl Fn(u64, usize) -> Result<(), Errno>,
@@ -1911,9 +1919,8 @@ pub(crate) fn iovecs_checked(
     let mut entries = Vec::with_capacity(count as usize);
     for index in 0..count {
         let addr = at + index * 16;
-        let base = c.mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
-        let length = c
-            .mem
+        let base = mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
+        let length = mem
             .read_u64(GuestAddr(addr + 8))
             .map_err(|_| Errno::EFAULT)?;
         if (length as i64) < 0 {

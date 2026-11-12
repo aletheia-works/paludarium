@@ -279,3 +279,33 @@ mod signals_time_tests {
     use super::*;
     include!("signals_time_tests.rs");
 }
+#[test]
+fn another_task_copies_page_by_page_as_linux_pins() {
+    let mut m = AddressSpace::new();
+    for (at, prot) in [
+        (0x10000, Prot::READ_WRITE),
+        (0x11000, Prot::READ),
+        (0x12000, Prot::WRITE),
+    ] {
+        m.map(Some(GuestAddr(at)), PAGE_SIZE, prot, MappingKind::Anonymous)
+            .unwrap();
+    }
+    m.write(GuestAddr(0x10ffc), b"abcd").unwrap();
+    let view = m.view();
+    let mut buf = [0; 16];
+    // Up to the write-only page, which has no VM_READ.
+    assert_eq!(view.read_pages(0x10ffc, &mut buf[..8]), Some(8));
+    assert_eq!(&buf[..4], b"abcd");
+    assert_eq!(view.read_pages(0x11ffc, &mut buf), Some(4));
+    assert_eq!(view.read_pages(0x12000, &mut buf), Some(0));
+    // Up to the read-only page; the write-only one takes bytes.
+    assert_eq!(view.write_pages(0x10ff8, b"12345678"), Some(8));
+    assert_eq!(view.write_pages(0x10ffc, b"wxyz1234"), Some(4));
+    assert_eq!(view.write_pages(0x12000, b"wo"), Some(2));
+    assert_eq!(view.write_pages(0x13000, b"no"), Some(0));
+    m.read(GuestAddr(0x10ff8), &mut buf[..8]).unwrap();
+    assert_eq!(&buf[..8], b"1234wxyz");
+    drop(m);
+    assert_eq!(view.read_pages(0x10000, &mut buf), None);
+    assert_eq!(view.write_pages(0x10000, b"x"), None);
+}

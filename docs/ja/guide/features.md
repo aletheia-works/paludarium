@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`kcmp`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
@@ -794,6 +794,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux がアドレスを隠すのと同じく、ランダムなクッキーで決まる順の 1 か 2 を返します。それを
   持たないスレッド（終わったプロセス、I/O コンテキストや undo リストのないスレッド）どうしは
   等しいとみなします。
+- `process_vm_readv` と `process_vm_writev` は Linux の `mm/process_vm_access.c` と同じ順に
+  確かめます。`flags` は 0 でなければならず（`EINVAL`）、次に手元の iovec 配列を `readv` と
+  同じく読み、次に相手側の配列を読みます（1024 を超える要素や負の長さは `EINVAL`、読めない
+  配列は `EFAULT`。バッファはまだ見ません）。どちらかの側に写すバイトがなければ、スレッドを
+  探す前に 0 を返します。`pid` は呼んだ側の PID 名前空間の番号でスレッドを指し（`ESRCH`。
+  ゾンビも同じ）、自分のメモリでない限り、実 ID で判断するアタッチモードの
+  `ptrace_may_access` と同じく、そのメモリにアタッチできることを求めます（`EPERM`）。
+  手元のバッファに空きがある間、相手側のバッファを順に写します。マップされていない相手側の
+  ページ、`PROT_READ` なしのページ（読む場合。Linux の `VM_READ` と同じく `PROT_WRITE` や
+  `PROT_EXEC` だけでは足りません）、`PROT_WRITE` なしのページ（書く場合）、または書けない・
+  読めない手元のバイトで写すのをやめ、それまでに写したバイト数を返します。1 バイトも
+  写せなければ `EFAULT` です。
+- `pidfd_getfd` はフラグを取らず（`EINVAL`）、pidfd を取り（`EBADF`）、そのプロセスに上と
+  同じくアタッチできることを求めます（`EPERM`）。終わったプロセスは回収の前でも後でも
+  `ESRCH`、そのプロセスにないディスクリプタは `EBADF` です。写しは開いたファイル記述を
+  共有し、空いている最小の番号を close-on-exec で得ます（`RLIMIT_NOFILE` に達すれば
+  `EMFILE`）。
 - `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
   （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
   `execve` は `READ_IMPLIES_EXEC` を、set-ID のプログラムなら `PER_CLEAR_ON_SETID` も

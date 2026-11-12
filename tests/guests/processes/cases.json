@@ -220,6 +220,8 @@
     {"name":"futex-requeue","binary":"process"},
     {"name":"futex-wake-op","binary":"process"},
     {"name":"kcmp","binary":"process"},
+    {"name":"process-vm","binary":"process"},
+    {"name":"pidfd-getfd","binary":"process"},
     {"name":"ignored-signal-wait","binary":"process"},
     {"name":"mmsg","binary":"process"},
     {"name":"itimer","binary":"process"},

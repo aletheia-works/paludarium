@@ -201,6 +201,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     通るかが違うことがあります。
   - ほかのプロセスの `get_robust_list` は `ESRCH` です。Linux は、そのプロセスを
     トレースできる呼び出し元には返します。
+  - ほかのプロセスにアタッチできるか（`process_vm_readv`、`process_vm_writev`、
+    `pidfd_getfd`）は、Yama のない Linux と同じく ID、ダンプ可能か、`CAP_SYS_PTRACE`、
+    Landlock だけで決めます。`kernel.yama.ptrace_scope` はないので、Yama の既定の
+    スコープ 1 なら祖先しか入れないところ、プロセスは親にも届きます。呼び出し元の
+    許可されたケーパビリティが相手のものを含むかという、ケーパビリティモジュールの
+    検査もしません。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
     読み込んだページも、触るまでは数えません。

@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `kcmp`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
@@ -899,6 +899,27 @@ kernel.
   for others in an order that random cookies make, as Linux hides the
   objects' addresses. A thread without one (an ended process, a thread with
   no I/O context or undo list) compares equal to another without.
+- `process_vm_readv` and `process_vm_writev` check as Linux's
+  `mm/process_vm_access.c` does: `flags` must be 0 (`EINVAL`), then the local
+  iovec array as `readv` reads it, then the remote one (more than 1024
+  entries or a negative length `EINVAL`, an array that cannot be read
+  `EFAULT`, its buffers not looked at yet); with no bytes to copy on either
+  side they return 0 before the thread is looked for. `pid` names a thread as
+  the caller's PID namespace numbers it (`ESRCH`, also for a zombie), whose
+  memory the caller must be allowed to attach to unless it is its own, as
+  `ptrace_may_access` in attach mode with the real IDs decides (`EPERM`).
+  They copy each remote buffer in turn while the local buffers have room: a
+  remote page that is not mapped, is not mapped with `PROT_READ` (to read;
+  `PROT_WRITE` or `PROT_EXEC` alone is not enough, as Linux's `VM_READ`) or
+  without `PROT_WRITE` (to write), or a local byte that cannot be written or
+  read, ends the copy, which gives the bytes copied before it, or `EFAULT`
+  with none.
+- `pidfd_getfd` takes no flags (`EINVAL`) and a pidfd (`EBADF`), and needs
+  the caller to be allowed to attach to its process as above (`EPERM`); a
+  process that has exited, reaped or not, is `ESRCH`, and a descriptor it
+  does not have `EBADF`. The copy shares the open file description and
+  gets the lowest free number, close-on-exec (`EMFILE` at
+  `RLIMIT_NOFILE`).
 - `personality` keeps any value for the thread, as Linux stores it, and
   returns the old one (`0xffffffff` only asks). New threads and processes
   inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and

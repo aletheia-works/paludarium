@@ -459,7 +459,7 @@ pub(super) fn vmsplice(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if !write && !readable(&file) {
         return Err(Errno::EBADF);
     }
-    let segments = iovecs_checked(c, a[1], a[2], |_, _| Ok(()))?;
+    let segments = iovecs_checked(c.mem, a[1], a[2], |_, _| Ok(()))?;
     if segments.iter().all(|&(_, length)| length == 0) {
         return Ok(0);
     }

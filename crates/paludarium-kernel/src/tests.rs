@@ -5132,3 +5132,147 @@ mod kcmp {
         assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), errno(Errno::ENOENT));
     }
 }
+mod process_vm {
+    use super::*;
+    const LOCAL: u64 = DATA + 0x40;
+    const REMOTE: u64 = DATA + 0x80;
+    /// Writes the iovec array `segments` at `at`.
+    fn iovecs(f: &Fixture, at: u64, segments: &[(u64, u64)]) {
+        for (index, &(base, length)) in segments.iter().enumerate() {
+            let entry = at + index as u64 * 16;
+            f.mem.write_u64(GuestAddr(entry), base).unwrap();
+            f.mem.write_u64(GuestAddr(entry + 8), length).unwrap();
+        }
+    }
+    #[test]
+    fn process_vm_checks_in_linux_order() {
+        let mut f = fixture();
+        let (esrch, einval, efault) = (errno(Errno(3)), errno(Errno::EINVAL), errno(Errno::EFAULT));
+        let pid = f.ret(39, &[]);
+        iovecs(&f, LOCAL, &[(DATA + 0x800, 8)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x900, 8)]);
+        for number in [310, 311] {
+            // flags, then the local array, before anything else.
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, REMOTE, 1, 1]), einval);
+            assert_eq!(f.ret(number, &[999, LOCAL, 1025, REMOTE, 1, 0]), einval);
+            assert_eq!(f.ret(number, &[999, 8, 1, REMOTE, 1, 0]), efault);
+            // No local bytes: nothing more is looked at.
+            assert_eq!(f.ret(number, &[999, LOCAL, 0, 8, 1, 0]), 0);
+            // The remote array: its count, that it can be read, its lengths.
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, REMOTE, 1025, 0]), einval);
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, 8, 1, 0]), efault);
+            // No remote bytes: the task is not looked for.
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, REMOTE, 0, 0]), 0);
+            // Then the task, by an `int`.
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, REMOTE, 1, 0]), esrch);
+            assert_eq!(f.ret(number, &[0, LOCAL, 1, REMOTE, 1, 0]), esrch);
+            assert_eq!(f.ret(number, &[u64::MAX, LOCAL, 1, REMOTE, 1, 0]), esrch);
+            assert_eq!(f.ret(number, &[pid | 1 << 32, LOCAL, 1, REMOTE, 1, 0]), 8);
+        }
+        iovecs(&f, REMOTE, &[(DATA + 0x900, 1 << 63)]);
+        assert_eq!(f.ret(310, &[999, LOCAL, 1, REMOTE, 1, 0]), einval);
+        iovecs(&f, REMOTE, &[(DATA + 0x900, 0), (DATA + 0x900, 0)]);
+        assert_eq!(f.ret(310, &[999, LOCAL, 1, REMOTE, 2, 0]), 0);
+    }
+    #[test]
+    fn process_vm_copies_and_stops_at_a_fault() {
+        let mut f = fixture();
+        let efault = errno(Errno::EFAULT);
+        let pid = f.ret(39, &[]);
+        // A read-only page after the data, and a page mapped write-only,
+        // which has no VM_READ for the remote side to read.
+        f.mem
+            .map(
+                Some(GuestAddr(DATA + 0x2000)),
+                0x1000,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        const ONLY_WRITE: u64 = 0x40_0000;
+        f.mem
+            .map(
+                Some(GuestAddr(ONLY_WRITE)),
+                0x1000,
+                Prot::WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x800), b"hello, world")
+            .unwrap();
+        // Two local buffers take one remote one in turn.
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 5), (DATA + 0xb00, 7)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x800, 12)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 2, REMOTE, 1, 0]), 12);
+        let mut out = [0; 7];
+        f.mem.read(GuestAddr(DATA + 0xa00), &mut out[..5]).unwrap();
+        assert_eq!(&out[..5], b"hello");
+        f.mem.read(GuestAddr(DATA + 0xb00), &mut out).unwrap();
+        assert_eq!(&out, b", world");
+        // A remote buffer that runs into a page that is not mapped gives the
+        // bytes before it; one that starts there is EFAULT, and so ends the
+        // copy, the bytes before it the result.
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 64)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x2ff8, 16)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), 8);
+        iovecs(&f, REMOTE, &[(DATA + 0x3000, 16)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), efault);
+        iovecs(
+            &f,
+            REMOTE,
+            &[(DATA + 0x800, 4), (DATA + 0x3000, 4), (DATA + 0x800, 4)],
+        );
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 3, 0]), 4);
+        // The local buffers stop at a page that cannot take the bytes.
+        iovecs(&f, LOCAL, &[(DATA + 0x1ffc, 8)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x800, 8)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), 4);
+        iovecs(&f, LOCAL, &[(DATA + 0x2000, 8)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), efault);
+        // Only as much as the local buffers hold, whatever lies beyond.
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 4)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x2ffc, 4), (DATA + 0x3000, 4)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 2, 0]), 4);
+        // A write-only page cannot be read from, but can be written.
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 4)]);
+        iovecs(&f, REMOTE, &[(ONLY_WRITE, 4)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), efault);
+        assert_eq!(f.ret(311, &[pid, LOCAL, 1, REMOTE, 1, 0]), 4);
+        // A write needs the remote page writable; the local one need only
+        // be readable, and one that is not ends the copy.
+        iovecs(&f, LOCAL, &[(DATA + 0x2000, 4)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x2000, 4)]);
+        assert_eq!(f.ret(311, &[pid, LOCAL, 1, REMOTE, 1, 0]), efault);
+        iovecs(&f, REMOTE, &[(DATA + 0xc00, 4)]);
+        assert_eq!(f.ret(311, &[pid, LOCAL, 1, REMOTE, 1, 0]), 4);
+        f.mem.write(GuestAddr(DATA + 0xa00), b"hell").unwrap();
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 4), (DATA + 0x5000, 4)]);
+        iovecs(&f, REMOTE, &[(DATA + 0xc00, 8)]);
+        assert_eq!(f.ret(311, &[pid, LOCAL, 2, REMOTE, 1, 0]), 4);
+        f.mem.read(GuestAddr(DATA + 0xc00), &mut out[..4]).unwrap();
+        assert_eq!(&out[..4], b"hell");
+    }
+    #[test]
+    fn pidfd_getfd_copies_a_descriptor() {
+        let mut f = fixture();
+        let (einval, ebadf) = (errno(Errno::EINVAL), errno(Errno::EBADF));
+        let pid = f.ret(39, &[]);
+        let pidfd = f.ret(434, &[pid, 0]);
+        let event = f.ret(290, &[0, 0]);
+        assert_eq!(f.ret(438, &[pidfd, event, 1]), einval);
+        assert_eq!(f.ret(438, &[99, event, 0]), ebadf);
+        assert_eq!(f.ret(438, &[event, event, 0]), ebadf);
+        assert_eq!(f.ret(438, &[pidfd, 99, 0]), ebadf);
+        assert_eq!(f.ret(438, &[pidfd, u64::MAX, 0]), ebadf);
+        let copy = f.ret(438, &[pidfd, event | 1 << 32, 0]);
+        assert!(copy > event, "{copy}");
+        // Close-on-exec, and the same open file description: a count
+        // written through one reads through the other.
+        assert_eq!(f.ret(72, &[copy, 1]), 1);
+        f.mem.write_u64(GuestAddr(DATA), 5).unwrap();
+        assert_eq!(f.ret(1, &[event, DATA, 8]), 8);
+        assert_eq!(f.ret(0, &[copy, DATA + 8, 8]), 8);
+        assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 5);
+    }
+}

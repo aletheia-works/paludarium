@@ -2,7 +2,8 @@
    every 32-bit argument dirty (and bits 16-31 of a umode_t). Linux casts the
    registers to the types its SYSCALL_DEFINEs declare, so the two match, except
    for unsigned long arguments it reads whole (mprotect's prot). readv's vlen
-   is unsigned long too, but import_iovec takes it as an unsigned. Only whether they match is printed: the results themselves are the
+   and vmsplice's nr_segs are unsigned long too, but import_iovec takes them as
+   unsigned. Only whether they match is printed: the results themselves are the
    other guests' business. */
 #include <signal.h>
 #include <stdio.h>
@@ -87,6 +88,9 @@ int main(void){
  P("sync_file_range flags",{r=S4(277,fd,0,0,D(1));});
  P("copy_file_range flags",{long g=S3(2,H,66,0644);long o=0;r=S6(326,fd,&o,g,0,3,D(0));S1(3,g);S1(87,H);});
  P("sendfile fds",{long g=S3(2,H,66,0644);long o=0;r=S4(40,D(g),D(fd),&o,3);S1(3,g);S1(87,H);});
+ P("splice fds,flags",{int p[2];S2(293,p,0);long o=0;r=S6(275,D(fd),&o,D(p[1]),0,3,D(0));long g=S3(2,H,66,0644);r=r*10+S6(275,D(p[0]),0,D(g),0,3,D(0));S1(3,g);S1(87,H);S1(3,p[0]);S1(3,p[1]);});
+ P("tee fds,flags",{int p[2],q[2];S2(293,p,0);S2(293,q,0);S3(1,p[1],"abc",3);r=S4(276,D(p[0]),D(q[1]),3,D(0));if(r>0)r=r*10+S3(0,q[0],buf,3);S1(3,p[0]);S1(3,p[1]);S1(3,q[0]);S1(3,q[1]);});
+ P("vmsplice fd,nr_segs,flags",{int p[2];S2(293,p,0);long iov[2]={(long)"abc",3};r=S4(278,D(p[1]),iov,dirty?W(1):1,D(0));if(r>0)r=r*10+S3(0,p[0],buf,3);S1(3,p[0]);S1(3,p[1]);});
  P("dup3 flags",{long g=S3(292,fd,50,D(0x80000));r=g>=0?S2(72,50,1):g;S1(3,50);});
  P("pipe2 flags",{int p[2];r=S2(293,p,D(0x80000));if(!r){r=S2(72,p[0],1);S1(3,p[0]);S1(3,p[1]);}});
  P("close_range flags",{S1(32,fd);r=S3(436,D(100),D(200),D(4));});

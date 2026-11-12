@@ -2072,7 +2072,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   示しません。pidfd は、そのプロセスが終わると読めるようになり（回収されると
   切断も示します。自動で回収された子では両方を同時に示します）、`epoll` で待てます。ノンブロッキングの pidfd での
   `waitid(P_PIDFD)` は `EAGAIN` を返します。`pidfd_send_signal` は siginfo と
-  範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。
+  範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。pidfd の
+  代わりに Linux の特別な値も受け付けます。`PIDFD_SELF_THREAD`（-10000）は呼んだ
+  スレッドに `tkill` と同じく（`SI_TKILL`）、`PIDFD_SELF_THREAD_GROUP`（-10001）は
+  そのプロセスに `kill` と同じく送ります。
 - 不正なポインタを渡されたときは `EFAULT` を返します。
 
 ## ネットワーク {#network}

@@ -974,7 +974,7 @@ impl ThreadGroup {
     /// `tkill` of thread `tid` from a thread of this process, `sender` as
     /// their PID namespace numbers the process. The init of a nested one
     /// drops what it would from any thread of the namespace.
-    fn send(&self, tid: u32, number: i32, sender: u32, uid: u32) -> Result<(), Errno> {
+    pub(crate) fn send(&self, tid: u32, number: i32, sender: u32, uid: u32) -> Result<(), Errno> {
         let inbox = self
             .members
             .lock()

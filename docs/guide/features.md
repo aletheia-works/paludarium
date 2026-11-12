@@ -2369,7 +2369,10 @@ kernel.
   `epoll` can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives
   `EAGAIN`.
   `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`
-  still names the whole process.
+  still names the whole process. It takes Linux's sentinels for no pidfd:
+  `PIDFD_SELF_THREAD` (-10000) sends to the calling thread, as `tkill`
+  does (`SI_TKILL`), and `PIDFD_SELF_THREAD_GROUP` (-10001) to its process,
+  as `kill` does.
 - Invalid pointers return `EFAULT`.
 
 ## Network

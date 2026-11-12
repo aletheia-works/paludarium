@@ -3317,9 +3317,9 @@ impl Kernel {
     /// (`EBADF` for no pidfd, `ESRCH` once it is reaped), and its memory
     /// (`ESRCH` for a zombie), which another process's must let the caller
     /// read it with its filesystem IDs (`EACCES`). Then the advice must be
-    /// one Linux knows (`EINVAL`, before any range, as Linux master
-    /// checks it; the CI's kernel checks it with each range); for another process's memory only
-    /// `MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED` and `MADV_COLLAPSE`
+    /// one Linux knows (`EINVAL`, before any range, as Linux master checks
+    /// it; the CI's kernel checks it with each range); for another
+    /// process's memory only `MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED` and `MADV_COLLAPSE`
     /// (`EINVAL`), and with `CAP_SYS_NICE` (`EPERM`). Each range is then
     /// advised in turn, as `madvise` would advise the caller's memory
     /// ([`crate::syscalls::advise`]); another process's only needs to be

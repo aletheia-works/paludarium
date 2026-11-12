@@ -83,17 +83,30 @@ runs:
         updated=
         # An update has hung on a mirror until the job's 60 minutes ran out (2026-11-11), so
         # each attempt is bounded. apt-get update exits 0 when a source is unreachable, so an
-        # attempt also fails when the packages have no candidate in the lists it left. A later
-        # attempt goes without the Azure mirror when others are listed. Without lists nothing
-        # installs, so the last failure fails the job.
+        # attempt also fails when a package has no candidate in the lists it left. This looks
+        # only at the lists, not at dependencies or what is installed; a misspelled package
+        # fails it too and costs the three attempts. A later attempt goes without the Azure
+        # mirror when others are listed. Without lists nothing installs, so the last failure
+        # fails the job.
+        candidates() {
+          local package policy
+          # shellcheck disable=SC2086 # the packages are separate words
+          for package in $PACKAGES; do
+            # Read whole first: with pipefail, grep -q ending early could fail apt-cache.
+            policy="$(apt-cache policy "$package")"
+            if ! grep -q '^  Candidate: [^(]' <<< "$policy"; then
+              echo "apt's lists have no candidate for $package" >&2
+              return 1
+            fi
+          done
+        }
         refresh() {
           local attempt
           for attempt in 1 2 3; do
-            if sudo timeout --kill-after=10 120 apt-get update &&
-              apt-get install --simulate --no-install-recommends $PACKAGES > /dev/null; then
+            if sudo timeout --kill-after=10 120 apt-get update && candidates; then
               return 0
             fi
-            echo "apt-get update failed, hit its limit of 120 seconds or left lists without the packages (attempt $attempt of 3)" >&2
+            echo "apt-get update failed, hit its limit of 120 seconds or left no candidate (attempt $attempt of 3)" >&2
             if [ "$attempt" -eq 3 ]; then
               return 1
             fi

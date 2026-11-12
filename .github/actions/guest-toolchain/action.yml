@@ -82,23 +82,27 @@ runs:
         # downloaded with all come from the lists the cache keeps.
         updated=
         # An update has hung on a mirror until the job's 60 minutes ran out (2026-11-11), so
-        # each attempt is bounded, and a later one goes without the Azure mirror when others
-        # are listed. Without lists nothing installs, so the last failure fails the job.
+        # each attempt is bounded. apt-get update exits 0 when a source is unreachable, so an
+        # attempt also fails when the packages have no candidate in the lists it left. A later
+        # attempt goes without the Azure mirror when others are listed. Without lists nothing
+        # installs, so the last failure fails the job.
         refresh() {
           local attempt
           for attempt in 1 2 3; do
-            if sudo timeout --kill-after=10 120 apt-get update; then
+            if sudo timeout --kill-after=10 120 apt-get update &&
+              apt-get install --simulate --no-install-recommends $PACKAGES > /dev/null; then
               return 0
             fi
-            echo "apt-get update failed or hit its limit of 120 seconds (attempt $attempt)" >&2
+            echo "apt-get update failed, hit its limit of 120 seconds or left lists without the packages (attempt $attempt of 3)" >&2
+            if [ "$attempt" -eq 3 ]; then
+              return 1
+            fi
             if [ -f "$mirrors" ] && grep -q 'azure\.archive\.ubuntu\.com' "$mirrors" &&
               grep -qv 'azure\.archive\.ubuntu\.com' "$mirrors"; then
               sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
             fi
             sleep 15
           done
-          echo "apt-get update did not succeed in 3 attempts" >&2
-          return 1
         }
         update() {
           if [ -z "$offline" ] && [ -z "$updated" ]; then

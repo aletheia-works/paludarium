@@ -1218,6 +1218,13 @@ fn tcp_info_tells_listeners_and_connections() {
     assert_eq!((raw[0], long(&raw, 128), word(&raw, 152)), (8, 101, 1));
     let (_, raw) = tcp_info(&mut f, client, 512);
     assert_eq!(raw[0], 5);
+    // The window scale its handshake offered stays, whatever buffer comes
+    // after.
+    f.mem
+        .write(GuestAddr(DATA + 0x500), &4608u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(54, [client, 1, 8, DATA + 0x500, 4, 0]), 0);
+    assert_eq!(tcp_info(&mut f, client, 512).1[6], 0xaa);
     // A shorter room takes that much; UDP has no TCP options.
     let (len, raw) = tcp_info(&mut f, client, 8);
     assert_eq!((len, raw[0]), (8, 5));

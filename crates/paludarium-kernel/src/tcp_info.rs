@@ -109,8 +109,6 @@ pub(crate) struct Carried {
     pub(crate) fin_received: bool,
     /// The bytes written that have not gone yet.
     pub(crate) unsent: u64,
-    pub(crate) segments_out: u32,
-    pub(crate) segments_in: u32,
     /// Milliseconds since data went and came.
     pub(crate) since_sent: u32,
     pub(crate) since_received: u32,
@@ -208,6 +206,10 @@ impl TcpInfo {
         // window a round trip.
         let pacing = u64::from(SND_MSS) * 2_000_000 * u64::from(CWND) / u64::from(RTT);
         let since_ack = carried.since_sent.min(carried.since_received);
+        // The data each way in segments of [`SND_MSS`], however the guest
+        // split its writes and reads.
+        let segments_out = segments(carried.sent);
+        let segments_in = segments(carried.received);
         Self {
             state,
             retransmits: 0,
@@ -244,22 +246,18 @@ impl TcpInfo {
             bytes_received: carried.received + u64::from(carried.fin_received),
             // The handshake's segments, then an acknowledgement for each
             // segment of data.
-            segs_out: if carried.accepted { 0 } else { 2 }
-                + carried.segments_out
-                + carried.segments_in,
-            segs_in: if carried.accepted { 2 } else { 1 }
-                + carried.segments_in
-                + carried.segments_out,
+            segs_out: if carried.accepted { 0 } else { 2 } + segments_out + segments_in,
+            segs_in: if carried.accepted { 2 } else { 1 } + segments_in + segments_out,
             notsent_bytes: u32::try_from(carried.unsent).unwrap_or(u32::MAX),
             min_rtt: RTT,
-            data_segs_in: carried.segments_in,
-            data_segs_out: carried.segments_out,
-            delivery_rate: if carried.segments_out > 0 {
+            data_segs_in: segments_in,
+            data_segs_out: segments_out,
+            delivery_rate: if segments_out > 0 {
                 carried.sent.min(u64::from(SND_MSS)) * 1_000_000 / u64::from(RTT)
             } else {
                 0
             },
-            delivered: 1 + carried.segments_out + u32::from(carried.fin_sent),
+            delivered: 1 + segments_out + u32::from(carried.fin_sent),
             bytes_sent: carried.sent,
             snd_wnd: WINDOW,
             rcv_wnd: WINDOW,
@@ -370,6 +368,10 @@ impl TcpInfo {
     }
 }
 
+/// The segments `bytes` take, of [`SND_MSS`] each.
+fn segments(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(u64::from(SND_MSS))).unwrap_or(u32::MAX)
+}
 /// The window scale a receive space of `space` bytes takes
 /// (`tcp_select_initial_window`).
 pub(crate) fn wscale(space: u32) -> u8 {
@@ -430,8 +432,6 @@ mod tests {
         let carried = Carried {
             sent: 100,
             received: 70_000,
-            segments_out: 1,
-            segments_in: 3,
             rcv_wscale: 10,
             ..Carried::default()
         };
@@ -457,6 +457,27 @@ mod tests {
             u64::from_le_bytes(raw[128..136].try_into().unwrap()),
             70_001
         );
+    }
+
+    #[test]
+    fn segments_follow_the_bytes_however_they_were_read() {
+        let carried = Carried {
+            received: 40_000,
+            ..Carried::default()
+        };
+        let raw = TcpInfo::connected(1, &carried, 0).bytes();
+        assert_eq!(word(&raw, 152), 2);
+        let raw = TcpInfo::connected(
+            1,
+            &Carried {
+                received: 100_000,
+                sent: 1,
+                ..carried
+            },
+            0,
+        )
+        .bytes();
+        assert_eq!([152, 156].map(|at| word(&raw, at)), [4, 1]);
     }
 
     #[test]

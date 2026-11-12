@@ -134,7 +134,8 @@ verified.
     tunes takes the values of a loopback connection in the simplest case:
     the round trip (30 µs) and the timeout, rates and pacing it gives, the
     send and receive MSS and windows, which never grow, and segment counts
-    of one per 32 KiB written or read, one acknowledgement for each; times
+    of the bytes sent and received in 32 KiB segments, one acknowledgement
+    for each; the window scale its handshake offered stays; times
     since data came count from its read. Beyond a handshake's tries nothing
     is retransmitted or lost, so those counts are 0; the peer's window scale is taken as Linux's
     default, whatever buffer it set; and a connection the host made is

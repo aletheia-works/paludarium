@@ -662,17 +662,25 @@ struct Counts {
     /// The bytes the guest wrote and read.
     written: u64,
     read: u64,
-    /// Segments of data, one per [`tcp_info::SND_MSS`] of each write and
-    /// each read.
-    segments_out: u32,
-    segments_in: u32,
     /// When the guest last wrote and read bytes.
     wrote: Option<u64>,
     came: Option<u64>,
+    /// The receive window scale its handshake offered, which stays
+    /// (`tcp_select_initial_window`).
+    rcv_wscale: u8,
 }
 impl Counts {
-    fn segments(n: usize) -> u32 {
-        u32::try_from(n.div_ceil(tcp_info::SND_MSS as usize)).unwrap_or(u32::MAX)
+    /// A connection that begins at `opened` with `options`.
+    fn new(opened: Option<u64>, options: &Options) -> Self {
+        Self {
+            opened,
+            rcv_wscale: tcp_info::receive_wscale(
+                options
+                    .receive_buffer_set
+                    .then_some(options.receive_buffer as u32),
+            ),
+            ..Self::default()
+        }
     }
 }
 
@@ -1165,7 +1173,6 @@ impl InetSocket {
                 s.eof_read |= n == 0 && ends && stream.readiness().read_closed;
                 if n > 0 && !peek {
                     s.counts.read += n as u64;
-                    s.counts.segments_in += Counts::segments(n);
                     s.counts.came = self.now();
                 }
                 Ok(Received {
@@ -1226,7 +1233,6 @@ impl InetSocket {
             && n > 0
         {
             s.counts.written += n as u64;
-            s.counts.segments_out += Counts::segments(n);
             s.counts.wrote = self.now();
         }
         if let (Ok(n), Some((link, side))) = (&written, Self::joined(&s)) {
@@ -1320,10 +1326,7 @@ impl InetSocket {
                     s.noted = false;
                     s.read_shut = false;
                     s.eof_read = false;
-                    s.counts = Counts {
-                        opened: self.now(),
-                        ..Counts::default()
-                    };
+                    s.counts = Counts::new(self.now(), &options);
                     s.connection = Connection::Connecting;
                     // The stub's own stream is open at once.
                     if address.port() == DNS && !loopback {
@@ -2063,7 +2066,7 @@ impl InetSocket {
         s.link = Some((own_link, 1));
         s.bound = Some(to);
         s.port_locked = locked;
-        s.counts.opened = child.now();
+        s.counts = Counts::new(child.now(), &options);
         drop(s);
         child
     }
@@ -2562,7 +2565,7 @@ impl InetSocket {
             port_locked: s.port_locked,
             received: received as u32,
             drops: s.listen.as_ref().map_or(0, |listen| listen.drops),
-            tcp: (!self.datagram).then(|| self.tcp_info(&s, &options, now)),
+            tcp: (!self.datagram).then(|| self.tcp_info(&s, now)),
             receive_buffer: options.receive_buffer as u32,
             send_buffer: options.send_buffer as u32,
         };
@@ -2720,7 +2723,7 @@ impl InetSocket {
     /// What `tcp_get_info` tells of this socket at `now`, on the host's
     /// monotonic clock: a listener's queue, a handshake's tries, or what
     /// its connection has carried (see [`tcp_info`]).
-    fn tcp_info(&self, s: &State, options: &Options, now: Option<u64>) -> TcpInfo {
+    fn tcp_info(&self, s: &State, now: Option<u64>) -> TcpInfo {
         let uptime = now.unwrap_or(0) / 1_000_000;
         let since = |at: Option<u64>| match (now, at) {
             (Some(now), Some(at)) => {
@@ -2768,16 +2771,9 @@ impl InetSocket {
             received: counts.read + unread as u64,
             fin_received: open && ready.read_closed,
             unsent,
-            segments_out: counts.segments_out,
-            // What has come counts, read or not.
-            segments_in: counts.segments_in + Counts::segments(unread),
             since_sent: since(counts.wrote.or(counts.opened)),
             since_received: since(counts.came.or(counts.opened)),
-            rcv_wscale: tcp_info::receive_wscale(
-                options
-                    .receive_buffer_set
-                    .then_some(options.receive_buffer as u32),
-            ),
+            rcv_wscale: counts.rcv_wscale,
         };
         let in_flight = u32::from(matches!(state, TCP_FIN_WAIT1 | TCP_LAST_ACK));
         TcpInfo::connected(state, &carried, in_flight)
@@ -3416,7 +3412,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
         }
         (6, 11) => {
             let s = socket.lock();
-            socket.tcp_info(&s, &options, socket.now()).bytes().to_vec()
+            socket.tcp_info(&s, socket.now()).bytes().to_vec()
         }
         (1, 13) => {
             let mut linger = [0; 8];

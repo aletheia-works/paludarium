@@ -957,6 +957,10 @@ int main(int argc, char **argv) {
         }
         tcp_info("client-shut", c, 0x7f, connection);
         tcp_info("server-ended", s, 0x7f, connection);
+        /* The window scale the handshake offered stays. */
+        int tiny = 2304;
+        setsockopt(c, SOL_SOCKET, SO_RCVBUF, &tiny, sizeof tiny);
+        tcp_info("client-rcvbuf-after", c, 0x40, (const int[]){0});
         close(s);
         close(c);
         /* A shorter room takes that much, a negative one is EINVAL; UDP has

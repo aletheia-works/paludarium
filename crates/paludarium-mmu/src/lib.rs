@@ -2925,7 +2925,11 @@ impl AddressSpaceData {
         let backing = self.backing_at(old).cloned();
         let pages = self.take_pages(old, old + old_len, keep_old && shared.is_some());
         if !keep_old && old_len > 0 {
-            let _ = self.unmap(GuestAddr(old), old_len);
+            // `remap` moves pages of one VMA only, whose mapping at `old` it
+            // found not sealed, and sealed mappings make VMAs of their own:
+            // nothing here is sealed, so the unmap cannot fail.
+            let unmapped = self.unmap(GuestAddr(old), old_len);
+            debug_assert!(unmapped.is_ok(), "{unmapped:?}");
         }
         if let Some(backing) = backing {
             self.backing.insert(
@@ -4793,6 +4797,38 @@ mod tests {
         // A fork keeps the seal.
         let child = space.fork();
         assert!(child.mappings().all(|m| m.sealed));
+    }
+
+    #[test]
+    fn mremap_of_a_range_whose_later_page_is_sealed_moves_nothing() {
+        let space = space_with(0x50000, 2 * PAGE_SIZE, Prot::READ_WRITE);
+        let at = |n: u64| GuestAddr(0x50000 + n * PAGE_SIZE);
+        space.write_u64(at(0), 1).unwrap();
+        space.write_u64(at(1), 2).unwrap();
+        space.seal_shared(at(1), PAGE_SIZE).unwrap();
+        let before: Vec<_> = space.mappings().collect();
+        let how = |fixed: bool, to: u64| Remap {
+            may_move: true,
+            fixed,
+            keep_old: false,
+            new_addr: GuestAddr(to),
+        };
+        // The sealed page is a VMA of its own, so the range runs past the
+        // first one (EFAULT, as Linux's `vma_lookup` finds the first).
+        assert_eq!(
+            space.remap_shared(at(0), 2 * PAGE_SIZE, 4 * PAGE_SIZE, how(false, 0)),
+            Err(Errno::EFAULT)
+        );
+        // A shrink that moves cannot unmap the sealed tail (EPERM).
+        assert_eq!(
+            space.remap_shared(at(0), 2 * PAGE_SIZE, PAGE_SIZE, how(true, 0x80000)),
+            Err(Errno::EPERM)
+        );
+        // Nothing moved, and nothing was emptied.
+        let after: Vec<_> = space.mappings().filter(|m| m.start.0 < 0x60000).collect();
+        assert_eq!(after, before);
+        assert_eq!(space.read_u64(at(0)).unwrap(), 1);
+        assert_eq!(space.read_u64(at(1)).unwrap(), 2);
     }
 
     #[test]

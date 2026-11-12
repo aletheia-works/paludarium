@@ -303,10 +303,14 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
     } else {
         F_SEAL_SEAL
     };
+    let inode = crate::files::anonymous_inode();
+    // No name links it: its watches hear `IN_DELETE_SELF` once nothing
+    // holds it, as the inode's eviction tells them.
+    c.files.caches.notify.unlinked_from_start((DEVICE, inode));
     let memfd = Arc::new(Memfd {
         file,
         fs,
-        inode: crate::files::anonymous_inode(),
+        inode,
         seals: Arc::new(AtomicU32::new(seals)),
         sealing: Arc::default(),
         name: name.into(),

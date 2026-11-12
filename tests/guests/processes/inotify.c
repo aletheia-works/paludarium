@@ -1067,6 +1067,200 @@ static int case_instance(void) {
     return 0;
 }
 
+/* Reads that meet memory the process cannot write: each record is copied
+ * out as it is taken, so the one that meets such a page is taken too and
+ * the read is EFAULT, whatever came before; an address no process has
+ * takes nothing. readv reads each buffer in turn and stops at one it does
+ * not fill. */
+static void show_record(const char *label, const char *p) {
+    const struct inotify_event *ev = (const struct inotify_event *)p;
+    printf("%s: [%d %#x %s len=%u]\n", label, ev->wd, ev->mask, ev->len ? ev->name : "", ev->len);
+}
+static int case_read(void) {
+    make_base("read");
+    int fd = inotify_init1(IN_NONBLOCK);
+    printf("wd=%d\n", inotify_add_watch(fd, base, IN_CREATE));
+    char *pages = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED) return 92;
+    printf("mprotect=%ld\n", e(mprotect(pages + 4096, 4096, PROT_READ)));
+    munmap(pages + 2 * 4096, 4096);
+    /* Each record here is 16 bytes and a 16-byte name. */
+    touch(at("a"));
+    touch(at("b"));
+    touch(at("c"));
+    char *edge = pages + 4096 - 40;
+    printf("partial=%ld\n", e(read(fd, edge, 96)));
+    show_record("before", edge);
+    drain(fd, "after-partial");
+    touch(at("d"));
+    touch(at("e"));
+    printf("read-only=%ld\n", e(read(fd, pages + 4096, 64)));
+    drain(fd, "after-read-only");
+    touch(at("f"));
+    touch(at("g"));
+    printf("unmapped=%ld\n", e(read(fd, pages + 2 * 4096, 64)));
+    drain(fd, "after-unmapped");
+    touch(at("h"));
+    printf("kernel=%ld\n", e(read(fd, (void *)-4096L, 64)));
+    printf("none=%ld\n", e(read(fd, pages, 0)));
+    drain(fd, "after-kernel");
+    touch(at("i"));
+    touch(at("j"));
+    touch(at("k"));
+    struct iovec iov[3] = {{pages, 32}, {pages + 64, 40}, {pages + 128, 64}};
+    printf("readv=%ld\n", e(readv(fd, iov, 3)));
+    show_record("first", pages);
+    show_record("second", pages + 64);
+    drain(fd, "after-readv");
+    touch(at("l"));
+    touch(at("m"));
+    struct iovec faulting[2] = {{pages, 32}, {pages + 4096, 64}};
+    printf("readv-fault=%ld\n", e(readv(fd, faulting, 2)));
+    show_record("kept", pages);
+    drain(fd, "after-readv-fault");
+    touch(at("n"));
+    struct iovec empty[2] = {{pages, 0}, {pages + 64, 0}};
+    printf("readv-empty=%ld\n", e(readv(fd, empty, 2)));
+    printf("preadv2 hipri=%ld\n", e(preadv2(fd, iov, 1, -1, RWF_HIPRI)));
+    touch(at("o"));
+    printf("preadv2 dsync=%ld\n", e(preadv2(fd, iov, 1, -1, RWF_DSYNC)));
+    drain(fd, "after-preadv2");
+    close(fd);
+    remove_all();
+    return 0;
+}
+
+/* A FIFO opened by its path is at its dentry as a file is: renames move
+ * its events, and an open through /proc/self/fd, with no name left, opens
+ * its pipe again (IN_OPEN) at the same dentry, which keeps the FIFO until
+ * the last of them closes. */
+static int case_fifo_moved(void) {
+    make_base("fifo-moved");
+    char *one = at("one");
+    char *two = at("two");
+    printf("mkdir=%ld %ld\n", e(mkdir(one, 0755)), e(mkdir(two, 0755)));
+    char *p = at("one/p");
+    char *q = at("two/q");
+    char *r = at("one/r");
+    printf("mkfifo=%ld %ld\n", e(mkfifo(p, 0644)), e(mkfifo(r, 0644)));
+    int fd = inotify_init1(IN_NONBLOCK);
+    int w1 = inotify_add_watch(fd, one, WATCHED);
+    int w2 = inotify_add_watch(fd, two, WATCHED);
+    int own = inotify_add_watch(fd, r, WATCHED);
+    printf("wd=%d %d %d\n", w1, w2, own);
+    int moved = open(p, O_RDWR | O_NONBLOCK);
+    printf("rename=%ld\n", e(rename(p, q)));
+    drain(fd, "renamed");
+    close(moved);
+    drain(fd, "closed");
+    int first = open(r, O_RDWR | O_NONBLOCK);
+    printf("unlink=%ld\n", e(unlink(r)));
+    drain(fd, "unlinked");
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", first);
+    int again = open(link, O_RDONLY | O_NONBLOCK);
+    printf("again=%s\n", again >= 0 ? "open" : strerror(errno));
+    drain(fd, "again");
+    char got = 0;
+    printf("write=%ld read=%ld byte=%c\n", (long)write(first, "x", 1), e(read(again, &got, 1)), got);
+    drain(fd, "used");
+    close(first);
+    drain(fd, "first-closed");
+    close(again);
+    drain(fd, "last-closed");
+    close(fd);
+    remove_all();
+    return 0;
+}
+
+/* The order of exec's closes: a program that runs with an ELF interpreter
+ * and then execs a script; an exec whose interpreter is no ELF file; and
+ * files only a descriptor holds, a memfd and a removed copy, run through
+ * execveat. */
+static void exec_child(const char *prog, char *const argv[]) {
+    pid_t child = fork();
+    if (child == 0) {
+        if (chdir(base)) _exit(96);
+        execv(prog, argv);
+        _exit(errno == ELIBBAD ? 80 : errno == ENOEXEC ? 81 : errno == ENOENT ? 82 : 83);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("%s exited=%d\n", strrchr(prog, '/') + 1, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+static void execveat_child(int file, const char *label) {
+    pid_t child = fork();
+    if (child == 0) {
+        char *const argv[] = {"fd-prog", "inotify-quiet", NULL};
+        char *const envp[] = {NULL};
+        syscall(SYS_execveat, file, "", argv, envp, AT_EMPTY_PATH);
+        _exit(83);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("%s exited=%d\n", label, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+static int case_exec_order(void) {
+    make_base("exec-order");
+    if (mkdir(at("bad"), 0755)) return 92;
+    char self[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", self, sizeof self - 32);
+    if (len <= 0) return 95;
+    self[len] = 0;
+    printf("copied=%d", copy_file(self, at("prog")));
+    strcpy(strrchr(self, '/') + 1, "inotify-interp");
+    printf(" %d", copy_file(self, at("dyn")));
+    printf(" %d", copy_file("/lib/ld-musl-x86_64.so.1", at("inotify-ld.so")));
+    printf(" %d\n", copy_file(self, at("bad/dyn")));
+    char line[160];
+    snprintf(line, sizeof line, "#!%s inotify-quiet\n", at("prog"));
+    printf("written=%d", write_file(at("s"), line, 0755));
+    printf(" %d\n", write_file(at("bad/inotify-ld.so"), "junk", 0755));
+    int fd = inotify_init1(IN_NONBLOCK);
+    printf("wd=%d\n", inotify_add_watch(fd, base, WATCHED));
+    char *then[] = {at("dyn"), "inotify-then", at("s"), NULL};
+    exec_child(at("dyn"), then);
+    drain(fd, "then");
+    printf("wd=%d\n", inotify_add_watch(fd, at("bad"), WATCHED));
+    if (chdir(at("bad"))) return 96;
+    char *bad[] = {"dyn", "inotify-quiet", NULL};
+    pid_t child = fork();
+    if (child == 0) {
+        execv("dyn", bad);
+        _exit(errno == ELIBBAD ? 80 : errno == ENOEXEC ? 81 : errno == ENOENT ? 82 : 83);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("bad exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    drain(fd, "bad");
+    if (chdir("/")) return 96;
+    int memfd = memfd_create("prog", 0);
+    int from = open(at("prog"), O_RDONLY);
+    struct stat st;
+    fstat(from, &st);
+    off_t off = 0;
+    printf("memfd copied=%d\n", sendfile(memfd, from, &off, st.st_size) == st.st_size);
+    close(from);
+    snprintf(line, sizeof line, "/proc/self/fd/%d", memfd);
+    int mw = inotify_add_watch(fd, line, WATCHED);
+    printf("memfd wd=%d\n", mw);
+    drain(fd, "memfd-copied");
+    execveat_child(memfd, "memfd");
+    drain(fd, "memfd");
+    close(memfd);
+    drain(fd, "memfd-closed");
+    int removed = open(at("prog"), O_RDONLY);
+    printf("unlink=%ld\n", e(unlink(at("prog"))));
+    drain(fd, "unlinked");
+    execveat_child(removed, "removed");
+    drain(fd, "removed");
+    close(removed);
+    drain(fd, "removed-closed");
+    close(fd);
+    remove_all();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1086,7 +1280,16 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-fifo")) return case_fifo();
     if (!strcmp(mode, "inotify-exec")) return case_exec();
     if (!strcmp(mode, "inotify-instance")) return case_instance();
+    if (!strcmp(mode, "inotify-read")) return case_read();
+    if (!strcmp(mode, "inotify-fifo-moved")) return case_fifo_moved();
+    if (!strcmp(mode, "inotify-exec-order")) return case_exec_order();
     if (!strcmp(mode, "inotify-runner")) return case_runner();
+    /* What case_exec_order's dynamic program does: runs argv[2]. */
+    if (!strcmp(mode, "inotify-then") && argc > 2) {
+        char *const next[] = {argv[2], "inotify-quiet", NULL};
+        execv(argv[2], next);
+        return 84;
+    }
     /* What case_exec runs: nothing. */
     if (!strcmp(mode, "inotify-quiet")) return 0;
     return 2;

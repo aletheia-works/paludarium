@@ -170,6 +170,7 @@ impl Execution {
             let next = kernel.handle(thread, memory, reason);
             if let Some(replacement) = kernel.take_exec_memory() {
                 *memory = replacement;
+                kernel.exec_finished();
                 decode = DecodeCache::new();
             }
             if let Some((mut child, mut child_thread)) = kernel.take_child() {

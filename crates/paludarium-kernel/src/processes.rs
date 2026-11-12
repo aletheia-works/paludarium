@@ -1923,6 +1923,12 @@ impl Kernel {
     pub fn take_exec_memory(&mut self) -> Option<Arc<AddressSpace>> {
         self.exec_memory.take()
     }
+    /// Ends an exec once the caller let go of the image it replaced: the
+    /// scripts it ran close after that image's files, as the `fput`s Linux
+    /// defers run newest first, the old `mm`'s after the scripts'.
+    pub fn exec_finished(&mut self) {
+        drop(self.exec_closes.take());
+    }
     pub fn complete_process(&self, status: ExitStatus) {
         self.processes.finish(self.process.pid, status);
         if self.group.active_threads() == 0 {
@@ -2910,6 +2916,7 @@ impl Kernel {
             pending_child: None,
             spawn_memory: child_mem,
             exec_memory: None,
+            exec_closes: None,
             vfork_release: release.clone(),
             vfork_wait: None,
             unimplemented: self.unimplemented.clone(),
@@ -3508,6 +3515,14 @@ impl Kernel {
                     Some(path) => crate::page_cache::mount_device(&self.files.fs.mounts(), path),
                     None => crate::memfd::DEVICE,
                 };
+                // `do_open_execat` opens the descriptor's file again.
+                opens.0.push(crate::inotify::Closing::of_handle(
+                    &self.files.caches,
+                    &self.files.fs,
+                    &file,
+                    device,
+                    &stat,
+                ));
                 let denied = self.files.caches.deny_write_access((device, stat.inode))?;
                 (
                     (Vec::new(), Vec::new(), entry),
@@ -3525,6 +3540,9 @@ impl Kernel {
             Some((file, name, denied)) => {
                 let mut head = [0; SCRIPT_HEAD];
                 read_from(&*file, &mut head)?;
+                if let Some(Some(opened)) = opens.0.last() {
+                    opened.read();
+                }
                 match script_interpreter(&head)? {
                     // Only an ELF program is read whole, and no more of it
                     // than the memory limit could hold (ENOMEM), as a file
@@ -3591,7 +3609,9 @@ impl Kernel {
                             None,
                             exe,
                         );
-                        drop(opens);
+                        if done.is_ok() {
+                            self.exec_closes = Some(opens);
+                        }
                         return done;
                     }
                 }
@@ -3599,7 +3619,12 @@ impl Kernel {
             None => None,
         };
         let (loaded, program, image, exe) = match image {
-            Some((bytes, name, denied)) => (Vec::new(), program, Some((bytes, name)), Some(denied)),
+            Some((bytes, name, denied)) => (
+                Vec::new(),
+                program,
+                Some((bytes, name)),
+                Some(denied.closing(opens.0.pop().flatten())),
+            ),
             None => {
                 let (loaded, program) = follow_scripts(
                     &self.files,
@@ -3629,8 +3654,10 @@ impl Kernel {
         );
         drop(opened);
         // The scripts' opens close at the end of exec, as the `fput`s
-        // `exec_binprm` defers.
-        drop(opens);
+        // `exec_binprm` defers, once the old image has gone.
+        if done.is_ok() {
+            self.exec_closes = Some(opens);
+        }
         done
     }
     /// The rest of exec, once the program is known: `raw` is its name,
@@ -3648,7 +3675,7 @@ impl Kernel {
         mut readable: bool,
         (argv, envp): (Vec<Vec<u8>>, Vec<Vec<u8>>),
         held: Option<(Vec<u8>, Vec<u8>)>,
-        exe: Option<crate::page_cache::WriteAccess>,
+        program_file: Option<crate::page_cache::WriteAccess>,
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let mut random = [0; 16];
         self.host
@@ -3675,6 +3702,13 @@ impl Kernel {
         let mut memory = match mem.memory_meter() {
             Some(meter) => AddressSpace::new().with_memory_meter(meter),
             None => AddressSpace::new(),
+        };
+        // An exec that fails from here closes the program before the
+        // interpreter it opened: `free_bprm`'s `fput` comes after
+        // `load_elf_binary`'s, and runs first.
+        let mut failing = FailingExec {
+            exe: program_file,
+            interpreters: Vec::new(),
         };
         // A 64-bit program drops READ_IMPLIES_EXEC (x86's
         // set_personality_64bit), and a set-ID one PER_CLEAR_ON_SETID too
@@ -3716,6 +3750,8 @@ impl Kernel {
             readable &= may_read;
             // Its mappings keep the open, which closes with the last of them
             // (`vm_file`), before they let go of the file.
+            let closing = Arc::new(Mutex::new(closing));
+            failing.interpreters.push(Arc::clone(&closing));
             let keep: paludarium_loader::Keep =
                 Arc::new((closing, self.files.interpreter_keep(&path)));
             Ok((path, Some(keep)))
@@ -3804,7 +3840,10 @@ impl Kernel {
             Some((_, name)) => name,
             None => crate::files::resolved(&self.files, &loaded).unwrap_or(loaded),
         });
-        self.group.set_exe_file(exe.map(Arc::new));
+        // The exec is done: the program and the interpreter close as the
+        // process and the mappings end.
+        failing.interpreters.clear();
+        self.group.set_exe_file(failing.exe.take().map(Arc::new));
         let ignored = thread
             .state
             .signal_actions
@@ -4025,6 +4064,25 @@ impl Drop for ExecOpens {
         while self.0.pop().is_some() {}
     }
 }
+/// What an exec that fails once its program is known closes: the program
+/// first, then the ELF interpreter it opened, whoever still holds that.
+struct FailingExec {
+    exe: Option<crate::page_cache::WriteAccess>,
+    interpreters: Vec<Arc<Mutex<Option<crate::inotify::Closing>>>>,
+}
+impl Drop for FailingExec {
+    fn drop(&mut self) {
+        drop(self.exe.take());
+        for interpreter in &self.interpreters {
+            drop(
+                interpreter
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(),
+            );
+        }
+    }
+}
 /// Tells inotify of exec's open of the file at `path` (`IN_OPEN`), and gives
 /// what tells it of the file's read and its close: none for a file that
 /// cannot be looked at, or when the open is not the guest's (`report`).
@@ -4040,7 +4098,7 @@ fn exec_opened(
     let node = files.fs.metadata(&path, false).ok()?;
     let device = crate::page_cache::mount_device(&files.fs.mounts(), &path);
     Some(crate::inotify::Closing::open(
-        &files.caches.notify,
+        &files.caches,
         &files.fs,
         &path,
         device,

@@ -11,7 +11,7 @@
 //! While no watch exists, a change costs one atomic load.
 use crate::events::{CLOEXEC, IN, NONBLOCK, ReadinessHub};
 use crate::fasync::{FileOwner, Notice, Reason, Registration};
-use crate::page_cache::Key;
+use crate::page_cache::{Key, PageCaches, Place};
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat, HostFs};
 use paludarium_types::{Errno, GuestAddr};
@@ -140,11 +140,16 @@ pub(crate) fn unnoticed<T>(f: impl FnOnce() -> T) -> T {
 /// opened, and hear `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`
 /// (`fsnotify_close`) when the last reference goes, which drops this: the
 /// FIFO's description's last descriptor, the program's process, the
-/// interpreter's mapping. They go to the name it was opened at.
+/// interpreter's mapping. They go to where its dentry is, its [`Place`],
+/// which renames move as a description's.
 pub(crate) struct Closing {
-    notify: Arc<Notifier>,
+    caches: Arc<PageCaches>,
     fs: Arc<dyn FileSystem>,
-    path: Vec<u8>,
+    place: Arc<Mutex<Place>>,
+    /// For a file exec runs from a descriptor (a memfd, a removed file):
+    /// its handle, which tells its events where its own dentry is, or with
+    /// no place when it has none.
+    file: Option<Arc<dyn FileHandle>>,
     device: u64,
     node: FileStat,
     writing: bool,
@@ -154,7 +159,7 @@ impl Closing {
     /// with `flags`, and gives what tells them of its close: none for an
     /// open the kernel makes on its own account.
     pub(crate) fn opened(
-        notify: &Arc<Notifier>,
+        caches: &Arc<PageCaches>,
         fs: &Arc<dyn FileSystem>,
         path: &[u8],
         device: u64,
@@ -164,27 +169,93 @@ impl Closing {
         if !reported_open() {
             return None;
         }
-        Some(Self::open(notify, fs, path, device, node, flags))
+        Some(Self::open(caches, fs, path, device, node, flags))
     }
     /// [`opened`](Self::opened), for an open known to be the guest's.
     pub(crate) fn open(
-        notify: &Arc<Notifier>,
+        caches: &Arc<PageCaches>,
         fs: &Arc<dyn FileSystem>,
         path: &[u8],
         device: u64,
         node: &FileStat,
         flags: u32,
     ) -> Self {
-        let closing = Self {
-            notify: Arc::clone(notify),
+        let place = caches.keep_place((device, node.inode), path);
+        Self::open_at(caches, fs, place, device, node, flags)
+    }
+    /// Another open of this file's dentry, as through `/proc/self/fd`, with
+    /// `flags`: none for an open the kernel makes on its own account.
+    pub(crate) fn again(&self, caches: &Arc<PageCaches>, flags: u32) -> Option<Self> {
+        if !reported_open() {
+            return None;
+        }
+        let mut node = self.node;
+        if let Ok(now) = self.fs.metadata(&Place::at(&self.place).0, false)
+            && now.inode == node.inode
+        {
+            node = now;
+        }
+        Some(Self::open_at(
+            caches,
+            &self.fs,
+            Arc::clone(&self.place),
+            self.device,
+            &node,
+            flags,
+        ))
+    }
+    /// Tells the watches of exec's open of `file`, which only a descriptor
+    /// holds, on `device` with the status `node` (`do_open_execat` of the
+    /// descriptor's dentry), and gives what tells them of its close: none
+    /// for an open the kernel makes on its own account.
+    pub(crate) fn of_handle(
+        caches: &Arc<PageCaches>,
+        fs: &Arc<dyn FileSystem>,
+        file: &Arc<dyn FileHandle>,
+        device: u64,
+        node: &FileStat,
+    ) -> Option<Self> {
+        if !reported_open() {
+            return None;
+        }
+        let mut closing = Self::unopened(caches, fs, Arc::default(), device, node, 0);
+        closing.file = Some(Arc::clone(file));
+        closing.tell(OPEN);
+        Some(closing)
+    }
+    /// The device of the file's node.
+    pub(crate) fn device(&self) -> u64 {
+        self.device
+    }
+    fn open_at(
+        caches: &Arc<PageCaches>,
+        fs: &Arc<dyn FileSystem>,
+        place: Arc<Mutex<Place>>,
+        device: u64,
+        node: &FileStat,
+        flags: u32,
+    ) -> Self {
+        let closing = Self::unopened(caches, fs, place, device, node, flags);
+        closing.tell(OPEN);
+        closing
+    }
+    fn unopened(
+        caches: &Arc<PageCaches>,
+        fs: &Arc<dyn FileSystem>,
+        place: Arc<Mutex<Place>>,
+        device: u64,
+        node: &FileStat,
+        flags: u32,
+    ) -> Self {
+        Self {
+            caches: Arc::clone(caches),
             fs: Arc::clone(fs),
-            path: path.to_vec(),
+            place,
+            file: None,
             device,
             node: *node,
             writing: flags & 3 != 0,
-        };
-        closing.tell(OPEN);
-        closing
+        }
     }
     /// Tells the watches of exec's read of the file's first bytes
     /// (`kernel_read`'s `IN_ACCESS`), which an empty file has none of.
@@ -194,22 +265,25 @@ impl Closing {
         }
     }
     fn tell(&self, mask: u32) {
-        if !self.notify.watching() {
+        let notify = &self.caches.notify;
+        if !notify.watching() {
             return;
         }
+        if let Some(file) = &self.file {
+            if !file.notify_event(mask) {
+                notify.file_event(None, self.device, &self.node, mask);
+            }
+            return;
+        }
+        let (path, unlinked) = Place::at(&self.place);
         // The links the node has now: none once its name is gone, or names
         // another file.
         let mut node = self.node;
-        node.links = match self.fs.metadata(&self.path, false) {
-            Ok(now) if now.inode == node.inode => now.links,
+        node.links = match self.fs.metadata(&path, false) {
+            Ok(now) if now.inode == node.inode && !unlinked => now.links,
             _ => 0,
         };
-        self.notify.file_event(
-            Some((&*self.fs, &self.path, false)),
-            self.device,
-            &node,
-            mask,
-        );
+        notify.file_event(Some((&*self.fs, &path, unlinked)), self.device, &node, mask);
     }
 }
 impl Drop for Closing {
@@ -219,6 +293,13 @@ impl Drop for Closing {
         } else {
             CLOSE_NOWRITE
         });
+        // `__fput` then lets go of the dentry: a removed file the last of
+        // its opens held ends now.
+        drop(std::mem::take(&mut self.place));
+        let key = (self.device, self.node.inode);
+        if self.caches.notify.waiting() && !self.caches.held(key) {
+            self.caches.notify.last_closed(key);
+        }
     }
 }
 
@@ -409,6 +490,14 @@ impl Notifier {
         for instance in self.instances() {
             instance.report(key, DELETE_SELF, b"", 0, false);
             instance.forget(key);
+        }
+    }
+    /// A file no name ever linked (a memfd), which ends, as a removed one
+    /// does, at its last close.
+    pub(crate) fn unlinked_from_start(&self, key: Key) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if pending.insert(key) {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
         }
     }
     /// Whether a removed file waits for its last close.
@@ -1039,7 +1128,8 @@ fn rm_watch(c: &mut Context<'_>, fd: u64, wd: i32) -> Result<u64, Errno> {
     of(&file).ok_or(Errno::EINVAL)?.unwatch(wd).map(|()| 0)
 }
 
-/// A read of an instance; `None` for any other file.
+/// A read of an instance into a kernel buffer, as an asynchronous read
+/// takes it; `None` for any other file.
 pub(crate) fn read(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -1047,43 +1137,101 @@ pub(crate) fn read(
     nowait: bool,
 ) -> Option<Result<usize, Errno>> {
     let instance = of(file)?;
-    Some(read_events(c, instance, out, nowait))
+    let mut records = Vec::new();
+    let result = read_events(c, instance, &mut records, out.len(), usize::MAX, nowait);
+    out[..records.len()].copy_from_slice(&records);
+    Some(result)
 }
 
-/// Linux's `inotify_read`: as many whole records as fit, waiting for the
-/// first unless the file is non-blocking; EINVAL when the first does not
-/// fit, and a pending signal ends the wait (ERESTARTSYS).
+/// `read(2)` of an instance, or one buffer of a `readv(2)`, into the
+/// guest's `len` bytes at `at`, which `access_ok` has passed, as Linux's
+/// `inotify_read` copies each record out as it takes it: the record that
+/// meets a page the guest cannot write is taken off the queue too, its bytes
+/// up to that page written, and the read is `EFAULT`, whatever came before.
+pub(crate) fn read_guest(
+    c: &mut Context<'_>,
+    instance: &Instance,
+    at: u64,
+    len: usize,
+) -> Result<usize, Errno> {
+    let writable = writable(c, at, len);
+    let mut records = Vec::new();
+    let result = read_events(c, instance, &mut records, len, writable, false);
+    let shown = records.len().min(writable);
+    c.mem
+        .write(GuestAddr(at), &records[..shown])
+        .map_err(|_| Errno::EFAULT)?;
+    result
+}
+
+/// How many of the `len` bytes at `at` the guest can write, from the start.
+fn writable(c: &Context<'_>, at: u64, len: usize) -> usize {
+    let fits = |n: usize| n == 0 || c.mem.check_write(GuestAddr(at), n).is_ok();
+    if fits(len) {
+        return len;
+    }
+    // Whole pages: the first that cannot be written ends the prefix.
+    let first = (4096 - (at % 4096) as usize).min(len);
+    if !fits(first) {
+        return 0;
+    }
+    let (mut good, mut bad) = (0usize, (len - first).div_ceil(4096));
+    while bad - good > 1 {
+        let mid = (good + bad) / 2;
+        if fits(first + mid * 4096) {
+            good = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    first + good * 4096
+}
+
+/// Linux's `inotify_read`: as many whole records as fit `len` bytes,
+/// waiting for the first unless the file is non-blocking; EINVAL when the
+/// first does not fit, and a pending signal ends the wait (ERESTARTSYS). A
+/// record that reaches past the first `writable` bytes is the last taken,
+/// and the read is then `EFAULT`.
 fn read_events(
     c: &mut Context<'_>,
     instance: &Instance,
-    out: &mut [u8],
+    out: &mut Vec<u8>,
+    len: usize,
+    writable: usize,
     nowait: bool,
 ) -> Result<usize, Errno> {
     loop {
         let ticket = c.files.readiness.token.value();
         let mut queue = instance.queue();
-        let mut at = 0;
         let mut short = false;
-        while let Some(len) = queue.events.front().map(Event::len) {
-            if len > out.len() - at {
+        let mut faulted = false;
+        while let Some(size) = queue.events.front().map(Event::len) {
+            if size > len - out.len() {
                 short = true;
                 break;
             }
             let Some(event) = queue.pop() else {
                 break;
             };
-            let record = &mut out[at..at + len];
-            record.fill(0);
+            let at = out.len();
+            out.resize(at + size, 0);
+            let record = &mut out[at..];
             record[0..4].copy_from_slice(&event.wd.to_le_bytes());
             record[4..8].copy_from_slice(&event.mask.to_le_bytes());
             record[8..12].copy_from_slice(&event.cookie.to_le_bytes());
-            record[12..16].copy_from_slice(&((len - RECORD) as u32).to_le_bytes());
+            record[12..16].copy_from_slice(&((size - RECORD) as u32).to_le_bytes());
             record[RECORD..RECORD + event.name.len()].copy_from_slice(&event.name);
-            at += len;
+            if out.len() > writable {
+                faulted = true;
+                break;
+            }
         }
         drop(queue);
-        if at != 0 {
-            return Ok(at);
+        if faulted {
+            return Err(Errno::EFAULT);
+        }
+        if !out.is_empty() {
+            return Ok(out.len());
         }
         if short {
             return Err(Errno::EINVAL);

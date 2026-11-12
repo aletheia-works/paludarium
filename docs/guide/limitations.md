@@ -349,29 +349,14 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: running a file only a descriptor holds (a memfd,
-  or a removed file, through `execveat`) is no event, where Linux reports
-  its `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`. The ELF interpreter of
-  the program an exec replaces closes after the exec's scripts, where Linux
-  closes it before them, and one opened by an exec that then fails closes
-  before the program, where Linux closes the program first. The events
-  of a FIFO opened by its path go to the name it was opened at, whatever
-  renames it since, and opening one no name links any more again through
-  `/proc/self/fd` shares its description, with no `IN_OPEN`, where Linux
-  opens a new one. A change through a
-  descriptor (`fchmod`, `ftruncate`, a read, a write or a close) follows
-  renames of the file, of the directories above it and onto it, as Linux's
-  dentry does, but the symbolic links of the path it was opened at are
-  resolved only when a rename or a removal first looks at it: a link changed
-  before then sends its events to where the link leads.
-  An instance's `/proc/self/fdinfo` lines end at `ignored_mask:0`, without
-  the file handle Linux adds for a file system that can make one, and
-  `IN_UNMOUNT` is never sent, as nothing is ever unmounted (there is no
-  `umount2`). `/proc/self/fdinfo` has only the lines every descriptor has
-  for the other files: not eventfd's count, an epoll's targets, a signalfd's
-  mask, a timerfd's settings or the record locks. A read into a buffer the guest cannot write is
-  `EFAULT` with the events left queued, where Linux takes the first one off
-  first. Changes the host makes to a mounted directory are not seen.
+- **inotify, in part**: an instance's `/proc/self/fdinfo` lines end at
+  `ignored_mask:0`, without the file handle Linux adds for a file system
+  that can make one, and `IN_UNMOUNT` is never sent, as nothing is ever
+  unmounted (there is no `umount2`). `/proc/self/fdinfo` has only the lines
+  every descriptor has for the other files: not eventfd's count, an
+  epoll's targets, a signalfd's mask, a timerfd's settings or the record
+  locks. Changes the host makes to a mounted directory are not seen, and
+  a descriptor's place does not follow them.
 - **Namespaces**: a user namespace has no `projid_map` and no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the

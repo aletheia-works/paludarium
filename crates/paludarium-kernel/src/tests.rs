@@ -5589,6 +5589,201 @@ mod inotify {
         );
     }
     #[test]
+    fn a_read_that_meets_an_unwritable_page_takes_the_record_there() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let dir = put(&f, DATA, b"/tmp");
+        let wd = f.ret(ADD, &[fd, dir, 0x100]) as i32;
+        let create = |f: &mut Fixture, name: &[u8]| {
+            let path = put(f, DATA + 0x40, &[b"/tmp/", name].concat());
+            let d = f.ret(2, &[path, 0o101, 0o600]);
+            assert_eq!(f.ret(3, &[d]), 0);
+        };
+        for name in [b"a", b"b", b"c"] {
+            create(&mut f, name);
+        }
+        // The page after DATA + 0x2000 is not mapped: the first record fits
+        // before it, the second does not.
+        let edge = DATA + 0x2000 - 40;
+        assert_eq!(f.ret(0, &[fd, edge, 96]), errno(Errno::EFAULT));
+        let mut first = [0; 32];
+        f.mem.read(GuestAddr(edge), &mut first).unwrap();
+        assert_eq!(&first[16..17], b"a");
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x100, &b"c"[..])]);
+        // None of it writable: the first record goes.
+        create(&mut f, b"d");
+        create(&mut f, b"e");
+        assert_eq!(f.ret(0, &[fd, DATA + 0x2000, 64]), errno(Errno::EFAULT));
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x100, &b"e"[..])]);
+        // An address past the user half takes nothing.
+        create(&mut f, b"f");
+        assert_eq!(f.ret(0, &[fd, (-4096i64) as u64, 64]), errno(Errno::EFAULT));
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x100, &b"f"[..])]);
+        // readv reads each buffer as one read, and stops at one it does not
+        // fill; a later buffer's fault leaves the count read.
+        for name in [b"g", b"h", b"i"] {
+            create(&mut f, name);
+        }
+        let vector = DATA + 0x200;
+        let iov = [
+            (DATA + 0x400, 32u64),
+            (DATA + 0x500, 40),
+            (DATA + 0x600, 64),
+        ];
+        for (i, (base, len)) in iov.iter().enumerate() {
+            f.mem
+                .write(GuestAddr(vector + i as u64 * 16), &base.to_le_bytes())
+                .unwrap();
+            f.mem
+                .write(GuestAddr(vector + i as u64 * 16 + 8), &len.to_le_bytes())
+                .unwrap();
+        }
+        assert_eq!(f.ret(19, &[fd, vector, 3]), 64);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x100, &b"i"[..])]);
+        create(&mut f, b"j");
+        create(&mut f, b"k");
+        f.mem
+            .write(GuestAddr(vector + 16), &(DATA + 0x2000).to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(vector + 24), &64u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(19, &[fd, vector, 2]), 32);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        // No bytes is no read; a flag but RWF_HIPRI is EOPNOTSUPP.
+        create(&mut f, b"l");
+        f.mem
+            .write(GuestAddr(vector + 8), &0u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(19, &[fd, vector, 1]), 0);
+        f.mem
+            .write(GuestAddr(vector + 8), &32u64.to_le_bytes())
+            .unwrap();
+        let minus_one = u64::MAX;
+        assert_eq!(
+            f.ret(327, &[fd, vector, 1, minus_one, minus_one, 2]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(f.ret(327, &[fd, vector, 1, minus_one, minus_one, 1]), 32);
+    }
+    #[test]
+    fn a_memfd_ends_with_its_last_close() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let name = put(&f, DATA, b"m");
+        let memfd = f.ret(319, &[name, 0]);
+        let link = put(&f, DATA + 0x20, format!("/proc/self/fd/{memfd}").as_bytes());
+        let wd = f.ret(ADD, &[fd, link, 0xfff]) as i32;
+        assert!(wd > 0, "{}", wd as i64);
+        let copy = f.ret(32, &[memfd]);
+        // memfd_create's own description is no open, and has no close.
+        assert_eq!(f.ret(3, &[memfd]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        assert_eq!(f.ret(3, &[copy]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x400, &b""[..]), (wd, 0x8000, b"")]
+        );
+    }
+    #[test]
+    fn a_fifo_is_heard_of_at_its_dentry() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let one = put(&f, DATA, b"/tmp/one");
+        let two = put(&f, DATA + 0x20, b"/tmp/two");
+        let p = put(&f, DATA + 0x40, b"/tmp/one/p");
+        let q = put(&f, DATA + 0x60, b"/tmp/two/q");
+        assert_eq!(f.ret(83, &[one, 0o700]), 0);
+        assert_eq!(f.ret(83, &[two, 0o700]), 0);
+        assert_eq!(f.ret(133, &[p, 0o010_644, 0]), 0);
+        let w1 = f.ret(ADD, &[fd, one, 0xfff]) as i32;
+        let w2 = f.ret(ADD, &[fd, two, 0xfff]) as i32;
+        let own = f.ret(ADD, &[fd, p, 0xfff]) as i32;
+        let d = f.ret(2, &[p, 0o4002, 0]);
+        assert!((d as i64) >= 0);
+        assert_eq!(f.ret(82, &[p, q]), 0);
+        drop(events(&mut f, fd));
+        // The rename moved the close.
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(w2, 0x8, &b"q"[..]), (own, 0x8, b"")]
+        );
+        // With no name left, /proc opens its pipe again: IN_OPEN there, and
+        // its end waits for the last close.
+        let d = f.ret(2, &[q, 0o4002, 0]);
+        assert_eq!(f.ret(87, &[q]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (w2, 0x20, &b"q"[..]),
+                (own, 0x20, b""),
+                (own, 0x4, b""),
+                (w2, 0x200, b"q"),
+            ]
+        );
+        let link = put(&f, DATA + 0x80, format!("/proc/self/fd/{d}").as_bytes());
+        let again = f.ret(2, &[link, 0o4000, 0]);
+        assert!((again as i64) >= 0, "reopen: {}", again as i64);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(w2, 0x20, &b"q"[..]), (own, 0x20, b"")]
+        );
+        let byte = put(&f, DATA + 0xa0, b"x");
+        assert_eq!(f.ret(1, &[d, byte, 1]), 1);
+        assert_eq!(f.ret(0, &[again, DATA + 0xc0, 1]), 1);
+        drop(events(&mut f, fd));
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(w2, 0x8, &b"q"[..]), (own, 0x8, b"")]
+        );
+        assert_eq!(f.ret(3, &[again]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (w2, 0x10, &b"q"[..]),
+                (own, 0x10, b""),
+                (own, 0x400, b""),
+                (own, 0x8000, b""),
+            ]
+        );
+        assert_ne!(w1, w2);
+    }
+    #[test]
+    fn a_descriptor_opened_through_a_link_stays_where_the_link_led() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let a = put(&f, DATA, b"/tmp/a");
+        let b = put(&f, DATA + 0x20, b"/tmp/b");
+        let l = put(&f, DATA + 0x40, b"/tmp/l");
+        let m = put(&f, DATA + 0x60, b"/tmp/m");
+        let at = put(&f, DATA + 0x80, b"/tmp/l/f");
+        let in_b = put(&f, DATA + 0xa0, b"/tmp/b/f");
+        let byte = put(&f, DATA + 0xc0, b"x");
+        assert_eq!(f.ret(83, &[a, 0o700]), 0);
+        assert_eq!(f.ret(83, &[b, 0o700]), 0);
+        assert_eq!(f.ret(88, &[a, l]), 0);
+        let d = f.ret(2, &[at, 0o102, 0o600]);
+        let made = f.ret(2, &[in_b, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[made]), 0);
+        let wd_a = f.ret(ADD, &[fd, a, 0x2]) as i32;
+        let wd_b = f.ret(ADD, &[fd, b, 0x2]) as i32;
+        drop(events(&mut f, fd));
+        // The link now leads to b, but the dentry is a's.
+        assert_eq!(f.ret(87, &[l]), 0);
+        assert_eq!(f.ret(88, &[b, l]), 0);
+        assert_eq!(f.ret(1, &[d, byte, 1]), 1);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd_a, 0x2, &b"f"[..])]);
+        // A rename of the link, and one onto it, change nothing either.
+        assert_eq!(f.ret(82, &[l, m]), 0);
+        assert_eq!(f.ret(88, &[b, l]), 0);
+        assert_eq!(f.ret(82, &[l, m]), 0);
+        assert_eq!(f.ret(1, &[d, byte, 1]), 1);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd_a, 0x2, &b"f"[..])]);
+        assert_ne!(wd_a, wd_b);
+    }
+    #[test]
     fn a_removed_working_directory_ends_when_no_process_is_in_it() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);

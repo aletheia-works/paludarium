@@ -2091,13 +2091,24 @@ kernel.
   (one that fails, such as a writer's `ENXIO`, is none), `IN_CLOSE_WRITE`
   or `IN_CLOSE_NOWRITE` at its description's last close, and its reads and
   writes for its own watches only, which Linux keeps from its directory's
-  (`d_is_special`). The files exec runs are open files too: `IN_OPEN` as
-  `execve` or `execveat` opens the program, each script and the ELF
-  interpreter, `IN_ACCESS` as it reads their first bytes (none of an empty
-  file), and `IN_CLOSE_NOWRITE` once nothing uses them: a script at the end
-  of the call, the program when no process runs it, the interpreter when no
-  process maps it, and a file exec cannot run when it gives up, the last
-  opened first. A watch with `IN_EXCL_UNLINK` does not
+  (`d_is_special`). Its events go where renames took its name, as a
+  file's do, and an open of it through `/proc/self/fd` opens its pipe
+  again at the same name (with `IN_OPEN`, waiting for the other end as an
+  open by its path does), even once no name links it; a removed one's
+  `IN_DELETE_SELF` waits for the last of them. A memfd, which no name
+  links, has its `IN_DELETE_SELF` once nothing holds it (no description,
+  mapping or process running it); `memfd_create`'s own description has no
+  `IN_OPEN` and no close. The files exec runs are open
+  files too: `IN_OPEN` as `execve` or `execveat` opens the program (one only
+  a descriptor holds, a memfd or a removed file, too), each script and the
+  ELF interpreter, `IN_ACCESS` as it reads their first bytes (none of an
+  empty file), and `IN_CLOSE_NOWRITE` once nothing uses them: the program
+  when no process runs it, the interpreter when no process maps it, and a
+  script at the end of the call, after the program the exec replaced and
+  its interpreter, as the `fput`s Linux defers run the newest first. An
+  exec that fails closes the files it opened as it gives up, the last
+  opened first: the program before the interpreter it found. A watch with
+  `IN_EXCL_UNLINK` does not
   hear of the open, close, read or write of a file through a name unlinked
   since it was opened (by `unlink`, `rmdir` or a rename onto it), even while
   another link keeps the file; `truncate` and `mknod` open nothing. A file's change reaches the watch of
@@ -2113,7 +2124,15 @@ kernel.
   `struct inotify_event` records as fit, each name padded with NULs to a
   multiple of 16 bytes, `EINVAL` when the first does not fit; it waits for
   the first unless the file is non-blocking, and a signal ends the wait
-  (`EINTR`, which `SA_RESTART` restarts). `FIONREAD` gives the bytes queued,
+  (`EINTR`, which `SA_RESTART` restarts). Each record is copied out as it
+  is taken, as Linux's `inotify_read` does: the one that meets a page the
+  process cannot write is taken too, its bytes up to that page written,
+  and the read is `EFAULT`, whatever it read before (an address outside
+  the user half is `EFAULT` with nothing taken). An instance has no
+  `read_iter`, so `readv` and `preadv2` read each buffer in turn as such a
+  read, until one is not filled or fails (`EFAULT` then only when it is the
+  first), give 0 for no bytes, and take no flag but `RWF_HIPRI`
+  (`EOPNOTSUPP`). `FIONREAD` gives the bytes queued,
   `poll`, `select` and `epoll` see the file readable while any event is
   queued, and each queued event is an edge for edge-triggered `epoll`.
   Closing the last descriptor of an instance removes its watches. A write

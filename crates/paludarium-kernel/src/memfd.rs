@@ -211,6 +211,10 @@ impl FileHandle for Memfd {
     fn set_times(&self, atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
         self.file.set_times(atime, mtime)
     }
+    /// A memfd is shmem's, which a tmpfs is.
+    fn file_system(&self) -> Option<u64> {
+        Some(0x0102_1994)
+    }
     fn sync(&self) -> Result<(), Errno> {
         self.file.sync()
     }

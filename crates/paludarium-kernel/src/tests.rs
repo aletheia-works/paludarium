@@ -4290,6 +4290,92 @@ mod vectored_flags {
         );
         assert!(sigpipe(&f));
     }
+    /// A regular file of the file system `fs`, as a handle names it.
+    struct OnFileSystem {
+        fs: Option<u64>,
+    }
+    impl paludarium_host::FileHandle for OnFileSystem {
+        fn file_system(&self) -> Option<u64> {
+            self.fs
+        }
+        fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+            Ok(0)
+        }
+        fn write(&self, b: &[u8]) -> Result<usize, Errno> {
+            Ok(b.len())
+        }
+        fn read_at(&self, _: u64, b: &mut [u8]) -> Result<usize, Errno> {
+            b.fill(b'x');
+            Ok(b.len())
+        }
+        fn write_at(&self, _: u64, b: &[u8]) -> Result<usize, Errno> {
+            Ok(b.len())
+        }
+        fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+            Ok(0)
+        }
+        fn stat(&self) -> Result<paludarium_host::FileStat, Errno> {
+            Ok(paludarium_host::FileStat {
+                mode: 0o100_600,
+                size: 8,
+                ..Default::default()
+            })
+        }
+        fn truncate(&self, _: u64) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn flock(&self, _: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn flags(&self) -> u32 {
+            2
+        }
+        fn set_flags(&self, _: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn file_systems_decide_nowait_and_dontcache() {
+        let mut f = fixture();
+        let (iov, buf) = (DATA + 0x300, DATA + 0x400);
+        iovec(&f, iov, buf, 2);
+        let refused = errno(Errno::EOPNOTSUPP);
+        // (file system, NOWAIT read, NOWAIT write, DONTCACHE), as Linux
+        // master's: 0 is a host's file system with no Linux number.
+        for (fs, read, write, dontcache) in [
+            (Some(0xef53), 2, refused, 2),                  // ext4
+            (Some(0), 2, refused, 2),                       // a macOS or Windows host's
+            (Some(0x5846_5342), 2, 2, 2),                   // xfs
+            (Some(0x9123_683e), 2, 2, refused),             // btrfs
+            (Some(0xf2f5_2010), 2, 2, refused),             // f2fs
+            (Some(0x0102_1994), refused, refused, refused), // tmpfs
+            (Some(0x794c_7630), refused, refused, refused), // overlayfs
+            (None, refused, refused, refused),              // a file the kernel makes
+        ] {
+            let fd = u64::from(
+                f.kernel
+                    .files
+                    .install(Arc::new(OnFileSystem { fs }), false, 1024)
+                    .unwrap(),
+            );
+            let got = [
+                f.ret(PREADV2, &[fd, iov, 1, 0, 0, 0x8]),
+                f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x8]),
+                f.ret(PREADV2, &[fd, iov, 1, 0, 0, 0x80]),
+            ];
+            assert_eq!(got, [read, write, dontcache], "{fs:x?}");
+        }
+        // A timerfd and /dev/null take NOWAIT too.
+        let timer = f.ret(283, &[1, 0]);
+        iovec(&f, iov + 16, buf, 8);
+        assert_eq!(
+            f.ret(PREADV2, &[timer, iov + 16, 1, HERE, 0, 0x8]),
+            errno(Errno::EAGAIN)
+        );
+        f.mem.write(GuestAddr(DATA), b"/dev/null\0").unwrap();
+        let null = f.ret(2, &[DATA, 2, 0]);
+        assert_eq!(f.ret(PREADV2, &[null, iov, 1, HERE, 0, 0x8]), 0);
+    }
     #[test]
     fn the_flags_are_checked_as_kiocb_set_rw_flags_checks_them() {
         let mut f = fixture();
@@ -4302,20 +4388,22 @@ mod vectored_flags {
         let read = |f: &mut Fixture, flags: u64| f.ret(PREADV2, &[fd, iov, 1, 0, 0, flags]);
         assert_eq!(read(&mut f, 0x200), errno(Errno::EOPNOTSUPP));
         assert_eq!(read(&mut f, 0x30), errno(Errno::EINVAL));
-        // Any file takes NOSIGNAL. This in-memory file has no DONTCACHE, as
-        // tmpfs has none (a host file's is `NativeFile::dontcache`).
+        // Any file takes NOSIGNAL. This in-memory file has no DONTCACHE nor
+        // NOWAIT, as tmpfs has neither (see
+        // `file_systems_decide_nowait_and_dontcache`).
         assert_eq!(read(&mut f, 0x100), 2);
         assert_eq!(read(&mut f, 0x80), errno(Errno::EOPNOTSUPP));
         assert_eq!(read(&mut f, 0x40), errno(Errno::EOPNOTSUPP)); // RWF_ATOMIC
-        // HIPRI, DSYNC, SYNC and NOWAIT read a regular file.
-        assert_eq!(read(&mut f, 0xf), 2);
+        // HIPRI, DSYNC and SYNC read a regular file; tmpfs refuses NOWAIT.
+        assert_eq!(read(&mut f, 0x7), 2);
+        assert_eq!(read(&mut f, 0x8), errno(Errno::EOPNOTSUPP));
         // Only the low 32 bits are the flags (rwf_t is an int).
         assert_eq!(read(&mut f, 1 << 32), 2);
         // A transfer of nothing checks no flags.
         iovec(&f, iov + 16, buf, 0);
         assert_eq!(f.ret(PREADV2, &[fd, iov + 16, 1, 0, 0, 0x80]), 0);
         assert_eq!(f.ret(PWRITEV2, &[fd, iov + 16, 1, HERE, 0, 0x80]), 0);
-        // A buffered write of a regular file refuses NOWAIT, as ext4's does.
+        // So does a write of it.
         assert_eq!(
             f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0x8]),
             errno(Errno::EOPNOTSUPP)

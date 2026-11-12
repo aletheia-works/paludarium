@@ -76,12 +76,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   あるときだけ、Linux の `kiocb_set_rw_flags` と同じく確かめます。知らないフラグは
   `EOPNOTSUPP`、`RWF_APPEND` と `RWF_NOAPPEND` の両方は `EINVAL`、`RWF_ATOMIC` は不可分に
   書けるファイルがないので `EOPNOTSUPP` です。`RWF_NOWAIT` は待たずに読み書きできるファイル
-  （通常のファイル、パイプ、ソケット、eventfd、signalfd。ほかは `EOPNOTSUPP`）で使え、待つ
-  ところで `EAGAIN` を返します。`RWF_DONTCACHE` は、それを持つファイルシステム
-  （`FOP_DONTCACHE`）が必要です。ホストのファイルシステムにある通常のファイルは ext4 と同じく受け付け、
-  何も変えません（何もキャッシュしません）。パイプ、ソケット、メモリ上のファイル（memfd や、
-  tmpfs のようなメモリ上のファイルシステムのもの）、カーネルが作るファイル（`/proc`）は
-  `EOPNOTSUPP` です。`RWF_NOSIGNAL` は、Linux 6.18 からと同じく、読む側のない
+  （パイプ、ソケット、eventfd、signalfd、timerfd、`/dev/null`、`/dev/zero`、`/dev/random`、
+  `/dev/urandom`、それを持つファイルシステムの通常のファイル。ほかは `EOPNOTSUPP`）で使え、
+  待つところで `EAGAIN` を返します。`RWF_DONTCACHE` は `FOP_DONTCACHE` を持つファイル
+  システムの通常のファイルが必要で、何も変えません（何もキャッシュしません）。通常のファイルの
+  ファイルシステムは、そのファイルがあるもの（`fstatfs` の名前）で、Linux master と同じく
+  どちらも決めます。ext4 は NOWAIT を受け付けますが書き込みでは断り、DONTCACHE も受け付け
+  ます。xfs はどちらも、書き込みの NOWAIT も受け付けます。btrfs と f2fs は NOWAIT を
+  書き込みでも受け付け、DONTCACHE は断ります。tmpfs（メモリ上のファイルシステムと memfd）、
+  overlayfs、`/proc`、そのほかのファイルシステムはどちらも断ります。Linux が番号を持たない
+  ファイルシステムの macOS と Windows のホストでは、ホストのファイルを ext4 のものとして
+  扱います。`RWF_NOSIGNAL` は、Linux 6.18 からと同じく、読む側のない
   パイプやソケットへの書き込みで `SIGPIPE` を送りません（`EPIPE` は返します）。
   `RWF_NOAPPEND` は、その呼び出しのあいだ `O_APPEND` の追記を止めます。書き込みは指定した
   位置へ行き（末尾より先ならファイルを伸ばします）、-1 ならファイルの位置へ行って位置が進みます。

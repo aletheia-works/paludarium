@@ -654,9 +654,15 @@ impl FileHandle for NativeFile {
             .set_times(times)
             .map_err(err)
     }
-    /// A host file takes `RWF_DONTCACHE`, as ext4's does.
-    fn dontcache(&self) -> bool {
-        true
+    /// On a Linux host the host file system's own number; elsewhere 0.
+    fn file_system(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        return Some(
+            rustix::fs::fstatfs(&*self.file.lock().unwrap_or_else(PoisonError::into_inner))
+                .map_or(0, |s| s.f_type as u64),
+        );
+        #[cfg(not(target_os = "linux"))]
+        Some(0)
     }
     fn sync(&self) -> Result<(), Errno> {
         self.file
@@ -1192,7 +1198,7 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
 mod files_tests {
     use super::*;
     #[test]
-    fn a_host_file_takes_dontcache() {
+    fn a_host_file_names_its_file_system_as_statfs_does() {
         let base = std::env::temp_dir().join(format!(
             "paludarium-dontcache-{}-{}",
             std::process::id(),
@@ -1201,7 +1207,9 @@ mod files_tests {
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("f"), b"x").unwrap();
         let fs = NativeFs::new(&base).unwrap();
-        assert!(fs.open(b"f", 0, 0).unwrap().dontcache());
+        let kind = fs.open(b"f", 0, 0).unwrap().file_system();
+        let expected = fs.statfs(b"f").unwrap().kind;
+        assert_eq!(kind, Some(expected));
         let _ = std::fs::remove_dir_all(&base);
     }
     #[test]

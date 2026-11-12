@@ -88,13 +88,18 @@ kernel.
   is `EOPNOTSUPP`, `RWF_APPEND` with `RWF_NOAPPEND` `EINVAL`, and
   `RWF_ATOMIC` `EOPNOTSUPP`, as no file here writes atomically.
   `RWF_NOWAIT` needs a file that can be read or written without waiting (a
-  regular file, a pipe, a socket, an eventfd or a signalfd; `EOPNOTSUPP` for
-  the rest) and then gives `EAGAIN` where the call would wait.
-  `RWF_DONTCACHE` needs a file system that has it (`FOP_DONTCACHE`): a
-  regular file on the host's own file system, as on ext4, takes it and it
-  changes nothing (nothing is cached), while a pipe, a socket, an in-memory
-  file (a memfd, or one of an in-memory file system, as tmpfs) or a file the
-  kernel makes (`/proc`) gives `EOPNOTSUPP`. `RWF_NOSIGNAL` spares a write to
+  pipe, a socket, an eventfd, a signalfd, a timerfd, `/dev/null`,
+  `/dev/zero`, `/dev/random`, `/dev/urandom`, or a regular file of a file
+  system that has it; `EOPNOTSUPP` for the rest) and then gives `EAGAIN`
+  where the call would wait. `RWF_DONTCACHE` needs a regular file of a file
+  system with `FOP_DONTCACHE`, and changes nothing (nothing is cached). A
+  regular file's file system is the one its file is on (as `fstatfs` names
+  it), and decides both as Linux master's: ext4 takes NOWAIT, but refuses it
+  for a write, and DONTCACHE; xfs takes both, a write's NOWAIT too; btrfs
+  and f2fs take NOWAIT, for a write too, and not DONTCACHE; tmpfs (an
+  in-memory file system, a memfd), overlayfs, `/proc` and any other file
+  system take neither. On a macOS or Windows host, whose file systems Linux
+  has no number for, a host file is taken as ext4's. `RWF_NOSIGNAL` spares a write to
   a pipe or socket with no reader its `SIGPIPE` (it still gives `EPIPE`), as
   since Linux 6.18. `RWF_NOAPPEND` turns an `O_APPEND` file's append off
   for the call: a write goes to the offset (growing the file past its end)

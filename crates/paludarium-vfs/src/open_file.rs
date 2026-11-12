@@ -246,6 +246,10 @@ impl FileHandle for MemFile {
         Ok(())
     }
     /// Memory needs no synchronising; files and directories both succeed.
+    /// The in-memory file system is a tmpfs.
+    fn file_system(&self) -> Option<u64> {
+        Some(TMPFS_MAGIC)
+    }
     fn sync(&self) -> Result<(), Errno> {
         Ok(())
     }

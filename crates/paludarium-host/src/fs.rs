@@ -103,12 +103,13 @@ pub trait FileHandle: Send + Sync {
     fn set_times(&self, _atime: Option<i128>, _mtime: Option<i128>) -> Result<(), Errno> {
         Err(Errno::EPERM)
     }
-    /// Whether `RWF_DONTCACHE` is taken (Linux's `FOP_DONTCACHE`): a
-    /// regular file on the host's own file system, as on ext4. Pipes,
-    /// sockets, in-memory files (tmpfs's, shmem's) and the files the kernel
-    /// makes (`/proc`) have none.
-    fn dontcache(&self) -> bool {
-        false
+    /// The file system the file is on, as `fstatfs`'s `f_type` numbers it
+    /// (`TMPFS_MAGIC` for an in-memory one), which decides what
+    /// `RWF_NOWAIT` and `RWF_DONTCACHE` a regular file takes: 0 for a host's
+    /// file system Linux has no number for (macOS's, Windows'), and none
+    /// for a file the kernel makes (`/proc`).
+    fn file_system(&self) -> Option<u64> {
+        None
     }
     /// `fsync` and `fdatasync`. Kinds that cannot be synchronised (pipes,
     /// sockets, terminals, devices) give `EINVAL`, as on Linux.

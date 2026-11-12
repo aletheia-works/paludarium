@@ -2070,13 +2070,57 @@ const S_IFSOCK: u32 = 0o140000;
 const S_IFIFO: u32 = 0o010000;
 const O_APPEND: u32 = 0o2000;
 
+/// What a regular file's file system takes, as Linux master's: `RWF_NOWAIT`
+/// (`FMODE_NOWAIT`), a buffered write with it, and `RWF_DONTCACHE`
+/// (`FOP_DONTCACHE`).
+#[derive(Clone, Copy)]
+struct FileSystemFlags {
+    nowait: bool,
+    nowait_write: bool,
+    dontcache: bool,
+}
+
+/// [`FileSystemFlags`] by the file's file system ([`FileHandle::file_system`]):
+/// ext4 takes NOWAIT but refuses it for a buffered write
+/// (`ext4_buffered_write_iter`) and takes DONTCACHE; xfs takes all three;
+/// btrfs and f2fs NOWAIT, for writes too, and not DONTCACHE; tmpfs (and
+/// shmem, a memfd's), overlayfs, the files the kernel makes and every other
+/// file system none. A host file system Linux has no number for (macOS's,
+/// Windows') is taken as ext4.
+fn file_system_flags(file: &Arc<dyn FileHandle>) -> FileSystemFlags {
+    const EXT4_SUPER_MAGIC: u64 = 0xef53;
+    const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+    const F2FS_SUPER_MAGIC: u64 = 0xf2f5_2010;
+    let (nowait, nowait_write, dontcache) = match file.file_system() {
+        Some(0 | EXT4_SUPER_MAGIC) => (true, false, true),
+        Some(XFS_SUPER_MAGIC) => (true, true, true),
+        Some(BTRFS_SUPER_MAGIC | F2FS_SUPER_MAGIC) => (true, true, false),
+        _ => (false, false, false),
+    };
+    FileSystemFlags {
+        nowait,
+        nowait_write,
+        dontcache,
+    }
+}
+
+/// Whether a buffered write of `file` refuses `RWF_NOWAIT` (`EOPNOTSUPP`), as
+/// ext4's `ext4_buffered_write_iter` does: a regular file whose file system
+/// does not write without waiting.
+fn refuses_nowait_write(file: &Arc<dyn FileHandle>, flags: u32) -> Result<bool, Errno> {
+    Ok(flags & RWF_NOWAIT != 0
+        && file.stat()?.mode & S_IFMT == S_IFREG
+        && !file_system_flags(file).nowait_write)
+}
+
 /// The `RWF_*` flags of a transfer with bytes to move, checked as Linux's
 /// `kiocb_set_rw_flags` checks them ([`kiocb_rw_flags`]), after the vector
-/// and the range, and then as ext4's `ext4_buffered_write_iter`, which
-/// refuses a regular file's buffered write with `RWF_NOWAIT`.
+/// and the range, and then as the file system's buffered write checks
+/// `RWF_NOWAIT` ([`refuses_nowait_write`]).
 fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, Errno> {
     let flags = kiocb_rw_flags(file, flags)?;
-    if write && flags & RWF_NOWAIT != 0 && file.stat()?.mode & S_IFMT == S_IFREG {
+    if write && refuses_nowait_write(file, flags)? {
         return Err(Errno::EOPNOTSUPP);
     }
     Ok(flags)
@@ -2084,16 +2128,15 @@ fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, 
 
 /// Linux's `kiocb_set_rw_flags`: unknown flags are `EOPNOTSUPP`, and
 /// `RWF_APPEND` with `RWF_NOAPPEND` `EINVAL`. `RWF_NOWAIT` needs a file
-/// opened with `FMODE_NOWAIT`: here a regular file (as on ext4; tmpfs has
-/// none), a pipe, a socket, an eventfd or a signalfd. No file can write
-/// atomically (`FMODE_CAN_ATOMIC_WRITE`). `RWF_DONTCACHE` needs a file
-/// system with `FOP_DONTCACHE` ([`FileHandle::dontcache`]): a regular file
-/// on the host's own file system, as on ext4, and not a pipe, a socket, an
-/// in-memory file (a memfd, or a file of an in-memory file system, as
-/// tmpfs) or a file the kernel makes (`/proc`). `RWF_NOSIGNAL` is taken by
-/// any file (a write to a pipe or socket with no reader then raises no
-/// `SIGPIPE`). `RWF_NOAPPEND` turns an `O_APPEND` file's append off for the
-/// transfer, read or write, but not an append-only file's (`EPERM`).
+/// opened with `FMODE_NOWAIT`: a regular file of a file system that has it
+/// ([`file_system_flags`]), a pipe, a socket, an eventfd, a signalfd, a
+/// timerfd, or `/dev/null`, `/dev/zero`, `/dev/random` and `/dev/urandom`
+/// (`mm/char-mem.c`). No file can write atomically
+/// (`FMODE_CAN_ATOMIC_WRITE`). `RWF_DONTCACHE` needs a regular file of a
+/// file system with `FOP_DONTCACHE`. `RWF_NOSIGNAL` is taken by any file (a
+/// write to a pipe or socket with no reader then raises no `SIGPIPE`).
+/// `RWF_NOAPPEND` turns an `O_APPEND` file's append off for the transfer,
+/// read or write, but not an append-only file's (`EPERM`).
 pub(crate) fn kiocb_rw_flags(file: &Arc<dyn FileHandle>, flags: u32) -> Result<u32, Errno> {
     if flags == 0 {
         return Ok(0);
@@ -2106,13 +2149,25 @@ pub(crate) fn kiocb_rw_flags(file: &Arc<dyn FileHandle>, flags: u32) -> Result<u
     }
     let kind = file.stat()?.mode & S_IFMT;
     if flags & RWF_NOWAIT != 0 {
+        use crate::devices::{Device, Kind};
         let any = file.as_any();
-        let nowait = kind == S_IFREG
-            || kind == S_IFIFO
-            || kind == S_IFSOCK
-            || any.is_some_and(|any| {
-                any.is::<crate::events::EventCounter>() || any.is::<crate::signalfd::SignalFile>()
-            });
+        let nowait = if kind == S_IFREG {
+            file_system_flags(file).nowait
+        } else {
+            kind == S_IFIFO
+                || kind == S_IFSOCK
+                || any.is_some_and(|any| {
+                    any.is::<crate::events::EventCounter>()
+                        || any.is::<crate::signalfd::SignalFile>()
+                        || any.is::<crate::timerfd::TimerFile>()
+                        || any.downcast_ref::<Device>().is_some_and(|device| {
+                            matches!(
+                                device.kind(),
+                                Kind::Null | Kind::Zero | Kind::Random | Kind::Urandom
+                            )
+                        })
+                })
+        };
         if !nowait {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -2120,7 +2175,7 @@ pub(crate) fn kiocb_rw_flags(file: &Arc<dyn FileHandle>, flags: u32) -> Result<u
     if flags & RWF_ATOMIC != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    if flags & RWF_DONTCACHE != 0 && (kind != S_IFREG || !file.dontcache()) {
+    if flags & RWF_DONTCACHE != 0 && (kind != S_IFREG || !file_system_flags(file).dontcache) {
         return Err(Errno::EOPNOTSUPP);
     }
     if unappended(file, flags) && attributes::append_only(&file.stat()?) {
@@ -2233,8 +2288,9 @@ fn aio_write(
         )?;
         return sync_written(file, flags, written);
     }
-    // ext4_buffered_write_iter.
-    if flags & RWF_NOWAIT != 0 && file.stat()?.mode & S_IFMT == S_IFREG {
+    // A buffered write the file system cannot do without waiting
+    // (ext4_buffered_write_iter's EOPNOTSUPP) is the event's result.
+    if refuses_nowait_write(file, flags)? {
         return Err(Errno::EOPNOTSUPP);
     }
     let start = appending(file, flags)?.unwrap_or(offset);

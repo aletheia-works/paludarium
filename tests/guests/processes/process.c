@@ -6052,6 +6052,22 @@ static int vector_flags_case(void) {
     printf("noappend at=%ld pos=%ld past=%ld here=%ld moved=%ld plain=%ld read=%ld contents=%.*s\n",
            na_at, na_pos, na_past, na_here, na_moved, plain_at, na_read, (int)(r > 0 ? r : 0), all);
     close(app);
+    /* A regular file's RWF_NOWAIT and RWF_DONTCACHE are its file system's,
+     * as Linux master's ext4, xfs, btrfs and f2fs have them (any other takes
+     * neither). The case prints whether the file's own file system, as
+     * fstatfs names it, gives what that table says, which holds on CI's and
+     * the emulator's file systems alike. */
+    struct statfs fsinfo;
+    long kind = fstatfs(fd, &fsinfo) == 0 ? (long)fsinfo.f_type : -1;
+    long want_read = -EOPNOTSUPP, want_write = -EOPNOTSUPP, want_dontcache = -EOPNOTSUPP;
+    if (kind == 0xef53) want_read = 2, want_dontcache = 2;
+    if (kind == 0x58465342) want_read = want_write = want_dontcache = 2;
+    if (kind == 0x9123683e || kind == (long)0xf2f52010) want_read = want_write = 2;
+    long got_read = vf_preadv2(fd, got, 2, 0, 0x8);
+    long got_write = vf_pwritev2(fd, "nw", 2, 0, 0x8);
+    long got_dontcache = vf_preadv2(fd, got, 2, 0, 0x80);
+    printf("by-file-system nowait-read=%d nowait-write=%d dontcache=%d\n", got_read == want_read,
+           got_write == want_write, got_dontcache == want_dontcache);
     close(fd);
     /* A pipe reads at the position only, and does not wait with NOWAIT. */
     int p[2];

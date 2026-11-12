@@ -187,6 +187,10 @@ mod linux {
         case("listen");
     }
     #[test]
+    fn network_tcp_info() {
+        case("tcp-info");
+    }
+    #[test]
     fn network_listen_errors() {
         case("listen-errors");
     }

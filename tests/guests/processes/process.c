@@ -1961,6 +1961,16 @@ static void inet_line(char *out, size_t size, const char *label, unsigned short 
         if (vlen >= 4) memcpy(&word, v, 4);
         if (kind == 21) {
             n += snprintf(out + n, size - n, " cgroup");
+        } else if (kind == 2) {
+            /* tcp_info: its length, state, options and window scales, a
+               listener's queue, and the path MTU, slow start threshold,
+               congestion window, advertised MSS and reordering, which do
+               not vary from run to run. */
+            unsigned info[70] = {0};
+            memcpy(info, v, vlen < (int)sizeof info ? vlen : (int)sizeof info);
+            n += snprintf(out + n, size - n, " info=%d:%u,%u,%u", vlen, v[0], v[5], v[6]);
+            if (v[0] == 10) n += snprintf(out + n, size - n, ",%u,%u", info[6], info[7]);
+            n += snprintf(out + n, size - n, ",%u,%u,%u,%u,%u", info[15], info[19], info[20], info[21], info[22]);
         } else if (kind == 4) {
             n += snprintf(out + n, size - n, " cong=%.*s", vlen, v);
         } else if (kind == 7) {
@@ -8369,6 +8379,7 @@ int main(int argc, char **argv) {
             INET_ASK("tcp", 20, dump, AF_INET, 6, 0x38, all, 0, 0, NULL, NULL);
             INET_ASK("tcp6", 20, dump, AF_INET6, 6, 0x38, all, 0, 0, NULL, NULL);
             INET_ASK("listening", 20, dump, AF_INET, 6, 0x40, 1 << 10, 0, 0, NULL, NULL);
+            INET_ASK("info", 20, dump, AF_INET, 6, 0x2, 1 << 10, 0, 0, NULL, NULL);
             INET_ASK("bound", 20, dump, AF_INET, 6, 0x50, 1 << 13, 0, 0, NULL, NULL);
             INET_ASK("bound6", 20, dump, AF_INET6, 6, 0x40, 1 << 13, 0, 0, NULL, NULL);
             INET_ASK("syn sent", 20, dump, AF_INET, 6, 0, 1 << 2, 0, 0, NULL, NULL);
@@ -8419,6 +8430,8 @@ int main(int argc, char **argv) {
                cookie. */
             unsigned short client_port = inet_find("client")->port;
             INET_ASK("exact client", 20, NL_F_REQUEST, AF_INET, 6, 0x38, 0, client_port, port, "127.0.0.1",
+                     "127.0.0.1");
+            INET_ASK("info client", 20, NL_F_REQUEST, AF_INET, 6, 0x2, 0, client_port, port, "127.0.0.1",
                      "127.0.0.1");
             nl_send(d, 20, NL_F_REQUEST, request, len);
             unsigned char reply[1024];

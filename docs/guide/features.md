@@ -1307,8 +1307,9 @@ kernel.
     mark to `CAP_NET_ADMIN`, its priority as its class, its cgroup, its
     options (`inet_diag_sockopt`), its memory (a UDP socket's datagrams
     charged in pages, as `udp_rmem_schedule` does, its buffers, and a
-    listener's handshakes that a full queue dropped), and a
-    TCP socket's congestion control (`cubic`). A hold in `TIME_WAIT` tells
+    listener's handshakes that a full queue dropped), a TCP socket's
+    `tcp_info` (`INET_DIAG_INFO`, which `ss -i` shows), and its
+    congestion control (`cubic`). A hold in `TIME_WAIT` tells
     its addresses, state and timer alone.
   - **Groups:** a socket has 32 groups, as Linux makes the four of
     `sock_diag` 32, which anyone may join, and which hear nothing.
@@ -2070,13 +2071,24 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     `SO_SNDBUF`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_LINGER`,
     `SO_PRIORITY`, `SO_BROADCAST`, `SO_OOBINLINE`, `TCP_NODELAY` (which reaches
     the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
-    `TCP_USER_TIMEOUT`, `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and
+    `TCP_USER_TIMEOUT`, `TCP_INFO` (read only), `IP_TOS` and `IPV6_V6ONLY`,
+    with Linux's defaults and
     range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
     `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
     `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
     `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
     while it is closed or listening).
+  - **`TCP_INFO`** gives Linux's 280-byte `struct tcp_info`, as much of it
+    as the room asks (`tcp_get_info`): a listener's state, connections
+    waiting and backlog; a socket that has not connected, Linux's
+    defaults; a handshake, its retries, with the timeout doubling past
+    `tcp_syn_linear_timeouts`; a connection, its state, options
+    (timestamps, SACK and window scaling), window scales (10, or less for a
+    receive buffer the guest set), the bytes it sent, had acknowledged and
+    received with its handshake and ends, those not sent yet, its data
+    segments and the times since data went and came. A UDP socket has no
+    TCP options (`EOPNOTSUPP`).
   - **Timestamps**: every UDP datagram is stamped as it comes, and
     `recvmsg` gives that time as Linux's `udp_recvmsg` does
     (`sock_recv_timestamp`), however late the receiver took the options:

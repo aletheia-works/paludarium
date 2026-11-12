@@ -29,6 +29,7 @@ const INET_DIAG_REQ_SK_BPF_STORAGES: u16 = 2;
 const INET_DIAG_REQ_PROTOCOL: u16 = 3;
 const SK_DIAG_BPF_STORAGE_REQ_MAP_FD: u16 = 1;
 const INET_DIAG_MEMINFO: u16 = 1;
+const INET_DIAG_INFO: u16 = 2;
 const INET_DIAG_CONG: u16 = 4;
 const INET_DIAG_TOS: u16 = 5;
 const INET_DIAG_TCLASS: u16 = 6;
@@ -392,8 +393,14 @@ impl NetlinkSocket {
             .collect();
             attribute(&mut out, INET_DIAG_SKMEMINFO, &memory);
         }
-        // A TCP socket that is not closed has its connection's state, but
-        // not `tcp_info`, which nothing here keeps.
+        // A TCP socket's `tcp_info` (`tcp_diag_get_info`), which comes
+        // before its congestion control; a socket that is not closed has
+        // that too.
+        if ext & bit(INET_DIAG_INFO) != 0
+            && let Some(tcp) = &full.tcp
+        {
+            attribute(&mut out, INET_DIAG_INFO, &tcp.bytes());
+        }
         if !entry.udp && entry.table != Table::Bound && ext & bit(INET_DIAG_CONG) != 0 {
             attribute(&mut out, INET_DIAG_CONG, CONGESTION);
         }

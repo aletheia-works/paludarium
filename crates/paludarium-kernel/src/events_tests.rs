@@ -1176,6 +1176,60 @@ fn readable(f: &mut Fixture, fd: u64) -> u32 {
         .unwrap()
         .0
 }
+/// `getsockopt(TCP_INFO)` of `fd` with room for `room` bytes: the length
+/// it gave and the bytes.
+fn tcp_info(f: &mut Fixture, fd: u64, room: u32) -> (u64, Vec<u8>) {
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &room.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(55, [fd, 6, 11, DATA + 0x400, DATA + 0x300, 0]), 0);
+    let len = u64::from(read_u32(f, DATA + 0x300));
+    let mut raw = vec![0; len as usize];
+    f.mem.read(GuestAddr(DATA + 0x400), &mut raw).unwrap();
+    (len, raw)
+}
+#[test]
+fn tcp_info_tells_listeners_and_connections() {
+    let mut f = network_fixture(&[]);
+    let unconnected = f.ret(41, [2, 1, 0, 0, 0, 0]);
+    let (len, raw) = tcp_info(&mut f, unconnected, 512);
+    assert_eq!((len, raw[0], raw[7]), (280, 7, 1));
+    let (listener, port) = loopback_listener(&mut f, 4);
+    let client = loopback_client(&mut f, port);
+    let (_, raw) = tcp_info(&mut f, listener, 512);
+    let word = |raw: &[u8], at: usize| u32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
+    let long = |raw: &[u8], at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+    // A listener: its state, the connection waiting and its backlog.
+    assert_eq!((raw[0], word(&raw, 24), word(&raw, 28)), (10, 1, 4));
+    let server = f.ret(288, [listener, 0, 0, 0, 0, 0]);
+    assert!((server as i64) >= 0);
+    // 100 bytes one way, read; then the client shuts down.
+    f.mem.write(GuestAddr(DATA + 0x1000), &[7; 100]).unwrap();
+    assert_eq!(f.ret(1, [client, DATA + 0x1000, 100, 0, 0, 0]), 100);
+    let (_, raw) = tcp_info(&mut f, server, 512);
+    assert_eq!(&raw[..8], &[1, 0, 0, 0, 0, 7, 0xaa, 1]);
+    assert_eq!((long(&raw, 120), long(&raw, 128)), (0, 100));
+    assert_eq!(f.ret(0, [server, DATA + 0x2000, 100, 0, 0, 0]), 100);
+    let (_, raw) = tcp_info(&mut f, client, 512);
+    assert_eq!((long(&raw, 120), long(&raw, 200)), (101, 100));
+    assert_eq!((word(&raw, 156), word(&raw, 192)), (1, 2));
+    assert_eq!(f.ret(48, [client, 1, 0, 0, 0, 0]), 0);
+    let (_, raw) = tcp_info(&mut f, server, 512);
+    assert_eq!((raw[0], long(&raw, 128), word(&raw, 152)), (8, 101, 1));
+    let (_, raw) = tcp_info(&mut f, client, 512);
+    assert_eq!(raw[0], 5);
+    // A shorter room takes that much; UDP has no TCP options.
+    let (len, raw) = tcp_info(&mut f, client, 8);
+    assert_eq!((len, raw[0]), (8, 5));
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    f.mem
+        .write(GuestAddr(DATA + 0x300), &4u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        f.ret(55, [udp, 6, 11, DATA + 0x400, DATA + 0x300, 0]) as i64,
+        -95
+    );
+}
 #[test]
 fn loopback_servers_listen_and_accept() {
     // No policy entry: the guest's own loopback needs none.

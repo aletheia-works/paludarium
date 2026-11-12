@@ -130,6 +130,41 @@ static void ready(const char *name, int fd, short events) {
     int n = poll(&p, 1, 0);
     printf("  %s poll=%d revents=%#x\n", name, n, (unsigned)p.revents);
 }
+/* `fd`'s tcp_info (getsockopt TCP_INFO) as raw bytes, with room for
+   `room`; the length it gave goes to `len`. */
+static int tcp_info_raw(int fd, unsigned char *raw, int room, socklen_t *len) {
+    memset(raw, 0xaa, 512);
+    *len = room;
+    errno = 0;
+    return getsockopt(fd, IPPROTO_TCP, TCP_INFO, raw, len);
+}
+static unsigned info_word(const unsigned char *raw, int at) {
+    unsigned v;
+    memcpy(&v, raw + at, 4);
+    return v;
+}
+static unsigned long long info_long(const unsigned char *raw, int at) {
+    unsigned long long v;
+    memcpy(&v, raw + at, 8);
+    return v;
+}
+/* Prints the fields of `fd`'s tcp_info at the offsets in `at` (words, or
+   with `+` the 8-byte ones), after its first eight bytes, or only those of
+   them `bytes` marks. Linux's round trips, rates, windows and the times
+   since data went or came vary from run to run, so they are not printed. */
+static void tcp_info(const char *name, int fd, unsigned bytes, const int *at) {
+    unsigned char raw[512];
+    socklen_t len;
+    int r = tcp_info_raw(fd, raw, 512, &len);
+    printf("  %s=%d errno=%d len=%u b=", name, r, errno, (unsigned)len);
+    for (int i = 0; i < 8; i++)
+        if (bytes & 1u << i) printf("%u,", raw[i]);
+    for (; *at; at++) {
+        if (*at > 0) printf(" %d:%u", *at, info_word(raw, *at));
+        else printf(" %d:%llu", -*at, info_long(raw, -*at));
+    }
+    putchar('\n');
+}
 /* A TCP socket listening with `backlog` on 127.0.0.1, at a port it takes,
    which `port` gets. */
 static int listener(int backlog, int *port) {
@@ -874,6 +909,74 @@ int main(int argc, char **argv) {
         printf("  anew port-ok=%d\n", port_of(l) != 0);
         close(l);
         close(ep);
+        return 0;
+    }
+    if (!strcmp(mode, "tcp-info")) {
+        /* getsockopt(TCP_INFO) of an unconnected socket, a listener, both
+           sides of a loopback connection as bytes go and it ends, and a
+           client whose receive buffer limits its window scale. */
+        static const int every[] = {8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 60, 64, 68, 72, 76, 80,
+                                    84, 88, 92, 96, 100, -104, -112, -120, -128, 136, 140, 144, 148, 152,
+                                    156, -160, -168, -176, -184, 192, 196, -200, -208, 216, 220, 224,
+                                    228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 0};
+        static const int connection[] = {24, 28, 32, 36, 60, 76, 80, 84, 88, 100, 144, -120, -128,
+                                         152, 156, 192, -200, -208, 0};
+        int u = tcp(0);
+        tcp_info("unconnected", u, 0xff, every);
+        int port;
+        int l = listener(4, &port);
+        tcp_info("listening", l, 0xff, every);
+        int result;
+        int c = client(port, 0, &result);
+        printf("  connect errno=%d\n", result);
+        poll(NULL, 0, 50);
+        tcp_info("one-waiting", l, 0xff, every);
+        int s = accept(l, NULL, NULL);
+        tcp_info("client", c, 0x7f, connection);
+        tcp_info("server", s, 0x7f, connection);
+        call("send", send(c, buf, 100, 0));
+        call("recv", recv(s, buf, sizeof buf, 0));
+        /* Past the 40 ms an acknowledgement may wait (TCP_DELACK_MAX). */
+        poll(NULL, 0, 100);
+        tcp_info("client-sent", c, 0x7f, connection);
+        tcp_info("server-read", s, 0x7f, connection);
+        call("send-back", send(s, buf, 200, 0));
+        poll(NULL, 0, 100);
+        tcp_info("server-unread", s, 0x7f, connection);
+        tcp_info("client-unread", c, 0x7f, connection);
+        call("shutdown", shutdown(c, SHUT_WR));
+        await_end(s);
+        /* The FIN's acknowledgement may wait too: until it comes the client
+           is in FIN_WAIT1. */
+        unsigned char raw[512];
+        socklen_t len;
+        for (int i = 0; i < 50; i++) {
+            tcp_info_raw(c, raw, 512, &len);
+            if (raw[0] != 4) break;
+            poll(NULL, 0, 20);
+        }
+        tcp_info("client-shut", c, 0x7f, connection);
+        tcp_info("server-ended", s, 0x7f, connection);
+        close(s);
+        close(c);
+        /* A shorter room takes that much, a negative one is EINVAL; UDP has
+           no TCP options. */
+        int r = tcp_info_raw(u, raw, 8, &len);
+        printf("  short=%d len=%u state=%u\n", r, (unsigned)len, raw[0]);
+        r = tcp_info_raw(u, raw, -1, &len);
+        printf("  negative=%d errno=%d\n", r, errno);
+        int udp = socket(AF_INET, SOCK_DGRAM, 0);
+        r = tcp_info_raw(udp, raw, 512, &len);
+        printf("  udp=%d errno=%d\n", r, errno);
+        /* SO_RCVBUF before connect clamps the window scale it offers. */
+        int small = tcp(0), size = 65536;
+        setsockopt(small, SOL_SOCKET, SO_RCVBUF, &size, sizeof size);
+        struct sockaddr_in a = to(port);
+        call("small-connect", connect(small, (void *)&a, sizeof a));
+        tcp_info("small", small, 0x60, (const int[]){0});
+        close(small);
+        close(l);
+        close(u);
         return 0;
     }
     if (!strcmp(mode, "listen-errors")) {

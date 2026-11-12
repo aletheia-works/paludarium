@@ -1136,7 +1136,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     クラス、待ち受け中か閉じていれば `IPV6_V6ONLY` を伝えます。続けて、`CAP_NET_ADMIN`
     にはマーク、クラスとして優先度、cgroup、オプション（`inet_diag_sockopt`）、メモリ
     （UDP のソケットのデータグラムは `udp_rmem_schedule` と同じくページ単位で数えたもの、
-    バッファー、リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
+    バッファー、リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの
+    `tcp_info`（`ss -i` が見せる `INET_DIAG_INFO`）と輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
     については、アドレス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
     グループは 32 です。誰でも入れますが、何も届きません。
@@ -1825,12 +1826,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `SO_RCVBUF`、`SO_RCVTIMEO`、`SO_SNDTIMEO`、`SO_LINGER`、`SO_PRIORITY`、
     `SO_BROADCAST`、`SO_OOBINLINE`、`TCP_NODELAY`（ホストにも伝えます）、
     `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
-    `TCP_USER_TIMEOUT`、`IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と
+    `TCP_USER_TIMEOUT`、`TCP_INFO`（読み出しのみ）、`IP_TOS`、`IPV6_V6ONLY`。
+    既定値と範囲の確かめ方は Linux と
     同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
     2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決めます
     （`rt_tos2priority`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
     設定して読み出せ、`SOF_TIMESTAMPING_OPT_ID` には TCP のソケットの接続が要ります
     （閉じているか待ち受けている間は `EINVAL`）。
+  - **`TCP_INFO`** は、Linux の 280 バイトの `struct tcp_info` を、渡された大きさの分だけ
+    返します（`tcp_get_info`）。リスナーは状態、待っている接続とバックログ、まだ接続して
+    いないソケットは Linux の既定値、ハンドシェイク中は再送の回数（タイムアウトは
+    `tcp_syn_linear_timeouts` を超えてから倍になります）を返します。接続は、状態、
+    オプション（タイムスタンプ、SACK、ウィンドウスケーリング）、ウィンドウスケール（10、
+    ゲストが受信バッファーを設定していればそれ以下）、送ったバイト、確認応答を受けた
+    バイト、受け取ったバイト（ハンドシェイクと終わりを含む）、まだ送っていないバイト、
+    データのセグメント、データを最後に送ってから・受け取ってからの時間を返します。UDP の
+    ソケットには TCP のオプションがありません（`EOPNOTSUPP`）。
   - **タイムスタンプ**：`recvmsg` は、Linux の `udp_recvmsg`（`sock_recv_timestamp`）と同じく、
     UDP のデータグラムに届いた時刻を付けます。受け手がいつオプションを設定したかによりません。
     `SO_TIMESTAMP` などの制御メッセージを付け、`SO_TIMESTAMPING` のフラグがソフトウェアの

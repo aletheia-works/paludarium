@@ -49,6 +49,7 @@ mod shm;
 mod sockets;
 mod syscalls;
 mod sysctl;
+mod tcp_info;
 mod threads;
 mod timerfd;
 mod timers;

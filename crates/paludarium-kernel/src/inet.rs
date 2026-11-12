@@ -16,6 +16,7 @@ use crate::fasync::{FileOwner, Notice, O_ASYNC, Reason, Registration};
 use crate::loopback::{Binding, Link, Ports};
 use crate::sockets::{Timeout, Timestamps};
 use crate::syscalls::Context;
+use crate::tcp_info::{self, TcpInfo};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use paludarium_host::net::{Driver, Event, Lookup, Phase, Stream};
 use paludarium_host::{FileHandle, FileStat};
@@ -624,6 +625,8 @@ struct State {
     eof_read: bool,
     /// A UDP socket's `SHUT_WR` (TCP's is its stream's).
     write_shut: bool,
+    /// What the connection has carried, for `tcp_info`.
+    counts: Counts,
     // The guest's loopback.
     /// The address a TCP socket holds its local port on: its `bind`'s, or
     /// the one `listen` or a loopback connection took.
@@ -648,6 +651,29 @@ struct State {
     inbox_size: usize,
     /// How many datagrams and queries have come, which orders them.
     received: u64,
+}
+
+/// What a TCP connection has carried, for `tcp_info`: from its handshake's
+/// first segment, or its creation on the side that accepted it.
+#[derive(Default, Clone, Copy)]
+struct Counts {
+    /// When it began, on the host's monotonic clock.
+    opened: Option<u64>,
+    /// The bytes the guest wrote and read.
+    written: u64,
+    read: u64,
+    /// Segments of data, one per [`tcp_info::SND_MSS`] of each write and
+    /// each read.
+    segments_out: u32,
+    segments_in: u32,
+    /// When the guest last wrote and read bytes.
+    wrote: Option<u64>,
+    came: Option<u64>,
+}
+impl Counts {
+    fn segments(n: usize) -> u32 {
+        u32::try_from(n.div_ceil(tcp_info::SND_MSS as usize)).unwrap_or(u32::MAX)
+    }
 }
 
 /// A datagram from another guest socket.
@@ -1137,6 +1163,11 @@ impl InetSocket {
         match read {
             Ok((n, at_mark, came)) => {
                 s.eof_read |= n == 0 && ends && stream.readiness().read_closed;
+                if n > 0 && !peek {
+                    s.counts.read += n as u64;
+                    s.counts.segments_in += Counts::segments(n);
+                    s.counts.came = self.now();
+                }
                 Ok(Received {
                     at_mark,
                     came,
@@ -1191,6 +1222,13 @@ impl InetSocket {
             return Err(Errno::EPIPE);
         };
         let written = stream.write(bytes);
+        if let Ok(n) = written
+            && n > 0
+        {
+            s.counts.written += n as u64;
+            s.counts.segments_out += Counts::segments(n);
+            s.counts.wrote = self.now();
+        }
         if let (Ok(n), Some((link, side))) = (&written, Self::joined(&s)) {
             let last = bytes[..*n].last().copied().filter(|_| urgent);
             link.wrote(side, *n, last);
@@ -1282,6 +1320,10 @@ impl InetSocket {
                     s.noted = false;
                     s.read_shut = false;
                     s.eof_read = false;
+                    s.counts = Counts {
+                        opened: self.now(),
+                        ..Counts::default()
+                    };
                     s.connection = Connection::Connecting;
                     // The stub's own stream is open at once.
                     if address.port() == DNS && !loopback {
@@ -2021,6 +2063,7 @@ impl InetSocket {
         s.link = Some((own_link, 1));
         s.bound = Some(to);
         s.port_locked = locked;
+        s.counts.opened = child.now();
         drop(s);
         child
     }
@@ -2441,6 +2484,8 @@ pub(crate) struct Full {
     pub(crate) received: u32,
     /// What it dropped (`sk_drops`): a listener's dropped handshakes.
     pub(crate) drops: u32,
+    /// A TCP socket's `tcp_info`.
+    pub(crate) tcp: Option<TcpInfo>,
     pub(crate) receive_buffer: u32,
     pub(crate) send_buffer: u32,
 }
@@ -2517,6 +2562,7 @@ impl InetSocket {
             port_locked: s.port_locked,
             received: received as u32,
             drops: s.listen.as_ref().map_or(0, |listen| listen.drops),
+            tcp: (!self.datagram).then(|| self.tcp_info(&s, &options, now)),
             receive_buffer: options.receive_buffer as u32,
             send_buffer: options.send_buffer as u32,
         };
@@ -2633,19 +2679,10 @@ impl InetSocket {
         let ready = stream.readiness();
         let shut = shutdown(s.read_shut || ready.read_closed, ready.write_closed);
         let timer = if state == TCP_SYN_SENT {
-            let syns = self
-                .network
-                .syns
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let syn = syns.iter().find(|syn| {
-                syn.stream
-                    .upgrade()
-                    .is_some_and(|own| Arc::ptr_eq(&own, stream))
-            });
-            syn.map_or((IDIAG_TIMER_ON, 0, None), |syn| {
-                (IDIAG_TIMER_ON, syn.tries as u8, Some(syn.next()))
-            })
+            self.syn_of(stream)
+                .map_or((IDIAG_TIMER_ON, 0, None), |(tries, next)| {
+                    (IDIAG_TIMER_ON, tries, Some(next))
+                })
         } else if options.keep_alive {
             let idle = u64::try_from(options.keep_idle).unwrap_or(0) * 1_000_000_000;
             (IDIAG_TIMER_KEEPALIVE, 0, now.map(|now| now + idle))
@@ -2664,6 +2701,87 @@ impl InetSocket {
 }
 
 impl InetSocket {
+    /// How many times the dropped handshake of `stream` has been sent
+    /// again, and when it goes next.
+    fn syn_of(&self, stream: &Arc<Stream>) -> Option<(u8, u64)> {
+        let syns = self
+            .network
+            .syns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        syns.iter()
+            .find(|syn| {
+                syn.stream
+                    .upgrade()
+                    .is_some_and(|own| Arc::ptr_eq(&own, stream))
+            })
+            .map(|syn| (syn.tries as u8, syn.next()))
+    }
+    /// What `tcp_get_info` tells of this socket at `now`, on the host's
+    /// monotonic clock: a listener's queue, a handshake's tries, or what
+    /// its connection has carried (see [`tcp_info`]).
+    fn tcp_info(&self, s: &State, options: &Options, now: Option<u64>) -> TcpInfo {
+        let uptime = now.unwrap_or(0) / 1_000_000;
+        let since = |at: Option<u64>| match (now, at) {
+            (Some(now), Some(at)) => {
+                u32::try_from(now.saturating_sub(at) / 1_000_000).unwrap_or(u32::MAX)
+            }
+            _ => 0,
+        };
+        if let Some(listen) = &s.listen {
+            return TcpInfo::listening(listen.ready.len() as u32, listen.backlog as u32);
+        }
+        let Some(stream) = &s.stream else {
+            return TcpInfo::unconnected(TCP_CLOSE, uptime);
+        };
+        let counts = s.counts;
+        let ready = stream.readiness();
+        let (unread, unsent) = stream.queued();
+        let state = match stream.phase() {
+            Phase::Connecting => {
+                let tries = self.syn_of(stream).map_or(0, |(tries, _)| tries);
+                return TcpInfo::connecting(tries, uptime, since(counts.opened));
+            }
+            Phase::Failed(_)
+                if s.connection != Connection::Connected
+                    && counts.written == 0
+                    && counts.read == 0 =>
+            {
+                return TcpInfo::unconnected(TCP_CLOSE, uptime);
+            }
+            Phase::Failed(_) => TCP_CLOSE,
+            Phase::Open => match (ready.write_closed, ready.read_closed) {
+                (false, false) => TCP_ESTABLISHED,
+                (false, true) => TCP_CLOSE_WAIT,
+                (true, false) if unsent > 0 => TCP_FIN_WAIT1,
+                (true, false) => TCP_FIN_WAIT2,
+                (true, true) if unsent > 0 => TCP_LAST_ACK,
+                (true, true) => TCP_CLOSE,
+            },
+        };
+        let open = stream.phase() == Phase::Open;
+        let unsent = unsent as u64;
+        let carried = tcp_info::Carried {
+            accepted: Self::joined(s).is_some_and(|(_, side)| side == 1),
+            sent: counts.written.saturating_sub(unsent),
+            fin_sent: open && ready.write_closed && unsent == 0,
+            received: counts.read + unread as u64,
+            fin_received: open && ready.read_closed,
+            unsent,
+            segments_out: counts.segments_out,
+            // What has come counts, read or not.
+            segments_in: counts.segments_in + Counts::segments(unread),
+            since_sent: since(counts.wrote.or(counts.opened)),
+            since_received: since(counts.came.or(counts.opened)),
+            rcv_wscale: tcp_info::receive_wscale(
+                options
+                    .receive_buffer_set
+                    .then_some(options.receive_buffer as u32),
+            ),
+        };
+        let in_flight = u32::from(matches!(state, TCP_FIN_WAIT1 | TCP_LAST_ACK));
+        TcpInfo::connected(state, &carried, in_flight)
+    }
     /// Whether closing this socket now waits: a connection on the loopback
     /// with a nonzero linger time, whose bytes still wait for room in the
     /// peer. Unread input, which resets it, does not wait.
@@ -3295,6 +3413,10 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 options.send_timeout
             };
             timeout.timeval().to_vec()
+        }
+        (6, 11) => {
+            let s = socket.lock();
+            socket.tcp_info(&s, &options, socket.now()).bytes().to_vec()
         }
         (1, 13) => {
             let mut linger = [0; 8];

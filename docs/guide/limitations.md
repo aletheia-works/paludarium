@@ -126,6 +126,19 @@ verified.
     of its own, so a sender that nobody reads fits a different number of
     bytes before it waits. One the guest does not set holds 256 KiB, where
     Linux grows it as it tunes the connection (to megabytes).
+  - `tcp_info` (`TCP_INFO`, `INET_DIAG_INFO`) has what the loopback
+    carries as Linux counts it: the state, options, window scales,
+    listener's queue, bytes sent, acknowledged, received and not yet sent,
+    and the slow start threshold, congestion window, path MTU, advertised
+    MSS and reordering Linux starts with. What Linux's TCP measures or
+    tunes takes the values of a loopback connection in the simplest case:
+    the round trip (30 µs) and the timeout, rates and pacing it gives, the
+    send and receive MSS and windows, which never grow, and segment counts
+    of one per 32 KiB written or read, one acknowledgement for each; times
+    since data came count from its read. Beyond a handshake's tries nothing
+    is retransmitted or lost, so those counts are 0; the peer's window scale is taken as Linux's
+    default, whatever buffer it set; and a connection the host made is
+    told the same way as one on the loopback.
 - **File mappings**: a file mapping shows the file's page cache as on Linux
   (a `MAP_PRIVATE` one in the pages it has not written), but the stores of a
   `MAP_SHARED` mapping reach the file on the host only when the guest reads
@@ -346,9 +359,8 @@ verified.
   `SOCK_DESTROY` is `EOPNOTSUPP`. A dump lists the sockets oldest first,
   where Linux's order follows its hash tables, and what an AF_UNIX socket
   sent that waits is counted as its send buffer is charged here, where
-  Linux counts its buffers' true sizes. Of a TCP socket they tell no
-  `tcp_info` (`INET_DIAG_INFO`, as `ss -i` asks), and its memory but for
-  its buffers as 0; its keepalive timer ends a whole `TCP_KEEPIDLE` from
+  Linux counts its buffers' true sizes. Of a TCP socket they tell its
+  memory but for its buffers as 0; its keepalive timer ends a whole `TCP_KEEPIDLE` from
   now, and only a handshake on the loopback has its retransmission's
   time and count. A connection the host made has no `TIME_WAIT` after
   it, and a closed socket whose bytes still wait to go shows as a hold in

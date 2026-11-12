@@ -2072,6 +2072,13 @@ kernel.
   Windows and in WebAssembly), the one the scheduler calls use, and here the ticks
   fall on whole multiples of it on each clock. `clock_getres` gives 1 ns,
   and the tick for the coarse clocks.
+- `clock_nanosleep` and `timer_create` run on `CLOCK_REALTIME`,
+  `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` and `CLOCK_TAI`. As Linux's,
+  `CLOCK_MONOTONIC_RAW` and the coarse clocks give `EOPNOTSUPP` (they can
+  only be read), as does the thread's CPU clock for a sleep, and
+  `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. The process's
+  CPU clock, CPU-time timers and the alarm clocks are not modelled
+  (`EINVAL`).
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one

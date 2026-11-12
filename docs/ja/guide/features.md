@@ -1806,6 +1806,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   1 ms）。スケジューラの呼び出しも同じティックを使います。ここでは、ティックは
   それぞれの時計でその倍数ちょうどに来ます。`clock_getres` は 1 ns、粗い時計では
   ティックの長さを返します。
+- `clock_nanosleep` と `timer_create` は、`CLOCK_REALTIME`、`CLOCK_MONOTONIC`、
+  `CLOCK_BOOTTIME`、`CLOCK_TAI` で動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
+  粗い時計は読むことしかできないので `EOPNOTSUPP` になり、スレッドの CPU 時計で眠る
+  ときも `EOPNOTSUPP` です。`clock_nanosleep` は、`flags` のうち `TIMER_ABSTIME`
+  しか見ません。プロセスの CPU 時計で眠ること、CPU 時間のタイマー、アラームの時計は
+  まだ再現していません（`EINVAL`）。
 - プロセスの実時間のインターバルタイマー（`ITIMER_REAL`）は、Linux と同じく、満了すると
   `SIGALRM` を送り、間隔の分だけ次に進みます。`setitimer` はタイマーより先に新しい値を読んで
   確かめ、古い値はタイマーを設定してから書き出すので、古い値を書けないときはタイマーを設定した

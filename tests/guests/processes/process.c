@@ -20930,6 +20930,31 @@ int main(int argc, char **argv) {
             long behind = (b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec);
             result("coarse-behind", behind >= 0 && behind < 1000000000L);
         }
+        /* Sleeps and timers on each clock, as Linux's k_clocks give them:
+           MONOTONIC_RAW, the coarse clocks and (for a sleep) the thread's CPU
+           clock can only be read; a sleep looks at no flag but TIMER_ABSTIME,
+           and timer_create copies the sigevent before it checks the clock. */
+        struct timespec zero = {0, 0};
+        int sleepers[] = {CLOCK_THREAD_CPUTIME_ID, CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE,
+                          CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME, CLOCK_TAI, 10, 12};
+        /* The raw call: the C library refuses the thread's CPU clock itself. */
+        for (size_t i = 0; i < sizeof sleepers / sizeof *sleepers; i++) {
+            errno = 0;
+            result("sleep-on", syscall(SYS_clock_nanosleep, sleepers[i], 0, &zero, NULL) < 0 ? -errno : 0);
+        }
+        errno = 0;
+        result("sleep-flags", syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 2, &zero, NULL) < 0 ? -errno : 0);
+        int timed[] = {CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, CLOCK_TAI, 10};
+        for (size_t i = 0; i < sizeof timed / sizeof *timed; i++) {
+            timer_t timer;
+            struct sigevent none = {.sigev_notify = SIGEV_NONE};
+            errno = 0;
+            long r = syscall(SYS_timer_create, timed[i], &none, &timer);
+            result("timer-on", r < 0 ? -errno : r);
+            if (r == 0) syscall(SYS_timer_delete, timer);
+        }
+        errno = 0;
+        result("timer-fault-first", syscall(SYS_timer_create, 10, (void *)8, &a) < 0 ? -errno : 0);
         errno = 0;
         result("unknown", clock_gettime(10, &a));
         result("errno", errno);

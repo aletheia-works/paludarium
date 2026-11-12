@@ -195,6 +195,32 @@ fn time_absolute_deadline() {
     assert_eq!(f.host.clock(paludarium_host::ClockId::Monotonic), Ok(100));
 }
 #[test]
+fn clock_nanosleep_clocks_and_flags() {
+    let mut f = fixture();
+    f.host
+        .set_clock(paludarium_host::ClockId::Realtime, 1_000);
+    f.host.set_clock(paludarium_host::ClockId::Monotonic, 100);
+    timespec(&mut f, 0, 42);
+    // BOOTTIME sleeps on the monotonic clock, TAI on the real-time one, and
+    // flags other than TIMER_ABSTIME are not looked at.
+    assert_eq!(f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[7, 2, DATA, 0]), 0);
+    assert_eq!(f.host.clock(paludarium_host::ClockId::Monotonic), Ok(142));
+    assert_eq!(f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[11, !1, DATA, 0]), 0);
+    // Clocks that cannot sleep, before the request is read; unknown ones.
+    for clock in [3, 4, 5, 6] {
+        assert_eq!(
+            f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[clock, 0, 8, 0]),
+            errno(Errno::EOPNOTSUPP)
+        );
+    }
+    for clock in [10, 12, u64::from(u32::MAX)] {
+        assert_eq!(
+            f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[clock, 0, DATA, 0]),
+            errno(Errno::EINVAL)
+        );
+    }
+}
+#[test]
 fn time_interrupt_remaining() {
     let mut f = fixture();
     timespec(&mut f, 2, 42);

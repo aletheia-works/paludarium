@@ -81,9 +81,28 @@ runs:
         # One update serves the whole job, so the files the toolchain and the packages were
         # downloaded with all come from the lists the cache keeps.
         updated=
+        # An update has hung on a mirror until the job's 60 minutes ran out (2026-11-11), so
+        # each attempt is bounded, and a later one goes without the Azure mirror when others
+        # are listed. Without lists nothing installs, so the last failure fails the job.
+        refresh() {
+          local attempt
+          for attempt in 1 2 3; do
+            if sudo timeout --kill-after=10 120 apt-get update; then
+              return 0
+            fi
+            echo "apt-get update failed or hit its limit of 120 seconds (attempt $attempt)" >&2
+            if [ -f "$mirrors" ] && grep -q 'azure\.archive\.ubuntu\.com' "$mirrors" &&
+              grep -qv 'azure\.archive\.ubuntu\.com' "$mirrors"; then
+              sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
+            fi
+            sleep 15
+          done
+          echo "apt-get update did not succeed in 3 attempts" >&2
+          return 1
+        }
         update() {
           if [ -z "$offline" ] && [ -z "$updated" ]; then
-            sudo apt-get update
+            refresh
             updated=1
           fi
         }
@@ -104,7 +123,7 @@ runs:
             fi
             echo "::warning::the cached apt files for this image are not enough; using the network"
             offline=
-            sudo apt-get update
+            refresh || return
             updated=1
           fi
           while true; do

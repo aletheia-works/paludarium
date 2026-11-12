@@ -1524,21 +1524,13 @@ fn size_limited(
     offset: Option<u64>,
     len: usize,
 ) -> Result<usize, Errno> {
-    let limit = c.group.fsize();
-    if limit == u64::MAX || len == 0 {
-        return Ok(len);
-    }
-    let metadata = file.stat()?;
-    if metadata.mode & 0o170000 != 0o100000 {
-        return Ok(len);
-    }
-    let start = match offset {
-        _ if file.flags() & 0o2000 != 0 => metadata.size,
-        Some(offset) => offset,
-        None => file.seek(0, 1)?,
-    };
-    let room = size_room(c, start)?;
-    Ok(len.min(usize::try_from(room).unwrap_or(usize::MAX)))
+    size_limited_by(c, file, len, |metadata| {
+        Ok(match offset {
+            _ if file.flags() & 0o2000 != 0 => metadata.size,
+            Some(offset) => offset,
+            None => file.seek(0, 1)?,
+        })
+    })
 }
 /// [`size_limited`] for a write that starts at `start` whatever the file's
 /// `O_APPEND` (`RWF_NOAPPEND`).
@@ -1548,18 +1540,39 @@ fn size_limited_from(
     start: u64,
     len: usize,
 ) -> Result<usize, Errno> {
-    if c.group.fsize() == u64::MAX || len == 0 || file.stat()?.mode & 0o170000 != 0o100000 {
+    size_limited_by(c, file, len, |_| Ok(start))
+}
+/// The bytes of a `len`-byte write of a regular file that RLIMIT_FSIZE lets
+/// through from where `start` says it starts.
+fn size_limited_by(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    len: usize,
+    start: impl FnOnce(&FileStat) -> Result<u64, Errno>,
+) -> Result<usize, Errno> {
+    if c.group.fsize() == u64::MAX || len == 0 {
         return Ok(len);
     }
-    let room = size_room(c, start)?;
+    let metadata = file.stat()?;
+    if metadata.mode & 0o170000 != 0o100000 {
+        return Ok(len);
+    }
+    let room = size_room(c, start(&metadata)?)?;
     Ok(len.min(usize::try_from(room).unwrap_or(usize::MAX)))
 }
 /// A positioned write with `RWF_NOAPPEND`: at `offset` even in an
-/// `O_APPEND` file ([`FileHandle::write_at_unappended`]); a kind without it
-/// writes as [`write_at`] does.
+/// `O_APPEND` file ([`FileHandle::write_at_unappended`]). A kind without it
+/// writes as [`write_at`] does if it has no position to append at (a
+/// device); a regular file of such a kind gives `EOPNOTSUPP` rather than
+/// append.
 fn write_at_unappended(file: &Arc<dyn FileHandle>, offset: u64, b: &[u8]) -> Result<usize, Errno> {
     match file.write_at_unappended(offset, b) {
-        Err(e) if e == Errno::ENODEV => write_at(file, offset, b),
+        Err(e) if e == Errno::ENODEV => {
+            if file.stat()?.mode & S_IFMT == S_IFREG {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            write_at(file, offset, b)
+        }
         result => result,
     }
 }

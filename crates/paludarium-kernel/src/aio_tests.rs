@@ -348,6 +348,43 @@ fn reads_and_writes_complete_before_submit_returns() {
 }
 
 #[test]
+fn noappend_writes_an_appending_file_at_aio_offset() {
+    let mut f = fixture();
+    f.mem.write(GuestAddr(DATA + 0xe00), b"/a\0").unwrap();
+    let fd = f.ret(2, &[DATA + 0xe00, 0o2102, 0o600]);
+    f.mem.write(GuestAddr(BUFFERS), b"abcdef").unwrap();
+    assert_eq!(f.ret(1, &[fd, BUFFERS, 6]), 6);
+    let ctx = f.setup(8);
+    f.mem.write(GuestAddr(BUFFERS + 0x100), b"XY").unwrap();
+    let write = Iocb {
+        data: 1,
+        opcode: 1,
+        fildes: fd as u32,
+        buf: BUFFERS + 0x100,
+        nbytes: 2,
+        offset: 1,
+        ..Iocb::default()
+    };
+    assert_eq!(
+        f.submit(
+            ctx,
+            Iocb {
+                rw_flags: 0x20,
+                ..write
+            }
+        ),
+        1
+    );
+    // Without it, the write appends.
+    assert_eq!(f.submit(ctx, Iocb { data: 2, ..write }), 1);
+    assert_eq!(f.reap(ctx), [(1, IOCBS, 2), (2, IOCBS, 2)]);
+    let mut got = [0; 8];
+    assert_eq!(f.ret(17, &[fd, BUFFERS + 0x200, 8, 0]), 8);
+    f.mem.read(GuestAddr(BUFFERS + 0x200), &mut got).unwrap();
+    assert_eq!(&got, b"aXYdefXY");
+}
+
+#[test]
 fn submit_checks_each_request_in_linux_order() {
     let mut f = fixture();
     let fd = f.file("a", b"abc");

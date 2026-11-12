@@ -4352,6 +4352,32 @@ mod vectored_flags {
         assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0]), 2);
     }
     #[test]
+    fn noappend_measures_rlimit_fsize_from_where_it_writes() {
+        let mut f = fixture();
+        let (iov, buf) = (DATA + 0x300, DATA + 0x400);
+        f.mem.write(GuestAddr(DATA), b"/a\0").unwrap();
+        f.mem.write(GuestAddr(buf), b"abcdef").unwrap();
+        let fd = f.ret(2, &[DATA, 0o2102, 0o600]);
+        assert_eq!(f.ret(1, &[fd, buf, 6]), 6);
+        iovec(&f, iov, buf, 2);
+        f.thread.state.signal_actions.insert(
+            25,
+            crate::SignalAction {
+                handler: 1,
+                ..Default::default()
+            },
+        );
+        f.mem.write_u64(GuestAddr(DATA + 0x200), 4).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 0x208), 4).unwrap();
+        assert_eq!(f.ret(160, &[1, DATA + 0x200]), 0); // setrlimit(RLIMIT_FSIZE)
+        // Appending starts at the end, past the limit: EFBIG.
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 0, 0, 0]), errno(Errno(27)));
+        // NOAPPEND starts at the offset: all of it, then what is left.
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 1, 0, 0x20]), 2);
+        assert_eq!(f.ret(PWRITEV2, &[fd, iov, 1, 3, 0, 0x20]), 1);
+        assert_eq!(contents(&mut f, fd), b"aabaef");
+    }
+    #[test]
     fn nowait_needs_a_file_that_has_it_and_does_not_wait() {
         let mut f = fixture();
         let (iov, buf) = (DATA + 0x300, DATA + 0x400);

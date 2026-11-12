@@ -92,7 +92,7 @@ runs:
           local package policy
           # shellcheck disable=SC2086 # the packages are separate words
           for package in $PACKAGES; do
-            # Read whole first: with pipefail, grep -q ending early could fail apt-cache.
+            # Not piped into grep -q, whose early exit could make apt-cache fail under pipefail.
             policy="$(apt-cache policy "$package")"
             if ! grep -q '^  Candidate: [^(]' <<< "$policy"; then
               echo "apt's lists have no candidate for $package" >&2

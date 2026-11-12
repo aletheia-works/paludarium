@@ -5,7 +5,11 @@
 //! (`/proc/sys/fs/aio-nr`, mode 0444) and their limit (`aio-max-nr`), as
 //! `fs/aio.c` has them: unsigned longs (`proc_doulongvec_minmax`), whose
 //! write takes no `-`, and which only root (user ID 0 outside any user
-//! namespace) may open to write.
+//! namespace) may open to write. The machine's inotify limits
+//! (`/proc/sys/fs/inotify`), as `fs/notify/inotify/inotify_user.c` has
+//! them, are root's in the same way: `max_user_instances` and
+//! `max_user_watches` unsigned longs from 0 to `INT_MAX`, and
+//! `max_queued_events` an `int` from 0.
 //!
 //! Each file is the opener's IPC namespace's ([`crate::mqueue::Limits`]),
 //! so a new namespace shows Linux's defaults again. A read gives the value
@@ -40,6 +44,7 @@ pub(crate) enum Directory {
     Sys,
     Fs,
     Mqueue,
+    Inotify,
 }
 
 /// A file of `/proc/sys/fs/mqueue`.
@@ -85,12 +90,28 @@ pub(crate) enum Aio {
     Nr,
 }
 
+/// A file of `/proc/sys/fs/inotify`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Inotify {
+    QueuedEvents,
+    UserInstances,
+    UserWatches,
+}
+
+/// The inotify files by name, in the order Linux lists them (by name).
+const INOTIFY: [(&[u8], Inotify); 3] = [
+    (b"max_queued_events", Inotify::QueuedEvents),
+    (b"max_user_instances", Inotify::UserInstances),
+    (b"max_user_watches", Inotify::UserWatches),
+];
+
 /// What `path` names under `/proc/sys`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Entry {
     Directory(Directory),
     Setting(Setting),
     Aio(Aio),
+    Inotify(Inotify),
 }
 
 /// The entry `path` names, if it is one of these.
@@ -104,9 +125,16 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
         b"" => Some(Entry::Directory(Directory::Sys)),
         b"/fs" => Some(Entry::Directory(Directory::Fs)),
         b"/fs/mqueue" => Some(Entry::Directory(Directory::Mqueue)),
+        b"/fs/inotify" => Some(Entry::Directory(Directory::Inotify)),
         b"/fs/aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
         b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
         _ => {
+            if let Some(name) = rest.strip_prefix(b"/fs/inotify/") {
+                return INOTIFY
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .map(|&(_, file)| Entry::Inotify(file));
+            }
             let name = rest.strip_prefix(b"/fs/mqueue/")?;
             SETTINGS
                 .iter()
@@ -123,9 +151,11 @@ pub(crate) fn entries(directory: Directory) -> Vec<DirectoryEntry> {
         Directory::Fs => vec![
             (b"aio-max-nr", DT_REG),
             (b"aio-nr", DT_REG),
+            (b"inotify", DT_DIR),
             (b"mqueue", DT_DIR),
         ],
         Directory::Mqueue => SETTINGS.iter().map(|&(name, _)| (name, DT_REG)).collect(),
+        Directory::Inotify => INOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
     };
     [(&b"."[..], DT_DIR), (b"..", DT_DIR)]
         .into_iter()
@@ -164,6 +194,17 @@ fn aio_line(limits: &crate::aio::Limits, aio: Aio) -> Vec<u8> {
     format!("{value}\n").into_bytes()
 }
 
+/// The value of an inotify file, as a line.
+fn inotify_line(limits: &crate::inotify::Limits, file: Inotify) -> Vec<u8> {
+    match file {
+        Inotify::QueuedEvents => line(limits.events.load(Ordering::SeqCst)),
+        Inotify::UserInstances => {
+            format!("{}\n", limits.instances.load(Ordering::SeqCst)).into_bytes()
+        }
+        Inotify::UserWatches => format!("{}\n", limits.watches.load(Ordering::SeqCst)).into_bytes(),
+    }
+}
+
 /// The status of `entry`: a directory anyone may read and search, a
 /// regular file of mode 0644, its owner's root's, or an aio file, root's,
 /// 0644 or for `aio-nr` 0444.
@@ -173,6 +214,10 @@ pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
         Entry::Aio(aio) => FileStat {
             mode: if aio == Aio::Nr { 0o100_444 } else { 0o100_644 },
             ..crate::proc::stat(aio_line(&c.processes.aio, aio).len())
+        },
+        Entry::Inotify(file) => FileStat {
+            mode: 0o100_644,
+            ..crate::proc::stat(inotify_line(&c.files.caches.notify.limits, file).len())
         },
         Entry::Setting(setting) => {
             let (uid, gid) = owner(c);
@@ -217,6 +262,17 @@ pub(crate) fn open(
                 flags,
             }))
         }
+        Entry::Inotify(file) => {
+            if flags & 3 != 0 && c.process.credentials.euid != 0 {
+                return Err(Errno::EACCES);
+            }
+            Ok(Arc::new(SettingFile {
+                value: Value::Inotify(Arc::clone(&c.files.caches.notify), file),
+                stat: stat(c, entry),
+                position: Mutex::new(0),
+                flags,
+            }))
+        }
         // `test_perm`: root has the owner's bits, everyone else the others'.
         Entry::Aio(aio) => {
             if flags & 3 != 0 && (aio == Aio::Nr || c.process.credentials.euid != 0) {
@@ -236,6 +292,7 @@ pub(crate) fn open(
 enum Value {
     Mqueue(Queues, Setting),
     Aio(Arc<crate::aio::Limits>, Aio),
+    Inotify(Arc<crate::inotify::Notifier>, Inotify),
 }
 
 impl Value {
@@ -245,6 +302,7 @@ impl Value {
                 line(setting.of(queues.limits()).0.load(Ordering::SeqCst))
             }
             Self::Aio(limits, aio) => aio_line(limits, *aio),
+            Self::Inotify(notifier, file) => inotify_line(&notifier.limits, *file),
         }
     }
     /// Takes the value written at the start of the file: the bytes taken.
@@ -262,6 +320,26 @@ impl Value {
                     return Err(Errno::EINVAL);
                 }
                 limits.set_max(value);
+                Ok(consumed)
+            }
+            Self::Inotify(notifier, file) => {
+                let limits = &notifier.limits;
+                if *file == Inotify::QueuedEvents {
+                    let (value, consumed) = parse(buf, Some((0, i32::MAX)))?;
+                    limits.events.store(value, Ordering::SeqCst);
+                    return Ok(consumed);
+                }
+                // `proc_doulongvec_minmax`, from 0 to `INT_MAX`.
+                let (negative, value, consumed) = scan(buf)?;
+                if negative || value > i32::MAX as u64 {
+                    return Err(Errno::EINVAL);
+                }
+                let limit = if *file == Inotify::UserInstances {
+                    &limits.instances
+                } else {
+                    &limits.watches
+                };
+                limit.store(value, Ordering::SeqCst);
                 Ok(consumed)
             }
         }
@@ -455,7 +533,17 @@ mod tests {
             Some(Entry::Aio(Aio::MaxNr))
         );
         assert_eq!(entry(b"/proc/sys/fs/aio-nr"), Some(Entry::Aio(Aio::Nr)));
-        assert_eq!(entries(Directory::Fs).len(), 5);
+        assert_eq!(entries(Directory::Fs).len(), 6);
+        assert_eq!(
+            entry(b"/proc/sys/fs/inotify"),
+            Some(Entry::Directory(Directory::Inotify))
+        );
+        assert_eq!(
+            entry(b"/proc/sys/fs/inotify/max_user_watches"),
+            Some(Entry::Inotify(Inotify::UserWatches))
+        );
+        assert_eq!(entry(b"/proc/sys/fs/inotify/other"), None);
+        assert_eq!(entries(Directory::Inotify).len(), 5);
         assert_eq!(entry(b"/proc/sys/kernel"), None);
         assert_eq!(entry(b"/proc/system"), None);
         assert_eq!(entries(Directory::Mqueue).len(), 7);

@@ -1,16 +1,17 @@
 //! Signal-driven I/O, as Linux's `fcntl.c` and `kill_fasync` have it: the
 //! owner (`F_SETOWN`, `F_SETOWN_EX`) and signal (`F_SETSIG`) of an open file,
-//! and the signal a pipe, socket, pseudo-terminal or the host's standard
-//! stream with `O_ASYNC` sends its owner when it changes.
+//! and the signal a pipe, socket, pseudo-terminal, inotify instance or the
+//! host's standard stream with `O_ASYNC` sends its owner when it changes.
 use crate::processes::Processes;
 use crate::syscalls::Context;
 use paludarium_host::FileHandle;
 use paludarium_types::{Errno, GuestAddr};
 use std::sync::{Arc, Weak};
 
-/// `O_ASYNC` (`FASYNC`): only pipes, sockets, pseudo-terminals and a
-/// standard stream that is one or a terminal keep it, the files that have Linux's `fasync`
-/// ([`has_fasync`]); on any other `F_SETFL` drops it.
+/// `O_ASYNC` (`FASYNC`): only pipes, sockets, pseudo-terminals, inotify
+/// instances and a standard stream that is one or a terminal keep it, the
+/// files that have Linux's `fasync` ([`has_fasync`]); on any other `F_SETFL`
+/// drops it.
 pub(crate) const O_ASYNC: u32 = 0o20000;
 
 /// Whom a file's signals go to, as `F_OWNER_TID`, `F_OWNER_PID` and
@@ -89,12 +90,13 @@ pub(crate) fn siginfo(signal: i32, fd: i32, reason: Reason) -> [u8; 48] {
     info
 }
 
-/// Whether `file` has Linux's `fasync`: a pipe, a socket or a
-/// pseudo-terminal, or a host's standard stream when that is a pipe, a
-/// socket or a terminal.
+/// Whether `file` has Linux's `fasync`: a pipe, a socket, a pseudo-terminal
+/// or an inotify instance (`fsnotify_fasync`), or a host's standard stream
+/// when that is a pipe, a socket or a terminal.
 pub(crate) fn has_fasync(file: &Arc<dyn FileHandle>) -> bool {
     crate::sockets::endpoint(file).is_some()
         || crate::inet::of(file).is_some()
+        || crate::inotify::of(file).is_some()
         || crate::pty::is_terminal(file)
         || crate::files::standard(file).is_some_and(crate::files::StandardFile::signals)
 }
@@ -105,6 +107,9 @@ fn owner(c: &Context<'_>, file: &Arc<dyn FileHandle>) -> FileOwner {
     }
     if let Some(pipe) = crate::sockets::pipe(file) {
         return pipe.file_owner();
+    }
+    if let Some(instance) = crate::inotify::of(file) {
+        return instance.file_owner();
     }
     match crate::sockets::endpoint(file) {
         Some(endpoint) => endpoint.file_owner(),
@@ -118,6 +123,9 @@ fn set_owner(c: &Context<'_>, file: &Arc<dyn FileHandle>, owner: FileOwner) {
     }
     if let Some(pipe) = crate::sockets::pipe(file) {
         return pipe.set_file_owner(owner);
+    }
+    if let Some(instance) = crate::inotify::of(file) {
+        return instance.set_file_owner(owner);
     }
     match crate::sockets::endpoint(file) {
         Some(endpoint) => endpoint.set_file_owner(owner),
@@ -186,6 +194,8 @@ pub(crate) fn set_flags(
             endpoint.set_async(registration);
         } else if let Some(socket) = crate::inet::of(file) {
             socket.set_async(registration);
+        } else if let Some(instance) = crate::inotify::of(file) {
+            instance.set_async(registration);
         } else if crate::pty::is_terminal(file) {
             crate::pty::set_async(c, file, registration);
         } else if let Some(stdin) = crate::files::standard(file) {

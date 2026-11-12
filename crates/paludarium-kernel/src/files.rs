@@ -1255,7 +1255,8 @@ fn directory_entries(
             crate::sysctl::entries(directory)
         }
         _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
-        Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c),
+        Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c, false),
+        Some(crate::proc::OwnEntry::DescriptorInfos) => descriptor_entries(c, true),
         Some(crate::proc::OwnEntry::Directory) => own_entries(),
         _ if crate::devices::entry(&d.path) == Some(crate::devices::Entry::Directory) => {
             crate::devices::entries(c.files.fs.metadata(b"/", true)?.inode)
@@ -2524,7 +2525,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // mount's minor number is its position in mountinfo, whose IDs start at
     // 21; a memfd's device 0 gives 20, a mount mountinfo does not show, as
     // Linux's internal one for memfds is not shown.
-    let id = 20 + (device & 0xff | (device >> 12) & !0xff);
+    let id = mount_id(device);
     let (bit, id) = if mask & STATX_MNT_ID_UNIQUE != 0 {
         (STATX_MNT_ID_UNIQUE, 1 << 31 | id)
     } else {
@@ -2534,6 +2535,11 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     b[144..152].copy_from_slice(&id.to_le_bytes());
     output(c, out, &b)?;
     Ok(0)
+}
+/// The ID of the mount whose device is `device`, as `/proc/self/mountinfo`
+/// numbers it: its minor number is its position there, from 21.
+fn mount_id(device: u64) -> u64 {
+    20 + (device & 0xff | (device >> 12) & !0xff)
 }
 /// `struct statx` with what [`encode_stat`] gives a `struct stat`: the basic
 /// fields, no birth time, and the mount's number as the device minor.
@@ -4921,6 +4927,11 @@ fn open_path(
             crate::proc::OwnEntry::Descriptors => Arc::new(crate::proc::OwnDirectory::new(
                 crate::proc::descriptors_stat(),
             )),
+            crate::proc::OwnEntry::DescriptorInfos => {
+                Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
+            }
+            // Opened above while the descriptor is open.
+            crate::proc::OwnEntry::DescriptorInfo(_) => return Err(Errno::ENOENT),
             crate::proc::OwnEntry::Status => {
                 Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
             }
@@ -5647,14 +5658,17 @@ pub(crate) fn mapped_path(c: &Context<'_>, d: &Descriptor) -> Option<Vec<u8>> {
 }
 /// The entries of `/proc/self/fd`: `.`, `..` and a link per descriptor, in
 /// order, as Linux lists them.
-fn descriptor_entries(c: &Context<'_>) -> Vec<paludarium_host::DirectoryEntry> {
+/// The names in `fd`, links, or with `info` in `fdinfo`, regular files.
+fn descriptor_entries(c: &Context<'_>, info: bool) -> Vec<paludarium_host::DirectoryEntry> {
     const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
     const DT_LNK: u8 = 10;
+    let kind = if info { DT_REG } else { DT_LNK };
     let fds = c.files.fds.lock().unwrap_or_else(PoisonError::into_inner);
     [b".".to_vec(), b"..".to_vec()]
         .into_iter()
         .map(|name| (name, DT_DIR))
-        .chain(fds.keys().map(|n| (n.to_string().into_bytes(), DT_LNK)))
+        .chain(fds.keys().map(|n| (n.to_string().into_bytes(), kind)))
         .enumerate()
         .map(|(i, (name, kind))| paludarium_host::DirectoryEntry {
             name,
@@ -5774,6 +5788,12 @@ fn other_generated_stat(
     let stat = match entry {
         crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),
         crate::proc::OwnEntry::Descriptors => crate::proc::descriptors_stat(),
+        crate::proc::OwnEntry::DescriptorInfos => crate::proc::directory_stat(),
+        // As Linux's, of size 0, while the descriptor is open.
+        crate::proc::OwnEntry::DescriptorInfo(n) => {
+            c.files.descriptor(u64::from(n)).ok()?;
+            crate::proc::stat(0)
+        }
         crate::proc::OwnEntry::Status => crate::proc::stat(status(c).len()),
         crate::proc::OwnEntry::Stat
         | crate::proc::OwnEntry::Cmdline
@@ -5893,8 +5913,31 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
                 caught: mask(&|handler| handler > 1),
             })
         }
+        crate::proc::OwnEntry::DescriptorInfo(n) => descriptor_info(c, n)?,
         _ => return None,
     })
+}
+/// `/proc/self/fdinfo/<n>` while descriptor `n` is open, as Linux's
+/// `seq_show` writes it: the description's position, its flags in octal
+/// (`F_GETFL`'s, and `O_CLOEXEC` for the descriptor), the ID of its mount
+/// (as `statx` gives it) and its inode; then, for an inotify instance, a line
+/// for each watch ([`crate::inotify::Instance::fdinfo`]). The lines other
+/// files add (eventfd's count, an epoll's targets, a signalfd's mask, the
+/// record locks) are not there.
+fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
+    const O_CLOEXEC: u32 = 0o2000000;
+    let d = c.files.descriptor(u64::from(n)).ok()?;
+    let flags = status_flags(&d) | if d.cloexec { O_CLOEXEC } else { 0 };
+    // A file that cannot seek (a pipe, a socket) is at 0.
+    let pos = d.file.seek(0, 1).unwrap_or(0);
+    let ino = d.file.stat().map_or(0, |stat| stat.inode);
+    let mount = mount_id(descriptor_device(c, &d));
+    let mut out =
+        format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t{mount}\nino:\t{ino}\n").into_bytes();
+    if let Some(instance) = crate::inotify::of(&d.file) {
+        out.extend(instance.fdinfo());
+    }
+    Some(out)
 }
 /// The contents of a system-wide /proc file, from what `sysinfo` reports.
 fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {

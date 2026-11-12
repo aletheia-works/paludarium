@@ -475,11 +475,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   グループ、セッションがなければ `ESRCH` です。`F_GETOWN` と `F_GETOWN_EX` で
   読み出し、その役割のもの（たとえばプロセスのいないグループ）がない間は 0 です。
   `F_SETSIG` で送るシグナルを選びます。`O_ASYNC` を持てるのはパイプ、ソケット、
-  疑似端末、それにパイプ、ソケット、端末のどれかであるときのホストの標準の
-  ストリームだけで、ほかのファイルでは
+  疑似端末、inotify のインスタンス、それにパイプ、ソケット、端末のどれかであるときの
+  ホストの標準のストリームだけで、ほかのファイルでは
   `F_SETFL` が落とし、`FIOASYNC` で付けようとすると `ENOTTY` です。`O_ASYNC` を付けた
   パイプ、ソケット、疑似端末（疑似端末は後述のとおり）は、持ち主にカーネルから
-  `SIGIO` を送ります。`F_SETSIG` があれば代わりにそのシグナルを送り、`si_code`
+  `SIGIO` を送ります。inotify のインスタンスは、`fsnotify_insert_event` の
+  `kill_fasync` と同じく、溜めたイベント 1 つごとに `POLL_IN` を送ります（直前の
+  イベントにまとめたものでは送りません）。`F_SETSIG` があれば代わりにそのシグナルを送り、`si_code`
   （`POLL_IN`、`POLL_OUT`、`POLL_ERR`、`POLL_PRI`、`POLL_HUP`）、`si_band`、`si_fd`（`O_ASYNC` を
   付けたディスクリプタ）を付けます。
   - **パイプ**：書き込みは、終わるときに読む側へ送ります（いっぱいで書けなかったときも
@@ -1472,7 +1474,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`maps`、`fd`、`ns`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
+  `cwd`、`maps`、`fd`、`fdinfo`、`ns`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。ただし、何も
   測っていないメモリと CPU の項目はありません。自分のディレクトリと `/proc` の下の
   それ以外のパスは、ふつうのパスと同じようにファイルシステムで探します。
@@ -1534,7 +1536,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   root（どのユーザー名前空間の外でもユーザー ID 0）だけです。どちらも Linux の
   `proc_doulongvec_minmax` と同じく unsigned long として読み書きし、書き込みは `-` を取らず
   （`EINVAL`）、それ以外は `/proc/sys/fs/mqueue` のファイルと同じに読みます。
-  `/proc/sys/fs` にあるのはこれらと `mqueue` だけです。
+  `/proc/sys/fs` にあるのはこれらと `inotify`、`mqueue` だけです。
+- `/proc/sys/fs/inotify` はマシンの inotify の上限で、root の持つモード 0644 の
+  通常のファイルです。書くために開けるのは root（どのユーザー名前空間の外でも
+  ユーザー ID 0）だけで、上のファイルと同じに読み書きします。`max_user_instances`
+  （最初は 128）と `max_user_watches`（最初は 31956、下のインスタンスの説明のとおり）は
+  0 から `INT_MAX` までの unsigned long で、それ以後に各ユーザーが持てる数です。
+  `max_queued_events`（最初は 16384）は 0 以上の `int` で、それ以後に作るインスタンスが
+  `IN_Q_OVERFLOW` までに溜めるイベントの数です。
+- `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
+  と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
+  （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、
+  ディスクリプタの `O_CLOEXEC` を加えたもの）、`mnt_id` は `statx` が返す ID、
+  `ino` は `fstat` が返す inode です。inotify のインスタンスでは、`inotify_fdinfo` と
+  同じく、新しいウォッチから順に 1 行ずつ加わります。`inotify wd:` にウォッチの
+  ディスクリプタ、`ino:` と `sdev:` にファイルの inode とカーネルの番号の付け方
+  （`MKDEV`）でのファイルシステムのデバイス、`mask:` に与えたマスクを 16 進で書き、
+  `ignored_mask:0` が続きます。
 - `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime` は、Linux と同じ形式で `sysinfo` と
   合った値を返します。ロードアベレージは 0 で、動いているタスクと生きているタスクの数、
   最後に割り当てた ID が続きます。メモリは合計、空き、使えるものがどれも 4 GiB で、ほかの
@@ -1740,7 +1758,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   一回りするまで使い回されません。`INOTIFY_IOC_SETNEXTWD` で次の番号を決められます。
   ウォッチのないディスクリプタの `inotify_rm_watch` は `EINVAL` です。1 人のユーザーが
   持てるのは、インスタンスが 128（`EMFILE`）、ウォッチが 31956（`ENOSPC`）で、
-  `sysinfo` が示す 4 GiB から Linux が出す数です。
+  `sysinfo` が示す 4 GiB から Linux が出す数です。インスタンスが溜めるイベントは
+  16384 です。どれも `/proc/sys/fs/inotify` で変えられます。
   ゲスト自身のシステムコールによる変更がイベントになり、Linux の `fsnotify` のフックと
   同じ順で届きます。新しいファイル、ディレクトリ、シンボリックリンク、FIFO、ソケット、
   リンクは `IN_CREATE` です（リンクではリンクされたファイルの `IN_ATTRIB` の後）。

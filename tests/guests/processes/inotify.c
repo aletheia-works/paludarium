@@ -9,6 +9,7 @@
    Outputs are watch descriptors (numbered from 1 in each instance), masks,
    names, whether cookies match, counts and errno values. */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -25,6 +26,7 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
@@ -942,6 +944,129 @@ static int case_exec(void) {
     return 0;
 }
 
+/* The instance itself: signal-driven I/O (O_ASYNC, FIOASYNC), whose signal
+ * comes once for each event queued; its /proc/self/fdinfo, which lists its
+ * watches the newest first; and /proc/sys/fs/inotify. Inode and device
+ * numbers are compared, not printed, and the file handle Linux adds after
+ * ignored_mask is not looked at. */
+static int signals_taken(int fd) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGRTMIN + 6);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    int count = 0;
+    while (sigtimedwait(&set, &info, &zero) > 0) {
+        printf(" [code=%d band=%#lx fd=%s]", info.si_code, (long)info.si_band, info.si_fd == fd ? "own" : "other");
+        count++;
+    }
+    return count;
+}
+static int case_instance(void) {
+    make_base("instance");
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGRTMIN + 6);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    int fd = inotify_init1(IN_NONBLOCK);
+    printf("setown=%ld setsig=%ld", e(fcntl(fd, F_SETOWN, getpid())), e(fcntl(fd, F_SETSIG, SIGRTMIN + 6)));
+    printf(" setfl=%ld", e(fcntl(fd, F_SETFL, O_ASYNC | O_NONBLOCK)));
+    printf(" async=%d\n", (fcntl(fd, F_GETFL) & O_ASYNC) != 0);
+    int wd = inotify_add_watch(fd, base, IN_CREATE | IN_ATTRIB);
+    touch(at("a"));
+    printf("created:");
+    printf(" count=%d\n", signals_taken(fd));
+    chmod(at("a"), 0600);
+    chmod(at("a"), 0600);
+    printf("merged:");
+    printf(" count=%d\n", signals_taken(fd));
+    inotify_rm_watch(fd, wd);
+    printf("removed:");
+    printf(" count=%d\n", signals_taken(fd));
+    int off = 0, on = 1;
+    long off_set = e(ioctl(fd, FIOASYNC, &off));
+    printf("fioasync off=%ld async=%d\n", off_set, (fcntl(fd, F_GETFL) & O_ASYNC) != 0);
+    wd = inotify_add_watch(fd, base, IN_CREATE);
+    touch(at("b"));
+    printf("off:");
+    printf(" count=%d\n", signals_taken(fd));
+    long on_set = e(ioctl(fd, FIOASYNC, &on));
+    printf("fioasync on=%ld async=%d\n", on_set, (fcntl(fd, F_GETFL) & O_ASYNC) != 0);
+    touch(at("c"));
+    printf("on:");
+    printf(" count=%d\n", signals_taken(fd));
+    drain(fd, "queued");
+    close(fd);
+
+    /* fdinfo: the lines every descriptor has, then one per watch. */
+    int in = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    printf("wds=%d", inotify_add_watch(in, base, IN_CREATE));
+    printf(" %d", inotify_add_watch(in, at("a"), IN_ATTRIB | IN_ONESHOT));
+    printf(" %d\n", inotify_add_watch(in, base, IN_CREATE | IN_DELETE | IN_EXCL_UNLINK));
+    struct stat own, dir, file;
+    fstat(in, &own);
+    stat(base, &dir);
+    stat(at("a"), &file);
+    /* statx's stx_mnt_id (STATX_MNT_ID), at byte 144 of its buffer. */
+    unsigned long long sx[32] = {0};
+    long sxr = e(syscall(SYS_statx, in, "", AT_EMPTY_PATH, 0x1000, sx));
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", in);
+    FILE *info = fopen(path, "r");
+    char line[512];
+    while (info && fgets(line, sizeof line, info)) {
+        unsigned long long n;
+        unsigned w, dev, mask, ignored;
+        unsigned long long ino;
+        if (sscanf(line, "mnt_id: %llu", &n) == 1) {
+            printf("mnt_id %s\n", sxr == 0 && n == sx[144 / 8] ? "statx" : "other");
+        } else if (sscanf(line, "ino: %llu", &n) == 1) {
+            printf("ino %s\n", n == (unsigned long long)own.st_ino ? "fstat" : "other");
+        } else if (sscanf(line, "inotify wd:%x ino:%llx sdev:%x mask:%x ignored_mask:%x", &w, &ino, &dev, &mask, &ignored) == 5) {
+            const char *name = ino == (unsigned long long)dir.st_ino ? "base" : ino == (unsigned long long)file.st_ino ? "a" : "other";
+            unsigned kernel = major(dir.st_dev) << 20 | minor(dir.st_dev);
+            printf("watch wd=%x %s sdev=%s mask=%#x ignored=%x\n", w, name, dev == kernel ? "same" : "other", mask, ignored);
+        } else {
+            printf("%s", line);
+        }
+    }
+    if (info) fclose(info);
+    close(in);
+
+    /* /proc/sys/fs/inotify: its files, root's 0644, each a number. */
+    DIR *d = opendir("/proc/sys/fs/inotify");
+    struct dirent *entry;
+    printf("sysctl:");
+    while (d && (entry = readdir(d))) {
+        if (entry->d_name[0] == '.') continue;
+        char name[300];
+        snprintf(name, sizeof name, "/proc/sys/fs/inotify/%s", entry->d_name);
+        struct stat st;
+        stat(name, &st);
+        FILE *v = fopen(name, "r");
+        char value[32] = {0};
+        char *got = v ? fgets(value, sizeof value, v) : NULL;
+        if (v) fclose(v);
+        char *end = NULL;
+        long number = got ? strtol(value, &end, 10) : -1;
+        printf(" [%s type=%d mode=%o uid=%u number=%d]", entry->d_name, entry->d_type, st.st_mode & 07777, st.st_uid,
+               got && number >= 0 && end && *end == '\n');
+    }
+    if (d) closedir(d);
+    printf("\n");
+    /* Only root may open them to write. */
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 && setresuid(65534, 65534, 65534)) _exit(97);
+        _exit(-e(open("/proc/sys/fs/inotify/max_user_watches", O_WRONLY)));
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("write as a user=%d\n", WIFEXITED(status) ? -WEXITSTATUS(status) : -1);
+    remove_all();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -960,6 +1085,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-moved")) return case_moved();
     if (!strcmp(mode, "inotify-fifo")) return case_fifo();
     if (!strcmp(mode, "inotify-exec")) return case_exec();
+    if (!strcmp(mode, "inotify-instance")) return case_instance();
     if (!strcmp(mode, "inotify-runner")) return case_runner();
     /* What case_exec runs: nothing. */
     if (!strcmp(mode, "inotify-quiet")) return 0;

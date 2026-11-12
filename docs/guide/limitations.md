@@ -365,10 +365,12 @@ verified.
   dentry does, but the symbolic links of the path it was opened at are
   resolved only when a rename or a removal first looks at it: a link changed
   before then sends its events to where the link leads.
-  An instance cannot be used for signal-driven I/O (`FIOASYNC` gives
-  `ENOTTY`, and `fcntl` leaves `O_ASYNC` off), its `/proc/self/fdinfo` entry
-  does not list its watches, `/proc/sys/fs/inotify` does not exist, and
-  `IN_UNMOUNT` is never sent. A read into a buffer the guest cannot write is
+  An instance's `/proc/self/fdinfo` lines end at `ignored_mask:0`, without
+  the file handle Linux adds for a file system that can make one, and
+  `IN_UNMOUNT` is never sent, as nothing is ever unmounted (there is no
+  `umount2`). `/proc/self/fdinfo` has only the lines every descriptor has
+  for the other files: not eventfd's count, an epoll's targets, a signalfd's
+  mask, a timerfd's settings or the record locks. A read into a buffer the guest cannot write is
   `EFAULT` with the events left queued, where Linux takes the first one off
   first. Changes the host makes to a mounted directory are not seen.
 - **Namespaces**: a user namespace has no `projid_map` and no

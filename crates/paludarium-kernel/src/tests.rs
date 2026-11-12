@@ -4880,6 +4880,175 @@ mod inotify {
             .map(|(wd, mask, _, name)| (*wd, *mask, &name[..]))
             .collect()
     }
+    /// The bytes of the file at `path`, read from its start.
+    fn contents(f: &mut Fixture, path: &[u8]) -> Vec<u8> {
+        let fd = f.ret(2, &[put(f, DATA + 0x800, path), 0, 0]);
+        assert!((fd as i64) >= 0, "{}", String::from_utf8_lossy(path));
+        let n = f.ret(0, &[fd, BUF, 0x800]);
+        assert_eq!(f.ret(3, &[fd]), 0);
+        let mut bytes = vec![0; n as usize];
+        f.mem.read(GuestAddr(BUF), &mut bytes).unwrap();
+        bytes
+    }
+    /// Writes `text` to the file at `path`: what the write returns.
+    fn write_to(f: &mut Fixture, path: &[u8], text: &[u8]) -> u64 {
+        let fd = f.ret(2, &[put(f, DATA + 0x800, path), 1, 0]);
+        f.mem.write(GuestAddr(BUF), text).unwrap();
+        let n = f.ret(1, &[fd, BUF, text.len() as u64]);
+        assert_eq!(f.ret(3, &[fd]), 0);
+        n
+    }
+    #[test]
+    fn an_async_instance_signals_its_owner_for_each_event_it_queues() {
+        let mut f = fixture();
+        // Blocked, the signals stay pending to be looked at.
+        f.thread.state.signal_mask = 1 << 39;
+        let taken = |f: &Fixture| -> Vec<(i32, i64, i32)> {
+            std::iter::from_fn(|| f.kernel.group.take_process_signal(1 << 39))
+                .filter_map(|signal| signal.queued)
+                .map(|info| {
+                    let word = |at: usize| i32::from_le_bytes(info[at..at + 4].try_into().unwrap());
+                    (
+                        word(8),
+                        i64::from_le_bytes(info[16..24].try_into().unwrap()),
+                        word(24),
+                    )
+                })
+                .collect()
+        };
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        assert_eq!(f.ret(72, &[fd, 8, 1]), 0);
+        assert_eq!(f.ret(72, &[fd, 9]), 1);
+        assert_eq!(f.ret(72, &[fd, 10, 40]), 0);
+        assert_eq!(f.ret(72, &[fd, 4, 0o20000 | 0o4000]), 0);
+        assert_eq!(f.ret(72, &[fd, 3]), 0o20000 | 0o4000);
+        let tmp = put(&f, DATA, b"/tmp");
+        let wd = f.ret(ADD, &[fd, tmp, 0x104]);
+        assert_eq!(wd, 1);
+        let a = put(&f, DATA + 0x40, b"/tmp/a");
+        let d = f.ret(2, &[a, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        // POLL_IN with its band, through the descriptor it was set on.
+        assert_eq!(taken(&f), [(1, 0x41, fd as i32)]);
+        // An event merged into the one before it queues nothing new.
+        assert_eq!(f.ret(90, &[a, 0o600]), 0);
+        assert_eq!(f.ret(90, &[a, 0o600]), 0);
+        assert_eq!(taken(&f), [(1, 0x41, fd as i32)]);
+        // Removing the watch queues its IN_IGNORED.
+        assert_eq!(f.ret(RM, &[fd, wd]), 0);
+        assert_eq!(taken(&f), [(1, 0x41, fd as i32)]);
+        // Without O_ASYNC nothing comes; FIOASYNC turns it on again.
+        assert_eq!(f.ret(72, &[fd, 4, 0o4000]), 0);
+        let wd = f.ret(ADD, &[fd, tmp, 0x100]);
+        let b = put(&f, DATA + 0x40, b"/tmp/b");
+        let d = f.ret(2, &[b, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert!(taken(&f).is_empty());
+        f.mem
+            .write(GuestAddr(DATA + 0x300), &1i32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(16, &[fd, 0x5452, DATA + 0x300]), 0);
+        assert_eq!(f.ret(72, &[fd, 3]) & 0o20000, 0o20000);
+        // IN_DELETE is not watched, and IN_IGNORED is queued.
+        assert_eq!(f.ret(87, &[b]), 0);
+        assert!(taken(&f).is_empty());
+        assert_eq!(f.ret(RM, &[fd, wd]), 0);
+        assert_eq!(taken(&f), [(1, 0x41, fd as i32)]);
+    }
+    #[test]
+    fn fdinfo_lists_the_watches_the_newest_first() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK | 0o2000000]);
+        let tmp = put(&f, DATA, b"/tmp");
+        let a = put(&f, DATA + 0x40, b"/tmp/a");
+        let d = f.ret(2, &[a, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(f.ret(ADD, &[fd, tmp, 0x100]), 1);
+        assert_eq!(f.ret(ADD, &[fd, a, 0x8000_0004]), 2);
+        // A changed mask keeps the watch where it was.
+        assert_eq!(f.ret(ADD, &[fd, tmp, 0x0400_0300]), 1);
+        let fs = &f.kernel.files.fs;
+        let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
+        let sdev = (device >> 8 & 0xfff) << 20 | device & 0xff | (device >> 12) & !0xff;
+        let ino = |path: &[u8]| fs.metadata(path, true).unwrap().inode;
+        let (tmp_ino, a_ino) = (ino(b"/tmp"), ino(b"/tmp/a"));
+        let path = format!("/proc/self/fdinfo/{fd}");
+        let text = String::from_utf8(contents(&mut f, path.as_bytes())).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("pos:\t0"));
+        assert_eq!(lines.next(), Some("flags:\t02004000"));
+        assert!(lines.next().unwrap().starts_with("mnt_id:\t"));
+        assert!(lines.next().unwrap().starts_with("ino:\t"));
+        assert_eq!(
+            lines.collect::<Vec<_>>(),
+            [
+                format!("inotify wd:2 ino:{a_ino:x} sdev:{sdev:x} mask:80000004 ignored_mask:0 "),
+                format!("inotify wd:1 ino:{tmp_ino:x} sdev:{sdev:x} mask:4000300 ignored_mask:0 "),
+            ]
+        );
+        // The directory lists the descriptors as regular files.
+        let dir = f.ret(2, &[put(&f, DATA, b"/proc/self/fdinfo"), 0o200000]);
+        let n = f.ret(217, &[dir, BUF, 0x800]);
+        let mut bytes = vec![0; n as usize];
+        f.mem.read(GuestAddr(BUF), &mut bytes).unwrap();
+        let name = fd.to_string();
+        let at = bytes
+            .windows(name.len() + 1)
+            .position(|w| w[..name.len()] == *name.as_bytes() && w[name.len()] == 0)
+            .unwrap();
+        assert_eq!(bytes[at - 1], 8);
+        // A descriptor that is not open has none.
+        assert_eq!(
+            f.ret(2, &[put(&f, DATA, b"/proc/self/fdinfo/99"), 0]),
+            errno(Errno::ENOENT)
+        );
+    }
+    #[test]
+    fn proc_sys_fs_inotify_holds_the_limits() {
+        let mut f = fixture();
+        let dir: &[u8] = b"/proc/sys/fs/inotify/";
+        let file = |name: &str| [dir, name.as_bytes()].concat();
+        assert_eq!(contents(&mut f, &file("max_queued_events")), b"16384\n");
+        assert_eq!(contents(&mut f, &file("max_user_instances")), b"128\n");
+        let watches = String::from_utf8(contents(&mut f, &file("max_user_watches"))).unwrap();
+        let watches: u64 = watches.trim_end().parse().unwrap();
+        assert!((8192..=1_048_576).contains(&watches));
+        // Out of bounds, or not a number, is EINVAL.
+        for (name, text) in [
+            ("max_user_instances", &b"-1"[..]),
+            ("max_user_instances", b"2147483648"),
+            ("max_queued_events", b"-1"),
+            ("max_user_watches", b"x"),
+        ] {
+            assert_eq!(write_to(&mut f, &file(name), text), errno(Errno::EINVAL));
+        }
+        // An instance made after max_queued_events changes queues that many.
+        assert_eq!(write_to(&mut f, &file("max_queued_events"), b"1\n"), 2);
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let tmp = put(&f, DATA, b"/tmp");
+        let wd = f.ret(ADD, &[fd, tmp, 0x100]) as i32;
+        for name in [&b"/tmp/a"[..], b"/tmp/b"] {
+            let d = f.ret(2, &[put(&f, DATA + 0x40, name), 0o101, 0o600]);
+            assert_eq!(f.ret(3, &[d]), 0);
+        }
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x100, &b"a"[..]), (-1, 0x4000, b"")]
+        );
+        // The users' limits count what each already has.
+        assert_eq!(write_to(&mut f, &file("max_user_instances"), b"1"), 1);
+        assert_eq!(f.ret(INIT1, &[0]), errno(Errno::EMFILE));
+        assert_eq!(write_to(&mut f, &file("max_user_watches"), b"1"), 1);
+        let a = put(&f, DATA + 0x40, b"/tmp/a");
+        assert_eq!(f.ret(ADD, &[fd, a, 0x4]), errno(Errno::ENOSPC));
+        assert_eq!(contents(&mut f, &file("max_user_watches")), b"1\n");
+        // Only root may open them to write.
+        f.thread.state.credentials.euid = 1000;
+        assert_eq!(
+            f.ret(2, &[put(&f, DATA, &file("max_user_watches")), 1]),
+            errno(Errno::EACCES)
+        );
+    }
     #[test]
     fn the_files_exec_opens_are_heard_of() {
         let mut f = fixture();

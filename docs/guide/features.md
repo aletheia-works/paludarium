@@ -533,11 +533,14 @@ kernel.
   kind of owner it names, as Linux finds the ID. `F_GETOWN` and
   `F_GETOWN_EX` read it back, as 0 while nothing is there in that role
   (such as a group no process is in), and `F_SETSIG` picks the signal.
-  Only pipes, sockets and pseudo-terminals, and the host's standard streams
-  when they are a pipe, a socket or a terminal, keep `O_ASYNC` (`F_SETFL`
-  drops it on other files, and `FIOASYNC` setting it there is `ENOTTY`). With
-  it, a pipe, socket or pseudo-terminal (as the pseudo-terminals below say)
-  sends its owner `SIGIO` from the kernel. With `F_SETSIG`, it sends that
+  Only pipes, sockets, pseudo-terminals and inotify instances, and the host's
+  standard streams when they are a pipe, a socket or a terminal, keep
+  `O_ASYNC` (`F_SETFL` drops it on other files, and `FIOASYNC` setting it
+  there is `ENOTTY`). With it, a pipe, socket or pseudo-terminal (as the
+  pseudo-terminals below say) sends its owner `SIGIO` from the kernel, and an
+  inotify instance `POLL_IN` once for each event it queues (none for one
+  merged into the event before it), as `fsnotify_insert_event`'s
+  `kill_fasync` does. With `F_SETSIG`, it sends that
   signal instead, with `si_code` (`POLL_IN`, `POLL_OUT`, `POLL_ERR`,
   `POLL_PRI` or `POLL_HUP`), `si_band`, and the descriptor `O_ASYNC` was set
   through as `si_fd`.
@@ -1689,7 +1692,7 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
-  `maps`, `fd`, `ns` and `task`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
+  `maps`, `fd`, `fdinfo`, `ns` and `task`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
   signal masks, capabilities and so on) without the memory and CPU ones,
   which nothing measures. Any other path in this process's directory or
   elsewhere under `/proc` is looked up in the filesystem like any path, so with
@@ -1764,7 +1767,24 @@ kernel.
   may open to write. Both are unsigned longs, as Linux's
   `proc_doulongvec_minmax` reads and writes them: a write takes no `-`
   (`EINVAL`) and otherwise reads as the files of `/proc/sys/fs/mqueue` do.
-  `/proc/sys/fs` lists only these and `mqueue`.
+  `/proc/sys/fs` lists only these, `inotify` and `mqueue`.
+- `/proc/sys/fs/inotify` has the machine's inotify limits, root's regular
+  files of mode 0644 that only root (user ID 0 outside any user namespace)
+  may open to write, read and written as the files above:
+  `max_user_instances` (128 at first) and `max_user_watches` (31956 at first,
+  as the instances below say), unsigned longs from 0 to `INT_MAX`, are what
+  each user may have from then on, and `max_queued_events` (16384 at first),
+  an `int` from 0, is how many events an instance made from then on queues
+  before `IN_Q_OVERFLOW`.
+- `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
+  descriptor, as Linux's `seq_show` writes it: `pos`, the description's
+  position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and
+  `O_CLOEXEC` for the descriptor), `mnt_id`, the ID `statx` gives, and `ino`,
+  the inode `fstat` gives. An inotify instance's adds a line for each watch,
+  the newest first, as `inotify_fdinfo`: `inotify wd:`, the watch descriptor,
+  `ino:` and `sdev:`, the file's inode and its file system's device as the
+  kernel numbers it (`MKDEV`), and `mask:`, the mask it was given, in
+  hexadecimal, then `ignored_mask:0`.
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
   in Linux's formats: load averages of 0 with the running and live tasks and
   the last ID handed out; 4 GiB of total, free and available memory and
@@ -1993,7 +2013,8 @@ kernel.
   `INOTIFY_IOC_SETNEXTWD` sets the next one. `inotify_rm_watch` of a
   descriptor no watch has is `EINVAL`. A user may have 128 instances
   (`EMFILE`) and 31956 watches (`ENOSPC`), what Linux works out for the
-  4 GiB `sysinfo` reports.
+  4 GiB `sysinfo` reports, and an instance queues 16384 events, until
+  `/proc/sys/fs/inotify` changes them.
   The changes the guest's own system calls make are the events, in the order
   Linux's `fsnotify` hooks give them: `IN_CREATE` for a new file, directory,
   symbolic link, FIFO, socket or link (after `IN_ATTRIB` of a linked file);

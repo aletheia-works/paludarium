@@ -370,6 +370,7 @@ mod linux {
         inotify_moved => ("inotify-moved","inotify"),
         inotify_fifo => ("inotify-fifo","inotify"),
         inotify_exec => ("inotify-exec","inotify"),
+        inotify_instance => ("inotify-instance","inotify"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

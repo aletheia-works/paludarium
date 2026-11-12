@@ -88,6 +88,7 @@
     {"name":"inotify-moved","binary":"inotify"},
     {"name":"inotify-fifo","binary":"inotify"},
     {"name":"inotify-exec","binary":"inotify"},
+    {"name":"inotify-instance","binary":"inotify"},
     {"name":"mqueue-calls","binary":"mqueue"},
     {"name":"mqueue-limits","binary":"mqueue"},
     {"name":"mqueue-wait","binary":"mqueue"},

@@ -56,6 +56,9 @@ pub(crate) enum OwnEntry {
     /// `fd`, and one of its links by descriptor number.
     Descriptors,
     Descriptor(u32),
+    /// `fdinfo`, and its file of a descriptor by number.
+    DescriptorInfos,
+    DescriptorInfo(u32),
 }
 pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
     let rest = path.strip_prefix(b"/proc/")?;
@@ -77,14 +80,23 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
         b"/cwd" => Some(OwnEntry::Cwd),
         b"/maps" => Some(OwnEntry::Maps),
         b"/fd" | b"/fd/" => Some(OwnEntry::Descriptors),
-        _ => descriptor_number(tail.strip_prefix(b"/fd/")?).map(OwnEntry::Descriptor),
+        b"/fdinfo" | b"/fdinfo/" => Some(OwnEntry::DescriptorInfos),
+        _ => match tail.strip_prefix(b"/fdinfo/") {
+            // A regular file, which no `/` follows.
+            Some(name) if !name.ends_with(b"/") => {
+                descriptor_number(name).map(OwnEntry::DescriptorInfo)
+            }
+            Some(_) => None,
+            None => descriptor_number(tail.strip_prefix(b"/fd/")?).map(OwnEntry::Descriptor),
+        },
     }
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 16] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 17] = [
     (b"task", 4),
     (b"fd", 4),
+    (b"fdinfo", 4),
     (b"ns", 4),
     (b"environ", 8),
     (b"status", 8),

@@ -10,6 +10,7 @@
 //!
 //! While no watch exists, a change costs one atomic load.
 use crate::events::{CLOEXEC, IN, NONBLOCK, ReadinessHub};
+use crate::fasync::{FileOwner, Notice, Reason, Registration};
 use crate::page_cache::Key;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat, HostFs};
@@ -17,7 +18,7 @@ use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, mount_device};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 pub(crate) const ACCESS: u32 = 0x1;
@@ -58,16 +59,16 @@ const ALL_BITS: u32 = ALL_EVENTS
     | ONESHOT;
 /// `sizeof(struct inotify_event)`, without its name.
 const RECORD: usize = 16;
-/// `/proc/sys/fs/inotify/max_queued_events`.
-const MAX_EVENTS: usize = 16384;
-/// `/proc/sys/fs/inotify/max_user_instances`.
-const MAX_INSTANCES: usize = 128;
-/// `/proc/sys/fs/inotify/max_user_watches`, as Linux's `inotify_user_setup`
-/// works it out for the memory `sysinfo` reports: 1% of it, over what a watch
-/// costs (a mark and twice an inode, about 1344 bytes on x86-64), between
-/// 8192 and 1048576.
-const MAX_WATCHES: usize = {
-    let watches = (crate::syscalls::SYSINFO_RAM / 100 / 1344) as usize;
+/// `/proc/sys/fs/inotify/max_queued_events` at first.
+const MAX_EVENTS: i32 = 16384;
+/// `/proc/sys/fs/inotify/max_user_instances` at first.
+const MAX_INSTANCES: u64 = 128;
+/// `/proc/sys/fs/inotify/max_user_watches` at first, as Linux's
+/// `inotify_user_setup` works it out for the memory `sysinfo` reports: 1% of
+/// it, over what a watch costs (a mark and twice an inode, about 1344 bytes
+/// on x86-64), between 8192 and 1048576.
+const MAX_WATCHES: u64 = {
+    let watches = crate::syscalls::SYSINFO_RAM / 100 / 1344;
     if watches < 8192 {
         8192
     } else if watches > 1_048_576 {
@@ -221,9 +222,30 @@ impl Drop for Closing {
     }
 }
 
+/// The machine's limits of `/proc/sys/fs/inotify`: the instances and
+/// watches each user may have (`max_user_instances` and `max_user_watches`,
+/// Linux's `ucount_max` of the initial user namespace), and the events an
+/// instance made from now on queues (`max_queued_events`).
+pub(crate) struct Limits {
+    pub(crate) instances: AtomicU64,
+    pub(crate) watches: AtomicU64,
+    pub(crate) events: AtomicI32,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            instances: AtomicU64::new(MAX_INSTANCES),
+            watches: AtomicU64::new(MAX_WATCHES),
+            events: AtomicI32::new(MAX_EVENTS),
+        }
+    }
+}
+
 /// The instances of one machine, which every change is told to.
 #[derive(Default)]
 pub(crate) struct Notifier {
+    /// `/proc/sys/fs/inotify`.
+    pub(crate) limits: Limits,
     /// The watches of every instance: while there are none, a change is
     /// not looked at.
     watches: AtomicUsize,
@@ -584,7 +606,7 @@ impl Notifier {
     fn add_instance(&self, user: u32) -> Result<(), Errno> {
         let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
         let count = registry.users.entry(user).or_default();
-        if count.0 >= MAX_INSTANCES {
+        if count.0 as u64 >= self.limits.instances.load(Ordering::SeqCst) {
             return Err(Errno::EMFILE);
         }
         count.0 += 1;
@@ -602,7 +624,7 @@ impl Notifier {
     fn add_watch(&self, user: u32) -> Result<(), Errno> {
         let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
         let count = registry.users.entry(user).or_default();
-        if count.1 >= MAX_WATCHES {
+        if count.1 as u64 >= self.limits.watches.load(Ordering::SeqCst) {
             return Err(Errno::ENOSPC);
         }
         count.1 += 1;
@@ -635,6 +657,9 @@ struct Watch {
     key: Key,
     /// The events it wants, with `IN_EXCL_UNLINK` and `IN_ONESHOT`.
     mask: u32,
+    /// When it was made, by the instance's count: Linux lists an instance's
+    /// marks the newest first (`marks_list`).
+    made: u64,
 }
 struct Event {
     wd: i32,
@@ -669,13 +694,18 @@ struct Queue {
     cursor: i32,
     /// Events queued so far, each a wakeup of the file.
     epoch: u64,
+    /// The events it queues at most (`max_events`), as
+    /// `max_queued_events` was when the instance was made.
+    max: usize,
+    /// Watches made so far.
+    made: u64,
 }
 impl Queue {
     /// Queues `event` as Linux's `fsnotify_insert_event`: past the limit
     /// only the overflow event, once; an event the same as the last one
     /// (but for `IN_IGNORED` and moves) is merged into it.
     fn push(&mut self, event: Event) -> bool {
-        if self.events.len() >= MAX_EVENTS {
+        if self.events.len() >= self.max {
             if self.overflowed {
                 return false;
             }
@@ -708,19 +738,17 @@ impl Queue {
         Some(event)
     }
     /// Removes watch `wd` and queues its `IN_IGNORED`, as Linux's
-    /// `inotify_ignored_and_remove_idr`.
-    fn unwatch(&mut self, wd: i32) -> bool {
-        let Some(watch) = self.watches.remove(&wd) else {
-            return false;
-        };
+    /// `inotify_ignored_and_remove_idr`: none if there is no such watch,
+    /// else whether the event was queued.
+    fn unwatch(&mut self, wd: i32) -> Option<bool> {
+        let watch = self.watches.remove(&wd)?;
         self.by_key.remove(&watch.key);
-        self.push(Event {
+        Some(self.push(Event {
             wd,
             mask: IGNORED,
             cookie: 0,
             name: Vec::new(),
-        });
-        true
+        }))
     }
     /// The next free watch descriptor from the cursor, wrapping to 1.
     fn allocate(&mut self) -> Result<i32, Errno> {
@@ -754,10 +782,59 @@ pub(crate) struct Instance {
     owner: u32,
     flags: AtomicU32,
     queue: Mutex<Queue>,
+    /// Its signal-driven I/O: the owner `F_SETOWN` and `F_SETSIG` gave, and
+    /// what sends the signal of the registration `O_ASYNC` made (`fsn_fa`).
+    signalling: Mutex<(FileOwner, Option<Signal>)>,
 }
+/// What signals an instance's owner, once `O_ASYNC` registered it. It keeps
+/// the registration out of sight of the types the machine's file system
+/// holds, whose `Send` the compiler would otherwise follow too deep.
+type Signal = Arc<dyn Fn(FileOwner) + Send + Sync>;
 impl Instance {
     fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn signalling(&self) -> std::sync::MutexGuard<'_, (FileOwner, Option<Signal>)> {
+        self.signalling
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// `F_GETOWN`: who its signals go to.
+    pub(crate) fn file_owner(&self) -> FileOwner {
+        self.signalling().0
+    }
+    /// `F_SETOWN` and `F_SETSIG`.
+    pub(crate) fn set_file_owner(&self, owner: FileOwner) {
+        self.signalling().0 = owner;
+    }
+    /// `F_SETFL` turning `O_ASYNC` on, with its registration, or off
+    /// (`fsnotify_fasync`).
+    pub(crate) fn set_async(&self, registration: Option<Registration>) {
+        self.signalling().1 = registration.map(|to| {
+            Arc::new(move |owner| {
+                Notice {
+                    to: to.clone(),
+                    owner,
+                    reason: Reason::In,
+                }
+                .send();
+            }) as Signal
+        });
+    }
+    /// Wakes its readers for `queued` events newly queued, and signals its
+    /// owner once for each, as `fsnotify_insert_event`'s `kill_fasync`
+    /// does with `POLL_IN`.
+    fn queued(&self, queued: usize) {
+        if queued == 0 {
+            return;
+        }
+        self.hub.changed();
+        let (owner, signal) = self.signalling().clone();
+        if let Some(signal) = signal {
+            for _ in 0..queued {
+                signal(owner);
+            }
+        }
     }
     /// An event for the watch on `key`, if there is one that wants it, as
     /// Linux's `fsnotify_handle_inode_event` and
@@ -780,21 +857,19 @@ impl Instance {
         } else {
             mask
         };
-        let mut woke = queue.push(Event {
+        let mut queued = usize::from(queue.push(Event {
             wd,
             mask,
             cookie,
             name: name.to_vec(),
-        });
-        let gone = oneshot && queue.unwatch(wd);
-        woke |= gone;
+        }));
+        let gone = if oneshot { queue.unwatch(wd) } else { None };
+        queued += usize::from(gone == Some(true));
         drop(queue);
-        if gone {
+        if gone.is_some() {
             self.notifier.release(self.owner, 1, false);
         }
-        if woke {
-            self.hub.changed();
-        }
+        self.queued(queued);
     }
     /// Removes the watch on `key`, whose file is gone.
     fn forget(&self, key: Key) {
@@ -802,10 +877,10 @@ impl Instance {
         let Some(&wd) = queue.by_key.get(&key) else {
             return;
         };
-        queue.unwatch(wd);
+        let queued = queue.unwatch(wd) == Some(true);
         drop(queue);
         self.notifier.release(self.owner, 1, false);
-        self.hub.changed();
+        self.queued(usize::from(queued));
     }
     /// `inotify_update_watch`: the watch on `key` gets `mask` (or it is
     /// added with `IN_MASK_ADD`), or a new watch is made.
@@ -829,20 +904,54 @@ impl Instance {
         // so a refused watch still moves the cursor on.
         let wd = queue.allocate()?;
         self.notifier.add_watch(self.owner)?;
-        queue.watches.insert(wd, Watch { key, mask: wanted });
+        queue.made += 1;
+        let made = queue.made;
+        queue.watches.insert(
+            wd,
+            Watch {
+                key,
+                mask: wanted,
+                made,
+            },
+        );
         queue.by_key.insert(key, wd);
         Ok(wd)
     }
     /// `inotify_rm_watch`: EINVAL for a descriptor no watch has.
     fn unwatch(&self, wd: i32) -> Result<(), Errno> {
         let mut queue = self.queue();
-        if !queue.unwatch(wd) {
-            return Err(Errno::EINVAL);
-        }
+        let queued = queue.unwatch(wd).ok_or(Errno::EINVAL)?;
         drop(queue);
         self.notifier.release(self.owner, 1, false);
-        self.hub.changed();
+        self.queued(usize::from(queued));
         Ok(())
+    }
+    /// What `/proc/self/fdinfo` shows of its watches after the lines every
+    /// descriptor has, as Linux's `inotify_fdinfo`: one line each, the
+    /// newest first, with the watch descriptor, the file's inode and its
+    /// file system's device (as the kernel numbers it) in hexadecimal, and
+    /// the mask the watch was given. No file handle follows, as for a file
+    /// system that cannot make one.
+    pub(crate) fn fdinfo(&self) -> Vec<u8> {
+        let queue = self.queue();
+        let mut watches: Vec<_> = queue.watches.iter().collect();
+        watches.sort_by_key(|(_, watch)| std::cmp::Reverse(watch.made));
+        let mut out = Vec::new();
+        for (wd, watch) in watches {
+            let (device, inode) = watch.key;
+            // `new_encode_dev` undone, then `MKDEV`.
+            let major = (device >> 8) & 0xfff;
+            let minor = (device & 0xff) | ((device >> 12) & !0xff);
+            out.extend_from_slice(
+                format!(
+                    "inotify wd:{wd:x} ino:{inode:x} sdev:{:x} mask:{:x} ignored_mask:0 \n",
+                    major << 20 | minor,
+                    watch.mask
+                )
+                .as_bytes(),
+            );
+        }
+        out
     }
 }
 impl Drop for Instance {
@@ -883,7 +992,11 @@ fn init(c: &mut Context<'_>, flags: u32) -> Result<u64, Errno> {
         hub: Arc::clone(&c.files.readiness),
         owner,
         flags: AtomicU32::new(flags & NONBLOCK),
-        queue: Mutex::default(),
+        queue: Mutex::new(Queue {
+            max: usize::try_from(notifier.limits.events.load(Ordering::SeqCst)).unwrap_or(0),
+            ..Queue::default()
+        }),
+        signalling: Mutex::default(),
     });
     notifier.register(Arc::downgrade(&instance));
     c.files
@@ -900,7 +1013,8 @@ fn instance(c: &Context<'_>, fd: u64) -> Result<Arc<dyn FileHandle>, Errno> {
     }
     Ok(file)
 }
-fn of(file: &Arc<dyn FileHandle>) -> Option<&Instance> {
+/// The instance `file` is, if it is one.
+pub(crate) fn of(file: &Arc<dyn FileHandle>) -> Option<&Instance> {
     file.as_any()?.downcast_ref::<Instance>()
 }
 
@@ -1048,7 +1162,10 @@ impl FileHandle for Instance {
         self.flags.load(Ordering::SeqCst)
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.flags.store(flags & NONBLOCK, Ordering::SeqCst);
+        self.flags.store(
+            flags & (NONBLOCK | crate::fasync::O_ASYNC),
+            Ordering::SeqCst,
+        );
         Ok(())
     }
 }

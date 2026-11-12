@@ -6412,6 +6412,12 @@ fn seccomp_listener_answers_a_waiting_call() {
     );
     assert_eq!(f.ret(16, &[fd, 0x4008_2109, DATA]), errno(Errno::EINVAL));
     assert_eq!(f.ret(0, &[fd, DATA, 8]), errno(Errno::EINVAL));
+    // An ADDFD argument longer than 24 bytes whose tail runs past the top
+    // of the address space is EFAULT.
+    assert_eq!(
+        f.ret(16, &[fd, 0x4020_2103, u64::MAX - 8]),
+        errno(Errno::EFAULT)
+    );
     // Once the listener is closed, the filter has none: ENOSYS.
     assert_eq!(f.ret(3, &[fd]), 0);
     assert_eq!(f.ret(39, &[]), errno(Errno::ENOSYS));

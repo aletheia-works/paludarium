@@ -1388,7 +1388,10 @@ fn add_fd(c: &mut Context<'_>, notifier: &Notifier, at: u64, size: usize) -> Res
     if size > ADDFD_SIZE {
         let mut rest = vec![0u8; size - ADDFD_SIZE];
         c.mem
-            .read(GuestAddr(at + ADDFD_SIZE as u64), &mut rest)
+            .read(
+                GuestAddr(at.checked_add(ADDFD_SIZE as u64).ok_or(Errno::EFAULT)?),
+                &mut rest,
+            )
             .map_err(|_| Errno::EFAULT)?;
         if rest.iter().any(|&b| b != 0) {
             return Err(E2BIG);

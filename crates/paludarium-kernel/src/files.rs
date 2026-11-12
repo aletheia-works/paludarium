@@ -16,7 +16,8 @@ pub const NUMBERS: &[u64] = &[
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
     188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
     261, 262, 263, 264, 265, 266, 267, 268, 269, 275, 276, 277, 278, 280, 285, 292, 293, 295, 296,
-    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 447, 451, 452, 463, 464, 465, 466, 468, 469,
+    303, 306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 447, 451, 452, 463, 464, 465, 466, 468,
+    469,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -694,33 +695,21 @@ fn looked_up(
 /// The file `inotify_add_watch` watches, as Linux's `inotify_find_inode`
 /// finds it: what the path at `ptr` names (the last symbolic link itself
 /// without `follow`), a directory with `directory` (ENOTDIR), and one the
-/// caller may read (EACCES); by its device and inode.
+/// caller may read (EACCES); by its device and inode, with its file
+/// system (`f_type`).
 pub(crate) fn watched(
     c: &Context<'_>,
     ptr: u64,
     follow: bool,
     directory: bool,
-) -> Result<crate::page_cache::Key, Errno> {
+) -> Result<(crate::page_cache::Key, u64), Errno> {
     let (p, _) = looked_up(c, (-100i32) as u64, ptr, follow)?;
-    let (stat, device) = match followed(c, &p, follow)? {
-        Some(Followed::Path { path, follow }) => {
-            let stat = c.files.fs.metadata(&path, follow)?;
-            (stat, watched_device(c, &path, follow))
-        }
-        Some(Followed::File(d)) => (d.file.stat()?, descriptor_device(c, &d)),
-        None => match generated_stat(c, &p, follow)? {
-            Some((stat, device, _)) => (stat, device),
-            None => (
-                c.files.fs.metadata(&p, follow)?,
-                watched_device(c, &p, follow),
-            ),
-        },
-    };
+    let (stat, device, kind) = named(c, &p, follow)?;
     if directory && stat.mode & 0o170000 != 0o040000 {
         return Err(Errno::ENOTDIR);
     }
     crate::permissions::permission(&c.process.credentials, &stat, 4)?;
-    Ok((device, stat.inode))
+    Ok(((device, stat.inode), kind))
 }
 /// The device of the file `path` names, by the mount it is in once its
 /// links are resolved, as the changes inotify hears of name it.
@@ -2716,6 +2705,211 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     output(c, out, &b)?;
     Ok(0)
 }
+/// `MAX_HANDLE_SZ`: the most bytes a file handle's own part may have.
+const MAX_HANDLE_SZ: u32 = 128;
+/// `name_to_handle_at` gives the mount's unique 64-bit ID (Linux 6.12).
+const AT_HANDLE_MNT_ID_UNIQUE: u64 = 0x001;
+/// A handle that can be opened again with its path's directories (Linux
+/// 6.13), which tmpfs cannot give (no `fh_to_parent`).
+const AT_HANDLE_CONNECTABLE: u64 = 0x002;
+/// A handle only to tell files apart, which any file system gives.
+const AT_HANDLE_FID: u64 = 0x200;
+const AT_SYMLINK_FOLLOW: u64 = 0x400;
+/// `FILEID_INVALID`: the type of a handle that did not fit.
+const FILEID_INVALID: u32 = 0xff;
+
+/// The handle a file of the file system `kind` with inode `inode` has, as
+/// Linux encodes it: its type and its 12 bytes. A tmpfs file's is
+/// `shmem_encode_fh`'s (`FILEID_INO32_GEN`: the generation, then the inode's
+/// low and high halves); any other's is the identifier
+/// `exportfs_encode_ino64_fid` gives a file system without NFS export
+/// (`FILEID_INO64_GEN`: the inode, then the generation). The generation is
+/// 0, where tmpfs picks a random one for each inode.
+pub(crate) fn file_handle(kind: u64, inode: u64) -> (u32, [u8; 12]) {
+    let generation = 0u32;
+    let mut b = [0; 12];
+    if kind == paludarium_vfs::TMPFS_MAGIC {
+        b[0..4].copy_from_slice(&generation.to_le_bytes());
+        b[4..8].copy_from_slice(&(inode as u32).to_le_bytes());
+        b[8..12].copy_from_slice(&((inode >> 32) as u32).to_le_bytes());
+        (1, b)
+    } else {
+        b[0..8].copy_from_slice(&inode.to_le_bytes());
+        b[8..12].copy_from_slice(&generation.to_le_bytes());
+        (0x81, b)
+    }
+}
+/// `name_to_handle_at(dirfd, path, handle, mount_id, flags)`, as Linux's
+/// (6.13 and later): the flags (`EINVAL`), the path, whether the file
+/// system can give the handle asked for (`EOPNOTSUPP`: only tmpfs, the
+/// one file system here with NFS export, gives one that is not
+/// `AT_HANDLE_FID`, and none a connectable one), the size the caller gives
+/// (`EINVAL` over `MAX_HANDLE_SZ`; `EOVERFLOW` under the handle's, with that
+/// size and `FILEID_INVALID` written back), then the mount's ID, as `statx`
+/// gives it, and the handle.
+fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let (dir, handle, mount, flags) = (a[0], a[2], a[3], a[4]);
+    if flags
+        & !(AT_SYMLINK_FOLLOW
+            | AT_EMPTY_PATH
+            | AT_HANDLE_FID
+            | AT_HANDLE_MNT_ID_UNIQUE
+            | AT_HANDLE_CONNECTABLE)
+        != 0
+        || (flags & AT_HANDLE_CONNECTABLE != 0 && flags & (AT_HANDLE_FID | AT_EMPTY_PATH) != 0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let raw = path(c, a[1])?;
+    let (stat, device, kind) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if dir as i32 == -100 {
+            let cwd = c
+                .files
+                .cwd
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            named(c, &cwd, true)?
+        } else {
+            let d = c.files.descriptor(dir)?;
+            (
+                d.file.stat()?,
+                descriptor_device(c, &d),
+                descriptor_kind(c, &d)?,
+            )
+        }
+    } else {
+        let follow = flags & AT_SYMLINK_FOLLOW != 0;
+        let (p, _) = lookup(c, dir, raw, follow)?;
+        named(c, &p, follow)?
+    };
+    if flags & AT_HANDLE_CONNECTABLE != 0
+        || (flags & AT_HANDLE_FID == 0 && kind != paludarium_vfs::TMPFS_MAGIC)
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let mut given = [0u8; 4];
+    c.mem
+        .read(GuestAddr(handle), &mut given)
+        .map_err(|_| Errno::EFAULT)?;
+    // The whole header is read, as `copy_from_user` of the struct does.
+    c.mem
+        .read(GuestAddr(handle.wrapping_add(4)), &mut [0u8; 4])
+        .map_err(|_| Errno::EFAULT)?;
+    let given = u32::from_le_bytes(given);
+    if given > MAX_HANDLE_SZ {
+        return Err(Errno::EINVAL);
+    }
+    let (kind, bytes) = file_handle(kind, stat.inode);
+    let fits = given >> 2 >= 3;
+    let id = mount_id(device);
+    if flags & AT_HANDLE_MNT_ID_UNIQUE != 0 {
+        output(c, mount, &(1u64 << 31 | id).to_le_bytes())?;
+    } else {
+        output(c, mount, &(id as u32).to_le_bytes())?;
+    }
+    let mut out = Vec::with_capacity(20);
+    out.extend_from_slice(&12u32.to_le_bytes());
+    out.extend_from_slice(&(if fits { kind } else { FILEID_INVALID }).to_le_bytes());
+    if fits {
+        out.extend_from_slice(&bytes);
+    }
+    output(c, handle, &out)?;
+    if fits { Ok(0) } else { Err(Errno::EOVERFLOW) }
+}
+/// The status, device and file system (`f_type`) of what path `p` names
+/// (the last link itself without `follow`), as the calls that name a file
+/// without opening it reach it: through a descriptor's link in `/proc`, a
+/// file paludarium makes, or the mounted directories.
+pub(crate) fn named(
+    c: &Context<'_>,
+    p: &[u8],
+    follow: bool,
+) -> Result<(FileStat, u64, u64), Errno> {
+    Ok(match followed(c, p, follow)? {
+        Some(Followed::Path { path, follow }) => (
+            c.files.fs.metadata(&path, follow)?,
+            watched_device(c, &path, follow),
+            path_kind(c, &path, follow),
+        ),
+        Some(Followed::File(d)) => (
+            d.file.stat()?,
+            descriptor_device(c, &d),
+            descriptor_kind(c, &d)?,
+        ),
+        None => match generated_stat(c, p, follow)? {
+            Some((stat, device, _)) => (stat, device, path_kind(c, p, follow)),
+            None => (
+                c.files.fs.metadata(p, follow)?,
+                watched_device(c, p, follow),
+                path_kind(c, p, follow),
+            ),
+        },
+    })
+}
+/// The file system (`f_type`) of the file `d` holds, as `fstatfs` gives it;
+/// a memfd's is shmem's, a tmpfs.
+fn descriptor_kind(c: &Context<'_>, d: &Descriptor) -> Result<u64, Errno> {
+    if let Some(memfd) = d
+        .file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
+    {
+        return Ok(if memfd.is_secret() {
+            crate::memfd::SECRETMEM_MAGIC
+        } else {
+            paludarium_vfs::TMPFS_MAGIC
+        });
+    }
+    Ok(descriptor_statfs(c, d)?.kind)
+}
+/// The file system (`f_type`) of the file path `p` names, as `statfs` of it
+/// gives it, or of its directory for a symbolic link not followed.
+fn path_kind(c: &Context<'_>, p: &[u8], follow: bool) -> u64 {
+    let link = !follow
+        && c.files
+            .fs
+            .metadata(p, false)
+            .is_ok_and(|s| s.mode & 0o170000 == 0o120000);
+    let place = match p.iter().rposition(|&b| b == b'/') {
+        Some(at) if link => &p[..at.max(1)],
+        _ => p,
+    };
+    path_statfs(c, place).map_or(0, |s| s.kind)
+}
+/// What `statfs` reports for path `p`, which it follows: /proc's, a
+/// descriptor's for a link in `fd`, the `mqueue` file system's, or that of
+/// the mounted directory holding it.
+fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Errno> {
+    Ok(if in_proc(p) {
+        // A link in `fd` leads to its descriptor's file; one for a
+        // descriptor not open is not there (`ENOENT`).
+        if let Some(crate::proc::OwnEntry::Descriptor(n)) = crate::proc::own_entry(p, c.process.pid)
+        {
+            let d = c
+                .files
+                .descriptor(u64::from(n))
+                .map_err(|_| Errno::ENOENT)?;
+            descriptor_statfs(c, &d)?
+        } else {
+            if generated_stat(c, p, true)?.is_none() {
+                c.files.fs.metadata(p, true)?;
+            }
+            pseudo_fs(PROC_SUPER_MAGIC)
+        }
+    } else if let Some(name) = paludarium_vfs::normalize_path(p)
+        .ok()
+        .filter(|p| p.as_slice() == b"/dev/mqueue" || crate::mqueue::mounted_name(p).is_some())
+    {
+        // `/dev/mqueue` and its queues are the `mqueue` filesystem.
+        if let Some(name) = crate::mqueue::mounted_name(&name) {
+            crate::mqueue::mounted_file(c, name)?;
+        }
+        pseudo_fs(MQUEUE_MAGIC)
+    } else {
+        c.files.fs.statfs(p)?
+    })
+}
 /// The ID of the mount whose device is `device`, as `/proc/self/mountinfo`
 /// numbers it: its minor number is its position there, from 21.
 fn mount_id(device: u64) -> u64 {
@@ -3050,6 +3244,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         275 => splice::splice(c, a),
         276 => splice::tee(c, a),
         278 => splice::vmsplice(c, a),
+        303 => name_to_handle_at(c, a),
         332 => statx(c, a),
         326 => copy_file_range(c, a),
         451 => cachestat(c, a),
@@ -3799,34 +3994,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         // statfs, fstatfs
         137 => {
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], true)?;
-            let stats = if in_proc(&p) {
-                // A link in `fd` leads to its descriptor's file; one for a
-                // descriptor not open is not there (`ENOENT`).
-                if let Some(crate::proc::OwnEntry::Descriptor(n)) =
-                    crate::proc::own_entry(&p, c.process.pid)
-                {
-                    let d = c
-                        .files
-                        .descriptor(u64::from(n))
-                        .map_err(|_| Errno::ENOENT)?;
-                    descriptor_statfs(c, &d)?
-                } else {
-                    if generated_stat(c, &p, true)?.is_none() {
-                        c.files.fs.metadata(&p, true)?;
-                    }
-                    pseudo_fs(PROC_SUPER_MAGIC)
-                }
-            } else if let Some(name) = paludarium_vfs::normalize_path(&p).ok().filter(|p| {
-                p.as_slice() == b"/dev/mqueue" || crate::mqueue::mounted_name(p).is_some()
-            }) {
-                // `/dev/mqueue` and its queues are the `mqueue` filesystem.
-                if let Some(name) = crate::mqueue::mounted_name(&name) {
-                    crate::mqueue::mounted_file(c, name)?;
-                }
-                pseudo_fs(MQUEUE_MAGIC)
-            } else {
-                c.files.fs.statfs(&p)?
-            };
+            let stats = path_statfs(c, &p)?;
             write_statfs(c, a[1], stats)
         }
         138 => {

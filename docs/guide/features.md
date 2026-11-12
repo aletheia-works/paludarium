@@ -62,7 +62,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | seccomp | `seccomp` (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
@@ -213,6 +213,20 @@ kernel.
   64-bit one in its place when `STATX_MNT_ID_UNIQUE` is asked for.
   `AT_EMPTY_PATH` names the descriptor, or the working directory for
   `AT_FDCWD`, and as since Linux 6.11 a null path with it does too.
+- `name_to_handle_at` gives a file's handle, checked in the order of
+  Linux's (6.13 and later): the flags (`EINVAL`, also for
+  `AT_HANDLE_CONNECTABLE` with `AT_HANDLE_FID` or `AT_EMPTY_PATH`), the path
+  (the last link itself unless `AT_SYMLINK_FOLLOW`; the descriptor, or the
+  working directory, with an empty one and `AT_EMPTY_PATH`), the file
+  system, then the size given (`EINVAL` over 128 bytes; `EOVERFLOW` under the
+  handle's, with its size and `FILEID_INVALID` written back), and the
+  mount's ID as `statx` gives it (the 64-bit one with
+  `AT_HANDLE_MNT_ID_UNIQUE`). A tmpfs file (and a memfd) has tmpfs's 12-byte
+  handle of type `FILEID_INO32_GEN`: the generation, then the inode's low and
+  high halves. Any other file system, as one without NFS export, refuses a
+  handle (`EOPNOTSUPP`) but gives `AT_HANDLE_FID` its identifier of type
+  `FILEID_INO64_GEN`: the inode, then the generation. A connectable handle is
+  `EOPNOTSUPP`, as tmpfs cannot give one.
 - `fallocate` checks its arguments as Linux's `vfs_fallocate` does, in
   order (`EINVAL`, `EOPNOTSUPP`, `EBADF`, then `ESPIPE`, `EISDIR` or
   `ENODEV` for a file that is not regular, and `EFBIG`). Files then behave
@@ -1871,7 +1885,10 @@ kernel.
   the newest first, as `inotify_fdinfo`: `inotify wd:`, the watch descriptor,
   `ino:` and `sdev:`, the file's inode and its file system's device as the
   kernel numbers it (`MKDEV`), and `mask:`, the mask it was given, in
-  hexadecimal, then `ignored_mask:0`. The other kinds add Linux's lines
+  hexadecimal, then `ignored_mask:0` and the file's handle as
+  `show_mark_fhandle` writes it: `fhandle-bytes:` and `fhandle-type:` in
+  hexadecimal, and `f_handle:`, its bytes, the identifier
+  `name_to_handle_at` gives with `AT_HANDLE_FID`. The other kinds add Linux's lines
   too. After the first four come `lock:` lines (`show_fd_locks`): the
   description's `flock` lock, then each record lock set through it that the
   process or the description owns, by where they start, numbered from 1

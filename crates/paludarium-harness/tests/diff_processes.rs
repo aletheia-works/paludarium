@@ -381,6 +381,7 @@ mod linux {
         inotify_read => ("inotify-read","inotify"),
         inotify_fifo_moved => ("inotify-fifo-moved","inotify"),
         inotify_exec_order => ("inotify-exec-order","inotify"),
+        inotify_handles => ("inotify-handles","inotify"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

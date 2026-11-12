@@ -654,6 +654,96 @@ static int case_running(void) {
     printf("copied=%d\n", copy_file("/proc/self/exe", prog));
     return run_removing(prog, prog);
 }
+/* name_to_handle_at, and the handle an instance's fdinfo shows for each
+ * watch. The file system /tmp is on may give no handle but an identifier
+ * (AT_HANDLE_FID), of a size and bytes of its own: those of a /tmp file are
+ * compared, not printed. A memfd is shmem's, a tmpfs, everywhere. */
+struct handle {
+    unsigned bytes;
+    int type;
+    unsigned char f[128];
+};
+static long to_handle(int dir, const char *path, struct handle *h, unsigned size, void *mount, int flags) {
+    memset(h, 0xaa, sizeof *h);
+    h->bytes = size;
+    return e(syscall(SYS_name_to_handle_at, dir, path, h, mount, flags));
+}
+static int same_handle(const struct handle *a, const struct handle *b) {
+    return a->bytes == b->bytes && a->type == b->type && !memcmp(a->f, b->f, a->bytes);
+}
+static int case_handles(void) {
+    make_base("handles");
+    touch(at("f"));
+    symlink(at("f"), at("link"));
+    struct handle h, file, link;
+    int id = -1;
+    unsigned long long unique = 0;
+    printf("flags unknown=%ld connectable-fid=%ld connectable-empty=%ld\n",
+           to_handle(AT_FDCWD, at("f"), &h, 128, &id, 0x4), to_handle(AT_FDCWD, at("f"), &h, 128, &id, 0x202),
+           to_handle(AT_FDCWD, at("f"), &h, 128, &id, 0x1002));
+    /* A memfd's handle: its size, and what too small or too big a buffer
+       gives. */
+    int memfd = syscall(SYS_memfd_create, "handles", 0);
+    long r = to_handle(memfd, "", &h, 0, &id, AT_EMPTY_PATH);
+    printf("memfd small=%ld bytes=%u type=%#x rest-untouched=%d\n", r, h.bytes, h.type, h.f[0] == 0xaa);
+    printf("memfd big=%ld", to_handle(memfd, "", &h, 129, &id, AT_EMPTY_PATH));
+    r = to_handle(memfd, "", &h, 12, &id, AT_EMPTY_PATH);
+    printf(" exact=%ld bytes=%u type=%#x\n", r, h.bytes, h.type);
+    /* A /tmp file's identifier, the same however the file is named. */
+    printf("fid=%ld", to_handle(AT_FDCWD, at("f"), &file, 128, &id, 0x200));
+    unsigned long long sx[32] = {0};
+    long sxr = e(syscall(SYS_statx, AT_FDCWD, at("f"), 0, 0x1000, sx));
+    printf(" mount=%s\n", sxr == 0 && (unsigned long long)id == sx[144 / 8] ? "statx" : "other");
+    r = to_handle(AT_FDCWD, at("f"), &h, 128, &unique, 0x201);
+    sxr = e(syscall(SYS_statx, AT_FDCWD, at("f"), 0, 0x4000, sx));
+    printf("unique=%ld mount=%s same=%d\n", r, sxr == 0 && unique == sx[144 / 8] ? "statx" : "other",
+           same_handle(&h, &file));
+    printf("link=%ld", to_handle(AT_FDCWD, at("link"), &link, 128, &id, 0x200));
+    printf(" own=%d", !same_handle(&link, &file));
+    printf(" followed=%ld", to_handle(AT_FDCWD, at("link"), &h, 128, &id, 0x200 | AT_SYMLINK_FOLLOW));
+    printf(" same=%d\n", same_handle(&h, &file));
+    int fd = open(at("f"), O_RDONLY);
+    printf("empty=%ld", to_handle(fd, "", &h, 128, &id, 0x200 | AT_EMPTY_PATH));
+    printf(" same=%d", same_handle(&h, &file));
+    printf(" without=%ld\n", to_handle(fd, "", &h, 128, &id, 0x200));
+    /* /proc and a pipe have no NFS export: only an identifier. */
+    printf("proc=%ld", to_handle(AT_FDCWD, "/proc/self/status", &h, 128, &id, 0));
+    r = to_handle(AT_FDCWD, "/proc/self/status", &h, 128, &id, 0x200);
+    printf(" fid=%ld bytes=%u type=%#x\n", r, h.bytes, h.type);
+    int pipes[2];
+    pipe(pipes);
+    printf("pipe=%ld", to_handle(pipes[0], "", &h, 128, &id, AT_EMPTY_PATH));
+    r = to_handle(pipes[0], "", &h, 128, &id, AT_EMPTY_PATH | 0x200);
+    printf(" fid=%ld bytes=%u type=%#x\n", r, h.bytes, h.type);
+    printf("missing=%ld fault=%ld", to_handle(AT_FDCWD, at("missing"), &h, 128, &id, 0x200),
+           e(syscall(SYS_name_to_handle_at, AT_FDCWD, at("f"), (void *)8, &id, 0x200)));
+    printf(" mount-fault=%ld\n", to_handle(AT_FDCWD, at("f"), &h, 128, (void *)8, 0x200));
+
+    /* The watch's handle in fdinfo is the file's. */
+    int in = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(in, at("f"), IN_ATTRIB);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", in);
+    FILE *info = fopen(path, "r");
+    char line[512];
+    while (info && fgets(line, sizeof line, info)) {
+        char *rest = strstr(line, "fhandle-bytes:");
+        if (!rest) continue;
+        unsigned bytes;
+        int type, used = 0;
+        if (sscanf(rest, "fhandle-bytes:%x fhandle-type:%x f_handle:%n", &bytes, &type, &used) != 2 || !used) continue;
+        struct handle shown = {bytes, type, {0}};
+        for (unsigned i = 0; i < bytes && i < sizeof shown.f; i++) {
+            unsigned v;
+            sscanf(rest + used + 2 * i, "%2x", &v);
+            shown.f[i] = v;
+        }
+        printf("fdinfo handle=%s\n", same_handle(&shown, &file) ? "file" : "other");
+    }
+    if (info) fclose(info);
+    remove_all();
+    return 0;
+}
 /* The program case_running runs: it says it runs, then waits for the end
    of its input. */
 static int case_runner(void) {
@@ -1284,6 +1374,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-fifo-moved")) return case_fifo_moved();
     if (!strcmp(mode, "inotify-exec-order")) return case_exec_order();
     if (!strcmp(mode, "inotify-runner")) return case_runner();
+    if (!strcmp(mode, "inotify-handles")) return case_handles();
     /* What case_exec_order's dynamic program does: runs argv[2]. */
     if (!strcmp(mode, "inotify-then") && argc > 2) {
         char *const next[] = {argv[2], "inotify-quiet", NULL};

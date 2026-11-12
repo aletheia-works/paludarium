@@ -54,7 +54,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | seccomp | `seccomp`（下に書きます） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
@@ -190,6 +190,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   64 ビットの ID です。
   `AT_EMPTY_PATH` はディスクリプタを、`AT_FDCWD` なら作業ディレクトリを指し、Linux 6.11
   からと同じく、それとともに渡した空ポインタのパスも同じ扱いです。
+- `name_to_handle_at` はファイルのハンドルを返し、Linux（6.13 以降）と同じ順に確かめます。
+  まずフラグ（`EINVAL`。`AT_HANDLE_CONNECTABLE` と `AT_HANDLE_FID` か `AT_EMPTY_PATH` を
+  合わせたときも）、次にパス（`AT_SYMLINK_FOLLOW` がなければ最後のリンクそのもの。空の
+  パスと `AT_EMPTY_PATH` ではディスクリプタか作業ディレクトリ）、ファイルシステム、渡した
+  大きさ（128 バイトを超えると `EINVAL`、ハンドルより小さいと `EOVERFLOW` で、要る大きさと
+  `FILEID_INVALID` を書き戻します）、最後に `statx` と同じマウントの ID
+  （`AT_HANDLE_MNT_ID_UNIQUE` では 64 ビットの ID）です。tmpfs のファイル（と memfd）は
+  tmpfs と同じ 12 バイトで型 `FILEID_INO32_GEN` のハンドルを持ちます。世代、inode の下位と
+  上位の半分の順です。ほかのファイルシステムは NFS のエクスポートがないものとして
+  ハンドルを断り（`EOPNOTSUPP`）、`AT_HANDLE_FID` には型 `FILEID_INO64_GEN` の識別子を
+  返します。inode、世代の順です。接続できるハンドルは、tmpfs が作れないので
+  `EOPNOTSUPP` です。
 - `fallocate` は、Linux の `vfs_fallocate` と同じ順に引数を確かめます（`EINVAL`、
   `EOPNOTSUPP`、`EBADF`、通常のファイルでなければ `ESPIPE`・`EISDIR`・`ENODEV`、
   そして `EFBIG`）。そのあとは tmpfs と同じふるまいです。通常の確保は範囲の
@@ -1628,7 +1640,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、新しいウォッチから順に 1 行ずつ加わります。`inotify wd:` にウォッチの
   ディスクリプタ、`ino:` と `sdev:` にファイルの inode とカーネルの番号の付け方
   （`MKDEV`）でのファイルシステムのデバイス、`mask:` に与えたマスクを 16 進で書き、
-  `ignored_mask:0` が続きます。ほかの種類のファイルも Linux と同じ行を加えます。
+  `ignored_mask:0` と、`show_mark_fhandle` と同じファイルのハンドルが続きます。
+  `fhandle-bytes:` と `fhandle-type:` は 16 進で、`f_handle:` はそのバイトで、
+  `AT_HANDLE_FID` の `name_to_handle_at` が返す識別子です。ほかの種類のファイルも Linux と同じ行を加えます。
   最初の 4 行の後には `lock:` の行が続きます（`show_fd_locks`）。まずファイル記述の
   `flock` のロック、次にそのファイル記述を通して掛けたレコードロックのうちプロセスか
   ファイル記述が持つものが始まりの順に並び、両方を通して 1 から番号が付きます。各行には

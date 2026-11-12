@@ -199,6 +199,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     スーパーブロックを見つけ、その数（0）を返します。`/proc` と `/dev` のファイルの
     `st_dev` は、そのパスがあるマウントのものなので、`ustat` はそのマウントの数を返します。
     Linux は procfs や devtmpfs の数を返します。
+  - ファイルハンドル（`name_to_handle_at` と、`/proc/self/fdinfo` にある inotify の
+    ウォッチのもの）の世代は 0 です。tmpfs は inode ごとに乱数で選びます。ホストの
+    ディレクトリのファイルは NFS のエクスポートがないファイルシステムのものとして扱います
+    （`EOPNOTSUPP`、`AT_HANDLE_FID` では型 `FILEID_INO64_GEN` の識別子）。Linux はその
+    ファイルシステム（たとえば ext4）のハンドルを返します。`open_by_handle_at` はありません
+    （`ENOSYS`）。
   - System V IPC には `/proc/sysvipc` がなく、共有メモリ・セマフォー・メッセージキューの
     上限は Linux の既定値で、`/proc/sys/kernel` から変えられません。メッセージキューで
     待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの
@@ -324,9 +330,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **inotify の一部**：インスタンスの `/proc/self/fdinfo` の行は `ignored_mask:0` で
-  終わります。Linux はファイルハンドルを作れるファイルシステムではその後にハンドルを
-  加えます。何もアンマウントしない（`umount2` がない）ので、`IN_UNMOUNT` は送りません。
+- **inotify の一部**：何もアンマウントしない（`umount2` がない）ので、`IN_UNMOUNT` は
+  送りません。
   `/proc/self/fdinfo` では、epoll のファイルはディスクリプタの順に並びます。Linux はファイルのアドレスの
   順です。eventfd の番号はエミュレータの中で数えます。Linux の `eventfd-id` はシステム
   全体で数えます。マウントしたディレクトリにホストが加えた変更は見えず、ディスクリプタの

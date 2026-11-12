@@ -230,6 +230,12 @@ verified.
     file in `/proc` or `/dev` has the `st_dev` of the mount holding the
     path, so `ustat` of it gives that mount's counts, where Linux gives
     procfs's or devtmpfs's.
+  - A file handle (`name_to_handle_at`, an inotify watch's in
+    `/proc/self/fdinfo`) has the generation 0, where tmpfs picks a random
+    one for each inode. A file of a host's directory is taken as one of a
+    file system without NFS export (`EOPNOTSUPP`, or the `FILEID_INO64_GEN`
+    identifier with `AT_HANDLE_FID`), where Linux gives the handle of that
+    file system (ext4's, say). There is no `open_by_handle_at` (`ENOSYS`).
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders
@@ -368,9 +374,7 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: an instance's `/proc/self/fdinfo` lines end at
-  `ignored_mask:0`, without the file handle Linux adds for a file system
-  that can make one, and `IN_UNMOUNT` is never sent, as nothing is ever
+- **inotify, in part**: `IN_UNMOUNT` is never sent, as nothing is ever
   unmounted (there is no `umount2`). `/proc/self/fdinfo` lists an epoll's files by
   descriptor where Linux's order follows the files' addresses, and numbers
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole

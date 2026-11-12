@@ -7210,10 +7210,15 @@ static int msg_case(void) {
     usleep(100000);
     long sent_other = msgx_send(id, 4, "four", 0);
     long sent_wanted = msgx_send(id, 5, "five", 0);
-    printf("sent-other=%ld sent-wanted=%ld\n", sent_other, sent_wanted);
-    fflush(stdout);
     for (int i = 0; i < 2; i++) {
         if (read(ready[0], &byte, 1) != 1) return 14;
+        /* The waiter prints what it took as it takes it, and says it is
+           ready again only after that, so this side prints its sends
+           only now. */
+        if (i == 0) {
+            printf("sent-other=%ld sent-wanted=%ld\n", sent_other, sent_wanted);
+            fflush(stdout);
+        }
         usleep(100000);
         kill(waiter, SIGUSR1);
     }

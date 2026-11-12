@@ -93,7 +93,7 @@ paludarium: SIGSEGV: read of an unmapped address 0x0 at 0x401000
 表示します。
 
 ```text
-paludarium: unimplemented system calls (they returned ENOSYS): 28, 63, 204
+paludarium: unimplemented system calls (they returned ENOSYS): 101, 165, 298
 ```
 
 番号は x86-64 の Linux のシステムコールの表のものです。エミュレータ自身のエラーは

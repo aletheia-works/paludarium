@@ -279,6 +279,15 @@ static int case_rw(void) {
     printf("eventfd=%zd", read(evfd, &count, 8));
     printf(" count=%llu\n", (unsigned long long)count);
     printf("read=%.11s iov=%.2s%.3s pos=%ld\n", rbuf, a, b, (long)lseek(fd, 0, SEEK_CUR));
+    /* A vector's count with bits past 32: import_iovec took an unsigned
+       until Linux 965e5e451146, so 2 and 0 entries, not EINVAL. */
+    memset(a, 0, sizeof a);
+    memset(b, 0, sizeof b);
+    cbs[0] = rw(CMD_PREADV, fd, iov, 0x100000002ul, 0, 1);
+    cbs[1] = rw(CMD_PREADV, fd, iov, 1ul << 32, 0, 2);
+    printf("wide-count submit=%ld\n", submit(ctx, 2, list));
+    reap("wide-count", ctx, 2, cbs);
+    printf("wide-count iov=%.2s%.3s\n", a, b);
     /* Writes: a vector at the end, an append, and an O_APPEND file's. */
     cbs[0] = rw(CMD_PWRITEV, fd, iov, 2, 11, 1);
     cbs[1] = rw(CMD_PWRITE, fd, "!", 1, 0, 2);

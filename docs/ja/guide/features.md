@@ -205,7 +205,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   0 にせずに呼ぶもの（fish の `fcntl`）でも、Linux と同じ結果になります。ポインタと
   `long`・`unsigned long`・`size_t`・`loff_t` の引数はそのまま全体を読むので、`prot` の
   32 ビットより上が立っている `mprotect` は `EINVAL` のままです。ただし `readv`・`writev`
-  などの iovec の数は、Linux が `unsigned` として渡すので下位 32 ビットだけを読みます。システムコールの番号も、
+  などの iovec の数（`process_vm_readv`・`process_vm_writev` の手元側、`vmsplice`、
+  ベクタを使う `io_submit` の要求の `aio_nbytes` も）は例外で、下位 32 ビットだけを読みます。
+  CI のランナーのカーネルはこの数を `unsigned` として `import_iovec` に渡すので、
+  `0x100000001` は要素 1 つになります。Linux master は 965e5e451146（2026-11-05）から
+  全体を読み、そうした数を `EINVAL` にします。paludarium は CI のカーネルがそうなってから
+  合わせます。システムコールの番号も、
   Linux の `do_syscall_64` が `int` で受け取るのと同じく `rax` の下位 32 ビットから読み、
   負の番号は `ENOSYS` です。
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET`・`REQUEUE`・`CMP_REQUEUE`・

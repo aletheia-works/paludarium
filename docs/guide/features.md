@@ -228,8 +228,13 @@ kernel.
   (fish's `fcntl` does) gets what it would on Linux. Pointers and `long`,
   `unsigned long`, `size_t` and `loff_t` arguments are read whole, so
   `mprotect` with a bit set past 32 in `prot` is still `EINVAL`; the iovec
-  count of `readv`, `writev` and their kin is the exception, since Linux passes
-  it on as an `unsigned`. The number
+  count of `readv`, `writev` and their kin (`process_vm_readv`'s and
+  `process_vm_writev`'s local one, `vmsplice`'s, and `aio_nbytes` of a
+  vectored `io_submit` request) is the exception: the CI runner's kernel
+  passes it to `import_iovec` as an `unsigned`, so a count of `0x100000001`
+  is one entry. Linux master reads it whole since 965e5e451146 (2026-11-05)
+  and gives such a count `EINVAL`; paludarium follows once the CI kernel
+  does. The number
   itself is read from the low 32 bits of `rax` too, as Linux's
   `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`,

@@ -1588,7 +1588,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、新しいウォッチから順に 1 行ずつ加わります。`inotify wd:` にウォッチの
   ディスクリプタ、`ino:` と `sdev:` にファイルの inode とカーネルの番号の付け方
   （`MKDEV`）でのファイルシステムのデバイス、`mask:` に与えたマスクを 16 進で書き、
-  `ignored_mask:0` が続きます。
+  `ignored_mask:0` が続きます。ほかの種類のファイルも Linux と同じ行を加えます。
+  最初の 4 行の後には、そのファイル記述を通して掛けたレコードロックのうち、プロセスか
+  ファイル記述が持つものが 1 つずつ `lock:` の行になります（`show_fd_locks`）。`POSIX` か
+  `OFDLCK`、`READ` か `WRITE`、持ち主のプロセス ID（ファイル記述のものは -1）、デバイスと
+  inode、範囲が並び、始まりの順に 1 から番号が付きます。ほかのロックにまとめたロックは、
+  `posix_lock_inode` と同じく、広げた側のロックのファイル記述に残ります。続いて eventfd では
+  `eventfd-count`（16 進）、`eventfd-id`（`ida_alloc` と同じく、ほかの eventfd が持たない
+  いちばん小さい番号）、`eventfd-semaphore`、signalfd では `sigmask`、timerfd では
+  `clockid`、`ticks`、`settime flags` と、`timerfd_gettime` が返す `it_value` と
+  `it_interval` です。epoll では見張るファイルごとに `tfd:` の行が加わります。追加した
+  ときのディスクリプタ、イベント（`epoll_ctl` が加える `EPOLLERR` と `EPOLLHUP` を含む）、
+  データ、ファイルの位置、inode、デバイスです。
 - `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime` は、Linux と同じ形式で `sysinfo` と
   合った値を返します。ロードアベレージは 0 で、動いているタスクと生きているタスクの数、
   最後に割り当てた ID が続きます。メモリは合計、空き、使えるものがどれも 4 GiB で、ほかの

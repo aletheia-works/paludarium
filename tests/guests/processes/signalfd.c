@@ -15,8 +15,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/select.h>
 #include <sys/signalfd.h>
+#include <sys/sysmacros.h>
+#include <sys/timerfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -382,6 +385,137 @@ static int case_interrupt(void) {
     return 0;
 }
 
+/* /proc/self/fdinfo of the other files whose kinds add lines: an eventfd's
+ * count, an epoll's targets, a signalfd's mask, a timerfd's settings, and
+ * the record locks set through a description. Numbers the system picks
+ * (eventfd-id, inodes, devices, process IDs) are compared, not printed. */
+static FILE *fdinfo(int fd) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    return fopen(path, "r");
+}
+/* The lines after the four every descriptor has. */
+static void show_extra(const char *label, int fd) {
+    FILE *f = fdinfo(fd);
+    char line[256];
+    int n = 0;
+    printf("%s:\n", label);
+    while (f && fgets(line, sizeof line, f)) {
+        if (n++ < 4) continue;
+        unsigned id;
+        if (sscanf(line, "eventfd-id: %u", &id) == 1) {
+            printf("  eventfd-id number\n");
+            continue;
+        }
+        int tfd;
+        unsigned events, sdev;
+        unsigned long long data, ino;
+        long long pos;
+        if (sscanf(line, "tfd: %d events: %x data: %llx pos:%lli ino:%llx sdev:%x", &tfd, &events, &data, &pos, &ino, &sdev) == 6) {
+            struct stat st;
+            fstat(tfd, &st);
+            printf("  tfd=%d events=%#x data=%#llx pos=%lld ino=%s sdev=%s\n", tfd, events, data, pos,
+                   ino == st.st_ino ? "fstat" : "other",
+                   sdev == (major(st.st_dev) << 20 | minor(st.st_dev)) ? "fstat" : "other");
+            continue;
+        }
+        unsigned long long sec, nsec;
+        if (sscanf(line, "it_value: (%llu, %llu)", &sec, &nsec) == 2) {
+            printf("  it_value sec=%llu zero=%d\n", sec, sec == 0 && nsec == 0);
+            continue;
+        }
+        int lid, pid;
+        char what[16], adv[16], kind[16], end[32];
+        unsigned maj, min;
+        unsigned long lino;
+        long long start;
+        if (sscanf(line, "lock:\t%d: %15s %15s %15s %d %x:%x:%lu %lld %31s", &lid, what, adv, kind, &pid, &maj, &min, &lino, &start, end) == 10) {
+            struct stat st;
+            fstat(fd, &st);
+            printf("  lock %d %s %s %s pid=%s dev=%s ino=%s %lld %s\n", lid, what, adv, kind,
+                   pid == getpid() ? "own" : pid == -1 ? "-1" : "other",
+                   maj == major(st.st_dev) && min == minor(st.st_dev) ? "fstat" : "other",
+                   lino == st.st_ino ? "fstat" : "other", start, end);
+            continue;
+        }
+        printf("  %s", line);
+    }
+    if (f) fclose(f);
+}
+static int lock_range(int fd, int cmd, short type, off_t start, off_t len) {
+    struct flock l = {.l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = len};
+    return TRY(fcntl(fd, cmd, &l));
+}
+static int case_fdinfo(void) {
+    int counter = eventfd(5, EFD_SEMAPHORE | EFD_NONBLOCK);
+    show_extra("eventfd", counter);
+    uint64_t more = 0x123456789;
+    say("write=%ld", (long)write(counter, &more, sizeof more));
+    show_extra("eventfd-more", counter);
+    int plain = eventfd(0, 0);
+    show_extra("eventfd-plain", plain);
+
+    sigset_t mask = set_of(3, SIGUSR1, SIGRTMIN + 1, SIGKILL);
+    int sig = signalfd(-1, &mask, SFD_NONBLOCK);
+    show_extra("signalfd", sig);
+
+    int timer = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    show_extra("timerfd", timer);
+    struct itimerspec spec = {.it_interval = {2, 500}, .it_value = {0, 1}};
+    say("settime=%d", TRY(timerfd_settime(timer, 0, &spec, NULL)));
+    usleep(20000);
+    show_extra("timerfd-expired", timer);
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    int real = timerfd_create(CLOCK_REALTIME, 0);
+    struct itimerspec at = {.it_interval = {0, 0}, .it_value = {now.tv_sec + 1000, 0}};
+    say("settime abs=%d", TRY(timerfd_settime(real, TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &at, NULL)));
+    FILE *f = fdinfo(real);
+    char line[256];
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned long long sec, nsec;
+        if (sscanf(line, "it_value: (%llu, %llu)", &sec, &nsec) == 2)
+            printf("  it_value near=%d\n", sec >= 998 && sec <= 1000);
+        else if (!strncmp(line, "clockid", 7) || !strncmp(line, "settime", 7) || !strncmp(line, "ticks", 5) || !strncmp(line, "it_interval", 11))
+            printf("  %s", line);
+    }
+    if (f) fclose(f);
+
+    int ep = epoll_create1(0);
+    int pipes[2];
+    if (pipe(pipes)) return 92;
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.u64 = 0xfeedface12345678ULL};
+    say("add=%d", TRY(epoll_ctl(ep, EPOLL_CTL_ADD, counter, &ev)));
+    ev.events = EPOLLOUT;
+    ev.data.u64 = 7;
+    say("add=%d", TRY(epoll_ctl(ep, EPOLL_CTL_ADD, pipes[1], &ev)));
+    show_extra("epoll", ep);
+    ev.events = EPOLLIN | EPOLLONESHOT;
+    say("mod=%d", TRY(epoll_ctl(ep, EPOLL_CTL_MOD, pipes[1], &ev)));
+    say("del=%d", TRY(epoll_ctl(ep, EPOLL_CTL_DEL, counter, NULL)));
+    show_extra("epoll-changed", ep);
+
+    char path[] = "/tmp/fdinfo-locks-XXXXXX";
+    int file = mkstemp(path);
+    if (file < 0) return 93;
+    unlink(path);
+    int same = dup(file);
+    say("setlk=%d %d", lock_range(file, F_SETLK, F_WRLCK, 0, 10), lock_range(file, F_SETLK, F_RDLCK, 20, 30));
+    show_extra("locks", file);
+    show_extra("locks-dup", same);
+    char again[64];
+    snprintf(again, sizeof again, "/proc/self/fd/%d", file);
+    int second = open(again, O_RDWR);
+    say("setlk second=%d", lock_range(second, F_SETLK, F_WRLCK, 10, 5));
+    show_extra("locks-merged", file);
+    show_extra("locks-second", second);
+    say("ofd=%d", lock_range(second, F_OFD_SETLK, F_WRLCK, 100, 1));
+    show_extra("locks-ofd", second);
+    say("unlock=%d", lock_range(file, F_SETLK, F_UNLCK, 2, 3));
+    show_extra("locks-split", file);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -392,5 +526,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "signalfd-fork")) return case_fork();
     if (!strcmp(mode, "signalfd-interrupt")) return case_interrupt();
     if (!strcmp(mode, "signalfd-edges")) return case_edges();
+    if (!strcmp(mode, "signalfd-fdinfo")) return case_fdinfo();
     return 2;
 }

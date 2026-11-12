@@ -1826,7 +1826,21 @@ kernel.
   the newest first, as `inotify_fdinfo`: `inotify wd:`, the watch descriptor,
   `ino:` and `sdev:`, the file's inode and its file system's device as the
   kernel numbers it (`MKDEV`), and `mask:`, the mask it was given, in
-  hexadecimal, then `ignored_mask:0`.
+  hexadecimal, then `ignored_mask:0`. The other kinds add Linux's lines
+  too. After the first four comes a `lock:` line for each record lock set
+  through the description that the process or the description owns
+  (`show_fd_locks`): `POSIX` or `OFDLCK`, `READ` or `WRITE`, the owner's
+  process ID (-1 for a description's), the device and inode, and the
+  range, numbered from 1 by where they start. A lock merged into another
+  stays with the description of the lock it extended, as
+  `posix_lock_inode` keeps it. Then an eventfd's `eventfd-count`
+  (hexadecimal), `eventfd-id` (the lowest number no other eventfd has, as
+  `ida_alloc` gives it) and `eventfd-semaphore`; a signalfd's `sigmask`; a
+  timerfd's `clockid`, `ticks`, `settime flags`, and the `it_value` and
+  `it_interval` `timerfd_gettime` gives; and an epoll's `tfd:` line for each
+  file it watches: the descriptor it was added with, the events (with
+  `EPOLLERR` and `EPOLLHUP`, which `epoll_ctl` adds), the data, and the
+  file's position, inode and device.
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
   in Linux's formats: load averages of 0 with the running and live tasks and
   the last ID handed out; 4 GiB of total, free and available memory and

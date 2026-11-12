@@ -351,6 +351,7 @@ mod linux {
         signalfd_fork => ("signalfd-fork","signalfd"),
         signalfd_interrupt => ("signalfd-interrupt","signalfd"),
         signalfd_edges => ("signalfd-edges","signalfd"),
+        signalfd_fdinfo => ("signalfd-fdinfo","signalfd"),
         aio_calls => ("aio-calls","aio"),
         aio_rw => ("aio-rw","aio"),
         aio_streams => ("aio-streams","aio"),

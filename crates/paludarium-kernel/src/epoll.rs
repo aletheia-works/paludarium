@@ -52,6 +52,21 @@ pub(crate) struct EpollInstance {
     hub: Arc<ReadinessHub>,
 }
 impl EpollInstance {
+    /// The files it watches, for `/proc/self/fdinfo`: each descriptor
+    /// number it was added with, the events as Linux keeps them (with
+    /// `EPOLLERR` and `EPOLLHUP`, which `epoll_ctl` adds), the data, and the
+    /// file.
+    pub(crate) fn targets(&self) -> Vec<(u32, u32, u64, Arc<dyn FileHandle>)> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .interests
+            .iter()
+            .filter_map(|(&(fd, _), interest)| {
+                let file = interest.file.upgrade()?;
+                Some((fd, interest.events | 0x18, interest.data, file))
+            })
+            .collect()
+    }
     pub fn new(hub: Arc<ReadinessHub>) -> Self {
         Self {
             state: Mutex::default(),

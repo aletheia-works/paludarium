@@ -116,6 +116,20 @@ pub(crate) struct EventCounter {
     semaphore: bool,
     flags: AtomicU32,
     hub: Arc<ReadinessHub>,
+    /// Its number in `/proc/self/fdinfo` (`eventfd-id`): the lowest one no
+    /// other eventfd has, as Linux's `ida_alloc` gives it.
+    id: u32,
+}
+/// The numbers eventfds have.
+static EVENTFD_IDS: Mutex<std::collections::BTreeSet<u32>> =
+    Mutex::new(std::collections::BTreeSet::new());
+impl Drop for EventCounter {
+    fn drop(&mut self) {
+        EVENTFD_IDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
 }
 impl EventCounter {
     pub fn new(value: u32, flags: u32, hub: Arc<ReadinessHub>) -> Result<Self, Errno> {
@@ -131,7 +145,28 @@ impl EventCounter {
             semaphore: flags & 1 != 0,
             flags: AtomicU32::new(2 | flags & NONBLOCK),
             hub,
+            id: {
+                let mut ids = EVENTFD_IDS.lock().unwrap_or_else(PoisonError::into_inner);
+                let id = (0..).find(|id| !ids.contains(id)).unwrap_or(0);
+                ids.insert(id);
+                id
+            },
         })
+    }
+    /// What `/proc/self/fdinfo` adds for the counter, as Linux's
+    /// `eventfd_show_fdinfo`.
+    pub(crate) fn fdinfo(&self) -> Vec<u8> {
+        let value = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .value;
+        format!(
+            "eventfd-count: {value:16x}\neventfd-id: {}\neventfd-semaphore: {}\n",
+            self.id,
+            u8::from(self.semaphore)
+        )
+        .into_bytes()
     }
 }
 impl EventCounter {

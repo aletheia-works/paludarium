@@ -130,6 +130,11 @@ pub(crate) struct SignalFile {
     updates: AtomicU64,
 }
 impl SignalFile {
+    /// What `/proc/self/fdinfo` adds for the file, as Linux's
+    /// `signalfd_show_fdinfo`: the signals it takes.
+    pub(crate) fn fdinfo(&self) -> Vec<u8> {
+        format!("sigmask:\t{:016x}\n", self.mask.load(Ordering::SeqCst)).into_bytes()
+    }
     fn new(mask: u64, flags: u32) -> Self {
         LIVE.fetch_add(1, Ordering::SeqCst);
         Self {

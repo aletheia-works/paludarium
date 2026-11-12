@@ -5113,6 +5113,95 @@ mod inotify {
         assert_eq!(f.ret(RM, &[fd, wd]), 0);
         assert_eq!(taken(&f), [(1, 0x41, fd as i32)]);
     }
+    /// The lines of `/proc/self/fdinfo/<fd>` after the four every
+    /// descriptor has.
+    fn extra(f: &mut Fixture, fd: u64) -> Vec<String> {
+        let path = format!("/proc/self/fdinfo/{fd}");
+        let text = String::from_utf8(contents(f, path.as_bytes())).unwrap();
+        text.lines().skip(4).map(str::to_owned).collect()
+    }
+    #[test]
+    fn fdinfo_shows_what_each_kind_of_file_adds() {
+        let mut f = fixture();
+        // An eventfd: its count, a number, and whether it is a semaphore.
+        let counter = f.ret(290, &[5, 1]);
+        let lines = extra(&mut f, counter);
+        assert_eq!(lines[0], format!("eventfd-count: {:>16}", "5"));
+        assert!(lines[1].starts_with("eventfd-id: "));
+        assert_eq!(lines[2], "eventfd-semaphore: 1");
+        // A signalfd: the signals it takes, never SIGKILL.
+        f.mem
+            .write(
+                GuestAddr(DATA),
+                &(1u64 << 9 | 1 << 8 | 1 << 34).to_le_bytes(),
+            )
+            .unwrap();
+        let signals = f.ret(289, &[u64::MAX, DATA, 8, 0]);
+        assert_eq!(extra(&mut f, signals), ["sigmask:\t0000000400000200"]);
+        // A timerfd, disarmed.
+        let timer = f.ret(283, &[1, 0]);
+        assert_eq!(
+            extra(&mut f, timer),
+            [
+                "clockid: 1",
+                "ticks: 0",
+                "settime flags: 00",
+                "it_value: (0, 0)",
+                "it_interval: (0, 0)"
+            ]
+        );
+        // An epoll: each target, with EPOLLERR and EPOLLHUP.
+        let epoll = f.ret(291, &[0]);
+        f.mem
+            .write(GuestAddr(DATA), &0x8000_0001u32.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 4), &0x1234u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(233, &[epoll, 1, counter, DATA]), 0);
+        let lines = extra(&mut f, epoll);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with(&format!(
+                "tfd: {counter:8} events: 80000019 data:             1234  pos:0 ino:"
+            )),
+            "{}",
+            lines[0]
+        );
+        // Record locks: those set through the description, numbered.
+        let path = put(&f, DATA + 0x100, b"/tmp/locked");
+        let file = f.ret(2, &[path, 0o102, 0o600]);
+        let other = f.ret(2, &[path, 0o2, 0]);
+        let lock = |f: &mut Fixture, fd: u64, cmd: u64, kind: i16, start: i64, len: i64| {
+            let mut raw = [0u8; 32];
+            raw[0..2].copy_from_slice(&kind.to_le_bytes());
+            raw[8..16].copy_from_slice(&start.to_le_bytes());
+            raw[16..24].copy_from_slice(&len.to_le_bytes());
+            f.mem.write(GuestAddr(DATA + 0x200), &raw).unwrap();
+            f.ret(72, &[fd, cmd, DATA + 0x200])
+        };
+        assert_eq!(lock(&mut f, file, 6, 1, 0, 10), 0);
+        assert_eq!(lock(&mut f, file, 6, 0, 20, 30), 0);
+        // Merged into the first, the lock stays with its description.
+        assert_eq!(lock(&mut f, other, 6, 1, 10, 5), 0);
+        assert_eq!(lock(&mut f, other, 37, 1, 100, 1), 0);
+        let fs = &f.kernel.files.fs;
+        let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
+        let (major, minor) = (device >> 8 & 0xfff, device & 0xff | (device >> 12) & !0xff);
+        let ino = fs.metadata(b"/tmp/locked", true).unwrap().inode;
+        let at = format!("{major:02x}:{minor:02x}:{ino}");
+        assert_eq!(
+            extra(&mut f, file),
+            [
+                format!("lock:\t1: POSIX  ADVISORY  WRITE 1 {at} 0 14"),
+                format!("lock:\t2: POSIX  ADVISORY  READ 1 {at} 20 49"),
+            ]
+        );
+        assert_eq!(
+            extra(&mut f, other),
+            [format!("lock:\t1: OFDLCK ADVISORY  WRITE -1 {at} 100 100")]
+        );
+    }
     #[test]
     fn fdinfo_lists_the_watches_the_newest_first() {
         let mut f = fixture();

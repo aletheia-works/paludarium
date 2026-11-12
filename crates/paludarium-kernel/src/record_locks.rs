@@ -71,6 +71,9 @@ pub(crate) struct Lock {
     pub(crate) kind: Kind,
     pub(crate) start: u64,
     pub(crate) end: u64,
+    /// The description it was set through (Linux's `flc_file`), which
+    /// `/proc/self/fdinfo` lists it under.
+    file: Option<Weak<dyn FileHandle>>,
 }
 impl Lock {
     fn overlaps(&self, start: u64, end: u64) -> bool {
@@ -179,6 +182,7 @@ impl Locks {
     /// touching it, and the waits for them end. A conflicting lock of another
     /// owner is the error; with `waiter`, the process that will wait for it,
     /// the wait is recorded unless it would close a cycle.
+    #[cfg(test)]
     pub(crate) fn set(
         &self,
         key: Key,
@@ -187,6 +191,21 @@ impl Locks {
         start: u64,
         end: u64,
         waiter: Option<u32>,
+    ) -> Result<(), Refused> {
+        self.set_through(key, owner, kind, (start, end), waiter, None)
+    }
+    /// [`set`](Self::set) through the description `file`. A lock merged
+    /// with the owner's first one of the same kind keeps that one's
+    /// description, as `posix_lock_inode` extends it; a new or replacing
+    /// one takes `file`, and the pieces of a split one keep theirs.
+    pub(crate) fn set_through(
+        &self,
+        key: Key,
+        owner: &Owner,
+        kind: Option<Kind>,
+        (start, end): (u64, u64),
+        waiter: Option<u32>,
+        file: Option<Weak<dyn FileHandle>>,
     ) -> Result<(), Refused> {
         let mut table = self.table();
         let list = table.files.entry(key).or_default();
@@ -222,6 +241,9 @@ impl Locks {
             return Err(Refused::Conflict);
         }
         let (mut new_start, mut new_end) = (start, end);
+        // The first lock merged into the new one, by its start, and its
+        // description.
+        let mut merged: Option<(u64, Option<Weak<dyn FileHandle>>)> = None;
         let mut kept = Vec::with_capacity(list.len() + 1);
         // The owner's locks this replaces, splits or merges, whose waits end.
         let mut changed = Vec::new();
@@ -235,6 +257,9 @@ impl Locks {
                 new_start = new_start.min(l.start);
                 new_end = new_end.max(l.end);
                 changed.push((l.start, l.end));
+                if merged.as_ref().is_none_or(|&(first, _)| l.start < first) {
+                    merged = Some((l.start, l.file.clone()));
+                }
             } else if l.overlaps(start, end) {
                 changed.push((l.start, l.end));
                 if l.start < start {
@@ -259,6 +284,7 @@ impl Locks {
                 kind,
                 start: new_start,
                 end: new_end,
+                file: merged.map_or(file, |(_, file)| file),
             });
         }
         kept.sort_by_key(|l| l.start);
@@ -307,6 +333,57 @@ impl Locks {
 /// The file `d` opens, for the table: its device and inode.
 fn key(c: &Context<'_>, d: &Descriptor) -> Result<Key, Errno> {
     Ok((crate::files::descriptor_device(c, d), d.file.stat()?.inode))
+}
+
+/// The `lock:` lines `/proc/self/fdinfo` has for descriptor `d`, as Linux's
+/// `show_fd_locks`: the locks set through its description that this
+/// process or the description owns, numbered from 1, by where they start.
+pub(crate) fn fdinfo(c: &Context<'_>, d: &Descriptor) -> Vec<u8> {
+    let Ok(key) = key(c, d) else {
+        return Vec::new();
+    };
+    let this = Arc::downgrade(&d.file);
+    let ours = Owner::Process(c.process.pid);
+    let locks = c.processes.locks();
+    let table = locks.table();
+    let Some(list) = table.files.get(&key) else {
+        return Vec::new();
+    };
+    // `new_encode_dev` undone.
+    let (device, inode) = key;
+    let major = (device >> 8) & 0xfff;
+    let minor = (device & 0xff) | ((device >> 12) & !0xff);
+    let mut out = Vec::new();
+    let shown = list.iter().filter(|l| {
+        l.owner.live()
+            && l.file.as_ref().is_some_and(|f| Weak::ptr_eq(f, &this))
+            && (l.owner.same(&ours) || l.owner.same(&Owner::Description(this.clone())))
+    });
+    for (id, lock) in shown.enumerate() {
+        let (what, pid) = match lock.owner {
+            Owner::Process(pid) => ("POSIX ", c.pid_space().number(pid) as i32),
+            Owner::Description(_) => ("OFDLCK", -1),
+        };
+        let kind = if lock.kind == Kind::Write {
+            "WRITE"
+        } else {
+            "READ"
+        };
+        let end = if lock.end == OFFSET_MAX {
+            "EOF".to_owned()
+        } else {
+            lock.end.to_string()
+        };
+        out.extend_from_slice(
+            format!(
+                "lock:\t{}: {what} ADVISORY  {kind} {pid} {major:02x}:{minor:02x}:{inode} {} {end}\n",
+                id + 1,
+                lock.start
+            )
+            .as_bytes(),
+        );
+    }
+    out
 }
 
 /// After this process closed `d`, drops its record locks on the file.
@@ -433,7 +510,14 @@ pub(crate) fn fcntl(
     // An OFD lock's wait takes no part in deadlock detection.
     let waiter = (wait && !ofd).then_some(c.process.pid);
     loop {
-        match locks.set(key, &owner, kind, start, end, waiter) {
+        match locks.set_through(
+            key,
+            &owner,
+            kind,
+            (start, end),
+            waiter,
+            Some(Arc::downgrade(&d.file)),
+        ) {
             Ok(()) => return Ok(0),
             Err(Refused::Deadlock) => return Err(Errno(35)),
             Err(Refused::Conflict) if !wait => return Err(Errno::EAGAIN),

@@ -7302,12 +7302,11 @@ static void seccomp_notify_parent(void) {
     printf("seccomp turn 6 ready=%#x recv=%ld arg=%llu ids=%lld answer=%ld", ready, r, n.args[0], ids, answered);
     printf(" stale=%ld\n", sc_receive(fd, &n));
     sc_take(sock);
-    /* 7: a handler without SA_RESTART: EINTR. */
+    /* 7: a handler without SA_RESTART: EINTR. The call returns at once, so
+     * the child reads what its handler wrote itself. */
     sc_give(sock, '7');
     sc_revents(fd, -1);
     kill(pid, SIGUSR2);
-    read(sc_signal_pipe[0], &h, 1);
-    write(sc_signal_pipe[1], &h, 1);
     sc_take(sock);
     r = sc_receive(fd, &n);
     printf("seccomp turn 7 stale=%ld revents=%#x\n", r, sc_revents(fd, 0));

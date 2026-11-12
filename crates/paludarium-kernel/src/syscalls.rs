@@ -291,6 +291,12 @@ impl SyscallTable {
         handlers.insert(244, crate::mqueue::sys_mq_notify);
         handlers.insert(245, crate::mqueue::sys_mq_getsetattr);
         handlers.insert(334, crate::rseq::sys_rseq);
+        handlers.insert(206, crate::aio::sys_setup);
+        handlers.insert(207, crate::aio::sys_destroy);
+        handlers.insert(208, crate::aio::sys_getevents);
+        handlers.insert(209, crate::aio::sys_submit);
+        handlers.insert(210, crate::aio::sys_cancel);
+        handlers.insert(333, crate::aio::sys_pgetevents);
         handlers.insert(425, crate::io_uring::sys_setup);
         handlers.insert(426, crate::io_uring::sys_enter);
         handlers.insert(427, crate::io_uring::sys_register);

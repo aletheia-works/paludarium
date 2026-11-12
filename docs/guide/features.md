@@ -66,6 +66,7 @@ kernel.
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
+| Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
@@ -938,6 +939,39 @@ kernel.
   completion is in the queue when the call returns; links, completions that
   skip success, and completions kept while the queue is full
   (`IORING_FEAT_NODROP`) behave as on Linux.
+- Linux's native asynchronous I/O (the calls libaio wraps) is `fs/aio.c`'s.
+  `io_setup` makes the number of events at least four for each CPU and
+  doubles it (`EINVAL` past `0x8000000 / 32`, `EAGAIN` past
+  `/proc/sys/fs/aio-max-nr`, alone or with the machine's other contexts),
+  and maps the ring where `mmap` would: its header (the context's index,
+  the events it holds, the head, the tail, the magic `0xa10a10a1`, the
+  features and the header's size of 32) and the events after it, which a
+  program may read and take itself, as libaio does; `/proc/self/maps`
+  names it `/[aio] (deleted)`. A context ID is the ring's address, and each
+  call finds its context by the index in that header (`EINVAL` for none).
+  `io_submit` takes at most as many requests as the ring holds, checks each
+  as Linux's `io_submit_one` does, in its order (`aio_reserved2`, the
+  length, a place in the ring, the file, the eventfd of `IOCB_FLAG_RESFD`,
+  clearing `aio_key`, then the operation: `IOCB_CMD_PREAD`, `PWRITE`,
+  `PREADV`, `PWRITEV`, `FSYNC`, `FDSYNC` and `POLL`, and `EINVAL` for
+  another, `IOCB_CMD_NOOP` too), and gives the count taken before the
+  first that fails. A read, write or sync runs as it is taken, at
+  `aio_offset` (a pipe, socket or terminal as a stream), with the
+  `IOCB_FLAG_IOPRIO` priority and `aio_rw_flags` checked as `preadv2`'s,
+  and its event is in the ring before the call returns: a read of an empty
+  pipe waits there, and a signal makes its result `EINTR`. A poll completes
+  at once if its file is ready, else waits until it is; `io_cancel` cancels
+  only a poll that waits (`EINPROGRESS`, with an event of no events in the
+  ring), and gives `EINVAL` for another request. `io_getevents` and
+  `io_pgetevents` take events from the head and wait for `min_nr` of them
+  as Linux's `read_events` does: until the timeout, a signal (`EINTR`, never
+  restarted for `io_getevents`; `ERESTARTNOHAND` for `io_pgetevents`, whose
+  signal mask is in place while it waits), or `io_destroy` from another
+  thread (`EINVAL`). An eventfd counts every completion of a request that
+  names it. The contexts belong to the address space: threads and
+  `CLONE_VM` children share them, a fork's child has none and not their
+  rings either (as `VM_DONTCOPY` since 2026), and `execve` or the last exit
+  ends them, cancelling their polls.
 - `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
   `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
   commands give `EPERM` until the address space registers for them, a fork
@@ -1618,6 +1652,13 @@ kernel.
   or one out of range (`queues_max` takes any `int`, compared as
   unsigned). A write past the start is taken and changes nothing, as
   `sysctl_writes_strict` has it.
+- `/proc/sys/fs/aio-nr` (mode 0444) is how many events the machine's aio
+  contexts were set up for, and `/proc/sys/fs/aio-max-nr` (0644, 65536 at
+  first) their limit, which only root (user ID 0 outside any user namespace)
+  may open to write. Both are unsigned longs, as Linux's
+  `proc_doulongvec_minmax` reads and writes them: a write takes no `-`
+  (`EINVAL`) and otherwise reads as the files of `/proc/sys/fs/mqueue` do.
+  `/proc/sys/fs` lists only these and `mqueue`.
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
   in Linux's formats: load averages of 0 with the running and live tasks and
   the last ID handed out; 4 GiB of total, free and available memory and

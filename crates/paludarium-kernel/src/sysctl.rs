@@ -1,7 +1,11 @@
 //! The sysctls paludarium has under `/proc/sys`: the POSIX message queue
 //! limits of `/proc/sys/fs/mqueue` (`queues_max`, `msg_max`,
 //! `msgsize_max`, `msg_default`, `msgsize_default`), as Linux's
-//! `ipc/mq_sysctl.c` has them.
+//! `ipc/mq_sysctl.c` has them, and the machine's aio events
+//! (`/proc/sys/fs/aio-nr`, mode 0444) and their limit (`aio-max-nr`), as
+//! `fs/aio.c` has them: unsigned longs (`proc_doulongvec_minmax`), whose
+//! write takes no `-`, and which only root (user ID 0 outside any user
+//! namespace) may open to write.
 //!
 //! Each file is the opener's IPC namespace's ([`crate::mqueue::Limits`]),
 //! so a new namespace shows Linux's defaults again. A read gives the value
@@ -74,11 +78,19 @@ impl Setting {
     }
 }
 
+/// A file of `/proc/sys/fs` for aio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Aio {
+    MaxNr,
+    Nr,
+}
+
 /// What `path` names under `/proc/sys`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Entry {
     Directory(Directory),
     Setting(Setting),
+    Aio(Aio),
 }
 
 /// The entry `path` names, if it is one of these.
@@ -92,6 +104,8 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
         b"" => Some(Entry::Directory(Directory::Sys)),
         b"/fs" => Some(Entry::Directory(Directory::Fs)),
         b"/fs/mqueue" => Some(Entry::Directory(Directory::Mqueue)),
+        b"/fs/aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
+        b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
         _ => {
             let name = rest.strip_prefix(b"/fs/mqueue/")?;
             SETTINGS
@@ -106,7 +120,11 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
 pub(crate) fn entries(directory: Directory) -> Vec<DirectoryEntry> {
     let names: Vec<(&[u8], u8)> = match directory {
         Directory::Sys => vec![(b"fs", DT_DIR)],
-        Directory::Fs => vec![(b"mqueue", DT_DIR)],
+        Directory::Fs => vec![
+            (b"aio-max-nr", DT_REG),
+            (b"aio-nr", DT_REG),
+            (b"mqueue", DT_DIR),
+        ],
         Directory::Mqueue => SETTINGS.iter().map(|&(name, _)| (name, DT_REG)).collect(),
     };
     [(&b"."[..], DT_DIR), (b"..", DT_DIR)]
@@ -137,11 +155,25 @@ fn owner(c: &Context<'_>) -> (u32, u32) {
     )
 }
 
-/// The status of `entry`: a directory anyone may read and search, or a
-/// regular file of mode 0644, its owner's root's.
+/// The value of an aio file, as a line.
+fn aio_line(limits: &crate::aio::Limits, aio: Aio) -> Vec<u8> {
+    let value = match aio {
+        Aio::MaxNr => limits.max(),
+        Aio::Nr => limits.nr(),
+    };
+    format!("{value}\n").into_bytes()
+}
+
+/// The status of `entry`: a directory anyone may read and search, a
+/// regular file of mode 0644, its owner's root's, or an aio file, root's,
+/// 0644 or for `aio-nr` 0444.
 pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
     match entry {
         Entry::Directory(_) => crate::proc::directory_stat(),
+        Entry::Aio(aio) => FileStat {
+            mode: if aio == Aio::Nr { 0o100_444 } else { 0o100_644 },
+            ..crate::proc::stat(aio_line(&c.processes.aio, aio).len())
+        },
         Entry::Setting(setting) => {
             let (uid, gid) = owner(c);
             let queues = queues(c);
@@ -179,8 +211,19 @@ pub(crate) fn open(
                 return Err(Errno::EACCES);
             }
             Ok(Arc::new(SettingFile {
-                queues: queues(c),
-                setting,
+                value: Value::Mqueue(queues(c), setting),
+                stat: stat(c, entry),
+                position: Mutex::new(0),
+                flags,
+            }))
+        }
+        // `test_perm`: root has the owner's bits, everyone else the others'.
+        Entry::Aio(aio) => {
+            if flags & 3 != 0 && (aio == Aio::Nr || c.process.credentials.euid != 0) {
+                return Err(Errno::EACCES);
+            }
+            Ok(Arc::new(SettingFile {
+                value: Value::Aio(Arc::clone(&c.processes.aio), aio),
                 stat: stat(c, entry),
                 position: Mutex::new(0),
                 flags,
@@ -189,10 +232,45 @@ pub(crate) fn open(
     }
 }
 
-/// An open file of `/proc/sys/fs/mqueue`.
+/// What an open sysctl file shows.
+enum Value {
+    Mqueue(Queues, Setting),
+    Aio(Arc<crate::aio::Limits>, Aio),
+}
+
+impl Value {
+    fn line(&self) -> Vec<u8> {
+        match self {
+            Self::Mqueue(queues, setting) => {
+                line(setting.of(queues.limits()).0.load(Ordering::SeqCst))
+            }
+            Self::Aio(limits, aio) => aio_line(limits, *aio),
+        }
+    }
+    /// Takes the value written at the start of the file: the bytes taken.
+    fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
+        match self {
+            Self::Mqueue(queues, setting) => {
+                let (value, bounds) = setting.of(queues.limits());
+                let (parsed, consumed) = parse(buf, bounds)?;
+                value.store(parsed, Ordering::SeqCst);
+                Ok(consumed)
+            }
+            Self::Aio(limits, _) => {
+                let (negative, value, consumed) = scan(buf)?;
+                if negative {
+                    return Err(Errno::EINVAL);
+                }
+                limits.set_max(value);
+                Ok(consumed)
+            }
+        }
+    }
+}
+
+/// An open file of `/proc/sys`.
 struct SettingFile {
-    queues: Queues,
-    setting: Setting,
+    value: Value,
     stat: FileStat,
     position: Mutex<u64>,
     flags: u32,
@@ -215,8 +293,7 @@ impl FileHandle for SettingFile {
         if *position != 0 || buf.is_empty() {
             return Ok(0);
         }
-        let (value, _) = self.setting.of(self.queues.limits());
-        let line = line(value.load(Ordering::SeqCst));
+        let line = self.value.line();
         let count = buf.len().min(line.len());
         buf[..count].copy_from_slice(&line[..count]);
         *position += count as u64;
@@ -236,9 +313,7 @@ impl FileHandle for SettingFile {
             *position += buf.len() as u64;
             return Ok(buf.len());
         }
-        let (value, bounds) = self.setting.of(self.queues.limits());
-        let (parsed, consumed) = parse(buf, bounds)?;
-        value.store(parsed, Ordering::SeqCst);
+        let consumed = self.value.write(buf)?;
         *position += consumed as u64;
         Ok(consumed)
     }
@@ -279,12 +354,11 @@ fn space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
-/// One `int` written to a sysctl, as Linux's `__do_proc_dointvec` with
-/// `proc_get_long` reads it, and `do_proc_dointvec_minmax_conv` bounds it:
-/// the value and the bytes taken, the spaces after it too. `EINVAL` for no
-/// value, one not followed by a space, tab, newline or the end, one of 21
-/// characters or more, one an `int` cannot hold, or one out of `bounds`.
-fn parse(buf: &[u8], bounds: Option<(i32, i32)>) -> Result<(i32, usize), Errno> {
+/// One number written to a sysctl, as Linux's `proc_get_long` reads it:
+/// whether it is negative, its magnitude, and the bytes taken, the spaces
+/// after it too. `EINVAL` for no value, one not followed by a space, tab,
+/// newline or the end, one of 21 characters or more, or one past 64 bits.
+fn scan(buf: &[u8]) -> Result<(bool, u64, usize), Errno> {
     let buf = &buf[..buf.len().min(4095)];
     let mut at = buf.iter().take_while(|&&b| space(b)).count();
     if at == buf.len() {
@@ -309,6 +383,16 @@ fn parse(buf: &[u8], bounds: Option<(i32, i32)>) -> Result<(i32, usize), Errno> 
     {
         return Err(Errno::EINVAL);
     }
+    at += buf[at..].iter().take_while(|&&b| space(b)).count();
+    Ok((negative, value, at))
+}
+
+/// One `int` written to a sysctl, as Linux's `__do_proc_dointvec` with
+/// `proc_get_long` reads it ([`scan`]), and `do_proc_dointvec_minmax_conv`
+/// bounds it: the value and the bytes taken. `EINVAL` as [`scan`] gives
+/// it, and for one an `int` cannot hold or one out of `bounds`.
+fn parse(buf: &[u8], bounds: Option<(i32, i32)>) -> Result<(i32, usize), Errno> {
+    let (negative, value, consumed) = scan(buf)?;
     let value = if negative {
         if value > i32::MAX as u64 + 1 {
             return Err(Errno::EINVAL);
@@ -322,8 +406,7 @@ fn parse(buf: &[u8], bounds: Option<(i32, i32)>) -> Result<(i32, usize), Errno> 
     {
         return Err(Errno::EINVAL);
     }
-    at += buf[at..].iter().take_while(|&&b| space(b)).count();
-    Ok((value, at))
+    Ok((value, consumed))
 }
 
 /// `strtoul` with base 0 on digits that start with a digit: 16 after `0x`
@@ -367,6 +450,12 @@ mod tests {
             Some(Entry::Setting(Setting::MsgMax))
         );
         assert_eq!(entry(b"/proc/sys/fs/mqueue/other"), None);
+        assert_eq!(
+            entry(b"/proc/sys/fs/aio-max-nr"),
+            Some(Entry::Aio(Aio::MaxNr))
+        );
+        assert_eq!(entry(b"/proc/sys/fs/aio-nr"), Some(Entry::Aio(Aio::Nr)));
+        assert_eq!(entries(Directory::Fs).len(), 5);
         assert_eq!(entry(b"/proc/sys/kernel"), None);
         assert_eq!(entry(b"/proc/system"), None);
         assert_eq!(entries(Directory::Mqueue).len(), 7);
@@ -404,5 +493,9 @@ mod tests {
         assert_eq!(parse(b"65536", bounded), Ok((65536, 5)));
         assert_eq!(parse(b"0", bounded), Err(Errno::EINVAL));
         assert_eq!(parse(b"65537", bounded), Err(Errno::EINVAL));
+        // An unsigned long takes all 64 bits, and a sign is seen.
+        assert_eq!(scan(b"18446744073709551615\n"), Ok((false, u64::MAX, 21)));
+        assert_eq!(scan(b"-1"), Ok((true, 1, 2)));
+        assert_eq!(scan(b"18446744073709551616"), Err(Errno::EINVAL));
     }
 }

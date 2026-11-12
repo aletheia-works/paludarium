@@ -182,6 +182,20 @@ verified.
   `IORING_FEAT_REG_REG_RING` is reported though no ring descriptor can be
   registered, and `IORING_FEAT_MIN_TIMEOUT` though a wait's `min_wait_usec`
   changes nothing (no request is ever in flight).
+- **Native AIO, in part**: every read, write and sync runs as `io_submit`
+  takes it, as Linux's buffered I/O does; one of a file opened with
+  `O_DIRECT` does not run in the background as on Linux, and a sync's event
+  is in the ring when the call returns, where Linux's comes from a worker
+  soon after. A poll that waits is looked at only as a thread of the
+  process makes a call (any call) and while one waits: a program that takes
+  events from the ring without ever calling the kernel does not see it
+  complete. Which files' polls wait on two queues, which Linux refuses with
+  `EINVAL` unless the file is ready, is guessed from the kind of file: a FIFO
+  open to read and write, and a character device (a terminal). A ring holds
+  exactly one request fewer than its events, where Linux's per-CPU counts
+  can stop one sooner; the I/O priority of `IOCB_FLAG_IOPRIO` is checked but
+  changes nothing; and a ring `mremap` moves is found at its new address
+  only when it moved whole (Linux refuses a partial move).
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
   - `pwritev2`'s `RWF_NOAPPEND` cannot turn an `O_APPEND` file's append off

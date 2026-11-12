@@ -72,6 +72,9 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
         c.host.clock(paludarium_host::ClockId::Monotonic)?,
     );
     crate::signalfd::observe(c.process, c.inbox, c.group);
+    // A poll an aio context holds completes once its file is ready, which
+    // what this wait is for may be waiting for in turn (its eventfd).
+    crate::aio::progress(c);
     if signalled(c)
         || receipt.interrupted
         || (outcome == paludarium_host::WaitOutcome::Interrupted
@@ -129,6 +132,17 @@ impl EventCounter {
             flags: AtomicU32::new(2 | flags & NONBLOCK),
             hub,
         })
+    }
+}
+impl EventCounter {
+    /// `eventfd_signal`: one more, unless the counter is at the most it can
+    /// count (`ULLONG_MAX`), as an aio completion counts itself.
+    pub(crate) fn signal(&self) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.value = s.value.saturating_add(1);
+        s.input_epoch = s.input_epoch.wrapping_add(1);
+        drop(s);
+        self.hub.changed();
     }
 }
 impl FileHandle for EventCounter {

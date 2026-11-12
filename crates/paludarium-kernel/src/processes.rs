@@ -180,6 +180,8 @@ pub struct Processes {
     pub(crate) mqueue_mount: crate::mqueue::Queues,
     /// The cookies `kcmp` hides objects behind, drawn once.
     kcmp_cookies: std::sync::OnceLock<[[u64; 2]; crate::kcmp::TYPES]>,
+    /// The events the machine's aio contexts take, and their limit.
+    pub(crate) aio: Arc<crate::aio::Limits>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -200,6 +202,7 @@ impl Processes {
             mqueue_charges: Arc::default(),
             mqueue_mount: group.namespaces(1).ipc.mq.clone(),
             kcmp_cookies: std::sync::OnceLock::new(),
+            aio: Arc::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -2829,6 +2832,9 @@ impl Kernel {
         self.group
             .numa()
             .new_process(group.numa(), parent.tid, pid, flags & 0x100 != 0);
+        self.group
+            .aio()
+            .new_process(group.aio(), child_mem.as_deref(), group.numa());
         group.register(pid, inbox.clone());
         // copy_semundo: CLONE_SYSVSEM shares the undo list, which the
         // parent is given first if it has none.

@@ -58,6 +58,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
+| 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
@@ -826,6 +827,32 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   見えます。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
   完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
   完了（`IORING_FEAT_NODROP`）は Linux と同じです。
+- Linux のネイティブな非同期 I/O（libaio が包む呼び出し）は `fs/aio.c` のものです。
+  `io_setup` はイベント数を CPU ごとに少なくとも 4 にして 2 倍にし（`0x8000000 / 32` を
+  超えると `EINVAL`、単独でもマシンのほかのコンテキストと合わせても
+  `/proc/sys/fs/aio-max-nr` を超えると `EAGAIN`）、`mmap` が置く場所にリングをマップします。
+  リングはヘッダー（コンテキストの番号、保てるイベント数、head、tail、マジック
+  `0xa10a10a1`、機能、ヘッダーの大きさ 32）とその後のイベントで、libaio と同じく
+  プログラムが自分で読んで取り出せます。`/proc/self/maps` での名前は `/[aio] (deleted)` です。
+  コンテキストの ID はリングのアドレスで、どの呼び出しもそのヘッダーの番号でコンテキストを
+  探します（ないと `EINVAL`）。`io_submit` はリングが保てる数までの要求を取り、それぞれを
+  Linux の `io_submit_one` と同じ順で確かめ（`aio_reserved2`、長さ、リングの空き、ファイル、
+  `IOCB_FLAG_RESFD` の eventfd、`aio_key` の消去、そして操作です。操作は `IOCB_CMD_PREAD`、
+  `PWRITE`、`PREADV`、`PWRITEV`、`FSYNC`、`FDSYNC`、`POLL` で、ほかは `IOCB_CMD_NOOP` も
+  `EINVAL`）、最初に失敗したものの前までに取った数を返します。読み書きと同期は取られたときに
+  `aio_offset` で実行され（パイプ、ソケット、端末はストリームとして）、`IOCB_FLAG_IOPRIO` の
+  優先度と `aio_rw_flags` は `preadv2` と同じく確かめ、そのイベントは呼び出しが戻る前に
+  リングにあります。空のパイプの読み込みはそこで待ち、シグナルで結果が `EINTR` になります。
+  poll はファイルが準備できていればすぐに完了し、そうでなければ準備できるまで待ちます。
+  `io_cancel` が取り消せるのは待っている poll だけで（`EINPROGRESS` で、イベントのない
+  イベントがリングに入ります）、ほかの要求には `EINVAL` です。`io_getevents` と
+  `io_pgetevents` は head からイベントを取り、Linux の `read_events` と同じく `min_nr` 個まで
+  待ちます。待ちが終わるのは、タイムアウト、シグナル（`io_getevents` は再開しない `EINTR`、
+  `io_pgetevents` は `ERESTARTNOHAND` で、待つあいだはそのシグナルマスクです）、ほかの
+  スレッドの `io_destroy`（`EINVAL`）です。eventfd を指定した要求の完了は、それぞれ eventfd が
+  数えます。コンテキストはアドレス空間のものです。スレッドと `CLONE_VM` の子は共有し、fork の
+  子はコンテキストもリングも持たず（2026 年からの `VM_DONTCOPY` と同じ）、`execve` か最後の
+  終了でコンテキストは終わり、待っている poll は取り消されます。
 - `membarrier` は、`CONFIG_RSEQ` があって `nohz_full` の CPU がない x86-64 の Linux の
   コマンドを持ちます（`MEMBARRIER_CMD_QUERY` は `0x3ff`）。プライベートのコマンドは、
   アドレス空間がそれに登録するまで `EPERM` です。fork は登録を保ち、exec のあとは登録がなく、
@@ -1410,6 +1437,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   返し、値がない、余計な文字がある、長すぎる、範囲外なら `EINVAL` です（`queues_max` は
   どの `int` も取り、符号なしで比べます）。先頭より後への書き込みは、`sysctl_writes_strict`
   と同じく受け取るだけで何も変えません。
+- `/proc/sys/fs/aio-nr`（モード 0444）はマシンの aio コンテキストが用意したイベントの数で、
+  `/proc/sys/fs/aio-max-nr`（0644、最初は 65536）はその上限です。書くために開けるのは
+  root（どのユーザー名前空間の外でもユーザー ID 0）だけです。どちらも Linux の
+  `proc_doulongvec_minmax` と同じく unsigned long として読み書きし、書き込みは `-` を取らず
+  （`EINVAL`）、それ以外は `/proc/sys/fs/mqueue` のファイルと同じに読みます。
+  `/proc/sys/fs` にあるのはこれらと `mqueue` だけです。
 - `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime` は、Linux と同じ形式で `sysinfo` と
   合った値を返します。ロードアベレージは 0 で、動いているタスクと生きているタスクの数、
   最後に割り当てた ID が続きます。メモリは合計、空き、使えるものがどれも 4 GiB で、ほかの

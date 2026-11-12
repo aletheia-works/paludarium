@@ -345,20 +345,25 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         // futex_waitv and futex2's futex_wait, whose timeout is absolute
         // (`ERESTARTSYS`).
         449 | 455 => true,
+        // io_pgetevents (`ERESTARTNOHAND`); io_getevents gives EINTR.
+        333 => true,
         _ => false,
     }
 }
 
 /// Whether a handler set with SA_RESTART runs the interrupted syscall
 /// `number` again: the calls that return ERESTARTSYS. pause, rt_sigsuspend,
-/// poll, ppoll, select, pselect6, msgsnd, msgrcv and an absolute
-/// clock_nanosleep return ERESTARTNOHAND, and the waits armed to go on
+/// poll, ppoll, select, pselect6, msgsnd, msgrcv, io_pgetevents and an
+/// absolute clock_nanosleep return ERESTARTNOHAND, and the waits armed to go on
 /// through restart_syscall
 /// ERESTART_RESTARTBLOCK, which a handler ends with EINTR whatever its flags.
 /// The last two are not entered here: the interrupted wait records them (as
 /// 230 or 219) in place of its own number.
 pub(crate) fn restarts_with_handler(number: u64) -> bool {
-    !matches!(number, 7 | 23 | 34 | 69 | 70 | 130 | 219 | 230 | 270 | 271)
+    !matches!(
+        number,
+        7 | 23 | 34 | 69 | 70 | 130 | 219 | 230 | 270 | 271 | 333
+    )
 }
 
 /// Shared selection for delivery and syscall-restart preview. SIGKILL wins,

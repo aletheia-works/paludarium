@@ -36,6 +36,8 @@ pub struct ThreadGroup {
     affinity_changes: std::sync::atomic::AtomicU64,
     /// The NUMA memory policies of its threads and of its address space.
     numa: crate::mempolicy::Numa,
+    /// The aio contexts of its address space.
+    aio: crate::aio::Contexts,
     /// What signalling each thread looks at, for other processes to read;
     /// a thread without one is root's ([`TaskIds`]).
     task_ids: Mutex<BTreeMap<u32, TaskIds>>,
@@ -122,6 +124,7 @@ impl Default for ThreadGroup {
             affinity: Mutex::default(),
             affinity_changes: std::sync::atomic::AtomicU64::new(0),
             numa: crate::mempolicy::Numa::default(),
+            aio: crate::aio::Contexts::default(),
             task_ids: Mutex::default(),
             namespaces: Mutex::default(),
             first_namespaces: Arc::default(),
@@ -310,8 +313,10 @@ impl ThreadGroup {
             affinity.insert(pid, mask);
         }
         drop(affinity);
-        // And its memory policy; the new address space has none of its own.
+        // And its memory policy; the new address space has none of its own,
+        // and no aio contexts.
         self.numa.exec(old_tid, pid);
+        self.aio.release();
         self.retired
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -587,6 +592,10 @@ impl ThreadGroup {
     /// The NUMA memory policies ([`crate::mempolicy`]).
     pub(crate) fn numa(&self) -> &crate::mempolicy::Numa {
         &self.numa
+    }
+    /// The aio contexts of the address space ([`crate::aio`]).
+    pub(crate) fn aio(&self) -> &crate::aio::Contexts {
+        &self.aio
     }
     /// The CPU mask of thread `tid`, if `sched_setaffinity` gave it one.
     pub(crate) fn affinity(&self, tid: u32) -> Option<Vec<u64>> {
@@ -1068,6 +1077,8 @@ impl Kernel {
         // As in `finish_thread`: no thread left runs the program.
         if alone {
             self.group.set_exe_file(None);
+            // `exit_aio`, once no process uses the address space.
+            self.group.aio().release();
         }
         self.group.forget_nice(tid);
         self.group.forget_task_ids(self.process.pid, tid);

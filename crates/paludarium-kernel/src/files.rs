@@ -1389,7 +1389,7 @@ fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
     c.mem.write(GuestAddr(addr), b).map_err(|_| Errno::EFAULT)
 }
 /// Linux's largest single read or write (`MAX_RW_COUNT`).
-const MAX_RW_COUNT: usize = 0x7fff_f000;
+pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
 /// The file a positioned read or write uses, checked in Linux's order: a
 /// negative offset (EINVAL), the descriptor (EBADF), a file without a
 /// position such as a pipe or socket (ESPIPE), then the access mode (EBADF).
@@ -1966,13 +1966,28 @@ const S_IFIFO: u32 = 0o010000;
 const O_APPEND: u32 = 0o2000;
 
 /// The `RWF_*` flags of a transfer with bytes to move, checked as Linux's
-/// `kiocb_set_rw_flags` checks them, after the vector and the range.
-/// `RWF_NOWAIT` needs a file opened with `FMODE_NOWAIT`: here a regular
-/// file (as on ext4; tmpfs has none), a pipe, a socket, an eventfd or a
-/// signalfd, and a regular file's buffered write refuses it as ext4's
-/// does. No file can write atomically (`FMODE_CAN_ATOMIC_WRITE`), and
-/// `RWF_NOAPPEND` cannot turn an `O_APPEND` file's append off here.
+/// `kiocb_set_rw_flags` checks them ([`kiocb_rw_flags`]), after the vector
+/// and the range, and then as ext4's `ext4_buffered_write_iter`, which
+/// refuses a regular file's buffered write with `RWF_NOWAIT`.
 fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, Errno> {
+    let flags = kiocb_rw_flags(file, flags, write)?;
+    if write && flags & RWF_NOWAIT != 0 && file.stat()?.mode & S_IFMT == S_IFREG {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(flags)
+}
+
+/// Linux's `kiocb_set_rw_flags`: unknown flags are `EOPNOTSUPP`, and
+/// `RWF_APPEND` with `RWF_NOAPPEND` `EINVAL`. `RWF_NOWAIT` needs a file
+/// opened with `FMODE_NOWAIT`: here a regular file (as on ext4; tmpfs has
+/// none), a pipe, a socket, an eventfd or a signalfd. No file can write
+/// atomically (`FMODE_CAN_ATOMIC_WRITE`), and `RWF_NOAPPEND` cannot turn an
+/// `O_APPEND` file's append off here.
+pub(crate) fn kiocb_rw_flags(
+    file: &Arc<dyn FileHandle>,
+    flags: u32,
+    write: bool,
+) -> Result<u32, Errno> {
     if flags == 0 {
         return Ok(0);
     }
@@ -2001,11 +2016,118 @@ fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, 
     if write && flags & RWF_NOAPPEND != 0 && file.flags() & O_APPEND != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
+    Ok(flags)
+}
+
+/// Whether an aio transfer of `file` is at its offset: a file with a
+/// position that `pread` and `pwrite` take (Linux's `FMODE_PREAD`), not a
+/// pipe, socket or terminal, a signalfd or an inotify instance, which read
+/// and write as a stream whatever the offset.
+fn aio_positioned(file: &Arc<dyn FileHandle>) -> bool {
+    file.seek(0, 1).is_ok()
+        && !file.as_any().is_some_and(|any| {
+            any.is::<crate::signalfd::SignalFile>() || any.is::<crate::inotify::Instance>()
+        })
+}
+
+/// An aio read or write of `segments` at `offset` with the `RWF_*` `flags`,
+/// once `io_submit` has checked it (`aio_read`, `aio_write`): what the
+/// file's `read_iter` or `write_iter` gives, a count or a negative errno,
+/// for the completion event. As Linux's, it tells no inotify watch.
+pub(crate) fn aio_transfer(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    write: bool,
+    segments: &[(u64, usize)],
+    offset: u64,
+    flags: u32,
+) -> i64 {
+    let result = if write {
+        aio_write(c, file, segments, offset, flags)
+    } else {
+        aio_read(c, file, segments, offset, flags)
+    };
+    result.map_or_else(|e| -i64::from(e.0), |count| count as i64)
+}
+
+/// Checks that the first `len` bytes of `segments` can be written.
+fn writable_prefix(
+    c: &Context<'_>,
+    segments: &[(u64, usize)],
+    mut len: usize,
+) -> Result<(), Errno> {
+    for &(base, length) in segments {
+        let length = length.min(len);
+        c.mem
+            .check_write(GuestAddr(base), length)
+            .map_err(|_| Errno::EFAULT)?;
+        len -= length;
+    }
+    Ok(())
+}
+
+fn aio_read(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    segments: &[(u64, usize)],
+    offset: u64,
+    flags: u32,
+) -> Result<u64, Errno> {
+    let total = segments.iter().map(|&(_, length)| length).sum::<usize>();
+    if total == 0 {
+        return Ok(0);
+    }
+    let (b, count) = if aio_positioned(file) {
+        let len = request(file, total as u64, offset, true)?;
+        writable_prefix(c, segments, len)?;
+        let mut b = buffer(len)?;
+        let count = read_at(file, offset, &mut b)?;
+        (b, count)
+    } else {
+        writable_prefix(c, segments, total)?;
+        let mut b = buffer(total)?;
+        let count = read_waiting(c, file, &mut b, flags & RWF_NOWAIT != 0)?;
+        (b, count)
+    };
+    scatter(c, segments, &b[..count])?;
+    Ok(count as u64)
+}
+
+fn aio_write(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    segments: &[(u64, usize)],
+    offset: u64,
+    flags: u32,
+) -> Result<u64, Errno> {
+    let total = segments.iter().map(|&(_, length)| length).sum::<usize>();
+    let mut bytes = Vec::new();
+    bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
+    for &(base, length) in segments {
+        let start = bytes.len();
+        bytes.resize(start + length, 0);
+        c.mem
+            .read(GuestAddr(base), &mut bytes[start..])
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    if !aio_positioned(file) {
+        let written = write_io_with(c, file, &bytes, false, flags & RWF_NOWAIT != 0)?;
+        return sync_written(file, flags, written);
+    }
     // ext4_buffered_write_iter.
-    if write && flags & RWF_NOWAIT != 0 && kind == S_IFREG {
+    if flags & RWF_NOWAIT != 0 && file.stat()?.mode & S_IFMT == S_IFREG {
         return Err(Errno::EOPNOTSUPP);
     }
-    Ok(flags)
+    let start = appending(file, flags)?.unwrap_or(offset);
+    let len = size_limited(c, file, Some(start), bytes.len())?;
+    let written = write_at(file, start, &bytes[..len])?;
+    if written > 0 {
+        crate::permissions::remove_set_ids(&c.process.credentials, &**file);
+    }
+    sync_written(file, flags, written as u64)
 }
 
 /// After a write of a regular file with `RWF_DSYNC` or `RWF_SYNC`, its

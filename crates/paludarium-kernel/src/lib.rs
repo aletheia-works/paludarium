@@ -18,6 +18,7 @@ mod permissions;
 mod signalfd;
 mod signals;
 pub use inbox::SignalInbox;
+mod aio;
 mod devices;
 mod epoll;
 mod events;
@@ -933,6 +934,7 @@ impl Kernel {
             group: &self.group,
             processes: &self.processes,
         };
+        aio::progress(&ctx);
         let outcome = handler(&mut ctx, args);
         if number == syscalls::nr::RT_SIGACTION
             && args[1] != 0
@@ -959,6 +961,9 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod aio_tests;
 
 #[cfg(test)]
 mod terminal_tests;

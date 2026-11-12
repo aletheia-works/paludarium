@@ -147,12 +147,37 @@ pub(crate) fn compare(
         }
         _ => return Err(Errno::EINVAL),
     };
-    // kcmp_epoll_target compares the two files as KCMP_FILE does, with its
-    // cookies.
-    Ok(order(
-        cookies,
-        if kind == 7 { 0 } else { kind as usize },
-        a,
-        b,
-    ))
+    Ok(order(cookies, cookie_kind(kind), a, b))
+}
+
+/// The cookies a type compares with: its own, except `KCMP_EPOLL_TFD`, which
+/// `kcmp_epoll_target` compares as `KCMP_FILE` does, with that type's.
+fn cookie_kind(kind: i32) -> usize {
+    if kind == 7 { 0 } else { kind as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn objects_order_by_their_types_cookies() {
+        // Type 0 (and so 7) keeps the order; type 1 xors the top bit,
+        // which reverses it for these two.
+        let mut cookies = [[0, 1]; TYPES];
+        cookies[1] = [1 << 63, 1];
+        cookies[7] = [1 << 63, 1];
+        let (low, high) = (Some(0x1000), Some(0x2000));
+        assert_eq!(order(&cookies, 0, low, high), 1);
+        assert_eq!(order(&cookies, 0, high, low), 2);
+        assert_eq!(order(&cookies, 0, low, low), 0);
+        assert_eq!(order(&cookies, 0, None, None), 0);
+        assert_eq!(order(&cookies, 1, Some(0), Some(1 << 63)), 1);
+        assert_eq!(order(&cookies, 0, Some(0), Some(1 << 63)), 2);
+        assert_eq!(cookie_kind(7), 0);
+        assert_eq!(cookie_kind(0), 0);
+        assert_eq!(cookie_kind(5), 5);
+        // The cookies Linux draws make each multiplier odd, top bit set.
+        let drawn = super::cookies(&[0; TYPES * 16]);
+        assert!(drawn.iter().all(|&[_, m]| m & 1 == 1 && m >> 63 == 1));
+    }
 }

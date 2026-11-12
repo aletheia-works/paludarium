@@ -107,6 +107,18 @@ pub struct Mapping {
     pub sealed: bool,
 }
 
+/// What a page table holds for a mapped page, as Linux's `folio_walk`
+/// finds it for `move_pages` ([`AddressSpace::page_state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageState {
+    /// Nothing touched the page since it was mapped or discarded: no page.
+    Absent,
+    /// Only read, in private anonymous memory: Linux's shared zero page.
+    Zero,
+    /// A page of its own, a file's, or shared memory's.
+    Present,
+}
+
 /// What a core dump needs to know of the Linux VMA at an address
 /// ([`AddressSpace::core_state`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2004,6 +2016,20 @@ impl AddressSpaceData {
                 .is_some_and(|shared| shared.pages.contains(page.wrapping_add(shared.shift))),
         )
     }
+    /// What the page table holds for the page at `page` ([`PageState`]):
+    /// `None` if it is not mapped. Any access gives a page its entry; a
+    /// private anonymous one without contents was only read.
+    fn page_state(&self, page: u64) -> Option<PageState> {
+        self.mapping_at(page)?;
+        let directory = self.read_directory();
+        let Some(entry) = lookup(&directory, page) else {
+            return Some(PageState::Absent);
+        };
+        if entry.frame.get().is_none() && !entry.file && self.shared_at(page).is_none() {
+            return Some(PageState::Zero);
+        }
+        Some(PageState::Present)
+    }
     /// Whether the file mapping page at `page` lies wholly past the end of
     /// its file.
     fn past_file_end(&self, page: u64) -> bool {
@@ -3527,6 +3553,18 @@ impl MemoryView {
         }
         Some(copied)
     }
+    /// The space's mappings, or `None` once it is gone.
+    #[must_use]
+    pub fn mappings(&self) -> Option<Vec<Mapping>> {
+        self.with_data(|data| data.mappings().copied().collect())
+    }
+    /// What the page table holds for the page at `addr` ([`PageState`]):
+    /// `None` if it is not mapped or the space is gone.
+    #[must_use]
+    pub fn page_state(&self, addr: u64) -> Option<PageState> {
+        self.with_data(|data| data.page_state(GuestAddr(addr).page_align_down().0))
+            .flatten()
+    }
     /// The total length of the space's mappings and its initial break, or
     /// `None` once it is gone.
     #[must_use]
@@ -3829,6 +3867,12 @@ impl AddressSpace {
     #[must_use]
     pub fn resident(&self, addr: GuestAddr) -> Option<bool> {
         self.locked().resident(addr.page_align_down().0)
+    }
+    /// What the page table holds for the page at `addr`, `None` if it is
+    /// not mapped ([`PageState`]).
+    #[must_use]
+    pub fn page_state(&self, addr: GuestAddr) -> Option<PageState> {
+        self.locked().page_state(addr.page_align_down().0)
     }
     /// Where `addr` lies in shared memory, if a shared mapping holds it: the
     /// memory's id and the offset in it. Every mapping of that memory, in

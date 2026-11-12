@@ -163,8 +163,8 @@ verified.
   another thread sets takes effect at the thread's next stop, and a thread
   in a system call holds no CPU, so its area shows the CPU it last ran on.
   Threads without `rseq` run on no virtual CPU and are not counted. There is
-  no time slice extension: `RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` gives `EINVAL`,
-  as on a Linux built without it.
+  no time slice extension: `RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` gives `EINVAL`
+  and `rseq_slice_yield` gives `ENOSYS`, as on a Linux built without it.
 - **Protection keys**: the virtual CPU has none (`CPUID` reports no PKU), so
   `pkey_alloc` gives `ENOSPC` as Linux does on such a CPU, and programs carry
   on without them. `RDPKRU` and `WRPKRU` stop a program with `SIGILL`, as on
@@ -205,6 +205,12 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
+  - `process_madvise` takes for the caller's own memory only the advice
+    `madvise` takes, and another process's ranges are only checked to be
+    mapped. In a child of `fork`, `move_pages` shows a page of a shared
+    mapping, or of a private one never written, that the parent had touched
+    as there, where Linux copies no page table of such a VMA (`-ENOENT`
+    until the child touches the page).
   - An error that ends `recvmmsg` after some messages is dropped, where
     Linux keeps it as the socket's error for the next call and
     `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.

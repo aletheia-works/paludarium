@@ -41,6 +41,8 @@ pub mod nr {
     pub const PKEY_ALLOC: u64 = 330;
     pub const PKEY_FREE: u64 = 331;
     pub const MSEAL: u64 = 462;
+    pub const SET_MEMPOLICY_HOME_NODE: u64 = 450;
+    pub const MAP_SHADOW_STACK: u64 = 453;
     pub const MUNMAP: u64 = 11;
     pub const BRK: u64 = 12;
     pub const RT_SIGACTION: u64 = 13;
@@ -154,7 +156,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 85] = [
+        let entries: [(u64, Handler); 87] = [
             (nr::GETITIMER, sys_getitimer),
             (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
@@ -222,6 +224,11 @@ impl SyscallTable {
             (nr::MBIND, crate::mempolicy::sys_mbind),
             (nr::SET_MEMPOLICY, crate::mempolicy::sys_set_mempolicy),
             (nr::GET_MEMPOLICY, crate::mempolicy::sys_get_mempolicy),
+            (
+                nr::SET_MEMPOLICY_HOME_NODE,
+                crate::mempolicy::sys_set_mempolicy_home_node,
+            ),
+            (nr::MAP_SHADOW_STACK, sys_map_shadow_stack),
             (nr::SCHED_YIELD, sys_sched_yield),
             (nr::SYSINFO, sys_sysinfo),
             (nr::GETRUSAGE, sys_getrusage),
@@ -1951,46 +1958,45 @@ fn sys_get_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let (addr, len, advice) = (a[0], a[1], a[2]);
+    match advise(c.mem, a[0], a[1], a[2]) {
+        Ok(()) => ok(0),
+        Err(e) => err(e),
+    }
+}
+
+/// `madvise(addr, len, advice)` on `mem`, which `process_madvise` gives
+/// each of its ranges of the caller's own memory too.
+pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Result<(), Errno> {
     // Of the advice values, only the access-pattern hints and the two that
     // give memory back are implemented; the others are rejected rather than
     // ignored, so that a guest relying on one of them notices.
     if !matches!(advice, 0..=3 | MADV_DONTNEED | MADV_FREE) {
-        return err(Errno::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if addr & 4095 != 0 {
-        return err(Errno::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let Some(length) = len.checked_add(4095).map(|l| l & !4095) else {
-        return err(Errno::EINVAL);
+        return Err(Errno::EINVAL);
     };
     if length == 0 {
-        return ok(0);
+        return Ok(());
     }
     let Some(end) = addr.checked_add(length) else {
-        return err(Errno::EINVAL);
+        return Err(Errno::EINVAL);
     };
     if end > USER_ADDRESS_LIMIT {
-        return err(Errno::ENOMEM);
+        return Err(Errno::ENOMEM);
     }
     if advice == MADV_DONTNEED {
-        return match c.mem.discard_shared(GuestAddr(addr), length) {
-            Ok(()) => ok(0),
-            Err(e) => err(e),
-        };
+        return mem.discard_shared(GuestAddr(addr), length);
     }
     if advice == MADV_FREE {
         // Linux frees such pages only under memory pressure, which the
         // emulator never has, so their contents stay as they are.
-        return match c.mem.check_private_anonymous(GuestAddr(addr), length) {
-            Ok(()) => ok(0),
-            Err(e) => err(e),
-        };
+        return mem.check_private_anonymous(GuestAddr(addr), length);
     }
-    let mapped = c
-        .mem
-        .mappings()
-        .filter(|m| m.start.0 < end && m.end() > addr);
+    let mapped = mem.mappings().filter(|m| m.start.0 < end && m.end() > addr);
     let covered = mapped.fold(addr, |covered, m| {
         if m.start.0 <= covered {
             covered.max(m.end())
@@ -1999,10 +2005,17 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
     });
     if covered < end {
-        err(Errno::ENOMEM)
+        Err(Errno::ENOMEM)
     } else {
-        ok(0)
+        Ok(())
     }
+}
+
+/// `map_shadow_stack(addr, size, flags)`, as Linux's on a CPU without
+/// user shadow stacks, which the virtual CPU is (`CPUID` reports no
+/// `CET_SS`): `EOPNOTSUPP` before anything is looked at.
+fn sys_map_shadow_stack(_: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+    err(Errno::EOPNOTSUPP)
 }
 
 fn sys_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {

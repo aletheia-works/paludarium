@@ -233,6 +233,7 @@ NAMES = {
     253: "inotify_init",
     254: "inotify_add_watch",
     255: "inotify_rm_watch",
+    256: "migrate_pages",
     257: "openat",
     258: "mkdirat",
     259: "mknodat",
@@ -255,6 +256,7 @@ NAMES = {
     276: "tee",
     277: "sync_file_range",
     278: "vmsplice",
+    279: "move_pages",
     280: "utimensat",
     281: "epoll_pwait",
     282: "signalfd",
@@ -310,13 +312,16 @@ NAMES = {
     437: "openat2",
     438: "pidfd_getfd",
     439: "faccessat2",
+    440: "process_madvise",
     441: "epoll_pwait2",
     444: "landlock_create_ruleset",
     445: "landlock_add_rule",
     446: "landlock_restrict_self",
     449: "futex_waitv",
+    450: "set_mempolicy_home_node",
     451: "cachestat",
     452: "fchmodat2",
+    453: "map_shadow_stack",
     454: "futex_wake",
     455: "futex_wait",
     456: "futex_requeue",
@@ -359,7 +364,7 @@ def implemented():
         if NAMES.get(value, name.lower()) != name.lower():
             raise ValueError(f"nr::{name} is {value}, which NAMES calls {NAMES[value]}")
     table = between(syscalls, "pub fn u1()", "SyscallTable { handlers }")
-    numbers = some("u1() entries", {consts[name] for name in re.findall(r"\(nr::(\w+),", table)})
+    numbers = some("u1() entries", {consts[name] for name in re.findall(r"\(\s*nr::(\w+),", table)})
     numbers |= some(
         "u1() inserts", {int(n) for n in re.findall(r"handlers\.insert\((\d+),", table)}
     )

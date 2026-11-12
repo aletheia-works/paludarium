@@ -7328,6 +7328,194 @@ static long pg_ask(long parent) {
     long pidfd = syscall(SYS_pidfd_open, parent, 0);
     return pidfd < 0 ? -errno : pg(pidfd, 0, 0);
 }
+/* Where pages lie on a machine with one NUMA node, node 0, which the
+ * emulator shows and the CI runners have: set_mempolicy_home_node (450),
+ * migrate_pages (256), move_pages (279), and process_madvise (440). It runs
+ * in a child that is not root (natively it never is, and an emulated root
+ * becomes nobody), so neither has CAP_SYS_NICE; the child stays dumpable,
+ * so that its own children may be asked about. map_shadow_stack (453) is
+ * EOPNOTSUPP on a CPU without user shadow stacks. */
+static long pn(long r) { return r < 0 ? -errno : r; }
+static void pn_statuses(const char *name, long r, const int *status, int n) {
+    printf("%s=%ld", name, r);
+    for (int i = 0; i < n; i++) printf(" %d", status[i]);
+    printf("\n");
+}
+static int page_nodes_worker(void) {
+    long page = 4096;
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 90;
+    prctl(PR_SET_DUMPABLE, 1);
+    unsigned long one[2] = {1}, two[2] = {2}, none[2] = {0};
+    char *m = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* Below mmap_min_addr, where nothing is ever mapped. */
+    char *hole = (char *)0x1000;
+    if (m == MAP_FAILED) return 91;
+
+    /* set_mempolicy_home_node(start, len, home_node, flags) */
+    printf("home-unaligned=%ld\n", pn(syscall(450, m + 1, page, 0L, 0L)));
+    printf("home-flags=%ld\n", pn(syscall(450, m, page, 0L, 1L)));
+    printf("home-node-1=%ld\n", pn(syscall(450, m, page, 1L, 0L)));
+    printf("home-empty=%ld\n", pn(syscall(450, m, 0L, 0L, 0L)));
+    printf("home-empty-bad-node=%ld\n", pn(syscall(450, m, 0L, 1L, 0L)));
+    printf("home-wraps=%ld\n", pn(syscall(450, -page, 2 * page, 0L, 0L)));
+    printf("home-no-policy=%ld\n", pn(syscall(450, m, 4 * page, 0L, 0L)));
+    printf("home-hole=%ld\n", pn(syscall(450, hole, page, 0L, 0L)));
+    printf("bind=%ld\n", pn(syscall(SYS_mbind, m, page, 2L, one, 65L, 0L)));
+    printf("interleave=%ld\n", pn(syscall(SYS_mbind, m + page, page, 3L, one, 65L, 0L)));
+    printf("preferred-many=%ld\n", pn(syscall(SYS_mbind, m + 3 * page, page, 5L, one, 65L, 0L)));
+    printf("home-bind=%ld\n", pn(syscall(450, m, page, 0L, 0L)));
+    printf("home-bind-partial=%ld\n", pn(syscall(450, m, 1L, 0L, 0L)));
+    printf("home-interleave=%ld\n", pn(syscall(450, m + page, page, 0L, 0L)));
+    printf("home-bind-then-interleave=%ld\n", pn(syscall(450, m, 2 * page, 0L, 0L)));
+    printf("home-none-then-preferred-many=%ld\n", pn(syscall(450, m + 2 * page, 2 * page, 0L, 0L)));
+    printf("home-over-hole=%ld\n", pn(syscall(450, m + 3 * page, 2 * page, 0L, 0L)));
+    printf("unbind=%ld\n", pn(syscall(SYS_mbind, m, page, 0L, NULL, 0L, 0L)));
+    printf("home-unbound=%ld\n", pn(syscall(450, m, page, 0L, 0L)));
+
+    /* migrate_pages(pid, maxnode, old_nodes, new_nodes) */
+    unsigned long wide[32] = {1};
+    wide[20] = 1;
+    printf("migrate-self=%ld\n", pn(syscall(256, 0L, 65L, one, one)));
+    printf("migrate-pid=%ld\n", pn(syscall(256, (long)getpid(), 65L, one, one)));
+    printf("migrate-no-old=%ld\n", pn(syscall(256, 0L, 65L, NULL, one)));
+    printf("migrate-no-new=%ld\n", pn(syscall(256, 0L, 65L, one, NULL)));
+    printf("migrate-empty-new=%ld\n", pn(syscall(256, 0L, 65L, one, none)));
+    printf("migrate-to-node-1=%ld\n", pn(syscall(256, 0L, 65L, one, two)));
+    printf("migrate-maxnode-0=%ld\n", pn(syscall(256, 0L, 0L, one, one)));
+    printf("migrate-too-big=%ld\n", pn(syscall(256, 0L, 4096L * 8 + 2, one, one)));
+    printf("migrate-high-node=%ld\n", pn(syscall(256, 0L, 2048L, wide, one)));
+    printf("migrate-old-fault=%ld\n", pn(syscall(256, 0L, 65L, (void *)8, one)));
+    printf("migrate-new-fault=%ld\n", pn(syscall(256, 0L, 65L, one, (void *)8)));
+    printf("migrate-fault-before-pid=%ld\n", pn(syscall(256, -1L, 65L, (void *)8, one)));
+    printf("migrate-negative-pid=%ld\n", pn(syscall(256, -1L, 65L, one, one)));
+    printf("migrate-no-pid=%ld\n", pn(syscall(256, 0x3ffffff0L, 65L, one, one)));
+
+    /* move_pages(pid, count, pages, nodes, status, flags): a written page,
+     * a page only read (the zero page), an untouched one, a hole and NULL;
+     * then a shared page only read, which has a page of its own. */
+    char *p = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *shared = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    char *noaccess = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED || shared == MAP_FAILED || noaccess == MAP_FAILED) return 92;
+    p[0] = 1;
+    volatile char seen = p[page];
+    seen = shared[0];
+    (void)seen;
+    void *pages[8] = {p, p + page + 5, p + 2 * page, hole, NULL, shared, shared + page, noaccess};
+    int nodes[8] = {0};
+    int status[8];
+    memset(status, 0x55, sizeof status);
+    pn_statuses("stat", pn(syscall(279, 0L, 8L, pages, NULL, status, 0L)), status, 8);
+    memset(status, 0x55, sizeof status);
+    pn_statuses("move", pn(syscall(279, 0L, 8L, pages, nodes, status, 2L)), status, 8);
+    memset(status, 0x55, sizeof status);
+    nodes[2] = 1;
+    pn_statuses("move-node-1", pn(syscall(279, 0L, 8L, pages, nodes, status, 0L)), status, 8);
+    nodes[2] = -1;
+    pn_statuses("move-node-negative", pn(syscall(279, 0L, 8L, pages, nodes, status, 0L)), status, 8);
+    nodes[2] = 2000;
+    pn_statuses("move-node-2000", pn(syscall(279, 0L, 8L, pages, nodes, status, 0L)), status, 8);
+    nodes[2] = 0;
+    printf("move-flag=%ld\n", pn(syscall(279, 0L, 1L, pages, NULL, status, 1L)));
+    printf("move-all=%ld\n", pn(syscall(279, 0L, 1L, pages, NULL, status, 4L)));
+    printf("move-none=%ld\n", pn(syscall(279, 0L, 0L, NULL, NULL, NULL, 0L)));
+    printf("stat-pages-fault=%ld\n", pn(syscall(279, 0L, 1L, (void *)8, NULL, status, 0L)));
+    printf("stat-status-fault=%ld\n", pn(syscall(279, 0L, 1L, pages, NULL, (void *)8, 0L)));
+    printf("move-nodes-fault=%ld\n", pn(syscall(279, 0L, 1L, pages, (void *)8, status, 0L)));
+    printf("move-status-fault=%ld\n", pn(syscall(279, 0L, 1L, pages, nodes, (void *)8, 0L)));
+    printf("move-no-pid=%ld\n", pn(syscall(279, 0x3ffffff0L, 1L, pages, NULL, status, 0L)));
+    /* 17 pages: the second chunk of 16 reaches a hole in the array. */
+    void **edge = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (edge == MAP_FAILED) return 93;
+    munmap((char *)edge + page, page);
+    void **tail = (void **)((char *)edge + page) - 16;
+    for (int i = 0; i < 16; i++) tail[i] = p;
+    int many[17];
+    memset(many, 0x55, sizeof many);
+    long r = pn(syscall(279, 0L, 17L, tail, NULL, many, 0L));
+    printf("stat-chunks=%ld first=%d sixteenth=%d seventeenth=%d\n", r, many[0], many[15], many[16]);
+
+    /* A child, which shares the pages until it writes, and a zombie. */
+    int gate[2];
+    if (pipe(gate)) return 94;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        char c;
+        read(gate[0], &c, 1);
+        _exit(0);
+    }
+    pid_t zombie = fork();
+    if (zombie == 0) _exit(0);
+    siginfo_t info;
+    waitid(P_PID, zombie, &info, WEXITED | WNOWAIT);
+    memset(status, 0x55, sizeof status);
+    /* Only pages of a VMA that was written: Linux copies no page table of
+     * another (a shared one, say) to a child. */
+    pn_statuses("child-stat", pn(syscall(279, (long)kid, 5L, pages, NULL, status, 0L)), status, 5);
+    printf("child-migrate=%ld\n", pn(syscall(256, (long)kid, 65L, one, one)));
+    printf("zombie-stat=%ld\n", pn(syscall(279, (long)zombie, 1L, pages, NULL, status, 0L)));
+    printf("zombie-migrate=%ld\n", pn(syscall(256, (long)zombie, 65L, one, one)));
+
+    /* process_madvise(pidfd, vec, vlen, advice, flags) */
+    long self = syscall(SYS_pidfd_open, (long)getpid(), 0L);
+    long kidfd = syscall(SYS_pidfd_open, (long)kid, 0L);
+    long zombiefd = syscall(SYS_pidfd_open, (long)zombie, 0L);
+    if (self < 0 || kidfd < 0 || zombiefd < 0) return 95;
+    struct iovec iov[3] = {{p, page}, {p + page, 100}, {hole, page}};
+    struct iovec bad[2] = {{p, page}, {p + 1, page}};
+    struct iovec empty[2] = {{p + 1, 0}, {p, page}};
+    printf("madvise-one=%ld\n", pn(syscall(440, self, iov, 1L, 3L, 0U)));
+    printf("madvise-two=%ld\n", pn(syscall(440, self, iov, 2L, 3L, 0U)));
+    printf("madvise-to-hole=%ld\n", pn(syscall(440, self, iov, 3L, 3L, 0U)));
+    printf("madvise-hole=%ld\n", pn(syscall(440, self, iov + 2, 1L, 3L, 0U)));
+    printf("madvise-then-unaligned=%ld\n", pn(syscall(440, self, bad, 2L, 3L, 0U)));
+    printf("madvise-unaligned=%ld\n", pn(syscall(440, self, bad + 1, 1L, 3L, 0U)));
+    printf("madvise-empty-unaligned=%ld\n", pn(syscall(440, self, empty, 2L, 3L, 0U)));
+    printf("madvise-self-thread=%ld\n", pn(syscall(440, -10000L, iov, 1L, 3L, 0U)));
+    printf("madvise-self-process=%ld\n", pn(syscall(440, -20000L, iov, 1L, 3L, 0U)));
+    printf("madvise-flags=%ld\n", pn(syscall(440, self, iov, 1L, 3L, 1U)));
+    printf("madvise-no-ranges=%ld\n", pn(syscall(440, self, NULL, 0L, 3L, 0U)));
+    printf("madvise-no-ranges-bad-advice=%ld\n", pn(syscall(440, self, NULL, 0L, 999L, 0U)));
+    printf("madvise-bad-advice=%ld\n", pn(syscall(440, self, iov, 1L, 999L, 0U)));
+    printf("madvise-bad-fd=%ld\n", pn(syscall(440, -1L, iov, 1L, 999L, 0U)));
+    printf("madvise-not-pidfd=%ld\n", pn(syscall(440, (long)gate[1], iov, 1L, 3L, 0U)));
+    printf("madvise-too-many=%ld\n", pn(syscall(440, self, iov, 1025L, 3L, 0U)));
+    printf("madvise-vector-fault=%ld\n", pn(syscall(440, self, (void *)8, 1L, 3L, 0U)));
+    printf("madvise-high-count=%ld\n", pn(syscall(440, self, iov, 1L | 1L << 32, 3L, 0U)));
+    p[0] = 7;
+    printf("madvise-dontneed=%ld\n", pn(syscall(440, self, iov, 1L, 4L, 0U)));
+    printf("after-dontneed=%d\n", p[0]);
+    printf("child-dontneed=%ld\n", pn(syscall(440, kidfd, iov, 1L, 4L, 0U)));
+    printf("child-willneed=%ld\n", pn(syscall(440, kidfd, iov, 1L, 3L, 0U)));
+    printf("child-cold=%ld\n", pn(syscall(440, kidfd, iov, 1L, 20L, 0U)));
+    printf("child-bad-advice=%ld\n", pn(syscall(440, kidfd, iov, 1L, 999L, 0U)));
+    printf("zombie-madvise=%ld\n", pn(syscall(440, zombiefd, iov, 1L, 3L, 0U)));
+    write(gate[1], "x", 1);
+    waitpid(kid, NULL, 0);
+    waitpid(zombie, NULL, 0);
+    printf("reaped-madvise=%ld\n", pn(syscall(440, zombiefd, iov, 1L, 3L, 0U)));
+
+    /* map_shadow_stack(addr, size, flags) */
+    printf("shadow-stack=%ld\n", pn(syscall(453, 0L, page, 0L)));
+    printf("shadow-stack-flags=%ld\n", pn(syscall(453, 0L, page, 99L)));
+    return 0;
+}
+static int page_nodes_case(void) {
+    fflush(stdout);
+    pid_t worker = fork();
+    if (worker == 0) {
+        int code = page_nodes_worker();
+        fflush(stdout);
+        _exit(code);
+    }
+    int status = 0;
+    waitpid(worker, &status, 0);
+    printf("worker=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
 static int process_vm_case(void) {
     if (pipe(pv_gate)) return 80;
     long self = getpid();
@@ -19389,6 +19577,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();
+    if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();

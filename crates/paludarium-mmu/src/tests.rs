@@ -309,3 +309,46 @@ fn another_task_copies_page_by_page_as_linux_pins() {
     assert_eq!(view.read_pages(0x10000, &mut buf), None);
     assert_eq!(view.write_pages(0x10000, b"x"), None);
 }
+#[test]
+fn page_state_tells_untouched_read_and_written_pages_apart() {
+    let mut m = AddressSpace::new();
+    m.map(
+        Some(GuestAddr(0x20000)),
+        3 * PAGE_SIZE,
+        Prot::READ_WRITE,
+        MappingKind::Anonymous,
+    )
+    .unwrap();
+    m.map_backed(
+        Placement::Exactly(GuestAddr(0x30000)),
+        2 * PAGE_SIZE,
+        Prot::READ_WRITE,
+        MappingKind::Anonymous,
+        Backing::SharedAnonymous,
+    )
+    .unwrap();
+    m.write(GuestAddr(0x20000), &[1]).unwrap();
+    let mut byte = [0u8];
+    m.read(GuestAddr(0x21000), &mut byte).unwrap();
+    m.read(GuestAddr(0x30000), &mut byte).unwrap();
+    let states = |space: &AddressSpace| {
+        [0x20000, 0x21fff, 0x22000, 0x30000, 0x31000, 0x40000]
+            .map(|addr| space.page_state(GuestAddr(addr)))
+    };
+    let expected = [
+        Some(PageState::Present),
+        Some(PageState::Zero),
+        Some(PageState::Absent),
+        Some(PageState::Present),
+        Some(PageState::Absent),
+        None,
+    ];
+    assert_eq!(states(&m), expected);
+    assert_eq!(m.view().page_state(0x21000), Some(PageState::Zero));
+    // A child of fork shares the written page and the zero page, as
+    // Linux copies the page table of a VMA with an anon_vma.
+    assert_eq!(states(&m.fork())[..3], expected[..3]);
+    // Discarded, a written page has none again.
+    m.discard_shared(GuestAddr(0x20000), PAGE_SIZE).unwrap();
+    assert_eq!(m.page_state(GuestAddr(0x20000)), Some(PageState::Absent));
+}

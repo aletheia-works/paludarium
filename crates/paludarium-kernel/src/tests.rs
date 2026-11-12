@@ -6150,6 +6150,187 @@ mod kcmp {
         assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), errno(Errno::ENOENT));
     }
 }
+mod page_nodes {
+    use super::*;
+    const AREA: u64 = DATA + 0x10_0000;
+    const MASKS: u64 = DATA + 0x100;
+    const ARRAY: u64 = DATA + 0x200;
+    const STATUS: u64 = DATA + 0x400;
+    /// Four read-write pages at `AREA`, and the masks {0} and {1} at
+    /// `MASKS` and `MASKS + 8`.
+    fn area(f: &mut Fixture) {
+        f.mem
+            .map(
+                Some(GuestAddr(AREA)),
+                0x4000,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        f.mem.write_u64(GuestAddr(MASKS), 1).unwrap();
+        f.mem.write_u64(GuestAddr(MASKS + 8), 2).unwrap();
+    }
+    fn statuses(f: &Fixture, n: usize) -> Vec<i32> {
+        let mut bytes = vec![0u8; n * 4];
+        f.mem.read(GuestAddr(STATUS), &mut bytes).unwrap();
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b))
+            .collect()
+    }
+    #[test]
+    fn home_node_needs_a_bind_or_preferred_many_policy() {
+        let mut f = fixture();
+        area(&mut f);
+        let (einval, enoent, eopnotsupp) = (
+            errno(Errno::EINVAL),
+            errno(Errno::ENOENT),
+            errno(Errno::EOPNOTSUPP),
+        );
+        assert_eq!(f.ret(450, &[AREA + 1, 0x1000, 0, 0]), einval);
+        assert_eq!(f.ret(450, &[AREA, 0x1000, 0, 1]), einval);
+        assert_eq!(f.ret(450, &[AREA, 0x1000, 1, 0]), einval);
+        assert_eq!(f.ret(450, &[AREA, 0, 1, 0]), einval);
+        assert_eq!(f.ret(450, &[AREA, 0, 0, 0]), 0);
+        assert_eq!(
+            f.ret(450, &[0u64.wrapping_sub(0x1000), 0x2000, 0, 0]),
+            einval
+        );
+        assert_eq!(f.ret(450, &[AREA, 0x4000, 0, 0]), enoent);
+        assert_eq!(f.ret(450, &[AREA + 0x10_0000, 0x1000, 0, 0]), enoent);
+        // mbind: bind, interleave, nothing, preferred-many.
+        assert_eq!(f.ret(237, &[AREA, 0x1000, 2, MASKS, 65, 0]), 0);
+        assert_eq!(f.ret(237, &[AREA + 0x1000, 0x1000, 3, MASKS, 65, 0]), 0);
+        assert_eq!(f.ret(237, &[AREA + 0x3000, 0x1000, 5, MASKS, 65, 0]), 0);
+        assert_eq!(f.ret(450, &[AREA, 1, 0, 0]), 0);
+        assert_eq!(f.ret(450, &[AREA + 0x1000, 0x1000, 0, 0]), eopnotsupp);
+        assert_eq!(f.ret(450, &[AREA, 0x2000, 0, 0]), eopnotsupp);
+        assert_eq!(f.ret(450, &[AREA + 0x2000, 0x2000, 0, 0]), 0);
+        assert_eq!(f.ret(237, &[AREA, 0x1000, 0, 0, 0, 0]), 0);
+        assert_eq!(f.ret(450, &[AREA, 0x1000, 0, 0]), enoent);
+    }
+    #[test]
+    fn migrate_pages_reads_both_masks_then_the_task() {
+        let mut f = fixture();
+        area(&mut f);
+        let pid = f.ret(39, &[]);
+        let (einval, efault, esrch) = (errno(Errno::EINVAL), errno(Errno::EFAULT), errno(Errno(3)));
+        assert_eq!(f.ret(256, &[0, 65, MASKS, MASKS]), 0);
+        assert_eq!(f.ret(256, &[pid, 65, MASKS, MASKS]), 0);
+        assert_eq!(f.ret(256, &[0, 65, 0, MASKS]), 0);
+        assert_eq!(f.ret(256, &[0, 65, MASKS, 0]), einval);
+        assert_eq!(f.ret(256, &[0, 0, MASKS, MASKS]), einval);
+        assert_eq!(f.ret(256, &[0, 4096 * 8 + 2, MASKS, MASKS]), einval);
+        assert_eq!(f.ret(256, &[0, 65, 8, MASKS]), efault);
+        assert_eq!(f.ret(256, &[u64::MAX, 65, MASKS, 8]), efault);
+        assert_eq!(f.ret(256, &[u64::MAX, 65, MASKS, MASKS]), esrch);
+        assert_eq!(f.ret(256, &[999, 65, MASKS, MASKS]), esrch);
+        // Node 1 is past the nodes the task may use, which root may ask
+        // for: none of it is left for the caller.
+        assert_eq!(f.ret(256, &[0, 65, MASKS, MASKS + 8]), einval);
+    }
+    #[test]
+    fn move_pages_reports_each_page_on_node_zero() {
+        let mut f = fixture();
+        area(&mut f);
+        let (einval, efault, enodev) = (
+            errno(Errno::EINVAL),
+            errno(Errno::EFAULT),
+            errno(Errno::ENODEV),
+        );
+        f.mem.write(GuestAddr(AREA), &[1]).unwrap();
+        let mut byte = [0u8];
+        f.mem.read(GuestAddr(AREA + 0x1000), &mut byte).unwrap();
+        let pages = [AREA, AREA + 0x1005, AREA + 0x2000, AREA + 0x10_0000, 0];
+        for (i, page) in pages.iter().enumerate() {
+            f.mem
+                .write_u64(GuestAddr(ARRAY + i as u64 * 8), *page)
+                .unwrap();
+        }
+        let nodes = ARRAY + 0x100;
+        f.mem.write(GuestAddr(nodes), &[0; 20]).unwrap();
+        assert_eq!(f.ret(279, &[0, 5, ARRAY, 0, STATUS, 0]), 0);
+        assert_eq!(statuses(&f, 5), [0, -14, -2, -14, -14]);
+        f.mem.write(GuestAddr(STATUS), &[0x55; 20]).unwrap();
+        assert_eq!(f.ret(279, &[0, 5, ARRAY, nodes, STATUS, 2]), 0);
+        assert_eq!(statuses(&f, 5), [0, -14, -2, -14, -14]);
+        f.mem.write(GuestAddr(STATUS), &[0x55; 20]).unwrap();
+        f.mem
+            .write(GuestAddr(nodes + 8), &1i32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(279, &[0, 5, ARRAY, nodes, STATUS, 0]), enodev);
+        assert_eq!(statuses(&f, 3), [0, -14, 0x5555_5555]);
+        assert_eq!(f.ret(279, &[0, 1, ARRAY, 0, STATUS, 1]), einval);
+        assert_eq!(f.ret(279, &[0, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(f.ret(279, &[0, 1, 8, 0, STATUS, 0]), efault);
+        assert_eq!(f.ret(279, &[0, 1, ARRAY, 0, 8, 0]), efault);
+        assert_eq!(f.ret(279, &[0, 1, ARRAY, 8, STATUS, 0]), efault);
+        assert_eq!(f.ret(279, &[999, 1, ARRAY, 0, STATUS, 0]), errno(Errno(3)));
+        // Discarded, a page is gone again.
+        assert_eq!(f.ret(28, &[AREA, 0x1000, 4]), 0);
+        assert_eq!(f.ret(279, &[0, 1, ARRAY, 0, STATUS, 0]), 0);
+        assert_eq!(statuses(&f, 1), [-2]);
+    }
+    #[test]
+    fn process_madvise_advises_the_callers_ranges_in_turn() {
+        let mut f = fixture();
+        area(&mut f);
+        let (einval, ebadf, enomem, efault) = (
+            errno(Errno::EINVAL),
+            errno(Errno::EBADF),
+            errno(Errno::ENOMEM),
+            errno(Errno::EFAULT),
+        );
+        let pid = f.ret(39, &[]);
+        let pidfd = f.ret(434, &[pid, 0]);
+        let iov = [
+            (AREA, 0x1000),
+            (AREA + 0x1000, 100),
+            (AREA + 0x10_0000, 0x1000),
+        ];
+        for (i, (base, len)) in iov.iter().enumerate() {
+            f.mem
+                .write_u64(GuestAddr(ARRAY + i as u64 * 16), *base)
+                .unwrap();
+            f.mem
+                .write_u64(GuestAddr(ARRAY + i as u64 * 16 + 8), *len)
+                .unwrap();
+        }
+        assert_eq!(f.ret(440, &[pidfd, ARRAY, 1, 3, 0]), 0x1000);
+        assert_eq!(f.ret(440, &[pidfd, ARRAY, 2, 3, 0]), 0x1000 + 100);
+        assert_eq!(f.ret(440, &[pidfd, ARRAY, 3, 3, 0]), 0x1000 + 100);
+        assert_eq!(f.ret(440, &[pidfd, ARRAY + 32, 1, 3, 0]), enomem);
+        assert_eq!(f.ret(440, &[(-10000i64) as u64, ARRAY, 1, 3, 0]), 0x1000);
+        assert_eq!(f.ret(440, &[(-20000i64) as u64, ARRAY, 1, 3, 0]), 0x1000);
+        assert_eq!(f.ret(440, &[pidfd, ARRAY, 1, 3, 1]), einval);
+        assert_eq!(f.ret(440, &[pidfd, 0, 0, 3, 0]), 0);
+        assert_eq!(f.ret(440, &[pidfd, 0, 0, 999, 0]), einval);
+        assert_eq!(f.ret(440, &[u64::MAX, ARRAY, 1, 999, 0]), ebadf);
+        assert_eq!(f.ret(440, &[0, ARRAY, 1, 3, 0]), ebadf);
+        assert_eq!(f.ret(440, &[pidfd, ARRAY, 1025, 3, 0]), einval);
+        assert_eq!(f.ret(440, &[pidfd, 8, 1, 3, 0]), efault);
+        // The count is an `unsigned int` to import_iovec.
+        assert_eq!(f.ret(440, &[pidfd, ARRAY, 1 | 1 << 32, 3, 0]), 0x1000);
+        // A misaligned range stops the call, after the ones before it.
+        f.mem.write_u64(GuestAddr(ARRAY + 16), AREA + 1).unwrap();
+        assert_eq!(f.ret(440, &[pidfd, ARRAY, 2, 3, 0]), 0x1000);
+        assert_eq!(f.ret(440, &[pidfd, ARRAY + 16, 1, 3, 0]), einval);
+        // MADV_DONTNEED empties the caller's page.
+        f.mem.write(GuestAddr(AREA), &[7]).unwrap();
+        assert_eq!(f.ret(440, &[pidfd, ARRAY, 1, 4, 0]), 0x1000);
+        let mut byte = [9u8];
+        f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+    }
+    #[test]
+    fn map_shadow_stack_is_not_supported() {
+        let mut f = fixture();
+        assert_eq!(f.ret(453, &[0, 0x1000, 0]), errno(Errno::EOPNOTSUPP));
+        assert_eq!(f.ret(453, &[0, 0x1000, 99]), errno(Errno::EOPNOTSUPP));
+    }
+}
 mod process_vm {
     use super::*;
     const LOCAL: u64 = DATA + 0x40;

@@ -513,6 +513,7 @@ mod linux {
         processes_mseal => ("mseal","process"),
         processes_seccomp => ("seccomp","process"),
         processes_process_vm => ("process-vm","process"),
+        processes_page_nodes => ("page-nodes","process"),
         processes_pidfd_getfd => ("pidfd-getfd","process"),
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),
         processes_mmsg => ("mmsg","process"),

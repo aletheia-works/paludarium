@@ -228,8 +228,8 @@ fn widths(number: u64) -> &'static [u8] {
         438 => b"iiu",
         // faccessat2: dfd, mode, flags
         439 => b"ilii",
-        // process_madvise: pidfd, behavior, flags
-        440 => b"illiu",
+        // process_madvise: pidfd, vlen (import_iovec's), behavior, flags
+        440 => b"iluiu",
         // epoll_pwait2: epfd, maxevents
         441 => b"ili",
         // mount_setattr: dfd, flags

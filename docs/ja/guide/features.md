@@ -24,7 +24,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   CPU の動きが違うところは、仮想 CPU 自身の動きのままです。
 - `RDTSC` と `RDTSCP` は仮想 CPU のカウンタを読みます。カウンタは時間ではなく読むたびに
   進みます。ホストのプロセス内のすべてのゲストがこのカウンタを共有するので、値は他のゲストが
-  読んだ回数によって変わります。シャドウスタックがないので、`RDSSP` は何もしません。`FXSAVE` と `FXRSTOR` は
+  読んだ回数によって変わります。シャドウスタックがないので、`RDSSP` は何もせず、`map_shadow_stack` は `EOPNOTSUPP` を返します。`FXSAVE` と `FXRSTOR` は
   x87 の状態、MXCSR、XMM レジスタを保ちます。
 - x87 の命令は、すべての丸めモードで、値の移動、変換、比較と、制御ワード、状態ワード、
   環境、スタックの操作を行います。すべての丸めモードと精度で、加減乗除と平方根を計算し、
@@ -47,7 +47,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
@@ -666,6 +666,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   メモリで、0 として読めます。共有メモリは自分の中身を保ちます。`MADV_FREE` では
   中身を残します。メモリが足りているときの Linux と同じです。
   アクセスの仕方のヒントは受け付け、ほかの指定には `EINVAL` を返します。
+- `process_madvise` は、iovec の範囲を順に指定どおりにします。呼んだプロセス自身の
+  メモリ（`PIDFD_SELF_THREAD`、`PIDFD_SELF_THREAD_GROUP`、自身かメモリを共有する
+  プロセスの pidfd）には `madvise` と同じようにします。結果は、最初に失敗した範囲より
+  前の範囲のバイト数で、それがなければその失敗のエラーです。ほかのプロセスのメモリに
+  使えるのは `MADV_COLD`、`MADV_PAGEOUT`、`MADV_WILLNEED`、`MADV_COLLAPSE` だけで
+  （`EINVAL`）、`CAP_SYS_NICE` が要ります（`EPERM`）。その範囲は、マップされていれば
+  足ります（`ENOMEM`）。確かめる順は Linux と同じで、`flags`、iovec、pidfd（`EBADF`、
+  `ESRCH`）、プロセスを読む権利（`EACCES`）、指定の順です。
 - `mremap` は、後ろが空いていればその場で広げ、空いていなければ `MREMAP_MAYMOVE` で
   中身ごと動かします。`MREMAP_FIXED` と `MREMAP_DONTUNMAP` も使えます。共有のメモリは、
   動かしても `fork` した相手と共有したままです。ファイルのマッピングは、ファイルの
@@ -1331,6 +1339,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プロセスの範囲のポリシーは `fork` と `mremap` の後も残り、ページの割り当てを外すか
   新しく割り当てるまで続きます。メモリはすべてノード 0 にあるので、どのポリシーでも
   ページは動きません。
+  `set_mempolicy_home_node` は、範囲、フラグ、ノード（ノード 0 だけ）を確かめ、
+  範囲に自分のポリシーを持つ VMA が要ります。なければ `ENOENT`、`MPOL_BIND` と
+  `MPOL_PREFERRED_MANY` 以外のポリシーなら `EOPNOTSUPP` です。`migrate_pages` と
+  `move_pages` は、Linux と同じようにタスクを探し（`ESRCH`、読む権利がなければ
+  `EPERM`、ゾンビなら `EINVAL`）、タスクが使えないノードや `MPOL_MF_MOVE_ALL` には
+  `CAP_SYS_NICE` が要ります。`migrate_pages` は何も動かさず、何も残しません。
+  `move_pages` も何も動かさず、状態にはページのものを返します。自分のページは 0
+  （ノード 0）、まだ何も触れていないページは `-ENOENT`、プライベートの匿名メモリを
+  読んだだけで割り当てられるゼロページと、何もマップされていない所は `-EFAULT` です。
+  0 以外のノードは `ENODEV` です。
 - `uname` は x86_64 の Linux で、スレッドの UTS 名前空間のホスト名 `paludarium` と
   ドメイン名 `(none)` を答えます。これは `sethostname` と `setdomainname` で変えられます
   （`CAP_SYS_ADMIN` がなければ `EPERM`、64 バイトを超えると `EINVAL`）。`CPUID` と同じく、

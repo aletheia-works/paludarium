@@ -2016,6 +2016,9 @@ impl Kernel {
             312 => self.kcmp(thread, mem, a),
             310 | 311 => self.process_vm(thread, mem, a, n == 311),
             438 => self.pidfd_getfd(thread, a),
+            440 => self.process_madvise(thread, mem, a),
+            256 => self.migrate_pages(thread, mem, a),
+            279 => self.move_pages(thread, mem, a),
             129 => self.sigqueueinfo(thread, mem, a),
             297 => self.tgsigqueueinfo(thread, mem, a),
             // The IDs these give are as the caller's PID namespace numbers
@@ -3306,6 +3309,205 @@ impl Kernel {
         let n = self.files.reserve(self.group.nofile())?;
         self.files.fill(n, descriptor.received(true));
         Ok(u64::from(n))
+    }
+    /// `process_madvise(pidfd, vec, vlen, advice, flags)`, as Linux's:
+    /// `flags` must be 0 (`EINVAL`) and the iovecs are read as
+    /// `import_iovec` reads them; then the task, `PIDFD_SELF_THREAD` or
+    /// `PIDFD_SELF_THREAD_GROUP` for the caller's, or a pidfd's process
+    /// (`EBADF` for no pidfd, `ESRCH` once it is reaped), and its memory
+    /// (`ESRCH` for a zombie), which another process's must let the caller
+    /// read it with its filesystem IDs (`EACCES`). Then the advice must be
+    /// one Linux knows (`EINVAL`); for another process's memory only
+    /// `MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED` and `MADV_COLLAPSE`
+    /// (`EINVAL`), and with `CAP_SYS_NICE` (`EPERM`). Each range is then
+    /// advised in turn, as `madvise` would advise the caller's memory
+    /// ([`crate::syscalls::advise`]); another process's only needs to be
+    /// mapped (`ENOMEM`), as the four only hint at how pages will be used.
+    /// The bytes of the ranges before the first that fails are the result,
+    /// or its error when there are none.
+    fn process_madvise(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        const PIDFD_SELF_THREAD: i32 = -10000;
+        const PIDFD_SELF_THREAD_GROUP: i32 = -20000;
+        const CAP_SYS_NICE: u64 = 1 << 23;
+        if a[4] as u32 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let ranges =
+            crate::files::iovecs_checked(mem, a[1], u64::from(a[2] as u32), |_, _| Ok(()))?;
+        let esrch = Errno(3);
+        let pidfd = a[0] as i32;
+        let target = if pidfd == PIDFD_SELF_THREAD || pidfd == PIDFD_SELF_THREAD_GROUP {
+            None
+        } else {
+            let d = self.files.descriptor(u64::from(pidfd as u32))?;
+            let pidfd = d
+                .file
+                .as_any()
+                .and_then(|any| any.downcast_ref::<PidFd>())
+                .ok_or(Errno::EBADF)?;
+            if pidfd.pid == self.process.pid {
+                None
+            } else {
+                let view = self.processes.view(pidfd.pid).ok_or(esrch)?;
+                let public = view.group.public(pidfd.pid).ok_or(esrch)?;
+                let memory = public
+                    .memory
+                    .clone()
+                    .filter(|_| !view.zombie)
+                    .ok_or(esrch)?;
+                if memory.is_of(mem) {
+                    None
+                } else {
+                    let readable = thread.state.credentials.may_read_task(
+                        &public.credentials,
+                        view.dumpable,
+                        false,
+                    );
+                    if !readable {
+                        return Err(Errno::EACCES);
+                    }
+                    Some(memory)
+                }
+            }
+        };
+        let advice = a[3] as i32;
+        if !matches!(advice, 0..=4 | 8..=25 | 100..=103) {
+            return Err(Errno::EINVAL);
+        }
+        if target.is_some() {
+            // MADV_WILLNEED, MADV_COLD, MADV_PAGEOUT, MADV_COLLAPSE
+            if !matches!(advice, 3 | 20 | 21 | 25) {
+                return Err(Errno::EINVAL);
+            }
+            if !thread.state.credentials.capable(CAP_SYS_NICE) {
+                return Err(Errno::EPERM);
+            }
+        }
+        let mut done = 0u64;
+        for (start, len) in ranges {
+            let len = len as u64;
+            // check_input_range: the lengths are cut short of wrapping.
+            let result =
+                if start & 4095 != 0 || start.checked_add(len.next_multiple_of(4096)).is_none() {
+                    Err(Errno::EINVAL)
+                } else if len == 0 {
+                    Ok(())
+                } else {
+                    match &target {
+                        None => crate::syscalls::advise(mem, start, len, advice as u64),
+                        Some(memory) => Self::mapped_whole(memory, start, len),
+                    }
+                };
+            match result {
+                Ok(()) => done += len,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+        Ok(done)
+    }
+    /// Whether `[start, start + len)` of `memory` is mapped through, as
+    /// `madvise_walk_vmas` finds a hole (`ENOMEM`).
+    fn mapped_whole(
+        memory: &paludarium_mmu::MemoryView,
+        start: u64,
+        len: u64,
+    ) -> Result<(), Errno> {
+        let end = start.saturating_add(len.next_multiple_of(4096));
+        if end > paludarium_types::USER_ADDRESS_LIMIT {
+            return Err(Errno::ENOMEM);
+        }
+        let mut mappings = memory.mappings().unwrap_or_default();
+        mappings.sort_unstable_by_key(|m| m.start.0);
+        let covered = mappings
+            .iter()
+            .filter(|m| m.start.0 < end && m.end() > start)
+            .fold(start, |covered, m| {
+                if m.start.0 <= covered {
+                    covered.max(m.end())
+                } else {
+                    covered
+                }
+            });
+        if covered < end {
+            Err(Errno::ENOMEM)
+        } else {
+            Ok(())
+        }
+    }
+    /// The memory of the task the caller's PID namespace numbers `number`
+    /// (the caller's for 0), for a call that may change where its pages lie,
+    /// as Linux's `find_get_task_by_vpid` and `ptrace_may_access` with
+    /// `PTRACE_MODE_READ_REALCREDS` give it: `ESRCH` for no such task, and
+    /// `EPERM` unless it is of the caller's process or the caller may read
+    /// it ([`Self::may_attach`]); `None` for a zombie, which has none.
+    fn movable_memory(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        number: i32,
+    ) -> Result<Option<paludarium_mmu::MemoryView>, Errno> {
+        if number == 0 {
+            return Ok(Some(mem.view()));
+        }
+        let esrch = Errno(3);
+        let number = u32::try_from(number).map_err(|_| esrch)?;
+        let tid = self.pid_space(thread.tid).task(number).ok_or(esrch)?;
+        if tid == thread.tid || self.group.has_member(tid) {
+            return Ok(Some(mem.view()));
+        }
+        let pid = match self.processes.view(tid) {
+            Some(_) => tid,
+            None => self.processes.thread_leader(tid).ok_or(esrch)?,
+        };
+        let view = self.processes.view(pid).ok_or(esrch)?;
+        let public = view.group.public(tid).ok_or(esrch)?;
+        if !Self::may_attach(thread, &view, &public) {
+            return Err(Errno::EPERM);
+        }
+        Ok(public.memory.clone().filter(|_| !view.zombie))
+    }
+    /// `migrate_pages(pid, maxnode, old_nodes, new_nodes)`, as Linux's
+    /// `kernel_migrate_pages`: both masks are read first
+    /// ([`crate::mempolicy::migration_masks`]), then the task
+    /// ([`Self::movable_memory`]), then the nodes it may be given
+    /// ([`crate::mempolicy::migration_targets`]), and a zombie is `EINVAL`.
+    /// Every page is on node 0, so none moves and none is left behind.
+    fn migrate_pages(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        let (_, new) = crate::mempolicy::migration_masks(mem, a[2], a[3], a[1])?;
+        let memory = self.movable_memory(thread, mem, a[0] as i32)?;
+        crate::mempolicy::migration_targets(&new, thread.state.credentials.capable(1 << 23))?;
+        memory.map(|_| 0).ok_or(Errno::EINVAL)
+    }
+    /// `move_pages(pid, count, pages, nodes, status, flags)`, as Linux's
+    /// `kernel_move_pages`: flags other than `MPOL_MF_MOVE` and
+    /// `MPOL_MF_MOVE_ALL` are `EINVAL`, and the latter needs `CAP_SYS_NICE`
+    /// (`EPERM`); then the task ([`Self::movable_memory`], `EINVAL` for a
+    /// zombie), whose pages [`crate::mempolicy::move_pages`] reports.
+    fn move_pages(&self, thread: &Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
+        const MPOL_MF_MOVE: i32 = 2;
+        const MPOL_MF_MOVE_ALL: i32 = 4;
+        let flags = a[5] as i32;
+        if flags & !(MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & MPOL_MF_MOVE_ALL != 0 && !thread.state.credentials.capable(1 << 23) {
+            return Err(Errno::EPERM);
+        }
+        let target = self
+            .movable_memory(thread, mem, a[0] as i32)?
+            .ok_or(Errno::EINVAL)?;
+        crate::mempolicy::move_pages(mem, &target, a[1], a[2], a[3], a[4])
     }
     /// `pidfd_open(pid, flags)`: a close-on-exec pidfd for a process.
     /// `PIDFD_THREAD` is accepted but still names the whole process.

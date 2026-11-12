@@ -4,7 +4,7 @@
 //! memory on node 0, so only the policies themselves are kept, for
 //! `get_mempolicy` to report.
 use crate::syscalls::{Context, Outcome, err, ok};
-use paludarium_mmu::Prot;
+use paludarium_mmu::{AddressSpace, MemoryView, PageState, Prot};
 use paludarium_types::{Errno, GuestAddr};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -39,7 +39,7 @@ const MPOL_MF_STRICT: u64 = 1;
 const MPOL_MF_MOVE: u64 = 2;
 const MPOL_MF_MOVE_ALL: u64 = 4;
 
-type NodeMask = [u64; WORDS];
+pub(crate) type NodeMask = [u64; WORDS];
 
 /// A policy other than the default (Linux's `struct mempolicy`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,11 +227,10 @@ fn sanitize(mode: u64) -> Result<(u32, u32), Errno> {
 }
 
 /// `get_bitmap`: `bits` bits of a node mask at `at`.
-fn bitmap(c: &Context<'_>, at: u64, bits: u64, out: &mut [u64]) -> Result<(), Errno> {
+fn bitmap(mem: &AddressSpace, at: u64, bits: u64, out: &mut [u64]) -> Result<(), Errno> {
     let words = bits.div_ceil(64) as usize;
     let mut bytes = vec![0u8; words * 8];
-    c.mem
-        .read(GuestAddr(at), &mut bytes)
+    mem.read(GuestAddr(at), &mut bytes)
         .map_err(|_| Errno::EFAULT)?;
     for (i, word) in bytes.as_chunks::<8>().0.iter().enumerate() {
         out[i] = u64::from_le_bytes(*word);
@@ -244,7 +243,7 @@ fn bitmap(c: &Context<'_>, at: u64, bits: u64, out: &mut [u64]) -> Result<(), Er
 
 /// `get_nodes`: the node mask of `maxnode - 1` bits at `at`. Bits past
 /// `MAX_NUMNODES` must be clear, read a word at a time from the end.
-fn nodes(c: &Context<'_>, at: u64, maxnode: u64) -> Result<NodeMask, Errno> {
+fn nodes(mem: &AddressSpace, at: u64, maxnode: u64) -> Result<NodeMask, Errno> {
     let mut mask = [0u64; WORDS];
     let mut maxnode = maxnode.wrapping_sub(1);
     if maxnode == 0 || at == 0 {
@@ -256,7 +255,7 @@ fn nodes(c: &Context<'_>, at: u64, maxnode: u64) -> Result<NodeMask, Errno> {
     while maxnode > MAX_NUMNODES {
         let bits = maxnode.min(64);
         let mut word = [0u64; 1];
-        bitmap(c, at + (maxnode - 1) / 64 * 8, bits, &mut word)?;
+        bitmap(mem, at + (maxnode - 1) / 64 * 8, bits, &mut word)?;
         let mut t = word[0];
         if maxnode - bits >= MAX_NUMNODES {
             maxnode -= bits;
@@ -268,7 +267,7 @@ fn nodes(c: &Context<'_>, at: u64, maxnode: u64) -> Result<NodeMask, Errno> {
             return Err(Errno::EINVAL);
         }
     }
-    bitmap(c, at, maxnode, &mut mask)?;
+    bitmap(mem, at, maxnode, &mut mask)?;
     Ok(mask)
 }
 
@@ -333,7 +332,7 @@ fn policy(mode: u32, flags: u32, nodes: &NodeMask) -> Result<Option<MemPolicy>, 
 /// `set_mempolicy(mode, nodemask, maxnode)`: the calling thread's policy.
 pub(crate) fn sys_set_mempolicy(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = sanitize(a[0])
-        .and_then(|(mode, flags)| Ok((mode, flags, nodes(c, a[1], a[2])?)))
+        .and_then(|(mode, flags)| Ok((mode, flags, nodes(c.mem, a[1], a[2])?)))
         .and_then(|(mode, flags, nodes)| policy(mode, flags, &nodes));
     match result {
         Ok(policy) => {
@@ -454,7 +453,7 @@ pub(crate) fn sys_mbind(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Ok(m) => m,
         Err(e) => return err(e),
     };
-    let mask = match nodes(c, a[3], a[4]) {
+    let mask = match nodes(c.mem, a[3], a[4]) {
         Ok(m) => m,
         Err(e) => return err(e),
     };
@@ -509,6 +508,139 @@ pub(crate) fn sys_mbind(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         ranges.set(s.max(start), e.min(end), policy.clone());
     }
     ok(0)
+}
+
+/// `set_mempolicy_home_node(start, len, home_node, flags)`, as Linux's: a
+/// misaligned start, any flag, or a node that is not online (only node 0
+/// is) is `EINVAL`, and so is a range that wraps; an empty one does
+/// nothing. Then each VMA of the range with a policy of its own takes the
+/// home node, which must be one of `MPOL_BIND` or `MPOL_PREFERRED_MANY`
+/// (`EOPNOTSUPP`, which stops there); with none such it is `ENOENT`. Every
+/// page is on node 0 whatever the home node, and `get_mempolicy` does not
+/// report it, so it is not kept.
+pub(crate) fn sys_set_mempolicy_home_node(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (start, len, home, flags) = (a[0], a[1], a[2], a[3]);
+    if start & 4095 != 0 || flags != 0 || home >= NODE_IDS {
+        return err(Errno::EINVAL);
+    }
+    let end = start.wrapping_add(len.wrapping_add(4095) & !4095);
+    if end < start {
+        return err(Errno::EINVAL);
+    }
+    if end == start {
+        return ok(0);
+    }
+    // The policies are kept only where something is mapped, a VMA's
+    // whole and cut at its ends, as Linux's VMAs are by their policies.
+    let ranges = c.group.numa().ranges();
+    let ranges = ranges.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut found = false;
+    for (_, _, policy) in ranges.within(start, end) {
+        if policy.mode != MPOL_BIND && policy.mode != MPOL_PREFERRED_MANY {
+            return err(Errno::EOPNOTSUPP);
+        }
+        found = true;
+    }
+    if found { ok(0) } else { err(Errno::ENOENT) }
+}
+
+/// `migrate_pages`'s two node masks, `old` and `new`, each of `maxnode`
+/// bits, read as `kernel_migrate_pages` reads them before it looks for the
+/// task.
+pub(crate) fn migration_masks(
+    mem: &AddressSpace,
+    old: u64,
+    new: u64,
+    maxnode: u64,
+) -> Result<(NodeMask, NodeMask), Errno> {
+    Ok((nodes(mem, old, maxnode)?, nodes(mem, new, maxnode)?))
+}
+
+/// The rest of `kernel_migrate_pages` once the caller may read the task:
+/// nodes in `new` that the task may not use (only node 0 is) need
+/// `CAP_SYS_NICE` (`nice`, `EPERM`), and with none the caller may use it
+/// is `EINVAL`. No page needs moving off node 0, so none is left behind.
+pub(crate) fn migration_targets(new: &NodeMask, nice: bool) -> Result<(), Errno> {
+    let outside = new[0] & !NODES != 0 || new[1..].iter().any(|word| *word != 0);
+    if outside && !nice {
+        return Err(Errno::EPERM);
+    }
+    if new[0] & NODES == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// `move_pages`'s status for the page at `addr` of `target`, as Linux's
+/// `do_pages_stat_array` and `add_folio_for_migration` give it, the page
+/// being on node 0 already: `EFAULT` where no VMA is or for the zero page,
+/// `ENOENT` for no page, else node 0.
+fn page_status(target: &MemoryView, addr: u64) -> i32 {
+    match target.page_state(addr) {
+        None | Some(PageState::Zero) => -14,
+        Some(PageState::Absent) => -2,
+        Some(PageState::Present) => 0,
+    }
+}
+
+/// `move_pages(pid, count, pages, nodes, status, flags)` once the task's
+/// memory `target` is found, as Linux's `do_pages_move` and
+/// `do_pages_stat`; `mem` holds the arrays. Without `nodes` the status of
+/// each page is reported, `DO_PAGES_STAT_CHUNK_NR` (16) at a time: a chunk
+/// of addresses that cannot be read or of statuses that cannot be written
+/// ends the call with `EFAULT`, after the chunks before it. With `nodes`
+/// each page's address and node are read in turn (`EFAULT`); a node out of
+/// range or without memory (any but node 0) ends the call with `ENODEV`,
+/// after the statuses stored before it. Every page is on node 0 already,
+/// so none moves and each status is the page's ([`page_status`]).
+pub(crate) fn move_pages(
+    mem: &AddressSpace,
+    target: &MemoryView,
+    count: u64,
+    pages: u64,
+    nodes: u64,
+    status: u64,
+) -> Result<u64, Errno> {
+    const CHUNK: u64 = 16;
+    let store = |index: u64, value: i32| {
+        mem.write(
+            GuestAddr(status.wrapping_add(index * 4)),
+            &value.to_le_bytes(),
+        )
+        .map_err(|_| Errno::EFAULT)
+    };
+    if nodes == 0 {
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(CHUNK);
+            let mut addresses = vec![0u8; (n * 8) as usize];
+            mem.read(GuestAddr(pages.wrapping_add(done * 8)), &mut addresses)
+                .map_err(|_| Errno::EFAULT)?;
+            let statuses: Vec<u8> = addresses
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .flat_map(|addr| page_status(target, u64::from_le_bytes(*addr)).to_le_bytes())
+                .collect();
+            mem.write(GuestAddr(status.wrapping_add(done * 4)), &statuses)
+                .map_err(|_| Errno::EFAULT)?;
+            done += n;
+        }
+        return Ok(0);
+    }
+    for index in 0..count {
+        let addr = mem
+            .read_u64(GuestAddr(pages.wrapping_add(index * 8)))
+            .map_err(|_| Errno::EFAULT)?;
+        let mut node = [0u8; 4];
+        mem.read(GuestAddr(nodes.wrapping_add(index * 4)), &mut node)
+            .map_err(|_| Errno::EFAULT)?;
+        if i32::from_le_bytes(node) != 0 {
+            return Err(Errno::ENODEV);
+        }
+        store(index, page_status(target, addr))?;
+    }
+    Ok(0)
 }
 
 #[cfg(test)]

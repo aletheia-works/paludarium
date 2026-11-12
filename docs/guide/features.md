@@ -28,8 +28,8 @@ Linux.
   `REP` faults, the virtual CPU keeps its own behaviour.
 - `RDTSC` and `RDTSCP` read a counter of the virtual CPU, which moves on with
   each read rather than with time. Every guest in the host process shares that
-  counter, so its values depend on what else has read it. `RDSSP` does nothing,
-  as there are no shadow stacks. `FXSAVE` and `FXRSTOR` keep the x87 state,
+  counter, so its values depend on what else has read it. `RDSSP` does nothing
+  and `map_shadow_stack` gives `EOPNOTSUPP`, as there are no shadow stacks. `FXSAVE` and `FXRSTOR` keep the x87 state,
   MXCSR and the XMM registers.
 - x87 instructions move values, convert them, compare them and keep the unit's
   control and status words, environment and stack, in every rounding mode. They
@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
@@ -741,6 +741,15 @@ kernel.
   Shared memory keeps its own contents. `MADV_FREE` keeps the contents, as
   Linux does without memory pressure.
   The access-pattern hints are accepted and other advice gives `EINVAL`.
+- `process_madvise` advises each range of its iovecs in turn, of the caller's
+  memory (`PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP`, or a pidfd of its
+  own process or of one sharing its memory) as `madvise` does, and gives the
+  bytes of the ranges before the first that fails, or that one's error.
+  Another process's memory takes only `MADV_COLD`, `MADV_PAGEOUT`,
+  `MADV_WILLNEED` and `MADV_COLLAPSE` (`EINVAL`), with `CAP_SYS_NICE`
+  (`EPERM`), and its ranges need only be mapped (`ENOMEM`). The checks come
+  in Linux's order: `flags`, the iovecs, the pidfd (`EBADF`, `ESRCH`), the
+  caller's right to read the process (`EACCES`), then the advice.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
   and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed
@@ -1538,6 +1547,17 @@ kernel.
   `execve` keeps it; a process's ranges keep theirs through `fork` and
   `mremap`, until the pages are unmapped or mapped anew. All memory is on
   node 0, so no policy moves a page.
+  `set_mempolicy_home_node` checks its range, flags and node (only node 0)
+  and needs a VMA there with a policy of its own, `ENOENT` without one and
+  `EOPNOTSUPP` for one other than `MPOL_BIND` or `MPOL_PREFERRED_MANY`.
+  `migrate_pages` and `move_pages` find the task as Linux does (`ESRCH`;
+  `EPERM` unless the caller may read it; `EINVAL` for a zombie), and need
+  `CAP_SYS_NICE` for nodes the task may not use or `MPOL_MF_MOVE_ALL`.
+  `migrate_pages` moves nothing and leaves nothing behind. `move_pages`
+  moves nothing either; each status is that of the page: 0 (node 0) for a
+  page of its own, `-ENOENT` for one nothing touched yet, and `-EFAULT` for
+  the zero page that only reading private anonymous memory maps, or where
+  nothing is mapped. A node other than 0 is `ENODEV`.
 - `uname` reports Linux on x86_64 with the host name `paludarium` and the
   domain name `(none)` of the thread's UTS namespace, until `sethostname` or
   `setdomainname` changes them (`CAP_SYS_ADMIN`, else `EPERM`; at most 64

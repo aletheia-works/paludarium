@@ -5212,10 +5212,11 @@ fn rename_queue(
     flags: u32,
 ) -> Result<u64, Errno> {
     // `filename_parentat` of each path in turn: the walk's search
-    // permission (`EACCES`), then the parent itself.
+    // permission (`EACCES`), which stops at the generated `/dev` on the
+    // `mqueue` side, then the parent itself.
     for (p, (dir, raw), name) in [(old, old_walk, &old_name), (new, new_walk, &new_name)] {
+        crate::permissions::search(c.files, &c.process.credentials, dir, raw, false)?;
         if name.is_none() {
-            crate::permissions::search(c.files, &c.process.credentials, dir, raw, false)?;
             parent_there(c, p)?;
         }
     }

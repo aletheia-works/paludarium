@@ -193,7 +193,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     成功します。Linux では、ファイルに `fsync` がないので `EINVAL` です。
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は、どちらも
     プロセスの CPU 時間のすべてを数えます。ここではそのすべてがユーザーの時間だからです
-    （Linux の `ITIMER_VIRTUAL` はシステムの時間を数えません）。タイマーを確かめるのは、
+    （Linux の `ITIMER_VIRTUAL` はシステムの時間を数えません）。WebAssembly のように
+    ホストがスレッドの CPU 時間を測れないところでは、それは経過時間なので、スレッドが
+    眠ったり待ったりしている時間も数えます。タイマーを確かめるのは、
     Linux のようにティックごとではなく、スレッドがシステムコールをするときと、命令を
     100,000 個実行するごとです。ティックは CI ランナーの `CONFIG_HZ` に合わせて 1 ms と
     します。CPU 時間の時計（`CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID`、ほかの

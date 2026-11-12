@@ -2085,6 +2085,8 @@ kernel.
   A value of 0 disarms one but keeps its interval, and a value set past
   `KTIME_MAX` shows negative seconds, as Linux's `ns_to_timespec64` makes
   them. A child of `fork` starts with neither, and `execve` keeps them.
+  They count CPU time as the CPU clocks do, so in WebAssembly, which cannot
+  measure it, they count wall time.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's, rounded up to
   a whole second as Linux rounds it.

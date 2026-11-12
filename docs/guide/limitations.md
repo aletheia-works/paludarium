@@ -223,7 +223,9 @@ verified.
     `EINVAL` as the file has no `fsync`.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
     both count the process's whole CPU time, as all of it is user time here
-    (Linux's `ITIMER_VIRTUAL` leaves out the system time). They are looked
+    (Linux's `ITIMER_VIRTUAL` leaves out the system time). Where the host
+    cannot measure a thread's CPU time, as in WebAssembly, that is wall time,
+    so they also count the time a thread sleeps or waits. They are looked
     at as a thread makes a system call and every 100,000 instructions it
     runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
     CI runners' `CONFIG_HZ`. `timer_create` on a CPU-time clock

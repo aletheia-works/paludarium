@@ -1814,6 +1814,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   新しい値は 1 ティック遅れて始まり、時間が来たタイマーは残り 1 ティックと見せます。値が 0
   なら止めますが間隔は残し、`KTIME_MAX` を超えて設定した値は、Linux の `ns_to_timespec64`
   と同じく負の秒数に見えます。`fork` の子はどちらも持たずに始まり、`execve` は引き継ぎます。
+  CPU 時間は CPU の時計と同じく数えるので、それを測れない WebAssembly では経過時間を数えます。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
   見せません。起動からの時間は単調時計の値で、Linux と同じく秒単位に切り上げます。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は

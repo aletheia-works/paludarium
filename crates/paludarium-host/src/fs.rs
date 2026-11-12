@@ -107,7 +107,8 @@ pub trait FileHandle: Send + Sync {
     /// (`TMPFS_MAGIC` for an in-memory one), which decides what
     /// `RWF_NOWAIT` and `RWF_DONTCACHE` a regular file takes: 0 for a host's
     /// file system Linux has no number for (macOS's, Windows'), and none
-    /// for a file the kernel makes (`/proc`).
+    /// for a file the kernel makes (`/proc`) or one whose file system cannot
+    /// be told, which then takes neither flag.
     fn file_system(&self) -> Option<u64> {
         None
     }

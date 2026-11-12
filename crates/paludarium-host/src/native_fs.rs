@@ -654,13 +654,13 @@ impl FileHandle for NativeFile {
             .set_times(times)
             .map_err(err)
     }
-    /// On a Linux host the host file system's own number; elsewhere 0.
+    /// On a Linux host the host file system's own number, or none when
+    /// `fstatfs` fails (a file system taking no flag); elsewhere 0.
     fn file_system(&self) -> Option<u64> {
         #[cfg(target_os = "linux")]
-        return Some(
-            rustix::fs::fstatfs(&*self.file.lock().unwrap_or_else(PoisonError::into_inner))
-                .map_or(0, |s| s.f_type as u64),
-        );
+        return rustix::fs::fstatfs(&*self.file.lock().unwrap_or_else(PoisonError::into_inner))
+            .ok()
+            .map(|s| s.f_type as u64);
         #[cfg(not(target_os = "linux"))]
         Some(0)
     }

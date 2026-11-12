@@ -245,11 +245,11 @@ impl FileHandle for MemFile {
         set_node_mtime(&mut lock(&self.node), mtime);
         Ok(())
     }
-    /// Memory needs no synchronising; files and directories both succeed.
     /// The in-memory file system is a tmpfs.
     fn file_system(&self) -> Option<u64> {
         Some(TMPFS_MAGIC)
     }
+    /// Memory needs no synchronising; files and directories both succeed.
     fn sync(&self) -> Result<(), Errno> {
         Ok(())
     }

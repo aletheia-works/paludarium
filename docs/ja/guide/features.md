@@ -732,7 +732,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `symlink`、通常ファイル以外の `mknod` は、Landlock の確認のあとで `EPERM` です。通常ファイル
   （型 0 も）の `mknod` は、`vfs_create` と同じく既定の属性のキューを作ります。`link` と
   `rename` は `do_linkat` と `do_renameat2` と同じく名前を引き（`ENOENT`、`EEXIST`。
-  `RENAME_NOREPLACE` と `RENAME_EXCHANGE` もそのとおり）、ほかのマウントとの間では `EXDEV`
+  `RENAME_NOREPLACE` と `RENAME_EXCHANGE` もそのとおり）、ほかのマウントとの間では、両方の
+  パスをたどったあと（途中の各ディレクトリを検索でき、なければ `EACCES`）で `EXDEV`
   （`rename` は名前を引く前）、その中では `EPERM` です。ただし、名前をそれ自身へ `rename`
   すると何もせずに成功します。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。

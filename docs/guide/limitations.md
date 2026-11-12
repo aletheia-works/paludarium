@@ -201,8 +201,8 @@ verified.
     `symlink`, `link`, `rename`, `chmod`, `chown`, `utimensat` and
     `truncate` work as on Linux, but only on a path that names
     `/dev/mqueue` itself: one that reaches it through a symbolic link
-    elsewhere is looked up on the host. The first namespace's root has the host's
-    boot time until a queue is made or unlinked there, where Linux's is
+    elsewhere is looked up on the host. The first namespace's root has the
+    host's boot time until a queue is made or unlinked there, where Linux's is
     when the kernel made it as it booted, a little later.
   - A `SIGEV_THREAD` cookie takes 960 bytes of its netlink socket's
     receive buffer, its `truesize` on the CI runner's kernel, while the

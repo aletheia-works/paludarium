@@ -831,7 +831,8 @@ kernel.
   default attributes, as `vfs_create` does. `link` and `rename` look the
   names up as `do_linkat` and `do_renameat2` do (`ENOENT`, `EEXIST`, with
   `RENAME_NOREPLACE` and `RENAME_EXCHANGE` as there), give `EXDEV` to or
-  from another mount (`rename` before it looks the names up), and `EPERM`
+  from another mount once both paths are walked (searching each directory
+  on the way, `EACCES`), `rename` before it looks the names up, and `EPERM`
   within it, but for a `rename` of a name onto itself, which does nothing.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).

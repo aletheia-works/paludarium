@@ -2356,8 +2356,8 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
 }
 
 /// [`readv`] of an inotify instance, which has no `read_iter`: Linux's
-/// `do_loop_readv_writev` reads each buffer in turn as [`read_guest`]
-/// (`crate::inotify::read_guest`) does, until one is not filled or fails;
+/// `do_loop_readv_writev` reads each buffer in turn as
+/// [`read_guest`](crate::inotify::read_guest) does, until one is not filled or fails;
 /// nothing to do for no bytes, and any flag but `RWF_HIPRI` `EOPNOTSUPP`.
 fn readv_instance(
     c: &mut Context<'_>,
@@ -6086,10 +6086,10 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
 /// `/proc/self/fdinfo/<n>` while descriptor `n` is open, as Linux's
 /// `seq_show` writes it: the description's position, its flags in octal
 /// (`F_GETFL`'s, and `O_CLOEXEC` for the descriptor), the ID of its mount
-/// (as `statx` gives it) and its inode; then, for an inotify instance, a line
-/// for each watch ([`crate::inotify::Instance::fdinfo`]). The lines other
-/// files add (eventfd's count, an epoll's targets, a signalfd's mask, the
-/// record locks) are not there.
+/// (as `statx` gives it) and its inode; then a `lock:` line for each record
+/// lock on the file ([`crate::record_locks::fdinfo`]), and the
+/// lines of an inotify instance, an eventfd, a signalfd, a timerfd or an
+/// epoll. `flock` locks have no lines: the file system keeps them.
 fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     const O_CLOEXEC: u32 = 0o2000000;
     let d = c.files.descriptor(u64::from(n)).ok()?;

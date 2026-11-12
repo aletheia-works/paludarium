@@ -132,7 +132,7 @@ impl Table {
     }
 }
 
-/// Why [`Locks::set`] did not set a lock.
+/// Why [`Locks::set_through`] did not set a lock.
 #[derive(Debug)]
 pub(crate) enum Refused {
     /// Another owner's lock is in the way.
@@ -194,7 +194,7 @@ impl Locks {
     ) -> Result<(), Refused> {
         self.set_through(key, owner, kind, (start, end), waiter, None)
     }
-    /// [`set`](Self::set) through the description `file`. A lock merged
+    /// `set` through the description `file`. A lock merged
     /// with the owner's first one of the same kind keeps that one's
     /// description, as `posix_lock_inode` extends it; a new or replacing
     /// one takes `file`, and the pieces of a split one keep theirs.

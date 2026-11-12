@@ -544,15 +544,19 @@ impl FileHandle for NativeFile {
             return Err(Errno(95));
         }
         let position = file.stream_position().map_err(err);
-        let result = position.and_then(|position| {
+        let result = position.as_ref().map_err(|&e| e).and_then(|_| {
             file.seek(SeekFrom::Start(offset)).map_err(err)?;
-            let result = file.write(b).map_err(err);
-            file.seek(SeekFrom::Start(position)).map_err(err)?;
-            result
+            file.write(b).map_err(err)
         });
+        // Append comes back first, whatever the write did. A failure to put
+        // it back is the call's error even after a write, as the
+        // description no longer appends for the writes after it.
         #[cfg(unix)]
         if appending {
             rustix::fs::fcntl_setfl(&*file, flags).map_err(|e| err(e.into()))?;
+        }
+        if let Ok(position) = position {
+            file.seek(SeekFrom::Start(position)).map_err(err)?;
         }
         result
     }

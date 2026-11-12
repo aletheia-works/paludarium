@@ -4336,6 +4336,14 @@ mod vectored_flags {
         assert_eq!(contents(&mut f, fd), b"aXXYef\0\0XYXY");
         // A read takes it too.
         assert_eq!(f.ret(PREADV2, &[fd, iov, 1, 0, 0, 0x20]), 2);
+        // With RWF_APPEND too, no path is taken: kiocb_set_rw_flags refuses
+        // the pair first.
+        for at in [0, HERE] {
+            assert_eq!(
+                f.ret(PWRITEV2, &[fd, iov, 1, at, 0, 0x30]),
+                errno(Errno::EINVAL)
+            );
+        }
         // An append-only file always appends: EPERM, for a read too.
         f.mem
             .write(GuestAddr(DATA + 0x500), &0x20u32.to_le_bytes())

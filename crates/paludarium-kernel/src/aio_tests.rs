@@ -375,6 +375,18 @@ fn noappend_writes_an_appending_file_at_aio_offset() {
         ),
         1
     );
+    // With RWF_APPEND too it is no request (EINVAL), as kiocb_set_rw_flags
+    // refuses the pair before either is applied.
+    assert_eq!(
+        f.submit(
+            ctx,
+            Iocb {
+                rw_flags: 0x30,
+                ..write
+            }
+        ),
+        errno(Errno::EINVAL)
+    );
     // Without it, the write appends.
     assert_eq!(f.submit(ctx, Iocb { data: 2, ..write }), 1);
     assert_eq!(f.reap(ctx), [(1, IOCBS, 2), (2, IOCBS, 2)]);

@@ -966,10 +966,11 @@ impl NetlinkSocket {
             _ => Err(EOPNOTSUPP),
         }
     }
-    /// The `ifinfomsg` of a request for `lo`, which names it by its index
-    /// or (with index 0) by `IFLA_IFNAME` or `IFLA_ALT_IFNAME`: `EINVAL` for
-    /// a short message, a negative index or, to get, neither; `ENODEV` for
-    /// another interface. To set, `NLM_F_EXCL` is `EEXIST` and
+    /// The `ifinfomsg` of a request for `lo`, which names it by a positive
+    /// index or else by `IFLA_IFNAME` or `IFLA_ALT_IFNAME`: `EINVAL` for a
+    /// short message, for neither to get or set (`RTM_SETLINK`), and for a
+    /// negative index to make (`RTM_NEWLINK`); `ENODEV` for another
+    /// interface. To set, `NLM_F_EXCL` is `EEXIST` and
     /// `NLM_F_REPLACE` `EOPNOTSUPP` for `RTM_NEWLINK`, and of the
     /// attributes only the name `lo` and `IFLA_EXT_MASK` are taken
     /// (`EOPNOTSUPP` for others). To get, `strict` is `Some` with whether
@@ -1030,12 +1031,16 @@ impl NetlinkSocket {
                 return Err(Errno::EINVAL);
             }
         }
+        // A positive index names the link; otherwise its name does, which
+        // `rtnl_getlink` and `rtnl_setlink` need (`EINVAL`), while
+        // `rtnl_newlink` takes no negative index (`EINVAL`).
+        let newlink = !get && header.kind == RTM_NEWLINK;
         let found = match (index, name) {
-            (i, _) if i < 0 => return Err(Errno::EINVAL),
-            (0, None) if get => return Err(Errno::EINVAL),
-            (0, None) => false,
-            (0, Some(name)) => name == b"lo",
-            (i, _) => i == 1,
+            (i, _) if i < 0 && newlink => return Err(Errno::EINVAL),
+            (i, _) if i > 0 => i == 1,
+            (_, Some(name)) => name == b"lo",
+            (_, None) if !newlink => return Err(Errno::EINVAL),
+            (_, None) => false,
         };
         if !found {
             // `rtnl_newlink` makes a link only of a kind it is given.
@@ -1045,7 +1050,7 @@ impl NetlinkSocket {
             return Err(ENODEV);
         }
         // Renaming `lo` to another name is not supported.
-        if !get && index != 0 && name.is_some_and(|name| name != b"lo") {
+        if !get && index > 0 && name.is_some_and(|name| name != b"lo") {
             return Err(EOPNOTSUPP);
         }
         if !get && header.kind == RTM_NEWLINK {

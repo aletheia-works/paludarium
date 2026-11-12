@@ -1163,7 +1163,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     経路表（名前空間にある唯一の表 `RT_TABLE_DEFAULT`）を `IFLA_AF_SPEC` に入れて返します。
     レジスター VIF、assert、PIM、パケット全体の設定はなく、解決を待つものも VIF もありません。
     検査するときは、`ipmr_valid_dumplink` と同じく、空の `ifinfomsg` だけを取ります。
-    `RTNL_FAMILY_IP6MR` のダンプには専用の処理がないので、ふつうのリンクのダンプになります。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
+    `RTNL_FAMILY_IP6MR` のダンプには専用の処理がないので、ふつうのリンクのダンプになります。
+    `RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。正でないインデックスはリンクを
+    指さないので、`rtnl_getlink` と `rtnl_setlink` と同じく名前で探します（名前もなければ
+    `EINVAL`）。`RTM_NEWLINK` は負のインデックスを取りません（`EINVAL`）。
   - **アドレス:** `RTM_GETADDR` は `lo` のアドレスを Linux の順でダンプします。IPv4 の
     プライマリは、同じかより広いスコープのプライマリの後に並び、セカンダリ（プライマリの
     サブネットの中のアドレス。`IFA_F_SECONDARY` が付きます）は最後です。IPv6 はグローバルな

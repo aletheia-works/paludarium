@@ -10213,6 +10213,34 @@ int main(int argc, char **argv) {
             b = nl_body(0, 16);
             nl_put(&b, 3, "lo", 3);
             nl_strict(fd, port, 18, 0, &b, "get name");
+            /* A negative index names no link, so the name does, as
+               rtnl_getlink and rtnl_setlink take it, EINVAL without one;
+               rtnl_newlink takes no negative index. */
+            link = (struct nl_link){.index = -1};
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_strict(fd, port, 18, 0, &b, "get negative");
+            nl_put(&b, 3, "lo", 3);
+            nl_strict(fd, port, 18, 0, &b, "get negative name");
+            link.index = -5;
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_put(&b, 3, "eth9", 5);
+            nl_strict(fd, port, 18, 0, &b, "get negative other");
+            link = (struct nl_link){.index = -1, .flags = IFF_UP, .change = IFF_UP};
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            int set_bare = nl_quiet(fd, 19, 0, b.bytes, b.len);
+            nl_put(&b, 3, "lo", 3);
+            int set_named = nl_quiet(fd, 19, 0, b.bytes, b.len);
+            int new_named = nl_quiet(fd, 16, 0, b.bytes, b.len);
+            printf("set negative: bare=%d name=%d new=%d\n", set_bare, set_named, new_named);
+            link.index = 0;
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            int set_none = nl_quiet(fd, 19, 0, b.bytes, b.len);
+            int new_none = nl_quiet(fd, 16, 0, b.bytes, b.len);
+            printf("set none: set=%d new=%d\n", set_none, new_none);
             /* Address dumps: an index shows its device's alone. */
             b = nl_body(0, 1);
             nl_strict(fd, port, 22, 1, &b, "addr rtgenmsg");
@@ -10326,6 +10354,11 @@ int main(int argc, char **argv) {
             b = nl_body(0, 16);
             nl_put(&b, 3, "lo", 3);
             nl_strict(loose, name.pid, 18, 1, &b, "loose link name");
+            link = (struct nl_link){.index = -1};
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_put(&b, 3, "lo", 3);
+            nl_strict(loose, name.pid, 18, 0, &b, "loose get negative name");
             b = nl_body(128, 1);
             nl_strict(loose, name.pid, 18, 1, &b, "loose ipmr rtgenmsg");
             link = (struct nl_link){.family = 128, .index = 1};

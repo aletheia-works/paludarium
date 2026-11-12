@@ -1339,7 +1339,10 @@ kernel.
     to be resolved, and no VIFs. Strictly it takes an `ifinfomsg` alone with
     nothing in it, as `ipmr_valid_dumplink` does; an `RTNL_FAMILY_IP6MR`
     dump has no handler of its own, so it is the ordinary link dump.
-    `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`.
+    `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`. An
+    index that is not positive names no link, so the name does, as
+    `rtnl_getlink` and `rtnl_setlink` take it (`EINVAL` without one);
+    `RTM_NEWLINK` takes no negative index (`EINVAL`).
   - **Addresses:** `RTM_GETADDR` dumps `lo`'s addresses in Linux's orders:
     IPv4's primaries after those of a scope as wide or wider, secondaries
     (an address in a primary's subnet, with `IFA_F_SECONDARY`) last; IPv6's

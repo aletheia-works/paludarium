@@ -1256,8 +1256,9 @@ kernel.
     any of which anyone may join; `nlctrl`'s `notify` is group 16, which
     hears nothing, as no family comes or goes.
 - A socket-diagnostics netlink socket (protocol `NETLINK_SOCK_DIAG`)
-  tells of the AF_UNIX sockets of the network namespace it was made in, as
-  Linux's `sock_diag` and `unix_diag` do, so `ss -x` lists them.
+  tells of the AF_UNIX, TCP and UDP sockets of the network namespace it was
+  made in, as Linux's `sock_diag`, `unix_diag`, `inet_diag`, `tcp_diag` and
+  `udp_diag` do, so `ss -x`, `ss -t` and `ss -u` list them.
   - **Requests:** `SOCK_DIAG_BY_FAMILY` for AF_UNIX dumps the sockets
     whose state (`TCP_ESTABLISHED`, `TCP_CLOSE` or `TCP_LISTEN`) is in
     `udiag_states`, in parts as large as Linux's `netlink_dump` makes
@@ -1267,10 +1268,11 @@ kernel.
     answers for the socket of inode `udiag_ino` (`EINVAL` for 0, `ENOENT`
     for none) whose cookie matches (`ESTALE` for another; all ones match
     any). A connection a listener has not accepted has no inode yet, and
-    is not listed. Another family has no handler (`ENOENT`), a family
-    past `AF_MAX` or a request too short is `EINVAL`, `SOCK_DESTROY` is
-    `EOPNOTSUPP`, and so is `TCPDIAG_GETSOCK`; any other type is `EINVAL`.
-    A second dump while one runs is `EBUSY`.
+    is not listed. A family but AF_UNIX, AF_INET and AF_INET6 has no
+    handler (`ENOENT`), a family past `AF_MAX` or a request too short is
+    `EINVAL`, `SOCK_DESTROY` is `EOPNOTSUPP`, and a type but
+    `SOCK_DIAG_BY_FAMILY`, `SOCK_DESTROY` and `TCPDIAG_GETSOCK` is
+    `EINVAL`. A second dump while one runs is `EBUSY`.
   - **What it tells:** each socket's type, state, inode and cookie, then
     as `udiag_show` asks, in `sk_diag_fill`'s order: its name, its socket
     file's inode and device, its peer's inode (0 once the peer has closed
@@ -1282,6 +1284,43 @@ kernel.
     both once the peer has closed), and its owner as the user namespace of
     whoever made the netlink socket shows it. A datagram socket another
     connects to is `TCP_ESTABLISHED`, as on Linux.
+  - **TCP and UDP requests:** `SOCK_DIAG_BY_FAMILY` for AF_INET or
+    AF_INET6 names a protocol (`sdiag_protocol`, or the
+    `INET_DIAG_REQ_PROTOCOL` attribute): TCP or UDP, as any other has no
+    handler (`ENOENT`, which a dump's `NLMSG_DONE` carries). A dump lists
+    the family's sockets whose state is in `idiag_states`, as Linux's
+    tables hold them: for TCP the listeners first (unless a destination
+    port is asked for), then the closed sockets that hold a port
+    (`TCP_BOUND_INACTIVE`), then the connections, with the holds in
+    `TIME_WAIT` (or `FIN_WAIT2`) that outlive their sockets; only those of
+    the source and destination ports asked for, and those a filter takes
+    (`INET_DIAG_REQ_BYTECODE`, as `ss` makes one of `sport = :80` and the
+    like), which is checked as Linux's `inet_diag_bc_audit` checks it
+    (`EINVAL`, and `EPERM` for a mark test without `CAP_NET_ADMIN`).
+    Without a dump it answers for the one socket of its addresses and
+    ports, as Linux looks it up: for TCP the connection, else the
+    listener, `ENOENT` for none or for a cookie that does not match; for
+    UDP the socket a datagram from the source to the destination reaches,
+    `ESTALE` for a cookie that does not match. The old `TCPDIAG_GETSOCK`
+    does the same for TCP of both families, and `SOCK_DESTROY` is
+    `EOPNOTSUPP`, as in a kernel built without
+    `CONFIG_INET_DIAG_DESTROY`. A request too short is `EINVAL`.
+  - **What it tells of TCP and UDP:** each socket's state (`TCP_SYN_SENT`
+    while a handshake waits for room in its listener, then that of the
+    connection's end, or `TCP_LISTEN`), its addresses and ports (IPv4 ones
+    mapped on an IPv6 socket), its cookie, its timer (a handshake's
+    retransmission, keepalive, or `TIME_WAIT`'s), its queues (a listener's
+    waiting connections and backlog), its owner as the user namespace of
+    whoever made the netlink socket shows it, and its inode (0 for a
+    connection not yet accepted); then, in `inet_sk_diag_fill`'s order,
+    its shutdown, as `idiag_ext` asks its `IP_TOS`, an IPv6 socket's
+    traffic class, and while listening or closed its `IPV6_V6ONLY`, its
+    mark to `CAP_NET_ADMIN`, its priority as its class, its cgroup, its
+    options (`inet_diag_sockopt`), its memory (a UDP socket's datagrams
+    charged in pages, as `udp_rmem_schedule` does, its buffers, and a
+    listener's handshakes that a full queue dropped), and a
+    TCP socket's congestion control (`cubic`). A hold in `TIME_WAIT` tells
+    its addresses, state and timer alone.
   - **Groups:** a socket has 32 groups, as Linux makes the four of
     `sock_diag` 32, which anyone may join, and which hear nothing.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
@@ -1822,9 +1861,13 @@ kernel.
   `readv`, `writev`, `preadv`, `pwritev`, `preadv2` or `pwritev2` that moved
   bytes, `sendfile` and `copy_file_range` (the input's, then the output's),
   `fallocate`, and each `getdents` and `getdents64`. A watch with `IN_EXCL_UNLINK` does not
-  hear of the open, close, read or write of a file no name links any more;
-  `truncate`, `mknod` and starting a program open nothing. A file's change reaches the watch of
-  its directory, with its name, before its own, and `IN_ISDIR` marks a
+  hear of the open, close, read or write of a file through a name unlinked
+  since it was opened (by `unlink`, `rmdir` or a rename onto it), even while
+  another link keeps the file; `truncate`, `mknod` and starting a program
+  open nothing. A file's change reaches the watch of
+  its directory, with its name, before its own (for an open file, the name
+  it was opened at as renames of it and of the directories above it moved
+  it, or the unlinked name it last had), and `IN_ISDIR` marks a
   directory's (not with `IN_DELETE_SELF` or `IN_MOVE_SELF`, as Linux
   leaves it out). `IN_ONESHOT` removes the watch after its first event, with
   `IN_IGNORED`. Each instance queues its events, merging one into the same
@@ -2044,7 +2087,8 @@ IPv4 address or an IPv6 one (`[::1]`), each with a port or for every port
     the host), `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_QUICKACK`,
     `TCP_USER_TIMEOUT`, `IP_TOS` and `IPV6_V6ONLY`, with Linux's defaults and
     range checks: `SO_SNDBUF` and `SO_RCVBUF` are at most the default
-    `wmem_max` and `rmem_max` (212992), doubled. `SO_TIMESTAMP`, its kin
+    `wmem_max` and `rmem_max` (212992), doubled; a new `IP_TOS` sets
+    `SO_PRIORITY` from its TOS bits too (`rt_tos2priority`). `SO_TIMESTAMP`, its kin
     and `SO_TIMESTAMPING` are set and read back as on AF_UNIX sockets, and
     `SOF_TIMESTAMPING_OPT_ID` needs a TCP socket's connection (`EINVAL`
     while it is closed or listening).
@@ -2101,7 +2145,8 @@ one only with an `--allow-net`.
   listener's, a connection it accepted, a client's), unless both set
   `SO_REUSEADDR` and the other does not listen, or both set
   `SO_REUSEPORT`. An IPv6 socket on `::` holds the port for IPv4 too,
-  unless `IPV6_V6ONLY`.
+  unless `IPV6_V6ONLY`; binding to another IPv6 address that is not an
+  IPv4 one sets `IPV6_V6ONLY`, as `__inet6_bind` does.
 - **`listen`** keeps up to `backlog` + 1 connections waiting (at most
   4096, `net.core.somaxconn`); an unbound socket takes an ephemeral port on
   every address. A listener is readable while a connection waits (for
@@ -2247,8 +2292,9 @@ one only with an `--allow-net`.
   give `EINTR` then. A handler set with `SA_RESTART` runs the calls that a
   stop runs again (from `read` to the `futex` wait with no timeout) again when
   it returns, as on Linux, except `pause`, `rt_sigsuspend`, `msgsnd`,
-  `msgrcv`, `poll`, `ppoll`, `select`, `pselect6` and a socket call whose
-  wait `SO_RCVTIMEO` or `SO_SNDTIMEO` limits, which give `EINTR`.
+  `msgrcv`, `poll`, `ppoll`, `select`, `pselect6` and a socket call, or a
+  `sendfile` into a socket, whose wait `SO_RCVTIMEO` or `SO_SNDTIMEO` limits,
+  which give `EINTR`.
   `epoll_wait`, `epoll_pwait`, `epoll_pwait2` and `rt_sigtimedwait` give
   `EINTR`, as on Linux. `rt_sigsuspend` waits with its mask in place of the signal mask until a
   handler has run, which runs with that mask; the original mask is back after
@@ -2257,7 +2303,9 @@ one only with an `--allow-net`.
   `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH`, which are ignored by
   default) discards its pending instances in the process and in every thread,
   as Linux's `do_sigaction` does. A blocked signal sent after that stays
-  pending.
+  pending. An unblocked ignored signal, such as the `SIGCHLD` of a child that
+  ends, ends no wait in any thread: a blocked `read` stays blocked, as Linux
+  drops the signal as it is sent (`sig_ignored`).
 
 ## Filesystem
 

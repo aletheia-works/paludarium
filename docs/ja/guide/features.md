@@ -1093,17 +1093,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     入れます。`nlctrl` の `notify` はグループ 16 で、ファミリーが増えも減りもしないので
     何も届きません。
 - ソケット診断の netlink ソケット（プロトコル `NETLINK_SOCK_DIAG`）は、Linux の
-  `sock_diag` と `unix_diag` と同じく、作られたネットワーク名前空間の AF_UNIX のソケットを
-  伝えます。そのため `ss -x` はそれらを挙げます。
+  `sock_diag`、`unix_diag`、`inet_diag`、`tcp_diag`、`udp_diag` と同じく、作られた
+  ネットワーク名前空間の AF_UNIX、TCP、UDP のソケットを伝えます。そのため `ss -x`、
+  `ss -t`、`ss -u` はそれらを挙げます。
   - **リクエスト:** AF_UNIX への `SOCK_DIAG_BY_FAMILY` は、状態（`TCP_ESTABLISHED`、
     `TCP_CLOSE`、`TCP_LISTEN`）が `udiag_states` にあるソケットを、Linux の `netlink_dump` と
     同じ大きさに分けてダンプします（1 ページ分、あるいはそれまでで一番長い受信の分で
     32 KiB まで。次の部分は受信が空きを作ったときに送ります）。`NLMSG_DONE` はそのあとです。ダンプでなければ、inode が `udiag_ino` で（0 は `EINVAL`、ない
     ものは `ENOENT`）、cookie が合う（違えば `ESTALE`、すべて 1 ならどれにも合います）
     ソケットに答えます。リスナーがまだ accept していない接続は inode をまだ持たないので
-    挙げません。ほかのファミリーにはハンドラーがなく（`ENOENT`）、`AF_MAX` を超える
-    ファミリーや短すぎるリクエストは `EINVAL`、`SOCK_DESTROY` と `TCPDIAG_GETSOCK` は
-    `EOPNOTSUPP`、ほかの型は `EINVAL` です。ダンプの途中のもう 1 つのダンプは `EBUSY` です。
+    挙げません。AF_UNIX、AF_INET、AF_INET6 のほかのファミリーにはハンドラーがなく
+    （`ENOENT`）、`AF_MAX` を超えるファミリーや短すぎるリクエストは `EINVAL`、
+    `SOCK_DESTROY` は `EOPNOTSUPP`、`SOCK_DIAG_BY_FAMILY`、`SOCK_DESTROY`、
+    `TCPDIAG_GETSOCK` のほかの型は `EINVAL` です。
+    ダンプの途中のもう 1 つのダンプは `EBUSY` です。
   - **伝えること:** ソケットごとに、型、状態、inode、cookie を、それから `udiag_show` が
     求めるものを `sk_diag_fill` の順に伝えます。名前、ソケットファイルの inode とデバイス、
     peer の inode（peer が閉じたあとと、accept を待つあいだは 0）、リスナーを待つ
@@ -1113,6 +1116,35 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     閉じたものも含み、peer が閉じたあとは両方）。最後に、所有者を、netlink ソケットを
     作った側のユーザー名前空間での値で伝えます。ほかのソケットが connect した
     データグラムのソケットは、Linux と同じく `TCP_ESTABLISHED` です。
+  - **TCP と UDP のリクエスト:** AF_INET か AF_INET6 への `SOCK_DIAG_BY_FAMILY` は
+    プロトコルを指します（`sdiag_protocol`、または `INET_DIAG_REQ_PROTOCOL` の属性）。
+    TCP か UDP で、ほかのものにはハンドラーがありません（`ENOENT` で、ダンプなら
+    `NLMSG_DONE` がそれを運びます）。ダンプは、状態が `idiag_states` にあるその
+    ファミリーのソケットを、Linux の表が持つとおりに挙げます。TCP では、まずリスナー
+    （宛先のポートを求められていなければ）、次にポートを持つ閉じたソケット
+    （`TCP_BOUND_INACTIVE`）、最後に接続で、ソケットがなくなったあとも残る `TIME_WAIT`
+    （または `FIN_WAIT2`）の保持もここに入ります。求められた送り元と宛先のポートのもの、
+    フィルター（`INET_DIAG_REQ_BYTECODE`。`ss` が `sport = :80` などから作るもの）が通す
+    ものだけを挙げます。フィルターは Linux の `inet_diag_bc_audit` と同じように確かめます
+    （`EINVAL`。`CAP_NET_ADMIN` のないマークの条件は `EPERM`）。ダンプでなければ、
+    アドレスとポートが指す 1 つのソケットに、Linux と同じ引き方で答えます。TCP では接続、
+    なければリスナーで、ないものと cookie が合わないものは `ENOENT` です。UDP では送り元
+    から宛先へのデータグラムが届くソケットで、cookie が合わなければ `ESTALE` です。古い
+    `TCPDIAG_GETSOCK` は、両方のファミリーの TCP に同じことをします。`SOCK_DESTROY` は、
+    `CONFIG_INET_DIAG_DESTROY` なしで作ったカーネルと同じく `EOPNOTSUPP` です。短すぎる
+    リクエストは `EINVAL` です。
+  - **TCP と UDP について伝えること:** ソケットごとに、状態（ハンドシェイクがリスナーの
+    空きを待つあいだは `TCP_SYN_SENT`、そのあとは接続の端の状態、または `TCP_LISTEN`）、
+    アドレスとポート（IPv6 のソケットでは IPv4 のものを対応させた形）、cookie、タイマー
+    （ハンドシェイクの再送、キープアライブ、`TIME_WAIT` のもの）、キュー（リスナーなら
+    待つ接続とバックログ）、netlink ソケットを作った側のユーザー名前空間での所有者、
+    inode（まだ accept されていない接続は 0）を伝えます。そのあと `inet_sk_diag_fill` の
+    順に、shutdown を伝え、`idiag_ext` が求めれば `IP_TOS`、IPv6 のソケットのトラフィック
+    クラス、待ち受け中か閉じていれば `IPV6_V6ONLY` を伝えます。続けて、`CAP_NET_ADMIN`
+    にはマーク、クラスとして優先度、cgroup、オプション（`inet_diag_sockopt`）、メモリ
+    （UDP のソケットのデータグラムは `udp_rmem_schedule` と同じくページ単位で数えたもの、
+    バッファー、リスナーのキューがいっぱいで落としたハンドシェイクの数）、TCP のソケットの輻輳制御（`cubic`）を伝えます。`TIME_WAIT` の保持
+    については、アドレス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
     グループは 32 です。誰でも入れますが、何も届きません。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
@@ -1596,10 +1628,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   まで参照を持ちます）。バイトを動かした `read`、`write`、`pread64`、`pwrite64`、
   `readv`、`writev`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`sendfile` と
   `copy_file_range`（入力の後に出力）、`fallocate`、毎回の `getdents` と `getdents64` は
-  `IN_ACCESS` か `IN_MODIFY` です。`IN_EXCL_UNLINK` のウォッチは、どの名前からも
-  リンクされなくなったファイルを開く・閉じる・読み書きすることを受けません。
+  `IN_ACCESS` か `IN_MODIFY` です。`IN_EXCL_UNLINK` のウォッチは、開いた後に
+  （`unlink`、`rmdir`、上書きする rename で）消えた名前を通してファイルを開く・閉じる・
+  読み書きすることを受けません。別のリンクがファイルを残していても同じです。
   `truncate`、`mknod`、プログラムの起動は何も開きません。ファイルの変更は、そのディレクトリのウォッチに
-  名前付きで先に届き、次にファイル自身のウォッチに届きます。ディレクトリのものには
+  名前付きで先に届き、次にファイル自身のウォッチに届きます（開いたファイルでは、開いたときの
+  名前を、ファイル自身や上のディレクトリの名前の変更に合わせて動かしたもの、または消える前の
+  最後の名前です）。ディレクトリのものには
   `IN_ISDIR` が付きます（`IN_DELETE_SELF` と `IN_MOVE_SELF` には Linux と同じく
   付きません）。`IN_ONESHOT` のウォッチは最初のイベントの後に `IN_IGNORED` とともに
   消えます。インスタンスはイベントを溜め、直前のイベントと同じもの（ディスクリプタ、
@@ -1802,7 +1837,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT`、`TCP_QUICKACK`、
     `TCP_USER_TIMEOUT`、`IP_TOS`、`IPV6_V6ONLY`。既定値と範囲の確かめ方は Linux と
     同じで、`SO_SNDBUF` と `SO_RCVBUF` は既定の `wmem_max` と `rmem_max`（212992）までを
-    2 倍にします。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
+    2 倍にします。新しい `IP_TOS` は、その TOS ビットから `SO_PRIORITY` も決めます
+    （`rt_tos2priority`）。`SO_TIMESTAMP` とその仲間、`SO_TIMESTAMPING` は AF_UNIX のソケットと同じく
     設定して読み出せ、`SOF_TIMESTAMPING_OPT_ID` には TCP のソケットの接続が要ります
     （閉じているか待ち受けている間は `EINVAL`）。
   - **タイムスタンプ**：`recvmsg` は、Linux の `udp_recvmsg`（`sock_recv_timestamp`）と同じく、
@@ -1852,7 +1888,9 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   ほかのソケット（待ち受け、それが受け付けた接続、クライアント）がポートを持って
   いれば `EADDRINUSE` です。ただし、両方が `SO_REUSEADDR` を付けていて相手が待ち
   受けていないとき、両方が `SO_REUSEPORT` を付けているときは共有できます。`::` の
-  IPv6 のソケットは、`IPV6_V6ONLY` でなければ IPv4 のポートも持ちます。
+  IPv6 のソケットは、`IPV6_V6ONLY` でなければ IPv4 のポートも持ちます。`::` でも
+  IPv4 のものでもない IPv6 のアドレスに `bind` すると、`__inet6_bind` と同じく
+  `IPV6_V6ONLY` が付きます。
 - **`listen`** は `backlog` + 1 本までの接続を待たせます（多くて 4096、
   `net.core.somaxconn`）。`bind` していないソケットは、すべてのアドレスで一時的な
   ポートを取ります。待ち受けているソケットは、接続が待っている間は読めます
@@ -1979,14 +2017,16 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   動いたときはやり直さず、`EINTR` を返します。
   `SA_RESTART` を付けたハンドラが動いたときは、Linux と同じく、ハンドラから戻った後に、停止の後にやり直す呼び出し（`read` から時間制限なしの `futex` の待ちまで）をやり直します。
   ただし `pause`、`rt_sigsuspend`、`msgsnd`、`msgrcv`、`poll`、`ppoll`、`select`、`pselect6` と、`SO_RCVTIMEO` や `SO_SNDTIMEO`
-  で待ちに時間制限のあるソケットの呼び出しは、`EINTR` を返します。
+  で待ちに時間制限のあるソケットの呼び出しと、そうしたソケットへの `sendfile` は、`EINTR` を返します。
   `epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`rt_sigtimedwait` は、Linux と同じく `EINTR` を返します。
   `rt_sigsuspend` は、シグナルのマスクを渡されたマスクに置き換えてハンドラが動くまで待ちます。
   ハンドラはそのマスクで動き、終わると元のマスクに戻ります。
 - シグナルを無視にする `sigaction`（`SIG_IGN` か、既定で無視される `SIGCHLD`、`SIGCONT`、
   `SIGURG`、`SIGWINCH` への `SIG_DFL`）は、Linux の `do_sigaction` と同じく、プロセスと
   すべてのスレッドで保留中のそのシグナルを捨てます。その後に送られたブロック中の
-  シグナルは、保留のまま残ります。
+  シグナルは、保留のまま残ります。ブロックされていない無視されるシグナル（終わった子の
+  `SIGCHLD` など）は、どのスレッドの待ちも終わらせません。Linux が送る時点で捨てる
+  （`sig_ignored`）のと同じく、ブロック中の `read` はそのまま待ち続けます。
 
 ## ファイルシステム
 

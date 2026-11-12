@@ -4702,6 +4702,70 @@ mod inotify {
         );
     }
     #[test]
+    fn a_descriptor_is_heard_of_where_renames_took_its_file() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let a = put(&f, DATA, b"/tmp/a");
+        let b = put(&f, DATA + 0x20, b"/tmp/b");
+        let c = put(&f, DATA + 0x40, b"/tmp/c");
+        let old = put(&f, DATA + 0x60, b"/tmp/a/f");
+        let new = put(&f, DATA + 0x80, b"/tmp/b/g");
+        let g = put(&f, DATA + 0xa0, b"/tmp/c/g");
+        let h = put(&f, DATA + 0xc0, b"/tmp/c/h");
+        let byte = put(&f, DATA + 0xe0, b"x");
+        assert_eq!(f.ret(83, &[a, 0o700]), 0);
+        assert_eq!(f.ret(83, &[b, 0o700]), 0);
+        let d = f.ret(2, &[old, 0o102, 0o600]);
+        // IN_MODIFY | IN_CLOSE_WRITE on the directory the file goes to, and
+        // the same with IN_EXCL_UNLINK, which a linked name passes.
+        let wd = f.ret(ADD, &[fd, b, 0xa]) as i32;
+        let excl = f.ret(INIT1, &[IN_NONBLOCK]);
+        let wd_excl = f.ret(ADD, &[excl, b, 0x0400_000a]) as i32;
+        assert_eq!(f.ret(82, &[old, new]), 0);
+        assert_eq!(f.ret(1, &[d, byte, 1]), 1);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x2, &b"g"[..])]);
+        assert_eq!(masks(&events(&mut f, excl)), [(wd_excl, 0x2, &b"g"[..])]);
+        assert_eq!(f.ret(3, &[excl]), 0);
+        // The directory's own rename leaves the file in it.
+        assert_eq!(f.ret(82, &[b, c]), 0);
+        assert_eq!(f.ret(1, &[d, byte, 1]), 1);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x2, &b"g"[..])]);
+        // Unlinked while another name links the file, its dentry keeps the
+        // name it had.
+        assert_eq!(f.ret(86, &[g, h]), 0);
+        assert_eq!(f.ret(87, &[g]), 0);
+        // A new file at that name, renamed and unlinked, leaves it there.
+        let n = put(&f, DATA + 0x100, b"/tmp/c/n");
+        let made = f.ret(2, &[g, 0o101, 0o600]);
+        assert_eq!(f.ret(3, &[made]), 0);
+        assert_eq!(f.ret(82, &[g, n]), 0);
+        assert_eq!(f.ret(87, &[n]), 0);
+        drop(events(&mut f, fd));
+        assert_eq!(f.ret(1, &[d, byte, 1]), 1);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x2, &b"g"[..])]);
+        // With no name left, /proc opens the same dentry again, whose place
+        // both descriptions share: RENAME_EXCHANGE of its directory moves
+        // it once.
+        assert_eq!(f.ret(87, &[h]), 0);
+        let link = put(&f, DATA + 0x120, format!("/proc/self/fd/{d}").as_bytes());
+        let again = f.ret(2, &[link, 0o2, 0]);
+        assert!((again as i64) >= 0, "reopen: {}", again as i64);
+        let e = put(&f, DATA + 0x140, b"/tmp/e");
+        assert_eq!(f.ret(83, &[e, 0o700]), 0);
+        assert_eq!(
+            f.ret(316, &[(-100i64) as u64, c, (-100i64) as u64, e, 2]),
+            0
+        );
+        drop(events(&mut f, fd));
+        assert_eq!(f.ret(1, &[d, byte, 1]), 1);
+        assert_eq!(f.ret(3, &[again]), 0);
+        assert_eq!(f.ret(3, &[d]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x2, &b"g"[..]), (wd, 0x8, b"g")]
+        );
+    }
+    #[test]
     fn a_removed_working_directory_ends_when_no_process_is_in_it() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);

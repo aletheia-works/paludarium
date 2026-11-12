@@ -3612,6 +3612,7 @@ impl Kernel {
             cpu,
             personality,
             arrivals: thread.state.arrivals,
+            process_notices: thread.state.process_notices,
             ..ThreadState::default()
         };
         thread.state.name_after(&path);

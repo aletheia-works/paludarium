@@ -2361,13 +2361,14 @@ pub(crate) fn pause_for_lock(c: &mut Context<'_>) -> Result<(), Errno> {
         c.cancellation,
     )?;
     let receipt = c.inbox.drain(c.process);
-    c.group.drain_process(c.process);
+    let sent = c.group.drain_process(c.process);
     if c.group.status().is_some()
         || crate::signals::next_pending(c.process, true).is_some()
         || receipt.interrupted
         || (outcome == paludarium_host::WaitOutcome::Interrupted
             && !receipt.timer_changed
             && !receipt.signals
+            && !sent
             && c.group.timer_generation() == timer_generation)
     {
         return Err(Errno(4));
@@ -2583,14 +2584,14 @@ fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
     let Ok(d) = c.files.descriptor(fd) else {
         return;
     };
-    if d.path.is_empty() || d.file.flags() & O_PATH != 0 {
+    if d.path.is_empty() || d.file.flags() & O_PATH != 0 || d.file.notify_event(mask) {
         return;
     }
     let Ok(stat) = d.file.stat() else {
         return;
     };
     c.files.caches.notify.file_event(
-        Some((&*c.files.fs, &d.path)),
+        Some((&*c.files.fs, &d.path, false)),
         descriptor_device(c, &d),
         &stat,
         mask,

@@ -56,6 +56,12 @@ pub trait FileHandle: Send + Sync {
     fn guest_path_hint(&self) -> Option<Vec<u8>> {
         None
     }
+    /// Tells the kernel's inotify watches of `mask` on this open file
+    /// itself (`fsnotify_file`), for a handle that knows where its file is
+    /// now; false leaves it to the caller.
+    fn notify_event(&self, _mask: u32) -> bool {
+        false
+    }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno>;
     fn write(&self, buf: &[u8]) -> Result<usize, Errno>;
     fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno>;

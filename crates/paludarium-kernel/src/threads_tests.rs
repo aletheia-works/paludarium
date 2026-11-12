@@ -866,6 +866,24 @@ fn a_waiting_thread_sees_a_handler_set_after_it_began_waiting() {
     assert!(signals::next_pending(&waiter, true).is_some());
 }
 #[test]
+fn every_thread_learns_of_a_process_signal_another_took() {
+    let group = ThreadGroup::default();
+    let (mut taker, mut other) = (ThreadState::default(), ThreadState::default());
+    // Nothing sent yet.
+    assert!(!group.drain_process(&mut taker));
+    assert!(!group.drain_process(&mut other));
+    group.send_process_from(signals::SIGCHLD, 2, 0).unwrap();
+    // One thread takes the ignored SIGCHLD in; the other still learns that
+    // a signal came, which is what woke it, so that its wait goes on.
+    assert!(group.drain_process(&mut taker));
+    assert!(group.drain_process(&mut other));
+    assert!(signals::next_pending(&other, true).is_none());
+    assert!(signals::next_pending(&taker, true).is_none());
+    // Once each, until another comes.
+    assert!(!group.drain_process(&mut taker));
+    assert!(!group.drain_process(&mut other));
+}
+#[test]
 fn futex_wake_counts_before_it_compares() {
     let m = memory();
     let f = futex::Futexes::default();

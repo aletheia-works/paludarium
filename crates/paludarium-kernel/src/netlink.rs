@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 mod diag;
 mod generic;
+mod inet_diag;
 
 const AF_NETLINK: u16 = 16;
 const NETLINK_ROUTE: u32 = 0;
@@ -355,6 +356,9 @@ pub(crate) struct NetlinkSocket {
     /// Whether whoever made it had that capability (the socket file's
     /// credentials, which Linux's `netlink_ns_capable` asks as well).
     opener_admin: bool,
+    /// Whether whoever made it had `CAP_BPF` or `CAP_SYS_ADMIN` over the
+    /// machine (`bpf_capable`), which a `write` asks.
+    opener_bpf: bool,
     /// The process ID of whoever made it, which a `write` that binds it
     /// takes, and its user ID, which a route lookup a `write` sends names.
     opener_pid: u32,
@@ -364,6 +368,8 @@ pub(crate) struct NetlinkSocket {
     /// network namespace, which it lists.
     opener_user: crate::users::UserNs,
     unix: Arc<crate::unix::Names>,
+    /// The host, whose clock times the sockets `sock_diag` tells of.
+    host: Arc<dyn paludarium_host::Host>,
     hub: Arc<ReadinessHub>,
     flags: AtomicU32,
     inode: u64,
@@ -380,7 +386,14 @@ pub(crate) struct NetlinkSocket {
 struct Sender {
     pid: u32,
     admin: bool,
+    /// `CAP_BPF` or `CAP_SYS_ADMIN` over the machine (`bpf_capable`).
+    bpf: bool,
     uid: u32,
+}
+const CAP_BPF: u64 = 1 << 39;
+/// `bpf_capable`.
+fn bpf_capable(credentials: &crate::credentials::Credentials) -> bool {
+    credentials.capable(CAP_BPF) || credentials.capable(crate::credentials::CAP_SYS_ADMIN)
 }
 
 /// `socket(AF_NETLINK, type, protocol)`, as Linux's `netlink_create`:
@@ -413,10 +426,12 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         network,
         namespace,
         opener_admin,
+        opener_bpf: bpf_capable(credentials),
         opener_pid: c.pid_space().number(c.process.pid),
         opener_uid: c.shown_uid(credentials.uid),
         opener_user: credentials.user.clone(),
         unix: c.unix_names(),
+        host: Arc::clone(c.shared_host),
         hub: Arc::clone(&c.files.readiness),
         flags: AtomicU32::new(2 | (kind & NONBLOCK)),
         inode: crate::files::anonymous_inode(),
@@ -482,6 +497,7 @@ impl NetlinkSocket {
                 && c.process
                     .credentials
                     .capable_in(CAP_NET_ADMIN, self.namespace.owner()),
+            bpf: bpf_capable(&c.process.credentials),
             uid: c.shown_uid(c.process.credentials.uid),
         }
     }
@@ -736,7 +752,7 @@ impl NetlinkSocket {
                 let mut told = Vec::new();
                 let result = match self.protocol {
                     NETLINK_GENERIC => self.generic(s, &header, &message[16..], port),
-                    NETLINK_SOCK_DIAG => self.diag(s, &header, &message[16..], port),
+                    NETLINK_SOCK_DIAG => self.diag(s, &header, &message[16..], port, sender),
                     _ => self.route(s, &header, &message[16..], port, sender, &mut told),
                 };
                 // This socket hears of what it changed as it happens, before
@@ -1057,6 +1073,7 @@ impl FileHandle for NetlinkSocket {
         let sender = Sender {
             pid: self.opener_pid,
             admin: self.opener_admin,
+            bpf: self.opener_bpf,
             uid: self.opener_uid,
         };
         self.send(buf, None, sender)
@@ -1163,6 +1180,14 @@ fn attribute(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(value);
     out.resize(align(out.len()), 0);
+}
+/// The types of the attributes of `bytes`, for tests.
+#[cfg(test)]
+pub(crate) fn attribute_kinds(bytes: &[u8]) -> Vec<u16> {
+    attributes(bytes)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect()
 }
 /// The attributes of `bytes`, as `nla_parse_deprecated` takes them: it
 /// stops at one too short or too long, and the type drops

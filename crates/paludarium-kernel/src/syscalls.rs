@@ -541,7 +541,7 @@ fn sleep_until(
             c.host.wait_until(clock, next, c.cancellation)
         };
         let received = c.inbox.drain(c.process);
-        c.group.drain_process(c.process);
+        let sent = c.group.drain_process(c.process);
         let interrupted = received.interrupted
             || (!c.inbox.owns_wake(c.cancellation)
                 && c.cancellation.load(std::sync::atomic::Ordering::SeqCst));
@@ -560,7 +560,10 @@ fn sleep_until(
                 continue;
             }
             Ok(WaitOutcome::Interrupted)
-                if received.signals && !pending && !interrupted && c.group.status().is_none() =>
+                if (received.signals || sent)
+                    && !pending
+                    && !interrupted
+                    && c.group.status().is_none() =>
             {
                 continue;
             }

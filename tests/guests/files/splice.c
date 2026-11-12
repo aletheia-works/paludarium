@@ -1,5 +1,5 @@
-/* splice (275), tee (276) and vmsplice (278), and in case 73 a signal that
-   interrupts sendfile (40) and splice, through the raw Linux ABI; the
+/* splice (275), tee (276) and vmsplice (278), and in cases 73 and 75 a
+   signal that interrupts sendfile (40) and splice, through the raw Linux ABI; the
    native result is regenerated before every comparison. Each case writes its
    results as longs. Pipes are only compared empty or full of whole pages, as
    Linux counts a pipe's capacity in page buffers. */
@@ -26,7 +26,7 @@ static long sigpipe_pending(void){
  static long zero[2];if(was)call(128,(long)&pipe_mask,0,(long)zero,8,0,0);return was;
 }
 static void pipe_of(int *fds,long flags,long size){call(293,(long)fds,flags,0,0,0,0);if(size)S(72,fds[0],1031,size);}
-#if CASE==73
+#if CASE==73||CASE==75
 /* call6(n,a,b,c,d,e), flags 0 in r9, with the syscall at call_at, so that a
    handler can tell from the frame that a signal came during the call. */
 __asm__(".global call6\ncall6: mov %rdi,%rax\nmov %rsi,%rdi\nmov %rdx,%rsi\nmov %rcx,%rdx\nmov %r8,%r10\nmov %r9,%r8\nxor %r9d,%r9d\n"
@@ -181,6 +181,48 @@ void _start(void) {
    S(1,gp[1],"g",1);call(61,pid,0,0,0,0,0);
    buf[0]=0;R(S(0,full[0],buf,16));R(buf[0]);
    S(3,hp[0],0,0);S(3,hp[1],0,0);S(3,rp[0],0,0);S(3,rp[1],0,0);S(3,gp[0],0,0);S(3,gp[1],0,0);S(3,full[0],0,0);
+  }
+#endif
+ }
+ if(CASE==75){ /* sendfile into a full socket, interrupted by a signal: SO_SNDTIMEO makes the wait's end EINTR, which SA_RESTART does not restart (sock_intr_errno) */
+#if CASE==75
+  /* Whether process `pid` sleeps (S in /proc/pid/stat). A signal is sent only
+     then: one that comes before the wait is ERESTARTSYS, as splice_to_socket
+     looks for a signal before it sends, and SA_RESTART restarts it even with
+     SO_SNDTIMEO. */
+  #define ASLEEP(pid) ({char path_[32]="/proc/",*e_=path_+6;long v_=(pid),d_=1;while(d_*10<=v_)d_*=10;for(;d_;d_/=10)*e_++='0'+v_/d_%10;\
+   char*t_="/stat";while(*t_)*e_++=*t_++;*e_=0;long f_=S(2,path_,0,0),n_=f_<0?0:S(0,f_,buf,200);if(f_>=0)S(3,f_,0,0);\
+   long s_=0;for(long i_=n_-2;i_>0;i_--)if(buf[i_]==')'){s_=buf[i_+2]=='S';break;}s_;})
+  for(long round=0;round<4;round++){
+   long timed=round&1,restart=round>>1;
+   int hp[2],rp[2],gp[2],sv[2];call(293,(long)hp,04000,0,0,0,0);S(22,rp,0,0);S(22,gp,0,0);
+   call(53,1,1,0,(long)sv,0,0);
+   if(timed){static long tv[2]={10,0};call(54,sv[1],1,21,(long)tv,16,0);}
+   /* Fill the socket; how much it takes is not compared. */
+   for(long i=0;i<4096;i++)buf[i]='p';
+   long filled=0,n;while((n=call(44,sv[1],(long)buf,4096,0x40,0,0))>0)filled+=n;
+   hit_fd=hp[1];
+   unsigned long act[4]={(unsigned long)interrupted,4|0x4000000|(restart?0x10000000:0),(unsigned long)restorer,0};
+   call(13,10,(long)act,0,8,0,0);
+   S(8,fd,round,0);
+   long pid=S(57,0,0,0);
+   if(!pid){
+    S(3,sv[0],0,0);
+    long r[5],k=0;
+    r[k++]=call6(40,sv[1],fd,0,1,0);
+    r[k++]=hit;r[k++]=hit_rax;r[k++]=hit_at;r[k++]=S(8,fd,0,1);
+    S(1,rp[1],r,k*8);while(S(0,gp[0],buf,1)==-4);S(60,0,0,0);
+   }
+   S(3,sv[1],0,0);
+   while(S(0,hp[0],buf,1)!=1){if(ASLEEP(pid))S(62,pid,10,0);S(24,0,0,0);}
+   /* Room for a restarted call: what was filled is read back. */
+   long drained=0;while(drained<filled&&(n=S(0,sv[0],buf,filled-drained<16384?filled-drained:16384))>0)drained+=n;
+   R(drained==filled);
+   long got[5];R(S(0,rp[0],got,5*8));for(int i=0;i<5;i++)R(got[i]);
+   S(1,gp[1],"g",1);call(61,pid,0,0,0,0,0);
+   /* The restarted call's byte, or the end of the stream. */
+   buf[0]=0;R(S(0,sv[0],buf,16));R(buf[0]);
+   S(3,hp[0],0,0);S(3,hp[1],0,0);S(3,rp[0],0,0);S(3,rp[1],0,0);S(3,gp[0],0,0);S(3,gp[1],0,0);S(3,sv[0],0,0);
   }
 #endif
  }

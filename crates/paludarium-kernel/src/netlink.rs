@@ -18,7 +18,9 @@
 //! down with `IFF_UP`, given `CAP_NET_ADMIN` in the user namespace that owns
 //! the network namespace. An error, or a success the request asks for with
 //! `NLM_F_ACK`, is answered with `NLMSG_ERROR`; any other request is
-//! `EOPNOTSUPP`. A datagram to another socket's port reaches it, and the
+//! `EOPNOTSUPP`. A socket with `NETLINK_GET_STRICT_CHK` has its dumps,
+//! link requests and route lookups checked as Linux checks them strictly,
+//! and its dumps narrowed as they ask. A datagram to another socket's port reaches it, and the
 //! members of a group hear of the changes to the link, addresses and
 //! routes as Linux tells them.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
@@ -105,6 +107,25 @@ const RTA_VIA: u16 = 18;
 const RTA_ENCAP: u16 = 22;
 const RTA_EXPIRES: u16 = 23;
 const RTA_NH_ID: u16 = 30;
+/// What a strict route lookup may name besides `RTA_SRC`, `RTA_DST`,
+/// `RTA_IIF`, `RTA_OIF` and `RTA_UID`.
+const RTA_MARK: u16 = 16;
+const RTA_IP_PROTO: u16 = 27;
+const RTA_SPORT: u16 = 28;
+const RTA_DPORT: u16 = 29;
+const RTA_FLOWLABEL: u16 = 31;
+/// The last route attribute (`RTA_MAX`, `RTA_DEL_REASON` on Linux master),
+/// past which strict checking takes none.
+const RTA_MAX: u16 = 32;
+/// `RTM_F_NOTIFY`, which a strict IPv4 lookup may ask, and `RTM_F_PREFIX`,
+/// which dumps only prefix routes: none of IPv4's, and of IPv6's only
+/// those of router advertisements, which `lo` has none of.
+const RTM_F_NOTIFY: u32 = 0x100;
+const RTM_F_PREFIX: u32 = 0x800;
+/// `NLM_F_DUMP_FILTERED`: a dump that its request narrowed.
+const NLM_F_DUMP_FILTERED: u16 = 0x20;
+/// The multicast routing tables' only table (`RT_TABLE_DEFAULT`).
+const RT_TABLE_DEFAULT: u32 = 253;
 /// `RTNH_F_ONLINK`.
 const RTNH_F_ONLINK: u32 = 4;
 /// A table past 255, as an `rtmsg` names it.
@@ -167,6 +188,20 @@ const IFLA_MAX_PACING_OFFLOAD_HORIZON: u16 = 66;
 const IFLA_NETNS_IMMUTABLE: u16 = 67;
 const IFLA_HEADROOM: u16 = 68;
 const IFLA_TAILROOM: u16 = 69;
+/// What a link dump takes besides `IFLA_EXT_MASK`: a master to show the
+/// devices of, a kind (whose devices `lo` is none of, but the kinds there
+/// are depend on the modules loaded, so it is taken without effect), and
+/// another namespace's ID, of which none is given.
+const IFLA_MASTER: u16 = 10;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_TARGET_NETNSID: u16 = 46;
+/// The last link attribute (`IFLA_MAX`, `IFLA_PACING_OFFLOAD` on Linux
+/// master).
+const IFLA_MAX: u16 = 70;
+/// An address dump's other namespace (`IFA_TARGET_NETNSID`), and the last
+/// address attribute (`IFA_MAX`, `IFA_MC_USERS`).
+const IFA_TARGET_NETNSID: u16 = 10;
+const IFA_MAX: u16 = 12;
 /// The attributes inside `IFLA_XDP` and `IFLA_AF_SPEC`.
 const IFLA_XDP_ATTACHED: u16 = 2;
 const IFLA_INET_CONF: u16 = 1;
@@ -814,59 +849,41 @@ impl NetlinkSocket {
             return Err(Errno::EPERM);
         }
         if get && header.flags & NLM_F_DUMP != 0 {
-            let messages = match (header.kind, family) {
+            // What the request asks is checked as the dump begins, so a
+            // bad one ends it at once, its error in `NLMSG_DONE`, which
+            // carries the flags (`answer_flags`) the checks set by then.
+            let strict = s.strict;
+            let mut answer = 0;
+            let (seq, network) = (header.seq, &*self.network);
+            let dump = match (header.kind, family) {
                 // `rtnl_bridge_getlink` has no bridge port to show.
-                (RTM_GETLINK, AF_BRIDGE) => Vec::new(),
+                (RTM_GETLINK, AF_BRIDGE) => bridge_dump_check(payload, strict).map(|()| Vec::new()),
                 // `inet6_dump_ifinfo`: each device with IPv6, as IPv6 shows it.
-                (RTM_GETLINK, AF_INET6) => {
-                    vec![inet6_link_message(
-                        &self.network,
-                        header.seq,
-                        port,
-                        NLM_F_MULTI,
-                    )]
-                }
-                (RTM_GETLINK, _) => vec![link_message(
-                    &self.network,
-                    header.seq,
-                    port,
-                    NLM_F_MULTI,
-                    ext_mask(payload),
-                )],
+                (RTM_GETLINK, AF_INET6) => inet6_link_dump_check(payload, strict)
+                    .map(|()| vec![inet6_link_message(network, seq, port, NLM_F_MULTI)]),
+                (RTM_GETLINK, _) => link_dump(network, payload, seq, port, strict),
                 // `rtnl_dump_all` dumps each family's: IPv4's, then IPv6's.
                 (RTM_GETADDR, _) => {
-                    let mut messages = Vec::new();
-                    if family != AF_INET6 {
-                        messages.extend(ipv4_message(&self.network, header.seq, port));
-                    }
-                    if family != AF_INET {
-                        messages.extend(ipv6_message(&self.network, header.seq, port));
-                    }
-                    messages
+                    address_dump(network, payload, family, seq, port, strict, &mut answer)
                 }
-                // The multicast routing tables have no route.
-                (RTM_GETROUTE, RTNL_FAMILY_IPMR | RTNL_FAMILY_IP6MR) => Vec::new(),
                 (RTM_GETROUTE, _) => {
-                    let mut messages = Vec::new();
-                    if family != AF_INET6 {
-                        messages.extend(ipv4_routes(&self.network, header.seq, port));
-                    }
-                    if family != AF_INET {
-                        messages.extend(ipv6_routes(&self.network, header.seq, port));
-                    }
-                    messages
+                    route_dump(network, payload, family, seq, port, strict, &mut answer)
                 }
                 _ => return Err(EOPNOTSUPP),
             };
             if s.done.is_some() {
                 return Err(EBUSY);
             }
+            let (messages, error) = match dump {
+                Ok(messages) => (messages, 0),
+                Err(e) => (Vec::new(), -e.0),
+            };
             let done = message(
                 NLMSG_DONE,
-                NLM_F_MULTI,
+                NLM_F_MULTI | answer,
                 header.seq,
                 port,
-                &0i32.to_le_bytes(),
+                &error.to_le_bytes(),
             );
             // `inet6_dump_ifaddr` and `inet6_dump_ifinfo`, not split, put
             // `NLMSG_DONE` after their last message when that part has room
@@ -877,6 +894,9 @@ impl NetlinkSocket {
         }
         match header.kind {
             RTM_GETROUTE if matches!(family, AF_INET | AF_INET6) => {
+                if s.strict {
+                    lookup_check(payload)?;
+                }
                 let reply = lookup(&self.network, payload, header.seq, port, sender.uid)?;
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
@@ -907,13 +927,13 @@ impl NetlinkSocket {
                 Ok(false)
             }
             RTM_GETLINK => {
-                self.find_link(payload, header, true)?;
+                self.find_link(payload, header, Some(s.strict))?;
                 let reply = link_message(&self.network, header.seq, port, 0, ext_mask(payload));
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
             RTM_NEWLINK | RTM_SETLINK => {
-                let (flags, change) = self.find_link(payload, header, false)?;
+                let (flags, change) = self.find_link(payload, header, None)?;
                 // `rtnl_dev_combine_flags`: only the flags `ifi_change`
                 // names, or all with none named; of them only `IFF_UP`.
                 if flags != 0 || change != 0 {
@@ -936,14 +956,34 @@ impl NetlinkSocket {
     /// another interface. To set, `NLM_F_EXCL` is `EEXIST` and
     /// `NLM_F_REPLACE` `EOPNOTSUPP` for `RTM_NEWLINK`, and of the
     /// attributes only the name `lo` and `IFLA_EXT_MASK` are taken
-    /// (`EOPNOTSUPP` for others). The flags and the change mask.
-    fn find_link(&self, payload: &[u8], header: &Header, get: bool) -> Result<(u32, u32), Errno> {
+    /// (`EOPNOTSUPP` for others). To get, `strict` is `Some` with whether
+    /// the socket checks strictly, which takes, as `rtnl_valid_getlink_req`
+    /// does, no type, flags or change mask (`EINVAL`), and of the
+    /// attributes ([`strict_attributes`]) only the names, `IFLA_EXT_MASK`
+    /// and `IFLA_TARGET_NETNSID` (`EINVAL` for others); another
+    /// namespace's ID is `EINVAL` either way, as there is none. The flags
+    /// and the change mask.
+    fn find_link(
+        &self,
+        payload: &[u8],
+        header: &Header,
+        strict: Option<bool>,
+    ) -> Result<(u32, u32), Errno> {
         if payload.len() < 16 {
             return Err(Errno::EINVAL);
         }
+        let get = strict.is_some();
         let word = |i: usize| u32::from_le_bytes(payload[i..i + 4].try_into().unwrap_or_default());
         let index = word(4) as i32;
-        let attributes = attributes(&payload[16..]);
+        let attributes = if strict == Some(true) {
+            if payload[1] != 0 || payload[2..4] != [0, 0] || payload[8..16].iter().any(|&b| b != 0)
+            {
+                return Err(Errno::EINVAL);
+            }
+            strict_attributes(&payload[16..], IFLA_MAX)?
+        } else {
+            attributes(&payload[16..])
+        };
         let mut name = None;
         for &(kind, value) in &attributes {
             match kind {
@@ -959,6 +999,22 @@ impl NetlinkSocket {
                 IFLA_EXT_MASK => {}
                 _ if get => {}
                 _ => return Err(EOPNOTSUPP),
+            }
+        }
+        if get {
+            let named = |kind: u16| attributes.iter().any(|&(k, _)| k == kind);
+            if strict == Some(true)
+                && attributes.iter().any(|&(kind, _)| {
+                    !matches!(
+                        kind,
+                        IFLA_IFNAME | IFLA_ALT_IFNAME | IFLA_EXT_MASK | IFLA_TARGET_NETNSID
+                    )
+                })
+            {
+                return Err(Errno::EINVAL);
+            }
+            if named(IFLA_TARGET_NETNSID) {
+                return Err(Errno::EINVAL);
             }
         }
         let found = match (index, name) {
@@ -1237,6 +1293,394 @@ fn attributes(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
         bytes = &bytes[align(len).min(bytes.len())..];
     }
     out
+}
+/// The attributes of `bytes` as `nlmsg_parse_deprecated_strict` takes them
+/// for a socket that checks strictly (`NETLINK_GET_STRICT_CHK`): `EINVAL`
+/// for a type of 0 or past `max`, and for bytes left after the last whole
+/// attribute. The attribute policies are not checked.
+fn strict_attributes(mut bytes: &[u8], max: u16) -> Result<Vec<(u16, &[u8])>, Errno> {
+    let mut out = Vec::new();
+    while bytes.len() >= 4 {
+        let len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+        if len < 4 || len > bytes.len() {
+            break;
+        }
+        let kind = u16::from_le_bytes([bytes[2], bytes[3]]) & 0x3fff;
+        if kind == 0 || kind > max {
+            return Err(Errno::EINVAL);
+        }
+        out.push((kind, &bytes[4..len]));
+        bytes = &bytes[align(len).min(bytes.len())..];
+    }
+    if bytes.is_empty() {
+        Ok(out)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+/// The attributes' values by type, the last of each, in the order of
+/// their types, as `nlmsg_parse` puts them in its table.
+fn by_type<'a>(attributes: &[(u16, &'a [u8])]) -> BTreeMap<u16, &'a [u8]> {
+    attributes.iter().copied().collect()
+}
+/// A `u32` attribute's value: `ERANGE` for one shorter, as its policy.
+fn u32_value(value: &[u8]) -> Result<u32, Errno> {
+    value
+        .first_chunk()
+        .copied()
+        .map(u32::from_le_bytes)
+        .ok_or(ERANGE)
+}
+/// Whether the `ifinfomsg` of a strict link request has a type, flags, a
+/// change mask or, with `index`, an index: `EINVAL` for a short one or
+/// for any of them.
+fn strict_link_header(payload: &[u8], index: bool) -> Result<(), Errno> {
+    if payload.len() < 16
+        || payload[1] != 0
+        || payload[2..4] != [0, 0]
+        || payload[8..16].iter().any(|&b| b != 0)
+        || (index && payload[4..8] != [0; 4])
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+/// A link dump, as `rtnl_dump_ifinfo`: `lo`, as `IFLA_EXT_MASK` asks it.
+/// An `IFLA_MASTER` other than 0 shows only the devices of that master,
+/// which `lo` is not, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
+/// namespace has an ID. Unchecked, a request shorter than an `ifinfomsg`
+/// is an old `rtgenmsg`, whose attributes follow its 4 bytes, and the
+/// attributes are not taken where one of those it reads is short, as a
+/// failed `nlmsg_parse_deprecated`; strictly, as
+/// `rtnl_valid_dump_ifinfo_req`, it is `EINVAL` with a type, flags, a
+/// change mask or an index ([`strict_link_header`]), and for attributes
+/// but those and `IFLA_LINKINFO`.
+fn link_dump(
+    network: &Network,
+    payload: &[u8],
+    seq: u32,
+    port: u32,
+    strict: bool,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    let attributes = if strict {
+        strict_link_header(payload, true)?;
+        strict_attributes(&payload[16..], IFLA_MAX)?
+    } else {
+        let start = if payload.len() < 16 { 4 } else { 16 };
+        payload.get(start..).map(attributes).unwrap_or_default()
+    };
+    let mut attributes = by_type(&attributes);
+    let read = |kind: u16| attributes.get(&kind).map(|value| u32_value(value));
+    let short = [IFLA_TARGET_NETNSID, IFLA_EXT_MASK, IFLA_MASTER]
+        .into_iter()
+        .find_map(|kind| read(kind)?.err());
+    match short {
+        Some(e) if strict => return Err(e),
+        Some(_) => attributes.clear(),
+        None => {}
+    }
+    let known = |kind: u16| {
+        matches!(
+            kind,
+            IFLA_TARGET_NETNSID | IFLA_EXT_MASK | IFLA_MASTER | IFLA_LINKINFO
+        )
+    };
+    if attributes.contains_key(&IFLA_TARGET_NETNSID)
+        || (strict && attributes.keys().any(|&kind| !known(kind)))
+    {
+        return Err(Errno::EINVAL);
+    }
+    let value = |kind: u16| {
+        attributes
+            .get(&kind)
+            .map_or(0, |v| u32_value(v).unwrap_or(0))
+    };
+    let (mask, master) = (value(IFLA_EXT_MASK), value(IFLA_MASTER));
+    if master != 0 {
+        return Ok(Vec::new());
+    }
+    Ok(vec![link_message(network, seq, port, NLM_F_MULTI, mask)])
+}
+/// Strictly, a bridge link dump (`valid_bridge_getlink_req`) takes no
+/// type, flags, change mask or index, and no attribute but
+/// `IFLA_EXT_MASK` (`EINVAL`). Unchecked, nothing is checked.
+fn bridge_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
+    if !strict {
+        return Ok(());
+    }
+    strict_link_header(payload, true)?;
+    let attributes = strict_attributes(&payload[16..], IFLA_MAX)?;
+    if let Some(&(_, value)) = attributes.iter().rev().find(|&&(k, _)| k == IFLA_EXT_MASK) {
+        u32_value(value)?;
+    }
+    if attributes.iter().any(|&(kind, _)| kind != IFLA_EXT_MASK) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+/// Strictly, an AF_INET6 link dump (`inet6_valid_dump_ifinfo`) takes an
+/// `ifinfomsg` alone, with no type, flags, change mask or index (`EINVAL`).
+fn inet6_link_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
+    if strict && payload.len() != 16 {
+        return Err(Errno::EINVAL);
+    }
+    if strict {
+        strict_link_header(payload, true)?;
+    }
+    Ok(())
+}
+/// Adds `flags` to each message of `messages`.
+fn with_flags(mut messages: Vec<Vec<u8>>, flags: u16) -> Vec<Vec<u8>> {
+    for message in &mut messages {
+        let old = u16::from_le_bytes([message[6], message[7]]);
+        message[6..8].copy_from_slice(&(old | flags).to_le_bytes());
+    }
+    messages
+}
+/// An address dump: IPv4's, then IPv6's, as `rtnl_dump_all` dumps each
+/// family's, or the one family's. Strictly, as
+/// `inet_valid_dump_ifaddr_req` and `inet6_valid_dump_ifaddr_req`, it is
+/// `EINVAL` for an `ifaddrmsg` short or with a prefix length, flags or a
+/// scope, and for any attribute (`IFA_TARGET_NETNSID` too, as no other
+/// namespace has an ID); an index other than 0 shows that device's
+/// addresses alone, as `NLM_F_DUMP_FILTERED`, which `NLMSG_DONE` carries
+/// too, and is `ENODEV` for another than `lo`'s.
+fn address_dump(
+    network: &Network,
+    payload: &[u8],
+    family: u8,
+    seq: u32,
+    port: u32,
+    strict: bool,
+    answer: &mut u16,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    let mut flags = 0;
+    if strict {
+        if payload.len() < 8 || payload[1..4] != [0; 3] {
+            return Err(Errno::EINVAL);
+        }
+        let index = u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default());
+        if index != 0 {
+            *answer |= NLM_F_DUMP_FILTERED;
+            flags = NLM_F_DUMP_FILTERED;
+        }
+        let attributes = by_type(&strict_attributes(&payload[8..], IFA_MAX)?);
+        if let Some(value) = attributes.get(&IFA_TARGET_NETNSID) {
+            u32_value(value)?;
+        }
+        if !attributes.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        if index > 1 {
+            return Err(ENODEV);
+        }
+    }
+    let mut messages = Vec::new();
+    if family != AF_INET6 {
+        messages.extend(ipv4_message(network, seq, port));
+    }
+    if family != AF_INET {
+        messages.extend(ipv6_message(network, seq, port));
+    }
+    Ok(with_flags(messages, flags))
+}
+/// What a route dump shows, as `struct fib_dump_filter`.
+#[derive(Default)]
+struct RouteFilter {
+    /// `RTM_F_CLONED`: only the routes cached from others, of which there
+    /// are none.
+    cloned: bool,
+    /// `RTM_F_PREFIX`: only prefix routes, of which there are none.
+    prefix: bool,
+    protocol: u8,
+    kind: u8,
+    table: u32,
+    /// Only the routes through `lo` (`RTA_OIF`).
+    device: bool,
+    /// Whether the messages carry `NLM_F_DUMP_FILTERED`, as every message
+    /// of a strict dump does, whose routes or exceptions are left out.
+    marked: bool,
+}
+/// The filter of a route dump. Unchecked, only `RTM_F_PREFIX` is taken,
+/// and `RTM_F_CLONED` changes nothing. Strictly, as `ip_valid_fib_dump_req`:
+/// `EINVAL` for an `rtmsg` short or with a prefix length, a source prefix
+/// length, a TOS or a scope, for flags but `RTM_F_CLONED` and
+/// `RTM_F_PREFIX`, and for attributes but `RTA_TABLE` and `RTA_OIF`,
+/// whose device is `ENODEV` but `lo`'s; the table, protocol and type, and
+/// those, narrow it, as `NLM_F_DUMP_FILTERED` in `NLMSG_DONE` too.
+fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteFilter, Errno> {
+    let flags = payload.get(8..12).map_or(0, |raw| {
+        u32::from_le_bytes(raw.try_into().unwrap_or_default())
+    });
+    if !strict {
+        return Ok(RouteFilter {
+            prefix: payload.len() >= 12 && flags & RTM_F_PREFIX != 0,
+            ..RouteFilter::default()
+        });
+    }
+    if payload.len() < 12 || payload[1..4] != [0; 3] || payload[6] != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & !(RTM_F_CLONED | RTM_F_PREFIX) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut filter = RouteFilter {
+        cloned: flags & RTM_F_CLONED != 0,
+        prefix: flags & RTM_F_PREFIX != 0,
+        protocol: payload[5],
+        kind: payload[7],
+        table: u32::from(payload[4]),
+        device: false,
+        marked: true,
+    };
+    let attributes = by_type(&strict_attributes(&payload[12..], RTA_MAX)?);
+    for kind in [RTA_OIF, RTA_TABLE] {
+        if let Some(value) = attributes.get(&kind) {
+            u32_value(value)?;
+        }
+    }
+    for (&kind, &value) in &attributes {
+        match kind {
+            RTA_TABLE => filter.table = u32_value(value)?,
+            RTA_OIF if u32_value(value)? == 1 => filter.device = true,
+            RTA_OIF => return Err(ENODEV),
+            _ => return Err(Errno::EINVAL),
+        }
+    }
+    if flags != 0 || filter.protocol != 0 || filter.kind != 0 || filter.table != 0 || filter.device
+    {
+        *answer = NLM_F_DUMP_FILTERED;
+    }
+    Ok(filter)
+}
+/// A route dump: IPv4's routes of every table, as `fib_dump_info` gives
+/// them, then IPv6's, as `rt6_fill_node` does, as `rtnl_dump_all` dumps
+/// each family's, or the one family's; the multicast routing tables have
+/// none. A table the filter names ([`route_filter`]) that the family has
+/// not made is `ENOENT` for a dump of that family alone (the multicast
+/// ones have only `RT_TABLE_DEFAULT`), and shows nothing of it otherwise.
+fn route_dump(
+    network: &Network,
+    payload: &[u8],
+    family: u8,
+    seq: u32,
+    port: u32,
+    strict: bool,
+    answer: &mut u16,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    let filter = route_filter(payload, strict, answer)?;
+    let flags = NLM_F_MULTI
+        | if filter.marked {
+            NLM_F_DUMP_FILTERED
+        } else {
+            0
+        };
+    let taken = |table: u32, kind: u8, proto: u8, device: bool| {
+        !filter.cloned
+            && !filter.prefix
+            && (filter.table == 0 || filter.table == table)
+            && (filter.kind == 0 || filter.kind == kind)
+            && (filter.protocol == 0 || filter.protocol == proto)
+            && (!filter.device || device)
+    };
+    if matches!(family, RTNL_FAMILY_IPMR | RTNL_FAMILY_IP6MR) {
+        if filter.table != 0 && filter.table != RT_TABLE_DEFAULT {
+            return Err(Errno::ENOENT);
+        }
+        return Ok(Vec::new());
+    }
+    let addresses = network.addresses();
+    let mut messages = Vec::new();
+    // `inet_dump_fib` looks at `RTM_F_PREFIX` before the table.
+    if family != AF_INET6 && !filter.prefix {
+        if filter.table != 0 && !addresses.has_table4(filter.table) {
+            if family == AF_INET {
+                return Err(Errno::ENOENT);
+            }
+        } else {
+            messages.extend(
+                addresses
+                    .dump4()
+                    .iter()
+                    .filter(|r| taken(r.table, r.kind.code(), r.proto, r.device))
+                    .map(|r| ipv4_route_of(RTM_NEWROUTE, r, r.table, seq, port, flags)),
+            );
+        }
+    }
+    if family != AF_INET {
+        if filter.table != 0 && !addresses.has_table6(filter.table) {
+            if family == AF_INET6 {
+                return Err(Errno::ENOENT);
+            }
+        } else {
+            messages.extend(
+                addresses
+                    .dump6()
+                    .iter()
+                    .filter(|r| taken(r.table, r.kind.code(), r.proto, true))
+                    .map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, flags)),
+            );
+        }
+    }
+    Ok(messages)
+}
+/// Strictly, a route lookup takes, as `inet_rtm_valid_getroute_req` and
+/// `inet6_rtm_valid_getroute_req`: prefix lengths of 0 or the whole
+/// address, and one where `RTA_SRC` or `RTA_DST` is given; no table,
+/// protocol, scope or type; of the flags only `RTM_F_FIB_MATCH`, and for
+/// IPv4 `RTM_F_NOTIFY` and `RTM_F_LOOKUP_TABLE` too; an IPv6 flow label
+/// of 20 bits; and only the attributes that select a route. Anything else
+/// is `EINVAL`.
+fn lookup_check(payload: &[u8]) -> Result<(), Errno> {
+    if payload.len() < 12 {
+        return Err(Errno::EINVAL);
+    }
+    let v6 = payload[0] == AF_INET6;
+    let whole = if v6 { 128 } else { 32 };
+    let (dst_len, src_len) = (payload[1], payload[2]);
+    let flags = u32::from_le_bytes(payload[8..12].try_into().unwrap_or_default());
+    let allowed = if v6 {
+        RTM_F_FIB_MATCH
+    } else {
+        RTM_F_NOTIFY | RTM_F_LOOKUP_TABLE | RTM_F_FIB_MATCH
+    };
+    if (src_len != 0 && src_len != whole)
+        || (dst_len != 0 && dst_len != whole)
+        || payload[4..8] != [0; 4]
+        || flags & !allowed != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let attributes = by_type(&strict_attributes(&payload[12..], RTA_MAX)?);
+    if (attributes.contains_key(&RTA_SRC) && src_len == 0)
+        || (attributes.contains_key(&RTA_DST) && dst_len == 0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if v6 && let Some(value) = attributes.get(&RTA_FLOWLABEL) {
+        let label = value.first_chunk::<4>().ok_or(ERANGE)?;
+        if u32::from_be_bytes(*label) & !0x000f_ffff != 0 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    let selects = |kind: u16| {
+        matches!(
+            kind,
+            RTA_SRC
+                | RTA_DST
+                | RTA_IIF
+                | RTA_OIF
+                | RTA_MARK
+                | RTA_UID
+                | RTA_SPORT
+                | RTA_DPORT
+                | RTA_IP_PROTO
+        ) || (v6 && kind == RTA_FLOWLABEL)
+    };
+    if attributes.keys().any(|&kind| !selects(kind)) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 /// `NLMSG_ERROR` for `request` with `error` (0 for an acknowledgement), as
 /// `netlink_ack`: an error carries the whole request unless `capped`
@@ -1716,7 +2160,8 @@ fn ipv6_route_of(
 /// `EOPNOTSUPP` for an input route (`RTA_IIF`), which is not supported;
 /// a rejecting route's error, `ENETUNREACH` where no route goes, and for
 /// IPv6 while `lo` is down. `0.0.0.0` goes to the loopback from
-/// `127.0.0.1`. An `RTA_UID` it names (`ERANGE` when shorter than 4
+/// `127.0.0.1`. An IPv4 answer gives the `RTA_MARK` it names, but 0
+/// (`ERANGE` when shorter than 4 bytes). An `RTA_UID` it names (`ERANGE` when shorter than 4
 /// bytes, for either family, as both policies take a `u32`) is the one an
 /// IPv4 answer gives, as it is; `RTA_SRC`, `RTA_OIF` and the other
 /// selectors are not looked at. An IPv4 answer names the main table but
@@ -1740,11 +2185,13 @@ fn lookup(
     let request_flags = u32::from_le_bytes(payload[8..12].try_into().unwrap_or_default());
     let mut dst = None;
     let mut asked_uid = None;
+    let mut mark = 0;
     for (kind, value) in attributes(&payload[12..]) {
         match kind {
             RTA_DST => dst = Some(value),
             RTA_IIF => return Err(EOPNOTSUPP),
             RTA_UID => asked_uid = Some(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?)),
+            RTA_MARK => mark = u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?),
             _ => {}
         }
     }
@@ -1842,29 +2289,17 @@ fn lookup(
     if let Some(gateway) = gateway {
         attribute(&mut body, RTA_GATEWAY, &gateway.octets());
     }
-    // An invalid user ID (-1) is left out (`uid_valid`).
+    // The mark it names, but 0, as `rt_fill_info` gives it; an invalid
+    // user ID (-1) is left out (`uid_valid`).
+    if mark != 0 {
+        attribute(&mut body, RTA_MARK, &mark.to_le_bytes());
+    }
     let uid = asked_uid.unwrap_or(uid);
     if uid != u32::MAX {
         attribute(&mut body, RTA_UID, &uid.to_le_bytes());
     }
     attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
-}
-/// The IPv4 routes of every table, as `fib_dump_info` gives them.
-fn ipv4_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
-    let routes = network.addresses().dump4();
-    routes
-        .iter()
-        .map(|r| ipv4_route_of(RTM_NEWROUTE, r, r.table, seq, port, NLM_F_MULTI))
-        .collect()
-}
-/// The IPv6 routes of every table, as `rt6_fill_node` gives them.
-fn ipv6_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
-    let routes = network.addresses().dump6();
-    routes
-        .iter()
-        .map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, NLM_F_MULTI))
-        .collect()
 }
 /// An `RTM_NEWROUTE` or `RTM_DELROUTE` request, as `inet_rtm_newroute`,
 /// `inet_rtm_delroute`, `inet6_rtm_newroute` and `inet6_rtm_delroute`
@@ -2329,9 +2764,10 @@ fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
 }
 /// `setsockopt`: `SO_SNDBUF` and `SO_RCVBUF` (doubled, as Linux keeps
 /// them), `SO_RCVTIMEO`, and `SOL_NETLINK`'s `NETLINK_CAP_ACK`,
-/// `NETLINK_EXT_ACK` and `NETLINK_GET_STRICT_CHK`, which are kept, though
-/// no error carries extended attributes and dumps are not checked
-/// strictly. Any other option is `ENOPROTOOPT`.
+/// `NETLINK_EXT_ACK`, which is kept, though no error carries extended
+/// attributes, and `NETLINK_GET_STRICT_CHK`, by which dumps, link requests
+/// and route lookups are checked strictly. Any other option is
+/// `ENOPROTOOPT`.
 fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Result<u64, Errno> {
     let (level, name, at, len) = (a[1], a[2], a[3], a[4]);
     match (level, name) {
@@ -2447,6 +2883,10 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A route dump of `family`'s routes alone, unchecked, to port 7.
+    fn routes(network: &Network, family: u8, seq: u32) -> Vec<Vec<u8>> {
+        route_dump(network, &[family], family, seq, 7, false, &mut 0).unwrap()
+    }
     #[test]
     fn dumps_go_in_parts_as_large_as_the_longest_receive() {
         let mut s = State {
@@ -2627,12 +3067,12 @@ mod tests {
     fn routes_follow_the_loopback_and_its_address() {
         let network = Network::isolated(crate::users::first());
         // None before the loopback has been up.
-        assert!(ipv4_routes(&network, 1, 7).is_empty());
-        assert!(ipv6_routes(&network, 1, 7).is_empty());
+        assert!(routes(&network, AF_INET, 1).is_empty());
+        assert!(routes(&network, AF_INET6, 1).is_empty());
         // Up: local 127.0.0.0/8, local 127.0.0.1 and the broadcast route,
         // then local ::1, each in the local table.
         network.set_up(true);
-        let v4 = ipv4_routes(&network, 2, 7).concat();
+        let v4 = routes(&network, AF_INET, 2).concat();
         let mut rest = &v4[..];
         let mut seen = Vec::new();
         while !rest.is_empty() {
@@ -2660,7 +3100,7 @@ mod tests {
                 (32, RT_SCOPE_LINK, RTN_BROADCAST, vec![127, 255, 255, 255]),
             ]
         );
-        let v6 = ipv6_routes(&network, 2, 7).concat();
+        let v6 = routes(&network, AF_INET6, 2).concat();
         assert_eq!(
             &v6[16..24],
             &[
@@ -2690,8 +3130,8 @@ mod tests {
         );
         // Down: the two local routes stay, as Linux keeps them.
         network.set_up(false);
-        assert_eq!(ipv4_routes(&network, 3, 7).concat().len(), 2 * 60);
-        assert!(ipv6_routes(&network, 3, 7).is_empty());
+        assert_eq!(routes(&network, AF_INET, 3).concat().len(), 2 * 60);
+        assert!(routes(&network, AF_INET6, 3).is_empty());
     }
 
     #[test]
@@ -2724,5 +3164,274 @@ mod tests {
         assert_eq!(first_group(0b1100), 3);
         assert_eq!(group_mask(3), 0b100);
         assert_eq!(group_mask(0), 0);
+    }
+
+    #[test]
+    fn strict_attributes_refuse_unknown_types_and_leftover_bytes() {
+        let mut bytes = Vec::new();
+        attribute(&mut bytes, IFLA_IFNAME | 0x8000, b"lo\0");
+        assert_eq!(
+            strict_attributes(&bytes, IFLA_MAX),
+            Ok(vec![(IFLA_IFNAME, &b"lo\0"[..])])
+        );
+        // The last attribute's padding may be left out.
+        assert_eq!(
+            strict_attributes(&bytes[..7], IFLA_MAX).map(|a| a.len()),
+            Ok(1)
+        );
+        for kind in [0, IFLA_MAX + 1] {
+            let mut bytes = Vec::new();
+            attribute(&mut bytes, kind, &[0; 4]);
+            assert_eq!(strict_attributes(&bytes, IFLA_MAX), Err(Errno::EINVAL));
+        }
+        let mut bytes = Vec::new();
+        attribute(&mut bytes, IFLA_MTU, &[0; 4]);
+        bytes.extend_from_slice(&[0, 0]);
+        assert_eq!(strict_attributes(&bytes, IFLA_MAX), Err(Errno::EINVAL));
+        assert_eq!(attributes(&bytes).len(), 1);
+    }
+
+    /// An `ifinfomsg` of `family` and `index`, then `attributes`.
+    fn ifinfo(family: u8, index: i32, attributes: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut out = vec![family, 0, 0, 0];
+        out.extend_from_slice(&index.to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
+        for &(kind, value) in attributes {
+            attribute(&mut out, kind, value);
+        }
+        out
+    }
+
+    #[test]
+    fn strict_link_dumps_take_only_their_filters() {
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true);
+        let dump = |payload: &[u8], strict| link_dump(&network, payload, 1, 7, strict);
+        let skip = RTEXT_FILTER_SKIP_STATS.to_le_bytes();
+        let plain = dump(&ifinfo(0, 0, &[]), true).unwrap();
+        assert_eq!(plain, vec![link_message(&network, 1, 7, NLM_F_MULTI, 0)]);
+        let skipped = vec![link_message(
+            &network,
+            1,
+            7,
+            NLM_F_MULTI,
+            RTEXT_FILTER_SKIP_STATS,
+        )];
+        assert_eq!(
+            dump(&ifinfo(0, 0, &[(IFLA_EXT_MASK, &skip)]), true),
+            Ok(skipped.clone())
+        );
+        // A master lo has not shows nothing; lo has no kind.
+        let master = ifinfo(0, 0, &[(IFLA_MASTER, &5u32.to_le_bytes())]);
+        assert_eq!(dump(&master, true), Ok(Vec::new()));
+        assert_eq!(dump(&master, false), Ok(Vec::new()));
+        assert_eq!(
+            dump(&ifinfo(0, 0, &[(IFLA_LINKINFO, &[])]), true),
+            Ok(plain.clone())
+        );
+        // No namespace has an ID, checked or not.
+        let netnsid = ifinfo(0, 0, &[(IFLA_TARGET_NETNSID, &1u32.to_le_bytes())]);
+        assert_eq!(dump(&netnsid, true), Err(Errno::EINVAL));
+        assert_eq!(dump(&netnsid, false), Err(Errno::EINVAL));
+        // Strictly, an rtgenmsg, a type, flags, an index or another
+        // attribute is EINVAL; a short filter is ERANGE.
+        let name = ifinfo(0, 0, &[(IFLA_IFNAME, b"lo\0")]);
+        let mut typed = ifinfo(0, 0, &[]);
+        typed[2] = 4;
+        let mut flagged = ifinfo(0, 0, &[]);
+        flagged[8] = 1;
+        for bad in [&[0][..], &typed, &flagged, &ifinfo(0, 1, &[]), &name] {
+            assert_eq!(dump(bad, true), Err(Errno::EINVAL));
+        }
+        assert_eq!(
+            dump(&ifinfo(0, 0, &[(IFLA_MASTER, &[5])]), true),
+            Err(ERANGE)
+        );
+        // Unchecked, those are taken, an old rtgenmsg's attributes after its
+        // 4 bytes, and none where one it reads is short.
+        assert_eq!(dump(&name, false), Ok(plain.clone()));
+        let mut old = vec![0; 4];
+        attribute(&mut old, IFLA_EXT_MASK, &skip);
+        assert_eq!(dump(&old, false), Ok(skipped));
+        let short = ifinfo(0, 0, &[(IFLA_EXT_MASK, &skip), (IFLA_MASTER, &[5])]);
+        assert_eq!(dump(&short, false), Ok(plain));
+        // The other link dumps.
+        assert_eq!(
+            inet6_link_dump_check(&ifinfo(AF_INET6, 0, &[]), true),
+            Ok(())
+        );
+        let six = ifinfo(AF_INET6, 0, &[(IFLA_EXT_MASK, &skip)]);
+        assert_eq!(inet6_link_dump_check(&six, true), Err(Errno::EINVAL));
+        assert_eq!(inet6_link_dump_check(&six, false), Ok(()));
+        assert_eq!(
+            inet6_link_dump_check(&ifinfo(AF_INET6, 1, &[]), true),
+            Err(Errno::EINVAL)
+        );
+        let bridge = ifinfo(AF_BRIDGE, 0, &[(IFLA_EXT_MASK, &skip)]);
+        assert_eq!(bridge_dump_check(&bridge, true), Ok(()));
+        assert_eq!(bridge_dump_check(&master, true), Err(Errno::EINVAL));
+        assert_eq!(
+            bridge_dump_check(&ifinfo(AF_BRIDGE, 1, &[]), true),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(bridge_dump_check(&[AF_BRIDGE], false), Ok(()));
+    }
+
+    #[test]
+    fn strict_address_dumps_narrow_to_an_index() {
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true);
+        let mut answer = 0;
+        let all = address_dump(&network, &[0; 8], 0, 1, 7, true, &mut answer).unwrap();
+        assert_eq!((all.len(), answer), (2, 0));
+        let mut by_index = vec![AF_INET6, 0, 0, 0];
+        by_index.extend_from_slice(&1u32.to_le_bytes());
+        let lo = address_dump(&network, &by_index, AF_INET6, 1, 7, true, &mut answer).unwrap();
+        assert_eq!(lo.len(), 1);
+        assert_eq!(
+            Header::read(&lo[0]).flags,
+            NLM_F_MULTI | NLM_F_DUMP_FILTERED
+        );
+        assert_eq!(answer, NLM_F_DUMP_FILTERED);
+        // Another index is ENODEV, after the filter is marked.
+        by_index[4] = 2;
+        answer = 0;
+        let other = address_dump(&network, &by_index, 0, 1, 7, true, &mut answer);
+        assert_eq!((other, answer), (Err(ENODEV), NLM_F_DUMP_FILTERED));
+        // Unchecked, the index changes nothing.
+        answer = 0;
+        let loose = address_dump(&network, &by_index, 0, 1, 7, false, &mut answer).unwrap();
+        assert_eq!((loose, answer), (all, 0));
+        let mut label = vec![0; 8];
+        attribute(&mut label, IFA_LABEL, b"lo\0");
+        for bad in [&[0][..], &[0, 8, 0, 0, 0, 0, 0, 0], &label] {
+            let found = address_dump(&network, bad, 0, 1, 7, true, &mut 0);
+            assert_eq!(found, Err(Errno::EINVAL));
+        }
+    }
+
+    /// An `rtmsg` of `family` with `table`, `protocol`, `kind` and
+    /// `flags`, then `attributes`.
+    fn rtmsg(family: u8, table: u8, protocol: u8, kind: u8, flags: u32) -> Vec<u8> {
+        let mut out = vec![family, 0, 0, 0, table, protocol, 0, kind];
+        out.extend_from_slice(&flags.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn strict_route_dumps_narrow_by_table_protocol_type_and_device() {
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true);
+        let dump = |payload: &[u8], family, answer: &mut u16| {
+            route_dump(&network, payload, family, 1, 7, true, answer)
+        };
+        let mut answer = 0;
+        let all = dump(&rtmsg(0, 0, 0, 0, 0), 0, &mut answer).unwrap();
+        // Every message of a strict dump is marked, NLMSG_DONE only when
+        // it was narrowed.
+        assert!(
+            all.iter()
+                .all(|m| Header::read(m).flags == NLM_F_MULTI | NLM_F_DUMP_FILTERED)
+        );
+        assert_eq!(answer, 0);
+        assert_eq!(all.len(), routes(&network, 0, 1).len());
+        let local = dump(
+            &rtmsg(AF_INET, RT_TABLE_LOCAL, 0, 0, 0),
+            AF_INET,
+            &mut answer,
+        )
+        .unwrap();
+        assert_eq!((local.len(), answer), (3, NLM_F_DUMP_FILTERED));
+        let kind = dump(&rtmsg(0, 0, 0, RTN_BROADCAST, 0), 0, &mut 0).unwrap();
+        assert_eq!(kind.len(), 1);
+        let protocol = dump(&rtmsg(AF_INET6, 0, 3, 0, 0), AF_INET6, &mut 0).unwrap();
+        assert!(protocol.is_empty());
+        let mut lo = rtmsg(0, 0, 0, 0, 0);
+        attribute(&mut lo, RTA_OIF, &1u32.to_le_bytes());
+        assert_eq!(dump(&lo, 0, &mut 0).unwrap().len(), all.len());
+        // A table the family has not made is ENOENT for that family alone.
+        let mut hundred = rtmsg(AF_INET6, 0, 0, 0, 0);
+        attribute(&mut hundred, RTA_TABLE, &100u32.to_le_bytes());
+        assert_eq!(dump(&hundred, AF_INET6, &mut 0), Err(Errno::ENOENT));
+        hundred[0] = 0;
+        assert_eq!(dump(&hundred, 0, &mut 0), Ok(Vec::new()));
+        let ipmr = rtmsg(RTNL_FAMILY_IPMR, 100, 0, 0, 0);
+        assert_eq!(dump(&ipmr, RTNL_FAMILY_IPMR, &mut 0), Err(Errno::ENOENT));
+        let ip6mr = rtmsg(RTNL_FAMILY_IP6MR, 253, 0, 0, 0);
+        assert_eq!(dump(&ip6mr, RTNL_FAMILY_IP6MR, &mut 0), Ok(Vec::new()));
+        // There are no cached routes and no prefix routes.
+        for flags in [RTM_F_CLONED, RTM_F_PREFIX] {
+            answer = 0;
+            let none = dump(&rtmsg(0, 0, 0, 0, flags), 0, &mut answer);
+            assert_eq!((none, answer), (Ok(Vec::new()), NLM_F_DUMP_FILTERED));
+        }
+        let prefix = rtmsg(0, 0, 0, 0, RTM_F_PREFIX);
+        assert_eq!(
+            route_dump(&network, &prefix, 0, 1, 7, false, &mut 0),
+            Ok(Vec::new())
+        );
+        // An unknown device is ENODEV; the rest is EINVAL.
+        let mut other = rtmsg(0, 0, 0, 0, 0);
+        attribute(&mut other, RTA_OIF, &2u32.to_le_bytes());
+        assert_eq!(dump(&other, 0, &mut 0), Err(ENODEV));
+        let mut dst = rtmsg(0, 0, 0, 0, 0);
+        attribute(&mut dst, RTA_DST, &[127, 0, 0, 1]);
+        let mut long = rtmsg(0, 0, 0, 0, 0);
+        long[1] = 8;
+        let lookup = rtmsg(0, 0, 0, 0, RTM_F_LOOKUP_TABLE);
+        for bad in [&[0][..], &dst, &long, &lookup] {
+            assert_eq!(dump(bad, 0, &mut 0), Err(Errno::EINVAL));
+        }
+    }
+
+    #[test]
+    fn strict_lookups_take_whole_lengths_and_selectors() {
+        let lookup = |family: u8, len: u8, flags: u32, extra: Option<(u16, &[u8])>| {
+            let mut out = rtmsg(family, 0, 0, 0, flags);
+            out[1] = len;
+            if family == AF_INET6 {
+                attribute(&mut out, RTA_DST, &Ipv6Addr::LOCALHOST.octets());
+            } else {
+                attribute(&mut out, RTA_DST, &[127, 0, 0, 1]);
+            }
+            if let Some((kind, value)) = extra {
+                attribute(&mut out, kind, value);
+            }
+            lookup_check(&out)
+        };
+        use core::net::Ipv6Addr;
+        assert_eq!(lookup(AF_INET, 32, RTM_F_LOOKUP_TABLE, None), Ok(()));
+        assert_eq!(
+            lookup(AF_INET, 32, 0, Some((RTA_MARK, &[1, 0, 0, 0]))),
+            Ok(())
+        );
+        assert_eq!(lookup(AF_INET6, 128, RTM_F_FIB_MATCH, None), Ok(()));
+        let label = 0x12345u32.to_be_bytes();
+        assert_eq!(
+            lookup(AF_INET6, 128, 0, Some((RTA_FLOWLABEL, &label))),
+            Ok(())
+        );
+        let wide = 0x10_0000u32.to_be_bytes();
+        assert_eq!(
+            lookup(AF_INET6, 128, 0, Some((RTA_FLOWLABEL, &wide))),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            lookup(AF_INET6, 128, 0, Some((RTA_FLOWLABEL, &[0]))),
+            Err(ERANGE)
+        );
+        for bad in [
+            lookup(AF_INET, 0, 0, None),
+            lookup(AF_INET, 24, 0, None),
+            lookup(AF_INET, 32, RTM_F_CLONED, None),
+            lookup(AF_INET6, 128, RTM_F_LOOKUP_TABLE, None),
+            lookup(AF_INET, 32, 0, Some((RTA_PRIORITY, &[1, 0, 0, 0]))),
+            lookup(AF_INET, 32, 0, Some((RTA_FLOWLABEL, &label))),
+        ] {
+            assert_eq!(bad, Err(Errno::EINVAL));
+        }
+        let mut table = rtmsg(AF_INET, RT_TABLE_LOCAL, 0, 0, 0);
+        table[1] = 32;
+        assert_eq!(lookup_check(&table), Err(Errno::EINVAL));
     }
 }

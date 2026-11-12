@@ -1268,6 +1268,23 @@ kernel.
     `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending
     thread and the socket's opener (`EPERM`).
+  - **Strict checking:** with `NETLINK_GET_STRICT_CHK`, as iproute2 sets
+    it, requests are checked as Linux checks them. A dump takes a whole
+    header with nothing in it but what may narrow it, and of the
+    attributes only those that narrow it, of known types, with no bytes
+    left over; anything else ends it with `EINVAL` in `NLMSG_DONE`. An
+    address dump's index shows `lo`'s addresses alone (`ENODEV` for
+    another), and a route dump's table, protocol, type and `RTA_OIF` show
+    the routes they name, all with `NLM_F_DUMP_FILTERED`, a table not made
+    being `ENOENT` for a dump of that family alone. `RTM_GETLINK` for `lo`
+    takes no flags and only its names, `IFLA_EXT_MASK` and
+    `IFLA_TARGET_NETNSID`, and a route lookup only whole prefix lengths and
+    the attributes that select a route, as `rtnl_valid_getlink_req`,
+    `inet_rtm_valid_getroute_req` and `inet6_rtm_valid_getroute_req`.
+    Checked or not, a link dump's `IFLA_MASTER` shows no device, as `lo`
+    has no master, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
+    namespace has an ID; `RTM_F_PREFIX` dumps no route, as `lo` has no
+    prefix route.
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
     7.0's attributes in its order: its flags, name, queue, state, MTU,
@@ -1332,7 +1349,8 @@ kernel.
     is up. A rejecting route's error is the answer (`EINVAL`,
     `EHOSTUNREACH`, `EACCES`). An IPv4 answer names the main table (with
     `RTM_F_LOOKUP_TABLE`, the table it came from), the source
-    `fib_select_path` picks, a gateway reached on link, and the caller's
+    `fib_select_path` picks, a gateway reached on link, the `RTA_MARK` the
+    request names (none for 0), and the caller's
     `RTA_UID` (or the one the request names, as it is; none for -1, and
     `ERANGE` for one shorter than 4 bytes); `0.0.0.0` goes to the loopback
     from 127.0.0.1. An IPv6 answer names the source `ipv6_dev_get_saddr`

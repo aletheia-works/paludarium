@@ -1519,6 +1519,31 @@ static void nl_route(int fd, unsigned port, unsigned short type, unsigned short 
     }
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, at), port, label);
 }
+/* The netlink-strict case: a request's body, its fixed header first and
+   then the attributes nl_put adds, each padded. */
+struct nl_body {
+    unsigned char bytes[160];
+    size_t len;
+};
+static void nl_put(struct nl_body *b, unsigned short type, const void *value, size_t len) {
+    unsigned short attribute[2] = {4 + len, type};
+    memcpy(b->bytes + b->len, attribute, 4);
+    memcpy(b->bytes + b->len + 4, value, len);
+    b->len += (4 + len + 3) & ~3;
+}
+static void nl_put32(struct nl_body *b, unsigned short type, unsigned value) {
+    nl_put(b, type, &value, 4);
+}
+/* A body of `len` bytes, the first of them `family`. */
+static struct nl_body nl_body(unsigned char family, size_t len) {
+    struct nl_body b = {{family}, len};
+    return b;
+}
+/* Sends `type`, a dump when `dump`, with body `b` and prints the answer. */
+static void nl_strict(int fd, unsigned port, unsigned short type, int dump, const struct nl_body *b,
+                      const char *label) {
+    nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | (dump ? NL_F_DUMP : 0), b->bytes, b->len), port, label);
+}
 /* The route-dump case: sends request `type` with `flags` and NLM_F_ACK,
    and takes its acknowledgement, giving its error. */
 static int nl_quiet(int fd, unsigned short type, unsigned short flags, const void *request, size_t len) {
@@ -9531,6 +9556,227 @@ int main(int argc, char **argv) {
                    netns_lo(owned, SIOCSIFFLAGS, "lo", IFF_UP));
             printf("user: owned=%ld made=%ld here=%ld\n", netns_lo(owned, SIOCGIFFLAGS, "lo", 0),
                    netns_lo(made, SIOCGIFFLAGS, "lo", 0), netns_lo(here, SIOCGIFFLAGS, "lo", 0));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "netlink-strict")) {
+        /* A child makes a network namespace with lo up and checks its
+           requests strictly (NETLINK_GET_STRICT_CHK), as iproute2 does:
+           link, address and route dumps, link requests and route lookups,
+           those it takes and those it refuses, whose error a dump gives in
+           NLMSG_DONE; then some on a socket that does not check. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int fd = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK};
+            bind(fd, (void *)&any, sizeof any);
+            struct nl_address name = {0};
+            socklen_t name_len = sizeof name;
+            getsockname(fd, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_link up = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            int on = 1, got = -1;
+            socklen_t got_len = sizeof got;
+            int set = setsockopt(fd, 270, 12, &on, sizeof on) < 0 ? -errno : 0;
+            getsockopt(fd, 270, 12, &got, &got_len);
+            printf("strict: up=%d set=%d got=%d\n", nl_quiet(fd, 16, 0, &up, sizeof up), set, got);
+            struct nl_body b;
+            struct nl_link link = {0};
+            /* Link dumps: an ifinfomsg with nothing in it, and of the
+               attributes IFLA_EXT_MASK, IFLA_MASTER (a master lo has not)
+               and IFLA_TARGET_NETNSID (an ID no namespace has). */
+            b = nl_body(0, 1);
+            nl_strict(fd, port, 18, 1, &b, "link rtgenmsg");
+            b = nl_body(0, 16);
+            nl_strict(fd, port, 18, 1, &b, "link");
+            link = (struct nl_link){.type = 772};
+            memcpy(b.bytes, &link, 16);
+            nl_strict(fd, port, 18, 1, &b, "link type");
+            link = (struct nl_link){.index = 1};
+            memcpy(b.bytes, &link, 16);
+            nl_strict(fd, port, 18, 1, &b, "link index");
+            b = nl_body(0, 16);
+            nl_put32(&b, 29, 8);
+            nl_strict(fd, port, 18, 1, &b, "link ext mask");
+            b = nl_body(0, 16);
+            nl_put32(&b, 10, 5);
+            nl_strict(fd, port, 18, 1, &b, "link master");
+            b = nl_body(0, 16);
+            nl_put(&b, 3, "lo", 3);
+            nl_strict(fd, port, 18, 1, &b, "link name");
+            b = nl_body(0, 16);
+            nl_put32(&b, 46, 12345);
+            nl_strict(fd, port, 18, 1, &b, "link netnsid");
+            b = nl_body(0, 16);
+            nl_put32(&b, 200, 0);
+            nl_strict(fd, port, 18, 1, &b, "link unknown");
+            b = nl_body(0, 16);
+            nl_put32(&b, 0, 0);
+            nl_strict(fd, port, 18, 1, &b, "link type 0");
+            b = nl_body(0, 18);
+            nl_strict(fd, port, 18, 1, &b, "link trailing");
+            b = nl_body(AF_INET6, 16);
+            nl_strict(fd, port, 18, 1, &b, "link6");
+            nl_put32(&b, 29, 8);
+            nl_strict(fd, port, 18, 1, &b, "link6 ext mask");
+            link = (struct nl_link){.family = AF_INET6, .index = 1};
+            b = nl_body(AF_INET6, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_strict(fd, port, 18, 1, &b, "link6 index");
+            b = nl_body(7, 16);
+            nl_strict(fd, port, 18, 1, &b, "bridge");
+            nl_put32(&b, 29, 8);
+            nl_strict(fd, port, 18, 1, &b, "bridge ext mask");
+            b = nl_body(7, 16);
+            nl_put32(&b, 10, 5);
+            nl_strict(fd, port, 18, 1, &b, "bridge master");
+            link = (struct nl_link){.family = 7, .index = 1};
+            b = nl_body(7, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_strict(fd, port, 18, 1, &b, "bridge index");
+            /* Getting lo: no flags, and only names, IFLA_EXT_MASK and
+               IFLA_TARGET_NETNSID. */
+            link = (struct nl_link){.index = 1};
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_strict(fd, port, 18, 0, &b, "get");
+            nl_put32(&b, 10, 5);
+            nl_strict(fd, port, 18, 0, &b, "get master");
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_put32(&b, 46, 12345);
+            nl_strict(fd, port, 18, 0, &b, "get netnsid");
+            link = (struct nl_link){.index = 1, .flags = IFF_UP};
+            memcpy(b.bytes, &link, 16);
+            b.len = 16;
+            nl_strict(fd, port, 18, 0, &b, "get flags");
+            b = nl_body(0, 16);
+            nl_put(&b, 3, "lo", 3);
+            nl_strict(fd, port, 18, 0, &b, "get name");
+            /* Address dumps: an index shows its device's alone. */
+            b = nl_body(0, 1);
+            nl_strict(fd, port, 22, 1, &b, "addr rtgenmsg");
+            b = nl_body(0, 8);
+            nl_strict(fd, port, 22, 1, &b, "addr");
+            unsigned index = 1;
+            b = nl_body(AF_INET, 8);
+            memcpy(b.bytes + 4, &index, 4);
+            nl_strict(fd, port, 22, 1, &b, "addr4 index");
+            b.bytes[0] = AF_INET6;
+            nl_strict(fd, port, 22, 1, &b, "addr6 index");
+            index = 100000;
+            b = nl_body(0, 8);
+            memcpy(b.bytes + 4, &index, 4);
+            nl_strict(fd, port, 22, 1, &b, "addr no index");
+            b = nl_body(0, 8);
+            b.bytes[1] = 8;
+            nl_strict(fd, port, 22, 1, &b, "addr prefix");
+            b = nl_body(0, 8);
+            nl_put(&b, 3, "lo", 3);
+            nl_strict(fd, port, 22, 1, &b, "addr label");
+            b = nl_body(AF_INET6, 8);
+            nl_put32(&b, 10, 12345);
+            nl_strict(fd, port, 22, 1, &b, "addr6 netnsid");
+            /* Route dumps, narrowed by table, protocol, type and device. */
+            static const struct {
+                unsigned char family, table, protocol, kind;
+                unsigned flags, attribute, value;
+                const char *label;
+            } dumps[] = {
+                {0, 0, 0, 0, 0, 0, 0, "route"},
+                {AF_INET, 255, 0, 0, 0, 0, 0, "route4 local"},
+                {AF_INET6, 254, 0, 0, 0, 0, 0, "route6 main"},
+                {AF_INET, 100, 0, 0, 0, 0, 0, "route4 table 100"},
+                {AF_INET6, 0, 0, 0, 0, 15, 100, "route6 table 100"},
+                {0, 100, 0, 0, 0, 0, 0, "route table 100"},
+                {0, 0, 0, 2, 0, 0, 0, "route local"},
+                {0, 0, 2, 0, 0, 0, 0, "route kernel"},
+                {AF_INET6, 0, 3, 0, 0, 0, 0, "route6 boot"},
+                {0, 0, 0, 0, 0, 4, 1, "route lo"},
+                {0, 0, 0, 0, 0, 4, 100000, "route no device"},
+                {0, 0, 0, 0, 0x200, 0, 0, "route cloned"},
+                {0, 0, 0, 0, 0x800, 0, 0, "route prefix"},
+                {0, 0, 0, 0, 0x1000, 0, 0, "route lookup table"},
+                {0, 0, 0, 0, 0, 6, 1, "route priority"},
+                {128, 100, 0, 0, 0, 0, 0, "ipmr table 100"},
+                {129, 253, 0, 0, 0, 0, 0, "ip6mr default"},
+            };
+            for (size_t i = 0; i < sizeof dumps / sizeof dumps[0]; i++) {
+                b = nl_body(dumps[i].family, 12);
+                b.bytes[4] = dumps[i].table;
+                b.bytes[5] = dumps[i].protocol;
+                b.bytes[7] = dumps[i].kind;
+                memcpy(b.bytes + 8, &dumps[i].flags, 4);
+                if (dumps[i].attribute) nl_put32(&b, dumps[i].attribute, dumps[i].value);
+                nl_strict(fd, port, 26, 1, &b, dumps[i].label);
+            }
+            b = nl_body(0, 1);
+            nl_strict(fd, port, 26, 1, &b, "route rtgenmsg");
+            b = nl_body(0, 12);
+            b.bytes[1] = 8;
+            nl_strict(fd, port, 26, 1, &b, "route dst len");
+            /* Route lookups: whole prefix lengths, no table, and only the
+               attributes that select. */
+            static const unsigned char loopback4[4] = {127, 0, 0, 1}, loopback6[16] = {[15] = 1};
+            static const struct {
+                unsigned char family, len, table;
+                unsigned flags, attribute, value;
+                const char *label;
+            } lookups[] = {
+                {AF_INET, 32, 0, 0, 0, 0, "get4"},
+                {AF_INET, 0, 0, 0, 0, 0, "get4 no len"},
+                {AF_INET, 24, 0, 0, 0, 0, "get4 len 24"},
+                {AF_INET, 32, 254, 0, 0, 0, "get4 table"},
+                {AF_INET, 32, 0, 0x1000, 0, 0, "get4 lookup table"},
+                {AF_INET, 32, 0, 0x200, 0, 0, "get4 cloned"},
+                {AF_INET, 32, 0, 0, 6, 1, "get4 priority"},
+                {AF_INET, 32, 0, 0, 16, 1, "get4 mark"},
+                {AF_INET6, 128, 0, 0, 0, 0, "get6"},
+                {AF_INET6, 128, 0, 0x1000, 0, 0, "get6 lookup table"},
+                {AF_INET6, 128, 0, 0, 31, 0x45230100, "get6 flow label"},
+                {AF_INET6, 128, 0, 0, 31, 0x10, "get6 wide flow label"},
+            };
+            for (size_t i = 0; i < sizeof lookups / sizeof lookups[0]; i++) {
+                int v6 = lookups[i].family == AF_INET6;
+                b = nl_body(lookups[i].family, 12);
+                b.bytes[1] = lookups[i].len;
+                b.bytes[4] = lookups[i].table;
+                memcpy(b.bytes + 8, &lookups[i].flags, 4);
+                nl_put(&b, 1, v6 ? loopback6 : loopback4, v6 ? 16 : 4);
+                if (lookups[i].attribute) nl_put32(&b, lookups[i].attribute, lookups[i].value);
+                nl_strict(fd, port, 26, 0, &b, lookups[i].label);
+            }
+            /* Unchecked: an old rtgenmsg with IFLA_EXT_MASK after its 4
+               bytes, IFLA_MASTER and IFLA_TARGET_NETNSID, and RTM_F_PREFIX. */
+            int loose = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            bind(loose, (void *)&any, sizeof any);
+            name_len = sizeof name;
+            getsockname(loose, (void *)&name, &name_len);
+            b = nl_body(0, 4);
+            nl_put32(&b, 29, 8);
+            nl_strict(loose, name.pid, 18, 1, &b, "loose link ext mask");
+            b = nl_body(0, 16);
+            nl_put32(&b, 10, 5);
+            nl_strict(loose, name.pid, 18, 1, &b, "loose link master");
+            b = nl_body(0, 16);
+            nl_put32(&b, 46, 12345);
+            nl_strict(loose, name.pid, 18, 1, &b, "loose link netnsid");
+            b = nl_body(0, 16);
+            nl_put(&b, 3, "lo", 3);
+            nl_strict(loose, name.pid, 18, 1, &b, "loose link name");
+            unsigned prefix = 0x800;
+            b = nl_body(0, 12);
+            memcpy(b.bytes + 8, &prefix, 4);
+            nl_strict(loose, name.pid, 26, 1, &b, "loose route prefix");
+            b.bytes[1] = 8;
+            prefix = 0;
+            memcpy(b.bytes + 8, &prefix, 4);
+            nl_strict(loose, name.pid, 26, 1, &b, "loose route dst len");
             fflush(stdout);
             _exit(0);
         }

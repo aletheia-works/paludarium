@@ -178,6 +178,7 @@ mod linux {
                     | "monitor"
                     | "routes"
                     | "route-dump"
+                    | "netlink-strict"
                     | "link-attributes"
                     | "generic-netlink"
                     | "sock-diag"
@@ -306,6 +307,7 @@ mod linux {
         processes_monitor => ("monitor","process"),
         processes_routes => ("routes","process"),
         processes_route_dump => ("route-dump","process"),
+        processes_netlink_strict => ("netlink-strict","process"),
         processes_link_attributes => ("link-attributes","process"),
         processes_generic_netlink => ("generic-netlink","process"),
         processes_sock_diag => ("sock-diag","process"),

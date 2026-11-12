@@ -1099,6 +1099,14 @@ impl Addresses {
             .flat_map(|t| self.routes6.iter().filter(move |r| r.table == t).copied())
             .collect()
     }
+    /// Whether IPv4 has made the table `table` (`fib_get_table`).
+    pub(crate) fn has_table4(&self, table: u32) -> bool {
+        self.tables4.contains(&table)
+    }
+    /// Whether IPv6 has made the table `table` (`fib6_get_table`).
+    pub(crate) fn has_table6(&self, table: u32) -> bool {
+        self.tables6.contains(&table)
+    }
     /// The tables one trie holds: the local and main ones share theirs.
     fn trie(table: u32) -> &'static [u32] {
         match table {

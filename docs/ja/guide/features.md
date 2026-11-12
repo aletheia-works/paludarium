@@ -1104,6 +1104,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`GET` のほかには、ネットワーク
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
     開いたものの両方に要ります（なければ `EPERM`）。
+  - **厳密な検査:** iproute2 と同じく `NETLINK_GET_STRICT_CHK` を設定すると、Linux と
+    同じくリクエストを調べます。ダンプには、絞り込みに使うもの以外は空のヘッダーが
+    そろっていて、属性は絞り込みに使うものだけで、型が知られたもので、余るバイトが
+    ないことが要ります。そうでなければ `NLMSG_DONE` の `EINVAL` で終わります。
+    アドレスのダンプのインデックスは `lo` のアドレスだけを見せ（ほかは `ENODEV`）、
+    経路のダンプの表・プロトコル・種類・`RTA_OIF` は指した経路だけを見せます。どちらも
+    `NLM_F_DUMP_FILTERED` が付きます。作られていない表は、そのファミリーだけのダンプでは
+    `ENOENT` です。`lo` への `RTM_GETLINK` はフラグを取らず、名前、`IFLA_EXT_MASK`、
+    `IFLA_TARGET_NETNSID` だけを取ります。経路の検索は、`rtnl_valid_getlink_req`、
+    `inet_rtm_valid_getroute_req`、`inet6_rtm_valid_getroute_req` と同じく、アドレス
+    全体の接頭辞長と経路を選ぶ属性だけを取ります。検査の有無にかかわらず、`lo` には
+    マスターがないのでリンクのダンプの `IFLA_MASTER` はどのデバイスも見せず、ほかの
+    名前空間には ID がないので `IFLA_TARGET_NETNSID` は `EINVAL` です。`lo` には
+    プレフィックス経路がないので、`RTM_F_PREFIX` はどの経路もダンプしません。
   - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
     `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、
@@ -1157,7 +1171,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     上がっている間、ローカルの表、メインの表の順に引きます。拒む経路に当たれば、その
     エラー（`EINVAL`、`EHOSTUNREACH`、`EACCES`）を返します。IPv4 の答えは、メインの表
     （`RTM_F_LOOKUP_TABLE` を付ければ、経路のあった表）、`fib_select_path` の選ぶ送り元、
-    オンリンクで届くゲートウェイ、呼び出し元の `RTA_UID`（リクエストが指せばそのまま。
+    オンリンクで届くゲートウェイ、リクエストが指した `RTA_MARK`（0 なら付けません）、呼び出し元の `RTA_UID`（リクエストが指せばそのまま。
     -1 なら付けず、4 バイトより短ければ `ERANGE`）を持ちます。`0.0.0.0` は 127.0.0.1 から
     ループバックへ向かいます。IPv6 の答えは、`ipv6_dev_get_saddr` の選ぶ送り元を
     持ちます。経路がなければ `ENETUNREACH`、`AF_UNSPEC` は `EOPNOTSUPP` です。

@@ -10224,6 +10224,19 @@ int main(int argc, char **argv) {
             nl_strict(fd, port, 22, 1, &b, "addr4 index");
             b.bytes[0] = AF_INET6;
             nl_strict(fd, port, 22, 1, &b, "addr6 index");
+            /* AF_MCTP (45) has a dump of its own (mctp_dump_addrinfo), of
+               addresses lo has none of: strictly it needs a whole
+               ifaddrmsg, whatever is in it, and takes any attribute. */
+            b = nl_body(45, 8);
+            nl_strict(fd, port, 22, 1, &b, "addr mctp");
+            b.bytes[1] = 8;
+            b.bytes[3] = 200;
+            index = 5;
+            memcpy(b.bytes + 4, &index, 4);
+            nl_put32(&b, 200, 0);
+            nl_strict(fd, port, 22, 1, &b, "addr mctp filled");
+            b = nl_body(45, 1);
+            nl_strict(fd, port, 22, 1, &b, "addr mctp rtgenmsg");
             index = 100000;
             b = nl_body(0, 8);
             memcpy(b.bytes + 4, &index, 4);
@@ -10328,6 +10341,8 @@ int main(int argc, char **argv) {
             nl_strict(loose, name.pid, 18, 1, &b, "loose link name");
             b = nl_body(128, 1);
             nl_strict(loose, name.pid, 18, 1, &b, "loose ipmr rtgenmsg");
+            b = nl_body(45, 1);
+            nl_strict(loose, name.pid, 22, 1, &b, "loose addr mctp rtgenmsg");
             link = (struct nl_link){.family = 128, .index = 1};
             b = nl_body(128, 16);
             memcpy(b.bytes, &link, 16);

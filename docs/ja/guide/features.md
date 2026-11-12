@@ -1169,6 +1169,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     サブネットの中のアドレス。`IFA_F_SECONDARY` が付きます）は最後です。IPv6 はグローバルな
     ものが先で、新しいものが先です。`lo` が上がるたびに `127.0.0.1/8`（消されていれば）と
     `::1/128` が付き、落とすと IPv6 のアドレスはすべて消えます（`keep_addr_on_down` は 0）。
+    `AF_MCTP` のダンプは、`mctp_dump_addrinfo` と同じく MCTP 自身が扱い、`lo` には MCTP の
+    アドレスがないので何も返しません。検査するときに要るのは `ifaddrmsg` 全体だけで
+    （足りなければ `EINVAL`）、インデックスは `NLM_F_DUMP_FILTERED` を付けずに絞り込みます。
     `RTM_NEWADDR` は、`inet_rtm_newaddr` と `inet6_rtm_newaddr` と同じくアドレスを足します。
     `lo` がすでに持つものは、`NLM_F_EXCL` なしの `NLM_F_REPLACE` でなければ `EEXIST` です。
     `IFA_LOCAL` のない IPv4 のもの、32（IPv6 なら 128）を超える接頭辞、`IFA_LOCAL` も

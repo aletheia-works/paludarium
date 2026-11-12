@@ -1345,7 +1345,11 @@ kernel.
     (an address in a primary's subnet, with `IFA_F_SECONDARY`) last; IPv6's
     global ones first, the newest first. `127.0.0.1/8` comes with each time
     `lo` comes up (should it have been removed) and `::1/128` too; taking
-    `lo` down removes every IPv6 address (`keep_addr_on_down` is 0).
+    `lo` down removes every IPv6 address (`keep_addr_on_down` is 0). An
+    `AF_MCTP` dump has MCTP's own handler, as `mctp_dump_addrinfo`, and
+    shows nothing, as `lo` has no MCTP address; strictly it needs only a
+    whole `ifaddrmsg` (`EINVAL`), whose index narrows it without
+    `NLM_F_DUMP_FILTERED`.
     `RTM_NEWADDR` adds one, as `inet_rtm_newaddr` and `inet6_rtm_newaddr`
     do: `EEXIST` for one `lo` has, unless `NLM_F_REPLACE` without
     `NLM_F_EXCL`; `EINVAL` for an IPv4 one without `IFA_LOCAL` or a prefix

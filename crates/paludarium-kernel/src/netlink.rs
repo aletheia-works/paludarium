@@ -12,7 +12,8 @@
 //! that leaves room sending the next, then `NLMSG_DONE` in a part of its
 //! own (after the last IPv6 address or link, when it has room); an AF_INET6
 //! `RTM_GETLINK` dump shows the loopback as IPv6 does, and an
-//! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table; `RTM_GETLINK`
+//! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table, and an AF_MCTP
+//! `RTM_GETADDR` dump nothing, as `lo` has no MCTP address; `RTM_GETLINK`
 //! without a dump answers for `lo` by index or name, and `RTM_GETROUTE`
 //! without one looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and
 //! remove the loopback's addresses ([`crate::interface`]); `RTM_NEWLINK`
@@ -220,8 +221,9 @@ const IFLA_XDP_ATTACHED: u16 = 2;
 const IFLA_INET_CONF: u16 = 1;
 const IFLA_MCTP_NET: u16 = 1;
 const IFLA_MCTP_PHYS_BINDING: u16 = 2;
-/// `AF_MCTP`, whose settings `IFLA_AF_SPEC` carries too.
-const AF_MCTP: u16 = 45;
+/// `AF_MCTP`, whose settings `IFLA_AF_SPEC` carries too, and whose
+/// address dump is its own.
+const AF_MCTP: u8 = 45;
 const IFLA_INET6_FLAGS: u16 = 1;
 const IFLA_INET6_CONF: u16 = 2;
 const IFLA_INET6_STATS: u16 = 3;
@@ -878,6 +880,10 @@ impl NetlinkSocket {
                 (RTM_GETLINK, RTNL_FAMILY_IPMR) => bare_link_dump_check(payload, strict)
                     .map(|()| vec![ipmr_link_message(seq, port)]),
                 (RTM_GETLINK, _) => link_dump(network, payload, seq, port, strict),
+                // `mctp_dump_addrinfo`: `lo` has no MCTP address.
+                (RTM_GETADDR, AF_MCTP) => {
+                    mctp_address_dump_check(payload, strict).map(|()| Vec::new())
+                }
                 // `rtnl_dump_all` dumps each family's: IPv4's, then IPv6's.
                 (RTM_GETADDR, _) => {
                     address_dump(network, payload, family, seq, port, strict, &mut answer)
@@ -1499,6 +1505,16 @@ fn address_dump(
     }
     Ok(with_flags(messages, flags))
 }
+/// Strictly, an MCTP address dump (`mctp_dump_addrinfo`) needs a whole
+/// `ifaddrmsg` (`EINVAL`), and nothing else: its index only narrows it,
+/// without `NLM_F_DUMP_FILTERED`, and it takes any other field and
+/// attribute. Unchecked, nothing is checked.
+fn mctp_address_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
+    if strict && payload.len() < 8 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
 /// What a route dump shows, as `struct fib_dump_filter`.
 #[derive(Default)]
 struct RouteFilter {
@@ -1829,7 +1845,7 @@ fn af_spec(up: bool, stats: bool) -> Vec<u8> {
     attribute(&mut mctp, IFLA_MCTP_NET, &1u32.to_le_bytes());
     attribute(&mut mctp, IFLA_MCTP_PHYS_BINDING, &[0]);
     let mut spec = Vec::new();
-    attribute(&mut spec, AF_MCTP, &mctp);
+    attribute(&mut spec, u16::from(AF_MCTP), &mctp);
     attribute(&mut spec, u16::from(AF_INET), &inet);
     attribute(&mut spec, u16::from(AF_INET6), &inet6_settings(up, stats));
     spec
@@ -3415,6 +3431,25 @@ mod tests {
             let found = address_dump(&network, bad, 0, 1, 7, true, &mut 0);
             assert_eq!(found, Err(Errno::EINVAL));
         }
+    }
+
+    #[test]
+    fn mctp_address_dumps_check_only_their_length() {
+        // A whole ifaddrmsg, whatever it holds; no attribute is checked.
+        let mut header = vec![AF_MCTP, 8, 1, 200];
+        header.extend_from_slice(&5u32.to_le_bytes());
+        attribute(&mut header, 200, &[1, 2, 3]);
+        assert_eq!(mctp_address_dump_check(&header, true), Ok(()));
+        assert_eq!(mctp_address_dump_check(&header[..8], true), Ok(()));
+        assert_eq!(
+            mctp_address_dump_check(&header[..7], true),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            mctp_address_dump_check(&[AF_MCTP], true),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(mctp_address_dump_check(&[AF_MCTP], false), Ok(()));
     }
 
     /// An `rtmsg` of `family` with `table`, `protocol`, `kind` and

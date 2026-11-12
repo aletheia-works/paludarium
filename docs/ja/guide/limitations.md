@@ -376,7 +376,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `NETLINK_PKTINFO`、`NETLINK_NO_ENOBUFS` など、機能のページに挙げていないオプションは
   `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、`CONFIG_MCTP` を
   組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。組み込んでいない
-  カーネルは載せません。
+  カーネルは載せず、`AF_MCTP` のアドレスのダンプを扱う処理もないので、そのダンプには
+  IPv4 と IPv6 のアドレスを返します。MCTP のアドレスは足せません（`AF_MCTP` の
+  `RTM_NEWADDR` は `EOPNOTSUPP`）。
   IPv4 と IPv6 の設定は、sysctl が組み込みのままのカーネルのものです。Linux の新しい
   名前空間はホストのものを写します。IPv6 の作成時刻は 0、到達可能時間は 30 秒です。
   Linux では乱数で決まります。アドレスの作成時刻は 0 です。`NETLINK_EXT_ACK` はエラーにもダンプの

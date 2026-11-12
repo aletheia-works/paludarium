@@ -6083,9 +6083,9 @@ static int vector_flags_case(void) {
     printf("socket empty=%ld eventfd empty=%ld\n", vf_preadv2(sv[0], got, 8, -1, 0x8),
            vf_preadv2(counter, got, 8, -1, 0x8));
     /* RWF_DONTCACHE needs a file system with it, which a pipe, a socket and
-     * shmem (a memfd) are not; a regular file's depends on the filesystem,
-     * so it is left out. RWF_NOSIGNAL spares a write with no reader its
-     * SIGPIPE, and a read takes it. */
+     * shmem (a memfd) are not; a regular file's is checked above, by its
+     * file system. RWF_NOSIGNAL spares a write with no reader its SIGPIPE,
+     * and a read takes it. */
     int shm = memfd_create("vf", 0);
     long dc_pipe = vf_pwritev2(p[1], "x", 1, -1, 0x80);
     long dc_socket = vf_preadv2(sv[0], got, 1, -1, 0x80);

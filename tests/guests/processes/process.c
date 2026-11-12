@@ -6002,7 +6002,8 @@ static long vf_pwritev2(int fd, const void *buf, size_t len, long offset, long f
 }
 /* preadv2 and pwritev2 with their flags (RWF_DONTCACHE and RWF_NOSIGNAL
  * as Linux master has them), and epoll_pwait2, as Linux 6.12 has it. A
- * regular file's RWF_NOWAIT depends on its filesystem, so it is left out. */
+ * regular file's RWF_NOWAIT and RWF_DONTCACHE depend on its file system, so
+ * they are compared with what fstatfs says that file system takes. */
 static int vector_flags_case(void) {
     char path[] = "/tmp/vector-flags-XXXXXX";
     int fd = mkstemp(path);

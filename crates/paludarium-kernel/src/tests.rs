@@ -6139,7 +6139,12 @@ fn seccomp_filters_refuse_calls_by_their_action() {
     f.thread.state.credentials = root;
     assert_eq!(f.ret(317, &[1, 128, DATA]), errno(Errno::EINVAL));
     assert_eq!(f.ret(317, &[1, 8 | 1, DATA]), errno(Errno::EINVAL));
+    // SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV and, in Linux master,
+    // SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV need a listener.
     assert_eq!(f.ret(317, &[1, 32, DATA]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(317, &[1, 64, DATA]), errno(Errno::EINVAL));
+    // With one, they are known flags: the filter is checked first.
+    assert_eq!(f.ret(317, &[1, 64 | 8, 1]), errno(Errno::EFAULT));
     assert_eq!(f.ret(317, &[0, 0, DATA]), errno(Errno::EINVAL));
     assert_eq!(f.ret(317, &[4, 0, 0]), errno(Errno::EINVAL));
     assert_eq!(f.ret(317, &[1, 0, 1]), errno(Errno::EFAULT));

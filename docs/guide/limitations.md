@@ -301,7 +301,9 @@ verified.
   `umount2` or `pivot_root` (`ENOSYS`), which Linux refuses a thread in a
   domain (`EPERM`).
 - **seccomp**: no listener is made: `SECCOMP_FILTER_FLAG_NEW_LISTENER` is
-  `EINVAL` once the filter is found good, so `SECCOMP_RET_USER_NOTIF` always
+  `EINVAL` once the filter is found good (as is
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` or
+  `SECCOMP_FILTER_FLAG_RESTART_BEFORE_RECV`, Linux master's, without it), so `SECCOMP_RET_USER_NOTIF` always
   gives `ENOSYS`. Nothing is logged (`SECCOMP_FILTER_FLAG_LOG`,
   `SECCOMP_RET_LOG`). Strict mode does not make `rdtsc` fault, as Linux's
   `TIF_NOTSC` does. After `SECCOMP_FILTER_FLAG_TSYNC`, `/proc` shows another

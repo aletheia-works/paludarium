@@ -39,6 +39,7 @@ const FLAG_LOG: u32 = 2;
 const FLAG_NEW_LISTENER: u32 = 8;
 const FLAG_TSYNC_ESRCH: u32 = 16;
 const FLAG_WAIT_KILLABLE_RECV: u32 = 32;
+/// In Linux master's uapi header, after 6.12.
 const FLAG_RESTART_BEFORE_RECV: u32 = 64;
 const FLAG_MASK: u32 = 127;
 

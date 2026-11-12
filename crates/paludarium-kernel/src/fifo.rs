@@ -48,14 +48,36 @@ impl Fifos {
     }
 }
 
-/// Opens the FIFO whose node, `key` on its device, has the status `node`,
-/// with the access and `O_NONBLOCK` of `flags`.
+/// Opens the FIFO at `path`, whose node, `key` on its device, has the
+/// status `node`, with the access and `O_NONBLOCK` of `flags`. Its inotify
+/// watches hear of the open once it is done, and later of its close.
 pub(crate) fn open(
     c: &mut Context<'_>,
+    path: &[u8],
     key: (u64, u64),
     node: &FileStat,
     flags: u32,
 ) -> Result<Arc<dyn FileHandle>, Errno> {
+    let description = join(c, key, node, flags)?;
+    if let Some(closing) = crate::inotify::Closing::opened(
+        &c.files.caches.notify,
+        &c.files.fs,
+        path,
+        key.0,
+        node,
+        flags,
+    ) {
+        description.notify_close(closing);
+    }
+    Ok(description)
+}
+/// The description [`open`] makes, once the other end is there.
+fn join(
+    c: &mut Context<'_>,
+    key: (u64, u64),
+    node: &FileStat,
+    flags: u32,
+) -> Result<Arc<PipeEnd>, Errno> {
     let access = flags & 3;
     if access == 3 {
         return Err(Errno::EINVAL);
@@ -95,7 +117,7 @@ pub(crate) fn open(
         (description, waiting_for)
     };
     let Some((reader, seen)) = waiting_for else {
-        return Ok(description as Arc<dyn FileHandle>);
+        return Ok(description);
     };
     loop {
         {
@@ -103,7 +125,7 @@ pub(crate) fn open(
             let fifo = table.entry(key).or_default();
             let count = if reader { fifo.readers } else { fifo.writers };
             if count != seen || fifo.has(reader) {
-                return Ok(description as Arc<dyn FileHandle>);
+                return Ok(description);
             }
         }
         // A signal ends the wait, and the description with it.

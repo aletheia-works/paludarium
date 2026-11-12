@@ -8,7 +8,7 @@ use paludarium_types::Errno;
 use paludarium_types::GuestAddr;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 // Per-stream flow-control window, not a per-guest memory/fd quota. Native
 // queue capacity and packet accounting depend on the host; the oracle compares
@@ -55,6 +55,9 @@ pub(crate) struct PipeEnd {
     /// This description's owner and `O_ASYNC`, which the sides it reads or
     /// writes signal ([`Side`]'s `descriptions`).
     signalling: Arc<Mutex<Signalling>>,
+    /// For a FIFO's description that a path opened, what tells its inotify
+    /// watches of its close.
+    closing: OnceLock<crate::inotify::Closing>,
 }
 /// What `fchmod` and `fchown` change on the inode of a pipe or a socket, as
 /// Linux's `simple_setattr` keeps them: the mode, whose file type stays, and
@@ -322,6 +325,7 @@ impl PipeEnd {
                 ends: Arc::clone(&ends),
                 writer: None,
                 signalling: Arc::default(),
+                closing: OnceLock::new(),
             },
             Self {
                 endpoint: writer,
@@ -332,6 +336,7 @@ impl PipeEnd {
                 ends,
                 writer: None,
                 signalling: Arc::default(),
+                closing: OnceLock::new(),
             },
         ];
         Ok(ends.map(|end| {
@@ -341,6 +346,10 @@ impl PipeEnd {
     }
 }
 impl PipeEnd {
+    /// Keeps what tells this FIFO description's watches of its close.
+    pub(crate) fn notify_close(&self, closing: crate::inotify::Closing) {
+        let _ = self.closing.set(closing);
+    }
     /// [`FileHandle::reopen`], as the pipe end itself, which a FIFO keeps.
     pub(crate) fn open_again(&self, flags: u32) -> Result<Arc<Self>, Errno> {
         const ENXIO: Errno = Errno(6);
@@ -359,6 +368,7 @@ impl PipeEnd {
             ends: Arc::clone(&self.ends),
             writer,
             signalling: Arc::default(),
+            closing: OnceLock::new(),
         };
         description.listen();
         Ok(Arc::new(description))

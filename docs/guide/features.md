@@ -1873,7 +1873,15 @@ kernel.
   `IN_ACCESS` or `IN_MODIFY` for a `read`, `write`, `pread64`, `pwrite64`,
   `readv`, `writev`, `preadv`, `pwritev`, `preadv2` or `pwritev2` that moved
   bytes, `sendfile` and `copy_file_range` (the input's, then the output's),
-  `fallocate`, and each `getdents` and `getdents64`. A watch with `IN_EXCL_UNLINK` does not
+  `fallocate`, and each `getdents` and `getdents64`; a `splice` that moved
+  bytes is the output's `IN_MODIFY`, then the input's `IN_ACCESS`, a `tee`
+  the input's, then the output's, and a `vmsplice` a write end's `IN_MODIFY`
+  or a read end's `IN_ACCESS`. A pipe has no watches, but a FIFO opened by
+  its path is an open file like the others: `IN_OPEN` once the open is done
+  (one that fails, such as a writer's `ENXIO`, is none), `IN_CLOSE_WRITE`
+  or `IN_CLOSE_NOWRITE` at its description's last close, and its reads and
+  writes for its own watches only, which Linux keeps from its directory's
+  (`d_is_special`). A watch with `IN_EXCL_UNLINK` does not
   hear of the open, close, read or write of a file through a name unlinked
   since it was opened (by `unlink`, `rmdir` or a rename onto it), even while
   another link keeps the file; `truncate`, `mknod` and starting a program

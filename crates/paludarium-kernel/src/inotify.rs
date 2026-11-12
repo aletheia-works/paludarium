@@ -132,6 +132,74 @@ pub(crate) fn unnoticed<T>(f: impl FnOnce() -> T) -> T {
     value
 }
 
+/// The open of a FIFO by its path, which Linux's `fifo_open` makes an
+/// ordinary open file: its watches heard `IN_OPEN` (`fsnotify_open`) when
+/// it opened, and hear `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`
+/// (`fsnotify_close`) when the last descriptor of the description closes,
+/// which drops this. They go to the name it was opened at.
+pub(crate) struct Closing {
+    notify: Arc<Notifier>,
+    fs: Arc<dyn FileSystem>,
+    path: Vec<u8>,
+    device: u64,
+    node: FileStat,
+    writing: bool,
+}
+impl Closing {
+    /// Tells the watches of the guest's open of the FIFO `node` at `path`
+    /// with `flags`, and gives what tells them of its close: none for an
+    /// open the kernel makes on its own account.
+    pub(crate) fn opened(
+        notify: &Arc<Notifier>,
+        fs: &Arc<dyn FileSystem>,
+        path: &[u8],
+        device: u64,
+        node: &FileStat,
+        flags: u32,
+    ) -> Option<Self> {
+        if !reported_open() {
+            return None;
+        }
+        let closing = Self {
+            notify: Arc::clone(notify),
+            fs: Arc::clone(fs),
+            path: path.to_vec(),
+            device,
+            node: *node,
+            writing: flags & 3 != 0,
+        };
+        closing.tell(OPEN);
+        Some(closing)
+    }
+    fn tell(&self, mask: u32) {
+        if !self.notify.watching() {
+            return;
+        }
+        // The links the node has now: none once its name is gone, or names
+        // another file.
+        let mut node = self.node;
+        node.links = match self.fs.metadata(&self.path, false) {
+            Ok(now) if now.inode == node.inode => now.links,
+            _ => 0,
+        };
+        self.notify.file_event(
+            Some((&*self.fs, &self.path, false)),
+            self.device,
+            &node,
+            mask,
+        );
+    }
+}
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.tell(if self.writing {
+            CLOSE_WRITE
+        } else {
+            CLOSE_NOWRITE
+        });
+    }
+}
+
 /// The instances of one machine, which every change is told to.
 #[derive(Default)]
 pub(crate) struct Notifier {

@@ -4541,6 +4541,91 @@ mod inotify {
             .collect()
     }
     #[test]
+    fn a_fifo_a_path_opened_and_splices_are_heard_of() {
+        let mut f = fixture();
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let q = put(&f, DATA, b"/tmp/q");
+        let p = put(&f, DATA + 0x20, b"/tmp/q/p");
+        let lone = put(&f, DATA + 0x40, b"/tmp/q/l");
+        let file = put(&f, DATA + 0x60, b"/tmp/q/f");
+        let bytes = put(&f, DATA + 0x80, b"xy");
+        let iov = DATA + 0xa0;
+        f.mem.write(GuestAddr(iov), &bytes.to_le_bytes()).unwrap();
+        f.mem
+            .write(GuestAddr(iov + 8), &1u64.to_le_bytes())
+            .unwrap();
+        let off = DATA + 0xc0;
+        f.mem.write(GuestAddr(off), &0u64.to_le_bytes()).unwrap();
+        let pipe = DATA + 0xd0;
+        assert_eq!(f.ret(83, &[q, 0o700]), 0);
+        assert_eq!(f.ret(133, &[p, 0o010644, 0]), 0);
+        assert_eq!(f.ret(133, &[lone, 0o010644, 0]), 0);
+        let reg = f.ret(2, &[file, 0o102, 0o600]);
+        assert_eq!(f.ret(1, &[reg, bytes, 2]), 2);
+        assert_eq!(f.ret(22, &[pipe]), 0);
+        let mut ends = [0; 8];
+        f.mem.read(GuestAddr(pipe), &mut ends).unwrap();
+        let pipe_w = u64::from(u32::from_le_bytes(ends[4..].try_into().unwrap()));
+        let wd = f.ret(ADD, &[fd, q, 0xfff]) as i32;
+        let own = f.ret(ADD, &[fd, p, 0xfff]) as i32;
+        // IN_OPEN once the open is done, for the directory and the FIFO; a
+        // writer with no reader (ENXIO) opens nothing.
+        assert_eq!(f.ret(2, &[lone, 0o4001, 0]), errno(Errno(6)));
+        let r = f.ret(2, &[p, 0o4002, 0]);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x20, &b"p"[..]), (own, 0x20, b"")]
+        );
+        // Reads and writes are the FIFO's own (`d_is_special`).
+        assert_eq!(f.ret(1, &[r, bytes, 1]), 1);
+        assert_eq!(f.ret(0, &[r, DATA + 0x100, 1]), 1);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(own, 0x2, &b""[..]), (own, 0x1, b"")]
+        );
+        // splice tells the output first, then the input.
+        assert_eq!(f.ret(275, &[reg, off, r, 0, 2, 0]), 2);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(own, 0x2, &b""[..]), (wd, 0x1, b"f")]
+        );
+        assert_eq!(f.ret(275, &[r, 0, reg, off, 1, 0]), 1);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x2, &b"f"[..]), (own, 0x1, b"")]
+        );
+        // tee the input, then the output (a pipe, which has no watches).
+        assert_eq!(f.ret(276, &[r, pipe_w, 1, 0]), 1);
+        assert_eq!(masks(&events(&mut f, fd)), [(own, 0x1, &b""[..])]);
+        // vmsplice into a description open for writing modifies it.
+        assert_eq!(f.ret(278, &[r, iov, 1, 0]), 1);
+        assert_eq!(masks(&events(&mut f, fd)), [(own, 0x2, &b""[..])]);
+        // One that moves nothing is no event.
+        assert_eq!(f.ret(275, &[reg, off, r, 0, 0, 0]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        // The last close of the description: IN_CLOSE_WRITE, as O_RDWR.
+        let dup = f.ret(32, &[r]);
+        assert_eq!(f.ret(3, &[r]), 0);
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        assert_eq!(f.ret(3, &[dup]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x8, &b"p"[..]), (own, 0x8, b"")]
+        );
+        // A reader's is IN_CLOSE_NOWRITE.
+        let reader = f.ret(2, &[p, 0o4000, 0]);
+        assert_eq!(f.ret(3, &[reader]), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (wd, 0x20, &b"p"[..]),
+                (own, 0x20, b""),
+                (wd, 0x10, b"p"),
+                (own, 0x10, b"")
+            ]
+        );
+    }
+    #[test]
     fn the_calls_are_checked_in_linuxs_order() {
         let mut f = fixture();
         assert_eq!(f.ret(INIT1, &[1]), errno(Errno::EINVAL));

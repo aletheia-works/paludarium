@@ -2578,12 +2578,27 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// The inotify events of a call that read or wrote files, as Linux's
 /// `fsnotify_access` and `fsnotify_modify` follow them: a read or write that
 /// moved bytes, `sendfile` and `copy_file_range` (the input's, then the
-/// output's), a `fallocate` that succeeded, and every `getdents` and
+/// output's), `splice` (the output's first, as `do_splice` has it), `tee`
+/// and `vmsplice` that moved bytes (a write end's `IN_MODIFY`, a read end's
+/// `IN_ACCESS`), a `fallocate` that succeeded, and every `getdents` and
 /// `getdents64` that reached `iterate_dir` (one with too small a buffer too).
+/// A pipe has no watches, but a FIFO that a path opened does.
 fn accessed(c: &Context<'_>, n: u64, a: [u64; 6], result: &Result<u64, Errno>) {
     use crate::inotify::{ACCESS, MODIFY};
     let moved = matches!(result, Ok(v) if *v > 0);
+    let vmspliced;
     let events: &[(u64, u32)] = match n {
+        275 if moved => &[(a[2], MODIFY), (a[0], ACCESS)],
+        276 if moved => &[(a[0], ACCESS), (a[1], MODIFY)],
+        // `vmsplice_to_pipe` for a descriptor open for writing.
+        278 if moved => {
+            let writes = c
+                .files
+                .descriptor(a[0])
+                .is_ok_and(|d| d.file.flags() & 3 != 0);
+            vmspliced = [(a[0], if writes { MODIFY } else { ACCESS })];
+            &vmspliced
+        }
         0 | 17 | 19 | 295 | 327 if moved => &[(a[0], ACCESS)],
         1 | 18 | 20 | 296 | 328 if moved => &[(a[0], MODIFY)],
         40 if moved => &[(a[1], ACCESS), (a[0], MODIFY)],
@@ -4704,7 +4719,7 @@ fn open_path(
                 return Err(Errno::ENOTDIR);
             }
             let key = (device(c, p), node.inode);
-            return Ok((crate::fifo::open(c, key, &node, flags)?, p.to_vec()));
+            return Ok((crate::fifo::open(c, p, key, &node, flags)?, p.to_vec()));
         }
         let file = c.files.fs.open(p, flags, mode & !c.files.umask())?;
         const O_TRUNC: u32 = 0o1000;

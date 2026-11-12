@@ -328,9 +328,12 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: opening a FIFO by its path, running a program
-  (which Linux reports as `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`),
-  `splice` and `io_uring`'s reads and writes are no events. A change through a
+- **inotify, in part**: running a program (which Linux reports as
+  `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`) is no event. The events
+  of a FIFO opened by its path go to the name it was opened at, whatever
+  renames it since, and opening one no name links any more again through
+  `/proc/self/fd` shares its description, with no `IN_OPEN`, where Linux
+  opens a new one. A change through a
   descriptor (`fchmod`, `ftruncate`, a read, a write or a close) follows
   renames of the file, of the directories above it and onto it, as Linux's
   dentry does, but the symbolic links of the path it was opened at are

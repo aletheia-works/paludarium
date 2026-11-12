@@ -1639,7 +1639,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   まで参照を持ちます）。バイトを動かした `read`、`write`、`pread64`、`pwrite64`、
   `readv`、`writev`、`preadv`、`pwritev`、`preadv2`、`pwritev2`、`sendfile` と
   `copy_file_range`（入力の後に出力）、`fallocate`、毎回の `getdents` と `getdents64` は
-  `IN_ACCESS` か `IN_MODIFY` です。`IN_EXCL_UNLINK` のウォッチは、開いた後に
+  `IN_ACCESS` か `IN_MODIFY` です。バイトを動かした `splice` は出力の `IN_MODIFY` の後に
+  入力の `IN_ACCESS`、`tee` は入力の後に出力、`vmsplice` は書き込み側なら `IN_MODIFY`、
+  読み込み側なら `IN_ACCESS` です。パイプにはウォッチがありませんが、パスで開いた FIFO は
+  ほかと同じ開いたファイルです。開き終えると `IN_OPEN`（書き手の `ENXIO` のように失敗した
+  ものは何もなし）、ファイル記述の最後のクローズで `IN_CLOSE_WRITE` か `IN_CLOSE_NOWRITE`
+  です。読み書きは FIFO 自身のウォッチだけに届き、Linux と同じくディレクトリのウォッチには
+  届きません（`d_is_special`）。`IN_EXCL_UNLINK` のウォッチは、開いた後に
   （`unlink`、`rmdir`、上書きする rename で）消えた名前を通してファイルを開く・閉じる・
   読み書きすることを受けません。別のリンクがファイルを残していても同じです。
   `truncate`、`mknod`、プログラムの起動は何も開きません。ファイルの変更は、そのディレクトリのウォッチに

@@ -824,6 +824,67 @@ static int case_moved(void) {
     remove_all();
     return 0;
 }
+/* A FIFO opened by its path is an open file: IN_OPEN once the open is done
+ * and IN_CLOSE_* when its description closes, for the directory and the
+ * FIFO, and its reads and writes for the FIFO only. splice, tee and
+ * vmsplice tell what they moved bytes through. */
+static int case_fifo(void) {
+    make_base("fifo");
+    int fd = inotify_init1(IN_NONBLOCK);
+    char *fifo = at("p");
+    char *lone = at("l");
+    char *file = at("f");
+    printf("mkfifo=%ld %ld\n", e(mkfifo(fifo, 0644)), e(mkfifo(lone, 0644)));
+    int reg = open(file, O_RDWR | O_CREAT, 0644);
+    printf("write=%ld\n", (long)write(reg, "xy", 2));
+    int pipes[2];
+    if (pipe(pipes)) return 92;
+    int wd = inotify_add_watch(fd, base, WATCHED);
+    int own = inotify_add_watch(fd, fifo, WATCHED);
+    printf("wd=%d own=%d\n", wd, own);
+    printf("lone writer=%ld\n", e(open(lone, O_WRONLY | O_NONBLOCK)));
+    drain(fd, "enxio");
+    int r = open(fifo, O_RDWR | O_NONBLOCK);
+    drain(fd, "opened");
+    long wrote = write(r, "a", 1);
+    char got;
+    printf("write=%ld read=%ld\n", wrote, (long)read(r, &got, 1));
+    drain(fd, "rw");
+    loff_t off = 0;
+    printf("splice in=%ld\n", e(splice(reg, &off, r, NULL, 2, 0)));
+    drain(fd, "spliced-in");
+    printf("splice out=%ld\n", e(splice(r, NULL, reg, &off, 1, 0)));
+    drain(fd, "spliced-out");
+    printf("tee=%ld\n", e(tee(r, pipes[1], 1, 0)));
+    drain(fd, "teed");
+    struct iovec iov = {"z", 1};
+    printf("vmsplice=%ld\n", e(vmsplice(r, &iov, 1, 0)));
+    drain(fd, "vmspliced");
+    printf("splice none=%ld\n", e(splice(reg, &off, r, NULL, 0, 0)));
+    drain(fd, "none");
+    int dup_r = dup(r);
+    close(r);
+    drain(fd, "one-closed");
+    close(dup_r);
+    drain(fd, "closed");
+    int reader = open(fifo, O_RDONLY | O_NONBLOCK);
+    char buf[4];
+    printf("empty read=%ld\n", e(read(reader, buf, sizeof buf)));
+    int writer = open(fifo, O_WRONLY | O_NONBLOCK);
+    printf("write=%ld\n", (long)write(writer, "b", 1));
+    struct iovec back = {buf, sizeof buf};
+    printf("vmsplice read=%ld\n", e(vmsplice(reader, &back, 1, 0)));
+    close(writer);
+    close(reader);
+    drain(fd, "reader");
+    close(pipes[0]);
+    close(pipes[1]);
+    close(reg);
+    close(fd);
+    remove_all();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -840,6 +901,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-running")) return case_running();
     if (!strcmp(mode, "inotify-interpreter")) return case_interpreter();
     if (!strcmp(mode, "inotify-moved")) return case_moved();
+    if (!strcmp(mode, "inotify-fifo")) return case_fifo();
     if (!strcmp(mode, "inotify-runner")) return case_runner();
     return 2;
 }

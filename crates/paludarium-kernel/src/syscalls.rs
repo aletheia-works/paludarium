@@ -1841,6 +1841,9 @@ fn is_zero_device(file: &dyn FileHandle) -> bool {
 
 const MADV_DONTNEED: u64 = 4;
 const MADV_FREE: u64 = 8;
+const MADV_POPULATE_READ: u64 = 22;
+const MADV_POPULATE_WRITE: u64 = 23;
+const MADV_DONTNEED_LOCKED: u64 = 24;
 
 /// `mincore(addr, length, vec)`, as Linux's: each byte of `vec` says whether
 /// its page is in memory, up to the first page that is not mapped, which is
@@ -1992,12 +1995,17 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// `madvise(addr, len, advice)` on `mem`, which `process_madvise` gives
-/// each of its ranges of the caller's own memory too.
+/// each of its ranges of the caller's own memory too. Implemented are the
+/// access-pattern hints and `MADV_WILLNEED`; `MADV_COLD` and
+/// `MADV_PAGEOUT`, which nothing to reclaim makes hints too; KSM's
+/// `MADV_MERGEABLE` and `MADV_UNMERGEABLE` and THP's `MADV_HUGEPAGE` and
+/// `MADV_NOHUGEPAGE`, which change only flags no page here depends on; the
+/// discards `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` (no VMA is locked
+/// apart) and `MADV_FREE`; and `MADV_POPULATE_READ` and
+/// `MADV_POPULATE_WRITE` ([`populate`]). The others are rejected rather
+/// than ignored, so that a guest relying on one of them notices.
 pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Result<(), Errno> {
-    // Of the advice values, only the access-pattern hints and the two that
-    // give memory back are implemented; the others are rejected rather than
-    // ignored, so that a guest relying on one of them notices.
-    if !matches!(advice, 0..=3 | MADV_DONTNEED | MADV_FREE) {
+    if !matches!(advice, 0..=4 | 8 | 12..=15 | 20..=24) {
         return Err(Errno::EINVAL);
     }
     if addr & 4095 != 0 {
@@ -2015,8 +2023,11 @@ pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Re
     if end > USER_ADDRESS_LIMIT {
         return Err(Errno::ENOMEM);
     }
-    if advice == MADV_DONTNEED {
+    if advice == MADV_DONTNEED || advice == MADV_DONTNEED_LOCKED {
         return mem.discard_shared(GuestAddr(addr), length);
+    }
+    if advice == MADV_POPULATE_READ || advice == MADV_POPULATE_WRITE {
+        return populate(mem, addr, end, advice == MADV_POPULATE_WRITE);
     }
     if advice == MADV_FREE {
         // Linux frees such pages only under memory pressure, which the
@@ -2036,6 +2047,48 @@ pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Re
     } else {
         Ok(())
     }
+}
+
+/// `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` of `[addr, end)`, as
+/// Linux's `madvise_populate` faults the pages in a page at a time: a page
+/// no mapping holds ends it with `ENOMEM`, one whose mapping may not be read
+/// (or, with `write`, written) with `EINVAL`, and one that cannot be
+/// brought in (past the end of its file, `SIGBUS`) with `EFAULT`, after the
+/// pages before it. A read maps what a read would (the zero page of
+/// private anonymous memory); a write breaks copy-on-write as a write
+/// would, and leaves the bytes as they are.
+fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), Errno> {
+    let mut at = addr;
+    while at < end {
+        let Some(mapping) = mem.mappings().find(|m| m.start.0 <= at && at < m.end()) else {
+            return Err(Errno::ENOMEM);
+        };
+        let needed = if write { Prot::WRITE } else { Prot::READ };
+        if !mapping.prot.contains(needed) {
+            return Err(Errno::EINVAL);
+        }
+        let stop = mapping.end().min(end);
+        while at < stop {
+            let faulted = if write {
+                mem.atomic(
+                    GuestAddr(at),
+                    paludarium_mmu::AtomicWidth::W8,
+                    paludarium_mmu::AtomicOp::Add(0),
+                )
+                .is_ok()
+            } else {
+                mem.read(GuestAddr(at), &mut [0]).is_ok()
+            };
+            if !faulted {
+                return Err(Errno::EFAULT);
+            }
+            if write {
+                mem.mark_written(GuestAddr(at), 1);
+            }
+            at += 4096;
+        }
+    }
+    Ok(())
 }
 
 /// `map_shadow_stack(addr, size, flags)`, as Linux's on a CPU without

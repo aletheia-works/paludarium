@@ -675,7 +675,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書き換えた読み込み専用のセグメント（コード）も同じです。残り（`.bss`）は無名の
   メモリで、0 として読めます。共有メモリは自分の中身を保ちます。`MADV_FREE` では
   中身を残します。メモリが足りているときの Linux と同じです。
-  アクセスの仕方のヒントは受け付け、ほかの指定には `EINVAL` を返します。
+  アクセスの仕方のヒントと `MADV_WILLNEED` を受け付けます。`MADV_COLD` と
+  `MADV_PAGEOUT`（回収するものがないので、これもヒントです）、`MADV_MERGEABLE`、
+  `MADV_UNMERGEABLE`、`MADV_HUGEPAGE`、`MADV_NOHUGEPAGE`（そのフラグでページは
+  変わりません）も受け付け、どれも範囲がマップされていれば足ります（`ENOMEM`）。
+  `MADV_DONTNEED_LOCKED` は `MADV_DONTNEED` と同じく捨てます。`MADV_POPULATE_READ` と
+  `MADV_POPULATE_WRITE` は、読み込みや書き込みと同じようにページを割り当てます
+  （ゼロページ、自分のページ）。どのマッピングにもないページ（`ENOMEM`）、マッピングが
+  読めないか書けないページ（`EINVAL`）、ファイルの終わりより先のページ（`EFAULT`）で
+  止まります。ほかの指定には `EINVAL` を返します。
 - `process_madvise` は、iovec の範囲を順に指定どおりにします。呼んだプロセス自身の
   メモリ（`PIDFD_SELF_THREAD`、`PIDFD_SELF_THREAD_GROUP`、自身かメモリを共有する
   プロセスの pidfd）には `madvise` と同じようにします。結果は、最初に失敗した範囲より

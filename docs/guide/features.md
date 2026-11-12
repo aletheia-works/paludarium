@@ -751,7 +751,16 @@ kernel.
   written, while the rest (`.bss`) is anonymous memory and reads as zeros.
   Shared memory keeps its own contents. `MADV_FREE` keeps the contents, as
   Linux does without memory pressure.
-  The access-pattern hints are accepted and other advice gives `EINVAL`.
+  The access-pattern hints and `MADV_WILLNEED` are accepted, and so are
+  `MADV_COLD` and `MADV_PAGEOUT` (with nothing to reclaim, hints too),
+  `MADV_MERGEABLE`, `MADV_UNMERGEABLE`, `MADV_HUGEPAGE` and
+  `MADV_NOHUGEPAGE`, whose flags no page here depends on: each needs only
+  the range mapped (`ENOMEM`). `MADV_DONTNEED_LOCKED` discards as
+  `MADV_DONTNEED` does. `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`
+  fault the pages in, as a read or a write would (the zero page, a page of
+  its own), up to a page no mapping holds (`ENOMEM`), one its mapping may
+  not read or write (`EINVAL`), or one past the end of its file (`EFAULT`).
+  Other advice gives `EINVAL`.
 - `process_madvise` advises each range of its iovecs in turn, of the caller's
   memory (`PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP`, or a pidfd of its
   own process or of one sharing its memory) as `madvise` does, and gives the

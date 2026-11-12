@@ -6351,6 +6351,105 @@ mod kcmp {
         assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), errno(Errno::ENOENT));
     }
 }
+mod madvise_advice {
+    use super::*;
+    const AREA: u64 = DATA + 0x10_0000;
+    const PAGE: u64 = 4096;
+    fn status(f: &mut Fixture, at: u64) -> i32 {
+        f.mem.write_u64(GuestAddr(DATA + 0x200), at).unwrap();
+        assert_eq!(f.ret(279, &[0, 1, DATA + 0x200, 0, DATA + 0x300, 0]), 0);
+        f.mem.read_u64(GuestAddr(DATA + 0x300)).unwrap() as i32
+    }
+    #[test]
+    fn hints_need_only_a_mapping() {
+        let mut f = fixture();
+        f.mem
+            .map(
+                Some(GuestAddr(AREA)),
+                2 * PAGE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        f.mem.write(GuestAddr(AREA), &[7]).unwrap();
+        for advice in [12, 13, 14, 15, 20, 21] {
+            assert_eq!(f.ret(28, &[AREA, 2 * PAGE, advice]), 0, "{advice}");
+            assert_eq!(f.ret(28, &[AREA, 3 * PAGE, advice]), errno(Errno::ENOMEM));
+        }
+        let mut byte = [0];
+        f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
+        assert_eq!(byte, [7]);
+        // Still refused: the fork, dump and guard advice, and unknown ones.
+        for advice in [9, 10, 11, 16, 17, 18, 19, 25, 100, 101, 102, 103, 26] {
+            assert_eq!(
+                f.ret(28, &[AREA, PAGE, advice]),
+                errno(Errno::EINVAL),
+                "{advice}"
+            );
+        }
+        // MADV_DONTNEED_LOCKED discards.
+        assert_eq!(f.ret(28, &[AREA, PAGE, 24]), 0);
+        assert_eq!(status(&mut f, AREA), -2);
+    }
+    #[test]
+    fn populate_faults_pages_in_until_one_cannot_be() {
+        let mut f = fixture();
+        let m = &mut f.mem;
+        m.map(
+            Some(GuestAddr(AREA)),
+            3 * PAGE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        m.map(
+            Some(GuestAddr(AREA + 4 * PAGE)),
+            PAGE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        m.map(
+            Some(GuestAddr(AREA + 6 * PAGE)),
+            PAGE,
+            Prot::READ,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        m.map(
+            Some(GuestAddr(AREA + 8 * PAGE)),
+            PAGE,
+            Prot::NONE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        // A read maps the zero page, a write a page of its own.
+        assert_eq!(f.ret(28, &[AREA, PAGE, 22]), 0);
+        assert_eq!(status(&mut f, AREA), -14);
+        f.mem.write(GuestAddr(AREA + 2 * PAGE), &[5]).unwrap();
+        assert_eq!(f.ret(28, &[AREA + PAGE, 2 * PAGE, 23]), 0);
+        assert_eq!(status(&mut f, AREA + PAGE), 0);
+        let mut byte = [0];
+        f.mem.read(GuestAddr(AREA + 2 * PAGE), &mut byte).unwrap();
+        assert_eq!(byte, [5]);
+        // A hole after a page: that page, then ENOMEM.
+        assert_eq!(
+            f.ret(28, &[AREA + 4 * PAGE, 2 * PAGE, 22]),
+            errno(Errno::ENOMEM)
+        );
+        assert_eq!(status(&mut f, AREA + 4 * PAGE), -14);
+        // A mapping that may not be read, or written.
+        assert_eq!(
+            f.ret(28, &[AREA + 8 * PAGE, PAGE, 22]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(
+            f.ret(28, &[AREA + 6 * PAGE, PAGE, 23]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(f.ret(28, &[AREA + 6 * PAGE, PAGE, 22]), 0);
+    }
+}
 mod page_nodes {
     use super::*;
     const AREA: u64 = DATA + 0x10_0000;

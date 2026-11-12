@@ -205,6 +205,13 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
+  - `madvise` refuses (`EINVAL`) the advice that changes `fork` or core
+    dumps (`MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK`,
+    `MADV_KEEPONFORK`, `MADV_DONTDUMP`, `MADV_DODUMP`), `MADV_REMOVE`,
+    `MADV_COLLAPSE`, the guard regions (`MADV_GUARD_INSTALL`,
+    `MADV_GUARD_REMOVE`) and `MADV_HWPOISON` and `MADV_SOFT_OFFLINE`, which
+    Linux takes. `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` bring in the
+    pages of a `memfd_secret` mapping, where Linux gives `EINVAL`.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
     mapped. It refuses advice Linux does not know before any range
@@ -271,7 +278,7 @@ verified.
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
   - Memory locks leave no state. So `RLIMIT_MEMLOCK` is not enforced on
     them (only on `SHM_LOCK`), which matters only to a guest that gave up
-    `CAP_IPC_LOCK`, `MADV_DONTNEED` works on
+    `CAP_IPC_LOCK`, `MADV_DONTNEED`, `MADV_COLD` and `MADV_PAGEOUT` work on
     locked memory where Linux gives `EINVAL`, `mlock` succeeds on the pages of a
     file mapping past the end of the file where Linux gives `ENOMEM`, and
     `/proc` shows no locked memory.

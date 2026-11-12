@@ -33,6 +33,7 @@
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},
     {"name":"landlock","binary":"process"},
+    {"name":"madvise-advice","binary":"process"},
     {"name":"mempolicy","binary":"process"},
     {"name":"memfd-secret","binary":"process"},
     {"name":"ids","binary":"process"},

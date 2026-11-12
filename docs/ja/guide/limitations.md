@@ -178,6 +178,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ファイルシステムによらず ext4 と同じく `RWF_NOWAIT` と `RWF_DONTCACHE` を受け付けます。
     Linux のホストで見分けるのは ext4、xfs、btrfs、f2fs だけです（ほかのファイルシステムは
     どちらも断ります）。
+  - `madvise` は、Linux が受け付ける次の指定を断ります（`EINVAL`）。`fork` やコアダンプを
+    変える指定（`MADV_DONTFORK`、`MADV_DOFORK`、`MADV_WIPEONFORK`、`MADV_KEEPONFORK`、
+    `MADV_DONTDUMP`、`MADV_DODUMP`）、`MADV_REMOVE`、`MADV_COLLAPSE`、ガード領域
+    （`MADV_GUARD_INSTALL`、`MADV_GUARD_REMOVE`）、`MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。
+    `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は、`memfd_secret` のマッピングのページも
+    割り当てます。Linux では `EINVAL` です。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか
     受け付けず、ほかのプロセスの範囲はマップされているかを確かめるだけです。Linux が知らない
     指定は、Linux master と同じく範囲を見る前に断ります（`EINVAL`）。CI のカーネルは範囲ごとに
@@ -235,7 +241,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - メモリのロックは状態を残しません。そのためロックには `RLIMIT_MEMLOCK` を適用
     しません（適用するのは `SHM_LOCK` だけで、`CAP_IPC_LOCK` を手放したゲストにだけ
     関係します）。ロックしたメモリへの
-    `MADV_DONTNEED` は、Linux の `EINVAL` と違って成功します。ファイルの終わりより後ろの
+    `MADV_DONTNEED`、`MADV_COLD`、`MADV_PAGEOUT` は、Linux の `EINVAL` と違って成功します。ファイルの終わりより後ろの
     ファイルのマッピングのページへの `mlock` は、Linux の `ENOMEM` と違って成功します。
     `/proc` にもロックしたメモリは出ません。
   - 共有のマッピングに `mbind` で付けたメモリのポリシーは、そのマッピングのものに

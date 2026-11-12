@@ -5966,6 +5966,73 @@ static void pkey_show(const char *label, long r) {
 static volatile sig_atomic_t itimer_fired;
 static void itimer_alarm(int sig) { (void)sig; itimer_fired++; }
 static long itimer_errno(long r) { return r < 0 ? -errno : r; }
+/* madvise's hints and MADV_POPULATE_READ/WRITE, seen through move_pages
+ * (279), which tells an untouched page (-ENOENT) from the zero page
+ * (-EFAULT) and a page of its own (0), and through the bytes. */
+static long advice_errno(long r) { return r < 0 ? -errno : r; }
+static int advice_status(void *at) {
+    int status = 99;
+    void *pages[1] = {at};
+    if (syscall(279, 0L, 1L, pages, NULL, &status, 0L)) return -999;
+    return status;
+}
+static int madvise_advice_case(void) {
+    long page = 4096;
+    char *p = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *gap = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *none = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *ro = mmap(NULL, page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *shared = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED || gap == MAP_FAILED || none == MAP_FAILED || ro == MAP_FAILED ||
+        shared == MAP_FAILED)
+        return 80;
+    munmap(gap + page, page);
+    /* Hints: whatever is mapped takes them, a hole is ENOMEM. */
+    p[3 * page] = 7;
+    const int hints[] = {MADV_COLD, MADV_PAGEOUT, MADV_MERGEABLE, MADV_UNMERGEABLE, MADV_HUGEPAGE,
+                         MADV_NOHUGEPAGE};
+    const char *names[] = {"cold", "pageout", "mergeable", "unmergeable", "hugepage", "nohugepage"};
+    for (int i = 0; i < 6; i++) {
+        long all = advice_errno(madvise(p, 4 * page, hints[i]));
+        long hole = advice_errno(madvise(gap, 3 * page, hints[i]));
+        long read_only = advice_errno(madvise(ro, page, hints[i]));
+        printf("%s=%ld hole=%ld read-only=%ld\n", names[i], all, hole, read_only);
+    }
+    printf("kept=%d\n", p[3 * page]);
+    /* MADV_POPULATE_READ maps the zero page; MADV_POPULATE_WRITE a page of
+     * its own, keeping its bytes. */
+    long r = advice_errno(madvise(p, page, 22));
+    printf("populate-read=%ld status=%d next=%d\n", r, advice_status(p), advice_status(p + page));
+    p[2 * page] = 5;
+    r = advice_errno(madvise(p + page, 2 * page, 23));
+    printf("populate-write=%ld status=%d bytes=%d %d\n", r, advice_status(p + page), p[page],
+           p[2 * page]);
+    r = advice_errno(madvise(shared, page, 22));
+    printf("populate-shared=%ld status=%d\n", r, advice_status(shared));
+    r = advice_errno(madvise(gap, 3 * page, 22));
+    printf("populate-hole=%ld first=%d last=%d\n", r, advice_status(gap),
+           advice_status(gap + 2 * page));
+    long no_access = advice_errno(madvise(none, page, 22));
+    long ro_write = advice_errno(madvise(ro, page, 23));
+    long ro_read = advice_errno(madvise(ro, page, 22));
+    printf("populate-no-access=%ld read-only-write=%ld read-only-read=%ld\n", no_access, ro_write,
+           ro_read);
+    /* Past the end of its file a mapping cannot be brought in. */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-advice-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || ftruncate(fd, page)) return 81;
+    char *f = mmap(NULL, 2 * page, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (f == MAP_FAILED) return 82;
+    r = advice_errno(madvise(f, 2 * page, 22));
+    printf("populate-past-end=%ld first=%d\n", r, advice_status(f));
+    /* MADV_DONTNEED_LOCKED discards as MADV_DONTNEED does. */
+    r = advice_errno(madvise(p + 2 * page, page, 24));
+    int status = advice_status(p + 2 * page);
+    printf("dontneed-locked=%ld status=%d bytes=%d\n", r, status, p[2 * page]);
+    return 0;
+}
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
  * timers are only read, never armed, so they show none set. */
 static int itimer_case(void) {
@@ -20009,6 +20076,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mseal")) return mseal_case();
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
     if (!strcmp(mode, "memfd-secret")) return memfd_secret_case();
+    if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();

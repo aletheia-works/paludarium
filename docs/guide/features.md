@@ -1836,11 +1836,14 @@ kernel.
   `posix_lock_inode` keeps it. Then an eventfd's `eventfd-count`
   (hexadecimal), `eventfd-id` (the lowest number no other eventfd has, as
   `ida_alloc` gives it) and `eventfd-semaphore`; a signalfd's `sigmask`; a
-  timerfd's `clockid`, `ticks`, `settime flags`, and the `it_value` and
-  `it_interval` `timerfd_gettime` gives; and an epoll's `tfd:` line for each
-  file it watches: the descriptor it was added with, the events (with
-  `EPOLLERR` and `EPOLLHUP`, which `epoll_ctl` adds), the data, and the
-  file's position, inode and device.
+  timerfd's `clockid`, `ticks`, `settime flags`, `it_value` and
+  `it_interval` (an expired timer stays at its expiry, with `it_value` 0 and
+  the first expiry's tick, until a read or `timerfd_gettime` moves it on);
+  and an epoll's `tfd:` line for each file it watches: the descriptor it was
+  added with, the events (with `EPOLLERR` and `EPOLLHUP`, which `epoll_ctl`
+  adds, and only the flags once a one-shot fired), the data, and the file's
+  position, inode and device (that of a descriptor the process has of it,
+  else 0).
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
   in Linux's formats: load averages of 0 with the running and live tasks and
   the last ID handed out; 4 GiB of total, free and available memory and

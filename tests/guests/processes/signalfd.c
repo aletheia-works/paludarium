@@ -490,10 +490,13 @@ static int case_fdinfo(void) {
     ev.data.u64 = 7;
     say("add=%d", TRY(epoll_ctl(ep, EPOLL_CTL_ADD, pipes[1], &ev)));
     show_extra("epoll", ep);
-    ev.events = EPOLLIN | EPOLLONESHOT;
+    ev.events = EPOLLOUT | EPOLLONESHOT;
     say("mod=%d", TRY(epoll_ctl(ep, EPOLL_CTL_MOD, pipes[1], &ev)));
     say("del=%d", TRY(epoll_ctl(ep, EPOLL_CTL_DEL, counter, NULL)));
     show_extra("epoll-changed", ep);
+    struct epoll_event got;
+    say("fired=%d", TRY(epoll_wait(ep, &got, 1, 0)));
+    show_extra("epoll-fired", ep);
 
     char path[] = "/tmp/fdinfo-locks-XXXXXX";
     int file = mkstemp(path);

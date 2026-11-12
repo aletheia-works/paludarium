@@ -63,7 +63,14 @@ impl EpollInstance {
             .iter()
             .filter_map(|(&(fd, _), interest)| {
                 let file = interest.file.upgrade()?;
-                Some((fd, interest.events | 0x18, interest.data, file))
+                // A one-shot that fired keeps only the private bits
+                // (`ep_send_events`).
+                let events = if interest.enabled {
+                    interest.events | 0x18
+                } else {
+                    interest.events & 0xf000_0000
+                };
+                Some((fd, events, interest.data, file))
             })
             .collect()
     }

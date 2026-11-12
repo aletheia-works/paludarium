@@ -1596,10 +1596,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `posix_lock_inode` と同じく、広げた側のロックのファイル記述に残ります。続いて eventfd では
   `eventfd-count`（16 進）、`eventfd-id`（`ida_alloc` と同じく、ほかの eventfd が持たない
   いちばん小さい番号）、`eventfd-semaphore`、signalfd では `sigmask`、timerfd では
-  `clockid`、`ticks`、`settime flags` と、`timerfd_gettime` が返す `it_value` と
-  `it_interval` です。epoll では見張るファイルごとに `tfd:` の行が加わります。追加した
-  ときのディスクリプタ、イベント（`epoll_ctl` が加える `EPOLLERR` と `EPOLLHUP` を含む）、
-  データ、ファイルの位置、inode、デバイスです。
+  `clockid`、`ticks`、`settime flags`、`it_value`、`it_interval` です（満了したタイマーは、
+  読み込みか `timerfd_gettime` が先へ進めるまで満了した時点にとどまり、`it_value` は 0、
+  `ticks` は最初の満了のものです）。epoll では見張るファイルごとに `tfd:` の行が加わります。
+  追加したときのディスクリプタ、イベント（`epoll_ctl` が加える `EPOLLERR` と `EPOLLHUP` を
+  含み、発火した one-shot ではフラグだけ）、データ、ファイルの位置、inode、デバイス
+  （プロセスが持つそのファイルのディスクリプタのもの。なければ 0）です。
 - `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime` は、Linux と同じ形式で `sysinfo` と
   合った値を返します。ロードアベレージは 0 で、動いているタスクと生きているタスクの数、
   最後に割り当てた ID が続きます。メモリは合計、空き、使えるものがどれも 4 GiB で、ほかの

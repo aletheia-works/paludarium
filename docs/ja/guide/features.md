@@ -1808,6 +1808,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マイクロ秒に切り捨てて返します。設定中で時間が来たタイマーは 1 µs、残りが 1 µs に満たない
   タイマーは 0 と見せます。`alarm` は Linux の `alarm_setitimer` と同じく、間隔なしの秒単位で
   設定し、残っていた秒数を四捨五入して返します（設定中だったなら少なくとも 1）。
+- プロセスの CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は、Linux の
+  `check_cpu_itimer` と同じく、プロセスのスレッドが合わせてその時間を使うと、カーネルから
+  （`SI_KERNEL`）`SIGVTALRM` と `SIGPROF` を送ります。満了するたびに間隔ひとつ分だけ進み、
+  新しい値は 1 ティック遅れて始まり、時間が来たタイマーは残り 1 ティックと見せます。値が 0
+  なら止めますが間隔は残し、`KTIME_MAX` を超えて設定した値は、Linux の `ns_to_timespec64`
+  と同じく負の秒数に見えます。`fork` の子はどちらも持たずに始まり、`execve` は引き継ぎます。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
   見せません。起動からの時間は単調時計の値で、Linux と同じく秒単位に切り上げます。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は

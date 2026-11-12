@@ -671,12 +671,68 @@ fn itimer_getitimer_checks_as_linux() {
     assert_eq!(f.ret(nr::GETITIMER, &[0, 0]), errno(Errno::EFAULT));
     // Only the low 32 bits name the timer.
     assert_eq!(f.ret(nr::GETITIMER, &[1 << 32, DATA]), 0);
-    // The CPU-time timers are never armed.
+    // The CPU-time timers start disarmed.
     for which in [1, 2] {
         f.mem.write_u64(GuestAddr(DATA), 9).unwrap();
         assert_eq!(f.ret(nr::GETITIMER, &[which, DATA]), 0);
         assert_eq!(itimerval_at(&f, DATA), [0; 4]);
     }
+}
+fn write_itimerval(f: &Fixture, at: u64, words: [u64; 4]) {
+    for (i, word) in words.into_iter().enumerate() {
+        f.mem.write_u64(GuestAddr(at + 8 * i as u64), word).unwrap();
+    }
+}
+/// The fixture's host measures no thread CPU time, so a thread's CPU time
+/// is the monotonic clock since its first system call.
+#[test]
+fn itimer_cpu_timers_count_cpu_time_and_send_their_signals() {
+    let mut f = fixture();
+    f.thread.state.signal_mask = 1 << 25 | 1 << 26; // SIGVTALRM, SIGPROF
+    set_monotonic(&f, 1_000_000_000);
+    // ITIMER_PROF: 10 ms, then every 5 ms. It is set a tick (1 ms) later.
+    write_itimerval(&f, DATA, [0, 5_000, 0, 10_000]);
+    assert_eq!(f.ret(nr::SETITIMER, &[2, DATA, DATA + 32]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 32), [0; 4]);
+    set_monotonic(&f, 1_004_000_000);
+    assert_eq!(f.ret(nr::GETITIMER, &[2, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0, 5_000, 0, 7_000]);
+    // ITIMER_VIRTUAL is apart: it is still disarmed.
+    assert_eq!(f.ret(nr::GETITIMER, &[1, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0; 4]);
+    // At its expiry a checkpoint sends SIGPROF and sets it again by its
+    // interval, once however far past.
+    set_monotonic(&f, 1_030_000_000);
+    f.kernel.checkpoint(&mut f.thread, &f.mem);
+    assert_eq!(f.ret(127, &[DATA + 128, 8]), 0); // rt_sigpending
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 1 << 26);
+    // Its expiry (16 ms) has come: a tick left.
+    assert_eq!(f.ret(nr::GETITIMER, &[2, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0, 5_000, 0, 1_000]);
+    // A value of 0 disarms it but keeps the interval, unlike ITIMER_REAL.
+    write_itimerval(&f, DATA, [3, 0, 0, 0]);
+    assert_eq!(f.ret(nr::SETITIMER, &[2, DATA, DATA + 32]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 32), [0, 5_000, 0, 1_000]);
+    assert_eq!(f.ret(nr::GETITIMER, &[2, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [3, 0, 0, 0]);
+    // A value clamped to KTIME_MAX, a tick later, is past what a signed
+    // time holds, so it shows negative seconds as on Linux.
+    write_itimerval(&f, DATA, [0, 0, u64::MAX >> 1, 0]);
+    assert_eq!(f.ret(nr::SETITIMER, &[1, DATA, 0]), 0);
+    assert_eq!(f.ret(nr::GETITIMER, &[1, DATA + 64]), 0);
+    assert_eq!(
+        itimerval_at(&f, DATA + 64),
+        [0, 0, (-9_223_372_037i64) as u64, 146_224]
+    );
+    // ITIMER_VIRTUAL sends SIGVTALRM, once with no interval.
+    write_itimerval(&f, DATA, [0, 0, 0, 2_000]);
+    assert_eq!(f.ret(nr::SETITIMER, &[1, DATA, 0]), 0);
+    set_monotonic(&f, 1_040_000_000);
+    f.kernel.checkpoint(&mut f.thread, &f.mem);
+    assert_eq!(f.ret(127, &[DATA + 128, 8]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 1 << 25 | 1 << 26);
+    assert_eq!(f.ret(nr::GETITIMER, &[1, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0; 4]);
 }
 #[test]
 fn itimer_setitimer_checks_in_linux_order() {

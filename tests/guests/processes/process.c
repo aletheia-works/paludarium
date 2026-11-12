@@ -5967,7 +5967,7 @@ static volatile sig_atomic_t itimer_fired;
 static void itimer_alarm(int sig) { (void)sig; itimer_fired++; }
 static long itimer_errno(long r) { return r < 0 ? -errno : r; }
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
- * timers are only read, never armed, so they show none set. */
+ * timers are only read here, before any is armed (cpu_itimer_case arms them). */
 static int itimer_case(void) {
     struct itimerval v, old;
     errno = 0;
@@ -6048,6 +6048,160 @@ static int itimer_case(void) {
     while (!itimer_fired) sigsuspend(&empty);
     printf("alarm fired=%d left=%ld\n", (int)itimer_fired, syscall(SYS_alarm, 0L));
     sigprocmask(SIG_UNBLOCK, &block, NULL);
+    return 0;
+}
+/* The interval timers of CPU time, ITIMER_VIRTUAL and ITIMER_PROF. What is
+ * printed holds whatever the speed: times left are only bounded, and the
+ * CPU time is the process's, which the spinning below uses. */
+static volatile sig_atomic_t cit_fired, cit_code, cit_pid, cit_signo;
+static volatile long cit_cpu_ns;
+static long cit_cpu(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return t.tv_sec * 1000000000L + t.tv_nsec;
+}
+static void cit_handler(int sig, siginfo_t *info, void *context) {
+    (void)context;
+    cit_signo = sig;
+    cit_code = info->si_code;
+    cit_pid = info->si_pid;
+    if (++cit_fired == 3) cit_cpu_ns = cit_cpu();
+}
+/* Runs on the CPU until `want` signals came or `limit` ns of CPU time went. */
+static void cit_spin(int want, long limit) {
+    long end = cit_cpu() + limit;
+    while (cit_fired < want && cit_cpu() < end)
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+}
+static long cit_us(struct timeval t) { return t.tv_sec * 1000000L + t.tv_usec; }
+static void *cit_spinner(void *arg) {
+    (void)arg;
+    long end = cit_cpu() + 5000000000L;
+    while (!cit_fired && cit_cpu() < end)
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+    return NULL;
+}
+static int cpu_itimer_case(const char *self) {
+    struct itimerval v, old;
+    /* A value of 0 leaves it disarmed but keeps the interval. */
+    v = (struct itimerval){{5, 7}, {0, 0}};
+    printf("prof interval-only=%ld\n", itimer_errno(syscall(SYS_setitimer, 2L, &v, NULL)));
+    memset(&v, 0x55, sizeof v);
+    syscall(SYS_getitimer, 2L, &v);
+    printf("prof shows interval=%ld.%06ld value=%ld.%06ld\n", (long)v.it_interval.tv_sec,
+           (long)v.it_interval.tv_usec, (long)v.it_value.tv_sec, (long)v.it_value.tv_usec);
+    syscall(SYS_setitimer, 2L, NULL, &old);
+    printf("prof old interval=%ld.%06ld value=%ld\n", (long)old.it_interval.tv_sec,
+           (long)old.it_interval.tv_usec, cit_us(old.it_value));
+    /* Armed, it counts down with CPU time, from a tick more than it was
+       given, and leaves the other timer alone. */
+    v = (struct itimerval){{0, 0}, {2, 0}};
+    syscall(SYS_setitimer, 1L, &v, NULL);
+    syscall(SYS_getitimer, 1L, &v);
+    long left = cit_us(v.it_value);
+    syscall(SYS_getitimer, 2L, &old);
+    printf("virtual left-in-range=%d prof-value=%ld\n", left > 1500000 && left <= 2001000,
+           cit_us(old.it_value));
+    syscall(SYS_setitimer, 1L, NULL, &old);
+    left = cit_us(old.it_value);
+    printf("virtual old-in-range=%d\n", left > 1500000 && left <= 2001000);
+    /* A value clamped to KTIME_MAX, a tick later, shows negative seconds. */
+    v = (struct itimerval){{0, 0}, {LONG_MAX, 0}};
+    printf("virtual huge=%ld\n", itimer_errno(syscall(SYS_setitimer, 1L, &v, NULL)));
+    syscall(SYS_getitimer, 1L, &v);
+    printf("virtual huge negative=%d usec-in-range=%d\n", v.it_value.tv_sec < 0,
+           v.it_value.tv_usec >= 0 && v.it_value.tv_usec < 1000000);
+    syscall(SYS_setitimer, 1L, NULL, NULL);
+    /* SIGPROF, from the kernel, every interval while the CPU runs. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = cit_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGPROF, &sa, NULL);
+    sigaction(SIGVTALRM, &sa, NULL);
+    v = (struct itimerval){{0, 10000}, {0, 10000}};
+    syscall(SYS_setitimer, 2L, &v, NULL);
+    cit_spin(3, 20000000000L);
+    syscall(SYS_setitimer, 2L, NULL, NULL);
+    printf("prof fired=%d signo=%d code=%d pid=%d cpu-past-31ms=%d\n", cit_fired >= 3,
+           (int)cit_signo, (int)cit_code, (int)cit_pid, cit_cpu_ns >= 31000000L);
+    /* ITIMER_VIRTUAL with no interval: SIGVTALRM once. */
+    cit_fired = 0;
+    v = (struct itimerval){{0, 0}, {0, 20000}};
+    syscall(SYS_setitimer, 1L, &v, NULL);
+    cit_spin(1, 20000000000L);
+    cit_spin(2, 100000000L);
+    syscall(SYS_getitimer, 1L, &v);
+    printf("virtual fired=%d signo=%d now=%ld %ld\n", (int)cit_fired, (int)cit_signo,
+           cit_us(v.it_interval), cit_us(v.it_value));
+    /* Another thread's CPU time counts, and the signal reaches a thread
+       that waits for it. */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGPROF);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    cit_fired = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, cit_spinner, NULL)) return 1;
+    v = (struct itimerval){{0, 0}, {0, 10000}};
+    syscall(SYS_setitimer, 2L, &v, NULL);
+    siginfo_t info;
+    /* No timeout: the harness's virtual clock would end it at once. */
+    int got = sigwaitinfo(&set, &info);
+    cit_fired = 1;
+    pthread_join(thread, NULL);
+    printf("thread waited=%d code=%d\n", got, info.si_code);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+    /* A child of fork starts with none; the parent's stays. */
+    v = (struct itimerval){{1, 0}, {100, 0}};
+    syscall(SYS_setitimer, 1L, &v, NULL);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        syscall(SYS_getitimer, 1L, &v);
+        printf("child interval=%ld value=%ld\n", cit_us(v.it_interval), cit_us(v.it_value));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    syscall(SYS_setitimer, 1L, NULL, &old);
+    printf("parent kept interval=%ld armed=%d\n", cit_us(old.it_interval),
+           old.it_value.tv_sec >= 90);
+    /* execve keeps them. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        v = (struct itimerval){{1, 0}, {100, 0}};
+        syscall(SYS_setitimer, 1L, &v, NULL);
+        char *args[] = {"x", "cpu-itimer-exec", (char *)self, NULL};
+        execv(self, args);
+        _exit(98);
+    }
+    waitpid(child, &status, 0);
+    printf("exec child exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    /* Ignored, it changes nothing; by default, it ends the process. */
+    signal(SIGPROF, SIG_IGN);
+    cit_fired = 0;
+    v = (struct itimerval){{0, 10000}, {0, 10000}};
+    syscall(SYS_setitimer, 2L, &v, NULL);
+    cit_spin(1, 60000000L);
+    syscall(SYS_setitimer, 2L, NULL, NULL);
+    printf("ignored fired=%d\n", (int)cit_fired);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        signal(SIGPROF, SIG_DFL);
+        alarm(60);
+        syscall(SYS_setitimer, 2L, &v, NULL);
+        for (;;) {
+        }
+    }
+    waitpid(child, &status, 0);
+    printf("default signaled=%d sig=%d\n", WIFSIGNALED(status),
+           WIFSIGNALED(status) ? WTERMSIG(status) : -1);
     return 0;
 }
 static long vf_errno(long r) { return r < 0 ? -errno : r; }
@@ -20017,6 +20171,14 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
+    if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
+    if (!strcmp(mode, "cpu-itimer-exec")) {
+        struct itimerval v;
+        syscall(SYS_getitimer, 1L, &v);
+        printf("after exec interval=%ld armed=%d\n", cit_us(v.it_interval),
+               v.it_value.tv_sec >= 90);
+        return 0;
+    }
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();
     if (!strcmp(mode, "etxtbsy-run")) {

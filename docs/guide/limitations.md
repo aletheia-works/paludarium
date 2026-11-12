@@ -222,8 +222,14 @@ verified.
     `msync` with `MS_SYNC` of its mapping succeeds, where Linux gives
     `EINVAL` as the file has no `fsync`.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
-    cannot be set: `setitimer` gives `EINVAL` for them, where Linux sets them
-    and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.
+    both count the process's whole CPU time, as all of it is user time here
+    (Linux's `ITIMER_VIRTUAL` leaves out the system time). They are looked
+    at as a thread makes a system call and every 100,000 instructions it
+    runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
+    CI runners' `CONFIG_HZ`. `timer_create` on a CPU-time clock
+    (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID` or another
+    process's or thread's) gives `EINVAL`, where Linux makes the timer, and
+    `RLIMIT_CPU` sends no `SIGXCPU`.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
     the superblock of its pseudo filesystem and gives its counts (0). A

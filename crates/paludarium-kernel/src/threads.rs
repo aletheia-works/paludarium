@@ -76,6 +76,11 @@ pub struct ThreadGroup {
     pub(crate) timers: Mutex<crate::timers::Timers>,
     /// Every thread's CPU time, live or exited, for the process's total.
     cpu: Mutex<Vec<Arc<AtomicU64>>>,
+    /// The interval timers of the process's CPU time, `ITIMER_VIRTUAL` and
+    /// `ITIMER_PROF` in that order (Linux's `signal->it`), and whether
+    /// either is armed. Locked before `cpu` and `process_inbox`.
+    cpu_timers: Mutex<[CpuTimer; 2]>,
+    cpu_timers_armed: std::sync::atomic::AtomicBool,
     /// The core dump a fatal signal started, which the last thread to end
     /// writes. Locked before `members`.
     pub(crate) core: Mutex<Option<crate::coredump::Dump>>,
@@ -103,6 +108,18 @@ pub struct ThreadGroup {
     /// SIGNAL_UNKILLABLE), until a fault ends it.
     unkillable: std::sync::atomic::AtomicBool,
 }
+/// An interval timer of the process's CPU time, as Linux's `cpu_itimer`:
+/// when it expires, in the process's CPU time (0 while it is disarmed), and
+/// the interval it is then set again by, which it keeps while disarmed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CpuTimer {
+    pub expires: u64,
+    pub incr: u64,
+}
+/// Linux's `TICK_NSEC` on the CI runners' kernels (`CONFIG_HZ=1000`), which
+/// a CPU-time interval timer is set later by and shows as left when it is
+/// about to fire.
+pub(crate) const TICK_NSEC: u64 = 1_000_000;
 /// What `/proc/<pid>` shows another process of a thread: its name, signal
 /// state and credentials, and its process's memory and files, which it
 /// does not keep alive.
@@ -151,6 +168,8 @@ impl Default for ThreadGroup {
             futexes: Futexes::machine(),
             timers: Mutex::default(),
             cpu: Mutex::default(),
+            cpu_timers: Mutex::default(),
+            cpu_timers_armed: std::sync::atomic::AtomicBool::new(false),
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
             robust_lists: Mutex::default(),
@@ -399,6 +418,73 @@ impl ThreadGroup {
             .map(|used| used.load(Ordering::SeqCst))
             .fold(0u64, u64::saturating_add)
     }
+    /// Whether an interval timer of the process's CPU time is armed, so
+    /// that a checkpoint brings the thread's CPU time up to date for it.
+    pub(crate) fn cpu_timers_armed(&self) -> bool {
+        self.cpu_timers_armed.load(Ordering::SeqCst)
+    }
+    /// The CPU-time interval timer `index` (0 for `ITIMER_VIRTUAL`, 1 for
+    /// `ITIMER_PROF`) as its interval and the time left, replaced by `new`
+    /// (a value and an interval) when there is one, as Linux's
+    /// `get_cpu_itimer` and `set_cpu_itimer`. Both count the process's CPU
+    /// time, which is all user time here. A new value is set one tick
+    /// later, and an expiry that has come shows one tick left.
+    pub(crate) fn swap_cpu_timer(&self, index: usize, new: Option<(u64, u64)>) -> (u64, u64) {
+        let mut timers = self
+            .cpu_timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let old = timers[index];
+        let now = self.process_cpu();
+        let left = match old.expires {
+            0 => 0,
+            expires if expires <= now => TICK_NSEC,
+            expires => expires - now,
+        };
+        if let Some((value, interval)) = new {
+            timers[index] = CpuTimer {
+                expires: match value {
+                    0 => 0,
+                    value => value.saturating_add(TICK_NSEC).saturating_add(now),
+                },
+                incr: interval,
+            };
+            self.cpu_timers_armed
+                .store(timers.iter().any(|t| t.expires != 0), Ordering::SeqCst);
+        }
+        (old.incr, left)
+    }
+    /// Expires the CPU-time interval timers whose time the process has
+    /// used, each once, sending the process SIGPROF and SIGVTALRM as
+    /// Linux's `check_cpu_itimer` does from the tick. They go through the
+    /// process's inbox, which wakes a thread that waits.
+    fn expire_cpu_timers(&self) {
+        if !self.cpu_timers_armed() {
+            return;
+        }
+        let mut timers = self
+            .cpu_timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = self.process_cpu();
+        // Linux checks ITIMER_PROF first.
+        for (index, number) in [(1, 27), (0, 26)] {
+            let timer = &mut timers[index];
+            if timer.expires != 0 && now >= timer.expires {
+                timer.expires = match timer.incr {
+                    0 => 0,
+                    incr => timer.expires.saturating_add(incr),
+                };
+                let _ = self
+                    .process_inbox
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .send_pending(signals::PendingSignal::user(number, 128));
+            }
+        }
+        self.cpu_timers_armed
+            .store(timers.iter().any(|t| t.expires != 0), Ordering::SeqCst);
+    }
     /// Sends this process SIGCHLD about `child`, with its `CLD_*` `code`.
     pub(crate) fn notify_child(&self, code: i32, child: signals::ChildSignal) {
         let _ = self
@@ -531,6 +617,7 @@ impl ThreadGroup {
     }
     pub(crate) fn expire_timer(&self, local: &mut ThreadState, now: u64) {
         self.discards.apply(local);
+        self.expire_cpu_timers();
         {
             let mut pending = self
                 .process_pending

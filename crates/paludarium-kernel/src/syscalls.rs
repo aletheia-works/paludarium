@@ -641,7 +641,8 @@ fn read_timeval(sec: u64, usec: u64) -> Result<u64, Errno> {
 }
 /// `ITIMER_REAL`, the interval timer of the process's real time.
 const ITIMER_REAL: i32 = 0;
-/// `ITIMER_VIRTUAL` and `ITIMER_PROF`, of its CPU time, which cannot be set.
+/// `ITIMER_VIRTUAL` and `ITIMER_PROF`, of its CPU time (user time, and user
+/// and system time, which are the same here).
 const ITIMER_VIRTUAL: i32 = 1;
 const ITIMER_PROF: i32 = 2;
 
@@ -654,6 +655,39 @@ fn itimerval(interval: u64, remaining: u64) -> [u64; 4] {
         remaining / 1_000_000_000,
         remaining % 1_000_000_000 / 1000,
     ]
+}
+
+/// A CPU-time interval timer's interval and time left as `struct
+/// itimerval` words. The time left is taken as signed, as Linux's
+/// `ns_to_timespec64` takes it: one set past `KTIME_MAX` shows negative
+/// seconds, and nanoseconds since then.
+fn cpu_itimerval(interval: u64, remaining: u64) -> [u64; 4] {
+    let [interval_sec, interval_usec, ..] = itimerval(interval, 0);
+    let remaining = remaining as i64;
+    let (sec, nsec) = if remaining >= 0 {
+        (remaining / 1_000_000_000, remaining % 1_000_000_000)
+    } else {
+        let before = -(remaining + 1);
+        (
+            -(before / 1_000_000_000) - 1,
+            999_999_999 - before % 1_000_000_000,
+        )
+    };
+    [
+        interval_sec,
+        interval_usec,
+        sec as u64,
+        (nsec / 1000) as u64,
+    ]
+}
+
+/// The CPU-time interval timer `which` names, as of the caller's CPU time
+/// now, replaced by `new` (a value and an interval) when there is one.
+fn swap_cpu_timer(c: &mut Context<'_>, which: i32, new: Option<(u64, u64)>) -> [u64; 4] {
+    crate::account_cpu(c.host, c.group, c.process);
+    let index = usize::from(which == ITIMER_PROF);
+    let (interval, remaining) = c.group.swap_cpu_timer(index, new);
+    cpu_itimerval(interval, remaining)
 }
 
 /// The process's interval timer as of now, once what is due has expired,
@@ -686,16 +720,18 @@ fn swap_real_timer(c: &mut Context<'_>, new: Option<(u64, u64)>) -> Result<(u64,
 }
 
 /// `getitimer(which, value)`, as Linux's: `EINVAL` for a timer that is none
-/// of the three, then `EFAULT` for `value`. The CPU-time timers cannot be
-/// set, so they are always disarmed.
+/// of the three, then `EFAULT` for `value`.
 fn sys_getitimer(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome((|| {
-        let (interval, remaining) = match a[0] as i32 {
-            ITIMER_REAL => swap_real_timer(c, None)?,
-            ITIMER_VIRTUAL | ITIMER_PROF => (0, 0),
+        let words = match a[0] as i32 {
+            ITIMER_REAL => {
+                let (interval, remaining) = swap_real_timer(c, None)?;
+                itimerval(interval, remaining)
+            }
+            which @ (ITIMER_VIRTUAL | ITIMER_PROF) => swap_cpu_timer(c, which, None),
             _ => return Err(Errno::EINVAL),
         };
-        write_words(c.mem, a[1], &itimerval(interval, remaining))?;
+        write_words(c.mem, a[1], &words)?;
         Ok(0)
     })())
 }
@@ -713,12 +749,18 @@ fn sys_setitimer(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         };
         let interval = read_timeval(words[0], words[1])?;
         let value = read_timeval(words[2], words[3])?;
-        if a[0] as i32 != ITIMER_REAL {
-            return Err(Errno::EINVAL);
-        }
-        let (old_interval, remaining) = swap_real_timer(c, Some((interval, value)))?;
+        let old = match a[0] as i32 {
+            ITIMER_REAL => {
+                let (old_interval, remaining) = swap_real_timer(c, Some((interval, value)))?;
+                itimerval(old_interval, remaining)
+            }
+            which @ (ITIMER_VIRTUAL | ITIMER_PROF) => {
+                swap_cpu_timer(c, which, Some((value, interval)))
+            }
+            _ => return Err(Errno::EINVAL),
+        };
         if a[2] != 0 {
-            write_words(c.mem, a[2], &itimerval(old_interval, remaining))?;
+            write_words(c.mem, a[2], &old)?;
         }
         Ok(0)
     })())

@@ -2077,6 +2077,14 @@ kernel.
   `alarm` sets it to whole seconds with no interval and returns the seconds
   that were left, rounded to the nearest and at least 1 while it was armed,
   as Linux's `alarm_setitimer`.
+- The interval timers of the process's CPU time, `ITIMER_VIRTUAL` and
+  `ITIMER_PROF`, send `SIGVTALRM` and `SIGPROF` from the kernel
+  (`SI_KERNEL`) when the process's threads together have used their time,
+  as Linux's `check_cpu_itimer`: each expiry goes on by one interval, a new
+  value starts a tick later, and an expiry that has come shows a tick left.
+  A value of 0 disarms one but keeps its interval, and a value set past
+  `KTIME_MAX` shows negative seconds, as Linux's `ns_to_timespec64` makes
+  them. A child of `fork` starts with neither, and `execve` keeps them.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's, rounded up to
   a whole second as Linux rounds it.

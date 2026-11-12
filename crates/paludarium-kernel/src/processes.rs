@@ -3317,7 +3317,8 @@ impl Kernel {
     /// (`EBADF` for no pidfd, `ESRCH` once it is reaped), and its memory
     /// (`ESRCH` for a zombie), which another process's must let the caller
     /// read it with its filesystem IDs (`EACCES`). Then the advice must be
-    /// one Linux knows (`EINVAL`); for another process's memory only
+    /// one Linux knows (`EINVAL`, before any range, as Linux master
+    /// checks it; the CI's kernel checks it with each range); for another process's memory only
     /// `MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED` and `MADV_COLLAPSE`
     /// (`EINVAL`), and with `CAP_SYS_NICE` (`EPERM`). Each range is then
     /// advised in turn, as `madvise` would advise the caller's memory
@@ -3332,7 +3333,7 @@ impl Kernel {
         a: [u64; 6],
     ) -> Result<u64, Errno> {
         const PIDFD_SELF_THREAD: i32 = -10000;
-        const PIDFD_SELF_THREAD_GROUP: i32 = -20000;
+        const PIDFD_SELF_THREAD_GROUP: i32 = -10001;
         const CAP_SYS_NICE: u64 = 1 << 23;
         if a[4] as u32 != 0 {
             return Err(Errno::EINVAL);

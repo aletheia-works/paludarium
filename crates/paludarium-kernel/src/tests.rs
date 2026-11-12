@@ -6303,7 +6303,8 @@ mod page_nodes {
         assert_eq!(f.ret(440, &[pidfd, ARRAY, 3, 3, 0]), 0x1000 + 100);
         assert_eq!(f.ret(440, &[pidfd, ARRAY + 32, 1, 3, 0]), enomem);
         assert_eq!(f.ret(440, &[(-10000i64) as u64, ARRAY, 1, 3, 0]), 0x1000);
-        assert_eq!(f.ret(440, &[(-20000i64) as u64, ARRAY, 1, 3, 0]), 0x1000);
+        assert_eq!(f.ret(440, &[(-10001i64) as u64, ARRAY, 1, 3, 0]), 0x1000);
+        assert_eq!(f.ret(440, &[(-20000i64) as u64, ARRAY, 1, 3, 0]), ebadf);
         assert_eq!(f.ret(440, &[pidfd, ARRAY, 1, 3, 1]), einval);
         assert_eq!(f.ret(440, &[pidfd, 0, 0, 3, 0]), 0);
         assert_eq!(f.ret(440, &[pidfd, 0, 0, 999, 0]), einval);

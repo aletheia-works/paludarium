@@ -7333,8 +7333,10 @@ static long pg_ask(long parent) {
  * migrate_pages (256), move_pages (279), and process_madvise (440). It runs
  * in a child that is not root (natively it never is, and an emulated root
  * becomes nobody), so neither has CAP_SYS_NICE; the child stays dumpable,
- * so that its own children may be asked about. map_shadow_stack (453) is
- * EOPNOTSUPP on a CPU without user shadow stacks. */
+ * so that its own children may be asked about. Two calls are left out:
+ * map_shadow_stack (453), which the CI's CPU has and the virtual CPU has
+ * not, and advice Linux does not know with no ranges, which Linux master
+ * refuses first and the CI's kernel finds no range to refuse it for. */
 static long pn(long r) { return r < 0 ? -errno : r; }
 static void pn_statuses(const char *name, long r, const int *status, int n) {
     printf("%s=%ld", name, r);
@@ -7475,10 +7477,10 @@ static int page_nodes_worker(void) {
     printf("madvise-unaligned=%ld\n", pn(syscall(440, self, bad + 1, 1L, 3L, 0U)));
     printf("madvise-empty-unaligned=%ld\n", pn(syscall(440, self, empty, 2L, 3L, 0U)));
     printf("madvise-self-thread=%ld\n", pn(syscall(440, -10000L, iov, 1L, 3L, 0U)));
-    printf("madvise-self-process=%ld\n", pn(syscall(440, -20000L, iov, 1L, 3L, 0U)));
+    printf("madvise-self-process=%ld\n", pn(syscall(440, -10001L, iov, 1L, 3L, 0U)));
+    printf("madvise-not-self=%ld\n", pn(syscall(440, -20000L, iov, 1L, 3L, 0U)));
     printf("madvise-flags=%ld\n", pn(syscall(440, self, iov, 1L, 3L, 1U)));
     printf("madvise-no-ranges=%ld\n", pn(syscall(440, self, NULL, 0L, 3L, 0U)));
-    printf("madvise-no-ranges-bad-advice=%ld\n", pn(syscall(440, self, NULL, 0L, 999L, 0U)));
     printf("madvise-bad-advice=%ld\n", pn(syscall(440, self, iov, 1L, 999L, 0U)));
     printf("madvise-bad-fd=%ld\n", pn(syscall(440, -1L, iov, 1L, 999L, 0U)));
     printf("madvise-not-pidfd=%ld\n", pn(syscall(440, (long)gate[1], iov, 1L, 3L, 0U)));
@@ -7497,10 +7499,6 @@ static int page_nodes_worker(void) {
     waitpid(kid, NULL, 0);
     waitpid(zombie, NULL, 0);
     printf("reaped-madvise=%ld\n", pn(syscall(440, zombiefd, iov, 1L, 3L, 0U)));
-
-    /* map_shadow_stack(addr, size, flags) */
-    printf("shadow-stack=%ld\n", pn(syscall(453, 0L, page, 0L)));
-    printf("shadow-stack-flags=%ld\n", pn(syscall(453, 0L, page, 99L)));
     return 0;
 }
 static int page_nodes_case(void) {

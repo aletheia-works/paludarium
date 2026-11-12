@@ -530,7 +530,7 @@ impl NetlinkSocket {
         self.offer(s, (0, 0, bytes), false);
     }
     fn offer(&self, s: &mut State, (from, group, bytes): (u32, u32, Vec<u8>), overrun: bool) {
-        let full = s.queued + s.charged >= usize::try_from(s.receive_buffer).unwrap_or(0);
+        let full = Self::full(s);
         if overrun && (full || s.congested) {
             if !s.congested {
                 s.congested = true;
@@ -539,17 +539,36 @@ impl NetlinkSocket {
         } else if full {
             s.error = Some(ENOBUFS);
         } else {
-            let size = bytes.len();
-            s.queued += size;
-            s.queue.push_back(Datagram {
-                from,
-                group,
-                bytes,
-                size,
-            });
+            Self::push(s, from, group, bytes);
         }
         s.arrivals += 1;
         self.hub.changed();
+    }
+    /// Queues a datagram another socket sends, and says whether it did:
+    /// one that finds the receive buffer full or the socket congested is
+    /// left to its sender, which waits or gives `EAGAIN`, and changes
+    /// nothing here (`netlink_attachskb` with a user socket).
+    fn offer_from_user(&self, s: &mut State, from: u32, group: u32, bytes: &[u8]) -> bool {
+        if Self::full(s) || s.congested {
+            return false;
+        }
+        Self::push(s, from, group, bytes.to_vec());
+        s.arrivals += 1;
+        self.hub.changed();
+        true
+    }
+    fn full(s: &State) -> bool {
+        s.queued + s.charged >= usize::try_from(s.receive_buffer).unwrap_or(0)
+    }
+    fn push(s: &mut State, from: u32, group: u32, bytes: Vec<u8>) {
+        let size = bytes.len();
+        s.queued += size;
+        s.queue.push_back(Datagram {
+            from,
+            group,
+            bytes,
+            size,
+        });
     }
     /// Charges a kernel buffer of `truesize` bytes held for a later send to
     /// the receive buffer, as `netlink_attachskb` does when the socket holds
@@ -675,7 +694,12 @@ impl NetlinkSocket {
             if t.peer.0 != 0 && t.peer.0 != port {
                 return Err(ECONNREFUSED);
             }
-            target.deliver(&mut t, port, group, bytes.to_vec());
+            // `netlink_attachskb` from a user socket: no room, or a
+            // congested socket, is `EAGAIN` for the sender to wait on, and
+            // only the kernel's own messages overrun a socket.
+            if !target.offer_from_user(&mut t, port, group, bytes) {
+                return Err(Errno::EAGAIN);
+            }
             return Ok(bytes.len());
         }
         let mut notices = Vec::new();
@@ -2083,7 +2107,7 @@ pub(crate) fn dispatch(
             c.mem
                 .read(GuestAddr(a[1]), &mut bytes)
                 .map_err(|_| Errno::EFAULT)?;
-            send(socket, &bytes, a[3], to, sender)
+            send(c, socket, &bytes, a[3], to, sender)
         }
         46 => {
             let header = crate::sockets::message_header(c, a[1], false)?;
@@ -2101,7 +2125,7 @@ pub(crate) fn dispatch(
                     .read(GuestAddr(base), &mut bytes[start..])
                     .map_err(|_| Errno::EFAULT)?;
             }
-            send(socket, &bytes, a[2], to, sender)
+            send(c, socket, &bytes, a[2], to, sender)
         }
         45 => {
             let len = crate::sockets::user_buffer(a[1], a[2])?;
@@ -2152,7 +2176,12 @@ pub(crate) fn dispatch(
 fn returned(n: usize, length: usize, flags: u64) -> u64 {
     (if flags & MSG_TRUNC != 0 { length } else { n }) as u64
 }
+/// Sends for sendto or sendmsg; a datagram to another socket that has no
+/// room for it waits unless `MSG_DONTWAIT` or the socket's `O_NONBLOCK` says
+/// not to (`EAGAIN`), as `netlink_unicast` does with the send timeout,
+/// which is not limited here.
 fn send(
+    c: &mut Context<'_>,
     socket: &NetlinkSocket,
     bytes: &[u8],
     flags: u64,
@@ -2162,7 +2191,14 @@ fn send(
     if flags & MSG_OOB != 0 {
         return Err(EOPNOTSUPP);
     }
-    socket.send(bytes, to, sender).map(|n| n as u64)
+    let dontwait = flags & MSG_DONTWAIT != 0 || socket.nonblocking();
+    loop {
+        let ticket = c.files.readiness.token.value();
+        match socket.send(bytes, to, sender) {
+            Err(Errno::EAGAIN) if !dontwait => crate::events::wait(c, ticket, None)?,
+            sent => return sent.map(|n| n as u64),
+        }
+    }
 }
 /// Receives for recvfrom or recvmsg, waiting unless `MSG_DONTWAIT` or the
 /// socket's `O_NONBLOCK` says not to, no longer than `SO_RCVTIMEO`.

@@ -1117,7 +1117,9 @@ kernel.
     receive, and the socket is then held congested, as Linux's
     `NETLINK_S_CONGESTED`: it drops the kernel's other messages too, with
     no other `ENOBUFS`, until a receive finds its queue empty. A dump's
-    parts do not look at it.
+    parts do not look at it. A datagram from another socket that finds no
+    room, or the socket congested, waits for room instead, or is `EAGAIN`
+    with `MSG_DONTWAIT` or `O_NONBLOCK`, and overruns nothing.
   - **Requests:** the kernel, port 0, takes each message of a datagram as
     `rtnetlink` does. A dump (`NLM_F_DUMP`) ends with `NLMSG_DONE` at the
     next receive. An error, or a success with `NLM_F_ACK`, is answered with

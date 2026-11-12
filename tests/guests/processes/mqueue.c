@@ -1945,6 +1945,23 @@ static long drain_for(int s, unsigned int seq) {
     }
 }
 
+/* The netlink address of port `port`, for a datagram from one socket to
+   another. */
+static struct sockaddr_nl_like {
+    unsigned short family, pad;
+    unsigned int pid, groups;
+} netlink_to(unsigned int port) {
+    struct sockaddr_nl_like to = {.family = AF_NETLINK, .pid = port};
+    return to;
+}
+
+static unsigned int port_of(int s) {
+    struct sockaddr_nl_like me = {0};
+    socklen_t size = sizeof me;
+    getsockname(s, (struct sockaddr *)&me, &size);
+    return me.pid;
+}
+
 static int congested_case(void) {
     if (isolate()) return 10;
     int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0);
@@ -1974,6 +1991,11 @@ static int congested_case(void) {
     /* Room for more, but the socket is still congested. */
     put("ask", ask_link(s, 9999) > 0);
     put("error-again", has_error(s));
+    /* Another socket's datagram waits too, or is EAGAIN, and overruns
+       nothing (netlink_attachskb from a user socket). */
+    int user = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0);
+    struct sockaddr_nl_like to = netlink_to(port_of(s));
+    put("user-send", TRY(sendto(user, "hello", 5, MSG_DONTWAIT, (struct sockaddr *)&to, sizeof to)));
     static char cookie[32] = "cookie";
     struct sigevent event = {.sigev_notify = SIGEV_THREAD, .sigev_signo = s};
     event.sigev_value.sival_ptr = cookie;
@@ -1994,6 +2016,33 @@ static int congested_case(void) {
     arm(500);
     put("notify", q_notify(q, &event));
     arm(0);
+    say("");
+    /* Filled by another socket's datagrams, a socket is full but not
+       congested: no ENOBUFS, and a receive makes room for the next. */
+    int other = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0);
+    if (other < 0) return 14;
+    setsockopt(other, SOL_SOCKET, SO_RCVBUF, &room, sizeof room);
+    struct sockaddr_nl_like there = netlink_to(port_of(other));
+    if (!there.pid) {
+        /* Bound by its first send otherwise; bind it to have a port. */
+        struct sockaddr_nl_like any = netlink_to(0);
+        bind(other, (struct sockaddr *)&any, sizeof any);
+        there = netlink_to(port_of(other));
+    }
+    static char datagram[1000];
+    int filled = 0;
+    long last = 0;
+    while (filled < MOST) {
+        last = TRY(sendto(user, datagram, sizeof datagram, MSG_DONTWAIT, (struct sockaddr *)&there, sizeof there));
+        if (last < 0) break;
+        filled++;
+    }
+    printf("user-filled:");
+    put("filled", filled > 1 && filled < MOST);
+    put("full", last);
+    put("error", has_error(other));
+    put("received", TRY(recv(other, buf, sizeof buf, MSG_DONTWAIT)));
+    put("again", TRY(sendto(user, datagram, sizeof datagram, MSG_DONTWAIT, (struct sockaddr *)&there, sizeof there)));
     say("");
     return 0;
 }

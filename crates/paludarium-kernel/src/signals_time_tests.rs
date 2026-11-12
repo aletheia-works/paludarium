@@ -109,6 +109,26 @@ fn gettimeofday_and_time_read_the_real_time_clock() {
     assert_eq!(f.ret(syscalls::nr::TIME, &[8]), fault);
 }
 #[test]
+fn coarse_clocks_and_time_give_the_latest_tick() {
+    let mut f = fixture();
+    f.host
+        .set_clock(paludarium_host::ClockId::Realtime, 5_999_999_999);
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, 2_000_999_999);
+    // CLOCK_REALTIME_COARSE and CLOCK_MONOTONIC_COARSE: the 1 ms tick.
+    assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[5, DATA]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 5);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 999_000_000);
+    assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[6, DATA]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 2);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 0);
+    // The precise clocks are not cut.
+    assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[0, DATA]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 999_999_999);
+    // time() gives CLOCK_REALTIME_COARSE's seconds.
+    assert_eq!(f.ret(syscalls::nr::TIME, &[0]), 5);
+}
+#[test]
 fn time_clock_serialization() {
     let mut f = fixture();
     f.host

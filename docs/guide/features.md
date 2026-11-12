@@ -2024,8 +2024,12 @@ kernel.
   in the host's user space; memory use is not measured.
 - `clock_gettime` also reads `CLOCK_MONOTONIC_RAW`, the coarse clocks,
   `CLOCK_BOOTTIME` (the host never suspends), the alarm clocks and
-  `CLOCK_TAI` (with a TAI offset of 0). `clock_getres` gives 1 ns, and 4 ms
-  for the coarse clocks.
+  `CLOCK_TAI` (with a TAI offset of 0). The coarse clocks give the time of
+  the latest tick of 1 ms (`HZ` is 1000, as on the CI kernel), and `time`
+  gives the seconds of `CLOCK_REALTIME_COARSE`, as Linux's do, so either can
+  be up to a tick behind `CLOCK_REALTIME` and `gettimeofday`. Here the ticks
+  fall on whole milliseconds of each clock. `clock_getres` gives 1 ns, and
+  1 ms for the coarse clocks.
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one

@@ -20328,6 +20328,17 @@ int main(int argc, char **argv) {
         int clocks[] = {CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME};
         for (size_t i = 0; i < sizeof clocks / sizeof *clocks; i++)
             result("other-clock", clock_gettime(clocks[i], &a));
+        /* The coarse clocks give the latest tick (TICK_NSEC), never past the
+           precise clock read after them, nor a second behind it. */
+        int coarse[][2] = {{CLOCK_REALTIME_COARSE, CLOCK_REALTIME}, {CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC}};
+        for (int i = 0; i < 2; i++) {
+            result("coarse-res", clock_getres(coarse[i][0], &res));
+            result("coarse-res-ns", res.tv_sec * 1000000000L + res.tv_nsec);
+            clock_gettime(coarse[i][0], &a);
+            clock_gettime(coarse[i][1], &b);
+            long behind = (b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec);
+            result("coarse-behind", behind >= 0 && behind < 1000000000L);
+        }
         errno = 0;
         result("unknown", clock_gettime(10, &a));
         result("errno", errno);

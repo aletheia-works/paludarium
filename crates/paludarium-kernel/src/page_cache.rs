@@ -40,6 +40,9 @@ pub(crate) struct PageCaches {
     writes: Mutex<HashMap<Key, i64>>,
     /// The machine's inotify watches, which its files' changes are told to.
     pub(crate) notify: Arc<crate::inotify::Notifier>,
+    /// Whether any of the machine's files was ever made immutable or
+    /// append-only ([`crate::files::attributes::any_flagged`]).
+    pub(crate) flagged: std::sync::atomic::AtomicBool,
     /// The open descriptions of the machine's files (each a
     /// [`CoherentFile`], by its handle), which keep a removed file there
     /// for inotify until the last is closed, as Linux's dentry keeps it.

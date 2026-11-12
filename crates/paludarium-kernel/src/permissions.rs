@@ -1,8 +1,11 @@
 //! Linux's discretionary access control (`fs/namei.c`, `fs/attr.c`): the
 //! permission bits and owners of files against a thread's filesystem IDs,
 //! supplementary groups and capabilities. Root, with every filesystem
-//! capability and filesystem IDs of 0, passes every check but executing a
-//! file that no one may execute, so its calls skip them.
+//! capability and filesystem IDs of 0, passes every permission check but
+//! executing a file that no one may execute, so its path walks skip them
+//! until a file of the machine has been made immutable or append-only; the
+//! inode flags refuse root too, so from then on root walks as well, and
+//! `chmod`, `chown` and `times` check them before their shortcut for root.
 use crate::credentials::Credentials;
 use crate::files::{Files, attributes};
 use paludarium_host::{FileHandle, FileStat};
@@ -225,8 +228,9 @@ pub(crate) fn walk(
     })
 }
 
-/// [`walk`] with the thread's credentials, which root skips while no file
-/// may be immutable or append-only, which root is refused too.
+/// [`walk`] with the thread's credentials. Root skips it while no file may
+/// be immutable or append-only, and then walks too, as those flags refuse
+/// root as well.
 pub(crate) fn search(
     files: &Files,
     creds: &Credentials,
@@ -234,7 +238,7 @@ pub(crate) fn search(
     raw: &[u8],
     follow: bool,
 ) -> Result<Found, Errno> {
-    if unchecked(creds) && !attributes::any_flagged() {
+    if unchecked(creds) && !attributes::any_flagged(files) {
         return Ok(Found::default());
     }
     walk(files, creds, dir, raw, follow)
@@ -397,8 +401,9 @@ pub(crate) fn may_mknod(creds: &Credentials) -> bool {
 }
 
 /// `chmod`'s checks (`may_setattr`, `setattr_prepare`): not an immutable
-/// or append-only file, then the owner or `CAP_FOWNER`, else EPERM. Returns the mode to set, without the set-group-ID bit when the
-/// thread is not in the file's group and lacks `CAP_FSETID`.
+/// or append-only file, then the owner or `CAP_FOWNER`, else EPERM.
+/// Returns the mode to set, without the set-group-ID bit when the thread
+/// is not in the file's group and lacks `CAP_FSETID`.
 pub(crate) fn chmod(creds: &Credentials, stat: &FileStat, mode: u32) -> Result<u32, Errno> {
     attributes::unchangeable(stat)?;
     if unchecked(creds) {
@@ -414,10 +419,10 @@ pub(crate) fn chmod(creds: &Credentials, stat: &FileStat, mode: u32) -> Result<u
 }
 
 /// `chown`'s checks (`may_setattr`, `chown_ok`, `chgrp_ok`): an owner or
-/// group to set on an immutable or append-only file is EPERM; a new owner only with
-/// `CAP_CHOWN` (the owner may name itself), a new group by the owner when
-/// it is a member, or with `CAP_CHOWN`; else EPERM. Returns whether a file
-/// keeps a set-group-ID bit without group execution
+/// group to set on an immutable or append-only file is EPERM; a new owner
+/// only with `CAP_CHOWN` (the owner may name itself), a new group by the
+/// owner when it is a member, or with `CAP_CHOWN`; else EPERM. Returns
+/// whether a file keeps a set-group-ID bit without group execution
 /// (`setattr_should_drop_sgid`): a member of its group, or `CAP_FSETID`.
 pub(crate) fn chown(
     creds: &Credentials,

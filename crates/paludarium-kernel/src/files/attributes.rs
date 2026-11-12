@@ -109,14 +109,11 @@ const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
 const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
 const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
 
-/// Whether any file was ever made immutable or append-only. Until one is,
-/// no call needs to look a file's flags up to refuse it, and root's path
-/// walks may skip their checks.
-static FLAGGED: AtomicBool = AtomicBool::new(false);
-
-/// Whether a file may now be immutable or append-only.
-pub(crate) fn any_flagged() -> bool {
-    FLAGGED.load(Ordering::Relaxed)
+/// Whether a file of the machine `files` belongs to may now be immutable
+/// or append-only. Until one was made so, root's path walks may skip their
+/// checks, as no file can refuse root.
+pub(crate) fn any_flagged(files: &crate::files::Files) -> bool {
+    files.caches.flagged.load(Ordering::Relaxed)
 }
 
 /// `IS_IMMUTABLE`.
@@ -212,7 +209,12 @@ fn current(with: &Reach<'_>) -> Result<u32, Errno> {
 /// reaches: the owner or `CAP_FOWNER` (EPERM), `CAP_LINUX_IMMUTABLE` to
 /// change `FS_IMMUTABLE_FL` or `FS_APPEND_FL` (EPERM), the project ID and
 /// extent size checks (EINVAL), then only what tmpfs keeps (EOPNOTSUPP).
-fn set(creds: &Credentials, stat: &FileStat, with: &Reach<'_>, mut fa: Kattr) -> Result<(), Errno> {
+fn set(
+    (creds, flagged): (&Credentials, &AtomicBool),
+    stat: &FileStat,
+    with: &Reach<'_>,
+    mut fa: Kattr,
+) -> Result<(), Errno> {
     let old_flags = current(with)?;
     if !crate::permissions::owner_or_capable(creds, stat) {
         return Err(Errno::EPERM);
@@ -274,7 +276,7 @@ fn set(creds: &Credentials, stat: &FileStat, with: &Reach<'_>, mut fa: Kattr) ->
     }
     let flags = fa.flags & MODIFIABLE;
     if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
-        FLAGGED.store(true, Ordering::Relaxed);
+        flagged.store(true, Ordering::Relaxed);
     }
     with(&mut |f| {
         *f = (*f & !MODIFIABLE) | flags;
@@ -337,7 +339,7 @@ fn file_setattr(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     };
     let target = Target::at(c, [a[0], a[1], flags], true)?;
     set(
-        &c.process.credentials,
+        (&c.process.credentials, &c.files.caches.flagged),
         target.stat(),
         &|f: &mut dyn FnMut(&mut u32)| target.with_attributes(c, f),
         fa,
@@ -406,7 +408,12 @@ pub(crate) fn ioctl(
     Some((|| {
         let current = current?;
         match (cmd, change) {
-            (_, Some(fa)) => set(&c.process.credentials, &file.stat()?, &with, fa)?,
+            (_, Some(fa)) => set(
+                (&c.process.credentials, &c.files.caches.flagged),
+                &file.stat()?,
+                &with,
+                fa,
+            )?,
             (FS_IOC_GETFLAGS, None) => output(c, arg, &current.to_le_bytes())?,
             _ => {
                 let mut out = [0; FSXATTR_SIZE];

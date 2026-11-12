@@ -3,8 +3,9 @@
    registers to the types its SYSCALL_DEFINEs declare, so the two match, except
    for unsigned long arguments it reads whole (mprotect's prot). readv's vlen
    and vmsplice's nr_segs are unsigned long too, but import_iovec takes them as
-   unsigned. Only whether they match is printed: the results themselves are the
-   other guests' business. */
+   unsigned (until Linux 965e5e451146, 2026-11-05, which makes a dirty one
+   EINVAL; the CI kernel predates it). Only whether they match is printed:
+   the results themselves are the other guests' business. */
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>

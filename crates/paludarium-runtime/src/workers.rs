@@ -82,6 +82,10 @@ impl Execution {
                 .stop_all(ExitStatus::Signaled(signal::SIGKILL));
         }
         kernel.finish_thread(thread, &memory);
+        // The address space goes before the exit is told (`exit_mm` before
+        // `exit_notify`): what its mappings hold, such as an ELF
+        // interpreter's file, is let go of before a parent's wait ends.
+        drop(memory);
         kernel.complete_process(
             result
                 .as_ref()

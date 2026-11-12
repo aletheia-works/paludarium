@@ -14,7 +14,11 @@
 /// `gid_t`, `dev_t`'s `unsigned`), which is zero-extended; `h` for `umode_t`;
 /// and `l` for a full register (pointers, `long`, `size_t`, `loff_t`).
 /// Arguments past the end are full registers. An `unsigned long` that Linux
-/// itself passes on as an `unsigned` (an iovec count) is `u`.
+/// itself passes on as an `unsigned` (an iovec count) is `u`: `import_iovec`
+/// takes an `unsigned` on the kernel CI runs. Linux master widened it to
+/// `unsigned long` in 965e5e451146 (2026-11-05), so a count past 32 bits is
+/// `EINVAL` there; these become `l` once the CI kernel has that change (and
+/// `aio`'s vectored `aio_nbytes` is read whole).
 fn widths(number: u64) -> &'static [u8] {
     match number {
         // read, write, close, fstat, pread64, pwrite64, dup, fsync,
@@ -156,7 +160,8 @@ fn widths(number: u64) -> &'static [u8] {
         // vmsplice: fd, nr_segs, flags
         278 => b"iluu",
         // readv, writev, preadv, pwritev: vlen. Linux declares it unsigned
-        // long but hands it to import_iovec, whose nr_segs is unsigned.
+        // long but hands it to import_iovec, whose nr_segs is unsigned
+        // before 965e5e451146 (see widths).
         19 | 20 | 295 | 296 => b"llu",
         // process_vm_readv, process_vm_writev: pid, liovcnt (import_iovec's
         // too; riovcnt is read whole)

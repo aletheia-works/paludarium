@@ -278,8 +278,13 @@ kernel.
   (fish's `fcntl` does) gets what it would on Linux. Pointers and `long`,
   `unsigned long`, `size_t` and `loff_t` arguments are read whole, so
   `mprotect` with a bit set past 32 in `prot` is still `EINVAL`; the iovec
-  count of `readv`, `writev` and their kin is the exception, since Linux passes
-  it on as an `unsigned`. The number
+  count of `readv`, `writev` and their kin (`process_vm_readv`'s and
+  `process_vm_writev`'s local one, `vmsplice`'s, and `aio_nbytes` of a
+  vectored `io_submit` request) is the exception: the CI runner's kernel
+  passes it to `import_iovec` as an `unsigned`, so a count of `0x100000001`
+  is one entry. Linux master reads it whole since 965e5e451146 (2026-11-05)
+  and gives such a count `EINVAL`; paludarium follows once the CI kernel
+  does. The number
   itself is read from the low 32 bits of `rax` too, as Linux's
   `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`,
@@ -1360,7 +1365,9 @@ kernel.
     `NLM_F_CREATE`, `NLM_F_EXCL`, `NLM_F_APPEND` or `NLM_F_REPLACE` Linux
     gives it), as `inetdev_event`, `fib_add_ifaddr`, `fib_del_ifaddr`,
     `addrconf`, `rt6_disable_ip`, `rtmsg_fib` and `inet6_rt_notify` tell
-    them. An IPv4 address's and a route request's carry the request's
+    them; and, last when it comes up, IPv6's own `RTM_NEWLINK` for it, as an
+    `AF_INET6` link dump gives it (`RTNLGRP_IPV6_IFINFO`, as
+    `inet6_ifinfo_notify`). An IPv4 address's and a route request's carry the request's
     sequence number and port; an IPv6 address is told of twice when added,
     tentative and then not. An unbound socket hears nothing; the requester
     of an IPv4 address's or a route's change has the notification before
@@ -2015,11 +2022,16 @@ kernel.
   (one that fails, such as a writer's `ENXIO`, is none), `IN_CLOSE_WRITE`
   or `IN_CLOSE_NOWRITE` at its description's last close, and its reads and
   writes for its own watches only, which Linux keeps from its directory's
-  (`d_is_special`). A watch with `IN_EXCL_UNLINK` does not
+  (`d_is_special`). The files exec runs are open files too: `IN_OPEN` as
+  `execve` or `execveat` opens the program, each script and the ELF
+  interpreter, `IN_ACCESS` as it reads their first bytes (none of an empty
+  file), and `IN_CLOSE_NOWRITE` once nothing uses them: a script at the end
+  of the call, the program when no process runs it, the interpreter when no
+  process maps it, and a file exec cannot run when it gives up, the last
+  opened first. A watch with `IN_EXCL_UNLINK` does not
   hear of the open, close, read or write of a file through a name unlinked
   since it was opened (by `unlink`, `rmdir` or a rename onto it), even while
-  another link keeps the file; `truncate`, `mknod` and starting a program
-  open nothing. A file's change reaches the watch of
+  another link keeps the file; `truncate` and `mknod` open nothing. A file's change reaches the watch of
   its directory, with its name, before its own (for an open file, the name
   it was opened at as renames of it and of the directories above it moved
   it, or the unlinked name it last had), and `IN_ISDIR` marks a

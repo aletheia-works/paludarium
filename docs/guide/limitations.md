@@ -350,8 +350,12 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: running a program (which Linux reports as
-  `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`) is no event. The events
+- **inotify, in part**: running a file only a descriptor holds (a memfd,
+  or a removed file, through `execveat`) is no event, where Linux reports
+  its `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`. The ELF interpreter of
+  the program an exec replaces closes after the exec's scripts, where Linux
+  closes it before them, and one opened by an exec that then fails closes
+  before the program, where Linux closes the program first. The events
   of a FIFO opened by its path go to the name it was opened at, whatever
   renames it since, and opening one no name links any more again through
   `/proc/self/fd` shares its description, with no `IN_OPEN`, where Linux
@@ -423,9 +427,8 @@ verified.
   no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
   the rest are not); its `rta_cacheinfo` counts one reference, where
   Linux counts the other users of the cached route too. Notifications go
-  out for the link, addresses and routes alone, not for IPv6's own link
-  information (`RTNLGRP_IPV6_IFINFO`), neighbours, netconf or the other
-  groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
+  out for the link, its IPv6 information, addresses and routes alone, not
+  for neighbours, netconf or the other groups, nor to a socket in another namespace (`NETLINK_LISTEN_ALL_NSID`
   is not supported); IPv4's routes through `lo` go without one when it
   goes down, as on Linux. `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the
   other options not listed in the features are `ENOPROTOOPT`. A link message's

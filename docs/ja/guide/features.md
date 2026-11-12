@@ -249,7 +249,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   0 にせずに呼ぶもの（fish の `fcntl`）でも、Linux と同じ結果になります。ポインタと
   `long`・`unsigned long`・`size_t`・`loff_t` の引数はそのまま全体を読むので、`prot` の
   32 ビットより上が立っている `mprotect` は `EINVAL` のままです。ただし `readv`・`writev`
-  などの iovec の数は、Linux が `unsigned` として渡すので下位 32 ビットだけを読みます。システムコールの番号も、
+  などの iovec の数（`process_vm_readv`・`process_vm_writev` の手元側、`vmsplice`、
+  ベクタを使う `io_submit` の要求の `aio_nbytes` も）は例外で、下位 32 ビットだけを読みます。
+  CI のランナーのカーネルはこの数を `unsigned` として `import_iovec` に渡すので、
+  `0x100000001` は要素 1 つになります。Linux master は 965e5e451146（2026-11-05）から
+  全体を読み、そうした数を `EINVAL` にします。paludarium は CI のカーネルがそうなってから
+  合わせます。システムコールの番号も、
   Linux の `do_syscall_64` が `int` で受け取るのと同じく `rax` の下位 32 ビットから読み、
   負の番号は `ENOSYS` です。
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET`・`REQUEUE`・`CMP_REQUEUE`・
@@ -1180,7 +1185,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `rtmsg_fib`、`inet6_rt_notify` と同じく、増えたり消えたりしたアドレス
     （`RTNLGRP_IPV4_IFADDR`、`RTNLGRP_IPV6_IFADDR`）と経路（`RTNLGRP_IPV4_ROUTE`、
     `RTNLGRP_IPV6_ROUTE`。新しいものは Linux と同じ `NLM_F_CREATE`、`NLM_F_EXCL`、
-    `NLM_F_APPEND`、`NLM_F_REPLACE` を持ちます）を伝えます。IPv4 のアドレスのものと経路の
+    `NLM_F_APPEND`、`NLM_F_REPLACE` を持ちます）を伝えます。上げたときは最後に、
+    `inet6_ifinfo_notify` と同じく、`AF_INET6` のリンクのダンプと同じ IPv6 自身の
+    `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を伝えます。IPv4 のアドレスのものと経路の
     リクエストのものはリクエストのシーケンス番号とポートを持ち、IPv6 のアドレスは足したときに
     仮のものと仮でないものの 2 度伝えます。bind していないソケットには何も届きません。
     IPv4 のアドレスか経路の変化を求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を
@@ -1758,10 +1765,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかと同じ開いたファイルです。開き終えると `IN_OPEN`（書き手の `ENXIO` のように失敗した
   ものは何もなし）、ファイル記述の最後のクローズで `IN_CLOSE_WRITE` か `IN_CLOSE_NOWRITE`
   です。読み書きは FIFO 自身のウォッチだけに届き、Linux と同じくディレクトリのウォッチには
-  届きません（`d_is_special`）。`IN_EXCL_UNLINK` のウォッチは、開いた後に
+  届きません（`d_is_special`）。exec が実行するファイルも開いたファイルです。`execve` か
+  `execveat` がプログラム、各スクリプト、ELF インタプリタを開くと `IN_OPEN`、先頭の
+  バイトを読むと `IN_ACCESS`（空のファイルではなし）、使うものがなくなると
+  `IN_CLOSE_NOWRITE` です。スクリプトは呼び出しの終わりに、プログラムは実行するプロセスが
+  なくなったときに、インタプリタはマップするプロセスがなくなったときに、実行できなかった
+  ファイルは exec が諦めたときに閉じ、最後に開いたものから閉じます。`IN_EXCL_UNLINK` のウォッチは、開いた後に
   （`unlink`、`rmdir`、上書きする rename で）消えた名前を通してファイルを開く・閉じる・
   読み書きすることを受けません。別のリンクがファイルを残していても同じです。
-  `truncate`、`mknod`、プログラムの起動は何も開きません。ファイルの変更は、そのディレクトリのウォッチに
+  `truncate` と `mknod` は何も開きません。ファイルの変更は、そのディレクトリのウォッチに
   名前付きで先に届き、次にファイル自身のウォッチに届きます（開いたファイルでは、開いたときの
   名前を、ファイル自身や上のディレクトリの名前の変更に合わせて動かしたもの、または消える前の
   最後の名前です）。ディレクトリのものには

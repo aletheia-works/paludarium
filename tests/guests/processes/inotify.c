@@ -582,7 +582,7 @@ static int case_home(void) {
 
 /* A program a process runs holds its file (Linux's `exe_file`): removed,
    its end waits until no process runs it. Its exec's own events are not
-   watched (they are no events here). */
+   watched (case_exec has them). */
 static int run_removing(const char *prog, const char *removed);
 /* Copies `from` to `to`, runnable; whether any of it was copied. */
 static int copy_file(const char *from_path, const char *to_path) {
@@ -885,6 +885,63 @@ static int case_fifo(void) {
     return 0;
 }
 
+/* The files exec opens are open files: IN_OPEN as it opens each, IN_ACCESS
+ * as it reads their first bytes, and IN_CLOSE_NOWRITE once nothing uses
+ * them, a script at the end of the exec, the program and its ELF
+ * interpreter when the process exits, and a file it cannot run at once.
+ * A child runs each from the watched directory. */
+static void run_watched(int fd, const char *name, const char *mode) {
+    char *prog = at(name);
+    char *const argv[] = {prog, (char *)mode, NULL};
+    pid_t child = fork();
+    if (child == 0) {
+        if (chdir(base)) _exit(96);
+        execv(prog, argv);
+        _exit(errno == ENOEXEC ? 98 : errno == EACCES ? 97 : 93);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("%s exited=%d\n", name, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    drain(fd, name);
+}
+static int write_file(const char *path, const char *text, mode_t mode) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    long n = write(fd, text, strlen(text));
+    close(fd);
+    return n == (long)strlen(text);
+}
+static int case_exec(void) {
+    make_base("exec");
+    char self[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", self, sizeof self - 32);
+    if (len <= 0) return 95;
+    self[len] = 0;
+    printf("copied=%d", copy_file(self, at("prog")));
+    strcpy(strrchr(self, '/') + 1, "inotify-interp");
+    printf(" %d", copy_file(self, at("dyn")));
+    printf(" %d\n", copy_file("/lib/ld-musl-x86_64.so.1", at("inotify-ld.so")));
+    char line[160];
+    snprintf(line, sizeof line, "#!%s inotify-quiet\n", at("prog"));
+    printf("written=%d", write_file(at("shut"), line, 0644));
+    printf(" %d", write_file(at("s"), line, 0755));
+    printf(" %d", write_file(at("empty"), "", 0755));
+    printf(" %d", write_file(at("junk"), "junk", 0755));
+    snprintf(line, sizeof line, "#!%s\n", at("junk"));
+    printf(" %d\n", write_file(at("bad"), line, 0755));
+    int fd = inotify_init1(IN_NONBLOCK);
+    printf("wd=%d\n", inotify_add_watch(fd, base, WATCHED));
+    run_watched(fd, "shut", "inotify-quiet");
+    run_watched(fd, "empty", "inotify-quiet");
+    run_watched(fd, "junk", "inotify-quiet");
+    run_watched(fd, "bad", "inotify-quiet");
+    run_watched(fd, "prog", "inotify-quiet");
+    run_watched(fd, "s", "inotify-quiet");
+    run_watched(fd, "dyn", "inotify-quiet");
+    close(fd);
+    remove_all();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -902,6 +959,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-interpreter")) return case_interpreter();
     if (!strcmp(mode, "inotify-moved")) return case_moved();
     if (!strcmp(mode, "inotify-fifo")) return case_fifo();
+    if (!strcmp(mode, "inotify-exec")) return case_exec();
     if (!strcmp(mode, "inotify-runner")) return case_runner();
+    /* What case_exec runs: nothing. */
+    if (!strcmp(mode, "inotify-quiet")) return 0;
     return 2;
 }

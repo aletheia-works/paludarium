@@ -107,9 +107,9 @@ pub(crate) fn changing_xattrs<T>(f: impl FnOnce() -> Result<T, Errno>) -> (Resul
 }
 
 thread_local! {
-    /// Cleared while the kernel opens a file on its own account, as it
-    /// reads a program's first bytes or makes a regular file for `mknod`,
-    /// which Linux does without opening one.
+    /// Cleared while the kernel opens a file on its own account, as exec's
+    /// loader reads a program whole or `mknod` makes a regular file, which
+    /// Linux does without opening one (exec's own opens are told of apart).
     static OPENS: Cell<bool> = const { Cell::new(true) };
 }
 /// Runs `f`, whose opens are no `IN_OPEN` and whose files no `IN_CLOSE_*`.
@@ -132,11 +132,14 @@ pub(crate) fn unnoticed<T>(f: impl FnOnce() -> T) -> T {
     value
 }
 
-/// The open of a FIFO by its path, which Linux's `fifo_open` makes an
-/// ordinary open file: its watches heard `IN_OPEN` (`fsnotify_open`) when
-/// it opened, and hear `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`
-/// (`fsnotify_close`) when the last descriptor of the description closes,
-/// which drops this. They go to the name it was opened at.
+/// An open file the kernel does not otherwise keep as one: a FIFO opened
+/// by its path, which Linux's `fifo_open` makes an ordinary open file, or a
+/// file exec opens (`do_open_execat`), a program, a script or an ELF
+/// interpreter. Its watches heard `IN_OPEN` (`fsnotify_open`) when it
+/// opened, and hear `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`
+/// (`fsnotify_close`) when the last reference goes, which drops this: the
+/// FIFO's description's last descriptor, the program's process, the
+/// interpreter's mapping. They go to the name it was opened at.
 pub(crate) struct Closing {
     notify: Arc<Notifier>,
     fs: Arc<dyn FileSystem>,
@@ -160,6 +163,17 @@ impl Closing {
         if !reported_open() {
             return None;
         }
+        Some(Self::open(notify, fs, path, device, node, flags))
+    }
+    /// [`opened`](Self::opened), for an open known to be the guest's.
+    pub(crate) fn open(
+        notify: &Arc<Notifier>,
+        fs: &Arc<dyn FileSystem>,
+        path: &[u8],
+        device: u64,
+        node: &FileStat,
+        flags: u32,
+    ) -> Self {
         let closing = Self {
             notify: Arc::clone(notify),
             fs: Arc::clone(fs),
@@ -169,7 +183,14 @@ impl Closing {
             writing: flags & 3 != 0,
         };
         closing.tell(OPEN);
-        Some(closing)
+        closing
+    }
+    /// Tells the watches of exec's read of the file's first bytes
+    /// (`kernel_read`'s `IN_ACCESS`), which an empty file has none of.
+    pub(crate) fn read(&self) {
+        if self.node.size > 0 {
+            self.tell(ACCESS);
+        }
     }
     fn tell(&self, mask: u32) {
         if !self.notify.watching() {

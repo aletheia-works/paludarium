@@ -70,6 +70,7 @@ const RTNLGRP_IPV4_IFADDR: u32 = 5;
 const RTNLGRP_IPV4_ROUTE: u32 = 7;
 const RTNLGRP_IPV6_IFADDR: u32 = 9;
 const RTNLGRP_IPV6_ROUTE: u32 = 11;
+const RTNLGRP_IPV6_IFINFO: u32 = 12;
 const GROUPS: u32 = 39;
 /// The bits of groups 30 and 31, the multicast routing ones of a full
 /// routing daemon, which need `CAP_NET_ADMIN` (`rtnetlink_bind`).
@@ -818,7 +819,12 @@ impl NetlinkSocket {
                 (RTM_GETLINK, AF_BRIDGE) => Vec::new(),
                 // `inet6_dump_ifinfo`: each device with IPv6, as IPv6 shows it.
                 (RTM_GETLINK, AF_INET6) => {
-                    vec![inet6_link_message(&self.network, header.seq, port)]
+                    vec![inet6_link_message(
+                        &self.network,
+                        header.seq,
+                        port,
+                        NLM_F_MULTI,
+                    )]
                 }
                 (RTM_GETLINK, _) => vec![link_message(
                     &self.network,
@@ -1401,7 +1407,7 @@ fn inet6_settings(up: bool, stats: bool) -> Vec<u8> {
 /// gives it: an `ifinfomsg` of AF_INET6, its name, hardware address, MTU and
 /// state (no `IFLA_LINK`, as `lo` is its own), then its IPv6 settings, with
 /// their statistics, in `IFLA_PROTINFO`, which is not marked nested.
-fn inet6_link_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+fn inet6_link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec<u8> {
     let up = network.is_up();
     let mut body = vec![AF_INET6, 0];
     body.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
@@ -1414,7 +1420,7 @@ fn inet6_link_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
     let operstate = if up { IF_OPER_UNKNOWN } else { IF_OPER_DOWN };
     attribute(&mut body, IFLA_OPERSTATE, &[operstate]);
     attribute(&mut body, IFLA_PROTINFO, &inet6_settings(up, true));
-    message(RTM_NEWLINK, NLM_F_MULTI, seq, port, &body)
+    message(RTM_NEWLINK, flags, seq, port, &body)
 }
 /// The `IFLA_EXT_MASK` of a link request, past its `ifinfomsg`: 0 for
 /// none, or for a dump that sends only a family byte.
@@ -2078,7 +2084,10 @@ fn told(
 }
 /// Brings `network`'s loopback up or down: `None` when it already is, else
 /// the notifications of it, `lo`'s `RTM_NEWLINK` with `IFF_UP` changed
-/// first (`rtmsg_ifinfo`), then what happens to its addresses and routes.
+/// first (`rtmsg_ifinfo`), then what happens to its addresses and routes;
+/// coming up, last, IPv6's own `RTM_NEWLINK` for `RTNLGRP_IPV6_IFINFO`, as
+/// `addrconf_notify` sends it at the end of `NETDEV_UP`
+/// (`inet6_ifinfo_notify`). Going down tells IPv6's group nothing.
 fn link_change(network: &Network, up: bool) -> Vec<Notice> {
     let Some(events) = network.set_up(up) else {
         return Vec::new();
@@ -2091,6 +2100,13 @@ fn link_change(network: &Network, up: bool) -> Vec<Notice> {
         bytes: link,
     }];
     notices.extend(told(events, 0, 0, false, false));
+    if up {
+        notices.push(Notice {
+            group: RTNLGRP_IPV6_IFINFO,
+            origin: 0,
+            bytes: inet6_link_message(network, 0, 0, 0),
+        });
+    }
     notices
 }
 /// Brings `network`'s loopback up or down, as `SIOCSIFFLAGS` does, and
@@ -2549,9 +2565,31 @@ mod tests {
     }
 
     #[test]
+    fn coming_up_tells_ipv6s_link_information_last() {
+        let network = Network::isolated(crate::users::first());
+        let up = link_change(&network, true);
+        assert_eq!(up[0].group, RTNLGRP_LINK);
+        let last = up.last().unwrap();
+        assert_eq!((last.group, last.origin), (RTNLGRP_IPV6_IFINFO, 0));
+        let header = Header::read(&last.bytes);
+        assert_eq!((header.kind, header.flags, header.seq), (RTM_NEWLINK, 0, 0));
+        assert_eq!(&last.bytes[12..16], &0u32.to_le_bytes());
+        assert_eq!(last.bytes, inet6_link_message(&network, 0, 0, 0));
+        assert_eq!(last.bytes[16], AF_INET6);
+        assert_eq!(
+            up.iter().filter(|n| n.group == RTNLGRP_IPV6_IFINFO).count(),
+            1
+        );
+        // Going down, or up again, tells IPv6's group nothing.
+        let down = link_change(&network, false);
+        assert!(!down.iter().any(|n| n.group == RTNLGRP_IPV6_IFINFO));
+        assert!(link_change(&network, false).is_empty());
+    }
+
+    #[test]
     fn an_inet6_link_dump_shows_lo_as_ipv6_does() {
         let network = Network::isolated(crate::users::first());
-        let link = inet6_link_message(&network, 4, 7);
+        let link = inet6_link_message(&network, 4, 7, NLM_F_MULTI);
         let header = Header::read(&link);
         assert_eq!(
             (header.len as usize, header.kind, header.flags, header.seq),
@@ -2579,7 +2617,7 @@ mod tests {
         );
         assert_eq!(found[4].1, inet6_settings(false, true));
         network.set_up(true);
-        let link = inet6_link_message(&network, 4, 7);
+        let link = inet6_link_message(&network, 4, 7, NLM_F_MULTI);
         let found = attributes(&link[32..]);
         assert_eq!(found[3].1, [IF_OPER_UNKNOWN]);
         assert_eq!(attributes(found[4].1)[0].1, IF_READY.to_le_bytes());

@@ -2338,9 +2338,6 @@ fn appending(file: &Arc<dyn FileHandle>, flags: u32) -> Result<Option<u64>, Errn
     Ok((metadata.mode & S_IFMT == S_IFREG).then_some(metadata.size))
 }
 
-/// `readv(fd, iov, count)`, and `preadv2` at the file position, as Linux's
-/// `vfs_readv`: the access mode, the vector, nothing to do for no bytes,
-/// the range, then the flags.
 /// Whether `file` has neither `read`/`read_iter` nor `write`/`write_iter`,
 /// so that Linux opens it without `FMODE_CAN_READ` and `FMODE_CAN_WRITE`
 /// and refuses `read`, `write` and their vectored forms (`EINVAL`) once
@@ -2350,6 +2347,10 @@ fn cannot_read_or_write(file: &Arc<dyn FileHandle>) -> bool {
         .and_then(|any| any.downcast_ref::<crate::memfd::Memfd>())
         .is_some_and(crate::memfd::Memfd::is_secret)
 }
+/// `readv(fd, iov, count)`, and `preadv2` at the file position, as Linux's
+/// `vfs_readv`: the access mode, a file that cannot be read
+/// ([`cannot_read_or_write`]), the vector, nothing to do for no bytes, the
+/// range, then the flags.
 fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     let file = c.files.descriptor(a[0])?.file;
     if file.flags() & 3 == 1 {
@@ -2412,8 +2413,9 @@ fn readv_instance(
 }
 
 /// `writev(fd, iov, count)`, and `pwritev2` at the file position, as
-/// Linux's `vfs_writev`: the descriptor and its access mode (EBADF), the
-/// vector (see [`iovecs`]), nothing to do for no bytes, then the flags.
+/// Linux's `vfs_writev`: the descriptor and its access mode (EBADF), a file
+/// that cannot be written ([`cannot_read_or_write`], EINVAL), the vector
+/// (see [`iovecs`]), nothing to do for no bytes, then the flags.
 fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
     let file = c.files.descriptor(a[0])?.file;
     if file.flags() & 3 == 0 {

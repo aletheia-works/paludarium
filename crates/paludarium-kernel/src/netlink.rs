@@ -124,8 +124,10 @@ const RTM_F_NOTIFY: u32 = 0x100;
 const RTM_F_PREFIX: u32 = 0x800;
 /// `NLM_F_DUMP_FILTERED`: a dump that its request narrowed.
 const NLM_F_DUMP_FILTERED: u16 = 0x20;
-/// The multicast routing tables' only table (`RT_TABLE_DEFAULT`).
+/// The multicast routing tables' only table: IPv4's `RT_TABLE_DEFAULT`,
+/// and IPv6's `RT6_TABLE_DFLT`, which is its main one.
 const RT_TABLE_DEFAULT: u32 = 253;
+const RT6_TABLE_DFLT: u32 = 254;
 /// `RTNH_F_ONLINK`.
 const RTNH_F_ONLINK: u32 = 4;
 /// A table past 255, as an `rtmsg` names it.
@@ -976,10 +978,7 @@ impl NetlinkSocket {
         let word = |i: usize| u32::from_le_bytes(payload[i..i + 4].try_into().unwrap_or_default());
         let index = word(4) as i32;
         let attributes = if strict == Some(true) {
-            if payload[1] != 0 || payload[2..4] != [0, 0] || payload[8..16].iter().any(|&b| b != 0)
-            {
-                return Err(Errno::EINVAL);
-            }
+            strict_link_header(payload, false)?;
             strict_attributes(&payload[16..], IFLA_MAX)?
         } else {
             attributes(&payload[16..])
@@ -1421,7 +1420,8 @@ fn bridge_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
 /// Strictly, an AF_INET6 link dump (`inet6_valid_dump_ifinfo`) takes an
 /// `ifinfomsg` alone, with no type, flags, change mask or index (`EINVAL`).
 fn inet6_link_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
-    if strict && payload.len() != 16 {
+    // `nlmsg_attrlen`: nothing may follow the header.
+    if strict && payload.len() > 16 {
         return Err(Errno::EINVAL);
     }
     if strict {
@@ -1558,7 +1558,8 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
 /// each family's, or the one family's; the multicast routing tables have
 /// none. A table the filter names ([`route_filter`]) that the family has
 /// not made is `ENOENT` for a dump of that family alone (the multicast
-/// ones have only `RT_TABLE_DEFAULT`), and shows nothing of it otherwise.
+/// ones have only `RT_TABLE_DEFAULT` for IPv4 and `RT6_TABLE_DFLT`, 254,
+/// for IPv6), and shows nothing of it otherwise.
 fn route_dump(
     network: &Network,
     payload: &[u8],
@@ -1584,7 +1585,12 @@ fn route_dump(
             && (!filter.device || device)
     };
     if matches!(family, RTNL_FAMILY_IPMR | RTNL_FAMILY_IP6MR) {
-        if filter.table != 0 && filter.table != RT_TABLE_DEFAULT {
+        let only = if family == RTNL_FAMILY_IPMR {
+            RT_TABLE_DEFAULT
+        } else {
+            RT6_TABLE_DFLT
+        };
+        if filter.table != 0 && filter.table != only {
             return Err(Errno::ENOENT);
         }
         return Ok(Vec::new());
@@ -3357,8 +3363,12 @@ mod tests {
         assert_eq!(dump(&hundred, 0, &mut 0), Ok(Vec::new()));
         let ipmr = rtmsg(RTNL_FAMILY_IPMR, 100, 0, 0, 0);
         assert_eq!(dump(&ipmr, RTNL_FAMILY_IPMR, &mut 0), Err(Errno::ENOENT));
-        let ip6mr = rtmsg(RTNL_FAMILY_IP6MR, 253, 0, 0, 0);
+        let ipmr = rtmsg(RTNL_FAMILY_IPMR, 253, 0, 0, 0);
+        assert_eq!(dump(&ipmr, RTNL_FAMILY_IPMR, &mut 0), Ok(Vec::new()));
+        let ip6mr = rtmsg(RTNL_FAMILY_IP6MR, 254, 0, 0, 0);
         assert_eq!(dump(&ip6mr, RTNL_FAMILY_IP6MR, &mut 0), Ok(Vec::new()));
+        let ip6mr = rtmsg(RTNL_FAMILY_IP6MR, 253, 0, 0, 0);
+        assert_eq!(dump(&ip6mr, RTNL_FAMILY_IP6MR, &mut 0), Err(Errno::ENOENT));
         // There are no cached routes and no prefix routes.
         for flags in [RTM_F_CLONED, RTM_F_PREFIX] {
             answer = 0;

@@ -9704,7 +9704,9 @@ int main(int argc, char **argv) {
                 {0, 0, 0, 0, 0x1000, 0, 0, "route lookup table"},
                 {0, 0, 0, 0, 0, 6, 1, "route priority"},
                 {128, 100, 0, 0, 0, 0, 0, "ipmr table 100"},
-                {129, 253, 0, 0, 0, 0, 0, "ip6mr default"},
+                {128, 253, 0, 0, 0, 0, 0, "ipmr default"},
+                {129, 254, 0, 0, 0, 0, 0, "ip6mr default"},
+                {129, 253, 0, 0, 0, 0, 0, "ip6mr table 253"},
             };
             for (size_t i = 0; i < sizeof dumps / sizeof dumps[0]; i++) {
                 b = nl_body(dumps[i].family, 12);

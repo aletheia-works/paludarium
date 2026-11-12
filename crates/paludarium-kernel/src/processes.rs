@@ -3146,7 +3146,12 @@ impl Kernel {
         };
         let cookies = self.processes.kcmp_cookies.get_or_init(|| {
             let mut random = [0; crate::kcmp::TYPES * 16];
-            let _ = self.host.random_bytes(&mut random);
+            // Linux draws them at boot and kcmp never fails for want of
+            // them: without the host's bytes they come from std's randomly
+            // keyed hasher, never all zeros.
+            if self.host.random_bytes(&mut random).is_err() {
+                crate::kcmp::fallback_random(&mut random);
+            }
             crate::kcmp::cookies(&random)
         });
         crate::kcmp::compare(

@@ -70,6 +70,19 @@ fn order(
     u64::from(a < b) | u64::from(a > b) << 1
 }
 
+/// Fills `random` from std's hasher, whose keys are random for each
+/// process, for when the host gives no random bytes.
+pub(crate) fn fallback_random(random: &mut [u8]) {
+    use std::hash::{BuildHasher, Hasher};
+    let keys = std::hash::RandomState::new();
+    for (index, chunk) in random.chunks_mut(8).enumerate() {
+        let mut hasher = keys.build_hasher();
+        hasher.write_usize(index);
+        let bytes = hasher.finish().to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+}
+
 /// The cookies Linux's `kcmp_cookies_init` draws at boot: random, each
 /// multiplier odd and with its top bit set.
 pub(crate) fn cookies(random: &[u8; TYPES * 16]) -> [[u64; 2]; TYPES] {
@@ -176,6 +189,10 @@ mod tests {
         assert_eq!(cookie_kind(7), 0);
         assert_eq!(cookie_kind(0), 0);
         assert_eq!(cookie_kind(5), 5);
+        // Without the host's bytes they are not all zeros.
+        let mut random = [0; TYPES * 16];
+        fallback_random(&mut random);
+        assert!(random.iter().any(|&b| b != 0));
         // The cookies Linux draws make each multiplier odd, top bit set.
         let drawn = super::cookies(&[0; TYPES * 16]);
         assert!(drawn.iter().all(|&[_, m]| m & 1 == 1 && m >> 63 == 1));

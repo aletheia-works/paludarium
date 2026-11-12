@@ -3034,7 +3034,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let new = c.files.path(new_dir, new_raw.clone())?;
             let names = (queue_name(&old), queue_name(&new));
             if names.0.is_some() || names.1.is_some() {
-                return rename_queue(c, (&old, &new), names, flags);
+                let walks = ((old_dir, &old_raw[..]), (new_dir, &new_raw[..]));
+                return rename_queue(c, (&old, &new), walks, names, flags);
             }
             crate::permissions::rename(
                 c.files,
@@ -5193,8 +5194,12 @@ fn link_queue(
 fn queue_path(name: &[u8]) -> Vec<u8> {
     [b"/dev/mqueue/".as_slice(), name].concat()
 }
+/// A path as a call's walk takes it: the directory it starts from
+/// (`AT_FDCWD` or a descriptor) and the path as given.
+type Walk<'a> = (u64, &'a [u8]);
 /// `rename` with a name in `/dev/mqueue`, as `do_renameat2` checks it:
-/// both directories are there, on one mount (`EXDEV`, before the names are
+/// both directories are there, each path's walk may search its way
+/// (`EACCES`), they are on one mount (`EXDEV`, before the names are
 /// looked up), the old name is there (`ENOENT`), the new one too with
 /// `RENAME_EXCHANGE` (`ENOENT`) and not with `RENAME_NOREPLACE`
 /// (`EEXIST`); a name onto itself does nothing, and the `mqueue` root has
@@ -5202,11 +5207,15 @@ fn queue_path(name: &[u8]) -> Vec<u8> {
 fn rename_queue(
     c: &Context<'_>,
     (old, new): (&[u8], &[u8]),
+    (old_walk, new_walk): (Walk<'_>, Walk<'_>),
     (old_name, new_name): (Option<Vec<u8>>, Option<Vec<u8>>),
     flags: u32,
 ) -> Result<u64, Errno> {
-    for (p, name) in [(old, &old_name), (new, &new_name)] {
+    // `filename_parentat` of each path in turn: the walk's search
+    // permission (`EACCES`), then the parent itself.
+    for (p, (dir, raw), name) in [(old, old_walk, &old_name), (new, new_walk, &new_name)] {
         if name.is_none() {
+            crate::permissions::search(c.files, &c.process.credentials, dir, raw, false)?;
             parent_there(c, p)?;
         }
     }

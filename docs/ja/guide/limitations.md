@@ -173,7 +173,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
     並びません。そこでは `open`、`stat`、`access`、`getdents`、`unlink`、`rmdir`、`statfs`、
     `mkdir`、`mknod`、`symlink`、`link`、`rename`、`chmod`、`chown`、`utimensat`、`truncate` が
-    Linux と同じに動きます。最初の名前空間のルートの時刻は、そこでキューを作るか消すまでは
+    Linux と同じに動きます。ただし、パスが `/dev/mqueue` そのものを指すときだけです。ほかの
+    場所のシンボリックリンクを通ってそこに着くパスは、ホストで引きます。最初の名前空間のルートの時刻は、そこでキューを作るか消すまでは
     ホストの起動時刻です。Linux では、起動の途中でカーネルがそれを作った、少しあとの時刻です。
   - `SIGEV_THREAD` のクッキーは、netlink ソケットの受信バッファーを 960 バイト（CI の
     ランナーのカーネルでの `truesize`）取りますが、そのソケットのほかのデータグラムは長さの

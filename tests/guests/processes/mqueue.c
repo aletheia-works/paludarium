@@ -1998,6 +1998,51 @@ static int congested_case(void) {
     return 0;
 }
 
+/* A link or rename between /dev/mqueue and another filesystem is EXDEV,
+   but first both paths are walked, so search permission on the way is
+   EACCES before it (filename_parentat, then the mount check). */
+static int links_case(void) {
+    char dir[] = "/tmp/mqueue-links-XXXXXX";
+    if (!mkdtemp(dir)) return 10;
+    chmod(dir, 0755);
+    char out[64], locked[64], hidden[96];
+    snprintf(out, sizeof out, "%s/out", dir);
+    snprintf(locked, sizeof locked, "%s/locked", dir);
+    snprintf(hidden, sizeof hidden, "%s/locked/x", dir);
+    if (mkdir(locked, 0700)) return 12;
+    int hidden_fd = open(hidden, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    if (hidden_fd < 0) return 13;
+    close(hidden_fd);
+    q_unlink(DEV_NAME "-via");
+    long q = q_open(DEV_NAME "-via", O_RDWR | O_CREAT, 0600, NULL);
+    if (q < 0 || fchmod((int)q, 0666)) return 14;
+    printf("across:");
+    put("link", TRY(link(DEV_PATH("-via"), out)));
+    put("rename", TRY(rename(DEV_PATH("-via"), out)));
+    put("rename-back", TRY(rename(hidden, DEV_PATH("-via2"))));
+    say("");
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unprivileged()) _exit(90);
+        printf("searched:");
+        put("rename-to", TRY(rename(DEV_PATH("-via"), hidden)));
+        put("rename-from", TRY(rename(hidden, DEV_PATH("-via2"))));
+        put("exchange-to", TRY(syscall(SYS_renameat2, AT_FDCWD, DEV_PATH("-via"), AT_FDCWD, hidden, 2)));
+        put("link-to", TRY(link(DEV_PATH("-via"), hidden)));
+        put("link-from", TRY(link(hidden, DEV_PATH("-via2"))));
+        put("rename-open", TRY(rename(DEV_PATH("-via"), out)));
+        say("");
+        _exit(0);
+    }
+    say("searched: status=%d", wait_child(pid));
+    close((int)q);
+    q_unlink(DEV_NAME "-via");
+    unlink(hidden);
+    rmdir(locked);
+    rmdir(dir);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -2013,5 +2058,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-dev")) return dev_case();
     if (!strcmp(mode, "mqueue-room")) return room_case();
     if (!strcmp(mode, "mqueue-congested")) return congested_case();
+    if (!strcmp(mode, "mqueue-links")) return links_case();
     return 3;
 }

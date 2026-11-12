@@ -88,6 +88,7 @@
     {"name":"mqueue-dev","binary":"mqueue"},
     {"name":"mqueue-room","binary":"mqueue"},
     {"name":"mqueue-congested","binary":"mqueue"},
+    {"name":"mqueue-links","binary":"mqueue"},
     {"name":"pgid-exec","binary":"process"},
     {"name":"priority","binary":"process"},
     {"name":"sysinfo","binary":"process"},

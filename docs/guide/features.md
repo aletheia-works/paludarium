@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
@@ -1001,6 +1001,22 @@ kernel.
   `pkey_free` gives `EINVAL`; and `pkey_mprotect` with key `-1` is `mprotect`,
   while any other key gives `EINVAL` after the checks Linux makes first (an
   empty range succeeds, an overflowing one gives `ENOMEM`).
+- `mseal` seals mappings as Linux's `mm/mseal.c` does. It takes no flags and a
+  page-aligned start, and a length that wraps or runs past the top is
+  `EINVAL`; a range with an unmapped page is `ENOMEM`, and seals nothing.
+  Each refusal of a sealed mapping is `EPERM`:
+  - `munmap` unmaps nothing of a range that holds one, and neither `mmap` with
+    `MAP_FIXED`, `mremap` (of it, or with `MREMAP_FIXED` onto it),
+    `remap_file_pages` nor a shrinking `brk` replaces it (`brk` keeps the
+    break).
+  - `mprotect` and `pkey_mprotect` change the mappings before the first
+    sealed one in the range and stop there, as Linux's per-VMA loop does,
+    even for the protection it already has.
+  - `MADV_DONTNEED` and `MADV_FREE` do not discard a sealed private anonymous
+    mapping that may not be written; a writable or file mapping may still be.
+  - `shmdt` of a sealed attachment succeeds and leaves it mapped, as Linux
+    ignores its failed unmap.
+  - A child of `fork` keeps the seals; `exec` starts without any.
 - io_uring is Linux 6.12's with two operations, `IORING_OP_NOP` and
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with); the
   other operations complete with `EOPNOTSUPP`, as on a Linux built without

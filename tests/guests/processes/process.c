@@ -6564,6 +6564,110 @@ static pid_t kc_child(int dumpable) {
     close(ready[0]);
     return pid;
 }
+/* mseal, as Linux's mm/mseal.c: a sealed mapping is not unmapped, moved,
+ * resized, given another protection, mapped over or (when anonymous and
+ * read-only) discarded; each refusal is EPERM. */
+static long ms_err(long r) { return r < 0 ? -errno : r; }
+static long ms_seal(void *addr, unsigned long len, unsigned long flags) {
+    return ms_err(syscall(462, addr, len, flags));
+}
+/* The permissions /proc/self/maps shows for the page at `addr`, or "----"
+ * where nothing is mapped. */
+static const char *ms_perms(void *addr) {
+    static char perms[5];
+    unsigned long at = (unsigned long)addr, start, end;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    strcpy(perms, "----");
+    if (!maps) return perms;
+    char line[512], p[5];
+    while (fgets(line, sizeof line, maps)) {
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, p) == 3 && start <= at && at < end) {
+            memcpy(perms, p, 4);
+            break;
+        }
+    }
+    fclose(maps);
+    return perms;
+}
+static int mseal_case(void) {
+    const unsigned long page = 4096;
+    char *p = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 80;
+    /* Arguments: flags, alignment, a length that wraps, none. */
+    printf("mseal args flags=%ld unaligned=%ld wraps=%ld past=%ld none=%ld\n", ms_seal(p, page, 1),
+           ms_seal(p + 1, page, 0), ms_seal(p, -1UL, 0), ms_seal((void *)-page, 2 * page, 0),
+           ms_seal(p, 0, 0));
+    /* A hole: ENOMEM, and nothing is sealed. */
+    munmap(p + 2 * page, page);
+    long hole = ms_seal(p, 4 * page, 0);
+    long after_hole = ms_err(mprotect(p, page, PROT_READ));
+    mprotect(p, page, PROT_READ | PROT_WRITE);
+    char *again = mmap(p + 2 * page, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    printf("mseal hole=%ld mprotect-after=%ld remapped=%d\n", hole, after_hole, again == p + 2 * page);
+    /* Seal the middle two pages; again is fine. */
+    p[page] = 7;
+    printf("mseal middle=%ld twice=%ld\n", ms_seal(p + page, 2 * page, 0), ms_seal(p + page, page, 0));
+    /* mprotect applies the pages before the first sealed one, then EPERM,
+     * even for the protection it has. */
+    long protect = ms_err(mprotect(p, 4 * page, PROT_READ));
+    printf("mprotect range=%ld first=%s sealed=%s last=%s same=%ld pkey=%ld\n", protect, ms_perms(p),
+           ms_perms(p + page), ms_perms(p + 3 * page),
+           ms_err(mprotect(p + page, page, PROT_READ | PROT_WRITE)),
+           ms_err(syscall(SYS_pkey_mprotect, p + page, page, PROT_READ, -1)));
+    mprotect(p, page, PROT_READ | PROT_WRITE);
+    /* munmap refuses the whole range, and unmaps nothing. */
+    long unmap = ms_err(munmap(p, 4 * page));
+    printf("munmap range=%ld first=%s sealed-part=%ld\n", unmap, ms_perms(p),
+           ms_err(munmap(p + 2 * page, page)));
+    /* mremap, a mapping over it, and MREMAP_FIXED onto it. */
+    char *spare = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *grown = mremap(p + page, page, 2 * page, MREMAP_MAYMOVE);
+    long grown_err = grown == MAP_FAILED ? -errno : 0;
+    void *onto = mremap(spare, page, page, MREMAP_MAYMOVE | MREMAP_FIXED, p + page);
+    long onto_err = onto == MAP_FAILED ? -errno : 0;
+    void *over = mmap(p + page, page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    long over_err = over == MAP_FAILED ? -errno : 0;
+    printf("mremap grow=%ld onto=%ld mmap-fixed=%ld value=%d\n", grown_err, onto_err, over_err, p[page]);
+    /* A writable sealed mapping may still be discarded. */
+    printf("madvise writable=%ld value=%d\n", ms_err(madvise(p + page, page, MADV_DONTNEED)), p[page]);
+    /* Not a read-only anonymous one, but a file mapping. */
+    char *ro = mmap(NULL, page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int memfd = memfd_create("mseal", 0);
+    if (ro == MAP_FAILED || memfd < 0 || ftruncate(memfd, page)) return 81;
+    char *file = mmap(NULL, page, PROT_READ, MAP_PRIVATE, memfd, 0);
+    if (file == MAP_FAILED) return 82;
+    ms_seal(ro, page, 0);
+    ms_seal(file, page, 0);
+    printf("madvise read-only=%ld free=%ld normal=%ld file=%ld\n", ms_err(madvise(ro, page, MADV_DONTNEED)),
+           ms_err(madvise(ro, page, MADV_FREE)), ms_err(madvise(ro, page, MADV_NORMAL)),
+           ms_err(madvise(file, page, MADV_DONTNEED)));
+    /* A child inherits the seal. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        printf("mseal child mprotect=%ld\n", ms_err(mprotect(p + page, page, PROT_READ)));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    /* The break does not shrink over a sealed page. */
+    unsigned long brk0 = syscall(SYS_brk, 0);
+    unsigned long grown_brk = syscall(SYS_brk, brk0 + 2 * page);
+    unsigned long top = (brk0 + page - 1) & ~(page - 1);
+    long heap = ms_seal((void *)top, page, 0);
+    unsigned long shrunk = syscall(SYS_brk, brk0);
+    printf("brk grew=%d seal=%ld kept=%d\n", grown_brk == brk0 + 2 * page, heap, shrunk == grown_brk);
+    /* shmdt of a sealed attachment succeeds and leaves it mapped. */
+    int id = (int)syscall(SYS_shmget, 0, page, 01000 | 0600);
+    char *shm = (char *)syscall(SYS_shmat, id, 0, 0);
+    if (id < 0 || shm == (char *)-1) return 83;
+    shm[0] = 5;
+    long sealed_shm = ms_seal(shm, page, 0);
+    long detach = ms_err(syscall(SYS_shmdt, shm));
+    printf("shmdt seal=%ld detach=%ld mapped=%s value=%d\n", sealed_shm, detach, ms_perms(shm), shm[0]);
+    syscall(SYS_shmctl, id, 0, 0);
+    return 0;
+}
 static int kcmp_case(void) {
     if (pipe(kc_gate)) return 80;
     long self = getpid();
@@ -18535,6 +18639,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "futex-requeue")) return futex_requeue_case();
     if (!strcmp(mode, "futex-wake-op")) return futex_wake_op_case();
     if (!strcmp(mode, "kcmp")) return kcmp_case();
+    if (!strcmp(mode, "mseal")) return mseal_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();

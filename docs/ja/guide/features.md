@@ -47,7 +47,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
@@ -881,6 +881,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PKEY_DISABLE_WRITE` 以外の権利には `EINVAL` です。`pkey_free` は `EINVAL` です。
   `pkey_mprotect` はキーが `-1` なら `mprotect` と同じで、それ以外のキーは、Linux が先に
   行う確認のあとで `EINVAL` です（空の範囲は成功し、あふれる範囲は `ENOMEM` です）。
+- `mseal` は、Linux の `mm/mseal.c` と同じようにマッピングを封印します。フラグは受け付けず、
+  先頭はページ境界でなければならず、一周する長さや上端を超える長さは `EINVAL` です。
+  マップされていないページを含む範囲は `ENOMEM` で、何も封印しません。封印された
+  マッピングへの操作は、どれも `EPERM` で拒否されます。
+  - `munmap` は、封印されたマッピングを含む範囲を何も解除しません。`MAP_FIXED` の
+    `mmap`、`mremap`（それ自身の、または `MREMAP_FIXED` でそこへの）、
+    `remap_file_pages`、縮める `brk` も置き換えません（`brk` はブレークを変えません）。
+  - `mprotect` と `pkey_mprotect` は、Linux の VMA ごとのループと同じく、範囲で最初の
+    封印されたマッピングより前を変えてからそこで止まります。同じ保護でも止まります。
+  - `MADV_DONTNEED` と `MADV_FREE` は、書き込めない封印されたプライベートの匿名
+    マッピングを捨てません。書き込めるものやファイルのマッピングは捨てられます。
+  - 封印された共有メモリの `shmdt` は、Linux が失敗した解除を無視するのと同じく、
+    成功してマップされたまま残します。
+  - `fork` の子は封印を受け継ぎ、`exec` のあとは何も封印されていません。
 - io_uring は、操作が `IORING_OP_NOP` と `IORING_OP_EPOLL_CTL`（libuv が `epoll_ctl` を
   まとめるのに使います）の 2 つだけの Linux 6.12 のものです。ほかの操作は、それらなしで
   ビルドした Linux と同じく `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もその 2 つだけを

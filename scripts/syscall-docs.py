@@ -318,6 +318,7 @@ NAMES = {
     454: "futex_wake",
     455: "futex_wait",
     456: "futex_requeue",
+    462: "mseal",
     463: "setxattrat",
     464: "getxattrat",
     465: "listxattrat",

@@ -101,6 +101,10 @@ pub struct Mapping {
     /// Linux's `anon_vma`, which the VMA keeps through splits, `fork` and
     /// `mremap`, and which a core dump writes a private mapping whole for.
     pub written: bool,
+    /// `mseal` sealed it (Linux's `VM_SEALED`): it is not unmapped, moved,
+    /// resized or given another protection (EPERM), and its anonymous
+    /// read-only pages are not discarded.
+    pub sealed: bool,
 }
 
 /// What a core dump needs to know of the Linux VMA at an address
@@ -2725,6 +2729,7 @@ impl AddressSpaceData {
                 prot,
                 kind,
                 written: false,
+                sealed: false,
             },
         );
         Ok(GuestAddr(start))
@@ -2782,9 +2787,14 @@ impl AddressSpaceData {
         self.mappings.insert(at, tail);
     }
 
-    /// Unmaps `[addr, addr+len)`. Unmapped holes inside the range are fine.
+    /// Unmaps `[addr, addr+len)`. Unmapped holes inside the range are fine;
+    /// a sealed mapping in it is EPERM, and nothing is unmapped
+    /// (`vms_gather_munmap_vmas`).
     pub fn unmap(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
+        if self.sealed_in(addr.0, end) {
+            return Err(Errno::EPERM);
+        }
         let affected: Vec<_> = self
             .shared
             .iter()
@@ -2823,12 +2833,13 @@ impl AddressSpaceData {
     }
 
     /// Whether two mappings would be one Linux VMA when adjacent: the same
-    /// protection and kind, and both the same shared memory, or both private
+    /// protection, kind and seal, and both the same shared memory, or both private
     /// and of no file or of the same file at contiguous offsets, as Linux's
     /// `vma_merge` asks for the same `vm_file` and following `vm_pgoff`.
     fn mergeable(&self, a: &Mapping, b: &Mapping) -> bool {
         a.prot == b.prot
             && a.kind == b.kind
+            && a.sealed == b.sealed
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -2991,7 +3002,10 @@ impl AddressSpaceData {
         {
             return Err(Errno::EINVAL);
         }
-        self.mapping_at(addr.0).ok_or(Errno::EFAULT)?;
+        // A sealed VMA is not remapped (`check_prep_vma`).
+        if self.mapping_at(addr.0).ok_or(Errno::EFAULT)?.sealed {
+            return Err(Errno::EPERM);
+        }
         if new_addr.is_none() && new_len <= old_len {
             if new_len < old_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
@@ -3064,6 +3078,39 @@ impl AddressSpaceData {
         Ok(GuestAddr(to))
     }
 
+    /// Whether a mapping in `[start, end)` is sealed.
+    fn sealed_in(&self, start: u64, end: u64) -> bool {
+        self.mappings
+            .range(..end)
+            .any(|(_, m)| m.sealed && m.end() > start)
+    }
+
+    /// `mseal(addr, len)` of a range that every page of which is mapped
+    /// (else ENOMEM, and nothing is sealed): its mappings are split at its
+    /// ends and sealed, as Linux's `mseal_range` seals its VMAs.
+    pub fn seal(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
+        let end = checked_range(addr, len)?;
+        if !self.covers(addr, len)? {
+            return Err(Errno::ENOMEM);
+        }
+        self.split_at(addr.0);
+        self.split_at(end);
+        for (_, m) in self.mappings.range_mut(addr.0..end) {
+            m.sealed = true;
+        }
+        Ok(())
+    }
+
+    /// Whether `m`, sealed, refuses to have its pages discarded
+    /// (`can_madvise_modify`): private anonymous memory that may not be
+    /// written, whose contents a discard would lose.
+    fn refuses_discard(&self, m: &Mapping) -> bool {
+        m.sealed
+            && !m.prot.contains(Prot::WRITE)
+            && !matches!(m.kind, MappingKind::ElfSegment | MappingKind::File)
+            && self.shared_at(m.start.0).is_none()
+    }
+
     /// Whether every page of `[addr, addr+len)` is mapped (`msync`).
     pub fn covers(&self, addr: GuestAddr, len: u64) -> Result<bool, Errno> {
         let end = checked_range(addr, len)?;
@@ -3086,7 +3133,7 @@ impl AddressSpaceData {
         let end = checked_range(addr, len)?;
         // The mappings must cover the range without holes.
         let mut covered = addr.0;
-        let mut denied = false;
+        let mut denied = None;
         for (_, m) in self.mappings.range(..end) {
             if m.end() <= covered {
                 continue;
@@ -3102,13 +3149,19 @@ impl AddressSpaceData {
                     .shared_at(m.start.0)
                     .is_some_and(|shared| !shared.may_write)
             {
-                denied = true;
+                denied = Some(Errno::EACCES);
+                break;
+            }
+            // A sealed one keeps its protection, even the same one
+            // (`mprotect_fixup`).
+            if m.sealed {
+                denied = Some(Errno::EPERM);
                 break;
             }
             covered = m.end();
         }
         if covered == addr.0 {
-            return Err(if denied { Errno::EACCES } else { Errno::ENOMEM });
+            return Err(denied.unwrap_or(Errno::ENOMEM));
         }
         // Linux applies the mapped prefix before reporting a later hole or
         // a mapping that refuses the protection.
@@ -3127,8 +3180,8 @@ impl AddressSpaceData {
                 page.prot = prot;
             }
         });
-        if denied {
-            Err(Errno::EACCES)
+        if let Some(e) = denied {
+            Err(e)
         } else if incomplete {
             Err(Errno::ENOMEM)
         } else {
@@ -3149,9 +3202,15 @@ impl AddressSpaceData {
         let mut covered = addr.0;
         let mut hole = false;
         let mut private = Vec::new();
+        let mut sealed = false;
         for (_, m) in self.mappings.range(..end) {
             if m.end() <= addr.0 {
                 continue;
+            }
+            // Linux discards VMA by VMA, and stops at a sealed one.
+            if self.refuses_discard(m) {
+                sealed = true;
+                break;
             }
             hole |= m.start.0 > covered;
             covered = m.end();
@@ -3166,7 +3225,7 @@ impl AddressSpaceData {
                 private.push((start, m.end().min(end)));
             }
         }
-        hole |= covered < end;
+        hole |= !sealed && covered < end;
         if !private.is_empty() {
             self.bump_code_generation();
         }
@@ -3174,7 +3233,13 @@ impl AddressSpaceData {
             self.for_populated(start, end, |entry| *entry = None);
             self.refill(start, end);
         }
-        if hole { Err(Errno::ENOMEM) } else { Ok(()) }
+        if sealed {
+            Err(Errno::EPERM)
+        } else if hole {
+            Err(Errno::ENOMEM)
+        } else {
+            Ok(())
+        }
     }
 
     /// Whether `[addr, addr+len)` is all private anonymous memory, as
@@ -3190,6 +3255,9 @@ impl AddressSpaceData {
             }
             hole |= m.start.0 > covered;
             covered = m.end();
+            if self.refuses_discard(m) {
+                return Err(Errno::EPERM);
+            }
             if matches!(m.kind, MappingKind::ElfSegment | MappingKind::File)
                 || self.shared_at(m.start.0.max(addr.0)).is_some()
             {
@@ -4098,6 +4166,10 @@ impl AddressSpace {
     pub fn unmap_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().unmap(addr, len)
     }
+    /// See [`AddressSpaceData::seal`].
+    pub fn seal_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
+        self.locked().seal(addr, len)
+    }
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)
     }
@@ -4665,6 +4737,62 @@ mod tests {
         let c = space.map(None, PAGE_SIZE, Prot::READ_WRITE, anon).unwrap();
         assert_eq!(c, a);
         assert_eq!(space.mappings().count(), 2);
+    }
+
+    #[test]
+    fn a_sealed_mapping_refuses_changes_as_mseal_has_it() {
+        let mut space = space_with(0x50000, 4 * PAGE_SIZE, Prot::READ_WRITE);
+        let at = |n: u64| GuestAddr(0x50000 + n * PAGE_SIZE);
+        // A hole is ENOMEM, and seals nothing.
+        space.unmap(at(3), PAGE_SIZE).unwrap();
+        assert_eq!(space.seal_shared(at(0), 4 * PAGE_SIZE), Err(Errno::ENOMEM));
+        assert!(space.mappings().all(|m| !m.sealed));
+        space.seal_shared(at(1), PAGE_SIZE).unwrap();
+        let sealed: Vec<_> = space.mappings().map(|m| (m.start.0, m.sealed)).collect();
+        assert_eq!(
+            sealed,
+            vec![(at(0).0, false), (at(1).0, true), (at(2).0, false)]
+        );
+        // mprotect changes what comes before it, then stops.
+        assert_eq!(
+            space.protect(at(0), 3 * PAGE_SIZE, Prot::READ),
+            Err(Errno::EPERM)
+        );
+        let prots: Vec<_> = space.mappings().map(|m| m.prot).collect();
+        assert_eq!(prots, vec![Prot::READ, Prot::READ_WRITE, Prot::READ_WRITE]);
+        assert_eq!(
+            space.protect(at(1), PAGE_SIZE, Prot::READ_WRITE),
+            Err(Errno::EPERM)
+        );
+        // munmap unmaps nothing; mremap and MAP_FIXED do not touch it.
+        assert_eq!(space.unmap(at(0), 3 * PAGE_SIZE), Err(Errno::EPERM));
+        assert_eq!(space.mappings().count(), 3);
+        let grow = Remap {
+            may_move: true,
+            fixed: false,
+            keep_old: false,
+            new_addr: GuestAddr(0),
+        };
+        assert_eq!(
+            space.remap_shared(at(1), PAGE_SIZE, 2 * PAGE_SIZE, grow),
+            Err(Errno::EPERM)
+        );
+        // Writable, it may be discarded; read-only and anonymous, not.
+        space.write_u64(at(1), 7).unwrap();
+        space.discard_shared(at(1), PAGE_SIZE).unwrap();
+        assert_eq!(space.read_u64(at(1)).unwrap(), 0);
+        space.seal_shared(at(0), PAGE_SIZE).unwrap();
+        assert_eq!(space.discard_shared(at(0), PAGE_SIZE), Err(Errno::EPERM));
+        assert_eq!(
+            space.check_private_anonymous(at(0), PAGE_SIZE),
+            Err(Errno::EPERM)
+        );
+        // Sealed and not sealed do not merge: the unsealed page goes alone.
+        space.unmap(at(2), PAGE_SIZE).unwrap();
+        assert_eq!(space.mappings().count(), 2);
+        // A fork keeps the seal.
+        let child = space.fork();
+        assert!(child.mappings().all(|m| m.sealed));
     }
 
     #[test]

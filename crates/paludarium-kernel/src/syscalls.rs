@@ -40,6 +40,7 @@ pub mod nr {
     pub const PKEY_MPROTECT: u64 = 329;
     pub const PKEY_ALLOC: u64 = 330;
     pub const PKEY_FREE: u64 = 331;
+    pub const MSEAL: u64 = 462;
     pub const MUNMAP: u64 = 11;
     pub const BRK: u64 = 12;
     pub const RT_SIGACTION: u64 = 13;
@@ -153,7 +154,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 84] = [
+        let entries: [(u64, Handler); 85] = [
             (nr::GETITIMER, sys_getitimer),
             (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
@@ -179,6 +180,7 @@ impl SyscallTable {
             (nr::PKEY_ALLOC, sys_pkey_alloc),
             (nr::PKEY_FREE, sys_pkey_free),
             (nr::MUNMAP, sys_munmap),
+            (nr::MSEAL, sys_mseal),
             (nr::BRK, sys_brk),
             (nr::RT_SIGACTION, sys_rt_sigaction),
             (nr::RT_SIGPROCMASK, sys_rt_sigprocmask),
@@ -2149,6 +2151,32 @@ fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         },
         Ok(true) => ok(0),
         Ok(false) | Err(_) => err(Errno::ENOMEM),
+    }
+}
+
+/// `mseal(addr, len, flags)`, as Linux's: no flags (EINVAL), a page-aligned
+/// start, a length rounded up to pages that neither wraps to 0 nor runs
+/// past the top (EINVAL), nothing to do for none, then a range every page
+/// of which is mapped (ENOMEM), whose mappings are sealed
+/// ([`paludarium_mmu::Mapping::sealed`]).
+fn sys_mseal(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (start, len, flags) = (a[0], a[1], a[2]);
+    if flags != 0 || start & 4095 != 0 {
+        return err(Errno::EINVAL);
+    }
+    let aligned = len.wrapping_add(4095) & !4095;
+    if len != 0 && aligned == 0 {
+        return err(Errno::EINVAL);
+    }
+    let Some(end) = start.checked_add(aligned) else {
+        return err(Errno::EINVAL);
+    };
+    if end == start {
+        return ok(0);
+    }
+    match c.mem.seal_shared(GuestAddr(start), aligned) {
+        Ok(()) => ok(0),
+        Err(e) => err(e),
     }
 }
 

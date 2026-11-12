@@ -500,6 +500,7 @@ mod linux {
         processes_futex_requeue => ("futex-requeue","process"),
         processes_futex_wake_op => ("futex-wake-op","process"),
         processes_kcmp => ("kcmp","process"),
+        processes_mseal => ("mseal","process"),
         processes_process_vm => ("process-vm","process"),
         processes_pidfd_getfd => ("pidfd-getfd","process"),
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),

@@ -413,6 +413,17 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
     let lies = |start: u64, offset: u64| start.wrapping_sub(addr) / PAGE == offset / PAGE;
     let mut rest = fragments.iter().skip_while(|f| f.end <= addr);
     let mut found = None;
+    let mut detached = false;
+    let unmap = |f: &paludarium_mmu::SharedFragment| {
+        let unmapped = c
+            .mem
+            .unmap_shared(GuestAddr(f.start), f.end - f.start)
+            .is_ok();
+        if unmapped {
+            c.group.numa().forget(f.start, f.end - f.start);
+        }
+        unmapped
+    };
     for f in rest.by_ref() {
         if let Some(&(id, size)) = attachments.get(&f.open_file)
             && lies(f.start, f.offset)
@@ -420,8 +431,7 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
             // Linux bounds the pieces by the size rounded up to a page
             // (`size = PAGE_ALIGN(size)` before its second loop).
             found = Some((f.open_file, id, size.div_ceil(PAGE) * PAGE));
-            c.mem.unmap_shared(GuestAddr(f.start), f.end - f.start)?;
-            c.group.numa().forget(f.start, f.end - f.start);
+            detached |= unmap(f);
             break;
         }
     }
@@ -430,13 +440,14 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
     };
     for f in rest.take_while(|f| f.end - addr <= size) {
         if f.open_file == file && lies(f.start, f.offset) {
-            c.mem.unmap_shared(GuestAddr(f.start), f.end - f.start)?;
-            c.group.numa().forget(f.start, f.end - f.start);
+            detached |= unmap(f);
         }
     }
     let shm = segments(c);
     let mut table = shm.lock();
-    if let Ok(segment) = table.checked(id) {
+    // A sealed piece stays (Linux ignores `do_vmi_align_munmap`'s EPERM),
+    // and only a closed one counts as a detach.
+    if detached && let Ok(segment) = table.checked(id) {
         segment.dtime = ipc::now(c);
         segment.lpid = c.process.pid;
     }

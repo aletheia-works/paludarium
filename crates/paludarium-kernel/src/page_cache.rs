@@ -919,6 +919,9 @@ impl FileHandle for CoherentFile {
         self.changed(Notifier::times_mask(atime.is_some(), mtime.is_some()));
         Ok(())
     }
+    fn dontcache(&self) -> bool {
+        self.inner.dontcache()
+    }
     fn sync(&self) -> Result<(), Errno> {
         if let Some(cache) = self.cache() {
             cache.write_back()?;

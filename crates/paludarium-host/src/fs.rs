@@ -88,6 +88,13 @@ pub trait FileHandle: Send + Sync {
     fn set_times(&self, _atime: Option<i128>, _mtime: Option<i128>) -> Result<(), Errno> {
         Err(Errno::EPERM)
     }
+    /// Whether `RWF_DONTCACHE` is taken (Linux's `FOP_DONTCACHE`): a
+    /// regular file on the host's own file system, as on ext4. Pipes,
+    /// sockets, in-memory files (tmpfs's, shmem's) and the files the kernel
+    /// makes (`/proc`) have none.
+    fn dontcache(&self) -> bool {
+        false
+    }
     /// `fsync` and `fdatasync`. Kinds that cannot be synchronised (pipes,
     /// sockets, terminals, devices) give `EINVAL`, as on Linux.
     fn sync(&self) -> Result<(), Errno> {

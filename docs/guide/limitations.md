@@ -204,7 +204,7 @@ verified.
     takes it, a write gives `EOPNOTSUPP`, where tmpfs refuses both and other
     filesystems may take a write, and a read never finds its pages uncached
     (Linux's `EAGAIN`). `RWF_DONTCACHE` too is taken for every regular file
-    of the host's, as ext4 takes it, where tmpfs and other filesystems
+    on the host's own file system, as ext4 takes it, where tmpfs and other filesystems
     without it give `EOPNOTSUPP`.
   - An error that ends `recvmmsg` after some messages is dropped, where
     Linux keeps it as the socket's error for the next call and

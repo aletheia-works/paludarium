@@ -91,8 +91,9 @@ kernel.
   regular file, a pipe, a socket, an eventfd or a signalfd; `EOPNOTSUPP` for
   the rest) and then gives `EAGAIN` where the call would wait.
   `RWF_DONTCACHE` needs a file system that has it (`FOP_DONTCACHE`): a
-  regular file of the host's, as on ext4, takes it and it changes nothing
-  (nothing is cached), while a pipe, a socket, a memfd (shmem) or a file the
+  regular file on the host's own file system, as on ext4, takes it and it
+  changes nothing (nothing is cached), while a pipe, a socket, an in-memory
+  file (a memfd, or one of an in-memory file system, as tmpfs) or a file the
   kernel makes (`/proc`) gives `EOPNOTSUPP`. `RWF_NOSIGNAL` spares a write to
   a pipe or socket with no reader its `SIGPIPE` (it still gives `EPIPE`), as
   since Linux 6.18. `RWF_APPEND` writes a regular file at its end,

@@ -1991,9 +1991,10 @@ fn rw_flags(file: &Arc<dyn FileHandle>, flags: u32, write: bool) -> Result<u32, 
 /// opened with `FMODE_NOWAIT`: here a regular file (as on ext4; tmpfs has
 /// none), a pipe, a socket, an eventfd or a signalfd. No file can write
 /// atomically (`FMODE_CAN_ATOMIC_WRITE`). `RWF_DONTCACHE` needs a file
-/// system with `FOP_DONTCACHE`: a regular file of the host's, as on ext4,
-/// and not a pipe, a socket, a memfd (shmem) or a file the kernel makes
-/// (`/proc`). `RWF_NOSIGNAL` is taken by any file (a write to a pipe or
+/// system with `FOP_DONTCACHE` ([`FileHandle::dontcache`]): a regular file
+/// on the host's own file system, as on ext4, and not a pipe, a socket, an
+/// in-memory file (a memfd, or a file of an in-memory file system, as
+/// tmpfs) or a file the kernel makes (`/proc`). `RWF_NOSIGNAL` is taken by any file (a write to a pipe or
 /// socket with no reader then raises no `SIGPIPE`). `RWF_NOAPPEND` cannot
 /// turn an `O_APPEND` file's append off here.
 pub(crate) fn kiocb_rw_flags(
@@ -2026,7 +2027,7 @@ pub(crate) fn kiocb_rw_flags(
     if flags & RWF_ATOMIC != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    if flags & RWF_DONTCACHE != 0 && (kind != S_IFREG || file.as_any().is_some()) {
+    if flags & RWF_DONTCACHE != 0 && (kind != S_IFREG || !file.dontcache()) {
         return Err(Errno::EOPNOTSUPP);
     }
     if write && flags & RWF_NOAPPEND != 0 && file.flags() & O_APPEND != 0 {

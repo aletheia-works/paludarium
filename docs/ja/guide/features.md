@@ -78,9 +78,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書けるファイルがないので `EOPNOTSUPP` です。`RWF_NOWAIT` は待たずに読み書きできるファイル
   （通常のファイル、パイプ、ソケット、eventfd、signalfd。ほかは `EOPNOTSUPP`）で使え、待つ
   ところで `EAGAIN` を返します。`RWF_DONTCACHE` は、それを持つファイルシステム
-  （`FOP_DONTCACHE`）が必要です。ホストの通常のファイルは ext4 と同じく受け付け、何も変えません
-  （何もキャッシュしません）。パイプ、ソケット、memfd（shmem）、カーネルが作るファイル
-  （`/proc`）は `EOPNOTSUPP` です。`RWF_NOSIGNAL` は、Linux 6.18 からと同じく、読む側のない
+  （`FOP_DONTCACHE`）が必要です。ホストのファイルシステムにある通常のファイルは ext4 と同じく受け付け、
+  何も変えません（何もキャッシュしません）。パイプ、ソケット、メモリ上のファイル（memfd や、
+  tmpfs のようなメモリ上のファイルシステムのもの）、カーネルが作るファイル（`/proc`）は
+  `EOPNOTSUPP` です。`RWF_NOSIGNAL` は、Linux 6.18 からと同じく、読む側のない
   パイプやソケットへの書き込みで `SIGPIPE` を送りません（`EPIPE` は返します）。
   `RWF_APPEND` は通常のファイルの末尾に書き、`RWF_DSYNC` と
   `RWF_SYNC` は `fdatasync` と同じく書き出し、`RWF_HIPRI` は何も変えません。

@@ -4080,6 +4080,16 @@ mod vectored_flags {
             errno(Errno::EOPNOTSUPP)
         );
         assert_eq!(f.ret(PWRITEV2, &[memfd, iov, 1, 0, 0, 0x100]), 2);
+        // Nor has a file the kernel makes.
+        f.mem
+            .write(GuestAddr(DATA), b"/proc/self/status\0")
+            .unwrap();
+        let status = f.ret(2, &[DATA, 0, 0]);
+        assert_eq!(
+            f.ret(PREADV2, &[status, iov, 1, 0, 0, 0x80]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(f.ret(PREADV2, &[status, iov, 1, 0, 0, 0]), 2);
         // With no reader, NOSIGNAL gives EPIPE without SIGPIPE.
         assert_eq!(f.ret(3, &[reader]), 0);
         f.thread.state.signal_mask = 1 << 12;
@@ -4107,10 +4117,10 @@ mod vectored_flags {
         let read = |f: &mut Fixture, flags: u64| f.ret(PREADV2, &[fd, iov, 1, 0, 0, flags]);
         assert_eq!(read(&mut f, 0x200), errno(Errno::EOPNOTSUPP));
         assert_eq!(read(&mut f, 0x30), errno(Errno::EINVAL));
-        // A host's regular file takes DONTCACHE, as ext4's does, and any file
-        // NOSIGNAL.
-        assert_eq!(read(&mut f, 0x80), 2);
+        // Any file takes NOSIGNAL. This in-memory file has no DONTCACHE, as
+        // tmpfs has none (a host file's is `NativeFile::dontcache`).
         assert_eq!(read(&mut f, 0x100), 2);
+        assert_eq!(read(&mut f, 0x80), errno(Errno::EOPNOTSUPP));
         assert_eq!(read(&mut f, 0x40), errno(Errno::EOPNOTSUPP)); // RWF_ATOMIC
         // HIPRI, DSYNC, SYNC and NOWAIT read a regular file.
         assert_eq!(read(&mut f, 0xf), 2);

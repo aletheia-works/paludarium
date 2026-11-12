@@ -314,7 +314,9 @@ static int case_rw(void) {
         {"read-directory", rw(CMD_PREAD, dir, rbuf, 1, 0, 0)},
         {"negative-offset", rw(CMD_PREAD, fd, rbuf, 1, -1, 0)},
         {"offset-overflow", rw(CMD_PREAD, fd, rbuf, 2, 0x7fffffffffffffffll, 0)},
-        {"kernel-buffer", rw(CMD_PREAD, fd, (void *)(1ul << 47), 1, 0, 0)},
+        /* A kernel address, which no paging mode lets user space have:
+           1 << 47 is a user one with five-level paging. */
+        {"kernel-buffer", rw(CMD_PREAD, fd, (void *)0xffff800000000000ul, 1, 0, 0)},
         {"too-many-iovecs", rw(CMD_PREADV, fd, iov, 1025, 0, 0)},
         {"bad-iovecs", rw(CMD_PREADV, fd, (void *)8, 1, 0, 0)},
         {"fsync-buffer", rw(CMD_FSYNC, fd, rbuf, 0, 0, 0)},

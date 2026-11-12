@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
@@ -691,6 +691,15 @@ kernel.
   written, shared anonymous memory once it was, and a file's page when it lies
   within the file. It writes the bytes up to the first page that is not mapped,
   which is `ENOMEM`, as Linux does.
+- `cachestat` (Linux 6.5) counts the pages of a byte range (to the end of the
+  file for a length of 0) that the file's page cache holds. A file in memory
+  holds its allocated pages, as tmpfs does, none of them dirty or under
+  writeback, as tmpfs tags none, and none evicted, as nothing is swapped out.
+  A pipe, a directory, `/proc` and a file in a mounted host directory hold
+  none here. As Linux checks, the descriptor must not be `O_PATH` (`EBADF`),
+  both structs must be readable and writable (`EFAULT`), and a description
+  open to read only needs a caller that owns or may write the file
+  (`EPERM`) before an unknown flag is `EINVAL`.
 - `mlock`, `mlock2` and `munlock` check their range as Linux does: the length
   rounds up to pages, a range past the end of addresses is `EINVAL`, and one
   with a page that is not mapped is `ENOMEM`. `mlock` and `mlock2` without

@@ -195,6 +195,9 @@ impl FileHandle for Memfd {
     fn with_attributes(&self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
         self.file.with_attributes(f)
     }
+    fn cached_pages(&self, first: u64, last: u64) -> u64 {
+        self.file.cached_pages(first, last)
+    }
     /// `F_SEAL_EXEC` keeps the execute bits as they are.
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         if self.seals() & F_SEAL_EXEC != 0 && (self.file.stat()?.mode ^ mode) & 0o111 != 0 {

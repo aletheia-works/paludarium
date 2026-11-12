@@ -68,6 +68,14 @@ impl Contents {
     pub(crate) fn blocks(&self) -> u64 {
         self.pages.len() as u64 * (PAGE / 512)
     }
+    /// The pages allocated from index `first` to `last`, which tmpfs's page
+    /// cache holds.
+    pub(crate) fn resident(&self, first: u64, last: u64) -> u64 {
+        if first > last {
+            return 0;
+        }
+        self.pages.range(first..=last).count() as u64
+    }
     /// The pages allocated, for `statfs`.
     pub(crate) fn pages(&self) -> u64 {
         self.pages.len() as u64

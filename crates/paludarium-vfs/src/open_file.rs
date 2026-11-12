@@ -245,6 +245,12 @@ impl FileHandle for MemFile {
     fn with_attributes(&self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
         lock(&self.node).with_attributes(f)
     }
+    fn cached_pages(&self, first: u64, last: u64) -> u64 {
+        match &lock(&self.node).kind {
+            Kind::File(contents) => contents.resident(first, last),
+            _ => 0,
+        }
+    }
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         set_node_mode(&mut lock(&self.node), mode);
         Ok(())

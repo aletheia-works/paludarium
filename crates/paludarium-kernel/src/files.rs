@@ -16,7 +16,7 @@ pub const NUMBERS: &[u64] = &[
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
     188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
     261, 262, 263, 264, 265, 266, 267, 268, 269, 275, 276, 277, 278, 280, 285, 292, 293, 295, 296,
-    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 452, 463, 464, 465, 466, 468, 469,
+    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 451, 452, 463, 464, 465, 466, 468, 469,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -1710,6 +1710,41 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 }
 /// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`, with the
 /// checks of Linux's generic_copy_file_checks and rw_verify_area in order.
+/// `cachestat(fd, range, stat, flags)`, as Linux's: a descriptor `fdget`
+/// takes (EBADF, also for `O_PATH`), a `struct cachestat_range` (`off`,
+/// `len`; EFAULT), a file the caller may write or could open to (EPERM,
+/// `can_do_cachestat`), no flags (EINVAL), then the `struct cachestat` of
+/// the pages from `off` for `len` bytes, or to the end for 0. A file in
+/// memory has its allocated pages cached, as tmpfs has them, none dirty or
+/// under writeback (tmpfs tags none) or evicted (no swap); any other file
+/// has none that the emulator keeps.
+fn cachestat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let file = io_descriptor(c, a[0])?;
+    let [off, len] = crate::syscalls::read_words::<2>(c.mem, a[1])?;
+    let creds = &c.process.credentials;
+    if file.flags() & 3 == 0 {
+        let stat = file.stat()?;
+        if !crate::permissions::owner_or_capable(creds, &stat)
+            && crate::permissions::permission(creds, &stat, crate::permissions::MAY_WRITE).is_err()
+        {
+            return Err(Errno::EPERM);
+        }
+    }
+    if a[3] != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let first = off >> 12;
+    let last = if len == 0 {
+        u64::MAX
+    } else {
+        off.wrapping_add(len).wrapping_sub(1) >> 12
+    };
+    let cached = file.cached_pages(first, last);
+    let mut out = [0u8; 40];
+    out[..8].copy_from_slice(&cached.to_le_bytes());
+    output(c, a[2], &out)?;
+    Ok(0)
+}
 fn copy_file_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if a[5] != 0 {
         return Err(Errno::EINVAL);
@@ -2809,6 +2844,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         278 => splice::vmsplice(c, a),
         332 => statx(c, a),
         326 => copy_file_range(c, a),
+        451 => cachestat(c, a),
         436 => close_range(c, a),
         // One `IN_MODIFY` for the call ([`accessed`]), as Linux's
         // `vfs_fallocate` gives, whatever sizes it changes.

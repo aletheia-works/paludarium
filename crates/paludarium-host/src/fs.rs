@@ -84,6 +84,12 @@ pub trait FileHandle: Send + Sync {
     fn with_attributes(&self, _f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
         Err(Errno::EOPNOTSUPP)
     }
+    /// The pages from index `first` to `last` that the file's page cache
+    /// holds, as `cachestat` counts them: none for a file whose pages the
+    /// emulator does not keep.
+    fn cached_pages(&self, _first: u64, _last: u64) -> u64 {
+        0
+    }
     /// `fchmod`: replaces the permission bits with the low 12 bits of `mode`.
     fn set_mode(&self, _mode: u32) -> Result<(), Errno> {
         Err(Errno::EPERM)

@@ -1913,6 +1913,50 @@ fn inode_flags_read_back_and_refuse_what_linux_refuses() {
 }
 
 #[test]
+fn cachestat_counts_a_files_allocated_pages_in_a_range() {
+    let mut f = fixture();
+    let (path, range, out) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+    let data = f.ret(nr::MMAP, &[0, 3 * 4096, 3, 0x22, u64::MAX, 0]);
+    f.mem.write(GuestAddr(path), b"/cachestat-file\0").unwrap();
+    let fd = f.ret(2, &[path, 0o102, 0o644]);
+    // Three pages, a hole, and the eleventh page.
+    assert_eq!(f.ret(1, &[fd, data, 3 * 4096]), 3 * 4096);
+    assert_eq!(f.ret(18, &[fd, data, 1, 10 * 4096]), 1);
+    let stat = |f: &mut Fixture, fd: u64, off: u64, len: u64, flags: u64| {
+        f.mem.write_u64(GuestAddr(range), off).unwrap();
+        f.mem.write_u64(GuestAddr(range + 8), len).unwrap();
+        f.mem.write(GuestAddr(out), &[0xff; 40]).unwrap();
+        let r = f.ret(451, &[fd, range, out, flags]);
+        (
+            r,
+            f.mem.read_u64(GuestAddr(out)).unwrap(),
+            f.mem.read_u64(GuestAddr(out + 32)).unwrap(),
+        )
+    };
+    assert_eq!(stat(&mut f, fd, 0, 0, 0), (0, 4, 0));
+    assert_eq!(stat(&mut f, fd, 4096, 4096, 0).1, 1);
+    assert_eq!(stat(&mut f, fd, 4095, 2, 0).1, 2);
+    assert_eq!(stat(&mut f, fd, 5 * 4096, 4096, 0).1, 0);
+    assert_eq!(stat(&mut f, fd, 4096, u64::MAX, 0).1, 0);
+    assert_eq!(stat(&mut f, fd, 0, 0, 1).0, errno(Errno::EINVAL));
+    assert_eq!(f.ret(451, &[fd, 0, out, 0]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(451, &[fd, range, 0, 0]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(451, &[999, range, out, 0]), errno(Errno::EBADF));
+    assert_eq!(f.ret(77, &[fd, 4096]), 0);
+    assert_eq!(stat(&mut f, fd, 0, 0, 0).1, 1);
+    // A pipe keeps none; another user's file, opened to read, is EPERM
+    // before the flags are looked at.
+    let pipe = DATA + 0x400;
+    assert_eq!(f.ret(22, &[pipe]), 0);
+    let reader = f.mem.read_u64(GuestAddr(pipe)).unwrap() & 0xffff_ffff;
+    assert_eq!(stat(&mut f, reader, 0, 0, 0), (0, 0, 0));
+    assert_eq!(f.ret(nr::SETUID, &[1000]), 0);
+    let read_only = f.ret(2, &[path, 0, 0]);
+    assert_eq!(stat(&mut f, read_only, 0, 0, 1).0, errno(Errno::EPERM));
+    assert_eq!(stat(&mut f, fd, 0, 0, 0).1, 1);
+}
+
+#[test]
 fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
     let mut f = fixture();
     let (vec, page) = (DATA + 0x800, 4096);

@@ -905,6 +905,9 @@ impl FileHandle for CoherentFile {
         }
         result
     }
+    fn cached_pages(&self, first: u64, last: u64) -> u64 {
+        self.inner.cached_pages(first, last)
+    }
     fn with_attributes(&self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
         let (result, changed) = crate::inotify::changing_xattrs(|| self.inner.with_attributes(f));
         if result.is_ok() && changed {

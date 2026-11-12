@@ -47,7 +47,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
@@ -622,6 +622,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   無名メモリは読むか書いたあとから、ファイルのページはファイルの範囲内ならメモリに
   あるとします。Linux と同じく、マップされていない最初のページの手前まで書いて
   `ENOMEM` を返します。
+- `cachestat`（Linux 6.5）は、バイト範囲（長さ 0 ならファイルの終わりまで）のうち、
+  ファイルのページキャッシュにあるページを数えます。メモリ上のファイルは、tmpfs と同じく
+  割り当て済みのページを持ち、tmpfs は印を付けないので dirty や書き戻し中のページはなく、
+  スワップアウトしないので追い出されたページもありません。パイプ、ディレクトリ、`/proc`、
+  マウントしたホストのディレクトリのファイルは、ここでは何も持ちません。Linux と同じく、
+  ディスクリプタは `O_PATH` でなく（`EBADF`）、2 つの構造体は読み書きでき（`EFAULT`）、
+  読み込み専用で開いたものは、呼び出し元がファイルの所有者か書き込めることが必要で
+  （`EPERM`）、そのあとで未知のフラグが `EINVAL` です。
 - `mlock`、`mlock2`、`munlock` は、Linux と同じように範囲を確かめます。長さはページ単位に
   切り上げ、アドレスの終わりを越える範囲は `EINVAL`、マップされていないページを含む範囲は
   `ENOMEM` です。`mlock` と、`MLOCK_ONFAULT` なしの `mlock2` は、`PROT_NONE` のページでも

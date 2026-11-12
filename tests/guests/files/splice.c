@@ -186,6 +186,13 @@ void _start(void) {
  }
  if(CASE==75){ /* sendfile into a full socket, interrupted by a signal: SO_SNDTIMEO makes the wait's end EINTR, which SA_RESTART does not restart (sock_intr_errno) */
 #if CASE==75
+  /* Whether process `pid` sleeps (S in /proc/pid/stat). A signal is sent only
+     then: one that comes before the wait is ERESTARTSYS, as splice_to_socket
+     looks for a signal before it sends, and SA_RESTART restarts it even with
+     SO_SNDTIMEO. */
+  #define ASLEEP(pid) ({char path_[32]="/proc/",*e_=path_+6;long v_=(pid),d_=1;while(d_*10<=v_)d_*=10;for(;d_;d_/=10)*e_++='0'+v_/d_%10;\
+   char*t_="/stat";while(*t_)*e_++=*t_++;*e_=0;long f_=S(2,path_,0,0),n_=f_<0?0:S(0,f_,buf,200);if(f_>=0)S(3,f_,0,0);\
+   long s_=0;for(long i_=n_-2;i_>0;i_--)if(buf[i_]==')'){s_=buf[i_+2]=='S';break;}s_;})
   for(long round=0;round<4;round++){
    long timed=round&1,restart=round>>1;
    int hp[2],rp[2],gp[2],sv[2];call(293,(long)hp,04000,0,0,0,0);S(22,rp,0,0);S(22,gp,0,0);
@@ -207,7 +214,7 @@ void _start(void) {
     S(1,rp[1],r,k*8);while(S(0,gp[0],buf,1)==-4);S(60,0,0,0);
    }
    S(3,sv[1],0,0);
-   while(S(0,hp[0],buf,1)!=1){S(62,pid,10,0);S(24,0,0,0);}
+   while(S(0,hp[0],buf,1)!=1){if(ASLEEP(pid))S(62,pid,10,0);S(24,0,0,0);}
    /* Room for a restarted call: what was filled is read back. */
    long drained=0;while(drained<filled&&(n=S(0,sv[0],buf,filled-drained<16384?filled-drained:16384))>0)drained+=n;
    R(drained==filled);

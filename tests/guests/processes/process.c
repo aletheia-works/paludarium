@@ -6469,8 +6469,7 @@ static void *kc_thread(void *arg) {
     (void)arg;
     kc_tid = syscall(SYS_gettid);
     char c;
-    /* The emulator lets a child's SIGCHLD interrupt this; Linux does not. */
-    while (read(kc_gate[0], &c, 1) < 0 && errno == EINTR) {}
+    read(kc_gate[0], &c, 1);
     return NULL;
 }
 /* A child that waits for the gate to close, after it, with `dumpable`,

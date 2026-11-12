@@ -4,6 +4,7 @@ mod splice;
 mod tasks;
 mod xattrs;
 use paludarium_host::{ClockId, FileHandle, FileStat};
+use paludarium_mmu::AddressSpace;
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, HostFs, MemFs};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +15,7 @@ pub const NUMBERS: &[u64] = &[
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
     188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
     261, 262, 263, 264, 265, 266, 267, 268, 269, 275, 276, 277, 278, 280, 285, 292, 293, 295, 296,
-    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 452,
+    306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 452, 463, 464, 465, 466,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -180,6 +181,13 @@ impl FilesView {
         let fds = self.fds.upgrade()?;
         let fds = fds.lock().unwrap_or_else(PoisonError::into_inner);
         fds.get(&fd).map(|descriptor| Arc::clone(&descriptor.file))
+    }
+    /// Descriptor `fd`, which `pidfd_getfd` copies with its open file
+    /// description and path.
+    pub(crate) fn descriptor(&self, fd: u32) -> Option<Descriptor> {
+        let fds = self.fds.upgrade()?;
+        let fds = fds.lock().unwrap_or_else(PoisonError::into_inner);
+        fds.get(&fd).cloned()
     }
     /// One past the highest open descriptor.
     pub(crate) fn descriptors(&self) -> usize {
@@ -1878,7 +1886,7 @@ pub(crate) fn iovecs(
     count: u64,
     write: bool,
 ) -> Result<Vec<(u64, usize)>, Errno> {
-    iovecs_checked(c, at, count, |base, length| {
+    iovecs_checked(c.mem, at, count, |base, length| {
         if write {
             c.mem.check_write(GuestAddr(base), length)
         } else {
@@ -1896,7 +1904,7 @@ pub(crate) fn iovecs(
 /// lengths are cut so that the total is at most `MAX_RW_COUNT`. `check` then
 /// looks at each cut buffer in turn.
 pub(crate) fn iovecs_checked(
-    c: &Context<'_>,
+    mem: &AddressSpace,
     at: u64,
     count: u64,
     check: impl Fn(u64, usize) -> Result<(), Errno>,
@@ -1911,9 +1919,8 @@ pub(crate) fn iovecs_checked(
     let mut entries = Vec::with_capacity(count as usize);
     for index in 0..count {
         let addr = at + index * 16;
-        let base = c.mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
-        let length = c
-            .mem
+        let base = mem.read_u64(GuestAddr(addr)).map_err(|_| Errno::EFAULT)?;
+        let length = mem
             .read_u64(GuestAddr(addr + 8))
             .map_err(|_| Errno::EFAULT)?;
         if (length as i64) < 0 {
@@ -3446,7 +3453,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         452 => fchmodat2(c, a),
         // Extended attributes.
-        188..=199 => xattrs::call(c, n, a),
+        188..=199 | 463..=466 => xattrs::call(c, n, a),
         // chown, fchown, lchown, fchownat
         92 | 94 => {
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], n == 92)?;
@@ -4326,6 +4333,45 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 const RESOLVE_IN_ROOT: u64 = 0x10;
 const RESOLVE_CACHED: u64 = 0x20;
+/// A struct a call takes with its size, as Linux's `copy_struct_from_user`
+/// copies one whose first version is `first` bytes: a size below that is
+/// `EINVAL` and above a page `E2BIG`. What a later version adds must be zero
+/// (`E2BIG`), which `check_zeroed_user` reads a page at a time up to the
+/// first byte that is not, before the first version is copied.
+pub(super) fn copy_struct(
+    c: &Context<'_>,
+    addr: u64,
+    size: u64,
+    first: u64,
+) -> Result<Vec<u8>, Errno> {
+    const PAGE_SIZE: u64 = 4096;
+    const E2BIG: Errno = Errno(7);
+    if size < first {
+        return Err(Errno::EINVAL);
+    }
+    if size > PAGE_SIZE {
+        return Err(E2BIG);
+    }
+    let mut at = addr.checked_add(first).ok_or(Errno::EFAULT)?;
+    let end = addr.checked_add(size).ok_or(Errno::EFAULT)?;
+    while at < end {
+        // The page's end, which in the last page is past `u64::MAX`.
+        let next = end.min((at | (PAGE_SIZE - 1)).saturating_add(1));
+        let mut tail = vec![0; (next - at) as usize];
+        c.mem
+            .read(GuestAddr(at), &mut tail)
+            .map_err(|_| Errno::EFAULT)?;
+        if tail.iter().any(|&b| b != 0) {
+            return Err(E2BIG);
+        }
+        at = next;
+    }
+    let mut copied = vec![0; first as usize];
+    c.mem
+        .read(GuestAddr(addr), &mut copied)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(copied)
+}
 /// `openat2(dirfd, path, how, size)`, as Linux's `do_sys_openat2` takes
 /// `struct open_how` (`flags`, `mode` and `resolve`, 24 bytes in its first
 /// version) and `build_open_flags` checks it: unlike `openat`, an unknown
@@ -4334,8 +4380,6 @@ const RESOLVE_CACHED: u64 = 0x20;
 /// `O_NOFOLLOW` and `O_CLOEXEC` are all `EINVAL`.
 fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     const OPEN_HOW_SIZE_VER0: u64 = 24;
-    const PAGE_SIZE: u64 = 4096;
-    const E2BIG: Errno = Errno(7);
     const O_CREAT: u64 = 0o100;
     const O_TRUNC: u64 = 0o1000;
     const O_DSYNC: u64 = 0o10000;
@@ -4349,34 +4393,7 @@ fn openat2(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // `O_CREAT` to `__O_TMPFILE`.
     const VALID_OPEN_FLAGS: u64 = 0o37777703;
     const VALID_RESOLVE_FLAGS: u64 = 0x3f;
-    let size = a[3];
-    if size < OPEN_HOW_SIZE_VER0 {
-        return Err(Errno::EINVAL);
-    }
-    if size > PAGE_SIZE {
-        return Err(E2BIG);
-    }
-    // `copy_struct_from_user`: what a later version adds must be zero, which
-    // `check_zeroed_user` reads a page at a time up to the first byte that
-    // is not, before the first version is copied.
-    let mut at = a[2].checked_add(OPEN_HOW_SIZE_VER0).ok_or(Errno::EFAULT)?;
-    let end = a[2].checked_add(size).ok_or(Errno::EFAULT)?;
-    while at < end {
-        // The page's end, which in the last page is past `u64::MAX`.
-        let next = end.min((at | (PAGE_SIZE - 1)).saturating_add(1));
-        let mut tail = vec![0; (next - at) as usize];
-        c.mem
-            .read(GuestAddr(at), &mut tail)
-            .map_err(|_| Errno::EFAULT)?;
-        if tail.iter().any(|&b| b != 0) {
-            return Err(E2BIG);
-        }
-        at = next;
-    }
-    let mut how = [0; OPEN_HOW_SIZE_VER0 as usize];
-    c.mem
-        .read(GuestAddr(a[2]), &mut how)
-        .map_err(|_| Errno::EFAULT)?;
+    let how = copy_struct(c, a[2], a[3], OPEN_HOW_SIZE_VER0)?;
     let field = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
     let (flags, mode, resolve) = (field(0), field(1), field(2));
     let mut flags = flags;

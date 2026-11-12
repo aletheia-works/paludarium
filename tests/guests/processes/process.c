@@ -1519,6 +1519,67 @@ static void nl_route(int fd, unsigned port, unsigned short type, unsigned short 
     }
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, at), port, label);
 }
+/* The route-dump case: sends request `type` with `flags` and NLM_F_ACK,
+   and takes its acknowledgement, giving its error. */
+static int nl_quiet(int fd, unsigned short type, unsigned short flags, const void *request, size_t len) {
+    nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, len);
+    static char buf[4096];
+    long n = recv(fd, buf, sizeof buf, 0);
+    if (n < 0) return -errno;
+    int error = 1;
+    if (n >= 20 && ((struct nl_header *)buf)->type == 2) memcpy(&error, buf + 16, 4);
+    return error;
+}
+/* A /32 address of lo, `ip`, as `ip address add` makes it. */
+static int nl_local(int fd, const unsigned char ip[4]) {
+    unsigned char request[8 + 2 * 8] = {AF_INET, 32, 0, 0, 1};
+    for (int i = 0; i < 2; i++) {
+        unsigned short attribute[2] = {8, 2 - i};
+        memcpy(request + 8 + 8 * i, attribute, 4);
+        memcpy(request + 12 + 8 * i, ip, 4);
+    }
+    return nl_quiet(fd, 20, 0x600, request, sizeof request);
+}
+/* A blackhole route to `dst` of prefix `len` in the main table. */
+static int nl_blackhole(int fd, int family, const unsigned char *dst, int len) {
+    unsigned char request[12 + 20] = {family, len, 0, 0, 254, 3, 0, 6};
+    int size = family == AF_INET ? 4 : 16;
+    unsigned short attribute[2] = {4 + size, 1};
+    memcpy(request + 12, attribute, 4);
+    memcpy(request + 16, dst, size);
+    return nl_quiet(fd, 24, 0x600, request, 16 + size);
+}
+/* Dumps `type` of `family` through a new socket, receiving into `room`
+   bytes, and prints each datagram the dump comes in: its length, flags,
+   messages and whether NLMSG_DONE or NLMSG_ERROR, with its error, ends it. */
+static void nl_parts(const char *label, unsigned short type, unsigned char family, size_t room) {
+    int fd = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+    nl_send(fd, type, NL_F_REQUEST | NL_F_DUMP, &family, 1);
+    static char buf[65536];
+    for (int part = 0; part < 64; part++) {
+        struct iovec iov = {buf, room};
+        struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+        long n = recvmsg(fd, &msg, MSG_DONTWAIT);
+        if (n < 0) {
+            printf("%s room=%zu part %d: %d\n", label, room, part, -errno);
+            break;
+        }
+        int messages = 0, done = 0, error = 0;
+        for (char *at = buf; at + sizeof(struct nl_header) <= buf + n;) {
+            struct nl_header *h = (void *)at;
+            if (h->len < sizeof *h || at + h->len > buf + n) break;
+            messages++;
+            if (h->type == 2 || h->type == 3) done = h->type, memcpy(&error, h + 1, 4);
+            at += (h->len + 3) & ~3;
+        }
+        printf("%s room=%zu part %d: n=%ld flags=%#x messages=%d done=%d", label, room, part, n, msg.msg_flags,
+               messages, done);
+        if (done) printf(" error=%d", error);
+        printf("\n");
+        if (done) break;
+    }
+    close(fd);
+}
 /* Route lookups for the routes case, as nl_lookups sends them. */
 static void routes_get(int fd, unsigned port, const char *when, const char *const *texts, size_t count,
                        unsigned flags) {
@@ -6579,6 +6640,245 @@ static int kcmp_case(void) {
     waitpid(zombie, NULL, 0);
     return 0;
 }
+/* process_vm_readv and process_vm_writev, as Linux's mm/process_vm_access.c,
+ * and pidfd_getfd, as kernel/pid.c. Each reaches into a child, which Yama's
+ * ptrace_scope 1 lets its parent attach to as well as no Yama does. */
+static char pv_buf[4096] __attribute__((aligned(4096)));
+static int pv_gate[2];
+static long pv_tid;
+static long pv(long number, long pid, const struct iovec *l, unsigned long ln,
+               const struct iovec *r, unsigned long rn, unsigned long flags) {
+    long ret = syscall(number, pid, l, ln, r, rn, flags);
+    return ret < 0 ? -errno : ret;
+}
+static long pv_read(long pid, void *local, size_t ln, void *remote, size_t rn) {
+    struct iovec l = {local, ln}, r = {remote, rn};
+    return pv(310, pid, &l, 1, &r, 1, 0);
+}
+static long pv_write(long pid, void *local, size_t ln, void *remote, size_t rn) {
+    struct iovec l = {local, ln}, r = {remote, rn};
+    return pv(311, pid, &l, 1, &r, 1, 0);
+}
+static long pg(long pidfd, long fd, long flags) {
+    long ret = syscall(438, pidfd, fd, flags);
+    return ret < 0 ? -errno : ret;
+}
+static void *pv_thread(void *arg) {
+    (void)arg;
+    __atomic_store_n(&pv_tid, syscall(SYS_gettid), __ATOMIC_SEQ_CST);
+    char c;
+    read(pv_gate[0], &c, 1);
+    return NULL;
+}
+struct pv_task {
+    pid_t pid;
+    /* The read end of a pipe the child wrote "from child" into. */
+    int fd;
+    /* Where the child says what its buffer held once the gate closed. */
+    int ready;
+};
+/* A child that, unless `dumpable`, becomes undumpable, puts its own text in
+ * pv_buf and waits for the gate to close. */
+static struct pv_task pv_child(int dumpable) {
+    struct pv_task task = {-1, -1, -1};
+    int ready[2];
+    if (pipe(ready)) return task;
+    task.pid = fork();
+    if (task.pid == 0) {
+        close(ready[0]);
+        close(pv_gate[1]);
+        if (!dumpable) prctl(PR_SET_DUMPABLE, 0);
+        strcpy(pv_buf, "the child's buffer");
+        int inner[2], n = -1;
+        if (!pipe(inner) && write(inner[1], "from child", 10) == 10) n = inner[0];
+        write(ready[1], &n, sizeof n);
+        char c;
+        while (read(pv_gate[0], &c, 1) > 0) {}
+        write(ready[1], pv_buf, 32);
+        _exit(0);
+    }
+    close(ready[1]);
+    read(ready[0], &task.fd, sizeof task.fd);
+    task.ready = ready[0];
+    return task;
+}
+/* A child that has exited and is not reaped. */
+static pid_t pv_zombie(void) {
+    pid_t pid = fork();
+    if (pid == 0) _exit(0);
+    siginfo_t info;
+    waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+    return pid;
+}
+/* Whether, as another user, a child's `ask` of its parent is refused: as
+ * root it becomes another user; otherwise it cannot, and Yama would decide. */
+static int pv_other_user(long (*ask)(long parent)) {
+    fflush(stdout);
+    pid_t asker = fork();
+    if (asker == 0) {
+        int other = geteuid() == 0 && !setgroups(0, NULL) && !setresgid(65534, 65534, 65534) &&
+                    !setresuid(65534, 65534, 65534);
+        _exit(other ? ask(getppid()) == -EPERM : 1);
+    }
+    int status = 0;
+    waitpid(asker, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 1;
+}
+static long pv_ask(long parent) {
+    char c[4];
+    return pv_read(parent, c, 4, pv_buf, 4);
+}
+static long pg_ask(long parent) {
+    long pidfd = syscall(SYS_pidfd_open, parent, 0);
+    return pidfd < 0 ? -errno : pg(pidfd, 0, 0);
+}
+static int process_vm_case(void) {
+    if (pipe(pv_gate)) return 80;
+    long self = getpid();
+    /* A page, a hole and a page; a write-only page, a read-only one and
+     * one with no access, laid out before the children copy them. */
+    char *two = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *wo = mmap(NULL, 4096, PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *ro = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (two == MAP_FAILED || wo == MAP_FAILED || ro == MAP_FAILED || none == MAP_FAILED) return 81;
+    munmap(two + 4096, 4096);
+    char *hole = two + 4096;
+    memcpy(hole - 8, "abcdefgh", 8);
+    strcpy(pv_buf, "the parent's buffer");
+    pthread_t t;
+    pthread_create(&t, NULL, pv_thread, NULL);
+    while (!__atomic_load_n(&pv_tid, __ATOMIC_SEQ_CST)) sched_yield();
+    struct pv_task child = pv_child(1), locked = pv_child(0);
+    pid_t zombie = pv_zombie();
+    char got[64] = {0};
+    long n = pv_read(child.pid, got, sizeof got, pv_buf, 32);
+    printf("process_vm read child=%ld \"%s\"", n, got);
+    memset(got, 0, sizeof got);
+    n = pv_read(self, got, sizeof got, pv_buf, 32);
+    printf(" self=%ld \"%s\"", n, got);
+    memset(got, 0, sizeof got);
+    n = pv_read(pv_tid, got, sizeof got, pv_buf, 32);
+    printf(" thread=%ld \"%s\"\n", n, got);
+    /* Two local buffers take one remote one, and one local buffer two
+     * remote ones, in turn. */
+    char a[6] = {0}, b[20] = {0};
+    struct iovec ls[2] = {{a, 5}, {b, 13}}, r1 = {pv_buf, 18};
+    long split = pv(310, child.pid, ls, 2, &r1, 1, 0);
+    memset(got, 0, sizeof got);
+    struct iovec l1 = {got, sizeof got}, rs[3] = {{pv_buf + 4, 6}, {NULL, 0}, {pv_buf, 3}};
+    long gather = pv(310, child.pid, &l1, 1, rs, 3, 0);
+    printf("process_vm split=%ld \"%s\" \"%s\" gather=%ld \"%s\"\n", split, a, b, gather, got);
+    /* A write, read back, and what the child finds. */
+    char text[] = "written by the parent";
+    long wrote = pv_write(child.pid, text, sizeof text, pv_buf, sizeof text);
+    memset(got, 0, sizeof got);
+    n = pv_read(child.pid, got, sizeof got, pv_buf, 32);
+    printf("process_vm write=%ld back=%ld \"%s\"\n", wrote, n, got);
+    /* The remote side stops at the first page it may not read or write;
+     * the local side at the first byte. */
+    char edge[17] = {0};
+    long across = pv_read(child.pid, edge, 16, hole - 8, 16);
+    long in_hole = pv_read(child.pid, edge + 8, 8, hole, 8);
+    struct iovec r3[3] = {{pv_buf, 4}, {hole, 4}, {pv_buf, 4}};
+    long after_hole = pv(310, child.pid, &l1, 1, r3, 3, 0);
+    printf("process_vm remote across=%ld \"%s\" in-hole=%ld after-hole=%ld write-only=%ld,%ld "
+           "read-only=%ld,%ld none=%ld,%ld\n",
+           across, edge, in_hole, after_hole, pv_read(child.pid, got, 4, wo, 4),
+           pv_write(child.pid, text, 4, wo, 4), pv_read(child.pid, got, 4, ro, 4),
+           pv_write(child.pid, text, 4, ro, 4), pv_read(child.pid, got, 4, none, 4),
+           pv_write(child.pid, text, 4, none, 4));
+    struct iovec r2[2] = {{pv_buf, 4}, {hole, 4}};
+    struct iovec l4 = {got, 4};
+    long bounded = pv(310, child.pid, &l4, 1, r2, 2, 0);
+    printf("process_vm local into-hole=%ld at-hole=%ld from-hole=%ld from-read-only=%ld "
+           "bounded=%ld\n",
+           pv_read(child.pid, hole - 4, 8, pv_buf, 8), pv_read(child.pid, hole, 8, pv_buf, 8),
+           pv_write(child.pid, hole - 2, 4, pv_buf, 4), pv_write(child.pid, ro, 4, pv_buf + 8, 4),
+           bounded);
+    /* The checks, in order: flags, the local array, nothing to copy, the
+     * remote array, nothing to copy, then the task. */
+    long gone = 4194303;
+    struct iovec bad_len = {pv_buf, (size_t)-1}, zero[2] = {{pv_buf, 0}, {hole, 0}};
+    struct iovec high = {(void *)(1UL << 47), 4};
+    printf("process_vm errors flags=%ld,%ld local-count=%ld local-array=%ld local-length=%ld "
+           "local-high=%ld no-local=%ld,%ld\n",
+           pv(310, gone, &l1, 1, &r1, 1, 1), pv(311, self, &l1, 1, &r1, 1, 1L << 32),
+           pv(310, gone, &l1, 1025, &r1, 1, 0), pv(310, gone, (void *)8, 1, &r1, 1, 0),
+           pv(310, gone, &bad_len, 1, &r1, 1, 0), pv(310, self, &high, 1, &r1, 1, 0),
+           pv(310, gone, &l1, 0, (void *)8, 1, 0), pv(310, gone, zero, 2, (void *)8, 1, 0));
+    printf("process_vm errors remote-count=%ld remote-array=%ld remote-length=%ld no-remote=%ld,%ld "
+           "zero=%ld negative=%ld absent=%ld high-pid=%ld zombie=%ld high-remote=%ld\n",
+           pv(310, gone, &l1, 1, &r1, 1025, 0), pv(310, gone, &l1, 1, (void *)8, 1, 0),
+           pv(310, gone, &l1, 1, &bad_len, 1, 0), pv(310, gone, &l1, 1, &r1, 0, 0),
+           pv(310, gone, &l1, 1, zero, 2, 0), pv(310, 0, &l1, 1, &r1, 1, 0),
+           pv(310, -1, &l1, 1, &r1, 1, 0), pv(310, gone, &l1, 1, &r1, 1, 0),
+           pv(310, self | 1L << 32, &l1, 1, &r1, 1, 0), pv(310, zombie, &l1, 1, &r1, 1, 0),
+           pv(310, self, &l1, 1, &high, 1, 0));
+    /* An undumpable task, or another user's, needs CAP_SYS_PTRACE: each is
+     * whether the outcome is the one for this process's user. */
+    int root = geteuid() == 0;
+    long undumpable = pv_read(locked.pid, got, 4, pv_buf, 4);
+    printf("process_vm undumpable=%d other-user=%d\n", root ? undumpable == 4 : undumpable == -EPERM,
+           pv_other_user(pv_ask));
+    close(pv_gate[1]);
+    pthread_join(t, NULL);
+    memset(got, 0, sizeof got);
+    read(child.ready, got, 32);
+    printf("process_vm the child's buffer \"%s\"\n", got);
+    waitpid(child.pid, NULL, 0);
+    waitpid(locked.pid, NULL, 0);
+    waitpid(zombie, NULL, 0);
+    return 0;
+}
+static int pidfd_getfd_case(void) {
+    if (pipe(pv_gate)) return 80;
+    struct pv_task child = pv_child(1), locked = pv_child(0);
+    pid_t zombie = pv_zombie(), reaped = pv_zombie();
+    long pidfd = syscall(SYS_pidfd_open, child.pid, 0);
+    long zombie_fd = syscall(SYS_pidfd_open, zombie, 0);
+    long reaped_fd = syscall(SYS_pidfd_open, reaped, 0);
+    long self_fd = syscall(SYS_pidfd_open, getpid(), 0);
+    if (pidfd < 0 || zombie_fd < 0 || reaped_fd < 0 || self_fd < 0) return 81;
+    waitpid(reaped, NULL, 0);
+    /* The lowest free number, close-on-exec, the same open file. */
+    int lowest = dup(0);
+    close(lowest);
+    long fd = pg(pidfd, child.fd, 0);
+    char text[16] = {0};
+    long got = fd < 0 ? fd : read(fd, text, 10);
+    printf("pidfd_getfd lowest=%d read=%ld \"%s\" cloexec=%d access=%d same=%ld\n", fd == lowest,
+           got, text, fcntl(fd, F_GETFD), fcntl(fd, F_GETFL) & O_ACCMODE,
+           syscall(312, getpid(), child.pid, 0, fd, child.fd));
+    long own = pg(self_fd, pv_gate[0], 0);
+    printf("pidfd_getfd self=%d cloexec=%d same=%ld\n", own >= 0, fcntl(own, F_GETFD),
+           syscall(312, getpid(), getpid(), 0, own, pv_gate[0]));
+    close(own);
+    printf("pidfd_getfd errors flags=%ld,%ld not-open=%ld not-pidfd=%ld target=%ld,%ld,%ld "
+           "high-target=%d zombie=%ld reaped=%ld\n",
+           pg(-1, 0, 1), pg(pidfd, child.fd, 1L << 31), pg(999, 0, 0), pg(pv_gate[0], 0, 0),
+           pg(pidfd, 999, 0), pg(pidfd, -1, 0), pg(pidfd, 1L << 20, 0),
+           pg(pidfd, child.fd | 1L << 32, 0) >= 0, pg(zombie_fd, 0, 0), pg(reaped_fd, 0, 0));
+    /* No free number below RLIMIT_NOFILE. */
+    struct rlimit limit;
+    getrlimit(RLIMIT_NOFILE, &limit);
+    int next = dup(0);
+    close(next);
+    struct rlimit low = {(rlim_t)next, limit.rlim_max};
+    setrlimit(RLIMIT_NOFILE, &low);
+    long full = pg(pidfd, child.fd, 0);
+    setrlimit(RLIMIT_NOFILE, &limit);
+    int root = geteuid() == 0;
+    long locked_fd = syscall(SYS_pidfd_open, locked.pid, 0);
+    long undumpable = pg(locked_fd, locked.fd, 0);
+    printf("pidfd_getfd emfile=%ld undumpable=%d other-user=%d\n", full,
+           root ? undumpable >= 0 : undumpable == -EPERM, pv_other_user(pg_ask));
+    close(pv_gate[1]);
+    waitpid(child.pid, NULL, 0);
+    waitpid(locked.pid, NULL, 0);
+    waitpid(zombie, NULL, 0);
+    return 0;
+}
 /* A signal whose action is to ignore it, by default (SIGCHLD, SIGURG,
  * SIGWINCH) or by SIG_IGN, is dropped as it is sent (Linux's sig_ignored),
  * so it ends no wait: a thread blocked in read on a pipe stays there. */
@@ -9192,6 +9492,47 @@ int main(int argc, char **argv) {
                    netns_lo(owned, SIOCSIFFLAGS, "lo", IFF_UP));
             printf("user: owned=%ld made=%ld here=%ld\n", netns_lo(owned, SIOCGIFFLAGS, "lo", 0),
                    netns_lo(made, SIOCGIFFLAGS, "lo", 0), netns_lo(here, SIOCGIFFLAGS, "lo", 0));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "route-dump")) {
+        /* A child makes a network namespace with lo up, 150 more addresses
+           and 300 blackhole routes, and prints the datagrams each address
+           and route dump comes in: a page's worth first, then as much as
+           the longest receive asked for, and NLMSG_DONE after them. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            int up = nl_quiet(ctl, 16, 0, &link, sizeof link), addresses = 0, routes4 = 0, routes6 = 0;
+            for (int i = 0; i < 150; i++) {
+                unsigned char ip[4] = {10, 30, i / 100, i % 100 + 1};
+                addresses += nl_local(ctl, ip) == 0;
+            }
+            for (int i = 0; i < 200; i++) {
+                unsigned char dst[16] = {10, 40, i, 0};
+                routes4 += nl_blackhole(ctl, AF_INET, dst, 24) == 0;
+            }
+            for (int i = 0; i < 100; i++) {
+                unsigned char dst[16] = {0x20, 0x01, 0x0d, 0xb8, 0, i};
+                routes6 += nl_blackhole(ctl, AF_INET6, dst, 48) == 0;
+            }
+            printf("added: up=%d addresses=%d routes4=%d routes6=%d\n", up, addresses, routes4, routes6);
+            static const struct {
+                unsigned short type;
+                unsigned char family;
+                const char *label;
+            } dumps[] = {{22, 0, "addr"},  {22, AF_INET, "addr4"},  {22, AF_INET6, "addr6"}, {26, 0, "route"},
+                         {26, AF_INET, "route4"}, {26, AF_INET6, "route6"}, {26, 128, "ipmr"}};
+            static const size_t rooms[] = {65536, 8192, 1024};
+            for (size_t i = 0; i < sizeof dumps / sizeof dumps[0]; i++)
+                for (size_t j = 0; j < sizeof rooms / sizeof rooms[0]; j++)
+                    nl_parts(dumps[i].label, dumps[i].type, dumps[i].family, rooms[j]);
             fflush(stdout);
             _exit(0);
         }
@@ -18194,6 +18535,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "futex-requeue")) return futex_requeue_case();
     if (!strcmp(mode, "futex-wake-op")) return futex_wake_op_case();
     if (!strcmp(mode, "kcmp")) return kcmp_case();
+    if (!strcmp(mode, "process-vm")) return process_vm_case();
+    if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();

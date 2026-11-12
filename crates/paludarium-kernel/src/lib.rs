@@ -41,6 +41,7 @@ mod msg;
 mod namespaces;
 mod page_cache;
 mod proc;
+mod process_vm;
 mod processes;
 mod pty;
 mod record_locks;

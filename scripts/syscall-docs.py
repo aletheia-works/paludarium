@@ -279,6 +279,8 @@ NAMES = {
     307: "sendmmsg",
     308: "setns",
     309: "getcpu",
+    310: "process_vm_readv",
+    311: "process_vm_writev",
     312: "kcmp",
     314: "sched_setattr",
     315: "sched_getattr",
@@ -305,6 +307,7 @@ NAMES = {
     435: "clone3",
     436: "close_range",
     437: "openat2",
+    438: "pidfd_getfd",
     439: "faccessat2",
     441: "epoll_pwait2",
     444: "landlock_create_ruleset",
@@ -315,6 +318,10 @@ NAMES = {
     454: "futex_wake",
     455: "futex_wait",
     456: "futex_requeue",
+    463: "setxattrat",
+    464: "getxattrat",
+    465: "listxattrat",
+    466: "removexattrat",
 }
 
 

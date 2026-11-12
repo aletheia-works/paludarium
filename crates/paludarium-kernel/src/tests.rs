@@ -1669,6 +1669,109 @@ fn an_xattr_list_longer_than_linux_copies_is_too_big() {
 }
 
 #[test]
+fn xattrat_calls_take_a_directory_flags_and_struct_xattr_args() {
+    let mut f = fixture();
+    let (dir, file, name, value, args, out) = (
+        DATA + 0x100,
+        DATA + 0x140,
+        DATA + 0x180,
+        DATA + 0x1c0,
+        DATA + 0x200,
+        DATA + 0x800,
+    );
+    let (einval, ebadf, e2big) = (errno(Errno::EINVAL), errno(Errno::EBADF), errno(Errno(7)));
+    let (efault, erange) = (errno(Errno::EFAULT), errno(Errno(34)));
+    f.mem.write(GuestAddr(dir), b"/\0").unwrap();
+    f.mem.write(GuestAddr(file), b"xattrat-file\0").unwrap();
+    f.mem.write(GuestAddr(name), b"user.k\0").unwrap();
+    f.mem.write(GuestAddr(value), b"abc").unwrap();
+    let set_args = |f: &mut Fixture, value: u64, size: u32, flags: u32| {
+        f.mem.write_u64(GuestAddr(args), value).unwrap();
+        f.mem
+            .write(GuestAddr(args + 8), &size.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(args + 12), &flags.to_le_bytes())
+            .unwrap();
+    };
+    let root = f.ret(2, &[dir, 0o200000, 0]);
+    let path_fd = f.ret(2, &[dir, 0o10000000, 0]);
+    let fd = f.ret(257, &[root, file, 0o102, 0o644]);
+    assert!(fd < 1024, "{fd}");
+
+    // setxattrat from a directory descriptor, and getxattrat back.
+    set_args(&mut f, value, 3, 0);
+    assert_eq!(f.ret(463, &[root, file, 0, name, args, 16]), 0);
+    set_args(&mut f, out, 16, 0);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 16]), 3);
+    let mut got = [0; 3];
+    f.mem.read(GuestAddr(out), &mut got).unwrap();
+    assert_eq!(&got, b"abc");
+    // A larger struct is fine if what it adds is zero.
+    f.mem.write_u64(GuestAddr(args + 16), 0).unwrap();
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 24]), 3);
+    f.mem.write_u64(GuestAddr(args + 16), 1).unwrap();
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 24]), e2big);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 15]), einval);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 4097]), e2big);
+    assert_eq!(f.ret(464, &[root, file, 0, name, 0, 16]), efault);
+    // getxattrat takes no flags; neither call takes other at_flags.
+    set_args(&mut f, out, 16, 1);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 16]), einval);
+    set_args(&mut f, value, 3, 4);
+    assert_eq!(f.ret(463, &[root, file, 0, name, args, 16]), einval);
+    set_args(&mut f, out, 16, 0);
+    assert_eq!(f.ret(464, &[root, file, 0x400, name, args, 16]), einval);
+    assert_eq!(f.ret(465, &[root, file, 0x400, 0, 0]), einval);
+    assert_eq!(f.ret(466, &[root, file, 0x400, name]), einval);
+    // A size of 0 asks for the length only.
+    set_args(&mut f, out, 0, 0);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 16]), 3);
+    set_args(&mut f, out, 2, 0);
+    assert_eq!(f.ret(464, &[root, file, 0, name, args, 16]), erange);
+
+    // AT_EMPTY_PATH: a null or empty path is the descriptor's file.
+    set_args(&mut f, out, 16, 0);
+    assert_eq!(f.ret(464, &[fd, 0, 0x1000, name, args, 16]), 3);
+    f.mem.write(GuestAddr(DATA + 0x300), b"\0").unwrap();
+    assert_eq!(f.ret(465, &[fd, DATA + 0x300, 0x1000, out, 64]), 7);
+    // Without it, an empty path is ENOENT.
+    assert_eq!(
+        f.ret(465, &[fd, DATA + 0x300, 0, out, 64]),
+        errno(Errno::ENOENT)
+    );
+    // An O_PATH descriptor names no file this way, but walks from one do.
+    assert_eq!(f.ret(465, &[path_fd, 0, 0x1000, out, 64]), ebadf);
+    assert_eq!(f.ret(465, &[path_fd, file, 0, out, 64]), 7);
+    // AT_FDCWD with an empty path: the working directory for set and get,
+    // EBADF for list and remove.
+    assert_eq!(
+        f.ret(464, &[(-100i64) as u64, 0, 0x1000, name, args, 16]),
+        errno(Errno(61))
+    );
+    assert_eq!(f.ret(465, &[(-100i64) as u64, 0, 0x1000, out, 64]), ebadf);
+    assert_eq!(f.ret(466, &[(-100i64) as u64, 0, 0x1000, name]), ebadf);
+    assert_eq!(
+        f.ret(464, &[(-1i64) as u64, 0, 0x1000, name, args, 16]),
+        ebadf
+    );
+
+    // The name is read before the file is found.
+    f.mem.write(GuestAddr(DATA + 0x340), b"\0").unwrap();
+    assert_eq!(
+        f.ret(466, &[(-1i64) as u64, 0, 0x1000, DATA + 0x340]),
+        erange
+    );
+    assert_eq!(f.ret(193, &[999, DATA + 0x340, 0, 0]), erange);
+    assert_eq!(f.ret(199, &[999, name]), ebadf);
+
+    // removexattrat, then it is gone.
+    assert_eq!(f.ret(466, &[root, file, 0, name]), 0);
+    assert_eq!(f.ret(466, &[root, file, 0, name]), errno(Errno(61)));
+    assert_eq!(f.ret(465, &[root, file, 0, out, 64]), 0);
+}
+
+#[test]
 fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
     let mut f = fixture();
     let (vec, page) = (DATA + 0x800, 4096);
@@ -5130,5 +5233,149 @@ mod kcmp {
         assert_eq!(f.ret(3, &[b]), 0);
         slot(&f, epoll, b, 0);
         assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), errno(Errno::ENOENT));
+    }
+}
+mod process_vm {
+    use super::*;
+    const LOCAL: u64 = DATA + 0x40;
+    const REMOTE: u64 = DATA + 0x80;
+    /// Writes the iovec array `segments` at `at`.
+    fn iovecs(f: &Fixture, at: u64, segments: &[(u64, u64)]) {
+        for (index, &(base, length)) in segments.iter().enumerate() {
+            let entry = at + index as u64 * 16;
+            f.mem.write_u64(GuestAddr(entry), base).unwrap();
+            f.mem.write_u64(GuestAddr(entry + 8), length).unwrap();
+        }
+    }
+    #[test]
+    fn process_vm_checks_in_linux_order() {
+        let mut f = fixture();
+        let (esrch, einval, efault) = (errno(Errno(3)), errno(Errno::EINVAL), errno(Errno::EFAULT));
+        let pid = f.ret(39, &[]);
+        iovecs(&f, LOCAL, &[(DATA + 0x800, 8)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x900, 8)]);
+        for number in [310, 311] {
+            // flags, then the local array, before anything else.
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, REMOTE, 1, 1]), einval);
+            assert_eq!(f.ret(number, &[999, LOCAL, 1025, REMOTE, 1, 0]), einval);
+            assert_eq!(f.ret(number, &[999, 8, 1, REMOTE, 1, 0]), efault);
+            // No local bytes: nothing more is looked at.
+            assert_eq!(f.ret(number, &[999, LOCAL, 0, 8, 1, 0]), 0);
+            // The remote array: its count, that it can be read, its lengths.
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, REMOTE, 1025, 0]), einval);
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, 8, 1, 0]), efault);
+            // No remote bytes: the task is not looked for.
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, REMOTE, 0, 0]), 0);
+            // Then the task, by an `int`.
+            assert_eq!(f.ret(number, &[999, LOCAL, 1, REMOTE, 1, 0]), esrch);
+            assert_eq!(f.ret(number, &[0, LOCAL, 1, REMOTE, 1, 0]), esrch);
+            assert_eq!(f.ret(number, &[u64::MAX, LOCAL, 1, REMOTE, 1, 0]), esrch);
+            assert_eq!(f.ret(number, &[pid | 1 << 32, LOCAL, 1, REMOTE, 1, 0]), 8);
+        }
+        iovecs(&f, REMOTE, &[(DATA + 0x900, 1 << 63)]);
+        assert_eq!(f.ret(310, &[999, LOCAL, 1, REMOTE, 1, 0]), einval);
+        iovecs(&f, REMOTE, &[(DATA + 0x900, 0), (DATA + 0x900, 0)]);
+        assert_eq!(f.ret(310, &[999, LOCAL, 1, REMOTE, 2, 0]), 0);
+    }
+    #[test]
+    fn process_vm_copies_and_stops_at_a_fault() {
+        let mut f = fixture();
+        let efault = errno(Errno::EFAULT);
+        let pid = f.ret(39, &[]);
+        // A read-only page after the data, and a page mapped write-only,
+        // which has no VM_READ for the remote side to read.
+        f.mem
+            .map(
+                Some(GuestAddr(DATA + 0x2000)),
+                0x1000,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        const ONLY_WRITE: u64 = 0x40_0000;
+        f.mem
+            .map(
+                Some(GuestAddr(ONLY_WRITE)),
+                0x1000,
+                Prot::WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        f.mem
+            .write(GuestAddr(DATA + 0x800), b"hello, world")
+            .unwrap();
+        // Two local buffers take one remote one in turn.
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 5), (DATA + 0xb00, 7)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x800, 12)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 2, REMOTE, 1, 0]), 12);
+        let mut out = [0; 7];
+        f.mem.read(GuestAddr(DATA + 0xa00), &mut out[..5]).unwrap();
+        assert_eq!(&out[..5], b"hello");
+        f.mem.read(GuestAddr(DATA + 0xb00), &mut out).unwrap();
+        assert_eq!(&out, b", world");
+        // A remote buffer that runs into a page that is not mapped gives the
+        // bytes before it; one that starts there is EFAULT, and so ends the
+        // copy, the bytes before it the result.
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 64)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x2ff8, 16)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), 8);
+        iovecs(&f, REMOTE, &[(DATA + 0x3000, 16)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), efault);
+        iovecs(
+            &f,
+            REMOTE,
+            &[(DATA + 0x800, 4), (DATA + 0x3000, 4), (DATA + 0x800, 4)],
+        );
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 3, 0]), 4);
+        // The local buffers stop at a page that cannot take the bytes.
+        iovecs(&f, LOCAL, &[(DATA + 0x1ffc, 8)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x800, 8)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), 4);
+        iovecs(&f, LOCAL, &[(DATA + 0x2000, 8)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), efault);
+        // Only as much as the local buffers hold, whatever lies beyond.
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 4)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x2ffc, 4), (DATA + 0x3000, 4)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 2, 0]), 4);
+        // A write-only page cannot be read from, but can be written.
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 4)]);
+        iovecs(&f, REMOTE, &[(ONLY_WRITE, 4)]);
+        assert_eq!(f.ret(310, &[pid, LOCAL, 1, REMOTE, 1, 0]), efault);
+        assert_eq!(f.ret(311, &[pid, LOCAL, 1, REMOTE, 1, 0]), 4);
+        // A write needs the remote page writable; the local one need only
+        // be readable, and one that is not ends the copy.
+        iovecs(&f, LOCAL, &[(DATA + 0x2000, 4)]);
+        iovecs(&f, REMOTE, &[(DATA + 0x2000, 4)]);
+        assert_eq!(f.ret(311, &[pid, LOCAL, 1, REMOTE, 1, 0]), efault);
+        iovecs(&f, REMOTE, &[(DATA + 0xc00, 4)]);
+        assert_eq!(f.ret(311, &[pid, LOCAL, 1, REMOTE, 1, 0]), 4);
+        f.mem.write(GuestAddr(DATA + 0xa00), b"hell").unwrap();
+        iovecs(&f, LOCAL, &[(DATA + 0xa00, 4), (DATA + 0x5000, 4)]);
+        iovecs(&f, REMOTE, &[(DATA + 0xc00, 8)]);
+        assert_eq!(f.ret(311, &[pid, LOCAL, 2, REMOTE, 1, 0]), 4);
+        f.mem.read(GuestAddr(DATA + 0xc00), &mut out[..4]).unwrap();
+        assert_eq!(&out[..4], b"hell");
+    }
+    #[test]
+    fn pidfd_getfd_copies_a_descriptor() {
+        let mut f = fixture();
+        let (einval, ebadf) = (errno(Errno::EINVAL), errno(Errno::EBADF));
+        let pid = f.ret(39, &[]);
+        let pidfd = f.ret(434, &[pid, 0]);
+        let event = f.ret(290, &[0, 0]);
+        assert_eq!(f.ret(438, &[pidfd, event, 1]), einval);
+        assert_eq!(f.ret(438, &[99, event, 0]), ebadf);
+        assert_eq!(f.ret(438, &[event, event, 0]), ebadf);
+        assert_eq!(f.ret(438, &[pidfd, 99, 0]), ebadf);
+        assert_eq!(f.ret(438, &[pidfd, u64::MAX, 0]), ebadf);
+        let copy = f.ret(438, &[pidfd, event | 1 << 32, 0]);
+        assert!(copy > event, "{copy}");
+        // Close-on-exec, and the same open file description: a count
+        // written through one reads through the other.
+        assert_eq!(f.ret(72, &[copy, 1]), 1);
+        f.mem.write_u64(GuestAddr(DATA), 5).unwrap();
+        assert_eq!(f.ret(1, &[event, DATA, 8]), 8);
+        assert_eq!(f.ret(0, &[copy, DATA + 8, 8]), 8);
+        assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 5);
     }
 }

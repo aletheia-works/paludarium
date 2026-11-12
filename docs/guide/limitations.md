@@ -246,6 +246,13 @@ verified.
     both kinds are mixed.
   - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
     caller that may trace that process.
+  - Whether a caller may attach to another process (`process_vm_readv`,
+    `process_vm_writev`, `pidfd_getfd`) is decided by the IDs, dumpability,
+    `CAP_SYS_PTRACE` and Landlock alone, as Linux with no Yama does: there is
+    no `kernel.yama.ptrace_scope`, so a process may reach its parent, where
+    Yama's default scope 1 lets only an ancestor in, and the capability
+    module's check that the caller's permitted capabilities cover the
+    target's is not made.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
@@ -427,9 +434,8 @@ verified.
   `NETLINK_EXT_ACK` adds no attributes to an error and strict checking
   checks nothing more. A message type past the last that `rtnetlink`
   knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`, where Linux 7.0
-  refuses the send itself with `EOPNOTSUPP`. A dump is answered whole at once, where Linux may
-  split it over datagrams, and a socket whose receive buffer is full drops
-  an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
+  refuses the send itself with `EOPNOTSUPP`. A socket whose receive buffer
+  is full drops an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
   acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that
   paludarium has, but for the System V shared memory, semaphores and
   message queues and the POSIX message queues of an IPC namespace: there is

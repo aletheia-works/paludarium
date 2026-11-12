@@ -769,7 +769,7 @@ fn transfer(
         return Err(Errno::EINVAL);
     }
     let segments = if vectored {
-        crate::files::iovecs_checked(c, iocb.buf, iocb.nbytes, |_, _| Ok(()))?
+        crate::files::iovecs_checked(c.mem, iocb.buf, iocb.nbytes, |_, _| Ok(()))?
     } else {
         // `import_ubuf`: the length cut to `MAX_RW_COUNT`, in the user half.
         let len = iocb.nbytes.min(crate::files::MAX_RW_COUNT as u64);

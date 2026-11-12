@@ -8,7 +8,9 @@
 //! its first `connect` or send. The kernel takes each message of a datagram
 //! sent to port 0 in turn: `RTM_GETLINK`, `RTM_GETADDR` and `RTM_GETROUTE`
 //! dumps (`NLM_F_DUMP`) answer with the loopback, its addresses and its
-//! routes, then `NLMSG_DONE` at the next receive; `RTM_GETLINK` without a
+//! routes, in parts as large as `netlink_dump` makes them, each receive
+//! that leaves room sending the next, then `NLMSG_DONE` in a part of its
+//! own (after the last IPv6 address, when it has room); `RTM_GETLINK` without a
 //! dump answers for `lo` by index or name, and `RTM_GETROUTE` without one
 //! looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and remove the
 //! loopback's addresses ([`crate::interface`]); `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
@@ -324,6 +326,10 @@ struct State {
     /// A dump's messages that have not gone yet, which each receive that
     /// leaves room sends on as much of as one part takes (`netlink_dump`).
     rest: VecDeque<Vec<u8>>,
+    /// Whether `done` goes after the last of `rest` when its part has room
+    /// for it, as it does after a dump callback that returns 0 when it is
+    /// through, rather than in a part of its own.
+    joined: bool,
     /// The longest buffer a receive has given, as much as one part of a
     /// dump may take (`max_recvmsg_len`).
     longest_read: usize,
@@ -807,13 +813,13 @@ impl NetlinkSocket {
             let messages = match (header.kind, family) {
                 // `rtnl_bridge_getlink` has no bridge port to show.
                 (RTM_GETLINK, AF_BRIDGE) => Vec::new(),
-                (RTM_GETLINK, _) => link_message(
+                (RTM_GETLINK, _) => vec![link_message(
                     &self.network,
                     header.seq,
                     port,
                     NLM_F_MULTI,
                     ext_mask(payload),
-                ),
+                )],
                 // `rtnl_dump_all` dumps each family's: IPv4's, then IPv6's.
                 (RTM_GETADDR, _) => {
                     let mut messages = Vec::new();
@@ -849,12 +855,10 @@ impl NetlinkSocket {
                 port,
                 &0i32.to_le_bytes(),
             );
-            if messages.is_empty() {
-                self.deliver_dump(s, done);
-            } else {
-                self.deliver_dump(s, messages);
-                s.done = Some(done);
-            }
+            // `inet6_dump_ifaddr` alone, not split, puts `NLMSG_DONE` after
+            // its last message when that part has room for it.
+            let joined = header.kind == RTM_GETADDR && family == AF_INET6;
+            self.start_dump_as(s, messages, done, joined);
             return Ok(true);
         }
         match header.kind {
@@ -1022,17 +1026,23 @@ impl NetlinkSocket {
         Ok(got)
     }
     /// Begins a dump of `messages`, as `netlink_dump_start`: the first
-    /// part goes now, the rest as receives make room, then `done`, or
-    /// `done` alone when there is nothing to dump.
+    /// part goes now, the rest as receives make room, then `done` in a
+    /// part of its own, or `done` alone when there is nothing to dump.
     fn start_dump(&self, s: &mut State, messages: Vec<Vec<u8>>, done: Vec<u8>) {
+        self.start_dump_as(s, messages, done, false);
+    }
+    /// [`Self::start_dump`], with `done` after the last message when
+    /// `joined` and its part has room for it.
+    fn start_dump_as(&self, s: &mut State, messages: Vec<Vec<u8>>, done: Vec<u8>, joined: bool) {
         if messages.is_empty() {
             self.deliver_dump(s, done);
             return;
         }
         s.rest = messages.into();
+        s.done = Some(done);
+        s.joined = joined;
         let part = dump_part(s);
         self.deliver_dump(s, part);
-        s.done = Some(done);
     }
 }
 
@@ -1127,7 +1137,8 @@ const LEAST_DUMP_PART: usize = 4096 - 320;
 const MOST_DUMP_PART: usize = 32768 - 320;
 /// The next part of a dump, as `netlink_dump` fills one: as many of the
 /// messages left as its size takes, the longest receive's but no less than
-/// a page's, and at least one.
+/// a page's, and at least one; then, for a dump whose `NLMSG_DONE` is
+/// joined to it, that, when it was the last and there is room left.
 fn dump_part(s: &mut State) -> Vec<u8> {
     let room = s.longest_read.max(LEAST_DUMP_PART);
     let mut part = Vec::new();
@@ -1136,6 +1147,12 @@ fn dump_part(s: &mut State) -> Vec<u8> {
             break;
         }
         part.extend(s.rest.pop_front().unwrap_or_default());
+    }
+    if s.joined
+        && s.rest.is_empty()
+        && let Some(done) = s.done.take_if(|done| part.len() + done.len() <= room)
+    {
+        part.extend(done);
     }
     part
 }
@@ -1381,11 +1398,11 @@ fn cacheinfo() -> [u8; 16] {
 }
 /// `RTM_NEWADDR` for each IPv4 address of `lo`, in its order, as
 /// `inet_fill_ifaddr` gives them.
-fn ipv4_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+fn ipv4_message(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
     let addresses = network.addresses().v4.clone();
     addresses
         .iter()
-        .flat_map(|address| ipv4_address(address, RTM_NEWADDR, NLM_F_MULTI, seq, port))
+        .map(|address| ipv4_address(address, RTM_NEWADDR, NLM_F_MULTI, seq, port))
         .collect()
 }
 /// An IPv4 address's message of `kind`, with `flags`.
@@ -1423,11 +1440,11 @@ fn ipv4_address(
 }
 /// `RTM_NEWADDR` for each IPv6 address of `lo`, in its order, as
 /// `inet6_fill_ifaddr` gives them.
-fn ipv6_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+fn ipv6_message(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
     let addresses = network.addresses().v6.clone();
     addresses
         .iter()
-        .flat_map(|address| ipv6_address(address, false, RTM_NEWADDR, NLM_F_MULTI, seq, port))
+        .map(|address| ipv6_address(address, false, RTM_NEWADDR, NLM_F_MULTI, seq, port))
         .collect()
 }
 /// An IPv6 address's message of `kind`, with `flags`, `tentative` or not.
@@ -1789,19 +1806,19 @@ fn lookup(
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }
 /// The IPv4 routes of every table, as `fib_dump_info` gives them.
-fn ipv4_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+fn ipv4_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
     let routes = network.addresses().dump4();
     routes
         .iter()
-        .flat_map(|r| ipv4_route_of(RTM_NEWROUTE, r, r.table, seq, port, NLM_F_MULTI))
+        .map(|r| ipv4_route_of(RTM_NEWROUTE, r, r.table, seq, port, NLM_F_MULTI))
         .collect()
 }
 /// The IPv6 routes of every table, as `rt6_fill_node` gives them.
-fn ipv6_routes(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+fn ipv6_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
     let routes = network.addresses().dump6();
     routes
         .iter()
-        .flat_map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, NLM_F_MULTI))
+        .map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, NLM_F_MULTI))
         .collect()
 }
 /// An `RTM_NEWROUTE` or `RTM_DELROUTE` request, as `inet_rtm_newroute`,
@@ -2393,6 +2410,29 @@ mod tests {
         assert_eq!(dump_part(&mut s).len(), 10);
         assert!(s.rest.is_empty());
     }
+    #[test]
+    fn a_joined_done_follows_the_last_message_when_there_is_room() {
+        let done = message(NLMSG_DONE, NLM_F_MULTI, 1, 7, &0i32.to_le_bytes());
+        let mut s = State {
+            rest: (0..4).map(|_| vec![0; 1000]).collect(),
+            done: Some(done.clone()),
+            joined: true,
+            ..State::default()
+        };
+        assert_eq!(dump_part(&mut s).len(), 3000);
+        assert_eq!(dump_part(&mut s).len(), 1000 + done.len());
+        assert!(s.done.is_none());
+        // With no room left after the last, it waits for a part of its own.
+        s.rest = (0..3).map(|_| vec![0; 1255]).collect();
+        s.done = Some(done.clone());
+        assert_eq!(dump_part(&mut s).len(), 3 * 1255);
+        assert_eq!(s.done, Some(done.clone()));
+        // Not joined, it never goes with the messages.
+        s.rest = vec![vec![0; 10]].into();
+        s.joined = false;
+        assert_eq!(dump_part(&mut s).len(), 10);
+        assert_eq!(s.done, Some(done));
+    }
     const RT_TABLE_LOCAL: u8 = 255;
     const RTPROT_KERNEL: u8 = 2;
     const RT_SCOPE_LINK: u8 = 253;
@@ -2453,9 +2493,9 @@ mod tests {
         );
         // Up, it has both; down again, it keeps 127.0.0.1 alone.
         network.set_up(true);
-        let v4 = ipv4_message(&network, 2, 7);
+        let v4 = ipv4_message(&network, 2, 7).concat();
         assert_eq!(&v4[16..24], &[2, 8, 0x80, 254, 1, 0, 0, 0]);
-        let v6 = ipv6_message(&network, 2, 7);
+        let v6 = ipv6_message(&network, 2, 7).concat();
         assert_eq!(&v6[16..24], &[10, 128, 0x80, 254, 1, 0, 0, 0]);
         assert_eq!(
             attributes(&v6[24..])[0],
@@ -2478,7 +2518,7 @@ mod tests {
         // Up: local 127.0.0.0/8, local 127.0.0.1 and the broadcast route,
         // then local ::1, each in the local table.
         network.set_up(true);
-        let v4 = ipv4_routes(&network, 2, 7);
+        let v4 = ipv4_routes(&network, 2, 7).concat();
         let mut rest = &v4[..];
         let mut seen = Vec::new();
         while !rest.is_empty() {
@@ -2506,7 +2546,7 @@ mod tests {
                 (32, RT_SCOPE_LINK, RTN_BROADCAST, vec![127, 255, 255, 255]),
             ]
         );
-        let v6 = ipv6_routes(&network, 2, 7);
+        let v6 = ipv6_routes(&network, 2, 7).concat();
         assert_eq!(
             &v6[16..24],
             &[
@@ -2536,7 +2576,7 @@ mod tests {
         );
         // Down: the two local routes stay, as Linux keeps them.
         network.set_up(false);
-        assert_eq!(ipv4_routes(&network, 3, 7).len(), 2 * 60);
+        assert_eq!(ipv4_routes(&network, 3, 7).concat().len(), 2 * 60);
         assert!(ipv6_routes(&network, 3, 7).is_empty());
     }
 

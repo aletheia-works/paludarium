@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`kcmp`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
@@ -54,7 +54,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
@@ -123,7 +123,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ用で（ほかでは読むと `ENODATA`、書くと `EPERM`）、`trusted.*` は
   `CAP_SYS_ADMIN` があるときだけ見え、`security.*` の変更にもこれが必要です。名前は
   1〜255 バイト（`ERANGE`）、値は 64 KiB まで（`E2BIG`）で、ほかの名前空間は
-  `EOPNOTSUPP` です。
+  `EOPNOTSUPP` です。Linux 6.13 以降と同じく、名前はファイルを探す前に読みます。
+- `setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`（Linux 6.13）は、
+  ディレクトリのディスクリプタからファイルを探し、受け付けるフラグは
+  `AT_SYMLINK_NOFOLLOW` と `AT_EMPTY_PATH` だけです（`EINVAL`）。`AT_EMPTY_PATH` では、
+  NULL または空のパスはディスクリプタのファイルを指します（ディスクリプタがないか
+  `O_PATH` のものなら `EBADF`）。このとき `setxattrat` と `getxattrat` は `AT_FDCWD` を
+  作業ディレクトリとして扱い、残りの 2 つは `EBADF` です。値とその大きさ、フラグは
+  `struct xattr_args` で渡し、`copy_struct_from_user` と同じように確かめます。16 バイト
+  未満は `EINVAL`、1 ページを超えるか 16 バイトより後ろに 0 でないバイトがあれば
+  `E2BIG` で、`getxattrat` はフラグを受け付けません（`EINVAL`）。
 - `statx` は、`stat` にある項目（`STATX_BASIC_STATS`）と、デバイス番号としてマウントの
   `st_dev` を返します。flags と mask は Linux と同じように確かめます（`EINVAL`）。
   mask が何を求めても、Linux と同じくマウントの ID も返します。`/proc/self/mountinfo`
@@ -795,6 +804,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux がアドレスを隠すのと同じく、ランダムなクッキーで決まる順の 1 か 2 を返します。それを
   持たないスレッド（終わったプロセス、I/O コンテキストや undo リストのないスレッド）どうしは
   等しいとみなします。
+- `process_vm_readv` と `process_vm_writev` は Linux の `mm/process_vm_access.c` と同じ順に
+  確かめます。`flags` は 0 でなければならず（`EINVAL`）、次に手元の iovec 配列を `readv` と
+  同じく読み、次に相手側の配列を読みます（1024 を超える要素や負の長さは `EINVAL`、読めない
+  配列は `EFAULT`。バッファはまだ見ません）。どちらかの側に写すバイトがなければ、スレッドを
+  探す前に 0 を返します。`pid` は呼んだ側の PID 名前空間の番号でスレッドを指し（`ESRCH`。
+  ゾンビも同じ）、自分のメモリでない限り、実 ID で判断するアタッチモードの
+  `ptrace_may_access` と同じく、そのメモリにアタッチできることを求めます（`EPERM`）。
+  手元のバッファに空きがある間、相手側のバッファを順に写します。マップされていない相手側の
+  ページ、`PROT_READ` なしのページ（読む場合。Linux の `VM_READ` と同じく `PROT_WRITE` や
+  `PROT_EXEC` だけでは足りません）、`PROT_WRITE` なしのページ（書く場合）、または書けない・
+  読めない手元のバイトで写すのをやめ、それまでに写したバイト数を返します。1 バイトも
+  写せなければ `EFAULT` です。
+- `pidfd_getfd` はフラグを取らず（`EINVAL`）、pidfd を取り（`EBADF`）、そのプロセスに上と
+  同じくアタッチできることを求めます（`EPERM`）。終わったプロセスは回収の前でも後でも
+  `ESRCH`、そのプロセスにないディスクリプタは `EBADF` です。写しは開いたファイル記述を
+  共有し、空いている最小の番号を close-on-exec で得ます（`RLIMIT_NOFILE` に達すれば
+  `EMFILE`）。
 - `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
   （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
   `execve` は `READ_IMPLIES_EXEC` を、set-ID のプログラムなら `PER_CLEAR_ON_SETID` も
@@ -1019,7 +1045,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     空きができるまで待ちます（`MSG_DONTWAIT` か `O_NONBLOCK` なら `EAGAIN`）。こちらは
     あふれたことにはなりません。
   - **リクエスト:** カーネル（ポート 0）は、`rtnetlink` と同じくデータグラムのメッセージを
-    1 つずつ受け取ります。ダンプ（`NLM_F_DUMP`）は次の受信の `NLMSG_DONE` で終わります。
+    1 つずつ受け取ります。ダンプ（`NLM_F_DUMP`）は、Linux の `netlink_dump` と同じ大きさに
+    分けて答えます（1 ページ分、あるいはそれまでで一番長い受信の分で 32 KiB まで。次の部分は
+    受信が空きを作ったときに送ります）。最後は別の部分の `NLMSG_DONE` です。`AF_INET6` の
+    アドレスのダンプでは、`inet6_dump_ifaddr` と同じく、空きがあれば最後のアドレスと同じ部分に
+    入れます。
     エラーと、`NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返し、エラーのものは
     `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`GET` のほかには、ネットワーク
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを

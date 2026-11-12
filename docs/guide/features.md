@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `kcmp`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
@@ -62,7 +62,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
@@ -139,7 +139,17 @@ kernel.
   files and directories (on others, reading gives `ENODATA` and writing `EPERM`),
   `trusted.*` shows only with `CAP_SYS_ADMIN`, and `security.*` needs it to
   change. A name is from 1 to 255 bytes (`ERANGE`), a value at most 64 KiB
-  (`E2BIG`), and any other namespace gives `EOPNOTSUPP`.
+  (`E2BIG`), and any other namespace gives `EOPNOTSUPP`. The name is read
+  before the file is found, as since Linux 6.13.
+- `setxattrat`, `getxattrat`, `listxattrat` and `removexattrat` (Linux 6.13)
+  find the file from a directory descriptor, and take `AT_SYMLINK_NOFOLLOW`
+  and `AT_EMPTY_PATH` only (`EINVAL`). With `AT_EMPTY_PATH`, a null or empty
+  path names the descriptor's file (`EBADF` for none or an `O_PATH` one);
+  `setxattrat` and `getxattrat` take `AT_FDCWD` then as the working
+  directory, and the other two give `EBADF`. The value, its size and the
+  flags come in a `struct xattr_args`, checked as `copy_struct_from_user`
+  checks one: below 16 bytes is `EINVAL`, above a page or with a nonzero
+  byte past the 16 is `E2BIG`, and `getxattrat` takes no flags (`EINVAL`).
 - `statx` reports the fields a `stat` has (`STATX_BASIC_STATS`) and the
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
   (`EINVAL`). Whatever the mask asks for, it also gives the mount's ID, as
@@ -900,6 +910,27 @@ kernel.
   for others in an order that random cookies make, as Linux hides the
   objects' addresses. A thread without one (an ended process, a thread with
   no I/O context or undo list) compares equal to another without.
+- `process_vm_readv` and `process_vm_writev` check as Linux's
+  `mm/process_vm_access.c` does: `flags` must be 0 (`EINVAL`), then the local
+  iovec array as `readv` reads it, then the remote one (more than 1024
+  entries or a negative length `EINVAL`, an array that cannot be read
+  `EFAULT`, its buffers not looked at yet); with no bytes to copy on either
+  side they return 0 before the thread is looked for. `pid` names a thread as
+  the caller's PID namespace numbers it (`ESRCH`, also for a zombie), whose
+  memory the caller must be allowed to attach to unless it is its own, as
+  `ptrace_may_access` in attach mode with the real IDs decides (`EPERM`).
+  They copy each remote buffer in turn while the local buffers have room: a
+  remote page that is not mapped, is not mapped with `PROT_READ` (to read;
+  `PROT_WRITE` or `PROT_EXEC` alone is not enough, as Linux's `VM_READ`) or
+  without `PROT_WRITE` (to write), or a local byte that cannot be written or
+  read, ends the copy, which gives the bytes copied before it, or `EFAULT`
+  with none.
+- `pidfd_getfd` takes no flags (`EINVAL`) and a pidfd (`EBADF`), and needs
+  the caller to be allowed to attach to its process as above (`EPERM`); a
+  process that has exited, reaped or not, is `ESRCH`, and a descriptor it
+  does not have `EBADF`. The copy shares the open file description and
+  gets the lowest free number, close-on-exec (`EMFILE` at
+  `RLIMIT_NOFILE`).
 - `personality` keeps any value for the thread, as Linux stores it, and
   returns the old one (`0xffffffff` only asks). New threads and processes
   inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and
@@ -1170,8 +1201,12 @@ kernel.
     room, or the socket congested, waits for room instead, or is `EAGAIN`
     with `MSG_DONTWAIT` or `O_NONBLOCK`, and overruns nothing.
   - **Requests:** the kernel, port 0, takes each message of a datagram as
-    `rtnetlink` does. A dump (`NLM_F_DUMP`) ends with `NLMSG_DONE` at the
-    next receive. An error, or a success with `NLM_F_ACK`, is answered with
+    `rtnetlink` does. A dump (`NLM_F_DUMP`) comes in parts as large as
+    Linux's `netlink_dump` makes them (a page's worth, or as much as the
+    longest receive so far asked for up to 32 KiB, the next as a receive
+    makes room), and ends with `NLMSG_DONE` in a part of its own; an
+    `AF_INET6` address dump's goes after its last address when that part
+    has room, as `inet6_dump_ifaddr` puts it. An error, or a success with `NLM_F_ACK`, is answered with
     `NLMSG_ERROR`, which carries the whole request with an error unless
     `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending

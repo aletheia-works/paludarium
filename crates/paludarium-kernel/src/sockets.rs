@@ -937,7 +937,7 @@ pub(crate) fn message_header(
     let iov = if write {
         crate::files::iovecs(c, word(16), word(24), true)?
     } else {
-        crate::files::iovecs_checked(c, word(16), word(24), |_, _| Ok(()))?
+        crate::files::iovecs_checked(c.mem, word(16), word(24), |_, _| Ok(()))?
     };
     Ok(MessageHeader {
         name: (name != 0 && name_len != 0).then_some((name, name_len)),

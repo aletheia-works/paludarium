@@ -6341,8 +6341,24 @@ static int kcmp_case(void) {
            "fault=%ld\n",
            watched, from_child, other == 1 || other == 2 ? "differ" : "?", past, not_epoll,
            bad_epoll, kc_raw(self, self, 7, b, 8));
-    /* Another user's or an undumpable task needs CAP_SYS_PTRACE. */
-    printf("kcmp undumpable=%s root=%d\n", kc(self, locked, 1, 0, 0), geteuid() == 0);
+    /* An undumpable task, or another user's, needs CAP_SYS_PTRACE: each is
+     * whether the outcome is the one for this process's user. As root, a
+     * child becomes another user to ask about its parent. */
+    int root = geteuid() == 0;
+    long undumpable = kc_raw(self, locked, 1, 0, 0);
+    fflush(stdout);
+    pid_t asker = fork();
+    if (asker == 0) {
+        int other = root && !setgroups(0, NULL) && !setresgid(65534, 65534, 65534) &&
+                    !setresuid(65534, 65534, 65534);
+        long r = kc_raw(getpid(), getppid(), 1, 0, 0);
+        _exit(other ? r == -EPERM : r == 1 || r == 2);
+    }
+    int status = 0;
+    waitpid(asker, &status, 0);
+    printf("kcmp undumpable=%d other-user=%d\n",
+           root ? undumpable == 1 || undumpable == 2 : undumpable == -EPERM,
+           WIFEXITED(status) && WEXITSTATUS(status) == 1);
     close(kc_gate[1]);
     pthread_join(t, NULL);
     waitpid(child, NULL, 0);

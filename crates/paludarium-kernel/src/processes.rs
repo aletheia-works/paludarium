@@ -3102,8 +3102,6 @@ impl Kernel {
             self.wait_for_children(ticket)?;
         }
     }
-    /// `pidfd_open(pid, flags)`: a close-on-exec pidfd for a process.
-    /// `PIDFD_THREAD` is accepted but still names the whole process.
     /// `kcmp(pid1, pid2, type, idx1, idx2)`: each number, an `int`, names
     /// a thread as the caller's PID namespace numbers them (`ESRCH`), as
     /// Linux's `find_task_by_vpid`; the caller's own thread is taken as it
@@ -3160,6 +3158,8 @@ impl Kernel {
             [a[3], a[4]],
         )
     }
+    /// `pidfd_open(pid, flags)`: a close-on-exec pidfd for a process.
+    /// `PIDFD_THREAD` is accepted but still names the whole process.
     fn pidfd_open(&mut self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
         let flags = u64::from(a[1] as u32);
         if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 || a[0] as i32 <= 0 {

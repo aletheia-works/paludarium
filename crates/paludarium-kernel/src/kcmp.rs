@@ -85,7 +85,8 @@ pub(crate) fn cookies(random: &[u8; TYPES * 16]) -> [[u64; 2]; TYPES] {
 /// the descriptor table, the working directory and umask, the signal
 /// dispositions, the I/O context, the System V semaphore undo list, or the
 /// first task's file with one an epoll instance of the second's watches
-/// (`KCMP_EPOLL_TFD`); any other is `EINVAL`.
+/// (`KCMP_EPOLL_TFD`, ordered as `KCMP_FILE` orders them); any other is
+/// `EINVAL`.
 pub(crate) fn compare(
     cookies: &[[u64; 2]; TYPES],
     caller: (&ThreadGroup, &Credentials),
@@ -146,5 +147,12 @@ pub(crate) fn compare(
         }
         _ => return Err(Errno::EINVAL),
     };
-    Ok(order(cookies, kind as usize, a, b))
+    // kcmp_epoll_target compares the two files as KCMP_FILE does, with its
+    // cookies.
+    Ok(order(
+        cookies,
+        if kind == 7 { 0 } else { kind as usize },
+        a,
+        b,
+    ))
 }

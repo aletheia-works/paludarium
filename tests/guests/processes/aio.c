@@ -577,8 +577,8 @@ static int case_getevents(void) {
     struct timespec ms10 = {.tv_nsec = 10000000};
     printf("empty=%ld", getevents(ctx, 0, 8, ev, &zero));
     printf(" timed-out=%ld\n", getevents(ctx, 1, 8, ev, &ms10));
-    struct timespec negative = {.tv_sec = -1};
-    printf("negative=%ld\n", getevents(ctx, 1, 8, ev, &negative));
+    /* A negative timeout waits as none does, which Linux's timer never
+       ends: not printed, as nothing would end it here. */
     /* The events are in the ring as io_submit returns, where the program
        may take them itself. */
     printf("submit=%ld", submit(ctx, 3, list));

@@ -616,7 +616,8 @@ fn polls_wait_for_their_files_and_can_be_cancelled() {
     assert_eq!(f.ret(0, &[eventfd, BUFFERS, 8]), errno(Errno::EAGAIN));
     f.mem.write(GuestAddr(BUFFERS), b"x").unwrap();
     assert_eq!(f.ret(1, &[writer, BUFFERS, 1]), 1);
-    assert_eq!(f.reap(ctx), [(2, waiting, 1)]);
+    // The pipe's wake-up gives its whole key, POLLIN | POLLRDNORM.
+    assert_eq!(f.reap(ctx), [(2, waiting, 0x41)]);
     assert_eq!(f.ret(0, &[eventfd, BUFFERS, 8]), 8);
     assert_eq!(f.u64_at(BUFFERS), 1);
     assert_eq!(f.ret(0, &[reader, BUFFERS, 1]), 1);

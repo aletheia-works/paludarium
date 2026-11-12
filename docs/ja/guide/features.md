@@ -869,11 +869,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `aio_offset` で実行され（パイプ、ソケット、端末はストリームとして）、`IOCB_FLAG_IOPRIO` の
   優先度と `aio_rw_flags` は `preadv2` と同じく確かめ、そのイベントは呼び出しが戻る前に
   リングにあります。空のパイプの読み込みはそこで待ち、シグナルで結果が `EINTR` になります。
-  poll はファイルが準備できていればすぐに完了し、そうでなければ準備できるまで待ちます。
+  poll はファイルが準備できていれば、そのイベントのうち準備できたものですぐに完了し、
+  そうでなければ準備できるまで待ちます。待ったあとは、Linux の `aio_poll_wake` と同じく
+  起床のキーをそのまま返します（パイプなら `POLLIN` だけを求めても `POLLIN | POLLRDNORM`、
+  キーのないハングアップなら準備できたもの）。
   `io_cancel` が取り消せるのは待っている poll だけで（`EINPROGRESS` で、イベントのない
   イベントがリングに入ります）、ほかの要求には `EINVAL` です。`io_getevents` と
   `io_pgetevents` は head からイベントを取り、Linux の `read_events` と同じく `min_nr` 個まで
-  待ちます。待ちが終わるのは、タイムアウト、シグナル（`io_getevents` は再開しない `EINTR`、
+  待ちます（負のタイムアウトは、Linux と同じくタイムアウトなしと同じに待ちます）。
+  待ちが終わるのは、タイムアウト、シグナル（`io_getevents` は再開しない `EINTR`、
   `io_pgetevents` は `ERESTARTNOHAND` で、待つあいだはそのシグナルマスクです）、ほかの
   スレッドの `io_destroy`（`EINVAL`）です。eventfd を指定した要求の完了は、それぞれ eventfd が
   数えます。コンテキストはアドレス空間のものです。スレッドと `CLONE_VM` の子は共有し、fork の

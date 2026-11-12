@@ -340,7 +340,7 @@ impl Ring {
             let mut index = 0;
             while index < state.polls.len() {
                 let poll = &state.polls[index];
-                let mask = polled(&poll.file).0 & poll.events;
+                let mask = woken(&poll.file, polled(&poll.file).0, poll.events);
                 if mask == 0 {
                     index += 1;
                 } else {
@@ -544,6 +544,39 @@ fn polled(file: &Arc<dyn FileHandle>) -> (u32, u32) {
         1
     };
     (mask, queues)
+}
+
+/// What a poll that waits completes with once `file` is ready (`mask`)
+/// for some of its `events`: Linux's `aio_poll_wake` takes the key of the
+/// wake-up whole, so that a pipe becoming readable gives `POLLIN |
+/// POLLRDNORM` (`pipe_write`'s key) and a socket `POLLIN | POLLPRI |
+/// POLLRDNORM | POLLRDBAND` (`sock_def_readable`'s), whatever was asked
+/// for; taking a write likewise gives the writer's key. A file whose
+/// wake-ups carry no key (a hang-up, a timerfd, ...) is polled again, and
+/// gives what is ready among `events`.
+fn woken(file: &Arc<dyn FileHandle>, mask: u32, events: u32) -> u32 {
+    const POLLPRI: u32 = 0x2;
+    const POLLRDBAND: u32 = 0x80;
+    const POLLWRBAND: u32 = 0x200;
+    let ready = mask & events;
+    let kind = file.stat().map_or(0, |stat| stat.mode & S_IFMT);
+    let counter = file
+        .as_any()
+        .is_some_and(|any| any.is::<crate::events::EventCounter>());
+    let keyed = matches!(kind, S_IFIFO | S_IFSOCK) || counter;
+    if !keyed || ready & (POLLIN | POLLOUT) == 0 {
+        return ready;
+    }
+    let (input, output) = match kind {
+        S_IFIFO => (POLLIN | POLLRDNORM, POLLOUT | POLLWRNORM),
+        S_IFSOCK => (
+            POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND,
+            POLLOUT | POLLWRNORM | POLLWRBAND,
+        ),
+        // eventfd's `wake_up_locked_poll` keys.
+        _ => (POLLIN, POLLOUT),
+    };
+    if ready & POLLIN != 0 { input } else { output }
 }
 
 /// Whether `file` has the `read_iter` (or with `write`, `write_iter`)
@@ -993,7 +1026,8 @@ fn cancel(c: &mut Context<'_>, ctx_id: u64, iocb: u64) -> Result<u64, Errno> {
 
 /// A timeout of `io_getevents`, as `timespec64_to_ktime` makes it: `None`
 /// for none or one past `KTIME_SEC_MAX` seconds, else nanoseconds, which
-/// may be 0 (no wait) or negative (as good as 0).
+/// may be 0 (no wait) or negative, which waits as none does (as Linux on
+/// CI does: its sleeper's timer never ends the wait).
 fn timeout(c: &Context<'_>, at: u64) -> Result<Option<Option<i64>>, Errno> {
     if at == 0 {
         return Ok(None);
@@ -1063,7 +1097,9 @@ fn get_events(
     let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) else {
         return got;
     };
-    let deadline = until.map(|nanos| now.saturating_add(nanos.max(0) as u64));
+    let deadline = until
+        .filter(|&nanos| nanos > 0)
+        .map(|nanos| now.saturating_add(nanos as u64));
     let mut interrupted = false;
     loop {
         let ticket = c.files.readiness.token.value();

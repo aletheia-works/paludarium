@@ -207,7 +207,9 @@ verified.
     host (any other file system takes neither).
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
-    mapped. In a child of `fork`, `move_pages` shows a page of a shared
+    mapped. It refuses advice Linux does not know before any range
+    (`EINVAL`), as Linux master does; the CI's kernel checks it with each
+    range, so with no ranges, or only empty ones, it gives 0 there. In a child of `fork`, `move_pages` shows a page of a shared
     mapping, or of a private one never written, that the parent had touched
     as there, where Linux copies no page table of such a VMA (`-ENOENT`
     until the child touches the page).

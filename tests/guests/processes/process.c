@@ -5995,8 +5995,8 @@ static long vf_pwritev2(int fd, const void *buf, size_t len, long offset, long f
     return vf_errno(syscall(328, (long)fd, &v, 1L, offset, 0L, flags));
 }
 /* preadv2 and pwritev2 with their flags (RWF_DONTCACHE and RWF_NOSIGNAL
- * as Linux master has them), and epoll_pwait2, as Linux 6.12 has it. A regular file's RWF_NOWAIT depends on its filesystem, so it is
- * left out. */
+ * as Linux master has them), and epoll_pwait2, as Linux 6.12 has it. A
+ * regular file's RWF_NOWAIT depends on its filesystem, so it is left out. */
 static int vector_flags_case(void) {
     char path[] = "/tmp/vector-flags-XXXXXX";
     int fd = mkstemp(path);
@@ -6061,8 +6061,8 @@ static int vector_flags_case(void) {
     int spared = !sigismember(&pending, SIGPIPE);
     long plain = vf_pwritev2(p[1], "x", 1, -1, 0);
     sigpending(&pending);
-    printf("nosignal pipe=%ld socket=%ld spared=%d plain=%ld raised=%d\n", ns_pipe, ns_socket, spared,
-           plain, sigismember(&pending, SIGPIPE));
+    printf("nosignal pipe=%ld socket=%ld spared=%d plain=%ld raised=%d\n", ns_pipe, ns_socket,
+           spared, plain, sigismember(&pending, SIGPIPE));
     signal(SIGPIPE, SIG_IGN);
     sigprocmask(SIG_SETMASK, &old_mask, NULL);
     signal(SIGPIPE, SIG_DFL);

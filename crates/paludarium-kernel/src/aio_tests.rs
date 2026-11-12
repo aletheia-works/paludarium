@@ -312,6 +312,21 @@ fn reads_and_writes_complete_before_submit_returns() {
     assert_eq!(f.submit(ctx, writev), 1);
     assert_eq!(f.reap(ctx), [(9, IOCBS, 5), (9, IOCBS, 5)]);
     assert_eq!(f.ret(8, &[fd, 0, 2]), 16);
+    // Only the low 32 bits of a vector's count are read, as `import_iovec`
+    // takes an `unsigned` on the kernels CI runs: two buffers, then none.
+    let wide = Iocb {
+        data: 13,
+        nbytes: 0x1_0000_0002,
+        ..readv
+    };
+    assert_eq!(f.submit(ctx, wide), 1);
+    let empty = Iocb {
+        data: 14,
+        nbytes: 1 << 32,
+        ..readv
+    };
+    assert_eq!(f.submit(ctx, empty), 1);
+    assert_eq!(f.reap(ctx), [(13, IOCBS, 5), (14, IOCBS, 0)]);
     // A sync, and a read past the end, which reads nothing.
     let sync = Iocb {
         data: 10,

@@ -1913,6 +1913,50 @@ fn inode_flags_read_back_and_refuse_what_linux_refuses() {
 }
 
 #[test]
+fn cachestat_counts_a_files_allocated_pages_in_a_range() {
+    let mut f = fixture();
+    let (path, range, out) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+    let data = f.ret(nr::MMAP, &[0, 3 * 4096, 3, 0x22, u64::MAX, 0]);
+    f.mem.write(GuestAddr(path), b"/cachestat-file\0").unwrap();
+    let fd = f.ret(2, &[path, 0o102, 0o644]);
+    // Three pages, a hole, and the eleventh page.
+    assert_eq!(f.ret(1, &[fd, data, 3 * 4096]), 3 * 4096);
+    assert_eq!(f.ret(18, &[fd, data, 1, 10 * 4096]), 1);
+    let stat = |f: &mut Fixture, fd: u64, off: u64, len: u64, flags: u64| {
+        f.mem.write_u64(GuestAddr(range), off).unwrap();
+        f.mem.write_u64(GuestAddr(range + 8), len).unwrap();
+        f.mem.write(GuestAddr(out), &[0xff; 40]).unwrap();
+        let r = f.ret(451, &[fd, range, out, flags]);
+        (
+            r,
+            f.mem.read_u64(GuestAddr(out)).unwrap(),
+            f.mem.read_u64(GuestAddr(out + 32)).unwrap(),
+        )
+    };
+    assert_eq!(stat(&mut f, fd, 0, 0, 0), (0, 4, 0));
+    assert_eq!(stat(&mut f, fd, 4096, 4096, 0).1, 1);
+    assert_eq!(stat(&mut f, fd, 4095, 2, 0).1, 2);
+    assert_eq!(stat(&mut f, fd, 5 * 4096, 4096, 0).1, 0);
+    assert_eq!(stat(&mut f, fd, 4096, u64::MAX, 0).1, 0);
+    assert_eq!(stat(&mut f, fd, 0, 0, 1).0, errno(Errno::EINVAL));
+    assert_eq!(f.ret(451, &[fd, 0, out, 0]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(451, &[fd, range, 0, 0]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(451, &[999, range, out, 0]), errno(Errno::EBADF));
+    assert_eq!(f.ret(77, &[fd, 4096]), 0);
+    assert_eq!(stat(&mut f, fd, 0, 0, 0).1, 1);
+    // A pipe keeps none; another user's file, opened to read, is EPERM
+    // before the flags are looked at.
+    let pipe = DATA + 0x400;
+    assert_eq!(f.ret(22, &[pipe]), 0);
+    let reader = f.mem.read_u64(GuestAddr(pipe)).unwrap() & 0xffff_ffff;
+    assert_eq!(stat(&mut f, reader, 0, 0, 0), (0, 0, 0));
+    assert_eq!(f.ret(nr::SETUID, &[1000]), 0);
+    let read_only = f.ret(2, &[path, 0, 0]);
+    assert_eq!(stat(&mut f, read_only, 0, 0, 1).0, errno(Errno::EPERM));
+    assert_eq!(stat(&mut f, fd, 0, 0, 0).1, 1);
+}
+
+#[test]
 fn mincore_reports_what_was_touched_up_to_what_is_not_mapped() {
     let mut f = fixture();
     let (vec, page) = (DATA + 0x800, 4096);
@@ -4199,6 +4243,54 @@ mod vectored_flags {
         );
     }
     #[test]
+    fn dontcache_needs_a_file_system_with_it_and_nosignal_spares_sigpipe() {
+        let mut f = fixture();
+        let (iov, buf) = (DATA + 0x300, DATA + 0x400);
+        f.mem.write(GuestAddr(buf), b"ab").unwrap();
+        iovec(&f, iov, buf, 2);
+        assert_eq!(f.ret(22, &[DATA + 0x500]), 0);
+        let mut ends = [0; 8];
+        f.mem.read(GuestAddr(DATA + 0x500), &mut ends).unwrap();
+        let reader = u64::from(u32::from_le_bytes(ends[..4].try_into().unwrap()));
+        let writer = u64::from(u32::from_le_bytes(ends[4..].try_into().unwrap()));
+        // A pipe and a memfd (shmem) have no FOP_DONTCACHE.
+        assert_eq!(
+            f.ret(PWRITEV2, &[writer, iov, 1, HERE, 0, 0x80]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        f.mem.write(GuestAddr(DATA), b"m\0").unwrap();
+        let memfd = f.ret(319, &[DATA, 0]);
+        assert_eq!(
+            f.ret(PWRITEV2, &[memfd, iov, 1, 0, 0, 0x80]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(f.ret(PWRITEV2, &[memfd, iov, 1, 0, 0, 0x100]), 2);
+        // Nor has a file the kernel makes.
+        f.mem
+            .write(GuestAddr(DATA), b"/proc/self/status\0")
+            .unwrap();
+        let status = f.ret(2, &[DATA, 0, 0]);
+        assert_eq!(
+            f.ret(PREADV2, &[status, iov, 1, 0, 0, 0x80]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(f.ret(PREADV2, &[status, iov, 1, 0, 0, 0]), 2);
+        // With no reader, NOSIGNAL gives EPIPE without SIGPIPE.
+        assert_eq!(f.ret(3, &[reader]), 0);
+        f.thread.state.signal_mask = 1 << 12;
+        let sigpipe = |f: &Fixture| f.thread.state.pending.iter().any(|s| s.number == 13);
+        assert_eq!(
+            f.ret(PWRITEV2, &[writer, iov, 1, HERE, 0, 0x100]),
+            errno(Errno(32))
+        );
+        assert!(!sigpipe(&f));
+        assert_eq!(
+            f.ret(PWRITEV2, &[writer, iov, 1, HERE, 0, 0]),
+            errno(Errno(32))
+        );
+        assert!(sigpipe(&f));
+    }
+    #[test]
     fn the_flags_are_checked_as_kiocb_set_rw_flags_checks_them() {
         let mut f = fixture();
         let (iov, buf) = (DATA + 0x300, DATA + 0x400);
@@ -4208,8 +4300,12 @@ mod vectored_flags {
         assert_eq!(f.ret(1, &[fd, buf, 6]), 6);
         iovec(&f, iov, buf, 2);
         let read = |f: &mut Fixture, flags: u64| f.ret(PREADV2, &[fd, iov, 1, 0, 0, flags]);
-        assert_eq!(read(&mut f, 0x80), errno(Errno::EOPNOTSUPP));
+        assert_eq!(read(&mut f, 0x200), errno(Errno::EOPNOTSUPP));
         assert_eq!(read(&mut f, 0x30), errno(Errno::EINVAL));
+        // Any file takes NOSIGNAL. This in-memory file has no DONTCACHE, as
+        // tmpfs has none (a host file's is `NativeFile::dontcache`).
+        assert_eq!(read(&mut f, 0x100), 2);
+        assert_eq!(read(&mut f, 0x80), errno(Errno::EOPNOTSUPP));
         assert_eq!(read(&mut f, 0x40), errno(Errno::EOPNOTSUPP)); // RWF_ATOMIC
         // HIPRI, DSYNC, SYNC and NOWAIT read a regular file.
         assert_eq!(read(&mut f, 0xf), 2);
@@ -4783,6 +4879,77 @@ mod inotify {
             .iter()
             .map(|(wd, mask, _, name)| (*wd, *mask, &name[..]))
             .collect()
+    }
+    #[test]
+    fn the_files_exec_opens_are_heard_of() {
+        let mut f = fixture();
+        let files: [(&[u8], u32, &[u8]); 6] = [
+            (b"/tmp/x/shut", 0o644, b"#!/tmp/x/prog\n"),
+            (b"/tmp/x/empty", 0o755, b""),
+            (b"/tmp/x/junk", 0o755, b"junk"),
+            (b"/tmp/x/bad", 0o755, b"#!/tmp/x/junk\n"),
+            (b"/tmp/x/s", 0o755, b"#!/tmp/x/prog\n"),
+            (
+                b"/tmp/x/prog",
+                0o755,
+                &paludarium_loader::testing::tiny_exec(&[0x90], b""),
+            ),
+        ];
+        assert_eq!(f.ret(83, &[put(&f, DATA, b"/tmp/x"), 0o755]), 0);
+        for (path, mode, bytes) in files {
+            let file = f.kernel.files.fs.open(path, 0o101, mode).unwrap();
+            assert_eq!(file.write_at(0, bytes).unwrap(), bytes.len());
+        }
+        let fd = f.ret(INIT1, &[IN_NONBLOCK]);
+        let wd = f.ret(ADD, &[fd, put(&f, DATA, b"/tmp/x"), 0xfff]) as i32;
+        let exec = |f: &mut Fixture, path: &[u8]| f.ret(59, &[put(f, DATA, path), 0, 0]);
+        // Exec opens no file it may not run, and closes one it cannot run
+        // after reading what of it there is.
+        assert_eq!(exec(&mut f, b"/tmp/x/shut"), errno(Errno::EACCES));
+        assert_eq!(masks(&events(&mut f, fd)), []);
+        assert_eq!(exec(&mut f, b"/tmp/x/empty"), errno(Errno(8)));
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [(wd, 0x20, &b"empty"[..]), (wd, 0x10, b"empty")]
+        );
+        assert_eq!(exec(&mut f, b"/tmp/x/junk"), errno(Errno(8)));
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (wd, 0x20, &b"junk"[..]),
+                (wd, 1, b"junk"),
+                (wd, 0x10, b"junk")
+            ]
+        );
+        // A script's interpreter is opened while the script is, and the
+        // last opened closes first.
+        assert_eq!(exec(&mut f, b"/tmp/x/bad"), errno(Errno(8)));
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (wd, 0x20, &b"bad"[..]),
+                (wd, 1, b"bad"),
+                (wd, 0x20, b"junk"),
+                (wd, 1, b"junk"),
+                (wd, 0x10, b"junk"),
+                (wd, 0x10, b"bad"),
+            ]
+        );
+        // The script closes at the end of the exec, and the program once
+        // no process runs it.
+        assert_eq!(exec(&mut f, b"/tmp/x/s"), 0);
+        assert_eq!(
+            masks(&events(&mut f, fd)),
+            [
+                (wd, 0x20, &b"s"[..]),
+                (wd, 1, b"s"),
+                (wd, 0x20, b"prog"),
+                (wd, 1, b"prog"),
+                (wd, 0x10, b"s"),
+            ]
+        );
+        f.kernel.group.set_exe_file(None);
+        assert_eq!(masks(&events(&mut f, fd)), [(wd, 0x10, &b"prog"[..])]);
     }
     #[test]
     fn a_fifo_a_path_opened_and_splices_are_heard_of() {

@@ -718,6 +718,38 @@ void _start(void) {
   ts[2]=2000;results[x++]=call(280,-100,(long)fdpath(fd),(long)ts,0,0,0);S(5,fd,st,0);results[x++]=MTIME();
   results[x++]=S(21,fdpath(fd),4,0);
   S(3,op,0,0);S(3,ol,0,0);S(3,dp,0,0);}
+ if(CASE==78){ /* cachestat(fd, range, stat, flags): the pages of a range a file's page cache holds, as ext4 and tmpfs both have written ones */
+  static char f[]="/tmp/paludarium-files-cachestat";static unsigned long cr[2],cs[5];static char page[4096];
+  #define CS(fd,o,l,fl) (cr[0]=(unsigned long)(o),cr[1]=(unsigned long)(l),cs[0]=99,cs[3]=99,call(451,fd,(long)cr,(long)cs,fl,0,0))
+  /* Root here, as the emulator runs guests, could read anything: nobody's IDs instead. */
+  if(S(102,0,0,0)==0){S(106,65534,0,0);S(105,65534,0,0);}
+  S(87,f,0,0);long fd=S(2,f,0102,0644);results[x++]=fd>=0;
+  for(int i=0;i<4096;i++)page[i]=(char)i;
+  for(int i=0;i<3;i++)S(1,fd,page,4096);
+  results[x++]=call(18,fd,(long)page,1,10*4096,0,0);
+  /* The whole file, a page, two straddled, a hole, a range that wraps to nothing. */
+  results[x++]=CS(fd,0,0,0);results[x++]=cs[0];results[x++]=cs[3];
+  results[x++]=CS(fd,4096,4096,0);results[x++]=cs[0];
+  results[x++]=CS(fd,4095,2,0);results[x++]=cs[0];
+  results[x++]=CS(fd,5*4096,4096,0);results[x++]=cs[0];
+  results[x++]=CS(fd,4096,-1L,0);results[x++]=cs[0];
+  results[x++]=CS(fd,1L<<40,0,0);results[x++]=cs[0];
+  /* Truncated, it holds less. */
+  results[x++]=S(77,fd,4096,0);results[x++]=CS(fd,0,0,0);results[x++]=cs[0];
+  /* Errors: flags, the two structs, descriptors. */
+  results[x++]=CS(fd,0,0,1);
+  results[x++]=call(451,fd,0,(long)cs,0,0,0);results[x++]=call(451,fd,(long)cr,0,0,0,0);
+  results[x++]=CS(999,0,0,0);
+  long path=S(2,f,010000000,0);results[x++]=CS(path,0,0,0);
+  /* What keeps no pages: a pipe, a directory. */
+  int pp[2];S(22,pp,0,0);results[x++]=CS(pp[0],0,0,0);results[x++]=cs[0];S(3,pp[0],0,0);S(3,pp[1],0,0);
+  long tmp=S(2,"/tmp",0200000,0);results[x++]=CS(tmp,0,0,0);results[x++]=cs[0];
+  /* A file the caller may not write, opened to read: EPERM, before the flags. */
+  long root=S(2,"/",0200000,0);results[x++]=CS(root,0,0,0);results[x++]=CS(root,0,0,1);
+  /* Its own file, opened to read: the owner may. */
+  long ro=S(2,f,0,0);results[x++]=CS(ro,0,0,0);results[x++]=cs[0];
+  #undef CS
+  S(3,fd,0,0);S(3,path,0,0);S(3,tmp,0,0);S(3,root,0,0);S(3,ro,0,0);S(87,f,0,0);}
  if(CASE==77){ /* file_getattr, file_setattr (Linux 6.17) and FS_IOC_GETFLAGS/SETFLAGS/FSGETXATTR/FSSETXATTR, unprivileged and as ext4 and tmpfs both give them */
   static char d[]="/tmp/paludarium-files-fileattr",f[]="/tmp/paludarium-files-fileattr/f",inner[]="/tmp/paludarium-files-fileattr/d",child[]="/tmp/paludarium-files-fileattr/d/c";
   static unsigned long fa[5];static unsigned int word[8];

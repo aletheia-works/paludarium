@@ -616,6 +616,10 @@ impl FileHandle for NativeFile {
             .set_times(times)
             .map_err(err)
     }
+    /// A host file takes `RWF_DONTCACHE`, as ext4's does.
+    fn dontcache(&self) -> bool {
+        true
+    }
     fn sync(&self) -> Result<(), Errno> {
         self.file
             .lock()
@@ -1149,6 +1153,19 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
 #[cfg(test)]
 mod files_tests {
     use super::*;
+    #[test]
+    fn a_host_file_takes_dontcache() {
+        let base = std::env::temp_dir().join(format!(
+            "paludarium-dontcache-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("f"), b"x").unwrap();
+        let fs = NativeFs::new(&base).unwrap();
+        assert!(fs.open(b"f", 0, 0).unwrap().dontcache());
+        let _ = std::fs::remove_dir_all(&base);
+    }
     #[test]
     fn mtime_system_time_before_epoch() {
         for ns in [1, 99, 100, 101, 500_000_000, 1_000_000_000] {

@@ -47,7 +47,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`mincore`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
@@ -77,7 +77,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EOPNOTSUPP`、`RWF_APPEND` と `RWF_NOAPPEND` の両方は `EINVAL`、`RWF_ATOMIC` は不可分に
   書けるファイルがないので `EOPNOTSUPP` です。`RWF_NOWAIT` は待たずに読み書きできるファイル
   （通常のファイル、パイプ、ソケット、eventfd、signalfd。ほかは `EOPNOTSUPP`）で使え、待つ
-  ところで `EAGAIN` を返します。`RWF_APPEND` は通常のファイルの末尾に書き、`RWF_DSYNC` と
+  ところで `EAGAIN` を返します。`RWF_DONTCACHE` は、それを持つファイルシステム
+  （`FOP_DONTCACHE`）が必要です。ホストのファイルシステムにある通常のファイルは ext4 と同じく受け付け、
+  何も変えません（何もキャッシュしません）。パイプ、ソケット、メモリ上のファイル（memfd や、
+  tmpfs のようなメモリ上のファイルシステムのもの）、カーネルが作るファイル（`/proc`）は
+  `EOPNOTSUPP` です。`RWF_NOSIGNAL` は、Linux 6.18 からと同じく、読む側のない
+  パイプやソケットへの書き込みで `SIGPIPE` を送りません（`EPIPE` は返します）。
+  `RWF_APPEND` は通常のファイルの末尾に書き、`RWF_DSYNC` と
   `RWF_SYNC` は `fdatasync` と同じく書き出し、`RWF_HIPRI` は何も変えません。
 - `copy_file_range` は、同じマウントにある 2 つの通常のファイルの間でコピーし（マウントを
   またぐと `EXDEV`）、入力の末尾で止まります。確かめる順番は Linux と同じです（`EISDIR`、
@@ -240,7 +246,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   0 にせずに呼ぶもの（fish の `fcntl`）でも、Linux と同じ結果になります。ポインタと
   `long`・`unsigned long`・`size_t`・`loff_t` の引数はそのまま全体を読むので、`prot` の
   32 ビットより上が立っている `mprotect` は `EINVAL` のままです。ただし `readv`・`writev`
-  などの iovec の数は、Linux が `unsigned` として渡すので下位 32 ビットだけを読みます。システムコールの番号も、
+  などの iovec の数（`process_vm_readv`・`process_vm_writev` の手元側、`vmsplice`、
+  ベクタを使う `io_submit` の要求の `aio_nbytes` も）は例外で、下位 32 ビットだけを読みます。
+  CI のランナーのカーネルはこの数を `unsigned` として `import_iovec` に渡すので、
+  `0x100000001` は要素 1 つになります。Linux master は 965e5e451146（2026-11-05）から
+  全体を読み、そうした数を `EINVAL` にします。paludarium は CI のカーネルがそうなってから
+  合わせます。システムコールの番号も、
   Linux の `do_syscall_64` が `int` で受け取るのと同じく `rax` の下位 32 ビットから読み、
   負の番号は `ENOSYS` です。
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET`・`REQUEUE`・`CMP_REQUEUE`・
@@ -622,6 +633,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   無名メモリは読むか書いたあとから、ファイルのページはファイルの範囲内ならメモリに
   あるとします。Linux と同じく、マップされていない最初のページの手前まで書いて
   `ENOMEM` を返します。
+- `cachestat`（Linux 6.5）は、バイト範囲（長さ 0 ならファイルの終わりまで）のうち、
+  ファイルのページキャッシュにあるページを数えます。メモリ上のファイルは、tmpfs と同じく
+  割り当て済みのページを持ち、tmpfs は印を付けないので dirty や書き戻し中のページはなく、
+  スワップアウトしないので追い出されたページもありません。パイプ、ディレクトリ、`/proc`、
+  マウントしたホストのディレクトリのファイルは、ここでは何も持ちません。Linux と同じく、
+  ディスクリプタは `O_PATH` でなく（`EBADF`）、2 つの構造体は読み書きでき（`EFAULT`）、
+  読み込み専用で開いたものは、呼び出し元がファイルの所有者か書き込めることが必要で
+  （`EPERM`）、そのあとで未知のフラグが `EINVAL` です。
 - `mlock`、`mlock2`、`munlock` は、Linux と同じように範囲を確かめます。長さはページ単位に
   切り上げ、アドレスの終わりを越える範囲は `EINVAL`、マップされていないページを含む範囲は
   `ENOMEM` です。`mlock` と、`MLOCK_ONFAULT` なしの `mlock2` は、`PROT_NONE` のページでも
@@ -1101,8 +1120,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     1 つずつ受け取ります。ダンプ（`NLM_F_DUMP`）は、Linux の `netlink_dump` と同じ大きさに
     分けて答えます（1 ページ分、あるいはそれまでで一番長い受信の分で 32 KiB まで。次の部分は
     受信が空きを作ったときに送ります）。最後は別の部分の `NLMSG_DONE` です。`AF_INET6` の
-    アドレスのダンプでは、`inet6_dump_ifaddr` と同じく、空きがあれば最後のアドレスと同じ部分に
-    入れます。
+    アドレスとリンクのダンプでは、`inet6_dump_ifaddr` と `inet6_dump_ifinfo` と同じく、
+    空きがあれば最後のメッセージと同じ部分に入れます。
     エラーと、`NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返し、エラーのものは
     `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`GET` のほかには、ネットワーク
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
@@ -1112,7 +1131,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、
     キューイング規律、0 の統計（`IFLA_EXT_MASK` に `RTEXT_FILTER_SKIP_STATS` があれば
     載せません）、XDP、マップ、MCTP と IPv4 と IPv6 の設定（MCTP を組み込んだカーネルと同じ `IFLA_AF_SPEC`）です。そのため
-    `ip -d link` は Linux と同じ詳細を出します。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
+    `ip -d link` は Linux と同じ詳細を出します。`AF_INET6` のダンプには、`inet6_dump_ifinfo`
+    と同じく、`AF_INET6` の `ifinfomsg` に名前、ハードウェアアドレス、MTU、状態と、
+    `IFLA_PROTINFO` に入れた IPv6 の設定（統計付き）を載せた `lo` を返します。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
   - **アドレス:** `RTM_GETADDR` は `lo` のアドレスを Linux の順でダンプします。IPv4 の
     プライマリは、同じかより広いスコープのプライマリの後に並び、セカンダリ（プライマリの
     サブネットの中のアドレス。`IFA_F_SECONDARY` が付きます）は最後です。IPv6 はグローバルな
@@ -1183,7 +1204,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `rtmsg_fib`、`inet6_rt_notify` と同じく、増えたり消えたりしたアドレス
     （`RTNLGRP_IPV4_IFADDR`、`RTNLGRP_IPV6_IFADDR`）と経路（`RTNLGRP_IPV4_ROUTE`、
     `RTNLGRP_IPV6_ROUTE`。新しいものは Linux と同じ `NLM_F_CREATE`、`NLM_F_EXCL`、
-    `NLM_F_APPEND`、`NLM_F_REPLACE` を持ちます）を伝えます。IPv4 のアドレスのものと経路の
+    `NLM_F_APPEND`、`NLM_F_REPLACE` を持ちます）を伝えます。上げたときは最後に、
+    `inet6_ifinfo_notify` と同じく、`AF_INET6` のリンクのダンプと同じ IPv6 自身の
+    `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を伝えます。IPv4 のアドレスのものと経路の
     リクエストのものはリクエストのシーケンス番号とポートを持ち、IPv6 のアドレスは足したときに
     仮のものと仮でないものの 2 度伝えます。bind していないソケットには何も届きません。
     IPv4 のアドレスか経路の変化を求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を
@@ -1761,10 +1784,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかと同じ開いたファイルです。開き終えると `IN_OPEN`（書き手の `ENXIO` のように失敗した
   ものは何もなし）、ファイル記述の最後のクローズで `IN_CLOSE_WRITE` か `IN_CLOSE_NOWRITE`
   です。読み書きは FIFO 自身のウォッチだけに届き、Linux と同じくディレクトリのウォッチには
-  届きません（`d_is_special`）。`IN_EXCL_UNLINK` のウォッチは、開いた後に
+  届きません（`d_is_special`）。exec が実行するファイルも開いたファイルです。`execve` か
+  `execveat` がプログラム、各スクリプト、ELF インタプリタを開くと `IN_OPEN`、先頭の
+  バイトを読むと `IN_ACCESS`（空のファイルではなし）、使うものがなくなると
+  `IN_CLOSE_NOWRITE` です。スクリプトは呼び出しの終わりに、プログラムは実行するプロセスが
+  なくなったときに、インタプリタはマップするプロセスがなくなったときに、実行できなかった
+  ファイルは exec が諦めたときに閉じ、最後に開いたものから閉じます。`IN_EXCL_UNLINK` のウォッチは、開いた後に
   （`unlink`、`rmdir`、上書きする rename で）消えた名前を通してファイルを開く・閉じる・
   読み書きすることを受けません。別のリンクがファイルを残していても同じです。
-  `truncate`、`mknod`、プログラムの起動は何も開きません。ファイルの変更は、そのディレクトリのウォッチに
+  `truncate` と `mknod` は何も開きません。ファイルの変更は、そのディレクトリのウォッチに
   名前付きで先に届き、次にファイル自身のウォッチに届きます（開いたファイルでは、開いたときの
   名前を、ファイル自身や上のディレクトリの名前の変更に合わせて動かしたもの、または消える前の
   最後の名前です）。ディレクトリのものには

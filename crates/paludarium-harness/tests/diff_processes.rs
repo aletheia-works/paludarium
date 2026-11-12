@@ -245,7 +245,7 @@ mod linux {
                         dir.join("dynamic-plugin.so").to_str().unwrap().to_owned(),
                         beside("dynamic-plugin.so"),
                     )
-            } else if mode == "inotify-interpreter" {
+            } else if mode == "inotify-interpreter" || mode == "inotify-exec" {
                 // The loader it copies, and beside the program (`/inotify`,
                 // as `/proc/self/exe` names it) the one it runs with the copy.
                 config
@@ -369,6 +369,7 @@ mod linux {
         inotify_interpreter => ("inotify-interpreter","inotify"),
         inotify_moved => ("inotify-moved","inotify"),
         inotify_fifo => ("inotify-fifo","inotify"),
+        inotify_exec => ("inotify-exec","inotify"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

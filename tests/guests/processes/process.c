@@ -1599,9 +1599,10 @@ static void routes_get(int fd, unsigned port, const char *when, const char *cons
 /* The link-attributes case: the attributes at `at`, one line each, with
    their type (with its NLA_F_NESTED bit) and length, the nested ones'
    inside. A value is printed in hex, or as a sum of its bytes past 16, but
-   for these of IFLA_AF_SPEC: the IPv4 and IPv6 settings, which a new
-   network namespace copies from the host's, and of IPv6's
-   `ifla_cacheinfo` its creation time and reachable time, which vary. */
+   for these of IFLA_AF_SPEC, and of an AF_INET6 dump's IFLA_PROTINFO: the
+   IPv4 and IPv6 settings, which a new network namespace copies from the
+   host's, and of IPv6's `ifla_cacheinfo` its creation time and reachable
+   time, which vary. */
 static void link_attributes(const unsigned char *at, int len, int depth, int parent, int family) {
     while (len >= 4) {
         unsigned short alen, type;
@@ -1614,6 +1615,9 @@ static void link_attributes(const unsigned char *at, int len, int depth, int par
         if (depth == 0 && (kind == 26 || kind == 43)) {
             printf("\n");
             link_attributes(v, n, 1, kind, 0);
+        } else if (depth == 0 && kind == 12) {
+            printf("\n");
+            link_attributes(v, n, 2, 26, 10);
         } else if (depth == 1 && parent == 26) {
             printf("\n");
             link_attributes(v, n, 2, 26, kind);
@@ -1636,11 +1640,13 @@ static void link_attributes(const unsigned char *at, int len, int depth, int par
         len -= step;
     }
 }
-/* Asks `fd` for lo's link message: a dump with only a family byte, as glibc
-   sends it, or with an `ifinfomsg` and IFLA_EXT_MASK `mask`, as ip does;
-   or `lo` by its index; and prints each message's header and attributes. */
-static void link_show(int fd, unsigned port, const char *label, int get, int full, unsigned mask) {
-    unsigned char request[16 + 8] = {0};
+/* Asks `fd` for lo's link message: a dump with only a family byte,
+   `family`, as glibc sends it, or with an `ifinfomsg` and IFLA_EXT_MASK
+   `mask`, as ip does; or `lo` by its index; and prints each message's header
+   and attributes. */
+static void link_show(int fd, unsigned port, const char *label, int get, int full, unsigned mask,
+                      unsigned char family) {
+    unsigned char request[16 + 8] = {family};
     size_t len = 1;
     if (full) {
         if (get) request[4] = 1;
@@ -5994,9 +6000,9 @@ static long vf_pwritev2(int fd, const void *buf, size_t len, long offset, long f
     struct iovec v = {(void *)buf, len};
     return vf_errno(syscall(328, (long)fd, &v, 1L, offset, 0L, flags));
 }
-/* preadv2 and pwritev2 with their flags, and epoll_pwait2, as Linux 6.12
- * has them. A regular file's RWF_NOWAIT depends on its filesystem, so it is
- * left out. */
+/* preadv2 and pwritev2 with their flags (RWF_DONTCACHE and RWF_NOSIGNAL
+ * as Linux master has them), and epoll_pwait2, as Linux 6.12 has it. A
+ * regular file's RWF_NOWAIT depends on its filesystem, so it is left out. */
 static int vector_flags_case(void) {
     char path[] = "/tmp/vector-flags-XXXXXX";
     int fd = mkstemp(path);
@@ -6038,6 +6044,35 @@ static int vector_flags_case(void) {
     int counter = eventfd(0, 0);
     printf("socket empty=%ld eventfd empty=%ld\n", vf_preadv2(sv[0], got, 8, -1, 0x8),
            vf_preadv2(counter, got, 8, -1, 0x8));
+    /* RWF_DONTCACHE needs a file system with it, which a pipe, a socket and
+     * shmem (a memfd) are not; a regular file's depends on the filesystem,
+     * so it is left out. RWF_NOSIGNAL spares a write with no reader its
+     * SIGPIPE, and a read takes it. */
+    int shm = memfd_create("vf", 0);
+    long dc_pipe = vf_pwritev2(p[1], "x", 1, -1, 0x80);
+    long dc_socket = vf_preadv2(sv[0], got, 1, -1, 0x80);
+    long dc_memfd = vf_pwritev2(shm, "x", 1, 0, 0x80);
+    long ns_memfd = vf_pwritev2(shm, "x", 1, 0, 0x100);
+    printf("dontcache pipe=%ld socket=%ld memfd=%ld nosignal memfd=%ld\n", dc_pipe, dc_socket,
+           dc_memfd, ns_memfd);
+    sigset_t pipe_mask, old_mask, pending;
+    sigemptyset(&pipe_mask);
+    sigaddset(&pipe_mask, SIGPIPE);
+    sigprocmask(SIG_BLOCK, &pipe_mask, &old_mask);
+    close(p[0]);
+    close(sv[1]);
+    long ns_pipe = vf_pwritev2(p[1], "x", 1, -1, 0x100);
+    long ns_socket = vf_pwritev2(sv[0], "x", 1, -1, 0x100);
+    sigpending(&pending);
+    int spared = !sigismember(&pending, SIGPIPE);
+    long plain = vf_pwritev2(p[1], "x", 1, -1, 0);
+    sigpending(&pending);
+    printf("nosignal pipe=%ld socket=%ld spared=%d plain=%ld raised=%d\n", ns_pipe, ns_socket,
+           spared, plain, sigismember(&pending, SIGPIPE));
+    signal(SIGPIPE, SIG_IGN);
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
+    signal(SIGPIPE, SIG_DFL);
+    close(shm);
     /* epoll_pwait2: its timeout first, then the mask, maxevents, the
      * descriptor; none waits for ever. */
     int ep = epoll_create1(0);
@@ -8669,8 +8704,9 @@ int main(int argc, char **argv) {
             int option = 0;
             socklen_t option_len = sizeof option;
             printf("get add=%ld\n", netns_result(getsockopt(mon, 270, 1, &option, &option_len)));
-            /* Bound with link, IPv4 and IPv6 addresses and routes. */
-            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x551};
+            /* Bound with link, IPv4 and IPv6 addresses and routes, and IPv6's
+               link information. */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0xd51};
             printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
             words_len = sizeof words;
             getsockopt(mon, 270, 9, words, &words_len);
@@ -9229,12 +9265,15 @@ int main(int argc, char **argv) {
             for (int up = 0; up < 2; up++) {
                 char label[64];
                 snprintf(label, sizeof label, "%s family", states[up]);
-                link_show(fd, port, label, 0, 0, 0);
+                link_show(fd, port, label, 0, 0, 0, 0);
                 snprintf(label, sizeof label, "%s vf", states[up]);
-                link_show(fd, port, label, 0, 1, 1);
+                link_show(fd, port, label, 0, 1, 1, 0);
                 /* RTEXT_FILTER_SKIP_STATS leaves the statistics out. */
                 snprintf(label, sizeof label, "%s get skip stats", states[up]);
-                link_show(fd, port, label, 1, 1, 8);
+                link_show(fd, port, label, 1, 1, 8, 0);
+                /* AF_INET6's own dump: lo as IPv6 shows it. */
+                snprintf(label, sizeof label, "%s inet6", states[up]);
+                link_show(fd, port, label, 0, 0, 0, AF_INET6);
                 if (!up) {
                     int udp = socket(AF_INET, SOCK_DGRAM, 0);
                     netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
@@ -9604,8 +9643,8 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "route-dump")) {
         /* A child makes a network namespace with lo up, 150 more addresses
-           and 300 blackhole routes, and prints the datagrams each address
-           and route dump comes in: a page's worth first, then as much as
+           and 300 blackhole routes, and prints the datagrams each link,
+           address and route dump comes in: a page's worth first, then as much as
            the longest receive asked for, and NLMSG_DONE after them. */
         fflush(stdout);
         pid_t maker = child();
@@ -9631,7 +9670,8 @@ int main(int argc, char **argv) {
                 unsigned short type;
                 unsigned char family;
                 const char *label;
-            } dumps[] = {{22, 0, "addr"},  {22, AF_INET, "addr4"},  {22, AF_INET6, "addr6"}, {26, 0, "route"},
+            } dumps[] = {{18, 0, "link"},          {18, AF_INET6, "link6"}, {22, 0, "addr"},
+                         {22, AF_INET, "addr4"},   {22, AF_INET6, "addr6"}, {26, 0, "route"},
                          {26, AF_INET, "route4"}, {26, AF_INET6, "route6"}, {26, 128, "ipmr"}};
             static const size_t rooms[] = {65536, 8192, 1024};
             for (size_t i = 0; i < sizeof dumps / sizeof dumps[0]; i++)

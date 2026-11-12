@@ -802,7 +802,11 @@ fn transfer(
         return Err(Errno::EINVAL);
     }
     let segments = if vectored {
-        crate::files::iovecs_checked(c.mem, iocb.buf, iocb.nbytes, |_, _| Ok(()))?
+        // `aio_setup_rw` hands `aio_nbytes` to `import_iovec`, whose count is
+        // an `unsigned` before Linux 965e5e451146 (2026-11-05, not yet in the
+        // kernel CI runs): only the low 32 bits count.
+        let count = u64::from(iocb.nbytes as u32);
+        crate::files::iovecs_checked(c.mem, iocb.buf, count, |_, _| Ok(()))?
     } else {
         // `import_ubuf`: the length cut to `MAX_RW_COUNT`, in the user half.
         let len = iocb.nbytes.min(crate::files::MAX_RW_COUNT as u64);

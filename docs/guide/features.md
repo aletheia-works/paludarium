@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `mincore`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
@@ -89,9 +89,16 @@ kernel.
   `RWF_ATOMIC` `EOPNOTSUPP`, as no file here writes atomically.
   `RWF_NOWAIT` needs a file that can be read or written without waiting (a
   regular file, a pipe, a socket, an eventfd or a signalfd; `EOPNOTSUPP` for
-  the rest) and then gives `EAGAIN` where the call would wait. `RWF_APPEND`
-  writes a regular file at its end, `RWF_DSYNC` and `RWF_SYNC` write it
-  through as `fdatasync`, and `RWF_HIPRI` changes nothing.
+  the rest) and then gives `EAGAIN` where the call would wait.
+  `RWF_DONTCACHE` needs a file system that has it (`FOP_DONTCACHE`): a
+  regular file on the host's own file system, as on ext4, takes it and it
+  changes nothing (nothing is cached), while a pipe, a socket, an in-memory
+  file (a memfd, or one of an in-memory file system, as tmpfs) or a file the
+  kernel makes (`/proc`) gives `EOPNOTSUPP`. `RWF_NOSIGNAL` spares a write to
+  a pipe or socket with no reader its `SIGPIPE` (it still gives `EPIPE`), as
+  since Linux 6.18. `RWF_APPEND` writes a regular file at its end,
+  `RWF_DSYNC` and `RWF_SYNC` write it through as `fdatasync`, and
+  `RWF_HIPRI` changes nothing.
 - `copy_file_range` copies between two regular files on one mount (`EXDEV`
   across mounts), stopping at the input's end, with Linux's checks in order
   (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in
@@ -268,8 +275,13 @@ kernel.
   (fish's `fcntl` does) gets what it would on Linux. Pointers and `long`,
   `unsigned long`, `size_t` and `loff_t` arguments are read whole, so
   `mprotect` with a bit set past 32 in `prot` is still `EINVAL`; the iovec
-  count of `readv`, `writev` and their kin is the exception, since Linux passes
-  it on as an `unsigned`. The number
+  count of `readv`, `writev` and their kin (`process_vm_readv`'s and
+  `process_vm_writev`'s local one, `vmsplice`'s, and `aio_nbytes` of a
+  vectored `io_submit` request) is the exception: the CI runner's kernel
+  passes it to `import_iovec` as an `unsigned`, so a count of `0x100000001`
+  is one entry. Linux master reads it whole since 965e5e451146 (2026-11-05)
+  and gives such a count `EINVAL`; paludarium follows once the CI kernel
+  does. The number
   itself is read from the low 32 bits of `rax` too, as Linux's
   `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`,
@@ -691,6 +703,15 @@ kernel.
   written, shared anonymous memory once it was, and a file's page when it lies
   within the file. It writes the bytes up to the first page that is not mapped,
   which is `ENOMEM`, as Linux does.
+- `cachestat` (Linux 6.5) counts the pages of a byte range (to the end of the
+  file for a length of 0) that the file's page cache holds. A file in memory
+  holds its allocated pages, as tmpfs does, none of them dirty or under
+  writeback, as tmpfs tags none, and none evicted, as nothing is swapped out.
+  A pipe, a directory, `/proc` and a file in a mounted host directory hold
+  none here. As Linux checks, the descriptor must not be `O_PATH` (`EBADF`),
+  both structs must be readable and writable (`EFAULT`), and a description
+  open to read only needs a caller that owns or may write the file
+  (`EPERM`) before an unknown flag is `EINVAL`.
 - `mlock`, `mlock2` and `munlock` check their range as Linux does: the length
   rounds up to pages, a range past the end of addresses is `EINVAL`, and one
   with a page that is not mapped is `ENOMEM`. `mlock` and `mlock2` without
@@ -1265,8 +1286,9 @@ kernel.
     Linux's `netlink_dump` makes them (a page's worth, or as much as the
     longest receive so far asked for up to 32 KiB, the next as a receive
     makes room), and ends with `NLMSG_DONE` in a part of its own; an
-    `AF_INET6` address dump's goes after its last address when that part
-    has room, as `inet6_dump_ifaddr` puts it. An error, or a success with `NLM_F_ACK`, is answered with
+    `AF_INET6` address or link dump's goes after its last message when
+    that part has room, as `inet6_dump_ifaddr` and `inet6_dump_ifinfo` put
+    it. An error, or a success with `NLM_F_ACK`, is answered with
     `NLMSG_ERROR`, which carries the whole request with an error unless
     `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending
@@ -1278,7 +1300,10 @@ kernel.
     with `RTEXT_FILTER_SKIP_STATS` in `IFLA_EXT_MASK`), XDP, map, and its
     MCTP, IPv4 and IPv6 settings (`IFLA_AF_SPEC`, as a kernel built with
     MCTP gives it), so `ip -d link` gives
-    Linux's details.
+    Linux's details. An `AF_INET6` dump answers as `inet6_dump_ifinfo`
+    does: `lo` with an `AF_INET6` `ifinfomsg`, its name, hardware address,
+    MTU and state, and its IPv6 settings with their statistics in
+    `IFLA_PROTINFO`.
     `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`.
   - **Addresses:** `RTM_GETADDR` dumps `lo`'s addresses in Linux's orders:
     IPv4's primaries after those of a scope as wide or wider, secondaries
@@ -1362,7 +1387,9 @@ kernel.
     `NLM_F_CREATE`, `NLM_F_EXCL`, `NLM_F_APPEND` or `NLM_F_REPLACE` Linux
     gives it), as `inetdev_event`, `fib_add_ifaddr`, `fib_del_ifaddr`,
     `addrconf`, `rt6_disable_ip`, `rtmsg_fib` and `inet6_rt_notify` tell
-    them. An IPv4 address's and a route request's carry the request's
+    them; and, last when it comes up, IPv6's own `RTM_NEWLINK` for it, as an
+    `AF_INET6` link dump gives it (`RTNLGRP_IPV6_IFINFO`, as
+    `inet6_ifinfo_notify`). An IPv4 address's and a route request's carry the request's
     sequence number and port; an IPv6 address is told of twice when added,
     tentative and then not. An unbound socket hears nothing; the requester
     of an IPv4 address's or a route's change has the notification before
@@ -2017,11 +2044,16 @@ kernel.
   (one that fails, such as a writer's `ENXIO`, is none), `IN_CLOSE_WRITE`
   or `IN_CLOSE_NOWRITE` at its description's last close, and its reads and
   writes for its own watches only, which Linux keeps from its directory's
-  (`d_is_special`). A watch with `IN_EXCL_UNLINK` does not
+  (`d_is_special`). The files exec runs are open files too: `IN_OPEN` as
+  `execve` or `execveat` opens the program, each script and the ELF
+  interpreter, `IN_ACCESS` as it reads their first bytes (none of an empty
+  file), and `IN_CLOSE_NOWRITE` once nothing uses them: a script at the end
+  of the call, the program when no process runs it, the interpreter when no
+  process maps it, and a file exec cannot run when it gives up, the last
+  opened first. A watch with `IN_EXCL_UNLINK` does not
   hear of the open, close, read or write of a file through a name unlinked
   since it was opened (by `unlink`, `rmdir` or a rename onto it), even while
-  another link keeps the file; `truncate`, `mknod` and starting a program
-  open nothing. A file's change reaches the watch of
+  another link keeps the file; `truncate` and `mknod` open nothing. A file's change reaches the watch of
   its directory, with its name, before its own (for an open file, the name
   it was opened at as renames of it and of the directories above it moved
   it, or the unlinked name it last had), and `IN_ISDIR` marks a

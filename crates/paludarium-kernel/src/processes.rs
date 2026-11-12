@@ -1,6 +1,7 @@
 //! Emulated process registry; no lock spans Host waits or guest execution.
 use crate::credentials::TaskIds;
 use crate::fasync::{FileOwner, OwnerKind, Reason};
+use crate::inotify::reported_open;
 use crate::namespaces::Namespace;
 use crate::scheduling;
 use crate::{Kernel, Next, SignalInbox, Thread, ThreadGroup, ThreadState, signals};
@@ -3456,10 +3457,15 @@ impl Kernel {
         // open on, as `do_open_execat` takes it, until exec ends; the program
         // it loads takes its own.
         let mut opened = None;
+        // Exec's opens of the files it runs, for inotify, in their order.
+        let mut opens = ExecOpens::default();
         let (start, program, mut readable, image) = match program {
             crate::files::Program::Path(path) => {
                 let (program, readable) =
                     crate::permissions::exec(&self.files, creds, dir, &raw, &path)?;
+                opens
+                    .0
+                    .push(exec_opened(&self.files, &path, reported_open()));
                 opened = deny_writes(&self.files, &path)?;
                 ((named.clone(), path.clone(), path), program, readable, None)
             }
@@ -3557,21 +3563,25 @@ impl Kernel {
                             &loaded,
                         )?;
                         readable = may_read;
+                        opens
+                            .0
+                            .push(exec_opened(&self.files, &loaded, reported_open()));
                         let (loaded, program) = follow_scripts(
                             &self.files,
                             creds,
                             (interpreter, loaded),
                             program,
                             &mut readable,
-                            &mut argv,
-                            &mut budget,
+                            (&mut argv, &mut budget),
+                            &mut opens,
                         )?;
                         path = loaded.clone();
                         // The script's own denial ends once its interpreter
                         // takes over (`exec_binprm`).
                         drop(denied);
-                        let exe = deny_writes(&self.files, &loaded)?;
-                        return self.exec_image(
+                        let exe = deny_writes(&self.files, &loaded)?
+                            .map(|exe| exe.closing(opens.0.pop().flatten()));
+                        let done = self.exec_image(
                             thread,
                             mem,
                             (named, path, loaded),
@@ -3581,6 +3591,8 @@ impl Kernel {
                             None,
                             exe,
                         );
+                        drop(opens);
+                        return done;
                     }
                 }
             }
@@ -3595,10 +3607,13 @@ impl Kernel {
                     (named_first, first),
                     program,
                     &mut readable,
-                    &mut argv,
-                    &mut budget,
+                    (&mut argv, &mut budget),
+                    &mut opens,
                 )?;
-                let exe = deny_writes(&self.files, &loaded)?;
+                // The program's own open closes with the process's last use
+                // of it (`exe_file`).
+                let exe = deny_writes(&self.files, &loaded)?
+                    .map(|exe| exe.closing(opens.0.pop().flatten()));
                 (loaded, program, None, exe)
             }
         };
@@ -3613,6 +3628,9 @@ impl Kernel {
             exe,
         );
         drop(opened);
+        // The scripts' opens close at the end of exec, as the `fput`s
+        // `exec_binprm` defers.
+        drop(opens);
         done
     }
     /// The rest of exec, once the program is known: `raw` is its name,
@@ -3670,6 +3688,9 @@ impl Kernel {
         if personality & crate::syscalls::ADDR_COMPAT_LAYOUT != 0 {
             memory.set_bottom_up(Some(GuestAddr(TASK_UNMAPPED_BASE)));
         }
+        // The loader reads the files whole, which is no open of the guest's:
+        // exec's own are told of as Linux makes them.
+        let report = reported_open();
         // As Linux's `open_exec` of an interpreter: it needs execute
         // permission (EACCES), and an unreadable one makes the program
         // undumpable (`would_dump`). Its set-ID bits do not count.
@@ -3686,14 +3707,21 @@ impl Kernel {
                 name,
                 &path,
             )?;
+            let closing = exec_opened(&self.files, &path, report);
             // Denied only while it loads, as `load_elf_binary` gives it back.
             drop(deny_writes(&self.files, &path)?);
+            if let Some(closing) = &closing {
+                closing.read();
+            }
             readable &= may_read;
-            let keep = self.files.interpreter_keep(&path);
-            Ok((path, keep))
+            // Its mappings keep the open, which closes with the last of them
+            // (`vm_file`), before they let go of the file.
+            let keep: paludarium_loader::Keep =
+                Arc::new((closing, self.files.interpreter_keep(&path)));
+            Ok((path, Some(keep)))
         };
         let fs = &*self.files.fs;
-        let image = match &held {
+        let image = crate::inotify::unopened(|| match &held {
             Some((bytes, name)) => paludarium_loader::load_file_with(
                 fs,
                 bytes,
@@ -3705,7 +3733,7 @@ impl Kernel {
             None => {
                 paludarium_loader::load_with(fs, &loaded, &start, &mut memory, &mut interpreter)
             }
-        }
+        })
         .map_err(|error| match error {
             // The new image did not fit under the memory limit.
             _ if memory.take_out_of_memory() => Errno::ENOMEM,
@@ -3952,10 +3980,15 @@ pub(crate) fn follow_scripts(
     (mut named, mut loaded): (Vec<u8>, Vec<u8>),
     mut program: Option<paludarium_host::FileStat>,
     readable: &mut bool,
-    argv: &mut Vec<Vec<u8>>,
-    budget: &mut usize,
+    (argv, budget): (&mut Vec<Vec<u8>>, &mut usize),
+    opens: &mut ExecOpens,
 ) -> Result<(Vec<u8>, Option<paludarium_host::FileStat>), Errno> {
     for depth in 0.. {
+        if program.is_some()
+            && let Some(Some(opened)) = opens.0.last()
+        {
+            opened.read();
+        }
         let Some(head) = program.as_ref().and_then(|_| read_head(files, &loaded)) else {
             break;
         };
@@ -3971,6 +4004,7 @@ pub(crate) fn follow_scripts(
         let may_read;
         (program, may_read) =
             crate::permissions::exec(files, credentials, -100i64 as u64, &interpreter, &loaded)?;
+        opens.0.push(exec_opened(files, &loaded, reported_open()));
         drop(deny_writes(files, &loaded)?);
         *readable = may_read;
         named = interpreter;
@@ -3980,6 +4014,39 @@ pub(crate) fn follow_scripts(
         }
     }
     Ok((loaded, program))
+}
+/// Exec's opens of the files it runs, a script's first, for inotify: each
+/// was `IN_OPEN` (`do_open_execat`), and closes when this drops, the last
+/// first, as the `fput`s Linux defers to the end of the call run.
+#[derive(Default)]
+pub(crate) struct ExecOpens(Vec<Option<crate::inotify::Closing>>);
+impl Drop for ExecOpens {
+    fn drop(&mut self) {
+        while self.0.pop().is_some() {}
+    }
+}
+/// Tells inotify of exec's open of the file at `path` (`IN_OPEN`), and gives
+/// what tells it of the file's read and its close: none for a file that
+/// cannot be looked at, or when the open is not the guest's (`report`).
+fn exec_opened(
+    files: &crate::files::Files,
+    path: &[u8],
+    report: bool,
+) -> Option<crate::inotify::Closing> {
+    if !report {
+        return None;
+    }
+    let path = crate::files::resolved(files, path)?;
+    let node = files.fs.metadata(&path, false).ok()?;
+    let device = crate::page_cache::mount_device(&files.fs.mounts(), &path);
+    Some(crate::inotify::Closing::open(
+        &files.caches.notify,
+        &files.fs,
+        &path,
+        device,
+        &node,
+        0,
+    ))
 }
 /// Write access to the regular file `path` names denied (ETXTBSY while a
 /// description has it open for writing), as Linux's `do_open_execat` denies

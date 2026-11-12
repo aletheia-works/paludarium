@@ -74,6 +74,8 @@ cases!(proc_fd_xattrs=>65);
 cases!(xattrat=>76);
 // Only in memory: a mounted host directory keeps no inode flags here.
 cases!(fileattr=>77);
+// Only in memory: the emulator keeps no page cache of a mounted host file.
+cases!(cachestat=>78);
 cases!(path_descriptor_io=>66,host_path_descriptor_io=>66);
 cases!(wide_arguments=>60,host_wide_arguments=>60);
 // Only on the emulator's own host: the mounted run's recorded clock moves only

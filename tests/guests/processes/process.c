@@ -19951,11 +19951,14 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "time-calls")) {
-        /* The raw calls, which a C library would answer from its vDSO. */
+        /* The raw calls, which a C library would answer from its vDSO.
+           Linux's time() gives the seconds the timer tick last set, which a
+           precise clock may already have passed: the coarse clock is set with
+           them, so it never runs ahead. */
         struct timespec before;
         struct { long seconds, micros; } tv = {-1, -1};
         struct { int minutes, dst; } tz = {-1, -1};
-        clock_gettime(CLOCK_REALTIME, &before);
+        clock_gettime(CLOCK_REALTIME_COARSE, &before);
         long r = syscall(SYS_gettimeofday, &tv, &tz);
         printf("gettimeofday: %ld close=%d micros-ok=%d tz=%d,%d\n", r, tv.seconds - before.tv_sec <= 1 && tv.seconds >= before.tv_sec,
                tv.micros >= 0 && tv.micros < 1000000, tz.minutes, tz.dst);

@@ -434,11 +434,11 @@ verified.
   `lo` while it is down is `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
   of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
-  lookup while `lo` is down is `ENETUNREACH` too. A route dump does not filter by
-  the table or attributes a strict request names, and a lookup looks at
-  no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
-  the rest are not); its `rta_cacheinfo` counts one reference, where
-  Linux counts the other users of the cached route too. Notifications go
+  lookup while `lo` is down is `ENETUNREACH` too. A route dump does not
+  filter by the table or attributes a strict request names, and a lookup
+  looks at no selector but its destination (`RTA_SRC`, `RTA_OIF`,
+  `RTA_MARK` and the rest are not); its `rta_cacheinfo` counts one
+  reference, where Linux counts the other users of the cached route too. Notifications go
   out for the link, its IPv6 information, addresses and routes alone, not
   for neighbours, netconf or the other groups, nor to a socket in
   another namespace (`NETLINK_LISTEN_ALL_NSID` is not supported); IPv4's
@@ -455,18 +455,19 @@ verified.
   statistics are zero; its IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30
-  seconds, where Linux's is random. An address's creation times are 0,
+  seconds, where Linux's is random. An address's creation times are 0.
   `NETLINK_EXT_ACK` adds no attributes to an error or to a dump's
   `NLMSG_DONE`. Strict checking does not check the attribute policies
   first, so of a request with a malformed attribute and another it
   refuses, it may give `EINVAL` where Linux gives `ERANGE`, and a link
   dump's `IFLA_LINKINFO` is taken without effect, where Linux shows only
-  the devices of a kind its modules know. A message type past the last that `rtnetlink`
-  knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`, where Linux 7.0
-  refuses the send itself with `EOPNOTSUPP`. A socket whose receive buffer
-  is full drops an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
-  acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that
-  paludarium has, but for the System V shared memory, semaphores and
+  the devices of a kind its modules know. A message type past the last
+  that `rtnetlink` knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`,
+  where Linux 7.0 refuses the send itself with `EOPNOTSUPP`. A socket
+  whose receive buffer is full drops an answer with `ENOBUFS` without
+  waiting. A `write` to a netlink socket acts with the capability of the
+  thread that opened it alone. The other namespaces keep nothing apart
+  that paludarium has, but for the System V shared memory, semaphores and
   message queues and the POSIX message queues of an IPC namespace: there is
   no `mount` for a mount namespace (whose mounts keep their IDs
   in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new

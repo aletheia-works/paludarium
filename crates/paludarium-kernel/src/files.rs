@@ -1708,8 +1708,6 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     Ok(0)
 }
-/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`, with the
-/// checks of Linux's generic_copy_file_checks and rw_verify_area in order.
 /// `cachestat(fd, range, stat, flags)`, as Linux's: a descriptor `fdget`
 /// takes (EBADF, also for `O_PATH`), a `struct cachestat_range` (`off`,
 /// `len`; EFAULT), a file the caller may write or could open to (EPERM,
@@ -1745,6 +1743,8 @@ fn cachestat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     output(c, a[2], &out)?;
     Ok(0)
 }
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`, with the
+/// checks of Linux's generic_copy_file_checks and rw_verify_area in order.
 fn copy_file_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if a[5] != 0 {
         return Err(Errno::EINVAL);

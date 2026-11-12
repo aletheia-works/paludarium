@@ -955,7 +955,10 @@ impl ThreadGroup {
     pub(crate) fn apply_discards(&self, local: &mut ThreadState) {
         self.discards.apply(local);
     }
-    pub(crate) fn drain_process(&self, local: &mut ThreadState) {
+    /// Takes in the process's signals; whether a signal has been sent to the
+    /// process inbox since this thread last did, which is what woke a
+    /// thread its own inbox has nothing for.
+    pub(crate) fn drain_process(&self, local: &mut ThreadState) -> bool {
         // The actions are the process's, as Linux's sighand_struct is: a
         // thread that has waited since another one set a handler would
         // otherwise take a signal in as ignored and wait on past it.
@@ -972,10 +975,16 @@ impl ThreadGroup {
             .process_pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        self.process_inbox
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain_process(&mut pending);
+        let notices = {
+            let inbox = self
+                .process_inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            inbox.drain_process(&mut pending);
+            inbox.notices()
+        };
+        let sent = notices != local.process_notices;
+        local.process_notices = notices;
         if pending.pending.iter().any(|s| s.number == 18) {
             self.stopped.store(false, Ordering::SeqCst);
         }
@@ -986,6 +995,7 @@ impl ThreadGroup {
             signals::queue(local, s);
         }
         local.stopped = self.stopped.load(Ordering::SeqCst);
+        sent
     }
     /// Takes the lowest process-directed signal in `set`, even a blocked one
     /// that [`Self::drain_process`] leaves for another thread

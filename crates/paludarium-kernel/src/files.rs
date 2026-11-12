@@ -2326,13 +2326,14 @@ pub(crate) fn pause_for_lock(c: &mut Context<'_>) -> Result<(), Errno> {
         c.cancellation,
     )?;
     let receipt = c.inbox.drain(c.process);
-    c.group.drain_process(c.process);
+    let sent = c.group.drain_process(c.process);
     if c.group.status().is_some()
         || crate::signals::next_pending(c.process, true).is_some()
         || receipt.interrupted
         || (outcome == paludarium_host::WaitOutcome::Interrupted
             && !receipt.timer_changed
             && !receipt.signals
+            && !sent
             && c.group.timer_generation() == timer_generation)
     {
         return Err(Errno(4));

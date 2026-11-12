@@ -6242,6 +6242,62 @@ static int futex_wake_op_case(void) {
     munmap(page, 4096);
     return 0;
 }
+/* A signal whose action is to ignore it, by default (SIGCHLD, SIGURG,
+ * SIGWINCH) or by SIG_IGN, is dropped as it is sent (Linux's sig_ignored),
+ * so it ends no wait: a thread blocked in read on a pipe stays there. */
+static int ig_pipe[2];
+static long ig_result[2];
+static void *ig_reader(void *arg) {
+    long *out = arg;
+    char c;
+    long r = read(ig_pipe[0], &c, 1);
+    *out = r < 0 ? -errno : r;
+    return NULL;
+}
+static long ig_round(const char *name, void (*send)(void)) {
+    long result = 0;
+    pthread_t t;
+    if (pipe(ig_pipe)) return 80;
+    pthread_create(&t, NULL, ig_reader, &result);
+    /* Let it block, send the signal, let it settle, then wake it. */
+    for (int i = 0; i < 20; i++) usleep(5000);
+    send();
+    for (int i = 0; i < 20; i++) usleep(5000);
+    write(ig_pipe[1], "x", 1);
+    pthread_join(t, NULL);
+    printf("ignored %s read=%ld\n", name, result);
+    close(ig_pipe[0]);
+    close(ig_pipe[1]);
+    return 0;
+}
+static void ig_child_exit(void) {
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    waitpid(child, NULL, 0);
+}
+static void ig_urg(void) { kill(getpid(), SIGURG); }
+static void ig_winch(void) { kill(getpid(), SIGWINCH); }
+static void ig_usr1(void) { kill(getpid(), SIGUSR1); }
+static void ig_thread_urg(void) { syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGURG); }
+static int ignored_signal_wait_case(void) {
+    (void)ig_result;
+    ig_round("sigchld", ig_child_exit);
+    ig_round("sigurg", ig_urg);
+    ig_round("sigwinch", ig_winch);
+    signal(SIGUSR1, SIG_IGN);
+    ig_round("sig_ign", ig_usr1);
+    ig_round("own-thread", ig_thread_urg);
+    /* A blocked ignored signal stays pending, and still ends nothing. */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGURG);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    ig_round("blocked", ig_urg);
+    sigset_t pending;
+    sigpending(&pending);
+    printf("ignored blocked pending=%d\n", sigismember(&pending, SIGURG));
+    return 0;
+}
 static long mm_errno(long r) { return r < 0 ? -errno : r; }
 /* sendmmsg and recvmmsg on an AF_UNIX datagram pair, as Linux 6.12's. */
 static int mmsg_case(void) {
@@ -17552,6 +17608,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "futex2")) return futex2_case();
     if (!strcmp(mode, "futex-requeue")) return futex_requeue_case();
     if (!strcmp(mode, "futex-wake-op")) return futex_wake_op_case();
+    if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();

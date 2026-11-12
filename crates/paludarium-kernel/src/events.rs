@@ -64,7 +64,9 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
         result => result?,
     };
     let receipt = c.inbox.drain(c.process);
-    c.group.drain_process(c.process);
+    // A signal sent to the process wakes every thread; one that ends no
+    // wait (an ignored one, or one another thread takes) is no interruption.
+    let sent = c.group.drain_process(c.process);
     c.group.expire_timer(
         c.process,
         c.host.clock(paludarium_host::ClockId::Monotonic)?,
@@ -75,6 +77,7 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
         || (outcome == paludarium_host::WaitOutcome::Interrupted
             && !receipt.timer_changed
             && !receipt.signals
+            && !sent
             && c.group.timer_generation() == generation)
     {
         Err(Errno(4))

@@ -13,6 +13,9 @@ pub struct SignalInbox {
     control_wake: AtomicBool,
     timer_wake: AtomicBool,
     listeners: Mutex<Vec<Weak<AtomicBool>>>,
+    /// How many times the listeners have been woken, so that a thread they
+    /// woke can tell a signal sent here from another wake.
+    notices: AtomicU64,
     /// The discards of the thread group this inbox belongs to.
     discards: Mutex<Option<Arc<signals::Discards>>>,
     /// The thread group's count of the signals its threads made pending
@@ -129,7 +132,12 @@ impl SignalInbox {
             listeners.push(listener);
         }
     }
+    /// How many times [`Self::notify_listeners`] has woken the listeners.
+    pub(crate) fn notices(&self) -> u64 {
+        self.notices.load(Ordering::SeqCst)
+    }
     fn notify_listeners(&self) {
+        self.notices.fetch_add(1, Ordering::SeqCst);
         let mut listeners = self
             .listeners
             .lock()

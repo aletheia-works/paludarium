@@ -190,6 +190,9 @@ pub struct ThreadState {
     /// have queued ([`signals::wakes`]), each of which its `signalfd_notify`
     /// wakes a signal file for.
     pub(crate) arrivals: u64,
+    /// The process inbox's [`SignalInbox::notices`] when this thread last
+    /// took in the process's signals.
+    pub(crate) process_notices: u64,
     pub(crate) frames: Vec<signals::SavedFrame>,
     pub(crate) timer: signals::RealTimer,
     /// The earliest POSIX timer deadline, synced from the thread group.

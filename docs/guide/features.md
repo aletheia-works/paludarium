@@ -2220,7 +2220,9 @@ one only with an `--allow-net`.
   `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH`, which are ignored by
   default) discards its pending instances in the process and in every thread,
   as Linux's `do_sigaction` does. A blocked signal sent after that stays
-  pending.
+  pending. An unblocked ignored signal, such as the `SIGCHLD` of a child that
+  ends, ends no wait in any thread: a blocked `read` stays blocked, as Linux
+  drops the signal as it is sent (`sig_ignored`).
 
 ## Filesystem
 

@@ -1052,8 +1052,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     1 つずつ受け取ります。ダンプ（`NLM_F_DUMP`）は、Linux の `netlink_dump` と同じ大きさに
     分けて答えます（1 ページ分、あるいはそれまでで一番長い受信の分で 32 KiB まで。次の部分は
     受信が空きを作ったときに送ります）。最後は別の部分の `NLMSG_DONE` です。`AF_INET6` の
-    アドレスのダンプでは、`inet6_dump_ifaddr` と同じく、空きがあれば最後のアドレスと同じ部分に
-    入れます。
+    アドレスとリンクのダンプでは、`inet6_dump_ifaddr` と `inet6_dump_ifinfo` と同じく、
+    空きがあれば最後のメッセージと同じ部分に入れます。
     エラーと、`NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返し、エラーのものは
     `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`GET` のほかには、ネットワーク
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
@@ -1063,7 +1063,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、
     キューイング規律、0 の統計（`IFLA_EXT_MASK` に `RTEXT_FILTER_SKIP_STATS` があれば
     載せません）、XDP、マップ、MCTP と IPv4 と IPv6 の設定（MCTP を組み込んだカーネルと同じ `IFLA_AF_SPEC`）です。そのため
-    `ip -d link` は Linux と同じ詳細を出します。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
+    `ip -d link` は Linux と同じ詳細を出します。`AF_INET6` のダンプには、`inet6_dump_ifinfo`
+    と同じく、`AF_INET6` の `ifinfomsg` に名前、ハードウェアアドレス、MTU、状態と、
+    `IFLA_PROTINFO` に入れた IPv6 の設定（統計付き）を載せた `lo` を返します。`RTM_NEWLINK` と `RTM_SETLINK` は `IFF_UP` で上げ下げします。
   - **アドレス:** `RTM_GETADDR` は `lo` のアドレスを Linux の順でダンプします。IPv4 の
     プライマリは、同じかより広いスコープのプライマリの後に並び、セカンダリ（プライマリの
     サブネットの中のアドレス。`IFA_F_SECONDARY` が付きます）は最後です。IPv6 はグローバルな

@@ -4119,13 +4119,24 @@ fn netlink_dumps_and_sets_a_new_namespaces_loopback() {
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
     assert_eq!(netlink_replies(&mut f, fd).len(), 2);
     // That dump's NLMSG_DONE comes after `::1`, in its datagram, as
-    // `inet6_dump_ifaddr` is not split; AF_INET's comes in one of its own.
+    // `inet6_dump_ifaddr` is not split, and so does AF_INET6's link dump's
+    // (`inet6_dump_ifinfo`); AF_INET's and the whole link dump's come in one
+    // of their own.
     let receive = |f: &mut Fixture| f.ret(45, [fd, DATA + 0x1000, 0x1000, 0x40, 0, 0]);
-    for (seq, family, joined) in [(15, 10, true), (16, 2, false)] {
-        let len = netlink_request(&f, DATA, 22, 0x301, seq, &[family]);
+    for (kind, seq, family, joined) in [
+        (22, 15, 10, true),
+        (22, 16, 2, false),
+        (18, 17, 10, true),
+        (18, 18, 0, false),
+    ] {
+        let len = netlink_request(&f, DATA, kind, 0x301, seq, &[family]);
         assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
         let first = receive(&mut f);
         let message = u64::from(read_u32(&f, DATA + 0x1000));
+        // The ifinfomsg's family is the one asked for, or AF_UNSPEC.
+        if kind == 18 {
+            assert_eq!(read_u32(&f, DATA + 0x1010) & 0xff, u32::from(family));
+        }
         if joined {
             assert_eq!(first, message + 20);
         } else {

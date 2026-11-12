@@ -1209,8 +1209,9 @@ kernel.
     Linux's `netlink_dump` makes them (a page's worth, or as much as the
     longest receive so far asked for up to 32 KiB, the next as a receive
     makes room), and ends with `NLMSG_DONE` in a part of its own; an
-    `AF_INET6` address dump's goes after its last address when that part
-    has room, as `inet6_dump_ifaddr` puts it. An error, or a success with `NLM_F_ACK`, is answered with
+    `AF_INET6` address or link dump's goes after its last message when
+    that part has room, as `inet6_dump_ifaddr` and `inet6_dump_ifinfo` put
+    it. An error, or a success with `NLM_F_ACK`, is answered with
     `NLMSG_ERROR`, which carries the whole request with an error unless
     `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending
@@ -1222,7 +1223,10 @@ kernel.
     with `RTEXT_FILTER_SKIP_STATS` in `IFLA_EXT_MASK`), XDP, map, and its
     MCTP, IPv4 and IPv6 settings (`IFLA_AF_SPEC`, as a kernel built with
     MCTP gives it), so `ip -d link` gives
-    Linux's details.
+    Linux's details. An `AF_INET6` dump answers as `inet6_dump_ifinfo`
+    does: `lo` with an `AF_INET6` `ifinfomsg`, its name, hardware address,
+    MTU and state, and its IPv6 settings with their statistics in
+    `IFLA_PROTINFO`.
     `RTM_NEWLINK` and `RTM_SETLINK` bring it up or down with `IFF_UP`.
   - **Addresses:** `RTM_GETADDR` dumps `lo`'s addresses in Linux's orders:
     IPv4's primaries after those of a scope as wide or wider, secondaries

@@ -1599,9 +1599,10 @@ static void routes_get(int fd, unsigned port, const char *when, const char *cons
 /* The link-attributes case: the attributes at `at`, one line each, with
    their type (with its NLA_F_NESTED bit) and length, the nested ones'
    inside. A value is printed in hex, or as a sum of its bytes past 16, but
-   for these of IFLA_AF_SPEC: the IPv4 and IPv6 settings, which a new
-   network namespace copies from the host's, and of IPv6's
-   `ifla_cacheinfo` its creation time and reachable time, which vary. */
+   for these of IFLA_AF_SPEC, and of an AF_INET6 dump's IFLA_PROTINFO: the
+   IPv4 and IPv6 settings, which a new network namespace copies from the
+   host's, and of IPv6's `ifla_cacheinfo` its creation time and reachable
+   time, which vary. */
 static void link_attributes(const unsigned char *at, int len, int depth, int parent, int family) {
     while (len >= 4) {
         unsigned short alen, type;
@@ -1614,6 +1615,9 @@ static void link_attributes(const unsigned char *at, int len, int depth, int par
         if (depth == 0 && (kind == 26 || kind == 43)) {
             printf("\n");
             link_attributes(v, n, 1, kind, 0);
+        } else if (depth == 0 && kind == 12) {
+            printf("\n");
+            link_attributes(v, n, 2, 26, 10);
         } else if (depth == 1 && parent == 26) {
             printf("\n");
             link_attributes(v, n, 2, 26, kind);
@@ -1636,11 +1640,13 @@ static void link_attributes(const unsigned char *at, int len, int depth, int par
         len -= step;
     }
 }
-/* Asks `fd` for lo's link message: a dump with only a family byte, as glibc
-   sends it, or with an `ifinfomsg` and IFLA_EXT_MASK `mask`, as ip does;
-   or `lo` by its index; and prints each message's header and attributes. */
-static void link_show(int fd, unsigned port, const char *label, int get, int full, unsigned mask) {
-    unsigned char request[16 + 8] = {0};
+/* Asks `fd` for lo's link message: a dump with only a family byte,
+   `family`, as glibc sends it, or with an `ifinfomsg` and IFLA_EXT_MASK
+   `mask`, as ip does; or `lo` by its index; and prints each message's header
+   and attributes. */
+static void link_show(int fd, unsigned port, const char *label, int get, int full, unsigned mask,
+                      unsigned char family) {
+    unsigned char request[16 + 8] = {family};
     size_t len = 1;
     if (full) {
         if (get) request[4] = 1;
@@ -9125,12 +9131,15 @@ int main(int argc, char **argv) {
             for (int up = 0; up < 2; up++) {
                 char label[64];
                 snprintf(label, sizeof label, "%s family", states[up]);
-                link_show(fd, port, label, 0, 0, 0);
+                link_show(fd, port, label, 0, 0, 0, 0);
                 snprintf(label, sizeof label, "%s vf", states[up]);
-                link_show(fd, port, label, 0, 1, 1);
+                link_show(fd, port, label, 0, 1, 1, 0);
                 /* RTEXT_FILTER_SKIP_STATS leaves the statistics out. */
                 snprintf(label, sizeof label, "%s get skip stats", states[up]);
-                link_show(fd, port, label, 1, 1, 8);
+                link_show(fd, port, label, 1, 1, 8, 0);
+                /* AF_INET6's own dump: lo as IPv6 shows it. */
+                snprintf(label, sizeof label, "%s inet6", states[up]);
+                link_show(fd, port, label, 0, 0, 0, AF_INET6);
                 if (!up) {
                     int udp = socket(AF_INET, SOCK_DGRAM, 0);
                     netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
@@ -9500,8 +9509,8 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "route-dump")) {
         /* A child makes a network namespace with lo up, 150 more addresses
-           and 300 blackhole routes, and prints the datagrams each address
-           and route dump comes in: a page's worth first, then as much as
+           and 300 blackhole routes, and prints the datagrams each link,
+           address and route dump comes in: a page's worth first, then as much as
            the longest receive asked for, and NLMSG_DONE after them. */
         fflush(stdout);
         pid_t maker = child();
@@ -9527,7 +9536,8 @@ int main(int argc, char **argv) {
                 unsigned short type;
                 unsigned char family;
                 const char *label;
-            } dumps[] = {{22, 0, "addr"},  {22, AF_INET, "addr4"},  {22, AF_INET6, "addr6"}, {26, 0, "route"},
+            } dumps[] = {{18, 0, "link"},          {18, AF_INET6, "link6"}, {22, 0, "addr"},
+                         {22, AF_INET, "addr4"},   {22, AF_INET6, "addr6"}, {26, 0, "route"},
                          {26, AF_INET, "route4"}, {26, AF_INET6, "route6"}, {26, 128, "ipmr"}};
             static const size_t rooms[] = {65536, 8192, 1024};
             for (size_t i = 0; i < sizeof dumps / sizeof dumps[0]; i++)

@@ -10,7 +10,8 @@
 //! dumps (`NLM_F_DUMP`) answer with the loopback, its addresses and its
 //! routes, in parts as large as `netlink_dump` makes them, each receive
 //! that leaves room sending the next, then `NLMSG_DONE` in a part of its
-//! own (after the last IPv6 address, when it has room); `RTM_GETLINK` without a
+//! own (after the last IPv6 address or link, when it has room); an AF_INET6
+//! `RTM_GETLINK` dump shows the loopback as IPv6 does; `RTM_GETLINK` without a
 //! dump answers for `lo` by index or name, and `RTM_GETROUTE` without one
 //! looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and remove the
 //! loopback's addresses ([`crate::interface`]); `RTM_NEWLINK` and `RTM_SETLINK` bring it up or
@@ -132,6 +133,8 @@ const IFLA_STATS: u16 = 7;
 const IFLA_TXQLEN: u16 = 13;
 const IFLA_MAP: u16 = 14;
 const IFLA_OPERSTATE: u16 = 16;
+/// `IFLA_PROTINFO`, where an AF_INET6 link dump puts IPv6's settings.
+const IFLA_PROTINFO: u16 = 12;
 const IFLA_LINKMODE: u16 = 17;
 const IFLA_STATS64: u16 = 23;
 const IFLA_AF_SPEC: u16 = 26;
@@ -813,6 +816,10 @@ impl NetlinkSocket {
             let messages = match (header.kind, family) {
                 // `rtnl_bridge_getlink` has no bridge port to show.
                 (RTM_GETLINK, AF_BRIDGE) => Vec::new(),
+                // `inet6_dump_ifinfo`: each device with IPv6, as IPv6 shows it.
+                (RTM_GETLINK, AF_INET6) => {
+                    vec![inet6_link_message(&self.network, header.seq, port)]
+                }
                 (RTM_GETLINK, _) => vec![link_message(
                     &self.network,
                     header.seq,
@@ -855,9 +862,10 @@ impl NetlinkSocket {
                 port,
                 &0i32.to_le_bytes(),
             );
-            // `inet6_dump_ifaddr` alone, not split, puts `NLMSG_DONE` after
-            // its last message when that part has room for it.
-            let joined = header.kind == RTM_GETADDR && family == AF_INET6;
+            // `inet6_dump_ifaddr` and `inet6_dump_ifinfo`, not split, put
+            // `NLMSG_DONE` after their last message when that part has room
+            // for it.
+            let joined = matches!(header.kind, RTM_GETADDR | RTM_GETLINK) && family == AF_INET6;
             self.start_dump_as(s, messages, done, joined);
             return Ok(true);
         }
@@ -1335,6 +1343,29 @@ fn af_spec(up: bool, stats: bool) -> Vec<u8> {
         0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10000, 1000,
         0, 0, 0, 0, 1,
     ];
+    let mut inet = Vec::new();
+    attribute(
+        &mut inet,
+        IFLA_INET_CONF,
+        &INET
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    // MCTP's, first, as a kernel built with it (Ubuntu's) gives: its
+    // default network, 1, and no physical binding.
+    let mut mctp = Vec::new();
+    attribute(&mut mctp, IFLA_MCTP_NET, &1u32.to_le_bytes());
+    attribute(&mut mctp, IFLA_MCTP_PHYS_BINDING, &[0]);
+    let mut spec = Vec::new();
+    attribute(&mut spec, AF_MCTP, &mctp);
+    attribute(&mut spec, u16::from(AF_INET), &inet);
+    attribute(&mut spec, u16::from(AF_INET6), &inet6_settings(up, stats));
+    spec
+}
+/// `lo`'s IPv6 settings, as `inet6_fill_ifla6_attrs` gives them, for
+/// [`af_spec`] and [`inet6_link_message`].
+fn inet6_settings(up: bool, stats: bool) -> Vec<u8> {
     const INET6: [i32; 60] = [
         0, 64, 65536, 1, 1, 1, 1, -1, 4000, 1000, -1, 172_800, 86400, 3, 600, 16, 0, 1, 1, 1,
         60000, 0, 0, 0, 0, 0, 0, -1, 0, 0, 10000, 1000, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 3_600_000,
@@ -1347,8 +1378,6 @@ fn af_spec(up: bool, stats: bool) -> Vec<u8> {
         raw[..8].copy_from_slice(&count.to_le_bytes());
         raw
     };
-    let mut inet = Vec::new();
-    attribute(&mut inet, IFLA_INET_CONF, &words(&INET));
     let mut inet6 = Vec::new();
     let ready: u32 = if up { IF_READY } else { 0 };
     attribute(&mut inet6, IFLA_INET6_FLAGS, &ready.to_le_bytes());
@@ -1366,16 +1395,26 @@ fn af_spec(up: bool, stats: bool) -> Vec<u8> {
     }
     attribute(&mut inet6, IFLA_INET6_TOKEN, &[0; 16]);
     attribute(&mut inet6, IFLA_INET6_ADDR_GEN_MODE, &[0]);
-    // MCTP's, first, as a kernel built with it (Ubuntu's) gives: its
-    // default network, 1, and no physical binding.
-    let mut mctp = Vec::new();
-    attribute(&mut mctp, IFLA_MCTP_NET, &1u32.to_le_bytes());
-    attribute(&mut mctp, IFLA_MCTP_PHYS_BINDING, &[0]);
-    let mut spec = Vec::new();
-    attribute(&mut spec, AF_MCTP, &mctp);
-    attribute(&mut spec, u16::from(AF_INET), &inet);
-    attribute(&mut spec, u16::from(AF_INET6), &inet6);
-    spec
+    inet6
+}
+/// `RTM_NEWLINK` for `lo` in an AF_INET6 link dump, as `inet6_fill_ifinfo`
+/// gives it: an `ifinfomsg` of AF_INET6, its name, hardware address, MTU and
+/// state (no `IFLA_LINK`, as `lo` is its own), then its IPv6 settings, with
+/// their statistics, in `IFLA_PROTINFO`, which is not marked nested.
+fn inet6_link_message(network: &Network, seq: u32, port: u32) -> Vec<u8> {
+    let up = network.is_up();
+    let mut body = vec![AF_INET6, 0];
+    body.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
+    body.extend_from_slice(&1i32.to_le_bytes());
+    body.extend_from_slice(&link_flags(network).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    attribute(&mut body, IFLA_IFNAME, b"lo\0");
+    attribute(&mut body, IFLA_ADDRESS, &[0; 6]);
+    attribute(&mut body, IFLA_MTU, &LO_MTU.to_le_bytes());
+    let operstate = if up { IF_OPER_UNKNOWN } else { IF_OPER_DOWN };
+    attribute(&mut body, IFLA_OPERSTATE, &[operstate]);
+    attribute(&mut body, IFLA_PROTINFO, &inet6_settings(up, true));
+    message(RTM_NEWLINK, NLM_F_MULTI, seq, port, &body)
 }
 /// The `IFLA_EXT_MASK` of a link request, past its `ifinfomsg`: 0 for
 /// none, or for a dump that sends only a family byte.
@@ -2507,6 +2546,43 @@ mod tests {
         network.set_up(false);
         assert!(!ipv4_message(&network, 3, 7).is_empty());
         assert!(ipv6_message(&network, 3, 7).is_empty());
+    }
+
+    #[test]
+    fn an_inet6_link_dump_shows_lo_as_ipv6_does() {
+        let network = Network::isolated(crate::users::first());
+        let link = inet6_link_message(&network, 4, 7);
+        let header = Header::read(&link);
+        assert_eq!(
+            (header.len as usize, header.kind, header.flags, header.seq),
+            (link.len(), RTM_NEWLINK, NLM_F_MULTI, 4)
+        );
+        assert_eq!(&link[16..20], &[AF_INET6, 0, 4, 3]);
+        assert_eq!(&link[20..24], &1i32.to_le_bytes());
+        let found = attributes(&link[32..]);
+        assert_eq!(
+            found.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            [
+                IFLA_IFNAME,
+                IFLA_ADDRESS,
+                IFLA_MTU,
+                IFLA_OPERSTATE,
+                IFLA_PROTINFO
+            ]
+        );
+        assert_eq!(found[3].1, [IF_OPER_DOWN]);
+        // IPv6's settings, as IFLA_AF_SPEC has them, always with statistics.
+        let inet6 = attributes(found[4].1);
+        assert_eq!(
+            inet6.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            [1, 5, 2, 3, 6, 7, 8]
+        );
+        assert_eq!(found[4].1, inet6_settings(false, true));
+        network.set_up(true);
+        let link = inet6_link_message(&network, 4, 7);
+        let found = attributes(&link[32..]);
+        assert_eq!(found[3].1, [IF_OPER_UNKNOWN]);
+        assert_eq!(attributes(found[4].1)[0].1, IF_READY.to_le_bytes());
     }
 
     #[test]

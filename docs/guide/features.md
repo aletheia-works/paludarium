@@ -824,8 +824,9 @@ kernel.
   queue's owner, the root's or `CAP_FOWNER`, and `mq_open` of a queue
   that is there does not search it (`lookup_noperm`). Landlock checks a
   `link` or `rename` within it (`EACCES`) before the root refuses it. The
-  root has no operations but to look up, make a queue and unlink one: a new name there that is free (else
-  `EEXIST`, as `/dev/mqueue` itself is) gives `mkdir`, `symlink` and
+  root has no operations but to look up, make a queue and unlink one: a
+  new name there that is free (else `EEXIST`, as `/dev/mqueue` itself
+  is) gives `mkdir`, `symlink` and
   `mknod` of anything but a regular file `EPERM`, after Landlock's check,
   and `mknod` of a regular file (or of type 0) makes a queue of the
   default attributes, as `vfs_create` does. `link` and `rename` look the

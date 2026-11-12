@@ -973,8 +973,6 @@ impl Processes {
         } else {
             return;
         }
-        // An exiting process's record locks go with it (locks_remove_posix).
-        self.locks.release_process(pid);
         // A session leader's exit, as Linux's disassociate_ctty(1): the
         // foreground group of its pseudo-terminal gets SIGHUP, and the
         // session loses the terminal.
@@ -2498,8 +2496,10 @@ impl Kernel {
             self.group.set_task_ids(thread.tid, credentials.task_ids());
             thread.state.credentials = credentials;
         }
-        if flags & (FS | FILES) != 0 {
-            self.files = self.files.for_clone(flags & FILES == 0, flags & FS == 0);
+        if flags & FILES != 0 {
+            self.files = self.files.unshared(flags & FS == 0);
+        } else if flags & FS != 0 {
+            self.files = self.files.for_clone(true, false);
         }
         if flags & (SYSVSEM | crate::namespaces::CLONE_NEWIPC) != 0 {
             self.group

@@ -1181,7 +1181,10 @@ impl Kernel {
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).
-        let closed = self.files.release_descriptors();
+        let (table, closed) = self.files.release_descriptors();
+        if let Some(table) = table {
+            self.processes.locks().release_table(table);
+        }
         crate::mqueue::exited(&closed, self.process.pid);
         drop(closed);
         // Then `exit_fs`: the last task sharing the working directory lets

@@ -345,6 +345,65 @@ mod process {
         assert!(tid < 1 << 32, "{tid:#x}");
     }
     #[test]
+    fn clone_files_shares_the_record_locks_of_the_table() {
+        let (mut k, mut t, m) = setup();
+        m.write(GuestAddr(DATA), b"/tmp/shared-locks\0").unwrap();
+        let fd = syscall(&mut k, &mut t, &m, 2, [DATA, 0o102, 0o600, 0, 0, 0]);
+        let lock = |kind: i16| {
+            let mut raw = [0u8; 32];
+            raw[0..2].copy_from_slice(&kind.to_le_bytes());
+            raw[16..24].copy_from_slice(&10i64.to_le_bytes());
+            raw
+        };
+        // CLONE_FILES | SIGCHLD: a process sharing the parent's table.
+        syscall(&mut k, &mut t, &m, 56, [0x400 | 17, 0, 0, 0, 0, 0]);
+        let (mut c, mut ct) = k.take_child().unwrap();
+        let cm = c.take_spawn_memory().unwrap();
+        cm.write(GuestAddr(DATA + 0x100), &lock(1)).unwrap();
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 72, [fd, 6, DATA + 0x100, 0, 0, 0]),
+            0
+        );
+        // The parent's table holds the child's lock: no conflict for it.
+        m.write(GuestAddr(DATA + 0x100), &lock(1)).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 72, [fd, 5, DATA + 0x100, 0, 0, 0]),
+            0
+        );
+        let mut got = [0u8; 2];
+        m.read(GuestAddr(DATA + 0x100), &mut got).unwrap();
+        assert_eq!(i16::from_le_bytes(got), 2, "F_UNLCK");
+        // A forked child has a table of its own, and sees the child's pid.
+        let (mut o, mut ot, om) = fork(&mut k, &mut t, &m);
+        om.write(GuestAddr(DATA + 0x100), &lock(0)).unwrap();
+        assert_eq!(
+            syscall(&mut o, &mut ot, &om, 72, [fd, 5, DATA + 0x100, 0, 0, 0]),
+            0
+        );
+        let mut raw = [0u8; 32];
+        om.read(GuestAddr(DATA + 0x100), &mut raw).unwrap();
+        assert_eq!(i16::from_le_bytes([raw[0], raw[1]]), 1, "F_WRLCK");
+        assert_eq!(u32::from_le_bytes(raw[24..28].try_into().unwrap()), ct.tid);
+        // The child's exit leaves the lock to the table's other task.
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        om.write(GuestAddr(DATA + 0x100), &lock(0)).unwrap();
+        assert_eq!(
+            syscall(&mut o, &mut ot, &om, 72, [fd, 5, DATA + 0x100, 0, 0, 0]),
+            0
+        );
+        om.read(GuestAddr(DATA + 0x100), &mut raw).unwrap();
+        assert_eq!(i16::from_le_bytes([raw[0], raw[1]]), 1, "F_WRLCK");
+        // The parent's last exit lets it go.
+        finish(&mut k, &t, &m, ExitStatus::Exited(0));
+        om.write(GuestAddr(DATA + 0x100), &lock(0)).unwrap();
+        assert_eq!(
+            syscall(&mut o, &mut ot, &om, 72, [fd, 5, DATA + 0x100, 0, 0, 0]),
+            0
+        );
+        om.read(GuestAddr(DATA + 0x100), &mut raw).unwrap();
+        assert_eq!(i16::from_le_bytes([raw[0], raw[1]]), 2, "F_UNLCK");
+    }
+    #[test]
     fn fork_inherits_the_descriptor_limit() {
         let (mut k, mut t, m) = setup();
         m.write_u64(GuestAddr(DATA), 3).unwrap();

@@ -108,6 +108,9 @@ pub struct Files {
     pub(crate) devpts: Arc<crate::pty::Devpts>,
     pub fs: Arc<dyn FileSystem>,
     pub(crate) fds: Arc<Mutex<BTreeMap<u32, Descriptor>>>,
+    /// The table's number, shared exactly as `fds` is: the owner of the POSIX
+    /// record locks set through it (Linux's `files_struct` as `flc_owner`).
+    table: Arc<Table>,
     /// Numbers an unfinished open has taken, as Linux's alloc_fd marks them
     /// before the file exists: no allocation gets them and no lookup sees
     /// them. Shared exactly as `fds` is; locked after it.
@@ -138,6 +141,7 @@ impl Default for Files {
                 Arc::clone(&caches),
             )),
             fds: Arc::new(Mutex::new(BTreeMap::new())),
+            table: Arc::new(Table::new()),
             reserved: Arc::default(),
             cwd: Arc::new(Mutex::new(b"/".to_vec())),
             home: Arc::default(),
@@ -259,16 +263,33 @@ impl Files {
     /// shared by live CLONE_FILES siblings; the last task to let go gets the
     /// files the table held (`put_files_struct`), deciding that with the
     /// release itself so that two tasks ending together cannot both miss it.
-    pub(crate) fn release_descriptors(&mut self) -> Vec<Arc<dyn FileHandle>> {
+    /// That last task also gets the table's number, whose record locks then
+    /// go (`locks_remove_posix` of each file `close_files` closes).
+    pub(crate) fn release_descriptors(&mut self) -> (Option<u64>, Vec<Arc<dyn FileHandle>>) {
         let fds = std::mem::replace(&mut self.fds, Arc::new(Mutex::new(BTreeMap::new())));
+        let table = std::mem::replace(&mut self.table, Arc::new(Table::new()));
         self.reserved = Arc::default();
-        Arc::into_inner(fds).map_or_else(Vec::new, |fds| {
-            fds.into_inner()
-                .unwrap_or_else(PoisonError::into_inner)
-                .into_values()
-                .map(|descriptor| descriptor.file)
-                .collect()
-        })
+        Arc::into_inner(fds).map_or_else(
+            || (None, Vec::new()),
+            |fds| {
+                let files = fds
+                    .into_inner()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .into_values()
+                    .map(|descriptor| descriptor.file)
+                    .collect();
+                (Some(table.0), files)
+            },
+        )
+    }
+    /// The number of this task's descriptor table, which owns the POSIX
+    /// record locks set through it.
+    pub(crate) fn table(&self) -> u64 {
+        self.table.0
+    }
+    /// The table itself, for a record lock to go once no task uses it.
+    pub(crate) fn table_token(&self) -> std::sync::Weak<Table> {
+        Arc::downgrade(&self.table)
     }
     pub(crate) fn umask(&self) -> u32 {
         self.umask.load(Ordering::SeqCst)
@@ -301,7 +322,7 @@ impl Files {
             .collect()
     }
     pub(crate) fn for_exec(&self) -> Self {
-        let child = self.for_clone(false, false);
+        let child = self.unshared(false);
         child
             .fds
             .lock()
@@ -525,9 +546,22 @@ impl Files {
     pub(crate) fn enter_root(&self) {
         self.change_directory(b"/".to_vec());
     }
+    /// This task's own copy of the descriptor table, as `unshare_fd` gives
+    /// one (for `unshare(CLONE_FILES)`, `CLOSE_RANGE_UNSHARE` and exec): of a
+    /// table no other task shares, the same table, with its record locks, as
+    /// Linux copies only a shared one. With `share_fs` the working directory
+    /// stays shared.
+    pub(crate) fn unshared(&self, share_fs: bool) -> Self {
+        let mut copy = self.for_clone(false, share_fs);
+        if Arc::strong_count(&self.fds) == 1 {
+            copy.table = Arc::clone(&self.table);
+        }
+        copy
+    }
     pub(crate) fn for_clone(&self, share_files: bool, share_fs: bool) -> Self {
         let mut child = self.clone();
         if !share_files {
+            child.table = Arc::new(Table::new());
             child.fds = Arc::new(Mutex::new(
                 self.fds
                     .lock()
@@ -553,6 +587,15 @@ impl Files {
             child.umask = Arc::new(AtomicU32::new(self.umask.load(Ordering::SeqCst)));
         }
         child
+    }
+}
+/// The number of a descriptor table, which no other table has had.
+#[derive(Debug)]
+pub(crate) struct Table(u64);
+impl Table {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 }
 /// The lowest number from `min` with no descriptor or reservation, which
@@ -1740,7 +1783,7 @@ fn close_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     if flags & CLOSE_RANGE_UNSHARE != 0 {
-        *c.files = c.files.for_clone(false, true);
+        *c.files = c.files.unshared(true);
     }
     let mut fds = c.files.fds.lock().unwrap_or_else(PoisonError::into_inner);
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
@@ -4493,6 +4536,26 @@ mod files_tests {
         );
         assert!(f.descriptor(0).is_err());
         assert_eq!(f.install_pair([x, y], false, 2), Ok([0, 1]));
+    }
+    #[test]
+    fn a_table_keeps_its_number_where_it_stays_the_same_table() {
+        let mut f = Files::default();
+        // A CLONE_FILES task shares the table; a fork's child has its own.
+        let mut shared = f.for_clone(true, true);
+        assert_eq!(shared.table(), f.table());
+        let forked = f.for_clone(false, false);
+        assert_ne!(forked.table(), f.table());
+        // Unsharing a shared table copies it; one used by no other task stays.
+        let copy = f.unshared(true);
+        assert_ne!(copy.table(), f.table());
+        let lone = forked.unshared(true);
+        assert_eq!(lone.table(), forked.table());
+        assert_eq!(forked.for_exec().table(), forked.table());
+        // Only the last task to let go gets the table's number, for its locks.
+        let table = f.table();
+        assert_eq!(f.release_descriptors().0, None);
+        assert_ne!(f.table(), table);
+        assert_eq!(shared.release_descriptors().0, Some(table));
     }
     #[test]
     fn exec_takes_the_close_on_exec_descriptors_of_a_table_of_its_own() {

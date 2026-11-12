@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -551,6 +552,67 @@ static int case_fdinfo(void) {
     return 0;
 }
 
+/* POSIX record locks belong to the descriptor table: a child cloned with
+ * CLONE_FILES alone sets them for its parent too. The parent never conflicts
+ * with them, another process does (seeing the child's pid), the child's exit
+ * leaves them, and the parent's close of the file drops them. */
+static int getlk_from_other(const char *path, short type) {
+    int ready[2];
+    pipe(ready);
+    pid_t other = fork();
+    if (other == 0) {
+        int fd = open(path, O_RDWR);
+        struct flock l = {.l_type = type, .l_whence = SEEK_SET, .l_start = 0, .l_len = 10};
+        int r = fcntl(fd, F_GETLK, &l);
+        int out[2] = {r < 0 ? -errno : l.l_type, l.l_pid};
+        write(ready[1], out, sizeof out);
+        _exit(0);
+    }
+    int got[2] = {-1, -1};
+    read(ready[0], got, sizeof got);
+    waitpid(other, NULL, 0);
+    close(ready[0]);
+    close(ready[1]);
+    return got[0] == F_UNLCK ? 0 : got[0] < 0 ? got[0] : got[1];
+}
+static int case_shared_locks(void) {
+    char path[] = "/tmp/shared-locks-XXXXXX";
+    int file = mkstemp(path);
+    if (file < 0) return 93;
+    int done[2];
+    pipe(done);
+    pid_t child = syscall(SYS_clone, CLONE_FILES | SIGCHLD, 0, 0, 0, 0);
+    if (child == 0) {
+        int r = lock_range(file, F_SETLK, F_WRLCK, 0, 10);
+        write(done[1], &r, sizeof r);
+        _exit(0);
+    }
+    int set = -1;
+    read(done[0], &set, sizeof set);
+    say("child setlk=%d", set);
+    /* The parent's table holds it: no conflict for the parent. */
+    struct flock l = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 10};
+    long getlk = TRY(fcntl(file, F_GETLK, &l));
+    say("parent getlk=%ld type=%s", getlk, l.l_type == F_UNLCK ? "unlocked" : "locked");
+    int pid = getlk_from_other(path, F_RDLCK);
+    say("other sees child=%d", pid == child);
+    show_extra("shared-locks", file);
+    int status;
+    waitpid(child, &status, 0);
+    say("child exited=%d", WIFEXITED(status));
+    pid = getlk_from_other(path, F_RDLCK);
+    say("after exit other sees child=%d", pid == child);
+    /* The parent changes the same lock, as its owner. */
+    say("parent setlk read=%d", lock_range(file, F_SETLK, F_RDLCK, 0, 5));
+    show_extra("shared-locks-changed", file);
+    /* Closing any descriptor of the file drops the table's locks. */
+    int again = open(path, O_RDWR);
+    close(again);
+    say("after close other sees=%d", getlk_from_other(path, F_WRLCK));
+    unlink(path);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -562,5 +624,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "signalfd-interrupt")) return case_interrupt();
     if (!strcmp(mode, "signalfd-edges")) return case_edges();
     if (!strcmp(mode, "signalfd-fdinfo")) return case_fdinfo();
+    if (!strcmp(mode, "signalfd-shared-locks")) return case_shared_locks();
     return 2;
 }

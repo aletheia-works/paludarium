@@ -395,19 +395,24 @@ kernel.
   `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
   take it, and it is a directory for the `*at` calls.
 - `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
-  locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a process owns, and open
+  locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a descriptor table owns (a
+  process's, which its threads and a child cloned with `CLONE_FILES` share,
+  as Linux's `files_struct`), and open
   file description locks (`F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`),
   which a description owns, conflicting with each other. A lock on a range
   replaces, splits or merges the owner's own there, as `posix_lock_inode`
-  does, and `F_GETLK` reports the first conflicting lock with its owner's PID
-  (-1 for a description's), or `F_UNLCK`. The arguments are checked in the
+  does, and `F_GETLK` reports the first conflicting lock with the PID of the
+  process that set it (-1 for a description's), or `F_UNLCK`. The arguments are checked in the
   order of `fcntl_getlk` and `fcntl_setlk` (the whence, the range with
   `EINVAL` or `EOVERFLOW`, the type, `EBADF` for a type the descriptor's
-  access does not allow, and an OFD lock's `l_pid`). A process's record locks
-  on a file go when it closes any descriptor of the file or exits, not with
-  `fork` or `execve`; a description's go when its last descriptor closes.
-  `F_SETLKW` waits until the range is free, `EDEADLK` when the record locks
-  of processes waiting for each other (up to 10) would close a cycle. A
+  access does not allow, and an OFD lock's `l_pid`). A table's record locks
+  on a file go when a task using it closes any descriptor of the file, or
+  when the last task using it exits, not with `fork` or `execve`; an exec,
+  `unshare(CLONE_FILES)` or `CLOSE_RANGE_UNSHARE` of a table another task
+  shares gives the caller a copy that owns none of them. A description's go
+  when its last descriptor closes. `F_SETLKW` waits until the range is free,
+  `EDEADLK` when the record locks of tables waiting for each other (up to
+  10) would close a cycle. A
   wait counts for that only while the lock it waits for stays as it was:
   unlocking, changing or closing it ends the wait there at once, as
   `locks_wake_up_blocks` does, even before the waiter runs again. The
@@ -1897,10 +1902,9 @@ kernel.
   hexadecimal, then `ignored_mask:0`. The other kinds add Linux's lines
   too. After the first four come `lock:` lines (`show_fd_locks`): the
   description's `flock` lock, then each record lock set through it that the
-  process or the description owns, by where they start, numbered from 1
+  process's table or the description owns, by where they start, numbered from 1
   across both. Each has `FLOCK`, `POSIX` or `OFDLCK`, `READ` or `WRITE`, the
-  process ID of its owner (for a `flock` lock, the process that set it;
-  -1 for a description's record lock), the device and inode, and the range
+  ID of the process that set it (-1 for a description's record lock), the device and inode, and the range
   (`0 EOF` for a `flock` lock). Asking again for the kind of `flock` lock a
   description has keeps it as it was, and a change of kind drops the old
   one first, even when the new one conflicts, as `flock_lock_inode` does.

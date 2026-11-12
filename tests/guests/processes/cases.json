@@ -71,6 +71,7 @@
     {"name":"signalfd-interrupt","binary":"signalfd"},
     {"name":"signalfd-edges","binary":"signalfd"},
     {"name":"signalfd-fdinfo","binary":"signalfd"},
+    {"name":"signalfd-shared-locks","binary":"signalfd"},
     {"name":"aio-calls","binary":"aio"},
     {"name":"aio-rw","binary":"aio"},
     {"name":"aio-streams","binary":"aio"},

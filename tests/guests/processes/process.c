@@ -2152,6 +2152,20 @@ static size_t inet_attribute(unsigned char *at, unsigned short kind, const void 
     memcpy(at + 4, value, len);
     return (total + 3) & ~3;
 }
+/* Waits, for at most a second, until the TCP socket from port `sport` to
+   `dport` on 127.0.0.1 has left TCP_FIN_WAIT1: on Linux the peer's ACK of
+   the FIN that close or shutdown sent comes through the loopback's
+   softirq, which may not have run when the call returns. Prints nothing. */
+static void inet_settle(int fd, unsigned short sport, unsigned short dport) {
+    unsigned char request[56], reply[1024];
+    for (int tries = 0; tries < 200; tries++) {
+        size_t len = inet_request(request, AF_INET, 6, 0, ~0u, sport, dport, "127.0.0.1", "127.0.0.1");
+        nl_send(fd, 20, NL_F_REQUEST, request, len);
+        long n = recv(fd, reply, sizeof reply, 0);
+        if (n < 16 + 72 || reply[16 + 1] != 4) return;
+        usleep(5000);
+    }
+}
 /* Binds a UDP socket of `family` to `text`, and prints the result. */
 static void addresses_bind(const char *text, const char *when) {
     int family = strchr(text, ':') ? AF_INET6 : AF_INET;
@@ -8819,12 +8833,14 @@ int main(int argc, char **argv) {
             int half_peer = accept(listener, NULL, NULL);
             inet_add("half-peer", half_peer);
             shutdown(half, SHUT_WR);
+            inet_settle(d, inet_find("half")->port, port);
             int closer = socket(AF_INET, SOCK_STREAM, 0);
             connect(closer, (void *)&to, sizeof to);
             inet_add("closer", closer);
             inet_add("closer-peer", accept(listener, NULL, NULL));
             close(closer);
             inet_find("closer")->fd = -1;
+            inet_settle(d, inet_find("closer")->port, port);
             struct sockaddr_in6 mapped_to = {.sin6_family = AF_INET6, .sin6_port = htons(port)};
             inet_pton(AF_INET6, "::ffff:127.0.0.1", &mapped_to.sin6_addr);
             int mapped = socket(AF_INET6, SOCK_STREAM, 0);

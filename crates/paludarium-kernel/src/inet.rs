@@ -305,6 +305,8 @@ pub(crate) struct Network {
     addresses: Mutex<crate::interface::Addresses>,
     /// The netlink sockets bound in it ([`crate::netlink`]).
     pub(crate) netlink: crate::netlink::Ports,
+    /// Its TCP and UDP sockets, oldest first, which `sock_diag` lists.
+    sockets: Mutex<Vec<Weak<InetSocket>>>,
     /// The user namespace that owns its network namespace, whose
     /// `CAP_NET_ADMIN` changes it; none for the first one's.
     owner: Option<Arc<crate::namespaces::Namespace>>,
@@ -329,6 +331,7 @@ impl Network {
             ever_up: AtomicBool::new(true),
             addresses: Mutex::new(crate::interface::Addresses::first()),
             netlink: crate::netlink::Ports::default(),
+            sockets: Mutex::default(),
             owner: None,
         }
     }
@@ -616,6 +619,9 @@ struct State {
     /// `sk_err`: the pending error, which `SO_ERROR` takes.
     error: Option<Errno>,
     read_shut: bool,
+    /// A read has met the peer's end, which moves Linux's `copied_seq`
+    /// past its FIN (`tcp_recvmsg`'s `found_fin_ok`).
+    eof_read: bool,
     /// A UDP socket's `SHUT_WR` (TCP's is its stream's).
     write_shut: bool,
     // The guest's loopback.
@@ -696,6 +702,8 @@ struct Listen {
     backlog: usize,
     ready: VecDeque<Arc<InetSocket>>,
     arrivals: u64,
+    /// The handshakes a full queue dropped (`tcp_listendrop`).
+    drops: u32,
 }
 /// A loopback connection whose handshake found the listener's queue full,
 /// which Linux drops (`tcp_conn_request`): the client sends it again at
@@ -736,6 +744,7 @@ impl Listen {
             backlog,
             ready: VecDeque::new(),
             arrivals: 0,
+            drops: 0,
         }
     }
     fn has_room(&self) -> bool {
@@ -954,6 +963,12 @@ pub(crate) struct InetSocket {
     state: Mutex<State>,
     options: Mutex<Options>,
     signals: Arc<Signals>,
+    /// Its cookie, which `sock_diag` gives it when first asked
+    /// (`sock_gen_cookie`).
+    cookie: OnceLock<u64>,
+    /// A connection in its listener's queue, which has no socket file yet
+    /// (`sk_ino` 0 until `sock_graft`).
+    embryo: AtomicBool,
 }
 
 impl InetSocket {
@@ -971,7 +986,7 @@ impl InetSocket {
         hub: &Arc<ReadinessHub>,
         flags: u32,
     ) -> Arc<Self> {
-        Arc::new_cyclic(|this| Self {
+        let socket = Arc::new_cyclic(|this| Self {
             this: Weak::clone(this),
             family,
             datagram,
@@ -986,7 +1001,21 @@ impl InetSocket {
             state: Mutex::new(State::default()),
             options: Mutex::new(Options::default()),
             signals: Arc::default(),
-        })
+            cookie: OnceLock::new(),
+            embryo: AtomicBool::new(false),
+        });
+        let mut sockets = network
+            .sockets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        sockets.retain(|socket| socket.strong_count() > 0);
+        sockets.push(Arc::downgrade(&socket));
+        drop(sockets);
+        socket
+    }
+    /// Its cookie, given when first asked for, as `sock_gen_cookie`.
+    fn cookie(&self) -> u64 {
+        *self.cookie.get_or_init(crate::sockets::new_cookie)
     }
     /// The network it was made in.
     pub(crate) fn network(&self) -> &Network {
@@ -1094,7 +1123,9 @@ impl InetSocket {
         let Some(stream) = s.stream.clone() else {
             return Err(ENOTCONN);
         };
+        let ends = !peek && !buf.is_empty();
         if s.read_shut && stream.queued().0 == 0 {
+            s.eof_read |= ends && stream.readiness().read_closed;
             return Ok(Received::bytes(0));
         }
         let read = match Self::joined(&s) {
@@ -1104,11 +1135,14 @@ impl InetSocket {
                 .map(|(n, stamp)| (n, false, stamp)),
         };
         match read {
-            Ok((n, at_mark, came)) => Ok(Received {
-                at_mark,
-                came,
-                ..Received::bytes(n)
-            }),
+            Ok((n, at_mark, came)) => {
+                s.eof_read |= n == 0 && ends && stream.readiness().read_closed;
+                Ok(Received {
+                    at_mark,
+                    came,
+                    ..Received::bytes(n)
+                })
+            }
             Err(e) if e == Errno::EAGAIN => Err(e),
             Err(_) => match s.error.take() {
                 Some(error) => Err(error),
@@ -1247,6 +1281,7 @@ impl InetSocket {
                     }
                     s.noted = false;
                     s.read_shut = false;
+                    s.eof_read = false;
                     s.connection = Connection::Connecting;
                     // The stub's own stream is open at once.
                     if address.port() == DNS && !loopback {
@@ -1766,6 +1801,12 @@ impl InetSocket {
                 }
             }
         };
+        // An IPv6 address that is neither the unspecified one nor an IPv4
+        // one makes the socket IPv6-only (`__inet6_bind`), unless the bind
+        // fails.
+        let only = matches!(address, SocketAddr::V6(a) if !a.ip().is_unspecified());
+        let mut options = options;
+        options.v6_only |= only;
         s.bound = Some(self.ports().bind(Binding {
             locked: address.port() != 0,
             ..self.binding(address, &options)
@@ -1773,6 +1814,10 @@ impl InetSocket {
         s.port_locked = address.port() != 0;
         s.address_locked = !address.ip().is_unspecified();
         s.address = None;
+        drop(s);
+        if only {
+            self.options().v6_only = true;
+        }
         Ok(0)
     }
     /// `listen(backlog)`, as Linux's `inet_listen`: `EOPNOTSUPP` for UDP,
@@ -1915,6 +1960,7 @@ impl InetSocket {
             return Knock::Refused;
         };
         if !listen.has_room() {
+            listen.drops += 1;
             return Knock::Full;
         }
         let child = listener.child((theirs, locked), stream, link, from, to);
@@ -1945,6 +1991,11 @@ impl InetSocket {
     ) -> Arc<InetSocket> {
         let child = InetSocket::new(self.family, false, &self.network, &self.host, &self.hub, 0);
         *child.options() = options;
+        // `sk_clone_lock` copies the listener's `sk_uid`.
+        child
+            .uid
+            .store(self.uid.load(Ordering::SeqCst), Ordering::SeqCst);
+        child.embryo.store(true, Ordering::SeqCst);
         let own = Stream::new(from);
         own.set_waker(stream_waker(&child.signals, &child.hub, &own));
         own.set_clock(realtime(&child.host));
@@ -2023,6 +2074,8 @@ impl InetSocket {
             let child = listener.child((theirs, locked), &stream, (&link, &notify), from, to);
             listen.ready.push_back(child);
             listen.arrivals += 1;
+        } else {
+            listen.drops += 1;
         }
         drop(state);
         if arrived {
@@ -2193,7 +2246,9 @@ impl Drop for InetSocket {
             && let Some((link, side)) = finish(&stream, s.link.as_ref(), abort)
             && let Some(now) = self.now()
         {
-            self.ports().linger(&self.this, (&link, side), now);
+            let cookie = self.cookie();
+            self.ports()
+                .linger(&self.this, (&link, side, stream.peer()), now, cookie);
         }
     }
 }
@@ -2339,6 +2394,273 @@ impl FileHandle for InetSocket {
 /// The inet socket of `file`, if it is one.
 pub(crate) fn of(file: &Arc<dyn FileHandle>) -> Option<&InetSocket> {
     file.as_any()?.downcast_ref::<InetSocket>()
+}
+
+/// Where `sock_diag` finds a TCP socket, as Linux's tables hold it: a
+/// listener's, a bound socket's that is closed (`TCP_BOUND_INACTIVE`), or
+/// the connections' (`ehash`), which also holds those in `TIME_WAIT`. A UDP
+/// socket is in its one table once it has a port.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Table {
+    Listening,
+    Bound,
+    Connected,
+}
+/// What `sock_diag` tells of a TCP or UDP socket of the guest, or of a TCP
+/// connection's hold in `TIME_WAIT` after its socket (Linux's
+/// `inet_timewait_sock`).
+pub(crate) struct Entry {
+    pub(crate) v6: bool,
+    pub(crate) udp: bool,
+    /// `sk_state`, or a hold's `tw_substate`.
+    pub(crate) state: u8,
+    pub(crate) table: Table,
+    /// Its own address, IPv4 as such even on an IPv6 socket, and its peer's.
+    pub(crate) local: SocketAddr,
+    pub(crate) peer: Option<SocketAddr>,
+    pub(crate) cookie: u64,
+    /// `idiag_timer`, `idiag_retrans` and when the timer ends, on the
+    /// host's monotonic clock.
+    pub(crate) timer: (u8, u8, Option<u64>),
+    /// `idiag_rqueue` and `idiag_wqueue`.
+    pub(crate) queues: (u32, u32),
+    /// What a socket tells and a hold in `TIME_WAIT` does not.
+    pub(crate) full: Option<Full>,
+}
+/// What `sock_diag` tells of a socket ([`Entry::full`]).
+pub(crate) struct Full {
+    pub(crate) uid: u32,
+    pub(crate) inode: u64,
+    pub(crate) shutdown: u8,
+    pub(crate) type_of_service: u8,
+    pub(crate) v6_only: bool,
+    pub(crate) priority: u32,
+    /// The guest bound its port (`SOCK_BINDPORT_LOCK`).
+    pub(crate) port_locked: bool,
+    /// The memory its unread datagrams take (`sk_rmem_alloc`).
+    pub(crate) received: u32,
+    /// What it dropped (`sk_drops`): a listener's dropped handshakes.
+    pub(crate) drops: u32,
+    pub(crate) receive_buffer: u32,
+    pub(crate) send_buffer: u32,
+}
+const TCP_ESTABLISHED: u8 = 1;
+const TCP_SYN_SENT: u8 = 2;
+const TCP_FIN_WAIT1: u8 = 4;
+const TCP_FIN_WAIT2: u8 = 5;
+const TCP_TIME_WAIT: u8 = 6;
+const TCP_CLOSE: u8 = 7;
+const TCP_CLOSE_WAIT: u8 = 8;
+const TCP_LAST_ACK: u8 = 9;
+const TCP_LISTEN: u8 = 10;
+const IDIAG_TIMER_ON: u8 = 1;
+const IDIAG_TIMER_KEEPALIVE: u8 = 2;
+const IDIAG_TIMER_TIMEWAIT: u8 = 3;
+impl Network {
+    /// What `sock_diag` tells of its TCP and UDP sockets, oldest first, and
+    /// then of the holds in `TIME_WAIT` whose sockets have gone, at `now`
+    /// on the host's monotonic clock.
+    pub(crate) fn diag(&self, now: Option<u64>) -> Vec<Entry> {
+        let sockets: Vec<Arc<InetSocket>> = self
+            .sockets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        // The handshakes whose time has come have been sent again, as
+        // Linux's retransmission timer does on its own.
+        if let Some(socket) = sockets.first() {
+            socket.retry_syns();
+        }
+        let mut entries: Vec<Entry> = sockets.iter().flat_map(|socket| socket.diag(now)).collect();
+        let mut ports = self.ports(false);
+        if let Some(now) = now {
+            ports.expire(now);
+        }
+        entries.extend(ports.waiting().into_iter().map(|wait| Entry {
+            v6: wait.v6,
+            udp: false,
+            state: wait.state,
+            table: Table::Connected,
+            local: wait.local,
+            peer: Some(wait.peer),
+            cookie: wait.cookie,
+            timer: (IDIAG_TIMER_TIMEWAIT, 0, wait.until),
+            queues: (0, 0),
+            full: None,
+        }));
+        entries
+    }
+}
+impl InetSocket {
+    /// What `sock_diag` tells of this socket: nothing while Linux's tables
+    /// would not hold it, as a socket with no port; for one whose
+    /// connection on the loopback has ended both ways, which it ended
+    /// first, a hold in `TIME_WAIT` too, as Linux's `tcp_time_wait` makes
+    /// one while the socket stays, closed.
+    fn diag(&self, now: Option<u64>) -> Vec<Entry> {
+        let options = *self.options();
+        let s = self.lock();
+        let held = self.ports().holds(&self.this);
+        let full = |shutdown: u8, received: usize| Full {
+            uid: self.uid.load(Ordering::SeqCst),
+            inode: if self.embryo.load(Ordering::SeqCst) {
+                0
+            } else {
+                self.inode
+            },
+            shutdown,
+            type_of_service: options.type_of_service as u8,
+            v6_only: options.v6_only,
+            priority: options.priority as u32,
+            port_locked: s.port_locked,
+            received: received as u32,
+            drops: s.listen.as_ref().map_or(0, |listen| listen.drops),
+            receive_buffer: options.receive_buffer as u32,
+            send_buffer: options.send_buffer as u32,
+        };
+        let shutdown = |read: bool, write: bool| u8::from(read) | u8::from(write) << 1;
+        let v6 = self.family == Family::V6;
+        if self.datagram {
+            let Some(local) = s.bound.filter(|_| held) else {
+                return Vec::new();
+            };
+            return vec![Entry {
+                v6,
+                udp: true,
+                state: if s.peer.is_some() {
+                    TCP_ESTABLISHED
+                } else {
+                    TCP_CLOSE
+                },
+                table: Table::Connected,
+                local,
+                peer: s.peer,
+                cookie: self.cookie(),
+                timer: (0, 0, None),
+                queues: (s.inbox_size as u32, 0),
+                full: Some(full(shutdown(s.read_shut, s.write_shut), s.inbox_size)),
+            }];
+        }
+        let unbound = || SocketAddr::new(self.unspecified(), 0);
+        let local = s
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.local())
+            .or(s.bound);
+        let entry = |state: u8, table: Table, shut: u8| Entry {
+            v6,
+            udp: false,
+            state,
+            table,
+            local: local.unwrap_or_else(unbound),
+            peer: None,
+            cookie: self.cookie(),
+            timer: (0, 0, None),
+            queues: (0, 0),
+            full: Some(full(shut, 0)),
+        };
+        if let Some(listen) = &s.listen {
+            return vec![Entry {
+                queues: (listen.ready.len() as u32, listen.backlog as u32),
+                ..entry(TCP_LISTEN, Table::Listening, 0)
+            }];
+        }
+        let Some(stream) = &s.stream else {
+            // Bound, never connected or disconnected.
+            return if held && local.is_some() {
+                vec![entry(TCP_CLOSE, Table::Bound, 0)]
+            } else {
+                Vec::new()
+            };
+        };
+        // `rcv_nxt - copied_seq` and `write_seq - snd_una`: the peer's
+        // FIN counts until a read meets it, and this side's SYN or FIN
+        // until its peer has it.
+        let (unread, unsent) = stream.queued();
+        let peer_ended = stream.readiness().read_closed && stream.phase() == Phase::Open;
+        let unread = unread + usize::from(peer_ended && !s.eof_read);
+        let queues = (unread as u32, unsent as u32);
+        // A closed socket stays in its bind bucket only with the port the
+        // guest bound (`tcp_set_state`'s `inet_put_port`); `tcp_done` has
+        // shut it down both ways.
+        let closed = |entries: &mut Vec<Entry>| {
+            if held && s.port_locked {
+                entries.push(Entry {
+                    queues,
+                    ..entry(TCP_CLOSE, Table::Bound, 3)
+                });
+            }
+        };
+        let mut entries = Vec::new();
+        let state = match stream.phase() {
+            Phase::Connecting => TCP_SYN_SENT,
+            Phase::Failed(_) => {
+                closed(&mut entries);
+                return entries;
+            }
+            Phase::Open => {
+                let ready = stream.readiness();
+                match (ready.write_closed, ready.read_closed) {
+                    (false, false) => TCP_ESTABLISHED,
+                    (false, true) => TCP_CLOSE_WAIT,
+                    (true, false) if unsent > 0 => TCP_FIN_WAIT1,
+                    (true, false) => TCP_FIN_WAIT2,
+                    (true, true) if unsent > 0 => TCP_LAST_ACK,
+                    (true, true) => {
+                        closed(&mut entries);
+                        let released =
+                            Self::joined(&s).and_then(|(link, side)| link.released(side));
+                        if let Some(until) = released
+                            && now.is_none_or(|now| until > now)
+                        {
+                            entries.push(Entry {
+                                state: TCP_TIME_WAIT,
+                                peer: Some(stream.peer()),
+                                timer: (IDIAG_TIMER_TIMEWAIT, 0, Some(until)),
+                                full: None,
+                                ..entry(TCP_TIME_WAIT, Table::Connected, 0)
+                            });
+                        }
+                        return entries;
+                    }
+                }
+            }
+        };
+        // `sk_shutdown`: what the guest shut down, and the peer's end
+        // (`tcp_fin`).
+        let ready = stream.readiness();
+        let shut = shutdown(s.read_shut || ready.read_closed, ready.write_closed);
+        let timer = if state == TCP_SYN_SENT {
+            let syns = self
+                .network
+                .syns
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let syn = syns.iter().find(|syn| {
+                syn.stream
+                    .upgrade()
+                    .is_some_and(|own| Arc::ptr_eq(&own, stream))
+            });
+            syn.map_or((IDIAG_TIMER_ON, 0, None), |syn| {
+                (IDIAG_TIMER_ON, syn.tries as u8, Some(syn.next()))
+            })
+        } else if options.keep_alive {
+            let idle = u64::try_from(options.keep_idle).unwrap_or(0) * 1_000_000_000;
+            (IDIAG_TIMER_KEEPALIVE, 0, now.map(|now| now + idle))
+        } else {
+            (0, 0, None)
+        };
+        let sending = u32::from(matches!(state, TCP_SYN_SENT | TCP_FIN_WAIT1 | TCP_LAST_ACK));
+        entries.push(Entry {
+            peer: Some(stream.peer()),
+            timer,
+            queues: (queues.0, queues.1 + sending),
+            ..entry(state, Table::Connected, shut)
+        });
+        entries
+    }
 }
 
 impl InetSocket {
@@ -2673,6 +2995,7 @@ fn accept(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6], flags: u64) -> 
         }
     };
     child.own(c);
+    child.embryo.store(false, Ordering::SeqCst);
     if flags & u64::from(NONBLOCK) != 0 {
         child.flags.store(2 | NONBLOCK, Ordering::SeqCst);
     }
@@ -2762,6 +3085,12 @@ fn receive(
     Ok(received)
 }
 
+/// The priority a type of service gives (`rt_tos2priority`, `ip_tos2prio`):
+/// best effort, bulk, interactive or interactive bulk, by its TOS bits.
+fn tos_priority(tos: i32) -> i32 {
+    const PRIORITIES: [i32; 8] = [0, 0, 2, 2, 6, 6, 4, 4];
+    PRIORITIES[((tos & 0x1e) >> 2) as usize]
+}
 /// Reads the `int` of a setsockopt (EINVAL for fewer than 4 bytes).
 fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
     if (len as u32 as i32) < 4 {
@@ -2877,7 +3206,13 @@ fn set_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                 (6, 12) => options.quick_ack = value != 0,
                 (6, 18) if value < 0 => return Err(Errno::EINVAL),
                 (6, 18) => options.user_timeout = value,
-                (0, 1) => options.type_of_service = value & 0xfc,
+                // A new type of service sets the priority too
+                // (`__ip_sock_set_tos`, `rt_tos2priority`).
+                (0, 1) if options.type_of_service != value & 0xfc => {
+                    options.type_of_service = value & 0xfc;
+                    options.priority = tos_priority(value);
+                }
+                (0, 1) => {}
                 (41, 26) if socket.family == Family::V6 => {
                     // Linux refuses it once the socket has a local port.
                     let s = socket.lock();
@@ -3279,6 +3614,17 @@ fn build_answer(query: &Query, code: u8, addresses: &[IpAddr], limit: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn types_of_service_give_linuxs_priorities() {
+        // IPTOS_LOWDELAY, IPTOS_THROUGHPUT, IPTOS_RELIABILITY, IPTOS_MINCOST
+        // and both delay and throughput; precedence and ECN bits do not count.
+        let priorities: Vec<i32> = [0x10, 0x08, 0x04, 0x02, 0x18, 0xe3, 0xf0]
+            .into_iter()
+            .map(tos_priority)
+            .collect();
+        assert_eq!(priorities, [6, 2, 0, 0, 4, 0, 6]);
+    }
 
     #[test]
     fn rules_name_hosts_addresses_and_ports() {

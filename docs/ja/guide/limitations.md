@@ -172,14 +172,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
     並びません。そこでは `open`、`stat`、`access`、`getdents`、`unlink`、`rmdir`、`statfs`、
-    キューへの `chmod`、`chown`、`utimensat`、`truncate` が Linux と同じに動きます。そこに
-    名前を作ったり移したりする呼び出し（`mkdir`、`mknod`、`symlink`、`link`、`rename`）と、
-    ルートそのものを変える呼び出しは Linux と同じには動きません。ルートの更新時刻は最初に
-    使ったときから始まります。Linux ではファイルシステムをマウントしたときです。
-  - `SIGEV_THREAD` のクッキーは、ソケットの受信バッファーがいっぱいでも
-    届きます。Linux の `mq_notify` は先に空きを待ちます。Linux はクッキーを登録のときから
-    その `truesize` でバッファーに数えますが、エミュレータの netlink ソケットはそれを
-    持ちません。
+    `mkdir`、`mknod`、`symlink`、`link`、`rename`、`chmod`、`chown`、`utimensat`、`truncate` が
+    Linux と同じに動きます。最初の名前空間のルートの時刻は、そこでキューを作るか消すまでは
+    ホストの起動時刻です。Linux では、起動の途中でカーネルがそれを作った、少しあとの時刻です。
+  - `SIGEV_THREAD` のクッキーは、netlink ソケットの受信バッファーを 960 バイト（CI の
+    ランナーのカーネルでの `truesize`）取りますが、そのソケットのほかのデータグラムは長さの
+    分だけ取ります。Linux はそれらも `truesize` で数えます。また、空きがなくてデータグラムを
+    落としたソケットを、空になるまで混んでいるとはしません（Linux の `NETLINK_S_CONGESTED`）。
+    そのため、待っている `mq_notify` が Linux より早く登録できることがあります。
   - `/proc/sys/fs/mqueue` のファイルは、書ける者を開くときに確かめます。Linux は書き込みの
     たびに書く者を確かめ直します。また、サイズとして値の長さを示します。Linux は 0 です。
   - セットで待っているセマフォーの操作は、1 つの待ち行列で待ち始めた順に試します（0 を
@@ -279,10 +279,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **inotify の一部**：FIFO をパスで開くこと、プログラムの起動（Linux は
   `IN_OPEN`、`IN_ACCESS`、`IN_CLOSE_NOWRITE` を知らせます）、`splice` と `io_uring` の
   読み書きはイベントになりません。ディスクリプタを
-  通した変更（`fchmod`、`ftruncate`、読み書き、閉じること）がファイルのディレクトリのウォッチに届くのは、
-  開いたときのパスがまだそのファイルを指している間と、どの名前からもリンクされなく
-  なった後（そのときの名前で）です。開いた後に名前を変えたファイルや、別のリンクの先に
-  なったファイルは、自分のウォッチにしか知らせません。Linux は名前の変更を追います。インスタンスはシグナル駆動の
+  通した変更（`fchmod`、`ftruncate`、読み書き、閉じること）は、Linux の dentry と同じく
+  ファイル自身や上のディレクトリの名前の変更と、ファイルへの上書きを追います。ただし、
+  開いたときのパスのシンボリックリンクは、名前の変更か削除が最初にそれを見るときに
+  解決します。それまでに変わったリンクでは、イベントはリンクの新しい先に届きます。インスタンスはシグナル駆動の
   入出力に使えず（`FIOASYNC` は `ENOTTY` で、`fcntl` の `O_ASYNC` は付きません）、
   `/proc/self/fdinfo` はウォッチを示さず、`/proc/sys/fs/inotify` はなく、`IN_UNMOUNT` は
   送りません。ゲストが書けないバッファへの読み込みは、イベントを溜めたまま `EFAULT`
@@ -298,12 +298,20 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IFF_UP` のほかのフラグを変えません。最初の名前空間でも `lo` しか見えません。
   Linux ではホストのインターフェースが見えます。
   netlink には `NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC` しかありません
-  （ほかは `EPROTONOSUPPORT`）。ソケット診断が伝えるのは AF_UNIX のソケットだけです。
-  AF_INET と AF_INET6（`ss -t` と `ss -u` が求める `inet_diag`）、AF_NETLINK、AF_PACKET には
-  ハンドラーがなく（`ENOENT`）、`TCPDIAG_GETSOCK` は `EOPNOTSUPP` です。AF_UNIX の
-  ダンプは古いものから順に挙げます。Linux の順はハッシュ表に従います。送って待っている
-  ものは、ここで送信バッファーに数える量で数えます。Linux はバッファーの本当の大きさで
-  数えます。汎用 netlink のファミリーは `nlctrl` だけで、Linux ではホストの
+  （ほかは `EPROTONOSUPPORT`）。ソケット診断が伝えるのは AF_UNIX、TCP、UDP のソケット
+  だけです。AF_NETLINK と AF_PACKET にはハンドラーがなく（`ENOENT`）、Linux がモジュール
+  として読み込む raw ソケット、SCTP、MPTCP のハンドラーもありません。`SOCK_DESTROY` は
+  `EOPNOTSUPP` です。ダンプは古いソケットから順に挙げます。Linux の順はハッシュ表に
+  従います。AF_UNIX のソケットが送って待っているものは、ここで送信バッファーに数える量で
+  数えます。Linux はバッファーの本当の大きさで数えます。TCP のソケットについては
+  `tcp_info`（`ss -i` が求める `INET_DIAG_INFO`）を伝えず、メモリはバッファーのほかを 0 と
+  伝えます。キープアライブのタイマーは今から `TCP_KEEPIDLE` まるごとで終わるとし、再送の
+  時刻と回数があるのはループバックのハンドシェイクだけです。ホストが張った接続には、
+  終わったあとの `TIME_WAIT` がありません。送るバイトがまだ残る閉じたソケットは
+  `FIN_WAIT1` の保持として見えます。Linux ではソケットそのものが残ります。どのソケットの
+  cgroup もルートの 1 で、トラフィッククラスは 0 です。BPF のマップを指すリクエスト
+  （`INET_DIAG_REQ_SK_BPF_STORAGES`）は、ここにはマップの記述子がないので `EINVAL` です。
+  Linux では、開いていない記述子なら `EBADF` です。汎用 netlink のファミリーは `nlctrl` だけで、Linux ではホストの
   カーネルとモジュールのもの（`ethtool`、`nl80211`、`devlink` など）があります。そのため
   それらを引くと `ENOENT` で、それらがグループをいくつ使っても、ソケットのグループは 64 です。
   `NETLINK_ROUTE` にあるのはリンク、アドレス、経路のリクエストだけです。

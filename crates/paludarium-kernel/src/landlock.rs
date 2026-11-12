@@ -527,17 +527,38 @@ pub(crate) fn refer(
     removable: bool,
     flags: u32,
 ) -> Result<(), Errno> {
+    if c.process.credentials.landlock.applicable(FS).is_none() {
+        return Ok(());
+    }
+    let stat = |p: &[u8]| c.files.fs.metadata(p, false).ok();
+    let Some(old_stat) = stat(old) else {
+        return Err(Errno::ENOENT);
+    };
+    let new_stat = stat(new);
+    refer_stated(
+        c,
+        (old, new),
+        (&old_stat, new_stat.as_ref()),
+        removable,
+        flags,
+    )
+}
+
+/// [`refer`] of the files `old` and `new` whose status the caller found:
+/// the new one's is none when it is not there.
+pub(crate) fn refer_stated(
+    c: &Context<'_>,
+    (old, new): (&[u8], &[u8]),
+    (old_stat, new_stat): (&FileStat, Option<&FileStat>),
+    removable: bool,
+    flags: u32,
+) -> Result<(), Errno> {
     const RENAME_EXCHANGE: u32 = 2;
     const RENAME_WHITEOUT: u32 = 4;
     let exchange = flags & RENAME_EXCHANGE != 0;
     let Some(domain) = c.process.credentials.landlock.applicable(FS) else {
         return Ok(());
     };
-    let stat = |p: &[u8]| c.files.fs.metadata(p, false).ok();
-    let Some(old_stat) = stat(old) else {
-        return Err(Errno::ENOENT);
-    };
-    let new_stat = stat(new);
     let mut request1 = 0;
     if exchange {
         let Some(new_stat) = &new_stat else {
@@ -547,8 +568,8 @@ pub(crate) fn refer(
     }
     let mut request2 = make_access(old_stat.mode, old_stat.rdev);
     if removable {
-        request1 |= remove_access(Some(&old_stat));
-        request2 |= remove_access(new_stat.as_ref());
+        request1 |= remove_access(Some(old_stat));
+        request2 |= remove_access(new_stat);
     }
     if flags & RENAME_WHITEOUT != 0 {
         request1 |= make_access(0o020000, 0);
@@ -575,7 +596,7 @@ pub(crate) fn refer(
     let child1 = child_masks(domain, identity(old));
     let child2 = exchange.then(|| child_masks(domain, identity(new)));
     let is_dir = |s: Option<&FileStat>| s.is_some_and(|s| s.mode & 0o170000 == 0o040000);
-    let (dir1, dir2) = (is_dir(Some(&old_stat)), is_dir(new_stat.as_ref()));
+    let (dir1, dir2) = (is_dir(Some(old_stat)), is_dir(new_stat));
     let mut checking_domain = true;
     let mut here = root;
     loop {

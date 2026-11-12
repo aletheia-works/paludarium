@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 mod diag;
 mod generic;
+mod inet_diag;
 
 const AF_NETLINK: u16 = 16;
 const NETLINK_ROUTE: u32 = 0;
@@ -297,6 +298,9 @@ struct Datagram {
     from: u32,
     group: u32,
     bytes: Vec<u8>,
+    /// What it takes of the receive buffer: its length, or a kernel
+    /// buffer's `truesize` charged before it was queued.
+    size: usize,
 }
 
 #[derive(Default)]
@@ -311,6 +315,9 @@ struct State {
     queue: VecDeque<Datagram>,
     /// The bytes waiting in `queue`.
     queued: usize,
+    /// The `truesize` of kernel buffers charged to the receive buffer and
+    /// not yet queued: `SIGEV_THREAD` cookies of POSIX message queues.
+    charged: usize,
     /// A dump's `NLMSG_DONE`, which the next receive queues (Linux's
     /// `cb_running`).
     done: Option<Vec<u8>>,
@@ -344,6 +351,9 @@ pub(crate) struct NetlinkSocket {
     /// Whether whoever made it had that capability (the socket file's
     /// credentials, which Linux's `netlink_ns_capable` asks as well).
     opener_admin: bool,
+    /// Whether whoever made it had `CAP_BPF` or `CAP_SYS_ADMIN` over the
+    /// machine (`bpf_capable`), which a `write` asks.
+    opener_bpf: bool,
     /// The process ID of whoever made it, which a `write` that binds it
     /// takes, and its user ID, which a route lookup a `write` sends names.
     opener_pid: u32,
@@ -353,6 +363,8 @@ pub(crate) struct NetlinkSocket {
     /// network namespace, which it lists.
     opener_user: crate::users::UserNs,
     unix: Arc<crate::unix::Names>,
+    /// The host, whose clock times the sockets `sock_diag` tells of.
+    host: Arc<dyn paludarium_host::Host>,
     hub: Arc<ReadinessHub>,
     flags: AtomicU32,
     inode: u64,
@@ -369,7 +381,14 @@ pub(crate) struct NetlinkSocket {
 struct Sender {
     pid: u32,
     admin: bool,
+    /// `CAP_BPF` or `CAP_SYS_ADMIN` over the machine (`bpf_capable`).
+    bpf: bool,
     uid: u32,
+}
+const CAP_BPF: u64 = 1 << 39;
+/// `bpf_capable`.
+fn bpf_capable(credentials: &crate::credentials::Credentials) -> bool {
+    credentials.capable(CAP_BPF) || credentials.capable(crate::credentials::CAP_SYS_ADMIN)
 }
 
 /// `socket(AF_NETLINK, type, protocol)`, as Linux's `netlink_create`:
@@ -402,10 +421,12 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         network,
         namespace,
         opener_admin,
+        opener_bpf: bpf_capable(credentials),
         opener_pid: c.pid_space().number(c.process.pid),
         opener_uid: c.shown_uid(credentials.uid),
         opener_user: credentials.user.clone(),
         unix: c.unix_names(),
+        host: Arc::clone(c.shared_host),
         hub: Arc::clone(&c.files.readiness),
         flags: AtomicU32::new(2 | (kind & NONBLOCK)),
         inode: crate::files::anonymous_inode(),
@@ -471,6 +492,7 @@ impl NetlinkSocket {
                 && c.process
                     .credentials
                     .capable_in(CAP_NET_ADMIN, self.namespace.owner()),
+            bpf: bpf_capable(&c.process.credentials),
             uid: c.shown_uid(c.process.credentials.uid),
         }
     }
@@ -509,25 +531,53 @@ impl NetlinkSocket {
     /// finds the receive buffer full is dropped, with `ENOBUFS` for the
     /// next receive (`netlink_overrun`).
     fn deliver(&self, s: &mut State, from: u32, group: u32, bytes: Vec<u8>) {
-        if s.queued >= usize::try_from(s.receive_buffer).unwrap_or(0) {
+        if s.queued + s.charged >= usize::try_from(s.receive_buffer).unwrap_or(0) {
             s.error = Some(ENOBUFS);
         } else {
-            s.queued += bytes.len();
-            s.queue.push_back(Datagram { from, group, bytes });
+            let size = bytes.len();
+            s.queued += size;
+            s.queue.push_back(Datagram {
+                from,
+                group,
+                bytes,
+                size,
+            });
         }
         s.arrivals += 1;
         self.hub.changed();
     }
-    /// Queues `bytes` from the kernel, past the receive buffer too, as
-    /// `netlink_sendskb` does with a POSIX message queue's `SIGEV_THREAD`
-    /// cookie ([`crate::mqueue`]).
-    pub(crate) fn attach(&self, bytes: Vec<u8>) {
+    /// Charges a kernel buffer of `truesize` bytes held for a later send to
+    /// the receive buffer, as `netlink_attachskb` does when the socket holds
+    /// nothing or has room for it, and says whether it did; a caller that
+    /// may wait waits until a receive makes room, and tries again.
+    pub(crate) fn charge(&self, truesize: usize) -> bool {
         let mut s = self.lock();
-        s.queued += bytes.len();
+        let held = s.queued + s.charged + truesize;
+        if held == truesize || held <= usize::try_from(s.receive_buffer).unwrap_or(0) {
+            s.charged += truesize;
+            true
+        } else {
+            false
+        }
+    }
+    /// Gives back a charge that will not be sent (`netlink_detachskb`).
+    pub(crate) fn uncharge(&self, truesize: usize) {
+        let mut s = self.lock();
+        s.charged = s.charged.saturating_sub(truesize);
+        self.hub.changed();
+    }
+    /// Queues `bytes` from the kernel, charged before for `truesize`
+    /// ([`Self::charge`]), as `netlink_sendskb` does with a POSIX message
+    /// queue's `SIGEV_THREAD` cookie ([`crate::mqueue`]).
+    pub(crate) fn attach(&self, bytes: Vec<u8>, truesize: usize) {
+        let mut s = self.lock();
+        s.charged = s.charged.saturating_sub(truesize);
+        s.queued += truesize;
         s.queue.push_back(Datagram {
             from: 0,
             group: 0,
             bytes,
+            size: truesize,
         });
         s.arrivals += 1;
         self.hub.changed();
@@ -654,7 +704,7 @@ impl NetlinkSocket {
                 let mut told = Vec::new();
                 let result = match self.protocol {
                     NETLINK_GENERIC => self.generic(s, &header, &message[16..], port),
-                    NETLINK_SOCK_DIAG => self.diag(s, &header, &message[16..], port),
+                    NETLINK_SOCK_DIAG => self.diag(s, &header, &message[16..], port, sender),
                     _ => self.route(s, &header, &message[16..], port, sender, &mut told),
                 };
                 // This socket hears of what it changed as it happens, before
@@ -889,8 +939,12 @@ impl NetlinkSocket {
         buf[..n].copy_from_slice(&first.bytes[..n]);
         let got = (n, first.bytes.len(), first.from, first.group);
         if !peek {
+            let size = first.size;
             s.queue.pop_front();
-            s.queued -= got.1;
+            s.queued -= size;
+            // A `mq_notify` waiting for room looks again
+            // (`netlink_rcv_wake`).
+            self.hub.changed();
         }
         s.longest_read = s.longest_read.max(buf.len()).min(MOST_DUMP_PART);
         if s.queued <= usize::try_from(s.receive_buffer / 2).unwrap_or(0) {
@@ -955,6 +1009,7 @@ impl FileHandle for NetlinkSocket {
         let sender = Sender {
             pid: self.opener_pid,
             admin: self.opener_admin,
+            bpf: self.opener_bpf,
             uid: self.opener_uid,
         };
         self.send(buf, None, sender)
@@ -1061,6 +1116,14 @@ fn attribute(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(value);
     out.resize(align(out.len()), 0);
+}
+/// The types of the attributes of `bytes`, for tests.
+#[cfg(test)]
+pub(crate) fn attribute_kinds(bytes: &[u8]) -> Vec<u16> {
+    attributes(bytes)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect()
 }
 /// The attributes of `bytes`, as `nla_parse_deprecated` takes them: it
 /// stops at one too short or too long, and the type drops

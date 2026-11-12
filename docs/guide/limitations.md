@@ -197,16 +197,17 @@ verified.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
     `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,
-    `access`, `getdents`, `unlink`, `rmdir`, `statfs`, and `chmod`,
-    `chown`, `utimensat` and `truncate` of a queue work as on Linux; the
-    calls that make or move a name there (`mkdir`, `mknod`, `symlink`,
-    `link`, `rename`) and those that change the root itself do not do what
-    Linux's would. The root's modification time starts when it is first
-    used, where Linux's is when the filesystem was mounted.
-  - A `SIGEV_THREAD` cookie goes to its socket even when the socket's
-    receive buffer is full, where Linux's `mq_notify` first waits for room:
-    Linux counts the cookie against that buffer from the registration on,
-    by its `truesize`, which the emulator's netlink sockets do not keep.
+    `access`, `getdents`, `unlink`, `rmdir`, `statfs`, `mkdir`, `mknod`,
+    `symlink`, `link`, `rename`, `chmod`, `chown`, `utimensat` and
+    `truncate` work as on Linux. The first namespace's root has the host's
+    boot time until a queue is made or unlinked there, where Linux's is
+    when the kernel made it as it booted, a little later.
+  - A `SIGEV_THREAD` cookie takes 960 bytes of its netlink socket's
+    receive buffer, its `truesize` on the CI runner's kernel, while the
+    socket's other datagrams take their length, where Linux counts their
+    `truesize` too; and a socket that dropped a datagram for want of room
+    is not held congested until it is emptied, as Linux's is
+    (`NETLINK_S_CONGESTED`), so a waiting `mq_notify` may register sooner.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.
@@ -316,11 +317,11 @@ verified.
 - **inotify, in part**: opening a FIFO by its path, running a program
   (which Linux reports as `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE`),
   `splice` and `io_uring`'s reads and writes are no events. A change through a
-  descriptor (`fchmod`, `ftruncate`, a read, a write or a close) reaches the
-  watch of the file's directory while the path it was opened at still names
-  it, and by that name once no name links the file; a file renamed or reached
-  through another link after it was opened is heard of by its own watches
-  only, where Linux follows the rename.
+  descriptor (`fchmod`, `ftruncate`, a read, a write or a close) follows
+  renames of the file, of the directories above it and onto it, as Linux's
+  dentry does, but the symbolic links of the path it was opened at are
+  resolved only when a rename or a removal first looks at it: a link changed
+  before then sends its events to where the link leads.
   An instance cannot be used for signal-driven I/O (`FIOASYNC` gives
   `ENOTTY`, and `fcntl` leaves `O_ASYNC` off), its `/proc/self/fdinfo` entry
   does not list its watches, `/proc/sys/fs/inotify` does not exist, and
@@ -339,13 +340,22 @@ verified.
   than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`,
   `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC` (`EPROTONOSUPPORT` for the
-  rest). Socket diagnostics tell only of AF_UNIX sockets: AF_INET and
-  AF_INET6 (`inet_diag`, as `ss -t` and `ss -u` ask), AF_NETLINK and
-  AF_PACKET have no handler (`ENOENT`), and `TCPDIAG_GETSOCK` is
-  `EOPNOTSUPP`. A dump of AF_UNIX sockets lists them oldest first, where
-  Linux's order follows its hash table, and what a socket sent that waits
-  is counted as its send buffer is charged here, where Linux counts its
-  buffers' true sizes. Generic netlink has no family but `nlctrl`, where
+  rest). Socket diagnostics tell only of AF_UNIX, TCP and UDP sockets:
+  AF_NETLINK and AF_PACKET have no handler (`ENOENT`), nor have raw
+  sockets, SCTP and MPTCP, whose handlers Linux loads as modules, and
+  `SOCK_DESTROY` is `EOPNOTSUPP`. A dump lists the sockets oldest first,
+  where Linux's order follows its hash tables, and what an AF_UNIX socket
+  sent that waits is counted as its send buffer is charged here, where
+  Linux counts its buffers' true sizes. Of a TCP socket they tell no
+  `tcp_info` (`INET_DIAG_INFO`, as `ss -i` asks), and its memory but for
+  its buffers as 0; its keepalive timer ends a whole `TCP_KEEPIDLE` from
+  now, and only a handshake on the loopback has its retransmission's
+  time and count. A connection the host made has no `TIME_WAIT` after
+  it, and a closed socket whose bytes still wait to go shows as a hold in
+  `FIN_WAIT1`, where Linux keeps the socket itself. Every socket's cgroup
+  is the root, 1, and its traffic class 0. A request that names a BPF
+  map (`INET_DIAG_REQ_SK_BPF_STORAGES`) is `EINVAL`, as no descriptor
+  here is one, where Linux's is `EBADF` for one that is not open. Generic netlink has no family but `nlctrl`, where
   Linux has those of the host's kernel and modules (`ethtool`,
   `nl80211`, `devlink` and others), so a lookup of one is `ENOENT` and a
   socket has 64 groups however many those take. Of `NETLINK_ROUTE` there

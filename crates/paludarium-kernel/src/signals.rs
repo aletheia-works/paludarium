@@ -302,7 +302,8 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         // blocking socket calls with sendmmsg and recvmmsg (a wait that
         // SO_RCVTIMEO or SO_SNDTIMEO limits gives EINTR instead, and clears
         // the restart itself), msgsnd, msgrcv, mq_timedsend,
-        // mq_timedreceive, sendfile (whose pipe or socket output waits for
+        // mq_timedreceive, mq_notify (whose SIGEV_THREAD socket waits for
+        // room), sendfile (whose pipe or socket output waits for
         // room, ERESTARTSYS as splice's wait_for_space), splice, tee and
         // vmsplice.
         0
@@ -327,6 +328,7 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         | 70
         | 242
         | 243
+        | 244
         | 275
         | 276
         | 278 => true,

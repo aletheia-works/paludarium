@@ -1112,6 +1112,41 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let follow = flags & AT_SYMLINK_FOLLOW != 0;
     let old_raw = path(c, old_ptr)?;
+    if !(old_raw.is_empty() && flags & AT_EMPTY_PATH != 0) {
+        let new_raw = path(c, new_ptr)?;
+        let old_name = queue_name(&c.files.path(old_dir, old_raw.clone())?);
+        let new_name = queue_name(&c.files.path(new_dir, new_raw.clone())?);
+        if old_name.is_some() || new_name.is_some() {
+            return link_queue(
+                c,
+                (old_dir, old_raw, follow),
+                (new_dir, &new_raw),
+                (old_name, new_name),
+            );
+        }
+    }
+    // A queue's descriptor is on its `mqueue` mount: `/dev/mqueue` for one
+    // opened there, whose root has no `link`, else one mounted nowhere.
+    if old_raw.is_empty() && flags & AT_EMPTY_PATH != 0 && old_dir as i32 != -100 {
+        let d = c.files.descriptor(old_dir)?;
+        if crate::mqueue::is_queue(&*d.file) {
+            let new_raw = path(c, new_ptr)?;
+            let new = c.files.path(new_dir, new_raw.clone())?;
+            let name = queue_name(&new);
+            match &name {
+                Some(name) if crate::mqueue::mounted_there(c, name)? => {
+                    return Err(Errno::EEXIST);
+                }
+                Some(_) => {}
+                None => new_name_free(c, new_dir, &new_raw, &new)?,
+            }
+            if name.is_none() || queue_name(&d.path).is_none() {
+                return Err(EXDEV);
+            }
+            crate::mqueue::may_change_root(c)?;
+            return Err(Errno::EPERM);
+        }
+    }
     let target = if old_raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if old_dir as i32 == -100 {
             Followed::Path {
@@ -2345,13 +2380,14 @@ pub(crate) fn pause_for_lock(c: &mut Context<'_>) -> Result<(), Errno> {
         c.cancellation,
     )?;
     let receipt = c.inbox.drain(c.process);
-    c.group.drain_process(c.process);
+    let sent = c.group.drain_process(c.process);
     if c.group.status().is_some()
         || crate::signals::next_pending(c.process, true).is_some()
         || receipt.interrupted
         || (outcome == paludarium_host::WaitOutcome::Interrupted
             && !receipt.timer_changed
             && !receipt.signals
+            && !sent
             && c.group.timer_generation() == timer_generation)
     {
         return Err(Errno(4));
@@ -2567,14 +2603,14 @@ fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
     let Ok(d) = c.files.descriptor(fd) else {
         return;
     };
-    if d.path.is_empty() || d.file.flags() & O_PATH != 0 {
+    if d.path.is_empty() || d.file.flags() & O_PATH != 0 || d.file.notify_event(mask) {
         return;
     }
     let Ok(stat) = d.file.stat() else {
         return;
     };
     c.files.caches.notify.file_event(
-        Some((&*c.files.fs, &d.path)),
+        Some((&*c.files.fs, &d.path, false)),
         descriptor_device(c, &d),
         &stat,
         mask,
@@ -3016,6 +3052,10 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             };
             let old = c.files.path(old_dir, old_raw.clone())?;
             let new = c.files.path(new_dir, new_raw.clone())?;
+            let names = (queue_name(&old), queue_name(&new));
+            if names.0.is_some() || names.1.is_some() {
+                return rename_queue(c, (&old, &new), names, flags);
+            }
             crate::permissions::rename(
                 c.files,
                 &c.process.credentials,
@@ -3083,6 +3123,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 (a[0], path(c, a[1])?, a[2])
             };
             let p = c.files.path(dir, raw.clone())?;
+            if queue_root(&p) {
+                return Err(Errno::EEXIST);
+            }
+            if let Some(name) = queue_name(&p) {
+                return crate::mqueue::make_mounted(c, &name, None, || {
+                    landlock_name(c, &p, crate::landlock::MAKE_DIR)
+                });
+            }
             let created = crate::permissions::create(c.files, &c.process.credentials, dir, &raw)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
                 landlock_name(c, &p, crate::landlock::MAKE_DIR)?;
@@ -3147,6 +3195,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 (a[1], path(c, a[2])?)
             };
             let p = c.files.path(dir, raw.clone())?;
+            if queue_root(&p) {
+                return Err(Errno::EEXIST);
+            }
+            if let Some(name) = queue_name(&p) {
+                return crate::mqueue::make_mounted(c, &name, None, || {
+                    landlock_name(c, &p, crate::landlock::MAKE_SYM)
+                });
+            }
             let created = crate::permissions::create(c.files, &c.process.credentials, dir, &raw)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
                 landlock_name(c, &p, crate::landlock::MAKE_SYM)?;
@@ -4464,10 +4520,7 @@ fn open_path(
                 Arc::new(crate::proc::OwnDirectory::new(crate::pty::directory_stat()))
             }
             crate::devices::Entry::Slave(None) => return Err(Errno::ENOENT),
-            crate::devices::Entry::Mqueue if flags & 3 != 0 => return Err(Errno::EISDIR),
-            crate::devices::Entry::Mqueue => Arc::new(crate::proc::OwnDirectory::new(
-                crate::mqueue::mounted_root_stat(c),
-            )),
+            crate::devices::Entry::Mqueue => crate::mqueue::MountedRoot::open(c, flags)?,
             crate::devices::Entry::Queue => {
                 let name = crate::mqueue::mounted_name(p).ok_or(Errno::ENOENT)?;
                 crate::mqueue::open_mounted(c, name, flags, mode)?
@@ -4712,6 +4765,10 @@ fn reopen(
         0o010000 if d.path.is_empty() => Ok((d.file.reopen(flags)?, Vec::new())),
         // A pidfd: another description of the same process.
         _ if d.path.is_empty() && is_pidfd => Ok((d.file.reopen(flags)?, Vec::new())),
+        // A queue `mq_open` gave: its inode, opened again.
+        _ if crate::mqueue::is_queue(&*d.file) => {
+            Ok((crate::mqueue::reopened(c, &d.file, flags)?, d.path.clone()))
+        }
         _ if d.path.is_empty() => Err(ENXIO),
         _ if generated(&d.path) => open_path(c, &d.path.clone(), flags, mode),
         _ => match current_path(c.files, &d, stat.inode) {
@@ -5082,6 +5139,129 @@ pub(crate) fn exec_program(
 fn followed(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, Errno> {
     through_descriptor(c.files, c.process.pid, p, follow)
 }
+/// The queue's name a path in `/dev/mqueue` gives, where the `mqueue`
+/// filesystem is mounted ([`crate::mqueue::mounted_name`]).
+fn queue_name(p: &[u8]) -> Option<Vec<u8>> {
+    paludarium_vfs::normalize_path(p)
+        .ok()
+        .and_then(|p| crate::mqueue::mounted_name(&p).map(<[u8]>::to_vec))
+}
+/// Whether `p` names `/dev/mqueue` itself, the `mqueue` root, which a new
+/// name there finds in use (`EEXIST`).
+fn queue_root(p: &[u8]) -> bool {
+    paludarium_vfs::normalize_path(p).is_ok_and(|p| p == b"/dev/mqueue")
+}
+/// The check `filename_parentat` makes of the directory a path's last name
+/// is in: it is there (`ENOENT`) and a directory (`ENOTDIR`).
+fn parent_there(c: &Context<'_>, p: &[u8]) -> Result<(), Errno> {
+    let at = p.iter().rposition(|&b| b == b'/').unwrap_or(0);
+    let parent = if at == 0 { b"/".as_slice() } else { &p[..at] };
+    if c.files.fs.metadata(parent, true)?.mode & 0o170000 != 0o040000 {
+        return Err(Errno::ENOTDIR);
+    }
+    Ok(())
+}
+/// `link` with a name in `/dev/mqueue`, the `mqueue` filesystem, as
+/// `do_linkat` checks it: the old name is there (`ENOENT`), the new one is
+/// not (`EEXIST`), both are on one mount (`EXDEV`), and the `mqueue` root
+/// has no `link` (`EPERM`).
+fn link_queue(
+    c: &Context<'_>,
+    (old_dir, old_raw, follow): (u64, Vec<u8>, bool),
+    (new_dir, new_raw): (u64, &[u8]),
+    (old_name, new_name): (Option<Vec<u8>>, Option<Vec<u8>>),
+) -> Result<u64, Errno> {
+    match &old_name {
+        Some(name) => {
+            if !crate::mqueue::mounted_there(c, name)? {
+                return Err(Errno::ENOENT);
+            }
+        }
+        None => {
+            let (old, _) = lookup(c, old_dir, old_raw, follow)?;
+            if generated_stat(c, &old, follow)?.is_none() {
+                c.files.fs.metadata(&old, follow)?;
+            }
+        }
+    }
+    let new = c.files.path(new_dir, new_raw.to_vec())?;
+    match &new_name {
+        Some(name) => {
+            if crate::mqueue::mounted_there(c, name)? {
+                return Err(Errno::EEXIST);
+            }
+        }
+        None => new_name_free(c, new_dir, new_raw, &new)?,
+    }
+    let (Some(old_name), Some(new_name)) = (old_name, new_name) else {
+        return Err(EXDEV);
+    };
+    // Landlock's check (`hook_path_link`) within the root.
+    let old_stat = crate::mqueue::mounted_stat(c, &old_name)?;
+    crate::landlock::refer_stated(
+        c,
+        (&queue_path(&old_name), &queue_path(&new_name)),
+        (&old_stat, None),
+        false,
+        0,
+    )?;
+    // `vfs_link`'s `may_create` before the root's missing `link`.
+    crate::mqueue::may_change_root(c)?;
+    Err(Errno::EPERM)
+}
+/// The path of the queue `name` in `/dev/mqueue`.
+fn queue_path(name: &[u8]) -> Vec<u8> {
+    [b"/dev/mqueue/".as_slice(), name].concat()
+}
+/// `rename` with a name in `/dev/mqueue`, as `do_renameat2` checks it:
+/// both directories are there, on one mount (`EXDEV`, before the names are
+/// looked up), the old name is there (`ENOENT`), the new one too with
+/// `RENAME_EXCHANGE` (`ENOENT`) and not with `RENAME_NOREPLACE`
+/// (`EEXIST`); a name onto itself does nothing, and the `mqueue` root has
+/// no `rename` (`EPERM`).
+fn rename_queue(
+    c: &Context<'_>,
+    (old, new): (&[u8], &[u8]),
+    (old_name, new_name): (Option<Vec<u8>>, Option<Vec<u8>>),
+    flags: u32,
+) -> Result<u64, Errno> {
+    for (p, name) in [(old, &old_name), (new, &new_name)] {
+        if name.is_none() {
+            parent_there(c, p)?;
+        }
+    }
+    let (Some(old_name), Some(new_name)) = (old_name, new_name) else {
+        return Err(EXDEV);
+    };
+    if !crate::mqueue::mounted_there(c, &old_name)? {
+        return Err(Errno::ENOENT);
+    }
+    let there = crate::mqueue::mounted_there(c, &new_name)?;
+    if flags & 2 != 0 && !there {
+        return Err(Errno::ENOENT);
+    }
+    if flags & 1 != 0 && there {
+        return Err(Errno::EEXIST);
+    }
+    // Landlock's check (`hook_path_rename`) within the root.
+    let old_stat = crate::mqueue::mounted_stat(c, &old_name)?;
+    let new_stat = crate::mqueue::mounted_stat(c, &new_name).ok();
+    crate::landlock::refer_stated(
+        c,
+        (&queue_path(&old_name), &queue_path(&new_name)),
+        (&old_stat, new_stat.as_ref()),
+        true,
+        flags,
+    )?;
+    if old_name == new_name {
+        return Ok(0);
+    }
+    // `vfs_rename`'s `may_delete` and `may_create` (or `may_delete` of a
+    // name there), whose sticky check also refuses with `EPERM`, before the
+    // root's missing `rename`.
+    crate::mqueue::may_change_root(c)?;
+    Err(Errno::EPERM)
+}
 /// What a call that changes the file path `p` names reaches ([`followed`]),
 /// or the file of the queue a path in `/dev/mqueue` names, which no
 /// filesystem here holds ([`crate::mqueue::mounted_file`]).
@@ -5089,10 +5269,17 @@ fn reached(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, 
     if let Some(target) = followed(c, p, follow)? {
         return Ok(Some(target));
     }
-    let Some(name) = paludarium_vfs::normalize_path(p)
-        .ok()
-        .and_then(|p| crate::mqueue::mounted_name(&p).map(<[u8]>::to_vec))
-    else {
+    if queue_root(p) {
+        return Ok(Some(Followed::File(Descriptor {
+            file: Arc::new(crate::mqueue::MountedRoot::new(c)),
+            path: b"/dev/mqueue".to_vec(),
+            cloexec: false,
+            opened: true,
+            listed: Arc::default(),
+            landlock: crate::landlock::FS,
+        })));
+    }
+    let Some(name) = queue_name(p) else {
         return Ok(None);
     };
     let file = crate::mqueue::mounted_file(c, &name)?;
@@ -5468,6 +5655,26 @@ fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
 fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Result<(), Errno> {
     const S_IFMT: u32 = 0o170000;
     let kind = mode & S_IFMT;
+    // A name in `/dev/mqueue` is the `mqueue` filesystem's, which makes a
+    // queue for a regular file and nothing else.
+    if matches!(
+        kind,
+        0 | 0o100000 | 0o010000 | 0o140000 | 0o020000 | 0o060000
+    ) {
+        let p = c.files.path(dir, raw.to_vec())?;
+        if queue_root(&p) {
+            return Err(Errno::EEXIST);
+        }
+        if let Some(name) = queue_name(&p) {
+            let device = matches!(kind, 0o020000 | 0o060000);
+            let regular = matches!(kind, 0 | 0o100000).then_some(mode);
+            return crate::mqueue::make_mounted(c, &name, regular, || {
+                let dev = if device { u64::from(dev) } else { 0 };
+                landlock_name(c, &p, crate::landlock::make_access(kind, dev))
+            })
+            .map(|_| ());
+        }
+    }
     match kind {
         0 | 0o100000 | 0o010000 | 0o140000 => {}
         0o020000 | 0o060000 => {

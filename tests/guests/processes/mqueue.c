@@ -25,11 +25,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -1301,6 +1303,257 @@ static void show_statfs(const char *label, long result, const struct statfs *s) 
 }
 #define ATTRS_NAME DEV_NAME "-attrs"
 #define ATTRS_PATH "/dev/mqueue/" ATTRS_NAME
+#define DEV_PATH(suffix) "/dev/mqueue/" DEV_NAME suffix
+/* Making and moving names in /dev/mqueue, whose root has only the
+   operations to look up, make (a queue) and unlink: mkdir, symlink and
+   mknod of anything but a regular file are EPERM once the name is free,
+   mknod of a regular file makes a queue, and link and rename are EXDEV
+   to or from another mount and EPERM within it. ATTRS_PATH is a queue. */
+static int dev_names(void) {
+    const char *made[] = {"-dir", "-sym", "-fifo", "-chr", "-node", "-zero", "-link", "-moved", "-in", "-fresh"};
+    for (unsigned i = 0; i < sizeof made / sizeof *made; i++) {
+        char name[128];
+        snprintf(name, sizeof name, DEV_NAME "%s", made[i]);
+        q_unlink(name);
+    }
+    printf("make:");
+    put("mkdir", TRY(mkdir(DEV_PATH("-dir"), 0700)));
+    put("mkdir-there", TRY(mkdir(ATTRS_PATH, 0700)));
+    put("mkdir-root", TRY(mkdir("/dev/mqueue", 0700)));
+    put("symlink-root", TRY(symlink("target", "/dev/mqueue")));
+    put("mknod-root", TRY(mknod("/dev/mqueue", S_IFREG | 0600, 0)));
+    put("symlink", TRY(symlink("target", DEV_PATH("-sym"))));
+    put("symlink-there", TRY(symlink("target", ATTRS_PATH)));
+    put("fifo", TRY(mknod(DEV_PATH("-fifo"), S_IFIFO | 0600, 0)));
+    put("chr", TRY(mknod(DEV_PATH("-chr"), S_IFCHR | 0600, makedev(1, 3))));
+    put("dir", TRY(mknod(DEV_PATH("-dir"), S_IFDIR | 0700, 0)));
+    put("bad-type", TRY(mknod(DEV_PATH("-dir"), 0170000 | 0700, 0)));
+    put("fifo-there", TRY(mknod(ATTRS_PATH, S_IFIFO | 0600, 0)));
+    put("listed", listed_type(DEV_NAME "-dir") + listed_type(DEV_NAME "-sym") + listed_type(DEV_NAME "-fifo") +
+                      listed_type(DEV_NAME "-chr"));
+    say("");
+    mode_t mask = umask(027);
+    printf("mknod:");
+    put("regular", TRY(mknod(DEV_PATH("-node"), S_IFREG | 0666, 0)));
+    put("type", listed_type(DEV_NAME "-node"));
+    struct stat st = {0};
+    put("stat", TRY(stat(DEV_PATH("-node"), &st)));
+    printf(" mode=%o", st.st_mode);
+    put("zero-type", TRY(mknod(DEV_PATH("-zero"), 0600, 0)));
+    put("again", TRY(mknod(DEV_PATH("-node"), S_IFREG | 0600, 0)));
+    say("");
+    umask(mask);
+    long node = q_open(DEV_NAME "-node", O_RDONLY, 0, NULL);
+    show_attr("node", node);
+    close((int)node);
+
+    char dir[] = "/tmp/mqueue-dev-XXXXXX";
+    if (!mkdtemp(dir)) return 1;
+    char file[64], other[64], none[64];
+    snprintf(file, sizeof file, "%s/file", dir);
+    snprintf(other, sizeof other, "%s/other", dir);
+    snprintf(none, sizeof none, "%s/none/x", dir);
+    int fd = open(file, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return 2;
+    close(fd);
+    printf("link:");
+    put("inside", TRY(link(ATTRS_PATH, DEV_PATH("-link"))));
+    put("onto", TRY(link(ATTRS_PATH, DEV_PATH("-node"))));
+    put("missing", TRY(link(DEV_PATH("-none"), DEV_PATH("-link"))));
+    put("follow", TRY(linkat(AT_FDCWD, ATTRS_PATH, AT_FDCWD, DEV_PATH("-link"), AT_SYMLINK_FOLLOW)));
+    put("out", TRY(link(ATTRS_PATH, other)));
+    put("out-onto", TRY(link(ATTRS_PATH, file)));
+    put("in", TRY(link(file, DEV_PATH("-in"))));
+    put("in-missing", TRY(link(other, DEV_PATH("-in"))));
+    put("in-onto", TRY(link(file, ATTRS_PATH)));
+    long by_name = q_open(ATTRS_NAME, O_RDONLY, 0, NULL);
+    long by_path = TRY(open(ATTRS_PATH, O_RDONLY | O_CLOEXEC));
+    put("empty-mq_open", TRY(linkat((int)by_name, "", AT_FDCWD, DEV_PATH("-link"), AT_EMPTY_PATH)));
+    put("empty-opened", TRY(linkat((int)by_path, "", AT_FDCWD, DEV_PATH("-link"), AT_EMPTY_PATH)));
+    put("empty-onto", TRY(linkat((int)by_path, "", AT_FDCWD, DEV_PATH("-node"), AT_EMPTY_PATH)));
+    close((int)by_name);
+    close((int)by_path);
+    put("listed", listed_type(DEV_NAME "-link") + listed_type(DEV_NAME "-in"));
+    say("");
+    printf("rename:");
+    put("inside", TRY(rename(ATTRS_PATH, DEV_PATH("-moved"))));
+    put("onto", TRY(rename(ATTRS_PATH, DEV_PATH("-node"))));
+    put("itself", TRY(rename(ATTRS_PATH, ATTRS_PATH)));
+    put("missing", TRY(rename(DEV_PATH("-none"), DEV_PATH("-moved"))));
+    put("noreplace", TRY(syscall(SYS_renameat2, AT_FDCWD, ATTRS_PATH, AT_FDCWD, DEV_PATH("-node"), 1)));
+    put("noreplace-itself", TRY(syscall(SYS_renameat2, AT_FDCWD, ATTRS_PATH, AT_FDCWD, ATTRS_PATH, 1)));
+    put("exchange-missing", TRY(syscall(SYS_renameat2, AT_FDCWD, ATTRS_PATH, AT_FDCWD, DEV_PATH("-none"), 2)));
+    put("exchange", TRY(syscall(SYS_renameat2, AT_FDCWD, ATTRS_PATH, AT_FDCWD, DEV_PATH("-node"), 2)));
+    put("out", TRY(rename(ATTRS_PATH, other)));
+    put("out-missing", TRY(rename(DEV_PATH("-none"), other)));
+    put("in", TRY(rename(file, DEV_PATH("-in"))));
+    put("in-no-directory", TRY(rename(none, DEV_PATH("-in"))));
+    put("listed", listed_type(DEV_NAME "-moved") + listed_type(DEV_NAME "-in"));
+    put("kept", listed_type(ATTRS_NAME));
+    say("");
+    /* Under a Landlock domain that handles making and removing regular
+       files and allows them nowhere, Landlock refuses a link, a rename
+       (onto itself too), a mknod and an unlink within the root (EACCES)
+       before the root's own EPERM; a link out of it is EXDEV first. */
+    pid_t pid = child();
+    if (pid == 0) {
+        unsigned long long handled = (1ULL << 8) | (1ULL << 5);
+        long ruleset = syscall(444, &handled, sizeof handled, 0);
+        if (ruleset < 0) _exit(90);
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || syscall(446, ruleset, 0)) _exit(91);
+        printf("landlock:");
+        put("link", TRY(link(ATTRS_PATH, DEV_PATH("-link"))));
+        put("rename", TRY(rename(ATTRS_PATH, DEV_PATH("-moved"))));
+        put("rename-itself", TRY(rename(ATTRS_PATH, ATTRS_PATH)));
+        put("link-out", TRY(link(ATTRS_PATH, other)));
+        put("mkdir", TRY(mkdir(DEV_PATH("-dir"), 0700)));
+        put("mknod", TRY(mknod(DEV_PATH("-fresh"), S_IFREG | 0600, 0)));
+        put("unlink", TRY(unlink(DEV_PATH("-node"))));
+        say("");
+        _exit(0);
+    }
+    say("landlock: status=%d", wait_child(pid));
+    unlink(file);
+    rmdir(dir);
+    q_unlink(DEV_NAME "-node");
+    q_unlink(DEV_NAME "-zero");
+    return 0;
+}
+
+/* What an unprivileged user (2000) may do in /dev/mqueue, which it may
+   search, read and write as the root's mode says. */
+static void as_user(const char *label) {
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unprivileged()) _exit(90);
+        printf("%s:", label);
+        struct stat st;
+        put("stat", TRY(stat(DEV_PATH("-root"), &st)));
+        long d = TRY(open("/dev/mqueue", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        put("open-dir", d < 0 ? d : 0);
+        long q = q_open(DEV_NAME "-root", O_RDONLY, 0, NULL);
+        put("mq_open", q < 0 ? q : 0);
+        long made = q_open(DEV_NAME "-theirs", O_RDWR | O_CREAT, 0600, NULL);
+        put("create", made < 0 ? made : 0);
+        put("open-create", TRY(open(DEV_PATH("-theirs2"), O_RDWR | O_CREAT | O_CLOEXEC, 0600)) < 0 ? -errno : 0);
+        put("mkdir", TRY(mkdir(DEV_PATH("-theirs3"), 0700)));
+        put("symlink", TRY(symlink("target", DEV_PATH("-theirs3"))));
+        put("fifo", TRY(mknod(DEV_PATH("-theirs3"), S_IFIFO | 0600, 0)));
+        put("link", TRY(link(DEV_PATH("-shared"), DEV_PATH("-theirs3"))));
+        put("rename", TRY(rename(DEV_PATH("-root"), DEV_PATH("-theirs3"))));
+        put("rename-itself", TRY(rename(DEV_PATH("-root"), DEV_PATH("-root"))));
+        say("");
+        _exit(0);
+    }
+    say("%s: status=%d", label, wait_child(pid));
+    q_unlink(DEV_NAME "-theirs");
+    q_unlink(DEV_NAME "-theirs2");
+}
+
+/* The root itself: chmod, chown, the times and fchmod of an open of it,
+   which change what others may do there; mq_open of a queue that is
+   there does not search it (lookup_noperm), while making and unlinking
+   one need to write and search it. Its mode, owner and time are put back
+   at the end, as this is the host's /dev/mqueue on Linux. Then a queue
+   opened again through its link in /proc/self/fd. */
+static int dev_root(void) {
+    struct stat st;
+    if (stat("/dev/mqueue", &st)) return 31;
+    mode_t mode = st.st_mode & 07777;
+    uid_t uid = st.st_uid;
+    gid_t gid = st.st_gid;
+    struct timespec kept[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT}, st.st_mtim};
+    q_unlink(DEV_NAME "-root");
+    long q = q_open(DEV_NAME "-root", O_RDWR | O_CREAT, 0644, NULL);
+    if (q < 0) return 32;
+    /* One anyone may read and write, which another user may link
+       whatever fs.protected_hardlinks is, so that link fails on the root. */
+    q_unlink(DEV_NAME "-shared");
+    long shared = q_open(DEV_NAME "-shared", O_RDWR | O_CREAT, 0600, NULL);
+    if (shared < 0 || fchmod((int)shared, 0666)) return 34;
+    printf("root-chmod:");
+    put("0755", TRY(chmod("/dev/mqueue", 0755)));
+    stat("/dev/mqueue", &st);
+    printf(" mode=%o", st.st_mode);
+    say("");
+    as_user("user-0755");
+    chmod("/dev/mqueue", 0711);
+    as_user("user-0711");
+    chmod("/dev/mqueue", 0700);
+    as_user("user-0700");
+    close((int)shared);
+    q_unlink(DEV_NAME "-shared");
+    long d = TRY(open("/dev/mqueue", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    printf("root-fd:");
+    put("fchmod", TRY(fchmod((int)d, 0777)));
+    stat("/dev/mqueue", &st);
+    printf(" mode=%o", st.st_mode);
+    say("");
+    /* Without the sticky bit, another user may unlink root's queue. */
+    pid_t pid = child();
+    if (pid == 0) {
+        if (unprivileged()) _exit(90);
+        printf("unsticky:");
+        put("unlink", TRY(unlink(DEV_PATH("-root"))));
+        say("");
+        _exit(0);
+    }
+    say("unsticky: status=%d", wait_child(pid));
+    printf("root-owner:");
+    put("chown", TRY(chown("/dev/mqueue", 2000, 3000)));
+    stat("/dev/mqueue", &st);
+    printf(" uid=%d gid=%d", st.st_uid, st.st_gid);
+    put("fchown", TRY(fchown((int)d, uid, gid)));
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT}, {.tv_sec = 1234567, .tv_nsec = 5}};
+    put("utimensat", TRY(utimensat(AT_FDCWD, "/dev/mqueue", times, 0)));
+    put("mtime-s", stat_mtime("/dev/mqueue") / 1000000000LL);
+    put("mtime-ns", stat_mtime("/dev/mqueue") % 1000000000LL);
+    put("truncate", TRY(truncate("/dev/mqueue", 0)));
+    put("chmod-back", TRY(chmod("/dev/mqueue", mode)));
+    put("times-back", TRY(utimensat(AT_FDCWD, "/dev/mqueue", kept, 0)));
+    stat("/dev/mqueue", &st);
+    put("mode-back", (st.st_mode & 07777) == mode);
+    put("owner-back", st.st_uid == uid && st.st_gid == gid);
+    say("");
+    close((int)d);
+    close((int)q);
+
+    /* A queue opened again through its link in /proc/self/fd. */
+    q_unlink(DEV_NAME "-reopen");
+    struct mq_attr small = {.mq_maxmsg = 2, .mq_msgsize = 8};
+    q = q_open(DEV_NAME "-reopen", O_RDWR | O_CREAT, 0600, &small);
+    if (q < 0) return 33;
+    ftruncate((int)q, 100);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fd/%ld", q);
+    long again = TRY(open(path, O_RDWR | O_CLOEXEC));
+    printf("reopen:");
+    put("open", again >= 0);
+    put("send", q_send(again, "hi", 2, 1, NULL));
+    say("");
+    show_attr("reopen", again);
+    show_link("reopen", again);
+    printf("reopen:");
+    put("directory", TRY(open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)));
+    long trunc = TRY(open(path, O_RDONLY | O_TRUNC | O_CLOEXEC));
+    put("o_trunc", trunc >= 0);
+    put("size", fd_size(q));
+    close((int)trunc);
+    say("");
+    pid = child();
+    if (pid == 0) {
+        if (unprivileged()) _exit(90);
+        printf("reopen-user:");
+        put("open", TRY(open(path, O_RDONLY | O_CLOEXEC)) < 0 ? -errno : 0);
+        say("");
+        _exit(0);
+    }
+    say("reopen-user: status=%d", wait_child(pid));
+    close((int)again);
+    close((int)q);
+    q_unlink(DEV_NAME "-reopen");
+    return 0;
+}
 /* The calls on a queue's path in /dev/mqueue, which change its file as
    simple_setattr does: its mode and owner, its modification time (to the
    second, and only that time is compared), and its size, which only a
@@ -1452,6 +1705,7 @@ static int dev_paths(void) {
         say("user-%d: status=%d", user, wait_child(pid));
     }
     show_file("users", ATTRS_PATH);
+    if (dev_names()) return 24;
 
     close((int)q);
     if (stat("/dev/mqueue", &root)) return 23;
@@ -1462,7 +1716,7 @@ static int dev_paths(void) {
     put("unlinked-shrinks", base - stat_size("/dev/mqueue"));
     put("unlinked-stamped", stamped_between(stat_mtime("/dev/mqueue"), second, this_second()));
     say("");
-    return 0;
+    return dev_root();
 }
 static int dev_case(void) {
     q_unlink(DEV_NAME);
@@ -1541,6 +1795,103 @@ static int dev_case(void) {
     return dev_paths();
 }
 
+/* A SIGEV_THREAD cookie's room in its netlink socket's receive buffer,
+   which Linux charges from the registration on: once a socket with the
+   smallest buffer has no room left, the next mq_notify waits until a
+   receive makes some, a signal without SA_RESTART ends the wait (EINTR)
+   and one with it does not. A cookie that a removal queues still holds its
+   room until it is received. How many cookies fit depends on their size
+   in the kernel, so only that some do is shown. */
+static int room_socket = -1;
+static long room_received = -1;
+static void *receive_later(void *unused) {
+    (void)unused;
+    pause_ms(300);
+    char buf[64];
+    room_received = TRY(recv(room_socket, buf, sizeof buf, 0));
+    return NULL;
+}
+static void arm(long millis) {
+    struct itimerval t = {.it_value = {.tv_sec = millis / 1000, .tv_usec = millis % 1000 * 1000}};
+    setitimer(ITIMER_REAL, &t, NULL);
+}
+static int room_case(void) {
+    if (isolate()) return 10;
+    room_socket = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0);
+    if (room_socket < 0) return 11;
+    int smallest = 0;
+    setsockopt(room_socket, SOL_SOCKET, SO_RCVBUF, &smallest, sizeof smallest);
+    struct sigaction interrupt = {.sa_handler = handler};
+    sigaction(SIGALRM, &interrupt, NULL);
+    static char cookie[32] = "cookie";
+    struct sigevent event = {.sigev_notify = SIGEV_THREAD, .sigev_signo = room_socket};
+    event.sigev_value.sival_ptr = cookie;
+    struct mq_attr one = {.mq_maxmsg = 1, .mq_msgsize = 1};
+    enum { MOST = 64 };
+    long queues[MOST];
+    int registered = 0;
+    long refused = 0;
+    for (int i = 0; i < MOST; i++) {
+        char name[16];
+        snprintf(name, sizeof name, "room-%d", i);
+        queues[i] = q_open(name, O_RDWR | O_CREAT, 0600, &one);
+        if (queues[i] < 0) return 12;
+        arm(200);
+        long r = q_notify(queues[i], &event);
+        arm(0);
+        if (r != 0) {
+            refused = r;
+            break;
+        }
+        registered++;
+    }
+    printf("room:");
+    put("some-fit", registered > 0 && registered < MOST);
+    put("full", refused);
+    put("caught", caught);
+    long next = queues[registered];
+    /* A removal queues its cookie, which still takes its room. */
+    put("remove", q_notify(queues[0], NULL));
+    arm(200);
+    put("removed-still-full", q_notify(next, &event));
+    arm(0);
+    /* A bad queue is looked up only after the room is found. */
+    arm(200);
+    put("bad-queue-waits", q_notify(-1, &event));
+    arm(0);
+    say("");
+    /* With SA_RESTART the signal does not end the wait, and a receive in
+       another thread lets it register. */
+    struct sigaction restart = {.sa_handler = handler, .sa_flags = SA_RESTART};
+    sigaction(SIGALRM, &restart, NULL);
+    caught = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, receive_later, NULL)) return 13;
+    struct timespec start = monotonic();
+    arm(100);
+    long r = q_notify(next, &event);
+    long waited = elapsed_ms(start);
+    arm(0);
+    pthread_join(thread, NULL);
+    printf("room:");
+    put("after-receive", r);
+    put("waited", waited >= 250);
+    put("restarted", caught);
+    put("received", room_received);
+    /* With room for one, a bad queue is EBADF, and its charge goes back. */
+    char buf[64];
+    put("remove-another", q_notify(queues[1], NULL));
+    put("drain", TRY(recv(room_socket, buf, sizeof buf, MSG_DONTWAIT)));
+    put("drained-last-byte", buf[31]);
+    arm(500);
+    put("bad-queue", q_notify(-1, &event));
+    long fresh = q_open("room-fresh", O_RDWR | O_CREAT, 0600, &one);
+    put("again", q_notify(fresh, &event));
+    arm(0);
+    say("");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1554,5 +1905,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mqueue-accounts")) return accounts_case();
     if (!strcmp(mode, "mqueue-files")) return files_case();
     if (!strcmp(mode, "mqueue-dev")) return dev_case();
+    if (!strcmp(mode, "mqueue-room")) return room_case();
     return 3;
 }

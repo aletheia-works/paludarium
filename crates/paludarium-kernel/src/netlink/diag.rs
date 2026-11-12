@@ -8,7 +8,8 @@
 //! Anyone may ask, and join its groups, which hear nothing, as no socket
 //! is destroyed through it.
 use super::{
-    Errno, Header, NLM_F_DUMP, NLM_F_MULTI, NLMSG_DONE, NetlinkSocket, State, attribute, message,
+    Errno, Header, NLM_F_DUMP, NLM_F_MULTI, NLMSG_DONE, NetlinkSocket, Sender, State, attribute,
+    message,
 };
 use crate::users::Ids;
 
@@ -19,6 +20,8 @@ const TCPDIAG_GETSOCK: u16 = 18;
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
 const SOCK_DESTROY: u16 = 21;
 const AF_UNIX: u8 = 1;
+const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
 /// The families there are (`AF_MAX`).
 const AF_MAX: u8 = 46;
 /// A `unix_diag_req`'s and a `unix_diag_msg`'s length.
@@ -79,14 +82,18 @@ impl NetlinkSocket {
         header: &Header,
         payload: &[u8],
         port: u32,
+        sender: Sender,
     ) -> Result<bool, Errno> {
         match header.kind {
-            TCPDIAG_GETSOCK => return Err(EOPNOTSUPP),
+            TCPDIAG_GETSOCK => return self.inet(s, header, payload, port, sender),
             SOCK_DIAG_BY_FAMILY | SOCK_DESTROY => {}
             _ => return Err(EINVAL),
         }
         if payload.len() < 2 || payload[0] >= AF_MAX {
             return Err(EINVAL);
+        }
+        if matches!(payload[0], AF_INET | AF_INET6) {
+            return self.inet(s, header, payload, port, sender);
         }
         if payload[0] != AF_UNIX {
             return Err(ENOENT);

@@ -119,8 +119,6 @@ pub(crate) struct UnixSocket {
     /// (`sock_gen_cookie`).
     cookie: OnceLock<u64>,
 }
-/// The last socket cookie given (`net_cookie`'s counter).
-static COOKIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// What `sock_diag` tells of a socket ([`UnixSocket::diag`]).
 pub(crate) struct Diag {
     pub(crate) kind: u8,
@@ -931,9 +929,7 @@ impl UnixSocket {
     }
     /// Its cookie, given when first asked for, as `sock_gen_cookie`.
     pub(crate) fn cookie(&self) -> u64 {
-        *self
-            .cookie
-            .get_or_init(|| COOKIES.fetch_add(1, Ordering::SeqCst) + 1)
+        *self.cookie.get_or_init(crate::sockets::new_cookie)
     }
     /// `accept`, as Linux's `unix_accept`: `EINVAL` unless listening, then
     /// the first connection waiting, or `EAGAIN` when none does and the

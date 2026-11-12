@@ -13,6 +13,9 @@ pub struct SignalInbox {
     control_wake: AtomicBool,
     timer_wake: AtomicBool,
     listeners: Mutex<Vec<Weak<AtomicBool>>>,
+    /// How many signals have been sent here and woken the listeners, so that
+    /// a thread they woke can tell a signal from another wake.
+    notices: AtomicU64,
     /// The discards of the thread group this inbox belongs to.
     discards: Mutex<Option<Arc<signals::Discards>>>,
     /// The thread group's count of the signals its threads made pending
@@ -96,6 +99,7 @@ impl SignalInbox {
         }
         queue.push(signal);
         self.wake.store(true, Ordering::SeqCst);
+        self.notices.fetch_add(1, Ordering::SeqCst);
         drop(queue);
         self.notify_listeners();
         Some((timer.id, timer.overrun))
@@ -115,6 +119,7 @@ impl SignalInbox {
         }
         queue.push(signal);
         self.wake.store(true, Ordering::SeqCst);
+        self.notices.fetch_add(1, Ordering::SeqCst);
         self.notify_listeners();
         Ok(())
     }
@@ -128,6 +133,11 @@ impl SignalInbox {
         if !listeners.iter().any(|existing| existing.ptr_eq(&listener)) {
             listeners.push(listener);
         }
+    }
+    /// How many signals have been sent here ([`Self::send_pending`],
+    /// [`Self::send_timer`]); an interruption does not count.
+    pub(crate) fn notices(&self) -> u64 {
+        self.notices.load(Ordering::SeqCst)
     }
     fn notify_listeners(&self) {
         let mut listeners = self

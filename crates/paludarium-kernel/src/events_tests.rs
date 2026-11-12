@@ -3722,9 +3722,9 @@ fn sock_diag_lists_the_namespaces_unix_sockets() {
     let replies = netlink_replies(&mut f, fd);
     assert_eq!((replies.len(), replies[0].0), (1, 3));
     // Another family has no handler; an inode of none is ENOENT.
-    let mut inet = request;
-    inet[0] = 2;
-    let len = netlink_request(&f, DATA, 20, 0x301, 9, &inet);
+    let mut other = request;
+    other[0] = 3;
+    let len = netlink_request(&f, DATA, 20, 0x301, 9, &other);
     assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
     assert_eq!(
         &netlink_replies(&mut f, fd)[0].4[..4],
@@ -3736,6 +3736,175 @@ fn sock_diag_lists_the_namespaces_unix_sockets() {
     assert_eq!(
         &netlink_replies(&mut f, fd)[0].4[..4],
         &(-2i32).to_le_bytes()
+    );
+}
+/// An `inet_diag_req_v2` of `family` and `protocol` for `states`, with
+/// `ext` and the source port and address `ip` (IPv4) and destination's.
+fn inet_diag_request(
+    (family, protocol, ext, states): (u8, u8, u8, u32),
+    (source, source_port): ([u8; 4], u16),
+    (destination, destination_port): ([u8; 4], u16),
+) -> Vec<u8> {
+    let mut request = vec![family, protocol, ext, 0];
+    request.extend_from_slice(&states.to_le_bytes());
+    request.extend_from_slice(&source_port.to_be_bytes());
+    request.extend_from_slice(&destination_port.to_be_bytes());
+    let mut source16 = [0u8; 16];
+    source16[..4].copy_from_slice(&source);
+    let mut destination16 = [0u8; 16];
+    destination16[..4].copy_from_slice(&destination);
+    request.extend_from_slice(&source16);
+    request.extend_from_slice(&destination16);
+    request.extend_from_slice(&0u32.to_le_bytes());
+    request.extend_from_slice(&u64::MAX.to_le_bytes());
+    request
+}
+/// Each `inet_diag_msg` of `replies` as its state, timer, source port,
+/// destination port, queues and whether it has an inode.
+fn inet_diag_rows(
+    replies: &[(u16, u16, u32, u32, Vec<u8>)],
+) -> Vec<(u8, u8, u16, u16, u32, u32, bool)> {
+    replies
+        .iter()
+        .filter(|r| r.0 == 20)
+        .map(|r| {
+            let b = &r.4;
+            let word = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+            (
+                b[1],
+                b[2],
+                u16::from_be_bytes([b[4], b[5]]),
+                u16::from_be_bytes([b[6], b[7]]),
+                word(56),
+                word(60),
+                word(68) != 0,
+            )
+        })
+        .collect()
+}
+#[test]
+fn sock_diag_lists_the_namespaces_tcp_and_udp_sockets() {
+    let mut f = network_fixture(&[]);
+    let fd = f.ret(41, [16, 3, 4, 0, 0, 0]);
+    assert!(fd < 1024);
+    let (listener, port) = loopback_listener(&mut f, 8);
+    let client = loopback_client(&mut f, port);
+    let name = name_of(&mut f, 51, client);
+    let client_port = u16::from_be_bytes([name[2], name[3]]);
+    let all = u32::MAX;
+    // The listener first, with one connection waiting of its backlog of 8;
+    // then the client and the connection not yet accepted, which has no
+    // socket file.
+    let request = inet_diag_request((2, 6, 0, all), ([0; 4], 0), ([0; 4], 0));
+    let len = netlink_request(&f, DATA, 20, 0x301, 7, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies.last().unwrap().0, 3);
+    assert_eq!(
+        inet_diag_rows(&replies),
+        vec![
+            (10, 0, port, 0, 1, 8, true),
+            (1, 0, client_port, port, 0, 0, true),
+            (1, 0, port, client_port, 0, 0, false),
+        ]
+    );
+    // Its attributes: the shutdown, the cgroup and the options.
+    let kinds: Vec<u16> = crate::netlink::attribute_kinds(&replies[0].4[72..]);
+    assert_eq!(kinds, vec![8, 15, 21, 22]);
+    let server = f.ret(288, [listener, 0, 0, 0, 0, 0]);
+    assert!((server as i64) >= 0);
+    // One socket by its addresses: the client's connection, then the
+    // listener for an address only it takes.
+    let one = inet_diag_request(
+        (2, 6, 0, 0),
+        ([127, 0, 0, 1], client_port),
+        ([127, 0, 0, 1], port),
+    );
+    let len = netlink_request(&f, DATA, 20, 0x1, 8, &one);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(replies[0].1, 0);
+    assert_eq!(
+        inet_diag_rows(&replies),
+        vec![(1, 0, client_port, port, 0, 0, true)]
+    );
+    let one = inet_diag_request((2, 6, 0, 0), ([127, 0, 0, 1], port), ([127, 0, 0, 1], 1));
+    let len = netlink_request(&f, DATA, 20, 0x1, 9, &one);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(inet_diag_rows(&netlink_replies(&mut f, fd))[0].0, 10);
+    // A filter of the listener's port takes it and the accepted side.
+    let mut filtered = request.clone();
+    let mut code = vec![11, 8, 12, 0, 0, 0];
+    code.extend_from_slice(&port.to_le_bytes());
+    filtered.extend_from_slice(&(4 + code.len() as u16).to_le_bytes());
+    filtered.extend_from_slice(&1u16.to_le_bytes());
+    filtered.extend_from_slice(&code);
+    let len = netlink_request(&f, DATA, 20, 0x301, 10, &filtered);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let rows = inet_diag_rows(&netlink_replies(&mut f, fd));
+    assert_eq!(
+        rows.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(),
+        vec![(10, port), (1, port)]
+    );
+    // The client closes first: it holds its port with no socket, in
+    // FIN_WAIT2 until the accepted side, which has the end (CLOSE_WAIT),
+    // closes too, then in TIME_WAIT.
+    assert_eq!(f.ret(3, [client, 0, 0, 0, 0, 0]), 0);
+    let len = netlink_request(&f, DATA, 20, 0x301, 11, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    let rows = inet_diag_rows(&replies);
+    assert_eq!(
+        rows.iter().map(|r| (r.0, r.1, r.6)).collect::<Vec<_>>(),
+        vec![(10, 0, true), (8, 0, true), (5, 3, false)]
+    );
+    // The peer's FIN waits to be read, as Linux's `copied_seq` counts it.
+    assert_eq!(rows[1].4, 1);
+    assert_eq!(f.ret(0, [server, DATA + 0x2000, 16, 0, 0, 0]), 0);
+    let len = netlink_request(&f, DATA, 20, 0x301, 17, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(inet_diag_rows(&netlink_replies(&mut f, fd))[1].4, 0);
+    assert_eq!(replies[2].4.len(), 72 + 8);
+    assert_eq!(f.ret(3, [server, 0, 0, 0, 0, 0]), 0);
+    let len = netlink_request(&f, DATA, 20, 0x301, 16, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let rows = inet_diag_rows(&netlink_replies(&mut f, fd));
+    assert_eq!(
+        rows.iter().map(|r| (r.0, r.1, r.2)).collect::<Vec<_>>(),
+        vec![(10, 0, port), (6, 3, client_port)]
+    );
+    // UDP: a bound socket, unconnected (TCP_CLOSE).
+    let udp = f.ret(41, [2, 2, 0, 0, 0, 0]);
+    inet_address(&f, DATA + 0x100, [127, 0, 0, 1], 0);
+    assert_eq!(f.ret(49, [udp, DATA + 0x100, 16, 0, 0, 0]), 0);
+    let request = inet_diag_request((2, 17, 0, all), ([0; 4], 0), ([0; 4], 0));
+    let len = netlink_request(&f, DATA, 20, 0x301, 12, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let rows = inet_diag_rows(&netlink_replies(&mut f, fd));
+    assert_eq!((rows.len(), rows[0].0), (1, 7));
+    // A protocol with no handler: the dump's NLMSG_DONE says ENOENT, as
+    // does the answer for one socket.
+    let request = inet_diag_request((2, 99, 0, all), ([0; 4], 0), ([0; 4], 0));
+    let len = netlink_request(&f, DATA, 20, 0x301, 13, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(
+        (replies[0].0, &replies[0].4[..4]),
+        (3, &(-2i32).to_le_bytes()[..])
+    );
+    let len = netlink_request(&f, DATA, 20, 0x1, 14, &request);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    let replies = netlink_replies(&mut f, fd);
+    assert_eq!(
+        (replies[0].0, &replies[0].4[..4]),
+        (2, &(-2i32).to_le_bytes()[..])
+    );
+    // Too short is EINVAL.
+    let len = netlink_request(&f, DATA, 20, 0x301, 15, &request[..40]);
+    assert_eq!(f.ret(44, [fd, DATA, len, 0, 0, 0]), len);
+    assert_eq!(
+        &netlink_replies(&mut f, fd)[0].4[..4],
+        &(-22i32).to_le_bytes()
     );
 }
 #[test]

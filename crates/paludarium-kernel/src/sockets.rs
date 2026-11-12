@@ -29,6 +29,13 @@ pub(crate) struct Signalling {
 }
 /// Counts `O_ASYNC` registrations of pipe descriptions, to order them.
 static REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
+/// The last socket cookie given (`net_cookie`'s counter), which every
+/// family's sockets share.
+static COOKIES: AtomicU64 = AtomicU64::new(0);
+/// A new socket cookie, as `sock_gen_cookie` gives one when first asked.
+pub(crate) fn new_cookie() -> u64 {
+    COOKIES.fetch_add(1, Ordering::SeqCst) + 1
+}
 /// Unidirectional anonymous pipe using the same buffered readiness transport.
 pub(crate) struct PipeEnd {
     endpoint: Arc<SocketPairEnd>,

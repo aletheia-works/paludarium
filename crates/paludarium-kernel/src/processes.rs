@@ -2455,10 +2455,11 @@ impl Kernel {
             let mut namespaces = own.unshared(flags, &credentials.user.0)?;
             namespaces.user = Arc::clone(&credentials.user.0);
             if flags & crate::namespaces::CLONE_NEWIPC != 0 {
-                namespaces
-                    .ipc
-                    .mq
-                    .made_by(credentials.fsuid, credentials.fsgid);
+                namespaces.ipc.mq.made_by(
+                    credentials.fsuid,
+                    credentials.fsgid,
+                    self.host.clock(ClockId::Realtime).unwrap_or(0),
+                );
             }
             self.group.set_namespaces(thread.tid, namespaces);
         }
@@ -2790,10 +2791,11 @@ impl Kernel {
             own.for_child(namespaces, flags & 0x100 != 0, &credentials.user.0)?;
         child_namespaces.user = Arc::clone(&credentials.user.0);
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 {
-            child_namespaces
-                .ipc
-                .mq
-                .made_by(credentials.fsuid, credentials.fsgid);
+            child_namespaces.ipc.mq.made_by(
+                credentials.fsuid,
+                credentials.fsgid,
+                self.host.clock(ClockId::Realtime).unwrap_or(0),
+            );
         }
         let child_mem = if flags & 0x100 == 0 {
             Some(Arc::new(mem.fork()))
@@ -3679,6 +3681,7 @@ impl Kernel {
             cpu,
             personality,
             arrivals: thread.state.arrivals,
+            process_notices: thread.state.process_notices,
             ..ThreadState::default()
         };
         thread.state.name_after(&path);

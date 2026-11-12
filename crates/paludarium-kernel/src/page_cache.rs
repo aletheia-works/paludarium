@@ -199,10 +199,10 @@ impl PageCaches {
                 .is_some_and(|&count| count < 0)
     }
     /// The places of the open descriptions of the machine's files in `fs`,
-    /// each resolved the first time a change of names looks at it, before
-    /// the change.
+    /// each once (a reopen shares its description's), and each resolved the
+    /// first time a change of names looks at it, before the change.
     fn places(&self, fs: &Arc<dyn FileSystem>) -> Vec<Arc<Mutex<Place>>> {
-        let places: Vec<_> = {
+        let mut places: Vec<_> = {
             let opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
             opens
                 .values()
@@ -214,6 +214,9 @@ impl PageCaches {
                 })
                 .collect()
         };
+        // `renamed` moves a place it sees twice twice.
+        places.sort_by_key(|place| Arc::as_ptr(place).addr());
+        places.dedup_by(|a, b| Arc::ptr_eq(a, b));
         for place in &places {
             let mut place = place.lock().unwrap_or_else(PoisonError::into_inner);
             if !place.resolved {

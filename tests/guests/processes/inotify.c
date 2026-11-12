@@ -791,6 +791,28 @@ static int case_moved(void) {
     printf("write y=%ld\n", e(write(fy, &byte, 1)));
     drain(fd, "after-exchange-y");
     drain(excl, "after-exchange-y-excl");
+    /* A removed file opened again through /proc is the same dentry, which
+     * RENAME_EXCHANGE of its directory moves once. */
+    char gone_dir[160], swap_dir[160], gone[200], proc[64];
+    snprintf(gone_dir, sizeof gone_dir, "%s/gone", base);
+    snprintf(swap_dir, sizeof swap_dir, "%s/swap", base);
+    mkdir(gone_dir, 0755);
+    mkdir(swap_dir, 0755);
+    snprintf(gone, sizeof gone, "%s/z", gone_dir);
+    int fz = open(gone, O_RDWR | O_CREAT, 0644);
+    unlink(gone);
+    snprintf(proc, sizeof proc, "/proc/self/fd/%d", fz);
+    int fz2 = open(proc, O_RDWR);
+    int wd_gone = inotify_add_watch(fd, gone_dir, WATCHED);
+    printf("wd gone=%d reopen=%d\n", wd_gone, fz2 >= 0);
+    printf("exchange dirs=%ld\n",
+           e(syscall(SYS_renameat2, AT_FDCWD, gone_dir, AT_FDCWD, swap_dir, 2)));
+    drain(fd, "dirs-exchanged");
+    printf("write=%ld\n", e(write(fz, &byte, 1)));
+    drain(fd, "after-dirs-exchange");
+    close(fz2);
+    close(fz);
+    drain(fd, "gone-closed");
     close(f);
     close(h);
     close(fx);

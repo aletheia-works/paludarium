@@ -166,11 +166,41 @@ runs:
             sleep 15
           done
         }
-        variant=/etc/apt/apt.conf.d/90arch-variant
+        # The images set the variant in 90arch-variant, but not every image only there (those
+        # on AWS from ubuntu26/20261111 kept it after that file went). Rather than edit files
+        # whose syntax may span lines, clear it in a part read after every other one in
+        # apt.conf.d; a variant that apt.conf or anything else sets again stops the job below.
+        config="$RUNNER_TEMP/apt-config"
+        # Not in a command substitution, which would not stop the job when apt cannot parse its
+        # configuration and so prints no variant at all.
+        variants() {
+          apt-config dump > "$config"
+          found="$(grep -iE '^APT::Architecture-Variants' "$config" || true)"
+        }
         toolchain=()
-        if [ -f "$variant" ]; then
-          sudo rm -f "$variant"
+        variants
+        if [ -n "$found" ]; then
+          echo "$found"
+          sudo grep -rIn -i 'Architecture-Variants' /etc/apt || true
+          sudo rm -f /etc/apt/apt.conf.d/90arch-variant
+          # Names sort after zz-retries.
+          echo '#clear APT::Architecture-Variants;' |
+            sudo tee /etc/apt/apt.conf.d/zzzz-baseline-architecture > /dev/null
+          variants
+          if [ -n "$found" ]; then
+            echo "apt still takes an architecture variant:" >&2
+            echo "$found" >&2
+            sudo grep -rIn -i variant /etc/apt /etc/dpkg >&2 || true
+            exit 1
+          fi
           update
+          # Reinstalling from lists that are still for a variant would bring the same builds.
+          # shellcheck disable=SC2016 # apt expands the fields, not the shell
+          if apt-get indextargets --format '$(ARCHITECTURE)' | grep -q 'v[0-9]'; then
+            echo "apt still fetches lists for an architecture variant:" >&2
+            apt-get indextargets --format '$(DESCRIPTION)' | sort -u >&2
+            exit 1
+          fi
           version="$(gcc -dumpversion)"
           toolchain=(
             --reinstall --allow-downgrades

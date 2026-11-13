@@ -2195,13 +2195,20 @@ kernel.
   fall on whole multiples of it on each clock. `clock_getres` gives 1 ns,
   and the tick for the coarse clocks.
 - `clock_nanosleep` and `timer_create` run on `CLOCK_REALTIME`,
-  `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` and `CLOCK_TAI`, and `timer_create`
-  on the process's and the thread's CPU clocks too. As Linux's,
+  `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, `CLOCK_TAI` and the process's CPU
+  clock, and `timer_create` on the thread's CPU clock too. As Linux's,
   `CLOCK_MONOTONIC_RAW` and the coarse clocks give `EOPNOTSUPP` (they can
   only be read), as does the thread's CPU clock for a sleep, and
-  `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. A sleep on the
-  process's CPU clock, the CPU clocks of other processes and threads and
-  the alarm clocks are not modelled (`EINVAL`).
+  `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. The CPU clocks of
+  other processes and threads and the alarm clocks are not modelled
+  (`EINVAL`).
+- A sleep on the process's CPU clock ends once the process's threads
+  together have used the time, as Linux's `do_cpu_nanosleep`: a time that
+  has passed, or none to sleep, returns at once, and the sleeping thread
+  uses none itself, so a process with no other thread running sleeps until
+  a signal comes. A signal with a handler ends it with `EINTR`, writing the
+  time left for a relative sleep, unless the time has been used by then,
+  when it returns 0; a stop resumes it as it does the other sleeps.
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one

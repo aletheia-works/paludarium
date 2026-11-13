@@ -6652,6 +6652,86 @@ static int cpu_timer_case(void) {
            ct_ns(v.it_value), syscall(SYS_timer_delete, (long)ct_thread_timer));
     return 0;
 }
+/* clock_nanosleep on the process's CPU clock: it ends once the process's
+ * threads have used the time, and a signal ends it with EINTR. What is
+ * printed holds whatever the speed. */
+static long cs_sleep(clockid_t clock, int flags, long ns, struct timespec *rem) {
+    struct timespec t = {ns / 1000000000L, ns % 1000000000L};
+    return syscall(SYS_clock_nanosleep, (long)clock, (long)flags, &t, rem) ? -errno : 0;
+}
+static void *cs_spin(void *arg) {
+    struct timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    long end = ct_ns(t) + (long)arg;
+    do {
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    } while (ct_ns(t) < end);
+    return NULL;
+}
+static void cs_alarm(int sig) { (void)sig; }
+static void cs_alarm_in(long us) {
+    struct itimerval it = {{0, 0}, {0, us}};
+    setitimer(ITIMER_REAL, &it, NULL);
+}
+static int cpu_sleep_case(void) {
+    /* A time that has passed, and nothing to sleep: at once, with the
+       time left untouched. */
+    struct timespec rem = {7, 7};
+    long past = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, 1, &rem);
+    long zero = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, 0, 0, &rem);
+    printf("past=%ld zero=%ld rem=%ld %ld\n", past, zero, (long)rem.tv_sec, rem.tv_nsec);
+    /* The thread's clock cannot sleep; bad requests on the process's. */
+    struct timespec negative = {-1, 0}, wide = {0, 1000000000L}, one = {0, 1};
+    printf("thread=%ld negative=%ld wide=%ld fault=%ld\n",
+           syscall(SYS_clock_nanosleep, (long)CLOCK_THREAD_CPUTIME_ID, 0L, &one, NULL)
+               ? -errno
+               : 0L,
+           syscall(SYS_clock_nanosleep, (long)CLOCK_PROCESS_CPUTIME_ID, 0L, &negative, NULL)
+               ? -errno
+               : 0L,
+           syscall(SYS_clock_nanosleep, (long)CLOCK_PROCESS_CPUTIME_ID, 0L, &wide, NULL)
+               ? -errno
+               : 0L,
+           syscall(SYS_clock_nanosleep, (long)CLOCK_PROCESS_CPUTIME_ID, 0L, (void *)8, NULL)
+               ? -errno
+               : 0L);
+    /* Another thread's work ends a relative sleep and an absolute one. */
+    pthread_t thread;
+    long start = cit_cpu();
+    if (pthread_create(&thread, NULL, cs_spin, (void *)100000000L)) return 1;
+    long relative = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, 0, 30000000L, NULL);
+    long used = cit_cpu() - start;
+    pthread_join(thread, NULL);
+    printf("worker relative=%ld used-enough=%d\n", relative, used >= 30000000L);
+    long deadline = cit_cpu() + 30000000L;
+    if (pthread_create(&thread, NULL, cs_spin, (void *)100000000L)) return 1;
+    long absolute = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, deadline, NULL);
+    long reached = cit_cpu() >= deadline;
+    pthread_join(thread, NULL);
+    printf("worker absolute=%ld reached=%ld\n", absolute, reached);
+    /* Alone, the process uses no CPU time while it sleeps: a signal with a
+       handler ends the sleep, with the time left for a relative one and
+       nothing written for an absolute one. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = cs_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    cs_alarm_in(20000);
+    rem.tv_sec = 7;
+    rem.tv_nsec = 7;
+    long interrupted = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, 0, 10000000000L, &rem);
+    printf("signal relative=%ld left-in-range=%d\n", interrupted,
+           ct_ns(rem) > 9000000000L && ct_ns(rem) <= 10000000000L);
+    cs_alarm_in(20000);
+    rem.tv_sec = 7;
+    rem.tv_nsec = 7;
+    interrupted =
+        cs_sleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, cit_cpu() + 10000000000L, &rem);
+    printf("signal absolute=%ld rem=%ld %ld\n", interrupted, (long)rem.tv_sec, rem.tv_nsec);
+    return 0;
+}
 /* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
  * SIGKILL at the hard limit. Each part runs in a child, whose CPU time
  * starts from 0. */
@@ -21025,6 +21105,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
+    if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {
         struct itimerval v;
         syscall(SYS_getitimer, 1L, &v);

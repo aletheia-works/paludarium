@@ -1909,12 +1909,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   それぞれの時計でその倍数ちょうどに来ます。`clock_getres` は 1 ns、粗い時計では
   ティックの長さを返します。
 - `clock_nanosleep` と `timer_create` は、`CLOCK_REALTIME`、`CLOCK_MONOTONIC`、
-  `CLOCK_BOOTTIME`、`CLOCK_TAI` で動きます。`timer_create` は、プロセスとスレッドの
-  CPU 時計でも動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
+  `CLOCK_BOOTTIME`、`CLOCK_TAI`、プロセスの CPU 時計で動きます。`timer_create` は、
+  スレッドの CPU 時計でも動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
   粗い時計は読むことしかできないので `EOPNOTSUPP` になり、スレッドの CPU 時計で眠る
   ときも `EOPNOTSUPP` です。`clock_nanosleep` は、`flags` のうち `TIMER_ABSTIME`
-  しか見ません。プロセスの CPU 時計で眠ること、ほかのプロセスやスレッドの CPU 時計、
-  アラームの時計はまだ再現していません（`EINVAL`）。
+  しか見ません。ほかのプロセスやスレッドの CPU 時計と、アラームの時計はまだ再現して
+  いません（`EINVAL`）。
+- プロセスの CPU 時計での眠りは、Linux の `do_cpu_nanosleep` と同じく、プロセスの
+  スレッドが合わせてその時間を使うと終わります。過ぎた時刻や 0 の時間ならすぐに戻ります。
+  眠っているスレッド自身は CPU 時間を使わないので、ほかに動くスレッドのないプロセスは
+  シグナルが来るまで眠ります。ハンドラのあるシグナルは `EINTR` で眠りを終わらせ、相対時間
+  なら残りの時間を書き出します。ただし、そのときもう時間を使い終えていれば 0 を返します。
+  停止からは、ほかの眠りと同じように再開します。
 - プロセスの実時間のインターバルタイマー（`ITIMER_REAL`）は、Linux と同じく、満了すると
   `SIGALRM` を送り、間隔の分だけ次に進みます。`setitimer` はタイマーより先に新しい値を読んで
   確かめ、古い値はタイマーを設定してから書き出すので、古い値を書けないときはタイマーを設定した

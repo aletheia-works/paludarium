@@ -110,6 +110,11 @@ def inspect_npm(path, expected):
 JSR_NAME = "@aletheia-works/paludarium-wasm"
 # MAX_FILE_SIZE and MAX_TOTAL_FILE_SIZE in api/src/tarball.rs of jsr-io/jsr.
 JSR_MAX_BYTES = 20 * 1024 * 1024
+# Deno 2.8.2 and later rewrite a Wasm module's import module names on publish
+# (denoland/deno#34549): `env` becomes `./env`, and the published paludarium.wasm
+# no longer instantiates with its import object (denoland/deno#37171). JSR 0.15.0
+# went out that way and was deleted. CI pins this version.
+JSR_DENO_VERSION = "2.8.1"
 
 
 def jsr_files(npm_files, config, version):
@@ -169,6 +174,7 @@ def deno_publish(deno, files, output, env, dry_run):
 
     import check
 
+    require_deno_version(deno, Path(str(output) + "-version"), env)
     with tempfile.TemporaryDirectory() as stage:
         write_files(Path(stage), files)
         receipt = check.run_command(
@@ -185,6 +191,29 @@ def deno_publish(deno, files, output, env, dry_run):
         listed = set(re.findall(r"^\s+file:///\S*?/([^/\s]+) \(", text, re.MULTILINE))
         policy.require(listed == set(files), "JSR dry run does not list exactly the files")
     return receipt
+
+
+def require_deno_version(deno, output, env):
+    """ValueError unless `deno --version` is JSR_DENO_VERSION, before any publish."""
+    from pathlib import Path
+
+    import check
+
+    keep = ("PATH", "HOME", "SYSTEMROOT", "TEMP", "TMP")
+    receipt = check.run_command(
+        [str(deno), "--version"],
+        Path(output).parent,
+        output,
+        60,
+        dict({k: env[k] for k in keep if k in env}, DENO_NO_UPDATE_CHECK="1"),
+    )
+    check.require_success(receipt)
+    first = (Path(output) / "stdout.bin").read_bytes().decode(errors="replace").splitlines()
+    first = first[0] if first else ""
+    policy.require(
+        re.match(r"deno " + re.escape(JSR_DENO_VERSION) + r" \(", first) is not None,
+        "deno publish needs Deno " + JSR_DENO_VERSION + ", not: " + first.strip(),
+    )
 
 
 def jsr_check(out, tarball, config, version, deno, env):

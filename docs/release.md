@@ -54,8 +54,16 @@ jsr-io/jsr `api/src/tarball.rs`), and `index.mjs` and `relay.mjs` must name
 their `.d.ts` with `@ts-self-types`. `deno publish --dry-run` of exactly those
 files, staged in a temporary directory outside the checkout, must succeed and
 list each of them. It uses `PALUDARIUM_RELEASE_DENO`, else the `deno` on
-`PATH` (CI pins Deno 2.9.8 with setup-deno). A mock upload test is not a
-registry or OIDC test.
+`PATH`, which must report Deno 2.8.1 (`JSR_DENO_VERSION` in
+`scripts/release/package.py`; CI pins it with setup-deno, and `mise.toml` with
+mise) before any dry run or upload. Deno 2.8.2 and later rewrite the import
+module names of a Wasm module on publish (denoland/deno#34549): `env` became
+`./env`, and the JSR 0.15.0 `paludarium.wasm` did not instantiate with its
+import object, so that version was deleted (denoland/deno#37171). Every query
+of a JSR version's metadata carries a fresh `?uncached=` query, because the
+CDN in front of jsr.io keeps `<version>_meta.json` for a year: the deleted
+0.15.0 still answered 200 from it. A mock upload test is not a registry or
+OIDC test.
 
 `release-check.yml` is PR/manual/reusable and has no publication credentials.
 It measures the fixed policy/package/check/acceptance file population (four

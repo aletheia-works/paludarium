@@ -219,13 +219,15 @@ class Evidence(unittest.TestCase):
             self.assertTrue(E.version_present(check.NPM_NAME, "0.2.0"))
             self.assertTrue(E.version_present(check.JSR_KEY, "0.2.0"))
         self.assertEqual(
-            asked,
             [
                 check.CRATES_API + "paludarium-cpu/0.2.0",
                 check.NPM_PACKAGE_URL + "/0.2.0",
                 check.JSR_PACKAGE_URL + "/0.2.0_meta.json",
             ],
+            [u.split("?uncached=")[0] for u in asked],
         )
+        # The CDN in front of jsr.io keeps a version's metadata for a year.
+        self.assertRegex(asked[2], r"\?uncached=[0-9]+$")
 
     def test_a_run_a_person_already_dispatched_is_reused(self):
         api = FakeGitHub()

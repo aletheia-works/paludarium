@@ -203,6 +203,15 @@ BUILD_DIRECTORY = re.compile(rb"target/release-evidence/package-[0-9]{1,20}/")
 JSR_KEY = "jsr:" + NPM_NAME
 JSR_PACKAGE_API = "https://api.jsr.io/scopes/aletheia-works/packages/paludarium-wasm"
 JSR_PACKAGE_URL = "https://jsr.io/@aletheia-works/paludarium-wasm"
+
+
+def jsr_uncached(url):
+    """url with a query no cache has seen. The CDN in front of jsr.io keeps a
+    <version>_meta.json for a year (max-age=31536000), so a deleted version still
+    answered 200 from it; the query reaches jsr.io itself."""
+    return url + "?uncached=" + str(time.time_ns())
+
+
 CARGO_TOKEN_NAMES = ("CARGO_REGISTRY_TOKEN", "RELEASE_OIDC_CRATES_IO_TOKEN")
 # Each publication child gets only the variables it needs (allow-list).
 COMMON_ENVIRONMENT = (
@@ -535,14 +544,18 @@ def same_but_build_directory(published, approved):
     return plain(published) == plain(approved)
 
 
-def uploaded_metadata(url, sleep=None, clock=None):
-    """A just-uploaded version can stay 404 for minutes (a new npm package took five), so wait for it."""
+def uploaded_metadata(url, sleep=None, clock=None, fresh=None):
+    """A just-uploaded version can stay 404 for minutes (a new npm package took five), so wait for it.
+
+    fresh, when given, makes the URL of each try (jsr_uncached)."""
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
     deadline = clock() + UPLOAD_VISIBLE_SECONDS
     while True:
         try:
-            with urllib.request.urlopen(registry_request(url), timeout=30) as response:
+            with urllib.request.urlopen(
+                registry_request(fresh(url) if fresh else url), timeout=30
+            ) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
             if error.code != 404 or clock() >= deadline:
@@ -786,7 +799,9 @@ def publish_artifacts(root, evidence):
         completed.append("@aletheia-works/paludarium-wasm")
         url = JSR_PACKAGE_URL + "/" + approved["version"] + "_meta.json"
         try:
-            with urllib.request.urlopen(registry_request(url), timeout=30) as response:
+            with urllib.request.urlopen(
+                registry_request(jsr_uncached(url)), timeout=30
+            ) as response:
                 body = json.load(response)
         except urllib.error.HTTPError as error:
             if error.code != 404:
@@ -798,10 +813,10 @@ def publish_artifacts(root, evidence):
             attempted.append(JSR_KEY)
             package.deno_publish(deno, files, directory / "publish-jsr", jsr_env, dry_run=False)
             uploaded.append(JSR_KEY)
-            body = uploaded_metadata(url)
+            body = uploaded_metadata(url, fresh=jsr_uncached)
         policy.require(body.get("manifest") == manifest, "JSR version files differ")
         with urllib.request.urlopen(
-            registry_request(JSR_PACKAGE_URL + "/meta.json"), timeout=30
+            registry_request(jsr_uncached(JSR_PACKAGE_URL + "/meta.json")), timeout=30
         ) as response:
             versions = json.load(response).get("versions", {})
         policy.require(approved["version"] in versions, "JSR version not listed")

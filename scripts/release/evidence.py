@@ -141,7 +141,9 @@ def tag_exists(api, version):
 
 def version_present(name, version):
     if name == check.JSR_KEY:
-        return check.registry_present(check.JSR_PACKAGE_URL + "/" + version + "_meta.json")
+        return check.registry_present(
+            check.jsr_uncached(check.JSR_PACKAGE_URL + "/" + version + "_meta.json")
+        )
     url = check.NPM_PACKAGE_URL if name == check.NPM_NAME else check.CRATES_API + name
     return check.registry_present(url + "/" + version)
 

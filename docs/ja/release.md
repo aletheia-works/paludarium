@@ -18,6 +18,13 @@ release PR をマージするかどうかだけです。詳しい手順と、す
    Trusted Publishing（OIDC）で公開します。続けて、npm と同じファイルを JSR に、
    パッケージにリンクした GitHub リポジトリの OIDC で公開します（0.14.0 の次のリリースから）。
    npm と JSR には provenance を付けます。人の承認は待ちません。
+   JSR への公開には Deno 2.8.1 を使い、dry run とアップロードの前にその版であることを確かめます
+   （CI は setup-deno で、`mise.toml` は mise で固定します）。Deno 2.8.2 以降は、公開するときに
+   Wasm の import のモジュール名を書き換えるためです（denoland/deno#34549）。`env` が `./env` に
+   なり、JSR の 0.15.0 の `paludarium.wasm` は import オブジェクトで読み込めなくなったので、
+   その版は削除しました（denoland/deno#37171）。また、jsr.io の前の CDN は版のメタデータ
+   （`<version>_meta.json`）を 1 年キャッシュし、削除した 0.15.0 も 200 を返し続けたので、
+   JSR の版のメタデータは毎回新しい `?uncached=` のクエリを付けて問い合わせます。
 5. **タグ**：すべての公開が成功した後で、最後にタグと GitHub Release を作ります。
    GitHub Release の本文には、マージした release PR の本文のリリースノートを使います。
    前の Publish の run が止まっている間に main が進むと、公開するのは release PR の

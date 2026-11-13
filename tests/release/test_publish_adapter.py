@@ -121,11 +121,18 @@ class PublishAdapterTests(unittest.TestCase):
         self.dry_dir = "target/package/tmp-crate"
         self.jsr_staged = []
         self.jsr_yanked = False
+        self.deno_version = "deno " + package.JSR_DENO_VERSION + " (stable, release, x86_64)"
+        self.deno_versions = []
 
     def request(self, request, timeout):
         # jsr.io answers 403 to urllib's own User-Agent, so every query must name ours.
         self.assertEqual(request.get_header("User-agent"), check.REGISTRY_USER_AGENT)
         url = request.full_url
+        if url.startswith(check.JSR_PACKAGE_URL + "/"):
+            # The CDN in front of jsr.io keeps a version's metadata for a year, so
+            # every JSR query must reach jsr.io itself.
+            self.assertRegex(url, r"\?uncached=[0-9]+$")
+            url = url.split("?")[0]
         if "crates.io/" in url:
             name = url.split("/")[-2]
             if name not in self.uploaded:
@@ -157,6 +164,11 @@ class PublishAdapterTests(unittest.TestCase):
         return io.BytesIO(json.dumps(dict(version=VERSION, dist=dict(integrity=digest))).encode())
 
     def command(self, argv, cwd, output, *args, **kwargs):
+        if argv[-1] == "--version":
+            self.deno_versions.append(Path(output).name)
+            Path(output).mkdir()
+            (Path(output) / "stdout.bin").write_text(self.deno_version + "\n")
+            return dict(exit=0, timeout=False, error=None, reaped=True)
         self.envs.append((Path(output).name, args[-1]))  # both adapters receive env last
         if "-p" in argv:
             name = argv[argv.index("-p") + 1]
@@ -334,6 +346,20 @@ class PublishAdapterTests(unittest.TestCase):
         self.assertLessEqual(set(env), set(check.JSR_ENVIRONMENT))
         self.assertEqual(env["DENO_DIR"], str(self.out / "deno-dir"))
 
+    # Each deno publish, the dry run and the upload, first checks the Deno version.
+    def test_jsr_needs_the_pinned_deno_before_each_publish(self):
+        self.assertEqual(len(self.execute()["published"]), 14)
+        self.assertEqual(self.deno_versions, ["dry-jsr-version", "publish-jsr-version"])
+
+    # Deno 2.8.2 and later rewrite paludarium.wasm's import module names, as
+    # JSR 0.15.0 showed (denoland/deno#37171).
+    def test_other_deno_stops_before_any_jsr_command(self):
+        self.deno_version = "deno 2.9.8 (long term support, release, x86_64)"
+        with self.assertRaisesRegex(ValueError, "needs Deno " + package.JSR_DENO_VERSION):
+            self.execute()
+        self.assertEqual([n for n, _ in self.envs if "jsr" in n], [])
+        self.assertNotIn("jsr", self.uploaded)
+
     def test_prepared_jsr_files_changed_stops_before_any_upload(self):
         self.result["jsr"]["files"]["/README.md"]["size"] += 1
         (self.out / "package-result.json").write_text(json.dumps(self.result))
@@ -346,7 +372,7 @@ class PublishAdapterTests(unittest.TestCase):
         request = self.request
 
         def other(req, timeout):
-            url = req.full_url
+            url = req.full_url.split("?")[0]
             if url.endswith("_meta.json") and "jsr" in self.uploaded:
                 return io.BytesIO(json.dumps(dict(manifest={})).encode())
             return request(req, timeout)

@@ -278,8 +278,15 @@ class JsrTests(unittest.TestCase):
         tarball = out / "npm.tgz"
         tar(tarball, self.files)
         seen = []
+        versions = []
+        self.deno = "deno " + package.JSR_DENO_VERSION
 
         def command(argv, cwd, output, timeout, env):
+            if argv[-1] == "--version":
+                versions.append((argv, Path(output).name, env))
+                Path(output).mkdir()
+                (Path(output) / "stdout.bin").write_text(self.deno + " (stable, release)\n")
+                return dict(exit=0, timeout=False, error=None, reaped=True)
             seen.append((argv, sorted(p.name for p in Path(cwd).iterdir()), Path(output).name, env))
             self.assertFalse(Path(cwd).resolve().is_relative_to(ROOT))
             deno_listing(cwd, output, self.unlisted)
@@ -300,8 +307,33 @@ class JsrTests(unittest.TestCase):
         self.assertEqual(output, "jsr-dry-run")
         self.assertEqual(env["DENO_DIR"], str(out / "deno-dir"))
         self.assertEqual(env["PATH"], "/bin")
+        # The Deno version is checked first, with no other environment than PATH.
+        self.assertEqual(
+            versions,
+            [
+                (
+                    [str(Path("/deno")), "--version"],
+                    "jsr-dry-run-version",
+                    {"PATH": "/bin", "DENO_NO_UPDATE_CHECK": "1"},
+                )
+            ],
+        )
+        # Deno 2.8.2 and later rewrite paludarium.wasm's import module names
+        # (denoland/deno#37171): no dry run with them.
+        self.deno = "deno 2.9.8"
+        for name in ("jsr-dry-run", "jsr-dry-run-version"):
+            (out / name).rename(out / ("old-" + name))
+        with (
+            unittest.mock.patch.object(check, "run_command", side_effect=command),
+            self.assertRaisesRegex(ValueError, "needs Deno " + package.JSR_DENO_VERSION),
+        ):
+            package.jsr_check(
+                out, tarball, self.config, self.version, Path("/deno"), {"PATH": "/bin"}
+            )
+        self.assertEqual(len(seen), 1)
+        self.deno = "deno " + package.JSR_DENO_VERSION
+        (out / "jsr-dry-run-version").rename(out / "older-jsr-dry-run-version")
         self.unlisted = ("paludarium.wasm",)
-        (out / "jsr-dry-run").rename(out / "first")
         with (
             unittest.mock.patch.object(check, "run_command", side_effect=command),
             self.assertRaisesRegex(ValueError, "does not list exactly the files"),

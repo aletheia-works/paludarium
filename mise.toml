@@ -23,8 +23,9 @@ cargo-deny = "latest"
 "aqua:taiki-e/cargo-llvm-cov" = "latest"
 # The npm package, its tests and the documentation site.
 node = "latest"
-# The JSR publication of the npm package (deno publish).
-deno = "latest"
+# The JSR publication of the npm package (deno publish). Pinned as CI pins it:
+# later Deno rewrites the Wasm's import module names (denoland/deno#37171).
+deno = "2.8.1"
 bun = "latest"
 # Release and test scripts.
 python = "latest"

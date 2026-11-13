@@ -589,7 +589,9 @@ fn sys_time(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 /// `clock_getres`: 1 ns for every clock, as Linux's high-resolution timers
 /// give, except the coarse ones, which move by the host's tick
-/// ([`scheduler_slice`]), and the CPU clocks Linux counts by ticks, a tick.
+/// ([`scheduler_slice`]), and the CPU clocks Linux counts by ticks
+/// (`CPUCLOCK_PROF`, `CPUCLOCK_VIRT`), a tick; a `CPUCLOCK_SCHED` one, as
+/// `CLOCK_PROCESS_CPUTIME_ID` and `CLOCK_THREAD_CPUTIME_ID`, 1 ns.
 /// A CPU clock of another task must name a process, or a thread of the
 /// caller's ([`cpu_clock`]).
 fn sys_clock_getres(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {

@@ -892,3 +892,73 @@ fn itimer_alarm_rounds_what_was_left() {
     assert_eq!(f.ret(nr::GETITIMER, &[0, DATA + 64]), 0);
     assert_eq!(itimerval_at(&f, DATA + 64), [0, 0, 7, 0]);
 }
+/// A POSIX timer on the process's CPU clock counts the process's CPU time
+/// (here the monotonic clock since the thread's first account) and sends
+/// its signal at the checkpoint that finds it due, then runs on by its
+/// interval.
+#[test]
+fn posix_timer_on_the_process_cpu_clock_sends_its_signal() {
+    let mut f = fixture();
+    f.thread.state.signal_mask = 1 << 9; // SIGUSR1 blocked, to stay pending
+    set_monotonic(&f, 1_000_000_000);
+    f.mem.write_u64(GuestAddr(DATA + 256), 42).unwrap();
+    f.mem.write_u64(GuestAddr(DATA + 264), 10).unwrap(); // SIGEV_SIGNAL, SIGUSR1
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[2, DATA + 256, DATA + 320]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 320)).unwrap() as u32, 0);
+    write_itimerval(&f, DATA, [1, 0, 2, 0]); // every 1 s, from 2 s on
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[0, 0, DATA, 0]), 0);
+    set_monotonic(&f, 2_000_000_000);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [1, 0, 1, 0]);
+    set_monotonic(&f, 2_999_999_999);
+    f.kernel.checkpoint(&mut f.thread, &f.mem);
+    assert_eq!(f.ret(127, &[DATA + 128, 8]), 0); // rt_sigpending
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 0);
+    set_monotonic(&f, 3_000_000_000);
+    f.kernel.checkpoint(&mut f.thread, &f.mem);
+    assert_eq!(f.ret(127, &[DATA + 128, 8]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 1 << 9);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [1, 0, 1, 0]);
+    // The CPU clocks of other processes and threads are not modelled.
+    let other = (!0u64 << 3) | 2;
+    assert_eq!(
+        f.ret(nr::TIMER_CREATE, &[other, DATA + 256, DATA + 320]),
+        errno(Errno::EINVAL)
+    );
+}
+/// A SIGEV_NONE timer on the thread's CPU clock is never armed: reading it
+/// moves its interval on past the clock, as Linux's `bump_cpu_timer`, and a
+/// disarmed one shows no interval either.
+#[test]
+fn posix_timer_on_the_thread_cpu_clock_reads_as_linux() {
+    let mut f = fixture();
+    set_monotonic(&f, 1_000_000_000);
+    f.mem.write_u64(GuestAddr(DATA + 264), 1 << 32).unwrap(); // SIGEV_NONE
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[3, DATA + 256, DATA + 320]), 0);
+    write_itimerval(&f, DATA + 64, [7, 7, 7, 7]);
+    // Absolute: at 0.5 s of the thread's CPU time, then every 0.25 s.
+    write_itimerval(&f, DATA, [0, 250_000_000, 0, 500_000_000]);
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[0, 1, DATA, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0, 0, 0, 0]);
+    set_monotonic(&f, 3_000_000_000); // 2 s of CPU time
+    f.kernel.checkpoint(&mut f.thread, &f.mem);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[0, DATA + 64]), 0);
+    assert_eq!(
+        itimerval_at(&f, DATA + 64),
+        [0, 250_000_000, 0, 250_000_000]
+    );
+    // Disarming gives the old value; then nothing shows, the interval
+    // included.
+    write_itimerval(&f, DATA, [5, 0, 0, 0]);
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[0, 0, DATA, DATA + 64]), 0);
+    assert_eq!(
+        itimerval_at(&f, DATA + 64),
+        [0, 250_000_000, 0, 250_000_000]
+    );
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64), [0, 0, 0, 0]);
+    // A value past KTIME_MAX is clamped to it, not refused.
+    write_itimerval(&f, DATA, [0, 0, i64::MAX as u64, 0]);
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[0, 0, DATA, 0]), 0);
+}

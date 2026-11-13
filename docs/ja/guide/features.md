@@ -1886,11 +1886,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   それぞれの時計でその倍数ちょうどに来ます。`clock_getres` は 1 ns、粗い時計では
   ティックの長さを返します。
 - `clock_nanosleep` と `timer_create` は、`CLOCK_REALTIME`、`CLOCK_MONOTONIC`、
-  `CLOCK_BOOTTIME`、`CLOCK_TAI` で動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
+  `CLOCK_BOOTTIME`、`CLOCK_TAI` で動きます。`timer_create` は、プロセスとスレッドの
+  CPU 時計でも動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
   粗い時計は読むことしかできないので `EOPNOTSUPP` になり、スレッドの CPU 時計で眠る
   ときも `EOPNOTSUPP` です。`clock_nanosleep` は、`flags` のうち `TIMER_ABSTIME`
-  しか見ません。プロセスの CPU 時計で眠ること、CPU 時間のタイマー、アラームの時計は
-  まだ再現していません（`EINVAL`）。
+  しか見ません。プロセスの CPU 時計で眠ること、ほかのプロセスやスレッドの CPU 時計、
+  アラームの時計はまだ再現していません（`EINVAL`）。
 - プロセスの実時間のインターバルタイマー（`ITIMER_REAL`）は、Linux と同じく、満了すると
   `SIGALRM` を送り、間隔の分だけ次に進みます。`setitimer` はタイマーより先に新しい値を読んで
   確かめ、古い値はタイマーを設定してから書き出すので、古い値を書けないときはタイマーを設定した
@@ -2019,13 +2020,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベントが溜まっている間読めると見ます。エッジトリガーの `epoll` は、イベントが
   1 つ溜まるたびにエッジを受けます。インスタンスの最後のディスクリプタを閉じると
   ウォッチも消えます。書き込みは `EBADF`、`pread` は `ESPIPE`、`lseek` は 0 です。
-- POSIX タイマーは `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き、プロセスへの
+- POSIX タイマーは上の時計で動き、プロセスへの
   シグナル（`SIGEV_SIGNAL`。`SI_TIMER` の siginfo とオーバーランつき）か、プロセスの
   中の 1 つのスレッドへのシグナル（`SIGEV_THREAD_ID`）で知らせるか、何も知らせません
   （`SIGEV_NONE`）。`SIGEV_THREAD` は、Linux と同じく `SIGEV_SIGNAL` として扱います
   （スレッドは C ライブラリが `SIGEV_THREAD_ID` を使って作ります）。スレッドへの
   タイマーのシグナルは、そのスレッドがまだ受け取っていない間だけオーバーランに足され、
-  スレッドが終わっていれば失われます。CPU 時間の時計のタイマーは `EINVAL` を返します。タイマーは
+  スレッドが終わっていれば失われます。`CLOCK_PROCESS_CPUTIME_ID` のタイマーはプロセスの
+  CPU 時間を、`CLOCK_THREAD_CPUTIME_ID` のタイマーはそれを作ったスレッドの CPU 時間を、
+  Linux の `posix_cpu_timer_*` と同じように数えます。値はその時間で表し
+  （`TIMER_ABSTIME` なら絶対時刻）、`KTIME_MAX` で頭打ちにします。止めると間隔も含めて
+  何も示さず、`SIGEV_NONE` のタイマーは読んだときに間隔の分だけ進めます。時計の
+  スレッドが終わったあとは、`timer_settime` は `ESRCH` を返し、`timer_gettime` は何も
+  示しません。タイマーは
   `fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、プロセス全体に
   届いてブロックされているシグナルも受け取ります。
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が

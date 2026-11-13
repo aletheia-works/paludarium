@@ -6463,6 +6463,139 @@ static int cpu_itimer_case(const char *self) {
            WIFSIGNALED(status) ? WTERMSIG(status) : -1);
     return 0;
 }
+/* POSIX timers on the CPU-time clocks. What is printed holds whatever the
+ * speed: times left are only bounded, and counts only from below. */
+static volatile sig_atomic_t ct_fired, ct_code, ct_value;
+static void ct_handler(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    (void)context;
+    ct_code = info->si_code;
+    ct_value = info->si_value.sival_int;
+    ct_fired++;
+}
+static long ct_ns(struct timespec t) { return t.tv_sec * 1000000000L + t.tv_nsec; }
+static int ct_create(clockid_t clock, int notify, int signo, int value) {
+    struct sigevent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = notify;
+    ev.sigev_signo = signo;
+    ev.sigev_value.sival_int = value;
+    int id = -1;
+    if (syscall(SYS_timer_create, (long)clock, &ev, &id)) return -errno;
+    return id;
+}
+static long ct_set(int id, int flags, long interval, long value, struct itimerspec *old) {
+    struct itimerspec v = {{interval / 1000000000L, interval % 1000000000L},
+                           {value / 1000000000L, value % 1000000000L}};
+    return syscall(SYS_timer_settime, (long)id, (long)flags, &v, old) ? -errno : 0;
+}
+static struct itimerspec ct_get(int id) {
+    struct itimerspec v;
+    memset(&v, 0x55, sizeof v);
+    syscall(SYS_timer_gettime, (long)id, &v);
+    return v;
+}
+static int ct_thread_timer;
+static void *ct_thread_creates(void *arg) {
+    (void)arg;
+    ct_thread_timer = ct_create(CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE, 0, 0);
+    ct_set(ct_thread_timer, 0, 0, 100000000000L, NULL);
+    return NULL;
+}
+static void *ct_thread_spins(void *arg) {
+    (void)arg;
+    struct timespec t;
+    long end;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    end = ct_ns(t) + 60000000L;
+    do {
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    } while (ct_ns(t) < end);
+    return NULL;
+}
+static int cpu_timer_case(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = ct_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGUSR1, &sa, NULL);
+    /* The process's clock: a signal every interval while the CPU runs,
+       from the timer (SI_TIMER), with its value. */
+    int id = ct_create(CLOCK_PROCESS_CPUTIME_ID, SIGEV_SIGNAL, SIGUSR1, 77);
+    printf("process create=%d\n", id >= 0);
+    ct_set(id, 0, 10000000L, 10000000L, NULL);
+    long end = cit_cpu() + 20000000000L;
+    while (ct_fired < 3 && cit_cpu() < end)
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+    struct itimerspec v = ct_get(id);
+    printf("process fired=%d code=%d value=%d interval=%ld left-in-range=%d\n", ct_fired >= 3,
+           (int)ct_code, (int)ct_value, ct_ns(v.it_interval),
+           ct_ns(v.it_value) > 0 && ct_ns(v.it_value) <= 10000000L);
+    /* Disarmed, it shows nothing; the old value had the interval. */
+    struct itimerspec old;
+    ct_set(id, 0, 0, 0, &old);
+    v = ct_get(id);
+    printf("process disarmed old-interval=%ld now=%ld %ld\n", ct_ns(old.it_interval),
+           ct_ns(v.it_interval), ct_ns(v.it_value));
+    syscall(SYS_timer_delete, (long)id);
+    /* SIGEV_NONE: counts down; a one-shot one that has expired shows 0,
+       and an interval one is moved on when it is read. */
+    id = ct_create(CLOCK_PROCESS_CPUTIME_ID, SIGEV_NONE, 0, 0);
+    ct_set(id, 0, 0, 1000000000L, NULL);
+    v = ct_get(id);
+    printf("none left-in-range=%d\n", ct_ns(v.it_value) > 500000000L &&
+                                          ct_ns(v.it_value) <= 1000000000L);
+    ct_set(id, TIMER_ABSTIME, 0, 1, NULL);
+    v = ct_get(id);
+    printf("none expired=%ld %ld\n", ct_ns(v.it_interval), ct_ns(v.it_value));
+    ct_set(id, TIMER_ABSTIME, 1000000000L, 1, NULL);
+    v = ct_get(id);
+    printf("none bumped interval=%ld left-in-range=%d\n", ct_ns(v.it_interval),
+           ct_ns(v.it_value) > 0 && ct_ns(v.it_value) <= 1000000000L);
+    /* A value past KTIME_MAX is clamped to it. */
+    struct itimerspec huge = {{0, 0}, {LONG_MAX, 0}};
+    printf("none huge set=%ld\n",
+           syscall(SYS_timer_settime, (long)id, 0L, &huge, NULL) ? -errno : 0L);
+    v = ct_get(id);
+    printf("none huge sec=%ld\n", (long)v.it_value.tv_sec);
+    syscall(SYS_timer_delete, (long)id);
+    /* The thread's clock counts that thread's CPU time only. */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    id = ct_create(CLOCK_THREAD_CPUTIME_ID, SIGEV_SIGNAL, SIGUSR2, 5);
+    ct_set(id, 0, 0, 30000000L, NULL);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, ct_thread_spins, NULL)) return 1;
+    pthread_join(thread, NULL);
+    sigset_t pending;
+    sigpending(&pending);
+    int other = sigismember(&pending, SIGUSR2);
+    ct_thread_spins(NULL);
+    siginfo_t info;
+    int got = sigwaitinfo(&set, &info);
+    printf("thread other=%d own=%d code=%d value=%d\n", other, got == SIGUSR2, info.si_code,
+           info.si_value.sival_int);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+    syscall(SYS_timer_delete, (long)id);
+    /* A timer on the clock of a thread that has gone: ESRCH to set, and
+       nothing to read. */
+    if (pthread_create(&thread, NULL, ct_thread_creates, NULL)) return 1;
+    pthread_join(thread, NULL);
+    long set_result = 0;
+    for (int i = 0; i < 1000000 && set_result != -ESRCH; i++) {
+        set_result = ct_set(ct_thread_timer, 0, 0, 1000000000L, NULL);
+        if (set_result != -ESRCH) sched_yield();
+    }
+    v = ct_get(ct_thread_timer);
+    printf("gone set=%ld now=%ld %ld delete=%ld\n", set_result, ct_ns(v.it_interval),
+           ct_ns(v.it_value), syscall(SYS_timer_delete, (long)ct_thread_timer));
+    return 0;
+}
 /* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
  * SIGKILL at the hard limit. Each part runs in a child, whose CPU time
  * starts from 0. */
@@ -20806,6 +20939,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
+    if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {
         struct itimerval v;
         syscall(SYS_getitimer, 1L, &v);

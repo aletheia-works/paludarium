@@ -74,13 +74,17 @@ pub struct ThreadGroup {
     fsize: AtomicU64,
     pub(crate) futexes: Futexes,
     pub(crate) timers: Mutex<crate::timers::Timers>,
-    /// Every thread's CPU time, live or exited, for the process's total.
-    cpu: Mutex<Vec<Arc<AtomicU64>>>,
+    /// Every thread's CPU time, live or exited, for the process's total,
+    /// with the thread's ID, for its own clock.
+    cpu: Mutex<Vec<(u32, Arc<AtomicU64>)>>,
     /// The interval timers of the process's CPU time and its `RLIMIT_CPU`,
     /// and whether either asks for the CPU time to be checked. Locked
     /// before `cpu` and `process_inbox`.
     cpu_timers: Mutex<CpuTimers>,
     cpu_timers_armed: std::sync::atomic::AtomicBool,
+    /// Whether a POSIX timer on a CPU-time clock is armed
+    /// ([`crate::timers::Timers::cpu_armed`]).
+    posix_cpu_armed: std::sync::atomic::AtomicBool,
     /// The core dump a fatal signal started, which the last thread to end
     /// writes. Locked before `members`.
     pub(crate) core: Mutex<Option<crate::coredump::Dump>>,
@@ -199,6 +203,7 @@ impl Default for ThreadGroup {
             cpu: Mutex::default(),
             cpu_timers: Mutex::default(),
             cpu_timers_armed: std::sync::atomic::AtomicBool::new(false),
+            posix_cpu_armed: std::sync::atomic::AtomicBool::new(false),
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
             robust_lists: Mutex::default(),
@@ -476,11 +481,11 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
-    pub(crate) fn register_cpu(&self, used: Arc<AtomicU64>) {
+    pub(crate) fn register_cpu(&self, tid: u32, used: Arc<AtomicU64>) {
         self.cpu
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(used);
+            .push((tid, used));
     }
     /// The process's CPU time: the sum of its threads' latest accounts.
     pub(crate) fn process_cpu(&self) -> u64 {
@@ -488,14 +493,45 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|used| used.load(Ordering::SeqCst))
+            .map(|(_, used)| used.load(Ordering::SeqCst))
             .fold(0u64, u64::saturating_add)
+    }
+    /// The CPU time of thread `tid` while it is live, as of its latest
+    /// account (0 before its first).
+    pub(crate) fn thread_cpu(&self, tid: u32) -> Option<u64> {
+        if !self.has_member(tid) {
+            return None;
+        }
+        Some(
+            self.cpu
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .rev()
+                .find(|(owner, _)| *owner == tid)
+                .map_or(0, |(_, used)| used.load(Ordering::SeqCst)),
+        )
+    }
+    /// The time of a POSIX timer's CPU-time clock; ESRCH once the thread
+    /// whose clock it is has exited (Linux's `timer_lock_sighand` finds no
+    /// task), and the monotonic clock's `mono` for the others.
+    pub(crate) fn timer_clock_now(
+        &self,
+        clock: crate::timers::TimerClock,
+        mono: u64,
+    ) -> Result<u64, Errno> {
+        use crate::timers::TimerClock;
+        match clock {
+            TimerClock::Process => Ok(self.process_cpu()),
+            TimerClock::Thread(tid) => self.thread_cpu(tid).ok_or(Errno(3)), // ESRCH
+            TimerClock::Monotonic | TimerClock::Realtime => Ok(mono),
+        }
     }
     /// Whether an interval timer of the process's CPU time is armed or its
     /// `RLIMIT_CPU` is set, so that a checkpoint brings the thread's CPU
     /// time up to date for them.
     pub(crate) fn cpu_timers_armed(&self) -> bool {
-        self.cpu_timers_armed.load(Ordering::SeqCst)
+        self.cpu_timers_armed.load(Ordering::SeqCst) || self.posix_cpu_armed.load(Ordering::SeqCst)
     }
     /// The CPU-time interval timer `index` (0 for `ITIMER_VIRTUAL`, 1 for
     /// `ITIMER_PROF`) as its interval and the time left, replaced by `new`
@@ -703,7 +739,13 @@ impl ThreadGroup {
         local: &mut ThreadState,
         f: impl FnOnce(&mut crate::timers::Timers) -> T,
     ) -> T {
-        let result = f(&mut self.timers.lock().unwrap_or_else(PoisonError::into_inner));
+        let result = {
+            let mut timers = self.timers.lock().unwrap_or_else(PoisonError::into_inner);
+            let result = f(&mut timers);
+            self.posix_cpu_armed
+                .store(timers.cpu_armed(), Ordering::SeqCst);
+            result
+        };
         local.posix_deadline = self.posix_deadline();
         self.timers_changed();
         result
@@ -727,17 +769,39 @@ impl ThreadGroup {
     pub(crate) fn expire_timer(&self, local: &mut ThreadState, now: u64) {
         self.discards.apply(local);
         self.expire_cpu_timers();
+        // The CPU times of the process and its live threads, taken before
+        // the timers are locked.
+        let cpu = self.posix_cpu_armed.load(Ordering::SeqCst).then(|| {
+            let process = self.process_cpu();
+            let live: Vec<u32> = self
+                .members
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .keys()
+                .copied()
+                .collect();
+            let threads: BTreeMap<u32, u64> = live
+                .into_iter()
+                .filter_map(|tid| self.thread_cpu(tid).map(|used| (tid, used)))
+                .collect();
+            (process, threads)
+        });
         {
             let mut pending = self
                 .process_pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             signals::expire_timer(&mut pending, now);
-            let directed = self
-                .timers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .expire(&mut pending, now);
+            let mut timers = self.timers.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut directed = timers.expire(&mut pending, now);
+            if let Some((process, threads)) = &cpu {
+                directed.extend(
+                    timers.expire_cpu(&mut pending, *process, |tid| threads.get(&tid).copied()),
+                );
+                self.posix_cpu_armed
+                    .store(timers.cpu_armed(), Ordering::SeqCst);
+            }
+            drop(timers);
             local.timer = pending.timer;
             drop(pending);
             // A thread that has exited loses its timer's signal, as on Linux.

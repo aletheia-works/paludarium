@@ -162,14 +162,19 @@ impl Eq for CpuAccount {}
 /// Brings the thread's CPU time up to date and returns it in nanoseconds;
 /// called at every system call, which publishes it for the process clock,
 /// and by the system calls that read the CPU clocks.
-pub(crate) fn account_cpu(host: &dyn Host, group: &ThreadGroup, state: &mut ThreadState) -> u64 {
+pub(crate) fn account_cpu(
+    host: &dyn Host,
+    group: &ThreadGroup,
+    state: &mut ThreadState,
+    tid: u32,
+) -> u64 {
     let now = host
         .thread_cpu_time()
         .or_else(|_| host.clock(paludarium_host::ClockId::Monotonic))
         .unwrap_or(0);
     let account = &mut state.cpu;
     let base = *account.base.get_or_insert_with(|| {
-        group.register_cpu(Arc::clone(&account.used));
+        group.register_cpu(tid, Arc::clone(&account.used));
         now
     });
     let used = now.saturating_sub(base);
@@ -687,7 +692,7 @@ impl Kernel {
         // The CPU-time interval timers count what this thread has run since
         // its last system call too, as Linux's tick does.
         if self.group.cpu_timers_armed() {
-            account_cpu(&*self.host, &self.group, &mut thread.state);
+            account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
         }
         if let Ok(now) = self.host.clock(paludarium_host::ClockId::Monotonic) {
             self.group.expire_timer(&mut thread.state, now);
@@ -987,7 +992,7 @@ impl Kernel {
         // to itself), so that it does not merge into a discarded one.
         self.group.apply_discards(&mut thread.state);
         self.group.sync_timer(&mut thread.state);
-        account_cpu(&*self.host, &self.group, &mut thread.state);
+        account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
         // The number is an int, as Linux's do_syscall_64 takes it, compared
         // unsigned: a dirty upper half of rax is not read, and a negative
         // number is past every table (ENOSYS).

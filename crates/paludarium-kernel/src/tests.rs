@@ -2283,8 +2283,9 @@ fn posix_timers_check_arguments_and_report_their_state() {
     assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 5); // interval
     assert!(f.mem.read_u64(GuestAddr(old + 16)).unwrap() >= 9); // seconds left
     assert_eq!(f.ret(nr::TIMER_GETOVERRUN, &[1]), 0);
-    // Errors: clocks, signals and notifications that are not supported.
-    assert_eq!(f.ret(nr::TIMER_CREATE, &[2, 0, id]), errno(Errno::EINVAL));
+    // Errors: clocks (the alarm clocks), signals and notifications that are
+    // not supported.
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[8, 0, id]), errno(Errno::EINVAL)); // CLOCK_REALTIME_ALARM
     f.mem.write_u64(GuestAddr(sev + 8), 99).unwrap();
     assert_eq!(f.ret(nr::TIMER_CREATE, &[1, sev, id]), errno(Errno::EINVAL));
     f.mem.write_u64(GuestAddr(sev + 8), 4 << 32 | 10).unwrap(); // SIGEV_THREAD_ID
@@ -2300,7 +2301,6 @@ fn posix_timers_check_arguments_and_report_their_state() {
             errno(Errno::EOPNOTSUPP)
         );
     }
-    assert_eq!(f.ret(nr::TIMER_CREATE, &[3, 0, id]), errno(Errno::EINVAL));
     assert_eq!(f.ret(nr::TIMER_CREATE, &[99, 0, id]), errno(Errno::EINVAL));
     assert_eq!(
         f.ret(nr::TIMER_SETTIME, &[1, 2, spec, 0]),

@@ -393,8 +393,9 @@ pub(crate) fn err(e: Errno) -> Outcome {
 /// on, as Linux's `k_clock`s give them: TAI on the real-time clock (its
 /// offset is 0), BOOTTIME on the monotonic one (this host never suspends).
 /// MONOTONIC_RAW and the coarse clocks can only be read (`EOPNOTSUPP`), as
-/// can the thread's CPU clock for a sleep (`thread`), but the CPU clocks and
-/// the alarm clocks are not modelled (`EINVAL`), nor are unknown clocks.
+/// can the thread's CPU clock for a sleep (`thread`). A sleep on the
+/// process's CPU clock and the alarm clocks are not modelled (`EINVAL`), nor
+/// are unknown clocks; [`posix_timer_clock`] adds the CPU clocks for timers.
 fn timer_clock(id: u64, thread: Errno) -> Result<ClockId, Errno> {
     match id as u32 as i32 {
         0 | 11 => Ok(ClockId::Realtime),
@@ -449,7 +450,7 @@ fn guest_clock(id: u64) -> Result<GuestClock, Errno> {
     })
 }
 fn read_clock(c: &mut Context<'_>, clock: GuestClock) -> Result<u64, Errno> {
-    let thread = crate::account_cpu(c.host, c.group, c.process);
+    let thread = crate::account_cpu(c.host, c.group, c.process, c.tid);
     match clock {
         GuestClock::Host(id) => c.host.clock(id),
         GuestClock::Coarse(id) => {
@@ -710,7 +711,7 @@ fn cpu_itimerval(interval: u64, remaining: u64) -> [u64; 4] {
 /// The CPU-time interval timer `which` names, as of the caller's CPU time
 /// now, replaced by `new` (a value and an interval) when there is one.
 fn swap_cpu_timer(c: &mut Context<'_>, which: i32, new: Option<(u64, u64)>) -> [u64; 4] {
-    crate::account_cpu(c.host, c.group, c.process);
+    crate::account_cpu(c.host, c.group, c.process, c.tid);
     let index = usize::from(which == ITIMER_PROF);
     let (interval, remaining) = c.group.swap_cpu_timer(index, new);
     cpu_itimerval(interval, remaining)
@@ -818,8 +819,24 @@ fn outcome(result: Result<u64, Errno>) -> Outcome {
     Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
 }
 
-/// `timer_create(clock, sevp, timerid)`, on the clocks [`timer_clock`]
-/// gives (the CPU-time clocks give EINVAL), notified by a signal to the
+/// The clock of a `timer_create` timer: those of [`timer_clock`], and the
+/// calling process's and thread's CPU-time clocks (Linux's
+/// `posix_cpu_timer_create`). The CPU clocks of other processes and threads
+/// (negative clock IDs) are not modelled (`EINVAL`).
+fn posix_timer_clock(id: u64, tid: u32) -> Result<crate::timers::TimerClock, Errno> {
+    use crate::timers::TimerClock;
+    match id as u32 as i32 {
+        2 => Ok(TimerClock::Process),
+        3 => Ok(TimerClock::Thread(tid)),
+        _ => timer_clock(id, Errno::EINVAL).map(|clock| match clock {
+            ClockId::Realtime => TimerClock::Realtime,
+            ClockId::Monotonic => TimerClock::Monotonic,
+        }),
+    }
+}
+
+/// `timer_create(clock, sevp, timerid)`, on the clocks
+/// [`posix_timer_clock`] gives, notified by a signal to the
 /// process or (SIGEV_THREAD_ID) to one of its threads, or not at all. The
 /// kernel treats SIGEV_THREAD, which the C library implements itself, as
 /// SIGEV_SIGNAL. Linux copies the whole 64-byte struct sigevent before it
@@ -831,7 +848,7 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .check_read(GuestAddr(a[1]), 64)
                 .map_err(|_| Errno::EFAULT)?;
         }
-        let realtime = timer_clock(a[0], Errno::EINVAL)? == ClockId::Realtime;
+        let clock = posix_timer_clock(a[0], c.tid)?;
         let (signal, value, thread) = if a[1] == 0 {
             (Some(14), None, None) // SIGALRM, with the timer ID as its value
         } else {
@@ -859,7 +876,7 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             .map_err(|_| Errno::EFAULT)?;
         let id = c.group.with_timers(c.process, |timers| {
             timers.create(crate::timers::PosixTimer {
-                realtime,
+                clock,
                 signal,
                 thread,
                 ..Default::default()
@@ -904,8 +921,88 @@ fn timer_state(timer: &crate::timers::PosixTimer, now: u64) -> [u64; 4] {
     itimerspec(timer.interval, remaining)
 }
 
+/// A CPU-time timer's interval and time left at `now`, as Linux's
+/// `__posix_cpu_timer_get`: an expiry that has come shows 1 ns left while
+/// its signal is to come, and none for `SIGEV_NONE`, whose interval timer,
+/// never armed, is moved on past `now` here instead (`bump_cpu_timer`).
+fn cpu_timer_left(timer: &mut crate::timers::PosixTimer, now: u64) -> u64 {
+    let Some(expires) = timer.deadline else {
+        return 0;
+    };
+    let expires = match timer.interval {
+        interval if interval != 0 && timer.signal.is_none() && now >= expires => {
+            let n = (now - expires) / interval + 1;
+            let next = n
+                .checked_mul(interval)
+                .and_then(|delta| expires.checked_add(delta))
+                .unwrap_or(u64::MAX);
+            timer.deadline = Some(next);
+            next
+        }
+        _ => expires,
+    };
+    if now < expires {
+        expires - now
+    } else {
+        u64::from(timer.signal.is_some())
+    }
+}
+
+/// `struct timespec` as Linux's `timespec64_to_ktime` takes it to
+/// nanoseconds, clamped to `KTIME_MAX`.
+fn timespec_ktime(seconds: u64, nanos: u64) -> Result<u64, Errno> {
+    const KTIME_SEC_MAX: u64 = i64::MAX as u64 / 1_000_000_000;
+    if (seconds as i64) < 0 || nanos >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(if seconds >= KTIME_SEC_MAX {
+        i64::MAX as u64
+    } else {
+        seconds * 1_000_000_000 + nanos
+    })
+}
+
 fn timer_id(value: u64) -> i32 {
     value as u32 as i32
+}
+
+/// The clock of timer `id`, which a CPU-time timer's time is sampled on
+/// before the timers are locked.
+fn timer_clock_of(c: &Context<'_>, id: i32) -> Result<crate::timers::TimerClock, Errno> {
+    c.group
+        .timers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .map(|timer| timer.clock)
+}
+
+/// `timer_settime` on a CPU-time clock, as Linux's `posix_cpu_timer_set`:
+/// the value is taken in the clock's time, relative to `now` unless
+/// TIMER_ABSTIME is given, and the old value is what
+/// `__posix_cpu_timer_get` gives, with the interval the timer had. An
+/// expiry that has already come sends the signal at the next checkpoint.
+fn set_cpu_timer(
+    timer: &mut crate::timers::PosixTimer,
+    flags: u64,
+    [i_sec, i_nsec, v_sec, v_nsec]: [u64; 4],
+    now: u64,
+) -> Result<[u64; 4], Errno> {
+    let (interval, value) = (
+        timespec_ktime(i_sec, i_nsec)?,
+        timespec_ktime(v_sec, v_nsec)?,
+    );
+    let old = itimerspec(timer.interval, cpu_timer_left(timer, now));
+    timer.deadline = (value != 0).then(|| {
+        if flags & TIMER_ABSTIME != 0 {
+            value
+        } else {
+            value.saturating_add(now)
+        }
+    });
+    timer.interval = if value == 0 { 0 } else { interval };
+    timer.overrun = 0;
+    Ok(old)
 }
 
 /// `timer_settime(id, flags, new, old)`, in Linux's order: read and check the
@@ -915,17 +1012,36 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if a[2] == 0 {
             return Err(Errno::EINVAL);
         }
-        let [i_sec, i_nsec, v_sec, v_nsec] = read_words::<4>(c.mem, a[2])?;
-        let (interval, value) = (timespec_ns(i_sec, i_nsec)?, timespec_ns(v_sec, v_nsec)?);
+        let new = read_words::<4>(c.mem, a[2])?;
+        let [i_sec, i_nsec, v_sec, v_nsec] = new;
+        timespec_ktime(i_sec, i_nsec)?;
+        timespec_ktime(v_sec, v_nsec)?;
         if a[1] & !TIMER_ABSTIME != 0 {
             return Err(Errno::EINVAL);
         }
         let mono = c.host.clock(ClockId::Monotonic)?;
         let real = c.host.clock(ClockId::Realtime)?;
+        let clock = timer_clock_of(c, timer_id(a[0]))?;
+        if clock.is_cpu() {
+            crate::account_cpu(c.host, c.group, c.process, c.tid);
+            let now = c.group.timer_clock_now(clock, mono)?;
+            let old = c.group.with_timers(c.process, |timers| {
+                set_cpu_timer(timers.get_mut(timer_id(a[0]))?, a[1], new, now)
+            })?;
+            if a[3] != 0 {
+                write_words(c.mem, a[3], &old)?;
+            }
+            return Ok(0);
+        }
+        let (interval, value) = (timespec_ns(i_sec, i_nsec)?, timespec_ns(v_sec, v_nsec)?);
         let old = c.group.with_timers(c.process, |timers| {
             let timer = timers.get_mut(timer_id(a[0]))?;
             let old = timer_state(timer, mono);
-            let now = if timer.realtime { real } else { mono };
+            let now = if timer.clock == crate::timers::TimerClock::Realtime {
+                real
+            } else {
+                mono
+            };
             timer.deadline = (value != 0).then(|| {
                 let delay = if a[1] & TIMER_ABSTIME != 0 {
                     value.saturating_sub(now)
@@ -948,8 +1064,24 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 fn sys_timer_gettime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome((|| {
         let mono = c.host.clock(ClockId::Monotonic)?;
+        let clock = timer_clock_of(c, timer_id(a[0]))?;
+        // A CPU-time timer shows nothing once it is disarmed, or once the
+        // thread whose clock it is has gone (Linux's `posix_cpu_timer_get`).
+        let now = if clock.is_cpu() {
+            crate::account_cpu(c.host, c.group, c.process, c.tid);
+            c.group.timer_clock_now(clock, mono).ok()
+        } else {
+            Some(mono)
+        };
         let state = c.group.with_timers(c.process, |timers| {
-            timers.get_mut(timer_id(a[0])).map(|t| timer_state(t, mono))
+            timers.get_mut(timer_id(a[0])).map(|t| match now {
+                _ if !clock.is_cpu() => timer_state(t, mono),
+                Some(now) if t.deadline.is_some() => {
+                    let left = cpu_timer_left(t, now);
+                    itimerspec(t.interval, left)
+                }
+                _ => [0; 4],
+            })
         })?;
         write_words(c.mem, a[1], &state)?;
         Ok(0)
@@ -2937,7 +3069,7 @@ pub(crate) fn rusage(cpu: u64) -> [u8; 144] {
 /// thread (RUSAGE_THREAD) or the children waited for (RUSAGE_CHILDREN), as
 /// [`rusage`] lays it out; any other `who` is `EINVAL`.
 fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let thread = crate::account_cpu(c.host, c.group, c.process);
+    let thread = crate::account_cpu(c.host, c.group, c.process, c.tid);
     let cpu = match a[0] as i32 {
         0 => c.group.process_cpu(),
         1 => thread,
@@ -2954,7 +3086,7 @@ fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// monotonic clock in ticks as the return value.
 fn sys_times(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = (|| {
-        crate::account_cpu(c.host, c.group, c.process);
+        crate::account_cpu(c.host, c.group, c.process, c.tid);
         let ticks = |ns: u64| ns / 10_000_000;
         if a[0] != 0 {
             let words = [

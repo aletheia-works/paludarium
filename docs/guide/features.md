@@ -2167,12 +2167,13 @@ kernel.
   fall on whole multiples of it on each clock. `clock_getres` gives 1 ns,
   and the tick for the coarse clocks.
 - `clock_nanosleep` and `timer_create` run on `CLOCK_REALTIME`,
-  `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` and `CLOCK_TAI`. As Linux's,
+  `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` and `CLOCK_TAI`, and `timer_create`
+  on the process's and the thread's CPU clocks too. As Linux's,
   `CLOCK_MONOTONIC_RAW` and the coarse clocks give `EOPNOTSUPP` (they can
   only be read), as does the thread's CPU clock for a sleep, and
-  `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. The process's
-  CPU clock, CPU-time timers and the alarm clocks are not modelled
-  (`EINVAL`).
+  `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. A sleep on the
+  process's CPU clock, the CPU clocks of other processes and threads and
+  the alarm clocks are not modelled (`EINVAL`).
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one
@@ -2321,14 +2322,20 @@ kernel.
   queued, and each queued event is an edge for edge-triggered `epoll`.
   Closing the last descriptor of an instance removes its watches. A write
   gives `EBADF`, `pread` `ESPIPE`, and `lseek` 0.
-- POSIX timers run on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` and notify with
+- POSIX timers run on the clocks above and notify with
   a signal to the process (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and
   overruns), a signal to one of its threads (`SIGEV_THREAD_ID`), or not at all
   (`SIGEV_NONE`). The kernel takes `SIGEV_THREAD` as `SIGEV_SIGNAL`, as Linux
   does; the C library builds the thread on `SIGEV_THREAD_ID`. A thread's timer
   signal adds to its overrun only while the thread has not taken it yet, and
-  is lost if the thread has exited. Timers on the CPU-time clocks give
-  `EINVAL`. Timers are
+  is lost if the thread has exited. A timer on `CLOCK_PROCESS_CPUTIME_ID`
+  counts the process's CPU time, and one on `CLOCK_THREAD_CPUTIME_ID` that
+  of the thread that made it, as Linux's `posix_cpu_timer_*`: its value is
+  in that time (absolute with `TIMER_ABSTIME`), clamped to `KTIME_MAX`; it
+  shows nothing, its interval included, once disarmed; a `SIGEV_NONE` one
+  is moved on by its interval when it is read; and once the thread whose
+  clock it is has exited, `timer_settime` gives `ESRCH` and
+  `timer_gettime` shows nothing. Timers are
   not inherited by `fork` and are deleted by `execve`. `rt_sigtimedwait` also
   takes blocked signals pending for the whole process.
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a

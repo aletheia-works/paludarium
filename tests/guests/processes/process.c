@@ -7064,8 +7064,11 @@ static long rq_old(long op, volatile uint32_t *from, long wake, long requeue, vo
 #define RQ_ATTEMPTS 20
 static int rq_queued(volatile uint32_t *word, long count) {
     rq_begin();
-    while (rq_old(4 | 128, word, 0, INT_MAX, word, 0) != count)
-        if (rq_late()) return 1; else sched_yield();
+    long r;
+    while ((r = rq_old(4 | 128, word, 0, INT_MAX, word, 0)) != count) {
+        if (r < 0 || rq_late()) return 1;
+        sched_yield();
+    }
     *word = 1;
     return 0;
 }

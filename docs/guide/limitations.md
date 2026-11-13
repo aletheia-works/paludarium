@@ -217,6 +217,10 @@ verified.
     mapped. It refuses advice Linux does not know before any range
     (`EINVAL`), as Linux master does; the CI's kernel checks it with each
     range, so with no ranges, or only empty ones, it gives 0 there.
+  - `process_mrelease` takes a process as dying from the moment a SIGKILL
+    is sent to it, but from another fatal signal only once one of its
+    threads takes it, where Linux marks the process as it sends any signal
+    that will end it (`EINVAL` here until then).
   - In a child of `fork`, `move_pages` shows a page of a shared mapping, or
     of a private one never written, that the parent had touched as there,
     where Linux copies no page table of such a VMA (`-ENOENT`

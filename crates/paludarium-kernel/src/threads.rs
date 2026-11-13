@@ -107,6 +107,9 @@ pub struct ThreadGroup {
     /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
     /// SIGNAL_UNKILLABLE), until a fault ends it.
     unkillable: std::sync::atomic::AtomicBool,
+    /// A SIGKILL was sent to the process, which Linux's `complete_signal`
+    /// marks as the whole group's exit (SIGNAL_GROUP_EXIT) as it sends it.
+    killed: std::sync::atomic::AtomicBool,
 }
 /// An interval timer of the process's CPU time, as Linux's `cpu_itimer`:
 /// when it expires, in the process's CPU time (0 while it is disarmed), and
@@ -178,6 +181,7 @@ impl Default for ThreadGroup {
             exe_file: Mutex::default(),
             public: Mutex::default(),
             unkillable: std::sync::atomic::AtomicBool::new(false),
+            killed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -206,6 +210,37 @@ impl ThreadGroup {
     /// The signals thread `tid` last published as blocked.
     pub(crate) fn blocked(&self, tid: u32) -> u64 {
         self.public(tid).map_or(0, |thread| thread.blocked)
+    }
+    /// Marks the process as killed: a SIGKILL was sent to it.
+    pub(crate) fn set_killed(&self) {
+        self.killed.store(true, Ordering::SeqCst);
+    }
+    /// Whether the process is on its way out with nothing left to run, as
+    /// Linux's `__task_will_free_mem` asks: a SIGKILL was sent to it or it
+    /// has begun to exit, and it is not writing a core dump, which still
+    /// reads its memory.
+    pub(crate) fn will_free_memory(&self) -> bool {
+        let ending = self.killed.load(Ordering::SeqCst) || self.status().is_some();
+        ending
+            && self
+                .core
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none()
+    }
+    /// The address spaces its threads run in, as they last published them.
+    pub(crate) fn memory_identities(&self) -> Vec<usize> {
+        self.public
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter_map(|thread| {
+                thread
+                    .memory
+                    .as_ref()
+                    .map(paludarium_mmu::MemoryView::identity)
+            })
+            .collect()
     }
     /// Makes the process the init of a nested PID namespace.
     pub(crate) fn set_unkillable(&self) {

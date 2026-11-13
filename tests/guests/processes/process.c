@@ -6050,6 +6050,46 @@ static int madvise_advice_case(void) {
     printf("dontneed-locked=%ld status=%d bytes=%d\n", r, status, p[2 * page]);
     return 0;
 }
+/* process_mrelease, as Linux master's: only the memory of a dying or exited
+ * process has nothing left to keep, and a reaped one is gone. */
+static long mrelease_errno(int pidfd, unsigned flags) {
+    return syscall(448, pidfd, flags) < 0 ? -errno : 0;
+}
+static int mrelease_case(void) {
+    pid_t child = fork();
+    if (child < 0) return 80;
+    if (child == 0) {
+        for (;;) pause();
+    }
+    int pidfd = syscall(SYS_pidfd_open, child, 0);
+    int own = syscall(SYS_pidfd_open, getpid(), 0);
+    int efd = eventfd(0, 0);
+    if (pidfd < 0 || own < 0 || efd < 0) return 81;
+    long flags = mrelease_errno(pidfd, 1);
+    long flags_first = mrelease_errno(1000, 1);
+    printf("flags=%ld flags-first=%ld\n", flags, flags_first);
+    long not_pidfd = mrelease_errno(efd, 0);
+    long closed = mrelease_errno(1000, 0);
+    long negative = mrelease_errno(-20000, 0);
+    printf("not-pidfd=%ld closed=%ld negative=%ld\n", not_pidfd, closed, negative);
+    long live = mrelease_errno(pidfd, 0);
+    long self = mrelease_errno(own, 0);
+    long self_thread = mrelease_errno(-10000, 0);
+    long self_process = mrelease_errno(-10001, 0);
+    printf("live=%ld self=%ld self-thread=%ld self-process=%ld\n", live, self, self_thread,
+           self_process);
+    if (kill(child, SIGKILL)) return 82;
+    long killed = mrelease_errno(pidfd, 0);
+    printf("killed=%ld\n", killed);
+    siginfo_t info;
+    if (waitid(P_PID, child, &info, WEXITED | WNOWAIT)) return 83;
+    long zombie = mrelease_errno(pidfd, 0);
+    printf("zombie=%ld\n", zombie);
+    if (waitpid(child, NULL, 0) != child) return 84;
+    long reaped = mrelease_errno(pidfd, 0);
+    printf("reaped=%ld\n", reaped);
+    return 0;
+}
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
  * timers are only read here, before any is armed (cpu_itimer_case arms them). */
 static int itimer_case(void) {
@@ -20308,6 +20348,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
     if (!strcmp(mode, "memfd-secret")) return memfd_secret_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
+    if (!strcmp(mode, "mrelease")) return mrelease_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();

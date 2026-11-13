@@ -695,7 +695,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MADV_POPULATE_WRITE` は、読み込みや書き込みと同じようにページを割り当てます
   （ゼロページ、自分のページ）。どのマッピングにもないページ（`ENOMEM`）、マッピングが
   読めないか書けないページ（`EINVAL`）、ファイルの終わりより先のページ（`EFAULT`）で
-  止まります。ほかの指定には `EINVAL` を返します。
+  止まります。`MADV_DONTFORK` と `MADV_DOFORK`、`MADV_WIPEONFORK` と `MADV_KEEPONFORK`、
+  `MADV_DONTDUMP` と `MADV_DODUMP` は、範囲の VMA のフラグを付けたり外したりします。
+  VMA は、Linux と同じように前後の VMA から分かれたり、つながったりします
+  （`/proc/<pid>/maps`）。VMA を順に処理し、受け付けない VMA があればそこで `EINVAL`
+  で止まります（`MADV_WIPEONFORK` はプライベートの匿名メモリだけです）。範囲に穴が
+  あれば、残りを処理してから `ENOMEM` を返します。`fork` の子は、`MADV_DONTFORK` の
+  マッピングを受け継がず、`MADV_WIPEONFORK` のマッピングはページなしの、0 で埋まった
+  新しいメモリとして受け継ぎます。そのフラグと `MADV_DONTDUMP` は子にも残ります。
+  `MADV_DONTDUMP` のマッピングは、コアダンプに何も書きません。ほかの指定には
+  `EINVAL` を返します。
 - `process_madvise` は、iovec の範囲を順に指定どおりにします。呼んだプロセス自身の
   メモリ（`PIDFD_SELF_THREAD`、`PIDFD_SELF_THREAD_GROUP`、自身かメモリを共有する
   プロセスの pidfd）には `madvise` と同じようにします。結果は、最初に失敗した範囲より

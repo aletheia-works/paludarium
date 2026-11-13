@@ -105,6 +105,26 @@ pub struct Mapping {
     /// resized or given another protection (EPERM), and its anonymous
     /// read-only pages are not discarded.
     pub sealed: bool,
+    /// `MADV_DONTFORK` (Linux's `VM_DONTCOPY`): a `fork`ed child does not
+    /// get it.
+    pub dont_fork: bool,
+    /// `MADV_WIPEONFORK` (Linux's `VM_WIPEONFORK`): a `fork`ed child gets it
+    /// with none of its pages, as new zero-filled memory.
+    pub wipe_on_fork: bool,
+    /// `MADV_DONTDUMP` (Linux's `VM_DONTDUMP`): a core dump holds none of it.
+    pub dont_dump: bool,
+}
+
+/// The `madvise` advice that sets or clears a flag of the VMAs of a range
+/// ([`AddressSpace::advise_flags`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlagAdvice {
+    DontFork,
+    DoFork,
+    WipeOnFork,
+    KeepOnFork,
+    DontDump,
+    DoDump,
 }
 
 /// What a page table holds for a mapped page, as Linux's `folio_walk`
@@ -2116,6 +2136,25 @@ impl AddressSpaceData {
             .directory
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner) = directory;
+        // MADV_DONTFORK leaves the child a hole; MADV_WIPEONFORK leaves it
+        // the mapping with no page and no `anon_vma`, as Linux's `dup_mmap`
+        // neither copies the one nor the other's page tables.
+        let advised: Vec<Mapping> = copy
+            .mappings
+            .values()
+            .filter(|m| m.dont_fork || m.wipe_on_fork)
+            .copied()
+            .collect();
+        for m in advised {
+            if m.dont_fork {
+                copy.remove(m.start.0, m.end());
+            } else {
+                copy.for_populated(m.start.0, m.end(), |entry| *entry = None);
+                if let Some(child) = copy.mappings.get_mut(&m.start.0) {
+                    child.written = false;
+                }
+            }
+        }
         copy
     }
 
@@ -2756,6 +2795,9 @@ impl AddressSpaceData {
                 kind,
                 written: false,
                 sealed: false,
+                dont_fork: false,
+                wipe_on_fork: false,
+                dont_dump: false,
             },
         );
         Ok(GuestAddr(start))
@@ -2821,6 +2863,14 @@ impl AddressSpaceData {
         if self.sealed_in(addr.0, end) {
             return Err(Errno::EPERM);
         }
+        self.remove(addr.0, end);
+        Ok(())
+    }
+
+    /// Takes `[addr, end)` out of the space, its mappings, memory and pages,
+    /// sealed or not.
+    fn remove(&mut self, addr: u64, end: u64) {
+        let addr = GuestAddr(addr);
         let affected: Vec<_> = self
             .shared
             .iter()
@@ -2855,7 +2905,6 @@ impl AddressSpaceData {
         }
         self.for_populated(addr.0, end, |entry| *entry = None);
         self.bump_code_generation();
-        Ok(())
     }
 
     /// Whether two mappings would be one Linux VMA when adjacent: the same
@@ -2866,6 +2915,9 @@ impl AddressSpaceData {
         a.prot == b.prot
             && a.kind == b.kind
             && a.sealed == b.sealed
+            && a.dont_fork == b.dont_fork
+            && a.wipe_on_fork == b.wipe_on_fork
+            && a.dont_dump == b.dont_dump
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -3129,6 +3181,55 @@ impl AddressSpaceData {
             m.sealed = true;
         }
         Ok(())
+    }
+
+    /// `madvise` of `advice` over `[addr, end)`, as Linux's
+    /// `madvise_walk_vmas` changes the flags of its VMAs in turn: a VMA that
+    /// may not take the advice ends it with `EINVAL`, after those before
+    /// it; a hole in the range is `ENOMEM` once the rest has it. Only
+    /// private anonymous memory takes `MADV_WIPEONFORK` (Linux's VMA of no
+    /// file and not shared).
+    pub fn advise_flags(&mut self, addr: u64, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
+        let starts: Vec<u64> = self
+            .mappings
+            .range(..end)
+            .filter(|(_, m)| m.end() > addr)
+            .map(|(&start, _)| start)
+            .collect();
+        let mut covered = addr;
+        let mut hole = false;
+        for start in starts {
+            let Some(&m) = self.mappings.get(&start) else {
+                continue;
+            };
+            hole |= m.start.0 > covered;
+            covered = covered.max(m.end());
+            if advice == FlagAdvice::WipeOnFork
+                && (m.kind == MappingKind::File
+                    || self.shared_at(start).is_some()
+                    || self.backing_at(start).is_some())
+            {
+                return Err(Errno::EINVAL);
+            }
+            let (from, to) = (start.max(addr), m.end().min(end));
+            self.split_at(from);
+            self.split_at(to);
+            for (_, m) in self.mappings.range_mut(from..to) {
+                match advice {
+                    FlagAdvice::DontFork => m.dont_fork = true,
+                    FlagAdvice::DoFork => m.dont_fork = false,
+                    FlagAdvice::WipeOnFork => m.wipe_on_fork = true,
+                    FlagAdvice::KeepOnFork => m.wipe_on_fork = false,
+                    FlagAdvice::DontDump => m.dont_dump = true,
+                    FlagAdvice::DoDump => m.dont_dump = false,
+                }
+            }
+        }
+        if hole || covered < end {
+            Err(Errno::ENOMEM)
+        } else {
+            Ok(())
+        }
     }
 
     /// Whether `m`, sealed, refuses to have its pages discarded
@@ -4218,6 +4319,10 @@ impl AddressSpace {
     pub fn seal_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().seal(addr, len)
     }
+    /// See [`AddressSpaceData::advise_flags`].
+    pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
+        self.locked().advise_flags(addr.0, end, advice)
+    }
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)
     }
@@ -4841,6 +4946,97 @@ mod tests {
         // A fork keeps the seal.
         let child = space.fork();
         assert!(child.mappings().all(|m| m.sealed));
+    }
+
+    #[test]
+    fn fork_advice_leaves_a_hole_or_new_memory_in_the_child() {
+        let space = space_with(0x50000, 4 * PAGE_SIZE, Prot::READ_WRITE);
+        let at = |n: u64| GuestAddr(0x50000 + n * PAGE_SIZE);
+        let end = |n: u64| 0x50000 + n * PAGE_SIZE;
+        for n in 0..4 {
+            space.write_u64(at(n), n + 1).unwrap();
+        }
+        space
+            .advise_flags(at(1), end(2), FlagAdvice::DontFork)
+            .unwrap();
+        space
+            .advise_flags(at(2), end(3), FlagAdvice::WipeOnFork)
+            .unwrap();
+        space
+            .advise_flags(at(3), end(4), FlagAdvice::DontDump)
+            .unwrap();
+        // Each flag splits the VMA, and none merges with another.
+        let flags: Vec<_> = space
+            .mappings()
+            .map(|m| (m.dont_fork, m.wipe_on_fork, m.dont_dump))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (false, false, true)
+            ]
+        );
+        let child = space.fork();
+        assert_eq!(child.read_u64(at(0)).unwrap(), 1);
+        assert!(child.read_u64(at(1)).is_err());
+        assert_eq!(child.page_state(at(2)), Some(PageState::Absent));
+        assert_eq!(child.read_u64(at(2)).unwrap(), 0);
+        assert_eq!(child.read_u64(at(3)).unwrap(), 4);
+        // The parent keeps its pages; the child keeps MADV_WIPEONFORK and
+        // MADV_DONTDUMP, and its wiped mapping has no `anon_vma` yet.
+        assert_eq!(space.read_u64(at(2)).unwrap(), 3);
+        let kept: Vec<_> = child
+            .mappings()
+            .map(|m| (m.start.0, m.wipe_on_fork, m.dont_dump, m.written))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                (at(0).0, false, false, true),
+                (at(2).0, true, false, false),
+                (at(3).0, false, true, true)
+            ]
+        );
+        // Clearing the flags lets the pieces be one VMA again.
+        space
+            .advise_flags(at(0), end(4), FlagAdvice::DoFork)
+            .unwrap();
+        space
+            .advise_flags(at(0), end(4), FlagAdvice::KeepOnFork)
+            .unwrap();
+        space
+            .advise_flags(at(0), end(4), FlagAdvice::DoDump)
+            .unwrap();
+        assert!(
+            space
+                .mappings()
+                .all(|m| !m.dont_fork && !m.wipe_on_fork && !m.dont_dump)
+        );
+    }
+
+    #[test]
+    fn flag_advice_stops_at_a_vma_that_refuses_it_and_reports_holes_last() {
+        let mut space = space_with(0x50000, 2 * PAGE_SIZE, Prot::READ_WRITE);
+        let at = |n: u64| GuestAddr(0x50000 + n * PAGE_SIZE);
+        space
+            .map(Some(at(3)), PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        // The hole at page 2 is reported after the rest took the advice.
+        assert_eq!(
+            space.advise_flags(at(0), 0x50000 + 4 * PAGE_SIZE, FlagAdvice::DontDump),
+            Err(Errno::ENOMEM)
+        );
+        assert!(space.mappings().all(|m| m.dont_dump));
+        // A file's VMA refuses MADV_WIPEONFORK, after the ones before it.
+        assert_eq!(
+            space.advise_flags(at(0), 0x50000 + 4 * PAGE_SIZE, FlagAdvice::WipeOnFork),
+            Err(Errno::EINVAL)
+        );
+        let wiped: Vec<_> = space.mappings().map(|m| m.wipe_on_fork).collect();
+        assert_eq!(wiped, vec![true, false]);
     }
 
     #[test]

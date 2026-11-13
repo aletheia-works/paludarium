@@ -2044,10 +2044,13 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// `MADV_NOHUGEPAGE`, which change only flags no page here depends on; the
 /// discards `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` (no VMA is locked
 /// apart) and `MADV_FREE`; and `MADV_POPULATE_READ` and
-/// `MADV_POPULATE_WRITE` ([`populate`]). The others are rejected rather
-/// than ignored, so that a guest relying on one of them notices.
+/// `MADV_POPULATE_WRITE` ([`populate`]); and the flags `fork` and core
+/// dumps look at, `MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK`,
+/// `MADV_KEEPONFORK`, `MADV_DONTDUMP` and `MADV_DODUMP`
+/// ([`AddressSpace::advise_flags`]). The others are rejected rather than
+/// ignored, so that a guest relying on one of them notices.
 pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Result<(), Errno> {
-    if !matches!(advice, 0..=4 | 8 | 12..=15 | 20..=24) {
+    if !matches!(advice, 0..=4 | 8 | 10..=24) {
         return Err(Errno::EINVAL);
     }
     if addr & 4095 != 0 {
@@ -2067,6 +2070,18 @@ pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Re
     }
     if advice == MADV_DONTNEED || advice == MADV_DONTNEED_LOCKED {
         return mem.discard_shared(GuestAddr(addr), length);
+    }
+    let flag = match advice {
+        10 => Some(paludarium_mmu::FlagAdvice::DontFork),
+        11 => Some(paludarium_mmu::FlagAdvice::DoFork),
+        16 => Some(paludarium_mmu::FlagAdvice::DontDump),
+        17 => Some(paludarium_mmu::FlagAdvice::DoDump),
+        18 => Some(paludarium_mmu::FlagAdvice::WipeOnFork),
+        19 => Some(paludarium_mmu::FlagAdvice::KeepOnFork),
+        _ => None,
+    };
+    if let Some(flag) = flag {
+        return mem.advise_flags(GuestAddr(addr), end, flag);
     }
     if advice == MADV_POPULATE_READ || advice == MADV_POPULATE_WRITE {
         return populate(mem, addr, end, advice == MADV_POPULATE_WRITE);

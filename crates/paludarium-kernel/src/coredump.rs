@@ -183,8 +183,13 @@ pub(crate) fn write(
 /// file unlinked since), else nothing of it; the stack, a writable ELF
 /// segment and the first page of the ELF image. Only the ELF headers ask
 /// for a mapping that can be read (`VM_READ`): Linux reads the rest whatever
-/// its protection.
+/// its protection. A mapping `MADV_DONTDUMP` marked has nothing in it.
 fn dump_length(mem: &AddressSpace, mapping: &Mapping, first_elf: bool) -> u64 {
+    // MADV_DONTDUMP leaves out even what is always dumped, as Linux's
+    // `vma_dump_size` checks VM_DONTDUMP before all but the vDSO.
+    if mapping.dont_dump {
+        return 0;
+    }
     let readable = mapping.prot.contains(Prot::READ);
     let writable = mapping.prot.contains(Prot::WRITE);
     match mapping.kind {

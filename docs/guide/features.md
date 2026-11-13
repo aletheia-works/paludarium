@@ -774,7 +774,17 @@ kernel.
   fault the pages in, as a read or a write would (the zero page, a page of
   its own), up to a page no mapping holds (`ENOMEM`), one its mapping may
   not read or write (`EINVAL`), or one past the end of its file (`EFAULT`).
-  Other advice gives `EINVAL`.
+  `MADV_DONTFORK` and `MADV_DOFORK`, `MADV_WIPEONFORK` and
+  `MADV_KEEPONFORK`, and `MADV_DONTDUMP` and `MADV_DODUMP` set and clear
+  flags of the VMAs of the range, which then split from and merge with
+  their neighbours as Linux's do (`/proc/<pid>/maps`). They go VMA by VMA:
+  one that refuses the advice stops it with `EINVAL` (`MADV_WIPEONFORK`
+  takes only private anonymous memory), and a hole in the range gives
+  `ENOMEM` after the rest has taken it. A `fork`ed child gets no mapping
+  `MADV_DONTFORK` marked, and a mapping `MADV_WIPEONFORK` marked without
+  its pages, as new zero-filled memory; it keeps that flag and
+  `MADV_DONTDUMP`. A core dump holds nothing of a mapping `MADV_DONTDUMP`
+  marked. Other advice gives `EINVAL`.
 - `process_madvise` advises each range of its iovecs in turn, of the caller's
   memory (`PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP`, or a pidfd of its
   own process or of one sharing its memory) as `madvise` does, and gives the

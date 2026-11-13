@@ -6503,8 +6503,14 @@ mod madvise_advice {
         let mut byte = [0];
         f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
         assert_eq!(byte, [7]);
-        // Still refused: the fork, dump and guard advice, and unknown ones.
-        for advice in [9, 10, 11, 16, 17, 18, 19, 25, 100, 101, 102, 103, 26] {
+        // The fork and dump flags take a mapping too; a hole is ENOMEM.
+        for advice in [10, 11, 16, 17, 18, 19] {
+            assert_eq!(f.ret(28, &[AREA, 2 * PAGE, advice]), 0, "{advice}");
+            assert_eq!(f.ret(28, &[AREA, 3 * PAGE, advice]), errno(Errno::ENOMEM));
+        }
+        // Still refused: MADV_REMOVE, MADV_COLLAPSE, the guard and memory
+        // failure advice, and unknown ones.
+        for advice in [9, 25, 100, 101, 102, 103, 26] {
             assert_eq!(
                 f.ret(28, &[AREA, PAGE, advice]),
                 errno(Errno::EINVAL),

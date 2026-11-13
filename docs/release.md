@@ -260,10 +260,11 @@ itself.
    `evidence` job runs `scripts/release/evidence.py`: while tag
    `v<version>` of the workspace version does not exist and the main head
    is that push, it first requires every crate, the npm package and the
-   JSR package (linked to this repository) to exist on their registry
-   without this version: a missing package (step 3) or a
-   version already partly on a registry (re-run the stopped jobs of the
-   earlier `Publish` run instead) stops it before any dispatch. It then
+   JSR package (linked to this repository) to exist on their registry: a
+   missing package (step 3) stops it before any dispatch. A version already
+   partly on a registry, left by an earlier `Publish` run that stopped, does
+   not: the publish job of this head only verifies what is already present
+   (see Publication and recovery). It then
    waits for the `ci.yml` push run, dispatches `macos-quality.yml`,
    `quality.yml` and `release-check.yml` once each (a run a person
    already dispatched for the head is reused, never doubled), waits for all
@@ -361,7 +362,14 @@ publication automatically. An owner must inspect registry state and propose
 the remaining recovery. Re-running the stopped jobs of the same `Publish`
 run (same head; nothing is tagged yet) is safe: every version already present is only verified
 (it must equal the approved digest and must not be yanked), and only the
-remaining ones are uploaded. The cargo and npm children
+remaining ones are uploaded. When the cause is in the release scripts
+themselves, a re-run runs the same scripts and stops again; merge the fix
+instead, and the `Publish` run of that later main head produces its own
+same-head evidence and resumes the same way, so its packages must have the
+digests already published (a version with another digest stops before any
+upload, so merge nothing that changes a package until then). Its notes add
+the commits after the release PR, as for any later head, so none is left out
+of every release. 0.15.0 stopped like this at its first JSR query. The cargo and npm children
 get allow-listed environments only (step 3); the allow-list for
 `npm publish --provenance` follows npm's provenance generator for GitHub
 Actions and is proven only by the real publication. A successful workflow alone is not

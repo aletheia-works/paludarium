@@ -2,12 +2,14 @@
 replaced by in-memory fakes; nothing reaches the network, and a passing test
 is not evidence that any real run, tag or registry state exists."""
 
+import io
 import itertools
 import json
 import re
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -169,21 +171,34 @@ class Evidence(unittest.TestCase):
                     produce(api, some)
                 self.assertEqual(api.posts, [])
 
-    def test_version_already_partly_published_stops(self):
+    # A later head can finish a publication that stopped (0.15.0 stopped at JSR after
+    # the crates and npm): it gets its own evidence, and its publish job only verifies
+    # the versions already present.
+    def test_version_already_partly_published_gets_evidence_of_this_head(self):
         api = FakeGitHub()
 
         def partly(name, version):
-            return name in ("paludarium-types", check.NPM_NAME)
+            return name != check.JSR_KEY
 
-        with self.assertRaisesRegex(
-            ValueError,
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(
+                produce(api, present=partly), dict(ready="true", version=VERSION, head=HEAD)
+            )
+        self.assertEqual(len(api.posts), 4)
+        self.assertIn(
             VERSION
-            + " already on a registry: "
-            + re.escape(", ".join(n for n in CHECKED if partly(n, VERSION)))
-            + "; re-run the stopped publish job instead",
-        ):
-            produce(api, present=partly)
-        self.assertEqual(api.posts, [])
+            + " already on a registry, to be verified, not uploaded: "
+            + ", ".join(n for n in CHECKED if n != check.JSR_KEY),
+            stderr.getvalue(),
+        )
+
+    def test_publishable_names_the_versions_already_present(self):
+        self.assertEqual(
+            E.publishable(INVENTORY, published, lambda name, version: name == check.NPM_NAME),
+            [check.NPM_NAME],
+        )
+        self.assertEqual(E.publishable(INVENTORY, published, never), [])
 
     def test_publishable_checks_every_name_at_this_version(self):
         orders, asked = [], []

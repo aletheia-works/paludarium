@@ -14,15 +14,19 @@ not published never gets a tag. A failed run is never dispatched again
 (performance is measured once per head); the head then needs a person.
 
 Publication is by Trusted Publishing only, so every package must already exist
-on its registry without this version. A new package (it needs one publication
-by hand before its Trusted Publisher can be registered) or a version already
-partly published (the stopped publish job is re-run instead) stops it before
-any dispatch.
+on its registry. A new package (it needs one publication by hand before its
+Trusted Publisher can be registered) stops it before any dispatch. A version
+already partly published by an earlier Publish run that stopped does not: this
+head gets its own evidence, and its publish job only verifies each version
+already present (it must have this head's approved digest and must not be
+yanked) and uploads the rest, so a fix to the release scripts can finish a
+stopped publication.
 """
 
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -143,7 +147,8 @@ def version_present(name, version):
 
 
 def publishable(inv, presence=check.registry_presence, present=version_present):
-    """ValueError unless every package exists on its registry without this version."""
+    """ValueError unless every package exists on its registry; the names that already
+    have this version, which the publish job then only verifies."""
     found = presence(inv["order"])
     new = sorted(set(found["checked"]) - set(found["present"]))
     policy.require(
@@ -153,13 +158,7 @@ def publishable(inv, presence=check.registry_presence, present=version_present):
             ", ".join(new)
         ),
     )
-    partial = [n for n in found["checked"] if present(n, inv["version"])]
-    policy.require(
-        not partial,
-        "{} already on a registry: {}; re-run the stopped publish job instead".format(
-            inv["version"], ", ".join(partial)
-        ),
-    )
+    return [n for n in found["checked"] if present(n, inv["version"])]
 
 
 def produce(
@@ -178,7 +177,14 @@ def produce(
         raise Stop(f"v{version} is already tagged")
     if main_head(api) != head:
         raise Stop(f"{head} is no longer the main head")
-    publishable(inv, presence, present)
+    resumed = publishable(inv, presence, present)
+    if resumed:
+        print(
+            "{} already on a registry, to be verified, not uploaded: {}".format(
+                version, ", ".join(resumed)
+            ),
+            file=sys.stderr,
+        )
     waiter = Waiter(api, head, sleep, clock)
     runs = [waiter.one(CI, "push")] + [waiter.dispatch(w) for w in QUALITY]
     for run in runs:

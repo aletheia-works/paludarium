@@ -222,6 +222,10 @@ impl Credentials {
     /// (`cap_ptrace_access_check`), and Landlock keeps a reader in a domain
     /// from a task outside it (`hook_ptrace_access_check`).
     pub(crate) fn may_read_task(&self, target: &Credentials, dumpable: bool, real: bool) -> bool {
+        self.may_read_ids(&target.task_ids(), dumpable, real)
+    }
+    /// [`Self::may_read_task`] of a task with the IDs and sets `target`.
+    pub(crate) fn may_read_ids(&self, target: &TaskIds, dumpable: bool, real: bool) -> bool {
         let (uid, gid, caps) = if real {
             (self.uid, self.gid, self.permitted)
         } else {

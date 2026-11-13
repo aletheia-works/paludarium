@@ -2790,7 +2790,6 @@ impl Kernel {
         mem: &AddressSpace,
         a: [u64; 6],
     ) -> Result<u64, Errno> {
-        use crate::credentials::CAP_SYS_PTRACE;
         use crate::namespaces::{self as ns, Kind};
         const CAP_SYS_CHROOT: u64 = 1 << 18;
         let flags = a[1];
@@ -2812,18 +2811,13 @@ impl Kernel {
                     .view(pidfd.pid)
                     .filter(|view| !view.zombie)
                     .ok_or(Errno(3))?; // ESRCH
-                // ptrace_may_access with the real IDs, as
-                // `Credentials::may_read_task` has it.
-                let reader = &thread.state.credentials;
+                // ptrace_may_access with the real IDs.
                 let target = view.group.task_ids(pidfd.pid, pidfd.pid);
                 if pidfd.pid != self.process.pid
-                    && !((reader.capable_in(CAP_SYS_PTRACE, &target.user)
-                        || view.dumpable
-                            && [target.uid, target.euid, target.suid] == [reader.uid; 3]
-                            && [target.gid, target.egid, target.sgid] == [reader.gid; 3]
-                            && reader.user == target.user
-                            && target.permitted & !reader.permitted == 0)
-                        && crate::landlock::may_trace(&reader.landlock, &target.landlock))
+                    && !thread
+                        .state
+                        .credentials
+                        .may_read_ids(&target, view.dumpable, true)
                 {
                     return Err(Errno::EPERM);
                 }

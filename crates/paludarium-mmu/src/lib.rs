@@ -2150,6 +2150,7 @@ impl AddressSpaceData {
                 copy.remove(m.start.0, m.end());
             } else {
                 copy.for_populated(m.start.0, m.end(), |entry| *entry = None);
+                copy.bump_code_generation();
                 if let Some(child) = copy.mappings.get_mut(&m.start.0) {
                     child.written = false;
                 }

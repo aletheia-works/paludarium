@@ -3205,8 +3205,9 @@ impl AddressSpaceData {
             };
             hole |= m.start.0 > covered;
             covered = covered.max(m.end());
+            // A loaded program's segments have a file (Linux's `vm_file`).
             if advice == FlagAdvice::WipeOnFork
-                && (m.kind == MappingKind::File
+                && (matches!(m.kind, MappingKind::File | MappingKind::ElfSegment)
                     || self.shared_at(start).is_some()
                     || self.backing_at(start).is_some())
             {
@@ -5040,6 +5041,19 @@ mod tests {
         );
         let wiped: Vec<_> = space.mappings().map(|m| m.wipe_on_fork).collect();
         assert_eq!(wiped, vec![true, false]);
+        // So does a loaded program's segment.
+        space
+            .map(
+                Some(at(8)),
+                PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::ElfSegment,
+            )
+            .unwrap();
+        assert_eq!(
+            space.advise_flags(at(8), 0x50000 + 9 * PAGE_SIZE, FlagAdvice::WipeOnFork),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]

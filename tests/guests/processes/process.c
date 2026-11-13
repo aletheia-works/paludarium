@@ -6111,6 +6111,7 @@ static int advice_vmas(char *start, char *end) {
 }
 /* MADV_DONTFORK, MADV_WIPEONFORK and MADV_DONTDUMP, which change the flags
  * of their VMAs, and what a fork's child gets of them. */
+static char advice_data[2 * 4096] __attribute__((aligned(4096))) = {1};
 static int madvise_fork_case(void) {
     long page = 4096;
     char *guard = mmap(NULL, 6 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -6137,6 +6138,9 @@ static int madvise_fork_case(void) {
     char *file = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     if (file == MAP_FAILED) return 82;
     long wipe_file = advice_errno(madvise(file, page, MADV_WIPEONFORK));
+    /* The program's initialized data is a private mapping of its file. */
+    long wipe_data = advice_errno(madvise(advice_data, page, MADV_WIPEONFORK));
+    printf("wipe-data=%ld\n", wipe_data);
     long hole = advice_errno(madvise(guard, 2 * page, MADV_DONTDUMP));
     long hole_dodump = advice_errno(madvise(guard, 2 * page, MADV_DODUMP));
     printf("wipe-shared=%ld wipe-file=%ld hole=%ld hole-dodump=%ld vmas=%d\n", wipe_shared,

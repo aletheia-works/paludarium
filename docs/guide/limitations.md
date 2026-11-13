@@ -402,17 +402,18 @@ verified.
   where Linux's order follows its hash tables, and what an AF_UNIX socket
   sent that waits is counted as its send buffer is charged here, where
   Linux counts its buffers' true sizes. Of a TCP socket they tell its
-  memory but for its buffers as 0; its keepalive timer ends a whole `TCP_KEEPIDLE` from
-  now, and only a handshake on the loopback has its retransmission's
-  time and count. A connection the host made has no `TIME_WAIT` after
-  it, and a closed socket whose bytes still wait to go shows as a hold in
-  `FIN_WAIT1`, where Linux keeps the socket itself. Every socket's cgroup
-  is the root, 1, and its traffic class 0. A request that names a BPF
-  map (`INET_DIAG_REQ_SK_BPF_STORAGES`) is `EINVAL`, as no descriptor
-  here is one, where Linux's is `EBADF` for one that is not open. Generic netlink has no family but `nlctrl`, where
-  Linux has those of the host's kernel and modules (`ethtool`,
-  `nl80211`, `devlink` and others), so a lookup of one is `ENOENT` and a
-  socket has 64 groups however many those take. Of `NETLINK_ROUTE` there
+  memory but for its buffers as 0; its keepalive timer ends a whole
+  `TCP_KEEPIDLE` from now, and only a handshake on the loopback has its
+  retransmission's time and count. A connection the host made has no
+  `TIME_WAIT` after it, and a closed socket whose bytes still wait to go
+  shows as a hold in `FIN_WAIT1`, where Linux keeps the socket itself.
+  Every socket's cgroup is the root, 1, and its traffic class 0. A request
+  that names a BPF map (`INET_DIAG_REQ_SK_BPF_STORAGES`) is `EINVAL`, as
+  no descriptor here is one, where Linux's is `EBADF` for one that is not
+  open. Generic netlink has no family but `nlctrl`, where Linux has those
+  of the host's kernel and modules (`ethtool`, `nl80211`, `devlink` and
+  others), so a lookup of one is `ENOENT` and a socket has 64 groups
+  however many those take. Of `NETLINK_ROUTE` there
   are only the link, address and route requests: neighbours, rules, queueing
   disciplines and the rest are `EOPNOTSUPP`, as are an input route
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), a non-dump
@@ -438,11 +439,12 @@ verified.
   filter by the table or attributes a strict request names, and a lookup
   looks at no selector but its destination (`RTA_SRC`, `RTA_OIF`,
   `RTA_MARK` and the rest are not); its `rta_cacheinfo` counts one
-  reference, where Linux counts the other users of the cached route too. Notifications go
-  out for the link, its IPv6 information, addresses and routes alone, not
-  for neighbours, netconf or the other groups, nor to a socket in
-  another namespace (`NETLINK_LISTEN_ALL_NSID` is not supported); IPv4's
-  routes through `lo` go without one when it goes down, as on Linux.
+  reference, where Linux counts the other users of the cached route too.
+  Notifications go out for the link, its IPv6 information, addresses and
+  routes alone, not for neighbours, netconf or the other groups, nor to a
+  socket in another namespace (`NETLINK_LISTEN_ALL_NSID` is not
+  supported); IPv4's routes through `lo` go without one when it goes down,
+  as on Linux.
   `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
   listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries

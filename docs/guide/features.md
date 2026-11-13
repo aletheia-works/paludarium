@@ -1098,6 +1098,20 @@ kernel.
   does not have `EBADF`. The copy shares the open file description and
   gets the lowest free number, close-on-exec (`EMFILE` at
   `RLIMIT_NOFILE`).
+- Whether a caller may read or attach to a thread of another process is
+  decided as Linux's `__ptrace_may_access` with the capability module and
+  Yama decides it. To read (`kcmp`, `/proc/<pid>/environ` and the like,
+  `move_pages`, `migrate_pages`, `setns` with a pidfd), it needs
+  `CAP_SYS_PTRACE` in the target's user namespace, or a dumpable target whose
+  user and group IDs all equal its own (real or filesystem ones, as the call
+  asks), in the same user namespace, with its permitted capabilities (its
+  effective ones for the filesystem ones) covering the target's permitted
+  ones; Landlock then keeps a caller in a domain from a task outside it. To
+  attach (`process_vm_readv`, `process_vm_writev`, `pidfd_getfd`), Yama's
+  `ptrace_scope` is 1, as Debian's, Ubuntu's and the CI runners' is: the
+  target must also be a descendant of the caller, or have let it in with
+  `PR_SET_PTRACER`, or the caller must have `CAP_SYS_PTRACE` in the target's
+  user namespace.
 - `personality` keeps any value for the thread, as Linux stores it, and
   returns the old one (`0xffffffff` only asks). New threads and processes
   inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and
@@ -2380,7 +2394,13 @@ kernel.
   again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
   by `execve`), `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
   `execve`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
-  with their `PR_GET_*`; other options give `EINVAL`.
+  with their `PR_GET_*`, and Yama's `PR_SET_PTRACER`, which reads no other
+  argument: 0 clears it, `PR_SET_PTRACER_ANY` (or -1 as an `int`) lets any
+  process attach, and another value, taken as an `int`, names a task in the
+  caller's PID namespace (`EINVAL` for none) whose process, and its
+  descendants, may attach while that task is there. It is the process's,
+  whichever thread sets it, and a child does not inherit it. Other options
+  give `EINVAL`.
 - When a process exits, its children go to the nearest ancestor that set
   `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,
   which acts as the init of a PID namespace, as Linux's

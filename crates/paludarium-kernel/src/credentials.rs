@@ -16,6 +16,7 @@ const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
 const CAP_SETPCAP: u64 = 1 << 8;
 const CAP_SYS_RAWIO: u64 = 1 << 17;
+pub(crate) const CAP_SYS_PTRACE: u64 = 1 << 19;
 pub(crate) const CAP_SYS_ADMIN: u64 = 1 << 21;
 pub(crate) const CAP_SYS_NICE: u64 = 1 << 23;
 pub(crate) const CAP_SYS_RESOURCE: u64 = 1 << 24;
@@ -214,19 +215,25 @@ impl Credentials {
     /// in read mode decides: `CAP_SYS_PTRACE` in the target's user
     /// namespace, or every user and group ID of a dumpable target equal to
     /// the reader's filesystem ones, or with `real`
-    /// (`PTRACE_MODE_REALCREDS`) its real ones. Landlock then keeps a reader
-    /// in a domain from a task outside it (`hook_ptrace_access_check`).
+    /// (`PTRACE_MODE_REALCREDS`) its real ones. The capability module then
+    /// asks the same capability again, or a reader in the target's user
+    /// namespace whose permitted capabilities (with `real`; its effective
+    /// ones for `PTRACE_MODE_FSCREDS`) cover the target's permitted ones
+    /// (`cap_ptrace_access_check`), and Landlock keeps a reader in a domain
+    /// from a task outside it (`hook_ptrace_access_check`).
     pub(crate) fn may_read_task(&self, target: &Credentials, dumpable: bool, real: bool) -> bool {
-        const CAP_SYS_PTRACE: u64 = 1 << 19;
-        let (uid, gid) = if real {
-            (self.uid, self.gid)
+        let (uid, gid, caps) = if real {
+            (self.uid, self.gid, self.permitted)
         } else {
-            (self.fsuid, self.fsgid)
+            (self.fsuid, self.fsgid, self.effective)
         };
-        (self.capable_in(CAP_SYS_PTRACE, &target.user)
+        let tracer = self.capable_in(CAP_SYS_PTRACE, &target.user);
+        (tracer
             || dumpable
                 && [target.uid, target.euid, target.suid] == [uid; 3]
-                && [target.gid, target.egid, target.sgid] == [gid; 3])
+                && [target.gid, target.egid, target.sgid] == [gid; 3]
+                && self.user == target.user
+                && target.permitted & !caps == 0)
             && crate::landlock::may_trace(&self.landlock, &target.landlock)
     }
     pub(crate) fn capable_in(&self, cap: u64, ns: &crate::namespaces::Namespace) -> bool {
@@ -902,6 +909,26 @@ mod credentials_tests {
             .unwrap()
             .task_ids();
         assert_eq!([groups.gid, groups.egid, groups.sgid], [1, 2, 3]);
+    }
+    #[test]
+    fn reading_another_task_needs_its_capabilities_or_cap_sys_ptrace() {
+        let no_ptrace = ALL_CAPABILITIES & !CAP_SYS_PTRACE;
+        let target = Credentials::default()
+            .capset(no_ptrace, no_ptrace, 0)
+            .unwrap();
+        // The same permitted set; with the filesystem IDs, the effective
+        // one counts.
+        let same = target.capset(0, no_ptrace, 0).unwrap();
+        assert!(same.may_read_task(&target, true, true));
+        assert!(!same.may_read_task(&target, true, false));
+        assert!(target.may_read_task(&target, true, false));
+        // One permitted capability fewer.
+        let fewer = target.capset(0, no_ptrace & !(1 << 13), 0).unwrap();
+        assert!(!fewer.may_read_task(&target, true, true));
+        assert!(fewer.may_read_task(&fewer, true, true));
+        // CAP_SYS_PTRACE lets it read anything.
+        assert!(Credentials::default().may_read_task(&target, false, true));
+        assert!(!same.may_read_task(&target, false, true), "not dumpable");
     }
     #[test]
     fn capset_keeps_within_what_the_thread_holds() {

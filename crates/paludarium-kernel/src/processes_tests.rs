@@ -199,6 +199,61 @@ fn finish(k: &mut Kernel, t: &Thread, m: &AddressSpace, status: ExitStatus) {
 mod process {
     use super::*;
     #[test]
+    fn yama_lets_in_descendants_and_those_named() {
+        let (mut k, mut t, m) = setup();
+        let eperm = Errno::EPERM.to_syscall_return();
+        const PR_SET_PTRACER: u64 = 0x5961_6d61;
+        // Not root, so CAP_SYS_PTRACE lets no one in; still dumpable.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 117, [1000, 1000, 1000, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [4, 1, 0, 0, 0, 0]), 0);
+        let parent = syscall(&mut k, &mut t, &m, 39, [0; 6]);
+        let event = syscall(&mut k, &mut t, &m, 290, [0; 6]);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let (mut g, mut gt, gm) = fork(&mut c, &mut ct, &cm);
+        let (mut s, mut st, sm) = fork(&mut k, &mut t, &m);
+        let getfd = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, pid: u64| {
+            let pidfd = syscall(k, t, m, 434, [pid, 0, 0, 0, 0, 0]);
+            let copy = syscall(k, t, m, 438, [pidfd, event, 0, 0, 0, 0]);
+            syscall(k, t, m, 3, [pidfd, 0, 0, 0, 0, 0]);
+            if copy == eperm { eperm } else { 0 }
+        };
+        // A parent reaches its descendants; they do not reach it.
+        let child = u64::from(ct.tid);
+        assert_eq!(getfd(&mut k, &mut t, &m, child), 0);
+        assert_eq!(getfd(&mut k, &mut t, &m, u64::from(gt.tid)), 0);
+        assert_eq!(getfd(&mut c, &mut ct, &cm, parent), eperm);
+        assert_eq!(getfd(&mut g, &mut gt, &gm, parent), eperm);
+        // The child named, and its descendants, but not its sibling.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 157, [PR_SET_PTRACER, child, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(getfd(&mut c, &mut ct, &cm, parent), 0);
+        assert_eq!(getfd(&mut g, &mut gt, &gm, parent), 0);
+        assert_eq!(getfd(&mut s, &mut st, &sm, parent), eperm);
+        assert_eq!(getfd(&mut s, &mut st, &sm, child), eperm);
+        // Any process, then none again.
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                157,
+                [PR_SET_PTRACER, u64::MAX, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(getfd(&mut s, &mut st, &sm, parent), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 157, [PR_SET_PTRACER, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(getfd(&mut c, &mut ct, &cm, parent), eperm);
+    }
+    #[test]
     fn unique_pid_tid() {
         let (mut k, mut t, m) = setup();
         let (_, a, _) = fork(&mut k, &mut t, &m);

@@ -8656,6 +8656,116 @@ static int process_vm_case(void) {
     waitpid(zombie, NULL, 0);
     return 0;
 }
+/* Yama's ptrace_scope 1, which the CI's runners have (sysctl.d's
+ * 55-ptrace.conf) and the emulator keeps, and the capability module's check,
+ * as security/yama/yama_lsm.c and security/commoncap.c decide them for
+ * process_vm_readv and pidfd_getfd of a parent from its child. It runs as a
+ * user who is not root (natively it never is, and an emulated root becomes
+ * nobody), so no CAP_SYS_PTRACE lets the child in. */
+#define YA_SET_PTRACER 0x59616d61L
+/* What prctl's PR_SET_PTRACER is given: the asking child's number. */
+#define YA_CHILD (-2L)
+enum { YA_PLAIN, YA_GRANDCHILD, YA_OWN_USERS, YA_FEWER_CAPS, YA_SAME_CAPS };
+static pid_t ya_parent;
+static long ya_r(long r) { return r < 0 ? -errno : r; }
+/* The child's two asks of its parent, a success shown as "ok": its
+ * buffer, and its standard output. */
+static void ya_show(const char *name) {
+    long vm = pv_ask(ya_parent), pidfd = ya_r(syscall(SYS_pidfd_open, ya_parent, 0));
+    long fd = pidfd < 0 ? pidfd : pg(pidfd, 1, 0);
+    printf("%s: vm=", name);
+    if (vm == 4) printf("ok"); else printf("%ld", vm);
+    printf(" getfd=");
+    if (fd >= 0) printf("ok\n"); else printf("%ld\n", fd);
+    fflush(stdout);
+}
+/* Sets the ptracer to `ptracer` (the child for YA_CHILD, nothing for -3),
+ * then lets a child ask in the way `how` says, and clears it again. */
+static void ya_ask(const char *name, long ptracer, int how) {
+    int gate[2];
+    if (pipe(gate)) return;
+    fflush(stdout);
+    pid_t asker = fork();
+    if (asker == 0) {
+        close(gate[1]);
+        char c;
+        read(gate[0], &c, 1);
+        if (how == YA_OWN_USERS && syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+        if (how == YA_FEWER_CAPS && caps_set(0, CAPS_ALL & ~CAP_BIT(19) & ~CAP_BIT(13), 0))
+            _exit(91);
+        if (how == YA_GRANDCHILD) {
+            pid_t grandchild = fork();
+            if (grandchild == 0) {
+                ya_show(name);
+                _exit(0);
+            }
+            waitpid(grandchild, NULL, 0);
+        } else {
+            ya_show(name);
+        }
+        _exit(0);
+    }
+    close(gate[0]);
+    if (ptracer != -3) {
+        long set = ya_r(prctl(YA_SET_PTRACER, ptracer == YA_CHILD ? (long)asker : ptracer, 0, 0, 0));
+        printf("%s: set=%ld\n", name, set);
+    }
+    fflush(stdout);
+    write(gate[1], "g", 1);
+    close(gate[1]);
+    int status = 0;
+    waitpid(asker, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) printf("%s: status=%d\n", name, status);
+    prctl(YA_SET_PTRACER, 0L, 0, 0, 0);
+}
+static void *ya_thread_sets(void *arg) {
+    *(long *)arg = ya_r(prctl(YA_SET_PTRACER, -1L, 0, 0, 0));
+    return NULL;
+}
+static int yama_case(void) {
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 80;
+    prctl(PR_SET_DUMPABLE, 1);
+    ya_parent = getpid();
+    strcpy(pv_buf, "the parent's buffer");
+    ya_ask("none", -3, YA_PLAIN);
+    ya_ask("the-child", YA_CHILD, YA_PLAIN);
+    ya_ask("the-child's-child", YA_CHILD, YA_GRANDCHILD);
+    ya_ask("any", -1L, YA_PLAIN);
+    ya_ask("any-as-int", 0xffffffffL, YA_PLAIN);
+    ya_ask("self", (long)getpid(), YA_PLAIN);
+    ya_ask("cleared", 0L, YA_PLAIN);
+    /* A number no task has, one whose int is 0, and a negative one. */
+    ya_ask("no-task", 0x3ffffff0L, YA_PLAIN);
+    ya_ask("high-bits", 1L << 32, YA_PLAIN);
+    ya_ask("negative", -5L, YA_PLAIN);
+    /* The process's, whichever thread sets it. */
+    long by_thread = -1;
+    pthread_t t;
+    pthread_create(&t, NULL, ya_thread_sets, &by_thread);
+    pthread_join(t, NULL);
+    printf("thread: set=%ld\n", by_thread);
+    ya_ask("set-by-a-thread", -3, YA_PLAIN);
+    /* Let in by Yama, but in another user namespace, with no capability in
+       the parent's: the capability module refuses. */
+    ya_ask("own-user-namespace", -1L, YA_OWN_USERS);
+    /* In a user namespace of the parent's own, where it holds every
+       capability but CAP_SYS_PTRACE: a child with the same ones may attach,
+       one without CAP_NET_RAW may not, its permitted ones not covering the
+       parent's. */
+    fflush(stdout);
+    pid_t owner = fork();
+    if (owner == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWUSER) || caps_set(0, CAPS_ALL & ~CAP_BIT(19), 0)) _exit(92);
+        ya_parent = getpid();
+        ya_ask("same-capabilities", -1L, YA_SAME_CAPS);
+        ya_ask("fewer-capabilities", -1L, YA_FEWER_CAPS);
+        _exit(0);
+    }
+    printf("owner: status=%d\n", reaped(owner));
+    return 0;
+}
 static int pidfd_getfd_case(void) {
     if (pipe(pv_gate)) return 80;
     struct pv_task child = pv_child(1), locked = pv_child(0);
@@ -21019,6 +21129,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "yama")) return yama_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();

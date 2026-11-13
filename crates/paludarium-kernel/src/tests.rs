@@ -7106,6 +7106,27 @@ mod process_vm {
         assert_eq!(&out[..4], b"hell");
     }
     #[test]
+    fn pr_set_ptracer_takes_a_task_or_any() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        let pid = f.ret(39, &[]);
+        const PR_SET_PTRACER: u64 = 0x5961_6d61;
+        // 0 clears it, -1 (as an int too) lets any process in, and the
+        // other arguments are not read.
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, 0, 9, 9, 9]), 0);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, u64::MAX, 0, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, 0xffff_ffff, 0, 0, 0]), 0);
+        // A task, by an int: none with this number, 0 or a negative one.
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, pid, 0, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, pid | 1 << 32, 0, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, 0x3fff_fff0, 0, 0, 0]), einval);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, 1 << 32, 0, 0, 0]), einval);
+        assert_eq!(
+            f.ret(157, &[PR_SET_PTRACER, (-5i64) as u64, 0, 0, 0]),
+            einval
+        );
+    }
+    #[test]
     fn pidfd_getfd_copies_a_descriptor() {
         let mut f = fixture();
         let (einval, ebadf) = (errno(Errno::EINVAL), errno(Errno::EBADF));

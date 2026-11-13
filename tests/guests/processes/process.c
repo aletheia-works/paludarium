@@ -6050,19 +6050,28 @@ static int madvise_advice_case(void) {
     printf("dontneed-locked=%ld status=%d bytes=%d\n", r, status, p[2 * page]);
     return 0;
 }
-/* The VMAs of [start, end) /proc/self/maps lists. */
+/* The VMAs of [start, end) /proc/self/maps lists. It allocates nothing, so
+ * that no new mapping lands in the range (a fork's MADV_DONTFORK hole). */
 static int advice_vmas(char *start, char *end) {
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) return -1;
-    char line[512];
+    static char maps[1 << 16];
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t length = 0;
+    ssize_t got;
+    while (length < sizeof maps - 1 && (got = read(fd, maps + length, sizeof maps - 1 - length)) > 0)
+        length += got;
+    close(fd);
+    maps[length] = 0;
     int count = 0;
-    while (fgets(line, sizeof line, maps)) {
-        unsigned long from, to;
-        if (sscanf(line, "%lx-%lx", &from, &to) == 2 && from < (unsigned long)end &&
-            to > (unsigned long)start)
-            count++;
+    for (char *line = maps; *line;) {
+        char *rest;
+        unsigned long from = strtoul(line, &rest, 16);
+        unsigned long to = *rest == '-' ? strtoul(rest + 1, NULL, 16) : 0;
+        if (from < (unsigned long)end && to > (unsigned long)start) count++;
+        char *next = strchr(line, '\n');
+        if (!next) break;
+        line = next + 1;
     }
-    fclose(maps);
     return count;
 }
 /* MADV_DONTFORK, MADV_WIPEONFORK and MADV_DONTDUMP, which change the flags
@@ -6104,8 +6113,9 @@ static int madvise_fork_case(void) {
         unsigned char vec;
         long gone = mincore(p + page, page, &vec) ? -errno : 0;
         int wiped = advice_status(p + 2 * page);
+        int vmas = advice_vmas(p, p + 4 * page);
         printf("child: kept=%d gone=%ld wiped-status=%d wiped=%d dumpless=%d vmas=%d\n", p[0], gone,
-               wiped, p[2 * page], p[3 * page], advice_vmas(p, p + 4 * page));
+               wiped, p[2 * page], p[3 * page], vmas);
         fflush(stdout);
         _exit(0);
     }

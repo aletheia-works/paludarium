@@ -17860,6 +17860,21 @@ int main(int argc, char **argv) {
         result("pidfd-sender", info.si_pid == pid);
         result("pidfd-code", info.si_code);
         waitpid(pid, NULL, 0);
+        /* PIDFD_SELF_THREAD (-10000) names the thread, which takes the
+           signal as from tkill (SI_TKILL); PIDFD_SELF_THREAD_GROUP (-10001)
+           the process, as kill sends (SI_USER). Other negative numbers are
+           no descriptor. */
+        result("self-thread", syscall(SYS_pidfd_send_signal, -10000L, SIGUSR1, NULL, 0));
+        if (sigwaitinfo(&usr, &info) != SIGUSR1) return 120;
+        result("self-thread-sender", info.si_pid == getpid());
+        result("self-thread-code", info.si_code);
+        result("self-process", syscall(SYS_pidfd_send_signal, -10001L, SIGUSR2, NULL, 0));
+        if (sigwaitinfo(&usr2, &info) != SIGUSR2) return 121;
+        result("self-process-sender", info.si_pid == getpid());
+        result("self-process-code", info.si_code);
+        errno = 0;
+        result("other-negative", syscall(SYS_pidfd_send_signal, -20000L, SIGUSR1, NULL, 0) == -1 &&
+                                     errno == EBADF);
         int ready[2], seen[2];
         if (pipe(ready) || pipe(seen)) return 84;
         pid_t parent = child();

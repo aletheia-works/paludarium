@@ -4074,6 +4074,26 @@ mod tests {
             route(RTM_DELROUTE, 15, 1, &[(RTA_DST, &[240]), (RTA_OIF, &lo)]),
             Err(Errno::EINVAL)
         );
+        // RTA_OIF of 0 is no interface (`ifindex` is its value): with a
+        // gateway it is the gateway's route, alone no output.
+        let none = 0u32.to_le_bytes();
+        assert_eq!(
+            route(
+                RTM_NEWROUTE,
+                0,
+                1,
+                &[(RTA_DST, &[60]), (RTA_OIF, &none), (RTA_GATEWAY, &one)]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            route(RTM_NEWROUTE, 0, 1, &[(RTA_DST, &[61]), (RTA_OIF, &none)]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            route(RTM_DELROUTE, 0, 1, &[(RTA_DST, &[60]), (RTA_GATEWAY, &one)]),
+            Ok(())
+        );
         // Removing does not look inside the metrics.
         let mut hoplimit = Vec::new();
         attribute(&mut hoplimit, 10, &64u32.to_le_bytes());

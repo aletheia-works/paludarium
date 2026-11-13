@@ -11125,6 +11125,18 @@ int main(int argc, char **argv) {
                 nl_put(&b, 5, gateway, 8);
                 nl_put(&b, 8 | 0x8000, hoplimit, 8);
                 printf("mctp unroute hoplimit: error=%d\n", nl_quiet(fd, 25, 0, b.bytes, b.len));
+                /* RTA_OIF of 0 names no interface: with a gateway it is the
+                   gateway's route, and alone no output (EINVAL). */
+                for (int with = 1; with >= 0; with--) {
+                    b = nl_body(45, 12);
+                    b.bytes[7] = 1;
+                    nl_put(&b, 1, &eid, 1);
+                    nl_put32(&b, 4, 0);
+                    if (with) nl_put(&b, 5, gateway, 8);
+                    printf("mctp route oif 0%s: error=%d\n", with ? " and gateway" : "",
+                           nl_quiet(fd, 24, 0, b.bytes, b.len));
+                }
+                nl_mctp_route(fd, 25, 0, 1, 40, 0, 0, 20, 0, "mctp unroute oif 0");
             }
             nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 50, 1, "mctp add 50");
             b = nl_body(45, 12);

@@ -7053,6 +7053,27 @@ static long rq_old(long op, volatile uint32_t *from, long wake, long requeue, vo
                    long cmp) {
     return f2_errno(syscall(SYS_futex, from, op, wake, (void *)requeue, to, cmp));
 }
+/* A waiter that wakes spuriously waits again on the word it first waited
+   on (Linux's __futex_wait goes back to its retry label), so the kernel can
+   take a waiter back off the word it was requeued to, which a run of the
+   emulator never does. Each scenario therefore counts its waiters onto the
+   first word, then sets that word to 1 and moves them all at once: a
+   waiter that wakes spuriously after that finds 1 where it waited for 0
+   and gives -EAGAIN, and the scenario runs again. The emulator gives the
+   same output every time, so running again hides none of its mistakes. */
+#define RQ_ATTEMPTS 20
+static int rq_queued(volatile uint32_t *word, long count) {
+    rq_begin();
+    while (rq_old(4 | 128, word, 0, INT_MAX, word, 0) != count)
+        if (rq_late()) return 1; else sched_yield();
+    *word = 1;
+    return 0;
+}
+static int rq_bounced(int count) {
+    for (int i = 0; i < count; i++)
+        if (rq_results[i] == -EAGAIN) return 1;
+    return 0;
+}
 static int futex_requeue_case(void) {
     volatile uint32_t *a = &rq_words[0], *b = &rq_words[1];
     printf("requeue negative-wake=%ld negative-requeue=%ld high-val2=%ld misaligned=%ld "
@@ -7063,37 +7084,36 @@ static int futex_requeue_case(void) {
            rq_old(4 | 128, a, 1, 1, b, 1), rq_old(4 | 128, a, 1, 1, b, 1L << 32),
            rq_old(4 | 128 | 256, a, 1, 1, b, 0));
     pthread_t t[3];
-    for (long i = 0; i < 3; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
-    long moved = 0;
-    rq_begin();
-    while (moved < 3 && !rq_late()) {
-        long r = rq_old(4 | 128, a, 0, INT_MAX, b, 0);
-        if (r < 0) return 80;
-        moved += r;
-        if (moved < 3) sched_yield();
+    long moved, woke_b, back, woke_a, left_b;
+    for (int attempt = 0; attempt < RQ_ATTEMPTS; attempt++) {
+        *a = 0;
+        for (long i = 0; i < 3; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
+        if (rq_queued(a, 3)) return 80;
+        moved = rq_old(4 | 128, a, 0, INT_MAX, b, 1);
+        woke_b = f2_errno(syscall(SYS_futex, b, 1 | 128, 1, NULL, NULL, 0));
+        back = rq_old(4 | 128, b, 1, 1, a, 0);
+        woke_a = f2_errno(syscall(SYS_futex, a, 1 | 128, INT_MAX, NULL, NULL, 0));
+        left_b = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
+        for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
+        if (!rq_bounced(3)) break;
     }
-    long woke_b = f2_errno(syscall(SYS_futex, b, 1 | 128, 1, NULL, NULL, 0));
-    long back = rq_old(4 | 128, b, 1, 1, a, 0);
-    long woke_a = f2_errno(syscall(SYS_futex, a, 1 | 128, INT_MAX, NULL, NULL, 0));
-    long left_b = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
-    for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
     printf("requeue moved=%ld woke-b=%ld back=%ld woke-a=%ld left-b=%ld results=%ld,%ld,%ld\n",
            moved, woke_b, back, woke_a, left_b, rq_results[0], rq_results[1], rq_results[2]);
     /* Onto its own word: Linux's requeue_futex leaves each waiter where it
        is, so the walk counts each once. */
-    for (long i = 0; i < 2; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
-    rq_begin();
-    for (moved = 0; moved < 2 && !rq_late();) {
-        long r = rq_old(4 | 128, a, 0, INT_MAX, b, 0);
-        if (r < 0) return 81;
-        moved += r;
-        if (moved < 2) sched_yield();
+    long same, alone_woke, alone, rest;
+    for (int attempt = 0; attempt < RQ_ATTEMPTS; attempt++) {
+        *a = 0;
+        for (long i = 0; i < 2; i++) pthread_create(&t[i], NULL, rq_old_waiter, (void *)i);
+        if (rq_queued(a, 2)) return 81;
+        moved = rq_old(4 | 128, a, 0, INT_MAX, b, 1);
+        same = rq_old(4 | 128, b, 0, 3, b, 0);
+        alone_woke = f2_errno(syscall(SYS_futex, b, 1 | 128, 1, NULL, NULL, 0));
+        alone = rq_old(4 | 128, b, 0, 5, b, 0);
+        rest = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
+        for (int i = 0; i < 2; i++) pthread_join(t[i], NULL);
+        if (!rq_bounced(2)) break;
     }
-    long same = rq_old(4 | 128, b, 0, 3, b, 0);
-    long alone_woke = f2_errno(syscall(SYS_futex, b, 1 | 128, 1, NULL, NULL, 0));
-    long alone = rq_old(4 | 128, b, 0, 5, b, 0);
-    long rest = f2_errno(syscall(SYS_futex, b, 1 | 128, INT_MAX, NULL, NULL, 0));
-    for (int i = 0; i < 2; i++) pthread_join(t[i], NULL);
     printf("requeue moved=%ld same-word=%ld woke=%ld alone=%ld rest=%ld results=%ld,%ld\n", moved, same,
            alone_woke, alone, rest, rq_results[0], rq_results[1]);
 
@@ -7110,13 +7130,18 @@ static int futex_requeue_case(void) {
     w[0].val = 0;
     printf("futex_requeue flags=%ld null=%ld negative=%ld differ=%ld mismatch=%ld none=%ld\n", flags,
            null, negative, differ, mismatch, f2_errno(syscall(456, w, 0L, 1L, 1L)));
-    pthread_t n;
-    pthread_create(&n, NULL, rq_new_waiter, NULL);
-    long r;
-    rq_begin();
-    while ((r = f2_errno(syscall(456, w, 0L, 0L, 1L))) == 0 && !rq_late()) sched_yield();
-    long woke = f2_wake((void *)&rq_words[3], 1, 1, F2_U32_PRIVATE);
-    pthread_join(n, NULL);
+    long r, woke;
+    w[0].val = 1;
+    for (int attempt = 0; attempt < RQ_ATTEMPTS; attempt++) {
+        rq_words[2] = 0;
+        pthread_t n;
+        pthread_create(&n, NULL, rq_new_waiter, NULL);
+        if (rq_queued(&rq_words[2], 1)) return 82;
+        r = f2_errno(syscall(456, w, 0L, 0L, 1L));
+        woke = f2_wake((void *)&rq_words[3], 1, 1, F2_U32_PRIVATE);
+        pthread_join(n, NULL);
+        if (rq_results[3] != -EAGAIN) break;
+    }
     printf("futex_requeue moved=%ld woke=%ld result=%ld\n", r, woke, rq_results[3]);
     return 0;
 }

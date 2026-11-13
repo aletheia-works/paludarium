@@ -9,7 +9,7 @@ paludarium was built from the ground up in these stages.
 | 3 | probe and aube run in Node.js and three browsers (Chromium-based, Firefox, Safari) | Done |
 | 4 | probe and aube run on macOS and Windows hosts | Done |
 | 5 | A minimal WebAssembly JIT, faster than the interpreter in Node.js | Done |
-| Release | Publish to crates.io, npm and JSR | crates.io and npm since 0.1.0, JSR from the first release after 0.14.0 ([releases](https://github.com/aletheia-works/paludarium/releases)) |
+| Release | Publish to crates.io, npm and JSR | crates.io and npm since 0.1.0, JSR from the first release after 0.15.0 ([releases](https://github.com/aletheia-works/paludarium/releases)) |
 
 Each stage moved on only after differential tests showed that its programs give
 the same results as a real x86-64 Linux. ripgrep has since joined probe and

@@ -10,7 +10,7 @@ Release Please pull request raises it. The twelve crates,
 published only with OIDC from `publish.yml` (Trusted Publishing on crates.io
 and npm; on JSR, the GitHub repository linked to the package), after the
 same-head evidence of the head (steps 5 and 6 below). JSR is published from
-the first release after 0.14.0. Only the first release, `v0.1.0` (2026-10-20, tag on
+the first release after 0.15.0. Only the first release, `v0.1.0` (2026-10-20, tag on
 0f456d07), was published by hand with one-time scoped tokens, because
 crates.io lets a Trusted Publisher be registered only for a crate that
 already exists.
@@ -59,7 +59,13 @@ list each of them. It uses `PALUDARIUM_RELEASE_DENO`, else the `deno` on
 mise) before any dry run or upload. Deno 2.8.2 and later rewrite the import
 module names of a Wasm module on publish (denoland/deno#34549): `env` became
 `./env`, and the JSR 0.15.0 `paludarium.wasm` did not instantiate with its
-import object, so that version was deleted (denoland/deno#37171). Every query
+import object, so that version was deleted (denoland/deno#37171). JSR keeps
+that upload's successful publishing task, which refuses every later upload of
+0.15.0 (`duplicateVersionPublish`; `deno publish` then exits 0 without
+uploading), so 0.15.0 is released without JSR: `JSR_SKIPPED_VERSIONS` in
+`scripts/release/check.py` makes the publish job verify the crates and npm and
+skip JSR for it. That exception is to be removed once a later version is on
+JSR. Every query
 of a JSR version's metadata carries a fresh `?uncached=` query, because the
 CDN in front of jsr.io keeps `<version>_meta.json` for a year: the deleted
 0.15.0 still answered 200 from it. A mock upload test is not a registry or

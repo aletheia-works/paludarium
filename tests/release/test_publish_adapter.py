@@ -123,6 +123,8 @@ class PublishAdapterTests(unittest.TestCase):
         self.jsr_yanked = False
         self.deno_version = "deno " + package.JSR_DENO_VERSION + " (stable, release, x86_64)"
         self.deno_versions = []
+        # The real list names the repository's own version while that is 0.15.0.
+        self.jsr_skipped = frozenset()
 
     def request(self, request, timeout):
         # jsr.io answers 403 to urllib's own User-Agent, so every query must name ours.
@@ -198,6 +200,7 @@ class PublishAdapterTests(unittest.TestCase):
             patch.object(check, "checked_command", side_effect=self.command),
             patch.object(check, "run_command", side_effect=self.command),
             patch.object(check.urllib.request, "urlopen", side_effect=self.request),
+            patch.object(check, "JSR_SKIPPED_VERSIONS", self.jsr_skipped),
         ):
             return check.publish_artifacts(self.root, None)
 
@@ -359,6 +362,22 @@ class PublishAdapterTests(unittest.TestCase):
             self.execute()
         self.assertEqual([n for n, _ in self.envs if "jsr" in n], [])
         self.assertNotIn("jsr", self.uploaded)
+
+    # 0.15.0 is released without JSR, after verifying the crates and npm as always.
+    def test_skipped_jsr_version_runs_no_jsr_command(self):
+        self.jsr_skipped = frozenset({VERSION})
+        result = self.execute()
+        self.assertEqual(len(result["published"]), 13)
+        self.assertEqual(result["published"][-1], check.NPM_NAME)
+        self.assertEqual(result["skipped"], [check.JSR_KEY])
+        self.assertEqual(self.deno_versions, [])
+        self.assertEqual([n for n, _ in self.envs if "jsr" in n], [])
+        self.assertNotIn("jsr", self.uploaded)
+        progress = json.loads((self.out / "publication-progress.json").read_text())
+        self.assertNotIn(check.JSR_KEY, progress["attempted"])
+
+    def test_only_0_15_0_is_released_without_jsr(self):
+        self.assertEqual(check.JSR_SKIPPED_VERSIONS, frozenset({"0.15.0"}))
 
     def test_prepared_jsr_files_changed_stops_before_any_upload(self):
         self.result["jsr"]["files"]["/README.md"]["size"] += 1

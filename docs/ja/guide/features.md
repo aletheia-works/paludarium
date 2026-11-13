@@ -338,7 +338,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   のときに、Linux の `exit_robust_list` と同じようにリストをたどります。スレッドが
   持っていたワードに `FUTEX_OWNER_DIED` を付け、`FUTEX_WAITERS` があれば shared の
   wake をします。使えないものに当たるか 2048 個たどると止まり、コアダンプはその前に
-  書きます。新しいスレッドとプロセスのリストは空です。
+  書きます。新しいスレッドとプロセスのリストは空です。`get_robust_list` は、ほかの
+  プロセスのスレッドの先頭も、Linux の `ptrace_may_access` が
+  `PTRACE_MODE_READ_REALCREDS` で読めるとする呼び出し元には返します（`EPERM` は
+  アドレスに書く前です）。ゾンビなら 0 です。
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
 - [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET`、`AF_INET6`、`AF_NETLINK` に

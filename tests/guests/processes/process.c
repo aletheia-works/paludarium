@@ -4541,6 +4541,54 @@ static int robust_list_cases(const char *self) {
     waitpid(child, &status, 0);
     robust_show("before-unmapped", *robust_word(base, 0), (unsigned)child);
 
+    /* Another process's list, for a caller that may read it (ptrace_may_access
+       with PTRACE_MODE_READ_REALCREDS, which Yama leaves alone). */
+    if (pipe(ready) || pipe(go)) return 92;
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 93;
+    if (!child) {
+        syscall(SYS_set_robust_list, base + 128, 24L);
+        if (write(ready[1], &byte, 1) != 1 || read(go[0], &byte, 1) != 1) _exit(1);
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if (write(ready[1], &byte, 1) != 1 || read(go[0], &byte, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    if (read(ready[0], &byte, 1) != 1) return 94;
+    got = NULL;
+    length = 0;
+    r = syscall(SYS_get_robust_list, (long)child, &got, &length);
+    printf("get-of-child=%ld same=%d length=%zu\n", r, got == base + 128, length);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child | 1L << 32, &got, &length);
+    printf("get-of-child-as-int=%ld\n", r);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, NULL, &length);
+    printf("get-of-child-bad-head=%ld errno=%d\n", r, errno);
+    if (write(go[1], &byte, 1) != 1 || read(ready[0], &byte, 1) != 1) return 95;
+    /* Not dumpable: only CAP_SYS_PTRACE reads it, before the addresses. */
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, NULL, NULL);
+    int privileged = geteuid() == 0;
+    printf("get-of-undumpable fits-caller=%d\n",
+           privileged ? r == -1 && errno == EFAULT : r == -1 && errno == EPERM);
+    if (write(go[1], &byte, 1) != 1) return 96;
+    siginfo_t info;
+    if (waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT)) return 97;
+    /* A zombie's list went as it ended; a reaped process is gone. */
+    got = base;
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, &got, &length);
+    printf("get-of-zombie=%ld errno=%d none=%d\n", r, errno, got == NULL);
+    waitpid(child, &status, 0);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, &got, &length);
+    printf("get-of-reaped=%ld errno=%d\n", r, errno);
+    close(ready[0]);
+    close(ready[1]);
+    close(go[0]);
+    close(go[1]);
+
     /* execve walks it on the old image, and the new program has none. */
     memset(base, 0, (size_t)page);
     fflush(stdout);

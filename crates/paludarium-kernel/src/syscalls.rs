@@ -156,7 +156,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 87] = [
+        let entries: [(u64, Handler); 86] = [
             (nr::GETITIMER, sys_getitimer),
             (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
@@ -202,7 +202,6 @@ impl SyscallTable {
             (nr::MLOCKALL, sys_mlockall),
             (nr::MUNLOCKALL, sys_munlockall),
             (nr::SET_ROBUST_LIST, sys_set_robust_list),
-            (nr::GET_ROBUST_LIST, sys_get_robust_list),
             (nr::UNAME, sys_uname),
             (nr::SETHOSTNAME, sys_sethostname),
             (nr::SETDOMAINNAME, sys_setdomainname),
@@ -2147,24 +2146,6 @@ fn sys_set_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         return err(Errno::EINVAL);
     }
     c.group.set_robust_list(c.tid, a[0]);
-    ok(0)
-}
-
-/// `get_robust_list(tid, head, length)` of a thread of this process, or
-/// `ESRCH` for any other (Linux gives another process's if it may trace it).
-fn sys_get_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let tid = a[0] as u32;
-    let tid = if tid == 0 { c.tid } else { c.named(tid) };
-    let Some(head) = c.group.robust_list(tid) else {
-        return err(Errno(3));
-    };
-    if c.mem
-        .write_u64(GuestAddr(a[2]), crate::futex::ROBUST_LIST_HEAD)
-        .is_err()
-        || c.mem.write_u64(GuestAddr(a[1]), head).is_err()
-    {
-        return err(Errno::EFAULT);
-    }
     ok(0)
 }
 

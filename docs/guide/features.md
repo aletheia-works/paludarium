@@ -383,6 +383,9 @@ kernel.
   a word the thread owned is marked `FUTEX_OWNER_DIED`, with a shared wake if
   it has `FUTEX_WAITERS`, the walk stops at what it cannot use and after 2048
   entries, and a core dump comes first. A new thread or process has no list.
+  `get_robust_list` gives another process's thread's head to a caller that may
+  read it, as Linux's `ptrace_may_access` with `PTRACE_MODE_READ_REALCREDS`
+  decides (`EPERM` before the addresses are written), and 0 for a zombie.
 - `futex`, `epoll` and `eventfd` are implemented inside paludarium, not with the
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.

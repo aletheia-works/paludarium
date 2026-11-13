@@ -1937,7 +1937,9 @@ kernel.
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
   gets `EACCES` for `environ` unless its real IDs, and for `exe`, `cwd` and
   the links of `ns` unless its filesystem IDs, are every user and group ID of a dumpable
-  process; an undumpable process's directory is root's. What a process shows of
+  process in its user namespace whose permitted capabilities its own cover
+  (its effective ones for the filesystem IDs), as reading another process
+  asks above; an undumpable process's directory is root's. What a process shows of
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for

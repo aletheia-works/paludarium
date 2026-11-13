@@ -11891,6 +11891,55 @@ int main(int argc, char **argv) {
                 b.bytes[4] = 254;
                 nl_strict(fd, port, 26, 1, &b, "policy route main after");
             }
+            /* An address got by itself (RTM_GETADDR without a dump): only
+               IPv6 has one, by IFA_LOCAL or else IFA_ADDRESS, on any
+               device when no device has the index (Linux's fallback
+               tunnels may have small ones); strictly, nothing else in the
+               request. */
+            static const unsigned char one6[16] = {[15] = 1};
+            static const unsigned char other6[16] = {0xfd, [15] = 1};
+            static const unsigned char one4[4] = {127, 0, 0, 1};
+            struct nl_body g6 = nl_body(AF_INET6, 8);
+            b = g6;
+            nl_put(&b, 1, one6, 16);
+            nl_strict(fd, port, 22, 0, &b, "get addr6");
+            struct nl_body by_one = b;
+            index = 1;
+            memcpy(b.bytes + 4, &index, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 index");
+            index = 1000000;
+            memcpy(b.bytes + 4, &index, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 no such index");
+            b = g6;
+            nl_put(&b, 1, other6, 16);
+            nl_put(&b, 2, one6, 16);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 local");
+            b = g6;
+            nl_put(&b, 1, one6, 16);
+            nl_put(&b, 2, other6, 16);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 missing");
+            nl_strict(fd, port, 22, 0, &g6, "get addr6 none");
+            b = nl_body(AF_INET6, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 short header");
+            b = g6;
+            nl_put(&b, 1, one6, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 short address");
+            b = by_one;
+            b.bytes[1] = 128;
+            nl_strict(fd, port, 22, 0, &b, "get addr6 prefix");
+            struct nl_body flagged6 = by_one;
+            nl_put32(&flagged6, 8, 0);
+            nl_strict(fd, port, 22, 0, &flagged6, "get addr6 flags");
+            struct nl_body netnsid6 = by_one;
+            nl_put32(&netnsid6, 10, 12345);
+            nl_strict(fd, port, 22, 0, &netnsid6, "get addr6 netnsid");
+            b = nl_body(AF_INET, 8);
+            nl_put(&b, 2, one4, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr4");
+            b = nl_body(45, 8);
+            nl_strict(fd, port, 22, 0, &b, "get addr mctp");
+            b = nl_body(0, 8);
+            nl_strict(fd, port, 22, 0, &b, "get addr unspec");
             /* Unchecked: an old rtgenmsg with IFLA_EXT_MASK after its 4
                bytes, IFLA_MASTER and IFLA_TARGET_NETNSID, and RTM_F_PREFIX. */
             int loose = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
@@ -11909,6 +11958,12 @@ int main(int argc, char **argv) {
             b = nl_body(0, 16);
             nl_put(&b, 3, "lo", 3);
             nl_strict(loose, name.pid, 18, 1, &b, "loose link name");
+            b = by_one;
+            b.bytes[1] = 128;
+            b.bytes[3] = 254;
+            nl_put32(&b, 8, 0);
+            nl_strict(loose, name.pid, 22, 0, &b, "loose get addr6 prefix flags");
+            nl_strict(loose, name.pid, 22, 0, &netnsid6, "loose get addr6 netnsid");
             link = (struct nl_link){.index = -1};
             b = nl_body(0, 16);
             memcpy(b.bytes, &link, 16);

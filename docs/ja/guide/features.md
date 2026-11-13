@@ -1272,7 +1272,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`IFA_F_NOPREFIXROUTE` も）、`IFA_PROTO` を保ちます。`RTM_DELADDR` は、指した
     `IFA_LOCAL`、`IFA_LABEL`、`IFA_ADDRESS` と接頭辞を持つ最初のものを消し（なければ
     `EADDRNOTAVAIL`）、プライマリならそのセカンダリも消します。`127.0.0.1` と `::1` も
-    消せます。
+    消せます。ダンプでない `RTM_GETADDR` は、`inet6_rtm_getaddr` と同じく IPv6 のアドレスを
+    1 つ返します。`IFA_LOCAL` が指すもの、なければ `IFA_ADDRESS` が指すもので、インデックスは
+    問いません。どちらもなければ `EINVAL`、`lo` が持たないものなら `EADDRNOTAVAIL` です。
+    厳密に確かめるソケットでは、ほかに何も指せません（`EINVAL`）。IPv4 と MCTP には 1 つだけ
+    返す処理がないので、Linux と同じく `EOPNOTSUPP` です。
   - **MCTP のアドレス:** `CONFIG_MCTP` を組み込んだカーネルのループバックと同じく、`lo` は
     MCTP のエンドポイント ID を持てます。`AF_MCTP` の `RTM_NEWADDR` と `RTM_DELADDR` は、
     `mctp_rtm_newaddr` と `mctp_rtm_deladdr` と同じく ID を足し、消します。リクエストは

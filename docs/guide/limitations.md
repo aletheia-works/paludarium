@@ -446,8 +446,8 @@ verified.
   however many those take. Of `NETLINK_ROUTE` there
   are only the link, address and route requests: neighbours, rules, queueing
   disciplines and the rest are `EOPNOTSUPP`, as are an input route
-  lookup (`RTA_IIF`, as `ip route get ... iif` sends), a non-dump
-  `RTM_GETADDR`, renaming `lo` and setting any other attribute of it. A
+  lookup (`RTA_IIF`, as `ip route get ... iif` sends), renaming `lo`
+  and setting any other attribute of it. A
   route goes through `lo` or rejects: IPv6 gateways, multipath routes,
   metrics (`RTA_METRICS`, as `ip route add ... mtu` sends), encapsulations,
   nexthop objects, realms, expiries, source prefixes, router preferences

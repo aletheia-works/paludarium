@@ -1468,7 +1468,12 @@ kernel.
     `IFA_F_NOPREFIXROUTE`) and `IFA_PROTO` are kept. `RTM_DELADDR` removes
     the first that has the `IFA_LOCAL`, `IFA_LABEL` and `IFA_ADDRESS` and
     prefix it names (`EADDRNOTAVAIL` for none), a primary with its
-    secondaries; `127.0.0.1` and `::1` may go too.
+    secondaries; `127.0.0.1` and `::1` may go too. An `RTM_GETADDR` that
+    is not a dump gets one IPv6 address, as `inet6_rtm_getaddr` does: the
+    one `IFA_LOCAL` names, or else `IFA_ADDRESS`, on any index, with
+    `EINVAL` for neither and `EADDRNOTAVAIL` for one `lo` has not; a socket
+    that checks strictly names nothing else (`EINVAL`). IPv4 and MCTP have
+    none to get, so theirs is `EOPNOTSUPP`, as on Linux.
   - **MCTP addresses:** `lo` takes MCTP endpoint IDs, as a kernel built
     with `CONFIG_MCTP` gives a loopback them. `RTM_NEWADDR` and
     `RTM_DELADDR` of `AF_MCTP` add and remove one, as `mctp_rtm_newaddr`

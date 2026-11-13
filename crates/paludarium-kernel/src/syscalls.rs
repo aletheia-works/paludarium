@@ -1306,9 +1306,6 @@ fn sys_rt_sigtimedwait(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 fn sys_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     sleep(c, ClockId::Monotonic, false, a[0], a[1])
 }
-/// `clock_nanosleep(clock, flags, request, remain)` on the clocks
-/// [`timer_clock`] gives, where the thread's CPU clock cannot sleep
-/// (`EOPNOTSUPP`). Linux looks only at `TIMER_ABSTIME` in `flags`.
 /// A sleep on a CPU clock, as Linux's `posix_cpu_nsleep` checks it: the
 /// request is read first, then the caller's own thread's clock is refused
 /// (`EINVAL`), then the clock's task is looked for ([`cpu_clock`]). A sleep
@@ -1333,6 +1330,11 @@ fn cpu_sleep(c: &mut Context<'_>, id: i32, absolute: bool, req: u64) -> Result<(
     };
     if due { Ok(()) } else { Err(Errno::EINVAL) }
 }
+/// `clock_nanosleep(clock, flags, request, remain)`: on the clocks
+/// [`timer_clock`] gives, looking at no flag but `TIMER_ABSTIME` (an alarm
+/// clock refuses the others), and on the CPU clocks ([`cpu_sleep`]). A
+/// dynamic clock cannot sleep (`EOPNOTSUPP`), and neither can
+/// `CLOCK_THREAD_CPUTIME_ID`.
 fn sys_clock_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // A dynamic clock cannot sleep (`EOPNOTSUPP`).
     let id_value = a[0] as u32 as i32;

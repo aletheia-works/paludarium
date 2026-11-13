@@ -327,6 +327,7 @@ mod linux {
         processes_madvise_advice => ("madvise-advice","process"),
         processes_madvise_fork => ("madvise-fork","process"),
         processes_madvise_remove => ("madvise-remove","process"),
+        processes_madvise_guard => ("madvise-guard","process"),
         processes_mrelease => ("mrelease","process"),
         processes_mempolicy => ("mempolicy","process"),
         processes_memfd_secret => ("memfd-secret","process"),

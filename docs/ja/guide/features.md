@@ -730,7 +730,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   共有マッピング（読み込みだけのマッピングでも構いません。`VM_MAYWRITE`）です。
   ファイルのないメモリには `EINVAL`、プライベートか読み込みだけのファイルの
   マッピングには `EACCES` を返し、ファイルの確認で失敗すればそのエラーを返します。
-  ほかの指定と同じく、VMA を順に処理します。ほかの指定には `EINVAL` を返します。
+  ほかの指定と同じく、VMA を順に処理します。`MADV_GUARD_INSTALL` は、Linux の
+  ガード PTE マーカーと同じように、範囲のページをガードページにします。ページの
+  内容はなくなり（ファイルのマッピングはファイルを読み直します）、ガードページに
+  触れると、マッピングのない場所と同じく `SEGV_MAPERR` の `SIGSEGV` になります。
+  システムコールのコピーは `EFAULT` になり、`MADV_POPULATE_READ` と
+  `MADV_POPULATE_WRITE` も `EFAULT` を返します。ページを割り当てられない `mlock` は
+  `ENOMEM` を返します。ガードは VMA を分けず、`MADV_DONTNEED` や重ねての指定の後も
+  残ります。`fork` の子に受け継がれ（`MADV_WIPEONFORK` のマッピングを除きます）、
+  `mremap` でページと一緒に移り、`munmap` でなくなります。`MADV_GUARD_REMOVE` は
+  ガードを外し、内容のないページを残します。ページを捨てられない封印したメモリには
+  ガードを置けません（`EPERM`）。Linux が `VM_DONTEXPAND` でマップする AIO と
+  `io_uring` のリングは、どちらの指定も受け付けません（`EINVAL`）。ほかの指定には
+  `EINVAL` を返します。
 - `process_madvise` は、iovec の範囲を順に指定どおりにします。呼んだプロセス自身の
   メモリ（`PIDFD_SELF_THREAD`、`PIDFD_SELF_THREAD_GROUP`、自身かメモリを共有する
   プロセスの pidfd）には `madvise` と同じようにします。結果は、最初に失敗した範囲より

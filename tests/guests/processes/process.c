@@ -6279,6 +6279,154 @@ static int madvise_remove_case(void) {
     printf("hole=%ld byte=%d\n", hole, shared[page]);
     return 0;
 }
+/* MADV_GUARD_INSTALL and MADV_GUARD_REMOVE, as Linux master's: a guard
+ * page faults as an unmapped one would (SEGV_MAPERR, and EFAULT for a
+ * system call), and stays through MADV_DONTNEED and fork, moves with
+ * mremap, and leaves nothing behind when removed. */
+#ifndef MADV_GUARD_INSTALL
+#define MADV_GUARD_INSTALL 102
+#define MADV_GUARD_REMOVE 103
+#endif
+static sigjmp_buf guard_return;
+static volatile int guard_code, guard_at;
+static volatile long guard_err;
+static volatile uintptr_t guard_expect;
+static void on_guard(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    guard_code = info->si_code;
+    guard_at = (uintptr_t)info->si_addr == guard_expect;
+    guard_err = (long)((ucontext_t *)context)->uc_mcontext.gregs[REG_ERR];
+    siglongjmp(guard_return, 1);
+}
+/* What touching `at` does: its byte, or the SIGSEGV code, address and
+ * error code. */
+static const char *guard_touch(char *out, volatile char *at, int write) {
+    guard_expect = (uintptr_t)at;
+    if (sigsetjmp(guard_return, 1)) {
+        snprintf(out, 64, "segv code=%d at=%d err=%ld", guard_code, guard_at, guard_err);
+        return out;
+    }
+    if (write) *at = 'w';
+    snprintf(out, 64, "byte=%d", *at);
+    return out;
+}
+static int madvise_guard_case(void) {
+    long page = 4096;
+    char a[64], b[64], c[64];
+    struct sigaction action = {0}, old;
+    action.sa_sigaction = on_guard;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGSEGV, &action, &old)) return 80;
+    char *area = mmap(NULL, 6 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 81;
+    /* Its own VMA, apart from any other mapping. */
+    munmap(area, page);
+    munmap(area + 5 * page, page);
+    char *p = area + page;
+    for (int i = 0; i < 4; i++) p[i * page] = 'a' + i;
+    long install = advice_errno(madvise(p + page, 2 * page, MADV_GUARD_INSTALL));
+    printf("install=%ld vmas=%d\n", install, advice_vmas(p, p + 4 * page));
+    printf("read: %s\nwrite: %s\nafter: %s\n", guard_touch(a, p + page, 0),
+           guard_touch(b, p + 2 * page + 5, 1), guard_touch(c, p + 3 * page, 0));
+    int pipes[2];
+    if (pipe(pipes)) return 82;
+    long from = advice_errno(write(pipes[1], p + page, 1));
+    long into = advice_errno(syscall(SYS_getcwd, p + page, 64L));
+    printf("write-from=%ld getcwd-into=%ld\n", from, into);
+    /* Installing again keeps them; MADV_DONTNEED leaves them. */
+    long again = advice_errno(madvise(p + 2 * page, 2 * page, MADV_GUARD_INSTALL));
+    long dontneed = advice_errno(madvise(p, 4 * page, MADV_DONTNEED));
+    printf("again=%ld dontneed=%ld guard: %s first: %s\n", again, dontneed,
+           guard_touch(a, p + 3 * page, 0), guard_touch(b, p, 0));
+    /* A populating mlock cannot fault a guard page in. */
+    long locked = advice_errno(mlock(p, 4 * page));
+    long onfault = advice_errno(syscall(SYS_mlock2, p, 4 * page, 1L));
+    long unlocked = advice_errno(munlock(p, 4 * page));
+    long populate = advice_errno(madvise(p, 4 * page, 22));
+    printf("mlock=%ld onfault=%ld munlock=%ld populate=%ld\n", locked, onfault, unlocked, populate);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 83;
+    if (child == 0) {
+        printf("child: guard: %s first: %s\n", guard_touch(a, p + page, 0), guard_touch(b, p, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 84;
+    /* Removing one leaves a page without contents. */
+    long removed = advice_errno(madvise(p + 3 * page, page, MADV_GUARD_REMOVE));
+    printf("remove=%ld removed: %s kept: %s\n", removed, guard_touch(a, p + 3 * page, 0),
+           guard_touch(b, p + page, 0));
+    /* MADV_WIPEONFORK leaves the child no guard. */
+    long wipe = advice_errno(madvise(p, 4 * page, MADV_WIPEONFORK));
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 85;
+    if (child == 0) {
+        printf("wiped child: %s\n", guard_touch(a, p + page, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 86;
+    long keep = advice_errno(madvise(p, 4 * page, MADV_KEEPONFORK));
+    printf("wipe=%ld keep=%ld parent: %s\n", wipe, keep, guard_touch(a, p + page, 0));
+    /* mremap moves them with the pages; MREMAP_DONTUNMAP leaves none. */
+    char *to = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (to == MAP_FAILED) return 87;
+    char *moved = mremap(p, 4 * page, 4 * page, MREMAP_MAYMOVE | MREMAP_FIXED, to);
+    printf("moved=%d guard: %s free: %s\n", moved == to, guard_touch(a, to + page, 0),
+           guard_touch(b, to + 3 * page, 0));
+    char *kept = mremap(to, 4 * page, 4 * page, MREMAP_MAYMOVE | 4, NULL);
+    if (kept == MAP_FAILED) return 88;
+    printf("dontunmap old: %s new: %s\n", guard_touch(a, to + page, 0),
+           guard_touch(b, kept + page, 0));
+    /* A hole is ENOMEM once the rest has its guards. */
+    char *h = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (h == MAP_FAILED) return 89;
+    munmap(h + page, page);
+    long hole = advice_errno(madvise(h, 3 * page, MADV_GUARD_INSTALL));
+    printf("hole=%ld after-hole: %s\n", hole, guard_touch(a, h + 2 * page, 0));
+    /* process_madvise may put them in its own process. */
+    int self = syscall(SYS_pidfd_open, getpid(), 0);
+    struct iovec iov = {h, page};
+    long advised = advice_errno(syscall(440, self, &iov, 1L, (long)MADV_GUARD_INSTALL, 0U));
+    printf("process-madvise=%ld %s\n", advised, guard_touch(a, h, 0));
+    /* A file's pages come back from the file, a private copy dropped. */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-guard-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || pwrite(fd, "f", 1, 0) != 1 || ftruncate(fd, page)) return 90;
+    char *copy = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    char *file = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (copy == MAP_FAILED || file == MAP_FAILED) return 91;
+    copy[0] = 'w';
+    file[1] = 's';
+    long copy_guard = advice_errno(madvise(copy, page, MADV_GUARD_INSTALL));
+    long file_guard = advice_errno(madvise(file, page, MADV_GUARD_INSTALL));
+    printf("private-file=%ld shared-file=%ld %s %s\n", copy_guard, file_guard,
+           guard_touch(a, copy, 0), guard_touch(b, file + 1, 0));
+    madvise(copy, page, MADV_GUARD_REMOVE);
+    madvise(file, page, MADV_GUARD_REMOVE);
+    printf("private-file: %s shared-file: %s\n", guard_touch(a, copy, 0), guard_touch(b, file + 1, 0));
+    /* Sealed memory that may not be written takes none, but loses them. */
+    char *ro = mmap(NULL, page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ro == MAP_FAILED) return 92;
+    long sealed = advice_errno(syscall(462, ro, page, 0L));
+    long sealed_install = advice_errno(madvise(ro, page, MADV_GUARD_INSTALL));
+    long sealed_remove = advice_errno(madvise(ro, page, MADV_GUARD_REMOVE));
+    printf("sealed=%ld install=%ld remove=%ld\n", sealed, sealed_install, sealed_remove);
+    /* An AIO ring is not memory core mm backs (VM_DONTEXPAND). */
+    unsigned long ring = 0;
+    if (syscall(SYS_io_setup, 1L, &ring)) return 93;
+    long ring_install = advice_errno(madvise((void *)ring, page, MADV_GUARD_INSTALL));
+    long ring_remove = advice_errno(madvise((void *)ring, page, MADV_GUARD_REMOVE));
+    printf("aio-ring install=%ld remove=%ld\n", ring_install, ring_remove);
+    syscall(SYS_io_destroy, ring);
+    sigaction(SIGSEGV, &old, NULL);
+    return 0;
+}
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
  * timers are only read here, before any is armed (cpu_itimer_case arms them). */
 static int itimer_case(void) {
@@ -21013,6 +21161,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
+    if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();

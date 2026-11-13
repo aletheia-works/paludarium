@@ -2021,6 +2021,8 @@ fn is_zero_device(file: &dyn FileHandle) -> bool {
 
 const MADV_DONTNEED: u64 = 4;
 const MADV_REMOVE: u64 = 9;
+const MADV_GUARD_INSTALL: u64 = 102;
+const MADV_GUARD_REMOVE: u64 = 103;
 const MADV_FREE: u64 = 8;
 const MADV_POPULATE_READ: u64 = 22;
 const MADV_POPULATE_WRITE: u64 = 23;
@@ -2102,6 +2104,11 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, populate: bool) -> Outcome {
         covered = m.end();
     }
     if covered < end {
+        return err(Errno::ENOMEM);
+    }
+    // Linux's `__mm_populate` fails to fault a guard page in (`EFAULT`),
+    // which `mlock` gives as `ENOMEM` (`__mlock_posix_error_return`).
+    if populate && c.mem.has_guards(GuestAddr(start), end) {
         return err(Errno::ENOMEM);
     }
     ok(0)
@@ -2197,7 +2204,7 @@ pub(crate) fn advise(
     len: u64,
     advice: u64,
 ) -> Result<(), Errno> {
-    if !matches!(advice, 0..=4 | 8..=24) {
+    if !matches!(advice, 0..=4 | 8..=24 | MADV_GUARD_INSTALL | MADV_GUARD_REMOVE) {
         return Err(Errno::EINVAL);
     }
     if addr & 4095 != 0 {
@@ -2224,6 +2231,9 @@ pub(crate) fn advise(
             remove(credentials, &removal?)?;
         }
         return if hole { Err(Errno::ENOMEM) } else { Ok(()) };
+    }
+    if advice == MADV_GUARD_INSTALL || advice == MADV_GUARD_REMOVE {
+        return mem.guard(GuestAddr(addr), end, advice == MADV_GUARD_INSTALL);
     }
     let flag = match advice {
         10 => Some(paludarium_mmu::FlagAdvice::DontFork),

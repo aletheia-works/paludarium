@@ -1094,6 +1094,12 @@ pub trait PageSource: Send + Sync {
     fn merges(&self) -> bool {
         true
     }
+    /// Whether the memory's VMAs are fixed mappings that core mm does not
+    /// back (Linux's `VM_DONTEXPAND`, as the rings of AIO and `io_uring`
+    /// are): they take no guard regions.
+    fn fixed(&self) -> bool {
+        false
+    }
     /// The source itself, for the kernel to tell its kinds apart.
     fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
         None
@@ -1547,6 +1553,11 @@ struct AddressSpaceData {
     shared: BTreeMap<u64, SharedMapping>,
     /// The files of private file mappings, by range ([`FileBacking`]).
     backing: BTreeMap<u64, FileBacking>,
+    /// The guard regions `MADV_GUARD_INSTALL` put in, from start to end:
+    /// Linux's guard PTE markers, a property of the page tables and not of
+    /// the VMAs, so they neither split nor stop a merge. An access to one
+    /// faults as one to no mapping would.
+    guards: BTreeMap<u64, u64>,
     /// What the frames are charged to; shared with the spaces forked from
     /// this one and the ones its exec starts.
     meter: Option<Arc<MemoryMeter>>,
@@ -1626,6 +1637,7 @@ impl AddressSpaceData {
             directory: RwLock::new(BTreeMap::new()),
             shared: BTreeMap::new(),
             backing: BTreeMap::new(),
+            guards: BTreeMap::new(),
             code: Arc::default(),
             mappings: BTreeMap::new(),
             initial_break: GuestAddr(0),
@@ -2110,6 +2122,9 @@ impl AddressSpaceData {
         copy.mappings = self.mappings.clone();
         copy.shared = self.shared.clone();
         copy.backing = self.backing.clone();
+        // Linux's `VM_COPY_ON_FORK` has `VM_MAYBE_GUARD`: the child gets the
+        // guard markers with the page tables.
+        copy.guards = self.guards.clone();
         copy.initial_break = self.initial_break;
         copy.current_break = self.current_break;
         copy.mmap_top = self.mmap_top;
@@ -2168,6 +2183,7 @@ impl AddressSpaceData {
                 copy.remove(m.start.0, m.end());
             } else {
                 copy.for_populated(m.start.0, m.end(), |entry| *entry = None);
+                copy.clear_guards(m.start.0, m.end());
                 copy.bump_code_generation();
                 if let Some(child) = copy.mappings.get_mut(&m.start.0) {
                     child.written = false;
@@ -2255,6 +2271,18 @@ impl AddressSpaceData {
             let at = page + offset as u64;
             if at >= USER_ADDRESS_LIMIT {
                 return Err(fault(at));
+            }
+            // Linux's `handle_pte_marker` gives `VM_FAULT_SIGSEGV` for a
+            // guard marker, which x86 reports as `SEGV_MAPERR` on a page
+            // that is not present, and which GUP (a system call's copy, a
+            // core dump) takes as `EFAULT`. The loader and the refill of a
+            // discarded file page are not accesses.
+            if access != Access::Setup && self.guarded(page) {
+                return Err(Fault {
+                    mapped: false,
+                    present: false,
+                    ..fault(at)
+                });
             }
             match self.prot_at(directory, page) {
                 Some(prot) if access.permitted(prot) => {}
@@ -2889,6 +2917,7 @@ impl AddressSpaceData {
     /// Takes `[addr, end)` out of the space, its mappings, memory and pages,
     /// sealed or not.
     fn remove(&mut self, addr: u64, end: u64) {
+        self.clear_guards(addr, end);
         let addr = GuestAddr(addr);
         let affected: Vec<_> = self
             .shared
@@ -3021,6 +3050,9 @@ impl AddressSpaceData {
         let shared = self.shared_at(old).cloned();
         let backing = self.backing_at(old).cloned();
         let pages = self.take_pages(old, old + old_len, keep_old && shared.is_some());
+        // The guard markers move with the page tables, and leave the old
+        // range even when `MREMAP_DONTUNMAP` keeps it.
+        let guards = self.clear_guards(old, old + old_len);
         if !keep_old && old_len > 0 {
             // `remap` moves pages of one VMA only, whose mapping at `old` it
             // found not sealed, and sealed mappings make VMAs of their own:
@@ -3067,6 +3099,9 @@ impl AddressSpaceData {
         for (page, entry) in pages {
             let (dir, slot) = page_index(page - old + to);
             directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
+        }
+        for (start, end) in guards {
+            self.add_guards(start - old + to, end - old + to);
         }
         self.bump_code_generation();
     }
@@ -3287,6 +3322,138 @@ impl AddressSpaceData {
         } else {
             Ok(())
         }
+    }
+
+    /// `MADV_GUARD_INSTALL` (with `install`) or `MADV_GUARD_REMOVE` of
+    /// `[addr, end)`, VMA by VMA as Linux's `madvise_walk_vmas`, up to the
+    /// first that refuses: a sealed one whose pages may not be discarded
+    /// installs none (`EPERM`, `can_madvise_modify`), and the rings of AIO
+    /// and `io_uring` take neither (`EINVAL`), as Linux's
+    /// `is_valid_guard_vma` refuses a VMA that is not `vma_is_mm_backed`
+    /// (`VM_DONTEXPAND`). An install drops the pages of the range, as
+    /// Linux's `zap_vma_range` does, but keeps the guards already there,
+    /// and gives private anonymous memory its `anon_vma`
+    /// ([`Mapping::written`]). A hole gives `ENOMEM` once the rest is done.
+    pub fn guard(&mut self, addr: u64, end: u64, install: bool) -> Result<(), Errno> {
+        let fragments: Vec<Mapping> = self
+            .mappings
+            .range(..end)
+            .filter(|(_, m)| m.end() > addr)
+            .map(|(_, m)| *m)
+            .collect();
+        let mut covered = addr;
+        let mut hole = false;
+        for m in fragments {
+            hole |= m.start.0 > covered;
+            covered = covered.max(m.end());
+            if install && self.refuses_discard(&m) {
+                return Err(Errno::EPERM);
+            }
+            let fixed = self
+                .shared_at(m.start.0)
+                .and_then(|shared| shared.pages.source())
+                .is_some_and(|source| source.fixed());
+            if fixed {
+                return Err(Errno::EINVAL);
+            }
+            let (from, to) = (m.start.0.max(addr), m.end().min(end));
+            if install {
+                self.install_guards(&m, from, to);
+            } else {
+                self.clear_guards(from, to);
+            }
+        }
+        if hole || covered < end {
+            Err(Errno::ENOMEM)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Puts guards on `[from, to)` of the mapping `m`: drops its pages as
+    /// [`Self::discard`] would, and its entries of shared memory, which
+    /// keeps its contents.
+    fn install_guards(&mut self, m: &Mapping, from: u64, to: u64) {
+        let shared = self.shared_at(from).is_some();
+        let file = matches!(m.kind, MappingKind::ElfSegment | MappingKind::File);
+        // As in `discard`: a file mapping without its file has nothing to
+        // read its pages from again, and keeps them.
+        if shared || !file || self.backing_at(from).is_some() {
+            self.for_populated(from, to, |entry| *entry = None);
+            self.refill(from, to);
+        }
+        if !shared && !file {
+            self.mark_written(GuestAddr(from), to - from);
+        }
+        self.add_guards(from, to);
+        self.bump_code_generation();
+    }
+
+    /// Whether the page at `page` is a guard page.
+    fn guarded(&self, page: u64) -> bool {
+        self.guards
+            .range(..=page)
+            .next_back()
+            .is_some_and(|(_, &end)| page < end)
+    }
+
+    /// Adds `[start, end)` to the guards, merging it with those it touches.
+    fn add_guards(&mut self, mut start: u64, mut end: u64) {
+        if let Some((&before, &before_end)) = self.guards.range(..=start).next_back()
+            && before_end >= start
+        {
+            start = before;
+            end = end.max(before_end);
+        }
+        let touched: Vec<(u64, u64)> = self
+            .guards
+            .range(start..=end)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in touched {
+            self.guards.remove(&s);
+            end = end.max(e);
+        }
+        self.guards.insert(start, end);
+    }
+
+    /// Takes `[start, end)` out of the guards, and gives the parts of it
+    /// that were guards.
+    fn clear_guards(&mut self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let mut cleared = Vec::new();
+        if end <= start || self.guards.is_empty() {
+            return cleared;
+        }
+        let first = self
+            .guards
+            .range(..start)
+            .next_back()
+            .filter(|&(_, &e)| e > start)
+            .map_or(start, |(&s, _)| s);
+        let overlapping: Vec<(u64, u64)> = self
+            .guards
+            .range(first..end)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in overlapping {
+            self.guards.remove(&s);
+            if s < start {
+                self.guards.insert(s, start);
+            }
+            if e > end {
+                self.guards.insert(end, e);
+            }
+            cleared.push((s.max(start), e.min(end)));
+        }
+        cleared
+    }
+
+    /// Whether `[start, end)` has a guard page.
+    fn has_guards(&self, start: u64, end: u64) -> bool {
+        self.guards
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, &e)| e > start)
     }
 
     /// Whether `m`, sealed, refuses to have its pages discarded
@@ -4386,6 +4553,15 @@ impl AddressSpace {
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
         self.locked().advise_flags(addr.0, end, advice)
     }
+    /// See [`AddressSpaceData::guard`].
+    pub fn guard(&self, addr: GuestAddr, end: u64, install: bool) -> Result<(), Errno> {
+        self.locked().guard(addr.0, end, install)
+    }
+    /// Whether `[addr, end)` has a guard page (`MADV_GUARD_INSTALL`), where
+    /// Linux's `mlock` fails to fault a page in.
+    pub fn has_guards(&self, addr: GuestAddr, end: u64) -> bool {
+        self.locked().has_guards(addr.0, end)
+    }
     pub fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
         self.protect_shared(addr, len, prot)
     }
@@ -5080,6 +5256,80 @@ mod tests {
                 .all(|m| !m.dont_fork && !m.wipe_on_fork && !m.dont_dump)
         );
         assert_eq!(space.vma_at(at(2)), Some((at(0), 4 * PAGE_SIZE)));
+    }
+
+    #[test]
+    fn guards_fault_and_follow_the_page_tables() {
+        let space = space_with(0x50000, 6 * PAGE_SIZE, Prot::READ_WRITE);
+        let at = |n: u64| GuestAddr(0x50000 + n * PAGE_SIZE);
+        let end = |n: u64| 0x50000 + n * PAGE_SIZE;
+        for n in 0..6 {
+            space.write_u64(at(n), n + 1).unwrap();
+        }
+        space.guard(at(1), end(3), true).unwrap();
+        // A guard page faults as no mapping would, for any access, and
+        // splits no VMA.
+        for n in [1, 2] {
+            let fault = space.read_u64(at(n)).unwrap_err();
+            assert!(!fault.mapped && !fault.present, "{fault:?}");
+            assert!(space.write_u64(at(n), 9).is_err());
+            assert!(space.fetch(at(n), &mut [0]).is_err());
+        }
+        assert_eq!(space.mappings().count(), 1);
+        assert!(space.has_guards(at(2), end(3)));
+        assert!(!space.has_guards(at(3), end(6)));
+        // Installing again keeps them; MADV_DONTNEED leaves them.
+        space.guard(at(2), end(4), true).unwrap();
+        space.discard_shared(at(0), 6 * PAGE_SIZE).unwrap();
+        assert!(space.read_u64(at(3)).is_err());
+        assert_eq!(space.read_u64(at(0)).unwrap(), 0);
+        // Removing one gives back a page without contents.
+        space.guard(at(3), end(4), false).unwrap();
+        assert_eq!(space.read_u64(at(3)).unwrap(), 0);
+        assert!(space.read_u64(at(2)).is_err());
+        // A fork copies them; a wiped mapping drops them in the child.
+        let child = space.fork();
+        assert!(child.read_u64(at(1)).is_err());
+        assert_eq!(child.read_u64(at(3)).unwrap(), 0);
+        space
+            .advise_flags(at(0), end(3), FlagAdvice::WipeOnFork)
+            .unwrap();
+        let wiped = space.fork();
+        assert_eq!(wiped.read_u64(at(1)).unwrap(), 0);
+        assert!(space.read_u64(at(1)).is_err());
+        // mremap moves them with the pages, and DONTUNMAP leaves none.
+        let mut moving = space_with(0x80000, 2 * PAGE_SIZE, Prot::READ_WRITE);
+        moving.guard(GuestAddr(0x81000), 0x82000, true).unwrap();
+        let how = Remap {
+            may_move: true,
+            fixed: true,
+            keep_old: true,
+            new_addr: GuestAddr(0x90000),
+        };
+        let to = moving
+            .remap_shared(GuestAddr(0x80000), 2 * PAGE_SIZE, 2 * PAGE_SIZE, how)
+            .unwrap();
+        assert_eq!(to, GuestAddr(0x90000));
+        assert!(moving.read_u64(GuestAddr(0x91000)).is_err());
+        assert_eq!(moving.read_u64(GuestAddr(0x81000)).unwrap(), 0);
+        // munmap takes them out: a new mapping there has none.
+        moving.unmap(GuestAddr(0x90000), 2 * PAGE_SIZE).unwrap();
+        moving
+            .map(
+                Some(GuestAddr(0x90000)),
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        assert_eq!(moving.read_u64(GuestAddr(0x91000)).unwrap(), 0);
+        // A hole is ENOMEM once the rest has its guards.
+        moving.unmap(GuestAddr(0x90000), PAGE_SIZE).unwrap();
+        assert_eq!(
+            moving.guard(GuestAddr(0x90000), 0x92000, true),
+            Err(Errno::ENOMEM)
+        );
+        assert!(moving.read_u64(GuestAddr(0x91000)).is_err());
     }
 
     #[test]

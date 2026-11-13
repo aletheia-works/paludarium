@@ -816,8 +816,19 @@ kernel.
   segment, or a file mapped shared through a description that may write
   it, even read-only (`VM_MAYWRITE`). Memory of no file gives `EINVAL`, a
   private or read-only file mapping `EACCES`, and the file's own checks
-  their errors, VMA by VMA as the other advice goes. Other advice gives
-  `EINVAL`.
+  their errors, VMA by VMA as the other advice goes. `MADV_GUARD_INSTALL`
+  makes the pages of the range guard pages, as Linux's guard PTE markers:
+  their contents go (a file mapping's read the file again), and an access
+  to one raises `SIGSEGV` with `SEGV_MAPERR`, as one to no mapping would,
+  and a system call's copy gives `EFAULT`, as do `MADV_POPULATE_READ` and
+  `MADV_POPULATE_WRITE`; `mlock`, which cannot bring one in, gives
+  `ENOMEM`. Guards split no VMA, stay through `MADV_DONTNEED` and other
+  installs, go to a `fork`ed child (not with `MADV_WIPEONFORK`), move with
+  `mremap`, and go with `munmap`. `MADV_GUARD_REMOVE` takes them out,
+  leaving pages without contents. Sealed memory whose pages may not be
+  discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
+  which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`). Other
+  advice gives `EINVAL`.
 - `process_madvise` advises each range of its iovecs in turn, of the caller's
   memory (`PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP`, or a pidfd of its
   own process or of one sharing its memory) as `madvise` does, and gives the

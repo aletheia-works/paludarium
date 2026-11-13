@@ -179,9 +179,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux のホストで見分けるのは ext4、xfs、btrfs、f2fs だけです（ほかのファイルシステムは
     どちらも断ります）。
   - `madvise` は、Linux が受け付ける次の指定を断ります（`EINVAL`）。`MADV_COLLAPSE`、
-    ガード領域（`MADV_GUARD_INSTALL`、`MADV_GUARD_REMOVE`）、`MADV_HWPOISON`、
-    `MADV_SOFT_OFFLINE` です。`MADV_REMOVE` は、ロックしたマッピングのメモリも解放します。
-    Linux では `EINVAL` です。ここではマッピングごとのロックの状態を持たないためです。
+    `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。`MADV_REMOVE` と `MADV_GUARD_INSTALL` は、
+    ロックしたマッピングのメモリも受け付けます。Linux では `EINVAL` です。ここでは
+    マッピングごとのロックの状態を持たないためです。`/proc/<pid>/smaps` は `VmFlags` を
+    出さないので、ガードを置いた VMA の `gu` フラグも出しません。`/proc/<pid>/pagemap` は
+    なく、ガードページを示せません。
     `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は、`memfd_secret` のマッピングのページも
     割り当てます。Linux では `EINVAL` です。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか

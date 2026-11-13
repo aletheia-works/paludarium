@@ -2199,9 +2199,16 @@ kernel.
   on the process's and the thread's CPU clocks too. As Linux's,
   `CLOCK_MONOTONIC_RAW` and the coarse clocks give `EOPNOTSUPP` (they can
   only be read), as does the thread's CPU clock for a sleep, and
-  `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. A sleep on the
-  process's CPU clock, the CPU clocks of other processes and threads and
-  the alarm clocks are not modelled (`EINVAL`).
+  `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. They also run on
+  the alarm clocks, `CLOCK_REALTIME_ALARM` on the real-time clock and
+  `CLOCK_BOOTTIME_ALARM` on the monotonic one, with `CAP_WAKE_ALARM`, as
+  Linux's `alarmtimer.c` with an RTC that can wake the machine, as the CI
+  runners have: a sleep reads its request, then refuses any flag but
+  `TIMER_ABSTIME` (`EINVAL`), then a caller without the capability
+  (`EPERM`); `timer_create` writes the timer's ID out before it refuses
+  one, and the ID is used up, as it is when it cannot be written
+  (`EFAULT`). A sleep on the process's CPU clock and the CPU clocks of
+  other processes and threads are not modelled (`EINVAL`).
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one
@@ -2230,7 +2237,9 @@ kernel.
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable
   once it has expired. `TFD_TIMER_CANCEL_ON_SET` is accepted, but the guest
-  cannot set the clock, so it never cancels; the alarm clocks give `EPERM`.
+  cannot set the clock, so it never cancels. The alarm clocks run as
+  `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and need `CAP_WAKE_ALARM`
+  (`EPERM`, after unknown flags give `EINVAL`).
 - A signalfd (`signalfd`, `signalfd4`) reads the signals of its mask that are
   pending for the thread reading it, blocked or not, as Linux's
   `dequeue_signal` takes them: the thread's own first, then the process's,

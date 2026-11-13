@@ -8656,6 +8656,52 @@ static int process_vm_case(void) {
     waitpid(zombie, NULL, 0);
     return 0;
 }
+/* The alarm clocks, CLOCK_REALTIME_ALARM and CLOCK_BOOTTIME_ALARM, as
+ * kernel/time/alarmtimer.c and fs/timerfd.c: a sleep, a timer or a timerfd
+ * on one needs CAP_WAKE_ALARM. The CI runners have an RTC that can wake them
+ * (rtc_cmos), so the clocks are there; the case runs in a child that is not
+ * root (natively it never is, and an emulated root becomes nobody), so each
+ * use is refused, and the order of the checks shows. */
+static long al_r(long r) { return r < 0 ? -errno : r; }
+static int alarm_clocks_worker(void) {
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 90;
+    struct timespec t, short_ = {0, 1000}, bad = {-1, 0};
+    for (int c = 8; c <= 9; c++)
+        printf("clock %d: gettime=%ld getres=%ld ns=%ld\n", c, al_r(syscall(SYS_clock_gettime, c, &t)),
+               al_r(syscall(SYS_clock_getres, c, &t)), t.tv_sec * 1000000000L + t.tv_nsec);
+    /* The request is read first, then a flag but TIMER_ABSTIME is refused,
+       then the capability. */
+    printf("nanosleep fault=%ld invalid=%ld flags=%ld abstime=%ld relative=%ld\n",
+           al_r(syscall(SYS_clock_nanosleep, 8, 2, (void *)8, NULL)),
+           al_r(syscall(SYS_clock_nanosleep, 8, 2, &bad, NULL)),
+           al_r(syscall(SYS_clock_nanosleep, 9, 2, &short_, NULL)),
+           al_r(syscall(SYS_clock_nanosleep, 9, 1, &short_, NULL)),
+           al_r(syscall(SYS_clock_nanosleep, 8, 0, &short_, NULL)));
+    /* timer_create writes the ID out before the clock refuses, and the ID
+       is used up; a place it cannot write is EFAULT first. */
+    int id = -1, next = -1;
+    long refused = al_r(syscall(SYS_timer_create, 8, NULL, &id));
+    long fault = al_r(syscall(SYS_timer_create, 9, NULL, (void *)8));
+    long made = al_r(syscall(SYS_timer_create, CLOCK_MONOTONIC, NULL, &next));
+    printf("timer_create refused=%ld id=%d fault=%ld made=%ld next=%d\n", refused, id, fault, made, next);
+    /* timerfd_create: unknown flags first. */
+    printf("timerfd alarm=%ld boottime-alarm=%ld flags=%ld\n", al_r(timerfd_create(8, 0)),
+           al_r(timerfd_create(9, TFD_CLOEXEC)), al_r(timerfd_create(9, 1)));
+    return 0;
+}
+static int alarm_clocks_case(void) {
+    fflush(stdout);
+    pid_t worker = fork();
+    if (worker == 0) {
+        int r = alarm_clocks_worker();
+        fflush(stdout);
+        _exit(r);
+    }
+    printf("worker=%d\n", reaped(worker));
+    return 0;
+}
 static int pidfd_getfd_case(void) {
     if (pipe(pv_gate)) return 80;
     struct pv_task child = pv_child(1), locked = pv_child(0);
@@ -21019,6 +21065,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();

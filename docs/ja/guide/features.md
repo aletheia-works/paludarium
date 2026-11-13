@@ -1913,8 +1913,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   CPU 時計でも動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
   粗い時計は読むことしかできないので `EOPNOTSUPP` になり、スレッドの CPU 時計で眠る
   ときも `EOPNOTSUPP` です。`clock_nanosleep` は、`flags` のうち `TIMER_ABSTIME`
-  しか見ません。プロセスの CPU 時計で眠ること、ほかのプロセスやスレッドの CPU 時計、
-  アラームの時計はまだ再現していません（`EINVAL`）。
+  しか見ません。アラームの時計でも動き、`CLOCK_REALTIME_ALARM` は実時間の時計、
+  `CLOCK_BOOTTIME_ALARM` は単調時計で動きます。CI のランナーのようにマシンを起こせる
+  RTC がある Linux の `alarmtimer.c` と同じく、`CAP_WAKE_ALARM` が要ります。眠る場合は、
+  要求を読み、次に `TIMER_ABSTIME` 以外の `flags` を断り（`EINVAL`）、そのあとで
+  ケーパビリティのない呼び出し元を断ります（`EPERM`）。`timer_create` は、断る前に
+  タイマーの ID を書き出します。書き出せない場合（`EFAULT`）と同じく、その ID は
+  使われたことになります。プロセスの CPU 時計で眠ることと、ほかのプロセスやスレッドの
+  CPU 時計はまだ再現していません（`EINVAL`）。
 - プロセスの実時間のインターバルタイマー（`ITIMER_REAL`）は、Linux と同じく、満了すると
   `SIGALRM` を送り、間隔の分だけ次に進みます。`setitimer` はタイマーより先に新しい値を読んで
   確かめ、古い値はタイマーを設定してから書き出すので、古い値を書けないときはタイマーを設定した
@@ -1936,7 +1942,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。
   `TFD_TIMER_CANCEL_ON_SET` は受け付けますが、ゲストは時計を設定できないので取り消しは
-  起きません。アラームの時計は `EPERM` を返します。
+  起きません。アラームの時計は `CLOCK_REALTIME` と `CLOCK_MONOTONIC` として動き、
+  `CAP_WAKE_ALARM` が要ります（`EPERM`。知らないフラグの `EINVAL` が先です）。
 - signalfd（`signalfd`、`signalfd4`）は、読むスレッドに保留されているシグナルのうち
   マスクにあるものを、ブロックされていてもいなくても、Linux の `dequeue_signal` と
   同じ順で読みます。スレッド自身のものが先で、次にプロセスのもの、それぞれ番号の

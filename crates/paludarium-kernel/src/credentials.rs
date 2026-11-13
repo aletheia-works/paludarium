@@ -20,6 +20,7 @@ pub(crate) const CAP_SYS_ADMIN: u64 = 1 << 21;
 pub(crate) const CAP_SYS_NICE: u64 = 1 << 23;
 pub(crate) const CAP_SYS_RESOURCE: u64 = 1 << 24;
 const CAP_SYS_TTY_CONFIG: u64 = 1 << 26;
+pub(crate) const CAP_WAKE_ALARM: u64 = 1 << 35;
 pub(crate) const CAP_CHECKPOINT_RESTORE: u64 = 1 << 40;
 /// The capabilities a filesystem ID of root brings (`CAP_FS_MASK`):
 /// CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,

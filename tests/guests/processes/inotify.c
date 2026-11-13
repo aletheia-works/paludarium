@@ -20,11 +20,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
@@ -744,6 +746,126 @@ static int case_handles(void) {
     remove_all();
     return 0;
 }
+/* inotify-open-handles: what open_by_handle_at opens. A pidfd's handle is
+   pidfs's (its inode, which fstat gives) and anyone may open it, from the
+   pidfd or pidfs's root, while its process is not reaped; elsewhere an
+   unprivileged caller gets EPERM once the handle's header is checked. */
+static long by_handle(int mount, struct handle *h, int flags) {
+    return e(syscall(SYS_open_by_handle_at, mount, h, flags));
+}
+static void opened(const char *name, long fd, unsigned long ino) {
+    struct stat st = {0};
+    printf("%s=%ld", name, fd < 0 ? fd : 0);
+    if (fd >= 0) {
+        fstat(fd, &st);
+        printf(" flags=%#o cloexec=%d same=%d signal=%ld", fcntl(fd, F_GETFL), fcntl(fd, F_GETFD),
+               st.st_ino == ino, e(syscall(SYS_pidfd_send_signal, fd, 0, NULL, 0)));
+        close(fd);
+    }
+    printf("\n");
+}
+static int case_open_handles(void) {
+    int gate[2];
+    pipe(gate);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char byte;
+        read(gate[0], &byte, 1);
+        _exit(0);
+    }
+    int pidfd = syscall(SYS_pidfd_open, pid, 0);
+    struct handle h, small;
+    int id = -1;
+    long r = to_handle(pidfd, "", &small, 4, &id, AT_EMPTY_PATH);
+    printf("pidfd small=%ld bytes=%u type=%#x\n", r, small.bytes, small.type);
+    r = to_handle(pidfd, "", &h, 8, &id, AT_EMPTY_PATH);
+    unsigned long long inode;
+    memcpy(&inode, h.f, sizeof inode);
+    struct stat st = {0};
+    fstat(pidfd, &st);
+    printf("pidfd handle=%ld bytes=%u type=%#x ino=%s\n", r, h.bytes, h.type,
+           st.st_ino == inode && inode ? "stat" : "other");
+    struct handle fid;
+    r = to_handle(pidfd, "", &fid, 128, &id, AT_EMPTY_PATH | 0x200);
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", pidfd);
+    printf("pidfd fid=%ld same=%d connectable=%ld\n", r, same_handle(&fid, &h),
+           to_handle(AT_FDCWD, link, &fid, 128, &id, AT_SYMLINK_FOLLOW | 0x2));
+    /* fstatfs: pidfs for a pidfd, the anonymous inodes' for an eventfd. */
+    struct statfs fs = {0};
+    fstatfs(pidfd, &fs);
+    printf("fstatfs pidfd=%#lx", (unsigned long)fs.f_type);
+    int ev = eventfd(0, 0);
+    fstatfs(ev, &fs);
+    printf(" eventfd=%#lx", (unsigned long)fs.f_type);
+    printf(" handle=%ld", to_handle(ev, "", &fid, 128, &id, AT_EMPTY_PATH));
+    r = to_handle(ev, "", &fid, 128, &id, AT_EMPTY_PATH | 0x200);
+    printf(" fid=%ld bytes=%u type=%#x\n", r, fid.bytes, fid.type);
+    /* Opened, from the pidfd or pidfs's root (FD_PIDFS_ROOT), always for
+       reading and writing. */
+    opened("from-pidfd", by_handle(pidfd, &h, O_RDONLY), inode);
+    opened("from-root", by_handle(-10002, &h, O_WRONLY | O_NONBLOCK | O_CLOEXEC), inode);
+    opened("thread", by_handle(pidfd, &h, O_EXCL), inode);
+    printf("flags creat=%ld trunc=%ld directory=%ld path=%ld\n", by_handle(pidfd, &h, O_CREAT),
+           by_handle(pidfd, &h, O_TRUNC), by_handle(pidfd, &h, O_DIRECTORY), by_handle(pidfd, &h, O_PATH));
+    /* A directory's handle, a connectable one (only from its own pidfd),
+       nsfs, another inode and another type. */
+    struct handle other = h;
+    other.type = 0x200fe;
+    printf("marked directory=%ld", by_handle(pidfd, &other, 0));
+    other.type = 0x100fe;
+    long own = by_handle(pidfd, &other, 0);
+    printf(" connectable-own=%ld connectable-root=%ld", own < 0 ? own : 0, by_handle(-10002, &other, 0));
+    if (own >= 0) close(own);
+    other.type = 0xfe;
+    printf(" nsfs=%ld", by_handle(-10003, &other, 0));
+    other.type = 1;
+    printf(" type=%ld", by_handle(pidfd, &other, 0));
+    other = h;
+    memset(other.f, 0, 8);
+    printf(" zero=%ld\n", by_handle(pidfd, &other, 0));
+    /* The header, then the mount, then the permission, then the rest. */
+    other = h;
+    other.bytes = 0;
+    printf("header empty=%ld", by_handle(pidfd, &other, 0));
+    other.bytes = 129;
+    printf(" big=%ld", by_handle(pidfd, &other, 0));
+    other.bytes = 8;
+    other.type = -1;
+    printf(" negative=%ld", by_handle(pidfd, &other, 0));
+    other.type = 0x400fe;
+    printf(" flag=%ld fault=%ld\n", by_handle(pidfd, &other, 0), e(syscall(SYS_open_by_handle_at, pidfd, (void *)8, 0)));
+    printf("mount bad=%ld closed=%ld", by_handle(-5, &h, 0), by_handle(999, &h, 0));
+    int memfd = syscall(SYS_memfd_create, "open-handles", 0);
+    struct handle shmem;
+    to_handle(memfd, "", &shmem, 128, &id, AT_EMPTY_PATH);
+    printf(" cwd=%ld memfd=%ld", by_handle(AT_FDCWD, &shmem, 0), by_handle(memfd, &shmem, 0));
+    other = shmem;
+    other.bytes = 0;
+    printf(" cwd-empty=%ld\n", by_handle(AT_FDCWD, &other, 0));
+    long page = sysconf(_SC_PAGESIZE);
+    char *two = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(two + page, page);
+    struct handle *edge = (struct handle *)(two + page - 8);
+    edge->bytes = 8;
+    edge->type = 0xfe;
+    printf("body fault=%ld cwd=%ld\n", by_handle(pidfd, edge, 0), by_handle(AT_FDCWD, edge, 0));
+    /* A zombie's handle still opens; once it is reaped it is stale. */
+    write(gate[1], "x", 1);
+    siginfo_t info;
+    waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+    opened("zombie", by_handle(pidfd, &h, 0), inode);
+    waitpid(pid, NULL, 0);
+    printf("reaped=%ld\n", by_handle(pidfd, &h, 0));
+    struct handle self;
+    int mine = syscall(SYS_pidfd_open, getpid(), 0);
+    to_handle(mine, "", &self, 8, &id, AT_EMPTY_PATH);
+    unsigned long long own_inode;
+    memcpy(&own_inode, self.f, sizeof own_inode);
+    printf("self differs=%d\n", own_inode != inode);
+    opened("self", by_handle(-10002, &self, 0), own_inode);
+    return 0;
+}
 /* The program case_running runs: it says it runs, then waits for the end
    of its input. */
 static int case_runner(void) {
@@ -1375,6 +1497,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "inotify-exec-order")) return case_exec_order();
     if (!strcmp(mode, "inotify-runner")) return case_runner();
     if (!strcmp(mode, "inotify-handles")) return case_handles();
+    if (!strcmp(mode, "inotify-open-handles")) return case_open_handles();
     /* What case_exec_order's dynamic program does: runs argv[2]. */
     if (!strcmp(mode, "inotify-then") && argc > 2) {
         char *const next[] = {argv[2], "inotify-quiet", NULL};

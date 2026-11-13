@@ -100,6 +100,7 @@
     {"name":"inotify-fifo-moved","binary":"inotify"},
     {"name":"inotify-exec-order","binary":"inotify"},
     {"name":"inotify-handles","binary":"inotify"},
+    {"name":"inotify-open-handles","binary":"inotify"},
     {"name":"mqueue-calls","binary":"mqueue"},
     {"name":"mqueue-limits","binary":"mqueue"},
     {"name":"mqueue-wait","binary":"mqueue"},

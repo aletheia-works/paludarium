@@ -1063,6 +1063,9 @@ impl FileSystem for CoherentFs {
     fn mounts(&self) -> Vec<MountPoint> {
         self.inner.mounts()
     }
+    fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
+        self.inner.memory_path(anchor, inode)
+    }
 }
 
 impl HostFs for CoherentFs {

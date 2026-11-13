@@ -405,4 +405,10 @@ impl HostFs for MemFs {
         Ok(out)
     }
 }
-impl FileSystem for MemFs {}
+impl FileSystem for MemFs {
+    fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
+        let t = lock(&self.tree);
+        t.resolve(anchor, true).ok()?;
+        t.path_of(inode, &|_| true)
+    }
+}

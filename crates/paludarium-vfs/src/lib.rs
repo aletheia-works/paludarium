@@ -109,6 +109,13 @@ pub trait FileSystem: HostFs {
             kind: "tmpfs",
         }]
     }
+    /// The path of the file numbered `inode` on the in-memory file system
+    /// that holds `anchor`, as a tmpfs file handle decoded on that mount
+    /// reaches the file: `None` when `anchor` is on another file system, or
+    /// when no name the guest reaches links the file.
+    fn memory_path(&self, _anchor: &[u8], _inode: u64) -> Option<Vec<u8>> {
+        None
+    }
     fn read_file(&self, path: &[u8]) -> Result<Arc<[u8]>, Errno> {
         let f = self.open(path, 0, 0)?;
         if f.stat()?.mode & 0o170000 == 0o040000 {
@@ -239,6 +246,28 @@ impl Tree {
             }
         }
         Ok(())
+    }
+    /// The first path, breadth first and in name order, that links node
+    /// `id` and that `reached` takes; the root's is `/`.
+    fn path_of(&self, id: u64, reached: &dyn Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
+        let mut queue = VecDeque::from([(1, b"/".to_vec())]);
+        while let Some((at, path)) = queue.pop_front() {
+            if at == id && reached(&path) {
+                return Some(path);
+            }
+            let node = self.node(at).ok()?;
+            if let Kind::Dir(children) = &lock(&node).kind {
+                for (name, &child) in children {
+                    let mut next = path.clone();
+                    if next.last() != Some(&b'/') {
+                        next.push(b'/');
+                    }
+                    next.extend_from_slice(name);
+                    queue.push_back((child, next));
+                }
+            }
+        }
+        None
     }
     fn node(&self, id: u64) -> Result<Arc<Mutex<Node>>, Errno> {
         self.nodes.get(&id).cloned().ok_or(Errno::ENOENT)

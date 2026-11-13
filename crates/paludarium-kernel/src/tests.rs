@@ -5412,6 +5412,180 @@ mod inotify {
         assert_eq!(ask(&mut f, cwd, missing, 128, 0), errno(Errno::ENOENT));
     }
     #[test]
+    fn open_by_handle_at_opens_tmpfs_files_with_the_capability() {
+        let mut f = fixture();
+        let file = put(&f, DATA, b"/tmp/opened");
+        let fd = f.ret(2, &[file, 0o102, 0o600]);
+        let text = put(&f, DATA + 0x40, b"abc");
+        assert_eq!(f.ret(1, &[fd, text, 3]), 3);
+        let tmp = put(&f, DATA + 0x80, b"/tmp");
+        let (handle, mount, buf) = (DATA + 0x200, DATA + 0x300, DATA + 0x400);
+        let cwd = (-100i64) as u64;
+        let encode = |f: &mut Fixture, path: u64, at: u64| {
+            f.mem.write(GuestAddr(at), &128u32.to_le_bytes()).unwrap();
+            assert_eq!(f.ret(303, &[cwd, path, at, mount, 0]), 0);
+        };
+        encode(&mut f, file, handle);
+        let dir_handle = DATA + 0x600;
+        encode(&mut f, tmp, dir_handle);
+        // The file it names, opened as asked.
+        let opened = f.ret(304, &[cwd, handle, 0]);
+        assert!(opened > fd, "{opened}");
+        assert_eq!(f.ret(17, &[opened, buf, 8, 0]), 3);
+        assert_eq!(f.ret(72, &[opened, 3]), 0o100000);
+        let dir = f.ret(304, &[cwd, dir_handle, 0o200000]);
+        assert!(dir > opened, "{dir}");
+        // From the file's own descriptor too, which is on the same mount.
+        assert!(f.ret(304, &[fd, handle, 0o2000000]) > dir);
+        // `O_CREAT` finds the file: EEXIST with `O_EXCL`, EISDIR for a
+        // directory.
+        assert_eq!(f.ret(304, &[cwd, handle, 0o300]), errno(Errno::EEXIST));
+        assert_eq!(f.ret(304, &[cwd, dir_handle, 0o100]), errno(Errno::EISDIR));
+        assert!(f.ret(304, &[cwd, handle, 0o102]) < 1 << 32);
+        // A file's handle marked as a directory's.
+        let header = |f: &mut Fixture, at: u64, size: u32, kind: u32| {
+            f.mem.write(GuestAddr(at), &size.to_le_bytes()).unwrap();
+            f.mem.write(GuestAddr(at + 4), &kind.to_le_bytes()).unwrap();
+        };
+        header(&mut f, handle, 12, 0x2_0001);
+        assert_eq!(f.ret(304, &[cwd, handle, 0]), errno(crate::files::ESTALE));
+        header(&mut f, dir_handle, 12, 0x2_0001);
+        assert!(f.ret(304, &[cwd, dir_handle, 0]) < 1 << 32);
+        // Connectable: only below the mount's directory.
+        header(&mut f, handle, 12, 0x1_0001);
+        assert!(f.ret(304, &[dir, handle, 0]) < 1 << 32);
+        let proc = put(&f, DATA + 0xc0, b"/tmp/sub");
+        assert_eq!(f.ret(83, &[proc, 0o700]), 0);
+        let sub = f.ret(2, &[proc, 0o200000]);
+        assert_eq!(f.ret(304, &[sub, handle, 0]), errno(crate::files::ESTALE));
+        header(&mut f, handle, 12, 1);
+        // The header: its size and the flags of its type.
+        header(&mut f, buf, 0, 1);
+        assert_eq!(f.ret(304, &[cwd, buf, 0]), errno(Errno::EINVAL));
+        header(&mut f, buf, 129, 1);
+        assert_eq!(f.ret(304, &[cwd, buf, 0]), errno(Errno::EINVAL));
+        header(&mut f, buf, 12, 0x8000_0001);
+        assert_eq!(f.ret(304, &[cwd, buf, 0]), errno(Errno::EINVAL));
+        header(&mut f, buf, 12, 0x4_0001);
+        assert_eq!(f.ret(304, &[cwd, buf, 0]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(304, &[cwd, 8, 0]), errno(Errno::EFAULT));
+        // Its bytes, read only once the mount and the permission are known.
+        header(&mut f, DATA + 0x1ff8, 12, 1);
+        assert_eq!(f.ret(304, &[cwd, DATA + 0x1ff8, 0]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(304, &[99, DATA + 0x1ff8, 0]), errno(Errno::EBADF));
+        assert_eq!(
+            f.ret(304, &[(-5i64) as u64, handle, 0]),
+            errno(Errno::EBADF)
+        );
+        // Another generation, a short handle, another file system, and a
+        // file no name links any more.
+        let mut copy = [0u8; 20];
+        f.mem.read(GuestAddr(handle), &mut copy).unwrap();
+        copy[8] = 1;
+        f.mem.write(GuestAddr(buf), &copy).unwrap();
+        assert_eq!(f.ret(304, &[cwd, buf, 0]), errno(crate::files::ESTALE));
+        header(&mut f, handle, 8, 1);
+        assert_eq!(f.ret(304, &[cwd, handle, 0]), errno(crate::files::ESTALE));
+        header(&mut f, handle, 12, 1);
+        let status = put(&f, DATA + 0x100, b"/proc/self/status");
+        let in_proc = f.ret(2, &[status, 0]);
+        assert_eq!(
+            f.ret(304, &[in_proc, handle, 0]),
+            errno(crate::files::ESTALE)
+        );
+        assert_eq!(f.ret(87, &[file]), 0);
+        assert_eq!(f.ret(304, &[cwd, handle, 0]), errno(crate::files::ESTALE));
+        // Without CAP_DAC_READ_SEARCH no handle decodes there.
+        assert_eq!(f.ret(105, &[1000]), 0);
+        assert_eq!(f.ret(304, &[cwd, dir_handle, 0]), errno(Errno::EPERM));
+    }
+    #[test]
+    fn pidfds_have_pidfs_handles_that_anyone_opens() {
+        const PIDFS: u64 = (-10002i64) as u64;
+        let mut f = fixture();
+        assert_eq!(f.ret(105, &[1000]), 0);
+        let pidfd = f.ret(434, &[1, 0]);
+        let (handle, mount, buf) = (DATA + 0x200, DATA + 0x300, DATA + 0x400);
+        let empty = put(&f, DATA, b"");
+        // pidfs's handle holds the inode, which fstat gives.
+        f.mem.write(GuestAddr(handle), &7u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            f.ret(303, &[pidfd, empty, handle, mount, 0x1000]),
+            errno(Errno::EOVERFLOW)
+        );
+        assert_eq!(f.mem.read_u64(GuestAddr(handle)).unwrap(), 0xff_0000_0008);
+        f.mem.write(GuestAddr(handle), &8u32.to_le_bytes()).unwrap();
+        assert_eq!(f.ret(303, &[pidfd, empty, handle, mount, 0x1000]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(handle)).unwrap(), 0xfe_0000_0008);
+        let inode = f.mem.read_u64(GuestAddr(handle + 8)).unwrap();
+        assert_eq!(f.ret(5, &[pidfd, buf]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(buf + 8)).unwrap(), inode);
+        assert_eq!(inode, 1);
+        // No connectable one, as pidfs's files have no parents.
+        let link = put(&f, DATA + 0x40, format!("/proc/self/fd/{pidfd}").as_bytes());
+        assert_eq!(
+            f.ret(303, &[(-100i64) as u64, link, handle, mount, 0x402]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        // fstatfs: pidfs, and the anonymous inodes' for an eventfd.
+        assert_eq!(f.ret(138, &[pidfd, buf]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(buf)).unwrap(), 0x5049_4446);
+        let eventfd = f.ret(290, &[0, 0]);
+        assert_eq!(f.ret(138, &[eventfd, buf]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(buf)).unwrap(), 0x0904_1934);
+        f.mem.write(GuestAddr(buf), &128u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            f.ret(303, &[eventfd, empty, buf, mount, 0x1000]),
+            errno(Errno::EOPNOTSUPP)
+        );
+        // Opened from pidfs's root or a pidfd without any capability: read
+        // and write, with the descriptor flags asked for.
+        let opened = f.ret(304, &[PIDFS, handle, 0o4000 | 0o2000000]);
+        assert!(opened > eventfd, "{opened}");
+        assert_eq!(f.ret(72, &[opened, 3]), 0o2004002);
+        assert_eq!(f.ret(72, &[opened, 1]), 1);
+        assert_eq!(f.ret(5, &[opened, buf]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(buf + 8)).unwrap(), inode);
+        let thread = f.ret(304, &[pidfd, handle, 0o200]);
+        assert!(thread > opened, "{thread}");
+        assert_eq!(f.ret(72, &[thread, 3]), 2);
+        let own = f.ret(434, &[1, 0x80]);
+        assert_eq!(f.ret(72, &[own, 3]), 0o202);
+        assert_eq!(f.ret(72, &[own, 4, 0]), 0);
+        assert_eq!(f.ret(72, &[own, 3]), 0o202);
+        // Flags a pidfd does not open with, a directory's or connectable
+        // handle, and a process that is not there.
+        assert_eq!(f.ret(304, &[PIDFS, handle, 0o100]), errno(Errno::EINVAL));
+        f.mem
+            .write(GuestAddr(handle + 4), &0x2_00feu32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(304, &[PIDFS, handle, 0]), errno(crate::files::ESTALE));
+        f.mem
+            .write(GuestAddr(handle + 4), &0x1_00feu32.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(304, &[PIDFS, handle, 0]), errno(crate::files::ESTALE));
+        assert!(f.ret(304, &[pidfd, handle, 0]) < 1 << 32);
+        f.mem
+            .write(GuestAddr(handle + 4), &0xfeu32.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(handle + 8), &99u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(304, &[PIDFS, handle, 0]), errno(crate::files::ESTALE));
+        f.mem
+            .write(GuestAddr(handle + 4), &1u32.to_le_bytes())
+            .unwrap();
+        f.mem
+            .write(GuestAddr(handle + 8), &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(f.ret(304, &[PIDFS, handle, 0]), errno(crate::files::ESTALE));
+        // nsfs decodes none of them.
+        assert_eq!(
+            f.ret(304, &[(-10003i64) as u64, handle, 0]),
+            errno(crate::files::ESTALE)
+        );
+    }
+    #[test]
     fn fdinfo_lists_the_watches_the_newest_first() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK | 0o2000000]);

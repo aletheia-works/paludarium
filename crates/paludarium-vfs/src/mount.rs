@@ -199,6 +199,16 @@ impl MountedFs {
     }
 }
 impl FileSystem for MountedFs {
+    /// The in-memory root's file, where `anchor` is on that root: a path
+    /// that no mount covers.
+    fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
+        let base = self.mounts.len();
+        let anchor = self.resolve(anchor, true, false).ok()?;
+        if self.route(&anchor).ok()?.0 != base {
+            return None;
+        }
+        lock(&self.base.tree).path_of(inode, &|p| self.route(p).is_ok_and(|(i, _, _)| i == base))
+    }
     fn mounts(&self) -> Vec<MountPoint> {
         let mut out = Vec::new();
         if !self.mounts.iter().any(|(root, _)| root == b"/") {

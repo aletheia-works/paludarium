@@ -457,3 +457,23 @@ fn rename_without_replacing_and_exchanging() {
     assert_eq!(fs.rename_with(b"/c", b"/c/f", 2), Err(Errno::EINVAL));
     assert_eq!(fs.rename_with(b"/c/f", b"/c", 2), Err(Errno::EINVAL));
 }
+#[test]
+fn memory_path_finds_a_linked_file_the_guest_reaches() {
+    let base = MemFs::new();
+    base.mkdir(b"/a", 0o755).unwrap();
+    let f = base.open(b"/a/x", 66, 0o644).unwrap();
+    let inode = f.stat().unwrap().inode;
+    base.link(b"/a/x", b"/b").unwrap();
+    // Breadth first: the shorter path, then in name order.
+    assert_eq!(base.memory_path(b"/", inode), Some(b"/b".to_vec()));
+    assert_eq!(base.memory_path(b"/", 1), Some(b"/".to_vec()));
+    assert_eq!(base.memory_path(b"/missing", inode), None);
+    base.unlink(b"/b", false).unwrap();
+    assert_eq!(base.memory_path(b"/a", inode), Some(b"/a/x".to_vec()));
+    // Through the mount table, the in-memory root's files where no mount
+    // covers them.
+    let mounted = MountedFs::new(base);
+    assert_eq!(mounted.memory_path(b"/a", inode), Some(b"/a/x".to_vec()));
+    assert_eq!(mounted.memory_path(b"/a/x/y", inode), None);
+    assert_eq!(mounted.memory_path(b"/", 99), None);
+}

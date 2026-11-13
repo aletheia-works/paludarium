@@ -54,7 +54,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | seccomp | `seccomp`（下に書きます） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
@@ -198,10 +198,27 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `FILEID_INVALID` を書き戻します）、最後に `statx` と同じマウントの ID
   （`AT_HANDLE_MNT_ID_UNIQUE` では 64 ビットの ID）です。tmpfs のファイル（と memfd）は
   tmpfs と同じ 12 バイトで型 `FILEID_INO32_GEN` のハンドルを持ちます。世代、inode の下位と
-  上位の半分の順です。ほかのファイルシステムは NFS のエクスポートがないものとして
-  ハンドルを断り（`EOPNOTSUPP`）、`AT_HANDLE_FID` には型 `FILEID_INO64_GEN` の識別子を
-  返します。inode、世代の順です。接続できるハンドルは、tmpfs が作れないので
-  `EOPNOTSUPP` です。
+  上位の半分の順です。pidfd は pidfs と同じ 8 バイトで型 `FILEID_KERNFS` のハンドル
+  （その inode）を持ちます。ほかのファイルシステム（eventfd の匿名 inode、パイプ、
+  `/proc` など）は NFS のエクスポートがないものとしてハンドルを断り（`EOPNOTSUPP`）、
+  `AT_HANDLE_FID` には型 `FILEID_INO64_GEN` の識別子を返します。inode、世代の順です。
+  接続できるハンドルは、tmpfs も pidfs も作れないので `EOPNOTSUPP` です。
+- `open_by_handle_at` はハンドルが指すファイルを開き、Linux と同じ順に確かめます。
+  まずハンドルの見出し（`EFAULT`）、その大きさ（0 か 128 バイトを超えると `EINVAL`）と
+  型のフラグ（接続できるハンドルとディレクトリのハンドルのもの以外は `EINVAL`）、
+  ハンドルを読み解くマウント（`EBADF`。ディスクリプタのファイルシステム、`AT_FDCWD` では
+  作業ディレクトリのもの、または `FD_PIDFS_ROOT` と `FD_NSFS_ROOT`）、そこでハンドルを
+  読み解いてよいか、ハンドルのバイト列（`EFAULT`）、最後にファイルです。見つからない
+  ときや、ハンドルを断るとき（ファイルにディレクトリのハンドルの印があるとき、接続できる
+  ハンドルのファイルがマウントのディレクトリの外にあるとき）は `ESTALE` です。pidfs の
+  ハンドルは、pidfd か `FD_PIDFS_ROOT` から、誰でも開けます。フラグは pidfd が開くときの
+  ものだけを受け付けます（ほかは `EINVAL`）。プロセスが回収されておらず、呼んだ側の PID
+  名前空間がそのプロセスに番号を付けている間は、そのプロセスの pidfd になります。いつも
+  読み書きできるように開き、`O_NONBLOCK` と `O_CLOEXEC` は指定のとおりで、`F_GETFL` にも
+  表れます。Linux 7.0 と同じく `PIDFD_THREAD` は付きません。ほかの場所で読み解くには `CAP_DAC_READ_SEARCH` が要ります
+  （`EPERM`）。メモリー上のルートの tmpfs のハンドルは、そのファイルそのものを開くのと
+  同じようにファイルを開きます。`O_CREAT` はそのファイルを見つけ（`O_EXCL` では
+  `EEXIST`、ディレクトリでは `EISDIR`）、シンボリックリンクはたどりません。
 - `fallocate` は、Linux の `vfs_fallocate` と同じ順に引数を確かめます（`EINVAL`、
   `EOPNOTSUPP`、`EBADF`、通常のファイルでなければ `ESPIPE`・`EISDIR`・`ENODEV`、
   そして `EFBIG`）。そのあとは tmpfs と同じふるまいです。通常の確保は範囲の
@@ -2166,10 +2183,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   子の分に足しません。`SIGCHLD` を無視しているときは、ブロック中でも `SIGCHLD` を
   保留しません。それより前にできたゾンビは、待ちのために残ります。
   `pidfd_open` の pidfd の `fstat` は、pidfs と同じくモード 0700 で、ファイルの種類を
-  示しません。pidfd は、そのプロセスが終わると読めるようになり（回収されると
+  示しません。inode は、pidfs がプロセスごとに一度だけ番号を付けるのと同じく、その
+  プロセスのもの（ここでは ID を二度配らないので、プロセスの ID）です。`fstatfs` は
+  pidfs（`PID_FS_MAGIC`）を返します。pidfd は、そのプロセスが終わると読めるようになり（回収されると
   切断も示します。自動で回収された子では両方を同時に示します）、`epoll` で待てます。ノンブロッキングの pidfd での
   `waitid(P_PIDFD)` は `EAGAIN` を返します。`pidfd_send_signal` は siginfo と
-  範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。pidfd の
+  範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。ただし
+  `F_GETFL` には Linux と同じく `O_EXCL` として表れます。pidfd の
   代わりに Linux の特別な値も受け付けます。`PIDFD_SELF_THREAD`（-10000）は呼んだ
   スレッドに `tkill` と同じく（`SI_TKILL`）、`PIDFD_SELF_THREAD_GROUP`（-10001）は
   そのプロセスに `kill` と同じく送ります。

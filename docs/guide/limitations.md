@@ -248,11 +248,23 @@ verified.
     path, so `ustat` of it gives that mount's counts, where Linux gives
     procfs's or devtmpfs's.
   - A file handle (`name_to_handle_at`, an inotify watch's in
-    `/proc/self/fdinfo`) has the generation 0, where tmpfs picks a random
-    one for each inode. A file of a host's directory is taken as one of a
+    `/proc/self/fdinfo`) has the generation 0 (1 for a memfd), where tmpfs
+    picks a random one for each inode. A file of a host's directory is taken as one of a
     file system without NFS export (`EOPNOTSUPP`, or the `FILEID_INO64_GEN`
     identifier with `AT_HANDLE_FID`), where Linux gives the handle of that
-    file system (ext4's, say). There is no `open_by_handle_at` (`ENOSYS`).
+    file system (ext4's, say). `open_by_handle_at` decodes only pidfs's
+    handles and, with `CAP_DAC_READ_SEARCH`, those of the in-memory root's
+    tmpfs, of a file a name still links (Linux also opens one that is
+    unlinked but open); on another mount (a host's directory, a memfd's) it
+    gives `ESTALE`. A caller without `CAP_DAC_READ_SEARCH` gets `EPERM`
+    there even for a directory with `O_DIRECTORY`, where Linux 6.10 and
+    later let one with `CAP_SYS_ADMIN` over the mount in. A namespace file
+    has no nsfs handle (`EOPNOTSUPP`, where Linux 6.18 gives one of type
+    `FILEID_NSFS`), so nothing decodes on nsfs (`ESTALE`). A pidfs handle
+    opens a process that never had a pidfd, where Linux gives `ESTALE`, and
+    a pidfd with `PIDFD_THREAD` has the inode of its whole process. A pidfd
+    opened from a handle with `O_EXCL` does not keep `PIDFD_THREAD`, as on
+    the CI runners' Linux 7.0, where Linux 7.2 and later keep it.
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders

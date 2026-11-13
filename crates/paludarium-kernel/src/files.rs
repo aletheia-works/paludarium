@@ -16,8 +16,8 @@ pub const NUMBERS: &[u64] = &[
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 132, 133, 136, 137, 138, 162, 187,
     188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 217, 221, 235, 257, 258, 259, 260,
     261, 262, 263, 264, 265, 266, 267, 268, 269, 275, 276, 277, 278, 280, 285, 292, 293, 295, 296,
-    303, 306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 447, 451, 452, 463, 464, 465, 466, 468,
-    469,
+    303, 304, 306, 316, 319, 326, 327, 328, 332, 436, 437, 439, 447, 451, 452, 463, 464, 465, 466,
+    468, 469,
 ];
 #[derive(Clone)]
 pub(crate) struct Descriptor {
@@ -812,8 +812,9 @@ fn pseudo_fs(kind: u64) -> paludarium_host::FsStats {
     }
 }
 /// What `fstatfs` reports for the file `d` holds: an empty pseudo
-/// filesystem for a /proc file (procfs), a terminal (devpts), a pipe or a
-/// socket, else the statistics of the filesystem holding its path.
+/// filesystem for a /proc file (procfs), a terminal (devpts), a pipe, a
+/// socket, a pidfd (pidfs) or another file of no type (Linux's anonymous
+/// inodes), else the statistics of the filesystem holding its path.
 fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host::FsStats, Errno> {
     if in_proc(&d.path) {
         return Ok(pseudo_fs(PROC_SUPER_MAGIC));
@@ -831,9 +832,16 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
     {
         return Ok(pseudo_fs(crate::memfd::SECRETMEM_MAGIC));
     }
+    if d.file
+        .as_any()
+        .is_some_and(|v| v.is::<crate::processes::PidFd>())
+    {
+        return Ok(pseudo_fs(PID_FS_MAGIC));
+    }
     Ok(match d.file.stat()?.mode & 0o170000 {
         0o010000 => pseudo_fs(0x5049_5045), // PIPEFS_MAGIC
         0o140000 => pseudo_fs(0x534F_434B), // SOCKFS_MAGIC
+        0 if !is_namespace(d) => pseudo_fs(ANON_INODE_FS_MAGIC),
         _ => c
             .files
             .fs
@@ -2760,32 +2768,57 @@ const AT_HANDLE_FID: u64 = 0x200;
 const AT_SYMLINK_FOLLOW: u64 = 0x400;
 /// `FILEID_INVALID`: the type of a handle that did not fit.
 const FILEID_INVALID: u32 = 0xff;
+/// The handle types: tmpfs's, pidfs's, and the identifier of a file system
+/// without NFS export.
+const FILEID_INO32_GEN: u32 = 1;
+const FILEID_KERNFS: u32 = 0xfe;
+const FILEID_INO64_GEN: u32 = 0x81;
+/// The flags `name_to_handle_at` may put in a handle's type, above its low
+/// 16 bits: a connectable handle's and a directory's.
+const FILEID_IS_CONNECTABLE: u32 = 0x1_0000;
+const FILEID_IS_DIR: u32 = 0x2_0000;
+/// `ESTALE`: a handle that names no file the file system has.
+pub(crate) const ESTALE: Errno = Errno(116);
 
 /// The handle a file of the file system `kind` with inode `inode` has, as
-/// Linux encodes it: its type and its 12 bytes. A tmpfs file's is
+/// Linux encodes it: its type and its bytes. A tmpfs file's is
 /// `shmem_encode_fh`'s (`FILEID_INO32_GEN`: the generation, then the inode's
-/// low and high halves); any other's is the identifier
-/// `exportfs_encode_ino64_fid` gives a file system without NFS export
-/// (`FILEID_INO64_GEN`: the inode, then the generation). The generation is
-/// 0, where tmpfs picks a random one for each inode.
-pub(crate) fn file_handle(kind: u64, inode: u64) -> (u32, [u8; 12]) {
-    let generation = 0u32;
-    let mut b = [0; 12];
-    if kind == paludarium_vfs::TMPFS_MAGIC {
-        b[0..4].copy_from_slice(&generation.to_le_bytes());
-        b[4..8].copy_from_slice(&(inode as u32).to_le_bytes());
-        b[8..12].copy_from_slice(&((inode >> 32) as u32).to_le_bytes());
-        (1, b)
-    } else {
-        b[0..8].copy_from_slice(&inode.to_le_bytes());
-        b[8..12].copy_from_slice(&generation.to_le_bytes());
-        (0x81, b)
+/// low and high halves) and a pidfd's `pidfs_encode_fh`'s (`FILEID_KERNFS`:
+/// the inode); any other's is the identifier `exportfs_encode_ino64_fid`
+/// gives a file system without NFS export (`FILEID_INO64_GEN`: the inode,
+/// then the generation). The in-memory root's files have the generation 0
+/// and memfds (on `device` [`crate::memfd::DEVICE`]) 1, so that neither's
+/// handle names the other's file, where tmpfs picks a random generation for
+/// each inode.
+pub(crate) fn file_handle(kind: u64, device: u64, inode: u64) -> (u32, Vec<u8>) {
+    let generation = u32::from(device == crate::memfd::DEVICE);
+    match kind {
+        paludarium_vfs::TMPFS_MAGIC => (
+            FILEID_INO32_GEN,
+            [
+                generation.to_le_bytes(),
+                (inode as u32).to_le_bytes(),
+                ((inode >> 32) as u32).to_le_bytes(),
+            ]
+            .concat(),
+        ),
+        PID_FS_MAGIC => (FILEID_KERNFS, inode.to_le_bytes().to_vec()),
+        _ => (
+            FILEID_INO64_GEN,
+            [&inode.to_le_bytes()[..], &generation.to_le_bytes()].concat(),
+        ),
     }
+}
+/// Whether the file system `kind` has Linux's NFS export operations, so
+/// that it gives a handle that is not `AT_HANDLE_FID` and decodes one: tmpfs
+/// and pidfs here.
+fn exportable(kind: u64) -> bool {
+    matches!(kind, paludarium_vfs::TMPFS_MAGIC | PID_FS_MAGIC)
 }
 /// `name_to_handle_at(dirfd, path, handle, mount_id, flags)`, as Linux's
 /// (6.13 and later): the flags (`EINVAL`), the path, whether the file
-/// system can give the handle asked for (`EOPNOTSUPP`: only tmpfs, the
-/// one file system here with NFS export, gives one that is not
+/// system can give the handle asked for (`EOPNOTSUPP`: only tmpfs and
+/// pidfs, the file systems here with NFS export, give one that is not
 /// `AT_HANDLE_FID`, and none a connectable one), the size the caller gives
 /// (`EINVAL` over `MAX_HANDLE_SZ`; `EOVERFLOW` under the handle's, with that
 /// size and `FILEID_INVALID` written back), then the mount's ID, as `statx`
@@ -2826,9 +2859,7 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         let (p, _) = lookup(c, dir, raw, follow)?;
         named(c, &p, follow)?
     };
-    if flags & AT_HANDLE_CONNECTABLE != 0
-        || (flags & AT_HANDLE_FID == 0 && kind != paludarium_vfs::TMPFS_MAGIC)
-    {
+    if flags & AT_HANDLE_CONNECTABLE != 0 || (flags & AT_HANDLE_FID == 0 && !exportable(kind)) {
         return Err(Errno::EOPNOTSUPP);
     }
     let mut given = [0u8; 4];
@@ -2843,22 +2874,182 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if given > MAX_HANDLE_SZ {
         return Err(Errno::EINVAL);
     }
-    let (kind, bytes) = file_handle(kind, stat.inode);
-    let fits = given >> 2 >= 3;
+    let (kind, bytes) = file_handle(kind, device, stat.inode);
+    // The file system takes the size in 4-byte words, as it encodes them.
+    let fits = given >> 2 >= bytes.len() as u32 >> 2;
     let id = mount_id(device);
     if flags & AT_HANDLE_MNT_ID_UNIQUE != 0 {
         output(c, mount, &(1u64 << 31 | id).to_le_bytes())?;
     } else {
         output(c, mount, &(id as u32).to_le_bytes())?;
     }
-    let mut out = Vec::with_capacity(20);
-    out.extend_from_slice(&12u32.to_le_bytes());
+    let mut out = Vec::with_capacity(8 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&(if fits { kind } else { FILEID_INVALID }).to_le_bytes());
     if fits {
         out.extend_from_slice(&bytes);
     }
     output(c, handle, &out)?;
     if fits { Ok(0) } else { Err(Errno::EOVERFLOW) }
+}
+/// `FD_PIDFS_ROOT` and `FD_NSFS_ROOT`: the roots of pidfs and nsfs, which
+/// `open_by_handle_at` takes for the mount to decode a handle on.
+const FD_PIDFS_ROOT: i32 = -10002;
+const FD_NSFS_ROOT: i32 = -10003;
+/// What `open_by_handle_at` decodes a handle on: the mount of its
+/// `mountdirfd`.
+enum HandleMount {
+    /// pidfs: its root, or the pidfd whose inode is `Some(inode)`.
+    Pidfs(Option<u64>),
+    /// nsfs, whose handles name namespaces.
+    Nsfs,
+    /// Another file system, `kind`, by the path of its directory or file.
+    Path(u64, Vec<u8>),
+}
+/// `open_by_handle_at(mountdirfd, handle, flags)`, as Linux's
+/// `do_handle_open` (master): the handle's header (`EFAULT`), its size
+/// (`EINVAL` for 0 or over `MAX_HANDLE_SZ`) and the flags of its type
+/// (`EINVAL`), the mount (`EBADF`), whether the caller may decode handles
+/// there (pidfs's `permission` takes only the flags a pidfd opens with, and
+/// `EINVAL` for others; nsfs's takes any; elsewhere it is `EPERM` without
+/// `CAP_DAC_READ_SEARCH`), the handle's bytes (`EFAULT`), then the file it
+/// names (`ESTALE` for none), which is opened.
+fn open_by_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    const O_CREAT: u32 = 0o100;
+    const O_EXCL: u32 = 0o200;
+    const O_NONBLOCK: u32 = 0o4000;
+    const O_LARGEFILE: u32 = 0o100000;
+    const O_NOFOLLOW: u32 = 0o400000;
+    const O_CLOEXEC: u32 = 0o2000000;
+    const CAP_DAC_READ_SEARCH: u64 = 1 << 2;
+    let (handle, flags) = (a[1], a[2] as u32);
+    let mut header = [0u8; 8];
+    c.mem
+        .read(GuestAddr(handle), &mut header)
+        .map_err(|_| Errno::EFAULT)?;
+    let size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let kind = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    if size == 0 || size > MAX_HANDLE_SZ {
+        return Err(Errno::EINVAL);
+    }
+    if (kind as i32) < 0 || kind & 0xffff_0000 & !(FILEID_IS_CONNECTABLE | FILEID_IS_DIR) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mount = match a[0] as i32 {
+        FD_PIDFS_ROOT => HandleMount::Pidfs(None),
+        FD_NSFS_ROOT => HandleMount::Nsfs,
+        -100 => {
+            let cwd = c
+                .files
+                .cwd
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            HandleMount::Path(path_kind(c, &cwd, true), cwd)
+        }
+        fd if fd >= 0 => {
+            let d = c.files.descriptor(u64::from(fd as u32))?;
+            if let Some(pidfd) = d
+                .file
+                .as_any()
+                .and_then(|v| v.downcast_ref::<crate::processes::PidFd>())
+            {
+                HandleMount::Pidfs(Some(pidfd.inode()))
+            } else if is_namespace(&d) {
+                HandleMount::Nsfs
+            } else {
+                HandleMount::Path(descriptor_kind(c, &d).unwrap_or(0), d.path.clone())
+            }
+        }
+        _ => return Err(Errno::EBADF),
+    };
+    // pidfs's `pidfs_export_permission`, nsfs's (its decoding checks), and
+    // `may_decode_fh` elsewhere. Linux 6.10 also lets a caller with
+    // CAP_SYS_ADMIN over the mount decode a directory's handle with
+    // `O_DIRECTORY`; that relaxed check is not made here.
+    match mount {
+        HandleMount::Pidfs(_) => {
+            if flags & !(3 | O_NONBLOCK | O_CLOEXEC | O_EXCL | O_LARGEFILE) != 0 {
+                return Err(Errno::EINVAL);
+            }
+        }
+        HandleMount::Nsfs => {}
+        HandleMount::Path(..) => {
+            if !c.process.credentials.capable(CAP_DAC_READ_SEARCH) {
+                return Err(Errno::EPERM);
+            }
+        }
+    }
+    let mut bytes = vec![0u8; size as usize];
+    c.mem
+        .read(GuestAddr(handle.wrapping_add(8)), &mut bytes)
+        .map_err(|_| Errno::EFAULT)?;
+    let (connectable, directory) = (kind & FILEID_IS_CONNECTABLE != 0, kind & FILEID_IS_DIR != 0);
+    let kind = kind & 0xffff;
+    // The file system decodes the size in 4-byte words.
+    let words = size as usize >> 2;
+    let cloexec = flags & O_CLOEXEC != 0;
+    match mount {
+        HandleMount::Pidfs(anchor) => {
+            // `pidfs_fh_to_dentry`; a pidfd is no directory, and a
+            // connectable handle's file is reached only from its own pidfd,
+            // as pidfs's files have no parents. `do_handle_to_path` gives
+            // `ESTALE` for any file the decoding refuses.
+            if kind != FILEID_KERNFS || words < 2 {
+                return Err(ESTALE);
+            }
+            let inode = u64::from_le_bytes(bytes[..8].try_into().map_err(|_| ESTALE)?);
+            let space = c.group.namespaces(c.tid).pid.clone();
+            let pidfd = crate::processes::PidFd::by_inode(c.processes, &space, inode, flags)?;
+            if directory || connectable && anchor != Some(inode) {
+                return Err(ESTALE);
+            }
+            c.files
+                .install(pidfd, cloexec, c.group.nofile())
+                .map(u64::from)
+        }
+        // No namespace has a handle here (`name_to_handle_at` of one is
+        // `EOPNOTSUPP`), so none decodes.
+        HandleMount::Nsfs => Err(ESTALE),
+        HandleMount::Path(file_system, anchor) => {
+            // Only the in-memory root is a file system here that decodes
+            // handles, tmpfs's `shmem_fh_to_dentry`: the generation (0
+            // there, [`file_handle`]) and the inode, of a file a name links.
+            if file_system != paludarium_vfs::TMPFS_MAGIC || words < 3 || bytes[..4] != [0; 4] {
+                return Err(ESTALE);
+            }
+            let low = u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| ESTALE)?);
+            let high = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| ESTALE)?);
+            let inode = u64::from(high) << 32 | u64::from(low);
+            let p = c.files.fs.memory_path(&anchor, inode).ok_or(ESTALE)?;
+            let stat = c.files.fs.metadata(&p, false)?;
+            let is_directory = stat.mode & 0o170000 == 0o040000;
+            // A directory's handle names a directory, and a connectable
+            // handle's file must be reached from the mount's directory
+            // (`vfs_dentry_acceptable`'s check of the subtree); the
+            // decoding's `ENOTDIR` and `EACCES` both become `ESTALE`.
+            let under = |root: &[u8]| {
+                root == b"/" || p == root || p.starts_with(root) && p.get(root.len()) == Some(&b'/')
+            };
+            if directory && !is_directory || connectable && !under(&anchor) {
+                return Err(ESTALE);
+            }
+            // `file_open_root` of the file itself: as the last component of
+            // an open, `O_CREAT` finds it there (`EEXIST` with `O_EXCL`,
+            // `EISDIR` for a directory), and a symbolic link is not followed.
+            if flags & O_CREAT != 0 {
+                if flags & O_EXCL != 0 {
+                    return Err(Errno::EEXIST);
+                }
+                if is_directory {
+                    return Err(Errno::EISDIR);
+                }
+            }
+            let link = stat.mode & 0o170000 == 0o120000;
+            let flags = flags & !(O_CREAT | O_EXCL) | if link { O_NOFOLLOW } else { 0 };
+            open_at(c, (-100i32) as u64, p, u64::from(flags), 0, 0)
+        }
+    }
 }
 /// The status, device and file system (`f_type`) of what path `p` names
 /// (the last link itself without `follow`), as the calls that name a file
@@ -3071,6 +3262,11 @@ const SMALL_BLOCK_SIZE: u32 = 1024;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
 const MQUEUE_MAGIC: u64 = 0x1980_0202;
+/// pidfs's `s_magic`, a pidfd's file system from Linux 6.9.
+const PID_FS_MAGIC: u64 = 0x5049_4446;
+/// The anonymous inodes' file system, which eventfds, epolls, timerfds,
+/// signalfds, inotify instances and the like are on.
+const ANON_INODE_FS_MAGIC: u64 = 0x0904_1934;
 /// Whether `path` is in `/proc`, which is procfs on Linux.
 fn in_proc(path: &[u8]) -> bool {
     path == b"/proc" || path.starts_with(b"/proc/")
@@ -3288,6 +3484,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         276 => splice::tee(c, a),
         278 => splice::vmsplice(c, a),
         303 => name_to_handle_at(c, a),
+        304 => open_by_handle_at(c, a),
         332 => statx(c, a),
         326 => copy_file_range(c, a),
         451 => cachestat(c, a),
@@ -4388,11 +4585,18 @@ fn status_flags(d: &Descriptor) -> u32 {
     if flags & O_PATH != 0 {
         return flags & (O_DIRECTORY | O_NOFOLLOW | O_PATH);
     }
-    let opened = d.opened
-        || d.file
-            .as_any()
-            .is_some_and(|v| v.is::<crate::memfd::Memfd>());
-    flags & !OPEN_ONLY | if opened { O_LARGEFILE } else { 0 }
+    let any = d.file.as_any();
+    let opened = d.opened || any.is_some_and(|v| v.is::<crate::memfd::Memfd>());
+    // A pidfd keeps `PIDFD_THREAD`, which is `O_EXCL`: `pidfs_alloc_file`
+    // sets it again after `do_dentry_open` drops the flags of the open.
+    // One opened by `open_by_handle_at` keeps `O_CLOEXEC` too, as
+    // `pidfs_export_open` hands the flags to `dentry_open` as they are.
+    let open_only = if any.is_some_and(|v| v.is::<crate::processes::PidFd>()) {
+        OPEN_ONLY & !(0o200 | O_CLOEXEC)
+    } else {
+        OPEN_ONLY
+    };
+    flags & !open_only | if opened { O_LARGEFILE } else { 0 }
 }
 /// How often a thread looks at a host's standard stream for `O_ASYNC`.
 const STREAM_WATCH: std::time::Duration = std::time::Duration::from_millis(10);

@@ -216,11 +216,21 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `st_dev` は、そのパスがあるマウントのものなので、`ustat` はそのマウントの数を返します。
     Linux は procfs や devtmpfs の数を返します。
   - ファイルハンドル（`name_to_handle_at` と、`/proc/self/fdinfo` にある inotify の
-    ウォッチのもの）の世代は 0 です。tmpfs は inode ごとに乱数で選びます。ホストの
+    ウォッチのもの）の世代は 0（memfd では 1）です。tmpfs は inode ごとに乱数で選びます。ホストの
     ディレクトリのファイルは NFS のエクスポートがないファイルシステムのものとして扱います
     （`EOPNOTSUPP`、`AT_HANDLE_FID` では型 `FILEID_INO64_GEN` の識別子）。Linux はその
-    ファイルシステム（たとえば ext4）のハンドルを返します。`open_by_handle_at` はありません
-    （`ENOSYS`）。
+    ファイルシステム（たとえば ext4）のハンドルを返します。`open_by_handle_at` が読み解く
+    のは pidfs のハンドルと、`CAP_DAC_READ_SEARCH` があればメモリー上のルートの tmpfs の
+    ハンドルで、まだ名前がリンクしているファイルのものだけです（Linux は削除したが開いて
+    いるファイルも開きます）。ほかのマウント（ホストのディレクトリ、memfd）では `ESTALE`
+    です。`CAP_DAC_READ_SEARCH` のない呼び出しは、`O_DIRECTORY` を付けたディレクトリでも
+    そこでは `EPERM` です。Linux 6.10 以降は、マウントに対して `CAP_SYS_ADMIN` を持つ
+    呼び出しを通します。名前空間のファイルには nsfs のハンドルがない（`EOPNOTSUPP`。
+    Linux 6.18 は型 `FILEID_NSFS` のハンドルを返します）ので、nsfs では何も読み解けません
+    （`ESTALE`）。pidfs のハンドルは、pidfd を一度も持たなかったプロセスも開きます。
+    Linux は `ESTALE` を返します。`PIDFD_THREAD` の pidfd の inode はプロセス全体のものです。
+    `O_EXCL` を付けてハンドルから開いた pidfd には、CI の Linux 7.0 と同じく `PIDFD_THREAD`
+    が残りません。Linux 7.2 以降は残します。
   - System V IPC には `/proc/sysvipc` がなく、共有メモリ・セマフォー・メッセージキューの
     上限は Linux の既定値で、`/proc/sys/kernel` から変えられません。メッセージキューで
     待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの

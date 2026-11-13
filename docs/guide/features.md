@@ -62,7 +62,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | seccomp | `seccomp` (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
@@ -223,10 +223,31 @@ kernel.
   mount's ID as `statx` gives it (the 64-bit one with
   `AT_HANDLE_MNT_ID_UNIQUE`). A tmpfs file (and a memfd) has tmpfs's 12-byte
   handle of type `FILEID_INO32_GEN`: the generation, then the inode's low and
-  high halves. Any other file system, as one without NFS export, refuses a
-  handle (`EOPNOTSUPP`) but gives `AT_HANDLE_FID` its identifier of type
-  `FILEID_INO64_GEN`: the inode, then the generation. A connectable handle is
-  `EOPNOTSUPP`, as tmpfs cannot give one.
+  high halves. A pidfd has pidfs's 8-byte handle of type `FILEID_KERNFS`, its
+  inode. Any other file system, as one without NFS export (an eventfd's
+  anonymous inode, a pipe's, `/proc`), refuses a handle (`EOPNOTSUPP`) but
+  gives `AT_HANDLE_FID` its identifier of type `FILEID_INO64_GEN`: the inode,
+  then the generation. A connectable handle is `EOPNOTSUPP`, as neither tmpfs
+  nor pidfs can give one.
+- `open_by_handle_at` opens the file a handle names, checked in the order of
+  Linux's: the handle's header (`EFAULT`), its size (`EINVAL` for 0 or over
+  128 bytes) and the flags of its type (`EINVAL`, but for a connectable
+  handle's and a directory's), the mount to decode it on (`EBADF`; a
+  descriptor's file system, the working directory's with `AT_FDCWD`, or
+  `FD_PIDFS_ROOT` and `FD_NSFS_ROOT`), whether the caller may decode handles
+  there, the handle's bytes (`EFAULT`), then the file, `ESTALE` where none is
+  found or the handle is refused (a directory's handle of a file, or a
+  connectable one of a file outside the mount's directory). Anyone may open
+  a pidfs handle, from a pidfd or `FD_PIDFS_ROOT`, with only the flags a
+  pidfd opens with (`EINVAL` for others): it is a pidfd of its process
+  while that process is not reaped and the caller's PID namespace numbers
+  it, always opened for reading and writing, with `O_NONBLOCK` and
+  `O_CLOEXEC` as asked, which `F_GETFL` shows, and without `PIDFD_THREAD`,
+  as Linux 7.0 opens it. Elsewhere decoding needs
+  `CAP_DAC_READ_SEARCH` (`EPERM`). A tmpfs handle of the in-memory root
+  opens its file, as an open of that file itself would: `O_CREAT` finds it
+  (`EEXIST` with `O_EXCL`, `EISDIR` for a directory), and a symbolic link is
+  not followed.
 - `fallocate` checks its arguments as Linux's `vfs_fallocate` does, in
   order (`EINVAL`, `EOPNOTSUPP`, `EBADF`, then `ESPIPE`, `EISDIR` or
   `ENODEV` for a file that is not regular, and `EFBIG`). Files then behave
@@ -2482,12 +2503,15 @@ kernel.
   does not join the parent's children's, and with `SIGCHLD` ignored no
   `SIGCHLD` is queued, even while blocked. A zombie from before stays for a
   wait. A pidfd from `pidfd_open` has pidfs's mode 0700 in `fstat`, with
-  no file type, and becomes readable when its process exits (and hung up
+  no file type, and an inode of its process's own (the process's ID, as IDs
+  are never handed out twice here), as pidfs numbers each process once;
+  `fstatfs` gives pidfs (`PID_FS_MAGIC`). It becomes readable when its process exits (and hung up
   once it is reaped; an automatically reaped child shows both at once), so
   `epoll` can wait for it; `waitid(P_PIDFD)` on a nonblocking one gives
   `EAGAIN`.
   `pidfd_send_signal` takes no siginfo and no scope flags, and `PIDFD_THREAD`
-  still names the whole process. It takes Linux's sentinels for no pidfd:
+  still names the whole process, though `F_GETFL` shows it as `O_EXCL` as
+  on Linux. It takes Linux's sentinels for no pidfd:
   `PIDFD_SELF_THREAD` (-10000) sends to the calling thread, as `tkill`
   does (`SI_TKILL`), and `PIDFD_SELF_THREAD_GROUP` (-10001) to its process,
   as `kill` does.

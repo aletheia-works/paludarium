@@ -1872,6 +1872,8 @@ const WEXITED: u64 = 4;
 const WNOWAIT: u64 = 0x0100_0000;
 const PIDFD_NONBLOCK: u64 = 0x800;
 const PIDFD_THREAD: u64 = 0x80;
+/// `O_CLOEXEC`, which a pidfd from `open_by_handle_at` keeps in its flags.
+const O_CLOEXEC: u32 = 0o2000000;
 
 /// A pidfd (`pidfd_open`): readable once its process has exited, and hung
 /// up once that process is reaped, as Linux's `pidfd_poll` reports. It is
@@ -1892,6 +1894,38 @@ impl PidFd {
             processes: Arc::clone(processes),
             flags: AtomicU32::new(2),
         }))
+    }
+    /// The pidfd `open_by_handle_at` makes from a pidfs handle naming inode
+    /// `inode`, as Linux's `pidfs_fh_to_dentry` finds its `struct pid`
+    /// ([`PidFd::inode`]) and `pidfs_export_open` opens it: `ESTALE` once the
+    /// process is reaped or for one the caller's PID namespace `space` does
+    /// not number. It is always opened for reading and writing, with the
+    /// access asked for added, and keeps `O_NONBLOCK` and `O_CLOEXEC` of
+    /// `flags` (Linux 7.0's `pidfs_export_open`, which gives them to
+    /// `dentry_open`; `O_EXCL`, `PIDFD_THREAD`, goes, which Linux 7.2 and
+    /// later keep).
+    pub(crate) fn by_inode(
+        processes: &Arc<Processes>,
+        space: &Namespace,
+        inode: u64,
+        flags: u32,
+    ) -> Result<Arc<Self>, Errno> {
+        let pid = u32::try_from(inode).map_err(|_| crate::files::ESTALE)?;
+        if processes.exited(pid).is_none() || space.number(pid) == 0 {
+            return Err(crate::files::ESTALE);
+        }
+        Ok(Arc::new(Self {
+            pid,
+            processes: Arc::clone(processes),
+            flags: AtomicU32::new(2 | flags & (3 | PIDFD_NONBLOCK as u32 | O_CLOEXEC)),
+        }))
+    }
+    /// The pidfs inode of its process, which `fstat` gives as `st_ino` and
+    /// its file handle holds: Linux numbers each `struct pid` once, from a
+    /// counter, and IDs here are never handed out twice, so the process's
+    /// ID does.
+    pub(crate) fn inode(&self) -> u64 {
+        u64::from(self.pid)
     }
 }
 impl paludarium_host::FileHandle for PidFd {
@@ -1930,10 +1964,11 @@ impl paludarium_host::FileHandle for PidFd {
     }
     fn stat(&self) -> Result<paludarium_host::FileStat, Errno> {
         // pidfs's inode: root's 0700, with its file type hidden as Linux's
-        // anon_inode_getattr hides it.
+        // anon_inode_getattr hides it, numbered for the process.
         Ok(paludarium_host::FileStat {
             mode: 0o700,
             links: 1,
+            inode: self.inode(),
             ..paludarium_host::FileStat::default()
         })
     }
@@ -1947,10 +1982,11 @@ impl paludarium_host::FileHandle for PidFd {
         self.flags.load(Ordering::SeqCst)
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        // The access stays what it was opened with.
-        let access = self.flags.load(Ordering::SeqCst) & 3;
+        // The access stays what it was opened with, and so do
+        // `PIDFD_THREAD` and `O_CLOEXEC`, which `F_SETFL` cannot change.
+        let kept = self.flags.load(Ordering::SeqCst) & (3 | PIDFD_THREAD as u32 | O_CLOEXEC);
         self.flags
-            .store(access | flags & PIDFD_NONBLOCK as u32, Ordering::SeqCst);
+            .store(kept | flags & PIDFD_NONBLOCK as u32, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -3594,7 +3630,8 @@ impl Kernel {
         crate::mempolicy::move_pages(mem, &target, a[1], a[2], a[3], a[4])
     }
     /// `pidfd_open(pid, flags)`: a close-on-exec pidfd for a process.
-    /// `PIDFD_THREAD` is accepted but still names the whole process.
+    /// `PIDFD_THREAD` is accepted, and shows in `F_GETFL` as `O_EXCL` as on
+    /// Linux, but still names the whole process.
     fn pidfd_open(&mut self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
         let flags = u64::from(a[1] as u32);
         if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 || a[0] as i32 <= 0 {
@@ -3611,7 +3648,7 @@ impl Kernel {
         let pidfd = Arc::new(PidFd {
             pid,
             processes: Arc::clone(&self.processes),
-            flags: AtomicU32::new((2 | flags & PIDFD_NONBLOCK) as u32),
+            flags: AtomicU32::new((2 | flags & (PIDFD_NONBLOCK | PIDFD_THREAD)) as u32),
         });
         self.files
             .install(pidfd, true, self.group.nofile())

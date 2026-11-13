@@ -1035,7 +1035,7 @@ impl Instance {
             // `new_encode_dev` undone, then `MKDEV`.
             let major = (device >> 8) & 0xfff;
             let minor = (device & 0xff) | ((device >> 12) & !0xff);
-            let (kind, handle) = crate::files::file_handle(watch.file_system, inode);
+            let (kind, handle) = crate::files::file_handle(watch.file_system, device, inode);
             let bytes: String = handle.iter().map(|b| format!("{b:02x}")).collect();
             out.extend_from_slice(
                 format!(

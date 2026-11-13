@@ -8668,9 +8668,13 @@ static int alarm_clocks_worker(void) {
         (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
         return 90;
     struct timespec t, short_ = {0, 1000}, bad = {-1, 0};
-    for (int c = 8; c <= 9; c++)
-        printf("clock %d: gettime=%ld getres=%ld ns=%ld\n", c, al_r(syscall(SYS_clock_gettime, c, &t)),
-               al_r(syscall(SYS_clock_getres, c, &t)), t.tv_sec * 1000000000L + t.tv_nsec);
+    for (int c = 8; c <= 9; c++) {
+        struct timespec res = {-1, -1};
+        long got = al_r(syscall(SYS_clock_gettime, c, &t));
+        long resolution = al_r(syscall(SYS_clock_getres, c, &res));
+        printf("clock %d: gettime=%ld getres=%ld res-ns=%ld\n", c, got, resolution,
+               res.tv_sec * 1000000000L + res.tv_nsec);
+    }
     /* The request is read first, then a flag but TIMER_ABSTIME is refused,
        then the capability. */
     printf("nanosleep fault=%ld invalid=%ld flags=%ld abstime=%ld relative=%ld\n",

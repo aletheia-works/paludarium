@@ -5381,19 +5381,17 @@ mod process_mrelease {
         assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), 0);
     }
     #[test]
-    fn a_zombie_has_none_and_a_reaped_process_is_gone() {
+    fn a_zombie_has_no_memory_to_find_and_a_reaped_process_is_gone() {
         let (mut k, mut t, m) = setup();
         let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
         let pidfd = syscall(&mut k, &mut t, &m, 434, [u64::from(ct.tid), 0, 0, 0, 0, 0]) as i64;
         finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
-        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), 0);
+        let esrch = Errno(3).to_syscall_return();
+        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), esrch);
         assert_eq!(
             syscall(&mut k, &mut t, &m, 61, [u64::from(ct.tid), 0, 0, 0, 0, 0]),
             u64::from(ct.tid)
         );
-        assert_eq!(
-            release(&mut k, &mut t, &m, pidfd, 0),
-            Errno(3).to_syscall_return()
-        );
+        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), esrch);
     }
 }

@@ -785,12 +785,13 @@ kernel.
   in Linux's order: `flags`, the iovecs, the pidfd (`EBADF`, `ESRCH`), the
   caller's right to read the process (`EACCES`), then the advice.
 - `process_mrelease` finds its process as `process_madvise` does (`flags`
-  must be 0, then `EBADF`, `ESRCH`) and succeeds when the process's memory
-  is on its way to be freed: it has exited, or it is dying (a SIGKILL was
-  sent to it, or it has begun to exit, and it is not writing a core dump),
-  and so is every other process that runs in its memory. Otherwise it
-  gives `EINVAL`, as for the caller itself. The memory goes as the
-  process's last thread ends, so there is nothing more to release early.
+  must be 0, then `EBADF`, `ESRCH`); a process that has exited has no
+  memory left (`ESRCH`, as a zombie). It succeeds when that memory is on
+  its way to be freed: the process is dying (a SIGKILL was sent to it, or
+  it has begun to exit, and it is not writing a core dump), and so is
+  every other process that runs in its memory. Otherwise it gives
+  `EINVAL`, as for the caller itself. The memory goes as the process's
+  last thread ends, so there is nothing more to release early.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
   and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed

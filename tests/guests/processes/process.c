@@ -6050,8 +6050,9 @@ static int madvise_advice_case(void) {
     printf("dontneed-locked=%ld status=%d bytes=%d\n", r, status, p[2 * page]);
     return 0;
 }
-/* process_mrelease, as Linux master's: only the memory of a dying or exited
- * process has nothing left to keep, and a reaped one is gone. */
+/* process_mrelease, as Linux master's: only the memory of a dying process
+ * may be released; an exited one has none left to find (ESRCH), and a
+ * reaped one is gone. */
 static long mrelease_errno(int pidfd, unsigned flags) {
     return syscall(448, pidfd, flags) < 0 ? -errno : 0;
 }
@@ -6079,8 +6080,13 @@ static int mrelease_case(void) {
     printf("live=%ld self=%ld self-thread=%ld self-process=%ld\n", live, self, self_thread,
            self_process);
     if (kill(child, SIGKILL)) return 82;
+    /* Just after a SIGKILL Linux releases the memory, unless the child has
+     * already let go of it on its way out (ESRCH): both are right. */
     long killed = mrelease_errno(pidfd, 0);
-    printf("killed=%ld\n", killed);
+    if (killed == 0 || killed == -ESRCH)
+        printf("killed=released-or-gone\n");
+    else
+        printf("killed=%ld\n", killed);
     siginfo_t info;
     if (waitid(P_PID, child, &info, WEXITED | WNOWAIT)) return 83;
     long zombie = mrelease_errno(pidfd, 0);

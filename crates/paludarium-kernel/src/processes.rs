@@ -1444,16 +1444,14 @@ impl Processes {
         entries.get(&pid).map(|entry| entry.status.is_some())
     }
     /// Whether `process_mrelease` finds the memory of process `pid` on its
-    /// way to be freed, as Linux's `task_will_free_mem` does: it has exited
-    /// (a zombie keeps none), or it is dying ([`ThreadGroup::will_free_memory`])
-    /// and so is every other live process that runs in its memory. `None`
-    /// once it is reaped (or never was).
+    /// way to be freed, as Linux's `task_will_free_mem` does: it is dying
+    /// ([`ThreadGroup::will_free_memory`]), and so is every other live
+    /// process that runs in its memory. `None` once it has exited, as a
+    /// zombie keeps no memory for Linux's `find_lock_task_mm` to find, or
+    /// is reaped (or never was).
     fn will_free_memory(&self, pid: u32) -> Option<bool> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = entries.get(&pid)?;
-        if entry.status.is_some() {
-            return Some(true);
-        }
+        let entry = entries.get(&pid).filter(|entry| entry.status.is_none())?;
         if !entry.group.will_free_memory() {
             return Some(false);
         }
@@ -3453,9 +3451,10 @@ impl Kernel {
     /// `process_mrelease(pidfd, flags)`, as Linux master's: `flags` must be
     /// 0 (`EINVAL`); then the task, `PIDFD_SELF_THREAD` or
     /// `PIDFD_SELF_THREAD_GROUP` for the caller's, or a pidfd's process
-    /// (`EBADF` for no pidfd, `ESRCH` once it is reaped). Its memory must be
-    /// on its way to be freed ([`Processes::will_free_memory`]), or there is
-    /// nothing to release early (`EINVAL`). There is nothing to do then:
+    /// (`EBADF` for no pidfd, `ESRCH` once it is reaped). It must still have
+    /// its memory (`ESRCH` once it has exited, as a zombie), and that memory
+    /// must be on its way to be freed ([`Processes::will_free_memory`]), or
+    /// there is nothing to release early (`EINVAL`). There is nothing to do then:
     /// the memory goes as the process's last thread ends, which is no later
     /// than Linux's reaper would free it.
     fn process_mrelease(&self, a: [u64; 6]) -> Result<u64, Errno> {

@@ -23,6 +23,7 @@ from test_policy import ROOT
 # The real manifests' release version; Release Please bumps it on every release.
 VERSION = policy.inventory(ROOT)["version"]
 # The uploads that authenticate by their own OIDC exchange, not the crates.io token.
+BUILT_IN = b"/home/runner/work/paludarium/paludarium/target/release-evidence/package-"
 OIDC = ("publish-npm", "publish-jsr")
 
 
@@ -74,9 +75,15 @@ class PublishAdapterTests(unittest.TestCase):
             )
             self.crates.append(p)
         files, config, _ = jsr_fixture()
+        # The Wasm keeps the dependency paths under the package check's build directory.
+        files["paludarium.wasm"] += BUILT_IN + b"1794555614340074887/cargo-home/registry/x.rs"
+        self.files, self.config = files, config
         self.jsr_files = package.jsr_files(files, config, VERSION)
         self.npm = self.art / "wasm.tgz"
         tar(self.npm, files)
+        # The npm tarball on the registry, once uploaded; another package check's
+        # build has other bytes.
+        self.published = self.npm.read_bytes()
         with zipfile.ZipFile(self.art / "source-snapshot.zip", "x") as z:
             for n, b in sourcefiles.items():
                 z.writestr(n, b)
@@ -143,9 +150,9 @@ class PublishAdapterTests(unittest.TestCase):
             return io.BytesIO(json.dumps(dict(manifest=manifest)).encode())
         if "npm" not in self.uploaded:
             raise check.urllib.error.HTTPError(url, 404, "absent", {}, None)
-        digest = (
-            "sha512-" + base64.b64encode(hashlib.sha512(self.npm.read_bytes()).digest()).decode()
-        )
+        if url == check.NPM_TARBALL_URL.format(VERSION):
+            return io.BytesIO(self.published)
+        digest = "sha512-" + base64.b64encode(hashlib.sha512(self.published).digest()).decode()
         return io.BytesIO(json.dumps(dict(version=VERSION, dist=dict(integrity=digest))).encode())
 
     def command(self, argv, cwd, output, *args, **kwargs):
@@ -183,6 +190,63 @@ class PublishAdapterTests(unittest.TestCase):
 
     def test_mocked_upload_transport(self):
         self.assertEqual(len(self.execute()["published"]), 14)
+
+    def publish_npm_built_as(self, wasm=None, **changed):
+        """Put on the registry an npm version of these files built elsewhere."""
+        files = dict(self.files, **changed)
+        if wasm is not None:
+            files["paludarium.wasm"] = wasm
+        path = self.root / "published.tgz"
+        tar(path, files)
+        self.published = path.read_bytes()
+        self.uploaded = set(self.inv["order"]) | {"npm"}
+        return files
+
+    # 0.15.0: a later head finished a publication that stopped at JSR, and its
+    # package check built the Wasm in another directory than the published one.
+    def test_npm_built_in_another_directory_gives_jsr_its_published_files(self):
+        files = self.publish_npm_built_as(
+            wasm=self.files["paludarium.wasm"].replace(
+                b"1794555614340074887", b"1794553343902493250"
+            )
+        )
+        self.jsr_files = package.jsr_files(files, self.config, VERSION)
+        self.assertNotEqual(self.jsr_files, package.jsr_files(self.files, self.config, VERSION))
+        self.assertEqual(len(self.execute()["published"]), 14)
+        self.assertEqual(self.jsr_staged, [self.jsr_files])
+        self.assertEqual([n for n, _ in self.envs], ["dry-jsr", "publish-jsr"])
+
+    def test_npm_version_with_other_bytes_stops_before_any_upload(self):
+        for changed in (
+            dict(wasm=self.files["paludarium.wasm"] + b"\0"),
+            dict(wasm=self.files["paludarium.wasm"].replace(b"cargo-home", b"cargo-HOME")),
+            {"index.mjs": self.files["index.mjs"] + b"\n"},
+        ):
+            with self.subTest(changed=sorted(changed)):
+                self.publish_npm_built_as(**changed)
+                self.envs = []
+                shutil.rmtree(self.out / "publish-source", ignore_errors=True)
+                (self.out / "publication-progress.json").unlink(missing_ok=True)
+                with self.assertRaisesRegex(ValueError, "existing version digest mismatch"):
+                    self.execute()
+                self.assertEqual(self.envs, [])
+                self.assertNotIn("jsr", self.uploaded)
+
+    def test_published_npm_tarball_must_have_the_registry_integrity(self):
+        self.publish_npm_built_as(wasm=self.files["paludarium.wasm"].replace(b"1794", b"1795"))
+        published = self.published
+        request = self.request
+
+        def swapped(req, timeout):
+            if req.full_url == check.NPM_TARBALL_URL.format(VERSION):
+                return io.BytesIO(self.npm.read_bytes())
+            self.published = published
+            return request(req, timeout)
+
+        self.request = swapped
+        with self.assertRaisesRegex(ValueError, "published npm tarball differs from its integrity"):
+            self.execute()
+        self.assertEqual(self.envs, [])
 
     def test_older_cargo_dry_run_location(self):
         self.dry_dir = "target/package"

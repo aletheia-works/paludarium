@@ -6,8 +6,10 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -193,6 +195,10 @@ REGISTRY_USER_AGENT = "paludarium-release (https://github.com/aletheia-works/pal
 CRATES_API = "https://crates.io/api/v1/crates/"
 NPM_NAME = "@aletheia-works/paludarium-wasm"
 NPM_PACKAGE_URL = "https://registry.npmjs.org/%40aletheia-works%2Fpaludarium-wasm"
+NPM_TARBALL_URL = NPM_PACKAGE_URL + "/-/paludarium-wasm-{}.tgz"
+# The package check builds in target/release-evidence/package-<time_ns>/, and the
+# Wasm keeps the dependency paths under it (panic locations, debug info).
+BUILD_DIRECTORY = re.compile(rb"target/release-evidence/package-[0-9]{1,20}/")
 # The same name on JSR; this key keeps it apart from the npm package in records.
 JSR_KEY = "jsr:" + NPM_NAME
 JSR_PACKAGE_API = "https://api.jsr.io/scopes/aletheia-works/packages/paludarium-wasm"
@@ -500,6 +506,35 @@ UPLOAD_VISIBLE_SECONDS = 15 * 60
 UPLOAD_POLL_SECONDS = 15
 
 
+def published_npm_files(version, integrity, path):
+    """The files of the npm tarball of this version on the registry, which must have the
+    registry's integrity."""
+    with urllib.request.urlopen(
+        registry_request(NPM_TARBALL_URL.format(version)), timeout=120
+    ) as response:
+        raw = response.read(256 * 1024 * 1024 + 1)
+    policy.require(
+        npm_integrity(raw) == integrity, "published npm tarball differs from its integrity"
+    )
+    path.write_bytes(raw)
+    return package.members(path, "package")
+
+
+def same_but_build_directory(published, approved):
+    """True when two npm file sets differ only in the package check's build directory
+    inside paludarium.wasm: the same source built by another package check."""
+
+    def plain(files):
+        return {
+            n: BUILD_DIRECTORY.sub(b"target/release-evidence/package-N/", d)
+            if n == "paludarium.wasm"
+            else d
+            for n, d in files.items()
+        }
+
+    return plain(published) == plain(approved)
+
+
 def uploaded_metadata(url, sleep=None, clock=None):
     """A just-uploaded version can stay 404 for minutes (a new npm package took five), so wait for it."""
     sleep = sleep or time.sleep
@@ -594,11 +629,9 @@ def publish_artifacts(root, evidence):
     )
     # JSR gets the same verified files as npm, without package.json and with
     # jsr.json from the verified source snapshot.
-    files = package.jsr_files(
-        package.members(tarballs[0], "package"),
-        (source / "packages/paludarium-wasm/jsr.json").read_bytes(),
-        approved["version"],
-    )
+    npm_files = package.members(tarballs[0], "package")
+    jsr_config = (source / "packages/paludarium-wasm/jsr.json").read_bytes()
+    files = package.jsr_files(npm_files, jsr_config, approved["version"])
     manifest = package.jsr_manifest(files)
     policy.require(manifest == result["jsr"]["files"], "prepared JSR files changed")
     dry_env, cargo_env, npm_env, jsr_env = publication_environments(env)
@@ -692,12 +725,14 @@ def publish_artifacts(root, evidence):
         npm = Path(os.environ["PALUDARIUM_RELEASE_NPM"])
         integrity = npm_integrity(tarballs[0].read_bytes())
         url = NPM_PACKAGE_URL + "/" + approved["version"]
+        present = True
         try:
             with urllib.request.urlopen(registry_request(url), timeout=30) as response:
                 body = json.load(response)
         except urllib.error.HTTPError as error:
             if error.code != 404:
                 raise
+            present = False
             attempted.append("@aletheia-works/paludarium-wasm")
             require_success(
                 run_command(
@@ -719,6 +754,24 @@ def publish_artifacts(root, evidence):
             )
             uploaded.append("@aletheia-works/paludarium-wasm")
             body = uploaded_metadata(url)
+        if present and body.get("dist", {}).get("integrity") != integrity:
+            # A later head finishing a stopped publication rebuilds the Wasm in another
+            # build directory. That version is the same source only when nothing but
+            # that directory name differs; JSR then gets the published files, so that
+            # JSR and npm hold the same bytes. Any other difference stops here.
+            published = published_npm_files(
+                approved["version"], body["dist"]["integrity"], directory / "published-npm.tgz"
+            )
+            if same_but_build_directory(published, npm_files):
+                print(
+                    "npm {} differs only in the build directory; JSR gets its files".format(
+                        approved["version"]
+                    ),
+                    file=sys.stderr,
+                )
+                integrity = body["dist"]["integrity"]
+                files = package.jsr_files(published, jsr_config, approved["version"])
+                manifest = package.jsr_manifest(files)
         registry_state(
             200,
             dict(version=body["version"], digest=body["dist"]["integrity"]),

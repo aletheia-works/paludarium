@@ -365,11 +365,18 @@ run (same head; nothing is tagged yet) is safe: every version already present is
 remaining ones are uploaded. When the cause is in the release scripts
 themselves, a re-run runs the same scripts and stops again; merge the fix
 instead, and the `Publish` run of that later main head produces its own
-same-head evidence and resumes the same way, so its packages must have the
+same-head evidence and resumes the same way, so its crates must have the
 digests already published (a version with another digest stops before any
-upload, so merge nothing that changes a package until then). Its notes add
-the commits after the release PR, as for any later head, so none is left out
-of every release. 0.15.0 stopped like this at its first JSR query. The cargo and npm children
+upload, so merge nothing that changes a package until then). Its npm tarball
+cannot: the package check builds in `target/release-evidence/package-<time_ns>/`,
+and `paludarium.wasm` keeps the dependency paths under it. A published npm
+version with another integrity is therefore accepted only when its tarball,
+fetched from the registry with the registry's integrity, has the same files
+and bytes except that directory name inside `paludarium.wasm`; JSR then gets
+the published files, so JSR and npm hold the same bytes. Any other
+difference stops before any upload. Its notes add the commits after the
+release PR, as for any later head, so none is left out of every release.
+0.15.0 stopped like this at its first JSR query. The cargo and npm children
 get allow-listed environments only (step 3); the allow-list for
 `npm publish --provenance` follows npm's provenance generator for GitHub
 Actions and is proven only by the real publication. A successful workflow alone is not

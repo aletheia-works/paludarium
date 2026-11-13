@@ -3381,9 +3381,10 @@ impl Kernel {
             if !Self::may_attach(thread, &view, &public) {
                 return Err(Errno::EPERM);
             }
-            match view.group.robust_list(tid) {
-                Some(head) if !view.zombie => head,
-                _ => 0,
+            if view.zombie {
+                0
+            } else {
+                view.group.robust_list(tid).ok_or(esrch)?
             }
         };
         mem.write_u64(GuestAddr(a[2]), crate::futex::ROBUST_LIST_HEAD)
@@ -3391,20 +3392,23 @@ impl Kernel {
             .map_err(|_| Errno::EFAULT)?;
         Ok(0)
     }
-    /// Whether the caller may attach to a thread of another process, as
-    /// Linux's `__ptrace_may_access` with `PTRACE_MODE_ATTACH_REALCREDS`
-    /// decides ([`crate::credentials::Credentials::may_read_task`] with the
-    /// real IDs): no Yama restriction is applied on top.
+    /// Whether the caller may attach to or read a thread of another process,
+    /// as Linux's `__ptrace_may_access` with `PTRACE_MODE_ATTACH_REALCREDS`
+    /// or `PTRACE_MODE_READ_REALCREDS` decides
+    /// ([`crate::credentials::Credentials::may_read_task`] with the real
+    /// IDs). The two modes differ only in Yama, which restricts attaching
+    /// and is not applied here. A zombie keeps the dumpability it had, as
+    /// Linux 7.1 and later keep it in the task's `exec_state` (before, a
+    /// task with no `mm` skipped the check).
     fn may_attach(
         thread: &Thread,
         view: &ProcessView,
         public: &crate::threads::PublicThread,
     ) -> bool {
-        thread.state.credentials.may_read_task(
-            &public.credentials,
-            view.dumpable || view.zombie,
-            true,
-        )
+        thread
+            .state
+            .credentials
+            .may_read_task(&public.credentials, view.dumpable, true)
     }
     /// `pidfd_getfd(pidfd, targetfd, flags)`, as Linux's: `flags` must be 0
     /// (`EINVAL`) and `pidfd` a pidfd (`EBADF`); its process must not be

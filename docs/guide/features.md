@@ -385,7 +385,10 @@ kernel.
   entries, and a core dump comes first. A new thread or process has no list.
   `get_robust_list` gives another process's thread's head to a caller that may
   read it, as Linux's `ptrace_may_access` with `PTRACE_MODE_READ_REALCREDS`
-  decides (`EPERM` before the addresses are written), and 0 for a zombie.
+  decides (`EPERM` before the addresses are written), and 0 for a zombie. A
+  zombie keeps the dumpability it had for that check, and for `kcmp`,
+  `pidfd_getfd`, `migrate_pages` and `move_pages`, as Linux 7.1 and later keep
+  it (before, a process with no memory left skipped it).
 - `futex`, `epoll` and `eventfd` are implemented inside paludarium, not with the
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.

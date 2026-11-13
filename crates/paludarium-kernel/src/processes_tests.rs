@@ -5508,7 +5508,13 @@ mod robust_lists {
             syscall(&mut k, &mut t, &m, 274, [other, 0, DATA + 8, 0, 0, 0]),
             Errno::EFAULT.to_syscall_return()
         );
-        // A zombie's list went as it ended; a reaped process is gone.
+        // A zombie's list went as it ended, and it keeps its dumpability,
+        // as Linux 7.1 and later keep it; a reaped process is gone.
+        let (mut n, mut nt, nm) = fork(&mut k, &mut t, &m);
+        let undumpable = u64::from(nt.tid);
+        assert_eq!(syscall(&mut n, &mut nt, &nm, 157, [4, 0, 0, 0, 0, 0]), 0);
+        finish(&mut n, &nt, &nm, ExitStatus::Exited(0));
+        assert_eq!(get(&mut k, &mut t, &m, undumpable).0, eperm);
         finish(&mut o, &ot, &om, ExitStatus::Exited(0));
         assert_eq!(get(&mut k, &mut t, &m, other), (0, 0));
         assert_eq!(

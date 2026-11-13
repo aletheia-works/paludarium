@@ -4575,7 +4575,22 @@ static int robust_list_cases(const char *self) {
     if (write(go[1], &byte, 1) != 1) return 96;
     siginfo_t info;
     if (waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT)) return 97;
+    /* A zombie keeps its dumpability (Linux 7.1 and later). */
+    got = base;
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, &got, &length);
+    printf("get-of-undumpable-zombie fits-caller=%d\n",
+           privileged ? r == 0 && got == NULL : r == -1 && errno == EPERM);
+    waitpid(child, &status, 0);
     /* A zombie's list went as it ended; a reaped process is gone. */
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 98;
+    if (!child) {
+        syscall(SYS_set_robust_list, base + 128, 24L);
+        _exit(0);
+    }
+    if (waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT)) return 99;
     got = base;
     errno = 0;
     r = syscall(SYS_get_robust_list, (long)child, &got, &length);

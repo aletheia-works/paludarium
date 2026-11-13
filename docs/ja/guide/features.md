@@ -341,7 +341,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書きます。新しいスレッドとプロセスのリストは空です。`get_robust_list` は、ほかの
   プロセスのスレッドの先頭も、Linux の `ptrace_may_access` が
   `PTRACE_MODE_READ_REALCREDS` で読めるとする呼び出し元には返します（`EPERM` は
-  アドレスに書く前です）。ゾンビなら 0 です。
+  アドレスに書く前です）。ゾンビなら 0 です。この検査と、`kcmp`、`pidfd_getfd`、
+  `migrate_pages`、`move_pages` の検査では、Linux 7.1 以降と同じく、ゾンビもダンプ
+  できるかどうかをそのまま持ちます（それより前は、メモリのなくなったプロセスでは
+  この判定を飛ばしていました）。
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
 - [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET`、`AF_INET6`、`AF_NETLINK` に

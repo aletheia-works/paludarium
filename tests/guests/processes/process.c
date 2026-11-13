@@ -6332,7 +6332,8 @@ static int madvise_guard_case(void) {
     int pipes[2];
     if (pipe(pipes)) return 82;
     long from = advice_errno(write(pipes[1], p + page, 1));
-    long into = advice_errno(syscall(SYS_getcwd, p + page, 64L));
+    /* Room for any working directory, so that the copy is what fails. */
+    long into = advice_errno(syscall(SYS_getcwd, p + page, 4096L));
     printf("write-from=%ld getcwd-into=%ld\n", from, into);
     /* Installing again keeps them; MADV_DONTNEED leaves them. */
     long again = advice_errno(madvise(p + 2 * page, 2 * page, MADV_GUARD_INSTALL));

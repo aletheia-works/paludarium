@@ -1305,6 +1305,18 @@ static void nl_route_attribute(unsigned short type, const unsigned char *v, int 
     if ((type == 1 || type == 5 || type == 7) && (len == 4 || len == 16)) {
         inet_ntop(len == 4 ? AF_INET : AF_INET6, v, text, sizeof text);
         printf("=%s", text);
+    } else if (type == 5 && len == 8) {
+        /* An MCTP gateway (struct mctp_fq_addr): its network and ID, then
+           the padding. */
+        unsigned net;
+        memcpy(&net, v, 4);
+        printf("=%u:%u:%02x%02x%02x", net, v[4], v[5], v[6], v[7]);
+    } else if (type == 8 && len == 8) {
+        /* Metrics of one u32, as an MCTP route's RTAX_MTU. */
+        unsigned short metric[2];
+        memcpy(metric, v, 4);
+        memcpy(&value, v + 4, 4);
+        printf("=%u:%u:%u", metric[0], metric[1], value);
     } else if (len == 4) {
         printf("=%u", value);
     } else if (len == 1) {
@@ -1580,6 +1592,29 @@ static void nl_mctp_change(int fd, unsigned port, int mon, unsigned short type, 
     if (attr) nl_put(&b, attr, value, len);
     printf("%s: error=%d\n", label, nl_quiet(fd, type, 0, b.bytes, b.len));
     nl_answer(mon, nl_seq, port, label);
+}
+/* The netlink-strict case: an MCTP route request `type` on `fd`, of type
+   `rtn` from ID `dst` (none for -1) and the `extent` after it, through
+   interface `oif` (none for 0) or gateway `gw` of network `net` (none for
+   -1), with `mtu` in RTA_METRICS (none for 0); prints its error. */
+static void nl_mctp_route(int fd, unsigned short type, int extent, int rtn, int dst, unsigned oif, unsigned net, int gw,
+                          unsigned mtu, const char *label) {
+    struct nl_body b = nl_body(45, 12);
+    b.bytes[1] = extent;
+    b.bytes[7] = rtn;
+    unsigned char eid = dst;
+    if (dst >= 0) nl_put(&b, 1, &eid, 1);
+    if (oif) nl_put32(&b, 4, oif);
+    unsigned char gateway[8] = {0};
+    memcpy(gateway, &net, 4);
+    gateway[4] = gw;
+    if (gw >= 0) nl_put(&b, 5, gateway, 8);
+    unsigned char metrics[8];
+    unsigned short metric[2] = {8, 2};
+    memcpy(metrics, metric, 4);
+    memcpy(metrics + 4, &mtu, 4);
+    if (mtu) nl_put(&b, 8 | 0x8000, metrics, 8);
+    printf("%s: error=%d\n", label, nl_quiet(fd, type, 0, b.bytes, b.len));
 }
 /* The route-dump case: sends request `type` with `flags` and NLM_F_ACK,
    and takes its acknowledgement, giving its error. */
@@ -11038,6 +11073,65 @@ int main(int argc, char **argv) {
             nl_strict(fd, port, 22, 1, &b, "addr all added");
             b = nl_body(0, 12);
             nl_strict(fd, port, 26, 1, &b, "route all added");
+            /* MCTP routes (mctp_newroute, mctp_delroute), of RTN_UNICAST
+               (1): a range from RTA_DST through a gateway, never lo
+               (EINVAL), one each for a range of a network, in network 1
+               for MCTP_NET_ANY; parsed strictly with rta_mctp_policy. The
+               newest come first in the dump, before the local routes of
+               the addresses added before them; an address whose ID such a
+               route has gets no local route. Removing takes the network
+               and range alone, which lo's index names too. */
+            nl_mctp_route(fd, 24, 2, 1, 30, 0, 0, 20, 1500, "mctp route 30-32 by 20");
+            nl_mctp_route(fd, 24, 2, 1, 30, 0, 1, 21, 0, "mctp route 30-32 again");
+            nl_mctp_route(fd, 24, 0, 1, 30, 0, 5, 21, 0, "mctp route 30 by 5:21");
+            nl_mctp_route(fd, 24, 0, 1, 50, 0, 0, 20, 0, "mctp route 50 by 20");
+            nl_mctp_route(fd, 24, 0, 1, 40, 1, 0, -1, 0, "mctp route through lo");
+            nl_mctp_route(fd, 24, 0, 1, 40, 2, 0, -1, 0, "mctp route other index");
+            nl_mctp_route(fd, 24, 0, 1, 40, 1, 0, 20, 0, "mctp route lo and gateway");
+            nl_mctp_route(fd, 24, 0, 1, 40, 0, 0, -1, 0, "mctp route no output");
+            nl_mctp_route(fd, 24, 0, 1, -1, 0, 0, 20, 0, "mctp route no dst");
+            nl_mctp_route(fd, 24, 0, 1, 40, 0, 0, 7, 0, "mctp route reserved gateway");
+            nl_mctp_route(fd, 24, 0, 2, 40, 0, 0, 20, 0, "mctp route local");
+            nl_mctp_route(fd, 24, 0, 1, 7, 0, 0, 20, 0, "mctp route reserved dst");
+            nl_mctp_route(fd, 24, 15, 1, 240, 0, 0, 20, 0, "mctp route past 254");
+            nl_mctp_route(fd, 24, 0, 1, 10, 0, 0, 20, 0, "mctp route 10 by 20");
+            {
+                /* The policies: a gateway of five bytes, metrics not marked
+                   nested, of two bytes, and holding another metric, and a
+                   table. */
+                unsigned char gateway[8] = {0, 0, 0, 0, 20};
+                unsigned char eid = 40;
+                unsigned char hoplimit[8] = {8, 0, 10, 0, 64};
+                struct { const char *label; unsigned short type; const void *value; int len; } bad[] = {
+                    {"mctp route gateway of 5", 5, gateway, 5},
+                    {"mctp route metrics unmarked", 8, hoplimit, 0},
+                    {"mctp route metrics of 2", 8 | 0x8000, hoplimit, 2},
+                    {"mctp route hoplimit", 8 | 0x8000, hoplimit, 8},
+                    {"mctp route table", 15, gateway, 4},
+                };
+                for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+                    b = nl_body(45, 12);
+                    b.bytes[7] = 1;
+                    nl_put(&b, 1, &eid, 1);
+                    if (bad[i].type != 5) nl_put(&b, 5, gateway, 8);
+                    nl_put(&b, bad[i].type, bad[i].value, bad[i].len);
+                    printf("%s: error=%d\n", bad[i].label, nl_quiet(fd, 24, 0, b.bytes, b.len));
+                }
+            }
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 50, 1, "mctp add 50");
+            b = nl_body(45, 12);
+            nl_strict(fd, port, 26, 1, &b, "route mctp routed");
+            nl_mctp_route(fd, 25, 0, 1, 8, 1, 0, -1, 0, "mctp unroute 8");
+            nl_mctp_route(fd, 25, 0, 2, 8, 1, 0, -1, 0, "mctp unroute local 8");
+            nl_mctp_route(fd, 25, 2, 1, 30, 1, 0, -1, 0, "mctp unroute 30-32 by lo");
+            nl_mctp_route(fd, 25, 2, 1, 30, 1, 0, -1, 0, "mctp unroute 30-32 again");
+            nl_mctp_route(fd, 25, 0, 1, 30, 0, 5, 99, 0, "mctp unroute 30 by 5:99");
+            nl_mctp_route(fd, 25, 15, 1, 240, 1, 0, -1, 0, "mctp unroute past 254");
+            nl_mctp_route(fd, 25, 0, 1, 10, 0, 0, 20, 0, "mctp unroute 10");
+            b = nl_body(45, 12);
+            nl_strict(fd, port, 26, 1, &b, "route mctp unrouted");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 50, 1, "mctp del 50");
+            nl_mctp_route(fd, 25, 0, 1, 50, 0, 0, 20, 0, "mctp unroute 50");
             nl_mctp_change(fd, port, mctp_mon, 21, 1, 1, 8, 1, "mctp del 8");
             nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 8, 1, "mctp del 8 again");
             nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 7, 1, "mctp del reserved");

@@ -393,8 +393,33 @@ pub(crate) struct Addresses {
     tables4: Vec<u32>,
     tables6: Vec<u32>,
     /// The loopback's MCTP endpoint IDs, the first added first, as
-    /// `mctp_dev`'s `addrs`; each has its local MCTP route.
+    /// `mctp_dev`'s `addrs`.
     pub mctp: Vec<u8>,
+    /// The MCTP routes, the newest first, as `mctp_route_add` puts each at
+    /// the head of the namespace's list: the local route of each of the
+    /// loopback's addresses, and those added through gateways.
+    pub mctp_routes: Vec<MctpRoute>,
+}
+/// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
+/// network, either local through the loopback or through a gateway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MctpRoute {
+    pub min: u8,
+    pub max: u8,
+    /// `RTN_LOCAL` for an address's own route, else `RTN_UNICAST`.
+    pub kind: u8,
+    /// Its MTU (`RTAX_MTU`), or 0 for none.
+    pub mtu: u32,
+    /// The gateway's network and endpoint ID, or `None` for a route
+    /// through the loopback.
+    pub gateway: Option<(u32, u8)>,
+}
+impl MctpRoute {
+    /// The network the route is in (`mctp_route_netid`): its gateway's,
+    /// or the loopback's, which is network 1.
+    pub(crate) fn net(&self) -> u32 {
+        self.gateway.map_or(1, |(net, _)| net)
+    }
 }
 impl Addresses {
     /// The first namespace's: `127.0.0.1/8` and `::1`, up.
@@ -413,6 +438,7 @@ impl Addresses {
             tables4: Vec::new(),
             tables6: vec![TABLE_MAIN, TABLE_LOCAL],
             mctp: Vec::new(),
+            mctp_routes: Vec::new(),
         }
     }
     /// The loopback comes up (`NETDEV_UP`), and what Linux tells of it, in

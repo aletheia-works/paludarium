@@ -1402,10 +1402,25 @@ kernel.
     first, each as `IFA_LOCAL` and `IFA_ADDRESS`; strictly it needs only a
     whole `ifaddrmsg` (`EINVAL`), whose index narrows it without
     `NLM_F_DUMP_FILTERED`. Each ID has a local route
-    (`mctp_route_add_local`), which an `AF_MCTP` route dump shows, the
-    newest first, as `mctp_dump_rtinfo` does, taking no filter. The
-    address and route dumps of every family (`rtnl_dump_all`) end with
-    MCTP's.
+    (`mctp_route_add_local`), unless a route of network 1 has that ID
+    alone already, and loses it with the ID. The address and route dumps
+    of every family (`rtnl_dump_all`) end with MCTP's.
+  - **MCTP routes:** `RTM_NEWROUTE` of `AF_MCTP` adds a route through a
+    gateway, as `mctp_newroute` does: `RTA_DST` and the `rtm_dst_len` IDs
+    after it, through the `mctp_fq_addr` of `RTA_GATEWAY` (network 0 is
+    the default one, 1), with an MTU in `RTA_METRICS` if it has one. The
+    request is parsed strictly with `rta_mctp_policy` (`EINVAL`, or
+    `ERANGE` for metrics of one to three bytes); it needs `RTA_DST`, a
+    unicast gateway ID and the type `RTN_UNICAST` (`EINVAL`), and takes no
+    route through `lo` (`EINVAL`, "no routes to loopback") or other
+    interface (`ENODEV`), a range from an ID below 8 or past 254
+    (`EINVAL`), or a range of the network that a route already has
+    (`EEXIST`). `RTM_DELROUTE` removes the `RTN_UNICAST` route of a
+    network and range, the network being the gateway's or that of `lo`'s
+    index (`ENOENT` for none), as `mctp_delroute` does. No notification
+    goes out for either, as on Linux. An `AF_MCTP` route dump shows the
+    local and gateway routes, the newest first, as `mctp_dump_rtinfo`
+    does, taking no filter.
   - **Routes:** each family has its routing tables, as Linux's `fib_trie`
     and `ip6_fib` keep them; IPv4's local and main tables share one trie,
     as they do while there is no policy rule. The addresses' routes are the

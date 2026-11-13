@@ -1219,9 +1219,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `mctp_dump_addrinfo` と同じく MCTP 自身が扱い、ID を足した順に、それぞれ `IFA_LOCAL` と
     `IFA_ADDRESS` で返します。検査するときに要るのは `ifaddrmsg` 全体だけで（足りなければ
     `EINVAL`）、インデックスは `NLM_F_DUMP_FILTERED` を付けずに絞り込みます。ID ごとに
-    ローカルの経路があり（`mctp_route_add_local`）、`AF_MCTP` の経路のダンプは、
-    `mctp_dump_rtinfo` と同じく絞り込みを取らずに、新しいものから返します。すべての
-    ファミリーのアドレスと経路のダンプ（`rtnl_dump_all`）は、最後に MCTP のものを返します。
+    ローカルの経路が付き（`mctp_route_add_local`）、ID を消すと消えます。ただし、
+    ネットワーク 1 にその ID だけの経路がすでにあれば付きません。すべてのファミリーの
+    アドレスと経路のダンプ（`rtnl_dump_all`）は、最後に MCTP のものを返します。
+  - **MCTP の経路:** `AF_MCTP` の `RTM_NEWROUTE` は、`mctp_newroute` と同じく
+    ゲートウェイを通る経路を足します。範囲は `RTA_DST` とその後の `rtm_dst_len` 個の ID で、
+    `RTA_GATEWAY` の `mctp_fq_addr` を通ります（ネットワーク 0 は既定の 1 です）。
+    `RTA_METRICS` に MTU があれば持ちます。リクエストは `rta_mctp_policy` で厳しく
+    解釈します（`EINVAL`、1 から 3 バイトのメトリクスは `ERANGE`）。`RTA_DST`、ユニキャストの
+    ゲートウェイ ID、`RTN_UNICAST` の型が要ります（`EINVAL`）。`lo` を通る経路
+    （`EINVAL`、"no routes to loopback"）、ほかのインターフェースを通る経路（`ENODEV`）、
+    8 より小さい ID か 254 を超える範囲（`EINVAL`）、そのネットワークにすでにある範囲
+    （`EEXIST`）は取りません。`RTM_DELROUTE` は、`mctp_delroute` と同じく、ネットワークと
+    範囲の合う `RTN_UNICAST` の経路を消します（なければ `ENOENT`）。ネットワークは
+    ゲートウェイのもの、または `lo` のインデックスのものです。どちらも、Linux と同じく
+    通知を送りません。`AF_MCTP` の経路のダンプは、`mctp_dump_rtinfo` と同じく絞り込みを
+    取らずに、ローカルの経路とゲートウェイの経路を新しいものから返します。
   - **経路:** ファミリーごとに、Linux の `fib_trie` と `ip6_fib` と同じく経路の表を
     持ちます。IPv4 のローカルの表とメインの表は、ポリシーのルールがない間の Linux と同じく
     1 つのトライを分け合います。アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付ける

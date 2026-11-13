@@ -449,9 +449,8 @@ verified.
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps
   IPv4's and IPv6's addresses and routes for those dumps, and takes no
-  MCTP address; MCTP routes cannot be added or removed (`RTM_NEWROUTE`
-  and `RTM_DELROUTE` of `AF_MCTP` are `EOPNOTSUPP`), so there are only
-  the local routes of `lo`'s addresses. A link message's
+  MCTP address or route; MCTP's addresses and routes carry nothing, as
+  there are no `AF_MCTP` sockets (`EAFNOSUPPORT`). A link message's
   statistics are zero; its IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30

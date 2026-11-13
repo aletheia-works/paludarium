@@ -1226,7 +1226,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ゲートウェイを通る経路を足します。範囲は `RTA_DST` とその後の `rtm_dst_len` 個の ID で、
     `RTA_GATEWAY` の `mctp_fq_addr` を通ります（ネットワーク 0 は既定の 1 です）。
     `RTA_METRICS` に MTU があれば持ちます。リクエストは `rta_mctp_policy` で厳しく
-    解釈します（`EINVAL`、1 から 3 バイトのメトリクスは `ERANGE`）。`RTA_DST`、ユニキャストの
+    解釈します（`EINVAL`、8 バイトでないゲートウェイと 1 から 3 バイトのメトリクスは
+    `ERANGE`）。`RTA_DST`、ユニキャストの
     ゲートウェイ ID、`RTN_UNICAST` の型が要ります（`EINVAL`）。`lo` を通る経路
     （`EINVAL`、"no routes to loopback"）、ほかのインターフェースを通る経路（`ENODEV`）、
     8 より小さい ID か 254 を超える範囲（`EINVAL`）、そのネットワークにすでにある範囲

@@ -1410,7 +1410,8 @@ kernel.
     after it, through the `mctp_fq_addr` of `RTA_GATEWAY` (network 0 is
     the default one, 1), with an MTU in `RTA_METRICS` if it has one. The
     request is parsed strictly with `rta_mctp_policy` (`EINVAL`, or
-    `ERANGE` for metrics of one to three bytes); it needs `RTA_DST`, a
+    `ERANGE` for a gateway of other than eight bytes and for metrics of
+    one to three); it needs `RTA_DST`, a
     unicast gateway ID and the type `RTN_UNICAST` (`EINVAL`), and takes no
     route through `lo` (`EINVAL`, "no routes to loopback") or other
     interface (`ENODEV`), a range from an ID below 8 or past 254

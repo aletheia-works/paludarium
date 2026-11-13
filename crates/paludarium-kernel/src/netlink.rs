@@ -1723,8 +1723,8 @@ fn same_range(a: &MctpRoute, b: &MctpRoute) -> bool {
 /// `nlmsg_parse` does with `rta_mctp_policy`: `EINVAL` for a short
 /// `rtmsg`, a type of 0 or past `RTA_MAX`, bytes left over, an attribute
 /// but `RTA_DST` (one byte), `RTA_OIF` (four), `RTA_GATEWAY` (a
-/// `mctp_fq_addr`, eight) and `RTA_METRICS` (nested, `ERANGE` for one of
-/// one to three bytes). Then, in `mctp_route_nlparse_common`'s order: no
+/// `mctp_fq_addr`, eight, `ERANGE` for another length) and `RTA_METRICS`
+/// (nested, `ERANGE` for one of one to three bytes). Then, in `mctp_route_nlparse_common`'s order: no
 /// `RTA_DST` is `EINVAL`, both `RTA_OIF` and `RTA_GATEWAY` or neither
 /// `EINVAL`, an interface but `lo` `ENODEV`, a gateway's broadcast or
 /// reserved ID `EINVAL`, and a type but `RTN_UNICAST` `EINVAL`. A gateway
@@ -1746,7 +1746,11 @@ fn change_mctp_route(network: &Network, header: &Header, payload: &[u8]) -> Resu
         match kind {
             RTA_DST => exact(nested, value, 1),
             RTA_OIF => exact(nested, value, 4),
-            RTA_GATEWAY => exact(nested, value, 8),
+            // `NLA_POLICY_EXACT_LEN`, a binary range: `ERANGE` for
+            // another length (`nla_validate_range_unsigned`).
+            RTA_GATEWAY if nested => Err(Errno::EINVAL),
+            RTA_GATEWAY if value.len() != 8 => Err(ERANGE),
+            RTA_GATEWAY => Ok(()),
             // `NLA_NESTED`: marked, and empty or holding a header.
             RTA_METRICS if !nested => Err(Errno::EINVAL),
             RTA_METRICS if (1..4).contains(&value.len()) => Err(ERANGE),
@@ -3958,12 +3962,7 @@ mod tests {
                 &[(RTA_DST, &[40, 0]), (RTA_GATEWAY, &one)],
                 Errno::EINVAL,
             ),
-            (
-                0,
-                1,
-                &[(RTA_DST, &[40]), (RTA_GATEWAY, &one[..5])],
-                Errno::EINVAL,
-            ),
+            (0, 1, &[(RTA_DST, &[40]), (RTA_GATEWAY, &one[..5])], ERANGE),
             (
                 0,
                 1,

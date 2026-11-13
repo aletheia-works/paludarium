@@ -203,11 +203,6 @@ BUILD_DIRECTORY = re.compile(rb"target/release-evidence/package-[0-9]{1,20}/")
 JSR_KEY = "jsr:" + NPM_NAME
 JSR_PACKAGE_API = "https://api.jsr.io/scopes/aletheia-works/packages/paludarium-wasm"
 JSR_PACKAGE_URL = "https://jsr.io/@aletheia-works/paludarium-wasm"
-# Versions released without JSR. 0.15.0: its first JSR upload, by Deno 2.9.8, rewrote
-# paludarium.wasm's import module names (denoland/deno#37171) and was deleted, but JSR
-# keeps that upload's successful publishing task, which refuses every later upload of
-# 0.15.0 (duplicateVersionPublish; deno publish then exits 0 without uploading).
-JSR_SKIPPED_VERSIONS = frozenset({"0.15.0"})
 
 
 def jsr_uncached(url):
@@ -802,14 +797,6 @@ def publish_artifacts(root, evidence):
             integrity,
         )
         completed.append("@aletheia-works/paludarium-wasm")
-        if approved["version"] in JSR_SKIPPED_VERSIONS:
-            print("JSR skipped for " + approved["version"], file=sys.stderr)
-            return dict(
-                published=completed,
-                skipped=[JSR_KEY],
-                head=approved["head"],
-                version=approved["version"],
-            )
         url = JSR_PACKAGE_URL + "/" + approved["version"] + "_meta.json"
         try:
             with urllib.request.urlopen(

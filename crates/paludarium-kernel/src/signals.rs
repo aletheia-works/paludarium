@@ -261,6 +261,14 @@ pub(crate) fn wakes(process: &ThreadState, signal: &PendingSignal) -> bool {
     signal.synchronous || blocked || !ignored
 }
 
+/// The clock a sleep counts on: a host clock, or the process's CPU time
+/// (`CLOCK_PROCESS_CPUTIME_ID`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SleepClock {
+    Host(ClockId),
+    ProcessCpu,
+}
+
 /// A wait that `restart_syscall` resumes after a stop, with its absolute
 /// deadline, as Linux's `restart_block` keeps it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,7 +276,7 @@ pub(crate) enum RestartBlock {
     /// nanosleep or a relative clock_nanosleep: the clock, the deadline on
     /// it and where the time left goes (0 for nowhere).
     Sleep {
-        clock: ClockId,
+        clock: SleepClock,
         deadline: u64,
         rem: u64,
     },

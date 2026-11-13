@@ -85,6 +85,8 @@ pub struct ThreadGroup {
     /// Whether a POSIX timer on a CPU-time clock is armed
     /// ([`crate::timers::Timers::cpu_armed`]).
     posix_cpu_armed: std::sync::atomic::AtomicBool,
+    /// The threads sleeping on the process's CPU clock ([`CpuSleep`]).
+    cpu_sleepers: std::sync::atomic::AtomicUsize,
     /// The core dump a fatal signal started, which the last thread to end
     /// writes. Locked before `members`.
     pub(crate) core: Mutex<Option<crate::coredump::Dump>>,
@@ -204,6 +206,7 @@ impl Default for ThreadGroup {
             cpu_timers: Mutex::default(),
             cpu_timers_armed: std::sync::atomic::AtomicBool::new(false),
             posix_cpu_armed: std::sync::atomic::AtomicBool::new(false),
+            cpu_sleepers: std::sync::atomic::AtomicUsize::new(0),
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
             robust_lists: Mutex::default(),
@@ -527,11 +530,22 @@ impl ThreadGroup {
             TimerClock::Monotonic | TimerClock::Realtime => Ok(mono),
         }
     }
-    /// Whether an interval timer of the process's CPU time is armed or its
-    /// `RLIMIT_CPU` is set, so that a checkpoint brings the thread's CPU
+    /// Whether an interval timer of the process's CPU time is armed, its
+    /// `RLIMIT_CPU` is set, a POSIX timer runs on a CPU clock or a thread
+    /// sleeps on the process's, so that a checkpoint brings the thread's CPU
     /// time up to date for them.
     pub(crate) fn cpu_timers_armed(&self) -> bool {
-        self.cpu_timers_armed.load(Ordering::SeqCst) || self.posix_cpu_armed.load(Ordering::SeqCst)
+        self.cpu_timers_armed.load(Ordering::SeqCst)
+            || self.posix_cpu_armed.load(Ordering::SeqCst)
+            || self.cpu_sleepers.load(Ordering::SeqCst) != 0
+    }
+    /// Marks a thread as sleeping on the process's CPU clock until the
+    /// returned guard is dropped, so that the other threads account their
+    /// CPU time at each checkpoint, as Linux's tick does for the timer its
+    /// `do_cpu_nanosleep` arms.
+    pub(crate) fn cpu_sleep(&self) -> CpuSleep<'_> {
+        self.cpu_sleepers.fetch_add(1, Ordering::SeqCst);
+        CpuSleep(self)
     }
     /// The CPU-time interval timer `index` (0 for `ITIMER_VIRTUAL`, 1 for
     /// `ITIMER_PROF`) as its interval and the time left, replaced by `new`
@@ -2214,6 +2228,14 @@ fn futex_words(
             })
         })
         .collect()
+}
+
+/// A thread's sleep on the process's CPU clock ([`ThreadGroup::cpu_sleep`]).
+pub(crate) struct CpuSleep<'a>(&'a ThreadGroup);
+impl Drop for CpuSleep<'_> {
+    fn drop(&mut self) {
+        self.0.cpu_sleepers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]

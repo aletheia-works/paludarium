@@ -6701,6 +6701,40 @@ mod madvise_advice {
         assert_eq!(f.ret(28, &[shared, 2 * PAGE, 9]), errno(Errno::ENOMEM));
         assert_eq!(memory_bytes(&f, shared + PAGE, 1), b"\0");
     }
+    #[test]
+    fn guards_fault_until_removed_and_refuse_what_linux_refuses() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        let at = f.ret(mmap, &[0, 4 * PAGE, 3, 0x22, u64::MAX, 0]);
+        for n in 0..4 {
+            f.mem.write(GuestAddr(at + n * PAGE), b"a").unwrap();
+        }
+        assert_eq!(f.ret(28, &[at + PAGE, 2 * PAGE, 102]), 0);
+        // A system call's copy faults on a guard page.
+        assert_eq!(f.ret(79, &[at + PAGE, 64]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(79, &[at + 3 * PAGE, 64]), 2);
+        // A populating mlock cannot fault it in; MLOCK_ONFAULT need not.
+        assert_eq!(f.ret(149, &[at, 4 * PAGE]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(325, &[at, 4 * PAGE, 1]), 0);
+        assert_eq!(f.ret(149, &[at + 3 * PAGE, PAGE]), 0);
+        assert_eq!(f.ret(28, &[at, 4 * PAGE, 22]), errno(Errno::EFAULT));
+        // Removing it leaves a page without contents.
+        assert_eq!(f.ret(28, &[at + 2 * PAGE, PAGE, 103]), 0);
+        assert_eq!(memory_bytes(&f, at + 2 * PAGE, 1), b"\0");
+        assert_eq!(memory_bytes(&f, at, 1), b"a");
+        assert!(f.mem.read(GuestAddr(at + PAGE), &mut [0]).is_err());
+        // Sealed memory that may not be written takes none; it may lose
+        // those it has.
+        assert_eq!(f.ret(10, &[at, PAGE, 1]), 0);
+        assert_eq!(f.ret(462, &[at, PAGE, 0]), 0);
+        assert_eq!(f.ret(28, &[at, PAGE, 102]), errno(Errno::EPERM));
+        assert_eq!(f.ret(28, &[at, PAGE, 103]), 0);
+        // An AIO ring takes neither.
+        assert_eq!(f.ret(206, &[1, DATA + 0x400]), 0);
+        let ring = f.mem.read_u64(GuestAddr(DATA + 0x400)).unwrap();
+        assert_eq!(f.ret(28, &[ring, PAGE, 102]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(28, &[ring, PAGE, 103]), errno(Errno::EINVAL));
+    }
     fn status(f: &mut Fixture, at: u64) -> i32 {
         f.mem.write_u64(GuestAddr(DATA + 0x200), at).unwrap();
         assert_eq!(f.ret(279, &[0, 1, DATA + 0x200, 0, DATA + 0x300, 0]), 0);
@@ -6730,9 +6764,9 @@ mod madvise_advice {
             assert_eq!(f.ret(28, &[AREA, 2 * PAGE, advice]), 0, "{advice}");
             assert_eq!(f.ret(28, &[AREA, 3 * PAGE, advice]), errno(Errno::ENOMEM));
         }
-        // Still refused: MADV_COLLAPSE, the guard and memory failure
-        // advice, and unknown ones.
-        for advice in [25, 100, 101, 102, 103, 26] {
+        // Still refused: MADV_COLLAPSE, the memory failure advice, and
+        // unknown ones.
+        for advice in [25, 100, 101, 26, 104] {
             assert_eq!(
                 f.ret(28, &[AREA, PAGE, advice]),
                 errno(Errno::EINVAL),

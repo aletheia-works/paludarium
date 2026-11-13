@@ -126,6 +126,10 @@ impl PageSource for RingPages {
         buf.fill(0);
         Ok(buf.len())
     }
+    /// Linux's `io_region_mmap` makes the rings `VM_DONTEXPAND`.
+    fn fixed(&self) -> bool {
+        true
+    }
     fn size(&self) -> Option<u64> {
         Some(self.size)
     }

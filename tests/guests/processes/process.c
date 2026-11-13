@@ -4541,6 +4541,69 @@ static int robust_list_cases(const char *self) {
     waitpid(child, &status, 0);
     robust_show("before-unmapped", *robust_word(base, 0), (unsigned)child);
 
+    /* Another process's list, for a caller that may read it (ptrace_may_access
+       with PTRACE_MODE_READ_REALCREDS, which Yama leaves alone). */
+    if (pipe(ready) || pipe(go)) return 92;
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 93;
+    if (!child) {
+        syscall(SYS_set_robust_list, base + 128, 24L);
+        if (write(ready[1], &byte, 1) != 1 || read(go[0], &byte, 1) != 1) _exit(1);
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if (write(ready[1], &byte, 1) != 1 || read(go[0], &byte, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    if (read(ready[0], &byte, 1) != 1) return 94;
+    got = NULL;
+    length = 0;
+    r = syscall(SYS_get_robust_list, (long)child, &got, &length);
+    printf("get-of-child=%ld same=%d length=%zu\n", r, got == base + 128, length);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child | 1L << 32, &got, &length);
+    printf("get-of-child-as-int=%ld\n", r);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, NULL, &length);
+    printf("get-of-child-bad-head=%ld errno=%d\n", r, errno);
+    if (write(go[1], &byte, 1) != 1 || read(ready[0], &byte, 1) != 1) return 95;
+    /* Not dumpable: only CAP_SYS_PTRACE reads it, before the addresses. */
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, NULL, NULL);
+    int privileged = geteuid() == 0;
+    printf("get-of-undumpable fits-caller=%d\n",
+           privileged ? r == -1 && errno == EFAULT : r == -1 && errno == EPERM);
+    if (write(go[1], &byte, 1) != 1) return 96;
+    siginfo_t info;
+    if (waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT)) return 97;
+    /* A zombie keeps its dumpability (Linux 7.1 and later). */
+    got = base;
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, &got, &length);
+    printf("get-of-undumpable-zombie fits-caller=%d\n",
+           privileged ? r == 0 && got == NULL : r == -1 && errno == EPERM);
+    waitpid(child, &status, 0);
+    /* A zombie's list went as it ended; a reaped process is gone. */
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 98;
+    if (!child) {
+        syscall(SYS_set_robust_list, base + 128, 24L);
+        _exit(0);
+    }
+    if (waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT)) return 99;
+    got = base;
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, &got, &length);
+    printf("get-of-zombie=%ld errno=%d none=%d\n", r, errno, got == NULL);
+    waitpid(child, &status, 0);
+    errno = 0;
+    r = syscall(SYS_get_robust_list, (long)child, &got, &length);
+    printf("get-of-reaped=%ld errno=%d\n", r, errno);
+    close(ready[0]);
+    close(ready[1]);
+    close(go[0]);
+    close(go[1]);
+
     /* execve walks it on the old image, and the new program has none. */
     memset(base, 0, (size_t)page);
     fflush(stdout);
@@ -6279,6 +6342,155 @@ static int madvise_remove_case(void) {
     printf("hole=%ld byte=%d\n", hole, shared[page]);
     return 0;
 }
+/* MADV_GUARD_INSTALL and MADV_GUARD_REMOVE, as Linux master's: a guard
+ * page faults as an unmapped one would (SEGV_MAPERR, and EFAULT for a
+ * system call), and stays through MADV_DONTNEED and fork, moves with
+ * mremap, and leaves nothing behind when removed. */
+#ifndef MADV_GUARD_INSTALL
+#define MADV_GUARD_INSTALL 102
+#define MADV_GUARD_REMOVE 103
+#endif
+static sigjmp_buf guard_return;
+static volatile int guard_code, guard_at;
+static volatile long guard_err;
+static volatile uintptr_t guard_expect;
+static void on_guard(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    guard_code = info->si_code;
+    guard_at = (uintptr_t)info->si_addr == guard_expect;
+    guard_err = (long)((ucontext_t *)context)->uc_mcontext.gregs[REG_ERR];
+    siglongjmp(guard_return, 1);
+}
+/* What touching `at` does: its byte, or the SIGSEGV code, address and
+ * error code. */
+static const char *guard_touch(char *out, volatile char *at, int write) {
+    guard_expect = (uintptr_t)at;
+    if (sigsetjmp(guard_return, 1)) {
+        snprintf(out, 64, "segv code=%d at=%d err=%ld", guard_code, guard_at, guard_err);
+        return out;
+    }
+    if (write) *at = 'w';
+    snprintf(out, 64, "byte=%d", *at);
+    return out;
+}
+static int madvise_guard_case(void) {
+    long page = 4096;
+    char a[64], b[64], c[64];
+    struct sigaction action = {0}, old;
+    action.sa_sigaction = on_guard;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGSEGV, &action, &old)) return 80;
+    char *area = mmap(NULL, 6 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 81;
+    /* Its own VMA, apart from any other mapping. */
+    munmap(area, page);
+    munmap(area + 5 * page, page);
+    char *p = area + page;
+    for (int i = 0; i < 4; i++) p[i * page] = 'a' + i;
+    long install = advice_errno(madvise(p + page, 2 * page, MADV_GUARD_INSTALL));
+    printf("install=%ld vmas=%d\n", install, advice_vmas(p, p + 4 * page));
+    printf("read: %s\nwrite: %s\nafter: %s\n", guard_touch(a, p + page, 0),
+           guard_touch(b, p + 2 * page + 5, 1), guard_touch(c, p + 3 * page, 0));
+    int pipes[2];
+    if (pipe(pipes)) return 82;
+    long from = advice_errno(write(pipes[1], p + page, 1));
+    /* Room for any working directory, so that the copy is what fails. */
+    long into = advice_errno(syscall(SYS_getcwd, p + page, 4096L));
+    printf("write-from=%ld getcwd-into=%ld\n", from, into);
+    /* Installing again keeps them; MADV_DONTNEED leaves them. */
+    long again = advice_errno(madvise(p + 2 * page, 2 * page, MADV_GUARD_INSTALL));
+    long dontneed = advice_errno(madvise(p, 4 * page, MADV_DONTNEED));
+    printf("again=%ld dontneed=%ld guard: %s first: %s\n", again, dontneed,
+           guard_touch(a, p + 3 * page, 0), guard_touch(b, p, 0));
+    /* A populating mlock cannot fault a guard page in. */
+    long locked = advice_errno(mlock(p, 4 * page));
+    long onfault = advice_errno(syscall(SYS_mlock2, p, 4 * page, 1L));
+    long unlocked = advice_errno(munlock(p, 4 * page));
+    long populate = advice_errno(madvise(p, 4 * page, 22));
+    printf("mlock=%ld onfault=%ld munlock=%ld populate=%ld\n", locked, onfault, unlocked, populate);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 83;
+    if (child == 0) {
+        printf("child: guard: %s first: %s\n", guard_touch(a, p + page, 0), guard_touch(b, p, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 84;
+    /* Removing one leaves a page without contents. */
+    long removed = advice_errno(madvise(p + 3 * page, page, MADV_GUARD_REMOVE));
+    printf("remove=%ld removed: %s kept: %s\n", removed, guard_touch(a, p + 3 * page, 0),
+           guard_touch(b, p + page, 0));
+    /* MADV_WIPEONFORK leaves the child no guard. */
+    long wipe = advice_errno(madvise(p, 4 * page, MADV_WIPEONFORK));
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 85;
+    if (child == 0) {
+        printf("wiped child: %s\n", guard_touch(a, p + page, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 86;
+    long keep = advice_errno(madvise(p, 4 * page, MADV_KEEPONFORK));
+    printf("wipe=%ld keep=%ld parent: %s\n", wipe, keep, guard_touch(a, p + page, 0));
+    /* mremap moves them with the pages; MREMAP_DONTUNMAP leaves none. */
+    char *to = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (to == MAP_FAILED) return 87;
+    char *moved = mremap(p, 4 * page, 4 * page, MREMAP_MAYMOVE | MREMAP_FIXED, to);
+    printf("moved=%d guard: %s free: %s\n", moved == to, guard_touch(a, to + page, 0),
+           guard_touch(b, to + 3 * page, 0));
+    char *kept = mremap(to, 4 * page, 4 * page, MREMAP_MAYMOVE | 4, NULL);
+    if (kept == MAP_FAILED) return 88;
+    printf("dontunmap old: %s new: %s\n", guard_touch(a, to + page, 0),
+           guard_touch(b, kept + page, 0));
+    /* A hole is ENOMEM once the rest has its guards. */
+    char *h = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (h == MAP_FAILED) return 89;
+    munmap(h + page, page);
+    long hole = advice_errno(madvise(h, 3 * page, MADV_GUARD_INSTALL));
+    printf("hole=%ld after-hole: %s\n", hole, guard_touch(a, h + 2 * page, 0));
+    /* process_madvise may put them in its own process. */
+    int self = syscall(SYS_pidfd_open, getpid(), 0);
+    struct iovec iov = {h, page};
+    long advised = advice_errno(syscall(440, self, &iov, 1L, (long)MADV_GUARD_INSTALL, 0U));
+    printf("process-madvise=%ld %s\n", advised, guard_touch(a, h, 0));
+    /* A file's pages come back from the file, a private copy dropped. */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-guard-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || pwrite(fd, "f", 1, 0) != 1 || ftruncate(fd, page)) return 90;
+    char *copy = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    char *file = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (copy == MAP_FAILED || file == MAP_FAILED) return 91;
+    copy[0] = 'w';
+    file[1] = 's';
+    long copy_guard = advice_errno(madvise(copy, page, MADV_GUARD_INSTALL));
+    long file_guard = advice_errno(madvise(file, page, MADV_GUARD_INSTALL));
+    printf("private-file=%ld shared-file=%ld %s %s\n", copy_guard, file_guard,
+           guard_touch(a, copy, 0), guard_touch(b, file + 1, 0));
+    madvise(copy, page, MADV_GUARD_REMOVE);
+    madvise(file, page, MADV_GUARD_REMOVE);
+    printf("private-file: %s shared-file: %s\n", guard_touch(a, copy, 0), guard_touch(b, file + 1, 0));
+    /* Sealed memory that may not be written takes none, but loses them. */
+    char *ro = mmap(NULL, page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ro == MAP_FAILED) return 92;
+    long sealed = advice_errno(syscall(462, ro, page, 0L));
+    long sealed_install = advice_errno(madvise(ro, page, MADV_GUARD_INSTALL));
+    long sealed_remove = advice_errno(madvise(ro, page, MADV_GUARD_REMOVE));
+    printf("sealed=%ld install=%ld remove=%ld\n", sealed, sealed_install, sealed_remove);
+    /* An AIO ring is not memory core mm backs (VM_DONTEXPAND). */
+    unsigned long ring = 0;
+    if (syscall(SYS_io_setup, 1L, &ring)) return 93;
+    long ring_install = advice_errno(madvise((void *)ring, page, MADV_GUARD_INSTALL));
+    long ring_remove = advice_errno(madvise((void *)ring, page, MADV_GUARD_REMOVE));
+    printf("aio-ring install=%ld remove=%ld\n", ring_install, ring_remove);
+    syscall(SYS_io_destroy, ring);
+    sigaction(SIGSEGV, &old, NULL);
+    return 0;
+}
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
  * timers are only read here, before any is armed (cpu_itimer_case arms them). */
 static int itimer_case(void) {
@@ -6650,6 +6862,86 @@ static int cpu_timer_case(void) {
     v = ct_get(ct_thread_timer);
     printf("gone set=%ld now=%ld %ld delete=%ld\n", set_result, ct_ns(v.it_interval),
            ct_ns(v.it_value), syscall(SYS_timer_delete, (long)ct_thread_timer));
+    return 0;
+}
+/* clock_nanosleep on the process's CPU clock: it ends once the process's
+ * threads have used the time, and a signal ends it with EINTR. What is
+ * printed holds whatever the speed. */
+static long cs_sleep(clockid_t clock, int flags, long ns, struct timespec *rem) {
+    struct timespec t = {ns / 1000000000L, ns % 1000000000L};
+    return syscall(SYS_clock_nanosleep, (long)clock, (long)flags, &t, rem) ? -errno : 0;
+}
+static void *cs_spin(void *arg) {
+    struct timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    long end = ct_ns(t) + (long)arg;
+    do {
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    } while (ct_ns(t) < end);
+    return NULL;
+}
+static void cs_alarm(int sig) { (void)sig; }
+static void cs_alarm_in(long us) {
+    struct itimerval it = {{0, 0}, {0, us}};
+    setitimer(ITIMER_REAL, &it, NULL);
+}
+static int cpu_sleep_case(void) {
+    /* A time that has passed, and nothing to sleep: at once, with the
+       time left untouched. */
+    struct timespec rem = {7, 7};
+    long past = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, 1, &rem);
+    long zero = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, 0, 0, &rem);
+    printf("past=%ld zero=%ld rem=%ld %ld\n", past, zero, (long)rem.tv_sec, rem.tv_nsec);
+    /* The thread's clock cannot sleep; bad requests on the process's. */
+    struct timespec negative = {-1, 0}, wide = {0, 1000000000L}, one = {0, 1};
+    printf("thread=%ld negative=%ld wide=%ld fault=%ld\n",
+           syscall(SYS_clock_nanosleep, (long)CLOCK_THREAD_CPUTIME_ID, 0L, &one, NULL)
+               ? -errno
+               : 0L,
+           syscall(SYS_clock_nanosleep, (long)CLOCK_PROCESS_CPUTIME_ID, 0L, &negative, NULL)
+               ? -errno
+               : 0L,
+           syscall(SYS_clock_nanosleep, (long)CLOCK_PROCESS_CPUTIME_ID, 0L, &wide, NULL)
+               ? -errno
+               : 0L,
+           syscall(SYS_clock_nanosleep, (long)CLOCK_PROCESS_CPUTIME_ID, 0L, (void *)8, NULL)
+               ? -errno
+               : 0L);
+    /* Another thread's work ends a relative sleep and an absolute one. */
+    pthread_t thread;
+    long start = cit_cpu();
+    if (pthread_create(&thread, NULL, cs_spin, (void *)100000000L)) return 1;
+    long relative = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, 0, 30000000L, NULL);
+    long used = cit_cpu() - start;
+    pthread_join(thread, NULL);
+    printf("worker relative=%ld used-enough=%d\n", relative, used >= 30000000L);
+    long deadline = cit_cpu() + 30000000L;
+    if (pthread_create(&thread, NULL, cs_spin, (void *)100000000L)) return 1;
+    long absolute = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, deadline, NULL);
+    long reached = cit_cpu() >= deadline;
+    pthread_join(thread, NULL);
+    printf("worker absolute=%ld reached=%ld\n", absolute, reached);
+    /* Alone, the process uses no CPU time while it sleeps: a signal with a
+       handler ends the sleep, with the time left for a relative one and
+       nothing written for an absolute one. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = cs_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    cs_alarm_in(20000);
+    rem.tv_sec = 7;
+    rem.tv_nsec = 7;
+    long interrupted = cs_sleep(CLOCK_PROCESS_CPUTIME_ID, 0, 10000000000L, &rem);
+    printf("signal relative=%ld left-in-range=%d\n", interrupted,
+           ct_ns(rem) > 9000000000L && ct_ns(rem) <= 10000000000L);
+    cs_alarm_in(20000);
+    rem.tv_sec = 7;
+    rem.tv_nsec = 7;
+    interrupted =
+        cs_sleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, cit_cpu() + 10000000000L, &rem);
+    printf("signal absolute=%ld rem=%ld %ld\n", interrupted, (long)rem.tv_sec, rem.tv_nsec);
     return 0;
 }
 /* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
@@ -12001,6 +12293,55 @@ int main(int argc, char **argv) {
                 b.bytes[4] = 254;
                 nl_strict(fd, port, 26, 1, &b, "policy route main after");
             }
+            /* An address got by itself (RTM_GETADDR without a dump): only
+               IPv6 has one, by IFA_LOCAL or else IFA_ADDRESS, on any
+               device when no device has the index (Linux's fallback
+               tunnels may have small ones); strictly, nothing else in the
+               request. */
+            static const unsigned char one6[16] = {[15] = 1};
+            static const unsigned char other6[16] = {0xfd, [15] = 1};
+            static const unsigned char one4[4] = {127, 0, 0, 1};
+            struct nl_body g6 = nl_body(AF_INET6, 8);
+            b = g6;
+            nl_put(&b, 1, one6, 16);
+            nl_strict(fd, port, 22, 0, &b, "get addr6");
+            struct nl_body by_one = b;
+            index = 1;
+            memcpy(b.bytes + 4, &index, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 index");
+            index = 1000000;
+            memcpy(b.bytes + 4, &index, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 no such index");
+            b = g6;
+            nl_put(&b, 1, other6, 16);
+            nl_put(&b, 2, one6, 16);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 local");
+            b = g6;
+            nl_put(&b, 1, one6, 16);
+            nl_put(&b, 2, other6, 16);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 missing");
+            nl_strict(fd, port, 22, 0, &g6, "get addr6 none");
+            b = nl_body(AF_INET6, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 short header");
+            b = g6;
+            nl_put(&b, 1, one6, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr6 short address");
+            b = by_one;
+            b.bytes[1] = 128;
+            nl_strict(fd, port, 22, 0, &b, "get addr6 prefix");
+            struct nl_body flagged6 = by_one;
+            nl_put32(&flagged6, 8, 0);
+            nl_strict(fd, port, 22, 0, &flagged6, "get addr6 flags");
+            struct nl_body netnsid6 = by_one;
+            nl_put32(&netnsid6, 10, 12345);
+            nl_strict(fd, port, 22, 0, &netnsid6, "get addr6 netnsid");
+            b = nl_body(AF_INET, 8);
+            nl_put(&b, 2, one4, 4);
+            nl_strict(fd, port, 22, 0, &b, "get addr4");
+            b = nl_body(45, 8);
+            nl_strict(fd, port, 22, 0, &b, "get addr mctp");
+            b = nl_body(0, 8);
+            nl_strict(fd, port, 22, 0, &b, "get addr unspec");
             /* Unchecked: an old rtgenmsg with IFLA_EXT_MASK after its 4
                bytes, IFLA_MASTER and IFLA_TARGET_NETNSID, and RTM_F_PREFIX. */
             int loose = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
@@ -12019,6 +12360,12 @@ int main(int argc, char **argv) {
             b = nl_body(0, 16);
             nl_put(&b, 3, "lo", 3);
             nl_strict(loose, name.pid, 18, 1, &b, "loose link name");
+            b = by_one;
+            b.bytes[1] = 128;
+            b.bytes[3] = 254;
+            nl_put32(&b, 8, 0);
+            nl_strict(loose, name.pid, 22, 0, &b, "loose get addr6 prefix flags");
+            nl_strict(loose, name.pid, 22, 0, &netnsid6, "loose get addr6 netnsid");
             link = (struct nl_link){.index = -1};
             b = nl_body(0, 16);
             memcpy(b.bytes, &link, 16);
@@ -21123,6 +21470,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
+    if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();
@@ -21136,6 +21484,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
+    if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {
         struct itimerval v;
         syscall(SYS_getitimer, 1L, &v);

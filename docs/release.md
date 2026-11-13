@@ -62,10 +62,7 @@ module names of a Wasm module on publish (denoland/deno#34549): `env` became
 import object, so that version was deleted (denoland/deno#37171). JSR keeps
 that upload's successful publishing task, which refuses every later upload of
 0.15.0 (`duplicateVersionPublish`; `deno publish` then exits 0 without
-uploading), so 0.15.0 is released without JSR: `JSR_SKIPPED_VERSIONS` in
-`scripts/release/check.py` makes the publish job verify the crates and npm and
-skip JSR for it. That exception is to be removed once a later version is on
-JSR. Every query
+uploading), so 0.15.0 was released without JSR. Every query
 of a JSR version's metadata carries a fresh `?uncached=` query, because the
 CDN in front of jsr.io keeps `<version>_meta.json` for a year: the deleted
 0.15.0 still answered 200 from it. A mock upload test is not a registry or

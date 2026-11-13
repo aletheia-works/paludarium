@@ -192,13 +192,16 @@ mod tests {
 
     #[test]
     fn a_refused_connection_fails() {
-        let address = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        // The local port of a connection this test holds open: nothing
+        // listens on it, and while it is held no other test can be given
+        // it, as one could a port freed before connecting.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let address = held.local_addr().unwrap();
         let stream = connect(address).unwrap();
         until(|| stream.phase() != Phase::Connecting);
         assert_eq!(stream.phase(), Phase::Failed(Errno(111)));
+        drop((held, listener));
     }
 
     #[test]

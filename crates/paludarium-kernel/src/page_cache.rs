@@ -633,6 +633,10 @@ impl FilePages {
             name,
         })
     }
+    /// The open file the mapping was made of.
+    pub(crate) fn file(&self) -> &Arc<dyn FileHandle> {
+        &self.file
+    }
 }
 
 impl paludarium_mmu::PageSource for FilePages {
@@ -674,6 +678,9 @@ impl paludarium_mmu::PageSource for FilePages {
     }
     fn open_file(&self) -> usize {
         Arc::as_ptr(&self.file).cast::<()>() as usize
+    }
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
     }
 }
 

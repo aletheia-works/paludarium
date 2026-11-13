@@ -1888,6 +1888,7 @@ fn is_zero_device(file: &dyn FileHandle) -> bool {
 }
 
 const MADV_DONTNEED: u64 = 4;
+const MADV_REMOVE: u64 = 9;
 const MADV_FREE: u64 = 8;
 const MADV_POPULATE_READ: u64 = 22;
 const MADV_POPULATE_WRITE: u64 = 23;
@@ -2036,7 +2037,7 @@ fn sys_get_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    match advise(c.mem, a[0], a[1], a[2]) {
+    match advise(c.mem, &c.process.credentials, a[0], a[1], a[2]) {
         Ok(()) => ok(0),
         Err(e) => err(e),
     }
@@ -2053,10 +2054,18 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// `MADV_POPULATE_WRITE` ([`populate`]); and the flags `fork` and core
 /// dumps look at, `MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK`,
 /// `MADV_KEEPONFORK`, `MADV_DONTDUMP` and `MADV_DODUMP`
-/// ([`AddressSpace::advise_flags`]). The others are rejected rather than
-/// ignored, so that a guest relying on one of them notices.
-pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Result<(), Errno> {
-    if !matches!(advice, 0..=4 | 8 | 10..=24) {
+/// ([`AddressSpace::advise_flags`]); and `MADV_REMOVE`, which frees shared
+/// memory as a hole punched in its file ([`remove`]). The others are
+/// rejected rather than ignored, so that a guest relying on one of them
+/// notices.
+pub(crate) fn advise(
+    mem: &AddressSpace,
+    credentials: &credentials::Credentials,
+    addr: u64,
+    len: u64,
+    advice: u64,
+) -> Result<(), Errno> {
+    if !matches!(advice, 0..=4 | 8..=24) {
         return Err(Errno::EINVAL);
     }
     if addr & 4095 != 0 {
@@ -2076,6 +2085,13 @@ pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Re
     }
     if advice == MADV_DONTNEED || advice == MADV_DONTNEED_LOCKED {
         return mem.discard_shared(GuestAddr(addr), length);
+    }
+    if advice == MADV_REMOVE {
+        let (removals, hole) = mem.removals(GuestAddr(addr), end);
+        for removal in removals {
+            remove(credentials, &removal?)?;
+        }
+        return if hole { Err(Errno::ENOMEM) } else { Ok(()) };
     }
     let flag = match advice {
         10 => Some(paludarium_mmu::FlagAdvice::DontFork),
@@ -2110,6 +2126,34 @@ pub(crate) fn advise(mem: &AddressSpace, addr: u64, len: u64, advice: u64) -> Re
     } else {
         Ok(())
     }
+}
+
+/// Frees what `MADV_REMOVE` found in a VMA, as Linux's `madvise_remove`
+/// punches a hole in the VMA's file: in a file's page cache as `fallocate`
+/// would ([`crate::files::punch_hole`]); in shared anonymous memory and a
+/// System V segment, whose files are tmpfs's, by zeroing its pages. Any
+/// other file has no `fallocate` (`EOPNOTSUPP`).
+fn remove(
+    credentials: &credentials::Credentials,
+    removal: &paludarium_mmu::Removal,
+) -> Result<(), Errno> {
+    let Some(source) = removal.pages.source() else {
+        removal
+            .pages
+            .zero(removal.offset, removal.offset.wrapping_add(removal.len));
+        return Ok(());
+    };
+    let any = source.as_any().ok_or(Errno::EOPNOTSUPP)?;
+    if let Some(pages) = any.downcast_ref::<crate::page_cache::FilePages>() {
+        return crate::files::punch_hole(credentials, pages.file(), removal.offset, removal.len);
+    }
+    if any.is::<crate::shm::Attachment>() {
+        removal
+            .pages
+            .zero(removal.offset, removal.offset.wrapping_add(removal.len));
+        return Ok(());
+    }
+    Err(Errno::EOPNOTSUPP)
 }
 
 /// `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` of `[addr, end)`, as

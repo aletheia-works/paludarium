@@ -6490,6 +6490,43 @@ mod madvise_advice {
     use super::*;
     const AREA: u64 = DATA + 0x10_0000;
     const PAGE: u64 = 4096;
+    #[test]
+    fn remove_frees_shared_memory_and_punches_its_file() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        // Shared anonymous memory reads as zeros again, past the range not.
+        let shared = f.ret(mmap, &[0, 2 * PAGE, 3, 0x21, u64::MAX, 0]);
+        f.mem.write(GuestAddr(shared), b"ab").unwrap();
+        f.mem.write(GuestAddr(shared + PAGE), b"c").unwrap();
+        assert_eq!(f.ret(28, &[shared, PAGE, 9]), 0);
+        assert_eq!(memory_bytes(&f, shared, 2), b"\0\0");
+        assert_eq!(memory_bytes(&f, shared + PAGE, 1), b"c");
+        // A shared file mapping punches a hole in the file.
+        f.mem.write(GuestAddr(DATA), b"/file\0hello").unwrap();
+        let fd = f.ret(2, &[DATA, 66, 0o600]);
+        assert_eq!(f.ret(1, &[fd, DATA + 6, 5]), 5);
+        assert_eq!(f.ret(77, &[fd, 2 * PAGE]), 0);
+        let at = f.ret(mmap, &[0, 2 * PAGE, 3, 1, fd, 0]);
+        f.mem.write(GuestAddr(at + PAGE), b"x").unwrap();
+        assert_eq!(f.ret(28, &[at, PAGE, 9]), 0);
+        assert_eq!(memory_bytes(&f, at, 5), b"\0\0\0\0\0");
+        assert_eq!(file_bytes(&mut f, fd, 0, 5), b"\0\0\0\0\0");
+        assert_eq!(memory_bytes(&f, at + PAGE, 1), b"x");
+        // Memory of no file, and a file's memory not shared or not
+        // writable through its file, are refused.
+        let private = f.ret(mmap, &[0, PAGE, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(f.ret(28, &[private, PAGE, 9]), errno(Errno::EINVAL));
+        let copy = f.ret(mmap, &[0, PAGE, 3, 2, fd, 0]);
+        assert_eq!(f.ret(28, &[copy, PAGE, 9]), errno(Errno::EACCES));
+        let read_only = f.ret(2, &[DATA, 0, 0]);
+        let seen = f.ret(mmap, &[0, PAGE, 1, 1, read_only, 0]);
+        assert_eq!(f.ret(28, &[seen, PAGE, 9]), errno(Errno::EACCES));
+        // A hole is ENOMEM once the rest is freed.
+        f.mem.write(GuestAddr(shared + PAGE), b"d").unwrap();
+        assert_eq!(f.ret(11, &[shared, PAGE]), 0);
+        assert_eq!(f.ret(28, &[shared, 2 * PAGE, 9]), errno(Errno::ENOMEM));
+        assert_eq!(memory_bytes(&f, shared + PAGE, 1), b"\0");
+    }
     fn status(f: &mut Fixture, at: u64) -> i32 {
         f.mem.write_u64(GuestAddr(DATA + 0x200), at).unwrap();
         assert_eq!(f.ret(279, &[0, 1, DATA + 0x200, 0, DATA + 0x300, 0]), 0);
@@ -6519,9 +6556,9 @@ mod madvise_advice {
             assert_eq!(f.ret(28, &[AREA, 2 * PAGE, advice]), 0, "{advice}");
             assert_eq!(f.ret(28, &[AREA, 3 * PAGE, advice]), errno(Errno::ENOMEM));
         }
-        // Still refused: MADV_REMOVE, MADV_COLLAPSE, the guard and memory
-        // failure advice, and unknown ones.
-        for advice in [9, 25, 100, 101, 102, 103, 26] {
+        // Still refused: MADV_COLLAPSE, the guard and memory failure
+        // advice, and unknown ones.
+        for advice in [25, 100, 101, 102, 103, 26] {
             assert_eq!(
                 f.ret(28, &[AREA, PAGE, advice]),
                 errno(Errno::EINVAL),

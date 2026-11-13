@@ -796,6 +796,11 @@ impl SharedPages {
             ..self.clone()
         }
     }
+    /// The file of a page cache, if these pages are one.
+    #[must_use]
+    pub fn source(&self) -> Option<&Arc<dyn PageSource>> {
+        self.source.as_ref()
+    }
     /// The same memory, read from `source` where a page has no contents and
     /// ending where the file does.
     #[must_use]
@@ -1089,6 +1094,19 @@ pub trait PageSource: Send + Sync {
     fn merges(&self) -> bool {
         true
     }
+    /// The source itself, for the kernel to tell its kinds apart.
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
+}
+/// The shared memory `MADV_REMOVE` frees in one VMA of its range
+/// ([`AddressSpace::removals`]): `len` bytes of `pages` from `offset`, the
+/// offset in its file for a file's page cache.
+#[derive(Clone)]
+pub struct Removal {
+    pub pages: SharedPages,
+    pub offset: u64,
+    pub len: u64,
 }
 /// The file behind `[start, end)` of a private file mapping: the page at
 /// `page` holds the file from `page + shift` (wrapping), so that a move by
@@ -3184,6 +3202,43 @@ impl AddressSpaceData {
         Ok(())
     }
 
+    /// What `MADV_REMOVE` of `[addr, end)` frees, VMA by VMA as Linux's
+    /// `madvise_walk_vmas` goes, as Linux's `madvise_remove` checks each:
+    /// memory of no file is `EINVAL`, and a VMA that is not shared or may
+    /// not be written (`VM_MAYWRITE`) `EACCES`; the walk stops at the first
+    /// of those. Whether the range has a hole, which is `ENOMEM` after the
+    /// rest, comes with them.
+    fn removals(&self, addr: u64, end: u64) -> (Vec<Result<Removal, Errno>>, bool) {
+        let mut found = Vec::new();
+        let mut covered = addr;
+        let mut hole = false;
+        for (&start, m) in self.mappings.range(..end).filter(|(_, m)| m.end() > addr) {
+            hole |= start > covered;
+            covered = covered.max(m.end());
+            let (from, to) = (start.max(addr), m.end().min(end));
+            let removal = match self.shared_at(start) {
+                Some(shared) if shared.may_write => Ok(Removal {
+                    pages: shared.pages.clone(),
+                    offset: from.wrapping_add(shared.shift),
+                    len: to - from,
+                }),
+                Some(_) => Err(Errno::EACCES),
+                None if matches!(m.kind, MappingKind::File | MappingKind::ElfSegment)
+                    || self.backing_at(start).is_some() =>
+                {
+                    Err(Errno::EACCES)
+                }
+                None => Err(Errno::EINVAL),
+            };
+            let failed = removal.is_err();
+            found.push(removal);
+            if failed {
+                return (found, false);
+            }
+        }
+        (found, hole || covered < end)
+    }
+
     /// `madvise` of `advice` over `[addr, end)`, as Linux's
     /// `madvise_walk_vmas` changes the flags of its VMAs in turn: a VMA that
     /// may not take the advice ends it with `EINVAL`, after those before
@@ -4320,6 +4375,12 @@ impl AddressSpace {
     /// See [`AddressSpaceData::seal`].
     pub fn seal_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().seal(addr, len)
+    }
+    /// See [`AddressSpaceData::removals`]: the memory to free, which the
+    /// kernel frees with the lock released, as its file may take time.
+    #[must_use]
+    pub fn removals(&self, addr: GuestAddr, end: u64) -> (Vec<Result<Removal, Errno>>, bool) {
+        self.locked().removals(addr.0, end)
     }
     /// See [`AddressSpaceData::advise_flags`].
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {

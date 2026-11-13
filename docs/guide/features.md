@@ -789,7 +789,14 @@ kernel.
   `MADV_DONTFORK` marked, and a mapping `MADV_WIPEONFORK` marked without
   its pages, as new zero-filled memory; it keeps that flag and
   `MADV_DONTDUMP`. A core dump holds nothing of a mapping `MADV_DONTDUMP`
-  marked. Other advice gives `EINVAL`.
+  marked. `MADV_REMOVE` frees shared memory as a hole punched in its file
+  (`fallocate` with `FALLOC_FL_PUNCH_HOLE`), so that the range reads as
+  zeros in every mapping of it: shared anonymous memory, a System V
+  segment, or a file mapped shared through a description that may write
+  it, even read-only (`VM_MAYWRITE`). Memory of no file gives `EINVAL`, a
+  private or read-only file mapping `EACCES`, and the file's own checks
+  their errors, VMA by VMA as the other advice goes. Other advice gives
+  `EINVAL`.
 - `process_madvise` advises each range of its iovecs in turn, of the caller's
   memory (`PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP`, or a pidfd of its
   own process or of one sharing its memory) as `madvise` does, and gives the

@@ -21,6 +21,7 @@
 #include <sys/ioctl.h>
 #include <stddef.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
 #include <sys/sendfile.h>
 #include <sys/resource.h>
 #include <sys/vfs.h>
@@ -6221,6 +6222,61 @@ static int mrelease_case(void) {
     if (waitpid(child, NULL, 0) != child) return 84;
     long reaped = mrelease_errno(pidfd, 0);
     printf("reaped=%ld\n", reaped);
+    return 0;
+}
+/* MADV_REMOVE frees shared memory, as a hole punched in its file: shared
+ * anonymous memory, a System V segment and a shared file mapping read as
+ * zeros there again; private memory and read-only sharing are refused. */
+static int madvise_remove_case(void) {
+    long page = 4096;
+    char *shared = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    char *private = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED || private == MAP_FAILED) return 80;
+    shared[0] = 1;
+    shared[page] = 2;
+    long anonymous = advice_errno(madvise(shared, page, MADV_REMOVE));
+    printf("shared=%ld bytes=%d %d\n", anonymous, shared[0], shared[page]);
+    long none = advice_errno(madvise(private, page, MADV_REMOVE));
+    printf("private=%ld\n", none);
+    int segment = shmget(IPC_PRIVATE, page, IPC_CREAT | 0600);
+    if (segment < 0) return 81;
+    char *attached = shmat(segment, NULL, 0);
+    shmctl(segment, IPC_RMID, NULL);
+    if (attached == (void *)-1) return 82;
+    attached[5] = 3;
+    long sysv = advice_errno(madvise(attached, page, MADV_REMOVE));
+    printf("sysv=%ld byte=%d\n", sysv, attached[5]);
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-remove-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    int read_only = open(path, O_RDONLY);
+    unlink(path);
+    if (fd < 0 || read_only < 0 || ftruncate(fd, 2 * page)) return 83;
+    char *file = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *copy = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    char *seen = mmap(NULL, page, PROT_READ, MAP_SHARED, read_only, 0);
+    char *readable = mmap(NULL, page, PROT_READ, MAP_SHARED, fd, 0);
+    if (file == MAP_FAILED || copy == MAP_FAILED || seen == MAP_FAILED || readable == MAP_FAILED)
+        return 84;
+    file[0] = 'a';
+    file[page] = 'b';
+    long punched = advice_errno(madvise(file, page, MADV_REMOVE));
+    char back[2] = {9, 9};
+    if (pread(fd, back, 1, 0) != 1 || pread(fd, back + 1, 1, page) != 1) return 85;
+    printf("file=%ld bytes=%d %d read=%d %c\n", punched, file[0], file[page], back[0], back[1]);
+    long private_file = advice_errno(madvise(copy, page, MADV_REMOVE));
+    long read_only_file = advice_errno(madvise(seen, page, MADV_REMOVE));
+    /* A read-only mapping of a file opened for writing may be made
+     * writable (VM_MAYWRITE), so it is punched. */
+    file[0] = 'c';
+    long may_write = advice_errno(madvise(readable, page, MADV_REMOVE));
+    printf("private-file=%ld read-only-file=%ld may-write=%ld byte=%d\n", private_file,
+           read_only_file, may_write, file[0]);
+    /* A hole is ENOMEM once the rest is freed. */
+    shared[page] = 4;
+    munmap(shared, page);
+    long hole = advice_errno(madvise(shared, 2 * page, MADV_REMOVE));
+    printf("hole=%ld byte=%d\n", hole, shared[page]);
     return 0;
 }
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
@@ -20795,6 +20851,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "memfd-secret")) return memfd_secret_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
+    if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();

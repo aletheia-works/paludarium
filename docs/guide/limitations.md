@@ -205,9 +205,11 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `madvise` refuses (`EINVAL`) `MADV_REMOVE`, `MADV_COLLAPSE`, the guard
-    regions (`MADV_GUARD_INSTALL`, `MADV_GUARD_REMOVE`) and `MADV_HWPOISON`
-    and `MADV_SOFT_OFFLINE`, which Linux takes. `MADV_POPULATE_READ` and
+  - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, the guard regions
+    (`MADV_GUARD_INSTALL`, `MADV_GUARD_REMOVE`) and `MADV_HWPOISON` and
+    `MADV_SOFT_OFFLINE`, which Linux takes. `MADV_REMOVE` frees the memory
+    of a locked mapping too, where Linux gives `EINVAL`, as no mapping here
+    is locked apart. `MADV_POPULATE_READ` and
     `MADV_POPULATE_WRITE` bring in the pages of a `memfd_secret` mapping,
     where Linux gives `EINVAL`.
   - `process_madvise` takes for the caller's own memory only the advice

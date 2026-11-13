@@ -1760,6 +1760,44 @@ fn fallocate(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     crate::permissions::remove_set_ids(&c.process.credentials, &*d.file);
     Ok(0)
 }
+/// `fallocate` of `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE` over
+/// `[offset, offset + len)` of `file`, as `madvise(MADV_REMOVE)` asks
+/// Linux's vfs_fallocate for it, with [`fallocate`]'s checks in its order.
+pub(crate) fn punch_hole(
+    credentials: &crate::credentials::Credentials,
+    file: &Arc<dyn FileHandle>,
+    offset: u64,
+    len: u64,
+) -> Result<(), Errno> {
+    if file.flags() & 3 == 0 {
+        return Err(Errno::EBADF);
+    }
+    let stat = file.stat()?;
+    if attributes::append_only(&stat) || attributes::immutable(&stat) {
+        return Err(Errno::EPERM);
+    }
+    match stat.mode & 0o170000 {
+        0o010000 => return Err(Errno::ESPIPE),
+        DIRECTORY => return Err(Errno::EISDIR),
+        REGULAR => {}
+        _ => return Err(Errno(19)), // ENODEV
+    }
+    if offset
+        .checked_add(len)
+        .is_none_or(|end| end > i64::MAX as u64)
+    {
+        return Err(Errno(27)); // EFBIG
+    }
+    let memfd = file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>());
+    if memfd.is_some_and(crate::memfd::Memfd::is_secret) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    file.zero_range(offset, len)?;
+    crate::permissions::remove_set_ids(credentials, &**file);
+    Ok(())
+}
 /// `close_range(first, last, flags)`, as Linux's ksys_close_range: the
 /// arguments are `unsigned int`s, numbers with no open descriptor are skipped,
 /// `CLOSE_RANGE_CLOEXEC` marks instead of closing, and `CLOSE_RANGE_UNSHARE`

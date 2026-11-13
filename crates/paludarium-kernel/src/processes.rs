@@ -3451,7 +3451,13 @@ impl Kernel {
                     Ok(())
                 } else {
                     match &target {
-                        None => crate::syscalls::advise(mem, start, len, advice as u64),
+                        None => crate::syscalls::advise(
+                            mem,
+                            &thread.state.credentials,
+                            start,
+                            len,
+                            advice as u64,
+                        ),
                         Some(memory) => Self::mapped_whole(memory, start, len),
                     }
                 };

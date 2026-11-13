@@ -101,7 +101,7 @@ impl Segment {
 }
 
 /// One `shmat`'s open file of a segment, which its shared mappings hold.
-struct Attachment {
+pub(crate) struct Attachment {
     id: i32,
     size: u64,
     /// The same size, which never changes, for the threads' TLBs to check
@@ -134,6 +134,9 @@ impl PageSource for Attachment {
     }
     fn name(&self) -> Option<Vec<u8>> {
         Some(self.name.to_vec())
+    }
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
     }
     /// Linux gives a segment's file the segment's ID as its inode.
     fn identity(&self) -> (u64, u64) {

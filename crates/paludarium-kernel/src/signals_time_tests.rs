@@ -262,9 +262,8 @@ fn cpu_clocks_of_tasks_by_number() {
     assert_eq!(nsleep(&mut f, 2, 8), errno(Errno::EFAULT));
     assert_eq!(nsleep(&mut f, cpu_clock_id(pid, true, 2), 8), errno(Errno::EFAULT));
     assert_eq!(nsleep(&mut f, cpu_clock_id(pid, true, 2), DATA), einval);
-    // A time that has come returns at once; one to wait for is not
-    // modelled.
-    assert_eq!(nsleep(&mut f, 2, DATA), einval);
+    // No such task; on the process's clock by number, a time that has come
+    // returns at once.
     assert_eq!(nsleep(&mut f, cpu_clock_id(0x0fff_fff0, false, 2), DATA), einval);
     timespec(&mut f, 0, 0);
     assert_eq!(nsleep(&mut f, 2, DATA), 0);
@@ -284,6 +283,57 @@ fn cpu_clocks_of_tasks_by_number() {
     assert_eq!(f.mem.read_u64(GuestAddr(id)).unwrap() as u32, 1);
     assert_eq!(create(&mut f, cpu_clock_id(0, false, 0)), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(id)).unwrap() as u32, 2);
+}
+/// The process's CPU clock sleeps until the process has used the time; this
+/// host counts wall time as CPU time.
+#[test]
+fn clock_nanosleep_on_the_process_cpu_clock() {
+    let mut f = fixture();
+    f.host.set_clock(paludarium_host::ClockId::Monotonic, 1_000_000_000);
+    // A time that has passed, and nothing to sleep: at once.
+    timespec(&mut f, 0, 0);
+    assert_eq!(f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[2, 1, DATA, 0]), 0);
+    assert_eq!(f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[2, 0, DATA, 0]), 0);
+    assert_eq!(
+        f.host.clock(paludarium_host::ClockId::Monotonic),
+        Ok(1_000_000_000)
+    );
+    // A relative sleep ends once the time is used, by the tick.
+    timespec(&mut f, 0, 2_500_000);
+    assert_eq!(f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[2, 0, DATA, 0]), 0);
+    assert_eq!(
+        f.host.clock(paludarium_host::ClockId::Monotonic),
+        Ok(1_003_000_000)
+    );
+    // Bad requests.
+    timespec(&mut f, -1, 0);
+    assert_eq!(
+        f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[2, 0, DATA, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[2, 0, 8, 0]),
+        errno(Errno::EFAULT)
+    );
+    // A signal ends it with the time left, and restart_syscall resumes it
+    // on the same clock.
+    timespec(&mut f, 2, 42);
+    f.host.interrupt_next_wait();
+    assert_eq!(
+        f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[2, 0, DATA, DATA + 16]),
+        errno(Errno(4))
+    );
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 16)).unwrap(), 2);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 24)).unwrap(), 42);
+    assert!(matches!(
+        f.thread.state.restart_block,
+        Some(signals::RestartBlock::Sleep {
+            clock: signals::SleepClock::ProcessCpu,
+            ..
+        })
+    ));
+    // The other threads account their CPU time only while it sleeps.
+    assert!(!f.kernel.group.cpu_timers_armed());
 }
 #[test]
 fn alarm_clocks_sleep_and_time_with_cap_wake_alarm() {

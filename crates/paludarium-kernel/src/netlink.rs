@@ -14,7 +14,8 @@
 //! `RTM_GETLINK` dump shows the loopback as IPv6 does, and an
 //! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table, and AF_MCTP
 //! ones the loopback's MCTP addresses and the MCTP routes; `RTM_GETLINK`
-//! without a dump answers for `lo` by index or name, and `RTM_GETROUTE`
+//! without a dump answers for `lo` by index or name, an AF_INET6
+//! `RTM_GETADDR` without one with an address of it, and `RTM_GETROUTE`
 //! without one looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and
 //! remove the loopback's IPv4, IPv6 and MCTP addresses, and
 //! `RTM_NEWROUTE` and `RTM_DELROUTE` IPv4, IPv6 and MCTP routes
@@ -317,6 +318,7 @@ const EBUSY: Errno = Errno(16);
 const EEXIST: Errno = Errno(17);
 const ENODEV: Errno = Errno(19);
 const ERANGE: Errno = Errno(34);
+const EADDRNOTAVAIL: Errno = Errno(99);
 const ENOTSOCK: Errno = Errno(88);
 const EMSGSIZE: Errno = Errno(90);
 const ENOPROTOOPT: Errno = Errno(92);
@@ -961,6 +963,13 @@ impl NetlinkSocket {
             return Ok(true);
         }
         match header.kind {
+            // Only IPv6 answers a single address (`inet6_rtm_getaddr`);
+            // IPv4 and MCTP have no `doit`, nor the `PF_UNSPEC` fallback.
+            RTM_GETADDR if family == AF_INET6 => {
+                let reply = address_get(&self.network, payload, header.seq, port, s.strict)?;
+                self.deliver(s, 0, 0, reply);
+                Ok(false)
+            }
             RTM_GETROUTE if matches!(family, AF_INET | AF_INET6) => {
                 lookup_check(payload, s.strict)?;
                 let reply = lookup(&self.network, payload, header.seq, port, sender.uid)?;
@@ -1865,6 +1874,56 @@ fn address_dump(
         messages.extend(mctp_addresses(network, payload, seq, port));
     }
     Ok(messages)
+}
+/// The `RTM_NEWADDR` of one IPv6 address of `lo`, as `inet6_rtm_getaddr`
+/// gives it to a request that is not a dump. As
+/// `inet6_rtm_valid_getaddr_req`, it is `EINVAL` for an `ifaddrmsg` short;
+/// then, strictly, `EINVAL` for a prefix length, flags or a scope, and
+/// `ifa_ipv6_policy`'s error, with `EINVAL` for an attribute but
+/// `IFA_ADDRESS`, `IFA_LOCAL` and `IFA_TARGET_NETNSID`; unchecked, the
+/// policy's error alone. `IFA_TARGET_NETNSID` is `EINVAL`, as no other
+/// namespace has an ID. The address is `IFA_LOCAL`'s, or else
+/// `IFA_ADDRESS`'s (`extract_addr`), and `EINVAL` with neither;
+/// `EADDRNOTAVAIL` when `lo` has it not. The index is not checked:
+/// `ipv6_get_ifaddr` looks on any device when none has it.
+fn address_get(
+    network: &Network,
+    payload: &[u8],
+    seq: u32,
+    port: u32,
+    strict: bool,
+) -> Result<Vec<u8>, Errno> {
+    if payload.len() < 8 {
+        return Err(Errno::EINVAL);
+    }
+    if strict && payload[1..4] != [0; 3] {
+        return Err(Errno::EINVAL);
+    }
+    let attributes = parse_policy(&payload[8..], &IFA6_POLICY, strict)?;
+    if strict
+        && attributes
+            .iter()
+            .any(|&(kind, _)| !matches!(kind, IFA_ADDRESS | IFA_LOCAL | IFA_TARGET_NETNSID))
+    {
+        return Err(Errno::EINVAL);
+    }
+    let by_kind = by_type(&attributes);
+    if by_kind.contains_key(&IFA_TARGET_NETNSID) {
+        return Err(Errno::EINVAL);
+    }
+    // The policy has made each at least 16 bytes long.
+    let wanted = by_kind
+        .get(&IFA_LOCAL)
+        .or_else(|| by_kind.get(&IFA_ADDRESS))
+        .and_then(|value| value.first_chunk::<16>())
+        .map(|octets| core::net::Ipv6Addr::from(*octets))
+        .ok_or(Errno::EINVAL)?;
+    let addresses = network.addresses().v6.clone();
+    let address = addresses
+        .iter()
+        .find(|address| address.address == wanted)
+        .ok_or(EADDRNOTAVAIL)?;
+    Ok(ipv6_address(address, false, RTM_NEWADDR, 0, seq, port))
 }
 /// Strictly, an MCTP address dump (`mctp_dump_addrinfo`) needs a whole
 /// `ifaddrmsg` (`EINVAL`), and nothing else: its index only narrows it,
@@ -4217,6 +4276,69 @@ mod tests {
         for bad in [&[0][..], &[0, 8, 0, 0, 0, 0, 0, 0], &label] {
             let found = address_dump(&network, bad, 0, 1, 7, true, &mut 0);
             assert_eq!(found, Err(Errno::EINVAL));
+        }
+    }
+
+    #[test]
+    fn an_ipv6_address_is_got_by_itself() {
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true);
+        let one = core::net::Ipv6Addr::LOCALHOST.octets();
+        let request = |index: u32, attributes: &[(u16, &[u8])]| {
+            let mut payload = vec![AF_INET6, 0, 0, 0];
+            payload.extend_from_slice(&index.to_le_bytes());
+            for &(kind, value) in attributes {
+                attribute(&mut payload, kind, value);
+            }
+            payload
+        };
+        // The dump's message, but for its flags; any index finds it.
+        let dumped = ipv6_message(&network, 3, 7).remove(0);
+        for (index, strict) in [(0, true), (1, true), (9, true), (9, false)] {
+            let got = address_get(
+                &network,
+                &request(index, &[(IFA_ADDRESS, &one)]),
+                3,
+                7,
+                strict,
+            );
+            let got = got.unwrap();
+            assert_eq!(Header::read(&got).flags, 0);
+            assert_eq!((&got[..6], &got[8..]), (&dumped[..6], &dumped[8..]));
+        }
+        // IFA_LOCAL is the address, before IFA_ADDRESS.
+        let other = core::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).octets();
+        let local = request(0, &[(IFA_ADDRESS, &other), (IFA_LOCAL, &one)]);
+        assert!(address_get(&network, &local, 3, 7, true).is_ok());
+        let missing = request(0, &[(IFA_ADDRESS, &one), (IFA_LOCAL, &other)]);
+        assert_eq!(
+            address_get(&network, &missing, 3, 7, true),
+            Err(EADDRNOTAVAIL)
+        );
+        // With neither, a short header or another namespace: EINVAL;
+        // a short address is the policy's ERANGE.
+        let netnsid = request(
+            0,
+            &[
+                (IFA_ADDRESS, &one),
+                (IFA_TARGET_NETNSID, &0i32.to_le_bytes()),
+            ],
+        );
+        for strict in [true, false] {
+            for bad in [&request(0, &[])[..], &[AF_INET6, 0, 0, 0], &netnsid] {
+                assert_eq!(address_get(&network, bad, 3, 7, strict), Err(Errno::EINVAL));
+            }
+            let short = request(0, &[(IFA_ADDRESS, &one[..4])]);
+            assert_eq!(address_get(&network, &short, 3, 7, strict), Err(ERANGE));
+        }
+        // Strictly, a prefix length, flags, a scope or another attribute is
+        // EINVAL; unchecked, they are taken.
+        let mut prefixed = request(0, &[(IFA_ADDRESS, &one)]);
+        prefixed[1] = 128;
+        let flagged = request(0, &[(IFA_ADDRESS, &one), (IFA_FLAGS, &0u32.to_le_bytes())]);
+        for loose in [&prefixed, &flagged] {
+            assert_eq!(address_get(&network, loose, 3, 7, true), Err(Errno::EINVAL));
+            assert!(address_get(&network, loose, 3, 7, false).is_ok());
         }
     }
 

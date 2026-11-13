@@ -24,9 +24,8 @@ release PR をマージするかどうかだけです。詳しい手順と、す
    なり、JSR の 0.15.0 の `paludarium.wasm` は import オブジェクトで読み込めなくなったので、
    その版は削除しました（denoland/deno#37171）。JSR はそのときの成功した公開タスクを残すので、
    0.15.0 をもう一度アップロードしても断られます（`duplicateVersionPublish`。`deno publish` は
-   アップロードせずに終了コード 0 で終わります）。そこで 0.15.0 は JSR なしでリリースします。
-   `scripts/release/check.py` の `JSR_SKIPPED_VERSIONS` により、publish job はその版の crate と
-   npm を確かめ、JSR を飛ばします。この例外は、後の版が JSR に出たら削除します。また、jsr.io の前の CDN は版のメタデータ
+   アップロードせずに終了コード 0 で終わります）。そのため 0.15.0 は JSR なしでリリースしました。
+   また、jsr.io の前の CDN は版のメタデータ
    （`<version>_meta.json`）を 1 年キャッシュし、削除した 0.15.0 も 200 を返し続けたので、
    JSR の版のメタデータは毎回新しい `?uncached=` のクエリを付けて問い合わせます。
 5. **タグ**：すべての公開が成功した後で、最後にタグと GitHub Release を作ります。

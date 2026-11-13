@@ -267,7 +267,10 @@ mod linux {
             let host = Arc::new(RecordingHost::new());
             // Their timers and limits wait for CPU time, which the virtual
             // clock does not pass.
-            if mode == "cpu-itimer" || mode == "rlimit-cpu" || mode == "cpu-timer" {
+            if matches!(
+                mode,
+                "cpu-itimer" | "rlimit-cpu" | "cpu-timer" | "cpu-sleep"
+            ) {
                 host.measure_cpu_time();
             }
             let session = Session::new(config, host.clone()).unwrap();
@@ -327,6 +330,7 @@ mod linux {
         processes_madvise_advice => ("madvise-advice","process"),
         processes_madvise_fork => ("madvise-fork","process"),
         processes_madvise_remove => ("madvise-remove","process"),
+        processes_madvise_guard => ("madvise-guard","process"),
         processes_mrelease => ("mrelease","process"),
         processes_mempolicy => ("mempolicy","process"),
         processes_memfd_secret => ("memfd-secret","process"),
@@ -538,6 +542,7 @@ mod linux {
         processes_cpu_itimer => ("cpu-itimer","process"),
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),
+        processes_cpu_sleep => ("cpu-sleep","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         vfork_exit => ("vfork-exit","process"),

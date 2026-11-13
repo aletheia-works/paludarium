@@ -11,6 +11,7 @@ use paludarium_host::{ClockId, FileHandle, Host, WaitOutcome};
 use paludarium_mmu::{AddressSpace, Backing, MappingKind, Placement, Prot, Remap};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 
+use crate::signals::SleepClock;
 use crate::{AltStack, SS_DISABLE, SignalAction, ThreadState, credentials, signals};
 
 /// Linux x86-64 system-call numbers used by the core emulator.
@@ -395,9 +396,9 @@ pub(crate) fn err(e: Errno) -> Outcome {
 /// monotonic one (this host never suspends); an alarm clock also needs
 /// CAP_WAKE_ALARM ([`may_use_alarm`]). MONOTONIC_RAW and the coarse clocks
 /// can only be read (`EOPNOTSUPP`), as can the thread's CPU clock for a
-/// sleep (`thread`). A sleep on the process's CPU clock is not modelled
-/// (`EINVAL`), nor are unknown clocks; [`posix_timer_clock`] adds the CPU
-/// clocks for timers.
+/// sleep (`thread`). Unknown clocks are `EINVAL`; [`posix_timer_clock`]
+/// adds the CPU clocks for timers, and [`sys_clock_nanosleep`] the
+/// process's for a sleep.
 fn timer_clock(id: u64, thread: Errno) -> Result<ClockId, Errno> {
     match id as u32 as i32 {
         0 | 8 | 11 => Ok(ClockId::Realtime),
@@ -613,12 +614,12 @@ fn sys_clock_getres(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Err(e) => err(e),
     }
 }
-fn sleep(c: &mut Context<'_>, clock: ClockId, absolute: bool, req: u64, rem: u64) -> Outcome {
+fn sleep(c: &mut Context<'_>, clock: SleepClock, absolute: bool, req: u64, rem: u64) -> Outcome {
     let request = match read_timespec(c.mem, req) {
         Ok(t) => t,
         Err(e) => return err(e),
     };
-    let now = match c.host.clock(clock) {
+    let now = match sleep_clock_now(c, clock) {
         Ok(t) => t,
         Err(e) => return err(e),
     };
@@ -630,23 +631,47 @@ fn sleep(c: &mut Context<'_>, clock: ClockId, absolute: bool, req: u64, rem: u64
     sleep_until(c, clock, absolute, deadline, rem)
 }
 
+/// The time of the clock a sleep counts on; the process's CPU time takes
+/// in the caller's first.
+fn sleep_clock_now(c: &mut Context<'_>, clock: SleepClock) -> Result<u64, Errno> {
+    match clock {
+        SleepClock::Host(id) => c.host.clock(id),
+        SleepClock::ProcessCpu => {
+            crate::account_cpu(c.host, c.group, c.process, c.tid);
+            Ok(c.group.process_cpu())
+        }
+    }
+}
+
 /// Sleeps on `clock` until `deadline`. A signal ends it with EINTR, writing
 /// the time left to `rem` for a relative sleep; a stop then resumes it, as
 /// Linux does: a relative sleep through `restart_syscall` with the same
 /// deadline, an absolute one by running the call again.
+///
+/// On the process's CPU clock the other threads account their CPU time at
+/// each checkpoint while the sleep lasts, and the sleep looks at the total
+/// every tick ([`scheduler_slice`]), as Linux's tick checks the timer its
+/// `do_cpu_nanosleep` arms. A signal that comes once the deadline has
+/// passed ends the sleep with 0, as Linux finds its timer fired.
 fn sleep_until(
     c: &mut Context<'_>,
-    clock: ClockId,
+    clock: SleepClock,
     absolute: bool,
     deadline: u64,
     rem: u64,
 ) -> Outcome {
+    let group = c.group;
+    let _sleeping = (clock == SleepClock::ProcessCpu).then(|| group.cpu_sleep());
     loop {
         let timer_generation = c.group.timer_generation();
-        let clock_now = match c.host.clock(clock) {
+        let clock_now = match sleep_clock_now(c, clock) {
             Ok(t) => t,
             Err(e) => return err(e),
         };
+        // Linux fires a CPU timer set to a time that has passed at once.
+        if clock == SleepClock::ProcessCpu && clock_now >= deadline {
+            return ok(0);
+        }
         let mono_now = match c.host.clock(ClockId::Monotonic) {
             Ok(t) => t,
             Err(e) => return err(e),
@@ -659,10 +684,21 @@ fn sleep_until(
         let result = if ends_sleep(c.process) || c.group.status().is_some() {
             Ok(WaitOutcome::Interrupted)
         } else {
-            let timer_deadline = signals::next_deadline(c.process)
-                .and_then(|d| clock_now.checked_add(d.saturating_sub(mono_now)));
-            let next = timer_deadline.map_or(deadline, |t| deadline.min(t));
-            c.host.wait_until(clock, next, c.cancellation)
+            match clock {
+                SleepClock::Host(id) => {
+                    let timer_deadline = signals::next_deadline(c.process)
+                        .and_then(|d| clock_now.checked_add(d.saturating_sub(mono_now)));
+                    let next = timer_deadline.map_or(deadline, |t| deadline.min(t));
+                    c.host.wait_until(id, next, c.cancellation)
+                }
+                SleepClock::ProcessCpu => {
+                    let tick = mono_now.saturating_add(scheduler_slice(c.host).tick);
+                    let next = signals::next_deadline(c.process).map_or(tick, |t| tick.min(t));
+                    // A wait the tick ends is complete, and the deadline is
+                    // checked below.
+                    c.host.wait_until(ClockId::Monotonic, next, c.cancellation)
+                }
+            }
         };
         let received = c.inbox.drain(c.process);
         let sent = c.group.drain_process(c.process);
@@ -692,17 +728,21 @@ fn sleep_until(
                 continue;
             }
             Ok(WaitOutcome::Complete) if !pending && !interrupted && c.group.status().is_none() => {
-                if c.host.clock(clock).is_ok_and(|now| now < deadline) {
+                if sleep_clock_now(c, clock).is_ok_and(|now| now < deadline) {
                     continue;
                 }
                 return ok(0);
             }
             Ok(WaitOutcome::Complete) | Ok(WaitOutcome::Interrupted) => {
-                if !absolute && rem != 0 {
-                    let now = c.host.clock(clock).unwrap_or(deadline);
-                    if let Err(e) = write_timespec(c.mem, rem, deadline.saturating_sub(now)) {
-                        return err(e);
-                    }
+                let now = sleep_clock_now(c, clock).unwrap_or(deadline);
+                if clock == SleepClock::ProcessCpu && now >= deadline {
+                    return ok(0);
+                }
+                if !absolute
+                    && rem != 0
+                    && let Err(e) = write_timespec(c.mem, rem, deadline.saturating_sub(now))
+                {
+                    return err(e);
                 }
                 if absolute {
                     // ERESTARTNOHAND: the same call, with the same deadline.
@@ -1304,52 +1344,56 @@ fn sys_rt_sigtimedwait(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 fn sys_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    sleep(c, ClockId::Monotonic, false, a[0], a[1])
+    sleep(c, SleepClock::Host(ClockId::Monotonic), false, a[0], a[1])
 }
-/// A sleep on a CPU clock, as Linux's `posix_cpu_nsleep` checks it: the
-/// request is read first, then the caller's own thread's clock is refused
-/// (`EINVAL`), then the clock's task is looked for ([`cpu_clock`]). A sleep
-/// whose time has already come (a relative 0, or an absolute time the
-/// clock has reached) returns at once, as Linux's does; one that would
-/// wait for CPU time to be used is not modelled (`EINVAL`).
-fn cpu_sleep(c: &mut Context<'_>, id: i32, absolute: bool, req: u64) -> Result<(), Errno> {
-    let request = read_timespec(c.mem, req)?;
-    let clock = if id == 2 {
-        GuestClock::ProcessCpu
-    } else {
-        match cpu_clock(c, id, false) {
-            Ok(GuestClock::ThreadCpu) => return Err(Errno::EINVAL),
-            clock => clock?,
+/// A sleep on a CPU clock named by a negative ID, as Linux's
+/// `posix_cpu_nsleep` checks it: the request is read first, then the
+/// caller's own thread's clock is refused (`EINVAL`), then the clock's
+/// task is looked for ([`cpu_clock`], `EINVAL`). The caller's process's
+/// clock sleeps as `CLOCK_PROCESS_CPUTIME_ID` does. On another task's, a
+/// sleep whose time has already come (a relative 0, or an absolute time
+/// the clock has reached) returns at once, as Linux's does; one that would
+/// wait for that task's CPU time is not modelled (`EINVAL`).
+fn cpu_sleep(c: &mut Context<'_>, id: i32, a: [u64; 6]) -> Outcome {
+    let absolute = a[1] & 1 != 0;
+    let request = match read_timespec(c.mem, a[2]) {
+        Ok(t) => t,
+        Err(e) => return err(e),
+    };
+    let clock = match cpu_clock(c, id, false) {
+        Ok(GuestClock::ThreadCpu) | Err(_) => return err(Errno::EINVAL),
+        Ok(GuestClock::ProcessCpu) => {
+            return sleep(c, SleepClock::ProcessCpu, absolute, a[2], a[3]);
         }
+        Ok(clock) => clock,
     };
-    let now = read_clock(c, clock)?;
-    let due = if absolute {
-        request <= now
-    } else {
-        request == 0
+    let due = match read_clock(c, clock) {
+        Ok(now) if absolute => request <= now,
+        Ok(_) => request == 0,
+        Err(e) => return err(e),
     };
-    if due { Ok(()) } else { Err(Errno::EINVAL) }
+    if due { ok(0) } else { err(Errno::EINVAL) }
 }
 /// `clock_nanosleep(clock, flags, request, remain)`: on the clocks
 /// [`timer_clock`] gives, looking at no flag but `TIMER_ABSTIME` (an alarm
-/// clock refuses the others), and on the CPU clocks ([`cpu_sleep`]). A
-/// dynamic clock cannot sleep (`EOPNOTSUPP`), and neither can
-/// `CLOCK_THREAD_CPUTIME_ID`.
+/// clock refuses the others), on the process's CPU clock, and on the CPU
+/// clocks of tasks by number ([`cpu_sleep`]). A dynamic clock cannot sleep
+/// (`EOPNOTSUPP`), and neither can `CLOCK_THREAD_CPUTIME_ID`.
 fn sys_clock_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // A dynamic clock cannot sleep (`EOPNOTSUPP`).
     let id_value = a[0] as u32 as i32;
     if id_value < 0 && id_value & 7 == 3 {
         return err(Errno::EOPNOTSUPP);
     }
-    if id_value == 2 || id_value < 0 {
-        return match cpu_sleep(c, id_value, a[1] & 1 != 0, a[2]) {
-            Ok(()) => ok(0),
-            Err(e) => err(e),
-        };
+    if id_value < 0 {
+        return cpu_sleep(c, id_value, a);
     }
-    let id = match timer_clock(a[0], Errno::EOPNOTSUPP) {
-        Ok(id) => id,
-        Err(e) => return err(e),
+    let clock = match id_value {
+        2 => SleepClock::ProcessCpu,
+        id => match timer_clock(u64::from(id as u32), Errno::EOPNOTSUPP) {
+            Ok(id) => SleepClock::Host(id),
+            Err(e) => return err(e),
+        },
     };
     // An alarm clock reads the request first, as the system call does,
     // then refuses any flag but TIMER_ABSTIME (`alarm_timer_nsleep`).
@@ -1364,7 +1408,7 @@ fn sys_clock_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             return err(e);
         }
     }
-    sleep(c, id, a[1] & 1 != 0, a[2], a[3])
+    sleep(c, clock, a[1] & 1 != 0, a[2], a[3])
 }
 fn sys_rt_sigreturn(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
     if signals::restore(c.process, c.cpu, c.mem).is_ok() {
@@ -2181,6 +2225,8 @@ fn is_zero_device(file: &dyn FileHandle) -> bool {
 
 const MADV_DONTNEED: u64 = 4;
 const MADV_REMOVE: u64 = 9;
+const MADV_GUARD_INSTALL: u64 = 102;
+const MADV_GUARD_REMOVE: u64 = 103;
 const MADV_FREE: u64 = 8;
 const MADV_POPULATE_READ: u64 = 22;
 const MADV_POPULATE_WRITE: u64 = 23;
@@ -2262,6 +2308,11 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, populate: bool) -> Outcome {
         covered = m.end();
     }
     if covered < end {
+        return err(Errno::ENOMEM);
+    }
+    // Linux's `__mm_populate` fails to fault a guard page in (`EFAULT`),
+    // which `mlock` gives as `ENOMEM` (`__mlock_posix_error_return`).
+    if populate && c.mem.has_guards(GuestAddr(start), end) {
         return err(Errno::ENOMEM);
     }
     ok(0)
@@ -2357,7 +2408,7 @@ pub(crate) fn advise(
     len: u64,
     advice: u64,
 ) -> Result<(), Errno> {
-    if !matches!(advice, 0..=4 | 8..=24) {
+    if !matches!(advice, 0..=4 | 8..=24 | MADV_GUARD_INSTALL | MADV_GUARD_REMOVE) {
         return Err(Errno::EINVAL);
     }
     if addr & 4095 != 0 {
@@ -2384,6 +2435,9 @@ pub(crate) fn advise(
             remove(credentials, &removal?)?;
         }
         return if hole { Err(Errno::ENOMEM) } else { Ok(()) };
+    }
+    if advice == MADV_GUARD_INSTALL || advice == MADV_GUARD_REMOVE {
+        return mem.guard(GuestAddr(addr), end, advice == MADV_GUARD_INSTALL);
     }
     let flag = match advice {
         10 => Some(paludarium_mmu::FlagAdvice::DontFork),

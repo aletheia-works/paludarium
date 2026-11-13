@@ -205,11 +205,13 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
-  - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, the guard regions
-    (`MADV_GUARD_INSTALL`, `MADV_GUARD_REMOVE`) and `MADV_HWPOISON` and
-    `MADV_SOFT_OFFLINE`, which Linux takes. `MADV_REMOVE` frees the memory
-    of a locked mapping too, where Linux gives `EINVAL`, as no mapping here
-    is locked apart. `MADV_POPULATE_READ` and
+  - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, `MADV_HWPOISON` and
+    `MADV_SOFT_OFFLINE`, which Linux takes. `MADV_REMOVE` and
+    `MADV_GUARD_INSTALL` take the memory of a locked mapping too, where
+    Linux gives `EINVAL`, as no mapping here is locked apart.
+    `/proc/<pid>/smaps` shows no `VmFlags`, so not the `gu` flag of a VMA
+    that had guards, and `/proc/<pid>/pagemap` is not there to show a
+    guard page. `MADV_POPULATE_READ` and
     `MADV_POPULATE_WRITE` bring in the pages of a `memfd_secret` mapping,
     where Linux gives `EINVAL`.
   - `process_madvise` takes for the caller's own memory only the advice
@@ -241,10 +243,14 @@ verified.
     at as a thread makes a system call and every 100,000 instructions it
     runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
     CI runners' `CONFIG_HZ`. POSIX timers on the CPU-time clocks count
-    and are looked at the same way. `timer_create` on another process's CPU
-    clock gives `EINVAL`, where Linux makes the timer, and a sleep on a CPU
-    clock gives `EINVAL` unless its time has already come, where Linux
-    waits until the clock's task has used the time.
+    and are looked at the same way, and so does a sleep on the process's
+    CPU clock, which the sleeping thread looks at every tick; where that is
+    wall time, the sleep counts its own time too, so a process alone ends
+    it after the wall time it asked for.
+    `timer_create` on another process's CPU clock gives `EINVAL`, where
+    Linux makes the timer, and a sleep on another task's CPU clock gives
+    `EINVAL` unless its time has already come, where Linux waits until that
+    task has used the time.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
     the superblock of its pseudo filesystem and gives its counts (0). A
@@ -446,8 +452,8 @@ verified.
   however many those take. Of `NETLINK_ROUTE` there
   are only the link, address and route requests: neighbours, rules, queueing
   disciplines and the rest are `EOPNOTSUPP`, as are an input route
-  lookup (`RTA_IIF`, as `ip route get ... iif` sends), a non-dump
-  `RTM_GETADDR`, renaming `lo` and setting any other attribute of it. A
+  lookup (`RTA_IIF`, as `ip route get ... iif` sends), renaming `lo`
+  and setting any other attribute of it. A
   route goes through `lo` or rejects: IPv6 gateways, multipath routes,
   metrics (`RTA_METRICS`, as `ip route add ... mtu` sends), encapsulations,
   nexthop objects, realms, expiries, source prefixes, router preferences

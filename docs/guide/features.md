@@ -816,8 +816,19 @@ kernel.
   segment, or a file mapped shared through a description that may write
   it, even read-only (`VM_MAYWRITE`). Memory of no file gives `EINVAL`, a
   private or read-only file mapping `EACCES`, and the file's own checks
-  their errors, VMA by VMA as the other advice goes. Other advice gives
-  `EINVAL`.
+  their errors, VMA by VMA as the other advice goes. `MADV_GUARD_INSTALL`
+  makes the pages of the range guard pages, as Linux's guard PTE markers:
+  their contents go (a file mapping's read the file again), and an access
+  to one raises `SIGSEGV` with `SEGV_MAPERR`, as one to no mapping would,
+  and a system call's copy gives `EFAULT`, as do `MADV_POPULATE_READ` and
+  `MADV_POPULATE_WRITE`; `mlock`, which cannot bring one in, gives
+  `ENOMEM`. Guards split no VMA, stay through `MADV_DONTNEED` and other
+  installs, go to a `fork`ed child (not with `MADV_WIPEONFORK`), move with
+  `mremap`, and go with `munmap`. `MADV_GUARD_REMOVE` takes them out,
+  leaving pages without contents. Sealed memory whose pages may not be
+  discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
+  which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`). Other
+  advice gives `EINVAL`.
 - `process_madvise` advises each range of its iovecs in turn, of the caller's
   memory (`PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP`, or a pidfd of its
   own process or of one sharing its memory) as `madvise` does, and gives the
@@ -1468,7 +1479,12 @@ kernel.
     `IFA_F_NOPREFIXROUTE`) and `IFA_PROTO` are kept. `RTM_DELADDR` removes
     the first that has the `IFA_LOCAL`, `IFA_LABEL` and `IFA_ADDRESS` and
     prefix it names (`EADDRNOTAVAIL` for none), a primary with its
-    secondaries; `127.0.0.1` and `::1` may go too.
+    secondaries; `127.0.0.1` and `::1` may go too. An `RTM_GETADDR` that
+    is not a dump gets one IPv6 address, as `inet6_rtm_getaddr` does: the
+    one `IFA_LOCAL` names, or else `IFA_ADDRESS`, on any index, with
+    `EINVAL` for neither and `EADDRNOTAVAIL` for one `lo` has not; a socket
+    that checks strictly names nothing else (`EINVAL`). IPv4 and MCTP have
+    none to get, so theirs is `EOPNOTSUPP`, as on Linux.
   - **MCTP addresses:** `lo` takes MCTP endpoint IDs, as a kernel built
     with `CONFIG_MCTP` gives a loopback them. `RTM_NEWADDR` and
     `RTM_DELADDR` of `AF_MCTP` add and remove one, as `mctp_rtm_newaddr`
@@ -2208,8 +2224,8 @@ kernel.
   fall on whole multiples of it on each clock. `clock_getres` gives 1 ns,
   and the tick for the coarse clocks.
 - `clock_nanosleep` and `timer_create` run on `CLOCK_REALTIME`,
-  `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` and `CLOCK_TAI`, and `timer_create`
-  on the process's and the thread's CPU clocks too. As Linux's,
+  `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, `CLOCK_TAI` and the process's CPU
+  clock, and `timer_create` on the thread's CPU clock too. As Linux's,
   `CLOCK_MONOTONIC_RAW` and the coarse clocks give `EOPNOTSUPP` (they can
   only be read), as does the thread's CPU clock for a sleep, and
   `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. They also run on
@@ -2224,12 +2240,22 @@ kernel.
   process and threads by number; it finds the task after the ID is out,
   as Linux's `posix_cpu_timer_create` does, so a task that is not there
   gives `EINVAL` with the ID used up. A dynamic clock has no timers and
-  cannot sleep (`EOPNOTSUPP`). A sleep on a CPU clock reads its request,
-  refuses the caller's own thread's clock (`EINVAL`) and then a task that
-  is not there (`EINVAL`), and returns at once when its time has come (a
-  relative 0, or an absolute time the clock has reached), as Linux's
-  `posix_cpu_nsleep`; one that would wait for CPU time to be used is not
-  modelled (`EINVAL`), nor is a timer on another process's CPU time.
+  cannot sleep (`EOPNOTSUPP`). A sleep on a CPU clock by number reads its
+  request, refuses the caller's own thread's clock (`EINVAL`) and then a
+  task that is not there (`EINVAL`); on the caller's process's clock it
+  sleeps as below, and on another task's it returns at once when its time
+  has come (a relative 0, or an absolute time the clock has reached), as
+  Linux's `posix_cpu_nsleep`, but one that would wait for that task's CPU
+  time is not modelled (`EINVAL`), nor is a timer on another process's
+  CPU time.
+- A sleep on the process's CPU clock ends once the process's threads
+  together have used the time, as Linux's `do_cpu_nanosleep`: a time that
+  has passed, or none to sleep, returns at once, and the sleeping thread
+  uses none itself, so a process with no other thread running sleeps until
+  a signal comes (in WebAssembly, which cannot measure CPU time, the
+  sleeper's wall time counts too). A signal with a handler ends it with `EINTR`, writing the
+  time left for a relative sleep, unless the time has been used by then,
+  when it returns 0; a stop resumes it as it does the other sleeps.
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one

@@ -730,7 +730,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   共有マッピング（読み込みだけのマッピングでも構いません。`VM_MAYWRITE`）です。
   ファイルのないメモリには `EINVAL`、プライベートか読み込みだけのファイルの
   マッピングには `EACCES` を返し、ファイルの確認で失敗すればそのエラーを返します。
-  ほかの指定と同じく、VMA を順に処理します。ほかの指定には `EINVAL` を返します。
+  ほかの指定と同じく、VMA を順に処理します。`MADV_GUARD_INSTALL` は、Linux の
+  ガード PTE マーカーと同じように、範囲のページをガードページにします。ページの
+  内容はなくなり（ファイルのマッピングはファイルを読み直します）、ガードページに
+  触れると、マッピングのない場所と同じく `SEGV_MAPERR` の `SIGSEGV` になります。
+  システムコールのコピーは `EFAULT` になり、`MADV_POPULATE_READ` と
+  `MADV_POPULATE_WRITE` も `EFAULT` を返します。ページを割り当てられない `mlock` は
+  `ENOMEM` を返します。ガードは VMA を分けず、`MADV_DONTNEED` や重ねての指定の後も
+  残ります。`fork` の子に受け継がれ（`MADV_WIPEONFORK` のマッピングを除きます）、
+  `mremap` でページと一緒に移り、`munmap` でなくなります。`MADV_GUARD_REMOVE` は
+  ガードを外し、内容のないページを残します。ページを捨てられない封印したメモリには
+  ガードを置けません（`EPERM`）。Linux が `VM_DONTEXPAND` でマップする AIO と
+  `io_uring` のリングは、どちらの指定も受け付けません（`EINVAL`）。ほかの指定には
+  `EINVAL` を返します。
 - `process_madvise` は、iovec の範囲を順に指定どおりにします。呼んだプロセス自身の
   メモリ（`PIDFD_SELF_THREAD`、`PIDFD_SELF_THREAD_GROUP`、自身かメモリを共有する
   プロセスの pidfd）には `madvise` と同じようにします。結果は、最初に失敗した範囲より
@@ -1272,7 +1284,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`IFA_F_NOPREFIXROUTE` も）、`IFA_PROTO` を保ちます。`RTM_DELADDR` は、指した
     `IFA_LOCAL`、`IFA_LABEL`、`IFA_ADDRESS` と接頭辞を持つ最初のものを消し（なければ
     `EADDRNOTAVAIL`）、プライマリならそのセカンダリも消します。`127.0.0.1` と `::1` も
-    消せます。
+    消せます。ダンプでない `RTM_GETADDR` は、`inet6_rtm_getaddr` と同じく IPv6 のアドレスを
+    1 つ返します。`IFA_LOCAL` が指すもの、なければ `IFA_ADDRESS` が指すもので、インデックスは
+    問いません。どちらもなければ `EINVAL`、`lo` が持たないものなら `EADDRNOTAVAIL` です。
+    厳密に確かめるソケットでは、ほかに何も指せません（`EINVAL`）。IPv4 と MCTP には 1 つだけ
+    返す処理がないので、Linux と同じく `EOPNOTSUPP` です。
   - **MCTP のアドレス:** `CONFIG_MCTP` を組み込んだカーネルのループバックと同じく、`lo` は
     MCTP のエンドポイント ID を持てます。`AF_MCTP` の `RTM_NEWADDR` と `RTM_DELADDR` は、
     `mctp_rtm_newaddr` と `mctp_rtm_deladdr` と同じく ID を足し、消します。リクエストは
@@ -1909,8 +1925,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   それぞれの時計でその倍数ちょうどに来ます。`clock_getres` は 1 ns、粗い時計では
   ティックの長さを返します。
 - `clock_nanosleep` と `timer_create` は、`CLOCK_REALTIME`、`CLOCK_MONOTONIC`、
-  `CLOCK_BOOTTIME`、`CLOCK_TAI` で動きます。`timer_create` は、プロセスとスレッドの
-  CPU 時計でも動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
+  `CLOCK_BOOTTIME`、`CLOCK_TAI`、プロセスの CPU 時計で動きます。`timer_create` は、
+  スレッドの CPU 時計でも動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
   粗い時計は読むことしかできないので `EOPNOTSUPP` になり、スレッドの CPU 時計で眠る
   ときも `EOPNOTSUPP` です。`clock_nanosleep` は、`flags` のうち `TIMER_ABSTIME`
   しか見ません。アラームの時計でも動き、`CLOCK_REALTIME_ALARM` は実時間の時計、
@@ -1919,8 +1935,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   要求を読み、次に `TIMER_ABSTIME` 以外の `flags` を断り（`EINVAL`）、そのあとで
   ケーパビリティのない呼び出し元を断ります（`EPERM`）。`timer_create` は、断る前に
   タイマーの ID を書き出します。書き出せない場合（`EFAULT`）と同じく、その ID は
-  使われたことになります。プロセスの CPU 時計で眠ることと、ほかのプロセスやスレッドの
-  CPU 時計はまだ再現していません（`EINVAL`）。
+  使われたことになります。ほかのプロセスやスレッドの CPU 時計はまだ再現していません
+  （`EINVAL`）。
+- プロセスの CPU 時計での眠りは、Linux の `do_cpu_nanosleep` と同じく、プロセスの
+  スレッドが合わせてその時間を使うと終わります。過ぎた時刻や 0 の時間ならすぐに戻ります。
+  眠っているスレッド自身は CPU 時間を使わないので、ほかに動くスレッドのないプロセスは
+  シグナルが来るまで眠ります（CPU 時間を測れない WebAssembly では、眠っているスレッドの
+  経過時間も数えます）。ハンドラのあるシグナルは `EINTR` で眠りを終わらせ、相対時間
+  なら残りの時間を書き出します。ただし、そのときもう時間を使い終えていれば 0 を返します。
+  停止からは、ほかの眠りと同じように再開します。
 - プロセスの実時間のインターバルタイマー（`ITIMER_REAL`）は、Linux と同じく、満了すると
   `SIGALRM` を送り、間隔の分だけ次に進みます。`setitimer` はタイマーより先に新しい値を読んで
   確かめ、古い値はタイマーを設定してから書き出すので、古い値を書けないときはタイマーを設定した

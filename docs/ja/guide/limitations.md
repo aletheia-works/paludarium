@@ -179,9 +179,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux のホストで見分けるのは ext4、xfs、btrfs、f2fs だけです（ほかのファイルシステムは
     どちらも断ります）。
   - `madvise` は、Linux が受け付ける次の指定を断ります（`EINVAL`）。`MADV_COLLAPSE`、
-    ガード領域（`MADV_GUARD_INSTALL`、`MADV_GUARD_REMOVE`）、`MADV_HWPOISON`、
-    `MADV_SOFT_OFFLINE` です。`MADV_REMOVE` は、ロックしたマッピングのメモリも解放します。
-    Linux では `EINVAL` です。ここではマッピングごとのロックの状態を持たないためです。
+    `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。`MADV_REMOVE` と `MADV_GUARD_INSTALL` は、
+    ロックしたマッピングのメモリも受け付けます。Linux では `EINVAL` です。ここでは
+    マッピングごとのロックの状態を持たないためです。`/proc/<pid>/smaps` は `VmFlags` を
+    出さないので、ガードを置いた VMA の `gu` フラグも出しません。`/proc/<pid>/pagemap` は
+    なく、ガードページを示せません。
     `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は、`memfd_secret` のマッピングのページも
     割り当てます。Linux では `EINVAL` です。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか
@@ -208,10 +210,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     眠ったり待ったりしている時間も数えます。タイマーを確かめるのは、
     Linux のようにティックごとではなく、スレッドがシステムコールをするときと、命令を
     100,000 個実行するごとです。ティックは CI ランナーの `CONFIG_HZ` に合わせて 1 ms と
-    します。CPU 時間の時計の POSIX タイマーも、同じように数えて確かめます。ほかの
+    します。CPU 時間の時計の POSIX タイマーも、同じように数えて確かめます。プロセスの
+    CPU 時計での眠りも同じで、眠っているスレッドがティックごとに確かめます。それが経過時間の
+    ところでは眠っている時間も数えるので、ほかにスレッドのないプロセスでも、頼んだ時間が
+    経てば眠りが終わります。ほかの
     プロセスやスレッドの CPU 時計（負の時計 ID）での `timer_create` は `EINVAL` を返します。
     Linux はタイマーを作ります。`clock_gettime` も、それらの時計では `EINVAL` を返します。
-    Linux はそれを読みます。
+    Linux はそれを読みます。`clock_nanosleep` も `EINVAL` を返します。Linux はその時計で眠ります。
   - `ustat` が見つけるのはマウントのデバイスだけです。パイプ・ソケット・memfd・名前空間の
     ファイルの `st_dev` では `EINVAL` を返します。Linux はその疑似ファイルシステムの
     スーパーブロックを見つけ、その数（0）を返します。`/proc` と `/dev` のファイルの
@@ -392,7 +397,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `NETLINK_ROUTE` にあるのはリンク、アドレス、経路のリクエストだけです。
   近隣、ルール、キューイング規律などは
   `EOPNOTSUPP` で、入力の経路の引き当て（`ip route get ... iif` が送る `RTA_IIF`）、
-  ダンプでない `RTM_GETADDR`、`lo` の名前の変更、ほかの属性の設定もそうです。経路は
+  `lo` の名前の変更、ほかの属性の設定もそうです。経路は
   `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、メトリクス
   （`ip route add ... mtu` が送る `RTA_METRICS`）、カプセル化、ネクストホップのオブジェクト、
   realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の

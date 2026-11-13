@@ -1724,19 +1724,22 @@ fn same_range(a: &MctpRoute, b: &MctpRoute) -> bool {
 /// `rtmsg`, a type of 0 or past `RTA_MAX`, bytes left over, an attribute
 /// but `RTA_DST` (one byte), `RTA_OIF` (four), `RTA_GATEWAY` (a
 /// `mctp_fq_addr`, eight, `ERANGE` for another length) and `RTA_METRICS`
-/// (nested, `ERANGE` for one of one to three bytes). Then, in `mctp_route_nlparse_common`'s order: no
-/// `RTA_DST` is `EINVAL`, both `RTA_OIF` and `RTA_GATEWAY` or neither
-/// `EINVAL`, an interface but `lo` `ENODEV`, a gateway's broadcast or
-/// reserved ID `EINVAL`, and a type but `RTN_UNICAST` `EINVAL`. A gateway
-/// in network 0 (`MCTP_NET_ANY`) is in the default one, 1. The range is
-/// `RTA_DST` and the `rtm_dst_len` IDs after it, `EINVAL` past 254.
+/// (nested, `ERANGE` for one of one to three bytes). Then, in
+/// `mctp_route_nlparse_common`'s order: no `RTA_DST` is `EINVAL`, both
+/// `RTA_OIF` and `RTA_GATEWAY` or neither `EINVAL`, an interface but `lo`
+/// `ENODEV`, a gateway's broadcast or reserved ID `EINVAL`, and a type but
+/// `RTN_UNICAST` `EINVAL`. A gateway in network 0 (`MCTP_NET_ANY`) is in
+/// the default one, 1. The range is `RTA_DST` and the `rtm_dst_len` IDs
+/// after it, `EINVAL` past 254.
 ///
 /// Adding, `RTA_METRICS` is parsed with `rta_metrics_policy` (`EINVAL` for
 /// anything but a four-byte `RTAX_MTU`); a route through `lo` is `EINVAL`
 /// ("no routes to loopback"), as is a range from a reserved ID, and one of
 /// a range a route of the network has `EEXIST`. Removing takes the
 /// network, range and type alone, so `RTA_OIF` of `lo` names its network
-/// too, whatever the gateway; none is `ENOENT`. No notification goes out.
+/// too, whatever the gateway, and does not look inside `RTA_METRICS`
+/// (`mctp_route_nlparse_lookup`); none is `ENOENT`. No notification goes
+/// out.
 fn change_mctp_route(network: &Network, header: &Header, payload: &[u8]) -> Result<(), Errno> {
     const RTN_UNICAST: u8 = 1;
     if payload.len() < 12 {
@@ -4070,6 +4073,18 @@ mod tests {
         assert_eq!(
             route(RTM_DELROUTE, 15, 1, &[(RTA_DST, &[240]), (RTA_OIF, &lo)]),
             Err(Errno::EINVAL)
+        );
+        // Removing does not look inside the metrics.
+        let mut hoplimit = Vec::new();
+        attribute(&mut hoplimit, 10, &64u32.to_le_bytes());
+        assert_eq!(
+            route(
+                RTM_DELROUTE,
+                0,
+                1,
+                &[(RTA_DST, &[60]), (RTA_GATEWAY, &one), (metrics, &hoplimit)]
+            ),
+            Err(Errno::ENOENT)
         );
         // 50's address goes without a local route to remove.
         assert_eq!(address(RTM_DELADDR, 50), Ok(50));

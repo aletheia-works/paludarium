@@ -11117,6 +11117,14 @@ int main(int argc, char **argv) {
                     nl_put(&b, bad[i].type, bad[i].value, bad[i].len);
                     printf("%s: error=%d\n", bad[i].label, nl_quiet(fd, 24, 0, b.bytes, b.len));
                 }
+                /* Removing does not parse the metrics' contents
+                   (mctp_route_nlparse_lookup): ENOENT, not EINVAL. */
+                b = nl_body(45, 12);
+                b.bytes[7] = 1;
+                nl_put(&b, 1, &eid, 1);
+                nl_put(&b, 5, gateway, 8);
+                nl_put(&b, 8 | 0x8000, hoplimit, 8);
+                printf("mctp unroute hoplimit: error=%d\n", nl_quiet(fd, 25, 0, b.bytes, b.len));
             }
             nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 50, 1, "mctp add 50");
             b = nl_body(45, 12);

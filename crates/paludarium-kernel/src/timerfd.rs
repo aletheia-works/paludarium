@@ -53,13 +53,8 @@ fn create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if flags & !(NONBLOCK | CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
     }
-    if matches!(a[0] as i32, 8 | 9)
-        && !c
-            .process
-            .credentials
-            .capable(crate::credentials::CAP_WAKE_ALARM)
-    {
-        return Err(Errno::EPERM);
+    if matches!(a[0] as i32, 8 | 9) {
+        crate::syscalls::may_use_alarm(c)?;
     }
     let timer = Arc::new(TimerFile {
         host: Arc::clone(c.shared_host),

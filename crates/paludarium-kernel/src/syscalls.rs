@@ -417,7 +417,7 @@ fn is_alarm(id: u64) -> bool {
 /// and `alarm_timer_nsleep` ask (`EPERM`). Linux gives `EOPNOTSUPP` first
 /// with no RTC that can wake it; the CI runners have one (`rtc_cmos`), and
 /// so does the machine here.
-fn may_use_alarm(c: &Context<'_>) -> Result<(), Errno> {
+pub(crate) fn may_use_alarm(c: &Context<'_>) -> Result<(), Errno> {
     if c.process
         .credentials
         .capable(crate::credentials::CAP_WAKE_ALARM)

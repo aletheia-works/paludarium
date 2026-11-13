@@ -22,8 +22,9 @@ from test_policy import ROOT
 
 # The real manifests' release version; Release Please bumps it on every release.
 VERSION = policy.inventory(ROOT)["version"]
-# The uploads that authenticate by their own OIDC exchange, not the crates.io token.
+# The package check's build directory, as the Wasm keeps it before its time_ns.
 BUILT_IN = b"/home/runner/work/paludarium/paludarium/target/release-evidence/package-"
+# The uploads that authenticate by their own OIDC exchange, not the crates.io token.
 OIDC = ("publish-npm", "publish-jsr")
 
 
@@ -231,6 +232,21 @@ class PublishAdapterTests(unittest.TestCase):
                     self.execute()
                 self.assertEqual(self.envs, [])
                 self.assertNotIn("jsr", self.uploaded)
+
+    def test_npm_version_without_integrity_stops_before_any_upload(self):
+        self.uploaded = set(self.inv["order"]) | {"npm"}
+        request = self.request
+
+        def bare(req, timeout):
+            if req.full_url == check.NPM_PACKAGE_URL + "/" + VERSION:
+                return io.BytesIO(json.dumps(dict(version=VERSION, dist={})).encode())
+            return request(req, timeout)
+
+        self.request = bare
+        with self.assertRaisesRegex(ValueError, "existing version digest mismatch"):
+            self.execute()
+        self.assertEqual(self.envs, [])
+        self.assertNotIn("jsr", self.uploaded)
 
     def test_published_npm_tarball_must_have_the_registry_integrity(self):
         self.publish_npm_built_as(wasm=self.files["paludarium.wasm"].replace(b"1794", b"1795"))

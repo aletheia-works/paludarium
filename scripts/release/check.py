@@ -754,13 +754,18 @@ def publish_artifacts(root, evidence):
             )
             uploaded.append("@aletheia-works/paludarium-wasm")
             body = uploaded_metadata(url)
-        if present and body.get("dist", {}).get("integrity") != integrity:
+        dist = body.get("dist")
+        published_integrity = dist.get("integrity") if isinstance(dist, dict) else None
+        policy.require(
+            isinstance(published_integrity, str), "existing version digest mismatch: no integrity"
+        )
+        if present and published_integrity != integrity:
             # A later head finishing a stopped publication rebuilds the Wasm in another
             # build directory. That version is the same source only when nothing but
             # that directory name differs; JSR then gets the published files, so that
             # JSR and npm hold the same bytes. Any other difference stops here.
             published = published_npm_files(
-                approved["version"], body["dist"]["integrity"], directory / "published-npm.tgz"
+                approved["version"], published_integrity, directory / "published-npm.tgz"
             )
             if same_but_build_directory(published, npm_files):
                 print(
@@ -769,12 +774,12 @@ def publish_artifacts(root, evidence):
                     ),
                     file=sys.stderr,
                 )
-                integrity = body["dist"]["integrity"]
+                integrity = published_integrity
                 files = package.jsr_files(published, jsr_config, approved["version"])
                 manifest = package.jsr_manifest(files)
         registry_state(
             200,
-            dict(version=body["version"], digest=body["dist"]["integrity"]),
+            dict(version=body.get("version"), digest=published_integrity),
             approved["version"],
             integrity,
         )

@@ -507,7 +507,7 @@ def uploaded_metadata(url, sleep=None, clock=None):
     deadline = clock() + UPLOAD_VISIBLE_SECONDS
     while True:
         try:
-            with urllib.request.urlopen(url, timeout=30) as response:
+            with urllib.request.urlopen(registry_request(url), timeout=30) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
             if error.code != 404 or clock() >= deadline:
@@ -609,7 +609,9 @@ def publish_artifacts(root, evidence):
         for name in approved["order"]:
             try:
                 with urllib.request.urlopen(
-                    "https://crates.io/api/v1/crates/" + name + "/" + approved["version"],
+                    registry_request(
+                        "https://crates.io/api/v1/crates/" + name + "/" + approved["version"]
+                    ),
                     timeout=30,
                 ) as response:
                     existing = json.load(response)
@@ -691,7 +693,7 @@ def publish_artifacts(root, evidence):
         integrity = npm_integrity(tarballs[0].read_bytes())
         url = NPM_PACKAGE_URL + "/" + approved["version"]
         try:
-            with urllib.request.urlopen(url, timeout=30) as response:
+            with urllib.request.urlopen(registry_request(url), timeout=30) as response:
                 body = json.load(response)
         except urllib.error.HTTPError as error:
             if error.code != 404:
@@ -726,7 +728,7 @@ def publish_artifacts(root, evidence):
         completed.append("@aletheia-works/paludarium-wasm")
         url = JSR_PACKAGE_URL + "/" + approved["version"] + "_meta.json"
         try:
-            with urllib.request.urlopen(url, timeout=30) as response:
+            with urllib.request.urlopen(registry_request(url), timeout=30) as response:
                 body = json.load(response)
         except urllib.error.HTTPError as error:
             if error.code != 404:
@@ -740,7 +742,9 @@ def publish_artifacts(root, evidence):
             uploaded.append(JSR_KEY)
             body = uploaded_metadata(url)
         policy.require(body.get("manifest") == manifest, "JSR version files differ")
-        with urllib.request.urlopen(JSR_PACKAGE_URL + "/meta.json", timeout=30) as response:
+        with urllib.request.urlopen(
+            registry_request(JSR_PACKAGE_URL + "/meta.json"), timeout=30
+        ) as response:
             versions = json.load(response).get("versions", {})
         policy.require(approved["version"] in versions, "JSR version not listed")
         policy.require(

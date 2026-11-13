@@ -114,7 +114,10 @@ class PublishAdapterTests(unittest.TestCase):
         self.jsr_staged = []
         self.jsr_yanked = False
 
-    def request(self, url, timeout):
+    def request(self, request, timeout):
+        # jsr.io answers 403 to urllib's own User-Agent, so every query must name ours.
+        self.assertEqual(request.get_header("User-agent"), check.REGISTRY_USER_AGENT)
+        url = request.full_url
         if "crates.io/" in url:
             name = url.split("/")[-2]
             if name not in self.uploaded:
@@ -190,12 +193,13 @@ class PublishAdapterTests(unittest.TestCase):
         misses = {"npm": 3, "paludarium": 2}
         sleeps = []
 
-        def late(url, timeout):
+        def late(req, timeout):
+            url = req.full_url
             key = "npm" if "npmjs" in url else url.split("/")[-2]
             if key in self.uploaded and misses.get(key):
                 misses[key] -= 1
                 raise check.urllib.error.HTTPError(url, 404, "not yet", {}, None)
-            return request(url, timeout)
+            return request(req, timeout)
 
         self.request = late
         with patch.object(check.time, "sleep", side_effect=sleeps.append):
@@ -206,10 +210,11 @@ class PublishAdapterTests(unittest.TestCase):
         request = self.request
         now = [0]
 
-        def never(url, timeout):
+        def never(req, timeout):
+            url = req.full_url
             if "npmjs" in url and "npm" in self.uploaded:
                 raise check.urllib.error.HTTPError(url, 404, "absent", {}, None)
-            return request(url, timeout)
+            return request(req, timeout)
 
         self.request = never
 
@@ -260,10 +265,11 @@ class PublishAdapterTests(unittest.TestCase):
     def test_jsr_version_with_other_files_stops(self):
         request = self.request
 
-        def other(url, timeout):
+        def other(req, timeout):
+            url = req.full_url
             if url.endswith("_meta.json") and "jsr" in self.uploaded:
                 return io.BytesIO(json.dumps(dict(manifest={})).encode())
-            return request(url, timeout)
+            return request(req, timeout)
 
         self.request = other
         with self.assertRaisesRegex(ValueError, "JSR version files differ"):
@@ -339,8 +345,9 @@ class PublishAdapterTests(unittest.TestCase):
         self.uploaded = {first}
         request = self.request
 
-        def tampered(url, timeout):
-            body = request(url, timeout)
+        def tampered(req, timeout):
+            url = req.full_url
+            body = request(req, timeout)
             if url.endswith("/" + first + "/" + VERSION):
                 return io.BytesIO(
                     json.dumps(

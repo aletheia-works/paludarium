@@ -6428,6 +6428,69 @@ static int madvise_guard_case(void) {
     sigaction(SIGSEGV, &old, NULL);
     return 0;
 }
+/* A forked child gets the page tables of a VMA only when Linux's
+ * vma_needs_copy copies them: one with an anon_vma (written private
+ * memory) or that had guards. Another's pages it faults in again, so
+ * move_pages finds none there (ENOENT) until it touches them. */
+static void fork_statuses(const char *who, char **pages, int count) {
+    int status[8];
+    for (int i = 0; i < count; i++) status[i] = 99;
+    long r = syscall(279, 0L, (long)count, pages, NULL, status, 0L);
+    printf("%s=%ld", who, r < 0 ? -errno : r);
+    for (int i = 0; i < count; i++) printf(" %d", status[i]);
+    printf("\n");
+}
+static int fork_page_tables_case(void) {
+    long page = 4096;
+    char *written = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* A VMA of its own, apart from the written one. */
+    char *read = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *shared = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    char *guarded = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-fork-tables-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || pwrite(fd, "ff", 2, 0) != 2 || ftruncate(fd, 2 * page)) return 80;
+    char *cached = mmap(NULL, page, PROT_READ, MAP_PRIVATE, fd, 0);
+    char *copied = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    char *file = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (written == MAP_FAILED || read == MAP_FAILED || shared == MAP_FAILED ||
+        guarded == MAP_FAILED || cached == MAP_FAILED || copied == MAP_FAILED || file == MAP_FAILED)
+        return 81;
+    munmap(read, page);
+    munmap(read + 2 * page, page);
+    read += page;
+    written[0] = 1;
+    volatile char sink = read[0];
+    shared[0] = 2;
+    long guard = madvise(guarded + page, page, 102) ? -errno : 0;
+    guarded[0] = 3;
+    sink = cached[0];
+    /* A write gives the VMA its anon_vma: the page it only read is
+     * copied too. */
+    copied[0] = 'w';
+    sink = copied[page];
+    file[1] = 's';
+    (void)sink;
+    char *pages[8] = {written, read, shared, guarded, cached, copied, copied + page, file};
+    printf("guard=%ld\n", guard);
+    fork_statuses("parent", pages, 8);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 82;
+    if (child == 0) {
+        fork_statuses("child", pages, 8);
+        /* What it lost a fault brings back. */
+        printf("child bytes=%d %d %d %c %d %c\n", read[0], shared[0], guarded[0], cached[0],
+               copied[page], file[1]);
+        fork_statuses("child after", pages, 8);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 83;
+    return 0;
+}
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
  * timers are only read here, before any is armed (cpu_itimer_case arms them). */
 static int itimer_case(void) {
@@ -21163,6 +21226,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
+    if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();

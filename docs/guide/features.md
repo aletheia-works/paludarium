@@ -2184,6 +2184,19 @@ kernel.
   is waited for. `getrusage`, `times` and the rusage of `wait4` and `waitid`
   report it all as user time, as the emulator's work for system calls runs
   in the host's user space; memory use is not measured.
+- A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`
+  takes it apart: the task's number in the caller's PID namespace
+  (`~id >> 3`, 0 for the caller), a thread's clock (bit 2) or a process's,
+  and the time in the low two bits (`CPUCLOCK_PROF`, `CPUCLOCK_VIRT` and
+  `CPUCLOCK_SCHED`, all the same time here). `clock_gettime` reads any
+  process's, a zombie's too, the caller's own thread's number as its
+  process's, and the clock of a thread of the caller's process;
+  `clock_getres` gives a tick (1 ms) for the first two kinds of time and
+  1 ns for the third. Another task's thread, a thread's number as a
+  process's (but the caller's own, to read), no such task, and the fourth
+  kind give `EINVAL`, as does a dynamic clock (`3` in the low three bits),
+  which needs a PTP device's file. Every clock ID is an `int`, as Linux's
+  system calls take it, so the high 32 bits are not looked at.
 - `clock_gettime` also reads `CLOCK_MONOTONIC_RAW`, the coarse clocks,
   `CLOCK_BOOTTIME` (the host never suspends), the alarm clocks and
   `CLOCK_TAI` (with a TAI offset of 0). The coarse clocks give the time of
@@ -2207,8 +2220,16 @@ kernel.
   `TIMER_ABSTIME` (`EINVAL`), then a caller without the capability
   (`EPERM`); `timer_create` writes the timer's ID out before it refuses
   one, and the ID is used up, as it is when it cannot be written
-  (`EFAULT`). A sleep on the process's CPU clock and the CPU clocks of
-  other processes and threads are not modelled (`EINVAL`).
+  (`EFAULT`). `timer_create` also runs on the CPU clocks of the caller's
+  process and threads by number; it finds the task after the ID is out,
+  as Linux's `posix_cpu_timer_create` does, so a task that is not there
+  gives `EINVAL` with the ID used up. A dynamic clock has no timers and
+  cannot sleep (`EOPNOTSUPP`). A sleep on a CPU clock reads its request,
+  refuses the caller's own thread's clock (`EINVAL`) and then a task that
+  is not there (`EINVAL`), and returns at once when its time has come (a
+  relative 0, or an absolute time the clock has reached), as Linux's
+  `posix_cpu_nsleep`; one that would wait for CPU time to be used is not
+  modelled (`EINVAL`), nor is a timer on another process's CPU time.
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one

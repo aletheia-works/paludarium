@@ -250,6 +250,7 @@
     {"name":"process-vm","binary":"process"},
     {"name":"page-nodes","binary":"process"},
     {"name":"pidfd-getfd","binary":"process"},
+    {"name":"cpu-clock-ids","binary":"process"},
     {"name":"alarm-clocks","binary":"process"},
     {"name":"ignored-signal-wait","binary":"process"},
     {"name":"mmsg","binary":"process"},

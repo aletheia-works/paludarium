@@ -8706,6 +8706,106 @@ static int alarm_clocks_case(void) {
     printf("worker=%d\n", reaped(worker));
     return 0;
 }
+/* The CPU clocks of tasks by number, as kernel/time/posix-cpu-timers.c's
+ * pid_for_clock takes a negative clockid_t apart: ~pid << 3, bit 2 for a
+ * thread's clock, and the low two bits (PROF, VIRT, SCHED; 3 is a dynamic
+ * clock, which needs a PTP device's file). Only results and resolutions
+ * show, as CPU time differs from host to host. */
+#define CI_CLOCK(pid, thread, which) ((clockid_t)((~(unsigned)(pid) << 3) | ((thread) ? 4 : 0) | (which)))
+static long ci_r(long r) { return r < 0 ? -errno : r; }
+static long ci_get(clockid_t id) {
+    struct timespec t;
+    return ci_r(syscall(SYS_clock_gettime, id, &t));
+}
+static long ci_res(clockid_t id) {
+    struct timespec t = {-1, -1};
+    long r = ci_r(syscall(SYS_clock_getres, id, &t));
+    return r < 0 ? r : t.tv_sec * 1000000000L + t.tv_nsec;
+}
+static int ci_gate[2];
+static long ci_tid;
+static void *ci_thread(void *arg) {
+    (void)arg;
+    __atomic_store_n(&ci_tid, syscall(SYS_gettid), __ATOMIC_SEQ_CST);
+    char c;
+    read(ci_gate[0], &c, 1);
+    return NULL;
+}
+static int cpu_clock_ids_case(void) {
+    pid_t self = getpid();
+    for (int which = 0; which < 3; which++)
+        printf("own %d: zero=%ld pid=%ld thread=%ld thread-as-process=%ld res=%ld,%ld\n", which,
+               ci_get(CI_CLOCK(0, 0, which)), ci_get(CI_CLOCK(self, 0, which)),
+               ci_get(CI_CLOCK(self, 1, which)), ci_get(CI_CLOCK(syscall(SYS_gettid), 0, which)),
+               ci_res(CI_CLOCK(self, 0, which)), ci_res(CI_CLOCK(0, 1, which)));
+    /* A clockid_t is an int: the high bits are not looked at. */
+    struct timespec t;
+    printf("high-bits: gettime=%ld getres=%ld\n", ci_r(syscall(SYS_clock_gettime, (1L << 32) | 1, &t)),
+           ci_r(syscall(SYS_clock_getres, (1L << 32) | 6, &t)));
+    /* Another thread: its own clock, not as a process's. (Once it has been
+       joined it may not have gone yet, so that is not looked at.) */
+    if (pipe(ci_gate)) return 80;
+    pthread_t th;
+    pthread_create(&th, NULL, ci_thread, NULL);
+    while (!__atomic_load_n(&ci_tid, __ATOMIC_SEQ_CST)) sched_yield();
+    long tid = ci_tid;
+    printf("thread: clock=%ld as-process=%ld res=%ld,%ld\n", ci_get(CI_CLOCK(tid, 1, 2)),
+           ci_get(CI_CLOCK(tid, 0, 2)), ci_res(CI_CLOCK(tid, 1, 1)), ci_res(CI_CLOCK(tid, 0, 2)));
+    timer_t timer;
+    long made = ci_r(syscall(SYS_timer_create, CI_CLOCK(tid, 1, 2), NULL, &timer));
+    printf("thread: timer=%ld\n", made);
+    if (made == 0) syscall(SYS_timer_delete, timer);
+    write(ci_gate[1], "g", 1);
+    pthread_join(th, NULL);
+    /* A child: its process's clock, not its thread's; a zombie's still. */
+    fflush(stdout);
+    int gate[2];
+    if (pipe(gate)) return 81;
+    pid_t kid = fork();
+    if (kid == 0) {
+        char c;
+        close(gate[1]);
+        read(gate[0], &c, 1);
+        _exit(0);
+    }
+    close(gate[0]);
+    printf("child: process=%ld thread=%ld res=%ld,%ld\n", ci_get(CI_CLOCK(kid, 0, 2)),
+           ci_get(CI_CLOCK(kid, 1, 2)), ci_res(CI_CLOCK(kid, 0, 0)), ci_res(CI_CLOCK(kid, 1, 0)));
+    close(gate[1]);
+    siginfo_t info;
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    printf("zombie: process=%ld\n", ci_get(CI_CLOCK(kid, 0, 2)));
+    waitpid(kid, NULL, 0);
+    printf("reaped: process=%ld\n", ci_get(CI_CLOCK(kid, 0, 2)));
+    /* No such task; a dynamic clock on an open file that is not one. */
+    printf("none: gettime=%ld getres=%ld\n", ci_get(CI_CLOCK(0x0ffffff0, 0, 2)),
+           ci_res(CI_CLOCK(0x0ffffff0, 1, 2)));
+    printf("dynamic: gettime=%ld getres=%ld kind-3-thread=%ld\n", ci_get(CI_CLOCK(1, 0, 3)),
+           ci_res(CI_CLOCK(1, 0, 3)), ci_get(CI_CLOCK(self, 1, 3)));
+    /* Sleeps: none on a dynamic clock (given a good request, which an Arm
+       Mac's translator reads first); on a CPU clock the request first, then
+       not on the caller's own thread; one whose time has come returns at
+       once. */
+    struct timespec zero = {0, 0};
+    printf("nanosleep: dynamic=%ld fault=%ld own-thread=%ld zero=%ld abs-zero=%ld no-task=%ld\n",
+           ci_r(syscall(SYS_clock_nanosleep, CI_CLOCK(1, 0, 3), 0, &zero, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CLOCK_PROCESS_CPUTIME_ID, 0, (void *)8, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CI_CLOCK(syscall(SYS_gettid), 1, 2), 0, &zero, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CLOCK_PROCESS_CPUTIME_ID, 0, &zero, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CI_CLOCK(self, 0, 0), 1, &zero, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CI_CLOCK(0x0ffffff0, 0, 2), 0, &zero, NULL)));
+    /* Timers: on the process's clock by its number; none on a dynamic
+       clock; a task not found after the ID is out, which is used up. */
+    int id = -1, next = -1;
+    long own = ci_r(syscall(SYS_timer_create, CI_CLOCK(self, 0, 1), NULL, &id));
+    long dynamic = ci_r(syscall(SYS_timer_create, CI_CLOCK(1, 0, 3), NULL, &id));
+    long none = ci_r(syscall(SYS_timer_create, CI_CLOCK(0x0ffffff0, 0, 2), NULL, &id));
+    int after_none = id;
+    long last = ci_r(syscall(SYS_timer_create, CLOCK_MONOTONIC, NULL, &next));
+    printf("timer_create: own=%ld dynamic=%ld none=%ld id=%d last=%ld next=%d\n", own, dynamic, none,
+           after_none, last, next);
+    return 0;
+}
 static int pidfd_getfd_case(void) {
     if (pipe(pv_gate)) return 80;
     struct pv_task child = pv_child(1), locked = pv_child(0);
@@ -21069,6 +21169,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();

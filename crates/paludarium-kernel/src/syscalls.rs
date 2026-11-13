@@ -447,9 +447,10 @@ fn write_timespec(mem: &AddressSpace, addr: u64, nanos: u64) -> Result<(), Errno
         .map_err(|_| Errno::EFAULT)
 }
 /// What a `clockid_t` reads: a host clock, the time of its latest tick, or
-/// this process's or thread's CPU time. MONOTONIC_RAW, BOOTTIME (this host
-/// never suspends), the two alarm clocks and TAI (with a TAI offset of 0, as
-/// Linux has until NTP sets one) read the monotonic and real-time clocks.
+/// the CPU time of this process or thread or of another. MONOTONIC_RAW,
+/// BOOTTIME (this host never suspends), the two alarm clocks and TAI (with a
+/// TAI offset of 0, as Linux has until NTP sets one) read the monotonic and
+/// real-time clocks.
 enum GuestClock {
     Host(ClockId),
     /// `CLOCK_REALTIME_COARSE` and `CLOCK_MONOTONIC_COARSE`: the time Linux's
@@ -459,17 +460,65 @@ enum GuestClock {
     Coarse(ClockId),
     ProcessCpu,
     ThreadCpu,
+    /// Another process's CPU time, its threads' together.
+    OtherProcessCpu(std::sync::Arc<crate::ThreadGroup>),
+    /// The CPU time of another thread of this process.
+    OtherThreadCpu(u32),
 }
-fn guest_clock(id: u64) -> Result<GuestClock, Errno> {
-    Ok(match id {
+/// The clock `id`, a `clockid_t` (an `int`, as Linux's system calls take
+/// it), for `clock_gettime` (`gettime`) or another call.
+fn guest_clock(c: &Context<'_>, id: u64, gettime: bool) -> Result<GuestClock, Errno> {
+    Ok(match id as u32 as i32 {
         0 | 8 | 11 => GuestClock::Host(ClockId::Realtime),
         1 | 4 | 7 | 9 => GuestClock::Host(ClockId::Monotonic),
         5 => GuestClock::Coarse(ClockId::Realtime),
         6 => GuestClock::Coarse(ClockId::Monotonic),
         2 => GuestClock::ProcessCpu,
         3 => GuestClock::ThreadCpu,
+        id if id < 0 => cpu_clock(c, id, gettime)?,
         _ => return Err(Errno::EINVAL),
     })
+}
+/// Linux's `CPUCLOCK_WHICH` of a CPU clock that is `CPUCLOCK_SCHED`, the
+/// time a task has run, which `clock_getres` gives to the nanosecond.
+const CPUCLOCK_SCHED: i32 = 2;
+/// A negative `clockid_t`, as Linux's `pid_for_clock` takes it apart: the
+/// task's number in the caller's PID namespace (`~id >> 3`, 0 for the
+/// caller), a thread's clock (bit 2) or a process's, and which time (the
+/// low two bits: `CPUCLOCK_PROF`, `CPUCLOCK_VIRT` or `CPUCLOCK_SCHED`, all
+/// the same time here, which counts it all as user time). `EINVAL` for a
+/// dynamic clock (`CLOCKFD`, 3: no file here is one), the fourth kind,
+/// no such task, a thread of another process, or a task that is not a
+/// process, except the caller's own thread as a process clock for
+/// `clock_gettime`.
+fn cpu_clock(c: &Context<'_>, id: i32, gettime: bool) -> Result<GuestClock, Errno> {
+    if id & 3 == 3 {
+        return Err(Errno::EINVAL);
+    }
+    let thread = id & 4 != 0;
+    let number = !(id >> 3) as u32;
+    if number == 0 {
+        return Ok(if thread {
+            GuestClock::ThreadCpu
+        } else {
+            GuestClock::ProcessCpu
+        });
+    }
+    let tid = c.pid_space().task(number).ok_or(Errno::EINVAL)?;
+    if thread {
+        return match tid {
+            tid if tid == c.tid => Ok(GuestClock::ThreadCpu),
+            tid if c.group.has_member(tid) => Ok(GuestClock::OtherThreadCpu(tid)),
+            _ => Err(Errno::EINVAL),
+        };
+    }
+    if tid == c.process.pid || gettime && tid == c.tid {
+        return Ok(GuestClock::ProcessCpu);
+    }
+    c.processes
+        .view(tid)
+        .map(|view| GuestClock::OtherProcessCpu(view.group))
+        .ok_or(Errno::EINVAL)
 }
 fn read_clock(c: &mut Context<'_>, clock: GuestClock) -> Result<u64, Errno> {
     let thread = crate::account_cpu(c.host, c.group, c.process, c.tid);
@@ -481,10 +530,13 @@ fn read_clock(c: &mut Context<'_>, clock: GuestClock) -> Result<u64, Errno> {
         }
         GuestClock::ProcessCpu => Ok(c.group.process_cpu()),
         GuestClock::ThreadCpu => Ok(thread),
+        GuestClock::OtherProcessCpu(group) => Ok(group.process_cpu()),
+        // A thread that has exited since is no task (`EINVAL`).
+        GuestClock::OtherThreadCpu(tid) => c.group.thread_cpu(tid).ok_or(Errno::EINVAL),
     }
 }
 fn sys_clock_gettime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let result = guest_clock(a[0])
+    let result = guest_clock(c, a[0], true)
         .and_then(|clock| read_clock(c, clock))
         .and_then(|value| write_timespec(c.mem, a[1], value));
     match result {
@@ -536,14 +588,21 @@ fn sys_time(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 /// `clock_getres`: 1 ns for every clock, as Linux's high-resolution timers
 /// give, except the coarse ones, which move by the host's tick
-/// ([`scheduler_slice`]).
+/// ([`scheduler_slice`]), and the CPU clocks Linux counts by ticks, a tick.
+/// A CPU clock of another task must name a process, or a thread of the
+/// caller's ([`cpu_clock`]).
 fn sys_clock_getres(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let result = guest_clock(a[0]).and_then(|clock| {
+    let result = guest_clock(c, a[0], false).and_then(|clock| {
         if a[1] == 0 {
             return Ok(());
         }
+        // A CPU clock that counts by ticks (CPUCLOCK_PROF, CPUCLOCK_VIRT)
+        // gives a tick, as Linux's `posix_cpu_clock_getres` does.
+        let id = a[0] as u32 as i32;
         let resolution = if matches!(clock, GuestClock::Coarse(_)) {
             scheduler_slice(c.host).tick
+        } else if id < 0 && id & 3 != CPUCLOCK_SCHED {
+            crate::threads::TICK_NSEC
         } else {
             1
         };
@@ -842,14 +901,24 @@ fn outcome(result: Result<u64, Errno>) -> Outcome {
 }
 
 /// The clock of a `timer_create` timer: those of [`timer_clock`], and the
-/// calling process's and thread's CPU-time clocks (Linux's
-/// `posix_cpu_timer_create`). The CPU clocks of other processes and threads
-/// (negative clock IDs) are not modelled (`EINVAL`).
-fn posix_timer_clock(id: u64, tid: u32) -> Result<crate::timers::TimerClock, Errno> {
+/// CPU-time clocks of the calling process and of its threads, by number
+/// too ([`cpu_clock`], Linux's `posix_cpu_timer_create`). A dynamic clock
+/// has no timers (`EOPNOTSUPP`). A timer on another process's CPU time is
+/// not modelled (`EINVAL`).
+fn posix_timer_clock(c: &Context<'_>, id: u64) -> Result<crate::timers::TimerClock, Errno> {
     use crate::timers::TimerClock;
     match id as u32 as i32 {
         2 => Ok(TimerClock::Process),
-        3 => Ok(TimerClock::Thread(tid)),
+        3 => Ok(TimerClock::Thread(c.tid)),
+        // A dynamic clock has no timers (`EOPNOTSUPP`).
+        id if id < 0 && id & 7 == 3 => Err(Errno::EOPNOTSUPP),
+        id if id < 0 => match cpu_clock(c, id, false)? {
+            GuestClock::ProcessCpu => Ok(TimerClock::Process),
+            GuestClock::ThreadCpu => Ok(TimerClock::Thread(c.tid)),
+            GuestClock::OtherThreadCpu(tid) => Ok(TimerClock::Thread(tid)),
+            // A timer on another process's CPU time is not modelled.
+            _ => Err(Errno::EINVAL),
+        },
         _ => timer_clock(id, Errno::EINVAL).map(|clock| match clock {
             ClockId::Realtime => TimerClock::Realtime,
             ClockId::Monotonic => TimerClock::Monotonic,
@@ -870,7 +939,14 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .check_read(GuestAddr(a[1]), 64)
                 .map_err(|_| Errno::EFAULT)?;
         }
-        let clock = posix_timer_clock(a[0], c.tid)?;
+        // The task of another task's CPU clock is looked for by the
+        // clock's own check (`posix_cpu_timer_create`), after the ID is
+        // out; every other clock is known or not first.
+        let id_value = a[0] as u32 as i32;
+        let clock = match posix_timer_clock(c, a[0]) {
+            Err(e) if !(id_value < 0 && id_value & 7 != 3) => return Err(e),
+            clock => clock,
+        };
         let (signal, value, thread) = if a[1] == 0 {
             (Some(14), None, None) // SIGALRM, with the timer ID as its value
         } else {
@@ -895,7 +971,7 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         };
         let id = c.group.with_timers(c.process, |timers| {
             timers.create(crate::timers::PosixTimer {
-                clock,
+                clock: clock.unwrap_or_default(),
                 signal,
                 thread,
                 ..Default::default()
@@ -917,7 +993,7 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 if is_alarm(a[0]) {
                     may_use_alarm(c)
                 } else {
-                    Ok(())
+                    clock.map(|_| ())
                 }
             });
         if let Err(e) = created {
@@ -1233,7 +1309,42 @@ fn sys_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// `clock_nanosleep(clock, flags, request, remain)` on the clocks
 /// [`timer_clock`] gives, where the thread's CPU clock cannot sleep
 /// (`EOPNOTSUPP`). Linux looks only at `TIMER_ABSTIME` in `flags`.
+/// A sleep on a CPU clock, as Linux's `posix_cpu_nsleep` checks it: the
+/// request is read first, then the caller's own thread's clock is refused
+/// (`EINVAL`), then the clock's task is looked for ([`cpu_clock`]). A sleep
+/// whose time has already come (a relative 0, or an absolute time the
+/// clock has reached) returns at once, as Linux's does; one that would
+/// wait for CPU time to be used is not modelled (`EINVAL`).
+fn cpu_sleep(c: &mut Context<'_>, id: i32, absolute: bool, req: u64) -> Result<(), Errno> {
+    let request = read_timespec(c.mem, req)?;
+    let clock = if id == 2 {
+        GuestClock::ProcessCpu
+    } else {
+        match cpu_clock(c, id, false) {
+            Ok(GuestClock::ThreadCpu) => return Err(Errno::EINVAL),
+            clock => clock?,
+        }
+    };
+    let now = read_clock(c, clock)?;
+    let due = if absolute {
+        request <= now
+    } else {
+        request == 0
+    };
+    if due { Ok(()) } else { Err(Errno::EINVAL) }
+}
 fn sys_clock_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    // A dynamic clock cannot sleep (`EOPNOTSUPP`).
+    let id_value = a[0] as u32 as i32;
+    if id_value < 0 && id_value & 7 == 3 {
+        return err(Errno::EOPNOTSUPP);
+    }
+    if id_value == 2 || id_value < 0 {
+        return match cpu_sleep(c, id_value, a[1] & 1 != 0, a[2]) {
+            Ok(()) => ok(0),
+            Err(e) => err(e),
+        };
+    }
     let id = match timer_clock(a[0], Errno::EOPNOTSUPP) {
         Ok(id) => id,
         Err(e) => return err(e),

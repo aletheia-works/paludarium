@@ -255,7 +255,13 @@ fn nodes(mem: &AddressSpace, at: u64, maxnode: u64) -> Result<NodeMask, Errno> {
     while maxnode > MAX_NUMNODES {
         let bits = maxnode.min(64);
         let mut word = [0u64; 1];
-        bitmap(mem, at + (maxnode - 1) / 64 * 8, bits, &mut word)?;
+        // A user pointer's sum, which wraps and then faults (EFAULT).
+        bitmap(
+            mem,
+            at.wrapping_add((maxnode - 1) / 64 * 8),
+            bits,
+            &mut word,
+        )?;
         let mut t = word[0];
         if maxnode - bits >= MAX_NUMNODES {
             maxnode -= bits;
@@ -427,7 +433,10 @@ pub(crate) fn sys_get_mempolicy(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 return err(Errno::EINVAL);
             }
             let zeros = vec![0u8; (copy - bytes) as usize];
-            if c.mem.write(GuestAddr(mask_at + bytes), &zeros).is_err() {
+            if c.mem
+                .write(GuestAddr(mask_at.wrapping_add(bytes)), &zeros)
+                .is_err()
+            {
                 return err(Errno::EFAULT);
             }
             copy = bytes;
@@ -655,6 +664,15 @@ mod tests {
         )
         .unwrap()
         .unwrap()
+    }
+
+    #[test]
+    fn a_mask_at_the_top_of_the_address_space_faults() {
+        let mem = AddressSpace::new();
+        // Past MAX_NUMNODES the last word is read first, at a sum that
+        // wraps around.
+        assert_eq!(nodes(&mem, u64::MAX - 7, 2000), Err(Errno::EFAULT));
+        assert_eq!(nodes(&mem, u64::MAX - 7, 200), Err(Errno::EFAULT));
     }
 
     #[test]

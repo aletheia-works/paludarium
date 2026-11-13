@@ -2206,7 +2206,8 @@ kernel.
   together have used the time, as Linux's `do_cpu_nanosleep`: a time that
   has passed, or none to sleep, returns at once, and the sleeping thread
   uses none itself, so a process with no other thread running sleeps until
-  a signal comes. A signal with a handler ends it with `EINTR`, writing the
+  a signal comes (in WebAssembly, which cannot measure CPU time, the
+  sleeper's wall time counts too). A signal with a handler ends it with `EINTR`, writing the
   time left for a relative sleep, unless the time has been used by then,
   when it returns 0; a stop resumes it as it does the other sleeps.
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`

@@ -242,7 +242,9 @@ verified.
     runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
     CI runners' `CONFIG_HZ`. POSIX timers on the CPU-time clocks count
     and are looked at the same way, and so does a sleep on the process's
-    CPU clock, which the sleeping thread looks at every tick.
+    CPU clock, which the sleeping thread looks at every tick; where that is
+    wall time, the sleep counts its own time too, so a process alone ends
+    it after the wall time it asked for.
     `timer_create` on another process's or thread's CPU clock (a negative
     clock ID) gives `EINVAL`, where Linux makes the timer, `clock_gettime`
     gives `EINVAL` for those clocks, where Linux reads them, and so does

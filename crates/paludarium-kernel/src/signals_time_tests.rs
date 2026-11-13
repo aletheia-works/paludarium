@@ -758,6 +758,48 @@ fn itimer_cpu_timers_count_cpu_time_and_send_their_signals() {
     assert_eq!(f.ret(nr::GETITIMER, &[1, DATA + 64]), 0);
     assert_eq!(itimerval_at(&f, DATA + 64), [0; 4]);
 }
+/// The fixture's host measures no thread CPU time, so the CPU time is the
+/// monotonic clock since the thread's first system call.
+#[test]
+fn rlimit_cpu_sends_sigxcpu_each_second_then_sigkill() {
+    let mut f = fixture();
+    f.thread.state.signal_mask = 1 << 23; // SIGXCPU blocked, to stay pending
+    set_monotonic(&f, 1_000_000_000);
+    write_itimerval(&f, DATA, [1, 3, 0, 0]); // soft 1 s, hard 3 s
+    assert_eq!(f.ret(160, &[0, DATA]), 0); // setrlimit
+    set_monotonic(&f, 1_900_000_000);
+    f.kernel.checkpoint(&mut f.thread, &f.mem);
+    assert_eq!(f.ret(127, &[DATA + 128, 8]), 0); // rt_sigpending
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 0);
+    // At the soft limit SIGXCPU comes, and the soft limit goes up a second.
+    set_monotonic(&f, 2_000_000_000);
+    f.kernel.checkpoint(&mut f.thread, &f.mem);
+    assert_eq!(f.ret(127, &[DATA + 128, 8]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 1 << 23);
+    assert_eq!(f.ret(97, &[0, DATA + 64]), 0); // getrlimit
+    assert_eq!(itimerval_at(&f, DATA + 64)[..2], [2, 3]);
+    // At the hard limit, SIGKILL.
+    set_monotonic(&f, 4_000_000_000);
+    assert_eq!(
+        f.kernel.checkpoint(&mut f.thread, &f.mem),
+        Next::Exit(ExitStatus::Signaled(9))
+    );
+}
+/// Linux takes the limits to nanoseconds by a `u64` product, which wraps:
+/// a soft limit of 2^55 s is 0 ns, so SIGXCPU comes at once.
+#[test]
+fn rlimit_cpu_limit_wraps_as_linux() {
+    let mut f = fixture();
+    f.thread.state.signal_mask = 1 << 23;
+    set_monotonic(&f, 1_000_000_000);
+    write_itimerval(&f, DATA, [1 << 55, u64::MAX, 0, 0]);
+    assert_eq!(f.ret(160, &[0, DATA]), 0);
+    f.kernel.checkpoint(&mut f.thread, &f.mem);
+    assert_eq!(f.ret(127, &[DATA + 128, 8]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 1 << 23);
+    assert_eq!(f.ret(97, &[0, DATA + 64]), 0);
+    assert_eq!(itimerval_at(&f, DATA + 64)[..2], [(1 << 55) + 1, u64::MAX]);
+}
 #[test]
 fn itimer_setitimer_checks_in_linux_order() {
     let mut f = fixture();

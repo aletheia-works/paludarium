@@ -76,10 +76,10 @@ pub struct ThreadGroup {
     pub(crate) timers: Mutex<crate::timers::Timers>,
     /// Every thread's CPU time, live or exited, for the process's total.
     cpu: Mutex<Vec<Arc<AtomicU64>>>,
-    /// The interval timers of the process's CPU time, `ITIMER_VIRTUAL` and
-    /// `ITIMER_PROF` in that order (Linux's `signal->it`), and whether
-    /// either is armed. Locked before `cpu` and `process_inbox`.
-    cpu_timers: Mutex<[CpuTimer; 2]>,
+    /// The interval timers of the process's CPU time and its `RLIMIT_CPU`,
+    /// and whether either asks for the CPU time to be checked. Locked
+    /// before `cpu` and `process_inbox`.
+    cpu_timers: Mutex<CpuTimers>,
     cpu_timers_armed: std::sync::atomic::AtomicBool,
     /// The core dump a fatal signal started, which the last thread to end
     /// writes. Locked before `members`.
@@ -115,6 +115,32 @@ pub struct ThreadGroup {
 pub(crate) struct CpuTimer {
     pub expires: u64,
     pub incr: u64,
+}
+/// What the process's CPU time is checked against (Linux's `signal->it`
+/// and `RLIMIT_CPU`, which `check_process_timers` looks at).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CpuTimers {
+    /// `ITIMER_VIRTUAL` and `ITIMER_PROF`, in that order.
+    pub itimers: [CpuTimer; 2],
+    /// The `RLIMIT_CPU` soft and hard limits, in seconds, which the
+    /// process entry's copy is kept from: sending SIGXCPU raises the soft
+    /// limit.
+    pub limit: (u64, u64),
+}
+impl Default for CpuTimers {
+    fn default() -> Self {
+        Self {
+            itimers: [CpuTimer::default(); 2],
+            limit: (u64::MAX, u64::MAX),
+        }
+    }
+}
+impl CpuTimers {
+    /// Whether the CPU time needs to be checked: an interval timer is
+    /// armed or the soft limit is not infinite (Linux's `timers_active`).
+    fn armed(&self) -> bool {
+        self.itimers.iter().any(|t| t.expires != 0) || self.limit.0 != u64::MAX
+    }
 }
 /// Linux's `TICK_NSEC` on the CI runners' kernels (`CONFIG_HZ=1000`), which
 /// a CPU-time interval timer is set later by and shows as left when it is
@@ -354,6 +380,16 @@ impl ThreadGroup {
     /// A new process's group: a copy of the dispositions, or with
     /// `share_actions` (`CLONE_SIGHAND`) the same ones.
     pub(crate) fn fork(&self, share_actions: bool) -> Self {
+        // The child keeps the limits, and so RLIMIT_CPU's check, but starts
+        // with no interval timers and no CPU time.
+        let cpu_timers = CpuTimers {
+            limit: self
+                .cpu_timers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .limit,
+            ..CpuTimers::default()
+        };
         let actions = self.shared_actions();
         let actions = if share_actions {
             actions
@@ -368,6 +404,8 @@ impl ThreadGroup {
             actions: Mutex::new(actions),
             nofile: AtomicU64::new(self.nofile()),
             fsize: AtomicU64::new(self.fsize()),
+            cpu_timers: Mutex::new(cpu_timers),
+            cpu_timers_armed: std::sync::atomic::AtomicBool::new(cpu_timers.armed()),
             // A fork keeps the memory, and so the program's initial stack
             // and the program itself (Linux's `exe_file`).
             start_stack: AtomicU64::new(self.start_stack()),
@@ -418,8 +456,9 @@ impl ThreadGroup {
             .map(|used| used.load(Ordering::SeqCst))
             .fold(0u64, u64::saturating_add)
     }
-    /// Whether an interval timer of the process's CPU time is armed, so
-    /// that a checkpoint brings the thread's CPU time up to date for it.
+    /// Whether an interval timer of the process's CPU time is armed or its
+    /// `RLIMIT_CPU` is set, so that a checkpoint brings the thread's CPU
+    /// time up to date for them.
     pub(crate) fn cpu_timers_armed(&self) -> bool {
         self.cpu_timers_armed.load(Ordering::SeqCst)
     }
@@ -434,7 +473,7 @@ impl ThreadGroup {
             .cpu_timers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let old = timers[index];
+        let old = timers.itimers[index];
         let now = self.process_cpu();
         let left = match old.expires {
             0 => 0,
@@ -442,7 +481,7 @@ impl ThreadGroup {
             expires => expires - now,
         };
         if let Some((value, interval)) = new {
-            timers[index] = CpuTimer {
+            timers.itimers[index] = CpuTimer {
                 expires: match value {
                     0 => 0,
                     value => value.saturating_add(TICK_NSEC).saturating_add(now),
@@ -450,14 +489,37 @@ impl ThreadGroup {
                 incr: interval,
             };
             self.cpu_timers_armed
-                .store(timers.iter().any(|t| t.expires != 0), Ordering::SeqCst);
+                .store(timers.armed(), Ordering::SeqCst);
         }
         (old.incr, left)
     }
+    /// The process's `RLIMIT_CPU` soft limit, which sending SIGXCPU raises.
+    pub(crate) fn cpu_soft_limit(&self) -> u64 {
+        self.cpu_timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .limit
+            .0
+    }
+    /// Sets the process's `RLIMIT_CPU`, as `setrlimit` and `prlimit64` do
+    /// (Linux's `update_rlimit_cpu`, which arms the check).
+    pub(crate) fn set_cpu_limit(&self, soft: u64, hard: u64) {
+        let mut timers = self
+            .cpu_timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        timers.limit = (soft, hard);
+        self.cpu_timers_armed
+            .store(timers.armed(), Ordering::SeqCst);
+    }
     /// Expires the CPU-time interval timers whose time the process has
     /// used, each once, sending the process SIGPROF and SIGVTALRM as
-    /// Linux's `check_cpu_itimer` does from the tick. They go through the
-    /// process's inbox, which wakes a thread that waits.
+    /// Linux's `check_cpu_itimer` does from the tick, then checks
+    /// `RLIMIT_CPU` as its `check_process_timers` does: SIGKILL at the hard
+    /// limit, or else SIGXCPU at the soft limit, which then goes up a
+    /// second, so that one comes every second. The limits are taken to
+    /// nanoseconds as Linux's `u64` products are, wrapping. The signals go
+    /// through the process's inbox, which wakes a thread that waits.
     fn expire_cpu_timers(&self) {
         if !self.cpu_timers_armed() {
             return;
@@ -467,23 +529,35 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let now = self.process_cpu();
+        let send = |number| {
+            let _ = self
+                .process_inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .send_pending(signals::PendingSignal::user(number, 128));
+        };
         // Linux checks ITIMER_PROF first.
         for (index, number) in [(1, 27), (0, 26)] {
-            let timer = &mut timers[index];
+            let timer = &mut timers.itimers[index];
             if timer.expires != 0 && now >= timer.expires {
                 timer.expires = match timer.incr {
                     0 => 0,
                     incr => timer.expires.saturating_add(incr),
                 };
-                let _ = self
-                    .process_inbox
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .send_pending(signals::PendingSignal::user(number, 128));
+                send(number);
+            }
+        }
+        let (soft, hard) = timers.limit;
+        if soft != u64::MAX {
+            if hard != u64::MAX && now >= hard.wrapping_mul(1_000_000_000) {
+                send(9);
+            } else if now >= soft.wrapping_mul(1_000_000_000) {
+                send(24);
+                timers.limit.0 = soft.wrapping_add(1);
             }
         }
         self.cpu_timers_armed
-            .store(timers.iter().any(|t| t.expires != 0), Ordering::SeqCst);
+            .store(timers.armed(), Ordering::SeqCst);
     }
     /// Sends this process SIGCHLD about `child`, with its `CLD_*` `code`.
     pub(crate) fn notify_child(&self, code: i32, child: signals::ChildSignal) {

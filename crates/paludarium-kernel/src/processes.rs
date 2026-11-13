@@ -36,7 +36,9 @@ struct Entry {
     execs: u64,
     /// Resource limits (soft, hard), inherited on fork and kept across exec.
     /// They are recorded and reported; RLIMIT_FSIZE and RLIMIT_NOFILE are
-    /// enforced, through the copy of their soft limits in the thread group.
+    /// enforced through the copy of their soft limits in the thread group,
+    /// RLIMIT_CPU through its pair there ([`Entry::limits`]), and
+    /// RLIMIT_CORE when a core is dumped.
     limits: [(u64, u64); RLIMITS],
     /// PR_SET_PDEATHSIG: sent to this process when its parent exits; cleared
     /// on fork.
@@ -71,6 +73,15 @@ struct Entry {
     /// the namespace to be gone, as Linux's `zap_pid_ns_processes` waits,
     /// before its parent is told.
     held: bool,
+}
+impl Entry {
+    /// The resource limits as they are now: the `RLIMIT_CPU` soft limit is
+    /// the thread group's, which sending SIGXCPU raises.
+    fn limits(&self) -> [(u64, u64); RLIMITS] {
+        let mut limits = self.limits;
+        limits[RLIMIT_CPU].0 = self.group.cpu_soft_limit();
+        limits
+    }
 }
 
 /// The tasks of a session and their limit, as a cgroup's `pids.current` and
@@ -114,6 +125,7 @@ const DEFAULT_LIMITS: [(u64, u64); RLIMITS] = [
     (0, 0),               // RTPRIO
     (INFINITY, INFINITY), // RTTIME
 ];
+const RLIMIT_CPU: usize = 0;
 const RLIMIT_NICE: usize = 13;
 const RLIMIT_RTPRIO: usize = 14;
 /// Linux's TASK_UNMAPPED_BASE on x86-64: a third of TASK_SIZE, page-aligned.
@@ -373,7 +385,7 @@ impl Processes {
                     (
                         p.pgid,
                         p.sid,
-                        p.limits,
+                        p.limits(),
                         p.dumpable,
                         p.no_new_privs,
                         p.terminal.clone(),
@@ -809,7 +821,7 @@ impl Processes {
         if !own && !sender.may_prlimit(&entry.group.task_ids(pid, named)) {
             return Err(Errno::EPERM);
         }
-        let old = *entry.limits.get(resource).ok_or(Errno::EINVAL)?;
+        let old = *entry.limits().get(resource).ok_or(Errno::EINVAL)?;
         if let Some((soft, hard)) = new {
             if soft > hard {
                 return Err(Errno::EINVAL);
@@ -822,6 +834,9 @@ impl Processes {
             }
             entry.limits[resource] = (soft, hard);
             entry.group.set_soft_limit(resource, soft);
+            if resource == RLIMIT_CPU {
+                entry.group.set_cpu_limit(soft, hard);
+            }
         }
         Ok(old)
     }
@@ -960,8 +975,8 @@ impl Processes {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&pid)
-            .and_then(|entry| entry.limits.get(resource))
-            .map_or(u64::MAX, |&(soft, _)| soft)
+            .and_then(|entry| entry.limits().get(resource).copied())
+            .map_or(u64::MAX, |(soft, _)| soft)
     }
     pub(crate) fn finish(&self, pid: u32, status: ExitStatus) {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);

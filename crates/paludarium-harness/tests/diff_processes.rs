@@ -265,9 +265,9 @@ mod linux {
                 config
             };
             let host = Arc::new(RecordingHost::new());
-            // Its timers wait for CPU time, which the virtual clock does
-            // not pass.
-            if mode == "cpu-itimer" {
+            // Their timers and limits wait for CPU time, which the virtual
+            // clock does not pass.
+            if mode == "cpu-itimer" || mode == "rlimit-cpu" {
                 host.measure_cpu_time();
             }
             let session = Session::new(config, host.clone()).unwrap();
@@ -529,6 +529,7 @@ mod linux {
         processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
         processes_cpu_itimer => ("cpu-itimer","process"),
+        processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         vfork_exit => ("vfork-exit","process"),

@@ -2334,7 +2334,7 @@ kernel.
   needs `CAP_SYS_RESOURCE` (`EPERM`). `prlimit64` on another thread, to read
   or to set, needs `CAP_SYS_RESOURCE`, or the caller's real user and group IDs
   to be all of that thread's real, effective and saved ones (`EPERM`, before
-  an unknown resource is noticed); a thread's ID names its process. Three are
+  an unknown resource is noticed); a thread's ID names its process. Four are
   enforced, as in Linux:
   - `RLIMIT_NOFILE`: a new descriptor past its soft limit gives `EMFILE` (and
     `open` creates nothing), `dup2`/`dup3` onto a number past it `EBADF`, and
@@ -2344,6 +2344,13 @@ kernel.
     `sendfile` and `splice`) stops at the soft limit; one that
     starts at or past it, and a `truncate`/`ftruncate` or `fallocate` that
     grows the file past it, raise `SIGXFSZ` and fail with `EFBIG`.
+  - `RLIMIT_CPU`: when the process's CPU time reaches the hard limit it is
+    sent `SIGKILL`; when it reaches the soft limit it is sent `SIGXCPU` and
+    the soft limit goes up a second, so another comes each second, as
+    Linux's `check_process_timers` does. The seconds are taken to
+    nanoseconds by a 64-bit product that wraps, as on Linux, so a soft limit
+    of 2^55 seconds or more can come at once. A child of `fork` keeps the
+    limits, and its own CPU time is checked against them.
   - `RLIMIT_CORE`: a process that a core-dumping signal (`SIGSEGV`, `SIGABRT`,
     ...) ends writes an ELF core named `core` in its working directory (mode
     0600 less the umask, replacing an old one), as Linux's `do_coredump` does

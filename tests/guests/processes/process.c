@@ -6290,6 +6290,110 @@ static int cpu_itimer_case(const char *self) {
            WIFSIGNALED(status) ? WTERMSIG(status) : -1);
     return 0;
 }
+/* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
+ * SIGKILL at the hard limit. Each part runs in a child, whose CPU time
+ * starts from 0. */
+static volatile sig_atomic_t rc_xcpu, rc_code;
+static void rc_handler(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    (void)context;
+    rc_code = info->si_code;
+    rc_xcpu++;
+}
+static void rc_spin(long limit) {
+    long end = cit_cpu() + limit;
+    while (cit_cpu() < end)
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+}
+static void rc_report(const char *label, pid_t child) {
+    int status;
+    waitpid(child, &status, 0);
+    printf("%s exited=%d signaled=%d sig=%d\n", label, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+           WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    fflush(stdout);
+}
+static int rlimit_cpu_case(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = rc_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    struct rlimit r;
+    fflush(stdout);
+    /* Soft 1 s, hard 2 s: one SIGXCPU, the soft limit raised to 2, then
+       SIGKILL. */
+    pid_t child = fork();
+    if (child == 0) {
+        sigaction(SIGXCPU, &sa, NULL);
+        r = (struct rlimit){1, 2};
+        setrlimit(RLIMIT_CPU, &r);
+        while (!rc_xcpu) rc_spin(10000000L);
+        getrlimit(RLIMIT_CPU, &r);
+        printf("soft-hard xcpu=%d code=%d now=%ld %ld\n", (int)rc_xcpu, (int)rc_code,
+               (long)r.rlim_cur, (long)r.rlim_max);
+        fflush(stdout);
+        rc_spin(20000000000L);
+        _exit(3);
+    }
+    rc_report("soft-hard", child);
+    /* A soft limit of 0 has passed already: SIGXCPU at once, which by
+       default ends the process. */
+    child = fork();
+    if (child == 0) {
+        r = (struct rlimit){0, RLIM_INFINITY};
+        setrlimit(RLIMIT_CPU, &r);
+        rc_spin(20000000000L);
+        _exit(3);
+    }
+    rc_report("zero-default", child);
+    /* Ignored, it is still sent once a second, each raising the limit. */
+    child = fork();
+    if (child == 0) {
+        signal(SIGXCPU, SIG_IGN);
+        r = (struct rlimit){0, RLIM_INFINITY};
+        setrlimit(RLIMIT_CPU, &r);
+        rc_spin(100000000L);
+        getrlimit(RLIMIT_CPU, &r);
+        printf("zero-ignored soft=%ld\n", (long)r.rlim_cur);
+        fflush(stdout);
+        _exit(0);
+    }
+    rc_report("zero-ignored", child);
+    /* The limit is taken to nanoseconds by a product that wraps: 2^55 s
+       is 0 ns. */
+    child = fork();
+    if (child == 0) {
+        sigaction(SIGXCPU, &sa, NULL);
+        r = (struct rlimit){1UL << 55, RLIM_INFINITY};
+        setrlimit(RLIMIT_CPU, &r);
+        long end = cit_cpu() + 500000000L;
+        while (!rc_xcpu && cit_cpu() < end) rc_spin(1000000L);
+        getrlimit(RLIMIT_CPU, &r);
+        printf("wrapped xcpu=%d soft-raised=%d\n", (int)rc_xcpu,
+               r.rlim_cur == (1UL << 55) + 1);
+        fflush(stdout);
+        _exit(0);
+    }
+    rc_report("wrapped", child);
+    /* A fork's child keeps the limit, and so its check. */
+    child = fork();
+    if (child == 0) {
+        /* Ignored first: a limit already passed sends SIGXCPU at once. */
+        signal(SIGXCPU, SIG_IGN);
+        r = (struct rlimit){0, 1};
+        setrlimit(RLIMIT_CPU, &r);
+        fflush(stdout);
+        pid_t grandchild = fork();
+        if (grandchild == 0) {
+            rc_spin(20000000000L);
+            _exit(3);
+        }
+        rc_report("inherited", grandchild);
+        _exit(0);
+    }
+    rc_report("inherited-parent", child);
+    return 0;
+}
 static long vf_errno(long r) { return r < 0 ? -errno : r; }
 static long vf_preadv2(int fd, void *buf, size_t len, long offset, long flags) {
     struct iovec v = {buf, len};
@@ -20317,6 +20421,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
+    if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {
         struct itimerval v;
         syscall(SYS_getitimer, 1L, &v);

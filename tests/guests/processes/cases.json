@@ -249,6 +249,7 @@
     {"name":"mmsg","binary":"process"},
     {"name":"itimer","binary":"process"},
     {"name":"cpu-itimer","binary":"process"},
+    {"name":"rlimit-cpu","binary":"process"},
     {"name":"mprotect-checks","binary":"process"},
     {"name":"io-uring","binary":"process"},
     {"name":"cloexec","binary":"process"},

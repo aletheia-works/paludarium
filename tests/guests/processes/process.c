@@ -1318,6 +1318,23 @@ static void nl_route_attribute(unsigned short type, const unsigned char *v, int 
         memcpy(metric, v, 4);
         memcpy(&value, v + 4, 4);
         printf("=%u:%u:%u", metric[0], metric[1], value);
+    } else if (type == 8 && len > 8) {
+        /* Metrics: each type, then its u32 or its string. */
+        printf("=");
+        for (int at = 0; at + 4 <= len;) {
+            unsigned short metric[2];
+            memcpy(metric, v + at, 4);
+            if (metric[0] < 4 || at + metric[0] > len) break;
+            int size = metric[0] - 4;
+            printf("%s%u", at ? "," : "", metric[1]);
+            if (size == 4) {
+                memcpy(&value, v + at + 4, 4);
+                printf(":%u", value);
+            } else {
+                printf(":'%.*s'", size, v + at + 4);
+            }
+            at += (metric[0] + 3) & ~3;
+        }
     } else if (len == 4) {
         printf("=%u", value);
     } else if (len == 1) {
@@ -1635,6 +1652,26 @@ static void nl_policy(int fd, unsigned short type, unsigned short flags, struct 
                       const void *value, size_t len, const char *label) {
     nl_put(&b, attr, value, len);
     printf("%s: error=%d\n", label, nl_quiet(fd, type, flags, b.bytes, b.len));
+}
+/* The route-metrics case: sends route request `type` with `flags` for
+   `dst`/`len` through lo (none for a reject type `kind` past 1), with
+   RTA_METRICS holding `b`'s attributes (none when NULL), and prints the
+   answer. */
+static void nl_metrics(int fd, unsigned port, unsigned short type, unsigned short flags, const char *dst, int len,
+                       int kind, const struct nl_body *m, const char *label) {
+    int family = strchr(dst, ':') ? AF_INET6 : AF_INET, size = family == AF_INET ? 4 : 16;
+    struct nl_body b = nl_body(family, 12);
+    b.bytes[1] = len;
+    b.bytes[4] = 254;
+    b.bytes[5] = type == 24 ? 3 : 0;
+    b.bytes[6] = type == 24 && family == AF_INET && kind == 1 ? 253 : type == 24 ? 0 : 255;
+    b.bytes[7] = kind;
+    unsigned char address[16];
+    inet_pton(family, dst, address);
+    nl_put(&b, 1, address, size);
+    if (kind == 1) nl_put32(&b, 4, 1);
+    if (m) nl_put(&b, 8, m->bytes, m->len);
+    nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, b.bytes, b.len), port, label);
 }
 /* A /32 address of lo, `ip`, as `ip address add` makes it. */
 static int nl_local(int fd, const unsigned char ip[4]) {
@@ -12295,6 +12332,128 @@ int main(int argc, char **argv) {
             b = nl_body(AF_INET, 12);
             nl_put32(&b, 200, 0);
             nl_strict(loose, name.pid, 26, 0, &b, "loose get4 unknown type");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "route-metrics")) {
+        /* A child makes a network namespace with lo up and adds IPv4 and
+           IPv6 routes with metrics (RTA_METRICS, as `ip route add ... mtu`
+           sends): those held to their limits, those refused, a route that
+           differs by its metrics alone, removals that name them, and what
+           dumps, lookups and notifications show of them. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            /* IPv4's and IPv6's route groups. */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x440};
+            bind(mon, (void *)&members, sizeof members);
+            const unsigned short add = 0x600, create = 0x400;
+            struct nl_body m;
+            /* Held: an MTU and an advertised MSS of 70000, a hop limit of
+               300; a type of 0 and a value of 0 left out; features and the
+               congestion control by name. */
+            m = nl_body(0, 0);
+            nl_put32(&m, 0, 1);
+            nl_put32(&m, 2, 70000);
+            nl_put32(&m, 8, 70000);
+            nl_put32(&m, 10, 300);
+            nl_put32(&m, 12, 1);
+            nl_put32(&m, 3, 0);
+            nl_put(&m, 16, "cubic", 6);
+            nl_metrics(ctl, port, 24, add, "10.8.0.0", 16, 1, &m, "add held");
+            /* Other metrics make another route; the same again is EEXIST. */
+            struct nl_body mtu = nl_body(0, 0);
+            nl_put32(&mtu, 2, 1400);
+            nl_metrics(ctl, port, 24, create, "10.8.0.0", 16, 1, &mtu, "add other");
+            nl_metrics(ctl, port, 24, create, "10.8.0.0", 16, 1, &mtu, "add other again");
+            /* A blackhole and the default route, and each of the rest. */
+            nl_metrics(ctl, port, 24, add, "10.6.0.0", 16, 6, &mtu, "add blackhole");
+            m = nl_body(0, 0);
+            static const unsigned short kinds[] = {1, 3, 4, 5, 6, 7, 9, 11, 13, 14, 15, 17};
+            for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++) nl_put32(&m, kinds[i], 10 + i);
+            nl_metrics(ctl, port, 24, add, "10.7.0.0", 16, 1, &m, "add every metric");
+            struct nl_body empty = nl_body(0, 0);
+            nl_metrics(ctl, port, 24, add, "10.10.0.0", 16, 1, &empty, "add empty");
+            /* Refused: a type past RTAX_MAX, a short value, a congestion
+               control there is not, an empty name, unknown features. A
+               locked window of 0 is EINVAL only since Linux's commit
+               363c8c79220d (2026-10), which the kernel these run on may
+               not have yet, so only the unit tests check it. */
+            static const struct {
+                const char *label;
+                unsigned short type;
+                const char *value;
+                int len;
+            } bad[] = {
+                {"bad type 18", 18, "\1\0\0\0", 4},
+                {"bad short mtu", 2, "\1\0", 2},
+                {"bad long mtu", 2, "\1\0\0\0\0", 5},
+                {"bad congestion", 16, "nosuchcc", 9},
+                {"bad empty congestion", 16, "", 0},
+                {"bad features", 12, "\x20\0\0\0", 4},
+            };
+            for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+                m = nl_body(0, 0);
+                nl_put(&m, bad[i].type, bad[i].value, bad[i].len);
+                nl_metrics(ctl, port, 24, add, "10.9.0.0", 16, 1, &m, bad[i].label);
+                nl_metrics(ctl, port, 24, add, "2001:db8:9::", 48, 1, &m, bad[i].label);
+            }
+            m = nl_body(0, 0);
+            nl_put32(&m, 1, 0x80);
+            nl_put32(&m, 7, 10);
+            nl_metrics(ctl, port, 24, add, "10.9.0.0", 16, 1, &m, "add locked window");
+            /* IPv6. */
+            m = nl_body(0, 0);
+            nl_put32(&m, 2, 1280);
+            nl_put32(&m, 10, 64);
+            nl_put(&m, 16, "reno", 5);
+            nl_metrics(ctl, port, 24, add, "2001:db8::", 48, 1, &m, "add6");
+            nl_metrics(ctl, port, 24, add, "2001:db8:6::", 48, 6, &mtu, "add6 blackhole");
+            monitor_show(mon, port, "added");
+            unsigned char family = 0;
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump");
+            static const char *const asked[] = {"10.8.1.1", "10.7.1.1", "10.10.1.1", "2001:db8::1"};
+            routes_get(ctl, port, "metrics", asked, sizeof asked / sizeof asked[0], 0);
+            routes_get(ctl, port, "metrics", asked, sizeof asked / sizeof asked[0], 0x2000);
+            /* Removing matches the values named, unheld: 70000 is not the
+               65520 kept; a bad type or value matches nothing; an unknown
+               congestion control is none, which a route with cubic has
+               not. IPv6's does not look at them. */
+            m = nl_body(0, 0);
+            nl_put32(&m, 2, 70000);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &m, "del unheld");
+            m = nl_body(0, 0);
+            nl_put32(&m, 18, 1);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &m, "del type 18");
+            m = nl_body(0, 0);
+            nl_put(&m, 10, "\1\0", 2);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &m, "del short");
+            struct nl_body unknown = nl_body(0, 0);
+            nl_put(&unknown, 16, "nosuchcc", 9);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &unknown, "del unknown congestion");
+            m = nl_body(0, 0);
+            nl_put32(&m, 2, 65520);
+            nl_put(&m, 16, "cubic", 5);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &m, "del held");
+            nl_metrics(ctl, port, 25, 0, "10.10.0.0", 16, 0, &unknown, "del empty by unknown");
+            nl_metrics(ctl, port, 25, 0, "10.7.0.0", 16, 0, &empty, "del every by empty");
+            m = nl_body(0, 0);
+            nl_put32(&m, 18, 1);
+            nl_metrics(ctl, port, 25, 0, "2001:db8::", 48, 0, &m, "del6 type 18");
+            monitor_show(mon, port, "removed");
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump after");
             fflush(stdout);
             _exit(0);
         }

@@ -1571,6 +1571,21 @@ kernel.
     `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
     answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,
     which none is).
+  - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
+    `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
+    `ip_metrics_convert` reads them: each type in turn, one of 0 passed
+    over; `RTAX_MTU` held to 65520, `RTAX_ADVMSS` to 65495 and
+    `RTAX_HOPLIMIT` to 255; `EINVAL` for a type past `RTAX_MAX`, a value
+    of other than four bytes, a congestion control (`RTAX_CC_ALGO`) other
+    than `cubic` and `reno`, features past `RTAX_FEATURE_MASK`, and a
+    locked congestion window of 0. Two IPv4 routes that differ by their
+    metrics alone are two routes, as `fib_find_info` tells them apart. A
+    dump, a notification and a lookup's answer give a route's metrics but
+    those of 0, as `rtnetlink_put_metrics` does (none for the limited
+    broadcast address, whose lookup drops them); an IPv4 removal that
+    names metrics takes only a route that has them, as `fib_metrics_match`
+    compares them (unheld, so an MTU of 70000 is not the 65520 kept), and
+    IPv6's does not look.
   - **Sockets:** an address a local route has is the guest's own: a TCP or
     UDP socket binds to it and reaches it on the loopback, from the
     preferred source of its route. On a loopback an IPv4 address makes its

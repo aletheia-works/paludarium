@@ -24,6 +24,7 @@
     {"name":"monitor","binary":"process"},
     {"name":"routes","binary":"process"},
     {"name":"route-dump","binary":"process"},
+    {"name":"route-metrics","binary":"process"},
     {"name":"netlink-strict","binary":"process"},
     {"name":"link-attributes","binary":"process"},
     {"name":"generic-netlink","binary":"process"},

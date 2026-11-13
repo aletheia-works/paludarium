@@ -454,14 +454,18 @@ verified.
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), renaming `lo`
   and setting any other attribute of it. A
   route goes through `lo` or rejects: IPv6 gateways, multipath routes,
-  metrics (`RTA_METRICS`, as `ip route add ... mtu` sends), encapsulations,
-  nexthop objects, realms, expiries, source prefixes, router preferences
+  encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
   namespace a connection or datagram to an address no local route has is
   still `ENETUNREACH`, whatever route takes it, where Linux's goes out
   through `lo` and is dropped, or fails with a rejecting route's error.
+  A route's metrics (`RTA_METRICS`) are kept and shown, but change
+  nothing a socket does: its MTU, hop limit, window and congestion control
+  are their defaults whatever its route holds. A route may name no
+  congestion control but `cubic` and `reno` (`EINVAL`), where Linux, for a
+  caller with `CAP_NET_ADMIN`, loads the module of another first.
   An address is always permanent: lifetimes (`IFA_CACHEINFO`) and
   `IFA_RT_PRIORITY` are not kept, a peer address is
   not a point-to-point one, and an IPv6 address is never tentative, where

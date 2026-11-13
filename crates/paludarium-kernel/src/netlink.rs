@@ -13,10 +13,11 @@
 //! own (after the last IPv6 address or link, when it has room); an AF_INET6
 //! `RTM_GETLINK` dump shows the loopback as IPv6 does, and an
 //! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table, and AF_MCTP
-//! ones the loopback's MCTP addresses and their local routes; `RTM_GETLINK`
+//! ones the loopback's MCTP addresses and the MCTP routes; `RTM_GETLINK`
 //! without a dump answers for `lo` by index or name, and `RTM_GETROUTE`
 //! without one looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and
-//! remove the loopback's IPv4, IPv6 and MCTP addresses
+//! remove the loopback's IPv4, IPv6 and MCTP addresses, and
+//! `RTM_NEWROUTE` and `RTM_DELROUTE` IPv4, IPv6 and MCTP routes
 //! ([`crate::interface`]); `RTM_NEWLINK`
 //! and `RTM_SETLINK` bring it up or down with `IFF_UP`, given
 //! `CAP_NET_ADMIN` in the user namespace that owns the network namespace.
@@ -29,6 +30,7 @@
 //! and routes as Linux tells them.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::inet::Network;
+use crate::interface::MctpRoute;
 use crate::sockets::Timeout;
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat};
@@ -78,6 +80,12 @@ const RTNLGRP_IPV6_IFADDR: u32 = 9;
 const RTNLGRP_IPV6_ROUTE: u32 = 11;
 const RTNLGRP_IPV6_IFINFO: u32 = 12;
 const RTNLGRP_MCTP_IFADDR: u32 = 34;
+/// `RTN_LOCAL`, the type of an MCTP address's own route.
+const RTN_LOCAL: u8 = 2;
+/// `RTAX_MTU` in `RTA_METRICS`, and the last metric (`RTAX_MAX`,
+/// `RTAX_FASTOPEN_NO_COOKIE`).
+const RTAX_MTU: u16 = 2;
+const RTAX_MAX: u16 = 17;
 const GROUPS: u32 = 39;
 /// The bits of groups 30 and 31, the multicast routing ones of a full
 /// routing daemon, which need `CAP_NET_ADMIN` (`rtnetlink_bind`).
@@ -955,6 +963,10 @@ impl NetlinkSocket {
                 notices.push(notice);
                 Ok(false)
             }
+            RTM_NEWROUTE | RTM_DELROUTE if family == AF_MCTP => {
+                change_mctp_route(&self.network, header, payload)?;
+                Ok(false)
+            }
             RTM_NEWROUTE | RTM_DELROUTE if matches!(family, AF_INET | AF_INET6) => {
                 let events = change_route(&self.network, header, payload)?;
                 let echo = header.flags & NLM_F_ECHO != 0;
@@ -1341,17 +1353,31 @@ fn attributes(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
 /// for a socket that checks strictly (`NETLINK_GET_STRICT_CHK`): `EINVAL`
 /// for a type of 0 or past `max`, and for bytes left after the last whole
 /// attribute. The attribute policies are not checked.
-fn strict_attributes(mut bytes: &[u8], max: u16) -> Result<Vec<(u16, &[u8])>, Errno> {
+fn strict_attributes(bytes: &[u8], max: u16) -> Result<Vec<(u16, &[u8])>, Errno> {
+    policy_attributes(bytes, max, |_, _, _| Ok(()))
+}
+/// The attributes of `bytes` as `nlmsg_parse` and `nla_parse_nested` take
+/// them (`NL_VALIDATE_STRICT`), in one walk as `__nla_validate_parse`'s:
+/// each in turn is `EINVAL` for a type of 0 or past `max`, or else has
+/// `policy` check its type, whether it is marked `NLA_F_NESTED`, and its
+/// value; then bytes left after the last whole attribute are `EINVAL`.
+fn policy_attributes(
+    mut bytes: &[u8],
+    max: u16,
+    policy: impl Fn(u16, bool, &[u8]) -> Result<(), Errno>,
+) -> Result<Vec<(u16, &[u8])>, Errno> {
     let mut out = Vec::new();
     while bytes.len() >= 4 {
         let len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
         if len < 4 || len > bytes.len() {
             break;
         }
-        let kind = u16::from_le_bytes([bytes[2], bytes[3]]) & 0x3fff;
+        let raw = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let kind = raw & 0x3fff;
         if kind == 0 || kind > max {
             return Err(Errno::EINVAL);
         }
+        policy(kind, raw & 0x8000 != 0, &bytes[4..len])?;
         out.push((kind, &bytes[4..len]));
         bytes = &bytes[align(len).min(bytes.len())..];
     }
@@ -1359,6 +1385,16 @@ fn strict_attributes(mut bytes: &[u8], max: u16) -> Result<Vec<(u16, &[u8])>, Er
         Ok(out)
     } else {
         Err(Errno::EINVAL)
+    }
+}
+/// A strict policy's check of an `NLA_U8`, `NLA_U32` or exact-length
+/// binary attribute (`validate_nla`): `EINVAL` for another length, or for
+/// one marked `NLA_F_NESTED`.
+fn exact(nested: bool, value: &[u8], len: usize) -> Result<(), Errno> {
+    if nested || value.len() != len {
+        Err(Errno::EINVAL)
+    } else {
+        Ok(())
     }
 }
 /// The attributes' values by type, the last of each, in the order of
@@ -1569,26 +1605,49 @@ fn mctp_address(eid: u8, kind: u16, flags: u16, seq: u32, port: u32) -> Vec<u8> 
     message(kind, flags, seq, port, &body)
 }
 /// The MCTP routes, as `mctp_dump_rtinfo` dumps them: the local route of
-/// each of `lo`'s addresses (`mctp_route_add_local`), the newest first, as
-/// `mctp_route_add` puts each at the head of the list. As
-/// `mctp_fill_rtinfo`: a range of no more endpoints (`rtm_dst_len` counts
-/// them), the default table, `RTPROT_STATIC`, link scope and
-/// `RTN_LOCAL`; its first endpoint as `RTA_DST`, metrics with no MTU (not
-/// marked nested) and `lo` as `RTA_OIF`.
+/// each of `lo`'s addresses (`mctp_route_add_local`) and the routes
+/// through gateways, the newest first, as `mctp_route_add` puts each at
+/// the head of the list. As `mctp_fill_rtinfo`: the number of endpoints
+/// after the first as `rtm_dst_len`, the default table, `RTPROT_STATIC`,
+/// link scope through `lo` and universe scope through a gateway, and the
+/// route's type; its first endpoint as `RTA_DST`, metrics with its MTU if
+/// it has one (not marked nested), and `lo` as `RTA_OIF` or the gateway's
+/// `mctp_fq_addr` as `RTA_GATEWAY`.
 fn mctp_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
     const RTPROT_STATIC: u8 = 4;
     const RT_SCOPE_LINK: u8 = 253;
-    const RTN_LOCAL: u8 = 2;
-    let eids = network.addresses().mctp.clone();
-    eids.into_iter()
-        .rev()
-        .map(|eid| {
-            let mut body = vec![AF_MCTP, 0, 0, 0, table_byte(RT_TABLE_DEFAULT)];
-            body.extend_from_slice(&[RTPROT_STATIC, RT_SCOPE_LINK, RTN_LOCAL]);
+    const RT_SCOPE_UNIVERSE: u8 = 0;
+    let routes = network.addresses().mctp_routes.clone();
+    routes
+        .into_iter()
+        .map(|route| {
+            let scope = if route.gateway.is_some() {
+                RT_SCOPE_UNIVERSE
+            } else {
+                RT_SCOPE_LINK
+            };
+            let mut body = vec![AF_MCTP, route.max - route.min, 0, 0];
+            body.extend_from_slice(&[
+                table_byte(RT_TABLE_DEFAULT),
+                RTPROT_STATIC,
+                scope,
+                route.kind,
+            ]);
             body.extend_from_slice(&0u32.to_le_bytes());
-            attribute(&mut body, RTA_DST, &[eid]);
-            attribute(&mut body, RTA_METRICS, &[]);
-            attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+            attribute(&mut body, RTA_DST, &[route.min]);
+            let mut metrics = Vec::new();
+            if route.mtu != 0 {
+                attribute(&mut metrics, RTAX_MTU, &route.mtu.to_le_bytes());
+            }
+            attribute(&mut body, RTA_METRICS, &metrics);
+            match route.gateway {
+                None => attribute(&mut body, RTA_OIF, &1u32.to_le_bytes()),
+                Some((net, eid)) => {
+                    let mut address = net.to_le_bytes().to_vec();
+                    address.extend_from_slice(&[eid, 0, 0, 0]);
+                    attribute(&mut body, RTA_GATEWAY, &address);
+                }
+            }
             message(RTM_NEWROUTE, NLM_F_MULTI, seq, port, &body)
         })
         .collect()
@@ -1607,13 +1666,11 @@ fn change_mctp_address(network: &Network, header: &Header, payload: &[u8]) -> Re
     if payload.len() < 8 {
         return Err(Errno::EINVAL);
     }
-    let attributes = strict_attributes(&payload[8..], IFA_MAX)?;
-    if attributes
-        .iter()
-        .any(|&(kind, value)| !matches!(kind, IFA_LOCAL | IFA_ADDRESS) || value.len() != 1)
-    {
-        return Err(Errno::EINVAL);
-    }
+    // `ifa_mctp_policy`: both are `NLA_U8`, and no other is taken.
+    let attributes = policy_attributes(&payload[8..], IFA_MAX, |kind, nested, value| match kind {
+        IFA_LOCAL | IFA_ADDRESS => exact(nested, value, 1),
+        _ => Err(Errno::EINVAL),
+    })?;
     let table = by_type(&attributes);
     let eid = table
         .get(&IFA_LOCAL)
@@ -1634,11 +1691,138 @@ fn change_mctp_address(network: &Network, header: &Header, payload: &[u8]) -> Re
             return Err(EEXIST);
         }
         addresses.mctp.push(eid);
+        // `mctp_route_add_local`, whose failure for a route there is
+        // already is not the address's.
+        let local = MctpRoute {
+            min: eid,
+            max: eid,
+            kind: RTN_LOCAL,
+            mtu: 0,
+            gateway: None,
+        };
+        if !addresses.mctp_routes.iter().any(|r| same_range(r, &local)) {
+            addresses.mctp_routes.insert(0, local);
+        }
     } else {
         let at = at.ok_or(Errno::ENOENT)?;
         addresses.mctp.remove(at);
+        // `mctp_route_remove_local`, which may find none.
+        addresses
+            .mctp_routes
+            .retain(|r| !(r.net() == 1 && r.min == eid && r.max == eid && r.kind == RTN_LOCAL));
     }
     Ok(eid)
+}
+/// Whether two MCTP routes cover the same range of the same network, which
+/// `mctp_route_add` takes as a duplicate (`mctp_rt_compare_exact`).
+fn same_range(a: &MctpRoute, b: &MctpRoute) -> bool {
+    a.net() == b.net() && a.min == b.min && a.max == b.max
+}
+/// Adds (`RTM_NEWROUTE`) or removes (`RTM_DELROUTE`) an MCTP route, as
+/// `mctp_newroute` and `mctp_delroute` do. The request is parsed as
+/// `nlmsg_parse` does with `rta_mctp_policy`: `EINVAL` for a short
+/// `rtmsg`, a type of 0 or past `RTA_MAX`, bytes left over, an attribute
+/// but `RTA_DST` (one byte), `RTA_OIF` (four), `RTA_GATEWAY` (a
+/// `mctp_fq_addr`, eight, `ERANGE` for another length) and `RTA_METRICS`
+/// (nested, `ERANGE` for one of one to three bytes). Then, in
+/// `mctp_route_nlparse_common`'s order: no `RTA_DST` is `EINVAL`, both
+/// `RTA_OIF` and `RTA_GATEWAY` or neither `EINVAL`, an interface but `lo`
+/// `ENODEV`, a gateway's broadcast or reserved ID `EINVAL`, and a type but
+/// `RTN_UNICAST` `EINVAL`. A gateway in network 0 (`MCTP_NET_ANY`) is in
+/// the default one, 1. The range is `RTA_DST` and the `rtm_dst_len` IDs
+/// after it, `EINVAL` past 254.
+///
+/// Adding, `RTA_METRICS` is parsed with `rta_metrics_policy` (`EINVAL` for
+/// anything but a four-byte `RTAX_MTU`); a route through `lo` is `EINVAL`
+/// ("no routes to loopback"), as is a range from a reserved ID, and one of
+/// a range a route of the network has `EEXIST`. Removing takes the
+/// network, range and type alone, so `RTA_OIF` of `lo` names its network
+/// too, whatever the gateway, and does not look inside `RTA_METRICS`
+/// (`mctp_route_nlparse_lookup`); none is `ENOENT`. No notification goes
+/// out.
+fn change_mctp_route(network: &Network, header: &Header, payload: &[u8]) -> Result<(), Errno> {
+    const RTN_UNICAST: u8 = 1;
+    if payload.len() < 12 {
+        return Err(Errno::EINVAL);
+    }
+    let attributes = policy_attributes(&payload[12..], RTA_MAX, |kind, nested, value| {
+        match kind {
+            RTA_DST => exact(nested, value, 1),
+            RTA_OIF => exact(nested, value, 4),
+            // `NLA_POLICY_EXACT_LEN`, a binary range: `ERANGE` for
+            // another length (`nla_validate_range_unsigned`).
+            RTA_GATEWAY if nested => Err(Errno::EINVAL),
+            RTA_GATEWAY if value.len() != 8 => Err(ERANGE),
+            RTA_GATEWAY => Ok(()),
+            // `NLA_NESTED`: marked, and empty or holding a header.
+            RTA_METRICS if !nested => Err(Errno::EINVAL),
+            RTA_METRICS if (1..4).contains(&value.len()) => Err(ERANGE),
+            RTA_METRICS => Ok(()),
+            _ => Err(Errno::EINVAL),
+        }
+    })?;
+    let table = by_type(&attributes);
+    let start = table.get(&RTA_DST).ok_or(Errno::EINVAL)?[0];
+    let oif = table.get(&RTA_OIF).map_or(0, |value| {
+        u32::from_le_bytes(value[..4].try_into().unwrap_or_default())
+    });
+    let gateway = match (oif, table.get(&RTA_GATEWAY)) {
+        (0, None) | (1.., Some(_)) => return Err(Errno::EINVAL),
+        (1, None) => None,
+        (_, None) => return Err(ENODEV),
+        (0, Some(value)) => {
+            let eid = value[4];
+            if !(8..255).contains(&eid) {
+                return Err(Errno::EINVAL);
+            }
+            let net = u32::from_le_bytes(value[..4].try_into().unwrap_or_default());
+            Some((if net == 0 { 1 } else { net }, eid))
+        }
+    };
+    if payload[7] != RTN_UNICAST {
+        return Err(Errno::EINVAL);
+    }
+    let extent = payload[1];
+    if u16::from(start) + u16::from(extent) >= 255 {
+        return Err(Errno::EINVAL);
+    }
+    let route = MctpRoute {
+        min: start,
+        max: start + extent,
+        kind: RTN_UNICAST,
+        mtu: 0,
+        gateway,
+    };
+    let mut addresses = network.addresses();
+    if header.kind == RTM_DELROUTE {
+        let before = addresses.mctp_routes.len();
+        addresses
+            .mctp_routes
+            .retain(|r| !(same_range(r, &route) && r.kind == RTN_UNICAST));
+        return if addresses.mctp_routes.len() == before {
+            Err(Errno::ENOENT)
+        } else {
+            Ok(())
+        };
+    }
+    let mut mtu = 0;
+    if let Some(metrics) = table.get(&RTA_METRICS) {
+        let metrics = policy_attributes(metrics, RTAX_MAX, |kind, nested, value| match kind {
+            RTAX_MTU => exact(nested, value, 4),
+            _ => Err(Errno::EINVAL),
+        })?;
+        if let Some(value) = by_type(&metrics).get(&RTAX_MTU) {
+            mtu = u32::from_le_bytes(value[..4].try_into().unwrap_or_default());
+        }
+    }
+    if gateway.is_none() || start < 8 {
+        return Err(Errno::EINVAL);
+    }
+    if addresses.mctp_routes.iter().any(|r| same_range(r, &route)) {
+        return Err(EEXIST);
+    }
+    addresses.mctp_routes.insert(0, MctpRoute { mtu, ..route });
+    Ok(())
 }
 /// What a route dump shows, as `struct fib_dump_filter`.
 #[derive(Default)]
@@ -3674,6 +3858,268 @@ mod tests {
         );
         assert_eq!(request(RTM_DELADDR, 2, &[(IFA_LOCAL, &[8])]), Err(ENODEV));
         assert_eq!(network.addresses().mctp, [8, 10]);
+    }
+
+    #[test]
+    fn mctp_routes_go_through_gateways_alone() {
+        let network = Network::isolated(crate::users::first());
+        // An rtmsg of RTN_UNICAST from `dst` with `len` more, then attributes.
+        let route = |kind: u16, len: u8, rtn: u8, attributes: &[(u16, &[u8])]| {
+            let mut payload = vec![AF_MCTP, len, 0, 0, 0, 0, 0, rtn, 0, 0, 0, 0];
+            for &(kind, value) in attributes {
+                attribute(&mut payload, kind, value);
+            }
+            let header = Header {
+                len: 0,
+                kind,
+                flags: 0,
+                seq: 3,
+            };
+            change_mctp_route(&network, &header, &payload)
+        };
+        let gateway = |net: u32, eid: u8| {
+            let mut value = net.to_le_bytes().to_vec();
+            value.extend_from_slice(&[eid, 0, 0, 0]);
+            value
+        };
+        let one = gateway(0, 20);
+        let lo = 1u32.to_le_bytes();
+        let mut mtu = Vec::new();
+        attribute(&mut mtu, RTAX_MTU, &1500u32.to_le_bytes());
+        let metrics = RTA_METRICS | 0x8000;
+        assert_eq!(
+            route(
+                RTM_NEWROUTE,
+                2,
+                1,
+                &[(RTA_DST, &[30]), (RTA_GATEWAY, &one), (metrics, &mtu)]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            route(
+                RTM_NEWROUTE,
+                2,
+                1,
+                &[(RTA_DST, &[30]), (RTA_GATEWAY, &gateway(1, 21))]
+            ),
+            Err(EEXIST)
+        );
+        // Another range, or another network, is no duplicate.
+        assert_eq!(
+            route(
+                RTM_NEWROUTE,
+                0,
+                1,
+                &[(RTA_DST, &[30]), (RTA_GATEWAY, &gateway(5, 21))]
+            ),
+            Ok(())
+        );
+        let short = [1u8, 2];
+        for (len, rtn, attributes, error) in [
+            // Through lo, and to no output.
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40][..]), (RTA_OIF, &lo[..])][..],
+                Errno::EINVAL,
+            ),
+            (0, 1, &[(RTA_DST, &[40])], Errno::EINVAL),
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40]), (RTA_OIF, &2u32.to_le_bytes())],
+                ENODEV,
+            ),
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40]), (RTA_OIF, &lo), (RTA_GATEWAY, &one)],
+                Errno::EINVAL,
+            ),
+            (0, 1, &[(RTA_GATEWAY, &one)], Errno::EINVAL),
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40]), (RTA_GATEWAY, &gateway(0, 7))],
+                Errno::EINVAL,
+            ),
+            (
+                0,
+                2,
+                &[(RTA_DST, &[40]), (RTA_GATEWAY, &one)],
+                Errno::EINVAL,
+            ),
+            // A reserved first ID, and a range past 254.
+            (0, 1, &[(RTA_DST, &[7]), (RTA_GATEWAY, &one)], Errno::EINVAL),
+            (
+                15,
+                1,
+                &[(RTA_DST, &[240]), (RTA_GATEWAY, &one)],
+                Errno::EINVAL,
+            ),
+            // The policies.
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40, 0]), (RTA_GATEWAY, &one)],
+                Errno::EINVAL,
+            ),
+            (0, 1, &[(RTA_DST, &[40]), (RTA_GATEWAY, &one[..5])], ERANGE),
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40]), (RTA_GATEWAY, &one), (RTA_METRICS, &[])],
+                Errno::EINVAL,
+            ),
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40]), (RTA_GATEWAY, &one), (metrics, &short)],
+                ERANGE,
+            ),
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40]), (RTA_GATEWAY, &one), (metrics, &mtu[..6])],
+                Errno::EINVAL,
+            ),
+            (
+                0,
+                1,
+                &[(RTA_DST, &[40]), (RTA_GATEWAY, &one), (RTA_TABLE, &lo)],
+                Errno::EINVAL,
+            ),
+            (
+                0,
+                1,
+                &[(RTA_DST | 0x8000, &[40]), (RTA_GATEWAY, &one)],
+                Errno::EINVAL,
+            ),
+            (0, 1, &[(RTA_MAX + 1, &[40])], Errno::EINVAL),
+        ] {
+            assert_eq!(
+                route(RTM_NEWROUTE, len, rtn, attributes),
+                Err(error),
+                "{attributes:?}"
+            );
+        }
+        // An address's local route is no duplicate of a gateway's of another
+        // network, but takes none where one is.
+        let address = |kind: u16, eid: u8| {
+            let mut payload = vec![AF_MCTP, 0, 0, 0, 1, 0, 0, 0];
+            attribute(&mut payload, IFA_LOCAL, &[eid]);
+            let header = Header {
+                len: 0,
+                kind,
+                flags: 0,
+                seq: 3,
+            };
+            change_mctp_address(&network, &header, &payload)
+        };
+        assert_eq!(address(RTM_NEWADDR, 8), Ok(8));
+        assert_eq!(
+            route(RTM_NEWROUTE, 0, 1, &[(RTA_DST, &[50]), (RTA_GATEWAY, &one)]),
+            Ok(())
+        );
+        assert_eq!(address(RTM_NEWADDR, 50), Ok(50));
+        let dumped = mctp_routes(&network, 4, 7);
+        assert_eq!(dumped.len(), 4);
+        // The newest first: 50 by 20, 8 through lo, 30 by 5:21, 30-32 by 1:20.
+        assert_eq!(
+            &dumped[0][16..28],
+            &[AF_MCTP, 0, 0, 0, 253, 4, 0, 1, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            &dumped[1][16..28],
+            &[AF_MCTP, 0, 0, 0, 253, 4, 253, 2, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            &dumped[3][16..28],
+            &[AF_MCTP, 2, 0, 0, 253, 4, 0, 1, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            attributes(&dumped[3][28..]),
+            [
+                (RTA_DST, &[30][..]),
+                (RTA_METRICS, &mtu[..]),
+                (RTA_GATEWAY, &gateway(1, 20)[..])
+            ]
+        );
+        assert_eq!(attributes(&dumped[2][28..])[2].1, &gateway(5, 21)[..]);
+        // Removing takes the network, range and type: lo's index names
+        // network 1, and an address's route is not RTN_UNICAST.
+        assert_eq!(
+            route(RTM_DELROUTE, 0, 1, &[(RTA_DST, &[8]), (RTA_OIF, &lo)]),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(
+            route(RTM_DELROUTE, 0, 2, &[(RTA_DST, &[8]), (RTA_OIF, &lo)]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            route(RTM_DELROUTE, 2, 1, &[(RTA_DST, &[30]), (RTA_OIF, &lo)]),
+            Ok(())
+        );
+        assert_eq!(
+            route(
+                RTM_DELROUTE,
+                0,
+                1,
+                &[(RTA_DST, &[30]), (RTA_GATEWAY, &gateway(5, 99))]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            route(RTM_DELROUTE, 15, 1, &[(RTA_DST, &[240]), (RTA_OIF, &lo)]),
+            Err(Errno::EINVAL)
+        );
+        // RTA_OIF of 0 is no interface (`ifindex` is its value): with a
+        // gateway it is the gateway's route, alone no output.
+        let none = 0u32.to_le_bytes();
+        assert_eq!(
+            route(
+                RTM_NEWROUTE,
+                0,
+                1,
+                &[(RTA_DST, &[60]), (RTA_OIF, &none), (RTA_GATEWAY, &one)]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            route(RTM_NEWROUTE, 0, 1, &[(RTA_DST, &[61]), (RTA_OIF, &none)]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            route(RTM_DELROUTE, 0, 1, &[(RTA_DST, &[60]), (RTA_GATEWAY, &one)]),
+            Ok(())
+        );
+        // Removing does not look inside the metrics.
+        let mut hoplimit = Vec::new();
+        attribute(&mut hoplimit, 10, &64u32.to_le_bytes());
+        assert_eq!(
+            route(
+                RTM_DELROUTE,
+                0,
+                1,
+                &[(RTA_DST, &[60]), (RTA_GATEWAY, &one), (metrics, &hoplimit)]
+            ),
+            Err(Errno::ENOENT)
+        );
+        // 50's address goes without a local route to remove.
+        assert_eq!(address(RTM_DELADDR, 50), Ok(50));
+        assert_eq!(address(RTM_DELADDR, 8), Ok(8));
+        let left = network.addresses().mctp_routes.clone();
+        assert_eq!(
+            left,
+            [MctpRoute {
+                min: 50,
+                max: 50,
+                kind: 1,
+                mtu: 0,
+                gateway: Some((1, 20))
+            }]
+        );
     }
 
     #[test]

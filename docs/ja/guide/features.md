@@ -47,7 +47,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
@@ -713,6 +713,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EINVAL`）、`CAP_SYS_NICE` が要ります（`EPERM`）。その範囲は、マップされていれば
   足ります（`ENOMEM`）。確かめる順は Linux と同じで、`flags`、iovec、pidfd（`EBADF`、
   `ESRCH`）、プロセスを読む権利（`EACCES`）、指定の順です。
+- `process_mrelease` は、`process_madvise` と同じようにプロセスを探します（`flags` は
+  0 で、そのあと `EBADF`、`ESRCH`）。終わったプロセス（ゾンビ）には、もうメモリが
+  ありません（`ESRCH`）。そのメモリが解放されるところなら成功します。つまり、プロセスが
+  終わりかけていて（SIGKILL を送られたか、終わり始めていて、コアダンプを書いていない）、
+  そのメモリで動くほかのプロセスもみな同じときです。
+  それ以外は、呼んだプロセス自身も含めて `EINVAL` です。メモリはプロセスの最後の
+  スレッドが終わるときに解放されるので、それより早く解放するものはありません。
 - `mremap` は、後ろが空いていればその場で広げ、空いていなければ `MREMAP_MAYMOVE` で
   中身ごと動かします。`MREMAP_FIXED` と `MREMAP_DONTUNMAP` も使えます。共有のメモリは、
   動かしても `fork` した相手と共有したままです。ファイルのマッピングは、ファイルの
@@ -1240,9 +1247,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `mctp_dump_addrinfo` と同じく MCTP 自身が扱い、ID を足した順に、それぞれ `IFA_LOCAL` と
     `IFA_ADDRESS` で返します。検査するときに要るのは `ifaddrmsg` 全体だけで（足りなければ
     `EINVAL`）、インデックスは `NLM_F_DUMP_FILTERED` を付けずに絞り込みます。ID ごとに
-    ローカルの経路があり（`mctp_route_add_local`）、`AF_MCTP` の経路のダンプは、
-    `mctp_dump_rtinfo` と同じく絞り込みを取らずに、新しいものから返します。すべての
-    ファミリーのアドレスと経路のダンプ（`rtnl_dump_all`）は、最後に MCTP のものを返します。
+    ローカルの経路が付き（`mctp_route_add_local`）、ID を消すと消えます。ただし、
+    ネットワーク 1 にその ID だけの経路がすでにあれば付きません。すべてのファミリーの
+    アドレスと経路のダンプ（`rtnl_dump_all`）は、最後に MCTP のものを返します。
+  - **MCTP の経路:** `AF_MCTP` の `RTM_NEWROUTE` は、`mctp_newroute` と同じく
+    ゲートウェイを通る経路を足します。範囲は `RTA_DST` とその後の `rtm_dst_len` 個の ID で、
+    `RTA_GATEWAY` の `mctp_fq_addr` を通ります（ネットワーク 0 は既定の 1 です）。
+    `RTA_METRICS` に MTU があれば持ちます。リクエストは `rta_mctp_policy` で厳しく
+    解釈します（`EINVAL`、8 バイトでないゲートウェイと 1 から 3 バイトのメトリクスは
+    `ERANGE`）。`RTA_DST`、ユニキャストの
+    ゲートウェイ ID、`RTN_UNICAST` の型が要ります（`EINVAL`）。`lo` を通る経路
+    （`EINVAL`、"no routes to loopback"）、ほかのインターフェースを通る経路（`ENODEV`）、
+    8 より小さい ID か 254 を超える範囲（`EINVAL`）、そのネットワークにすでにある範囲
+    （`EEXIST`）は取りません。`RTM_DELROUTE` は、`mctp_delroute` と同じく、ネットワークと
+    範囲の合う `RTN_UNICAST` の経路を消します（なければ `ENOENT`）。ネットワークは
+    ゲートウェイのもの、または `lo` のインデックスのものです。どちらも、Linux と同じく
+    通知を送りません。`AF_MCTP` の経路のダンプは、`mctp_dump_rtinfo` と同じく絞り込みを
+    取らずに、ローカルの経路とゲートウェイの経路を新しいものから返します。
   - **経路:** ファミリーごとに、Linux の `fib_trie` と `ip6_fib` と同じく経路の表を
     持ちます。IPv4 のローカルの表とメインの表は、ポリシーのルールがない間の Linux と同じく
     1 つのトライを分け合います。アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付ける
@@ -1849,6 +1870,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   1 ms）。スケジューラの呼び出しも同じティックを使います。ここでは、ティックは
   それぞれの時計でその倍数ちょうどに来ます。`clock_getres` は 1 ns、粗い時計では
   ティックの長さを返します。
+- `clock_nanosleep` と `timer_create` は、`CLOCK_REALTIME`、`CLOCK_MONOTONIC`、
+  `CLOCK_BOOTTIME`、`CLOCK_TAI` で動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
+  粗い時計は読むことしかできないので `EOPNOTSUPP` になり、スレッドの CPU 時計で眠る
+  ときも `EOPNOTSUPP` です。`clock_nanosleep` は、`flags` のうち `TIMER_ABSTIME`
+  しか見ません。プロセスの CPU 時計で眠ること、CPU 時間のタイマー、アラームの時計は
+  まだ再現していません（`EINVAL`）。
 - プロセスの実時間のインターバルタイマー（`ITIMER_REAL`）は、Linux と同じく、満了すると
   `SIGALRM` を送り、間隔の分だけ次に進みます。`setitimer` はタイマーより先に新しい値を読んで
   確かめ、古い値はタイマーを設定してから書き出すので、古い値を書けないときはタイマーを設定した

@@ -389,10 +389,18 @@ pub(crate) fn err(e: Errno) -> Outcome {
     Outcome::Return(e.to_syscall_return())
 }
 
-fn clock_id(id: u64) -> Result<ClockId, Errno> {
-    match id {
-        0 => Ok(ClockId::Realtime),
-        1 => Ok(ClockId::Monotonic),
+/// The clock a `clock_nanosleep` sleeps on or a `timer_create` timer runs
+/// on, as Linux's `k_clock`s give them: TAI on the real-time clock (its
+/// offset is 0), BOOTTIME on the monotonic one (this host never suspends).
+/// MONOTONIC_RAW and the coarse clocks can only be read (`EOPNOTSUPP`), as
+/// can the thread's CPU clock for a sleep (`thread`), but the CPU clocks and
+/// the alarm clocks are not modelled (`EINVAL`), nor are unknown clocks.
+fn timer_clock(id: u64, thread: Errno) -> Result<ClockId, Errno> {
+    match id as u32 as i32 {
+        0 | 11 => Ok(ClockId::Realtime),
+        1 | 7 => Ok(ClockId::Monotonic),
+        3 => Err(thread),
+        4..=6 => Err(Errno::EOPNOTSUPP),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -810,25 +818,23 @@ fn outcome(result: Result<u64, Errno>) -> Outcome {
     Outcome::Return(result.unwrap_or_else(Errno::to_syscall_return))
 }
 
-/// `timer_create(clock, sevp, timerid)`. CLOCK_REALTIME and CLOCK_MONOTONIC
-/// (and CLOCK_BOOTTIME, which never sleeps here) are supported, notified by
-/// a signal to the process or (SIGEV_THREAD_ID) to one of its threads, or not
-/// at all; CPU-time clocks give EINVAL. The kernel treats SIGEV_THREAD, which
-/// the C library implements itself, as SIGEV_SIGNAL.
+/// `timer_create(clock, sevp, timerid)`, on the clocks [`timer_clock`]
+/// gives (the CPU-time clocks give EINVAL), notified by a signal to the
+/// process or (SIGEV_THREAD_ID) to one of its threads, or not at all. The
+/// kernel treats SIGEV_THREAD, which the C library implements itself, as
+/// SIGEV_SIGNAL. Linux copies the whole 64-byte struct sigevent before it
+/// looks at the clock.
 fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome((|| {
-        let realtime = match a[0] {
-            0 => true,
-            1 | 7 => false,
-            _ => return Err(Errno::EINVAL),
-        };
-        let (signal, value, thread) = if a[1] == 0 {
-            (Some(14), None, None) // SIGALRM, with the timer ID as its value
-        } else {
-            // Linux copies the whole 64-byte struct sigevent.
+        if a[1] != 0 {
             c.mem
                 .check_read(GuestAddr(a[1]), 64)
                 .map_err(|_| Errno::EFAULT)?;
+        }
+        let realtime = timer_clock(a[0], Errno::EINVAL)? == ClockId::Realtime;
+        let (signal, value, thread) = if a[1] == 0 {
+            (Some(14), None, None) // SIGALRM, with the timer ID as its value
+        } else {
             let [value, word, tid] = read_words::<3>(c.mem, a[1])?;
             let (number, notify) = (word as u32 as i32, (word >> 32) as u32);
             // good_sigevent: the thread must be in this thread group, then the
@@ -1058,14 +1064,14 @@ fn sys_rt_sigtimedwait(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 fn sys_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     sleep(c, ClockId::Monotonic, false, a[0], a[1])
 }
+/// `clock_nanosleep(clock, flags, request, remain)` on the clocks
+/// [`timer_clock`] gives, where the thread's CPU clock cannot sleep
+/// (`EOPNOTSUPP`). Linux looks only at `TIMER_ABSTIME` in `flags`.
 fn sys_clock_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    let id = match clock_id(a[0]) {
+    let id = match timer_clock(a[0], Errno::EOPNOTSUPP) {
         Ok(id) => id,
         Err(e) => return err(e),
     };
-    if a[1] & !1 != 0 {
-        return err(Errno::EINVAL);
-    }
     sleep(c, id, a[1] & 1 != 0, a[2], a[3])
 }
 fn sys_rt_sigreturn(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {

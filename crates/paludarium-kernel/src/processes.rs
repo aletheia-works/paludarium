@@ -1443,6 +1443,30 @@ impl Processes {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.get(&pid).map(|entry| entry.status.is_some())
     }
+    /// Whether `process_mrelease` finds the memory of process `pid` on its
+    /// way to be freed, as Linux's `task_will_free_mem` does: it is dying
+    /// ([`ThreadGroup::will_free_memory`]), and so is every other live
+    /// process that runs in its memory. `None` once it has exited, as a
+    /// zombie keeps no memory for Linux's `find_lock_task_mm` to find, or
+    /// is reaped (or never was).
+    fn will_free_memory(&self, pid: u32) -> Option<bool> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get(&pid).filter(|entry| entry.status.is_none())?;
+        if !entry.group.will_free_memory() {
+            return Some(false);
+        }
+        let spaces = entry.group.memory_identities();
+        Some(entries.iter().all(|(&other, sharer)| {
+            other == pid
+                || sharer.status.is_some()
+                || sharer.group.will_free_memory()
+                || !sharer
+                    .group
+                    .memory_identities()
+                    .iter()
+                    .any(|space| spaces.contains(space))
+        }))
+    }
     /// What `pidfd_open` finds at `pid`: a process (`Ok`), a thread of one
     /// (`ENOENT`) or nothing (`ESRCH`).
     fn pidfd_target(&self, pid: u32) -> Result<(), Errno> {
@@ -1792,7 +1816,13 @@ impl Processes {
             }
             return Ok(());
         }
-        send(&entry.group)
+        send(&entry.group)?;
+        // SIGKILL ends the whole process from the moment it is sent, as
+        // Linux's complete_signal marks it.
+        if number == 9 {
+            entry.group.set_killed();
+        }
+        Ok(())
     }
 }
 
@@ -2017,6 +2047,7 @@ impl Kernel {
             310 | 311 => self.process_vm(thread, mem, a, n == 311),
             438 => self.pidfd_getfd(thread, a),
             440 => self.process_madvise(thread, mem, a),
+            448 => self.process_mrelease(a),
             256 => self.migrate_pages(thread, mem, a),
             279 => self.move_pages(thread, mem, a),
             129 => self.sigqueueinfo(thread, mem, a),
@@ -3416,6 +3447,38 @@ impl Kernel {
             }
         }
         Ok(done)
+    }
+    /// `process_mrelease(pidfd, flags)`, as Linux master's: `flags` must be
+    /// 0 (`EINVAL`); then the task, `PIDFD_SELF_THREAD` or
+    /// `PIDFD_SELF_THREAD_GROUP` for the caller's, or a pidfd's process
+    /// (`EBADF` for no pidfd, `ESRCH` once it is reaped). It must still have
+    /// its memory (`ESRCH` once it has exited, as a zombie), and that memory
+    /// must be on its way to be freed ([`Processes::will_free_memory`]), or
+    /// there is nothing to release early (`EINVAL`). There is nothing to do then:
+    /// the memory goes as the process's last thread ends, which is no later
+    /// than Linux's reaper would free it.
+    fn process_mrelease(&self, a: [u64; 6]) -> Result<u64, Errno> {
+        const PIDFD_SELF_THREAD: i32 = -10000;
+        const PIDFD_SELF_THREAD_GROUP: i32 = -10001;
+        if a[1] as u32 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pid = match a[0] as i32 {
+            PIDFD_SELF_THREAD | PIDFD_SELF_THREAD_GROUP => self.process.pid,
+            _ => {
+                let d = self.files.descriptor(u64::from(a[0] as u32))?;
+                d.file
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<PidFd>())
+                    .ok_or(Errno::EBADF)?
+                    .pid
+            }
+        };
+        match self.processes.will_free_memory(pid) {
+            None => Err(Errno(3)),
+            Some(true) => Ok(0),
+            Some(false) => Err(Errno::EINVAL),
+        }
     }
     /// Whether `[start, start + len)` of `memory` is mapped through, as
     /// `madvise_walk_vmas` finds a hole (`ENOMEM`).

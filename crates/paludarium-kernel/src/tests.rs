@@ -2291,6 +2291,17 @@ fn posix_timers_check_arguments_and_report_their_state() {
     assert_eq!(f.ret(nr::TIMER_CREATE, &[1, sev, id]), errno(Errno::EINVAL));
     assert_eq!(f.ret(nr::TIMER_CREATE, &[1, 1, id]), errno(Errno::EFAULT));
     assert_eq!(f.ret(nr::TIMER_CREATE, &[1, 0, 1]), errno(Errno::EFAULT));
+    // The sigevent is copied before the clock is looked at; the clocks
+    // that can only be read give EOPNOTSUPP.
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[99, 1, id]), errno(Errno::EFAULT));
+    for clock in [4, 5, 6] {
+        assert_eq!(
+            f.ret(nr::TIMER_CREATE, &[clock, 0, id]),
+            errno(Errno::EOPNOTSUPP)
+        );
+    }
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[3, 0, id]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[99, 0, id]), errno(Errno::EINVAL));
     assert_eq!(
         f.ret(nr::TIMER_SETTIME, &[1, 2, spec, 0]),
         errno(Errno::EINVAL)

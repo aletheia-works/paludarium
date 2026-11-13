@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
@@ -794,6 +794,14 @@ kernel.
   (`EPERM`), and its ranges need only be mapped (`ENOMEM`). The checks come
   in Linux's order: `flags`, the iovecs, the pidfd (`EBADF`, `ESRCH`), the
   caller's right to read the process (`EACCES`), then the advice.
+- `process_mrelease` finds its process as `process_madvise` does (`flags`
+  must be 0, then `EBADF`, `ESRCH`); a process that has exited has no
+  memory left (`ESRCH`, as a zombie). It succeeds when that memory is on
+  its way to be freed: the process is dying (a SIGKILL was sent to it, or
+  it has begun to exit, and it is not writing a core dump), and so is
+  every other process that runs in its memory. Otherwise it gives
+  `EINVAL`, as for the caller itself. The memory goes as the process's
+  last thread ends, so there is nothing more to release early.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
   and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed
@@ -1426,10 +1434,26 @@ kernel.
     first, each as `IFA_LOCAL` and `IFA_ADDRESS`; strictly it needs only a
     whole `ifaddrmsg` (`EINVAL`), whose index narrows it without
     `NLM_F_DUMP_FILTERED`. Each ID has a local route
-    (`mctp_route_add_local`), which an `AF_MCTP` route dump shows, the
-    newest first, as `mctp_dump_rtinfo` does, taking no filter. The
-    address and route dumps of every family (`rtnl_dump_all`) end with
-    MCTP's.
+    (`mctp_route_add_local`), unless a route of network 1 has that ID
+    alone already, and loses it with the ID. The address and route dumps
+    of every family (`rtnl_dump_all`) end with MCTP's.
+  - **MCTP routes:** `RTM_NEWROUTE` of `AF_MCTP` adds a route through a
+    gateway, as `mctp_newroute` does: `RTA_DST` and the `rtm_dst_len` IDs
+    after it, through the `mctp_fq_addr` of `RTA_GATEWAY` (network 0 is
+    the default one, 1), with an MTU in `RTA_METRICS` if it has one. The
+    request is parsed strictly with `rta_mctp_policy` (`EINVAL`, or
+    `ERANGE` for a gateway of other than eight bytes and for metrics of
+    one to three); it needs `RTA_DST`, a
+    unicast gateway ID and the type `RTN_UNICAST` (`EINVAL`), and takes no
+    route through `lo` (`EINVAL`, "no routes to loopback") or other
+    interface (`ENODEV`), a range from an ID below 8 or past 254
+    (`EINVAL`), or a range of the network that a route already has
+    (`EEXIST`). `RTM_DELROUTE` removes the `RTN_UNICAST` route of a
+    network and range, the network being the gateway's or that of `lo`'s
+    index (`ENOENT` for none), as `mctp_delroute` does. No notification
+    goes out for either, as on Linux. An `AF_MCTP` route dump shows the
+    local and gateway routes, the newest first, as `mctp_dump_rtinfo`
+    does, taking no filter.
   - **Routes:** each family has its routing tables, as Linux's `fib_trie`
     and `ip6_fib` keep them; IPv4's local and main tables share one trie,
     as they do while there is no policy rule. The addresses' routes are the
@@ -2122,6 +2146,13 @@ kernel.
   Windows and in WebAssembly), the one the scheduler calls use, and here the ticks
   fall on whole multiples of it on each clock. `clock_getres` gives 1 ns,
   and the tick for the coarse clocks.
+- `clock_nanosleep` and `timer_create` run on `CLOCK_REALTIME`,
+  `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` and `CLOCK_TAI`. As Linux's,
+  `CLOCK_MONOTONIC_RAW` and the coarse clocks give `EOPNOTSUPP` (they can
+  only be read), as does the thread's CPU clock for a sleep, and
+  `clock_nanosleep` looks at no flag but `TIMER_ABSTIME`. The process's
+  CPU clock, CPU-time timers and the alarm clocks are not modelled
+  (`EINVAL`).
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one

@@ -319,6 +319,7 @@ NAMES = {
     445: "landlock_add_rule",
     446: "landlock_restrict_self",
     447: "memfd_secret",
+    448: "process_mrelease",
     449: "futex_waitv",
     450: "set_mempolicy_home_node",
     451: "cachestat",

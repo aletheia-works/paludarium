@@ -215,6 +215,10 @@ verified.
     mapped. It refuses advice Linux does not know before any range
     (`EINVAL`), as Linux master does; the CI's kernel checks it with each
     range, so with no ranges, or only empty ones, it gives 0 there.
+  - `process_mrelease` takes a process as dying from the moment a SIGKILL
+    is sent to it, but from another fatal signal only once one of its
+    threads takes it, where Linux marks the process as it sends any signal
+    that will end it (`EINVAL` here until then).
   - In a child of `fork`, `move_pages` shows a page of a shared mapping, or
     of a private one never written, that the parent had touched as there,
     where Linux copies no page table of such a VMA (`-ENOENT`
@@ -461,9 +465,8 @@ verified.
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps
   IPv4's and IPv6's addresses and routes for those dumps, and takes no
-  MCTP address; MCTP routes cannot be added or removed (`RTM_NEWROUTE`
-  and `RTM_DELROUTE` of `AF_MCTP` are `EOPNOTSUPP`), so there are only
-  the local routes of `lo`'s addresses. A link message's
+  MCTP address or route; MCTP's addresses and routes carry nothing, as
+  there are no `AF_MCTP` sockets (`EAFNOSUPPORT`). A link message's
   statistics are zero; its IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30

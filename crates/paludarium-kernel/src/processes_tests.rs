@@ -5339,3 +5339,59 @@ mod msg {
         );
     }
 }
+mod process_mrelease {
+    use super::*;
+    fn release(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, pidfd: i64, flags: u64) -> u64 {
+        syscall(k, t, m, 448, [pidfd as u64, flags, 0, 0, 0, 0])
+    }
+    #[test]
+    fn only_a_dying_process_has_memory_to_release() {
+        let (mut k, mut t, m) = setup();
+        let einval = Errno::EINVAL.to_syscall_return();
+        let ebadf = Errno::EBADF.to_syscall_return();
+        let (_c, ct, _cm) = fork(&mut k, &mut t, &m);
+        let pidfd = syscall(&mut k, &mut t, &m, 434, [u64::from(ct.tid), 0, 0, 0, 0, 0]) as i64;
+        assert!(pidfd < 1024, "{pidfd:#x}");
+        // The flags come first.
+        assert_eq!(release(&mut k, &mut t, &m, pidfd, 1), einval);
+        assert_eq!(release(&mut k, &mut t, &m, 1000, 1), einval);
+        // No descriptor, and one of no pidfd.
+        assert_eq!(release(&mut k, &mut t, &m, 1000, 0), ebadf);
+        assert_eq!(release(&mut k, &mut t, &m, -20000, 0), ebadf);
+        let eventfd = syscall(&mut k, &mut t, &m, 290, [0; 6]) as i64;
+        assert_eq!(release(&mut k, &mut t, &m, eventfd, 0), ebadf);
+        // A live process, and the caller, whose memory is in use.
+        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), einval);
+        assert_eq!(release(&mut k, &mut t, &m, -10000, 0), einval);
+        assert_eq!(release(&mut k, &mut t, &m, -10001, 0), einval);
+        let tid = u64::from(t.tid);
+        let own = syscall(&mut k, &mut t, &m, 434, [tid, 0, 0, 0, 0, 0]) as i64;
+        assert_eq!(release(&mut k, &mut t, &m, own, 0), einval);
+        // Another signal leaves it be until it takes it; SIGKILL dooms it
+        // as it is sent.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 62, [u64::from(ct.tid), 15, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), einval);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 62, [u64::from(ct.tid), 9, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), 0);
+    }
+    #[test]
+    fn a_zombie_has_no_memory_to_find_and_a_reaped_process_is_gone() {
+        let (mut k, mut t, m) = setup();
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        let pidfd = syscall(&mut k, &mut t, &m, 434, [u64::from(ct.tid), 0, 0, 0, 0, 0]) as i64;
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        let esrch = Errno(3).to_syscall_return();
+        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), esrch);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [u64::from(ct.tid), 0, 0, 0, 0, 0]),
+            u64::from(ct.tid)
+        );
+        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), esrch);
+    }
+}

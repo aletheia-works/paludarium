@@ -2044,6 +2044,7 @@ fn shared_file(
         offset,
         len,
         may_write,
+        memfd.is_some_and(crate::memfd::Memfd::is_secret),
     )?;
     map(&pages, may_write)
 }
@@ -2056,6 +2057,14 @@ fn file_cache(
     let stat = file.stat()?;
     let key = (crate::files::descriptor_device(c, d), stat.inode);
     Ok(c.files.caches.cache(key, c.mem.memory_meter(), stat.size))
+}
+/// Whether a mapping of a `memfd_secret` file meets `[start, end)`: Linux's
+/// `get_user_pages` refuses its pages (`check_vma_flags`), and its file has
+/// no `fsync`.
+fn maps_secret(mem: &AddressSpace, start: u64, end: u64) -> bool {
+    mem.shared_fragments()
+        .iter()
+        .any(|f| f.secret && f.start < end && start < f.end)
 }
 fn is_zero_device(file: &dyn FileHandle) -> bool {
     file.as_any()
@@ -2150,9 +2159,10 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, populate: bool) -> Outcome {
     if covered < end {
         return err(Errno::ENOMEM);
     }
-    // Linux's `__mm_populate` fails to fault a guard page in (`EFAULT`),
-    // which `mlock` gives as `ENOMEM` (`__mlock_posix_error_return`).
-    if populate && c.mem.has_guards(GuestAddr(start), end) {
+    // Linux's `__mm_populate` fails to fault a guard page or a page of a
+    // `memfd_secret` file in (`EFAULT`), which `mlock` gives as `ENOMEM`
+    // (`__mlock_posix_error_return`).
+    if populate && (c.mem.has_guards(GuestAddr(start), end) || maps_secret(c.mem, start, end)) {
         return err(Errno::ENOMEM);
     }
     ok(0)
@@ -2327,7 +2337,8 @@ fn remove(
 /// `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` of `[addr, end)`, as
 /// Linux's `madvise_populate` faults the pages in a page at a time: a page
 /// no mapping holds ends it with `ENOMEM`, one whose mapping may not be read
-/// (or, with `write`, written) with `EINVAL`, and one that cannot be
+/// (or, with `write`, written), or that maps a `memfd_secret` file, with
+/// `EINVAL`, and one that cannot be
 /// brought in (past the end of its file, `SIGBUS`) with `EFAULT`, after the
 /// pages before it. A read maps what a read would (the zero page of
 /// private anonymous memory); a write breaks copy-on-write as a write
@@ -2339,10 +2350,10 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
             return Err(Errno::ENOMEM);
         };
         let needed = if write { Prot::WRITE } else { Prot::READ };
-        if !mapping.prot.contains(needed) {
+        let stop = mapping.end().min(end);
+        if !mapping.prot.contains(needed) || maps_secret(mem, at, stop) {
             return Err(Errno::EINVAL);
         }
-        let stop = mapping.end().min(end);
         while at < stop {
             let faulted = if write {
                 mem.atomic(
@@ -2498,7 +2509,10 @@ const MS_SYNC: u64 = 4;
 
 /// `msync`: checks its arguments and the range, then writes the stores of
 /// shared file mappings back to their files (all of them, which the next
-/// read of a file would do anyway).
+/// read of a file would do anyway). With `MS_SYNC`, a shared mapping of a
+/// `memfd_secret` file in the range gives `EINVAL`, as Linux's walk of the
+/// range reaches it before it can run out of VMAs and its file has no
+/// `fsync` (`vfs_fsync_range`), whatever holes the range has.
 fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, flags) = (a[0], a[1], a[2]);
     if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
@@ -2512,6 +2526,14 @@ fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let len = len.wrapping_add(4095) & !4095;
     if len == 0 {
         return ok(0);
+    }
+    // A range that wraps past the top is `ENOMEM` before any VMA is looked at.
+    if flags & MS_SYNC != 0
+        && addr
+            .checked_add(len)
+            .is_some_and(|end| maps_secret(c.mem, addr, end))
+    {
+        return err(Errno::EINVAL);
     }
     match c.mem.covers(GuestAddr(addr), len) {
         Ok(true) if flags & (MS_ASYNC | MS_SYNC) != 0 => match c.files.caches.write_back_all() {

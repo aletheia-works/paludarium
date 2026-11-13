@@ -176,6 +176,8 @@ pub struct SharedFragment {
     pub offset: u64,
     /// The open file it maps ([`PageSource::open_file`]), or 0 for none.
     pub open_file: usize,
+    /// It maps secret memory ([`PageSource::secret`]).
+    pub secret: bool,
 }
 
 /// A Linux VMA as `/proc/<pid>/maps` shows it ([`MemoryView::vma_from`]).
@@ -1098,6 +1100,12 @@ pub trait PageSource: Send + Sync {
     /// back (Linux's `VM_DONTEXPAND`, as the rings of AIO and `io_uring`
     /// are): they take no guard regions.
     fn fixed(&self) -> bool {
+        false
+    }
+    /// Whether the memory is a `memfd_secret` file's (Linux's
+    /// `vma_is_secretmem`), whose pages the kernel may not reach: `get_user_pages`
+    /// refuses them.
+    fn secret(&self) -> bool {
         false
     }
     /// The source itself, for the kernel to tell its kinds apart.
@@ -2878,6 +2886,7 @@ impl AddressSpaceData {
                 end: shared.end,
                 offset: start.wrapping_add(shared.shift),
                 open_file: shared.pages.source.as_ref().map_or(0, |s| s.open_file()),
+                secret: shared.pages.source.as_ref().is_some_and(|s| s.secret()),
             })
             .collect()
     }

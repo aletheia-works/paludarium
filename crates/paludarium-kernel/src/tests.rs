@@ -6702,6 +6702,38 @@ mod madvise_advice {
         assert_eq!(memory_bytes(&f, shared + PAGE, 1), b"\0");
     }
     #[test]
+    fn a_secret_files_pages_are_not_populated_locked_or_synced() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        let fd = f.ret(447, &[0]);
+        assert_eq!(f.ret(77, &[fd, 2 * PAGE]), 0);
+        let at = f.ret(mmap, &[0, 2 * PAGE, 3, 1, fd, 0]);
+        f.mem.write(GuestAddr(at), b"s").unwrap();
+        // `get_user_pages` refuses its pages, which both populates and a
+        // lock that brings them in need.
+        assert_eq!(f.ret(28, &[at, 2 * PAGE, 22]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(28, &[at + PAGE, PAGE, 23]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(149, &[at, 2 * PAGE]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(325, &[at, 2 * PAGE, 1]), 0);
+        assert_eq!(f.ret(150, &[at, 2 * PAGE]), 0);
+        // Its file has no `fsync`, which only `MS_SYNC` makes, even past a
+        // hole that `MS_ASYNC` stops at; a range that wraps is `ENOMEM`.
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 4]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 1]), 0);
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 0]), 0);
+        assert_eq!(f.ret(11, &[at, PAGE]), 0);
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 4]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 1]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(26, &[at, !(2 * PAGE - 1), 4]), errno(Errno::ENOMEM));
+        // Beside it, the pages of a memfd are none of that.
+        let plain = f.ret(319, &[DATA, 0]);
+        assert_eq!(f.ret(77, &[plain, PAGE]), 0);
+        let other = f.ret(mmap, &[0, PAGE, 3, 1, plain, 0]);
+        assert_eq!(f.ret(28, &[other, PAGE, 23]), 0);
+        assert_eq!(f.ret(149, &[other, PAGE]), 0);
+        assert_eq!(f.ret(26, &[other, PAGE, 4]), 0);
+    }
+    #[test]
     fn guards_fault_until_removed_and_refuse_what_linux_refuses() {
         let mut f = fixture();
         let mmap = syscalls::nr::MMAP;

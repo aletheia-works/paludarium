@@ -184,8 +184,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     マッピングごとのロックの状態を持たないためです。`/proc/<pid>/smaps` は `VmFlags` を
     出さないので、ガードを置いた VMA の `gu` フラグも出しません。`/proc/<pid>/pagemap` は
     なく、ガードページを示せません。
-    `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は、`memfd_secret` のマッピングのページも
-    割り当てます。Linux では `EINVAL` です。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか
     受け付けず、ほかのプロセスの範囲はマップされているかを確かめるだけです。Linux が知らない
     指定は、Linux master と同じく範囲を見る前に断ります（`EINVAL`）。CI のカーネルは範囲ごとに
@@ -200,9 +198,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - いくつかのメッセージのあとで `recvmmsg` を終わらせたエラーは捨てます。Linux はこれを
     ソケットのエラーとして残し、次の呼び出しと `SO_ERROR` で返します。また `recvmmsg` は、
     ソケットに残っているエラーを先に返しません。
-  - `memfd_secret` のファイルのページは `RLIMIT_MEMLOCK` に数えません。Linux では、それを
-    超えるページフォールトは `SIGBUS` です。また、そのマッピングの `MS_SYNC` の `msync` は
-    成功します。Linux では、ファイルに `fsync` がないので `EINVAL` です。
+  - `memfd_secret` のファイルのページは `RLIMIT_MEMLOCK` に数えません。Linux 7.3 以降は、
+    ページフォールトのときにユーザーの分として数え、それを超えると `SIGBUS` です。それより前の
+    カーネルはマッピングをロックしたものとして数え、超えると `mmap` が `EAGAIN` です。その前の
+    カーネルではマッピングがロックされているので、`MS_INVALIDATE` の `msync` は `EBUSY` に
+    なります。ここでは Linux 7.3 と同じく成功します。
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）と `RLIMIT_CPU` は、
     どれもプロセスの CPU 時間のすべてを数えます。ここではそのすべてがユーザーの時間だからです
     （Linux の `ITIMER_VIRTUAL` はシステムの時間を数えず、`RLIMIT_CPU` は数えます）。WebAssembly のように

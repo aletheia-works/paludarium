@@ -211,9 +211,7 @@ verified.
     Linux gives `EINVAL`, as no mapping here is locked apart.
     `/proc/<pid>/smaps` shows no `VmFlags`, so not the `gu` flag of a VMA
     that had guards, and `/proc/<pid>/pagemap` is not there to show a
-    guard page. `MADV_POPULATE_READ` and
-    `MADV_POPULATE_WRITE` bring in the pages of a `memfd_secret` mapping,
-    where Linux gives `EINVAL`.
+    guard page.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
     mapped. It refuses advice Linux does not know before any range
@@ -231,9 +229,12 @@ verified.
     Linux keeps it as the socket's error for the next call and
     `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.
   - The pages of a `memfd_secret` file do not count against
-    `RLIMIT_MEMLOCK`, where Linux's fault past it raises `SIGBUS`, and
-    `msync` with `MS_SYNC` of its mapping succeeds, where Linux gives
-    `EINVAL` as the file has no `fsync`.
+    `RLIMIT_MEMLOCK`, where Linux 7.3 and later count them against the
+    user's as they are faulted in (`SIGBUS` past it), and earlier kernels
+    count its mappings as locked (`mmap` gives `EAGAIN` past it). Those
+    earlier kernels' mapping is also locked, so `msync` with
+    `MS_INVALIDATE` of it gives `EBUSY` there, where it succeeds here, as
+    on Linux 7.3.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`, and
     `RLIMIT_CPU` all count the process's whole CPU time, as all of it is user time here
     (Linux's `ITIMER_VIRTUAL` leaves out the system time; its `RLIMIT_CPU`

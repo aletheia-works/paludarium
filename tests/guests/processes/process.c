@@ -9164,6 +9164,29 @@ static int memfd_secret_case(void) {
     char *again = mmap(NULL, 2 * page, PROT_READ, MAP_SHARED, fd, 0);
     if (again == MAP_FAILED) return 83;
     printf("kept=%.6s\n", again + page);
+    /* The kernel may not reach its pages (get_user_pages), and its file has
+     * no fsync, which msync with MS_SYNC makes. MS_INVALIDATE is left out:
+     * before Linux 7.3 the mapping is locked, which gives EBUSY. */
+    char *both = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (both == MAP_FAILED) return 86;
+    printf("populate-read=%ld\n", secret_errno(madvise(again, 2 * page, 22)));
+    printf("populate-write=%ld\n", secret_errno(madvise(both, 2 * page, 23)));
+    printf("populate-read-writable=%ld\n", secret_errno(madvise(both + page, page, 22)));
+    printf("msync-sync=%ld\n", secret_errno(msync(again, 2 * page, MS_SYNC)));
+    printf("msync-async=%ld\n", secret_errno(msync(again, 2 * page, MS_ASYNC)));
+    printf("msync-none=%ld\n", secret_errno(msync(again, 2 * page, 0)));
+    /* A hole before it: MS_SYNC still reaches the mapping, MS_ASYNC stops at
+     * the hole. */
+    char *holed = mmap(NULL, 3 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (holed == MAP_FAILED) return 87;
+    if (mmap(holed + page, 2 * page, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) return 88;
+    munmap(holed, page);
+    printf("msync-sync-after-hole=%ld\n", secret_errno(msync(holed, 3 * page, MS_SYNC)));
+    printf("msync-async-after-hole=%ld\n", secret_errno(msync(holed, 3 * page, MS_ASYNC)));
+    /* A lock that brings its pages in cannot; one on fault can. */
+    printf("mlock=%ld\n", secret_errno(mlock(both, 2 * page)));
+    printf("mlock-onfault=%ld\n", secret_errno(syscall(SYS_mlock2, both, 2 * page, 1L)));
+    printf("munlock=%ld\n", secret_errno(munlock(both, 2 * page)));
     if (fstat(fd, &st)) return 84;
     printf("after size=%ld blocks=%ld\n", (long)st.st_size, (long)st.st_blocks);
     /* Past its end, a mapping raises SIGBUS. */

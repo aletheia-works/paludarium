@@ -1373,6 +1373,22 @@ kernel.
     has no master, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
     namespace has an ID; `RTM_F_PREFIX` dumps no route, as `lo` has no
     prefix route.
+  - **Attribute policies:** each request's attributes are checked first,
+    in their order, against the policy Linux has for it (`ifla_policy`,
+    `ifa_ipv4_policy`, `ifa_ipv6_policy`, `rtm_ipv4_policy`,
+    `rtm_ipv6_policy`, and `ifla_info_policy` inside a new link's
+    `IFLA_LINKINFO`), after only the checks of the header that Linux
+    makes before them: an integer shorter than its type, a string or
+    binary longer than its policy's, an empty string or an integer out of
+    its range is `ERANGE`, a rejected attribute (`IFLA_PERM_ADDRESS` and
+    others) `EINVAL`, and so is an attribute of a type from the policy's
+    `strict_start_type` on (`RTA_NH_ID`, `IFLA_DPLL_PIN`) that is of
+    another length, marked nested or not, or not named. Strictly, a type
+    of 0 or past the last and bytes left over are `EINVAL`; unchecked, they
+    are passed over, and a link dump whose attributes break the policy
+    takes none of them. A change of the link takes one of
+    `IFLA_NET_NS_PID`, `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` at most
+    (`EINVAL`).
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
     7.0's attributes in its order: its flags, name, queue, state, MTU,

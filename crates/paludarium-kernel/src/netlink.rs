@@ -22,7 +22,9 @@
 //! and `RTM_SETLINK` bring it up or down with `IFF_UP`, given
 //! `CAP_NET_ADMIN` in the user namespace that owns the network namespace.
 //! An error, or a success the request asks for with `NLM_F_ACK`, is
-//! answered with `NLMSG_ERROR`; any other request is `EOPNOTSUPP`. A
+//! answered with `NLMSG_ERROR`; any other request is `EOPNOTSUPP`. Each
+//! request's attributes are checked against its policy first, as Linux's
+//! `ifla_policy`, `ifa_ipv4_policy` and the others are ([`parse_policy`]). A
 //! socket with `NETLINK_GET_STRICT_CHK` has its dumps, link requests and
 //! route lookups checked as Linux checks them strictly, and its dumps
 //! narrowed as they ask. A datagram to another socket's port reaches it,
@@ -126,6 +128,7 @@ const RTA_METRICS: u16 = 8;
 const RTA_MULTIPATH: u16 = 9;
 const RTA_FLOW: u16 = 11;
 const RTA_VIA: u16 = 18;
+const RTA_ENCAP_TYPE: u16 = 21;
 const RTA_ENCAP: u16 = 22;
 const RTA_EXPIRES: u16 = 23;
 const RTA_NH_ID: u16 = 30;
@@ -222,6 +225,37 @@ const IFLA_TARGET_NETNSID: u16 = 46;
 /// The last link attribute (`IFLA_MAX`, `IFLA_PACING_OFFLOAD` on Linux
 /// master).
 const IFLA_MAX: u16 = 70;
+/// The other link attributes `ifla_policy` names.
+const IFLA_LINK: u16 = 5;
+const IFLA_WEIGHT: u16 = 15;
+const IFLA_NET_NS_PID: u16 = 19;
+const IFLA_IFALIAS: u16 = 20;
+const IFLA_VFINFO_LIST: u16 = 22;
+const IFLA_VF_PORTS: u16 = 24;
+const IFLA_PORT_SELF: u16 = 25;
+const IFLA_NET_NS_FD: u16 = 28;
+const IFLA_PHYS_PORT_ID: u16 = 34;
+const IFLA_PHYS_SWITCH_ID: u16 = 36;
+const IFLA_LINK_NETNSID: u16 = 37;
+const IFLA_EVENT: u16 = 44;
+const IFLA_NEW_IFINDEX: u16 = 49;
+const IFLA_PROP_LIST: u16 = 52;
+const IFLA_PERM_ADDRESS: u16 = 54;
+const IFLA_PROTO_DOWN_REASON: u16 = 55;
+const IFLA_PARENT_DEV_NAME: u16 = 56;
+const IFLA_PACING_OFFLOAD: u16 = 70;
+/// The attributes inside `IFLA_LINKINFO` (`ifla_info_policy`), the last
+/// of them `IFLA_INFO_MAX`.
+const IFLA_INFO_KIND: u16 = 1;
+const IFLA_INFO_DATA: u16 = 2;
+const IFLA_INFO_SLAVE_KIND: u16 = 4;
+const IFLA_INFO_SLAVE_DATA: u16 = 5;
+const IFLA_INFO_MAX: u16 = 5;
+/// `MAX_TCP_HEADER` of a kernel built as Ubuntu's is for x86-64
+/// (`L1_CACHE_ALIGN(128 + MAX_HEADER)`, `MAX_HEADER` 128 + 48 with
+/// `CONFIG_MAC80211_MESH` and the IP tunnels), one less than the least
+/// `IFLA_GSO_MAX_SIZE` and `IFLA_GSO_IPV4_MAX_SIZE` that `ifla_policy` takes.
+const MAX_TCP_HEADER: u32 = 320;
 /// An address dump's other namespace (`IFA_TARGET_NETNSID`), and the last
 /// address attribute (`IFA_MAX`, `IFA_MC_USERS`).
 const IFA_TARGET_NETNSID: u16 = 10;
@@ -260,6 +294,7 @@ const IFA_LABEL: u16 = 3;
 const IFA_BROADCAST: u16 = 4;
 const IFA_CACHEINFO: u16 = 6;
 const IFA_FLAGS: u16 = 8;
+const IFA_RT_PRIORITY: u16 = 9;
 const IFA_PROTO: u16 = 11;
 const ARPHRD_LOOPBACK: u16 = 772;
 const IFF_UP: u32 = 0x1;
@@ -927,9 +962,7 @@ impl NetlinkSocket {
         }
         match header.kind {
             RTM_GETROUTE if matches!(family, AF_INET | AF_INET6) => {
-                if s.strict {
-                    lookup_check(payload)?;
-                }
+                lookup_check(payload, s.strict)?;
                 let reply = lookup(&self.network, payload, header.seq, port, sender.uid)?;
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
@@ -1007,14 +1040,18 @@ impl NetlinkSocket {
     /// index or else by `IFLA_IFNAME` or `IFLA_ALT_IFNAME`: `EINVAL` for a
     /// short message, for neither to get or set (`RTM_SETLINK`), and for a
     /// negative index to make (`RTM_NEWLINK`); `ENODEV` for another
-    /// interface. To set, `NLM_F_EXCL` is `EEXIST` and
-    /// `NLM_F_REPLACE` `EOPNOTSUPP` for `RTM_NEWLINK`, and of the
-    /// attributes only the name `lo` and `IFLA_EXT_MASK` are taken
+    /// interface. The attributes are checked against `ifla_policy` first
+    /// ([`parse_policy`]). To set, more than one of `IFLA_NET_NS_PID`,
+    /// `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` is `EINVAL`
+    /// (`rtnl_ensure_unique_netns`), `RTM_NEWLINK` checks what
+    /// `IFLA_LINKINFO` holds against `ifla_info_policy`, `NLM_F_EXCL` is
+    /// `EEXIST` and `NLM_F_REPLACE` `EOPNOTSUPP` for `RTM_NEWLINK`, and of
+    /// the attributes only the name `lo` and `IFLA_EXT_MASK` are taken
     /// (`EOPNOTSUPP` for others). To get, `strict` is `Some` with whether
     /// the socket checks strictly, which takes, as `rtnl_valid_getlink_req`
     /// does, no type, flags or change mask (`EINVAL`), and of the
-    /// attributes ([`strict_attributes`]) only the names, `IFLA_EXT_MASK`
-    /// and `IFLA_TARGET_NETNSID` (`EINVAL` for others); another
+    /// attributes only the names, `IFLA_EXT_MASK` and
+    /// `IFLA_TARGET_NETNSID` (`EINVAL` for others); another
     /// namespace's ID is `EINVAL` either way, as there is none. The flags
     /// and the change mask.
     fn find_link(
@@ -1029,29 +1066,41 @@ impl NetlinkSocket {
         let get = strict.is_some();
         let word = |i: usize| u32::from_le_bytes(payload[i..i + 4].try_into().unwrap_or_default());
         let index = word(4) as i32;
-        let attributes = if strict == Some(true) {
+        if strict == Some(true) {
             strict_link_header(payload, false)?;
-            strict_attributes(&payload[16..], IFLA_MAX)?
-        } else {
-            attributes(&payload[16..])
-        };
-        let mut name = None;
-        for &(kind, value) in &attributes {
+        }
+        let attributes = parse_policy(&payload[16..], &IFLA_POLICY, strict == Some(true))?;
+        let named = |kind: u16| attributes.iter().any(|&(k, _)| k == kind);
+        if !get {
+            // `rtnl_ensure_unique_netns`: one namespace at most.
+            let namespaces = [IFLA_NET_NS_PID, IFLA_NET_NS_FD, IFLA_TARGET_NETNSID];
+            if namespaces.into_iter().filter(|&kind| named(kind)).count() > 1 {
+                return Err(Errno::EINVAL);
+            }
+        }
+        if !get
+            && header.kind == RTM_NEWLINK
+            && let Some(&(_, info)) = attributes.iter().rev().find(|&&(k, _)| k == IFLA_LINKINFO)
+        {
+            parse_policy(info, &IFLA_INFO_POLICY, false)?;
+        }
+        for &(kind, _) in &attributes {
             match kind {
-                IFLA_IFNAME | IFLA_ALT_IFNAME => {
-                    let end = value.iter().position(|&b| b == 0).unwrap_or(value.len());
-                    if end > 15 {
-                        return Err(ERANGE);
-                    }
-                    if kind == IFLA_IFNAME || name.is_none() {
-                        name = Some(&value[..end]);
-                    }
-                }
-                IFLA_EXT_MASK => {}
+                IFLA_IFNAME | IFLA_ALT_IFNAME | IFLA_EXT_MASK => {}
                 _ if get => {}
                 _ => return Err(EOPNOTSUPP),
             }
         }
+        // `rtnl_dev_get`: the last `IFLA_IFNAME`, or else `IFLA_ALT_IFNAME`,
+        // to its NUL.
+        let by_kind = by_type(&attributes);
+        let name = by_kind
+            .get(&IFLA_IFNAME)
+            .or_else(|| by_kind.get(&IFLA_ALT_IFNAME))
+            .map(|value| {
+                let end = value.iter().position(|&b| b == 0).unwrap_or(value.len());
+                &value[..end]
+            });
         if get {
             let named = |kind: u16| attributes.iter().any(|&(k, _)| k == kind);
             if strict == Some(true)
@@ -1349,12 +1398,259 @@ fn attributes(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
     }
     out
 }
-/// The attributes of `bytes` as `nlmsg_parse_deprecated_strict` takes them
-/// for a socket that checks strictly (`NETLINK_GET_STRICT_CHK`): `EINVAL`
-/// for a type of 0 or past `max`, and for bytes left after the last whole
-/// attribute. The attribute policies are not checked.
-fn strict_attributes(bytes: &[u8], max: u16) -> Result<Vec<(u16, &[u8])>, Errno> {
-    policy_attributes(bytes, max, |_, _, _| Ok(()))
+/// What an attribute's `struct nla_policy` asks of it, as `validate_nla`
+/// checks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nla {
+    /// `NLA_UNSPEC` of at least this many bytes (a policy's `len`); a type
+    /// the policy does not name is one of 0.
+    Unspec(usize),
+    U8,
+    U16,
+    U32,
+    S32,
+    Be32,
+    /// An `NLA_U32` whose value lies from the first to the second
+    /// (`NLA_POLICY_MIN`, `NLA_POLICY_MAX`, `NLA_POLICY_FULL_RANGE`).
+    U32In(u32, u32),
+    /// An `NLA_S32` of at least this (`NLA_POLICY_MIN`).
+    S32Min(i32),
+    /// `NLA_STRING` of at most this many bytes but a last NUL (none for 0).
+    String(usize),
+    /// `NLA_NUL_STRING` without a length.
+    NulString,
+    /// `NLA_BINARY` of at most this many bytes.
+    Binary(usize),
+    /// `NLA_NESTED` without a nested policy.
+    Nested,
+    /// `NLA_REJECT`.
+    Reject,
+}
+impl Nla {
+    /// The length of an integer, which a strict policy takes alone.
+    fn size(self) -> Option<usize> {
+        match self {
+            Nla::U8 => Some(1),
+            Nla::U16 => Some(2),
+            Nla::U32 | Nla::S32 | Nla::Be32 | Nla::U32In(..) | Nla::S32Min(_) => Some(4),
+            _ => None,
+        }
+    }
+}
+/// A message's attribute policy: its last type (`maxtype`), the first type
+/// it always checks strictly (`strict_start_type`, none for 0), and each
+/// type's [`Nla`].
+struct Policy {
+    max: u16,
+    strict_start: u16,
+    of: fn(u16) -> Nla,
+}
+/// `ifla_policy`, the link requests'.
+const IFLA_POLICY: Policy = Policy {
+    max: IFLA_MAX,
+    strict_start: IFLA_DPLL_PIN,
+    of: |kind| match kind {
+        IFLA_IFNAME => Nla::String(15),
+        IFLA_ALT_IFNAME => Nla::String(127),
+        // `MAX_ADDR_LEN` and `MAX_PHYS_ITEM_ID_LEN`.
+        IFLA_ADDRESS | IFLA_BROADCAST | IFLA_PHYS_PORT_ID | IFLA_PHYS_SWITCH_ID => Nla::Binary(32),
+        // `IFALIASZ - 1`.
+        IFLA_IFALIAS => Nla::Binary(255),
+        // `struct rtnl_link_ifmap`.
+        IFLA_MAP => Nla::Unspec(32),
+        IFLA_TXQLEN => Nla::U32In(0, i16::MAX as u32),
+        IFLA_GSO_MAX_SIZE | IFLA_GSO_IPV4_MAX_SIZE => Nla::U32In(MAX_TCP_HEADER + 1, u32::MAX),
+        IFLA_PACING_OFFLOAD => Nla::U32In(0, 1),
+        IFLA_MTU
+        | IFLA_LINK
+        | IFLA_MASTER
+        | IFLA_WEIGHT
+        | IFLA_NET_NS_PID
+        | IFLA_NET_NS_FD
+        | IFLA_EXT_MASK
+        | IFLA_PROMISCUITY
+        | IFLA_NUM_TX_QUEUES
+        | IFLA_NUM_RX_QUEUES
+        | IFLA_GSO_MAX_SEGS
+        | IFLA_CARRIER_CHANGES
+        | IFLA_EVENT
+        | IFLA_GROUP
+        | IFLA_CARRIER_UP_COUNT
+        | IFLA_CARRIER_DOWN_COUNT
+        | IFLA_MIN_MTU
+        | IFLA_MAX_MTU
+        | IFLA_GRO_MAX_SIZE
+        | IFLA_GRO_IPV4_MAX_SIZE => Nla::U32,
+        IFLA_CARRIER | IFLA_OPERSTATE | IFLA_LINKMODE | IFLA_PROTO_DOWN => Nla::U8,
+        IFLA_LINK_NETNSID | IFLA_TARGET_NETNSID => Nla::S32,
+        IFLA_NEW_IFINDEX => Nla::S32Min(1),
+        IFLA_LINKINFO
+        | IFLA_VFINFO_LIST
+        | IFLA_VF_PORTS
+        | IFLA_PORT_SELF
+        | IFLA_AF_SPEC
+        | IFLA_XDP
+        | IFLA_PROP_LIST
+        | IFLA_PROTO_DOWN_REASON => Nla::Nested,
+        IFLA_PARENT_DEV_NAME => Nla::NulString,
+        IFLA_PERM_ADDRESS
+        | IFLA_TSO_MAX_SIZE
+        | IFLA_TSO_MAX_SEGS
+        | IFLA_ALLMULTI
+        | IFLA_MAX_PACING_OFFLOAD_HORIZON
+        | IFLA_NETNS_IMMUTABLE
+        | IFLA_HEADROOM
+        | IFLA_TAILROOM => Nla::Reject,
+        _ => Nla::Unspec(0),
+    },
+};
+/// `ifla_info_policy`, inside the `IFLA_LINKINFO` of `RTM_NEWLINK`.
+const IFLA_INFO_POLICY: Policy = Policy {
+    max: IFLA_INFO_MAX,
+    strict_start: 0,
+    of: |kind| match kind {
+        IFLA_INFO_KIND | IFLA_INFO_SLAVE_KIND => Nla::String(0),
+        IFLA_INFO_DATA | IFLA_INFO_SLAVE_DATA => Nla::Nested,
+        _ => Nla::Unspec(0),
+    },
+};
+/// `ifa_ipv4_policy`, IPv4's address requests'.
+const IFA4_POLICY: Policy = Policy {
+    max: IFA_MAX,
+    strict_start: 0,
+    of: |kind| match kind {
+        IFA_LOCAL | IFA_ADDRESS | IFA_BROADCAST | IFA_FLAGS | IFA_RT_PRIORITY => Nla::U32,
+        IFA_LABEL => Nla::String(15),
+        // `struct ifa_cacheinfo`.
+        IFA_CACHEINFO => Nla::Unspec(16),
+        IFA_TARGET_NETNSID => Nla::S32,
+        IFA_PROTO => Nla::U8,
+        _ => Nla::Unspec(0),
+    },
+};
+/// `ifa_ipv6_policy`, IPv6's address requests'.
+const IFA6_POLICY: Policy = Policy {
+    max: IFA_MAX,
+    strict_start: 0,
+    of: |kind| match kind {
+        IFA_ADDRESS | IFA_LOCAL | IFA_CACHEINFO => Nla::Unspec(16),
+        IFA_FLAGS | IFA_RT_PRIORITY => Nla::Unspec(4),
+        IFA_TARGET_NETNSID => Nla::S32,
+        IFA_PROTO => Nla::U8,
+        _ => Nla::Unspec(0),
+    },
+};
+/// `rtm_ipv4_policy`, IPv4's route requests' and every route dump's.
+const RTA4_POLICY: Policy = Policy {
+    max: RTA_MAX,
+    strict_start: RTA_DPORT + 1,
+    of: |kind| match kind {
+        RTA_DST | RTA_SRC | RTA_IIF | RTA_OIF | RTA_GATEWAY | RTA_PRIORITY | RTA_PREFSRC
+        | RTA_FLOW | RTA_UID | RTA_MARK | RTA_TABLE | RTA_NH_ID => Nla::U32,
+        RTA_METRICS | RTA_ENCAP => Nla::Nested,
+        // `struct rtnexthop`.
+        RTA_MULTIPATH => Nla::Unspec(8),
+        RTA_ENCAP_TYPE | RTA_SPORT | RTA_DPORT => Nla::U16,
+        RTA_IP_PROTO => Nla::U8,
+        _ => Nla::Unspec(0),
+    },
+};
+/// `rtm_ipv6_policy`, IPv6's route requests'.
+const RTA6_POLICY: Policy = Policy {
+    max: RTA_MAX,
+    strict_start: RTA_DPORT + 1,
+    of: |kind| match kind {
+        RTA_GATEWAY | RTA_PREFSRC => Nla::Unspec(16),
+        RTA_OIF | RTA_IIF | RTA_PRIORITY | RTA_EXPIRES | RTA_UID | RTA_MARK | RTA_TABLE
+        | RTA_NH_ID => Nla::U32,
+        RTA_METRICS | RTA_ENCAP => Nla::Nested,
+        RTA_MULTIPATH => Nla::Unspec(8),
+        RTA_PREF | RTA_IP_PROTO => Nla::U8,
+        RTA_ENCAP_TYPE | RTA_SPORT | RTA_DPORT => Nla::U16,
+        RTA_FLOWLABEL => Nla::Be32,
+        _ => Nla::Unspec(0),
+    },
+};
+/// The attributes of `bytes` (types 1 to the policy's last; an attribute
+/// of type 0 or past it is left out), each checked against `policy` in
+/// turn, as `__nla_validate_parse` does. `strict` is
+/// `nlmsg_parse_deprecated_strict`'s check, for a socket that checks
+/// strictly (`NETLINK_GET_STRICT_CHK`): `EINVAL` for a type of 0 or past
+/// the last, and for bytes left after the last whole attribute; without
+/// it, as `nlmsg_parse_deprecated`, those are passed over. A type from the
+/// policy's `strict_start` on is checked as `nlmsg_parse` would
+/// ([`validate_nla`]).
+fn parse_policy<'a>(
+    mut bytes: &'a [u8],
+    policy: &Policy,
+    strict: bool,
+) -> Result<Vec<(u16, &'a [u8])>, Errno> {
+    let mut out = Vec::new();
+    while bytes.len() >= 4 {
+        let len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+        if len < 4 || len > bytes.len() {
+            break;
+        }
+        let raw = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let (kind, value) = (raw & 0x3fff, &bytes[4..len]);
+        bytes = &bytes[align(len).min(bytes.len())..];
+        if kind == 0 || kind > policy.max {
+            if strict {
+                return Err(Errno::EINVAL);
+            }
+            continue;
+        }
+        let full = policy.strict_start != 0 && kind >= policy.strict_start;
+        validate_nla((policy.of)(kind), raw & NLA_F_NESTED != 0, value, full)?;
+        out.push((kind, value));
+    }
+    if strict && !bytes.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(out)
+}
+/// `validate_nla`'s check of an attribute's `value` against `nla`, and
+/// whether it is marked `NLA_F_NESTED`. With `strict` (`NL_VALIDATE_STRICT`,
+/// as `nlmsg_parse` and a policy's `strict_start_type` ask), `EINVAL` for
+/// an integer of another length, for a nest unmarked or another attribute
+/// marked (but `NLA_UNSPEC`), and for an `NLA_UNSPEC`. Then `EINVAL` for
+/// `NLA_REJECT` and for an `NLA_NUL_STRING` without a NUL; `ERANGE` for an
+/// integer, `NLA_UNSPEC` or nest shorter than its policy's, an empty
+/// string, a string or binary longer, and an integer out of its range.
+fn validate_nla(nla: Nla, nested: bool, value: &[u8], strict: bool) -> Result<(), Errno> {
+    let len = value.len();
+    if strict {
+        let unspec = matches!(nla, Nla::Unspec(_));
+        if nla.size().is_some_and(|size| len != size)
+            || ((nla == Nla::Nested) != nested && !unspec)
+            || unspec
+        {
+            return Err(Errno::EINVAL);
+        }
+    }
+    let fits = match nla {
+        Nla::Reject => return Err(Errno::EINVAL),
+        Nla::NulString if !value.contains(&0) => return Err(Errno::EINVAL),
+        Nla::NulString => true,
+        Nla::Unspec(least) => len >= least,
+        Nla::String(most) => {
+            let bytes = len - usize::from(value.last() == Some(&0));
+            len > 0 && (most == 0 || bytes <= most)
+        }
+        Nla::Binary(most) => most == 0 || len <= most,
+        Nla::Nested => len == 0 || len >= 4,
+        _ => nla.size().is_some_and(|size| len >= size),
+    };
+    if !fits {
+        return Err(ERANGE);
+    }
+    let word = || value.first_chunk().copied().map_or(0, u32::from_le_bytes);
+    let within = match nla {
+        Nla::U32In(least, most) => (least..=most).contains(&word()),
+        Nla::S32Min(least) => word().cast_signed() >= least,
+        _ => true,
+    };
+    if within { Ok(()) } else { Err(ERANGE) }
 }
 /// The attributes of `bytes` as `nlmsg_parse` and `nla_parse_nested` take
 /// them (`NL_VALIDATE_STRICT`), in one walk as `__nla_validate_parse`'s:
@@ -1428,12 +1724,12 @@ fn strict_link_header(payload: &[u8], index: bool) -> Result<(), Errno> {
 /// An `IFLA_MASTER` other than 0 shows only the devices of that master,
 /// which `lo` is not, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
 /// namespace has an ID. Unchecked, a request shorter than an `ifinfomsg`
-/// is an old `rtgenmsg`, whose attributes follow its 4 bytes, and the
-/// attributes are not taken where one of those it reads is short, as a
-/// failed `nlmsg_parse_deprecated`; strictly, as
-/// `rtnl_valid_dump_ifinfo_req`, it is `EINVAL` with a type, flags, a
-/// change mask or an index ([`strict_link_header`]), and for attributes
-/// but those and `IFLA_LINKINFO`.
+/// is an old `rtgenmsg`, whose attributes follow its 4 bytes, and none
+/// is taken where one breaks `ifla_policy`, as a failed
+/// `nlmsg_parse_deprecated`; strictly, as `rtnl_valid_dump_ifinfo_req`, it
+/// is `EINVAL` with a type, flags, a change mask or an index
+/// ([`strict_link_header`]), then the policy's error, and `EINVAL` for
+/// attributes but those and `IFLA_LINKINFO`.
 fn link_dump(
     network: &Network,
     payload: &[u8],
@@ -1441,23 +1737,22 @@ fn link_dump(
     port: u32,
     strict: bool,
 ) -> Result<Vec<Vec<u8>>, Errno> {
-    let attributes = if strict {
+    let parsed = if strict {
         strict_link_header(payload, true)?;
-        strict_attributes(&payload[16..], IFLA_MAX)?
+        parse_policy(&payload[16..], &IFLA_POLICY, true)
     } else {
         let start = if payload.len() < 16 { 4 } else { 16 };
-        payload.get(start..).map(attributes).unwrap_or_default()
+        parse_policy(
+            payload.get(start..).unwrap_or_default(),
+            &IFLA_POLICY,
+            false,
+        )
     };
-    let mut attributes = by_type(&attributes);
-    let read = |kind: u16| attributes.get(&kind).map(|value| u32_value(value));
-    let short = [IFLA_TARGET_NETNSID, IFLA_EXT_MASK, IFLA_MASTER]
-        .into_iter()
-        .find_map(|kind| read(kind)?.err());
-    match short {
-        Some(e) if strict => return Err(e),
-        Some(_) => attributes.clear(),
-        None => {}
-    }
+    let attributes = match parsed {
+        Ok(attributes) => by_type(&attributes),
+        Err(e) if strict => return Err(e),
+        Err(_) => BTreeMap::new(),
+    };
     let known = |kind: u16| {
         matches!(
             kind,
@@ -1481,17 +1776,15 @@ fn link_dump(
     Ok(vec![link_message(network, seq, port, NLM_F_MULTI, mask)])
 }
 /// Strictly, a bridge link dump (`valid_bridge_getlink_req`) takes no
-/// type, flags, change mask or index, and no attribute but
-/// `IFLA_EXT_MASK` (`EINVAL`). Unchecked, nothing is checked.
+/// type, flags, change mask or index (`EINVAL`), then breaks no rule of
+/// `ifla_policy`, and has no attribute but `IFLA_EXT_MASK` (`EINVAL`).
+/// Unchecked, nothing is checked.
 fn bridge_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
     if !strict {
         return Ok(());
     }
     strict_link_header(payload, true)?;
-    let attributes = strict_attributes(&payload[16..], IFLA_MAX)?;
-    if let Some(&(_, value)) = attributes.iter().rev().find(|&&(k, _)| k == IFLA_EXT_MASK) {
-        u32_value(value)?;
-    }
+    let attributes = parse_policy(&payload[16..], &IFLA_POLICY, true)?;
     if attributes.iter().any(|&(kind, _)| kind != IFLA_EXT_MASK) {
         return Err(Errno::EINVAL);
     }
@@ -1522,7 +1815,8 @@ fn with_flags(mut messages: Vec<Vec<u8>>, flags: u16) -> Vec<Vec<u8>> {
 /// family's, or the one family's. Strictly, as
 /// `inet_valid_dump_ifaddr_req` and `inet6_valid_dump_ifaddr_req`, it is
 /// `EINVAL` for an `ifaddrmsg` short or with a prefix length, flags or a
-/// scope, and for any attribute (`IFA_TARGET_NETNSID` too, as no other
+/// scope, then the family's policy's error (IPv4's for both), and
+/// `EINVAL` for any attribute (`IFA_TARGET_NETNSID` too, as no other
 /// namespace has an ID); an index other than 0 shows that device's
 /// addresses alone, as `NLM_F_DUMP_FILTERED`, which `NLMSG_DONE` carries
 /// too, and is `ENODEV` for another than `lo`'s.
@@ -1545,11 +1839,13 @@ fn address_dump(
             *answer |= NLM_F_DUMP_FILTERED;
             flags = NLM_F_DUMP_FILTERED;
         }
-        let attributes = by_type(&strict_attributes(&payload[8..], IFA_MAX)?);
-        if let Some(value) = attributes.get(&IFA_TARGET_NETNSID) {
-            u32_value(value)?;
-        }
-        if !attributes.is_empty() {
+        // `rtnl_dump_all` asks IPv4's first, whose error ends the dump.
+        let policy = if family == AF_INET6 {
+            &IFA6_POLICY
+        } else {
+            &IFA4_POLICY
+        };
+        if !parse_policy(&payload[8..], policy, true)?.is_empty() {
             return Err(Errno::EINVAL);
         }
         if index > 1 {
@@ -1845,7 +2141,8 @@ struct RouteFilter {
 /// and `RTM_F_CLONED` changes nothing. Strictly, as `ip_valid_fib_dump_req`:
 /// `EINVAL` for an `rtmsg` short or with a prefix length, a source prefix
 /// length, a TOS or a scope, for flags but `RTM_F_CLONED` and
-/// `RTM_F_PREFIX`, and for attributes but `RTA_TABLE` and `RTA_OIF`,
+/// `RTM_F_PREFIX`, then `rtm_ipv4_policy`'s errors (for IPv6's too), and
+/// for attributes but `RTA_TABLE` and `RTA_OIF`,
 /// whose device is `ENODEV` but `lo`'s; the table, protocol and type, and
 /// those, narrow it, as `NLM_F_DUMP_FILTERED` in `NLMSG_DONE` too.
 fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteFilter, Errno> {
@@ -1873,12 +2170,8 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
         device: false,
         marked: true,
     };
-    let attributes = by_type(&strict_attributes(&payload[12..], RTA_MAX)?);
-    for kind in [RTA_OIF, RTA_TABLE] {
-        if let Some(value) = attributes.get(&kind) {
-            u32_value(value)?;
-        }
-    }
+    // `rtm_ipv4_policy`, for IPv6's too.
+    let attributes = by_type(&parse_policy(&payload[12..], &RTA4_POLICY, true)?);
     for (&kind, &value) in &attributes {
         match kind {
             RTA_TABLE => filter.table = u32_value(value)?,
@@ -1975,18 +2268,24 @@ fn route_dump(
     }
     Ok(messages)
 }
-/// Strictly, a route lookup takes, as `inet_rtm_valid_getroute_req` and
-/// `inet6_rtm_valid_getroute_req`: prefix lengths of 0 or the whole
+/// A route lookup's checks, as `inet_rtm_valid_getroute_req` and
+/// `inet6_rtm_valid_getroute_req` make them: `EINVAL` for a request
+/// shorter than an `rtmsg`, then the family's policy (`rtm_ipv4_policy`,
+/// `rtm_ipv6_policy`) unless `strict`. Strictly, it takes: prefix lengths of 0 or the whole
 /// address, and one where `RTA_SRC` or `RTA_DST` is given; no table,
 /// protocol, scope or type; of the flags only `RTM_F_FIB_MATCH`, and for
 /// IPv4 `RTM_F_NOTIFY` and `RTM_F_LOOKUP_TABLE` too; an IPv6 flow label
 /// of 20 bits; and only the attributes that select a route. Anything else
-/// is `EINVAL`.
-fn lookup_check(payload: &[u8]) -> Result<(), Errno> {
+/// is `EINVAL`, but the policy's errors, which come after the header's.
+fn lookup_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
     if payload.len() < 12 {
         return Err(Errno::EINVAL);
     }
     let v6 = payload[0] == AF_INET6;
+    let policy = if v6 { &RTA6_POLICY } else { &RTA4_POLICY };
+    if !strict {
+        return parse_policy(&payload[12..], policy, false).map(drop);
+    }
     let whole = if v6 { 128 } else { 32 };
     let (dst_len, src_len) = (payload[1], payload[2]);
     let flags = u32::from_le_bytes(payload[8..12].try_into().unwrap_or_default());
@@ -2002,17 +2301,19 @@ fn lookup_check(payload: &[u8]) -> Result<(), Errno> {
     {
         return Err(Errno::EINVAL);
     }
-    let attributes = by_type(&strict_attributes(&payload[12..], RTA_MAX)?);
+    let attributes = by_type(&parse_policy(&payload[12..], policy, true)?);
     if (attributes.contains_key(&RTA_SRC) && src_len == 0)
         || (attributes.contains_key(&RTA_DST) && dst_len == 0)
     {
         return Err(Errno::EINVAL);
     }
-    if v6 && let Some(value) = attributes.get(&RTA_FLOWLABEL) {
-        let label = value.first_chunk::<4>().ok_or(ERANGE)?;
-        if u32::from_be_bytes(*label) & !0x000f_ffff != 0 {
-            return Err(Errno::EINVAL);
-        }
+    // The policy takes an `NLA_BE32` of 4 bytes alone, past its
+    // `strict_start_type`.
+    if v6
+        && let Some(label) = attributes.get(&RTA_FLOWLABEL).and_then(|v| v.first_chunk())
+        && u32::from_be_bytes(*label) & !0x000f_ffff != 0
+    {
+        return Err(Errno::EINVAL);
     }
     let selects = |kind: u16| {
         matches!(
@@ -2345,8 +2646,9 @@ fn ipv6_address(
 }
 /// `RTM_NEWADDR` or `RTM_DELADDR` for `lo`, as `inet_rtm_newaddr`,
 /// `inet_rtm_deladdr`, `inet6_rtm_newaddr` and `inet6_rtm_deladdr` take
-/// them: `EINVAL` for a message shorter than an `ifaddrmsg`, an IPv4
-/// prefix past 32 or an IPv6 one past 128, an IPv4 address without
+/// them: `EINVAL` for a message shorter than an `ifaddrmsg`; then the
+/// family's policy (`ifa_ipv4_policy`, `ifa_ipv6_policy`, which has no
+/// label or broadcast address); `EINVAL` for an IPv4 prefix past 32 or an IPv6 one past 128, an IPv4 address without
 /// `IFA_LOCAL` to add or an IPv6 one without `IFA_LOCAL` or `IFA_ADDRESS`;
 /// `ENODEV` for another interface than index 1. An address added again is
 /// `EEXIST`, unless `NLM_F_REPLACE` without `NLM_F_EXCL`, and one to
@@ -2371,20 +2673,21 @@ fn change_address(
     let mut label = None;
     let mut flags = u32::from(header_flags);
     let mut proto = 0;
-    for (kind, value) in attributes(&payload[8..]) {
+    let v4 = family == AF_INET;
+    let policy = if v4 { &IFA4_POLICY } else { &IFA6_POLICY };
+    // The policy has made each as long as it reads; IPv6 has no label or
+    // broadcast address.
+    for (kind, value) in parse_policy(&payload[8..], policy, false)? {
         match kind {
             IFA_LOCAL => local = Some(value),
             IFA_ADDRESS => address = Some(value),
-            IFA_BROADCAST => broadcast = Some(*value.first_chunk::<4>().ok_or(ERANGE)?),
-            IFA_LABEL => {
+            IFA_BROADCAST if v4 => broadcast = value.first_chunk::<4>().copied(),
+            IFA_LABEL if v4 => {
                 let end = value.iter().position(|&b| b == 0).unwrap_or(value.len());
-                if end > 15 {
-                    return Err(ERANGE);
-                }
                 label = Some(value[..end].to_vec());
             }
-            IFA_FLAGS => flags = u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?),
-            IFA_PROTO => proto = *value.first().ok_or(ERANGE)?,
+            IFA_FLAGS => flags = u32_value(value)?,
+            IFA_PROTO => proto = value.first().copied().unwrap_or_default(),
             _ => {}
         }
     }
@@ -2684,9 +2987,9 @@ fn lookup(
 /// An `RTM_NEWROUTE` or `RTM_DELROUTE` request, as `inet_rtm_newroute`,
 /// `inet_rtm_delroute`, `inet6_rtm_newroute` and `inet6_rtm_delroute`
 /// take it ([`crate::interface::Addresses::add_route4`] and the others):
-/// `EINVAL` for one shorter than an `rtmsg`; an attribute shorter than its
-/// policy's is `ERANGE`, but an IPv6 destination shorter than its prefix,
-/// `EINVAL`; then `EINVAL` for a TOS with ECN bits (any for IPv6) or a
+/// `EINVAL` for one shorter than an `rtmsg`; then the family's policy
+/// (`rtm_ipv4_policy`, `rtm_ipv6_policy`), and `EINVAL` for an IPv6
+/// destination shorter than its prefix; then `EINVAL` for a TOS with ECN bits (any for IPv6) or a
 /// kind past `RTN_MAX`. Multipath routes, metrics, encapsulations,
 /// nexthop objects, realms, expiries, IPv6 gateways, source prefixes and
 /// router preferences are `EOPNOTSUPP`. The table is the `rtmsg`'s, or the
@@ -2719,7 +3022,8 @@ fn change_route(
     let address = |value: &[u8]| -> Result<Vec<u8>, Errno> {
         value.get(..size).map(<[u8]>::to_vec).ok_or(ERANGE)
     };
-    for (attr, value) in attributes(&payload[12..]) {
+    let policy = if v6 { &RTA6_POLICY } else { &RTA4_POLICY };
+    for (attr, value) in parse_policy(&payload[12..], policy, false)? {
         match attr {
             RTA_DST if v6 => {
                 let bytes = usize::from(dst_len).div_ceil(8);
@@ -3609,28 +3913,192 @@ mod tests {
     }
 
     #[test]
-    fn strict_attributes_refuse_unknown_types_and_leftover_bytes() {
+    fn strict_parsing_refuses_unknown_types_and_leftover_bytes() {
         let mut bytes = Vec::new();
         attribute(&mut bytes, IFLA_IFNAME | 0x8000, b"lo\0");
         assert_eq!(
-            strict_attributes(&bytes, IFLA_MAX),
+            parse_policy(&bytes, &IFLA_POLICY, true),
             Ok(vec![(IFLA_IFNAME, &b"lo\0"[..])])
         );
         // The last attribute's padding may be left out.
         assert_eq!(
-            strict_attributes(&bytes[..7], IFLA_MAX).map(|a| a.len()),
+            parse_policy(&bytes[..7], &IFLA_POLICY, true).map(|a| a.len()),
             Ok(1)
         );
         for kind in [0, IFLA_MAX + 1] {
             let mut bytes = Vec::new();
             attribute(&mut bytes, kind, &[0; 4]);
-            assert_eq!(strict_attributes(&bytes, IFLA_MAX), Err(Errno::EINVAL));
+            assert_eq!(parse_policy(&bytes, &IFLA_POLICY, true), Err(Errno::EINVAL));
+            // Unchecked, it is passed over.
+            assert_eq!(parse_policy(&bytes, &IFLA_POLICY, false), Ok(Vec::new()));
         }
         let mut bytes = Vec::new();
         attribute(&mut bytes, IFLA_MTU, &[0; 4]);
         bytes.extend_from_slice(&[0, 0]);
-        assert_eq!(strict_attributes(&bytes, IFLA_MAX), Err(Errno::EINVAL));
+        assert_eq!(parse_policy(&bytes, &IFLA_POLICY, true), Err(Errno::EINVAL));
+        assert_eq!(
+            parse_policy(&bytes, &IFLA_POLICY, false).map(|a| a.len()),
+            Ok(1)
+        );
         assert_eq!(attributes(&bytes).len(), 1);
+    }
+
+    #[test]
+    fn policies_check_each_attribute_in_turn() {
+        let parse = |policy: &Policy, strict: bool, list: &[(u16, &[u8])]| {
+            let mut bytes = Vec::new();
+            for &(kind, value) in list {
+                attribute(&mut bytes, kind, value);
+            }
+            parse_policy(&bytes, policy, strict).map(|a| a.len())
+        };
+        // A short integer is ERANGE, before a later unknown type, strictly
+        // or not; a long one is EINVAL only past `strict_start_type`.
+        let short: &[(u16, &[u8])] = &[(IFLA_EXT_MASK, &[0; 2]), (200, &[])];
+        assert_eq!(parse(&IFLA_POLICY, true, short), Err(ERANGE));
+        assert_eq!(parse(&IFLA_POLICY, false, short), Err(ERANGE));
+        let long: &[(u16, &[u8])] = &[(IFLA_EXT_MASK, &[0; 5])];
+        assert_eq!(parse(&IFLA_POLICY, true, long), Ok(1));
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_PACING_OFFLOAD, &[0; 5])]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_PACING_OFFLOAD, &[1, 0, 0, 0])]),
+            Ok(1)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_PACING_OFFLOAD, &[2, 0, 0, 0])]),
+            Err(ERANGE)
+        );
+        // Unnamed past `strict_start_type`: an `NLA_UNSPEC`, refused.
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_DPLL_PIN, &[])]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse(&RTA4_POLICY, false, &[(RTA_FLOWLABEL, &[0; 4])]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse(&RTA6_POLICY, false, &[(RTA_FLOWLABEL, &[0; 4])]),
+            Ok(1)
+        );
+        assert_eq!(
+            parse(&RTA6_POLICY, false, &[(RTA_FLOWLABEL | 0x8000, &[0; 4])]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse(&RTA6_POLICY, false, &[(RTA_FLOWLABEL, &[0; 2])]),
+            Err(Errno::EINVAL)
+        );
+        // Strings: at most their length but a last NUL, and not empty.
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_IFNAME, &[b'a'; 15])]),
+            Ok(1)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_IFNAME, b"aaaaaaaaaaaaaaa\0")]),
+            Ok(1)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_IFNAME, &[b'a'; 16])]),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(
+                &IFLA_POLICY,
+                false,
+                &[(IFLA_IFNAME, b"lo\0\0aaaaaaaaaaaaa")]
+            ),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_IFNAME, &[])]),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_ALT_IFNAME, &[b'a'; 127])]),
+            Ok(1)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_PARENT_DEV_NAME, b"ab")]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_PARENT_DEV_NAME, b"ab\0")]),
+            Ok(1)
+        );
+        // Binaries at most, `NLA_UNSPEC` at least, nests empty or whole.
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_ADDRESS, &[0; 33])]),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_MAP, &[0; 31])]),
+            Err(ERANGE)
+        );
+        assert_eq!(parse(&IFLA_POLICY, true, &[(IFLA_MAP, &[0; 32])]), Ok(1));
+        assert_eq!(parse(&IFLA_POLICY, false, &[(IFLA_AF_SPEC, &[])]), Ok(1));
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_AF_SPEC, &[0; 3])]),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(&IFLA_POLICY, false, &[(IFLA_PERM_ADDRESS, &[])]),
+            Err(Errno::EINVAL)
+        );
+        // Ranges.
+        assert_eq!(
+            parse(
+                &IFLA_POLICY,
+                false,
+                &[(IFLA_TXQLEN, &32_768u32.to_le_bytes())]
+            ),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(
+                &IFLA_POLICY,
+                false,
+                &[(IFLA_GSO_MAX_SIZE, &320u32.to_le_bytes())]
+            ),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(
+                &IFLA_POLICY,
+                false,
+                &[(IFLA_GSO_MAX_SIZE, &321u32.to_le_bytes())]
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            parse(
+                &IFLA_POLICY,
+                false,
+                &[(IFLA_NEW_IFINDEX, &0u32.to_le_bytes())]
+            ),
+            Err(ERANGE)
+        );
+        // The families' address policies differ.
+        assert_eq!(parse(&IFA4_POLICY, false, &[(IFA_ADDRESS, &[0; 4])]), Ok(1));
+        assert_eq!(
+            parse(&IFA6_POLICY, false, &[(IFA_ADDRESS, &[0; 4])]),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(&IFA6_POLICY, false, &[(IFA_LABEL, &[b'a'; 40])]),
+            Ok(1)
+        );
+        assert_eq!(
+            parse(&IFA4_POLICY, false, &[(IFA_LABEL, &[b'a'; 16])]),
+            Err(ERANGE)
+        );
+        assert_eq!(
+            parse(&IFA4_POLICY, false, &[(IFA_CACHEINFO, &[0; 15])]),
+            Err(ERANGE)
+        );
     }
 
     /// An `ifinfomsg` of `family` and `index`, then `attributes`.
@@ -4232,7 +4700,7 @@ mod tests {
             if let Some((kind, value)) = extra {
                 attribute(&mut out, kind, value);
             }
-            lookup_check(&out)
+            lookup_check(&out, true)
         };
         use core::net::Ipv6Addr;
         assert_eq!(lookup(AF_INET, 32, RTM_F_LOOKUP_TABLE, None), Ok(()));
@@ -4253,7 +4721,7 @@ mod tests {
         );
         assert_eq!(
             lookup(AF_INET6, 128, 0, Some((RTA_FLOWLABEL, &[0]))),
-            Err(ERANGE)
+            Err(Errno::EINVAL)
         );
         for bad in [
             lookup(AF_INET, 0, 0, None),
@@ -4267,6 +4735,6 @@ mod tests {
         }
         let mut table = rtmsg(AF_INET, RT_TABLE_LOCAL, 0, 0, 0);
         table[1] = 32;
-        assert_eq!(lookup_check(&table), Err(Errno::EINVAL));
+        assert_eq!(lookup_check(&table, true), Err(Errno::EINVAL));
     }
 }

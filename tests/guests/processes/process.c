@@ -1627,6 +1627,14 @@ static int nl_quiet(int fd, unsigned short type, unsigned short flags, const voi
     if (n >= 20 && ((struct nl_header *)buf)->type == 2) memcpy(&error, buf + 16, 4);
     return error;
 }
+/* The netlink-strict case: request `type` with `flags` and body `b`,
+   attribute `attr` of `len` bytes of `value` added to it; prints its
+   error. */
+static void nl_policy(int fd, unsigned short type, unsigned short flags, struct nl_body b, unsigned short attr,
+                      const void *value, size_t len, const char *label) {
+    nl_put(&b, attr, value, len);
+    printf("%s: error=%d\n", label, nl_quiet(fd, type, flags, b.bytes, b.len));
+}
 /* A /32 address of lo, `ip`, as `ip address add` makes it. */
 static int nl_local(int fd, const unsigned char ip[4]) {
     unsigned char request[8 + 2 * 8] = {AF_INET, 32, 0, 0, 1};
@@ -11364,6 +11372,120 @@ int main(int argc, char **argv) {
             b = nl_body(45, 12);
             nl_strict(fd, port, 26, 1, &b, "route mctp deleted");
             close(mctp_mon);
+            /* Attribute policies (ifla_policy, ifla_info_policy,
+               ifa_ipv4_policy, ifa_ipv6_policy, rtm_ipv4_policy,
+               rtm_ipv6_policy), checked before what a request refuses: a
+               short integer, a long string or an integer out of range is
+               ERANGE, NLA_REJECT EINVAL, and so is a type from a policy's
+               strict_start_type on (RTA_NH_ID, IFLA_DPLL_PIN) of another
+               length or not named; a type past the last is passed over. */
+            static const char long_name[20] = "looooooooooooooooon";
+            static const unsigned char two[2] = {1, 2};
+            unsigned value = 0;
+            b = nl_body(0, 16);
+            nl_put(&b, 3, long_name, 20);
+            nl_strict(fd, port, 18, 1, &b, "policy link dump long name");
+            link = (struct nl_link){.index = 1};
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_put(&b, 4, two, 2);
+            nl_strict(fd, port, 18, 0, &b, "policy get short mtu");
+            b = nl_body(0, 16);
+            nl_put(&b, 53, long_name, 20);
+            nl_strict(fd, port, 18, 0, &b, "policy get long alt name");
+            static const unsigned char policy_families[] = {0, AF_INET, AF_INET6};
+            for (size_t i = 0; i < sizeof policy_families; i++) {
+                char label[64];
+                b = nl_body(policy_families[i], 8);
+                nl_put(&b, 8, two, 2);
+                snprintf(label, sizeof label, "policy addr%d short flags", policy_families[i]);
+                nl_strict(fd, port, 22, 1, &b, label);
+                b = nl_body(policy_families[i], 8);
+                nl_put32(&b, 1, 0);
+                snprintf(label, sizeof label, "policy addr%d 4-byte address", policy_families[i]);
+                nl_strict(fd, port, 22, 1, &b, label);
+                b = nl_body(policy_families[i], 12);
+                nl_put(&b, 6, two, 2);
+                snprintf(label, sizeof label, "policy route%d short priority", policy_families[i]);
+                nl_strict(fd, port, 26, 1, &b, label);
+            }
+            b = nl_body(AF_INET, 12);
+            nl_put(&b, 15, two, 2);
+            nl_strict(fd, port, 26, 0, &b, "policy get4 short table");
+            b = nl_body(AF_INET, 12);
+            nl_put32(&b, 31, 0);
+            nl_strict(fd, port, 26, 0, &b, "policy get4 flow label");
+            b = nl_body(AF_INET6, 12);
+            nl_put(&b, 31, two, 1);
+            nl_strict(fd, port, 26, 0, &b, "policy get6 short flow label");
+            /* Link changes, which check ifla_policy whatever the socket. */
+            link = (struct nl_link){.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            b = nl_body(0, 16);
+            memcpy(b.bytes, &link, 16);
+            nl_policy(fd, 19, 0, b, 4, two, 2, "policy set short mtu");
+            nl_policy(fd, 16, 0, b, 4, two, 2, "policy new short mtu");
+            nl_policy(fd, 19, 0, b, 54, NULL, 0, "policy set perm address");
+            nl_policy(fd, 19, 0, b, 3, long_name, 20, "policy set long name");
+            value = 0;
+            nl_policy(fd, 19, 0, b, 200, &value, 4, "policy set unknown type");
+            nl_policy(fd, 19, 0, b, 65, NULL, 0, "policy set dpll pin");
+            {
+                struct nl_body both = b;
+                value = 1;
+                nl_put32(&both, 19, getpid());
+                nl_policy(fd, 19, 0, both, 28, &value, 4, "policy set pid and fd");
+                /* IFLA_LINKINFO with an empty IFLA_INFO_KIND. */
+                unsigned short kind[2] = {4, 1};
+                nl_policy(fd, 16, 0, b, 18, kind, 4, "policy new empty kind");
+            }
+            /* Addresses: IPv6 has no label, so a long one is taken. */
+            {
+                static const unsigned char doc6[16] = {0x20, 0x01, 0x0d, 0xb8, [15] = 1};
+                static const unsigned char doc4[4] = {10, 9, 9, 9};
+                char label40[40];
+                memset(label40, 'a', sizeof label40);
+                struct nl_body a6 = nl_body(AF_INET6, 8);
+                a6.bytes[1] = 128;
+                index = 1;
+                memcpy(a6.bytes + 4, &index, 4);
+                nl_put(&a6, 1, doc6, 16);
+                nl_policy(fd, 20, 0x600, a6, 3, label40, sizeof label40, "policy addr6 long label");
+                nl_policy(fd, 21, 0, a6, 3, label40, sizeof label40, "policy del addr6 long label");
+                nl_policy(fd, 20, 0x600, a6, 8, two, 2, "policy addr6 short flags");
+                struct nl_body a4 = nl_body(AF_INET, 8);
+                a4.bytes[1] = 32;
+                memcpy(a4.bytes + 4, &index, 4);
+                nl_put(&a4, 2, doc4, 4);
+                nl_policy(fd, 20, 0x600, a4, 6, two, 2, "policy addr4 short cacheinfo");
+                nl_policy(fd, 20, 0x600, a4, 9, two, 2, "policy addr4 short priority");
+                nl_policy(fd, 20, 0x600, a4, 3, long_name, 20, "policy addr4 long label");
+                nl_policy(fd, 21, 0, a4, 10, two, 2, "policy del addr4 short netnsid");
+                /* Routes: rtm_ipv4_policy names no flow label. */
+                static const unsigned char net4[4] = {10, 8, 0, 0};
+                struct nl_body r4 = nl_body(AF_INET, 12);
+                r4.bytes[1] = 16;
+                r4.bytes[4] = 254;
+                r4.bytes[5] = 3;
+                r4.bytes[7] = 6;
+                nl_put(&r4, 1, net4, 4);
+                value = 0;
+                nl_policy(fd, 24, 0x600, r4, 31, &value, 4, "policy route4 flow label");
+                nl_policy(fd, 24, 0x600, r4, 21, two, 1, "policy route4 short encap type");
+                nl_policy(fd, 24, 0x600, r4, 30, &value, 5, "policy route4 long nexthop");
+                struct nl_body r6 = nl_body(AF_INET6, 12);
+                r6.bytes[1] = 48;
+                r6.bytes[4] = 254;
+                r6.bytes[5] = 3;
+                r6.bytes[7] = 6;
+                nl_put(&r6, 1, doc6, 16);
+                nl_policy(fd, 24, 0x600, r6, 23, two, 2, "policy route6 short expires");
+                nl_policy(fd, 24, 0x600, r6, 5, doc4, 4, "policy route6 short gateway");
+                b = nl_body(0, 8);
+                nl_strict(fd, port, 22, 1, &b, "policy addr after");
+                b = nl_body(0, 12);
+                b.bytes[4] = 254;
+                nl_strict(fd, port, 26, 1, &b, "policy route main after");
+            }
             /* Unchecked: an old rtgenmsg with IFLA_EXT_MASK after its 4
                bytes, IFLA_MASTER and IFLA_TARGET_NETNSID, and RTM_F_PREFIX. */
             int loose = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
@@ -11405,6 +11527,22 @@ int main(int argc, char **argv) {
             prefix = 0;
             memcpy(b.bytes + 8, &prefix, 4);
             nl_strict(loose, name.pid, 26, 1, &b, "loose route dst len");
+            /* Unchecked, a link dump with an attribute that breaks
+               ifla_policy takes none of them, so IFLA_MASTER narrows
+               nothing; lookups check their policies. */
+            b = nl_body(0, 16);
+            nl_put32(&b, 10, 5);
+            nl_put(&b, 3, long_name, 20);
+            nl_strict(loose, name.pid, 18, 1, &b, "loose link master and long name");
+            b = nl_body(AF_INET, 12);
+            nl_put(&b, 3, two, 2);
+            nl_strict(loose, name.pid, 26, 0, &b, "loose get4 short iif");
+            b = nl_body(AF_INET, 12);
+            nl_put32(&b, 31, 0);
+            nl_strict(loose, name.pid, 26, 0, &b, "loose get4 flow label");
+            b = nl_body(AF_INET, 12);
+            nl_put32(&b, 200, 0);
+            nl_strict(loose, name.pid, 26, 0, &b, "loose get4 unknown type");
             fflush(stdout);
             _exit(0);
         }

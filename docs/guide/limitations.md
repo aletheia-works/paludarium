@@ -474,11 +474,11 @@ verified.
   host's, and IPv6's creation time is 0 and its reachable time 30
   seconds, where Linux's is random. An address's creation times are 0.
   `NETLINK_EXT_ACK` adds no attributes to an error or to a dump's
-  `NLMSG_DONE`. Strict checking does not check the attribute policies
-  first, so of a request with a malformed attribute and another it
-  refuses, it may give `EINVAL` where Linux gives `ERANGE`, and a link
-  dump's `IFLA_LINKINFO` is taken without effect, where Linux shows only
-  the devices of a kind its modules know. A message type past the last
+  `NLMSG_DONE`. A link dump's `IFLA_LINKINFO` is taken without effect,
+  where Linux shows only the devices of a kind its modules know. The
+  least `IFLA_GSO_MAX_SIZE` and `IFLA_GSO_IPV4_MAX_SIZE` the link policy
+  takes is 321, as for Ubuntu's kernel (`MAX_TCP_HEADER` + 1), where
+  another build's may differ. A message type past the last
   that `rtnetlink` knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`,
   where Linux 7.0 refuses the send itself with `EOPNOTSUPP`. A socket
   whose receive buffer is full drops an answer with `ENOBUFS` without

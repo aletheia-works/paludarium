@@ -1196,6 +1196,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     マスターがないのでリンクのダンプの `IFLA_MASTER` はどのデバイスも見せず、ほかの
     名前空間には ID がないので `IFLA_TARGET_NETNSID` は `EINVAL` です。`lo` には
     プレフィックス経路がないので、`RTM_F_PREFIX` はどの経路もダンプしません。
+  - **属性のポリシー:** 各リクエストの属性は、まず Linux がそのリクエストに持つ
+    ポリシー（`ifla_policy`、`ifa_ipv4_policy`、`ifa_ipv6_policy`、`rtm_ipv4_policy`、
+    `rtm_ipv6_policy`、新しいリンクの `IFLA_LINKINFO` の中では `ifla_info_policy`）で、
+    並びの順に調べます。その前に調べるのは、Linux がその前に調べるヘッダーだけです。
+    型より短い整数、ポリシーより長い文字列やバイナリ、空の文字列、範囲外の整数は
+    `ERANGE` です。断る属性（`IFLA_PERM_ADDRESS` など）は `EINVAL` です。ポリシーの
+    `strict_start_type` 以降の型（`RTA_NH_ID`、`IFLA_DPLL_PIN`）の属性で、長さが違うもの、
+    入れ子の印が合わないもの、ポリシーにないものも `EINVAL` です。厳密な検査では、
+    型 0 や最後より後の型、余ったバイトは `EINVAL` です。検査しなければ読み飛ばし、
+    属性がポリシーに反するリンクのダンプは、属性をどれも使いません。リンクの変更は
+    `IFLA_NET_NS_PID`、`IFLA_NET_NS_FD`、`IFLA_TARGET_NETNSID` のうち一つまでを
+    取ります（`EINVAL`）。
   - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
     `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、

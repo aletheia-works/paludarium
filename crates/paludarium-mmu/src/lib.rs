@@ -4979,6 +4979,7 @@ mod tests {
                 (false, false, true)
             ]
         );
+        assert_eq!(space.vma_at(at(1)), Some((at(1), PAGE_SIZE)));
         let child = space.fork();
         assert_eq!(child.read_u64(at(0)).unwrap(), 1);
         assert!(child.read_u64(at(1)).is_err());
@@ -5015,6 +5016,7 @@ mod tests {
                 .mappings()
                 .all(|m| !m.dont_fork && !m.wipe_on_fork && !m.dont_dump)
         );
+        assert_eq!(space.vma_at(at(2)), Some((at(0), 4 * PAGE_SIZE)));
     }
 
     #[test]

@@ -5326,6 +5326,92 @@ mod inotify {
         assert_eq!(extra(&mut f, a)[0], flock("WRITE"));
     }
     #[test]
+    fn name_to_handle_at_gives_tmpfs_handles_and_others_identifiers() {
+        let mut f = fixture();
+        let file = put(&f, DATA, b"/tmp/handled");
+        let fd = f.ret(2, &[file, 0o102, 0o600]);
+        let link = put(&f, DATA + 0x40, b"/tmp/handled-link");
+        assert_eq!(f.ret(88, &[file, link]), 0);
+        let (handle, mount) = (DATA + 0x200, DATA + 0x300);
+        let ask = |f: &mut Fixture, dir: u64, path: u64, size: u32, flags: u64| {
+            f.mem.write(GuestAddr(handle), &[0xaa; 32]).unwrap();
+            f.mem.write(GuestAddr(handle), &size.to_le_bytes()).unwrap();
+            f.mem.write(GuestAddr(mount), &[0xbb; 8]).unwrap();
+            f.ret(303, &[dir, path, handle, mount, flags])
+        };
+        let header = |f: &mut Fixture| {
+            let mut b = [0u8; 20];
+            f.mem.read(GuestAddr(handle), &mut b).unwrap();
+            b
+        };
+        let fs = &f.kernel.files.fs;
+        let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
+        let id = 20 + (device & 0xff | (device >> 12) & !0xff);
+        let ino = fs.metadata(b"/tmp/handled", true).unwrap().inode;
+        let link_ino = fs.metadata(b"/tmp/handled-link", false).unwrap().inode;
+        let tmpfs = |ino: u64| {
+            let mut b = [0u8; 20];
+            b[0..4].copy_from_slice(&12u32.to_le_bytes());
+            b[4..8].copy_from_slice(&1u32.to_le_bytes());
+            b[12..16].copy_from_slice(&(ino as u32).to_le_bytes());
+            b[16..20].copy_from_slice(&((ino >> 32) as u32).to_le_bytes());
+            b
+        };
+        let cwd = (-100i64) as u64;
+        // Flags: unknown ones, and a connectable handle with FID or an
+        // empty path.
+        assert_eq!(ask(&mut f, cwd, file, 128, 0x4), errno(Errno::EINVAL));
+        assert_eq!(ask(&mut f, cwd, file, 128, 0x202), errno(Errno::EINVAL));
+        assert_eq!(ask(&mut f, cwd, file, 128, 0x1002), errno(Errno::EINVAL));
+        // Too little room: EOVERFLOW, with the size needed, FILEID_INVALID
+        // and the mount's ID written back; too much asked: EINVAL.
+        assert_eq!(ask(&mut f, cwd, file, 11, 0), errno(Errno::EOVERFLOW));
+        let b = header(&mut f);
+        assert_eq!(&b[0..8], &[12, 0, 0, 0, 0xff, 0, 0, 0]);
+        assert_eq!(&b[8..12], &[0xaa; 4]);
+        assert_eq!(
+            f.mem.read_u64(GuestAddr(mount)).unwrap(),
+            0xbbbb_bbbb_0000_0000 | id
+        );
+        assert_eq!(ask(&mut f, cwd, file, 129, 0), errno(Errno::EINVAL));
+        // A tmpfs file's handle; the link itself unless it is followed.
+        assert_eq!(ask(&mut f, cwd, file, 12, 0), 0);
+        assert_eq!(header(&mut f), tmpfs(ino));
+        assert_eq!(ask(&mut f, cwd, link, 128, 0), 0);
+        assert_eq!(header(&mut f), tmpfs(link_ino));
+        assert_eq!(ask(&mut f, cwd, link, 128, 0x400), 0);
+        assert_eq!(header(&mut f), tmpfs(ino));
+        // By descriptor, with the unique 64-bit mount ID.
+        let empty = put(&f, DATA + 0x80, b"");
+        assert_eq!(ask(&mut f, fd, empty, 128, 0x1001), 0);
+        assert_eq!(header(&mut f), tmpfs(ino));
+        assert_eq!(f.mem.read_u64(GuestAddr(mount)).unwrap(), 1 << 31 | id);
+        assert_eq!(ask(&mut f, fd, empty, 128, 0), errno(Errno::ENOENT));
+        // tmpfs cannot give a connectable handle.
+        assert_eq!(ask(&mut f, cwd, file, 128, 0x2), errno(Errno::EOPNOTSUPP));
+        // /proc has no NFS export: only an identifier, of the inode.
+        let status = put(&f, DATA + 0xc0, b"/proc/self/status");
+        assert_eq!(ask(&mut f, cwd, status, 128, 0), errno(Errno::EOPNOTSUPP));
+        assert_eq!(ask(&mut f, cwd, status, 128, 0x200), 0);
+        let b = header(&mut f);
+        assert_eq!(&b[0..8], &[12, 0, 0, 0, 0x81, 0, 0, 0]);
+        assert_eq!(&b[16..20], &[0; 4]);
+        // A memfd is shmem's.
+        let name = put(&f, DATA + 0x100, b"handled");
+        let memfd = f.ret(319, &[name, 0]);
+        assert_eq!(ask(&mut f, memfd, empty, 128, 0x1000), 0);
+        assert_eq!(&header(&mut f)[0..8], &[12, 0, 0, 0, 1, 0, 0, 0]);
+        // What cannot be read or written, and what is not there.
+        assert_eq!(f.ret(303, &[cwd, file, 8, mount, 0]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(303, &[cwd, file, handle, 8, 0]), errno(Errno::EFAULT));
+        assert_eq!(
+            f.ret(303, &[cwd, 8, handle, mount, 0]),
+            errno(Errno::EFAULT)
+        );
+        let missing = put(&f, DATA + 0x140, b"/tmp/missing");
+        assert_eq!(ask(&mut f, cwd, missing, 128, 0), errno(Errno::ENOENT));
+    }
+    #[test]
     fn fdinfo_lists_the_watches_the_newest_first() {
         let mut f = fixture();
         let fd = f.ret(INIT1, &[IN_NONBLOCK | 0o2000000]);
@@ -5349,12 +5435,50 @@ mod inotify {
         assert_eq!(lines.next(), Some("flags:\t02004000"));
         assert!(lines.next().unwrap().starts_with("mnt_id:\t"));
         assert!(lines.next().unwrap().starts_with("ino:\t"));
+        // Then tmpfs's handle: the generation, and the inode in halves.
+        let handle = |ino: u64| {
+            format!(
+                "fhandle-bytes:c fhandle-type:1 f_handle:00000000{:08x}{:08x}",
+                (ino as u32).swap_bytes(),
+                ((ino >> 32) as u32).swap_bytes()
+            )
+        };
         assert_eq!(
             lines.collect::<Vec<_>>(),
             [
-                format!("inotify wd:2 ino:{a_ino:x} sdev:{sdev:x} mask:80000004 ignored_mask:0 "),
-                format!("inotify wd:1 ino:{tmp_ino:x} sdev:{sdev:x} mask:4000300 ignored_mask:0 "),
+                format!(
+                    "inotify wd:2 ino:{a_ino:x} sdev:{sdev:x} mask:80000004 ignored_mask:0 {}",
+                    handle(a_ino)
+                ),
+                format!(
+                    "inotify wd:1 ino:{tmp_ino:x} sdev:{sdev:x} mask:4000300 ignored_mask:0 {}",
+                    handle(tmp_ino)
+                ),
             ]
+        );
+        // A /proc file's is the identifier of a file system without NFS
+        // export: the inode, then the generation.
+        let proc = put(&f, DATA + 0x80, b"/proc/self/status");
+        assert_eq!(f.ret(ADD, &[fd, proc, 0x2]), 3);
+        let path = format!("/proc/self/fdinfo/{fd}");
+        let text = String::from_utf8(contents(&mut f, path.as_bytes())).unwrap();
+        let line = text.lines().nth(4).unwrap();
+        let ino = u64::from_str_radix(
+            line.split("ino:")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap(),
+            16,
+        )
+        .unwrap();
+        assert!(
+            line.ends_with(&format!(
+                "fhandle-bytes:c fhandle-type:81 f_handle:{:016x}00000000",
+                ino.swap_bytes()
+            )),
+            "{line}"
         );
         // The directory lists the descriptors as regular files.
         let dir = f.ret(2, &[put(&f, DATA, b"/proc/self/fdinfo"), 0o200000]);
@@ -6360,6 +6484,105 @@ mod kcmp {
         assert_eq!(f.ret(3, &[b]), 0);
         slot(&f, epoll, b, 0);
         assert_eq!(f.ret(312, &[pid, pid, 7, a, SLOT]), errno(Errno::ENOENT));
+    }
+}
+mod madvise_advice {
+    use super::*;
+    const AREA: u64 = DATA + 0x10_0000;
+    const PAGE: u64 = 4096;
+    fn status(f: &mut Fixture, at: u64) -> i32 {
+        f.mem.write_u64(GuestAddr(DATA + 0x200), at).unwrap();
+        assert_eq!(f.ret(279, &[0, 1, DATA + 0x200, 0, DATA + 0x300, 0]), 0);
+        f.mem.read_u64(GuestAddr(DATA + 0x300)).unwrap() as i32
+    }
+    #[test]
+    fn hints_need_only_a_mapping() {
+        let mut f = fixture();
+        f.mem
+            .map(
+                Some(GuestAddr(AREA)),
+                2 * PAGE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        f.mem.write(GuestAddr(AREA), &[7]).unwrap();
+        for advice in [12, 13, 14, 15, 20, 21] {
+            assert_eq!(f.ret(28, &[AREA, 2 * PAGE, advice]), 0, "{advice}");
+            assert_eq!(f.ret(28, &[AREA, 3 * PAGE, advice]), errno(Errno::ENOMEM));
+        }
+        let mut byte = [0];
+        f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
+        assert_eq!(byte, [7]);
+        // Still refused: the fork, dump and guard advice, and unknown ones.
+        for advice in [9, 10, 11, 16, 17, 18, 19, 25, 100, 101, 102, 103, 26] {
+            assert_eq!(
+                f.ret(28, &[AREA, PAGE, advice]),
+                errno(Errno::EINVAL),
+                "{advice}"
+            );
+        }
+        // MADV_DONTNEED_LOCKED discards.
+        assert_eq!(f.ret(28, &[AREA, PAGE, 24]), 0);
+        assert_eq!(status(&mut f, AREA), -2);
+    }
+    #[test]
+    fn populate_faults_pages_in_until_one_cannot_be() {
+        let mut f = fixture();
+        let m = &mut f.mem;
+        m.map(
+            Some(GuestAddr(AREA)),
+            3 * PAGE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        m.map(
+            Some(GuestAddr(AREA + 4 * PAGE)),
+            PAGE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        m.map(
+            Some(GuestAddr(AREA + 6 * PAGE)),
+            PAGE,
+            Prot::READ,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        m.map(
+            Some(GuestAddr(AREA + 8 * PAGE)),
+            PAGE,
+            Prot::NONE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        // A read maps the zero page, a write a page of its own.
+        assert_eq!(f.ret(28, &[AREA, PAGE, 22]), 0);
+        assert_eq!(status(&mut f, AREA), -14);
+        f.mem.write(GuestAddr(AREA + 2 * PAGE), &[5]).unwrap();
+        assert_eq!(f.ret(28, &[AREA + PAGE, 2 * PAGE, 23]), 0);
+        assert_eq!(status(&mut f, AREA + PAGE), 0);
+        let mut byte = [0];
+        f.mem.read(GuestAddr(AREA + 2 * PAGE), &mut byte).unwrap();
+        assert_eq!(byte, [5]);
+        // A hole after a page: that page, then ENOMEM.
+        assert_eq!(
+            f.ret(28, &[AREA + 4 * PAGE, 2 * PAGE, 22]),
+            errno(Errno::ENOMEM)
+        );
+        assert_eq!(status(&mut f, AREA + 4 * PAGE), -14);
+        // A mapping that may not be read, or written.
+        assert_eq!(
+            f.ret(28, &[AREA + 8 * PAGE, PAGE, 22]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(
+            f.ret(28, &[AREA + 6 * PAGE, PAGE, 23]),
+            errno(Errno::EINVAL)
+        );
+        assert_eq!(f.ret(28, &[AREA + 6 * PAGE, PAGE, 22]), 0);
     }
 }
 mod page_nodes {

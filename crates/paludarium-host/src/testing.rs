@@ -25,6 +25,9 @@ struct Streams {
     /// reader is slow ([`RecordingHost::set_output_full`]).
     output_full: [bool; 2],
     network: bool,
+    /// Whether a thread's CPU time is the host thread's, not the virtual
+    /// monotonic clock ([`RecordingHost::measure_cpu_time`]).
+    cpu_time: bool,
 }
 
 impl Default for Streams {
@@ -42,6 +45,7 @@ impl Default for Streams {
             stderr: Vec::new(),
             output_full: [false; 2],
             network: false,
+            cpu_time: false,
         }
     }
 }
@@ -131,6 +135,12 @@ impl RecordingHost {
     pub fn enable_network(&self) {
         self.lock().network = true;
     }
+    /// Measures each thread's CPU time on the native host, for the
+    /// differential tests of guests that wait for CPU time to pass, which
+    /// the virtual clock alone does not make pass.
+    pub fn measure_cpu_time(&self) {
+        self.lock().cpu_time = true;
+    }
     /// Makes standard output (`channel` 1) or standard error (2) full, or
     /// gives it room again, for [`Host::output_writable`]; writes still go.
     pub fn set_output_full(&self, channel: u32, full: bool) {
@@ -188,6 +198,14 @@ impl Host for RecordingHost {
 
     fn clock(&self, clock: ClockId) -> Result<u64, Errno> {
         Ok(self.lock().now(clock))
+    }
+    fn thread_cpu_time(&self) -> Result<u64, Errno> {
+        // WebAssembly has no thread CPU time to measure.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.lock().cpu_time {
+            return crate::clock::native_thread_cpu_time();
+        }
+        Err(Errno::ENOSYS)
     }
     /// Gives other threads the wait's time, up to [`GRACE`], of real time
     /// to cancel it, then reaches its deadline at once on the virtual clock.

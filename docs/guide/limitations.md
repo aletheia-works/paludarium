@@ -205,6 +205,13 @@ verified.
     `RWF_NOWAIT` and `RWF_DONTCACHE` as ext4's does, whatever its own file
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
+  - `madvise` refuses (`EINVAL`) the advice that changes `fork` or core
+    dumps (`MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK`,
+    `MADV_KEEPONFORK`, `MADV_DONTDUMP`, `MADV_DODUMP`), `MADV_REMOVE`,
+    `MADV_COLLAPSE`, the guard regions (`MADV_GUARD_INSTALL`,
+    `MADV_GUARD_REMOVE`) and `MADV_HWPOISON` and `MADV_SOFT_OFFLINE`, which
+    Linux takes. `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` bring in the
+    pages of a `memfd_secret` mapping, where Linux gives `EINVAL`.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
     mapped. It refuses advice Linux does not know before any range
@@ -222,14 +229,28 @@ verified.
     `msync` with `MS_SYNC` of its mapping succeeds, where Linux gives
     `EINVAL` as the file has no `fsync`.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`,
-    cannot be set: `setitimer` gives `EINVAL` for them, where Linux sets them
-    and sends `SIGVTALRM` and `SIGPROF`, and `getitimer` shows them disarmed.
+    both count the process's whole CPU time, as all of it is user time here
+    (Linux's `ITIMER_VIRTUAL` leaves out the system time). Where the host
+    cannot measure a thread's CPU time, as in WebAssembly, that is wall time,
+    so they also count the time a thread sleeps or waits. They are looked
+    at as a thread makes a system call and every 100,000 instructions it
+    runs, not at each tick as on Linux, and a tick is taken as 1 ms, the
+    CI runners' `CONFIG_HZ`. `timer_create` on a CPU-time clock
+    (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID` or another
+    process's or thread's) gives `EINVAL`, where Linux makes the timer, and
+    `RLIMIT_CPU` sends no `SIGXCPU`.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
     the superblock of its pseudo filesystem and gives its counts (0). A
     file in `/proc` or `/dev` has the `st_dev` of the mount holding the
     path, so `ustat` of it gives that mount's counts, where Linux gives
     procfs's or devtmpfs's.
+  - A file handle (`name_to_handle_at`, an inotify watch's in
+    `/proc/self/fdinfo`) has the generation 0, where tmpfs picks a random
+    one for each inode. A file of a host's directory is taken as one of a
+    file system without NFS export (`EOPNOTSUPP`, or the `FILEID_INO64_GEN`
+    identifier with `AT_HANDLE_FID`), where Linux gives the handle of that
+    file system (ext4's, say). There is no `open_by_handle_at` (`ENOSYS`).
   - System V IPC has no `/proc/sysvipc`, and the limits of its shared
     memory, semaphores and message queues are Linux's defaults, which
     `/proc/sys/kernel` cannot change. A message queue's waiting senders
@@ -271,7 +292,7 @@ verified.
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
   - Memory locks leave no state. So `RLIMIT_MEMLOCK` is not enforced on
     them (only on `SHM_LOCK`), which matters only to a guest that gave up
-    `CAP_IPC_LOCK`, `MADV_DONTNEED` works on
+    `CAP_IPC_LOCK`, `MADV_DONTNEED`, `MADV_COLD` and `MADV_PAGEOUT` work on
     locked memory where Linux gives `EINVAL`, `mlock` succeeds on the pages of a
     file mapping past the end of the file where Linux gives `ENOMEM`, and
     `/proc` shows no locked memory.
@@ -368,9 +389,7 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: an instance's `/proc/self/fdinfo` lines end at
-  `ignored_mask:0`, without the file handle Linux adds for a file system
-  that can make one, and `IN_UNMOUNT` is never sent, as nothing is ever
+- **inotify, in part**: `IN_UNMOUNT` is never sent, as nothing is ever
   unmounted (there is no `umount2`). `/proc/self/fdinfo` lists an epoll's files by
   descriptor where Linux's order follows the files' addresses, and numbers
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
@@ -395,17 +414,18 @@ verified.
   where Linux's order follows its hash tables, and what an AF_UNIX socket
   sent that waits is counted as its send buffer is charged here, where
   Linux counts its buffers' true sizes. Of a TCP socket they tell its
-  memory but for its buffers as 0; its keepalive timer ends a whole `TCP_KEEPIDLE` from
-  now, and only a handshake on the loopback has its retransmission's
-  time and count. A connection the host made has no `TIME_WAIT` after
-  it, and a closed socket whose bytes still wait to go shows as a hold in
-  `FIN_WAIT1`, where Linux keeps the socket itself. Every socket's cgroup
-  is the root, 1, and its traffic class 0. A request that names a BPF
-  map (`INET_DIAG_REQ_SK_BPF_STORAGES`) is `EINVAL`, as no descriptor
-  here is one, where Linux's is `EBADF` for one that is not open. Generic netlink has no family but `nlctrl`, where
-  Linux has those of the host's kernel and modules (`ethtool`,
-  `nl80211`, `devlink` and others), so a lookup of one is `ENOENT` and a
-  socket has 64 groups however many those take. Of `NETLINK_ROUTE` there
+  memory but for its buffers as 0; its keepalive timer ends a whole
+  `TCP_KEEPIDLE` from now, and only a handshake on the loopback has its
+  retransmission's time and count. A connection the host made has no
+  `TIME_WAIT` after it, and a closed socket whose bytes still wait to go
+  shows as a hold in `FIN_WAIT1`, where Linux keeps the socket itself.
+  Every socket's cgroup is the root, 1, and its traffic class 0. A request
+  that names a BPF map (`INET_DIAG_REQ_SK_BPF_STORAGES`) is `EINVAL`, as
+  no descriptor here is one, where Linux's is `EBADF` for one that is not
+  open. Generic netlink has no family but `nlctrl`, where Linux has those
+  of the host's kernel and modules (`ethtool`, `nl80211`, `devlink` and
+  others), so a lookup of one is `ENOENT` and a socket has 64 groups
+  however many those take. Of `NETLINK_ROUTE` there
   are only the link, address and route requests: neighbours, rules, queueing
   disciplines and the rest are `EOPNOTSUPP`, as are an input route
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), a non-dump
@@ -427,37 +447,41 @@ verified.
   `lo` while it is down is `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
   of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
-  lookup while `lo` is down is `ENETUNREACH` too. A route dump does not filter by
-  the table or attributes a strict request names, and a lookup looks at
-  no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
-  the rest are not); its `rta_cacheinfo` counts one reference, where
-  Linux counts the other users of the cached route too. Notifications go
-  out for the link, its IPv6 information, addresses and routes alone, not
-  for neighbours, netconf or the other groups, nor to a socket in
-  another namespace (`NETLINK_LISTEN_ALL_NSID` is not supported); IPv4's
-  routes through `lo` go without one when it goes down, as on Linux.
+  lookup while `lo` is down is `ENETUNREACH` too. A route dump does not
+  filter by the table or attributes a strict request names, and a lookup
+  looks at no selector but its destination (`RTA_SRC`, `RTA_OIF`,
+  `RTA_MARK` and the rest are not); its `rta_cacheinfo` counts one
+  reference, where Linux counts the other users of the cached route too.
+  Notifications go out for the link, its IPv6 information, addresses and
+  routes alone, not for neighbours, netconf or the other groups, nor to a
+  socket in another namespace (`NETLINK_LISTEN_ALL_NSID` is not
+  supported); IPv4's routes through `lo` go without one when it goes down,
+  as on Linux.
   `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
   listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
-  MCTP's settings and an `AF_MCTP` address dump has its own answer,
-  where a kernel without it gives no MCTP settings and dumps IPv4's and
-  IPv6's addresses for that dump; MCTP addresses cannot be added
-  (`RTM_NEWADDR` of `AF_MCTP` is `EOPNOTSUPP`). A link message's
+  MCTP's settings and `AF_MCTP` address and route dumps have their own
+  answers, where a kernel without it gives no MCTP settings, dumps
+  IPv4's and IPv6's addresses and routes for those dumps, and takes no
+  MCTP address; MCTP routes cannot be added or removed (`RTM_NEWROUTE`
+  and `RTM_DELROUTE` of `AF_MCTP` are `EOPNOTSUPP`), so there are only
+  the local routes of `lo`'s addresses. A link message's
   statistics are zero; its IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30
-  seconds, where Linux's is random. An address's creation times are 0,
+  seconds, where Linux's is random. An address's creation times are 0.
   `NETLINK_EXT_ACK` adds no attributes to an error or to a dump's
   `NLMSG_DONE`. Strict checking does not check the attribute policies
   first, so of a request with a malformed attribute and another it
   refuses, it may give `EINVAL` where Linux gives `ERANGE`, and a link
   dump's `IFLA_LINKINFO` is taken without effect, where Linux shows only
-  the devices of a kind its modules know. A message type past the last that `rtnetlink`
-  knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`, where Linux 7.0
-  refuses the send itself with `EOPNOTSUPP`. A socket whose receive buffer
-  is full drops an answer with `ENOBUFS` without waiting. A `write` to a netlink socket
-  acts with the capability of the thread that opened it alone. The other namespaces keep nothing apart that
-  paludarium has, but for the System V shared memory, semaphores and
+  the devices of a kind its modules know. A message type past the last
+  that `rtnetlink` knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`,
+  where Linux 7.0 refuses the send itself with `EOPNOTSUPP`. A socket
+  whose receive buffer is full drops an answer with `ENOBUFS` without
+  waiting. A `write` to a netlink socket acts with the capability of the
+  thread that opened it alone. The other namespaces keep nothing apart
+  that paludarium has, but for the System V shared memory, semaphores and
   message queues and the POSIX message queues of an IPC namespace: there is
   no `mount` for a mount namespace (whose mounts keep their IDs
   in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new

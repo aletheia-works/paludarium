@@ -684,6 +684,11 @@ impl Kernel {
         if thread.state.pending.iter().any(|s| s.number == 18) {
             self.group.job_continue();
         }
+        // The CPU-time interval timers count what this thread has run since
+        // its last system call too, as Linux's tick does.
+        if self.group.cpu_timers_armed() {
+            account_cpu(&*self.host, &self.group, &mut thread.state);
+        }
         if let Ok(now) = self.host.clock(paludarium_host::ClockId::Monotonic) {
             self.group.expire_timer(&mut thread.state, now);
         }

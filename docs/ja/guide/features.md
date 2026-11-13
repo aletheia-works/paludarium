@@ -54,7 +54,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | seccomp | `seccomp`（下に書きます） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
@@ -190,6 +190,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   64 ビットの ID です。
   `AT_EMPTY_PATH` はディスクリプタを、`AT_FDCWD` なら作業ディレクトリを指し、Linux 6.11
   からと同じく、それとともに渡した空ポインタのパスも同じ扱いです。
+- `name_to_handle_at` はファイルのハンドルを返し、Linux（6.13 以降）と同じ順に確かめます。
+  まずフラグ（`EINVAL`。`AT_HANDLE_CONNECTABLE` と `AT_HANDLE_FID` か `AT_EMPTY_PATH` を
+  合わせたときも）、次にパス（`AT_SYMLINK_FOLLOW` がなければ最後のリンクそのもの。空の
+  パスと `AT_EMPTY_PATH` ではディスクリプタか作業ディレクトリ）、ファイルシステム、渡した
+  大きさ（128 バイトを超えると `EINVAL`、ハンドルより小さいと `EOVERFLOW` で、要る大きさと
+  `FILEID_INVALID` を書き戻します）、最後に `statx` と同じマウントの ID
+  （`AT_HANDLE_MNT_ID_UNIQUE` では 64 ビットの ID）です。tmpfs のファイル（と memfd）は
+  tmpfs と同じ 12 バイトで型 `FILEID_INO32_GEN` のハンドルを持ちます。世代、inode の下位と
+  上位の半分の順です。ほかのファイルシステムは NFS のエクスポートがないものとして
+  ハンドルを断り（`EOPNOTSUPP`）、`AT_HANDLE_FID` には型 `FILEID_INO64_GEN` の識別子を
+  返します。inode、世代の順です。接続できるハンドルは、tmpfs が作れないので
+  `EOPNOTSUPP` です。
 - `fallocate` は、Linux の `vfs_fallocate` と同じ順に引数を確かめます（`EINVAL`、
   `EOPNOTSUPP`、`EBADF`、通常のファイルでなければ `ESPIPE`・`EISDIR`・`ENODEV`、
   そして `EFBIG`）。そのあとは tmpfs と同じふるまいです。通常の確保は範囲の
@@ -675,7 +687,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書き換えた読み込み専用のセグメント（コード）も同じです。残り（`.bss`）は無名の
   メモリで、0 として読めます。共有メモリは自分の中身を保ちます。`MADV_FREE` では
   中身を残します。メモリが足りているときの Linux と同じです。
-  アクセスの仕方のヒントは受け付け、ほかの指定には `EINVAL` を返します。
+  アクセスの仕方のヒントと `MADV_WILLNEED` を受け付けます。`MADV_COLD` と
+  `MADV_PAGEOUT`（回収するものがないので、これもヒントです）、`MADV_MERGEABLE`、
+  `MADV_UNMERGEABLE`、`MADV_HUGEPAGE`、`MADV_NOHUGEPAGE`（そのフラグでページは
+  変わりません）も受け付け、どれも範囲がマップされていれば足ります（`ENOMEM`）。
+  `MADV_DONTNEED_LOCKED` は `MADV_DONTNEED` と同じく捨てます。`MADV_POPULATE_READ` と
+  `MADV_POPULATE_WRITE` は、読み込みや書き込みと同じようにページを割り当てます
+  （ゼロページ、自分のページ）。どのマッピングにもないページ（`ENOMEM`）、マッピングが
+  読めないか書けないページ（`EINVAL`）、ファイルの終わりより先のページ（`EFAULT`）で
+  止まります。ほかの指定には `EINVAL` を返します。
 - `process_madvise` は、iovec の範囲を順に指定どおりにします。呼んだプロセス自身の
   メモリ（`PIDFD_SELF_THREAD`、`PIDFD_SELF_THREAD_GROUP`、自身かメモリを共有する
   プロセスの pidfd）には `madvise` と同じようにします。結果は、最初に失敗した範囲より
@@ -1190,9 +1210,6 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     サブネットの中のアドレス。`IFA_F_SECONDARY` が付きます）は最後です。IPv6 はグローバルな
     ものが先で、新しいものが先です。`lo` が上がるたびに `127.0.0.1/8`（消されていれば）と
     `::1/128` が付き、落とすと IPv6 のアドレスはすべて消えます（`keep_addr_on_down` は 0）。
-    `AF_MCTP` のダンプは、`mctp_dump_addrinfo` と同じく MCTP 自身が扱い、`lo` には MCTP の
-    アドレスがないので何も返しません。検査するときに要るのは `ifaddrmsg` 全体だけで
-    （足りなければ `EINVAL`）、インデックスは `NLM_F_DUMP_FILTERED` を付けずに絞り込みます。
     `RTM_NEWADDR` は、`inet_rtm_newaddr` と `inet6_rtm_newaddr` と同じくアドレスを足します。
     `lo` がすでに持つものは、`NLM_F_EXCL` なしの `NLM_F_REPLACE` でなければ `EEXIST` です。
     `IFA_LOCAL` のない IPv4 のもの、32（IPv6 なら 128）を超える接頭辞、`IFA_LOCAL` も
@@ -1202,6 +1219,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `IFA_LOCAL`、`IFA_LABEL`、`IFA_ADDRESS` と接頭辞を持つ最初のものを消し（なければ
     `EADDRNOTAVAIL`）、プライマリならそのセカンダリも消します。`127.0.0.1` と `::1` も
     消せます。
+  - **MCTP のアドレス:** `CONFIG_MCTP` を組み込んだカーネルのループバックと同じく、`lo` は
+    MCTP のエンドポイント ID を持てます。`AF_MCTP` の `RTM_NEWADDR` と `RTM_DELADDR` は、
+    `mctp_rtm_newaddr` と `mctp_rtm_deladdr` と同じく ID を足し、消します。リクエストは
+    ソケットにかかわらず厳しく解釈します。`ifaddrmsg` 全体と、1 バイトの `IFA_LOCAL`
+    （なければ `IFA_ADDRESS`）が要り、ほかの属性は取りません（`EINVAL`）。インデックスは
+    `lo` のものです（ほかは `ENODEV`）。足せる ID は 8 から 254 で（ほかは `EINVAL`）、
+    同じものは一度だけです（`EEXIST`）。`lo` にないものを消そうとすると `ENOENT` です。
+    変更は、`mctp_addr_notify` と同じく、リクエストのシーケンス番号とポートを付けて
+    `RTNLGRP_MCTP_IFADDR`（34）に伝えます。`AF_MCTP` のアドレスのダンプは、
+    `mctp_dump_addrinfo` と同じく MCTP 自身が扱い、ID を足した順に、それぞれ `IFA_LOCAL` と
+    `IFA_ADDRESS` で返します。検査するときに要るのは `ifaddrmsg` 全体だけで（足りなければ
+    `EINVAL`）、インデックスは `NLM_F_DUMP_FILTERED` を付けずに絞り込みます。ID ごとに
+    ローカルの経路があり（`mctp_route_add_local`）、`AF_MCTP` の経路のダンプは、
+    `mctp_dump_rtinfo` と同じく絞り込みを取らずに、新しいものから返します。すべての
+    ファミリーのアドレスと経路のダンプ（`rtnl_dump_all`）は、最後に MCTP のものを返します。
   - **経路:** ファミリーごとに、Linux の `fib_trie` と `ip6_fib` と同じく経路の表を
     持ちます。IPv4 のローカルの表とメインの表は、ポリシーのルールがない間の Linux と同じく
     1 つのトライを分け合います。アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付ける
@@ -1628,7 +1660,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、新しいウォッチから順に 1 行ずつ加わります。`inotify wd:` にウォッチの
   ディスクリプタ、`ino:` と `sdev:` にファイルの inode とカーネルの番号の付け方
   （`MKDEV`）でのファイルシステムのデバイス、`mask:` に与えたマスクを 16 進で書き、
-  `ignored_mask:0` が続きます。ほかの種類のファイルも Linux と同じ行を加えます。
+  `ignored_mask:0` と、`show_mark_fhandle` と同じファイルのハンドルが続きます。
+  `fhandle-bytes:` と `fhandle-type:` は 16 進で、`f_handle:` はそのバイトで、
+  `AT_HANDLE_FID` の `name_to_handle_at` が返す識別子です。ほかの種類のファイルも Linux と同じ行を加えます。
   最初の 4 行の後には `lock:` の行が続きます（`show_fd_locks`）。まずファイル記述の
   `flock` のロック、次にそのファイル記述を通して掛けたレコードロックのうちプロセスか
   ファイル記述が持つものが始まりの順に並び、両方を通して 1 から番号が付きます。各行には
@@ -1820,6 +1854,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マイクロ秒に切り捨てて返します。設定中で時間が来たタイマーは 1 µs、残りが 1 µs に満たない
   タイマーは 0 と見せます。`alarm` は Linux の `alarm_setitimer` と同じく、間隔なしの秒単位で
   設定し、残っていた秒数を四捨五入して返します（設定中だったなら少なくとも 1）。
+- プロセスの CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は、Linux の
+  `check_cpu_itimer` と同じく、プロセスのスレッドが合わせてその時間を使うと、カーネルから
+  （`SI_KERNEL`）`SIGVTALRM` と `SIGPROF` を送ります。満了するたびに間隔ひとつ分だけ進み、
+  新しい値は 1 ティック遅れて始まり、時間が来たタイマーは残り 1 ティックと見せます。値が 0
+  なら止めますが間隔は残し、`KTIME_MAX` を超えて設定した値は、Linux の `ns_to_timespec64`
+  と同じく負の秒数に見えます。`fork` の子はどちらも持たずに始まり、`execve` は引き継ぎます。
+  CPU 時間は CPU の時計と同じく数えるので、それを測れない WebAssembly では経過時間を数えます。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
   見せません。起動からの時間は単調時計の値で、Linux と同じく秒単位に切り上げます。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
@@ -2078,7 +2119,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   示しません。pidfd は、そのプロセスが終わると読めるようになり（回収されると
   切断も示します。自動で回収された子では両方を同時に示します）、`epoll` で待てます。ノンブロッキングの pidfd での
   `waitid(P_PIDFD)` は `EAGAIN` を返します。`pidfd_send_signal` は siginfo と
-  範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。
+  範囲の指定を受け付けず、`PIDFD_THREAD` を付けてもプロセス全体を指します。pidfd の
+  代わりに Linux の特別な値も受け付けます。`PIDFD_SELF_THREAD`（-10000）は呼んだ
+  スレッドに `tkill` と同じく（`SI_TKILL`）、`PIDFD_SELF_THREAD_GROUP`（-10001）は
+  そのプロセスに `kill` と同じく送ります。
 - 不正なポインタを渡されたときは `EFAULT` を返します。
 
 ## ネットワーク {#network}

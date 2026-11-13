@@ -2853,6 +2853,29 @@ mod signal_senders {
         assert_eq!(take(&mut k, &mut t, &m), (0, ct.tid));
     }
     #[test]
+    fn pidfd_send_signal_takes_the_self_sentinels() {
+        let (mut k, mut t, m) = setup();
+        block(&mut k, &mut t, &m);
+        let send = |k: &mut Kernel, t: &mut Thread, pidfd: i64, number: u64| {
+            syscall(k, t, &m, 424, [pidfd as u64, number, 0, 0, 0, 0])
+        };
+        // PIDFD_SELF_THREAD: the thread, as tkill sends (SI_TKILL).
+        assert_eq!(send(&mut k, &mut t, -10000, 10), 0);
+        assert_eq!(take(&mut k, &mut t, &m), (-6, 1));
+        // PIDFD_SELF_THREAD_GROUP: the process, as kill sends (SI_USER).
+        assert_eq!(send(&mut k, &mut t, -10001, 10), 0);
+        assert_eq!(take(&mut k, &mut t, &m), (0, 1));
+        assert_eq!(send(&mut k, &mut t, -10000, 0), 0);
+        let einval = Errno::EINVAL.to_syscall_return();
+        assert_eq!(send(&mut k, &mut t, -10000, 65), einval);
+        assert_eq!(send(&mut k, &mut t, -10001, 65), einval);
+        // Any other negative number is no descriptor.
+        assert_eq!(
+            send(&mut k, &mut t, -20000, 10),
+            Errno::EBADF.to_syscall_return()
+        );
+    }
+    #[test]
     fn the_parent_death_signal_comes_from_the_parent() {
         let (mut k, mut t, m) = setup();
         let (mut p, mut pt, pm) = fork(&mut k, &mut t, &m);

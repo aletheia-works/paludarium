@@ -3590,31 +3590,51 @@ impl Kernel {
     }
     /// `pidfd_send_signal(pidfd, sig, info, flags)`, as `kill` on the
     /// pidfd's process; a siginfo and the scope flags are not supported
-    /// (`EINVAL`).
+    /// (`EINVAL`). `PIDFD_SELF_THREAD` (-10000) names the calling thread,
+    /// which takes the signal as from `tkill`, and `PIDFD_SELF_THREAD_GROUP`
+    /// (-10001) its process, as Linux master's sentinels do; any other
+    /// number must be a pidfd (`EBADF`).
     fn pidfd_send_signal(&self, thread: &Thread, a: [u64; 6]) -> Result<u64, Errno> {
+        const PIDFD_SELF_THREAD: i32 = -10000;
+        const PIDFD_SELF_THREAD_GROUP: i32 = -10001;
         if a[3] as u32 != 0 {
             return Err(Errno::EINVAL);
         }
-        let d = self.files.descriptor(u64::from(a[0] as u32))?;
-        let pidfd = d
-            .file
-            .as_any()
-            .and_then(|any| any.downcast_ref::<PidFd>())
-            .ok_or(Errno::EBADF)?;
+        let target = match a[0] as i32 {
+            PIDFD_SELF_THREAD => None,
+            PIDFD_SELF_THREAD_GROUP => Some(self.process.pid),
+            _ => {
+                let d = self.files.descriptor(u64::from(a[0] as u32))?;
+                let pidfd = d
+                    .file
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<PidFd>())
+                    .ok_or(Errno::EBADF)?;
+                Some(pidfd.pid)
+            }
+        };
         let number = a[1] as i32;
         if !(0..=64).contains(&number) || a[2] != 0 {
             return Err(Errno::EINVAL);
         }
-        // A zombie takes the signal and drops it; a reaped process is gone.
-        let exited = self.processes.exited(pidfd.pid).ok_or(Errno(3))?;
         let sender = thread.state.credentials.task_ids();
+        let Some(pid) = target else {
+            // The thread itself, which may always signal itself.
+            let own = self.pid_space(thread.tid).number(self.process.pid);
+            return self
+                .group
+                .send(thread.tid, number, own, sender.uid)
+                .map(|()| 0);
+        };
+        // A zombie takes the signal and drops it; a reaped process is gone.
+        let exited = self.processes.exited(pid).ok_or(Errno(3))?;
         self.processes
-            .may_signal(self.process.pid, sender.clone(), pidfd.pid, number)?;
+            .may_signal(self.process.pid, sender.clone(), pid, number)?;
         if exited {
             return Ok(0);
         }
         self.processes
-            .signal(self.process.pid, sender.uid, pidfd.pid, number)
+            .signal(self.process.pid, sender.uid, pid, number)
             .map(|()| 0)
     }
     /// Closes what exec closed, as Linux's `__fput` does on the way back to

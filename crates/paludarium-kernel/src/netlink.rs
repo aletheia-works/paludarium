@@ -12,11 +12,12 @@
 //! that leaves room sending the next, then `NLMSG_DONE` in a part of its
 //! own (after the last IPv6 address or link, when it has room); an AF_INET6
 //! `RTM_GETLINK` dump shows the loopback as IPv6 does, and an
-//! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table, and an AF_MCTP
-//! `RTM_GETADDR` dump nothing, as `lo` has no MCTP address; `RTM_GETLINK`
+//! `RTNL_FAMILY_IPMR` one the IPv4 multicast routing table, and AF_MCTP
+//! ones the loopback's MCTP addresses and their local routes; `RTM_GETLINK`
 //! without a dump answers for `lo` by index or name, and `RTM_GETROUTE`
 //! without one looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and
-//! remove the loopback's addresses ([`crate::interface`]); `RTM_NEWLINK`
+//! remove the loopback's IPv4, IPv6 and MCTP addresses
+//! ([`crate::interface`]); `RTM_NEWLINK`
 //! and `RTM_SETLINK` bring it up or down with `IFF_UP`, given
 //! `CAP_NET_ADMIN` in the user namespace that owns the network namespace.
 //! An error, or a success the request asks for with `NLM_F_ACK`, is
@@ -76,6 +77,7 @@ const RTNLGRP_IPV4_ROUTE: u32 = 7;
 const RTNLGRP_IPV6_IFADDR: u32 = 9;
 const RTNLGRP_IPV6_ROUTE: u32 = 11;
 const RTNLGRP_IPV6_IFINFO: u32 = 12;
+const RTNLGRP_MCTP_IFADDR: u32 = 34;
 const GROUPS: u32 = 39;
 /// The bits of groups 30 and 31, the multicast routing ones of a full
 /// routing daemon, which need `CAP_NET_ADMIN` (`rtnetlink_bind`).
@@ -880,10 +882,11 @@ impl NetlinkSocket {
                 (RTM_GETLINK, RTNL_FAMILY_IPMR) => bare_link_dump_check(payload, strict)
                     .map(|()| vec![ipmr_link_message(seq, port)]),
                 (RTM_GETLINK, _) => link_dump(network, payload, seq, port, strict),
-                // `mctp_dump_addrinfo`: `lo` has no MCTP address.
-                (RTM_GETADDR, AF_MCTP) => {
-                    mctp_address_dump_check(payload, strict).map(|()| Vec::new())
-                }
+                // `mctp_dump_addrinfo`: `lo`'s MCTP addresses.
+                (RTM_GETADDR, AF_MCTP) => mctp_address_dump_check(payload, strict)
+                    .map(|()| mctp_addresses(network, payload, seq, port)),
+                // `mctp_dump_rtinfo`, which checks nothing.
+                (RTM_GETROUTE, AF_MCTP) => Ok(mctp_routes(network, seq, port)),
                 // `rtnl_dump_all` dumps each family's: IPv4's, then IPv6's.
                 (RTM_GETADDR, _) => {
                     address_dump(network, payload, family, seq, port, strict, &mut answer)
@@ -934,6 +937,22 @@ impl NetlinkSocket {
                     }
                 }
                 notices.extend(told);
+                Ok(false)
+            }
+            RTM_NEWADDR | RTM_DELADDR if family == AF_MCTP => {
+                let eid = change_mctp_address(&self.network, header, payload)?;
+                let echo = header.flags & NLM_F_ECHO != 0;
+                // `mctp_addr_notify`, which `rtnl_notify` sends as an IPv4
+                // address's.
+                let notice = Notice {
+                    group: RTNLGRP_MCTP_IFADDR,
+                    origin: if echo { port } else { 0 },
+                    bytes: mctp_address(eid, header.kind, 0, header.seq, port),
+                };
+                if echo && port != 0 {
+                    self.deliver(s, 0, 0, notice.bytes.clone());
+                }
+                notices.push(notice);
                 Ok(false)
             }
             RTM_NEWROUTE | RTM_DELROUTE if matches!(family, AF_INET | AF_INET6) => {
@@ -1508,7 +1527,12 @@ fn address_dump(
     if family != AF_INET {
         messages.extend(ipv6_message(network, seq, port));
     }
-    Ok(with_flags(messages, flags))
+    let mut messages = with_flags(messages, flags);
+    // `rtnl_dump_all` goes on to MCTP's, which marks nothing.
+    if !matches!(family, AF_INET | AF_INET6) {
+        messages.extend(mctp_addresses(network, payload, seq, port));
+    }
+    Ok(messages)
 }
 /// Strictly, an MCTP address dump (`mctp_dump_addrinfo`) needs a whole
 /// `ifaddrmsg` (`EINVAL`), and nothing else: its index only narrows it,
@@ -1519,6 +1543,102 @@ fn mctp_address_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
         return Err(Errno::EINVAL);
     }
     Ok(())
+}
+/// `lo`'s MCTP addresses, as `mctp_dump_addrinfo` dumps them: all, unless
+/// a whole `ifaddrmsg` names another device's index.
+fn mctp_addresses(network: &Network, payload: &[u8], seq: u32, port: u32) -> Vec<Vec<u8>> {
+    let index = payload
+        .get(4..8)
+        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap_or_default()));
+    if index > 1 {
+        return Vec::new();
+    }
+    let eids = network.addresses().mctp.clone();
+    eids.into_iter()
+        .map(|eid| mctp_address(eid, RTM_NEWADDR, NLM_F_MULTI, seq, port))
+        .collect()
+}
+/// An MCTP address of `lo`, as `mctp_fill_addrinfo` gives it: an
+/// `ifaddrmsg` of `AF_MCTP` with nothing but the index, then the endpoint
+/// ID as `IFA_LOCAL` and as `IFA_ADDRESS`.
+fn mctp_address(eid: u8, kind: u16, flags: u16, seq: u32, port: u32) -> Vec<u8> {
+    let mut body = vec![AF_MCTP, 0, 0, 0];
+    body.extend_from_slice(&1u32.to_le_bytes());
+    attribute(&mut body, IFA_LOCAL, &[eid]);
+    attribute(&mut body, IFA_ADDRESS, &[eid]);
+    message(kind, flags, seq, port, &body)
+}
+/// The MCTP routes, as `mctp_dump_rtinfo` dumps them: the local route of
+/// each of `lo`'s addresses (`mctp_route_add_local`), the newest first, as
+/// `mctp_route_add` puts each at the head of the list. As
+/// `mctp_fill_rtinfo`: a range of no more endpoints (`rtm_dst_len` counts
+/// them), the default table, `RTPROT_STATIC`, link scope and
+/// `RTN_LOCAL`; its first endpoint as `RTA_DST`, metrics with no MTU (not
+/// marked nested) and `lo` as `RTA_OIF`.
+fn mctp_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
+    const RTPROT_STATIC: u8 = 4;
+    const RT_SCOPE_LINK: u8 = 253;
+    const RTN_LOCAL: u8 = 2;
+    let eids = network.addresses().mctp.clone();
+    eids.into_iter()
+        .rev()
+        .map(|eid| {
+            let mut body = vec![AF_MCTP, 0, 0, 0, table_byte(RT_TABLE_DEFAULT)];
+            body.extend_from_slice(&[RTPROT_STATIC, RT_SCOPE_LINK, RTN_LOCAL]);
+            body.extend_from_slice(&0u32.to_le_bytes());
+            attribute(&mut body, RTA_DST, &[eid]);
+            attribute(&mut body, RTA_METRICS, &[]);
+            attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+            message(RTM_NEWROUTE, NLM_F_MULTI, seq, port, &body)
+        })
+        .collect()
+}
+/// Adds (`RTM_NEWADDR`) or removes (`RTM_DELADDR`) an MCTP address of `lo`,
+/// as `mctp_rtm_newaddr` and `mctp_rtm_deladdr` do, and gives its endpoint
+/// ID. The request is parsed as `nlmsg_parse` does with `ifa_mctp_policy`:
+/// `EINVAL` for a short `ifaddrmsg`, a type of 0 or past `IFA_MAX`, bytes
+/// left over, an attribute but `IFA_LOCAL` and `IFA_ADDRESS`, and one of
+/// those of other than one byte. The ID is the last `IFA_LOCAL`, or else
+/// the last `IFA_ADDRESS` (`EINVAL` for neither); the index is `lo`'s
+/// (`ENODEV` for another). Adding, a broadcast or reserved ID (0 to 7 and
+/// 255) is `EINVAL` and one `lo` has `EEXIST`; removing, one it has not is
+/// `ENOENT`. Its local route comes and goes with it.
+fn change_mctp_address(network: &Network, header: &Header, payload: &[u8]) -> Result<u8, Errno> {
+    if payload.len() < 8 {
+        return Err(Errno::EINVAL);
+    }
+    let attributes = strict_attributes(&payload[8..], IFA_MAX)?;
+    if attributes
+        .iter()
+        .any(|&(kind, value)| !matches!(kind, IFA_LOCAL | IFA_ADDRESS) || value.len() != 1)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let table = by_type(&attributes);
+    let eid = table
+        .get(&IFA_LOCAL)
+        .or_else(|| table.get(&IFA_ADDRESS))
+        .map(|value| value[0])
+        .ok_or(Errno::EINVAL)?;
+    if u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default()) != 1 {
+        return Err(ENODEV);
+    }
+    let mut addresses = network.addresses();
+    let at = addresses.mctp.iter().position(|&e| e == eid);
+    if header.kind == RTM_NEWADDR {
+        // `mctp_address_unicast`.
+        if !(8..255).contains(&eid) {
+            return Err(Errno::EINVAL);
+        }
+        if at.is_some() {
+            return Err(EEXIST);
+        }
+        addresses.mctp.push(eid);
+    } else {
+        let at = at.ok_or(Errno::ENOENT)?;
+        addresses.mctp.remove(at);
+    }
+    Ok(eid)
 }
 /// What a route dump shows, as `struct fib_dump_filter`.
 #[derive(Default)]
@@ -1663,6 +1783,11 @@ fn route_dump(
                     .map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, flags)),
             );
         }
+    }
+    drop(addresses);
+    // `rtnl_dump_all` goes on to MCTP's, which takes no filter.
+    if !matches!(family, AF_INET | AF_INET6) {
+        messages.extend(mctp_routes(network, seq, port));
     }
     Ok(messages)
 }
@@ -2668,9 +2793,14 @@ fn first_group(groups: u32) -> u32 {
         groups.trailing_zeros() + 1
     }
 }
-/// The mask of group number `group` (`netlink_group_mask`).
+/// The mask of group number `group` (`netlink_group_mask`): none for 0, or
+/// for a group past the 32 a `sockaddr_nl` has bits for.
 fn group_mask(group: u32) -> u32 {
-    if group == 0 { 0 } else { 1 << (group - 1) }
+    if group == 0 || group > 32 {
+        0
+    } else {
+        1 << (group - 1)
+    }
 }
 
 /// The system calls of a netlink socket, `file` of descriptor `a[0]`.
@@ -3436,6 +3566,114 @@ mod tests {
             let found = address_dump(&network, bad, 0, 1, 7, true, &mut 0);
             assert_eq!(found, Err(Errno::EINVAL));
         }
+    }
+
+    #[test]
+    fn group_masks_have_bits_for_the_first_32_groups_alone() {
+        assert_eq!(group_mask(0), 0);
+        assert_eq!(group_mask(1), 1);
+        assert_eq!(group_mask(32), 1 << 31);
+        assert_eq!(group_mask(RTNLGRP_MCTP_IFADDR), 0);
+    }
+
+    #[test]
+    fn mctp_addresses_come_and_go_with_their_local_routes() {
+        let network = Network::isolated(crate::users::first());
+        let request = |kind: u16, index: u32, attributes: &[(u16, &[u8])]| {
+            let mut payload = vec![AF_MCTP, 0, 0, 0];
+            payload.extend_from_slice(&index.to_le_bytes());
+            for &(kind, value) in attributes {
+                attribute(&mut payload, kind, value);
+            }
+            let header = Header {
+                len: 0,
+                kind,
+                flags: 0,
+                seq: 3,
+            };
+            change_mctp_address(&network, &header, &payload)
+        };
+        assert_eq!(request(RTM_NEWADDR, 1, &[(IFA_LOCAL, &[8])]), Ok(8));
+        assert_eq!(request(RTM_NEWADDR, 1, &[(IFA_LOCAL, &[8])]), Err(EEXIST));
+        // IFA_LOCAL before IFA_ADDRESS, whatever their order.
+        let both = [(IFA_LOCAL, &[9][..]), (IFA_ADDRESS, &[10][..])];
+        assert_eq!(request(RTM_NEWADDR, 1, &both), Ok(9));
+        assert_eq!(request(RTM_NEWADDR, 1, &[(IFA_ADDRESS, &[10])]), Ok(10));
+        for (index, attributes, error) in [
+            (1, &[(IFA_LOCAL, &[7][..])][..], Errno::EINVAL),
+            (1, &[(IFA_LOCAL, &[255])], Errno::EINVAL),
+            (1, &[], Errno::EINVAL),
+            (1, &[(IFA_LOCAL, &[11, 0])], Errno::EINVAL),
+            (1, &[(IFA_LOCAL, &[])], Errno::EINVAL),
+            (
+                1,
+                &[(IFA_LOCAL, &[11]), (IFA_LABEL, b"lo\0")],
+                Errno::EINVAL,
+            ),
+            (1, &[(IFA_MAX + 1, &[11])], Errno::EINVAL),
+            (2, &[(IFA_LOCAL, &[11])], ENODEV),
+            (0, &[(IFA_LOCAL, &[11])], ENODEV),
+        ] {
+            assert_eq!(request(RTM_NEWADDR, index, attributes), Err(error));
+        }
+        let header = Header {
+            len: 0,
+            kind: RTM_NEWADDR,
+            flags: 0,
+            seq: 3,
+        };
+        assert_eq!(
+            change_mctp_address(&network, &header, &[AF_MCTP, 0, 0, 0]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(network.addresses().mctp, [8, 9, 10]);
+        // The addresses, the oldest first, and the routes, the newest first.
+        let dumped = mctp_addresses(&network, &[AF_MCTP], 4, 7);
+        assert_eq!(dumped.len(), 3);
+        assert_eq!(dumped[0], mctp_address(8, RTM_NEWADDR, NLM_F_MULTI, 4, 7));
+        assert_eq!(&dumped[0][16..24], &[AF_MCTP, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(
+            attributes(&dumped[0][24..]),
+            [(IFA_LOCAL, &[8][..]), (IFA_ADDRESS, &[8][..])]
+        );
+        let mut other = vec![AF_MCTP, 0, 0, 0];
+        other.extend_from_slice(&2u32.to_le_bytes());
+        assert!(mctp_addresses(&network, &other, 4, 7).is_empty());
+        let local = mctp_routes(&network, 4, 7);
+        assert_eq!(local.len(), 3);
+        assert_eq!(
+            &local[0][16..28],
+            &[AF_MCTP, 0, 0, 0, 253, 4, 253, 2, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            attributes(&local[0][28..]),
+            [
+                (RTA_DST, &[10][..]),
+                (RTA_METRICS, &[][..]),
+                (RTA_OIF, &1u32.to_le_bytes()[..])
+            ]
+        );
+        // rtnl_dump_all's dumps end with MCTP's; a family's own do not.
+        network.set_up(true);
+        let all = address_dump(&network, &[0], 0, 4, 7, false, &mut 0).unwrap();
+        assert_eq!(all[all.len() - 3..], dumped[..]);
+        let four = address_dump(&network, &[AF_INET], AF_INET, 4, 7, false, &mut 0).unwrap();
+        assert!(!four.iter().any(|m| m[16] == AF_MCTP));
+        let all = routes(&network, 0, 4);
+        assert_eq!(all.iter().filter(|m| m[16] == AF_MCTP).count(), 3);
+        assert!(
+            !routes(&network, AF_INET6, 4)
+                .iter()
+                .any(|m| m[16] == AF_MCTP)
+        );
+        // Removing: ENOENT for one lo has not.
+        assert_eq!(request(RTM_DELADDR, 1, &[(IFA_ADDRESS, &[9])]), Ok(9));
+        assert_eq!(
+            request(RTM_DELADDR, 1, &[(IFA_LOCAL, &[9])]),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(request(RTM_DELADDR, 2, &[(IFA_LOCAL, &[8])]), Err(ENODEV));
+        assert_eq!(network.addresses().mctp, [8, 10]);
     }
 
     #[test]

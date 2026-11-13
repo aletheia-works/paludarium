@@ -1331,6 +1331,9 @@ static void nl_address_attribute(unsigned short type, const unsigned char *v, in
         unsigned lifetimes[2];
         memcpy(lifetimes, v, 8);
         printf("=%#x,%#x", lifetimes[0], lifetimes[1]);
+    } else if ((type == 1 || type == 2) && len == 1) {
+        /* An MCTP endpoint ID. */
+        printf("=%u", v[0]);
     }
 }
 /* Receives on `fd` until NLMSG_DONE or an error: prints each message of
@@ -1563,6 +1566,20 @@ static struct nl_body nl_body(unsigned char family, size_t len) {
 static void nl_strict(int fd, unsigned port, unsigned short type, int dump, const struct nl_body *b,
                       const char *label) {
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | (dump ? NL_F_DUMP : 0), b->bytes, b->len), port, label);
+}
+static int nl_quiet(int fd, unsigned short type, unsigned short flags, const void *request, size_t len);
+/* The netlink-strict case: an MCTP address request `type` on `fd` (at
+   `port`) for index `index`, with attribute `attr` (none for 0) of `len`
+   bytes of `eid`; prints its error and what `mon`, a member of
+   RTNLGRP_MCTP_IFADDR, hears of it. */
+static void nl_mctp_change(int fd, unsigned port, int mon, unsigned short type, unsigned index, unsigned short attr,
+                           int eid, int len, const char *label) {
+    struct nl_body b = nl_body(45, 8);
+    memcpy(b.bytes + 4, &index, 4);
+    unsigned char value[2] = {eid, eid};
+    if (attr) nl_put(&b, attr, value, len);
+    printf("%s: error=%d\n", label, nl_quiet(fd, type, 0, b.bytes, b.len));
+    nl_answer(mon, nl_seq, port, label);
 }
 /* The route-dump case: sends request `type` with `flags` and NLM_F_ACK,
    and takes its acknowledgement, giving its error. */
@@ -5966,8 +5983,75 @@ static void pkey_show(const char *label, long r) {
 static volatile sig_atomic_t itimer_fired;
 static void itimer_alarm(int sig) { (void)sig; itimer_fired++; }
 static long itimer_errno(long r) { return r < 0 ? -errno : r; }
+/* madvise's hints and MADV_POPULATE_READ/WRITE, seen through move_pages
+ * (279), which tells an untouched page (-ENOENT) from the zero page
+ * (-EFAULT) and a page of its own (0), and through the bytes. */
+static long advice_errno(long r) { return r < 0 ? -errno : r; }
+static int advice_status(void *at) {
+    int status = 99;
+    void *pages[1] = {at};
+    if (syscall(279, 0L, 1L, pages, NULL, &status, 0L)) return -999;
+    return status;
+}
+static int madvise_advice_case(void) {
+    long page = 4096;
+    char *p = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *gap = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *none = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *ro = mmap(NULL, page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *shared = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED || gap == MAP_FAILED || none == MAP_FAILED || ro == MAP_FAILED ||
+        shared == MAP_FAILED)
+        return 80;
+    munmap(gap + page, page);
+    /* Hints: whatever is mapped takes them, a hole is ENOMEM. */
+    p[3 * page] = 7;
+    const int hints[] = {MADV_COLD, MADV_PAGEOUT, MADV_MERGEABLE, MADV_UNMERGEABLE, MADV_HUGEPAGE,
+                         MADV_NOHUGEPAGE};
+    const char *names[] = {"cold", "pageout", "mergeable", "unmergeable", "hugepage", "nohugepage"};
+    for (int i = 0; i < 6; i++) {
+        long all = advice_errno(madvise(p, 4 * page, hints[i]));
+        long hole = advice_errno(madvise(gap, 3 * page, hints[i]));
+        long read_only = advice_errno(madvise(ro, page, hints[i]));
+        printf("%s=%ld hole=%ld read-only=%ld\n", names[i], all, hole, read_only);
+    }
+    printf("kept=%d\n", p[3 * page]);
+    /* MADV_POPULATE_READ maps the zero page; MADV_POPULATE_WRITE a page of
+     * its own, keeping its bytes. */
+    long r = advice_errno(madvise(p, page, 22));
+    printf("populate-read=%ld status=%d next=%d\n", r, advice_status(p), advice_status(p + page));
+    p[2 * page] = 5;
+    r = advice_errno(madvise(p + page, 2 * page, 23));
+    printf("populate-write=%ld status=%d bytes=%d %d\n", r, advice_status(p + page), p[page],
+           p[2 * page]);
+    r = advice_errno(madvise(shared, page, 22));
+    printf("populate-shared=%ld status=%d\n", r, advice_status(shared));
+    r = advice_errno(madvise(gap, 3 * page, 22));
+    printf("populate-hole=%ld first=%d last=%d\n", r, advice_status(gap),
+           advice_status(gap + 2 * page));
+    long no_access = advice_errno(madvise(none, page, 22));
+    long ro_write = advice_errno(madvise(ro, page, 23));
+    long ro_read = advice_errno(madvise(ro, page, 22));
+    printf("populate-no-access=%ld read-only-write=%ld read-only-read=%ld\n", no_access, ro_write,
+           ro_read);
+    /* Past the end of its file a mapping cannot be brought in. */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-advice-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || ftruncate(fd, page)) return 81;
+    char *f = mmap(NULL, 2 * page, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (f == MAP_FAILED) return 82;
+    r = advice_errno(madvise(f, 2 * page, 22));
+    printf("populate-past-end=%ld first=%d\n", r, advice_status(f));
+    /* MADV_DONTNEED_LOCKED discards as MADV_DONTNEED does. */
+    r = advice_errno(madvise(p + 2 * page, page, 24));
+    int status = advice_status(p + 2 * page);
+    printf("dontneed-locked=%ld status=%d bytes=%d\n", r, status, p[2 * page]);
+    return 0;
+}
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
- * timers are only read, never armed, so they show none set. */
+ * timers are only read here, before any is armed (cpu_itimer_case arms them). */
 static int itimer_case(void) {
     struct itimerval v, old;
     errno = 0;
@@ -6048,6 +6132,162 @@ static int itimer_case(void) {
     while (!itimer_fired) sigsuspend(&empty);
     printf("alarm fired=%d left=%ld\n", (int)itimer_fired, syscall(SYS_alarm, 0L));
     sigprocmask(SIG_UNBLOCK, &block, NULL);
+    return 0;
+}
+/* The interval timers of CPU time, ITIMER_VIRTUAL and ITIMER_PROF. What is
+ * printed holds whatever the speed: times left are only bounded, and the
+ * CPU time is the process's, which the spinning below uses. */
+static volatile sig_atomic_t cit_fired, cit_code, cit_pid, cit_signo;
+static long cit_cpu(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return t.tv_sec * 1000000000L + t.tv_nsec;
+}
+static void cit_handler(int sig, siginfo_t *info, void *context) {
+    (void)context;
+    cit_signo = sig;
+    cit_code = info->si_code;
+    cit_pid = info->si_pid;
+    cit_fired++;
+}
+/* Runs on the CPU until `want` signals came or `limit` ns of CPU time went. */
+static void cit_spin(int want, long limit) {
+    long end = cit_cpu() + limit;
+    while (cit_fired < want && cit_cpu() < end)
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+}
+static long cit_us(struct timeval t) { return t.tv_sec * 1000000L + t.tv_usec; }
+static void *cit_spinner(void *arg) {
+    (void)arg;
+    long end = cit_cpu() + 5000000000L;
+    while (!cit_fired && cit_cpu() < end)
+        for (volatile int i = 0; i < 20000; i++) {
+        }
+    return NULL;
+}
+static int cpu_itimer_case(const char *self) {
+    struct itimerval v, old;
+    /* A value of 0 leaves it disarmed but keeps the interval. */
+    v = (struct itimerval){{5, 7}, {0, 0}};
+    printf("prof interval-only=%ld\n", itimer_errno(syscall(SYS_setitimer, 2L, &v, NULL)));
+    memset(&v, 0x55, sizeof v);
+    syscall(SYS_getitimer, 2L, &v);
+    printf("prof shows interval=%ld.%06ld value=%ld.%06ld\n", (long)v.it_interval.tv_sec,
+           (long)v.it_interval.tv_usec, (long)v.it_value.tv_sec, (long)v.it_value.tv_usec);
+    syscall(SYS_setitimer, 2L, NULL, &old);
+    printf("prof old interval=%ld.%06ld value=%ld\n", (long)old.it_interval.tv_sec,
+           (long)old.it_interval.tv_usec, cit_us(old.it_value));
+    /* Armed, it counts down with CPU time, from a tick more than it was
+       given, and leaves the other timer alone. */
+    v = (struct itimerval){{0, 0}, {2, 0}};
+    syscall(SYS_setitimer, 1L, &v, NULL);
+    syscall(SYS_getitimer, 1L, &v);
+    long left = cit_us(v.it_value);
+    syscall(SYS_getitimer, 2L, &old);
+    printf("virtual left-in-range=%d prof-value=%ld\n", left > 1500000 && left <= 2001000,
+           cit_us(old.it_value));
+    syscall(SYS_setitimer, 1L, NULL, &old);
+    left = cit_us(old.it_value);
+    printf("virtual old-in-range=%d\n", left > 1500000 && left <= 2001000);
+    /* A value clamped to KTIME_MAX, a tick later, shows negative seconds. */
+    v = (struct itimerval){{0, 0}, {LONG_MAX, 0}};
+    printf("virtual huge=%ld\n", itimer_errno(syscall(SYS_setitimer, 1L, &v, NULL)));
+    syscall(SYS_getitimer, 1L, &v);
+    printf("virtual huge negative=%d usec-in-range=%d\n", v.it_value.tv_sec < 0,
+           v.it_value.tv_usec >= 0 && v.it_value.tv_usec < 1000000);
+    syscall(SYS_setitimer, 1L, NULL, NULL);
+    /* SIGPROF, from the kernel, every interval while the CPU runs. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = cit_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGPROF, &sa, NULL);
+    sigaction(SIGVTALRM, &sa, NULL);
+    v = (struct itimerval){{0, 10000}, {0, 10000}};
+    syscall(SYS_setitimer, 2L, &v, NULL);
+    cit_spin(3, 20000000000L);
+    syscall(SYS_setitimer, 2L, NULL, NULL);
+    /* How much CPU time has passed by then is not compared: Linux's tick
+       samples the process's time apart from what clock_gettime reads, and
+       can fire before that reaches the expiry. */
+    printf("prof fired=%d signo=%d code=%d pid=%d\n", cit_fired >= 3, (int)cit_signo,
+           (int)cit_code, (int)cit_pid);
+    /* ITIMER_VIRTUAL with no interval: SIGVTALRM once. */
+    cit_fired = 0;
+    v = (struct itimerval){{0, 0}, {0, 20000}};
+    syscall(SYS_setitimer, 1L, &v, NULL);
+    cit_spin(1, 20000000000L);
+    cit_spin(2, 100000000L);
+    syscall(SYS_getitimer, 1L, &v);
+    printf("virtual fired=%d signo=%d now=%ld %ld\n", (int)cit_fired, (int)cit_signo,
+           cit_us(v.it_interval), cit_us(v.it_value));
+    /* Another thread's CPU time counts, and the signal reaches a thread
+       that waits for it. */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGPROF);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    cit_fired = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, cit_spinner, NULL)) return 1;
+    v = (struct itimerval){{0, 0}, {0, 10000}};
+    syscall(SYS_setitimer, 2L, &v, NULL);
+    siginfo_t info;
+    /* No timeout: the harness's virtual clock would end it at once. */
+    int got = sigwaitinfo(&set, &info);
+    cit_fired = 1;
+    pthread_join(thread, NULL);
+    printf("thread waited=%d code=%d\n", got, info.si_code);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+    /* A child of fork starts with none; the parent's stays. */
+    v = (struct itimerval){{1, 0}, {100, 0}};
+    syscall(SYS_setitimer, 1L, &v, NULL);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        syscall(SYS_getitimer, 1L, &v);
+        printf("child interval=%ld value=%ld\n", cit_us(v.it_interval), cit_us(v.it_value));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    syscall(SYS_setitimer, 1L, NULL, &old);
+    printf("parent kept interval=%ld armed=%d\n", cit_us(old.it_interval),
+           old.it_value.tv_sec >= 90);
+    /* execve keeps them. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        v = (struct itimerval){{1, 0}, {100, 0}};
+        syscall(SYS_setitimer, 1L, &v, NULL);
+        char *args[] = {"x", "cpu-itimer-exec", (char *)self, NULL};
+        execv(self, args);
+        _exit(98);
+    }
+    waitpid(child, &status, 0);
+    printf("exec child exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    /* Ignored, it changes nothing; by default, it ends the process. */
+    signal(SIGPROF, SIG_IGN);
+    cit_fired = 0;
+    v = (struct itimerval){{0, 10000}, {0, 10000}};
+    syscall(SYS_setitimer, 2L, &v, NULL);
+    cit_spin(1, 60000000L);
+    syscall(SYS_setitimer, 2L, NULL, NULL);
+    printf("ignored fired=%d\n", (int)cit_fired);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        signal(SIGPROF, SIG_DFL);
+        alarm(60);
+        syscall(SYS_setitimer, 2L, &v, NULL);
+        for (;;) {
+        }
+    }
+    waitpid(child, &status, 0);
+    printf("default signaled=%d sig=%d\n", WIFSIGNALED(status),
+           WIFSIGNALED(status) ? WTERMSIG(status) : -1);
     return 0;
 }
 static long vf_errno(long r) { return r < 0 ? -errno : r; }
@@ -10922,6 +11162,48 @@ int main(int argc, char **argv) {
                 if (lookups[i].attribute) nl_put32(&b, lookups[i].attribute, lookups[i].value);
                 nl_strict(fd, port, 26, 0, &b, lookups[i].label);
             }
+            /* MCTP addresses of lo (mctp_rtm_newaddr, mctp_rtm_deladdr),
+               which a member of RTNLGRP_MCTP_IFADDR (34) hears of: endpoint
+               IDs 8 to 254, each once, as one byte of IFA_LOCAL or else of
+               IFA_ADDRESS, the request parsed strictly whatever the socket.
+               Each has a local route, which AF_MCTP's route dump shows, and
+               the dumps of every family end with them. */
+            int mctp_mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            bind(mctp_mon, (void *)&any, sizeof any);
+            int mctp_group = 34;
+            printf("mctp join=%d\n", setsockopt(mctp_mon, 270, 1, &mctp_group, sizeof mctp_group) < 0 ? -errno : 0);
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 8, 1, "mctp add 8");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 8, 1, "mctp add 8 again");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 1, 9, 1, "mctp add address 9");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 10, 1, "mctp add 10");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 7, 1, "mctp add reserved");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 255, 1, "mctp add broadcast");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 11, 2, "mctp add two bytes");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 2, 11, 0, "mctp add no bytes");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 3, 11, 1, "mctp add label");
+            nl_mctp_change(fd, port, mctp_mon, 20, 1, 0, 11, 1, "mctp add none");
+            nl_mctp_change(fd, port, mctp_mon, 20, 2, 2, 11, 1, "mctp add other index");
+            nl_mctp_change(fd, port, mctp_mon, 20, 0, 2, 11, 1, "mctp add index 0");
+            b = nl_body(45, 4);
+            printf("mctp add short: error=%d\n", nl_quiet(fd, 20, 0, b.bytes, b.len));
+            b = nl_body(45, 8);
+            nl_strict(fd, port, 22, 1, &b, "addr mctp added");
+            b = nl_body(45, 12);
+            nl_strict(fd, port, 26, 1, &b, "route mctp added");
+            b = nl_body(0, 8);
+            nl_strict(fd, port, 22, 1, &b, "addr all added");
+            b = nl_body(0, 12);
+            nl_strict(fd, port, 26, 1, &b, "route all added");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 1, 8, 1, "mctp del 8");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 8, 1, "mctp del 8 again");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 7, 1, "mctp del reserved");
+            nl_mctp_change(fd, port, mctp_mon, 21, 2, 2, 9, 1, "mctp del other index");
+            nl_mctp_change(fd, port, mctp_mon, 21, 1, 2, 10, 1, "mctp del 10");
+            b = nl_body(45, 8);
+            nl_strict(fd, port, 22, 1, &b, "addr mctp deleted");
+            b = nl_body(45, 12);
+            nl_strict(fd, port, 26, 1, &b, "route mctp deleted");
+            close(mctp_mon);
             /* Unchecked: an old rtgenmsg with IFLA_EXT_MASK after its 4
                bytes, IFLA_MASTER and IFLA_TARGET_NETNSID, and RTM_F_PREFIX. */
             int loose = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
@@ -10949,6 +11231,7 @@ int main(int argc, char **argv) {
             nl_strict(loose, name.pid, 18, 1, &b, "loose ipmr rtgenmsg");
             b = nl_body(45, 1);
             nl_strict(loose, name.pid, 22, 1, &b, "loose addr mctp rtgenmsg");
+            nl_strict(loose, name.pid, 26, 1, &b, "loose route mctp rtgenmsg");
             link = (struct nl_link){.family = 128, .index = 1};
             b = nl_body(128, 16);
             memcpy(b.bytes, &link, 16);
@@ -17631,6 +17914,21 @@ int main(int argc, char **argv) {
         result("pidfd-sender", info.si_pid == pid);
         result("pidfd-code", info.si_code);
         waitpid(pid, NULL, 0);
+        /* PIDFD_SELF_THREAD (-10000) names the thread, which takes the
+           signal as from tkill (SI_TKILL); PIDFD_SELF_THREAD_GROUP (-10001)
+           the process, as kill sends (SI_USER). Other negative numbers are
+           no descriptor. */
+        result("self-thread", syscall(SYS_pidfd_send_signal, -10000L, SIGUSR1, NULL, 0));
+        if (sigwaitinfo(&usr, &info) != SIGUSR1) return 120;
+        result("self-thread-sender", info.si_pid == getpid());
+        result("self-thread-code", info.si_code);
+        result("self-process", syscall(SYS_pidfd_send_signal, -10001L, SIGUSR2, NULL, 0));
+        if (sigwaitinfo(&usr2, &info) != SIGUSR2) return 121;
+        result("self-process-sender", info.si_pid == getpid());
+        result("self-process-code", info.si_code);
+        errno = 0;
+        result("other-negative", syscall(SYS_pidfd_send_signal, -20000L, SIGUSR1, NULL, 0) == -1 &&
+                                     errno == EBADF);
         int ready[2], seen[2];
         if (pipe(ready) || pipe(seen)) return 84;
         pid_t parent = child();
@@ -20009,6 +20307,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mseal")) return mseal_case();
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
     if (!strcmp(mode, "memfd-secret")) return memfd_secret_case();
+    if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();
@@ -20017,6 +20316,14 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
+    if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
+    if (!strcmp(mode, "cpu-itimer-exec")) {
+        struct itimerval v;
+        syscall(SYS_getitimer, 1L, &v);
+        printf("after exec interval=%ld armed=%d\n", cit_us(v.it_interval),
+               v.it_value.tv_sec >= 90);
+        return 0;
+    }
     if (!strcmp(mode, "mprotect-checks")) return mprotect_checks_case();
     if (!strcmp(mode, "io-uring")) return io_uring_case();
     if (!strcmp(mode, "etxtbsy-run")) {

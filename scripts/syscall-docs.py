@@ -277,6 +277,7 @@ NAMES = {
     297: "rt_tgsigqueueinfo",
     299: "recvmmsg",
     302: "prlimit64",
+    303: "name_to_handle_at",
     306: "syncfs",
     307: "sendmmsg",
     308: "setns",

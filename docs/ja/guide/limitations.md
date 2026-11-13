@@ -178,6 +178,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ファイルシステムによらず ext4 と同じく `RWF_NOWAIT` と `RWF_DONTCACHE` を受け付けます。
     Linux のホストで見分けるのは ext4、xfs、btrfs、f2fs だけです（ほかのファイルシステムは
     どちらも断ります）。
+  - `madvise` は、Linux が受け付ける次の指定を断ります（`EINVAL`）。`fork` やコアダンプを
+    変える指定（`MADV_DONTFORK`、`MADV_DOFORK`、`MADV_WIPEONFORK`、`MADV_KEEPONFORK`、
+    `MADV_DONTDUMP`、`MADV_DODUMP`）、`MADV_REMOVE`、`MADV_COLLAPSE`、ガード領域
+    （`MADV_GUARD_INSTALL`、`MADV_GUARD_REMOVE`）、`MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。
+    `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は、`memfd_secret` のマッピングのページも
+    割り当てます。Linux では `EINVAL` です。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか
     受け付けず、ほかのプロセスの範囲はマップされているかを確かめるだけです。Linux が知らない
     指定は、Linux master と同じく範囲を見る前に断ります（`EINVAL`）。CI のカーネルは範囲ごとに
@@ -191,14 +197,27 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - `memfd_secret` のファイルのページは `RLIMIT_MEMLOCK` に数えません。Linux では、それを
     超えるページフォールトは `SIGBUS` です。また、そのマッピングの `MS_SYNC` の `msync` は
     成功します。Linux では、ファイルに `fsync` がないので `EINVAL` です。
-  - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は設定できません。
-    Linux はこれを設定して `SIGVTALRM` と `SIGPROF` を送りますが、`setitimer` は `EINVAL` を
-    返し、`getitimer` は設定されていないものとして見せます。
+  - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は、どちらも
+    プロセスの CPU 時間のすべてを数えます。ここではそのすべてがユーザーの時間だからです
+    （Linux の `ITIMER_VIRTUAL` はシステムの時間を数えません）。WebAssembly のように
+    ホストがスレッドの CPU 時間を測れないところでは、それは経過時間なので、スレッドが
+    眠ったり待ったりしている時間も数えます。タイマーを確かめるのは、
+    Linux のようにティックごとではなく、スレッドがシステムコールをするときと、命令を
+    100,000 個実行するごとです。ティックは CI ランナーの `CONFIG_HZ` に合わせて 1 ms と
+    します。CPU 時間の時計（`CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID`、ほかの
+    プロセスやスレッドの時計）での `timer_create` は `EINVAL` を返します。Linux はタイマーを
+    作ります。また、`RLIMIT_CPU` は `SIGXCPU` を送りません。
   - `ustat` が見つけるのはマウントのデバイスだけです。パイプ・ソケット・memfd・名前空間の
     ファイルの `st_dev` では `EINVAL` を返します。Linux はその疑似ファイルシステムの
     スーパーブロックを見つけ、その数（0）を返します。`/proc` と `/dev` のファイルの
     `st_dev` は、そのパスがあるマウントのものなので、`ustat` はそのマウントの数を返します。
     Linux は procfs や devtmpfs の数を返します。
+  - ファイルハンドル（`name_to_handle_at` と、`/proc/self/fdinfo` にある inotify の
+    ウォッチのもの）の世代は 0 です。tmpfs は inode ごとに乱数で選びます。ホストの
+    ディレクトリのファイルは NFS のエクスポートがないファイルシステムのものとして扱います
+    （`EOPNOTSUPP`、`AT_HANDLE_FID` では型 `FILEID_INO64_GEN` の識別子）。Linux はその
+    ファイルシステム（たとえば ext4）のハンドルを返します。`open_by_handle_at` はありません
+    （`ENOSYS`）。
   - System V IPC には `/proc/sysvipc` がなく、共有メモリ・セマフォー・メッセージキューの
     上限は Linux の既定値で、`/proc/sys/kernel` から変えられません。メッセージキューで
     待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの
@@ -235,7 +254,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - メモリのロックは状態を残しません。そのためロックには `RLIMIT_MEMLOCK` を適用
     しません（適用するのは `SHM_LOCK` だけで、`CAP_IPC_LOCK` を手放したゲストにだけ
     関係します）。ロックしたメモリへの
-    `MADV_DONTNEED` は、Linux の `EINVAL` と違って成功します。ファイルの終わりより後ろの
+    `MADV_DONTNEED`、`MADV_COLD`、`MADV_PAGEOUT` は、Linux の `EINVAL` と違って成功します。ファイルの終わりより後ろの
     ファイルのマッピングのページへの `mlock` は、Linux の `ENOMEM` と違って成功します。
     `/proc` にもロックしたメモリは出ません。
   - 共有のマッピングに `mbind` で付けたメモリのポリシーは、そのマッピングのものに
@@ -324,9 +343,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **inotify の一部**：インスタンスの `/proc/self/fdinfo` の行は `ignored_mask:0` で
-  終わります。Linux はファイルハンドルを作れるファイルシステムではその後にハンドルを
-  加えます。何もアンマウントしない（`umount2` がない）ので、`IN_UNMOUNT` は送りません。
+- **inotify の一部**：何もアンマウントしない（`umount2` がない）ので、`IN_UNMOUNT` は
+  送りません。
   `/proc/self/fdinfo` では、epoll のファイルはディスクリプタの順に並びます。Linux はファイルのアドレスの
   順です。eventfd の番号はエミュレータの中で数えます。Linux の `eventfd-id` はシステム
   全体で数えます。マウントしたディレクトリにホストが加えた変更は見えず、ディスクリプタの
@@ -374,33 +392,38 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   処理が動くまで仮です。`lo` が落ちている間のそのアドレスへの接続とデータグラムは
   `ENETUNREACH` です。Linux では送り出されて捨てられます。`lo` のアドレスでない、
   接頭辞の中の IPv6 のアドレスへのものも `ENETUNREACH` です。Linux では接頭辞の経路が
-  そこへ送って捨てます。`lo` が落ちている間の IPv6 の経路の引き当ても `ENETUNREACH` です。経路のダンプは、厳密なリクエストが指す表や属性で
+  そこへ送って捨てます。`lo` が落ちている間の IPv6 の経路の引き当ても
+  `ENETUNREACH` です。経路のダンプは、厳密なリクエストが指す表や属性で
   絞り込みません。経路の引き当ては宛先のほかの条件（`RTA_SRC`、`RTA_OIF`、`RTA_MARK`
   など）を見ず、その `rta_cacheinfo` は参照を 1 つと数えます。Linux はキャッシュされた
   経路を使うほかのものも数えます。通知はリンクとその IPv6 の情報、アドレス、経路のもの
-  だけで、近隣、netconf などのグループには送らず、ほかの
-  名前空間のソケットにも送りません（`NETLINK_LISTEN_ALL_NSID` はありません）。`lo` を
-  落としたときに消える、`lo` を通る IPv4 の経路は、Linux と同じく何も伝えません。
+  だけで、近隣、netconf などのグループには送らず、ほかの名前空間のソケットにも
+  送りません（`NETLINK_LISTEN_ALL_NSID` はありません）。`lo` を落としたときに消える、
+  `lo` を通る IPv4 の経路は、Linux と同じく何も伝えません。
   `NETLINK_PKTINFO`、`NETLINK_NO_ENOBUFS` など、機能のページに挙げていないオプションは
-  `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、`CONFIG_MCTP` を
-  組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。組み込んでいない
-  カーネルは載せず、`AF_MCTP` のアドレスのダンプを扱う処理もないので、そのダンプには
-  IPv4 と IPv6 のアドレスを返します。MCTP のアドレスは足せません（`AF_MCTP` の
-  `RTM_NEWADDR` は `EOPNOTSUPP`）。
+  `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、
+  `CONFIG_MCTP` を組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。
+  組み込んでいないカーネルは載せず、`AF_MCTP` のアドレスと経路のダンプを扱う処理も
+  ないので、それらのダンプには IPv4 と IPv6 のアドレスと経路を返し、MCTP のアドレスも
+  取りません。MCTP の経路は足すことも消すこともできません（`AF_MCTP` の
+  `RTM_NEWROUTE` と `RTM_DELROUTE` は `EOPNOTSUPP`）。そのため、経路は `lo` の
+  アドレスのローカルの経路だけです。
   IPv4 と IPv6 の設定は、sysctl が組み込みのままのカーネルのものです。Linux の新しい
   名前空間はホストのものを写します。IPv6 の作成時刻は 0、到達可能時間は 30 秒です。
-  Linux では乱数で決まります。アドレスの作成時刻は 0 です。`NETLINK_EXT_ACK` はエラーにもダンプの
-  `NLMSG_DONE` にも属性を足しません。厳密な検査は属性のポリシーを先に調べないので、
-  形の崩れた属性と、検査が断るほかの属性とがあるリクエストには、Linux が `ERANGE` を
-  返すところで `EINVAL` を返すことがあります。リンクのダンプの `IFLA_LINKINFO` は
-  受け取るだけで何もしません。Linux はモジュールが知る種類のデバイスだけを見せます。`rtnetlink` の知る最後より後の型のメッセージには `NLMSG_ERROR` で
-  `EOPNOTSUPP` を返します。Linux 7.0 では送信そのものが `EOPNOTSUPP` になります。
-  受信バッファがいっぱいのソケットへの答えは、待たずに `ENOBUFS` で捨てます。
-  netlink のソケットへの `write` は、ソケットを開いたスレッドのケーパビリティだけで
-  動きます。ほかの名前空間は、paludarium に
-  分けるものがありません（IPC 名前空間の System V の共有メモリ・セマフォー・メッセージキューと
-  POSIX メッセージキューを除きます）。マウント名前空間には `mount` がありません（`/proc/self/mountinfo` のマウント ID は
-  変わりません。Linux では新しい名前空間の写しに新しい ID が付きます）。cgroup 名前空間には
+  Linux では乱数で決まります。アドレスの作成時刻は 0 です。`NETLINK_EXT_ACK` は
+  エラーにもダンプの `NLMSG_DONE` にも属性を足しません。厳密な検査は属性のポリシーを
+  先に調べないので、形の崩れた属性と、検査が断るほかの属性とがあるリクエストには、
+  Linux が `ERANGE` を返すところで `EINVAL` を返すことがあります。リンクのダンプの
+  `IFLA_LINKINFO` は受け取るだけで何もしません。Linux はモジュールが知る種類の
+  デバイスだけを見せます。`rtnetlink` の知る最後より後の型のメッセージには
+  `NLMSG_ERROR` で `EOPNOTSUPP` を返します。Linux 7.0 では送信そのものが
+  `EOPNOTSUPP` になります。受信バッファがいっぱいのソケットへの答えは、待たずに
+  `ENOBUFS` で捨てます。netlink のソケットへの `write` は、ソケットを開いたスレッドの
+  ケーパビリティだけで動きます。ほかの名前空間は、paludarium に分けるものが
+  ありません（IPC 名前空間の System V の共有メモリ・セマフォー・メッセージキューと
+  POSIX メッセージキューを除きます）。マウント名前空間には `mount` がありません
+  （`/proc/self/mountinfo` のマウント ID は変わりません。Linux では新しい名前空間の
+  写しに新しい ID が付きます）。cgroup 名前空間には
   `/proc/self/cgroup` がなく、time 名前空間には `/proc/<pid>/timens_offsets` がなく、
   時計は最初の名前空間のものです。PID 名前空間はそれぞれの番号を 1 度だけ配ります。
   Linux では `pid_max` で一回りして使い回します。同じ理由で、`clone3` の `set_tid` は、

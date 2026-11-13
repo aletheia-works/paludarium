@@ -265,6 +265,11 @@ mod linux {
                 config
             };
             let host = Arc::new(RecordingHost::new());
+            // Its timers wait for CPU time, which the virtual clock does
+            // not pass.
+            if mode == "cpu-itimer" {
+                host.measure_cpu_time();
+            }
             let session = Session::new(config, host.clone()).unwrap();
             let start = Instant::now();
             let status = session.run().unwrap();
@@ -319,6 +324,7 @@ mod linux {
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
         processes_landlock => ("landlock","process"),
+        processes_madvise_advice => ("madvise-advice","process"),
         processes_mempolicy => ("mempolicy","process"),
         processes_memfd_secret => ("memfd-secret","process"),
         processes_ids => ("ids","process"),
@@ -381,6 +387,7 @@ mod linux {
         inotify_read => ("inotify-read","inotify"),
         inotify_fifo_moved => ("inotify-fifo-moved","inotify"),
         inotify_exec_order => ("inotify-exec-order","inotify"),
+        inotify_handles => ("inotify-handles","inotify"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -521,6 +528,7 @@ mod linux {
         processes_ignored_signal_wait => ("ignored-signal-wait","process"),
         processes_mmsg => ("mmsg","process"),
         processes_itimer => ("itimer","process"),
+        processes_cpu_itimer => ("cpu-itimer","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         vfork_exit => ("vfork-exit","process"),

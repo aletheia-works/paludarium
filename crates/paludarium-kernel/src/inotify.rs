@@ -749,6 +749,8 @@ struct Watch {
     /// When it was made, by the instance's count: Linux lists an instance's
     /// marks the newest first (`marks_list`).
     made: u64,
+    /// The file system (`f_type`) of the file, for its handle.
+    file_system: u64,
 }
 struct Event {
     wd: i32,
@@ -973,7 +975,7 @@ impl Instance {
     }
     /// `inotify_update_watch`: the watch on `key` gets `mask` (or it is
     /// added with `IN_MASK_ADD`), or a new watch is made.
-    fn watch(&self, key: Key, mask: u32) -> Result<i32, Errno> {
+    fn watch(&self, key: Key, file_system: u64, mask: u32) -> Result<i32, Errno> {
         let wanted = mask & (ALL_EVENTS | EXCL_UNLINK | ONESHOT);
         let mut queue = self.queue();
         if let Some(&wd) = queue.by_key.get(&key) {
@@ -1001,6 +1003,7 @@ impl Instance {
                 key,
                 mask: wanted,
                 made,
+                file_system,
             },
         );
         queue.by_key.insert(key, wd);
@@ -1019,8 +1022,9 @@ impl Instance {
     /// descriptor has, as Linux's `inotify_fdinfo`: one line each, the
     /// newest first, with the watch descriptor, the file's inode and its
     /// file system's device (as the kernel numbers it) in hexadecimal, and
-    /// the mask the watch was given. No file handle follows, as for a file
-    /// system that cannot make one.
+    /// the mask the watch was given, then the file's handle as
+    /// `show_mark_fhandle` writes it ([`crate::files::file_handle`]): its
+    /// size and type in hexadecimal and its bytes in pairs of hex digits.
     pub(crate) fn fdinfo(&self) -> Vec<u8> {
         let queue = self.queue();
         let mut watches: Vec<_> = queue.watches.iter().collect();
@@ -1031,11 +1035,15 @@ impl Instance {
             // `new_encode_dev` undone, then `MKDEV`.
             let major = (device >> 8) & 0xfff;
             let minor = (device & 0xff) | ((device >> 12) & !0xff);
+            let (kind, handle) = crate::files::file_handle(watch.file_system, inode);
+            let bytes: String = handle.iter().map(|b| format!("{b:02x}")).collect();
             out.extend_from_slice(
                 format!(
-                    "inotify wd:{wd:x} ino:{inode:x} sdev:{:x} mask:{:x} ignored_mask:0 \n",
+                    "inotify wd:{wd:x} ino:{inode:x} sdev:{:x} mask:{:x} ignored_mask:0 \
+                     fhandle-bytes:{:x} fhandle-type:{kind:x} f_handle:{bytes}\n",
                     major << 20 | minor,
-                    watch.mask
+                    watch.mask,
+                    handle.len(),
                 )
                 .as_bytes(),
             );
@@ -1119,8 +1127,11 @@ fn add_watch(c: &mut Context<'_>, fd: u64, path: u64, mask: u32) -> Result<u64, 
         return Err(Errno::EINVAL);
     }
     let instance = of(&file).ok_or(Errno::EINVAL)?;
-    let key = crate::files::watched(c, path, mask & DONT_FOLLOW == 0, mask & ONLYDIR != 0)?;
-    instance.watch(key, mask).map(|wd| wd as u32 as u64)
+    let (key, file_system) =
+        crate::files::watched(c, path, mask & DONT_FOLLOW == 0, mask & ONLYDIR != 0)?;
+    instance
+        .watch(key, file_system, mask)
+        .map(|wd| wd as u32 as u64)
 }
 
 fn rm_watch(c: &mut Context<'_>, fd: u64, wd: i32) -> Result<u64, Errno> {

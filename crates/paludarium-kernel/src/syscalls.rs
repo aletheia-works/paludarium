@@ -398,7 +398,7 @@ pub(crate) fn err(e: Errno) -> Outcome {
 /// can only be read (`EOPNOTSUPP`), as can the thread's CPU clock for a
 /// sleep (`thread`). Unknown clocks are `EINVAL`; [`posix_timer_clock`]
 /// adds the CPU clocks for timers, and [`sys_clock_nanosleep`] the
-/// process's for a sleep.
+/// process's and, by number, other tasks' ([`cpu_sleep`]) for a sleep.
 fn timer_clock(id: u64, thread: Errno) -> Result<ClockId, Errno> {
     match id as u32 as i32 {
         0 | 8 | 11 => Ok(ClockId::Realtime),

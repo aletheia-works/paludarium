@@ -748,8 +748,10 @@ static int case_handles(void) {
 }
 /* inotify-open-handles: what open_by_handle_at opens. A pidfd's handle is
    pidfs's (its inode, which fstat gives) and anyone may open it, from the
-   pidfd or pidfs's root, while its process is not reaped; elsewhere an
-   unprivileged caller gets EPERM once the handle's header is checked. */
+   pidfd or pidfs's root, while its process is not reaped; elsewhere a
+   caller without CAP_DAC_READ_SEARCH gets EPERM once the handle's header
+   is checked. The emulator runs this as root, so those lines say whether
+   the outcome is the one for this process's user (decode_permission). */
 static long by_handle(int mount, struct handle *h, int flags) {
     return e(syscall(SYS_open_by_handle_at, mount, h, flags));
 }
@@ -763,6 +765,9 @@ static void opened(const char *name, long fd, unsigned long ino) {
         close(fd);
     }
     printf("\n");
+}
+static int decode_permission(long r) {
+    return geteuid() == 0 ? r != -EPERM : r == -EPERM;
 }
 static int case_open_handles(void) {
     int gate[2];
@@ -839,7 +844,10 @@ static int case_open_handles(void) {
     int memfd = syscall(SYS_memfd_create, "open-handles", 0);
     struct handle shmem;
     to_handle(memfd, "", &shmem, 128, &id, AT_EMPTY_PATH);
-    printf(" cwd=%ld memfd=%ld", by_handle(AT_FDCWD, &shmem, 0), by_handle(memfd, &shmem, 0));
+    long cwd = by_handle(AT_FDCWD, &shmem, 0), own_mount = by_handle(memfd, &shmem, 0);
+    printf(" cwd=%d memfd=%d", decode_permission(cwd), decode_permission(own_mount));
+    if (cwd >= 0) close(cwd);
+    if (own_mount >= 0) close(own_mount);
     other = shmem;
     other.bytes = 0;
     printf(" cwd-empty=%ld\n", by_handle(AT_FDCWD, &other, 0));
@@ -849,7 +857,9 @@ static int case_open_handles(void) {
     struct handle *edge = (struct handle *)(two + page - 8);
     edge->bytes = 8;
     edge->type = 0xfe;
-    printf("body fault=%ld cwd=%ld\n", by_handle(pidfd, edge, 0), by_handle(AT_FDCWD, edge, 0));
+    long fault = by_handle(AT_FDCWD, edge, 0);
+    printf("body fault=%ld cwd=%d\n", by_handle(pidfd, edge, 0),
+           geteuid() == 0 ? fault == -EFAULT : fault == -EPERM);
     /* A zombie's handle still opens; once it is reaped it is stale. */
     write(gate[1], "x", 1);
     siginfo_t info;

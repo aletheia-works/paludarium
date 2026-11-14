@@ -40,17 +40,21 @@ fn outcome(result: Result<u64, Errno>) -> Outcome {
 }
 
 /// `timerfd_create(clockid, flags)`. CLOCK_BOOTTIME runs as CLOCK_MONOTONIC,
-/// as the guest never suspends; the alarm clocks need CAP_WAKE_ALARM.
+/// as the guest never suspends, and the alarm clocks as CLOCK_REALTIME and
+/// CLOCK_MONOTONIC. Unknown flags or clocks give `EINVAL`, then an alarm
+/// clock without CAP_WAKE_ALARM `EPERM`, in Linux's order.
 fn create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let clock = match a[0] as i32 {
-        0 => ClockId::Realtime,
-        1 | 7 => ClockId::Monotonic,
-        8 | 9 => return Err(Errno::EPERM),
+        0 | 8 => ClockId::Realtime,
+        1 | 7 | 9 => ClockId::Monotonic,
         _ => return Err(Errno::EINVAL),
     };
     let flags = a[1] as i32 as u32;
     if flags & !(NONBLOCK | CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
+    }
+    if matches!(a[0] as i32, 8 | 9) {
+        crate::syscalls::may_use_alarm(c)?;
     }
     let timer = Arc::new(TimerFile {
         host: Arc::clone(c.shared_host),

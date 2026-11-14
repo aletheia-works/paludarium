@@ -274,6 +274,13 @@ fn a_copy_of_fetched_code_keeps_its_mark() {
         }
         fetch(&parent, CODE);
         let child = parent.fork();
+        // A VMA never written has no `anon_vma`: the child gets none of its
+        // page tables, as Linux's `vma_needs_copy`, and fetches the page
+        // again before running it.
+        if !written {
+            assert_eq!(child.page_state(GuestAddr(CODE)), Some(PageState::Absent));
+            fetch(&child, CODE);
+        }
         for space in [&parent, &child] {
             let before = cached(space);
             space.write(GuestAddr(CODE), &[0xc3]).unwrap();

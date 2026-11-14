@@ -223,10 +223,11 @@ verified.
     is sent to it, but from another fatal signal only once one of its
     threads takes it, where Linux marks the process as it sends any signal
     that will end it (`EINVAL` here until then).
-  - In a child of `fork`, `move_pages` shows a page of a shared mapping, or
-    of a private one never written, that the parent had touched as there,
-    where Linux copies no page table of such a VMA (`-ENOENT`
-    until the child touches the page).
+  - In a child of `fork`, `move_pages` shows a page of a program's own
+    ELF segment that the loader wrote and nothing wrote since as there,
+    where Linux copies no page table of a VMA without an `anon_vma`
+    (`-ENOENT` until the child touches the page): the loader's copy is
+    the only one the page has here.
   - An error that ends `recvmmsg` after some messages is dropped, where
     Linux keeps it as the socket's error for the next call and
     `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.

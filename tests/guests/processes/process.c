@@ -6491,6 +6491,69 @@ static int madvise_guard_case(void) {
     sigaction(SIGSEGV, &old, NULL);
     return 0;
 }
+/* A forked child gets the page tables of a VMA only when Linux's
+ * vma_needs_copy copies them: one with an anon_vma (written private
+ * memory) or that had guards. Another's pages it faults in again, so
+ * move_pages finds none there (ENOENT) until it touches them. */
+static void fork_statuses(const char *who, char **pages, int count) {
+    int status[8];
+    for (int i = 0; i < count; i++) status[i] = 99;
+    long r = syscall(279, 0L, (long)count, pages, NULL, status, 0L);
+    printf("%s=%ld", who, r < 0 ? -errno : r);
+    for (int i = 0; i < count; i++) printf(" %d", status[i]);
+    printf("\n");
+}
+static int fork_page_tables_case(void) {
+    long page = 4096;
+    char *written = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* A VMA of its own, apart from the written one. */
+    char *read = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *shared = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    char *guarded = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-fork-tables-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || pwrite(fd, "ff", 2, 0) != 2 || ftruncate(fd, 2 * page)) return 80;
+    char *cached = mmap(NULL, page, PROT_READ, MAP_PRIVATE, fd, 0);
+    char *copied = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    char *file = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (written == MAP_FAILED || read == MAP_FAILED || shared == MAP_FAILED ||
+        guarded == MAP_FAILED || cached == MAP_FAILED || copied == MAP_FAILED || file == MAP_FAILED)
+        return 81;
+    munmap(read, page);
+    munmap(read + 2 * page, page);
+    read += page;
+    written[0] = 1;
+    volatile char sink = read[0];
+    shared[0] = 2;
+    long guard = madvise(guarded + page, page, 102) ? -errno : 0;
+    guarded[0] = 3;
+    sink = cached[0];
+    /* A write gives the VMA its anon_vma: the page it only read is
+     * copied too. */
+    copied[0] = 'w';
+    sink = copied[page];
+    file[1] = 's';
+    (void)sink;
+    char *pages[8] = {written, read, shared, guarded, cached, copied, copied + page, file};
+    printf("guard=%ld\n", guard);
+    fork_statuses("parent", pages, 8);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 82;
+    if (child == 0) {
+        fork_statuses("child", pages, 8);
+        /* What it lost a fault brings back. */
+        printf("child bytes=%d %d %d %c %d %c\n", read[0], shared[0], guarded[0], cached[0],
+               copied[page], file[1]);
+        fork_statuses("child after", pages, 8);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 83;
+    return 0;
+}
 /* getitimer, setitimer's order of checks and alarm, as Linux's. The CPU-time
  * timers are only read here, before any is armed (cpu_itimer_case arms them). */
 static int itimer_case(void) {
@@ -9056,6 +9119,56 @@ static int yama_case(void) {
         _exit(0);
     }
     printf("owner: status=%d\n", reaped(owner));
+    return 0;
+}
+/* The alarm clocks, CLOCK_REALTIME_ALARM and CLOCK_BOOTTIME_ALARM, as
+ * kernel/time/alarmtimer.c and fs/timerfd.c: a sleep, a timer or a timerfd
+ * on one needs CAP_WAKE_ALARM. The CI runners have an RTC that can wake them
+ * (rtc_cmos), so the clocks are there; the case runs in a child that is not
+ * root (natively it never is, and an emulated root becomes nobody), so each
+ * use is refused, and the order of the checks shows. */
+static long al_r(long r) { return r < 0 ? -errno : r; }
+static int alarm_clocks_worker(void) {
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 90;
+    struct timespec t, short_ = {0, 1000}, bad = {-1, 0};
+    for (int c = 8; c <= 9; c++) {
+        struct timespec res = {-1, -1};
+        long got = al_r(syscall(SYS_clock_gettime, c, &t));
+        long resolution = al_r(syscall(SYS_clock_getres, c, &res));
+        printf("clock %d: gettime=%ld getres=%ld res-ns=%ld\n", c, got, resolution,
+               res.tv_sec * 1000000000L + res.tv_nsec);
+    }
+    /* The request is read first, then a flag but TIMER_ABSTIME is refused,
+       then the capability. */
+    printf("nanosleep fault=%ld invalid=%ld flags=%ld abstime=%ld relative=%ld\n",
+           al_r(syscall(SYS_clock_nanosleep, 8, 2, (void *)8, NULL)),
+           al_r(syscall(SYS_clock_nanosleep, 8, 2, &bad, NULL)),
+           al_r(syscall(SYS_clock_nanosleep, 9, 2, &short_, NULL)),
+           al_r(syscall(SYS_clock_nanosleep, 9, 1, &short_, NULL)),
+           al_r(syscall(SYS_clock_nanosleep, 8, 0, &short_, NULL)));
+    /* timer_create writes the ID out before the clock refuses, and the ID
+       is used up; a place it cannot write is EFAULT first. */
+    int id = -1, next = -1;
+    long refused = al_r(syscall(SYS_timer_create, 8, NULL, &id));
+    long fault = al_r(syscall(SYS_timer_create, 9, NULL, (void *)8));
+    long made = al_r(syscall(SYS_timer_create, CLOCK_MONOTONIC, NULL, &next));
+    printf("timer_create refused=%ld id=%d fault=%ld made=%ld next=%d\n", refused, id, fault, made, next);
+    /* timerfd_create: unknown flags first. */
+    printf("timerfd alarm=%ld boottime-alarm=%ld flags=%ld\n", al_r(timerfd_create(8, 0)),
+           al_r(timerfd_create(9, TFD_CLOEXEC)), al_r(timerfd_create(9, 1)));
+    return 0;
+}
+static int alarm_clocks_case(void) {
+    fflush(stdout);
+    pid_t worker = fork();
+    if (worker == 0) {
+        int r = alarm_clocks_worker();
+        fflush(stdout);
+        _exit(r);
+    }
+    printf("worker=%d\n", reaped(worker));
     return 0;
 }
 static int pidfd_getfd_case(void) {
@@ -21471,12 +21584,14 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
+    if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
     if (!strcmp(mode, "yama")) return yama_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();

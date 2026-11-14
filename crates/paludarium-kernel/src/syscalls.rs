@@ -390,20 +390,41 @@ pub(crate) fn err(e: Errno) -> Outcome {
 }
 
 /// The clock a `clock_nanosleep` sleeps on or a `timer_create` timer runs
-/// on, as Linux's `k_clock`s give them: TAI on the real-time clock (its
-/// offset is 0), BOOTTIME on the monotonic one (this host never suspends).
-/// MONOTONIC_RAW and the coarse clocks can only be read (`EOPNOTSUPP`), as
-/// can the thread's CPU clock for a sleep (`thread`). The alarm clocks are
-/// not modelled (`EINVAL`), nor are unknown clocks; [`posix_timer_clock`]
+/// on, as Linux's `k_clock`s give them: TAI and REALTIME_ALARM on the
+/// real-time clock (TAI's offset is 0), BOOTTIME and BOOTTIME_ALARM on the
+/// monotonic one (this host never suspends); an alarm clock also needs
+/// CAP_WAKE_ALARM ([`may_use_alarm`]). MONOTONIC_RAW and the coarse clocks
+/// can only be read (`EOPNOTSUPP`), as can the thread's CPU clock for a
+/// sleep (`thread`). Unknown clocks are `EINVAL`; [`posix_timer_clock`]
 /// adds the CPU clocks for timers, and [`sys_clock_nanosleep`] the
 /// process's for a sleep.
 fn timer_clock(id: u64, thread: Errno) -> Result<ClockId, Errno> {
     match id as u32 as i32 {
-        0 | 11 => Ok(ClockId::Realtime),
-        1 | 7 => Ok(ClockId::Monotonic),
+        0 | 8 | 11 => Ok(ClockId::Realtime),
+        1 | 7 | 9 => Ok(ClockId::Monotonic),
         3 => Err(thread),
         4..=6 => Err(Errno::EOPNOTSUPP),
         _ => Err(Errno::EINVAL),
+    }
+}
+/// Whether `id` is an alarm clock, `CLOCK_REALTIME_ALARM` or
+/// `CLOCK_BOOTTIME_ALARM`.
+fn is_alarm(id: u64) -> bool {
+    matches!(id as u32 as i32, 8 | 9)
+}
+/// Whether the caller may sleep or set a timer on an alarm clock, which
+/// can wake the machine: CAP_WAKE_ALARM, as Linux's `alarm_timer_create`
+/// and `alarm_timer_nsleep` ask (`EPERM`). Linux gives `EOPNOTSUPP` first
+/// with no RTC that can wake it; the CI runners have one (`rtc_cmos`), and
+/// so does the machine here.
+pub(crate) fn may_use_alarm(c: &Context<'_>) -> Result<(), Errno> {
+    if c.process
+        .credentials
+        .capable(crate::credentials::CAP_WAKE_ALARM)
+    {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
     }
 }
 fn read_timespec(mem: &AddressSpace, addr: u64) -> Result<u64, Errno> {
@@ -911,9 +932,6 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 _ => return Err(Errno::EINVAL),
             }
         };
-        c.mem
-            .check_write(GuestAddr(a[2]), 4)
-            .map_err(|_| Errno::EFAULT)?;
         let id = c.group.with_timers(c.process, |timers| {
             timers.create(crate::timers::PosixTimer {
                 clock,
@@ -927,9 +945,24 @@ fn sys_timer_create(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 timer.value = value.unwrap_or(id as u32 as u64);
             }
         });
-        c.mem
+        // The ID is written out before the clock's own check, and a timer
+        // that fails either has used its ID up, as Linux's
+        // `do_timer_create` has.
+        let created = c
+            .mem
             .write(GuestAddr(a[2]), &id.to_le_bytes())
-            .map_err(|_| Errno::EFAULT)?;
+            .map_err(|_| Errno::EFAULT)
+            .and_then(|()| {
+                if is_alarm(a[0]) {
+                    may_use_alarm(c)
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(e) = created {
+            c.group.with_timers(c.process, |timers| timers.delete(id))?;
+            return Err(e);
+        }
         Ok(0)
     })())
 }
@@ -1248,6 +1281,19 @@ fn sys_clock_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             Err(e) => return err(e),
         },
     };
+    // An alarm clock reads the request first, as the system call does,
+    // then refuses any flag but TIMER_ABSTIME (`alarm_timer_nsleep`).
+    if is_alarm(a[0]) {
+        let checked = read_timespec(c.mem, a[2]).and_then(|_| {
+            if a[1] as u32 & !1 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            may_use_alarm(c)
+        });
+        if let Err(e) = checked {
+            return err(e);
+        }
+    }
     sleep(c, clock, a[1] & 1 != 0, a[2], a[3])
 }
 fn sys_rt_sigreturn(c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {

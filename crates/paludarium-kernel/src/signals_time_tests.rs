@@ -272,6 +272,38 @@ fn clock_nanosleep_on_the_process_cpu_clock() {
     assert!(!f.kernel.group.cpu_timers_armed());
 }
 #[test]
+fn alarm_clocks_sleep_and_time_with_cap_wake_alarm() {
+    let mut f = fixture();
+    f.host
+        .set_clock(paludarium_host::ClockId::Realtime, 1_000);
+    f.host.set_clock(paludarium_host::ClockId::Monotonic, 100);
+    timespec(&mut f, 0, 42);
+    // REALTIME_ALARM sleeps on the real-time clock, BOOTTIME_ALARM on the
+    // monotonic one.
+    assert_eq!(f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[8, 0, DATA, 0]), 0);
+    assert_eq!(f.host.clock(paludarium_host::ClockId::Realtime), Ok(1_042));
+    assert_eq!(f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[9, 0, DATA, 0]), 0);
+    assert_eq!(f.host.clock(paludarium_host::ClockId::Monotonic), Ok(184));
+    // The request first, then any flag but TIMER_ABSTIME, then the
+    // capability.
+    let nsleep = |f: &mut Fixture, clock: u64, flags: u64, req: u64| {
+        f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[clock, flags, req, 0])
+    };
+    assert_eq!(nsleep(&mut f, 8, 2, 8), errno(Errno::EFAULT));
+    assert_eq!(nsleep(&mut f, 8, 2, DATA), errno(Errno::EINVAL));
+    let root = f.thread.state.credentials.clone();
+    f.thread.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+    assert_eq!(nsleep(&mut f, 9, 2, DATA), errno(Errno::EINVAL));
+    assert_eq!(nsleep(&mut f, 9, 1, DATA), errno(Errno::EPERM));
+    // timer_create writes the ID out, then refuses, and the ID is used up.
+    assert_eq!(f.ret(syscalls::nr::TIMER_CREATE, &[8, 0, DATA + 64]), errno(Errno::EPERM));
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 64)).unwrap() as u32, 0);
+    assert_eq!(f.ret(syscalls::nr::TIMER_CREATE, &[8, 0, 8]), errno(Errno::EFAULT));
+    f.thread.state.credentials = root;
+    assert_eq!(f.ret(syscalls::nr::TIMER_CREATE, &[9, 0, DATA + 64]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 64)).unwrap() as u32, 2);
+}
+#[test]
 fn time_interrupt_remaining() {
     let mut f = fixture();
     timespec(&mut f, 2, 42);

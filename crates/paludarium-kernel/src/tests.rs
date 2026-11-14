@@ -2283,9 +2283,8 @@ fn posix_timers_check_arguments_and_report_their_state() {
     assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 5); // interval
     assert!(f.mem.read_u64(GuestAddr(old + 16)).unwrap() >= 9); // seconds left
     assert_eq!(f.ret(nr::TIMER_GETOVERRUN, &[1]), 0);
-    // Errors: clocks (the alarm clocks), signals and notifications that are
-    // not supported.
-    assert_eq!(f.ret(nr::TIMER_CREATE, &[8, 0, id]), errno(Errno::EINVAL)); // CLOCK_REALTIME_ALARM
+    // Errors: clocks, signals and notifications that are not supported.
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[10, 0, id]), errno(Errno::EINVAL));
     f.mem.write_u64(GuestAddr(sev + 8), 99).unwrap();
     assert_eq!(f.ret(nr::TIMER_CREATE, &[1, sev, id]), errno(Errno::EINVAL));
     f.mem.write_u64(GuestAddr(sev + 8), 4 << 32 | 10).unwrap(); // SIGEV_THREAD_ID
@@ -2907,7 +2906,15 @@ fn timerfd_counts_expirations() {
         .set_clock(paludarium_host::ClockId::Monotonic, 1_000_000_000);
     assert_eq!(f.ret(283, &[2, 0]), errno(Errno::EINVAL));
     assert_eq!(f.ret(283, &[1, 1]), errno(Errno::EINVAL));
-    assert_eq!(f.ret(283, &[8, 0]), errno(Errno::EPERM));
+    // The alarm clocks need CAP_WAKE_ALARM, looked at after the flags.
+    let alarm = f.ret(283, &[8, 0]);
+    assert!(alarm < 1 << 32, "{alarm}");
+    assert_eq!(f.ret(3, &[alarm]), 0);
+    let root = f.thread.state.credentials.clone();
+    f.thread.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+    assert_eq!(f.ret(283, &[9, 1]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(283, &[9, 0]), errno(Errno::EPERM));
+    f.thread.state.credentials = root;
     let fd = f.ret(283, &[1, 0x800]);
     assert_eq!(f.ret(0, &[fd, DATA, 8]), errno(Errno::EAGAIN));
     // 5 ms, then every 2 ms: by 10 ms it has expired at 5, 7 and 9 ms.

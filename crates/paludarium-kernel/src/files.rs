@@ -618,9 +618,6 @@ fn lowest_free(
         Err(Errno::EMFILE)
     }
 }
-/// The path at `addr`, with a link in `/proc/self/fd` (or `/proc/self/cwd`,
-/// `/proc/self/exe`, `/dev/fd`) before its last component taken to where it
-/// leads ([`through_magic_links`]).
 /// Opens the path at guest address `name` as Linux's `file_open_name` does
 /// for a call that keeps no descriptor (`swapon`, `swapoff`): with the
 /// checks of an open, after which the file is closed again.
@@ -649,6 +646,9 @@ pub(crate) fn named_at(c: &Context<'_>, name: u64) -> Result<FileStat, Errno> {
     let p = c.files.path((-100i32) as u64, raw)?;
     Ok(named(c, &p, true)?.0)
 }
+/// The path at `addr`, with a link in `/proc/self/fd` (or `/proc/self/cwd`,
+/// `/proc/self/exe`, `/dev/fd`) before its last component taken to where it
+/// leads ([`through_magic_links`]).
 fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     through_magic_links(c, string(c, addr)?)
 }

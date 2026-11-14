@@ -704,11 +704,16 @@ fn escape(path: &[u8]) -> String {
 }
 
 /// `mountinfo` or `mounts` lines for `mounts`; each filesystem type is also
-/// its source, so host paths are not shown.
-pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool) -> Vec<u8> {
+/// its source, so host paths are not shown. Mount points are shown from
+/// `root`, the process's root, and those not under it are left out, as
+/// Linux's `seq_path_root` skips them.
+pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec<u8> {
     let mut out = String::new();
     for (i, mount) in mounts.iter().enumerate() {
-        let path = escape(&mount.path);
+        let Some(path) = crate::files::seen_from(root, &mount.path) else {
+            continue;
+        };
+        let path = escape(&path);
         if mountinfo {
             let (id, parent) = (21 + i, if i == 0 { 1 } else { 21 });
             out.push_str(&format!(
@@ -796,7 +801,7 @@ impl FileHandle for GeneratedFile {
 /// One line of `maps`, as Linux's `show_map_vma` writes it: the header with
 /// a space after the inode, then, for a VMA with a name, spaces up to column
 /// 72 and one more before it. A newline in a path is octal.
-fn map_line(vma: &Vma, start_stack: u64) -> Vec<u8> {
+fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
     let flag = |prot: Prot, letter: char| {
         if vma.prot.contains(prot) { letter } else { '-' }
     };
@@ -821,8 +826,15 @@ fn map_line(vma: &Vma, start_stack: u64) -> Vec<u8> {
         vma.offset,
     )
     .into_bytes();
+    // A file's name as `d_path` gives it: from the root when it is under
+    // it, else from the machine's root.
+    let seen;
     let name: &[u8] = match &vma.file {
-        Some(file) if file.source => file.name.as_deref().unwrap_or_default(),
+        Some(file) if file.source => {
+            let name = file.name.as_deref().unwrap_or_default();
+            seen = crate::files::seen_from(root, name);
+            seen.as_deref().unwrap_or(name)
+        }
         Some(_) => b"/dev/zero (deleted)",
         None if vma.heap => b"[heap]",
         None if vma.start <= start_stack && vma.end >= start_stack => b"[stack]",
@@ -947,19 +959,28 @@ pub(crate) struct MapsFile {
     start_stack: u64,
     /// It is `smaps`, which follows each line with [`smap_lines`].
     smaps: bool,
+    /// The opener's root, from which file names are shown.
+    root: Vec<u8>,
     writable: bool,
     position: Mutex<MapsPosition>,
 }
 impl MapsFile {
-    pub(crate) fn open(memory: MemoryView, start_stack: u64, flags: u32) -> Self {
-        Self::open_as(memory, start_stack, flags, false)
+    pub(crate) fn open(memory: MemoryView, start_stack: u64, flags: u32, root: Vec<u8>) -> Self {
+        Self::open_as(memory, start_stack, flags, root, false)
     }
     /// `smaps` rather than `maps` with `smaps`.
-    pub(crate) fn open_as(memory: MemoryView, start_stack: u64, flags: u32, smaps: bool) -> Self {
+    pub(crate) fn open_as(
+        memory: MemoryView,
+        start_stack: u64,
+        flags: u32,
+        root: Vec<u8>,
+        smaps: bool,
+    ) -> Self {
         Self {
             memory,
             start_stack,
             smaps,
+            root,
             writable: flags & 3 != 0,
             position: Mutex::new(MapsPosition {
                 pending: Vec::new(),
@@ -977,7 +998,7 @@ impl MapsFile {
         }
         let vma = self.memory.vma_from(next)?;
         let after = self.memory.vma_from(vma.end).map_or(MAPS_END, |v| v.start);
-        let mut line = map_line(&vma, self.start_stack);
+        let mut line = map_line(&vma, self.start_stack, &self.root);
         if self.smaps {
             let usage = self.memory.usage(vma.start, vma.end).unwrap_or_default();
             line.extend_from_slice(&smap_lines(&vma, usage));
@@ -1131,7 +1152,7 @@ mod tests {
             .unwrap();
         mem.map(at(0x7fff0000), 0x1000, Prot::READ_WRITE, MappingKind::Stack)
             .unwrap();
-        let file = MapsFile::open(mem.view(), 0x7fff0800, 0);
+        let file = MapsFile::open(mem.view(), 0x7fff0800, 0, b"/".to_vec());
         assert_eq!(
             String::from_utf8(read_all(&file, 4096)).unwrap(),
             format!(
@@ -1172,7 +1193,7 @@ mod tests {
             Some(paludarium_mmu::Lock::OnFault),
         )
         .unwrap();
-        let file = MapsFile::open_as(mem.view(), 0x7fff0800, 0, true);
+        let file = MapsFile::open_as(mem.view(), 0x7fff0800, 0, b"/".to_vec(), true);
         let text = String::from_utf8(read_all(&file, 4096)).unwrap();
         let blocks: Vec<&str> = text.split_inclusive("VmFlags:").collect();
         assert!(
@@ -1229,7 +1250,7 @@ mod tests {
         mem.set_break(GuestAddr(0x11000));
         let vma = view.vma_from(0).unwrap();
         assert!(vma.heap);
-        assert!(map_line(&vma, 0).ends_with(b" [heap]\n"));
+        assert!(map_line(&vma, 0, b"/").ends_with(b" [heap]\n"));
     }
 
     #[test]
@@ -1249,11 +1270,17 @@ mod tests {
             heap: false,
             flags: 0,
         };
-        let line = map_line(&vma, 0);
+        let line = map_line(&vma, 0, b"/");
         let text = std::str::from_utf8(&line).unwrap();
         assert!(text.starts_with("00001000-00002000 r--p 00003000 08:12 9 "));
         assert_eq!(text.find('/'), Some(MAPS_NAME_COLUMN + 1));
         assert!(text.ends_with("/a b\\c\\012d\n"));
+        // Under a root, from there; elsewhere, from the machine's root.
+        assert!(map_line(&vma, 0, b"/a b").ends_with(b" /a b\\c\\012d\n"));
+        let mut inside = vma.clone();
+        inside.file.as_mut().unwrap().name = Some(b"/jail/lib/x".to_vec());
+        assert!(map_line(&inside, 0, b"/jail").ends_with(b" /lib/x\n"));
+        assert!(map_line(&inside, 0, b"/jai").ends_with(b" /jail/lib/x\n"));
     }
 
     #[test]
@@ -1264,7 +1291,7 @@ mod tests {
             .unwrap();
         mem.mark_shared(at, 0x1000).unwrap();
         let vma = mem.view().vma_from(0).unwrap();
-        let line = String::from_utf8(map_line(&vma, 0)).unwrap();
+        let line = String::from_utf8(map_line(&vma, 0, b"/")).unwrap();
         assert!(line.contains(" rw-s 00000000 00:01 "), "{line}");
         assert!(line.ends_with(" /dev/zero (deleted)\n"), "{line}");
         assert_ne!(vma.identity.1, 0);
@@ -1284,7 +1311,7 @@ mod tests {
         };
         map(0x10000);
         map(0x30000);
-        let file = MapsFile::open(mem.view(), 0, 0);
+        let file = MapsFile::open(mem.view(), 0, 0, b"/".to_vec());
         let mut buf = [0; 10];
         assert_eq!(file.read(&mut buf).unwrap(), 10);
         // The reader goes on from the VMA it found next, as Linux's does:
@@ -1313,7 +1340,7 @@ mod tests {
             )
             .unwrap();
         }
-        let file = MapsFile::open(mem.view(), 0, 0);
+        let file = MapsFile::open(mem.view(), 0, 0, b"/".to_vec());
         let whole = read_all(&file, 1 << 16);
         assert_eq!(whole.len(), 200 * 41);
         file.seek(0, 0).unwrap();
@@ -1333,7 +1360,7 @@ mod tests {
         assert_eq!(file.stat().unwrap().size, 0);
         assert_eq!(file.write(b"x"), Err(Errno::EBADF));
         assert_eq!(
-            MapsFile::open(mem.view(), 0, 2).write(b"x"),
+            MapsFile::open(mem.view(), 0, 2, b"/".to_vec()).write(b"x"),
             Err(Errno::EINVAL)
         );
     }
@@ -1343,7 +1370,7 @@ mod tests {
         let mem = AddressSpace::new();
         mem.map_shared(None, 0x1000, Prot::READ, MappingKind::Anonymous)
             .unwrap();
-        let file = MapsFile::open(mem.view(), 0, 0);
+        let file = MapsFile::open(mem.view(), 0, 0, b"/".to_vec());
         drop(mem);
         assert_eq!(file.read(&mut [0; 16]).unwrap(), 0);
     }
@@ -1505,14 +1532,20 @@ mod tests {
             },
         ];
         assert_eq!(
-            String::from_utf8(render(&mounts, true)).unwrap(),
+            String::from_utf8(render(&mounts, true, b"/")).unwrap(),
             "21 1 0:1 / / rw,relatime - tmpfs tmpfs rw\n\
              22 21 0:2 / /my\\040dir rw,relatime - hostfs hostfs rw\n"
         );
         assert_eq!(
-            String::from_utf8(render(&mounts, false)).unwrap(),
+            String::from_utf8(render(&mounts, false, b"/")).unwrap(),
             "tmpfs / tmpfs rw,relatime 0 0\nhostfs /my\\040dir hostfs rw,relatime 0 0\n"
         );
+        // From a root, only the mounts at or under it, from there.
+        assert_eq!(
+            String::from_utf8(render(&mounts, true, b"/my dir")).unwrap(),
+            "22 21 0:2 / / rw,relatime - hostfs hostfs rw\n"
+        );
+        assert_eq!(render(&mounts, false, b"/my"), b"");
         let file = GeneratedFile::open(b"abc".to_vec(), 0);
         let mut buf = [0; 2];
         assert_eq!(file.read(&mut buf), Ok(2));

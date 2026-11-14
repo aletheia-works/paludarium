@@ -72,9 +72,9 @@ verified.
   root's `/proc` or `/dev`, so a program there finds only the files the
   directory holds. In a path that climbs above the root as written, `..` is
   taken from the names as written, where Linux takes a `..` after a
-  symbolic link from the link's target. `maps`, `smaps`, `mounts` and
-  `mountinfo` in `/proc` show paths from the machine's root, where Linux
-  shows them from the reader's root (its links do read from there).
+  symbolic link from the link's target. `maps` and `smaps` in `/proc` name
+  files from the root their opener had when it opened them, where Linux
+  takes the root of whoever reads them, at each read.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has

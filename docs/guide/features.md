@@ -2079,7 +2079,9 @@ kernel.
   space and inodes are what it holds, and a mounted host directory with the
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
-  `--mount`, without host paths). Each mount has its own `st_dev`, as its
+  `--mount`, without host paths). After `chroot` they show each mount point
+  from the process's root and leave out those not under it, as Linux's
+  `seq_path_root` does. Each mount has its own `st_dev`, as its
   line in `mountinfo` says, so `df` lists every mount. A pipe, a socket, a
   pidfd, a memfd, a `memfd_secret` file, a namespace file and an anonymous
   inode (an eventfd, an epoll and the like) that no path opened are each on
@@ -2131,7 +2133,7 @@ kernel.
   the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
-  unmarked. `status` has Linux's fields in Linux's order (umask, IDs, threads,
+  unmarked; `maps` and `smaps` name a mapped file the same way. `status` has Linux's fields in Linux's order (umask, IDs, threads,
   signal masks, capabilities and so on) and, of the memory ones, the locked
   memory (`VmLck`); the other memory fields and the CPU ones are not there,
   as nothing measures them. Any other path in this process's directory or

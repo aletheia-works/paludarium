@@ -7885,6 +7885,49 @@ static void cr_link(const char *label, int dir, const char *name) {
     else
         printf("%s: %s\n", label, buf);
 }
+/* The file of the mapping at `at` in dir/name (maps or smaps), BASE for
+   the base. */
+static void cr_mapped(const char *label, int dir, const char *name, void *at) {
+    static char buf[1 << 17];
+    int fd = openat(dir, name, O_RDONLY);
+    if (fd < 0) {
+        printf("%s: errno=%d\n", label, errno);
+        return;
+    }
+    size_t got = 0;
+    ssize_t n;
+    while (got < sizeof buf - 1 && (n = read(fd, buf + got, sizeof buf - 1 - got)) > 0) got += n;
+    close(fd);
+    buf[got] = 0;
+    for (char *line = buf, *end; (end = strchr(line, '\n')); line = end + 1) {
+        *end = 0;
+        unsigned long start;
+        if (sscanf(line, "%lx-", &start) != 1 || start != (unsigned long)at) continue;
+        char *path = strchr(line, '/');
+        char *base = path ? strstr(path, cr_base) : NULL;
+        if (base)
+            printf("%s: %.*sBASE%s\n", label, (int)(base - path), path, base + strlen(cr_base));
+        else
+            printf("%s: %s\n", label, path ? path : "(none)");
+        return;
+    }
+    printf("%s: not found\n", label);
+}
+/* The number of lines in dir/name. */
+static void cr_lines(const char *label, int dir, const char *name) {
+    int fd = openat(dir, name, O_RDONLY);
+    if (fd < 0) {
+        printf("%s: errno=%d\n", label, errno);
+        return;
+    }
+    char buf[4096];
+    ssize_t n;
+    int lines = 0;
+    while ((n = read(fd, buf, sizeof buf)) > 0)
+        for (ssize_t i = 0; i < n; i++) lines += buf[i] == '\n';
+    close(fd);
+    printf("%s: %d lines\n", label, lines);
+}
 static int chroot_exec_case(void) {
     cr_cwd("exec");
     cr_read("exec /f", "/f");
@@ -7950,6 +7993,7 @@ static int chroot_case(const char *self) {
         if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
         if (chdir(cr_base)) _exit(91);
         int proc = open("/proc/self", O_RDONLY | O_DIRECTORY);
+        int outer = open("f", O_RDONLY);
         long rooted = cr_call(jail);
         printf("chroot=%ld\n", rooted);
         if (rooted) _exit(89);
@@ -7962,6 +8006,20 @@ static int chroot_case(const char *self) {
         char name[32];
         snprintf(name, sizeof name, "fd/%d", file);
         cr_link("own fd", proc, name);
+        /* Files mapped from under the new root and from outside it, named
+           from the root and from the machine's root; the mounts, none of
+           them under the new root. */
+        void *in_map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, file, 0);
+        void *out_map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, outer, 0);
+        cr_mapped("maps inside", proc, "maps", in_map);
+        cr_mapped("maps outside", proc, "maps", out_map);
+        cr_mapped("smaps inside", proc, "smaps", in_map);
+        cr_mapped("smaps outside", proc, "smaps", out_map);
+        cr_lines("mounts", proc, "mounts");
+        cr_lines("mountinfo", proc, "mountinfo");
+        munmap(in_map, 4096);
+        munmap(out_map, 4096);
+        close(outer);
         close(file);
         close(proc);
         /* The parent reads this root while it is there. */

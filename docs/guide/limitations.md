@@ -561,9 +561,7 @@ verified.
   where Linux shows only the devices of a kind its modules know. The
   least `IFLA_GSO_MAX_SIZE` and `IFLA_GSO_IPV4_MAX_SIZE` the link policy
   takes is 321, as for Ubuntu's kernel (`MAX_TCP_HEADER` + 1), where
-  another build's may differ. A message type past the last
-  that `rtnetlink` knows is answered with `EOPNOTSUPP` in `NLMSG_ERROR`,
-  where Linux 7.0 refuses the send itself with `EOPNOTSUPP`. A socket
+  another build's may differ. A socket
   whose receive buffer is full drops an answer with `ENOBUFS` without
   waiting. A `write` to a netlink socket acts with the capability of the
   thread that opened it alone. The other namespaces keep nothing apart

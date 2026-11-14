@@ -1316,7 +1316,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     エラーと、ダンプをすぐに終える `NLMSG_DONE` に、Linux の `netlink_ext_ack` が持つものを
     載せます（`NLM_F_ACK_TLVS`）。Linux のメッセージ（`NLMSGERR_ATTR_MSG`）、問題の属性の
     オフセット（`NLMSGERR_ATTR_OFFS`）、その属性を拒んだポリシー（`NLMSGERR_ATTR_POLICY`）
-    です。確認応答には、属性のあとに残ったバイトのような警告を載せます。`GET` のほかには、ネットワーク
+    です。確認応答には、属性のあとに残ったバイトのような警告を載せます。`rtnetlink` の知る最後
+    （`RTM_MAX`、123）より後の型のメッセージも送れて、`rtnetlink_rcv_msg` と同じく
+    `EOPNOTSUPP` を返します。`GET` のほかには、ネットワーク
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
     開いたものの両方に要ります（なければ `EPERM`）。
   - **厳密な検査:** iproute2 と同じく `NETLINK_GET_STRICT_CHK` を設定すると、Linux と

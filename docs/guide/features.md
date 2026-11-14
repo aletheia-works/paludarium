@@ -1505,7 +1505,9 @@ kernel.
     (`NLMSGERR_ATTR_MSG`), the offset of the attribute at fault
     (`NLMSGERR_ATTR_OFFS`) and the policy that refused it
     (`NLMSGERR_ATTR_POLICY`); an acknowledgement carries a warning, such
-    as of bytes left over after the attributes. Anything but a `GET` needs `CAP_NET_ADMIN` in
+    as of bytes left over after the attributes. A message type past the
+    last `rtnetlink` knows (`RTM_MAX`, 123) is sent, and answered with
+    `EOPNOTSUPP`, as `rtnetlink_rcv_msg` does. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending
     thread and the socket's opener (`EPERM`).
   - **Strict checking:** with `NETLINK_GET_STRICT_CHK`, as iproute2 sets

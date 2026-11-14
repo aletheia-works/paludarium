@@ -14364,6 +14364,14 @@ int main(int argc, char **argv) {
             nl_answer(fd, nl_send(fd, 16, NL_F_REQUEST | NL_F_ACK, &nowhere, sizeof nowhere), port, "nowhere");
             nl_answer(fd, nl_send(fd, 18, NL_F_REQUEST, &family, 1), port, "short");
             nl_answer(fd, nl_send(fd, 16, NL_F_ACK, &link, sizeof link), port, "no request");
+            /* A type past RTM_MAX (123): rtnetlink_rcv_msg answers it with
+               EOPNOTSUPP; the send itself goes through. */
+            static const unsigned short unknown_types[] = {124, 1000, 0xffff};
+            for (int u = 0; u < 3; u++) {
+                long seq = nl_send(fd, unknown_types[u], NL_F_REQUEST | NL_F_ACK, &family, 1);
+                printf("unknown type %u: send=%ld\n", unknown_types[u], seq < 0 ? seq : 0);
+                if (seq >= 0) nl_answer(fd, seq, port, "unknown type");
+            }
             /* Unprivileged, setting is EPERM and getting works. */
             fflush(stdout);
             pid_t user = child();

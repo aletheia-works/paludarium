@@ -159,6 +159,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **保護キー**：仮想 CPU には保護キーがありません（`CPUID` は PKU を報告しません）。そのため
   `pkey_alloc` は、そういう CPU での Linux と同じく `ENOSPC` を返し、プログラムは保護キーなしで
   続けます。`RDPKRU` と `WRPKRU` は、そういう CPU と同じく `SIGILL` でプログラムを止めます。
+- **セグメントレジスタ**：仮想 CPU はセグメントレジスタへの、またはそこからの移動ができません
+  （`%ds` や `%fs` などへの `mov` は `SIGILL` でプログラムを止めます）。そのため `modify_ldt`
+  が書いたエントリを読み込んで使うことはできません。Linux は読み込みます。テーブルそのものは
+  Linux と同じに読み返せます。
 - **io_uring の一部**：実行するのは `IORING_OP_NOP` と `IORING_OP_EPOLL_CTL` だけで、ほかの
   操作は `EOPNOTSUPP` で完了します。setup のフラグ `IORING_SETUP_IOPOLL`、`_SQPOLL`、
   `_SQ_AFF`、`_ATTACH_WQ`、`_R_DISABLED`、`_SQE128`、`_CQE32`、`_NO_MMAP`、

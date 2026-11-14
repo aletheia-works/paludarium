@@ -4292,6 +4292,10 @@ pub struct AddressSpace {
     /// `mm->membarrier_state`: a fork's copy keeps it, a new space (exec)
     /// has none.
     membarrier: AtomicU32,
+    /// The space's local descriptor table, as Linux's `mm->context.ldt`:
+    /// the 8-byte descriptors `modify_ldt` wrote, as many as the highest
+    /// entry written; a fork's copy keeps it, a new space (exec) has none.
+    ldt: Mutex<Vec<u64>>,
 }
 
 /// An address space's VMAs for as long as a thread uses it, as Linux's
@@ -4528,6 +4532,7 @@ impl AddressSpace {
             data: Arc::new(Mutex::new(data)),
             serialization,
             membarrier: AtomicU32::new(0),
+            ldt: Mutex::new(Vec::new()),
         }
     }
     fn locked(&self) -> AddressSpaceGuard<'_> {
@@ -4565,6 +4570,8 @@ impl AddressSpace {
         child
             .membarrier
             .store(self.membarrier.load(Ordering::SeqCst), Ordering::SeqCst);
+        // ldt_dup_context copies the parent's LDT.
+        lock_spinning(&child.ldt).clone_from(&lock_spinning(&self.ldt));
         child
     }
     /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
@@ -4776,6 +4783,12 @@ impl AddressSpace {
     #[must_use]
     pub fn membarrier_state(&self) -> &AtomicU32 {
         &self.membarrier
+    }
+    /// The space's local descriptor table, shared by every thread that runs
+    /// in it.
+    #[must_use]
+    pub fn ldt(&self) -> &Mutex<Vec<u64>> {
+        &self.ldt
     }
     /// This space's VMAs as `/proc/<pid>/maps` reads them ([`MemoryView`]).
     #[must_use]

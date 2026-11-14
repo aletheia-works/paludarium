@@ -7590,6 +7590,76 @@ static int time_set_case(void) {
     return 0;
 }
 
+/* modify_ldt: Linux gives its int result as an unsigned int, so errors come
+   back as large positive numbers, not -1 with errno. */
+static long ldt_call(long func, void *ptr, long count) {
+    return syscall(SYS_modify_ldt, func, ptr, count);
+}
+static long ldt_write(long func, unsigned entry, unsigned base, unsigned limit, unsigned flags) {
+    unsigned desc[4] = {entry, base, limit, flags};
+    return ldt_call(func, desc, sizeof desc);
+}
+static void ldt_show(const char *label, long count) {
+    unsigned long long table[8];
+    memset(table, 0x5a, sizeof table);
+    long r = ldt_call(0, table, count);
+    printf("%s read=%ld", label, r);
+    for (long i = 0; i < count / 8 && i < 8; i++) printf(" %016llx", table[i]);
+    printf("\n");
+}
+static int ldt_case(const char *self) {
+    unsigned char zeros[200];
+    ldt_show("empty", 64);
+    printf("empty-fault=%ld\n", ldt_call(0, (void *)8, 64));
+    memset(zeros, 0xff, sizeof zeros);
+    long r = ldt_call(2, zeros, sizeof zeros);
+    int zeroed = 1;
+    for (int i = 0; i < 128; i++) zeroed &= zeros[i] == 0;
+    printf("default=%ld zeroed=%d after=%#x fault=%#lx\n", r, zeroed, zeros[128],
+           ldt_call(2, (void *)8, 1));
+    printf("unknown=%#lx %#lx high-func=%#lx\n", ldt_call(3, zeros, 16), ldt_call(-1, zeros, 16),
+           ldt_call(1L << 32 | 2, zeros, 8));
+    unsigned desc[4] = {0};
+    printf("size=%#lx %#lx fault=%#lx\n", ldt_call(0x11, desc, 15), ldt_call(0x11, desc, 17),
+           ldt_call(0x11, (void *)8, 16));
+    printf("entry=%#lx conforming-old=%#lx present=%#lx\n", ldt_write(0x11, 8192, 0, 0, 0),
+           ldt_write(1, 1, 0x1000, 0xfff, 3 << 1 | 1 << 5), ldt_write(0x11, 1, 0x1000, 0xfff, 3 << 1));
+    /* A 32-bit data segment, useable and page-granular; a not-present
+       conforming code segment; a 16-bit one; and the lm bit, ignored. */
+    printf("writes=%ld %ld %ld %ld\n", ldt_write(0x11, 2, 0x12345678, 0xabcde, 1 | 1 << 4 | 1 << 6),
+           ldt_write(0x11, 4, 0x1000, 0xfff, 1 | 3 << 1 | 1 << 5),
+           ldt_write(0x11, 5, 0x10000, 0xffff, 1 << 3),
+           ldt_write(0x11, 6, 0xffffffffu, 0xfffff, 0xff));
+    ldt_show("new", 64);
+    ldt_show("short", 20);
+    unsigned long long big[8200];
+    memset(big, 0x5a, sizeof big);
+    r = ldt_call(0, big, 1L << 20);
+    int rest = 1;
+    for (int i = 7; i < 8192; i++) rest &= big[i] == 0;
+    printf("whole=%ld rest-zero=%d past=%llx\n", r, rest, big[8192]);
+    /* The old mode drops useable, and no base nor limit clears an entry;
+       so does an empty descriptor in the new mode. */
+    printf("old=%ld %ld empty=%ld\n", ldt_write(1, 0, 0x1000, 0xfff, 1 | 1 << 6),
+           ldt_write(1, 4, 0, 0, 1), ldt_write(0x11, 5, 0, 0, 1 << 3 | 1 << 5));
+    ldt_show("cleared", 64);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ldt_show("child", 64);
+        ldt_write(0x11, 7, 0x2000, 0x1fff, 1);
+        fflush(stdout);
+        char *args[] = {"x", "ldt-exec", (char *)self, NULL};
+        execv(self, args);
+        _exit(98);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("child exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    ldt_show("parent", 64);
+    return 0;
+}
+
 /* iopl, ioperm and acct as a user without capabilities: the arguments, then
    EPERM for whatever needs CAP_SYS_RAWIO or CAP_SYS_PACCT. */
 static int port_access_case(void) {
@@ -23059,6 +23129,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
     if (!strcmp(mode, "time-set")) return time_set_case();
+    if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
+    if (!strcmp(mode, "ldt-exec")) {
+        ldt_show("after exec", 64);
+        return 0;
+    }
     if (!strcmp(mode, "port-access")) return port_access_case();
     if (!strcmp(mode, "timer-limits")) return timer_limits_case();
     if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();

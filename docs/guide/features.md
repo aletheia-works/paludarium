@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl`, `modify_ldt` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs` |
@@ -1268,6 +1268,18 @@ kernel.
   `CLONE_VM` children share them, a fork's child has none and not their
   rings either (as `VM_DONTCOPY` since 2026), and `execve` or the last exit
   ends them, cancelling their polls.
+- `modify_ldt` keeps the address space's local descriptor table as Linux's
+  `arch/x86/kernel/ldt.c` does. Writing (1, the old mode, or 0x11) takes one
+  16-byte `struct user_desc`. An entry number of 8,192 or more gives
+  `EINVAL`, and so does a conforming code segment, unless the mode is the
+  new one and the segment is not present. It stores
+  Linux's descriptor, or clears the entry for an empty one (or, in the old
+  mode, one with no base and no limit). The table grows to the highest
+  entry written. Reading (0) gives 0 until something is written, then the
+  entries, zero-filled up to the count (at most 64 KiB); 2 reads up to 128
+  zero bytes, and other functions give `ENOSYS`. A fork keeps a copy and an
+  exec starts with none. The result is Linux's `int` as an `unsigned int`,
+  so an error comes back as, say, `0xffffffea`, not `-EINVAL`.
 - `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
   `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
   commands give `EPERM` until the address space registers for them, a fork

@@ -170,6 +170,7 @@ NAMES = {
     151: "mlockall",
     152: "munlockall",
     153: "vhangup",
+    154: "modify_ldt",
     157: "prctl",
     158: "arch_prctl",
     159: "adjtimex",

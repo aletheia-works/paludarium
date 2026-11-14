@@ -1236,3 +1236,55 @@ fn adjtimex_reads_an_unsynchronised_clock() {
         assert_eq!(f.ret(305, &[clock, timex]), errno(e));
     }
 }
+/// modify_ldt keeps the address space's table as Linux's ldt.c does, and
+/// gives its result as an unsigned int.
+#[test]
+fn modify_ldt_writes_and_reads_the_local_descriptor_table() {
+    let mut f = fixture();
+    let n = syscalls::nr::MODIFY_LDT;
+    let low = |e: Errno| errno(e) as u32 as u64;
+    let desc = |f: &mut Fixture, words: [u32; 4]| {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        f.mem.write(GuestAddr(DATA), &bytes).unwrap();
+    };
+    // No table: a read gives 0 even at a bad pointer; the default one is
+    // zeros, at most 128 bytes.
+    assert_eq!(f.ret(n, &[0, 8, 64]), 0);
+    f.mem.write(GuestAddr(DATA + 256), &[0xff; 200]).unwrap();
+    assert_eq!(f.ret(n, &[2, DATA + 256, 1000]), 128);
+    let mut bytes = [1; 129];
+    f.mem.read(GuestAddr(DATA + 256), &mut bytes).unwrap();
+    assert!(bytes[..128].iter().all(|&b| b == 0) && bytes[128] == 0xff);
+    assert_eq!(f.ret(n, &[2, 8, 1]), low(Errno::EFAULT));
+    assert_eq!(f.ret(n, &[3, DATA, 16]), low(Errno::ENOSYS));
+    // Writes: the size, the read, the entry number, then the contents.
+    assert_eq!(f.ret(n, &[0x11, 8, 15]), low(Errno::EINVAL));
+    assert_eq!(f.ret(n, &[0x11, 8, 16]), low(Errno::EFAULT));
+    desc(&mut f, [8192, 0, 0, 0]);
+    assert_eq!(f.ret(n, &[0x11, DATA, 16]), low(Errno::EINVAL));
+    desc(&mut f, [1, 0x1234_5678, 0xabcde, 3 << 1 | 1 << 5]);
+    assert_eq!(f.ret(n, &[1, DATA, 16]), low(Errno::EINVAL));
+    desc(&mut f, [1, 0x1234_5678, 0xabcde, 3 << 1]);
+    assert_eq!(f.ret(n, &[0x11, DATA, 16]), low(Errno::EINVAL));
+    // A 32-bit data segment in entry 2, useable, page-granular.
+    desc(&mut f, [2, 0x1234_5678, 0xabcde, 1 | 1 << 4 | 1 << 6]);
+    assert_eq!(f.ret(n, &[0x11, DATA, 16]), 0);
+    // 64 KiB at most, zero-filled past the 3 entries: past the 8 KiB here.
+    assert_eq!(f.ret(n, &[0, DATA + 256, 1 << 20]), low(Errno::EFAULT));
+    assert_eq!(f.ret(n, &[0, DATA + 256, 32]), 32);
+    let entry = |f: &Fixture, i: u64| f.mem.read_u64(GuestAddr(DATA + 256 + i * 8)).unwrap();
+    assert_eq!((entry(&f, 0), entry(&f, 1)), (0, 0));
+    assert_eq!(entry(&f, 2), 0x12da_f334_5678_bcde);
+    // Old mode drops `useable`; no base or limit clears the entry.
+    desc(&mut f, [0, 0x1000, 0xfff, 1 | 1 << 6]);
+    assert_eq!(f.ret(n, &[1, DATA, 16]), 0);
+    assert_eq!(f.ret(n, &[0, DATA + 256, 24]), 24);
+    assert_eq!(entry(&f, 0) >> 52 & 1, 0);
+    desc(&mut f, [2, 0, 0, 1]);
+    assert_eq!(f.ret(n, &[1, DATA, 16]), 0);
+    assert_eq!(f.ret(n, &[0, DATA + 256, 24]), 24);
+    assert_eq!(entry(&f, 2), 0);
+    // A child of fork has a copy.
+    let child = f.mem.fork();
+    assert_eq!(child.ldt().lock().unwrap().len(), 3);
+}

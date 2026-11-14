@@ -48,6 +48,7 @@ pub mod nr {
     pub const PKEY_MPROTECT: u64 = 329;
     pub const PKEY_ALLOC: u64 = 330;
     pub const PKEY_FREE: u64 = 331;
+    pub const MODIFY_LDT: u64 = 154;
     pub const MSEAL: u64 = 462;
     pub const SET_MEMPOLICY_HOME_NODE: u64 = 450;
     pub const MAP_SHADOW_STACK: u64 = 453;
@@ -164,7 +165,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 93] = [
+        let entries: [(u64, Handler); 94] = [
             (nr::GETITIMER, sys_getitimer),
             (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
@@ -196,6 +197,7 @@ impl SyscallTable {
             (nr::PKEY_MPROTECT, sys_pkey_mprotect),
             (nr::PKEY_ALLOC, sys_pkey_alloc),
             (nr::PKEY_FREE, sys_pkey_free),
+            (nr::MODIFY_LDT, sys_modify_ldt),
             (nr::MUNMAP, sys_munmap),
             (nr::MSEAL, sys_mseal),
             (nr::BRK, sys_brk),
@@ -3147,6 +3149,123 @@ fn sys_pkey_alloc(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// [`sys_pkey_mprotect`]).
 fn sys_pkey_free(_: &mut Context<'_>, _: [u64; 6]) -> Outcome {
     err(Errno::EINVAL)
+}
+
+/// Entries a local descriptor table holds (`LDT_ENTRIES`), 8 bytes each.
+const LDT_ENTRIES: u64 = 8192;
+
+/// `modify_ldt(func, ptr, bytecount)` on the address space's local
+/// descriptor table, as Linux's `arch/x86/kernel/ldt.c`: 0 reads it, 1 and
+/// 0x11 write one entry (the old and the new mode), 2 reads the default
+/// table, all zeros; any other function is `ENOSYS`. The result is Linux's
+/// `int` as an `unsigned int`, so an error reaches the guest as, say,
+/// `0xffffffea` rather than `-EINVAL`.
+fn sys_modify_ldt(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let (ptr, bytecount) = (a[1], a[2]);
+    let result = match a[0] as u32 {
+        0 => read_ldt(c.mem, ptr, bytecount),
+        1 => write_ldt(c.mem, ptr, bytecount, true),
+        2 => zero_user(c.mem, ptr, bytecount.min(128)),
+        0x11 => write_ldt(c.mem, ptr, bytecount, false),
+        _ => Err(Errno::ENOSYS),
+    };
+    ok(u64::from(
+        result.unwrap_or_else(Errno::to_syscall_return) as u32
+    ))
+}
+
+/// Writes `len` zero bytes at `ptr` and gives `len` (`EFAULT` if it
+/// cannot).
+fn zero_user(mem: &AddressSpace, ptr: u64, len: u64) -> Result<u64, Errno> {
+    mem.write(GuestAddr(ptr), &vec![0; len as usize])
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(len)
+}
+
+/// `read_ldt`: nothing (0) while the space has no table; else the entries,
+/// at most `bytecount` bytes and at most the whole table's, and zeros up
+/// to `bytecount`, which it gives.
+fn read_ldt(mem: &AddressSpace, ptr: u64, bytecount: u64) -> Result<u64, Errno> {
+    let ldt = mem
+        .ldt()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if ldt.is_empty() {
+        return Ok(0);
+    }
+    let bytecount = bytecount.min(LDT_ENTRIES * 8);
+    let mut bytes: Vec<u8> = ldt.iter().flat_map(|d| d.to_le_bytes()).collect();
+    bytes.resize(bytecount as usize, 0);
+    mem.write(GuestAddr(ptr), &bytes)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(bytecount)
+}
+
+/// `write_ldt`: one `struct user_desc` (16 bytes, else `EINVAL`), read
+/// before its entry number (8192 or more is `EINVAL`) and contents are
+/// checked (contents 3, a conforming code segment, is `EINVAL` unless the
+/// mode is the new one and the segment is not present). An empty one, or
+/// in the old mode one of no base and no limit, clears the entry;
+/// otherwise it becomes Linux's `fill_ldt` descriptor (accessed, user,
+/// privilege 3, never 64-bit), without the `useable` bit in the old mode.
+/// The table grows to hold the entry and never shrinks.
+fn write_ldt(mem: &AddressSpace, ptr: u64, bytecount: u64, old: bool) -> Result<u64, Errno> {
+    if bytecount != 16 {
+        return Err(Errno::EINVAL);
+    }
+    let [entry, base, limit, flags] = read_words32(mem, ptr)?;
+    let bit = |n: u32| u64::from(flags >> n & 1);
+    let (seg_32bit, contents, read_exec_only) = (bit(0), u64::from(flags >> 1 & 3), bit(3));
+    let (limit_in_pages, not_present, useable) = (bit(4), bit(5), bit(6));
+    if u64::from(entry) >= LDT_ENTRIES || contents == 3 && (old || not_present == 0) {
+        return Err(Errno::EINVAL);
+    }
+    let empty = base == 0
+        && limit == 0
+        && contents == 0
+        && read_exec_only == 1
+        && seg_32bit == 0
+        && limit_in_pages == 0
+        && not_present == 1
+        && useable == 0;
+    let descriptor = if old && base == 0 && limit == 0 || empty {
+        0
+    } else {
+        let (base, limit) = (u64::from(base), u64::from(limit));
+        let kind = (read_exec_only ^ 1) << 1 | contents << 2 | 1;
+        let available = if old { 0 } else { useable };
+        limit & 0xffff
+            | (base & 0xff_ffff) << 16
+            | kind << 40
+            | 1 << 44
+            | 3 << 45
+            | (not_present ^ 1) << 47
+            | (limit >> 16 & 0xf) << 48
+            | available << 52
+            | seg_32bit << 54
+            | limit_in_pages << 55
+            | (base >> 24) << 56
+    };
+    let mut ldt = mem
+        .ldt()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = entry as usize;
+    if ldt.len() <= at {
+        ldt.resize(at + 1, 0);
+    }
+    ldt[at] = descriptor;
+    Ok(0)
+}
+
+/// Four 32-bit words at `ptr` (`EFAULT` if they cannot be read).
+fn read_words32(mem: &AddressSpace, ptr: u64) -> Result<[u32; 4], Errno> {
+    let mut b = [0; 16];
+    mem.read(GuestAddr(ptr), &mut b)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(std::array::from_fn(|i| {
+        u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+    }))
 }
 
 const MREMAP_MAYMOVE: u64 = 1;

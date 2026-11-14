@@ -4793,6 +4793,74 @@ mod multiple_messages {
         assert_eq!(f.ret(SENDMMSG, &[a, send, (1 << 32) | 1, 0]), 1);
         assert_eq!(f.ret(RECVMMSG, &[b, receive, 4, 0x40, 0]), 1);
     }
+    fn so_error(f: &mut Fixture, fd: u64) -> u64 {
+        f.mem.write_u64(GuestAddr(DATA + 0x308), 4).unwrap();
+        assert_eq!(f.ret(55, &[fd, 1, 4, DATA + 0x300, DATA + 0x308]), 0);
+        f.mem.read_u64(GuestAddr(DATA + 0x300)).unwrap() & 0xffff_ffff
+    }
+    #[test]
+    fn an_error_after_a_message_is_kept_for_the_next_call() {
+        let mut f = fixture();
+        let (a, b) = datagram_pair(&mut f);
+        let (send, receive, out, into) = (DATA + 0x400, DATA + 0x800, DATA + 0x600, DATA + 0xa00);
+        vector(&f, send, out, 3, 5);
+        assert_eq!(f.ret(SENDMMSG, &[a, send, 3, 0]), 3);
+        // The third entry's iovec cannot be read: two came, and the fault
+        // is the socket's, which SO_ERROR takes once.
+        vector(&f, receive, into, 3, 8);
+        f.mem.write_u64(GuestAddr(receive + 128 + 16), 8).unwrap();
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 3, 0x40, 0]), 2);
+        assert_eq!(so_error(&mut f, b), 14);
+        assert_eq!(so_error(&mut f, b), 0);
+        // Kept, it comes before the message still queued, and only once.
+        f.mem.write_u64(GuestAddr(receive + 64 + 16), 8).unwrap();
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 3, 0x40, 0]), 1);
+        assert_eq!(f.ret(SENDMMSG, &[a, send, 1, 0]), 1);
+        assert_eq!(
+            f.ret(RECVMMSG, &[b, receive, 1, 0x40, 0]),
+            errno(Errno::EFAULT)
+        );
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 1, 0x40, 0]), 1);
+        // MSG_ERRQUEUE skips that check, but a datagram's receive takes
+        // the error first all the same (`__skb_try_recv_datagram`).
+        assert_eq!(f.ret(SENDMMSG, &[a, send, 1, 0]), 1);
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 3, 0x40, 0]), 1);
+        assert_eq!(
+            f.ret(RECVMMSG, &[b, receive, 1, 0x2040, 0]),
+            errno(Errno::EFAULT)
+        );
+        assert_eq!(so_error(&mut f, b), 0);
+        // An empty queue after a message (EAGAIN) is no error.
+        assert_eq!(f.ret(SENDMMSG, &[a, send, 1, 0]), 1);
+        vector(&f, receive, into, 3, 8);
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 3, 0x40, 0]), 1);
+        assert_eq!(so_error(&mut f, b), 0);
+    }
+    #[test]
+    fn a_stream_gives_a_kept_error_once_nothing_is_queued() {
+        let mut f = fixture();
+        assert_eq!(f.ret(53, &[1, 1, 0, DATA + 0x100]), 0);
+        let fds = f.mem.read_u64(GuestAddr(DATA + 0x100)).unwrap();
+        let (a, b) = (fds & 0xffff_ffff, fds >> 32);
+        let (receive, into) = (DATA + 0x800, DATA + 0xa00);
+        f.mem.write(GuestAddr(DATA + 0x200), b"hello").unwrap();
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 5]), 5);
+        vector(&f, receive, into, 2, 8);
+        f.mem.write_u64(GuestAddr(receive + 64 + 16), 8).unwrap();
+        assert_eq!(f.ret(RECVMMSG, &[b, receive, 2, 0x40, 0]), 1);
+        assert_eq!(msg_len(&f, receive, 0), 5);
+        // Data queued since comes first; then the error, before more waits.
+        assert_eq!(f.ret(1, &[a, DATA + 0x200, 3]), 3);
+        assert_eq!(f.ret(45, &[b, DATA + 0x300, 8, 0x40, 0, 0]), 3);
+        assert_eq!(
+            f.ret(45, &[b, DATA + 0x300, 8, 0x40, 0, 0]),
+            errno(Errno::EFAULT)
+        );
+        assert_eq!(
+            f.ret(45, &[b, DATA + 0x300, 8, 0x40, 0, 0]),
+            errno(Errno::EAGAIN)
+        );
+    }
     #[test]
     fn they_check_as_linux_does() {
         let mut f = fixture();

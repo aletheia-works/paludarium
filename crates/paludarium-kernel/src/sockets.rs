@@ -733,6 +733,31 @@ const MSG_LEN: u64 = 56;
 /// Where `struct msghdr` keeps `msg_flags`.
 const MSG_FLAGS: u64 = 48;
 
+/// Takes the pending error of the socket `file` (`sock_error`), for
+/// `recvmmsg`.
+fn take_pending_error(file: &Arc<dyn FileHandle>) -> Option<Errno> {
+    if let Some(socket) = crate::inet::of(file) {
+        socket.take_error()
+    } else if let Some(socket) = crate::netlink::of(file) {
+        socket.take_error()
+    } else {
+        file.as_any()?.downcast_ref::<SocketPairEnd>()?.take_error()
+    }
+}
+/// Makes `error` the pending error of the socket `file`, as `recvmmsg`
+/// keeps an error that came after some messages.
+fn store_pending_error(file: &Arc<dyn FileHandle>, error: Errno) {
+    if let Some(socket) = crate::inet::of(file) {
+        socket.store_error(error);
+    } else if let Some(socket) = crate::netlink::of(file) {
+        socket.store_error(error);
+    } else if let Some(socket) = file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<SocketPairEnd>())
+    {
+        socket.store_error(error);
+    }
+}
 /// EBADF for no descriptor, ENOTSOCK for a file that is no socket, as
 /// `sockfd_lookup_light`.
 fn socket_of(c: &Context<'_>, fd: u64) -> Result<(), Errno> {
@@ -813,8 +838,11 @@ fn send_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// first only. The timeout is looked at only after each message, as on
 /// Linux, so the first is waited for without it; the time left is written
 /// back when a message came. It stops at an error, or after out-of-band
-/// data, and gives the error only when no message came. Unlike `sendmmsg`,
-/// it takes any `vlen`, as `do_recvmmsg` caps none.
+/// data, and gives the error only when no message came. One that came after
+/// a message, other than `EAGAIN`, becomes the socket's pending error,
+/// which the next call (that does not ask for `MSG_ERRQUEUE`) gives before
+/// any message, and `SO_ERROR` too. Unlike `sendmmsg`, it takes any `vlen`,
+/// as `do_recvmmsg` caps none.
 fn receive_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let mut flags = a[3] & 0xffff_ffff;
     if flags & MSG_CMSG_COMPAT != 0 {
@@ -832,6 +860,12 @@ fn receive_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     };
     let count = a[2] & 0xffff_ffff;
     socket_of(c, a[0])?;
+    let file = c.files.descriptor(a[0])?.file;
+    if flags & MSG_ERRQUEUE == 0
+        && let Some(error) = take_pending_error(&file)
+    {
+        return Err(error);
+    }
     let mut received = 0;
     let mut error = None;
     let mut left = None;
@@ -869,10 +903,19 @@ fn receive_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             break;
         }
     }
-    if let Some(e) = error
-        && received == 0
-    {
-        return Err(e);
+    match error {
+        Some(e) if received == 0 => return Err(e),
+        // Linux keeps the error as it is, so a wait that a signal would
+        // restart leaves `ERESTARTSYS` (512) there.
+        Some(e) if e != Errno::EAGAIN => {
+            let kept = if e == Errno(4) && c.process.restart.is_some() {
+                Errno(512)
+            } else {
+                e
+            };
+            store_pending_error(&file, kept);
+        }
+        _ => {}
     }
     if received != 0 {
         c.process.restart = None;
@@ -894,6 +937,7 @@ const MSG_PEEK: u64 = 0x2;
 const MSG_CTRUNC: u32 = 0x8;
 const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
+const MSG_ERRQUEUE: u64 = 0x2000;
 const MSG_WAITALL: u64 = 0x100;
 const MSG_NOSIGNAL: u64 = 0x4000;
 const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
@@ -3026,9 +3070,13 @@ impl SocketPairEnd {
         {
             let mut sides = self.lock_sides();
             let own = &mut sides[self.side];
-            // A datagram socket's error comes before its queue, as
-            // `__skb_try_recv_datagram` takes it.
-            if let Some(error) = own.error.take() {
+            // A datagram or packet socket's error comes before its queue,
+            // as `__skb_try_recv_datagram` takes it; a stream's only once
+            // nothing is queued (`unix_stream_read_generic`).
+            let queued = !own.bytes.is_empty() || !own.writes.is_empty();
+            if (self.pair.messages() || !queued)
+                && let Some(error) = own.error.take()
+            {
                 return Err(error);
             }
             if own.reset && own.bytes.is_empty() && own.writes.is_empty() {
@@ -4042,6 +4090,11 @@ impl SocketPairEnd {
     /// The pending error, which goes with this (`sock_error`).
     pub(crate) fn take_error(&self) -> Option<Errno> {
         self.lock_sides()[self.side].error.take()
+    }
+    /// Makes `error` this end's pending error without reporting it, as
+    /// `do_recvmmsg` writes `sk_err`: no wake, and no `POLL_ERR`.
+    pub(crate) fn store_error(&self, error: Errno) {
+        self.lock_sides()[self.side].error = Some(error);
     }
     /// Gives this end the pending `error`, as Linux's `sk_error_report`:
     /// `POLLERR`, and `POLL_ERR` with `O_ASYNC`.

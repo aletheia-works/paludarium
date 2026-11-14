@@ -398,7 +398,7 @@ impl Namespace {
 /// more than [`MAX_EXTENTS`].
 fn parse_map(text: &[u8]) -> Result<Vec<Extent>, Errno> {
     let mut extents: Vec<Extent> = Vec::new();
-    let text = text.strip_suffix(b"\n").unwrap_or(text);
+    let text = text.trim_suffix(b"\n");
     for line in text.split(|&b| b == b'\n') {
         let mut numbers = line
             .split(u8::is_ascii_whitespace)

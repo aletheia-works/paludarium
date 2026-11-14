@@ -307,22 +307,21 @@ fn windows_fs_symlink_hardlink() {
         );
         #[cfg(windows)]
         {
-            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            use cap_fs_ext::MetadataExt;
+            use std::os::windows::fs::OpenOptionsExt;
             // Read the link's own identity from a real handle, without
             // dereferencing its possibly dangling or out-of-root target.
-            let raw = std::fs::OpenOptions::new()
+            let link = std::fs::OpenOptions::new()
                 .access_mode(0x80)
                 .custom_flags(0x02200000)
                 .open(x.root.join("root").join(std::str::from_utf8(name).unwrap()))
-                .unwrap()
-                .metadata()
-                .unwrap()
-                .file_index();
+                .unwrap();
+            let raw = cap_std::fs::Metadata::from_file(&link).unwrap().ino();
             eprintln!(
                 "Windows symlink Windows file_index {}: {raw:?}",
                 String::from_utf8_lossy(name)
             );
-            assert_eq!(Some(inode), raw);
+            assert_eq!(inode, raw);
         }
     }
     assert_eq!(

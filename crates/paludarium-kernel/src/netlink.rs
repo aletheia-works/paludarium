@@ -82,6 +82,7 @@ const RTM_GETROUTE: u16 = 26;
 /// The groups (`RTNLGRP_*`) notifications go to, and how many there are
 /// (`RTNLGRP_MAX`).
 const RTNLGRP_LINK: u32 = 1;
+const RTNLGRP_NEIGH: u32 = 3;
 const RTNLGRP_IPV4_IFADDR: u32 = 5;
 const RTNLGRP_IPV4_ROUTE: u32 = 7;
 const RTNLGRP_IPV6_IFADDR: u32 = 9;
@@ -4110,6 +4111,8 @@ fn told(
                     route_origin,
                     ipv6_route_of(RTM_DELROUTE, &r, route_seq, route_port, 0, now),
                 ),
+                // `neigh_cleanup_and_release`, which names no request.
+                Event::DelNeighbour(n) => (RTNLGRP_NEIGH, 0, neighbour_message(&n, now)),
             };
             Notice {
                 group,
@@ -4118,6 +4121,38 @@ fn told(
             }
         })
         .collect()
+}
+/// The `RTM_DELNEIGH` of a neighbour of the loopback gone at `now`, as
+/// `__neigh_fill_info` makes it: an `ndmsg` for `lo`, `NUD_NOARP`, then its
+/// key, its link-layer address (`lo`'s six zero bytes), its probes (none)
+/// and `struct nda_cacheinfo`: the hundredths of a second since it was
+/// confirmed (made two base reachable times, 60 seconds, before it was,
+/// `neigh_alloc`), used and updated, and the references left (none).
+fn neighbour_message(n: &crate::interface::Neighbour, now: u64) -> Vec<u8> {
+    const RTM_DELNEIGH: u16 = 29;
+    const NUD_NOARP: u16 = 0x40;
+    const NDA_DST: u16 = 1;
+    const NDA_LLADDR: u16 = 2;
+    const NDA_CACHEINFO: u16 = 3;
+    const NDA_PROBES: u16 = 4;
+    let family = if n.ip.is_ipv6() { AF_INET6 } else { AF_INET };
+    let mut body = vec![family, 0, 0, 0];
+    body.extend_from_slice(&1i32.to_le_bytes());
+    body.extend_from_slice(&NUD_NOARP.to_le_bytes());
+    body.extend_from_slice(&[0, n.kind]);
+    match n.ip {
+        core::net::IpAddr::V4(ip) => attribute(&mut body, NDA_DST, &ip.octets()),
+        core::net::IpAddr::V6(ip) => attribute(&mut body, NDA_DST, &ip.octets()),
+    }
+    attribute(&mut body, NDA_LLADDR, &[0; 6]);
+    attribute(&mut body, NDA_PROBES, &0u32.to_le_bytes());
+    let since = u32::try_from(now.saturating_sub(n.made) / 10_000_000).unwrap_or(u32::MAX);
+    let mut info = Vec::with_capacity(16);
+    for value in [since.saturating_add(6000), since, since, 0] {
+        info.extend_from_slice(&value.to_le_bytes());
+    }
+    attribute(&mut body, NDA_CACHEINFO, &info);
+    message(RTM_DELNEIGH, 0, 0, 0, &body)
 }
 /// Brings `network`'s loopback up or down: `None` when it already is, else
 /// the notifications of it, `lo`'s `RTM_NEWLINK` with `IFF_UP` changed

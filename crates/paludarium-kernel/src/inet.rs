@@ -367,6 +367,11 @@ impl Network {
             to => Ok(to),
         }
     }
+    /// A packet goes out through the loopback to `to` at the host's
+    /// monotonic `now` ([`crate::interface::Addresses::output`]).
+    fn output(&self, to: IpAddr, now: Option<u64>) {
+        self.addresses().output(plain(to), now.unwrap_or(0));
+    }
     /// The loopback's addresses.
     pub(crate) fn addresses(&self) -> MutexGuard<'_, crate::interface::Addresses> {
         self.addresses
@@ -1303,6 +1308,11 @@ impl InetSocket {
                     let to = self
                         .network
                         .route(SocketAddr::new(plain(address.ip()), address.port()))?;
+                    // The handshake's first segment goes out through the
+                    // loopback, whatever answers it.
+                    if let Some(to) = to {
+                        self.network.output(to.ip(), self.now());
+                    }
                     let opened = match to {
                         Some(to) => self.open_loopback(&mut s, to, &options)?,
                         None => None,
@@ -1320,9 +1330,15 @@ impl InetSocket {
                                 stream.set_waker(stream_waker(&self.signals, &self.hub, &stream));
                                 stream.set_clock(realtime(&self.host));
                                 stream
-                            } else if to.is_some() {
+                            } else if let Some(to) = to {
                                 // Nothing listens there on the guest's own
-                                // loopback, which answers with a reset.
+                                // loopback, which answers with a reset, back
+                                // to the address the connection leaves from.
+                                let from = match s.bound.map(|b| b.ip()).or(s.address) {
+                                    Some(ip) if !ip.is_unspecified() => ip,
+                                    _ => self.network.source(to),
+                                };
+                                self.network.output(from, self.now());
                                 return self.refused(&mut s, address);
                             } else {
                                 return Err(ENETUNREACH);
@@ -1589,6 +1605,8 @@ impl InetSocket {
             let from = self.datagram_source(&mut s, dest, &options)?;
             let to_peer = s.peer == Some(dest);
             drop(s);
+            let now = self.now();
+            self.network.output(dest.ip(), now);
             let receiver = self.ports().receiver(dest, from);
             if let Some(receiver) = receiver {
                 receiver.deliver(from, bytes);
@@ -1597,8 +1615,9 @@ impl InetSocket {
             // A nested namespace has no stub.
             if dest.port() != DNS || self.network.isolated {
                 // The loopback answers with ICMP's port unreachable, which
-                // only a socket connected there learns of
-                // (`__udp4_lib_err`).
+                // goes back out through it, and which only a socket
+                // connected there learns of (`__udp4_lib_err`).
+                self.network.output(from.ip(), now);
                 if to_peer {
                     self.lock().error = Some(ECONNREFUSED);
                     self.signals.send(Reason::Error);
@@ -2130,6 +2149,8 @@ impl InetSocket {
         self.ports().attach(&self.this, (&link, 0));
         let arrived = listen.has_room();
         if arrived {
+            // The listener's answer goes back out through the loopback.
+            self.network.output(from.ip(), self.now());
             let notify = self.urgent_notify();
             let child = listener.child((theirs, locked), &stream, (&link, &notify), from, to);
             listen.ready.push_back(child);

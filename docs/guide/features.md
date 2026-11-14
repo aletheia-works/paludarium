@@ -1767,6 +1767,19 @@ kernel.
     tentative and then not. An unbound socket hears nothing; the requester
     of an IPv4 address's or a route's change has the notification before
     its acknowledgement, and with `NLM_F_ECHO` as its own copy.
+    `RTNLGRP_NEIGH` hears of the loopback's neighbours as they go: a UDP
+    datagram through `lo` (and ICMP's port unreachable back from a port
+    where nothing listens) and a TCP handshake's first segment (and its
+    answer back) make one for the next hop, silently, as
+    `___neigh_create` does, IPv4's one keyed by `0.0.0.0`
+    (`RTN_BROADCAST`), IPv6's one each (`RTN_LOCAL`), all `NUD_NOARP`;
+    each is told of with `RTM_DELNEIGH`, the newest first, when `lo` goes
+    down (IPv4's after `RTM_NEWLINK`, IPv6's after its routes and before
+    its addresses, as `fib_disable_ip` and `rt6_disable_ip` flush them) and
+    IPv4's when it loses its last IPv4 address. No netconf notification
+    (`RTNLGRP_IPV4_NETCONF`, `RTNLGRP_IPV6_NETCONF`) comes, as on Linux,
+    which sends one only as a device comes or goes or a forwarding sysctl
+    is written.
 - A generic netlink socket (protocol `NETLINK_GENERIC`) has its own ports,
   so it binds to the process's ID as a `NETLINK_ROUTE` socket does too,
   and its one family is the controller, `nlctrl` (family ID 16), as in a

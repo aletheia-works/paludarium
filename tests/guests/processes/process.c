@@ -2564,6 +2564,27 @@ static void addresses_connect(const char *text, const char *when) {
     close(client), close(listener);
     if (accepted >= 0) close(accepted);
 }
+/* A neighbour message's attribute, for monitor_show: its address, the
+   length of its link-layer address, its probes, and of its cacheinfo the
+   references alone, as its times are the clock's. */
+static void nl_neighbour_attribute(unsigned short type, const unsigned char *v, int len) {
+    char text[INET6_ADDRSTRLEN] = "";
+    unsigned value = 0;
+    if (len >= 4) memcpy(&value, v, 4);
+    switch (type) {
+    case 1:
+        inet_ntop(len == 4 ? AF_INET : AF_INET6, v, text, sizeof text);
+        printf(" dst=%s", len == 4 || len == 16 ? text : "?");
+        break;
+    case 2: printf(" lladdr:%d", len); break;
+    case 3:
+        if (len == 16) memcpy(&value, v + 12, 4);
+        printf(" cacheinfo:%d refcnt=%u", len, value);
+        break;
+    case 4: printf(" probes=%u", value); break;
+    default: printf(" %u:%d", type, len); break;
+    }
+}
 /* The monitor case: prints what the notifications `fd` has had are, until
    none has come for 700 ms, as Linux tells some of them a little later.
    `ctl` is the port of the socket that asked for the change. */
@@ -2597,6 +2618,14 @@ static void monitor_show(int fd, unsigned ctl, const char *label) {
                 printf(" route family=%u dst=%u table=%u protocol=%u scope=%u kind=%u attributes", body[0], body[1],
                        body[4], body[5], body[6], body[7]);
                 nl_attributes(body + 12, body_len - 12, nl_route_attribute);
+            } else if (h->type >= 28 && h->type <= 30 && body_len >= 12) {
+                int index;
+                unsigned short state;
+                memcpy(&index, body + 4, 4);
+                memcpy(&state, body + 8, 2);
+                printf(" neigh family=%u index=%d state=%#x flags=%#x type=%u attributes", body[0], index, state,
+                       body[10], body[11]);
+                nl_attributes(body + 12, body_len - 12, nl_neighbour_attribute);
             }
             printf("\n");
             at += (h->len + 3) & ~3;
@@ -14168,6 +14197,70 @@ int main(int argc, char **argv) {
             printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 1, 0, 0, "down oif lo");
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 0, 0, 0, "down");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "neighbours")) {
+        /* A child makes a network namespace with lo up, and sends through
+           it: each packet's next hop has a neighbour, IPv4's one keyed by
+           0.0.0.0 on a loopback, IPv6's one each, made silently. They go,
+           told of to RTNLGRP_NEIGH with RTM_DELNEIGH, when lo goes down,
+           and IPv4's when lo loses its last IPv4 address. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            /* The link, the neighbours, and IPv4's and IPv6's addresses
+               and routes. */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x555};
+            printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            monitor_show(mon, port, "up");
+            const unsigned short add = 0x600;
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 128, 1, NULL, 0, 0x02, "first6");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::2", 128, 1, NULL, 0, 0x02, "second6");
+            monitor_show(mon, port, "addresses");
+            /* From ::1 to the first address, where nothing listens: its
+               neighbour, then ::1's, which ICMPv6's port unreachable goes
+               back to. Then TCP to the second, whose reset goes back to it,
+               its source. Then IPv4. */
+            int u6 = socket(AF_INET6, SOCK_DGRAM, 0);
+            struct sockaddr_in6 from6 = {.sin6_family = AF_INET6}, to6 = {.sin6_family = AF_INET6, .sin6_port = htons(9)};
+            inet_pton(AF_INET6, "::1", &from6.sin6_addr);
+            printf("bind6=%ld\n", netns_result(bind(u6, (void *)&from6, sizeof from6)));
+            inet_pton(AF_INET6, "2001:db8:5::1", &to6.sin6_addr);
+            printf("send6=%ld\n", netns_result(sendto(u6, "x", 1, 0, (void *)&to6, sizeof to6)));
+            int t6 = socket(AF_INET6, SOCK_STREAM, 0);
+            inet_pton(AF_INET6, "2001:db8:5::2", &to6.sin6_addr);
+            printf("connect6=%ld\n", netns_result(connect(t6, (void *)&to6, sizeof to6)));
+            int u4 = socket(AF_INET, SOCK_DGRAM, 0);
+            struct sockaddr_in to4 = {.sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(0x7f000001)};
+            printf("send4=%ld\n", netns_result(sendto(u4, "x", 1, 0, (void *)&to4, sizeof to4)));
+            to4.sin_addr.s_addr = htonl(0x7f000002);
+            printf("send4 other=%ld\n", netns_result(sendto(u4, "x", 1, 0, (void *)&to4, sizeof to4)));
+            monitor_show(mon, port, "traffic");
+            link.flags = 0;
+            printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            monitor_show(mon, port, "down");
+            link.flags = IFF_UP;
+            printf("up again=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            monitor_show(mon, port, "up again");
+            to4.sin_addr.s_addr = htonl(0x7f000001);
+            printf("send4 again=%ld\n", netns_result(sendto(u4, "x", 1, 0, (void *)&to4, sizeof to4)));
+            monitor_show(mon, port, "traffic again");
+            nl_addr(ctl, port, 21, 0, AF_INET, "127.0.0.1", 8, 254, 1, "last4");
+            monitor_show(mon, port, "last4");
+            printf("send4 after=%ld\n", netns_result(sendto(u4, "x", 1, 0, (void *)&to4, sizeof to4)));
             fflush(stdout);
             _exit(0);
         }

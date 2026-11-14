@@ -541,11 +541,16 @@ verified.
   reference, where Linux counts the other users of the cached route too.
   `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the
   cached route, so that later lookups through it are marked too.
-  Notifications go out for the link, its IPv6 information, addresses and
-  routes alone, not for neighbours, netconf or the other groups, nor to a
-  socket in another namespace (`NETLINK_LISTEN_ALL_NSID` is not
-  supported); IPv4's routes through `lo` go without one when it goes down,
-  as on Linux.
+  Notifications go out for the link, its IPv6 information, addresses,
+  routes and neighbours alone, not for the other groups, nor to a socket
+  in another namespace (`NETLINK_LISTEN_ALL_NSID` is not supported);
+  IPv4's routes through `lo` go without one when it goes down, as on
+  Linux. A neighbour is made by UDP and TCP's handshakes alone, which are
+  the only packets paludarium sends through `lo` (a TCP handshake retried
+  into a full backlog makes none of its answer), and never times out
+  (`gc_thresh1` is never reached); neighbours are not dumped
+  (`RTM_GETNEIGH` is `EOPNOTSUPP`), and their cache information counts
+  from when each was made.
   `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
   listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries

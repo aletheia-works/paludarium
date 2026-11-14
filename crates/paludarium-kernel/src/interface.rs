@@ -25,6 +25,10 @@ use core::cmp::{Ordering, Reverse};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use paludarium_types::Errno;
 
+/// The `RTN_*` types of the loopback's neighbours.
+const RTN_LOCAL: u8 = 2;
+const RTN_BROADCAST: u8 = 3;
+const RTN_MULTICAST: u8 = 5;
 const ESRCH: Errno = Errno(3);
 const EADDRNOTAVAIL: Errno = Errno(99);
 const ENETDOWN: Errno = Errno(100);
@@ -529,6 +533,23 @@ pub(crate) enum Event {
     DelAddr6(V6),
     NewRoute6(Route6, u16),
     DelRoute6(Route6),
+    DelNeighbour(Neighbour),
+}
+/// A neighbour of the loopback, as `___neigh_create` makes one for the
+/// next hop of a packet out through it. On a loopback each is `NUD_NOARP`
+/// with the device's address, all zeros: IPv4's one entry is keyed by
+/// `0.0.0.0` (`arp_constructor` keys a loopback's so), of type
+/// `RTN_BROADCAST` (`inet_addr_type` of it); IPv6's are keyed by each next
+/// hop, of type `RTN_LOCAL`, or `RTN_MULTICAST` for a multicast one
+/// (`ndisc_constructor`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Neighbour {
+    pub ip: IpAddr,
+    /// The `RTN_*` type.
+    pub kind: u8,
+    /// When it was made, which is when it was last used and updated too,
+    /// as a loopback's output (`neigh_connected_output`) changes neither.
+    pub made: u64,
 }
 
 /// An IPv4 route a request adds, as `rtm_to_fib_config` reads it.
@@ -615,6 +636,8 @@ pub(crate) struct Addresses {
     /// the head of the namespace's list: the local route of each of the
     /// loopback's addresses, and those added through gateways.
     pub mctp_routes: Vec<MctpRoute>,
+    /// The loopback's neighbours, the oldest first.
+    neighbours: Vec<Neighbour>,
 }
 /// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
 /// network, either local through the loopback or through a gateway.
@@ -655,7 +678,36 @@ impl Addresses {
             tables6: vec![TABLE_MAIN, TABLE_LOCAL],
             mctp: Vec::new(),
             mctp_routes: Vec::new(),
+            neighbours: Vec::new(),
         }
+    }
+    /// A packet goes out through the loopback to `next` at `now`, as
+    /// `ip_finish_output2` and `ip6_finish_output2` look its next hop's
+    /// neighbour up, or make it, silently.
+    pub(crate) fn output(&mut self, next: IpAddr, now: u64) {
+        let (ip, kind) = match next {
+            IpAddr::V4(_) => (IpAddr::V4(Ipv4Addr::UNSPECIFIED), RTN_BROADCAST),
+            IpAddr::V6(ip) if ip.is_multicast() => (next, RTN_MULTICAST),
+            IpAddr::V6(_) => (next, RTN_LOCAL),
+        };
+        if !self.neighbours.iter().any(|n| n.ip == ip) {
+            self.neighbours.push(Neighbour {
+                ip,
+                kind,
+                made: now,
+            });
+        }
+    }
+    /// The neighbours of one family flushed (`neigh_flush_dev`), told of
+    /// with `RTM_DELNEIGH`, the newest first, as each was put at the head
+    /// of the device's list.
+    fn flush(&mut self, v6: bool, events: &mut Vec<Event>) {
+        let (gone, kept) = self
+            .neighbours
+            .drain(..)
+            .partition::<Vec<_>, _>(|n| n.ip.is_ipv6() == v6);
+        self.neighbours = kept;
+        events.extend(gone.into_iter().rev().map(Event::DelNeighbour));
     }
     /// The loopback comes up (`NETDEV_UP`) at `now`, and what Linux tells
     /// of it, in its order: `127.0.0.1/8` if it has it not, with its routes
@@ -702,8 +754,14 @@ impl Addresses {
     pub(crate) fn down(&mut self) -> Vec<Event> {
         self.routes4
             .retain(|r| !(r.device && r.scope != SCOPE_HOST));
-        let mut events: Vec<Event> = self.dump6().into_iter().map(Event::DelRoute6).collect();
+        // `fib_disable_ip` flushes IPv4's neighbours (`arp_ifdown`); then
+        // `addrconf_ifdown` takes IPv6's routes, its neighbours
+        // (`rt6_disable_ip`) and its addresses.
+        let mut events = Vec::new();
+        self.flush(false, &mut events);
+        events.extend(self.dump6().into_iter().map(Event::DelRoute6));
         self.routes6.clear();
+        self.flush(true, &mut events);
         events.extend(self.v6.drain(..).map(Event::DelAddr6));
         events
     }
@@ -879,8 +937,11 @@ impl Addresses {
                     self.kernel_del4(&route, &mut events);
                 }
             }
+            // The last address gone, `fib_disable_ip` takes every route
+            // through the loopback, and its neighbours (`arp_ifdown`).
             if self.v4.is_empty() {
                 self.routes4.retain(|r| !r.device);
+                self.flush(false, &mut events);
             }
         }
         events
@@ -1894,6 +1955,7 @@ mod tests {
                 Event::DelAddr6(a) => format!("-addr {}/{}", a.address, a.prefix),
                 Event::NewRoute6(r, flags) => format!("+route {} {flags:#x}", short6(r)),
                 Event::DelRoute6(r) => format!("-route {}", short6(r)),
+                Event::DelNeighbour(n) => format!("-neigh {}", n.ip),
             })
             .collect()
     }
@@ -2509,6 +2571,58 @@ mod tests {
                 "-route 255 2001:db8:5::2/128 Local 0",
                 "-route 254 2001:db8:5::/64 Unicast 256",
             ]
+        );
+    }
+
+    #[test]
+    fn neighbours_go_with_the_loopback_and_its_last_ipv4_address() {
+        let mut a = Addresses::first();
+        let one = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let other = IpAddr::V6("2001:db8::1".parse().unwrap());
+        a.output(other, 5);
+        a.output(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 6);
+        a.output(one, 7);
+        // IPv4's one entry, however many addresses it went to.
+        a.output(IpAddr::V4(Ipv4Addr::LOCALHOST), 8);
+        a.output(other, 9);
+        let gone = |events: &[Event]| -> Vec<(IpAddr, u8, u64)> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::DelNeighbour(n) => Some((n.ip, n.kind, n.made)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let down = a.down();
+        let zero = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            gone(&down),
+            vec![
+                (zero, RTN_BROADCAST, 6),
+                (one, RTN_LOCAL, 7),
+                (other, RTN_LOCAL, 5)
+            ]
+        );
+        // IPv4's first, then IPv6's routes, its neighbours, its addresses.
+        assert!(matches!(down[0], Event::DelNeighbour(_)));
+        let first6 = down
+            .iter()
+            .position(|e| matches!(e, Event::DelNeighbour(n) if n.ip == one));
+        let route = down.iter().rposition(|e| matches!(e, Event::DelRoute6(_)));
+        let address = down.iter().position(|e| matches!(e, Event::DelAddr6(_)));
+        assert!(route < first6 && first6 < address);
+        assert!(gone(&a.down()).is_empty());
+        let _ = a.up(10);
+        a.output(IpAddr::V4(Ipv4Addr::LOCALHOST), 11);
+        a.output(IpAddr::V6("ff02::1".parse().unwrap()), 12);
+        let last = a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();
+        assert_eq!(gone(&last), vec![(zero, RTN_BROADCAST, 11)]);
+        assert!(matches!(last.last(), Some(Event::DelNeighbour(_))));
+        // A multicast one is of its own type, and stays.
+        assert_eq!(
+            gone(&a.down()),
+            vec![(IpAddr::V6("ff02::1".parse().unwrap()), RTN_MULTICAST, 12)]
         );
     }
 

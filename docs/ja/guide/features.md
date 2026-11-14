@@ -1533,7 +1533,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     リクエストのものはリクエストのシーケンス番号とポートを持ち、IPv6 のアドレスは足したときに
     仮のものと仮でないものの 2 度伝えます。bind していないソケットには何も届きません。
     IPv4 のアドレスか経路の変化を求めたソケットには確認応答の前に届き、`NLM_F_ECHO` を
-    付ければ自分の写しとして届きます。
+    付ければ自分の写しとして届きます。`RTNLGRP_NEIGH` には、ループバックの近隣が消えるときに
+    伝えます。`lo` を通る UDP のデータグラム（待つものがないポートからは ICMP の port
+    unreachable が戻ります）と、TCP のハンドシェイクの最初のセグメント（とその答え）は、
+    `___neigh_create` と同じく、次のホップの近隣を黙って作ります。IPv4 は `0.0.0.0` を
+    キーにする 1 つ（`RTN_BROADCAST`）、IPv6 は 1 つずつ（`RTN_LOCAL`）で、どれも
+    `NUD_NOARP` です。`lo` を落とすと、新しいものから順に `RTM_DELNEIGH` で伝えます
+    （`fib_disable_ip` と `rt6_disable_ip` が消すのと同じく、IPv4 のものは `RTM_NEWLINK`
+    のあと、IPv6 のものはその経路のあとでアドレスの前）。IPv4 のものは、最後の IPv4 の
+    アドレスがなくなったときにも伝えます。netconf の通知（`RTNLGRP_IPV4_NETCONF`、
+    `RTNLGRP_IPV6_NETCONF`）は来ません。Linux も、デバイスが増えるか消えるとき、または
+    転送の sysctl に書いたときにしか送りません。
 - 汎用 netlink のソケット（プロトコル `NETLINK_GENERIC`）は自分のポートを持つので、
   `NETLINK_ROUTE` のソケットもプロセスの ID に bind していても、同じくプロセスの ID に
   bind します。ファミリーは、ほかを入れずに作ったカーネルと同じく、コントローラの `nlctrl`

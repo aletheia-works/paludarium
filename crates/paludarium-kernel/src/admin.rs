@@ -251,6 +251,8 @@ pub(crate) fn sys_kexec_file_load(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if flags & 1 != 0 {
             return Ok(0);
         }
+        // Linux's `KEXEC_FILE_SIZE_MAX`, `min(4 GiB, SSIZE_MAX)`: not
+        // `finit_module`'s `INT_MAX`.
         let kernel = read_file(c, a[0], 4 << 30)?;
         let u16_at = |at: usize| u16::from_le_bytes([kernel[at], kernel[at + 1]]);
         let bzimage = kernel.len() >= 1024

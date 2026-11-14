@@ -6742,6 +6742,71 @@ mod madvise_advice {
         assert_eq!(f.ret(28, &[ring, PAGE, 102]), errno(Errno::EINVAL));
         assert_eq!(f.ret(28, &[ring, PAGE, 103]), errno(Errno::EINVAL));
     }
+    #[test]
+    fn locked_memory_is_counted_and_refused_what_linux_refuses() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        let at = f.ret(mmap, &[0, 4 * PAGE, 3, 0x22, u64::MAX, 0]);
+        // A lock splits the VMA off.
+        assert_eq!(f.ret(149, &[at + PAGE, PAGE]), 0);
+        let locked = f.mem.first_locked(GuestAddr(at), at + 4 * PAGE).unwrap();
+        assert_eq!((locked.start.0, locked.length), (at + PAGE, PAGE));
+        assert_eq!(f.mem.locked_pages(), 1);
+        // Advice that drops or ages pages stops at it; what came before took
+        // it. MADV_DONTNEED_LOCKED takes it.
+        f.mem.write(GuestAddr(at), b"x").unwrap();
+        assert_eq!(f.ret(28, &[at, 4 * PAGE, 4]), errno(Errno::EINVAL));
+        assert_eq!(memory_bytes(&f, at, 1), b"\0");
+        for advice in [8, 9, 20, 21, 102] {
+            assert_eq!(
+                f.ret(28, &[at, 4 * PAGE, advice]),
+                errno(Errno::EINVAL),
+                "{advice}"
+            );
+        }
+        assert_eq!(f.ret(28, &[at + PAGE, PAGE, 24]), 0);
+        // MADV_GUARD_INSTALL put a guard on the page before the locked one.
+        assert_eq!(f.ret(28, &[at, PAGE, 103]), 0);
+        // MS_INVALIDATE of locked memory is EBUSY.
+        assert_eq!(f.ret(26, &[at, 4 * PAGE, 2]), errno(Errno(16)));
+        assert_eq!(f.ret(150, &[at, 4 * PAGE]), 0);
+        assert_eq!(f.mem.locked_pages(), 0);
+        // Without CAP_IPC_LOCK, RLIMIT_MEMLOCK bounds what is locked.
+        f.mem.write_u64(GuestAddr(DATA), PAGE).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 8), u64::MAX).unwrap();
+        assert_eq!(f.ret(160, &[8, DATA]), 0);
+        let all = crate::credentials::ALL_CAPABILITIES;
+        f.thread.state.credentials = f
+            .thread
+            .state
+            .credentials
+            .capset(!(1 << 14) & all, all, 0)
+            .unwrap();
+        assert_eq!(f.ret(149, &[at, 2 * PAGE]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(149, &[at, PAGE]), 0);
+        // What is locked already does not count again.
+        assert_eq!(f.ret(149, &[at, PAGE]), 0);
+        assert_eq!(
+            f.ret(mmap, &[0, PAGE, 3, 0x2022, u64::MAX, 0]),
+            errno(Errno::EAGAIN)
+        );
+        assert_eq!(f.ret(151, &[1]), errno(Errno::ENOMEM));
+        // MCL_FUTURE locks what comes next, and needs room for it too.
+        assert_eq!(f.ret(151, &[2]), 0);
+        assert_eq!(
+            f.ret(mmap, &[0, PAGE, 3, 0x22, u64::MAX, 0]),
+            errno(Errno::EAGAIN)
+        );
+        assert_eq!(f.ret(152, &[]), 0);
+        assert_eq!(f.mem.locked_pages(), 0);
+        let new = f.ret(mmap, &[0, PAGE, 3, 0x22, u64::MAX, 0]);
+        assert!(new < u64::MAX - 4095, "{new:#x}");
+        // No RLIMIT_MEMLOCK at all is EPERM.
+        f.mem.write_u64(GuestAddr(DATA), 0).unwrap();
+        assert_eq!(f.ret(160, &[8, DATA]), 0);
+        assert_eq!(f.ret(149, &[at, PAGE]), errno(Errno::EPERM));
+        assert_eq!(f.ret(151, &[1]), errno(Errno::EPERM));
+    }
     fn status(f: &mut Fixture, at: u64) -> i32 {
         f.mem.write_u64(GuestAddr(DATA + 0x200), at).unwrap();
         assert_eq!(f.ret(279, &[0, 1, DATA + 0x200, 0, DATA + 0x300, 0]), 0);

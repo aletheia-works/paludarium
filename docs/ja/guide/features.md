@@ -701,10 +701,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   読み込み専用で開いたものは、呼び出し元がファイルの所有者か書き込めることが必要で
   （`EPERM`）、そのあとで未知のフラグが `EINVAL` です。
 - `mlock`、`mlock2`、`munlock` は、Linux と同じように範囲を確かめます。長さはページ単位に
-  切り上げ、アドレスの終わりを越える範囲は `EINVAL`、マップされていないページを含む範囲は
-  `ENOMEM` です。`mlock` と、`MLOCK_ONFAULT` なしの `mlock2` は、`PROT_NONE` のページでも
-  `ENOMEM` を返します。`mlock2` と `mlockall` の未知のフラグは `EINVAL` です。スワップアウト
-  は起きないので、ほかに何もしなくてもメモリはそのまま残ります。
+  切り上げ、アドレスの終わりを越える範囲は `EINVAL`、マップされていないページを含む範囲は、
+  その前の VMA に新しい状態を付けてから `ENOMEM` です。ロック（`VM_LOCKED`、
+  `MLOCK_ONFAULT` なら `VM_LOCKONFAULT` も）した部分は、`/proc/<pid>/maps` に見えるとおり
+  別の VMA になります。ロックには 0 より大きい `RLIMIT_MEMLOCK`（`EPERM`）と、まだ
+  ロックしていないページの分の空き（`ENOMEM`）が要ります。`CAP_IPC_LOCK` があれば
+  要りません。`mlock` と、`MLOCK_ONFAULT` なしの `mlock2` は、そのあとページを
+  割り当て、割り当てられないページ（`PROT_NONE`、ガードページ、ファイルの終わりより
+  先）があれば `ENOMEM` を返します。`mlockall` は `MCL_CURRENT` ですべてのマッピングを
+  （マップしているもの全部が収まらなければ `ENOMEM`）、`MCL_FUTURE` で新しいマッピングを
+  ロックします。そのあとの `mmap`、`brk`、広がる `mremap` には、`MAP_LOCKED` と同じく
+  空きが要ります（`EAGAIN`。`brk` は区切りを変えません）。`munlockall` はどちらも
+  外します。ロックした VMA は、`MADV_DONTNEED`、`MADV_FREE`、`MADV_COLD`、
+  `MADV_PAGEOUT`、`MADV_REMOVE`、`MADV_GUARD_INSTALL` を断り（`EINVAL`。前の VMA は
+  指定を受けたあとです）、`MS_INVALIDATE` の `msync` も断ります（`EBUSY`）。
+  `MADV_DONTNEED_LOCKED` は受け付けます。`fork` の子と、`MREMAP_DONTUNMAP` が残す元の
+  範囲はロックされず、AIO と `io_uring` のリングもロックされません。`mlock2` と
+  `mlockall` の未知のフラグは `EINVAL` です。スワップアウトは起きないので、ほかに
+  何もしなくてもメモリはそのまま残ります。
 - `madvise`：`MADV_DONTNEED` を受けたプライベートなページは空になります。無名の
   ページはそのあと 0 として読め、ファイルのマッピングのページは、Linux がファイルから
   読み込み直すのと同じく、そのときのファイルの中身を読みます。`mremap` で動かしたあとも、`fork` した子でも同じです。プログラム自身の

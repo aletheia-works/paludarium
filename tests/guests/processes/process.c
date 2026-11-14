@@ -6287,6 +6287,74 @@ static int mrelease_case(void) {
     printf("reaped=%ld\n", reaped);
     return 0;
 }
+/* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
+ * VM_LOCKONFAULT: VMAs of their own, advice that drops or ages pages
+ * refused (EINVAL), MS_INVALIDATE refused (EBUSY), and no lock in a forked
+ * child, the old range of MREMAP_DONTUNMAP, or after munlockall. Every
+ * lock here fits any RLIMIT_MEMLOCK a runner has. */
+static int lock_state_case(void) {
+    long page = 4096;
+    char *area = mmap(NULL, 5 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 80;
+    munmap(area, page);
+    munmap(area + 4 * page, page);
+    char *p = area + page;
+    long locked = advice_errno(mlock(p + page, page));
+    long onfault = advice_errno(syscall(SYS_mlock2, p + 2 * page, page, 1L));
+    printf("mlock=%ld onfault=%ld vmas=%d\n", locked, onfault, advice_vmas(p, p + 3 * page));
+    p[0] = 'a';
+    const long advices[] = {MADV_DONTNEED, MADV_FREE, 20, 21, 102};
+    const char *names[] = {"dontneed", "free", "cold", "pageout", "guard"};
+    for (int i = 0; i < 5; i++)
+        printf("%s=%ld ", names[i], advice_errno(madvise(p + page, page, advices[i])));
+    printf("dontneed-locked=%ld\n", advice_errno(madvise(p + page, page, 24)));
+    /* What comes before the locked VMA takes the advice. */
+    long before = advice_errno(madvise(p, 2 * page, MADV_DONTNEED));
+    printf("before=%ld byte=%d\n", before, p[0]);
+    printf("invalidate=%ld async=%ld\n", advice_errno(msync(p, 3 * page, MS_INVALIDATE)),
+           advice_errno(msync(p, 3 * page, MS_ASYNC)));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 81;
+    if (child == 0) {
+        printf("child dontneed=%ld\n", advice_errno(madvise(p + page, page, MADV_DONTNEED)));
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 82;
+    long unlocked = advice_errno(munlock(p, 3 * page));
+    printf("munlock=%ld vmas=%d dontneed=%ld\n", unlocked, advice_vmas(p, p + 3 * page),
+           advice_errno(madvise(p + page, page, MADV_DONTNEED)));
+    /* MREMAP_DONTUNMAP moves the lock with the pages. */
+    char *m = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
+    if (m == MAP_FAILED) return 83;
+    printf("map-locked dontneed=%ld\n", advice_errno(madvise(m, page, MADV_DONTNEED)));
+    char *moved = mremap(m, page, page, MREMAP_MAYMOVE | 4, NULL);
+    if (moved == MAP_FAILED) return 84;
+    printf("dontunmap old=%ld new=%ld\n", advice_errno(madvise(m, page, MADV_DONTNEED)),
+           advice_errno(madvise(moved, page, MADV_DONTNEED)));
+    /* MCL_FUTURE locks what is mapped next, until munlockall. */
+    long future = advice_errno(mlockall(MCL_FUTURE));
+    char *next = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (next == MAP_FAILED) return 85;
+    long next_advice = advice_errno(madvise(next, page, MADV_DONTNEED));
+    long all = advice_errno(munlockall());
+    printf("future=%ld next=%ld munlockall=%ld moved=%ld next=%ld\n", future, next_advice, all,
+           advice_errno(madvise(moved, page, MADV_DONTNEED)),
+           advice_errno(madvise(next, page, MADV_DONTNEED)));
+    /* A page past the end of its file cannot be brought in. */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-lock-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || ftruncate(fd, page)) return 86;
+    char *file = mmap(NULL, 2 * page, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file == MAP_FAILED) return 87;
+    printf("past-end=%ld within=%ld\n", advice_errno(mlock(file, 2 * page)),
+           advice_errno(mlock(file, page)));
+    munlock(file, 2 * page);
+    return 0;
+}
 /* MADV_REMOVE frees shared memory, as a hole punched in its file: shared
  * anonymous memory, a System V segment and a shared file mapping read as
  * zeros there again; private memory and read-only sharing are refused. */
@@ -21473,6 +21541,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
+    if (!strcmp(mode, "lock-state")) return lock_state_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
     if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();

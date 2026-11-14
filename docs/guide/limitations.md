@@ -206,12 +206,10 @@ verified.
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
   - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, `MADV_HWPOISON` and
-    `MADV_SOFT_OFFLINE`, which Linux takes. `MADV_REMOVE` and
-    `MADV_GUARD_INSTALL` take the memory of a locked mapping too, where
-    Linux gives `EINVAL`, as no mapping here is locked apart.
-    `/proc/<pid>/smaps` shows no `VmFlags`, so not the `gu` flag of a VMA
-    that had guards, and `/proc/<pid>/pagemap` is not there to show a
-    guard page. `MADV_POPULATE_READ` and
+    `MADV_SOFT_OFFLINE`, which Linux takes. Neither `/proc/<pid>/smaps`,
+    whose `VmFlags` would show the `gu` of a VMA that had guards and the
+    `lo` of a locked one, nor `/proc/<pid>/pagemap`, which would show a
+    guard page, is there. `MADV_POPULATE_READ` and
     `MADV_POPULATE_WRITE` bring in the pages of a `memfd_secret` mapping,
     where Linux gives `EINVAL`.
   - `process_madvise` takes for the caller's own memory only the advice
@@ -314,12 +312,11 @@ verified.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
-  - Memory locks leave no state. So `RLIMIT_MEMLOCK` is not enforced on
-    them (only on `SHM_LOCK`), which matters only to a guest that gave up
-    `CAP_IPC_LOCK`, `MADV_DONTNEED`, `MADV_COLD` and `MADV_PAGEOUT` work on
-    locked memory where Linux gives `EINVAL`, `mlock` succeeds on the pages of a
-    file mapping past the end of the file where Linux gives `ENOMEM`, and
-    `/proc` shows no locked memory.
+  - `/proc/<pid>/status` shows no locked memory (`VmLck`). `mmap` with
+    `MAP_LOCKED` checks `can_do_mlock` (`EPERM`) and room under
+    `RLIMIT_MEMLOCK` (`EAGAIN`) before it looks at the file, where Linux
+    looks at the file first, and `mremap` checks the room for a locked VMA
+    that grows before its other checks of the new range.
   - A memory policy that `mbind` gives a shared mapping belongs to that
     mapping, where Linux keeps it with the shared memory itself, for every
     process that maps it. `/proc/<pid>/numa_maps` does not exist.

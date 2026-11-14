@@ -783,9 +783,24 @@ kernel.
   (`EPERM`) before an unknown flag is `EINVAL`.
 - `mlock`, `mlock2` and `munlock` check their range as Linux does: the length
   rounds up to pages, a range past the end of addresses is `EINVAL`, and one
-  with a page that is not mapped is `ENOMEM`. `mlock` and `mlock2` without
-  `MLOCK_ONFAULT` also give `ENOMEM` for a page with `PROT_NONE`. Unknown flags
-  of `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
+  with a page that is not mapped is `ENOMEM`, once the VMAs before it took
+  the new state. A lock (`VM_LOCKED`, with `MLOCK_ONFAULT` also
+  `VM_LOCKONFAULT`) makes VMAs of their own, as `/proc/<pid>/maps` shows.
+  It needs a `RLIMIT_MEMLOCK` above 0 (`EPERM`) and room under it for the
+  pages not locked yet (`ENOMEM`), unless the caller has `CAP_IPC_LOCK`.
+  `mlock` and `mlock2` without `MLOCK_ONFAULT` then bring the pages in, and
+  give `ENOMEM` for one that cannot be (`PROT_NONE`, a guard page, past the
+  end of its file). `mlockall` locks every mapping with `MCL_CURRENT`
+  (`ENOMEM` when all that is mapped does not fit) and every new one with
+  `MCL_FUTURE`, which `mmap`, `brk` and a growing `mremap` then need room
+  for (`EAGAIN`; `brk` keeps the break), as `MAP_LOCKED` does; `munlockall`
+  undoes both. A locked VMA refuses `MADV_DONTNEED`, `MADV_FREE`,
+  `MADV_COLD`, `MADV_PAGEOUT`, `MADV_REMOVE` and `MADV_GUARD_INSTALL`
+  (`EINVAL`, after the VMAs before it took the advice) and `msync` with
+  `MS_INVALIDATE` (`EBUSY`); `MADV_DONTNEED_LOCKED` takes it. A `fork`ed
+  child has no lock, nor does the old range `MREMAP_DONTUNMAP` leaves, and
+  the rings of AIO and `io_uring` are never locked. Unknown flags of
+  `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
   memory stays in place without more being done.
 - `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
   as zeros, and those of a file mapping read the file again, as it is then,

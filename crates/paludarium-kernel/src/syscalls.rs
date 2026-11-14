@@ -1905,6 +1905,21 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         let hint = GuestAddr(addr & !4095);
         Placement::Near((hint.0 != 0).then_some(hint))
     };
+    // A locked mapping, by MAP_LOCKED or `mlockall`'s MCL_FUTURE, needs
+    // `can_do_mlock` (EPERM, for MAP_LOCKED) and room under RLIMIT_MEMLOCK
+    // (`mlock_future_ok`, EAGAIN).
+    let future = c.mem.future_lock();
+    let lock = match (flags & MAP_LOCKED != 0, future) {
+        (true, Some(paludarium_mmu::Lock::OnFault)) => Some(paludarium_mmu::Lock::OnFault),
+        (true, _) => Some(paludarium_mmu::Lock::Populated),
+        (false, future) => future,
+    };
+    if flags & MAP_LOCKED != 0 && !can_do_mlock(c) {
+        return err(Errno::EPERM);
+    }
+    if lock.is_some() && !lock_fits(c, len.div_ceil(4096)) {
+        return err(Errno::EAGAIN);
+    }
     // What the mapping shows is made first, outside the address space's
     // lock, as it may read the file. The mapping and what it shows then go
     // in under one hold of the lock, so that no other thread sees the
@@ -1948,9 +1963,14 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     };
     match result {
         Ok(a) => {
+            if flags & MAP_LOCKED != 0 {
+                let end = a.0.saturating_add(len.next_multiple_of(4096));
+                let _ = c.mem.lock(a, end, lock);
+            }
             // Linux populates a writable private mapping by writing it, which
-            // gives it an anon_vma (a core then writes it whole).
-            if flags & (MAP_POPULATE | MAP_LOCKED) != 0
+            // gives it an anon_vma (a core then writes it whole), with
+            // MAP_POPULATE or a lock that is not on fault.
+            if (flags & MAP_POPULATE != 0 || lock == Some(paludarium_mmu::Lock::Populated))
                 && flags & MAP_SHARED == 0
                 && prot.contains(Prot::WRITE)
             {
@@ -2117,6 +2137,8 @@ const MADV_FREE: u64 = 8;
 const MADV_POPULATE_READ: u64 = 22;
 const MADV_POPULATE_WRITE: u64 = 23;
 const MADV_DONTNEED_LOCKED: u64 = 24;
+const MADV_COLD: u64 = 20;
+const MADV_PAGEOUT: u64 = 21;
 
 /// `mincore(addr, length, vec)`, as Linux's: each byte of `vec` says whether
 /// its page is in memory, up to the first page that is not mapped, which is
@@ -2170,7 +2192,42 @@ const MCL_ONFAULT: u32 = 4;
 /// `do_mlock` and `do_munlock` decide. Nothing is ever swapped out here, so
 /// that is all there is to do. `populate` is a lock that brings its pages in,
 /// which a page without access fails, as `__mm_populate` does.
-fn lock_range(c: &Context<'_>, addr: u64, len: u64, populate: bool) -> Outcome {
+const CAP_IPC_LOCK: u64 = 1 << 14;
+const RLIMIT_MEMLOCK: usize = 8;
+
+/// The caller's RLIMIT_MEMLOCK soft limit in pages, and whether it may
+/// lock past it (`CAP_IPC_LOCK`).
+fn lock_limit(c: &Context<'_>) -> (u64, bool) {
+    let limit = c.processes.soft_limit(c.process.pid, RLIMIT_MEMLOCK) >> 12;
+    (limit, c.process.credentials.capable(CAP_IPC_LOCK))
+}
+
+/// Whether the caller may lock memory at all (`can_do_mlock`): a
+/// RLIMIT_MEMLOCK above 0, or `CAP_IPC_LOCK`.
+fn can_do_mlock(c: &Context<'_>) -> bool {
+    c.processes.soft_limit(c.process.pid, RLIMIT_MEMLOCK) != 0
+        || c.process.credentials.capable(CAP_IPC_LOCK)
+}
+
+/// Whether `pages` more pages may be locked (`mlock_future_ok`): within
+/// RLIMIT_MEMLOCK with what is locked, or with `CAP_IPC_LOCK`.
+pub(crate) fn lock_fits(c: &Context<'_>, pages: u64) -> bool {
+    let (limit, capable) = lock_limit(c);
+    capable || pages.saturating_add(c.mem.locked_pages()) <= limit
+}
+
+/// `mlock`, `mlock2` and `munlock` of the pages `[addr, addr+len)`
+/// touches, as Linux's `do_mlock` and `apply_vma_lock_flags`: a lock needs
+/// `can_do_mlock` (`EPERM`) and room under RLIMIT_MEMLOCK for the pages
+/// not locked yet (`ENOMEM`), unless the caller has `CAP_IPC_LOCK`. The
+/// VMAs from `addr` take the new state up to a hole (`ENOMEM`). A lock that
+/// is not `MLOCK_ONFAULT` then brings each page in (`__mm_populate`), and a
+/// page that cannot be (no access, a guard page, past the end of its file)
+/// gives `ENOMEM`, the VMAs locked.
+fn lock_range(c: &Context<'_>, addr: u64, len: u64, lock: Option<paludarium_mmu::Lock>) -> Outcome {
+    if lock.is_some() && !can_do_mlock(c) {
+        return err(Errno::EPERM);
+    }
     // Rounded as Linux's PAGE_ALIGN is, so a huge length may wrap to none.
     let length = len.wrapping_add(addr & 4095).wrapping_add(4095) & !4095;
     let start = addr & !4095;
@@ -2180,38 +2237,50 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, populate: bool) -> Outcome {
     if length == 0 {
         return ok(0);
     }
-    let mut mappings: Vec<_> = c
-        .mem
-        .mappings()
-        .filter(|m| m.start.0 < end && m.end() > start)
-        .collect();
-    mappings.sort_by_key(|m| m.start.0);
-    let mut covered = start;
-    for m in &mappings {
-        if m.start.0 > covered || populate && m.prot == Prot::NONE {
+    if lock.is_some() {
+        let (limit, capable) = lock_limit(c);
+        let mut locked = (length >> 12).saturating_add(c.mem.locked_pages());
+        if locked > limit && !capable {
+            locked -= c.mem.locked_pages_in(GuestAddr(start), end);
+        }
+        if locked > limit && !capable {
             return err(Errno::ENOMEM);
         }
-        covered = m.end();
     }
-    if covered < end {
-        return err(Errno::ENOMEM);
+    if let Err(e) = c.mem.lock(GuestAddr(start), end, lock) {
+        return err(e);
     }
-    // Linux's `__mm_populate` fails to fault a guard page in (`EFAULT`),
-    // which `mlock` gives as `ENOMEM` (`__mlock_posix_error_return`).
-    if populate && c.mem.has_guards(GuestAddr(start), end) {
-        return err(Errno::ENOMEM);
+    if lock == Some(paludarium_mmu::Lock::Populated) {
+        let mut mappings: Vec<_> = c
+            .mem
+            .mappings()
+            .filter(|m| m.start.0 < end && m.end() > start)
+            .collect();
+        mappings.sort_by_key(|m| m.start.0);
+        for m in mappings {
+            if m.prot == Prot::NONE {
+                return err(Errno::ENOMEM);
+            }
+            let mut page = m.start.0.max(start);
+            while page < m.end().min(end) {
+                if c.mem.read_for_dump(GuestAddr(page), &mut [0]).is_err() {
+                    return err(Errno::ENOMEM);
+                }
+                page += 4096;
+            }
+        }
     }
     ok(0)
 }
 
 /// `mlock(addr, len)`.
 fn sys_mlock(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    lock_range(c, a[0], a[1], true)
+    lock_range(c, a[0], a[1], Some(paludarium_mmu::Lock::Populated))
 }
 
 /// `munlock(addr, len)`.
 fn sys_munlock(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    lock_range(c, a[0], a[1], false)
+    lock_range(c, a[0], a[1], None)
 }
 
 /// `mlock2(addr, len, flags)`: `MLOCK_ONFAULT` brings no page in.
@@ -2220,21 +2289,50 @@ fn sys_mlock2(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if flags & !MLOCK_ONFAULT != 0 {
         return err(Errno::EINVAL);
     }
-    lock_range(c, a[0], a[1], flags & MLOCK_ONFAULT == 0)
+    let lock = if flags & MLOCK_ONFAULT != 0 {
+        paludarium_mmu::Lock::OnFault
+    } else {
+        paludarium_mmu::Lock::Populated
+    };
+    lock_range(c, a[0], a[1], Some(lock))
 }
 
-/// `mlockall(flags)`: it covers what is mapped, so only the flags can be wrong.
-fn sys_mlockall(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+/// `mlockall(flags)`, as Linux's: the flags (`EINVAL`), `can_do_mlock`
+/// (`EPERM`), then with `MCL_CURRENT` room for every mapped page under
+/// RLIMIT_MEMLOCK (`ENOMEM`) unless the caller has `CAP_IPC_LOCK`. Every
+/// mapping is locked with `MCL_CURRENT`, and every new one with
+/// `MCL_FUTURE`; without `MCL_CURRENT` the mappings are left as they are.
+fn sys_mlockall(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let flags = a[0] as u32;
     if flags == 0 || flags == MCL_ONFAULT || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0
     {
         return err(Errno::EINVAL);
     }
+    if !can_do_mlock(c) {
+        return err(Errno::EPERM);
+    }
+    let lock = if flags & MCL_ONFAULT != 0 {
+        paludarium_mmu::Lock::OnFault
+    } else {
+        paludarium_mmu::Lock::Populated
+    };
+    if flags & MCL_CURRENT != 0 {
+        let (limit, capable) = lock_limit(c);
+        let total: u64 = c.mem.mappings().map(|m| m.length >> 12).sum();
+        if total > limit && !capable {
+            return err(Errno::ENOMEM);
+        }
+    }
+    c.mem.lock_all(
+        (flags & MCL_CURRENT != 0).then_some(Some(lock)),
+        (flags & MCL_FUTURE != 0).then_some(lock),
+    );
     ok(0)
 }
 
-/// `munlockall()`.
-fn sys_munlockall(_: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+/// `munlockall()`: no mapping stays locked, and new ones are not.
+fn sys_munlockall(c: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+    c.mem.lock_all(Some(None), None);
     ok(0)
 }
 
@@ -2294,18 +2392,30 @@ pub(crate) fn advise(
     if end > USER_ADDRESS_LIMIT {
         return Err(Errno::ENOMEM);
     }
-    if advice == MADV_DONTNEED || advice == MADV_DONTNEED_LOCKED {
+    if advice == MADV_DONTNEED_LOCKED {
         return mem.discard_shared(GuestAddr(addr), length);
     }
-    if advice == MADV_REMOVE {
-        let (removals, hole) = mem.removals(GuestAddr(addr), end);
-        for removal in removals {
-            remove(credentials, &removal?)?;
-        }
-        return if hole { Err(Errno::ENOMEM) } else { Ok(()) };
+    if advice == MADV_DONTNEED {
+        return short_of_locked(mem, addr, end, true, |to| {
+            mem.discard_shared(GuestAddr(addr), to - addr)
+        });
     }
-    if advice == MADV_GUARD_INSTALL || advice == MADV_GUARD_REMOVE {
-        return mem.guard(GuestAddr(addr), end, advice == MADV_GUARD_INSTALL);
+    if advice == MADV_REMOVE {
+        return short_of_locked(mem, addr, end, true, |to| {
+            let (removals, hole) = mem.removals(GuestAddr(addr), to);
+            for removal in removals {
+                remove(credentials, &removal?)?;
+            }
+            if hole { Err(Errno::ENOMEM) } else { Ok(()) }
+        });
+    }
+    if advice == MADV_GUARD_INSTALL {
+        return short_of_locked(mem, addr, end, true, |to| {
+            mem.guard(GuestAddr(addr), to, true)
+        });
+    }
+    if advice == MADV_GUARD_REMOVE {
+        return mem.guard(GuestAddr(addr), end, false);
     }
     let flag = match advice {
         10 => Some(paludarium_mmu::FlagAdvice::DontFork),
@@ -2325,8 +2435,19 @@ pub(crate) fn advise(
     if advice == MADV_FREE {
         // Linux frees such pages only under memory pressure, which the
         // emulator never has, so their contents stay as they are.
-        return mem.check_private_anonymous(GuestAddr(addr), length);
+        return short_of_locked(mem, addr, end, true, |to| {
+            mem.check_private_anonymous(GuestAddr(addr), to - addr)
+        });
     }
+    // MADV_COLD and MADV_PAGEOUT take no locked VMA (`can_madv_lru_vma`).
+    if advice == MADV_COLD || advice == MADV_PAGEOUT {
+        return short_of_locked(mem, addr, end, false, |to| covered(mem, addr, to));
+    }
+    covered(mem, addr, end)
+}
+
+/// Whether `[addr, end)` is mapped through (`ENOMEM` for a hole).
+fn covered(mem: &AddressSpace, addr: u64, end: u64) -> Result<(), Errno> {
     let mapped = mem.mappings().filter(|m| m.start.0 < end && m.end() > addr);
     let covered = mapped.fold(addr, |covered, m| {
         if m.start.0 <= covered {
@@ -2340,6 +2461,34 @@ pub(crate) fn advise(
     } else {
         Ok(())
     }
+}
+
+/// `op` over `[addr, end)` up to the first locked VMA, which refuses the
+/// advice as Linux's `madvise_walk_vmas` meets it: `EINVAL`, or first
+/// `EPERM` for advice that `discards` the pages of sealed memory
+/// (`can_madvise_modify`). An error before it stands, but not the `ENOMEM`
+/// of a hole, which Linux gives only once the walk is done.
+fn short_of_locked(
+    mem: &AddressSpace,
+    addr: u64,
+    end: u64,
+    discards: bool,
+    op: impl FnOnce(u64) -> Result<(), Errno>,
+) -> Result<(), Errno> {
+    let Some(locked) = mem.first_locked(GuestAddr(addr), end) else {
+        return op(end);
+    };
+    let at = locked.start.0.max(addr);
+    if at > addr {
+        match op(at) {
+            Ok(()) | Err(Errno::ENOMEM) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if discards && mem.refuses_discard_at(GuestAddr(at)) {
+        return Err(Errno::EPERM);
+    }
+    Err(Errno::EINVAL)
 }
 
 /// Frees what `MADV_REMOVE` found in a VMA, as Linux's `madvise_remove`
@@ -2529,6 +2678,19 @@ fn sys_mremap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         new_addr: GuestAddr(new_addr),
     };
     let keep_old = how.keep_old;
+    // A locked VMA that grows must fit under RLIMIT_MEMLOCK
+    // (`mlock_future_ok` in `remap_is_valid`'s resize, EAGAIN).
+    let align = |len: u64| len.wrapping_add(4095) & !4095;
+    let grows = align(new_len).saturating_sub(align(old_len));
+    if addr & 4095 == 0
+        && grows > 0
+        && c.mem
+            .first_locked(GuestAddr(addr), addr.saturating_add(1))
+            .is_some_and(|m| m.start.0 <= addr)
+        && !lock_fits(c, grows >> 12)
+    {
+        return err(Errno::EAGAIN);
+    }
     match c.mem.remap_shared(GuestAddr(addr), old_len, new_len, how) {
         Ok(at) => {
             c.group.numa().moved(addr, old_len, at.0, new_len, keep_old);
@@ -2558,6 +2720,14 @@ fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let len = len.wrapping_add(4095) & !4095;
     if len == 0 {
         return ok(0);
+    }
+    // MS_INVALIDATE of a locked VMA is EBUSY.
+    if flags & MS_INVALIDATE != 0
+        && c.mem
+            .first_locked(GuestAddr(addr), addr.saturating_add(len))
+            .is_some()
+    {
+        return err(Errno(16));
     }
     match c.mem.covers(GuestAddr(addr), len) {
         Ok(true) if flags & (MS_ASYNC | MS_SYNC) != 0 => match c.files.caches.write_back_all() {
@@ -2608,6 +2778,13 @@ fn sys_munmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 fn sys_brk(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // brk(0) and invalid requests return the current break.
     let old = c.mem.set_break_shared(GuestAddr(0)).0;
+    // Under `mlockall`'s MCL_FUTURE the heap it grows into is locked, and
+    // must fit under RLIMIT_MEMLOCK (`mlock_future_ok`).
+    let grows =
+        (a[0].saturating_add(4095) & !4095).saturating_sub(old.saturating_add(4095) & !4095);
+    if grows > 0 && c.mem.future_lock().is_some() && !lock_fits(c, grows >> 12) {
+        return ok(old);
+    }
     let new = c.mem.set_break_shared(GuestAddr(a[0])).0;
     // The pages it gives back, or a new VMA it grows into, have no memory
     // policy (Linux expands the heap's VMA only when it has none).

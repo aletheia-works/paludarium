@@ -19,7 +19,7 @@ reference; no code is copied). Its first user is
 
 | Package | Install |
 |---|---|
-| [`paludarium`](https://crates.io/crates/paludarium) (library and command) | `cargo +nightly install paludarium` / `cargo add paludarium` |
+| [`paludarium`](https://crates.io/crates/paludarium) (library and command) | `cargo install paludarium` / `cargo add paludarium` |
 | [`@aletheia-works/paludarium-wasm`](https://www.npmjs.com/package/@aletheia-works/paludarium-wasm) | `npm install @aletheia-works/paludarium-wasm` |
 | [`@aletheia-works/paludarium-wasm` on JSR](https://jsr.io/@aletheia-works/paludarium-wasm) | `npx jsr add @aletheia-works/paludarium-wasm` |
 
@@ -106,8 +106,8 @@ or run a task.
 ## CI
 
 - `ci.yml` (every pull request): unit tests on three OSes, rustfmt, clippy
-  (`-D warnings`, also with the latest stable Rust for the Linux, macOS and
-  Windows targets), the wasm32 build, cargo-deny, differential tests, 80 %
+  (`-D warnings`, also with the stable Rust that `rust-version` names for the
+  Linux, macOS and Windows targets), the wasm32 build, cargo-deny, differential tests, 80 %
   coverage, probe, aube and ripgrep differential tests, the WebAssembly acceptance
   tests, polyglot lint, the documentation build and the release package
   check. A pull request runs the jobs its changed files need
@@ -118,7 +118,8 @@ or run a task.
   real Safari, with and without the JIT). A failure opens an issue; the next
   passing night closes it.
 - `bump-pins.yml` (every Monday): moves the nightly pinned in
-  `rust-toolchain.toml` and the aube and ripgrep guests in
+  `rust-toolchain.toml`, the workspace's `rust-version` (the latest stable
+  Rust) and the aube and ripgrep guests in
   `tests/guests/programs/source-lock.json` to their latest releases
   (`scripts/bump-pins.py`), one pull request each from aletheia-works-bot that
   merges itself once `ci-ok` passes. Workflows name the toolchain through

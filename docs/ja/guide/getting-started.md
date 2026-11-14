@@ -12,12 +12,13 @@ paludarium は、crates.io の crate と、npm と JSR のパッケージとし�
 ## Rust
 
 paludarium は、日付を固定した nightly の Rust（`rust-toolchain.toml` にあるもの。
-毎週、最新の nightly へ上げます）で作って確かめています。crate は MSRV（使える最も古い Rust）として 1.101 を宣言しているので、
-1.101 より前の stable ではビルドできず、stable の Rust では確かめていません。nightly の Rust を使ってください。
+毎週、最新の nightly へ上げます）で作って確かめています。crate は最新の stable の Rust でもビルドできます。
+`rust-version`（使える最も古い Rust）は stable のリリースごとに上げ、CI はその版で clippy を動かします。
+テストは nightly だけで動かします。
 
 ```sh
-rustup toolchain install nightly
-cargo +nightly install paludarium
+rustup update stable
+cargo install paludarium
 ```
 
 動かせるのは、静的にリンクした x86-64 Linux の実行ファイル（`ET_EXEC` と static-pie）と、

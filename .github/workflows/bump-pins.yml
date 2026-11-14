@@ -1,6 +1,7 @@
 name: Bump pins
 
-# Every week, moves the pinned nightly Rust (rust-toolchain.toml) and the aube
+# Every week, moves the pinned nightly Rust (rust-toolchain.toml), the
+# workspace's rust-version (Cargo.toml, the latest stable Rust) and the aube
 # and ripgrep guests (tests/guests/programs/source-lock.json) to their latest releases with
 # scripts/bump-pins.py, and opens one pull request per pin as
 # aletheia-works-bot. Each pull request merges itself once ci-ok passes; if it
@@ -28,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pin: [toolchain, aube, ripgrep]
+        pin: [toolchain, rust-version, aube, ripgrep]
     steps:
       - name: Get an aletheia-works-bot token
         id: app-token

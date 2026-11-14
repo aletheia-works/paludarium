@@ -23,10 +23,11 @@ together with the internal dependency versions and the npm package version
 Harness, the Rust Wasm adapter and the fuzz crate have `publish = false`.
 
 The tested toolchain is the nightly pinned in `rust-toolchain.toml`. Every
-crate declares MSRV 1.101, so no stable release before 1.101 can build
-them, and stable support is not claimed. The WebAssembly build (the Wasm
-adapter, and `paludarium-host` on wasm32) additionally needs nightly build-std
-and atomic-wait support.
+crate's `rust-version` is the latest stable Rust (`scripts/bump-pins.py`
+moves it with each release), and the package check builds the external
+consumer with that stable Rust as well. The WebAssembly build (the Wasm
+adapter, and `paludarium-host` on wasm32) needs nightly build-std and
+atomic-wait support.
 
 ## Non-publishing checks
 
@@ -43,8 +44,8 @@ python3 -B scripts/release/check.py --mode package-check
 retains argv, tool SHA, stdout, stderr, real exit/timeout/reaping, source and
 lock before/after hashes. The original source is never rewritten. It builds
 twelve real `.crate` files, checks all members and normalized dependencies,
-builds a crate-external consumer from a temporary sparse registry, probes
-stable separately, and builds the production Wasm without diagnostic features.
+builds a crate-external consumer from a temporary sparse registry, also with
+the latest stable Rust, and builds the production Wasm without diagnostic features.
 One npm tarball is inspected and used for all seven distribution boundary
 checks, including real Wasm hello, invalid guest cleanup, missing JS and a
 corrupt Wasm. The JSR upload is that tarball's files without `package.json`,

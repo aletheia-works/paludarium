@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Move a pin to its latest release: the nightly Rust, or the aube or ripgrep guest.
+"""Move a pin to its latest release: the nightly Rust, rust-version, or a guest.
 
-    bump-pins.py toolchain --body body.md   # rust-toolchain.toml, source-lock.json
-    bump-pins.py aube --body body.md        # source-lock.json, the feature pages
-    bump-pins.py ripgrep --body body.md     # the same for ripgrep
+    bump-pins.py toolchain --body body.md      # rust-toolchain.toml, source-lock.json
+    bump-pins.py rust-version --body body.md   # Cargo.toml: the latest stable Rust
+    bump-pins.py aube --body body.md           # source-lock.json, the feature pages
+    bump-pins.py ripgrep --body body.md        # the same for ripgrep
     bump-pins.py --self-test
 
 When the pin moves, the pull request title goes to stdout and its body to
@@ -24,6 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLCHAIN_FILE = "rust-toolchain.toml"
+WORKSPACE_MANIFEST = "Cargo.toml"
 SOURCE_LOCK = "tests/guests/programs/source-lock.json"
 FEATURE_PAGES = ("docs/guide/features.md", "docs/ja/guide/features.md")
 DIST = "https://static.rust-lang.org/dist"
@@ -115,6 +117,33 @@ def bump_toolchain(get=fetch):
 
 def version(tag):
     return tuple(int(part) for part in re.findall(r"\d+", tag))
+
+
+def bump_rust_version(get=fetch):
+    """Moves the workspace's rust-version to the latest stable Rust's major.minor."""
+    pinned = tomllib.loads((ROOT / WORKSPACE_MANIFEST).read_text())["workspace"]["package"][
+        "rust-version"
+    ]
+    stable = tomllib.loads(get(f"{DIST}/channel-rust-stable.toml").decode())
+    full = stable["pkg"]["rust"]["version"]
+    match = re.match(r"(\d+)\.(\d+)\.\d+ ", full)
+    if not match:
+        raise SystemExit(f"unexpected stable version {full!r}")
+    new = f"{match.group(1)}.{match.group(2)}"
+    if version(new) <= version(pinned):
+        return None
+    edit(WORKSPACE_MANIFEST, f'rust-version = "{pinned}"', f'rust-version = "{new}"')
+    body = "\n".join(
+        [
+            f"Moves `rust-version` from {pinned} to {new}, the latest stable Rust (`{full}`).",
+            "",
+            f"- Release notes: https://github.com/rust-lang/rust/releases/tag/{new}.0",
+            "",
+            "The stable clippy job in ci.yml checks that the crates build with it. If it",
+            "fails, make the code build with stable rather than leaving rust-version behind.",
+        ]
+    )
+    return f"chore(toolchain): raise rust-version to {new}, the latest stable Rust", body
 
 
 def edit_line(path, marker, old, new):
@@ -260,6 +289,20 @@ def self_test():
         # Already the latest.
         assert bump_toolchain(fake({"latest": manifest("2026-10-11")})) is None
 
+        # rust-version follows the latest stable's major.minor, and only upwards.
+        def stable_get(full):
+            return lambda url: toml({"pkg": {"rust": {"version": full}}}).encode()
+
+        (ROOT / WORKSPACE_MANIFEST).write_text(
+            '[workspace.package]\nversion = "0.1.0"\nrust-version = "1.100"\n'
+        )
+        assert bump_rust_version(stable_get("1.100.1 (abcdef012 2026-11-20)")) is None
+        assert bump_rust_version(stable_get("1.99.0 (abcdef012 2026-10-01)")) is None
+        title, body = bump_rust_version(stable_get("1.101.0 (abcdef012 2026-12-22)"))
+        assert title == "chore(toolchain): raise rust-version to 1.101, the latest stable Rust"
+        assert 'rust-version = "1.101"' in (ROOT / WORKSPACE_MANIFEST).read_text()
+        assert "releases/tag/1.101.0" in body, body
+
         # A newer release moves the guest's tag, revision, lock digest and both
         # pages, and leaves the other guest alone.
         def guest_line(name, tag, revision, digest):
@@ -326,7 +369,7 @@ def self_test():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("pin", nargs="?", choices=("toolchain", *GUESTS))
+    parser.add_argument("pin", nargs="?", choices=("toolchain", "rust-version", *GUESTS))
     parser.add_argument("--body", type=Path, help="where to write the pull request body")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -335,7 +378,12 @@ def main():
         return
     if not args.pin:
         parser.error("name a pin, or pass --self-test")
-    result = bump_toolchain() if args.pin == "toolchain" else bump_guest(args.pin)
+    if args.pin == "toolchain":
+        result = bump_toolchain()
+    elif args.pin == "rust-version":
+        result = bump_rust_version()
+    else:
+        result = bump_guest(args.pin)
     if result is None:
         print(f"{args.pin} is already the latest", file=sys.stderr)
         return

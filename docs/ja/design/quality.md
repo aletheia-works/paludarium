@@ -132,8 +132,8 @@ lock 付きの命令のフェンスを外しても、テストはすべて通り
 
 - 行カバレッジの下限は 80% です。公開の前の測定では、workspace 全体で約 94% でした。
 - `cargo fmt --check`、clippy（警告はエラー）、`cargo deny`（ライセンス、取得元、
-  既知の脆弱性）を、プルリクエストごとに動かします。clippy は、最新の stable の Rust でも
-  Linux・macOS・Windows のターゲットに動かし、ネイティブの crate が stable でもビルドできることを
+  既知の脆弱性）を、プルリクエストごとに動かします。clippy は、`rust-version` が指す stable の Rust
+  （最新の版で、毎週上げます）でも Linux・macOS・Windows のターゲットに動かし、ネイティブの crate が stable でもビルドできることを
   保ちます。テストは、固定した nightly だけで動かします。
 - GitHub Actions の action は、すべてコミットの SHA で固定しています。
 
@@ -144,7 +144,7 @@ lock 付きの命令のフェンスを外しても、テストはすべて通り
 | プルリクエストごと | Linux・macOS・Windows の単体テスト、lint、依存の検査、WebAssembly のビルド、x86-64 Linux での差分テスト（ネイティブの JIT ありでも）、カバレッジ、probe・aube・ripgrep の差分テスト、4 つの WebAssembly の環境と x86-64 Linux の WebKit での受け入れのテスト、ファジングの一部 |
 | 毎晩 | 14 の対象のファジング、macOS と Windows での差分テスト、x86-64 Linux での Debian のプログラム、4 つの WebAssembly の環境と x86-64 Linux の WebKit での JIT ありとなし、速さの測定 |
 | 毎日 | 定期実行のワークフローが時間どおりに始まったかを確かめます。始まらなかった、動かなかった、無効になっていたときは Issue を立てます |
-| 毎週 | 固定した nightly の Rust と、aube と ripgrep のゲストを最新のリリースへ上げます。それぞれのプルリクエストは、検査が通ると自分でマージされます |
+| 毎週 | 固定した nightly の Rust、workspace の `rust-version`（最新の stable の Rust）、aube と ripgrep のゲストを最新のリリースへ上げます。それぞれのプルリクエストは、検査が通ると自分でマージされます |
 | 公開の前 | 公開する同じコードで、上のすべて（下を参照） |
 
 ゲストのプログラムは、ビルドの前に、依存がルートの方針の `cargo deny` を通らなければ

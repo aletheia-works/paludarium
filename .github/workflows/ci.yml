@@ -1,6 +1,7 @@
 # Pull-request gate: unit tests on Linux, macOS and Windows, fmt, clippy
-# (-D warnings, also with the latest stable Rust), dependency checks, the x86-64 Linux differential tests and
-# the 80% line-coverage floor. A pull request runs the jobs its changed
+# (-D warnings, also with the stable Rust of rust-version), dependency
+# checks, the x86-64 Linux differential tests and the 80% line-coverage
+# floor. A pull request runs the jobs its changed
 # files need (scripts/ci-changes.py) and a push to main runs every job;
 # ci-ok, the required check, passes only when every job passed or was not
 # needed. Actions are pinned by commit SHA and the default token is
@@ -190,30 +191,32 @@ jobs:
         run: cargo build --locked -p paludarium-decoder -p paludarium-mmu -p paludarium-cpu --target wasm32-unknown-unknown
 
   # The pinned nightly builds and tests everything; this keeps the native
-  # crates building with the latest stable Rust, whose clippy also has lints
-  # the nightly's does not. Clippy checks without linking, so one Linux runner
-  # covers the Linux, macOS and Windows targets. The crates declare an MSRV
-  # newer than stable (rust-version), hence --ignore-rust-version. The
-  # WebAssembly build needs nightly features and is left out.
+  # crates building with the stable Rust that rust-version in Cargo.toml
+  # names: the latest stable, which scripts/bump-pins.py moves weekly, so a
+  # new release's lints arrive in that pull request rather than in unrelated
+  # ones. Its clippy also has lints the nightly's does not. Clippy checks
+  # without linking, so one Linux runner covers the Linux, macOS and Windows
+  # targets. The WebAssembly build needs nightly features and is left out.
   stable-clippy:
-    name: clippy (latest stable Rust)
+    name: clippy (stable Rust of rust-version)
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Overrides rust-toolchain.toml for cargo, rustc and rust-cache's key.
-      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install the latest stable Rust
+      - name: Install the stable Rust of rust-version
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml for cargo, rustc and
+        # rust-cache's key.
         uses: ./.github/actions/rust-toolchain
         with:
+          rust-version: 'true'
+          set-rustup-toolchain: 'true'
           args: >-
-            toolchain install stable --profile minimal --component clippy
+            toolchain install $RUST_TOOLCHAIN --profile minimal --component clippy
             --target x86_64-unknown-linux-gnu --target aarch64-apple-darwin
             --target x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -222,7 +225,7 @@ jobs:
           rustc --version
           for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
             echo "::group::$target"
-            cargo clippy --locked --workspace --all-targets --ignore-rust-version --target "$target" -- -D warnings
+            cargo clippy --locked --workspace --all-targets --target "$target" -- -D warnings
             echo "::endgroup::"
           done
 

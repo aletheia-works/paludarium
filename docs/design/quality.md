@@ -147,9 +147,9 @@ every test passing.
   release was about 94 % for the whole workspace.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
-  with the latest stable Rust for the Linux, macOS and Windows targets, so the
-  native crates keep building with stable; the tests use only the pinned
-  nightly.
+  with the stable Rust that `rust-version` names (the latest, moved weekly)
+  for the Linux, macOS and Windows targets, so the native crates keep building
+  with stable; the tests use only the pinned nightly.
 - Every GitHub Actions action is pinned to a commit SHA.
 
 ## CI
@@ -159,7 +159,7 @@ every test passing.
 | Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux; part of the fuzzing |
 | Every night | fuzzing of the 14 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
 | Every day | every scheduled workflow is checked to have started on time; one that failed to start, did not run or was disabled opens an Issue |
-| Every week | the pinned nightly Rust and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
+| Every week | the pinned nightly Rust, the workspace's `rust-version` (the latest stable Rust) and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
 | Before a release | all of the above on the exact code being released (below) |
 
 Before a guest program is built, its dependencies must pass `cargo deny`

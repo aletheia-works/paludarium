@@ -390,8 +390,12 @@ def package_check(root):
                     env,
                 )
             )
-            stable = list(check.rustup_toolchains().glob("1.99.1-*/bin/cargo"))
-            policy.require(len(stable) == 1, "actual verified stable1.99.1 Cargo required")
+            # rust-version is the latest stable Rust, so a consumer builds with it.
+            msrv = tomllib.loads((copy / "Cargo.toml").read_text())["workspace"]["package"][
+                "rust-version"
+            ]
+            stable = list(check.rustup_toolchains().glob(msrv + "-*/bin/cargo"))
+            policy.require(len(stable) == 1, "one actual Cargo of rust-version required")
             stableenv = dict(
                 env,
                 RUSTC=str(stable[0].with_name("rustc")),
@@ -411,6 +415,7 @@ def package_check(root):
                 900,
                 stableenv,
             )
+            check.require_success(stable_result)
         stage = "production-wasm"
         env["RUSTFLAGS"] = (
             "-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--import-memory -C link-arg=--shared-memory -C link-arg=--max-memory=1073741824 -C link-arg=--export=__stack_pointer -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base"

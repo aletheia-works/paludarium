@@ -52,6 +52,7 @@ macOS と Windows でも、Linux のバイナリを直接 exec するのでは�
 
 - 日付を固定した nightly（`rust-toolchain.toml` にあるもの。毎週、最新の nightly へ
   上げます）で作って確かめています。
-- crate は MSRV として 1.101 を宣言しているので、1.101 より前の stable ではビルドできません。
-  stable の Rust では確かめていません。
-- WebAssembly 版は、さらに nightly の `build-std` と atomics の機能を使います。
+- ネイティブの crate は、最新の stable の Rust でもビルドできます。`Cargo.toml` の `rust-version` を
+  stable のリリースごとに上げ、CI はその版で Linux・macOS・Windows のターゲットに clippy を動かします。
+  テストは nightly だけで動かします。
+- WebAssembly 版は nightly が必要です。`build-std` と、atomics の wait の機能を使います。

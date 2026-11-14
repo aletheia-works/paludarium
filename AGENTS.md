@@ -43,7 +43,9 @@ lists what an agent needs first.
   (in both languages) or left it. Agents that trusted a stale instruction file
   over the code have broken working systems
   ([arXiv:2605.30777](https://arxiv.org/abs/2605.30777)).
-- The Rust toolchain is the nightly pinned in `rust-toolchain.toml`.
+- The Rust toolchain is the nightly pinned in `rust-toolchain.toml`. The
+  native crates must also build with the latest stable Rust (`rust-version`
+  in `Cargo.toml`, checked by `stable-clippy` in CI).
   Dependencies come from crates.io with licenses compatible with Apache-2.0
   (`mise run deny`).
 - Do not copy code from other projects, including jart/blink.

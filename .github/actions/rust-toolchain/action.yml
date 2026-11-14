@@ -12,6 +12,13 @@ inputs:
       the pinned toolchain, so workflows do not repeat the pin.
     required: false
     default: toolchain install
+  rust-version:
+    description: >-
+      Name the workspace's rust-version in Cargo.toml (the latest stable Rust,
+      scripts/rust-toolchain.sh --rust-version) as RUST_TOOLCHAIN instead of
+      the nightly pinned in rust-toolchain.toml.
+    required: false
+    default: 'false'
   set-rustup-toolchain:
     description: >-
       Also export RUSTUP_TOOLCHAIN, so every later step of the job uses the
@@ -28,10 +35,15 @@ runs:
       shell: bash
       env:
         SET_RUSTUP_TOOLCHAIN: ${{ inputs.set-rustup-toolchain }}
+        RUST_VERSION: ${{ inputs.rust-version }}
       run: |
         set -euo pipefail
         cd "$GITHUB_WORKSPACE"
-        toolchain=$(bash scripts/rust-toolchain.sh)
+        if [ "$RUST_VERSION" = true ]; then
+          toolchain=$(bash scripts/rust-toolchain.sh --rust-version)
+        else
+          toolchain=$(bash scripts/rust-toolchain.sh)
+        fi
         {
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home"
           echo "RUST_TOOLCHAIN=$toolchain"

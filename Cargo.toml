@@ -23,7 +23,8 @@ exclude = ["fuzz", "spikes/wasm-threads", "tests/guests/hello-rs"]
 [workspace.package]
 version = "0.16.0"
 edition = "2024"
-rust-version = "1.101"
+# The latest stable Rust; scripts/bump-pins.py moves it with each release.
+rust-version = "1.100"
 readme = "README.md"
 repository = "https://github.com/aletheia-works/paludarium"
 license = "Apache-2.0"

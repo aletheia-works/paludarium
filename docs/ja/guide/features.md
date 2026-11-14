@@ -286,7 +286,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `RESOLVE_*` フラグ、`O_CREAT` も `O_TMPFILE` もないのに付けたモードや許可ビットを
   超えるモード、`O_CREAT | O_DIRECTORY`、`O_DIRECTORY`・`O_NOFOLLOW`・`O_CLOEXEC`
   以外のフラグを伴う `O_PATH` は `EINVAL` です。`RESOLVE_NO_SYMLINKS` はシンボリック
-  リンクを、`RESOLVE_NO_MAGICLINKS` は `/proc/self/fd` のリンクや `exe`・`cwd` を
+  リンクを、`RESOLVE_NO_MAGICLINKS` は `/proc/self/fd` のリンクや `exe`・`cwd`・`root` を
   たどりません（`ELOOP`）。`RESOLVE_NO_XDEV` は `/proc` や `/dev` も含めてマウントを
   越えません（`EXDEV`）。`RESOLVE_BENEATH` では絶対パスや絶対パスへのリンク、
   ディレクトリの外に出る `..`、マジックリンクが `EXDEV` になり、`RESOLVE_IN_ROOT` は
@@ -1825,7 +1825,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`maps`、`smaps`、`fd`、`fdinfo`、`ns`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
+  `cwd`、`root`、`maps`、`smaps`、`fd`、`fdinfo`、`ns`、`task` があります。`root` は
+  ルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
+  パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`status` は、Linux と同じ項目を同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。メモリの項目は
   ロックしたメモリ（`VmLck`）だけで、何も測っていないほかのメモリの項目と CPU の
   項目はありません。自分のディレクトリと `/proc` の下の
@@ -1835,7 +1838,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
-  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`ns`（0511）、
+  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`root`、`ns`（0511）、
   `task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
@@ -1846,7 +1849,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`exe`、`cwd`、`ns` のリンクはファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`exe`、`cwd`、`root`、`ns` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
@@ -1859,7 +1862,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
   コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
-  持ちません。Linux と同じく、`cmdline` と `environ` は空で、`exe` と `cwd` は `ENOENT` です。
+  持ちません。Linux と同じく、`cmdline` と `environ` は空で、`exe`、`cwd`、`root` は `ENOENT` です。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、

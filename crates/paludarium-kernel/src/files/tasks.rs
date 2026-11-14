@@ -156,7 +156,9 @@ impl Task {
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
-        TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Namespace(_) if !task.may_access(c, false) => {
+        TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Root | TaskEntry::Namespace(_)
+            if !task.may_access(c, false) =>
+        {
             Err(Errno::EACCES)
         }
         _ => Ok(()),
@@ -264,6 +266,7 @@ pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errn
         TaskEntry::ThreadLink => Some(format!("{}/task/{}", task.pid, task.tid).into_bytes()),
         TaskEntry::Exe => task.live().then(|| task.view.group.executable()),
         TaskEntry::Cwd => task.live().then(|| task.public.files.cwd()).flatten(),
+        TaskEntry::Root => task.live().then(|| task.public.files.root()).flatten(),
         TaskEntry::Namespace(entry) => namespace(task, entry).map(|namespace| namespace.link()),
         _ => return None,
     };
@@ -296,13 +299,13 @@ pub(super) fn stat(
         TaskEntry::Directory | TaskEntry::Threads => crate::proc::directory_stat(),
         TaskEntry::ThreadLink if follow => crate::proc::directory_stat(),
         TaskEntry::ThreadLink => crate::proc::self_link_stat(),
-        TaskEntry::Exe | TaskEntry::Cwd if follow => {
+        TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Root if follow => {
             check(c, task, entry)?;
             let target = link(task, entry).ok_or(Errno::ENOENT)??;
             let stat = c.files.fs().metadata(&target, true)?;
             return Ok((stat, device(c, &target), BLOCK_SIZE));
         }
-        TaskEntry::Exe | TaskEntry::Cwd => crate::proc::self_link_stat(),
+        TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Root => crate::proc::self_link_stat(),
         TaskEntry::Namespaces => crate::proc::namespaces_stat(),
         TaskEntry::Namespace(entry) if follow => {
             check(c, task, TaskEntry::Namespace(entry))?;

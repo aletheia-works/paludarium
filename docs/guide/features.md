@@ -323,8 +323,8 @@ kernel.
   or with more than the permission bits, `O_CREAT | O_DIRECTORY`, and
   `O_PATH` with other flags than `O_DIRECTORY`, `O_NOFOLLOW` and
   `O_CLOEXEC` are `EINVAL`. `RESOLVE_NO_SYMLINKS` follows no symbolic link
-  and `RESOLVE_NO_MAGICLINKS` no link in `/proc/self/fd` or `exe` and `cwd`
-  (`ELOOP`); `RESOLVE_NO_XDEV` crosses no mount, `/proc` and `/dev`
+  and `RESOLVE_NO_MAGICLINKS` no link in `/proc/self/fd` or `exe`, `cwd` and
+  `root` (`ELOOP`); `RESOLVE_NO_XDEV` crosses no mount, `/proc` and `/dev`
   included (`EXDEV`); `RESOLVE_BENEATH` gives `EXDEV` for an absolute path
   or link, `..` out of the directory and a magic link, and
   `RESOLVE_IN_ROOT` takes the directory as the root, where those stay but
@@ -2097,7 +2097,11 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
-  `maps`, `smaps`, `fd`, `fdinfo`, `ns` and `task`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
+  `root`, `maps`, `smaps`, `fd`, `fdinfo`, `ns` and `task`. `root` leads to
+  the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
+  `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
+  when its file is under that root, and otherwise from the machine's root,
+  unmarked. `status` has Linux's fields in Linux's order (umask, IDs, threads,
   signal masks, capabilities and so on) and, of the memory ones, the locked
   memory (`VmLck`); the other memory fields and the CPU ones are not there,
   as nothing measures them. Any other path in this process's directory or
@@ -2108,7 +2112,7 @@ kernel.
   and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
-  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd`, `ns` (0511) and
+  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd`, `root`, `ns` (0511) and
   `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
@@ -2120,8 +2124,8 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `exe`, `cwd` and
-  the links of `ns` unless its filesystem IDs, are every user and group ID of a dumpable
+  gets `EACCES` for `environ` unless its real IDs, and for `exe`, `cwd`,
+  `root` and the links of `ns` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
   asks above; an undumpable process's directory is root's. What a process shows of
@@ -2134,7 +2138,7 @@ kernel.
   reaped, `S (sleeping)` while its thread is in a system call, where it waits
   if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline` and
-  `environ` are empty and `exe` and `cwd` are `ENOENT`, as on Linux.
+  `environ` are empty and `exe`, `cwd` and `root` are `ENOENT`, as on Linux.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0

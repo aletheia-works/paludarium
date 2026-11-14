@@ -169,6 +169,7 @@ pub(crate) struct Root {
 #[derive(Clone, Default)]
 pub(crate) struct FilesView {
     cwd: std::sync::Weak<Mutex<Vec<u8>>>,
+    root: std::sync::Weak<Mutex<Option<Root>>>,
     umask: std::sync::Weak<AtomicU32>,
     fds: std::sync::Weak<Mutex<BTreeMap<u32, Descriptor>>>,
 }
@@ -176,6 +177,16 @@ impl FilesView {
     pub(crate) fn cwd(&self) -> Option<Vec<u8>> {
         let cwd = self.cwd.upgrade()?;
         Some(cwd.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+    /// The root, a path from the machine's root (`/` unless `chroot`
+    /// moved it).
+    pub(crate) fn root(&self) -> Option<Vec<u8>> {
+        let root = self.root.upgrade()?;
+        let root = root.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(
+            root.as_ref()
+                .map_or_else(|| b"/".to_vec(), |root| root.path.clone()),
+        )
     }
     pub(crate) fn umask(&self) -> u32 {
         self.umask
@@ -224,6 +235,7 @@ impl Files {
     pub(crate) fn view(&self) -> FilesView {
         FilesView {
             cwd: Arc::downgrade(&self.cwd),
+            root: Arc::downgrade(&self.root),
             umask: Arc::downgrade(&self.umask),
             fds: Arc::downgrade(&self.fds),
         }
@@ -776,7 +788,11 @@ fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, 
                     .is_ok_and(|now| now.inode == stat.inode);
             if named { Ok(path) } else { Err(Errno::ENOENT) }
         })()),
-        Some(entry @ (crate::proc::OwnEntry::Cwd | crate::proc::OwnEntry::Exe)) => {
+        Some(
+            entry @ (crate::proc::OwnEntry::Cwd
+            | crate::proc::OwnEntry::Root
+            | crate::proc::OwnEntry::Exe),
+        ) => {
             let target = own_link(c, entry)?;
             Some(if entry == crate::proc::OwnEntry::Exe {
                 Err(ENOTDIR)
@@ -788,7 +804,9 @@ fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, 
             let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
             match task_path.entry {
                 crate::proc::TaskEntry::Exe => Some(Err(ENOTDIR)),
-                crate::proc::TaskEntry::Cwd => Some(own_link_target(c, path).ok_or(Errno::ENOENT)),
+                crate::proc::TaskEntry::Cwd | crate::proc::TaskEntry::Root => {
+                    Some(own_link_target(c, path).ok_or(Errno::ENOENT))
+                }
                 _ => None,
             }
         }
@@ -4397,7 +4415,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 let task = tasks::find(c, &path)?;
                 tasks::check(c, &task, path.entry)?;
                 match tasks::link(&task, path.entry) {
-                    Some(target) => target?,
+                    Some(target) => from_reader(c, target?),
                     None if path.entry == crate::proc::TaskEntry::Missing => {
                         return Err(Errno::ENOENT);
                     }
@@ -4410,7 +4428,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 target.to_vec()
             } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
                 if let Some(target) = own_link(c, entry) {
-                    target
+                    from_reader(c, target)
                 } else {
                     let crate::proc::OwnEntry::Descriptor(n) = entry else {
                         return Err(Errno::EINVAL);
@@ -4419,7 +4437,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         .files
                         .descriptor(u64::from(n))
                         .map_err(|_| Errno::ENOENT)?;
-                    link_target(c, &d)?
+                    from_reader(c, link_target(c, &d)?)
                 }
             } else {
                 c.files.fs().readlink(&p)?
@@ -5571,11 +5589,14 @@ fn resolve_scoped(
                     crate::proc::OwnEntry::Descriptor(_)
                         | crate::proc::OwnEntry::Exe
                         | crate::proc::OwnEntry::Cwd
+                        | crate::proc::OwnEntry::Root
                 )
             ) || crate::proc::task_path(&candidate, c.process.pid, c.tid).is_some_and(|path| {
                 matches!(
                     path.entry,
-                    crate::proc::TaskEntry::Exe | crate::proc::TaskEntry::Cwd
+                    crate::proc::TaskEntry::Exe
+                        | crate::proc::TaskEntry::Cwd
+                        | crate::proc::TaskEntry::Root
                 )
             });
         if magic {
@@ -5834,7 +5855,8 @@ fn open_path(
             | crate::proc::OwnEntry::Environ
             | crate::proc::OwnEntry::Comm
             | crate::proc::OwnEntry::Exe
-            | crate::proc::OwnEntry::Cwd => return Err(Errno::ENOENT),
+            | crate::proc::OwnEntry::Cwd
+            | crate::proc::OwnEntry::Root => return Err(Errno::ENOENT),
             crate::proc::OwnEntry::Maps => Arc::new(crate::proc::MapsFile::open(
                 c.mem.view(),
                 c.group.start_stack(),
@@ -6722,7 +6744,9 @@ fn other_generated_stat(
         crate::proc::OwnEntry::Environ => {
             crate::proc::private_stat(own_file(c, entry).map_or(0, |content| content.len()))
         }
-        crate::proc::OwnEntry::Exe | crate::proc::OwnEntry::Cwd => return None,
+        crate::proc::OwnEntry::Exe | crate::proc::OwnEntry::Cwd | crate::proc::OwnEntry::Root => {
+            return None;
+        }
         crate::proc::OwnEntry::Maps | crate::proc::OwnEntry::Smaps => crate::proc::stat(0),
         crate::proc::OwnEntry::Descriptor(n) => {
             let d = c.files.descriptor(u64::from(n)).ok()?;
@@ -6753,8 +6777,18 @@ fn own_entries() -> Vec<paludarium_host::DirectoryEntry> {
         })
         .collect()
 }
-/// Where this process's `exe` or `cwd` link leads: the program it runs and
-/// its current directory. `None` for any other entry.
+/// A `/proc` link's path as the reader reads it, as Linux's `d_path` gives
+/// it: from the reader's root when it is under it, else from the machine's
+/// root (unmarked, unlike `getcwd`'s). Other targets (`pipe:[…]`, a task's
+/// directory) as they are.
+fn from_reader(c: &Context<'_>, target: Vec<u8>) -> Vec<u8> {
+    if target.first() != Some(&b'/') {
+        return target;
+    }
+    c.files.seen_from_root(&target).unwrap_or(target)
+}
+/// Where this process's `exe`, `cwd` or `root` link leads: the program it
+/// runs, its current directory and its root. `None` for any other entry.
 fn own_link(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
     match entry {
         crate::proc::OwnEntry::Exe => Some(c.group.executable()),
@@ -6765,6 +6799,7 @@ fn own_link(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
         ),
+        crate::proc::OwnEntry::Root => Some(c.files.root()),
         _ => None,
     }
 }

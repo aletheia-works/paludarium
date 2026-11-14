@@ -7965,3 +7965,51 @@ fn chroot_keeps_paths_to_the_new_root() {
     let p = s(&mut f, 0, b"/none");
     assert_eq!(f.ret(161, &[p]), errno(Errno::ENOENT));
 }
+/// `/proc/self/root` is the root, and the links read from the reader's
+/// root, as Linux's `d_path` gives them.
+#[test]
+fn proc_links_read_from_the_root() {
+    let mut f = fixture();
+    let s = |f: &mut Fixture, at: u64, text: &[u8]| -> u64 {
+        let mut bytes = text.to_vec();
+        bytes.push(0);
+        f.mem.write(GuestAddr(DATA + at), &bytes).unwrap();
+        DATA + at
+    };
+    let link = |f: &mut Fixture, dir: u64, name: &[u8]| -> Vec<u8> {
+        let p = s(f, 0, name);
+        let n = f.ret(267, &[dir, p, DATA + 0x1000, 256]);
+        if (n as i64) < 0 {
+            return format!("errno {}", -(n as i64)).into_bytes();
+        }
+        let mut out = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x1000), &mut out).unwrap();
+        out
+    };
+    const AT_FDCWD: u64 = -100i64 as u64;
+    for dir in [&b"/jail"[..], b"/jail/d", b"/out"] {
+        let p = s(&mut f, 0, dir);
+        assert_eq!(f.ret(83, &[p, 0o755]), 0);
+    }
+    assert_eq!(link(&mut f, AT_FDCWD, b"/proc/self/root"), b"/");
+    let p = s(&mut f, 0, b"/out");
+    let out = f.ret(2, &[p, 0o200000, 0]);
+    let p = s(&mut f, 0, b"/proc/self");
+    let proc = f.ret(2, &[p, 0o200000, 0]);
+    let p = s(&mut f, 0, b"/jail/d");
+    assert_eq!(f.ret(80, &[p]), 0);
+    let p = s(&mut f, 0, b"/jail");
+    assert_eq!(f.ret(161, &[p]), 0);
+    // Through the /proc opened before: the root and the working directory
+    // from the new root; the new root has no /proc of its own.
+    assert_eq!(link(&mut f, proc, b"root"), b"/");
+    assert_eq!(link(&mut f, proc, b"cwd"), b"/d");
+    assert_eq!(link(&mut f, AT_FDCWD, b"/proc/self/root"), b"errno 2");
+    let p = s(&mut f, 0, b"/d");
+    let d = f.ret(2, &[p, 0o200000, 0]);
+    assert_eq!(link(&mut f, proc, format!("fd/{d}").as_bytes()), b"/d");
+    // A working directory outside the root reads from the machine's root,
+    // unmarked.
+    assert_eq!(f.ret(81, &[out]), 0);
+    assert_eq!(link(&mut f, proc, b"cwd"), b"/out");
+}

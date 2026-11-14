@@ -7842,6 +7842,20 @@ static void cr_cwd(const char *label) {
     else
         printf("%s cwd: %s\n", label, buf);
 }
+/* A /proc link at dir/name as readlinkat reads it, BASE for the base. */
+static void cr_link(const char *label, int dir, const char *name) {
+    char buf[512] = {0};
+    ssize_t n = readlinkat(dir, name, buf, sizeof buf - 1);
+    if (n < 0) {
+        printf("%s: errno=%d\n", label, errno);
+        return;
+    }
+    char *at = strstr(buf, cr_base);
+    if (at)
+        printf("%s: %.*sBASE%s\n", label, (int)(at - buf), buf, at + strlen(cr_base));
+    else
+        printf("%s: %s\n", label, buf);
+}
 static int chroot_exec_case(void) {
     cr_cwd("exec");
     cr_read("exec /f", "/f");
@@ -7894,16 +7908,36 @@ static int chroot_case(const char *self) {
         _exit(0);
     }
     printf("unprivileged status=%d\n", reaped(child));
+    cr_link("parent root", AT_FDCWD, "/proc/self/root");
     fflush(stdout);
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 94;
     child = fork();
     if (child == 0) {
         /* Each line out before an early _exit. */
         setvbuf(stdout, NULL, _IOLBF, 0);
+        close(ready[0]);
+        close(done[1]);
         if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
         if (chdir(cr_base)) _exit(91);
+        int proc = open("/proc/self", O_RDONLY | O_DIRECTORY);
         long rooted = cr_call(jail);
         printf("chroot=%ld\n", rooted);
         if (rooted) _exit(89);
+        /* The links through the /proc opened before, read from the new
+           root: the root itself, a working directory outside it from the
+           machine's root, and a file under it. */
+        cr_link("own root", proc, "root");
+        cr_link("own cwd", proc, "cwd");
+        int file = open("/f", O_RDONLY);
+        char name[32];
+        snprintf(name, sizeof name, "fd/%d", file);
+        cr_link("own fd", proc, name);
+        close(file);
+        close(proc);
+        /* The parent reads this root while it is there. */
+        char byte;
+        if (write(ready[1], "r", 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
         cr_cwd("outside");
         cr_read("/f", "/f");
         cr_read("/../../f", "/../../f");
@@ -7939,6 +7973,20 @@ static int chroot_case(const char *self) {
         fflush(stdout);
         _exit(0);
     }
+    close(ready[1]);
+    close(done[0]);
+    char byte;
+    if (read(ready[0], &byte, 1) == 1) {
+        char link[64];
+        snprintf(link, sizeof link, "/proc/%d/root", (int)child);
+        cr_link("child root", AT_FDCWD, link);
+        snprintf(link, sizeof link, "/proc/%d/root/f", (int)child);
+        cr_read("through child root", link);
+        fflush(stdout);
+    }
+    if (write(done[1], "d", 1) != 1) perror("write");
+    close(ready[0]);
+    close(done[1]);
     printf("rooted status=%d\n", reaped(child));
     const char *names[] = {"self", "f", "d/abs", "d/up"};
     for (unsigned i = 0; i < 4; i++) {

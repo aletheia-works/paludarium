@@ -49,9 +49,11 @@ pub(crate) enum OwnEntry {
     Cmdline,
     Environ,
     Comm,
-    /// The links to the running program and to the current directory.
+    /// The links to the running program, the current directory and the
+    /// root.
     Exe,
     Cwd,
+    Root,
     Maps,
     /// `smaps`: `maps` with what each VMA holds and its flags.
     Smaps,
@@ -80,6 +82,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
         b"/comm" => Some(OwnEntry::Comm),
         b"/exe" => Some(OwnEntry::Exe),
         b"/cwd" => Some(OwnEntry::Cwd),
+        b"/root" => Some(OwnEntry::Root),
         b"/maps" => Some(OwnEntry::Maps),
         b"/smaps" => Some(OwnEntry::Smaps),
         b"/fd" | b"/fd/" => Some(OwnEntry::Descriptors),
@@ -96,7 +99,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 18] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 19] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -108,6 +111,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 18] = [
     (b"stat", 8),
     (b"maps", 8),
     (b"cwd", 10),
+    (b"root", 10),
     (b"exe", 10),
     (b"mounts", 8),
     (b"mountinfo", 8),
@@ -117,7 +121,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 18] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 12] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 13] = [
     (b"task", 4),
     (b"ns", 4),
     (b"environ", 8),
@@ -126,6 +130,7 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 12] = [
     (b"cmdline", 8),
     (b"stat", 8),
     (b"cwd", 10),
+    (b"root", 10),
     (b"exe", 10),
     (b"uid_map", 8),
     (b"gid_map", 8),
@@ -146,6 +151,8 @@ pub(crate) enum TaskEntry {
     Comm,
     Exe,
     Cwd,
+    /// `root`, the task's root (`chroot`'s).
+    Root,
     /// `/proc/thread-self`, a link to the reading thread's directory.
     ThreadLink,
     /// `ns`, the directory of the task's namespaces, and one of its links.
@@ -197,6 +204,7 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"comm" => TaskEntry::Comm,
         b"exe" => TaskEntry::Exe,
         b"cwd" => TaskEntry::Cwd,
+        b"root" => TaskEntry::Root,
         b"ns" => TaskEntry::Namespaces,
         b"uid_map" => TaskEntry::IdMap(crate::users::Ids::User),
         b"gid_map" => TaskEntry::IdMap(crate::users::Ids::Group),

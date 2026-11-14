@@ -14527,8 +14527,13 @@ int main(int argc, char **argv) {
             monitor_show(mon, port, "up");
             const unsigned short add = 0x600;
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 128, 1, NULL, 0, 0x02, "first6");
+            /* Read before the second address: Linux tells of an address's
+               prefix route at once but of the address and its local route
+               from its duplicate address detection's work, which would race
+               the second's prefix route. */
+            monitor_show(mon, port, "first address");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::2", 128, 1, NULL, 0, 0x02, "second6");
-            monitor_show(mon, port, "addresses");
+            monitor_show(mon, port, "second address");
             /* From ::1 to the first address, where nothing listens: its
                neighbour, then ::1's, which ICMPv6's port unreachable goes
                back to. Then TCP to the second, whose reset goes back to it,

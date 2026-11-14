@@ -5104,8 +5104,9 @@ mod old_forms {
             .write(GuestAddr(name), b"/proc/self/ns/net\0")
             .unwrap();
         let namespace = f.ret(2, &[name, 0]);
+        let secret = f.ret(447, &[0]);
         let mut devices = vec![1];
-        for fd in [pipe, socket, eventfd, pidfd, memfd, namespace] {
+        for fd in [pipe, socket, eventfd, pidfd, memfd, namespace, secret] {
             assert_eq!(f.ret(5, &[fd, stat]), 0, "fd {fd}");
             let device = f.mem.read_u64(GuestAddr(stat)).unwrap();
             assert!(!devices.contains(&device), "fd {fd}: {device:#x}");
@@ -5125,6 +5126,12 @@ mod old_forms {
             .unwrap();
         assert_eq!(f.ret(4, &[name, stat]), 0);
         assert_eq!(f.mem.read_u64(GuestAddr(stat)).unwrap(), devices[1]);
+        // statx's mount ID: a small one below mountinfo's, from 21.
+        f.mem.write(GuestAddr(name), b"\0").unwrap();
+        let statx = DATA + 0x400;
+        assert_eq!(f.ret(332, &[pipe, name, 0x1000, 0x1000, statx]), 0);
+        let id = f.mem.read_u64(GuestAddr(statx + 144)).unwrap();
+        assert!((1..21).contains(&id), "{id}");
     }
     const MAP_SHARED: u64 = 1;
     const MAP_PRIVATE: u64 = 2;

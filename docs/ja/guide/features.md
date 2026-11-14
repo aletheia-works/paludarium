@@ -187,7 +187,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `st_dev` を返します。flags と mask は Linux と同じように確かめます（`EINVAL`）。
   mask が何を求めても、Linux と同じくマウントの ID も返します。`/proc/self/mountinfo`
   が示す ID（`STATX_MNT_ID`）か、`STATX_MNT_ID_UNIQUE` を求めたときはその代わりに
-  64 ビットの ID です。
+  64 ビットの ID です。内部のファイルシステムのファイル（パイプ・ソケット・memfd
+  など。後の `statfs` を参照）は、mountinfo に出ない小さな ID のマウントにあります。
+  mountinfo の ID は 21 から始まり、Linux の内部のマウントも mountinfo に出ません。
   `AT_EMPTY_PATH` はディスクリプタを、`AT_FDCWD` なら作業ディレクトリを指し、Linux 6.11
   からと同じく、それとともに渡した空ポインタのパスも同じ扱いです。
 - `name_to_handle_at` はファイルのハンドルを返し、Linux（6.13 以降）と同じ順に確かめます。

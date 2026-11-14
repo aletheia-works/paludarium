@@ -210,7 +210,10 @@ kernel.
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
   (`EINVAL`). Whatever the mask asks for, it also gives the mount's ID, as
   Linux does: the one `/proc/self/mountinfo` shows (`STATX_MNT_ID`), or a
-  64-bit one in its place when `STATX_MNT_ID_UNIQUE` is asked for.
+  64-bit one in its place when `STATX_MNT_ID_UNIQUE` is asked for. A file
+  of an internal file system (a pipe, a socket, a memfd and the like; see
+  `statfs` below) is on a mount with one of the small IDs that mountinfo,
+  whose IDs start at 21, does not show, as Linux's internal mounts are.
   `AT_EMPTY_PATH` names the descriptor, or the working directory for
   `AT_FDCWD`, and as since Linux 6.11 a null path with it does too.
 - `name_to_handle_at` gives a file's handle, checked in the order of

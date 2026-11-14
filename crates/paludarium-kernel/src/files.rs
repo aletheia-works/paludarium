@@ -2786,8 +2786,8 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // As Linux's vfs_statx, the mount's ID whether or not it was asked for:
     // the unique one if that was, the one mountinfo shows otherwise. A
     // mount's minor number is its position in mountinfo, whose IDs start at
-    // 21; an internal file system's minor gives a mount mountinfo does not
-    // show, as Linux's internal mounts are not shown.
+    // 21; an internal file system's mount has a small one that mountinfo
+    // does not show, as Linux's internal mounts are not shown.
     let id = mount_id(device);
     let (bit, id) = if mask & STATX_MNT_ID_UNIQUE != 0 {
         (STATX_MNT_ID_UNIQUE, 1 << 31 | id)
@@ -3190,9 +3190,14 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
     })
 }
 /// The ID of the mount whose device is `device`, as `/proc/self/mountinfo`
-/// numbers it: its minor number is its position there, from 21.
+/// numbers it: its minor number is its position there, from 21. An internal
+/// file system's mount ([`Internal`]) has one of the small IDs below those,
+/// as Linux's `kern_mount`s take theirs first, at boot.
 fn mount_id(device: u64) -> u64 {
-    20 + (device & 0xff | (device >> 12) & !0xff)
+    match Internal::ALL.iter().position(|fs| fs.device() == device) {
+        Some(i) => i as u64 + 1,
+        None => 20 + (device & 0xff | (device >> 12) & !0xff),
+    }
 }
 /// `struct statx` with what [`encode_stat`] gives a `struct stat`: the basic
 /// fields, no birth time, and the mount's number as the device minor.

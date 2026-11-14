@@ -2365,10 +2365,11 @@ impl FileHandle for InetSocket {
         if let Some(listen) = &s.listen {
             return Ok((u32::from(!listen.ready.is_empty()) * IN, listen.arrivals, 0));
         }
-        // The stream's readiness is read before its phase, and a failure is
-        // noted from that one reading of the phase. A host connection moves
-        // on from connecting to open to failed at any time, so readings in
-        // that order never show a failed connection without its error, as
+        // The stream's readiness is read before its phase, and the failure
+        // is noted only when that phase is failed. A host connection moves
+        // on from connecting to open to failed at any time and never back,
+        // so `note`'s own later reading is failed too, and readings in this
+        // order never show a failed connection without its error, as
         // Linux's `tcp_done_with_error` writes `sk_err` before the state; a
         // change after them wakes the wait again.
         let read = s

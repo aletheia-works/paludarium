@@ -26,8 +26,6 @@ const NL_POLICY_TYPE_ATTR_MIN_VALUE_U: u16 = 4;
 const NL_POLICY_TYPE_ATTR_MAX_VALUE_U: u16 = 5;
 const NL_POLICY_TYPE_ATTR_MIN_LENGTH: u16 = 6;
 const NL_POLICY_TYPE_ATTR_MAX_LENGTH: u16 = 7;
-const NL_POLICY_TYPE_ATTR_BYTE_ORDER: u16 = 13;
-const NL_POLICY_BYTE_ORDER_BIG_ENDIAN: u32 = 2;
 const NL_ATTR_TYPE_U8: u32 = 2;
 const NL_ATTR_TYPE_U16: u32 = 3;
 const NL_ATTR_TYPE_U32: u32 = 4;
@@ -184,8 +182,8 @@ pub(crate) fn attributes(report: &Report, payload: &[u8], len: u32, error: i32) 
     out
 }
 /// An attribute's policy as `netlink_policy_dump_write_attr` writes it:
-/// its range or most length, then its type; none for `NLA_UNSPEC` and
-/// `NLA_REJECT`. x86-64 puts 64-bit values without padding.
+/// its range or most length, then its type; none for `NLA_UNSPEC`,
+/// `NLA_REJECT` and `NLA_BE32`. x86-64 puts 64-bit values without padding.
 fn policy_attributes(policy: Nla) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let unsigned = |out: &mut Vec<u8>, least: u64, most: u64| {
@@ -206,7 +204,9 @@ fn policy_attributes(policy: Nla) -> Option<Vec<u8>> {
         }
     };
     let kind = match policy {
-        Nla::Unspec(_) | Nla::Reject => return None,
+        // Linux 7.0, as CI's kernel, writes nothing for `NLA_BE32` either;
+        // master gives its range with `NL_POLICY_TYPE_ATTR_BYTE_ORDER`.
+        Nla::Unspec(_) | Nla::Reject | Nla::Be32 => return None,
         Nla::U8 => {
             unsigned(&mut out, 0, u8::MAX.into());
             NL_ATTR_TYPE_U8
@@ -221,15 +221,6 @@ fn policy_attributes(policy: Nla) -> Option<Vec<u8>> {
         }
         Nla::U32In(least, most) => {
             unsigned(&mut out, least.into(), most.into());
-            NL_ATTR_TYPE_U32
-        }
-        Nla::Be32 => {
-            attribute(
-                &mut out,
-                NL_POLICY_TYPE_ATTR_BYTE_ORDER,
-                &NL_POLICY_BYTE_ORDER_BIG_ENDIAN.to_le_bytes(),
-            );
-            unsigned(&mut out, 0, u32::MAX.into());
             NL_ATTR_TYPE_U32
         }
         Nla::S32 => {

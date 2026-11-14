@@ -2349,9 +2349,8 @@ fn remove(
 /// Linux's `madvise_populate` faults the pages in a page at a time: a page
 /// no mapping holds ends it with `ENOMEM`, one whose mapping may not be read
 /// (or, with `write`, written), or that maps a `memfd_secret` file, with
-/// `EINVAL`, and one that cannot be
-/// brought in (past the end of its file, `SIGBUS`) with `EFAULT`, after the
-/// pages before it. A read maps what a read would (the zero page of
+/// `EINVAL`, and one that cannot be brought in (past the end of its file,
+/// `SIGBUS`) with `EFAULT`, after the pages before it. A read maps what a read would (the zero page of
 /// private anonymous memory); a write breaks copy-on-write as a write
 /// would, and leaves the bytes as they are.
 fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), Errno> {
@@ -2538,7 +2537,8 @@ fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if len == 0 {
         return ok(0);
     }
-    // A range that wraps past the top is `ENOMEM` before any VMA is looked at.
+    // A range that wraps past the top is Linux's `ENOMEM` before any VMA is
+    // looked at, so it skips this check and `covers` below refuses it.
     if flags & MS_SYNC != 0
         && addr
             .checked_add(len)

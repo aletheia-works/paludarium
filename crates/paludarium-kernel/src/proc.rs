@@ -1371,6 +1371,7 @@ mod tests {
         assert_eq!(path(b"/proc/8/task/../stat"), at(8, None, TaskEntry::Stat));
         assert_eq!(path(b"/proc/8/stat"), at(8, None, TaskEntry::Stat));
         assert_eq!(path(b"/proc/8/exe"), at(8, None, TaskEntry::Exe));
+        assert_eq!(path(b"/proc/8/root"), at(8, None, TaskEntry::Root));
         assert_eq!(path(b"/proc/8/environ"), at(8, None, TaskEntry::Environ));
         assert_eq!(
             path(b"/proc/thread-self"),

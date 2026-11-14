@@ -2133,10 +2133,11 @@ kernel.
   the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
-  unmarked; `maps` and `smaps` name a mapped file the same way. `status` has Linux's fields in Linux's order (umask, IDs, threads,
-  signal masks, capabilities and so on) and, of the memory ones, the locked
-  memory (`VmLck`); the other memory fields and the CPU ones are not there,
-  as nothing measures them. Any other path in this process's directory or
+  unmarked; `maps` and `smaps` name a mapped file the same way. `status`
+  has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
+  capabilities and so on) and, of the memory ones, the locked memory
+  (`VmLck`); the other memory fields and the CPU ones are not there, as
+  nothing measures them. Any other path in this process's directory or
   elsewhere under `/proc` is looked up in the filesystem like any path, so with
   `--mount /:/` it reaches the host's own `/proc`.
 - `/proc` lists what the filesystem has there that is not a process (with

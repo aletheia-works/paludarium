@@ -287,9 +287,8 @@ impl ThreadGroup {
     }
     /// Whether the process is on its way out with nothing left to run, as
     /// Linux's `__task_will_free_mem` asks: a fatal signal was sent to it
-    /// ([`Self::fatal_at_send`]) or it
-    /// has begun to exit, and it is not writing a core dump, which still
-    /// reads its memory.
+    /// ([`Self::fatal_at_send`]) or it has begun to exit, and it is not
+    /// writing a core dump, which still reads its memory.
     pub(crate) fn will_free_memory(&self) -> bool {
         let ending = self.killed.load(Ordering::SeqCst) || self.status().is_some();
         ending

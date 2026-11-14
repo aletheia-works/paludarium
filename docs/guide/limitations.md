@@ -219,11 +219,11 @@ verified.
     mapped. It refuses advice Linux does not know before any range
     (`EINVAL`), as Linux master does; the CI's kernel checks it with each
     range, so with no ranges, or only empty ones, it gives 0 there.
-  - A fatal signal other than SIGKILL sent to a process whose thread
-    already has a signal pending and is not running marks it as dying for
-    `process_mrelease`, where Linux's `wants_signal` passes over such a
-    thread, and marks the process only as one of its threads takes the
-    signal.
+  - A fatal signal other than SIGKILL marks a process as dying for
+    `process_mrelease` as it is sent even when the only thread that does
+    not block it already has a signal pending and is not running, or is
+    exiting. Linux's `wants_signal` passes over such a thread, so Linux
+    marks the process only once one of its threads takes the signal.
   - In a child of `fork`, `move_pages` shows a page of a program's own
     ELF segment that the loader wrote and nothing wrote since as there,
     where Linux copies no page table of a VMA without an `anon_vma`

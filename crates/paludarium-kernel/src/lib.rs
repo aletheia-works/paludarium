@@ -833,6 +833,22 @@ impl Kernel {
         }
     }
 
+    /// Whether the access a fault stopped can be made now.
+    fn accessible(
+        mem: &AddressSpace,
+        addr: paludarium_types::GuestAddr,
+        write: bool,
+        fetch: bool,
+    ) -> bool {
+        if fetch {
+            mem.fetch(addr, &mut [0]).is_ok()
+        } else if write {
+            mem.check_write(addr, 1).is_ok()
+        } else {
+            mem.check_read(addr, 1).is_ok()
+        }
+    }
+
     /// What a mapping that grows down may grow to for `thread`
     /// ([`AddressSpace::grow_down`]): its RLIMIT_STACK in bytes, and the
     /// pages it may have locked, its RLIMIT_MEMLOCK unless it has
@@ -859,16 +875,22 @@ impl Kernel {
         self.group.register(thread.tid, Arc::clone(&self.inbox));
         // A fault below a mapping that grows down extends it, and the
         // instruction runs again, as Linux's `lock_mm_and_find_vma` expands
-        // the stack VMA before it handles the fault.
+        // the stack VMA before it handles the fault. So it does when the
+        // access can be made by now, as another thread grew the mapping
+        // first; a fault the access still meets (a guard page, a page that
+        // cannot be executed) is the signal's, or the instruction would only
+        // fault again.
         if let ExitReason::PageFault {
             rip,
             addr,
+            write,
+            fetch,
             mapped: false,
             ..
         } = reason
             && {
                 let (stack, lock) = self.stack_limits(thread);
-                mem.grow_down(addr, stack, lock)
+                mem.grow_down(addr, stack, lock) || Self::accessible(mem, addr, write, fetch)
             }
         {
             thread.cpu.rip = rip;

@@ -3765,13 +3765,12 @@ impl AddressSpaceData {
     /// [`STACK_GUARD_GAP`] under `addr`, when the VMA would then be larger
     /// than `stack_limit` (`RLIMIT_STACK`), or when it is locked and its new
     /// pages would take the locked ones past `lock_limit` pages
-    /// (`acct_stack_growth`). Whether the access may be made again: it grew,
-    /// or another thread's access grew it first (a guard page there stays a
-    /// fault).
+    /// (`acct_stack_growth`). Whether it grew: an address something already
+    /// maps is not grown to.
     fn grow_down(&mut self, addr: u64, stack_limit: u64, lock_limit: u64) -> bool {
         let addr = addr & !(PAGE_SIZE - 1);
-        if let Some(mapping) = self.mapping_at(addr) {
-            return mapping.grows_down && !self.guarded(addr);
+        if self.mapping_at(addr).is_some() {
+            return false;
         }
         let Some((_, &next)) = self.mappings.range(addr..).next() else {
             return false;
@@ -5193,7 +5192,7 @@ impl AddressSpace {
     }
     /// Extends the mapping above `addr` down to it when it grows down and
     /// may, as Linux's page fault does (see [`AddressSpaceData::grow_down`]):
-    /// whether `addr` is mapped afterwards.
+    /// whether it grew.
     pub fn grow_down(&self, addr: GuestAddr, stack_limit: u64, lock_limit: u64) -> bool {
         self.locked().grow_down(addr.0, stack_limit, lock_limit)
     }

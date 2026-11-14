@@ -4000,6 +4000,41 @@ mod mprotect_order {
         assert_eq!(f.ret(10, &[at, 4096, 1 | GROWSDOWN]), 0);
         assert_eq!(prot_at(&f, at - 0x2000), Prot::READ);
         assert_eq!(prot_at(&f, at + 0x1000), Prot::READ_WRITE);
+        // Another thread grew it first: the access is made again, as a read
+        // of it can be made now (a write, to read-only memory, cannot).
+        let read = ExitReason::PageFault {
+            rip,
+            addr: GuestAddr(at - 0x1ff8),
+            write: false,
+            fetch: false,
+            mapped: false,
+            present: false,
+        };
+        assert_eq!(f.kernel.handle(&mut f.thread, &f.mem, read), Next::Resume);
+        // What the access still meets there is the signal's, not a retry: a
+        // guard page, or a page that cannot be executed.
+        f.mem
+            .guard(GuestAddr(at - 0x2000), at - 0x1000, true)
+            .unwrap();
+        let fetch = ExitReason::PageFault {
+            rip,
+            addr: GuestAddr(at),
+            write: false,
+            fetch: true,
+            mapped: false,
+            present: false,
+        };
+        let mut other = fixture();
+        assert_eq!(other.ret(9, &[at, 0x2000, 3, flags, u64::MAX, 0]), at);
+        assert_eq!(
+            other.kernel.handle(&mut other.thread, &other.mem, fetch),
+            Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
+        );
+        assert_eq!(
+            f.kernel.handle(&mut f.thread, &f.mem, fault(at - 0x1ff8)),
+            Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
+        );
+        let mut f = fixture();
         // Below memory that does not grow down, a fault is still SIGSEGV.
         let plain = 0x70_0000;
         assert_eq!(

@@ -528,8 +528,8 @@ fn a_mapping_that_grows_down_grows_as_linux_expand_downwards_does() {
     assert_eq!(start(&m), top - 3 * PAGE_SIZE);
     m.write(GuestAddr(top - 3 * PAGE_SIZE), &[7]).unwrap();
     assert!(m.view().vma_from(top).unwrap().flags & vm::GROWSDOWN != 0);
-    // Within it, it is already there; a guard page stays a fault.
-    assert!(m.grow_down(GuestAddr(top - PAGE_SIZE), u64::MAX, u64::MAX));
+    // Within it, nothing grows, a guard page included.
+    assert!(!m.grow_down(GuestAddr(top - PAGE_SIZE), u64::MAX, u64::MAX));
     m.guard(GuestAddr(top - PAGE_SIZE), top, true).unwrap();
     assert!(!m.grow_down(GuestAddr(top - PAGE_SIZE), u64::MAX, u64::MAX));
     m.guard(GuestAddr(top - PAGE_SIZE), top, false).unwrap();

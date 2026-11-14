@@ -34,6 +34,7 @@ mod ipc;
 mod kcmp;
 mod loopback;
 mod lsm;
+mod mctp;
 mod netlink;
 pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;

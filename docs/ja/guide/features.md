@@ -63,7 +63,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
-| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
+| ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、`AF_MCTP` のデータグラム、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
 
 - `readv`・`writev` とその位置指定版、`vmsplice`、`sendmsg`、`recvmsg` の `struct iovec` の配列は、
@@ -374,7 +374,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   この判定を飛ばしていました）。
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
-- [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET`、`AF_INET6`、`AF_NETLINK` に
+- [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET`、`AF_INET6`、`AF_NETLINK`、`AF_MCTP` に
   `EAFNOSUPPORT` を返します。
 - `epoll_wait`・`epoll_pwait`・`epoll_pwait2` は、Linux 6.12 より後のカーネルと同じ順番で引数を
   確かめます（6.12 は記述子より先に `maxevents` を確かめていました）。
@@ -1639,6 +1639,53 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     については、アドレス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
     グループは 32 です。誰でも入れますが、何も届きません。
+- MCTP のソケット（`AF_MCTP`、`SOCK_DGRAM`、プロトコル 0。ほかのプロトコルは
+  `EPROTONOSUPPORT`、その次にほかの型は `ESOCKTNOSUPPORT`）は、`CONFIG_MCTP` を組み込んだ
+  カーネルの Linux 7.0 の `af_mctp` と同じく、ネットワーク名前空間のループバックの MCTP
+  エンドポイント ID の間でメッセージを送受信します。
+  - **バインド:** `bind` は `sockaddr_mctp` を取ります（短いものや詰め物のあるものは
+    `EINVAL`、ほかのファミリーは `EAFNOSUPPORT`、`CAP_NET_BIND_SERVICE` がなければ
+    `EACCES`）。中身は、整合性検査のビットを除いたメッセージの型、ローカルのエンドポイント
+    ID か `MCTP_ADDR_ANY`、ネットワークです。ID があって `MCTP_NET_ANY` なら、既定の
+    ネットワーク（1）になります。同じようにバインドするソケットは 2 つ持てず、1 つの
+    ソケットは 1 度しかバインドできません（`EADDRINUSE`）。その前の `connect` は、
+    バインドが受け取る相手と型を決めます（長さが 12 でないもの、タグや整合性検査の
+    ビットのあるもの、それと違う型やネットワークのバインドは `EINVAL`。バインドや
+    `connect` の後は `EADDRINUSE`）。
+  - **送信:** `sendto` と `sendmsg` には、欠けも詰め物もなく、タグのビットがタグ・
+    `MCTP_TAG_OWNER`・`MCTP_TAG_PREALLOC` だけで、最後のものには持ち主のビットもある
+    アドレス（違えば `EINVAL`。なければ `EDESTADDRREQ` で、`write` も同じです）と
+    `CAP_NET_RAW`（`EACCES`）が要ります。メッセージは型を先頭に、`mctp_route_lookup` と
+    同じくゲートウェイをたどってローカルの経路に至る経路で（なければ `EHOSTUNREACH`）、
+    ループバックの最初の MCTP アドレスから、途中のいちばん小さい MTU のパケットに
+    分けて送ります。パケットはすぐに受け取られ（`mctp_dst_input`）、そこでのエラーが
+    送信のエラーになります。受け取る鍵もバインドもなければ `ENOENT`、受信バッファが
+    いっぱいなら `ENOMEM`（Linux と同じく各パケットの `truesize` で数えます）、
+    どの鍵も組み立て直さない 64 KiB を超えるメッセージは `EINVAL` です。バッファに
+    収まらない長さ（`kmalloc` の 4 MiB）は `ENOBUFS` です。
+  - **受信:** メッセージは、タグとアドレスが一致する鍵のソケットに届きます。送り手が
+    タグを持つメッセージの始まりなら、その型のバインドに Linux の順番で届きます。
+    宛先と送り手の両方、送り手、宛先、そのネットワークの任意のアドレス、任意の
+    ネットワークの順です。`recvfrom` と `recvmsg` は、その中身と、ネットワーク・送り手・
+    型・タグの `sockaddr_mctp` を返します。フラグは `MSG_PEEK`、`MSG_TRUNC`、
+    `MSG_DONTWAIT` だけを取ります（ほかは `EOPNOTSUPP`）。
+  - **タグ:** `MCTP_TAG_OWNER` の送信は、相手への鍵がまだ持っていないいちばん小さい
+    タグを取ります（8 つとも取られていれば `EBUSY`）。その鍵は 6 秒の間か、そのタグの
+    答えが来るまで残ります。`SIOCMCTPALLOCTAG` と `SIOCMCTPALLOCTAG2` は手でタグを作り
+    （タグ・フラグ・ローカルの ID のある要求は `EINVAL`）、`MCTP_TAG_PREALLOC` の送信が
+    それを使います（作っていないものは `ENOENT`）。そのタグは `SIOCMCTPDROPTAG` か
+    `SIOCMCTPDROPTAG2` が捨てるまで残ります（なければ `EINVAL`）。ソケット自身の
+    ほかの `ioctl` は、`FIONREAD` も含めてすべて `EINVAL` です。
+  - **ハードウェアアドレス:** `MCTP_OPT_ADDR_EXT`（`SOL_MCTP`。ちょうど `int` の大きさで、
+    違えば `EINVAL`）を付けると、`sockaddr_mctp_ext` はインターフェースの番号と
+    ハードウェアアドレスでループバックの外に送ります（ほかの番号は `ENOENT`、6 バイトで
+    ないアドレスや詰め物は `EINVAL`）。ループバックは `mctp_pkttype_receive` と同じく
+    それを受け取り直し、どうなったかは送り手に伝えません。ループバックが下りている間は
+    `ENOBUFS` です。そのとき受け取るメッセージは、入ってきたインターフェース（なければ
+    0）を示します。
+  - **そのほか:** `getsockname`、`getpeername`、`listen`、`accept`、`shutdown`、`socketpair` は
+    `EOPNOTSUPP` です。`SOL_SOCKET` と `SOL_MCTP` 以外のレベルの `setsockopt` と
+    `getsockopt` は `EINVAL` です。
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、

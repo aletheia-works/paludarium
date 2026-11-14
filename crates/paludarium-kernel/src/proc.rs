@@ -1561,6 +1561,7 @@ mod generated_tests {
         assert_eq!(entry(b"/proc/self/comm"), Some(OwnEntry::Comm));
         assert_eq!(entry(b"/proc/self/exe"), Some(OwnEntry::Exe));
         assert_eq!(entry(b"/proc/self/cwd"), Some(OwnEntry::Cwd));
+        assert_eq!(entry(b"/proc/self/root"), Some(OwnEntry::Root));
         assert_eq!(entry(b"/proc/8/stat"), None);
         assert_eq!(system_entry(b"/proc/loadavg"), Some(SystemEntry::Loadavg));
         assert_eq!(system_entry(b"/proc/meminfo"), Some(SystemEntry::Meminfo));

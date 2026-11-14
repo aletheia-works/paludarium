@@ -2112,8 +2112,8 @@ kernel.
   and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
-  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd`, `root`, `ns` (0511) and
-  `task`, made as
+  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd`, `root`, `ns`
+  (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of

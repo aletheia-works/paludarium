@@ -235,7 +235,7 @@ fn bitmap(mem: &AddressSpace, at: u64, bits: u64, out: &mut [u64]) -> Result<(),
     for (i, word) in bytes.as_chunks::<8>().0.iter().enumerate() {
         out[i] = u64::from_le_bytes(*word);
     }
-    if bits % 64 != 0 {
+    if !bits.is_multiple_of(64) {
         out[words - 1] &= (1u64 << (bits % 64)) - 1;
     }
     Ok(())

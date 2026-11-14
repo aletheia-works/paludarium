@@ -593,7 +593,7 @@ fn falling_through_offers_every_instruction_and_decodes_once() {
 fn an_instruction_turned_down_inside_a_block_is_not_offered_again() {
     let (_, memory) = machine();
     let mut cache = DecodeCache::new();
-    let even = |rip: u64| rip % 2 == 0;
+    let even = |rip: u64| rip.is_multiple_of(2);
     let (offered, _) = offered_in_one_block(&memory, &mut cache, true, even);
     assert_eq!(offered.len(), 32);
     let odd = (4096..4096 + 32).filter(|r| r % 2 == 1).collect::<Vec<_>>();
@@ -613,7 +613,7 @@ fn without_cached_rejections_every_instruction_is_offered_again() {
     let (_, memory) = machine();
     let mut cache = DecodeCache::new();
     let all = (4096..4096 + 32).collect::<Vec<_>>();
-    let even = |rip: u64| rip % 2 == 0;
+    let even = |rip: u64| rip.is_multiple_of(2);
     assert_eq!(
         offered_in_one_block(&memory, &mut cache, false, even),
         (all.clone(), 32)

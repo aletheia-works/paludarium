@@ -1998,7 +1998,7 @@ fn select(
                 .read_u64(GuestAddr(at.wrapping_add(index as u64 * 8)))
                 .map_err(|_| Errno::EFAULT)?;
         }
-        if n % 64 != 0
+        if !n.is_multiple_of(64)
             && let Some(last) = set.last_mut()
         {
             *last &= (1u64 << (n % 64)) - 1;
@@ -3867,7 +3867,7 @@ fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .map(|word| u64::from_le_bytes(*word))
         .collect();
     // Only the CPUs the host has.
-    if cpus % 64 != 0
+    if !cpus.is_multiple_of(64)
         && let Some(last) = mask.last_mut()
     {
         *last &= (1u64 << (cpus % 64)) - 1;

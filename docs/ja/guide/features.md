@@ -270,7 +270,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   触れられません。`MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は `EINVAL`、`mlock` は
   `ENOMEM` です。`mlock_fixup` がその VMA に `VM_LOCKONFAULT` を付けないので、
   `MLOCK_ONFAULT` でも同じです。ファイルに `fsync` がないので、`MS_SYNC` の `msync` も、
-  範囲に穴があってもそのマッピングに着けば `EINVAL` です。ページはエミュレータのものなので、
+  範囲に穴があってもそのマッピングに着けば `EINVAL` です。ページフォールトでページを
+  割り当てるのは、そのユーザーが作ったファイルのページが、フォールトしたプロセスの
+  `RLIMIT_MEMLOCK` に収まる間だけです（超えると `CAP_IPC_LOCK` の有無によらず `SIGBUS`）。
+  Linux master の secretmem が作ったユーザーの `locked_vm` に数えるのと同じく、ページは
+  マップしているかによらず、ファイルがなくなるまで数えます。ページはエミュレータのものなので、
   ゲストのほかのメモリと同じだけしか秘密になりません。
 - `openat2` は `openat` と同じように開き（FIFO も）、`struct open_how` を Linux と同じく
   より厳しく調べます。24 バイトに満たない大きさは `EINVAL`、1 ページを超えるものや、

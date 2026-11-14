@@ -9513,6 +9513,54 @@ static int memfd_secret_case(void) {
     printf("reopen=%ld\n", secret_errno(open(link, O_RDWR)));
     return 0;
 }
+/* What a memfd_secret file's pages charge, as Linux master's secretmem:
+ * a fault brings a page in only within RLIMIT_MEMLOCK (else SIGBUS), and
+ * the pages count against the user who made the file until it goes, not
+ * while they are mapped. */
+static int memfd_secret_memlock_case(void) {
+    long page = 4096;
+    struct rlimit limit = {2 * page, 2 * page}, old;
+    if (getrlimit(RLIMIT_MEMLOCK, &old)) return 80;
+    limit.rlim_max = old.rlim_max;
+    if (setrlimit(RLIMIT_MEMLOCK, &limit)) return 81;
+    struct sigaction action = {0}, before;
+    action.sa_sigaction = on_bus;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGBUS, &action, &before)) return 82;
+    int fd = (int)syscall(447, 0L);
+    if (fd < 0) {
+        printf("memfd_secret=%d\n", -errno);
+        return 0;
+    }
+    if (ftruncate(fd, 4 * page)) return 83;
+    /* The mapping may be larger than the limit. */
+    char *m = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    printf("map=%ld\n", m == MAP_FAILED ? (long)-errno : 0L);
+    if (m == MAP_FAILED) return 0;
+    touch("first", m, 1);
+    touch("second", m + page, 0);
+    touch("third", m + 2 * page, 0);
+    /* Unmapping keeps them charged: the file still has them. */
+    munmap(m, 4 * page);
+    char *again = mmap(NULL, 4 * page, PROT_READ, MAP_SHARED, fd, 0);
+    if (again == MAP_FAILED) return 84;
+    touch("again first", again, 0);
+    touch("again fourth", again + 3 * page, 0);
+    /* Another file of the same user finds no room either. */
+    int other = (int)syscall(447, 0L);
+    if (other < 0 || ftruncate(other, page)) return 85;
+    char *o = mmap(NULL, page, PROT_READ, MAP_SHARED, other, 0);
+    if (o == MAP_FAILED) return 86;
+    touch("other", o, 0);
+    /* Once the first file goes, its pages do. */
+    munmap(again, 4 * page);
+    close(fd);
+    touch("other after close", o, 0);
+    sigaction(SIGBUS, &before, NULL);
+    setrlimit(RLIMIT_MEMLOCK, &old);
+    return 0;
+}
 static int pkey_case(void) {
     long page = 4096;
     char *base = mmap(NULL, 4 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -21805,6 +21853,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mseal")) return mseal_case();
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
     if (!strcmp(mode, "memfd-secret")) return memfd_secret_case();
+    if (!strcmp(mode, "memfd-secret-memlock")) return memfd_secret_memlock_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();

@@ -6817,6 +6817,37 @@ mod madvise_advice {
         assert_eq!(f.ret(28, &[ring, PAGE, 102]), errno(Errno::EINVAL));
         assert_eq!(f.ret(28, &[ring, PAGE, 103]), errno(Errno::EINVAL));
     }
+    #[test]
+    fn secret_pages_count_against_memlock_until_the_file_goes() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        // RLIMIT_MEMLOCK of two pages.
+        f.mem.write_u64(GuestAddr(DATA), 2 * PAGE).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 8), u64::MAX).unwrap();
+        assert_eq!(f.ret(160, &[8, DATA]), 0);
+        let fd = f.ret(447, &[0]);
+        assert_eq!(f.ret(77, &[fd, 4 * PAGE]), 0);
+        // The mapping may be larger than the limit; a fault past it is a
+        // bus error.
+        let at = f.ret(mmap, &[0, 4 * PAGE, 3, 1, fd, 0]);
+        f.mem.write(GuestAddr(at), b"s").unwrap();
+        f.mem.read(GuestAddr(at + PAGE), &mut [0]).unwrap();
+        let fault = f.mem.read(GuestAddr(at + 2 * PAGE), &mut [0]).unwrap_err();
+        assert!(fault.bus, "{fault:?}");
+        // MS_SYNC fsyncs a file that has none; MS_ASYNC does nothing; GUP
+        // refuses secret memory.
+        assert_eq!(f.ret(26, &[at, 4 * PAGE, 4]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(26, &[at, 4 * PAGE, 1]), 0);
+        assert_eq!(f.ret(28, &[at, PAGE, 22]), errno(Errno::EINVAL));
+        // Unmapped, the pages stay charged; once the file goes they do not.
+        assert_eq!(f.ret(11, &[at, 4 * PAGE]), 0);
+        let other = f.ret(447, &[0]);
+        assert_eq!(f.ret(77, &[other, PAGE]), 0);
+        let o = f.ret(mmap, &[0, PAGE, 1, 1, other, 0]);
+        assert!(f.mem.read(GuestAddr(o), &mut [0]).unwrap_err().bus);
+        assert_eq!(f.ret(3, &[fd]), 0);
+        f.mem.read(GuestAddr(o), &mut [0]).unwrap();
+    }
     fn status(f: &mut Fixture, at: u64) -> i32 {
         f.mem.write_u64(GuestAddr(DATA + 0x200), at).unwrap();
         assert_eq!(f.ret(279, &[0, 1, DATA + 0x200, 0, DATA + 0x300, 0]), 0);

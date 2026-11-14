@@ -199,11 +199,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - いくつかのメッセージのあとで `recvmmsg` を終わらせたエラーは捨てます。Linux はこれを
     ソケットのエラーとして残し、次の呼び出しと `SO_ERROR` で返します。また `recvmmsg` は、
     ソケットに残っているエラーを先に返しません。
-  - `memfd_secret` のファイルのページは `RLIMIT_MEMLOCK` に数えません。Linux 7.3 以降は、
-    ページフォールトのときにユーザーの分として数え、それを超えると `SIGBUS` です。それより前の
-    カーネルはマッピングをロックしたものとして数え、超えると `mmap` が `EAGAIN` です。その前の
-    カーネルではマッピングがロックされているので、`MS_INVALIDATE` の `msync` は `EBUSY` に
-    なります。ここでは Linux 7.3 と同じく成功します。
+  - `memfd_secret` のページのフォールトは、フォールトしたプロセスの最後のシステムコールの
+    ときの `RLIMIT_MEMLOCK` で決めます（システムコールの前は、作ったプロセスのものです）。
+    数えるのは `memfd_secret` のファイルのページだけです。Linux のユーザーの `locked_vm` は、
+    `io_uring` のバッファなども数えます。ページをフォールトのときに数える変更
+    （97d34aa65c29「mm/secretmem: properly account locked pages」）のないカーネルは、
+    代わりにマッピングをロックしたものとして数えます。上限を超えると `mmap` が `EAGAIN` で、
+    そのマッピングの `MS_INVALIDATE` の `msync` は `EBUSY` です。ここでは、変更のある
+    カーネルと同じく成功します。
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）と `RLIMIT_CPU` は、
     どれもプロセスの CPU 時間のすべてを数えます。ここではそのすべてがユーザーの時間だからです
     （Linux の `ITIMER_VIRTUAL` はシステムの時間を数えず、`RLIMIT_CPU` は数えます）。WebAssembly のように

@@ -1100,6 +1100,13 @@ pub trait PageSource: Send + Sync {
     fn merges(&self) -> bool {
         true
     }
+    /// Whether the page at `offset` may come into the file's memory, which
+    /// an access to it asks each time: `false` makes the access a bus
+    /// error (`SIGBUS`), as secretmem's fault past `RLIMIT_MEMLOCK` is.
+    fn admit(&self, offset: u64) -> bool {
+        let _ = offset;
+        true
+    }
     /// Whether the memory's VMAs are fixed mappings that core mm does not
     /// back (Linux's `VM_DONTEXPAND`, as the rings of AIO and `io_uring`
     /// are): they take no guard regions.
@@ -2340,6 +2347,17 @@ impl AddressSpaceData {
             match self.prot_at(directory, page) {
                 Some(prot) if access.permitted(prot) => {}
                 _ => return Err(fault(at)),
+            }
+            // A shared page its memory refuses to take in is a bus error.
+            if access != Access::Setup
+                && let Some(shared) = self.shared_at(page)
+                && let Some(source) = &shared.pages.source
+                && !source.admit(page.wrapping_add(shared.shift))
+            {
+                return Err(Fault {
+                    bus: true,
+                    ..fault(at)
+                });
             }
             let file = lookup(directory, page).map_or_else(
                 || {

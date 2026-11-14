@@ -520,7 +520,7 @@ impl FileCache {
         offset: u64,
         len: u64,
         may_write: bool,
-        secret: bool,
+        charge: Option<Arc<crate::memfd::SecretCharge>>,
     ) -> Result<SharedPages, Errno> {
         let size = file.stat()?.size;
         let end = offset.saturating_add(len);
@@ -542,7 +542,9 @@ impl FileCache {
             cache: Arc::clone(self),
             writable: may_write,
         }));
-        Ok(mapped.with_source(FilePages::new(file, name, self, secret)))
+        // Only a `memfd_secret` file's pages charge anything.
+        let secret = charge.is_some();
+        Ok(mapped.with_source(FilePages::new(file, name, self, secret, charge)))
     }
     /// The pages for a new private mapping of `file`, named `name`, which
     /// reads them from the file on first touch.
@@ -556,7 +558,7 @@ impl FileCache {
                 cache: Arc::clone(self),
                 writable: false,
             }))
-            .with_source(FilePages::new(file, name, self, false))
+            .with_source(FilePages::new(file, name, self, false, None))
     }
     /// Whether a mapping that may write shows the cache.
     pub(crate) fn mapped_writable(&self) -> bool {
@@ -622,6 +624,9 @@ pub(crate) struct FilePages {
     name: Option<Vec<u8>>,
     /// The file is a `memfd_secret` file, whose own handle `file` is not.
     secret: bool,
+    /// What the pages of a `memfd_secret` file charge as faults bring
+    /// them in.
+    charge: Option<Arc<crate::memfd::SecretCharge>>,
 }
 
 impl FilePages {
@@ -630,12 +635,14 @@ impl FilePages {
         name: Option<Vec<u8>>,
         cache: &Arc<FileCache>,
         secret: bool,
+        charge: Option<Arc<crate::memfd::SecretCharge>>,
     ) -> Arc<Self> {
         Arc::new(FilePages {
             file: Arc::clone(file),
             cache: Arc::clone(cache),
             name,
             secret,
+            charge,
         })
     }
     /// The open file the mapping was made of.
@@ -683,6 +690,11 @@ impl paludarium_mmu::PageSource for FilePages {
     }
     fn open_file(&self) -> usize {
         Arc::as_ptr(&self.file).cast::<()>() as usize
+    }
+    fn admit(&self, offset: u64) -> bool {
+        self.charge
+            .as_ref()
+            .is_none_or(|charge| charge.admit(offset))
     }
     fn secret(&self) -> bool {
         self.secret

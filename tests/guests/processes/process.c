@@ -6324,6 +6324,57 @@ static int mrelease_case(void) {
     printf("reaped=%ld\n", reaped);
     return 0;
 }
+/* A fatal signal other than SIGKILL marks the process as dying as it is
+ * sent, as Linux's complete_signal starts the group exit, so that
+ * process_mrelease finds its memory on its way out: one with its default
+ * action, unblocked, that dumps no core, to a process not stopped. */
+static void mrelease_fatal_handler(int sig) { (void)sig; }
+/* A child that handles SIGTERM (1), blocks SIGUSR1 (2) or neither (0),
+ * and says so on `ready` before it waits. */
+static pid_t mrelease_fatal_child(int how, int ready) {
+    pid_t child = fork();
+    if (child != 0) return child;
+    if (how == 1) signal(SIGTERM, mrelease_fatal_handler);
+    if (how == 2) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+    }
+    if (write(ready, "r", 1) != 1) _exit(1);
+    for (;;) pause();
+}
+static int mrelease_fatal_case(void) {
+    const char *names[] = {"handled", "blocked", "default", "stopped"};
+    int signals[] = {SIGTERM, SIGUSR1, SIGUSR2, SIGTERM};
+    for (int how = 0; how < 4; how++) {
+        int pipes[2];
+        if (pipe(pipes)) return 80;
+        pid_t child = mrelease_fatal_child(how == 0 ? 1 : how == 1 ? 2 : 0, pipes[1]);
+        if (child < 0) return 81;
+        char byte;
+        if (read(pipes[0], &byte, 1) != 1) return 82;
+        close(pipes[0]);
+        close(pipes[1]);
+        int status;
+        if (how == 3) {
+            kill(child, SIGSTOP);
+            if (waitpid(child, &status, WUNTRACED) != child || !WIFSTOPPED(status)) return 83;
+        }
+        int pidfd = syscall(SYS_pidfd_open, child, 0);
+        if (pidfd < 0) return 84;
+        kill(child, signals[how]);
+        long r = mrelease_errno(pidfd, 0);
+        close(pidfd);
+        if (how == 2 && (r == 0 || r == -ESRCH))
+            printf("%s=released-or-gone\n", names[how]);
+        else
+            printf("%s=%ld\n", names[how], r);
+        kill(child, SIGKILL);
+        if (waitpid(child, &status, 0) != child) return 85;
+    }
+    return 0;
+}
 /* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
  * VM_LOCKONFAULT: VMAs of their own, advice that drops or ages pages
  * refused (EINVAL), MS_INVALIDATE refused (EBUSY), and no lock in a forked
@@ -21879,6 +21930,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
+    if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
     if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();

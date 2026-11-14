@@ -1903,10 +1903,12 @@ impl Processes {
             }
             return Ok(());
         }
+        // Whether it ends the whole process from the moment it is sent, as
+        // Linux's complete_signal marks it, depends on the process as it
+        // takes it.
+        let fatal = entry.status.is_none() && entry.group.fatal_at_send(number, thread);
         send(&entry.group)?;
-        // SIGKILL ends the whole process from the moment it is sent, as
-        // Linux's complete_signal marks it.
-        if number == 9 {
+        if fatal {
             entry.group.set_killed();
         }
         Ok(())

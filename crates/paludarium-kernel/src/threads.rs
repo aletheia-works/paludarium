@@ -245,14 +245,50 @@ impl ThreadGroup {
     pub(crate) fn blocked(&self, tid: u32) -> u64 {
         self.public(tid).map_or(0, |thread| thread.blocked)
     }
-    /// Marks the process as killed: a SIGKILL was sent to it.
+    /// Whether signal `number`, sent now to thread `thread` or to the
+    /// process, ends the whole process at once, as Linux's
+    /// `complete_signal` starts a group exit as it sends it: its action is
+    /// the default (`sig_fatal`: neither ignored nor stopping), which
+    /// writes no core (`sig_kernel_coredump`), and a thread that takes it
+    /// (`thread`, or any of the process's) does not block it; a stopped
+    /// process takes none but SIGKILL then (`wants_signal`).
+    pub(crate) fn fatal_at_send(&self, number: i32, thread: Option<u32>) -> bool {
+        if number == 9 {
+            return true;
+        }
+        // SIGCHLD, SIGCONT, SIGURG and SIGWINCH are ignored by default, and
+        // SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU stop; SIGQUIT, SIGILL,
+        // SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGXCPU, SIGXFSZ and
+        // SIGSYS dump a core, which their taker starts.
+        const NOT_AT_SEND: [i32; 18] = [
+            17, 18, 23, 28, 19, 20, 21, 22, 3, 4, 5, 6, 7, 8, 11, 24, 25, 31,
+        ];
+        if !(1..=64).contains(&number) || NOT_AT_SEND.contains(&number) || self.is_stopped() {
+            return false;
+        }
+        let default = self
+            .shared_actions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&number)
+            .is_none_or(|action| action.handler == 0);
+        let bit = 1u64 << (number - 1);
+        let public = self.public.lock().unwrap_or_else(PoisonError::into_inner);
+        let wanted = match thread {
+            Some(tid) => public.get(&tid).is_some_and(|t| t.blocked & bit == 0),
+            None => public.values().any(|t| t.blocked & bit == 0),
+        };
+        default && wanted
+    }
+    /// Marks the process as killed: a fatal signal was sent to it
+    /// ([`Self::fatal_at_send`]).
     pub(crate) fn set_killed(&self) {
         self.killed.store(true, Ordering::SeqCst);
     }
     /// Whether the process is on its way out with nothing left to run, as
-    /// Linux's `__task_will_free_mem` asks: a SIGKILL was sent to it or it
-    /// has begun to exit, and it is not writing a core dump, which still
-    /// reads its memory.
+    /// Linux's `__task_will_free_mem` asks: a fatal signal was sent to it
+    /// ([`Self::fatal_at_send`]) or it has begun to exit, and it is not
+    /// writing a core dump, which still reads its memory.
     pub(crate) fn will_free_memory(&self) -> bool {
         let ending = self.killed.load(Ordering::SeqCst) || self.status().is_some();
         ending

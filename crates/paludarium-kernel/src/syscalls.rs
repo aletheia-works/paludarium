@@ -629,11 +629,12 @@ fn sleep(c: &mut Context<'_>, clock: SleepClock, absolute: bool, req: u64, rem: 
     } else {
         now.saturating_add(request).min(i64::MAX as u64)
     };
-    sleep_until(c, clock, absolute, deadline, rem)
+    sleep_until(c, clock, absolute, deadline, rem, Some(now))
 }
 
 /// The time of the clock a sleep counts on; the process's CPU time takes
-/// in the caller's first.
+/// in the caller's first. Another task's CPU time is `ESRCH` once the task
+/// has gone (a process once it is reaped, a thread once it has exited).
 fn sleep_clock_now(c: &mut Context<'_>, clock: SleepClock) -> Result<u64, Errno> {
     match clock {
         SleepClock::Host(id) => c.host.clock(id),
@@ -641,6 +642,12 @@ fn sleep_clock_now(c: &mut Context<'_>, clock: SleepClock) -> Result<u64, Errno>
             crate::account_cpu(c.host, c.group, c.process, c.tid);
             Ok(c.group.process_cpu())
         }
+        SleepClock::Process(pid) => c
+            .processes
+            .view(pid)
+            .map(|view| view.group.process_cpu())
+            .ok_or(Errno(3)),
+        SleepClock::Thread(tid) => c.group.thread_cpu(tid).ok_or(Errno(3)),
     }
 }
 
@@ -649,28 +656,49 @@ fn sleep_clock_now(c: &mut Context<'_>, clock: SleepClock) -> Result<u64, Errno>
 /// Linux does: a relative sleep through `restart_syscall` with the same
 /// deadline, an absolute one by running the call again.
 ///
-/// On the process's CPU clock the other threads account their CPU time at
-/// each checkpoint while the sleep lasts, and the sleep looks at the total
-/// every tick ([`scheduler_slice`]), as Linux's tick checks the timer its
-/// `do_cpu_nanosleep` arms. A signal that comes once the deadline has
-/// passed ends the sleep with 0, as Linux finds its timer fired.
+/// On a CPU clock the threads whose time it counts account their CPU time
+/// at each checkpoint while the sleep lasts, and the sleep looks at the
+/// total every tick ([`scheduler_slice`]), as Linux's tick checks the timer
+/// its `do_cpu_nanosleep` arms. A signal that comes once the deadline has
+/// passed ends the sleep with 0, as Linux finds its timer fired. Another
+/// task that goes leaves the sleep waiting until a signal, which ends it
+/// as it ends any, but with the whole request as the time left: Linux's
+/// `posix_cpu_timer_set` finds no task and gives back nothing, so
+/// `do_cpu_nanosleep` copies out what it was asked. A restart then finds
+/// no task (`EINVAL`), as `posix_cpu_nsleep_restart` does.
 fn sleep_until(
     c: &mut Context<'_>,
     clock: SleepClock,
     absolute: bool,
     deadline: u64,
     rem: u64,
+    mut start: Option<u64>,
 ) -> Outcome {
     let group = c.group;
-    let _sleeping = (clock == SleepClock::ProcessCpu).then(|| group.cpu_sleep());
+    let target = match clock {
+        SleepClock::Process(pid) => c.processes.view(pid).map(|view| view.group),
+        _ => None,
+    };
+    let _sleeping = match clock {
+        SleepClock::ProcessCpu | SleepClock::Thread(_) => Some(group.cpu_sleep()),
+        _ => None,
+    };
+    let _target_sleeping = target.as_deref().map(crate::ThreadGroup::cpu_sleep);
+    // `start` is the clock's time as the sleep began (none for a restart),
+    // for the time left once its task has gone.
     loop {
         let timer_generation = c.group.timer_generation();
+        // A task that has gone never reaches the deadline; one gone before
+        // a restart is no clock at all.
         let clock_now = match sleep_clock_now(c, clock) {
             Ok(t) => t,
+            Err(_) if clock.is_cpu() && start.is_some() => 0,
+            Err(_) if clock.is_cpu() => return err(Errno::EINVAL),
             Err(e) => return err(e),
         };
+        start.get_or_insert(clock_now);
         // Linux fires a CPU timer set to a time that has passed at once.
-        if clock == SleepClock::ProcessCpu && clock_now >= deadline {
+        if clock.is_cpu() && clock_now >= deadline {
             return ok(0);
         }
         let mono_now = match c.host.clock(ClockId::Monotonic) {
@@ -692,7 +720,7 @@ fn sleep_until(
                     let next = timer_deadline.map_or(deadline, |t| deadline.min(t));
                     c.host.wait_until(id, next, c.cancellation)
                 }
-                SleepClock::ProcessCpu => {
+                SleepClock::ProcessCpu | SleepClock::Process(_) | SleepClock::Thread(_) => {
                     let tick = mono_now.saturating_add(scheduler_slice(c.host).tick);
                     let next = signals::next_deadline(c.process).map_or(tick, |t| tick.min(t));
                     // A wait the tick ends is complete, and the deadline is
@@ -729,14 +757,24 @@ fn sleep_until(
                 continue;
             }
             Ok(WaitOutcome::Complete) if !pending && !interrupted && c.group.status().is_none() => {
-                if sleep_clock_now(c, clock).is_ok_and(|now| now < deadline) {
+                // A CPU clock whose task has gone never gets there.
+                let reached = match sleep_clock_now(c, clock) {
+                    Ok(now) => now >= deadline,
+                    Err(_) => !clock.is_cpu(),
+                };
+                if !reached {
                     continue;
                 }
                 return ok(0);
             }
             Ok(WaitOutcome::Complete) | Ok(WaitOutcome::Interrupted) => {
-                let now = sleep_clock_now(c, clock).unwrap_or(deadline);
-                if clock == SleepClock::ProcessCpu && now >= deadline {
+                let now = match sleep_clock_now(c, clock) {
+                    Ok(now) => now,
+                    // The task has gone: the whole request is left.
+                    Err(_) if clock.is_cpu() => start.unwrap_or(deadline),
+                    Err(_) => deadline,
+                };
+                if clock.is_cpu() && now >= deadline {
                     return ok(0);
                 }
                 if !absolute
@@ -1349,30 +1387,25 @@ fn sys_nanosleep(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// A sleep on a CPU clock named by a negative ID, as Linux's
 /// `posix_cpu_nsleep` checks it: the request is read first, then the
 /// caller's own thread's clock is refused (`EINVAL`), then the clock's
-/// task is looked for ([`cpu_clock`], `EINVAL`). The caller's process's
-/// clock sleeps as `CLOCK_PROCESS_CPUTIME_ID` does. On another task's, a
-/// sleep whose time has already come (a relative 0, or an absolute time
-/// the clock has reached) returns at once, as Linux's does; one that would
-/// wait for that task's CPU time is not modelled (`EINVAL`).
+/// task is looked for ([`cpu_clock`], `EINVAL`). Then it sleeps until that
+/// clock reaches its time, as `CLOCK_PROCESS_CPUTIME_ID` does
+/// ([`sleep_until`]): on the caller's process's clock, another process's,
+/// or another thread's of its process.
 fn cpu_sleep(c: &mut Context<'_>, id: i32, a: [u64; 6]) -> Outcome {
-    let absolute = a[1] & 1 != 0;
-    let request = match read_timespec(c.mem, a[2]) {
-        Ok(t) => t,
-        Err(e) => return err(e),
-    };
+    if let Err(e) = read_timespec(c.mem, a[2]) {
+        return err(e);
+    }
     let clock = match cpu_clock(c, id, false) {
-        Ok(GuestClock::ThreadCpu) | Err(_) => return err(Errno::EINVAL),
-        Ok(GuestClock::ProcessCpu) => {
-            return sleep(c, SleepClock::ProcessCpu, absolute, a[2], a[3]);
-        }
-        Ok(clock) => clock,
+        Ok(GuestClock::ProcessCpu) => SleepClock::ProcessCpu,
+        Ok(GuestClock::OtherThreadCpu(tid)) => SleepClock::Thread(tid),
+        // cpu_clock found the process by this number.
+        Ok(GuestClock::OtherProcessCpu(_)) => match c.pid_space().task(!(id >> 3) as u32) {
+            Some(pid) => SleepClock::Process(pid),
+            None => return err(Errno::EINVAL),
+        },
+        _ => return err(Errno::EINVAL),
     };
-    let due = match read_clock(c, clock) {
-        Ok(now) if absolute => request <= now,
-        Ok(_) => request == 0,
-        Err(e) => return err(e),
-    };
-    if due { ok(0) } else { err(Errno::EINVAL) }
+    sleep(c, clock, a[1] & 1 != 0, a[2], a[3])
 }
 /// `clock_nanosleep(clock, flags, request, remain)`: on the clocks
 /// [`timer_clock`] gives, looking at no flag but `TIMER_ABSTIME` (an alarm
@@ -1612,7 +1645,7 @@ fn sys_restart_syscall(c: &mut Context<'_>, _: [u64; 6]) -> Outcome {
             clock,
             deadline,
             rem,
-        }) => sleep_until(c, clock, false, deadline, rem),
+        }) => sleep_until(c, clock, false, deadline, rem, None),
         Some(signals::RestartBlock::Poll {
             fds,
             nfds,

@@ -199,6 +199,68 @@ fn finish(k: &mut Kernel, t: &Thread, m: &AddressSpace, status: ExitStatus) {
 mod process {
     use super::*;
     #[test]
+    fn sleep_on_another_process_cpu_clock() {
+        let host = Arc::new(paludarium_host::testing::RecordingHost::new());
+        let mut k = Kernel::new(Arc::clone(&host) as Arc<dyn paludarium_host::Host>);
+        let mut t = Thread::new(
+            1,
+            CpuState::new(GuestAddr(0x400000), GuestAddr(DATA + PAGE_SIZE)),
+        );
+        let m = AddressSpace::new();
+        m.map_shared(
+            Some(GuestAddr(DATA)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        let clock = u64::from(((!(ct.tid as i32)) << 3 | 2) as u32);
+        let timespec = |seconds: u64, nanos: u64| {
+            m.write_u64(GuestAddr(DATA), seconds).unwrap();
+            m.write_u64(GuestAddr(DATA + 8), nanos).unwrap();
+        };
+        // A time the child's clock has reached: at once.
+        timespec(0, 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 230, [clock, 1, DATA, 0, 0, 0]),
+            0
+        );
+        // A relative sleep waits for the child's time; a signal ends it with
+        // the time left, the child having used none.
+        timespec(5, 0);
+        host.interrupt_next_wait();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 230, [clock, 0, DATA, DATA + 16, 0, 0]),
+            Errno(4).to_syscall_return()
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 16)).unwrap(), 5);
+        assert!(matches!(
+            t.state.restart_block,
+            Some(crate::signals::RestartBlock::Sleep {
+                clock: crate::signals::SleepClock::Process(pid),
+                ..
+            }) if pid == ct.tid
+        ));
+        // The child accounted its CPU time only while the sleep lasted.
+        assert!(!c.group.cpu_timers_armed());
+        // Once reaped, the child is no task: the sleep restarted after a
+        // stop finds none, and a new one is refused.
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [u64::from(ct.tid), 0, 0, 0, 0, 0]),
+            u64::from(ct.tid)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 219, [0; 6]),
+            Errno::EINVAL.to_syscall_return()
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 230, [clock, 1, DATA, 0, 0, 0]),
+            Errno::EINVAL.to_syscall_return()
+        );
+    }
+    #[test]
     fn yama_lets_in_descendants_and_those_named() {
         let (mut k, mut t, m) = setup();
         let eperm = Errno::EPERM.to_syscall_return();

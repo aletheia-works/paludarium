@@ -270,7 +270,7 @@ mod linux {
             // clock does not pass.
             if matches!(
                 mode,
-                "cpu-itimer" | "rlimit-cpu" | "cpu-timer" | "cpu-sleep"
+                "cpu-itimer" | "rlimit-cpu" | "cpu-timer" | "cpu-sleep" | "cpu-sleep-others"
             ) {
                 host.measure_cpu_time();
             }
@@ -550,6 +550,7 @@ mod linux {
         processes_cpu_timer => ("cpu-timer","process"),
         processes_timer_limits => ("timer-limits","process"),
         processes_cpu_sleep => ("cpu-sleep","process"),
+        processes_cpu_sleep_others => ("cpu-sleep-others","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         vfork_exit => ("vfork-exit","process"),

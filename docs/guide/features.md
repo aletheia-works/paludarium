@@ -2310,12 +2310,15 @@ kernel.
   gives `EINVAL` with the ID used up. A dynamic clock has no timers and
   cannot sleep (`EOPNOTSUPP`). A sleep on a CPU clock by number reads its
   request, refuses the caller's own thread's clock (`EINVAL`) and then a
-  task that is not there (`EINVAL`); on the caller's process's clock it
-  sleeps as below, and on another task's it returns at once when its time
-  has come (a relative 0, or an absolute time the clock has reached), as
-  Linux's `posix_cpu_nsleep`, but one that would wait for that task's CPU
-  time is not modelled (`EINVAL`), nor is a timer on another process's
-  CPU time.
+  task that is not there (`EINVAL`); then it sleeps as below, until the
+  caller's process, another process (a zombie's clock does not move) or
+  another thread of the caller's process has used the time, that task's
+  threads accounting their CPU time while it waits. A task that goes while
+  it waits leaves the sleep to a signal, which ends it as it ends any but
+  with the whole request as the time left, as Linux's `do_cpu_nanosleep`
+  copies out what it was asked once `posix_cpu_timer_set` finds no task;
+  a restart after a stop then finds no task (`EINVAL`). A timer on another
+  process's CPU time is not modelled (`EINVAL`).
 - A sleep on the process's CPU clock ends once the process's threads
   together have used the time, as Linux's `do_cpu_nanosleep`: a time that
   has passed, or none to sleep, returns at once, and the sleeping thread

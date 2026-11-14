@@ -261,12 +261,21 @@ pub(crate) fn wakes(process: &ThreadState, signal: &PendingSignal) -> bool {
     signal.synchronous || blocked || !ignored
 }
 
-/// The clock a sleep counts on: a host clock, or the process's CPU time
-/// (`CLOCK_PROCESS_CPUTIME_ID`).
+/// The clock a sleep counts on: a host clock, the process's CPU time
+/// (`CLOCK_PROCESS_CPUTIME_ID`), or the CPU time of another process or of
+/// another thread of the process, by its ID in the emulator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SleepClock {
     Host(ClockId),
     ProcessCpu,
+    Process(u32),
+    Thread(u32),
+}
+impl SleepClock {
+    /// Whether it counts CPU time, which a sleep looks at every tick.
+    pub(crate) fn is_cpu(self) -> bool {
+        !matches!(self, Self::Host(_))
+    }
 }
 
 /// A wait that `restart_syscall` resumes after a stop, with its absolute

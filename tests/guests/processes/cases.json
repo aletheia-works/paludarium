@@ -266,6 +266,7 @@
     {"name":"cpu-timer","binary":"process"},
     {"name":"timer-limits","binary":"process"},
     {"name":"cpu-sleep","binary":"process"},
+    {"name":"cpu-sleep-others","binary":"process"},
     {"name":"mprotect-checks","binary":"process"},
     {"name":"io-uring","binary":"process"},
     {"name":"cloexec","binary":"process"},

@@ -9471,6 +9471,87 @@ static int cpu_clock_ids_case(void) {
            after_none, last, next);
     return 0;
 }
+/* clock_nanosleep on the CPU clock of another task, by number: another
+ * thread's, a child process's, and a zombie's; a thread that goes while
+ * the sleep waits leaves it to a signal, which ends it with EINTR and the
+ * whole request left, as Linux's do_cpu_nanosleep copies out what it was
+ * asked once posix_cpu_timer_set finds no task. What is printed holds
+ * whatever the speed. */
+static long co_tid;
+static void *co_spin(void *arg) {
+    __atomic_store_n(&co_tid, syscall(SYS_gettid), __ATOMIC_SEQ_CST);
+    return cs_spin(arg);
+}
+static void *co_leave(void *arg) {
+    (void)arg;
+    __atomic_store_n(&co_tid, syscall(SYS_gettid), __ATOMIC_SEQ_CST);
+    struct timespec wait = {0, 20000000L};
+    nanosleep(&wait, NULL);
+    return NULL;
+}
+static long co_cpu(clockid_t clock) {
+    struct timespec t;
+    return clock_gettime(clock, &t) ? -errno : ct_ns(t);
+}
+static int cpu_sleep_others_case(void) {
+    /* Another thread's clock: relative, then absolute. */
+    pthread_t thread;
+    co_tid = 0;
+    if (pthread_create(&thread, NULL, co_spin, (void *)100000000L)) return 1;
+    while (!__atomic_load_n(&co_tid, __ATOMIC_SEQ_CST)) sched_yield();
+    clockid_t tclock = CI_CLOCK(co_tid, 1, 2);
+    long start = co_cpu(tclock);
+    long relative = cs_sleep(tclock, 0, 30000000L, NULL);
+    long used = co_cpu(tclock) - start;
+    long deadline = co_cpu(tclock) + 30000000L;
+    long absolute = cs_sleep(tclock, TIMER_ABSTIME, deadline, NULL);
+    long reached = co_cpu(tclock) >= deadline;
+    pthread_join(thread, NULL);
+    printf("thread relative=%ld used-enough=%d absolute=%ld reached=%ld\n", relative,
+           used >= 30000000L, absolute, reached);
+    /* A child process's clock. */
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        cs_spin((void *)100000000L);
+        _exit(0);
+    }
+    clockid_t pclock = CI_CLOCK(kid, 0, 2);
+    start = co_cpu(pclock);
+    relative = cs_sleep(pclock, 0, 30000000L, NULL);
+    used = co_cpu(pclock) - start;
+    printf("child relative=%ld used-enough=%d\n", relative, used >= 30000000L);
+    waitpid(kid, NULL, 0);
+    /* A zombie's clock does not move: a signal ends the sleep with the
+       time left. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = cs_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) _exit(0);
+    siginfo_t info;
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    struct timespec rem = {7, 7};
+    cs_alarm_in(20000);
+    long interrupted = cs_sleep(CI_CLOCK(kid, 0, 2), 0, 10000000000L, &rem);
+    printf("zombie=%ld left-in-range=%d\n", interrupted,
+           ct_ns(rem) > 9000000000L && ct_ns(rem) <= 10000000000L);
+    waitpid(kid, NULL, 0);
+    /* A thread that goes while the sleep waits: the signal ends it, the
+       whole request left. */
+    co_tid = 0;
+    if (pthread_create(&thread, NULL, co_leave, NULL)) return 1;
+    while (!__atomic_load_n(&co_tid, __ATOMIC_SEQ_CST)) sched_yield();
+    rem.tv_sec = 7;
+    rem.tv_nsec = 7;
+    cs_alarm_in(200000);
+    long gone = cs_sleep(CI_CLOCK(co_tid, 1, 2), 0, 10000000000L, &rem);
+    pthread_join(thread, NULL);
+    printf("gone=%ld rem=%ld %ld\n", gone, (long)rem.tv_sec, rem.tv_nsec);
+    return 0;
+}
 static int pidfd_getfd_case(void) {
     if (pipe(pv_gate)) return 80;
     struct pv_task child = pv_child(1), locked = pv_child(0);
@@ -22050,6 +22131,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
     if (!strcmp(mode, "timer-limits")) return timer_limits_case();
     if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();
+    if (!strcmp(mode, "cpu-sleep-others")) return cpu_sleep_others_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {
         struct itimerval v;
         syscall(SYS_getitimer, 1L, &v);

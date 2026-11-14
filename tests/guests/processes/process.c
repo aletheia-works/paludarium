@@ -9756,15 +9756,24 @@ static void admin_reboot_in_namespace(const char *name, long cmd, int by_init) {
         if (unshare(CLONE_NEWUSER | CLONE_NEWPID)) _exit(90);
         pid_t init = fork();
         if (init == 0) {
+            /* A reboot that works kills the init; one that fails says why,
+             * and the init ends with the failing process's code. */
             if (!by_init) {
+                fflush(stdout);
                 pid_t kid = fork();
                 if (kid == 0) {
-                    syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, cmd, NULL);
+                    printf("reboot-%s: child=%ld\n", name,
+                           pn(syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, cmd, NULL)));
+                    fflush(stdout);
                     _exit(91);
                 }
-                pause();
+                int status = 0;
+                waitpid(kid, &status, 0);
+                _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 93);
             }
-            syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, cmd, NULL);
+            printf("reboot-%s: init=%ld\n", name,
+                   pn(syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, cmd, NULL)));
+            fflush(stdout);
             _exit(92);
         }
         int status = 0;

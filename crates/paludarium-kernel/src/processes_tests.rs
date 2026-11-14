@@ -5463,7 +5463,7 @@ mod process_mrelease {
         let (mut k, mut t, m) = setup();
         let einval = Errno::EINVAL.to_syscall_return();
         let ebadf = Errno::EBADF.to_syscall_return();
-        let (_c, ct, _cm) = fork(&mut k, &mut t, &m);
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         let pidfd = syscall(&mut k, &mut t, &m, 434, [u64::from(ct.tid), 0, 0, 0, 0, 0]) as i64;
         assert!(pidfd < 1024, "{pidfd:#x}");
         // The flags come first.
@@ -5481,18 +5481,46 @@ mod process_mrelease {
         let tid = u64::from(t.tid);
         let own = syscall(&mut k, &mut t, &m, 434, [tid, 0, 0, 0, 0, 0]) as i64;
         assert_eq!(release(&mut k, &mut t, &m, own, 0), einval);
-        // Another signal leaves it be until it takes it; SIGKILL dooms it
-        // as it is sent.
+        // A signal it handles, or blocks, leaves it be until it takes it.
+        cm.write_u64(GuestAddr(DATA), 0x1000).unwrap();
+        cm.write_u64(GuestAddr(DATA + 8), 0).unwrap();
+        cm.write_u64(GuestAddr(DATA + 16), 0).unwrap();
+        cm.write_u64(GuestAddr(DATA + 24), 0).unwrap();
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 13, [15, DATA, 0, 8, 0, 0]), 0);
+        cm.write_u64(GuestAddr(DATA + 0x40), 1 << 9).unwrap();
         assert_eq!(
-            syscall(&mut k, &mut t, &m, 62, [u64::from(ct.tid), 15, 0, 0, 0, 0]),
+            syscall(&mut c, &mut ct, &cm, 14, [0, DATA + 0x40, 0, 8, 0, 0]),
             0
         );
-        assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), einval);
-        assert_eq!(
-            syscall(&mut k, &mut t, &m, 62, [u64::from(ct.tid), 9, 0, 0, 0, 0]),
-            0
-        );
+        let child = u64::from(ct.tid);
+        for signal in [15, 10] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 62, [child, signal, 0, 0, 0, 0]),
+                0
+            );
+            assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), einval, "{signal}");
+        }
+        // One whose default action ends it without a core dooms it as it
+        // is sent, as SIGKILL does.
+        assert_eq!(syscall(&mut k, &mut t, &m, 62, [child, 12, 0, 0, 0, 0]), 0);
         assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), 0);
+    }
+    #[test]
+    fn a_core_dumping_or_ignored_signal_is_fatal_only_once_taken() {
+        let (mut k, mut t, m) = setup();
+        let einval = Errno::EINVAL.to_syscall_return();
+        let (_c, ct, _cm) = fork(&mut k, &mut t, &m);
+        let pidfd = syscall(&mut k, &mut t, &m, 434, [u64::from(ct.tid), 0, 0, 0, 0, 0]) as i64;
+        let child = u64::from(ct.tid);
+        // SIGQUIT, SIGSEGV and SIGSYS dump a core; SIGCHLD and SIGURG are
+        // ignored by default.
+        for signal in [3, 11, 31, 17, 23] {
+            assert_eq!(
+                syscall(&mut k, &mut t, &m, 62, [child, signal, 0, 0, 0, 0]),
+                0
+            );
+            assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), einval, "{signal}");
+        }
     }
     #[test]
     fn a_zombie_has_no_memory_to_find_and_a_reaped_process_is_gone() {

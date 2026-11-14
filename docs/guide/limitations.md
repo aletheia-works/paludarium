@@ -206,21 +206,20 @@ verified.
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
   - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, `MADV_HWPOISON` and
-    `MADV_SOFT_OFFLINE`, which Linux takes. `MADV_REMOVE` and
-    `MADV_GUARD_INSTALL` take the memory of a locked mapping too, where
-    Linux gives `EINVAL`, as no mapping here is locked apart.
-    `/proc/<pid>/smaps` shows no `VmFlags`, so not the `gu` flag of a VMA
-    that had guards, and `/proc/<pid>/pagemap` is not there to show a
-    guard page.
+    `MADV_SOFT_OFFLINE`, which Linux takes. Neither `/proc/<pid>/smaps`,
+    whose `VmFlags` would show the `gu` of a VMA that had guards and the
+    `lo` of a locked one, nor `/proc/<pid>/pagemap`, which would show a
+    guard page, is there.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
     mapped. It refuses advice Linux does not know before any range
     (`EINVAL`), as Linux master does; the CI's kernel checks it with each
     range, so with no ranges, or only empty ones, it gives 0 there.
-  - `process_mrelease` takes a process as dying from the moment a SIGKILL
-    is sent to it, but from another fatal signal only once one of its
-    threads takes it, where Linux marks the process as it sends any signal
-    that will end it (`EINVAL` here until then).
+  - A fatal signal other than SIGKILL marks a process as dying for
+    `process_mrelease` as it is sent even when the only thread that does
+    not block it already has a signal pending and is not running, or is
+    exiting. Linux's `wants_signal` passes over such a thread, so Linux
+    marks the process only once one of its threads takes the signal.
   - In a child of `fork`, `move_pages` shows a page of a program's own
     ELF segment that the loader wrote and nothing wrote since as there,
     where Linux copies no page table of a VMA without an `anon_vma`
@@ -251,10 +250,10 @@ verified.
     CPU clock, which the sleeping thread looks at every tick; where that is
     wall time, the sleep counts its own time too, so a process alone ends
     it after the wall time it asked for.
-    `timer_create` on another process's or thread's CPU clock (a negative
-    clock ID) gives `EINVAL`, where Linux makes the timer, `clock_gettime`
-    gives `EINVAL` for those clocks, where Linux reads them, and so does
-    `clock_nanosleep`, where Linux sleeps on them.
+    `timer_create` on another process's CPU clock gives `EINVAL`, where
+    Linux makes the timer, and a sleep on another task's CPU clock gives
+    `EINVAL` unless its time has already come, where Linux waits until that
+    task has used the time.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
     the superblock of its pseudo filesystem and gives its counts (0). A
@@ -311,12 +310,17 @@ verified.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
-  - Memory locks leave no state. So `RLIMIT_MEMLOCK` is not enforced on
-    them (only on `SHM_LOCK`), which matters only to a guest that gave up
-    `CAP_IPC_LOCK`, `MADV_DONTNEED`, `MADV_COLD` and `MADV_PAGEOUT` work on
-    locked memory where Linux gives `EINVAL`, `mlock` succeeds on the pages of a
-    file mapping past the end of the file where Linux gives `ENOMEM`, and
-    `/proc` shows no locked memory.
+  - Adjacent private VMAs merge once their flags agree again (after
+    `munlock`, for one), whatever their `anon_vma`s. Linux merges them only
+    when they share one. A VMA gets its `anon_vma` on its first write, and
+    takes a neighbour's only if their flags agreed then
+    (`anon_vma_compatible`), so pieces written while apart may stay
+    separate VMAs in `/proc/<pid>/maps`.
+  - `/proc/<pid>/status` shows no locked memory (`VmLck`). `mmap` with
+    `MAP_LOCKED` checks `can_do_mlock` (`EPERM`) and room under
+    `RLIMIT_MEMLOCK` (`EAGAIN`) before it finds room for the mapping
+    (`ENOMEM`) and looks at the file, where Linux does those first, and `mremap` checks the room for a locked VMA
+    that grows before its other checks of the new range.
   - A memory policy that `mbind` gives a shared mapping belongs to that
     mapping, where Linux keeps it with the shared memory itself, for every
     process that maps it. `/proc/<pid>/numa_maps` does not exist.

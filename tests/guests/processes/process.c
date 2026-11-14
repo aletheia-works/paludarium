@@ -6324,6 +6324,127 @@ static int mrelease_case(void) {
     printf("reaped=%ld\n", reaped);
     return 0;
 }
+/* A fatal signal other than SIGKILL marks the process as dying as it is
+ * sent, as Linux's complete_signal starts the group exit, so that
+ * process_mrelease finds its memory on its way out: one with its default
+ * action, unblocked, that dumps no core, to a process not stopped. */
+static void mrelease_fatal_handler(int sig) { (void)sig; }
+/* A child that handles SIGTERM (1), blocks SIGUSR1 (2) or neither (0),
+ * and says so on `ready` before it waits. */
+static pid_t mrelease_fatal_child(int how, int ready) {
+    pid_t child = fork();
+    if (child != 0) return child;
+    if (how == 1) signal(SIGTERM, mrelease_fatal_handler);
+    if (how == 2) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+    }
+    if (write(ready, "r", 1) != 1) _exit(1);
+    for (;;) pause();
+}
+static int mrelease_fatal_case(void) {
+    const char *names[] = {"handled", "blocked", "default", "stopped"};
+    int signals[] = {SIGTERM, SIGUSR1, SIGUSR2, SIGTERM};
+    for (int how = 0; how < 4; how++) {
+        int pipes[2];
+        if (pipe(pipes)) return 80;
+        pid_t child = mrelease_fatal_child(how == 0 ? 1 : how == 1 ? 2 : 0, pipes[1]);
+        if (child < 0) return 81;
+        char byte;
+        if (read(pipes[0], &byte, 1) != 1) return 82;
+        close(pipes[0]);
+        close(pipes[1]);
+        int status;
+        if (how == 3) {
+            kill(child, SIGSTOP);
+            if (waitpid(child, &status, WUNTRACED) != child || !WIFSTOPPED(status)) return 83;
+        }
+        int pidfd = syscall(SYS_pidfd_open, child, 0);
+        if (pidfd < 0) return 84;
+        kill(child, signals[how]);
+        long r = mrelease_errno(pidfd, 0);
+        close(pidfd);
+        if (how == 2 && (r == 0 || r == -ESRCH))
+            printf("%s=released-or-gone\n", names[how]);
+        else
+            printf("%s=%ld\n", names[how], r);
+        kill(child, SIGKILL);
+        if (waitpid(child, &status, 0) != child) return 85;
+    }
+    return 0;
+}
+/* What a memory lock leaves on a VMA, as Linux's VM_LOCKED and
+ * VM_LOCKONFAULT: VMAs of their own, advice that drops or ages pages
+ * refused (EINVAL), MS_INVALIDATE refused (EBUSY), and no lock in a forked
+ * child, the old range of MREMAP_DONTUNMAP, or after munlockall. Every
+ * lock here fits any RLIMIT_MEMLOCK a runner has. */
+static int lock_state_case(void) {
+    long page = 4096;
+    char *area = mmap(NULL, 5 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 80;
+    munmap(area, page);
+    munmap(area + 4 * page, page);
+    char *p = area + page;
+    /* Written first, so that the pieces the locks split off share its
+     * anon_vma and merge again once unlocked. */
+    p[0] = 'a';
+    long locked = advice_errno(mlock(p + page, page));
+    long onfault = advice_errno(syscall(SYS_mlock2, p + 2 * page, page, 1L));
+    printf("mlock=%ld onfault=%ld vmas=%d\n", locked, onfault, advice_vmas(p, p + 3 * page));
+    const long advices[] = {MADV_DONTNEED, MADV_FREE, 20, 21, 102};
+    const char *names[] = {"dontneed", "free", "cold", "pageout", "guard"};
+    for (int i = 0; i < 5; i++)
+        printf("%s=%ld ", names[i], advice_errno(madvise(p + page, page, advices[i])));
+    printf("dontneed-locked=%ld\n", advice_errno(madvise(p + page, page, 24)));
+    /* What comes before the locked VMA takes the advice. */
+    long before = advice_errno(madvise(p, 2 * page, MADV_DONTNEED));
+    printf("before=%ld byte=%d\n", before, p[0]);
+    printf("invalidate=%ld async=%ld\n", advice_errno(msync(p, 3 * page, MS_INVALIDATE)),
+           advice_errno(msync(p, 3 * page, MS_ASYNC)));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 81;
+    if (child == 0) {
+        printf("child dontneed=%ld\n", advice_errno(madvise(p + page, page, MADV_DONTNEED)));
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 82;
+    long unlocked = advice_errno(munlock(p, 3 * page));
+    printf("munlock=%ld vmas=%d dontneed=%ld\n", unlocked, advice_vmas(p, p + 3 * page),
+           advice_errno(madvise(p + page, page, MADV_DONTNEED)));
+    /* MREMAP_DONTUNMAP moves the lock with the pages. */
+    char *m = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
+    if (m == MAP_FAILED) return 83;
+    printf("map-locked dontneed=%ld\n", advice_errno(madvise(m, page, MADV_DONTNEED)));
+    char *moved = mremap(m, page, page, MREMAP_MAYMOVE | 4, NULL);
+    if (moved == MAP_FAILED) return 84;
+    printf("dontunmap old=%ld new=%ld\n", advice_errno(madvise(m, page, MADV_DONTNEED)),
+           advice_errno(madvise(moved, page, MADV_DONTNEED)));
+    /* MCL_FUTURE locks what is mapped next, until munlockall. */
+    long future = advice_errno(mlockall(MCL_FUTURE));
+    char *next = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (next == MAP_FAILED) return 85;
+    long next_advice = advice_errno(madvise(next, page, MADV_DONTNEED));
+    long all = advice_errno(munlockall());
+    printf("future=%ld next=%ld munlockall=%ld moved=%ld next=%ld\n", future, next_advice, all,
+           advice_errno(madvise(moved, page, MADV_DONTNEED)),
+           advice_errno(madvise(next, page, MADV_DONTNEED)));
+    /* A page past the end of its file cannot be brought in. */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-lock-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    unlink(path);
+    if (fd < 0 || ftruncate(fd, page)) return 86;
+    char *file = mmap(NULL, 2 * page, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file == MAP_FAILED) return 87;
+    printf("past-end=%ld within=%ld\n", advice_errno(mlock(file, 2 * page)),
+           advice_errno(mlock(file, page)));
+    munlock(file, 2 * page);
+    return 0;
+}
 /* MADV_REMOVE frees shared memory, as a hole punched in its file: shared
  * anonymous memory, a System V segment and a shared file mapping read as
  * zeros there again; private memory and read-only sharing are refused. */
@@ -9248,6 +9369,106 @@ static int alarm_clocks_case(void) {
         _exit(r);
     }
     printf("worker=%d\n", reaped(worker));
+    return 0;
+}
+/* The CPU clocks of tasks by number, as kernel/time/posix-cpu-timers.c's
+ * pid_for_clock takes a negative clockid_t apart: ~pid << 3, bit 2 for a
+ * thread's clock, and the low two bits (PROF, VIRT, SCHED; 3 is a dynamic
+ * clock, which needs a PTP device's file). Only results and resolutions
+ * show, as CPU time differs from host to host. */
+#define CI_CLOCK(pid, thread, which) ((clockid_t)((~(unsigned)(pid) << 3) | ((thread) ? 4 : 0) | (which)))
+static long ci_r(long r) { return r < 0 ? -errno : r; }
+static long ci_get(clockid_t id) {
+    struct timespec t;
+    return ci_r(syscall(SYS_clock_gettime, id, &t));
+}
+static long ci_res(clockid_t id) {
+    struct timespec t = {-1, -1};
+    long r = ci_r(syscall(SYS_clock_getres, id, &t));
+    return r < 0 ? r : t.tv_sec * 1000000000L + t.tv_nsec;
+}
+static int ci_gate[2];
+static long ci_tid;
+static void *ci_thread(void *arg) {
+    (void)arg;
+    __atomic_store_n(&ci_tid, syscall(SYS_gettid), __ATOMIC_SEQ_CST);
+    char c;
+    read(ci_gate[0], &c, 1);
+    return NULL;
+}
+static int cpu_clock_ids_case(void) {
+    pid_t self = getpid();
+    for (int which = 0; which < 3; which++)
+        printf("own %d: zero=%ld pid=%ld thread=%ld thread-as-process=%ld res=%ld,%ld\n", which,
+               ci_get(CI_CLOCK(0, 0, which)), ci_get(CI_CLOCK(self, 0, which)),
+               ci_get(CI_CLOCK(self, 1, which)), ci_get(CI_CLOCK(syscall(SYS_gettid), 0, which)),
+               ci_res(CI_CLOCK(self, 0, which)), ci_res(CI_CLOCK(0, 1, which)));
+    /* A clockid_t is an int: the high bits are not looked at. */
+    struct timespec t;
+    printf("high-bits: gettime=%ld getres=%ld\n", ci_r(syscall(SYS_clock_gettime, (1L << 32) | 1, &t)),
+           ci_r(syscall(SYS_clock_getres, (1L << 32) | 6, &t)));
+    /* Another thread: its own clock, not as a process's. (Once it has been
+       joined it may not have gone yet, so that is not looked at.) */
+    if (pipe(ci_gate)) return 80;
+    pthread_t th;
+    pthread_create(&th, NULL, ci_thread, NULL);
+    while (!__atomic_load_n(&ci_tid, __ATOMIC_SEQ_CST)) sched_yield();
+    long tid = ci_tid;
+    printf("thread: clock=%ld as-process=%ld res=%ld,%ld\n", ci_get(CI_CLOCK(tid, 1, 2)),
+           ci_get(CI_CLOCK(tid, 0, 2)), ci_res(CI_CLOCK(tid, 1, 1)), ci_res(CI_CLOCK(tid, 0, 2)));
+    timer_t timer;
+    long made = ci_r(syscall(SYS_timer_create, CI_CLOCK(tid, 1, 2), NULL, &timer));
+    printf("thread: timer=%ld\n", made);
+    if (made == 0) syscall(SYS_timer_delete, timer);
+    write(ci_gate[1], "g", 1);
+    pthread_join(th, NULL);
+    /* A child: its process's clock, not its thread's; a zombie's still. */
+    fflush(stdout);
+    int gate[2];
+    if (pipe(gate)) return 81;
+    pid_t kid = fork();
+    if (kid == 0) {
+        char c;
+        close(gate[1]);
+        read(gate[0], &c, 1);
+        _exit(0);
+    }
+    close(gate[0]);
+    printf("child: process=%ld thread=%ld res=%ld,%ld\n", ci_get(CI_CLOCK(kid, 0, 2)),
+           ci_get(CI_CLOCK(kid, 1, 2)), ci_res(CI_CLOCK(kid, 0, 0)), ci_res(CI_CLOCK(kid, 1, 0)));
+    close(gate[1]);
+    siginfo_t info;
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    printf("zombie: process=%ld\n", ci_get(CI_CLOCK(kid, 0, 2)));
+    waitpid(kid, NULL, 0);
+    printf("reaped: process=%ld\n", ci_get(CI_CLOCK(kid, 0, 2)));
+    /* No such task; a dynamic clock on an open file that is not one. */
+    printf("none: gettime=%ld getres=%ld\n", ci_get(CI_CLOCK(0x0ffffff0, 0, 2)),
+           ci_res(CI_CLOCK(0x0ffffff0, 1, 2)));
+    printf("dynamic: gettime=%ld getres=%ld kind-3-thread=%ld\n", ci_get(CI_CLOCK(1, 0, 3)),
+           ci_res(CI_CLOCK(1, 0, 3)), ci_get(CI_CLOCK(self, 1, 3)));
+    /* Sleeps: none on a dynamic clock (given a good request, which an Arm
+       Mac's translator reads first); on a CPU clock the request first, then
+       not on the caller's own thread; one whose time has come returns at
+       once. */
+    struct timespec zero = {0, 0};
+    printf("nanosleep: dynamic=%ld fault=%ld own-thread=%ld zero=%ld abs-zero=%ld no-task=%ld\n",
+           ci_r(syscall(SYS_clock_nanosleep, CI_CLOCK(1, 0, 3), 0, &zero, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CLOCK_PROCESS_CPUTIME_ID, 0, (void *)8, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CI_CLOCK(syscall(SYS_gettid), 1, 2), 0, &zero, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CLOCK_PROCESS_CPUTIME_ID, 0, &zero, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CI_CLOCK(self, 0, 0), 1, &zero, NULL)),
+           ci_r(syscall(SYS_clock_nanosleep, CI_CLOCK(0x0ffffff0, 0, 2), 0, &zero, NULL)));
+    /* Timers: on the process's clock by its number; none on a dynamic
+       clock; a task not found after the ID is out, which is used up. */
+    int id = -1, next = -1;
+    long own = ci_r(syscall(SYS_timer_create, CI_CLOCK(self, 0, 1), NULL, &id));
+    long dynamic = ci_r(syscall(SYS_timer_create, CI_CLOCK(1, 0, 3), NULL, &id));
+    long none = ci_r(syscall(SYS_timer_create, CI_CLOCK(0x0ffffff0, 0, 2), NULL, &id));
+    int after_none = id;
+    long last = ci_r(syscall(SYS_timer_create, CLOCK_MONOTONIC, NULL, &next));
+    printf("timer_create: own=%ld dynamic=%ld none=%ld id=%d last=%ld next=%d\n", own, dynamic, none,
+           after_none, last, next);
     return 0;
 }
 static int pidfd_getfd_case(void) {
@@ -21857,6 +22078,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
+    if (!strcmp(mode, "lock-state")) return lock_state_case();
+    if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
     if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();
@@ -21865,6 +22088,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
     if (!strcmp(mode, "yama")) return yama_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();

@@ -117,6 +117,18 @@ pub struct Mapping {
     /// which stays when they go, does not stop a merge, and makes `fork`
     /// copy the VMA's page tables.
     pub maybe_guard: bool,
+    /// `mlock` locked it (Linux's `VM_LOCKED`), and with `MLOCK_ONFAULT`
+    /// brings in only the pages something touches (`VM_LOCKONFAULT`).
+    pub locked: Option<Lock>,
+}
+
+/// How a mapping is locked ([`Mapping::locked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lock {
+    /// Every page is brought in (`VM_LOCKED`).
+    Populated,
+    /// Pages are brought in as they are touched (`VM_LOCKONFAULT`).
+    OnFault,
 }
 
 /// The `madvise` advice that sets or clears a flag of the VMAs of a range
@@ -1577,6 +1589,9 @@ struct AddressSpaceData {
     /// the VMAs, so they neither split nor stop a merge. An access to one
     /// faults as one to no mapping would.
     guards: BTreeMap<u64, u64>,
+    /// How a new mapping is locked: `mlockall` with `MCL_FUTURE` (Linux's
+    /// `def_flags`), which neither `fork` nor `exec` keeps.
+    future_lock: Option<Lock>,
     /// What the frames are charged to; shared with the spaces forked from
     /// this one and the ones its exec starts.
     meter: Option<Arc<MemoryMeter>>,
@@ -1657,6 +1672,7 @@ impl AddressSpaceData {
             shared: BTreeMap::new(),
             backing: BTreeMap::new(),
             guards: BTreeMap::new(),
+            future_lock: None,
             code: Arc::default(),
             mappings: BTreeMap::new(),
             initial_break: GuestAddr(0),
@@ -1814,6 +1830,13 @@ impl AddressSpaceData {
         }
         self.for_populated(addr.0, end, |entry| *entry = None);
         self.bump_code_generation();
+        // Linux's `mmap_region` does not lock a VMA `vma_supports_mlock`
+        // refuses, as the rings of AIO and `io_uring` are.
+        if pages.source().is_some_and(|source| source.fixed()) {
+            for (_, mapping) in self.mappings.range_mut(addr.0..end) {
+                mapping.locked = None;
+            }
+        }
         self.shared.insert(
             addr.0,
             SharedMapping {
@@ -2189,6 +2212,10 @@ impl AddressSpaceData {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner) = directory;
         copy.drop_refaultable_pages();
+        // A child's VMAs are not locked (`dup_mmap` clears `VMA_LOCKED_MASK`).
+        for mapping in copy.mappings.values_mut() {
+            mapping.locked = None;
+        }
         // MADV_DONTFORK leaves the child a hole; MADV_WIPEONFORK leaves it
         // the mapping with no page and no `anon_vma`, as Linux's `dup_mmap`
         // neither copies the one nor the other's page tables.
@@ -2919,6 +2946,7 @@ impl AddressSpaceData {
                 wipe_on_fork: false,
                 dont_dump: false,
                 maybe_guard: false,
+                locked: self.future_lock,
             },
         );
         Ok(GuestAddr(start))
@@ -3041,6 +3069,7 @@ impl AddressSpaceData {
             && a.dont_fork == b.dont_fork
             && a.wipe_on_fork == b.wipe_on_fork
             && a.dont_dump == b.dont_dump
+            && a.locked == b.locked
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -3128,6 +3157,14 @@ impl AddressSpaceData {
         // The guard markers move with the page tables, and leave the old
         // range even when `MREMAP_DONTUNMAP` keeps it.
         let guards = self.clear_guards(old, old + old_len);
+        // MREMAP_DONTUNMAP leaves the old range unlocked (`VMA_LOCKED_MASK`).
+        if keep_old {
+            self.split_at(old);
+            self.split_at(old + old_len);
+            for (_, m) in self.mappings.range_mut(old..old + old_len) {
+                m.locked = None;
+            }
+        }
         if !keep_old && old_len > 0 {
             // `remap` moves pages of one VMA only, whose mapping at `old` it
             // found not sealed, and sealed mappings make VMAs of their own:
@@ -3397,6 +3434,121 @@ impl AddressSpaceData {
         } else {
             Ok(())
         }
+    }
+
+    /// Locks or unlocks `[addr, end)` (`lock`), as Linux's
+    /// `apply_vma_lock_flags`: VMA by VMA from the one at `addr`, which must
+    /// exist, to a hole (`ENOMEM` once the VMAs before it took the new
+    /// state). A VMA that cannot be locked (`vma_supports_mlock`: the rings
+    /// of AIO and `io_uring`) keeps its state.
+    pub fn lock(&mut self, addr: u64, end: u64, lock: Option<Lock>) -> Result<(), Errno> {
+        if end <= addr {
+            return Ok(());
+        }
+        if self.mapping_at(addr).is_none() {
+            return Err(Errno::ENOMEM);
+        }
+        let mut at = addr;
+        while at < end {
+            let Some(&m) = self.mapping_at(at) else {
+                return Err(Errno::ENOMEM);
+            };
+            let to = m.end().min(end);
+            if !self.refuses_lock(at) {
+                self.split_at(at);
+                self.split_at(to);
+                for (_, mapping) in self.mappings.range_mut(at..to) {
+                    mapping.locked = lock;
+                }
+            }
+            at = to;
+        }
+        Ok(())
+    }
+
+    /// Locks the new mapping `[addr, end)` as `mmap` with `MAP_LOCKED` does
+    /// (`__mmap_complete`): only a VMA `vma_supports_mlock` refuses, the
+    /// rings of AIO and `io_uring`, stays unlocked. Secret memory is locked
+    /// here, as only `mlock_fixup` passes it over.
+    pub fn lock_new(&mut self, addr: u64, end: u64, lock: Lock) {
+        let fixed = self
+            .shared_at(addr)
+            .and_then(|shared| shared.pages.source())
+            .is_some_and(|source| source.fixed());
+        if fixed {
+            return;
+        }
+        self.split_at(addr);
+        self.split_at(end);
+        for (_, mapping) in self.mappings.range_mut(addr..end) {
+            mapping.locked = Some(lock);
+        }
+    }
+
+    /// Whether the mapping at `addr` cannot be locked: the rings of AIO and
+    /// `io_uring` (Linux's `vma_supports_mlock`), and secret memory, which
+    /// `mlock_fixup` leaves as it is.
+    fn refuses_lock(&self, addr: u64) -> bool {
+        self.shared_at(addr)
+            .and_then(|shared| shared.pages.source())
+            .is_some_and(|source| source.fixed() || source.secret())
+    }
+
+    /// `mlockall` and `munlockall`: new mappings take `future`, and with
+    /// `current` every mapping takes it; `None` leaves them as they are
+    /// (`mlockall` with `MCL_FUTURE` alone).
+    pub fn lock_all(&mut self, current: Option<Option<Lock>>, future: Option<Lock>) {
+        self.future_lock = future;
+        let Some(current) = current else {
+            return;
+        };
+        let starts: Vec<u64> = self.mappings.keys().copied().collect();
+        for start in starts {
+            if !self.refuses_lock(start)
+                && let Some(mapping) = self.mappings.get_mut(&start)
+            {
+                mapping.locked = current;
+            }
+        }
+    }
+
+    /// The first mapping of `[addr, end)` that is locked.
+    pub fn first_locked(&self, addr: u64, end: u64) -> Option<Mapping> {
+        self.mappings
+            .range(..end)
+            .map(|(_, m)| *m)
+            .find(|m| m.end() > addr && m.locked.is_some())
+    }
+
+    /// Whether the mapping at `addr` refuses to have its pages discarded
+    /// ([`Self::refuses_discard`]).
+    pub fn refuses_discard_at(&self, addr: u64) -> bool {
+        self.mapping_at(addr)
+            .is_some_and(|m| self.refuses_discard(m))
+    }
+
+    /// How many pages are locked (Linux's `locked_vm`).
+    pub fn locked_pages(&self) -> u64 {
+        self.mappings
+            .values()
+            .filter(|m| m.locked.is_some())
+            .map(|m| m.length / PAGE_SIZE)
+            .sum()
+    }
+
+    /// How many pages of `[addr, end)` are locked
+    /// (`count_mm_mlocked_page_nr`).
+    pub fn locked_pages_in(&self, addr: u64, end: u64) -> u64 {
+        self.mappings
+            .values()
+            .filter(|m| m.locked.is_some() && m.start.0 < end && m.end() > addr)
+            .map(|m| (m.end().min(end) - m.start.0.max(addr)) / PAGE_SIZE)
+            .sum()
+    }
+
+    /// How a new mapping is locked ([`Self::lock_all`]).
+    pub fn future_lock(&self) -> Option<Lock> {
+        self.future_lock
     }
 
     /// `MADV_GUARD_INSTALL` (with `install`) or `MADV_GUARD_REMOVE` of
@@ -4633,6 +4785,38 @@ impl AddressSpace {
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
         self.locked().advise_flags(addr.0, end, advice)
     }
+    /// See [`AddressSpaceData::lock`].
+    pub fn lock(&self, addr: GuestAddr, end: u64, lock: Option<Lock>) -> Result<(), Errno> {
+        self.locked().lock(addr.0, end, lock)
+    }
+    /// See [`AddressSpaceData::lock_new`].
+    pub fn lock_new(&self, addr: GuestAddr, end: u64, lock: Lock) {
+        self.locked().lock_new(addr.0, end, lock);
+    }
+    /// See [`AddressSpaceData::lock_all`].
+    pub fn lock_all(&self, current: Option<Option<Lock>>, future: Option<Lock>) {
+        self.locked().lock_all(current, future);
+    }
+    /// See [`AddressSpaceData::first_locked`].
+    pub fn first_locked(&self, addr: GuestAddr, end: u64) -> Option<Mapping> {
+        self.locked().first_locked(addr.0, end)
+    }
+    /// See [`AddressSpaceData::refuses_discard_at`].
+    pub fn refuses_discard_at(&self, addr: GuestAddr) -> bool {
+        self.locked().refuses_discard_at(addr.0)
+    }
+    /// See [`AddressSpaceData::locked_pages`].
+    pub fn locked_pages(&self) -> u64 {
+        self.locked().locked_pages()
+    }
+    /// See [`AddressSpaceData::locked_pages_in`].
+    pub fn locked_pages_in(&self, addr: GuestAddr, end: u64) -> u64 {
+        self.locked().locked_pages_in(addr.0, end)
+    }
+    /// See [`AddressSpaceData::future_lock`].
+    pub fn future_lock(&self) -> Option<Lock> {
+        self.locked().future_lock()
+    }
     /// See [`AddressSpaceData::guard`].
     pub fn guard(&self, addr: GuestAddr, end: u64, install: bool) -> Result<(), Errno> {
         self.locked().guard(addr.0, end, install)
@@ -5336,6 +5520,56 @@ mod tests {
                 .all(|m| !m.dont_fork && !m.wipe_on_fork && !m.dont_dump)
         );
         assert_eq!(space.vma_at(at(2)), Some((at(0), 4 * PAGE_SIZE)));
+    }
+
+    #[test]
+    fn locks_split_vmas_and_go_where_linux_drops_them() {
+        let mut space = space_with(0x50000, 3 * PAGE_SIZE, Prot::READ_WRITE);
+        space
+            .lock(GuestAddr(0x51000), 0x52000, Some(Lock::Populated))
+            .unwrap();
+        assert_eq!(
+            space.vma_at(GuestAddr(0x51000)),
+            Some((GuestAddr(0x51000), PAGE_SIZE))
+        );
+        assert_eq!(space.locked_pages(), 1);
+        // A hole stops it, after the VMAs before took it.
+        assert_eq!(
+            space.lock(GuestAddr(0x50000), 0x60000, Some(Lock::OnFault)),
+            Err(Errno::ENOMEM)
+        );
+        assert_eq!(space.locked_pages(), 3);
+        assert_eq!(
+            space.vma_at(GuestAddr(0x50000)),
+            Some((GuestAddr(0x50000), 3 * PAGE_SIZE))
+        );
+        // A child has none.
+        assert_eq!(space.fork().locked_pages(), 0);
+        // MREMAP_DONTUNMAP leaves the old range unlocked, the new locked.
+        let how = Remap {
+            may_move: true,
+            fixed: true,
+            keep_old: true,
+            new_addr: GuestAddr(0x90000),
+        };
+        space
+            .remap_shared(GuestAddr(0x50000), 3 * PAGE_SIZE, 3 * PAGE_SIZE, how)
+            .unwrap();
+        assert!(space.first_locked(GuestAddr(0x50000), 0x53000).is_none());
+        assert_eq!(space.locked_pages_in(GuestAddr(0x90000), 0x93000), 3);
+        // MCL_FUTURE locks what is mapped next; munlockall none.
+        space.lock_all(None, Some(Lock::Populated));
+        space
+            .map(
+                Some(GuestAddr(0xa0000)),
+                PAGE_SIZE,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        assert_eq!(space.locked_pages(), 4);
+        space.lock_all(Some(None), None);
+        assert_eq!(space.locked_pages(), 0);
     }
 
     #[test]

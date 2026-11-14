@@ -792,9 +792,24 @@ kernel.
   (`EPERM`) before an unknown flag is `EINVAL`.
 - `mlock`, `mlock2` and `munlock` check their range as Linux does: the length
   rounds up to pages, a range past the end of addresses is `EINVAL`, and one
-  with a page that is not mapped is `ENOMEM`. `mlock` and `mlock2` without
-  `MLOCK_ONFAULT` also give `ENOMEM` for a page with `PROT_NONE`. Unknown flags
-  of `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
+  with a page that is not mapped is `ENOMEM`, once the VMAs before it took
+  the new state. A lock (`VM_LOCKED`, with `MLOCK_ONFAULT` also
+  `VM_LOCKONFAULT`) makes VMAs of their own, as `/proc/<pid>/maps` shows.
+  It needs a `RLIMIT_MEMLOCK` above 0 (`EPERM`) and room under it for the
+  pages not locked yet (`ENOMEM`), unless the caller has `CAP_IPC_LOCK`.
+  `mlock` and `mlock2` without `MLOCK_ONFAULT` then bring the pages in, and
+  give `ENOMEM` for one that cannot be (`PROT_NONE`, a guard page, past the
+  end of its file). `mlockall` locks every mapping with `MCL_CURRENT`
+  (`ENOMEM` when all that is mapped does not fit) and every new one with
+  `MCL_FUTURE`, which `mmap`, `brk` and a growing `mremap` then need room
+  for (`EAGAIN`; `brk` keeps the break), as `MAP_LOCKED` does; `munlockall`
+  undoes both. A locked VMA refuses `MADV_DONTNEED`, `MADV_FREE`,
+  `MADV_COLD`, `MADV_PAGEOUT`, `MADV_REMOVE` and `MADV_GUARD_INSTALL`
+  (`EINVAL`, after the VMAs before it took the advice) and `msync` with
+  `MS_INVALIDATE` (`EBUSY`); `MADV_DONTNEED_LOCKED` takes it. A `fork`ed
+  child has no lock, nor does the old range `MREMAP_DONTUNMAP` leaves, and
+  the rings of AIO and `io_uring` are never locked. Unknown flags of
+  `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
   memory stays in place without more being done.
 - `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
   as zeros, and those of a file mapping read the file again, as it is then,
@@ -856,11 +871,17 @@ kernel.
 - `process_mrelease` finds its process as `process_madvise` does (`flags`
   must be 0, then `EBADF`, `ESRCH`); a process that has exited has no
   memory left (`ESRCH`, as a zombie). It succeeds when that memory is on
-  its way to be freed: the process is dying (a SIGKILL was sent to it, or
-  it has begun to exit, and it is not writing a core dump), and so is
+  its way to be freed: the process is dying (a fatal signal was sent to
+  it, or it has begun to exit, and it is not writing a core dump), and so is
   every other process that runs in its memory. Otherwise it gives
-  `EINVAL`, as for the caller itself. The memory goes as the process's
-  last thread ends, so there is nothing more to release early.
+  `EINVAL`, as for the caller itself. A signal is fatal as it is sent, as
+  Linux's `complete_signal` starts the group exit then, when it is SIGKILL,
+  or when its action is the default one, which ends the process without a
+  core (not SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV,
+  SIGXCPU, SIGXFSZ or SIGSYS, which their taker dumps), the thread it goes
+  to (or one of the process's) does not block it, and the process is not
+  stopped. The memory goes as the process's last thread ends, so there is
+  nothing more to release early.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
   and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed
@@ -2251,6 +2272,19 @@ kernel.
   is waited for. `getrusage`, `times` and the rusage of `wait4` and `waitid`
   report it all as user time, as the emulator's work for system calls runs
   in the host's user space; memory use is not measured.
+- A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`
+  takes it apart: the task's number in the caller's PID namespace
+  (`~id >> 3`, 0 for the caller), a thread's clock (bit 2) or a process's,
+  and the time in the low two bits (`CPUCLOCK_PROF`, `CPUCLOCK_VIRT` and
+  `CPUCLOCK_SCHED`, all the same time here). `clock_gettime` reads any
+  process's, a zombie's too, the caller's own thread's number as its
+  process's, and the clock of a thread of the caller's process;
+  `clock_getres` gives a tick (1 ms) for the first two kinds of time and
+  1 ns for the third. Another task's thread, a thread's number as a
+  process's (but the caller's own, to read), no such task, and the fourth
+  kind give `EINVAL`, as does a dynamic clock (`3` in the low three bits),
+  which needs a PTP device's file. Every clock ID is an `int`, as Linux's
+  system calls take it, so the high 32 bits are not looked at.
 - `clock_gettime` also reads `CLOCK_MONOTONIC_RAW`, the coarse clocks,
   `CLOCK_BOOTTIME` (the host never suspends), the alarm clocks and
   `CLOCK_TAI` (with a TAI offset of 0). The coarse clocks give the time of
@@ -2274,8 +2308,18 @@ kernel.
   `TIMER_ABSTIME` (`EINVAL`), then a caller without the capability
   (`EPERM`); `timer_create` writes the timer's ID out before it refuses
   one, and the ID is used up, as it is when it cannot be written
-  (`EFAULT`). The CPU clocks of other processes and threads are not
-  modelled (`EINVAL`).
+  (`EFAULT`). `timer_create` also runs on the CPU clocks of the caller's
+  process and threads by number; it finds the task after the ID is out,
+  as Linux's `posix_cpu_timer_create` does, so a task that is not there
+  gives `EINVAL` with the ID used up. A dynamic clock has no timers and
+  cannot sleep (`EOPNOTSUPP`). A sleep on a CPU clock by number reads its
+  request, refuses the caller's own thread's clock (`EINVAL`) and then a
+  task that is not there (`EINVAL`); on the caller's process's clock it
+  sleeps as below, and on another task's it returns at once when its time
+  has come (a relative 0, or an absolute time the clock has reached), as
+  Linux's `posix_cpu_nsleep`, but one that would wait for that task's CPU
+  time is not modelled (`EINVAL`), nor is a timer on another process's
+  CPU time.
 - A sleep on the process's CPU clock ends once the process's threads
   together have used the time, as Linux's `do_cpu_nanosleep`: a time that
   has passed, or none to sleep, returns at once, and the sleeping thread

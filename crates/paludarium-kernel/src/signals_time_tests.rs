@@ -220,6 +220,70 @@ fn clock_nanosleep_clocks_and_flags() {
         );
     }
 }
+/// Linux's `make_process_cpuclock` and `make_thread_cpuclock`.
+fn cpu_clock_id(pid: u32, thread: bool, which: i32) -> u64 {
+    u64::from(((!(pid as i32)) << 3 | if thread { 4 } else { 0 } | which) as u32)
+}
+#[test]
+fn cpu_clocks_of_tasks_by_number() {
+    let mut f = fixture();
+    let (einval, enotsup) = (errno(Errno::EINVAL), errno(Errno::EOPNOTSUPP));
+    let pid = f.ret(39, &[]) as u32;
+    let gettime = |f: &mut Fixture, id: u64| f.ret(syscalls::nr::CLOCK_GETTIME, &[id, DATA]);
+    let getres = |f: &mut Fixture, id: u64| {
+        let r = f.ret(syscalls::nr::CLOCK_GETRES, &[id, DATA]);
+        (r, f.mem.read_u64(GuestAddr(DATA + 8)).unwrap())
+    };
+    // The caller's own clocks: by 0, by its number, and its thread's number
+    // as a process clock too, which only clock_gettime takes.
+    for which in 0..3 {
+        assert_eq!(gettime(&mut f, cpu_clock_id(0, false, which)), 0);
+        assert_eq!(gettime(&mut f, cpu_clock_id(pid, false, which)), 0);
+        assert_eq!(gettime(&mut f, cpu_clock_id(pid, true, which)), 0);
+    }
+    // A tick for the clocks Linux counts by ticks, 1 ns for the run time.
+    assert_eq!(getres(&mut f, cpu_clock_id(pid, false, 0)), (0, 1_000_000));
+    assert_eq!(getres(&mut f, cpu_clock_id(pid, true, 1)), (0, 1_000_000));
+    assert_eq!(getres(&mut f, cpu_clock_id(0, false, 2)), (0, 1));
+    // No such task, a dynamic clock (no file here is one), the fourth kind.
+    assert_eq!(gettime(&mut f, cpu_clock_id(0x0fff_fff0, false, 2)), einval);
+    assert_eq!(getres(&mut f, cpu_clock_id(0x0fff_fff0, true, 2)).0, einval);
+    assert_eq!(gettime(&mut f, cpu_clock_id(3, false, 3)), einval);
+    assert_eq!(gettime(&mut f, cpu_clock_id(pid, true, 3)), einval);
+    // A clockid_t is an int.
+    assert_eq!(gettime(&mut f, 1 << 32 | 1), 0);
+    assert_eq!(getres(&mut f, 1 << 32 | 6).0, 0);
+    // Sleeps: none on a dynamic clock; a CPU clock reads the request first.
+    timespec(&mut f, 0, 42);
+    let nsleep = |f: &mut Fixture, id: u64, req: u64| {
+        f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[id, 0, req, 0])
+    };
+    assert_eq!(nsleep(&mut f, cpu_clock_id(3, false, 3), 8), enotsup);
+    assert_eq!(nsleep(&mut f, 2, 8), errno(Errno::EFAULT));
+    assert_eq!(nsleep(&mut f, cpu_clock_id(pid, true, 2), 8), errno(Errno::EFAULT));
+    assert_eq!(nsleep(&mut f, cpu_clock_id(pid, true, 2), DATA), einval);
+    // No such task; on the process's clock by number, a time that has come
+    // returns at once.
+    assert_eq!(nsleep(&mut f, cpu_clock_id(0x0fff_fff0, false, 2), DATA), einval);
+    timespec(&mut f, 0, 0);
+    assert_eq!(nsleep(&mut f, 2, DATA), 0);
+    assert_eq!(
+        f.ret(syscalls::nr::CLOCK_NANOSLEEP, &[cpu_clock_id(pid, false, 0), 1, DATA, 0]),
+        0
+    );
+    timespec(&mut f, 0, 42);
+    // Timers: on the thread's clock by its number; none on a dynamic clock,
+    // and a task not found after the ID is out, which is then used up.
+    let id = DATA + 64;
+    let create = |f: &mut Fixture, clock: u64| f.ret(syscalls::nr::TIMER_CREATE, &[clock, 0, id]);
+    assert_eq!(create(&mut f, cpu_clock_id(pid, true, 2)), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(id)).unwrap() as u32, 0);
+    assert_eq!(create(&mut f, cpu_clock_id(3, false, 3)), enotsup);
+    assert_eq!(create(&mut f, cpu_clock_id(0x0fff_fff0, false, 2)), einval);
+    assert_eq!(f.mem.read_u64(GuestAddr(id)).unwrap() as u32, 1);
+    assert_eq!(create(&mut f, cpu_clock_id(0, false, 0)), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(id)).unwrap() as u32, 2);
+}
 /// The process's CPU clock sleeps until the process has used the time; this
 /// host counts wall time as CPU time.
 #[test]
@@ -1003,10 +1067,11 @@ fn posix_timer_on_the_process_cpu_clock_sends_its_signal() {
     assert_eq!(f.mem.read_u64(GuestAddr(DATA + 128)).unwrap(), 1 << 9);
     assert_eq!(f.ret(nr::TIMER_GETTIME, &[0, DATA + 64]), 0);
     assert_eq!(itimerval_at(&f, DATA + 64), [1, 0, 1, 0]);
-    // The CPU clocks of other processes and threads are not modelled.
-    let other = (!0u64 << 3) | 2;
+    // The process's own clock by number 0; a task that is not there.
+    let own = (!0u64 << 3) | 2;
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[own, DATA + 256, DATA + 320]), 0);
     assert_eq!(
-        f.ret(nr::TIMER_CREATE, &[other, DATA + 256, DATA + 320]),
+        f.ret(nr::TIMER_CREATE, &[cpu_clock_id(0x0fff_fff0, false, 2), DATA + 256, DATA + 320]),
         errno(Errno::EINVAL)
     );
 }

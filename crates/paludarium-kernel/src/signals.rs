@@ -443,6 +443,7 @@ pub(crate) fn install(
     mem: &AddressSpace,
     signal: PendingSignal,
     action: SignalAction,
+    stack_limits: (u64, u64),
 ) -> Result<(), ()> {
     let old_stack = process.alt_stack;
     let already_on = on_altstack(cpu, old_stack);
@@ -492,6 +493,9 @@ pub(crate) fn install(
     put(&mut b, MASK, process.signal_mask);
     b[INFO..INFO + 128].copy_from_slice(&siginfo(process, &signal));
     b[fp..fp + FX_WRITTEN].copy_from_slice(&cpu.fx_image());
+    // Writing the frame below a mapping that grows down extends it, as
+    // Linux's fault on the user copy does.
+    mem.grow_down(GuestAddr(base), stack_limits.0, stack_limits.1);
     mem.write(GuestAddr(base), &b).map_err(|_| ())?;
     process.frames.push(SavedFrame {
         base,

@@ -23,7 +23,8 @@
 //! and `RTM_SETLINK` bring it up or down with `IFF_UP`, given
 //! `CAP_NET_ADMIN` in the user namespace that owns the network namespace.
 //! An error, or a success the request asks for with `NLM_F_ACK`, is
-//! answered with `NLMSG_ERROR`; any other request is `EOPNOTSUPP`. Each
+//! answered with `NLMSG_ERROR`, which tells why as Linux does for a socket
+//! with `NETLINK_EXT_ACK` ([`extack`]); any other request is `EOPNOTSUPP`. Each
 //! request's attributes are checked against its policy first, as Linux's
 //! `ifla_policy`, `ifa_ipv4_policy` and the others are ([`parse_policy`]). A
 //! socket with `NETLINK_GET_STRICT_CHK` has its dumps, link requests and
@@ -43,6 +44,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 mod diag;
+pub(crate) mod extack;
 mod generic;
 mod inet_diag;
 
@@ -62,6 +64,9 @@ const NLM_F_ACK: u16 = 0x4;
 const NLM_F_ECHO: u16 = 0x8;
 const NLM_F_DUMP: u16 = 0x300;
 const NLM_F_CAPPED: u16 = 0x100;
+const NLM_F_ACK_TLVS: u16 = 0x200;
+/// `NLM_F_BULK`, of a removal.
+const NLM_F_BULK: u16 = 0x200;
 const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
@@ -115,6 +120,8 @@ const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
 const IFA_F_TENTATIVE: u32 = 0x40;
 /// `IFA_F_MANAGETEMPADDR`.
 const IFA_F_MANAGETEMPADDR: u32 = 0x100;
+/// `IFA_F_MCAUTOJOIN`: a multicast address joins its group.
+const IFA_F_MCAUTOJOIN: u32 = 0x400;
 /// The multicast routing families, whose dumps find no route.
 const RTNL_FAMILY_IPMR: u8 = 128;
 const RTNL_FAMILY_IP6MR: u8 = 129;
@@ -907,6 +914,7 @@ impl NetlinkSocket {
                 }
                 notices.extend(expired);
             }
+            extack::begin();
             let result = if header.flags & NLM_F_REQUEST == 0 || header.kind < NLMSG_MIN_TYPE {
                 Ok(false)
             } else {
@@ -930,11 +938,14 @@ impl NetlinkSocket {
                 Ok(true) => {}
                 Ok(false) if header.flags & NLM_F_ACK == 0 => {}
                 Ok(false) => {
-                    let ack = acknowledgement(message, &header, port, 0, true);
+                    let report = s.ext_ack.then(extack::take);
+                    let ack = acknowledgement(message, &header, port, 0, true, report.as_ref());
                     self.deliver(s, 0, 0, ack);
                 }
                 Err(e) => {
-                    let ack = acknowledgement(message, &header, port, e.0, s.cap_ack);
+                    let report = s.ext_ack.then(extack::take);
+                    let ack =
+                        acknowledgement(message, &header, port, e.0, s.cap_ack, report.as_ref());
                     self.deliver(s, 0, 0, ack);
                 }
             }
@@ -976,11 +987,27 @@ impl NetlinkSocket {
                 // `rtnl_bridge_getlink` has no bridge port to show.
                 (RTM_GETLINK, AF_BRIDGE) => bridge_dump_check(payload, strict).map(|()| Vec::new()),
                 // `inet6_dump_ifinfo`: each device with IPv6, as IPv6 shows it.
-                (RTM_GETLINK, AF_INET6) => bare_link_dump_check(payload, strict)
-                    .map(|()| vec![inet6_link_message(network, seq, port, NLM_F_MULTI)]),
+                (RTM_GETLINK, AF_INET6) => bare_link_dump_check(
+                    payload,
+                    strict,
+                    [
+                        "ipv6: Invalid header for link dump request",
+                        "ipv6: Invalid data after header",
+                        "ipv6: Invalid values in header for dump request",
+                    ],
+                )
+                .map(|()| vec![inet6_link_message(network, seq, port, NLM_F_MULTI)]),
                 // `ipmr_rtm_dumplink`: each IPv4 multicast routing table.
-                (RTM_GETLINK, RTNL_FAMILY_IPMR) => bare_link_dump_check(payload, strict)
-                    .map(|()| vec![ipmr_link_message(seq, port)]),
+                (RTM_GETLINK, RTNL_FAMILY_IPMR) => bare_link_dump_check(
+                    payload,
+                    strict,
+                    [
+                        "ipv4: Invalid header for ipmr link dump",
+                        "Invalid data after header in ipmr link dump",
+                        "Invalid values in header for ipmr link dump request",
+                    ],
+                )
+                .map(|()| vec![ipmr_link_message(seq, port)]),
                 (RTM_GETLINK, _) => link_dump(network, payload, seq, port, strict),
                 // `mctp_dump_addrinfo`: `lo`'s MCTP addresses.
                 (RTM_GETADDR, AF_MCTP) => mctp_address_dump_check(payload, strict)
@@ -1010,26 +1037,32 @@ impl NetlinkSocket {
                 ),
                 _ => return Err(EOPNOTSUPP),
             };
+            // `netlink_dump_start` finds a dump running before the dump
+            // checks anything.
             if s.done.is_some() {
+                extack::take();
                 return Err(EBUSY);
             }
             let (messages, error) = match dump {
                 Ok(messages) => (messages, 0),
                 Err(e) => (Vec::new(), -e.0),
             };
-            let done = message(
-                NLMSG_DONE,
-                NLM_F_MULTI | answer,
-                header.seq,
-                port,
-                &error.to_le_bytes(),
-            );
             // `inet6_dump_ifaddr` and `inet6_dump_ifinfo`, not split, put
             // `NLMSG_DONE` after their last message when that part has room
             // for it.
             let joined = matches!(header.kind, RTM_GETADDR | RTM_GETLINK) && family == AF_INET6;
+            let first = messages.is_empty() || joined;
+            let done = done_message(s, header, payload, port, answer, error, first);
             self.start_dump_as(s, messages, done, joined);
             return Ok(true);
+        }
+        // A removal of those `rtnetlink_rcv_msg` has a handler for, which
+        // asks to remove in bulk (`NLM_F_BULK`), as none of them can.
+        if matches!(header.kind, RTM_DELADDR | RTM_DELROUTE)
+            && matches!(family, AF_INET | AF_INET6 | AF_MCTP)
+            && header.flags & NLM_F_BULK != 0
+        {
+            return Err(extack::message(EOPNOTSUPP, "Bulk delete is not supported"));
         }
         match header.kind {
             // Only IPv6 answers a single address (`inet6_rtm_getaddr`);
@@ -1129,23 +1162,36 @@ impl NetlinkSocket {
     /// the socket checks strictly, which takes, as `rtnl_valid_getlink_req`
     /// does, no type, flags or change mask (`EINVAL`), and of the
     /// attributes only the names, `IFLA_EXT_MASK` and
-    /// `IFLA_TARGET_NETNSID` (`EINVAL` for others); another
-    /// namespace's ID is `EINVAL` either way, as there is none. The flags
-    /// and the change mask.
+    /// `IFLA_TARGET_NETNSID` (`EINVAL` for others); either way
+    /// `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are then `EOPNOTSUPP`, and
+    /// another namespace's ID `EINVAL`, as there is none. The flags and the
+    /// change mask.
     fn find_link(
         &self,
         payload: &[u8],
         header: &Header,
         strict: Option<bool>,
     ) -> Result<(u32, u32), Errno> {
-        if payload.len() < 16 {
-            return Err(Errno::EINVAL);
-        }
         let get = strict.is_some();
+        if payload.len() < 16 {
+            return Err(extack::message(
+                Errno::EINVAL,
+                if get {
+                    "Invalid header for get link"
+                } else {
+                    "Invalid header length"
+                },
+            ));
+        }
         let word = |i: usize| u32::from_le_bytes(payload[i..i + 4].try_into().unwrap_or_default());
         let index = word(4) as i32;
         if strict == Some(true) {
-            strict_link_header(payload, false)?;
+            strict_link_header(
+                payload,
+                false,
+                "Invalid header for get link",
+                "Invalid values in header for get link request",
+            )?;
         }
         let attributes = parse_policy(&payload[16..], &IFLA_POLICY, strict == Some(true))?;
         let named = |kind: u16| attributes.iter().any(|&(k, _)| k == kind);
@@ -1153,14 +1199,18 @@ impl NetlinkSocket {
             // `rtnl_ensure_unique_netns`: one namespace at most.
             let namespaces = [IFLA_NET_NS_PID, IFLA_NET_NS_FD, IFLA_TARGET_NETNSID];
             if namespaces.into_iter().filter(|&kind| named(kind)).count() > 1 {
-                return Err(Errno::EINVAL);
+                return Err(extack::message(
+                    Errno::EINVAL,
+                    "multiple netns identifying attributes specified",
+                ));
             }
         }
         if !get
             && header.kind == RTM_NEWLINK
             && let Some(&(_, info)) = attributes.iter().rev().find(|&&(k, _)| k == IFLA_LINKINFO)
         {
-            parse_policy(info, &IFLA_INFO_POLICY, false)?;
+            // `rtnl_newlink` parses it without a report.
+            extack::quietly(|| parse_policy(info, &IFLA_INFO_POLICY, false))?;
         }
         for &(kind, _) in &attributes {
             match kind {
@@ -1189,7 +1239,17 @@ impl NetlinkSocket {
                     )
                 })
             {
-                return Err(Errno::EINVAL);
+                return Err(extack::message(
+                    Errno::EINVAL,
+                    "Unsupported attribute in get link request",
+                ));
+            }
+            // `rtnl_ensure_unique_netns` for an ID alone.
+            if named(IFLA_NET_NS_PID) || named(IFLA_NET_NS_FD) {
+                return Err(extack::message(
+                    EOPNOTSUPP,
+                    "specified netns attribute not supported",
+                ));
             }
             if named(IFLA_TARGET_NETNSID) {
                 return Err(Errno::EINVAL);
@@ -1200,7 +1260,9 @@ impl NetlinkSocket {
         // `rtnl_newlink` takes no negative index (`EINVAL`).
         let newlink = !get && header.kind == RTM_NEWLINK;
         let found = match (index, name) {
-            (i, _) if i < 0 && newlink => return Err(Errno::EINVAL),
+            (i, _) if i < 0 && newlink => {
+                return Err(extack::message(Errno::EINVAL, "ifindex can't be negative"));
+            }
             (i, _) if i > 0 => i == 1,
             (_, Some(name)) => name == b"lo",
             (_, None) if !newlink => return Err(Errno::EINVAL),
@@ -1209,7 +1271,7 @@ impl NetlinkSocket {
         if !found {
             // `rtnl_newlink` makes a link only of a kind it is given.
             if !get && header.kind == RTM_NEWLINK && header.flags & NLM_F_CREATE != 0 {
-                return Err(EOPNOTSUPP);
+                return Err(extack::message(EOPNOTSUPP, "Unknown device type"));
             }
             return Err(ENODEV);
         }
@@ -1479,7 +1541,7 @@ fn attributes(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
 /// What an attribute's `struct nla_policy` asks of it, as `validate_nla`
 /// checks it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Nla {
+pub(super) enum Nla {
     /// `NLA_UNSPEC` of at least this many bytes (a policy's `len`); a type
     /// the policy does not name is one of 0.
     Unspec(usize),
@@ -1495,10 +1557,12 @@ enum Nla {
     S32Min(i32),
     /// `NLA_STRING` of at most this many bytes but a last NUL (none for 0).
     String(usize),
-    /// `NLA_NUL_STRING` without a length.
-    NulString,
+    /// `NLA_NUL_STRING` of at most this many bytes but its NUL (any for 0).
+    NulString(usize),
     /// `NLA_BINARY` of at most this many bytes.
     Binary(usize),
+    /// `NLA_BINARY` of exactly this many bytes (`NLA_POLICY_EXACT_LEN`).
+    BinaryOf(usize),
     /// `NLA_NESTED` without a nested policy.
     Nested,
     /// `NLA_REJECT`.
@@ -1570,7 +1634,7 @@ const IFLA_POLICY: Policy = Policy {
         | IFLA_XDP
         | IFLA_PROP_LIST
         | IFLA_PROTO_DOWN_REASON => Nla::Nested,
-        IFLA_PARENT_DEV_NAME => Nla::NulString,
+        IFLA_PARENT_DEV_NAME => Nla::NulString(0),
         IFLA_PERM_ADDRESS
         | IFLA_TSO_MAX_SIZE
         | IFLA_TSO_MAX_SEGS
@@ -1649,6 +1713,38 @@ const RTA6_POLICY: Policy = Policy {
         _ => Nla::Unspec(0),
     },
 };
+/// `ifa_mctp_policy`, MCTP's address requests', which `nlmsg_parse` checks
+/// strictly throughout.
+const IFA_MCTP_POLICY: Policy = Policy {
+    max: IFA_MAX,
+    strict_start: 1,
+    of: |kind| match kind {
+        IFA_ADDRESS | IFA_LOCAL => Nla::U8,
+        _ => Nla::Unspec(0),
+    },
+};
+/// `rta_mctp_policy`, MCTP's route requests', checked strictly throughout.
+const RTA_MCTP_POLICY: Policy = Policy {
+    max: RTA_MAX,
+    strict_start: 1,
+    of: |kind| match kind {
+        RTA_DST => Nla::U8,
+        RTA_METRICS => Nla::Nested,
+        RTA_OIF => Nla::U32,
+        // `NLA_POLICY_EXACT_LEN(sizeof(struct mctp_fq_addr))`.
+        RTA_GATEWAY => Nla::BinaryOf(8),
+        _ => Nla::Unspec(0),
+    },
+};
+/// MCTP's `rta_metrics_policy`, inside `RTA_METRICS`.
+const RTA_MCTP_METRICS_POLICY: Policy = Policy {
+    max: RTAX_MAX,
+    strict_start: 1,
+    of: |kind| match kind {
+        RTAX_MTU => Nla::U32,
+        _ => Nla::Unspec(0),
+    },
+};
 /// The attributes of `bytes` (types 1 to the policy's last; an attribute
 /// of type 0 or past it is left out), each checked against `policy` in
 /// turn, as `__nla_validate_parse` does. `strict` is
@@ -1674,7 +1770,7 @@ fn parse_policy<'a>(
         bytes = &bytes[align(len).min(bytes.len())..];
         if kind == 0 || kind > policy.max {
             if strict {
-                return Err(Errno::EINVAL);
+                return Err(extack::at(Errno::EINVAL, value, "Unknown attribute type"));
             }
             continue;
         }
@@ -1682,10 +1778,17 @@ fn parse_policy<'a>(
         validate_nla((policy.of)(kind), raw & NLA_F_NESTED != 0, value, full)?;
         out.push((kind, value));
     }
-    if strict && !bytes.is_empty() {
-        return Err(Errno::EINVAL);
-    }
+    leftover(bytes, strict)?;
     Ok(out)
+}
+/// `__nla_validate_parse`'s end: bytes left after the last whole
+/// attribute are told of, a warning, which is `EINVAL` when `strict`.
+pub(super) fn leftover(bytes: &[u8], strict: bool) -> Result<(), Errno> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    extack::say("bytes leftover after parsing attributes");
+    if strict { Err(Errno::EINVAL) } else { Ok(()) }
 }
 /// `validate_nla`'s check of an attribute's `value` against `nla`, and
 /// whether it is marked `NLA_F_NESTED`. With `strict` (`NL_VALIDATE_STRICT`,
@@ -1695,80 +1798,90 @@ fn parse_policy<'a>(
 /// `NLA_REJECT` and for an `NLA_NUL_STRING` without a NUL; `ERANGE` for an
 /// integer, `NLA_UNSPEC` or nest shorter than its policy's, an empty
 /// string, a string or binary longer, and an integer out of its range.
-fn validate_nla(nla: Nla, nested: bool, value: &[u8], strict: bool) -> Result<(), Errno> {
+///
+/// Each refusal is told of with the attribute, and but for `NLA_UNSPEC`
+/// its policy, as `validate_nla` does.
+pub(super) fn validate_nla(
+    nla: Nla,
+    nested: bool,
+    value: &[u8],
+    strict: bool,
+) -> Result<(), Errno> {
     let len = value.len();
+    let failed = |error| extack::against(error, value, nla, "Attribute failed policy validation");
     if strict {
         let unspec = matches!(nla, Nla::Unspec(_));
-        if nla.size().is_some_and(|size| len != size)
-            || ((nla == Nla::Nested) != nested && !unspec)
-            || unspec
-        {
-            return Err(Errno::EINVAL);
+        if nla.size().is_some_and(|size| len != size) {
+            return Err(extack::against(
+                Errno::EINVAL,
+                value,
+                nla,
+                "invalid attribute length",
+            ));
+        }
+        if nla == Nla::Nested && !nested {
+            return Err(extack::against(
+                Errno::EINVAL,
+                value,
+                nla,
+                "NLA_F_NESTED is missing",
+            ));
+        }
+        if nla != Nla::Nested && !unspec && nested {
+            return Err(extack::against(
+                Errno::EINVAL,
+                value,
+                nla,
+                "NLA_F_NESTED not expected",
+            ));
+        }
+        if unspec {
+            return Err(extack::at(Errno::EINVAL, value, "Unsupported attribute"));
         }
     }
     let fits = match nla {
-        Nla::Reject => return Err(Errno::EINVAL),
-        Nla::NulString if !value.contains(&0) => return Err(Errno::EINVAL),
-        Nla::NulString => true,
+        Nla::Reject => return Err(failed(Errno::EINVAL)),
+        // Its NUL within its length and one more byte, then no longer.
+        Nla::NulString(most) => {
+            let within = if most == 0 { len } else { len.min(most + 1) };
+            if within == 0 || !value[..within].contains(&0) {
+                return Err(failed(Errno::EINVAL));
+            }
+            most == 0 || len - usize::from(value[len - 1] == 0) <= most
+        }
         Nla::Unspec(least) => len >= least,
         Nla::String(most) => {
             let bytes = len - usize::from(value.last() == Some(&0));
             len > 0 && (most == 0 || bytes <= most)
         }
         Nla::Binary(most) => most == 0 || len <= most,
+        Nla::BinaryOf(_) => true,
         Nla::Nested => len == 0 || len >= 4,
         _ => nla.size().is_some_and(|size| len >= size),
     };
     if !fits {
-        return Err(ERANGE);
+        return Err(failed(ERANGE));
     }
     let word = || value.first_chunk().copied().map_or(0, u32::from_le_bytes);
+    if let Nla::BinaryOf(size) = nla
+        && len != size
+    {
+        return Err(extack::against(
+            ERANGE,
+            value,
+            nla,
+            "binary attribute size out of range",
+        ));
+    }
     let within = match nla {
         Nla::U32In(least, most) => (least..=most).contains(&word()),
         Nla::S32Min(least) => word().cast_signed() >= least,
         _ => true,
     };
-    if within { Ok(()) } else { Err(ERANGE) }
-}
-/// The attributes of `bytes` as `nlmsg_parse` and `nla_parse_nested` take
-/// them (`NL_VALIDATE_STRICT`), in one walk as `__nla_validate_parse`'s:
-/// each in turn is `EINVAL` for a type of 0 or past `max`, or else has
-/// `policy` check its type, whether it is marked `NLA_F_NESTED`, and its
-/// value; then bytes left after the last whole attribute are `EINVAL`.
-fn policy_attributes(
-    mut bytes: &[u8],
-    max: u16,
-    policy: impl Fn(u16, bool, &[u8]) -> Result<(), Errno>,
-) -> Result<Vec<(u16, &[u8])>, Errno> {
-    let mut out = Vec::new();
-    while bytes.len() >= 4 {
-        let len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
-        if len < 4 || len > bytes.len() {
-            break;
-        }
-        let raw = u16::from_le_bytes([bytes[2], bytes[3]]);
-        let kind = raw & 0x3fff;
-        if kind == 0 || kind > max {
-            return Err(Errno::EINVAL);
-        }
-        policy(kind, raw & 0x8000 != 0, &bytes[4..len])?;
-        out.push((kind, &bytes[4..len]));
-        bytes = &bytes[align(len).min(bytes.len())..];
-    }
-    if bytes.is_empty() {
-        Ok(out)
-    } else {
-        Err(Errno::EINVAL)
-    }
-}
-/// A strict policy's check of an `NLA_U8`, `NLA_U32` or exact-length
-/// binary attribute (`validate_nla`): `EINVAL` for another length, or for
-/// one marked `NLA_F_NESTED`.
-fn exact(nested: bool, value: &[u8], len: usize) -> Result<(), Errno> {
-    if nested || value.len() != len {
-        Err(Errno::EINVAL)
-    } else {
+    if within {
         Ok(())
+    } else {
+        Err(extack::against(ERANGE, value, nla, "integer out of range"))
     }
 }
 /// The attributes' values by type, the last of each, in the order of
@@ -1785,16 +1898,23 @@ fn u32_value(value: &[u8]) -> Result<u32, Errno> {
         .ok_or(ERANGE)
 }
 /// Whether the `ifinfomsg` of a strict link request has a type, flags, a
-/// change mask or, with `index`, an index: `EINVAL` for a short one or
-/// for any of them.
-fn strict_link_header(payload: &[u8], index: bool) -> Result<(), Errno> {
-    if payload.len() < 16
-        || payload[1] != 0
+/// change mask or, with `index`, an index: `EINVAL` for a short one, told
+/// of as `short`, or for any of them, as `values`.
+fn strict_link_header(
+    payload: &[u8],
+    index: bool,
+    short: &'static str,
+    values: &'static str,
+) -> Result<(), Errno> {
+    if payload.len() < 16 {
+        return Err(extack::message(Errno::EINVAL, short));
+    }
+    if payload[1] != 0
         || payload[2..4] != [0, 0]
         || payload[8..16].iter().any(|&b| b != 0)
         || (index && payload[4..8] != [0; 4])
     {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(Errno::EINVAL, values));
     }
     Ok(())
 }
@@ -1816,7 +1936,18 @@ fn link_dump(
     strict: bool,
 ) -> Result<Vec<Vec<u8>>, Errno> {
     let parsed = if strict {
-        strict_link_header(payload, true)?;
+        strict_link_header(
+            payload,
+            false,
+            "Invalid header for link dump",
+            "Invalid values in header for link dump request",
+        )?;
+        if payload[4..8] != [0; 4] {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Filter by device index not supported for link dumps",
+            ));
+        }
         parse_policy(&payload[16..], &IFLA_POLICY, true)
     } else {
         let start = if payload.len() < 16 { 4 } else { 16 };
@@ -1837,10 +1968,20 @@ fn link_dump(
             IFLA_TARGET_NETNSID | IFLA_EXT_MASK | IFLA_MASTER | IFLA_LINKINFO
         )
     };
-    if attributes.contains_key(&IFLA_TARGET_NETNSID)
-        || (strict && attributes.keys().any(|&kind| !known(kind)))
-    {
-        return Err(Errno::EINVAL);
+    // In the order of their types, as `rtnl_dump_ifinfo` looks at them.
+    for &kind in attributes.keys() {
+        if kind == IFLA_TARGET_NETNSID {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Invalid target network namespace id",
+            ));
+        }
+        if strict && !known(kind) {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Unsupported attribute in link dump request",
+            ));
+        }
     }
     let value = |kind: u16| {
         attributes
@@ -1856,30 +1997,53 @@ fn link_dump(
 /// Strictly, a bridge link dump (`valid_bridge_getlink_req`) takes no
 /// type, flags, change mask or index (`EINVAL`), then breaks no rule of
 /// `ifla_policy`, and has no attribute but `IFLA_EXT_MASK` (`EINVAL`).
-/// Unchecked, nothing is checked.
+/// Unchecked, its attributes are parsed only for what that tells, as
+/// `rtnl_bridge_getlink` takes no error then.
 fn bridge_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
     if !strict {
+        if payload.len() < 16 {
+            extack::say("Invalid header length");
+        } else {
+            let _ = parse_policy(&payload[16..], &IFLA_POLICY, false);
+        }
         return Ok(());
     }
-    strict_link_header(payload, true)?;
+    strict_link_header(
+        payload,
+        true,
+        "Invalid header for bridge link dump",
+        "Invalid values in header for bridge link dump request",
+    )?;
     let attributes = parse_policy(&payload[16..], &IFLA_POLICY, true)?;
     if attributes.iter().any(|&(kind, _)| kind != IFLA_EXT_MASK) {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Unsupported attribute in bridge link dump request",
+        ));
     }
     Ok(())
 }
 /// Strictly, an AF_INET6 link dump (`inet6_valid_dump_ifinfo`) and an
 /// `RTNL_FAMILY_IPMR` one (`ipmr_valid_dumplink`) take an `ifinfomsg`
 /// alone, with no type, flags, change mask or index (`EINVAL`).
-fn bare_link_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
+/// Each tells of its refusals as `messages`: of a short header, of data
+/// after it, and of values in it.
+fn bare_link_dump_check(
+    payload: &[u8],
+    strict: bool,
+    messages: [&'static str; 3],
+) -> Result<(), Errno> {
+    if !strict {
+        return Ok(());
+    }
+    if payload.len() < 16 {
+        return Err(extack::message(Errno::EINVAL, messages[0]));
+    }
     // `nlmsg_attrlen`: nothing may follow the header.
-    if strict && payload.len() > 16 {
-        return Err(Errno::EINVAL);
+    if payload.len() > 16 {
+        return Err(extack::message(Errno::EINVAL, messages[1]));
     }
-    if strict {
-        strict_link_header(payload, true)?;
-    }
-    Ok(())
+    strict_link_header(payload, true, messages[0], messages[2])
 }
 /// Adds `flags` to each message of `messages`.
 fn with_flags(mut messages: Vec<Vec<u8>>, flags: u16) -> Vec<Vec<u8>> {
@@ -1914,22 +2078,47 @@ fn address_dump(
 ) -> Result<Vec<Vec<u8>>, Errno> {
     let mut flags = 0;
     if strict {
-        if payload.len() < 8 || payload[1..4] != [0; 3] {
-            return Err(Errno::EINVAL);
+        // `rtnl_dump_all` asks IPv4's first, whose error ends the dump.
+        let (policy, messages) = if family == AF_INET6 {
+            (
+                &IFA6_POLICY,
+                [
+                    "ipv6: Invalid header for address dump request",
+                    "ipv6: Invalid values in header for address dump request",
+                    "ipv6: Invalid target network namespace id",
+                    "ipv6: Unsupported attribute in dump request",
+                ],
+            )
+        } else {
+            (
+                &IFA4_POLICY,
+                [
+                    "ipv4: Invalid header for address dump request",
+                    "ipv4: Invalid values in header for address dump request",
+                    "ipv4: Invalid target network namespace id",
+                    "ipv4: Unsupported attribute in dump request",
+                ],
+            )
+        };
+        if payload.len() < 8 {
+            return Err(extack::message(Errno::EINVAL, messages[0]));
+        }
+        if payload[1..4] != [0; 3] {
+            return Err(extack::message(Errno::EINVAL, messages[1]));
         }
         let index = u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default());
         if index != 0 {
             *answer |= NLM_F_DUMP_FILTERED;
             flags = NLM_F_DUMP_FILTERED;
         }
-        // `rtnl_dump_all` asks IPv4's first, whose error ends the dump.
-        let policy = if family == AF_INET6 {
-            &IFA6_POLICY
-        } else {
-            &IFA4_POLICY
-        };
-        if !parse_policy(&payload[8..], policy, true)?.is_empty() {
-            return Err(Errno::EINVAL);
+        let attributes = parse_policy(&payload[8..], policy, true)?;
+        if let Some(&kind) = by_type(&attributes).keys().next() {
+            let message = if kind == IFA_TARGET_NETNSID {
+                messages[2]
+            } else {
+                messages[3]
+            };
+            return Err(extack::message(Errno::EINVAL, message));
         }
         if index > 1 {
             return Err(ENODEV);
@@ -1969,10 +2158,16 @@ fn address_get(
     now: u64,
 ) -> Result<Vec<u8>, Errno> {
     if payload.len() < 8 {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "ipv6: Invalid header for get address request",
+        ));
     }
     if strict && payload[1..4] != [0; 3] {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "ipv6: Invalid values in header for get address request",
+        ));
     }
     let attributes = parse_policy(&payload[8..], &IFA6_POLICY, strict)?;
     if strict
@@ -1980,7 +2175,10 @@ fn address_get(
             .iter()
             .any(|&(kind, _)| !matches!(kind, IFA_ADDRESS | IFA_LOCAL | IFA_TARGET_NETNSID))
     {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "ipv6: Unsupported attribute in get address request",
+        ));
     }
     let by_kind = by_type(&attributes);
     if by_kind.contains_key(&IFA_TARGET_NETNSID) {
@@ -2006,7 +2204,10 @@ fn address_get(
 /// attribute. Unchecked, nothing is checked.
 fn mctp_address_dump_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
     if strict && payload.len() < 8 {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "mctp: Invalid header for addr dump request",
+        ));
     }
     Ok(())
 }
@@ -2094,13 +2295,9 @@ fn mctp_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
 /// `ENOENT`. Its local route comes and goes with it.
 fn change_mctp_address(network: &Network, header: &Header, payload: &[u8]) -> Result<u8, Errno> {
     if payload.len() < 8 {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(Errno::EINVAL, "Invalid header length"));
     }
-    // `ifa_mctp_policy`: both are `NLA_U8`, and no other is taken.
-    let attributes = policy_attributes(&payload[8..], IFA_MAX, |kind, nested, value| match kind {
-        IFA_LOCAL | IFA_ADDRESS => exact(nested, value, 1),
-        _ => Err(Errno::EINVAL),
-    })?;
+    let attributes = parse_policy(&payload[8..], &IFA_MCTP_POLICY, true)?;
     let table = by_type(&attributes);
     let eid = table
         .get(&IFA_LOCAL)
@@ -2172,49 +2369,57 @@ fn same_range(a: &MctpRoute, b: &MctpRoute) -> bool {
 /// out.
 fn change_mctp_route(network: &Network, header: &Header, payload: &[u8]) -> Result<(), Errno> {
     const RTN_UNICAST: u8 = 1;
-    if payload.len() < 12 {
-        return Err(Errno::EINVAL);
-    }
-    let attributes = policy_attributes(&payload[12..], RTA_MAX, |kind, nested, value| {
-        match kind {
-            RTA_DST => exact(nested, value, 1),
-            RTA_OIF => exact(nested, value, 4),
-            // `NLA_POLICY_EXACT_LEN`, a binary range: `ERANGE` for
-            // another length (`nla_validate_range_unsigned`).
-            RTA_GATEWAY if nested => Err(Errno::EINVAL),
-            RTA_GATEWAY if value.len() != 8 => Err(ERANGE),
-            RTA_GATEWAY => Ok(()),
-            // `NLA_NESTED`: marked, and empty or holding a header.
-            RTA_METRICS if !nested => Err(Errno::EINVAL),
-            RTA_METRICS if (1..4).contains(&value.len()) => Err(ERANGE),
-            RTA_METRICS => Ok(()),
-            _ => Err(Errno::EINVAL),
-        }
-    })?;
+    // `mctp_route_nlparse_common` tells of any failure to parse so, the
+    // attribute and policy at fault kept.
+    let parsed = if payload.len() < 12 {
+        Err(Errno::EINVAL)
+    } else {
+        parse_policy(&payload[12..], &RTA_MCTP_POLICY, true)
+    };
+    let attributes = parsed.map_err(|e| extack::message(e, "incorrect format"))?;
     let table = by_type(&attributes);
-    let start = table.get(&RTA_DST).ok_or(Errno::EINVAL)?[0];
+    let start = table
+        .get(&RTA_DST)
+        .ok_or_else(|| extack::message(Errno::EINVAL, "dst EID missing"))?[0];
     let oif = table.get(&RTA_OIF).map_or(0, |value| {
         u32::from_le_bytes(value[..4].try_into().unwrap_or_default())
     });
     let gateway = match (oif, table.get(&RTA_GATEWAY)) {
-        (0, None) | (1.., Some(_)) => return Err(Errno::EINVAL),
+        (1.., Some(_)) => {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "cannot specify both ifindex and gateway",
+            ));
+        }
+        (0, None) => {
+            return Err(extack::message(Errno::EINVAL, "no route output provided"));
+        }
         (1, None) => None,
-        (_, None) => return Err(ENODEV),
+        (_, None) => return Err(extack::message(ENODEV, "bad ifindex")),
         (0, Some(value)) => {
             let eid = value[4];
             if !(8..255).contains(&eid) {
-                return Err(Errno::EINVAL);
+                return Err(extack::message(Errno::EINVAL, "bad gateway"));
             }
             let net = u32::from_le_bytes(value[..4].try_into().unwrap_or_default());
             Some((if net == 0 { 1 } else { net }, eid))
         }
     };
     if payload[7] != RTN_UNICAST {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "rtm_type must be RTN_UNICAST",
+        ));
     }
     let extent = payload[1];
+    // `mctp_route_nlparse_populate` tells of it; `mctp_route_remove` does
+    // not.
     if u16::from(start) + u16::from(extent) >= 255 {
-        return Err(Errno::EINVAL);
+        return Err(if header.kind == RTM_NEWROUTE {
+            extack::message(Errno::EINVAL, "invalid eid range")
+        } else {
+            Errno::EINVAL
+        });
     }
     let route = MctpRoute {
         min: start,
@@ -2237,15 +2442,18 @@ fn change_mctp_route(network: &Network, header: &Header, payload: &[u8]) -> Resu
     }
     let mut mtu = 0;
     if let Some(metrics) = table.get(&RTA_METRICS) {
-        let metrics = policy_attributes(metrics, RTAX_MAX, |kind, nested, value| match kind {
-            RTAX_MTU => exact(nested, value, 4),
-            _ => Err(Errno::EINVAL),
-        })?;
+        // `nla_parse_nested`, without a report.
+        let metrics = extack::quietly(|| parse_policy(metrics, &RTA_MCTP_METRICS_POLICY, true))
+            .map_err(|e| extack::message(e, "incorrect RTA_METRICS format"))?;
         if let Some(value) = by_type(&metrics).get(&RTAX_MTU) {
             mtu = u32::from_le_bytes(value[..4].try_into().unwrap_or_default());
         }
     }
-    if gateway.is_none() || start < 8 {
+    if gateway.is_none() {
+        return Err(extack::message(Errno::EINVAL, "no routes to loopback"));
+    }
+    // `mctp_route_add`.
+    if start < 8 {
         return Err(Errno::EINVAL);
     }
     if addresses.mctp_routes.iter().any(|r| same_range(r, &route)) {
@@ -2289,11 +2497,23 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
             ..RouteFilter::default()
         });
     }
-    if payload.len() < 12 || payload[1..4] != [0; 3] || payload[6] != 0 {
-        return Err(Errno::EINVAL);
+    if payload.len() < 12 {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid header for FIB dump request",
+        ));
+    }
+    if payload[1..4] != [0; 3] || payload[6] != 0 {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid values in header for FIB dump request",
+        ));
     }
     if flags & !(RTM_F_CLONED | RTM_F_PREFIX) != 0 {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid flags for FIB dump request",
+        ));
     }
     let mut filter = RouteFilter {
         cloned: flags & RTM_F_CLONED != 0,
@@ -2311,7 +2531,12 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
             RTA_TABLE => filter.table = u32_value(value)?,
             RTA_OIF if u32_value(value)? == 1 => filter.device = true,
             RTA_OIF => return Err(ENODEV),
-            _ => return Err(Errno::EINVAL),
+            _ => {
+                return Err(extack::message(
+                    Errno::EINVAL,
+                    "Unsupported attribute in dump request",
+                ));
+            }
         }
     }
     if flags != 0 || filter.protocol != 0 || filter.kind != 0 || filter.table != 0 || filter.device
@@ -2363,7 +2588,14 @@ fn route_dump(
             RT6_TABLE_DFLT
         };
         if filter.table != 0 && filter.table != only {
-            return Err(Errno::ENOENT);
+            return Err(extack::message(
+                Errno::ENOENT,
+                if family == RTNL_FAMILY_IPMR {
+                    "ipv4: MR table does not exist"
+                } else {
+                    "ipv6: MR table does not exist"
+                },
+            ));
         }
         return Ok(Vec::new());
     }
@@ -2373,7 +2605,10 @@ fn route_dump(
     if family != AF_INET6 && !filter.prefix {
         if filter.table != 0 && !addresses.has_table4(filter.table) {
             if family == AF_INET {
-                return Err(Errno::ENOENT);
+                return Err(extack::message(
+                    Errno::ENOENT,
+                    "ipv4: FIB table does not exist",
+                ));
             }
         } else {
             messages.extend(
@@ -2388,7 +2623,10 @@ fn route_dump(
     if family != AF_INET {
         if filter.table != 0 && !addresses.has_table6(filter.table) {
             if family == AF_INET6 {
-                return Err(Errno::ENOENT);
+                return Err(extack::message(
+                    Errno::ENOENT,
+                    "ipv6: FIB table does not exist",
+                ));
             }
         } else {
             messages.extend(
@@ -2417,10 +2655,17 @@ fn route_dump(
 /// of 20 bits; and only the attributes that select a route. Anything else
 /// is `EINVAL`, but the policy's errors, which come after the header's.
 fn lookup_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
+    let v6 = payload.first() == Some(&AF_INET6);
+    // Each family's own words, IPv6's with its module's name.
+    let say = |v4: &'static str, v6_message: &'static str| {
+        extack::message(Errno::EINVAL, if v6 { v6_message } else { v4 })
+    };
     if payload.len() < 12 {
-        return Err(Errno::EINVAL);
+        return Err(say(
+            "ipv4: Invalid header for route get request",
+            "ipv6: Invalid header for get route request",
+        ));
     }
-    let v6 = payload[0] == AF_INET6;
     let policy = if v6 { &RTA6_POLICY } else { &RTA4_POLICY };
     if !strict {
         return parse_policy(&payload[12..], policy, false).map(drop);
@@ -2436,23 +2681,35 @@ fn lookup_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
     if (src_len != 0 && src_len != whole)
         || (dst_len != 0 && dst_len != whole)
         || payload[4..8] != [0; 4]
-        || flags & !allowed != 0
     {
-        return Err(Errno::EINVAL);
+        return Err(say(
+            "ipv4: Invalid values in header for route get request",
+            "ipv6: Invalid values in header for get route request",
+        ));
+    }
+    if flags & !allowed != 0 {
+        return Err(say(
+            "ipv4: Unsupported rtm_flags for route get request",
+            "ipv6: Invalid flags for get route request",
+        ));
     }
     let attributes = by_type(&parse_policy(&payload[12..], policy, true)?);
     if (attributes.contains_key(&RTA_SRC) && src_len == 0)
         || (attributes.contains_key(&RTA_DST) && dst_len == 0)
     {
-        return Err(Errno::EINVAL);
+        return Err(say(
+            "ipv4: rtm_src_len and rtm_dst_len must be 32 for IPv4",
+            "ipv6: rtm_src_len and rtm_dst_len must be 128 for IPv6",
+        ));
     }
     // The policy takes an `NLA_BE32` of 4 bytes alone, past its
     // `strict_start_type`.
     if v6
-        && let Some(label) = attributes.get(&RTA_FLOWLABEL).and_then(|v| v.first_chunk())
+        && let Some(value) = attributes.get(&RTA_FLOWLABEL)
+        && let Some(label) = value.first_chunk()
         && u32::from_be_bytes(*label) & !0x000f_ffff != 0
     {
-        return Err(Errno::EINVAL);
+        return Err(extack::at(Errno::EINVAL, value, "Invalid flow label"));
     }
     let selects = |kind: u16| {
         matches!(
@@ -2469,19 +2726,49 @@ fn lookup_check(payload: &[u8], strict: bool) -> Result<(), Errno> {
         ) || (v6 && kind == RTA_FLOWLABEL)
     };
     if attributes.keys().any(|&kind| !selects(kind)) {
-        return Err(Errno::EINVAL);
+        return Err(say(
+            "ipv4: Unsupported attribute in route get request",
+            "ipv6: Unsupported attribute in get route request",
+        ));
     }
     Ok(())
 }
+/// A dump's `NLMSG_DONE` with `error` (0 or a negative errno) for the
+/// request of `header` and `payload`, as
+/// `netlink_dump_done`: with `NLM_F_MULTI` and the `answer` flags the
+/// dump set, and, for a socket with `NETLINK_EXT_ACK`, what its first
+/// part's report holds, when that part ends it (`first`), as an error
+/// always does: each part has a report of its own.
+fn done_message(
+    s: &State,
+    header: &Header,
+    payload: &[u8],
+    port: u32,
+    answer: u16,
+    error: i32,
+    first: bool,
+) -> Vec<u8> {
+    let mut body = error.to_le_bytes().to_vec();
+    let mut flags = NLM_F_MULTI | answer;
+    let report = extack::take();
+    if s.ext_ack && first && report.any(error) {
+        flags |= NLM_F_ACK_TLVS;
+        body.extend(extack::attributes(&report, payload, header.len, error));
+    }
+    message(NLMSG_DONE, flags, header.seq, port, &body)
+}
 /// `NLMSG_ERROR` for `request` with `error` (0 for an acknowledgement), as
 /// `netlink_ack`: an error carries the whole request unless `capped`
-/// (`NETLINK_CAP_ACK`), which an acknowledgement always is.
+/// (`NETLINK_CAP_ACK`), which an acknowledgement always is; then, for a
+/// socket with `NETLINK_EXT_ACK`, what the request's `report` holds, which
+/// sets `NLM_F_ACK_TLVS` ([`extack::attributes`]).
 fn acknowledgement(
     request: &[u8],
     header: &Header,
     port: u32,
     error: i32,
     capped: bool,
+    report: Option<&extack::Report>,
 ) -> Vec<u8> {
     let capped = error == 0 || capped;
     let mut payload = (-error).to_le_bytes().to_vec();
@@ -2491,7 +2778,16 @@ fn acknowledgement(
         payload.extend_from_slice(request);
         payload.resize(4 + 16 + align(request.len() - 16), 0);
     }
-    let flags = if capped { NLM_F_CAPPED } else { 0 };
+    let mut flags = if capped { NLM_F_CAPPED } else { 0 };
+    if let Some(report) = report.filter(|report| report.any(-error)) {
+        flags |= NLM_F_ACK_TLVS;
+        payload.extend(extack::attributes(
+            report,
+            &request[16..],
+            header.len,
+            -error,
+        ));
+    }
     message(NLMSG_ERROR, flags, header.seq, port, &payload)
 }
 /// The flags of `lo`, as `dev_get_flags`: `IFF_LOOPBACK`, with `IFF_UP`,
@@ -2816,7 +3112,8 @@ fn ipv6_address(
 /// `EINVAL` for neither `IFA_LOCAL` nor `IFA_ADDRESS` and such lifetimes,
 /// then `ENODEV` for another interface than index 1, then, for a new one,
 /// `EINVAL` for a prefix past 128, or `IFA_F_MANAGETEMPADDR` but on a
-/// prefix of 64. To remove one, `EINVAL` for an IPv4 prefix past 32 or an
+/// prefix of 64, and `EADDRNOTAVAIL` for `::` and for a multicast address
+/// without `IFA_F_MCAUTOJOIN` (`ipv6_add_addr`). To remove one, `EINVAL` for an IPv4 prefix past 32 or an
 /// IPv6 one past 128, then `ENODEV`. An address added again is `EEXIST`,
 /// unless `NLM_F_REPLACE` without `NLM_F_EXCL`, which changes it
 /// ([`crate::interface::Addresses::add_v4`], `add_v6`), and one to remove
@@ -2834,7 +3131,7 @@ fn change_address(
     use crate::interface::Lifetimes;
     use core::net::{Ipv4Addr, Ipv6Addr};
     if payload.len() < 8 {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(Errno::EINVAL, "Invalid header length"));
     }
     let (family, prefix, header_flags, scope) = (payload[0], payload[1], payload[2], payload[3]);
     let index = u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default());
@@ -2895,14 +3192,30 @@ fn change_address(
                 .transpose()
         };
         let (local, address) = (v4(local)?, v4(address)?);
-        if add && (prefix > 32 || local.is_none() || bad_lifetimes) {
-            return Err(Errno::EINVAL);
+        // `inet_validate_rtm`.
+        if add && prefix > 32 {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "ipv4: Invalid prefix length",
+            ));
+        }
+        if add && local.is_none() {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "ipv4: Local address is not supplied",
+            ));
+        }
+        if add && bad_lifetimes {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "ipv4: address lifetime invalid",
+            ));
         }
         if add && local.is_some_and(|l| l.is_unspecified()) {
             return Ok(Vec::new());
         }
         if index != 1 {
-            return Err(ENODEV);
+            return Err(extack::message(ENODEV, "ipv4: Device not found"));
         }
         if !add {
             return network
@@ -2929,20 +3242,25 @@ fn change_address(
         })
         .transpose()?
         .ok_or(Errno::EINVAL)?;
+    let no_device = || extack::message(ENODEV, "ipv6: Unable to find the interface");
+    let long = || extack::message(Errno::EINVAL, "ipv6: Invalid prefix length");
     if !add {
         if prefix > 128 {
-            return Err(Errno::EINVAL);
+            return Err(long());
         }
         if index != 1 {
-            return Err(ENODEV);
+            return Err(no_device());
         }
         return network.addresses().del_v6(ip, prefix, now);
     }
     if bad_lifetimes {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "ipv6: address lifetime invalid",
+        ));
     }
     if index != 1 {
-        return Err(ENODEV);
+        return Err(no_device());
     }
     let flags = flags & crate::interface::V6_ASKED;
     let mut addresses = network.addresses();
@@ -2954,10 +3272,31 @@ fn change_address(
     // `inet6_addr_add` checks the request's prefix, `inet6_addr_modify`
     // the address's.
     let checked = exists.unwrap_or(prefix);
-    if (exists.is_none() && prefix > 128)
-        || (flags & IFA_F_MANAGETEMPADDR != 0 && checked != 64 && (exists.is_none() || replace))
-    {
-        return Err(Errno::EINVAL);
+    if exists.is_none() && prefix > 128 {
+        return Err(long());
+    }
+    if flags & IFA_F_MANAGETEMPADDR != 0 && checked != 64 {
+        if exists.is_none() {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "ipv6: address with \"mngtmpaddr\" flag must have a prefix length of 64",
+            ));
+        }
+        if replace {
+            return Err(Errno::EINVAL);
+        }
+    }
+    // `ipv6_add_addr`, for a new address.
+    if exists.is_none() {
+        if ip.is_unspecified() {
+            return Err(extack::message(EADDRNOTAVAIL, "ipv6: Invalid address"));
+        }
+        if ip.is_multicast() && flags & IFA_F_MCAUTOJOIN == 0 {
+            return Err(extack::message(
+                EADDRNOTAVAIL,
+                "ipv6: Cannot assign multicast address without \"IFA_F_MCAUTOJOIN\" flag",
+            ));
+        }
     }
     let mut new = crate::interface::V6::new(ip, prefix);
     new.flags = flags;
@@ -3160,8 +3499,9 @@ fn lookup(
         }
     }
     let icmp = if v6 { 58 } else { 1 };
+    // `rtm_getroute_parse_ip_proto`.
     if proto.is_some_and(|p| !matches!(p, 6 | 17) && p != icmp) {
-        return Err(EOPNOTSUPP);
+        return Err(extack::message(EOPNOTSUPP, "Unsupported ip proto"));
     }
     if iif != 0 {
         return Err(if iif == 1 { EOPNOTSUPP } else { ENODEV });
@@ -3371,11 +3711,13 @@ fn lookup(
 /// `inet_rtm_delroute`, `inet6_rtm_newroute` and `inet6_rtm_delroute`
 /// take it ([`crate::interface::Addresses::add_route4`] and the others):
 /// `EINVAL` for one shorter than an `rtmsg`; then the family's policy
-/// (`rtm_ipv4_policy`, `rtm_ipv6_policy`), and `EINVAL` for an IPv6
-/// destination shorter than its prefix; then `EINVAL` for a TOS with ECN
-/// bits (any for IPv6; other bits past the legacy TOS ones are taken, and
-/// such a route matches no lookup, as on Linux) or a kind past `RTN_MAX`.
-/// Multipath routes, encapsulations, nexthop objects, realms, expiries,
+/// (`rtm_ipv4_policy`, `rtm_ipv6_policy`); then `EINVAL` for a TOS with
+/// ECN bits (any for IPv6; other bits past the legacy TOS ones are taken,
+/// and such a route matches no lookup, as on Linux), and for IPv4 a kind
+/// past `RTN_MAX`; for IPv6, `EINVAL` for `RTA_FLOWLABEL`, `RTA_VIA` and a
+/// destination shorter than its prefix, then, adding (`fib6_config_validate`),
+/// for `RTM_F_CLONED`, a kind past `RTN_MAX` and a prefix or source prefix
+/// past 128. Multipath routes, encapsulations, nexthop objects, realms, expiries,
 /// IPv6 gateways, source prefixes and router preferences are
 /// `EOPNOTSUPP`. A route added takes the metrics `RTA_METRICS` holds
 /// ([`convert_metrics`]); an IPv4 one removed must have those it names
@@ -3388,13 +3730,20 @@ fn change_route(
 ) -> Result<Vec<crate::interface::Event>, Errno> {
     use crate::interface::{Ask4, Ask6, Select4};
     use core::net::{Ipv4Addr, Ipv6Addr};
+    let v6 = payload.first() == Some(&AF_INET6);
     if payload.len() < 12 {
-        return Err(Errno::EINVAL);
+        // `nlmsg_parse_deprecated` tells of it; IPv4's
+        // `nlmsg_validate_deprecated` does not.
+        return Err(if v6 {
+            extack::message(Errno::EINVAL, "Invalid header length")
+        } else {
+            Errno::EINVAL
+        });
     }
-    let (family, dst_len, src_len, tos) = (payload[0], payload[1], payload[2], payload[3]);
+    let (dst_len, src_len, tos) = (payload[1], payload[2], payload[3]);
     let (proto, scope, kind) = (payload[5], payload[6], payload[7]);
     let flags = u32::from_le_bytes(payload[8..12].try_into().unwrap_or_default());
-    let v6 = family == AF_INET6;
+    let add = header.kind == RTM_NEWROUTE;
     let size = if v6 { 16 } else { 4 };
     let mut table = u32::from(payload[4]);
     let mut dst = None;
@@ -3411,7 +3760,41 @@ fn change_route(
         value.get(..size).map(<[u8]>::to_vec).ok_or(ERANGE)
     };
     let policy = if v6 { &RTA6_POLICY } else { &RTA4_POLICY };
-    for (attr, value) in parse_policy(&payload[12..], policy, false)? {
+    let parsed = parse_policy(&payload[12..], policy, false)?;
+    // `rtm_to_fib_config` and `rtm_to_fib6_config` look at the header,
+    // then IPv6 at what it refuses, before the attributes.
+    if v6 && tos != 0 {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid dsfield (tos): option not available for IPv6",
+        ));
+    }
+    if !v6 && tos & 0x3 != 0 {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid dsfield (tos): ECN bits must be 0",
+        ));
+    }
+    if !v6 && kind > RTN_MAX {
+        return Err(extack::message(Errno::EINVAL, "Invalid route type"));
+    }
+    if v6 {
+        let table = by_type(&parsed);
+        if let Some(value) = table.get(&RTA_FLOWLABEL) {
+            return Err(extack::at(
+                Errno::EINVAL,
+                value,
+                "Flow label cannot be specified for this operation",
+            ));
+        }
+        if table.contains_key(&RTA_VIA) {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "IPv6 does not support RTA_VIA attribute",
+            ));
+        }
+    }
+    for (attr, value) in parsed {
         match attr {
             RTA_DST if v6 => {
                 let bytes = usize::from(dst_len).div_ceil(8);
@@ -3441,16 +3824,36 @@ fn change_route(
             _ => {}
         }
     }
-    let add = header.kind == RTM_NEWROUTE;
-    if (v6 && tos != 0) || (!v6 && tos & 0x3 != 0) || (kind > RTN_MAX && (add || !v6)) {
-        return Err(Errno::EINVAL);
+    // `fib6_config_validate`, for an IPv6 route added.
+    if v6 && add {
+        if flags & RTM_F_CLONED != 0 {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Userspace can not set RTF_CACHE",
+            ));
+        }
+        if kind > RTN_MAX {
+            return Err(extack::message(Errno::EINVAL, "Invalid route type"));
+        }
+        if dst_len > 128 {
+            return Err(extack::message(Errno::EINVAL, "Invalid prefix length"));
+        }
+        if src_len > 128 {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Invalid source address length",
+            ));
+        }
     }
     if unsupported {
         return Err(EOPNOTSUPP);
     }
     let up = network.is_up();
     let mut addresses = network.addresses();
-    let converted = metrics.map_or(Ok(crate::interface::NO_METRICS), convert_metrics);
+    // Linux converts the metrics later, where the error is told of
+    // ([`extack::raise`]).
+    let converted =
+        extack::defer(|| metrics.map_or(Ok(crate::interface::NO_METRICS), convert_metrics));
     if v6 {
         let ip = |raw: Option<Vec<u8>>| {
             raw.map(|r| Ipv6Addr::from(<[u8; 16]>::try_from(r).unwrap_or_default()))
@@ -3541,28 +3944,44 @@ fn convert_metrics(bytes: &[u8]) -> Result<crate::interface::Metrics, Errno> {
             continue;
         }
         if kind > RTAX_MAX {
-            return Err(Errno::EINVAL);
+            return Err(extack::message(Errno::EINVAL, "Invalid metric type"));
         }
-        let mut number = if kind == RTAX_CC_ALGO {
-            match congestion_key(value) {
-                0 => return Err(Errno::EINVAL),
-                key => key,
-            }
-        } else {
-            u32::from_le_bytes(value.try_into().map_err(|_| Errno::EINVAL)?)
-        };
+        let mut number =
+            if kind == RTAX_CC_ALGO {
+                match congestion_key(value) {
+                    0 => {
+                        return Err(extack::message(
+                            Errno::EINVAL,
+                            "Unknown tcp congestion algorithm",
+                        ));
+                    }
+                    key => key,
+                }
+            } else {
+                u32::from_le_bytes(value.try_into().map_err(|_| {
+                    extack::at(Errno::EINVAL, value, "Invalid attribute in metrics")
+                })?)
+            };
         match kind {
             RTAX_ADVMSS => number = number.min(65535 - 40),
             RTAX_MTU => number = number.min(65535 - 15),
             RTAX_HOPLIMIT => number = number.min(255),
-            RTAX_FEATURES if number & !RTAX_FEATURE_MASK != 0 => return Err(Errno::EINVAL),
+            RTAX_FEATURES if number & !RTAX_FEATURE_MASK != 0 => {
+                return Err(extack::message(
+                    Errno::EINVAL,
+                    "Unknown flag set in feature mask in metrics attribute",
+                ));
+            }
             _ => {}
         }
         metrics[usize::from(kind - 1)] = number;
     }
     let locked = metrics[usize::from(RTAX_LOCK - 1)] & (1 << RTAX_CWND) != 0;
     if locked && metrics[usize::from(RTAX_CWND - 1)] == 0 {
-        return Err(Errno::EINVAL);
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Locked cwnd metric must be non zero",
+        ));
     }
     Ok(metrics)
 }
@@ -3952,8 +4371,8 @@ fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
 }
 /// `setsockopt`: `SO_SNDBUF` and `SO_RCVBUF` (doubled, as Linux keeps
 /// them), `SO_RCVTIMEO`, and `SOL_NETLINK`'s `NETLINK_CAP_ACK`,
-/// `NETLINK_EXT_ACK`, which is kept, though no error carries extended
-/// attributes, and `NETLINK_GET_STRICT_CHK`, by which dumps, link requests
+/// `NETLINK_EXT_ACK`, by which acknowledgements tell why ([`extack`]), and
+/// `NETLINK_GET_STRICT_CHK`, by which dumps, link requests
 /// and route lookups are checked strictly. Any other option is
 /// `ENOPROTOOPT`.
 fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Result<u64, Errno> {
@@ -4645,15 +5064,21 @@ mod tests {
         );
         // Strictly an ifinfomsg alone, as ipmr_valid_dumplink takes it.
         let bare = ifinfo(RTNL_FAMILY_IPMR, 0, &[]);
-        assert_eq!(bare_link_dump_check(&bare, true), Ok(()));
+        assert_eq!(bare_link_dump_check(&bare, true, [""; 3]), Ok(()));
         let index = ifinfo(RTNL_FAMILY_IPMR, 1, &[]);
-        assert_eq!(bare_link_dump_check(&index, true), Err(Errno::EINVAL));
-        assert_eq!(bare_link_dump_check(&index, false), Ok(()));
         assert_eq!(
-            bare_link_dump_check(&[RTNL_FAMILY_IPMR], true),
+            bare_link_dump_check(&index, true, [""; 3]),
             Err(Errno::EINVAL)
         );
-        assert_eq!(bare_link_dump_check(&[RTNL_FAMILY_IPMR], false), Ok(()));
+        assert_eq!(bare_link_dump_check(&index, false, [""; 3]), Ok(()));
+        assert_eq!(
+            bare_link_dump_check(&[RTNL_FAMILY_IPMR], true, [""; 3]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            bare_link_dump_check(&[RTNL_FAMILY_IPMR], false, [""; 3]),
+            Ok(())
+        );
     }
 
     #[test]
@@ -4733,16 +5158,65 @@ mod tests {
         let header = Header::read(&request);
         // `nlmsg_len` is the request's own, 17, not its padded length.
         let request = &request[..17];
-        let ack = acknowledgement(request, &header, 5, 0, false);
+        let ack = acknowledgement(request, &header, 5, 0, false, None);
         assert_eq!(ack.len(), 36);
         assert_eq!(&ack[4..8], &[2, 0, 0x00, 0x01]);
         assert_eq!(&ack[16..20], &0i32.to_le_bytes());
-        let error = acknowledgement(request, &header, 5, 95, false);
+        let error = acknowledgement(request, &header, 5, 95, false, None);
         assert_eq!(error.len(), 40);
         assert_eq!(&error[6..8], &0u16.to_le_bytes());
         assert_eq!(&error[16..20], &(-95i32).to_le_bytes());
         assert_eq!(&error[20..37], request);
-        assert_eq!(acknowledgement(request, &header, 5, 95, true).len(), 36);
+        assert_eq!(
+            acknowledgement(request, &header, 5, 95, true, None).len(),
+            36
+        );
+    }
+
+    #[test]
+    fn extended_acknowledgements_tell_why_and_where() {
+        // An `RTM_SETLINK` whose `IFLA_MTU` is 2 bytes long.
+        let mut body = vec![0u8; 16];
+        attribute(&mut body, IFLA_IFNAME, b"lo\0");
+        attribute(&mut body, IFLA_MTU, &[1, 2]);
+        let request = message(RTM_SETLINK, NLM_F_REQUEST, 9, 0, &body);
+        let header = Header::read(&request);
+        extack::begin();
+        assert_eq!(
+            parse_policy(&request[32..], &IFLA_POLICY, false),
+            Err(ERANGE)
+        );
+        let report = extack::take();
+        let ack = acknowledgement(&request, &header, 5, 34, true, Some(&report));
+        assert_eq!(&ack[6..8], &(NLM_F_CAPPED | NLM_F_ACK_TLVS).to_le_bytes());
+        let found = attributes(&ack[36..]);
+        let message = b"Attribute failed policy validation\0";
+        assert_eq!(found[0], (1, &message[..]));
+        // The header of `IFLA_MTU`, after the `nlmsghdr`, the `ifinfomsg`
+        // and `IFLA_IFNAME`'s 8 bytes.
+        assert_eq!(found[1], (2, &40u32.to_le_bytes()[..]));
+        let policy = attributes(found[2].1);
+        assert_eq!(found[2].0, 4);
+        assert_eq!(policy[0], (4, &0u64.to_le_bytes()[..]));
+        assert_eq!(policy[1], (5, &u64::from(u32::MAX).to_le_bytes()[..]));
+        assert_eq!(policy[2], (1, &4u32.to_le_bytes()[..]));
+        // Without `NETLINK_EXT_ACK`, nothing; a success only the message.
+        assert_eq!(
+            acknowledgement(&request, &header, 5, 34, true, None).len(),
+            36
+        );
+        let ack = acknowledgement(&request, &header, 5, 0, true, Some(&report));
+        assert_eq!(attributes(&ack[36..]), vec![(1, &message[..])]);
+        // A warning: bytes left over, taken without a strict check.
+        extack::begin();
+        assert!(parse_policy(&[0, 0], &IFLA_POLICY, false).is_ok());
+        let report = extack::take();
+        assert!(report.any(0));
+        let ack = acknowledgement(&request, &header, 5, 0, true, Some(&report));
+        assert_eq!(
+            attributes(&ack[36..]),
+            vec![(1, &b"bytes leftover after parsing attributes\0"[..])]
+        );
     }
 
     #[test]
@@ -5014,14 +5488,17 @@ mod tests {
         assert_eq!(dump(&short, false), Ok(plain));
         // The other link dumps.
         assert_eq!(
-            bare_link_dump_check(&ifinfo(AF_INET6, 0, &[]), true),
+            bare_link_dump_check(&ifinfo(AF_INET6, 0, &[]), true, [""; 3]),
             Ok(())
         );
         let six = ifinfo(AF_INET6, 0, &[(IFLA_EXT_MASK, &skip)]);
-        assert_eq!(bare_link_dump_check(&six, true), Err(Errno::EINVAL));
-        assert_eq!(bare_link_dump_check(&six, false), Ok(()));
         assert_eq!(
-            bare_link_dump_check(&ifinfo(AF_INET6, 1, &[]), true),
+            bare_link_dump_check(&six, true, [""; 3]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(bare_link_dump_check(&six, false, [""; 3]), Ok(()));
+        assert_eq!(
+            bare_link_dump_check(&ifinfo(AF_INET6, 1, &[]), true, [""; 3]),
             Err(Errno::EINVAL)
         );
         let bridge = ifinfo(AF_BRIDGE, 0, &[(IFLA_EXT_MASK, &skip)]);

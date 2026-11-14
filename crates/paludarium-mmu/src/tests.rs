@@ -505,3 +505,108 @@ fn usage_counts_pages_as_linux_smaps_does() {
         (1, 0, 1)
     );
 }
+
+#[test]
+fn a_mapping_that_grows_down_grows_as_linux_expand_downwards_does() {
+    let m = AddressSpace::new();
+    let top = 0x4000_0000;
+    let at = m
+        .map_backed(
+            Placement::Exactly(GuestAddr(top)),
+            2 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+            Backing::None,
+        )
+        .unwrap();
+    // Not before it is marked.
+    assert!(!m.grow_down(GuestAddr(top - 1), u64::MAX, u64::MAX));
+    m.grow_new_down(at, top + 2 * PAGE_SIZE);
+    let start = |m: &AddressSpace| m.vma_at(GuestAddr(top)).unwrap().0.0;
+    // An access anywhere below takes the pages from its own up.
+    assert!(m.grow_down(GuestAddr(top - 3 * PAGE_SIZE + 5), u64::MAX, u64::MAX));
+    assert_eq!(start(&m), top - 3 * PAGE_SIZE);
+    m.write(GuestAddr(top - 3 * PAGE_SIZE), &[7]).unwrap();
+    assert!(m.view().vma_from(top).unwrap().flags & vm::GROWSDOWN != 0);
+    // Within it, nothing grows, a guard page included.
+    assert!(!m.grow_down(GuestAddr(top - PAGE_SIZE), u64::MAX, u64::MAX));
+    m.guard(GuestAddr(top - PAGE_SIZE), top, true).unwrap();
+    assert!(!m.grow_down(GuestAddr(top - PAGE_SIZE), u64::MAX, u64::MAX));
+    m.guard(GuestAddr(top - PAGE_SIZE), top, false).unwrap();
+    // RLIMIT_STACK bounds the whole VMA, 5 pages here.
+    let low = top - 3 * PAGE_SIZE;
+    assert!(!m.grow_down(GuestAddr(low - 2 * PAGE_SIZE), 6 * PAGE_SIZE, u64::MAX));
+    assert!(m.grow_down(GuestAddr(low - PAGE_SIZE), 6 * PAGE_SIZE, u64::MAX));
+    let low = low - PAGE_SIZE;
+    // A mapping below that can be accessed keeps the guard gap free.
+    let other = low - STACK_GUARD_GAP - PAGE_SIZE;
+    m.map_shared(
+        Some(GuestAddr(other)),
+        PAGE_SIZE,
+        Prot::READ,
+        MappingKind::Anonymous,
+    )
+    .unwrap();
+    assert!(!m.grow_down(GuestAddr(low - PAGE_SIZE), u64::MAX, u64::MAX));
+    m.protect_shared(GuestAddr(other), PAGE_SIZE, Prot::NONE)
+        .unwrap();
+    assert!(m.grow_down(GuestAddr(low - PAGE_SIZE), u64::MAX, u64::MAX));
+    // A hint in the gap is not taken, and the search leaves the gap free.
+    let gap_start = low - PAGE_SIZE - STACK_GUARD_GAP;
+    let hinted = m
+        .map_backed(
+            Placement::Near(Some(GuestAddr(low - 3 * PAGE_SIZE))),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+            Backing::None,
+        )
+        .unwrap();
+    assert!(hinted.0 + PAGE_SIZE <= gap_start || hinted.0 >= top + 2 * PAGE_SIZE);
+    m.unmap_shared(hinted, PAGE_SIZE).unwrap();
+    m.unmap_shared(GuestAddr(other), PAGE_SIZE).unwrap();
+    let mut space = AddressSpace::new();
+    space.set_mmap_top(GuestAddr(top + 2 * PAGE_SIZE));
+    let at = space
+        .map(
+            Some(GuestAddr(top)),
+            2 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    space.grow_new_down(at, top + 2 * PAGE_SIZE);
+    let found = space
+        .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    assert_eq!(found.0, top - STACK_GUARD_GAP - PAGE_SIZE);
+    // Nor below the lowest address a mapping may have.
+    let mut low = AddressSpace::new();
+    low.map(
+        Some(GuestAddr(MMAP_MIN_ADDR)),
+        PAGE_SIZE,
+        Prot::READ_WRITE,
+        MappingKind::Stack,
+    )
+    .unwrap();
+    assert!(!low.grow_down(GuestAddr(MMAP_MIN_ADDR - 1), u64::MAX, u64::MAX));
+}
+
+#[test]
+fn a_locked_mapping_grows_down_within_the_lock_limit() {
+    let m = AddressSpace::new();
+    let top = 0x4000_0000;
+    let at = m
+        .map_shared(
+            Some(GuestAddr(top)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.grow_new_down(at, top + PAGE_SIZE);
+    m.lock(at, top + PAGE_SIZE, Some(Lock::OnFault)).unwrap();
+    assert!(!m.grow_down(GuestAddr(top - PAGE_SIZE), u64::MAX, 1));
+    assert!(m.grow_down(GuestAddr(top - PAGE_SIZE), u64::MAX, 2));
+    assert_eq!(m.locked_pages(), 2);
+}

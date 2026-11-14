@@ -167,7 +167,8 @@ the real work started.
   In WebKit, a Worker with an instance of a shared memory ending while another
   thread grows that memory crashes the page.
 - To share the whole emulator (the Rust heap and std) between Workers, std is
-  rebuilt with atomics and every Worker gets its own stack and TLS.
+  rebuilt with atomics, and every run and guest thread gets a stack and TLS of
+  its own, freed when it ends; an idle Worker takes the next thread's.
 
 ## The JIT as a separate component
 

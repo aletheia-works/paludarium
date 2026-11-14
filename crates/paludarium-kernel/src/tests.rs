@@ -3961,6 +3961,91 @@ mod mprotect_order {
         assert_eq!(f.ret(329, &[stack, 4096, 1 | GROWSDOWN, u64::MAX]), 0);
         assert_eq!(prot_at(&f, stack), Prot::READ);
     }
+
+    #[test]
+    fn a_map_growsdown_mapping_grows_down_at_a_fault() {
+        const MAP_GROWSDOWN: u64 = 0x100;
+        const PRIVATE_FIXED: u64 = 0x02 | 0x10 | 0x20;
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // Only private anonymous memory grows down.
+        assert_eq!(
+            f.ret(9, &[0, 4096, 3, 0x01 | 0x20 | MAP_GROWSDOWN, u64::MAX, 0]),
+            einval
+        );
+        let at = 0x60_0000;
+        let flags = PRIVATE_FIXED | MAP_GROWSDOWN;
+        assert_eq!(f.ret(9, &[at, 0x2000, 3, flags, u64::MAX, 0]), at);
+        // A fault two pages below takes both pages, and the access runs again.
+        let rip = GuestAddr(0x1234);
+        let fault = |addr| ExitReason::PageFault {
+            rip,
+            addr: GuestAddr(addr),
+            write: true,
+            fetch: false,
+            mapped: false,
+            present: false,
+        };
+        assert_eq!(
+            f.kernel.handle(&mut f.thread, &f.mem, fault(at - 0x1ff8)),
+            Next::Resume
+        );
+        assert_eq!(f.thread.cpu.rip, rip);
+        assert_eq!(
+            f.mem.vma_at(GuestAddr(at)),
+            Some((GuestAddr(at - 0x2000), 0x4000))
+        );
+        f.mem.write(GuestAddr(at - 0x2000), &[1]).unwrap();
+        // PROT_GROWSDOWN reaches the new start.
+        assert_eq!(f.ret(10, &[at, 4096, 1 | GROWSDOWN]), 0);
+        assert_eq!(prot_at(&f, at - 0x2000), Prot::READ);
+        assert_eq!(prot_at(&f, at + 0x1000), Prot::READ_WRITE);
+        // Another thread grew it first: the access is made again, as a read
+        // of it can be made now (a write, to read-only memory, cannot).
+        let read = ExitReason::PageFault {
+            rip,
+            addr: GuestAddr(at - 0x1ff8),
+            write: false,
+            fetch: false,
+            mapped: false,
+            present: false,
+        };
+        assert_eq!(f.kernel.handle(&mut f.thread, &f.mem, read), Next::Resume);
+        // What the access still meets there is the signal's, not a retry: a
+        // guard page, or a page that cannot be executed.
+        f.mem
+            .guard(GuestAddr(at - 0x2000), at - 0x1000, true)
+            .unwrap();
+        let fetch = ExitReason::PageFault {
+            rip,
+            addr: GuestAddr(at),
+            write: false,
+            fetch: true,
+            mapped: false,
+            present: false,
+        };
+        let mut other = fixture();
+        assert_eq!(other.ret(9, &[at, 0x2000, 3, flags, u64::MAX, 0]), at);
+        assert_eq!(
+            other.kernel.handle(&mut other.thread, &other.mem, fetch),
+            Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
+        );
+        assert_eq!(
+            f.kernel.handle(&mut f.thread, &f.mem, fault(at - 0x1ff8)),
+            Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
+        );
+        let mut f = fixture();
+        // Below memory that does not grow down, a fault is still SIGSEGV.
+        let plain = 0x70_0000;
+        assert_eq!(
+            f.ret(9, &[plain, 4096, 3, PRIVATE_FIXED, u64::MAX, 0]),
+            plain
+        );
+        assert_eq!(
+            f.kernel.handle(&mut f.thread, &f.mem, fault(plain - 8)),
+            Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
+        );
+    }
 }
 
 mod io_uring {
@@ -5430,7 +5515,7 @@ mod inotify {
         // Merged into the first, the lock stays with its description.
         assert_eq!(lock(&mut f, other, 6, 1, 10, 5), 0);
         assert_eq!(lock(&mut f, other, 37, 1, 100, 1), 0);
-        let fs = &f.kernel.files.fs;
+        let fs = &f.kernel.files.fs();
         let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
         let (major, minor) = (device >> 8 & 0xfff, device & 0xff | (device >> 12) & !0xff);
         let ino = fs.metadata(b"/tmp/locked", true).unwrap().inode;
@@ -5453,7 +5538,7 @@ mod inotify {
         let path = put(&f, DATA, b"/tmp/flocked");
         let a = f.ret(2, &[path, 0o102, 0o600]);
         let b = f.ret(2, &[path, 0o2, 0]);
-        let fs = &f.kernel.files.fs;
+        let fs = &f.kernel.files.fs();
         let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
         let (major, minor) = (device >> 8 & 0xfff, device & 0xff | (device >> 12) & !0xff);
         let ino = fs.metadata(b"/tmp/flocked", true).unwrap().inode;
@@ -5520,7 +5605,7 @@ mod inotify {
             f.mem.read(GuestAddr(handle), &mut b).unwrap();
             b
         };
-        let fs = &f.kernel.files.fs;
+        let fs = &f.kernel.files.fs();
         let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
         let id = 20 + (device & 0xff | (device >> 12) & !0xff);
         let ino = fs.metadata(b"/tmp/handled", true).unwrap().inode;
@@ -5773,7 +5858,7 @@ mod inotify {
         assert_eq!(f.ret(ADD, &[fd, a, 0x8000_0004]), 2);
         // A changed mask keeps the watch where it was.
         assert_eq!(f.ret(ADD, &[fd, tmp, 0x0400_0300]), 1);
-        let fs = &f.kernel.files.fs;
+        let fs = &f.kernel.files.fs();
         let device = paludarium_vfs::mount_device(&fs.mounts(), b"/tmp");
         let sdev = (device >> 8 & 0xfff) << 20 | device & 0xff | (device >> 12) & !0xff;
         let ino = |path: &[u8]| fs.metadata(path, true).unwrap().inode;
@@ -5910,7 +5995,7 @@ mod inotify {
         ];
         assert_eq!(f.ret(83, &[put(&f, DATA, b"/tmp/x"), 0o755]), 0);
         for (path, mode, bytes) in files {
-            let file = f.kernel.files.fs.open(path, 0o101, mode).unwrap();
+            let file = f.kernel.files.fs().open(path, 0o101, mode).unwrap();
             assert_eq!(file.write_at(0, bytes).unwrap(), bytes.len());
         }
         let fd = f.ret(INIT1, &[IN_NONBLOCK]);
@@ -7956,4 +8041,94 @@ mod admin {
         assert_eq!(f.ret(443, &[dir, info | 3, 0, 0]), einval);
         assert_eq!(f.ret(443, &[99, info, 0, 0]), errno(Errno::EBADF));
     }
+}
+/// chroot keeps absolute paths, links and `..` inside the new root, and
+/// leaves the working directory where it was.
+#[test]
+fn chroot_keeps_paths_to_the_new_root() {
+    let mut f = fixture();
+    let s = |f: &mut Fixture, at: u64, text: &[u8]| -> u64 {
+        let mut bytes = text.to_vec();
+        bytes.push(0);
+        f.mem.write(GuestAddr(DATA + at), &bytes).unwrap();
+        DATA + at
+    };
+    let cwd = |f: &mut Fixture| -> Vec<u8> {
+        let n = f.ret(79, &[DATA + 0x1000, 256]);
+        let mut out = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x1000), &mut out).unwrap();
+        out.pop();
+        out
+    };
+    for dir in [&b"/jail"[..], b"/jail/d", b"/jail/d/e"] {
+        let p = s(&mut f, 0, dir);
+        assert_eq!(f.ret(83, &[p, 0o755]), 0);
+    }
+    let p = s(&mut f, 0, b"/jail/f");
+    let fd = f.ret(2, &[p, 0o101, 0o644]);
+    let data = s(&mut f, 0x100, b"in");
+    assert_eq!(f.ret(1, &[fd, data, 2]), 2);
+    let p = s(&mut f, 0, b"/f");
+    let fd = f.ret(2, &[p, 0o101, 0o644]);
+    let data = s(&mut f, 0x100, b"out");
+    assert_eq!(f.ret(1, &[fd, data, 3]), 3);
+    let (target, link) = (s(&mut f, 0, b"/f"), s(&mut f, 0x80, b"/jail/d/abs"));
+    assert_eq!(f.ret(88, &[target, link]), 0);
+    let (target, link) = (s(&mut f, 0, b"../../../f"), s(&mut f, 0x80, b"/jail/d/up"));
+    assert_eq!(f.ret(88, &[target, link]), 0);
+    // Lookups first: missing, not a directory.
+    let p = s(&mut f, 0, b"/none");
+    assert_eq!(f.ret(161, &[p]), errno(Errno::ENOENT));
+    let p = s(&mut f, 0, b"/jail/f");
+    assert_eq!(f.ret(161, &[p]), errno(Errno::ENOTDIR));
+    let p = s(&mut f, 0, b"/jail");
+    assert_eq!(f.ret(80, &[p]), 0);
+    let p = s(&mut f, 0, b"d");
+    assert_eq!(f.ret(80, &[p]), 0);
+    let p = s(&mut f, 0, b"/jail");
+    assert_eq!(f.ret(161, &[p]), 0);
+    // The working directory stayed: /jail/d is /d from the new root.
+    assert_eq!(cwd(&mut f), b"/d");
+    let read = |f: &mut Fixture, path: &[u8]| -> Vec<u8> {
+        let p = s(f, 0, path);
+        let fd = f.ret(2, &[p, 0, 0]);
+        if (fd as i64) < 0 {
+            return format!("errno {}", -(fd as i64)).into_bytes();
+        }
+        let n = f.ret(0, &[fd, DATA + 0x200, 16]);
+        let mut out = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x200), &mut out).unwrap();
+        f.ret(3, &[fd]);
+        out
+    };
+    assert_eq!(read(&mut f, b"/f"), b"in");
+    assert_eq!(read(&mut f, b"/../../f"), b"in");
+    assert_eq!(read(&mut f, b"../../../f"), b"in");
+    assert_eq!(read(&mut f, b"abs"), b"in");
+    assert_eq!(read(&mut f, b"up"), b"in");
+    assert_eq!(read(&mut f, b"/d/e/../../f"), b"in");
+    // No proc filesystem under the new root.
+    assert_eq!(read(&mut f, b"/proc/self/status"), b"errno 2");
+    // chdir("/") is the new root; a root inside it moves again.
+    let p = s(&mut f, 0, b"/");
+    assert_eq!(f.ret(80, &[p]), 0);
+    assert_eq!(cwd(&mut f), b"/");
+    let p = s(&mut f, 0, b"/d");
+    assert_eq!(f.ret(161, &[p]), 0);
+    assert_eq!(cwd(&mut f), b"(unreachable)/jail");
+    // Outside the root, `..` goes up as ever.
+    assert_eq!(read(&mut f, b"../f"), b"out");
+    assert_eq!(read(&mut f, b"/f"), b"errno 2");
+    assert_eq!(read(&mut f, b"/../abs"), b"errno 2");
+    // Without CAP_SYS_CHROOT, after the lookup and the permission check.
+    f.thread.state.credentials = f
+        .thread
+        .state
+        .credentials
+        .setresuid(1000, 1000, 1000)
+        .unwrap();
+    let p = s(&mut f, 0, b"/e");
+    assert_eq!(f.ret(161, &[p]), errno(Errno::EPERM));
+    let p = s(&mut f, 0, b"/none");
+    assert_eq!(f.ret(161, &[p]), errno(Errno::ENOENT));
 }

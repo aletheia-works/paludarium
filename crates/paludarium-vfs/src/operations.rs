@@ -406,6 +406,14 @@ impl HostFs for MemFs {
     }
 }
 impl FileSystem for MemFs {
+    /// The same tree through a [`MountedFs`] with no mounts, which keeps
+    /// to `root`.
+    fn rooted(&self, root: &[u8]) -> Option<Arc<dyn FileSystem>> {
+        let same = MemFs {
+            tree: Arc::clone(&self.tree),
+        };
+        MountedFs::new(same).rooted(root)
+    }
     fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
         let t = lock(&self.tree);
         t.resolve(anchor, true).ok()?;

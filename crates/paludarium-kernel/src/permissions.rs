@@ -131,7 +131,8 @@ pub(crate) struct Found {
 /// directory a component is looked up in, from the starting directory,
 /// whose own ancestors are not checked, and through each symbolic link on
 /// the way and, when `follow`, the last. Returns what it found. Paths under
-/// `/proc` and `/dev` are not checked.
+/// `/proc` and `/dev` are not checked. An absolute path or link starts at
+/// the process's root, where `..` stays.
 pub(crate) fn walk(
     files: &Files,
     creds: &Credentials,
@@ -141,7 +142,7 @@ pub(crate) fn walk(
 ) -> Result<Found, Errno> {
     let follow = follow || raw.last() == Some(&b'/');
     let start = if raw.first() == Some(&b'/') {
-        b"/".to_vec()
+        files.root()
     } else {
         files.path(dir, b".".to_vec())?
     };
@@ -163,6 +164,7 @@ pub(crate) fn walk(
             .flat_map(|part| [&b"/"[..], part].concat())
             .collect()
     };
+    let root = components(&files.root());
     let mut parts = components(&start);
     let mut pending: Vec<Vec<u8>> = components(raw).into_iter().rev().collect();
     let mut links = 0;
@@ -171,7 +173,7 @@ pub(crate) fn walk(
         if crate::files::generated(&here) {
             return Ok(Found::default());
         }
-        let Ok(directory) = files.fs.metadata(&here, false) else {
+        let Ok(directory) = files.fs().metadata(&here, false) else {
             return Ok(Found::default());
         };
         if directory.mode & TYPE != DIRECTORY {
@@ -181,7 +183,9 @@ pub(crate) fn walk(
         match &part[..] {
             b"." => continue,
             b".." => {
-                parts.pop();
+                if parts != root {
+                    parts.pop();
+                }
                 continue;
             }
             _ => {}
@@ -192,7 +196,7 @@ pub(crate) fn walk(
         if crate::files::generated(&candidate) {
             return Ok(Found::default());
         }
-        let Ok(stat) = files.fs.metadata(&candidate, false) else {
+        let Ok(stat) = files.fs().metadata(&candidate, false) else {
             return Ok(Found {
                 parent: last.then_some(directory),
                 file: None,
@@ -200,7 +204,7 @@ pub(crate) fn walk(
         };
         if stat.mode & TYPE == SYMLINK && (!last || follow) {
             links += 1;
-            let Ok(target) = files.fs.readlink(&candidate) else {
+            let Ok(target) = files.fs().readlink(&candidate) else {
                 return Ok(Found::default());
             };
             if links > 40 || target.is_empty() {
@@ -208,7 +212,7 @@ pub(crate) fn walk(
             }
             parts.pop();
             if target.first() == Some(&b'/') {
-                parts.clear();
+                parts.clone_from(&root);
             }
             pending.extend(components(&target).into_iter().rev());
             continue;
@@ -224,7 +228,7 @@ pub(crate) fn walk(
     // starting directory itself.
     Ok(Found {
         parent: None,
-        file: files.fs.metadata(&join(&parts), false).ok(),
+        file: files.fs().metadata(&join(&parts), false).ok(),
     })
 }
 
@@ -326,7 +330,7 @@ pub(crate) fn own(
     let group = (parent.mode & 0o2000 == 0).then_some(creds.fsgid);
     // Linux gives the inode its owner as it makes it: no `IN_ATTRIB`.
     let _ =
-        crate::inotify::unnoticed(|| files.fs.set_owner(path, follow, Some(creds.fsuid), group));
+        crate::inotify::unnoticed(|| files.fs().set_owner(path, follow, Some(creds.fsuid), group));
 }
 
 /// `unlink` and `rmdir`: [`may_delete`] on a file that is there.
@@ -538,7 +542,7 @@ pub(crate) fn exec(
     if !raw.is_empty() {
         search(files, creds, dir, raw, true)?;
     }
-    let stat = match files.fs.metadata(path, true) {
+    let stat = match files.fs().metadata(path, true) {
         Ok(stat) => stat,
         Err(e) if e == Errno::ENOTDIR => return Err(e),
         Err(_) => return Ok((None, true)),

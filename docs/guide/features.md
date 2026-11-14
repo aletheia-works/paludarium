@@ -62,7 +62,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | Security modules | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` |
 | Probes | `uprobe`, `uretprobe` |
@@ -1197,9 +1197,22 @@ kernel.
   and `PROT_GROWSUP`, a misaligned start, an empty range (which succeeds
   whatever the bits), an end that overflows (`ENOMEM`), then unknown bits.
   `PROT_GROWSDOWN` extends the range down to the start of the first VMA in
-  it, which must grow down (the main stack), else `EINVAL`; `PROT_GROWSUP` is
+  it, which must grow down (the main stack, or a `MAP_GROWSDOWN` mapping),
+  else `EINVAL`; `PROT_GROWSUP` is
   `EINVAL` on a mapped start, as no VMA grows up on x86-64. Where no VMA is
   in the range, both give `ENOMEM`.
+- A mapping that grows down, the main stack or private anonymous memory that
+  `mmap` made with `MAP_GROWSDOWN` (`VmFlags` shows `gd`), grows as Linux's
+  `expand_downwards` makes it: an access to an unmapped page below it, or a
+  signal frame written there, extends it down to that page, and the access is
+  made again. It does not grow below `mmap_min_addr` (64 KiB), within the
+  guard gap of 256 pages (`stack_guard_gap`) above a mapping that does not
+  grow down and can be accessed, past `RLIMIT_STACK` for the whole VMA, or,
+  locked, past `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`; the access then gives
+  `SIGSEGV`. No mapping is placed within that gap below it, whether at a hint
+  or where `mmap` looks for room. A file's mapping, `/dev/zero`'s included,
+  and shared memory cannot grow down (`EINVAL`). The main stack's VMA starts
+  at 8 MiB, so with a larger `RLIMIT_STACK` it grows past that.
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or
@@ -1317,6 +1330,19 @@ kernel.
   a CPU, one that has kept its own for 4 ms lets them have it first. A
   fork keeps the registration; a new thread, a `CLONE_VM` child and an
   exec start without one.
+- `chroot` gives the tasks that share the caller's working directory
+  (`CLONE_FS`) a root of their own, as Linux's `set_fs_root`, after its
+  checks: the path's lookup (`ENOENT`, `ENOTDIR`, `ELOOP`, `EACCES`), search
+  permission on the directory (`EACCES`), then `CAP_SYS_CHROOT` in the
+  caller's user namespace (`EPERM`). An absolute path or symbolic link then
+  starts at the root and `..` stays there, for exec and its interpreters
+  too. The working directory stays where it was, and from one outside the
+  root a path goes anywhere, as on Linux. `getcwd` gives a working directory
+  from the root, or, when it is not under the root, its path from the
+  machine's root after `(unreachable)`. A child of `fork` keeps the root, a
+  rename moves it with its directory, and `setns` into a mount namespace
+  goes back to the machine's root. The generated `/proc` and `/dev` are not
+  under another root, as no `proc` filesystem is mounted there.
 - `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
   with `CLONE_FS` its own working directory and umask, as Linux. With
   `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
@@ -1487,7 +1513,13 @@ kernel.
     that part has room, as `inet6_dump_ifaddr` and `inet6_dump_ifinfo` put
     it. An error, or a success with `NLM_F_ACK`, is answered with
     `NLMSG_ERROR`, which carries the whole request with an error unless
-    `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
+    `NETLINK_CAP_ACK` is set. With `NETLINK_EXT_ACK`, an error and a dump's
+    `NLMSG_DONE` that ends it at once carry what Linux's
+    `netlink_ext_ack` holds (`NLM_F_ACK_TLVS`): Linux's message
+    (`NLMSGERR_ATTR_MSG`), the offset of the attribute at fault
+    (`NLMSGERR_ATTR_OFFS`) and the policy that refused it
+    (`NLMSGERR_ATTR_POLICY`); an acknowledgement carries a warning, such
+    as of bytes left over after the attributes. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending
     thread and the socket's opener (`EPERM`).
   - **Strict checking:** with `NETLINK_GET_STRICT_CHK`, as iproute2 sets
@@ -1522,7 +1554,7 @@ kernel.
     are passed over, and a link dump whose attributes break the policy
     takes none of them. A change of the link takes one of
     `IFLA_NET_NS_PID`, `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` at most
-    (`EINVAL`).
+    (`EINVAL`), and a get neither of the first two (`EOPNOTSUPP`).
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
     7.0's attributes in its order: its flags, name, queue, state, MTU,
@@ -1557,7 +1589,9 @@ kernel.
     with no valid one or a preferred one longer, or a message shorter than
     an `ifaddrmsg`; `ENODEV` for another interface; then, for a new IPv6
     one, `EINVAL` for a prefix past 128, or `IFA_F_MANAGETEMPADDR` but on
-    a prefix of 64. An `IFA_LOCAL` of `0.0.0.0` is taken without effect.
+    a prefix of 64, and `EADDRNOTAVAIL` for `::` or a multicast address
+    without `IFA_F_MCAUTOJOIN`. An IPv4 one in the subnet of one of another
+    scope is `EINVAL`. An `IFA_LOCAL` of `0.0.0.0` is taken without effect.
     `IFA_LABEL`, `IFA_BROADCAST`, `IFA_FLAGS` (with `IFA_F_NOPREFIXROUTE`,
     and for IPv6 `IFA_F_NODAD`, which tells of the address once; IPv6 keeps
     only the flags a request may set), `IFA_PROTO`, `IFA_RT_PRIORITY`, the
@@ -1637,7 +1671,8 @@ kernel.
     `inet_rtm_newroute` and `inet6_rtm_newroute` do: `NLM_F_EXCL`,
     `NLM_F_REPLACE`, `NLM_F_APPEND` and `NLM_F_CREATE` put it in Linux's
     place, or Linux's error refuses it (`EEXIST`, `ENOENT`; `EINVAL` for a
-    bad prefix, scope, kind, gateway or preferred source; `ENODEV` for
+    bad prefix, scope, kind, gateway or preferred source, and for an IPv6
+    route with `RTA_FLOWLABEL`, `RTA_VIA` or `RTM_F_CLONED`; `ENODEV` for
     another device; `ENETDOWN` while `lo` is down, but for an IPv4 route of
     host scope). `RTM_DELROUTE` removes the first route that matches what it
     names (`ESRCH` for none), a kernel's too, which a change of an address

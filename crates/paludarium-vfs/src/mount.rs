@@ -2,12 +2,25 @@
 use crate::*;
 use std::collections::BTreeSet;
 pub struct MountedFs {
+    shared: Arc<Shared>,
+    /// Where absolute paths and links start and `..` stops for the process
+    /// that sees the filesystem through this view ([`HostFs::root`]).
+    root: Vec<u8>,
+}
+/// What every view of one [`MountedFs`] shares.
+pub struct Shared {
     base: MemFs,
     mounts: Vec<(Vec<u8>, Arc<dyn HostFs>)>,
     private_files: BTreeSet<Vec<u8>>,
     private_dirs: BTreeSet<Vec<u8>>,
     // Host storage uses confined relative targets; guests retain their namespace.
     targets: Mutex<BTreeMap<(usize, u64), Vec<u8>>>,
+}
+impl std::ops::Deref for MountedFs {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
 }
 impl MountedFs {
     fn require_trailing_directory(&self, path: &[u8]) -> Result<(), Errno> {
@@ -56,34 +69,42 @@ impl MountedFs {
             }
         }
         Self {
-            base,
-            mounts: Vec::new(),
-            private_files: files,
-            private_dirs: dirs,
-            targets: Mutex::new(BTreeMap::new()),
+            shared: Arc::new(Shared {
+                base,
+                mounts: Vec::new(),
+                private_files: files,
+                private_dirs: dirs,
+                targets: Mutex::new(BTreeMap::new()),
+            }),
+            root: b"/".to_vec(),
         }
     }
+    /// Mounts `fs` at `path`, before any view of this filesystem is made
+    /// (`EBUSY`, 16, after).
     pub fn mount(&mut self, path: Vec<u8>, fs: Arc<dyn HostFs>) -> Result<(), Errno> {
+        let shared = Arc::get_mut(&mut self.shared).ok_or(Errno(16))?; // EBUSY
         let path = normalize_path(&path)?;
-        if self.mounts.iter().any(|(p, _)| *p == path) {
+        if shared.mounts.iter().any(|(p, _)| *p == path) {
             return Err(Errno::EEXIST);
         }
         let mut prefix = Vec::new();
         for part in path.split(|b| *b == b'/').filter(|p| !p.is_empty()) {
             prefix.push(b'/');
             prefix.extend_from_slice(part);
-            match self.base.mkdir(&prefix, 0o755) {
+            match shared.base.mkdir(&prefix, 0o755) {
                 Ok(()) => {}
                 Err(e) if e == Errno::EEXIST => {
-                    if self.base.metadata(&prefix, true)?.mode & 0o170000 != 0o040000 {
+                    if shared.base.metadata(&prefix, true)?.mode & 0o170000 != 0o040000 {
                         return Err(Errno::ENOTDIR);
                     }
                 }
                 Err(e) => return Err(e),
             }
         }
-        self.mounts.push((path, fs));
-        self.mounts.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        shared.mounts.push((path, fs));
+        shared
+            .mounts
+            .sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
         Ok(())
     }
     fn route<'a>(&'a self, p: &[u8]) -> Result<(usize, &'a dyn HostFs, Vec<u8>), Errno> {
@@ -157,7 +178,7 @@ impl MountedFs {
                 continue;
             }
             if part == b".." {
-                if current != b"/" {
+                if current != b"/" && current != self.root {
                     let at = current.iter().rposition(|b| *b == b'/').ok_or(Errno::EIO)?;
                     current.truncate(at.max(1));
                 }
@@ -183,7 +204,7 @@ impl MountedFs {
                 let target = self.raw_readlink(&next)?;
                 validate(&target)?;
                 if target[0] == b'/' {
-                    current = b"/".to_vec()
+                    current.clone_from(&self.root);
                 }
                 for component in target.split(|b| *b == b'/').filter(|p| !p.is_empty()).rev() {
                     queue.push_front(component.to_vec())
@@ -199,6 +220,12 @@ impl MountedFs {
     }
 }
 impl FileSystem for MountedFs {
+    fn rooted(&self, root: &[u8]) -> Option<Arc<dyn FileSystem>> {
+        Some(Arc::new(MountedFs {
+            shared: Arc::clone(&self.shared),
+            root: root.to_vec(),
+        }))
+    }
     /// The in-memory root's file, where `anchor` is on that root: a path
     /// that no mount covers.
     fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
@@ -225,6 +252,9 @@ impl FileSystem for MountedFs {
     }
 }
 impl HostFs for MountedFs {
+    fn root(&self) -> &[u8] {
+        &self.root
+    }
     fn open(&self, p: &[u8], f: u32, m: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         if f & (64 | 65536) == 64 | 65536 {
             return Err(Errno::EINVAL);
@@ -637,6 +667,35 @@ mod mount_tests {
         assert_eq!(&*x.fs.read_file(b"/mnt/s").unwrap(), b"private");
         assert_eq!(x.fs.readlink(b"/mnt/s").unwrap(), b"/a");
         assert_eq!(x.fs.metadata(b"/mnt/s", false).unwrap().size, 2);
+    }
+    #[test]
+    fn rooted_view_keeps_links_and_dotdot_to_its_root() {
+        let x = Fixture::new();
+        x.fs.mkdir(b"/mnt/jail", 0o755).unwrap();
+        x.fs.mkdir(b"/mnt/jail/d", 0o755).unwrap();
+        for (path, text) in [(&b"/mnt/jail/f"[..], &b"in"[..]), (b"/f", b"out")] {
+            x.fs.open(path, 66, 0o600).unwrap().write(text).unwrap();
+        }
+        x.fs.symlink(b"/f", b"/mnt/jail/d/abs").unwrap();
+        x.fs.symlink(b"../../../../f", b"/mnt/jail/d/up").unwrap();
+        let jail = x.fs.rooted(b"/mnt/jail").unwrap();
+        assert_eq!(jail.root(), b"/mnt/jail");
+        for path in [
+            &b"/mnt/jail/d/abs"[..],
+            b"/mnt/jail/d/up",
+            b"/mnt/jail/../../f",
+        ] {
+            assert_eq!(&*jail.read_file(path).unwrap(), b"in");
+        }
+        // A path that does not pass through the root is not held back.
+        assert_eq!(&*jail.read_file(b"/mnt/../f").unwrap(), b"out");
+        // The view shares the filesystem with the machine's.
+        jail.mkdir(b"/mnt/jail/new", 0o755).unwrap();
+        assert!(x.fs.metadata(b"/mnt/jail/new", false).is_ok());
+        assert_eq!(&*x.fs.read_file(b"/mnt/jail/d/abs").unwrap(), b"out");
+        let mut fs = MountedFs::new(MemFs::new());
+        let _view = fs.rooted(b"/");
+        assert!(fs.mount(b"/m".to_vec(), Arc::new(MemFs::new())).is_err());
     }
     #[test]
     fn mount_link_dotdot_namespace() {

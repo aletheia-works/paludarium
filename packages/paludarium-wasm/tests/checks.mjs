@@ -75,8 +75,20 @@ export async function runChecks({ wasmUrl, readGuest, native }) {
     const integer = await readGuest("integer");
     // One after the other, a run takes the Worker the one before it left.
     for (let run = 0; run < 2; run++) await observe(runtime, integer);
-    const simultaneous = await Promise.all(Array.from({ length: 4 }, () => observe(runtime, integer)));
-    check(simultaneous.every(result => result.status.kind === "exited" && result.status.code === expected.get("integer").returncode), "simultaneous shared Rust sessions failed");
+    // Four at once, each held on its input until all four have started: a run that ended before the next
+    // began would leave it its stack, TLS and Worker, which the check below would take for a shared one.
+    const stdinGuest = await readGuest("stdin"), stdinRow = expected.get("stdin");
+    const startedBefore = (await runtime.diagnostics()).workers.length;
+    const held = Array.from({ length: 4 }, () => runtime.run({ program: "/guest", files: { "/guest": stdinGuest } }));
+    const heldOutputs = held.map(run => Promise.all([collect(run.stdout), collect(run.stderr), run.exited]));
+    const startDeadline = performance.now() + 30000;
+    while ((await runtime.diagnostics()).workers.length < startedBefore + 4) {
+      check(performance.now() < startDeadline, "simultaneous shared Rust sessions did not all start");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    for (const run of held) { const writer = run.stdin.getWriter(); await writer.write(encode.encode("input\n")); await writer.close(); }
+    const simultaneous = (await Promise.all(heldOutputs)).map(([stdout, stderr, status]) => ({ stdout: hex(stdout), stderr: hex(stderr), status }));
+    check(simultaneous.every(result => result.stdout === stdinRow.stdout && result.stderr === stdinRow.stderr && result.status.kind === "exited" && result.status.code === stdinRow.returncode), "simultaneous shared Rust sessions failed");
     results.push({ case: "simultaneous-shared-Rust-sessions", pass: true, workers: simultaneous.length });
     const report = await runtime.diagnostics(), diagnostics = report.workers;
     check(diagnostics.length >= 10, "nonzero nested Worker diagnostics missing");

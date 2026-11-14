@@ -170,6 +170,13 @@ pub trait FileHandle: Send + Sync {
     }
 }
 pub trait HostFs: Send + Sync {
+    /// The directory an absolute path and an absolute symbolic link start
+    /// from, and that `..` does not leave: `/`, or the root a process gave
+    /// itself with `chroot` (Linux's `fs->root`). Paths given to and taken
+    /// from the filesystem are still from the machine's root.
+    fn root(&self) -> &[u8] {
+        b"/"
+    }
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
     fn metadata(&self, path: &[u8], follow: bool) -> Result<FileStat, Errno>;
     fn mkdir(&self, path: &[u8], mode: u32) -> Result<(), Errno>;

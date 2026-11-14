@@ -26,6 +26,10 @@ pub const ENTRIES_PER_TABLE: u64 = 512;
 
 /// Lowest address handed out for mappings without a fixed address.
 pub const MMAP_MIN_ADDR: u64 = 0x10000;
+/// Linux's default `stack_guard_gap`, 256 pages: a mapping that grows down
+/// does not grow within it of the mapping below, and no new mapping is placed
+/// within it below one (`vm_start_gap`).
+pub const STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE;
 
 /// Default top of the region searched for mappings without a fixed address.
 pub const DEFAULT_MMAP_TOP: u64 = 0x7fff_0000_0000;
@@ -132,6 +136,11 @@ pub struct Mapping {
     pub huge_pages: Option<bool>,
     /// `MADV_MERGEABLE` (KSM's `VM_MERGEABLE`).
     pub mergeable: bool,
+    /// It grows down (Linux's `VM_GROWSDOWN`): the main stack, and a
+    /// mapping `mmap` made with `MAP_GROWSDOWN`. An access to an unmapped
+    /// page below it extends it ([`AddressSpace::grow_down`]), and no
+    /// mapping is placed within [`STACK_GUARD_GAP`] below it.
+    pub grows_down: bool,
 }
 
 /// How a mapping is read ([`Mapping::read_hint`]).
@@ -310,6 +319,17 @@ impl Mapping {
     #[must_use]
     pub const fn end(&self) -> u64 {
         self.start.0 + self.length
+    }
+    /// The lowest address a new mapping may end at below it: its start, or
+    /// [`STACK_GUARD_GAP`] lower for one that grows down (Linux's
+    /// `vm_start_gap`, 0 where that wraps).
+    #[must_use]
+    pub const fn start_gap(&self) -> u64 {
+        if self.grows_down {
+            self.start.0.saturating_sub(STACK_GUARD_GAP)
+        } else {
+            self.start.0
+        }
     }
 }
 
@@ -2991,7 +3011,7 @@ impl AddressSpaceData {
             }
             None => flags |= vm::MAYWRITE | bit(m.account, vm::ACCOUNT),
         }
-        flags |= bit(m.kind == MappingKind::Stack, vm::GROWSDOWN)
+        flags |= bit(m.grows_down, vm::GROWSDOWN)
             | bit(m.locked.is_some(), vm::LOCKED)
             | bit(m.locked == Some(Lock::OnFault), vm::LOCKONFAULT)
             | bit(m.read_hint == Some(ReadHint::Sequential), vm::SEQ_READ)
@@ -3067,7 +3087,7 @@ impl AddressSpaceData {
             if m.end() <= start {
                 continue;
             }
-            if m.start.0 >= start.checked_add(len)? {
+            if m.start_gap() >= start.checked_add(len)? {
                 break;
             }
             start = m.end().checked_next_multiple_of(align)?;
@@ -3083,7 +3103,7 @@ impl AddressSpaceData {
             if m.end() <= end && end - m.end() >= len {
                 break;
             }
-            end = end.min(m.start.0);
+            end = end.min(m.start_gap());
         }
         let start = end.checked_sub(len)?;
         (start >= MMAP_MIN_ADDR).then_some(start)
@@ -3163,6 +3183,7 @@ impl AddressSpaceData {
                 read_hint: None,
                 huge_pages: None,
                 mergeable: false,
+                grows_down: kind == MappingKind::Stack,
             },
         );
         Ok(GuestAddr(start))
@@ -3291,6 +3312,7 @@ impl AddressSpaceData {
             && a.read_hint == b.read_hint
             && a.huge_pages == b.huge_pages
             && a.mergeable == b.mergeable
+            && a.grows_down == b.grows_down
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -3735,6 +3757,62 @@ impl AddressSpaceData {
         }
     }
 
+    /// Linux's `expand_downwards` for an access at `addr` that no mapping
+    /// holds: the mapping above it, when it grows down, takes the pages from
+    /// `addr`'s down, so that the access can be made again. It does not when
+    /// `addr` is below `MMAP_MIN_ADDR` (`EPERM`), when a mapping below that
+    /// does not grow down and can be accessed ends less than
+    /// [`STACK_GUARD_GAP`] under `addr`, when the VMA would then be larger
+    /// than `stack_limit` (`RLIMIT_STACK`), or when it is locked and its new
+    /// pages would take the locked ones past `lock_limit` pages
+    /// (`acct_stack_growth`). Whether it grew: an address something already
+    /// maps is not grown to.
+    fn grow_down(&mut self, addr: u64, stack_limit: u64, lock_limit: u64) -> bool {
+        let addr = addr & !(PAGE_SIZE - 1);
+        if self.mapping_at(addr).is_some() {
+            return false;
+        }
+        let Some((_, &next)) = self.mappings.range(addr..).next() else {
+            return false;
+        };
+        if !next.grows_down || addr < MMAP_MIN_ADDR {
+            return false;
+        }
+        if let Some((_, prev)) = self.mappings.range(..addr).next_back()
+            && !prev.grows_down
+            && prev.prot != Prot::NONE
+            && addr - prev.end() < STACK_GUARD_GAP
+        {
+            return false;
+        }
+        let Some((_, end)) = self.region_at(next.start.0) else {
+            return false;
+        };
+        let grow = (next.start.0 - addr) / PAGE_SIZE;
+        if end - addr > stack_limit
+            || next.locked.is_some() && self.locked_pages().saturating_add(grow) > lock_limit
+        {
+            return false;
+        }
+        self.bump_code_generation();
+        self.mappings.remove(&next.start.0);
+        self.mappings.insert(
+            addr,
+            Mapping {
+                start: GuestAddr(addr),
+                length: next.end() - addr,
+                ..next
+            },
+        );
+        true
+    }
+    /// Gives the new mappings in `[addr, end)` `MAP_GROWSDOWN`'s
+    /// `VM_GROWSDOWN`.
+    pub fn grow_new_down(&mut self, addr: u64, end: u64) {
+        for (_, mapping) in self.mappings.range_mut(addr..end) {
+            mapping.grows_down = true;
+        }
+    }
     /// Gives the new mapping `[addr, end)` the flags of `mmap`'s
     /// `MAP_NORESERVE` (`VM_NORESERVE`, which takes the mapping out of
     /// overcommit's charge) and `MAP_STACK` (`VM_NOHUGEPAGE`).
@@ -4623,6 +4701,14 @@ impl AddressSpace {
             }
             Placement::Exactly(at) => data.map(Some(at), len, prot, kind)?,
             Placement::Near(hint) => {
+                // A hint within the guard gap below a mapping that grows
+                // down is not taken (`vm_start_gap`).
+                let hint = hint.filter(|hint| {
+                    data.mappings
+                        .range(hint.0..)
+                        .next()
+                        .is_none_or(|(_, m)| hint.0.saturating_add(len) <= m.start_gap())
+                });
                 match hint.and_then(|hint| data.map(Some(hint), len, prot, kind).ok()) {
                     Some(at) => at,
                     None => data.map(None, len, prot, kind)?,
@@ -5112,6 +5198,16 @@ impl AddressSpace {
     /// See [`AddressSpaceData::lock_new`].
     pub fn lock_new(&self, addr: GuestAddr, end: u64, lock: Lock) {
         self.locked().lock_new(addr.0, end, lock);
+    }
+    /// See [`AddressSpaceData::grow_new_down`].
+    pub fn grow_new_down(&self, addr: GuestAddr, end: u64) {
+        self.locked().grow_new_down(addr.0, end);
+    }
+    /// Extends the mapping above `addr` down to it when it grows down and
+    /// may, as Linux's page fault does (see [`AddressSpaceData::grow_down`]):
+    /// whether it grew.
+    pub fn grow_down(&self, addr: GuestAddr, stack_limit: u64, lock_limit: u64) -> bool {
+        self.locked().grow_down(addr.0, stack_limit, lock_limit)
     }
     /// See [`AddressSpaceData::flag_new`].
     pub fn flag_new(&self, addr: GuestAddr, end: u64, no_reserve: bool, no_huge_pages: bool) {

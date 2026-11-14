@@ -1097,6 +1097,12 @@ impl CoherentFs {
 }
 
 impl FileSystem for CoherentFs {
+    fn rooted(&self, root: &[u8]) -> Option<Arc<dyn FileSystem>> {
+        Some(Arc::new(CoherentFs::new(
+            self.inner.rooted(root)?,
+            Arc::clone(&self.caches),
+        )))
+    }
     fn mounts(&self) -> Vec<MountPoint> {
         self.inner.mounts()
     }
@@ -1106,6 +1112,9 @@ impl FileSystem for CoherentFs {
 }
 
 impl HostFs for CoherentFs {
+    fn root(&self) -> &[u8] {
+        self.inner.root()
+    }
     fn open(&self, path: &[u8], flags: u32, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         // A running program's file is not truncated: `handle_truncate`
         // takes write access first (ETXTBSY), whatever the access mode.

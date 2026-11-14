@@ -49,6 +49,111 @@
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
+/* The ext-ack- modes: each netlink case again, its NETLINK_ROUTE and
+   NETLINK_GENERIC sockets with NETLINK_EXT_ACK (option 11 of SOL_NETLINK,
+   270) on, and the attributes each NLMSG_ERROR and NLMSG_DONE with
+   NLM_F_ACK_TLVS (0x200) carries shown as it is received: the message
+   (NLMSGERR_ATTR_MSG), the offset of the attribute at fault (_OFFS) and
+   its policy (_POLICY), each of whose attributes is shown by type. The
+   option is set in the environment too, for the programs the cases run. */
+static int nl_ext_ack;
+static int nl_ext_socket(int domain, int type, int protocol) {
+    int fd = socket(domain, type, protocol);
+    if (fd >= 0 && domain == 16 && nl_ext_ack) {
+        int on = 1;
+        setsockopt(fd, 270, 11, &on, sizeof on);
+    }
+    return fd;
+}
+static void nl_ext_policy(const unsigned char *at, int len) {
+    while (len >= 4) {
+        unsigned short alen, type;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        long long value = 0;
+        if (alen - 4 == 4) {
+            unsigned v;
+            memcpy(&v, at + 4, 4);
+            value = v;
+        } else if (alen - 4 == 8) {
+            memcpy(&value, at + 4, 8);
+        }
+        printf(" %u=%lld", type & 0x3fff, value);
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+}
+/* The extended attributes of the messages in the n bytes at buf. */
+static void nl_ext_show(const unsigned char *buf, long n) {
+    while (n >= 16) {
+        unsigned len;
+        unsigned short type, flags;
+        memcpy(&len, buf, 4);
+        memcpy(&type, buf + 4, 2);
+        memcpy(&flags, buf + 6, 2);
+        if (len < 16 || len > n) break;
+        if ((type == 2 || type == 3) && (flags & 0x200)) {
+            int error;
+            memcpy(&error, buf + 16, 4);
+            unsigned at = 20;
+            if (type == 2) {
+                unsigned inner = 16;
+                if (!(flags & 0x100) && len >= 24) memcpy(&inner, buf + 20, 4);
+                at += (flags & 0x100) ? 16 : (inner + 3) & ~3u;
+            }
+            printf("  ext %s error=%d:", type == 2 ? "error" : "done", error);
+            while (at + 4 <= len) {
+                unsigned short alen, kind;
+                memcpy(&alen, buf + at, 2);
+                memcpy(&kind, buf + at + 2, 2);
+                if (alen < 4 || at + alen > len) break;
+                const unsigned char *v = buf + at + 4;
+                int vlen = alen - 4;
+                unsigned word = 0;
+                if (vlen >= 4) memcpy(&word, v, 4);
+                switch (kind & 0x3fff) {
+                case 1: printf(" msg=\"%.*s\"", vlen > 0 ? vlen - 1 : 0, v); break;
+                case 2: printf(" offs=%u", word); break;
+                case 4: printf(" policy{"); nl_ext_policy(v, vlen); printf(" }"); break;
+                default: printf(" %u:%d", kind & 0x3fff, vlen); break;
+                }
+                at += (alen + 3) & ~3u;
+            }
+            printf("\n");
+        }
+        buf += (len + 3) & ~3u;
+        n -= (len + 3) & ~3u;
+    }
+}
+static int nl_ext_netlink(int fd) {
+    int domain = 0;
+    socklen_t size = sizeof domain;
+    return nl_ext_ack && getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &size) == 0 && domain == 16;
+}
+static ssize_t nl_ext_recv(int fd, void *buf, size_t len, int flags) {
+    ssize_t n = recv(fd, buf, len, flags);
+    if (n > 0 && !(flags & MSG_PEEK) && nl_ext_netlink(fd)) nl_ext_show(buf, (size_t)n < len ? n : (long)len);
+    return n;
+}
+static ssize_t nl_ext_recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *from, socklen_t *size) {
+    ssize_t n = recvfrom(fd, buf, len, flags, from, size);
+    if (n > 0 && !(flags & MSG_PEEK) && nl_ext_netlink(fd)) nl_ext_show(buf, (size_t)n < len ? n : (long)len);
+    return n;
+}
+static ssize_t nl_ext_recvmsg(int fd, struct msghdr *msg, int flags) {
+    ssize_t n = recvmsg(fd, msg, flags);
+    if (n > 0 && !(flags & MSG_PEEK) && msg->msg_iovlen > 0 && nl_ext_netlink(fd)) {
+        size_t room = msg->msg_iov[0].iov_len;
+        nl_ext_show(msg->msg_iov[0].iov_base, (size_t)n < room ? n : (long)room);
+    }
+    return n;
+}
+#define socket(domain, type, protocol) nl_ext_socket(domain, type, protocol)
+#define recv(fd, buf, len, flags) nl_ext_recv(fd, buf, len, flags)
+#define recvfrom(fd, buf, len, flags, from, size) nl_ext_recvfrom(fd, buf, len, flags, from, size)
+#define recvmsg(fd, msg, flags) nl_ext_recvmsg(fd, msg, flags)
 #ifndef F_SETPIPE_SZ
 #define F_SETPIPE_SZ 1031
 #define F_GETPIPE_SZ 1032
@@ -2172,13 +2277,14 @@ static void diag_ask(int fd, const char *label, unsigned short type, unsigned sh
     printf("%s: unknown=%d\n", label, unknown);
 }
 /* The inet-diag case's TCP and UDP sockets: a label, the descriptor (-1
-   once closed), its inode, its type and its local port. */
+   once closed), its inode, its type, its local port and its peer's port (0
+   for none yet). */
 struct inet_socket {
     const char *label;
     int fd;
     unsigned ino;
     int type;
-    unsigned short port;
+    unsigned short port, peer;
 };
 static struct inet_socket inet_sockets[32];
 static int inet_count;
@@ -2191,7 +2297,11 @@ static void inet_add(const char *label, int fd) {
     int type = 0;
     socklen_t type_len = sizeof type;
     getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_len);
-    inet_sockets[inet_count++] = (struct inet_socket){label, fd, (unsigned)st.st_ino, type, ntohs(at.sin6_port)};
+    struct sockaddr_in6 peer = {0};
+    len = sizeof peer;
+    getpeername(fd, (void *)&peer, &len);
+    inet_sockets[inet_count++] =
+        (struct inet_socket){label, fd, (unsigned)st.st_ino, type, ntohs(at.sin6_port), ntohs(peer.sin6_port)};
 }
 static struct inet_socket *inet_find(const char *label) {
     for (int i = 0; i < inet_count; i++)
@@ -2205,12 +2315,18 @@ static const char *inet_label(unsigned ino) {
         if (inet_sockets[i].ino == ino) return inet_sockets[i].label;
     return "?";
 }
-/* The label of the first socket of `type` on local port `port`, "0" for
-   0: TCP and UDP ports are apart. */
-static const char *inet_port_label(unsigned short port, int type) {
+/* The label of the first socket of `type` on local port `port` that has no
+   peer or has `other`, the other end's port, as its peer; "0" for 0, "?"
+   for none: TCP and UDP ports are apart. Linux gives sockets that connect
+   to different ports the same local port when its hash of each destination
+   happens to choose it, so the port alone may name two of them. Every
+   socket that connects has its peer, whatever the order they came in. */
+static const char *inet_port_label(unsigned short port, unsigned short other, int type) {
     if (port == 0) return "0";
     for (int i = 0; i < inet_count; i++)
-        if (inet_sockets[i].port == port && inet_sockets[i].type == type) return inet_sockets[i].label;
+        if (inet_sockets[i].port == port && inet_sockets[i].type == type &&
+            (inet_sockets[i].peer == 0 || inet_sockets[i].peer == other))
+            return inet_sockets[i].label;
     return "?";
 }
 /* The type of the socket of inode `ino`; one with none is TCP's. */
@@ -2245,8 +2361,8 @@ static void inet_line(char *out, size_t size, const char *label, unsigned short 
     int n = snprintf(out, size,
                      "%s: %s type=%u family=%u state=%u timer=%u retrans=%u sport=%s dport=%s src=%s dst=%s if=%u cookie=%d "
                      "expires=%s rqueue=%u wqueue=%u uid=%u",
-                     label, inet_label(words[4]), type, b[0], b[1], b[2], b[3], inet_port_label(ntohs(sport), inet_type(words[4])),
-                     inet_port_label(ntohs(dport), inet_type(words[4])), src, dst, interface, cookie[0] || cookie[1],
+                     label, inet_label(words[4]), type, b[0], b[1], b[2], b[3], inet_port_label(ntohs(sport), ntohs(dport), inet_type(words[4])),
+                     inet_port_label(ntohs(dport), ntohs(sport), inet_type(words[4])), src, dst, interface, cookie[0] || cookie[1],
                      words[0] == 0 ? "0" : words[0] <= 7200000 ? "+" : "big", words[1], words[2], words[3]);
     const unsigned char *at = b + 72;
     len -= 72;
@@ -6166,9 +6282,9 @@ static int io_uring_case(void) {
     return 0;
 }
 
-/* mprotect's checks in Linux's order, and the grows flags: only the main
-   stack grows down (a MAP_GROWSDOWN mapping does on Linux but not in the
-   emulator), and nothing grows up on x86-64. */
+/* mprotect's checks in Linux's order, and the grows flags: the main stack
+   grows down (as a MAP_GROWSDOWN mapping does, see grows_down_case), and
+   nothing grows up on x86-64. */
 static void pkey_show(const char *label, long r);
 
 static int mprotect_checks_case(void) {
@@ -6954,6 +7070,104 @@ static int madvise_guard_case(void) {
     sigaction(SIGSEGV, &old, NULL);
     return 0;
 }
+/* A mapping that MAP_GROWSDOWN makes grows down as the main stack does: a
+ * touch of an unmapped page below it extends its VMA down to that page,
+ * unless a VMA below that can be accessed ends within the guard gap (256
+ * pages) or the VMA would pass RLIMIT_STACK. No mapping is placed in that
+ * gap, a signal frame written below it extends it as well, and neither a
+ * file's mapping nor shared memory grows down. A reservation that cannot be
+ * accessed keeps the other mappings away. */
+static unsigned long grows_start(const void *at) {
+    struct maps_line line;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    unsigned long start =
+        fd >= 0 && maps_find(maps_text(fd), (unsigned long)at, &line) ? line.start : 0;
+    if (fd >= 0) close(fd);
+    return start;
+}
+static void grows_touch(const char *label, char *top, char *at, int write) {
+    char out[64];
+    guard_touch(out, at, write);
+    unsigned long start = grows_start(top);
+    printf("%s: %s grown-to-it=%d pages=%ld\n", label, out,
+           start == ((uintptr_t)at & ~(uintptr_t)4095), (long)((uintptr_t)top + 8192 - start) / 4096);
+}
+static volatile int grows_handled;
+static void grows_on_usr1(int sig) {
+    (void)sig;
+    grows_handled = 1;
+}
+static int grows_down_case(void) {
+    long page = 4096, mib = 1 << 20;
+    struct sigaction action = {0}, old;
+    action.sa_sigaction = on_guard;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGSEGV, &action, &old)) return 80;
+    int zero = open("/dev/zero", O_RDWR);
+    if (zero < 0) return 81;
+    char *m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
+    printf("shared: %d errno=%d\n", m == MAP_FAILED, m == MAP_FAILED ? errno : 0);
+    m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_GROWSDOWN, zero, 0);
+    printf("file: %d errno=%d\n", m == MAP_FAILED, m == MAP_FAILED ? errno : 0);
+    close(zero);
+    char *area = mmap(NULL, (size_t)(8 * mib), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 82;
+    munmap(area + 5 * mib, (size_t)(2 * mib));
+    char *g = mmap(area + 7 * mib, (size_t)(2 * page), PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
+    if (g != area + 7 * mib) return 83;
+    smaps_show("made", g, SMAPS_SIZE);
+    grows_touch("below", g, g - page, 1);
+    grows_touch("far-below", g, g - 9 * page, 0);
+    smaps_show("grown", g, SMAPS_SIZE);
+    /* PROT_GROWSDOWN reaches down to the start of the VMA. */
+    printf("protect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_GROWSDOWN));
+    grows_touch("read-only", g, g - page, 1);
+    printf("unprotect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_WRITE | PROT_GROWSDOWN));
+    /* A hint in the gap is not taken; one at its edge is. */
+    char *start = (char *)grows_start(g);
+    char *h = mmap(start - 2 * page, (size_t)page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("hint-in-gap: %d\n", h == start - 2 * page);
+    if (h != MAP_FAILED) munmap(h, (size_t)page);
+    char *below = mmap(start - mib - page, (size_t)page, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("hint-at-gap: %d\n", below == start - mib - page);
+    if (below != start - mib - page) return 84;
+    /* That mapping ends at the gap, so nothing more may grow, unless it
+     * cannot be accessed. */
+    grows_touch("near-other", g, start - page, 1);
+    mprotect(below, (size_t)page, PROT_NONE);
+    grows_touch("near-inaccessible", g, start - page, 1);
+    munmap(below, (size_t)page);
+    /* RLIMIT_STACK bounds the whole VMA. */
+    struct rlimit limit, small;
+    getrlimit(RLIMIT_STACK, &limit);
+    start = (char *)grows_start(g);
+    small = limit;
+    small.rlim_cur = (rlim_t)(g + 2 * page - start + page);
+    if (setrlimit(RLIMIT_STACK, &small)) return 85;
+    grows_touch("past-limit", g, start - 2 * page, 1);
+    grows_touch("at-limit", g, start - page, 1);
+    setrlimit(RLIMIT_STACK, &limit);
+    /* A signal frame on an alternate stack that ends just inside it. */
+    start = (char *)grows_start(g);
+    stack_t alt = {.ss_sp = start + 256 - 64 * 1024, .ss_size = 64 * 1024, .ss_flags = 0}, was;
+    if (sigaltstack(&alt, &was)) return 86;
+    struct sigaction usr = {0}, old_usr;
+    usr.sa_handler = grows_on_usr1;
+    usr.sa_flags = SA_ONSTACK;
+    sigemptyset(&usr.sa_mask);
+    sigaction(SIGUSR1, &usr, &old_usr);
+    raise(SIGUSR1);
+    alt.ss_flags = SS_DISABLE;
+    sigaltstack(&alt, NULL);
+    sigaction(SIGUSR1, &old_usr, NULL);
+    printf("frame: handled=%d grew=%d\n", grows_handled, grows_start(g) < (unsigned long)start);
+    sigaction(SIGSEGV, &old, NULL);
+    munmap(area, (size_t)(8 * mib));
+    return 0;
+}
 /* A forked child gets the page tables of a VMA only when Linux's
  * vma_needs_copy copies them: one with an anon_vma (written private
  * memory) or that had guards. Another's pages it faults in again, so
@@ -7587,6 +7801,159 @@ static int time_set_case(void) {
     gettimeofday(&tv, NULL);
     printf("settimeofday now=%ld zone=%ld none=%ld\n", ts_call(SYS_settimeofday, (long)&tv, 0),
            ts_call(SYS_settimeofday, 0, (long)&tz), ts_call(SYS_settimeofday, 0, 0));
+    return 0;
+}
+
+/* chroot: an unprivileged caller's errors in Linux's order, then a root of
+   its own in a new user namespace, which gives CAP_SYS_CHROOT. */
+static char cr_base[] = "/tmp/chroot-XXXXXX";
+static long cr_call(const char *p) { return syscall(SYS_chroot, p) ? -errno : 0; }
+static void cr_put(const char *dir, const char *name, const char *text) {
+    char path[256];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        if (write(fd, text, strlen(text)) < 0) perror("write");
+        close(fd);
+    }
+}
+static void cr_read(const char *label, const char *path) {
+    char buf[16] = {0};
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("%s: errno=%d\n", label, errno);
+        return;
+    }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    printf("%s: %.*s\n", label, (int)(n > 0 ? n : 0), buf);
+}
+/* The working directory, with the random base shown as BASE: the raw
+   call, as libc's getcwd turns "(unreachable)" into ENOENT. */
+static void cr_cwd(const char *label) {
+    char buf[512];
+    if (syscall(SYS_getcwd, buf, sizeof buf) < 0) {
+        printf("%s cwd: errno=%d\n", label, errno);
+        return;
+    }
+    char *at = strstr(buf, cr_base);
+    if (at)
+        printf("%s cwd: %.*sBASE%s\n", label, (int)(at - buf), buf, at + strlen(cr_base));
+    else
+        printf("%s cwd: %s\n", label, buf);
+}
+static int chroot_exec_case(void) {
+    cr_cwd("exec");
+    cr_read("exec /f", "/f");
+    cr_read("exec ../f", "../f");
+    printf("exec /proc=%d\n", access("/proc/self", F_OK) ? errno : 0);
+    return 0;
+}
+static int chroot_case(const char *self) {
+    if (!mkdtemp(cr_base)) return 93;
+    chmod(cr_base, 0755);
+    char jail[256], path[256];
+    snprintf(jail, sizeof jail, "%s/jail", cr_base);
+    mkdir(jail, 0755);
+    const char *dirs[] = {"d", "d/e", "locked"};
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "%s/%s", jail, dirs[i]);
+        mkdir(path, i == 2 ? 0600 : 0755);
+    }
+    cr_put(jail, "f", "in");
+    cr_put(cr_base, "f", "out");
+    snprintf(path, sizeof path, "%s/d/abs", jail);
+    symlink("/f", path);
+    snprintf(path, sizeof path, "%s/d/up", jail);
+    symlink("../../../f", path);
+    /* The program itself, to run under the new root. */
+    int in = open(self, O_RDONLY);
+    snprintf(path, sizeof path, "%s/self", jail);
+    int out = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    char chunk[65536];
+    ssize_t n;
+    while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
+        if (write(out, chunk, n) != n) break;
+    close(in);
+    close(out);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(1);
+        char file[256], locked[256];
+        snprintf(file, sizeof file, "%s/f", cr_base);
+        snprintf(locked, sizeof locked, "%s/locked/x", jail);
+        printf("unprivileged missing=%ld notdir=%ld fault=%ld empty=%ld search=%ld\n",
+               cr_call("/nonexistent/x"), cr_call(file), syscall(SYS_chroot, 8L) ? -errno : 0L,
+               cr_call(""), cr_call(locked));
+        snprintf(locked, sizeof locked, "%s/locked", jail);
+        printf("unprivileged no-exec=%ld eperm=%ld\n", cr_call(locked), cr_call(jail));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("unprivileged status=%d\n", reaped(child));
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        /* Each line out before an early _exit. */
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+        if (chdir(cr_base)) _exit(91);
+        long rooted = cr_call(jail);
+        printf("chroot=%ld\n", rooted);
+        if (rooted) _exit(89);
+        cr_cwd("outside");
+        cr_read("/f", "/f");
+        cr_read("/../../f", "/../../f");
+        cr_read("/d/abs", "/d/abs");
+        cr_read("/d/up", "/d/up");
+        cr_read("/d/e/../../f", "/d/e/../../f");
+        cr_read("f from outside", "f");
+        cr_read("jail/../f from outside", "jail/../f");
+        printf("/proc=%d /tmp=%d\n", access("/proc/self", F_OK) ? errno : 0,
+               access("/tmp", F_OK) ? errno : 0);
+        char link[64] = {0};
+        printf("readlink /d/abs=%.*s\n", (int)readlink("/d/abs", link, sizeof link - 1), link);
+        if (chdir("/")) _exit(92);
+        cr_cwd("root");
+        cr_read("../f at root", "../f");
+        int d = open("/d", O_RDONLY | O_DIRECTORY);
+        if (d < 0 || fchdir(d)) _exit(93);
+        close(d);
+        cr_cwd("fchdir");
+        fflush(stdout);
+        pid_t runner = fork();
+        if (runner == 0) {
+            char *args[] = {"x", "chroot-exec", "/self", NULL};
+            execv("/self", args);
+            printf("exec errno=%d\n", errno);
+            _exit(98);
+        }
+        printf("exec status=%d\n", reaped(runner));
+        printf("nested=%ld\n", cr_call("/d"));
+        cr_cwd("nested");
+        cr_read("nested /abs", "/abs");
+        cr_read("nested /../f", "/../f");
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("rooted status=%d\n", reaped(child));
+    const char *names[] = {"self", "f", "d/abs", "d/up"};
+    for (unsigned i = 0; i < 4; i++) {
+        snprintf(path, sizeof path, "%s/%s", jail, names[i]);
+        unlink(path);
+    }
+    const char *gone[] = {"d/e", "d", "locked"};
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "%s/%s", jail, gone[i]);
+        rmdir(path);
+    }
+    rmdir(jail);
+    snprintf(path, sizeof path, "%s/f", cr_base);
+    unlink(path);
+    printf("cleaned=%d\n", rmdir(cr_base) == 0);
     return 0;
 }
 
@@ -11535,6 +11902,11 @@ int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
     const char *mode = argv[1], *self = argv[2];
+    if (!strncmp(mode, "ext-ack-", 8)) {
+        mode += 8;
+        setenv("PALUDARIUM_EXT_ACK", "1", 1);
+    }
+    nl_ext_ack = getenv("PALUDARIUM_EXT_ACK") != NULL;
     if (!strcmp(mode, "clone-vm")) {
         char *stack = mmap(NULL, 65536, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         if (stack == MAP_FAILED) return 80;
@@ -12542,6 +12914,8 @@ int main(int argc, char **argv) {
             int syn = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
             printf("syn connect=%ld\n", netns_result(connect(syn, (void *)&full_to, sizeof full_to)));
             inet_add("syn", syn);
+            /* Still in TCP_SYN_SENT, it has no peer getpeername gives. */
+            inet_find("syn")->peer = ntohs(full_to.sin_port);
             struct sockaddr_in6 any6 = {.sin6_family = AF_INET6};
             inet_pton(AF_INET6, "::1", &any6.sin6_addr);
             int listener6 = socket(AF_INET6, SOCK_STREAM, 0);
@@ -23229,6 +23603,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
+    if (!strcmp(mode, "grows-down")) return grows_down_case();
     if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();
@@ -23249,6 +23624,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
     if (!strcmp(mode, "time-set")) return time_set_case();
+    if (!strcmp(mode, "chroot")) return chroot_case(self);
+    if (!strcmp(mode, "chroot-exec")) return chroot_exec_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

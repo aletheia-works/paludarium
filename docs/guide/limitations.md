@@ -48,8 +48,8 @@ verified.
   those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `um`, `uw` or `ui` (`userfaultfd`), `ht` or `dp` (`MAP_HUGETLB`,
-  `MAP_DROPPABLE`), and no `gd` for a `MAP_GROWSDOWN` mapping.
+  `um`, `uw` or `ui` (`userfaultfd`), and no `ht` or `dp` (`MAP_HUGETLB`,
+  `MAP_DROPPABLE`).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, `/proc/sys` but for `fs/mqueue`, ...) and the other names in
@@ -66,6 +66,16 @@ verified.
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is not
   seen. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
   used.
+- **Roots of their own, in part**: `chroot` into the generated `/proc` or
+  `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
+  root. As `mount` is not implemented, nothing can be mounted on the new
+  root's `/proc` or `/dev`, so a program there finds only the files the
+  directory holds. In a path that climbs above the root as written, `..` is
+  taken from the names as written, where Linux takes a `..` after a
+  symbolic link from the link's target. `/proc` shows the paths of
+  processes' files from the machine's root, where Linux shows them from the
+  reader's root, and a process has no `/proc/<pid>/root`. `fchroot`, new in
+  Linux master, is not there (`ENOSYS`).
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
   no device for it to stand for. A FIFO in a mounted host directory can be
@@ -163,10 +173,12 @@ verified.
   open with `O_APPEND` do not reach the file. The end of a mapped file, past
   which a page raises `SIGBUS`, is the size the guest's own file operations
   give it, so a host program changing the size does not move it.
-- **Mappings that grow down**: only the main stack is a VMA that grows down.
-  A mapping made with `MAP_GROWSDOWN` is an ordinary one, so it does not grow
-  and `mprotect` with `PROT_GROWSDOWN` on it gives `EINVAL`, where Linux
-  changes it.
+- **Mappings that grow down**: such a mapping grows when the guest's own
+  code touches a page below it or a signal frame is written there
+  ([features](./features#system-calls)), but not when a system call reads or
+  writes there: the call gives `EFAULT`, where Linux's copy of user memory
+  grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
+  growth, as it does not stop `mmap`.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its
@@ -558,8 +570,15 @@ verified.
   host's, and IPv6's creation time is 0 and its reachable time 30
   seconds, where Linux's is random. The first namespace's `127.0.0.1`
   and `::1` were made at 0, where Linux's were made as it booted.
-  `NETLINK_EXT_ACK` adds no attributes to an error or to a dump's
-  `NLMSG_DONE`. A link dump's `IFLA_LINKINFO` is taken without effect,
+  With `NETLINK_EXT_ACK`, a request refused for a feature paludarium does
+  not have (a multipath route, say, or a link of a kind) carries no
+  message, as Linux would take it; an IPv6 route replaced without
+  `NLM_F_CREATE` that is not there is told of
+  ("Can not replace route - no match found") only where its prefix has
+  no route, where Linux looks for a node of its tree; and no answer
+  carries a missing attribute (`NLMSGERR_ATTR_MISS_TYPE`) or a cookie, as
+  no request taken asks for one. `NLM_F_BULK` is refused ("Bulk delete is
+  not supported") for address and route removals alone. A link dump's `IFLA_LINKINFO` is taken without effect,
   where Linux shows only the devices of a kind its modules know. The
   least `IFLA_GSO_MAX_SIZE` and `IFLA_GSO_IPV4_MAX_SIZE` the link policy
   takes is 321, as for Ubuntu's kernel (`MAX_TCP_HEADER` + 1), where

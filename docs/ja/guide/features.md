@@ -54,7 +54,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
@@ -1057,9 +1057,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `mprotect` は引数を Linux と同じ順で確かめます。`PROT_GROWSDOWN` と `PROT_GROWSUP` の
   両方、そろっていない先頭、空の範囲（ビットが何でも成功します）、あふれる終わり（`ENOMEM`）、
   そのあと未知のビットの順です。`PROT_GROWSDOWN` は範囲を、その中の最初の VMA の先頭まで
-  下に広げます。その VMA は下に伸びるもの（メインのスタック）でなければならず、そうでなければ
+  下に広げます。その VMA は下に伸びるもの（メインのスタックか、`MAP_GROWSDOWN` の
+  マッピング）でなければならず、そうでなければ
   `EINVAL` です。`PROT_GROWSUP` は、x86-64 には上に伸びる VMA がないので、先頭がマップ済みなら
   `EINVAL` です。範囲に VMA がなければ、どちらも `ENOMEM` です。
+- 下に伸びるマッピング（メインのスタックか、`mmap` が `MAP_GROWSDOWN` で作った
+  プライベートな匿名メモリで、`VmFlags` は `gd` を示します）は、Linux の
+  `expand_downwards` と同じように伸びます。その下のマップされていないページへの
+  アクセスや、そこへのシグナルフレームの書き込みで、そのページまで下に伸び、アクセスは
+  やり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
+  上の 256 ページの guard gap（`stack_guard_gap`）の中、VMA 全体で `RLIMIT_STACK` を
+  超えるところ、ロックされていれば `CAP_IPC_LOCK` なしで `RLIMIT_MEMLOCK` を超える
+  ところへは伸びず、そのアクセスは `SIGSEGV` になります。その下の gap には、ヒントでも、
+  `mmap` が空きを探すときでも、マッピングを置きません。ファイルのマッピング
+  （`/dev/zero` も含みます）と共有メモリは下に伸ばせません（`EINVAL`）。メインの
+  スタックの VMA は 8 MiB から始まるので、それより大きい `RLIMIT_STACK` ではそれを
+  超えて伸びます。
 - 保護キーは、保護キーのない CPU での Linux と同じ答えを返します。仮想 CPU はそういう CPU
   です（`CPUID` は PKU を報告しません）。キーは、既定のキー 0 も含めて一つも割り当てられて
   いません。`pkey_alloc` は `ENOSPC` で、フラグや `PKEY_DISABLE_ACCESS` と
@@ -1158,6 +1171,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   では、スレッドは `SIGSEGV` で終わります。CPU を待つスレッドがあると、自分の CPU を 4 ms 使った
   スレッドは先に譲ります。fork は登録を保ち、新しいスレッド、`CLONE_VM` の子、exec は登録なしで
   始まります。
+- `chroot` は、Linux の `set_fs_root` と同じく、呼び出し元と作業ディレクトリを共有する
+  タスク（`CLONE_FS`）に自分のルートを与えます。その前に Linux と同じ順に確かめます。
+  パスのたどり（`ENOENT`、`ENOTDIR`、`ELOOP`、`EACCES`）、ディレクトリの検索の許可
+  （`EACCES`）、呼び出し元のユーザー名前空間での `CAP_SYS_CHROOT`（`EPERM`）です。
+  そのあと、絶対パスと絶対のシンボリックリンクはルートから始まり、`..` はそこで止まります。
+  exec とそのインタープリターも同じです。作業ディレクトリは元の場所のままで、ルートの外の
+  作業ディレクトリからは、Linux と同じくパスはどこへでも行けます。`getcwd` は、作業
+  ディレクトリをルートからのパスで返し、ルートの下にないときは、マシンのルートからのパスの前に
+  `(unreachable)` を付けて返します。`fork` の子はルートを保ち、名前の変更はディレクトリと
+  一緒にルートも動かし、マウント名前空間への `setns` はマシンのルートに戻します。生成される
+  `/proc` と `/dev` は、ほかのルートの下にはありません。そこには `proc` ファイルシステムが
+  マウントされていないからです。
 - `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
   `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
@@ -1300,7 +1325,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     アドレスとリンクのダンプでは、`inet6_dump_ifaddr` と `inet6_dump_ifinfo` と同じく、
     空きがあれば最後のメッセージと同じ部分に入れます。
     エラーと、`NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返し、エラーのものは
-    `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`GET` のほかには、ネットワーク
+    `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`NETLINK_EXT_ACK` を付けると、
+    エラーと、ダンプをすぐに終える `NLMSG_DONE` に、Linux の `netlink_ext_ack` が持つものを
+    載せます（`NLM_F_ACK_TLVS`）。Linux のメッセージ（`NLMSGERR_ATTR_MSG`）、問題の属性の
+    オフセット（`NLMSGERR_ATTR_OFFS`）、その属性を拒んだポリシー（`NLMSGERR_ATTR_POLICY`）
+    です。確認応答には、属性のあとに残ったバイトのような警告を載せます。`GET` のほかには、ネットワーク
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
     開いたものの両方に要ります（なければ `EPERM`）。
   - **厳密な検査:** iproute2 と同じく `NETLINK_GET_STRICT_CHK` を設定すると、Linux と
@@ -1328,7 +1357,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     型 0 や最後より後の型、余ったバイトは `EINVAL` です。検査しなければ読み飛ばし、
     属性がポリシーに反するリンクのダンプは、属性をどれも使いません。リンクの変更は
     `IFLA_NET_NS_PID`、`IFLA_NET_NS_FD`、`IFLA_TARGET_NETNSID` のうち一つまでを
-    取ります（`EINVAL`）。
+    取ります（`EINVAL`）。リンクの取得は、はじめの二つのどちらも取りません（`EOPNOTSUPP`）。
   - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
     `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、
@@ -1356,7 +1385,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ない IPv6 のもの、有効な寿命がないか、それより長い推奨の寿命、`ifaddrmsg` より短い
     メッセージは `EINVAL`、ほかのインターフェースは `ENODEV` です。そのあと、新しい IPv6 の
     ものでは、128 を超える接頭辞と、64 でない接頭辞の `IFA_F_MANAGETEMPADDR` が
-    `EINVAL` です。`0.0.0.0` の `IFA_LOCAL` は受け取るだけで何もしません。`IFA_LABEL`、
+    `EINVAL`、`::` と、`IFA_F_MCAUTOJOIN` のないマルチキャストアドレスが `EADDRNOTAVAIL`
+    です。スコープの違うアドレスのサブネットに入る IPv4 のものは `EINVAL` です。
+    `0.0.0.0` の `IFA_LOCAL` は受け取るだけで何もしません。`IFA_LABEL`、
     `IFA_BROADCAST`、`IFA_FLAGS`（`IFA_F_NOPREFIXROUTE` と、IPv6 ではアドレスを 1 度だけ
     伝える `IFA_F_NODAD` も。IPv6 は要求が付けられるフラグだけを保ちます）、`IFA_PROTO`、
     アドレスの接頭辞の経路のメトリックになる `IFA_RT_PRIORITY`、`IFA_CACHEINFO` の寿命を
@@ -1423,7 +1454,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     優先する送り元、IPv4 のゲートウェイ（オンリンクも）を持てます。`NLM_F_EXCL`、
     `NLM_F_REPLACE`、`NLM_F_APPEND`、`NLM_F_CREATE` に従って Linux と同じ場所に置くか、
     Linux と同じエラーで断ります（`EEXIST`、`ENOENT`。接頭辞、スコープ、種類、
-    ゲートウェイ、優先する送り元がおかしければ `EINVAL`、ほかのデバイスは `ENODEV`、
+    ゲートウェイ、優先する送り元がおかしいときと、`RTA_FLOWLABEL`、`RTA_VIA`、
+    `RTM_F_CLONED` を持つ IPv6 の経路は `EINVAL`、ほかのデバイスは `ENODEV`、
     `lo` が落ちている間はホストのスコープの IPv4 の経路のほかは `ENETDOWN`）。
     `RTM_DELROUTE` は、指したものに合う最初の経路を消します（なければ `ESRCH`）。
     カーネルの経路も消せ、アドレスの変化や `lo` が上がったときに戻ります。`lo` を落とすと、

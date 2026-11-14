@@ -18,13 +18,16 @@ async function stopDriver(driver) {
   try { await stopped; } finally { clearTimeout(force); }
 }
 
-// The one safaridriver failure that is retried: on a fresh macOS runner, session creation can fail while
-// safaridriver waits for its first Safari launch, e.g. run 39114110570 attempt 1:
+// The safaridriver failures that are retried, both of session creation while safaridriver launches Safari on
+// a fresh macOS runner: it times out waiting for that launch, e.g. run 39114110570 attempt 1:
 // {"error":"session not created","message":"Could not create a session: The session timed out while connecting to a Safari instance. ..."}
-export function isSafariLaunchTimeout(error) {
+// or the launched Safari never becomes ready, e.g. run 43576635510 attempt 1 (4 such runs in 2026-11-08..14):
+// {"error":"session not created","message":"Could not create a session: The host application never became ready, unable to create a WebDriver session."}
+const SAFARI_LAUNCH_FAILURES = ["timed out while connecting to a Safari instance", "The host application never became ready"];
+export function isSafariLaunchFailure(error) {
   const text = String(error?.cause ?? error);
   return error?.phase === "session-creation" && text.includes('"error":"session not created"')
-    && text.includes("timed out while connecting to a Safari instance");
+    && SAFARI_LAUNCH_FAILURES.some(failure => text.includes(failure));
 }
 
 // Stop any Safari left by the failed attempt before the single retry: SIGTERM by exact process name, bounded to 10 s.
@@ -43,7 +46,7 @@ async function safari(url, timeout) {
     const result = await safariAttempt(url, timeout);
     return { ...result, session_retry: { attempts: 1, retried: false, first_failure: null } };
   } catch (error) {
-    if (!isSafariLaunchTimeout(error)) throw error;
+    if (!isSafariLaunchFailure(error)) throw error;
     first = error;
   }
   const stopped = await stopSafari();

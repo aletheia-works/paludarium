@@ -1046,7 +1046,10 @@ fn set_cpu_timer(
 }
 
 /// `timer_settime(id, flags, new, old)`, in Linux's order: read and check the
-/// new value, find the timer, set it, then write the old value out.
+/// new value, find the timer, set it, then write the old value out. As
+/// Linux's `common_timer_set`, it looks at no flag but `TIMER_ABSTIME`, takes
+/// the value and the interval up to `KTIME_MAX`, and a relative expiry past
+/// it stops there (`ktime_add_safe`), on the monotonic clock for both clocks.
 fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome((|| {
         if a[2] == 0 {
@@ -1054,11 +1057,8 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         let new = read_words::<4>(c.mem, a[2])?;
         let [i_sec, i_nsec, v_sec, v_nsec] = new;
-        timespec_ktime(i_sec, i_nsec)?;
-        timespec_ktime(v_sec, v_nsec)?;
-        if a[1] & !TIMER_ABSTIME != 0 {
-            return Err(Errno::EINVAL);
-        }
+        let interval = timespec_ktime(i_sec, i_nsec)?;
+        let value = timespec_ktime(v_sec, v_nsec)?;
         let mono = c.host.clock(ClockId::Monotonic)?;
         let real = c.host.clock(ClockId::Realtime)?;
         let clock = timer_clock_of(c, timer_id(a[0]))?;
@@ -1073,7 +1073,6 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             }
             return Ok(0);
         }
-        let (interval, value) = (timespec_ns(i_sec, i_nsec)?, timespec_ns(v_sec, v_nsec)?);
         let old = c.group.with_timers(c.process, |timers| {
             let timer = timers.get_mut(timer_id(a[0]))?;
             let old = timer_state(timer, mono);
@@ -1086,7 +1085,7 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 let delay = if a[1] & TIMER_ABSTIME != 0 {
                     value.saturating_sub(now)
                 } else {
-                    value
+                    value.min((i64::MAX as u64).saturating_sub(mono))
                 };
                 mono.saturating_add(delay)
             });

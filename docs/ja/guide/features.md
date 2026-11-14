@@ -2084,7 +2084,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`TIMER_ABSTIME` なら絶対時刻）、`KTIME_MAX` で頭打ちにします。止めると間隔も含めて
   何も示さず、`SIGEV_NONE` のタイマーは読んだときに間隔の分だけ進めます。時計の
   スレッドが終わったあとは、`timer_settime` は `ESRCH` を返し、`timer_gettime` は何も
-  示しません。タイマーは
+  示しません。ほかの時計では、Linux の `common_timer_set` と同じく、`timer_settime` は
+  `flags` のうち `TIMER_ABSTIME` しか見ず、値と間隔は `KTIME_MAX` で頭打ちにし、相対時間で
+  `KTIME_MAX` を超える満了もそこで止めます。相対時間の `CLOCK_REALTIME` のタイマーは
+  単調時計で数えます。タイマーは
   `fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、プロセス全体に
   届いてブロックされているシグナルも受け取ります。
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が

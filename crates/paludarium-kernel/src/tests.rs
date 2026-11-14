@@ -2302,10 +2302,8 @@ fn posix_timers_check_arguments_and_report_their_state() {
         );
     }
     assert_eq!(f.ret(nr::TIMER_CREATE, &[99, 0, id]), errno(Errno::EINVAL));
-    assert_eq!(
-        f.ret(nr::TIMER_SETTIME, &[1, 2, spec, 0]),
-        errno(Errno::EINVAL)
-    );
+    // Linux looks at no flag but TIMER_ABSTIME.
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[1, !1, spec, 0]), 0);
     assert_eq!(
         f.ret(nr::TIMER_SETTIME, &[1, 0, 0, 0]),
         errno(Errno::EINVAL)
@@ -2330,6 +2328,49 @@ fn posix_timers_check_arguments_and_report_their_state() {
     assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 5);
     assert_eq!(f.ret(nr::TIMER_GETTIME, &[1, old]), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(old + 16)).unwrap(), 0);
+}
+/// Times past `KTIME_MAX` are taken up to it, and a relative expiry past it
+/// stops there, as Linux's `timespec64_to_ktime` and `ktime_add_safe` do.
+#[test]
+fn posix_timers_take_times_up_to_ktime_max() {
+    const KTIME_MAX: u64 = i64::MAX as u64;
+    let mut f = fixture();
+    let (id, sev, spec, old) = (DATA, DATA + 0x40, DATA + 0x100, DATA + 0x140);
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, 1_000_000_000);
+    f.host
+        .set_clock(paludarium_host::ClockId::Realtime, 5_000_000_000);
+    f.mem.write_u64(GuestAddr(sev + 8), 1 << 32).unwrap(); // SIGEV_NONE
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, sev, id]), 0);
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[0, sev, id]), 0);
+    let words = |f: &Fixture| -> [u64; 4] {
+        std::array::from_fn(|i| f.mem.read_u64(GuestAddr(old + 8 * i as u64)).unwrap())
+    };
+    // Seconds past u64 nanoseconds, and i64::MAX seconds.
+    for (i, v) in [20_000_000_000, 0, i64::MAX as u64, 0].iter().enumerate() {
+        f.mem.write_u64(GuestAddr(spec + 8 * i as u64), *v).unwrap();
+    }
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[0, 0, spec, 0]), 0);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[0, old]), 0);
+    let left = KTIME_MAX - 1_000_000_000;
+    assert_eq!(
+        words(&f),
+        [
+            KTIME_MAX / 1_000_000_000,
+            KTIME_MAX % 1_000_000_000,
+            left / 1_000_000_000,
+            left % 1_000_000_000
+        ]
+    );
+    // A relative CLOCK_REALTIME timer runs on the monotonic clock, an
+    // absolute one on its own.
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[1, 0, spec, 0]), 0);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[1, old]), 0);
+    assert_eq!(words(&f)[2..], [left / 1_000_000_000, left % 1_000_000_000]);
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[1, 1, spec, 0]), 0);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[1, old]), 0);
+    let left = KTIME_MAX - 5_000_000_000;
+    assert_eq!(words(&f)[2..], [left / 1_000_000_000, left % 1_000_000_000]);
 }
 #[test]
 fn sigtimedwait_takes_blocked_process_signals_and_times_out() {

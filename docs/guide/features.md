@@ -2393,7 +2393,11 @@ kernel.
   shows nothing, its interval included, once disarmed; a `SIGEV_NONE` one
   is moved on by its interval when it is read; and once the thread whose
   clock it is has exited, `timer_settime` gives `ESRCH` and
-  `timer_gettime` shows nothing. Timers are
+  `timer_gettime` shows nothing. On the other clocks, as Linux's
+  `common_timer_set`, `timer_settime` looks at no flag but `TIMER_ABSTIME`
+  and takes the value and the interval up to `KTIME_MAX`, and a relative
+  expiry past `KTIME_MAX` stops there; a relative `CLOCK_REALTIME` timer
+  counts on the monotonic clock. Timers are
   not inherited by `fork` and are deleted by `execve`. `rt_sigtimedwait` also
   takes blocked signals pending for the whole process.
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a

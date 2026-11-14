@@ -6944,6 +6944,48 @@ static int cpu_sleep_case(void) {
     printf("signal absolute=%ld rem=%ld %ld\n", interrupted, (long)rem.tv_sec, rem.tv_nsec);
     return 0;
 }
+/* timer_settime on the host clocks takes times up to KTIME_MAX, stops a
+ * relative expiry there, and looks at no flag but TIMER_ABSTIME. */
+static long tl_set(int id, int flags, long i_sec, long v_sec, long v_nsec) {
+    struct itimerspec v = {{i_sec, 0}, {v_sec, v_nsec}};
+    return syscall(SYS_timer_settime, (long)id, (long)flags, &v, NULL) ? -errno : 0;
+}
+/* Whether the time left and the clock's time make KTIME_MAX, to a second. */
+static int tl_reaches_max(int id, clockid_t clock) {
+    struct itimerspec v;
+    struct timespec now;
+    syscall(SYS_timer_gettime, (long)id, &v);
+    clock_gettime(clock, &now);
+    long sec = v.it_value.tv_sec + now.tv_sec + (v.it_value.tv_nsec + now.tv_nsec) / 1000000000L;
+    return sec >= 9223372035L && sec <= 9223372036L;
+}
+static int timer_limits_case(void) {
+    int mono = ct_create(CLOCK_MONOTONIC, SIGEV_NONE, 0, 0);
+    int real = ct_create(CLOCK_REALTIME, SIGEV_NONE, 0, 0);
+    printf("create=%d\n", mono >= 0 && real >= 0);
+    /* Past u64 nanoseconds and at LONG_MAX seconds: clamped. */
+    printf("huge set=%ld\n", tl_set(mono, 0, 20000000000L, LONG_MAX, 0));
+    struct itimerspec v = ct_get(mono);
+    printf("huge interval=%ld %ld reaches-max=%d\n", (long)v.it_interval.tv_sec,
+           v.it_interval.tv_nsec, tl_reaches_max(mono, CLOCK_MONOTONIC));
+    /* Past KTIME_MAX but within u64 nanoseconds: clamped too. */
+    printf("past-max set=%ld\n", tl_set(mono, 0, 0, 10000000000L, 0));
+    printf("past-max reaches-max=%d\n", tl_reaches_max(mono, CLOCK_MONOTONIC));
+    /* A relative CLOCK_REALTIME timer counts on the monotonic clock, an
+       absolute one on its own. */
+    printf("real relative=%ld reaches-max=%d\n", tl_set(real, 0, 0, LONG_MAX, 0),
+           tl_reaches_max(real, CLOCK_MONOTONIC));
+    printf("real absolute=%ld reaches-max=%d\n", tl_set(real, TIMER_ABSTIME, 0, LONG_MAX, 0),
+           tl_reaches_max(real, CLOCK_REALTIME));
+    /* Other flags are not looked at; bad times are. */
+    printf("flags=%ld\n", tl_set(mono, ~TIMER_ABSTIME, 0, 5, 0));
+    v = ct_get(mono);
+    printf("flags left-in-range=%d\n", v.it_value.tv_sec >= 4 && v.it_value.tv_sec <= 5);
+    printf("negative=%ld wide=%ld\n", tl_set(mono, 0, 0, -1, 0), tl_set(mono, 0, 0, 1, 1000000000L));
+    printf("delete=%ld %ld\n", syscall(SYS_timer_delete, (long)mono),
+           syscall(SYS_timer_delete, (long)real));
+    return 0;
+}
 /* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
  * SIGKILL at the hard limit. Each part runs in a child, whose CPU time
  * starts from 0. */
@@ -21373,6 +21415,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
+    if (!strcmp(mode, "timer-limits")) return timer_limits_case();
     if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {
         struct itimerval v;

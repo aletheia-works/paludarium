@@ -3446,6 +3446,25 @@ impl AddressSpaceData {
         Ok(())
     }
 
+    /// Locks the new mapping `[addr, end)` as `mmap` with `MAP_LOCKED` does
+    /// (`__mmap_complete`): only a VMA `vma_supports_mlock` refuses, the
+    /// rings of AIO and `io_uring`, stays unlocked. Secret memory is locked
+    /// here, as only `mlock_fixup` passes it over.
+    pub fn lock_new(&mut self, addr: u64, end: u64, lock: Lock) {
+        let fixed = self
+            .shared_at(addr)
+            .and_then(|shared| shared.pages.source())
+            .is_some_and(|source| source.fixed());
+        if fixed {
+            return;
+        }
+        self.split_at(addr);
+        self.split_at(end);
+        for (_, mapping) in self.mappings.range_mut(addr..end) {
+            mapping.locked = Some(lock);
+        }
+    }
+
     /// Whether the mapping at `addr` cannot be locked: the rings of AIO and
     /// `io_uring` (Linux's `vma_supports_mlock`), and secret memory, which
     /// `mlock_fixup` leaves as it is.
@@ -4749,6 +4768,10 @@ impl AddressSpace {
     /// See [`AddressSpaceData::lock`].
     pub fn lock(&self, addr: GuestAddr, end: u64, lock: Option<Lock>) -> Result<(), Errno> {
         self.locked().lock(addr.0, end, lock)
+    }
+    /// See [`AddressSpaceData::lock_new`].
+    pub fn lock_new(&self, addr: GuestAddr, end: u64, lock: Lock) {
+        self.locked().lock_new(addr.0, end, lock);
     }
     /// See [`AddressSpaceData::lock_all`].
     pub fn lock_all(&self, current: Option<Option<Lock>>, future: Option<Lock>) {

@@ -6846,6 +6846,22 @@ mod madvise_advice {
         assert_eq!(f.ret(26, &[at, 4 * PAGE, 2]), errno(Errno(16)));
         assert_eq!(f.ret(150, &[at, 4 * PAGE]), 0);
         assert_eq!(f.mem.locked_pages(), 0);
+        // Secret memory is locked by MAP_LOCKED, which only `mlock_fixup`
+        // passes over: a later mlock leaves it as it is.
+        let fd = f.ret(447, &[0]);
+        assert_eq!(f.ret(77, &[fd, PAGE]), 0);
+        let secret = f.ret(mmap, &[0, PAGE, 3, 0x2001, fd, 0]);
+        assert!(
+            f.mem
+                .first_locked(GuestAddr(secret), secret + PAGE)
+                .is_some()
+        );
+        assert_eq!(f.ret(11, &[secret, PAGE]), 0);
+        let plain = f.ret(mmap, &[0, PAGE, 3, 1, fd, 0]);
+        assert_eq!(f.ret(149, &[plain, PAGE]), errno(Errno::ENOMEM));
+        assert!(f.mem.first_locked(GuestAddr(plain), plain + PAGE).is_none());
+        assert_eq!(f.ret(11, &[plain, PAGE]), 0);
+        assert_eq!(f.mem.locked_pages(), 0);
         // Without CAP_IPC_LOCK, RLIMIT_MEMLOCK bounds what is locked.
         f.mem.write_u64(GuestAddr(DATA), PAGE).unwrap();
         f.mem.write_u64(GuestAddr(DATA + 8), u64::MAX).unwrap();

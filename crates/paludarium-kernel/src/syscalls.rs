@@ -1962,11 +1962,11 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     };
     match result {
         Ok(a) => {
-            if flags & MAP_LOCKED != 0 {
+            if flags & MAP_LOCKED != 0
+                && let Some(lock) = lock
+            {
                 let end = a.0.saturating_add(len.next_multiple_of(4096));
-                // The VMA was just made, so it has no hole to stop the lock.
-                let locked = c.mem.lock(a, end, lock);
-                debug_assert!(locked.is_ok(), "{locked:?}");
+                c.mem.lock_new(a, end, lock);
             }
             // Linux populates a writable private mapping by writing it, which
             // gives it an anon_vma (a core then writes it whole), with

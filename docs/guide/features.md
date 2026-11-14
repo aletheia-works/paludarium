@@ -1938,11 +1938,13 @@ kernel.
   - **Hardware addresses:** with `MCTP_OPT_ADDR_EXT` (`SOL_MCTP`, an `int`
     exactly, else `EINVAL`), a `sockaddr_mctp_ext` sends out of the
     loopback by its index and hardware address (`ENOENT` for another index,
-    `EINVAL` for an address of other than six bytes, or padding), and the
-    loopback takes it back in as `mctp_pkttype_receive` does, without
-    telling the sender what became of it; while it is down, its `noop`
-    queueing discipline drops it, and the send still succeeds. A message received then names the interface it came in by,
-    0 for none.
+    `EINVAL` for an address of other than six bytes, or padding). The send
+    succeeds and the message is lost, as on Linux: while the loopback is
+    down its `noop` queueing discipline drops it, and while it is up it
+    comes back in, but `eth_type_trans` takes `ETH_P_MCTP` (0xfa), below
+    `ETH_P_802_3_MIN`, for an 802.3 length, so the frame goes to 802.2 and
+    never to MCTP. A socket with the option names, in a message it
+    receives, the interface it came in by, which is 0, none.
   - **Others:** `getsockname`, `getpeername`, `listen`, `accept`,
     `shutdown` and `socketpair` are `EOPNOTSUPP`; `setsockopt` and
     `getsockopt` of a level but `SOL_SOCKET` and `SOL_MCTP` are `EINVAL`.

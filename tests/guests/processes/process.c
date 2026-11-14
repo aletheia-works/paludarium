@@ -14656,8 +14656,10 @@ int main(int argc, char **argv) {
             mctp_send(c, &name, sizeof name, 65536, "longer");
             mctp_receive(a, 0, 70000, "any got");
             mctp_send(c, &name, sizeof name, 5 << 20, "too long");
-            /* Out of lo by its hardware address: while it is down, which
-               drops it, and up, to IDs of the route through 9. */
+            /* Out of lo by its hardware address, which loses it: while it
+               is down, its noop qdisc drops it, and while it is up, it comes
+               back as an 802.2 frame, ETH_P_MCTP (0xfa) being below
+               ETH_P_802_3_MIN. */
             value = 1;
             printf("ext set=%ld\n", netns_result(setsockopt(c, 285, 1, &value, sizeof value)));
             setsockopt(a, 285, 1, &value, sizeof value);
@@ -14739,9 +14741,8 @@ int main(int argc, char **argv) {
             for (int i = 0; i < 9; i++) mctp_send(c, &name, sizeof name, 1, "owned");
             for (int i = 0; i < 9; i++) mctp_receive(a, 0, 100, "any got");
             /* A close drops its keys. A new socket then sends out of lo to
-               MCTP_ADDR_NULL at lo's own hardware address, which comes in
-               at once: its tag is for any peer, which every key of the
-               local ID would hold back. */
+               MCTP_ADDR_NULL, which is lost as well: its tag is for any
+               peer, which every key of the local ID would hold back. */
             close(c);
             int f = socket(45, SOCK_DGRAM, 0);
             value = 1;

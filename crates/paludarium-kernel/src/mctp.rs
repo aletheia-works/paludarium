@@ -6,9 +6,9 @@
 //! A message goes as `mctp_local_output` sends it: through the route to its
 //! endpoint ID, in packets of the route's MTU, each into `mctp_dst_input`,
 //! which reassembles them and gives the message to the socket a tag's key
-//! or a bind names. A send through the loopback by its hardware address
-//! (`MCTP_OPT_ADDR_EXT`) goes out of it and comes back in, as
-//! `mctp_pkttype_receive` takes it. Tags are kept as Linux keeps them: a
+//! or a bind names. A send out of the loopback by its hardware address
+//! (`MCTP_OPT_ADDR_EXT`) is lost, as on Linux, where the loopback takes
+//! the frame back in as 802.2's. Tags are kept as Linux keeps them: a
 //! tag a sender owns has a key for six seconds, or until the answer to it
 //! comes, and `SIOCMCTPALLOCTAG` keeps one until `SIOCMCTPDROPTAG`.
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
@@ -188,10 +188,6 @@ fn bucket(kind: u8, local: u8, peer: u8) -> u32 {
 /// `mctp_address_matches`.
 fn matches(pattern: u8, eid: u8) -> bool {
     pattern == eid || pattern == ANY
-}
-/// `mctp_address_unicast`.
-fn unicast(eid: u8) -> bool {
-    (8..255).contains(&eid)
 }
 /// The `truesize` of a buffer `alloc_skb` makes for `len` bytes with
 /// `GFP_KERNEL` on x86-64: the `sk_buff` (256 bytes) and its head, which
@@ -639,7 +635,7 @@ impl MctpSocket {
         let ext = self.lock().ext && raw.len() >= NAME_EXT;
         // Where it goes: out of the loopback to the hardware address
         // (`mctp_dst_from_extaddr`), or through a route (`mctp_route_lookup`).
-        let (mtu, haddr) = if ext {
+        let (mtu, out) = if ext {
             if raw[17] | raw[18] | raw[19] != 0 {
                 return Err(Errno::EINVAL);
             }
@@ -654,9 +650,9 @@ impl MctpSocket {
             if halen != LO_ADDR_LEN {
                 return Err(Errno::EINVAL);
             }
-            (LO_MTU, Some(raw[20..20 + halen].to_vec()))
+            (LO_MTU, true)
         } else {
-            (self.route(net, dest).ok_or(EHOSTUNREACH)?, None)
+            (self.route(net, dest).ok_or(EHOSTUNREACH)?, false)
         };
         // `sock_alloc_send_skb`: the header room, the type and the bytes,
         // in a head `kmalloc` can make (`ENOBUFS`).
@@ -718,9 +714,14 @@ impl MctpSocket {
                 net: DEFAULT_NET,
                 ifindex: 0,
             };
-            match &haddr {
-                None => t.input(&packet, now)?,
-                Some(haddr) => self.transmit(&mut t, packet, haddr, now)?,
+            // Out of the loopback (`mctp_dst_output`), a packet is lost:
+            // down, its `noop` queueing discipline drops it (`NET_XMIT_CN`,
+            // which `net_xmit_errno` makes 0); up, it comes back in, but
+            // `eth_type_trans` takes `ETH_P_MCTP` (0xfa), below
+            // `ETH_P_802_3_MIN`, for an 802.3 length, and gives it to 802.2,
+            // so MCTP never sees it. Either way the send succeeds.
+            if !out {
+                t.input(&packet, now)?;
             }
             seq = (seq + 1) & 3;
             at += size;
@@ -751,35 +752,6 @@ impl MctpSocket {
             }
         }
         None
-    }
-    /// A packet out of the loopback (`mctp_dst_output`): while it is down
-    /// its `noop` queueing discipline drops it (`NET_XMIT_CN`, which
-    /// `net_xmit_errno` makes 0), else it comes back in by it
-    /// (`mctp_pkttype_receive`),
-    /// to the route its destination has, or, to `MCTP_ADDR_NULL` at the
-    /// loopback's own hardware address, in at once; what happens to it
-    /// there is not the sender's to hear.
-    fn transmit(
-        &self,
-        t: &mut Table,
-        mut packet: Packet<'_>,
-        haddr: &[u8],
-        now: u64,
-    ) -> Result<(), Errno> {
-        if !self.network.is_up() {
-            return Ok(());
-        }
-        packet.ifindex = LO_INDEX;
-        let dest = packet.dest;
-        if !(unicast(dest) || dest == NULL || dest == ANY) {
-            return Ok(());
-        }
-        let local = self.route(DEFAULT_NET, dest).is_some()
-            || (dest == NULL && haddr.iter().all(|&b| b == 0));
-        if local {
-            let _ = t.input(&packet, now);
-        }
-        Ok(())
     }
     /// Receives one message into `buf`, as `mctp_recvmsg`: `EAGAIN` while
     /// there is none; `peek` leaves it. The bytes copied, the message's

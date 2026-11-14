@@ -1679,10 +1679,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **ハードウェアアドレス:** `MCTP_OPT_ADDR_EXT`（`SOL_MCTP`。ちょうど `int` の大きさで、
     違えば `EINVAL`）を付けると、`sockaddr_mctp_ext` はインターフェースの番号と
     ハードウェアアドレスでループバックの外に送ります（ほかの番号は `ENOENT`、6 バイトで
-    ないアドレスや詰め物は `EINVAL`）。ループバックは `mctp_pkttype_receive` と同じく
-    それを受け取り直し、どうなったかは送り手に伝えません。ループバックが下りている間は
-    `noop` のキューイング規則が捨てますが、送信は成功します。そのとき受け取るメッセージは、入ってきたインターフェース（なければ
-    0）を示します。
+    ないアドレスや詰め物は `EINVAL`）。Linux と同じく、送信は成功してもメッセージは
+    失われます。ループバックが下りている間は `noop` のキューイング規則が捨てます。
+    上がっている間は戻ってきますが、`eth_type_trans` が `ETH_P_MCTP`（0xfa）を
+    `ETH_P_802_3_MIN` より小さい 802.3 の長さとみなすので、フレームは 802.2 に渡り、
+    MCTP には届きません。このオプションを付けたソケットが受け取るメッセージは、
+    入ってきたインターフェースを示しますが、それは 0（なし）です。
   - **そのほか:** `getsockname`、`getpeername`、`listen`、`accept`、`shutdown`、`socketpair` は
     `EOPNOTSUPP` です。`SOL_SOCKET` と `SOL_MCTP` 以外のレベルの `setsockopt` と
     `getsockopt` は `EINVAL` です。

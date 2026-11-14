@@ -2283,9 +2283,11 @@ impl Kernel {
             who
         }
     }
-    /// `prctl(option, ...)`: PR_SET/GET_NAME and PR_SET/GET_KEEPCAPS (per thread),
-    /// PR_SET/GET_PDEATHSIG, PR_SET/GET_DUMPABLE, PR_SET/GET_CHILD_SUBREAPER
-    /// and PR_SET/GET_NO_NEW_PRIVS; any other option is EINVAL, as Linux
+    /// `prctl(option, ...)`: PR_SET/GET_NAME, PR_SET/GET_SECCOMP and the
+    /// capability module's options ([`crate::credentials::Credentials::prctl`])
+    /// per thread, Yama's PR_SET_PTRACER, PR_SET/GET_PDEATHSIG,
+    /// PR_SET/GET_DUMPABLE, PR_SET/GET_CHILD_SUBREAPER and
+    /// PR_SET/GET_NO_NEW_PRIVS; any other option is EINVAL, as Linux
     /// gives for options it does not know.
     fn prctl(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         match a[0] {
@@ -2335,14 +2337,13 @@ impl Kernel {
                     .map_err(|_| Errno::EFAULT)?;
                 return Ok(0);
             }
-            // PR_GET_KEEPCAPS, PR_SET_KEEPCAPS (0 or 1), kept per thread with
-            // its credentials.
-            7 => return Ok(u64::from(thread.state.credentials.keep_caps)),
-            8 if a[1] <= 1 => {
-                thread.state.credentials.keep_caps = a[1] == 1;
-                return Ok(0);
+            // The capability module's options, kept per thread with its
+            // credentials.
+            7 | 8 | 23 | 24 | 27 | 28 | 47 => {
+                if let Some(done) = thread.state.credentials.prctl(a) {
+                    return done;
+                }
             }
-            8 => return Err(Errno::EINVAL),
             // PR_GET_SECCOMP, PR_SET_SECCOMP
             21 => return Ok(crate::seccomp::mode(&thread.state)),
             22 => {
@@ -2901,14 +2902,8 @@ impl Kernel {
                     if !credentials.capable_in(crate::credentials::CAP_SYS_ADMIN, &target) {
                         return Err(Errno::EPERM);
                     }
-                    credentials = crate::credentials::Credentials {
-                        user: crate::users::UserNs(Arc::clone(&target)),
-                        permitted: crate::credentials::ALL_CAPABILITIES,
-                        effective: crate::credentials::ALL_CAPABILITIES,
-                        inheritable: 0,
-                        keep_caps: false,
-                        ..credentials
-                    };
+                    credentials =
+                        credentials.in_user_namespace(crate::users::UserNs(Arc::clone(&target)));
                 }
                 Kind::Mnt if !admin || credentials.effective & CAP_SYS_CHROOT == 0 => {
                     return Err(Errno::EPERM);
@@ -4117,7 +4112,8 @@ impl Kernel {
                         if file.stat()?.size > limit {
                             return Err(Errno::ENOMEM);
                         }
-                        Some((read_whole(&*file, limit)?, name, denied))
+                        let capabilities = program_capabilities(|f| file.with_xattrs(f))?;
+                        Some((read_whole(&*file, limit)?, name, capabilities, denied))
                     }
                     // A script reads itself by its name, which a descriptor
                     // closed on exec leaves to nothing
@@ -4183,10 +4179,10 @@ impl Kernel {
             None => None,
         };
         let (loaded, program, image, exe) = match image {
-            Some((bytes, name, denied)) => (
+            Some((bytes, name, capabilities, denied)) => (
                 Vec::new(),
                 program,
-                Some((bytes, name)),
+                Some((bytes, name, capabilities)),
                 Some(denied.closing(opens.0.pop().flatten())),
             ),
             None => {
@@ -4238,7 +4234,7 @@ impl Kernel {
         program: Option<paludarium_host::FileStat>,
         mut readable: bool,
         (argv, envp): (Vec<Vec<u8>>, Vec<Vec<u8>>),
-        held: Option<(Vec<u8>, Vec<u8>)>,
+        held: Option<HeldProgram>,
         program_file: Option<crate::page_cache::WriteAccess>,
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let mut random = [0; 16];
@@ -4246,10 +4242,23 @@ impl Kernel {
             .random_bytes(&mut random)
             .map_err(|_| Errno::EIO)?;
         let (_, _, no_new_privs) = self.processes.status_of(self.process.pid);
-        let (credentials, secure) = thread
-            .state
-            .credentials
-            .after_exec(program.as_ref(), no_new_privs);
+        // The program's file capabilities: a held file's, read before its
+        // bytes, or those of the file the path names.
+        let capabilities = match &held {
+            Some((_, _, capabilities)) => capabilities.clone(),
+            None => program_capabilities(|f| self.files.fs().with_xattrs(&loaded, true, f))?,
+        };
+        // Linux takes the new credentials once the loader has read the
+        // program and opened its interpreter (`begin_new_exec`), so their
+        // error comes after the loader's.
+        let exec_credentials = thread.state.credentials.after_exec(
+            program.as_ref(),
+            capabilities.as_deref(),
+            no_new_privs,
+        );
+        let (credentials, secure) = exec_credentials
+            .clone()
+            .unwrap_or_else(|_| (thread.state.credentials.clone(), false));
         let start = StartInfo {
             argv: &argv,
             envp: &envp,
@@ -4322,7 +4331,7 @@ impl Kernel {
         };
         let fs = &*self.files.fs();
         let image = crate::inotify::unopened(|| match &held {
-            Some((bytes, name)) => paludarium_loader::load_file_with(
+            Some((bytes, name, _)) => paludarium_loader::load_file_with(
                 fs,
                 bytes,
                 name,
@@ -4343,6 +4352,7 @@ impl Kernel {
             LoadError::Errno(error) => error,
             _ => Errno(8),
         })?;
+        exec_credentials?;
         // MMAP_PAGE_ZERO: SVr4's read-only page 0, as load_elf_binary maps it
         // last, when the new credentials may map below mmap_min_addr
         // (CAP_SYS_RAWIO); a failure is ignored, as there.
@@ -4401,7 +4411,7 @@ impl Kernel {
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
         self.group.set_start_stack(image.initial_stack_pointer.0);
         self.group.set_executable(match held {
-            Some((_, name)) => name,
+            Some((_, name, _)) => name,
             None => crate::files::resolved(&self.files, &loaded).unwrap_or(loaded),
         });
         // The exec is done: the program and the interpreter close as the
@@ -4652,6 +4662,23 @@ impl Drop for FailingExec {
         }
     }
 }
+/// The bytes of a program that no path names, the name `/proc/self/exe`
+/// reads of it, and its file capabilities.
+type HeldProgram = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+/// A program's `security.capability` attribute, which exec reads
+/// (`get_vfs_caps_from_disk`) through `with`: none where the file keeps no
+/// attributes, as a host's directory.
+fn program_capabilities(
+    with: impl FnOnce(&mut dyn FnMut(&mut paludarium_host::Xattrs)) -> Result<(), Errno>,
+) -> Result<Option<Vec<u8>>, Errno> {
+    let mut value = None;
+    match with(&mut |map| value = map.get(crate::permissions::CAPS).cloned()) {
+        Ok(()) | Err(Errno::EOPNOTSUPP) => Ok(value),
+        Err(e) => Err(e),
+    }
+}
+
 /// Tells inotify of exec's open of the file at `path` (`IN_OPEN`), and gives
 /// what tells it of the file's read and its close: none for a file that
 /// cannot be looked at, or when the open is not the guest's (`report`).

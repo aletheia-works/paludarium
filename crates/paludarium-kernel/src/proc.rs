@@ -581,7 +581,6 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
     // Each group, then a space Linux has always written after them.
     let groups: Vec<String> = c.groups.iter().map(|&g| gid(g).to_string()).collect();
     let groups = groups.join(" ");
-    let bounding = crate::credentials::ALL_CAPABILITIES;
     // Each ID as the PID namespace of /proc, the first, numbers it, then each
     // namespace below it down to the task's own (`task_state`).
     let levels = s.space.levels();
@@ -609,7 +608,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
          FDSize:\t{fd_size}\nGroups:\t{groups} \n{numbers}{memory}Threads:\t{}\nSigQ:\t{}/{}\n\
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
          SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
-         CapEff:\t{:016x}\nCapBnd:\t{bounding:016x}\nCapAmb:\t{:016x}\n\
+         CapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n\
          NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n\
          voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         s.parent,
@@ -632,7 +631,8 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         c.inheritable,
         c.permitted,
         c.effective,
-        0,
+        c.bounding,
+        c.ambient,
         u8::from(s.no_new_privs),
         s.seccomp.0,
         s.seccomp.1,
@@ -1461,6 +1461,8 @@ mod tests {
                 groups: vec![5, 6],
                 effective: 0,
                 inheritable: 0x42,
+                bounding: 0xfff,
+                ambient: 0x2,
                 ..crate::credentials::Credentials::default()
             },
             reader: crate::users::first(),
@@ -1485,7 +1487,8 @@ mod tests {
             "CapInh:\t0000000000000042\n",
             "CapPrm:\t000001ffffffffff\n",
             "CapEff:\t0000000000000000\n",
-            "CapBnd:\t000001ffffffffff\n",
+            "CapBnd:\t0000000000000fff\n",
+            "CapAmb:\t0000000000000002\n",
             "NoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n",
         ] {
             assert!(text.contains(line), "{line:?} in {text}");

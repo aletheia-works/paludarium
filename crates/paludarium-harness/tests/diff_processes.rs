@@ -124,7 +124,7 @@ mod linux {
             let args = [mode.to_owned(), self_path.clone()];
             // The credentials, permissions, setuid, signal-permissions,
             // limit-permissions, peer-credentials, core-credentials,
-            // set-id-writes, socket-owners, capabilities and script-exec cases
+            // set-id-writes, socket-owners, capabilities, file-capabilities and script-exec cases
             // change IDs as root, pty-vhangup needs root's capabilities and
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
@@ -150,6 +150,7 @@ mod linux {
                     | "set-id-writes"
                     | "socket-owners"
                     | "capabilities"
+                    | "file-capabilities"
                     | "script-exec"
                     | "proc-maps"
                     | "dynamic-exec"
@@ -496,6 +497,7 @@ mod linux {
         processes_dynamic_exec => ("dynamic-exec","process"),
         processes_script_exec => ("script-exec","process"),
         processes_capabilities => ("capabilities","process"),
+        processes_file_capabilities => ("file-capabilities","process"),
         processes_set_id_writes => ("set-id-writes","process"),
         processes_socket_owners => ("socket-owners","process"),
         processes_peer_credentials => ("peer-credentials","process"),

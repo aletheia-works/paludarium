@@ -1,6 +1,6 @@
 //! A thread's credentials, as Linux's `struct cred`: the real, effective,
 //! saved and filesystem user and group IDs, the supplementary groups and
-//! the permitted and effective capabilities, with the `set*id` system calls
+//! the capability sets and securebits, with the `set*id` system calls
 //! that change them (`kernel/sys.c`) and the capability changes that follow
 //! (`cap_task_fix_setuid`). Like Linux's, they belong to a thread: a raw
 //! system call changes only the calling thread's, and the C library applies
@@ -15,6 +15,8 @@ const CAP_KILL: u64 = 1 << 5;
 const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
 const CAP_SETPCAP: u64 = 1 << 8;
+/// `CAP_LAST_CAP`, the highest capability `prctl` takes.
+const CAP_LAST_CAP: u64 = 40;
 const CAP_SYS_RAWIO: u64 = 1 << 17;
 const CAP_SYS_CHROOT: u64 = 1 << 18;
 pub(crate) const CAP_SYS_PTRACE: u64 = 1 << 19;
@@ -41,6 +43,28 @@ const UNCHANGED: u32 = u32::MAX;
 const CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+/// The securebits (`include/uapi/linux/securebits.h`): each bit, then the
+/// lock above it that keeps it as it is.
+const SECBIT_NOROOT: u32 = 1 << 0;
+const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
+const SECBIT_KEEP_CAPS: u32 = 1 << 4;
+const SECBIT_KEEP_CAPS_LOCKED: u32 = 1 << 5;
+const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
+/// `SECURE_ALL_BITS` (with `SECBIT_EXEC_RESTRICT_FILE` and
+/// `SECBIT_EXEC_DENY_INTERACTIVE`, which only user space acts on), and
+/// `SECURE_ALL_LOCKS`.
+const SECURE_ALL_BITS: u64 = 0x555;
+const SECURE_ALL_LOCKS: u64 = SECURE_ALL_BITS << 1;
+/// `SECURE_ALL_UNPRIVILEGED`: the bits a thread without CAP_SETPCAP may
+/// change, the two of exec's checks in user space.
+const SECURE_ALL_UNPRIVILEGED: u64 = 0x500;
+/// The revisions of file capabilities (`VFS_CAP_REVISION_*`), the mask of
+/// their magic that names one, and its effective flag.
+const VFS_CAP_REVISION_MASK: u32 = 0xff00_0000;
+const VFS_CAP_REVISION_1: u32 = 0x0100_0000;
+const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
+const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
+const VFS_CAP_FLAGS_EFFECTIVE: u32 = 1;
 
 /// What acting on another thread looks at in credentials, which another
 /// process can read ([`crate::ThreadGroup::task_ids`]).
@@ -132,9 +156,17 @@ pub struct Credentials {
     /// What a program may take from a file's inheritable capabilities. Set
     /// only by `capset`, and kept by `set*id` and exec.
     pub inheritable: u64,
-    /// `PR_SET_KEEPCAPS` (`SECBIT_KEEP_CAPS`): leaving root keeps the
-    /// permitted capabilities. Cleared by exec.
-    pub keep_caps: bool,
+    /// The bounding set, which limits what exec takes from a file's
+    /// permitted capabilities and what `capset` may add to the inheritable
+    /// set; `PR_CAPBSET_DROP` lowers it, and nothing raises it.
+    pub bounding: u64,
+    /// The ambient set, always within the permitted and inheritable ones
+    /// (`PR_CAP_AMBIENT`), which exec of a program without file
+    /// capabilities or set-ID bits keeps as permitted and effective.
+    pub ambient: u64,
+    /// The securebits (`PR_SET_SECUREBITS`; `PR_SET_KEEPCAPS` sets
+    /// `SECBIT_KEEP_CAPS`, which exec clears).
+    pub securebits: u32,
     /// The Landlock domain ([`crate::landlock`]), which exec keeps.
     pub landlock: crate::landlock::Landlock,
     /// The last `LANDLOCK_RESTRICT_SELF_TSYNC` of its process this thread has
@@ -162,7 +194,9 @@ impl Default for Credentials {
             permitted: ALL_CAPABILITIES,
             effective: ALL_CAPABILITIES,
             inheritable: 0,
-            keep_caps: false,
+            bounding: ALL_CAPABILITIES,
+            ambient: 0,
+            securebits: 0,
             landlock: crate::landlock::Landlock::default(),
             landlock_sync: 0,
             user: crate::users::UserNs::default(),
@@ -188,9 +222,10 @@ impl Credentials {
     }
     /// `capset`, as Linux's `cap_capset`: a new inheritable set within the
     /// old inheritable and permitted ones unless the thread has CAP_SETPCAP,
+    /// and within the old inheritable and bounding ones whatever it has,
     /// permitted within the old permitted, and effective within the new
-    /// permitted (EPERM). The bounding set holds every capability, so it
-    /// refuses nothing.
+    /// permitted (EPERM). The ambient set keeps only what is still both
+    /// permitted and inheritable.
     pub(crate) fn capset(
         &self,
         effective: u64,
@@ -199,6 +234,7 @@ impl Credentials {
     ) -> Result<Self, Errno> {
         let capped = self.effective & CAP_SETPCAP == 0;
         if (capped && inheritable & !(self.inheritable | self.permitted) != 0)
+            || inheritable & !(self.inheritable | self.bounding) != 0
             || permitted & !self.permitted != 0
             || effective & !permitted != 0
         {
@@ -208,8 +244,28 @@ impl Credentials {
             effective,
             permitted,
             inheritable,
+            ambient: self.ambient & permitted & inheritable,
             ..self.clone()
         })
+    }
+    /// The credentials a thread takes in user namespace `user`, which it
+    /// made or entered (`set_cred_user_ns`): every capability there,
+    /// permitted, effective and bounding, none inheritable or ambient, and
+    /// no securebits.
+    pub(crate) fn in_user_namespace(&self, user: crate::users::UserNs) -> Self {
+        Self {
+            user,
+            permitted: ALL_CAPABILITIES,
+            effective: ALL_CAPABILITIES,
+            inheritable: 0,
+            bounding: ALL_CAPABILITIES,
+            ambient: 0,
+            securebits: 0,
+            ..self.clone()
+        }
+    }
+    fn secure(&self, bit: u32) -> bool {
+        self.securebits & bit != 0
     }
     /// Whether a task with these credentials may read the details of a task
     /// of another process with `target`'s, as Linux's `__ptrace_may_access`
@@ -392,6 +448,9 @@ impl Credentials {
         }
         let mut new = self.clone();
         new.fsuid = fsuid;
+        if self.secure(SECBIT_NO_SETUID_FIXUP) {
+            return Some(new);
+        }
         if self.is_root(self.fsuid) && !self.is_root(fsuid) {
             new.effective &= !FS_CAPABILITIES;
         }
@@ -401,14 +460,21 @@ impl Credentials {
         Some(new)
     }
     /// The capabilities after a change of user IDs from `old`, as Linux's
-    /// `cap_emulate_setxuid`: leaving root in all three IDs drops them (but
-    /// for `keep_caps`, the permitted ones), an effective ID leaving root
+    /// `cap_emulate_setxuid`, unless `SECBIT_NO_SETUID_FIXUP`: leaving root
+    /// in all three IDs drops them (but for `SECBIT_KEEP_CAPS`, the
+    /// permitted ones) and the ambient ones, an effective ID leaving root
     /// drops the effective ones, and one coming back to it raises them.
     fn fix_setuid(mut self, old: &Self) -> Self {
+        if old.secure(SECBIT_NO_SETUID_FIXUP) {
+            return self;
+        }
         let root = |c: &Self| c.is_root(c.uid) || c.is_root(c.euid) || c.is_root(c.suid);
-        if root(old) && !root(&self) && !self.keep_caps {
-            self.permitted = 0;
-            self.effective = 0;
+        if root(old) && !root(&self) {
+            if !old.secure(SECBIT_KEEP_CAPS) {
+                self.permitted = 0;
+                self.effective = 0;
+            }
+            self.ambient = 0;
         }
         if old.is_root(old.euid) && !self.is_root(self.euid) {
             self.effective = 0;
@@ -517,25 +583,38 @@ impl Credentials {
     }
 
     /// The credentials a program runs with after exec from `program`, as
-    /// Linux's `bprm_fill_uid` and `cap_bprm_creds_from_file` give them
-    /// without file capabilities: a set-user-ID program's owner becomes the
-    /// effective user ID, and a set-group-ID one's group (when the group
-    /// may execute it) the effective group ID, unless `no_new_privs`; root
-    /// (by its real or effective ID) gets every permitted capability and,
-    /// by its effective ID, every effective one, anyone else none. With
-    /// `no_new_privs`, an exec that would change the effective user ID, give
-    /// an effective group ID the thread is not in (by its filesystem or a
-    /// supplementary group) or gain capabilities instead takes the real IDs
-    /// as effective and keeps no more capabilities than it had. The saved
-    /// and filesystem IDs take the effective ones, and `keep_caps` is
-    /// cleared. Also returns whether the exec is secure (`AT_SECURE`): it
-    /// changes the effective IDs, they differ from the real ones before it,
-    /// or a user other than root keeps capabilities.
+    /// Linux's `bprm_fill_uid` and `cap_bprm_creds_from_file` give them, with
+    /// `capabilities` the value of its `security.capability` attribute:
+    /// - **IDs:** a set-user-ID program's owner becomes the effective user
+    ///   ID, and a set-group-ID one's group (when the group may execute it)
+    ///   the effective group ID, unless `no_new_privs`.
+    /// - **Permitted:** the file's permitted capabilities within the bounding
+    ///   set, and its inheritable ones within the thread's
+    ///   ([`Self::file_capabilities`]). Unless `SECBIT_NOROOT`, root (by its
+    ///   real or effective ID) gets the bounding and inheritable sets instead,
+    ///   but not a set-user-ID root program with file capabilities that
+    ///   another user runs. A program whose effective flag is set and that
+    ///   would not get all its permitted capabilities is `EPERM`.
+    /// - **`no_new_privs`:** an exec that would change the effective user ID,
+    ///   give an effective group ID the thread is not in (by its filesystem
+    ///   or a supplementary group) or gain capabilities instead takes the real
+    ///   IDs as effective and keeps no more capabilities than it had.
+    /// - **Ambient:** file capabilities or such a change of IDs clear the
+    ///   ambient set; what stays of it is permitted too.
+    /// - **Effective:** every permitted capability with the file's effective
+    ///   flag, or for root by its effective ID; otherwise the ambient set.
+    ///
+    /// The saved and filesystem IDs take the effective ones, and
+    /// `SECBIT_KEEP_CAPS` is cleared. Also returns whether the exec is secure
+    /// (`AT_SECURE`): it changes the effective IDs, they differ from the real
+    /// ones before it, or a user other than root takes an effective flag or
+    /// permitted capabilities beyond the ambient ones.
     pub(crate) fn after_exec(
         &self,
         program: Option<&FileStat>,
+        capabilities: Option<&[u8]>,
         no_new_privs: bool,
-    ) -> (Self, bool) {
+    ) -> Result<(Self, bool), Errno> {
         let mut new = self.clone();
         // A program whose owner or group the user namespace does not map
         // changes no ID (`bprm_fill_uid`).
@@ -556,13 +635,28 @@ impl Credentials {
                 new.egid = program.gid;
             }
         }
-        new.keep_caps = false;
-        new.permitted = if new.is_root(new.uid) || new.is_root(new.euid) {
-            ALL_CAPABILITIES
-        } else {
-            0
+        // `get_file_caps`.
+        let file = match capabilities {
+            Some(value) => self.file_capabilities(value)?,
+            None => None,
         };
-        let effective = new.is_root(new.euid);
+        let mut effective = false;
+        new.permitted = 0;
+        if let Some(file) = &file {
+            effective = file.effective;
+            new.permitted = self.bounding & file.permitted | self.inheritable & file.inheritable;
+            if effective && file.permitted & !new.permitted != 0 {
+                return Err(Errno::EPERM);
+            }
+        }
+        // `handle_privileged_root`.
+        let set_user_id_root = new.is_root(new.euid) && !new.is_root(new.uid);
+        if !self.secure(SECBIT_NOROOT) && !(file.is_some() && set_user_id_root) {
+            if new.is_root(new.uid) || new.is_root(new.euid) {
+                new.permitted = self.bounding | self.inheritable;
+            }
+            effective |= new.is_root(new.euid);
+        }
         let changed =
             new.euid != self.euid || (new.egid != self.fsgid && !self.groups.contains(&new.egid));
         if no_new_privs && (changed || new.permitted & !self.permitted != 0) {
@@ -570,17 +664,162 @@ impl Credentials {
             new.egid = new.gid;
             new.permitted &= self.permitted;
         }
-        new.effective = if effective { new.permitted } else { 0 };
         new.suid = new.euid;
         new.fsuid = new.euid;
         new.sgid = new.egid;
         new.fsgid = new.egid;
+        if file.is_some() || changed {
+            new.ambient = 0;
+        }
+        new.permitted |= new.ambient;
+        new.effective = if effective {
+            new.permitted
+        } else {
+            new.ambient
+        };
+        new.securebits &= !SECBIT_KEEP_CAPS;
         let secure = changed
             || new.euid != self.uid
             || new.egid != self.gid
-            || (!new.is_root(new.uid) && (effective || new.permitted != 0));
-        (new, secure)
+            || (!new.is_root(new.uid) && (effective || new.permitted & !new.ambient != 0));
+        Ok((new, secure))
     }
+
+    /// The file capabilities of `value`, a `security.capability` attribute,
+    /// as Linux's `get_vfs_caps_from_disk` reads them for exec: a revision
+    /// 1 (12 bytes), 2 (20 bytes) or 3 (24 bytes) value, or `EINVAL`. They
+    /// count only when the root they name (a revision 3 one's own, or root
+    /// of the first namespace) is root in the thread's user namespace or one
+    /// it is nested in.
+    fn file_capabilities(&self, value: &[u8]) -> Result<Option<FileCapabilities>, Errno> {
+        let word = |at: usize| {
+            u32::from_le_bytes([value[at], value[at + 1], value[at + 2], value[at + 3]])
+        };
+        if value.len() < 4 {
+            return Err(Errno::EINVAL);
+        }
+        let magic = word(0);
+        let revision = magic & VFS_CAP_REVISION_MASK;
+        let size = match revision {
+            VFS_CAP_REVISION_1 => 12,
+            VFS_CAP_REVISION_2 => 20,
+            VFS_CAP_REVISION_3 => 24,
+            _ => return Err(Errno::EINVAL),
+        };
+        if value.len() != size {
+            return Err(Errno::EINVAL);
+        }
+        let root = if revision == VFS_CAP_REVISION_3 {
+            word(20)
+        } else {
+            0
+        };
+        // -1 names no user (`make_kuid`).
+        if root == UNCHANGED || !self.user.root_here_or_above(root) {
+            return Ok(None);
+        }
+        let (mut permitted, mut inheritable) = (u64::from(word(4)), u64::from(word(8)));
+        if revision != VFS_CAP_REVISION_1 {
+            permitted |= u64::from(word(12)) << 32;
+            inheritable |= u64::from(word(16)) << 32;
+        }
+        Ok(Some(FileCapabilities {
+            permitted: permitted & ALL_CAPABILITIES,
+            inheritable: inheritable & ALL_CAPABILITIES,
+            effective: magic & VFS_CAP_FLAGS_EFFECTIVE != 0,
+        }))
+    }
+
+    /// The `prctl` options of the capability module (`cap_task_prctl`),
+    /// which change only the calling thread's credentials, or `None` for
+    /// another option:
+    /// - `PR_GET_KEEPCAPS` and `PR_SET_KEEPCAPS` (0 or 1, `EINVAL`; `EPERM`
+    ///   once `SECBIT_KEEP_CAPS_LOCKED` is set);
+    /// - `PR_CAPBSET_READ` and `PR_CAPBSET_DROP` (`EPERM` without
+    ///   CAP_SETPCAP, then `EINVAL` past `CAP_LAST_CAP`);
+    /// - `PR_GET_SECUREBITS` and `PR_SET_SECUREBITS`, which changes no
+    ///   locked bit, unlocks nothing and sets no unknown bit, and without
+    ///   CAP_SETPCAP must change something and only the bits user space acts
+    ///   on (`EPERM`);
+    /// - `PR_CAP_AMBIENT`'s `IS_SET`, `RAISE` (of a capability both
+    ///   permitted and inheritable, unless `SECBIT_NO_CAP_AMBIENT_RAISE`:
+    ///   `EPERM`), `LOWER` and `CLEAR_ALL`, whose unused arguments must be
+    ///   0 (`EINVAL`).
+    pub(crate) fn prctl(&mut self, a: [u64; 6]) -> Option<Result<u64, Errno>> {
+        let [option, arg2, arg3, arg4, arg5, _] = a;
+        let setpcap = self.effective & CAP_SETPCAP != 0;
+        let valid = |cap: u64| cap <= CAP_LAST_CAP;
+        Some(match option {
+            // PR_GET_KEEPCAPS, PR_SET_KEEPCAPS
+            7 => Ok(u64::from(self.secure(SECBIT_KEEP_CAPS))),
+            8 if arg2 > 1 => Err(Errno::EINVAL),
+            8 if self.secure(SECBIT_KEEP_CAPS_LOCKED) => Err(Errno::EPERM),
+            8 => {
+                self.securebits = self.securebits & !SECBIT_KEEP_CAPS
+                    | if arg2 == 1 { SECBIT_KEEP_CAPS } else { 0 };
+                Ok(0)
+            }
+            // PR_CAPBSET_READ, PR_CAPBSET_DROP
+            23 if !valid(arg2) => Err(Errno::EINVAL),
+            23 => Ok(self.bounding >> arg2 & 1),
+            24 if !setpcap => Err(Errno::EPERM),
+            24 if !valid(arg2) => Err(Errno::EINVAL),
+            24 => {
+                self.bounding &= !(1 << arg2);
+                Ok(0)
+            }
+            // PR_GET_SECUREBITS, PR_SET_SECUREBITS
+            27 => Ok(u64::from(self.securebits)),
+            28 => {
+                let old = u64::from(self.securebits);
+                let changed = old ^ arg2;
+                if (old & SECURE_ALL_LOCKS) >> 1 & changed != 0
+                    || old & SECURE_ALL_LOCKS & !arg2 != 0
+                    || arg2 & !(SECURE_ALL_LOCKS | SECURE_ALL_BITS) != 0
+                    || (!setpcap
+                        && (changed == 0
+                            || changed & !(SECURE_ALL_UNPRIVILEGED | SECURE_ALL_UNPRIVILEGED << 1)
+                                != 0))
+                {
+                    return Some(Err(Errno::EPERM));
+                }
+                self.securebits = arg2 as u32;
+                Ok(0)
+            }
+            // PR_CAP_AMBIENT: IS_SET (1), RAISE (2), LOWER (3), CLEAR_ALL (4)
+            47 if arg2 == 4 && arg3 | arg4 | arg5 != 0 => Err(Errno::EINVAL),
+            47 if arg2 == 4 => {
+                self.ambient = 0;
+                Ok(0)
+            }
+            47 if !valid(arg3) || arg4 | arg5 != 0 => Err(Errno::EINVAL),
+            47 if arg2 == 1 => Ok(self.ambient >> arg3 & 1),
+            47 if arg2 == 2 => {
+                let cap = 1 << arg3;
+                if self.permitted & cap == 0
+                    || self.inheritable & cap == 0
+                    || self.secure(SECBIT_NO_CAP_AMBIENT_RAISE)
+                {
+                    return Some(Err(Errno::EPERM));
+                }
+                self.ambient |= cap;
+                Ok(0)
+            }
+            47 if arg2 == 3 => {
+                self.ambient &= !(1 << arg3);
+                Ok(0)
+            }
+            47 => Err(Errno::EINVAL),
+            _ => return None,
+        })
+    }
+}
+
+/// What a program's file capabilities give (`struct cpu_vfs_cap_data`).
+struct FileCapabilities {
+    permitted: u64,
+    inheritable: u64,
+    effective: bool,
 }
 
 fn id(value: u64) -> u32 {
@@ -979,8 +1218,11 @@ mod credentials_tests {
             .unwrap();
         let user = root.setresuid(2000, 2000, 2000).unwrap();
         assert_eq!((user.inheritable, user.permitted), (0x42, 0));
-        assert_eq!(root.after_exec(None, false).0.inheritable, 0x42);
-        assert_eq!(user.after_exec(None, false).0.permitted, 0);
+        assert_eq!(
+            root.after_exec(None, None, false).unwrap().0.inheritable,
+            0x42
+        );
+        assert_eq!(user.after_exec(None, None, false).unwrap().0.permitted, 0);
     }
     #[test]
     fn scm_credentials_name_the_callers_own_ids_without_capabilities() {
@@ -1109,13 +1351,13 @@ mod credentials_tests {
     #[test]
     fn keep_caps_keeps_the_permitted_capabilities() {
         let root = Credentials {
-            keep_caps: true,
+            securebits: SECBIT_KEEP_CAPS,
             ..Credentials::default()
         };
         let user = root.setresuid(1000, 1000, 1000).unwrap();
         assert_eq!((user.permitted, user.effective), (ALL_CAPABILITIES, 0));
-        let (exec, secure) = user.after_exec(None, false);
-        assert_eq!((exec.permitted, exec.keep_caps, secure), (0, false, false));
+        let (exec, secure) = user.after_exec(None, None, false).unwrap();
+        assert_eq!((exec.permitted, exec.securebits, secure), (0, 0, false));
     }
 
     #[test]
@@ -1133,10 +1375,14 @@ mod credentials_tests {
     fn exec_takes_the_effective_ids_as_saved_and_reports_a_secure_exec() {
         let root = Credentials::default();
         let user = root.setresuid(1000, 1001, 1002).unwrap();
-        let (exec, secure) = user.after_exec(None, false);
+        let (exec, secure) = user.after_exec(None, None, false).unwrap();
         assert_eq!(ids(&exec), [1000, 1001, 1001, 1001]);
         assert!(secure);
-        let (exec, secure) = root.setresuid(1000, 0, 0).unwrap().after_exec(None, false);
+        let (exec, secure) = root
+            .setresuid(1000, 0, 0)
+            .unwrap()
+            .after_exec(None, None, false)
+            .unwrap();
         assert_eq!(
             (exec.permitted, exec.effective, secure),
             (ALL_CAPABILITIES, ALL_CAPABILITIES, true)
@@ -1158,47 +1404,65 @@ mod credentials_tests {
             .setresgid(2000, 2000, 2000)
             .and_then(|c| c.setresuid(1000, 1000, 1000))
             .unwrap();
-        let (exec, secure) = user.after_exec(Some(&program(0o4755, 1001, 0)), false);
+        let (exec, secure) = user
+            .after_exec(Some(&program(0o4755, 1001, 0)), None, false)
+            .unwrap();
         assert_eq!(ids(&exec), [1000, 1001, 1001, 1001]);
         assert_eq!((exec.permitted, secure), (0, true));
-        let (exec, secure) = user.after_exec(Some(&program(0o2755, 0, 3000)), false);
+        let (exec, secure) = user
+            .after_exec(Some(&program(0o2755, 0, 3000)), None, false)
+            .unwrap();
         assert_eq!(
             [exec.gid, exec.egid, exec.sgid, exec.fsgid],
             [2000, 3000, 3000, 3000]
         );
         assert!(secure);
         // Without the group's execute bit, set-group-ID means locking.
-        let (exec, secure) = user.after_exec(Some(&program(0o2745, 0, 3000)), false);
+        let (exec, secure) = user
+            .after_exec(Some(&program(0o2745, 0, 3000)), None, false)
+            .unwrap();
         assert_eq!((exec.egid, secure), (2000, false));
         // A set-user-ID root program gives every capability.
-        let (exec, secure) = user.after_exec(Some(&program(0o4755, 0, 0)), false);
+        let (exec, secure) = user
+            .after_exec(Some(&program(0o4755, 0, 0)), None, false)
+            .unwrap();
         assert_eq!(ids(&exec), [1000, 0, 0, 0]);
         assert_eq!(
             (exec.permitted, exec.effective, secure),
             (ALL_CAPABILITIES, ALL_CAPABILITIES, true)
         );
         // The program's own owner gains nothing.
-        let (exec, secure) = user.after_exec(Some(&program(0o4755, 1000, 0)), false);
+        let (exec, secure) = user
+            .after_exec(Some(&program(0o4755, 1000, 0)), None, false)
+            .unwrap();
         assert_eq!((ids(&exec), secure), ([1000; 4], false));
         // Going back to the real ID changes the effective one: secure.
         let away = Credentials::default().setresuid(1000, 1001, 1001).unwrap();
-        let (exec, secure) = away.after_exec(Some(&program(0o4755, 1000, 0)), false);
+        let (exec, secure) = away
+            .after_exec(Some(&program(0o4755, 1000, 0)), None, false)
+            .unwrap();
         assert_eq!((ids(&exec), secure), ([1000; 4], true));
     }
 
     #[test]
     fn no_new_privs_ignores_set_id_bits_and_keeps_the_effective_ids() {
         let user = Credentials::default().setresuid(1000, 1000, 1000).unwrap();
-        let (exec, secure) = user.after_exec(Some(&program(0o6755, 0, 3000)), true);
+        let (exec, secure) = user
+            .after_exec(Some(&program(0o6755, 0, 3000)), None, true)
+            .unwrap();
         assert_eq!((ids(&exec), exec.egid, secure), ([1000; 4], 0, false));
         // Effective IDs other than the real ones stay, and the exec counts
         // as secure.
         let root = Credentials::default();
         let away = root.setresuid(1000, 1001, 1001).unwrap();
-        let (exec, secure) = away.after_exec(None, true);
+        let (exec, secure) = away.after_exec(None, None, true).unwrap();
         assert_eq!((ids(&exec), secure), ([1000, 1001, 1001, 1001], true));
         // Root by its effective ID keeps its capabilities.
-        let (exec, secure) = root.setresuid(1000, 0, 0).unwrap().after_exec(None, true);
+        let (exec, secure) = root
+            .setresuid(1000, 0, 0)
+            .unwrap()
+            .after_exec(None, None, true)
+            .unwrap();
         assert_eq!(ids(&exec), [1000, 0, 0, 0]);
         assert_eq!(
             (exec.permitted, exec.effective, secure),
@@ -1211,10 +1475,313 @@ mod credentials_tests {
             .unwrap()
             .setresuid(1000, 1001, 1001)
             .unwrap();
-        let (exec, secure) = elsewhere.after_exec(None, true);
+        let (exec, secure) = elsewhere.after_exec(None, None, true).unwrap();
         assert_eq!(
             (ids(&exec), exec.egid, exec.fsgid, secure),
             ([1000; 4], 0, 0, true)
+        );
+    }
+
+    /// A `security.capability` value of `revision` (1 to 3), with the
+    /// effective flag when `effective`, and a revision 3 one's `root`.
+    fn file_caps(
+        revision: u32,
+        effective: bool,
+        permitted: u64,
+        inheritable: u64,
+        root: u32,
+    ) -> Vec<u8> {
+        let mut v = (revision << 24 | u32::from(effective))
+            .to_le_bytes()
+            .to_vec();
+        v.extend_from_slice(&(permitted as u32).to_le_bytes());
+        v.extend_from_slice(&(inheritable as u32).to_le_bytes());
+        if revision > 1 {
+            v.extend_from_slice(&((permitted >> 32) as u32).to_le_bytes());
+            v.extend_from_slice(&((inheritable >> 32) as u32).to_le_bytes());
+        }
+        if revision == 3 {
+            v.extend_from_slice(&root.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn exec_takes_file_capabilities_within_the_bounding_and_inheritable_sets() {
+        let user = Credentials::default()
+            .capset(ALL_CAPABILITIES, ALL_CAPABILITIES, 0x30)
+            .and_then(|c| c.setresuid(1000, 1000, 1000))
+            .unwrap();
+        let none = program(0o755, 0, 0);
+        let exec = |c: &Credentials, value: &[u8]| c.after_exec(Some(&none), Some(value), false);
+        // Permitted ones within the bounding set, inheritable ones within
+        // the thread's, effective only with the flag; and the exec is
+        // secure, as a user other than root gains them.
+        let mut bounded = user.clone();
+        bounded.bounding = ALL_CAPABILITIES & !0x2;
+        let (new, secure) = exec(&bounded, &file_caps(2, false, 0x3, 0x10 | 0x40, 0)).unwrap();
+        assert_eq!((new.permitted, new.effective, secure), (0x11, 0, true));
+        let (new, secure) = exec(&user, &file_caps(2, true, 1 << 40, 0, 0)).unwrap();
+        assert_eq!(
+            (new.permitted, new.effective, secure),
+            (1 << 40, 1 << 40, true)
+        );
+        // With the effective flag, a permitted capability the bounding set
+        // holds back refuses the exec; without it, the program runs with
+        // less.
+        assert_eq!(
+            exec(&bounded, &file_caps(2, true, 0x3, 0, 0)),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            exec(&bounded, &file_caps(2, false, 0x3, 0, 0))
+                .unwrap()
+                .0
+                .permitted,
+            0x1
+        );
+        // A revision 1 value has the low word alone, a revision 3 one
+        // counts when its root is root here, and the bits past the last
+        // capability go.
+        let (new, _) = exec(&user, &file_caps(1, true, 0x5, 0, 0)).unwrap();
+        assert_eq!(new.permitted, 0x5);
+        let (new, _) = exec(&user, &file_caps(3, true, 0x5, 0, 0)).unwrap();
+        assert_eq!(new.permitted, 0x5);
+        let (new, secure) = exec(&user, &file_caps(3, true, 0x5, 0, 1000)).unwrap();
+        assert_eq!((new.permitted, secure), (0, false));
+        assert_eq!(
+            exec(&user, &file_caps(3, true, 0x5, 0, u32::MAX))
+                .unwrap()
+                .0
+                .permitted,
+            0
+        );
+        assert_eq!(
+            exec(&user, &file_caps(2, false, u64::MAX, 0, 0))
+                .unwrap()
+                .0
+                .permitted,
+            ALL_CAPABILITIES
+        );
+        // A value of no known revision or of the wrong size refuses it.
+        for bad in [
+            Vec::new(),
+            vec![0; 3],
+            file_caps(4, false, 1, 0, 0),
+            file_caps(2, false, 1, 0, 0)[..12].to_vec(),
+            file_caps(3, false, 1, 0, 0)[..20].to_vec(),
+            [file_caps(1, false, 1, 0, 0), vec![0]].concat(),
+        ] {
+            assert_eq!(exec(&user, &bad), Err(Errno::EINVAL), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn root_takes_the_bounding_and_inheritable_sets_unless_noroot() {
+        let mut root = Credentials::default()
+            .capset(ALL_CAPABILITIES, ALL_CAPABILITIES, 0x3)
+            .unwrap();
+        root.bounding = 0xf0;
+        let (new, secure) = root.after_exec(None, None, false).unwrap();
+        assert_eq!((new.permitted, new.effective, secure), (0xf3, 0xf3, false));
+        // File capabilities do not lessen root's.
+        let caps = file_caps(2, false, 0x100, 0, 0);
+        let (new, _) = root.after_exec(None, Some(&caps), false).unwrap();
+        assert_eq!((new.permitted, new.effective), (0xf3, 0xf3));
+        // A set-user-ID root program with file capabilities that another
+        // user runs gives only those.
+        let user = root.setresuid(1000, 1000, 1000).unwrap();
+        let caps = file_caps(2, false, 0x30, 0, 0);
+        let (new, secure) = user
+            .after_exec(Some(&program(0o4755, 0, 0)), Some(&caps), false)
+            .unwrap();
+        assert_eq!(
+            (new.euid, new.permitted, new.effective, secure),
+            (0, 0x30, 0, true)
+        );
+        // SECBIT_NOROOT: root is no one special.
+        root.securebits = SECBIT_NOROOT;
+        let (new, secure) = root.after_exec(None, None, false).unwrap();
+        assert_eq!((new.permitted, new.effective, secure), (0, 0, false));
+        let caps = file_caps(2, true, 0x10, 0, 0);
+        let (new, _) = root.after_exec(None, Some(&caps), false).unwrap();
+        assert_eq!((new.permitted, new.effective), (0x10, 0x10));
+    }
+
+    #[test]
+    fn the_ambient_set_lasts_through_exec_without_file_capabilities_or_set_ids() {
+        let mut user = Credentials::default()
+            .capset(ALL_CAPABILITIES, ALL_CAPABILITIES, 0x6)
+            .unwrap();
+        user.securebits = SECBIT_KEEP_CAPS;
+        let mut user = user.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(user.prctl([47, 2, 1, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(user.prctl([47, 2, 2, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(user.ambient, 0x6);
+        let (new, secure) = user.after_exec(None, None, false).unwrap();
+        assert_eq!(
+            (new.permitted, new.effective, new.ambient, secure),
+            (0x6, 0x6, 0x6, false)
+        );
+        // File capabilities clear it.
+        let caps = file_caps(2, false, 0x1, 0, 0);
+        let (new, _) = user.after_exec(None, Some(&caps), false).unwrap();
+        assert_eq!((new.permitted, new.effective, new.ambient), (0x1, 0, 0));
+        // So does a set-user-ID program, but not one that changes nothing.
+        let (new, _) = user
+            .after_exec(Some(&program(0o4755, 1001, 0)), None, false)
+            .unwrap();
+        assert_eq!((new.permitted, new.ambient), (0, 0));
+        let (new, _) = user
+            .after_exec(Some(&program(0o4755, 1000, 0)), None, false)
+            .unwrap();
+        assert_eq!(new.ambient, 0x6);
+        // capset keeps it within the new permitted and inheritable sets,
+        // and leaving root clears it.
+        let less = user.capset(0, 0x2 | 0x4, 0x2).unwrap();
+        assert_eq!(less.ambient, 0x2);
+        let mut root = Credentials::default()
+            .capset(ALL_CAPABILITIES, ALL_CAPABILITIES, 0x2)
+            .unwrap();
+        root.securebits = SECBIT_KEEP_CAPS;
+        assert_eq!(root.prctl([47, 2, 1, 0, 0, 0]), Some(Ok(0)));
+        let left = root.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!((left.permitted, left.ambient), (ALL_CAPABILITIES, 0));
+    }
+
+    #[test]
+    fn prctl_reads_and_drops_the_bounding_set() {
+        let mut root = Credentials::default();
+        assert_eq!(root.prctl([23, 40, 0, 0, 0, 0]), Some(Ok(1)));
+        assert_eq!(root.prctl([23, 41, 0, 0, 0, 0]), Some(Err(Errno::EINVAL)));
+        assert_eq!(root.prctl([24, 41, 0, 0, 0, 0]), Some(Err(Errno::EINVAL)));
+        assert_eq!(root.prctl([24, 7, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(root.prctl([23, 7, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(root.bounding, ALL_CAPABILITIES & !CAP_SETUID);
+        // A dropped capability cannot be made inheritable, even with
+        // CAP_SETPCAP, but one inheritable already stays.
+        assert_eq!(
+            root.capset(ALL_CAPABILITIES, ALL_CAPABILITIES, CAP_SETUID),
+            Err(Errno::EPERM)
+        );
+        // Without CAP_SETPCAP, EPERM comes first.
+        let mut user = root.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(user.prctl([24, 41, 0, 0, 0, 0]), Some(Err(Errno::EPERM)));
+        assert_eq!(user.prctl([23, 0, 0, 0, 0, 0]), Some(Ok(1)));
+        assert_eq!(user.prctl([99, 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn prctl_raises_the_ambient_set_only_within_permitted_and_inheritable() {
+        let mut c = Credentials::default()
+            .capset(ALL_CAPABILITIES, ALL_CAPABILITIES, 0x1)
+            .unwrap();
+        assert_eq!(c.prctl([47, 2, 2, 0, 0, 0]), Some(Err(Errno::EPERM)));
+        assert_eq!(c.prctl([47, 2, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(c.prctl([47, 1, 0, 0, 0, 0]), Some(Ok(1)));
+        assert_eq!(c.prctl([47, 1, 1, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(c.prctl([47, 3, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(c.ambient, 0);
+        // Unused arguments, a bad capability and an unknown operation.
+        assert_eq!(c.prctl([47, 4, 1, 0, 0, 0]), Some(Err(Errno::EINVAL)));
+        assert_eq!(c.prctl([47, 1, 41, 0, 0, 0]), Some(Err(Errno::EINVAL)));
+        assert_eq!(c.prctl([47, 1, 0, 0, 1, 0]), Some(Err(Errno::EINVAL)));
+        assert_eq!(c.prctl([47, 5, 0, 0, 0, 0]), Some(Err(Errno::EINVAL)));
+        assert_eq!(c.prctl([47, 0, 41, 0, 0, 0]), Some(Err(Errno::EINVAL)));
+        assert_eq!(c.prctl([47, 0, 0, 0, 0, 0]), Some(Err(Errno::EINVAL)));
+        c.prctl([47, 2, 0, 0, 0, 0]);
+        assert_eq!(c.prctl([47, 4, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(c.ambient, 0);
+        // SECBIT_NO_CAP_AMBIENT_RAISE refuses it.
+        c.securebits = SECBIT_NO_CAP_AMBIENT_RAISE;
+        assert_eq!(c.prctl([47, 2, 0, 0, 0, 0]), Some(Err(Errno::EPERM)));
+    }
+
+    #[test]
+    fn prctl_sets_securebits_within_their_locks() {
+        let mut root = Credentials::default();
+        assert_eq!(root.prctl([27, 0, 0, 0, 0, 0]), Some(Ok(0)));
+        // An unknown bit, then each bit and its lock.
+        assert_eq!(
+            root.prctl([28, 0x1000, 0, 0, 0, 0]),
+            Some(Err(Errno::EPERM))
+        );
+        assert_eq!(
+            root.prctl([28, 0, 0, 0, 0, 0]),
+            Some(Ok(0)),
+            "no change, with CAP_SETPCAP"
+        );
+        assert_eq!(root.prctl([28, 0x30, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(root.prctl([7, 0, 0, 0, 0, 0]), Some(Ok(1)));
+        assert_eq!(root.prctl([8, 0, 0, 0, 0, 0]), Some(Err(Errno::EPERM)));
+        assert_eq!(root.prctl([8, 2, 0, 0, 0, 0]), Some(Err(Errno::EINVAL)));
+        assert_eq!(
+            root.prctl([28, 0x20, 0, 0, 0, 0]),
+            Some(Err(Errno::EPERM)),
+            "a locked bit"
+        );
+        assert_eq!(
+            root.prctl([28, 0x10, 0, 0, 0, 0]),
+            Some(Err(Errno::EPERM)),
+            "a lock"
+        );
+        assert_eq!(root.prctl([28, 0x31, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(root.prctl([27, 0, 0, 0, 0, 0]), Some(Ok(0x31)));
+        // Exec clears SECBIT_KEEP_CAPS even when it is locked.
+        let (new, _) = root.after_exec(None, None, false).unwrap();
+        assert_eq!(new.securebits, 0x21);
+        // Without CAP_SETPCAP, only the bits user space acts on, and a change.
+        let mut user = Credentials::default().setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(user.prctl([28, 0, 0, 0, 0, 0]), Some(Err(Errno::EPERM)));
+        assert_eq!(user.prctl([28, 0x1, 0, 0, 0, 0]), Some(Err(Errno::EPERM)));
+        assert_eq!(user.prctl([28, 0x100, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(user.prctl([28, 0x300, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(user.prctl([28, 0x200, 0, 0, 0, 0]), Some(Err(Errno::EPERM)));
+        assert_eq!(user.prctl([8, 1, 0, 0, 0, 0]), Some(Ok(0)));
+        assert_eq!(user.securebits, 0x310);
+    }
+
+    #[test]
+    fn no_setuid_fixup_keeps_the_capabilities_through_set_id_calls() {
+        let root = Credentials {
+            securebits: SECBIT_NO_SETUID_FIXUP,
+            ..Credentials::default()
+        };
+        let user = root.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(
+            (user.permitted, user.effective),
+            (ALL_CAPABILITIES, ALL_CAPABILITIES)
+        );
+        assert_eq!(root.setfsuid(1000).unwrap().effective, ALL_CAPABILITIES);
+    }
+
+    #[test]
+    fn a_new_user_namespace_starts_with_full_sets_and_no_securebits() {
+        let c = Credentials {
+            bounding: 0x1,
+            ambient: 0x1,
+            inheritable: 0x1,
+            securebits: 0x31,
+            ..Credentials::default()
+        };
+        let new = c.in_user_namespace(crate::users::UserNs::default());
+        assert_eq!(
+            (
+                new.permitted,
+                new.effective,
+                new.inheritable,
+                new.bounding,
+                new.ambient,
+                new.securebits
+            ),
+            (
+                ALL_CAPABILITIES,
+                ALL_CAPABILITIES,
+                0,
+                ALL_CAPABILITIES,
+                0,
+                0
+            )
         );
     }
 

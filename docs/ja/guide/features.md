@@ -50,12 +50,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
-| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm` |
+| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm`、`syslog`、`sysfs` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
+| セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
+| プローブ | `uprobe`、`uretprobe` |
 | seccomp | `seccomp`（下に書きます） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
@@ -2135,6 +2137,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ポートを手放すことは受け、それ以上はポートへのアクセスをロックダウンしたカーネルと同じく
   `EPERM` を返します。`acct` は `CAP_SYS_PACCT` を求め（`EPERM`）、そのうえで、いつも
   切れているアカウンティングを切ることは受け、ファイルには `EPERM` を返します。
+- `syslog` が読むカーネルのログは空です。ログに書くものがないためです。Ubuntu の
+  `kernel.dmesg_restrict` が 1 であるのと同じく、どの操作にも `CAP_SYSLOG` が要ります
+  （`EPERM`）。そのあとは Linux の `do_syslog` と同じく、知らない操作と 1 から 8 の外の
+  コンソールのレベルは `EINVAL` です。読む操作には、バッファと負でない長さ（`EINVAL`）、
+  ユーザー空間の中のバッファ（`EFAULT`）が要ります。`SYSLOG_ACTION_READ` は来ることの
+  ないメッセージを、シグナルが来るまで待ちます（`ERESTARTSYS`）。ほかの読む操作は何も
+  写さず 0 を返します。バッファの大きさは 256 KiB（`CONFIG_LOG_BUF_SHIFT` が 18）で、
+  未読のものはありません。
+- `sysfs` はファイルシステムの種類に番号を付けます。種類は `tmpfs`、`proc`、`sockfs`、
+  `pipefs`、`devpts`、`ext4`、`mqueue` で、paludarium が渡すファイルの種類（ホストの
+  ファイルは `ext4`）を、Linux が登録する順に並べています。オプション 1 は名前の番号を、
+  2 は番号の名前を、3 は種類の数を返します。知らないオプション、名前、番号は `EINVAL`
+  で、`PATH_MAX` バイトのうちに終わらない名前も `EINVAL` です。
+- セキュリティモジュールは paludarium にあるもので、Ubuntu の設定で Linux が始める順に、
+  Lockdown（Ubuntu では early のモジュールで、paludarium はこれによってポートへの
+  アクセスを断ります）、capability モジュール、Landlock、Yama です。`lsm_list_modules` はこれを並べます
+  （バッファが小さければ、要る大きさを書いて `E2BIG`）。どれもタスクの属性を持たない
+  ので、`lsm_get_self_attr` と `lsm_set_self_attr` は、引数が Linux の確認をその順に
+  通ったあと `EOPNOTSUPP` を返します（大きさは 0 にします）。
+- uprobe が置かれることはないので、プローブのトランポリンもありません。そのため、
+  Linux でトランポリンの外から呼んだときと同じく、`uretprobe` は `SIGILL`（`SI_KERNEL`）
+  を送って -1 を返し、`uprobe` は `EPROTO` を返します。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。

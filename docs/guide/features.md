@@ -58,12 +58,14 @@ kernel.
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
-| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm` |
+| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
+| Security modules | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` |
+| Probes | `uprobe`, `uretprobe` |
 | seccomp | `seccomp` (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
@@ -2460,6 +2462,32 @@ kernel.
   for anything more, as a kernel locked down against port access does.
   `acct` needs `CAP_SYS_PACCT` (`EPERM`), and then turns accounting off,
   which is never on, or gives `EPERM` for a file.
+- `syslog` reads a kernel log that is empty, as nothing writes to it. As
+  with Ubuntu's `kernel.dmesg_restrict` of 1, every action needs
+  `CAP_SYSLOG` (`EPERM`). Then, as Linux's `do_syslog`, an unknown action
+  or a console level outside 1 to 8 is `EINVAL`; a read wants a buffer and a
+  length that is not negative (`EINVAL`), and a buffer in the user half
+  (`EFAULT`). `SYSLOG_ACTION_READ` waits for a message that never comes,
+  until a signal (`ERESTARTSYS`); the other reads copy nothing and give 0.
+  The buffer size is 256 KiB (`CONFIG_LOG_BUF_SHIFT` 18), and nothing is
+  unread.
+- `sysfs` numbers the file system types: `tmpfs`, `proc`, `sockfs`,
+  `pipefs`, `devpts`, `ext4` and `mqueue`, the types of the files paludarium
+  gives (a host file's as `ext4`), in the order Linux registers them. Option
+  1 gives a name's index, 2 copies an index's name and 3 gives the count; an
+  unknown option, name or index is `EINVAL`, and a name that does not end
+  within `PATH_MAX` bytes too.
+- The security modules are the ones paludarium has, in the order Linux
+  starts them with Ubuntu's configuration: Lockdown (an early module there,
+  whose port access paludarium refuses), the capability module, Landlock
+  and Yama, which
+  `lsm_list_modules` lists (`E2BIG` with the size they take for a smaller
+  buffer). None of them keeps an attribute of a task, so
+  `lsm_get_self_attr` and `lsm_set_self_attr` give `EOPNOTSUPP` (and a size
+  of 0) once their arguments pass Linux's checks, in its order.
+- No uprobe is ever set, so there is no probe trampoline: `uretprobe` forces
+  `SIGILL` (`SI_KERNEL`) and returns -1, and `uprobe` gives `EPROTO`, as
+  Linux does when they are called from anywhere else.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

@@ -282,6 +282,14 @@ verified.
     its name, where Linux opens the file (so a bad pointer gives `EFAULT`,
     a missing file `ENOENT` and one that is not regular `EACCES`) and writes
     a record as each process exits.
+  - The kernel log that `syslog` reads is always empty, where Linux's holds
+    its boot messages, and `kernel.dmesg_restrict` is always 1 (there is no
+    `/proc/sys/kernel/dmesg_restrict`, `/proc/kmsg` or `/dev/kmsg`).
+    `sysfs` knows only seven file system types, where Linux has dozens, so
+    their indexes differ from Linux's though not their order. There is no
+    AppArmor or SELinux: `lsm_list_modules` lists four modules, and
+    `lsm_get_self_attr` finds no attribute where Linux gives AppArmor's
+    context.
   - A file in `/proc` or `/dev` has the `st_dev` of the mount holding the
     path, so `ustat` of it gives that mount's counts, where Linux gives
     procfs's or devtmpfs's.

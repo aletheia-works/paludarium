@@ -9540,6 +9540,141 @@ static int page_nodes_case(void) {
     printf("worker=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
 }
+/* syslog, sysfs, the LSM calls and the probe calls, by a user without
+ * capabilities. */
+static volatile int ki_code = -1;
+static void ki_sigill(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    (void)context;
+    ki_code = info->si_code;
+}
+static int kernel_info_worker(void) {
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 90;
+    static char buf[256];
+    /* syslog(type, buf, len): kernel.dmesg_restrict refuses every action. */
+    for (long kind = -1; kind <= 11; kind++)
+        printf("syslog-%ld=%ld\n", kind, pn(syscall(103, kind, buf, 64L)));
+
+    /* sysfs(option, arg1, arg2) */
+    long count = pn(syscall(139, 3L, 0L, 0L));
+    printf("sysfs-count-positive=%d\n", count > 0);
+    const char *names[] = {"tmpfs", "proc", "sockfs", "pipefs", "devpts", "ext4", "mqueue"};
+    long last = -1;
+    for (int i = 0; i < 7; i++) {
+        long index = pn(syscall(139, 1L, names[i], 0L));
+        char name[64] = "";
+        long got = index >= 0 ? pn(syscall(139, 2L, index, name)) : index;
+        printf("sysfs-%s: found=%d after=%d round=%ld %s\n", names[i], index >= 0, index > last,
+               got, name);
+        if (index > last) last = index;
+    }
+    printf("sysfs-past-end=%ld\n", pn(syscall(139, 2L, count, buf)));
+    printf("sysfs-unknown=%ld\n", pn(syscall(139, 1L, "nosuchfs", 0L)));
+    printf("sysfs-name-fault=%ld\n", pn(syscall(139, 1L, 0L, 0L)));
+    printf("sysfs-buf-fault=%ld\n", pn(syscall(139, 2L, 0L, 0L)));
+    static char longname[4097];
+    memset(longname, 'x', 4096);
+    printf("sysfs-long=%ld\n", pn(syscall(139, 1L, longname, 0L)));
+    longname[4095] = 0;
+    printf("sysfs-longest=%ld\n", pn(syscall(139, 1L, longname, 0L)));
+    for (long option = -1; option <= 4; option += 5)
+        printf("sysfs-option-%ld=%ld\n", option, pn(syscall(139, option, 0L, 0L)));
+    printf("sysfs-option-0=%ld\n", pn(syscall(139, 0L, 0L, 0L)));
+
+    /* lsm_list_modules(ids, size, flags) */
+    unsigned long long ids[32];
+    unsigned size = 8;
+    printf("list-flags=%ld\n", pn(syscall(461, ids, &size, 1L)));
+    printf("list-size-fault=%ld\n", pn(syscall(461, ids, NULL, 0L)));
+    long r = pn(syscall(461, ids, &size, 0L));
+    printf("list-small=%ld size-words=%d at-least-4=%d\n", r, size % 8 == 0, size >= 32);
+    size = sizeof ids;
+    long n = pn(syscall(461, ids, &size, 0L));
+    int lockdown_first = n > 0 && ids[0] == 108, capability_next = n > 1 && ids[1] == 100;
+    int landlock = 0, yama = 0, known = 1;
+    for (long i = 0; i < n; i++) {
+        landlock |= ids[i] == 110;
+        yama |= ids[i] == 105;
+        known &= ids[i] >= 100 && ids[i] <= 113;
+    }
+    printf("list: size-matches=%d lockdown-first=%d capability-next=%d landlock=%d yama=%d "
+           "known=%d\n",
+           n > 0 && size == n * 8, lockdown_first, capability_next, landlock, yama, known);
+    size = sizeof ids;
+    printf("list-ids-fault=%ld\n", pn(syscall(461, NULL, &size, 0L)));
+
+    /* lsm_get_self_attr(attr, ctx, size, flags) */
+    unsigned long long ctx[64] = {0};
+    size = sizeof ctx;
+    printf("get-undef=%ld\n", pn(syscall(459, 0L, ctx, &size, 0L)));
+    printf("get-no-size=%ld\n", pn(syscall(459, 100L, ctx, NULL, 0L)));
+    printf("get-size-fault=%ld\n", pn(syscall(459, 100L, ctx, (void *)8, 0L)));
+    printf("get-flags=%ld\n", pn(syscall(459, 100L, ctx, &size, 2L)));
+    printf("get-single-no-ctx=%ld\n", pn(syscall(459, 100L, NULL, &size, 1L)));
+    printf("get-single-undef=%ld\n", pn(syscall(459, 100L, ctx, &size, 1L)));
+    ctx[0] = 100;
+    printf("get-single-capability=%ld size=%u\n", pn(syscall(459, 100L, ctx, &size, 1L)), size);
+    size = sizeof ctx;
+    printf("get-unknown=%ld size=%u\n", pn(syscall(459, 999L, ctx, &size, 0L)), size);
+
+    /* lsm_set_self_attr(attr, ctx, size, flags) */
+    ctx[0] = 100, ctx[1] = 0, ctx[2] = 40, ctx[3] = 8;
+    printf("set-flags=%ld\n", pn(syscall(460, 100L, ctx, 40L, 1L)));
+    printf("set-short=%ld\n", pn(syscall(460, 100L, ctx, 31L, 0L)));
+    printf("set-big=%ld\n", pn(syscall(460, 100L, ctx, 4097L, 0L)));
+    printf("set-fault=%ld\n", pn(syscall(460, 100L, NULL, 40L, 0L)));
+    printf("set-capability=%ld\n", pn(syscall(460, 100L, ctx, 40L, 0L)));
+    printf("set-len-past-size=%ld\n", pn(syscall(460, 100L, ctx, 39L, 0L)));
+    ctx[3] = 9;
+    printf("set-ctx-past-len=%ld\n", pn(syscall(460, 100L, ctx, 40L, 0L)));
+    ctx[3] = ~0ULL;
+    printf("set-ctx-overflow=%ld\n", pn(syscall(460, 100L, ctx, 40L, 0L)));
+
+    /* uprobe() and uretprobe() from outside a trampoline. */
+    printf("uprobe=%ld\n", pn(syscall(336)));
+    struct sigaction sa = {0};
+    sa.sa_sigaction = ki_sigill;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGILL, &sa, NULL);
+    errno = 0;
+    long ret = syscall(335);
+    printf("uretprobe=%ld errno=%d si_code=%d\n", ret, errno, ki_code);
+    fflush(stdout);
+    for (int blocked = 0; blocked < 2; blocked++) {
+        pid_t kid = fork();
+        if (kid == 0) {
+            sigset_t set;
+            sigemptyset(&set);
+            sigaddset(&set, SIGILL);
+            if (blocked)
+                sigprocmask(SIG_BLOCK, &set, NULL);
+            else
+                signal(SIGILL, SIG_IGN);
+            syscall(335);
+            _exit(7);
+        }
+        int status = 0;
+        waitpid(kid, &status, 0);
+        printf("uretprobe-%s: signaled=%d sig=%d\n", blocked ? "blocked" : "ignored",
+               WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    }
+    return 0;
+}
+static int kernel_info_case(void) {
+    fflush(stdout);
+    pid_t worker = fork();
+    if (worker == 0) {
+        int code = kernel_info_worker();
+        fflush(stdout);
+        _exit(code);
+    }
+    int status = 0;
+    waitpid(worker, &status, 0);
+    printf("worker=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
 static int process_vm_case(void) {
     if (pipe(pv_gate)) return 80;
     long self = getpid();
@@ -22911,6 +23046,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "seccomp-notify")) return seccomp_notify_case();
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
+    if (!strcmp(mode, "kernel-info")) return kernel_info_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
     if (!strcmp(mode, "cpu-timer-others")) return cpu_timer_others_case();
     if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();

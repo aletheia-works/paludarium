@@ -244,6 +244,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     名前を読まずに `EPERM` を返します。Linux はファイルを開き（そのため、不正なポインタは
     `EFAULT`、ないファイルは `ENOENT`、通常のファイルでないものは `EACCES`）、プロセスが
     終わるたびに記録を書きます。
+  - `syslog` が読むカーネルのログはいつも空です。Linux のログには起動時のメッセージが
+    あります。`kernel.dmesg_restrict` はいつも 1 です（`/proc/sys/kernel/dmesg_restrict`、
+    `/proc/kmsg`、`/dev/kmsg` はありません）。`sysfs` が知っているファイルシステムの種類は
+    7 つだけで、Linux には何十もあります。そのため、順は同じでも番号は Linux と違います。
+    AppArmor も SELinux もありません。`lsm_list_modules` が並べるのは 4 つのモジュールで、
+    Linux が AppArmor のコンテキストを返すところで、`lsm_get_self_attr` は属性を見つけません。
   - `/proc` と `/dev` のファイルの `st_dev` は、そのパスがあるマウントのものなので、
     `ustat` はそのマウントの数を返します。Linux は procfs や devtmpfs の数を返します。
   - ファイルハンドル（`name_to_handle_at` と、`/proc/self/fdinfo` にある inotify の

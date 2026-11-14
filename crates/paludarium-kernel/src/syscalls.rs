@@ -339,6 +339,13 @@ impl SyscallTable {
                 crate::landlock::sys_restrict_self(c, a).unwrap_or_else(Errno::to_syscall_return),
             )
         });
+        handlers.insert(103, crate::syslog::sys_syslog);
+        handlers.insert(139, crate::filesystems::sys_sysfs);
+        handlers.insert(335, sys_uretprobe);
+        handlers.insert(336, sys_uprobe);
+        handlers.insert(459, crate::lsm::sys_lsm_get_self_attr);
+        handlers.insert(460, crate::lsm::sys_lsm_set_self_attr);
+        handlers.insert(461, crate::lsm::sys_lsm_list_modules);
         for number in [213, 233, 232, 281, 291, 441] {
             handlers.insert(number, crate::epoll::dispatch);
         }
@@ -1579,7 +1586,7 @@ fn sys_rt_sigsuspend(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 /// Waits until a signal can be delivered, the process exits, or the wait is
 /// cancelled; the result is always EINTR.
-fn wait_for_signal(c: &mut Context<'_>) -> Result<u64, Errno> {
+pub(crate) fn wait_for_signal(c: &mut Context<'_>) -> Result<u64, Errno> {
     loop {
         let ticket = c.files.readiness.token.value();
         crate::events::wait(c, ticket, None)?;
@@ -3023,6 +3030,28 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
 /// `map_shadow_stack(addr, size, flags)`, as Linux's on a CPU without
 /// user shadow stacks, which the virtual CPU is (`CPUID` reports no
 /// `CET_SS`): `EOPNOTSUPP` before anything is looked at.
+/// `uretprobe()`, which only the return probe's trampoline may call. No
+/// probe is ever set here, so there is no trampoline: Linux then forces
+/// `SIGILL` on the caller (`SI_KERNEL`) and returns -1.
+fn sys_uretprobe(c: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+    signals::queue(c.process, forced_sigill());
+    ok(u64::MAX)
+}
+
+/// `uprobe()`, which only a probe's trampoline may call: from anywhere else
+/// `EPROTO`, and there is never a trampoline here.
+fn sys_uprobe(_: &mut Context<'_>, _: [u64; 6]) -> Outcome {
+    err(Errno(71))
+}
+
+/// `force_sig(SIGILL)`: a `SIGILL` a mask or `SIG_IGN` does not keep back.
+fn forced_sigill() -> signals::PendingSignal {
+    signals::PendingSignal {
+        number: paludarium_types::signal::SIGILL,
+        ..crate::rseq::forced_sigsegv()
+    }
+}
+
 fn sys_map_shadow_stack(_: &mut Context<'_>, _: [u64; 6]) -> Outcome {
     err(Errno::EOPNOTSUPP)
 }

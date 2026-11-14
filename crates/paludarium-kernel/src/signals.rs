@@ -364,6 +364,8 @@ pub(crate) fn restarts_without_handler(number: u64, args: &[u64; 6]) -> bool {
         // futex_waitv and futex2's futex_wait, whose timeout is absolute
         // (`ERESTARTSYS`).
         449 | 455 => true,
+        // syslog's SYSLOG_ACTION_READ, which waits for the log (`ERESTARTSYS`).
+        103 => crate::syslog::waits(args[0]),
         // io_pgetevents (`ERESTARTNOHAND`); io_getevents gives EINTR.
         333 => true,
         _ => false,

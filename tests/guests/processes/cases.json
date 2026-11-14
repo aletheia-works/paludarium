@@ -259,6 +259,7 @@
     {"name":"seccomp-notify","binary":"process"},
     {"name":"process-vm","binary":"process"},
     {"name":"page-nodes","binary":"process"},
+    {"name":"kernel-info","binary":"process"},
     {"name":"pidfd-getfd","binary":"process"},
     {"name":"cpu-clock-ids","binary":"process"},
     {"name":"alarm-clocks","binary":"process"},

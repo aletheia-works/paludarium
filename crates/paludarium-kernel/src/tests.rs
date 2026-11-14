@@ -7641,3 +7641,152 @@ fn seccomp_strict_mode_allows_four_calls_and_kills_for_the_rest() {
     assert_eq!(f.ret(1, &[1, DATA, 0]), 0);
     assert_eq!(f.call(231, &[0]), Next::Exit(ExitStatus::Signaled(9)));
 }
+
+mod kernel_info {
+    use super::*;
+    const BUF: u64 = DATA + 0x100;
+    const SIZE: u64 = DATA + 0x80;
+    fn write_u32(f: &Fixture, at: u64, value: u32) {
+        f.mem.write(GuestAddr(at), &value.to_le_bytes()).unwrap();
+    }
+    fn read_u32(f: &Fixture, at: u64) -> u32 {
+        let mut bytes = [0; 4];
+        f.mem.read(GuestAddr(at), &mut bytes).unwrap();
+        u32::from_le_bytes(bytes)
+    }
+    #[test]
+    fn syslog_reads_an_empty_log_with_cap_syslog() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        assert_eq!(f.ret(103, &[10, 0, 0]), 1 << 18);
+        assert_eq!(f.ret(103, &[9, 0, 0]), 0);
+        assert_eq!(f.ret(103, &[3, BUF, 64]), 0);
+        assert_eq!(f.ret(103, &[4, BUF, 64]), 0);
+        assert_eq!(f.ret(103, &[3, BUF, 0]), 0);
+        assert_eq!(f.ret(103, &[3, 0, 64]), einval);
+        assert_eq!(f.ret(103, &[3, BUF, u64::MAX]), einval);
+        assert_eq!(f.ret(103, &[2, 0, 64]), einval);
+        // The user half's end, not whether the buffer is mapped.
+        assert_eq!(f.ret(103, &[3, 0x7000_0000, 64]), 0);
+        assert_eq!(
+            f.ret(103, &[3, USER_ADDRESS_LIMIT - 8, 64]),
+            errno(Errno::EFAULT)
+        );
+        assert_eq!(f.ret(103, &[8, 0, 0]), einval);
+        assert_eq!(f.ret(103, &[8, 0, 9]), einval);
+        assert_eq!(f.ret(103, &[8, 0, 8]), 0);
+        for kind in [0, 1, 5, 6, 7] {
+            assert_eq!(f.ret(103, &[kind, 0, 0]), 0);
+        }
+        assert_eq!(f.ret(103, &[11, 0, 0]), einval);
+        assert_eq!(f.ret(103, &[u64::MAX, 0, 0]), einval);
+        assert!(crate::signals::restarts_without_handler(
+            103,
+            &[2, 0, 0, 0, 0, 0]
+        ));
+        assert!(!crate::signals::restarts_without_handler(
+            103,
+            &[3, 0, 0, 0, 0, 0]
+        ));
+    }
+    #[test]
+    fn syslog_needs_cap_syslog_for_every_action() {
+        let mut f = fixture();
+        assert_eq!(f.ret(105, &[1000]), 0);
+        for kind in [0, 2, 3, 10, 11] {
+            assert_eq!(f.ret(103, &[kind, BUF, 64]), errno(Errno::EPERM));
+        }
+    }
+    #[test]
+    fn sysfs_numbers_the_file_system_types() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        let count = f.ret(139, &[3, 0, 0]);
+        assert_eq!(count, 7);
+        f.mem.write(GuestAddr(BUF), b"proc\0").unwrap();
+        let proc = f.ret(139, &[1, BUF, 0]);
+        assert_eq!(proc, 1);
+        assert_eq!(f.ret(139, &[2, proc, BUF + 0x40]), 0);
+        let mut name = [0; 5];
+        f.mem.read(GuestAddr(BUF + 0x40), &mut name).unwrap();
+        assert_eq!(&name, b"proc\0");
+        assert_eq!(f.ret(139, &[2, count, BUF]), einval);
+        assert_eq!(f.ret(139, &[2, 1 << 32, BUF]), 0);
+        assert_eq!(f.ret(139, &[2, 0, 0]), errno(Errno::EFAULT));
+        f.mem.write(GuestAddr(BUF), b"nosuchfs\0").unwrap();
+        assert_eq!(f.ret(139, &[1, BUF, 0]), einval);
+        assert_eq!(f.ret(139, &[1, 0, 0]), errno(Errno::EFAULT));
+        // No NUL within PATH_MAX bytes.
+        f.mem.write(GuestAddr(DATA), &[b'x'; 0x1000]).unwrap();
+        assert_eq!(f.ret(139, &[1, DATA, 0]), einval);
+        // A name that runs into the end of the mapping.
+        f.mem.write(GuestAddr(DATA + 0x1ffe), b"xy").unwrap();
+        assert_eq!(f.ret(139, &[1, DATA + 0x1ffe, 0]), errno(Errno::EFAULT));
+        for option in [0, 4, u64::MAX] {
+            assert_eq!(f.ret(139, &[option, 0, 0]), einval);
+        }
+    }
+    #[test]
+    fn lsm_list_modules_gives_lockdown_capability_landlock_and_yama() {
+        let mut f = fixture();
+        let e2big = errno(Errno(7));
+        assert_eq!(f.ret(461, &[BUF, SIZE, 1]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(461, &[BUF, 0, 0]), errno(Errno::EFAULT));
+        write_u32(&f, SIZE, 8);
+        assert_eq!(f.ret(461, &[BUF, SIZE, 0]), e2big);
+        assert_eq!(read_u32(&f, SIZE), 32);
+        assert_eq!(f.ret(461, &[BUF, SIZE, 0]), 4);
+        let ids: Vec<u64> = (0..4)
+            .map(|i| f.mem.read_u64(GuestAddr(BUF + i * 8)).unwrap())
+            .collect();
+        assert_eq!(ids, [108, 100, 110, 105]);
+        assert_eq!(f.ret(461, &[0, SIZE, 0]), errno(Errno::EFAULT));
+    }
+    #[test]
+    fn lsm_self_attributes_have_no_module() {
+        let mut f = fixture();
+        let (einval, eopnotsupp) = (errno(Errno::EINVAL), errno(Errno::EOPNOTSUPP));
+        // lsm_get_self_attr(attr, ctx, size, flags)
+        write_u32(&f, SIZE, 64);
+        assert_eq!(f.ret(459, &[0, BUF, SIZE, 0]), einval);
+        assert_eq!(f.ret(459, &[100, BUF, 0, 0]), einval);
+        assert_eq!(f.ret(459, &[100, BUF, 8, 0]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(459, &[100, BUF, SIZE, 2]), einval);
+        assert_eq!(f.ret(459, &[100, 0, SIZE, 1]), einval);
+        f.mem.write_u64(GuestAddr(BUF), 0).unwrap();
+        assert_eq!(f.ret(459, &[100, BUF, SIZE, 1]), einval);
+        f.mem.write_u64(GuestAddr(BUF), 104).unwrap();
+        assert_eq!(f.ret(459, &[100, BUF, SIZE, 1]), eopnotsupp);
+        assert_eq!(read_u32(&f, SIZE), 0);
+        write_u32(&f, SIZE, 64);
+        assert_eq!(f.ret(459, &[999, 0, SIZE, 0]), eopnotsupp);
+        assert_eq!(read_u32(&f, SIZE), 0);
+        // lsm_set_self_attr(attr, ctx, size, flags)
+        let header = |f: &Fixture, id: u64, len: u64, ctx_len: u64| {
+            for (i, word) in [id, 0, len, ctx_len].into_iter().enumerate() {
+                f.mem
+                    .write_u64(GuestAddr(BUF + i as u64 * 8), word)
+                    .unwrap();
+            }
+        };
+        header(&f, 100, 40, 8);
+        assert_eq!(f.ret(460, &[100, BUF, 40, 1]), einval);
+        assert_eq!(f.ret(460, &[100, BUF, 31, 0]), einval);
+        assert_eq!(f.ret(460, &[100, BUF, 4097, 0]), errno(Errno(7)));
+        assert_eq!(f.ret(460, &[100, 0, 40, 0]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(460, &[100, BUF, 40, 0]), eopnotsupp);
+        assert_eq!(f.ret(460, &[100, BUF, 39, 0]), einval);
+        header(&f, 100, 40, 9);
+        assert_eq!(f.ret(460, &[100, BUF, 40, 0]), einval);
+        header(&f, 100, 40, u64::MAX);
+        assert_eq!(f.ret(460, &[100, BUF, 40, 0]), einval);
+    }
+    #[test]
+    fn probes_have_no_trampoline() {
+        let mut f = fixture();
+        f.thread.state.signal_mask = 1 << 3;
+        assert_eq!(f.ret(336, &[]), errno(Errno(71)));
+        assert!(f.thread.state.pending.is_empty());
+        assert_eq!(f.call(335, &[]), Next::Exit(ExitStatus::Signaled(4)));
+    }
+}

@@ -550,6 +550,7 @@ mod linux {
         processes_seccomp_notify => ("seccomp-notify","process"),
         processes_process_vm => ("process-vm","process"),
         processes_page_nodes => ("page-nodes","process"),
+        processes_kernel_info => ("kernel-info","process"),
         processes_pidfd_getfd => ("pidfd-getfd","process"),
         processes_cpu_clock_ids => ("cpu-clock-ids","process"),
         processes_alarm_clocks => ("alarm-clocks","process"),

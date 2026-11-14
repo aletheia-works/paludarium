@@ -24,8 +24,9 @@ Harness, the Rust Wasm adapter and the fuzz crate have `publish = false`.
 
 The tested toolchain is the nightly pinned in `rust-toolchain.toml`. Every
 crate declares MSRV 1.101, so no stable release before 1.101 can build
-them, and stable support is not claimed. The Wasm adapter
-additionally needs nightly build-std and atomic-wait support.
+them, and stable support is not claimed. The WebAssembly build (the Wasm
+adapter, and `paludarium-host` on wasm32) additionally needs nightly build-std
+and atomic-wait support.
 
 ## Non-publishing checks
 

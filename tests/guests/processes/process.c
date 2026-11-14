@@ -7500,6 +7500,26 @@ static int time_set_case(void) {
            ts_call(SYS_settimeofday, 0, (long)&tz), ts_call(SYS_settimeofday, 0, 0));
     return 0;
 }
+
+/* iopl, ioperm and acct as a user without capabilities: the arguments, then
+   EPERM for whatever needs CAP_SYS_RAWIO or CAP_SYS_PACCT. */
+static int port_access_case(void) {
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 1;
+    long levels[] = {0, 1L << 32, 1, 3, 4, 0xffffffffL, 1L << 32 | 4};
+    for (unsigned i = 0; i < sizeof levels / sizeof *levels; i++)
+        printf("iopl %#lx=%ld\n", levels[i], ts_call(SYS_iopl, levels[i], 0));
+    long ranges[][3] = {{0, 0, 0},         {65535, 2, 0}, {65536, 1, 0}, {-1L, 2, 0},
+                        {0, 65536, 0},     {0x80, 1, 0},  {0x80, 1, 1L << 32},
+                        {0x80, 1, 1},      {0, 0, 1},     {65535, 1, -1}};
+    for (unsigned i = 0; i < sizeof ranges / sizeof *ranges; i++)
+        printf("ioperm %#lx+%ld on=%#lx: %ld\n", ranges[i][0], ranges[i][1], ranges[i][2],
+               syscall(SYS_ioperm, ranges[i][0], ranges[i][1], ranges[i][2]) ? -errno : 0L);
+    printf("acct null=%ld missing=%ld fault=%ld\n", ts_call(SYS_acct, 0, 0),
+           ts_call(SYS_acct, (long)"/nonexistent/acct", 0), ts_call(SYS_acct, 8, 0));
+    return 0;
+}
 /* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
  * SIGKILL at the hard limit. Each part runs in a child, whose CPU time
  * starts from 0. */
@@ -22392,6 +22412,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
     if (!strcmp(mode, "time-set")) return time_set_case();
+    if (!strcmp(mode, "port-access")) return port_access_case();
     if (!strcmp(mode, "timer-limits")) return timer_limits_case();
     if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {

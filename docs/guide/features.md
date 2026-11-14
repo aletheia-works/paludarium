@@ -58,7 +58,7 @@ kernel.
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
-| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
+| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
@@ -2385,6 +2385,12 @@ kernel.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's, rounded up to
   a whole second as Linux rounds it.
+- `iopl` and `ioperm` check their arguments as Linux does (a level past 3,
+  or a range that is empty or goes past port 65,535, gives `EINVAL`), keep
+  the thread's level of 0 and give up ports it never had, and give `EPERM`
+  for anything more, as a kernel locked down against port access does.
+  `acct` needs `CAP_SYS_PACCT` (`EPERM`), and then turns accounting off,
+  which is never on, or gives `EPERM` for a file.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

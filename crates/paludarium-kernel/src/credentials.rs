@@ -17,6 +17,7 @@ const CAP_SETUID: u64 = 1 << 7;
 const CAP_SETPCAP: u64 = 1 << 8;
 const CAP_SYS_RAWIO: u64 = 1 << 17;
 pub(crate) const CAP_SYS_PTRACE: u64 = 1 << 19;
+const CAP_SYS_PACCT: u64 = 1 << 20;
 pub(crate) const CAP_SYS_ADMIN: u64 = 1 << 21;
 pub(crate) const CAP_SYS_NICE: u64 = 1 << 23;
 pub(crate) const CAP_SYS_RESOURCE: u64 = 1 << 24;
@@ -265,6 +266,10 @@ impl Credentials {
     /// `cap_mmap_addr`).
     pub(crate) fn may_map_low(&self) -> bool {
         self.capable(CAP_SYS_RAWIO)
+    }
+    /// CAP_SYS_PACCT over the machine, which `acct` asks for.
+    pub(crate) fn may_account(&self) -> bool {
+        self.capable(CAP_SYS_PACCT)
     }
     /// CAP_SYS_ADMIN over the machine, which `trusted.*` and `security.*`
     /// attributes and a terminal's `TIOCEXCL` and `TIOCSCTTY` ask for.

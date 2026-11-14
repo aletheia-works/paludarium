@@ -272,6 +272,12 @@ verified.
     with. `clock_settime` on a CPU clock named by a negative clock ID gives
     `EINVAL` without reading the time, where Linux reads it, finds the task
     and gives `EPERM`, and the auxiliary clocks (`CLOCK_AUX`) are not there.
+  - The host's I/O ports cannot be used: `iopl` above level 0 and `ioperm`
+    turning ports on give `EPERM` even to a caller with `CAP_SYS_RAWIO`, as
+    a kernel locked down against port access gives, where Linux without
+    lockdown grants them. Process accounting cannot be turned on: `acct`
+    with a file gives `EPERM` even with `CAP_SYS_PACCT`, where Linux opens
+    the file and writes a record as each process exits.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
     the superblock of its pseudo filesystem and gives its counts (0). A

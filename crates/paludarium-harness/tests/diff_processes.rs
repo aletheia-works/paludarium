@@ -551,6 +551,7 @@ mod linux {
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),
         processes_time_set => ("time-set","process"),
+        processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),
         processes_cpu_sleep => ("cpu-sleep","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),

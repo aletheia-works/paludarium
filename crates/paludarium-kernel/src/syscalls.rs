@@ -38,6 +38,9 @@ pub mod nr {
     pub const SETTIMEOFDAY: u64 = 164;
     pub const CLOCK_SETTIME: u64 = 227;
     pub const CLOCK_ADJTIME: u64 = 305;
+    pub const ACCT: u64 = 163;
+    pub const IOPL: u64 = 172;
+    pub const IOPERM: u64 = 173;
     pub const TIME: u64 = 201;
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const MMAP: u64 = 9;
@@ -161,7 +164,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 90] = [
+        let entries: [(u64, Handler); 93] = [
             (nr::GETITIMER, sys_getitimer),
             (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
@@ -176,6 +179,9 @@ impl SyscallTable {
             (nr::CLOCK_SETTIME, sys_clock_settime),
             (nr::ADJTIMEX, sys_adjtimex),
             (nr::CLOCK_ADJTIME, sys_clock_adjtime),
+            (nr::ACCT, sys_acct),
+            (nr::IOPL, sys_iopl),
+            (nr::IOPERM, sys_ioperm),
             (nr::TIME, sys_time),
             (nr::NANOSLEEP, sys_nanosleep),
             (nr::CLOCK_NANOSLEEP, sys_clock_nanosleep),
@@ -744,6 +750,47 @@ fn sys_clock_adjtime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             .map_err(|_| Errno::EFAULT)?;
         Ok(result)
     })())
+}
+
+/// `iopl(level)`: a level past 3 gives `EINVAL`, and the thread's own, 0,
+/// succeeds with nothing to change. A higher one gives `EPERM`, with or
+/// without CAP_SYS_RAWIO, as a kernel locked down against port access
+/// (`LOCKDOWN_IOPORT`) refuses it: the host's ports cannot be given to the
+/// guest. Only the low 32 bits of the level count, as Linux's `unsigned
+/// int`.
+fn sys_iopl(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    match a[0] as u32 {
+        0 => ok(0),
+        1..=3 => err(Errno::EPERM),
+        _ => err(Errno::EINVAL),
+    }
+}
+
+/// `ioperm(from, num, turn_on)`: a range that is empty, wraps or goes past
+/// port 65,535 gives `EINVAL`; then turning ports on gives `EPERM`, as
+/// [`sys_iopl`]'s higher level, and turning them off succeeds, as there is
+/// no bitmap to clear. `turn_on` is Linux's `int`, its low 32 bits.
+fn sys_ioperm(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    const IO_BITMAP_BITS: u64 = 65_536;
+    let end = a[0].wrapping_add(a[1]);
+    if end <= a[0] || end > IO_BITMAP_BITS {
+        err(Errno::EINVAL)
+    } else if a[2] as u32 != 0 {
+        err(Errno::EPERM)
+    } else {
+        ok(0)
+    }
+}
+
+/// `acct(name)`: CAP_SYS_PACCT first (`EPERM`), as Linux. With it, a null
+/// name turns accounting off, which is never on, and a file gives `EPERM`
+/// still: no accounting records are written, so none is opened.
+fn sys_acct(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    if c.process.credentials.may_account() && a[0] == 0 {
+        ok(0)
+    } else {
+        err(Errno::EPERM)
+    }
 }
 
 /// `time(t)`: the seconds of the real time clock as of the latest tick, as

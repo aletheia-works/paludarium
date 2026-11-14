@@ -37,6 +37,11 @@ CI run produces them afresh on an x86-64 Linux runner.
   `net.unix.max_dgram_qlen` of 10, which systemd raises on many hosts. CI
   sets it with `sysctl` (a container's own network namespace has it);
   elsewhere the case stops and says so.
+- The `chroot` case takes `CAP_SYS_CHROOT` in a user namespace of its own,
+  which Linux grants. Ubuntu's AppArmor refuses every capability there
+  (the `unprivileged_userns` profile) while
+  `kernel.apparmor_restrict_unprivileged_userns` is 1, so CI sets it to 0
+  with `sysctl`; elsewhere the case differs from such a host's native run.
 - The native side must be a real x86-64 Linux. Docker on an Arm Mac runs
   x86-64 programs under QEMU's user-mode emulation, which handles signals
   itself, so there even native results can differ from Linux: a stopped and

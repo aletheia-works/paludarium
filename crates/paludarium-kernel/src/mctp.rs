@@ -935,7 +935,9 @@ pub(crate) fn dispatch(
         }
         45 => {
             let len = crate::sockets::user_buffer(a[1], a[2])?;
-            let mut bytes = vec![0; len];
+            let mut bytes = Vec::new();
+            bytes.try_reserve(len).map_err(|_| Errno::ENOMEM)?;
+            bytes.resize(len, 0);
             let (n, length, name) = receive(c, file, socket, &mut bytes, a[3])?;
             c.mem
                 .write(GuestAddr(a[1]), &bytes[..n])

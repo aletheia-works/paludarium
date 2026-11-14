@@ -173,7 +173,8 @@ kernel.
   value when the reader's namespace maps that root to an ID other than 0, a
   revision 2 one when it is root there or above, and `EOVERFLOW` otherwise.
   A write or truncation of the file, and a `chown` of anything but a
-  directory, takes them away, whoever does it.
+  directory, takes them away, whoever does it. `execve` gives them to the
+  program it runs (see the credentials below).
 - `setxattrat`, `getxattrat`, `listxattrat` and `removexattrat` (Linux 6.13)
   find the file from a directory descriptor, and take `AT_SYMLINK_NOFOLLOW`
   and `AT_EMPTY_PATH` only (`EINVAL`). With `AT_EMPTY_PATH`, a null or empty
@@ -1925,16 +1926,20 @@ kernel.
   group 0, with every capability) without supplementary groups, as Linux's
   first process does; a native program has its launcher's instead. Each
   thread has its own credentials, as on Linux: the real, effective, saved
-  and filesystem user and group IDs, the supplementary groups and the
-  permitted, effective and inheritable capabilities.
+  and filesystem user and group IDs, the supplementary groups, the
+  permitted, effective, inheritable, bounding and ambient capabilities and
+  the securebits.
   `capget` reads any thread's capabilities in all three header versions, and
-  `capset` changes the calling thread's, within what it holds by Linux's rules.
+  `capset` changes the calling thread's, within what it holds by Linux's rules
+  (an inheritable one also within the bounding set), and keeps the ambient
+  set within the new permitted and inheritable ones.
   The `set*id` calls and `setgroups` change them by Linux's rules: an ID
   goes to one of the thread's own, or anywhere with `CAP_SETUID` or
-  `CAP_SETGID`; leaving root in every user ID drops the capabilities (but
-  for the permitted ones with `PR_SET_KEEPCAPS`), the effective ID leaving
-  root drops the effective ones and coming back raises them, and the
-  filesystem ID does the same for the filesystem capabilities. A change of
+  `CAP_SETGID`; unless `SECBIT_NO_SETUID_FIXUP`, leaving root in every
+  user ID drops the capabilities (but for the permitted ones with
+  `PR_SET_KEEPCAPS`) and the ambient ones, the effective ID leaving root
+  drops the effective ones and coming back raises them, and the filesystem
+  ID does the same for the filesystem capabilities. A change of
   an effective or filesystem ID makes the process undumpable
   (`fs.suid_dumpable` is 0) and clears its parent-death signal. `execve`
   of a set-user-ID program makes its owner the effective user ID, and of a
@@ -1944,11 +1949,29 @@ kernel.
   thread is not in by its filesystem or a supplementary group) or gain
   capabilities takes the real IDs as effective and keeps no more
   capabilities than the thread had. `execve` then makes the saved and
-  filesystem IDs the effective ones, gives root (by its real or effective
-  ID) every capability and anyone else none, and clears `PR_SET_KEEPCAPS`.
+  filesystem IDs the effective ones and gives the capabilities as Linux's
+  `cap_bprm_creds_from_file` does:
+  - **File capabilities:** a program's `security.capability` gives its
+    permitted ones within the bounding set and its inheritable ones within
+    the thread's, effective too when its effective flag is set. A revision 3
+    value counts only where its root is root in the thread's user namespace
+    or one above it. A value of no known revision, or one whose effective
+    flag is set and whose permitted capabilities the bounding set does not
+    all allow, refuses the exec (`EINVAL`, `EPERM`), after the program and
+    its interpreter are read.
+  - **Root:** unless `SECBIT_NOROOT`, root (by its real or effective ID)
+    gets the bounding and inheritable sets, effective by its effective ID,
+    but not a set-user-ID root program with file capabilities that another
+    user runs.
+  - **Ambient:** file capabilities or a change of the effective IDs clear
+    the ambient set; what stays of it is permitted and effective.
+  - It clears `PR_SET_KEEPCAPS` and keeps the other securebits, the bounding
+    set and the inheritable set.
+
   It sets `AT_SECURE` when it changes the effective IDs, when they differ
-  from the real ones before it, or when a user other than root keeps
-  capabilities, and such a secure exec
+  from the real ones before it, or when a user other than root takes the
+  effective flag or permitted capabilities beyond its ambient ones, and
+  such a secure exec
   clears the parent-death signal and lowers the `RLIMIT_STACK` soft limit
   to 8 MiB. The process is dumpable again after `execve` unless its
   effective IDs differed from its real ones before it, it may not read the
@@ -2768,7 +2791,13 @@ kernel.
   threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
   parent exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
   again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
-  by `execve`), `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
+  by `execve`), the capability module's `PR_CAPBSET_READ`, `PR_CAPBSET_DROP`
+  (with `CAP_SETPCAP`), `PR_GET_SECUREBITS`, `PR_SET_SECUREBITS` (which
+  changes no locked bit; without `CAP_SETPCAP` only the two bits for exec's
+  checks in user space, and only a change) and `PR_CAP_AMBIENT` (a raised
+  capability must be permitted and inheritable, unless
+  `SECBIT_NO_CAP_AMBIENT_RAISE` refuses it), all per thread,
+  `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
   `execve`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
   with their `PR_GET_*`, and Yama's `PR_SET_PTRACER`, which reads no other
   argument: 0 clears it, `PR_SET_PTRACER_ANY` (or -1 as an `int`) lets any

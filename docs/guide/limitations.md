@@ -436,15 +436,17 @@ verified.
   ends, with that thread's. Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
-  act as 0, the kernel's defaults, which many distributions raise. `execve`
-  reads no file capabilities (`security.capability`), no mount is
-  `nosuid`, and a set-user-ID or set-group-ID program takes its owner or
-  group even when another process shares the caller's working directory
-  (`CLONE_FS`), where Linux takes the real IDs as effective unless the
-  caller has `CAP_SETUID`. `/proc/self/status` shows the calling thread's
-  credentials, where Linux shows the thread group leader's. Every thread's
-  bounding set holds every capability and its ambient set none, as there is
-  no `PR_CAPBSET_DROP` or `PR_CAP_AMBIENT`.
+  act as 0, the kernel's defaults, which many distributions raise. No mount
+  is `nosuid`, and a set-user-ID or set-group-ID program takes its owner or
+  group, and a program with file capabilities takes them, even when another
+  process shares the caller's working directory (`CLONE_FS`), where Linux
+  takes the real IDs as effective unless the caller has `CAP_SETUID` and
+  gives no more capabilities than the caller had. `execveat`'s
+  `AT_EXECVE_CHECK` (Linux 6.14), with which user space checks a file before
+  it runs it under `SECBIT_EXEC_RESTRICT_FILE`, is `EINVAL`: the securebits
+  for those checks are kept and shown, but nothing here acts on them.
+  `/proc/self/status` shows the calling thread's credentials, where Linux
+  shows the thread group leader's.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
   `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS` as Linux does, with
   these differences:
@@ -486,8 +488,7 @@ verified.
   the file was opened with, where Linux also takes the writer's for the
   `CAP_SETUID` and `CAP_SETGID` it needs in the parent; and the `/proc` files
   of a process that is not dumpable belong to root of the first namespace,
-  where Linux gives them to root of the process's own when it maps one.
-  `execve` honours no file capabilities, in a user namespace either. A network
+  where Linux gives them to root of the process's own when it maps one. A network
   namespace has no interface but its loopback (no `veth` pairs to reach
   another), and the interface requests and netlink change no other flag
   than `IFF_UP`. The first namespace shows `lo` alone too, where Linux

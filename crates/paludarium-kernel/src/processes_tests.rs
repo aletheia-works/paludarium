@@ -4901,6 +4901,66 @@ mod user_namespaces {
         (k, t, m)
     }
     #[test]
+    fn file_capabilities_written_in_a_namespace_name_its_own_root() {
+        let (mut k, mut t, m) = user();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [NEWUSER, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            write(&mut k, &mut t, &m, "/proc/self/setgroups", b"deny"),
+            4
+        );
+        let map = b"1000 1000 1\n";
+        assert_eq!(write(&mut k, &mut t, &m, "/proc/self/uid_map", map), 12);
+        assert_eq!(write(&mut k, &mut t, &m, "/proc/self/gid_map", map), 12);
+        let (name, value, out) = (DATA + 0x200, DATA + 0x300, DATA + 0x400);
+        m.write(GuestAddr(name), b"security.capability\0").unwrap();
+        let set = |k: &mut Kernel, t: &mut Thread, file: &str, revision: u32, root: u32| {
+            let mut v = (revision | 1).to_le_bytes().to_vec();
+            v.extend_from_slice(&[0; 16]);
+            if revision == 0x0300_0000 {
+                v.extend_from_slice(&root.to_le_bytes());
+            }
+            m.write(GuestAddr(value), &v).unwrap();
+            path(&m, DATA, file);
+            syscall(k, t, &m, 188, [DATA, name, value, v.len() as u64, 0, 0])
+        };
+        // Its CAP_SETFCAP is over the namespace only: a revision 2 value
+        // names root, which the namespace does not map, and so does a root
+        // it does not map; root's file is not one it may give them.
+        assert_eq!(
+            set(&mut k, &mut t, "/own", 0x0200_0000, 0),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            set(&mut k, &mut t, "/own", 0x0300_0000, 1001),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            set(&mut k, &mut t, "/root", 0x0300_0000, 1000),
+            e(Errno::EPERM)
+        );
+        assert_eq!(set(&mut k, &mut t, "/own", 0x0300_0000, 1000), 0);
+        path(&m, DATA, "/own");
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 191, [DATA, name, out, 24, 0, 0]),
+            24
+        );
+        let word = |at: u64| m.read_u64(GuestAddr(out + at)).unwrap() as u32;
+        assert_eq!((word(0), word(20)), (0x0300_0001, 1000));
+        // Its own root, which the first namespace maps to an ID other than
+        // 0, reads the same there.
+        let first = t.state.credentials.user.clone();
+        t.state.credentials.user = crate::users::UserNs::default();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 191, [DATA, name, out, 24, 0, 0]),
+            24
+        );
+        assert_eq!((word(0), word(20)), (0x0300_0001, 1000));
+        t.state.credentials.user = first;
+    }
+    #[test]
     fn a_user_makes_one_and_maps_itself_as_root() {
         let (mut k, mut t, m) = user();
         let first = read(&mut k, &mut t, &m, "/proc/self/uid_map");

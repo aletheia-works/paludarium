@@ -20,10 +20,16 @@ pub(crate) enum TimerClock {
     /// `CLOCK_THREAD_CPUTIME_ID`: the CPU time of the thread that created
     /// the timer.
     Thread(u32),
+    /// Another process's CPU time, by its ID in the emulator; that
+    /// process's checkpoints expire it ([`Timers::expire_foreign`]).
+    OtherProcess(u32),
 }
 impl TimerClock {
     pub(crate) fn is_cpu(self) -> bool {
-        matches!(self, Self::Process | Self::Thread(_))
+        matches!(
+            self,
+            Self::Process | Self::Thread(_) | Self::OtherProcess(_)
+        )
     }
 }
 
@@ -80,9 +86,30 @@ impl Timers {
     /// that checkpoints have to bring the CPU time up to date for it
     /// (Linux never arms a `SIGEV_NONE` one).
     pub(crate) fn cpu_armed(&self) -> bool {
-        self.table
-            .values()
-            .any(|t| t.clock.is_cpu() && t.signal.is_some() && t.deadline.is_some())
+        self.table.values().any(|t| {
+            matches!(t.clock, TimerClock::Process | TimerClock::Thread(_))
+                && t.signal.is_some()
+                && t.deadline.is_some()
+        })
+    }
+    /// Whether a timer on process `pid`'s CPU time is armed to send a
+    /// signal, so that that process's checkpoints have to look at it.
+    pub(crate) fn foreign_armed(&self, pid: u32) -> bool {
+        self.table.values().any(|t| {
+            t.clock == TimerClock::OtherProcess(pid) && t.signal.is_some() && t.deadline.is_some()
+        })
+    }
+    /// As [`Self::expire`], for the timers on process `pid`'s CPU time,
+    /// which is `cpu`: Linux's tick of that process expires them.
+    pub(crate) fn expire_foreign(
+        &mut self,
+        pending: &mut ThreadState,
+        pid: u32,
+        cpu: u64,
+    ) -> Vec<(u32, PendingSignal)> {
+        self.expire_by(pending, |timer| {
+            (timer.clock == TimerClock::OtherProcess(pid) && timer.signal.is_some()).then_some(cpu)
+        })
     }
     /// Queues the signal of every timer due at `now` into `pending`. An
     /// expiry while the timer's last signal is still pending counts as an
@@ -111,7 +138,7 @@ impl Timers {
             _ if timer.signal.is_none() => None,
             TimerClock::Process => Some(process),
             TimerClock::Thread(tid) => thread(tid),
-            TimerClock::Monotonic | TimerClock::Realtime => None,
+            TimerClock::Monotonic | TimerClock::Realtime | TimerClock::OtherProcess(_) => None,
         })
     }
     /// Expires the timers for which `now` gives the time of their clock.

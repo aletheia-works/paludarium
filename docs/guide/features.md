@@ -2309,7 +2309,11 @@ kernel.
   (`EPERM`); `timer_create` writes the timer's ID out before it refuses
   one, and the ID is used up, as it is when it cannot be written
   (`EFAULT`). `timer_create` also runs on the CPU clocks of the caller's
-  process and threads by number; it finds the task after the ID is out,
+  process and threads, and of other processes, by number; a timer on
+  another process's CPU time is expired by that process's checkpoints
+  while it is armed, as Linux's tick of that process expires it, and its
+  signal comes to the process that made it; once that process is reaped
+  the timer gives `ESRCH` to set and shows nothing. It finds the task after the ID is out,
   as Linux's `posix_cpu_timer_create` does, so a task that is not there
   gives `EINVAL` with the ID used up. A dynamic clock has no timers and
   cannot sleep (`EOPNOTSUPP`). A sleep on a CPU clock by number reads its
@@ -2318,8 +2322,7 @@ kernel.
   sleeps as below, and on another task's it returns at once when its time
   has come (a relative 0, or an absolute time the clock has reached), as
   Linux's `posix_cpu_nsleep`, but one that would wait for that task's CPU
-  time is not modelled (`EINVAL`), nor is a timer on another process's
-  CPU time.
+  time is not modelled (`EINVAL`).
 - A sleep on the process's CPU clock ends once the process's threads
   together have used the time, as Linux's `do_cpu_nanosleep`: a time that
   has passed, or none to sleep, returns at once, and the sleeping thread

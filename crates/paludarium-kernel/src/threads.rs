@@ -90,6 +90,13 @@ pub struct ThreadGroup {
     posix_cpu_armed: std::sync::atomic::AtomicBool,
     /// The threads sleeping on the process's CPU clock ([`CpuSleep`]).
     cpu_sleepers: std::sync::atomic::AtomicUsize,
+    /// The processes with a POSIX timer armed on this one's CPU time, which
+    /// its checkpoints expire, as Linux's tick of this process does
+    /// ([`Self::watch_cpu`]); this process's ID for them; and whether there
+    /// are any. Locked alone.
+    cpu_watchers: Mutex<Vec<std::sync::Weak<ThreadGroup>>>,
+    cpu_watched_as: std::sync::atomic::AtomicU32,
+    cpu_watched: std::sync::atomic::AtomicBool,
     /// The core dump a fatal signal started, which the last thread to end
     /// writes. Locked before `members`.
     pub(crate) core: Mutex<Option<crate::coredump::Dump>>,
@@ -211,6 +218,9 @@ impl Default for ThreadGroup {
             cpu_timers_armed: std::sync::atomic::AtomicBool::new(false),
             posix_cpu_armed: std::sync::atomic::AtomicBool::new(false),
             cpu_sleepers: std::sync::atomic::AtomicUsize::new(0),
+            cpu_watchers: Mutex::default(),
+            cpu_watched_as: std::sync::atomic::AtomicU32::new(0),
+            cpu_watched: std::sync::atomic::AtomicBool::new(false),
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
             robust_lists: Mutex::default(),
@@ -574,7 +584,95 @@ impl ThreadGroup {
             TimerClock::Process => Ok(self.process_cpu()),
             TimerClock::Thread(tid) => self.thread_cpu(tid).ok_or(Errno(3)), // ESRCH
             TimerClock::Monotonic | TimerClock::Realtime => Ok(mono),
+            // The caller looks for the other process ([`crate::processes`]).
+            TimerClock::OtherProcess(_) => Err(Errno(3)),
         }
+    }
+    /// Lets process `watcher` expire its POSIX timers on this process's CPU
+    /// time from this process's checkpoints, this process being `pid` to
+    /// it; it stops once the watcher has none armed or has gone.
+    pub(crate) fn watch_cpu(&self, pid: u32, watcher: &Arc<ThreadGroup>) {
+        let mut watchers = self
+            .cpu_watchers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !watchers
+            .iter()
+            .any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(watcher)))
+        {
+            watchers.push(Arc::downgrade(watcher));
+        }
+        self.cpu_watched_as.store(pid, Ordering::SeqCst);
+        self.cpu_watched.store(true, Ordering::SeqCst);
+    }
+    /// Expires the timers other processes have on this process's CPU time
+    /// ([`Self::watch_cpu`]), forgetting the processes that have none armed
+    /// any more or have gone.
+    fn expire_watchers(&self) {
+        if !self.cpu_watched.load(Ordering::SeqCst) {
+            return;
+        }
+        let pid = self.cpu_watched_as.load(Ordering::SeqCst);
+        let cpu = self.process_cpu();
+        let watchers: Vec<_> = self
+            .cpu_watchers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut done = Vec::new();
+        for weak in &watchers {
+            let armed = weak
+                .upgrade()
+                .is_some_and(|watcher| watcher.expire_foreign(pid, cpu));
+            if !armed {
+                done.push(weak.as_ptr());
+            }
+        }
+        if !done.is_empty() {
+            let mut watchers = self
+                .cpu_watchers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            watchers.retain(|w| !done.contains(&w.as_ptr()));
+            self.cpu_watched
+                .store(!watchers.is_empty(), Ordering::SeqCst);
+        }
+    }
+    /// Expires this process's POSIX timers on process `pid`'s CPU time,
+    /// which is `cpu`, and wakes its threads for their signals; whether any
+    /// is still armed.
+    fn expire_foreign(&self, pid: u32, cpu: u64) -> bool {
+        let (directed, armed) = {
+            let mut pending = self
+                .process_pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut timers = self.timers.lock().unwrap_or_else(PoisonError::into_inner);
+            let queued = pending.pending.len();
+            let directed = timers.expire_foreign(&mut pending, pid, cpu);
+            let fired = pending.pending.len() > queued;
+            (directed, (timers.foreign_armed(pid), fired))
+        };
+        for (tid, signal) in directed {
+            let inbox = self
+                .members
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&tid)
+                .cloned();
+            if let Some((id, overrun)) = inbox.and_then(|inbox| inbox.send_timer(signal)) {
+                self.timers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .set_overrun(id, overrun);
+            }
+        }
+        // A signal for the process waits in its pending set: its threads
+        // look again.
+        if armed.1 {
+            self.timers_changed();
+        }
+        armed.0
     }
     /// Whether an interval timer of the process's CPU time is armed, its
     /// `RLIMIT_CPU` is set, a POSIX timer runs on a CPU clock or a thread
@@ -584,6 +682,7 @@ impl ThreadGroup {
         self.cpu_timers_armed.load(Ordering::SeqCst)
             || self.posix_cpu_armed.load(Ordering::SeqCst)
             || self.cpu_sleepers.load(Ordering::SeqCst) != 0
+            || self.cpu_watched.load(Ordering::SeqCst)
     }
     /// Marks a thread as sleeping on the process's CPU clock until the
     /// returned guard is dropped, so that the other threads account their
@@ -829,6 +928,7 @@ impl ThreadGroup {
     pub(crate) fn expire_timer(&self, local: &mut ThreadState, now: u64) {
         self.discards.apply(local);
         self.expire_cpu_timers();
+        self.expire_watchers();
         // The CPU times of the process and its live threads, taken before
         // the timers are locked.
         let cpu = self.posix_cpu_armed.load(Ordering::SeqCst).then(|| {

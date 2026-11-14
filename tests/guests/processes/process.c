@@ -9471,6 +9471,62 @@ static int cpu_clock_ids_case(void) {
            after_none, last, next);
     return 0;
 }
+/* A POSIX timer on another process's CPU clock, by number: the child's
+ * checkpoints expire it, as Linux's tick of that process does, and the
+ * signal comes to the process that made it. What is printed holds whatever
+ * the speed. */
+static int cpu_timer_others_case(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    int gate[2];
+    if (pipe(gate)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        char c;
+        close(gate[1]);
+        read(gate[0], &c, 1);
+        cs_spin((void *)200000000L);
+        _exit(0);
+    }
+    close(gate[0]);
+    clockid_t clock = CI_CLOCK(kid, 0, 2);
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGUSR1;
+    sev.sigev_value.sival_int = 77;
+    timer_t timer, quiet;
+    long made = syscall(SYS_timer_create, clock, &sev, &timer) ? -errno : 0;
+    sev.sigev_notify = SIGEV_NONE;
+    long made_quiet = syscall(SYS_timer_create, clock, &sev, &quiet) ? -errno : 0;
+    struct itimerspec it = {{0, 0}, {0, 30000000L}}, now;
+    long set_timer = syscall(SYS_timer_settime, timer, 0, &it, NULL) ? -errno : 0;
+    it.it_value.tv_sec = 100;
+    long set_quiet = syscall(SYS_timer_settime, quiet, 0, &it, NULL) ? -errno : 0;
+    syscall(SYS_timer_gettime, quiet, &now);
+    printf("made=%ld,%ld set=%ld,%ld quiet-armed=%d\n", made, made_quiet, set_timer, set_quiet,
+           now.it_value.tv_sec > 90);
+    /* The child spins: its time ends the timer, and the signal is ours. */
+    write(gate[1], "g", 1);
+    siginfo_t info;
+    struct timespec limit = {10, 0};
+    long got = sigtimedwait(&set, &info, &limit);
+    printf("signal=%ld code=%d value=%d\n", got, info.si_code, info.si_value.sival_int);
+    syscall(SYS_timer_gettime, timer, &now);
+    printf("one-shot done=%d\n", now.it_value.tv_sec == 0 && now.it_value.tv_nsec == 0);
+    /* Once the child is reaped, the timers have no clock: ESRCH to set,
+       nothing to read. */
+    waitpid(kid, NULL, 0);
+    long reset = syscall(SYS_timer_settime, timer, 0, &it, NULL) ? -errno : 0;
+    now.it_value.tv_sec = 9;
+    syscall(SYS_timer_gettime, quiet, &now);
+    printf("reaped set=%ld quiet=%ld delete=%ld\n", reset, (long)now.it_value.tv_sec,
+           syscall(SYS_timer_delete, timer) ? -errno : 0L);
+    return 0;
+}
 static int pidfd_getfd_case(void) {
     if (pipe(pv_gate)) return 80;
     struct pv_task child = pv_child(1), locked = pv_child(0);
@@ -22088,6 +22144,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "cpu-timer-others")) return cpu_timer_others_case();
     if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
     if (!strcmp(mode, "yama")) return yama_case();

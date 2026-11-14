@@ -998,6 +998,12 @@ impl Processes {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.keys().copied().collect()
     }
+    /// Process `pid`'s CPU time, its threads' together, a zombie's too;
+    /// `None` once it is reaped.
+    pub(crate) fn process_cpu(&self, pid: u32) -> Option<u64> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.get(&pid).map(|entry| entry.group.process_cpu())
+    }
     /// What `/proc/<pid>` shows of a process other than the reader, or
     /// `None` when there is no such process.
     pub(crate) fn view(&self, pid: u32) -> Option<ProcessView> {

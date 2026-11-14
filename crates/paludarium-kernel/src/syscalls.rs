@@ -642,11 +642,7 @@ fn sleep_clock_now(c: &mut Context<'_>, clock: SleepClock) -> Result<u64, Errno>
             crate::account_cpu(c.host, c.group, c.process, c.tid);
             Ok(c.group.process_cpu())
         }
-        SleepClock::Process(pid) => c
-            .processes
-            .view(pid)
-            .map(|view| view.group.process_cpu())
-            .ok_or(Errno(3)),
+        SleepClock::Process(pid) => c.processes.process_cpu(pid).ok_or(Errno(3)),
         SleepClock::Thread(tid) => c.group.thread_cpu(tid).ok_or(Errno(3)),
     }
 }

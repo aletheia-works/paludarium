@@ -2255,18 +2255,23 @@ impl Kernel {
         };
         let mut interrupted = false;
         loop {
-            if let Some(index) = waiters
-                .iter()
-                .rposition(|w| w.state.load(Ordering::SeqCst) == 1)
-            {
+            // Each state is read once: a wake between two reads would be
+            // taken for the end that only `finish` gives.
+            let (mut woken, mut ended) = (None, None);
+            for (index, waiter) in waiters.iter().enumerate() {
+                match waiter.state.load(Ordering::SeqCst) {
+                    0 => {}
+                    1 => woken = Some(index),
+                    state => {
+                        ended.get_or_insert(state);
+                    }
+                }
+            }
+            if let Some(index) = woken {
                 finish(&self.group.futexes, 3);
                 return Ok(index);
             }
-            if let Some(state) = waiters
-                .iter()
-                .map(|w| w.state.load(Ordering::SeqCst))
-                .find(|&state| state != 0)
-            {
+            if let Some(state) = ended {
                 return Err(Errno(if state == 2 { 110 } else { 4 }));
             }
             self.group.drain_process(&mut thread.state);

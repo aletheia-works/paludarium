@@ -2190,10 +2190,7 @@ const MCL_CURRENT: u32 = 1;
 const MCL_FUTURE: u32 = 2;
 const MCL_ONFAULT: u32 = 4;
 
-/// Whether `mlock` and its kin may take `[addr, addr + len)`, as Linux's
-/// `do_mlock` and `do_munlock` decide. Nothing is ever swapped out here, so
-/// that is all there is to do. `populate` is a lock that brings its pages in,
-/// which a page without access fails, as `__mm_populate` does.
+/// The capability that locks memory past RLIMIT_MEMLOCK.
 const CAP_IPC_LOCK: u64 = 1 << 14;
 const RLIMIT_MEMLOCK: usize = 8;
 

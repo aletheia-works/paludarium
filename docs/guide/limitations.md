@@ -312,6 +312,12 @@ verified.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
+  - Adjacent private VMAs merge once their flags agree again (after
+    `munlock`, for one), whatever their `anon_vma`s. Linux merges them only
+    when they share one. A VMA gets its `anon_vma` on its first write, and
+    takes a neighbour's only if their flags agreed then
+    (`anon_vma_compatible`), so pieces written while apart may stay
+    separate VMAs in `/proc/<pid>/maps`.
   - `/proc/<pid>/status` shows no locked memory (`VmLck`). `mmap` with
     `MAP_LOCKED` checks `can_do_mlock` (`EPERM`) and room under
     `RLIMIT_MEMLOCK` (`EAGAIN`) before it finds room for the mapping

@@ -269,6 +269,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
     読み込んだページも、触るまでは数えません。
+  - 隣り合うプライベートの VMA は、（`munlock` のあとなど）フラグがまたそろえば、
+    `anon_vma` によらずつながります。Linux は同じ `anon_vma` を持つときだけつなげます。
+    VMA は最初の書き込みで `anon_vma` を得て、そのとき隣とフラグがそろっていたときだけ
+    隣のものを使う（`anon_vma_compatible`）ので、離れている間に書き込んだかけらは、
+    `/proc/<pid>/maps` で別の VMA のまま残ることがあります。
   - `/proc/<pid>/status` にロックしたメモリ（`VmLck`）は出ません。`MAP_LOCKED` の
     `mmap` は、マッピングの場所を探し（`ENOMEM`）ファイルを確かめる前に、`can_do_mlock`
     （`EPERM`）と `RLIMIT_MEMLOCK` の空き（`EAGAIN`）を確かめます。Linux はそれらを先にします。`mremap` は、

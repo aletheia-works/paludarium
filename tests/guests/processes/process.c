@@ -6299,10 +6299,12 @@ static int lock_state_case(void) {
     munmap(area, page);
     munmap(area + 4 * page, page);
     char *p = area + page;
+    /* Written first, so that the pieces the locks split off share its
+     * anon_vma and merge again once unlocked. */
+    p[0] = 'a';
     long locked = advice_errno(mlock(p + page, page));
     long onfault = advice_errno(syscall(SYS_mlock2, p + 2 * page, page, 1L));
     printf("mlock=%ld onfault=%ld vmas=%d\n", locked, onfault, advice_vmas(p, p + 3 * page));
-    p[0] = 'a';
     const long advices[] = {MADV_DONTNEED, MADV_FREE, 20, 21, 102};
     const char *names[] = {"dontneed", "free", "cold", "pageout", "guard"};
     for (int i = 0; i < 5; i++)

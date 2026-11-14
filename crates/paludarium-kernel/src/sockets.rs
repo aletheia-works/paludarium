@@ -733,38 +733,33 @@ const MSG_LEN: u64 = 56;
 /// Where `struct msghdr` keeps `msg_flags`.
 const MSG_FLAGS: u64 = 48;
 
-/// EBADF for no descriptor, ENOTSOCK for a file that is no socket, as
-/// `sockfd_lookup_light`.
-/// Takes the pending error of the socket `file` (`sock_error`), or makes
-/// `store` it, for `recvmmsg`.
-fn pending_error(file: &Arc<dyn FileHandle>, store: Option<Errno>) -> Option<Errno> {
+/// Takes the pending error of the socket `file` (`sock_error`), for
+/// `recvmmsg`.
+fn take_pending_error(file: &Arc<dyn FileHandle>) -> Option<Errno> {
     if let Some(socket) = crate::inet::of(file) {
-        return match store {
-            Some(error) => {
-                socket.store_error(error);
-                None
-            }
-            None => socket.take_error(),
-        };
-    }
-    if let Some(socket) = crate::netlink::of(file) {
-        return match store {
-            Some(error) => {
-                socket.store_error(error);
-                None
-            }
-            None => socket.take_error(),
-        };
-    }
-    let socket = file.as_any()?.downcast_ref::<SocketPairEnd>()?;
-    match store {
-        Some(error) => {
-            socket.store_error(error);
-            None
-        }
-        None => socket.take_error(),
+        socket.take_error()
+    } else if let Some(socket) = crate::netlink::of(file) {
+        socket.take_error()
+    } else {
+        file.as_any()?.downcast_ref::<SocketPairEnd>()?.take_error()
     }
 }
+/// Makes `error` the pending error of the socket `file`, as `recvmmsg`
+/// keeps an error that came after some messages.
+fn store_pending_error(file: &Arc<dyn FileHandle>, error: Errno) {
+    if let Some(socket) = crate::inet::of(file) {
+        socket.store_error(error);
+    } else if let Some(socket) = crate::netlink::of(file) {
+        socket.store_error(error);
+    } else if let Some(socket) = file
+        .as_any()
+        .and_then(|v| v.downcast_ref::<SocketPairEnd>())
+    {
+        socket.store_error(error);
+    }
+}
+/// EBADF for no descriptor, ENOTSOCK for a file that is no socket, as
+/// `sockfd_lookup_light`.
 fn socket_of(c: &Context<'_>, fd: u64) -> Result<(), Errno> {
     let file = c.files.descriptor(fd)?.file;
     if crate::inet::of(&file).is_some()
@@ -867,7 +862,7 @@ fn receive_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     socket_of(c, a[0])?;
     let file = c.files.descriptor(a[0])?.file;
     if flags & MSG_ERRQUEUE == 0
-        && let Some(error) = pending_error(&file, None)
+        && let Some(error) = take_pending_error(&file)
     {
         return Err(error);
     }
@@ -918,7 +913,7 @@ fn receive_messages(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             } else {
                 e
             };
-            pending_error(&file, Some(kept));
+            store_pending_error(&file, kept);
         }
         _ => {}
     }

@@ -444,18 +444,25 @@ pub(crate) fn chown(
     Ok(in_group(creds, stat.gid) || capable(creds, stat, CAP_FSETID))
 }
 
-/// What a write or a truncation takes from a regular file without
-/// `CAP_FSETID` (`setattr_should_drop_suidgid`): its set-user-ID bit, and its
+/// The file capabilities' attribute (`XATTR_NAME_CAPS`).
+pub(crate) const CAPS: &[u8] = b"security.capability";
+
+/// What a write or a truncation takes from a regular file: its file
+/// capabilities, whoever writes (`cap_inode_killpriv`), and without
+/// `CAP_FSETID` (`setattr_should_drop_suidgid`) its set-user-ID bit, and its
 /// set-group-ID bit with group execution or when the thread is not in its
 /// group. Linux's `file_remove_privs` and `do_truncate`.
 pub(crate) fn remove_set_ids(creds: &Credentials, file: &dyn FileHandle) {
     let Ok(stat) = file.stat() else {
         return;
     };
-    if capable(creds, &stat, CAP_FSETID) {
+    if stat.mode & TYPE != REGULAR {
         return;
     }
-    if stat.mode & TYPE != REGULAR {
+    let _ = file.with_xattrs(&mut |map| {
+        map.remove(CAPS);
+    });
+    if capable(creds, &stat, CAP_FSETID) {
         return;
     }
     let mut kill = stat.mode & 0o4000;

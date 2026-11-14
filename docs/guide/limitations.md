@@ -375,9 +375,10 @@ verified.
     moves the boundary between the two.
 - **Extended attributes**: a mounted host directory behaves as a file system
   without them, so reading finds none (`ENODATA`) and writing gives `EOPNOTSUPP`.
-  In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), a value
-  of `security.capability` is not checked, and a sticky directory does not limit
-  `user.*` to its owner.
+  In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), so it
+  has no POSIX ACLs (`system.posix_acl_access`) where tmpfs has them. A
+  socket file has no `user.*` attributes (writing gives `EPERM`), as on the CI runners'
+  Linux 7.0, where Linux master gives them to sockets too.
 - **Rename flags**: on a Windows host, `renameat2` in a mounted directory
   takes neither `RENAME_NOREPLACE` nor `RENAME_EXCHANGE` (`EINVAL`), as a
   Linux filesystem without them.

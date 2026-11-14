@@ -1642,9 +1642,91 @@ fn xattrs_ask_for_permission_and_capabilities() {
     assert_eq!(f.ret(197, &[path, trusted]), eperm);
     let security = name(&mut f, b"security.a\0");
     assert_eq!(f.ret(191, &[path, security, 0, 0]), 1);
-    assert_eq!(f.ret(188, &[path, security, buffer, 1, 0]), eacces);
+    // The file's access is not asked of security.*, but CAP_SYS_ADMIN is
+    // of a change (`cap_inode_setxattr`).
+    assert_eq!(f.ret(188, &[path, security, buffer, 1, 0]), eperm);
+    assert_eq!(f.ret(197, &[path, security]), eperm);
     // The list hides what cannot be read.
     assert_eq!(f.ret(194, &[path, 0, 0]), 18);
+}
+
+#[test]
+fn file_capabilities_are_checked_converted_and_killed_as_linux_does() {
+    let mut f = fixture();
+    let (path, caps, value, out) = (DATA + 0x100, DATA + 0x200, DATA + 0x300, DATA + 0x400);
+    f.mem.write(GuestAddr(path), b"/caps-file\0").unwrap();
+    f.mem
+        .write(GuestAddr(caps), b"security.capability\0")
+        .unwrap();
+    let fd = f.ret(2, &[path, 0o102, 0o755]);
+    assert!(fd < 1024, "{fd}");
+    let einval = errno(Errno::EINVAL);
+    // magic, then permitted and inheritable twice, then a v3's root.
+    let cap = |f: &mut Fixture, revision: u32, root: u32| {
+        let mut v = (revision | 1).to_le_bytes().to_vec();
+        v.extend_from_slice(&(1u32 << 10).to_le_bytes());
+        v.extend_from_slice(&[0; 12]);
+        if revision == 0x0300_0000 {
+            v.extend_from_slice(&root.to_le_bytes());
+        }
+        f.mem.write(GuestAddr(value), &v).unwrap();
+        v.len() as u64
+    };
+    let read = |f: &mut Fixture| -> (u64, u32) {
+        let n = f.ret(191, &[path, caps, out, 64]);
+        let mut magic = [0; 4];
+        f.mem.read(GuestAddr(out), &mut magic).unwrap();
+        (n, u32::from_le_bytes(magic))
+    };
+    // Neither revision 2 nor 3, or not of its size.
+    let n = cap(&mut f, 0x0100_0000, 0);
+    assert_eq!(f.ret(188, &[path, caps, value, n, 0]), einval);
+    let n = cap(&mut f, 0x0200_0000, 0);
+    assert_eq!(f.ret(188, &[path, caps, value, n + 1, 0]), einval);
+    // Root of the first namespace keeps a revision 2 value.
+    assert_eq!(f.ret(188, &[path, caps, value, n, 0]), 0);
+    assert_eq!(read(&mut f), (20, 0x0200_0001));
+    // A revision 3 value of root reads as revision 2 for root, one of
+    // another root as itself; too small a buffer is ERANGE.
+    let n = cap(&mut f, 0x0300_0000, 0);
+    assert_eq!(f.ret(188, &[path, caps, value, n, 0]), 0);
+    assert_eq!(read(&mut f), (20, 0x0200_0001));
+    let n = cap(&mut f, 0x0300_0000, 1000);
+    assert_eq!(f.ret(188, &[path, caps, value, n, 0]), 0);
+    assert_eq!(read(&mut f), (24, 0x0300_0001));
+    assert_eq!(f.ret(191, &[path, caps, out, 20]), errno(Errno(34)));
+    assert_eq!(f.ret(191, &[path, caps, 0, 0]), 24);
+    // A write takes them away, and so does a chown that changes nothing.
+    f.mem.write(GuestAddr(out), b"x").unwrap();
+    assert_eq!(f.ret(1, &[fd, out, 1]), 1);
+    assert_eq!(f.ret(191, &[path, caps, 0, 0]), errno(Errno(61)));
+    assert_eq!(f.ret(188, &[path, caps, value, n, 0]), 0);
+    assert_eq!(f.ret(92, &[path, u64::MAX, u64::MAX]), 0);
+    assert_eq!(f.ret(191, &[path, caps, 0, 0]), errno(Errno(61)));
+    assert_eq!(f.ret(188, &[path, caps, value, n, 0]), 0);
+    // Without CAP_SETFCAP neither a change nor a removal; anyone reads them,
+    // whatever the file's access.
+    assert_eq!(f.ret(90, &[path, 0]), 0);
+    assert_eq!(f.ret(nr::SETUID, &[1000]), 0);
+    assert_eq!(f.ret(188, &[path, caps, value, n, 0]), errno(Errno::EPERM));
+    assert_eq!(f.ret(197, &[path, caps]), errno(Errno::EPERM));
+    assert_eq!(read(&mut f), (24, 0x0300_0001));
+}
+
+#[test]
+fn only_its_owner_changes_the_user_attributes_of_a_sticky_directory() {
+    let mut f = fixture();
+    let (path, name, value) = (DATA + 0x100, DATA + 0x200, DATA + 0x300);
+    f.mem.write(GuestAddr(path), b"/sticky\0").unwrap();
+    f.mem.write(GuestAddr(name), b"user.a\0").unwrap();
+    assert_eq!(f.ret(83, &[path, 0o1777]), 0);
+    assert_eq!(f.ret(90, &[path, 0o1777]), 0);
+    assert_eq!(f.ret(188, &[path, name, value, 1, 0]), 0);
+    assert_eq!(f.ret(nr::SETUID, &[1000]), 0);
+    // It may write the directory, but not its attributes; it reads them.
+    assert_eq!(f.ret(188, &[path, name, value, 1, 0]), errno(Errno::EPERM));
+    assert_eq!(f.ret(197, &[path, name]), errno(Errno::EPERM));
+    assert_eq!(f.ret(191, &[path, name, 0, 0]), 1);
 }
 
 #[test]

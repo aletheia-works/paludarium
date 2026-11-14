@@ -155,10 +155,24 @@ kernel.
 - Extended attributes stay with a file in memory, through hard links and
   renames and after its last name is gone. As on Linux, `user.*` is for regular
   files and directories (on others, reading gives `ENODATA` and writing `EPERM`),
-  `trusted.*` shows only with `CAP_SYS_ADMIN`, and `security.*` needs it to
-  change. A name is from 1 to 255 bytes (`ERANGE`), a value at most 64 KiB
-  (`E2BIG`), and any other namespace gives `EOPNOTSUPP`. The name is read
-  before the file is found, as since Linux 6.13.
+  and in a sticky directory only its owner or a caller with `CAP_FOWNER`
+  changes them (`EPERM`). `trusted.*` shows only with `CAP_SYS_ADMIN`.
+  `security.*` and `system.*` ask nothing of the file's access, and
+  `security.*` needs `CAP_SYS_ADMIN` to change. A name is from 1 to 255 bytes
+  (`ERANGE`), a value at most 64 KiB (`E2BIG`), and any other namespace gives
+  `EOPNOTSUPP`. The name is read before the file is found, as since Linux 6.13.
+- File capabilities (`security.capability`) are checked and converted as
+  Linux's capability module does. A value written must be a `vfs_cap_data` of
+  revision 2 (20 bytes) or 3 (24 bytes) (`EINVAL`), and the caller needs
+  `CAP_SETFCAP` in a user namespace that maps the file's owner and group
+  (`EPERM`), which removing them needs too. A caller with `CAP_SETFCAP` over
+  the first user namespace keeps a revision 2 value; any other value is
+  stored as revision 3 with the kernel ID of the root it names in the
+  caller's namespace, which must map it (`EINVAL`). Reading gives a revision 3
+  value when the reader's namespace maps that root to an ID other than 0, a
+  revision 2 one when it is root there or above, and `EOVERFLOW` otherwise.
+  A write or truncation of the file, and a `chown` of anything but a
+  directory, takes them away, whoever does it.
 - `setxattrat`, `getxattrat`, `listxattrat` and `removexattrat` (Linux 6.13)
   find the file from a directory descriptor, and take `AT_SYMLINK_NOFOLLOW`
   and `AT_EMPTY_PATH` only (`EINVAL`). With `AT_EMPTY_PATH`, a null or empty

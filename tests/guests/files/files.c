@@ -718,6 +718,77 @@ void _start(void) {
   ts[2]=2000;results[x++]=call(280,-100,(long)fdpath(fd),(long)ts,0,0,0);S(5,fd,st,0);results[x++]=MTIME();
   results[x++]=S(21,fdpath(fd),4,0);
   S(3,op,0,0);S(3,ol,0,0);S(3,dp,0,0);}
+ if(CASE==79){ /* who may change which extended attributes: user.* of a sticky directory, security.* and system.* whatever the file's access, and file capabilities, checked, converted for a user namespace and taken away by a write, a chown and a truncation */
+  static char d[]="/tmp/paludarium-files-caps",f[]="/tmp/paludarium-files-caps/f",z[]="/tmp/paludarium-files-caps/z",s[]="/tmp/paludarium-files-caps/s";
+  static char caps[]="security.capability",user[]="user.paludarium",sec[]="security.paludarium",sys[]="system.paludarium";
+  static unsigned int v[6];static long r[48];static char map[32];
+  #define CAPV(rev,root,n) (v[0]=(rev)|1,v[1]=1u<<10,v[2]=0,v[3]=0,v[4]=0,v[5]=(root),(long)(n))
+  /* Root here, as the emulator runs guests, would have every capability: nobody's IDs instead,
+     dumpable again so that /proc/self is its own, as a process that never changed its IDs. */
+  if(S(102,0,0,0)==0){S(106,65534,0,0);S(105,65534,0,0);S(157,4,1,0);}
+  long uid=S(102,0,0,0),gid=S(104,0,0,0);
+  S(87,f,0,0);S(87,z,0,0);S(84,s,0,0);S(84,d,0,0);
+  results[x++]=S(83,d,0755,0);
+  long fd=S(2,f,0102,0644);results[x++]=fd>=0;S(3,S(2,z,0102,0),0,0);
+  /* A sticky directory: only its owner changes user.*; anyone reads them. */
+  results[x++]=call(188,(long)"/tmp",(long)user,(long)"x",1,0,0);
+  results[x++]=call(191,(long)"/tmp",(long)user,0,0,0,0);
+  results[x++]=S(83,s,01777,0);
+  results[x++]=call(188,(long)s,(long)user,(long)"x",1,0,0);
+  /* security.* and system.* do not ask for the file's access. */
+  results[x++]=call(191,(long)z,(long)sec,(long)buf,8,0,0);
+  results[x++]=call(188,(long)z,(long)sec,(long)"x",1,0,0);
+  results[x++]=call(197,(long)z,(long)sec,0,0,0,0);
+  results[x++]=call(191,(long)z,(long)sys,(long)buf,8,0,0);
+  /* File capabilities: the value first, then CAP_SETFCAP. */
+  results[x++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x02000000,0,3),0,0);
+  results[x++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x01000000,0,12),0,0);
+  results[x++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x03000000,uid,24),0,0);
+  results[x++]=call(191,(long)f,(long)caps,0,0,0,0);
+  /* In a user namespace that maps only the caller's own IDs, which owns the file. */
+  int pf[2];S(22,pf,0,0);
+  long pid=S(57,0,0,0);
+  if(pid==0){
+   long n=0;S(3,pf[0],0,0);
+   r[n++]=S(272,0x10000000,0,0);
+   long m=S(2,"/proc/self/setgroups",1,0);r[n++]=m>=0?S(1,m,"deny",4):m;S(3,m,0,0);
+   for(int which=0;which<2;which++){
+    long id=which?gid:uid;char t[12];int k=0,len=0;do{t[k++]='0'+id%10;id/=10;}while(id);
+    for(int half=0;half<2;half++){for(int i=k-1;i>=0;i--)map[len++]=t[i];map[len++]=' ';}map[len++]='1';
+    m=S(2,which?"/proc/self/gid_map":"/proc/self/uid_map",1,0);r[n++]=m>=0?S(1,m,map,len)==len:m;S(3,m,0,0);
+   }
+   /* A revision 2 value names root, which this namespace does not map. */
+   r[n++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x02000000,0,20),0,0);
+   r[n++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x03000000,uid+1,24),0,0);
+   r[n++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x03000000,uid,24),0,0);
+   v[0]=0;v[5]=0;r[n++]=call(191,(long)f,(long)caps,(long)v,24,0,0);r[n++]=v[0];r[n++]=v[5]==uid;r[n++]=v[1];
+   r[n++]=call(191,(long)f,(long)caps,(long)v,23,0,0);
+   r[n++]=call(194,(long)f,(long)buf,sizeof(buf),0,0,0);
+   /* A write, a chown that changes nothing and a truncation take them away. */
+   long w=S(2,f,1,0);
+   r[n++]=S(1,w,"x",1);r[n++]=call(191,(long)f,(long)caps,0,0,0,0);
+   r[n++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x03000000,uid,24),0,0);
+   r[n++]=S(92,f,-1,-1);r[n++]=call(191,(long)f,(long)caps,0,0,0,0);
+   r[n++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x03000000,uid,24),0,0);
+   r[n++]=S(77,w,0,0);r[n++]=call(191,(long)f,(long)caps,0,0,0,0);
+   r[n++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x03000000,uid,24),0,0);
+   r[n++]=call(197,(long)f,(long)caps,0,0,0,0);
+   r[n++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x03000000,uid,24),0,0);
+   /* Without CAP_SETFCAP, neither a change nor a removal. */
+   static unsigned int hdr[2]={0x20080522,0},cd[6];
+   r[n++]=S(125,hdr,cd,0);cd[0]&=~(1u<<31);cd[1]&=~(1u<<31);r[n++]=S(126,hdr,cd,0);
+   r[n++]=call(188,(long)f,(long)caps,(long)v,CAPV(0x03000000,uid,24),0,0);
+   r[n++]=call(197,(long)f,(long)caps,0,0,0,0);
+   S(1,pf[1],r,n*8);S(60,0,0,0);
+  }
+  S(3,pf[1],0,0);
+  long got=S(0,pf[0],r,sizeof(r));results[x++]=got/8;for(long i=0;i<got/8;i++)results[x++]=r[i];
+  int status=0;results[x++]=call(61,pid,(long)&status,0,0,0,0)==pid;results[x++]=status;
+  /* Outside, the namespace's value is of the caller's own root. */
+  v[0]=0;v[5]=0;results[x++]=call(191,(long)f,(long)caps,(long)v,24,0,0);results[x++]=v[0];results[x++]=v[5]==uid;
+  S(3,fd,0,0);S(3,pf[0],0,0);S(87,f,0,0);S(87,z,0,0);S(84,s,0,0);S(84,d,0,0);
+  #undef CAPV
+ }
  if(CASE==78){ /* cachestat(fd, range, stat, flags): the pages of a range a file's page cache holds, as ext4 and tmpfs both have written ones */
   static char f[]="/tmp/paludarium-files-cachestat";static unsigned long cr[2],cs[5];static char page[4096];
   #define CS(fd,o,l,fl) (cr[0]=(unsigned long)(o),cr[1]=(unsigned long)(l),cs[0]=99,cs[3]=99,call(451,fd,(long)cr,(long)cs,fl,0,0))

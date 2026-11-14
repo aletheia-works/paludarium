@@ -17,6 +17,11 @@ const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: u64 = 65536;
 const XATTR_LIST_MAX: u64 = 65536;
 const NAMESPACES: [&[u8]; 3] = [b"user.", b"trusted.", b"security."];
+use crate::permissions::CAPS;
+const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
+const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
+const VFS_CAP_FLAGS_EFFECTIVE: u32 = 1;
+const CAP_SETFCAP: u64 = 1 << 31;
 const MAY_READ: u32 = 4;
 const MAY_WRITE: u32 = 2;
 const AT_FDCWD: i32 = -100;
@@ -189,26 +194,137 @@ fn namespace(name: &[u8]) -> Result<(), Errno> {
     }
 }
 
-/// `xattr_permission`, then what `cap_inode_setxattr` asks of a change.
+/// `xattr_permission`: `security.*` and `system.*` are left to the security
+/// module and the file system, `trusted.*` needs `CAP_SYS_ADMIN`, and
+/// `user.*` is for regular files and directories, whose access it needs; in
+/// a sticky directory only its owner or a caller with `CAP_FOWNER` may
+/// change them.
 fn permitted(creds: &Credentials, stat: &FileStat, name: &[u8], write: bool) -> Result<(), Errno> {
     // `may_write_xattr`: not an immutable or append-only file (EPERM).
     if write {
         super::attributes::unchangeable(stat)?;
+    }
+    if name.starts_with(b"security.") || name.starts_with(b"system.") {
+        return Ok(());
     }
     let refused = if write { Errno::EPERM } else { ENODATA };
     if name.starts_with(b"trusted.") && !creds.may_administer() {
         return Err(refused);
     }
     let kind = stat.mode & 0o170000;
-    if name.starts_with(b"user.") && kind != 0o100000 && kind != 0o040000 {
-        return Err(refused);
+    if name.starts_with(b"user.") {
+        if kind != 0o100000 && kind != 0o040000 {
+            return Err(refused);
+        }
+        if kind == 0o040000
+            && stat.mode & 0o1000 != 0
+            && write
+            && !crate::permissions::owner_or_capable(creds, stat)
+        {
+            return Err(Errno::EPERM);
+        }
     }
     let mask = if write { MAY_WRITE } else { MAY_READ };
-    crate::permissions::permission(creds, stat, mask)?;
-    if write && name.starts_with(b"security.") && !creds.may_administer() {
+    crate::permissions::permission(creds, stat, mask)
+}
+
+/// What the capability module asks of a change to a `security.*`
+/// attribute (`cap_inode_setxattr`, `cap_inode_removexattr`): `CAP_SYS_ADMIN`,
+/// but for the file capabilities, which `cap_convert_nscap` checks as they
+/// are written and which need `CAP_SETFCAP` over the file to be removed.
+fn security_permitted(
+    creds: &Credentials,
+    stat: &FileStat,
+    name: &[u8],
+    remove: bool,
+) -> Result<(), Errno> {
+    if !name.starts_with(b"security.") {
+        return Ok(());
+    }
+    let allowed = if name == CAPS {
+        !remove || crate::permissions::capable(creds, stat, CAP_SETFCAP)
+    } else {
+        creds.may_administer()
+    };
+    if allowed { Ok(()) } else { Err(Errno::EPERM) }
+}
+
+/// The revision of a `struct vfs_cap_data` (or `vfs_ns_cap_data`) value:
+/// 2 or 3 for one of that revision's size whose magic names it, whatever
+/// its effective flag (`is_v2header`, `is_v3header`).
+fn revision(value: &[u8]) -> Option<u32> {
+    let revision = match value.len() {
+        20 => VFS_CAP_REVISION_2,
+        24 => VFS_CAP_REVISION_3,
+        _ => return None,
+    };
+    let magic = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+    (magic & !VFS_CAP_FLAGS_EFFECTIVE == revision).then_some(revision)
+}
+
+/// `value`'s capabilities as a value of `revision`, the effective flag kept,
+/// with `root` as the root ID of a revision 3 one.
+fn capabilities(value: &[u8], revision: u32, root: u32) -> Vec<u8> {
+    let magic = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+    let mut out = (revision | magic & VFS_CAP_FLAGS_EFFECTIVE)
+        .to_le_bytes()
+        .to_vec();
+    out.extend_from_slice(&value[4..20]);
+    if revision == VFS_CAP_REVISION_3 {
+        out.extend_from_slice(&root.to_le_bytes());
+    }
+    out
+}
+
+/// `cap_convert_nscap`: a value of file capabilities as it is written. It
+/// must be of revision 2 or 3 (`EINVAL`), and the caller needs
+/// `CAP_SETFCAP` in a user namespace that maps the file's owner and group
+/// (`EPERM`). One with `CAP_SETFCAP` over the file system's namespace (the
+/// first) keeps a revision 2 value; any other value becomes a revision 3 one
+/// whose root is the kernel ID of the root it names in the caller's
+/// namespace (0 for revision 2), which that namespace must map (`EINVAL`).
+fn written_capabilities(
+    creds: &Credentials,
+    stat: &FileStat,
+    value: Vec<u8>,
+) -> Result<Vec<u8>, Errno> {
+    let Some(revision) = revision(&value) else {
+        return Err(Errno::EINVAL);
+    };
+    if !crate::permissions::capable(creds, stat, CAP_SETFCAP) {
         return Err(Errno::EPERM);
     }
-    Ok(())
+    if revision == VFS_CAP_REVISION_2 && creds.capable(CAP_SETFCAP) {
+        return Ok(value);
+    }
+    let root = if revision == VFS_CAP_REVISION_3 {
+        u32::from_le_bytes([value[20], value[21], value[22], value[23]])
+    } else {
+        0
+    };
+    let root = creds
+        .user
+        .kernel_of(crate::users::Ids::User, root)
+        .ok_or(Errno::EINVAL)?;
+    Ok(capabilities(&value, VFS_CAP_REVISION_3, root))
+}
+
+/// `cap_inode_getsecurity`: the stored file capabilities as the caller's
+/// user namespace reads them. A root that it maps to an ID other than 0
+/// gives a revision 3 value with that ID; a root that is root there or in a
+/// namespace above gives a revision 2 one; any other root is `EOVERFLOW`,
+/// and a stored value of neither revision `EINVAL`.
+fn read_capabilities(creds: &Credentials, stored: &[u8]) -> Result<Vec<u8>, Errno> {
+    let root = match revision(stored) {
+        Some(VFS_CAP_REVISION_2) => 0,
+        Some(_) => u32::from_le_bytes([stored[20], stored[21], stored[22], stored[23]]),
+        None => return Err(Errno::EINVAL),
+    };
+    match creds.user.id_of(crate::users::Ids::User, root) {
+        Some(mapped) if mapped != 0 => Ok(capabilities(stored, VFS_CAP_REVISION_3, mapped)),
+        _ if creds.user.root_here_or_above(root) => Ok(capabilities(stored, VFS_CAP_REVISION_2, 0)),
+        _ => Err(Errno::EOVERFLOW),
+    }
 }
 
 /// `getxattr`: the name, then the file (as since Linux 6.13), then the value.
@@ -221,9 +337,12 @@ fn get(
     let target = target(c)?;
     permitted(&c.process.credentials, target.stat(), &name, false)?;
     namespace(&name)?;
-    let value = target
+    let mut value = target
         .read(c, |map| map.get(&name).cloned(), None)?
         .ok_or(ENODATA)?;
+    if name == CAPS {
+        value = read_capabilities(&c.process.credentials, &value)?;
+    }
     let length = value.len() as u64;
     if size != 0 {
         if length > size.min(XATTR_SIZE_MAX) {
@@ -283,7 +402,14 @@ fn set(
         .read(GuestAddr(addr), &mut value)
         .map_err(|_| Errno::EFAULT)?;
     let target = target(c)?;
-    permitted(&c.process.credentials, target.stat(), &name, true)?;
+    let creds = &c.process.credentials;
+    // `vfs_setxattr` converts file capabilities before it checks anything
+    // else of the change.
+    if name == CAPS && !value.is_empty() {
+        value = written_capabilities(creds, target.stat(), value)?;
+    }
+    permitted(creds, target.stat(), &name, true)?;
+    security_permitted(creds, target.stat(), &name, false)?;
     namespace(&name)?;
     let mut result = Ok(0);
     target.with(c, &mut |map| {
@@ -309,6 +435,7 @@ fn remove(
     let name = name(c, ptr)?;
     let target = target(c)?;
     permitted(&c.process.credentials, target.stat(), &name, true)?;
+    security_permitted(&c.process.credentials, target.stat(), &name, true)?;
     namespace(&name)?;
     let mut result = Err(ENODATA);
     target.with(c, &mut |map| {

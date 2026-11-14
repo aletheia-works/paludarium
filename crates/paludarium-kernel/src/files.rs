@@ -1063,6 +1063,13 @@ fn chown_file(
     if let Some(mode) = mode_after_chown(stat.mode, keeps_sgid) {
         file.set_mode(mode)?;
     }
+    // `chown_common`'s ATTR_KILL_PRIV: a file that is not a directory loses
+    // its file capabilities (`cap_inode_killpriv`).
+    if stat.mode & 0o170000 != 0o040000 {
+        let _ = file.with_xattrs(&mut |map| {
+            map.remove(crate::permissions::CAPS);
+        });
+    }
     Ok(0)
 }
 /// `chown` of `path`; with `follow` false (`lchown`) a final symbolic link
@@ -1086,6 +1093,11 @@ fn chown_path(
     c.files.fs.set_owner(path, follow, uid, gid)?;
     if let Some(mode) = mode_after_chown(stat.mode, keeps_sgid) {
         c.files.fs.set_mode(path, mode)?;
+    }
+    if stat.mode & 0o170000 != 0o040000 {
+        let _ = c.files.fs.with_xattrs(path, follow, &mut |map| {
+            map.remove(crate::permissions::CAPS);
+        });
     }
     Ok(0)
 }

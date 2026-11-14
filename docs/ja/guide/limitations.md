@@ -324,8 +324,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     動かします。
 - **拡張属性**：マウントしたホストのディレクトリは、拡張属性のないファイルシステムとして
   振る舞います。読むと見つからず（`ENODATA`）、書くと `EOPNOTSUPP` です。メモリ上では、
-  `system.*` の属性はなく（`EOPNOTSUPP`）、`security.capability` の値は確かめず、スティッキー
-  ディレクトリでも `user.*` を持ち主に限りません。
+  `system.*` の属性はなく（`EOPNOTSUPP`）、tmpfs にはある POSIX ACL
+  （`system.posix_acl_access`）もありません。ソケットのファイルは、CI ランナーの
+  Linux 7.0 と同じく `user.*` の属性を持てません（`EPERM`）。Linux master では
+  ソケットにも持たせます。
 - **名前を変えるときのフラグ**：Windows のホストでは、マウントしたディレクトリでの
   `renameat2` は、そのフラグのない Linux のファイルシステムと同じく
   `RENAME_NOREPLACE` も `RENAME_EXCHANGE` も受け付けません（`EINVAL`）。

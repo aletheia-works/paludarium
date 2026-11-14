@@ -164,6 +164,20 @@ impl Namespace {
             .iter()
             .find_map(|extent| extent.up(kernel))
     }
+    /// Whether kernel user ID `kernel` is root here or in a namespace this
+    /// one is nested in (`kuid_root_in_ns`).
+    pub(crate) fn root_here_or_above(&self, kernel: u32) -> bool {
+        let mut at = self;
+        loop {
+            if at.id_of(Ids::User, kernel) == Some(0) {
+                return true;
+            }
+            match at.users.parent.as_deref() {
+                Some(parent) => at = parent,
+                None => return false,
+            }
+        }
+    }
     /// The same, or [`OVERFLOW`] for an ID it does not map, as a system call
     /// shows one (`from_kuid_munged`).
     pub(crate) fn shown(&self, ids: Ids, kernel: u32) -> u32 {

@@ -32,6 +32,7 @@ mod interface;
 mod io_uring;
 mod ipc;
 mod kcmp;
+mod keys;
 mod loopback;
 mod lsm;
 mod mctp;
@@ -1181,6 +1182,8 @@ mod threads_tests;
 #[cfg(test)]
 mod events_tests;
 
+#[cfg(test)]
+mod keys_tests;
 #[cfg(test)]
 mod processes_tests;
 #[cfg(test)]

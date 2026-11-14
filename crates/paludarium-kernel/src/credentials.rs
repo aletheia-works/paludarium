@@ -594,6 +594,9 @@ fn commit(c: &mut Context<'_>, new: Credentials) {
         c.processes.credentials_changed(c.process.pid);
     }
     c.group.set_task_ids(c.tid, new.task_ids());
+    c.group
+        .keyrings(c.tid)
+        .follow_ids(&c.process.credentials, &new);
     c.process.credentials = new;
 }
 

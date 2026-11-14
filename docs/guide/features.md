@@ -58,6 +58,7 @@ kernel.
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl`, `modify_ldt` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
+| Keys | `add_key`, `request_key`, `keyctl` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -1093,6 +1094,31 @@ kernel.
   on the way, `EACCES`; `rename` before it looks the names up), and
   `EPERM` within it, but for a `rename` of a name onto itself, which does
   nothing.
+- The key retention service (`add_key`, `request_key`, `keyctl`), as
+  Linux's `security/keys`: `keyring`, `user` and `logon` keys, each with
+  its serial number, owner, group, permissions (possessor, user, group and
+  other) and expiry. A thread has its thread, process and session keyrings
+  (`fork` and `exec` keep the session one, a new thread gets a thread
+  keyring of its own when its creator has one, and a thread keyring
+  follows the file-system IDs), and each user its `_uid.<uid>`,
+  `_uid_ses.<uid>` and `_persistent.<uid>` keyrings in its user namespace.
+  A search walks nested keyrings as `search_nested_keyrings` does, six
+  deep, with its order of errors (`EKEYREVOKED`, `EKEYEXPIRED`, `EACCES`,
+  a negative key's error), and a key found through the thread's keyrings
+  is possessed. Each user has Linux's quotas (200 keys and 20000 bytes, a
+  million keys and 25 MB for root), which a keyring's links count against
+  too. `keyctl` takes every option of a kernel built without big keys,
+  Diffie-Hellman, asymmetric keys and notifications: `GET_KEYRING_ID`,
+  `JOIN_SESSION_KEYRING` (named sessions too), `UPDATE`, `REVOKE`, `CHOWN`,
+  `SETPERM`, `DESCRIBE`, `CLEAR`, `LINK`, `UNLINK`, `SEARCH`, `READ`,
+  `SET_REQKEY_KEYRING`, `SET_TIMEOUT`, `GET_SECURITY`,
+  `SESSION_TO_PARENT`, `INVALIDATE`, `GET_PERSISTENT`, `RESTRICT_KEYRING`
+  (to take no more links: these types have no restrictions, `ENOENT`), `MOVE` and `CAPABILITIES`; the
+  others give `EOPNOTSUPP`. `request_key` with callout information makes
+  the key negative for 60 seconds, as a failed `/sbin/request-key` does,
+  and gives `ENOENT`, so `INSTANTIATE`, `NEGATE`, `REJECT` and
+  `INSTANTIATE_IOV` find no authority (`EPERM`) and `ASSUME_AUTHORITY` of
+  a key `ENOKEY`.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux

@@ -357,6 +357,17 @@ verified.
     receive buffer, its `truesize` on the CI runner's kernel, while the
     socket's other datagrams take their length, where Linux counts their
     `truesize` too, so a socket may hold more of them before it is full.
+  - Keys have no `/proc/keys`, `/proc/key-users` or `/proc/sys/kernel/keys`,
+    no `big_key`, `asymmetric`, `encrypted` or `trusted` types, no
+    Diffie-Hellman, public-key or watch operations (`EOPNOTSUPP`) and no
+    `/sbin/request-key` to construct a key. The first process starts with
+    no session keyring, where a login gives one, and the kernel's own
+    `.builtin_trusted_keys`, BPF, dm-verity and fs-verity keyrings are not
+    there (`ENOKEY`). The garbage collector's work (unlinking invalidated
+    keys, and keys 5 minutes after they expire) is done as the next key
+    call begins, not by a worker of its own; a thread
+    keyring follows only the file-system IDs that `setfsuid`, `setuid`
+    and the like change.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.

@@ -351,6 +351,9 @@ impl SyscallTable {
         handlers.insert(313, crate::admin::sys_finit_module);
         handlers.insert(320, crate::admin::sys_kexec_file_load);
         handlers.insert(443, crate::admin::sys_quotactl_fd);
+        handlers.insert(248, crate::keys::sys_add_key);
+        handlers.insert(249, crate::keys::sys_request_key);
+        handlers.insert(250, crate::keys::sys_keyctl);
         handlers.insert(139, crate::filesystems::sys_sysfs);
         handlers.insert(335, sys_uretprobe);
         handlers.insert(336, sys_uprobe);

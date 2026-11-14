@@ -50,6 +50,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl`、`modify_ldt` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
+| 鍵 | `add_key`、`request_key`、`keyctl` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm`、`syslog`、`sysfs` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -968,6 +969,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   パスをたどったあと（途中の各ディレクトリを検索でき、なければ `EACCES`）で `EXDEV`
   （`rename` は名前を引く前）、その中では `EPERM` です。ただし、名前をそれ自身へ `rename`
   すると何もせずに成功します。
+- 鍵の保管サービス（`add_key`、`request_key`、`keyctl`）は Linux の `security/keys`
+  と同じです。`keyring`、`user`、`logon` の鍵があり、それぞれに通し番号、所有者、グループ、
+  許可（所持者、ユーザー、グループ、その他）、期限があります。スレッドはスレッド、
+  プロセス、セッションのキーリングを持ちます（`fork` と `exec` はセッションのものを残し、
+  新しいスレッドは、作ったスレッドが持っていれば自分のスレッドのキーリングを持ちます。
+  スレッドのキーリングはファイルシステムの ID に従います）。ユーザーはユーザー名前空間に
+  `_uid.<uid>`、`_uid_ses.<uid>`、`_persistent.<uid>` のキーリングを持ちます。検索は
+  `search_nested_keyrings` と同じく入れ子のキーリングを 6 段までたどり、エラーの順
+  （`EKEYREVOKED`、`EKEYEXPIRED`、`EACCES`、否定の鍵のエラー）もそのとおりです。スレッドの
+  キーリングから見つかった鍵は所持しているものとします。ユーザーごとに Linux と同じ割り当て
+  （鍵 200 個と 20000 バイト。ルートは 100 万個と 25 MB）があり、キーリングのリンクも
+  そこに数えます。`keyctl` は、big key、Diffie-Hellman、非対称鍵、通知のないカーネルの
+  すべてのオプションを受け付けます。`GET_KEYRING_ID`、`JOIN_SESSION_KEYRING`（名前付きの
+  セッションも）、`UPDATE`、`REVOKE`、`CHOWN`、`SETPERM`、`DESCRIBE`、`CLEAR`、`LINK`、
+  `UNLINK`、`SEARCH`、`READ`、`SET_REQKEY_KEYRING`、`SET_TIMEOUT`、`GET_SECURITY`、
+  `SESSION_TO_PARENT`、`INVALIDATE`、`GET_PERSISTENT`、`RESTRICT_KEYRING`（これ以上リンクを
+  取らないものだけ。ここの型には制限がなく `ENOENT`）、`MOVE`、`CAPABILITIES` です。ほかは `EOPNOTSUPP` です。呼び出し情報つきの
+  `request_key` は、`/sbin/request-key` が失敗したときと同じく鍵を 60 秒の否定の鍵にして
+  `ENOENT` を返します。そのため `INSTANTIATE`、`NEGATE`、`REJECT`、`INSTANTIATE_IOV` は
+  権限を見つけられず（`EPERM`）、鍵の `ASSUME_AUTHORITY` は `ENOKEY` です。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。

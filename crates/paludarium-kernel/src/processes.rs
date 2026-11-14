@@ -222,6 +222,8 @@ pub struct Processes {
     /// The `memfd_secret` pages each user has (Linux's `locked_vm` of its
     /// `user_struct`).
     pub(crate) secret_pages: Arc<crate::memfd::SecretPages>,
+    /// The machine's keys and keyrings.
+    pub(crate) keys: crate::keys::Keys,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -241,6 +243,7 @@ impl Processes {
             cpus: Arc::default(),
             mqueue_charges: Arc::default(),
             secret_pages: Arc::default(),
+            keys: crate::keys::Keys::default(),
             mqueue_mount: group.namespaces(1).ipc.mq.clone(),
             kcmp_cookies: std::sync::OnceLock::new(),
             aio: Arc::default(),
@@ -1028,6 +1031,10 @@ impl Processes {
             terminal: entry.terminal.clone(),
             space: Arc::clone(&entry.space),
         })
+    }
+    /// The parent of process `pid`, 0 for none.
+    pub(crate) fn parent_of(&self, pid: u32) -> u32 {
+        self.parent(pid)
     }
     fn parent(&self, pid: u32) -> u32 {
         self.entries
@@ -3081,6 +3088,9 @@ impl Kernel {
         let mut state = parent.state.clone();
         state.credentials = credentials.clone();
         state.pid = pid;
+        // A new process keeps the session keyring, not the thread's or the
+        // process's keyring (`copy_creds`).
+        group.set_keyrings(pid, self.group.keyrings(parent.tid).for_process());
         state.pending.clear();
         // Nothing has come for the new task yet, which its group counts.
         state.arrivals = 0;
@@ -4388,6 +4398,8 @@ impl Kernel {
         // exec deletes the POSIX timers (the interval timer stays).
         self.group
             .with_timers(&mut thread.state, |timers| timers.clear());
+        // exec keeps the session keyring (`prepare_exec_creds`).
+        let keyrings = self.group.keyrings(thread.tid).after_exec();
         // The thread's undo list goes with its new number.
         if thread.tid != self.process.pid
             && let Some(list) = self.group.take_sem_undo_list(thread.tid)
@@ -4441,6 +4453,7 @@ impl Kernel {
             .executed_as(self.process.pid, dumpable, secure || changed, secure);
         self.group
             .reset_task_ids(self.process.pid, credentials.task_ids());
+        self.group.reset_keyrings(self.process.pid, keyrings);
         self.group
             .reset_seccomp(self.process.pid, &thread.state.seccomp);
         self.group.reset_namespaces(self.process.pid, namespaces);

@@ -566,7 +566,13 @@ kernel.
   after out-of-band data. Its timeout is read (`EFAULT`) and checked
   (`EINVAL`) before the descriptor, but, as on Linux, it is looked at only
   after each message, so the first is waited for without it; the time left
-  is written back once a message came.
+  is written back once a message came. `recvmmsg` first gives the socket's
+  pending error, unless `MSG_ERRQUEUE` asks for its error queue, and an
+  error after some messages other than `EAGAIN` becomes that pending error,
+  for the next call or `SO_ERROR` (a wait a signal would restart leaves
+  `ERESTARTSYS`'s 512 there, as on Linux). A datagram or packet socket's
+  receive gives it before its queue too, and an AF_UNIX stream's only once
+  nothing is queued, as Linux's `unix_stream_read_generic` does.
 - Sockets that only unread messages hold are closed, as Linux's garbage
   collector (`unix_gc`) closes them when a socket goes: a socket whose
   descriptor waits in its own queue, or sockets that hold each other so,
@@ -889,7 +895,11 @@ kernel.
   process when it moves. A file mapping grows over more of the file, whose
   pages it reads when they are first touched, and moving a range that spans
   several mappings with `MREMAP_FIXED`, which recent Linux allows, gives
-  `EFAULT`.
+  `EFAULT`. The rings of AIO and `io_uring` are fixed mappings
+  (`VM_DONTEXPAND`): they do not grow (`EFAULT`) or stay behind a move
+  (`MREMAP_DONTUNMAP`, `EINVAL`), and an AIO ring moves only whole, as
+  Linux master's `aio_ring_mremap` has it (`EINVAL` once the target is
+  free and what a shrink drops is gone), with its context.
 - `msync` checks its arguments and the range, and with `MS_SYNC` or
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
 - `remap_file_pages` maps a range of a shared mapping again at another page
@@ -1617,6 +1627,26 @@ kernel.
     `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
     answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,
     which none is).
+  - **Route lookup selectors:** a lookup takes what else the request names,
+    as `ip route get ... from ... oif ... tos ... ipproto ...` sends it,
+    as `ip_route_output_key_hash_rcu` and `ip6_route_output` do. An IPv4
+    source (`RTA_SRC`) must be the loopback's (`ENETUNREACH`; `EINVAL` for
+    a multicast or broadcast one), and the answer names it as `RTA_SRC`
+    instead of the `RTA_PREFSRC` it would pick. An output device
+    (`RTA_OIF`) is `ENODEV` but for `lo` and `ENETUNREACH` while it is
+    down; where the tables give no route or an error, an IPv4 destination
+    is taken to be on link through it (of no table, which
+    `RTM_F_FIB_MATCH` makes `EHOSTUNREACH`), and `0.0.0.0` leaves from the
+    address of host scope it picks. The IPv4 tables match a route's TOS
+    against the request's legacy TOS bits, and the answer gives the TOS of
+    the route that matched. An IPv6 answer gives the request's source as
+    `RTA_SRC`, and an output device but `lo` finds no route
+    (`ENETUNREACH`) without a source, or to a loopback, link-local or
+    multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
+    and the family's ICMP, and `RTA_IIF` is `ENODEV` for a device there is
+    not. The mark, the user ID, the protocol and the ports choose among
+    policy rules and multipath routes, which there are none of, so they
+    change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed
@@ -2314,7 +2344,9 @@ kernel.
   `gettimeofday`. The tick is the host's, the resolution of its
   `CLOCK_MONOTONIC_COARSE` (1 ms where the host does not tell, as on macOS,
   Windows and in WebAssembly), the one the scheduler calls use, and here the ticks
-  fall on whole multiples of it on each clock. `clock_getres` gives 1 ns,
+  fall on whole multiples of it on the monotonic clock, both coarse clocks
+  moving at the same instant, as Linux's timekeeping updates both at each
+  tick. `clock_getres` gives 1 ns,
   and the tick for the coarse clocks.
 - `clock_nanosleep` and `timer_create` run on `CLOCK_REALTIME`,
   `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, `CLOCK_TAI` and the process's CPU
@@ -2330,7 +2362,11 @@ kernel.
   (`EPERM`); `timer_create` writes the timer's ID out before it refuses
   one, and the ID is used up, as it is when it cannot be written
   (`EFAULT`). `timer_create` also runs on the CPU clocks of the caller's
-  process and threads by number; it finds the task after the ID is out,
+  process and threads, and of other processes, by number; a timer on
+  another process's CPU time is expired by that process's checkpoints
+  while it is armed, as Linux's tick of that process expires it, and its
+  signal comes to the process that made it; once that process is reaped
+  the timer gives `ESRCH` to set and shows nothing. It finds the task after the ID is out,
   as Linux's `posix_cpu_timer_create` does, so a task that is not there
   gives `EINVAL` with the ID used up. A dynamic clock has no timers and
   cannot sleep (`EOPNOTSUPP`). A sleep on a CPU clock by number reads its
@@ -2339,8 +2375,7 @@ kernel.
   sleeps as below, and on another task's it returns at once when its time
   has come (a relative 0, or an absolute time the clock has reached), as
   Linux's `posix_cpu_nsleep`, but one that would wait for that task's CPU
-  time is not modelled (`EINVAL`), nor is a timer on another process's
-  CPU time.
+  time is not modelled (`EINVAL`).
 - A sleep on the process's CPU clock ends once the process's threads
   together have used the time, as Linux's `do_cpu_nanosleep`: a time that
   has passed, or none to sleep, returns at once, and the sleeping thread

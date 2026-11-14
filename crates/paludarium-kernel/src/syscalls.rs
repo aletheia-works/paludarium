@@ -532,9 +532,17 @@ fn read_clock(c: &mut Context<'_>, clock: GuestClock) -> Result<u64, Errno> {
     let thread = crate::account_cpu(c.host, c.group, c.process, c.tid);
     match clock {
         GuestClock::Host(id) => c.host.clock(id),
+        // The ticks fall on whole multiples of the tick on the monotonic
+        // clock, and the real-time clock takes its time at the same instant,
+        // as Linux's timekeeping updates both at each tick.
         GuestClock::Coarse(id) => {
             let tick = scheduler_slice(c.host).tick;
-            c.host.clock(id).map(|now| now - now % tick)
+            let mono = c.host.clock(ClockId::Monotonic)?;
+            let since = mono % tick;
+            match id {
+                ClockId::Monotonic => Ok(mono - since),
+                ClockId::Realtime => c.host.clock(id).map(|now| now.saturating_sub(since)),
+            }
         }
         GuestClock::ProcessCpu => Ok(c.group.process_cpu()),
         GuestClock::ThreadCpu => Ok(thread),
@@ -1123,7 +1131,8 @@ fn outcome(result: Result<u64, Errno>) -> Outcome {
 /// CPU-time clocks of the calling process and of its threads, by number
 /// too ([`cpu_clock`], Linux's `posix_cpu_timer_create`). A dynamic clock
 /// has no timers (`EOPNOTSUPP`). A timer on another process's CPU time is
-/// not modelled (`EINVAL`).
+/// expired by that process's checkpoints
+/// ([`crate::ThreadGroup::watch_cpu`]).
 fn posix_timer_clock(c: &Context<'_>, id: u64) -> Result<crate::timers::TimerClock, Errno> {
     use crate::timers::TimerClock;
     match id as u32 as i32 {
@@ -1135,7 +1144,12 @@ fn posix_timer_clock(c: &Context<'_>, id: u64) -> Result<crate::timers::TimerClo
             GuestClock::ProcessCpu => Ok(TimerClock::Process),
             GuestClock::ThreadCpu => Ok(TimerClock::Thread(c.tid)),
             GuestClock::OtherThreadCpu(tid) => Ok(TimerClock::Thread(tid)),
-            // A timer on another process's CPU time is not modelled.
+            // cpu_clock found the process by this number.
+            GuestClock::OtherProcessCpu(_) => c
+                .pid_space()
+                .task(!(id >> 3) as u32)
+                .map(TimerClock::OtherProcess)
+                .ok_or(Errno::EINVAL),
             _ => Err(Errno::EINVAL),
         },
         _ => timer_clock(id, Errno::EINVAL).map(|clock| match clock {
@@ -1295,6 +1309,23 @@ fn timer_id(value: u64) -> i32 {
     value as u32 as i32
 }
 
+/// The time of a POSIX timer's clock ([`crate::ThreadGroup::timer_clock_now`]),
+/// another process's CPU time too: `ESRCH` once that process is reaped, as
+/// Linux's `timer_lock_sighand` finds no task.
+fn timer_clock_now(
+    c: &Context<'_>,
+    clock: crate::timers::TimerClock,
+    mono: u64,
+) -> Result<u64, Errno> {
+    match clock {
+        crate::timers::TimerClock::OtherProcess(pid) => c
+            .processes
+            .view(pid)
+            .map(|view| view.group.process_cpu())
+            .ok_or(Errno(3)),
+        clock => c.group.timer_clock_now(clock, mono),
+    }
+}
 /// The clock of timer `id`, which a CPU-time timer's time is sampled on
 /// before the timers are locked.
 fn timer_clock_of(c: &Context<'_>, id: i32) -> Result<crate::timers::TimerClock, Errno> {
@@ -1353,10 +1384,18 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         let clock = timer_clock_of(c, timer_id(a[0]))?;
         if clock.is_cpu() {
             crate::account_cpu(c.host, c.group, c.process, c.tid);
-            let now = c.group.timer_clock_now(clock, mono)?;
+            let now = timer_clock_now(c, clock, mono)?;
             let old = c.group.with_timers(c.process, |timers| {
                 set_cpu_timer(timers.get_mut(timer_id(a[0]))?, a[1], new, now)
             })?;
+            // Another process's checkpoints expire a timer on its CPU time.
+            if let crate::timers::TimerClock::OtherProcess(pid) = clock
+                && value != 0
+                && let (Some(target), Some(own)) =
+                    (c.processes.view(pid), c.processes.view(c.process.pid))
+            {
+                target.group.watch_cpu(pid, &own.group);
+            }
             if a[3] != 0 {
                 write_words(c.mem, a[3], &old)?;
             }
@@ -1397,7 +1436,7 @@ fn sys_timer_gettime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // thread whose clock it is has gone (Linux's `posix_cpu_timer_get`).
         let now = if clock.is_cpu() {
             crate::account_cpu(c.host, c.group, c.process, c.tid);
-            c.group.timer_clock_now(clock, mono).ok()
+            timer_clock_now(c, clock, mono).ok()
         } else {
             Some(mono)
         };

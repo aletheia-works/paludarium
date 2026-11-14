@@ -206,9 +206,8 @@ verified.
   `EINVAL` unless the file is ready, is guessed from the kind of file: a FIFO
   open to read and write, and a character device (a terminal). A ring holds
   exactly one request fewer than its events, where Linux's per-CPU counts
-  can stop one sooner; the I/O priority of `IOCB_FLAG_IOPRIO` is checked but
-  changes nothing; and a ring `mremap` moves is found at its new address
-  only when it moved whole (Linux refuses a partial move).
+  can stop one sooner; and the I/O priority of `IOCB_FLAG_IOPRIO` is checked
+  but changes nothing.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
   - `pwritev2`'s `RWF_NOAPPEND` cannot turn an `O_APPEND` file's append off
@@ -236,9 +235,6 @@ verified.
     where Linux copies no page table of a VMA without an `anon_vma`
     (`-ENOENT` until the child touches the page): the loader's copy is
     the only one the page has here.
-  - An error that ends `recvmmsg` after some messages is dropped, where
-    Linux keeps it as the socket's error for the next call and
-    `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.
   - A fault of a `memfd_secret` page takes the faulting process's
     `RLIMIT_MEMLOCK` as of its last system call (its creator's before
     one), and the pages count only `memfd_secret` files, where Linux's
@@ -261,8 +257,15 @@ verified.
     CPU clock, which the sleeping thread looks at every tick; where that is
     wall time, the sleep counts its own time too, so a process alone ends
     it after the wall time it asked for.
-    `timer_create` on another process's CPU clock gives `EINVAL`, where
-    Linux makes the timer, and a sleep on another task's CPU clock gives
+    A timer on another process's CPU time is looked at as that process's
+    threads make system calls, the same way. Another process's CPU time,
+    read or set from outside it, is each of its threads' as of that thread's
+    last account (its last system call, while nothing timed that process),
+    as a thread's CPU time can only be measured by the thread itself: a
+    timer set on it counts from there, so its first expiry can come early
+    by what the process ran since then without a system call, and
+    `timer_gettime` can show more time left, where Linux samples the
+    running threads at once. A sleep on another task's CPU clock gives
     `EINVAL` unless its time has already come, where Linux waits until that
     task has used the time.
   - The time cannot be set: `settimeofday`, `clock_settime` and an
@@ -494,10 +497,13 @@ verified.
   `lo` while it is down is `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
   of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
-  lookup while `lo` is down is `ENETUNREACH` too. A route lookup looks at
-  no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
-  the rest are not); its `rta_cacheinfo` counts one reference, where
-  Linux counts the other users of the cached route too.
+  lookup while `lo` is down is `ENETUNREACH` too. A route lookup of a
+  multicast or the limited broadcast address answers with the route the
+  tables give, where Linux's answer is of the multicast or broadcast kind
+  `__mkroute_output` makes for them; its `rta_cacheinfo` counts one
+  reference, where Linux counts the other users of the cached route too.
+  `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the
+  cached route, so that later lookups through it are marked too.
   Notifications go out for the link, its IPv6 information, addresses and
   routes alone, not for neighbours, netconf or the other groups, nor to a
   socket in another namespace (`NETLINK_LISTEN_ALL_NSID` is not

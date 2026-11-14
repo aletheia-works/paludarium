@@ -140,7 +140,7 @@ fn below<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 /// `path` with the directories above its last name resolved, as the entry a
 /// rename or a removal changes: none for the root or a missing directory.
 fn entry_path(fs: &dyn HostFs, path: &[u8]) -> Option<Vec<u8>> {
-    let trimmed = path.strip_suffix(b"/").unwrap_or(path);
+    let trimmed = path.trim_suffix(b"/");
     let at = trimmed.iter().rposition(|&b| b == b'/')?;
     let name = &trimmed[at + 1..];
     if name.is_empty() || name == b"." || name == b".." {

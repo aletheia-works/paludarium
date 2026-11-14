@@ -114,16 +114,18 @@ fn coarse_clocks_and_time_give_the_latest_tick() {
     f.host
         .set_clock(paludarium_host::ClockId::Realtime, 5_999_999_999);
     f.host
-        .set_clock(paludarium_host::ClockId::Monotonic, 2_000_999_999);
-    // CLOCK_REALTIME_COARSE and CLOCK_MONOTONIC_COARSE: the latest of the
-    // host's ticks.
+        .set_clock(paludarium_host::ClockId::Monotonic, 2_000_500_000);
+    // CLOCK_MONOTONIC_COARSE: the latest of the host's ticks, on whole
+    // multiples of it; CLOCK_REALTIME_COARSE: the real time at that same
+    // instant, whatever its own phase.
     let tick = syscalls::scheduler_slice(&*f.host).tick;
+    let since = 2_000_500_000 % tick;
     assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[5, DATA]), 0);
-    let coarse = 5_999_999_999 - 5_999_999_999 % tick;
+    let coarse = 5_999_999_999 - since;
     assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), coarse / 1_000_000_000);
     assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), coarse % 1_000_000_000);
     assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[6, DATA]), 0);
-    let coarse = 2_000_999_999 - 2_000_999_999 % tick;
+    let coarse = 2_000_500_000 - since;
     assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), coarse / 1_000_000_000);
     assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), coarse % 1_000_000_000);
     // The precise clocks are not cut.
@@ -131,6 +133,12 @@ fn coarse_clocks_and_time_give_the_latest_tick() {
     assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 999_999_999);
     // time() gives CLOCK_REALTIME_COARSE's seconds.
     assert_eq!(f.ret(syscalls::nr::TIME, &[0]), 5);
+    // A real time nearer its start than the monotonic clock is to its tick
+    // stops at 0.
+    f.host.set_clock(paludarium_host::ClockId::Realtime, since / 2);
+    assert_eq!(f.ret(syscalls::nr::CLOCK_GETTIME, &[5, DATA]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA)).unwrap(), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(DATA + 8)).unwrap(), 0);
 }
 #[test]
 fn time_clock_serialization() {

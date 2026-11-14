@@ -129,7 +129,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // addresses, monitor, routes, route-dump, route-metrics, link-attributes, generic-netlink, sock-diag, inet-diag and msg cases, whose checks depend on
+            // addresses, monitor, routes, route-dump, route-metrics, route-selectors, link-attributes, generic-netlink, sock-diag, inet-diag and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts), the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
@@ -179,6 +179,7 @@ mod linux {
                     | "routes"
                     | "route-dump"
                     | "route-metrics"
+                    | "route-selectors"
                     | "netlink-strict"
                     | "link-attributes"
                     | "generic-netlink"
@@ -270,7 +271,7 @@ mod linux {
             // clock does not pass.
             if matches!(
                 mode,
-                "cpu-itimer" | "rlimit-cpu" | "cpu-timer" | "cpu-sleep"
+                "cpu-itimer" | "rlimit-cpu" | "cpu-timer" | "cpu-sleep" | "cpu-timer-others"
             ) {
                 host.measure_cpu_time();
             }
@@ -320,6 +321,7 @@ mod linux {
         processes_routes => ("routes","process"),
         processes_route_dump => ("route-dump","process"),
         processes_route_metrics => ("route-metrics","process"),
+        processes_route_selectors => ("route-selectors","process"),
         processes_netlink_strict => ("netlink-strict","process"),
         processes_link_attributes => ("link-attributes","process"),
         processes_generic_netlink => ("generic-netlink","process"),
@@ -384,6 +386,7 @@ mod linux {
         aio_getevents => ("aio-getevents","aio"),
         aio_full => ("aio-full","aio"),
         aio_lifetime => ("aio-lifetime","aio"),
+        aio_mremap => ("aio-mremap","aio"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -553,6 +556,7 @@ mod linux {
         processes_time_set => ("time-set","process"),
         processes_timer_limits => ("timer-limits","process"),
         processes_cpu_sleep => ("cpu-sleep","process"),
+        processes_cpu_timer_others => ("cpu-timer-others","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         vfork_exit => ("vfork-exit","process"),

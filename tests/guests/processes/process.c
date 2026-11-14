@@ -1304,7 +1304,7 @@ static void nl_route_attribute(unsigned short type, const unsigned char *v, int 
     unsigned value = 0;
     if (len == 4) memcpy(&value, v, 4);
     printf(" %u", type);
-    if ((type == 1 || type == 5 || type == 7) && (len == 4 || len == 16)) {
+    if ((type == 1 || type == 2 || type == 5 || type == 7) && (len == 4 || len == 16)) {
         inet_ntop(len == 4 ? AF_INET : AF_INET6, v, text, sizeof text);
         printf("=%s", text);
     } else if (type == 5 && len == 8) {
@@ -1673,6 +1673,34 @@ static void nl_metrics(int fd, unsigned port, unsigned short type, unsigned shor
     if (kind == 1) nl_put32(&b, 4, 1);
     if (m) nl_put(&b, 8, m->bytes, m->len);
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, b.bytes, b.len), port, label);
+}
+/* The route-selectors case: a lookup (RTM_GETROUTE without a dump) of
+   `dst` (none for NULL) with TOS `tos` and `flags`, from `src` (none for
+   NULL), through `oif` and in from `iif` (none for 0), of protocol `proto`
+   (none for 0); prints the answer. */
+static void nl_select(int fd, unsigned port, const char *dst, unsigned tos, unsigned flags, const char *src,
+                      unsigned oif, unsigned iif, int proto, const char *label) {
+    const char *any = dst ? dst : src ? src : "0.0.0.0";
+    int family = strchr(any, ':') ? AF_INET6 : AF_INET, size = family == AF_INET ? 4 : 16;
+    struct nl_body b = nl_body(family, 12);
+    b.bytes[3] = tos;
+    memcpy(b.bytes + 8, &flags, 4);
+    unsigned char address[16];
+    if (dst) {
+        b.bytes[1] = size * 8;
+        inet_pton(family, dst, address);
+        nl_put(&b, 1, address, size);
+    }
+    if (src) {
+        b.bytes[2] = size * 8;
+        inet_pton(family, src, address);
+        nl_put(&b, 2, address, size);
+    }
+    if (oif) nl_put32(&b, 4, oif);
+    if (iif) nl_put32(&b, 3, iif);
+    unsigned char p = proto;
+    if (proto) nl_put(&b, 27, &p, 1);
+    nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, b.bytes, b.len), port, label);
 }
 /* A /32 address of lo, `ip`, as `ip address add` makes it. */
 static int nl_local(int fd, const unsigned char ip[4]) {
@@ -9764,6 +9792,62 @@ static int cpu_clock_ids_case(void) {
            after_none, last, next);
     return 0;
 }
+/* A POSIX timer on another process's CPU clock, by number: the child's
+ * checkpoints expire it, as Linux's tick of that process does, and the
+ * signal comes to the process that made it. What is printed holds whatever
+ * the speed. */
+static int cpu_timer_others_case(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    int gate[2];
+    if (pipe(gate)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        char c;
+        close(gate[1]);
+        read(gate[0], &c, 1);
+        cs_spin((void *)200000000L);
+        _exit(0);
+    }
+    close(gate[0]);
+    clockid_t clock = CI_CLOCK(kid, 0, 2);
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGUSR1;
+    sev.sigev_value.sival_int = 77;
+    timer_t timer, quiet;
+    long made = syscall(SYS_timer_create, clock, &sev, &timer) ? -errno : 0;
+    sev.sigev_notify = SIGEV_NONE;
+    long made_quiet = syscall(SYS_timer_create, clock, &sev, &quiet) ? -errno : 0;
+    struct itimerspec it = {{0, 0}, {0, 30000000L}}, now;
+    long set_timer = syscall(SYS_timer_settime, timer, 0, &it, NULL) ? -errno : 0;
+    it.it_value.tv_sec = 100;
+    long set_quiet = syscall(SYS_timer_settime, quiet, 0, &it, NULL) ? -errno : 0;
+    syscall(SYS_timer_gettime, quiet, &now);
+    printf("made=%ld,%ld set=%ld,%ld quiet-armed=%d\n", made, made_quiet, set_timer, set_quiet,
+           now.it_value.tv_sec > 90);
+    /* The child spins: its time ends the timer, and the signal is ours. */
+    write(gate[1], "g", 1);
+    siginfo_t info;
+    struct timespec limit = {10, 0};
+    long got = sigtimedwait(&set, &info, &limit);
+    printf("signal=%ld code=%d value=%d\n", got, info.si_code, info.si_value.sival_int);
+    syscall(SYS_timer_gettime, timer, &now);
+    printf("one-shot done=%d\n", now.it_value.tv_sec == 0 && now.it_value.tv_nsec == 0);
+    /* Once the child is reaped, the timers have no clock: ESRCH to set,
+       nothing to read. */
+    waitpid(kid, NULL, 0);
+    long reset = syscall(SYS_timer_settime, timer, 0, &it, NULL) ? -errno : 0;
+    now.it_value.tv_sec = 9;
+    syscall(SYS_timer_gettime, quiet, &now);
+    printf("reaped set=%ld quiet=%ld delete=%ld\n", reset, (long)now.it_value.tv_sec,
+           syscall(SYS_timer_delete, timer) ? -errno : 0L);
+    return 0;
+}
 static int pidfd_getfd_case(void) {
     if (pipe(pv_gate)) return 80;
     struct pv_task child = pv_child(1), locked = pv_child(0);
@@ -9923,6 +10007,49 @@ static int mmsg_case(void) {
     printf("timed=%ld left-ok=%d empty=%ld\n", timed,
            t.tv_sec >= 0 && t.tv_sec <= 5 && (t.tv_sec || t.tv_nsec),
            mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 2L, (long)MSG_DONTWAIT, NULL)));
+    /* An error after a message is the socket's: SO_ERROR takes it, and so
+     * does the next call, before any message. An empty queue is none. */
+    om[1].msg_hdr.msg_iov = &oi[1];
+    struct iovec *bad_iov = (struct iovec *)8;
+    int so_error = -1;
+    socklen_t so_len = sizeof so_error;
+#define MM_SO_ERROR() (so_error = -1, so_len = sizeof so_error, \
+                       getsockopt(sv[1], SOL_SOCKET, SO_ERROR, &so_error, &so_len), so_error)
+    long three = mm_errno(syscall(SYS_sendmmsg, (long)sv[0], om, 3L, 0L));
+    im[2].msg_hdr.msg_iov = bad_iov;
+    long kept = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 3L, (long)MSG_DONTWAIT, NULL));
+    int first = MM_SO_ERROR();
+    int second = MM_SO_ERROR();
+    printf("kept sent=%ld received=%ld so-error=%d then=%d\n", three, kept, first, second);
+    im[1].msg_hdr.msg_iov = bad_iov;
+    long last = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 3L, (long)MSG_DONTWAIT, NULL));
+    syscall(SYS_sendmmsg, (long)sv[0], om, 1L, 0L);
+    long before = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 1L, (long)MSG_DONTWAIT, NULL));
+    long after = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 1L, (long)MSG_DONTWAIT, NULL));
+    printf("next-call last=%ld before=%ld after=%ld\n", last, before, after);
+    syscall(SYS_sendmmsg, (long)sv[0], om, 1L, 0L);
+    long one = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 3L, (long)MSG_DONTWAIT, NULL));
+    long errqueue = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 1L, (long)(MSG_DONTWAIT | 0x2000), NULL));
+    printf("errqueue one=%ld errqueue=%ld so-error=%d\n", one, errqueue, MM_SO_ERROR());
+    im[1].msg_hdr.msg_iov = &ii[1];
+    im[2].msg_hdr.msg_iov = &ii[2];
+    syscall(SYS_sendmmsg, (long)sv[0], om, 1L, 0L);
+    long empty_after = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 3L, (long)MSG_DONTWAIT, NULL));
+    printf("empty-after=%ld so-error=%d\n", empty_after, MM_SO_ERROR());
+#undef MM_SO_ERROR
+    /* A stream gives the kept error only once nothing is queued. */
+    int st[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, st)) return 82;
+    char stream_buf[8];
+    if (write(st[0], "hello", 5) != 5) return 83;
+    im[1].msg_hdr.msg_iov = bad_iov;
+    long stream_kept = mm_errno(syscall(SYS_recvmmsg, (long)st[1], im, 2L, (long)MSG_DONTWAIT, NULL));
+    if (write(st[0], "abc", 3) != 3) return 84;
+    long queued = mm_errno(recv(st[1], stream_buf, sizeof stream_buf, MSG_DONTWAIT));
+    long then_error = mm_errno(recv(st[1], stream_buf, sizeof stream_buf, MSG_DONTWAIT));
+    long then_none = mm_errno(recv(st[1], stream_buf, sizeof stream_buf, MSG_DONTWAIT));
+    printf("stream kept=%ld len=%u queued=%ld then=%ld,%ld\n", stream_kept, im[0].msg_len, queued,
+           then_error, then_none);
     return 0;
 }
 /* memfd_secret (447), as Linux's secretmem: a file of its own that only a
@@ -13183,6 +13310,97 @@ int main(int argc, char **argv) {
             b = nl_body(AF_INET, 12);
             nl_put32(&b, 200, 0);
             nl_strict(loose, name.pid, 26, 0, &b, "loose get4 unknown type");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "route-selectors")) {
+        /* A child makes a network namespace with lo up, a route of a TOS
+           beside one of none and a blackhole route, and looks routes up by
+           what else a request names, as `ip route get ... from ... oif ...
+           tos ... ipproto ...` sends it: the source, the output device, the
+           TOS and the protocol, those taken and those refused. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            const unsigned short add = 0x600;
+#define ROUTE4(...) ((struct nl_rt){.family = AF_INET, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "add plain");
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.tos = 0x10, .scope = 253, .oif = 1), "add tos");
+            /* A TOS past the legacy bits is taken, and matches nothing. */
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.tos = 0x20, .scope = 253, .oif = 1), "add tos 0x20");
+            nl_route(ctl, port, 24, add, "10.6.0.0", 16, ROUTE4(.kind = 6), "add blackhole");
+#undef ROUTE4
+            /* A device no namespace has: Linux may have fallback tunnels of
+               small indices in every one. */
+            const unsigned none = 1000000;
+            /* The TOS: its legacy bits choose the route. */
+            nl_select(ctl, port, "10.9.1.1", 0x10, 0, NULL, 0, 0, 0, "tos 0x10");
+            nl_select(ctl, port, "10.9.1.1", 0xf0, 0, NULL, 0, 0, 0, "tos 0xf0");
+            nl_select(ctl, port, "10.9.1.1", 0x14, 0, NULL, 0, 0, 0, "tos 0x14");
+            nl_select(ctl, port, "10.9.1.1", 0x20, 0, NULL, 0, 0, 0, "tos 0x20");
+            nl_select(ctl, port, "10.9.1.1", 0x10, 0x2000, NULL, 0, 0, 0, "tos 0x10 fibmatch");
+            /* The source: the loopback's, or refused. */
+            nl_select(ctl, port, "10.9.1.1", 0, 0, "127.0.0.5", 0, 0, 0, "from 127.0.0.5");
+            nl_select(ctl, port, "127.0.0.1", 0, 0, "127.0.0.1", 0, 0, 0, "from 127.0.0.1 to it");
+            nl_select(ctl, port, NULL, 0, 0, "127.0.0.1", 0, 0, 0, "from 127.0.0.1 to none");
+            nl_select(ctl, port, "10.9.1.1", 0, 0, "10.1.1.1", 0, 0, 0, "from elsewhere");
+            nl_select(ctl, port, "10.9.1.1", 0, 0, "224.0.0.9", 0, 0, 0, "from multicast");
+            nl_select(ctl, port, "10.9.1.1", 0, 0, "255.255.255.255", 0, 0, 0, "from broadcast");
+            /* The device: lo, or none there is. */
+            nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, 1, 0, 0, "oif lo");
+            nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, none, 0, 0, "oif none");
+            nl_select(ctl, port, "192.0.2.1", 0, 0, NULL, 0, 0, 0, "unrouted");
+            nl_select(ctl, port, "192.0.2.1", 0, 0, NULL, 1, 0, 0, "unrouted oif lo");
+            nl_select(ctl, port, "192.0.2.1", 0, 0x1000, NULL, 1, 0, 0, "unrouted oif lo table");
+            nl_select(ctl, port, "192.0.2.1", 0, 0x2000, NULL, 1, 0, 0, "unrouted oif lo fibmatch");
+            nl_select(ctl, port, "192.0.2.1", 0, 0, "127.0.0.1", 1, 0, 0, "unrouted oif lo from");
+            nl_select(ctl, port, "10.6.1.1", 0, 0, NULL, 0, 0, 0, "blackholed");
+            nl_select(ctl, port, "10.6.1.1", 0, 0, NULL, 1, 0, 0, "blackholed oif lo");
+            nl_select(ctl, port, NULL, 0, 0, NULL, 1, 0, 0, "none oif lo");
+            nl_select(ctl, port, NULL, 0, 0x1000, NULL, 0, 0, 0, "none table");
+            nl_select(ctl, port, "0.1.2.3", 0, 0, NULL, 0, 0, 0, "zeronet");
+            nl_select(ctl, port, "0.1.2.3", 0, 0, NULL, 1, 0, 0, "zeronet oif lo");
+            /* The protocol and an input device there is not. */
+            static const int protos[] = {6, 17, 1, 58, 132};
+            for (size_t i = 0; i < sizeof protos / sizeof protos[0]; i++) {
+                char label[32];
+                snprintf(label, sizeof label, "proto %d", protos[i]);
+                nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, 0, 0, protos[i], label);
+                snprintf(label, sizeof label, "proto6 %d", protos[i]);
+                nl_select(ctl, port, "::1", 0, 0, NULL, 0, 0, protos[i], label);
+            }
+            nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, 0, none, 0, "iif none");
+            /* RTM_F_NOTIFY marks the answer. Linux keeps the mark on the
+               route it caches, so this is the last lookup through it. */
+            nl_select(ctl, port, "10.9.1.1", 0, 0x100, NULL, 0, 0, 0, "notify");
+            /* IPv6: the source as it is; another device without one. */
+            nl_select(ctl, port, "::1", 0, 0, "2001:db8::1", 0, 0, 0, "six from");
+            nl_select(ctl, port, "::1", 0, 0, NULL, 1, 0, 0, "six oif lo");
+            nl_select(ctl, port, "::1", 0, 0, NULL, none, 0, 0, "six oif none");
+            nl_select(ctl, port, "::1", 0, 0, "2001:db8::1", none, 0, 0, "six oif none from");
+            /* To an address that needs no device of its own, a source lets
+               the route go through another device than the one named. */
+            nl_route(ctl, port, 24, add, "2001:db8::", 48,
+                     (struct nl_rt){.family = AF_INET6, .table = 254, .protocol = 3, .kind = 1, .oif = 1}, "add6");
+            nl_select(ctl, port, "2001:db8::9", 0, 0, NULL, none, 0, 0, "six other oif none");
+            nl_select(ctl, port, "2001:db8::9", 0, 0, "::1", none, 0, 0, "six other oif none from");
+            /* Down: a device is ENETUNREACH. */
+            link.flags = 0;
+            printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 1, 0, 0, "down oif lo");
+            nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 0, 0, 0, "down");
             fflush(stdout);
             _exit(0);
         }
@@ -22382,6 +22600,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "cpu-timer-others")) return cpu_timer_others_case();
     if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
     if (!strcmp(mode, "yama")) return yama_case();

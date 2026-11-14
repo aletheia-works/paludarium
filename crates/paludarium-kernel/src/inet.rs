@@ -1110,6 +1110,19 @@ impl InetSocket {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Takes the pending error (`sock_error`), as `SO_ERROR` does.
+    pub(crate) fn take_error(&self) -> Option<Errno> {
+        let mut s = self.lock();
+        s.note();
+        s.error.take()
+    }
+    /// Makes `error` the pending error without reporting it, as
+    /// `do_recvmmsg` writes `sk_err`.
+    pub(crate) fn store_error(&self, error: Errno) {
+        let mut s = self.lock();
+        s.note();
+        s.error = Some(error);
+    }
     /// The ports of this socket's protocol, without the holds in
     /// `TIME_WAIT` that have ended.
     fn ports(&self) -> MutexGuard<'_, Ports> {
@@ -3430,11 +3443,7 @@ fn get_option(c: &mut Context<'_>, socket: &InetSocket, a: [u64; 6]) -> Result<u
                         2
                     }
                 }
-                (1, 4) => {
-                    let mut s = socket.lock();
-                    s.note();
-                    s.error.take().map_or(0, |e| e.0)
-                }
+                (1, 4) => socket.take_error().map_or(0, |e| e.0),
                 (1, 6) => i32::from(options.broadcast),
                 (1, 7) => options.send_buffer,
                 (1, 8) => options.receive_buffer,

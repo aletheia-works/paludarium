@@ -586,6 +586,15 @@ impl NetlinkSocket {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Takes the pending error (`sock_error`), as `SO_ERROR` does.
+    pub(crate) fn take_error(&self) -> Option<Errno> {
+        self.lock().error.take()
+    }
+    /// Makes `error` the pending error without reporting it, as
+    /// `do_recvmmsg` writes `sk_err`.
+    pub(crate) fn store_error(&self, error: Errno) {
+        self.lock().error = Some(error);
+    }
     /// The network it was made in.
     pub(crate) fn network(&self) -> &Network {
         &self.network

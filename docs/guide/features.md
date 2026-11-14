@@ -562,7 +562,13 @@ kernel.
   after out-of-band data. Its timeout is read (`EFAULT`) and checked
   (`EINVAL`) before the descriptor, but, as on Linux, it is looked at only
   after each message, so the first is waited for without it; the time left
-  is written back once a message came.
+  is written back once a message came. `recvmmsg` first gives the socket's
+  pending error, unless `MSG_ERRQUEUE` asks for its error queue, and an
+  error after some messages other than `EAGAIN` becomes that pending error,
+  for the next call or `SO_ERROR` (a wait a signal would restart leaves
+  `ERESTARTSYS`'s 512 there, as on Linux). A datagram or packet socket's
+  receive gives it before its queue too, and an AF_UNIX stream's only once
+  nothing is queued, as Linux's `unix_stream_read_generic` does.
 - Sockets that only unread messages hold are closed, as Linux's garbage
   collector (`unix_gc`) closes them when a socket goes: a socket whose
   descriptor waits in its own queue, or sockets that hold each other so,

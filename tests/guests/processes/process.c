@@ -9630,6 +9630,49 @@ static int mmsg_case(void) {
     printf("timed=%ld left-ok=%d empty=%ld\n", timed,
            t.tv_sec >= 0 && t.tv_sec <= 5 && (t.tv_sec || t.tv_nsec),
            mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 2L, (long)MSG_DONTWAIT, NULL)));
+    /* An error after a message is the socket's: SO_ERROR takes it, and so
+     * does the next call, before any message. An empty queue is none. */
+    om[1].msg_hdr.msg_iov = &oi[1];
+    struct iovec *bad_iov = (struct iovec *)8;
+    int so_error = -1;
+    socklen_t so_len = sizeof so_error;
+#define MM_SO_ERROR() (so_error = -1, so_len = sizeof so_error, \
+                       getsockopt(sv[1], SOL_SOCKET, SO_ERROR, &so_error, &so_len), so_error)
+    long three = mm_errno(syscall(SYS_sendmmsg, (long)sv[0], om, 3L, 0L));
+    im[2].msg_hdr.msg_iov = bad_iov;
+    long kept = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 3L, (long)MSG_DONTWAIT, NULL));
+    int first = MM_SO_ERROR();
+    int second = MM_SO_ERROR();
+    printf("kept sent=%ld received=%ld so-error=%d then=%d\n", three, kept, first, second);
+    im[1].msg_hdr.msg_iov = bad_iov;
+    long last = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 3L, (long)MSG_DONTWAIT, NULL));
+    syscall(SYS_sendmmsg, (long)sv[0], om, 1L, 0L);
+    long before = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 1L, (long)MSG_DONTWAIT, NULL));
+    long after = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 1L, (long)MSG_DONTWAIT, NULL));
+    printf("next-call last=%ld before=%ld after=%ld\n", last, before, after);
+    syscall(SYS_sendmmsg, (long)sv[0], om, 1L, 0L);
+    long one = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 3L, (long)MSG_DONTWAIT, NULL));
+    long errqueue = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 1L, (long)(MSG_DONTWAIT | 0x2000), NULL));
+    printf("errqueue one=%ld errqueue=%ld so-error=%d\n", one, errqueue, MM_SO_ERROR());
+    im[1].msg_hdr.msg_iov = &ii[1];
+    im[2].msg_hdr.msg_iov = &ii[2];
+    syscall(SYS_sendmmsg, (long)sv[0], om, 1L, 0L);
+    long empty_after = mm_errno(syscall(SYS_recvmmsg, (long)sv[1], im, 3L, (long)MSG_DONTWAIT, NULL));
+    printf("empty-after=%ld so-error=%d\n", empty_after, MM_SO_ERROR());
+#undef MM_SO_ERROR
+    /* A stream gives the kept error only once nothing is queued. */
+    int st[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, st)) return 82;
+    char stream_buf[8];
+    if (write(st[0], "hello", 5) != 5) return 83;
+    im[1].msg_hdr.msg_iov = bad_iov;
+    long stream_kept = mm_errno(syscall(SYS_recvmmsg, (long)st[1], im, 2L, (long)MSG_DONTWAIT, NULL));
+    if (write(st[0], "abc", 3) != 3) return 84;
+    long queued = mm_errno(recv(st[1], stream_buf, sizeof stream_buf, MSG_DONTWAIT));
+    long then_error = mm_errno(recv(st[1], stream_buf, sizeof stream_buf, MSG_DONTWAIT));
+    long then_none = mm_errno(recv(st[1], stream_buf, sizeof stream_buf, MSG_DONTWAIT));
+    printf("stream kept=%ld len=%u queued=%ld then=%ld,%ld\n", stream_kept, im[0].msg_len, queued,
+           then_error, then_none);
     return 0;
 }
 /* memfd_secret (447), as Linux's secretmem: a file of its own that only a

@@ -9792,8 +9792,9 @@ static void admin_reboot_in_namespace(const char *name, long cmd, int by_init) {
 static void admin_namespace_cases(void) {
     /* In a PID namespace of its own user namespace, which gives
      * CAP_SYS_BOOT there. The case makes them as root (the harness runs it
-     * natively through sudo), as user-namespaces does: Ubuntu's AppArmor gives a user namespace an unprivileged user
-     * makes no capabilities (kernel.apparmor_restrict_unprivileged_userns). */
+     * natively through sudo), as user-namespaces does: Ubuntu's AppArmor
+     * gives a user namespace an unprivileged user makes no capabilities
+     * (kernel.apparmor_restrict_unprivileged_userns). */
     fflush(stdout);
     pid_t outer = fork();
     if (outer == 0) {

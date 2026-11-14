@@ -5,7 +5,7 @@
 # Cargo.toml instead: the latest stable Rust, which bump-pins.py also moves.
 #
 #   bash scripts/rust-toolchain.sh                  # for example nightly-2026-10-11
-#   bash scripts/rust-toolchain.sh --rust-version   # for example 1.100
+#   bash scripts/rust-toolchain.sh --rust-version   # for example 1.100.0
 set -euo pipefail
 
 if [ "${1:-}" = --rust-version ]; then

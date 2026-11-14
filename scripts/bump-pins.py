@@ -120,24 +120,25 @@ def version(tag):
 
 
 def bump_rust_version(get=fetch):
-    """Moves the workspace's rust-version to the latest stable Rust's major.minor."""
+    """Moves the workspace's rust-version to the latest stable Rust, patch releases too."""
     pinned = tomllib.loads((ROOT / WORKSPACE_MANIFEST).read_text())["workspace"]["package"][
         "rust-version"
     ]
     stable = tomllib.loads(get(f"{DIST}/channel-rust-stable.toml").decode())
     full = stable["pkg"]["rust"]["version"]
-    match = re.match(r"(\d+)\.(\d+)\.\d+ ", full)
+    match = re.match(r"(\d+\.\d+\.\d+) ", full)
     if not match:
         raise SystemExit(f"unexpected stable version {full!r}")
-    new = f"{match.group(1)}.{match.group(2)}"
-    if version(new) <= version(pinned):
+    new = match.group(1)
+    # A pin without a patch number ("1.100") compares as patch 0.
+    if version(new) <= version(pinned) + (0,) * (3 - len(version(pinned))):
         return None
     edit(WORKSPACE_MANIFEST, f'rust-version = "{pinned}"', f'rust-version = "{new}"')
     body = "\n".join(
         [
             f"Moves `rust-version` from {pinned} to {new}, the latest stable Rust (`{full}`).",
             "",
-            f"- Release notes: https://github.com/rust-lang/rust/releases/tag/{new}.0",
+            f"- Release notes: https://github.com/rust-lang/rust/releases/tag/{new}",
             "",
             "The stable clippy job in ci.yml checks that the crates build with it. If it",
             "fails, make the code build with stable rather than leaving rust-version behind.",
@@ -289,19 +290,25 @@ def self_test():
         # Already the latest.
         assert bump_toolchain(fake({"latest": manifest("2026-10-11")})) is None
 
-        # rust-version follows the latest stable's major.minor, and only upwards.
+        # rust-version follows the latest stable release, patch releases too,
+        # and only upwards.
         def stable_get(full):
             return lambda url: toml({"pkg": {"rust": {"version": full}}}).encode()
 
         (ROOT / WORKSPACE_MANIFEST).write_text(
-            '[workspace.package]\nversion = "0.1.0"\nrust-version = "1.100"\n'
+            '[workspace.package]\nversion = "0.1.0"\nrust-version = "1.100.0"\n'
         )
-        assert bump_rust_version(stable_get("1.100.1 (abcdef012 2026-11-20)")) is None
-        assert bump_rust_version(stable_get("1.99.0 (abcdef012 2026-10-01)")) is None
-        title, body = bump_rust_version(stable_get("1.101.0 (abcdef012 2026-12-22)"))
-        assert title == "chore(toolchain): raise rust-version to 1.101, the latest stable Rust"
-        assert 'rust-version = "1.101"' in (ROOT / WORKSPACE_MANIFEST).read_text()
-        assert "releases/tag/1.101.0" in body, body
+        assert bump_rust_version(stable_get("1.100.0 (abcdef012 2026-11-09)")) is None
+        assert bump_rust_version(stable_get("1.99.1 (abcdef012 2026-10-15)")) is None
+        title, body = bump_rust_version(stable_get("1.100.1 (abcdef012 2026-11-20)"))
+        assert title == "chore(toolchain): raise rust-version to 1.100.1, the latest stable Rust"
+        assert 'rust-version = "1.100.1"' in (ROOT / WORKSPACE_MANIFEST).read_text()
+        assert "releases/tag/1.100.1" in body, body
+        title, _ = bump_rust_version(stable_get("1.101.0 (abcdef012 2026-12-22)"))
+        assert 'rust-version = "1.101.0"' in (ROOT / WORKSPACE_MANIFEST).read_text(), title
+        # A pin without a patch number counts as patch 0.
+        (ROOT / WORKSPACE_MANIFEST).write_text('[workspace.package]\nrust-version = "1.101"\n')
+        assert bump_rust_version(stable_get("1.101.0 (abcdef012 2026-12-22)")) is None
 
         # A newer release moves the guest's tag, revision, lock digest and both
         # pages, and leaves the other guest alone.

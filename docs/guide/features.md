@@ -1611,6 +1611,26 @@ kernel.
     `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
     answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,
     which none is).
+  - **Route lookup selectors:** a lookup takes what else the request names,
+    as `ip route get ... from ... oif ... tos ... ipproto ...` sends it,
+    as `ip_route_output_key_hash_rcu` and `ip6_route_output` do. An IPv4
+    source (`RTA_SRC`) must be the loopback's (`ENETUNREACH`; `EINVAL` for
+    a multicast or broadcast one), and the answer names it as `RTA_SRC`
+    instead of the `RTA_PREFSRC` it would pick. An output device
+    (`RTA_OIF`) is `ENODEV` but for `lo` and `ENETUNREACH` while it is
+    down; where the tables give no route or an error, an IPv4 destination
+    is taken to be on link through it (of no table, which
+    `RTM_F_FIB_MATCH` makes `EHOSTUNREACH`), and `0.0.0.0` leaves from the
+    address of host scope it picks. The IPv4 tables match a route's TOS
+    against the request's legacy TOS bits, and the answer gives the TOS of
+    the route that matched. An IPv6 answer gives the request's source as
+    `RTA_SRC`, and an output device but `lo` finds no route
+    (`ENETUNREACH`) without a source, or to a loopback, link-local or
+    multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
+    and the family's ICMP, and `RTA_IIF` is `ENODEV` for a device there is
+    not. The mark, the user ID, the protocol and the ports choose among
+    policy rules and multipath routes, which there are none of, so they
+    change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
     `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
     `ip_metrics_convert` reads them: each type in turn, one of 0 passed

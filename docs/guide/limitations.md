@@ -474,10 +474,12 @@ verified.
   `lo` while it is down is `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
   of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
-  lookup while `lo` is down is `ENETUNREACH` too. A route lookup looks at
-  no selector but its destination (`RTA_SRC`, `RTA_OIF`, `RTA_MARK` and
-  the rest are not); its `rta_cacheinfo` counts one reference, where
-  Linux counts the other users of the cached route too.
+  lookup while `lo` is down is `ENETUNREACH` too. A route lookup of a
+  multicast or the limited broadcast address answers with the route the
+  tables give, where Linux's answer is of the multicast or broadcast kind
+  `__mkroute_output` makes for them (and, from a source, comes from no
+  table at all); its `rta_cacheinfo` counts one reference, where Linux
+  counts the other users of the cached route too.
   Notifications go out for the link, its IPv6 information, addresses and
   routes alone, not for neighbours, netconf or the other groups, nor to a
   socket in another namespace (`NETLINK_LISTEN_ALL_NSID` is not

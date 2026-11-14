@@ -38,6 +38,9 @@ pub(crate) const SCOPE_UNIVERSE: u8 = 0;
 pub(crate) const SCOPE_LINK: u8 = 253;
 pub(crate) const SCOPE_HOST: u8 = 254;
 pub(crate) const SCOPE_NOWHERE: u8 = 255;
+/// The TOS bits a route's TOS is matched against
+/// (`INET_DSCP_LEGACY_TOS_MASK`).
+const TOS_LEGACY: u8 = 0x1c;
 /// `IFAPROT_KERNEL_LO`: the kernel gave `::1` to the loopback.
 pub(crate) const KERNEL_LO: u8 = 1;
 /// The tables Linux has by name (`RT_TABLE_*`).
@@ -1003,10 +1006,10 @@ impl Addresses {
         let mut found = Err(Errno::EAGAIN);
         let separate = table != TABLE_MAIN && self.tables4.contains(&table);
         if separate {
-            found = self.table_lookup4(Self::trie(table), gateway, scope, ask.oif);
+            found = self.table_lookup4(Self::trie(table), gateway, scope, ask.oif, 0);
         }
         if !separate || found.is_err() {
-            found = self.lookup4_in(gateway, scope, ask.oif);
+            found = self.lookup4_in(gateway, scope, ask.oif, 0);
         }
         let via = found?;
         if !matches!(via.kind, Kind::Unicast | Kind::Local) {
@@ -1190,15 +1193,17 @@ impl Addresses {
         }
     }
     /// A lookup in one trie (`fib_table_lookup`): the longest prefix that
-    /// has a route of no TOS, of `scope` or narrower and through `oif` (any
-    /// for 0), the first such of it; a rejecting one's error; `EAGAIN` for
-    /// none. A table not named in [`Self::trie`] is looked in alone.
+    /// has a route of no TOS or the flow's `tos` (its legacy TOS bits,
+    /// `fib_dscp_masked_match`), of `scope` or narrower and through `oif`
+    /// (any for 0), the first such of it; a rejecting one's error; `EAGAIN`
+    /// for none. A table not named in [`Self::trie`] is looked in alone.
     fn table_lookup4(
         &self,
         tables: &[u32],
         ip: Ipv4Addr,
         scope: u8,
         oif: u32,
+        tos: u8,
     ) -> Result<Route4, Errno> {
         for len in (0..=32u8).rev() {
             let dst = Ipv4Addr::from(u32::from(ip) & mask4(len));
@@ -1207,7 +1212,7 @@ impl Addresses {
                 .iter()
                 .filter(|r| r.dst == dst && r.len == len && tables.contains(&r.table))
             {
-                if r.tos != 0 || r.scope < scope {
+                if (r.tos != 0 && r.tos != tos & TOS_LEGACY) || r.scope < scope {
                     continue;
                 }
                 if let Some(e) = r.kind.error() {
@@ -1225,16 +1230,25 @@ impl Addresses {
     /// the local and main tables' trie, then, where that gives `EAGAIN`,
     /// the default table if there is one; `EAGAIN` at the end is
     /// `ENETUNREACH`.
-    fn lookup4_in(&self, ip: Ipv4Addr, scope: u8, oif: u32) -> Result<Route4, Errno> {
-        let mut found = self.table_lookup4(Self::trie(TABLE_MAIN), ip, scope, oif);
+    fn lookup4_in(&self, ip: Ipv4Addr, scope: u8, oif: u32, tos: u8) -> Result<Route4, Errno> {
+        let mut found = self.table_lookup4(Self::trie(TABLE_MAIN), ip, scope, oif, tos);
         if found == Err(Errno::EAGAIN) && self.tables4.contains(&TABLE_DEFAULT) {
-            found = self.table_lookup4(Self::trie(TABLE_DEFAULT), ip, scope, oif);
+            found = self.table_lookup4(Self::trie(TABLE_DEFAULT), ip, scope, oif, tos);
         }
         found.map_err(|e| if e == Errno::EAGAIN { ENETUNREACH } else { e })
     }
     /// The route to `ip`, as an output route's lookup takes it.
     pub(crate) fn lookup4(&self, ip: Ipv4Addr) -> Result<Route4, Errno> {
-        self.lookup4_in(ip, SCOPE_UNIVERSE, 0)
+        self.lookup4_in(ip, SCOPE_UNIVERSE, 0, 0)
+    }
+    /// The route to `ip` of a flow of `tos` through `oif` (any for 0).
+    pub(crate) fn lookup4_flow(&self, ip: Ipv4Addr, tos: u8, oif: u32) -> Result<Route4, Errno> {
+        self.lookup4_in(ip, SCOPE_UNIVERSE, oif, tos)
+    }
+    /// Whether `ip` is the loopback's (`__ip_dev_find`): one of its
+    /// addresses, or else local to the local table's routes.
+    pub(crate) fn is_local4(&self, ip: Ipv4Addr) -> bool {
+        self.v4.iter().any(|a| a.local == ip) || self.addr_type4(ip, TABLE_LOCAL) == Kind::Local
     }
     /// What `ip` is to `table` (`inet_addr_type_table`): broadcast while
     /// there is no such table, the kind of the route a lookup in it finds,
@@ -1247,7 +1261,7 @@ impl Addresses {
             [] => core::slice::from_ref(&table),
             trie => trie,
         };
-        self.table_lookup4(tables, ip, SCOPE_UNIVERSE, 0)
+        self.table_lookup4(tables, ip, SCOPE_UNIVERSE, 0, 0)
             .map_or(Kind::Unicast, |r| r.kind)
     }
     /// The address a route through `lo` to `ip` leaves from
@@ -1262,12 +1276,20 @@ impl Addresses {
         if route.prefsrc.is_some() {
             return route.prefsrc;
         }
+        self.select4(route.gateway, route.scope)
+    }
+    /// The address `inet_select_addr` picks on `lo` for `dst` (any for
+    /// `None`) of `scope`: the first primary address of a scope as narrow
+    /// (host at most, as `lo` does not route its local net), one in
+    /// `dst`'s subnet before the others; else the first primary one not of
+    /// link scope; `None` for none.
+    pub(crate) fn select4(&self, dst: Option<Ipv4Addr>, scope: u8) -> Option<Ipv4Addr> {
         let mut first = None;
         for a in self.v4.iter().filter(|a| !a.secondary()) {
-            if a.scope.min(SCOPE_HOST) > route.scope {
+            if a.scope.min(SCOPE_HOST) > scope {
                 continue;
             }
-            if route.gateway.is_none_or(|g| a.covers(g)) {
+            if dst.is_none_or(|d| a.covers(d)) {
                 return Some(a.local);
             }
             first.get_or_insert(a.local);
@@ -1275,7 +1297,7 @@ impl Addresses {
         first.or_else(|| {
             self.v4
                 .iter()
-                .find(|a| !a.secondary() && a.scope != SCOPE_LINK && a.scope <= route.scope)
+                .find(|a| !a.secondary() && a.scope != SCOPE_LINK && a.scope <= scope)
                 .map(|a| a.local)
         })
     }

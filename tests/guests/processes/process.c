@@ -1303,7 +1303,7 @@ static void nl_route_attribute(unsigned short type, const unsigned char *v, int 
     unsigned value = 0;
     if (len == 4) memcpy(&value, v, 4);
     printf(" %u", type);
-    if ((type == 1 || type == 5 || type == 7) && (len == 4 || len == 16)) {
+    if ((type == 1 || type == 2 || type == 5 || type == 7) && (len == 4 || len == 16)) {
         inet_ntop(len == 4 ? AF_INET : AF_INET6, v, text, sizeof text);
         printf("=%s", text);
     } else if (type == 5 && len == 8) {
@@ -1672,6 +1672,34 @@ static void nl_metrics(int fd, unsigned port, unsigned short type, unsigned shor
     if (kind == 1) nl_put32(&b, 4, 1);
     if (m) nl_put(&b, 8, m->bytes, m->len);
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, b.bytes, b.len), port, label);
+}
+/* The route-selectors case: a lookup (RTM_GETROUTE without a dump) of
+   `dst` (none for NULL) with TOS `tos` and `flags`, from `src` (none for
+   NULL), through `oif` and in from `iif` (none for 0), of protocol `proto`
+   (none for 0); prints the answer. */
+static void nl_select(int fd, unsigned port, const char *dst, unsigned tos, unsigned flags, const char *src,
+                      unsigned oif, unsigned iif, int proto, const char *label) {
+    const char *any = dst ? dst : src ? src : "0.0.0.0";
+    int family = strchr(any, ':') ? AF_INET6 : AF_INET, size = family == AF_INET ? 4 : 16;
+    struct nl_body b = nl_body(family, 12);
+    b.bytes[3] = tos;
+    memcpy(b.bytes + 8, &flags, 4);
+    unsigned char address[16];
+    if (dst) {
+        b.bytes[1] = size * 8;
+        inet_pton(family, dst, address);
+        nl_put(&b, 1, address, size);
+    }
+    if (src) {
+        b.bytes[2] = size * 8;
+        inet_pton(family, src, address);
+        nl_put(&b, 2, address, size);
+    }
+    if (oif) nl_put32(&b, 4, oif);
+    if (iif) nl_put32(&b, 3, iif);
+    unsigned char p = proto;
+    if (proto) nl_put(&b, 27, &p, 1);
+    nl_answer(fd, nl_send(fd, 26, NL_F_REQUEST, b.bytes, b.len), port, label);
 }
 /* A /32 address of lo, `ip`, as `ip address add` makes it. */
 static int nl_local(int fd, const unsigned char ip[4]) {
@@ -12842,6 +12870,91 @@ int main(int argc, char **argv) {
             b = nl_body(AF_INET, 12);
             nl_put32(&b, 200, 0);
             nl_strict(loose, name.pid, 26, 0, &b, "loose get4 unknown type");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "route-selectors")) {
+        /* A child makes a network namespace with lo up, a route of a TOS
+           beside one of none and a blackhole route, and looks routes up by
+           what else a request names, as `ip route get ... from ... oif ...
+           tos ... ipproto ...` sends it: the source, the output device, the
+           TOS and the protocol, those taken and those refused. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            const unsigned short add = 0x600;
+#define ROUTE4(...) ((struct nl_rt){.family = AF_INET, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "add plain");
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.tos = 0x10, .scope = 253, .oif = 1), "add tos");
+            nl_route(ctl, port, 24, add, "10.6.0.0", 16, ROUTE4(.kind = 6), "add blackhole");
+#undef ROUTE4
+            /* A device no namespace has: Linux may have fallback tunnels of
+               small indices in every one. */
+            const unsigned none = 1000000;
+            /* The TOS: its legacy bits choose the route. */
+            nl_select(ctl, port, "10.9.1.1", 0x10, 0, NULL, 0, 0, 0, "tos 0x10");
+            nl_select(ctl, port, "10.9.1.1", 0xf0, 0, NULL, 0, 0, 0, "tos 0xf0");
+            nl_select(ctl, port, "10.9.1.1", 0x14, 0, NULL, 0, 0, 0, "tos 0x14");
+            nl_select(ctl, port, "10.9.1.1", 0x10, 0x2000, NULL, 0, 0, 0, "tos 0x10 fibmatch");
+            /* The source: the loopback's, or refused. */
+            nl_select(ctl, port, "10.9.1.1", 0, 0, "127.0.0.5", 0, 0, 0, "from 127.0.0.5");
+            nl_select(ctl, port, "127.0.0.1", 0, 0, "127.0.0.1", 0, 0, 0, "from 127.0.0.1 to it");
+            nl_select(ctl, port, NULL, 0, 0, "127.0.0.1", 0, 0, 0, "from 127.0.0.1 to none");
+            nl_select(ctl, port, "10.9.1.1", 0, 0, "10.1.1.1", 0, 0, 0, "from elsewhere");
+            nl_select(ctl, port, "10.9.1.1", 0, 0, "224.0.0.9", 0, 0, 0, "from multicast");
+            nl_select(ctl, port, "10.9.1.1", 0, 0, "255.255.255.255", 0, 0, 0, "from broadcast");
+            /* The device: lo, or none there is. */
+            nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, 1, 0, 0, "oif lo");
+            nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, none, 0, 0, "oif none");
+            nl_select(ctl, port, "192.0.2.1", 0, 0, NULL, 0, 0, 0, "unrouted");
+            nl_select(ctl, port, "192.0.2.1", 0, 0, NULL, 1, 0, 0, "unrouted oif lo");
+            nl_select(ctl, port, "192.0.2.1", 0, 0x1000, NULL, 1, 0, 0, "unrouted oif lo table");
+            nl_select(ctl, port, "192.0.2.1", 0, 0x2000, NULL, 1, 0, 0, "unrouted oif lo fibmatch");
+            nl_select(ctl, port, "192.0.2.1", 0, 0, "127.0.0.1", 1, 0, 0, "unrouted oif lo from");
+            nl_select(ctl, port, "10.6.1.1", 0, 0, NULL, 0, 0, 0, "blackholed");
+            nl_select(ctl, port, "10.6.1.1", 0, 0, NULL, 1, 0, 0, "blackholed oif lo");
+            nl_select(ctl, port, NULL, 0, 0, NULL, 1, 0, 0, "none oif lo");
+            nl_select(ctl, port, NULL, 0, 0x1000, NULL, 0, 0, 0, "none table");
+            nl_select(ctl, port, "0.1.2.3", 0, 0, NULL, 0, 0, 0, "zeronet");
+            nl_select(ctl, port, "0.1.2.3", 0, 0, NULL, 1, 0, 0, "zeronet oif lo");
+            /* The protocol and an input device there is not. */
+            static const int protos[] = {6, 17, 1, 58, 132};
+            for (size_t i = 0; i < sizeof protos / sizeof protos[0]; i++) {
+                char label[32];
+                snprintf(label, sizeof label, "proto %d", protos[i]);
+                nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, 0, 0, protos[i], label);
+                snprintf(label, sizeof label, "proto6 %d", protos[i]);
+                nl_select(ctl, port, "::1", 0, 0, NULL, 0, 0, protos[i], label);
+            }
+            nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, 0, none, 0, "iif none");
+            /* IPv6: the source as it is; another device without one. */
+            nl_select(ctl, port, "::1", 0, 0, "2001:db8::1", 0, 0, 0, "six from");
+            nl_select(ctl, port, "::1", 0, 0, NULL, 1, 0, 0, "six oif lo");
+            nl_select(ctl, port, "::1", 0, 0, NULL, none, 0, 0, "six oif none");
+            nl_select(ctl, port, "::1", 0, 0, "2001:db8::1", none, 0, 0, "six oif none from");
+            /* To an address that needs no device of its own, a source lets
+               the route go through another device than the one named. */
+            nl_route(ctl, port, 24, add, "2001:db8::", 48,
+                     (struct nl_rt){.family = AF_INET6, .table = 254, .protocol = 3, .kind = 1, .oif = 1}, "add6");
+            nl_select(ctl, port, "2001:db8::9", 0, 0, NULL, none, 0, 0, "six other oif none");
+            nl_select(ctl, port, "2001:db8::9", 0, 0, "::1", none, 0, 0, "six other oif none from");
+            /* Down: a device is ENETUNREACH. */
+            link.flags = 0;
+            printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 1, 0, 0, "down oif lo");
+            nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 0, 0, 0, "down");
             fflush(stdout);
             _exit(0);
         }

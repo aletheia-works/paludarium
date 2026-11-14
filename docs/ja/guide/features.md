@@ -1398,6 +1398,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら `EINVAL` です。
     `RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に合う項目はないので
     `EHOSTUNREACH` です）。
+  - **経路の引き当ての条件:** `ip route get ... from ... oif ... tos ... ipproto ...` が送るように
+    リクエストが宛先のほかに指すものも、`ip_route_output_key_hash_rcu` と `ip6_route_output`
+    と同じく使います。IPv4 の送り元（`RTA_SRC`）はループバックのものでなければならず
+    （`ENETUNREACH`。マルチキャストとブロードキャストのものは `EINVAL`）、答えは選ぶはずの
+    `RTA_PREFSRC` の代わりに、それを `RTA_SRC` として返します。出力デバイス（`RTA_OIF`）は
+    `lo` のほかは `ENODEV`、`lo` が落ちている間は `ENETUNREACH` です。表が経路を与えないか
+    エラーを返せば、IPv4 の宛先はそのデバイスのリンク上にあるとみなします（どの表のもので
+    もないので、`RTM_F_FIB_MATCH` では `EHOSTUNREACH` です）。`0.0.0.0` は、選んだホストの
+    スコープのアドレスから向かいます。IPv4 の表は、経路の TOS をリクエストの従来の TOS の
+    ビットと比べ、答えは合った経路の TOS を返します。IPv6 の答えはリクエストの送り元を
+    `RTA_SRC` として返します。`lo` のほかの出力デバイスを指すと、送り元がないか、宛先が
+    ループバック、リンクローカル、マルチキャストのアドレスなら、経路は見つかりません
+    （`ENETUNREACH`）。`RTA_IP_PROTO` は
+    TCP、UDP、そのファミリーの ICMP のほかは `EOPNOTSUPP`、`RTA_IIF` はないデバイスなら
+    `ENODEV` です。マーク、ユーザー ID、プロトコル、ポートはポリシーのルールとマルチパスの
+    経路を選ぶためのもので、どちらもないので何も変えません。
   - **経路のメトリクス:** IPv4 と IPv6 の経路は、`RTA_METRICS` が持つメトリクス
     （`ip route add ... mtu 1400` が送るもの）を、`ip_metrics_convert` と同じく読んで
     保ちます。種類を順に読み、0 の種類は飛ばします。`RTAX_MTU` は 65520 に、`RTAX_ADVMSS`

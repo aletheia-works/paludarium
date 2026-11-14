@@ -2912,22 +2912,39 @@ fn ipv6_route_of(
 /// A route lookup (`RTM_GETROUTE` without a dump), as `inet_rtm_getroute`
 /// and `inet6_rtm_getroute` answer one for the destination `RTA_DST` names
 /// (none is `0.0.0.0` or `::`), by the routing tables
-/// ([`crate::interface::Addresses::lookup4`] and `lookup6`): `EINVAL` for
-/// a request shorter than an `rtmsg`; a destination shorter than its
-/// family's address is `ERANGE` for IPv4 and `EINVAL` for IPv6, as their
-/// attribute policies give, and a longer one counts as its first bytes;
-/// `EOPNOTSUPP` for an input route (`RTA_IIF`), which is not supported;
-/// a rejecting route's error, `ENETUNREACH` where no route goes, and for
-/// IPv6 while `lo` is down. `0.0.0.0` goes to the loopback from
-/// `127.0.0.1`. An IPv4 answer gives the `RTA_MARK` it names, but 0
-/// (`ERANGE` when shorter than 4 bytes). An `RTA_UID` it names (`ERANGE` when shorter than 4
-/// bytes, for either family, as both policies take a `u32`) is the one an
-/// IPv4 answer gives, as it is; `RTA_SRC`, `RTA_OIF` and the other
-/// selectors are not looked at. An IPv4 answer names the main table but
-/// with `RTM_F_LOOKUP_TABLE`, the table it came from (the main one for the
-/// local one, whose trie it shares). With `RTM_F_FIB_MATCH` the answer is
-/// the table's entry that matched, and `EHOSTUNREACH` for `0.0.0.0`, which
-/// no entry is.
+/// ([`crate::interface::Addresses::lookup4_flow`] and `lookup6`): `EINVAL`
+/// for a request shorter than an `rtmsg`; an IPv6 source or destination
+/// shorter than 16 bytes is `EINVAL` (an IPv4 one is the policy's
+/// `ERANGE`), and a longer one counts as its first bytes; `EOPNOTSUPP` for
+/// an `RTA_IP_PROTO` but TCP, UDP and the family's ICMP
+/// (`rtm_getroute_parse_ip_proto`); then `ENODEV` for an input route
+/// (`RTA_IIF`) of another device than `lo`, and `EOPNOTSUPP` for one of
+/// `lo`, which is not supported.
+///
+/// IPv4, as `ip_route_output_key_hash_rcu`: a source (`RTA_SRC`) is
+/// `EINVAL` when multicast or the limited broadcast address and
+/// `ENETUNREACH` when not the loopback's ([`crate::interface::Addresses::is_local4`]);
+/// an output device (`RTA_OIF`) is `ENODEV` but for `lo`, and
+/// `ENETUNREACH` while it is down. `0.0.0.0` goes to the loopback, from
+/// the source, or else from `127.0.0.1` (with a device, from the address
+/// `inet_select_addr` picks of host scope). The tables are looked in by the
+/// request's TOS; where they give an error and a device is named, the
+/// route is on link through it instead, from an address of link scope. The
+/// answer gives the TOS of the route that matched, the source as `RTA_SRC`
+/// where the request names one, and else the source the route leaves from
+/// as `RTA_PREFSRC`; the `RTA_MARK` it names, but 0 (`ERANGE` when shorter
+/// than 4 bytes); and the `RTA_UID` it names (`ERANGE` when shorter than 4
+/// bytes, for either family, as both policies take a `u32`), as it is, or
+/// the caller's. It names the main table but with `RTM_F_LOOKUP_TABLE`,
+/// the table it came from (the main one for the local one, whose trie it
+/// shares), or 0 where no table gave it. With `RTM_F_FIB_MATCH` the answer
+/// is the table's entry that matched, and `EHOSTUNREACH` where none did.
+///
+/// IPv6, as `ip6_route_output`: `ENETUNREACH` while `lo` is down, and for
+/// an output device but `lo` without a source, or to a loopback,
+/// link-local or multicast address (`RT6_LOOKUP_F_IFACE`); the answer gives the request's source as `RTA_SRC`. The mark, the user ID,
+/// the protocol and the ports choose among policy rules and multipath
+/// routes, of which there are none, so they change nothing.
 fn lookup(
     network: &Network,
     payload: &[u8],
@@ -2935,34 +2952,68 @@ fn lookup(
     port: u32,
     uid: u32,
 ) -> Result<Vec<u8>, Errno> {
-    use crate::interface::{Kind, TABLE_LOCAL, TABLE_MAIN};
+    use crate::interface::{Kind, NO_METRICS, SCOPE_HOST, SCOPE_LINK, SCOPE_UNIVERSE};
+    use crate::interface::{TABLE_LOCAL, TABLE_MAIN};
     use core::net::{Ipv4Addr, Ipv6Addr};
     if payload.len() < 12 {
         return Err(Errno::EINVAL);
     }
     let family = payload[0];
+    let tos = payload[3];
     let request_flags = u32::from_le_bytes(payload[8..12].try_into().unwrap_or_default());
     let mut dst = None;
+    let mut src = None;
     let mut asked_uid = None;
     let mut mark = 0;
+    let mut iif = 0;
+    let mut oif = 0;
+    let mut proto = None;
+    let number = |value: &[u8]| -> Result<u32, Errno> {
+        Ok(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?))
+    };
     for (kind, value) in attributes(&payload[12..]) {
         match kind {
             RTA_DST => dst = Some(value),
-            RTA_IIF => return Err(EOPNOTSUPP),
-            RTA_UID => asked_uid = Some(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?)),
-            RTA_MARK => mark = u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?),
+            RTA_SRC => src = Some(value),
+            RTA_IIF => iif = number(value)?,
+            RTA_OIF => oif = number(value)?,
+            RTA_UID => asked_uid = Some(number(value)?),
+            RTA_MARK => mark = number(value)?,
+            RTA_IP_PROTO => proto = Some(value.first().copied().unwrap_or_default()),
             _ => {}
         }
     }
+    let v6 = family == AF_INET6;
+    // `inet6_rtm_getroute` takes the addresses first.
+    let (mut source6, mut address6) = ([0u8; 16], [0u8; 16]);
+    if v6 {
+        if let Some(value) = src {
+            source6 = *value.first_chunk().ok_or(Errno::EINVAL)?;
+        }
+        if let Some(value) = dst {
+            address6 = *value.first_chunk().ok_or(Errno::EINVAL)?;
+        }
+    }
+    let icmp = if v6 { 58 } else { 1 };
+    if proto.is_some_and(|p| !matches!(p, 6 | 17) && p != icmp) {
+        return Err(EOPNOTSUPP);
+    }
+    if iif != 0 {
+        return Err(if iif == 1 { EOPNOTSUPP } else { ENODEV });
+    }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
     let addresses = network.addresses();
-    if family == AF_INET6 {
-        let mut address = [0u8; 16];
-        if let Some(value) = dst {
-            address = *value.first_chunk().ok_or(Errno::EINVAL)?;
-        }
-        let ip = Ipv6Addr::from(address);
+    if v6 {
+        let ip = Ipv6Addr::from(address6);
         if !network.is_up() {
+            return Err(ENETUNREACH);
+        }
+        // `rt6_score_route`: a route must go through the device named
+        // (`RT6_LOOKUP_F_IFACE`) with no source, or to a loopback,
+        // link-local or multicast address (`rt6_need_strict`), and every
+        // one goes through `lo`.
+        let strict = ip.is_loopback() || ip.is_unicast_link_local() || ip.is_multicast();
+        if oif != 0 && oif != 1 && (strict || source6 == [0; 16]) {
             return Err(ENETUNREACH);
         }
         let route = addresses.lookup6(ip)?;
@@ -2970,8 +3021,8 @@ fn lookup(
             return Ok(ipv6_route_of(RTM_NEWROUTE, &route, seq, port, 0));
         }
         // `rt6_fill_node` of the route the lookup made, with the request's
-        // source, unspecified, and the source it leaves from, then the
-        // route's own preferred source again.
+        // source, and the source it leaves from, then the route's own
+        // preferred source again.
         let mut body = vec![
             AF_INET6,
             128,
@@ -2984,8 +3035,8 @@ fn lookup(
         ];
         body.extend_from_slice(&0u32.to_le_bytes());
         attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
-        attribute(&mut body, RTA_DST, &address);
-        attribute(&mut body, RTA_SRC, &[0; 16]);
+        attribute(&mut body, RTA_DST, &address6);
+        attribute(&mut body, RTA_SRC, &source6);
         if let Some(source) = addresses.source6(&route, ip) {
             attribute(&mut body, RTA_PREFSRC, &source.octets());
         }
@@ -3000,45 +3051,110 @@ fn lookup(
         attribute(&mut body, RTA_PREF, &[0]);
         return Ok(message(RTM_NEWROUTE, 0, seq, port, &body));
     }
-    let mut address = [0u8; 4];
-    if let Some(value) = dst {
-        address = *value.first_chunk().ok_or(ERANGE)?;
-    }
+    let four = |value: Option<&[u8]>| -> Result<[u8; 4], Errno> {
+        value.map_or(Ok([0; 4]), |v| v.first_chunk().copied().ok_or(ERANGE))
+    };
+    let (address, asked_source) = (four(dst)?, four(src)?);
     let ip = Ipv4Addr::from(address);
-    let (kind, source, gateway, table, metrics) = if ip.is_unspecified() {
+    let named = Ipv4Addr::from(asked_source);
+    let mut source = named;
+    if !named.is_unspecified() {
+        if named.is_multicast() || named.is_broadcast() {
+            return Err(Errno::EINVAL);
+        }
+        if !addresses.is_local4(named) {
+            return Err(ENETUNREACH);
+        }
+    }
+    if oif != 0 {
+        if oif != 1 {
+            return Err(ENODEV);
+        }
+        if !network.is_up() {
+            return Err(ENETUNREACH);
+        }
+        if source.is_unspecified() {
+            let scope = if ip.is_multicast() {
+                Some(SCOPE_UNIVERSE)
+            } else if ip.is_unspecified() {
+                Some(SCOPE_HOST)
+            } else {
+                None
+            };
+            if let Some(picked) = scope.and_then(|scope| addresses.select4(None, scope)) {
+                source = picked;
+            }
+        }
+    }
+    let lookup_table = request_flags & RTM_F_LOOKUP_TABLE != 0;
+    // The route's kind, the TOS it matched, its gateway, the table it came
+    // from (none for a route no table gave) and its metrics.
+    let (kind, matched_tos, gateway, table, metrics): (
+        Kind,
+        u8,
+        Option<Ipv4Addr>,
+        Option<u32>,
+        crate::interface::Metrics,
+    );
+    if ip.is_unspecified() {
         if fib_match {
             return Err(EHOSTUNREACH);
         }
-        let none = crate::interface::NO_METRICS;
-        (
-            Kind::Local,
-            Some(Ipv4Addr::LOCALHOST),
-            None,
-            TABLE_MAIN,
-            none,
-        )
-    } else {
-        let route = addresses.lookup4(ip)?;
-        let table = if request_flags & RTM_F_LOOKUP_TABLE == 0 || route.table == TABLE_LOCAL {
-            TABLE_MAIN
-        } else {
-            route.table
-        };
-        if fib_match {
-            return Ok(ipv4_route_of(RTM_NEWROUTE, &route, table, seq, port, 0));
+        if source.is_unspecified() {
+            source = Ipv4Addr::LOCALHOST;
         }
-        let gateway = route.gateway.filter(|_| route.uses_gateway);
-        // `__mkroute_output` drops the route's `fib_info`, and so its
-        // metrics, for the limited broadcast address, and for a multicast
-        // one when the route is shorter than 224.0.0.0/4's prefix (the
-        // default route, which it takes for want of a multicast one).
-        let metrics = if ip.is_broadcast() || (ip.is_multicast() && route.len < 4) {
-            crate::interface::NO_METRICS
-        } else {
-            route.metrics
-        };
-        let source = addresses.source4(&route, ip);
-        (route.kind, source, gateway, table, metrics)
+        (kind, matched_tos, gateway, table, metrics) = (Kind::Local, 0, None, None, NO_METRICS);
+    } else {
+        match addresses.lookup4_flow(ip, tos, oif) {
+            Ok(route) => {
+                let from = if route.table == TABLE_LOCAL {
+                    TABLE_MAIN
+                } else {
+                    route.table
+                };
+                if fib_match {
+                    let named = if lookup_table { from } else { TABLE_MAIN };
+                    return Ok(ipv4_route_of(RTM_NEWROUTE, &route, named, seq, port, 0));
+                }
+                if source.is_unspecified()
+                    && let Some(picked) = addresses.source4(&route, ip)
+                {
+                    source = picked;
+                }
+                // `__mkroute_output` drops the route's `fib_info`, and so
+                // its metrics, for the limited broadcast address, and for a
+                // multicast one when the route is shorter than
+                // 224.0.0.0/4's prefix (the default route, which it takes
+                // for want of a multicast one).
+                let held = if ip.is_broadcast() || (ip.is_multicast() && route.len < 4) {
+                    NO_METRICS
+                } else {
+                    route.metrics
+                };
+                let via = route.gateway.filter(|_| route.uses_gateway);
+                (kind, matched_tos, gateway, table, metrics) =
+                    (route.kind, route.tos, via, Some(from), held);
+            }
+            // With a device named, the destination is taken to be on link.
+            Err(_) if oif != 0 => {
+                if fib_match {
+                    return Err(EHOSTUNREACH);
+                }
+                if source.is_unspecified()
+                    && let Some(picked) = addresses.select4(None, SCOPE_LINK)
+                {
+                    source = picked;
+                }
+                (kind, matched_tos, gateway, table, metrics) =
+                    (Kind::Unicast, 0, None, None, NO_METRICS);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let table = if lookup_table {
+        table.unwrap_or(0)
+    } else {
+        TABLE_MAIN
     };
     // `rt_fill_info` of the cached route the lookup made, which is local as
     // it goes through `lo`.
@@ -3050,8 +3166,8 @@ fn lookup(
     let mut body = vec![
         AF_INET,
         32,
-        0,
-        0,
+        if named.is_unspecified() { 0 } else { 32 },
+        matched_tos,
         table_byte(table),
         0,
         RT_SCOPE_UNIVERSE,
@@ -3060,8 +3176,11 @@ fn lookup(
     body.extend_from_slice(&flags.to_le_bytes());
     attribute(&mut body, RTA_TABLE, &table.to_le_bytes());
     attribute(&mut body, RTA_DST, &address);
+    if !named.is_unspecified() {
+        attribute(&mut body, RTA_SRC, &asked_source);
+    }
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
-    if let Some(source) = source {
+    if source != named {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
     if let Some(gateway) = gateway {
@@ -3955,6 +4074,171 @@ mod tests {
             Err(Errno::EINVAL)
         );
         assert!(request(RTM_DELROUTE, 0, &net6, 16, Some(&bad)).is_ok());
+    }
+
+    #[test]
+    fn route_lookups_take_their_source_device_and_tos() {
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true);
+        let add = |dst: [u8; 4], tos: u8, kind: u8| {
+            let device = kind == 1;
+            let scope = if device { 253 } else { 0 };
+            let mut payload = vec![AF_INET, 16, 0, tos, 254, 3, scope, kind, 0, 0, 0, 0];
+            attribute(&mut payload, RTA_DST, &dst);
+            if device {
+                attribute(&mut payload, RTA_OIF, &1u32.to_le_bytes());
+            }
+            let header = Header {
+                len: 0,
+                kind: RTM_NEWROUTE,
+                flags: NLM_F_REQUEST | 0x600,
+                seq: 1,
+            };
+            change_route(&network, &header, &payload).unwrap();
+        };
+        add([10, 9, 0, 0], 0, 1);
+        add([10, 9, 0, 0], 0x10, 1);
+        add([10, 6, 0, 0], 0, 6);
+        // A lookup of `dst` with `tos`, `flags` and the attributes, and its
+        // answer's rtmsg and attributes.
+        let get = |family: u8, tos: u8, flags: u32, attrs: &[(u16, &[u8])]| {
+            let mut payload = vec![family, 0, 0, tos, 0, 0, 0, 0];
+            payload.extend_from_slice(&flags.to_le_bytes());
+            for &(kind, value) in attrs {
+                attribute(&mut payload, kind, value);
+            }
+            lookup(&network, &payload, 1, 7, 0).map(|answer| {
+                let found: Vec<(u16, Vec<u8>)> = attributes(&answer[28..])
+                    .into_iter()
+                    .map(|(k, v)| (k, v.to_vec()))
+                    .collect();
+                (answer[16..28].to_vec(), found)
+            })
+        };
+        let has = |found: &[(u16, Vec<u8>)], kind: u16| found.iter().any(|(k, _)| *k == kind);
+        let value = |found: &[(u16, Vec<u8>)], kind: u16| {
+            found
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .map(|(_, v)| v.clone())
+        };
+        let one = 1u32.to_le_bytes();
+        // The TOS: the route of the request's legacy TOS bits, else the one
+        // of none; the answer gives the TOS that matched.
+        let (header, _) = get(AF_INET, 0x10, 0, &[(RTA_DST, &[10, 9, 1, 1])]).unwrap();
+        assert_eq!(header[3], 0x10);
+        let (header, _) = get(AF_INET, 0xf0, 0, &[(RTA_DST, &[10, 9, 1, 1])]).unwrap();
+        assert_eq!(header[3], 0x10);
+        let (header, _) = get(AF_INET, 0x14, 0, &[(RTA_DST, &[10, 9, 1, 1])]).unwrap();
+        assert_eq!(header[3], 0);
+        // The source: the loopback's, named as RTA_SRC and not RTA_PREFSRC;
+        // EINVAL for a multicast or broadcast one, ENETUNREACH for another.
+        let from = |source: [u8; 4], to: [u8; 4]| {
+            get(AF_INET, 0, 0, &[(RTA_DST, &to), (RTA_SRC, &source)])
+        };
+        let (header, found) = from([127, 0, 0, 5], [10, 9, 1, 1]).unwrap();
+        assert_eq!(header[2], 32);
+        assert_eq!(value(&found, RTA_SRC), Some(vec![127, 0, 0, 5]));
+        assert!(!has(&found, RTA_PREFSRC));
+        assert_eq!(from([10, 1, 1, 1], [10, 9, 1, 1]), Err(ENETUNREACH));
+        assert_eq!(from([224, 0, 0, 1], [10, 9, 1, 1]), Err(Errno::EINVAL));
+        assert_eq!(from([255; 4], [10, 9, 1, 1]), Err(Errno::EINVAL));
+        let (_, found) = from([127, 0, 0, 1], [0; 4]).unwrap();
+        assert_eq!(value(&found, RTA_DST), Some(vec![0; 4]));
+        assert!(!has(&found, RTA_PREFSRC));
+        // The device: ENODEV but for lo. Where the tables give an error, a
+        // route on link through it, of no table, from no address of link
+        // scope; none matches it, and 0.0.0.0/8 is EINVAL.
+        let through = |to: [u8; 4], flags: u32, oif: u32| {
+            get(
+                AF_INET,
+                0,
+                flags,
+                &[(RTA_DST, &to), (RTA_OIF, &oif.to_le_bytes())],
+            )
+        };
+        assert_eq!(through([10, 9, 1, 1], 0, 2), Err(ENODEV));
+        for to in [[192, 0, 2, 1], [10, 6, 1, 1]] {
+            assert!(get(AF_INET, 0, 0, &[(RTA_DST, &to)]).is_err());
+            let (header, found) = through(to, RTM_F_LOOKUP_TABLE, 1).unwrap();
+            assert_eq!((header[4], header[7]), (0, 1));
+            assert_eq!(value(&found, RTA_TABLE), Some(vec![0; 4]));
+            assert!(!has(&found, RTA_PREFSRC));
+            assert_eq!(through(to, RTM_F_FIB_MATCH, 1), Err(EHOSTUNREACH));
+        }
+        // 0.1.2.3 is no special address (`ipv4_is_zeronet` is 0.0.0.0's).
+        assert!(through([0, 1, 2, 3], 0, 1).is_ok());
+        assert_eq!(
+            get(AF_INET, 0, 0, &[(RTA_DST, &[0, 1, 2, 3])]),
+            Err(ENETUNREACH)
+        );
+        // 0.0.0.0 through it leaves from its address of host scope.
+        let (_, found) = through([0; 4], 0, 1).unwrap();
+        assert_eq!(value(&found, RTA_PREFSRC), Some(vec![127, 0, 0, 1]));
+        let (header, _) = get(AF_INET, 0, RTM_F_LOOKUP_TABLE, &[]).unwrap();
+        assert_eq!(header[4], 0);
+        // The protocol: TCP, UDP and the family's ICMP; an input route.
+        for (family, proto, ok) in [(AF_INET, 6, true), (AF_INET, 1, true), (AF_INET, 58, false)] {
+            let found = get(
+                family,
+                0,
+                0,
+                &[(RTA_DST, &[10, 9, 1, 1]), (RTA_IP_PROTO, &[proto])],
+            );
+            assert_eq!(found.is_ok(), ok, "{proto}");
+        }
+        assert_eq!(
+            get(AF_INET, 0, 0, &[(RTA_IP_PROTO, &[132])]),
+            Err(EOPNOTSUPP)
+        );
+        assert_eq!(get(AF_INET, 0, 0, &[(RTA_IIF, &[2, 0, 0, 0])]), Err(ENODEV));
+        assert_eq!(get(AF_INET, 0, 0, &[(RTA_IIF, &one)]), Err(EOPNOTSUPP));
+        // Down, a device is ENETUNREACH.
+        network.set_up(false);
+        assert_eq!(through([127, 0, 0, 1], 0, 1), Err(ENETUNREACH));
+        assert!(get(AF_INET, 0, 0, &[(RTA_DST, &[127, 0, 0, 1])]).is_ok());
+        network.set_up(true);
+        // IPv6: the source as RTA_SRC, as it is; another device is
+        // ENETUNREACH without a source, or to ::1 with one; ICMP is
+        // ICMPv6's.
+        let loopback = core::net::Ipv6Addr::LOCALHOST.octets();
+        let other = core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
+        let (_, found) = get(AF_INET6, 0, 0, &[(RTA_DST, &loopback), (RTA_SRC, &other)]).unwrap();
+        assert_eq!(value(&found, RTA_SRC), Some(other.to_vec()));
+        let five = 5u32.to_le_bytes();
+        let mut route6 = vec![AF_INET6, 48, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
+        attribute(&mut route6, RTA_DST, &other);
+        attribute(&mut route6, RTA_OIF, &one);
+        let header = Header {
+            len: 0,
+            kind: RTM_NEWROUTE,
+            flags: NLM_F_REQUEST | 0x600,
+            seq: 1,
+        };
+        change_route(&network, &header, &route6).unwrap();
+        let six = |attrs: &[(u16, &[u8])]| get(AF_INET6, 0, 0, attrs);
+        assert_eq!(
+            six(&[(RTA_DST, &loopback), (RTA_OIF, &five)]),
+            Err(ENETUNREACH)
+        );
+        assert_eq!(
+            six(&[(RTA_DST, &loopback), (RTA_OIF, &five), (RTA_SRC, &other)]),
+            Err(ENETUNREACH)
+        );
+        assert_eq!(
+            six(&[(RTA_DST, &other), (RTA_OIF, &five)]),
+            Err(ENETUNREACH)
+        );
+        let elsewhere = [
+            (RTA_DST, &other[..]),
+            (RTA_OIF, &five),
+            (RTA_SRC, &loopback),
+        ];
+        assert!(six(&elsewhere).is_ok());
+        assert!(six(&[(RTA_DST, &loopback), (RTA_OIF, &one)]).is_ok());
+        assert_eq!(six(&[(RTA_IP_PROTO, &[1])]), Err(EOPNOTSUPP));
+        assert!(six(&[(RTA_DST, &loopback), (RTA_IP_PROTO, &[58])]).is_ok());
+        assert_eq!(six(&[(RTA_SRC, &other[..4])]), Err(Errno::EINVAL));
     }
 
     #[test]

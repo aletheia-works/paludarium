@@ -1123,8 +1123,6 @@ fn timer_id(value: u64) -> i32 {
     value as u32 as i32
 }
 
-/// The clock of timer `id`, which a CPU-time timer's time is sampled on
-/// before the timers are locked.
 /// The time of a POSIX timer's clock ([`crate::ThreadGroup::timer_clock_now`]),
 /// another process's CPU time too: `ESRCH` once that process is reaped, as
 /// Linux's `timer_lock_sighand` finds no task.
@@ -1142,6 +1140,8 @@ fn timer_clock_now(
         clock => c.group.timer_clock_now(clock, mono),
     }
 }
+/// The clock of timer `id`, which a CPU-time timer's time is sampled on
+/// before the timers are locked.
 fn timer_clock_of(c: &Context<'_>, id: i32) -> Result<crate::timers::TimerClock, Errno> {
     c.group
         .timers

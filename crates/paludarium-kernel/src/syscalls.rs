@@ -2514,8 +2514,8 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// and `MADV_UNMERGEABLE` and THP's `MADV_HUGEPAGE` and `MADV_NOHUGEPAGE`,
 /// which change only the flags of the VMAs (`/proc/<pid>/smaps` shows
 /// them), as no page here depends on them; the discards `MADV_DONTNEED`,
-/// `MADV_DONTNEED_LOCKED` (which takes locked VMAs too) and `MADV_FREE`; and `MADV_POPULATE_READ` and
-/// `MADV_POPULATE_WRITE` ([`populate`]); and the flags `fork` and core
+/// `MADV_DONTNEED_LOCKED` (which takes locked VMAs too) and `MADV_FREE`;
+/// and `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` ([`populate`]); and the flags `fork` and core
 /// dumps look at, `MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK`,
 /// `MADV_KEEPONFORK`, `MADV_DONTDUMP` and `MADV_DODUMP`
 /// ([`AddressSpace::advise_flags`]); and `MADV_REMOVE`, which frees shared

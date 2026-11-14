@@ -2258,7 +2258,7 @@ impl AddressSpaceData {
                 let written = self.mapping_at(page).is_some_and(|m| m.written);
                 let anonymous = !shared && !entry.cache && (!entry.file || written);
                 let dirty =
-                    anonymous || bytes.is_some_and(|b| b.dirty.load(Ordering::Acquire)) && shared;
+                    anonymous || (shared && bytes.is_some_and(|b| b.dirty.load(Ordering::Acquire)));
                 usage.resident += 1;
                 usage.anonymous += u64::from(anonymous);
                 match (entry.cow && !entry.cache, dirty) {

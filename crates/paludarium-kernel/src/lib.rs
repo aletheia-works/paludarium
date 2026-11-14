@@ -8,6 +8,7 @@
 //! records signal registrations but never delivers signals.
 #![forbid(unsafe_code)]
 
+mod admin;
 mod arguments;
 mod coredump;
 mod credentials;

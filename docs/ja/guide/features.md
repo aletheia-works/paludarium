@@ -58,6 +58,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
+| 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
@@ -2170,6 +2171,44 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - uprobe が置かれることはないので、プローブのトランポリンもありません。そのため、
   Linux でトランポリンの外から呼んだときと同じく、`uretprobe` は `SIGILL`（`SI_KERNEL`）
   を送って -1 を返し、`uprobe` は `EPROTO` を返します。
+- 管理の syscall は、Linux master の確認をその順に行います。カーネルは、Ubuntu が
+  Secure Boot のときと同じく integrity でロックダウンしています（`iopl` と `ioperm` が
+  ポートへのアクセスを断るのもこのためです）。なので、カーネルにコードを読み込むことは
+  できません。tmpfs と同じく、どのファイルシステムにもスワップとクォータはありません。
+  - `reboot` には、呼び出し元の PID 名前空間を持つユーザー名前空間での `CAP_SYS_BOOT`
+    （`EPERM`）と、Linux のマジックナンバー（`EINVAL`）が要ります。再起動
+    （`LINUX_REBOOT_CMD_RESTART` か `RESTART2`）は名前空間の init を止め、init は
+    `SIGHUP` で終わります。停止と電源断も同じで、init は `SIGINT` で終わります。これは
+    Linux の `reboot_pid_ns` と同じで、呼んだスレッドは状態 0 で終わります。入れ子の
+    PID 名前空間では、ほかのコマンドは `EINVAL` です。最初の名前空間では init は最初の
+    プロセスなので、実行が終わります。`RESTART2` の文字列はその前に読みます（`EFAULT`）。
+    最初の名前空間では、`CAD_ON` と `CAD_OFF` は成功し、`KEXEC` は読み込まれた
+    カーネルがないので `EINVAL`、`SW_SUSPEND` はロックダウンしたカーネルを休止
+    できないので `EPERM` です。
+  - `swapon` はフラグ（`EINVAL`）と `CAP_SYS_ADMIN`（`EPERM`）を確かめ、パスを読み書き
+    用に開き（その open のエラーを返します）、そのあと `EINVAL` を返します。tmpfs には
+    スワップに要るページの読み込みがないためです。`swapoff` は `CAP_SYS_ADMIN` を確かめて
+    パスを開き、スワップが使われていないので `EINVAL` を返します。
+  - `init_module`、`finit_module`、`delete_module` には `CAP_SYS_MODULE` が要ります
+    （`EPERM`）。`init_module` は ELF ヘッダーより短いイメージを断り（`ENOEXEC`）、
+    イメージを読みます（`EFAULT`）。`finit_module` はフラグを確かめ（`EINVAL`）、
+    Linux の `kernel_read_file` と同じくファイルを読みます（読むために開いていない
+    ディスクリプタは `EBADF`、通常のファイルでないものと空のものは `EINVAL`）。その
+    あと、`mod_check_sig` が断る署名はそのエラー（`EBADMSG`、`ENOPKG`）で、ほかの
+    モジュールは `EPERM` です。署名を確かめられる鍵がなく、署名のないモジュールは
+    ロックダウンが断るためです。`delete_module` は名前を読み（`EFAULT`）、モジュールが
+    ないので `ENOENT` を返します。
+  - `kexec_load` には `CAP_SYS_BOOT` が要り、そのあとロックダウンが断ります（どちらでも
+    `EPERM`）。`kexec_file_load` には `CAP_SYS_BOOT`（`EPERM`）と知っているフラグ
+    （`EINVAL`）が要ります。何も読み込まれていないので、`KEXEC_FILE_UNLOAD` は成功
+    します。それ以外は、カーネルのファイルを `finit_module` と同じく読みます。4 GiB より
+    上に置ける 64 ビットの bzImage でないものは `ENOEXEC`、そうであるものは確かめる鍵が
+    ないので `EPERM` です。
+  - `quotactl` はクォータの種類を確かめます（`EINVAL`）。デバイスを指定しないときは
+    `Q_SYNC` が成功し、ほかは `ENODEV` です。デバイスのパスはそのエラーとともに探し、
+    ブロックデバイスはないので `ENOTBLK` を返します。`quotactl_fd` はどのディスクリプタも
+    受け付け（`EBADF`）、種類を確かめ（`EINVAL`）、クォータのないファイルシステムに
+    対する Linux の `do_quotactl` と同じく `ENOSYS` を返します。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。

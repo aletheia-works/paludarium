@@ -254,6 +254,16 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     7 つだけで、Linux には何十もあります。そのため、順は同じでも番号は Linux と違います。
     AppArmor も SELinux もありません。`lsm_list_modules` が並べるのは 4 つのモジュールで、
     Linux が AppArmor のコンテキストを返すところで、`lsm_get_self_attr` は属性を見つけません。
+  - カーネルはいつも integrity でロックダウンしています。Secure Boot でない Linux は
+    そうではありません。モジュールと kexec のイメージは、Linux が信頼する鍵で署名した
+    ものでも読み込みません。モジュールの PKCS#7 の署名は解析しないので、壊れた署名は
+    Linux の `EBADMSG` ではなく `EPERM` になります。`finit_module` は
+    `MODULE_INIT_COMPRESSED_FILE` のモジュールを展開しません。`finit_module` も
+    `kexec_file_load` も、書き込み用に開かれているファイルを断りません（Linux の
+    `ETXTBSY`）。最初の PID 名前空間での `reboot` の再起動は、実行をやり直さずに終わらせます。
+  - スワップとクォータはありません。ホストのファイルへの `swapon` は `EINVAL` を返します。
+    ext4 の上の Linux は、スワップの署名のあるファイルならスワップに使います。ホストの
+    ファイルへの `quotactl_fd` は `ENOSYS` を返しますが、ext4 なら答えを返します。
   - `/proc` と `/dev` のファイルの `st_dev` は、そのパスがあるマウントのものなので、
     `ustat` はそのマウントの数を返します。Linux は procfs や devtmpfs の数を返します。
   - ファイルハンドル（`name_to_handle_at` と、`/proc/self/fdinfo` にある inotify の

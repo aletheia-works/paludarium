@@ -621,6 +621,34 @@ fn lowest_free(
 /// The path at `addr`, with a link in `/proc/self/fd` (or `/proc/self/cwd`,
 /// `/proc/self/exe`, `/dev/fd`) before its last component taken to where it
 /// leads ([`through_magic_links`]).
+/// Opens the path at guest address `name` as Linux's `file_open_name` does
+/// for a call that keeps no descriptor (`swapon`, `swapoff`): with the
+/// checks of an open, after which the file is closed again.
+pub(crate) fn open_name(
+    c: &mut Context<'_>,
+    name: u64,
+    flags: u32,
+) -> Result<Arc<dyn FileHandle>, Errno> {
+    let raw = path(c, name)?;
+    let fd = open_at(c, (-100i32) as u64, raw, u64::from(flags), 0, 0)?;
+    let closed = c
+        .files
+        .fds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&(fd as u32))
+        .ok_or(Errno::EBADF)?;
+    crate::record_locks::closed(c, &closed);
+    crate::mqueue::closed(c, &closed);
+    Ok(closed.file)
+}
+/// The status of what the path at guest address `name` names, its links
+/// followed, as Linux's `kern_path` with `LOOKUP_FOLLOW` finds it.
+pub(crate) fn named_at(c: &Context<'_>, name: u64) -> Result<FileStat, Errno> {
+    let raw = path(c, name)?;
+    let p = c.files.path((-100i32) as u64, raw)?;
+    Ok(named(c, &p, true)?.0)
+}
 fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     through_magic_links(c, string(c, addr)?)
 }

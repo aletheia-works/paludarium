@@ -66,6 +66,7 @@ kernel.
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | Security modules | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` |
 | Probes | `uprobe`, `uretprobe` |
+| Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
@@ -2500,6 +2501,47 @@ kernel.
 - No uprobe is ever set, so there is no probe trampoline: `uretprobe` forces
   `SIGILL` (`SI_KERNEL`) and returns -1, and `uprobe` gives `EPROTO`, as
   Linux does when they are called from anywhere else.
+- The administration calls take Linux master's checks in its order, on a
+  kernel locked down for integrity, as Ubuntu's is under Secure Boot (and as
+  `iopl` and `ioperm` refuse port access): nothing can load code into it, and
+  no file system has swap or quotas, as tmpfs has neither.
+  - `reboot` needs `CAP_SYS_BOOT` in the user namespace that owns the
+    caller's PID namespace (`EPERM`) and Linux's magic numbers (`EINVAL`).
+    A restart (`LINUX_REBOOT_CMD_RESTART` or `RESTART2`) kills the
+    namespace's init, which then ends with `SIGHUP`, and a halt or power-off
+    likewise with `SIGINT`, as Linux's `reboot_pid_ns` does; the calling
+    thread ends with status 0. In a nested PID namespace any other command
+    is `EINVAL`. In the first namespace its init is the first process, so the
+    run ends; `RESTART2`'s string is read first (`EFAULT`). There,
+    `CAD_ON` and `CAD_OFF` succeed, `KEXEC` finds no kernel loaded
+    (`EINVAL`) and `SW_SUSPEND` cannot hibernate a locked-down kernel
+    (`EPERM`).
+  - `swapon` checks its flags (`EINVAL`) and `CAP_SYS_ADMIN` (`EPERM`),
+    opens the path for reading and writing with that open's errors, and then
+    gives `EINVAL`, as tmpfs has no page reads for swap. `swapoff` checks
+    `CAP_SYS_ADMIN`, opens the path, and gives `EINVAL`, as no swap is on.
+  - `init_module`, `finit_module` and `delete_module` need
+    `CAP_SYS_MODULE` (`EPERM`). `init_module` refuses an image shorter than
+    an ELF header (`ENOEXEC`) and reads it (`EFAULT`); `finit_module`
+    checks its flags (`EINVAL`) and reads its file as Linux's
+    `kernel_read_file` does (`EBADF` for a descriptor not open for reading,
+    `EINVAL` for one that is not a regular file or is empty). Then a
+    signature that `mod_check_sig` refuses gives its error (`EBADMSG`,
+    `ENOPKG`), and any other module `EPERM`, as no key verifies it and
+    lockdown refuses an unsigned one. `delete_module` reads the name
+    (`EFAULT`) and finds no module (`ENOENT`).
+  - `kexec_load` needs `CAP_SYS_BOOT`, and lockdown then refuses it
+    (`EPERM` either way). `kexec_file_load` needs `CAP_SYS_BOOT` (`EPERM`)
+    and known flags (`EINVAL`); `KEXEC_FILE_UNLOAD` succeeds, as nothing is
+    loaded. Otherwise the kernel's file is read as `finit_module`'s, a file
+    that is not a 64-bit bzImage that can load above 4 GiB is `ENOEXEC`, and
+    one that is gives `EPERM`, as no key verifies it.
+  - `quotactl` checks the quota type (`EINVAL`); with no device `Q_SYNC`
+    succeeds and anything else is `ENODEV`, and a device path is looked up
+    with its errors and is `ENOTBLK`, as nothing is a block device.
+    `quotactl_fd` takes any descriptor (`EBADF`), checks the type
+    (`EINVAL`) and gives `ENOSYS`, as Linux's `do_quotactl` does for a file
+    system without quotas.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

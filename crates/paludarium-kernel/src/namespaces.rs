@@ -287,6 +287,9 @@ struct Numbers {
     /// Its init has exited, so no task may join it (Linux clears
     /// `PIDNS_ADDING`).
     closed: bool,
+    /// The signal its init ends with after `reboot` (Linux's
+    /// `pid_ns->reboot`).
+    reboot: Option<i32>,
 }
 impl Numbers {
     /// The next number after the last handed out that no task has, as
@@ -362,6 +365,14 @@ impl Namespace {
     /// Its init has exited: no task may join it any more.
     pub(crate) fn close(&self) {
         self.numbers().closed = true;
+    }
+    /// `reboot` in it: its init ends with `signal`.
+    pub(crate) fn set_reboot(&self, signal: i32) {
+        self.numbers().reboot = Some(signal);
+    }
+    /// The signal its init ends with after `reboot`, if it was called.
+    pub(crate) fn reboot(&self) -> Option<i32> {
+        self.numbers().reboot
     }
     /// This PID namespace and each one it is in, from the first down to it,
     /// as Linux's `pid->numbers` holds a task's numbers by level.

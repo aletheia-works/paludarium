@@ -1088,6 +1088,13 @@ impl Processes {
         // more, as in Linux's zap_pid_ns_processes.
         let space = entries.get(&pid).map(|entry| entry.space.clone());
         let zapped = space.filter(|space| space.init() == Some(pid));
+        // After `reboot`, the init ends with its signal, as Linux's
+        // zap_pid_ns_processes sets `group_exit_code`.
+        if let Some(signal) = zapped.as_ref().and_then(|space| space.reboot())
+            && let Some(entry) = entries.get_mut(&pid)
+        {
+            entry.status = Some(ExitStatus::Signaled(signal));
+        }
         if let Some(space) = &zapped {
             if !space.is_first() {
                 space.close();
@@ -1835,6 +1842,17 @@ impl Processes {
         let result = Self::deliver(entries, pid, thread, signal);
         self.changed.notify();
         result
+    }
+    /// `reboot` in PID namespace `space`, as Linux's `reboot_pid_ns`: its
+    /// init is killed (SIGKILL from the kernel) and ends with `signal`.
+    pub(crate) fn reboot(&self, space: &Namespace, signal: i32) {
+        space.set_reboot(signal);
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(init) = space.init() {
+            let _ = Self::deliver(&mut entries, init, None, Self::from_kernel(9));
+        }
+        drop(entries);
+        self.changed.notify();
     }
     /// A signal the kernel sends itself (`SI_KERNEL`).
     fn from_kernel(number: i32) -> signals::PendingSignal {

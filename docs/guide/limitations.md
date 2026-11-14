@@ -294,6 +294,17 @@ verified.
     AppArmor or SELinux: `lsm_list_modules` lists four modules, and
     `lsm_get_self_attr` finds no attribute where Linux gives AppArmor's
     context.
+  - The kernel is always locked down for integrity, where Linux without
+    Secure Boot is not: a module or kexec image is never loaded, even one
+    signed by a key Linux trusts, and a module's PKCS#7 signature is not
+    parsed, so a malformed one gives `EPERM` where Linux gives `EBADMSG`.
+    `finit_module` does not decompress a `MODULE_INIT_COMPRESSED_FILE`
+    module, and neither it nor `kexec_file_load` refuses a file open for
+    writing (Linux's `ETXTBSY`). A restart by `reboot` in the first PID
+    namespace ends the run rather than starting it again.
+  - There is no swap and no quota: `swapon` of a host file gives `EINVAL`
+    where Linux on ext4 swaps on a file with a swap signature, and
+    `quotactl_fd` of a host file gives `ENOSYS` where ext4 answers.
   - A file in `/proc` or `/dev` has the `st_dev` of the mount holding the
     path, so `ustat` of it gives that mount's counts, where Linux gives
     procfs's or devtmpfs's.

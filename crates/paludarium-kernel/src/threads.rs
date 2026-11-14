@@ -1746,6 +1746,18 @@ impl Kernel {
             60 => {
                 return Some(Next::Exit(ExitStatus::Exited((a[0] & 255) as i32)));
             }
+            // reboot(magic1, magic2, cmd, arg): the commands that end the
+            // PID namespace's init end the calling thread too.
+            169 => match crate::admin::reboot(
+                &self.processes,
+                &self.pid_space(thread.tid),
+                &thread.state.credentials,
+                mem,
+                a,
+            ) {
+                Ok(true) => return Some(Next::Exit(ExitStatus::Exited(0))),
+                result => result.map(|_| 0),
+            },
             231 => {
                 let status = ExitStatus::Exited((a[0] & 255) as i32);
                 thread.state.exit_status = Some(status);

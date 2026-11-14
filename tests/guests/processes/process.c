@@ -9745,6 +9745,110 @@ static int kernel_info_case(void) {
     printf("worker=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;
 }
+/* reboot, swap, modules, kexec and quotas, by a user without capabilities,
+ * and reboot in a PID namespace of its own user namespace. */
+#define ADMIN_MAGIC1 0xfee1deadL
+#define ADMIN_MAGIC2 672274793L
+static void admin_reboot_in_namespace(const char *name, long cmd, int by_init) {
+    fflush(stdout);
+    pid_t outer = fork();
+    if (outer == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWPID)) _exit(90);
+        pid_t init = fork();
+        if (init == 0) {
+            if (!by_init) {
+                pid_t kid = fork();
+                if (kid == 0) {
+                    syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, cmd, NULL);
+                    _exit(91);
+                }
+                pause();
+            }
+            syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, cmd, NULL);
+            _exit(92);
+        }
+        int status = 0;
+        waitpid(init, &status, 0);
+        printf("reboot-%s: signaled=%d sig=%d exited=%d\n", name, WIFSIGNALED(status),
+               WIFSIGNALED(status) ? WTERMSIG(status) : -1,
+               WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(outer, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status))
+        printf("reboot-%s: outer=%d\n", name, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+static int admin_worker(void) {
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 90;
+    static char buf[256];
+    int fd = open("/proc/self/exe", O_RDONLY);
+    printf("reboot=%ld\n", pn(syscall(169, 0L, 0L, 0L, NULL)));
+    printf("swapon-flags=%ld\n", pn(syscall(167, "/", 1L << 19)));
+    printf("swapon=%ld\n", pn(syscall(167, "/", 0L)));
+    printf("swapoff=%ld\n", pn(syscall(168, "/")));
+    printf("init-module=%ld\n", pn(syscall(175, buf, 0L, "")));
+    printf("finit-module=%ld\n", pn(syscall(313, -1L, "", 99L)));
+    printf("delete-module=%ld\n", pn(syscall(176, NULL, 0L)));
+    printf("kexec-load=%ld\n", pn(syscall(246, 0L, 0L, NULL, 0L)));
+    printf("kexec-file-load=%ld\n", pn(syscall(320, -1L, -1L, 0L, NULL, 1L << 6)));
+    /* quotactl(QCMD(cmd, type), special, id, addr) */
+    long sync = 0x80000100L, getinfo = 0x80000500L;
+    printf("quotactl-sync-all=%ld\n", pn(syscall(179, sync, NULL, 0L, NULL)));
+    printf("quotactl-type=%ld\n", pn(syscall(179, sync | 3, NULL, 0L, NULL)));
+    printf("quotactl-no-device=%ld\n", pn(syscall(179, getinfo, NULL, 0L, NULL)));
+    printf("quotactl-not-block=%ld\n", pn(syscall(179, getinfo, "/", 0L, buf)));
+    printf("quotactl-missing=%ld\n", pn(syscall(179, getinfo, "/nonexistent", 0L, buf)));
+    printf("quotactl-empty=%ld\n", pn(syscall(179, getinfo, "", 0L, buf)));
+    printf("quotactl-fault=%ld\n", pn(syscall(179, getinfo, (void *)8, 0L, buf)));
+    printf("quotactl-fd-bad=%ld\n", pn(syscall(443, -1L, getinfo, 0L, buf)));
+    printf("quotactl-fd-type=%ld\n", pn(syscall(443, (long)fd, sync | 3, 0L, buf)));
+    close(fd);
+
+    /* In a PID namespace of its own user namespace, which gives
+     * CAP_SYS_BOOT there. */
+    fflush(stdout);
+    pid_t outer = fork();
+    if (outer == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWPID)) _exit(90);
+        pid_t init = fork();
+        if (init == 0) {
+            printf("ns-bad-magic=%ld\n", pn(syscall(169, ADMIN_MAGIC1, 1L, 0x01234567L, NULL)));
+            printf("ns-cad-on=%ld\n", pn(syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, 0x89ABCDEFL, NULL)));
+            printf("ns-kexec=%ld\n", pn(syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, 0x45584543L, NULL)));
+            fflush(stdout);
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(init, &status, 0);
+        fflush(stdout);
+        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 99);
+    }
+    int status = 0;
+    waitpid(outer, &status, 0);
+    printf("ns-checks=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    admin_reboot_in_namespace("halt-by-child", 0xCDEF0123L, 0);
+    admin_reboot_in_namespace("power-off-by-init", 0x4321FEDCL, 1);
+    admin_reboot_in_namespace("restart-by-init", 0x01234567L, 1);
+    admin_reboot_in_namespace("restart2-by-child", 0xA1B2C3D4L, 0);
+    return 0;
+}
+static int admin_case(void) {
+    fflush(stdout);
+    pid_t worker = fork();
+    if (worker == 0) {
+        int code = admin_worker();
+        fflush(stdout);
+        _exit(code);
+    }
+    int status = 0;
+    waitpid(worker, &status, 0);
+    printf("worker=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
 static int process_vm_case(void) {
     if (pipe(pv_gate)) return 80;
     long self = getpid();
@@ -23117,6 +23221,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "process-vm")) return process_vm_case();
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "kernel-info")) return kernel_info_case();
+    if (!strcmp(mode, "admin")) return admin_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
     if (!strcmp(mode, "cpu-timer-others")) return cpu_timer_others_case();
     if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();

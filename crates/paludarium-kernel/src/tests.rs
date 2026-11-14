@@ -7790,3 +7790,170 @@ mod kernel_info {
         assert_eq!(f.call(335, &[]), Next::Exit(ExitStatus::Signaled(4)));
     }
 }
+
+mod admin {
+    use super::*;
+    const NAME: u64 = DATA + 0x100;
+    const BUF: u64 = DATA + 0x400;
+    fn put(f: &Fixture, at: u64, bytes: &[u8]) -> u64 {
+        f.mem.write(GuestAddr(at), bytes).unwrap();
+        f.mem
+            .write(GuestAddr(at + bytes.len() as u64), &[0])
+            .unwrap();
+        at
+    }
+    /// A file `/tmp/<name>` holding `bytes`, and its path at `NAME`.
+    fn file(f: &mut Fixture, name: &[u8], bytes: &[u8]) -> u64 {
+        let mut path = b"/tmp/".to_vec();
+        path.extend_from_slice(name);
+        let at = put(f, NAME, &path);
+        let fd = f.ret(2, &[at, 0o102, 0o600]);
+        f.mem.write(GuestAddr(BUF), bytes).unwrap();
+        assert_eq!(f.ret(1, &[fd, BUF, bytes.len() as u64]), bytes.len() as u64);
+        assert_eq!(f.ret(3, &[fd]), 0);
+        at
+    }
+    const MAGIC: [u64; 2] = [0xfee1_dead, 672_274_793];
+    #[test]
+    fn reboot_checks_the_capability_magic_and_command() {
+        let mut f = fixture();
+        let (einval, eperm) = (errno(Errno::EINVAL), errno(Errno::EPERM));
+        assert_eq!(f.ret(169, &[0, 0, 0x89AB_CDEF, 0]), einval);
+        assert_eq!(f.ret(169, &[MAGIC[0], 1, 0x89AB_CDEF, 0]), einval);
+        for magic2 in [672_274_793, 85_072_278, 369_367_448, 537_993_216] {
+            assert_eq!(f.ret(169, &[MAGIC[0], magic2, 0x89AB_CDEF, 0]), 0);
+        }
+        // The magic numbers are `int`s: only the low 32 bits count.
+        assert_eq!(f.ret(169, &[MAGIC[0] | 1 << 32, MAGIC[1], 0, 0]), 0);
+        assert_eq!(f.ret(169, &[MAGIC[0], MAGIC[1], 0x4558_4543, 0]), einval);
+        assert_eq!(f.ret(169, &[MAGIC[0], MAGIC[1], 0xD000_FCE2, 0]), eperm);
+        assert_eq!(f.ret(169, &[MAGIC[0], MAGIC[1], 7, 0]), einval);
+        assert_eq!(
+            f.ret(169, &[MAGIC[0], MAGIC[1], 0xA1B2_C3D4, 0]),
+            errno(Errno::EFAULT)
+        );
+        assert_eq!(f.ret(105, &[1000]), 0);
+        assert_eq!(f.ret(169, &[0, 0, 0, 0]), eperm);
+    }
+    #[test]
+    fn reboot_halts_the_first_namespace() {
+        let mut f = fixture();
+        assert_eq!(
+            f.call(169, &[MAGIC[0], MAGIC[1], 0xCDEF_0123, 0]),
+            Next::Exit(ExitStatus::Exited(0))
+        );
+        assert_eq!(f.kernel.pid_space(1).reboot(), Some(2));
+    }
+    #[test]
+    fn swap_needs_cap_sys_admin_and_opens_the_file() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        let swap = file(&mut f, b"swap", &[0; 16]);
+        assert_eq!(f.ret(167, &[swap, 1 << 19]), einval);
+        assert_eq!(f.ret(167, &[swap, 0x7_ffff]), einval);
+        assert_eq!(f.ret(168, &[swap]), einval);
+        let missing = put(&f, NAME, b"/tmp/missing");
+        assert_eq!(f.ret(167, &[missing, 0]), errno(Errno::ENOENT));
+        assert_eq!(f.ret(168, &[missing]), errno(Errno::ENOENT));
+        let tmp = put(&f, NAME, b"/tmp");
+        assert_eq!(f.ret(167, &[tmp, 0]), errno(Errno::EISDIR));
+        assert_eq!(f.ret(167, &[0, 0]), errno(Errno::EFAULT));
+        // No descriptor is left open.
+        assert_eq!(f.ret(32, &[3]), errno(Errno::EBADF));
+        assert_eq!(f.ret(105, &[1000]), 0);
+        assert_eq!(f.ret(167, &[tmp, 1 << 19]), einval);
+        assert_eq!(f.ret(167, &[tmp, 0]), errno(Errno::EPERM));
+        assert_eq!(f.ret(168, &[tmp]), errno(Errno::EPERM));
+    }
+    #[test]
+    fn modules_are_refused_unsigned_and_none_is_loaded() {
+        let mut f = fixture();
+        let eperm = errno(Errno::EPERM);
+        f.mem.write(GuestAddr(BUF), &[0x7f; 64]).unwrap();
+        assert_eq!(f.ret(175, &[BUF, 63, 0]), errno(Errno(8)));
+        assert_eq!(f.ret(175, &[BUF, 64, 0]), eperm);
+        assert_eq!(f.ret(175, &[0x4000_0000, 64, 0]), errno(Errno::EFAULT));
+        // A signature whose description Linux refuses.
+        let mut module = vec![0u8; 64];
+        let signed = |module: &mut Vec<u8>, info: [u8; 12]| {
+            let mut m = module.clone();
+            m.extend_from_slice(&info);
+            m.extend_from_slice(b"~Module signature appended~\n");
+            m
+        };
+        let cases: [([u8; 12], Errno); 4] = [
+            ([0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 8], Errno::EPERM),
+            ([0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 8], Errno(65)),
+            ([1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 8], Errno(74)),
+            ([0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 64], Errno(74)),
+        ];
+        for (info, expected) in cases {
+            let image = signed(&mut module, info);
+            f.mem.write(GuestAddr(BUF), &image).unwrap();
+            assert_eq!(f.ret(175, &[BUF, image.len() as u64, 0]), errno(expected));
+        }
+        module.clear();
+        // finit_module(fd, params, flags)
+        let path = file(&mut f, b"module", &[0x7f; 64]);
+        let fd = f.ret(2, &[path, 0]);
+        assert_eq!(f.ret(313, &[fd, 0, 8]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(313, &[fd, 0, 0]), eperm);
+        assert_eq!(f.ret(313, &[fd, 0, 4]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(313, &[99, 0, 0]), errno(Errno::EBADF));
+        let tmp = put(&f, NAME, b"/tmp");
+        let dir = f.ret(2, &[tmp, 0o200000]);
+        assert_eq!(f.ret(313, &[dir, 0, 0]), errno(Errno::EINVAL));
+        // delete_module(name, flags)
+        let name = put(&f, NAME, b"ext4");
+        assert_eq!(f.ret(176, &[name, 0]), errno(Errno::ENOENT));
+        assert_eq!(f.ret(176, &[0, 0]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(105, &[1000]), 0);
+        assert_eq!(f.ret(175, &[BUF, 1, 0]), eperm);
+        assert_eq!(f.ret(313, &[99, 0, 8]), eperm);
+        assert_eq!(f.ret(176, &[0, 0]), eperm);
+    }
+    #[test]
+    fn kexec_is_locked_down() {
+        let mut f = fixture();
+        let eperm = errno(Errno::EPERM);
+        assert_eq!(f.ret(246, &[0, 0, 0, 0]), eperm);
+        assert_eq!(f.ret(320, &[0, 0, 0, 0, 1 << 6]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(320, &[99, 99, 0, 0, 1]), 0);
+        assert_eq!(f.ret(320, &[99, 0, 0, 0, 4]), errno(Errno::EBADF));
+        let path = file(&mut f, b"vmlinuz", &[0; 2048]);
+        let fd = f.ret(2, &[path, 0]);
+        assert_eq!(f.ret(320, &[fd, 0, 0, 0, 4]), errno(Errno(8)));
+        let mut kernel = vec![0u8; 2048];
+        kernel[0x1fe..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+        kernel[0x202..0x206].copy_from_slice(b"HdrS");
+        kernel[0x206..0x208].copy_from_slice(&0x020Fu16.to_le_bytes());
+        kernel[0x211] = 1;
+        kernel[0x236] = 3;
+        let path = file(&mut f, b"bzimage", &kernel);
+        let fd = f.ret(2, &[path, 0]);
+        assert_eq!(f.ret(320, &[fd, 0, 0, 0, 4]), eperm);
+        assert_eq!(f.ret(105, &[1000]), 0);
+        assert_eq!(f.ret(320, &[fd, 0, 0, 0, 1 << 6]), eperm);
+    }
+    #[test]
+    fn quotas_are_on_no_device_or_file_system() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // QCMD(Q_SYNC, USRQUOTA), QCMD(Q_GETINFO, GRPQUOTA).
+        let (sync, info) = (0x8000_0100u64, 0x8000_0501u64);
+        assert_eq!(f.ret(179, &[sync, 0, 0, 0]), 0);
+        assert_eq!(f.ret(179, &[sync | 3, 0, 0, 0]), einval);
+        assert_eq!(f.ret(179, &[info, 0, 0, 0]), errno(Errno::ENODEV));
+        let tmp = put(&f, NAME, b"/tmp");
+        assert_eq!(f.ret(179, &[info, tmp, 0, 0]), errno(Errno(15)));
+        let missing = put(&f, NAME, b"/tmp/missing");
+        assert_eq!(f.ret(179, &[info, missing, 0, 0]), errno(Errno::ENOENT));
+        assert_eq!(f.ret(179, &[info, 0x4000_0000, 0, 0]), errno(Errno::EFAULT));
+        // quotactl_fd(fd, cmd, id, addr)
+        let tmp = put(&f, NAME, b"/tmp");
+        let dir = f.ret(2, &[tmp, 0o10_000_000]);
+        assert_eq!(f.ret(443, &[dir, info, 0, 0]), errno(Errno::ENOSYS));
+        assert_eq!(f.ret(443, &[dir, info | 3, 0, 0]), einval);
+        assert_eq!(f.ret(443, &[99, info, 0, 0]), errno(Errno::EBADF));
+    }
+}

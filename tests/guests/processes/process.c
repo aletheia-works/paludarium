@@ -13489,6 +13489,8 @@ int main(int argc, char **argv) {
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 48, 1, NULL, 0, 0x100, "mngtmpaddr 48");
             /* 0.0.0.0 is taken, and adds nothing. */
             nl_addr_life(ctl, port, add, AF_INET, "0.0.0.0", 24, 1, NULL, 0, -1, "zero4");
+            /* Before the device is looked for. */
+            nl_addr_life(ctl, port, add, AF_INET, "0.0.0.0", 24, none_index, NULL, 0, -1, "zero4 other index");
             /* IPv6 keeps only the flags a request may set; IFA_F_NODAD
                tells of the address once. */
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:6::1", 64, 1, NULL, 0, 0x01 | 0x40, "flags6");

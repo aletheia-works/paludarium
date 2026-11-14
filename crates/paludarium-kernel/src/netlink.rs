@@ -5218,6 +5218,11 @@ mod tests {
             request(AF_INET, 0, 24, 1, &[(IFA_LOCAL, &[0; 4])], 0),
             Ok(Vec::new())
         );
+        // Before the device is looked for, as `inet_rtm_newaddr` does.
+        assert_eq!(
+            request(AF_INET, 0, 24, 7, &[(IFA_LOCAL, &[0; 4])], 0),
+            Ok(Vec::new())
+        );
         let cache = life(500, 1000);
         let priority = 50u32.to_le_bytes();
         let asked4 = [

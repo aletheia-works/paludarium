@@ -800,6 +800,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   続きの上へ広げられ、そのページは初めて触れたときに読み込みます。また、複数の
   マッピングにまたがる範囲を
   `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
+  AIO と `io_uring` のリングは固定のマッピング（`VM_DONTEXPAND`）で、広げられず
+  （`EFAULT`）、動かして元を残すこともできません（`MREMAP_DONTUNMAP`、`EINVAL`）。
+  AIO のリングは、Linux master の `aio_ring_mremap` と同じく丸ごとでなければ動かせず
+  （行き先を空け、縮めて落とす分を外したあとで `EINVAL`）、コンテキストも一緒に移ります。
 - `msync` は、引数と範囲を確かめ、`MS_SYNC` か `MS_ASYNC` なら共有のファイルの
   マッピングへの書き込みをファイルに書き戻します。
 - `remap_file_pages` は、共有のマッピングの範囲を、そのファイルや共有メモリの別の

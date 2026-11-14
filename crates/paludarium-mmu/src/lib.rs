@@ -1218,6 +1218,13 @@ pub trait PageSource: Send + Sync {
     fn fixed(&self) -> bool {
         false
     }
+    /// Whether `mremap` may move `length` bytes of a mapping of this
+    /// memory to a new place (the VMA's `vm_ops->mremap`). The ring of AIO
+    /// moves only whole (`aio_ring_mremap`).
+    fn moves(&self, length: u64) -> bool {
+        let _ = length;
+        true
+    }
     /// Whether the memory is a `memfd_secret` file's (Linux's
     /// `vma_is_secretmem`), whose pages the kernel may not reach: `get_user_pages`
     /// refuses them.
@@ -3478,12 +3485,29 @@ impl AddressSpaceData {
         if old_len == 0 && !shared {
             return Err(Errno::EINVAL);
         }
+        // A fixed mapping (the rings of AIO and `io_uring`) neither stays
+        // behind a move (`check_prep_vma`)...
+        let source = self
+            .shared_at(addr.0)
+            .and_then(|shared| shared.pages.source().cloned());
+        let fixed = source.as_ref().is_some_and(|source| source.fixed());
+        if how.keep_old && fixed {
+            return Err(Errno::EINVAL);
+        }
         // A shrink may cross the end of the VMA: only what stays must not.
         let kept = old_len.min(new_len);
         let (_, region_end) = self.region_at(addr.0).ok_or(Errno::EFAULT)?;
         if kept > region_end - addr.0 {
             return Err(Errno::EFAULT);
         }
+        // ...nor grows.
+        if new_len > old_len && fixed {
+            return Err(Errno::EFAULT);
+        }
+        // What the memory's own `mremap` refuses comes once the target is
+        // free and what a shrink drops is gone, as Linux's `move_vma` asks
+        // it after moving the pages, and moves them back.
+        let moves = |length: u64| source.as_ref().is_none_or(|source| source.moves(length));
         let old_end = addr.0 + old_len;
         if let Some(hint) = new_addr {
             let to = if how.fixed {
@@ -3496,6 +3520,9 @@ impl AddressSpaceData {
             };
             if old_len > new_len {
                 self.unmap(GuestAddr(addr.0 + new_len), old_len - new_len)?;
+            }
+            if !moves(new_len) {
+                return Err(Errno::EINVAL);
             }
             self.move_region(addr.0, kept, to, new_len, how.keep_old);
             return Ok(GuestAddr(to));
@@ -3536,6 +3563,9 @@ impl AddressSpaceData {
             return Err(Errno::ENOMEM);
         }
         let to = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
+        if !moves(new_len) {
+            return Err(Errno::EINVAL);
+        }
         self.move_region(addr.0, old_len, to, new_len, false);
         Ok(GuestAddr(to))
     }

@@ -89,6 +89,7 @@
     {"name":"aio-getevents","binary":"aio"},
     {"name":"aio-full","binary":"aio"},
     {"name":"aio-lifetime","binary":"aio"},
+    {"name":"aio-mremap","binary":"aio"},
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"inotify-directory","binary":"inotify"},
     {"name":"inotify-files","binary":"inotify"},

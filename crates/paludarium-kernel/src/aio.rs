@@ -178,6 +178,10 @@ impl PageSource for RingPages {
     fn fixed(&self) -> bool {
         true
     }
+    /// `aio_ring_mremap` refuses a move of part of the ring (`EINVAL`).
+    fn moves(&self, length: u64) -> bool {
+        length == self.size
+    }
     /// `aio_ring_mmap_prepare` adds `VM_DONTEXPAND` and `VM_DONTCOPY`; the
     /// ring's file lies on a pseudo file system, which runs nothing.
     fn vma_flags(&self, flags: u64) -> u64 {

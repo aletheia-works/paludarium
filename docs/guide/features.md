@@ -889,7 +889,11 @@ kernel.
   process when it moves. A file mapping grows over more of the file, whose
   pages it reads when they are first touched, and moving a range that spans
   several mappings with `MREMAP_FIXED`, which recent Linux allows, gives
-  `EFAULT`.
+  `EFAULT`. The rings of AIO and `io_uring` are fixed mappings
+  (`VM_DONTEXPAND`): they do not grow (`EFAULT`) or stay behind a move
+  (`MREMAP_DONTUNMAP`, `EINVAL`), and an AIO ring moves only whole, as
+  Linux master's `aio_ring_mremap` has it (`EINVAL` once the target is
+  free and what a shrink drops is gone), with its context.
 - `msync` checks its arguments and the range, and with `MS_SYNC` or
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
 - `remap_file_pages` maps a range of a shared mapping again at another page

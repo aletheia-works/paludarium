@@ -384,6 +384,7 @@ mod linux {
         aio_getevents => ("aio-getevents","aio"),
         aio_full => ("aio-full","aio"),
         aio_lifetime => ("aio-lifetime","aio"),
+        aio_mremap => ("aio-mremap","aio"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),

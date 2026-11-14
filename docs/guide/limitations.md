@@ -206,9 +206,8 @@ verified.
   `EINVAL` unless the file is ready, is guessed from the kind of file: a FIFO
   open to read and write, and a character device (a terminal). A ring holds
   exactly one request fewer than its events, where Linux's per-CPU counts
-  can stop one sooner; the I/O priority of `IOCB_FLAG_IOPRIO` is checked but
-  changes nothing; and a ring `mremap` moves is found at its new address
-  only when it moved whole (Linux refuses a partial move).
+  can stop one sooner; and the I/O priority of `IOCB_FLAG_IOPRIO` is checked
+  but changes nothing.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
   - `pwritev2`'s `RWF_NOAPPEND` cannot turn an `O_APPEND` file's append off

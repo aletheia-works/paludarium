@@ -146,7 +146,10 @@ every test passing.
 - Line coverage must stay at 80 % or more. The measurement before the first
   release was about 94 % for the whole workspace.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
-  sources, known vulnerabilities) run on every pull request.
+  sources, known vulnerabilities) run on every pull request. Clippy also runs
+  with the latest stable Rust for the Linux, macOS and Windows targets, so the
+  native crates keep building with stable; the tests use only the pinned
+  nightly.
 - Every GitHub Actions action is pinned to a commit SHA.
 
 ## CI

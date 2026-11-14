@@ -106,7 +106,8 @@ or run a task.
 ## CI
 
 - `ci.yml` (every pull request): unit tests on three OSes, rustfmt, clippy
-  (`-D warnings`), the wasm32 build, cargo-deny, differential tests, 80 %
+  (`-D warnings`, also with the latest stable Rust for the Linux, macOS and
+  Windows targets), the wasm32 build, cargo-deny, differential tests, 80 %
   coverage, probe, aube and ripgrep differential tests, the WebAssembly acceptance
   tests, polyglot lint, the documentation build and the release package
   check. A pull request runs the jobs its changed files need

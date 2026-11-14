@@ -3029,8 +3029,10 @@ fn lookup(
         }
         let gateway = route.gateway.filter(|_| route.uses_gateway);
         // `__mkroute_output` drops the route's `fib_info`, and so its
-        // metrics, for the limited broadcast address.
-        let metrics = if ip.is_broadcast() {
+        // metrics, for the limited broadcast address, and for a multicast
+        // one when the route is shorter than 224.0.0.0/4's prefix (the
+        // default route, which it takes for want of a multicast one).
+        let metrics = if ip.is_broadcast() || (ip.is_multicast() && route.len < 4) {
             crate::interface::NO_METRICS
         } else {
             route.metrics
@@ -3865,6 +3867,19 @@ mod tests {
         let mut elsewhere = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         attribute(&mut elsewhere, RTA_DST, &[192, 0, 2, 1]);
         let answer = lookup(&network, &elsewhere, 1, 7, u32::MAX).unwrap();
+        assert!(attributes(&answer[28..]).contains(&(RTA_METRICS, &held[..])));
+        // So does one of a multicast address through the default route,
+        // but not through a multicast route of its own.
+        let mut group = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        attribute(&mut group, RTA_DST, &[224, 0, 0, 1]);
+        let answer = lookup(&network, &group, 1, 7, u32::MAX).unwrap();
+        assert!(
+            !attributes(&answer[28..])
+                .iter()
+                .any(|&(k, _)| k == RTA_METRICS)
+        );
+        assert!(request(RTM_NEWROUTE, 0x600, &[224, 0, 0, 0], 4, Some(&held)).is_ok());
+        let answer = lookup(&network, &group, 1, 7, u32::MAX).unwrap();
         assert!(attributes(&answer[28..]).contains(&(RTA_METRICS, &held[..])));
         // A request that names other metrics adds another route; the same
         // again is EEXIST.

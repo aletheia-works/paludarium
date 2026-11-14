@@ -1582,7 +1582,8 @@ kernel.
     metrics alone are two routes, as `fib_find_info` tells them apart. A
     dump, a notification and a lookup's answer give a route's metrics but
     those of 0, as `rtnetlink_put_metrics` does (none for the limited
-    broadcast address, whose lookup drops them); an IPv4 removal that
+    broadcast address, and for a multicast one through a route of a prefix
+    shorter than 4, whose lookups drop them); an IPv4 removal that
     names metrics takes only a route that has them, as `fib_metrics_match`
     compares them (unheld, so an MTU of 70000 is not the 65520 kept), and
     IPv6's does not look.

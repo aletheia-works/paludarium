@@ -13593,6 +13593,25 @@ int main(int argc, char **argv) {
                      "del6 metric 7");
             nl_route(ctl, port, 25, 0, "2001:db8:2::", 64, ROUTE6(.protocol = 0, .kind = 1), "del6 blackhole as unicast");
             nl_route(ctl, port, 25, 0, "2001:db8:77::", 64, ROUTE6(.protocol = 0, .kind = 0), "del6 missing");
+            /* A refused add makes its table only once its prefix is good:
+               a removal from a table never made is told the table does not
+               exist, one from a table made is told of no route. */
+            nl_route(ctl, port, 24, add, "10.0.0.1", 8, ROUTE4(.table = 500, .scope = 253, .oif = 1),
+                     "add bad prefix 500");
+            nl_route(ctl, port, 25, 0, "10.0.0.0", 8, ROUTE4(.table = 500, .protocol = 0, .scope = 255, .kind = 0),
+                     "del in 500");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 33, ROUTE4(.table = 501, .scope = 253, .oif = 1),
+                     "add prefix 33 in 501");
+            nl_route(ctl, port, 25, 0, "10.0.0.0", 8, ROUTE4(.table = 501, .protocol = 0, .scope = 255, .kind = 0),
+                     "del in 501");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 8, ROUTE4(.table = 502, .scope = 254, .oif = 1, .gw = "127.0.0.2"),
+                     "add bad gateway 502");
+            nl_route(ctl, port, 25, 0, "10.0.0.0", 8, ROUTE4(.table = 502, .protocol = 0, .scope = 255, .kind = 0),
+                     "del in 502");
+            nl_route(ctl, port, 24, add, "2001:db8:8::", 129, ROUTE6(.table = 503, .oif = 1), "add6 prefix 129 in 503");
+            nl_route(ctl, port, 25, 0, "2001:db8:8::", 64, ROUTE6(.table = 503, .protocol = 0, .kind = 0), "del6 in 503");
+            nl_route(ctl, port, 24, add, "2001:db8:8::", 64, ROUTE6(.table = 504, .oif = 999), "add6 other device 504");
+            nl_route(ctl, port, 25, 0, "2001:db8:8::", 64, ROUTE6(.table = 504, .protocol = 0, .kind = 0), "del6 in 504");
             monitor_show(mon, port, "dels");
             /* An address's prefix route and the routes from it. */
             nl_route(ctl, port, 24, add, "2001:db8:a::", 64, ROUTE6(.oif = 1, .metric = 5), "add6 before address");

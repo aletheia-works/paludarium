@@ -232,7 +232,7 @@ fn a_backed_map_shows_its_backing_or_nothing() {
     let backing = Backing::Shared {
         pages: &pages,
         offset: 0,
-        may_write: true,
+        writes: SharedWrites::Allowed,
     };
     assert_eq!(
         m.map_backed(
@@ -351,4 +351,157 @@ fn page_state_tells_untouched_read_and_written_pages_apart() {
     // Discarded, a written page has none again.
     m.discard_shared(GuestAddr(0x20000), PAGE_SIZE).unwrap();
     assert_eq!(m.page_state(GuestAddr(0x20000)), Some(PageState::Absent));
+}
+
+#[test]
+fn vma_flags_follow_linux_vm_flags() {
+    let mut m = AddressSpace::new();
+    let flags = |m: &AddressSpace, at: u64| m.view().vma_from(at).unwrap().flags;
+    let vmas = |m: &AddressSpace, from: u64, to: u64| {
+        let mut count = 0;
+        let mut at = from;
+        while let Some(vma) = m.view().vma_from(at).filter(|v| v.start < to) {
+            count += 1;
+            at = vma.end;
+        }
+        count
+    };
+    let base = vm::MAYREAD | vm::MAYWRITE | vm::MAYEXEC | vm::SOFTDIRTY;
+    let rw = vm::READ | vm::WRITE;
+    // Private memory that may be written is charged.
+    let at = m
+        .map(
+            Some(GuestAddr(0x10000)),
+            3 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap()
+        .0;
+    assert_eq!(flags(&m, at), base | rw | vm::ACCOUNT);
+    // Advice splits a VMA off and merges it again once the flags agree.
+    let middle = at + PAGE_SIZE;
+    let advise = |m: &AddressSpace, advice| {
+        m.advise_flags(GuestAddr(middle), middle + PAGE_SIZE, advice)
+            .unwrap();
+    };
+    advise(&m, FlagAdvice::Read(Some(ReadHint::Random)));
+    assert_eq!(flags(&m, middle), base | rw | vm::ACCOUNT | vm::RAND_READ);
+    assert_eq!(vmas(&m, at, at + 3 * PAGE_SIZE), 3);
+    advise(&m, FlagAdvice::Read(None));
+    assert_eq!(vmas(&m, at, at + 3 * PAGE_SIZE), 1);
+    advise(&m, FlagAdvice::HugePages(false));
+    advise(&m, FlagAdvice::Mergeable(true));
+    assert_eq!(
+        flags(&m, middle),
+        base | rw | vm::ACCOUNT | vm::NOHUGEPAGE | vm::MERGEABLE
+    );
+    // Never written, anonymous memory gives its charge back as it stops
+    // being writable; written, it keeps it.
+    let fresh = m
+        .map(
+            Some(GuestAddr(0x20000)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.protect(fresh, PAGE_SIZE, Prot::READ).unwrap();
+    assert_eq!(flags(&m, fresh.0), base | vm::READ);
+    m.protect(fresh, PAGE_SIZE, Prot::READ_WRITE).unwrap();
+    m.write(fresh, b"x").unwrap();
+    m.protect(fresh, PAGE_SIZE, Prot::READ).unwrap();
+    assert_eq!(flags(&m, fresh.0), base | vm::READ | vm::ACCOUNT);
+    // MAP_NORESERVE takes it out of the charge; MAP_STACK keeps huge pages
+    // away.
+    let new = m
+        .map(
+            Some(GuestAddr(0x30000)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.flag_new(new, new.0 + PAGE_SIZE, true, true);
+    assert_eq!(flags(&m, new.0), base | rw | vm::NORESERVE | vm::NOHUGEPAGE);
+    // Shared memory is not charged, and its file decides what it may do.
+    let pages = SharedPages::new();
+    for (writes, extra) in [
+        (SharedWrites::Allowed, vm::SHARED | vm::MAYWRITE),
+        (SharedWrites::Sealed, vm::SHARED),
+        (SharedWrites::ReadOnly, 0),
+    ] {
+        let at = m
+            .map(None, PAGE_SIZE, Prot::READ, MappingKind::File)
+            .unwrap();
+        m.share_pages(at, PAGE_SIZE, &pages, 0, writes).unwrap();
+        let expected = vm::READ | vm::MAYREAD | vm::MAYEXEC | vm::MAYSHARE | vm::SOFTDIRTY | extra;
+        assert_eq!(flags(&m, at.0), expected, "{writes:?}");
+        // A sealed file still lets remap_file_pages map it again.
+        assert_eq!(
+            m.remap_shared_pages(at, PAGE_SIZE, Ok(0)).is_ok(),
+            writes != SharedWrites::ReadOnly,
+            "{writes:?}"
+        );
+    }
+    // The initial stack is not soft-dirty.
+    let stack = m
+        .map(
+            Some(GuestAddr(0x7000_0000)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Stack,
+        )
+        .unwrap();
+    assert_eq!(
+        flags(&m, stack.0),
+        base & !vm::SOFTDIRTY | rw | vm::GROWSDOWN | vm::ACCOUNT
+    );
+}
+
+#[test]
+fn usage_counts_pages_as_linux_smaps_does() {
+    let mut m = AddressSpace::new();
+    let at = m
+        .map(
+            Some(GuestAddr(0x10000)),
+            4 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    let mut byte = [0];
+    m.read(at, &mut byte).unwrap();
+    m.write(GuestAddr(at.0 + PAGE_SIZE), b"x").unwrap();
+    m.write(GuestAddr(at.0 + 2 * PAGE_SIZE), b"x").unwrap();
+    let usage = |m: &AddressSpace| m.view().usage(at.0, at.0 + 4 * PAGE_SIZE).unwrap();
+    // The page only read shows the zero page, which is not counted.
+    let written = usage(&m);
+    assert_eq!(
+        (written.resident, written.anonymous, written.private_dirty),
+        (2, 2, 2)
+    );
+    // After a fork the pages are shared until either writes them.
+    let child = m.fork();
+    let shared = usage(&child);
+    assert_eq!(
+        (shared.resident, shared.shared_dirty, shared.private_dirty),
+        (2, 2, 0)
+    );
+    // Shared memory's pages are not anonymous, and dirty once written.
+    let s = m
+        .map(
+            Some(GuestAddr(0x40000)),
+            2 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.mark_shared(s, 2 * PAGE_SIZE).unwrap();
+    m.write(s, b"x").unwrap();
+    let pages = m.view().usage(s.0, s.0 + 2 * PAGE_SIZE).unwrap();
+    assert_eq!(
+        (pages.resident, pages.anonymous, pages.private_dirty),
+        (1, 0, 1)
+    );
 }

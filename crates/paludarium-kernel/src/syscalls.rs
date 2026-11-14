@@ -1945,6 +1945,8 @@ const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 const MAP_LOCKED: u64 = 0x2000;
 const MAP_POPULATE: u64 = 0x8000;
+const MAP_NORESERVE: u64 = 0x4000;
+const MAP_STACK: u64 = 0x2_0000;
 
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
@@ -2041,7 +2043,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = match (&file, &descriptor) {
         (Some(file), Some(d)) if flags & MAP_SHARED != 0 => {
             // The mapping shows the file's page cache.
-            shared_file(c, d, file, len, offset, prot, |pages, may_write| {
+            shared_file(c, d, file, len, offset, prot, |pages, writes| {
                 c.mem.map_backed(
                     placement,
                     len,
@@ -2050,7 +2052,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                     Backing::Shared {
                         pages,
                         offset,
-                        may_write,
+                        writes,
                     },
                 )
             })
@@ -2077,11 +2079,17 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     };
     match result {
         Ok(a) => {
+            let end = a.0.saturating_add(len.next_multiple_of(4096));
             if flags & MAP_LOCKED != 0
                 && let Some(lock) = lock
             {
-                let end = a.0.saturating_add(len.next_multiple_of(4096));
                 c.mem.lock_new(a, end, lock);
+            }
+            // Overcommit is never strict here, so MAP_NORESERVE always
+            // counts (`do_mmap`).
+            if flags & (MAP_NORESERVE | MAP_STACK) != 0 {
+                c.mem
+                    .flag_new(a, end, flags & MAP_NORESERVE != 0, flags & MAP_STACK != 0);
             }
             // Linux populates a writable private mapping by writing it, which
             // gives it an anon_vma (a core then writes it whole), with
@@ -2207,7 +2215,10 @@ fn shared_file(
     len: u64,
     offset: u64,
     prot: Prot,
-    map: impl FnOnce(&paludarium_mmu::SharedPages, bool) -> Result<GuestAddr, Errno>,
+    map: impl FnOnce(
+        &paludarium_mmu::SharedPages,
+        paludarium_mmu::SharedWrites,
+    ) -> Result<GuestAddr, Errno>,
 ) -> Result<GuestAddr, Errno> {
     let len = GuestAddr(len).page_align_up().ok_or(Errno::ENOMEM)?.0;
     // A memfd's seals stay as they are until the mapping counts among the
@@ -2219,7 +2230,12 @@ fn shared_file(
     if prot.contains(Prot::WRITE) && write_sealed(file.as_ref()) {
         return Err(Errno::EPERM);
     }
-    let may_write = file.flags() & 3 == 2 && !write_sealed(file.as_ref());
+    let writes = match (file.flags() & 3 == 2, write_sealed(file.as_ref())) {
+        (false, _) => paludarium_mmu::SharedWrites::ReadOnly,
+        (true, true) => paludarium_mmu::SharedWrites::Sealed,
+        (true, false) => paludarium_mmu::SharedWrites::Allowed,
+    };
+    let may_write = writes == paludarium_mmu::SharedWrites::Allowed;
     let pages = file_cache(c, d, file)?.map(
         &crate::memfd::pages_source(file),
         crate::files::mapped_path(c, d),
@@ -2228,7 +2244,7 @@ fn shared_file(
         may_write,
         crate::memfd::secret_charge(file),
     )?;
-    map(&pages, may_write)
+    map(&pages, writes)
 }
 /// The page cache of the file `d` holds, which keeps its size.
 fn file_cache(
@@ -2492,13 +2508,13 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// `madvise(addr, len, advice)` on `mem`, which `process_madvise` gives
-/// each of its ranges of the caller's own memory too. Implemented are the
-/// access-pattern hints and `MADV_WILLNEED`; `MADV_COLD` and
-/// `MADV_PAGEOUT`, which nothing to reclaim makes hints too; KSM's
-/// `MADV_MERGEABLE` and `MADV_UNMERGEABLE` and THP's `MADV_HUGEPAGE` and
-/// `MADV_NOHUGEPAGE`, which change only flags no page here depends on; the
-/// discards `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` (no VMA is locked
-/// apart) and `MADV_FREE`; and `MADV_POPULATE_READ` and
+/// each of its ranges of the caller's own memory too. Implemented are
+/// `MADV_WILLNEED`; `MADV_COLD` and `MADV_PAGEOUT`, which nothing to
+/// reclaim makes hints; the access-pattern hints, KSM's `MADV_MERGEABLE`
+/// and `MADV_UNMERGEABLE` and THP's `MADV_HUGEPAGE` and `MADV_NOHUGEPAGE`,
+/// which change only the flags of the VMAs (`/proc/<pid>/smaps` shows
+/// them), as no page here depends on them; the discards `MADV_DONTNEED`,
+/// `MADV_DONTNEED_LOCKED` (which takes locked VMAs too) and `MADV_FREE`; and `MADV_POPULATE_READ` and
 /// `MADV_POPULATE_WRITE` ([`populate`]); and the flags `fork` and core
 /// dumps look at, `MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK`,
 /// `MADV_KEEPONFORK`, `MADV_DONTDUMP` and `MADV_DODUMP`
@@ -2557,6 +2573,17 @@ pub(crate) fn advise(
         return mem.guard(GuestAddr(addr), end, false);
     }
     let flag = match advice {
+        0 => Some(paludarium_mmu::FlagAdvice::Read(None)),
+        1 => Some(paludarium_mmu::FlagAdvice::Read(Some(
+            paludarium_mmu::ReadHint::Random,
+        ))),
+        2 => Some(paludarium_mmu::FlagAdvice::Read(Some(
+            paludarium_mmu::ReadHint::Sequential,
+        ))),
+        12 => Some(paludarium_mmu::FlagAdvice::Mergeable(true)),
+        13 => Some(paludarium_mmu::FlagAdvice::Mergeable(false)),
+        14 => Some(paludarium_mmu::FlagAdvice::HugePages(true)),
+        15 => Some(paludarium_mmu::FlagAdvice::HugePages(false)),
         10 => Some(paludarium_mmu::FlagAdvice::DontFork),
         11 => Some(paludarium_mmu::FlagAdvice::DoFork),
         16 => Some(paludarium_mmu::FlagAdvice::DontDump),

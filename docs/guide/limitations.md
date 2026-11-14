@@ -35,8 +35,21 @@ verified.
   VMA has its full size from the start, where Linux's grows as it is used. A
   program's own segments and its interpreter's are named by the path it was
   started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `/proc/<pid>/maps` of another process, `smaps` and
-  `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+  symbolic links. `/proc/<pid>/maps` and `smaps` of another process,
+  `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+- **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
+  page entries. `Referenced` is every page counted, a page that `fork`
+  shares counts as shared (and half of it in `Pss`) even after the other
+  process has let it go, while one of shared memory counts as private
+  whoever else maps it. A page of a loaded program's segment counts as
+  anonymous once the segment was written, not once the page was. A
+  file's pages are counted as they are touched, where Linux's fault
+  brings in up to 16 pages around one (`fault_around_bytes`), and so are
+  those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
+  `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
+  no huge pages and the CPU has no protection keys. `VmFlags` shows no
+  `um`, `uw` or `ui` (`userfaultfd`), `ht` or `dp` (`MAP_HUGETLB`,
+  `MAP_DROPPABLE`), and no `gd` for a `MAP_GROWSDOWN` mapping.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, `/proc/sys` but for `fs/mqueue`, ...) and the other names in
@@ -206,10 +219,8 @@ verified.
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
   - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, `MADV_HWPOISON` and
-    `MADV_SOFT_OFFLINE`, which Linux takes. Neither `/proc/<pid>/smaps`,
-    whose `VmFlags` would show the `gu` of a VMA that had guards and the
-    `lo` of a locked one, nor `/proc/<pid>/pagemap`, which would show a
-    guard page, is there.
+    `MADV_SOFT_OFFLINE`, which Linux takes. `/proc/<pid>/pagemap`, which
+    would show a guard page, is not there.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
     mapped. It refuses advice Linux does not know before any range
@@ -316,7 +327,7 @@ verified.
     takes a neighbour's only if their flags agreed then
     (`anon_vma_compatible`), so pieces written while apart may stay
     separate VMAs in `/proc/<pid>/maps`.
-  - `/proc/<pid>/status` shows no locked memory (`VmLck`). `mmap` with
+  - `mmap` with
     `MAP_LOCKED` checks `can_do_mlock` (`EPERM`) and room under
     `RLIMIT_MEMLOCK` (`EAGAIN`) before it finds room for the mapping
     (`ENOMEM`) and looks at the file, where Linux does those first, and `mremap` checks the room for a locked VMA

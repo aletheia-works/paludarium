@@ -6445,6 +6445,221 @@ static int lock_state_case(void) {
     munlock(file, 2 * page);
     return 0;
 }
+/* /proc/self/smaps: the block of the VMA holding an address, by the fields
+ * that do not depend on the CPU or the kernel's configuration (no
+ * THPeligible or ProtectionKey) or on how many pages a fault brings in
+ * around the one it is for (no counts for a file's pages). */
+static char smaps_buffer[1 << 20];
+static const char *smaps_field(const char *block, const char *end, const char *name) {
+    size_t length = strlen(name);
+    for (const char *line = block; line < end;) {
+        const char *next = memchr(line, '\n', (size_t)(end - line));
+        next = next ? next + 1 : end;
+        if ((size_t)(next - line) > length && !strncmp(line, name, length) && line[length] == ':')
+            return line + length + 1;
+        line = next;
+    }
+    return NULL;
+}
+static long smaps_kb(const char *block, const char *end, const char *name) {
+    const char *value = smaps_field(block, end, name);
+    return value ? strtol(value, NULL, 10) : -1;
+}
+/* What smaps_show prints of a VMA: its flags; its size too; and what its
+ * pages hold as well. */
+enum { SMAPS_FLAGS, SMAPS_SIZE, SMAPS_COUNTS };
+static void smaps_show(const char *label, const void *at, int what) {
+    int fd = open("/proc/self/smaps", O_RDONLY);
+    if (fd < 0) {
+        printf("%s: open=%d\n", label, errno);
+        return;
+    }
+    size_t length = 0;
+    for (;;) {
+        ssize_t got = read(fd, smaps_buffer + length, sizeof smaps_buffer - 1 - length);
+        if (got <= 0) break;
+        length += (size_t)got;
+    }
+    close(fd);
+    smaps_buffer[length] = 0;
+    uintptr_t address = (uintptr_t)at;
+    /* A block starts at a line whose first field is a range. */
+    for (char *line = smaps_buffer; line && *line;) {
+        unsigned long start, stop;
+        char perms[5];
+        if (sscanf(line, "%lx-%lx %4s", &start, &stop, perms) == 3 && address >= start &&
+            address < stop) {
+            char *end = line + 1;
+            for (;;) {
+                end = strchr(end, '\n');
+                if (!end || !end[1]) {
+                    end = smaps_buffer + length;
+                    break;
+                }
+                end++;
+                unsigned long a, b;
+                if (sscanf(end, "%lx-%lx ", &a, &b) == 2) break;
+            }
+            const char *flags = smaps_field(line, end, "VmFlags");
+            const char *flags_end = flags ? strchr(flags, '\n') : NULL;
+            printf("%s: %s", label, perms);
+            if (what >= SMAPS_SIZE)
+                printf(" pages=%lu size=%ld", (stop - start) / 4096, smaps_kb(line, end, "Size"));
+            if (what == SMAPS_COUNTS)
+                printf(" rss=%ld pss=%ld pss-dirty=%ld shared=%ld/%ld private=%ld/%ld anon=%ld locked=%ld",
+                       smaps_kb(line, end, "Rss"), smaps_kb(line, end, "Pss"),
+                       smaps_kb(line, end, "Pss_Dirty"), smaps_kb(line, end, "Shared_Clean"),
+                       smaps_kb(line, end, "Shared_Dirty"), smaps_kb(line, end, "Private_Clean"),
+                       smaps_kb(line, end, "Private_Dirty"), smaps_kb(line, end, "Anonymous"),
+                       smaps_kb(line, end, "Locked"));
+            printf(" flags=%.*s\n", flags ? (int)(flags_end - flags) : 0, flags ? flags : "");
+            return;
+        }
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    printf("%s: none\n", label);
+}
+static void smaps_locked(void) {
+    char status[8192];
+    int fd = open("/proc/self/status", O_RDONLY);
+    ssize_t got = fd < 0 ? -1 : read(fd, status, sizeof status - 1);
+    if (fd >= 0) close(fd);
+    status[got > 0 ? got : 0] = 0;
+    const char *line = strstr(status, "\nVmLck:");
+    printf("status VmLck=%ld\n", line ? strtol(line + 7, NULL, 10) : -1);
+}
+/* Memory with a hole on each side, which no other VMA merges with: the
+ * emulator merges private VMAs whatever their anon_vma. */
+static char *smaps_area(long pages, int prot, int flags) {
+    long page = 4096;
+    char *area = mmap(NULL, (pages + 2) * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return MAP_FAILED;
+    munmap(area, page);
+    munmap(area + (pages + 1) * page, page);
+    char *at = mmap(area + page, pages * page, prot, flags | MAP_FIXED, -1, 0);
+    return at;
+}
+static int smaps_flags_case(void) {
+    long page = 4096;
+    /* Private anonymous memory: charged, soft-dirty; its pages count as
+     * they are written, and the zero page that a read shows does not. */
+    char *p = smaps_area(4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (p == MAP_FAILED) return 80;
+    volatile char seen = p[0];
+    (void)seen;
+    smaps_show("read", p, SMAPS_COUNTS);
+    for (int i = 1; i < 4; i++) p[i * page] = 1;
+    smaps_show("written", p, SMAPS_COUNTS);
+    /* What mprotect splits off keeps VM_ACCOUNT once the VMA was written. */
+    mprotect(p + page, page, PROT_READ);
+    smaps_show("protected", p + page, SMAPS_COUNTS);
+    /* Memory never written gives the charge back as it stops being
+     * writable, and takes it again as it becomes writable. */
+    char *q = smaps_area(1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (q == MAP_FAILED) return 81;
+    smaps_show("none", q, SMAPS_SIZE);
+    mprotect(q, page, PROT_READ | PROT_WRITE);
+    smaps_show("made-writable", q, SMAPS_SIZE);
+    mprotect(q, page, PROT_READ);
+    smaps_show("made-read-only", q, SMAPS_SIZE);
+    char *r = smaps_area(1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+    char *s = smaps_area(1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK);
+    char *t = smaps_area(2, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS);
+    if (r == MAP_FAILED || s == MAP_FAILED || t == MAP_FAILED) return 82;
+    smaps_show("noreserve", r, SMAPS_SIZE);
+    smaps_show("stack-flag", s, SMAPS_SIZE);
+    t[0] = 1;
+    smaps_show("shared", t, SMAPS_COUNTS);
+    /* Advice that sets a flag splits the VMA, and merges it again once the
+     * flags agree. */
+    char *a = smaps_area(3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (a == MAP_FAILED) return 83;
+    const struct {
+        const char *name;
+        int advice;
+    } advices[] = {
+        {"random", MADV_RANDOM},       {"sequential", MADV_SEQUENTIAL}, {"normal", MADV_NORMAL},
+        {"hugepage", MADV_HUGEPAGE},   {"nohugepage", MADV_NOHUGEPAGE}, {"mergeable", MADV_MERGEABLE},
+        {"unmergeable", MADV_UNMERGEABLE}, {"dontfork", MADV_DONTFORK}, {"dofork", MADV_DOFORK},
+        {"dontdump", MADV_DONTDUMP},   {"dodump", MADV_DODUMP},         {"wipeonfork", MADV_WIPEONFORK},
+        {"keeponfork", MADV_KEEPONFORK},
+    };
+    for (size_t i = 0; i < sizeof advices / sizeof advices[0]; i++) {
+        long e = advice_errno(madvise(a + page, page, advices[i].advice));
+        char label[64];
+        snprintf(label, sizeof label, "%s=%ld vmas=%d", advices[i].name, e,
+                 advice_vmas(a, a + 3 * page));
+        smaps_show(label, a + page, SMAPS_SIZE);
+    }
+    /* Advice for shared memory that KSM leaves alone. */
+    printf("shared mergeable=%ld\n", advice_errno(madvise(t, page, MADV_MERGEABLE)));
+    smaps_show("shared-mergeable", t, SMAPS_SIZE);
+    /* Locked memory, and what status counts. */
+    char *l = smaps_area(3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (l == MAP_FAILED) return 84;
+    for (int i = 0; i < 3; i++) l[i * page] = 1;
+    smaps_locked();
+    printf("mlock=%ld onfault=%ld\n", advice_errno(mlock(l, page)),
+           advice_errno(syscall(SYS_mlock2, l + page, page, 1L)));
+    smaps_show("locked", l, SMAPS_COUNTS);
+    smaps_show("locked-onfault", l + page, SMAPS_COUNTS);
+    smaps_locked();
+    munlock(l, 2 * page);
+    smaps_show("unlocked", l, SMAPS_SIZE);
+    smaps_locked();
+    /* A guard leaves its flag when it goes; a seal stays. */
+    char *g = smaps_area(2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (g == MAP_FAILED) return 85;
+    long install = advice_errno(madvise(g, page, 102));
+    long removed = advice_errno(madvise(g, page, 103));
+    printf("guard=%ld removed=%ld\n", install, removed);
+    smaps_show("guarded", g, SMAPS_SIZE);
+    printf("mseal=%ld\n", advice_errno(syscall(462, g, 2 * page, 0UL)));
+    smaps_show("sealed", g, SMAPS_SIZE);
+    /* A file's mappings: shared only when it is open for writing, and may
+     * become writable only when no seal keeps it from being written. */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-smaps-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    int read_only = open(path, O_RDONLY);
+    unlink(path);
+    if (fd < 0 || read_only < 0 || ftruncate(fd, page)) return 86;
+    char *f_private = mmap(NULL, page, PROT_READ, MAP_PRIVATE, fd, 0);
+    char *f_shared = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *f_read = mmap(NULL, page, PROT_READ, MAP_SHARED, read_only, 0);
+    if (f_private == MAP_FAILED || f_shared == MAP_FAILED || f_read == MAP_FAILED) return 87;
+    smaps_show("file-private", f_private, SMAPS_SIZE);
+    smaps_show("file-shared", f_shared, SMAPS_SIZE);
+    smaps_show("file-read-only", f_read, SMAPS_SIZE);
+    int sealed = memfd_create("smaps", MFD_ALLOW_SEALING);
+    if (sealed < 0 || ftruncate(sealed, page)) return 88;
+    printf("seal=%ld\n", advice_errno(fcntl(sealed, F_ADD_SEALS, F_SEAL_FUTURE_WRITE)));
+    char *m = mmap(NULL, page, PROT_READ, MAP_SHARED, sealed, 0);
+    if (m == MAP_FAILED) return 89;
+    smaps_show("memfd-sealed", m, SMAPS_SIZE);
+    printf("remap=%ld\n", advice_errno(syscall(SYS_remap_file_pages, m, page, 0L, 0L, 0L)));
+    printf("mprotect-write=%ld\n", advice_errno(mprotect(m, page, PROT_READ | PROT_WRITE)));
+    /* The initial stack and the break's heap. */
+    char local = 0;
+    smaps_show("stack", &local, SMAPS_FLAGS);
+    char *heap = (char *)syscall(SYS_brk, 0L);
+    if ((char *)syscall(SYS_brk, heap + page) != heap + page) return 90;
+    heap[0] = 1;
+    smaps_show("heap", heap, SMAPS_FLAGS);
+    /* A child shares the written pages with its parent until either writes
+     * them: half of each is its. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 91;
+    if (child == 0) {
+        smaps_show("child", p + 2 * page, SMAPS_COUNTS);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 92;
+    return 0;
+}
 /* MADV_REMOVE frees shared memory, as a hole punched in its file: shared
  * anonymous memory, a System V segment and a shared file mapping read as
  * zeros there again; private memory and read-only sharing are refused. */
@@ -22079,6 +22294,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
+    if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
     if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();

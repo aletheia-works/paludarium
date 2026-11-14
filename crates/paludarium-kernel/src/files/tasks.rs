@@ -238,6 +238,7 @@ pub(super) fn content(
             session: task.view.session,
             space: &task.view.space,
             descriptors: task.live().then(|| public.files.descriptors()),
+            locked: task.memory().and_then(|memory| memory.locked_pages()),
             threads: task.threads(),
             queued: public.queued,
             queue_limit: task.view.queue_limit,

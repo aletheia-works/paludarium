@@ -333,6 +333,7 @@ mod linux {
         processes_madvise_fork => ("madvise-fork","process"),
         processes_madvise_remove => ("madvise-remove","process"),
         processes_lock_state => ("lock-state","process"),
+        processes_smaps_flags => ("smaps-flags","process"),
         processes_mrelease_fatal => ("mrelease-fatal","process"),
         processes_madvise_guard => ("madvise-guard","process"),
         processes_fork_page_tables => ("fork-page-tables","process"),

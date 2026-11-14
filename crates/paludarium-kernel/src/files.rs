@@ -1484,7 +1484,8 @@ fn positioned(
     Ok(file)
 }
 /// Where reads of a regular file stop: at its size, but for `maps`, which
-/// says 0 as Linux's /proc does and ends where its `read` does.
+/// and `smaps`, which say 0 as Linux's /proc does and end where their
+/// `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file
         .as_any()
@@ -5620,6 +5621,12 @@ fn open_path(
                 c.group.start_stack(),
                 flags,
             )),
+            crate::proc::OwnEntry::Smaps => Arc::new(crate::proc::MapsFile::open_as(
+                c.mem.view(),
+                c.group.start_stack(),
+                flags,
+                true,
+            )),
             crate::proc::OwnEntry::Descriptor(n) => {
                 // A link for a descriptor that is not open is not there
                 // (ENOENT), whatever the flags. One that is, is a symbolic
@@ -6488,7 +6495,7 @@ fn other_generated_stat(
             crate::proc::private_stat(own_file(c, entry).map_or(0, |content| content.len()))
         }
         crate::proc::OwnEntry::Exe | crate::proc::OwnEntry::Cwd => return None,
-        crate::proc::OwnEntry::Maps => crate::proc::stat(0),
+        crate::proc::OwnEntry::Maps | crate::proc::OwnEntry::Smaps => crate::proc::stat(0),
         crate::proc::OwnEntry::Descriptor(n) => {
             let d = c.files.descriptor(u64::from(n)).ok()?;
             if follow {
@@ -6802,6 +6809,7 @@ fn status(c: &Context<'_>) -> Vec<u8> {
         session,
         space: &space,
         descriptors: Some(descriptors),
+        locked: Some(c.mem.locked_pages()),
         threads: c.group.active_threads(),
         queued: c.process.pending.len(),
         queue_limit,

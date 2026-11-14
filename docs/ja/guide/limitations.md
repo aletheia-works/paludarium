@@ -32,7 +32,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   初めから全体の大きさで、Linux のように使うにつれて伸びません。プログラムと
   インタープリターのセグメントの名前は起動時のパスで、`(deleted)` も付きません。
   Linux は名前の変更を追い、シンボリックリンクを解決します。ほかのプロセスの
-  `/proc/<pid>/maps`、`smaps`、`[anon:<名前>]` の名前（`PR_SET_VMA`）はありません。
+  `/proc/<pid>/maps` と `smaps`、`smaps_rollup`、`[anon:<名前>]` の名前
+  （`PR_SET_VMA`）はありません。
+- **`/proc/self/smaps` の一部**：数える値は、エミュレーターのページのエントリーから
+  出します。`Referenced` は数えたページすべてです。`fork` が共有するページは、相手の
+  プロセスが手放したあとも共有として数え（`Pss` にはその半分）、共有メモリのページは
+  ほかに誰がマップしていてもプライベートとして数えます。読み込んだプログラムの
+  セグメントのページは、ページではなくセグメントに書き込んだ時点で匿名として数えます。
+  ファイルのページは触れたときに数えます。Linux のフォールトは周りの 16 ページまで
+  取り込みます（`fault_around_bytes`）。`MAP_POPULATE`、`MAP_LOCKED`、ロックが
+  取り込むはずのページも、触れたときに数えます。ヒュージページもプロテクションキーも
+  ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
+  `um`、`uw`、`ui`（`userfaultfd`）、`ht`、`dp`（`MAP_HUGETLB`、`MAP_DROPPABLE`）が
+  なく、`MAP_GROWSDOWN` のマッピングにも `gd` がありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
   `fs/mqueue` 以外の `/proc/sys` など）と、読むプロセス自身のディレクトリのほかの名前
@@ -179,9 +191,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux のホストで見分けるのは ext4、xfs、btrfs、f2fs だけです（ほかのファイルシステムは
     どちらも断ります）。
   - `madvise` は、Linux が受け付ける次の指定を断ります（`EINVAL`）。`MADV_COLLAPSE`、
-    `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。`/proc/<pid>/smaps` はありません。Linux では
-    その `VmFlags` が、ガードを置いた VMA の `gu` とロックした VMA の `lo` を示します。
-    ガードページを示す `/proc/<pid>/pagemap` もありません。
+    `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。ガードページを示す
+    `/proc/<pid>/pagemap` はありません。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか
     受け付けず、ほかのプロセスの範囲はマップされているかを確かめるだけです。Linux が知らない
     指定は、Linux master と同じく範囲を見る前に断ります（`EINVAL`）。CI のカーネルは範囲ごとに
@@ -272,7 +283,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     VMA は最初の書き込みで `anon_vma` を得て、そのとき隣とフラグがそろっていたときだけ
     隣のものを使う（`anon_vma_compatible`）ので、離れている間に書き込んだかけらは、
     `/proc/<pid>/maps` で別の VMA のまま残ることがあります。
-  - `/proc/<pid>/status` にロックしたメモリ（`VmLck`）は出ません。`MAP_LOCKED` の
+  - `MAP_LOCKED` の
     `mmap` は、マッピングの場所を探し（`ENOMEM`）ファイルを確かめる前に、`can_do_mlock`
     （`EPERM`）と `RLIMIT_MEMLOCK` の空き（`EAGAIN`）を確かめます。Linux はそれらを先にします。`mremap` は、
     ロックした VMA が広がるときの空きを、新しい範囲のほかの確認より前に確かめます。

@@ -38,6 +38,7 @@
     {"name":"madvise-fork","binary":"process"},
     {"name":"madvise-remove","binary":"process"},
     {"name":"lock-state","binary":"process"},
+    {"name":"smaps-flags","binary":"process"},
     {"name":"madvise-guard","binary":"process"},
     {"name":"fork-page-tables","binary":"process"},
     {"name":"mrelease","binary":"process"},

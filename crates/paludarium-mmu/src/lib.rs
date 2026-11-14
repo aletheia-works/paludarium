@@ -120,6 +120,56 @@ pub struct Mapping {
     /// `mlock` locked it (Linux's `VM_LOCKED`), and with `MLOCK_ONFAULT`
     /// brings in only the pages something touches (`VM_LOCKONFAULT`).
     pub locked: Option<Lock>,
+    /// Its memory is charged against overcommit (Linux's `VM_ACCOUNT`):
+    /// private memory that was writable, unless `MAP_NORESERVE`.
+    pub account: bool,
+    /// `MAP_NORESERVE` made it (Linux's `VM_NORESERVE`).
+    pub no_reserve: bool,
+    /// `MADV_SEQUENTIAL` or `MADV_RANDOM` (`VM_SEQ_READ`, `VM_RAND_READ`).
+    pub read_hint: Option<ReadHint>,
+    /// `MADV_HUGEPAGE` or `MADV_NOHUGEPAGE`, which `MAP_STACK` gives too
+    /// (`VM_HUGEPAGE`, `VM_NOHUGEPAGE`).
+    pub huge_pages: Option<bool>,
+    /// `MADV_MERGEABLE` (KSM's `VM_MERGEABLE`).
+    pub mergeable: bool,
+}
+
+/// How a mapping is read ([`Mapping::read_hint`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadHint {
+    Sequential,
+    Random,
+}
+
+/// The bits of Linux's `vm_flags` that `/proc/<pid>/smaps` shows
+/// ([`Vma::flags`]), as `include/linux/mm.h` numbers them.
+pub mod vm {
+    pub const READ: u64 = 1 << 0;
+    pub const WRITE: u64 = 1 << 1;
+    pub const EXEC: u64 = 1 << 2;
+    pub const SHARED: u64 = 1 << 3;
+    pub const MAYREAD: u64 = 1 << 4;
+    pub const MAYWRITE: u64 = 1 << 5;
+    pub const MAYEXEC: u64 = 1 << 6;
+    pub const MAYSHARE: u64 = 1 << 7;
+    pub const GROWSDOWN: u64 = 1 << 8;
+    pub const MAYBE_GUARD: u64 = 1 << 11;
+    pub const LOCKED: u64 = 1 << 13;
+    pub const SEQ_READ: u64 = 1 << 15;
+    pub const RAND_READ: u64 = 1 << 16;
+    pub const DONTCOPY: u64 = 1 << 17;
+    pub const DONTEXPAND: u64 = 1 << 18;
+    pub const LOCKONFAULT: u64 = 1 << 19;
+    pub const ACCOUNT: u64 = 1 << 20;
+    pub const NORESERVE: u64 = 1 << 21;
+    pub const WIPEONFORK: u64 = 1 << 25;
+    pub const DONTDUMP: u64 = 1 << 26;
+    pub const SOFTDIRTY: u64 = 1 << 27;
+    pub const MIXEDMAP: u64 = 1 << 28;
+    pub const HUGEPAGE: u64 = 1 << 29;
+    pub const NOHUGEPAGE: u64 = 1 << 30;
+    pub const MERGEABLE: u64 = 1 << 31;
+    pub const SEALED: u64 = 1 << 42;
 }
 
 /// How a mapping is locked ([`Mapping::locked`]).
@@ -141,6 +191,26 @@ pub enum FlagAdvice {
     KeepOnFork,
     DontDump,
     DoDump,
+    /// `MADV_NORMAL`, `MADV_SEQUENTIAL` and `MADV_RANDOM`.
+    Read(Option<ReadHint>),
+    /// `MADV_HUGEPAGE` (`true`) and `MADV_NOHUGEPAGE`.
+    HugePages(bool),
+    /// `MADV_MERGEABLE` (`true`) and `MADV_UNMERGEABLE`.
+    Mergeable(bool),
+}
+
+/// What the file of a shared mapping lets it do (Linux's `VM_SHARED` and
+/// `VM_MAYWRITE`, which `do_mmap` and a memfd's seals clear).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedWrites {
+    /// The file is open for writing: `mprotect` may make the mapping
+    /// writable.
+    Allowed,
+    /// The file is open for writing but sealed against it: the mapping
+    /// is `VM_SHARED` but may not become writable.
+    Sealed,
+    /// The file is open only for reading: neither.
+    ReadOnly,
 }
 
 /// What a page table holds for a mapped page, as Linux's `folio_walk`
@@ -213,6 +283,26 @@ pub struct Vma {
     pub identity: (u64, u64),
     /// It lies across the break's range (Linux's `vma_is_initial_heap`).
     pub heap: bool,
+    /// Linux's `vm_flags` of it ([`vm`]).
+    pub flags: u64,
+}
+
+/// What a VMA's pages hold, as Linux's `smaps_account` counts them, in
+/// pages ([`MemoryView::usage`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Pages with an entry of their own (`Rss`); a page of private memory
+    /// only read shows Linux's zero page, which is not counted.
+    pub resident: u64,
+    /// Those that a `fork` shares with another process until either
+    /// writes them (`Shared_*`), and of them the ones written.
+    pub shared_clean: u64,
+    pub shared_dirty: u64,
+    /// The rest (`Private_*`).
+    pub private_clean: u64,
+    pub private_dirty: u64,
+    /// The pages of private memory, not a file's (`Anonymous`).
+    pub anonymous: u64,
 }
 
 impl Mapping {
@@ -753,7 +843,7 @@ pub enum Backing<'a> {
     Shared {
         pages: &'a SharedPages,
         offset: u64,
-        may_write: bool,
+        writes: SharedWrites,
     },
     /// The page cache `pages` from `offset`, until a page is written
     /// ([`AddressSpace::back_with_cache`]).
@@ -1004,6 +1094,9 @@ struct SharedMapping {
     pages: SharedPages,
     /// `mprotect` may make the mapping writable (Linux's `VM_MAYWRITE`).
     may_write: bool,
+    /// Its file is open for writing (Linux's `VM_SHARED`, which shared
+    /// anonymous memory has too).
+    vm_shared: bool,
 }
 
 /// A file's size and how many times it has shrunk, which a [`PageSource`]
@@ -1130,6 +1223,13 @@ pub trait PageSource: Send + Sync {
     /// refuses them.
     fn secret(&self) -> bool {
         false
+    }
+    /// The `vm_flags` ([`vm`]) of a VMA of this memory, from those of a
+    /// mapping of an ordinary file: a file's `mmap` may add its own, and one
+    /// on a file system that runs nothing (`SB_I_NOEXEC`, as Linux's pseudo
+    /// file systems are) has no `VM_MAYEXEC`.
+    fn vma_flags(&self, flags: u64) -> u64 {
+        flags
     }
     /// The source itself, for the kernel to tell its kinds apart.
     fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
@@ -1767,6 +1867,13 @@ impl AddressSpaceData {
     ) -> Result<(), Errno> {
         self.back(addr, len, source, None, offset)
     }
+    /// Shared memory is not charged as a private mapping is
+    /// (`accountable_mapping`).
+    fn unaccount(&mut self, start: u64, end: u64) {
+        for (_, mapping) in self.mappings.range_mut(start..end) {
+            mapping.account = false;
+        }
+    }
     /// Marks a newly created mapping as Linux MAP_SHARED, independently of VM sharing.
     fn mark_shared(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
@@ -1804,13 +1911,15 @@ impl AddressSpaceData {
                 shift: 0u64.wrapping_sub(addr.0),
                 pages: SharedPages::with_frames(frames),
                 may_write: true,
+                vm_shared: true,
             },
         );
+        self.unaccount(addr.0, end);
         Ok(())
     }
     /// Makes the newly created mapping `[addr, addr+len)` show `pages` from
     /// key `offset` on, a file's page cache from that file offset, as a
-    /// Linux `MAP_SHARED` mapping of the file; `may_write` says whether
+    /// Linux `MAP_SHARED` mapping of the file; `writes` says whether
     /// `mprotect` may make it writable.
     fn share_pages(
         &mut self,
@@ -1818,7 +1927,7 @@ impl AddressSpaceData {
         len: u64,
         pages: &SharedPages,
         offset: u64,
-        may_write: bool,
+        writes: SharedWrites,
     ) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
         if !self
@@ -1843,16 +1952,18 @@ impl AddressSpaceData {
                 end,
                 shift: offset.wrapping_sub(addr.0),
                 pages: pages.clone(),
-                may_write,
+                may_write: writes == SharedWrites::Allowed,
+                vm_shared: writes != SharedWrites::ReadOnly,
             },
         );
+        self.unaccount(addr.0, end);
         Ok(())
     }
     /// Maps `[start, start+len)` again to show the shared memory it shows
     /// from key `offset` on, as Linux's `remap_file_pages` does with a
     /// `MAP_SHARED | MAP_FIXED` `mmap` of the VMA's file: the mapping at
-    /// `start` must be shared and may write (`VM_SHARED`, which a file open
-    /// only for reading does not give), and the range must lie in it and in
+    /// `start` must be shared and its file open for writing (`VM_SHARED`,
+    /// which a file open only for reading does not give), and the range must lie in it and in
     /// mappings after it with no hole, of the same memory and protection
     /// (`EINVAL`). Only then is `offset` taken, which is `mmap`'s error when
     /// the file cannot reach it. The new mapping keeps that protection.
@@ -1866,14 +1977,19 @@ impl AddressSpaceData {
         let first = *self.mapping_at(start).ok_or(Errno::EINVAL)?;
         let shared = self
             .shared_at(start)
-            .filter(|shared| shared.may_write)
+            .filter(|shared| shared.vm_shared)
             .ok_or(Errno::EINVAL)?;
         let pages = shared.pages.clone();
+        let writes = if shared.may_write {
+            SharedWrites::Allowed
+        } else {
+            SharedWrites::Sealed
+        };
         let mut last = first;
         while last.end() < end {
             let next = *self.mappings.get(&last.end()).ok_or(Errno::EINVAL)?;
             let same = self.shared_at(next.start.0).is_some_and(|shared| {
-                shared.may_write && Arc::ptr_eq(&shared.pages.frames, &pages.frames)
+                shared.vm_shared && Arc::ptr_eq(&shared.pages.frames, &pages.frames)
             });
             if !same || next.prot != first.prot || next.kind != first.kind {
                 return Err(Errno::EINVAL);
@@ -1883,7 +1999,7 @@ impl AddressSpaceData {
         let offset = offset?;
         self.unmap(GuestAddr(start), len)?;
         self.map(Some(GuestAddr(start)), len, first.prot, first.kind)?;
-        self.share_pages(GuestAddr(start), len, &pages, offset, true)
+        self.share_pages(GuestAddr(start), len, &pages, offset, writes)
     }
     /// Makes the private file mapping `[addr, addr+len)` show the page
     /// cache `pages` of the file from `offset`, which must have its file
@@ -2107,6 +2223,53 @@ impl AddressSpaceData {
             self.shared_at(page)
                 .is_some_and(|shared| shared.pages.contains(page.wrapping_add(shared.shift))),
         )
+    }
+    /// What the pages of `[start, end)` hold ([`Usage`]), as Linux's
+    /// `smaps_pte_entry` finds them. A page of private memory that has a
+    /// frame of its own is anonymous, and dirty, as Linux's is once written;
+    /// a loaded program's segment, whose frames hold what was read from its
+    /// file, counts its pages so once the segment was written
+    /// ([`Mapping::written`]). The page cache's pages are dirty when a store
+    /// changed them since they were written back. A page that `fork` shares
+    /// until it is written counts as shared, whether or not the other
+    /// process still has it.
+    fn usage(&self, start: u64, end: u64) -> Usage {
+        let mut usage = Usage::default();
+        if end <= start {
+            return usage;
+        }
+        let directory = self.read_directory();
+        let (first, last) = (
+            start / PAGE_SIZE / ENTRIES_PER_TABLE,
+            (end - 1) / PAGE_SIZE / ENTRIES_PER_TABLE,
+        );
+        for (&dir, table) in directory.range(first..=last) {
+            for (slot, entry) in table.pages.iter().enumerate() {
+                let page = (dir * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
+                let Some(entry) = entry.as_ref().filter(|_| page >= start && page < end) else {
+                    continue;
+                };
+                let shared = self.shared_at(page).is_some();
+                let bytes = entry.frame.get();
+                // Only read, private memory shows the zero page.
+                if bytes.is_none() && !entry.file && !shared {
+                    continue;
+                }
+                let written = self.mapping_at(page).is_some_and(|m| m.written);
+                let anonymous = !shared && !entry.cache && (!entry.file || written);
+                let dirty =
+                    anonymous || bytes.is_some_and(|b| b.dirty.load(Ordering::Acquire)) && shared;
+                usage.resident += 1;
+                usage.anonymous += u64::from(anonymous);
+                match (entry.cow && !entry.cache, dirty) {
+                    (true, false) => usage.shared_clean += 1,
+                    (true, true) => usage.shared_dirty += 1,
+                    (false, false) => usage.private_clean += 1,
+                    (false, true) => usage.private_dirty += 1,
+                }
+            }
+        }
+        usage
     }
     /// What the page table holds for the page at `page` ([`PageState`]):
     /// `None` if it is not mapped. Any access gives a page its entry; a
@@ -2796,8 +2959,49 @@ impl AddressSpaceData {
             }),
             identity: (0, self.shared_at(start).map_or(0, |shared| shared.pages.id)),
             heap: start < self.current_break.0 && end > self.initial_break.0,
+            flags: self.vma_flags(start, end),
         };
         Some((vma, source))
+    }
+
+    /// Linux's `vm_flags` of the VMA `[start, end)` ([`vm`]), but for what
+    /// its file adds ([`PageSource::vma_flags`]). Its mappings agree on all
+    /// but the sticky flags, which any of them gives it (`VMA_STICKY_FLAGS`):
+    /// `VM_MAYBE_GUARD`, and `VM_SOFTDIRTY`, which every new VMA but the
+    /// initial stack has (`setup_arg_pages` gives it flags without it).
+    fn vma_flags(&self, start: u64, end: u64) -> u64 {
+        let pieces: Vec<&Mapping> = self.mappings.range(start..end).map(|(_, m)| m).collect();
+        let Some(&&m) = pieces.first() else {
+            return 0;
+        };
+        let bit = |on: bool, flag: u64| if on { flag } else { 0 };
+        let mut flags = u64::from(m.prot.bits()) | vm::MAYREAD | vm::MAYEXEC;
+        match self.shared_at(start) {
+            Some(shared) => {
+                flags |= vm::MAYSHARE
+                    | bit(shared.vm_shared, vm::SHARED)
+                    | bit(shared.may_write, vm::MAYWRITE);
+            }
+            None => flags |= vm::MAYWRITE | bit(m.account, vm::ACCOUNT),
+        }
+        flags |= bit(m.kind == MappingKind::Stack, vm::GROWSDOWN)
+            | bit(m.locked.is_some(), vm::LOCKED)
+            | bit(m.locked == Some(Lock::OnFault), vm::LOCKONFAULT)
+            | bit(m.read_hint == Some(ReadHint::Sequential), vm::SEQ_READ)
+            | bit(m.read_hint == Some(ReadHint::Random), vm::RAND_READ)
+            | bit(m.dont_fork, vm::DONTCOPY)
+            | bit(m.no_reserve, vm::NORESERVE)
+            | bit(m.wipe_on_fork, vm::WIPEONFORK)
+            | bit(m.dont_dump, vm::DONTDUMP)
+            | bit(m.huge_pages == Some(true), vm::HUGEPAGE)
+            | bit(m.huge_pages == Some(false), vm::NOHUGEPAGE)
+            | bit(m.mergeable, vm::MERGEABLE)
+            | bit(m.sealed, vm::SEALED);
+        for piece in pieces {
+            flags |= bit(piece.maybe_guard, vm::MAYBE_GUARD)
+                | bit(piece.kind != MappingKind::Stack, vm::SOFTDIRTY);
+        }
+        flags
     }
 
     /// Reads guest memory (any mapped page is readable on x86).
@@ -2947,6 +3151,11 @@ impl AddressSpaceData {
                 dont_dump: false,
                 maybe_guard: false,
                 locked: self.future_lock,
+                account: prot.contains(Prot::WRITE),
+                no_reserve: false,
+                read_hint: None,
+                huge_pages: None,
+                mergeable: false,
             },
         );
         Ok(GuestAddr(start))
@@ -3070,6 +3279,11 @@ impl AddressSpaceData {
             && a.wipe_on_fork == b.wipe_on_fork
             && a.dont_dump == b.dont_dump
             && a.locked == b.locked
+            && a.account == b.account
+            && a.no_reserve == b.no_reserve
+            && a.read_hint == b.read_hint
+            && a.huge_pages == b.huge_pages
+            && a.mergeable == b.mergeable
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -3415,6 +3629,7 @@ impl AddressSpaceData {
             {
                 return Err(Errno::EINVAL);
             }
+            let ksm = self.shared_at(start).is_none();
             let (from, to) = (start.max(addr), m.end().min(end));
             self.split_at(from);
             self.split_at(to);
@@ -3426,6 +3641,11 @@ impl AddressSpaceData {
                     FlagAdvice::KeepOnFork => m.wipe_on_fork = false,
                     FlagAdvice::DontDump => m.dont_dump = true,
                     FlagAdvice::DoDump => m.dont_dump = false,
+                    FlagAdvice::Read(hint) => m.read_hint = hint,
+                    FlagAdvice::HugePages(huge) => m.huge_pages = Some(huge),
+                    // KSM leaves shared memory and the rings, which core mm
+                    // does not back, as they are (`ksm_compatible`).
+                    FlagAdvice::Mergeable(on) => m.mergeable = on && (m.mergeable || ksm),
                 }
             }
         }
@@ -3485,6 +3705,20 @@ impl AddressSpaceData {
         }
     }
 
+    /// Gives the new mapping `[addr, end)` the flags of `mmap`'s
+    /// `MAP_NORESERVE` (`VM_NORESERVE`, which takes the mapping out of
+    /// overcommit's charge) and `MAP_STACK` (`VM_NOHUGEPAGE`).
+    pub fn flag_new(&mut self, addr: u64, end: u64, no_reserve: bool, no_huge_pages: bool) {
+        for (_, mapping) in self.mappings.range_mut(addr..end) {
+            if no_reserve {
+                mapping.no_reserve = true;
+                mapping.account = false;
+            }
+            if no_huge_pages {
+                mapping.huge_pages = Some(false);
+            }
+        }
+    }
     /// Whether the mapping at `addr` cannot be locked: the rings of AIO and
     /// `io_uring` (Linux's `vma_supports_mlock`), and secret memory, which
     /// `mlock_fixup` leaves as it is.
@@ -3759,8 +3993,39 @@ impl AddressSpaceData {
         self.split_at(addr.0);
         self.split_at(end);
         self.bump_code_generation();
-        for (_, m) in self.mappings.range_mut(addr.0..end) {
+        let shared: Vec<bool> = self
+            .mappings
+            .range(addr.0..end)
+            .map(|(&start, _)| self.shared_at(start).is_some())
+            .collect();
+        // Anonymous memory of a Linux VMA without an `anon_vma`: no piece of
+        // the VMA it is part of was written.
+        let anonymous: Vec<bool> = self
+            .mappings
+            .range(addr.0..end)
+            .map(|(&start, m)| {
+                matches!(
+                    m.kind,
+                    MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
+                ) && self.backing_at(start).is_none()
+                    && !self.core_state(start).0.written
+            })
+            .collect();
+        for (((_, m), shared), anonymous) in self
+            .mappings
+            .range_mut(addr.0..end)
+            .zip(shared)
+            .zip(anonymous)
+        {
             m.prot = prot;
+            // Linux's `mprotect_fixup` charges private memory that becomes
+            // writable, and gives back the charge of anonymous memory that
+            // stops being writable before any page of it was written.
+            if prot.contains(Prot::WRITE) {
+                m.account |= !shared && !m.no_reserve;
+            } else if anonymous && !shared {
+                m.account = false;
+            }
         }
         self.for_populated(addr.0, end, |entry| {
             if let Some(page) = entry {
@@ -4038,6 +4303,7 @@ impl MemoryView {
         if let (Some(file), Some(source)) = (vma.file.as_mut(), source) {
             file.name = source.name();
             vma.identity = source.identity();
+            vma.flags = source.vma_flags(vma.flags);
         }
         Some(vma)
     }
@@ -4121,6 +4387,18 @@ impl MemoryView {
     pub fn page_state(&self, addr: u64) -> Option<PageState> {
         self.with_data(|data| data.page_state(GuestAddr(addr).page_align_down().0))
             .flatten()
+    }
+    /// What the pages of `[start, end)` hold ([`Usage`]), or `None` once
+    /// the space is gone.
+    #[must_use]
+    pub fn usage(&self, start: u64, end: u64) -> Option<Usage> {
+        self.with_data(|data| data.usage(start, end))
+    }
+    /// How many pages are locked (Linux's `locked_vm`), or `None` once the
+    /// space is gone.
+    #[must_use]
+    pub fn locked_pages(&self) -> Option<u64> {
+        self.with_data(AddressSpaceData::locked_pages)
     }
     /// The total length of the space's mappings and its initial break, or
     /// `None` once it is gone.
@@ -4265,7 +4543,7 @@ impl AddressSpace {
     }
     /// Makes the newly created mapping `[addr, addr+len)` show `pages` from
     /// key `offset` on, a file's page cache from that file offset, as a
-    /// Linux `MAP_SHARED` mapping of the file; `may_write` says whether
+    /// Linux `MAP_SHARED` mapping of the file; `writes` says whether
     /// `mprotect` may make it writable.
     pub fn share_pages(
         &self,
@@ -4273,10 +4551,9 @@ impl AddressSpace {
         len: u64,
         pages: &SharedPages,
         offset: u64,
-        may_write: bool,
+        writes: SharedWrites,
     ) -> Result<(), Errno> {
-        self.locked()
-            .share_pages(addr, len, pages, offset, may_write)
+        self.locked().share_pages(addr, len, pages, offset, writes)
     }
     /// See [`AddressSpaceData::remap_shared_pages`], under one hold of the
     /// locks, as Linux's `remap_file_pages` holds its `mmap_lock` for writing.
@@ -4321,8 +4598,8 @@ impl AddressSpace {
             Backing::Shared {
                 pages,
                 offset,
-                may_write,
-            } => data.share_pages(at, len, pages, offset, may_write),
+                writes,
+            } => data.share_pages(at, len, pages, offset, writes),
             Backing::Cache { pages, offset } => data.back_with_cache(at, len, pages, offset),
         };
         if let Err(error) = attached {
@@ -4792,6 +5069,11 @@ impl AddressSpace {
     /// See [`AddressSpaceData::lock_new`].
     pub fn lock_new(&self, addr: GuestAddr, end: u64, lock: Lock) {
         self.locked().lock_new(addr.0, end, lock);
+    }
+    /// See [`AddressSpaceData::flag_new`].
+    pub fn flag_new(&self, addr: GuestAddr, end: u64, no_reserve: bool, no_huge_pages: bool) {
+        self.locked()
+            .flag_new(addr.0, end, no_reserve, no_huge_pages);
     }
     /// See [`AddressSpaceData::lock_all`].
     pub fn lock_all(&self, current: Option<Option<Lock>>, future: Option<Lock>) {
@@ -5587,7 +5869,13 @@ mod tests {
         map(&mut space, 0x80000, Prot::READ_WRITE);
         for at in [0x70000, 0x80000] {
             space
-                .share_pages(GuestAddr(at), PAGE_SIZE, &SharedPages::new(), 0, true)
+                .share_pages(
+                    GuestAddr(at),
+                    PAGE_SIZE,
+                    &SharedPages::new(),
+                    0,
+                    SharedWrites::Allowed,
+                )
                 .unwrap();
         }
         space.write_u64(GuestAddr(0x50000), 1).unwrap();
@@ -5962,7 +6250,7 @@ mod tests {
             .map_shared(None, 3 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
             .unwrap();
         shared
-            .share_pages(other, 3 * PAGE_SIZE, &pages, 0, true)
+            .share_pages(other, 3 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
             .unwrap();
         let mut b = [0];
         for (space, at) in [(&private, at), (&shared, other)] {
@@ -6270,7 +6558,7 @@ mod tests {
             .unwrap();
         // The mapping shows the pages from key 0x2000 on.
         space
-            .share_pages(at, 2 * PAGE_SIZE, &pages, 0x2000, true)
+            .share_pages(at, 2 * PAGE_SIZE, &pages, 0x2000, SharedWrites::Allowed)
             .unwrap();
         assert_eq!(byte(&space, at.0 + PAGE_SIZE), b'f');
         let child = space.fork();
@@ -6318,9 +6606,12 @@ mod tests {
             let at = space
                 .map_shared(None, PAGE_SIZE, Prot::READ, MappingKind::File)
                 .unwrap();
-            space
-                .share_pages(at, PAGE_SIZE, &pages, 0, may_write)
-                .unwrap();
+            let writes = if may_write {
+                SharedWrites::Allowed
+            } else {
+                SharedWrites::Sealed
+            };
+            space.share_pages(at, PAGE_SIZE, &pages, 0, writes).unwrap();
             let result = space.protect_shared(at, PAGE_SIZE, Prot::READ_WRITE);
             assert_eq!(
                 result,
@@ -6336,7 +6627,7 @@ mod tests {
             .map_shared(None, 2 * PAGE_SIZE, Prot::READ, MappingKind::File)
             .unwrap();
         assert_eq!(
-            space.share_pages(at, PAGE_SIZE, &pages, 0, true),
+            space.share_pages(at, PAGE_SIZE, &pages, 0, SharedWrites::Allowed),
             Err(Errno::EINVAL)
         );
     }
@@ -6517,7 +6808,9 @@ mod tests {
             match source {
                 Some(source) => {
                     let pages = SharedPages::new().with_source(source);
-                    space.share_pages(at, PAGE_SIZE, &pages, 0, false).unwrap();
+                    space
+                        .share_pages(at, PAGE_SIZE, &pages, 0, SharedWrites::ReadOnly)
+                        .unwrap();
                 }
                 None => space.mark_shared(at, PAGE_SIZE).unwrap(),
             }

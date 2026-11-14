@@ -735,16 +735,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書き換えた読み込み専用のセグメント（コード）も同じです。残り（`.bss`）は無名の
   メモリで、0 として読めます。共有メモリは自分の中身を保ちます。`MADV_FREE` では
   中身を残します。メモリが足りているときの Linux と同じです。
-  アクセスの仕方のヒントと `MADV_WILLNEED` を受け付けます。`MADV_COLD` と
-  `MADV_PAGEOUT`（回収するものがないので、これもヒントです）、`MADV_MERGEABLE`、
-  `MADV_UNMERGEABLE`、`MADV_HUGEPAGE`、`MADV_NOHUGEPAGE`（そのフラグでページは
-  変わりません）も受け付け、どれも範囲がマップされていれば足ります（`ENOMEM`）。
+  `MADV_WILLNEED` を受け付けます。`MADV_COLD` と `MADV_PAGEOUT`（回収するものが
+  ないので、これもヒントです）も受け付け、どれも範囲がマップされていれば足ります
+  （`ENOMEM`）。
   `MADV_DONTNEED_LOCKED` は `MADV_DONTNEED` と同じく捨てます。`MADV_POPULATE_READ` と
   `MADV_POPULATE_WRITE` は、読み込みや書き込みと同じようにページを割り当てます
   （ゼロページ、自分のページ）。どのマッピングにもないページ（`ENOMEM`）、マッピングが
   読めないか書けないページ（`EINVAL`）、ファイルの終わりより先のページ（`EFAULT`）で
   止まります。`MADV_DONTFORK` と `MADV_DOFORK`、`MADV_WIPEONFORK` と `MADV_KEEPONFORK`、
-  `MADV_DONTDUMP` と `MADV_DODUMP` は、範囲の VMA のフラグを付けたり外したりします。
+  `MADV_DONTDUMP` と `MADV_DODUMP`、アクセスの仕方のヒント（`MADV_NORMAL`、
+  `MADV_SEQUENTIAL`、`MADV_RANDOM`）、`MADV_HUGEPAGE` と `MADV_NOHUGEPAGE`、KSM の
+  `MADV_MERGEABLE`（共有メモリはそのままにします）と `MADV_UNMERGEABLE` は、範囲の
+  VMA のフラグを付けたり外したりします（あとのものでページは変わりません）。
   VMA は、Linux と同じように前後の VMA から分かれたり、つながったりします
   （`/proc/<pid>/maps`）。VMA を順に処理し、受け付けない VMA があればそこで `EINVAL`
   で止まります（`MADV_WIPEONFORK` はプライベートの匿名メモリだけです）。範囲に穴が
@@ -802,8 +804,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピングへの書き込みをファイルに書き戻します。
 - `remap_file_pages` は、共有のマッピングの範囲を、そのファイルや共有メモリの別の
   ページに張り直します。Linux がマッピング自身のファイルを `mmap` し直すのと同じで、
-  保護はそのままです。Linux と同じく、`prot` は 0 でなければならず、範囲は書き込める
-  同じメモリの共有のマッピングの中に隙間なく収まっていなければなりません（`EINVAL`）。
+  保護はそのままです。Linux と同じく、`prot` は 0 でなければならず、範囲は、ファイルを
+  書き込み用に開いた（`VM_SHARED`。memfd の封印は外しません）同じメモリの共有の
+  マッピングの中に隙間なく収まっていなければなりません（`EINVAL`）。
   ファイルが届かないページは `EOVERFLOW` です。
 - System V の共有メモリ（`shmget`、`shmat`、`shmdt`、`shmctl`）は、スレッドの IPC
   名前空間のものです。新しい IPC 名前空間にはセグメントがありません。確かめる内容とその
@@ -1728,9 +1731,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`maps`、`fd`、`fdinfo`、`ns`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
-  （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。ただし、何も
-  測っていないメモリと CPU の項目はありません。自分のディレクトリと `/proc` の下の
+  `cwd`、`maps`、`smaps`、`fd`、`fdinfo`、`ns`、`task` があります。`status` は、Linux と同じ項目を同じ順番で持ちます
+  （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。メモリの項目は
+  ロックしたメモリ（`VmLck`）だけで、何も測っていないほかのメモリの項目と CPU の
+  項目はありません。自分のディレクトリと `/proc` の下の
   それ以外のパスは、ふつうのパスと同じようにファイルシステムで探します。
   そのため `--mount /:/` では、ホストの `/proc` に届きます。
 - `/proc` は、ファイルシステムがそこに持つプロセス以外のもの（`--mount /:/` では、
@@ -1850,6 +1854,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   大きさは 0 です。ディスクリプタが示すのは開いたときのアドレス空間で、fork した
   子が読んでもそのアドレス空間を示します。`execve` の後のように、そのアドレス空間を
   使うスレッドがなくなると何も示しません。マップはできません（`ENODEV`）。
+- `/proc/self/smaps` は、`maps` の各行のあとに Linux の `show_smap` と同じ項目を
+  続け、`maps` と同じように読めます。大きさ、ページの中身（`Rss`、`Pss`、`Pss_Dirty`、
+  共有とプライベートそれぞれの clean と dirty のページ、`Anonymous`、`Locked`。
+  ヒュージページ、スワップ、KSM は 0）、`THPeligible`、`VmFlags` です。ページは
+  エントリーを持てば数えます。読んだだけのプライベートメモリはゼロページを示すので
+  数えず、書いたプライベートメモリは匿名で dirty です。`fork` が書き込みまで共有する
+  ページは共有として数え、`Pss` にはその半分を足します。`VmFlags` は VMA の Linux の
+  フラグを Linux と同じ順番で並べます。保護とそのなれる先（`mr`、`mw`、`me`、`ms`。
+  読むためだけに開いたファイルと書き込みを封じたファイルには `mw` がなく、AIO と
+  `io_uring` のリングと秘密のメモリには、何も実行しない疑似ファイルシステムなので
+  `me` がありません）、`sh`、最初のスタックの `gd`、ロック（`lo`、`lf`）、ガード
+  （`gu`）、アドバイス（`sr`、`rr`、`dc`、`wf`、`dd`、`hg`、`nh`、`mg`）、リングと秘密の
+  メモリの `de`、`mm`、`dd`、課金（`ac`。書き込めたプライベートメモリが持ち、
+  `MAP_NORESERVE` なら代わりに `nr` を持ちます。一度も書いていない匿名メモリは書き込め
+  なくなるときに返します）、`MAP_STACK` のマッピングの `nh`、封印（`sl`）、最初の
+  スタック以外のすべての VMA の `sd` です。
 - `/proc/self/fd`（モード 0500）は、`.`、`..` と、開いているディスクリプタごとの
   リンクを並べます。名前は番号で、Linux と同じく先頭に 0 のない形で読みます。各リンクの
   `lstat` は、ユーザーのビットでディスクリプタのアクセスを示し、大きさは 64 です。`stat`

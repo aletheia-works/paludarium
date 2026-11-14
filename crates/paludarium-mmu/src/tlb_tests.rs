@@ -957,7 +957,7 @@ fn shared_space(memory: &SharedPages, pages: u64, prot: Prot) -> Arc<AddressSpac
         .map_shared(Some(GuestAddr(AT)), len, prot, MappingKind::File)
         .unwrap();
     space
-        .share_pages(GuestAddr(AT), len, memory, 0, true)
+        .share_pages(GuestAddr(AT), len, memory, 0, SharedWrites::Allowed)
         .unwrap();
     Arc::new(space)
 }

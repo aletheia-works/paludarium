@@ -370,7 +370,11 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         Backing::Shared {
             pages: &memory,
             offset: 0,
-            may_write: flag & SHM_RDONLY == 0,
+            writes: if flag & SHM_RDONLY == 0 {
+                paludarium_mmu::SharedWrites::Allowed
+            } else {
+                paludarium_mmu::SharedWrites::ReadOnly
+            },
         },
     )?;
     c.group.numa().forget(at.0, len);

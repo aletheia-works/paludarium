@@ -699,6 +699,16 @@ impl paludarium_mmu::PageSource for FilePages {
     fn secret(&self) -> bool {
         self.secret
     }
+    /// `secretmem_mmap_prepare` adds `VM_DONTDUMP`; secretmem's pseudo file
+    /// system runs nothing.
+    fn vma_flags(&self, flags: u64) -> u64 {
+        use paludarium_mmu::vm;
+        if self.secret {
+            (flags | vm::DONTDUMP) & !vm::MAYEXEC
+        } else {
+            flags
+        }
+    }
     fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
         Some(self)
     }

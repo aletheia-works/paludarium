@@ -445,8 +445,14 @@ fn futex_shared_memory_keys_reach_other_spaces() {
             MappingKind::Anonymous,
         )
         .unwrap();
-        mem.share_pages(GuestAddr(at), 4096, &pages, offset, true)
-            .unwrap();
+        mem.share_pages(
+            GuestAddr(at),
+            4096,
+            &pages,
+            offset,
+            paludarium_mmu::SharedWrites::Allowed,
+        )
+        .unwrap();
         mem
     });
     let f = futex::Futexes::default();

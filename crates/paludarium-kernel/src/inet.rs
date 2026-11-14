@@ -410,15 +410,15 @@ impl Network {
     /// `RTM_NEWLINK` with `IFF_UP` does, with what that does to its
     /// addresses ([`crate::interface::Addresses::up`] and `down`).
     /// `None` when it already is, else what happened to the addresses and
-    /// routes, for netlink to tell ([`crate::netlink::set_up`]).
-    pub(crate) fn set_up(&self, up: bool) -> Option<Vec<crate::interface::Event>> {
+    /// routes at `now`, for netlink to tell ([`crate::netlink::set_up`]).
+    pub(crate) fn set_up(&self, up: bool, now: u64) -> Option<Vec<crate::interface::Event>> {
         let mut addresses = self.addresses();
         if up == self.is_up() {
             return None;
         }
         let events = if up {
             self.ever_up.store(true, Ordering::SeqCst);
-            addresses.up()
+            addresses.up(now)
         } else {
             addresses.down()
         };
@@ -431,13 +431,14 @@ impl Network {
     /// CAP_NET_ADMIN (`EPERM`, before the name is looked at) and takes only
     /// `IFF_UP`, with what that does to the loopback's addresses
     /// ([`Self::set_up`]): down, it loses every IPv6 address; up, it has
-    /// `127.0.0.1/8` and `::1` back.
+    /// `127.0.0.1/8` and `::1` back, made at `now`.
     pub(crate) fn interface(
         &self,
         name: &[u8],
         request: u64,
         flags: u16,
         may_administer: bool,
+        now: u64,
     ) -> Result<u32, Errno> {
         // `dev_ioctl` checks the capability before it looks the name up.
         if request == SIOCSIFFLAGS && !may_administer {
@@ -454,7 +455,7 @@ impl Network {
                 IFF_LOOPBACK
             })),
             SIOCSIFFLAGS => {
-                crate::netlink::set_up(self, flags & IFF_UP != 0);
+                crate::netlink::set_up(self, flags & IFF_UP != 0, now);
                 Ok(0)
             }
             _ => Ok(1),

@@ -483,8 +483,17 @@ verified.
   are their defaults whatever its route holds. A route may name no
   congestion control but `cubic` and `reno` (`EINVAL`), where Linux, for a
   caller with `CAP_NET_ADMIN`, loads the module of another first.
-  An address is always permanent: lifetimes (`IFA_CACHEINFO`) and
-  `IFA_RT_PRIORITY` are not kept, a peer address is
+  An address's lifetimes run out only when a netlink request in its
+  namespace next comes, which first tells of it, where Linux's work finds
+  them on time: until then a socket may still use an address past its
+  valid lifetime. An IPv6 route that has run out goes from its table then
+  too, where Linux's, which lookups pass over, stays in dumps until its
+  garbage collection (`gc_interval`, 30 seconds), and from 7.3 marks its
+  notification of that with `RTA_DEL_REASON`. A change that gives a
+  permanent IPv6 address a lifetime gives its prefix route the same, as
+  Linux does from 7.3; before it, one that has already run out. No
+  temporary addresses are made for `IFA_F_MANAGETEMPADDR`, and
+  `IFA_F_MCAUTOJOIN` joins no group. A peer address is
   not a point-to-point one, and an IPv6 address is never tentative, where
   Linux's is until its duplicate address detection work, which ends at
   once on a loopback, has run. A connection or datagram to an address of
@@ -514,7 +523,8 @@ verified.
   statistics are zero; its IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30
-  seconds, where Linux's is random. An address's creation times are 0.
+  seconds, where Linux's is random. The first namespace's `127.0.0.1`
+  and `::1` were made at 0, where Linux's were made as it booted.
   `NETLINK_EXT_ACK` adds no attributes to an error or to a dump's
   `NLMSG_DONE`. A link dump's `IFLA_LINKINFO` is taken without effect,
   where Linux shows only the devices of a kind its modules know. The

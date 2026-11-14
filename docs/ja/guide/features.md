@@ -1332,10 +1332,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `::1/128` が付き、落とすと IPv6 のアドレスはすべて消えます（`keep_addr_on_down` は 0）。
     `RTM_NEWADDR` は、`inet_rtm_newaddr` と `inet6_rtm_newaddr` と同じくアドレスを足します。
     `lo` がすでに持つものは、`NLM_F_EXCL` なしの `NLM_F_REPLACE` でなければ `EEXIST` です。
-    `IFA_LOCAL` のない IPv4 のもの、32（IPv6 なら 128）を超える接頭辞、`IFA_LOCAL` も
-    `IFA_ADDRESS` もない IPv6 のもの、`ifaddrmsg` より短いメッセージは `EINVAL`、ほかの
-    インターフェースは `ENODEV` です。`IFA_LABEL`、`IFA_BROADCAST`、`IFA_FLAGS`
-    （`IFA_F_NOPREFIXROUTE` も）、`IFA_PROTO` を保ちます。`RTM_DELADDR` は、指した
+    `IFA_LOCAL` のない IPv4 のもの、32 を超える接頭辞、`IFA_LOCAL` も `IFA_ADDRESS` も
+    ない IPv6 のもの、有効な寿命がないか、それより長い推奨の寿命、`ifaddrmsg` より短い
+    メッセージは `EINVAL`、ほかのインターフェースは `ENODEV` です。そのあと、新しい IPv6 の
+    ものでは、128 を超える接頭辞と、64 でない接頭辞の `IFA_F_MANAGETEMPADDR` が
+    `EINVAL` です。`0.0.0.0` の `IFA_LOCAL` は受け取るだけで何もしません。`IFA_LABEL`、
+    `IFA_BROADCAST`、`IFA_FLAGS`（`IFA_F_NOPREFIXROUTE` と、IPv6 ではアドレスを 1 度だけ
+    伝える `IFA_F_NODAD` も。IPv6 は要求が付けられるフラグだけを保ちます）、`IFA_PROTO`、
+    アドレスの接頭辞の経路のメトリックになる `IFA_RT_PRIORITY`、`IFA_CACHEINFO` の寿命を
+    保ちます。有効な寿命のあるアドレスは `IFA_F_PERMANENT` でなく、推奨の寿命が 0 のものは
+    `IFA_F_DEPRECATED` で、`IFA_CACHEINFO` はそれぞれの残りと、アドレスが作られた時刻と
+    寿命を決めた時刻を伝えます。Linux の確認と同じく、推奨の寿命が尽きたアドレスは非推奨に
+    なり、有効な寿命が尽きると経路とともに消えます。IPv6 の接頭辞の経路は、Linux と同じく
+    ひとりでには尽きません。Linux ではループバックを通る経路は作るときに `RTF_EXPIRES` を
+    失います（`fib6_is_reject`）。変更が永続のアドレスに寿命を与えたとき
+    （`modify_prefix_route`）か、接頭辞のアドレスの 1 つが消えて残りに寿命があるときに、
+    経路も寿命（`rta_expires`）を持ち、それが尽きると消えます。`NLM_F_REPLACE` は `lo` が
+    持つアドレスを変えて、
+    それを伝えます。IPv4 のものは要求の優先度（なければ 0）、プロトコル、寿命を取り、IPv6 の
+    ものは `inet6_addr_modify` と同じく、フラグ、プロトコル、寿命と、要求が指していれば
+    優先度を取ります。接頭辞の経路もそれに従います。`RTM_DELADDR` は、指した
     `IFA_LOCAL`、`IFA_LABEL`、`IFA_ADDRESS` と接頭辞を持つ最初のものを消し（なければ
     `EADDRNOTAVAIL`）、プライマリならそのセカンダリも消します。`127.0.0.1` と `::1` も
     消せます。ダンプでない `RTM_GETADDR` は、`inet6_rtm_getaddr` と同じく IPv6 のアドレスを
@@ -1376,10 +1392,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     持ちます。IPv4 のローカルの表とメインの表は、ポリシーのルールがない間の Linux と同じく
     1 つのトライを分け合います。アドレスの経路は、`fib_add_ifaddr` と `addrconf` が付ける
     カーネルのものです。IPv4 のアドレスには、初めからローカルの表に `local` の経路があり、
-    `lo` が上がると、接頭辞の経路（ループバックでは `local` で、落ちても残ります）、
-    サブネットの `broadcast` の経路、`IFA_BROADCAST` のものが付きます。IPv6 のアドレスには、
-    ローカルの表に `local` の経路が、そのアドレスを持って `lo` が初めて上がってからは、
-    メインの表にメトリック 256 のユニキャストの接頭辞の経路があります（`::1` には
+    `lo` が上がると、接頭辞の経路（ループバックでは `local` で、落ちても残り、優先度は
+    アドレスのものです）、サブネットの `broadcast` の経路、`IFA_BROADCAST` のものが付きます。
+    IPv6 のアドレスには、ローカルの表に `local` の経路が、そのアドレスを持って `lo` が初めて
+    上がってからは（落ちている間に足したものは永続のときだけ）、メインの表に、アドレスの
+    優先度か、なければメトリック 256 のユニキャストの接頭辞の経路があります（`::1` には
     ありません）。`RTM_NEWROUTE` は、`inet_rtm_newroute` と `inet6_rtm_newroute` と同じく、
     `lo` を通る経路か、デバイスのない種類（`blackhole`、`unreachable`、`prohibit`、
     `throw`）の経路を、どの表にも足します。メトリック、プロトコル、スコープ、TOS、

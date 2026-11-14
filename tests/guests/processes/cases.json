@@ -26,6 +26,7 @@
     {"name":"route-dump","binary":"process"},
     {"name":"route-metrics","binary":"process"},
     {"name":"route-selectors","binary":"process"},
+    {"name":"address-lifetimes","binary":"process"},
     {"name":"netlink-strict","binary":"process"},
     {"name":"link-attributes","binary":"process"},
     {"name":"generic-netlink","binary":"process"},

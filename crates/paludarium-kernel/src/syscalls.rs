@@ -3440,7 +3440,11 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 .process
                 .credentials
                 .capable_in(CAP_NET_ADMIN, network.owner());
-            let value = network.interface(&request[..16], a[1], flags, admin)?;
+            let now = c
+                .host
+                .clock(paludarium_host::ClockId::Monotonic)
+                .unwrap_or(0);
+            let value = network.interface(&request[..16], a[1], flags, admin, now)?;
             match a[1] {
                 crate::inet::SIOCGIFFLAGS => {
                     request[16..18].copy_from_slice(&(value as u16).to_le_bytes());

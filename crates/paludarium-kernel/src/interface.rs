@@ -11,8 +11,9 @@
 //! route. Going down, the loopback loses every IPv4 route through it but
 //! those of host scope, without a word, and every IPv6 route and address,
 //! each told (`keep_addr_on_down` is 0). An IPv6 address has its `local`
-//! route and, from an up, a unicast prefix route of metric 256 in the main
-//! table.
+//! route and, from an up, a unicast prefix route in the main table, of its
+//! priority or else metric 256. Addresses may have lifetimes, and run out
+//! as [`Addresses::expire`] finds them.
 //!
 //! The local and main IPv4 tables are one trie, as Linux merges them while
 //! there is no policy rule: a lookup takes the longest prefix of either,
@@ -29,10 +30,28 @@ const ENETDOWN: Errno = Errno(100);
 const ENETUNREACH: Errno = Errno(101);
 const EHOSTUNREACH: Errno = Errno(113);
 const EOPNOTSUPP: Errno = Errno(95);
-/// `IFA_F_SECONDARY`, `IFA_F_NOPREFIXROUTE` and `IFA_F_PERMANENT`.
+/// `IFA_F_SECONDARY`, `IFA_F_NOPREFIXROUTE`, `IFA_F_PERMANENT` and
+/// `IFA_F_DEPRECATED`.
 pub(crate) const SECONDARY: u32 = 0x01;
 pub(crate) const NO_PREFIX_ROUTE: u32 = 0x200;
 pub(crate) const PERMANENT: u32 = 0x80;
+pub(crate) const DEPRECATED: u32 = 0x20;
+/// `IFA_F_NODAD`: an IPv6 address is never tentative.
+const NO_DAD: u32 = 0x02;
+/// The IPv6 address flags a request may set (`inet6_rtm_newaddr`):
+/// `IFA_F_NODAD`, `IFA_F_HOMEADDRESS`, `IFA_F_MANAGETEMPADDR`,
+/// `IFA_F_NOPREFIXROUTE` and `IFA_F_MCAUTOJOIN`; `IFA_F_OPTIMISTIC` too,
+/// which goes again while `optimistic_dad` is 0.
+pub(crate) const V6_ASKED: u32 = 0x02 | 0x10 | 0x100 | NO_PREFIX_ROUTE | 0x400;
+/// The IPv6 address flags a change takes off before it puts the asked ones
+/// on (`inet6_addr_modify`).
+const V6_CHANGED: u32 = DEPRECATED | PERMANENT | 0x02 | 0x10 | 0x100 | NO_PREFIX_ROUTE;
+/// `INFINITY_LIFE_TIME`: a lifetime that never ends.
+pub(crate) const FOREVER: u32 = u32::MAX;
+/// A second, and how much sooner than its lifetime an address is taken to
+/// have run out (`ADDRCONF_TIMER_FUZZ_MINUS`, `HZ / 50`), in nanoseconds.
+const SECOND: u64 = 1_000_000_000;
+const FUZZ: u64 = 20_000_000;
 /// The scopes of addresses and routes (`RT_SCOPE_*`).
 pub(crate) const SCOPE_UNIVERSE: u8 = 0;
 pub(crate) const SCOPE_LINK: u8 = 253;
@@ -76,6 +95,60 @@ pub(crate) struct V4 {
     pub flags: u32,
     pub proto: u8,
     pub label: Vec<u8>,
+    /// The metric of its prefix route (`IFA_RT_PRIORITY`).
+    pub priority: u32,
+    pub life: Life,
+}
+/// The lifetimes of an address, in seconds from when they were last set,
+/// and when it was made and they were set, in nanoseconds of the
+/// monotonic clock (`cstamp` and `tstamp`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Life {
+    pub valid: u32,
+    pub preferred: u32,
+    pub created: u64,
+    pub changed: u64,
+}
+impl Life {
+    /// The whole seconds since its lifetimes were set, as `inet_fill_ifaddr`
+    /// counts them.
+    fn age(&self, now: u64) -> u32 {
+        u32::try_from(now.saturating_sub(self.changed) / SECOND).unwrap_or(u32::MAX)
+    }
+    /// The seconds each has left at `now`, as `inet_fill_ifaddr` and
+    /// `inet6_fill_ifaddr` tell them of an address that has one: none are
+    /// taken from either when the preferred one never ends.
+    pub(crate) fn left(&self, now: u64) -> (u32, u32) {
+        if self.preferred == FOREVER {
+            return (self.preferred, self.valid);
+        }
+        let age = self.age(now);
+        let valid = if self.valid == FOREVER {
+            FOREVER
+        } else {
+            self.valid.saturating_sub(age)
+        };
+        (self.preferred.saturating_sub(age), valid)
+    }
+    /// Whether at `now` it is as old as `lifetime` (which is not forever),
+    /// a little sooner counting (`check_lifetime`, `addrconf_verify_rtnl`).
+    fn reached(&self, lifetime: u32, now: u64) -> bool {
+        lifetime != FOREVER
+            && (now + FUZZ).saturating_sub(self.changed) / SECOND >= u64::from(lifetime)
+    }
+}
+/// The valid and preferred lifetimes a request asks an address to have
+/// (`IFA_CACHEINFO`), which are forever when it names none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Lifetimes {
+    pub valid: u32,
+    pub preferred: u32,
+}
+impl Lifetimes {
+    pub(crate) const FOREVER: Self = Self {
+        valid: FOREVER,
+        preferred: FOREVER,
+    };
 }
 impl V4 {
     /// An address the guest asks for: `local`, `address` (its peer, or the
@@ -90,6 +163,34 @@ impl V4 {
             flags: 0,
             proto: 0,
             label: b"lo".to_vec(),
+            priority: 0,
+            life: Life::default(),
+        }
+    }
+    /// Gives it `lifetimes` at `now`, as `set_ifa_lifetime` does: one that
+    /// never ends makes it `IFA_F_PERMANENT`, and is not kept; a preferred
+    /// one of 0 makes it `IFA_F_DEPRECATED`.
+    fn set_life(&mut self, lifetimes: Lifetimes, now: u64) {
+        self.flags &= !(PERMANENT | DEPRECATED);
+        if lifetimes.valid == FOREVER {
+            self.flags |= PERMANENT;
+        } else {
+            self.life.valid = lifetimes.valid;
+        }
+        if lifetimes.preferred != FOREVER {
+            if lifetimes.preferred == 0 {
+                self.flags |= DEPRECATED;
+            }
+            self.life.preferred = lifetimes.preferred;
+        }
+        self.life.changed = now;
+    }
+    /// The lifetimes it has left at `now`: forever while permanent.
+    pub(crate) fn left(&self, now: u64) -> (u32, u32) {
+        if self.flags & PERMANENT != 0 {
+            (FOREVER, FOREVER)
+        } else {
+            self.life.left(now)
         }
     }
     fn mask(&self) -> u32 {
@@ -110,15 +211,57 @@ pub(crate) struct V6 {
     pub prefix: u8,
     pub flags: u32,
     pub proto: u8,
+    /// The metric of its prefix route, 0 for `IP6_RT_PRIO_ADDRCONF`
+    /// (`IFA_RT_PRIORITY`).
+    pub priority: u32,
+    pub life: Life,
 }
 impl V6 {
+    /// A permanent address that never ends, made at 0.
     pub(crate) fn new(address: Ipv6Addr, prefix: u8) -> Self {
         Self {
             address,
             prefix,
             flags: PERMANENT,
             proto: 0,
+            priority: 0,
+            life: Life {
+                valid: FOREVER,
+                preferred: FOREVER,
+                created: 0,
+                changed: 0,
+            },
         }
+    }
+    /// Gives it `lifetimes` at `now`, as `inet6_rtm_newaddr` reads them: it
+    /// is `IFA_F_PERMANENT` unless its valid one ends, and
+    /// `IFA_F_DEPRECATED` with a preferred one of 0.
+    fn set_life(&mut self, lifetimes: Lifetimes, now: u64) {
+        self.flags |= PERMANENT;
+        if lifetimes.valid != FOREVER {
+            self.flags &= !PERMANENT;
+        }
+        if lifetimes.preferred == 0 {
+            self.flags |= DEPRECATED;
+        }
+        self.life.valid = lifetimes.valid;
+        self.life.preferred = lifetimes.preferred;
+        self.life.changed = now;
+    }
+    /// The lifetimes it has left at `now`, as `inet6_fill_ifaddr`: forever
+    /// while permanent with a preferred lifetime that never ends.
+    pub(crate) fn left(&self, now: u64) -> (u32, u32) {
+        if self.flags & PERMANENT != 0 && self.life.preferred == FOREVER {
+            (FOREVER, FOREVER)
+        } else {
+            self.life.left(now)
+        }
+    }
+    /// When a change gives its prefix route its lifetime
+    /// (`modify_prefix_route`): never while it is permanent.
+    fn expires(&self) -> Option<u64> {
+        (self.flags & PERMANENT == 0)
+            .then(|| self.life.changed + u64::from(self.life.valid) * SECOND)
     }
     /// Its scope, as `ipv6_addr_scope` gives it.
     pub(crate) fn scope(&self) -> u8 {
@@ -138,21 +281,36 @@ impl V6 {
             proto: PROTO_KERNEL,
             prefsrc: None,
             metrics: NO_METRICS,
+            expires: None,
         }
     }
     /// Its prefix route in the main table (`addrconf_prefix_route`), which
-    /// `::1`, the kernel's, has not.
+    /// `::1`, the kernel's, has not: of its priority, or 256. It does not
+    /// run out, whatever the address's lifetime: a route through a
+    /// loopback to another address is a rejecting one, whose flags,
+    /// `RTF_EXPIRES` among them, its making sets anew (`fib6_is_reject`).
     pub(crate) fn prefix_route(&self) -> Option<Route6> {
         (self.proto != KERNEL_LO && self.flags & NO_PREFIX_ROUTE == 0).then(|| Route6 {
             table: TABLE_MAIN,
-            dst: Ipv6Addr::from(u128::from(self.address) & mask6(self.prefix)),
+            dst: self.prefix_of(),
             len: self.prefix,
             kind: Kind::Unicast,
-            metric: METRIC_ADDRCONF,
+            metric: self.metric(),
             proto: PROTO_KERNEL,
             prefsrc: None,
             metrics: NO_METRICS,
+            expires: None,
         })
+    }
+    fn prefix_of(&self) -> Ipv6Addr {
+        Ipv6Addr::from(u128::from(self.address) & mask6(self.prefix))
+    }
+    fn metric(&self) -> u32 {
+        if self.priority == 0 {
+            METRIC_ADDRCONF
+        } else {
+            self.priority
+        }
     }
 }
 /// The metrics of a route (`RTA_METRICS`), as `ip_metrics_convert`
@@ -167,6 +325,18 @@ fn mask4(prefix: u8) -> u32 {
 }
 fn mask6(prefix: u8) -> u128 {
     u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0)
+}
+/// The prefix route of the IPv4 address `address`, of its priority, as
+/// `fib_add_ifaddr` and `fib_modify_prefix_metric` make it on a loopback:
+/// none for the prefix 0, or a `/32` of its own address.
+fn prefix_route4(address: &V4) -> Option<Route4> {
+    let prefix = Ipv4Addr::from(u32::from(address.address) & address.mask());
+    (!prefix.is_unspecified() && !(prefix == address.local && address.prefix == 32)).then(|| {
+        Route4 {
+            priority: address.priority,
+            ..Route4::kernel(prefix, address.prefix, Kind::Local, address.local)
+        }
+    })
 }
 fn scope6(ip: Ipv6Addr) -> u8 {
     if ip.is_loopback() {
@@ -299,6 +469,9 @@ pub(crate) struct Route6 {
     pub prefsrc: Option<Ipv6Addr>,
     /// Its `fib6_metrics`.
     pub metrics: Metrics,
+    /// When it runs out (`RTF_EXPIRES`), in nanoseconds of the monotonic
+    /// clock.
+    pub expires: Option<u64>,
 }
 impl Route6 {
     fn covers(&self, ip: Ipv6Addr) -> bool {
@@ -453,7 +626,7 @@ impl Addresses {
     /// The first namespace's: `127.0.0.1/8` and `::1`, up.
     pub(crate) fn first() -> Self {
         let mut addresses = Self::isolated();
-        let _ = addresses.up();
+        let _ = addresses.up(0);
         addresses
     }
     /// A new namespace's: none.
@@ -469,17 +642,16 @@ impl Addresses {
             mctp_routes: Vec::new(),
         }
     }
-    /// The loopback comes up (`NETDEV_UP`), and what Linux tells of it, in
-    /// its order: `127.0.0.1/8` if it has it not, with its routes
+    /// The loopback comes up (`NETDEV_UP`) at `now`, and what Linux tells
+    /// of it, in its order: `127.0.0.1/8` if it has it not, with its routes
     /// (`inetdev_event`); the routes every IPv4 address has then that are
     /// not there, in the addresses' order (`fib_netdev_event`); the prefix
-    /// route of each IPv6 address added while it was down
+    /// route of each permanent IPv6 address added while it was down
     /// (`addrconf_permanent_addr`); and `::1` with its route.
-    pub(crate) fn up(&mut self) -> Vec<Event> {
+    pub(crate) fn up(&mut self, now: u64) -> Vec<Event> {
         let mut events = Vec::new();
-        let mut loopback = V4::new(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 8, SCOPE_HOST);
-        loopback.flags = PERMANENT;
-        if let Ok(added) = self.add_v4(loopback, false, true) {
+        let loopback = V4::new(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 8, SCOPE_HOST);
+        if let Ok(added) = self.add_v4(loopback, Lifetimes::FOREVER, false, true, now) {
             events.extend(added);
         }
         for address in self.v4.clone() {
@@ -488,13 +660,17 @@ impl Addresses {
             }
         }
         for address in self.v6.clone() {
-            if let Some(route) = address.prefix_route() {
+            if address.flags & PERMANENT != 0
+                && let Some(route) = address.prefix_route()
+            {
                 self.kernel_add6(route, &mut events);
             }
         }
         if !self.local6(Ipv6Addr::LOCALHOST) {
             let mut one = V6::new(Ipv6Addr::LOCALHOST, 128);
             one.proto = KERNEL_LO;
+            one.life.created = now;
+            one.life.changed = now;
             events.push(Event::NewAddr6(one.clone(), false));
             self.kernel_add6(one.local_route(), &mut events);
             self.insert_v6(one);
@@ -514,22 +690,28 @@ impl Addresses {
         events.extend(self.v6.drain(..).map(Event::DelAddr6));
         events
     }
-    /// Adds an IPv4 address as `__inet_insert_ifa` does: the same local
-    /// address and subnet again is `EEXIST`, unless `replace`, which takes
-    /// its protocol; one in a subnet a primary address has is secondary,
-    /// and goes last; a primary goes after the primaries of a scope as wide
-    /// or wider. What Linux tells: the address, then the routes it brings
-    /// (`fib_add_ifaddr`), those while `up` too.
+    /// Adds an IPv4 address with `lifetimes` at `now`, as
+    /// `inet_rtm_newaddr` and `__inet_insert_ifa` do: the same local
+    /// address and subnet again is `EEXIST`, unless `replace`; one in a
+    /// subnet a primary address has is secondary, and goes last; a primary
+    /// goes after the primaries of a scope as wide or wider. What Linux
+    /// tells: the address, then the routes it brings (`fib_add_ifaddr`),
+    /// those while `up` too. One replaced takes the new one's protocol,
+    /// priority (its prefix route, while `up`, again with it, then the old
+    /// one gone: `fib_modify_prefix_metric`) and lifetimes, and is told of.
     pub(crate) fn add_v4(
         &mut self,
         mut new: V4,
+        lifetimes: Lifetimes,
         replace: bool,
         up: bool,
+        now: u64,
     ) -> Result<Vec<Event>, Errno> {
         new.flags &= !SECONDARY;
-        new.flags |= PERMANENT;
+        new.set_life(lifetimes, now);
+        new.life.created = now;
         let mut last_primary = 0;
-        for (i, old) in self.v4.iter_mut().enumerate() {
+        for (i, old) in self.v4.iter().enumerate() {
             if !old.secondary() && new.scope <= old.scope {
                 last_primary = i + 1;
             }
@@ -538,8 +720,7 @@ impl Addresses {
                     if !replace {
                         return Err(Errno::EEXIST);
                     }
-                    old.proto = new.proto;
-                    return Ok(Vec::new());
+                    return Ok(self.change_v4(i, &new, lifetimes, up, now));
                 }
                 new.flags |= SECONDARY;
             }
@@ -555,16 +736,42 @@ impl Addresses {
         }
         Ok(events)
     }
+    /// The IPv4 address at `i` replaced by `new`, as `inet_rtm_newaddr`
+    /// changes one it has.
+    fn change_v4(
+        &mut self,
+        i: usize,
+        new: &V4,
+        lifetimes: Lifetimes,
+        up: bool,
+        now: u64,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        let old = self.v4[i].clone();
+        if old.priority != new.priority
+            && up
+            && old.flags & (SECONDARY | NO_PREFIX_ROUTE) == 0
+            && let Some(route) = prefix_route4(&old)
+        {
+            self.kernel_add4(
+                Route4 {
+                    priority: new.priority,
+                    ..route
+                },
+                &mut events,
+            );
+            self.kernel_del4(&route, &mut events);
+        }
+        let address = &mut self.v4[i];
+        address.priority = new.priority;
+        address.proto = new.proto;
+        address.set_life(lifetimes, now);
+        events.push(Event::NewAddr4(address.clone()));
+        events
+    }
     /// Removes the first IPv4 address that has `local`, `label`, and
     /// `address` in a subnet of `prefix`, each as given, as
-    /// `inet_rtm_deladdr`: `EADDRNOTAVAIL` for none. A primary takes its
-    /// secondaries with it (`promote_secondaries` is 0), which go first.
-    /// What Linux tells: each address, then the kernel's routes that go
-    /// with it, the prefix route, the broadcast ones, then the local one
-    /// (`fib_del_ifaddr`); where its local address is the loopback's no
-    /// more, the main table's routes from it (`fib_sync_down_addr`). The
-    /// last address takes every route through `lo` with it, without a word
-    /// (`fib_disable_ip`).
+    /// `inet_rtm_deladdr`: `EADDRNOTAVAIL` for none ([`Self::remove_v4`]).
     pub(crate) fn del_v4(
         &mut self,
         local: Option<Ipv4Addr>,
@@ -581,6 +788,17 @@ impl Addresses {
                     && address.is_none_or(|address| a.prefix == prefix && a.covers(address))
             })
             .ok_or(EADDRNOTAVAIL)?;
+        Ok(self.remove_v4(found))
+    }
+    /// Removes the IPv4 address at `found` (`__inet_del_ifa`). A primary
+    /// takes its secondaries with it (`promote_secondaries` is 0), which go
+    /// first. What Linux tells: each address, then the kernel's routes
+    /// that go with it, the prefix route, the broadcast ones, then the
+    /// local one (`fib_del_ifaddr`); where its local address is the
+    /// loopback's no more, the main table's routes from it
+    /// (`fib_sync_down_addr`). The last address takes every route through
+    /// `lo` with it, without a word (`fib_disable_ip`).
+    fn remove_v4(&mut self, found: usize) -> Vec<Event> {
         let target = self.v4[found].clone();
         let mut gone: Vec<V4> = Vec::new();
         if !target.secondary() {
@@ -597,7 +815,7 @@ impl Addresses {
         let mut events = Vec::new();
         for address in gone {
             // `fib_del_ifaddr`'s order: the prefix route, the broadcast ones,
-            // then the local one.
+            // then the local one, each named with no priority.
             let candidates = self.candidates(&address, true);
             let (local, rest) = candidates
                 .split_first()
@@ -605,7 +823,7 @@ impl Addresses {
             let mut order: Vec<Route4> = rest
                 .iter()
                 .filter(|r| r.kind == Kind::Local)
-                .copied()
+                .map(|r| Route4 { priority: 0, ..*r })
                 .collect();
             order.extend(rest.iter().filter(|r| r.kind == Kind::Broadcast));
             order.extend(local);
@@ -640,37 +858,132 @@ impl Addresses {
                 self.routes4.retain(|r| !r.device);
             }
         }
-        Ok(events)
+        events
     }
-    /// Adds an IPv6 address: the same one again is `EEXIST`, unless
-    /// `replace`. Global ones go before host ones, the newest first
-    /// within a scope (`ipv6_link_dev_addr`). What Linux tells: while up,
-    /// its prefix route; the address, tentative, then once its duplicate
-    /// address detection has ended at once on a loopback, as it is; then
-    /// its local route.
+    /// Adds an IPv6 address with `lifetimes` at `now`
+    /// ([`V6::set_life`]): the same one again is `EEXIST`, unless
+    /// `replace` ([`Self::change_v6`]). Global ones go before host ones, the
+    /// newest first within a scope (`ipv6_link_dev_addr`). What Linux
+    /// tells: while up, its prefix route; the address, tentative unless
+    /// `IFA_F_NODAD`, then once its duplicate address detection has ended
+    /// at once on a loopback, as it is; then its local route.
     pub(crate) fn add_v6(
         &mut self,
         mut new: V6,
+        lifetimes: Lifetimes,
         replace: bool,
         up: bool,
+        now: u64,
     ) -> Result<Vec<Event>, Errno> {
-        if let Some(old) = self.v6.iter_mut().find(|a| a.address == new.address) {
+        new.set_life(lifetimes, now);
+        new.life.created = now;
+        if let Some(i) = self.v6.iter().position(|a| a.address == new.address) {
             if !replace {
                 return Err(Errno::EEXIST);
             }
-            old.proto = new.proto;
-            return Ok(Vec::new());
+            return Ok(self.change_v6(i, &new, up));
         }
-        new.flags |= PERMANENT;
         let mut events = Vec::new();
         if up && let Some(route) = new.prefix_route() {
             self.kernel_add6(route, &mut events);
         }
-        events.push(Event::NewAddr6(new.clone(), true));
+        if new.flags & NO_DAD == 0 {
+            events.push(Event::NewAddr6(new.clone(), true));
+        }
         events.push(Event::NewAddr6(new.clone(), false));
         self.kernel_add6(new.local_route(), &mut events);
         self.insert_v6(new);
         Ok(events)
+    }
+    /// The IPv6 address at `i` changed to `new`'s flags, lifetimes and
+    /// protocol, and its priority where `new` names one, as
+    /// `inet6_addr_modify` does, and told of. Its prefix route, while
+    /// `up`, follows (`modify_prefix_route`): one of another metric goes
+    /// and comes again of the new one, and one of the same takes its
+    /// lifetime; none, or none it had, is made. One that no longer asks for
+    /// it goes as on a removal ([`Self::prefix_gone`]).
+    fn change_v6(&mut self, i: usize, new: &V6, up: bool) -> Vec<Event> {
+        let old = self.v6[i].clone();
+        let had = old.flags & PERMANENT != 0 && old.flags & NO_PREFIX_ROUTE == 0;
+        let address = &mut self.v6[i];
+        address.flags = address.flags & !V6_CHANGED | new.flags;
+        address.life.valid = new.life.valid;
+        address.life.preferred = new.life.preferred;
+        address.life.changed = new.life.changed;
+        address.proto = new.proto;
+        if new.priority != 0 {
+            address.priority = new.priority;
+        }
+        let changed = address.clone();
+        let mut events = vec![Event::NewAddr6(changed.clone(), false)];
+        if changed.flags & NO_PREFIX_ROUTE == 0 {
+            let found = had
+                .then(|| {
+                    self.routes6.iter().position(|r| {
+                        r.table == TABLE_MAIN
+                            && r.dst == changed.prefix_of()
+                            && r.len == changed.prefix
+                    })
+                })
+                .flatten();
+            match found {
+                Some(at) if self.routes6[at].metric != changed.metric() => {
+                    events.push(Event::DelRoute6(self.routes6.remove(at)));
+                    if up && let Some(route) = changed.prefix_route() {
+                        self.kernel_add6(route, &mut events);
+                    }
+                }
+                Some(at) => self.routes6[at].expires = changed.expires(),
+                None => {
+                    if up && let Some(route) = changed.prefix_route() {
+                        self.kernel_add6(route, &mut events);
+                    }
+                }
+            }
+        } else if had {
+            self.prefix_gone(&changed, changed.life.changed, &mut events);
+        }
+        events
+    }
+    /// What becomes of the prefix route of `gone`, which is going or no
+    /// longer asks for one (`check_cleanup_prefix_route`,
+    /// `cleanup_prefix_route`): kept where another address of its prefix
+    /// is permanent or has none; else, with others, it runs out when the
+    /// last of them does, if it did not already; with none, the first
+    /// route of the main table to it goes, whoever's.
+    fn prefix_gone(&mut self, gone: &V6, now: u64, events: &mut Vec<Event>) {
+        let mut others = self
+            .v6
+            .iter()
+            .filter(|a| {
+                a.address != gone.address && a.prefix == gone.prefix && a.covers(gone.address)
+            })
+            .peekable();
+        let mut expires = None;
+        if others.peek().is_some() {
+            let mut last = now;
+            for other in others {
+                if other.flags & (PERMANENT | NO_PREFIX_ROUTE) != 0 {
+                    return;
+                }
+                last = last.max(other.life.changed + u64::from(other.life.valid) * SECOND);
+            }
+            expires = Some(last);
+        }
+        let Some(at) = self.routes6.iter().position(|r| {
+            r.table == TABLE_MAIN && r.dst == gone.prefix_of() && r.len == gone.prefix
+        }) else {
+            return;
+        };
+        match expires {
+            None => events.push(Event::DelRoute6(self.routes6.remove(at))),
+            Some(expires) => {
+                let route = &mut self.routes6[at];
+                if route.expires.is_none() {
+                    route.expires = Some(expires);
+                }
+            }
+        }
     }
     fn insert_v6(&mut self, new: V6) {
         let at = self
@@ -680,35 +993,83 @@ impl Addresses {
             .unwrap_or(self.v6.len());
         self.v6.insert(at, new);
     }
-    /// Removes the IPv6 address `address/prefix` (`EADDRNOTAVAIL` for
-    /// none). What Linux tells: the address, its local route, then, if no
-    /// other address has its prefix, the first route of the main table to
-    /// it, whoever's (`cleanup_prefix_route`).
-    pub(crate) fn del_v6(&mut self, address: Ipv6Addr, prefix: u8) -> Result<Vec<Event>, Errno> {
+    /// Removes the IPv6 address `address/prefix` at `now` (`EADDRNOTAVAIL`
+    /// for none, [`Self::remove_v6`]).
+    pub(crate) fn del_v6(
+        &mut self,
+        address: Ipv6Addr,
+        prefix: u8,
+        now: u64,
+    ) -> Result<Vec<Event>, Errno> {
         let found = self
             .v6
             .iter()
             .position(|a| a.address == address && a.prefix == prefix)
             .ok_or(EADDRNOTAVAIL)?;
+        Ok(self.remove_v6(found, now))
+    }
+    /// Removes the IPv6 address at `found` (`ipv6_del_addr`). What Linux
+    /// tells: the address, its local route, then what becomes of its
+    /// prefix route ([`Self::prefix_gone`]), unless it had none.
+    fn remove_v6(&mut self, found: usize, now: u64) -> Vec<Event> {
         let gone = self.v6.remove(found);
         let mut events = vec![Event::DelAddr6(gone.clone())];
         self.kernel_del6(&gone.local_route(), &mut events);
-        if gone.flags & NO_PREFIX_ROUTE == 0
-            && !self
-                .v6
-                .iter()
-                .any(|a| a.prefix == gone.prefix && a.covers(gone.address))
-        {
-            let dst = Ipv6Addr::from(u128::from(gone.address) & mask6(gone.prefix));
-            if let Some(i) = self
-                .routes6
-                .iter()
-                .position(|r| r.table == TABLE_MAIN && r.dst == dst && r.len == gone.prefix)
-            {
-                events.push(Event::DelRoute6(self.routes6.remove(i)));
-            }
+        if gone.flags & NO_PREFIX_ROUTE == 0 {
+            self.prefix_gone(&gone, now, &mut events);
         }
-        Ok(events)
+        events
+    }
+    /// What has run out by `now`, as Linux's work finds it
+    /// (`check_lifetime`, then `addrconf_verify_rtnl`, then the IPv6 routes'
+    /// garbage collection, `fib6_run_gc`): an address past its valid
+    /// lifetime goes, as on a removal, and one past its preferred lifetime
+    /// is `IFA_F_DEPRECATED`, and told of; an IPv6 route past its own goes,
+    /// and is told of. A permanent IPv4 address never runs out, nor an IPv6
+    /// one whose preferred lifetime never ends.
+    pub(crate) fn expire(&mut self, now: u64) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut i = 0;
+        while i < self.v4.len() {
+            let a = &mut self.v4[i];
+            if a.flags & PERMANENT == 0 {
+                if a.life.reached(a.life.valid, now) {
+                    events.extend(self.remove_v4(i));
+                    i = 0;
+                    continue;
+                }
+                if a.life.reached(a.life.preferred, now) && a.flags & DEPRECATED == 0 {
+                    a.flags |= DEPRECATED;
+                    events.push(Event::NewAddr4(a.clone()));
+                }
+            }
+            i += 1;
+        }
+        let mut i = 0;
+        while i < self.v6.len() {
+            let a = &mut self.v6[i];
+            if !(a.flags & PERMANENT != 0 && a.life.preferred == FOREVER) {
+                if a.life.reached(a.life.valid, now) {
+                    events.extend(self.remove_v6(i, now));
+                    i = 0;
+                    continue;
+                }
+                if a.life.reached(a.life.preferred, now) && a.flags & DEPRECATED == 0 {
+                    a.flags |= DEPRECATED;
+                    events.push(Event::NewAddr6(a.clone(), false));
+                }
+            }
+            i += 1;
+        }
+        let expired: Vec<Route6> = self
+            .dump6()
+            .into_iter()
+            .filter(|r| r.expires.is_some_and(|at| at < now))
+            .collect();
+        for route in expired {
+            self.kernel_del6(&route, &mut events);
+        }
+        events
     }
     /// The primary address whose subnet `secondary` is in, or itself.
     fn primary_of(&self, address: &V4) -> Ipv4Addr {
@@ -744,7 +1105,10 @@ impl Addresses {
             return routes;
         }
         if address.flags & NO_PREFIX_ROUTE == 0 {
-            routes.push(route(prefix, address.prefix, Kind::Local));
+            routes.push(Route4 {
+                priority: address.priority,
+                ..route(prefix, address.prefix, Kind::Local)
+            });
         }
         if address.prefix < 31 {
             routes.push(route(
@@ -839,6 +1203,13 @@ impl Addresses {
             r.table == new.table && r.dst == new.dst && r.len == new.len && r.metric == new.metric
         }) {
             if asked(F_EXCL) || !asked(F_REPLACE) {
+                // The same route through the same device, which runs out,
+                // runs out as the new one does instead, if at all
+                // (`fib6_add_rt2node`).
+                let old = &mut self.routes6[i];
+                if !asked(F_EXCL) && old.expires.is_some() {
+                    old.expires = new.expires;
+                }
                 return Err(Errno::EEXIST);
             }
             self.routes6[i] = new;
@@ -868,14 +1239,21 @@ impl Addresses {
             events.push(Event::NewRoute4(route, flags));
         }
     }
-    /// Removes one of the kernel's IPv4 routes, whatever its metrics, as
-    /// `fib_magic` names none.
+    /// Removes the first of the IPv4 routes `route` names, as `fib_magic`
+    /// does: whatever their metrics and gateway, and their priority where
+    /// it names none (`fib_table_delete`, `fib_nh_match`).
     fn kernel_del4(&mut self, route: &Route4, events: &mut Vec<Event>) {
         let same = |r: &Route4| {
-            *r == Route4 {
-                metrics: r.metrics,
-                ..*route
-            }
+            r.table == route.table
+                && r.dst == route.dst
+                && r.len == route.len
+                && r.tos == route.tos
+                && r.kind == route.kind
+                && r.scope == route.scope
+                && r.prefsrc == route.prefsrc
+                && r.proto == route.proto
+                && r.device == route.device
+                && (route.priority == 0 || r.priority == route.priority)
         };
         if let Some(i) = self.routes4.iter().position(same) {
             events.push(Event::DelRoute4(self.routes4.remove(i)));
@@ -1128,6 +1506,7 @@ impl Addresses {
             proto: ask.proto,
             prefsrc: ask.prefsrc,
             metrics,
+            expires: None,
         };
         let flags = self.insert6(route, Some(ask.request))?;
         Ok(vec![Event::NewRoute6(route, flags)])
@@ -1485,13 +1864,27 @@ mod tests {
     fn changes_are_told_in_linux_order() {
         let mut a = Addresses::isolated();
         // Added while down: the address and its local route; IPv6's twice.
-        let added = a.add_v4(v4("10.5.5.5", 24), false, false).unwrap();
+        let added = a
+            .add_v4(
+                v4("10.5.5.5", 24),
+                crate::interface::Lifetimes::FOREVER,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
         assert_eq!(
             told(&added),
             ["+addr 10.5.5.5/24", "+route 255 10.5.5.5/32 Local 0x600"]
         );
         let added = a
-            .add_v6(V6::new("2001:db8::5".parse().unwrap(), 64), false, false)
+            .add_v6(
+                V6::new("2001:db8::5".parse().unwrap(), 64),
+                crate::interface::Lifetimes::FOREVER,
+                false,
+                false,
+                0,
+            )
             .unwrap();
         assert_eq!(
             told(&added),
@@ -1504,7 +1897,7 @@ mod tests {
         // Up: 127.0.0.1/8 and its routes, the routes the up brings the
         // other address, IPv6's prefix route, then ::1.
         assert_eq!(
-            told(&a.up()),
+            told(&a.up(0)),
             [
                 "+addr 127.0.0.1/8",
                 "+route 255 127.0.0.1/32 Local 0x600",
@@ -1518,7 +1911,13 @@ mod tests {
             ]
         );
         let added = a
-            .add_v6(V6::new("2001:db8:1::1".parse().unwrap(), 64), false, true)
+            .add_v6(
+                V6::new("2001:db8:1::1".parse().unwrap(), 64),
+                crate::interface::Lifetimes::FOREVER,
+                false,
+                true,
+                0,
+            )
             .unwrap();
         assert_eq!(
             told(&added)[0],
@@ -1526,7 +1925,14 @@ mod tests {
         );
         // A primary goes after its secondary: each address, then its
         // routes, the prefix route first and the local one last.
-        a.add_v4(v4("10.5.5.9", 24), false, true).unwrap();
+        a.add_v4(
+            v4("10.5.5.9", 24),
+            crate::interface::Lifetimes::FOREVER,
+            false,
+            true,
+            0,
+        )
+        .unwrap();
         let gone = a
             .del_v4(Some("10.5.5.5".parse().unwrap()), None, 24, None)
             .unwrap();
@@ -1563,23 +1969,56 @@ mod tests {
         // Every address binds before there is a local table.
         assert!(a.bindable4("10.9.9.9".parse().unwrap()));
         // Added while down: its local route alone.
-        a.add_v4(v4("10.1.2.3", 24), false, false).unwrap();
-        a.add_v6(V6::new("2001:db8::5".parse().unwrap(), 64), false, false)
-            .unwrap();
+        a.add_v4(
+            v4("10.1.2.3", 24),
+            crate::interface::Lifetimes::FOREVER,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        a.add_v6(
+            V6::new("2001:db8::5".parse().unwrap(), 64),
+            crate::interface::Lifetimes::FOREVER,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
         assert_eq!(
             a.dump4().iter().map(short4).collect::<Vec<_>>(),
             ["255 10.1.2.3/32 Local"]
         );
         assert!(!a.bindable4("10.9.9.9".parse().unwrap()));
         assert_eq!(a.dump6().len(), 1);
-        a.up();
+        a.up(0);
         // 127.0.0.1/8, of host scope, goes first; a secondary goes last.
-        a.add_v4(v4("10.1.2.9", 24), false, true).unwrap();
+        a.add_v4(
+            v4("10.1.2.9", 24),
+            crate::interface::Lifetimes::FOREVER,
+            false,
+            true,
+            0,
+        )
+        .unwrap();
         assert_eq!(
-            a.add_v4(v4("10.1.2.3", 24), false, true),
+            a.add_v4(
+                v4("10.1.2.3", 24),
+                crate::interface::Lifetimes::FOREVER,
+                false,
+                true,
+                0
+            ),
             Err(Errno::EEXIST)
         );
-        a.add_v4(v4("10.1.2.3", 16), false, true).unwrap();
+        a.add_v4(
+            v4("10.1.2.3", 16),
+            crate::interface::Lifetimes::FOREVER,
+            false,
+            true,
+            0,
+        )
+        .unwrap();
         let order: Vec<_> =
             a.v4.iter()
                 .map(|a| (a.local.to_string(), a.prefix, a.flags))
@@ -1616,8 +2055,14 @@ mod tests {
         );
         // IPv6: global first, newest first; the prefix route in the main
         // table, before the local ones.
-        a.add_v6(V6::new("2001:db8:1::1".parse().unwrap(), 128), false, true)
-            .unwrap();
+        a.add_v6(
+            V6::new("2001:db8:1::1".parse().unwrap(), 128),
+            crate::interface::Lifetimes::FOREVER,
+            false,
+            true,
+            0,
+        )
+        .unwrap();
         let order: Vec<_> = a.v6.iter().map(|a| a.address.to_string()).collect();
         assert_eq!(order, ["2001:db8:1::1", "2001:db8::5", "::1"]);
         assert_eq!(
@@ -1641,7 +2086,7 @@ mod tests {
         a.down();
         assert!(a.v6.is_empty());
         assert_eq!(a.dump4().len(), 6);
-        a.up();
+        a.up(0);
         assert_eq!(a.v6.len(), 1);
         // A primary takes its secondary; 127.0.0.1 comes back with the next
         // up.
@@ -1659,7 +2104,7 @@ mod tests {
         );
         a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();
         assert!(!a.bindable4(Ipv4Addr::LOCALHOST));
-        a.up();
+        a.up(0);
         assert!(a.bindable4(Ipv4Addr::LOCALHOST));
     }
 
@@ -1672,7 +2117,7 @@ mod tests {
             a.add_route4(&ask4("10.9.0.0", 16, 1, 0x600), false),
             Err(ENETDOWN)
         );
-        a.up();
+        a.up(0);
         // The same prefix: prepended, replaced, appended.
         let mut ask = ask4("10.9.0.0", 16, 1, 0x600);
         assert_eq!(
@@ -1770,7 +2215,7 @@ mod tests {
             ]
         );
         // IPv6: by metric within a prefix, the walk's order across them.
-        a.up();
+        a.up(0);
         let ask6 = |dst: &str, len, metric| Ask6 {
             table: TABLE_MAIN,
             dst: dst.parse().unwrap(),
@@ -1806,6 +2251,228 @@ mod tests {
         assert_eq!(
             (via.metric, a.source6(&via, ip)),
             (5, Some(Ipv6Addr::LOCALHOST))
+        );
+    }
+    fn v6(s: &str, prefix: u8) -> V6 {
+        V6::new(s.parse().unwrap(), prefix)
+    }
+    fn life(valid: u32, preferred: u32) -> Lifetimes {
+        Lifetimes { valid, preferred }
+    }
+
+    #[test]
+    fn addresses_deprecate_then_go_as_their_lifetimes_run_out() {
+        let start = 10 * SECOND;
+        let mut a = Addresses::first();
+        a.add_v4(v4("10.9.0.1", 24), life(3, 1), false, true, start)
+            .unwrap();
+        a.add_v6(v6("2001:db8:9::1", 64), life(5, 2), false, true, start)
+            .unwrap();
+        let four = a.v4.iter().find(|x| x.prefix == 24).unwrap().clone();
+        assert_eq!(four.flags & (PERMANENT | DEPRECATED), 0);
+        assert_eq!((four.life.created, four.life.changed), (start, start));
+        assert_eq!(four.left(start), (1, 3));
+        assert_eq!(four.left(start + 3 * SECOND / 2), (0, 2));
+        let six = a.v6.iter().find(|x| x.prefix == 64).unwrap().clone();
+        assert_eq!(six.left(start + 4 * SECOND), (0, 1));
+        let prefix = a.dump6().into_iter().find(|r| r.len == 64).unwrap();
+        // Through a loopback, it does not run out by itself.
+        assert_eq!(prefix.expires, None);
+        // Nothing yet; then, a little sooner than its second, IPv4's is
+        // deprecated, once.
+        assert!(a.expire(start + SECOND / 2).is_empty());
+        let soon = start + SECOND - FUZZ;
+        assert_eq!(told(&a.expire(soon)), ["+addr 10.9.0.1/24"]);
+        assert!(a.v4.iter().any(|x| x.flags & DEPRECATED != 0));
+        assert!(a.expire(soon).is_empty());
+        assert_eq!(
+            told(&a.expire(start + 2 * SECOND)),
+            ["+addr 2001:db8:9::1/64 false"]
+        );
+        assert_eq!(
+            told(&a.expire(start + 3 * SECOND)),
+            [
+                "-addr 10.9.0.1/24",
+                "-route 255 10.9.0.0/24 Local",
+                "-route 255 10.9.0.255/32 Broadcast",
+                "-route 255 10.9.0.1/32 Local",
+            ]
+        );
+        assert_eq!(
+            told(&a.expire(start + 5 * SECOND)),
+            [
+                "-addr 2001:db8:9::1/64",
+                "-route 255 2001:db8:9::1/128 Local 0",
+                "-route 254 2001:db8:9::/64 Unicast 256",
+            ]
+        );
+        // The kernel's own never run out.
+        assert!(a.expire(u64::MAX / 2).is_empty());
+        assert_eq!(a.v4.len(), 1);
+    }
+
+    #[test]
+    fn a_priority_is_the_prefix_routes_metric_and_a_replacement_changes_it() {
+        let mut a = Addresses::first();
+        let mut new = v4("10.1.0.1", 24);
+        new.priority = 50;
+        a.add_v4(new.clone(), Lifetimes::FOREVER, false, true, 0)
+            .unwrap();
+        let priority = |a: &Addresses| {
+            a.dump4()
+                .iter()
+                .filter(|r| r.dst == Ipv4Addr::new(10, 1, 0, 0))
+                .map(|r| r.priority)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(priority(&a), [50]);
+        // IPv4 takes the replacement's, none being 0, and its lifetimes,
+        // the new route first.
+        new.priority = 60;
+        let events = a
+            .add_v4(new.clone(), life(9, 5), true, true, SECOND)
+            .unwrap();
+        assert_eq!(
+            told(&events),
+            [
+                "+route 255 10.1.0.0/24 Local 0x600",
+                "-route 255 10.1.0.0/24 Local",
+                "+addr 10.1.0.1/24",
+            ]
+        );
+        assert_eq!(priority(&a), [60]);
+        let replaced = a.v4.iter().find(|x| x.prefix == 24).unwrap();
+        assert_eq!((replaced.left(SECOND), replaced.life.created), ((5, 9), 0));
+        new.priority = 0;
+        a.add_v4(new, Lifetimes::FOREVER, true, true, 2 * SECOND)
+            .unwrap();
+        assert_eq!(priority(&a), [0]);
+        assert!(a.v4.iter().all(|x| x.flags & PERMANENT != 0));
+        // IPv6 keeps its own when the replacement names none.
+        let mut six = v6("2001:db8:1::1", 64);
+        six.priority = 300;
+        a.add_v6(six.clone(), Lifetimes::FOREVER, false, true, 0)
+            .unwrap();
+        let metric = |a: &Addresses| {
+            a.dump6()
+                .iter()
+                .filter(|r| r.len == 64)
+                .map(|r| (r.metric, r.expires))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(metric(&a), [(300, None)]);
+        six.priority = 0;
+        let events = a
+            .add_v6(six.clone(), life(7, 7), true, true, SECOND)
+            .unwrap();
+        assert_eq!(told(&events), ["+addr 2001:db8:1::1/64 false"]);
+        assert_eq!(metric(&a), [(300, Some(8 * SECOND))]);
+        six.priority = 400;
+        let events = a
+            .add_v6(six.clone(), life(7, 7), true, true, SECOND)
+            .unwrap();
+        // It was not permanent, so its prefix route is made again, and
+        // the old one, of another metric, stays.
+        assert_eq!(
+            told(&events),
+            [
+                "+addr 2001:db8:1::1/64 false",
+                "+route 254 2001:db8:1::/64 Unicast 400 0x600",
+            ]
+        );
+        // Permanent, its route of the same metric runs out no more.
+        let events = a
+            .add_v6(six.clone(), Lifetimes::FOREVER, true, true, SECOND)
+            .unwrap();
+        assert_eq!(told(&events), ["+addr 2001:db8:1::1/64 false"]);
+        assert_eq!(metric(&a), [(300, Some(8 * SECOND)), (400, None)]);
+        // Of another metric again, permanent, it goes and comes again.
+        six.priority = 500;
+        let events = a
+            .add_v6(six, Lifetimes::FOREVER, true, true, SECOND)
+            .unwrap();
+        assert_eq!(
+            told(&events),
+            [
+                "+addr 2001:db8:1::1/64 false",
+                "-route 254 2001:db8:1::/64 Unicast 300",
+                "+route 254 2001:db8:1::/64 Unicast 500 0x600",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prefix_route_outlives_its_address_while_another_has_the_prefix() {
+        let mut a = Addresses::first();
+        a.add_v6(v6("2001:db8::1", 64), life(10, 10), false, true, 0)
+            .unwrap();
+        a.add_v6(v6("2001:db8::2", 64), life(30, 30), false, true, 0)
+            .unwrap();
+        let expires = |a: &Addresses| {
+            a.dump6()
+                .iter()
+                .filter(|r| r.len == 64)
+                .map(|r| r.expires)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(expires(&a), [None]);
+        // With the second gone, it runs out with the first.
+        let gone = a
+            .del_v6("2001:db8::2".parse().unwrap(), 64, SECOND)
+            .unwrap();
+        assert_eq!(
+            told(&gone),
+            ["-addr 2001:db8::2/64", "-route 255 2001:db8::2/128 Local 0"]
+        );
+        assert_eq!(expires(&a), [Some(10 * SECOND)]);
+        // A permanent one, whose route is the same, keeps it whatever runs
+        // out.
+        a.add_v6(v6("2001:db8::3", 64), Lifetimes::FOREVER, false, true, 0)
+            .unwrap();
+        assert_eq!(expires(&a), [None]);
+        let gone = a
+            .del_v6("2001:db8::1".parse().unwrap(), 64, SECOND)
+            .unwrap();
+        assert_eq!(told(&gone).len(), 2);
+        assert_eq!(expires(&a), [None]);
+        // An IPv6 route past its time goes, and is told of.
+        a.add_v6(v6("2001:db8:5::1", 64), life(10, 10), false, true, 0)
+            .unwrap();
+        a.add_v6(v6("2001:db8:5::2", 64), life(2, 2), false, true, 0)
+            .unwrap();
+        a.del_v6("2001:db8:5::1".parse().unwrap(), 64, 0).unwrap();
+        let events = a.expire(3 * SECOND);
+        assert_eq!(
+            told(&events),
+            [
+                "-addr 2001:db8:5::2/64",
+                "-route 255 2001:db8:5::2/128 Local 0",
+                "-route 254 2001:db8:5::/64 Unicast 256",
+            ]
+        );
+    }
+
+    #[test]
+    fn nodad_is_told_of_once_and_routes_of_lifetimes_go_by_themselves() {
+        let mut a = Addresses::first();
+        let mut quiet = v6("2001:db8:7::1", 64);
+        quiet.flags = NO_DAD;
+        let events = a.add_v6(quiet, Lifetimes::FOREVER, false, true, 0).unwrap();
+        assert_eq!(
+            told(&events),
+            [
+                "+route 254 2001:db8:7::/64 Unicast 256 0x600",
+                "+addr 2001:db8:7::1/64 false",
+                "+route 255 2001:db8:7::1/128 Local 0 0x600",
+            ]
+        );
+        let mut route = v6("2001:db8:8::1", 64).prefix_route().unwrap();
+        route.expires = Some(SECOND);
+        a.kernel_add6(route, &mut Vec::new());
+        assert!(a.expire(SECOND).is_empty());
+        assert_eq!(
+            told(&a.expire(SECOND + 1)),
+            ["-route 254 2001:db8:8::/64 Unicast 256"]
         );
     }
 }

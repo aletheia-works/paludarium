@@ -113,6 +113,8 @@ const NETLINK_DROP_MEMBERSHIP: u64 = 2;
 const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
 /// `IFA_F_TENTATIVE`, which an IPv6 address has when first told of.
 const IFA_F_TENTATIVE: u32 = 0x40;
+/// `IFA_F_MANAGETEMPADDR`.
+const IFA_F_MANAGETEMPADDR: u32 = 0x100;
 /// The multicast routing families, whose dumps find no route.
 const RTNL_FAMILY_IPMR: u8 = 128;
 const RTNL_FAMILY_IP6MR: u8 = 129;
@@ -621,6 +623,13 @@ impl NetlinkSocket {
     fn nonblocking(&self) -> bool {
         self.flags.load(Ordering::SeqCst) & NONBLOCK != 0
     }
+    /// The host's monotonic clock, which times the addresses' lifetimes,
+    /// or 0 without one.
+    fn clock(&self) -> u64 {
+        self.host
+            .clock(paludarium_host::ClockId::Monotonic)
+            .unwrap_or(0)
+    }
     /// The calling thread, as a sender: Linux's `netlink_ns_capable` wants
     /// the capability of both it and whoever opened the socket.
     fn sender(&self, c: &Context<'_>) -> Sender {
@@ -879,6 +888,25 @@ impl NetlinkSocket {
                 return;
             }
             let message = &bytes[..len];
+            if !matches!(self.protocol, NETLINK_GENERIC | NETLINK_SOCK_DIAG) {
+                // What has run out by now, which Linux's work would have
+                // found as it did, is told of first.
+                let now = self.clock();
+                let expired = told(
+                    self.network.addresses().expire(now),
+                    0,
+                    0,
+                    false,
+                    false,
+                    now,
+                );
+                for notice in &expired {
+                    if s.groups & (1u64 << (notice.group - 1)) != 0 {
+                        self.deliver(s, 0, notice.group, notice.bytes.clone());
+                    }
+                }
+                notices.extend(expired);
+            }
             let result = if header.flags & NLM_F_REQUEST == 0 || header.kind < NLMSG_MIN_TYPE {
                 Ok(false)
             } else {
@@ -929,6 +957,7 @@ impl NetlinkSocket {
         if header.kind > RTM_MAX {
             return Err(EOPNOTSUPP);
         }
+        let now = self.clock();
         let Some(&family) = payload.first() else {
             return Ok(false);
         };
@@ -959,12 +988,26 @@ impl NetlinkSocket {
                 // `mctp_dump_rtinfo`, which checks nothing.
                 (RTM_GETROUTE, AF_MCTP) => Ok(mctp_routes(network, seq, port)),
                 // `rtnl_dump_all` dumps each family's: IPv4's, then IPv6's.
-                (RTM_GETADDR, _) => {
-                    address_dump(network, payload, family, seq, port, strict, &mut answer)
-                }
-                (RTM_GETROUTE, _) => {
-                    route_dump(network, payload, family, seq, port, strict, &mut answer)
-                }
+                (RTM_GETADDR, _) => address_dump(
+                    network,
+                    payload,
+                    family,
+                    seq,
+                    port,
+                    strict,
+                    &mut answer,
+                    now,
+                ),
+                (RTM_GETROUTE, _) => route_dump(
+                    network,
+                    payload,
+                    family,
+                    seq,
+                    port,
+                    strict,
+                    &mut answer,
+                    now,
+                ),
                 _ => return Err(EOPNOTSUPP),
             };
             if s.done.is_some() {
@@ -992,20 +1035,20 @@ impl NetlinkSocket {
             // Only IPv6 answers a single address (`inet6_rtm_getaddr`);
             // IPv4 and MCTP have no `doit`, nor the `PF_UNSPEC` fallback.
             RTM_GETADDR if family == AF_INET6 => {
-                let reply = address_get(&self.network, payload, header.seq, port, s.strict)?;
+                let reply = address_get(&self.network, payload, header.seq, port, s.strict, now)?;
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
             RTM_GETROUTE if matches!(family, AF_INET | AF_INET6) => {
                 lookup_check(payload, s.strict)?;
-                let reply = lookup(&self.network, payload, header.seq, port, sender.uid)?;
+                let reply = lookup(&self.network, payload, header.seq, port, sender.uid, now)?;
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
             RTM_NEWADDR | RTM_DELADDR if matches!(family, AF_INET | AF_INET6) => {
-                let events = change_address(&self.network, header, payload)?;
+                let events = change_address(&self.network, header, payload, now)?;
                 let echo = header.flags & NLM_F_ECHO != 0;
-                let told = told(events, header.seq, port, echo, false);
+                let told = told(events, header.seq, port, echo, false, now);
                 if echo {
                     // `nlmsg_notify`'s own copy of an IPv4 address's.
                     for notice in told.iter().filter(|n| n.origin == port && port != 0) {
@@ -1038,7 +1081,7 @@ impl NetlinkSocket {
             RTM_NEWROUTE | RTM_DELROUTE if matches!(family, AF_INET | AF_INET6) => {
                 let events = change_route(&self.network, header, payload)?;
                 let echo = header.flags & NLM_F_ECHO != 0;
-                let told = told(events, header.seq, port, echo, true);
+                let told = told(events, header.seq, port, echo, true, now);
                 if echo {
                     for notice in told.iter().filter(|n| n.origin == port && port != 0) {
                         self.deliver(s, 0, 0, notice.bytes.clone());
@@ -1064,7 +1107,7 @@ impl NetlinkSocket {
                         (flags & change) | (link_flags(&self.network) & !change)
                     } & IFF_UP
                         != 0;
-                    notices.extend(link_change(&self.network, up));
+                    notices.extend(link_change(&self.network, up, now));
                 }
                 Ok(false)
             }
@@ -1855,6 +1898,10 @@ fn with_flags(mut messages: Vec<Vec<u8>>, flags: u16) -> Vec<Vec<u8>> {
 /// namespace has an ID); an index other than 0 shows that device's
 /// addresses alone, as `NLM_F_DUMP_FILTERED`, which `NLMSG_DONE` carries
 /// too, and is `ENODEV` for another than `lo`'s.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request's parts, and the time lifetimes are shown at"
+)]
 fn address_dump(
     network: &Network,
     payload: &[u8],
@@ -1863,6 +1910,7 @@ fn address_dump(
     port: u32,
     strict: bool,
     answer: &mut u16,
+    now: u64,
 ) -> Result<Vec<Vec<u8>>, Errno> {
     let mut flags = 0;
     if strict {
@@ -1889,10 +1937,10 @@ fn address_dump(
     }
     let mut messages = Vec::new();
     if family != AF_INET6 {
-        messages.extend(ipv4_message(network, seq, port));
+        messages.extend(ipv4_message(network, seq, port, now));
     }
     if family != AF_INET {
-        messages.extend(ipv6_message(network, seq, port));
+        messages.extend(ipv6_message(network, seq, port, now));
     }
     let mut messages = with_flags(messages, flags);
     // `rtnl_dump_all` goes on to MCTP's, which marks nothing.
@@ -1918,6 +1966,7 @@ fn address_get(
     seq: u32,
     port: u32,
     strict: bool,
+    now: u64,
 ) -> Result<Vec<u8>, Errno> {
     if payload.len() < 8 {
         return Err(Errno::EINVAL);
@@ -1949,7 +1998,7 @@ fn address_get(
         .iter()
         .find(|address| address.address == wanted)
         .ok_or(EADDRNOTAVAIL)?;
-    Ok(ipv6_address(address, false, RTM_NEWADDR, 0, seq, port))
+    Ok(ipv6_address(address, false, RTM_NEWADDR, 0, seq, port, now))
 }
 /// Strictly, an MCTP address dump (`mctp_dump_addrinfo`) needs a whole
 /// `ifaddrmsg` (`EINVAL`), and nothing else: its index only narrows it,
@@ -2278,6 +2327,10 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
 /// not made is `ENOENT` for a dump of that family alone (the multicast
 /// ones have only `RT_TABLE_DEFAULT` for IPv4 and `RT6_TABLE_DFLT`, 254,
 /// for IPv6), and shows nothing of it otherwise.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request's parts, and the time routes are shown at"
+)]
 fn route_dump(
     network: &Network,
     payload: &[u8],
@@ -2286,6 +2339,7 @@ fn route_dump(
     port: u32,
     strict: bool,
     answer: &mut u16,
+    now: u64,
 ) -> Result<Vec<Vec<u8>>, Errno> {
     let filter = route_filter(payload, strict, answer)?;
     let flags = NLM_F_MULTI
@@ -2342,7 +2396,7 @@ fn route_dump(
                     .dump6()
                     .iter()
                     .filter(|r| taken(r.table, r.kind.code(), r.proto, true))
-                    .map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, flags)),
+                    .map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, flags, now)),
             );
         }
     }
@@ -2644,29 +2698,35 @@ fn ext_mask(payload: &[u8]) -> u32 {
         .and_then(|(_, value)| value.first_chunk().copied())
         .map_or(0, u32::from_le_bytes)
 }
-/// `struct ifa_cacheinfo`: forever preferred and valid. The times it was
-/// made and changed are given as 0.
-fn cacheinfo() -> [u8; 16] {
+/// `struct ifa_cacheinfo` of an address of `life` (`put_cacheinfo`): the
+/// lifetimes it has left, then when it was made and its lifetimes set, in
+/// hundredths of a second since boot.
+fn cacheinfo(life: &crate::interface::Life, (preferred, valid): (u32, u32)) -> [u8; 16] {
+    let hundredths = |at: u64| (at / 10_000_000) as u32;
     let mut raw = [0; 16];
-    raw[..8].copy_from_slice(&[0xff; 8]);
+    raw[..4].copy_from_slice(&preferred.to_le_bytes());
+    raw[4..8].copy_from_slice(&valid.to_le_bytes());
+    raw[8..12].copy_from_slice(&hundredths(life.created).to_le_bytes());
+    raw[12..].copy_from_slice(&hundredths(life.changed).to_le_bytes());
     raw
 }
 /// `RTM_NEWADDR` for each IPv4 address of `lo`, in its order, as
 /// `inet_fill_ifaddr` gives them.
-fn ipv4_message(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
+fn ipv4_message(network: &Network, seq: u32, port: u32, now: u64) -> Vec<Vec<u8>> {
     let addresses = network.addresses().v4.clone();
     addresses
         .iter()
-        .map(|address| ipv4_address(address, RTM_NEWADDR, NLM_F_MULTI, seq, port))
+        .map(|address| ipv4_address(address, RTM_NEWADDR, NLM_F_MULTI, seq, port, now))
         .collect()
 }
-/// An IPv4 address's message of `kind`, with `flags`.
+/// An IPv4 address's message of `kind`, with `flags`, at `now`.
 fn ipv4_address(
     address: &crate::interface::V4,
     kind: u16,
     flags: u16,
     seq: u32,
     port: u32,
+    now: u64,
 ) -> Vec<u8> {
     {
         let mut body = vec![AF_INET, address.prefix, address.flags as u8, address.scope];
@@ -2689,20 +2749,28 @@ fn ipv4_address(
             attribute(&mut body, IFA_PROTO, &[address.proto]);
         }
         attribute(&mut body, IFA_FLAGS, &address.flags.to_le_bytes());
-        attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
+        if address.priority != 0 {
+            attribute(&mut body, IFA_RT_PRIORITY, &address.priority.to_le_bytes());
+        }
+        attribute(
+            &mut body,
+            IFA_CACHEINFO,
+            &cacheinfo(&address.life, address.left(now)),
+        );
         message(kind, flags, seq, port, &body)
     }
 }
 /// `RTM_NEWADDR` for each IPv6 address of `lo`, in its order, as
 /// `inet6_fill_ifaddr` gives them.
-fn ipv6_message(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
+fn ipv6_message(network: &Network, seq: u32, port: u32, now: u64) -> Vec<Vec<u8>> {
     let addresses = network.addresses().v6.clone();
     addresses
         .iter()
-        .map(|address| ipv6_address(address, false, RTM_NEWADDR, NLM_F_MULTI, seq, port))
+        .map(|address| ipv6_address(address, false, RTM_NEWADDR, NLM_F_MULTI, seq, port, now))
         .collect()
 }
-/// An IPv6 address's message of `kind`, with `flags`, `tentative` or not.
+/// An IPv6 address's message of `kind`, with `flags`, `tentative` or not,
+/// at `now`.
 fn ipv6_address(
     address: &crate::interface::V6,
     tentative: bool,
@@ -2710,6 +2778,7 @@ fn ipv6_address(
     flags: u16,
     seq: u32,
     port: u32,
+    now: u64,
 ) -> Vec<u8> {
     {
         let address_flags = address.flags | if tentative { IFA_F_TENTATIVE } else { 0 };
@@ -2721,7 +2790,14 @@ fn ipv6_address(
         ];
         body.extend_from_slice(&1u32.to_le_bytes());
         attribute(&mut body, IFA_ADDRESS, &address.address.octets());
-        attribute(&mut body, IFA_CACHEINFO, &cacheinfo());
+        if address.priority != 0 {
+            attribute(&mut body, IFA_RT_PRIORITY, &address.priority.to_le_bytes());
+        }
+        attribute(
+            &mut body,
+            IFA_CACHEINFO,
+            &cacheinfo(&address.life, address.left(now)),
+        );
         attribute(&mut body, IFA_FLAGS, &address_flags.to_le_bytes());
         if address.proto != 0 {
             attribute(&mut body, IFA_PROTO, &[address.proto]);
@@ -2729,23 +2805,33 @@ fn ipv6_address(
         message(kind, flags, seq, port, &body)
     }
 }
-/// `RTM_NEWADDR` or `RTM_DELADDR` for `lo`, as `inet_rtm_newaddr`,
-/// `inet_rtm_deladdr`, `inet6_rtm_newaddr` and `inet6_rtm_deladdr` take
-/// them: `EINVAL` for a message shorter than an `ifaddrmsg`; then the
-/// family's policy (`ifa_ipv4_policy`, `ifa_ipv6_policy`, which has no
-/// label or broadcast address); `EINVAL` for an IPv4 prefix past 32 or an IPv6 one past 128, an IPv4 address without
-/// `IFA_LOCAL` to add or an IPv6 one without `IFA_LOCAL` or `IFA_ADDRESS`;
-/// `ENODEV` for another interface than index 1. An address added again is
-/// `EEXIST`, unless `NLM_F_REPLACE` without `NLM_F_EXCL`, and one to
-/// remove that `lo` has not `EADDRNOTAVAIL`. `IFA_LABEL`, `IFA_BROADCAST`,
-/// `IFA_FLAGS` (of which `IFA_F_NOPREFIXROUTE` takes effect) and
-/// `IFA_PROTO` are kept; lifetimes (`IFA_CACHEINFO`) and `IFA_RT_PRIORITY`
-/// are not, and every address is permanent.
+/// `RTM_NEWADDR` or `RTM_DELADDR` for `lo` at `now`, as
+/// `inet_rtm_newaddr`, `inet_rtm_deladdr`, `inet6_rtm_newaddr` and
+/// `inet6_rtm_deladdr` take them: `EINVAL` for a message shorter than an
+/// `ifaddrmsg`; then the family's policy (`ifa_ipv4_policy`,
+/// `ifa_ipv6_policy`, which has no label or broadcast address). To add an
+/// IPv4 address, `EINVAL` for a prefix past 32, no `IFA_LOCAL` or lifetimes
+/// (`IFA_CACHEINFO`) with no valid one or a preferred one longer, and an
+/// `IFA_LOCAL` of `0.0.0.0` is taken without effect; to add an IPv6 one,
+/// `EINVAL` for neither `IFA_LOCAL` nor `IFA_ADDRESS` and such lifetimes,
+/// then `ENODEV` for another interface than index 1, then, for a new one,
+/// `EINVAL` for a prefix past 128, or `IFA_F_MANAGETEMPADDR` but on a
+/// prefix of 64. To remove one, `EINVAL` for an IPv4 prefix past 32 or an
+/// IPv6 one past 128, then `ENODEV`. An address added again is `EEXIST`,
+/// unless `NLM_F_REPLACE` without `NLM_F_EXCL`, which changes it
+/// ([`crate::interface::Addresses::add_v4`], `add_v6`), and one to remove
+/// that `lo` has not `EADDRNOTAVAIL`. `IFA_LABEL`, `IFA_BROADCAST`,
+/// `IFA_FLAGS` (of which `IFA_F_NOPREFIXROUTE` and, for IPv6,
+/// `IFA_F_NODAD` take effect; IPv6 keeps only those a request may set,
+/// [`crate::interface::V6_ASKED`]), `IFA_PROTO`, `IFA_RT_PRIORITY`, the
+/// metric of its prefix route, and the lifetimes are kept.
 fn change_address(
     network: &Network,
     header: &Header,
     payload: &[u8],
+    now: u64,
 ) -> Result<Vec<crate::interface::Event>, Errno> {
+    use crate::interface::Lifetimes;
     use core::net::{Ipv4Addr, Ipv6Addr};
     if payload.len() < 8 {
         return Err(Errno::EINVAL);
@@ -2758,6 +2844,8 @@ fn change_address(
     let mut label = None;
     let mut flags = u32::from(header_flags);
     let mut proto = 0;
+    let mut priority = 0;
+    let mut lifetimes = None;
     let v4 = family == AF_INET;
     let policy = if v4 { &IFA4_POLICY } else { &IFA6_POLICY };
     // The policy has made each as long as it reads; IPv6 has no label or
@@ -2773,12 +2861,29 @@ fn change_address(
             }
             IFA_FLAGS => flags = u32_value(value)?,
             IFA_PROTO => proto = value.first().copied().unwrap_or_default(),
+            IFA_RT_PRIORITY => priority = u32_value(value)?,
+            // `struct ifa_cacheinfo`: the preferred lifetime, then the
+            // valid one.
+            IFA_CACHEINFO => {
+                let word = |at: usize| {
+                    value
+                        .get(at..at + 4)
+                        .and_then(|w| w.first_chunk::<4>())
+                        .map_or(0, |w| u32::from_le_bytes(*w))
+                };
+                lifetimes = Some(Lifetimes {
+                    preferred: word(0),
+                    valid: word(4),
+                });
+            }
             _ => {}
         }
     }
     let add = header.kind == RTM_NEWADDR;
     let replace = header.flags & NLM_F_REPLACE != 0 && header.flags & NLM_F_EXCL == 0;
     let up = network.is_up();
+    let bad_lifetimes = lifetimes.is_some_and(|l| l.valid == 0 || l.preferred > l.valid);
+    let lifetimes = lifetimes.unwrap_or(Lifetimes::FOREVER);
     if family == AF_INET {
         let v4 = |value: Option<&[u8]>| -> Result<Option<Ipv4Addr>, Errno> {
             value
@@ -2790,8 +2895,11 @@ fn change_address(
                 .transpose()
         };
         let (local, address) = (v4(local)?, v4(address)?);
-        if add && (prefix > 32 || local.is_none()) {
+        if add && (prefix > 32 || local.is_none() || bad_lifetimes) {
             return Err(Errno::EINVAL);
+        }
+        if add && local.is_some_and(|l| l.is_unspecified()) {
+            return Ok(Vec::new());
         }
         if index != 1 {
             return Err(ENODEV);
@@ -2806,10 +2914,11 @@ fn change_address(
         new.broadcast = broadcast.map(Ipv4Addr::from);
         new.flags = flags;
         new.proto = proto;
+        new.priority = priority;
         if let Some(label) = label {
             new.label = label;
         }
-        return network.addresses().add_v4(new, replace, up);
+        return network.addresses().add_v4(new, lifetimes, replace, up, now);
     }
     let ip = local
         .or(address)
@@ -2820,19 +2929,41 @@ fn change_address(
         })
         .transpose()?
         .ok_or(Errno::EINVAL)?;
-    if prefix > 128 {
+    if !add {
+        if prefix > 128 {
+            return Err(Errno::EINVAL);
+        }
+        if index != 1 {
+            return Err(ENODEV);
+        }
+        return network.addresses().del_v6(ip, prefix, now);
+    }
+    if bad_lifetimes {
         return Err(Errno::EINVAL);
     }
     if index != 1 {
         return Err(ENODEV);
     }
-    if !add {
-        return network.addresses().del_v6(ip, prefix);
+    let flags = flags & crate::interface::V6_ASKED;
+    let mut addresses = network.addresses();
+    let exists = addresses
+        .v6
+        .iter()
+        .find(|a| a.address == ip)
+        .map(|a| a.prefix);
+    // `inet6_addr_add` checks the request's prefix, `inet6_addr_modify`
+    // the address's.
+    let checked = exists.unwrap_or(prefix);
+    if (exists.is_none() && prefix > 128)
+        || (flags & IFA_F_MANAGETEMPADDR != 0 && checked != 64 && (exists.is_none() || replace))
+    {
+        return Err(Errno::EINVAL);
     }
     let mut new = crate::interface::V6::new(ip, prefix);
     new.flags = flags;
     new.proto = proto;
-    network.addresses().add_v6(new, replace, up)
+    new.priority = priority;
+    addresses.add_v6(new, lifetimes, replace, up, now)
 }
 /// A table as an `rtmsg` holds it: one past 255 is `RT_TABLE_COMPAT`.
 fn table_byte(table: u32) -> u8 {
@@ -2886,14 +3017,16 @@ fn ipv4_route_of(
     }
     message(kind, flags, seq, port, &body)
 }
-/// An IPv6 route as `rt6_fill_node` gives it (with an empty
-/// `rta_cacheinfo`), as a message of `kind` with `flags`.
+/// An IPv6 route as `rt6_fill_node` gives it at `now`, as a message of
+/// `kind` with `flags`: its `rta_cacheinfo` has only the time it has left,
+/// if it runs out ([`route_expires`]).
 fn ipv6_route_of(
     kind: u16,
     route: &crate::interface::Route6,
     seq: u32,
     port: u32,
     flags: u16,
+    now: u64,
 ) -> Vec<u8> {
     let mut body = vec![
         AF_INET6,
@@ -2916,9 +3049,25 @@ fn ipv6_route_of(
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
-    attribute(&mut body, RTA_CACHEINFO, &[0; RTA_CACHEINFO_LEN]);
+    let mut cache = [0; RTA_CACHEINFO_LEN];
+    cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
+    attribute(&mut body, RTA_CACHEINFO, &cache);
     attribute(&mut body, RTA_PREF, &[0]);
     message(kind, flags, seq, port, &body)
+}
+/// The `rta_expires` of a route that runs out at `expires`, at `now`, as
+/// `rtnl_put_cacheinfo` gives it: in hundredths of a second, negative once
+/// past, at most `INT_MAX`; 0 for none.
+fn route_expires(expires: Option<u64>, now: u64) -> i32 {
+    let Some(at) = expires else {
+        return 0;
+    };
+    let hundredths = |ns: u64| i32::try_from(ns / 10_000_000).unwrap_or(i32::MAX);
+    if at >= now {
+        hundredths(at - now)
+    } else {
+        -hundredths(now - at)
+    }
 }
 /// A route lookup (`RTM_GETROUTE` without a dump), as `inet_rtm_getroute`
 /// and `inet6_rtm_getroute` answer one for the destination `RTA_DST` names
@@ -2966,6 +3115,7 @@ fn lookup(
     seq: u32,
     port: u32,
     uid: u32,
+    now: u64,
 ) -> Result<Vec<u8>, Errno> {
     use crate::interface::{Kind, NO_METRICS, SCOPE_HOST, SCOPE_LINK, SCOPE_UNIVERSE};
     use crate::interface::{TABLE_LOCAL, TABLE_MAIN};
@@ -3033,7 +3183,7 @@ fn lookup(
         }
         let route = addresses.lookup6(ip)?;
         if fib_match {
-            return Ok(ipv6_route_of(RTM_NEWROUTE, &route, seq, port, 0));
+            return Ok(ipv6_route_of(RTM_NEWROUTE, &route, seq, port, 0, now));
         }
         // `rt6_fill_node` of the route the lookup made, with the request's
         // source, and the source it leaves from, then the route's own
@@ -3488,6 +3638,7 @@ fn told(
     port: u32,
     echo: bool,
     routes: bool,
+    now: u64,
 ) -> Vec<Notice> {
     use crate::interface::Event;
     let origin = if echo { port } else { 0 };
@@ -3503,12 +3654,12 @@ fn told(
                 Event::NewAddr4(a) => (
                     RTNLGRP_IPV4_IFADDR,
                     origin,
-                    ipv4_address(&a, RTM_NEWADDR, 0, seq, port),
+                    ipv4_address(&a, RTM_NEWADDR, 0, seq, port, now),
                 ),
                 Event::DelAddr4(a) => (
                     RTNLGRP_IPV4_IFADDR,
                     origin,
-                    ipv4_address(&a, RTM_DELADDR, 0, seq, port),
+                    ipv4_address(&a, RTM_DELADDR, 0, seq, port, now),
                 ),
                 Event::NewRoute4(r, flags) => (
                     RTNLGRP_IPV4_ROUTE,
@@ -3523,22 +3674,22 @@ fn told(
                 Event::NewAddr6(a, tentative) => (
                     RTNLGRP_IPV6_IFADDR,
                     0,
-                    ipv6_address(&a, tentative, RTM_NEWADDR, 0, 0, 0),
+                    ipv6_address(&a, tentative, RTM_NEWADDR, 0, 0, 0, now),
                 ),
                 Event::DelAddr6(a) => (
                     RTNLGRP_IPV6_IFADDR,
                     0,
-                    ipv6_address(&a, false, RTM_DELADDR, 0, 0, 0),
+                    ipv6_address(&a, false, RTM_DELADDR, 0, 0, 0, now),
                 ),
                 Event::NewRoute6(r, flags) => (
                     RTNLGRP_IPV6_ROUTE,
                     route_origin,
-                    ipv6_route_of(RTM_NEWROUTE, &r, route_seq, route_port, flags),
+                    ipv6_route_of(RTM_NEWROUTE, &r, route_seq, route_port, flags, now),
                 ),
                 Event::DelRoute6(r) => (
                     RTNLGRP_IPV6_ROUTE,
                     route_origin,
-                    ipv6_route_of(RTM_DELROUTE, &r, route_seq, route_port, 0),
+                    ipv6_route_of(RTM_DELROUTE, &r, route_seq, route_port, 0, now),
                 ),
             };
             Notice {
@@ -3555,8 +3706,8 @@ fn told(
 /// coming up, last, IPv6's own `RTM_NEWLINK` for `RTNLGRP_IPV6_IFINFO`, as
 /// `addrconf_notify` sends it at the end of `NETDEV_UP`
 /// (`inet6_ifinfo_notify`). Going down tells IPv6's group nothing.
-fn link_change(network: &Network, up: bool) -> Vec<Notice> {
-    let Some(events) = network.set_up(up) else {
+fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
+    let Some(events) = network.set_up(up, now) else {
         return Vec::new();
     };
     let mut link = link_message(network, 0, 0, 0, 0);
@@ -3566,7 +3717,7 @@ fn link_change(network: &Network, up: bool) -> Vec<Notice> {
         origin: 0,
         bytes: link,
     }];
-    notices.extend(told(events, 0, 0, false, false));
+    notices.extend(told(events, 0, 0, false, false, now));
     if up {
         notices.push(Notice {
             group: RTNLGRP_IPV6_IFINFO,
@@ -3577,9 +3728,9 @@ fn link_change(network: &Network, up: bool) -> Vec<Notice> {
     notices
 }
 /// Brings `network`'s loopback up or down, as `SIOCSIFFLAGS` does, and
-/// tells netlink's members of it.
-pub(crate) fn set_up(network: &Network, up: bool) {
-    let notices = link_change(network, up);
+/// tells netlink's members of it, at `now`.
+pub(crate) fn set_up(network: &Network, up: bool, now: u64) {
+    let notices = link_change(network, up, now);
     notify(network, notices, None);
 }
 /// Sends each notification to the namespace's sockets that are members of
@@ -3922,12 +4073,12 @@ mod tests {
     use super::*;
     /// A route dump of `family`'s routes alone, unchecked, to port 7.
     fn routes(network: &Network, family: u8, seq: u32) -> Vec<Vec<u8>> {
-        route_dump(network, &[family], family, seq, 7, false, &mut 0).unwrap()
+        route_dump(network, &[family], family, seq, 7, false, &mut 0, 0).unwrap()
     }
     #[test]
     fn inet_routes_keep_check_and_show_their_metrics() {
         let network = Network::isolated(crate::users::first());
-        network.set_up(true);
+        network.set_up(true, 0);
         let request = |kind: u16, flags: u16, dst: &[u8], len: u8, metrics: Option<&[u8]>| {
             let family = if dst.len() == 4 { AF_INET } else { AF_INET6 };
             let mut payload = vec![family, len, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
@@ -3990,14 +4141,14 @@ mod tests {
         // them; a lookup's answer has them too.
         let mut lookup_request = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         attribute(&mut lookup_request, RTA_DST, &[10, 8, 1, 1]);
-        let answer = lookup(&network, &lookup_request, 1, 7, u32::MAX).unwrap();
+        let answer = lookup(&network, &lookup_request, 1, 7, u32::MAX, 0).unwrap();
         assert!(attributes(&answer[28..]).contains(&(RTA_METRICS, &held[..])));
         // A lookup of the limited broadcast address drops them, as
         // `__mkroute_output` drops the route's `fib_info`.
         assert!(request(RTM_NEWROUTE, 0x600, &[0; 4], 0, Some(&held)).is_ok());
         let mut broadcast = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         attribute(&mut broadcast, RTA_DST, &[255; 4]);
-        let answer = lookup(&network, &broadcast, 1, 7, u32::MAX).unwrap();
+        let answer = lookup(&network, &broadcast, 1, 7, u32::MAX, 0).unwrap();
         assert!(
             !attributes(&answer[28..])
                 .iter()
@@ -4005,20 +4156,20 @@ mod tests {
         );
         let mut elsewhere = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         attribute(&mut elsewhere, RTA_DST, &[192, 0, 2, 1]);
-        let answer = lookup(&network, &elsewhere, 1, 7, u32::MAX).unwrap();
+        let answer = lookup(&network, &elsewhere, 1, 7, u32::MAX, 0).unwrap();
         assert!(attributes(&answer[28..]).contains(&(RTA_METRICS, &held[..])));
         // So does one of a multicast address through the default route,
         // but not through a multicast route of its own.
         let mut group = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         attribute(&mut group, RTA_DST, &[224, 0, 0, 1]);
-        let answer = lookup(&network, &group, 1, 7, u32::MAX).unwrap();
+        let answer = lookup(&network, &group, 1, 7, u32::MAX, 0).unwrap();
         assert!(
             !attributes(&answer[28..])
                 .iter()
                 .any(|&(k, _)| k == RTA_METRICS)
         );
         assert!(request(RTM_NEWROUTE, 0x600, &[224, 0, 0, 0], 4, Some(&held)).is_ok());
-        let answer = lookup(&network, &group, 1, 7, u32::MAX).unwrap();
+        let answer = lookup(&network, &group, 1, 7, u32::MAX, 0).unwrap();
         assert!(attributes(&answer[28..]).contains(&(RTA_METRICS, &held[..])));
         // A request that names other metrics adds another route; the same
         // again is EEXIST.
@@ -4099,7 +4250,7 @@ mod tests {
     #[test]
     fn route_lookups_take_their_source_device_and_tos() {
         let network = Network::isolated(crate::users::first());
-        network.set_up(true);
+        network.set_up(true, 0);
         let add = |dst: [u8; 4], tos: u8, kind: u8| {
             let device = kind == 1;
             let scope = if device { 253 } else { 0 };
@@ -4129,7 +4280,7 @@ mod tests {
             for &(kind, value) in attrs {
                 attribute(&mut payload, kind, value);
             }
-            lookup(&network, &payload, 1, 7, 0).map(|answer| {
+            lookup(&network, &payload, 1, 7, 0, 0).map(|answer| {
                 let found: Vec<(u16, Vec<u8>)> = attributes(&answer[28..])
                     .into_iter()
                     .map(|(k, v)| (k, v.to_vec()))
@@ -4225,10 +4376,10 @@ mod tests {
         assert_eq!(get(AF_INET, 0, 0, &[(RTA_IIF, &[2, 0, 0, 0])]), Err(ENODEV));
         assert_eq!(get(AF_INET, 0, 0, &[(RTA_IIF, &one)]), Err(EOPNOTSUPP));
         // Down, a device is ENETUNREACH.
-        network.set_up(false);
+        network.set_up(false, 0);
         assert_eq!(through([127, 0, 0, 1], 0, 1), Err(ENETUNREACH));
         assert!(get(AF_INET, 0, 0, &[(RTA_DST, &[127, 0, 0, 1])]).is_ok());
-        network.set_up(true);
+        network.set_up(true, 0);
         // IPv6: the source as RTA_SRC, as it is; another device is
         // ENETUNREACH without a source, or to ::1 with one; ICMP is
         // ICMPv6's.
@@ -4324,8 +4475,8 @@ mod tests {
     fn messages_take_linux_layouts() {
         let network = Network::isolated(crate::users::first());
         // Down, a new namespace's loopback has no address.
-        assert!(ipv4_message(&network, 1, 7).is_empty());
-        assert!(ipv6_message(&network, 1, 7).is_empty());
+        assert!(ipv4_message(&network, 1, 7, 0).is_empty());
+        assert!(ipv6_message(&network, 1, 7, 0).is_empty());
         let link = link_message(&network, 1, 7, NLM_F_MULTI, 0);
         assert_eq!(link.len() % 4, 0);
         let header = Header::read(&link);
@@ -4372,10 +4523,10 @@ mod tests {
             [1, 5, 2, 7, 8]
         );
         // Up, it has both; down again, it keeps 127.0.0.1 alone.
-        network.set_up(true);
-        let v4 = ipv4_message(&network, 2, 7).concat();
+        network.set_up(true, 0);
+        let v4 = ipv4_message(&network, 2, 7, 0).concat();
         assert_eq!(&v4[16..24], &[2, 8, 0x80, 254, 1, 0, 0, 0]);
-        let v6 = ipv6_message(&network, 2, 7).concat();
+        let v6 = ipv6_message(&network, 2, 7, 0).concat();
         assert_eq!(&v6[16..24], &[10, 128, 0x80, 254, 1, 0, 0, 0]);
         assert_eq!(
             attributes(&v6[24..])[0],
@@ -4384,15 +4535,15 @@ mod tests {
                 &[0; 15].iter().chain(&[1]).copied().collect::<Vec<u8>>()[..]
             )
         );
-        network.set_up(false);
-        assert!(!ipv4_message(&network, 3, 7).is_empty());
-        assert!(ipv6_message(&network, 3, 7).is_empty());
+        network.set_up(false, 0);
+        assert!(!ipv4_message(&network, 3, 7, 0).is_empty());
+        assert!(ipv6_message(&network, 3, 7, 0).is_empty());
     }
 
     #[test]
     fn coming_up_tells_ipv6s_link_information_last() {
         let network = Network::isolated(crate::users::first());
-        let up = link_change(&network, true);
+        let up = link_change(&network, true, 0);
         assert_eq!(up[0].group, RTNLGRP_LINK);
         let last = up.last().unwrap();
         assert_eq!((last.group, last.origin), (RTNLGRP_IPV6_IFINFO, 0));
@@ -4406,9 +4557,9 @@ mod tests {
             1
         );
         // Going down, or up again, tells IPv6's group nothing.
-        let down = link_change(&network, false);
+        let down = link_change(&network, false, 0);
         assert!(!down.iter().any(|n| n.group == RTNLGRP_IPV6_IFINFO));
-        assert!(link_change(&network, false).is_empty());
+        assert!(link_change(&network, false, 0).is_empty());
     }
 
     #[test]
@@ -4441,7 +4592,7 @@ mod tests {
             [1, 5, 2, 3, 6, 7, 8]
         );
         assert_eq!(found[4].1, inet6_settings(false, true));
-        network.set_up(true);
+        network.set_up(true, 0);
         let link = inet6_link_message(&network, 4, 7, NLM_F_MULTI);
         let found = attributes(&link[32..]);
         assert_eq!(found[3].1, [IF_OPER_UNKNOWN]);
@@ -4513,7 +4664,7 @@ mod tests {
         assert!(routes(&network, AF_INET6, 1).is_empty());
         // Up: local 127.0.0.0/8, local 127.0.0.1 and the broadcast route,
         // then local ::1, each in the local table.
-        network.set_up(true);
+        network.set_up(true, 0);
         let v4 = routes(&network, AF_INET, 2).concat();
         let mut rest = &v4[..];
         let mut seen = Vec::new();
@@ -4571,7 +4722,7 @@ mod tests {
             ]
         );
         // Down: the two local routes stay, as Linux keeps them.
-        network.set_up(false);
+        network.set_up(false, 0);
         assert_eq!(routes(&network, AF_INET, 3).concat().len(), 2 * 60);
         assert!(routes(&network, AF_INET6, 3).is_empty());
     }
@@ -4811,7 +4962,7 @@ mod tests {
     #[test]
     fn strict_link_dumps_take_only_their_filters() {
         let network = Network::isolated(crate::users::first());
-        network.set_up(true);
+        network.set_up(true, 0);
         let dump = |payload: &[u8], strict| link_dump(&network, payload, 1, 7, strict);
         let skip = RTEXT_FILTER_SKIP_STATS.to_le_bytes();
         let plain = dump(&ifinfo(0, 0, &[]), true).unwrap();
@@ -4886,13 +5037,13 @@ mod tests {
     #[test]
     fn strict_address_dumps_narrow_to_an_index() {
         let network = Network::isolated(crate::users::first());
-        network.set_up(true);
+        network.set_up(true, 0);
         let mut answer = 0;
-        let all = address_dump(&network, &[0; 8], 0, 1, 7, true, &mut answer).unwrap();
+        let all = address_dump(&network, &[0; 8], 0, 1, 7, true, &mut answer, 0).unwrap();
         assert_eq!((all.len(), answer), (2, 0));
         let mut by_index = vec![AF_INET6, 0, 0, 0];
         by_index.extend_from_slice(&1u32.to_le_bytes());
-        let lo = address_dump(&network, &by_index, AF_INET6, 1, 7, true, &mut answer).unwrap();
+        let lo = address_dump(&network, &by_index, AF_INET6, 1, 7, true, &mut answer, 0).unwrap();
         assert_eq!(lo.len(), 1);
         assert_eq!(
             Header::read(&lo[0]).flags,
@@ -4902,16 +5053,16 @@ mod tests {
         // Another index is ENODEV, after the filter is marked.
         by_index[4] = 2;
         answer = 0;
-        let other = address_dump(&network, &by_index, 0, 1, 7, true, &mut answer);
+        let other = address_dump(&network, &by_index, 0, 1, 7, true, &mut answer, 0);
         assert_eq!((other, answer), (Err(ENODEV), NLM_F_DUMP_FILTERED));
         // Unchecked, the index changes nothing.
         answer = 0;
-        let loose = address_dump(&network, &by_index, 0, 1, 7, false, &mut answer).unwrap();
+        let loose = address_dump(&network, &by_index, 0, 1, 7, false, &mut answer, 0).unwrap();
         assert_eq!((loose, answer), (all, 0));
         let mut label = vec![0; 8];
         attribute(&mut label, IFA_LABEL, b"lo\0");
         for bad in [&[0][..], &[0, 8, 0, 0, 0, 0, 0, 0], &label] {
-            let found = address_dump(&network, bad, 0, 1, 7, true, &mut 0);
+            let found = address_dump(&network, bad, 0, 1, 7, true, &mut 0, 0);
             assert_eq!(found, Err(Errno::EINVAL));
         }
     }
@@ -4919,7 +5070,7 @@ mod tests {
     #[test]
     fn an_ipv6_address_is_got_by_itself() {
         let network = Network::isolated(crate::users::first());
-        network.set_up(true);
+        network.set_up(true, 0);
         let one = core::net::Ipv6Addr::LOCALHOST.octets();
         let request = |index: u32, attributes: &[(u16, &[u8])]| {
             let mut payload = vec![AF_INET6, 0, 0, 0];
@@ -4930,7 +5081,7 @@ mod tests {
             payload
         };
         // The dump's message, but for its flags; any index finds it.
-        let dumped = ipv6_message(&network, 3, 7).remove(0);
+        let dumped = ipv6_message(&network, 3, 7, 0).remove(0);
         for (index, strict) in [(0, true), (1, true), (9, true), (9, false)] {
             let got = address_get(
                 &network,
@@ -4938,6 +5089,7 @@ mod tests {
                 3,
                 7,
                 strict,
+                0,
             );
             let got = got.unwrap();
             assert_eq!(Header::read(&got).flags, 0);
@@ -4946,10 +5098,10 @@ mod tests {
         // IFA_LOCAL is the address, before IFA_ADDRESS.
         let other = core::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).octets();
         let local = request(0, &[(IFA_ADDRESS, &other), (IFA_LOCAL, &one)]);
-        assert!(address_get(&network, &local, 3, 7, true).is_ok());
+        assert!(address_get(&network, &local, 3, 7, true, 0).is_ok());
         let missing = request(0, &[(IFA_ADDRESS, &one), (IFA_LOCAL, &other)]);
         assert_eq!(
-            address_get(&network, &missing, 3, 7, true),
+            address_get(&network, &missing, 3, 7, true, 0),
             Err(EADDRNOTAVAIL)
         );
         // With neither, a short header or another namespace: EINVAL;
@@ -4963,10 +5115,13 @@ mod tests {
         );
         for strict in [true, false] {
             for bad in [&request(0, &[])[..], &[AF_INET6, 0, 0, 0], &netnsid] {
-                assert_eq!(address_get(&network, bad, 3, 7, strict), Err(Errno::EINVAL));
+                assert_eq!(
+                    address_get(&network, bad, 3, 7, strict, 0),
+                    Err(Errno::EINVAL)
+                );
             }
             let short = request(0, &[(IFA_ADDRESS, &one[..4])]);
-            assert_eq!(address_get(&network, &short, 3, 7, strict), Err(ERANGE));
+            assert_eq!(address_get(&network, &short, 3, 7, strict, 0), Err(ERANGE));
         }
         // Strictly, a prefix length, flags, a scope or another attribute is
         // EINVAL; unchecked, they are taken.
@@ -4974,8 +5129,11 @@ mod tests {
         prefixed[1] = 128;
         let flagged = request(0, &[(IFA_ADDRESS, &one), (IFA_FLAGS, &0u32.to_le_bytes())]);
         for loose in [&prefixed, &flagged] {
-            assert_eq!(address_get(&network, loose, 3, 7, true), Err(Errno::EINVAL));
-            assert!(address_get(&network, loose, 3, 7, false).is_ok());
+            assert_eq!(
+                address_get(&network, loose, 3, 7, true, 0),
+                Err(Errno::EINVAL)
+            );
+            assert!(address_get(&network, loose, 3, 7, false, 0).is_ok());
         }
     }
 
@@ -4985,6 +5143,129 @@ mod tests {
         assert_eq!(group_mask(1), 1);
         assert_eq!(group_mask(32), 1 << 31);
         assert_eq!(group_mask(RTNLGRP_MCTP_IFADDR), 0);
+    }
+
+    #[test]
+    fn addresses_take_lifetimes_and_a_priority_and_show_them() {
+        use crate::interface::FOREVER;
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true, 0);
+        let second = 1_000_000_000;
+        let request = |family: u8,
+                       flags: u16,
+                       prefix: u8,
+                       index: u32,
+                       attributes: &[(u16, &[u8])],
+                       now: u64| {
+            let mut payload = vec![family, prefix, 0, 0];
+            payload.extend_from_slice(&index.to_le_bytes());
+            for &(kind, value) in attributes {
+                attribute(&mut payload, kind, value);
+            }
+            let header = Header {
+                len: 0,
+                kind: RTM_NEWADDR,
+                flags,
+                seq: 3,
+            };
+            change_address(&network, &header, &payload, now)
+        };
+        let life = |preferred: u32, valid: u32| {
+            let mut raw = [0; 16];
+            raw[..4].copy_from_slice(&preferred.to_le_bytes());
+            raw[4..8].copy_from_slice(&valid.to_le_bytes());
+            raw
+        };
+        let ten = [10, 9, 0, 1];
+        let six: [u8; 16] = "2001:db8:9::1"
+            .parse::<core::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        // No valid lifetime, or a preferred one longer, is refused before
+        // the device; IPv6's prefix after it.
+        for (family, address, index, prefix, cache) in [
+            (AF_INET, &ten[..], 1, 24, life(0, 0)),
+            (AF_INET, &ten, 7, 24, life(20, 10)),
+            (AF_INET, &ten, 1, 24, life(FOREVER, 10)),
+            (AF_INET6, &six, 7, 64, life(20, 10)),
+            (AF_INET6, &six, 1, 129, life(1, 1)),
+        ] {
+            let asked = [(IFA_LOCAL, address), (IFA_CACHEINFO, &cache[..])];
+            assert_eq!(
+                request(family, 0, prefix, index, &asked, 0),
+                Err(Errno::EINVAL)
+            );
+        }
+        assert_eq!(
+            request(AF_INET6, 0, 129, 7, &[(IFA_LOCAL, &six)], 0),
+            Err(ENODEV)
+        );
+        // A /48 may not manage temporary addresses.
+        let manage = 0x100u32.to_le_bytes();
+        assert_eq!(
+            request(
+                AF_INET6,
+                0,
+                48,
+                1,
+                &[(IFA_LOCAL, &six), (IFA_FLAGS, &manage)],
+                0
+            ),
+            Err(Errno::EINVAL)
+        );
+        // 0.0.0.0 is taken, and adds nothing.
+        assert_eq!(
+            request(AF_INET, 0, 24, 1, &[(IFA_LOCAL, &[0; 4])], 0),
+            Ok(Vec::new())
+        );
+        let cache = life(500, 1000);
+        let priority = 50u32.to_le_bytes();
+        let asked4 = [
+            (IFA_LOCAL, &ten[..]),
+            (IFA_CACHEINFO, &cache[..]),
+            (IFA_RT_PRIORITY, &priority[..]),
+        ];
+        assert!(request(AF_INET, 0, 24, 1, &asked4, 3 * second).is_ok());
+        // IPv6 keeps only the flags a request may set.
+        let asked = (0x01u32 | 0x40 | 0x02).to_le_bytes();
+        assert!(
+            request(
+                AF_INET6,
+                0,
+                64,
+                1,
+                &[(IFA_LOCAL, &six), (IFA_FLAGS, &asked)],
+                0
+            )
+            .is_ok()
+        );
+        let dumped = ipv4_message(&network, 1, 7, 5 * second + second / 2);
+        let found = |message: &[u8], kind: u16| {
+            attributes(&message[24..])
+                .into_iter()
+                .find(|&(k, _)| k == kind)
+                .map(|(_, v)| v.to_vec())
+        };
+        let ours = dumped.iter().find(|m| m[17] == 24).unwrap();
+        assert_eq!(found(ours, IFA_RT_PRIORITY), Some(priority.to_vec()));
+        assert_eq!(found(ours, IFA_FLAGS), Some(0u32.to_le_bytes().to_vec()));
+        // Two seconds on: their lifetimes left, made and set at 3 s, in
+        // hundredths.
+        let mut shown = life(498, 998).to_vec();
+        shown[8..12].copy_from_slice(&300u32.to_le_bytes());
+        shown[12..].copy_from_slice(&300u32.to_le_bytes());
+        assert_eq!(found(ours, IFA_CACHEINFO), Some(shown));
+        let v6 = ipv6_message(&network, 1, 7, 0);
+        let nodad = v6.iter().find(|m| m[17] == 64).unwrap();
+        assert_eq!(
+            found(nodad, IFA_FLAGS),
+            Some((0x80u32 | 0x02).to_le_bytes().to_vec())
+        );
+        assert_eq!(found(nodad, IFA_RT_PRIORITY), None);
+        // An IPv6 route that runs out tells how long it has, in hundredths.
+        assert_eq!(route_expires(None, 5), 0);
+        assert_eq!(route_expires(Some(3 * second), second), 200);
+        assert_eq!(route_expires(Some(second), 3 * second + 5_000_000), -200);
     }
 
     #[test]
@@ -5065,10 +5346,10 @@ mod tests {
             ]
         );
         // rtnl_dump_all's dumps end with MCTP's; a family's own do not.
-        network.set_up(true);
-        let all = address_dump(&network, &[0], 0, 4, 7, false, &mut 0).unwrap();
+        network.set_up(true, 0);
+        let all = address_dump(&network, &[0], 0, 4, 7, false, &mut 0, 0).unwrap();
         assert_eq!(all[all.len() - 3..], dumped[..]);
-        let four = address_dump(&network, &[AF_INET], AF_INET, 4, 7, false, &mut 0).unwrap();
+        let four = address_dump(&network, &[AF_INET], AF_INET, 4, 7, false, &mut 0, 0).unwrap();
         assert!(!four.iter().any(|m| m[16] == AF_MCTP));
         let all = routes(&network, 0, 4);
         assert_eq!(all.iter().filter(|m| m[16] == AF_MCTP).count(), 3);
@@ -5379,9 +5660,9 @@ mod tests {
     #[test]
     fn strict_route_dumps_narrow_by_table_protocol_type_and_device() {
         let network = Network::isolated(crate::users::first());
-        network.set_up(true);
+        network.set_up(true, 0);
         let dump = |payload: &[u8], family, answer: &mut u16| {
-            route_dump(&network, payload, family, 1, 7, true, answer)
+            route_dump(&network, payload, family, 1, 7, true, answer, 0)
         };
         let mut answer = 0;
         let all = dump(&rtmsg(0, 0, 0, 0, 0), 0, &mut answer).unwrap();
@@ -5429,7 +5710,7 @@ mod tests {
         }
         let prefix = rtmsg(0, 0, 0, 0, RTM_F_PREFIX);
         assert_eq!(
-            route_dump(&network, &prefix, 0, 1, 7, false, &mut 0),
+            route_dump(&network, &prefix, 0, 1, 7, false, &mut 0, 0),
             Ok(Vec::new())
         );
         // An unknown device is ENODEV; the rest is EINVAL.

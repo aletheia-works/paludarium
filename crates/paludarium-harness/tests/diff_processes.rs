@@ -129,7 +129,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // addresses, monitor, routes, route-dump, route-metrics, route-selectors, link-attributes, generic-netlink, sock-diag, inet-diag and msg cases, whose checks depend on
+            // addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, link-attributes, generic-netlink, sock-diag, inet-diag and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts), the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
@@ -180,6 +180,7 @@ mod linux {
                     | "route-dump"
                     | "route-metrics"
                     | "route-selectors"
+                    | "address-lifetimes"
                     | "netlink-strict"
                     | "link-attributes"
                     | "generic-netlink"
@@ -322,6 +323,7 @@ mod linux {
         processes_route_dump => ("route-dump","process"),
         processes_route_metrics => ("route-metrics","process"),
         processes_route_selectors => ("route-selectors","process"),
+        processes_address_lifetimes => ("address-lifetimes","process"),
         processes_netlink_strict => ("netlink-strict","process"),
         processes_link_attributes => ("link-attributes","process"),
         processes_generic_netlink => ("generic-netlink","process"),

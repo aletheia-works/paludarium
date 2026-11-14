@@ -1531,10 +1531,31 @@ kernel.
     `RTM_NEWADDR` adds one, as `inet_rtm_newaddr` and `inet6_rtm_newaddr`
     do: `EEXIST` for one `lo` has, unless `NLM_F_REPLACE` without
     `NLM_F_EXCL`; `EINVAL` for an IPv4 one without `IFA_LOCAL` or a prefix
-    past 32 (128 for IPv6), an IPv6 one without `IFA_LOCAL` or
-    `IFA_ADDRESS`, or a message shorter than an `ifaddrmsg`; `ENODEV` for
-    another interface. `IFA_LABEL`, `IFA_BROADCAST`, `IFA_FLAGS` (with
-    `IFA_F_NOPREFIXROUTE`) and `IFA_PROTO` are kept. `RTM_DELADDR` removes
+    past 32, an IPv6 one without `IFA_LOCAL` or `IFA_ADDRESS`, lifetimes
+    with no valid one or a preferred one longer, or a message shorter than
+    an `ifaddrmsg`; `ENODEV` for another interface; then, for a new IPv6
+    one, `EINVAL` for a prefix past 128, or `IFA_F_MANAGETEMPADDR` but on
+    a prefix of 64. An `IFA_LOCAL` of `0.0.0.0` is taken without effect.
+    `IFA_LABEL`, `IFA_BROADCAST`, `IFA_FLAGS` (with `IFA_F_NOPREFIXROUTE`,
+    and for IPv6 `IFA_F_NODAD`, which tells of the address once; IPv6 keeps
+    only the flags a request may set), `IFA_PROTO`, `IFA_RT_PRIORITY`, the
+    metric of the address's prefix route, and the lifetimes of
+    `IFA_CACHEINFO` are kept. An address with a valid lifetime is not
+    `IFA_F_PERMANENT`, one with a preferred lifetime of 0 is
+    `IFA_F_DEPRECATED`, and `IFA_CACHEINFO` tells what each has left and
+    when the address was made and its lifetimes set. As Linux's checks do,
+    an address becomes deprecated when its preferred lifetime ends, and
+    goes with its routes when its valid one does. An IPv6 prefix route does
+    not run out by itself, as on Linux, whose routes through a loopback
+    lose `RTF_EXPIRES` as they are made (`fib6_is_reject`); it takes a
+    lifetime (`rta_expires`) when a change gives its permanent address one
+    (`modify_prefix_route`), or when an address of its prefix goes while
+    the others have lifetimes, and goes when that runs out. With
+    `NLM_F_REPLACE` an address
+    `lo` has changes, and is told of: IPv4's takes the request's priority
+    (none is 0), protocol and lifetimes, IPv6's its flags, protocol and
+    lifetimes, and its priority where the request names one, as
+    `inet6_addr_modify` does; its prefix route follows. `RTM_DELADDR` removes
     the first that has the `IFA_LOCAL`, `IFA_LABEL` and `IFA_ADDRESS` and
     prefix it names (`EADDRNOTAVAIL` for none), a primary with its
     secondaries; `127.0.0.1` and `::1` may go too. An `RTM_GETADDR` that
@@ -1583,10 +1604,11 @@ kernel.
     kernel's, as `fib_add_ifaddr` and `addrconf` make them: an IPv4 address
     has a `local` route in the local table from the start and, once `lo` is
     up, its prefix route (`local` too on a loopback, which stays when it
-    goes down), its subnet's `broadcast` route and that of an
-    `IFA_BROADCAST`; an IPv6 address has a `local` route in the local table
-    and, from the first time `lo` is up with it, a unicast prefix route in
-    the main table, metric 256, but for `::1`. `RTM_NEWROUTE` adds a route
+    goes down, of its priority), its subnet's `broadcast` route and that of
+    an `IFA_BROADCAST`; an IPv6 address has a `local` route in the local
+    table and, from the first time `lo` is up with it (for one added while
+    down, if it is permanent), a unicast prefix route in the main table, of
+    its priority or else metric 256, but for `::1`. `RTM_NEWROUTE` adds a route
     through `lo` or of a kind without a device (`blackhole`, `unreachable`,
     `prohibit`, `throw`) to any table, with its metric, protocol, scope,
     TOS, preferred source and an IPv4 gateway (on link too), as

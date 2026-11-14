@@ -1319,6 +1319,16 @@ static void nl_route_attribute(unsigned short type, const unsigned char *v, int 
         memcpy(metric, v, 4);
         memcpy(&value, v + 4, 4);
         printf("=%u:%u:%u", metric[0], metric[1], value);
+    } else if (type == 12 && len == 32 && v[8] | v[9] | v[10] | v[11]) {
+        /* An rta_cacheinfo with rta_expires, in hundredths of a second: up
+           to which hundred seconds, as how long a run takes changes the
+           rest, or past. */
+        int expires;
+        memcpy(&expires, v + 8, 4);
+        if (expires > 0)
+            printf("=expires:<=%ds", (expires + 9999) / 10000 * 100);
+        else
+            printf("=expired");
     } else if (type == 8 && len > 8) {
         /* Metrics: each type, then its u32 or its string. */
         printf("=");
@@ -1344,6 +1354,9 @@ static void nl_route_attribute(unsigned short type, const unsigned char *v, int 
         printf(":%d", len);
     }
 }
+/* Whether nl_address_attribute tells whether an address's lifetimes were
+   set after it was made, which only the address-lifetimes case asks. */
+static int nl_stamps;
 static void nl_address_attribute(unsigned short type, const unsigned char *v, int len) {
     char text[64] = "";
     unsigned value = 0;
@@ -1359,9 +1372,13 @@ static void nl_address_attribute(unsigned short type, const unsigned char *v, in
     } else if (type == 11) {
         printf("=%u", v[0]);
     } else if (type == 6 && len == 16) {
-        unsigned lifetimes[2];
-        memcpy(lifetimes, v, 8);
+        unsigned lifetimes[4];
+        memcpy(lifetimes, v, 16);
         printf("=%#x,%#x", lifetimes[0], lifetimes[1]);
+        /* Whether its lifetimes were set after it was made. */
+        if (nl_stamps) printf(",%s", lifetimes[3] > lifetimes[2] ? "later" : "same");
+    } else if (type == 9 && len == 4) {
+        printf("=%u", value);
     } else if ((type == 1 || type == 2) && len == 1) {
         /* An MCTP endpoint ID. */
         printf("=%u", v[0]);
@@ -1530,6 +1547,50 @@ static void nl_addr(int fd, unsigned port, unsigned short type, unsigned short f
         at += 4 + len;
     }
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, request, at), port, label);
+}
+/* The address-lifetimes case: adds the address `text` of `family` and
+   `prefix` on interface `index` (RTM_NEWADDR) with `flags`, its IFA_LOCAL
+   and, where given, its preferred and valid lifetimes (IFA_CACHEINFO), its
+   IFA_RT_PRIORITY (none for 0) and its IFA_FLAGS (none for -1), and prints
+   the answer. */
+static void nl_addr_life(int fd, unsigned port, unsigned short flags, int family, const char *text, int prefix,
+                         int index, const unsigned *life, unsigned priority, long ifa_flags, const char *label) {
+    unsigned char request[8 + 20 + 20 + 8 + 8] = {family, prefix};
+    memcpy(request + 4, &index, 4);
+    int len = family == AF_INET ? 4 : 16, at = 8;
+    unsigned short attribute[2] = {4 + len, 2};
+    memcpy(request + at, attribute, 4);
+    inet_pton(family, text, request + at + 4);
+    at += 4 + len;
+    if (life) {
+        unsigned short cache[2] = {20, 6};
+        unsigned info[4] = {life[0], life[1], 0, 0};
+        memcpy(request + at, cache, 4);
+        memcpy(request + at + 4, info, 16);
+        at += 20;
+    }
+    const struct {
+        unsigned short kind;
+        long value;
+    } numbers[] = {{9, priority ? (long)priority : -1}, {8, ifa_flags}};
+    for (size_t i = 0; i < sizeof numbers / sizeof numbers[0]; i++) {
+        if (numbers[i].value < 0) continue;
+        unsigned short number[2] = {8, numbers[i].kind};
+        unsigned value = (unsigned)numbers[i].value;
+        memcpy(request + at, number, 4);
+        memcpy(request + at + 4, &value, 4);
+        at += 8;
+    }
+    nl_answer(fd, nl_send(fd, 20, NL_F_REQUEST | NL_F_ACK | flags, request, at), port, label);
+}
+/* Sleeps until `seconds` past `start` on the monotonic clock. */
+static void sleep_until(const struct timespec *start, double seconds) {
+    struct timespec until = *start;
+    long nanoseconds = (long)((seconds - (long)seconds) * 1e9);
+    until.tv_sec += (long)seconds + (until.tv_nsec + nanoseconds) / 1000000000;
+    until.tv_nsec = (until.tv_nsec + nanoseconds) % 1000000000;
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL) == EINTR) {
+    }
 }
 /* The routes case: a route request's `rtmsg` and attributes. `table` goes
    in the `rtmsg` up to 255 and in RTA_TABLE past it; `oif` and `metric` are
@@ -13345,6 +13406,120 @@ int main(int argc, char **argv) {
             printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 1, 0, 0, "down oif lo");
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 0, 0, 0, "down");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "address-lifetimes")) {
+        /* A child makes a network namespace with lo up and adds addresses
+           with lifetimes (IFA_CACHEINFO) and a priority for their prefix
+           routes (IFA_RT_PRIORITY), as `ip address add ... valid_lft ...
+           preferred_lft ... metric ...` sends them: what dumps and
+           notifications show of them, those it refuses, replacing them, and
+           how they run out. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            nl_stamps = 1;
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            /* IPv4's and IPv6's addresses and routes. */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x550};
+            printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
+            unsigned char everything[8] = {0};
+            const unsigned short dump = 0x300, add = 0x600, replace = 0x500;
+            /* How addresses run out, IPv4's two seconds apart from IPv6's,
+               as Linux checks each family's on its own: one becomes
+               deprecated when its preferred lifetime ends, and goes with its
+               routes when its valid one does. A request a second after each
+               finds them as they are, and its notifications are read before
+               the next. */
+            struct timespec start;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            const unsigned life4[2] = {1, 5}, life6[2] = {3, 7};
+            nl_addr_life(ctl, port, add, AF_INET, "10.9.0.1", 24, 1, life4, 0, -1, "short4");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:9::1", 64, 1, life6, 0, -1, "short6");
+            static const double checks[] = {1.5, 3.5, 5.5, 7.5};
+            for (size_t i = 0; i < sizeof checks / sizeof checks[0]; i++) {
+                sleep_until(&start, checks[i]);
+                char label[32];
+                snprintf(label, sizeof label, "at %.1fs", checks[i]);
+                nl_answer(ctl, nl_send(ctl, 22, NL_F_REQUEST | dump, everything, 8), port, label);
+                monitor_show(mon, port, label);
+            }
+            /* Lifetimes: both, deprecated at once, and a valid one with a
+               preferred one that never ends, which is longer, so refused. */
+            const unsigned both[2] = {500, 1000}, deprecated[2] = {0, 1000}, valid[2] = {0xffffffff, 1000};
+            const unsigned forever[2] = {0xffffffff, 0xffffffff};
+            nl_addr_life(ctl, port, add, AF_INET, "10.2.0.1", 24, 1, both, 0, -1, "both4");
+            nl_addr_life(ctl, port, add, AF_INET, "10.3.0.1", 24, 1, deprecated, 0, -1, "deprecated4");
+            nl_addr_life(ctl, port, add, AF_INET, "10.4.0.1", 24, 1, valid, 0, -1, "valid4");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:2::1", 64, 1, both, 0, -1, "both6");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:3::1", 64, 1, deprecated, 0, -1, "deprecated6");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:4::1", 64, 1, valid, 0, -1, "valid6");
+            nl_answer(ctl, nl_send(ctl, 22, NL_F_REQUEST | dump, everything, 8), port, "lifetimes");
+            monitor_show(mon, port, "lifetimes");
+            /* A priority for the prefix route. */
+            nl_addr_life(ctl, port, add, AF_INET, "10.1.0.1", 24, 1, NULL, 50, -1, "priority4");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:1::1", 64, 1, NULL, 300, -1, "priority6");
+            monitor_show(mon, port, "priority");
+            /* Refused: no valid lifetime, a preferred one longer, before the
+               device is looked for; IPv6's prefix after it. */
+            const unsigned none[2] = {0, 0}, longer[2] = {20, 10};
+            /* A device no namespace has: Linux may have fallback tunnels of
+               small indices in every one. */
+            const int none_index = 1000000;
+            nl_addr_life(ctl, port, add, AF_INET, "10.5.0.1", 24, 1, none, 0, -1, "none4");
+            nl_addr_life(ctl, port, add, AF_INET, "10.5.0.1", 24, 1, longer, 0, -1, "longer4");
+            nl_addr_life(ctl, port, add, AF_INET, "10.5.0.1", 24, none_index, longer, 0, -1, "longer4 other index");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 64, 1, none, 0, -1, "none6");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 64, 1, longer, 0, -1, "longer6");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 64, none_index, longer, 0, -1, "longer6 other index");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 129, none_index, NULL, 0, -1, "prefix 129 other index");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 129, 1, NULL, 0, -1, "prefix 129");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 48, 1, NULL, 0, 0x100, "mngtmpaddr 48");
+            /* 0.0.0.0 is taken, and adds nothing. */
+            nl_addr_life(ctl, port, add, AF_INET, "0.0.0.0", 24, 1, NULL, 0, -1, "zero4");
+            /* IPv6 keeps only the flags a request may set; IFA_F_NODAD
+               tells of the address once. */
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:6::1", 64, 1, NULL, 0, 0x01 | 0x40, "flags6");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:7::1", 64, 1, NULL, 0, 0x02, "nodad6");
+            monitor_show(mon, port, "refused");
+            /* Replaced: IPv4 takes the new priority, none being 0, and its
+               lifetimes; IPv6 keeps its priority when none is named, and a
+               prefix route of the same metric takes the new lifetime. */
+            nl_addr_life(ctl, port, replace, AF_INET, "10.1.0.1", 24, 1, both, 60, -1, "replace4 60");
+            monitor_show(mon, port, "replace4 60");
+            nl_addr_life(ctl, port, replace, AF_INET, "10.1.0.1", 24, 1, NULL, 0, -1, "replace4 none");
+            monitor_show(mon, port, "replace4 none");
+            nl_addr_life(ctl, port, add, AF_INET, "10.1.0.1", 24, 1, NULL, 0, -1, "add4 again");
+            nl_addr_life(ctl, port, replace, AF_INET6, "2001:db8:1::1", 64, 1, NULL, 400, -1, "replace6 400");
+            monitor_show(mon, port, "replace6 400");
+            /* A prefix route through lo does not run out by itself, but
+               when an address of its prefix goes, it runs out with the
+               others. */
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:a::1", 64, 1, both, 0, -1, "shared one");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:a::2", 64, 1, both, 0, -1, "shared two");
+            nl_addr(ctl, port, 21, 0, AF_INET6, "2001:db8:a::2", 64, 0, 1, "shared del");
+            monitor_show(mon, port, "shared");
+            nl_addr_life(ctl, port, replace, AF_INET6, "2001:db8:2::1", 128, 1, forever, 0, -1, "replace6 forever");
+            monitor_show(mon, port, "replace6 forever");
+            nl_addr_life(ctl, port, replace, AF_INET6, "2001:db8:4::1", 64, 1, NULL, 0, 0x200, "replace6 noprefixroute");
+            monitor_show(mon, port, "replace6 noprefixroute");
+            nl_answer(ctl, nl_send(ctl, 22, NL_F_REQUEST | dump, everything, 8), port, "addresses");
+            unsigned char routes[12] = {AF_INET6};
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | dump, routes, 12), port, "routes6");
+            routes[0] = AF_INET;
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | dump, routes, 12), port, "routes4");
             fflush(stdout);
             _exit(0);
         }

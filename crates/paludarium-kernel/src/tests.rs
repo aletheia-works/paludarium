@@ -7958,6 +7958,10 @@ mod admin {
         assert_eq!(f.ret(175, &[BUF, 63, 0]), errno(Errno(8)));
         assert_eq!(f.ret(175, &[BUF, 64, 0]), eperm);
         assert_eq!(f.ret(175, &[0x4000_0000, 64, 0]), errno(Errno::EFAULT));
+        // A length past what is mapped is EFAULT, and nothing of that size
+        // is allocated (the fuzzer's out-of-memory case).
+        assert_eq!(f.ret(175, &[BUF, 0xff00_0000, 0]), errno(Errno::EFAULT));
+        assert_eq!(f.ret(175, &[BUF, 1 << 32, 0]), errno(Errno::EFAULT));
         // A signature whose description Linux refuses.
         let mut module = vec![0u8; 64];
         let signed = |module: &mut Vec<u8>, info: [u8; 12]| {

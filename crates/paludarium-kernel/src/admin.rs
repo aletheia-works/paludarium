@@ -91,11 +91,42 @@ pub(crate) fn reboot(
     Ok(true)
 }
 
-/// The bytes of the regular file a descriptor `fd` holds open for reading,
-/// as `kernel_read_file_from_fd` reads them, up to `limit` bytes: a
-/// descriptor not open for reading is `EBADF`, a file that is not regular or
-/// is empty `EINVAL`, and one past `limit` `EFBIG`.
-fn read_file(c: &Context<'_>, fd: u64, limit: u64) -> Result<Vec<u8>, Errno> {
+/// What the module and kexec checks read of an image: its length, its
+/// first bytes (a bzImage's header) and its last (a module's signature),
+/// which are all they look at; the rest is not copied.
+struct Image {
+    len: u64,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+/// The bytes of [`Image::head`] and [`Image::tail`].
+const HEAD: u64 = 0x238;
+const TAIL: u64 = 40;
+impl Image {
+    /// The ends of an image of `total` bytes, which `read(at, buf)` fills
+    /// from byte `at`.
+    fn read(
+        total: u64,
+        mut read: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
+    ) -> Result<Self, Errno> {
+        let mut head = vec![0; total.min(HEAD) as usize];
+        read(0, &mut head)?;
+        let tail_len = total.min(TAIL);
+        let mut tail = vec![0; tail_len as usize];
+        read(total - tail_len, &mut tail)?;
+        Ok(Self {
+            len: total,
+            head,
+            tail,
+        })
+    }
+}
+
+/// The regular file a descriptor `fd` holds open for reading, as
+/// `kernel_read_file_from_fd` reads it, up to `limit` bytes: a descriptor not
+/// open for reading is `EBADF`, a file that is not regular or is empty
+/// `EINVAL`, and one past `limit` `EFBIG`.
+fn read_file(c: &Context<'_>, fd: u64, limit: u64) -> Result<Image, Errno> {
     const O_PATH: u32 = 0o10_000_000;
     let descriptor = c.files.descriptor(u64::from(fd as u32))?;
     let file: Arc<dyn FileHandle> = descriptor.file;
@@ -109,16 +140,16 @@ fn read_file(c: &Context<'_>, fd: u64, limit: u64) -> Result<Vec<u8>, Errno> {
     if stat.size > limit {
         return Err(EFBIG);
     }
-    let mut bytes = vec![0; usize::try_from(stat.size).map_err(|_| Errno::ENOMEM)?];
-    let mut done = 0;
-    while done < bytes.len() {
-        match file.read_at(done as u64, &mut bytes[done..])? {
-            0 => break,
-            n => done += n,
+    Image::read(stat.size, |at, buf| {
+        let mut done = 0;
+        while done < buf.len() {
+            match file.read_at(at + done as u64, &mut buf[done..])? {
+                0 => break,
+                n => done += n,
+            }
         }
-    }
-    bytes.truncate(done);
-    Ok(bytes)
+        Ok(())
+    })
 }
 
 /// `module_sig_check` of a module's bytes on a kernel locked down for
@@ -128,21 +159,21 @@ fn read_file(c: &Context<'_>, fd: u64, limit: u64) -> Result<Vec<u8>, Errno> {
 /// no key verifies leaves it unsigned (`-ENOKEY`) and lockdown refuses that.
 /// `mangled`, a module whose version information is to be ignored, is taken
 /// as unsigned.
-fn check_signature(module: &[u8], mangled: bool) -> Errno {
+fn check_signature(module: &Image, mangled: bool) -> Errno {
     const MARKER: &[u8] = b"~Module signature appended~\n";
     const SIGNATURE: usize = 12;
-    let Some(signed) = module
-        .strip_suffix(MARKER)
-        .filter(|_| !mangled && module.len() > MARKER.len())
-    else {
+    let len = module.len as usize;
+    if mangled || len <= MARKER.len() || !module.tail.ends_with(MARKER) {
         return Errno::EPERM;
-    };
-    if signed.len() <= SIGNATURE {
+    }
+    let signed = len - MARKER.len();
+    if signed <= SIGNATURE {
         return EBADMSG;
     }
-    let info = &signed[signed.len() - SIGNATURE..];
+    let end = module.tail.len() - MARKER.len();
+    let info = &module.tail[end - SIGNATURE..end];
     let length = u32::from_be_bytes([info[8], info[9], info[10], info[11]]) as usize;
-    if length >= signed.len() - SIGNATURE {
+    if length >= signed - SIGNATURE {
         return EBADMSG;
     }
     if info[2] != 2 {
@@ -169,10 +200,17 @@ pub(crate) fn sys_init_module(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         if a[1] > 1 << 32 {
             return Err(Errno::ENOMEM);
         }
-        let mut module = vec![0; a[1] as usize];
+        // All of it must be readable (`EFAULT`), though only its ends are
+        // looked at.
+        let len = usize::try_from(a[1]).map_err(|_| Errno::ENOMEM)?;
         c.mem
-            .read(GuestAddr(a[0]), &mut module)
+            .check_read(GuestAddr(a[0]), len)
             .map_err(|_| Errno::EFAULT)?;
+        let module = Image::read(a[1], |at, buf| {
+            c.mem
+                .read(GuestAddr(a[0].wrapping_add(at)), buf)
+                .map_err(|_| Errno::EFAULT)
+        })?;
         Err(check_signature(&module, false))
     })())
 }
@@ -194,7 +232,7 @@ pub(crate) fn sys_finit_module(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         let module = read_file(c, a[0], i32::MAX as u64)?;
         if flags & 4 != 0 {
-            if !module.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            if !module.head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
                 return Err(Errno::EINVAL);
             }
             return Err(Errno::EPERM);
@@ -254,12 +292,13 @@ pub(crate) fn sys_kexec_file_load(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // Linux's `KEXEC_FILE_SIZE_MAX`, `min(4 GiB, SSIZE_MAX)`: not
         // `finit_module`'s `INT_MAX`.
         let kernel = read_file(c, a[0], 4 << 30)?;
-        let u16_at = |at: usize| u16::from_le_bytes([kernel[at], kernel[at + 1]]);
-        let bzimage = kernel.len() >= 1024
-            && &kernel[0x202..0x206] == b"HdrS"
+        let head = &kernel.head;
+        let u16_at = |at: usize| u16::from_le_bytes([head[at], head[at + 1]]);
+        let bzimage = kernel.len >= 1024
+            && &head[0x202..0x206] == b"HdrS"
             && u16_at(0x1fe) == 0xAA55
             && u16_at(0x206) >= 0x020C
-            && kernel[0x211] & 1 != 0
+            && head[0x211] & 1 != 0
             && u16_at(0x236) & 3 == 3;
         if !bzimage {
             return Err(ENOEXEC);

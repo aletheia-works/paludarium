@@ -196,7 +196,7 @@ impl NetworkPolicy {
 /// A host name in lower case without its final dot, or `None` for one that
 /// is not made of letters, digits, hyphens and dots.
 fn normal(name: &str) -> Option<String> {
-    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    let name = name.trim_suffix('.').to_ascii_lowercase();
     let valid = !name.is_empty()
         && name.len() <= 253
         && name.split('.').all(|label| {

@@ -353,7 +353,7 @@ impl Tree {
     }
     fn parent(&self, path: &[u8]) -> Result<(u64, Vec<u8>), Errno> {
         validate(path)?;
-        let trimmed = path.strip_suffix(b"/").unwrap_or(path);
+        let trimmed = path.trim_suffix(b"/");
         let pos = trimmed
             .iter()
             .rposition(|b| *b == b'/')

@@ -382,7 +382,7 @@ fn resolved(fs: &dyn HostFs, path: &[u8]) -> Option<Vec<u8>> {
 }
 /// `path`'s directory and last name; none for the root.
 fn split(path: &[u8]) -> Option<(&[u8], &[u8])> {
-    let trimmed = path.strip_suffix(b"/").unwrap_or(path);
+    let trimmed = path.trim_suffix(b"/");
     let at = trimmed.iter().rposition(|&b| b == b'/')?;
     let name = &trimmed[at + 1..];
     if name.is_empty() {

@@ -270,8 +270,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
     読み込んだページも、触るまでは数えません。
   - `/proc/<pid>/status` にロックしたメモリ（`VmLck`）は出ません。`MAP_LOCKED` の
-    `mmap` は、ファイルを確かめる前に `can_do_mlock`（`EPERM`）と `RLIMIT_MEMLOCK` の
-    空き（`EAGAIN`）を確かめます。Linux はファイルを先に確かめます。`mremap` は、
+    `mmap` は、マッピングの場所を探し（`ENOMEM`）ファイルを確かめる前に、`can_do_mlock`
+    （`EPERM`）と `RLIMIT_MEMLOCK` の空き（`EAGAIN`）を確かめます。Linux はそれらを先にします。`mremap` は、
     ロックした VMA が広がるときの空きを、新しい範囲のほかの確認より前に確かめます。
   - 共有のマッピングに `mbind` で付けたメモリのポリシーは、そのマッピングのものに
     なります。Linux はそのポリシーを共有メモリそのものに付け、マッピングしている

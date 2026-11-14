@@ -314,8 +314,8 @@ verified.
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
   - `/proc/<pid>/status` shows no locked memory (`VmLck`). `mmap` with
     `MAP_LOCKED` checks `can_do_mlock` (`EPERM`) and room under
-    `RLIMIT_MEMLOCK` (`EAGAIN`) before it looks at the file, where Linux
-    looks at the file first, and `mremap` checks the room for a locked VMA
+    `RLIMIT_MEMLOCK` (`EAGAIN`) before it finds room for the mapping
+    (`ENOMEM`) and looks at the file, where Linux does those first, and `mremap` checks the room for a locked VMA
     that grows before its other checks of the new range.
   - A memory policy that `mbind` gives a shared mapping belongs to that
     mapping, where Linux keeps it with the shared memory itself, for every

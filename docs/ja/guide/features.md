@@ -47,7 +47,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl`、`modify_ldt` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl`、`modify_ldt`、`set_thread_area`／`get_thread_area` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm`、`syslog`、`sysfs` |
@@ -1155,6 +1155,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   最大 128 バイトの 0 を読み、ほかの関数は `ENOSYS` です。fork はコピーを保ち、exec のあとは
   テーブルがありません。結果は Linux の `int` を `unsigned int` にしたものなので、エラーは
   `-EINVAL` ではなく、たとえば `0xffffffea` として返ります。
+- `set_thread_area` と `get_thread_area` は、Linux の `arch/x86/kernel/tls.c` と同じく、
+  スレッドの 3 つの TLS ディスクリプタ（GDT のエントリ 12〜14）を持ちます。`set_thread_area`
+  が受ける `struct user_desc` は、セグメントなしを表すもの（すべて 0、または Linux の空の
+  もの）ならエントリを消し、存在する 32 ビットのデータセグメントなら `modify_ldt` と同じ
+  ディスクリプタを書きます。それ以外は `EINVAL` です。エントリ番号 -1 は最初の空いた
+  エントリを使ってその番号を書き戻し（空きがなければ `ESRCH`）、ほかの番号で 12〜14 の外に
+  あるものは `EINVAL` です。`get_thread_area` はエントリを `struct user_desc` として
+  書き戻し、空のエントリは読み込み専用で存在しないものとして読めます。新しいスレッドや
+  プロセスはコピーを持ち、exec のあとはエントリがありません。
 - `membarrier` は、`CONFIG_RSEQ` があって `nohz_full` の CPU がない x86-64 の Linux の
   コマンドを持ちます（`MEMBARRIER_CMD_QUERY` は `0x3ff`）。プライベートのコマンドは、
   アドレス空間がそれに登録するまで `EPERM` です。fork は登録を保ち、exec のあとは登録がなく、

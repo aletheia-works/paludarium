@@ -1288,3 +1288,59 @@ fn modify_ldt_writes_and_reads_the_local_descriptor_table() {
     let child = f.mem.fork();
     assert_eq!(child.ldt().lock().unwrap().len(), 3);
 }
+
+/// set_thread_area and get_thread_area keep the thread's three TLS
+/// descriptors as Linux's tls.c does.
+#[test]
+fn thread_area_sets_and_reads_the_tls_descriptors() {
+    let mut f = fixture();
+    let (set, get) = (205, 211);
+    let desc = |f: &mut Fixture, words: [u32; 4]| {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        f.mem.write(GuestAddr(DATA), &bytes).unwrap();
+    };
+    let words = |f: &Fixture| -> [u32; 4] {
+        let mut b = [0; 16];
+        f.mem.read(GuestAddr(DATA), &mut b).unwrap();
+        std::array::from_fn(|i| u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]))
+    };
+    assert_eq!(f.ret(set, &[8]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(get, &[8]), errno(Errno::EFAULT));
+    // The descriptor is checked first: 16-bit, code, or not present.
+    for flags in [0x10, 1 | 2 << 1, 1 | 1 << 5] {
+        desc(&mut f, [12, 0x1000, 0xfff, flags]);
+        assert_eq!(f.ret(set, &[DATA]), errno(Errno::EINVAL), "{flags:#x}");
+    }
+    desc(&mut f, [11, 0x1000, 0xfff, 1]);
+    assert_eq!(f.ret(set, &[DATA]), errno(Errno::EINVAL));
+    // -1 takes the first free entry and says which.
+    desc(&mut f, [u32::MAX, 0x1234_5678, 0xabcde, 1 | 1 << 4 | 1 << 6 | 1 << 7]);
+    assert_eq!(f.ret(set, &[DATA]), 0);
+    assert_eq!(words(&f)[0], 12);
+    assert_eq!(f.thread.state.tls[0], 0x12da_f334_5678_bcde);
+    desc(&mut f, [14, 0x2000, 0x10, 1 | 1 << 1 | 1 << 3]);
+    assert_eq!(f.ret(set, &[DATA]), 0);
+    desc(&mut f, [u32::MAX, 0x3000, 0x10, 1]);
+    assert_eq!(f.ret(set, &[DATA]), 0);
+    assert_eq!(words(&f)[0], 13);
+    desc(&mut f, [u32::MAX, 0x3000, 0x10, 1]);
+    assert_eq!(f.ret(set, &[DATA]), errno(Errno(3)));
+    // Read back as Linux's fill_user_desc: `lm` was not taken.
+    desc(&mut f, [12, 0, 0, 0]);
+    assert_eq!(f.ret(get, &[DATA]), 0);
+    assert_eq!(words(&f), [12, 0x1234_5678, 0xabcde, 1 | 1 << 4 | 1 << 6]);
+    desc(&mut f, [14, 0, 0, 0]);
+    assert_eq!(f.ret(get, &[DATA]), 0);
+    assert_eq!(words(&f), [14, 0x2000, 0x10, 1 | 1 << 1 | 1 << 3]);
+    desc(&mut f, [15, 0, 0, 0]);
+    assert_eq!(f.ret(get, &[DATA]), errno(Errno::EINVAL));
+    // All zeros, or LDT_empty, clear the entry, which reads as not present.
+    desc(&mut f, [13, 0, 0, 0]);
+    assert_eq!(f.ret(set, &[DATA]), 0);
+    desc(&mut f, [14, 0, 0, 1 << 3 | 1 << 5]);
+    assert_eq!(f.ret(set, &[DATA]), 0);
+    assert_eq!(f.thread.state.tls[1..], [0, 0]);
+    desc(&mut f, [13, 0, 0, 0]);
+    assert_eq!(f.ret(get, &[DATA]), 0);
+    assert_eq!(words(&f), [13, 0, 0, 1 << 3 | 1 << 5]);
+}

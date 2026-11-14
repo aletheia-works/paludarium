@@ -253,6 +253,10 @@ pub struct ThreadState {
     /// handler (ERESTARTSYS, `false`), or after any handler (ERESTARTNOINTR,
     /// `true`). Taken with `restart`.
     pub(crate) seccomp_restart: Option<bool>,
+    /// The thread's three TLS descriptors (GDT entries 12 to 14), as
+    /// Linux's `thread_struct.tls_array`: `set_thread_area` sets them, a
+    /// new thread or process copies them and exec clears them.
+    pub(crate) tls: [u64; 3],
 }
 
 impl ThreadState {

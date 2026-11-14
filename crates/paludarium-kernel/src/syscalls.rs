@@ -316,6 +316,8 @@ impl SyscallTable {
         handlers.insert(244, crate::mqueue::sys_mq_notify);
         handlers.insert(245, crate::mqueue::sys_mq_getsetattr);
         handlers.insert(334, crate::rseq::sys_rseq);
+        handlers.insert(205, sys_set_thread_area);
+        handlers.insert(211, sys_get_thread_area);
         handlers.insert(317, crate::seccomp::sys_seccomp);
         handlers.insert(206, crate::aio::sys_setup);
         handlers.insert(207, crate::aio::sys_destroy);
@@ -3236,37 +3238,15 @@ fn write_ldt(mem: &AddressSpace, ptr: u64, bytecount: u64, old: bool) -> Result<
         return Err(Errno::EINVAL);
     }
     let [entry, base, limit, flags] = read_words32(mem, ptr)?;
-    let bit = |n: u32| u64::from(flags >> n & 1);
-    let (seg_32bit, contents, read_exec_only) = (bit(0), u64::from(flags >> 1 & 3), bit(3));
-    let (limit_in_pages, not_present, useable) = (bit(4), bit(5), bit(6));
+    let (contents, not_present) = (flags >> 1 & 3, flags >> 5 & 1);
     if u64::from(entry) >= LDT_ENTRIES || contents == 3 && (old || not_present == 0) {
         return Err(Errno::EINVAL);
     }
-    let empty = base == 0
-        && limit == 0
-        && contents == 0
-        && read_exec_only == 1
-        && seg_32bit == 0
-        && limit_in_pages == 0
-        && not_present == 1
-        && useable == 0;
-    let descriptor = if old && base == 0 && limit == 0 || empty {
+    let descriptor = if old && base == 0 && limit == 0 || ldt_empty(base, limit, flags) {
         0
     } else {
-        let (base, limit) = (u64::from(base), u64::from(limit));
-        let kind = (read_exec_only ^ 1) << 1 | contents << 2 | 1;
-        let available = if old { 0 } else { useable };
-        limit & 0xffff
-            | (base & 0xff_ffff) << 16
-            | kind << 40
-            | 1 << 44
-            | 3 << 45
-            | (not_present ^ 1) << 47
-            | (limit >> 16 & 0xf) << 48
-            | available << 52
-            | seg_32bit << 54
-            | limit_in_pages << 55
-            | (base >> 24) << 56
+        // The old mode has no `useable` bit.
+        fill_ldt(base, limit, if old { flags & !(1 << 6) } else { flags })
     };
     let mut ldt = mem
         .ldt()
@@ -3278,6 +3258,127 @@ fn write_ldt(mem: &AddressSpace, ptr: u64, bytecount: u64, old: bool) -> Result<
     }
     ldt[at] = descriptor;
     Ok(0)
+}
+
+/// The flags of a `struct user_desc` but `lm`: `seg_32bit` (bit 0),
+/// `contents` (1-2), `read_exec_only` (3), `limit_in_pages` (4),
+/// `seg_not_present` (5) and `useable` (6).
+const DESC_FLAGS: u32 = 0x7f;
+/// `READ_EXEC_ONLY` and `SEG_NOT_PRESENT`.
+const DESC_EMPTY: u32 = 1 << 3 | 1 << 5;
+
+/// Linux's `LDT_empty`: no base, no limit, and of the flags only
+/// `read_exec_only` and `seg_not_present`, the way to ask for no segment.
+fn ldt_empty(base: u32, limit: u32, flags: u32) -> bool {
+    base == 0 && limit == 0 && flags & DESC_FLAGS == DESC_EMPTY
+}
+
+/// Linux's `LDT_zero`: a `struct user_desc` all zeros but for its entry
+/// number (and `lm`), which programs take for no segment.
+fn ldt_zero(base: u32, limit: u32, flags: u32) -> bool {
+    base == 0 && limit == 0 && flags & DESC_FLAGS == 0
+}
+
+/// Linux's `fill_ldt`: the descriptor for a `struct user_desc`, accessed,
+/// a code or data segment, privilege 3, and never 64-bit (`lm` is not
+/// taken).
+fn fill_ldt(base: u32, limit: u32, flags: u32) -> u64 {
+    let bit = |n: u32| u64::from(flags >> n & 1);
+    let (base, limit) = (u64::from(base), u64::from(limit));
+    let kind = (bit(3) ^ 1) << 1 | u64::from(flags >> 1 & 3) << 2 | 1;
+    limit & 0xffff
+        | (base & 0xff_ffff) << 16
+        | kind << 40
+        | 1 << 44
+        | 3 << 45
+        | (bit(5) ^ 1) << 47
+        | (limit >> 16 & 0xf) << 48
+        | bit(6) << 52
+        | bit(0) << 54
+        | bit(4) << 55
+        | (base >> 24) << 56
+}
+
+/// The first of the thread-local storage entries in the GDT
+/// (`GDT_ENTRY_TLS_MIN`), of which a thread has three.
+const TLS_FIRST: u32 = 12;
+
+/// `set_thread_area(u_info)`, Linux's `do_set_thread_area` for x86-64: sets
+/// one of the thread's three TLS descriptors from a `struct user_desc`.
+/// The descriptor must ask for no segment ([`ldt_empty`] or [`ldt_zero`],
+/// which clear the entry) or be a present 32-bit data segment (`EINVAL`).
+/// Entry number -1 takes the first empty entry (`ESRCH` when none is) and
+/// writes its number back; then a number outside 12 to 14 is `EINVAL`. The
+/// CPU loads no segment registers, so the entries are only kept for
+/// [`sys_get_thread_area`] and a new thread or process, which copies
+/// them; exec clears them.
+fn sys_set_thread_area(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    match set_thread_area(c, a[0]) {
+        Ok(()) => ok(0),
+        Err(e) => err(e),
+    }
+}
+
+fn set_thread_area(c: &mut Context<'_>, ptr: u64) -> Result<(), Errno> {
+    let [entry, base, limit, flags] = read_words32(c.mem, ptr)?;
+    let none = ldt_empty(base, limit, flags) || ldt_zero(base, limit, flags);
+    // `tls_desc_okay`: no 16-bit segment, only data, and present.
+    if !none && (flags & 1 == 0 || flags >> 1 & 3 > 1 || flags >> 5 & 1 != 0) {
+        return Err(Errno::EINVAL);
+    }
+    let mut index = entry;
+    if index == u32::MAX {
+        // ESRCH when every entry is taken.
+        let free = c.process.tls.iter().position(|d| *d == 0);
+        index = TLS_FIRST + free.ok_or(Errno(3))? as u32;
+        c.mem
+            .write(GuestAddr(ptr), &index.to_le_bytes())
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    let slot = index
+        .checked_sub(TLS_FIRST)
+        .filter(|slot| *slot < 3)
+        .ok_or(Errno::EINVAL)?;
+    c.process.tls[slot as usize] = if none {
+        0
+    } else {
+        fill_ldt(base, limit, flags)
+    };
+    Ok(())
+}
+
+/// `get_thread_area(u_info)`, Linux's `do_get_thread_area`: the TLS
+/// descriptor numbered by `u_info`'s entry number (12 to 14, else
+/// `EINVAL`), written back as a `struct user_desc` (Linux's
+/// `fill_user_desc`); an empty entry reads as not present and read-only.
+fn sys_get_thread_area(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let ptr = a[0];
+    let mut entry = [0; 4];
+    if c.mem.read(GuestAddr(ptr), &mut entry).is_err() {
+        return err(Errno::EFAULT);
+    }
+    let index = u32::from_le_bytes(entry);
+    let Some(slot) = index.checked_sub(TLS_FIRST).filter(|slot| *slot < 3) else {
+        return err(Errno::EINVAL);
+    };
+    let desc = c.process.tls[slot as usize];
+    let bit = |n: u32| (desc >> n & 1) as u32;
+    let kind = (desc >> 40 & 0xf) as u32;
+    let base = (desc >> 16 & 0xff_ffff | (desc >> 56) << 24) as u32;
+    let limit = (desc & 0xffff | (desc >> 48 & 0xf) << 16) as u32;
+    let flags = bit(54)
+        | (kind >> 2) << 1
+        | u32::from(kind & 2 == 0) << 3
+        | bit(55) << 4
+        | (bit(47) ^ 1) << 5
+        | bit(52) << 6
+        | bit(53) << 7;
+    let words = [index, base, limit, flags];
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    match c.mem.write(GuestAddr(ptr), &bytes) {
+        Ok(()) => ok(0),
+        Err(_) => err(Errno::EFAULT),
+    }
 }
 
 /// Four 32-bit words at `ptr` (`EFAULT` if they cannot be read).

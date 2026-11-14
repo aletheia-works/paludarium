@@ -55,7 +55,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl`, `modify_ldt` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl`, `modify_ldt`, `set_thread_area`/`get_thread_area` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs` |
@@ -1308,6 +1308,16 @@ kernel.
   zero bytes, and other functions give `ENOSYS`. A fork keeps a copy and an
   exec starts with none. The result is Linux's `int` as an `unsigned int`,
   so an error comes back as, say, `0xffffffea`, not `-EINVAL`.
+- `set_thread_area` and `get_thread_area` keep the thread's three TLS
+  descriptors, GDT entries 12 to 14, as Linux's `arch/x86/kernel/tls.c`
+  does. `set_thread_area` takes a `struct user_desc` that asks for no
+  segment (all zeros, or Linux's empty one), which clears the entry, or a
+  present 32-bit data segment (anything else is `EINVAL`), stored as
+  `modify_ldt` stores it. Entry number -1 takes the first empty entry and
+  writes its number back (`ESRCH` when none is); any other number outside
+  12 to 14 is `EINVAL`. `get_thread_area` writes the entry back as a
+  `struct user_desc`; an empty one reads as read-only and not present. A
+  new thread or process has a copy, and an exec starts with none.
 - `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
   `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
   commands give `EPERM` until the address space registers for them, a fork

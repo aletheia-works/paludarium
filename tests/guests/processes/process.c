@@ -8236,6 +8236,90 @@ static int ldt_case(const char *self) {
     return 0;
 }
 
+/* set_thread_area and get_thread_area: the thread's three TLS descriptors,
+   GDT entries 12 to 14. */
+static long ta_call(long n, void *desc) { return syscall(n, desc) ? -errno : 0; }
+static long ta_set(unsigned entry, unsigned base, unsigned limit, unsigned flags, unsigned *got) {
+    unsigned desc[4] = {entry, base, limit, flags};
+    long r = ta_call(SYS_set_thread_area, desc);
+    if (got) *got = desc[0];
+    return r;
+}
+static void ta_show(const char *label) {
+    printf("%s:", label);
+    for (unsigned entry = 12; entry < 15; entry++) {
+        unsigned desc[4] = {entry, 0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a};
+        long r = ta_call(SYS_get_thread_area, desc);
+        if (r)
+            printf(" %u=%ld", entry, r);
+        else
+            printf(" %u=%#x,%#x,%#x", desc[0], desc[1], desc[2], desc[3]);
+    }
+    printf("\n");
+}
+static void *ta_thread(void *arg) {
+    (void)arg;
+    ta_show("thread");
+    printf("thread set=%ld\n", ta_set(12, 0x7000, 0x7, 1, NULL));
+    ta_show("thread after");
+    return NULL;
+}
+static int ta_case(const char *self) {
+    ta_show("start");
+    printf("fault set=%ld get=%ld\n", ta_call(SYS_set_thread_area, (void *)8),
+           ta_call(SYS_get_thread_area, (void *)8));
+    unsigned desc[4] = {11, 0, 0, 0};
+    printf("entries get=%ld", ta_call(SYS_get_thread_area, desc));
+    desc[0] = 15;
+    printf(" %ld", ta_call(SYS_get_thread_area, desc));
+    desc[0] = -1u;
+    printf(" %ld set=%ld %ld %ld\n", ta_call(SYS_get_thread_area, desc),
+           ta_set(11, 0x1000, 0xfff, 1, NULL), ta_set(15, 0x1000, 0xfff, 1, NULL),
+           ta_set(0x80000000u, 0x1000, 0xfff, 1, NULL));
+    /* 16-bit, code, not present; then a bad entry after a bad descriptor. */
+    printf("descs=%ld %ld %ld %ld %ld\n", ta_set(12, 0x1000, 0xfff, 1 << 4, NULL),
+           ta_set(12, 0x1000, 0xfff, 1 | 2 << 1, NULL), ta_set(12, 0x1000, 0xfff, 1 | 3 << 1, NULL),
+           ta_set(12, 0x1000, 0xfff, 1 | 1 << 5, NULL), ta_set(99, 0x1000, 0xfff, 0x10, NULL));
+    /* -1 picks the first empty entry; lm is not taken. */
+    unsigned got[4];
+    long r[4];
+    r[0] = ta_set(-1u, 0x12345678, 0xabcde, 1 | 1 << 4 | 1 << 6 | 1 << 7, &got[0]);
+    r[1] = ta_set(14, 0x2000, 0x10, 1 | 1 << 1 | 1 << 3, &got[1]);
+    r[2] = ta_set(-1u, 0x3000, 0xffffffffu, 1 | 1 << 1, &got[2]);
+    r[3] = ta_set(-1u, 0x4000, 0x10, 1, &got[3]);
+    printf("allocate=%ld:%u %ld:%u %ld:%u %ld:%u\n", r[0], got[0], r[1], got[1], r[2], got[2], r[3],
+           got[3]);
+    ta_show("set");
+    /* An entry number it cannot write back: EFAULT, and nothing is set. */
+    unsigned *ro = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned fresh[4] = {-1u, 0x5000, 0x10, 1};
+    memcpy(ro, fresh, sizeof fresh);
+    mprotect(ro, 4096, PROT_READ);
+    printf("clear=%ld", ta_set(13, 0, 0, 0, NULL));
+    printf(" readonly=%ld", ta_call(SYS_set_thread_area, ro));
+    printf(" empty=%ld\n", ta_set(14, 0, 0, 1 << 3 | 1 << 5, NULL));
+    munmap(ro, 4096);
+    ta_show("cleared");
+    ta_set(13, 0x6000, 0x10, 1, NULL);
+    fflush(stdout);
+    pthread_t t;
+    if (pthread_create(&t, NULL, ta_thread, NULL) || pthread_join(t, NULL)) return 97;
+    ta_show("main after thread");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        ta_show("child");
+        fflush(stdout);
+        char *args[] = {"x", "thread-area-exec", (char *)self, NULL};
+        execv(self, args);
+        _exit(98);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("child exited=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
 /* iopl, ioperm and acct as a user without capabilities: the arguments, then
    EPERM for whatever needs CAP_SYS_RAWIO or CAP_SYS_PACCT. */
 static int port_access_case(void) {
@@ -24158,6 +24242,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);
+        return 0;
+    }
+    if (!strcmp(mode, "thread-area")) return ta_case(self);
+    if (!strcmp(mode, "thread-area-exec")) {
+        ta_show("after exec");
         return 0;
     }
     if (!strcmp(mode, "port-access")) return port_access_case();

@@ -196,8 +196,9 @@ verified.
   such a CPU.
 - **Segment registers**: the virtual CPU cannot move to or from a segment
   register (`mov` to `%ds`, `%fs` and the like stops a program with
-  `SIGILL`), so an entry that `modify_ldt` writes cannot be loaded and used,
-  where Linux loads it. The table itself reads back as Linux's.
+  `SIGILL`), so an entry that `modify_ldt` or `set_thread_area` writes
+  cannot be loaded and used, where Linux loads it. The tables themselves
+  read back as Linux's.
 - **io_uring, in part**: only `IORING_OP_NOP` and `IORING_OP_EPOLL_CTL`
   run; the other operations complete with `EOPNOTSUPP`. The setup flags
   `IORING_SETUP_IOPOLL`, `_SQPOLL`, `_SQ_AFF`, `_ATTACH_WQ`, `_R_DISABLED`,

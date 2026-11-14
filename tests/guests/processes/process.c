@@ -9183,7 +9183,8 @@ static int memfd_secret_case(void) {
     munmap(holed, page);
     printf("msync-sync-after-hole=%ld\n", secret_errno(msync(holed, 3 * page, MS_SYNC)));
     printf("msync-async-after-hole=%ld\n", secret_errno(msync(holed, 3 * page, MS_ASYNC)));
-    /* A lock that brings its pages in cannot; one on fault can. */
+    /* No lock can bring its pages in, and mlock_fixup gives its VMA no
+     * VM_LOCKONFAULT, so a lock on fault tries to as well. */
     printf("mlock=%ld\n", secret_errno(mlock(both, 2 * page)));
     printf("mlock-onfault=%ld\n", secret_errno(syscall(SYS_mlock2, both, 2 * page, 1L)));
     printf("munlock=%ld\n", secret_errno(munlock(both, 2 * page)));

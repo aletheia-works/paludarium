@@ -302,8 +302,8 @@ kernel.
   seals (`EINVAL`), and opening it again through `/proc/self/fd` gives
   `ENXIO`. The kernel may not reach the pages of its mapping, as Linux's
   `get_user_pages` refuses them: `MADV_POPULATE_READ` and
-  `MADV_POPULATE_WRITE` give `EINVAL`, and `mlock` `ENOMEM` (`MLOCK_ONFAULT`
-  takes it). `msync` with `MS_SYNC` gives `EINVAL` for it, as its file has
+  `MADV_POPULATE_WRITE` give `EINVAL`, and `mlock` `ENOMEM`, with
+  `MLOCK_ONFAULT` too, as `mlock_fixup` gives its VMA no `VM_LOCKONFAULT`. `msync` with `MS_SYNC` gives `EINVAL` for it, as its file has
   no `fsync`, even after a hole in the range. Its pages are the emulator's, so they are as secret as any
   other memory of the guest.
 - `openat2` opens as `openat` does (a FIFO too), with Linux's stricter

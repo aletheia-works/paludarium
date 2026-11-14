@@ -2178,13 +2178,24 @@ fn sys_munlock(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     lock_range(c, a[0], a[1], false)
 }
 
-/// `mlock2(addr, len, flags)`: `MLOCK_ONFAULT` brings no page in.
+/// `mlock2(addr, len, flags)`: `MLOCK_ONFAULT` brings no page in, except
+/// in a mapping of a `memfd_secret` file, which Linux's `mlock_fixup`
+/// leaves without `VM_LOCKONFAULT`, so that `__mm_populate` still tries
+/// to fault its pages in and fails (`ENOMEM`), as for `mlock`.
 fn sys_mlock2(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let flags = a[2] as u32;
     if flags & !MLOCK_ONFAULT != 0 {
         return err(Errno::EINVAL);
     }
-    lock_range(c, a[0], a[1], flags & MLOCK_ONFAULT == 0)
+    let locked = lock_range(c, a[0], a[1], flags & MLOCK_ONFAULT == 0);
+    if matches!(locked, Outcome::Return(0)) && flags & MLOCK_ONFAULT != 0 {
+        let start = a[0] & !4095;
+        let length = a[1].wrapping_add(a[0] & 4095).wrapping_add(4095) & !4095;
+        if maps_secret(c.mem, start, start.wrapping_add(length)) {
+            return err(Errno::ENOMEM);
+        }
+    }
+    locked
 }
 
 /// `mlockall(flags)`: it covers what is mapped, so only the flags can be wrong.

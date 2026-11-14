@@ -52,10 +52,14 @@ const server = createServer(async (request, response) => {
   }
 });
 // A connection the server drops before it answers shows in the page only as a failed fetch. The
-// listener replaces Node's default, so it answers as that does; an idle keep-alive reset shows here too.
+// listener replaces Node's default, so it answers with that one's statuses (408 for a timeout, 431 for
+// headers too large, 400 else) only on a socket that has written nothing; an idle keep-alive reset
+// shows here too.
+const CLIENT_ERROR_STATUS = { ERR_HTTP_REQUEST_TIMEOUT: "408 Request Timeout", HPE_HEADER_OVERFLOW: "431 Request Header Fields Too Large" };
 server.on("clientError", (error, socket) => {
   console.error(JSON.stringify({ client_error: String(error), code: error.code ?? null }));
-  if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); else socket.destroy();
+  if (socket.writable && socket.bytesWritten === 0) socket.end(`HTTP/1.1 ${CLIENT_ERROR_STATUS[error.code] ?? "400 Bad Request"}\r\n\r\n`);
+  else socket.destroy();
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 try { const result = await runBrowser(browser, `http://127.0.0.1:${server.address().port}/`, 600000); Object.assign(report, result); await persist(); if (!report.complete || !report.passed) throw new Error("Actual browser acceptance failed"); console.log(JSON.stringify({ environment: browser, version: report.version, complete: report.complete })); }

@@ -7689,7 +7689,22 @@ static int chroot_case(const char *self) {
         if (chdir(cr_base)) _exit(91);
         long rooted = cr_call(jail);
         printf("chroot=%ld\n", rooted);
-        if (rooted) _exit(89);
+        if (rooted) {
+            /* What refused it, for the comparison to show. */
+            const char *files[] = {"/proc/self/attr/current",
+                                   "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+                                   "/proc/self/status"};
+            for (unsigned i = 0; i < 3; i++) {
+                char text[4096] = {0};
+                int fd = open(files[i], O_RDONLY);
+                ssize_t got = fd < 0 ? -1 : read(fd, text, sizeof text - 1);
+                if (fd >= 0) close(fd);
+                char *cap = strstr(text, "CapEff");
+                printf("%s: %.*s\n", files[i], cap ? 24 : (int)(got > 0 ? got : 0), cap ? cap : text);
+            }
+            printf("newuts=%ld\n", syscall(SYS_unshare, CLONE_NEWUTS) ? -errno : 0L);
+            _exit(89);
+        }
         cr_cwd("outside");
         cr_read("/f", "/f");
         cr_read("/../../f", "/../../f");

@@ -339,6 +339,7 @@ mod linux {
         processes_mrelease => ("mrelease","process"),
         processes_mempolicy => ("mempolicy","process"),
         processes_memfd_secret => ("memfd-secret","process"),
+        processes_memfd_secret_memlock => ("memfd-secret-memlock","process"),
         processes_ids => ("ids","process"),
         processes_access => ("access","process"),
         processes_chown => ("chown","process"),

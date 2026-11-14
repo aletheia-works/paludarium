@@ -2226,7 +2226,7 @@ fn shared_file(
         offset,
         len,
         may_write,
-        memfd.is_some_and(crate::memfd::Memfd::is_secret),
+        crate::memfd::secret_charge(file),
     )?;
     map(&pages, may_write)
 }

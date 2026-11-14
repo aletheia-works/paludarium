@@ -6,7 +6,7 @@
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat, HostFs};
 use paludarium_types::{Errno, GuestAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const MFD_CLOEXEC: u32 = 0x01;
@@ -45,6 +45,8 @@ pub(crate) struct Memfd {
     /// A `memfd_secret` file ([`memfd_secret`]): no reads or writes, a
     /// size set once, shared mappings only, and its own name.
     secret: bool,
+    /// What a secret file's pages charge its creator ([`SecretCharge`]).
+    charge: Option<Arc<SecretCharge>>,
 }
 /// secretmem's `statfs` type, `SECRETMEM_MAGIC`.
 pub(crate) const SECRETMEM_MAGIC: u64 = 0x5345_434d;
@@ -95,6 +97,7 @@ impl Memfd {
             sealing: Arc::clone(&self.sealing),
             name: Arc::clone(&self.name),
             secret: false,
+            charge: None,
         }))
     }
     pub(crate) fn seals(&self) -> u32 {
@@ -389,6 +392,7 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
         sealing: Arc::default(),
         name: name.into(),
         secret: false,
+        charge: None,
     });
     let file =
         crate::page_cache::CoherentFile::with_device(memfd, Arc::clone(&c.files.caches), DEVICE);
@@ -396,6 +400,102 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
         .files
         .install(Arc::new(file), flags & MFD_CLOEXEC != 0, c.group.nofile())?;
     Ok(u64::from(fd))
+}
+
+thread_local! {
+    /// The RLIMIT_MEMLOCK soft limit of the process whose thread this host
+    /// thread runs, as of its last system call ([`enter`]). Every guest
+    /// thread has a host worker of its own (a Web Worker in WebAssembly),
+    /// so the limit is never another thread's.
+    static MEMLOCK: std::cell::RefCell<Option<Arc<AtomicU64>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Records, as a system call starts, the RLIMIT_MEMLOCK of the process
+/// whose thread runs on this host thread: the limit a fault of a secret
+/// page counts against, as Linux's `rlimit` reads the faulting task's.
+pub(crate) fn enter(memlock: &Arc<AtomicU64>) {
+    MEMLOCK.with(|current| {
+        let mut current = current.borrow_mut();
+        if !current
+            .as_ref()
+            .is_some_and(|known| Arc::ptr_eq(known, memlock))
+        {
+            *current = Some(Arc::clone(memlock));
+        }
+    });
+}
+
+/// The `memfd_secret` pages each user has, by kernel user ID: Linux's
+/// `locked_vm` of the `user_struct`, for the whole machine.
+#[derive(Default)]
+pub(crate) struct SecretPages(Mutex<std::collections::BTreeMap<u32, u64>>);
+
+/// What a secret file's pages charge: the user who made it, for each page
+/// a fault brought in, until the file goes (Linux's
+/// `secretmem_inode_state`). A fault past the faulting process's
+/// RLIMIT_MEMLOCK, which the creator's stands for until that process makes
+/// a system call, is refused (`SIGBUS`); `CAP_IPC_LOCK` gives no room.
+pub(crate) struct SecretCharge {
+    pages: Arc<SecretPages>,
+    user: u32,
+    creator: Arc<AtomicU64>,
+    /// The offsets of the pages charged.
+    charged: Mutex<std::collections::BTreeSet<u64>>,
+}
+
+impl SecretCharge {
+    /// Whether the page at `offset` is in the file: charged before, or
+    /// charged now if the user's pages stay within the limit
+    /// (`__secretmem_account_pages`).
+    pub(crate) fn admit(&self, offset: u64) -> bool {
+        let page = offset & !4095;
+        // The file's own lock, then the machine's: `Drop` takes only the
+        // machine's, so the order never inverts.
+        let mut charged = self.charged.lock().unwrap_or_else(PoisonError::into_inner);
+        if charged.contains(&page) {
+            return true;
+        }
+        let limit = MEMLOCK
+            .with(|current| {
+                current
+                    .borrow()
+                    .as_ref()
+                    .map(|limit| limit.load(Ordering::SeqCst))
+            })
+            .unwrap_or_else(|| self.creator.load(Ordering::SeqCst))
+            / 4096;
+        let mut users = self.pages.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = users.entry(self.user).or_default();
+        if *held + 1 > limit {
+            return false;
+        }
+        *held += 1;
+        charged.insert(page);
+        true
+    }
+}
+
+impl Drop for SecretCharge {
+    /// The file goes: its pages no longer count (`secretmem_unaccount_all_folios`).
+    fn drop(&mut self) {
+        let count = self
+            .charged
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len() as u64;
+        let mut users = self.pages.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = users.get_mut(&self.user) {
+            *held = held.saturating_sub(count);
+        }
+    }
+}
+
+/// What a secret file's pages charge, for the mapping of `file` to take
+/// its faults from; `None` for any other file.
+pub(crate) fn secret_charge(file: &Arc<dyn FileHandle>) -> Option<Arc<SecretCharge>> {
+    file.as_any()
+        .and_then(|any| any.downcast_ref::<Memfd>())
+        .and_then(|memfd| memfd.charge.clone())
 }
 
 /// What a mapping of `file` reads its pages from and writes them back to:
@@ -431,6 +531,12 @@ pub(crate) fn memfd_secret(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
     let credentials = &c.process.credentials;
     file.set_owner(Some(credentials.fsuid), Some(credentials.fsgid))?;
     let inode = crate::files::anonymous_inode();
+    let charge = Arc::new(SecretCharge {
+        pages: Arc::clone(&c.processes.secret_pages),
+        user: credentials.uid,
+        creator: Arc::clone(c.group.memlock()),
+        charged: Mutex::default(),
+    });
     let secret = Arc::new(Memfd {
         file,
         fs,
@@ -439,6 +545,7 @@ pub(crate) fn memfd_secret(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
         sealing: Arc::default(),
         name: Arc::from(&b"secretmem"[..]),
         secret: true,
+        charge: Some(charge),
     });
     let file =
         crate::page_cache::CoherentFile::with_device(secret, Arc::clone(&c.files.caches), DEVICE);

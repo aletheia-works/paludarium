@@ -44,6 +44,7 @@
     {"name":"mrelease-fatal","binary":"process"},
     {"name":"mempolicy","binary":"process"},
     {"name":"memfd-secret","binary":"process"},
+    {"name":"memfd-secret-memlock","binary":"process"},
     {"name":"ids","binary":"process"},
     {"name":"access","binary":"process"},
     {"name":"chown","binary":"process"},

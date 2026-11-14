@@ -1940,8 +1940,8 @@ kernel.
     loopback by its index and hardware address (`ENOENT` for another index,
     `EINVAL` for an address of other than six bytes, or padding), and the
     loopback takes it back in as `mctp_pkttype_receive` does, without
-    telling the sender what became of it; while it is down that is
-    `ENOBUFS`. A message received then names the interface it came in by,
+    telling the sender what became of it; while it is down, its `noop`
+    queueing discipline drops it, and the send still succeeds. A message received then names the interface it came in by,
     0 for none.
   - **Others:** `getsockname`, `getpeername`, `listen`, `accept`,
     `shutdown` and `socketpair` are `EOPNOTSUPP`; `setsockopt` and

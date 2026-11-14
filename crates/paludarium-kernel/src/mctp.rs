@@ -752,8 +752,10 @@ impl MctpSocket {
         }
         None
     }
-    /// A packet out of the loopback (`mctp_dst_output`): `ENOBUFS` while
-    /// it is down, else it comes back in by it (`mctp_pkttype_receive`),
+    /// A packet out of the loopback (`mctp_dst_output`): while it is down
+    /// its `noop` queueing discipline drops it (`NET_XMIT_CN`, which
+    /// `net_xmit_errno` makes 0), else it comes back in by it
+    /// (`mctp_pkttype_receive`),
     /// to the route its destination has, or, to `MCTP_ADDR_NULL` at the
     /// loopback's own hardware address, in at once; what happens to it
     /// there is not the sender's to hear.
@@ -765,7 +767,7 @@ impl MctpSocket {
         now: u64,
     ) -> Result<(), Errno> {
         if !self.network.is_up() {
-            return Err(ENOBUFS);
+            return Ok(());
         }
         packet.ifindex = LO_INDEX;
         let dest = packet.dest;

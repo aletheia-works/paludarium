@@ -1843,14 +1843,18 @@ static struct mctp_name mctp_name(unsigned net, int eid, int type, int tag) {
    and prints what it gave. */
 static void mctp_send(int fd, const void *name, socklen_t size, size_t len, const char *label) {
     static unsigned char bytes[70000];
-    unsigned char *at = len > sizeof bytes ? malloc(len) : bytes;
-    for (size_t i = 0; i < len; i++) at[i] = 'a' + i % 26;
+    /* One longer than a message may be is left zero, which takes the
+       emulator less time than the pattern would. */
+    unsigned char *at = len > sizeof bytes ? calloc(len, 1) : bytes;
+    for (size_t i = 0; at == bytes && i < len; i++) at[i] = 'a' + i % 26;
     printf("%s: send=%ld\n", label, netns_result(sendto(fd, at, len, 0, name, size)));
     if (at != bytes) free(at);
 }
 /* Receives on `fd` without waiting, with `flags`, into `room` bytes, and
    prints what came: its length, its name, and its bytes (the first 16 and a
-   sum of them all). */
+   sum of them all). Of the tag, only whether its sender owns it: which one
+   it is depends on the keys of six seconds before, and a slow run may
+   outlast them. */
 static void mctp_receive(int fd, int flags, size_t room, const char *label) {
     static unsigned char bytes[70000];
     struct mctp_name_ext name;
@@ -1866,9 +1870,9 @@ static void mctp_receive(int fd, int flags, size_t room, const char *label) {
     unsigned sum = 0;
     size_t got = (size_t)n < room ? (size_t)n : room;
     for (size_t i = 0; i < got; i++) sum = sum * 31 + bytes[i];
-    printf(" flags=%#x namelen=%u family=%u pad=%u net=%u eid=%u type=%#x tag=%#x pad=%u", m.msg_flags,
+    printf(" flags=%#x namelen=%u family=%u pad=%u net=%u eid=%u type=%#x owned=%d high=%d pad=%u", m.msg_flags,
            m.msg_namelen, name.base.family, name.base.pad0, name.base.net, name.base.eid, name.base.type,
-           name.base.tag, name.base.pad1);
+           !!(name.base.tag & 8), name.base.tag >> 4, name.base.pad1);
     if (m.msg_namelen == sizeof name)
         printf(" ifindex=%d halen=%u", name.ifindex, name.halen);
     printf(" bytes='%.*s' sum=%u\n", (int)(got < 16 ? got : 16), bytes, sum);
@@ -14562,6 +14566,8 @@ int main(int argc, char **argv) {
             bind(ctl, (void *)&any, sizeof any);
             mctp_address(ctl, 8);
             mctp_address(ctl, 9);
+            /* IDs 30 to 60 through 9, whose tags no other part takes. */
+            nl_mctp_route(ctl, 24, 30, 1, 30, 0, 1, 9, 0, "route 30-60 by 9");
             /* Binds. */
             name = mctp_name(0, 0xff, 1, 0);
             printf("bind short=%ld\n", netns_result(bind(a, (void *)&name, 8)));
@@ -14644,21 +14650,24 @@ int main(int argc, char **argv) {
             name = mctp_name(0, 20, 1, 8);
             mctp_send(c, &name, sizeof name, 200, "through 9");
             mctp_receive(a, 0, 1000, "any got");
-            name = mctp_name(0, 9, 1, 8);
+            name = mctp_name(0, 31, 1, 8);
             mctp_send(c, &name, sizeof name, 65535, "longest");
-            mctp_receive(b, 0, 70000, "9 got");
+            mctp_receive(a, 0, 70000, "any got");
             mctp_send(c, &name, sizeof name, 65536, "longer");
-            mctp_receive(b, 0, 70000, "9 got");
+            mctp_receive(a, 0, 70000, "any got");
             mctp_send(c, &name, sizeof name, 5 << 20, "too long");
-            /* Out of lo by its hardware address: while it is down, and up. */
+            /* Out of lo by its hardware address: while it is down, which
+               drops it, and up, to IDs of the route through 9. */
             value = 1;
             printf("ext set=%ld\n", netns_result(setsockopt(c, 285, 1, &value, sizeof value)));
+            setsockopt(a, 285, 1, &value, sizeof value);
             len = sizeof value;
             value = 0;
             printf("ext get=%ld", netns_result(getsockopt(c, 285, 1, &value, &len)));
             printf(" %d\n", value);
-            struct mctp_name_ext ext = {.base = mctp_name(0, 9, 1, 8), .ifindex = 1, .halen = 6};
+            struct mctp_name_ext ext = {.base = mctp_name(0, 32, 1, 8), .ifindex = 1, .halen = 6};
             mctp_send(c, &ext, sizeof ext, 5, "ext down");
+            mctp_receive(a, 0, 100, "any got");
             ext.ifindex = 2;
             mctp_send(c, &ext, sizeof ext, 5, "ext index 2");
             ext.ifindex = 1;
@@ -14672,21 +14681,17 @@ int main(int argc, char **argv) {
             ext.pad[1] = 0;
             struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
             printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
-            value = 1;
-            setsockopt(b, 285, 1, &value, sizeof value);
             mctp_send(c, &ext, sizeof ext, 5, "ext up");
-            mctp_receive(b, 0, 100, "9 got");
-            mctp_send(c, &name, sizeof name, 5, "routed");
-            mctp_receive(b, 0, 100, "9 got");
-            ext.base.eid = 0;
-            mctp_send(c, &ext, sizeof ext, 5, "ext null");
             mctp_receive(a, 0, 100, "any got");
-            ext.base.eid = 30;
+            name = mctp_name(0, 33, 1, 8);
+            mctp_send(c, &name, sizeof name, 5, "routed");
+            mctp_receive(a, 0, 100, "any got");
+            ext.base.eid = 70;
             mctp_send(c, &ext, sizeof ext, 5, "ext nowhere");
             /* Tags made by hand. */
             struct mctp_tag_ctl tag = {.peer = 8};
             printf("alloc=%ld", netns_result(ioctl(c, 0x89e0, &tag)));
-            printf(" tag=%#x\n", tag.tag);
+            printf(" flags=%#x\n", tag.tag & ~7);
             struct mctp_tag_ctl tag2 = {.peer = 8, .tag = 1};
             printf("alloc tagged=%ld\n", netns_result(ioctl(c, 0x89e0, &tag2)));
             tag2.tag = 0;
@@ -14696,7 +14701,7 @@ int main(int argc, char **argv) {
             printf("alloc2 local=%ld\n", netns_result(ioctl(c, 0x89e2, &v2)));
             v2.local = 0;
             printf("alloc2=%ld", netns_result(ioctl(c, 0x89e2, &v2)));
-            printf(" tag=%#x net=%u\n", v2.tag, v2.net);
+            printf(" flags=%#x net=%u\n", v2.tag & ~7, v2.net);
             name = mctp_name(0, 8, 5, tag.tag);
             mctp_send(c, &name, sizeof name, 3, "preallocated");
             mctp_receive(e, 0, 100, "8 got");
@@ -14716,7 +14721,7 @@ int main(int argc, char **argv) {
                in: a send with it finds none, and only net 0 drops it. */
             struct mctp_tag_ctl2 any_net = {.net = 0, .peer = 8};
             printf("alloc2 net 0=%ld", netns_result(ioctl(c, 0x89e2, &any_net)));
-            printf(" tag=%#x\n", any_net.tag);
+            printf(" flags=%#x\n", any_net.tag & ~7);
             name = mctp_name(0, 8, 5, any_net.tag);
             mctp_send(c, &name, sizeof name, 3, "net 0 preallocated");
             any_net.net = 1;
@@ -14728,9 +14733,22 @@ int main(int argc, char **argv) {
             name = mctp_name(0, 9, 1, 8);
             mctp_send(c, &name, sizeof name, 2, "after close");
             mctp_receive(a, 0, 100, "any got");
-            /* Owned tags for 9 run out. */
+            /* Owned tags for a peer no other part sends to run out after
+               eight, in a burst. */
+            name = mctp_name(0, 40, 1, 8);
             for (int i = 0; i < 9; i++) mctp_send(c, &name, sizeof name, 1, "owned");
             for (int i = 0; i < 9; i++) mctp_receive(a, 0, 100, "any got");
+            /* A close drops its keys. A new socket then sends out of lo to
+               MCTP_ADDR_NULL at lo's own hardware address, which comes in
+               at once: its tag is for any peer, which every key of the
+               local ID would hold back. */
+            close(c);
+            int f = socket(45, SOCK_DGRAM, 0);
+            value = 1;
+            setsockopt(f, 285, 1, &value, sizeof value);
+            ext.base.eid = 0;
+            mctp_send(f, &ext, sizeof ext, 5, "ext null");
+            mctp_receive(a, 0, 100, "any got");
             fflush(stdout);
             _exit(0);
         }

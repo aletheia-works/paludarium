@@ -1681,7 +1681,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ハードウェアアドレスでループバックの外に送ります（ほかの番号は `ENOENT`、6 バイトで
     ないアドレスや詰め物は `EINVAL`）。ループバックは `mctp_pkttype_receive` と同じく
     それを受け取り直し、どうなったかは送り手に伝えません。ループバックが下りている間は
-    `ENOBUFS` です。そのとき受け取るメッセージは、入ってきたインターフェース（なければ
+    `noop` のキューイング規則が捨てますが、送信は成功します。そのとき受け取るメッセージは、入ってきたインターフェース（なければ
     0）を示します。
   - **そのほか:** `getsockname`、`getpeername`、`listen`、`accept`、`shutdown`、`socketpair` は
     `EOPNOTSUPP` です。`SOL_SOCKET` と `SOL_MCTP` 以外のレベルの `setsockopt` と

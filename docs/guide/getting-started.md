@@ -12,8 +12,10 @@ paludarium is published as crates on crates.io and as a package on npm and JSR.
 ## Rust
 
 paludarium is built and tested with a pinned nightly Rust (the one in
-`rust-toolchain.toml`, moved to the latest nightly every week). The crates declare 1.101 as their MSRV (the oldest Rust
-they support), so today's stable Rust cannot build them; use a nightly Rust.
+`rust-toolchain.toml`, moved to the latest nightly every week). The crates
+declare 1.101 as their MSRV (the oldest Rust they support), so stable releases
+before 1.101 cannot build them, and no stable Rust is tested; use a nightly
+Rust.
 
 ```sh
 rustup toolchain install nightly

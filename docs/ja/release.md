@@ -67,3 +67,8 @@ JSR にはその公開済みのファイルを出します。JSR と npm は同�
 `paludarium-loader`、`paludarium-decoder`、`paludarium-cpu`、`paludarium-jit`、
 `paludarium-jit-native`、`paludarium-kernel`、`paludarium-runtime`、`paludarium` の 12 個です。0.x の間は、
 minor を上げることで互換を壊す変更をすることがあり、その場合はリリースノートに書きます。
+
+確かめるツールチェーンは、`rust-toolchain.toml` に固定した nightly です。どの crate も MSRV として
+1.101 を宣言しているので、1.101 より前の stable ではビルドできず、stable で動くとはうたっていません。
+WebAssembly 版（Rust の Wasm アダプタと、wasm32 の `paludarium-host`）は、さらに nightly の build-std と
+atomics の wait を使います。

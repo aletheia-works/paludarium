@@ -13,7 +13,7 @@ paludarium は、crates.io の crate と、npm と JSR のパッケージとし�
 
 paludarium は、日付を固定した nightly の Rust（`rust-toolchain.toml` にあるもの。
 毎週、最新の nightly へ上げます）で作って確かめています。crate は MSRV（使える最も古い Rust）として 1.101 を宣言しているので、
-今の stable の Rust ではビルドできません。nightly の Rust を使ってください。
+1.101 より前の stable ではビルドできず、stable の Rust では確かめていません。nightly の Rust を使ってください。
 
 ```sh
 rustup toolchain install nightly

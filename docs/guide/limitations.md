@@ -601,7 +601,9 @@ verified.
   and only Linux on x86-64 hosts has it; the other native builds use the
   interpreter. It compiles only the instructions with a simple form at the
   start of a block ([Architecture](../design/architecture#the-native-jit)).
-- **Stable Rust**: a nightly Rust is required.
+- **Stable Rust**: stable releases before 1.101 cannot build the crates (their
+  MSRV), the WebAssembly build uses nightly-only features, and no stable Rust
+  is tested; use a nightly Rust ([Supported platforms](platforms#rust-toolchain)).
 
 ## Not verified
 

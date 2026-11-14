@@ -523,7 +523,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   x86-64 の Linux のホストだけで、それ以外のネイティブ版はインタプリタで動きます。
   コンパイルするのは、ブロックの先頭から続く、単純な形を持つ命令だけです
   （[アーキテクチャ](../design/architecture#the-native-jit)）。
-- **stable の Rust**：nightly の Rust が必要です。
+- **stable の Rust**：1.101 より前の stable では crate をビルドできず（MSRV）、WebAssembly 版は
+  nightly だけの機能を使い、stable の Rust では確かめていません。nightly の Rust を使ってください
+  （[対応環境](platforms#rust-toolchain)）。
 
 ## 確かめていないこと
 

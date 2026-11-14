@@ -2172,13 +2172,14 @@ static void diag_ask(int fd, const char *label, unsigned short type, unsigned sh
     printf("%s: unknown=%d\n", label, unknown);
 }
 /* The inet-diag case's TCP and UDP sockets: a label, the descriptor (-1
-   once closed), its inode, its type and its local port. */
+   once closed), its inode, its type, its local port and its peer's port (0
+   for none yet). */
 struct inet_socket {
     const char *label;
     int fd;
     unsigned ino;
     int type;
-    unsigned short port;
+    unsigned short port, peer;
 };
 static struct inet_socket inet_sockets[32];
 static int inet_count;
@@ -2191,7 +2192,11 @@ static void inet_add(const char *label, int fd) {
     int type = 0;
     socklen_t type_len = sizeof type;
     getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_len);
-    inet_sockets[inet_count++] = (struct inet_socket){label, fd, (unsigned)st.st_ino, type, ntohs(at.sin6_port)};
+    struct sockaddr_in6 peer = {0};
+    len = sizeof peer;
+    getpeername(fd, (void *)&peer, &len);
+    inet_sockets[inet_count++] =
+        (struct inet_socket){label, fd, (unsigned)st.st_ino, type, ntohs(at.sin6_port), ntohs(peer.sin6_port)};
 }
 static struct inet_socket *inet_find(const char *label) {
     for (int i = 0; i < inet_count; i++)
@@ -2205,12 +2210,18 @@ static const char *inet_label(unsigned ino) {
         if (inet_sockets[i].ino == ino) return inet_sockets[i].label;
     return "?";
 }
-/* The label of the first socket of `type` on local port `port`, "0" for
-   0: TCP and UDP ports are apart. */
-static const char *inet_port_label(unsigned short port, int type) {
+/* The label of the first socket of `type` on local port `port` that has no
+   peer or has `other`, the other end's port, as its peer; "0" for 0, "?"
+   for none: TCP and UDP ports are apart. Linux gives sockets that connect
+   to different ports the same local port when its hash of each destination
+   happens to choose it, so the port alone may name two of them. Every
+   socket that connects has its peer, whatever the order they came in. */
+static const char *inet_port_label(unsigned short port, unsigned short other, int type) {
     if (port == 0) return "0";
     for (int i = 0; i < inet_count; i++)
-        if (inet_sockets[i].port == port && inet_sockets[i].type == type) return inet_sockets[i].label;
+        if (inet_sockets[i].port == port && inet_sockets[i].type == type &&
+            (inet_sockets[i].peer == 0 || inet_sockets[i].peer == other))
+            return inet_sockets[i].label;
     return "?";
 }
 /* The type of the socket of inode `ino`; one with none is TCP's. */
@@ -2245,8 +2256,8 @@ static void inet_line(char *out, size_t size, const char *label, unsigned short 
     int n = snprintf(out, size,
                      "%s: %s type=%u family=%u state=%u timer=%u retrans=%u sport=%s dport=%s src=%s dst=%s if=%u cookie=%d "
                      "expires=%s rqueue=%u wqueue=%u uid=%u",
-                     label, inet_label(words[4]), type, b[0], b[1], b[2], b[3], inet_port_label(ntohs(sport), inet_type(words[4])),
-                     inet_port_label(ntohs(dport), inet_type(words[4])), src, dst, interface, cookie[0] || cookie[1],
+                     label, inet_label(words[4]), type, b[0], b[1], b[2], b[3], inet_port_label(ntohs(sport), ntohs(dport), inet_type(words[4])),
+                     inet_port_label(ntohs(dport), ntohs(sport), inet_type(words[4])), src, dst, interface, cookie[0] || cookie[1],
                      words[0] == 0 ? "0" : words[0] <= 7200000 ? "+" : "big", words[1], words[2], words[3]);
     const unsigned char *at = b + 72;
     len -= 72;
@@ -12423,6 +12434,8 @@ int main(int argc, char **argv) {
             int syn = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
             printf("syn connect=%ld\n", netns_result(connect(syn, (void *)&full_to, sizeof full_to)));
             inet_add("syn", syn);
+            /* Still in TCP_SYN_SENT, it has no peer getpeername gives. */
+            inet_find("syn")->peer = ntohs(full_to.sin_port);
             struct sockaddr_in6 any6 = {.sin6_family = AF_INET6};
             inet_pton(AF_INET6, "::1", &any6.sin6_addr);
             int listener6 = socket(AF_INET6, SOCK_STREAM, 0);

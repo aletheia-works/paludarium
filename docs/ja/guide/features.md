@@ -1998,7 +1998,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `gettimeofday` より最大 1 ティック遅れます。ティックはホストのもので、ホストの
   `CLOCK_MONOTONIC_COARSE` の分解能です（ホストが教えない macOS、Windows、WebAssembly では
   1 ms）。スケジューラの呼び出しも同じティックを使います。ここでは、ティックは
-  それぞれの時計でその倍数ちょうどに来ます。`clock_getres` は 1 ns、粗い時計では
+  単調時計でその倍数ちょうどに来て、Linux の時刻管理がティックごとに両方を更新するのと
+  同じく、2 つの粗い時計は同じ瞬間に進みます。`clock_getres` は 1 ns、粗い時計では
   ティックの長さを返します。
 - `clock_nanosleep` と `timer_create` は、`CLOCK_REALTIME`、`CLOCK_MONOTONIC`、
   `CLOCK_BOOTTIME`、`CLOCK_TAI`、プロセスの CPU 時計で動きます。`timer_create` は、

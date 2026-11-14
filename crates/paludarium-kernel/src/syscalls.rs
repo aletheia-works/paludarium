@@ -524,9 +524,17 @@ fn read_clock(c: &mut Context<'_>, clock: GuestClock) -> Result<u64, Errno> {
     let thread = crate::account_cpu(c.host, c.group, c.process, c.tid);
     match clock {
         GuestClock::Host(id) => c.host.clock(id),
+        // The ticks fall on whole multiples of the tick on the monotonic
+        // clock, and the real-time clock takes its time at the same instant,
+        // as Linux's timekeeping updates both at each tick.
         GuestClock::Coarse(id) => {
             let tick = scheduler_slice(c.host).tick;
-            c.host.clock(id).map(|now| now - now % tick)
+            let mono = c.host.clock(ClockId::Monotonic)?;
+            let since = mono % tick;
+            match id {
+                ClockId::Monotonic => Ok(mono - since),
+                ClockId::Realtime => c.host.clock(id).map(|now| now.saturating_sub(since)),
+            }
         }
         GuestClock::ProcessCpu => Ok(c.group.process_cpu()),
         GuestClock::ThreadCpu => Ok(thread),

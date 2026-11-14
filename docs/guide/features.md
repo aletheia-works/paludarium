@@ -2293,7 +2293,9 @@ kernel.
   `gettimeofday`. The tick is the host's, the resolution of its
   `CLOCK_MONOTONIC_COARSE` (1 ms where the host does not tell, as on macOS,
   Windows and in WebAssembly), the one the scheduler calls use, and here the ticks
-  fall on whole multiples of it on each clock. `clock_getres` gives 1 ns,
+  fall on whole multiples of it on the monotonic clock, both coarse clocks
+  moving at the same instant, as Linux's timekeeping updates both at each
+  tick. `clock_getres` gives 1 ns,
   and the tick for the coarse clocks.
 - `clock_nanosleep` and `timer_create` run on `CLOCK_REALTIME`,
   `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, `CLOCK_TAI` and the process's CPU

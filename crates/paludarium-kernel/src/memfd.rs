@@ -404,7 +404,9 @@ pub(crate) fn memfd_create(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
 
 thread_local! {
     /// The RLIMIT_MEMLOCK soft limit of the process whose thread this host
-    /// thread runs, as of its last system call ([`enter`]).
+    /// thread runs, as of its last system call ([`enter`]). Every guest
+    /// thread has a host worker of its own (a Web Worker in WebAssembly),
+    /// so the limit is never another thread's.
     static MEMLOCK: std::cell::RefCell<Option<Arc<AtomicU64>>> = const { std::cell::RefCell::new(None) };
 }
 

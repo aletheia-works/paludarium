@@ -269,10 +269,7 @@ verified.
     with. `clock_settime` on a CPU clock named by a negative clock ID gives
     `EINVAL` without reading the time, where Linux reads it, finds the task
     and gives `EPERM`, and the auxiliary clocks (`CLOCK_AUX`) are not there.
-  - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
-    socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
-    the superblock of its pseudo filesystem and gives its counts (0). A
-    file in `/proc` or `/dev` has the `st_dev` of the mount holding the
+  - A file in `/proc` or `/dev` has the `st_dev` of the mount holding the
     path, so `ustat` of it gives that mount's counts, where Linux gives
     procfs's or devtmpfs's.
   - A file handle (`name_to_handle_at`, an inotify watch's in

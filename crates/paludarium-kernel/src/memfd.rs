@@ -27,8 +27,15 @@ pub(crate) const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 pub(crate) const F_SEAL_EXEC: u32 = 0x20;
 const PAGE: u64 = 4096;
 /// Memfds share a device of their own, as Linux's live on its internal
-/// tmpfs mount: minor 0, which no mount here has.
-pub(crate) const DEVICE: u64 = 0;
+/// tmpfs mount.
+pub(crate) const DEVICE: u64 = crate::files::Internal::Shmem.device();
+/// `memfd_secret` files are on secretmem's own mount.
+pub(crate) const SECRET_DEVICE: u64 = crate::files::Internal::Secretmem.device();
+/// The device of `memfd`'s file system: [`SECRET_DEVICE`] for a
+/// `memfd_secret` file, else [`DEVICE`].
+pub(crate) fn device(memfd: &Memfd) -> u64 {
+    if memfd.secret { SECRET_DEVICE } else { DEVICE }
+}
 /// Where a memfd's file lives in its own filesystem.
 const PATH: &[u8] = b"/memfd";
 
@@ -547,8 +554,11 @@ pub(crate) fn memfd_secret(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errn
         secret: true,
         charge: Some(charge),
     });
-    let file =
-        crate::page_cache::CoherentFile::with_device(secret, Arc::clone(&c.files.caches), DEVICE);
+    let file = crate::page_cache::CoherentFile::with_device(
+        secret,
+        Arc::clone(&c.files.caches),
+        SECRET_DEVICE,
+    );
     let fd = c
         .files
         .install(Arc::new(file), flags & O_CLOEXEC != 0, c.group.nofile())?;

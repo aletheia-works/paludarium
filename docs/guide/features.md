@@ -1972,8 +1972,14 @@ kernel.
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
   `--mount`, without host paths). Each mount has its own `st_dev`, as its
-  line in `mountinfo` says, so `df` lists every mount. `ustat` of a mount's
-  `st_dev` gives its free blocks and inodes, and of any other device
+  line in `mountinfo` says, so `df` lists every mount. A pipe, a socket, a
+  pidfd, a memfd, a `memfd_secret` file, a namespace file and an anonymous
+  inode (an eventfd, an epoll and the like) that no path opened are each on
+  a device of their file system's own (pipefs, sockfs, pidfs, the internal
+  tmpfs, secretmem, nsfs, anon_inodefs), as on Linux, none of them a
+  mount's. `ustat` of a mount's `st_dev` gives its free blocks and inodes,
+  of one of those devices none (0, as Linux's `simple_statfs` and the
+  internal tmpfs, which has no limits, give), and of any other device
   `EINVAL`.
 - A file's block size (`st_blksize`, `stx_blksize`, `FIGETBSZ`) is its
   filesystem's, as on Linux: 1024 for `/proc` (procfs), a pseudo-terminal's

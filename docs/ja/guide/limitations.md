@@ -233,11 +233,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ままです。負の時計 ID で表す CPU 時計での `clock_settime` は、時刻を読まずに `EINVAL` を
     返します。Linux は時刻を読み、タスクを探して `EPERM` を返します。補助の時計
     （`CLOCK_AUX`）もありません。
-  - `ustat` が見つけるのはマウントのデバイスだけです。パイプ・ソケット・memfd・名前空間の
-    ファイルの `st_dev` では `EINVAL` を返します。Linux はその疑似ファイルシステムの
-    スーパーブロックを見つけ、その数（0）を返します。`/proc` と `/dev` のファイルの
-    `st_dev` は、そのパスがあるマウントのものなので、`ustat` はそのマウントの数を返します。
-    Linux は procfs や devtmpfs の数を返します。
+  - `/proc` と `/dev` のファイルの `st_dev` は、そのパスがあるマウントのものなので、
+    `ustat` はそのマウントの数を返します。Linux は procfs や devtmpfs の数を返します。
   - ファイルハンドル（`name_to_handle_at` と、`/proc/self/fdinfo` にある inotify の
     ウォッチのもの）の世代は 0（memfd では 1）です。tmpfs は inode ごとに乱数で選びます。ホストの
     ディレクトリのファイルは NFS のエクスポートがないファイルシステムのものとして扱います

@@ -5088,6 +5088,44 @@ mod old_forms {
         assert_eq!(f.ret(136, &[1 << 32 | 1, out]), 0);
         assert_eq!(f.ret(136, &[1, 0]), errno(Errno::EFAULT));
     }
+    #[test]
+    fn internal_file_systems_have_devices_of_their_own_with_nothing_free() {
+        let mut f = fixture();
+        let (name, stat, out) = (DATA, DATA + 0x100, DATA + 0x300);
+        assert_eq!(f.ret(293, &[DATA + 0x80, 0]), 0);
+        let pipe = f.mem.read_u64(GuestAddr(DATA + 0x80)).unwrap() & 0xffff_ffff;
+        let socket = f.ret(41, &[1, 1, 0]);
+        let eventfd = f.ret(290, &[0, 0]);
+        let pid = f.ret(39, &[]);
+        let pidfd = f.ret(434, &[pid, 0]);
+        f.mem.write(GuestAddr(name), b"m\0").unwrap();
+        let memfd = f.ret(319, &[name, 0]);
+        f.mem
+            .write(GuestAddr(name), b"/proc/self/ns/net\0")
+            .unwrap();
+        let namespace = f.ret(2, &[name, 0]);
+        let mut devices = vec![1];
+        for fd in [pipe, socket, eventfd, pidfd, memfd, namespace] {
+            assert_eq!(f.ret(5, &[fd, stat]), 0, "fd {fd}");
+            let device = f.mem.read_u64(GuestAddr(stat)).unwrap();
+            assert!(!devices.contains(&device), "fd {fd}: {device:#x}");
+            devices.push(device);
+            f.mem.write(GuestAddr(out), &[0xff; 32]).unwrap();
+            assert_eq!(f.ret(136, &[device, out]), 0, "fd {fd}");
+            let mut b = [0xffu8; 32];
+            f.mem.read(GuestAddr(out), &mut b).unwrap();
+            assert_eq!(b, [0; 32], "fd {fd}");
+        }
+        // Through /proc/self/fd too.
+        f.mem
+            .write(
+                GuestAddr(name),
+                format!("/proc/self/fd/{pipe}\0").as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(f.ret(4, &[name, stat]), 0);
+        assert_eq!(f.mem.read_u64(GuestAddr(stat)).unwrap(), devices[1]);
+    }
     const MAP_SHARED: u64 = 1;
     const MAP_PRIVATE: u64 = 2;
     const MAP_ANONYMOUS: u64 = 0x20;

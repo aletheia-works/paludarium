@@ -653,9 +653,8 @@ impl NamespaceFile {
         }
     }
 }
-/// The device of namespace files, as Linux's nsfs has its own: a minor
-/// number no mount here takes.
-pub(crate) const DEVICE: u64 = 1 << 19;
+/// The device of namespace files, as Linux's nsfs has its own.
+pub(crate) const DEVICE: u64 = crate::files::Internal::Nsfs.device();
 /// The `stat` of a namespace file: a 0444 regular file of no size, whose
 /// inode is the namespace's number.
 pub(crate) fn file_stat(namespace: &Namespace) -> FileStat {

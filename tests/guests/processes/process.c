@@ -7893,6 +7893,32 @@ static int old_forms_case(void) {
     for (int i = 16; i < 28; i++) names_empty &= ust[i] == 0;
     printf("ustat=%ld names-empty=%d none=%ld fault=%ld\n", u, names_empty,
            ot_errno(syscall(SYS_ustat, 0L, ust)), ot_errno(syscall(SYS_ustat, (long)st.st_dev, NULL)));
+    /* The internal file systems: a device of each one's own, with nothing
+     * free. */
+    int internal_pipe[2];
+    if (pipe(internal_pipe)) return 85;
+    int internal[] = {
+        internal_pipe[0],
+        socket(AF_UNIX, SOCK_STREAM, 0),
+        eventfd(0, 0),
+        (int)syscall(SYS_pidfd_open, (long)getpid(), 0L),
+        (int)syscall(SYS_memfd_create, "ustat", 0L),
+        open("/proc/self/ns/net", O_RDONLY),
+    };
+    const char *internal_names[] = {"pipe", "socket", "eventfd", "pidfd", "memfd", "ns"};
+    dev_t seen[7] = {st.st_dev};
+    for (int i = 0; i < 6; i++) {
+        struct stat is;
+        if (internal[i] < 0 || fstat(internal[i], &is)) return 86;
+        int own = 1;
+        for (int j = 0; j <= i; j++) own &= is.st_dev != seen[j];
+        seen[i + 1] = is.st_dev;
+        memset(ust, 0xff, sizeof ust);
+        long r = ot_errno(syscall(SYS_ustat, (long)is.st_dev, ust));
+        int zero = 1;
+        for (size_t k = 0; k < sizeof ust; k++) zero &= ust[k] == 0;
+        printf("ustat %s own=%d ret=%ld zero=%d\n", internal_names[i], own, r, zero);
+    }
 
     char *shared = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (shared == MAP_FAILED) return 84;

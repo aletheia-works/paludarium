@@ -1358,23 +1358,27 @@ fn directory_entries(
 /// `ustat(dev, ubuf)`, as Linux's: the free blocks and inodes of the
 /// filesystem whose device `dev` is, in the "new" encoding `stat`'s
 /// `st_dev` has (`new_decode_dev`), else `EINVAL`. The devices here are the
-/// mounts' (0:1 the root, as [`device`] numbers them). The 32-byte
+/// mounts' (0:1 the root, as [`device`] numbers them) and the internal file
+/// systems' ([`Internal`]), which have none free, as their `simple_statfs`
+/// and the `shmem_statfs` of a tmpfs of no limits give. The 32-byte
 /// `struct ustat` has an `int f_tfree`, which takes the count's low bits as
 /// C's conversion does, and an `unsigned long f_tinode`; its names are
 /// empty.
 fn ustat(c: &Context<'_>, dev: u32, buf: u64) -> Result<u64, Errno> {
     let major = (dev & 0xfff00) >> 8;
     let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
-    let mounts = c.files.fs.mounts();
-    let mount = (major == 0)
-        .then(|| minor.checked_sub(1))
-        .flatten()
-        .and_then(|i| mounts.get(i as usize))
-        .ok_or(Errno::EINVAL)?;
-    let stats = c.files.fs.statfs(&mount.path)?;
     let mut b = [0u8; 32];
-    b[0..4].copy_from_slice(&(stats.blocks_free as i32).to_le_bytes());
-    b[8..16].copy_from_slice(&stats.files_free.to_le_bytes());
+    if !Internal::ALL.iter().any(|fs| fs.device() == u64::from(dev)) {
+        let mounts = c.files.fs.mounts();
+        let mount = (major == 0)
+            .then(|| minor.checked_sub(1))
+            .flatten()
+            .and_then(|i| mounts.get(i as usize))
+            .ok_or(Errno::EINVAL)?;
+        let stats = c.files.fs.statfs(&mount.path)?;
+        b[0..4].copy_from_slice(&(stats.blocks_free as i32).to_le_bytes());
+        b[8..16].copy_from_slice(&stats.files_free.to_le_bytes());
+    }
     output(c, buf, &b)?;
     Ok(0)
 }
@@ -2782,8 +2786,8 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // As Linux's vfs_statx, the mount's ID whether or not it was asked for:
     // the unique one if that was, the one mountinfo shows otherwise. A
     // mount's minor number is its position in mountinfo, whose IDs start at
-    // 21; a memfd's device 0 gives 20, a mount mountinfo does not show, as
-    // Linux's internal one for memfds is not shown.
+    // 21; an internal file system's minor gives a mount mountinfo does not
+    // show, as Linux's internal mounts are not shown.
     let id = mount_id(device);
     let (bit, id) = if mask & STATX_MNT_ID_UNIQUE != 0 {
         (STATX_MNT_ID_UNIQUE, 1 << 31 | id)
@@ -2826,11 +2830,13 @@ pub(crate) const ESTALE: Errno = Errno(116);
 /// the inode); any other's is the identifier `exportfs_encode_ino64_fid`
 /// gives a file system without NFS export (`FILEID_INO64_GEN`: the inode,
 /// then the generation). The in-memory root's files have the generation 0
-/// and memfds (on `device` [`crate::memfd::DEVICE`]) 1, so that neither's
+/// and memfds (on `device` [`crate::memfd::DEVICE`] or
+/// [`crate::memfd::SECRET_DEVICE`]) 1, so that neither's
 /// handle names the other's file, where tmpfs picks a random generation for
 /// each inode.
 pub(crate) fn file_handle(kind: u64, device: u64, inode: u64) -> (u32, Vec<u8>) {
-    let generation = u32::from(device == crate::memfd::DEVICE);
+    let generation =
+        u32::from(device == crate::memfd::DEVICE || device == crate::memfd::SECRET_DEVICE);
     match kind {
         paludarium_vfs::TMPFS_MAGIC => (
             FILEID_INO32_GEN,
@@ -3273,16 +3279,60 @@ pub(crate) fn pause_for_lock(c: &mut Context<'_>) -> Result<(), Errno> {
     }
     Ok(())
 }
-/// The device of the file a descriptor holds: a memfd's own (it is on no
-/// mount), else that of the mount holding its path.
+/// The file systems Linux keeps on internal mounts that no path reaches.
+/// Each has a device of its own, as `get_anon_bdev` gives each superblock
+/// one: here from the top of the 20-bit minors down, which no mount takes.
+#[derive(Clone, Copy)]
+pub(crate) enum Internal {
+    /// `shm_mnt`, the tmpfs of memfds.
+    Shmem,
+    Nsfs,
+    Pipefs,
+    Sockfs,
+    /// The anonymous inodes' (eventfds, epolls, timerfds and the like).
+    AnonInodes,
+    Pidfs,
+    Secretmem,
+}
+impl Internal {
+    const ALL: [Self; 7] = [
+        Self::Shmem,
+        Self::Nsfs,
+        Self::Pipefs,
+        Self::Sockfs,
+        Self::AnonInodes,
+        Self::Pidfs,
+        Self::Secretmem,
+    ];
+    /// Its device, in `stat`'s encoding (`new_encode_dev`).
+    pub(crate) const fn device(self) -> u64 {
+        let minor = 0xf_ffff - self as u64;
+        minor & 0xff | (minor & !0xff) << 12
+    }
+}
+/// The device of the file a descriptor holds: an internal file system's for
+/// a memfd, a namespace file, a pipe, a socket, a pidfd or a file of no type
+/// (an anonymous inode) that no path opened, else that of the mount holding
+/// its path.
 pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
     let any = d.file.as_any();
-    if any.is_some_and(|v| v.is::<crate::memfd::Memfd>()) {
-        crate::memfd::DEVICE
-    } else if is_namespace(d) {
-        crate::namespaces::DEVICE
-    } else {
-        device(c, &d.path)
+    if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
+        return crate::memfd::device(memfd);
+    }
+    if is_namespace(d) {
+        return crate::namespaces::DEVICE;
+    }
+    if !d.path.is_empty() {
+        return device(c, &d.path);
+    }
+    if any.is_some_and(|v| v.is::<crate::processes::PidFd>()) {
+        return Internal::Pidfs.device();
+    }
+    match d.file.stat().map(|stat| stat.mode & 0o170000) {
+        Ok(0o010000) => Internal::Pipefs.device(),
+        Ok(0o140000) => Internal::Sockfs.device(),
+        Ok(0) => Internal::AnonInodes.device(),
+        _ => device(c, &d.path),
     }
 }
 /// The minor number of the mount that holds `path` (the longest matching
@@ -5706,7 +5756,7 @@ fn reopen(
         let file = crate::page_cache::CoherentFile::with_device(
             memfd.reopen(flags)?,
             Arc::clone(&c.files.caches),
-            crate::memfd::DEVICE,
+            crate::memfd::device(memfd),
         )
         .writing(flags)?;
         return Ok((Arc::new(file), Vec::new()));

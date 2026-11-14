@@ -37,6 +37,7 @@
     {"name":"madvise-fork","binary":"process"},
     {"name":"madvise-remove","binary":"process"},
     {"name":"madvise-guard","binary":"process"},
+    {"name":"fork-page-tables","binary":"process"},
     {"name":"mrelease","binary":"process"},
     {"name":"mempolicy","binary":"process"},
     {"name":"memfd-secret","binary":"process"},

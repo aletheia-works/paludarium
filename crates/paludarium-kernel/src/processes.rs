@@ -2093,6 +2093,7 @@ impl Kernel {
             434 => self.pidfd_open(thread, a),
             424 => self.pidfd_send_signal(thread, a),
             312 => self.kcmp(thread, mem, a),
+            274 => self.get_robust_list(thread, mem, a),
             310 | 311 => self.process_vm(thread, mem, a, n == 311),
             438 => self.pidfd_getfd(thread, a),
             440 => self.process_madvise(thread, mem, a),
@@ -3347,20 +3348,67 @@ impl Kernel {
         }
         Ok(memory)
     }
-    /// Whether the caller may attach to a thread of another process, as
-    /// Linux's `__ptrace_may_access` with `PTRACE_MODE_ATTACH_REALCREDS`
-    /// decides ([`crate::credentials::Credentials::may_read_task`] with the
-    /// real IDs): no Yama restriction is applied on top.
+    /// `get_robust_list(pid, head, length)`, as Linux's
+    /// `futex_get_robust_list_common`: the task the caller's PID namespace
+    /// numbers `pid`, an `int` (the caller for 0, `ESRCH` for none), must be
+    /// of the caller's process or one it may read (`ptrace_may_access` with
+    /// `PTRACE_MODE_READ_REALCREDS`, [`Self::may_attach`], `EPERM`); then the
+    /// length is written and the head (`EFAULT`). A zombie's list went as it
+    /// ended, so its head is 0.
+    fn get_robust_list(
+        &self,
+        thread: &Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        let esrch = Errno(3);
+        let number = a[0] as i32;
+        let tid = if number == 0 {
+            thread.tid
+        } else {
+            let number = u32::try_from(number).map_err(|_| esrch)?;
+            self.pid_space(thread.tid).task(number).ok_or(esrch)?
+        };
+        let head = if tid == thread.tid || self.group.has_member(tid) {
+            self.group.robust_list(tid).ok_or(esrch)?
+        } else {
+            let pid = match self.processes.view(tid) {
+                Some(_) => tid,
+                None => self.processes.thread_leader(tid).ok_or(esrch)?,
+            };
+            let view = self.processes.view(pid).ok_or(esrch)?;
+            let public = view.group.public(tid).ok_or(esrch)?;
+            if !Self::may_attach(thread, &view, &public) {
+                return Err(Errno::EPERM);
+            }
+            if view.zombie {
+                0
+            } else {
+                view.group.robust_list(tid).ok_or(esrch)?
+            }
+        };
+        mem.write_u64(GuestAddr(a[2]), crate::futex::ROBUST_LIST_HEAD)
+            .and_then(|()| mem.write_u64(GuestAddr(a[1]), head))
+            .map_err(|_| Errno::EFAULT)?;
+        Ok(0)
+    }
+    /// Whether the caller may attach to or read a thread of another process,
+    /// as Linux's `__ptrace_may_access` with `PTRACE_MODE_ATTACH_REALCREDS`
+    /// or `PTRACE_MODE_READ_REALCREDS` decides
+    /// ([`crate::credentials::Credentials::may_read_task`] with the real
+    /// IDs). The two modes differ only in Yama, which restricts attaching
+    /// and is not applied here. A zombie keeps the dumpability it had, as
+    /// Linux 7.1 and later keep it in the task's `exec_state` (before, a
+    /// task with no `mm` skipped the check).
     fn may_attach(
         thread: &Thread,
         view: &ProcessView,
         public: &crate::threads::PublicThread,
     ) -> bool {
-        thread.state.credentials.may_read_task(
-            &public.credentials,
-            view.dumpable || view.zombie,
-            true,
-        )
+        thread
+            .state
+            .credentials
+            .may_read_task(&public.credentials, view.dumpable, true)
     }
     /// `pidfd_getfd(pidfd, targetfd, flags)`, as Linux's: `flags` must be 0
     /// (`EINVAL`) and `pidfd` a pidfd (`EBADF`); its process must not be

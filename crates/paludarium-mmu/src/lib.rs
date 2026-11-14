@@ -113,6 +113,10 @@ pub struct Mapping {
     pub wipe_on_fork: bool,
     /// `MADV_DONTDUMP` (Linux's `VM_DONTDUMP`): a core dump holds none of it.
     pub dont_dump: bool,
+    /// `MADV_GUARD_INSTALL` put guards in its Linux VMA (`VM_MAYBE_GUARD`),
+    /// which stays when they go, does not stop a merge, and makes `fork`
+    /// copy the VMA's page tables.
+    pub maybe_guard: bool,
 }
 
 /// The `madvise` advice that sets or clears a flag of the VMAs of a range
@@ -2169,6 +2173,7 @@ impl AddressSpaceData {
             .directory
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner) = directory;
+        copy.drop_refaultable_pages();
         // MADV_DONTFORK leaves the child a hole; MADV_WIPEONFORK leaves it
         // the mapping with no page and no `anon_vma`, as Linux's `dup_mmap`
         // neither copies the one nor the other's page tables.
@@ -2195,6 +2200,46 @@ impl AddressSpaceData {
 
     fn bump_code_generation(&mut self) {
         self.code.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Drops the page entries of a forked child that Linux's `fork` does not
+    /// copy (`vma_needs_copy`): those of a VMA with no `anon_vma`
+    /// ([`Mapping::written`]) and no guards (`VM_MAYBE_GUARD`), which a
+    /// fault fills again. Such an entry is one of shared memory, a page of
+    /// the file's page cache, or one with no contents of private
+    /// anonymous memory. An entry with contents of its own (an ELF
+    /// segment's, which the loader wrote) stays, as nothing would give them
+    /// back.
+    fn drop_refaultable_pages(&mut self) {
+        let mut regions = Vec::new();
+        let mut at = self.mappings.keys().next().copied();
+        while let Some(start) = at {
+            let Some((first, last)) = self.region_at(start) else {
+                break;
+            };
+            let copies = self
+                .mappings
+                .range(first..last)
+                .any(|(_, m)| m.written || m.maybe_guard);
+            if !copies {
+                regions.push((first, last, self.shared_at(first).is_some()));
+            }
+            at = self.mappings.range(last..).next().map(|(&s, _)| s);
+        }
+        if regions.is_empty() {
+            return;
+        }
+        for (first, last, shared) in regions {
+            self.for_populated(first, last, |entry| {
+                let refaults = entry
+                    .as_ref()
+                    .is_some_and(|p| shared || p.cache || (p.frame.get().is_none() && !p.file));
+                if refaults {
+                    *entry = None;
+                }
+            });
+        }
+        self.bump_code_generation();
     }
 
     /// The mappings in address order.
@@ -2845,6 +2890,7 @@ impl AddressSpaceData {
                 dont_fork: false,
                 wipe_on_fork: false,
                 dont_dump: false,
+                maybe_guard: false,
             },
         );
         Ok(GuestAddr(start))
@@ -3384,6 +3430,11 @@ impl AddressSpaceData {
         }
         if !shared && !file {
             self.mark_written(GuestAddr(from), to - from);
+        }
+        if let Some((first, last)) = self.region_at(from) {
+            for (_, mapping) in self.mappings.range_mut(first..last) {
+                mapping.maybe_guard = true;
+            }
         }
         self.add_guards(from, to);
         self.bump_code_generation();
@@ -5256,6 +5307,56 @@ mod tests {
                 .all(|m| !m.dont_fork && !m.wipe_on_fork && !m.dont_dump)
         );
         assert_eq!(space.vma_at(at(2)), Some((at(0), 4 * PAGE_SIZE)));
+    }
+
+    #[test]
+    fn a_child_gets_the_page_tables_linux_copies() {
+        let mut space = AddressSpace::new();
+        let map = |space: &mut AddressSpace, at: u64, prot: Prot| {
+            space
+                .map(Some(GuestAddr(at)), PAGE_SIZE, prot, MappingKind::Anonymous)
+                .unwrap();
+        };
+        // Written, only read, shared, and shared with guards once.
+        map(&mut space, 0x50000, Prot::READ_WRITE);
+        map(&mut space, 0x60000, Prot::READ_WRITE);
+        map(&mut space, 0x70000, Prot::READ_WRITE);
+        map(&mut space, 0x80000, Prot::READ_WRITE);
+        for at in [0x70000, 0x80000] {
+            space
+                .share_pages(GuestAddr(at), PAGE_SIZE, &SharedPages::new(), 0, true)
+                .unwrap();
+        }
+        space.write_u64(GuestAddr(0x50000), 1).unwrap();
+        space.mark_written(GuestAddr(0x50000), 8);
+        space.read_u64(GuestAddr(0x60000)).unwrap();
+        space.write_u64(GuestAddr(0x70000), 3).unwrap();
+        space.guard(GuestAddr(0x80000), 0x81000, true).unwrap();
+        space.guard(GuestAddr(0x80000), 0x81000, false).unwrap();
+        space.write_u64(GuestAddr(0x80000), 4).unwrap();
+        assert_eq!(space.page_state(GuestAddr(0x60000)), Some(PageState::Zero));
+        let child = space.fork();
+        let states: Vec<_> = [0x50000, 0x60000, 0x70000, 0x80000]
+            .map(|at| child.page_state(GuestAddr(at)))
+            .into();
+        assert_eq!(
+            states,
+            vec![
+                Some(PageState::Present),
+                Some(PageState::Absent),
+                Some(PageState::Absent),
+                Some(PageState::Present)
+            ]
+        );
+        // What the child lost a fault brings back.
+        assert_eq!(child.read_u64(GuestAddr(0x70000)).unwrap(), 3);
+        assert_eq!(child.read_u64(GuestAddr(0x60000)).unwrap(), 0);
+        assert_eq!(child.read_u64(GuestAddr(0x50000)).unwrap(), 1);
+        // The parent keeps its own.
+        assert_eq!(
+            space.page_state(GuestAddr(0x70000)),
+            Some(PageState::Present)
+        );
     }
 
     #[test]

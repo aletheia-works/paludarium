@@ -383,6 +383,12 @@ kernel.
   a word the thread owned is marked `FUTEX_OWNER_DIED`, with a shared wake if
   it has `FUTEX_WAITERS`, the walk stops at what it cannot use and after 2048
   entries, and a core dump comes first. A new thread or process has no list.
+  `get_robust_list` gives another process's thread's head to a caller that may
+  read it, as Linux's `ptrace_may_access` with `PTRACE_MODE_READ_REALCREDS`
+  decides (`EPERM` before the addresses are written), and 0 for a zombie. A
+  zombie keeps the dumpability it had for that check, and for `kcmp`,
+  `pidfd_getfd`, `migrate_pages` and `move_pages`, as Linux 7.1 and later keep
+  it (before, a process with no memory left skipped it).
 - `futex`, `epoll` and `eventfd` are implemented inside paludarium, not with the
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
@@ -1711,7 +1717,11 @@ kernel.
   moves nothing either; each status is that of the page: 0 (node 0) for a
   page of its own, `-ENOENT` for one nothing touched yet, and `-EFAULT` for
   the zero page that only reading private anonymous memory maps, or where
-  nothing is mapped. A node other than 0 is `ENODEV`.
+  nothing is mapped. A node other than 0 is `ENODEV`. A `fork`ed child has
+  the page tables of a VMA only when Linux's `vma_needs_copy` copies them:
+  one with an `anon_vma` (private memory something wrote) or that had guard
+  regions. The pages of any other VMA it faults in again, so they are
+  `-ENOENT` until it touches them.
 - `uname` reports Linux on x86_64 with the host name `paludarium` and the
   domain name `(none)` of the thread's UTS namespace, until `sethostname` or
   `setdomainname` changes them (`CAP_SYS_ADMIN`, else `EPERM`; at most 64

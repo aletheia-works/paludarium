@@ -223,10 +223,11 @@ verified.
     is sent to it, but from another fatal signal only once one of its
     threads takes it, where Linux marks the process as it sends any signal
     that will end it (`EINVAL` here until then).
-  - In a child of `fork`, `move_pages` shows a page of a shared mapping, or
-    of a private one never written, that the parent had touched as there,
-    where Linux copies no page table of such a VMA (`-ENOENT`
-    until the child touches the page).
+  - In a child of `fork`, `move_pages` shows a page of a program's own
+    ELF segment that the loader wrote and nothing wrote since as there,
+    where Linux copies no page table of a VMA without an `anon_vma`
+    (`-ENOENT` until the child touches the page): the loader's copy is
+    the only one the page has here.
   - An error that ends `recvmmsg` after some messages is dropped, where
     Linux keeps it as the socket's error for the next call and
     `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.
@@ -302,15 +303,14 @@ verified.
     each semaphore beside one for operations on several, and which of two
     waits that both could go through goes first can differ where waits of
     both kinds are mixed.
-  - `get_robust_list` of another process is `ESRCH`, where Linux gives it to a
-    caller that may trace that process.
   - Whether a caller may attach to another process (`process_vm_readv`,
     `process_vm_writev`, `pidfd_getfd`) is decided by the IDs, dumpability,
     `CAP_SYS_PTRACE` and Landlock alone, as Linux with no Yama does: there is
     no `kernel.yama.ptrace_scope`, so a process may reach its parent, where
-    Yama's default scope 1 lets only an ancestor in, and the capability
-    module's check that the caller's permitted capabilities cover the
-    target's is not made.
+    Yama's default scope 1 lets only an ancestor in. For that and for reading
+    another process (`get_robust_list`, `kcmp`, `migrate_pages`,
+    `move_pages`), the capability module's check that the caller's permitted
+    capabilities cover the target's is not made.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.

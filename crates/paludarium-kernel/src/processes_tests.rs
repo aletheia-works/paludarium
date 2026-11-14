@@ -5454,3 +5454,73 @@ mod process_mrelease {
         assert_eq!(release(&mut k, &mut t, &m, pidfd, 0), esrch);
     }
 }
+mod robust_lists {
+    use super::*;
+    const HEAD: u64 = DATA + 0x100;
+    /// `get_robust_list(pid, DATA, DATA + 8)`, and the head it wrote.
+    fn get(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, pid: u64) -> (u64, u64) {
+        m.write_u64(GuestAddr(DATA), 1).unwrap();
+        let r = syscall(k, t, m, 274, [pid, DATA, DATA + 8, 0, 0, 0]);
+        (r, m.read_u64(GuestAddr(DATA)).unwrap())
+    }
+    #[test]
+    fn another_process_s_list_is_read_by_who_may_read_it() {
+        let (mut k, mut t, m) = setup();
+        let (esrch, eperm) = (
+            Errno(3).to_syscall_return(),
+            Errno::EPERM.to_syscall_return(),
+        );
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let child = u64::from(ct.tid);
+        assert_eq!(get(&mut k, &mut t, &m, child), (0, 0));
+        assert_eq!(
+            syscall(&mut c, &mut ct, &cm, 273, [HEAD, 24, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(get(&mut k, &mut t, &m, child), (0, HEAD));
+        assert_eq!(m.read_u64(GuestAddr(DATA + 8)), Ok(24));
+        // The number is an `int`.
+        assert_eq!(get(&mut k, &mut t, &m, child | 1 << 32), (0, HEAD));
+        // CAP_SYS_PTRACE reads one that is not dumpable.
+        assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [4, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(get(&mut k, &mut t, &m, child), (0, HEAD));
+        // Without it, only a dumpable process of the same IDs, and the
+        // permission comes before the addresses.
+        let user = [1000, 1000, 1000, 0, 0, 0];
+        let (mut o, mut ot, om) = fork(&mut k, &mut t, &m);
+        let other = u64::from(ot.tid);
+        assert_eq!(syscall(&mut o, &mut ot, &om, 117, user), 0);
+        assert_eq!(
+            syscall(&mut o, &mut ot, &om, 273, [HEAD, 24, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 117, user), 0);
+        assert_eq!(get(&mut k, &mut t, &m, child).0, eperm);
+        assert_eq!(syscall(&mut o, &mut ot, &om, 157, [4, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(get(&mut k, &mut t, &m, other).0, eperm);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 274, [other, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        assert_eq!(syscall(&mut o, &mut ot, &om, 157, [4, 1, 0, 0, 0, 0]), 0);
+        assert_eq!(get(&mut k, &mut t, &m, other), (0, HEAD));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 274, [other, 0, DATA + 8, 0, 0, 0]),
+            Errno::EFAULT.to_syscall_return()
+        );
+        // A zombie's list went as it ended, and it keeps its dumpability,
+        // as Linux 7.1 and later keep it; a reaped process is gone.
+        let (mut n, mut nt, nm) = fork(&mut k, &mut t, &m);
+        let undumpable = u64::from(nt.tid);
+        assert_eq!(syscall(&mut n, &mut nt, &nm, 157, [4, 0, 0, 0, 0, 0]), 0);
+        finish(&mut n, &nt, &nm, ExitStatus::Exited(0));
+        assert_eq!(get(&mut k, &mut t, &m, undumpable).0, eperm);
+        finish(&mut o, &ot, &om, ExitStatus::Exited(0));
+        assert_eq!(get(&mut k, &mut t, &m, other), (0, 0));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [other, 0, 0, 0, 0, 0]),
+            other
+        );
+        assert_eq!(get(&mut k, &mut t, &m, other).0, esrch);
+    }
+}

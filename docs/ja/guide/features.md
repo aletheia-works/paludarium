@@ -338,7 +338,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   のときに、Linux の `exit_robust_list` と同じようにリストをたどります。スレッドが
   持っていたワードに `FUTEX_OWNER_DIED` を付け、`FUTEX_WAITERS` があれば shared の
   wake をします。使えないものに当たるか 2048 個たどると止まり、コアダンプはその前に
-  書きます。新しいスレッドとプロセスのリストは空です。
+  書きます。新しいスレッドとプロセスのリストは空です。`get_robust_list` は、ほかの
+  プロセスのスレッドの先頭も、Linux の `ptrace_may_access` が
+  `PTRACE_MODE_READ_REALCREDS` で読めるとする呼び出し元には返します（`EPERM` は
+  アドレスに書く前です）。ゾンビなら 0 です。この検査と、`kcmp`、`pidfd_getfd`、
+  `migrate_pages`、`move_pages` の検査では、Linux 7.1 以降と同じく、ゾンビもダンプ
+  できるかどうかをそのまま持ちます（それより前は、メモリのなくなったプロセスでは
+  この判定を飛ばしていました）。
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
 - [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET`、`AF_INET6`、`AF_NETLINK` に
@@ -1480,7 +1486,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `move_pages` も何も動かさず、状態にはページのものを返します。自分のページは 0
   （ノード 0）、まだ何も触れていないページは `-ENOENT`、プライベートの匿名メモリを
   読んだだけで割り当てられるゼロページと、何もマップされていない所は `-EFAULT` です。
-  0 以外のノードは `ENODEV` です。
+  0 以外のノードは `ENODEV` です。`fork` の子は、Linux の `vma_needs_copy` がコピーする
+  VMA のページテーブルだけを受け継ぎます。`anon_vma` を持つ VMA（何かが書き込んだ
+  プライベートのメモリ）と、ガード領域を置いたことのある VMA です。ほかの VMA の
+  ページは子が改めて割り当てるので、子が触れるまでは `-ENOENT` です。
 - `uname` は x86_64 の Linux で、スレッドの UTS 名前空間のホスト名 `paludarium` と
   ドメイン名 `(none)` を答えます。これは `sethostname` と `setdomainname` で変えられます
   （`CAP_SYS_ADMIN` がなければ `EPERM`、64 バイトを超えると `EINVAL`）。`CPUID` と同じく、

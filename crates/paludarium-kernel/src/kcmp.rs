@@ -113,7 +113,7 @@ pub(crate) fn compare(
         std::ptr::eq(Arc::as_ptr(&task.group), caller.0)
             || caller
                 .1
-                .may_read_task(&task.credentials, task.dumpable || task.zombie, true)
+                .may_read_task(&task.credentials, task.dumpable, true)
     };
     if !readable(first) || !readable(second) {
         return Err(Errno::EPERM);

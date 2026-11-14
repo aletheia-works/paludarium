@@ -237,11 +237,14 @@ impl Files {
         ]
     }
     /// Uses `fs`, keeping its files in step with their page caches.
+    /// The root goes back to the machine's, as a view of the old
+    /// filesystem would keep showing it.
     pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
         self.machine_fs = Arc::new(crate::page_cache::CoherentFs::new(
             fs,
             Arc::clone(&self.caches),
         ));
+        *self.root.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
     /// The filesystem as this process sees it: from its root.
     pub(crate) fn fs(&self) -> Arc<dyn FileSystem> {
@@ -553,8 +556,8 @@ impl Files {
     /// whose `..` would leave the root as written stops there, as Linux's
     /// walk does at `fs->root`, so no check of the text sees a name above it.
     pub(crate) fn path(&self, dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
-        let joined = self.joined(dir, p)?;
         let root = self.root();
+        let joined = self.joined(&root, dir, p)?;
         if root == b"/" {
             return Ok(joined);
         }
@@ -565,18 +568,17 @@ impl Files {
             _ => Ok(joined),
         }
     }
-    fn joined(&self, dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
+    fn joined(&self, root: &[u8], dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
         if p.is_empty() {
             return Err(Errno::ENOENT);
         }
         if p.first() == Some(&b'/') {
-            let root = self.root();
             if root == b"/" {
                 return Ok(p);
             }
             let start = p.iter().position(|&b| b != b'/').unwrap_or(p.len());
             let rest = &p[start..];
-            let mut at = root;
+            let mut at = root.to_vec();
             if !rest.is_empty() {
                 at.push(b'/');
                 at.extend_from_slice(rest);

@@ -7683,9 +7683,13 @@ static int chroot_case(const char *self) {
     fflush(stdout);
     child = fork();
     if (child == 0) {
+        /* Each line out before an early _exit. */
+        setvbuf(stdout, NULL, _IOLBF, 0);
         if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
         if (chdir(cr_base)) _exit(91);
-        printf("chroot=%ld\n", cr_call(jail));
+        long rooted = cr_call(jail);
+        printf("chroot=%ld\n", rooted);
+        if (rooted) _exit(89);
         cr_cwd("outside");
         cr_read("/f", "/f");
         cr_read("/../../f", "/../../f");

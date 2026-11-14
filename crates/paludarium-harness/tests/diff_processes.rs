@@ -345,6 +345,7 @@ mod linux {
         processes_smaps_flags => ("smaps-flags","process"),
         processes_mrelease_fatal => ("mrelease-fatal","process"),
         processes_madvise_guard => ("madvise-guard","process"),
+        processes_grows_down => ("grows-down","process"),
         processes_fork_page_tables => ("fork-page-tables","process"),
         processes_mrelease => ("mrelease","process"),
         processes_mempolicy => ("mempolicy","process"),

@@ -1194,9 +1194,22 @@ kernel.
   and `PROT_GROWSUP`, a misaligned start, an empty range (which succeeds
   whatever the bits), an end that overflows (`ENOMEM`), then unknown bits.
   `PROT_GROWSDOWN` extends the range down to the start of the first VMA in
-  it, which must grow down (the main stack), else `EINVAL`; `PROT_GROWSUP` is
+  it, which must grow down (the main stack, or a `MAP_GROWSDOWN` mapping),
+  else `EINVAL`; `PROT_GROWSUP` is
   `EINVAL` on a mapped start, as no VMA grows up on x86-64. Where no VMA is
   in the range, both give `ENOMEM`.
+- A mapping that grows down, the main stack or private anonymous memory that
+  `mmap` made with `MAP_GROWSDOWN` (`VmFlags` shows `gd`), grows as Linux's
+  `expand_downwards` makes it: an access to an unmapped page below it, or a
+  signal frame written there, extends it down to that page, and the access is
+  made again. It does not grow below `mmap_min_addr` (64 KiB), within the
+  guard gap of 256 pages (`stack_guard_gap`) above a mapping that does not
+  grow down and can be accessed, past `RLIMIT_STACK` for the whole VMA, or,
+  locked, past `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`; the access then gives
+  `SIGSEGV`. No mapping is placed within that gap below it, whether at a hint
+  or where `mmap` looks for room. A file's mapping, `/dev/zero`'s included,
+  and shared memory cannot grow down (`EINVAL`). The main stack's VMA starts
+  at 8 MiB, so with a larger `RLIMIT_STACK` it grows past that.
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or

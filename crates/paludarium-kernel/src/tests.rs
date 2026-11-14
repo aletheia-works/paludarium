@@ -3961,6 +3961,56 @@ mod mprotect_order {
         assert_eq!(f.ret(329, &[stack, 4096, 1 | GROWSDOWN, u64::MAX]), 0);
         assert_eq!(prot_at(&f, stack), Prot::READ);
     }
+
+    #[test]
+    fn a_map_growsdown_mapping_grows_down_at_a_fault() {
+        const MAP_GROWSDOWN: u64 = 0x100;
+        const PRIVATE_FIXED: u64 = 0x02 | 0x10 | 0x20;
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        // Only private anonymous memory grows down.
+        assert_eq!(
+            f.ret(9, &[0, 4096, 3, 0x01 | 0x20 | MAP_GROWSDOWN, u64::MAX, 0]),
+            einval
+        );
+        let at = 0x60_0000;
+        let flags = PRIVATE_FIXED | MAP_GROWSDOWN;
+        assert_eq!(f.ret(9, &[at, 0x2000, 3, flags, u64::MAX, 0]), at);
+        // A fault two pages below takes both pages, and the access runs again.
+        let rip = GuestAddr(0x1234);
+        let fault = |addr| ExitReason::PageFault {
+            rip,
+            addr: GuestAddr(addr),
+            write: true,
+            fetch: false,
+            mapped: false,
+            present: false,
+        };
+        assert_eq!(
+            f.kernel.handle(&mut f.thread, &f.mem, fault(at - 0x1ff8)),
+            Next::Resume
+        );
+        assert_eq!(f.thread.cpu.rip, rip);
+        assert_eq!(
+            f.mem.vma_at(GuestAddr(at)),
+            Some((GuestAddr(at - 0x2000), 0x4000))
+        );
+        f.mem.write(GuestAddr(at - 0x2000), &[1]).unwrap();
+        // PROT_GROWSDOWN reaches the new start.
+        assert_eq!(f.ret(10, &[at, 4096, 1 | GROWSDOWN]), 0);
+        assert_eq!(prot_at(&f, at - 0x2000), Prot::READ);
+        assert_eq!(prot_at(&f, at + 0x1000), Prot::READ_WRITE);
+        // Below memory that does not grow down, a fault is still SIGSEGV.
+        let plain = 0x70_0000;
+        assert_eq!(
+            f.ret(9, &[plain, 4096, 3, PRIVATE_FIXED, u64::MAX, 0]),
+            plain
+        );
+        assert_eq!(
+            f.kernel.handle(&mut f.thread, &f.mem, fault(plain - 8)),
+            Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
+        );
+    }
 }
 
 mod io_uring {

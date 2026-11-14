@@ -6166,9 +6166,9 @@ static int io_uring_case(void) {
     return 0;
 }
 
-/* mprotect's checks in Linux's order, and the grows flags: only the main
-   stack grows down (a MAP_GROWSDOWN mapping does on Linux but not in the
-   emulator), and nothing grows up on x86-64. */
+/* mprotect's checks in Linux's order, and the grows flags: the main stack
+   grows down (as a MAP_GROWSDOWN mapping does, see grows_down_case), and
+   nothing grows up on x86-64. */
 static void pkey_show(const char *label, long r);
 
 static int mprotect_checks_case(void) {
@@ -6952,6 +6952,104 @@ static int madvise_guard_case(void) {
     printf("aio-ring install=%ld remove=%ld\n", ring_install, ring_remove);
     syscall(SYS_io_destroy, ring);
     sigaction(SIGSEGV, &old, NULL);
+    return 0;
+}
+/* A mapping that MAP_GROWSDOWN makes grows down as the main stack does: a
+ * touch of an unmapped page below it extends its VMA down to that page,
+ * unless a VMA below that can be accessed ends within the guard gap (256
+ * pages) or the VMA would pass RLIMIT_STACK. No mapping is placed in that
+ * gap, a signal frame written below it extends it as well, and neither a
+ * file's mapping nor shared memory grows down. A reservation that cannot be
+ * accessed keeps the other mappings away. */
+static unsigned long grows_start(const void *at) {
+    struct maps_line line;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    unsigned long start =
+        fd >= 0 && maps_find(maps_text(fd), (unsigned long)at, &line) ? line.start : 0;
+    if (fd >= 0) close(fd);
+    return start;
+}
+static void grows_touch(const char *label, char *top, char *at, int write) {
+    char out[64];
+    guard_touch(out, at, write);
+    unsigned long start = grows_start(top);
+    printf("%s: %s grown-to-it=%d pages=%ld\n", label, out,
+           start == ((uintptr_t)at & ~(uintptr_t)4095), (long)((uintptr_t)top + 8192 - start) / 4096);
+}
+static volatile int grows_handled;
+static void grows_on_usr1(int sig) {
+    (void)sig;
+    grows_handled = 1;
+}
+static int grows_down_case(void) {
+    long page = 4096, mib = 1 << 20;
+    struct sigaction action = {0}, old;
+    action.sa_sigaction = on_guard;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGSEGV, &action, &old)) return 80;
+    int zero = open("/dev/zero", O_RDWR);
+    if (zero < 0) return 81;
+    char *m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
+    printf("shared: %d errno=%d\n", m == MAP_FAILED, m == MAP_FAILED ? errno : 0);
+    m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_GROWSDOWN, zero, 0);
+    printf("file: %d errno=%d\n", m == MAP_FAILED, m == MAP_FAILED ? errno : 0);
+    close(zero);
+    char *area = mmap(NULL, (size_t)(8 * mib), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return 82;
+    munmap(area + 5 * mib, (size_t)(2 * mib));
+    char *g = mmap(area + 7 * mib, (size_t)(2 * page), PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
+    if (g != area + 7 * mib) return 83;
+    smaps_show("made", g, SMAPS_SIZE);
+    grows_touch("below", g, g - page, 1);
+    grows_touch("far-below", g, g - 9 * page, 0);
+    smaps_show("grown", g, SMAPS_SIZE);
+    /* PROT_GROWSDOWN reaches down to the start of the VMA. */
+    printf("protect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_GROWSDOWN));
+    grows_touch("read-only", g, g - page, 1);
+    printf("unprotect: %d\n", mprotect(g, (size_t)page, PROT_READ | PROT_WRITE | PROT_GROWSDOWN));
+    /* A hint in the gap is not taken; one at its edge is. */
+    char *start = (char *)grows_start(g);
+    char *h = mmap(start - 2 * page, (size_t)page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("hint-in-gap: %d\n", h == start - 2 * page);
+    if (h != MAP_FAILED) munmap(h, (size_t)page);
+    char *below = mmap(start - mib - page, (size_t)page, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("hint-at-gap: %d\n", below == start - mib - page);
+    if (below != start - mib - page) return 84;
+    /* That mapping ends at the gap, so nothing more may grow, unless it
+     * cannot be accessed. */
+    grows_touch("near-other", g, start - page, 1);
+    mprotect(below, (size_t)page, PROT_NONE);
+    grows_touch("near-inaccessible", g, start - page, 1);
+    munmap(below, (size_t)page);
+    /* RLIMIT_STACK bounds the whole VMA. */
+    struct rlimit limit, small;
+    getrlimit(RLIMIT_STACK, &limit);
+    start = (char *)grows_start(g);
+    small = limit;
+    small.rlim_cur = (rlim_t)(g + 2 * page - start + page);
+    if (setrlimit(RLIMIT_STACK, &small)) return 85;
+    grows_touch("past-limit", g, start - 2 * page, 1);
+    grows_touch("at-limit", g, start - page, 1);
+    setrlimit(RLIMIT_STACK, &limit);
+    /* A signal frame on an alternate stack that ends just inside it. */
+    start = (char *)grows_start(g);
+    stack_t alt = {.ss_sp = start + 256 - 64 * 1024, .ss_size = 64 * 1024, .ss_flags = 0}, was;
+    if (sigaltstack(&alt, &was)) return 86;
+    struct sigaction usr = {0}, old_usr;
+    usr.sa_handler = grows_on_usr1;
+    usr.sa_flags = SA_ONSTACK;
+    sigemptyset(&usr.sa_mask);
+    sigaction(SIGUSR1, &usr, &old_usr);
+    raise(SIGUSR1);
+    alt.ss_flags = SS_DISABLE;
+    sigaltstack(&alt, NULL);
+    sigaction(SIGUSR1, &old_usr, NULL);
+    printf("frame: handled=%d grew=%d\n", grows_handled, grows_start(g) < (unsigned long)start);
+    sigaction(SIGSEGV, &old, NULL);
+    munmap(area, (size_t)(8 * mib));
     return 0;
 }
 /* A forked child gets the page tables of a VMA only when Linux's
@@ -22905,6 +23003,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
+    if (!strcmp(mode, "grows-down")) return grows_down_case();
     if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();
     if (!strcmp(mode, "mrelease")) return mrelease_case();
     if (!strcmp(mode, "seccomp-exec")) return seccomp_exec_case();

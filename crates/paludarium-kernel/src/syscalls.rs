@@ -2240,6 +2240,7 @@ const MAP_LOCKED: u64 = 0x2000;
 const MAP_POPULATE: u64 = 0x8000;
 const MAP_NORESERVE: u64 = 0x4000;
 const MAP_STACK: u64 = 0x2_0000;
+const MAP_GROWSDOWN: u64 = 0x100;
 
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
@@ -2329,6 +2330,11 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if lock.is_some() && !lock_fits(c, len.div_ceil(4096)) {
         return err(Errno::EAGAIN);
     }
+    // Only private anonymous memory grows down (a file's is refused in
+    // `check_mappable`).
+    if flags & (MAP_GROWSDOWN | MAP_SHARED) == MAP_GROWSDOWN | MAP_SHARED {
+        return err(Errno::EINVAL);
+    }
     // What the mapping shows is made first, outside the address space's
     // lock, as it may read the file. The mapping and what it shows then go
     // in under one hold of the lock, so that no other thread sees the
@@ -2383,6 +2389,9 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             if flags & (MAP_NORESERVE | MAP_STACK) != 0 {
                 c.mem
                     .flag_new(a, end, flags & MAP_NORESERVE != 0, flags & MAP_STACK != 0);
+            }
+            if flags & MAP_GROWSDOWN != 0 {
+                c.mem.grow_new_down(a, end);
             }
             // Linux populates a writable private mapping by writing it, which
             // gives it an anon_vma (a core then writes it whole), with
@@ -2471,6 +2480,10 @@ fn check_mappable(
     let readable = regular && file.read_at(0, &mut []) != Err(Errno::ENODEV);
     if !readable && !is_zero_device(file) {
         return Err(Errno::ENODEV);
+    }
+    // A file's mapping never grows down (`do_mmap`), /dev/zero's included.
+    if flags & MAP_GROWSDOWN != 0 {
+        return Err(Errno::EINVAL);
     }
     if shared_write && write_sealed(file) {
         return Err(Errno::EPERM);
@@ -3046,9 +3059,9 @@ fn sys_pkey_mprotect(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// with bad bits), an end that overflows (`ENOMEM`), unknown bits, and only
 /// then the key (`allocated` is false for a key that is not) and the
 /// mappings. `PROT_GROWSDOWN` extends the range down to the start of the
-/// first VMA in it, which must be a stack, as only the main thread's stack is
-/// a VMA that grows down here; `PROT_GROWSUP` is `EINVAL` where a VMA holds
-/// the start, as no VMA grows up on x86-64.
+/// first VMA in it, which must grow down (the main stack, or a mapping made
+/// with `MAP_GROWSDOWN`); `PROT_GROWSUP` is `EINVAL` where a VMA holds the
+/// start, as no VMA grows up on x86-64.
 fn mprotect_with_key(c: &mut Context<'_>, a: [u64; 6], allocated: bool) -> Outcome {
     const PROT_SEM: u64 = 0x8;
     const PROT_GROWSDOWN: u64 = 0x0100_0000;
@@ -3089,7 +3102,7 @@ fn mprotect_with_key(c: &mut Context<'_>, a: [u64; 6], allocated: bool) -> Outco
                 Errno::EINVAL
             });
         }
-        if first.kind != MappingKind::Stack {
+        if !first.grows_down {
             return err(Errno::EINVAL);
         }
         start = c

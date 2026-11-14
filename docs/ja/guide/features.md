@@ -1054,9 +1054,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `mprotect` は引数を Linux と同じ順で確かめます。`PROT_GROWSDOWN` と `PROT_GROWSUP` の
   両方、そろっていない先頭、空の範囲（ビットが何でも成功します）、あふれる終わり（`ENOMEM`）、
   そのあと未知のビットの順です。`PROT_GROWSDOWN` は範囲を、その中の最初の VMA の先頭まで
-  下に広げます。その VMA は下に伸びるもの（メインのスタック）でなければならず、そうでなければ
+  下に広げます。その VMA は下に伸びるもの（メインのスタックか、`MAP_GROWSDOWN` の
+  マッピング）でなければならず、そうでなければ
   `EINVAL` です。`PROT_GROWSUP` は、x86-64 には上に伸びる VMA がないので、先頭がマップ済みなら
   `EINVAL` です。範囲に VMA がなければ、どちらも `ENOMEM` です。
+- 下に伸びるマッピング（メインのスタックか、`mmap` が `MAP_GROWSDOWN` で作った
+  プライベートな匿名メモリで、`VmFlags` は `gd` を示します）は、Linux の
+  `expand_downwards` と同じように伸びます。その下のマップされていないページへの
+  アクセスや、そこへのシグナルフレームの書き込みで、そのページまで下に伸び、アクセスは
+  やり直されます。`mmap_min_addr`（64 KiB）より下、下に伸びずアクセスできるマッピングの
+  上の 256 ページの guard gap（`stack_guard_gap`）の中、VMA 全体で `RLIMIT_STACK` を
+  超えるところ、ロックされていれば `CAP_IPC_LOCK` なしで `RLIMIT_MEMLOCK` を超える
+  ところへは伸びず、そのアクセスは `SIGSEGV` になります。その下の gap には、ヒントでも、
+  `mmap` が空きを探すときでも、マッピングを置きません。ファイルのマッピング
+  （`/dev/zero` も含みます）と共有メモリは下に伸ばせません（`EINVAL`）。メインの
+  スタックの VMA は 8 MiB から始まるので、それより大きい `RLIMIT_STACK` ではそれを
+  超えて伸びます。
 - 保護キーは、保護キーのない CPU での Linux と同じ答えを返します。仮想 CPU はそういう CPU
   です（`CPUID` は PKU を報告しません）。キーは、既定のキー 0 も含めて一つも割り当てられて
   いません。`pkey_alloc` は `ENOSPC` で、フラグや `PKEY_DISABLE_ACCESS` と

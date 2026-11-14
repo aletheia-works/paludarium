@@ -767,7 +767,17 @@ impl Kernel {
             if forced && signal.number == signal::SIGSEGV {
                 return self.terminate(thread, signal::SIGSEGV);
             }
-            if signals::install(&mut thread.state, &mut thread.cpu, mem, signal, action).is_err() {
+            let limits = self.stack_limits(thread);
+            if signals::install(
+                &mut thread.state,
+                &mut thread.cpu,
+                mem,
+                signal,
+                action,
+                limits,
+            )
+            .is_err()
+            {
                 return self.terminate(thread, signal::SIGSEGV);
             }
             if restore_mask.is_some() {
@@ -823,6 +833,23 @@ impl Kernel {
         }
     }
 
+    /// What a mapping that grows down may grow to for `thread`
+    /// ([`AddressSpace::grow_down`]): its RLIMIT_STACK in bytes, and the
+    /// pages it may have locked, its RLIMIT_MEMLOCK unless it has
+    /// `CAP_IPC_LOCK`.
+    fn stack_limits(&self, thread: &Thread) -> (u64, u64) {
+        const RLIMIT_STACK: usize = 3;
+        const RLIMIT_MEMLOCK: usize = 8;
+        const CAP_IPC_LOCK: u64 = 1 << 14;
+        let stack = self.processes.soft_limit(self.process.pid, RLIMIT_STACK);
+        let lock = if thread.state.credentials.capable(CAP_IPC_LOCK) {
+            u64::MAX
+        } else {
+            self.processes.soft_limit(self.process.pid, RLIMIT_MEMLOCK) >> 12
+        };
+        (stack, lock)
+    }
+
     /// Handles a stop of `thread` (W3, W4).
     pub fn handle(&mut self, thread: &mut Thread, mem: &AddressSpace, reason: ExitReason) -> Next {
         // The thread runs no guest code until it takes a CPU again.
@@ -830,6 +857,23 @@ impl Kernel {
         // A caller that did not finish the last exec finishes it now.
         self.exec_finished();
         self.group.register(thread.tid, Arc::clone(&self.inbox));
+        // A fault below a mapping that grows down extends it, and the
+        // instruction runs again, as Linux's `lock_mm_and_find_vma` expands
+        // the stack VMA before it handles the fault.
+        if let ExitReason::PageFault {
+            rip,
+            addr,
+            mapped: false,
+            ..
+        } = reason
+            && {
+                let (stack, lock) = self.stack_limits(thread);
+                mem.grow_down(addr, stack, lock)
+            }
+        {
+            thread.cpu.rip = rip;
+            return self.checkpoint(thread, mem);
+        }
         let fault = match reason {
             ExitReason::PageFault {
                 rip,

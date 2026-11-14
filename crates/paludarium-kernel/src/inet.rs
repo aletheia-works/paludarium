@@ -2365,12 +2365,23 @@ impl FileHandle for InetSocket {
         if let Some(listen) = &s.listen {
             return Ok((u32::from(!listen.ready.is_empty()) * IN, listen.arrivals, 0));
         }
-        s.note();
+        // The stream's readiness is read before its phase, and a failure is
+        // noted from that one reading of the phase. A host connection moves
+        // on from connecting to open to failed at any time, so readings in
+        // that order never show a failed connection without its error, as
+        // Linux's `tcp_done_with_error` writes `sk_err` before the state; a
+        // change after them wakes the wait again.
+        let read = s
+            .stream
+            .as_ref()
+            .map(|stream| (stream.readiness(), stream.phase()));
+        if matches!(read, Some((_, Phase::Failed(_)))) {
+            s.note();
+        }
         let error = u32::from(s.error.is_some()) * POLLERR;
-        let Some(stream) = s.stream.clone() else {
+        let (Some(stream), Some((ready, phase))) = (s.stream.clone(), read) else {
             return Ok((OUT | POLLHUP | error, 0, 0));
         };
-        let ready = stream.readiness();
         // An urgent byte waiting is `POLLPRI`; not inline, a read at its mark
         // needs a byte past it (`tcp_poll`).
         let (urgent, at_mark) = Self::joined(&s).map_or((false, false), |(link, side)| {
@@ -2381,7 +2392,7 @@ impl FileHandle for InetSocket {
         if at_mark && !ready.read_closed {
             readable = stream.queued().0 > 1;
         }
-        let mask = match stream.phase() {
+        let mask = match phase {
             Phase::Connecting => 0,
             Phase::Failed(_) => IN | OUT | POLLHUP | POLLRDHUP,
             Phase::Open => {

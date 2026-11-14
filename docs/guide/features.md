@@ -300,8 +300,13 @@ kernel.
   `read`, `write` or positioned or vectored forms of them (`EINVAL`), no
   `lseek` (`ESPIPE`), `fsync` (`EINVAL`), `fallocate` (`EOPNOTSUPP`) or
   seals (`EINVAL`), and opening it again through `/proc/self/fd` gives
-  `ENXIO`. Its pages are the emulator's, so they are as secret as any
-  other memory of the guest.
+  `ENXIO`. The kernel may not reach the pages of its mapping, as Linux's
+  `get_user_pages` refuses them: `MADV_POPULATE_READ` and
+  `MADV_POPULATE_WRITE` give `EINVAL`, and `mlock` `ENOMEM`, with
+  `MLOCK_ONFAULT` too, as `mlock_fixup` gives its VMA no `VM_LOCKONFAULT`.
+  `msync` with `MS_SYNC` gives `EINVAL` for it, as its file has no `fsync`,
+  even after a hole in the range. Its pages are the emulator's, so they are
+  as secret as any other memory of the guest.
 - `openat2` opens as `openat` does (a FIFO too), with Linux's stricter
   checks of its `struct open_how`: a size below 24 bytes is `EINVAL`, above
   a page or with unknown nonzero bytes past the first version `E2BIG`; an
@@ -1130,6 +1135,20 @@ kernel.
   does not have `EBADF`. The copy shares the open file description and
   gets the lowest free number, close-on-exec (`EMFILE` at
   `RLIMIT_NOFILE`).
+- Whether a caller may read or attach to a thread of another process is
+  decided as Linux's `__ptrace_may_access` with the capability module and
+  Yama decides it. To read (`kcmp`, `get_robust_list`, `/proc/<pid>/environ`
+  and the like, `move_pages`, `migrate_pages`, `setns` with a pidfd), it needs
+  `CAP_SYS_PTRACE` in the target's user namespace, or a dumpable target whose
+  user and group IDs all equal its own (real or filesystem ones, as the call
+  asks), in the same user namespace, with its permitted capabilities (its
+  effective ones for the filesystem ones) covering the target's permitted
+  ones; Landlock then keeps a caller in a domain from a task outside it. To
+  attach (`process_vm_readv`, `process_vm_writev`, `pidfd_getfd`), Yama's
+  `ptrace_scope` is 1, as Debian's, Ubuntu's and the CI runners' is: the
+  target must also be a descendant of the caller, or have let it in with
+  `PR_SET_PTRACER`, or the caller must have `CAP_SYS_PTRACE` in the target's
+  user namespace.
 - `personality` keeps any value for the thread, as Linux stores it, and
   returns the old one (`0xffffffff` only asks). New threads and processes
   inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and
@@ -1586,6 +1605,22 @@ kernel.
     `ERANGE` for IPv4 and `EINVAL` for IPv6. With `RTM_F_FIB_MATCH` the
     answer is the table entry that matched (`EHOSTUNREACH` for `0.0.0.0`,
     which none is).
+  - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
+    `RTA_METRICS` holds (as `ip route add ... mtu 1400` sends them), as
+    `ip_metrics_convert` reads them: each type in turn, one of 0 passed
+    over; `RTAX_MTU` held to 65520, `RTAX_ADVMSS` to 65495 and
+    `RTAX_HOPLIMIT` to 255; `EINVAL` for a type past `RTAX_MAX`, a value
+    of other than four bytes, a congestion control (`RTAX_CC_ALGO`) other
+    than `cubic` and `reno`, features past `RTAX_FEATURE_MASK`, and a
+    locked congestion window of 0. Two IPv4 routes that differ by their
+    metrics alone are two routes, as `fib_find_info` tells them apart. A
+    dump, a notification and a lookup's answer give a route's metrics but
+    those of 0, as `rtnetlink_put_metrics` does (none for the limited
+    broadcast address, and for a multicast one through a route of a prefix
+    shorter than 4, whose lookups drop them); an IPv4 removal that
+    names metrics takes only a route that has them, as `fib_metrics_match`
+    compares them (unheld, so an MTU of 70000 is not the 65520 kept), and
+    IPv6's does not look.
   - **Sockets:** an address a local route has is the guest's own: a TCP or
     UDP socket binds to it and reaches it on the loopback, from the
     preferred source of its route. On a loopback an IPv4 address makes its
@@ -1964,7 +1999,9 @@ kernel.
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
   gets `EACCES` for `environ` unless its real IDs, and for `exe`, `cwd` and
   the links of `ns` unless its filesystem IDs, are every user and group ID of a dumpable
-  process; an undumpable process's directory is root's. What a process shows of
+  process in its user namespace whose permitted capabilities its own cover
+  (its effective ones for the filesystem IDs), as reading another process
+  asks above; an undumpable process's directory is root's. What a process shows of
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
@@ -2421,7 +2458,11 @@ kernel.
   shows nothing, its interval included, once disarmed; a `SIGEV_NONE` one
   is moved on by its interval when it is read; and once the thread whose
   clock it is has exited, `timer_settime` gives `ESRCH` and
-  `timer_gettime` shows nothing. Timers are
+  `timer_gettime` shows nothing. On the other clocks, as Linux's
+  `common_timer_set`, `timer_settime` looks at no flag but `TIMER_ABSTIME`
+  and takes the value and the interval up to `KTIME_MAX`, and a relative
+  expiry past `KTIME_MAX` stops there; a relative `CLOCK_REALTIME` timer
+  counts on the monotonic clock. Timers are
   not inherited by `fork` and are deleted by `execve`. `rt_sigtimedwait` also
   takes blocked signals pending for the whole process.
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
@@ -2438,7 +2479,13 @@ kernel.
   again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
   by `execve`), `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
   `execve`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
-  with their `PR_GET_*`; other options give `EINVAL`.
+  with their `PR_GET_*`, and Yama's `PR_SET_PTRACER`, which reads no other
+  argument: 0 clears it, `PR_SET_PTRACER_ANY` (or -1 as an `int`) lets any
+  process attach, and another value, taken as an `int`, names a task in the
+  caller's PID namespace (`EINVAL` for none) whose process, and its
+  descendants, may attach while that task is there. It is the process's,
+  whichever thread sets it, and a child does not inherit it. Other options
+  give `EINVAL`.
 - When a process exits, its children go to the nearest ancestor that set
   `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,
   which acts as the init of a PID namespace, as Linux's

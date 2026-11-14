@@ -18,6 +18,27 @@ use std::{
     },
 };
 
+/// The process task `tid` is of, a zombie's too, while the task is there.
+fn process_of(entries: &BTreeMap<u32, Entry>, tid: u32) -> Option<u32> {
+    if entries.contains_key(&tid) {
+        return Some(tid);
+    }
+    entries
+        .iter()
+        .find(|(_, entry)| entry.status.is_none() && entry.group.has_member(tid))
+        .map(|(&pid, _)| pid)
+}
+
+/// Whom a process let attach to it with Yama's `PR_SET_PTRACER`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ptracer {
+    /// `PR_SET_PTRACER_ANY`: any process.
+    Any,
+    /// The process of this task, and its descendants, while the task is
+    /// there.
+    Task(u32),
+}
+
 struct Entry {
     parent: u32,
     group: Arc<ThreadGroup>,
@@ -57,6 +78,9 @@ struct Entry {
     /// PR_SET_CHILD_SUBREAPER: orphaned descendants come to this process
     /// rather than to the first one. Not inherited on fork, kept on exec.
     subreaper: bool,
+    /// Yama's PR_SET_PTRACER: who else may attach to it. Not inherited on
+    /// fork, kept on exec.
+    ptracer: Option<Ptracer>,
     /// Whether its fatal signal wrote a whole core (CLD_DUMPED).
     dumped: bool,
     /// Its controlling terminal (Linux's `signal->tty`), when that is a
@@ -239,6 +263,7 @@ impl Processes {
                     children_cpu: 0,
                     exit_signal: signals::SIGCHLD,
                     subreaper: false,
+                    ptracer: None,
                     dumped: false,
                     terminal: None,
                     _task: TaskCharge(Arc::clone(&tasks)),
@@ -410,6 +435,7 @@ impl Processes {
                 children_cpu: 0,
                 exit_signal,
                 subreaper: false,
+                ptracer: None,
                 dumped: false,
                 terminal,
                 _task: task,
@@ -918,6 +944,54 @@ impl Processes {
             .iter()
             .find(|(_, entry)| entry.status.is_none() && entry.group.has_member(tid))
             .map(|(&pid, _)| pid)
+    }
+    /// Sets process `pid`'s Yama ptracer (`PR_SET_PTRACER`), or clears it;
+    /// `EINVAL` for a task that is not there (`find_get_task_by_vpid`).
+    fn set_ptracer(&self, pid: u32, ptracer: Option<Ptracer>) -> Result<(), Errno> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(Ptracer::Task(tid)) = ptracer
+            && process_of(&entries, tid).is_none()
+        {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(entry) = entries.get_mut(&pid) {
+            entry.ptracer = ptracer;
+        }
+        Ok(())
+    }
+    /// Whether Yama's `ptrace_scope` 1 lets process `caller` attach to
+    /// process `target`, as Linux's `yama_ptrace_access_check` decides
+    /// before the capability it also takes: `target` is a descendant of
+    /// `caller` (`task_is_descendant`, up the parents), or it let any
+    /// process in, or a task whose process is `caller` or one of its
+    /// ancestors (`ptracer_exception_found`). A task that has gone takes
+    /// its exception with it (`yama_task_free`).
+    pub(crate) fn yama_allows(&self, caller: u32, target: u32) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let descends = |ancestor: u32, mut walker: u32| {
+            // Each step goes to an older process, so this ends; the bound
+            // only guards against a cycle.
+            for _ in 0..=entries.len() {
+                if walker == ancestor {
+                    return true;
+                }
+                match entries.get(&walker) {
+                    Some(entry) if entry.parent != 0 => walker = entry.parent,
+                    _ => return false,
+                }
+            }
+            false
+        };
+        if descends(caller, target) {
+            return true;
+        }
+        match entries.get(&target).and_then(|entry| entry.ptracer) {
+            Some(Ptracer::Any) => true,
+            Some(Ptracer::Task(tid)) => {
+                process_of(&entries, tid).is_some_and(|tracer| descends(tracer, caller))
+            }
+            None => false,
+        }
     }
     /// The processes there are, zombies too, in order, as `/proc` lists them.
     pub(crate) fn pids(&self) -> Vec<u32> {
@@ -2185,6 +2259,30 @@ impl Kernel {
     /// gives for options it does not know.
     fn prctl(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         match a[0] {
+            // Yama's PR_SET_PTRACER (`yama_task_prctl`), which reads no
+            // other argument: 0 clears it, PR_SET_PTRACER_ANY (-1 as an
+            // int too) lets any process attach, and anything else is the
+            // number of a task in the caller's PID namespace (`EINVAL` for
+            // none). It is the process's, whichever thread sets it.
+            0x5961_6d61 => {
+                let ptracer = if a[1] == 0 {
+                    None
+                } else if a[1] as i32 == -1 {
+                    Some(Ptracer::Any)
+                } else {
+                    let number = u32::try_from(a[1] as i32)
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .ok_or(Errno::EINVAL)?;
+                    let tid = self
+                        .pid_space(thread.tid)
+                        .task(number)
+                        .ok_or(Errno::EINVAL)?;
+                    Some(Ptracer::Task(tid))
+                };
+                self.processes.set_ptracer(self.process.pid, ptracer)?;
+                return Ok(0);
+            }
             // PR_SET_NAME: up to 15 bytes, ending at a NUL; the rest of the
             // name is cleared.
             15 => {
@@ -2695,7 +2793,6 @@ impl Kernel {
     ) -> Result<u64, Errno> {
         use crate::namespaces::{self as ns, Kind};
         const CAP_SYS_CHROOT: u64 = 1 << 18;
-        const CAP_SYS_PTRACE: u64 = 1 << 19;
         let flags = a[1];
         let d = self.files.descriptor(a[0])?;
         let any = d.file.as_any();
@@ -2716,13 +2813,12 @@ impl Kernel {
                     .filter(|view| !view.zombie)
                     .ok_or(Errno(3))?; // ESRCH
                 // ptrace_may_access with the real IDs.
-                let reader = &thread.state.credentials;
                 let target = view.group.task_ids(pidfd.pid, pidfd.pid);
                 if pidfd.pid != self.process.pid
-                    && !reader.capable_in(CAP_SYS_PTRACE, &target.user)
-                    && !(view.dumpable
-                        && [target.uid, target.euid, target.suid] == [reader.uid; 3]
-                        && [target.gid, target.egid, target.sgid] == [reader.gid; 3])
+                    && !thread
+                        .state
+                        .credentials
+                        .may_read_ids(&target, view.dumpable, true)
                 {
                     return Err(Errno::EPERM);
                 }
@@ -3343,7 +3439,7 @@ impl Kernel {
             .clone()
             .filter(|_| !view.zombie)
             .ok_or(esrch)?;
-        if !memory.is_of(mem) && !Self::may_attach(thread, &view, &public) {
+        if !memory.is_of(mem) && !self.may_attach(thread, pid, &view, &public) {
             return Err(Errno::EPERM);
         }
         Ok(memory)
@@ -3352,7 +3448,7 @@ impl Kernel {
     /// `futex_get_robust_list_common`: the task the caller's PID namespace
     /// numbers `pid`, an `int` (the caller for 0, `ESRCH` for none), must be
     /// of the caller's process or one it may read (`ptrace_may_access` with
-    /// `PTRACE_MODE_READ_REALCREDS`, [`Self::may_attach`], `EPERM`); then the
+    /// `PTRACE_MODE_READ_REALCREDS`, [`Self::may_read`], `EPERM`); then the
     /// length is written and the head (`EFAULT`). A zombie's list went as it
     /// ended, so its head is 0.
     fn get_robust_list(
@@ -3378,7 +3474,7 @@ impl Kernel {
             };
             let view = self.processes.view(pid).ok_or(esrch)?;
             let public = view.group.public(tid).ok_or(esrch)?;
-            if !Self::may_attach(thread, &view, &public) {
+            if !Self::may_read(thread, &view, &public) {
                 return Err(Errno::EPERM);
             }
             if view.zombie {
@@ -3392,15 +3488,13 @@ impl Kernel {
             .map_err(|_| Errno::EFAULT)?;
         Ok(0)
     }
-    /// Whether the caller may attach to or read a thread of another process,
-    /// as Linux's `__ptrace_may_access` with `PTRACE_MODE_ATTACH_REALCREDS`
-    /// or `PTRACE_MODE_READ_REALCREDS` decides
+    /// Whether the caller may read a thread of another process, as Linux's
+    /// `__ptrace_may_access` with `PTRACE_MODE_READ_REALCREDS` decides
     /// ([`crate::credentials::Credentials::may_read_task`] with the real
-    /// IDs). The two modes differ only in Yama, which restricts attaching
-    /// and is not applied here. A zombie keeps the dumpability it had, as
-    /// Linux 7.1 and later keep it in the task's `exec_state` (before, a
-    /// task with no `mm` skipped the check).
-    fn may_attach(
+    /// IDs). A zombie keeps the dumpability it had, as Linux 7.1 and later
+    /// keep it in the task's `exec_state` (before, a task with no `mm`
+    /// skipped the check).
+    fn may_read(
         thread: &Thread,
         view: &ProcessView,
         public: &crate::threads::PublicThread,
@@ -3409,6 +3503,28 @@ impl Kernel {
             .state
             .credentials
             .may_read_task(&public.credentials, view.dumpable, true)
+    }
+    /// Whether the caller may attach to a thread of process `pid`, another
+    /// process, as Linux's `__ptrace_may_access` with
+    /// `PTRACE_MODE_ATTACH_REALCREDS` decides: it may read it
+    /// ([`Self::may_read`]), and Yama, whose `ptrace_scope` here is 1, as
+    /// Debian's and Ubuntu's, lets it in
+    /// ([`Processes::yama_allows`], or `CAP_SYS_PTRACE` in the target's
+    /// user namespace).
+    fn may_attach(
+        &self,
+        thread: &Thread,
+        pid: u32,
+        view: &ProcessView,
+        public: &crate::threads::PublicThread,
+    ) -> bool {
+        use crate::credentials::CAP_SYS_PTRACE;
+        Self::may_read(thread, view, public)
+            && (self.processes.yama_allows(self.process.pid, pid)
+                || thread
+                    .state
+                    .credentials
+                    .capable_in(CAP_SYS_PTRACE, &public.credentials.user))
     }
     /// `pidfd_getfd(pidfd, targetfd, flags)`, as Linux's: `flags` must be 0
     /// (`EINVAL`) and `pidfd` a pidfd (`EBADF`); its process must not be
@@ -3433,7 +3549,7 @@ impl Kernel {
             let esrch = Errno(3);
             let view = self.processes.view(pidfd.pid).ok_or(esrch)?;
             let public = view.group.public(pidfd.pid).ok_or(esrch)?;
-            if !Self::may_attach(thread, &view, &public) {
+            if !self.may_attach(thread, pidfd.pid, &view, &public) {
                 return Err(Errno::EPERM);
             }
             if view.zombie {
@@ -3619,7 +3735,7 @@ impl Kernel {
     /// as Linux's `find_get_task_by_vpid` and `ptrace_may_access` with
     /// `PTRACE_MODE_READ_REALCREDS` give it: `ESRCH` for no such task, and
     /// `EPERM` unless it is of the caller's process or the caller may read
-    /// it ([`Self::may_attach`]); `None` for a zombie, which has none.
+    /// it ([`Self::may_read`]); `None` for a zombie, which has none.
     fn movable_memory(
         &self,
         thread: &Thread,
@@ -3641,7 +3757,7 @@ impl Kernel {
         };
         let view = self.processes.view(pid).ok_or(esrch)?;
         let public = view.group.public(tid).ok_or(esrch)?;
-        if !Self::may_attach(thread, &view, &public) {
+        if !Self::may_read(thread, &view, &public) {
             return Err(Errno::EPERM);
         }
         Ok(public.memory.clone().filter(|_| !view.zombie))

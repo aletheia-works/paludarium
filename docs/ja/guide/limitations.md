@@ -182,8 +182,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。`/proc/<pid>/smaps` はありません。Linux では
     その `VmFlags` が、ガードを置いた VMA の `gu` とロックした VMA の `lo` を示します。
     ガードページを示す `/proc/<pid>/pagemap` もありません。
-    `MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は、`memfd_secret` のマッピングのページも
-    割り当てます。Linux では `EINVAL` です。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか
     受け付けず、ほかのプロセスの範囲はマップされているかを確かめるだけです。Linux が知らない
     指定は、Linux master と同じく範囲を見る前に断ります（`EINVAL`）。CI のカーネルは範囲ごとに
@@ -199,9 +197,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - いくつかのメッセージのあとで `recvmmsg` を終わらせたエラーは捨てます。Linux はこれを
     ソケットのエラーとして残し、次の呼び出しと `SO_ERROR` で返します。また `recvmmsg` は、
     ソケットに残っているエラーを先に返しません。
-  - `memfd_secret` のファイルのページは `RLIMIT_MEMLOCK` に数えません。Linux では、それを
-    超えるページフォールトは `SIGBUS` です。また、そのマッピングの `MS_SYNC` の `msync` は
-    成功します。Linux では、ファイルに `fsync` がないので `EINVAL` です。
+  - `memfd_secret` のファイルのページは `RLIMIT_MEMLOCK` に数えません。Linux 7.3 以降は、
+    ページフォールトのときにユーザーの分として数え、それを超えると `SIGBUS` です。それより前の
+    カーネルはマッピングをロックしたものとして数え、超えると `mmap` が `EAGAIN` です。その前の
+    カーネルではマッピングがロックされているので、`MS_INVALIDATE` の `msync` は `EBUSY` に
+    なります。ここでは Linux 7.3 と同じく成功します。
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）と `RLIMIT_CPU` は、
     どれもプロセスの CPU 時間のすべてを数えます。ここではそのすべてがユーザーの時間だからです
     （Linux の `ITIMER_VIRTUAL` はシステムの時間を数えず、`RLIMIT_CPU` は数えます）。WebAssembly のように
@@ -259,13 +259,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     待つものが先）。Linux はセマフォーごとの待ち行列と、複数のセマフォーへの操作の待ち行列を
     分けて持つので、両方の種類の待ちが混ざると、どちらも通れる 2 つの待ちのどちらが先に
     通るかが違うことがあります。
-  - ほかのプロセスにアタッチできるか（`process_vm_readv`、`process_vm_writev`、
-    `pidfd_getfd`）は、Yama のない Linux と同じく ID、ダンプ可能か、`CAP_SYS_PTRACE`、
-    Landlock だけで決めます。`kernel.yama.ptrace_scope` はないので、Yama の既定の
-    スコープ 1 なら祖先しか入れないところ、プロセスは親にも届きます。アタッチと、
-    ほかのプロセスを読むとき（`get_robust_list`、`kcmp`、`migrate_pages`、
-    `move_pages`）のどちらでも、呼び出し元の許可されたケーパビリティが相手のものを
-    含むかという、ケーパビリティモジュールの検査はしません。
+  - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
+    `/proc/sys/kernel/yama/ptrace_scope` はありません。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
     読み込んだページも、触るまでは数えません。
@@ -399,14 +394,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   近隣、ルール、キューイング規律などは
   `EOPNOTSUPP` で、入力の経路の引き当て（`ip route get ... iif` が送る `RTA_IIF`）、
   `lo` の名前の変更、ほかの属性の設定もそうです。経路は
-  `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、メトリクス
-  （`ip route add ... mtu` が送る `RTA_METRICS`）、カプセル化、ネクストホップのオブジェクト、
+  `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、
+  カプセル化、ネクストホップのオブジェクト、
   realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の
   種類（IPv6 ではブロードキャストも）は `EOPNOTSUPP` です。ポリシーのルール
   （`RTM_NEWRULE`）も `EOPNOTSUPP` なので、ローカル、メイン、既定の表のほかは引き当てに
   使われません。新しいネットワーク名前空間では、ローカルな経路のないアドレスへの接続と
   データグラムは、どの経路に当たっても `ENETUNREACH` のままです。Linux では `lo` へ
   送り出されて捨てられるか、拒む経路のエラーになります。
+  経路のメトリクス（`RTA_METRICS`）は保って見せますが、ソケットの動きは変えません。
+  経路が何を持っていても、MTU、ホップ制限、ウィンドウ、輻輳制御は既定のままです。経路が
+  指せる輻輳制御は `cubic` と `reno` だけで（ほかは `EINVAL`）、Linux では
+  `CAP_NET_ADMIN` を持つ呼び出し元なら、先にそのモジュールを読み込みます。
   アドレスはいつも永続です。寿命（`IFA_CACHEINFO`）と `IFA_RT_PRIORITY` は保たず、
   相手のアドレスはポイントツーポイントのものにならず、IPv6 のアドレスが仮（tentative）に
   なることもありません。Linux のものは、ループバックならすぐ終わる重複アドレス検出の

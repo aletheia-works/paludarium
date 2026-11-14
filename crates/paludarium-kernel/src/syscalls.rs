@@ -1079,7 +1079,10 @@ fn set_cpu_timer(
 }
 
 /// `timer_settime(id, flags, new, old)`, in Linux's order: read and check the
-/// new value, find the timer, set it, then write the old value out.
+/// new value, find the timer, set it, then write the old value out. As
+/// Linux's `common_timer_set`, it looks at no flag but `TIMER_ABSTIME`, takes
+/// the value and the interval up to `KTIME_MAX`, and a relative expiry past
+/// it stops there (`ktime_add_safe`), on the monotonic clock for both clocks.
 fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome((|| {
         if a[2] == 0 {
@@ -1087,11 +1090,8 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         let new = read_words::<4>(c.mem, a[2])?;
         let [i_sec, i_nsec, v_sec, v_nsec] = new;
-        timespec_ktime(i_sec, i_nsec)?;
-        timespec_ktime(v_sec, v_nsec)?;
-        if a[1] & !TIMER_ABSTIME != 0 {
-            return Err(Errno::EINVAL);
-        }
+        let interval = timespec_ktime(i_sec, i_nsec)?;
+        let value = timespec_ktime(v_sec, v_nsec)?;
         let mono = c.host.clock(ClockId::Monotonic)?;
         let real = c.host.clock(ClockId::Realtime)?;
         let clock = timer_clock_of(c, timer_id(a[0]))?;
@@ -1106,7 +1106,6 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             }
             return Ok(0);
         }
-        let (interval, value) = (timespec_ns(i_sec, i_nsec)?, timespec_ns(v_sec, v_nsec)?);
         let old = c.group.with_timers(c.process, |timers| {
             let timer = timers.get_mut(timer_id(a[0]))?;
             let old = timer_state(timer, mono);
@@ -1119,7 +1118,7 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                 let delay = if a[1] & TIMER_ABSTIME != 0 {
                     value.saturating_sub(now)
                 } else {
-                    value
+                    value.min((i64::MAX as u64).saturating_sub(mono))
                 };
                 mono.saturating_add(delay)
             });
@@ -2112,6 +2111,7 @@ fn shared_file(
         offset,
         len,
         may_write,
+        memfd.is_some_and(crate::memfd::Memfd::is_secret),
     )?;
     map(&pages, may_write)
 }
@@ -2124,6 +2124,14 @@ fn file_cache(
     let stat = file.stat()?;
     let key = (crate::files::descriptor_device(c, d), stat.inode);
     Ok(c.files.caches.cache(key, c.mem.memory_meter(), stat.size))
+}
+/// Whether a mapping of a `memfd_secret` file meets `[start, end)`: Linux's
+/// `get_user_pages` refuses its pages (`check_vma_flags`), and its file has
+/// no `fsync`.
+fn maps_secret(mem: &AddressSpace, start: u64, end: u64) -> bool {
+    mem.shared_fragments()
+        .iter()
+        .any(|f| f.secret && f.start < end && start < f.end)
 }
 fn is_zero_device(file: &dyn FileHandle) -> bool {
     file.as_any()
@@ -2249,6 +2257,12 @@ fn lock_range(c: &Context<'_>, addr: u64, len: u64, lock: Option<paludarium_mmu:
     if let Err(e) = c.mem.lock(GuestAddr(start), end, lock) {
         return err(e);
     }
+    // Linux's `__mm_populate` fails to fault a page of a `memfd_secret`
+    // file in (`EFAULT`, which `mlock` gives as `ENOMEM`), as GUP refuses
+    // secret memory; `mlock_fixup` leaves its VMA unlocked.
+    if lock == Some(paludarium_mmu::Lock::Populated) && maps_secret(c.mem, start, end) {
+        return err(Errno::ENOMEM);
+    }
     if lock == Some(paludarium_mmu::Lock::Populated) {
         let mut mappings: Vec<_> = c
             .mem
@@ -2282,7 +2296,10 @@ fn sys_munlock(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     lock_range(c, a[0], a[1], None)
 }
 
-/// `mlock2(addr, len, flags)`: `MLOCK_ONFAULT` brings no page in.
+/// `mlock2(addr, len, flags)`: `MLOCK_ONFAULT` brings no page in, except
+/// in a mapping of a `memfd_secret` file, which Linux's `mlock_fixup`
+/// leaves without `VM_LOCKONFAULT`, so that `__mm_populate` still tries
+/// to fault its pages in and fails (`ENOMEM`), as for `mlock`.
 fn sys_mlock2(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let flags = a[2] as u32;
     if flags & !MLOCK_ONFAULT != 0 {
@@ -2293,7 +2310,15 @@ fn sys_mlock2(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     } else {
         paludarium_mmu::Lock::Populated
     };
-    lock_range(c, a[0], a[1], Some(lock))
+    let locked = lock_range(c, a[0], a[1], Some(lock));
+    if matches!(locked, Outcome::Return(0)) && flags & MLOCK_ONFAULT != 0 {
+        let start = a[0] & !4095;
+        let length = a[1].wrapping_add(a[0] & 4095).wrapping_add(4095) & !4095;
+        if maps_secret(c.mem, start, start.wrapping_add(length)) {
+            return err(Errno::ENOMEM);
+        }
+    }
+    locked
 }
 
 /// `mlockall(flags)`, as Linux's: the flags (`EINVAL`), `can_do_mlock`
@@ -2521,9 +2546,9 @@ fn remove(
 /// `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` of `[addr, end)`, as
 /// Linux's `madvise_populate` faults the pages in a page at a time: a page
 /// no mapping holds ends it with `ENOMEM`, one whose mapping may not be read
-/// (or, with `write`, written) with `EINVAL`, and one that cannot be
-/// brought in (past the end of its file, `SIGBUS`) with `EFAULT`, after the
-/// pages before it. A read maps what a read would (the zero page of
+/// (or, with `write`, written), or that maps a `memfd_secret` file, with
+/// `EINVAL`, and one that cannot be brought in (past the end of its file,
+/// `SIGBUS`) with `EFAULT`, after the pages before it. A read maps what a read would (the zero page of
 /// private anonymous memory); a write breaks copy-on-write as a write
 /// would, and leaves the bytes as they are.
 fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), Errno> {
@@ -2533,10 +2558,10 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
             return Err(Errno::ENOMEM);
         };
         let needed = if write { Prot::WRITE } else { Prot::READ };
-        if !mapping.prot.contains(needed) {
+        let stop = mapping.end().min(end);
+        if !mapping.prot.contains(needed) || maps_secret(mem, at, stop) {
             return Err(Errno::EINVAL);
         }
-        let stop = mapping.end().min(end);
         while at < stop {
             let faulted = if write {
                 mem.atomic(
@@ -2705,7 +2730,10 @@ const MS_SYNC: u64 = 4;
 
 /// `msync`: checks its arguments and the range, then writes the stores of
 /// shared file mappings back to their files (all of them, which the next
-/// read of a file would do anyway).
+/// read of a file would do anyway). With `MS_SYNC`, a shared mapping of a
+/// `memfd_secret` file in the range gives `EINVAL`, as Linux's walk of the
+/// range reaches it before it can run out of VMAs and its file has no
+/// `fsync` (`vfs_fsync_range`), whatever holes the range has.
 fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, flags) = (a[0], a[1], a[2]);
     if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
@@ -2727,6 +2755,15 @@ fn sys_msync(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             .is_some()
     {
         return err(Errno(16));
+    }
+    // A range that wraps past the top is Linux's `ENOMEM` before any VMA is
+    // looked at, so it skips this check and `covers` below refuses it.
+    if flags & MS_SYNC != 0
+        && addr
+            .checked_add(len)
+            .is_some_and(|end| maps_secret(c.mem, addr, end))
+    {
+        return err(Errno::EINVAL);
     }
     match c.mem.covers(GuestAddr(addr), len) {
         Ok(true) if flags & (MS_ASYNC | MS_SYNC) != 0 => match c.files.caches.write_back_all() {

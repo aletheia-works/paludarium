@@ -134,6 +134,7 @@ impl V6 {
             metric: 0,
             proto: PROTO_KERNEL,
             prefsrc: None,
+            metrics: NO_METRICS,
         }
     }
     /// Its prefix route in the main table (`addrconf_prefix_route`), which
@@ -147,9 +148,17 @@ impl V6 {
             metric: METRIC_ADDRCONF,
             proto: PROTO_KERNEL,
             prefsrc: None,
+            metrics: NO_METRICS,
         })
     }
 }
+/// The metrics of a route (`RTA_METRICS`), as `ip_metrics_convert`
+/// keeps them in a `dst_metrics`: the value of each `RTAX_*` type at its
+/// index less one, 0 for none. `RTAX_CC_ALGO`'s is the key of a
+/// congestion control.
+pub(crate) type Metrics = [u32; 17];
+/// A route's metrics when its request names none (`dst_default_metrics`).
+pub(crate) const NO_METRICS: Metrics = [0; 17];
 fn mask4(prefix: u8) -> u32 {
     u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
 }
@@ -236,6 +245,9 @@ pub(crate) struct Route4 {
     /// Whether its gateway is reached by a route of link scope, so that a
     /// lookup's answer names it (`rt_uses_gateway`).
     pub uses_gateway: bool,
+    /// Its `fib_info`'s metrics, which tell two routes apart as
+    /// `fib_find_info` does.
+    pub metrics: Metrics,
 }
 impl Route4 {
     /// One of the kernel's routes for an address, in the local table, with
@@ -259,6 +271,7 @@ impl Route4 {
             device: true,
             onlink: false,
             uses_gateway: false,
+            metrics: NO_METRICS,
         }
     }
     /// The same route of the table, whatever its preferred source.
@@ -281,6 +294,8 @@ pub(crate) struct Route6 {
     pub metric: u32,
     pub proto: u8,
     pub prefsrc: Option<Ipv6Addr>,
+    /// Its `fib6_metrics`.
+    pub metrics: Metrics,
 }
 impl Route6 {
     fn covers(&self, ip: Ipv6Addr) -> bool {
@@ -344,11 +359,14 @@ pub(crate) struct Ask4 {
     pub flags: u32,
     /// The request's `NLM_F_*`.
     pub request: u16,
+    /// Its metrics, or the error converting them gave
+    /// (`ip_fib_metrics_init`), which comes after the scope's.
+    pub metrics: Result<Metrics, Errno>,
 }
 /// An IPv4 route a request removes: the first of `table`'s routes to
 /// `dst/len` of `tos` from `priority` on that matches the rest, each
 /// matching any when 0 (`RT_SCOPE_NOWHERE` for the scope).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Select4 {
     pub table: u32,
     pub dst: Ipv4Addr,
@@ -361,6 +379,10 @@ pub(crate) struct Select4 {
     pub prefsrc: Option<Ipv4Addr>,
     pub gateway: Option<Ipv4Addr>,
     pub oif: u32,
+    /// The metrics the route must have (`fib_metrics_match`): each as an
+    /// index of [`Metrics`] and its value, none for a request that names
+    /// none; `None` where the request names one no route has.
+    pub metrics: Option<Vec<(usize, u32)>>,
 }
 /// An IPv6 route a request adds or (each field 0 for any) removes.
 #[derive(Clone, Copy, Debug)]
@@ -374,6 +396,9 @@ pub(crate) struct Ask6 {
     pub prefsrc: Option<Ipv6Addr>,
     pub oif: u32,
     pub request: u16,
+    /// Its metrics to add, or the error converting them gave, which comes
+    /// once its table is made; a removal does not look at them.
+    pub metrics: Result<Metrics, Errno>,
 }
 
 /// The loopback's addresses and the routing tables, in Linux's orders.
@@ -840,8 +865,16 @@ impl Addresses {
             events.push(Event::NewRoute4(route, flags));
         }
     }
+    /// Removes one of the kernel's IPv4 routes, whatever its metrics, as
+    /// `fib_magic` names none.
     fn kernel_del4(&mut self, route: &Route4, events: &mut Vec<Event>) {
-        if let Some(i) = self.routes4.iter().position(|r| r == route) {
+        let same = |r: &Route4| {
+            *r == Route4 {
+                metrics: r.metrics,
+                ..*route
+            }
+        };
+        if let Some(i) = self.routes4.iter().position(same) {
             events.push(Event::DelRoute4(self.routes4.remove(i)));
         }
     }
@@ -865,7 +898,9 @@ impl Addresses {
     /// scope, an on-link route without a gateway, an invalid gateway or a
     /// preferred source that is not the loopback's; `ENODEV` for a device
     /// not `lo`; `ENETDOWN` while it is down, but for a route of host
-    /// scope. Anycast, multicast and NAT routes are `EOPNOTSUPP`.
+    /// scope. Anycast, multicast and NAT routes are `EOPNOTSUPP`. The
+    /// metrics' error comes after the scope's, as `fib_create_info` makes
+    /// them.
     pub(crate) fn add_route4(&mut self, ask: &Ask4, up: bool) -> Result<Vec<Event>, Errno> {
         let table = if ask.table == 0 {
             TABLE_MAIN
@@ -886,6 +921,7 @@ impl Addresses {
         if widest > ask.scope || ask.flags & NEXTHOP_DEAD != 0 {
             return Err(Errno::EINVAL);
         }
+        let metrics = ask.metrics?;
         let kind = Kind::of(ask.kind).ok_or(if matches!(ask.kind, 4 | 5 | 10 | 11) {
             EOPNOTSUPP
         } else {
@@ -906,6 +942,7 @@ impl Addresses {
             device: true,
             onlink,
             uses_gateway: false,
+            metrics,
         };
         if kind.error().is_some() {
             if ask.gateway.is_some() || ask.oif != 0 {
@@ -997,7 +1034,8 @@ impl Addresses {
     }
     /// Removes the IPv4 route `select` names, as `fib_table_delete`:
     /// `ESRCH` for a table there is not, or no such route; `EINVAL` for a
-    /// prefix past 32 or with bits past its length.
+    /// prefix past 32 or with bits past its length. A route must have the
+    /// metrics `select` names (`fib_metrics_match`).
     pub(crate) fn del_route4(&mut self, select: &Select4) -> Result<Vec<Event>, Errno> {
         let table = if select.table == 0 {
             TABLE_MAIN
@@ -1026,6 +1064,10 @@ impl Addresses {
                     && (select.proto == 0 || r.proto == select.proto)
                     && (select.oif == 0 || (r.device && select.oif == 1))
                     && select.gateway.is_none_or(|g| r.gateway == Some(g))
+                    && select
+                        .metrics
+                        .as_ref()
+                        .is_some_and(|m| m.iter().all(|&(i, v)| r.metrics[i] == v))
             })
             .map(|(i, _)| i)
             .ok_or(ESRCH)?;
@@ -1047,6 +1089,7 @@ impl Addresses {
             ask.table
         };
         self.create6(table);
+        let metrics = ask.metrics?;
         let kind = match ask.kind {
             0 => Kind::Unicast,
             code => Kind::of(code)
@@ -1081,6 +1124,7 @@ impl Addresses {
             },
             proto: ask.proto,
             prefsrc: ask.prefsrc,
+            metrics,
         };
         let flags = self.insert6(route, Some(ask.request))?;
         Ok(vec![Event::NewRoute6(route, flags)])
@@ -1411,6 +1455,7 @@ mod tests {
             oif: u32::from(kind == 1),
             flags: 0,
             request,
+            metrics: Ok(NO_METRICS),
         }
     }
 
@@ -1653,6 +1698,7 @@ mod tests {
             prefsrc: None,
             gateway: None,
             oif: 0,
+            metrics: Some(Vec::new()),
         };
         let gone = a.del_route4(&select).unwrap();
         assert!(matches!(gone[..], [Event::DelRoute4(r)] if r.scope == SCOPE_HOST));
@@ -1713,6 +1759,7 @@ mod tests {
             prefsrc: None,
             oif: 1,
             request: 0x600,
+            metrics: Ok(NO_METRICS),
         };
         a.add_route6(&ask6("::", 0, 0), true).unwrap();
         a.add_route6(&ask6("2001:db8::", 64, 0), true).unwrap();

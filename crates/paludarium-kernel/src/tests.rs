@@ -2301,10 +2301,8 @@ fn posix_timers_check_arguments_and_report_their_state() {
         );
     }
     assert_eq!(f.ret(nr::TIMER_CREATE, &[99, 0, id]), errno(Errno::EINVAL));
-    assert_eq!(
-        f.ret(nr::TIMER_SETTIME, &[1, 2, spec, 0]),
-        errno(Errno::EINVAL)
-    );
+    // Linux looks at no flag but TIMER_ABSTIME.
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[1, !1, spec, 0]), 0);
     assert_eq!(
         f.ret(nr::TIMER_SETTIME, &[1, 0, 0, 0]),
         errno(Errno::EINVAL)
@@ -2329,6 +2327,49 @@ fn posix_timers_check_arguments_and_report_their_state() {
     assert_eq!(f.mem.read_u64(GuestAddr(old)).unwrap(), 5);
     assert_eq!(f.ret(nr::TIMER_GETTIME, &[1, old]), 0);
     assert_eq!(f.mem.read_u64(GuestAddr(old + 16)).unwrap(), 0);
+}
+/// Times past `KTIME_MAX` are taken up to it, and a relative expiry past it
+/// stops there, as Linux's `timespec64_to_ktime` and `ktime_add_safe` do.
+#[test]
+fn posix_timers_take_times_up_to_ktime_max() {
+    const KTIME_MAX: u64 = i64::MAX as u64;
+    let mut f = fixture();
+    let (id, sev, spec, old) = (DATA, DATA + 0x40, DATA + 0x100, DATA + 0x140);
+    f.host
+        .set_clock(paludarium_host::ClockId::Monotonic, 1_000_000_000);
+    f.host
+        .set_clock(paludarium_host::ClockId::Realtime, 5_000_000_000);
+    f.mem.write_u64(GuestAddr(sev + 8), 1 << 32).unwrap(); // SIGEV_NONE
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[1, sev, id]), 0);
+    assert_eq!(f.ret(nr::TIMER_CREATE, &[0, sev, id]), 0);
+    let words = |f: &Fixture| -> [u64; 4] {
+        std::array::from_fn(|i| f.mem.read_u64(GuestAddr(old + 8 * i as u64)).unwrap())
+    };
+    // Seconds past u64 nanoseconds, and i64::MAX seconds.
+    for (i, v) in [20_000_000_000, 0, i64::MAX as u64, 0].iter().enumerate() {
+        f.mem.write_u64(GuestAddr(spec + 8 * i as u64), *v).unwrap();
+    }
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[0, 0, spec, 0]), 0);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[0, old]), 0);
+    let left = KTIME_MAX - 1_000_000_000;
+    assert_eq!(
+        words(&f),
+        [
+            KTIME_MAX / 1_000_000_000,
+            KTIME_MAX % 1_000_000_000,
+            left / 1_000_000_000,
+            left % 1_000_000_000
+        ]
+    );
+    // A relative CLOCK_REALTIME timer runs on the monotonic clock, an
+    // absolute one on its own.
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[1, 0, spec, 0]), 0);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[1, old]), 0);
+    assert_eq!(words(&f)[2..], [left / 1_000_000_000, left % 1_000_000_000]);
+    assert_eq!(f.ret(nr::TIMER_SETTIME, &[1, 1, spec, 0]), 0);
+    assert_eq!(f.ret(nr::TIMER_GETTIME, &[1, old]), 0);
+    let left = KTIME_MAX - 5_000_000_000;
+    assert_eq!(words(&f)[2..], [left / 1_000_000_000, left % 1_000_000_000]);
 }
 #[test]
 fn sigtimedwait_takes_blocked_process_signals_and_times_out() {
@@ -6709,6 +6750,40 @@ mod madvise_advice {
         assert_eq!(memory_bytes(&f, shared + PAGE, 1), b"\0");
     }
     #[test]
+    fn a_secret_files_pages_are_not_populated_locked_or_synced() {
+        let mut f = fixture();
+        let mmap = syscalls::nr::MMAP;
+        let fd = f.ret(447, &[0]);
+        assert_eq!(f.ret(77, &[fd, 2 * PAGE]), 0);
+        let at = f.ret(mmap, &[0, 2 * PAGE, 3, 1, fd, 0]);
+        f.mem.write(GuestAddr(at), b"s").unwrap();
+        // `get_user_pages` refuses its pages, which both populates and a
+        // lock need: `mlock_fixup` gives its VMA no `VM_LOCKONFAULT`, so
+        // even `MLOCK_ONFAULT` tries to bring them in. Unlocking is fine.
+        assert_eq!(f.ret(28, &[at, 2 * PAGE, 22]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(28, &[at + PAGE, PAGE, 23]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(149, &[at, 2 * PAGE]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(325, &[at, 2 * PAGE, 1]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(150, &[at, 2 * PAGE]), 0);
+        // Its file has no `fsync`, which only `MS_SYNC` makes, even past a
+        // hole that `MS_ASYNC` stops at; a range that wraps is `ENOMEM`.
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 4]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 1]), 0);
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 0]), 0);
+        assert_eq!(f.ret(11, &[at, PAGE]), 0);
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 4]), errno(Errno::EINVAL));
+        assert_eq!(f.ret(26, &[at, 2 * PAGE, 1]), errno(Errno::ENOMEM));
+        assert_eq!(f.ret(26, &[at, !(2 * PAGE - 1), 4]), errno(Errno::ENOMEM));
+        // Beside it, the pages of a memfd are none of that.
+        let plain = f.ret(319, &[DATA, 0]);
+        assert_eq!(f.ret(77, &[plain, PAGE]), 0);
+        let other = f.ret(mmap, &[0, PAGE, 3, 1, plain, 0]);
+        assert_eq!(f.ret(28, &[other, PAGE, 23]), 0);
+        assert_eq!(f.ret(149, &[other, PAGE]), 0);
+        assert_eq!(f.ret(325, &[other, PAGE, 1]), 0);
+        assert_eq!(f.ret(26, &[other, PAGE, 4]), 0);
+    }
+    #[test]
     fn guards_fault_until_removed_and_refuse_what_linux_refuses() {
         let mut f = fixture();
         let mmap = syscalls::nr::MMAP;
@@ -7210,6 +7285,27 @@ mod process_vm {
         assert_eq!(f.ret(311, &[pid, LOCAL, 2, REMOTE, 1, 0]), 4);
         f.mem.read(GuestAddr(DATA + 0xc00), &mut out[..4]).unwrap();
         assert_eq!(&out[..4], b"hell");
+    }
+    #[test]
+    fn pr_set_ptracer_takes_a_task_or_any() {
+        let mut f = fixture();
+        let einval = errno(Errno::EINVAL);
+        let pid = f.ret(39, &[]);
+        const PR_SET_PTRACER: u64 = 0x5961_6d61;
+        // 0 clears it, -1 (as an int too) lets any process in, and the
+        // other arguments are not read.
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, 0, 9, 9, 9]), 0);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, u64::MAX, 0, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, 0xffff_ffff, 0, 0, 0]), 0);
+        // A task, by an int: none with this number, 0 or a negative one.
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, pid, 0, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, pid | 1 << 32, 0, 0, 0]), 0);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, 0x3fff_fff0, 0, 0, 0]), einval);
+        assert_eq!(f.ret(157, &[PR_SET_PTRACER, 1 << 32, 0, 0, 0]), einval);
+        assert_eq!(
+            f.ret(157, &[PR_SET_PTRACER, (-5i64) as u64, 0, 0, 0]),
+            einval
+        );
     }
     #[test]
     fn pidfd_getfd_copies_a_descriptor() {

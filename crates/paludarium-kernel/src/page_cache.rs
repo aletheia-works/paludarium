@@ -520,6 +520,7 @@ impl FileCache {
         offset: u64,
         len: u64,
         may_write: bool,
+        secret: bool,
     ) -> Result<SharedPages, Errno> {
         let size = file.stat()?.size;
         let end = offset.saturating_add(len);
@@ -541,7 +542,7 @@ impl FileCache {
             cache: Arc::clone(self),
             writable: may_write,
         }));
-        Ok(mapped.with_source(FilePages::new(file, name, self)))
+        Ok(mapped.with_source(FilePages::new(file, name, self, secret)))
     }
     /// The pages for a new private mapping of `file`, named `name`, which
     /// reads them from the file on first touch.
@@ -555,7 +556,7 @@ impl FileCache {
                 cache: Arc::clone(self),
                 writable: false,
             }))
-            .with_source(FilePages::new(file, name, self))
+            .with_source(FilePages::new(file, name, self, false))
     }
     /// Whether a mapping that may write shows the cache.
     pub(crate) fn mapped_writable(&self) -> bool {
@@ -619,6 +620,8 @@ pub(crate) struct FilePages {
     file: Arc<dyn FileHandle>,
     cache: Arc<FileCache>,
     name: Option<Vec<u8>>,
+    /// The file is a `memfd_secret` file, whose own handle `file` is not.
+    secret: bool,
 }
 
 impl FilePages {
@@ -626,11 +629,13 @@ impl FilePages {
         file: &Arc<dyn FileHandle>,
         name: Option<Vec<u8>>,
         cache: &Arc<FileCache>,
+        secret: bool,
     ) -> Arc<Self> {
         Arc::new(FilePages {
             file: Arc::clone(file),
             cache: Arc::clone(cache),
             name,
+            secret,
         })
     }
     /// The open file the mapping was made of.
@@ -678,6 +683,9 @@ impl paludarium_mmu::PageSource for FilePages {
     }
     fn open_file(&self) -> usize {
         Arc::as_ptr(&self.file).cast::<()>() as usize
+    }
+    fn secret(&self) -> bool {
+        self.secret
     }
     fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
         Some(self)

@@ -266,8 +266,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   だけで（`EINVAL`）、終わりより先は `SIGBUS` です。`read`、`write` とその位置指定や
   ベクタの形はなく（`EINVAL`）、`lseek`（`ESPIPE`）、`fsync`（`EINVAL`）、`fallocate`
   （`EOPNOTSUPP`）、シール（`EINVAL`）もありません。`/proc/self/fd` から開き直すと
-  `ENXIO` です。ページはエミュレータのものなので、ゲストのほかのメモリと同じだけしか
-  秘密になりません。
+  `ENXIO` です。Linux の `get_user_pages` と同じく、カーネルはそのマッピングのページに
+  触れられません。`MADV_POPULATE_READ` と `MADV_POPULATE_WRITE` は `EINVAL`、`mlock` は
+  `ENOMEM` です。`mlock_fixup` がその VMA に `VM_LOCKONFAULT` を付けないので、
+  `MLOCK_ONFAULT` でも同じです。ファイルに `fsync` がないので、`MS_SYNC` の `msync` も、
+  範囲に穴があってもそのマッピングに着けば `EINVAL` です。ページはエミュレータのものなので、
+  ゲストのほかのメモリと同じだけしか秘密になりません。
 - `openat2` は `openat` と同じように開き（FIFO も）、`struct open_how` を Linux と同じく
   より厳しく調べます。24 バイトに満たない大きさは `EINVAL`、1 ページを超えるものや、
   最初の版より後ろに 0 でない未知のバイトがあるものは `E2BIG` です。未知のフラグや
@@ -998,6 +1002,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `ESRCH`、そのプロセスにないディスクリプタは `EBADF` です。写しは開いたファイル記述を
   共有し、空いている最小の番号を close-on-exec で得ます（`RLIMIT_NOFILE` に達すれば
   `EMFILE`）。
+- ほかのプロセスのスレッドを読めるか、アタッチできるかは、Linux の `__ptrace_may_access` が
+  ケーパビリティモジュールと Yama を合わせて決めるのと同じく決めます。読む場合（`kcmp`、`get_robust_list`、
+  `/proc/<pid>/environ` など、`move_pages`、`migrate_pages`、pidfd を渡した `setns`）は、
+  相手のユーザー名前空間での `CAP_SYS_PTRACE` か、次のすべてを求めます。相手がダンプでき、
+  相手のユーザー ID とグループ ID がすべて呼び出し元のもの（呼び出しに応じて実 ID か
+  ファイルシステム ID）と同じで、同じユーザー名前空間にいて、呼び出し元の許可された
+  ケーパビリティ（ファイルシステム ID の場合は実効ケーパビリティ）が相手の許可された
+  ケーパビリティを含むことです。そのうえで Landlock が、ドメインの中の呼び出し元を外の
+  タスクから遠ざけます。アタッチする場合（`process_vm_readv`、`process_vm_writev`、
+  `pidfd_getfd`）は、Debian や Ubuntu、CI のランナーと同じく Yama の `ptrace_scope` を 1 と
+  します。相手が呼び出し元の子孫であるか、`PR_SET_PTRACER` で呼び出し元を入れているか、
+  呼び出し元が相手のユーザー名前空間で `CAP_SYS_PTRACE` を持つことも求めます。
 - `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
   （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
   `execve` は `READ_IMPLIES_EXEC` を、set-ID のプログラムなら `PER_CLEAR_ON_SETID` も
@@ -1376,6 +1392,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ファミリーのアドレスより短い宛先は、IPv4 なら `ERANGE`、IPv6 なら `EINVAL` です。
     `RTM_F_FIB_MATCH` を付ければ、合った表の項目を返します（`0.0.0.0` に合う項目はないので
     `EHOSTUNREACH` です）。
+  - **経路のメトリクス:** IPv4 と IPv6 の経路は、`RTA_METRICS` が持つメトリクス
+    （`ip route add ... mtu 1400` が送るもの）を、`ip_metrics_convert` と同じく読んで
+    保ちます。種類を順に読み、0 の種類は飛ばします。`RTAX_MTU` は 65520 に、`RTAX_ADVMSS`
+    は 65495 に、`RTAX_HOPLIMIT` は 255 に抑えます。`RTAX_MAX` を超える種類、4 バイトでない
+    値、`cubic` と `reno` のほかの輻輳制御（`RTAX_CC_ALGO`）、`RTAX_FEATURE_MASK` を超える
+    機能、ロックした 0 の輻輳ウィンドウは `EINVAL` です。`fib_find_info` と同じく、
+    メトリクスだけが違う IPv4 の経路は別の経路になります。ダンプ、通知、引き当ての答えは、
+    `rtnetlink_put_metrics` と同じく、0 のもののほかの経路のメトリクスを持ちます
+    （制限ブロードキャストアドレスと、4 より短い接頭辞の経路を通るマルチキャストアドレスの
+    引き当ては、メトリクスを落とすので持ちません）。
+    メトリクスを指した IPv4 の削除は、`fib_metrics_match` と同じく、それを持つ経路だけを
+    消します。抑える前の値で比べるので、MTU の 70000 は保った 65520 と合いません。IPv6 の
+    削除はメトリクスを見ません。
   - **ソケット:** ローカルな経路が持つアドレスはゲスト自身のものです。TCP や UDP の
     ソケットはそこへ bind でき、その経路の優先する送り元からループバックの上で届きます。
     ループバックでは、IPv4 のアドレスはそのサブネット全体を、IPv4 のローカルな経路
@@ -1710,7 +1739,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
   `environ` は実 ID が、`exe`、`cwd`、`ns` のリンクはファイルシステムの ID が、ダンプできるプロセスの
-  ユーザーとグループのすべての ID と同じでなければ `EACCES` です。ダンプできないプロセスの
+  ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
+  その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
+  ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
+  同じです。ダンプできないプロセスの
   ディレクトリの持ち主は root です。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
   ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
@@ -2108,7 +2140,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`TIMER_ABSTIME` なら絶対時刻）、`KTIME_MAX` で頭打ちにします。止めると間隔も含めて
   何も示さず、`SIGEV_NONE` のタイマーは読んだときに間隔の分だけ進めます。時計の
   スレッドが終わったあとは、`timer_settime` は `ESRCH` を返し、`timer_gettime` は何も
-  示しません。タイマーは
+  示しません。ほかの時計では、Linux の `common_timer_set` と同じく、`timer_settime` は
+  `flags` のうち `TIMER_ABSTIME` しか見ず、値と間隔は `KTIME_MAX` で頭打ちにし、相対時間で
+  `KTIME_MAX` を超える満了もそこで止めます。相対時間の `CLOCK_REALTIME` のタイマーは
+  単調時計で数えます。タイマーは
   `fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、プロセス全体に
   届いてブロックされているシグナルも受け取ります。
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が
@@ -2123,7 +2158,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PR_SET_KEEPCAPS`（スレッドごとで、`execve` で消えます）、
   `PR_SET_CHILD_SUBREAPER`（`fork` では受け継がれず、`execve` では残ります）、
   `PR_SET_NO_NEW_PRIVS`、`PR_SET_SECCOMP`（下の seccomp を見てください）と、
-  それぞれの `PR_GET_*` に対応します。ほかの指定には `EINVAL` を返します。
+  それぞれの `PR_GET_*`、そして Yama の `PR_SET_PTRACER` に対応します。`PR_SET_PTRACER` は
+  ほかの引数を読みません。0 で消え、`PR_SET_PTRACER_ANY`（`int` として -1 も同じ）でどの
+  プロセスもアタッチできるようになります。ほかの値は `int` として、呼び出し元の PID 名前空間の
+  タスクを指します（なければ `EINVAL`）。そのタスクがある間、そのプロセスとその子孫が
+  アタッチできます。どのスレッドが設定してもプロセスのもので、子には受け継がれません。
+  ほかの指定には `EINVAL` を返します。
 - プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって
   いない一番近い祖先に、いなければ PID 名前空間の init にあたる最初のプロセスに
   引き取られます。Linux の `forget_original_parent` と同じです。その後 `getppid` は

@@ -1318,6 +1318,23 @@ static void nl_route_attribute(unsigned short type, const unsigned char *v, int 
         memcpy(metric, v, 4);
         memcpy(&value, v + 4, 4);
         printf("=%u:%u:%u", metric[0], metric[1], value);
+    } else if (type == 8 && len > 8) {
+        /* Metrics: each type, then its u32 or its string. */
+        printf("=");
+        for (int at = 0; at + 4 <= len;) {
+            unsigned short metric[2];
+            memcpy(metric, v + at, 4);
+            if (metric[0] < 4 || at + metric[0] > len) break;
+            int size = metric[0] - 4;
+            printf("%s%u", at ? "," : "", metric[1]);
+            if (size == 4) {
+                memcpy(&value, v + at + 4, 4);
+                printf(":%u", value);
+            } else {
+                printf(":'%.*s'", size, v + at + 4);
+            }
+            at += (metric[0] + 3) & ~3;
+        }
     } else if (len == 4) {
         printf("=%u", value);
     } else if (len == 1) {
@@ -1635,6 +1652,26 @@ static void nl_policy(int fd, unsigned short type, unsigned short flags, struct 
                       const void *value, size_t len, const char *label) {
     nl_put(&b, attr, value, len);
     printf("%s: error=%d\n", label, nl_quiet(fd, type, flags, b.bytes, b.len));
+}
+/* The route-metrics case: sends route request `type` with `flags` for
+   `dst`/`len` through lo (none for a reject type `kind` past 1), with
+   RTA_METRICS holding `b`'s attributes (none when NULL), and prints the
+   answer. */
+static void nl_metrics(int fd, unsigned port, unsigned short type, unsigned short flags, const char *dst, int len,
+                       int kind, const struct nl_body *m, const char *label) {
+    int family = strchr(dst, ':') ? AF_INET6 : AF_INET, size = family == AF_INET ? 4 : 16;
+    struct nl_body b = nl_body(family, 12);
+    b.bytes[1] = len;
+    b.bytes[4] = 254;
+    b.bytes[5] = type == 24 ? 3 : 0;
+    b.bytes[6] = type == 24 && family == AF_INET && kind == 1 ? 253 : type == 24 ? 0 : 255;
+    b.bytes[7] = kind;
+    unsigned char address[16];
+    inet_pton(family, dst, address);
+    nl_put(&b, 1, address, size);
+    if (kind == 1) nl_put32(&b, 4, 1);
+    if (m) nl_put(&b, 8, m->bytes, m->len);
+    nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | NL_F_ACK | flags, b.bytes, b.len), port, label);
 }
 /* A /32 address of lo, `ip`, as `ip address add` makes it. */
 static int nl_local(int fd, const unsigned char ip[4]) {
@@ -7077,6 +7114,48 @@ static int cpu_sleep_case(void) {
     printf("signal absolute=%ld rem=%ld %ld\n", interrupted, (long)rem.tv_sec, rem.tv_nsec);
     return 0;
 }
+/* timer_settime on the host clocks takes times up to KTIME_MAX, stops a
+ * relative expiry there, and looks at no flag but TIMER_ABSTIME. */
+static long tl_set(int id, int flags, long i_sec, long v_sec, long v_nsec) {
+    struct itimerspec v = {{i_sec, 0}, {v_sec, v_nsec}};
+    return syscall(SYS_timer_settime, (long)id, (long)flags, &v, NULL) ? -errno : 0;
+}
+/* Whether the time left and the clock's time make KTIME_MAX, to a second. */
+static int tl_reaches_max(int id, clockid_t clock) {
+    struct itimerspec v;
+    struct timespec now;
+    syscall(SYS_timer_gettime, (long)id, &v);
+    clock_gettime(clock, &now);
+    long sec = v.it_value.tv_sec + now.tv_sec + (v.it_value.tv_nsec + now.tv_nsec) / 1000000000L;
+    return sec >= 9223372035L && sec <= 9223372036L;
+}
+static int timer_limits_case(void) {
+    int mono = ct_create(CLOCK_MONOTONIC, SIGEV_NONE, 0, 0);
+    int real = ct_create(CLOCK_REALTIME, SIGEV_NONE, 0, 0);
+    printf("create=%d\n", mono >= 0 && real >= 0);
+    /* Past u64 nanoseconds and at LONG_MAX seconds: clamped. */
+    printf("huge set=%ld\n", tl_set(mono, 0, 20000000000L, LONG_MAX, 0));
+    struct itimerspec v = ct_get(mono);
+    printf("huge interval=%ld %ld reaches-max=%d\n", (long)v.it_interval.tv_sec,
+           v.it_interval.tv_nsec, tl_reaches_max(mono, CLOCK_MONOTONIC));
+    /* Past KTIME_MAX but within u64 nanoseconds: clamped too. */
+    printf("past-max set=%ld\n", tl_set(mono, 0, 0, 10000000000L, 0));
+    printf("past-max reaches-max=%d\n", tl_reaches_max(mono, CLOCK_MONOTONIC));
+    /* A relative CLOCK_REALTIME timer counts on the monotonic clock, an
+       absolute one on its own. */
+    printf("real relative=%ld reaches-max=%d\n", tl_set(real, 0, 0, LONG_MAX, 0),
+           tl_reaches_max(real, CLOCK_MONOTONIC));
+    printf("real absolute=%ld reaches-max=%d\n", tl_set(real, TIMER_ABSTIME, 0, LONG_MAX, 0),
+           tl_reaches_max(real, CLOCK_REALTIME));
+    /* Other flags are not looked at; bad times are. */
+    printf("flags=%ld\n", tl_set(mono, ~TIMER_ABSTIME, 0, 5, 0));
+    v = ct_get(mono);
+    printf("flags left-in-range=%d\n", v.it_value.tv_sec >= 4 && v.it_value.tv_sec <= 5);
+    printf("negative=%ld wide=%ld\n", tl_set(mono, 0, 0, -1, 0), tl_set(mono, 0, 0, 1, 1000000000L));
+    printf("delete=%ld %ld\n", syscall(SYS_timer_delete, (long)mono),
+           syscall(SYS_timer_delete, (long)real));
+    return 0;
+}
 /* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
  * SIGKILL at the hard limit. Each part runs in a child, whose CPU time
  * starts from 0. */
@@ -9081,6 +9160,116 @@ static int process_vm_case(void) {
     waitpid(zombie, NULL, 0);
     return 0;
 }
+/* Yama's ptrace_scope 1, which the CI's runners have (sysctl.d's
+ * 55-ptrace.conf) and the emulator keeps, and the capability module's check,
+ * as security/yama/yama_lsm.c and security/commoncap.c decide them for
+ * process_vm_readv and pidfd_getfd of a parent from its child. It runs as a
+ * user who is not root (natively it never is, and an emulated root becomes
+ * nobody), so no CAP_SYS_PTRACE lets the child in. */
+#define YA_SET_PTRACER 0x59616d61L
+/* What prctl's PR_SET_PTRACER is given: the asking child's number. */
+#define YA_CHILD (-2L)
+enum { YA_PLAIN, YA_GRANDCHILD, YA_OWN_USERS, YA_FEWER_CAPS, YA_SAME_CAPS };
+static pid_t ya_parent;
+static long ya_r(long r) { return r < 0 ? -errno : r; }
+/* The child's two asks of its parent, a success shown as "ok": its
+ * buffer, and its standard output. */
+static void ya_show(const char *name) {
+    long vm = pv_ask(ya_parent), pidfd = ya_r(syscall(SYS_pidfd_open, ya_parent, 0));
+    long fd = pidfd < 0 ? pidfd : pg(pidfd, 1, 0);
+    printf("%s: vm=", name);
+    if (vm == 4) printf("ok"); else printf("%ld", vm);
+    printf(" getfd=");
+    if (fd >= 0) printf("ok\n"); else printf("%ld\n", fd);
+    fflush(stdout);
+}
+/* Sets the ptracer to `ptracer` (the child for YA_CHILD, nothing for -3),
+ * then lets a child ask in the way `how` says, and clears it again. */
+static void ya_ask(const char *name, long ptracer, int how) {
+    int gate[2];
+    if (pipe(gate)) return;
+    fflush(stdout);
+    pid_t asker = fork();
+    if (asker == 0) {
+        close(gate[1]);
+        char c;
+        read(gate[0], &c, 1);
+        if (how == YA_OWN_USERS && syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+        if (how == YA_FEWER_CAPS && caps_set(0, CAPS_ALL & ~CAP_BIT(19) & ~CAP_BIT(13), 0))
+            _exit(91);
+        if (how == YA_GRANDCHILD) {
+            pid_t grandchild = fork();
+            if (grandchild == 0) {
+                ya_show(name);
+                _exit(0);
+            }
+            waitpid(grandchild, NULL, 0);
+        } else {
+            ya_show(name);
+        }
+        _exit(0);
+    }
+    close(gate[0]);
+    if (ptracer != -3) {
+        long set = ya_r(prctl(YA_SET_PTRACER, ptracer == YA_CHILD ? (long)asker : ptracer, 0, 0, 0));
+        printf("%s: set=%ld\n", name, set);
+    }
+    fflush(stdout);
+    write(gate[1], "g", 1);
+    close(gate[1]);
+    int status = 0;
+    waitpid(asker, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) printf("%s: status=%d\n", name, status);
+    prctl(YA_SET_PTRACER, 0L, 0, 0, 0);
+}
+static void *ya_thread_sets(void *arg) {
+    *(long *)arg = ya_r(prctl(YA_SET_PTRACER, -1L, 0, 0, 0));
+    return NULL;
+}
+static int yama_case(void) {
+    if (geteuid() == 0 &&
+        (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+        return 80;
+    prctl(PR_SET_DUMPABLE, 1);
+    ya_parent = getpid();
+    strcpy(pv_buf, "the parent's buffer");
+    ya_ask("none", -3, YA_PLAIN);
+    ya_ask("the-child", YA_CHILD, YA_PLAIN);
+    ya_ask("the-child's-child", YA_CHILD, YA_GRANDCHILD);
+    ya_ask("any", -1L, YA_PLAIN);
+    ya_ask("any-as-int", 0xffffffffL, YA_PLAIN);
+    ya_ask("self", (long)getpid(), YA_PLAIN);
+    ya_ask("cleared", 0L, YA_PLAIN);
+    /* A number no task has, one whose int is 0, and a negative one. */
+    ya_ask("no-task", 0x3ffffff0L, YA_PLAIN);
+    ya_ask("high-bits", 1L << 32, YA_PLAIN);
+    ya_ask("negative", -5L, YA_PLAIN);
+    /* The process's, whichever thread sets it. */
+    long by_thread = -1;
+    pthread_t t;
+    pthread_create(&t, NULL, ya_thread_sets, &by_thread);
+    pthread_join(t, NULL);
+    printf("thread: set=%ld\n", by_thread);
+    ya_ask("set-by-a-thread", -3, YA_PLAIN);
+    /* Let in by Yama, but in another user namespace, with no capability in
+       the parent's: the capability module refuses. */
+    ya_ask("own-user-namespace", -1L, YA_OWN_USERS);
+    /* In a user namespace of the parent's own, where it holds every
+       capability but CAP_SYS_PTRACE: a child with the same ones may attach,
+       one without CAP_NET_RAW may not, its permitted ones not covering the
+       parent's. */
+    fflush(stdout);
+    pid_t owner = fork();
+    if (owner == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWUSER) || caps_set(0, CAPS_ALL & ~CAP_BIT(19), 0)) _exit(92);
+        ya_parent = getpid();
+        ya_ask("same-capabilities", -1L, YA_SAME_CAPS);
+        ya_ask("fewer-capabilities", -1L, YA_FEWER_CAPS);
+        _exit(0);
+    }
+    printf("owner: status=%d\n", reaped(owner));
+    return 0;
+}
 /* The alarm clocks, CLOCK_REALTIME_ALARM and CLOCK_BOOTTIME_ALARM, as
  * kernel/time/alarmtimer.c and fs/timerfd.c: a sleep, a timer or a timerfd
  * on one needs CAP_WAKE_ALARM. The CI runners have an RTC that can wake them
@@ -9347,6 +9536,30 @@ static int memfd_secret_case(void) {
     char *again = mmap(NULL, 2 * page, PROT_READ, MAP_SHARED, fd, 0);
     if (again == MAP_FAILED) return 83;
     printf("kept=%.6s\n", again + page);
+    /* The kernel may not reach its pages (get_user_pages), and its file has
+     * no fsync, which msync with MS_SYNC makes. MS_INVALIDATE is left out:
+     * before Linux 7.3 the mapping is locked, which gives EBUSY. */
+    char *both = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (both == MAP_FAILED) return 86;
+    printf("populate-read=%ld\n", secret_errno(madvise(again, 2 * page, 22)));
+    printf("populate-write=%ld\n", secret_errno(madvise(both, 2 * page, 23)));
+    printf("populate-read-writable=%ld\n", secret_errno(madvise(both + page, page, 22)));
+    printf("msync-sync=%ld\n", secret_errno(msync(again, 2 * page, MS_SYNC)));
+    printf("msync-async=%ld\n", secret_errno(msync(again, 2 * page, MS_ASYNC)));
+    printf("msync-none=%ld\n", secret_errno(msync(again, 2 * page, 0)));
+    /* A hole before it: MS_SYNC still reaches the mapping, MS_ASYNC stops at
+     * the hole. */
+    char *holed = mmap(NULL, 3 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (holed == MAP_FAILED) return 87;
+    if (mmap(holed + page, 2 * page, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) return 88;
+    munmap(holed, page);
+    printf("msync-sync-after-hole=%ld\n", secret_errno(msync(holed, 3 * page, MS_SYNC)));
+    printf("msync-async-after-hole=%ld\n", secret_errno(msync(holed, 3 * page, MS_ASYNC)));
+    /* No lock can bring its pages in, and mlock_fixup gives its VMA no
+     * VM_LOCKONFAULT, so a lock on fault tries to as well. */
+    printf("mlock=%ld\n", secret_errno(mlock(both, 2 * page)));
+    printf("mlock-onfault=%ld\n", secret_errno(syscall(SYS_mlock2, both, 2 * page, 1L)));
+    printf("munlock=%ld\n", secret_errno(munlock(both, 2 * page)));
     if (fstat(fd, &st)) return 84;
     printf("after size=%ld blocks=%ld\n", (long)st.st_size, (long)st.st_blocks);
     /* Past its end, a mapping raises SIGBUS. */
@@ -12478,6 +12691,128 @@ int main(int argc, char **argv) {
             b = nl_body(AF_INET, 12);
             nl_put32(&b, 200, 0);
             nl_strict(loose, name.pid, 26, 0, &b, "loose get4 unknown type");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "route-metrics")) {
+        /* A child makes a network namespace with lo up and adds IPv4 and
+           IPv6 routes with metrics (RTA_METRICS, as `ip route add ... mtu`
+           sends): those held to their limits, those refused, a route that
+           differs by its metrics alone, removals that name them, and what
+           dumps, lookups and notifications show of them. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            /* IPv4's and IPv6's route groups. */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x440};
+            bind(mon, (void *)&members, sizeof members);
+            const unsigned short add = 0x600, create = 0x400;
+            struct nl_body m;
+            /* Held: an MTU and an advertised MSS of 70000, a hop limit of
+               300; a type of 0 and a value of 0 left out; features and the
+               congestion control by name. */
+            m = nl_body(0, 0);
+            nl_put32(&m, 0, 1);
+            nl_put32(&m, 2, 70000);
+            nl_put32(&m, 8, 70000);
+            nl_put32(&m, 10, 300);
+            nl_put32(&m, 12, 1);
+            nl_put32(&m, 3, 0);
+            nl_put(&m, 16, "cubic", 6);
+            nl_metrics(ctl, port, 24, add, "10.8.0.0", 16, 1, &m, "add held");
+            /* Other metrics make another route; the same again is EEXIST. */
+            struct nl_body mtu = nl_body(0, 0);
+            nl_put32(&mtu, 2, 1400);
+            nl_metrics(ctl, port, 24, create, "10.8.0.0", 16, 1, &mtu, "add other");
+            nl_metrics(ctl, port, 24, create, "10.8.0.0", 16, 1, &mtu, "add other again");
+            /* A blackhole and the default route, and each of the rest. */
+            nl_metrics(ctl, port, 24, add, "10.6.0.0", 16, 6, &mtu, "add blackhole");
+            m = nl_body(0, 0);
+            static const unsigned short kinds[] = {1, 3, 4, 5, 6, 7, 9, 11, 13, 14, 15, 17};
+            for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++) nl_put32(&m, kinds[i], 10 + i);
+            nl_metrics(ctl, port, 24, add, "10.7.0.0", 16, 1, &m, "add every metric");
+            struct nl_body empty = nl_body(0, 0);
+            nl_metrics(ctl, port, 24, add, "10.10.0.0", 16, 1, &empty, "add empty");
+            /* Refused: a type past RTAX_MAX, a short value, a congestion
+               control there is not, an empty name, unknown features. A
+               locked window of 0 is EINVAL only since Linux's commit
+               363c8c79220d (2026-10), which the kernel these run on may
+               not have yet, so only the unit tests check it. */
+            static const struct {
+                const char *label;
+                unsigned short type;
+                const char *value;
+                int len;
+            } bad[] = {
+                {"bad type 18", 18, "\1\0\0\0", 4},
+                {"bad short mtu", 2, "\1\0", 2},
+                {"bad long mtu", 2, "\1\0\0\0\0", 5},
+                {"bad congestion", 16, "nosuchcc", 9},
+                {"bad empty congestion", 16, "", 0},
+                {"bad features", 12, "\x20\0\0\0", 4},
+            };
+            for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+                m = nl_body(0, 0);
+                nl_put(&m, bad[i].type, bad[i].value, bad[i].len);
+                nl_metrics(ctl, port, 24, add, "10.9.0.0", 16, 1, &m, bad[i].label);
+                nl_metrics(ctl, port, 24, add, "2001:db8:9::", 48, 1, &m, bad[i].label);
+            }
+            m = nl_body(0, 0);
+            nl_put32(&m, 1, 0x80);
+            nl_put32(&m, 7, 10);
+            nl_metrics(ctl, port, 24, add, "10.9.0.0", 16, 1, &m, "add locked window");
+            /* IPv6. */
+            m = nl_body(0, 0);
+            nl_put32(&m, 2, 1280);
+            nl_put32(&m, 10, 64);
+            nl_put(&m, 16, "reno", 5);
+            nl_metrics(ctl, port, 24, add, "2001:db8::", 48, 1, &m, "add6");
+            nl_metrics(ctl, port, 24, add, "2001:db8:6::", 48, 6, &mtu, "add6 blackhole");
+            monitor_show(mon, port, "added");
+            unsigned char family = 0;
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump");
+            static const char *const asked[] = {"10.8.1.1", "10.7.1.1", "10.10.1.1", "2001:db8::1"};
+            routes_get(ctl, port, "metrics", asked, sizeof asked / sizeof asked[0], 0);
+            routes_get(ctl, port, "metrics", asked, sizeof asked / sizeof asked[0], 0x2000);
+            /* Removing matches the values named, unheld: 70000 is not the
+               65520 kept; a bad type or value matches nothing; an unknown
+               congestion control is none, which a route with cubic has
+               not. IPv6's does not look at them. */
+            m = nl_body(0, 0);
+            nl_put32(&m, 2, 70000);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &m, "del unheld");
+            m = nl_body(0, 0);
+            nl_put32(&m, 18, 1);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &m, "del type 18");
+            m = nl_body(0, 0);
+            nl_put(&m, 10, "\1\0", 2);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &m, "del short");
+            struct nl_body unknown = nl_body(0, 0);
+            nl_put(&unknown, 16, "nosuchcc", 9);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &unknown, "del unknown congestion");
+            m = nl_body(0, 0);
+            nl_put32(&m, 2, 65520);
+            nl_put(&m, 16, "cubic", 5);
+            nl_metrics(ctl, port, 25, 0, "10.8.0.0", 16, 0, &m, "del held");
+            nl_metrics(ctl, port, 25, 0, "10.10.0.0", 16, 0, &unknown, "del empty by unknown");
+            nl_metrics(ctl, port, 25, 0, "10.7.0.0", 16, 0, &empty, "del every by empty");
+            m = nl_body(0, 0);
+            nl_put32(&m, 18, 1);
+            nl_metrics(ctl, port, 25, 0, "2001:db8::", 48, 0, &m, "del6 type 18");
+            monitor_show(mon, port, "removed");
+            nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | NL_F_DUMP, &family, 1), port, "dump after");
             fflush(stdout);
             _exit(0);
         }
@@ -21553,12 +21888,14 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "page-nodes")) return page_nodes_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
+    if (!strcmp(mode, "yama")) return yama_case();
     if (!strcmp(mode, "ignored-signal-wait")) return ignored_signal_wait_case();
     if (!strcmp(mode, "mmsg")) return mmsg_case();
     if (!strcmp(mode, "itimer")) return itimer_case();
     if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
+    if (!strcmp(mode, "timer-limits")) return timer_limits_case();
     if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {
         struct itimerval v;

@@ -209,9 +209,7 @@ verified.
     `MADV_SOFT_OFFLINE`, which Linux takes. Neither `/proc/<pid>/smaps`,
     whose `VmFlags` would show the `gu` of a VMA that had guards and the
     `lo` of a locked one, nor `/proc/<pid>/pagemap`, which would show a
-    guard page, is there. `MADV_POPULATE_READ` and
-    `MADV_POPULATE_WRITE` bring in the pages of a `memfd_secret` mapping,
-    where Linux gives `EINVAL`.
+    guard page, is there.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
     mapped. It refuses advice Linux does not know before any range
@@ -230,9 +228,12 @@ verified.
     Linux keeps it as the socket's error for the next call and
     `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.
   - The pages of a `memfd_secret` file do not count against
-    `RLIMIT_MEMLOCK`, where Linux's fault past it raises `SIGBUS`, and
-    `msync` with `MS_SYNC` of its mapping succeeds, where Linux gives
-    `EINVAL` as the file has no `fsync`.
+    `RLIMIT_MEMLOCK`, where Linux 7.3 and later count them against the
+    user's as they are faulted in (`SIGBUS` past it), and earlier kernels
+    count its mappings as locked (`mmap` gives `EAGAIN` past it). Those
+    earlier kernels' mapping is also locked, so `msync` with
+    `MS_INVALIDATE` of it gives `EBUSY` there, where it succeeds here, as
+    on Linux 7.3.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`, and
     `RLIMIT_CPU` all count the process's whole CPU time, as all of it is user time here
     (Linux's `ITIMER_VIRTUAL` leaves out the system time; its `RLIMIT_CPU`
@@ -301,14 +302,8 @@ verified.
     each semaphore beside one for operations on several, and which of two
     waits that both could go through goes first can differ where waits of
     both kinds are mixed.
-  - Whether a caller may attach to another process (`process_vm_readv`,
-    `process_vm_writev`, `pidfd_getfd`) is decided by the IDs, dumpability,
-    `CAP_SYS_PTRACE` and Landlock alone, as Linux with no Yama does: there is
-    no `kernel.yama.ptrace_scope`, so a process may reach its parent, where
-    Yama's default scope 1 lets only an ancestor in. For that and for reading
-    another process (`get_robust_list`, `kcmp`, `migrate_pages`,
-    `move_pages`), the capability module's check that the caller's permitted
-    capabilities cover the target's is not made.
+  - Yama's `ptrace_scope` is always 1: there is no
+    `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
@@ -458,14 +453,18 @@ verified.
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), renaming `lo`
   and setting any other attribute of it. A
   route goes through `lo` or rejects: IPv6 gateways, multipath routes,
-  metrics (`RTA_METRICS`, as `ip route add ... mtu` sends), encapsulations,
-  nexthop objects, realms, expiries, source prefixes, router preferences
+  encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup
   reaches a table but the local, main and default ones. In a new network
   namespace a connection or datagram to an address no local route has is
   still `ENETUNREACH`, whatever route takes it, where Linux's goes out
   through `lo` and is dropped, or fails with a rejecting route's error.
+  A route's metrics (`RTA_METRICS`) are kept and shown, but change
+  nothing a socket does: its MTU, hop limit, window and congestion control
+  are their defaults whatever its route holds. A route may name no
+  congestion control but `cubic` and `reno` (`EINVAL`), where Linux, for a
+  caller with `CAP_NET_ADMIN`, loads the module of another first.
   An address is always permanent: lifetimes (`IFA_CACHEINFO`) and
   `IFA_RT_PRIORITY` are not kept, a peer address is
   not a point-to-point one, and an IPv6 address is never tentative, where

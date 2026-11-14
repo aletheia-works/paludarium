@@ -89,6 +89,21 @@ const RTN_LOCAL: u8 = 2;
 /// `RTAX_FASTOPEN_NO_COOKIE`).
 const RTAX_MTU: u16 = 2;
 const RTAX_MAX: u16 = 17;
+/// The other metrics `ip_metrics_convert` looks at: `RTAX_LOCK`,
+/// `RTAX_CWND`, `RTAX_ADVMSS`, `RTAX_HOPLIMIT`, `RTAX_FEATURES` and
+/// `RTAX_CC_ALGO`, and the features a request may set
+/// (`RTAX_FEATURE_MASK`).
+const RTAX_LOCK: u16 = 1;
+const RTAX_CWND: u16 = 7;
+const RTAX_ADVMSS: u16 = 8;
+const RTAX_HOPLIMIT: u16 = 10;
+const RTAX_FEATURES: u16 = 12;
+const RTAX_CC_ALGO: u16 = 16;
+const RTAX_FEATURE_MASK: u32 = 0x1f;
+/// The congestion controls a route may name (`RTAX_CC_ALGO`), by their
+/// keys: those built into Linux, `cubic`, the one sockets use, and
+/// `reno`, which is always there.
+const CONGESTION_CONTROLS: [(u32, &[u8]); 2] = [(1, b"cubic"), (2, b"reno")];
 const GROUPS: u32 = 39;
 /// The bits of groups 30 and 31, the multicast routing ones of a full
 /// routing daemon, which need `CAP_NET_ADMIN` (`rtnetlink_bind`).
@@ -2848,6 +2863,7 @@ fn ipv4_route_of(
     if route.priority != 0 {
         attribute(&mut body, RTA_PRIORITY, &route.priority.to_le_bytes());
     }
+    put_metrics(&mut body, &route.metrics);
     if let Some(source) = route.prefsrc {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
@@ -2886,6 +2902,7 @@ fn ipv6_route_of(
     if let Some(source) = route.prefsrc {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
+    put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
     attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &[0; RTA_CACHEINFO_LEN]);
@@ -2975,6 +2992,8 @@ fn lookup(
         if let Some(source) = route.prefsrc {
             attribute(&mut body, RTA_PREFSRC, &source.octets());
         }
+        // The route's metrics, which its `rt6_info` shares.
+        put_metrics(&mut body, &route.metrics);
         attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
         attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
         attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
@@ -2986,11 +3005,18 @@ fn lookup(
         address = *value.first_chunk().ok_or(ERANGE)?;
     }
     let ip = Ipv4Addr::from(address);
-    let (kind, source, gateway, table) = if ip.is_unspecified() {
+    let (kind, source, gateway, table, metrics) = if ip.is_unspecified() {
         if fib_match {
             return Err(EHOSTUNREACH);
         }
-        (Kind::Local, Some(Ipv4Addr::LOCALHOST), None, TABLE_MAIN)
+        let none = crate::interface::NO_METRICS;
+        (
+            Kind::Local,
+            Some(Ipv4Addr::LOCALHOST),
+            None,
+            TABLE_MAIN,
+            none,
+        )
     } else {
         let route = addresses.lookup4(ip)?;
         let table = if request_flags & RTM_F_LOOKUP_TABLE == 0 || route.table == TABLE_LOCAL {
@@ -3002,7 +3028,17 @@ fn lookup(
             return Ok(ipv4_route_of(RTM_NEWROUTE, &route, table, seq, port, 0));
         }
         let gateway = route.gateway.filter(|_| route.uses_gateway);
-        (route.kind, addresses.source4(&route, ip), gateway, table)
+        // `__mkroute_output` drops the route's `fib_info`, and so its
+        // metrics, for the limited broadcast address, and for a multicast
+        // one when the route is shorter than 224.0.0.0/4's prefix (the
+        // default route, which it takes for want of a multicast one).
+        let metrics = if ip.is_broadcast() || (ip.is_multicast() && route.len < 4) {
+            crate::interface::NO_METRICS
+        } else {
+            route.metrics
+        };
+        let source = addresses.source4(&route, ip);
+        (route.kind, source, gateway, table, metrics)
     };
     // `rt_fill_info` of the cached route the lookup made, which is local as
     // it goes through `lo`.
@@ -3031,6 +3067,7 @@ fn lookup(
     if let Some(gateway) = gateway {
         attribute(&mut body, RTA_GATEWAY, &gateway.octets());
     }
+    put_metrics(&mut body, &metrics);
     // The mark it names, but 0, as `rt_fill_info` gives it; an invalid
     // user ID (-1) is left out (`uid_valid`).
     if mark != 0 {
@@ -3049,9 +3086,11 @@ fn lookup(
 /// `EINVAL` for one shorter than an `rtmsg`; then the family's policy
 /// (`rtm_ipv4_policy`, `rtm_ipv6_policy`), and `EINVAL` for an IPv6
 /// destination shorter than its prefix; then `EINVAL` for a TOS with ECN bits (any for IPv6) or a
-/// kind past `RTN_MAX`. Multipath routes, metrics, encapsulations,
+/// kind past `RTN_MAX`. Multipath routes, encapsulations,
 /// nexthop objects, realms, expiries, IPv6 gateways, source prefixes and
-/// router preferences are `EOPNOTSUPP`. The table is the `rtmsg`'s, or the
+/// router preferences are `EOPNOTSUPP`. A route added takes the metrics
+/// `RTA_METRICS` holds ([`convert_metrics`]); an IPv4 one removed must
+/// have those it names ([`metrics_match`]), and IPv6's does not look. The table is the `rtmsg`'s, or the
 /// one `RTA_TABLE` names.
 fn change_route(
     network: &Network,
@@ -3074,6 +3113,7 @@ fn change_route(
     let mut gateway = None;
     let mut oif = 0;
     let mut priority = 0;
+    let mut metrics = None;
     let mut unsupported = src_len != 0 && v6;
     let number = |value: &[u8]| -> Result<u32, Errno> {
         Ok(u32::from_le_bytes(*value.first_chunk().ok_or(ERANGE)?))
@@ -3105,8 +3145,10 @@ fn change_route(
             RTA_PRIORITY => priority = number(value)?,
             RTA_TABLE => table = number(value)?,
             RTA_PREF if v6 => unsupported |= value.first().is_some_and(|&p| p == 1 || p == 3),
-            RTA_METRICS | RTA_MULTIPATH | RTA_FLOW | RTA_VIA | RTA_ENCAP | RTA_EXPIRES
-            | RTA_NH_ID => unsupported = true,
+            RTA_METRICS => metrics = Some(value),
+            RTA_MULTIPATH | RTA_FLOW | RTA_VIA | RTA_ENCAP | RTA_EXPIRES | RTA_NH_ID => {
+                unsupported = true;
+            }
             _ => {}
         }
     }
@@ -3119,6 +3161,7 @@ fn change_route(
     }
     let up = network.is_up();
     let mut addresses = network.addresses();
+    let converted = metrics.map_or(Ok(crate::interface::NO_METRICS), convert_metrics);
     if v6 {
         let ip = |raw: Option<Vec<u8>>| {
             raw.map(|r| Ipv6Addr::from(<[u8; 16]>::try_from(r).unwrap_or_default()))
@@ -3133,6 +3176,7 @@ fn change_route(
             prefsrc: ip(prefsrc),
             oif,
             request: header.flags,
+            metrics: converted,
         };
         return if add {
             addresses.add_route6(&ask, up)
@@ -3161,6 +3205,7 @@ fn change_route(
                 oif,
                 flags,
                 request: header.flags,
+                metrics: converted,
             },
             up,
         );
@@ -3177,7 +3222,112 @@ fn change_route(
         prefsrc,
         gateway,
         oif,
+        metrics: metrics.map_or(Some(Vec::new()), metrics_match),
     })
+}
+/// The key of the congestion control `RTAX_CC_ALGO`'s `value` names, as
+/// `nla_strscpy` and `tcp_ca_get_key_by_name` find it: to a NUL, in at
+/// most 15 bytes; 0 (`TCP_CA_UNSPEC`) for none of
+/// [`CONGESTION_CONTROLS`]. Linux would load a module for another name.
+fn congestion_key(value: &[u8]) -> u32 {
+    let value = value.strip_suffix(&[0]).unwrap_or(value);
+    let value = &value[..value.len().min(15)];
+    let name = value.split(|&b| b == 0).next().unwrap_or_default();
+    CONGESTION_CONTROLS
+        .iter()
+        .find(|&&(_, known)| known == name)
+        .map_or(0, |&(key, _)| key)
+}
+/// A route's metrics from its `RTA_METRICS`, as `ip_metrics_convert`
+/// reads them: each attribute in turn, as `nla_for_each_attr` takes
+/// them, type 0 passed over; `EINVAL` for a type past `RTAX_MAX`, for a
+/// value of other than four bytes but `RTAX_CC_ALGO`'s, for a congestion
+/// control there is not, for features past `RTAX_FEATURE_MASK`, and for
+/// a locked congestion window of 0. `RTAX_ADVMSS` is held to 65495,
+/// `RTAX_MTU` to 65520 and `RTAX_HOPLIMIT` to 255.
+fn convert_metrics(bytes: &[u8]) -> Result<crate::interface::Metrics, Errno> {
+    let mut metrics = crate::interface::NO_METRICS;
+    for (kind, value) in attributes(bytes) {
+        if kind == 0 {
+            continue;
+        }
+        if kind > RTAX_MAX {
+            return Err(Errno::EINVAL);
+        }
+        let mut number = if kind == RTAX_CC_ALGO {
+            match congestion_key(value) {
+                0 => return Err(Errno::EINVAL),
+                key => key,
+            }
+        } else {
+            u32::from_le_bytes(value.try_into().map_err(|_| Errno::EINVAL)?)
+        };
+        match kind {
+            RTAX_ADVMSS => number = number.min(65535 - 40),
+            RTAX_MTU => number = number.min(65535 - 15),
+            RTAX_HOPLIMIT => number = number.min(255),
+            RTAX_FEATURES if number & !RTAX_FEATURE_MASK != 0 => return Err(Errno::EINVAL),
+            _ => {}
+        }
+        metrics[usize::from(kind - 1)] = number;
+    }
+    let locked = metrics[usize::from(RTAX_LOCK - 1)] & (1 << RTAX_CWND) != 0;
+    if locked && metrics[usize::from(RTAX_CWND - 1)] == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(metrics)
+}
+/// The metrics an IPv4 removal names, as `fib_metrics_match` compares
+/// them, unheld: each type, with a congestion control's key (0 for one
+/// there is not); `None`, which no route matches, for a type past
+/// `RTAX_MAX` or a value of other than four bytes but a congestion
+/// control's.
+fn metrics_match(bytes: &[u8]) -> Option<Vec<(usize, u32)>> {
+    let mut wanted = Vec::new();
+    for (kind, value) in attributes(bytes) {
+        if kind == 0 {
+            continue;
+        }
+        if kind > RTAX_MAX {
+            return None;
+        }
+        let number = if kind == RTAX_CC_ALGO {
+            congestion_key(value)
+        } else {
+            u32::from_le_bytes(value.try_into().ok()?)
+        };
+        wanted.push((usize::from(kind - 1), number));
+    }
+    Some(wanted)
+}
+/// A route's `RTA_METRICS`, as `rtnetlink_put_metrics` gives it, unmarked
+/// as nested: each metric but 0, in order, a congestion control by its
+/// name, and features only those of `RTAX_FEATURE_MASK`; nothing when
+/// none is left.
+fn put_metrics(body: &mut Vec<u8>, metrics: &crate::interface::Metrics) {
+    let mut nest = Vec::new();
+    for (kind, &value) in (1..=RTAX_MAX).zip(metrics) {
+        let value = if kind == RTAX_FEATURES {
+            value & RTAX_FEATURE_MASK
+        } else {
+            value
+        };
+        if value == 0 {
+            continue;
+        }
+        if kind == RTAX_CC_ALGO {
+            if let Some(&(_, name)) = CONGESTION_CONTROLS.iter().find(|&&(key, _)| key == value) {
+                let mut name = name.to_vec();
+                name.push(0);
+                attribute(&mut nest, kind, &name);
+            }
+        } else {
+            attribute(&mut nest, kind, &value.to_le_bytes());
+        }
+    }
+    if !nest.is_empty() {
+        attribute(body, RTA_METRICS, &nest);
+    }
 }
 /// A notification for the members of `group`, which goes to every one of
 /// them but the socket whose port is `origin` (`do_one_broadcast`): 0, so
@@ -3635,6 +3785,178 @@ mod tests {
     fn routes(network: &Network, family: u8, seq: u32) -> Vec<Vec<u8>> {
         route_dump(network, &[family], family, seq, 7, false, &mut 0).unwrap()
     }
+    #[test]
+    fn inet_routes_keep_check_and_show_their_metrics() {
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true);
+        let request = |kind: u16, flags: u16, dst: &[u8], len: u8, metrics: Option<&[u8]>| {
+            let family = if dst.len() == 4 { AF_INET } else { AF_INET6 };
+            let mut payload = vec![family, len, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
+            attribute(&mut payload, RTA_DST, dst);
+            attribute(&mut payload, RTA_OIF, &1u32.to_le_bytes());
+            if let Some(metrics) = metrics {
+                attribute(&mut payload, RTA_METRICS, metrics);
+            }
+            let header = Header {
+                len: 0,
+                kind,
+                flags: NLM_F_REQUEST | flags,
+                seq: 1,
+            };
+            change_route(&network, &header, &payload)
+        };
+        let nest = |metrics: &[(u16, &[u8])]| {
+            let mut nest = Vec::new();
+            for &(kind, value) in metrics {
+                attribute(&mut nest, kind, value);
+            }
+            nest
+        };
+        let word = |value: u32| value.to_le_bytes();
+        // The routes' metrics in a dump of `family`, those to `dst`.
+        let shown = |family: u8, dst: &[u8]| -> Vec<Vec<u8>> {
+            routes(&network, family, 1)
+                .iter()
+                .filter(|m| attributes(&m[28..]).contains(&(RTA_DST, dst)))
+                .map(|m| {
+                    let found = attributes(&m[28..]);
+                    let at = found.iter().position(|&(k, _)| k == RTA_METRICS);
+                    at.map(|i| found[i].1.to_vec()).unwrap_or_default()
+                })
+                .collect()
+        };
+        // Held to their limits, a type of 0 and a value of 0 left out, and
+        // the congestion control by name.
+        let (big, hops, one, zero) = (word(70_000), word(300), word(1), word(0));
+        let metrics = nest(&[
+            (0, &one),
+            (RTAX_MTU, &big),
+            (RTAX_ADVMSS, &big),
+            (RTAX_HOPLIMIT, &hops),
+            (RTAX_FEATURES, &one),
+            (3, &zero),
+            (RTAX_CC_ALGO, b"cubic\0"),
+        ]);
+        let net8 = [10, 8, 0, 0];
+        assert!(request(RTM_NEWROUTE, 0x600, &net8, 16, Some(&metrics)).is_ok());
+        let held = nest(&[
+            (RTAX_MTU, &word(65520)),
+            (RTAX_ADVMSS, &word(65495)),
+            (RTAX_HOPLIMIT, &word(255)),
+            (RTAX_FEATURES, &one),
+            (RTAX_CC_ALGO, b"cubic\0"),
+        ]);
+        assert_eq!(shown(AF_INET, &net8), std::slice::from_ref(&held));
+        // After RTA_PRIORITY and before RTA_PREFSRC, as fib_dump_info puts
+        // them; a lookup's answer has them too.
+        let mut lookup_request = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        attribute(&mut lookup_request, RTA_DST, &[10, 8, 1, 1]);
+        let answer = lookup(&network, &lookup_request, 1, 7, u32::MAX).unwrap();
+        assert!(attributes(&answer[28..]).contains(&(RTA_METRICS, &held[..])));
+        // A lookup of the limited broadcast address drops them, as
+        // `__mkroute_output` drops the route's `fib_info`.
+        assert!(request(RTM_NEWROUTE, 0x600, &[0; 4], 0, Some(&held)).is_ok());
+        let mut broadcast = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        attribute(&mut broadcast, RTA_DST, &[255; 4]);
+        let answer = lookup(&network, &broadcast, 1, 7, u32::MAX).unwrap();
+        assert!(
+            !attributes(&answer[28..])
+                .iter()
+                .any(|&(k, _)| k == RTA_METRICS)
+        );
+        let mut elsewhere = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        attribute(&mut elsewhere, RTA_DST, &[192, 0, 2, 1]);
+        let answer = lookup(&network, &elsewhere, 1, 7, u32::MAX).unwrap();
+        assert!(attributes(&answer[28..]).contains(&(RTA_METRICS, &held[..])));
+        // So does one of a multicast address through the default route,
+        // but not through a multicast route of its own.
+        let mut group = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        attribute(&mut group, RTA_DST, &[224, 0, 0, 1]);
+        let answer = lookup(&network, &group, 1, 7, u32::MAX).unwrap();
+        assert!(
+            !attributes(&answer[28..])
+                .iter()
+                .any(|&(k, _)| k == RTA_METRICS)
+        );
+        assert!(request(RTM_NEWROUTE, 0x600, &[224, 0, 0, 0], 4, Some(&held)).is_ok());
+        let answer = lookup(&network, &group, 1, 7, u32::MAX).unwrap();
+        assert!(attributes(&answer[28..]).contains(&(RTA_METRICS, &held[..])));
+        // A request that names other metrics adds another route; the same
+        // again is EEXIST.
+        let mtu = nest(&[(RTAX_MTU, &word(1400))]);
+        assert!(request(RTM_NEWROUTE, NLM_F_CREATE, &net8, 16, Some(&mtu)).is_ok());
+        assert_eq!(
+            request(RTM_NEWROUTE, NLM_F_CREATE, &net8, 16, Some(&mtu)),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(shown(AF_INET, &net8).len(), 2);
+        // EINVAL for a type past RTAX_MAX, a short value, a congestion
+        // control there is not, unknown features and a locked window of 0.
+        let net9 = [10, 9, 0, 0];
+        for bad in [
+            nest(&[(RTAX_MAX + 1, &one)]),
+            nest(&[(RTAX_MTU, &one[..2])]),
+            nest(&[(RTAX_CC_ALGO, b"nosuchcc")]),
+            nest(&[(RTAX_CC_ALGO, b"")]),
+            nest(&[(RTAX_FEATURES, &word(0x20))]),
+            nest(&[(RTAX_LOCK, &word(1 << RTAX_CWND))]),
+        ] {
+            let added = request(RTM_NEWROUTE, 0x600, &net9, 16, Some(&bad));
+            assert_eq!(added, Err(Errno::EINVAL), "{bad:?}");
+        }
+        let locked = nest(&[(RTAX_LOCK, &word(1 << RTAX_CWND)), (RTAX_CWND, &word(10))]);
+        assert!(request(RTM_NEWROUTE, 0x600, &net9, 16, Some(&locked)).is_ok());
+        // An empty nest, or one of zeros, shows nothing.
+        let net10 = [10, 10, 0, 0];
+        assert!(request(RTM_NEWROUTE, 0x600, &net10, 16, Some(&[])).is_ok());
+        assert_eq!(shown(AF_INET, &net10), [Vec::<u8>::new()]);
+        // Removing matches the values as named, unheld: 70000 is not the
+        // 65520 kept, a bad type matches nothing, and an unknown
+        // congestion control is none.
+        for unmatched in [
+            nest(&[(RTAX_MTU, &big)]),
+            nest(&[(RTAX_MAX + 1, &one)]),
+            nest(&[(RTAX_HOPLIMIT, &one[..2])]),
+        ] {
+            let removed = request(RTM_DELROUTE, 0, &net8, 16, Some(&unmatched));
+            assert_eq!(removed, Err(Errno(3)), "{unmatched:?}");
+        }
+        let exact = nest(&[(RTAX_MTU, &word(65520)), (RTAX_CC_ALGO, b"cubic")]);
+        assert!(request(RTM_DELROUTE, 0, &net8, 16, Some(&exact)).is_ok());
+        assert_eq!(shown(AF_INET, &net8), std::slice::from_ref(&mtu));
+        // An unknown congestion control is key 0, which a route without
+        // one has, and one with cubic has not.
+        let unknown = nest(&[(RTAX_CC_ALGO, b"nosuchcc")]);
+        assert!(request(RTM_DELROUTE, 0, &net9, 16, Some(&unknown)).is_ok());
+        let cubic = nest(&[(RTAX_CC_ALGO, b"cubic\0")]);
+        assert!(request(RTM_NEWROUTE, 0x600, &net9, 16, Some(&cubic)).is_ok());
+        assert_eq!(
+            request(RTM_DELROUTE, 0, &net9, 16, Some(&unknown)),
+            Err(Errno(3))
+        );
+        assert!(request(RTM_DELROUTE, 0, &net10, 16, Some(&unknown)).is_ok());
+        // IPv6: before RTA_PRIORITY, as rt6_fill_node puts them; removing
+        // does not look at them.
+        let net6 = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let reno = nest(&[(RTAX_MTU, &word(1280)), (RTAX_CC_ALGO, b"reno\0")]);
+        assert!(request(RTM_NEWROUTE, 0x600, &net6, 16, Some(&reno)).is_ok());
+        assert_eq!(shown(AF_INET6, &net6), std::slice::from_ref(&reno));
+        let dumped = routes(&network, AF_INET6, 1);
+        let six = dumped
+            .iter()
+            .find(|m| attributes(&m[28..]).contains(&(RTA_DST, &net6[..])))
+            .unwrap();
+        let kinds: Vec<u16> = attributes(&six[28..]).iter().map(|&(k, _)| k).collect();
+        assert_eq!(kinds[..4], [RTA_TABLE, RTA_DST, RTA_METRICS, RTA_PRIORITY]);
+        let net7 = [0xfd, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let bad = nest(&[(RTAX_MAX + 1, &one)]);
+        assert_eq!(
+            request(RTM_NEWROUTE, 0x600, &net7, 16, Some(&bad)),
+            Err(Errno::EINVAL)
+        );
+        assert!(request(RTM_DELROUTE, 0, &net6, 16, Some(&bad)).is_ok());
+    }
+
     #[test]
     fn dumps_go_in_parts_as_large_as_the_longest_receive() {
         let mut s = State {

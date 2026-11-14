@@ -598,7 +598,9 @@ fn set_time_of_day(time: Option<(u64, u64)>) -> Errno {
 
 /// `settimeofday(tv, tz)`, in Linux's order: the time is read and its
 /// microseconds checked, then the time zone read, then the time checked
-/// ([`set_time_of_day`]); the time zone is not looked at.
+/// ([`set_time_of_day`]); the time zone is not looked at. 1,000,000
+/// microseconds is refused at once, as Linux master has since
+/// ce4abda5e126 (2026-06); earlier kernels read the time zone first.
 fn sys_settimeofday(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome((|| {
         let time = if a[0] == 0 {
@@ -720,7 +722,8 @@ fn sys_adjtimex(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// clock looked at. `CLOCK_REALTIME` is [`read_timex`], written back
 /// unless it fails; the other clocks Linux knows give `EOPNOTSUPP`, as do
 /// the CPU clocks of other processes and threads, and a clock file
-/// descriptor (none is a PTP clock here) and unknown clocks `EINVAL`.
+/// descriptor (none is a PTP clock here, and Linux's `get_clock_desc` gives
+/// `EINVAL` for a closed one too) and unknown clocks `EINVAL`.
 fn sys_clock_adjtime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome((|| {
         let mut timex = [0u8; TIMEX_SIZE];

@@ -18,6 +18,12 @@ await mkdir(outputDirectory, { recursive: true });
 const persist = () => writeFile(resolve(outputDirectory, "observations.json"), JSON.stringify(report, null, 2) + "\n"); await persist();
 const page = `<!doctype html><script type="module">
 import {runSuite} from '/packages/paludarium-wasm/tests/wasm-suite.mjs';
+// Safari's TypeError for a failed fetch says only "Load failed"; name the request and when it failed.
+const plainFetch = globalThis.fetch;
+globalThis.fetch = async (resource, options) => {
+ try { return await plainFetch(resource, options); }
+ catch (error) { if (!(error instanceof TypeError)) throw error; throw new TypeError(error.message + ' (' + (options?.method ?? 'GET') + ' ' + String(resource) + ' at ' + Math.round(performance.now()) + ' ms)', { cause: error }); }
+};
 try {
  if (!crossOriginIsolated) throw new Error('Shared memory unavailable');
  const input = await (await fetch('/input.json')).json(), decode = text => Uint8Array.from(atob(text), char => char.charCodeAt(0));
@@ -45,6 +51,8 @@ const server = createServer(async (request, response) => {
     else response.destroy(cause);
   }
 });
+// A connection the server drops before it answers shows in the page only as a failed fetch.
+server.on("clientError", (error, socket) => { console.error(JSON.stringify({ client_error: String(error), code: error.code ?? null })); socket.destroy(); });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 try { const result = await runBrowser(browser, `http://127.0.0.1:${server.address().port}/`, 600000); Object.assign(report, result); await persist(); if (!report.complete || !report.passed) throw new Error("Actual browser acceptance failed"); console.log(JSON.stringify({ environment: browser, version: report.version, complete: report.complete })); }
 finally { await new Promise(resolve => server.close(resolve)); }

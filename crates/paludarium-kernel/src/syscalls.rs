@@ -34,6 +34,10 @@ pub mod nr {
     pub const NANOSLEEP: u64 = 35;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const GETTIMEOFDAY: u64 = 96;
+    pub const ADJTIMEX: u64 = 159;
+    pub const SETTIMEOFDAY: u64 = 164;
+    pub const CLOCK_SETTIME: u64 = 227;
+    pub const CLOCK_ADJTIME: u64 = 305;
     pub const TIME: u64 = 201;
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const MMAP: u64 = 9;
@@ -157,7 +161,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 86] = [
+        let entries: [(u64, Handler); 90] = [
             (nr::GETITIMER, sys_getitimer),
             (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
@@ -168,6 +172,10 @@ impl SyscallTable {
             (nr::TGKILL, sys_tgkill),
             (nr::CLOCK_GETTIME, sys_clock_gettime),
             (nr::GETTIMEOFDAY, sys_gettimeofday),
+            (nr::SETTIMEOFDAY, sys_settimeofday),
+            (nr::CLOCK_SETTIME, sys_clock_settime),
+            (nr::ADJTIMEX, sys_adjtimex),
+            (nr::CLOCK_ADJTIME, sys_clock_adjtime),
             (nr::TIME, sys_time),
             (nr::NANOSLEEP, sys_nanosleep),
             (nr::CLOCK_NANOSLEEP, sys_clock_nanosleep),
@@ -568,6 +576,173 @@ fn sys_gettimeofday(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Err(e) => err(e),
     }
 }
+/// The latest seconds `settimeofday` and `clock_settime` take, as Linux's
+/// `TIME_SETTOD_SEC_MAX`: 30 years short of `KTIME_SEC_MAX`.
+const TIME_SETTOD_SEC_MAX: u64 = i64::MAX as u64 / 1_000_000_000 - 30 * 365 * 24 * 3600;
+
+/// Checks a time to set the real-time clock to, as Linux's
+/// `do_sys_settimeofday64`: `EINVAL` for one it does not take, and else
+/// `EPERM`. The session never sets the time, as a container whose
+/// capabilities leave out `CAP_SYS_TIME` cannot, whatever the caller's
+/// capabilities.
+fn set_time_of_day(time: Option<(u64, u64)>) -> Errno {
+    match time {
+        Some((seconds, nanos))
+            if (seconds as i64) < 0 || nanos >= 1_000_000_000 || seconds >= TIME_SETTOD_SEC_MAX =>
+        {
+            Errno::EINVAL
+        }
+        _ => Errno::EPERM,
+    }
+}
+
+/// `settimeofday(tv, tz)`, in Linux's order: the time is read and its
+/// microseconds checked, then the time zone read, then the time checked
+/// ([`set_time_of_day`]); the time zone is not looked at.
+fn sys_settimeofday(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let time = if a[0] == 0 {
+            None
+        } else {
+            let [seconds, micros] = read_words::<2>(c.mem, a[0])?;
+            if micros >= 1_000_000 {
+                return Err(Errno::EINVAL);
+            }
+            Some((seconds, micros * 1000))
+        };
+        if a[1] != 0 {
+            read_words::<1>(c.mem, a[1])?;
+        }
+        Err(set_time_of_day(time))
+    })())
+}
+
+/// `clock_settime(clock, tp)`: only `CLOCK_REALTIME` can be set, as on
+/// Linux, and the time is then checked as `settimeofday`'s; the other
+/// clocks give `EINVAL` before the time is read.
+fn sys_clock_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        if a[0] as u32 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let [seconds, nanos] = read_words::<2>(c.mem, a[1])?;
+        Err(set_time_of_day(Some((seconds, nanos))))
+    })())
+}
+
+/// The size of Linux's `struct __kernel_timex`.
+const TIMEX_SIZE: usize = 208;
+
+/// Reads the real-time clock's NTP state into `timex`, as Linux's
+/// `do_adjtimex`, after checking its `modes` as `timekeeping_validate_timex`
+/// does: only reads are taken (no mode, or `ADJ_OFFSET_SS_READ`), and the
+/// others give `EPERM` ([`set_time_of_day`]). The state is the one Linux
+/// starts with, as nothing here disciplines the clock and the host's is not
+/// revealed: unsynchronised (`STA_UNSYNC`, so the result is `TIME_ERROR`),
+/// with the errors at `NTP_PHASE_LIMIT`, no offset or frequency correction,
+/// a time constant of 2, a tick of `USER_TICK_USEC`, no PPS and no TAI
+/// offset. The time is the real-time clock's, in microseconds.
+fn read_timex(c: &Context<'_>, timex: &mut [u8; TIMEX_SIZE]) -> Result<u64, Errno> {
+    const ADJ_OFFSET_SINGLESHOT: u32 = 0x0001;
+    const ADJ_FREQUENCY: u32 = 0x0002;
+    const ADJ_SETOFFSET: u32 = 0x0100;
+    const ADJ_OFFSET_READONLY: u32 = 0x2000;
+    const ADJ_ADJTIME: u32 = 0x8000;
+    // Linux's PPM_SCALE: 1000 << (NTP_SCALE_SHIFT - SHIFT_USEC).
+    const PPM_SCALE: i64 = 1000 << 16;
+    let word = |at: usize| i64::from_le_bytes(timex[at..at + 8].try_into().unwrap_or_default());
+    let modes = u32::from_le_bytes(timex[..4].try_into().unwrap_or_default());
+    if modes & ADJ_ADJTIME != 0 {
+        if modes & ADJ_OFFSET_SINGLESHOT == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if modes & ADJ_OFFSET_READONLY == 0 {
+            return Err(Errno::EPERM);
+        }
+    } else if modes != 0 {
+        return Err(Errno::EPERM);
+    }
+    if modes & ADJ_SETOFFSET != 0 {
+        return Err(Errno::EPERM);
+    }
+    let freq = word(16);
+    if modes & ADJ_FREQUENCY != 0 && !(i64::MIN / PPM_SCALE..=i64::MAX / PPM_SCALE).contains(&freq)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let now = c.host.clock(ClockId::Realtime)?;
+    let mut put = |at: usize, value: i64| timex[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    let longs: [(usize, i64); 16] = [
+        (8, 0),           // offset
+        (16, 0),          // freq
+        (24, 16_000_000), // maxerror: NTP_PHASE_LIMIT
+        (32, 16_000_000), // esterror
+        (48, 2),          // constant
+        (56, 1),          // precision
+        (64, 32_768_000), // tolerance: MAXFREQ_SCALED / PPM_SCALE
+        (72, (now / 1_000_000_000) as i64),
+        (80, (now % 1_000_000_000 / 1000) as i64),
+        (88, 10_000), // tick: USER_TICK_USEC
+        (96, 0),      // ppsfreq
+        (104, 0),     // jitter
+        (120, 0),     // stabil
+        (128, 0),     // jitcnt
+        (136, 0),     // calcnt
+        (144, 0),     // errcnt
+    ];
+    for (at, value) in longs {
+        put(at, value);
+    }
+    put(152, 0); // stbcnt
+    timex[40..44].copy_from_slice(&0x40i32.to_le_bytes()); // status: STA_UNSYNC
+    timex[112..116].fill(0); // shift
+    timex[160..164].fill(0); // tai
+    Ok(5) // TIME_ERROR
+}
+
+/// `adjtimex(buf)` ([`read_timex`]). As Linux's, it writes the structure
+/// back whatever the result, so a buffer it cannot write gives `EFAULT`.
+fn sys_adjtimex(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let mut timex = [0u8; TIMEX_SIZE];
+        c.mem
+            .read(GuestAddr(a[0]), &mut timex)
+            .map_err(|_| Errno::EFAULT)?;
+        let result = read_timex(c, &mut timex);
+        c.mem
+            .write(GuestAddr(a[0]), &timex)
+            .map_err(|_| Errno::EFAULT)?;
+        result
+    })())
+}
+
+/// `clock_adjtime(clock, buf)`: the structure is read first, then the
+/// clock looked at. `CLOCK_REALTIME` is [`read_timex`], written back
+/// unless it fails; the other clocks Linux knows give `EOPNOTSUPP`, as do
+/// the CPU clocks of other processes and threads, and a clock file
+/// descriptor (none is a PTP clock here) and unknown clocks `EINVAL`.
+fn sys_clock_adjtime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let mut timex = [0u8; TIMEX_SIZE];
+        c.mem
+            .read(GuestAddr(a[1]), &mut timex)
+            .map_err(|_| Errno::EFAULT)?;
+        match a[0] as u32 as i32 {
+            0 => {}
+            // CLOCKFD.
+            id if id < 0 && id & 7 == 3 => return Err(Errno::EINVAL),
+            id if id < 0 => return Err(Errno::EOPNOTSUPP),
+            1..=9 | 11 => return Err(Errno::EOPNOTSUPP),
+            _ => return Err(Errno::EINVAL),
+        }
+        let result = read_timex(c, &mut timex)?;
+        c.mem
+            .write(GuestAddr(a[1]), &timex)
+            .map_err(|_| Errno::EFAULT)?;
+        Ok(result)
+    })())
+}
+
 /// `time(t)`: the seconds of the real time clock as of the latest tick, as
 /// Linux's `ktime_get_real_seconds` gives the timekeeper's `xtime_sec`
 /// (`CLOCK_REALTIME_COARSE`'s), also at `t` if it is not null.

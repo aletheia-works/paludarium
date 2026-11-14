@@ -27,6 +27,7 @@
 #include <sys/vfs.h>
 #include <sys/prctl.h>
 #include <sys/time.h>
+#include <sys/timex.h>
 #include <time.h>
 #include <utime.h>
 #include <sys/socket.h>
@@ -7205,6 +7206,83 @@ static int timer_limits_case(void) {
     printf("negative=%ld wide=%ld\n", tl_set(mono, 0, 0, -1, 0), tl_set(mono, 0, 0, 1, 1000000000L));
     printf("delete=%ld %ld\n", syscall(SYS_timer_delete, (long)mono),
            syscall(SYS_timer_delete, (long)real));
+    return 0;
+}
+/* Setting the time, and reading the NTP state. What is printed holds
+ * whether or not the host's clock is synchronised, and whatever time is
+ * set is the time it already is. */
+#ifndef ADJ_ADJTIME
+#define ADJ_ADJTIME 0x8000
+#endif
+static long ts_call(long n, long a, long b) { return syscall(n, a, b) ? -errno : 0; }
+static int time_set_case(void) {
+    struct timex t;
+    memset(&t, 0x5a, sizeof t);
+    t.modes = 0;
+    long r = syscall(SYS_adjtimex, &t);
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    long usec = t.status & STA_NANO ? t.time.tv_usec / 1000 : t.time.tv_usec;
+    long apart = (now.tv_sec - t.time.tv_sec) * 1000000L + now.tv_usec - usec;
+    unsigned char *bytes = (unsigned char *)&t;
+    int padded = 1;
+    for (size_t i = offsetof(struct timex, tai) + sizeof t.tai; i < sizeof t; i++)
+        padded &= bytes[i] == 0x5a;
+    printf("adjtimex result-in-range=%d error-matches=%d modes=%u\n", r >= 0 && r <= 5,
+           !(t.status & STA_UNSYNC) || r == TIME_ERROR, t.modes);
+    printf("adjtimex precision=%ld tolerance=%ld tick=%ld errors-in-range=%d near=%d padded=%d\n",
+           t.precision, t.tolerance, t.tick,
+           t.maxerror >= 0 && t.maxerror <= 16000000 && t.esterror >= 0 &&
+               t.esterror <= 16000000,
+           apart > -2000000 && apart < 2000000, padded);
+    memset(&t, 0, sizeof t);
+    t.modes = ADJ_OFFSET_SS_READ;
+    r = syscall(SYS_adjtimex, &t);
+    printf("adjtime-read result-in-range=%d\n", r >= 0 && r <= 5);
+    unsigned modes[] = {ADJ_ADJTIME, ADJ_OFFSET, ADJ_TICK, ADJ_OFFSET_SINGLESHOT,
+                        ADJ_OFFSET_SS_READ | ADJ_SETOFFSET};
+    for (unsigned i = 0; i < sizeof modes / sizeof *modes; i++) {
+        memset(&t, 0, sizeof t);
+        t.modes = modes[i];
+        t.tick = 10000;
+        printf("adjtimex modes=%#x %ld\n", modes[i], ts_call(SYS_adjtimex, (long)&t, 0));
+    }
+    memset(&t, 0, sizeof t);
+    t.modes = ADJ_OFFSET_SS_READ | ADJ_FREQUENCY;
+    t.freq = LONG_MAX;
+    printf("adjtimex freq-past-range=%ld fault=%ld\n", ts_call(SYS_adjtimex, (long)&t, 0),
+           ts_call(SYS_adjtimex, 8, 0));
+    /* clock_adjtime: the buffer, then the clock. */
+    memset(&t, 0, sizeof t);
+    r = syscall(SYS_clock_adjtime, CLOCK_REALTIME, &t);
+    printf("clock_adjtime realtime-in-range=%d fault-first=%ld\n", r >= 0 && r <= 5,
+           ts_call(SYS_clock_adjtime, 99, 8));
+    long clocks[] = {CLOCK_MONOTONIC, CLOCK_TAI, CLOCK_BOOTTIME, 10, 12, -1, (long)(~0u << 3 | 3)};
+    for (unsigned i = 0; i < sizeof clocks / sizeof *clocks; i++)
+        printf("clock_adjtime %ld=%ld\n", clocks[i],
+               ts_call(SYS_clock_adjtime, clocks[i], (long)&t));
+    /* clock_settime: only CLOCK_REALTIME can be set, after checks. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct timespec wide = {ts.tv_sec, 1000000000L}, late = {8277292036L, 0};
+    printf("clock_settime monotonic=%ld cpu=%ld fault=%ld wide=%ld late=%ld\n",
+           ts_call(SYS_clock_settime, CLOCK_MONOTONIC, (long)&ts),
+           ts_call(SYS_clock_settime, CLOCK_PROCESS_CPUTIME_ID, (long)&ts),
+           ts_call(SYS_clock_settime, CLOCK_REALTIME, 8),
+           ts_call(SYS_clock_settime, CLOCK_REALTIME, (long)&wide),
+           ts_call(SYS_clock_settime, CLOCK_REALTIME, (long)&late));
+    clock_gettime(CLOCK_REALTIME, &ts);
+    printf("clock_settime now=%ld\n", ts_call(SYS_clock_settime, CLOCK_REALTIME, (long)&ts));
+    /* settimeofday. */
+    struct timeval tv, bad = {0, 1000000};
+    struct timezone tz = {0, 0};
+    gettimeofday(&tv, NULL);
+    printf("settimeofday fault=%ld usec=%ld tz-fault=%ld\n", ts_call(SYS_settimeofday, 8, 0),
+           ts_call(SYS_settimeofday, (long)&bad, 0),
+           ts_call(SYS_settimeofday, (long)&tv, 8));
+    gettimeofday(&tv, NULL);
+    printf("settimeofday now=%ld zone=%ld none=%ld\n", ts_call(SYS_settimeofday, (long)&tv, 0),
+           ts_call(SYS_settimeofday, 0, (long)&tz), ts_call(SYS_settimeofday, 0, 0));
     return 0;
 }
 /* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
@@ -22048,6 +22126,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
+    if (!strcmp(mode, "time-set")) return time_set_case();
     if (!strcmp(mode, "timer-limits")) return timer_limits_case();
     if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();
     if (!strcmp(mode, "cpu-itimer-exec")) {

@@ -1110,3 +1110,92 @@ fn posix_timer_on_the_thread_cpu_clock_reads_as_linux() {
     write_itimerval(&f, DATA, [0, 0, i64::MAX as u64, 0]);
     assert_eq!(f.ret(nr::TIMER_SETTIME, &[0, 0, DATA, 0]), 0);
 }
+/// The time is never set: what Linux takes gives EPERM, after Linux's
+/// checks.
+#[test]
+fn setting_the_time_is_refused_after_linux_checks() {
+    let mut f = fixture();
+    let set = |f: &mut Fixture, words: [u64; 2]| {
+        f.mem.write_u64(GuestAddr(DATA), words[0]).unwrap();
+        f.mem.write_u64(GuestAddr(DATA + 8), words[1]).unwrap();
+    };
+    // settimeofday: a bad pointer, bad microseconds, a bad time zone
+    // pointer, a time too late, and then EPERM even with nothing to set.
+    assert_eq!(f.ret(164, &[1, 0]), errno(Errno::EFAULT));
+    set(&mut f, [5, 1_000_000]);
+    assert_eq!(f.ret(164, &[DATA, 0]), errno(Errno::EINVAL));
+    set(&mut f, [5, 0]);
+    assert_eq!(f.ret(164, &[DATA, 1]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(164, &[DATA, DATA]), errno(Errno::EPERM));
+    set(&mut f, [8_277_292_036, 0]);
+    assert_eq!(f.ret(164, &[DATA, 0]), errno(Errno::EINVAL));
+    set(&mut f, [-1i64 as u64, 0]);
+    assert_eq!(f.ret(164, &[DATA, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(164, &[0, 0]), errno(Errno::EPERM));
+    // clock_settime: only CLOCK_REALTIME, before the time is read.
+    for clock in [1, 2, 3, 4, 7, 8, 11, 12] {
+        assert_eq!(f.ret(227, &[clock, 1]), errno(Errno::EINVAL));
+    }
+    assert_eq!(f.ret(227, &[0, 1]), errno(Errno::EFAULT));
+    set(&mut f, [5, 1_000_000_000]);
+    assert_eq!(f.ret(227, &[0, DATA]), errno(Errno::EINVAL));
+    set(&mut f, [8_277_292_035, 999_999_999]);
+    assert_eq!(f.ret(227, &[0, DATA]), errno(Errno::EPERM));
+}
+/// adjtimex reads Linux's state at boot and refuses to change it.
+#[test]
+fn adjtimex_reads_an_unsynchronised_clock() {
+    let mut f = fixture();
+    f.host
+        .set_clock(paludarium_host::ClockId::Realtime, 1_700_000_000_123_456_789);
+    let timex = DATA + 0x100;
+    f.mem.write(GuestAddr(timex), &[0x5a; 208]).unwrap();
+    f.mem.write(GuestAddr(timex), &[0; 4]).unwrap(); // modes
+    assert_eq!(f.ret(159, &[timex]), 5); // TIME_ERROR
+    let word = |f: &Fixture, at: u64| f.mem.read_u64(GuestAddr(timex + at)).unwrap();
+    let fields: Vec<u64> = [8, 16, 24, 32, 48, 56, 64, 72, 80, 88, 96, 104, 120, 152]
+        .iter()
+        .map(|&at| word(&f, at))
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            0, 0, 16_000_000, 16_000_000, 2, 1, 32_768_000, 1_700_000_000, 123_456,
+            10_000, 0, 0, 0, 0
+        ]
+    );
+    assert_eq!(word(&f, 40) as u32, 0x40); // STA_UNSYNC
+    assert_eq!(word(&f, 160) as u32, 0); // tai
+    // The modes and the padding are left as they were.
+    assert_eq!(word(&f, 0), 0x5a5a_5a5a_0000_0000);
+    assert_eq!(word(&f, 200), 0x5a5a_5a5a_5a5a_5a5a);
+    // adjtime's read is taken; a change, or a single shot without its
+    // bit, is not.
+    f.mem.write_u64(GuestAddr(timex), 0xa001).unwrap();
+    assert_eq!(f.ret(159, &[timex]), 5);
+    f.mem.write_u64(GuestAddr(timex), 0x8000).unwrap();
+    assert_eq!(f.ret(159, &[timex]), errno(Errno::EINVAL));
+    for modes in [0x0001, 0x8001, 0x4000, 0xa101] {
+        f.mem.write_u64(GuestAddr(timex), modes).unwrap();
+        assert_eq!(f.ret(159, &[timex]), errno(Errno::EPERM));
+    }
+    // A read with a frequency past Linux's range.
+    f.mem.write_u64(GuestAddr(timex), 0xa003).unwrap();
+    f.mem.write_u64(GuestAddr(timex + 16), i64::MAX as u64).unwrap();
+    assert_eq!(f.ret(159, &[timex]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(159, &[1]), errno(Errno::EFAULT));
+    // clock_adjtime: the buffer first, then the clock.
+    f.mem.write_u64(GuestAddr(timex), 0).unwrap();
+    assert_eq!(f.ret(305, &[99, 1]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(305, &[0, timex]), 5);
+    for (clock, e) in [
+        (1, Errno::EOPNOTSUPP),
+        (11, Errno::EOPNOTSUPP),
+        (10, Errno::EINVAL),
+        (12, Errno::EINVAL),
+        (u64::from(u32::MAX), Errno::EOPNOTSUPP),
+        (u64::from(!0u32 << 3 | 3), Errno::EINVAL),
+    ] {
+        assert_eq!(f.ret(305, &[clock, timex]), errno(e));
+    }
+}

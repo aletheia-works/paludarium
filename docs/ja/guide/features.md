@@ -53,7 +53,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
-| 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete` |
+| 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
 | ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | seccomp | `seccomp`（下に書きます） |
@@ -2038,6 +2038,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   なら止めますが間隔は残し、`KTIME_MAX` を超えて設定した値は、Linux の `ns_to_timespec64`
   と同じく負の秒数に見えます。`fork` の子はどちらも持たずに始まり、`execve` は引き継ぎます。
   CPU 時間は CPU の時計と同じく数えるので、それを測れない WebAssembly では経過時間を数えます。
+- `CLOCK_REALTIME` での `adjtimex` と `clock_adjtime` は、時計の NTP の状態を、ホストのものは
+  見せずに、Linux が起動したときのまま読みます。同期しておらず（`STA_UNSYNC` なので結果は
+  `TIME_ERROR`）、誤差は 16 秒、オフセットと周波数の補正はなく、時定数は 2、ティックは
+  10,000 µs、PPS と TAI のオフセットはなく、時刻は実時間の時計のものです。Linux と同じく
+  モードを確かめたうえで、読むこと（モードなし、または adjtime の `ADJ_OFFSET_SS_READ`）
+  だけを受けます。`adjtimex` は結果にかかわらず構造体を書き戻し、`clock_adjtime` は時計を
+  見る前に構造体を読みます（ほかの時計は `EOPNOTSUPP`、知らない時計は `EINVAL`）。
+  `settimeofday` と `clock_settime`（`CLOCK_REALTIME` だけで、ほかは `EINVAL`）は、Linux と
+  同じく時刻を確かめ（`KTIME_MAX` の 30 年前より先は `EINVAL`）、そのうえで `EPERM` を
+  返します。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
   見せません。起動からの時間は単調時計の値で、Linux と同じく秒単位に切り上げます。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は

@@ -216,6 +216,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     経てば眠りが終わります。ほかのプロセスの CPU 時計での `timer_create` は `EINVAL` を
     返します。Linux はタイマーを作ります。ほかのタスクの CPU 時計で眠ると、時がすでに
     来ていなければ `EINVAL` を返します。Linux は、そのタスクがその時間を使うまで待ちます。
+  - 時刻は設定できません。`settimeofday`、`clock_settime`、何かを変える `adjtimex` と
+    `clock_adjtime` は、`CAP_SYS_TIME` を持つ呼び出し元にも `EPERM` を返します。Linux は時計、
+    タイムゾーン、NTP の状態を設定します。そのため NTP の状態は、いつも Linux が起動したときの
+    ままです。負の時計 ID で表す CPU 時計での `clock_settime` は、時刻を読まずに `EINVAL` を
+    返します。Linux は時刻を読み、タスクを探して `EPERM` を返します。補助の時計
+    （`CLOCK_AUX`）もありません。
   - `ustat` が見つけるのはマウントのデバイスだけです。パイプ・ソケット・memfd・名前空間の
     ファイルの `st_dev` では `EINVAL` を返します。Linux はその疑似ファイルシステムの
     スーパーブロックを見つけ、その数（0）を返します。`/proc` と `/dev` のファイルの

@@ -252,6 +252,13 @@ verified.
     Linux makes the timer, and a sleep on another task's CPU clock gives
     `EINVAL` unless its time has already come, where Linux waits until that
     task has used the time.
+  - The time cannot be set: `settimeofday`, `clock_settime` and an
+    `adjtimex` or `clock_adjtime` that changes something give `EPERM` even
+    to a caller with `CAP_SYS_TIME`, where Linux sets the clock, its time
+    zone or its NTP state, so the NTP state is always the one Linux starts
+    with. `clock_settime` on a CPU clock named by a negative clock ID gives
+    `EINVAL` without reading the time, where Linux reads it, finds the task
+    and gives `EPERM`, and the auxiliary clocks (`CLOCK_AUX`) are not there.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
     the superblock of its pseudo filesystem and gives its counts (0). A

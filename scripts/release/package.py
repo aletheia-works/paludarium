@@ -391,10 +391,9 @@ def package_check(root):
                 )
             )
             # rust-version is the latest stable Rust, so a consumer builds with it.
-            msrv = tomllib.loads((copy / "Cargo.toml").read_text())["workspace"]["package"][
-                "rust-version"
-            ]
-            stable = list(check.rustup_toolchains().glob(msrv + "-*/bin/cargo"))
+            workspace = tomllib.loads((copy / "Cargo.toml").read_text())["workspace"]
+            rust_version = workspace["package"]["rust-version"]
+            stable = list(check.rustup_toolchains().glob(rust_version + "-*/bin/cargo"))
             policy.require(len(stable) == 1, "one actual Cargo of rust-version required")
             stableenv = dict(
                 env,
@@ -530,7 +529,6 @@ def package_check(root):
             npm=npm_result,
             jsr=jsr_result,
             packed_cases=packed_cases,
-            stable_supported=stable_result["exit"] == 0,
             published=False,
         )
         return result

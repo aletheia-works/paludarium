@@ -251,7 +251,14 @@ verified.
     wall time, the sleep counts its own time too, so a process alone ends
     it after the wall time it asked for.
     A timer on another process's CPU time is looked at as that process's
-    threads make system calls, the same way. A sleep on another task's CPU clock gives
+    threads make system calls, the same way. Another process's CPU time,
+    read or set from outside it, is each of its threads' as of that thread's
+    last account (its last system call, while nothing timed that process),
+    as a thread's CPU time can only be measured by the thread itself: a
+    timer set on it counts from there, so its first expiry can come early
+    by what the process ran since then without a system call, and
+    `timer_gettime` can show more time left, where Linux samples the
+    running threads at once. A sleep on another task's CPU clock gives
     `EINVAL` unless its time has already come, where Linux waits until that
     task has used the time.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a

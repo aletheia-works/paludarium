@@ -72,6 +72,9 @@ pub struct ThreadGroup {
     /// writes. The process entry keeps the limit pairs `prlimit` reports.
     nofile: AtomicU64,
     fsize: AtomicU64,
+    /// The RLIMIT_MEMLOCK soft limit, which a fault of a `memfd_secret`
+    /// page counts against ([`crate::memfd::enter`]).
+    memlock: Arc<AtomicU64>,
     pub(crate) futexes: Futexes,
     pub(crate) timers: Mutex<crate::timers::Timers>,
     /// Every thread's CPU time, live or exited, for the process's total,
@@ -200,6 +203,7 @@ impl Default for ThreadGroup {
             timer_generation: AtomicU64::new(0),
             nofile: AtomicU64::new(1024),
             fsize: AtomicU64::new(u64::MAX),
+            memlock: Arc::new(AtomicU64::new(8 << 20)),
             futexes: Futexes::machine(),
             timers: Mutex::default(),
             cpu: Mutex::default(),
@@ -483,6 +487,7 @@ impl ThreadGroup {
             actions: Mutex::new(actions),
             nofile: AtomicU64::new(self.nofile()),
             fsize: AtomicU64::new(self.fsize()),
+            memlock: Arc::new(AtomicU64::new(self.memlock.load(Ordering::SeqCst))),
             cpu_timers: Mutex::new(cpu_timers),
             cpu_timers_armed: std::sync::atomic::AtomicBool::new(cpu_timers.armed()),
             // A fork keeps the memory, and so the program's initial stack
@@ -505,12 +510,17 @@ impl ThreadGroup {
     pub(crate) fn fsize(&self) -> u64 {
         self.fsize.load(Ordering::SeqCst)
     }
-    /// Takes the new soft limit of an enforced resource (RLIMIT_FSIZE or
-    /// RLIMIT_NOFILE); the others are only recorded.
+    /// The process's RLIMIT_MEMLOCK soft limit, as it changes.
+    pub(crate) fn memlock(&self) -> &Arc<AtomicU64> {
+        &self.memlock
+    }
+    /// Takes the new soft limit of an enforced resource (RLIMIT_FSIZE,
+    /// RLIMIT_NOFILE or RLIMIT_MEMLOCK); the others are only recorded.
     pub(crate) fn set_soft_limit(&self, resource: usize, soft: u64) {
         match resource {
             1 => self.fsize.store(soft, Ordering::SeqCst),
             7 => self.nofile.store(soft, Ordering::SeqCst),
+            8 => self.memlock.store(soft, Ordering::SeqCst),
             _ => {}
         }
     }

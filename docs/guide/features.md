@@ -61,7 +61,7 @@ kernel.
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
-| Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete` |
+| Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
 | Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | seccomp | `seccomp` (see below) |
@@ -305,8 +305,12 @@ kernel.
   `MADV_POPULATE_WRITE` give `EINVAL`, and `mlock` `ENOMEM`, with
   `MLOCK_ONFAULT` too, as `mlock_fixup` gives its VMA no `VM_LOCKONFAULT`.
   `msync` with `MS_SYNC` gives `EINVAL` for it, as its file has no `fsync`,
-  even after a hole in the range. Its pages are the emulator's, so they are
-  as secret as any other memory of the guest.
+  even after a hole in the range. A fault brings a page in only while the
+  pages of the files the user made stay within the faulting process's
+  `RLIMIT_MEMLOCK` (else `SIGBUS`, `CAP_IPC_LOCK` or not), and they count
+  until the file goes, mapped or not, as Linux master's secretmem charges
+  the creator's `locked_vm`. Its pages are the emulator's, so they are as
+  secret as any other memory of the guest.
 - `openat2` opens as `openat` does (a FIFO too), with Linux's stricter
   checks of its `struct open_how`: a size below 24 bytes is `EINVAL`, above
   a page or with unknown nonzero bytes past the first version `E2BIG`; an
@@ -817,18 +821,19 @@ kernel.
   written, while the rest (`.bss`) is anonymous memory and reads as zeros.
   Shared memory keeps its own contents. `MADV_FREE` keeps the contents, as
   Linux does without memory pressure.
-  The access-pattern hints and `MADV_WILLNEED` are accepted, and so are
-  `MADV_COLD` and `MADV_PAGEOUT` (with nothing to reclaim, hints too),
-  `MADV_MERGEABLE`, `MADV_UNMERGEABLE`, `MADV_HUGEPAGE` and
-  `MADV_NOHUGEPAGE`, whose flags no page here depends on: each needs only
-  the range mapped (`ENOMEM`). `MADV_DONTNEED_LOCKED` discards as
+  `MADV_WILLNEED` is accepted, and so are `MADV_COLD` and `MADV_PAGEOUT`
+  (with nothing to reclaim, hints too): each needs only the range mapped
+  (`ENOMEM`). `MADV_DONTNEED_LOCKED` discards as
   `MADV_DONTNEED` does. `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE`
   fault the pages in, as a read or a write would (the zero page, a page of
   its own), up to a page no mapping holds (`ENOMEM`), one its mapping may
   not read or write (`EINVAL`), or one past the end of its file (`EFAULT`).
   `MADV_DONTFORK` and `MADV_DOFORK`, `MADV_WIPEONFORK` and
-  `MADV_KEEPONFORK`, and `MADV_DONTDUMP` and `MADV_DODUMP` set and clear
-  flags of the VMAs of the range, which then split from and merge with
+  `MADV_KEEPONFORK`, `MADV_DONTDUMP` and `MADV_DODUMP`, the access-pattern
+  hints (`MADV_NORMAL`, `MADV_SEQUENTIAL`, `MADV_RANDOM`), `MADV_HUGEPAGE`
+  and `MADV_NOHUGEPAGE`, and KSM's `MADV_MERGEABLE` (which leaves shared
+  memory as it is) and `MADV_UNMERGEABLE` set and clear flags of the VMAs
+  of the range (no page here depends on the last ones), which then split from and merge with
   their neighbours as Linux's do (`/proc/<pid>/maps`). They go VMA by VMA:
   one that refuses the advice stops it with `EINVAL` (`MADV_WIPEONFORK`
   takes only private anonymous memory), and a hole in the range gives
@@ -890,8 +895,9 @@ kernel.
 - `remap_file_pages` maps a range of a shared mapping again at another page
   of its file or shared memory, as Linux's `mmap` of the mapping's own file
   does, keeping its protection. As on Linux, `prot` must be 0 and the range
-  must lie in shared mappings of the same memory that may write, with no
-  hole (`EINVAL`), and a page past what a file can reach is `EOVERFLOW`.
+  must lie in shared mappings of the same memory whose file is open for
+  writing (`VM_SHARED`, which a memfd's seals leave), with no hole
+  (`EINVAL`), and a page past what a file can reach is `EOVERFLOW`.
 - System V shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) belongs to
   the thread's IPC namespace, with Linux's checks in Linux's order and its
   default limits; a new IPC namespace starts with no segments. A segment's ID is its index and a sequence number, given
@@ -1981,9 +1987,10 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
-  `maps`, `fd`, `fdinfo`, `ns` and `task`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
-  signal masks, capabilities and so on) without the memory and CPU ones,
-  which nothing measures. Any other path in this process's directory or
+  `maps`, `smaps`, `fd`, `fdinfo`, `ns` and `task`. `status` has Linux's fields in Linux's order (umask, IDs, threads,
+  signal masks, capabilities and so on) and, of the memory ones, the locked
+  memory (`VmLck`); the other memory fields and the CPU ones are not there,
+  as nothing measures them. Any other path in this process's directory or
   elsewhere under `/proc` is looked up in the filesystem like any path, so with
   `--mount /:/` it reaches the host's own `/proc`.
 - `/proc` lists what the filesystem has there that is not a process (with
@@ -2124,6 +2131,24 @@ kernel.
   shows the address space it was opened on, which a forked child reading it
   sees too, and nothing once no thread uses that space, as after an `execve`.
   It cannot be mapped (`ENODEV`).
+- `/proc/self/smaps` follows each line of `maps` with Linux's `show_smap`
+  block, read as `maps` is: the size, what the pages hold (`Rss`, `Pss`,
+  `Pss_Dirty`, the shared and private clean and dirty pages, `Anonymous`,
+  `Locked`, with 0 for huge pages, swap and KSM), `THPeligible` and
+  `VmFlags`. A page counts once it has an entry: private memory only read
+  shows the zero page, which is not counted, written private memory is
+  anonymous and dirty, and a page that a `fork` shares until it is written
+  is shared, half of it in `Pss`. `VmFlags` names Linux's flags of the VMA
+  in Linux's order: the protection and what it may become (`mr`, `mw`, `me`,
+  `ms`, without `mw` for a file open only for reading or sealed against
+  writes, and without `me` for the rings of AIO and `io_uring` and secret
+  memory, whose pseudo file systems run nothing), `sh`, `gd` for the initial
+  stack, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
+  `dc`, `wf`, `dd`, `hg`, `nh`, `mg`), `de`, `mm` and `dd` of the rings and
+  secret memory, the charge (`ac`, which private memory that was writable
+  has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never
+  written gives back as it stops being writable), `nh` of a `MAP_STACK`
+  mapping, the seal (`sl`), and `sd` on every VMA but the initial stack.
 - `/proc/self/fd` (mode 0500) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each
   link's `lstat` shows the descriptor's access in its user bits and size 64,
@@ -2348,6 +2373,18 @@ kernel.
   them. A child of `fork` starts with neither, and `execve` keeps them.
   They count CPU time as the CPU clocks do, so in WebAssembly, which cannot
   measure it, they count wall time.
+- `adjtimex` and `clock_adjtime` on `CLOCK_REALTIME` read the clock's NTP
+  state as Linux starts with it, without revealing the host's:
+  unsynchronised (`STA_UNSYNC`, so the result is `TIME_ERROR`), the errors at
+  16 s, no offset or frequency correction, a time constant of 2, a 10,000 µs
+  tick and no PPS or TAI offset, with the real-time clock's time. They take
+  only reads (no mode, or adjtime's `ADJ_OFFSET_SS_READ`), after Linux's
+  checks of the modes; `adjtimex` writes the structure back whatever the
+  result, and `clock_adjtime` reads it before it looks at the clock (other
+  clocks give `EOPNOTSUPP`, or `EINVAL` for unknown ones). `settimeofday` and
+  `clock_settime` (only on `CLOCK_REALTIME`, or `EINVAL`) check the time as
+  Linux does, `EINVAL` past 30 years short of `KTIME_MAX`, and then give
+  `EPERM`.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's, rounded up to
   a whole second as Linux rounds it.

@@ -219,6 +219,9 @@ pub struct Processes {
     kcmp_cookies: std::sync::OnceLock<[[u64; 2]; crate::kcmp::TYPES]>,
     /// The events the machine's aio contexts take, and their limit.
     pub(crate) aio: Arc<crate::aio::Limits>,
+    /// The `memfd_secret` pages each user has (Linux's `locked_vm` of its
+    /// `user_struct`).
+    pub(crate) secret_pages: Arc<crate::memfd::SecretPages>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -237,6 +240,7 @@ impl Processes {
             fifos: Arc::default(),
             cpus: Arc::default(),
             mqueue_charges: Arc::default(),
+            secret_pages: Arc::default(),
             mqueue_mount: group.namespaces(1).ipc.mq.clone(),
             kcmp_cookies: std::sync::OnceLock::new(),
             aio: Arc::default(),

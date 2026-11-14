@@ -573,6 +573,7 @@ impl Kernel {
         number: u64,
         notify: &seccomp::Notify,
     ) -> Option<Next> {
+        memfd::enter(self.group.memlock());
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number,
@@ -1053,6 +1054,7 @@ impl Kernel {
             thread.cpu.gpr[reg::RAX] = paludarium_types::Errno::ENOSYS.to_syscall_return();
             return Next::Resume;
         };
+        memfd::enter(self.group.memlock());
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number,

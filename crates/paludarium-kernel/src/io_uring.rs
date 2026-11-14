@@ -130,6 +130,12 @@ impl PageSource for RingPages {
     fn fixed(&self) -> bool {
         true
     }
+    /// `io_region_mmap` adds `VM_DONTEXPAND`, and `vm_insert_pages`
+    /// `VM_MIXEDMAP`; the ring's anonymous inode runs nothing.
+    fn vma_flags(&self, flags: u64) -> u64 {
+        use paludarium_mmu::vm;
+        (flags | vm::DONTEXPAND | vm::MIXEDMAP) & !vm::MAYEXEC
+    }
     fn size(&self) -> Option<u64> {
         Some(self.size)
     }
@@ -866,7 +872,10 @@ pub(crate) fn mmap(
     let at = c
         .mem
         .map_shared(None, len, prot, paludarium_mmu::MappingKind::File)?;
-    if let Err(e) = c.mem.share_pages(at, len, pages, 0, true) {
+    if let Err(e) = c
+        .mem
+        .share_pages(at, len, pages, 0, paludarium_mmu::SharedWrites::Allowed)
+    {
         let _ = c.mem.unmap_shared(at, len);
         return Err(e);
     }

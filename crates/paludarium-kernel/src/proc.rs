@@ -7,7 +7,7 @@
 //! to its namespaces, and its `maps`, which alone is generated as it is
 //! read.
 use paludarium_host::{FileHandle, FileStat};
-use paludarium_mmu::{MemoryView, Prot, Vma};
+use paludarium_mmu::{MemoryView, Prot, Usage, Vma, vm};
 use paludarium_types::Errno;
 use paludarium_vfs::MountPoint;
 use std::sync::{Mutex, PoisonError};
@@ -53,6 +53,8 @@ pub(crate) enum OwnEntry {
     Exe,
     Cwd,
     Maps,
+    /// `smaps`: `maps` with what each VMA holds and its flags.
+    Smaps,
     /// `fd`, and one of its links by descriptor number.
     Descriptors,
     Descriptor(u32),
@@ -79,6 +81,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
         b"/exe" => Some(OwnEntry::Exe),
         b"/cwd" => Some(OwnEntry::Cwd),
         b"/maps" => Some(OwnEntry::Maps),
+        b"/smaps" => Some(OwnEntry::Smaps),
         b"/fd" | b"/fd/" => Some(OwnEntry::Descriptors),
         b"/fdinfo" | b"/fdinfo/" => Some(OwnEntry::DescriptorInfos),
         _ => match tail.strip_prefix(b"/fdinfo/") {
@@ -93,7 +96,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 17] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 18] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -108,6 +111,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 17] = [
     (b"exe", 10),
     (b"mounts", 8),
     (b"mountinfo", 8),
+    (b"smaps", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
@@ -524,6 +528,9 @@ pub(crate) struct Status<'a> {
     /// namespace it is in the `NS*` lines give.
     pub space: &'a crate::namespaces::Namespace,
     pub descriptors: Option<usize>,
+    /// The pages locked in memory (Linux's `locked_vm`), which a process
+    /// that no longer has its memory does not show.
+    pub locked: Option<u64>,
     pub threads: usize,
     pub queued: usize,
     pub queue_limit: u64,
@@ -538,8 +545,9 @@ pub(crate) struct Status<'a> {
     /// The reader's user namespace, which the IDs are shown in.
     pub reader: &'a crate::namespaces::Namespace,
 }
-/// `/proc/<pid>/status` in Linux's field order. The memory and CPU fields
-/// are left out, as nothing measures them; parsers treat them as optional.
+/// `/proc/<pid>/status` in Linux's field order. Of the memory fields only
+/// `VmLck` is there, and none of the CPU ones, as nothing measures them;
+/// parsers treat them as optional.
 pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
     let mut name = String::new();
     for &b in s.name.iter().take_while(|&&b| b != 0) {
@@ -584,10 +592,13 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         }
         numbers.push('\n');
     }
+    let memory = s
+        .locked
+        .map_or_else(String::new, |pages| format!("VmLck:\t{:8} kB\n", pages * 4));
     format!(
         "Name:\t{name}\n{umask}State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\n\
          Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
-         FDSize:\t{fd_size}\nGroups:\t{groups} \n{numbers}Threads:\t{}\nSigQ:\t{}/{}\n\
+         FDSize:\t{fd_size}\nGroups:\t{groups} \n{numbers}{memory}Threads:\t{}\nSigQ:\t{}/{}\n\
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
          SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
          CapEff:\t{:016x}\nCapBnd:\t{bounding:016x}\nCapAmb:\t{:016x}\n\
@@ -823,6 +834,80 @@ fn map_line(vma: &Vma, start_stack: u64) -> Vec<u8> {
     line.push(b'\n');
     line
 }
+/// The lines `smaps` writes after a VMA's line of `maps`, as Linux's
+/// `show_smap` does: its size, what its pages hold ([`Usage`]), and its
+/// flags. Pss counts a page `fork` shares as half, as if one other process
+/// had it. No page here is huge, swapped or merged by KSM, and the CPU
+/// has no protection keys, which leaves out `ProtectionKey`.
+fn smap_lines(vma: &Vma, usage: Usage) -> Vec<u8> {
+    let kb = |pages: u64| pages * 4;
+    let pss = |private: u64, shared: u64| private * 4 + shared * 2;
+    let pss_all = pss(
+        usage.private_clean + usage.private_dirty,
+        usage.shared_clean + usage.shared_dirty,
+    );
+    let locked = if vma.flags & vm::LOCKED != 0 {
+        pss_all
+    } else {
+        0
+    };
+    let mut out = String::new();
+    for (name, value) in [
+        ("Size:           ", (vma.end - vma.start) >> 10),
+        ("KernelPageSize: ", 4),
+        ("MMUPageSize:    ", 4),
+        ("Rss:            ", kb(usage.resident)),
+        ("Pss:            ", pss_all),
+        (
+            "Pss_Dirty:      ",
+            pss(usage.private_dirty, usage.shared_dirty),
+        ),
+        ("Shared_Clean:   ", kb(usage.shared_clean)),
+        ("Shared_Dirty:   ", kb(usage.shared_dirty)),
+        ("Private_Clean:  ", kb(usage.private_clean)),
+        ("Private_Dirty:  ", kb(usage.private_dirty)),
+        ("Referenced:     ", kb(usage.resident)),
+        ("Anonymous:      ", kb(usage.anonymous)),
+        ("KSM:            ", 0),
+        ("LazyFree:       ", 0),
+        ("AnonHugePages:  ", 0),
+        ("ShmemPmdMapped: ", 0),
+        ("FilePmdMapped:  ", 0),
+        ("Shared_Hugetlb: ", 0),
+    ] {
+        out.push_str(&format!("{name}{value:8} kB\n"));
+    }
+    // One column more for the longer name.
+    out.push_str(&format!("Private_Hugetlb: {:7} kB\n", 0));
+    for (name, value) in [
+        ("Swap:           ", 0),
+        ("SwapPss:        ", 0),
+        ("Locked:         ", locked),
+    ] {
+        out.push_str(&format!("{name}{value:8} kB\n"));
+    }
+    out.push_str(&format!("THPeligible:    {:8}\n", 0));
+    out.push_str("VmFlags: ");
+    for bit in 0..64 {
+        if vma.flags & (1 << bit) != 0
+            && let Some(name) = VM_FLAG_NAMES.get(bit)
+            && !name.is_empty()
+        {
+            out.push_str(name);
+            out.push(' ');
+        }
+    }
+    out.push('\n');
+    out.into_bytes()
+}
+/// The names `smaps` gives the bits of `vm_flags`, by bit, as Linux's
+/// `show_smap_vma_flags` has them on x86-64: the protection key's bits
+/// have none, and one it does not know is `??`.
+const VM_FLAG_NAMES: [&str; 44] = [
+    "rd", "wr", "ex", "sh", "mr", "mw", "me", "ms", "gd", "um", "pf", "gu", "uw", "lo", "io", "sr",
+    "rr", "dc", "de", "lf", "ac", "nr", "ht", "sf", "ar", "wf", "dd", "sd", "mm", "hg", "nh", "mg",
+    "", "", "", "", "", "ss", "??", "??", "dp", "ui", "sl", "ur",
+];
 /// Where `maps` pads a line to before its name (Linux's width of
 /// `25 + sizeof(void *) * 6 - 1`).
 const MAPS_NAME_COLUMN: usize = 72;
@@ -852,14 +937,21 @@ struct MapsPosition {
 pub(crate) struct MapsFile {
     memory: MemoryView,
     start_stack: u64,
+    /// It is `smaps`, which follows each line with [`smap_lines`].
+    smaps: bool,
     writable: bool,
     position: Mutex<MapsPosition>,
 }
 impl MapsFile {
     pub(crate) fn open(memory: MemoryView, start_stack: u64, flags: u32) -> Self {
+        Self::open_as(memory, start_stack, flags, false)
+    }
+    /// `smaps` rather than `maps` with `smaps`.
+    pub(crate) fn open_as(memory: MemoryView, start_stack: u64, flags: u32, smaps: bool) -> Self {
         Self {
             memory,
             start_stack,
+            smaps,
             writable: flags & 3 != 0,
             position: Mutex::new(MapsPosition {
                 pending: Vec::new(),
@@ -877,7 +969,12 @@ impl MapsFile {
         }
         let vma = self.memory.vma_from(next)?;
         let after = self.memory.vma_from(vma.end).map_or(MAPS_END, |v| v.start);
-        Some((map_line(&vma, self.start_stack), after))
+        let mut line = map_line(&vma, self.start_stack);
+        if self.smaps {
+            let usage = self.memory.usage(vma.start, vma.end).unwrap_or_default();
+            line.extend_from_slice(&smap_lines(&vma, usage));
+        }
+        Some((line, after))
     }
     /// Gathers whole lines until `wanted` bytes are there or one more would
     /// fill the buffer, as `seq_read` does; the first always goes in.
@@ -1039,6 +1136,83 @@ mod tests {
     }
 
     #[test]
+    fn smaps_follows_each_line_with_what_the_vma_holds() {
+        let mut mem = AddressSpace::new();
+        let at = mem
+            .map(
+                Some(GuestAddr(0x5000)),
+                0x3000,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        mem.map(
+            Some(GuestAddr(0x7fff0000)),
+            0x1000,
+            Prot::READ_WRITE,
+            MappingKind::Stack,
+        )
+        .unwrap();
+        // A read shows the zero page, which is not counted; writes are.
+        let mut byte = [0];
+        mem.read(at, &mut byte).unwrap();
+        mem.write(GuestAddr(0x6000), b"x").unwrap();
+        mem.write(GuestAddr(0x7000), b"x").unwrap();
+        mem.lock(
+            GuestAddr(0x7000),
+            0x8000,
+            Some(paludarium_mmu::Lock::OnFault),
+        )
+        .unwrap();
+        let file = MapsFile::open_as(mem.view(), 0x7fff0800, 0, true);
+        let text = String::from_utf8(read_all(&file, 4096)).unwrap();
+        let blocks: Vec<&str> = text.split_inclusive("VmFlags:").collect();
+        assert!(
+            text.starts_with(
+                "00005000-00007000 rw-p 00000000 00:00 0 \n\
+                 Size:                  8 kB\n\
+                 KernelPageSize:        4 kB\n\
+                 MMUPageSize:           4 kB\n\
+                 Rss:                   4 kB\n\
+                 Pss:                   4 kB\n\
+                 Pss_Dirty:             4 kB\n\
+                 Shared_Clean:          0 kB\n\
+                 Shared_Dirty:          0 kB\n\
+                 Private_Clean:         0 kB\n\
+                 Private_Dirty:         4 kB\n\
+                 Referenced:            4 kB\n\
+                 Anonymous:             4 kB\n\
+                 KSM:                   0 kB\n\
+                 LazyFree:              0 kB\n\
+                 AnonHugePages:         0 kB\n\
+                 ShmemPmdMapped:        0 kB\n\
+                 FilePmdMapped:         0 kB\n\
+                 Shared_Hugetlb:        0 kB\n\
+                 Private_Hugetlb:       0 kB\n\
+                 Swap:                  0 kB\n\
+                 SwapPss:               0 kB\n\
+                 Locked:                0 kB\n\
+                 THPeligible:           0\n\
+                 VmFlags: rd wr mr mw me ac sd \n"
+            ),
+            "{text}"
+        );
+        assert_eq!(blocks.len(), 4, "{text}");
+        // The locked page is a VMA of its own, and all of it is locked.
+        assert!(text.contains("00007000-00008000 rw-p"), "{text}");
+        assert!(
+            blocks[1].contains("Locked:                4 kB\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("VmFlags: rd wr mr mw me lo lf ac sd \n"),
+            "{text}"
+        );
+        // The initial stack is not soft-dirty.
+        assert!(text.ends_with("VmFlags: rd wr mr mw me gd ac \n"), "{text}");
+    }
+
+    #[test]
     fn maps_shows_the_break_as_the_heap_once_it_has_grown() {
         let mut mem = AddressSpace::new();
         mem.set_initial_break(GuestAddr(0x10000));
@@ -1065,6 +1239,7 @@ mod tests {
             }),
             identity: (0x0812, 9),
             heap: false,
+            flags: 0,
         };
         let line = map_line(&vma, 0);
         let text = std::str::from_utf8(&line).unwrap();
@@ -1259,6 +1434,7 @@ mod tests {
             session: 2,
             space: &namespaces.pid,
             descriptors: Some(70),
+            locked: Some(3),
             threads: 2,
             queued: 1,
             queue_limit: 4096,
@@ -1296,7 +1472,7 @@ mod tests {
             "Uid:\t1\t2\t3\t4\n",
             "Gid:\t0\t0\t0\t0\n",
             // In Linux's place, the session's leader outside the namespace.
-            "Groups:\t5 6 \nNStgid:\t3\t1\nNSpid:\t4\t2\nNSpgid:\t3\t1\nNSsid:\t2\t0\nThreads:",
+            "Groups:\t5 6 \nNStgid:\t3\t1\nNSpid:\t4\t2\nNSpgid:\t3\t1\nNSsid:\t2\t0\nVmLck:\t      12 kB\nThreads:",
             "CapInh:\t0000000000000042\n",
             "CapPrm:\t000001ffffffffff\n",
             "CapEff:\t0000000000000000\n",

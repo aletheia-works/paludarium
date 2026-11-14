@@ -178,6 +178,12 @@ impl PageSource for RingPages {
     fn fixed(&self) -> bool {
         true
     }
+    /// `aio_ring_mmap_prepare` adds `VM_DONTEXPAND` and `VM_DONTCOPY`; the
+    /// ring's file lies on a pseudo file system, which runs nothing.
+    fn vma_flags(&self, flags: u64) -> u64 {
+        use paludarium_mmu::vm;
+        (flags | vm::DONTEXPAND | vm::DONTCOPY) & !vm::MAYEXEC
+    }
     fn size(&self) -> Option<u64> {
         Some(self.size)
     }
@@ -885,7 +891,16 @@ fn setup(c: &mut Context<'_>, nr_events: u32, ctxp: u64) -> Result<u64, Errno> {
             paludarium_mmu::MappingKind::File,
         )
         .map_err(|_| Errno::ENOMEM)?;
-    if c.mem.share_pages(at, mmap_size, &shared, 0, true).is_err() {
+    if c.mem
+        .share_pages(
+            at,
+            mmap_size,
+            &shared,
+            0,
+            paludarium_mmu::SharedWrites::Allowed,
+        )
+        .is_err()
+    {
         let _ = c.mem.unmap_shared(at, mmap_size);
         return Err(Errno::ENOMEM);
     }

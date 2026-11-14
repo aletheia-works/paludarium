@@ -193,7 +193,13 @@ fn shared_offset_names_the_memory_not_the_address() {
             )
             .unwrap();
         space
-            .share_pages(GuestAddr(at), PAGE_SIZE, &pages, offset, true)
+            .share_pages(
+                GuestAddr(at),
+                PAGE_SIZE,
+                &pages,
+                offset,
+                SharedWrites::Allowed,
+            )
             .unwrap();
     }
     let (memory, offset) = p.shared_offset(GuestAddr(0x40008)).unwrap();

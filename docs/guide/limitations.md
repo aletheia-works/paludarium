@@ -35,8 +35,21 @@ verified.
   VMA has its full size from the start, where Linux's grows as it is used. A
   program's own segments and its interpreter's are named by the path it was
   started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `/proc/<pid>/maps` of another process, `smaps` and
-  `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+  symbolic links. `/proc/<pid>/maps` and `smaps` of another process,
+  `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+- **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
+  page entries. `Referenced` is every page counted, a page that `fork`
+  shares counts as shared (and half of it in `Pss`) even after the other
+  process has let it go, while one of shared memory counts as private
+  whoever else maps it. A page of a loaded program's segment counts as
+  anonymous once the segment was written, not once the page was. A
+  file's pages are counted as they are touched, where Linux's fault
+  brings in up to 16 pages around one (`fault_around_bytes`), and so are
+  those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
+  `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
+  no huge pages and the CPU has no protection keys. `VmFlags` shows no
+  `um`, `uw` or `ui` (`userfaultfd`), `ht` or `dp` (`MAP_HUGETLB`,
+  `MAP_DROPPABLE`), and no `gd` for a `MAP_GROWSDOWN` mapping.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, `/proc/sys` but for `fs/mqueue`, ...) and the other names in
@@ -206,10 +219,8 @@ verified.
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
   - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, `MADV_HWPOISON` and
-    `MADV_SOFT_OFFLINE`, which Linux takes. Neither `/proc/<pid>/smaps`,
-    whose `VmFlags` would show the `gu` of a VMA that had guards and the
-    `lo` of a locked one, nor `/proc/<pid>/pagemap`, which would show a
-    guard page, is there.
+    `MADV_SOFT_OFFLINE`, which Linux takes. `/proc/<pid>/pagemap`, which
+    would show a guard page, is not there.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
     mapped. It refuses advice Linux does not know before any range
@@ -228,13 +239,15 @@ verified.
   - An error that ends `recvmmsg` after some messages is dropped, where
     Linux keeps it as the socket's error for the next call and
     `SO_ERROR`, and `recvmmsg` does not first give a socket's pending error.
-  - The pages of a `memfd_secret` file do not count against
-    `RLIMIT_MEMLOCK`, where Linux 7.3 and later count them against the
-    user's as they are faulted in (`SIGBUS` past it), and earlier kernels
-    count its mappings as locked (`mmap` gives `EAGAIN` past it). Those
-    earlier kernels' mapping is also locked, so `msync` with
-    `MS_INVALIDATE` of it gives `EBUSY` there, where it succeeds here, as
-    on Linux 7.3.
+  - A fault of a `memfd_secret` page takes the faulting process's
+    `RLIMIT_MEMLOCK` as of its last system call (its creator's before
+    one), and the pages count only `memfd_secret` files, where Linux's
+    `locked_vm` of a user also counts its `io_uring` buffers and the like.
+    Kernels without the change that counts them as they are faulted in
+    (97d34aa65c29, "mm/secretmem: properly account locked pages") count
+    its mappings as locked instead: `mmap` gives `EAGAIN` past the limit,
+    and `msync` with `MS_INVALIDATE` of the mapping gives `EBUSY`, where it
+    succeeds here, as on kernels with the change.
   - The interval timers of CPU time, `ITIMER_VIRTUAL` and `ITIMER_PROF`, and
     `RLIMIT_CPU` all count the process's whole CPU time, as all of it is user time here
     (Linux's `ITIMER_VIRTUAL` leaves out the system time; its `RLIMIT_CPU`
@@ -251,6 +264,13 @@ verified.
     A sleep on another task's CPU clock is looked at the same way.
     `timer_create` on another process's CPU clock gives `EINVAL`, where
     Linux makes the timer.
+  - The time cannot be set: `settimeofday`, `clock_settime` and an
+    `adjtimex` or `clock_adjtime` that changes something give `EPERM` even
+    to a caller with `CAP_SYS_TIME`, where Linux sets the clock, its time
+    zone or its NTP state, so the NTP state is always the one Linux starts
+    with. `clock_settime` on a CPU clock named by a negative clock ID gives
+    `EINVAL` without reading the time, where Linux reads it, finds the task
+    and gives `EPERM`, and the auxiliary clocks (`CLOCK_AUX`) are not there.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
     the superblock of its pseudo filesystem and gives its counts (0). A
@@ -313,7 +333,7 @@ verified.
     takes a neighbour's only if their flags agreed then
     (`anon_vma_compatible`), so pieces written while apart may stay
     separate VMAs in `/proc/<pid>/maps`.
-  - `/proc/<pid>/status` shows no locked memory (`VmLck`). `mmap` with
+  - `mmap` with
     `MAP_LOCKED` checks `can_do_mlock` (`EPERM`) and room under
     `RLIMIT_MEMLOCK` (`EAGAIN`) before it finds room for the mapping
     (`ENOMEM`) and looks at the file, where Linux does those first, and `mremap` checks the room for a locked VMA

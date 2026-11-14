@@ -32,7 +32,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   初めから全体の大きさで、Linux のように使うにつれて伸びません。プログラムと
   インタープリターのセグメントの名前は起動時のパスで、`(deleted)` も付きません。
   Linux は名前の変更を追い、シンボリックリンクを解決します。ほかのプロセスの
-  `/proc/<pid>/maps`、`smaps`、`[anon:<名前>]` の名前（`PR_SET_VMA`）はありません。
+  `/proc/<pid>/maps` と `smaps`、`smaps_rollup`、`[anon:<名前>]` の名前
+  （`PR_SET_VMA`）はありません。
+- **`/proc/self/smaps` の一部**：数える値は、エミュレーターのページのエントリーから
+  出します。`Referenced` は数えたページすべてです。`fork` が共有するページは、相手の
+  プロセスが手放したあとも共有として数え（`Pss` にはその半分）、共有メモリのページは
+  ほかに誰がマップしていてもプライベートとして数えます。読み込んだプログラムの
+  セグメントのページは、ページではなくセグメントに書き込んだ時点で匿名として数えます。
+  ファイルのページは触れたときに数えます。Linux のフォールトは周りの 16 ページまで
+  取り込みます（`fault_around_bytes`）。`MAP_POPULATE`、`MAP_LOCKED`、ロックが
+  取り込むはずのページも、触れたときに数えます。ヒュージページもプロテクションキーも
+  ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
+  `um`、`uw`、`ui`（`userfaultfd`）、`ht`、`dp`（`MAP_HUGETLB`、`MAP_DROPPABLE`）が
+  なく、`MAP_GROWSDOWN` のマッピングにも `gd` がありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
   `fs/mqueue` 以外の `/proc/sys` など）と、読むプロセス自身のディレクトリのほかの名前
@@ -179,9 +191,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux のホストで見分けるのは ext4、xfs、btrfs、f2fs だけです（ほかのファイルシステムは
     どちらも断ります）。
   - `madvise` は、Linux が受け付ける次の指定を断ります（`EINVAL`）。`MADV_COLLAPSE`、
-    `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。`/proc/<pid>/smaps` はありません。Linux では
-    その `VmFlags` が、ガードを置いた VMA の `gu` とロックした VMA の `lo` を示します。
-    ガードページを示す `/proc/<pid>/pagemap` もありません。
+    `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。ガードページを示す
+    `/proc/<pid>/pagemap` はありません。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか
     受け付けず、ほかのプロセスの範囲はマップされているかを確かめるだけです。Linux が知らない
     指定は、Linux master と同じく範囲を見る前に断ります（`EINVAL`）。CI のカーネルは範囲ごとに
@@ -198,11 +209,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - いくつかのメッセージのあとで `recvmmsg` を終わらせたエラーは捨てます。Linux はこれを
     ソケットのエラーとして残し、次の呼び出しと `SO_ERROR` で返します。また `recvmmsg` は、
     ソケットに残っているエラーを先に返しません。
-  - `memfd_secret` のファイルのページは `RLIMIT_MEMLOCK` に数えません。Linux 7.3 以降は、
-    ページフォールトのときにユーザーの分として数え、それを超えると `SIGBUS` です。それより前の
-    カーネルはマッピングをロックしたものとして数え、超えると `mmap` が `EAGAIN` です。その前の
-    カーネルではマッピングがロックされているので、`MS_INVALIDATE` の `msync` は `EBUSY` に
-    なります。ここでは Linux 7.3 と同じく成功します。
+  - `memfd_secret` のページのフォールトは、フォールトしたプロセスの最後のシステムコールの
+    ときの `RLIMIT_MEMLOCK` で決めます（システムコールの前は、作ったプロセスのものです）。
+    数えるのは `memfd_secret` のファイルのページだけです。Linux のユーザーの `locked_vm` は、
+    `io_uring` のバッファなども数えます。ページをフォールトのときに数える変更
+    （97d34aa65c29「mm/secretmem: properly account locked pages」）のないカーネルは、
+    代わりにマッピングをロックしたものとして数えます。上限を超えると `mmap` が `EAGAIN` で、
+    そのマッピングの `MS_INVALIDATE` の `msync` は `EBUSY` です。ここでは、変更のある
+    カーネルと同じく成功します。
   - CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）と `RLIMIT_CPU` は、
     どれもプロセスの CPU 時間のすべてを数えます。ここではそのすべてがユーザーの時間だからです
     （Linux の `ITIMER_VIRTUAL` はシステムの時間を数えず、`RLIMIT_CPU` は数えます）。WebAssembly のように
@@ -216,6 +230,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     経てば眠りが終わります。ほかのタスクの CPU 時計での眠りも同じように確かめます。ほかの
     プロセスの CPU 時計での `timer_create` は `EINVAL` を返します。Linux はタイマーを
     作ります。
+  - 時刻は設定できません。`settimeofday`、`clock_settime`、何かを変える `adjtimex` と
+    `clock_adjtime` は、`CAP_SYS_TIME` を持つ呼び出し元にも `EPERM` を返します。Linux は時計、
+    タイムゾーン、NTP の状態を設定します。そのため NTP の状態は、いつも Linux が起動したときの
+    ままです。負の時計 ID で表す CPU 時計での `clock_settime` は、時刻を読まずに `EINVAL` を
+    返します。Linux は時刻を読み、タスクを探して `EPERM` を返します。補助の時計
+    （`CLOCK_AUX`）もありません。
   - `ustat` が見つけるのはマウントのデバイスだけです。パイプ・ソケット・memfd・名前空間の
     ファイルの `st_dev` では `EINVAL` を返します。Linux はその疑似ファイルシステムの
     スーパーブロックを見つけ、その数（0）を返します。`/proc` と `/dev` のファイルの
@@ -269,7 +289,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     VMA は最初の書き込みで `anon_vma` を得て、そのとき隣とフラグがそろっていたときだけ
     隣のものを使う（`anon_vma_compatible`）ので、離れている間に書き込んだかけらは、
     `/proc/<pid>/maps` で別の VMA のまま残ることがあります。
-  - `/proc/<pid>/status` にロックしたメモリ（`VmLck`）は出ません。`MAP_LOCKED` の
+  - `MAP_LOCKED` の
     `mmap` は、マッピングの場所を探し（`ENOMEM`）ファイルを確かめる前に、`can_do_mlock`
     （`EPERM`）と `RLIMIT_MEMLOCK` の空き（`EAGAIN`）を確かめます。Linux はそれらを先にします。`mremap` は、
     ロックした VMA が広がるときの空きを、新しい範囲のほかの確認より前に確かめます。

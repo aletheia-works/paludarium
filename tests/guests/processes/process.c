@@ -27,6 +27,7 @@
 #include <sys/vfs.h>
 #include <sys/prctl.h>
 #include <sys/time.h>
+#include <sys/timex.h>
 #include <time.h>
 #include <utime.h>
 #include <sys/socket.h>
@@ -6445,6 +6446,221 @@ static int lock_state_case(void) {
     munlock(file, 2 * page);
     return 0;
 }
+/* /proc/self/smaps: the block of the VMA holding an address, by the fields
+ * that do not depend on the CPU or the kernel's configuration (no
+ * THPeligible or ProtectionKey) or on how many pages a fault brings in
+ * around the one it is for (no counts for a file's pages). */
+static char smaps_buffer[1 << 20];
+static const char *smaps_field(const char *block, const char *end, const char *name) {
+    size_t length = strlen(name);
+    for (const char *line = block; line < end;) {
+        const char *next = memchr(line, '\n', (size_t)(end - line));
+        next = next ? next + 1 : end;
+        if ((size_t)(next - line) > length && !strncmp(line, name, length) && line[length] == ':')
+            return line + length + 1;
+        line = next;
+    }
+    return NULL;
+}
+static long smaps_kb(const char *block, const char *end, const char *name) {
+    const char *value = smaps_field(block, end, name);
+    return value ? strtol(value, NULL, 10) : -1;
+}
+/* What smaps_show prints of a VMA: its flags; its size too; and what its
+ * pages hold as well. */
+enum { SMAPS_FLAGS, SMAPS_SIZE, SMAPS_COUNTS };
+static void smaps_show(const char *label, const void *at, int what) {
+    int fd = open("/proc/self/smaps", O_RDONLY);
+    if (fd < 0) {
+        printf("%s: open=%d\n", label, errno);
+        return;
+    }
+    size_t length = 0;
+    for (;;) {
+        ssize_t got = read(fd, smaps_buffer + length, sizeof smaps_buffer - 1 - length);
+        if (got <= 0) break;
+        length += (size_t)got;
+    }
+    close(fd);
+    smaps_buffer[length] = 0;
+    uintptr_t address = (uintptr_t)at;
+    /* A block starts at a line whose first field is a range. */
+    for (char *line = smaps_buffer; line && *line;) {
+        unsigned long start, stop;
+        char perms[5];
+        if (sscanf(line, "%lx-%lx %4s", &start, &stop, perms) == 3 && address >= start &&
+            address < stop) {
+            char *end = line + 1;
+            for (;;) {
+                end = strchr(end, '\n');
+                if (!end || !end[1]) {
+                    end = smaps_buffer + length;
+                    break;
+                }
+                end++;
+                unsigned long a, b;
+                if (sscanf(end, "%lx-%lx ", &a, &b) == 2) break;
+            }
+            const char *flags = smaps_field(line, end, "VmFlags");
+            const char *flags_end = flags ? strchr(flags, '\n') : NULL;
+            printf("%s: %s", label, perms);
+            if (what >= SMAPS_SIZE)
+                printf(" pages=%lu size=%ld", (stop - start) / 4096, smaps_kb(line, end, "Size"));
+            if (what == SMAPS_COUNTS)
+                printf(" rss=%ld pss=%ld pss-dirty=%ld shared=%ld/%ld private=%ld/%ld anon=%ld locked=%ld",
+                       smaps_kb(line, end, "Rss"), smaps_kb(line, end, "Pss"),
+                       smaps_kb(line, end, "Pss_Dirty"), smaps_kb(line, end, "Shared_Clean"),
+                       smaps_kb(line, end, "Shared_Dirty"), smaps_kb(line, end, "Private_Clean"),
+                       smaps_kb(line, end, "Private_Dirty"), smaps_kb(line, end, "Anonymous"),
+                       smaps_kb(line, end, "Locked"));
+            printf(" flags=%.*s\n", flags ? (int)(flags_end - flags) : 0, flags ? flags : "");
+            return;
+        }
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    printf("%s: none\n", label);
+}
+static void smaps_locked(void) {
+    char status[8192];
+    int fd = open("/proc/self/status", O_RDONLY);
+    ssize_t got = fd < 0 ? -1 : read(fd, status, sizeof status - 1);
+    if (fd >= 0) close(fd);
+    status[got > 0 ? got : 0] = 0;
+    const char *line = strstr(status, "\nVmLck:");
+    printf("status VmLck=%ld\n", line ? strtol(line + 7, NULL, 10) : -1);
+}
+/* Memory with a hole on each side, which no other VMA merges with: the
+ * emulator merges private VMAs whatever their anon_vma. */
+static char *smaps_area(long pages, int prot, int flags) {
+    long page = 4096;
+    char *area = mmap(NULL, (pages + 2) * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) return MAP_FAILED;
+    munmap(area, page);
+    munmap(area + (pages + 1) * page, page);
+    char *at = mmap(area + page, pages * page, prot, flags | MAP_FIXED, -1, 0);
+    return at;
+}
+static int smaps_flags_case(void) {
+    long page = 4096;
+    /* Private anonymous memory: charged, soft-dirty; its pages count as
+     * they are written, and the zero page that a read shows does not. */
+    char *p = smaps_area(4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (p == MAP_FAILED) return 80;
+    volatile char seen = p[0];
+    (void)seen;
+    smaps_show("read", p, SMAPS_COUNTS);
+    for (int i = 1; i < 4; i++) p[i * page] = 1;
+    smaps_show("written", p, SMAPS_COUNTS);
+    /* What mprotect splits off keeps VM_ACCOUNT once the VMA was written. */
+    mprotect(p + page, page, PROT_READ);
+    smaps_show("protected", p + page, SMAPS_COUNTS);
+    /* Memory never written gives the charge back as it stops being
+     * writable, and takes it again as it becomes writable. */
+    char *q = smaps_area(1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (q == MAP_FAILED) return 81;
+    smaps_show("none", q, SMAPS_SIZE);
+    mprotect(q, page, PROT_READ | PROT_WRITE);
+    smaps_show("made-writable", q, SMAPS_SIZE);
+    mprotect(q, page, PROT_READ);
+    smaps_show("made-read-only", q, SMAPS_SIZE);
+    char *r = smaps_area(1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+    char *s = smaps_area(1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK);
+    char *t = smaps_area(2, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS);
+    if (r == MAP_FAILED || s == MAP_FAILED || t == MAP_FAILED) return 82;
+    smaps_show("noreserve", r, SMAPS_SIZE);
+    smaps_show("stack-flag", s, SMAPS_SIZE);
+    t[0] = 1;
+    smaps_show("shared", t, SMAPS_COUNTS);
+    /* Advice that sets a flag splits the VMA, and merges it again once the
+     * flags agree. */
+    char *a = smaps_area(3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (a == MAP_FAILED) return 83;
+    const struct {
+        const char *name;
+        int advice;
+    } advices[] = {
+        {"random", MADV_RANDOM},       {"sequential", MADV_SEQUENTIAL}, {"normal", MADV_NORMAL},
+        {"hugepage", MADV_HUGEPAGE},   {"nohugepage", MADV_NOHUGEPAGE}, {"mergeable", MADV_MERGEABLE},
+        {"unmergeable", MADV_UNMERGEABLE}, {"dontfork", MADV_DONTFORK}, {"dofork", MADV_DOFORK},
+        {"dontdump", MADV_DONTDUMP},   {"dodump", MADV_DODUMP},         {"wipeonfork", MADV_WIPEONFORK},
+        {"keeponfork", MADV_KEEPONFORK},
+    };
+    for (size_t i = 0; i < sizeof advices / sizeof advices[0]; i++) {
+        long e = advice_errno(madvise(a + page, page, advices[i].advice));
+        char label[64];
+        snprintf(label, sizeof label, "%s=%ld vmas=%d", advices[i].name, e,
+                 advice_vmas(a, a + 3 * page));
+        smaps_show(label, a + page, SMAPS_SIZE);
+    }
+    /* Advice for shared memory that KSM leaves alone. */
+    printf("shared mergeable=%ld\n", advice_errno(madvise(t, page, MADV_MERGEABLE)));
+    smaps_show("shared-mergeable", t, SMAPS_SIZE);
+    /* Locked memory, and what status counts. */
+    char *l = smaps_area(3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (l == MAP_FAILED) return 84;
+    for (int i = 0; i < 3; i++) l[i * page] = 1;
+    smaps_locked();
+    printf("mlock=%ld onfault=%ld\n", advice_errno(mlock(l, page)),
+           advice_errno(syscall(SYS_mlock2, l + page, page, 1L)));
+    smaps_show("locked", l, SMAPS_COUNTS);
+    smaps_show("locked-onfault", l + page, SMAPS_COUNTS);
+    smaps_locked();
+    munlock(l, 2 * page);
+    smaps_show("unlocked", l, SMAPS_SIZE);
+    smaps_locked();
+    /* A guard leaves its flag when it goes; a seal stays. */
+    char *g = smaps_area(2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (g == MAP_FAILED) return 85;
+    long install = advice_errno(madvise(g, page, 102));
+    long removed = advice_errno(madvise(g, page, 103));
+    printf("guard=%ld removed=%ld\n", install, removed);
+    smaps_show("guarded", g, SMAPS_SIZE);
+    printf("mseal=%ld\n", advice_errno(syscall(462, g, 2 * page, 0UL)));
+    smaps_show("sealed", g, SMAPS_SIZE);
+    /* A file's mappings: shared only when it is open for writing, and may
+     * become writable only when no seal keeps it from being written. */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/paludarium-smaps-%d", getpid());
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    int read_only = open(path, O_RDONLY);
+    unlink(path);
+    if (fd < 0 || read_only < 0 || ftruncate(fd, page)) return 86;
+    char *f_private = mmap(NULL, page, PROT_READ, MAP_PRIVATE, fd, 0);
+    char *f_shared = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *f_read = mmap(NULL, page, PROT_READ, MAP_SHARED, read_only, 0);
+    if (f_private == MAP_FAILED || f_shared == MAP_FAILED || f_read == MAP_FAILED) return 87;
+    smaps_show("file-private", f_private, SMAPS_SIZE);
+    smaps_show("file-shared", f_shared, SMAPS_SIZE);
+    smaps_show("file-read-only", f_read, SMAPS_SIZE);
+    int sealed = memfd_create("smaps", MFD_ALLOW_SEALING);
+    if (sealed < 0 || ftruncate(sealed, page)) return 88;
+    printf("seal=%ld\n", advice_errno(fcntl(sealed, F_ADD_SEALS, F_SEAL_FUTURE_WRITE)));
+    char *m = mmap(NULL, page, PROT_READ, MAP_SHARED, sealed, 0);
+    if (m == MAP_FAILED) return 89;
+    smaps_show("memfd-sealed", m, SMAPS_SIZE);
+    printf("remap=%ld\n", advice_errno(syscall(SYS_remap_file_pages, m, page, 0L, 0L, 0L)));
+    printf("mprotect-write=%ld\n", advice_errno(mprotect(m, page, PROT_READ | PROT_WRITE)));
+    /* The initial stack and the break's heap. */
+    char local = 0;
+    smaps_show("stack", &local, SMAPS_FLAGS);
+    char *heap = (char *)syscall(SYS_brk, 0L);
+    if ((char *)syscall(SYS_brk, heap + page) != heap + page) return 90;
+    heap[0] = 1;
+    smaps_show("heap", heap, SMAPS_FLAGS);
+    /* A child shares the written pages with its parent until either writes
+     * them: half of each is its. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 91;
+    if (child == 0) {
+        smaps_show("child", p + 2 * page, SMAPS_COUNTS);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (waitpid(child, NULL, 0) != child) return 92;
+    return 0;
+}
 /* MADV_REMOVE frees shared memory, as a hole punched in its file: shared
  * anonymous memory, a System V segment and a shared file mapping read as
  * zeros there again; private memory and read-only sharing are refused. */
@@ -7205,6 +7421,83 @@ static int timer_limits_case(void) {
     printf("negative=%ld wide=%ld\n", tl_set(mono, 0, 0, -1, 0), tl_set(mono, 0, 0, 1, 1000000000L));
     printf("delete=%ld %ld\n", syscall(SYS_timer_delete, (long)mono),
            syscall(SYS_timer_delete, (long)real));
+    return 0;
+}
+/* Setting the time, and reading the NTP state. What is printed holds
+ * whether or not the host's clock is synchronised, and whatever time is
+ * set is the time it already is. */
+#ifndef ADJ_ADJTIME
+#define ADJ_ADJTIME 0x8000
+#endif
+static long ts_call(long n, long a, long b) { return syscall(n, a, b) ? -errno : 0; }
+static int time_set_case(void) {
+    struct timex t;
+    memset(&t, 0x5a, sizeof t);
+    t.modes = 0;
+    long r = syscall(SYS_adjtimex, &t);
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    long usec = t.status & STA_NANO ? t.time.tv_usec / 1000 : t.time.tv_usec;
+    long apart = (now.tv_sec - t.time.tv_sec) * 1000000L + now.tv_usec - usec;
+    unsigned char *bytes = (unsigned char *)&t;
+    int padded = 1;
+    for (size_t i = offsetof(struct timex, tai) + sizeof t.tai; i < sizeof t; i++)
+        padded &= bytes[i] == 0x5a;
+    printf("adjtimex result-in-range=%d error-matches=%d modes=%u\n", r >= 0 && r <= 5,
+           !(t.status & STA_UNSYNC) || r == TIME_ERROR, t.modes);
+    printf("adjtimex precision=%ld tolerance=%ld tick=%ld errors-in-range=%d near=%d padded=%d\n",
+           t.precision, t.tolerance, t.tick,
+           t.maxerror >= 0 && t.maxerror <= 16000000 && t.esterror >= 0 &&
+               t.esterror <= 16000000,
+           apart > -2000000 && apart < 2000000, padded);
+    memset(&t, 0, sizeof t);
+    t.modes = ADJ_OFFSET_SS_READ;
+    r = syscall(SYS_adjtimex, &t);
+    printf("adjtime-read result-in-range=%d\n", r >= 0 && r <= 5);
+    unsigned modes[] = {ADJ_ADJTIME, ADJ_OFFSET, ADJ_TICK, ADJ_OFFSET_SINGLESHOT,
+                        ADJ_OFFSET_SS_READ | ADJ_SETOFFSET};
+    for (unsigned i = 0; i < sizeof modes / sizeof *modes; i++) {
+        memset(&t, 0, sizeof t);
+        t.modes = modes[i];
+        t.tick = 10000;
+        printf("adjtimex modes=%#x %ld\n", modes[i], ts_call(SYS_adjtimex, (long)&t, 0));
+    }
+    memset(&t, 0, sizeof t);
+    t.modes = ADJ_OFFSET_SS_READ | ADJ_FREQUENCY;
+    t.freq = LONG_MAX;
+    printf("adjtimex freq-past-range=%ld fault=%ld\n", ts_call(SYS_adjtimex, (long)&t, 0),
+           ts_call(SYS_adjtimex, 8, 0));
+    /* clock_adjtime: the buffer, then the clock. */
+    memset(&t, 0, sizeof t);
+    r = syscall(SYS_clock_adjtime, CLOCK_REALTIME, &t);
+    printf("clock_adjtime realtime-in-range=%d fault-first=%ld\n", r >= 0 && r <= 5,
+           ts_call(SYS_clock_adjtime, 99, 8));
+    long clocks[] = {CLOCK_MONOTONIC, CLOCK_TAI, CLOCK_BOOTTIME, 10, 12, -1, (long)(~0u << 3 | 3)};
+    for (unsigned i = 0; i < sizeof clocks / sizeof *clocks; i++)
+        printf("clock_adjtime %ld=%ld\n", clocks[i],
+               ts_call(SYS_clock_adjtime, clocks[i], (long)&t));
+    /* clock_settime: only CLOCK_REALTIME can be set, after checks. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct timespec wide = {ts.tv_sec, 1000000000L}, late = {8277292036L, 0};
+    printf("clock_settime monotonic=%ld cpu=%ld fault=%ld wide=%ld late=%ld\n",
+           ts_call(SYS_clock_settime, CLOCK_MONOTONIC, (long)&ts),
+           ts_call(SYS_clock_settime, CLOCK_PROCESS_CPUTIME_ID, (long)&ts),
+           ts_call(SYS_clock_settime, CLOCK_REALTIME, 8),
+           ts_call(SYS_clock_settime, CLOCK_REALTIME, (long)&wide),
+           ts_call(SYS_clock_settime, CLOCK_REALTIME, (long)&late));
+    clock_gettime(CLOCK_REALTIME, &ts);
+    printf("clock_settime now=%ld\n", ts_call(SYS_clock_settime, CLOCK_REALTIME, (long)&ts));
+    /* settimeofday. */
+    struct timeval tv, bad = {0, 1000000};
+    struct timezone tz = {0, 0};
+    gettimeofday(&tv, NULL);
+    printf("settimeofday fault=%ld usec=%ld tz-fault=%ld\n", ts_call(SYS_settimeofday, 8, 0),
+           ts_call(SYS_settimeofday, (long)&bad, 0),
+           ts_call(SYS_settimeofday, (long)&tv, 8));
+    gettimeofday(&tv, NULL);
+    printf("settimeofday now=%ld zone=%ld none=%ld\n", ts_call(SYS_settimeofday, (long)&tv, 0),
+           ts_call(SYS_settimeofday, 0, (long)&tz), ts_call(SYS_settimeofday, 0, 0));
     return 0;
 }
 /* RLIMIT_CPU: SIGXCPU at the soft limit, which then goes up a second, and
@@ -9813,6 +10106,54 @@ static int memfd_secret_case(void) {
     ssize_t n = readlink(link, target, sizeof target);
     printf("link=%.*s\n", n > 0 ? (int)n : 0, target);
     printf("reopen=%ld\n", secret_errno(open(link, O_RDWR)));
+    return 0;
+}
+/* What a memfd_secret file's pages charge, as Linux master's secretmem:
+ * a fault brings a page in only within RLIMIT_MEMLOCK (else SIGBUS), and
+ * the pages count against the user who made the file until it goes, not
+ * while they are mapped. */
+static int memfd_secret_memlock_case(void) {
+    long page = 4096;
+    struct rlimit limit = {2 * page, 2 * page}, old;
+    if (getrlimit(RLIMIT_MEMLOCK, &old)) return 80;
+    limit.rlim_max = old.rlim_max;
+    if (setrlimit(RLIMIT_MEMLOCK, &limit)) return 81;
+    struct sigaction action = {0}, before;
+    action.sa_sigaction = on_bus;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGBUS, &action, &before)) return 82;
+    int fd = (int)syscall(447, 0L);
+    if (fd < 0) {
+        printf("memfd_secret=%d\n", -errno);
+        return 0;
+    }
+    if (ftruncate(fd, 4 * page)) return 83;
+    /* The mapping may be larger than the limit. */
+    char *m = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    printf("map=%ld\n", m == MAP_FAILED ? (long)-errno : 0L);
+    if (m == MAP_FAILED) return 0;
+    touch("first", m, 1);
+    touch("second", m + page, 0);
+    touch("third", m + 2 * page, 0);
+    /* Unmapping keeps them charged: the file still has them. */
+    munmap(m, 4 * page);
+    char *again = mmap(NULL, 4 * page, PROT_READ, MAP_SHARED, fd, 0);
+    if (again == MAP_FAILED) return 84;
+    touch("again first", again, 0);
+    touch("again fourth", again + 3 * page, 0);
+    /* Another file of the same user finds no room either. */
+    int other = (int)syscall(447, 0L);
+    if (other < 0 || ftruncate(other, page)) return 85;
+    char *o = mmap(NULL, page, PROT_READ, MAP_SHARED, other, 0);
+    if (o == MAP_FAILED) return 86;
+    touch("other", o, 0);
+    /* Once the first file goes, its pages do. */
+    munmap(again, 4 * page);
+    close(fd);
+    touch("other after close", o, 0);
+    sigaction(SIGBUS, &before, NULL);
+    setrlimit(RLIMIT_MEMLOCK, &old);
     return 0;
 }
 static int pkey_case(void) {
@@ -22107,10 +22448,12 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mseal")) return mseal_case();
     if (!strcmp(mode, "seccomp")) return seccomp_case(self);
     if (!strcmp(mode, "memfd-secret")) return memfd_secret_case();
+    if (!strcmp(mode, "memfd-secret-memlock")) return memfd_secret_memlock_case();
     if (!strcmp(mode, "madvise-advice")) return madvise_advice_case();
     if (!strcmp(mode, "madvise-fork")) return madvise_fork_case();
     if (!strcmp(mode, "madvise-remove")) return madvise_remove_case();
     if (!strcmp(mode, "lock-state")) return lock_state_case();
+    if (!strcmp(mode, "smaps-flags")) return smaps_flags_case();
     if (!strcmp(mode, "mrelease-fatal")) return mrelease_fatal_case();
     if (!strcmp(mode, "madvise-guard")) return madvise_guard_case();
     if (!strcmp(mode, "fork-page-tables")) return fork_page_tables_case();
@@ -22129,6 +22472,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "cpu-itimer")) return cpu_itimer_case(self);
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
+    if (!strcmp(mode, "time-set")) return time_set_case();
     if (!strcmp(mode, "timer-limits")) return timer_limits_case();
     if (!strcmp(mode, "cpu-sleep")) return cpu_sleep_case();
     if (!strcmp(mode, "cpu-sleep-others")) return cpu_sleep_others_case();

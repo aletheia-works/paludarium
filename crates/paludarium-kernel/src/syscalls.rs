@@ -34,6 +34,10 @@ pub mod nr {
     pub const NANOSLEEP: u64 = 35;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const GETTIMEOFDAY: u64 = 96;
+    pub const ADJTIMEX: u64 = 159;
+    pub const SETTIMEOFDAY: u64 = 164;
+    pub const CLOCK_SETTIME: u64 = 227;
+    pub const CLOCK_ADJTIME: u64 = 305;
     pub const TIME: u64 = 201;
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const MMAP: u64 = 9;
@@ -157,7 +161,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 86] = [
+        let entries: [(u64, Handler); 90] = [
             (nr::GETITIMER, sys_getitimer),
             (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
@@ -168,6 +172,10 @@ impl SyscallTable {
             (nr::TGKILL, sys_tgkill),
             (nr::CLOCK_GETTIME, sys_clock_gettime),
             (nr::GETTIMEOFDAY, sys_gettimeofday),
+            (nr::SETTIMEOFDAY, sys_settimeofday),
+            (nr::CLOCK_SETTIME, sys_clock_settime),
+            (nr::ADJTIMEX, sys_adjtimex),
+            (nr::CLOCK_ADJTIME, sys_clock_adjtime),
             (nr::TIME, sys_time),
             (nr::NANOSLEEP, sys_nanosleep),
             (nr::CLOCK_NANOSLEEP, sys_clock_nanosleep),
@@ -568,6 +576,176 @@ fn sys_gettimeofday(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         Err(e) => err(e),
     }
 }
+/// The latest seconds `settimeofday` and `clock_settime` take, as Linux's
+/// `TIME_SETTOD_SEC_MAX`: 30 years short of `KTIME_SEC_MAX`.
+const TIME_SETTOD_SEC_MAX: u64 = i64::MAX as u64 / 1_000_000_000 - 30 * 365 * 24 * 3600;
+
+/// Checks a time to set the real-time clock to, as Linux's
+/// `do_sys_settimeofday64`: `EINVAL` for one it does not take, and else
+/// `EPERM`. The session never sets the time, as a container whose
+/// capabilities leave out `CAP_SYS_TIME` cannot, whatever the caller's
+/// capabilities.
+fn set_time_of_day(time: Option<(u64, u64)>) -> Errno {
+    match time {
+        Some((seconds, nanos))
+            if (seconds as i64) < 0 || nanos >= 1_000_000_000 || seconds >= TIME_SETTOD_SEC_MAX =>
+        {
+            Errno::EINVAL
+        }
+        _ => Errno::EPERM,
+    }
+}
+
+/// `settimeofday(tv, tz)`, in Linux's order: the time is read and its
+/// microseconds checked, then the time zone read, then the time checked
+/// ([`set_time_of_day`]); the time zone is not looked at. 1,000,000
+/// microseconds is refused at once, as Linux master has since
+/// ce4abda5e126 (2026-06); earlier kernels read the time zone first.
+fn sys_settimeofday(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let time = if a[0] == 0 {
+            None
+        } else {
+            let [seconds, micros] = read_words::<2>(c.mem, a[0])?;
+            if micros >= 1_000_000 {
+                return Err(Errno::EINVAL);
+            }
+            Some((seconds, micros * 1000))
+        };
+        if a[1] != 0 {
+            read_words::<1>(c.mem, a[1])?;
+        }
+        Err(set_time_of_day(time))
+    })())
+}
+
+/// `clock_settime(clock, tp)`: only `CLOCK_REALTIME` can be set, as on
+/// Linux, and the time is then checked as `settimeofday`'s; the other
+/// clocks give `EINVAL` before the time is read.
+fn sys_clock_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        if a[0] as u32 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let [seconds, nanos] = read_words::<2>(c.mem, a[1])?;
+        Err(set_time_of_day(Some((seconds, nanos))))
+    })())
+}
+
+/// The size of Linux's `struct __kernel_timex`.
+const TIMEX_SIZE: usize = 208;
+
+/// Reads the real-time clock's NTP state into `timex`, as Linux's
+/// `do_adjtimex`, after checking its `modes` as `timekeeping_validate_timex`
+/// does: only reads are taken (no mode, or `ADJ_OFFSET_SS_READ`), and the
+/// others give `EPERM` ([`set_time_of_day`]). The state is the one Linux
+/// starts with, as nothing here disciplines the clock and the host's is not
+/// revealed: unsynchronised (`STA_UNSYNC`, so the result is `TIME_ERROR`),
+/// with the errors at `NTP_PHASE_LIMIT`, no offset or frequency correction,
+/// a time constant of 2, a tick of `USER_TICK_USEC`, no PPS and no TAI
+/// offset. The time is the real-time clock's, in microseconds.
+fn read_timex(c: &Context<'_>, timex: &mut [u8; TIMEX_SIZE]) -> Result<u64, Errno> {
+    const ADJ_OFFSET_SINGLESHOT: u32 = 0x0001;
+    const ADJ_FREQUENCY: u32 = 0x0002;
+    const ADJ_SETOFFSET: u32 = 0x0100;
+    const ADJ_OFFSET_READONLY: u32 = 0x2000;
+    const ADJ_ADJTIME: u32 = 0x8000;
+    // Linux's PPM_SCALE: 1000 << (NTP_SCALE_SHIFT - SHIFT_USEC).
+    const PPM_SCALE: i64 = 1000 << 16;
+    let word = |at: usize| i64::from_le_bytes(timex[at..at + 8].try_into().unwrap_or_default());
+    let modes = u32::from_le_bytes(timex[..4].try_into().unwrap_or_default());
+    if modes & ADJ_ADJTIME != 0 {
+        if modes & ADJ_OFFSET_SINGLESHOT == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if modes & ADJ_OFFSET_READONLY == 0 {
+            return Err(Errno::EPERM);
+        }
+    } else if modes != 0 {
+        return Err(Errno::EPERM);
+    }
+    if modes & ADJ_SETOFFSET != 0 {
+        return Err(Errno::EPERM);
+    }
+    let freq = word(16);
+    if modes & ADJ_FREQUENCY != 0 && !(i64::MIN / PPM_SCALE..=i64::MAX / PPM_SCALE).contains(&freq)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let now = c.host.clock(ClockId::Realtime)?;
+    let mut put = |at: usize, value: i64| timex[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    let longs: [(usize, i64); 16] = [
+        (8, 0),           // offset
+        (16, 0),          // freq
+        (24, 16_000_000), // maxerror: NTP_PHASE_LIMIT
+        (32, 16_000_000), // esterror
+        (48, 2),          // constant
+        (56, 1),          // precision
+        (64, 32_768_000), // tolerance: MAXFREQ_SCALED / PPM_SCALE
+        (72, (now / 1_000_000_000) as i64),
+        (80, (now % 1_000_000_000 / 1000) as i64),
+        (88, 10_000), // tick: USER_TICK_USEC
+        (96, 0),      // ppsfreq
+        (104, 0),     // jitter
+        (120, 0),     // stabil
+        (128, 0),     // jitcnt
+        (136, 0),     // calcnt
+        (144, 0),     // errcnt
+    ];
+    for (at, value) in longs {
+        put(at, value);
+    }
+    put(152, 0); // stbcnt
+    timex[40..44].copy_from_slice(&0x40i32.to_le_bytes()); // status: STA_UNSYNC
+    timex[112..116].fill(0); // shift
+    timex[160..164].fill(0); // tai
+    Ok(5) // TIME_ERROR
+}
+
+/// `adjtimex(buf)` ([`read_timex`]). As Linux's, it writes the structure
+/// back whatever the result, so a buffer it cannot write gives `EFAULT`.
+fn sys_adjtimex(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let mut timex = [0u8; TIMEX_SIZE];
+        c.mem
+            .read(GuestAddr(a[0]), &mut timex)
+            .map_err(|_| Errno::EFAULT)?;
+        let result = read_timex(c, &mut timex);
+        c.mem
+            .write(GuestAddr(a[0]), &timex)
+            .map_err(|_| Errno::EFAULT)?;
+        result
+    })())
+}
+
+/// `clock_adjtime(clock, buf)`: the structure is read first, then the
+/// clock looked at. `CLOCK_REALTIME` is [`read_timex`], written back
+/// unless it fails; the other clocks Linux knows give `EOPNOTSUPP`, as do
+/// the CPU clocks of other processes and threads, and a clock file
+/// descriptor (none is a PTP clock here, and Linux's `get_clock_desc` gives
+/// `EINVAL` for a closed one too) and unknown clocks `EINVAL`.
+fn sys_clock_adjtime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome((|| {
+        let mut timex = [0u8; TIMEX_SIZE];
+        c.mem
+            .read(GuestAddr(a[1]), &mut timex)
+            .map_err(|_| Errno::EFAULT)?;
+        match a[0] as u32 as i32 {
+            0 => {}
+            // CLOCKFD.
+            id if id < 0 && id & 7 == 3 => return Err(Errno::EINVAL),
+            id if id < 0 => return Err(Errno::EOPNOTSUPP),
+            1..=9 | 11 => return Err(Errno::EOPNOTSUPP),
+            _ => return Err(Errno::EINVAL),
+        }
+        let result = read_timex(c, &mut timex)?;
+        c.mem
+            .write(GuestAddr(a[1]), &timex)
+            .map_err(|_| Errno::EFAULT)?;
+        Ok(result)
+    })())
+}
+
 /// `time(t)`: the seconds of the real time clock as of the latest tick, as
 /// Linux's `ktime_get_real_seconds` gives the timekeeper's `xtime_sec`
 /// (`CLOCK_REALTIME_COARSE`'s), also at `t` if it is not null.
@@ -1974,6 +2152,8 @@ const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 const MAP_LOCKED: u64 = 0x2000;
 const MAP_POPULATE: u64 = 0x8000;
+const MAP_NORESERVE: u64 = 0x4000;
+const MAP_STACK: u64 = 0x2_0000;
 
 fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (addr, len, prot, flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4] as i32, a[5]);
@@ -2070,7 +2250,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let result = match (&file, &descriptor) {
         (Some(file), Some(d)) if flags & MAP_SHARED != 0 => {
             // The mapping shows the file's page cache.
-            shared_file(c, d, file, len, offset, prot, |pages, may_write| {
+            shared_file(c, d, file, len, offset, prot, |pages, writes| {
                 c.mem.map_backed(
                     placement,
                     len,
@@ -2079,7 +2259,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
                     Backing::Shared {
                         pages,
                         offset,
-                        may_write,
+                        writes,
                     },
                 )
             })
@@ -2106,11 +2286,17 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     };
     match result {
         Ok(a) => {
+            let end = a.0.saturating_add(len.next_multiple_of(4096));
             if flags & MAP_LOCKED != 0
                 && let Some(lock) = lock
             {
-                let end = a.0.saturating_add(len.next_multiple_of(4096));
                 c.mem.lock_new(a, end, lock);
+            }
+            // Overcommit is never strict here, so MAP_NORESERVE always
+            // counts (`do_mmap`).
+            if flags & (MAP_NORESERVE | MAP_STACK) != 0 {
+                c.mem
+                    .flag_new(a, end, flags & MAP_NORESERVE != 0, flags & MAP_STACK != 0);
             }
             // Linux populates a writable private mapping by writing it, which
             // gives it an anon_vma (a core then writes it whole), with
@@ -2236,7 +2422,10 @@ fn shared_file(
     len: u64,
     offset: u64,
     prot: Prot,
-    map: impl FnOnce(&paludarium_mmu::SharedPages, bool) -> Result<GuestAddr, Errno>,
+    map: impl FnOnce(
+        &paludarium_mmu::SharedPages,
+        paludarium_mmu::SharedWrites,
+    ) -> Result<GuestAddr, Errno>,
 ) -> Result<GuestAddr, Errno> {
     let len = GuestAddr(len).page_align_up().ok_or(Errno::ENOMEM)?.0;
     // A memfd's seals stay as they are until the mapping counts among the
@@ -2248,16 +2437,21 @@ fn shared_file(
     if prot.contains(Prot::WRITE) && write_sealed(file.as_ref()) {
         return Err(Errno::EPERM);
     }
-    let may_write = file.flags() & 3 == 2 && !write_sealed(file.as_ref());
+    let writes = match (file.flags() & 3 == 2, write_sealed(file.as_ref())) {
+        (false, _) => paludarium_mmu::SharedWrites::ReadOnly,
+        (true, true) => paludarium_mmu::SharedWrites::Sealed,
+        (true, false) => paludarium_mmu::SharedWrites::Allowed,
+    };
+    let may_write = writes == paludarium_mmu::SharedWrites::Allowed;
     let pages = file_cache(c, d, file)?.map(
         &crate::memfd::pages_source(file),
         crate::files::mapped_path(c, d),
         offset,
         len,
         may_write,
-        memfd.is_some_and(crate::memfd::Memfd::is_secret),
+        crate::memfd::secret_charge(file),
     )?;
-    map(&pages, may_write)
+    map(&pages, writes)
 }
 /// The page cache of the file `d` holds, which keeps its size.
 fn file_cache(
@@ -2521,14 +2715,14 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// `madvise(addr, len, advice)` on `mem`, which `process_madvise` gives
-/// each of its ranges of the caller's own memory too. Implemented are the
-/// access-pattern hints and `MADV_WILLNEED`; `MADV_COLD` and
-/// `MADV_PAGEOUT`, which nothing to reclaim makes hints too; KSM's
-/// `MADV_MERGEABLE` and `MADV_UNMERGEABLE` and THP's `MADV_HUGEPAGE` and
-/// `MADV_NOHUGEPAGE`, which change only flags no page here depends on; the
-/// discards `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` (no VMA is locked
-/// apart) and `MADV_FREE`; and `MADV_POPULATE_READ` and
-/// `MADV_POPULATE_WRITE` ([`populate`]); and the flags `fork` and core
+/// each of its ranges of the caller's own memory too. Implemented are
+/// `MADV_WILLNEED`; `MADV_COLD` and `MADV_PAGEOUT`, which nothing to
+/// reclaim makes hints; the access-pattern hints, KSM's `MADV_MERGEABLE`
+/// and `MADV_UNMERGEABLE` and THP's `MADV_HUGEPAGE` and `MADV_NOHUGEPAGE`,
+/// which change only the flags of the VMAs (`/proc/<pid>/smaps` shows
+/// them), as no page here depends on them; the discards `MADV_DONTNEED`,
+/// `MADV_DONTNEED_LOCKED` (which takes locked VMAs too) and `MADV_FREE`;
+/// and `MADV_POPULATE_READ` and `MADV_POPULATE_WRITE` ([`populate`]); and the flags `fork` and core
 /// dumps look at, `MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK`,
 /// `MADV_KEEPONFORK`, `MADV_DONTDUMP` and `MADV_DODUMP`
 /// ([`AddressSpace::advise_flags`]); and `MADV_REMOVE`, which frees shared
@@ -2586,6 +2780,17 @@ pub(crate) fn advise(
         return mem.guard(GuestAddr(addr), end, false);
     }
     let flag = match advice {
+        0 => Some(paludarium_mmu::FlagAdvice::Read(None)),
+        1 => Some(paludarium_mmu::FlagAdvice::Read(Some(
+            paludarium_mmu::ReadHint::Random,
+        ))),
+        2 => Some(paludarium_mmu::FlagAdvice::Read(Some(
+            paludarium_mmu::ReadHint::Sequential,
+        ))),
+        12 => Some(paludarium_mmu::FlagAdvice::Mergeable(true)),
+        13 => Some(paludarium_mmu::FlagAdvice::Mergeable(false)),
+        14 => Some(paludarium_mmu::FlagAdvice::HugePages(true)),
+        15 => Some(paludarium_mmu::FlagAdvice::HugePages(false)),
         10 => Some(paludarium_mmu::FlagAdvice::DontFork),
         11 => Some(paludarium_mmu::FlagAdvice::DoFork),
         16 => Some(paludarium_mmu::FlagAdvice::DontDump),

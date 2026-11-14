@@ -847,11 +847,17 @@ kernel.
 - `process_mrelease` finds its process as `process_madvise` does (`flags`
   must be 0, then `EBADF`, `ESRCH`); a process that has exited has no
   memory left (`ESRCH`, as a zombie). It succeeds when that memory is on
-  its way to be freed: the process is dying (a SIGKILL was sent to it, or
-  it has begun to exit, and it is not writing a core dump), and so is
+  its way to be freed: the process is dying (a fatal signal was sent to
+  it, or it has begun to exit, and it is not writing a core dump), and so is
   every other process that runs in its memory. Otherwise it gives
-  `EINVAL`, as for the caller itself. The memory goes as the process's
-  last thread ends, so there is nothing more to release early.
+  `EINVAL`, as for the caller itself. A signal is fatal as it is sent, as
+  Linux's `complete_signal` starts the group exit then, when it is SIGKILL,
+  or when its action is the default one, which ends the process without a
+  core (not SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV,
+  SIGXCPU, SIGXFSZ or SIGSYS, which their taker dumps), the thread it goes
+  to (or one of the process's) does not block it, and the process is not
+  stopped. The memory goes as the process's last thread ends, so there is
+  nothing more to release early.
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
   and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed

@@ -9789,6 +9789,36 @@ static void admin_reboot_in_namespace(const char *name, long cmd, int by_init) {
     if (!WIFEXITED(status) || WEXITSTATUS(status))
         printf("reboot-%s: outer=%d\n", name, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 }
+static void admin_namespace_cases(void) {
+    /* In a PID namespace of its own user namespace, which gives
+     * CAP_SYS_BOOT there. The case makes them as root, as user-namespaces
+     * does: Ubuntu's AppArmor gives a user namespace an unprivileged user
+     * makes no capabilities (kernel.apparmor_restrict_unprivileged_userns). */
+    fflush(stdout);
+    pid_t outer = fork();
+    if (outer == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWPID)) _exit(90);
+        pid_t init = fork();
+        if (init == 0) {
+            printf("ns-bad-magic=%ld\n", pn(syscall(169, ADMIN_MAGIC1, 1L, 0x01234567L, NULL)));
+            printf("ns-cad-on=%ld\n", pn(syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, 0x89ABCDEFL, NULL)));
+            printf("ns-kexec=%ld\n", pn(syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, 0x45584543L, NULL)));
+            fflush(stdout);
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(init, &status, 0);
+        fflush(stdout);
+        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 99);
+    }
+    int status = 0;
+    waitpid(outer, &status, 0);
+    printf("ns-checks=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    admin_reboot_in_namespace("halt-by-child", 0xCDEF0123L, 0);
+    admin_reboot_in_namespace("power-off-by-init", 0x4321FEDCL, 1);
+    admin_reboot_in_namespace("restart-by-init", 0x01234567L, 1);
+    admin_reboot_in_namespace("restart2-by-child", 0xA1B2C3D4L, 0);
+}
 static int admin_worker(void) {
     if (geteuid() == 0 &&
         (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
@@ -9817,35 +9847,10 @@ static int admin_worker(void) {
     printf("quotactl-fd-type=%ld\n", pn(syscall(443, (long)fd, sync | 3, 0L, buf)));
     close(fd);
 
-    /* In a PID namespace of its own user namespace, which gives
-     * CAP_SYS_BOOT there. */
-    fflush(stdout);
-    pid_t outer = fork();
-    if (outer == 0) {
-        if (unshare(CLONE_NEWUSER | CLONE_NEWPID)) _exit(90);
-        pid_t init = fork();
-        if (init == 0) {
-            printf("ns-bad-magic=%ld\n", pn(syscall(169, ADMIN_MAGIC1, 1L, 0x01234567L, NULL)));
-            printf("ns-cad-on=%ld\n", pn(syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, 0x89ABCDEFL, NULL)));
-            printf("ns-kexec=%ld\n", pn(syscall(169, ADMIN_MAGIC1, ADMIN_MAGIC2, 0x45584543L, NULL)));
-            fflush(stdout);
-            _exit(0);
-        }
-        int status = 0;
-        waitpid(init, &status, 0);
-        fflush(stdout);
-        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 99);
-    }
-    int status = 0;
-    waitpid(outer, &status, 0);
-    printf("ns-checks=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-    admin_reboot_in_namespace("halt-by-child", 0xCDEF0123L, 0);
-    admin_reboot_in_namespace("power-off-by-init", 0x4321FEDCL, 1);
-    admin_reboot_in_namespace("restart-by-init", 0x01234567L, 1);
-    admin_reboot_in_namespace("restart2-by-child", 0xA1B2C3D4L, 0);
     return 0;
 }
 static int admin_case(void) {
+    admin_namespace_cases();
     fflush(stdout);
     pid_t worker = fork();
     if (worker == 0) {

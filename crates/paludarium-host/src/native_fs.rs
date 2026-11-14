@@ -77,25 +77,35 @@ fn made(key: Key, parent: Option<&FileStat>) {
         None => owners.remove(&key),
     };
 }
-/// The [`Key`] of a host file's metadata.
-fn std_key(m: &std::fs::Metadata) -> Result<Key, Errno> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok((m.dev(), m.ino()))
-    }
+/// The [`Key`] of an open host file.
+fn file_key(file: &std::fs::File) -> Result<Key, Errno> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        Ok((0, m.file_index().ok_or(Errno::EIO)?))
+        cap_key(&windows_metadata(file)?)
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(windows))]
     {
-        let _ = m;
-        Ok((0, 0))
+        let m = file.metadata().map_err(err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok((m.dev(), m.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = m;
+            Ok((0, 0))
+        }
     }
 }
-/// [`std_key`] of metadata read through the retained directory.
+/// An open file's metadata on Windows, read from its handle. std's file
+/// index and link count (`windows_by_handle`) are unstable; cap-std reads
+/// them with `GetFileInformationByHandle`.
+#[cfg(windows)]
+fn windows_metadata(file: &std::fs::File) -> Result<cap_std::fs::Metadata, Errno> {
+    cap_std::fs::Metadata::from_file(file).map_err(err)
+}
+/// [`file_key`] of metadata read through the retained directory.
 fn cap_key(m: &cap_std::fs::Metadata) -> Result<Key, Errno> {
     #[cfg(unix)]
     {
@@ -104,8 +114,10 @@ fn cap_key(m: &cap_std::fs::Metadata) -> Result<Key, Errno> {
     }
     #[cfg(windows)]
     {
-        use cap_std::fs::MetadataExt;
-        Ok((0, m.file_index().ok_or(Errno::EIO)?))
+        // The metadata of a path and of an open file is read from a handle
+        // on Windows, so cap-std has the file index.
+        use cap_fs_ext::MetadataExt;
+        Ok((0, m.ino()))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -224,6 +236,7 @@ fn mtime_ns(time: std::time::SystemTime) -> Result<i128, Errno> {
             .ok_or(Errno(75)),
     }
 }
+#[cfg(not(windows))]
 fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
     let mtime_ns = mtime_ns(m.modified().map_err(|_| Errno::EIO)?)?;
     #[cfg(unix)]
@@ -248,15 +261,6 @@ fn stat(m: std::fs::Metadata) -> Result<FileStat, Errno> {
     }
     #[cfg(not(unix))]
     {
-        #[cfg(windows)]
-        let (inode, links) = {
-            use std::os::windows::fs::MetadataExt;
-            (
-                m.file_index().ok_or(Errno::EIO)?,
-                u64::from(m.number_of_links().ok_or(Errno::EIO)?),
-            )
-        };
-        #[cfg(not(windows))]
         let (inode, links) = (0, 1);
         let (uid, gid) = owner_of((0, inode));
         Ok(FileStat {
@@ -587,13 +591,11 @@ impl FileHandle for NativeFile {
             .map_err(err)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        let metadata = self
-            .file
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .metadata()
-            .map_err(err)?;
-        stat(metadata)
+        let file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(windows)]
+        return cap_stat(windows_metadata(&file)?);
+        #[cfg(not(windows))]
+        stat(file.metadata().map_err(err)?)
     }
     fn zero_range(&self, offset: u64, len: u64) -> Result<(), Errno> {
         self.write_in_place(offset, len, None)
@@ -631,13 +633,8 @@ impl FileHandle for NativeFile {
         return read_only::set(&file, mode).map_err(err);
     }
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
-        let metadata = self
-            .file
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .metadata()
-            .map_err(err)?;
-        record_owner(std_key(&metadata)?, uid, gid);
+        let key = file_key(&self.file.lock().unwrap_or_else(PoisonError::into_inner))?;
+        record_owner(key, uid, gid);
         Ok(())
     }
     fn set_times(&self, atime: Option<i128>, mtime: Option<i128>) -> Result<(), Errno> {
@@ -801,7 +798,7 @@ impl HostFs for NativeFs {
             return Err(Errno::ENOTDIR);
         }
         if !existed {
-            self.made_key(std_key(&file.metadata().map_err(err)?)?, p);
+            self.made_key(file_key(&file)?, p);
         }
         Ok(Arc::new(NativeFile {
             file: Mutex::new(file),
@@ -1165,11 +1162,9 @@ fn cap_stat(m: cap_std::fs::Metadata) -> Result<FileStat, Errno> {
     {
         #[cfg(windows)]
         let (inode, links) = {
-            use cap_std::fs::MetadataExt;
-            (
-                m.file_index().ok_or(Errno::EIO)?,
-                u64::from(m.number_of_links().ok_or(Errno::EIO)?),
-            )
+            // Read from a handle, as in `cap_key`.
+            use cap_fs_ext::MetadataExt;
+            (m.ino(), m.nlink())
         };
         #[cfg(not(windows))]
         let (inode, links) = (0, 1);
@@ -1811,7 +1806,8 @@ mod files_tests {
     #[cfg(windows)]
     #[test]
     fn native_windows_recreated_symlink_has_distinct_handle_identity() {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::fs::OpenOptionsExt;
+        let index = |file: &std::fs::File| cap_key(&windows_metadata(file).unwrap()).unwrap().1;
         let x = Fixture::new();
         let outside = x.base.join("outside");
         std::fs::create_dir(&outside).unwrap();
@@ -1827,7 +1823,7 @@ mod files_tests {
             .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
             .open(&link)
             .unwrap();
-        let old_id = handle.metadata().unwrap().file_index().unwrap();
+        let old_id = index(&handle);
         std::fs::remove_dir(&link).unwrap();
         std::os::windows::fs::symlink_dir(&outside, &link).unwrap();
         let replacement = std::fs::OpenOptions::new()
@@ -1836,11 +1832,11 @@ mod files_tests {
             .custom_flags(0x0220_0000)
             .open(&link)
             .unwrap();
-        let new_id = replacement.metadata().unwrap().file_index().unwrap();
+        let new_id = index(&replacement);
         assert_ne!(old_id, new_id, "old handle must not alias replacement link");
-        assert_eq!(handle.metadata().unwrap().file_index(), Some(old_id));
+        assert_eq!(index(&handle), old_id);
         drop(handle);
-        assert_eq!(replacement.metadata().unwrap().file_index(), Some(new_id));
+        assert_eq!(index(&replacement), new_id);
         assert_eq!(std::fs::read_link(&link).unwrap(), outside);
         assert_eq!(std::fs::read(link.join("sentinel")).unwrap(), b"outside");
         drop(replacement);

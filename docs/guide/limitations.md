@@ -466,7 +466,7 @@ verified.
   `CAP_SETUID` and `CAP_SETGID` it needs in the parent; and the `/proc` files
   of a process that is not dumpable belong to root of the first namespace,
   where Linux gives them to root of the process's own when it maps one.
-  There are no file capabilities, in a user namespace either. A network
+  `execve` honours no file capabilities, in a user namespace either. A network
   namespace has no interface but its loopback (no `veth` pairs to reach
   another), and the interface requests and netlink change no other flag
   than `IFF_UP`. The first namespace shows `lo` alone too, where Linux

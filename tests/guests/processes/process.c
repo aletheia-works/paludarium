@@ -14712,6 +14712,17 @@ int main(int argc, char **argv) {
             struct mctp_tag_ctl unowned = {.peer = 8, .tag = 0x10};
             printf("drop unowned=%ld\n", netns_result(ioctl(c, 0x89e1, &unowned)));
             printf("drop2=%ld\n", netns_result(ioctl(c, 0x89e3, &v2)));
+            /* A tag of MCTP_NET_ANY is that network's, which no message is
+               in: a send with it finds none, and only net 0 drops it. */
+            struct mctp_tag_ctl2 any_net = {.net = 0, .peer = 8};
+            printf("alloc2 net 0=%ld", netns_result(ioctl(c, 0x89e2, &any_net)));
+            printf(" tag=%#x\n", any_net.tag);
+            name = mctp_name(0, 8, 5, any_net.tag);
+            mctp_send(c, &name, sizeof name, 3, "net 0 preallocated");
+            any_net.net = 1;
+            printf("drop2 net 1=%ld\n", netns_result(ioctl(c, 0x89e3, &any_net)));
+            any_net.net = 0;
+            printf("drop2 net 0=%ld\n", netns_result(ioctl(c, 0x89e3, &any_net)));
             /* Closed, its bind goes, and any's takes what it took. */
             close(b);
             name = mctp_name(0, 9, 1, 8);

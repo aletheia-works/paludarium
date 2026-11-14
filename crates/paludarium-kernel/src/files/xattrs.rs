@@ -107,7 +107,7 @@ impl Target {
         // A walk leaves out the last name's status when it does not need it.
         let stat = match walked {
             Some(stat) => stat,
-            None => c.files.fs.metadata(&path, follow)?,
+            None => c.files.fs().metadata(&path, follow)?,
         };
         if super::in_proc(&path) {
             return Ok(Self::Generated { stat });
@@ -134,7 +134,7 @@ impl Target {
         f: &mut dyn FnMut(&mut u32),
     ) -> Result<(), Errno> {
         match self {
-            Self::Path { path, follow, .. } => c.files.fs.with_attributes(path, *follow, f),
+            Self::Path { path, follow, .. } => c.files.fs().with_attributes(path, *follow, f),
             Self::File { file, .. } => file.with_attributes(f),
             Self::Generated { .. } => Err(Errno::EOPNOTSUPP),
         }
@@ -142,7 +142,7 @@ impl Target {
     /// Runs `f` on the attributes; `EOPNOTSUPP` if it holds none.
     fn with(&self, c: &Context<'_>, f: &mut dyn FnMut(&mut Xattrs)) -> Result<(), Errno> {
         match self {
-            Self::Path { path, follow, .. } => c.files.fs.with_xattrs(path, *follow, f),
+            Self::Path { path, follow, .. } => c.files.fs().with_xattrs(path, *follow, f),
             Self::File { file, .. } => file.with_xattrs(f),
             Self::Generated { .. } => Err(Errno::EOPNOTSUPP),
         }

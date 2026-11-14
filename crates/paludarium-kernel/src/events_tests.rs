@@ -2981,7 +2981,7 @@ fn a_socket_file_belongs_to_its_binder_who_needs_the_directory() {
         f.mem.write(GuestAddr(DATA + 0x100), &raw).unwrap();
         raw.len() as u64
     };
-    let fs = std::sync::Arc::clone(&f.kernel.files.fs);
+    let fs = std::sync::Arc::clone(&f.kernel.files.fs());
     fs.set_mode(b"/", 0o777).unwrap();
     leave_root(&mut f);
     let socket = f.ret(41, [1, 1, 0, 0, 0, 0]);
@@ -3008,7 +3008,7 @@ fn a_socket_file_belongs_to_its_binder_who_needs_the_directory() {
 #[test]
 fn connecting_needs_permission_to_write_what_the_path_names() {
     let mut f = Fixture::new();
-    let fs = std::sync::Arc::clone(&f.kernel.files.fs);
+    let fs = std::sync::Arc::clone(&f.kernel.files.fs());
     let address = |f: &mut Fixture, name: &[u8]| {
         let mut raw = vec![1, 0];
         raw.extend_from_slice(name);
@@ -3040,13 +3040,13 @@ fn connecting_needs_permission_to_write_what_the_path_names() {
 fn set_id_file(f: &mut Fixture, mode: u32, gid: u32) -> u64 {
     f.mem.write(GuestAddr(DATA + 0x300), b"/f\0").unwrap();
     let fd = f.ret(2, [DATA + 0x300, 0o102, 0o777, 0, 0, 0]);
-    let fs = &f.kernel.files.fs;
+    let fs = &f.kernel.files.fs();
     fs.set_mode(b"/f", mode).unwrap();
     fs.set_owner(b"/f", true, Some(2000), Some(gid)).unwrap();
     fd
 }
 fn file_mode(f: &Fixture) -> u32 {
-    f.kernel.files.fs.metadata(b"/f", false).unwrap().mode & 0o7777
+    f.kernel.files.fs().metadata(b"/f", false).unwrap().mode & 0o7777
 }
 #[test]
 fn what_a_write_takes_from_a_file_depends_on_its_bits_and_group() {
@@ -3119,7 +3119,7 @@ fn every_way_of_changing_a_file_takes_its_set_id_bits() {
     ];
     for (name, way) in ways {
         let mut f = Fixture::new();
-        f.kernel.files.fs.set_mode(b"/", 0o777).unwrap();
+        f.kernel.files.fs().set_mode(b"/", 0o777).unwrap();
         let fd = set_id_file(&mut f, 0o6755, 2100);
         leave_root(&mut f);
         way(&mut f, fd);

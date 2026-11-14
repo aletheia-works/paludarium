@@ -1358,10 +1358,10 @@ mod signal_permissions {
     fn exec_records_the_ids_it_gives() {
         let (mut k, mut t, m) = exec_setup();
         k.files
-            .fs
+            .fs()
             .set_owner(b"/child", true, Some(3000), None)
             .unwrap();
-        k.files.fs.set_mode(b"/child", 0o4755).unwrap();
+        k.files.fs().set_mode(b"/child", 0o4755).unwrap();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         let child = u64::from(ct.tid);
         become_user(&mut c, &mut ct, &cm, 2000);
@@ -1749,10 +1749,10 @@ mod exec {
         assert_eq!(run(&mut k, &mut t, &m, b"/empty"), fail(13));
         assert_eq!(run(&mut k, &mut t, &m, b"/dir"), fail(13));
         // Not executable, even for root.
-        k.files.fs.set_mode(b"/ld", 0o644).unwrap();
+        k.files.fs().set_mode(b"/ld", 0o644).unwrap();
         assert_eq!(run(&mut k, &mut t, &m, b"/ok"), fail(13));
         // Executable but not readable: it runs, undumpable.
-        k.files.fs.set_mode(b"/ld", 0o111).unwrap();
+        k.files.fs().set_mode(b"/ld", 0o111).unwrap();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         let user = [2000, 2000, 2000, 0, 0, 0];
         assert_eq!(syscall(&mut c, &mut ct, &cm, 117, user), 0);
@@ -1760,10 +1760,10 @@ mod exec {
         assert_eq!(syscall(&mut c, &mut ct, &cm, 157, [3, 0, 0, 0, 0, 0]), 0);
         // Readable: dumpable, and its set-ID bits do not count.
         k.files
-            .fs
+            .fs()
             .set_owner(b"/ld", true, Some(3000), None)
             .unwrap();
-        k.files.fs.set_mode(b"/ld", 0o4755).unwrap();
+        k.files.fs().set_mode(b"/ld", 0o4755).unwrap();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         assert_eq!(syscall(&mut c, &mut ct, &cm, 117, user), 0);
         assert_eq!(run(&mut c, &mut ct, &cm, b"/ok"), 0);
@@ -1833,18 +1833,21 @@ mod exec {
     #[test]
     fn the_interpreters_set_id_bits_count_not_the_scripts() {
         let (mut k, mut t, m) = with_scripts(&[("/s", b"#!/child\n")]);
-        k.files.fs.set_owner(b"/s", true, Some(3000), None).unwrap();
-        k.files.fs.set_mode(b"/s", 0o4755).unwrap();
+        k.files
+            .fs()
+            .set_owner(b"/s", true, Some(3000), None)
+            .unwrap();
+        k.files.fs().set_mode(b"/s", 0o4755).unwrap();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         let user = [2000, 2000, 2000, 0, 0, 0];
         assert_eq!(syscall(&mut c, &mut ct, &cm, 117, user), 0);
         assert_eq!(run(&mut c, &mut ct, &cm, b"/s"), 0);
         assert_eq!(ct.state.credentials.euid, 2000);
         k.files
-            .fs
+            .fs()
             .set_owner(b"/child", true, Some(3000), None)
             .unwrap();
-        k.files.fs.set_mode(b"/child", 0o4755).unwrap();
+        k.files.fs().set_mode(b"/child", 0o4755).unwrap();
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         let user = [2000, 2000, 2000, 0, 0, 0];
         assert_eq!(syscall(&mut c, &mut ct, &cm, 117, user), 0);
@@ -1943,10 +1946,10 @@ mod exec {
     fn a_set_user_id_program_runs_as_its_owner_undumpable_on_a_lower_stack_limit() {
         let (mut k, mut t, m) = exec_setup();
         k.files
-            .fs
+            .fs()
             .set_owner(b"/child", true, Some(1001), None)
             .unwrap();
-        k.files.fs.set_mode(b"/child", 0o4755).unwrap();
+        k.files.fs().set_mode(b"/child", 0o4755).unwrap();
         // RLIMIT_STACK up to infinity, then a user other than root.
         m.write_u64(GuestAddr(DATA + 64), u64::MAX).unwrap();
         m.write_u64(GuestAddr(DATA + 72), u64::MAX).unwrap();
@@ -3228,7 +3231,7 @@ mod core_dumps {
         m.read_u64(GuestAddr(DATA)).unwrap() as u32
     }
     fn core(k: &Kernel) -> Option<Vec<u8>> {
-        let file = k.files.fs.open(b"/core", 0, 0).ok()?;
+        let file = k.files.fs().open(b"/core", 0, 0).ok()?;
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 4096];
         loop {
@@ -3288,7 +3291,7 @@ mod core_dumps {
         assert_eq!(u16_at(&core, 16), 4); // ET_CORE
         assert_eq!(u16_at(&core, 18), 62); // EM_X86_64
         assert_eq!(
-            k.files.fs.metadata(b"/core", false).unwrap().mode & 0o777,
+            k.files.fs().metadata(b"/core", false).unwrap().mode & 0o777,
             0o600
         );
         let segments = segments(&core);
@@ -3322,10 +3325,10 @@ mod core_dumps {
     #[test]
     fn a_core_belongs_to_the_filesystem_ids_and_names_the_real_ones() {
         let (mut k, mut t, m) = setup();
-        k.files.fs.set_mode(b"/", 0o777).unwrap();
+        k.files.fs().set_mode(b"/", 0o777).unwrap();
         let pid = end_as_user(&mut k, &mut t, &m);
         assert_eq!(wait_status(&mut k, &mut t, &m, pid), 11 | 0x80);
-        let stat = k.files.fs.metadata(b"/core", false).unwrap();
+        let stat = k.files.fs().metadata(b"/core", false).unwrap();
         assert_eq!([stat.uid, stat.gid], [2000, 2100]);
         let core = core(&k).expect("a core");
         let (_, offset, _, size) = segments(&core)
@@ -3351,14 +3354,14 @@ mod core_dumps {
     fn no_core_where_its_user_may_not_write_or_replace_it() {
         // A directory it may not write.
         let (mut k, mut t, m) = setup();
-        k.files.fs.set_mode(b"/", 0o755).unwrap();
+        k.files.fs().set_mode(b"/", 0o755).unwrap();
         let pid = end_as_user(&mut k, &mut t, &m);
         assert_eq!(wait_status(&mut k, &mut t, &m, pid), 11);
         assert!(core(&k).is_none());
         // Root's old core in a sticky directory stays.
         let (mut k, mut t, m) = setup();
-        k.files.fs.set_mode(b"/", 0o1777).unwrap();
-        k.files.fs.open(b"/core", 0o101, 0o644).unwrap();
+        k.files.fs().set_mode(b"/", 0o1777).unwrap();
+        k.files.fs().open(b"/core", 0o101, 0o644).unwrap();
         let pid = end_as_user(&mut k, &mut t, &m);
         assert_eq!(wait_status(&mut k, &mut t, &m, pid), 11);
         assert_eq!(core(&k).as_deref(), Some(&[][..]));
@@ -3405,7 +3408,7 @@ mod core_dumps {
     #[test]
     fn an_old_core_is_replaced() {
         let (mut k, mut t, m) = setup();
-        let old = k.files.fs.open(b"/core", 0o101, 0o644).unwrap();
+        let old = k.files.fs().open(b"/core", 0o101, 0o644).unwrap();
         assert_eq!(old.write(b"old").unwrap(), 3);
         let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
         core_limit(&mut c, &mut ct, &cm, u64::MAX);
@@ -3413,7 +3416,7 @@ mod core_dumps {
         assert_eq!(wait_status(&mut k, &mut t, &m, ct.tid), 11 | 0x80);
         assert!(core(&k).unwrap().starts_with(b"\x7fELF"));
         assert_eq!(
-            k.files.fs.metadata(b"/core", false).unwrap().mode & 0o777,
+            k.files.fs().metadata(b"/core", false).unwrap().mode & 0o777,
             0o600
         );
     }

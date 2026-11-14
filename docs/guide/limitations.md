@@ -66,6 +66,16 @@ verified.
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is not
   seen. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
   used.
+- **Roots of their own, in part**: `chroot` into the generated `/proc` or
+  `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
+  root. As `mount` is not implemented, nothing can be mounted on the new
+  root's `/proc` or `/dev`, so a program there finds only the files the
+  directory holds. In a path that climbs above the root as written, `..` is
+  taken from the names as written, where Linux takes a `..` after a
+  symbolic link from the link's target. `/proc` shows the paths of
+  processes' files from the machine's root, where Linux shows them from the
+  reader's root, and a process has no `/proc/<pid>/root`. `fchroot`, new in
+  Linux master, is not there (`ENOSYS`).
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
   no device for it to stand for. A FIFO in a mounted host directory can be

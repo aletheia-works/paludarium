@@ -4040,7 +4040,7 @@ impl Kernel {
                 // removed file walks up from where it was, the file itself
                 // still the object it was (a memfd is in no hierarchy).
                 if let Some(path) = &removed {
-                    let device = crate::page_cache::mount_device(&self.files.fs.mounts(), path);
+                    let device = crate::page_cache::mount_device(&self.files.fs().mounts(), path);
                     let files = &self.files;
                     crate::landlock::check_with(
                         &creds.landlock,
@@ -4058,13 +4058,13 @@ impl Kernel {
                 // A memfd is on a device of its own; a removed file still on
                 // its mount's.
                 let device = match &removed {
-                    Some(path) => crate::page_cache::mount_device(&self.files.fs.mounts(), path),
+                    Some(path) => crate::page_cache::mount_device(&self.files.fs().mounts(), path),
                     None => crate::memfd::DEVICE,
                 };
                 // `do_open_execat` opens the descriptor's file again.
                 opens.0.push(crate::inotify::Closing::of_handle(
                     &self.files.caches,
-                    &self.files.fs,
+                    &self.files.fs(),
                     &file,
                     device,
                     &stat,
@@ -4302,7 +4302,7 @@ impl Kernel {
                 Arc::new((closing, self.files.interpreter_keep(&path)));
             Ok((path, Some(keep)))
         };
-        let fs = &*self.files.fs;
+        let fs = &*self.files.fs();
         let image = crate::inotify::unopened(|| match &held {
             Some((bytes, name)) => paludarium_loader::load_file_with(
                 fs,
@@ -4646,11 +4646,11 @@ fn exec_opened(
         return None;
     }
     let path = crate::files::resolved(files, path)?;
-    let node = files.fs.metadata(&path, false).ok()?;
-    let device = crate::page_cache::mount_device(&files.fs.mounts(), &path);
+    let node = files.fs().metadata(&path, false).ok()?;
+    let device = crate::page_cache::mount_device(&files.fs().mounts(), &path);
     Some(crate::inotify::Closing::open(
         &files.caches,
-        &files.fs,
+        &files.fs(),
         &path,
         device,
         &node,
@@ -4667,14 +4667,14 @@ pub(crate) fn deny_writes(
     files: &crate::files::Files,
     path: &[u8],
 ) -> Result<Option<crate::page_cache::WriteAccess>, Errno> {
-    let Ok(stat) = files.fs.metadata(path, true) else {
+    let Ok(stat) = files.fs().metadata(path, true) else {
         return Ok(None);
     };
     if stat.mode & 0o170000 != 0o100000 {
         return Ok(None);
     }
     let key = (
-        crate::page_cache::mount_device(&files.fs.mounts(), path),
+        crate::page_cache::mount_device(&files.fs().mounts(), path),
         stat.inode,
     );
     files.caches.deny_write_access(key).map(Some)
@@ -4717,7 +4717,7 @@ const SCRIPT_HEAD: usize = 256;
 /// The first [`SCRIPT_HEAD`] bytes of the file at `path`, zero after its end,
 /// or `None` when it cannot be read, which loading it then reports.
 fn read_head(files: &crate::files::Files, path: &[u8]) -> Option<[u8; SCRIPT_HEAD]> {
-    let file = crate::inotify::unnoticed(|| files.fs.open(path, 0, 0)).ok()?;
+    let file = crate::inotify::unnoticed(|| files.fs().open(path, 0, 0)).ok()?;
     let mut head = [0; SCRIPT_HEAD];
     let mut at = 0;
     while at < SCRIPT_HEAD {

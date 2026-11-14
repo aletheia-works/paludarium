@@ -175,6 +175,7 @@ NAMES = {
     158: "arch_prctl",
     159: "adjtimex",
     160: "setrlimit",
+    161: "chroot",
     162: "sync",
     163: "acct",
     164: "settimeofday",

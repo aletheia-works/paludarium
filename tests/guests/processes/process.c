@@ -7590,6 +7590,155 @@ static int time_set_case(void) {
     return 0;
 }
 
+/* chroot: an unprivileged caller's errors in Linux's order, then a root of
+   its own in a new user namespace, which gives CAP_SYS_CHROOT. */
+static char cr_base[] = "/tmp/chroot-XXXXXX";
+static long cr_call(const char *p) { return syscall(SYS_chroot, p) ? -errno : 0; }
+static void cr_put(const char *dir, const char *name, const char *text) {
+    char path[256];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        if (write(fd, text, strlen(text)) < 0) perror("write");
+        close(fd);
+    }
+}
+static void cr_read(const char *label, const char *path) {
+    char buf[16] = {0};
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("%s: errno=%d\n", label, errno);
+        return;
+    }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    printf("%s: %.*s\n", label, (int)(n > 0 ? n : 0), buf);
+}
+/* The working directory, with the random base shown as BASE: the raw
+   call, as libc's getcwd turns "(unreachable)" into ENOENT. */
+static void cr_cwd(const char *label) {
+    char buf[512];
+    if (syscall(SYS_getcwd, buf, sizeof buf) < 0) {
+        printf("%s cwd: errno=%d\n", label, errno);
+        return;
+    }
+    char *at = strstr(buf, cr_base);
+    if (at)
+        printf("%s cwd: %.*sBASE%s\n", label, (int)(at - buf), buf, at + strlen(cr_base));
+    else
+        printf("%s cwd: %s\n", label, buf);
+}
+static int chroot_exec_case(void) {
+    cr_cwd("exec");
+    cr_read("exec /f", "/f");
+    cr_read("exec ../f", "../f");
+    printf("exec /proc=%d\n", access("/proc/self", F_OK) ? errno : 0);
+    return 0;
+}
+static int chroot_case(const char *self) {
+    if (!mkdtemp(cr_base)) return 93;
+    chmod(cr_base, 0755);
+    char jail[256], path[256];
+    snprintf(jail, sizeof jail, "%s/jail", cr_base);
+    mkdir(jail, 0755);
+    const char *dirs[] = {"d", "d/e", "locked"};
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "%s/%s", jail, dirs[i]);
+        mkdir(path, i == 2 ? 0600 : 0755);
+    }
+    cr_put(jail, "f", "in");
+    cr_put(cr_base, "f", "out");
+    snprintf(path, sizeof path, "%s/d/abs", jail);
+    symlink("/f", path);
+    snprintf(path, sizeof path, "%s/d/up", jail);
+    symlink("../../../f", path);
+    /* The program itself, to run under the new root. */
+    int in = open(self, O_RDONLY);
+    snprintf(path, sizeof path, "%s/self", jail);
+    int out = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    char chunk[65536];
+    ssize_t n;
+    while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
+        if (write(out, chunk, n) != n) break;
+    close(in);
+    close(out);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (geteuid() == 0 &&
+            (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)))
+            _exit(1);
+        char file[256], locked[256];
+        snprintf(file, sizeof file, "%s/f", cr_base);
+        snprintf(locked, sizeof locked, "%s/locked/x", jail);
+        printf("unprivileged missing=%ld notdir=%ld fault=%ld empty=%ld search=%ld\n",
+               cr_call("/nonexistent/x"), cr_call(file), syscall(SYS_chroot, 8L) ? -errno : 0L,
+               cr_call(""), cr_call(locked));
+        snprintf(locked, sizeof locked, "%s/locked", jail);
+        printf("unprivileged no-exec=%ld eperm=%ld\n", cr_call(locked), cr_call(jail));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("unprivileged status=%d\n", reaped(child));
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
+        if (chdir(cr_base)) _exit(91);
+        printf("chroot=%ld\n", cr_call(jail));
+        cr_cwd("outside");
+        cr_read("/f", "/f");
+        cr_read("/../../f", "/../../f");
+        cr_read("/d/abs", "/d/abs");
+        cr_read("/d/up", "/d/up");
+        cr_read("/d/e/../../f", "/d/e/../../f");
+        cr_read("f from outside", "f");
+        cr_read("jail/../f from outside", "jail/../f");
+        printf("/proc=%d /tmp=%d\n", access("/proc/self", F_OK) ? errno : 0,
+               access("/tmp", F_OK) ? errno : 0);
+        char link[64] = {0};
+        printf("readlink /d/abs=%.*s\n", (int)readlink("/d/abs", link, sizeof link - 1), link);
+        if (chdir("/")) _exit(92);
+        cr_cwd("root");
+        cr_read("../f at root", "../f");
+        int d = open("/d", O_RDONLY | O_DIRECTORY);
+        if (d < 0 || fchdir(d)) _exit(93);
+        close(d);
+        cr_cwd("fchdir");
+        fflush(stdout);
+        pid_t runner = fork();
+        if (runner == 0) {
+            char *args[] = {"x", "chroot-exec", "/self", NULL};
+            execv("/self", args);
+            printf("exec errno=%d\n", errno);
+            _exit(98);
+        }
+        printf("exec status=%d\n", reaped(runner));
+        printf("nested=%ld\n", cr_call("/d"));
+        cr_cwd("nested");
+        cr_read("nested /abs", "/abs");
+        cr_read("nested /../f", "/../f");
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("rooted status=%d\n", reaped(child));
+    const char *names[] = {"self", "f", "d/abs", "d/up"};
+    for (unsigned i = 0; i < 4; i++) {
+        snprintf(path, sizeof path, "%s/%s", jail, names[i]);
+        unlink(path);
+    }
+    const char *gone[] = {"d/e", "d", "locked"};
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "%s/%s", jail, gone[i]);
+        rmdir(path);
+    }
+    rmdir(jail);
+    snprintf(path, sizeof path, "%s/f", cr_base);
+    unlink(path);
+    printf("cleaned=%d\n", rmdir(cr_base) == 0);
+    return 0;
+}
+
 /* modify_ldt: Linux gives its int result as an unsigned int, so errors come
    back as large positive numbers, not -1 with errno. */
 static long ldt_call(long func, void *ptr, long count) {
@@ -23129,6 +23278,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "rlimit-cpu")) return rlimit_cpu_case();
     if (!strcmp(mode, "cpu-timer")) return cpu_timer_case();
     if (!strcmp(mode, "time-set")) return time_set_case();
+    if (!strcmp(mode, "chroot")) return chroot_case(self);
+    if (!strcmp(mode, "chroot-exec")) return chroot_exec_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

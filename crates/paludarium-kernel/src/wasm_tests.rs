@@ -7,7 +7,7 @@ fn fixture() -> Files {
     fs.mkdir(b"/app", 0o755).unwrap();
     fs.open(b"/file", 66, 0o644).unwrap();
     let mut files = Files::default();
-    files.fs = Arc::new(fs);
+    files.set_file_system(Arc::new(fs));
     files
 }
 #[test]
@@ -43,6 +43,6 @@ fn cwd_dot_components() {
 #[test]
 fn cwd_symlink_directory() {
     let mut files = fixture();
-    files.fs.symlink(b"/app", b"/link").unwrap();
+    files.fs().symlink(b"/app", b"/link").unwrap();
     assert!(files.set_current_directory(b"/link").is_ok());
 }

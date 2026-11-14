@@ -369,7 +369,7 @@ pub(crate) fn find(
     if name[0] != 0 {
         crate::permissions::connect(c.files, &c.process.credentials, &path_of(name))?;
         let path = c.files.exec_path(path_of(name))?;
-        let stat = c.files.fs.metadata(&path, true)?;
+        let stat = c.files.fs().metadata(&path, true)?;
         if stat.mode & 0o170000 != 0o140000 {
             return Err(ECONNREFUSED);
         }
@@ -412,7 +412,7 @@ fn path_of(name: &[u8]) -> Vec<u8> {
 }
 /// The socket file at `path` with inode `inode`, as [`Names`] keys it.
 fn inode(c: &Context<'_>, path: &[u8], inode: u64) -> Inode {
-    let mounts = c.files.fs.mounts();
+    let mounts = c.files.fs().mounts();
     (crate::page_cache::mount_device(&mounts, path), inode)
 }
 
@@ -516,12 +516,12 @@ impl UnixSocket {
         let parent = crate::permissions::create(c.files, creds, AT_FDCWD, path)?;
         let full = c.files.exec_path(path.to_vec())?;
         // Landlock's MAKE_SOCK on its directory, for a name not there yet.
-        if c.files.fs.metadata(&full, false).is_err() {
+        if c.files.fs().metadata(&full, false).is_err() {
             crate::files::landlock_name(c, &full, crate::landlock::MAKE_SOCK)?;
         }
         let stat = c
             .files
-            .fs
+            .fs()
             .make_socket(&full, 0o777 & !c.files.umask())
             .map_err(|e| if e == Errno::EEXIST { EADDRINUSE } else { e })?;
         if let Some(parent) = parent {
@@ -531,7 +531,7 @@ impl UnixSocket {
         let mut s = self.lock();
         if self.name.get().is_some() {
             drop(s);
-            let _ = c.files.fs.unlink(&full, false);
+            let _ = c.files.fs().unlink(&full, false);
             return Err(Errno::EINVAL);
         }
         self.names.files().insert(key, Weak::clone(&self.this));

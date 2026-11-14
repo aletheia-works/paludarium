@@ -257,7 +257,7 @@ pub(crate) fn parent(path: &[u8]) -> &[u8] {
 /// one of its ancestors.
 fn mount_root(c: &Context<'_>, path: &[u8]) -> Vec<u8> {
     c.files
-        .fs
+        .fs()
         .mounts()
         .into_iter()
         .map(|m| m.path)
@@ -530,7 +530,7 @@ pub(crate) fn refer(
     if c.process.credentials.landlock.applicable(FS).is_none() {
         return Ok(());
     }
-    let stat = |p: &[u8]| c.files.fs.metadata(p, false).ok();
+    let stat = |p: &[u8]| c.files.fs().metadata(p, false).ok();
     let Some(old_stat) = stat(old) else {
         return Err(Errno::ENOENT);
     };

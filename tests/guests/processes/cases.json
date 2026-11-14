@@ -283,6 +283,7 @@
     {"name":"rlimit-cpu","binary":"process"},
     {"name":"cpu-timer","binary":"process"},
     {"name":"time-set","binary":"process"},
+    {"name":"chroot","binary":"process"},
     {"name":"modify-ldt","binary":"process"},
     {"name":"port-access","binary":"process"},
     {"name":"timer-limits","binary":"process"},

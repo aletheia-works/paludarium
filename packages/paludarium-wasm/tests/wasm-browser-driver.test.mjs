@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { isSafariLaunchTimeout, runBrowser, webdriverRequest } from "./wasm-browser-driver.mjs";
+import { isSafariLaunchFailure, runBrowser, webdriverRequest } from "./wasm-browser-driver.mjs";
 // The exact safaridriver answer of run 39114110570 attempt 1 (job 117638480843).
 const LAUNCH_TIMEOUT = { error: "session not created", message: "Could not create a session: The session timed out while connecting to a Safari instance. The following asynchronous operation timed out: Finding or launching a compatible local Safari and waiting for its RWIApplication to appear and become ready.", stacktrace: "" };
+// The exact safaridriver answer of run 43576635510 attempt 1 (job 132402449303).
+const NEVER_READY = { error: "session not created", message: "Could not create a session: The host application never became ready, unable to create a WebDriver session.", stacktrace: "" };
 // Stub safaridriver/pkill, fetch, AbortSignal.timeout and console.error for one Safari run; everything is restored in finally.
 // `reply(key, count)` answers a WebDriver request (count = how many times that key was asked) with [status, value].
 async function stubbedSafari(reply, run) {
@@ -93,16 +95,19 @@ test("Safari session creation alone waits 60000 ms while other WebDriver request
     { key: "DELETE /session/s1", timeoutMs: 10000 },
   ]);
 });
-test("only the safaridriver launch timeout in session creation counts as retryable", () => {
+test("only the safaridriver launch failures in session creation count as retryable", () => {
   const cause = new Error(`WebDriver POST /session: ${JSON.stringify(LAUNCH_TIMEOUT)}`);
   const failure = phase => Object.assign(new Error(`Safari ${phase}: ${cause}`, { cause }), { phase });
-  assert.equal(isSafariLaunchTimeout(failure("session-creation")), true);
-  assert.equal(isSafariLaunchTimeout(failure("navigation")), false);
-  assert.equal(isSafariLaunchTimeout(failure("driver-startup")), false);
+  assert.equal(isSafariLaunchFailure(failure("session-creation")), true);
+  assert.equal(isSafariLaunchFailure(failure("navigation")), false);
+  assert.equal(isSafariLaunchFailure(failure("driver-startup")), false);
+  const neverReady = new Error(`WebDriver POST /session: ${JSON.stringify(NEVER_READY)}`);
+  assert.equal(isSafariLaunchFailure(Object.assign(new Error(String(neverReady), { cause: neverReady }), { phase: "session-creation" })), true);
+  assert.equal(isSafariLaunchFailure(Object.assign(new Error(String(neverReady), { cause: neverReady }), { phase: "navigation" })), false);
   const other = new Error(`WebDriver POST /session: ${JSON.stringify({ error: "session not created", message: "Could not create a session: Allow remote automation is off" })}`);
-  assert.equal(isSafariLaunchTimeout(Object.assign(new Error(String(other), { cause: other }), { phase: "session-creation" })), false);
+  assert.equal(isSafariLaunchFailure(Object.assign(new Error(String(other), { cause: other }), { phase: "session-creation" })), false);
   const unrelated = new Error(`WebDriver POST /session: ${JSON.stringify({ error: "timeout", message: "timed out while connecting to a Safari instance" })}`);
-  assert.equal(isSafariLaunchTimeout(Object.assign(new Error(String(unrelated), { cause: unrelated }), { phase: "session-creation" })), false);
+  assert.equal(isSafariLaunchFailure(Object.assign(new Error(String(unrelated), { cause: unrelated }), { phase: "session-creation" })), false);
 });
 test("Safari launch timeout is retried once after stopping safaridriver and Safari, and the first failure stays in the result and the log", async () => {
   const run = await stubbedSafari((key, count) => key === "POST /session" && count === 1 ? [500, LAUNCH_TIMEOUT] : healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000));
@@ -138,6 +143,14 @@ test("a second launch timeout stops after the single retry and keeps both failur
   assert.match(error.message, /^Safari session-creation: .*; first attempt \(retried once\): Safari session-creation: .*timed out while connecting/);
   assert.equal(error.firstFailure.phase, "session-creation");
   assert.equal(run.requests.filter(r => r.key === "POST /session").length, 2);
+  assert.deepEqual(run.spawned.map(({ command }) => command), ["/usr/bin/safaridriver", "/usr/bin/pkill", "/usr/bin/safaridriver"]);
+  assert.equal(run.logged.length, 1);
+});
+test("Safari that never became ready is retried once like a launch timeout", async () => {
+  const run = await stubbedSafari((key, count) => key === "POST /session" && count === 1 ? [500, NEVER_READY] : healthy[key], () => runBrowser("safari", "http://127.0.0.1/page", 5000));
+  assert.ok(run.outcome.value, String(run.outcome.error));
+  assert.equal(run.outcome.value.session_retry.attempts, 2);
+  assert.match(run.outcome.value.session_retry.first_failure, /^Safari session-creation: .*The host application never became ready/);
   assert.deepEqual(run.spawned.map(({ command }) => command), ["/usr/bin/safaridriver", "/usr/bin/pkill", "/usr/bin/safaridriver"]);
   assert.equal(run.logged.length, 1);
 });

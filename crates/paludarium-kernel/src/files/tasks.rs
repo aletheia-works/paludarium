@@ -299,7 +299,7 @@ pub(super) fn stat(
         TaskEntry::Exe | TaskEntry::Cwd if follow => {
             check(c, task, entry)?;
             let target = link(task, entry).ok_or(Errno::ENOENT)??;
-            let stat = c.files.fs.metadata(&target, true)?;
+            let stat = c.files.fs().metadata(&target, true)?;
             return Ok((stat, device(c, &target), BLOCK_SIZE));
         }
         TaskEntry::Exe | TaskEntry::Cwd => crate::proc::self_link_stat(),
@@ -402,7 +402,7 @@ const ROOT_NAMES: [(&[u8], u8); 8] = [
 pub(super) fn root_entries(c: &Context<'_>) -> Vec<DirectoryEntry> {
     let mut names: Vec<(Vec<u8>, u8)> = c
         .files
-        .fs
+        .fs()
         .read_dir(b"/proc")
         .unwrap_or_default()
         .into_iter()

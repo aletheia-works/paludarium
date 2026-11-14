@@ -60,7 +60,7 @@ pub(crate) fn open(
 ) -> Result<Arc<dyn FileHandle>, Errno> {
     let description = join(c, key, node, flags)?;
     if let Some(closing) =
-        crate::inotify::Closing::opened(&c.files.caches, &c.files.fs, path, key.0, node, flags)
+        crate::inotify::Closing::opened(&c.files.caches, &c.files.fs(), path, key.0, node, flags)
     {
         description.notify_close(closing);
     }

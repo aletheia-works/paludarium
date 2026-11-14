@@ -285,6 +285,14 @@ jobs:
       # net.unix.max_dgram_qlen, which the runner's systemd raises.
       - name: Keep the default AF_UNIX datagram queue length
         run: sudo sysctl -w net.unix.max_dgram_qlen=10
+      # The chroot case takes CAP_SYS_CHROOT in a user namespace of its own,
+      # which Linux grants but Ubuntu's AppArmor refuses there
+      # (unprivileged_userns).
+      - name: Let a new user namespace use its capabilities
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Record native architectural profile
         run: |
           mkdir -p target/encodings-guests
@@ -329,6 +337,14 @@ jobs:
         run: test "$(ulimit -Sc)" = 0
       - name: Keep the default AF_UNIX datagram queue length
         run: sudo sysctl -w net.unix.max_dgram_qlen=10
+      # The chroot case takes CAP_SYS_CHROOT in a user namespace of its own,
+      # which Linux grants but Ubuntu's AppArmor refuses there
+      # (unprivileged_userns).
+      - name: Let a new user namespace use its capabilities
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Differential tests, every block compiled the first time it runs
         env:
           PALUDARIUM_TEST_JIT: "1"
@@ -377,6 +393,14 @@ jobs:
       # net.unix.max_dgram_qlen, which the runner's systemd raises.
       - name: Keep the default AF_UNIX datagram queue length
         run: sudo sysctl -w net.unix.max_dgram_qlen=10
+      # The chroot case takes CAP_SYS_CHROOT in a user namespace of its own,
+      # which Linux grants but Ubuntu's AppArmor refuses there
+      # (unprivileged_userns).
+      - name: Let a new user namespace use its capabilities
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Record native architectural profile
         run: |
           mkdir -p target/encodings-guests

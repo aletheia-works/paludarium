@@ -756,7 +756,7 @@ fn timer_notification_does_not_interrupt_flock_wait() {
         release: std::sync::Mutex::new(release_rx),
     });
     let mut k = Kernel::new(host).with_signal_inbox(Arc::new(SignalInbox::default()));
-    let blocker = k.files.fs.open(b"/lock", 0x42, 0o600).unwrap();
+    let blocker = k.files.fs().open(b"/lock", 0x42, 0o600).unwrap();
     blocker.flock(2).unwrap();
     let group = k.group.clone();
     let m = memory();

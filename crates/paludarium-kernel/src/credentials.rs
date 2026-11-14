@@ -16,6 +16,7 @@ const CAP_SETGID: u64 = 1 << 6;
 const CAP_SETUID: u64 = 1 << 7;
 const CAP_SETPCAP: u64 = 1 << 8;
 const CAP_SYS_RAWIO: u64 = 1 << 17;
+const CAP_SYS_CHROOT: u64 = 1 << 18;
 pub(crate) const CAP_SYS_PTRACE: u64 = 1 << 19;
 const CAP_SYS_PACCT: u64 = 1 << 20;
 pub(crate) const CAP_SYS_ADMIN: u64 = 1 << 21;
@@ -275,6 +276,11 @@ impl Credentials {
     /// attributes and a terminal's `TIOCEXCL` and `TIOCSCTTY` ask for.
     pub(crate) fn may_administer(&self) -> bool {
         self.capable(CAP_SYS_ADMIN)
+    }
+    /// CAP_SYS_CHROOT in the thread's own user namespace, which `chroot`
+    /// asks for.
+    pub(crate) fn may_chroot(&self) -> bool {
+        self.effective & CAP_SYS_CHROOT != 0
     }
     /// CAP_SYS_ADMIN in the thread's own user namespace, which new
     /// namespaces ask for.

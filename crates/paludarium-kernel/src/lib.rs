@@ -431,7 +431,7 @@ impl Kernel {
     ) -> Result<(Vec<u8>, bool), paludarium_types::Errno> {
         let loaded = self.files.exec_path(path.to_vec())?;
         let resolved = loaded.clone();
-        let program = self.files.fs.metadata(&loaded, true).ok();
+        let program = self.files.fs().metadata(&loaded, true).ok();
         let mut budget = (paludarium_loader::MAX_ARG_BYTES as usize).saturating_sub(
             argv.iter()
                 .chain(envp)

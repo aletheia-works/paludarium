@@ -74,6 +74,36 @@ pub fn normalize_path(path: &[u8]) -> Result<Vec<u8>, Errno> {
     }
     Ok(out)
 }
+/// [`normalize_path`] for a process whose root is `root`: a `..` there
+/// stays, as Linux's `follow_dotdot` keeps a walk at `fs->root`, so no
+/// path that passes through the root leaves it.
+pub fn normalize_in(root: &[u8], path: &[u8]) -> Result<Vec<u8>, Errno> {
+    if root == b"/" {
+        return normalize_path(path);
+    }
+    validate(path)?;
+    if path[0] != b'/' {
+        return Err(Errno::ENOENT);
+    }
+    let mut out = b"/".to_vec();
+    for p in path.split(|b| *b == b'/') {
+        match p {
+            b"" | b"." => {}
+            b".." if out == root || out == b"/" => {}
+            b".." => {
+                let at = out.iter().rposition(|b| *b == b'/').unwrap_or(0);
+                out.truncate(at.max(1));
+            }
+            _ => {
+                if out != b"/" {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(p);
+            }
+        }
+    }
+    Ok(out)
+}
 /// `TMPFS_MAGIC`: what the in-memory filesystem calls itself.
 pub const TMPFS_MAGIC: u64 = 0x0102_1994;
 /// The size the in-memory filesystem reports, the memory `sysinfo` reports.
@@ -102,6 +132,12 @@ pub fn mount_device(mounts: &[MountPoint], path: &[u8]) -> u64 {
         .map_or(1, |(i, _)| i as u64 + 1)
 }
 pub trait FileSystem: HostFs {
+    /// This filesystem seen by a process whose root is the directory at
+    /// `root`, a resolved path from the machine's root ([`HostFs::root`]):
+    /// `None` when it cannot be.
+    fn rooted(&self, _root: &[u8]) -> Option<Arc<dyn FileSystem>> {
+        None
+    }
     /// The mounts, root first, for `/proc/self/mountinfo`.
     fn mounts(&self) -> Vec<MountPoint> {
         vec![MountPoint {

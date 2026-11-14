@@ -34,6 +34,11 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   10 である必要があります。多くのホストでは systemd がこれを大きくします。CI では
   `sysctl` で設定します（コンテナ自身のネットワークの名前空間ではこの値です）。それ以外の
   環境では、そう伝えて止まります。
+- `chroot` のケースは、自分のユーザー名前空間で `CAP_SYS_CHROOT` を使います。Linux は
+  これを許します。Ubuntu の AppArmor は、`kernel.apparmor_restrict_unprivileged_userns`
+  が 1 のあいだ、そこでのケーパビリティをすべて拒みます（`unprivileged_userns` の
+  プロファイル）。そのため CI では `sysctl` で 0 にします。それ以外の環境では、そういう
+  ホストの native の結果とは違います。
 - native の側は、本物の x86-64 Linux でなければなりません。Arm の Mac の Docker は、
   x86-64 のプログラムを QEMU のユーザーモードのエミュレーションで動かします。QEMU は
   シグナルを自分で扱うので、そこでは native の結果も Linux と違うことがあります。

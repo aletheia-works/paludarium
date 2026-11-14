@@ -49,6 +49,111 @@
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
+/* The ext-ack- modes: each netlink case again, its NETLINK_ROUTE and
+   NETLINK_GENERIC sockets with NETLINK_EXT_ACK (option 11 of SOL_NETLINK,
+   270) on, and the attributes each NLMSG_ERROR and NLMSG_DONE with
+   NLM_F_ACK_TLVS (0x200) carries shown as it is received: the message
+   (NLMSGERR_ATTR_MSG), the offset of the attribute at fault (_OFFS) and
+   its policy (_POLICY), each of whose attributes is shown by type. The
+   option is set in the environment too, for the programs the cases run. */
+static int nl_ext_ack;
+static int nl_ext_socket(int domain, int type, int protocol) {
+    int fd = socket(domain, type, protocol);
+    if (fd >= 0 && domain == 16 && nl_ext_ack) {
+        int on = 1;
+        setsockopt(fd, 270, 11, &on, sizeof on);
+    }
+    return fd;
+}
+static void nl_ext_policy(const unsigned char *at, int len) {
+    while (len >= 4) {
+        unsigned short alen, type;
+        memcpy(&alen, at, 2);
+        memcpy(&type, at + 2, 2);
+        if (alen < 4 || alen > len) break;
+        long long value = 0;
+        if (alen - 4 == 4) {
+            unsigned v;
+            memcpy(&v, at + 4, 4);
+            value = v;
+        } else if (alen - 4 == 8) {
+            memcpy(&value, at + 4, 8);
+        }
+        printf(" %u=%lld", type & 0x3fff, value);
+        int step = (alen + 3) & ~3;
+        at += step;
+        len -= step;
+    }
+}
+/* The extended attributes of the messages in the n bytes at buf. */
+static void nl_ext_show(const unsigned char *buf, long n) {
+    while (n >= 16) {
+        unsigned len;
+        unsigned short type, flags;
+        memcpy(&len, buf, 4);
+        memcpy(&type, buf + 4, 2);
+        memcpy(&flags, buf + 6, 2);
+        if (len < 16 || len > n) break;
+        if ((type == 2 || type == 3) && (flags & 0x200)) {
+            int error;
+            memcpy(&error, buf + 16, 4);
+            unsigned at = 20;
+            if (type == 2) {
+                unsigned inner = 16;
+                if (!(flags & 0x100) && len >= 24) memcpy(&inner, buf + 20, 4);
+                at += (flags & 0x100) ? 16 : (inner + 3) & ~3u;
+            }
+            printf("  ext %s error=%d:", type == 2 ? "error" : "done", error);
+            while (at + 4 <= len) {
+                unsigned short alen, kind;
+                memcpy(&alen, buf + at, 2);
+                memcpy(&kind, buf + at + 2, 2);
+                if (alen < 4 || at + alen > len) break;
+                const unsigned char *v = buf + at + 4;
+                int vlen = alen - 4;
+                unsigned word = 0;
+                if (vlen >= 4) memcpy(&word, v, 4);
+                switch (kind & 0x3fff) {
+                case 1: printf(" msg=\"%.*s\"", vlen > 0 ? vlen - 1 : 0, v); break;
+                case 2: printf(" offs=%u", word); break;
+                case 4: printf(" policy{"); nl_ext_policy(v, vlen); printf(" }"); break;
+                default: printf(" %u:%d", kind & 0x3fff, vlen); break;
+                }
+                at += (alen + 3) & ~3u;
+            }
+            printf("\n");
+        }
+        buf += (len + 3) & ~3u;
+        n -= (len + 3) & ~3u;
+    }
+}
+static int nl_ext_netlink(int fd) {
+    int domain = 0;
+    socklen_t size = sizeof domain;
+    return nl_ext_ack && getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &size) == 0 && domain == 16;
+}
+static ssize_t nl_ext_recv(int fd, void *buf, size_t len, int flags) {
+    ssize_t n = recv(fd, buf, len, flags);
+    if (n > 0 && !(flags & MSG_PEEK) && nl_ext_netlink(fd)) nl_ext_show(buf, (size_t)n < len ? n : (long)len);
+    return n;
+}
+static ssize_t nl_ext_recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *from, socklen_t *size) {
+    ssize_t n = recvfrom(fd, buf, len, flags, from, size);
+    if (n > 0 && !(flags & MSG_PEEK) && nl_ext_netlink(fd)) nl_ext_show(buf, (size_t)n < len ? n : (long)len);
+    return n;
+}
+static ssize_t nl_ext_recvmsg(int fd, struct msghdr *msg, int flags) {
+    ssize_t n = recvmsg(fd, msg, flags);
+    if (n > 0 && !(flags & MSG_PEEK) && msg->msg_iovlen > 0 && nl_ext_netlink(fd)) {
+        size_t room = msg->msg_iov[0].iov_len;
+        nl_ext_show(msg->msg_iov[0].iov_base, (size_t)n < room ? n : (long)room);
+    }
+    return n;
+}
+#define socket(domain, type, protocol) nl_ext_socket(domain, type, protocol)
+#define recv(fd, buf, len, flags) nl_ext_recv(fd, buf, len, flags)
+#define recvfrom(fd, buf, len, flags, from, size) nl_ext_recvfrom(fd, buf, len, flags, from, size)
+#define recvmsg(fd, msg, flags) nl_ext_recvmsg(fd, msg, flags)
 #ifndef F_SETPIPE_SZ
 #define F_SETPIPE_SZ 1031
 #define F_GETPIPE_SZ 1032
@@ -11211,6 +11316,11 @@ int main(int argc, char **argv) {
     if (argc >= 1 && !strncmp(argv[0], "./interp", 8)) return script_show(argc, argv);
     if (argc < 3) return 99;
     const char *mode = argv[1], *self = argv[2];
+    if (!strncmp(mode, "ext-ack-", 8)) {
+        mode += 8;
+        setenv("PALUDARIUM_EXT_ACK", "1", 1);
+    }
+    nl_ext_ack = getenv("PALUDARIUM_EXT_ACK") != NULL;
     if (!strcmp(mode, "clone-vm")) {
         char *stack = mmap(NULL, 65536, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         if (stack == MAP_FAILED) return 80;

@@ -13,7 +13,7 @@
 //! anyone may join; as no family comes or goes, it hears nothing.
 use super::{
     Errno, Header, NLM_F_ACK, NLM_F_DUMP, NLM_F_ECHO, NLM_F_MULTI, NLM_F_REQUEST, NLMSG_DONE,
-    NetlinkSocket, State, align, attribute, message,
+    NetlinkSocket, Nla, State, align, attribute, extack, leftover, message, validate_nla,
 };
 
 /// The groups a `NETLINK_GENERIC` socket has (`ngroups`): a word of them,
@@ -57,7 +57,6 @@ const NL_ATTR_TYPE_U32: u32 = 4;
 const NL_ATTR_TYPE_NUL_STRING: u32 = 12;
 const ENOENT: Errno = Errno::ENOENT;
 const EINVAL: Errno = Errno::EINVAL;
-const ERANGE: Errno = Errno::ERANGE;
 const EOPNOTSUPP: Errno = Errno::EOPNOTSUPP;
 const EBUSY: Errno = Errno(16);
 
@@ -123,8 +122,17 @@ impl NetlinkSocket {
             } else {
                 header.flags
             };
-            if payload[2..4] != [0, 0] || flags & !(NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO) != 0 {
-                return Err(EINVAL);
+            if payload[2..4] != [0, 0] {
+                return Err(extack::message(
+                    EINVAL,
+                    "genlmsghdr.reserved field is not 0",
+                ));
+            }
+            if flags & !(NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO) != 0 {
+                return Err(extack::message(
+                    EINVAL,
+                    "ambiguous or reserved bits set in nlmsg_flags",
+                ));
             }
         }
         let attributes = &payload[4..];
@@ -189,51 +197,24 @@ fn parse(mut bytes: &[u8], policy: Policy, strict: bool) -> Result<Vec<Option<&[
         let value = &bytes[4..len];
         if kind == 0 || kind >= policy.len() {
             if strict {
-                return Err(EINVAL);
+                return Err(extack::at(EINVAL, value, "Unknown attribute type"));
             }
         } else {
-            match policy[kind] {
-                Some(of) => validate(of, raw & NLA_F_NESTED != 0, value, strict)?,
-                // `NL_VALIDATE_UNSPEC`.
-                None if strict => return Err(EINVAL),
-                None => {}
-            }
+            // Each as `validate_nla` checks it, an unnamed one being
+            // `NLA_UNSPEC` of no length.
+            let nla = match policy[kind] {
+                Some(Kind::U16) => Nla::U16,
+                Some(Kind::U32) => Nla::U32,
+                Some(Kind::NulString(longest)) => Nla::NulString(longest),
+                None => Nla::Unspec(0),
+            };
+            validate_nla(nla, raw & NLA_F_NESTED != 0, value, strict)?;
             tb[kind] = Some(value);
         }
         bytes = &bytes[align(len).min(bytes.len())..];
     }
-    if strict && !bytes.is_empty() {
-        return Err(EINVAL);
-    }
+    leftover(bytes, strict)?;
     Ok(tb)
-}
-/// Checks an attribute of kind `of`, as `validate_nla`: strictly, an
-/// integer of another length or one marked nested is `EINVAL`; a shorter
-/// one is `ERANGE`. A string needs its NUL within its longest length and
-/// one more byte (`EINVAL`), and without a last NUL must be no longer
-/// (`ERANGE`).
-fn validate(of: Kind, nested: bool, value: &[u8], strict: bool) -> Result<(), Errno> {
-    let size = match of {
-        Kind::U16 => 2,
-        Kind::U32 => 4,
-        Kind::NulString(_) => 0,
-    };
-    if strict && ((size != 0 && value.len() != size) || nested) {
-        return Err(EINVAL);
-    }
-    if let Kind::NulString(longest) = of {
-        let within = value.len().min(longest + 1);
-        if within == 0 || !value[..within].contains(&0) {
-            return Err(EINVAL);
-        }
-        let len = value.len() - usize::from(value[value.len() - 1] == 0);
-        if len > longest {
-            return Err(ERANGE);
-        }
-    } else if value.len() < size {
-        return Err(ERANGE);
-    }
-    Ok(())
 }
 fn u16_of(value: &[u8]) -> u16 {
     u16::from_le_bytes([value[0], value[1]])
@@ -315,12 +296,12 @@ fn policies(tb: &[Option<&[u8]>], seq: u32, port: u32) -> Result<Vec<u8>, Errno>
         return Err(ENOENT);
     }
     let commands: Vec<_> = match tb[usize::from(CTRL_ATTR_OP)] {
-        Some(op) => {
-            let op = u32::from_le_bytes(op[..4].try_into().unwrap_or_default());
+        Some(value) => {
+            let op = u32::from_le_bytes(value[..4].try_into().unwrap_or_default());
             let found = COMMANDS
                 .iter()
                 .find(|&&(command, ..)| u32::from(command) == op)
-                .ok_or(ENOENT)?;
+                .ok_or_else(|| extack::bad(ENOENT, value))?;
             vec![*found]
         }
         None => COMMANDS.to_vec(),
@@ -454,7 +435,7 @@ mod tests {
         assert!(parse(&attr(1, &[16, 0, 0, 0]), FAMILY_POLICY, false).is_ok());
         assert_eq!(
             parse(&attr(1, &[16]), FAMILY_POLICY, false).err(),
-            Some(ERANGE)
+            Some(Errno::ERANGE)
         );
         assert!(parse(&attr(9, &[0; 4]), FAMILY_POLICY, false).is_ok());
         // Strict: both are EINVAL, as is one marked nested.
@@ -480,7 +461,7 @@ mod tests {
         long[3] = 0;
         assert_eq!(
             parse(&attr(2, &long), FAMILY_POLICY, false).err(),
-            Some(ERANGE)
+            Some(Errno::ERANGE)
         );
         let mut fifteen = vec![b'a'; 15];
         fifteen.push(0);

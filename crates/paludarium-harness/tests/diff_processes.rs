@@ -129,7 +129,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, link-attributes, generic-netlink, sock-diag, inet-diag and msg cases, whose checks depend on
+            // addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts), the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
@@ -186,6 +186,17 @@ mod linux {
                     | "generic-netlink"
                     | "sock-diag"
                     | "inet-diag"
+                    | "ext-ack-netlink"
+                    | "ext-ack-addresses"
+                    | "ext-ack-monitor"
+                    | "ext-ack-routes"
+                    | "ext-ack-route-dump"
+                    | "ext-ack-route-metrics"
+                    | "ext-ack-route-selectors"
+                    | "ext-ack-address-lifetimes"
+                    | "ext-ack-netlink-strict"
+                    | "ext-ack-link-attributes"
+                    | "ext-ack-generic-netlink"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -334,6 +345,17 @@ mod linux {
         processes_generic_netlink => ("generic-netlink","process"),
         processes_sock_diag => ("sock-diag","process"),
         processes_inet_diag => ("inet-diag","process"),
+        processes_ext_ack_netlink => ("ext-ack-netlink","process"),
+        processes_ext_ack_addresses => ("ext-ack-addresses","process"),
+        processes_ext_ack_monitor => ("ext-ack-monitor","process"),
+        processes_ext_ack_routes => ("ext-ack-routes","process"),
+        processes_ext_ack_route_dump => ("ext-ack-route-dump","process"),
+        processes_ext_ack_route_metrics => ("ext-ack-route-metrics","process"),
+        processes_ext_ack_route_selectors => ("ext-ack-route-selectors","process"),
+        processes_ext_ack_address_lifetimes => ("ext-ack-address-lifetimes","process"),
+        processes_ext_ack_netlink_strict => ("ext-ack-netlink-strict","process"),
+        processes_ext_ack_link_attributes => ("ext-ack-link-attributes","process"),
+        processes_ext_ack_generic_netlink => ("ext-ack-generic-netlink","process"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),

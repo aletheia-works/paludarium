@@ -535,8 +535,15 @@ verified.
   host's, and IPv6's creation time is 0 and its reachable time 30
   seconds, where Linux's is random. The first namespace's `127.0.0.1`
   and `::1` were made at 0, where Linux's were made as it booted.
-  `NETLINK_EXT_ACK` adds no attributes to an error or to a dump's
-  `NLMSG_DONE`. A link dump's `IFLA_LINKINFO` is taken without effect,
+  With `NETLINK_EXT_ACK`, a request refused for a feature paludarium does
+  not have (a multipath route, say, or a link of a kind) carries no
+  message, as Linux would take it; an IPv6 route replaced without
+  `NLM_F_CREATE` that is not there is told of
+  ("Can not replace route - no match found") only where its prefix has
+  no route, where Linux looks for a node of its tree; and no answer
+  carries a missing attribute (`NLMSGERR_ATTR_MISS_TYPE`) or a cookie, as
+  no request taken asks for one. `NLM_F_BULK` is refused ("Bulk delete is
+  not supported") for address and route removals alone. A link dump's `IFLA_LINKINFO` is taken without effect,
   where Linux shows only the devices of a kind its modules know. The
   least `IFLA_GSO_MAX_SIZE` and `IFLA_GSO_IPV4_MAX_SIZE` the link policy
   takes is 321, as for Ubuntu's kernel (`MAX_TCP_HEADER` + 1), where

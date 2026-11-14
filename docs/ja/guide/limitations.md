@@ -465,8 +465,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   IPv4 と IPv6 の設定は、sysctl が組み込みのままのカーネルのものです。Linux の新しい
   名前空間はホストのものを写します。IPv6 の作成時刻は 0、到達可能時間は 30 秒です。
   Linux では乱数で決まります。最初の名前空間の `127.0.0.1` と `::1` は時刻 0 に
-  作られたことになります。Linux では起動の途中で作られます。`NETLINK_EXT_ACK` は
-  エラーにもダンプの `NLMSG_DONE` にも属性を足しません。リンクのダンプの
+  作られたことになります。Linux では起動の途中で作られます。`NETLINK_EXT_ACK` を
+  付けても、paludarium にない機能（マルチパスの経路や、種類を持つリンクなど）のために
+  拒んだリクエストにはメッセージを載せません。Linux ならそれを受け付けます。
+  `NLM_F_CREATE` なしで置き換える IPv6 の経路がないときの
+  「Can not replace route - no match found」は、そのプレフィックスに経路がないときだけ
+  載せます。Linux は木のノードを探します。足りない属性を報告する属性
+  （`NLMSGERR_ATTR_MISS_TYPE`）とクッキーは、受け付けるリクエストがどれも求めないので
+  載せません。`NLM_F_BULK` を拒む（「Bulk delete is not supported」）のはアドレスと
+  経路の削除だけです。リンクのダンプの
   `IFLA_LINKINFO` は受け取るだけで何もしません。Linux はモジュールが知る種類の
   デバイスだけを見せます。リンクのポリシーが取る `IFLA_GSO_MAX_SIZE` と
   `IFLA_GSO_IPV4_MAX_SIZE` の最小値は、Ubuntu のカーネルと同じく 321

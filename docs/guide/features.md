@@ -1472,7 +1472,13 @@ kernel.
     that part has room, as `inet6_dump_ifaddr` and `inet6_dump_ifinfo` put
     it. An error, or a success with `NLM_F_ACK`, is answered with
     `NLMSG_ERROR`, which carries the whole request with an error unless
-    `NETLINK_CAP_ACK` is set. Anything but a `GET` needs `CAP_NET_ADMIN` in
+    `NETLINK_CAP_ACK` is set. With `NETLINK_EXT_ACK`, an error and a dump's
+    `NLMSG_DONE` that ends it at once carry what Linux's
+    `netlink_ext_ack` holds (`NLM_F_ACK_TLVS`): Linux's message
+    (`NLMSGERR_ATTR_MSG`), the offset of the attribute at fault
+    (`NLMSGERR_ATTR_OFFS`) and the policy that refused it
+    (`NLMSGERR_ATTR_POLICY`); an acknowledgement carries a warning, such
+    as of bytes left over after the attributes. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending
     thread and the socket's opener (`EPERM`).
   - **Strict checking:** with `NETLINK_GET_STRICT_CHK`, as iproute2 sets
@@ -1507,7 +1513,7 @@ kernel.
     are passed over, and a link dump whose attributes break the policy
     takes none of them. A change of the link takes one of
     `IFLA_NET_NS_PID`, `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` at most
-    (`EINVAL`).
+    (`EINVAL`), and a get neither of the first two (`EOPNOTSUPP`).
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
     7.0's attributes in its order: its flags, name, queue, state, MTU,
@@ -1542,7 +1548,9 @@ kernel.
     with no valid one or a preferred one longer, or a message shorter than
     an `ifaddrmsg`; `ENODEV` for another interface; then, for a new IPv6
     one, `EINVAL` for a prefix past 128, or `IFA_F_MANAGETEMPADDR` but on
-    a prefix of 64. An `IFA_LOCAL` of `0.0.0.0` is taken without effect.
+    a prefix of 64, and `EADDRNOTAVAIL` for `::` or a multicast address
+    without `IFA_F_MCAUTOJOIN`. An IPv4 one in the subnet of one of another
+    scope is `EINVAL`. An `IFA_LOCAL` of `0.0.0.0` is taken without effect.
     `IFA_LABEL`, `IFA_BROADCAST`, `IFA_FLAGS` (with `IFA_F_NOPREFIXROUTE`,
     and for IPv6 `IFA_F_NODAD`, which tells of the address once; IPv6 keeps
     only the flags a request may set), `IFA_PROTO`, `IFA_RT_PRIORITY`, the
@@ -1622,7 +1630,8 @@ kernel.
     `inet_rtm_newroute` and `inet6_rtm_newroute` do: `NLM_F_EXCL`,
     `NLM_F_REPLACE`, `NLM_F_APPEND` and `NLM_F_CREATE` put it in Linux's
     place, or Linux's error refuses it (`EEXIST`, `ENOENT`; `EINVAL` for a
-    bad prefix, scope, kind, gateway or preferred source; `ENODEV` for
+    bad prefix, scope, kind, gateway or preferred source, and for an IPv6
+    route with `RTA_FLOWLABEL`, `RTA_VIA` or `RTM_F_CLONED`; `ENODEV` for
     another device; `ENETDOWN` while `lo` is down, but for an IPv4 route of
     host scope). `RTM_DELROUTE` removes the first route that matches what it
     names (`ESRCH` for none), a kernel's too, which a change of an address

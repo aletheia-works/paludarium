@@ -20,6 +20,7 @@
 //! then the default table's (253) where they have no answer. IPv6 looks in
 //! the local table, then the main one. The other tables are kept and shown,
 //! but no lookup reaches them.
+use crate::netlink::extack;
 use core::cmp::{Ordering, Reverse};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use paludarium_types::Errno;
@@ -322,6 +323,20 @@ pub(crate) type Metrics = [u32; 17];
 pub(crate) const NO_METRICS: Metrics = [0; 17];
 fn mask4(prefix: u8) -> u32 {
     u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
+}
+/// An IPv4 route's prefix, as `rtm_to_fib_config` checks it: `EINVAL` for
+/// a length past 32 or bits past it.
+fn prefix4(dst: Ipv4Addr, len: u8) -> Result<(), Errno> {
+    if len > 32 {
+        return Err(extack::message(Errno::EINVAL, "Invalid prefix length"));
+    }
+    if u32::from(dst) & !mask4(len) != 0 {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid prefix for given prefix length",
+        ));
+    }
+    Ok(())
 }
 fn mask6(prefix: u8) -> u128 {
     u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0)
@@ -651,7 +666,9 @@ impl Addresses {
     pub(crate) fn up(&mut self, now: u64) -> Vec<Event> {
         let mut events = Vec::new();
         let loopback = V4::new(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 8, SCOPE_HOST);
-        if let Ok(added) = self.add_v4(loopback, Lifetimes::FOREVER, false, true, now) {
+        // The kernel's own, which reports nothing when it is there.
+        let added = extack::quietly(|| self.add_v4(loopback, Lifetimes::FOREVER, false, true, now));
+        if let Ok(added) = added {
             events.extend(added);
         }
         for address in self.v4.clone() {
@@ -693,6 +710,7 @@ impl Addresses {
     /// Adds an IPv4 address with `lifetimes` at `now`, as
     /// `inet_rtm_newaddr` and `__inet_insert_ifa` do: the same local
     /// address and subnet again is `EEXIST`, unless `replace`; one in a
+    /// subnet an address of another scope has is `EINVAL`; one in a
     /// subnet a primary address has is secondary, and goes last; a primary
     /// goes after the primaries of a scope as wide or wider. What Linux
     /// tells: the address, then the routes it brings (`fib_add_ifaddr`),
@@ -718,9 +736,16 @@ impl Addresses {
             if old.mask() == new.mask() && old.covers(new.address) {
                 if old.local == new.local {
                     if !replace {
-                        return Err(Errno::EEXIST);
+                        return Err(extack::message(
+                            Errno::EEXIST,
+                            "ipv4: Address already assigned",
+                        ));
                     }
                     return Ok(self.change_v4(i, &new, lifetimes, up, now));
+                }
+                // `__inet_insert_ifa`: a subnet has one scope.
+                if old.scope != new.scope {
+                    return Err(extack::message(Errno::EINVAL, "ipv4: Invalid scope value"));
                 }
                 new.flags |= SECONDARY;
             }
@@ -787,7 +812,7 @@ impl Addresses {
                     && label.is_none_or(|label| a.label == label)
                     && address.is_none_or(|address| a.prefix == prefix && a.covers(address))
             })
-            .ok_or(EADDRNOTAVAIL)?;
+            .ok_or_else(|| extack::message(EADDRNOTAVAIL, "ipv4: Address not found"))?;
         Ok(self.remove_v4(found))
     }
     /// Removes the IPv4 address at `found` (`__inet_del_ifa`). A primary
@@ -879,7 +904,10 @@ impl Addresses {
         new.life.created = now;
         if let Some(i) = self.v6.iter().position(|a| a.address == new.address) {
             if !replace {
-                return Err(Errno::EEXIST);
+                return Err(extack::message(
+                    Errno::EEXIST,
+                    "ipv6: address already assigned",
+                ));
             }
             return Ok(self.change_v6(i, &new, up));
         }
@@ -1005,7 +1033,7 @@ impl Addresses {
             .v6
             .iter()
             .position(|a| a.address == address && a.prefix == prefix)
-            .ok_or(EADDRNOTAVAIL)?;
+            .ok_or_else(|| extack::message(EADDRNOTAVAIL, "ipv6: address not found"))?;
         Ok(self.remove_v6(found, now))
     }
     /// Removes the IPv6 address at `found` (`ipv6_del_addr`). What Linux
@@ -1216,6 +1244,18 @@ impl Addresses {
             return Ok(F_REPLACE);
         }
         if asked(F_REPLACE) && !asked(F_CREATE) {
+            // `fib6_add_1` tells of it where the prefix has no node, which
+            // is taken to be where it has no route.
+            let node = self
+                .routes6
+                .iter()
+                .any(|r| r.table == new.table && r.dst == new.dst && r.len == new.len);
+            if !node {
+                return Err(extack::message(
+                    Errno::ENOENT,
+                    "Can not replace route - no match found",
+                ));
+            }
             return Err(Errno::ENOENT);
         }
         let at = self
@@ -1271,9 +1311,10 @@ impl Addresses {
         }
     }
 
-    /// Adds the IPv4 route `ask` asks for, as `inet_rtm_newroute`: its
-    /// table is made first, whatever comes of it. `EINVAL` for a prefix
-    /// past 32 or with bits past its length, a scope narrower than its
+    /// Adds the IPv4 route `ask` asks for, as `inet_rtm_newroute`: `EINVAL`
+    /// for a prefix past 32 or with bits past its length
+    /// (`rtm_to_fib_config`); then its table is made, whatever comes of it.
+    /// `EINVAL` for a scope narrower than its
     /// kind's, a kind without a device that names one or a gateway, an
     /// unknown kind, the scope `RT_SCOPE_NOWHERE`, a gateway of host
     /// scope, an on-link route without a gateway, an invalid gateway or a
@@ -1288,10 +1329,8 @@ impl Addresses {
         } else {
             ask.table
         };
+        prefix4(ask.dst, ask.len)?;
         self.create4(table);
-        if ask.len > 32 || u32::from(ask.dst) & !mask4(ask.len) != 0 {
-            return Err(Errno::EINVAL);
-        }
         // `fib_props`' scope of each kind.
         let widest = match ask.kind {
             0 | 10 | 11 => SCOPE_NOWHERE,
@@ -1299,14 +1338,22 @@ impl Addresses {
             3 | 4 => SCOPE_LINK,
             _ => SCOPE_UNIVERSE,
         };
-        if widest > ask.scope || ask.flags & NEXTHOP_DEAD != 0 {
-            return Err(Errno::EINVAL);
+        if widest > ask.scope {
+            return Err(extack::message(Errno::EINVAL, "Invalid scope"));
         }
-        let metrics = ask.metrics?;
-        let kind = Kind::of(ask.kind).ok_or(if matches!(ask.kind, 4 | 5 | 10 | 11) {
-            EOPNOTSUPP
-        } else {
-            Errno::EINVAL
+        if ask.flags & NEXTHOP_DEAD != 0 {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Invalid rtm_flags - can not contain DEAD or LINKDOWN",
+            ));
+        }
+        let metrics = ask.metrics.map_err(extack::raise)?;
+        let kind = Kind::of(ask.kind).ok_or_else(|| {
+            if matches!(ask.kind, 4 | 5 | 10 | 11) {
+                EOPNOTSUPP
+            } else {
+                extack::message(Errno::EINVAL, "Invalid route type")
+            }
         })?;
         let onlink = ask.flags & 4 != 0;
         let mut route = Route4 {
@@ -1327,14 +1374,20 @@ impl Addresses {
         };
         if kind.error().is_some() {
             if ask.gateway.is_some() || ask.oif != 0 {
-                return Err(Errno::EINVAL);
+                return Err(extack::message(
+                    Errno::EINVAL,
+                    "Gateway, device and multipath can not be specified for this route type",
+                ));
             }
             route.device = false;
         } else if ask.scope > SCOPE_HOST {
-            return Err(Errno::EINVAL);
+            return Err(extack::message(Errno::EINVAL, "Invalid scope"));
         } else if ask.scope == SCOPE_HOST {
             if ask.gateway.is_some() {
-                return Err(Errno::EINVAL);
+                return Err(extack::message(
+                    Errno::EINVAL,
+                    "Route with host scope can not have a gateway",
+                ));
             }
             if ask.oif != 1 {
                 return Err(Errno::ENODEV);
@@ -1342,16 +1395,19 @@ impl Addresses {
         } else if let Some(gateway) = ask.gateway {
             route.uses_gateway = self.gateway4(gateway, ask, table, up)?;
         } else if onlink {
-            return Err(Errno::EINVAL);
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Invalid flags for nexthop - PERVASIVE and ONLINK can not be set",
+            ));
         } else if ask.oif != 1 {
             return Err(Errno::ENODEV);
         } else if !up {
-            return Err(ENETDOWN);
+            return Err(extack::message(ENETDOWN, "Device for nexthop is not up"));
         }
         if let Some(source) = ask.prefsrc
             && !self.valid_prefsrc4(source, &route)
         {
-            return Err(Errno::EINVAL);
+            return Err(extack::message(Errno::EINVAL, "Invalid prefsrc address"));
         }
         Ok(self
             .insert4(route, ask.request)?
@@ -1365,18 +1421,22 @@ impl Addresses {
     /// or local route, in the route's table then the main one, its error
     /// as it is. Whether a route of link scope reaches it.
     fn gateway4(&self, gateway: Ipv4Addr, ask: &Ask4, table: u32, up: bool) -> Result<bool, Errno> {
+        let invalid = |error| extack::message(error, "Nexthop has invalid gateway");
         if ask.flags & 4 != 0 {
             if ask.scope >= SCOPE_LINK {
-                return Err(Errno::EINVAL);
+                return Err(extack::message(Errno::EINVAL, "Nexthop has invalid scope"));
             }
             if ask.oif != 1 {
-                return Err(Errno::ENODEV);
+                return Err(extack::message(
+                    Errno::ENODEV,
+                    "Nexthop device required for onlink",
+                ));
             }
             if !up {
-                return Err(ENETDOWN);
+                return Err(extack::message(ENETDOWN, "Nexthop device is not up"));
             }
             if self.addr_type4(gateway, TABLE_LOCAL) != Kind::Unicast {
-                return Err(Errno::EINVAL);
+                return Err(invalid(Errno::EINVAL));
             }
             return Ok(true);
         }
@@ -1389,9 +1449,9 @@ impl Addresses {
         if !separate || found.is_err() {
             found = self.lookup4_in(gateway, scope, ask.oif, 0);
         }
-        let via = found?;
+        let via = found.map_err(invalid)?;
         if !matches!(via.kind, Kind::Unicast | Kind::Local) {
-            return Err(Errno::EINVAL);
+            return Err(invalid(Errno::EINVAL));
         }
         if !up {
             return Err(ENETDOWN);
@@ -1414,20 +1474,20 @@ impl Addresses {
             || (table != TABLE_LOCAL && self.addr_type4(source, TABLE_LOCAL) == Kind::Local)
     }
     /// Removes the IPv4 route `select` names, as `fib_table_delete`:
-    /// `ESRCH` for a table there is not, or no such route; `EINVAL` for a
-    /// prefix past 32 or with bits past its length. A route must have the
-    /// metrics `select` names (`fib_metrics_match`).
+    /// `EINVAL` for a prefix past 32 or with bits past its length, then
+    /// `ESRCH` for a table there is not, or no such route. A route must have
+    /// the metrics `select` names (`fib_metrics_match`).
     pub(crate) fn del_route4(&mut self, select: &Select4) -> Result<Vec<Event>, Errno> {
         let table = if select.table == 0 {
             TABLE_MAIN
         } else {
             select.table
         };
+        // `rtm_to_fib_config` checks the prefix before the table is
+        // looked for.
+        prefix4(select.dst, select.len)?;
         if !self.tables4.contains(&table) {
-            return Err(ESRCH);
-        }
-        if select.len > 32 || u32::from(select.dst) & !mask4(select.len) != 0 {
-            return Err(Errno::EINVAL);
+            return Err(extack::message(ESRCH, "FIB table does not exist"));
         }
         let at = self
             .routes4
@@ -1470,7 +1530,7 @@ impl Addresses {
             ask.table
         };
         self.create6(table);
-        let metrics = ask.metrics?;
+        let metrics = ask.metrics.map_err(extack::raise)?;
         let kind = match ask.kind {
             0 => Kind::Unicast,
             code => Kind::of(code)
@@ -1485,13 +1545,13 @@ impl Addresses {
                 return Err(Errno::ENODEV);
             }
             if !up {
-                return Err(ENETDOWN);
+                return Err(extack::message(ENETDOWN, "Nexthop device is not up"));
             }
         }
         if let Some(source) = ask.prefsrc
             && !self.local6(source)
         {
-            return Err(Errno::EINVAL);
+            return Err(extack::message(Errno::EINVAL, "Invalid source address"));
         }
         let route = Route6 {
             table,
@@ -1521,7 +1581,7 @@ impl Addresses {
             ask.table
         };
         if !self.tables6.contains(&table) {
-            return Err(ESRCH);
+            return Err(extack::message(ESRCH, "FIB table does not exist"));
         }
         let dst = Ipv6Addr::from(u128::from(ask.dst) & mask6(ask.len));
         let at = self

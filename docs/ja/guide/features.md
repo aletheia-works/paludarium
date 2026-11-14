@@ -1286,7 +1286,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     アドレスとリンクのダンプでは、`inet6_dump_ifaddr` と `inet6_dump_ifinfo` と同じく、
     空きがあれば最後のメッセージと同じ部分に入れます。
     エラーと、`NLM_F_ACK` を付けた成功には `NLMSG_ERROR` を返し、エラーのものは
-    `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`GET` のほかには、ネットワーク
+    `NETLINK_CAP_ACK` がなければリクエスト全体を載せます。`NETLINK_EXT_ACK` を付けると、
+    エラーと、ダンプをすぐに終える `NLMSG_DONE` に、Linux の `netlink_ext_ack` が持つものを
+    載せます（`NLM_F_ACK_TLVS`）。Linux のメッセージ（`NLMSGERR_ATTR_MSG`）、問題の属性の
+    オフセット（`NLMSGERR_ATTR_OFFS`）、その属性を拒んだポリシー（`NLMSGERR_ATTR_POLICY`）
+    です。確認応答には、属性のあとに残ったバイトのような警告を載せます。`GET` のほかには、ネットワーク
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
     開いたものの両方に要ります（なければ `EPERM`）。
   - **厳密な検査:** iproute2 と同じく `NETLINK_GET_STRICT_CHK` を設定すると、Linux と
@@ -1314,7 +1318,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     型 0 や最後より後の型、余ったバイトは `EINVAL` です。検査しなければ読み飛ばし、
     属性がポリシーに反するリンクのダンプは、属性をどれも使いません。リンクの変更は
     `IFLA_NET_NS_PID`、`IFLA_NET_NS_FD`、`IFLA_TARGET_NETNSID` のうち一つまでを
-    取ります（`EINVAL`）。
+    取ります（`EINVAL`）。リンクの取得は、はじめの二つのどちらも取りません（`EOPNOTSUPP`）。
   - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
     `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、
@@ -1342,7 +1346,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ない IPv6 のもの、有効な寿命がないか、それより長い推奨の寿命、`ifaddrmsg` より短い
     メッセージは `EINVAL`、ほかのインターフェースは `ENODEV` です。そのあと、新しい IPv6 の
     ものでは、128 を超える接頭辞と、64 でない接頭辞の `IFA_F_MANAGETEMPADDR` が
-    `EINVAL` です。`0.0.0.0` の `IFA_LOCAL` は受け取るだけで何もしません。`IFA_LABEL`、
+    `EINVAL`、`::` と、`IFA_F_MCAUTOJOIN` のないマルチキャストアドレスが `EADDRNOTAVAIL`
+    です。スコープの違うアドレスのサブネットに入る IPv4 のものは `EINVAL` です。
+    `0.0.0.0` の `IFA_LOCAL` は受け取るだけで何もしません。`IFA_LABEL`、
     `IFA_BROADCAST`、`IFA_FLAGS`（`IFA_F_NOPREFIXROUTE` と、IPv6 ではアドレスを 1 度だけ
     伝える `IFA_F_NODAD` も。IPv6 は要求が付けられるフラグだけを保ちます）、`IFA_PROTO`、
     アドレスの接頭辞の経路のメトリックになる `IFA_RT_PRIORITY`、`IFA_CACHEINFO` の寿命を
@@ -1409,7 +1415,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     優先する送り元、IPv4 のゲートウェイ（オンリンクも）を持てます。`NLM_F_EXCL`、
     `NLM_F_REPLACE`、`NLM_F_APPEND`、`NLM_F_CREATE` に従って Linux と同じ場所に置くか、
     Linux と同じエラーで断ります（`EEXIST`、`ENOENT`。接頭辞、スコープ、種類、
-    ゲートウェイ、優先する送り元がおかしければ `EINVAL`、ほかのデバイスは `ENODEV`、
+    ゲートウェイ、優先する送り元がおかしいときと、`RTA_FLOWLABEL`、`RTA_VIA`、
+    `RTM_F_CLONED` を持つ IPv6 の経路は `EINVAL`、ほかのデバイスは `ENODEV`、
     `lo` が落ちている間はホストのスコープの IPv4 の経路のほかは `ENETDOWN`）。
     `RTM_DELROUTE` は、指したものに合う最初の経路を消します（なければ `ESRCH`）。
     カーネルの経路も消せ、アドレスの変化や `lo` が上がったときに戻ります。`lo` を落とすと、

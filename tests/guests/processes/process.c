@@ -2211,18 +2211,17 @@ static const char *inet_label(unsigned ino) {
     return "?";
 }
 /* The label of the first socket of `type` on local port `port` that has no
-   peer or has `other`, the other end's port, as its peer; "0" for 0: TCP
-   and UDP ports are apart. Linux gives sockets that connect to different
-   ports the same local port when its hash of each destination happens to
-   choose it, so the port alone may name two of them. */
+   peer or has `other`, the other end's port, as its peer; "0" for 0, "?"
+   for none: TCP and UDP ports are apart. Linux gives sockets that connect
+   to different ports the same local port when its hash of each destination
+   happens to choose it, so the port alone may name two of them. Every
+   socket that connects has its peer, whatever the order they came in. */
 static const char *inet_port_label(unsigned short port, unsigned short other, int type) {
     if (port == 0) return "0";
     for (int i = 0; i < inet_count; i++)
         if (inet_sockets[i].port == port && inet_sockets[i].type == type &&
             (inet_sockets[i].peer == 0 || inet_sockets[i].peer == other))
             return inet_sockets[i].label;
-    for (int i = 0; i < inet_count; i++)
-        if (inet_sockets[i].port == port && inet_sockets[i].type == type) return inet_sockets[i].label;
     return "?";
 }
 /* The type of the socket of inode `ino`; one with none is TCP's. */
@@ -12230,6 +12229,8 @@ int main(int argc, char **argv) {
             int syn = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
             printf("syn connect=%ld\n", netns_result(connect(syn, (void *)&full_to, sizeof full_to)));
             inet_add("syn", syn);
+            /* Still in TCP_SYN_SENT, it has no peer getpeername gives. */
+            inet_find("syn")->peer = ntohs(full_to.sin_port);
             struct sockaddr_in6 any6 = {.sin6_family = AF_INET6};
             inet_pton(AF_INET6, "::1", &any6.sin6_addr);
             int listener6 = socket(AF_INET6, SOCK_STREAM, 0);

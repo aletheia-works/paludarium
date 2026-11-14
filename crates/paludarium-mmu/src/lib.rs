@@ -2348,17 +2348,6 @@ impl AddressSpaceData {
                 Some(prot) if access.permitted(prot) => {}
                 _ => return Err(fault(at)),
             }
-            // A shared page its memory refuses to take in is a bus error.
-            if access != Access::Setup
-                && let Some(shared) = self.shared_at(page)
-                && let Some(source) = &shared.pages.source
-                && !source.admit(page.wrapping_add(shared.shift))
-            {
-                return Err(Fault {
-                    bus: true,
-                    ..fault(at)
-                });
-            }
             let file = lookup(directory, page).map_or_else(
                 || {
                     self.mapping_at(page)
@@ -2367,6 +2356,19 @@ impl AddressSpaceData {
                 |p| p.file,
             );
             if file && self.past_file_end(page) {
+                return Err(Fault {
+                    bus: true,
+                    ..fault(at)
+                });
+            }
+            // A shared page its memory refuses to take in is a bus error;
+            // asked only of a page within its file, so that one past the
+            // end is never charged.
+            if access != Access::Setup
+                && let Some(shared) = self.shared_at(page)
+                && let Some(source) = &shared.pages.source
+                && !source.admit(page.wrapping_add(shared.shift))
+            {
                 return Err(Fault {
                     bus: true,
                     ..fault(at)

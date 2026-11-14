@@ -447,6 +447,8 @@ impl SecretCharge {
     /// (`__secretmem_account_pages`).
     pub(crate) fn admit(&self, offset: u64) -> bool {
         let page = offset & !4095;
+        // The file's own lock, then the machine's: `Drop` takes only the
+        // machine's, so the order never inverts.
         let mut charged = self.charged.lock().unwrap_or_else(PoisonError::into_inner);
         if charged.contains(&page) {
             return true;

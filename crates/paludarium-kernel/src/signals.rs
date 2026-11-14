@@ -263,7 +263,9 @@ pub(crate) fn wakes(process: &ThreadState, signal: &PendingSignal) -> bool {
 
 /// The clock a sleep counts on: a host clock, the process's CPU time
 /// (`CLOCK_PROCESS_CPUTIME_ID`), or the CPU time of another process or of
-/// another thread of the process, by its ID in the emulator.
+/// another thread of the process, by its ID in the emulator, which is never
+/// handed out twice ([`crate::processes::Processes::allocate`]), so a
+/// restart cannot find another task by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SleepClock {
     Host(ClockId),

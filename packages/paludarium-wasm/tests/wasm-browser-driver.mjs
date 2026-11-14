@@ -24,7 +24,7 @@ async function stopDriver(driver) {
 // or the launched Safari never becomes ready, e.g. run 43576635510 attempt 1 (4 such runs in 2026-11-08..14):
 // {"error":"session not created","message":"Could not create a session: The host application never became ready, unable to create a WebDriver session."}
 const SAFARI_LAUNCH_FAILURES = ["timed out while connecting to a Safari instance", "The host application never became ready"];
-export function isSafariLaunchTimeout(error) {
+export function isSafariLaunchFailure(error) {
   const text = String(error?.cause ?? error);
   return error?.phase === "session-creation" && text.includes('"error":"session not created"')
     && SAFARI_LAUNCH_FAILURES.some(failure => text.includes(failure));
@@ -46,7 +46,7 @@ async function safari(url, timeout) {
     const result = await safariAttempt(url, timeout);
     return { ...result, session_retry: { attempts: 1, retried: false, first_failure: null } };
   } catch (error) {
-    if (!isSafariLaunchTimeout(error)) throw error;
+    if (!isSafariLaunchFailure(error)) throw error;
     first = error;
   }
   const stopped = await stopSafari();

@@ -13464,10 +13464,13 @@ int main(int argc, char **argv) {
             nl_addr_life(ctl, port, add, AF_INET, "10.3.0.1", 24, 1, deprecated, 0, -1, "deprecated4");
             nl_addr_life(ctl, port, add, AF_INET, "10.4.0.1", 24, 1, valid, 0, -1, "valid4");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:2::1", 64, 1, both, 0, -1, "both6");
+            /* Read before the next IPv6 address, whose notifications would
+               race its duplicate address detection's work. */
+            monitor_show(mon, port, "both6");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:3::1", 64, 1, deprecated, 0, -1, "deprecated6");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:4::1", 64, 1, valid, 0, -1, "valid6");
-            nl_answer(ctl, nl_send(ctl, 22, NL_F_REQUEST | dump, everything, 8), port, "lifetimes");
             monitor_show(mon, port, "lifetimes");
+            nl_answer(ctl, nl_send(ctl, 22, NL_F_REQUEST | dump, everything, 8), port, "lifetimes");
             /* A priority for the prefix route. */
             nl_addr_life(ctl, port, add, AF_INET, "10.1.0.1", 24, 1, NULL, 50, -1, "priority4");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:1::1", 64, 1, NULL, 300, -1, "priority6");
@@ -13494,6 +13497,7 @@ int main(int argc, char **argv) {
             /* IPv6 keeps only the flags a request may set; IFA_F_NODAD
                tells of the address once. */
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:6::1", 64, 1, NULL, 0, 0x01 | 0x40, "flags6");
+            monitor_show(mon, port, "flags6");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:7::1", 64, 1, NULL, 0, 0x02, "nodad6");
             monitor_show(mon, port, "refused");
             /* Replaced: IPv4 takes the new priority, none being 0, and its
@@ -13508,11 +13512,15 @@ int main(int argc, char **argv) {
             monitor_show(mon, port, "replace6 400");
             /* A prefix route through lo does not run out by itself, but
                when an address of its prefix goes, it runs out with the
-               others. */
+               others. Each address's notifications are read before the next
+               change, as Linux ends its duplicate address detection in work
+               of its own. */
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:a::1", 64, 1, both, 0, -1, "shared one");
+            monitor_show(mon, port, "shared one");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:a::2", 64, 1, both, 0, -1, "shared two");
+            monitor_show(mon, port, "shared two");
             nl_addr(ctl, port, 21, 0, AF_INET6, "2001:db8:a::2", 64, 0, 1, "shared del");
-            monitor_show(mon, port, "shared");
+            monitor_show(mon, port, "shared del");
             nl_addr_life(ctl, port, replace, AF_INET6, "2001:db8:2::1", 128, 1, forever, 0, -1, "replace6 forever");
             monitor_show(mon, port, "replace6 forever");
             nl_addr_life(ctl, port, replace, AF_INET6, "2001:db8:4::1", 64, 1, NULL, 0, 0x200, "replace6 noprefixroute");

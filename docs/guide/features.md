@@ -58,7 +58,7 @@ kernel.
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
-| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times` |
+| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
@@ -898,7 +898,11 @@ kernel.
   process when it moves. A file mapping grows over more of the file, whose
   pages it reads when they are first touched, and moving a range that spans
   several mappings with `MREMAP_FIXED`, which recent Linux allows, gives
-  `EFAULT`.
+  `EFAULT`. The rings of AIO and `io_uring` are fixed mappings
+  (`VM_DONTEXPAND`): they do not grow (`EFAULT`) or stay behind a move
+  (`MREMAP_DONTUNMAP`, `EINVAL`), and an AIO ring moves only whole, as
+  Linux master's `aio_ring_mremap` has it (`EINVAL` once the target is
+  free and what a shrink drops is gone), with its context.
 - `msync` checks its arguments and the range, and with `MS_SYNC` or
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
 - `remap_file_pages` maps a range of a shared mapping again at another page
@@ -2367,7 +2371,11 @@ kernel.
   (`EPERM`); `timer_create` writes the timer's ID out before it refuses
   one, and the ID is used up, as it is when it cannot be written
   (`EFAULT`). `timer_create` also runs on the CPU clocks of the caller's
-  process and threads by number; it finds the task after the ID is out,
+  process and threads, and of other processes, by number; a timer on
+  another process's CPU time is expired by that process's checkpoints
+  while it is armed, as Linux's tick of that process expires it, and its
+  signal comes to the process that made it; once that process is reaped
+  the timer gives `ESRCH` to set and shows nothing. It finds the task after the ID is out,
   as Linux's `posix_cpu_timer_create` does, so a task that is not there
   gives `EINVAL` with the ID used up. A dynamic clock has no timers and
   cannot sleep (`EOPNOTSUPP`). A sleep on a CPU clock by number reads its
@@ -2376,8 +2384,7 @@ kernel.
   sleeps as below, and on another task's it returns at once when its time
   has come (a relative 0, or an absolute time the clock has reached), as
   Linux's `posix_cpu_nsleep`, but one that would wait for that task's CPU
-  time is not modelled (`EINVAL`), nor is a timer on another process's
-  CPU time.
+  time is not modelled (`EINVAL`).
 - A sleep on the process's CPU clock ends once the process's threads
   together have used the time, as Linux's `do_cpu_nanosleep`: a time that
   has passed, or none to sleep, returns at once, and the sleeping thread
@@ -2422,6 +2429,12 @@ kernel.
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's, rounded up to
   a whole second as Linux rounds it.
+- `iopl` and `ioperm` check their arguments as Linux does (a level past 3,
+  or a range that is empty or goes past port 65,535, gives `EINVAL`), keep
+  the thread's level of 0 and give up ports it never had, and give `EPERM`
+  for anything more, as a kernel locked down against port access does.
+  `acct` needs `CAP_SYS_PACCT` (`EPERM`), and then turns accounting off,
+  which is never on, or gives `EPERM` for a file.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

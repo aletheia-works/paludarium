@@ -199,6 +199,72 @@ fn finish(k: &mut Kernel, t: &Thread, m: &AddressSpace, status: ExitStatus) {
 mod process {
     use super::*;
     #[test]
+    fn timer_on_another_process_cpu_clock() {
+        use paludarium_host::ClockId;
+        let host = Arc::new(paludarium_host::testing::RecordingHost::new());
+        host.set_clock(ClockId::Monotonic, 1_000_000_000);
+        let mut k = Kernel::new(Arc::clone(&host) as Arc<dyn paludarium_host::Host>);
+        let mut t = Thread::new(
+            1,
+            CpuState::new(GuestAddr(0x400000), GuestAddr(DATA + PAGE_SIZE)),
+        );
+        let m = AddressSpace::new();
+        m.map_shared(
+            Some(GuestAddr(DATA)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        let (mut c, mut ct, cm) = fork(&mut k, &mut t, &m);
+        let clock = u64::from(((!(ct.tid as i32)) << 3 | 2) as u32);
+        // SIGUSR1, blocked so that it stays pending, SIGEV_SIGNAL, and 1 ms
+        // of the child's time.
+        t.state.signal_mask = 1 << 9;
+        m.write_u64(GuestAddr(DATA + 0x40), 7).unwrap();
+        m.write_u64(GuestAddr(DATA + 0x48), 10).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 222, [clock, DATA + 0x40, DATA, 0, 0, 0]),
+            0
+        );
+        let id = m.read_u64(GuestAddr(DATA)).unwrap() & 0xffff_ffff;
+        for (i, word) in [0, 0, 0, 1_000_000].into_iter().enumerate() {
+            m.write_u64(GuestAddr(DATA + 0x80 + 8 * i as u64), word)
+                .unwrap();
+        }
+        assert!(!c.group.cpu_timers_armed());
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 223, [id, 0, DATA + 0x80, 0, 0, 0]),
+            0
+        );
+        // Now the child accounts its CPU time, and its checkpoint expires
+        // the timer: the parent has SIGUSR1 pending.
+        assert!(c.group.cpu_timers_armed());
+        // The child's CPU time (here its wall time) counts from its first
+        // account.
+        c.checkpoint(&mut ct, &cm);
+        host.set_clock(ClockId::Monotonic, 1_002_000_000);
+        c.checkpoint(&mut ct, &cm);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 127, [DATA + 0x100, 8, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 0x100)).unwrap(), 1 << 9);
+        // A one-shot timer is done: the child stops accounting for it.
+        c.checkpoint(&mut ct, &cm);
+        assert!(!c.group.cpu_timers_armed());
+        // Once the child is reaped, the timer cannot be set (ESRCH).
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 61, [u64::from(ct.tid), 0, 0, 0, 0, 0]),
+            u64::from(ct.tid)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 223, [id, 0, DATA + 0x80, 0, 0, 0]),
+            Errno(3).to_syscall_return()
+        );
+    }
+    #[test]
     fn yama_lets_in_descendants_and_those_named() {
         let (mut k, mut t, m) = setup();
         let eperm = Errno::EPERM.to_syscall_return();

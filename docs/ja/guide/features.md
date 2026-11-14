@@ -50,7 +50,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
-| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times` |
+| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
@@ -807,6 +807,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   続きの上へ広げられ、そのページは初めて触れたときに読み込みます。また、複数の
   マッピングにまたがる範囲を
   `MREMAP_FIXED` で動かすと、`EFAULT` になります（最近の Linux は動かせます）。
+  AIO と `io_uring` のリングは固定のマッピング（`VM_DONTEXPAND`）で、広げられず
+  （`EFAULT`）、動かして元を残すこともできません（`MREMAP_DONTUNMAP`、`EINVAL`）。
+  AIO のリングは、Linux master の `aio_ring_mremap` と同じく丸ごとでなければ動かせず
+  （行き先を空け、縮めて落とす分を外したあとで `EINVAL`）、コンテキストも一緒に移ります。
 - `msync` は、引数と範囲を確かめ、`MS_SYNC` か `MS_ASYNC` なら共有のファイルの
   マッピングへの書き込みをファイルに書き戻します。
 - `remap_file_pages` は、共有のマッピングの範囲を、そのファイルや共有メモリの別の
@@ -2061,14 +2065,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ケーパビリティのない呼び出し元を断ります（`EPERM`）。`timer_create` は、断る前に
   タイマーの ID を書き出します。書き出せない場合（`EFAULT`）と同じく、その ID は
   使われたことになります。`timer_create` は、呼び出し元のプロセスとスレッドの CPU 時計を
-  番号で指しても動きます。Linux の `posix_cpu_timer_create` と同じく ID を書き出したあとで
+  番号で指しても、ほかのプロセスの CPU 時計を番号で指しても動きます。ほかのプロセスの CPU
+  時間でのタイマーは、Linux でそのプロセスのティックが満了させるのと同じく、設定されている
+  間はそのプロセスのチェックポイントが満了させ、シグナルは作ったプロセスに届きます。その
+  プロセスが回収されたあとは、設定すると `ESRCH` で、読んでも何も見えません。Linux の `posix_cpu_timer_create` と同じく ID を書き出したあとで
   タスクを探すので、ないタスクは `EINVAL` で、その ID は使われたことになります。動的な時計は
   タイマーを持てず、眠れもしません（`EOPNOTSUPP`）。番号で指した CPU 時計で眠る場合は、
   要求を読み、呼び出し元自身のスレッドの時計を断り（`EINVAL`）、次にないタスクを断ります
   （`EINVAL`）。呼び出し元のプロセスの時計なら下に書くとおりに眠り、ほかのタスクの時計なら、
   Linux の `posix_cpu_nsleep` と同じく、時が来ていれば（相対の 0 か、時計がすでに達した
-  絶対時刻）すぐに返ります。そのタスクの CPU 時間が使われるのを待つ眠りと、ほかの
-  プロセスの CPU 時間でのタイマーはまだ再現していません（`EINVAL`）。
+  絶対時刻）すぐに返ります。そのタスクの CPU 時間が使われるのを待つ眠りはまだ
+  再現していません（`EINVAL`）。
 - プロセスの CPU 時計での眠りは、Linux の `do_cpu_nanosleep` と同じく、プロセスの
   スレッドが合わせてその時間を使うと終わります。過ぎた時刻や 0 の時間ならすぐに戻ります。
   眠っているスレッド自身は CPU 時間を使わないので、ほかに動くスレッドのないプロセスは
@@ -2103,6 +2110,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   返します。
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
   見せません。起動からの時間は単調時計の値で、Linux と同じく秒単位に切り上げます。
+- `iopl` と `ioperm` は Linux と同じく引数を確かめ（3 を超えるレベルや、空の範囲、
+  ポート 65,535 を越える範囲は `EINVAL`）、スレッドのレベル 0 を保つことと、持っていない
+  ポートを手放すことは受け、それ以上はポートへのアクセスをロックダウンしたカーネルと同じく
+  `EPERM` を返します。`acct` は `CAP_SYS_PACCT` を求め（`EPERM`）、そのうえで、いつも
+  切れているアカウンティングを切ることは受け、ファイルには `EPERM` を返します。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。

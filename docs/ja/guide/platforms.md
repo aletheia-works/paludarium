@@ -48,9 +48,10 @@ macOS と Windows でも、Linux のバイナリを直接 exec するのでは�
 - ブラウザの主スレッドでは `Atomics.wait` が使えないので、エミュレータはすべて
   Worker の中で動きます。
 
-## Rust のツールチェーン
+## Rust のツールチェーン {#rust-toolchain}
 
 - 日付を固定した nightly（`rust-toolchain.toml` にあるもの。毎週、最新の nightly へ
   上げます）で作って確かめています。
-- crate の MSRV は 1.101 なので、今の stable の Rust ではビルドできません。
+- crate は MSRV として 1.101 を宣言しているので、1.101 より前の stable ではビルドできません。
+  stable の Rust では確かめていません。
 - WebAssembly 版は、さらに nightly の `build-std` と atomics の機能を使います。

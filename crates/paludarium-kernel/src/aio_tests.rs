@@ -235,6 +235,32 @@ fn setup_maps_a_ring_and_destroy_ends_it() {
 }
 
 #[test]
+fn mremap_moves_a_ring_only_whole() {
+    let mut f = fixture();
+    let ctx = f.setup(1000);
+    let size = 32 + 32 * u64::from(f.u32_at(ctx + 4));
+    assert!(size > 4096, "{size}");
+    // Part of it does not move (`aio_ring_mremap`), and stays where it is.
+    let to = 0x4000_0000;
+    assert_eq!(
+        f.ret(25, &[ctx, 4096, 4096, 1 | 2, to]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.u32_at(ctx + 16), 0xa10a_10a1);
+    assert!(f.mem.read_u64(GuestAddr(to)).is_err());
+    // A fixed mapping neither grows nor stays behind a move.
+    assert_eq!(
+        f.ret(25, &[ctx, size, size + 4096, 1]),
+        errno(Errno::EFAULT)
+    );
+    assert_eq!(f.ret(25, &[ctx, size, size, 1 | 4]), errno(Errno::EINVAL));
+    // Whole, it moves, and its context goes with it.
+    assert_eq!(f.ret(25, &[ctx, size, size, 1 | 2, to]), to);
+    assert!(f.mem.read_u64(GuestAddr(ctx)).is_err());
+    assert_eq!(f.ret(DESTROY, &[to]), 0);
+}
+
+#[test]
 fn reads_and_writes_complete_before_submit_returns() {
     let mut f = fixture();
     let fd = f.file("a", b"hello world");

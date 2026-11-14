@@ -38,6 +38,9 @@ pub mod nr {
     pub const SETTIMEOFDAY: u64 = 164;
     pub const CLOCK_SETTIME: u64 = 227;
     pub const CLOCK_ADJTIME: u64 = 305;
+    pub const ACCT: u64 = 163;
+    pub const IOPL: u64 = 172;
+    pub const IOPERM: u64 = 173;
     pub const TIME: u64 = 201;
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const MMAP: u64 = 9;
@@ -161,7 +164,7 @@ impl SyscallTable {
     /// The core table.
     #[must_use]
     pub fn u1() -> Self {
-        let entries: [(u64, Handler); 90] = [
+        let entries: [(u64, Handler); 93] = [
             (nr::GETITIMER, sys_getitimer),
             (nr::ALARM, sys_alarm),
             (nr::SETITIMER, sys_setitimer),
@@ -176,6 +179,9 @@ impl SyscallTable {
             (nr::CLOCK_SETTIME, sys_clock_settime),
             (nr::ADJTIMEX, sys_adjtimex),
             (nr::CLOCK_ADJTIME, sys_clock_adjtime),
+            (nr::ACCT, sys_acct),
+            (nr::IOPL, sys_iopl),
+            (nr::IOPERM, sys_ioperm),
             (nr::TIME, sys_time),
             (nr::NANOSLEEP, sys_nanosleep),
             (nr::CLOCK_NANOSLEEP, sys_clock_nanosleep),
@@ -754,6 +760,47 @@ fn sys_clock_adjtime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     })())
 }
 
+/// `iopl(level)`: a level past 3 gives `EINVAL`, and the thread's own, 0,
+/// succeeds with nothing to change. A higher one gives `EPERM`, with or
+/// without CAP_SYS_RAWIO, as a kernel locked down against port access
+/// (`LOCKDOWN_IOPORT`) refuses it: the host's ports cannot be given to the
+/// guest. Only the low 32 bits of the level count, as Linux's `unsigned
+/// int`.
+fn sys_iopl(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    match a[0] as u32 {
+        0 => ok(0),
+        1..=3 => err(Errno::EPERM),
+        _ => err(Errno::EINVAL),
+    }
+}
+
+/// `ioperm(from, num, turn_on)`: a range that is empty, wraps or goes past
+/// port 65,535 gives `EINVAL`; then turning ports on gives `EPERM`, as
+/// [`sys_iopl`]'s higher level, and turning them off succeeds, as there is
+/// no bitmap to clear. `turn_on` is Linux's `int`, its low 32 bits.
+fn sys_ioperm(_: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    const IO_BITMAP_BITS: u64 = 65_536;
+    let end = a[0].wrapping_add(a[1]);
+    if end <= a[0] || end > IO_BITMAP_BITS {
+        err(Errno::EINVAL)
+    } else if a[2] as u32 != 0 {
+        err(Errno::EPERM)
+    } else {
+        ok(0)
+    }
+}
+
+/// `acct(name)`: CAP_SYS_PACCT first (`EPERM`), as Linux. With it, a null
+/// name turns accounting off, which is never on, and a file gives `EPERM`
+/// still: no accounting records are written, so none is opened.
+fn sys_acct(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    if c.process.credentials.may_account() && a[0] == 0 {
+        ok(0)
+    } else {
+        err(Errno::EPERM)
+    }
+}
+
 /// `time(t)`: the seconds of the real time clock as of the latest tick, as
 /// Linux's `ktime_get_real_seconds` gives the timekeeper's `xtime_sec`
 /// (`CLOCK_REALTIME_COARSE`'s), also at `t` if it is not null.
@@ -1131,7 +1178,8 @@ fn outcome(result: Result<u64, Errno>) -> Outcome {
 /// CPU-time clocks of the calling process and of its threads, by number
 /// too ([`cpu_clock`], Linux's `posix_cpu_timer_create`). A dynamic clock
 /// has no timers (`EOPNOTSUPP`). A timer on another process's CPU time is
-/// not modelled (`EINVAL`).
+/// expired by that process's checkpoints
+/// ([`crate::ThreadGroup::watch_cpu`]).
 fn posix_timer_clock(c: &Context<'_>, id: u64) -> Result<crate::timers::TimerClock, Errno> {
     use crate::timers::TimerClock;
     match id as u32 as i32 {
@@ -1143,7 +1191,12 @@ fn posix_timer_clock(c: &Context<'_>, id: u64) -> Result<crate::timers::TimerClo
             GuestClock::ProcessCpu => Ok(TimerClock::Process),
             GuestClock::ThreadCpu => Ok(TimerClock::Thread(c.tid)),
             GuestClock::OtherThreadCpu(tid) => Ok(TimerClock::Thread(tid)),
-            // A timer on another process's CPU time is not modelled.
+            // cpu_clock found the process by this number.
+            GuestClock::OtherProcessCpu(_) => c
+                .pid_space()
+                .task(!(id >> 3) as u32)
+                .map(TimerClock::OtherProcess)
+                .ok_or(Errno::EINVAL),
             _ => Err(Errno::EINVAL),
         },
         _ => timer_clock(id, Errno::EINVAL).map(|clock| match clock {
@@ -1303,6 +1356,23 @@ fn timer_id(value: u64) -> i32 {
     value as u32 as i32
 }
 
+/// The time of a POSIX timer's clock ([`crate::ThreadGroup::timer_clock_now`]),
+/// another process's CPU time too: `ESRCH` once that process is reaped, as
+/// Linux's `timer_lock_sighand` finds no task.
+fn timer_clock_now(
+    c: &Context<'_>,
+    clock: crate::timers::TimerClock,
+    mono: u64,
+) -> Result<u64, Errno> {
+    match clock {
+        crate::timers::TimerClock::OtherProcess(pid) => c
+            .processes
+            .view(pid)
+            .map(|view| view.group.process_cpu())
+            .ok_or(Errno(3)),
+        clock => c.group.timer_clock_now(clock, mono),
+    }
+}
 /// The clock of timer `id`, which a CPU-time timer's time is sampled on
 /// before the timers are locked.
 fn timer_clock_of(c: &Context<'_>, id: i32) -> Result<crate::timers::TimerClock, Errno> {
@@ -1361,10 +1431,18 @@ fn sys_timer_settime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         let clock = timer_clock_of(c, timer_id(a[0]))?;
         if clock.is_cpu() {
             crate::account_cpu(c.host, c.group, c.process, c.tid);
-            let now = c.group.timer_clock_now(clock, mono)?;
+            let now = timer_clock_now(c, clock, mono)?;
             let old = c.group.with_timers(c.process, |timers| {
                 set_cpu_timer(timers.get_mut(timer_id(a[0]))?, a[1], new, now)
             })?;
+            // Another process's checkpoints expire a timer on its CPU time.
+            if let crate::timers::TimerClock::OtherProcess(pid) = clock
+                && value != 0
+                && let (Some(target), Some(own)) =
+                    (c.processes.view(pid), c.processes.view(c.process.pid))
+            {
+                target.group.watch_cpu(pid, &own.group);
+            }
             if a[3] != 0 {
                 write_words(c.mem, a[3], &old)?;
             }
@@ -1405,7 +1483,7 @@ fn sys_timer_gettime(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // thread whose clock it is has gone (Linux's `posix_cpu_timer_get`).
         let now = if clock.is_cpu() {
             crate::account_cpu(c.host, c.group, c.process, c.tid);
-            c.group.timer_clock_now(clock, mono).ok()
+            timer_clock_now(c, clock, mono).ok()
         } else {
             Some(mono)
         };
@@ -2006,7 +2084,7 @@ fn select(
                 .read_u64(GuestAddr(at.wrapping_add(index as u64 * 8)))
                 .map_err(|_| Errno::EFAULT)?;
         }
-        if n % 64 != 0
+        if !n.is_multiple_of(64)
             && let Some(last) = set.last_mut()
         {
             *last &= (1u64 << (n % 64)) - 1;
@@ -3875,7 +3953,7 @@ fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         .map(|word| u64::from_le_bytes(*word))
         .collect();
     // Only the CPUs the host has.
-    if cpus % 64 != 0
+    if !cpus.is_multiple_of(64)
         && let Some(last) = mask.last_mut()
     {
         *last &= (1u64 << (cpus % 64)) - 1;

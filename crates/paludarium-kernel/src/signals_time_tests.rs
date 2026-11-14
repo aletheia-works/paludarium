@@ -1150,6 +1150,35 @@ fn setting_the_time_is_refused_after_linux_checks() {
     set(&mut f, [8_277_292_035, 999_999_999]);
     assert_eq!(f.ret(227, &[0, DATA]), errno(Errno::EPERM));
 }
+/// iopl, ioperm and acct check their arguments as Linux does, then refuse
+/// what would need the host: ports even to root, accounting to a file.
+#[test]
+fn port_access_and_accounting_are_refused_after_linux_checks() {
+    let mut f = fixture();
+    let ports = syscalls::nr::IOPERM;
+    for (level, expected) in [(0, 0), (1 << 32, 0), (1, errno(Errno::EPERM)), (3, errno(Errno::EPERM))] {
+        assert_eq!(f.ret(syscalls::nr::IOPL, &[level]), expected);
+    }
+    for level in [4, u64::from(u32::MAX), (1 << 32) | 4] {
+        assert_eq!(f.ret(syscalls::nr::IOPL, &[level]), errno(Errno::EINVAL));
+    }
+    // ioperm: the range first, even when turning off; then turning on.
+    for (from, num) in [(0, 0), (65_535, 2), (65_536, 1), (u64::MAX, 2)] {
+        assert_eq!(f.ret(ports, &[from, num, 0]), errno(Errno::EINVAL));
+    }
+    assert_eq!(f.ret(ports, &[0, 65_536, 0]), 0);
+    assert_eq!(f.ret(ports, &[0x80, 1, 1 << 32]), 0);
+    assert_eq!(f.ret(ports, &[65_535, 1, 1]), errno(Errno::EPERM));
+    // acct: root may turn accounting off, but not on.
+    assert_eq!(f.ret(syscalls::nr::ACCT, &[0]), 0);
+    assert_eq!(f.ret(syscalls::nr::ACCT, &[1]), errno(Errno::EPERM));
+    let root = f.thread.state.credentials.clone();
+    f.thread.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+    assert_eq!(f.ret(syscalls::nr::ACCT, &[0]), errno(Errno::EPERM));
+    assert_eq!(f.ret(syscalls::nr::IOPL, &[0]), 0);
+    assert_eq!(f.ret(ports, &[0, 1, 0]), 0);
+    assert_eq!(f.ret(ports, &[0, 1, 1]), errno(Errno::EPERM));
+}
 /// adjtimex reads Linux's state at boot and refuses to change it.
 #[test]
 fn adjtimex_reads_an_unsynchronised_clock() {

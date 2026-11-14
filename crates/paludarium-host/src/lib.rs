@@ -8,7 +8,6 @@
 //! This is the only crate where `unsafe` is permitted. The core
 //! implementation does not need any.
 
-#![cfg_attr(windows, feature(windows_by_handle))]
 #![cfg_attr(target_arch = "wasm32", feature(stdarch_wasm_atomic_wait))]
 
 use std::io;

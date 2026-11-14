@@ -132,7 +132,9 @@ lock 付きの命令のフェンスを外しても、テストはすべて通り
 
 - 行カバレッジの下限は 80% です。公開の前の測定では、workspace 全体で約 94% でした。
 - `cargo fmt --check`、clippy（警告はエラー）、`cargo deny`（ライセンス、取得元、
-  既知の脆弱性）を、プルリクエストごとに動かします。
+  既知の脆弱性）を、プルリクエストごとに動かします。clippy は、最新の stable の Rust でも
+  Linux・macOS・Windows のターゲットに動かし、ネイティブの crate が stable でもビルドできることを
+  保ちます。テストは、固定した nightly だけで動かします。
 - GitHub Actions の action は、すべてコミットの SHA で固定しています。
 
 ## CI

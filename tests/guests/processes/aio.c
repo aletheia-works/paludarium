@@ -682,6 +682,29 @@ static void *waiter(void *arg) {
     return (void *)r;
 }
 
+/* A ring is a fixed mapping: mremap neither grows it (EFAULT) nor leaves it
+ * behind (MREMAP_DONTUNMAP, EINVAL), and moves it whole with its context.
+ * A move of part of it, which Linux master refuses since 2026-04
+ * (aio_ring_mremap), is left out: CI's kernel may be older. */
+static int case_mremap(void) {
+    aio_context_t ctx = 0;
+    printf("setup=%ld\n", setup(1000, &ctx));
+    if (!ctx) return 3;
+    unsigned long size = 32 + 32 * (unsigned long)((struct aio_ring *)ctx)->nr;
+    printf("pages=%lu\n", size / 4096);
+    void *grown = mremap((void *)ctx, size, size + 4096, MREMAP_MAYMOVE);
+    printf("grow=%d\n", grown == MAP_FAILED ? -errno : 0);
+    void *kept = mremap((void *)ctx, size, size, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    printf("dontunmap=%d\n", kept == MAP_FAILED ? -errno : 0);
+    void *to = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (to == MAP_FAILED) return 4;
+    void *moved = mremap((void *)ctx, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, to);
+    printf("moved=%d\n", moved == to ? 0 : -errno);
+    printf("old destroy=%ld\n", destroy(ctx));
+    printf("new destroy=%ld\n", destroy((aio_context_t)to));
+    return 0;
+}
+
 static int case_lifetime(int argc, char **argv) {
     unsigned long before = aio_nr();
     aio_context_t ctx = 0;
@@ -770,6 +793,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "aio-getevents")) return case_getevents();
     if (!strcmp(mode, "aio-full")) return case_full();
     if (!strcmp(mode, "aio-lifetime")) return case_lifetime(argc, argv);
+    if (!strcmp(mode, "aio-mremap")) return case_mremap();
     if (!strcmp(mode, "aio-exec") && argc > 3) return case_exec(argv);
     return 2;
 }

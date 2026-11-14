@@ -206,9 +206,8 @@ verified.
   `EINVAL` unless the file is ready, is guessed from the kind of file: a FIFO
   open to read and write, and a character device (a terminal). A ring holds
   exactly one request fewer than its events, where Linux's per-CPU counts
-  can stop one sooner; the I/O priority of `IOCB_FLAG_IOPRIO` is checked but
-  changes nothing; and a ring `mremap` moves is found at its new address
-  only when it moved whole (Linux refuses a partial move).
+  can stop one sooner; and the I/O priority of `IOCB_FLAG_IOPRIO` is checked
+  but changes nothing.
 - **Some system calls**: unimplemented system calls return `ENOSYS`, so some
   programs can carry on without the feature.
   - `pwritev2`'s `RWF_NOAPPEND` cannot turn an `O_APPEND` file's append off
@@ -258,8 +257,15 @@ verified.
     CPU clock, which the sleeping thread looks at every tick; where that is
     wall time, the sleep counts its own time too, so a process alone ends
     it after the wall time it asked for.
-    `timer_create` on another process's CPU clock gives `EINVAL`, where
-    Linux makes the timer, and a sleep on another task's CPU clock gives
+    A timer on another process's CPU time is looked at as that process's
+    threads make system calls, the same way. Another process's CPU time,
+    read or set from outside it, is each of its threads' as of that thread's
+    last account (its last system call, while nothing timed that process),
+    as a thread's CPU time can only be measured by the thread itself: a
+    timer set on it counts from there, so its first expiry can come early
+    by what the process ran since then without a system call, and
+    `timer_gettime` can show more time left, where Linux samples the
+    running threads at once. A sleep on another task's CPU clock gives
     `EINVAL` unless its time has already come, where Linux waits until that
     task has used the time.
   - The time cannot be set: `settimeofday`, `clock_settime` and an
@@ -269,6 +275,14 @@ verified.
     with. `clock_settime` on a CPU clock named by a negative clock ID gives
     `EINVAL` without reading the time, where Linux reads it, finds the task
     and gives `EPERM`, and the auxiliary clocks (`CLOCK_AUX`) are not there.
+  - The host's I/O ports cannot be used: `iopl` above level 0 and `ioperm`
+    turning ports on give `EPERM` even to a caller with `CAP_SYS_RAWIO`, as
+    a kernel locked down against port access gives, where Linux without
+    lockdown grants them. Process accounting cannot be turned on: `acct`
+    with a file gives `EPERM` even with `CAP_SYS_PACCT`, without reading
+    its name, where Linux opens the file (so a bad pointer gives `EFAULT`,
+    a missing file `ENOENT` and one that is not regular `EACCES`) and writes
+    a record as each process exits.
   - A file in `/proc` or `/dev` has the `st_dev` of the mount holding the
     path, so `ustat` of it gives that mount's counts, where Linux gives
     procfs's or devtmpfs's.
@@ -598,7 +612,9 @@ verified.
   and only Linux on x86-64 hosts has it; the other native builds use the
   interpreter. It compiles only the instructions with a simple form at the
   start of a block ([Architecture](../design/architecture#the-native-jit)).
-- **Stable Rust**: a nightly Rust is required.
+- **Stable Rust**: stable releases before 1.101 cannot build the crates (their
+  MSRV), the WebAssembly build uses nightly-only features, and no stable Rust
+  is tested; use a nightly Rust ([Supported platforms](platforms#rust-toolchain)).
 
 ## Not verified
 

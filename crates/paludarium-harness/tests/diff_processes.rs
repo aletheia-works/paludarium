@@ -271,7 +271,7 @@ mod linux {
             // clock does not pass.
             if matches!(
                 mode,
-                "cpu-itimer" | "rlimit-cpu" | "cpu-timer" | "cpu-sleep"
+                "cpu-itimer" | "rlimit-cpu" | "cpu-timer" | "cpu-sleep" | "cpu-timer-others"
             ) {
                 host.measure_cpu_time();
             }
@@ -386,6 +386,7 @@ mod linux {
         aio_getevents => ("aio-getevents","aio"),
         aio_full => ("aio-full","aio"),
         aio_lifetime => ("aio-lifetime","aio"),
+        aio_mremap => ("aio-mremap","aio"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -553,8 +554,10 @@ mod linux {
         processes_rlimit_cpu => ("rlimit-cpu","process"),
         processes_cpu_timer => ("cpu-timer","process"),
         processes_time_set => ("time-set","process"),
+        processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),
         processes_cpu_sleep => ("cpu-sleep","process"),
+        processes_cpu_timer_others => ("cpu-timer-others","process"),
         processes_mprotect_checks => ("mprotect-checks","process"),
         processes_io_uring => ("io-uring","process"),
         vfork_exit => ("vfork-exit","process"),

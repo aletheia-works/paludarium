@@ -138,6 +138,8 @@ const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 const RTM_F_CLONED: u32 = 0x200;
 const RTCF_LOCAL: u32 = 0x8000_0000;
 const RTCF_BROADCAST: u32 = 0x1000_0000;
+/// The mark `RTM_F_NOTIFY` leaves on a looked-up route.
+const RTCF_NOTIFY: u32 = 0x0001_0000;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_METRICS: u16 = 8;
@@ -2923,8 +2925,8 @@ fn ipv6_route_of(
 ///
 /// IPv4, as `ip_route_output_key_hash_rcu`: a source (`RTA_SRC`) is
 /// `EINVAL` when multicast or the limited broadcast address and
-/// `ENETUNREACH` when not the loopback's ([`crate::interface::Addresses::is_local4`]);
-/// an output device (`RTA_OIF`) is `ENODEV` but for `lo`, and
+/// `ENETUNREACH` when not the loopback's
+/// ([`crate::interface::Addresses::is_local4`]); an output device (`RTA_OIF`) is `ENODEV` but for `lo`, and
 /// `ENETUNREACH` while it is down. `0.0.0.0` goes to the loopback, from
 /// the source, or else from `127.0.0.1` (with a device, from the address
 /// `inet_select_addr` picks of host scope). The tables are looked in by the
@@ -2939,12 +2941,16 @@ fn ipv6_route_of(
 /// the table it came from (the main one for the local one, whose trie it
 /// shares), or 0 where no table gave it. With `RTM_F_FIB_MATCH` the answer
 /// is the table's entry that matched, and `EHOSTUNREACH` where none did.
+/// With `RTM_F_NOTIFY` its flags have `RTM_F_NOTIFY` and `RTCF_NOTIFY`,
+/// which Linux keeps on the cached route, so that later lookups through it
+/// show them too, and this does not.
 ///
 /// IPv6, as `ip6_route_output`: `ENETUNREACH` while `lo` is down, and for
 /// an output device but `lo` without a source, or to a loopback,
-/// link-local or multicast address (`RT6_LOOKUP_F_IFACE`); the answer gives the request's source as `RTA_SRC`. The mark, the user ID,
-/// the protocol and the ports choose among policy rules and multipath
-/// routes, of which there are none, so they change nothing.
+/// link-local or multicast address (`RT6_LOOKUP_F_IFACE`); the answer
+/// gives the request's source as `RTA_SRC`. The mark, the user ID, the
+/// protocol and the ports choose among policy rules and multipath routes,
+/// of which there are none, so they change nothing.
 fn lookup(
     network: &Network,
     payload: &[u8],
@@ -3158,11 +3164,14 @@ fn lookup(
     };
     // `rt_fill_info` of the cached route the lookup made, which is local as
     // it goes through `lo`.
-    let flags = if kind == Kind::Broadcast {
+    let mut flags = if kind == Kind::Broadcast {
         RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST
     } else {
         RTM_F_CLONED | RTCF_LOCAL
     };
+    if request_flags & RTM_F_NOTIFY != 0 {
+        flags |= RTM_F_NOTIFY | RTCF_NOTIFY;
+    }
     let mut body = vec![
         AF_INET,
         32,
@@ -3204,13 +3213,15 @@ fn lookup(
 /// take it ([`crate::interface::Addresses::add_route4`] and the others):
 /// `EINVAL` for one shorter than an `rtmsg`; then the family's policy
 /// (`rtm_ipv4_policy`, `rtm_ipv6_policy`), and `EINVAL` for an IPv6
-/// destination shorter than its prefix; then `EINVAL` for a TOS with ECN bits (any for IPv6) or a
-/// kind past `RTN_MAX`. Multipath routes, encapsulations,
-/// nexthop objects, realms, expiries, IPv6 gateways, source prefixes and
-/// router preferences are `EOPNOTSUPP`. A route added takes the metrics
-/// `RTA_METRICS` holds ([`convert_metrics`]); an IPv4 one removed must
-/// have those it names ([`metrics_match`]), and IPv6's does not look. The table is the `rtmsg`'s, or the
-/// one `RTA_TABLE` names.
+/// destination shorter than its prefix; then `EINVAL` for a TOS with ECN
+/// bits (any for IPv6; other bits past the legacy TOS ones are taken, and
+/// such a route matches no lookup, as on Linux) or a kind past `RTN_MAX`.
+/// Multipath routes, encapsulations, nexthop objects, realms, expiries,
+/// IPv6 gateways, source prefixes and router preferences are
+/// `EOPNOTSUPP`. A route added takes the metrics `RTA_METRICS` holds
+/// ([`convert_metrics`]); an IPv4 one removed must have those it names
+/// ([`metrics_match`]), and IPv6's does not look. The table is the
+/// `rtmsg`'s, or the one `RTA_TABLE` names.
 fn change_route(
     network: &Network,
     header: &Header,
@@ -4098,6 +4109,8 @@ mod tests {
         };
         add([10, 9, 0, 0], 0, 1);
         add([10, 9, 0, 0], 0x10, 1);
+        // A TOS past the legacy bits is taken, and matches nothing.
+        add([10, 9, 0, 0], 0x20, 1);
         add([10, 6, 0, 0], 0, 6);
         // A lookup of `dst` with `tos`, `flags` and the attributes, and its
         // answer's rtmsg and attributes.
@@ -4131,6 +4144,15 @@ mod tests {
         assert_eq!(header[3], 0x10);
         let (header, _) = get(AF_INET, 0x14, 0, &[(RTA_DST, &[10, 9, 1, 1])]).unwrap();
         assert_eq!(header[3], 0);
+        let (header, _) = get(AF_INET, 0x20, 0, &[(RTA_DST, &[10, 9, 1, 1])]).unwrap();
+        assert_eq!(header[3], 0);
+        // RTM_F_NOTIFY marks the answer.
+        let (header, _) = get(AF_INET, 0, RTM_F_NOTIFY, &[(RTA_DST, &[10, 9, 1, 1])]).unwrap();
+        let flags = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        assert_eq!(
+            flags,
+            RTM_F_CLONED | RTCF_LOCAL | RTM_F_NOTIFY | RTCF_NOTIFY
+        );
         // The source: the loopback's, named as RTA_SRC and not RTA_PREFSRC;
         // EINVAL for a multicast or broadcast one, ENETUNREACH for another.
         let from = |source: [u8; 4], to: [u8; 4]| {

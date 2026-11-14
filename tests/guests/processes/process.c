@@ -12898,6 +12898,8 @@ int main(int argc, char **argv) {
 #define ROUTE4(...) ((struct nl_rt){.family = AF_INET, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
             nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "add plain");
             nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.tos = 0x10, .scope = 253, .oif = 1), "add tos");
+            /* A TOS past the legacy bits is taken, and matches nothing. */
+            nl_route(ctl, port, 24, add, "10.9.0.0", 16, ROUTE4(.tos = 0x20, .scope = 253, .oif = 1), "add tos 0x20");
             nl_route(ctl, port, 24, add, "10.6.0.0", 16, ROUTE4(.kind = 6), "add blackhole");
 #undef ROUTE4
             /* A device no namespace has: Linux may have fallback tunnels of
@@ -12907,6 +12909,7 @@ int main(int argc, char **argv) {
             nl_select(ctl, port, "10.9.1.1", 0x10, 0, NULL, 0, 0, 0, "tos 0x10");
             nl_select(ctl, port, "10.9.1.1", 0xf0, 0, NULL, 0, 0, 0, "tos 0xf0");
             nl_select(ctl, port, "10.9.1.1", 0x14, 0, NULL, 0, 0, 0, "tos 0x14");
+            nl_select(ctl, port, "10.9.1.1", 0x20, 0, NULL, 0, 0, 0, "tos 0x20");
             nl_select(ctl, port, "10.9.1.1", 0x10, 0x2000, NULL, 0, 0, 0, "tos 0x10 fibmatch");
             /* The source: the loopback's, or refused. */
             nl_select(ctl, port, "10.9.1.1", 0, 0, "127.0.0.5", 0, 0, 0, "from 127.0.0.5");
@@ -12939,6 +12942,9 @@ int main(int argc, char **argv) {
                 nl_select(ctl, port, "::1", 0, 0, NULL, 0, 0, protos[i], label);
             }
             nl_select(ctl, port, "10.9.1.1", 0, 0, NULL, 0, none, 0, "iif none");
+            /* RTM_F_NOTIFY marks the answer. Linux keeps the mark on the
+               route it caches, so this is the last lookup through it. */
+            nl_select(ctl, port, "10.9.1.1", 0, 0x100, NULL, 0, 0, 0, "notify");
             /* IPv6: the source as it is; another device without one. */
             nl_select(ctl, port, "::1", 0, 0, "2001:db8::1", 0, 0, 0, "six from");
             nl_select(ctl, port, "::1", 0, 0, NULL, 1, 0, 0, "six oif lo");

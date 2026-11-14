@@ -477,9 +477,10 @@ verified.
   lookup while `lo` is down is `ENETUNREACH` too. A route lookup of a
   multicast or the limited broadcast address answers with the route the
   tables give, where Linux's answer is of the multicast or broadcast kind
-  `__mkroute_output` makes for them (and, from a source, comes from no
-  table at all); its `rta_cacheinfo` counts one reference, where Linux
-  counts the other users of the cached route too.
+  `__mkroute_output` makes for them; its `rta_cacheinfo` counts one
+  reference, where Linux counts the other users of the cached route too.
+  `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the
+  cached route, so that later lookups through it are marked too.
   Notifications go out for the link, its IPv6 information, addresses and
   routes alone, not for neighbours, netconf or the other groups, nor to a
   socket in another namespace (`NETLINK_LISTEN_ALL_NSID` is not

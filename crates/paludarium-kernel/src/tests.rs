@@ -4052,6 +4052,21 @@ mod io_uring {
     }
 
     #[test]
+    fn mremap_neither_grows_nor_keeps_behind_a_ring() {
+        let mut f = fixture();
+        let r = ring(&mut f);
+        // A fixed mapping (`VM_DONTEXPAND`): no growth, no MREMAP_DONTUNMAP.
+        assert_eq!(f.ret(25, &[r.sqes, 4096, 8192, 1]), errno(Errno::EFAULT));
+        assert_eq!(
+            f.ret(25, &[r.sqes, 4096, 4096, 1 | 4]),
+            errno(Errno::EINVAL)
+        );
+        // It moves: `io_uring` has no `mremap` of its own.
+        let to = 0x4000_0000;
+        assert_eq!(f.ret(25, &[r.sqes, 4096, 4096, 1 | 2, to]), to);
+    }
+
+    #[test]
     fn setup_gives_linux_sizes_offsets_and_features() {
         let mut f = fixture();
         let p = params(&mut f, 0);

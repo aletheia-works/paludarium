@@ -704,6 +704,7 @@ static int case_mremap(void) {
     printf("new destroy=%ld\n", destroy((aio_context_t)to));
     return 0;
 }
+
 static int case_lifetime(int argc, char **argv) {
     unsigned long before = aio_nr();
     aio_context_t ctx = 0;

@@ -276,8 +276,10 @@ verified.
     turning ports on give `EPERM` even to a caller with `CAP_SYS_RAWIO`, as
     a kernel locked down against port access gives, where Linux without
     lockdown grants them. Process accounting cannot be turned on: `acct`
-    with a file gives `EPERM` even with `CAP_SYS_PACCT`, where Linux opens
-    the file and writes a record as each process exits.
+    with a file gives `EPERM` even with `CAP_SYS_PACCT`, without reading
+    its name, where Linux opens the file (so a bad pointer gives `EFAULT`,
+    a missing file `ENOENT` and one that is not regular `EACCES`) and writes
+    a record as each process exits.
   - `ustat` finds only the mounts' devices. The `st_dev` of a pipe, a
     socket, a memfd or a namespace file gives `EINVAL`, where Linux finds
     the superblock of its pseudo filesystem and gives its counts (0). A

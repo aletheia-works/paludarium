@@ -168,7 +168,7 @@ the real work started.
   thread grows that memory crashes the page.
 - To share the whole emulator (the Rust heap and std) between Workers, std is
   rebuilt with atomics, and every run and guest thread gets a stack and TLS of
-  its own, freed when it ends; a Worker that waits gets the next thread's.
+  its own, freed when it ends; an idle Worker takes the next thread's.
 
 ## The JIT as a separate component
 

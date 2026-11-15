@@ -345,10 +345,10 @@ pub enum Fast {
     },
 }
 
-/// A general-purpose register that is not one of the high bytes.
+/// A general register, or one of the high-byte registers ah, ch, dh and bh.
 fn gpr(o: Option<Operand>) -> Option<Register> {
     match o {
-        Some(Operand::Register(r @ Register::Gpr { .. })) => Some(r),
+        Some(Operand::Register(r @ (Register::Gpr { .. } | Register::GprHigh8 { .. }))) => Some(r),
         _ => None,
     }
 }
@@ -363,7 +363,9 @@ fn gpr64(o: Option<Operand>) -> Option<u8> {
 /// A register of `size` bytes, or an immediate.
 fn source(o: Option<Operand>, size: u8) -> Option<Source> {
     match o {
-        Some(Operand::Register(r @ Register::Gpr { size: s, .. })) if s == size => {
+        Some(Operand::Register(r @ (Register::Gpr { .. } | Register::GprHigh8 { .. })))
+            if r.size() == size =>
+        {
             Some(Source::Register(r))
         }
         Some(Operand::Immediate(v)) => Some(Source::Immediate(v)),

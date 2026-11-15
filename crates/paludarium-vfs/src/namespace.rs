@@ -25,6 +25,27 @@ pub mod mount_flags {
     pub const RELATIME: u32 = 0x20;
     pub const READONLY: u32 = 0x40;
     pub const NOSYMFOLLOW: u32 = 0x80;
+    /// The flags `mount` and a remount set (`MNT_USER_SETTABLE_MASK`).
+    pub const SETTABLE: u32 = 0xff;
+    /// The access-time flags (`MNT_ATIME_MASK`).
+    pub const ATIME: u32 = NOATIME | NODIRATIME | RELATIME;
+    /// What a copy into a less privileged mount namespace may not change
+    /// (`MNT_LOCK_*`, set by `lock_mnt_tree`), kept apart from the flags.
+    pub const LOCK_ATIME: u32 = 0x100;
+    pub const LOCK_READONLY: u32 = 0x200;
+    pub const LOCK_NODEV: u32 = 0x400;
+    pub const LOCK_NOSUID: u32 = 0x800;
+    pub const LOCK_NOEXEC: u32 = 0x1000;
+}
+
+/// A propagation type `mount` gives a mount (`MS_SHARED`, `MS_PRIVATE`,
+/// `MS_SLAVE`, `MS_UNBINDABLE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Propagation {
+    Shared,
+    Private,
+    Slave,
+    Unbindable,
 }
 
 /// `show_vfsmnt_opts`: the per-mount options `/proc/self/mountinfo` shows
@@ -46,15 +67,80 @@ fn shown_flags(flags: u32) -> String {
     .collect()
 }
 
-/// The IDs and device minors in use, which every table made from the first
-/// one shares: Linux's `mnt_id_ida` and `unnamed_dev_ida`, each handing out
-/// the lowest free number.
+/// The IDs, device minors and peer groups in use, which every table made
+/// from the first one shares: Linux's `mnt_id_ida`, `unnamed_dev_ida` and
+/// `mnt_group_ida`, each handing out the lowest free number. It also keeps
+/// the superblocks of the boot mounts, by device, and every table, which a
+/// change of a peer group reaches.
 #[derive(Default)]
 struct Numbers {
     ids: Mutex<BTreeSet<u64>>,
     minors: Mutex<BTreeSet<u64>>,
+    groups: Mutex<BTreeSet<u64>>,
+    boot: Mutex<BTreeMap<u64, Arc<SuperState>>>,
+    tables: Mutex<Vec<std::sync::Weak<dyn Listed>>>,
+}
+/// A table [`Numbers`] keeps, behind a trait object, which keeps the
+/// auto-trait checks of what holds a table shallow.
+trait Listed: Send + Sync {
+    fn table(&self) -> &MountTable;
+}
+impl Listed for MountTable {
+    fn table(&self) -> &MountTable {
+        self
+    }
 }
 impl Numbers {
+    /// Every table that is still there.
+    fn tables(&self) -> Vec<Arc<dyn Listed>> {
+        let mut tables = lock(&self.tables);
+        tables.retain(|t| t.strong_count() > 0);
+        tables.iter().filter_map(std::sync::Weak::upgrade).collect()
+    }
+    /// The boot superblock of `device`.
+    fn boot_state(&self, device: u64) -> Arc<SuperState> {
+        Arc::clone(lock(&self.boot).entry(device).or_default())
+    }
+    /// Peer group `group`'s members have left: when none is left in any table its number is free again,
+    /// and its slaves become slaves of `master` (`transfer_propagation`),
+    /// or private for none.
+    fn left(&self, group: u64, master: u64) {
+        if group == 0 {
+            return;
+        }
+        let tables = self.tables();
+        if tables
+            .iter()
+            .any(|t| t.table().snapshot().iter().any(|e| e.group == group))
+        {
+            return;
+        }
+        lock(&self.groups).remove(&group);
+        for table in &tables {
+            let table = table.table();
+            if table.snapshot().iter().any(|e| e.master == group) {
+                let _ = table.update(|entries| {
+                    for e in entries.iter_mut().filter(|e| e.master == group) {
+                        e.master = master;
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+    /// The master of a member of peer group `group`, in any table.
+    fn master_of(&self, group: u64) -> u64 {
+        self.tables()
+            .iter()
+            .find_map(|t| {
+                t.table()
+                    .snapshot()
+                    .iter()
+                    .find(|e| e.group == group)
+                    .map(|e| e.master)
+            })
+            .unwrap_or(0)
+    }
     fn take(set: &Mutex<BTreeSet<u64>>, from: u64) -> u64 {
         let mut set = lock(set);
         let mut n = from;
@@ -64,6 +150,15 @@ impl Numbers {
         set.insert(n);
         n
     }
+}
+
+/// What every mount of a superblock shares: whether it is read-only
+/// (`SB_RDONLY`), and how many files are open for writing on its mounts,
+/// which a remount read-only refuses (`sb_prepare_remount_readonly`).
+#[derive(Default)]
+struct SuperState {
+    read_only: AtomicBool,
+    writers: AtomicUsize,
 }
 
 /// One mount's identity: its ID, held until the last [`MountPin`] and
@@ -77,6 +172,48 @@ struct Token {
     /// How many [`MountPin`]s hold it: Linux's `mnt_count` less the
     /// parent's and the lookup's own references.
     pins: AtomicUsize,
+    /// How many of them are files open for writing (`mnt_writers`).
+    writers: AtomicUsize,
+    state: Arc<SuperState>,
+    /// `MNT_EXPIRE`'s mark (`mnt_expiry_mark`), which any use of the
+    /// mount clears (`mntput`).
+    expiry: AtomicBool,
+}
+thread_local! {
+    /// Whether this thread's lookups now leave expiry marks ([`keeping_expiry`]).
+    static KEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Runs `f`, whose lookups leave the mounts' expiry marks, as `umount2`'s
+/// own lookup does (`path_umount` drops it without `mntput`).
+pub fn keeping_expiry<T>(f: impl FnOnce() -> T) -> T {
+    let was = KEEPING.with(|keeping| keeping.replace(true));
+    let value = f();
+    KEEPING.with(|keeping| keeping.set(was));
+    value
+}
+impl Token {
+    /// `mntput`: a use of the mount ends, which clears its expiry mark.
+    fn used(&self) {
+        if self.expiry.load(Ordering::Relaxed) && !KEEPING.with(std::cell::Cell::get) {
+            self.expiry.store(false, Ordering::SeqCst);
+        }
+    }
+    fn new(
+        id: u64,
+        numbers: &Arc<Numbers>,
+        superblock: Option<Arc<Superblock>>,
+        state: Arc<SuperState>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            numbers: Arc::clone(numbers),
+            _superblock: superblock,
+            pins: AtomicUsize::new(0),
+            writers: AtomicUsize::new(0),
+            state,
+            expiry: AtomicBool::new(false),
+        })
+    }
 }
 impl Drop for Token {
     fn drop(&mut self) {
@@ -89,7 +226,7 @@ impl Drop for Token {
 /// it. It keeps a detached mount's file system too. Its mount is behind a
 /// trait object, which keeps the auto-trait checks of the files that hold
 /// one shallow.
-pub struct MountPin(Arc<dyn Pinned>);
+pub struct MountPin(Arc<dyn Pinned>, bool);
 /// A mount a [`MountPin`] holds.
 trait Pinned: Send + Sync {
     fn token(&self) -> &Token;
@@ -100,20 +237,37 @@ impl Pinned for Token {
     }
 }
 impl MountPin {
-    fn new(token: &Arc<Token>) -> Self {
+    /// A pin of `token`'s mount; with `writer` one that writes to it.
+    fn new(token: &Arc<Token>, writer: bool) -> Self {
+        let pin = Self(Arc::clone(token) as Arc<dyn Pinned>, writer);
+        pin.take();
+        pin
+    }
+    fn take(&self) {
+        let token = self.0.token();
         token.pins.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(token) as Arc<dyn Pinned>)
+        if self.1 {
+            token.writers.fetch_add(1, Ordering::SeqCst);
+            token.state.writers.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 impl Clone for MountPin {
     fn clone(&self) -> Self {
-        self.0.token().pins.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(&self.0))
+        let pin = Self(Arc::clone(&self.0), self.1);
+        pin.take();
+        pin
     }
 }
 impl Drop for MountPin {
     fn drop(&mut self) {
-        self.0.token().pins.fetch_sub(1, Ordering::SeqCst);
+        let token = self.0.token();
+        token.used();
+        token.pins.fetch_sub(1, Ordering::SeqCst);
+        if self.1 {
+            token.writers.fetch_sub(1, Ordering::SeqCst);
+            token.state.writers.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 impl std::fmt::Debug for MountPin {
@@ -131,11 +285,34 @@ struct Superblock {
     fs: Arc<dyn FileSystem>,
     minor: u64,
     numbers: Arc<Numbers>,
-    blocks: u64,
-    inodes: u64,
-    common: String,
-    shown: String,
+    settings: Mutex<Settings>,
     owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+/// What a tmpfs superblock was mounted or last remounted with.
+#[derive(Clone)]
+pub struct Settings {
+    /// Its size in 4 KiB blocks and its inodes, 0 for no limit, which
+    /// `statfs` reports (and nothing enforces).
+    pub blocks: u64,
+    pub inodes: u64,
+    /// What mountinfo shows of the superblock after `rw`: the common
+    /// options (`,sync`), and tmpfs's own (`,size=1024k,inode64`).
+    pub common_options: String,
+    pub super_options: String,
+    /// The options as the kernel parsed them, which a remount starts from.
+    pub parsed: Arc<dyn std::any::Any + Send + Sync>,
+}
+/// What a remount reconfigures from: a tmpfs superblock's settings and the
+/// blocks and inodes its files use, none for the lower file system's.
+pub type InUse<'a> = Option<(&'a Settings, u64, u64)>;
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Settings({} {} {:?} {:?})",
+            self.blocks, self.inodes, self.common_options, self.super_options
+        )
+    }
 }
 impl Drop for Superblock {
     fn drop(&mut self) {
@@ -153,14 +330,9 @@ pub struct NewTmpfs {
     /// Its files: an empty tree whose root has the mode and owner asked
     /// for.
     pub fs: MemFs,
-    /// Its size in 4 KiB blocks and its inodes, 0 for no limit, which
-    /// `statfs` reports (and nothing enforces).
-    pub blocks: u64,
-    pub inodes: u64,
-    /// What mountinfo shows of the superblock after `rw`: the common
-    /// options (`,sync`), and tmpfs's own (`,size=1024k,inode64`).
-    pub common_options: String,
-    pub super_options: String,
+    pub settings: Settings,
+    /// Its superblock is read-only (`ro`, `MS_RDONLY`).
+    pub read_only: bool,
     /// The per-mount flags ([`mount_flags`]).
     pub flags: u32,
     /// What it was mounted from, `none` if nothing.
@@ -198,10 +370,16 @@ struct Entry {
     /// from the machine's root for one of the lower filesystem's.
     root: Vec<u8>,
     flags: u32,
+    /// The flags it may not change ([`mount_flags`]'s `LOCK_*`).
+    locks: u32,
     locked: bool,
-    /// `MNT_EXPIRE`'s mark (`mnt_expiry_mark`).
-    expiring: bool,
     source: Vec<u8>,
+    /// Its peer group (`mnt_group_id`), 0 for none: a mount in one is
+    /// shared.
+    group: u64,
+    /// The peer group it is a slave of (its `mnt_master`'s), 0 for none.
+    master: u64,
+    unbindable: bool,
 }
 impl Entry {
     fn id(&self) -> u64 {
@@ -220,6 +398,53 @@ impl Entry {
     /// The path in its file system of `path`, a path in the mount.
     fn inside(&self, path: &[u8]) -> Vec<u8> {
         joined(&self.root, &relative(&self.point, path))
+    }
+    fn read_only(&self) -> ReadOnly {
+        let superblock = self.token.state.read_only.load(Ordering::SeqCst);
+        ReadOnly {
+            mount: superblock || self.flags & mount_flags::READONLY != 0,
+            superblock,
+        }
+    }
+    /// A copy of it made by `clone_mnt`, with a new ID, rooted at `root` in
+    /// its file system and mounted at `point` on the mount `parent`: a
+    /// peer of it, and a slave of its master. With `slave` (`CL_SLAVE`) it
+    /// is no peer, but a slave of its peer group if it has one.
+    fn cloned(
+        &self,
+        numbers: &Arc<Numbers>,
+        root: Vec<u8>,
+        parent: u64,
+        point: Vec<u8>,
+        slave: bool,
+    ) -> Self {
+        let (group, master) = match (slave, self.group) {
+            (true, 0) => (0, self.master),
+            (true, group) => (0, group),
+            (false, group) => (group, self.master),
+        };
+        Self {
+            token: Token::new(
+                Numbers::take(&numbers.ids, 21),
+                numbers,
+                self.memory().cloned(),
+                Arc::clone(&self.token.state),
+            ),
+            parent,
+            point,
+            backing: match &self.backing {
+                Backing::Boot { kind, device } => Backing::Lower {
+                    kind,
+                    device: *device,
+                    base: self.point.clone(),
+                },
+                other => other.clone(),
+            },
+            root,
+            group,
+            master,
+            ..self.clone()
+        }
     }
     /// Whether it shows the same file system as `other`.
     fn same_files(&self, other: &Self) -> bool {
@@ -258,12 +483,7 @@ impl MountTable {
                 lock(&numbers.ids).insert(m.id);
                 lock(&numbers.minors).insert(m.device & 0xff | (m.device >> 12) & !0xff);
                 Entry {
-                    token: Arc::new(Token {
-                        id: m.id,
-                        numbers: Arc::clone(&numbers),
-                        _superblock: None,
-                        pins: AtomicUsize::new(0),
-                    }),
+                    token: Token::new(m.id, &numbers, None, numbers.boot_state(m.device)),
                     parent: m.parent,
                     point: m.path.clone(),
                     backing: Backing::Boot {
@@ -272,45 +492,81 @@ impl MountTable {
                     },
                     root: m.path.clone(),
                     flags: mount_flags::RELATIME,
+                    locks: 0,
                     locked: false,
-                    expiring: false,
                     source: m.source.clone(),
+                    group: 0,
+                    master: 0,
+                    unbindable: false,
                 }
             })
             .collect();
-        Arc::new(Self {
+        Self::registered(Self {
             entries: RwLock::new(Arc::new(entries)),
             boot_only: AtomicBool::new(true),
             boot: mounts.len(),
             numbers,
         })
     }
+    /// `table`, which the changes of a peer group now reach.
+    fn registered(table: Self) -> Arc<Self> {
+        let table = Arc::new(table);
+        let listed: Arc<dyn Listed> = Arc::clone(&table) as Arc<dyn Listed>;
+        lock(&table.numbers.tables).push(Arc::downgrade(&listed));
+        table
+    }
     /// A new namespace's copy of this one (`copy_mnt_ns`): every mount
-    /// again, with a new ID, on the same file systems. With `locked` (the new
-    /// namespace has another user namespace) each copy is locked, as
-    /// `lock_mnt_tree` locks all but the copy's root; here the root is
-    /// locked too, standing for Linux's `/`, which sits on its rootfs.
+    /// again, with a new ID, on the same file systems, unbindable ones too,
+    /// each a peer of the one it copies and a slave of its master. With
+    /// `locked` (the new namespace has another user namespace) each copy
+    /// is locked, as `lock_mnt_tree` locks all but the copy's root (here
+    /// the root is locked too, standing for Linux's `/`, which sits on its
+    /// rootfs), its flags are locked, and it is a slave of the one it
+    /// copies instead of a peer (`CL_SLAVE`).
     #[must_use]
     pub fn copy(&self, locked: bool) -> Arc<Self> {
+        use mount_flags::*;
         let old = self.snapshot();
         let mut ids = BTreeMap::new();
         let mut entries = Vec::with_capacity(old.len());
         for e in old.iter() {
             let id = Numbers::take(&self.numbers.ids, 21);
             ids.insert(e.id(), id);
+            let (group, master) = match (locked, e.group) {
+                (true, 0) => (0, e.master),
+                (true, group) => (0, group),
+                (false, group) => (group, e.master),
+            };
+            let mut locks = e.locks;
+            if locked {
+                locks |= LOCK_ATIME;
+                for (flag, lock) in [
+                    (READONLY, LOCK_READONLY),
+                    (NODEV, LOCK_NODEV),
+                    (NOSUID, LOCK_NOSUID),
+                    (NOEXEC, LOCK_NOEXEC),
+                ] {
+                    if e.flags & flag != 0 {
+                        locks |= lock;
+                    }
+                }
+            }
             entries.push(Entry {
-                token: Arc::new(Token {
+                token: Token::new(
                     id,
-                    numbers: Arc::clone(&self.numbers),
-                    _superblock: e.memory().cloned(),
-                    pins: AtomicUsize::new(0),
-                }),
+                    &self.numbers,
+                    e.memory().cloned(),
+                    Arc::clone(&e.token.state),
+                ),
                 parent: ids.get(&e.parent).copied().unwrap_or(e.parent),
                 locked: e.locked || locked,
+                locks,
+                group,
+                master,
                 ..e.clone()
             });
         }
-        Arc::new(Self {
+        Self::registered(Self {
             entries: RwLock::new(Arc::new(entries)),
             boot_only: AtomicBool::new(self.boot_only.load(Ordering::SeqCst)),
             boot: self.boot,
@@ -329,6 +585,10 @@ impl MountTable {
         *guard = Arc::new(entries);
         Ok(out)
     }
+    /// A peer group's number, the lowest free one (`mnt_alloc_group_id`).
+    fn new_group(&self) -> u64 {
+        Numbers::take(&self.numbers.groups, 1)
+    }
     /// The boot mount holding `path`: the longest mount point.
     fn boot_index(&self, entries: &[Entry], path: &[u8]) -> usize {
         entries[..self.boot]
@@ -337,6 +597,16 @@ impl MountTable {
             .filter(|(_, e)| within(path, &e.point))
             .max_by_key(|(_, e)| e.point.len())
             .map_or(0, |(i, _)| i)
+    }
+}
+
+impl Drop for MountTable {
+    /// The namespace's mounts go (`put_mnt_ns`), each private first.
+    fn drop(&mut self) {
+        let entries = self.snapshot();
+        for e in entries.iter() {
+            self.numbers.left(e.group, e.master);
+        }
     }
 }
 
@@ -410,6 +680,14 @@ pub struct Target {
     pub covered: bool,
     /// The user namespace that owns its superblock; none for the first.
     pub owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Its flags, and those it may not change ([`mount_flags`]).
+    pub flags: u32,
+    pub locks: u32,
+    /// Its file system's type.
+    pub kind: &'static str,
+    /// A tmpfs superblock's settings; none for the lower file system.
+    pub settings: Option<Settings>,
+    pub read_only: ReadOnly,
 }
 
 /// The filesystem through a mount namespace's table.
@@ -504,8 +782,24 @@ impl NamespacedFs {
     /// Walks `path` one name at a time, as [`MountedFs`] does, through the
     /// mounts: with `follow` a last symbolic link is followed, with
     /// `missing` a missing last name is where it would be, and with `cross`
-    /// a mount on the last name is stepped into.
+    /// a mount on the last name is stepped into. The mount it ends on is
+    /// used, which clears its expiry mark (`path_put`).
     fn walk(
+        &self,
+        entries: &[Entry],
+        path: &[u8],
+        follow: bool,
+        missing: bool,
+        cross: bool,
+    ) -> Result<Loc, Errno> {
+        let loc = self.walk_keeping(entries, path, follow, missing, cross)?;
+        if let Some(i) = loc.at {
+            entries[i].token.used();
+        }
+        Ok(loc)
+    }
+    /// [`Self::walk`], leaving the expiry mark, as `umount2`'s lookup does.
+    fn walk_keeping(
         &self,
         entries: &[Entry],
         path: &[u8],
@@ -639,7 +933,7 @@ impl NamespacedFs {
     /// symbolic link is not followed).
     pub fn target(&self, path: &[u8]) -> Result<Target, Errno> {
         let entries = self.table.snapshot();
-        let loc = self.walk(&entries, path, false, false, true)?;
+        let loc = self.walk_keeping(&entries, path, false, false, true)?;
         let e = self.entry(&entries, &loc);
         let id = e.id();
         Ok(Target {
@@ -650,6 +944,14 @@ impl NamespacedFs {
             locked: e.locked,
             covered: entries.iter().any(|c| c.parent == id && c.id() != id),
             owner: e.memory().and_then(|sb| sb.owner.clone()),
+            flags: e.flags,
+            locks: e.locks,
+            kind: match &e.backing {
+                Backing::Boot { kind, .. } | Backing::Lower { kind, .. } => kind,
+                Backing::Memory(_) => "tmpfs",
+            },
+            settings: e.memory().map(|sb| lock(&sb.settings).clone()),
+            read_only: e.read_only(),
         })
     }
     /// Mounts `new` on the directory at the resolved `path`, on top of what
@@ -660,35 +962,41 @@ impl NamespacedFs {
         if self.lstat(&entries, &loc)?.mode & S_IFMT != S_IFDIR {
             return Err(Errno::ENOTDIR);
         }
-        let parent = self.id_of(&entries, &loc);
+        let parent = self.entry(&entries, &loc);
         let numbers = &self.table.numbers;
         let minor = Numbers::take(&numbers.minors, 1);
+        let state = Arc::new(SuperState::default());
+        state.read_only.store(new.read_only, Ordering::SeqCst);
         let sb = Arc::new(Superblock {
             fs: Arc::new(new.fs),
             minor,
             numbers: Arc::clone(numbers),
-            blocks: new.blocks,
-            inodes: new.inodes,
-            common: new.common_options,
-            shown: new.super_options,
+            settings: Mutex::new(new.settings),
             owner: new.owner,
         });
-        let entry = Entry {
-            token: Arc::new(Token {
-                id: Numbers::take(&numbers.ids, 21),
-                numbers: Arc::clone(numbers),
-                _superblock: Some(Arc::clone(&sb)),
-                pins: AtomicUsize::new(0),
-            }),
-            parent,
+        let mut entry = Entry {
+            token: Token::new(
+                Numbers::take(&numbers.ids, 21),
+                numbers,
+                Some(Arc::clone(&sb)),
+                state,
+            ),
+            parent: parent.id(),
             point: loc.path,
             backing: Backing::Memory(sb),
             root: b"/".to_vec(),
             flags: new.flags,
+            locks: 0,
             locked: false,
-            expiring: false,
             source: new.source,
+            group: 0,
+            master: 0,
+            unbindable: false,
         };
+        // `attach_recursive_mnt`: a mount on a shared one is shared too.
+        if parent.group != 0 {
+            entry.group = self.table.new_group();
+        }
         self.table.update(|entries| {
             entries.push(entry);
             Ok(())
@@ -697,67 +1005,55 @@ impl NamespacedFs {
     /// Binds what the resolved `source` names onto the resolved `target`
     /// (`do_loopback`), both with their last links followed: a new mount of
     /// the source's mount's file system, rooted there, with that mount's
-    /// flags, its source and its type, not locked. With `recurse`
-    /// (`copy_tree`) the mounts below the source come along, each still
-    /// locked if it was; without, a locked one below it is `EINVAL`
-    /// (`has_locked_children`). A directory goes on a directory, a file on
-    /// a file (`graft_tree`, `ENOTDIR`).
+    /// flags, its source and its type, not locked, a peer of it and a slave
+    /// of its master. An unbindable source mount is `EINVAL`. With
+    /// `recurse` (`copy_tree`) the mounts below the source come along, each
+    /// still locked if it was, but for unbindable ones and what is on them
+    /// (`EPERM` for a locked one); without, a locked one below it is
+    /// `EINVAL` (`has_locked_children`). A directory goes on a directory, a
+    /// file on a file (`graft_tree`, `ENOTDIR`). On a shared mount, the new
+    /// mounts are shared too, each in a new peer group if it was in none.
     pub fn bind(&self, source: &[u8], target: &[u8], recurse: bool) -> Result<(), Errno> {
         let entries = self.table.snapshot();
         let from = self.walk(&entries, source, true, false, true)?;
         let to = self.walk(&entries, target, true, false, true)?;
         let old = self.entry(&entries, &from);
+        if old.unbindable {
+            return Err(Errno::EINVAL);
+        }
         let below =
             |e: &Entry| e.parent == old.id() && e.id() != old.id() && within(&e.point, &from.path);
         if !recurse && entries.iter().any(|e| below(e) && e.locked) {
             return Err(Errno::EINVAL);
         }
-        let directory = |loc: &Loc| -> Result<bool, Errno> {
-            Ok(self.lstat(&entries, loc)?.mode & S_IFMT == S_IFDIR)
-        };
-        if directory(&from)? != directory(&to)? {
-            return Err(Errno::ENOTDIR);
-        }
         let numbers = &self.table.numbers;
-        // `clone_mnt` of `e`, rooted at `root` in its file system.
-        let clone = |e: &Entry, root: Vec<u8>, parent: u64, point: Vec<u8>, locked: bool| Entry {
-            token: Arc::new(Token {
-                id: Numbers::take(&numbers.ids, 21),
-                numbers: Arc::clone(numbers),
-                _superblock: e.memory().cloned(),
-                pins: AtomicUsize::new(0),
-            }),
-            parent,
-            point,
-            backing: match &e.backing {
-                Backing::Boot { kind, device } => Backing::Lower {
-                    kind,
-                    device: *device,
-                    base: e.point.clone(),
-                },
-                other => other.clone(),
-            },
-            root,
-            flags: e.flags,
-            locked,
-            expiring: false,
-            source: e.source.clone(),
-        };
-        let top = clone(
-            old,
+        let parent = self.entry(&entries, &to);
+        let top = old.cloned(
+            numbers,
             self.backing(&entries, &from).1,
-            self.id_of(&entries, &to),
+            parent.id(),
             to.path.clone(),
             false,
         );
-        let mut new = vec![top];
+        let mut new = vec![Entry {
+            locked: false,
+            unbindable: false,
+            ..top
+        }];
         if recurse {
-            // Each mount below, its parent's copy before it (`next_mnt`).
+            // Each mount below, its parent's copy before it (`next_mnt`),
+            // but for an unbindable one and the mounts on it.
             let mut copies = BTreeMap::from([(old.id(), new[0].id())]);
             let mut queue: Vec<&Entry> = entries.iter().filter(|e| below(e)).rev().collect();
             while let Some(e) = queue.pop() {
+                if e.unbindable {
+                    if e.locked {
+                        return Err(Errno::EPERM);
+                    }
+                    continue;
+                }
                 let point = joined(&to.path, &relative(&from.path, &e.point));
-                let copy = clone(e, e.root.clone(), copies[&e.parent], point, e.locked);
+                let copy = e.cloned(numbers, e.root.clone(), copies[&e.parent], point, false);
                 copies.insert(e.id(), copy.id());
                 new.push(copy);
                 queue.extend(
@@ -768,6 +1064,20 @@ impl NamespacedFs {
                 );
             }
         }
+        let directory = |loc: &Loc| -> Result<bool, Errno> {
+            Ok(self.lstat(&entries, loc)?.mode & S_IFMT == S_IFDIR)
+        };
+        if directory(&from)? != directory(&to)? {
+            return Err(Errno::ENOTDIR);
+        }
+        if parent.group != 0 {
+            for e in &mut new {
+                if e.group == 0 {
+                    e.group = self.table.new_group();
+                }
+                e.unbindable = false;
+            }
+        }
         self.table.update(|entries| {
             entries.extend(new);
             Ok(())
@@ -776,9 +1086,9 @@ impl NamespacedFs {
     /// Unmounts the tmpfs mount `id` (`umount_tree`): with `detach` it and
     /// every mount on it go at once, its open files staying usable;
     /// without, a mount in use or with others on it is `EBUSY`
-    /// (`propagate_mount_busy`).
+    /// (`propagate_mount_busy`). Each is made private as it goes.
     pub fn umount(&self, id: u64, detach: bool) -> Result<(), Errno> {
-        self.table.update(|entries| {
+        let gone = self.table.update(|entries| {
             let i = Self::runtime_index(entries, id).ok_or(Errno::EINVAL)?;
             if !detach
                 && (entries.iter().any(|e| e.parent == id)
@@ -798,9 +1108,18 @@ impl NamespacedFs {
                 }
                 gone.extend(more);
             }
+            let left: Vec<(u64, u64)> = entries
+                .iter()
+                .filter(|e| gone.contains(&e.id()))
+                .map(|e| (e.group, e.master))
+                .collect();
             entries.retain(|e| !gone.contains(&e.id()));
-            Ok(())
-        })
+            Ok(left)
+        })?;
+        for (group, master) in gone {
+            self.table.numbers.left(group, master);
+        }
+        Ok(())
     }
     /// `MNT_EXPIRE` of mount `id`, not in use and with no mounts on it
     /// (else `EBUSY`): the first call marks it and is `EAGAIN`, the next
@@ -814,12 +1133,168 @@ impl NamespacedFs {
             {
                 return Err(EBUSY);
             }
-            Ok(std::mem::replace(&mut entries[i].expiring, true))
+            Ok(entries[i].token.expiry.swap(true, Ordering::SeqCst))
         })?;
         if !marked {
             return Err(Errno::EAGAIN);
         }
         self.umount(id, false)
+    }
+    /// The mount `id` and, with `recurse`, every mount on it, in the order
+    /// Linux's `next_mnt` takes them: a mount, then each on it in the order
+    /// they were made.
+    fn tree(entries: &[Entry], id: u64, recurse: bool) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut stack = vec![id];
+        while let Some(at) = stack.pop() {
+            out.push(at);
+            if recurse {
+                stack.extend(
+                    entries
+                        .iter()
+                        .filter(|e| e.parent == at && e.id() != at)
+                        .map(Entry::id)
+                        .rev(),
+                );
+            }
+        }
+        out
+    }
+    /// `do_change_type` of mount `id`, and with `recurse` of each mount on
+    /// it (`change_mnt_propagation`). A shared one is in a peer group,
+    /// a new one if it was in none (`invent_group_ids`), and is no longer
+    /// unbindable. Any other type takes it out of its peer group: its
+    /// slaves then follow a peer, or with none left its own master, which
+    /// a slave then follows too; a private or an unbindable one has no
+    /// master.
+    pub fn change_type(&self, id: u64, kind: Propagation, recurse: bool) -> Result<(), Errno> {
+        let numbers = &self.table.numbers;
+        let ids = Self::tree(&self.table.snapshot(), id, recurse);
+        for id in ids {
+            let mut left = None;
+            let fresh = (kind == Propagation::Shared)
+                .then(|| {
+                    let entries = self.table.snapshot();
+                    let e = entries.iter().find(|e| e.id() == id)?;
+                    (e.group == 0).then(|| self.table.new_group())
+                })
+                .flatten();
+            self.table.update(|entries| {
+                let peers = |group: u64| {
+                    group != 0 && entries.iter().filter(|e| e.group == group).count() > 1
+                };
+                let Some(at) = entries.iter().position(|e| e.id() == id) else {
+                    return Ok(());
+                };
+                let group = entries[at].group;
+                let alone = !peers(group);
+                let e = &mut entries[at];
+                if kind == Propagation::Shared {
+                    if let Some(fresh) = fresh {
+                        e.group = fresh;
+                    }
+                    e.unbindable = false;
+                    return Ok(());
+                }
+                // The master it then has: a peer, or its own.
+                let mut master = e.master;
+                if group != 0 {
+                    e.group = 0;
+                    if alone {
+                        left = Some((group, e.master));
+                    } else {
+                        master = group;
+                    }
+                }
+                match kind {
+                    Propagation::Slave => e.master = master,
+                    _ => {
+                        e.master = 0;
+                        e.unbindable = kind == Propagation::Unbindable;
+                    }
+                }
+                Ok(())
+            })?;
+            if let Some((group, master)) = left {
+                numbers.left(group, master);
+            }
+        }
+        Ok(())
+    }
+    /// `do_reconfigure_mnt` of mount `id` (`MS_REMOUNT | MS_BIND`): its
+    /// flags become `flags`; to make it read-only, no file may be open for
+    /// writing on it (`mnt_make_readonly`, `EBUSY`).
+    pub fn reconfigure_mount(&self, id: u64, flags: u32) -> Result<(), Errno> {
+        self.table.update(|entries| {
+            let e = entries
+                .iter_mut()
+                .find(|e| e.id() == id)
+                .ok_or(Errno::EINVAL)?;
+            if flags & mount_flags::READONLY != 0
+                && !e.read_only().mount
+                && e.token.writers.load(Ordering::SeqCst) != 0
+            {
+                return Err(EBUSY);
+            }
+            e.flags = flags & mount_flags::SETTABLE;
+            Ok(())
+        })
+    }
+    /// `reconfigure_super` of mount `id`'s superblock, then its flags
+    /// (`do_remount`): to make the superblock read-only, no file may be
+    /// open for writing on any of its mounts (`sb_prepare_remount_readonly`,
+    /// `EBUSY`); then `configure` checks and makes a tmpfs's new settings
+    /// from the old ones (none for the lower file system's) and the blocks
+    /// and inodes its files use.
+    pub fn reconfigure(
+        &self,
+        id: u64,
+        read_only: bool,
+        flags: u32,
+        configure: &mut dyn FnMut(InUse<'_>) -> Result<Option<Settings>, Errno>,
+    ) -> Result<(), Errno> {
+        self.table.update(|entries| {
+            let e = entries
+                .iter_mut()
+                .find(|e| e.id() == id)
+                .ok_or(Errno::EINVAL)?;
+            let state = Arc::clone(&e.token.state);
+            if read_only
+                && !state.read_only.load(Ordering::SeqCst)
+                && state.writers.load(Ordering::SeqCst) != 0
+            {
+                return Err(EBUSY);
+            }
+            match e.memory() {
+                Some(sb) => {
+                    let stats = sb.fs.statfs(b"/")?;
+                    let used = stats.blocks.saturating_sub(stats.blocks_free);
+                    let files = stats.files.saturating_sub(stats.files_free);
+                    let mut settings = lock(&sb.settings);
+                    if let Some(new) = configure(Some((&settings, used, files)))? {
+                        *settings = new;
+                    }
+                }
+                None => {
+                    configure(None)?;
+                }
+            }
+            state.read_only.store(read_only, Ordering::SeqCst);
+            e.flags = flags & mount_flags::SETTABLE;
+            Ok(())
+        })
+    }
+    /// The peer group nearest along `e`'s masters with a member in this
+    /// namespace (`get_dominating_id`), 0 for none.
+    fn dominating(&self, entries: &[Entry], e: &Entry) -> u64 {
+        let mut group = e.master;
+        for _ in 0..64 {
+            if group == 0 || entries.iter().any(|m| m.group == group) {
+                return group;
+            }
+            group = self.table.numbers.master_of(group);
+        }
+        0
     }
 }
 
@@ -853,14 +1328,32 @@ impl FileSystem for NamespacedFs {
                         String::new(),
                         String::new(),
                     ),
-                    Backing::Memory(sb) => (
-                        "tmpfs",
-                        sb.device(),
-                        e.root.clone(),
-                        sb.common.clone(),
-                        sb.shown.clone(),
-                    ),
+                    Backing::Memory(sb) => {
+                        let settings = lock(&sb.settings);
+                        (
+                            "tmpfs",
+                            sb.device(),
+                            e.root.clone(),
+                            settings.common_options.clone(),
+                            settings.super_options.clone(),
+                        )
+                    }
                 };
+                // `show_mountinfo`'s optional fields.
+                let mut tags = String::new();
+                if e.group != 0 {
+                    tags.push_str(&format!(" shared:{}", e.group));
+                }
+                if e.master != 0 {
+                    tags.push_str(&format!(" master:{}", e.master));
+                    let from = self.dominating(&entries, e);
+                    if from != 0 && from != e.master {
+                        tags.push_str(&format!(" propagate_from:{from}"));
+                    }
+                }
+                if e.unbindable {
+                    tags.push_str(" unbindable");
+                }
                 MountPoint {
                     path: e.point.clone(),
                     root,
@@ -870,6 +1363,9 @@ impl FileSystem for NamespacedFs {
                     device,
                     source: e.source.clone(),
                     options: shown_flags(e.flags),
+                    read_only: e.flags & mount_flags::READONLY != 0,
+                    super_read_only: e.read_only().superblock,
+                    tags,
                     common_options,
                     super_options,
                 }
@@ -909,7 +1405,62 @@ impl FileSystem for NamespacedFs {
         }
         let entries = self.table.snapshot();
         let loc = self.locate(&entries, path);
-        loc.at.map(|i| MountPin::new(&entries[i].token))
+        loc.at.map(|i| MountPin::new(&entries[i].token, false))
+    }
+    /// A boot mount's too, which a remount read-only of it also checks;
+    /// while there are only boot mounts, the one whose mount point the
+    /// path is under, its links not followed.
+    fn mount_writer(&self, path: &[u8], follow: bool) -> Option<MountPin> {
+        let entries = self.table.snapshot();
+        let token = if self.fast() {
+            &entries[self.table.boot_index(&entries, path)].token
+        } else {
+            let loc = self.walk(&entries, path, follow, false, true).ok()?;
+            &self.entry(&entries, &loc).token
+        };
+        Some(MountPin::new(token, true))
+    }
+    /// `ST_VALID` and the flags of the mount holding `path`
+    /// (`flags_by_mnt`), with `ST_RDONLY` for a read-only superblock.
+    fn statfs_flags(&self, path: &[u8]) -> u64 {
+        use mount_flags::*;
+        let entries = self.table.snapshot();
+        let e = match self.walk(&entries, path, true, false, true) {
+            Ok(loc) => self.entry(&entries, &loc),
+            Err(_) => &entries[0],
+        };
+        let mut out = 0x20;
+        for (flag, bit) in [
+            (NOSUID, 0x2),
+            (NODEV, 0x4),
+            (NOEXEC, 0x8),
+            (NOATIME, 0x400),
+            (NODIRATIME, 0x800),
+            (RELATIME, 0x1000),
+            (NOSYMFOLLOW, 0x2000),
+        ] {
+            if e.flags & flag != 0 {
+                out |= bit;
+            }
+        }
+        if e.read_only().mount {
+            out |= 1;
+        }
+        out
+    }
+    fn any_read_only(&self) -> bool {
+        self.table.snapshot().iter().any(|e| e.read_only().mount)
+    }
+    fn read_only(&self, path: &[u8], follow: bool) -> ReadOnly {
+        let entries = self.table.snapshot();
+        if !entries.iter().any(|e| e.read_only().mount) {
+            return ReadOnly::default();
+        }
+        // A missing last name is on its directory's mount.
+        match self.walk(&entries, path, follow, true, true) {
+            Ok(loc) => self.entry(&entries, &loc).read_only(),
+            Err(_) => ReadOnly::default(),
+        }
     }
     fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
         if self.fast() {
@@ -1129,11 +1680,12 @@ impl HostFs for NamespacedFs {
         if let Some(sb) = loc.at.and_then(|i| entries[i].memory()) {
             let used = stats.blocks - stats.blocks_free;
             let files = stats.files - stats.files_free;
-            stats.blocks = sb.blocks;
-            stats.blocks_free = sb.blocks.saturating_sub(used);
+            let settings = lock(&sb.settings);
+            stats.blocks = settings.blocks;
+            stats.blocks_free = settings.blocks.saturating_sub(used);
             stats.blocks_available = stats.blocks_free;
-            stats.files = sb.inodes;
-            stats.files_free = sb.inodes.saturating_sub(files);
+            stats.files = settings.inodes;
+            stats.files_free = settings.inodes.saturating_sub(files);
         }
         Ok(stats)
     }

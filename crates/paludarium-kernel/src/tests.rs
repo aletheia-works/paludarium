@@ -8230,23 +8230,23 @@ fn mount_checks_in_linux_order() {
         mount(&mut f, [none, target, tmpfs, 4096, 0]),
         errno(Errno::ENOENT)
     );
-    // What is not supported yet, after the checks before it.
-    for flags in [8192, 32, 32 | 4096, 1 << 20, 1 << 17, 1, 256] {
-        let at = if flags & (1 << 20 | 1 << 17) != 0 {
-            put(&mut f, 0x180, b"/")
-        } else {
-            target
-        };
+    // What is not supported yet, after the checks before it: MS_MOVE,
+    // MS_NOSYMFOLLOW.
+    for flags in [8192, 256] {
         assert_eq!(
-            mount(&mut f, [none, at, tmpfs, flags, 0]),
+            mount(&mut f, [none, target, tmpfs, flags, 0]),
             errno(Errno::EOPNOTSUPP),
             "{flags:#x}"
         );
     }
-    let ro = put(&mut f, 0x140, b"ro");
+    // A remount is of a mount's root.
     assert_eq!(
-        mount(&mut f, [none, target, tmpfs, 0, ro]),
-        errno(Errno::EOPNOTSUPP)
+        mount(&mut f, [none, target, tmpfs, 32, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        mount(&mut f, [none, target, tmpfs, 32 | 4096, 0]),
+        errno(Errno::EINVAL)
     );
     // Propagation: of a mount's root, one type, which every mount has.
     let root = put(&mut f, 0x180, b"/");
@@ -8319,9 +8319,17 @@ fn a_tmpfs_mount_and_its_umount() {
     assert_eq!(f.ret(166, &[missing, 0]), errno(Errno::ENOENT));
     assert_eq!(f.ret(166, &[tmp, 0]), errno(Errno::EINVAL));
     assert_eq!(f.ret(166, &[target, 4 | 2]), errno(Errno::EINVAL));
-    // The root from start-up stays.
+    // The caller's root stays, its superblock remounted read-only
+    // (`do_umount_root`).
     let root = put(&mut f, 0x100, b"/");
-    assert_eq!(f.ret(166, &[root, 0]), errno(Errno(16)));
+    assert_eq!(f.ret(166, &[root, 0]), 0);
+    let made = put(&mut f, 0x100, b"/tmp/made");
+    assert_eq!(f.ret(83, &[made, 0o755]), errno(Errno(30)));
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.starts_with("21 1 0:1 / / rw,relatime - tmpfs tmpfs ro\n"),
+        "{info}"
+    );
     // In use by the open file: EBUSY; MNT_EXPIRE too.
     assert_eq!(f.ret(166, &[target, 0]), errno(Errno(16)));
     assert_eq!(f.ret(166, &[target, 4]), errno(Errno(16)));
@@ -8342,6 +8350,86 @@ fn a_tmpfs_mount_and_its_umount() {
     assert_eq!(f.ret(165, &[none, target, tmpfs, 0, 0]), 0);
     assert_eq!(f.ret(166, &[target, 4]), errno(Errno::EAGAIN));
     assert_eq!(f.ret(166, &[target, 4]), 0);
+}
+
+/// A read-only mount refuses what writes, in Linux's order; remounts and
+/// propagation types show in mountinfo.
+#[test]
+fn read_only_mounts_remounts_and_propagation() {
+    let mut f = fixture();
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let target = put(&mut f, 0x40, b"/tmp/m");
+    assert_eq!(f.ret(83, &[target, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, target, tmpfs, 0, 0]), 0);
+    let file = put(&mut f, 0x80, b"/tmp/m/f");
+    let fd = f.ret(2, &[file, 0o101, 0o644]);
+    // Busy while the file is open for writing.
+    let (remount, bind, rdonly) = (32, 4096, 1);
+    assert_eq!(
+        f.ret(165, &[0, target, 0, remount | bind | rdonly, 0]),
+        errno(Errno(16))
+    );
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(165, &[0, target, 0, remount | bind | rdonly, 0]), 0);
+    let erofs = errno(Errno(30));
+    let (missing, deep) = (
+        put(&mut f, 0xc0, b"/tmp/m/g"),
+        put(&mut f, 0x100, b"/tmp/m/x/y"),
+    );
+    assert_eq!(f.ret(83, &[missing, 0o755]), erofs);
+    assert_eq!(f.ret(83, &[file, 0o755]), errno(Errno::EEXIST));
+    assert_eq!(f.ret(83, &[deep, 0o755]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(2, &[missing, 0o101, 0o644]), erofs);
+    assert_eq!(f.ret(2, &[file, 1, 0]), erofs);
+    assert_eq!(f.ret(2, &[file, 0o1000, 0]), erofs);
+    let fd = f.ret(2, &[file, 0, 0]);
+    assert_eq!(f.ret(91, &[fd, 0o600]), erofs);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(87, &[missing]), erofs);
+    assert_eq!(f.ret(87, &[file]), erofs);
+    assert_eq!(f.ret(90, &[file, 0o600]), erofs);
+    assert_eq!(f.ret(90, &[missing, 0o600]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(76, &[file, 0]), erofs);
+    assert_eq!(f.ret(21, &[file, 2]), erofs);
+    assert_eq!(f.ret(21, &[file, 4]), 0);
+    let dot = put(&mut f, 0x140, b"/tmp/m/.");
+    assert_eq!(f.ret(84, &[dot]), errno(Errno::EINVAL));
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" /tmp/m ro,relatime - tmpfs none rw,"),
+        "{info}"
+    );
+    // The superblock, with tmpfs's options, then writable again.
+    let size = put(&mut f, 0x180, b"size=2m");
+    assert_eq!(f.ret(165, &[0, target, 0, remount | rdonly, size]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" /tmp/m ro,relatime - tmpfs none ro,size=2048k,"),
+        "{info}"
+    );
+    let dirsync = put(&mut f, 0x180, b"dirsync");
+    assert_eq!(
+        f.ret(165, &[0, target, 0, remount, dirsync]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(165, &[0, target, 0, remount, 0]), 0);
+    assert_eq!(f.ret(83, &[missing, 0o755]), 0);
+    // Propagation: a peer group, and a mount on a shared one.
+    let (shared, private, rec) = (1 << 20, 1 << 18, 1 << 14);
+    assert_eq!(f.ret(165, &[0, target, 0, shared, 0]), 0);
+    assert_eq!(f.ret(165, &[none, missing, tmpfs, 0, 0]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" /tmp/m rw,relatime shared:1 - tmpfs"),
+        "{info}"
+    );
+    assert!(
+        info.contains(" /tmp/m/g rw,relatime shared:2 - tmpfs"),
+        "{info}"
+    );
+    assert_eq!(f.ret(165, &[0, target, 0, private | rec, 0]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(!info.contains("shared:"), "{info}");
 }
 
 /// A new mount namespace has copies of the mounts, with new IDs, on the

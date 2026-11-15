@@ -292,6 +292,7 @@ impl SyscallTable {
         handlers.insert(289, crate::signalfd::sys_signalfd4);
         handlers.insert(253, crate::inotify::sys_inotify_init);
         handlers.insert(300, crate::fanotify::sys_fanotify_init);
+        handlers.insert(321, crate::bpf::sys_bpf);
         handlers.insert(301, crate::fanotify::sys_fanotify_mark);
         handlers.insert(323, crate::userfaultfd::sys_userfaultfd);
         handlers.insert(254, crate::inotify::sys_inotify_add_watch);
@@ -3656,7 +3657,9 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         // FS_IOC_GETFLAGS, FS_IOC_SETFLAGS, FS_IOC_FSGETXATTR and
         // FS_IOC_FSSETXATTR, which `do_vfs_ioctl` answers for a file whose
         // file system keeps inode flags.
-        if let Some(result) = crate::files::attributes::ioctl(c, &*file, a[1] as u32, a[2]) {
+        if let Some(result) =
+            crate::files::attributes::ioctl(c, &*file, &descriptor.path, a[1] as u32, a[2])
+        {
             return result;
         }
         // A pseudo-terminal's own requests.

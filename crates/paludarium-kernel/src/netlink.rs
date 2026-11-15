@@ -16,7 +16,9 @@
 //! ones the loopback's MCTP addresses and the MCTP routes; `RTM_GETLINK`
 //! without a dump answers for `lo` by index or name, an AF_INET6
 //! `RTM_GETADDR` without one with an address of it, and `RTM_GETROUTE`
-//! without one looks a route up; `RTM_NEWADDR` and `RTM_DELADDR` add and
+//! without one looks a route up; an `RTM_GETNEIGH` dump answers with the
+//! loopback's neighbours, and one without a dump with one of them;
+//! `RTM_NEWADDR` and `RTM_DELADDR` add and
 //! remove the loopback's IPv4, IPv6 and MCTP addresses, and
 //! `RTM_NEWROUTE` and `RTM_DELROUTE` IPv4, IPv6 and MCTP routes
 //! ([`crate::interface`]); `RTM_NEWLINK`
@@ -82,6 +84,9 @@ const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
 const RTM_GETROUTE: u16 = 26;
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_DELNEIGH: u16 = 29;
+const RTM_GETNEIGH: u16 = 30;
 /// The groups (`RTNLGRP_*`) notifications go to, and how many there are
 /// (`RTNLGRP_MAX`).
 const RTNLGRP_LINK: u32 = 1;
@@ -1100,6 +1105,18 @@ impl NetlinkSocket {
                     &mut answer,
                     now,
                 ),
+                // `rtnl_fdb_dump`, a bridge's forwarding database, is not here.
+                (RTM_GETNEIGH, AF_BRIDGE) => return Err(EOPNOTSUPP),
+                // `mctp_rtm_getneigh`: MCTP's neighbours, of which none is
+                // added; it checks only the `ndmsg`'s length.
+                (RTM_GETNEIGH, AF_MCTP) => {
+                    if payload.len() < 12 {
+                        Err(Errno::EINVAL)
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
+                (RTM_GETNEIGH, _) => neighbour_dump(network, payload, (seq, port), strict, now),
                 _ => return Err(EOPNOTSUPP),
             };
             // `netlink_dump_start` finds a dump running before the dump
@@ -1114,9 +1131,11 @@ impl NetlinkSocket {
             };
             // `inet6_dump_ifaddr` and `inet6_dump_ifinfo`, not split, put
             // `NLMSG_DONE` after their last message when that part has room
-            // for it, and so does `rtnl_net_dumpid`, which returns 0.
+            // for it, and so does `rtnl_net_dumpid`, which returns 0, as does
+            // `neigh_dump_info` once it has gone through every table.
             let joined = matches!(header.kind, RTM_GETADDR | RTM_GETLINK) && family == AF_INET6
-                || header.kind == nsid::RTM_GETNSID;
+                || header.kind == nsid::RTM_GETNSID
+                || (header.kind == RTM_GETNEIGH && family != AF_MCTP);
             let first = messages.is_empty() || joined;
             let done = done_message(s, header, payload, port, answer, error, first);
             self.start_dump_as(s, messages, done, joined);
@@ -1187,6 +1206,12 @@ impl NetlinkSocket {
                     }
                 }
                 notices.extend(told);
+                Ok(false)
+            }
+            // `neigh_get`, which a bridge's (`rtnl_fdb_get`) takes the place of.
+            RTM_GETNEIGH if family != AF_BRIDGE => {
+                let reply = neighbour_get(&self.network, payload, (header.seq, port), now)?;
+                self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
             nsid::RTM_NEWNSID => {
@@ -1636,6 +1661,8 @@ pub(super) enum Nla {
     U32In(u32, u32),
     /// An `NLA_S32` of at least this (`NLA_POLICY_MIN`).
     S32Min(i32),
+    /// An `NLA_U32` with no bit set but this mask's (`NLA_POLICY_MASK`).
+    U32Mask(u32),
     /// `NLA_STRING` of at most this many bytes but a last NUL (none for 0).
     String(usize),
     /// `NLA_NUL_STRING` of at most this many bytes but its NUL (any for 0).
@@ -1655,7 +1682,9 @@ impl Nla {
         match self {
             Nla::U8 => Some(1),
             Nla::U16 => Some(2),
-            Nla::U32 | Nla::S32 | Nla::Be32 | Nla::U32In(..) | Nla::S32Min(_) => Some(4),
+            Nla::U32 | Nla::S32 | Nla::Be32 | Nla::U32In(..) | Nla::S32Min(_) | Nla::U32Mask(_) => {
+                Some(4)
+            }
             _ => None,
         }
     }
@@ -1878,10 +1907,11 @@ pub(super) fn leftover(bytes: &[u8], strict: bool) -> Result<(), Errno> {
 /// marked (but `NLA_UNSPEC`), and for an `NLA_UNSPEC`. Then `EINVAL` for
 /// `NLA_REJECT` and for an `NLA_NUL_STRING` without a NUL; `ERANGE` for an
 /// integer, `NLA_UNSPEC` or nest shorter than its policy's, an empty
-/// string, a string or binary longer, and an integer out of its range.
+/// string, a string or binary longer, and an integer out of its range;
+/// `EINVAL` for an integer with a bit set that its mask has not.
 ///
 /// Each refusal is told of with the attribute, and but for `NLA_UNSPEC`
-/// its policy, as `validate_nla` does.
+/// and a mask's its policy, as `validate_nla` does.
 pub(super) fn validate_nla(
     nla: Nla,
     nested: bool,
@@ -1954,6 +1984,11 @@ pub(super) fn validate_nla(
             "binary attribute size out of range",
         ));
     }
+    if let Nla::U32Mask(mask) = nla
+        && word() & !mask != 0
+    {
+        return Err(extack::at(Errno::EINVAL, value, "reserved bit set"));
+    }
     let within = match nla {
         Nla::U32In(least, most) => (least..=most).contains(&word()),
         Nla::S32Min(least) => word().cast_signed() >= least,
@@ -2002,7 +2037,7 @@ fn strict_link_header(
 /// A link dump, as `rtnl_dump_ifinfo`: `lo`, as `IFLA_EXT_MASK` asks it.
 /// An `IFLA_MASTER` other than 0 shows only the devices of that master,
 /// which `lo` is not, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
-/// namespace has an ID. Unchecked, a request shorter than an `ifinfomsg`
+/// namespace's links are shown. Unchecked, a request shorter than an `ifinfomsg`
 /// is an old `rtgenmsg`, whose attributes follow its 4 bytes, and none
 /// is taken where one breaks `ifla_policy`, as a failed
 /// `nlmsg_parse_deprecated`; strictly, as `rtnl_valid_dump_ifinfo_req`, it
@@ -2140,7 +2175,7 @@ fn with_flags(mut messages: Vec<Vec<u8>>, flags: u16) -> Vec<Vec<u8>> {
 /// `EINVAL` for an `ifaddrmsg` short or with a prefix length, flags or a
 /// scope, then the family's policy's error (IPv4's for both), and
 /// `EINVAL` for any attribute (`IFA_TARGET_NETNSID` too, as no other
-/// namespace has an ID); an index other than 0 shows that device's
+/// namespace's addresses are shown); an index other than 0 shows that device's
 /// addresses alone, as `NLM_F_DUMP_FILTERED`, which `NLMSG_DONE` carries
 /// too, and is `ENODEV` for another than `lo`'s.
 #[expect(
@@ -2226,7 +2261,7 @@ fn address_dump(
 /// `ifa_ipv6_policy`'s error, with `EINVAL` for an attribute but
 /// `IFA_ADDRESS`, `IFA_LOCAL` and `IFA_TARGET_NETNSID`; unchecked, the
 /// policy's error alone. `IFA_TARGET_NETNSID` is `EINVAL`, as no other
-/// namespace has an ID. The address is `IFA_LOCAL`'s, or else
+/// namespace's addresses are shown. The address is `IFA_LOCAL`'s, or else
 /// `IFA_ADDRESS`'s (`extract_addr`), and `EINVAL` with neither;
 /// `EADDRNOTAVAIL` when `lo` has it not. The index is not checked:
 /// `ipv6_get_ifaddr` looks on any device when none has it.
@@ -4234,7 +4269,11 @@ fn told(
                     ipv6_route_of(RTM_DELROUTE, &r, route_seq, route_port, 0, now),
                 ),
                 // `neigh_cleanup_and_release`, which names no request.
-                Event::DelNeighbour(n) => (RTNLGRP_NEIGH, 0, neighbour_message(&n, now)),
+                Event::DelNeighbour(n) => (
+                    RTNLGRP_NEIGH,
+                    0,
+                    neighbour_message(&n, RTM_DELNEIGH, 0, (0, 0), 0, now),
+                ),
             };
             Notice {
                 group,
@@ -4244,19 +4283,59 @@ fn told(
         })
         .collect()
 }
-/// The `RTM_DELNEIGH` of a neighbour of the loopback gone at `now`, as
-/// `__neigh_fill_info` makes it: an `ndmsg` for `lo`, `NUD_NOARP`, then its
-/// key, its link-layer address (`lo`'s six zero bytes), its probes (none)
-/// and `struct nda_cacheinfo`: the hundredths of a second since it was
-/// confirmed (made two base reachable times, 60 seconds, before it was,
-/// `neigh_alloc`), used and updated, and the references left (none).
-fn neighbour_message(n: &crate::interface::Neighbour, now: u64) -> Vec<u8> {
-    const RTM_DELNEIGH: u16 = 29;
+/// `NTF_PROXY`: a request about the proxy entries (`pneigh_entry`).
+const NTF_PROXY: u8 = 0x08;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+const NDA_CACHEINFO: u16 = 3;
+const NDA_PROBES: u16 = 4;
+const NDA_VLAN: u16 = 5;
+const NDA_PORT: u16 = 6;
+const NDA_VNI: u16 = 7;
+const NDA_IFINDEX: u16 = 8;
+const NDA_MASTER: u16 = 9;
+const NDA_PROTOCOL: u16 = 12;
+const NDA_NH_ID: u16 = 13;
+const NDA_FDB_EXT_ATTRS: u16 = 14;
+const NDA_FLAGS_EXT: u16 = 15;
+const NDA_MAX: u16 = 17;
+/// `NTF_EXT_MASK`: `NTF_EXT_MANAGED` and `NTF_EXT_EXT_VALIDATED`.
+const NTF_EXT_MASK: u32 = 0b101;
+/// `nda_policy`, the neighbour requests'. Its two last types,
+/// `NDA_NDM_STATE_MASK` and `NDA_NDM_FLAGS_MASK`, have no entry, so a
+/// request that has either is `EINVAL` (`strict_start_type`).
+const NDA_POLICY: Policy = Policy {
+    max: NDA_MAX,
+    strict_start: NDA_NH_ID,
+    of: |kind| match kind {
+        // `MAX_ADDR_LEN`.
+        NDA_DST | NDA_LLADDR => Nla::Binary(32),
+        // `struct nda_cacheinfo`.
+        NDA_CACHEINFO => Nla::Unspec(16),
+        NDA_PROBES | NDA_VNI | NDA_IFINDEX | NDA_MASTER | NDA_NH_ID => Nla::U32,
+        NDA_VLAN | NDA_PORT => Nla::U16,
+        NDA_PROTOCOL => Nla::U8,
+        NDA_FLAGS_EXT => Nla::U32Mask(NTF_EXT_MASK),
+        NDA_FDB_EXT_ATTRS => Nla::Nested,
+        _ => Nla::Unspec(0),
+    },
+};
+/// A neighbour of the loopback at `now` as `__neigh_fill_info` makes it,
+/// a message of `kind` with `flags`: an `ndmsg` for `lo`, `NUD_NOARP`,
+/// then its key, its link-layer address (`lo`'s six zero bytes), its
+/// probes (none) and `struct nda_cacheinfo`: the hundredths of a second
+/// since it was confirmed (made two base reachable times, 60 seconds,
+/// before it was, `neigh_alloc`), used and updated, and `refs`, the
+/// references but the table's.
+fn neighbour_message(
+    n: &crate::interface::Neighbour,
+    kind: u16,
+    flags: u16,
+    (seq, port): (u32, u32),
+    refs: u32,
+    now: u64,
+) -> Vec<u8> {
     const NUD_NOARP: u16 = 0x40;
-    const NDA_DST: u16 = 1;
-    const NDA_LLADDR: u16 = 2;
-    const NDA_CACHEINFO: u16 = 3;
-    const NDA_PROBES: u16 = 4;
     let family = if n.ip.is_ipv6() { AF_INET6 } else { AF_INET };
     let mut body = vec![family, 0, 0, 0];
     body.extend_from_slice(&1i32.to_le_bytes());
@@ -4270,11 +4349,189 @@ fn neighbour_message(n: &crate::interface::Neighbour, now: u64) -> Vec<u8> {
     attribute(&mut body, NDA_PROBES, &0u32.to_le_bytes());
     let since = u32::try_from(now.saturating_sub(n.made) / 10_000_000).unwrap_or(u32::MAX);
     let mut info = Vec::with_capacity(16);
-    for value in [since.saturating_add(6000), since, since, 0] {
+    for value in [since.saturating_add(6000), since, since, refs] {
         info.extend_from_slice(&value.to_le_bytes());
     }
     attribute(&mut body, NDA_CACHEINFO, &info);
-    message(RTM_DELNEIGH, 0, 0, 0, &body)
+    message(kind, flags, seq, port, &body)
+}
+/// What a neighbour dump asks, as `neigh_valid_dump_req` reads it: the
+/// device (`NDA_IFINDEX`) and master device (`NDA_MASTER`) to show the
+/// neighbours of, 0 for any. Strictly, `EINVAL` for an `ndmsg` short, or
+/// with padding, an index, a state, a type or a flag but `NTF_PROXY`, and
+/// for an attribute but those two; `nda_policy`'s error, checked strictly
+/// throughout (`nlmsg_parse_deprecated_strict`). Unchecked, its error is
+/// `nlmsg_parse_deprecated`'s alone, which the dump passes over.
+fn neighbour_filter(payload: &[u8], strict: bool) -> Result<(u32, u32), Errno> {
+    if strict {
+        let Some(header) = payload.get(..12) else {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Invalid header for neighbor dump request",
+            ));
+        };
+        if header[1..10] != [0; 9] || header[11] != 0 {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Invalid values in header for neighbor dump request",
+            ));
+        }
+        if header[10] & !NTF_PROXY != 0 {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Invalid flags in header for neighbor dump request",
+            ));
+        }
+    }
+    if payload.len() < 12 {
+        return Err(extack::message(Errno::EINVAL, "Invalid header length"));
+    }
+    let attributes = parse_policy(&payload[12..], &NDA_POLICY, strict)?;
+    let (mut device, mut master) = (0, 0);
+    for (&kind, &value) in &by_type(&attributes) {
+        match kind {
+            NDA_IFINDEX => device = u32_value(value)?,
+            NDA_MASTER => master = u32_value(value)?,
+            _ if strict => {
+                return Err(extack::message(
+                    Errno::EINVAL,
+                    "Unsupported attribute in neighbor dump request",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok((device, master))
+}
+/// A neighbour dump, as `neigh_dump_info`: the neighbours of each table
+/// the family names, ARP's (IPv4's) and then neighbour discovery's
+/// (IPv6's) for `AF_UNSPEC`, none for any other family. An `ndmsg` whose
+/// flags are `NTF_PROXY` asks for the proxy entries, of which there are
+/// none. The filter ([`neighbour_filter`]) shows `lo`'s for its index, 1,
+/// and for a master of -1, which asks for the devices without one; any
+/// other shows nothing, and either marks each message
+/// `NLM_F_DUMP_FILTERED`. Linux goes through each table's hash buckets in
+/// turn, in an order its random hash gives; the newest comes first here,
+/// as each is put at the head of its bucket.
+fn neighbour_dump(
+    network: &Network,
+    payload: &[u8],
+    (seq, port): (u32, u32),
+    strict: bool,
+    now: u64,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    // `ndm_flags == NTF_PROXY`, as Linux tests it: not the bit alone.
+    let proxy = payload.len() >= 12 && payload[10] == NTF_PROXY;
+    let (device, master) = match neighbour_filter(payload, strict) {
+        Ok(filter) => filter,
+        Err(e) if strict => return Err(e),
+        Err(_) => (0, 0),
+    };
+    let flags = if device != 0 || master != 0 {
+        NLM_F_MULTI | NLM_F_DUMP_FILTERED
+    } else {
+        NLM_F_MULTI
+    };
+    let shown = matches!(device, 0 | 1) && matches!(master, 0 | u32::MAX);
+    if proxy || !shown {
+        return Ok(Vec::new());
+    }
+    let neighbours = network.addresses().neighbours().to_vec();
+    let mut messages = Vec::new();
+    for v6 in [false, true] {
+        let family = if v6 { AF_INET6 } else { AF_INET };
+        if payload[0] != 0 && payload[0] != family {
+            continue;
+        }
+        messages.extend(
+            neighbours
+                .iter()
+                .rev()
+                .filter(|n| n.ip.is_ipv6() == v6)
+                .map(|n| neighbour_message(n, RTM_NEWNEIGH, flags, (seq, port), 0, now)),
+        );
+    }
+    Ok(messages)
+}
+/// One neighbour, as `neigh_get` answers a request that is not a dump:
+/// `EINVAL` for an `ndmsg` short, or with padding, a state, a type, a flag
+/// but `NTF_PROXY`, or without that flag no device; then `nda_policy`'s
+/// error, checked strictly throughout; `EINVAL` without `NDA_DST` and for
+/// any other attribute; `EAFNOSUPPORT` for a family but IPv4 and IPv6;
+/// `EINVAL` for a key of another length than the family's; `ENODEV` for a
+/// device but `lo`; `ENOENT` for a proxy entry, as there are none, and
+/// for a neighbour `lo` has not. The answer counts the reference the
+/// lookup holds as it is made (`neigh_lookup`).
+fn neighbour_get(
+    network: &Network,
+    payload: &[u8],
+    (seq, port): (u32, u32),
+    now: u64,
+) -> Result<Vec<u8>, Errno> {
+    let Some(header) = payload.get(..12) else {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid header for neighbor get request",
+        ));
+    };
+    if header[1..4] != [0; 3] || header[8..10] != [0; 2] || header[11] != 0 {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid values in header for neighbor get request",
+        ));
+    }
+    if header[10] & !NTF_PROXY != 0 {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Invalid flags in header for neighbor get request",
+        ));
+    }
+    let proxy = header[10] & NTF_PROXY != 0;
+    let index = i32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    if !proxy && index == 0 {
+        return Err(extack::message(Errno::EINVAL, "No device specified"));
+    }
+    let attributes = parse_policy(&payload[12..], &NDA_POLICY, true)?;
+    let table = by_type(&attributes);
+    let Some(&key) = table.get(&NDA_DST) else {
+        return Err(extack::missing(Errno::EINVAL, NDA_DST));
+    };
+    if table.len() > 1 {
+        return Err(extack::message(
+            Errno::EINVAL,
+            "Unsupported attribute in neighbor get request",
+        ));
+    }
+    let ip = match (header[0], key.len()) {
+        (AF_INET, 4) => core::net::IpAddr::from([key[0], key[1], key[2], key[3]]),
+        (AF_INET6, 16) => core::net::IpAddr::from(<[u8; 16]>::try_from(key).unwrap_or_default()),
+        (AF_INET | AF_INET6, _) => {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "Invalid network address in neighbor get request",
+            ));
+        }
+        _ => {
+            return Err(extack::message(
+                EAFNOSUPPORT,
+                "Unsupported family in header for neighbor get request",
+            ));
+        }
+    };
+    if index != 0 && index != 1 {
+        return Err(extack::message(ENODEV, "Unknown device ifindex"));
+    }
+    if proxy {
+        return Err(extack::message(
+            Errno::ENOENT,
+            "Proxy neighbour entry not found",
+        ));
+    }
+    let addresses = network.addresses();
+    let Some(n) = addresses.neighbours().iter().find(|n| n.ip == ip) else {
+        return Err(extack::message(Errno::ENOENT, "Neighbour entry not found"));
+    };
+    Ok(neighbour_message(n, RTM_NEWNEIGH, 0, (seq, port), 1, now))
 }
 /// Brings `network`'s loopback up or down: `None` when it already is, else
 /// the notifications of it, `lo`'s `RTM_NEWLINK` with `IFF_UP` changed
@@ -4965,6 +5222,144 @@ mod tests {
         assert!(request(RTM_DELROUTE, 0, &net6, 16, Some(&bad)).is_ok());
     }
 
+    #[test]
+    fn neighbour_requests_show_the_loopbacks_neighbours_as_linux_checks_them() {
+        use core::net::IpAddr;
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true, 0);
+        let second = 1_000_000_000;
+        {
+            let mut addresses = network.addresses();
+            addresses.output("127.0.0.1".parse().unwrap(), 0);
+            addresses.output("::1".parse().unwrap(), 0);
+            addresses.output("ff02::1".parse().unwrap(), second);
+        }
+        let ndmsg = |family: u8, index: i32, flags: u8| {
+            let mut out = vec![family, 0, 0, 0];
+            out.extend_from_slice(&index.to_le_bytes());
+            out.extend_from_slice(&[0, 0, flags, 0]);
+            out
+        };
+        let with = |mut payload: Vec<u8>, kind: u16, value: &[u8]| {
+            attribute(&mut payload, kind, value);
+            payload
+        };
+        // Each message's flags, key and references.
+        let shown = |messages: Vec<Vec<u8>>| -> Vec<(u16, IpAddr, u32)> {
+            messages
+                .iter()
+                .map(|m| {
+                    let found = by_type(&attributes(&m[28..]))
+                        .into_iter()
+                        .map(|(k, v)| (k, v.to_vec()))
+                        .collect::<BTreeMap<_, _>>();
+                    let key = &found[&NDA_DST];
+                    let ip = match key.len() {
+                        4 => IpAddr::from(<[u8; 4]>::try_from(key.as_slice()).unwrap()),
+                        _ => IpAddr::from(<[u8; 16]>::try_from(key.as_slice()).unwrap()),
+                    };
+                    let info = &found[&NDA_CACHEINFO];
+                    (
+                        Header::read(m).flags,
+                        ip,
+                        u32::from_le_bytes(info[12..16].try_into().unwrap()),
+                    )
+                })
+                .collect()
+        };
+        let dump = |payload: &[u8], strict: bool| {
+            neighbour_dump(&network, payload, (5, 7), strict, second).map(shown)
+        };
+        let any4: IpAddr = "0.0.0.0".parse().unwrap();
+        let (one, all) = ("::1".parse().unwrap(), "ff02::1".parse().unwrap());
+        let multi = NLM_F_MULTI;
+        let filtered = NLM_F_MULTI | NLM_F_DUMP_FILTERED;
+        // IPv4's one, then IPv6's, the newest first.
+        let everything = vec![(multi, any4, 0), (multi, all, 0), (multi, one, 0)];
+        assert_eq!(dump(&[0], false), Ok(everything.clone()));
+        assert_eq!(dump(&ndmsg(0, 0, 0), true), Ok(everything.clone()));
+        assert_eq!(
+            dump(&ndmsg(AF_INET, 0, 0), true),
+            Ok(vec![(multi, any4, 0)])
+        );
+        assert_eq!(dump(&ndmsg(AF_INET6, 0, 0), true).map(|m| m.len()), Ok(2));
+        assert_eq!(dump(&ndmsg(17, 0, 0), true), Ok(Vec::new()));
+        assert_eq!(dump(&ndmsg(0, 0, NTF_PROXY), true), Ok(Vec::new()));
+        // Only flags of `NTF_PROXY` alone ask for the proxy entries:
+        // unchecked, another flag with it is an ordinary dump.
+        assert_eq!(
+            dump(&ndmsg(0, 0, NTF_PROXY | 0x10), false),
+            Ok(everything.clone())
+        );
+        // The filters: lo, another device, no master, and a master.
+        let device = |index: u32| with(ndmsg(AF_INET, 0, 0), NDA_IFINDEX, &index.to_le_bytes());
+        assert_eq!(dump(&device(1), true), Ok(vec![(filtered, any4, 0)]));
+        assert_eq!(dump(&device(2), true), Ok(Vec::new()));
+        let master = |index: u32| with(ndmsg(AF_INET, 0, 0), NDA_MASTER, &index.to_le_bytes());
+        assert_eq!(dump(&master(u32::MAX), true), Ok(vec![(filtered, any4, 0)]));
+        assert_eq!(dump(&master(3), false), Ok(Vec::new()));
+        // Strictly, the header and the attributes are checked; unchecked,
+        // what does not parse leaves the dump unfiltered.
+        assert_eq!(dump(&[0; 8], true), Err(Errno::EINVAL));
+        assert_eq!(dump(&ndmsg(0, 1, 0), true), Err(Errno::EINVAL));
+        assert_eq!(dump(&ndmsg(0, 0, 0x10), true), Err(Errno::EINVAL));
+        assert_eq!(dump(&ndmsg(0, 0, 0x10), false), Ok(everything.clone()));
+        let key = with(ndmsg(AF_INET, 0, 0), NDA_DST, &[0; 4]);
+        assert_eq!(dump(&key, true), Err(Errno::EINVAL));
+        assert_eq!(dump(&key, false).map(|m| m.len()), Ok(1));
+        let masked = with(device(2), 16, &0u16.to_le_bytes());
+        assert_eq!(dump(&masked, true), Err(Errno::EINVAL));
+        assert_eq!(dump(&masked, false).map(|m| m.len()), Ok(1));
+        let reserved = with(ndmsg(0, 0, 0), NDA_FLAGS_EXT, &2u32.to_le_bytes());
+        assert_eq!(dump(&reserved, true), Err(Errno::EINVAL));
+        let managed = with(ndmsg(0, 0, 0), NDA_FLAGS_EXT, &1u32.to_le_bytes());
+        assert_eq!(dump(&managed, true), Err(Errno::EINVAL));
+        assert_eq!(dump(&managed, false), Ok(everything));
+
+        // One neighbour: its reference from the lookup counts.
+        let get = |payload: &[u8]| {
+            neighbour_get(&network, payload, (5, 7), second).map(|m| shown(vec![m]))
+        };
+        let ask = |family: u8, index: i32, flags: u8, key: &[u8]| {
+            with(ndmsg(family, index, flags), NDA_DST, key)
+        };
+        assert_eq!(get(&ask(AF_INET, 1, 0, &[0; 4])), Ok(vec![(0, any4, 1)]));
+        let mut loopback = [0; 16];
+        loopback[15] = 1;
+        assert_eq!(get(&ask(AF_INET6, 1, 0, &loopback)), Ok(vec![(0, one, 1)]));
+        assert_eq!(
+            get(&ask(AF_INET, 1, 0, &[127, 0, 0, 1])),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(get(&ask(AF_INET, 0, 0, &[0; 4])), Err(Errno::EINVAL));
+        assert_eq!(
+            get(&ask(AF_INET, 0, NTF_PROXY, &[0; 4])),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(get(&ask(AF_INET, 2, 0, &[0; 4])), Err(ENODEV));
+        assert_eq!(get(&ask(AF_INET, -1, 0, &[0; 4])), Err(ENODEV));
+        assert_eq!(get(&ask(AF_INET, 1, 0, &[0; 16])), Err(Errno::EINVAL));
+        assert_eq!(get(&ask(17, 1, 0, &[0; 4])), Err(EAFNOSUPPORT));
+        assert_eq!(get(&ask(AF_MCTP, 1, 0, &[8])), Err(EAFNOSUPPORT));
+        assert_eq!(get(&ndmsg(AF_INET, 1, 0)), Err(Errno::EINVAL));
+        assert_eq!(get(&ask(AF_INET, 1, 0, &[0; 4])[..8]), Err(Errno::EINVAL));
+        let other = with(
+            ask(AF_INET, 1, 0, &[0; 4]),
+            NDA_IFINDEX,
+            &1u32.to_le_bytes(),
+        );
+        assert_eq!(get(&other), Err(Errno::EINVAL));
+        let mut state = ask(AF_INET, 1, 0, &[0; 4]);
+        state[8] = 2;
+        assert_eq!(get(&state), Err(Errno::EINVAL));
+        // A missing key is told of by its type.
+        extack::begin();
+        assert_eq!(get(&ndmsg(AF_INET, 1, 0)), Err(Errno::EINVAL));
+        let report = extack::take();
+        let payload = ndmsg(AF_INET, 1, 0);
+        let told = extack::attributes(&report, &payload, 28, -22);
+        assert_eq!(attributes(&told), vec![(5, &1u32.to_le_bytes()[..])]);
+    }
     #[test]
     fn lookups_of_groups_and_the_broadcast_take_mkroute_outputs_kind() {
         let network = Network::isolated(crate::users::first());
@@ -5862,7 +6257,7 @@ mod tests {
             dump(&ifinfo(0, 0, &[(IFLA_LINKINFO, &[])]), true),
             Ok(plain.clone())
         );
-        // No namespace has an ID, checked or not.
+        // No other namespace's links are shown, checked or not.
         let netnsid = ifinfo(0, 0, &[(IFLA_TARGET_NETNSID, &1u32.to_le_bytes())]);
         assert_eq!(dump(&netnsid, true), Err(Errno::EINVAL));
         assert_eq!(dump(&netnsid, false), Err(Errno::EINVAL));

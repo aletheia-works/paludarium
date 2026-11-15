@@ -81,8 +81,15 @@ pub(crate) enum Arithmetic {
 
 /// Where `fxsave` keeps the registers, 16 bytes each.
 const IMAGE_REGISTERS: usize = 32;
-/// The 64-bit `fnstenv` image.
+/// The 64-bit `fnstenv` image, and the 16-bit one of the `0x66` prefix.
 pub(crate) const ENVIRONMENT: usize = 28;
+pub(crate) const ENVIRONMENT_16: usize = 14;
+/// `fnsave`'s image: the environment and the eight registers from the top.
+pub(crate) const STATE: usize = ENVIRONMENT + 80;
+pub(crate) const STATE_16: usize = ENVIRONMENT_16 + 80;
+/// What `fbstp` writes for what an 18-digit packed decimal cannot hold.
+const DECIMAL_INDEFINITE: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff];
+const DECIMAL_LIMIT: u128 = 999_999_999_999_999_999;
 
 /// One 80-bit value in its parts.
 #[derive(Clone, Copy)]
@@ -970,6 +977,43 @@ fn power_of_two_minus_one(value: u128, control: u16) -> (u128, u16, bool) {
     (value, flags | more, up)
 }
 
+/// `fbstp`'s packed decimal: 18 digits, two to a byte from the lowest, and the
+/// sign in the top bit of the last byte, which a zero keeps. The value is
+/// rounded as the control word says, and a CPU notes no denormal.
+fn to_decimal(value: u128, control: u16) -> ([u8; 10], u16, bool) {
+    let v = parts(value);
+    if v.unsupported() || v.exponent == EXPONENT_MAX || v.power() >= 64 {
+        return (DECIMAL_INDEFINITE, INVALID, false);
+    }
+    let (size, rest, up) = if v.zero() {
+        (0, 0, false)
+    } else {
+        let (whole, rest, half) = whole_part(v);
+        let up = rounds_away(control, v.negative, whole, rest, half);
+        (whole + u128::from(up), rest, up)
+    };
+    if size > DECIMAL_LIMIT {
+        return (DECIMAL_INDEFINITE, INVALID, false);
+    }
+    let mut image = [0; 10];
+    let mut left = size;
+    for byte in &mut image[..9] {
+        *byte = (left % 10) as u8 | ((left / 10 % 10) as u8) << 4;
+        left /= 100;
+    }
+    image[9] = if v.negative { 0x80 } else { 0 };
+    (image, if rest != 0 { INEXACT } else { 0 }, up)
+}
+
+/// `fbld`'s value of a packed decimal. A nibble above 9 counts for what it is,
+/// as on Intel's and AMD's CPUs, and the sign byte's other bits for nothing.
+fn from_decimal(image: &[u8; 10]) -> u128 {
+    let size = image[..9].iter().rev().fold(0u64, |size, &byte| {
+        size * 100 + u64::from(byte >> 4) * 10 + u64::from(byte & 15)
+    });
+    integer_value(size as i64) | u128::from(image[9] >> 7) << 79
+}
+
 /// An integer in the 80-bit format, which always holds it.
 pub(crate) fn integer_value(value: i64) -> u128 {
     if value == 0 {
@@ -1580,37 +1624,86 @@ impl X87 {
             tags | tag << (at * 2)
         })
     }
-    /// `fnstenv`'s image in 64-bit mode: three words, each followed by a
-    /// reserved one of all ones, as the x87 case compares with a real CPU;
-    /// where the last instruction and operand were, which nothing here keeps;
-    /// and one more reserved word. It then masks every exception.
-    pub(crate) fn store_environment(&mut self) -> [u8; ENVIRONMENT] {
+    /// `fnstenv`'s image in 64-bit mode, of [`ENVIRONMENT`] bytes: three
+    /// words, each followed by a reserved one of all ones, as the x87 case
+    /// compares with a real CPU; where the last instruction and operand were,
+    /// which nothing here keeps; and one more reserved word. With a `0x66`
+    /// prefix, the first [`ENVIRONMENT_16`] bytes: the three words with none
+    /// between them, and then where the last ones were. It then masks every
+    /// exception.
+    pub(crate) fn store_environment(&mut self, size: usize) -> [u8; ENVIRONMENT] {
         let mut image = [0; ENVIRONMENT];
-        for (at, word) in [
-            (0, self.control),
-            (4, self.status_word()),
-            (8, self.full_tags()),
-        ] {
-            image[at..at + 2].copy_from_slice(&word.to_le_bytes());
-            image[at + 2..at + 4].fill(0xff);
+        let step = if size == ENVIRONMENT { 4 } else { 2 };
+        for (at, word) in [self.control, self.status_word(), self.full_tags()]
+            .into_iter()
+            .enumerate()
+        {
+            image[at * step..at * step + 2].copy_from_slice(&word.to_le_bytes());
+            if size == ENVIRONMENT {
+                image[at * step + 2..at * step + 4].fill(0xff);
+            }
         }
-        image[26..28].fill(0xff);
+        if size == ENVIRONMENT {
+            image[26..28].fill(0xff);
+        }
         self.control |= EXCEPTIONS;
         self.summarize();
         image
     }
-    /// `fldenv`, which takes the status word as it is, with its summary, as a
-    /// CPU does.
-    pub(crate) fn load_environment(&mut self, image: &[u8; ENVIRONMENT]) {
-        let word = |at: usize| u16::from_le_bytes([image[at], image[at + 1]]);
+    /// `fldenv` of an image of [`ENVIRONMENT`] or [`ENVIRONMENT_16`] bytes,
+    /// which takes the status word as it is, with its summary, as a CPU does.
+    pub(crate) fn load_environment(&mut self, image: &[u8]) {
+        let step = if image.len() == ENVIRONMENT { 4 } else { 2 };
+        let word = |at: usize| u16::from_le_bytes([image[at * step], image[at * step + 1]]);
         self.control = word(0) & CONTROL_BITS | CONTROL_SET;
-        let status = word(4);
+        let status = word(1);
         self.top = (status >> 11 & 7) as u8;
         self.status = status & !TOP;
-        let tags = word(8);
+        let tags = word(2);
         self.used = (0..8).fold(0, |used, at| {
             used | u8::from(tags >> (at * 2) & 3 != 3) << at
         });
+    }
+    /// `fnsave`'s image of [`STATE`] or [`STATE_16`] bytes: the environment,
+    /// and then the registers from the top. It then initializes the unit.
+    pub(crate) fn save(&mut self, size: usize) -> [u8; STATE] {
+        let environment = size - 80;
+        let mut image = [0; STATE];
+        image[..environment].copy_from_slice(&self.store_environment(environment)[..environment]);
+        for index in 0..8u8 {
+            let at = environment + usize::from(index) * 10;
+            let value = self.registers[self.physical(index)];
+            image[at..at + 10].copy_from_slice(&value.to_le_bytes()[..10]);
+        }
+        self.initialize();
+        image
+    }
+    /// `frstor`, of what [`X87::save`] writes.
+    pub(crate) fn restore(&mut self, image: &[u8]) {
+        let environment = image.len() - 80;
+        self.load_environment(&image[..environment]);
+        for index in 0..8u8 {
+            let at = environment + usize::from(index) * 10;
+            let mut value = [0; 16];
+            value[..10].copy_from_slice(&image[at..at + 10]);
+            self.registers[self.physical(index)] = u128::from_le_bytes(value);
+        }
+    }
+    /// `fbld`.
+    pub(crate) fn load_decimal(&mut self, image: &[u8; 10]) {
+        self.push(from_decimal(image));
+    }
+    /// What `fbstp` writes, before it pops.
+    pub(crate) fn store_decimal(&mut self) -> [u8; 10] {
+        self.condition(C1, false);
+        let Some(value) = self.get(0) else {
+            self.raise(INVALID | STACK_FAULT);
+            return DECIMAL_INDEFINITE;
+        };
+        let (image, flags, up) = to_decimal(value, self.control);
+        self.raise(flags);
+        self.condition(C1, up);
+        image
     }
     /// The first 160 bytes of `fxsave`'s area: the words, one bit for each
     /// physical register that is not empty, and the registers from the top.
@@ -2560,7 +2653,7 @@ mod tests {
         x.load_one();
         x.load_zero();
         x.load_extended(INDEFINITE);
-        let image = x.store_environment();
+        let image = x.store_environment(ENVIRONMENT);
         assert_eq!(u16::from_le_bytes([image[0], image[1]]), 0x27f);
         assert_eq!(u16::from_le_bytes([image[4], image[5]]) >> 11 & 7, 5);
         // R7 valid, R6 zero, R5 special, the rest empty.
@@ -2572,7 +2665,7 @@ mod tests {
         assert_eq!(&image[12..26], &[0; 14], "nothing kept of where it was");
         assert_eq!(x.control_word(), 0x27f | 0x3f);
         x.set_control(0x260);
-        x.store_environment();
+        x.store_environment(ENVIRONMENT);
         assert_eq!(x.control_word(), 0x27f, "every exception masked");
         let mut other = X87::default();
         other.load_environment(&image);
@@ -2790,6 +2883,141 @@ mod tests {
             of(ONE, number(-1, 63), true),
             (Some(number(-1, 63)), None, INEXACT)
         );
+    }
+
+    #[test]
+    fn packed_decimals_round_as_the_control_word_asks_and_keep_the_sign() {
+        let of = |value, control| {
+            let x = after(&[value], |x| {
+                x.set_control(control);
+            });
+            let mut x = x;
+            let image = x.store_decimal();
+            (image, x.status_word() & (C1 | EXCEPTIONS))
+        };
+        let digits = |low: u64, negative: bool| {
+            let mut image = [0; 10];
+            let mut left = low;
+            for byte in &mut image[..9] {
+                *byte = (left % 10) as u8 | ((left / 10 % 10) as u8) << 4;
+                left /= 100;
+            }
+            image[9] = u8::from(negative) << 7;
+            image
+        };
+        assert_eq!(
+            of(number(123_456_789, 0), EXTENDED),
+            (digits(123_456_789, false), 0)
+        );
+        assert_eq!(of(1 << 79, EXTENDED), (digits(0, true), 0));
+        assert_eq!(of(number(-5, -1), EXTENDED), (digits(2, true), INEXACT));
+        assert_eq!(
+            of(number(-5, -1), EXTENDED | DOWN),
+            (digits(3, true), C1 | INEXACT)
+        );
+        assert_eq!(
+            of(number(3, -2), EXTENDED),
+            (digits(1, false), C1 | INEXACT)
+        );
+        // A denormal is no more than inexact, and keeps its sign.
+        assert_eq!(of(1 | 1 << 79, EXTENDED), (digits(0, true), INEXACT));
+        let largest = number(999_999_999_999_999_999, 0);
+        assert_eq!(
+            of(largest | 1 << 79, EXTENDED),
+            (digits(999_999_999_999_999_999, true), 0)
+        );
+        for value in [
+            number(1_000_000_000_000_000_000, 0),
+            number(1, 63),
+            INFINITY,
+            QUIET,
+            SIGNALING,
+            number(1, 0) ^ INTEGER_BIT as u128,
+        ] {
+            assert_eq!(of(value, EXTENDED), (DECIMAL_INDEFINITE, INVALID));
+        }
+        // Rounding up past the largest is invalid too.
+        let below = number(1_999_999_999_999_999_999, -1);
+        assert_eq!(
+            of(below, EXTENDED | TOWARD_ZERO).0,
+            digits(999_999_999_999_999_999, false)
+        );
+        assert_eq!(of(below, EXTENDED | UP).0, DECIMAL_INDEFINITE);
+        let mut x = X87::default();
+        assert_eq!(x.store_decimal(), DECIMAL_INDEFINITE);
+        assert_eq!(x.status_word() & 0x41, 0x41);
+    }
+
+    #[test]
+    fn a_packed_decimal_loads_as_its_nibbles_count() {
+        let of = |image: [u8; 10]| {
+            let mut x = X87::default();
+            x.load_decimal(&image);
+            x.get(0)
+        };
+        assert_eq!(
+            of([0x21, 0x43, 0x65, 0x87, 0x09, 0, 0, 0, 0, 0]),
+            Some(number(987_654_321, 0))
+        );
+        assert_eq!(
+            of([0x21, 0x43, 0x65, 0x87, 0x09, 0, 0, 0, 0, 0xff]),
+            Some(number(-987_654_321, 0))
+        );
+        assert_eq!(of([0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80]), Some(1 << 79));
+        assert_eq!(of([1, 0, 0, 0, 0, 0, 0, 0, 0, 0x7f]), Some(ONE));
+        // Nibbles above 9 count for what they are.
+        assert_eq!(of([0x1b, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Some(number(21, 0)));
+        assert_eq!(of([0xff; 10]), Some(number(-1_666_666_666_666_666_665, 0)));
+        let mut x = X87::default();
+        for _ in 0..8 {
+            x.load_one();
+        }
+        x.load_decimal(&[1; 10]);
+        assert_eq!(x.get(0), Some(INDEFINITE));
+    }
+
+    #[test]
+    fn the_16_bit_environment_has_no_reserved_words() {
+        let mut x = after(&[ONE, 0, QUIET], |x| x.set_control(0x260));
+        let image = x.store_environment(ENVIRONMENT_16);
+        assert_eq!(&image[..6], &[0x60, 0x02, 0x00, 0x28, 0xff, 0x1b]);
+        assert_eq!(&image[6..], &[0; ENVIRONMENT - 6]);
+        assert_eq!(x.control_word(), 0x27f);
+        let mut y = X87::default();
+        y.load_environment(&image[..ENVIRONMENT_16]);
+        assert_eq!(
+            (y.control_word(), y.status_word(), y.used),
+            (0x260, 0x2800, 0xe0)
+        );
+    }
+
+    #[test]
+    fn saving_keeps_the_registers_from_the_top_and_initializes() {
+        for size in [STATE, STATE_16] {
+            let mut x = after(&[ONE, 0, number(3, 0)], |x| x.set_control(0x262));
+            let image = x.save(size);
+            assert_eq!(
+                (x.control_word(), x.status_word(), x.used),
+                (INITIAL_CONTROL, 0, 0)
+            );
+            let environment = size - 80;
+            let register = |index: usize| {
+                let mut value = [0; 16];
+                value[..10].copy_from_slice(&image[environment + index * 10..][..10]);
+                u128::from_le_bytes(value)
+            };
+            assert_eq!(
+                (register(0), register(1), register(2)),
+                (number(3, 0), 0, ONE)
+            );
+            let mut y = X87::default();
+            y.restore(&image[..size]);
+            assert_eq!(
+                (y.get(0), y.get(1), y.get(2), y.get(3)),
+                (Some(number(3, 0)), Some(0), Some(ONE), None)
+            );
+            assert_eq!((y.control_word(), y.status_word()), (0x262, 0x2800));
+        }
     }
 
     #[test]

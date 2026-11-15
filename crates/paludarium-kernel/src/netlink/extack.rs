@@ -1,7 +1,7 @@
 //! What a request leaves for its acknowledgement, as Linux's
 //! `struct netlink_ext_ack`: a message, and the attribute at fault and its
-//! policy. None of the requests taken here asks for an attribute that
-//! Linux reports missing (`NL_SET_ERR_ATTR_MISS`), nor sets a cookie.
+//! policy, or the type of an attribute missing (`NL_SET_ERR_ATTR_MISS`).
+//! None of the requests taken here sets a cookie.
 //! Each request the kernel takes begins with none ([`begin`]); the checks
 //! that refuse it say why as Linux's `NL_SET_ERR_MSG` and the others do,
 //! and a socket with `NETLINK_EXT_ACK` has them in its `NLMSG_ERROR`, or in
@@ -19,6 +19,7 @@ use std::cell::RefCell;
 const NLMSGERR_ATTR_MSG: u16 = 1;
 const NLMSGERR_ATTR_OFFS: u16 = 2;
 const NLMSGERR_ATTR_POLICY: u16 = 4;
+const NLMSGERR_ATTR_MISS_TYPE: u16 = 5;
 const NL_POLICY_TYPE_ATTR_TYPE: u16 = 1;
 const NL_POLICY_TYPE_ATTR_MIN_VALUE_S: u16 = 2;
 const NL_POLICY_TYPE_ATTR_MAX_VALUE_S: u16 = 3;
@@ -26,6 +27,7 @@ const NL_POLICY_TYPE_ATTR_MIN_VALUE_U: u16 = 4;
 const NL_POLICY_TYPE_ATTR_MAX_VALUE_U: u16 = 5;
 const NL_POLICY_TYPE_ATTR_MIN_LENGTH: u16 = 6;
 const NL_POLICY_TYPE_ATTR_MAX_LENGTH: u16 = 7;
+const NL_POLICY_TYPE_ATTR_MASK: u16 = 12;
 const NL_ATTR_TYPE_U8: u32 = 2;
 const NL_ATTR_TYPE_U16: u32 = 3;
 const NL_ATTR_TYPE_U32: u32 = 4;
@@ -42,6 +44,8 @@ pub(crate) struct Report {
     /// The address of the bad attribute's header.
     bad: Option<usize>,
     policy: Option<Nla>,
+    /// The type of an attribute the request lacks.
+    miss: Option<u16>,
 }
 
 thread_local! {
@@ -131,6 +135,11 @@ pub(super) fn against(error: Errno, value: &[u8], policy: Nla, message: &'static
     });
     error
 }
+/// `NL_SET_ERR_ATTR_MISS`, outside a nest: attribute `kind` is missing.
+pub(crate) fn missing(error: Errno, kind: u16) -> Errno {
+    with(|report| report.miss = Some(kind));
+    error
+}
 /// `NL_SET_BAD_ATTR`: the attribute of `value`, without a message.
 pub(crate) fn bad(error: Errno, value: &[u8]) -> Errno {
     let bad = header_of(value);
@@ -143,17 +152,18 @@ pub(crate) fn bad(error: Errno, value: &[u8]) -> Errno {
 impl Report {
     /// Whether the acknowledgement of `error` carries anything, as
     /// `netlink_ack_tlv_len` finds it: a message, and for an error the
-    /// attribute at fault or its policy. A report that does sets
-    /// `NLM_F_ACK_TLVS`, though it may put nothing.
+    /// attribute at fault, its policy or a missing one's type. A report
+    /// that does sets `NLM_F_ACK_TLVS`, though it may put nothing.
     pub(crate) fn any(&self, error: i32) -> bool {
-        self.message.is_some() || (error != 0 && (self.bad.is_some() || self.policy.is_some()))
+        self.message.is_some()
+            || (error != 0 && (self.bad.is_some() || self.policy.is_some() || self.miss.is_some()))
     }
 }
 /// The attributes the acknowledgement with `error` of a request of `len`
 /// bytes, whose `payload` follows its header, carries, as
 /// `netlink_ack_tlv_fill` puts them: the message; then, for an error, the
 /// attribute's offset (`NLMSGERR_ATTR_OFFS`) when it lies in the request's
-/// payload, and its policy.
+/// payload, its policy, and the type of an attribute missing.
 pub(crate) fn attributes(report: &Report, payload: &[u8], len: u32, error: i32) -> Vec<u8> {
     let mut out = Vec::new();
     if let Some(message) = &report.message {
@@ -178,6 +188,13 @@ pub(crate) fn attributes(report: &Report, payload: &[u8], len: u32, error: i32) 
         && let Some(nest) = policy_attributes(policy)
     {
         attribute(&mut out, NLMSGERR_ATTR_POLICY, &nest);
+    }
+    if let Some(kind) = report.miss {
+        attribute(
+            &mut out,
+            NLMSGERR_ATTR_MISS_TYPE,
+            &u32::from(kind).to_le_bytes(),
+        );
     }
     out
 }
@@ -248,6 +265,15 @@ fn policy_attributes(policy: Nla) -> Option<Vec<u8>> {
             attribute(&mut out, NL_POLICY_TYPE_ATTR_MIN_LENGTH, &size);
             attribute(&mut out, NL_POLICY_TYPE_ATTR_MAX_LENGTH, &size);
             NL_ATTR_TYPE_BINARY
+        }
+        // `NL_POLICY_TYPE_ATTR_MASK` in place of a range.
+        Nla::U32Mask(mask) => {
+            attribute(
+                &mut out,
+                NL_POLICY_TYPE_ATTR_MASK,
+                &u64::from(mask).to_le_bytes(),
+            );
+            NL_ATTR_TYPE_U32
         }
         Nla::Nested => NL_ATTR_TYPE_NESTED,
     };

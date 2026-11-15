@@ -107,7 +107,9 @@ out:
 - `movzx` from a register, `movsx` and `movsxd` from a register or memory,
   `cbw`, `cwde` and `cdqe`, and `lea` into a 16- or 32-bit register;
 - `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`;
-- `setcc` and `cmovcc`.
+- `setcc` and `cmovcc`;
+- `mul` and `imul` of a register into rdx:rax, and `imul` of two registers or of
+  a register and an immediate.
 
 A register in these forms may also be one of the high-byte registers `ah`, `ch`,
 `dh` and `bh`.

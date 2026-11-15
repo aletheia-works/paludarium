@@ -3,9 +3,9 @@
 //! system call first runs the thread's classic BPF programs over its
 //! `seccomp_data`. The lowest action of all of them decides: kill the
 //! process or the thread with SIGSYS, a SIGSYS the thread may handle
-//! (TRAP), an errno, the tracer's word for TRACE (ENOSYS without one), a wait for the filter's
-//! listener to answer (USER_NOTIF, ENOSYS once it has none), or the call
-//! itself (LOG, ALLOW).
+//! (TRAP), an errno, the tracer's word for TRACE (ENOSYS without one), a
+//! wait for the filter's listener to answer (USER_NOTIF, ENOSYS once it has
+//! none), or the call itself (LOG, ALLOW).
 //!
 //! A thread keeps its mode and filters in [`ThreadState`]; a new thread or
 //! process takes its creator's, exec keeps them, and

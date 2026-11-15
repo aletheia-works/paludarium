@@ -1301,7 +1301,9 @@ impl Exec<'_> {
         let register = register.unwrap_or(0);
         let mut unit = self.s.x87;
         // All but these wait, and fault first where an unmasked exception is
-        // pending, as on Intel's and AMD's CPUs.
+        // pending, as on Intel's and AMD's CPUs. `FLDCW` waits. `FXSAVE`, which
+        // does not wait either, never comes here: it is dispatched on its own,
+        // before the x87 instructions.
         let waits = !matches!(
             m,
             M::Fninit | M::Fnclex | M::Fnstcw | M::Fnstsw | M::Fnstenv | M::Fldenv | M::Fnsave

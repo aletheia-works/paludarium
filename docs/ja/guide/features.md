@@ -1947,6 +1947,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs のマウントは
   ソースとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。
+  `/proc/<pid>/mountinfo` と `mounts`（`/proc/thread-self` と `/proc/<pid>/task/<tid>` のものも）は、
+  Linux の `mounts_open_common` と同じくそのタスクのもので、そのマウント名前空間のマウントを
+  そのルートから見せます。読むのは誰でもかまいません。終わったプロセスは、回収されるまで
+  これらのファイルを持ちますが、開くと `EINVAL` です。
   マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
   `df` はどのマウントも表示します。パスから開いたのではないパイプ・ソケット・pidfd・
   memfd・`memfd_secret` のファイル・名前空間のファイル・匿名 inode（eventfd や epoll
@@ -1989,7 +1993,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`root`、`maps`、`smaps`、`fd`、`fdinfo`、`ns`、`task` があります。`root` は
+  `cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`fd`、`fdinfo`、`ns`、`task` があります。`root` は
   ルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
@@ -2004,8 +2008,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
-  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`root`、`ns`（0511）、
-  `task` があり、
+  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`root`、`mounts`、
+  `mountinfo`、`ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、

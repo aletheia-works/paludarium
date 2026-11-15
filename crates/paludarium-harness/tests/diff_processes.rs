@@ -621,6 +621,7 @@ mod linux {
         processes_time_set => ("time-set","process"),
         processes_chroot => ("chroot","process"),
         processes_mounts => ("mounts","process"),
+        processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),

@@ -56,3 +56,11 @@ of these ([Testing and verification](../design/quality)):
   the Linux, macOS and Windows targets. The tests run only with the nightly.
 - The WebAssembly build needs the nightly: it uses `build-std` and the atomic
   wait intrinsics.
+- The WebAssembly build has no DWARF debug information (`-C debuginfo=0` in
+  `mise-tasks/wasm/build.sh` and the release package check). It was about 80%
+  of `paludarium.wasm` and took the npm and JSR package to the edge of JSR's
+  20 MiB limit. The native builds keep their line tables
+  (`debug = "line-tables-only"` in `Cargo.toml`). The module keeps its `name`
+  section, so the stack of a panic (a Wasm trap) in a browser or Node.js still
+  names the Rust functions, but browser developer tools can no longer show
+  their source files and lines.

@@ -1898,6 +1898,7 @@ fn positioned(
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file.as_any().is_some_and(|file| {
         file.is::<crate::proc::MapsFile>()
+            || file.is::<crate::proc::PagemapFile>()
             || file
                 .downcast_ref::<crate::proc::GeneratedFile>()
                 .is_some_and(crate::proc::GeneratedFile::is_entry)
@@ -6257,6 +6258,9 @@ fn open_path(
                 c.files.root(),
                 true,
             )),
+            crate::proc::OwnEntry::Pagemap => {
+                Arc::new(crate::proc::PagemapFile::open(c.mem.view(), flags))
+            }
             crate::proc::OwnEntry::Descriptor(n) => {
                 // A link for a descriptor that is not open is not there
                 // (ENOENT), whatever the flags. One that is, is a symbolic
@@ -7161,6 +7165,7 @@ fn other_generated_stat(
             return None;
         }
         crate::proc::OwnEntry::Maps | crate::proc::OwnEntry::Smaps => crate::proc::stat(0),
+        crate::proc::OwnEntry::Pagemap => crate::proc::private_stat(0),
         crate::proc::OwnEntry::Descriptor(n) => {
             let d = c.files.descriptor(u64::from(n)).ok()?;
             if follow {

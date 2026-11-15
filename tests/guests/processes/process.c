@@ -5986,6 +5986,126 @@ static int lock_cases(void) {
     return 0;
 }
 
+/* `call`'s result and errno, each read after it returns. */
+#define PM_RESULT(label, call)                                       \
+    do {                                                             \
+        errno = 0;                                                   \
+        long long result_ = (long long)(call);                       \
+        int errno_ = errno;                                          \
+        printf("%s=%lld errno=%d\n", label, result_, errno_);         \
+    } while (0)
+
+/* The pagemap entries of `pages` pages from `at`, read with pread at the
+   page's offset: each in hex, or the error. */
+static void pm_show(int fd, const char *label, void *at, int pages) {
+    uint64_t entries[16] = {0};
+    errno = 0;
+    ssize_t n = pread(fd, entries, (size_t)pages * 8, (off_t)((uintptr_t)at / 4096 * 8));
+    printf("%s: n=%zd errno=%d", label, n, errno);
+    for (int i = 0; n > 0 && i < n / 8; i++) printf(" %llx", (unsigned long long)entries[i]);
+    printf("\n");
+}
+
+/* /proc/self/pagemap: what each page table entry holds, as one 64-bit
+   entry a page (present, swapped or a guard, file or anonymous, mapped
+   only here, soft-dirty), and how it is read. The frame numbers are 0, as
+   for any reader without CAP_SYS_ADMIN. */
+static int pagemap_case(void) {
+    long page = 4096;
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) return 80;
+    struct stat st;
+    int got = fstat(fd, &st);
+    printf("fstat=%d mode=%o size=%lld\n", got, st.st_mode, (long long)st.st_size);
+    errno = 0;
+    int w = open("/proc/self/pagemap", O_RDWR);
+    printf("open-rdwr=%d errno=%d\n", w < 0 ? -1 : 0, errno);
+    if (w >= 0) close(w);
+    /* Each mapping lies between unmapped pages, not to merge or grow into
+       a huge page. */
+    char *base = mmap(NULL, 64 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 81;
+    munmap(base, (size_t)(64 * page));
+    int flags = MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS;
+    char *a = mmap(base + 2 * page, 6 * page, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (a == MAP_FAILED) return 82;
+    volatile char seen = a[page];
+    (void)seen;
+    a[2 * page] = 1;
+    a[4 * page] = 1;
+    printf("guard=%d\n", madvise(a + 3 * page, (size_t)page, 102 /* MADV_GUARD_INSTALL */));
+    madvise(a + 4 * page, (size_t)page, MADV_DONTNEED);
+    mprotect(a + 5 * page, (size_t)page, PROT_NONE);
+    /* The hole before, untouched, read (the zero page), written, a guard,
+       discarded, no access, the hole after. */
+    pm_show(fd, "anonymous", a - page, 8);
+
+    /* fork shares a written page until either writes it. */
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 83;
+    if (!child) {
+        pm_show(fd, "forked", a + 2 * page, 1);
+        int own = open("/proc/self/pagemap", O_RDONLY);
+        pm_show(own, "child", a + 2 * page, 1);
+        a[2 * page] = 2;
+        pm_show(own, "child-written", a + 2 * page, 1);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+
+    /* Shared anonymous memory is shared memory's: a file page. */
+    char *s = mmap(base + 10 * page, 2 * page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (s == MAP_FAILED) return 84;
+    s[page] = 1;
+    pm_show(fd, "shared", s, 2);
+
+    /* A private mapping of a file: a page read is the file's, one written
+       a copy of its own. Only those pages are shown, as Linux's read fault
+       maps the pages around one too (fault_around_bytes). */
+    char path[] = "/tmp/pagemap-XXXXXX";
+    int file = mkstemp(path);
+    if (file < 0) return 85;
+    unlink(path);
+    char block[4096];
+    memset(block, 'f', sizeof block);
+    for (int i = 0; i < 3; i++)
+        if (write(file, block, sizeof block) != (ssize_t)sizeof block) return 86;
+    char *f = mmap(base + 20 * page, 3 * page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, file, 0);
+    if (f == MAP_FAILED) return 87;
+    seen = f[page];
+    pm_show(fd, "file-read", f + page, 1);
+    f[2 * page] = 'g';
+    pm_show(fd, "file-written", f + 2 * page, 1);
+    close(file);
+
+    /* Whole entries only, from any position; a read past its end is 0. */
+    uint64_t entry = 0;
+    PM_RESULT("unaligned-offset", pread(fd, &entry, 8, 4));
+    PM_RESULT("unaligned-count", pread(fd, &entry, 4, 8));
+    PM_RESULT("no-count", pread(fd, &entry, 0, 8));
+    PM_RESULT("negative-offset", pread(fd, &entry, 8, -8));
+    PM_RESULT("bad-buffer", pread(fd, (void *)16, 8, 8));
+    /* The position: lseek from the start and the current one only, to any
+       position; read moves it by what it read. */
+    off_t at = (off_t)((uintptr_t)(a + 2 * page) / 4096 * 8);
+    printf("seek=%d\n", lseek(fd, at, SEEK_SET) == at);
+    errno = 0;
+    ssize_t n = read(fd, &entry, 8);
+    printf("read=%zd errno=%d entry=%llx\n", n, errno, (unsigned long long)entry);
+    printf("after=%d\n", lseek(fd, 0, SEEK_CUR) == at + 8);
+    printf("back=%d\n", lseek(fd, -8, SEEK_CUR) == at);
+    PM_RESULT("seek-end", lseek(fd, 0, SEEK_END));
+    PM_RESULT("seek-negative", syscall(SYS_lseek, fd, -4096L * 1024, SEEK_SET));
+    PM_RESULT("read-negative", read(fd, &entry, 8));
+    PM_RESULT("write", write(fd, &entry, 8));
+    close(fd);
+    return 0;
+}
+
 static int mincore_show(const char *label, void *at, size_t length, size_t pages) {
     unsigned char vec[16];
     memset(vec, 7, sizeof vec);
@@ -25786,6 +25906,7 @@ int main(int argc, char **argv) {
         return r == 0 && length == 24 ? 0 : 1;
     }
     if (!strcmp(mode, "mincore")) return mincore_cases();
+    if (!strcmp(mode, "pagemap")) return pagemap_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {
         x87_arithmetic_cases();

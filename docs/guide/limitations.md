@@ -64,6 +64,20 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
   `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
+- **`/proc/self/pagemap`, in part**: it is there for the reader itself
+  only (`/proc/self` and its own PID), not in `/proc/thread-self`,
+  `task/<tid>` or another process's directory. Its entries come from the
+  emulator's page entries, as `smaps`'s counts do: a page that a `fork`
+  shared is not exclusive (bit 56) until this process writes it, even
+  after the other has let it go, and a page of shared memory is exclusive
+  whoever else maps it. A page of a loaded program's segment, or of a
+  private file mapping, is a file's (bit 61) until the mapping was
+  written, not until the page was. A read of a file's page gives only
+  that page an entry, where Linux's fault maps the pages around it too
+  (`fault_around_bytes`). The frame number is 0 for every reader, also one
+  with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; nothing
+  clears the soft-dirty bit (`/proc/<pid>/clear_refs` is not there); and
+  user space ends at 2^47 bytes, as with 4-level page tables.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
@@ -250,8 +264,7 @@ verified.
     system, and only ext4, xfs, btrfs and f2fs are told apart on a Linux
     host (any other file system takes neither).
   - `madvise` refuses (`EINVAL`) `MADV_COLLAPSE`, `MADV_HWPOISON` and
-    `MADV_SOFT_OFFLINE`, which Linux takes. `/proc/<pid>/pagemap`, which
-    would show a guard page, is not there.
+    `MADV_SOFT_OFFLINE`, which Linux takes.
   - `process_madvise` takes for the caller's own memory only the advice
     `madvise` takes, and another process's ranges are only checked to be
     mapped. It refuses advice Linux does not know before any range

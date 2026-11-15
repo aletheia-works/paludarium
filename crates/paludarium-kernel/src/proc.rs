@@ -64,6 +64,8 @@ pub(crate) enum OwnEntry {
     Maps,
     /// `smaps`: `maps` with what each VMA holds and its flags.
     Smaps,
+    /// `pagemap`: an entry of 8 bytes for each page ([`PagemapFile`]).
+    Pagemap,
     /// `fd`, and one of its links by descriptor number.
     Descriptors,
     Descriptor(u32),
@@ -92,6 +94,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
         b"/root" => Some(OwnEntry::Root),
         b"/maps" => Some(OwnEntry::Maps),
         b"/smaps" => Some(OwnEntry::Smaps),
+        b"/pagemap" => Some(OwnEntry::Pagemap),
         b"/fd" | b"/fd/" => Some(OwnEntry::Descriptors),
         b"/fdinfo" | b"/fdinfo/" => Some(OwnEntry::DescriptorInfos),
         _ => match tail.strip_prefix(b"/fdinfo/") {
@@ -106,7 +109,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 19] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 20] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -123,6 +126,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 19] = [
     (b"mounts", 8),
     (b"mountinfo", 8),
     (b"smaps", 8),
+    (b"pagemap", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
@@ -1222,6 +1226,105 @@ impl FileHandle for MapsFile {
     }
 }
 
+/// Linux's `TASK_SIZE` with 4-level page tables: where `pagemap` ends.
+const PAGEMAP_END: u64 = (1 << 47) - 4096;
+
+/// `/proc/<pid>/pagemap`, as Linux's `pagemap_read` serves it: the entry of
+/// each page ([`MemoryView::pagemap`]) at 8 bytes a page, read from the
+/// address space it was opened on as it is at that moment. A position and
+/// a count must both be whole entries (`EINVAL`), and nothing is read once
+/// the space is gone or past the end of user space.
+pub(crate) struct PagemapFile {
+    memory: MemoryView,
+    writable: bool,
+    position: Mutex<u64>,
+}
+impl PagemapFile {
+    pub(crate) fn open(memory: MemoryView, flags: u32) -> Self {
+        Self {
+            memory,
+            writable: flags & 3 != 0,
+            position: Mutex::new(0),
+        }
+    }
+}
+impl FileHandle for PagemapFile {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = self.read_at(*position, buf)?;
+        *position += count as u64;
+        Ok(count)
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        // A position past `i64::MAX` is a negative one, which the VFS
+        // refuses (`rw_verify_area`).
+        if i64::try_from(offset).is_err() {
+            return Err(Errno::EINVAL);
+        }
+        // Gone: `mmget_not_zero` fails before any check.
+        if self.memory.pagemap(0, 0).is_none() {
+            return Ok(0);
+        }
+        if offset % 8 != 0 || buf.len() % 8 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let start = (offset / 8).saturating_mul(4096);
+        if buf.is_empty() || start >= PAGEMAP_END {
+            return Ok(0);
+        }
+        let end = start
+            .checked_add(buf.len() as u64 / 8 * 4096)
+            .filter(|&end| end < PAGEMAP_END)
+            .unwrap_or(PAGEMAP_END);
+        let Some(entries) = self.memory.pagemap(start, (end - start) / 4096) else {
+            return Ok(0);
+        };
+        for (slot, entry) in buf.as_chunks_mut::<8>().0.iter_mut().zip(&entries) {
+            *slot = entry.to_le_bytes();
+        }
+        Ok(entries.len() * 8)
+    }
+    /// It has no write operation: EINVAL, or EBADF on a descriptor opened
+    /// read-only.
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(if self.writable {
+            Errno::EINVAL
+        } else {
+            Errno::EBADF
+        })
+    }
+    /// As Linux's `mem_lseek`: from the start or the current position, to
+    /// any position, a negative one too, never from the end.
+    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
+        let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
+        *position = match whence {
+            0 => offset as u64,
+            1 => position.wrapping_add_signed(offset),
+            _ => return Err(Errno::EINVAL),
+        };
+        Ok(*position)
+    }
+    /// Size 0 and only its owner may read it, as Linux's (0400).
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(private_stat(0))
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn flags(&self) -> u32 {
+        0
+    }
+    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1260,6 +1363,86 @@ mod tests {
                 " ".repeat(MAPS_NAME_COLUMN - 40 + 1)
             )
         );
+    }
+
+    /// The entries `file` gives from the page at `addr`, `count` of them.
+    fn pagemap_entries(file: &PagemapFile, addr: u64, count: usize) -> Vec<u64> {
+        let mut buf = vec![0; count * 8];
+        let n = file.read_at(addr / 4096 * 8, &mut buf).unwrap();
+        buf[..n]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b))
+            .collect()
+    }
+
+    #[test]
+    fn pagemap_says_what_each_page_table_entry_holds() {
+        use paludarium_mmu::pagemap::{EXCLUSIVE, GUARD_REGION, PRESENT, SOFT_DIRTY, SWAP};
+        let mut mem = AddressSpace::new();
+        let at = mem
+            .map(
+                Some(GuestAddr(0x10000)),
+                0x5000,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let mut byte = [0];
+        mem.read(GuestAddr(0x11000), &mut byte).unwrap();
+        mem.write(GuestAddr(0x12000), b"x").unwrap();
+        mem.guard(GuestAddr(0x13000), 0x14000, true).unwrap();
+        let file = PagemapFile::open(mem.view(), 0);
+        assert_eq!(
+            pagemap_entries(&file, at.0 - 0x1000, 7),
+            [
+                0,
+                SOFT_DIRTY,
+                SOFT_DIRTY | PRESENT,
+                SOFT_DIRTY | PRESENT | EXCLUSIVE,
+                SOFT_DIRTY | SWAP | GUARD_REGION,
+                SOFT_DIRTY,
+                0,
+            ]
+        );
+        // `fork` shares the written page until either writes it.
+        let child = mem.fork();
+        assert_eq!(pagemap_entries(&file, 0x12000, 1), [SOFT_DIRTY | PRESENT]);
+        let theirs = PagemapFile::open(child.view(), 0);
+        assert_eq!(pagemap_entries(&theirs, 0x12000, 1), [SOFT_DIRTY | PRESENT]);
+        child.write(GuestAddr(0x12000), b"y").unwrap();
+        assert_eq!(
+            pagemap_entries(&theirs, 0x12000, 1),
+            [SOFT_DIRTY | PRESENT | EXCLUSIVE]
+        );
+    }
+
+    #[test]
+    fn pagemap_reads_whole_entries_up_to_the_end_of_user_space() {
+        let mem = AddressSpace::new();
+        let file = PagemapFile::open(mem.view(), 0);
+        let mut buf = [0xffu8; 16];
+        assert_eq!(file.read_at(4, &mut buf[..8]), Err(Errno::EINVAL));
+        assert_eq!(file.read_at(8, &mut buf[..12]), Err(Errno::EINVAL));
+        assert_eq!(file.read_at(8, &mut buf[..0]), Ok(0));
+        assert_eq!(file.read_at(8, &mut buf), Ok(16));
+        assert_eq!(buf, [0; 16]);
+        // The last page of user space, and nothing after it.
+        let last = (PAGEMAP_END / 4096 - 1) * 8;
+        assert_eq!(file.read_at(last, &mut buf), Ok(8));
+        assert_eq!(file.read_at(last + 8, &mut buf), Ok(0));
+        assert_eq!(file.read_at(u64::MAX / 16 * 8, &mut buf), Ok(0));
+        // A negative position is taken, and is no position to read from.
+        assert_eq!(file.seek(-8, 0), Ok((-8i64) as u64));
+        assert_eq!(file.read(&mut buf), Err(Errno::EINVAL));
+        assert_eq!(file.seek(16, 1), Ok(8));
+        assert_eq!(file.read(&mut buf), Ok(16));
+        assert_eq!(file.seek(0, 1), Ok(24));
+        assert_eq!(file.seek(0, 2), Err(Errno::EINVAL));
+        // Nothing once the space is gone.
+        drop(mem);
+        assert_eq!(file.read_at(4, &mut buf), Ok(0));
     }
 
     #[test]

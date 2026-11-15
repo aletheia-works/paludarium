@@ -56,6 +56,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
   `ui`（提供しない `userfaultfd` のマイナーのモード）、`ht`、`dp`
   （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
+- **`/proc/self/pagemap` の一部**：読み手自身の分（`/proc/self` と自分の PID）だけで、
+  `/proc/thread-self`、`task/<tid>`、ほかのプロセスのディレクトリにはありません。
+  エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
+  `fork` が共有したページは、相手が手放したあとも、このプロセスが書き込むまで
+  ここだけのもの（ビット 56）になりません。共有メモリのページは、ほかに誰がマップして
+  いてもここだけのものです。読み込んだプログラムのセグメントやファイルのプライベートな
+  マッピングのページは、ページではなくマッピングに書き込むまでファイルのもの（ビット 61）
+  です。ファイルのページを読むとそのページだけがエントリーを得ます。Linux のフォールトは
+  周りのページもマップします（`fault_around_bytes`）。フレーム番号は、Linux が物理
+  フレームを見せる `CAP_SYS_ADMIN` のある読み手にも 0 です。soft-dirty のビットを消すものは
+  なく（`/proc/<pid>/clear_refs` はありません）、ユーザー空間は 4 段のページテーブルと
+  同じく 2^47 バイトで終わります。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
   `fs` 以外の `/proc/sys` など）と、読むプロセス自身のディレクトリのほかの名前
@@ -220,8 +232,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux のホストで見分けるのは ext4、xfs、btrfs、f2fs だけです（ほかのファイルシステムは
     どちらも断ります）。
   - `madvise` は、Linux が受け付ける次の指定を断ります（`EINVAL`）。`MADV_COLLAPSE`、
-    `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。ガードページを示す
-    `/proc/<pid>/pagemap` はありません。
+    `MADV_HWPOISON`、`MADV_SOFT_OFFLINE` です。
   - `process_madvise` は、呼んだプロセス自身のメモリには `madvise` が受け付ける指定しか
     受け付けず、ほかのプロセスの範囲はマップされているかを確かめるだけです。Linux が知らない
     指定は、Linux master と同じく範囲を見る前に断ります（`EINVAL`）。CI のカーネルは範囲ごとに

@@ -252,6 +252,25 @@ pub enum SharedWrites {
     ReadOnly,
 }
 
+/// The bits of a `/proc/<pid>/pagemap` entry, as Linux's `fs/proc/task_mmu.c`
+/// numbers them.
+pub mod pagemap {
+    /// Bit 55: the page or its VMA is soft-dirty.
+    pub const SOFT_DIRTY: u64 = 1 << 55;
+    /// Bit 56: the page is mapped only here.
+    pub const EXCLUSIVE: u64 = 1 << 56;
+    /// Bit 57: `userfaultfd` write-protects it.
+    pub const UFFD_WP: u64 = 1 << 57;
+    /// Bit 58: a guard region's page (`MADV_GUARD_INSTALL`).
+    pub const GUARD_REGION: u64 = 1 << 58;
+    /// Bit 61: a file's page or shared memory's.
+    pub const FILE: u64 = 1 << 61;
+    /// Bit 62: a swap entry, which a guard marker also is.
+    pub const SWAP: u64 = 1 << 62;
+    /// Bit 63: the page is present.
+    pub const PRESENT: u64 = 1 << 63;
+}
+
 /// What a page table holds for a mapped page, as Linux's `folio_walk`
 /// finds it for `move_pages` ([`AddressSpace::page_state`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2367,6 +2386,52 @@ impl AddressSpaceData {
             return Some(PageState::Zero);
         }
         Some(PageState::Present)
+    }
+    /// The `/proc/<pid>/pagemap` entries of the `count` pages from `start`
+    /// ([`pagemap`]), as Linux's `pagemap_pte_hole` and
+    /// `pte_to_pagemap_entry` make them, without the frame number (bits 0 to
+    /// 54), which only a reader with `CAP_SYS_ADMIN` sees.
+    ///
+    /// A page outside every mapping is 0. One in a mapping is soft-dirty, as
+    /// Linux marks every new VMA `VM_SOFTDIRTY` and nothing here clears it
+    /// (`clear_refs`); a guard region's page is also a swap entry with the
+    /// guard bit, and one any access gave an entry is present. The zero page
+    /// that a read of private anonymous memory shows is only that. Any other
+    /// is a file's or shared memory's, unless it is anonymous as `usage`
+    /// counts it, and mapped only here unless `fork` shares it until a
+    /// write.
+    fn pagemap(&self, start: u64, count: u64) -> Vec<u64> {
+        let directory = self.read_directory();
+        (0..count)
+            .map(|i| {
+                let page = start + i * PAGE_SIZE;
+                let Some(mapping) = self.mapping_at(page) else {
+                    return 0;
+                };
+                let mut entry = pagemap::SOFT_DIRTY;
+                if self.guarded(page) {
+                    return entry | pagemap::SWAP | pagemap::GUARD_REGION;
+                }
+                let Some(pte) = lookup(&directory, page) else {
+                    return entry;
+                };
+                entry |= pagemap::PRESENT;
+                if pte.uffd_wp {
+                    entry |= pagemap::UFFD_WP;
+                }
+                let shared = self.shared_at(page).is_some();
+                if pte.frame.get().is_none() && !pte.file && !shared {
+                    return entry;
+                }
+                if shared || pte.cache || (pte.file && !mapping.written) {
+                    entry |= pagemap::FILE;
+                }
+                if !pte.cow || pte.cache {
+                    entry |= pagemap::EXCLUSIVE;
+                }
+                entry
+            })
+            .collect()
     }
     /// Whether the file mapping page at `page` lies wholly past the end of
     /// its file.
@@ -4973,6 +5038,12 @@ impl MemoryView {
     pub fn page_state(&self, addr: u64) -> Option<PageState> {
         self.with_data(|data| data.page_state(GuestAddr(addr).page_align_down().0))
             .flatten()
+    }
+    /// The `/proc/<pid>/pagemap` entries of the `count` pages from the page
+    /// at `start` ([`pagemap`]), or `None` once the space is gone.
+    #[must_use]
+    pub fn pagemap(&self, start: u64, count: u64) -> Option<Vec<u64>> {
+        self.with_data(|data| data.pagemap(start, count))
     }
     /// What the pages of `[start, end)` hold ([`Usage`]), or `None` once
     /// the space is gone.

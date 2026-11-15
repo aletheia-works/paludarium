@@ -548,6 +548,7 @@ mod linux {
         processes_futex_shared => ("futex-shared","process"),
         processes_late_handler => ("late-handler","process"),
         processes_mincore => ("mincore","process"),
+        processes_pagemap => ("pagemap","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),
         processes_fifo => ("fifo","process"),

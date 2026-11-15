@@ -2407,8 +2407,8 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
-  `root`, `maps`, `mounts`, `mountinfo`, `smaps`, `fd`, `fdinfo`, `ns` and
-  `task`. `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
+  `root`, `maps`, `mounts`, `mountinfo`, `smaps`, `pagemap`, `fd`, `fdinfo`,
+  `ns` and `task`. `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
   unmarked; `maps` and `smaps` name a mapped file the same way. `status`
@@ -2597,6 +2597,25 @@ kernel.
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never
   written gives back as it stops being writable), `nh` of a `MAP_STACK`
   mapping, the seal (`sl`), and `sd` on every VMA but the initial stack.
+- `/proc/self/pagemap` (mode 0400, size 0) has an entry of 8 bytes for
+  each page of user space, as Linux's `pagemap_read` gives them: the
+  entry of the page at an address is at that address divided by the page
+  size, times 8. An entry outside every mapping is 0. In a mapping it is
+  soft-dirty (bit 55), as Linux marks every new VMA so; a guard region's
+  page (`MADV_GUARD_INSTALL`) is also a swap entry (bit 62) with the guard
+  bit (58); and a page any access gave an entry is present (bit 63). The
+  zero page that a read of private anonymous memory shows is only that.
+  Any other present page is a file's or shared memory's (bit 61) unless it
+  is anonymous, as `smaps` counts it, and mapped only here (bit 56) unless
+  a `fork` shares it until it is written; one `userfaultfd` write-protects
+  has bit 57. The frame number (bits 0 to 54) is 0, as Linux gives it to a
+  reader without `CAP_SYS_ADMIN`. A read or `pread` must start at a whole
+  entry and ask for whole entries (`EINVAL`), and gives nothing from the end
+  of user space on, or once no thread uses the address space it was opened
+  on. `lseek` goes from the start or the current position to any position,
+  as Linux's `mem_lseek`, a negative one too, from which a read is `EINVAL`;
+  from the end it is `EINVAL`. It cannot be written (`EINVAL`, `EBADF` on a
+  descriptor open only for reading).
 - `/proc/self/fd` (mode 0500) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each
   link's `lstat` shows the descriptor's access in its user bits and size 64,

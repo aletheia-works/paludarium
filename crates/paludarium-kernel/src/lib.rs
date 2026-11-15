@@ -20,6 +20,7 @@ mod signalfd;
 mod signals;
 pub use inbox::SignalInbox;
 mod aio;
+mod bpf;
 mod devices;
 mod epoll;
 mod events;

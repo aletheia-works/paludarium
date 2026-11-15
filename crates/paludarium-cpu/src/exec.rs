@@ -10,7 +10,8 @@ use crate::alu::{self, ShiftKind, sign_extend, size_mask};
 use crate::softfloat::{F32, F64};
 use crate::state::{CpuState, FX_WRITTEN, flag, reg};
 use crate::x87::{
-    Arithmetic, ENVIRONMENT, LN_2, LOG2_10, LOG2_E, LOG10_2, PI, float_operand, integer_value,
+    Arithmetic, ENVIRONMENT, ENVIRONMENT_16, LN_2, LOG2_10, LOG2_E, LOG10_2, PI, STATE, STATE_16,
+    float_operand, integer_value,
 };
 use core::cmp::Ordering;
 
@@ -1502,16 +1503,47 @@ impl Exec<'_> {
             (M::Fnstsw, None) => {
                 self.write(op(self.i, 0)?, 2, u64::from(unit.status_word()))?;
             }
-            (M::Fnstenv, Some(memory)) if usize::from(memory.size) == ENVIRONMENT => {
-                let image = unit.store_environment();
+            (M::Fnstenv, Some(memory))
+                if matches!(usize::from(memory.size), ENVIRONMENT | ENVIRONMENT_16) =>
+            {
+                let size = usize::from(memory.size);
+                let image = unit.store_environment(size);
                 let at = self.linear(&memory);
-                self.mem.check_write(at, ENVIRONMENT)?;
-                self.mem.write(at, &image)?;
+                self.mem.check_write(at, size)?;
+                self.mem.write(at, &image[..size])?;
             }
-            (M::Fldenv, Some(memory)) if usize::from(memory.size) == ENVIRONMENT => {
+            (M::Fldenv, Some(memory))
+                if matches!(usize::from(memory.size), ENVIRONMENT | ENVIRONMENT_16) =>
+            {
                 let mut image = [0; ENVIRONMENT];
+                let image = &mut image[..usize::from(memory.size)];
+                self.mem.read(self.linear(&memory), image)?;
+                unit.load_environment(image);
+            }
+            (M::Fnsave, Some(memory)) if matches!(usize::from(memory.size), STATE | STATE_16) => {
+                let size = usize::from(memory.size);
+                let image = unit.save(size);
+                let at = self.linear(&memory);
+                self.mem.check_write(at, size)?;
+                self.mem.write(at, &image[..size])?;
+            }
+            (M::Frstor, Some(memory)) if matches!(usize::from(memory.size), STATE | STATE_16) => {
+                let mut image = [0; STATE];
+                let image = &mut image[..usize::from(memory.size)];
+                self.mem.read(self.linear(&memory), image)?;
+                unit.restore(image);
+            }
+            (M::Fbld, Some(memory)) if memory.size == 10 => {
+                let mut image = [0; 10];
                 self.mem.read(self.linear(&memory), &mut image)?;
-                unit.load_environment(&image);
+                unit.load_decimal(&image);
+            }
+            (M::Fbstp, Some(memory)) if memory.size == 10 => {
+                let image = unit.store_decimal();
+                let at = self.linear(&memory);
+                self.mem.check_write(at, 10)?;
+                self.mem.write(at, &image)?;
+                unit.pop();
             }
             _ => return Err(Stop::Invalid),
         }
@@ -2318,6 +2350,10 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
         | Mnemonic::Fninit
         | Mnemonic::Fnstenv
         | Mnemonic::Fldenv
+        | Mnemonic::Fnsave
+        | Mnemonic::Frstor
+        | Mnemonic::Fbld
+        | Mnemonic::Fbstp
         | Mnemonic::Wait => x.x87()?,
         Mnemonic::Cpuid => {
             let values = crate::cpuid::values(x.s.gpr[reg::RAX] as u32, x.s.gpr[reg::RCX] as u32);

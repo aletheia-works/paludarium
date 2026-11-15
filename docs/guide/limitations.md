@@ -5,14 +5,14 @@ verified.
 
 ## Not supported
 
-- **Part of x87, for now**: packed decimals (`FBLD`, `FBSTP`) are not
-  implemented yet, so a program stops with `SIGILL` where it reaches one. An
-  x87 exception always takes its masked response: an unmasked one sets the
-  status word's summary and does not raise `SIGFPE`. The 16-bit forms of
-  `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not implemented either.
-  `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
-  implemented. Where `FPREM` and `FPREM1` stop on the way when their
-  operands are far apart is each CPU's choice: the final remainder is the same.
+- **Part of x87, for now**: an x87 exception always takes its masked
+  response: an unmasked one sets the status word's summary and does not raise
+  `SIGFPE`. `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
+  implemented. Where the last instruction and its memory operand were, which
+  `FNSTENV`, `FNSAVE` and `FXSAVE` write, is not kept: those fields are zero,
+  and Intel's and AMD's CPUs fill them in differently. Where `FPREM` and
+  `FPREM1` stop on the way when their operands are far apart is each CPU's
+  choice: the final remainder is the same.
 - **A dynamically linked program's files, unless given**: a program runs with
   its interpreter as on Linux, on musl's dynamic linker or glibc's. A session
   reads the interpreter and the libraries from its own files, so they must be
@@ -220,6 +220,28 @@ verified.
   `EOPNOTSUPP`. `kernel.perf_event_paranoid` is always 2 (Debian's and
   Ubuntu's kernels default to more), with no `/proc/sys/kernel` file for it,
   and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
+- **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
+  Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
+  links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), IDs
+  (`BPF_*_GET_NEXT_ID`, `BPF_*_GET_FD_BY_ID`), tokens, iterators and
+  statistics are `ENOSYS`, as each command Linux has that is not here; a
+  number Linux has no command for is `EINVAL`, as there. So libbpf finds no
+  program loads (its trivial-program probe fails with `ENOSYS`) and
+  `bpftool feature` says the `bpf()` system call is not there, as it asks
+  `BPF_PROG_LOAD` and looks for `ENOSYS`. The other map types are `EINVAL`,
+  as on a kernel built without them; the per-CPU ones
+  (`BPF_MAP_TYPE_PERCPU_ARRAY`, `PERCPU_HASH`, `LRU_PERCPU_HASH`) could not
+  be compared with Linux anyway, as their values are one per possible CPU,
+  which a test machine and the emulator count differently. A hash gives
+  its keys in the order of their bytes, where Linux's order follows its
+  buckets and a random seed, and a batch of it takes each element as a
+  bucket of its own, so `in_batch` and `out_batch` count elements. Maps
+  take no memory limit and no `memlock` charge Linux would refuse (a huge
+  map is made, where Linux may give `ENOMEM`), and fdinfo's `memlock` is
+  the elements' size alone. `BPF_F_MMAPABLE` is taken but `mmap` of a map
+  is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
+  `kernel.unprivileged_bpf_disabled` is always 2, with no
+  `/proc/sys/kernel` file for it.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its
@@ -415,11 +437,6 @@ verified.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.
-  - A set's waiting semaphore operations are tried in one queue in the
-    order they began, the waits for zero first. Linux keeps a queue for
-    each semaphore beside one for operations on several, and which of two
-    waits that both could go through goes first can differ where waits of
-    both kinds are mixed.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` has no system-call stops, events, single-stepping or
@@ -654,7 +671,10 @@ verified.
   of the host's kernel and modules (`ethtool`, `nl80211`, `devlink` and
   others), so a lookup of one is `ENOENT` and a socket has 64 groups
   however many those take. Of `NETLINK_ROUTE` there
-  are only the link, address and route requests: neighbours, rules, queueing
+  are only the link, address and route requests and the neighbour dumps
+  and gets: adding and removing neighbours (`RTM_NEWNEIGH`,
+  `RTM_DELNEIGH`), the neighbour tables (`RTM_GETNEIGHTBL`), a bridge's
+  forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`), rules, queueing
   disciplines and the rest are `EOPNOTSUPP`, as are an input route
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), renaming `lo`
   and setting any other attribute of it. A
@@ -702,9 +722,10 @@ verified.
   Linux. A neighbour is made by UDP and TCP's handshakes alone, which are
   the only packets paludarium sends through `lo` (a TCP handshake retried
   into a full backlog makes none of its answer), and never times out
-  (`gc_thresh1` is never reached); neighbours are not dumped
-  (`RTM_GETNEIGH` is `EOPNOTSUPP`), and their cache information counts
-  from when each was made.
+  (`gc_thresh1` is never reached). A dump gives a family's neighbours
+  the newest first, where Linux gives them in the order of its hash
+  table, which a random key sets; their cache information counts from
+  when each was made.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
   ID goes when its namespace does, with no `RTM_DELNSID` to tell of it;
   an ID is given only by `RTM_NEWNSID`, as no device of another

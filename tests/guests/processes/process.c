@@ -118,6 +118,7 @@ static void nl_ext_show(const unsigned char *buf, long n) {
                 case 1: printf(" msg=\"%.*s\"", vlen > 0 ? vlen - 1 : 0, v); break;
                 case 2: printf(" offs=%u", word); break;
                 case 4: printf(" policy{"); nl_ext_policy(v, vlen); printf(" }"); break;
+                case 5: printf(" miss-type=%u", word); break;
                 default: printf(" %u:%d", kind & 0x3fff, vlen); break;
                 }
                 at += (alen + 3) & ~3u;
@@ -1493,6 +1494,7 @@ static void nl_address_attribute(unsigned short type, const unsigned char *v, in
 /* Receives on `fd` until NLMSG_DONE or an error: prints each message of
    the answer to request `seq` from `port`, whatever datagrams carry them,
    and returns how many came, or -errno. */
+static void nl_neighbour_attribute(unsigned short type, const unsigned char *v, int len);
 static long nl_answer(int fd, long seq, unsigned port, const char *label) {
     long messages = 0;
     for (;;) {
@@ -1565,6 +1567,14 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
                 printf(" family=%u prefix=%u flags=%#x scope=%u index=%d attributes", body[0], body[1], body[2],
                        body[3], index);
                 nl_attributes(body + 8, body_len - 8, nl_address_attribute);
+            } else if (h->type == 28 && body_len >= 12) {
+                int index;
+                unsigned short state;
+                memcpy(&index, body + 4, 4);
+                memcpy(&state, body + 8, 2);
+                printf(" neigh family=%u index=%d state=%#x flags=%#x type=%u attributes", body[0], index, state,
+                       body[10], body[11]);
+                nl_attributes(body + 12, body_len - 12, nl_neighbour_attribute);
             }
             printf("\n");
         }
@@ -12611,6 +12621,16 @@ static pid_t semx_child(int id, unsigned short num, short op, short flags) {
     if (child == 0) _exit(semx_op(id, num, op, flags));
     return child;
 }
+/* A child that does two operations at once and exits with its error. */
+static pid_t semx_child2(int id, struct semx_op first, struct semx_op second) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct semx_op ops[2] = {first, second};
+        _exit(semx_errno(syscall(SYS_semop, id, ops, 2)));
+    }
+    return child;
+}
 static int semx_reaped(pid_t child) {
     int status;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
@@ -13092,6 +13112,37 @@ static int sem_case(void) {
     printf(" down=%d", semx_op(id, 2, -4, 0));
     printf(" zero=%d", semx_reaped(zero));
     printf(" by-zero=%d\n", semx_ctl(id, 2, SEMX_GETPID, 0) == zero);
+
+    /* Waits of both kinds: on one semaphore, which wait in its own queue,
+       and on two, after which the others wait in the set's queue too, in
+       the order they began. A complex change done lets through the wait for
+       zero it makes, then the rest of the queue again. */
+    int mixed = syscall(SYS_semget, 0, 2, 0600);
+    semx_ctl(mixed, 1, SEMX_SETVAL, 1);
+    pid_t simple = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 1);
+    pid_t complex = semx_child2(mixed, (struct semx_op){0, -1, 0}, (struct semx_op){1, -1, 0});
+    semx_await(mixed, 0, SEMX_GETNCNT, 2);
+    pid_t behind = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 3);
+    pid_t zeroed = semx_child(mixed, 1, 0, 0);
+    semx_await(mixed, 1, SEMX_GETZCNT, 1);
+    printf("mixed ncnt=%ld,%ld", semx_ctl(mixed, 0, SEMX_GETNCNT, 0), semx_ctl(mixed, 1, SEMX_GETNCNT, 0));
+    printf(" up=%d", semx_op(mixed, 0, 1, 0));
+    printf(" simple=%d", semx_reaped(simple));
+    printf(" by-simple=%d", semx_ctl(mixed, 0, SEMX_GETPID, 0) == simple);
+    printf(" ncnt=%ld", semx_ctl(mixed, 0, SEMX_GETNCNT, 0));
+    printf(" up=%d", semx_op(mixed, 0, 2, 0));
+    printf(" complex=%d behind=%d zeroed=%d", semx_reaped(complex), semx_reaped(behind), semx_reaped(zeroed));
+    printf(" by-behind=%d", semx_ctl(mixed, 0, SEMX_GETPID, 0) == behind);
+    printf(" by-zeroed=%d", semx_ctl(mixed, 1, SEMX_GETPID, 0) == zeroed);
+    printf(" values=%ld,%ld", semx_ctl(mixed, 0, SEMX_GETVAL, 0), semx_ctl(mixed, 1, SEMX_GETVAL, 0));
+    /* With no complex wait left, a simple one waits on its own again. */
+    pid_t again = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 1);
+    printf(" again-up=%d", semx_op(mixed, 0, 1, 0));
+    printf(" again=%d", semx_reaped(again));
+    printf(" removed=%ld\n", semx_ctl(mixed, 0, SEMX_RMID, 0));
 
     /* A signal ends a wait with EINTR, even with SA_RESTART. */
     fflush(stdout);
@@ -15674,6 +15725,153 @@ int main(int argc, char **argv) {
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 1, 0, 0, "down oif lo");
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 0, 0, 0, "down");
             nl_select(ctl, port, "224.0.0.1", 0, 0, "127.0.0.1", 0, 0, 0, "down all hosts from");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "neighbour-requests")) {
+        /* A child makes a network namespace with lo up and sends through it,
+           which makes IPv4's neighbour (0.0.0.0) and IPv6's ::1. RTM_GETNEIGH
+           dumps show them by family and filter, and a request without a dump
+           one of them, checked as neigh_valid_dump_req and
+           neigh_valid_get_req check them: dumps unchecked, then strictly
+           (NETLINK_GET_STRICT_CHK). */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            int u4 = socket(AF_INET, SOCK_DGRAM, 0), u6 = socket(AF_INET6, SOCK_DGRAM, 0);
+            struct sockaddr_in to4 = {.sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(0x7f000001)};
+            struct sockaddr_in6 to6 = {.sin6_family = AF_INET6, .sin6_port = htons(9)};
+            inet_pton(AF_INET6, "::1", &to6.sin6_addr);
+            printf("send4=%ld\n", netns_result(sendto(u4, "x", 1, 0, (void *)&to4, sizeof to4)));
+            printf("send6=%ld\n", netns_result(sendto(u6, "x", 1, 0, (void *)&to6, sizeof to6)));
+            /* Let ICMPv6's port unreachable come back through ::1. */
+            usleep(100000);
+            for (int strict = 0; strict < 2; strict++) {
+                if (strict) {
+                    int on = 1;
+                    printf("strict=%ld\n", netns_result(setsockopt(ctl, 270, 12, &on, sizeof on)));
+                }
+                const char *p = strict ? "strict " : "";
+                char label[64];
+                struct nl_body b;
+#define NEIGH_DUMP(text) (snprintf(label, sizeof label, "%s%s", p, text), nl_strict(ctl, port, 30, 1, &b, label))
+                b = nl_body(0, 1);
+                NEIGH_DUMP("family byte");
+                b = nl_body(0, 12);
+                NEIGH_DUMP("all");
+                b = nl_body(AF_INET, 12);
+                NEIGH_DUMP("inet");
+                b = nl_body(AF_INET6, 12);
+                NEIGH_DUMP("inet6");
+                b = nl_body(17, 12);
+                NEIGH_DUMP("packet");
+                b = nl_body(45, 1);
+                NEIGH_DUMP("mctp short");
+                b = nl_body(45, 12);
+                NEIGH_DUMP("mctp");
+                b = nl_body(0, 12);
+                b.bytes[10] = 8;
+                NEIGH_DUMP("proxy");
+                b.bytes[10] = 0x18;
+                NEIGH_DUMP("proxy and more");
+                b = nl_body(0, 12);
+                b.bytes[8] = 2;
+                NEIGH_DUMP("state");
+                b = nl_body(0, 12);
+                b.bytes[4] = 1;
+                NEIGH_DUMP("index");
+                b = nl_body(0, 8);
+                NEIGH_DUMP("short");
+                b = nl_body(0, 12);
+                nl_put32(&b, 8, 1);
+                NEIGH_DUMP("device 1");
+                b = nl_body(0, 12);
+                nl_put32(&b, 8, 2);
+                NEIGH_DUMP("device 2");
+                b = nl_body(0, 12);
+                nl_put32(&b, 9, -1);
+                NEIGH_DUMP("no master");
+                b = nl_body(0, 12);
+                nl_put32(&b, 9, 3);
+                NEIGH_DUMP("master 3");
+                b = nl_body(AF_INET, 12);
+                nl_put(&b, 1, "\0\0\0\0", 4);
+                NEIGH_DUMP("key");
+                b = nl_body(0, 12);
+                nl_put32(&b, 8, 2);
+                nl_put(&b, 16, "\0\0", 2);
+                NEIGH_DUMP("state mask");
+                b = nl_body(0, 12);
+                nl_put(&b, 8, "\2\0", 2);
+                NEIGH_DUMP("short index");
+                b = nl_body(0, 12);
+                nl_put32(&b, 15, 2);
+                NEIGH_DUMP("reserved flag");
+                b = nl_body(0, 12);
+                nl_put32(&b, 15, 1);
+                NEIGH_DUMP("managed flag");
+                b = nl_body(0, 12);
+                nl_put(&b, 15, "\1\0", 2);
+                NEIGH_DUMP("short flags");
+                b = nl_body(0, 12);
+                nl_put32(&b, 99, 1);
+                NEIGH_DUMP("past the last");
+#undef NEIGH_DUMP
+            }
+            /* One neighbour each, without a dump. */
+            struct nl_body b;
+#define NEIGH_GET(family, index, flags, key, len, text)                    \
+    (b = nl_body(family, 12), memcpy(b.bytes + 4, &(int){index}, 4), b.bytes[10] = flags, \
+     (len) ? nl_put(&b, 1, key, len) : (void)0, nl_strict(ctl, port, 30, 0, &b, text))
+            const unsigned char zero[16] = {0}, loopback6[16] = {[15] = 1}, loopback4[4] = {127, 0, 0, 1};
+            NEIGH_GET(AF_INET, 1, 0, zero, 4, "get inet");
+            NEIGH_GET(AF_INET6, 1, 0, loopback6, 16, "get inet6");
+            NEIGH_GET(AF_INET, 1, 0, loopback4, 4, "get absent");
+            NEIGH_GET(AF_INET6, 1, 0, zero, 16, "get absent6");
+            NEIGH_GET(AF_INET, 0, 0, zero, 4, "get no device");
+            NEIGH_GET(AF_INET, 0, 8, zero, 4, "get proxy");
+            NEIGH_GET(AF_INET, 1, 8, zero, 4, "get proxy on lo");
+            /* A new namespace can hold fallback tunnels (sit0 and others) after lo,
+               so ask for an index no device has. */
+            NEIGH_GET(AF_INET, 4096, 0, zero, 4, "get device 4096");
+            NEIGH_GET(AF_INET, -1, 0, zero, 4, "get device -1");
+            NEIGH_GET(AF_INET, 1, 0, zero, 16, "get long key");
+            NEIGH_GET(AF_INET6, 1, 0, zero, 4, "get short key6");
+            NEIGH_GET(17, 1, 0, zero, 4, "get packet");
+            NEIGH_GET(45, 1, 0, zero, 1, "get mctp");
+            NEIGH_GET(AF_INET, 1, 0x10, zero, 4, "get flags");
+            NEIGH_GET(AF_INET, 1, 0, zero, 0, "get no key");
+            /* The key with more: an index attribute, a state, padding. */
+            b = nl_body(AF_INET, 12);
+            b.bytes[4] = 1;
+            nl_put(&b, 1, zero, 4);
+            size_t keyed = b.len;
+            nl_put32(&b, 8, 1);
+            nl_strict(ctl, port, 30, 0, &b, "get index attribute");
+            b.len = keyed;
+            nl_put32(&b, 15, 2);
+            nl_strict(ctl, port, 30, 0, &b, "get reserved flag");
+            b.len = keyed;
+            b.bytes[8] = 2;
+            nl_strict(ctl, port, 30, 0, &b, "get state");
+            b.bytes[8] = 0;
+            b.bytes[1] = 1;
+            nl_strict(ctl, port, 30, 0, &b, "get padding");
+            b = nl_body(AF_INET, 8);
+            nl_strict(ctl, port, 30, 0, &b, "get short");
+#undef NEIGH_GET
             fflush(stdout);
             _exit(0);
         }

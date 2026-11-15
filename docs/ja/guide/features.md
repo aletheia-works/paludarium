@@ -32,8 +32,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `FCMOV` と、glibc と musl の `long double` の数学関数が使う超越関数の命令
   （`FSIN`、`FCOS`、`FSINCOS`、`FPTAN`、`FPATAN`、`F2XM1`、`FYL2X`、`FYL2XP1`）も
   正しく丸めて実行します。これは実際の CPU の最後のビットと同じとは限りません
-  （[制限](./limitations)）。10 進数はまだ実装していません。シグナルハンドラは、
-  Linux と同じく x87 と SSE の状態をリセット直後にして始まります。
+  （[制限](./limitations)）。10 進数を読み書きし（`FBLD`、`FBSTP`）、`FNSAVE`、
+  `FRSTOR`、`FNSTENV`、`FLDENV` で、16 ビット形式（`0x66` プレフィックス付き）も
+  含めて、ユニットを保存して戻します。シグナルハンドラは、Linux と同じく x87 と
+  SSE の状態をリセット直後にして始まります。
 - AVX、AVX-512、MMX は対象外です。glibc が必須とするので `CPUID` は MMX を示しますが、
   その命令は `SIGILL` で止まります。
 
@@ -63,6 +65,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
+| BPF | `bpf`、マップのみ（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -912,8 +915,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   呼び出しの操作は、すべてまとめて行うか、どれも行いません。すぐに通らない操作は、待つ
   ことになる操作に `IPC_NOWAIT` があれば `EAGAIN` で、なければ変更で通れるようになるか、
   セットが消える（`EIDRM`）か、シグナルが来る（`EINTR`。Linux と同じく再開しません）か、
-  `semtimedop` の時間切れ（`EAGAIN`）まで待ちます。変更のたびに、Linux の
-  `do_smart_update` と同じく待ちを試します。0 を待つものが先で、ほかは待ち始めた順です。
+  `semtimedop` の時間切れ（`EAGAIN`）まで待ちます。待ちは Linux と同じ待ち行列に入ります。
+  1 つのセマフォーだけへの操作はそのセマフォーの待ち行列に、複数のセマフォーへの操作はセットの
+  待ち行列に入り、後者が待っている間は、1 つのセマフォーを変える待ちもセットの待ち行列に
+  加わります。変更のたびに、Linux の `do_smart_update` と同じく、まず 0 にしたセマフォーで
+  0 を待つものを、次に値を変える待ちを、どの待ち行列も待ち始めた順に試します。
   `SEM_UNDO` の調整値はプロセスの undo リストに持ちます。このリストは `CLONE_SYSVSEM` で
   共有し（`pthread_create` はこれを渡します）、`fork` では共有しません。`SETVAL` と
   `SETALL` は調整値を消します。リストを共有する最後のスレッドが、終わるとき、または
@@ -1689,6 +1695,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     IPv6 は自分のアドレスにだけ bind できます。IPv4 にまだローカルの表がなければ、Linux の
     `inet_addr_type` がそのときどのアドレスもブロードキャストと見るのと同じく、ソケットは
     どの IPv4 のアドレスにも bind できます。
+  - **近隣:** `RTM_GETNEIGH` のダンプは、`neigh_dump_info` と同じくループバックの近隣
+    （下の通知の項のとおり、通信が作るもの）を返します。それぞれは、消えるときに伝える
+    `RTM_DELNEIGH` と同じ形の `RTM_NEWNEIGH` です。`AF_UNSPEC` では ARP（IPv4）の
+    ものに続けて近隣探索（IPv6）のものを、`AF_INET` と `AF_INET6` ではそのファミリーの
+    ものを返し、ほかのファミリーでは何も返しません。フラグが `NTF_PROXY` の `ndmsg` は
+    代理のエントリを求めますが、それはありません。`NDA_IFINDEX` と `NDA_MASTER` は
+    ダンプを絞り、どのメッセージにも `NLM_F_DUMP_FILTERED` を付けます。`lo` の番号の 1
+    と、マスターの -1（マスターなし）なら近隣を残し、ほかの値では何も返しません。
+    厳しく調べるときは、`neigh_valid_dump_req` と同じく、短い `ndmsg`、詰め物・番号・
+    状態・型・`NTF_PROXY` 以外のフラグを持つ `ndmsg`、ほかの属性は `EINVAL` です。
+    調べないときは、属性が `nda_policy` に合わないダンプは絞りません。`AF_MCTP` の
+    ダンプは近隣を返しません（`mctp_rtm_getneigh` と同じく、短い `ndmsg` は `EINVAL`）。
+    ダンプでないリクエストは、`neigh_get` と同じく、ファミリーとキー（`NDA_DST`）と
+    `lo` の番号で 1 つの近隣を指し、答えは引き当てが持つ参照も数えます。キーがない
+    （`NLMSGERR_ATTR_MISS_TYPE` で伝えます）、ほかの属性がある、キーの長さが違う、
+    デバイスがない、詰め物・状態・型・`NTF_PROXY` 以外のフラグがあるものは `EINVAL`、
+    IPv4 と IPv6 以外のファミリーは `EAFNOSUPPORT`、ほかのデバイスは `ENODEV`、`lo` に
+    ない近隣と代理のエントリは `ENOENT` です。
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
     `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
     1 から 39 で（0 とそれを超えるものは `EINVAL`、マルチキャストの経路の 30 と 31 には
@@ -2260,7 +2284,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>/…`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに
   `pipe:[<inode>]`、`socket:[<inode>]`、`anon_inode:[eventfd]`・`[eventpoll]`・
   `[timerfd]`・`[signalfd]`・`[perf_event]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
-  名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`/memfd:<名前> (deleted)` です。
+  名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`anon_inode:bpf-map`、`/memfd:<名前> (deleted)` です。
   そのためにパイプとソケットは自分の inode 番号を持ちます。リンクを開くと、ファイルを
   パスで開き直します。どのパスもそのファイルを指さなくなったとき（消された、または
   名前が変わった）は、同じファイルをそのハンドルから開き直し、オフセットは別に持ちます。
@@ -2559,6 +2583,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベントを以後ずっと無効にします。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
+- `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを
+  持ちます。どのコマンドも、まず union のサイズ（1 ページより大きいか、Linux master の 168
+  バイトより先に 0 でないバイトがあれば `E2BIG`）と、コマンド自身のフィールドより先
+  （`CHECK_ATTR`、`EINVAL`）を確かめます。`BPF_MAP_CREATE` は `BPF_MAP_TYPE_ARRAY`
+  （4 バイトのキーで、どの要素も初めからあって 0）か `BPF_MAP_TYPE_HASH` を、Linux の検査の
+  順に作ります。BTF の型 ID、`map_extra`、NUMA ノード（一つです）、型、型ごとのサイズと
+  フラグ（`EINVAL`。大きすぎるハッシュの要素は `E2BIG`、`CAP_SYS_ADMIN` なしの
+  `BPF_F_ZERO_SEED` は `EPERM`）、Linux の既定の 2 の `kernel.unprivileged_bpf_disabled`
+  （マップには `CAP_BPF` か `CAP_SYS_ADMIN` が要ります、`EPERM`）、名前（英数字、`_`、`.`）、
+  BTF（どのファイルも BTF ではありません、`EINVAL`）、`BPF_F_RDONLY` と `BPF_F_WRONLY` の
+  両方（`EINVAL`）の順です。ディスクリプタは close-on-exec で、`BPF_F_RDONLY` と
+  `BPF_F_WRONLY` に従って読み込み、書き込み、その両方で開かれ、リンクは
+  `anon_inode:bpf-map`、読み書きは `EINVAL` です。`BPF_MAP_LOOKUP_ELEM`、`UPDATE_ELEM`
+  （`BPF_ANY`、`BPF_NOEXIST`、`BPF_EXIST`。いっぱいのハッシュと配列の終わりより先の
+  添字は `E2BIG`）、`DELETE_ELEM`（配列では `EINVAL`）、`GET_NEXT_KEY`、
+  `LOOKUP_AND_DELETE_ELEM`（配列ではカーネルの `ENOTSUPP`、524）、`BPF_MAP_FREEZE`
+  （どのディスクリプタからの書き込みも止めるので、2 回目も `EPERM`）は、ディスクリプタのアクセスを
+  要ります（`EPERM`）。バッチのコマンドは、数を指定して検索、更新、削除、検索して削除を行い、
+  `count` を書き戻します（配列は削除できません、`ENOTSUPP`）。`BPF_OBJ_GET_INFO_BY_FD` は
+  マップの `struct bpf_map_info` を求められた長さまで返します（ディスクリプタがなければ
+  `EBADFD`、マップでなければ `EINVAL`）。fdinfo には `map_type`、`key_size`、`value_size`、
+  `max_entries`、`map_flags`、`map_extra`、`memlock`、`map_id`、`frozen` があります。
+  ないものは [制限](./limitations) を参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。

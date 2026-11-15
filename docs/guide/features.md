@@ -2441,8 +2441,7 @@ kernel.
     for one it cannot see), the owner and creator in the reader's user
     namespace, and the times.
   - A segment's line adds the bytes of its pages in memory, and 0 swapped.
-  - A segment's or queue's PIDs, which `IPC_STAT` gives too (and a
-    semaphore's, which `GETPID` gives), still show
+  - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
     once their process is gone, as the object keeps its `struct pid`.
 - These system files (`loadavg`, `meminfo`, `stat`, `uptime` and
   `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a

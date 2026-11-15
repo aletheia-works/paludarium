@@ -3,10 +3,8 @@
 and their correctly rounded results, which the x87-transcendental case compares
 a CPU with and the CPU crate's unit tests compare the emulator with.
 
-Run it by hand after changing what it chooses; it needs mpmath
-(`python3 -m pip install mpmath`):
-
-    python3 tests/guests/processes/x87_transcendental.py > tests/guests/processes/x87_transcendental.h
+After changing what it chooses, `mise run x87:table` writes the header again
+(with mpmath, which uv fetches); `lint:all` checks that the two agree.
 
 The results follow what Intel's and AMD's CPUs compute, rounded once: fsin,
 fcos, fsincos and fptan take away multiples of pi/2 as pi/2 cut to 66 bits,

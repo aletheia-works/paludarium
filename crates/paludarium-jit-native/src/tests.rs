@@ -108,6 +108,25 @@ const FORMS: &[&[u8]] = &[
     &[0xf6, 0x03, 0x01],
     &[0x48, 0x85, 0x03],
     &[0x66, 0x83, 0x7b, 0x02, 0xff],
+    // inc, dec, neg, not
+    &[0x48, 0xff, 0xc0],
+    &[0xff, 0xc8],
+    &[0xfe, 0xc0],
+    &[0x66, 0xff, 0xc0],
+    &[0x49, 0xff, 0xc8],
+    &[0x48, 0xf7, 0xd8],
+    &[0xf7, 0xd8],
+    &[0xf6, 0xd8],
+    &[0x48, 0xf7, 0xd0],
+    &[0xf7, 0xd0],
+    &[0x66, 0xf7, 0xd0],
+    &[0xf6, 0xd0],
+    &[0x48, 0xff, 0x03],
+    &[0xff, 0x4b, 0x04],
+    &[0xfe, 0x03],
+    &[0x48, 0xf7, 0x1b],
+    &[0xf7, 0x13],
+    &[0x66, 0xff, 0x0b],
     // op r, [m]
     &[0x48, 0x03, 0x03],
     &[0x2b, 0x43, 0x08],
@@ -314,6 +333,23 @@ fn a_form_that_faults_runs_nothing() {
     let memory = space(&code, &[]);
     let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
     state.gpr[reg::RBX] = 0x1000;
+    let before = state.clone();
+    assert_eq!(
+        compiled.run(&mut state, &memory, memory.code_generation_cached()),
+        0
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn an_increment_of_memory_it_cannot_write_runs_nothing() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    // inc dword [rbx] with rbx at the code, which reads but does not write.
+    let code = [0xff, 0x03];
+    let compiled = compiler.compile(&forms(&code)).unwrap();
+    let memory = space(&code, &[]);
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    state.gpr[reg::RBX] = CODE;
     let before = state.clone();
     assert_eq!(
         compiled.run(&mut state, &memory, memory.code_generation_cached()),

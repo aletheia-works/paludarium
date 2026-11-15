@@ -192,6 +192,7 @@ mod linux {
                     | "userfaultfd-signals"
                     | "userfaultfd-sigbus"
                     | "userfaultfd-shared"
+                    | "userfaultfd-wp"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -492,6 +493,7 @@ mod linux {
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
         userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
+        userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -650,6 +652,7 @@ mod linux {
         processes_time_set => ("time-set","process"),
         processes_chroot => ("chroot","process"),
         processes_mounts => ("mounts","process"),
+        processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),

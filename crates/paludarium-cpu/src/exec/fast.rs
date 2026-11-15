@@ -63,6 +63,48 @@ impl Alu {
     }
 }
 
+/// An operation of [`Fast`] on one operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Unary {
+    Inc,
+    Dec,
+    Neg,
+    Not,
+}
+
+impl Unary {
+    fn of(m: Mnemonic) -> Option<Self> {
+        Some(match m {
+            Mnemonic::Inc => Self::Inc,
+            Mnemonic::Dec => Self::Dec,
+            Mnemonic::Neg => Self::Neg,
+            Mnemonic::Not => Self::Not,
+            _ => return None,
+        })
+    }
+
+    /// The result of the operation on `a`, the flags it changes and their
+    /// values, as [`Exec::unary`] has them.
+    #[inline]
+    fn apply(self, a: u64, size: u8) -> (u64, u64, u64) {
+        match self {
+            Self::Inc => {
+                let (r, f) = alu::add(a, 1, false, size);
+                (r, flag::STATUS & !flag::CF, f)
+            }
+            Self::Dec => {
+                let (r, f) = alu::sub(a, 1, false, size);
+                (r, flag::STATUS & !flag::CF, f)
+            }
+            Self::Neg => {
+                let (r, f) = alu::sub(0, a, false, size);
+                (r, flag::STATUS, f)
+            }
+            Self::Not => (!a & size_mask(size), 0, 0),
+        }
+    }
+}
+
 /// A shift or rotate of [`Fast`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Shift {
@@ -234,6 +276,16 @@ pub enum Fast {
         mem: Address,
         src: Source,
     },
+    /// `inc`, `dec`, `neg` or `not` of a register.
+    Unary {
+        op: Unary,
+        dst: Register,
+    },
+    /// `inc`, `dec`, `neg` or `not` of memory, without `lock`.
+    UnaryStore {
+        op: Unary,
+        mem: Address,
+    },
     /// `op r, [m]`.
     AluLoad {
         op: Alu,
@@ -355,6 +407,19 @@ impl Fast {
             Mnemonic::Jmp => Self::Jmp(branch(a)?),
             Mnemonic::Call => Self::Call(branch(a)?),
             Mnemonic::Ret if a.is_none() => Self::Ret,
+            m if Unary::of(m).is_some() => {
+                if b.is_some() {
+                    return None;
+                }
+                let op = Unary::of(m)?;
+                match gpr(a) {
+                    Some(dst) => Self::Unary { op, dst },
+                    None => Self::UnaryStore {
+                        op,
+                        mem: address(a)?,
+                    },
+                }
+            }
             m if Shift::of(m).is_some() => {
                 let dst = gpr(a)?;
                 let count = match b {
@@ -509,6 +574,23 @@ pub(crate) fn execute(
             let a = x.load(x.fast_linear(&mem), size)?;
             let (_, flags) = op.apply(a, b, size);
             x.set_status(flag::STATUS, flags);
+            next
+        }
+        Fast::Unary { op, dst } => {
+            let size = dst.size();
+            let a = x.read_reg(dst) & size_mask(size);
+            let (r, update, flags) = op.apply(a, size);
+            x.write_reg(dst, r);
+            x.set_status(update, flags);
+            next
+        }
+        Fast::UnaryStore { op, mem } => {
+            let size = mem.size;
+            let address = x.fast_linear(&mem);
+            let a = x.load(address, size)?;
+            let (r, update, flags) = op.apply(a, size);
+            x.store(address, size, r)?;
+            x.set_status(update, flags);
             next
         }
         Fast::AluLoad { op, dst, mem } => {

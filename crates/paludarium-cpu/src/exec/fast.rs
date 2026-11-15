@@ -234,6 +234,18 @@ pub enum Fast {
         mem: Address,
         src: Source,
     },
+    /// `op r, [m]`.
+    AluLoad {
+        op: Alu,
+        dst: Register,
+        mem: Address,
+    },
+    /// `op [m], r/imm` for an operation that writes its result (no `lock`).
+    AluStore {
+        op: Alu,
+        mem: Address,
+        src: Source,
+    },
     /// `shl`, `shr`, `sar`, `rol` or `ror` of a register by an immediate
     /// (or 1), masked as the instruction masks it.
     Shift {
@@ -359,19 +371,22 @@ impl Fast {
             m => {
                 let op = Alu::of(m)?;
                 if let Some(dst) = gpr(a) {
-                    Self::Alu {
-                        op,
-                        dst,
-                        src: source(b, dst.size())?,
+                    match address(b) {
+                        Some(mem) if mem.size == dst.size() => Self::AluLoad { op, dst, mem },
+                        Some(_) => return None,
+                        None => Self::Alu {
+                            op,
+                            dst,
+                            src: source(b, dst.size())?,
+                        },
                     }
-                } else if op.writes() {
-                    return None;
                 } else {
                     let mem = address(a)?;
-                    Self::Compare {
-                        op,
-                        mem,
-                        src: source(b, mem.size)?,
+                    let src = source(b, mem.size)?;
+                    if op.writes() {
+                        Self::AluStore { op, mem, src }
+                    } else {
+                        Self::Compare { op, mem, src }
                     }
                 }
             }
@@ -493,6 +508,27 @@ pub(crate) fn execute(
             let b = x.source(src, size);
             let a = x.load(x.fast_linear(&mem), size)?;
             let (_, flags) = op.apply(a, b, size);
+            x.set_status(flag::STATUS, flags);
+            next
+        }
+        Fast::AluLoad { op, dst, mem } => {
+            let size = dst.size();
+            let b = x.load(x.fast_linear(&mem), size)?;
+            let a = x.read_reg(dst) & size_mask(size);
+            let (r, flags) = op.apply(a, b, size);
+            if op.writes() {
+                x.write_reg(dst, r & size_mask(size));
+            }
+            x.set_status(flag::STATUS, flags);
+            next
+        }
+        Fast::AluStore { op, mem, src } => {
+            let size = mem.size;
+            let b = x.source(src, size);
+            let address = x.fast_linear(&mem);
+            let a = x.load(address, size)?;
+            let (r, flags) = op.apply(a, b, size);
+            x.store(address, size, r & size_mask(size))?;
             x.set_status(flag::STATUS, flags);
             next
         }

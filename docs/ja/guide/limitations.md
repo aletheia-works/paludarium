@@ -569,7 +569,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   backlog に再送したハンドシェイクは、その答えの近隣を作りません）。近隣は時間切れでは
   消えません（`gc_thresh1` に届きません）。近隣のダンプはなく（`RTM_GETNEIGH` は
   `EOPNOTSUPP`）、キャッシュの情報はそれぞれを作ったときから数えます。
-  `NETLINK_PKTINFO`、`NETLINK_NO_ENOBUFS` など、機能のページに挙げていないオプションは
+  `NETLINK_LISTEN_ALL_NSID` など、機能のページに挙げていないオプションは
   `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、
   `CONFIG_MCTP` を組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。
   組み込んでいないカーネルは載せず、`AF_MCTP` のアドレスと経路のダンプを扱う処理も

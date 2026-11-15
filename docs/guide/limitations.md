@@ -659,8 +659,8 @@ verified.
   (`gc_thresh1` is never reached); neighbours are not dumped
   (`RTM_GETNEIGH` is `EOPNOTSUPP`), and their cache information counts
   from when each was made.
-  `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
-  listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
+  `NETLINK_LISTEN_ALL_NSID` and the other options not listed in the
+  features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps

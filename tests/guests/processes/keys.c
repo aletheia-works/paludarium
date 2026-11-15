@@ -219,10 +219,13 @@ static int case_keyrings(void) {
     show("link displaces", keyctl(8, k2b, SESSION, 0, 0));
     links("session displaced", session, known, 4);
     show("link into a user key", keyctl(8, k1, k1, 0, 0));
+    /* Linux puts a key whose last link goes after an RCU grace period, so
+       k1 stays linked elsewhere for what follows. */
+    keyctl(8, k1, PROCESS, 0, 0);
     show("unlink", keyctl(9, k1, ring, 0, 0));
     show("unlink again", keyctl(9, k1, ring, 0, 0));
     show("unlink from a user key", keyctl(9, k1, k2, 0, 0));
-    show("unlinked is gone", keyctl(6, k1, 0, 0, 0));
+    show("unlinked is still linked elsewhere", keyctl(6, k1, 0, 0, 0) > 0);
 
     long ring2 = add_key("keyring", "ring2", NULL, 0, SESSION);
     long k3 = add_key("user", "k3", "three", 5, ring);
@@ -234,7 +237,6 @@ static int case_keyrings(void) {
     long k3b = add_key("user", "k3", "again", 5, ring);
     show("move exclusive", keyctl(30, k3b, ring, ring2, 1));
     show("move displaces", keyctl(30, k3b, ring, ring2, 0));
-    show("moved over is gone", keyctl(6, k3, 0, 0, 0));
     show("move cycle", keyctl(30, ring, SESSION, inner, 0));
 
     show("restrict", keyctl(29, ring2, 0, 0, 0));
@@ -459,6 +461,8 @@ static int case_permissions(void) {
     long root_key = add_key("user", "rootkey", "root", 4, SESSION);
     long ring = add_key("keyring", "rootring", NULL, 0, SESSION);
     long hidden = add_key("user", "hidden", "data", 4, ring);
+    /* Kept by the process keyring, which the child does not have. */
+    keyctl(8, ring, PROCESS, 0, 0);
     keyctl(9, ring, SESSION, 0, 0);
     pid_t child = fork();
     if (child == 0) {
@@ -485,7 +489,7 @@ static int case_permissions(void) {
         char payload[100];
         memset(payload, 'p', sizeof payload);
         for (;;) {
-            char name[16];
+            char name[24];
             snprintf(name, sizeof name, "q%ld", count);
             r = add_key("user", name, payload, sizeof payload, SESSION);
             if (r < 0) break;
@@ -494,9 +498,20 @@ static int case_permissions(void) {
         printf("quota: %ld keys, then %ld\n", count, r);
         show("update past quota", keyctl(2, session, (unsigned long)"x", 1, 0));
         show("clear", keyctl(7, SESSION, 0, 0, 0));
-        count = 0;
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+
+    /* The quota of keys, by a user no other case is (Linux gives back what
+       a key took only when its collector frees it, a little later). */
+    child = fork();
+    if (child == 0) {
+        setresgid(65533, 65533, 65533);
+        setresuid(65533, 65533, 65533);
+        start_session();
+        long count = 0, r;
         for (;;) {
-            char name[16];
+            char name[24];
             snprintf(name, sizeof name, "q%ld", count);
             r = add_key("user", name, "1", 1, SESSION);
             if (r < 0) break;

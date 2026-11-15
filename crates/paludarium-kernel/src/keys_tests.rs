@@ -258,6 +258,10 @@ fn revoke_clear_invalidate_and_unlink() {
     assert_eq!(f.keyctl(&[21, k3]), 0);
     assert_eq!(f.keyctl(&[11, k3, BUF, 10]), errno(ENOKEY));
     assert_eq!(f.search(SESSION, "user", "k3", 0), errno(ENOKEY));
+    // Its number is not given again, though the host's bytes never change.
+    let k4 = f.add("user", "k4", b"4", SESSION);
+    assert!(serial(k4) && k4 != k3);
+    assert_eq!(f.keyctl(&[11, k3, BUF, 10]), errno(ENOKEY));
 }
 
 #[test]
@@ -381,7 +385,6 @@ fn special_keyrings_are_made_when_asked() {
     for id in -11..=-7 {
         assert_eq!(f.keyctl(&[0, id as u64, 0]), errno(ENOKEY));
     }
-    // Named sessions are found again by name.
     // A named session keyring its user cannot search is not found by its
     // name, so joining the name again makes another.
     let unsearchable = f.join(Some("named"));
@@ -391,8 +394,15 @@ fn special_keyrings_are_made_when_asked() {
     assert_eq!(f.keyctl(&[5, named, 0x3f1b_0000]), 0);
     // Joining the session keyring the thread has gives 0.
     assert_eq!(f.join(Some("named")), 0);
+    // Found again by name while something holds it; once nothing does, it
+    // is gone and the name makes another.
+    assert_eq!(f.keyctl(&[8, named, PROCESS]), 0);
     f.join(None);
     assert_eq!(f.join(Some("named")), named);
+    assert_eq!(f.keyctl(&[9, named, PROCESS]), 0);
+    f.join(None);
+    let again = f.join(Some("named"));
+    assert!(serial(again) && again != named);
     assert_eq!(f.join(Some("")), errno(Errno::EINVAL));
     // The default keyring for request_key.
     assert_eq!(f.keyctl(&[14, -1i64 as u64]), 0);
@@ -422,7 +432,10 @@ fn special_keyrings_are_made_when_asked() {
         errno(Errno::ENOTDIR)
     );
     // A security label, empty without an LSM.
-    assert_eq!(f.keyctl(&[17, session, BUF, 10]), 1);
+    let now = f.keyctl(&[0, SESSION, 0]);
+    assert_eq!(f.keyctl(&[17, now, BUF, 10]), 1);
+    // The first session keyring went when it was replaced.
+    assert_eq!(f.keyctl(&[17, session, BUF, 10]), errno(ENOKEY));
     // A session for the parent, which the first process has none of.
     assert_eq!(f.keyctl(&[18]), errno(Errno::EPERM));
 }

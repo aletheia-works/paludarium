@@ -365,7 +365,9 @@ verified.
     `.builtin_trusted_keys`, BPF, dm-verity and fs-verity keyrings are not
     there (`ENOKEY`). The garbage collector's work (unlinking invalidated
     keys, and keys 5 minutes after they expire) is done as the next key
-    call begins, not by a worker of its own; a thread
+    call begins, not by a worker of its own, and a key whose last link
+    goes is gone at once, its quota given back, where Linux frees it a
+    little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,

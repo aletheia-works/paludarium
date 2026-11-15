@@ -362,6 +362,11 @@ struct Space {
 #[derive(Default)]
 struct Registry {
     serials: BTreeMap<i32, Weak<Key>>,
+    /// The last random number drawn, and the last serial number given,
+    /// which a host whose random bytes repeat counts on from, so that a
+    /// dead key's number is not given again.
+    drawn: i32,
+    last: i32,
     spaces: Vec<Space>,
 }
 
@@ -474,13 +479,21 @@ impl Keys {
         let mut registry = self.registry();
         registry.serials.retain(|_, key| key.strong_count() > 0);
         // `key_alloc_serial`: a random number of at least 3, then the
-        // next free one after it.
+        // next free one after it. A host whose random bytes do not change
+        // (the test hosts) counts on from the last number instead.
         let mut bytes = [0; 4];
         let _ = host.random_bytes(&mut bytes);
-        let mut serial = ((u32::from_le_bytes(bytes) >> 1) as i32).max(3);
+        let drawn = (u32::from_le_bytes(bytes) >> 1) as i32;
+        let repeated = std::mem::replace(&mut registry.drawn, drawn) == drawn;
+        let mut serial = if drawn < 3 || repeated {
+            registry.last.checked_add(1).unwrap_or(3).max(3)
+        } else {
+            drawn
+        };
         while registry.serials.contains_key(&serial) {
             serial = serial.checked_add(1).unwrap_or(3);
         }
+        registry.last = serial;
         let key = Arc::new(Key {
             serial,
             kind,

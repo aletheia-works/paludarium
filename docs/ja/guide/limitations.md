@@ -168,7 +168,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   受け付けますが子は数えず、一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。`PERF_FLAG_FD_OUTPUT` と ioctl の
   `SET_OUTPUT`、`SET_FILTER`、`SET_BPF`、`PAUSE_OUTPUT`、`QUERY_BPF`、
-  `MODIFY_ATTRIBUTES` は、何もしないか `ENOTTY` です。Linux master の構造体の SIMD
+  `MODIFY_ATTRIBUTES` は、何もしないか `ENOTTY` です。`remove_on_exec` は、タスクの
+  `execve` でイベントを無効にし、読めるまま残します。Linux はタスクのコンテキストから
+  取り除きます。それが率いたグループのメンバーは、それぞれで数え続けます。`execve` を待つ
+  イベントは、エミュレートするすべてのマシンで一つの一覧に置き、スレッドグループとスレッドで
+  照合して、閉じたときに除きます。Linux master の構造体の SIMD
   レジスタのフィールドは確かめず、使うと `EOPNOTSUPP` です。`kernel.perf_event_paranoid` は
   いつも 2 で（Debian と Ubuntu のカーネルの既定はそれより大きい）、それを示す
   `/proc/sys/kernel` のファイルはなく、`prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と

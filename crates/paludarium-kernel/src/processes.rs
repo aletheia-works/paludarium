@@ -2203,15 +2203,20 @@ impl Kernel {
             56 if a[0] & 0x10000 == 0 => self.clone_process(thread, mem, a),
             57 => self.clone_process(thread, mem, [17, 0, 0, 0, 0, 0]),
             58 => self.clone_process(thread, mem, [0x4111, 0, 0, 0, 0, 0]),
-            59 | 322 => match self.exec(thread, mem, n, a) {
-                Ok(closed) => {
-                    self.close_on_exec(thread, mem, closed);
-                    // The events that wait for it start counting.
-                    crate::perf::exec(&self.group, thread.tid);
-                    return Some(Next::Resume);
+            59 | 322 => {
+                // The exec'ing thread, by the number it had: it takes the
+                // leader's, but its perf events are its own.
+                let tid = thread.tid;
+                match self.exec(thread, mem, n, a) {
+                    Ok(closed) => {
+                        self.close_on_exec(thread, mem, closed);
+                        // The events that wait for it start counting.
+                        crate::perf::exec(&self.group, tid);
+                        return Some(Next::Resume);
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             61 => self.wait4(thread, mem, a),
             247 => self.waitid(thread, mem, a),
             434 => self.pidfd_open(thread, a),

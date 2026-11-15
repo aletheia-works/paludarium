@@ -740,7 +740,8 @@ fn init(attr: &Attr) -> Result<Counter, Errno> {
     }
 }
 
-/// What an `execve` of thread `tid` of thread group `group` does to the
+/// What an `execve` by thread `tid` (its number before the exec) of thread
+/// group `group` does to the
 /// events that wait for it: one with `enable_on_exec` is enabled
 /// (`perf_event_enable_on_exec`), and one with `remove_on_exec` is
 /// disabled for good (`perf_event_remove_on_exec`).
@@ -758,6 +759,10 @@ pub(crate) fn exec(group: &ThreadGroup, tid: u32) {
                 if event.attr.flag(bit::REMOVE_ON_EXEC) {
                     event.disable();
                     event.settle().removed = true;
+                    // The members of a group it led count on their own.
+                    for member in event.members() {
+                        member.set_paused(false);
+                    }
                 } else {
                     event.enable();
                 }

@@ -191,7 +191,12 @@ verified.
   counted, an event of a task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
   ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
-  and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. The SIMD register
+  and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
+  disables the event at its task's `execve` and leaves it to be read, where
+  Linux takes it out of the task's context, and the members of a group it
+  led count on their own. The events that wait for an `execve` are kept in
+  one list for every emulated machine, matched by thread group and thread,
+  and dropped as they close. The SIMD register
   fields of Linux master's structure are not checked, and any use of them is
   `EOPNOTSUPP`. `kernel.perf_event_paranoid` is always 2 (Debian's and
   Ubuntu's kernels default to more), with no `/proc/sys/kernel` file for it,

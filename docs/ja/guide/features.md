@@ -2456,7 +2456,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
   と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
-  イベントをそのタスクの `execve` で有効にします。ディスクリプタのリンクは
+  イベントをそのタスクの `execve` で有効にし、`remove_on_exec` はそのとき
+  イベントを以後ずっと無効にします。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は

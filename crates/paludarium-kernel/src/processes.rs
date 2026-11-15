@@ -2207,7 +2207,7 @@ impl Kernel {
                 Ok(closed) => {
                     self.close_on_exec(thread, mem, closed);
                     // The events that wait for it start counting.
-                    crate::perf::exec(thread.tid);
+                    crate::perf::exec(&self.group, thread.tid);
                     return Some(Next::Resume);
                 }
                 Err(error) => Err(error),

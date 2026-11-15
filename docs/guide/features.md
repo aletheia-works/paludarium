@@ -2829,7 +2829,8 @@ kernel.
   `RESET`, each of the event or with `PERF_IOC_FLAG_GROUP` of its group,
   and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
   for an event that does not sample. `enable_on_exec` enables a disabled
-  event when its task runs `execve`, as `perf stat` uses it. The
+  event when its task runs `execve`, as `perf stat` uses it, and
+  `remove_on_exec` disables one then for good. The
   descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.

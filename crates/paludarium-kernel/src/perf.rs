@@ -323,6 +323,9 @@ struct State {
     since: u64,
     /// The task is gone: its last time stays.
     last: u64,
+    /// `remove_on_exec` took it out at its task's `execve`: it counts no
+    /// more and is not enabled again.
+    removed: bool,
 }
 
 /// One event: Linux's `struct perf_event`.
@@ -341,7 +344,9 @@ pub(crate) struct Event {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-/// The events that wait for their task's `execve` (`enable_on_exec`).
+/// The events that wait for their task's `execve` (`enable_on_exec` and
+/// `remove_on_exec`), of every emulated machine: each is matched by its
+/// task's thread group as well as its thread ID.
 static ON_EXEC: Mutex<Vec<Weak<Event>>> = Mutex::new(Vec::new());
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -399,7 +404,13 @@ impl Event {
             .collect()
     }
     fn set_enabled(&self, enabled: bool) {
-        self.settle().enabled = enabled;
+        {
+            let mut state = self.settle();
+            if state.removed {
+                return;
+            }
+            state.enabled = enabled;
+        }
         // A leader takes its group in and out with it.
         if self.leader.is_none() {
             for member in self.members() {
@@ -682,8 +693,13 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     if !attr.flag(bit::DISABLED) {
         event.enable();
-    } else if attr.flag(bit::ENABLE_ON_EXEC) {
-        lock(&ON_EXEC).push(Arc::downgrade(&event));
+    }
+    if attr.flag(bit::DISABLED) && attr.flag(bit::ENABLE_ON_EXEC) || attr.flag(bit::REMOVE_ON_EXEC)
+    {
+        let mut waiting = lock(&ON_EXEC);
+        // Those of events that are gone go first.
+        waiting.retain(|event| event.strong_count() > 0);
+        waiting.push(Arc::downgrade(&event));
     }
     let cloexec = flags & PERF_FLAG_FD_CLOEXEC != 0;
     c.files
@@ -724,17 +740,27 @@ fn init(attr: &Attr) -> Result<Counter, Errno> {
     }
 }
 
-/// Enables the events that wait for an `execve` of thread `tid`
-/// (`perf_event_enable_on_exec`).
-pub(crate) fn exec(tid: u32) {
+/// What an `execve` of thread `tid` of thread group `group` does to the
+/// events that wait for it: one with `enable_on_exec` is enabled
+/// (`perf_event_enable_on_exec`), and one with `remove_on_exec` is
+/// disabled for good (`perf_event_remove_on_exec`).
+pub(crate) fn exec(group: &ThreadGroup, tid: u32) {
     let mut waiting = lock(&ON_EXEC);
     waiting.retain(|event| {
         let Some(event) = event.upgrade() else {
             return false;
         };
         match &event.target {
-            Target::Thread { tid: target, .. } if *target == tid => {
-                event.enable();
+            Target::Thread {
+                group: target,
+                tid: target_tid,
+            } if *target_tid == tid && std::ptr::eq(Arc::as_ptr(target), group) => {
+                if event.attr.flag(bit::REMOVE_ON_EXEC) {
+                    event.disable();
+                    event.settle().removed = true;
+                } else {
+                    event.enable();
+                }
                 false
             }
             _ => true,

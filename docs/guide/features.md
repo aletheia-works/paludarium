@@ -1582,8 +1582,9 @@ kernel.
     (`ECONNREFUSED` for none). `recvmsg` gives the sender's `sockaddr_nl`,
     `MSG_PEEK` and `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`,
     `SO_RCVTIMEO`, `NETLINK_PKTINFO`, `NETLINK_BROADCAST_ERROR`,
-    `NETLINK_NO_ENOBUFS`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
-    `NETLINK_GET_STRICT_CHK` can be set; as in Linux's
+    `NETLINK_NO_ENOBUFS`, `NETLINK_LISTEN_ALL_NSID` (which needs
+    `CAP_NET_BROADCAST` over the socket's namespace), `NETLINK_CAP_ACK`,
+    `NETLINK_EXT_ACK` and `NETLINK_GET_STRICT_CHK` can be set; as in Linux's
     `netlink_setsockopt`, a value shorter than an `int` is 0. With
     `NETLINK_PKTINFO`, `recvmsg` gives each datagram's group (0 for one
     to the socket's own port) in a `SOL_NETLINK` `NETLINK_PKTINFO` control
@@ -1633,7 +1634,7 @@ kernel.
     `inet_rtm_valid_getroute_req` and `inet6_rtm_valid_getroute_req`.
     Checked or not, a link dump's `IFLA_MASTER` shows no device, as `lo`
     has no master, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
-    namespace has an ID; `RTM_F_PREFIX` dumps no route, as `lo` has no
+    namespace's links are shown; `RTM_F_PREFIX` dumps no route, as `lo` has no
     prefix route.
   - **Attribute policies:** each request's attributes are checked first,
     in their order, against the policy Linux has for it (`ifla_policy`,
@@ -1651,6 +1652,27 @@ kernel.
     takes none of them. A change of the link takes one of
     `IFLA_NET_NS_PID`, `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` at most
     (`EINVAL`), and a get neither of the first two (`EOPNOTSUPP`).
+  - **Namespace IDs:** as Linux's `net_namespace.c`, `RTM_NEWNSID` gives
+    the network namespace of a process (`NETNSA_PID`, `ESRCH` for none) or
+    of a `/proc/<pid>/ns/net` descriptor (`NETNSA_FD`, `EBADF`, or `EINVAL`
+    for another file) the ID `NETNSA_NSID`, or with a negative one the
+    lowest free; one without either is `EINVAL`, and a namespace that has
+    an ID, or an ID taken, `EEXIST`, each with Linux's extended-ack
+    message. The members of `RTNLGRP_NSID` hear of each new ID
+    (`NLM_F_ECHO` sends it to the requester alone of them). `RTM_GETNSID`
+    answers with the ID of a namespace named by process, descriptor or ID
+    (`ENOENT` for an ID none has), -1 for none, and with
+    `NETNSA_TARGET_NSID` with the ID that namespace gives it and this
+    one's in `NETNSA_CURRENT_NSID` (`EINVAL` for no such namespace,
+    `EACCES` without `CAP_NET_ADMIN` over it); its dump lists the IDs in
+    order, and strictly may name another namespace by
+    `NETNSA_TARGET_NSID` and nothing else, as `rtnl_net_dumpid` does. A
+    socket with `NETLINK_LISTEN_ALL_NSID` also hears the notifications of
+    each namespace its own has an ID for, when its opener has
+    `CAP_NET_BROADCAST` over that namespace, and `recvmsg` gives that ID
+    in a `SOL_NETLINK` `NETLINK_LISTEN_ALL_NSID` control message, after
+    `NETLINK_PKTINFO`'s, as `do_one_broadcast` and
+    `netlink_cmsg_listen_all_nsid` do.
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
     7.0's attributes in its order: its flags, name, queue, state, MTU,

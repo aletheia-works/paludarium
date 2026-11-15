@@ -1383,7 +1383,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     データグラムはそのソケットに届きます（なければ `ECONNREFUSED`）。`recvmsg` は送り手の
     `sockaddr_nl` を返し、`MSG_PEEK` と `MSG_TRUNC` が使えます。`SO_RCVBUF`、
     `SO_SNDBUF`、`SO_RCVTIMEO`、`NETLINK_PKTINFO`、`NETLINK_BROADCAST_ERROR`、
-    `NETLINK_NO_ENOBUFS`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
+    `NETLINK_NO_ENOBUFS`、`NETLINK_LISTEN_ALL_NSID`（ソケットの名前空間への
+    `CAP_NET_BROADCAST` が要ります）、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
     `NETLINK_GET_STRICT_CHK` を設定できます。Linux の `netlink_setsockopt` と同じく、
     `int` より短い値は 0 です。`NETLINK_PKTINFO` を付けると、`recvmsg` はデータグラムの
     グループ（ソケット自身のポートに来たものは 0）を `SOL_NETLINK` の `NETLINK_PKTINFO`
@@ -1425,7 +1426,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `inet_rtm_valid_getroute_req`、`inet6_rtm_valid_getroute_req` と同じく、アドレス
     全体の接頭辞長と経路を選ぶ属性だけを取ります。検査の有無にかかわらず、`lo` には
     マスターがないのでリンクのダンプの `IFLA_MASTER` はどのデバイスも見せず、ほかの
-    名前空間には ID がないので `IFLA_TARGET_NETNSID` は `EINVAL` です。`lo` には
+    名前空間のリンクは見せないので `IFLA_TARGET_NETNSID` は `EINVAL` です。`lo` には
     プレフィックス経路がないので、`RTM_F_PREFIX` はどの経路もダンプしません。
   - **属性のポリシー:** 各リクエストの属性は、まず Linux がそのリクエストに持つ
     ポリシー（`ifla_policy`、`ifa_ipv4_policy`、`ifa_ipv6_policy`、`rtm_ipv4_policy`、
@@ -1439,6 +1440,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     属性がポリシーに反するリンクのダンプは、属性をどれも使いません。リンクの変更は
     `IFLA_NET_NS_PID`、`IFLA_NET_NS_FD`、`IFLA_TARGET_NETNSID` のうち一つまでを
     取ります（`EINVAL`）。リンクの取得は、はじめの二つのどちらも取りません（`EOPNOTSUPP`）。
+  - **名前空間の ID:** Linux の `net_namespace.c` と同じく、`RTM_NEWNSID` は、
+    プロセス（`NETNSA_PID`、なければ `ESRCH`）か `/proc/<pid>/ns/net` の記述子
+    （`NETNSA_FD`、`EBADF`、ほかのファイルなら `EINVAL`）のネットワーク名前空間に
+    ID `NETNSA_NSID` を、負の値なら空いている一番小さい ID を与えます。どちらもなければ
+    `EINVAL`、すでに ID がある名前空間や使われている ID は `EEXIST` で、それぞれ Linux の
+    拡張 ACK のメッセージを付けます。`RTNLGRP_NSID` のメンバーは新しい ID を知らされます
+    （`NLM_F_ECHO` なら、そのうちリクエストした側だけが受け取ります）。`RTM_GETNSID` は、
+    プロセス、記述子、ID で指した名前空間の ID（なければ -1、だれも持たない ID は
+    `ENOENT`）を返し、`NETNSA_TARGET_NSID` を付けるとその名前空間が与えた ID を、
+    こちらの ID を `NETNSA_CURRENT_NSID` に添えて返します（その名前空間がなければ
+    `EINVAL`、それへの `CAP_NET_ADMIN` がなければ `EACCES`）。そのダンプは ID を順に
+    並べ、厳密な検査では `rtnl_net_dumpid` と同じく `NETNSA_TARGET_NSID` でほかの
+    名前空間を指せ、それ以外は取りません。`NETLINK_LISTEN_ALL_NSID` を付けたソケットは、
+    自分の名前空間が ID を与えた名前空間の通知も、開いた側がその名前空間への
+    `CAP_NET_BROADCAST` を持てば受け取ります。`recvmsg` はその ID を、
+    `do_one_broadcast` と `netlink_cmsg_listen_all_nsid` と同じく `NETLINK_PKTINFO`
+    の後の `SOL_NETLINK` の `NETLINK_LISTEN_ALL_NSID` 制御メッセージで返します。
   - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
     `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、

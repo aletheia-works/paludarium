@@ -615,8 +615,7 @@ verified.
   `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the
   cached route, so that later lookups through it are marked too.
   Notifications go out for the link, its IPv6 information, addresses,
-  routes and neighbours alone, not for the other groups, nor to a socket
-  in another namespace (`NETLINK_LISTEN_ALL_NSID` is not supported);
+  routes, neighbours and namespace IDs alone, not for the other groups;
   IPv4's routes through `lo` go without one when it goes down, as on
   Linux. A neighbour is made by UDP and TCP's handshakes alone, which are
   the only packets paludarium sends through `lo` (a TCP handshake retried
@@ -624,8 +623,14 @@ verified.
   (`gc_thresh1` is never reached); neighbours are not dumped
   (`RTM_GETNEIGH` is `EOPNOTSUPP`), and their cache information counts
   from when each was made.
-  `NETLINK_LISTEN_ALL_NSID` and the other options not listed in the
-  features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
+  The options not listed in the features are `ENOPROTOOPT`. A namespace
+  ID goes when its namespace does, with no `RTM_DELNSID` to tell of it;
+  an ID is given only by `RTM_NEWNSID`, as no device of another
+  namespace makes Linux's `peernet2id_alloc` give one; a request sent by
+  `write` rather than `send` names no process or descriptor (`ESRCH`,
+  `EBADF`), as no caller is known there; and `IFLA_TARGET_NETNSID` and
+  `IFA_TARGET_NETNSID` are `EINVAL` even for an ID a namespace has, as
+  no other namespace's links or addresses are dumped. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps

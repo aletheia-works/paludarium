@@ -129,7 +129,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -220,6 +220,8 @@ mod linux {
                     | "netlink-option-flags"
                     | "netlink-pktinfo"
                     | "netlink-no-enobufs"
+                    | "netlink-nsid"
+                    | "netlink-listen-all-nsid"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -385,6 +387,8 @@ mod linux {
         netlink_option_flags => ("netlink-option-flags","netlink-options"),
         netlink_pktinfo => ("netlink-pktinfo","netlink-options"),
         netlink_no_enobufs => ("netlink-no-enobufs","netlink-options"),
+        netlink_nsid => ("netlink-nsid","netlink-options"),
+        netlink_listen_all_nsid => ("netlink-listen-all-nsid","netlink-options"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),

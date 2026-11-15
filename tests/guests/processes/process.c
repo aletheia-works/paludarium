@@ -8823,6 +8823,27 @@ static long pomaps_read(const char *path, char *buffer) {
     buffer[total] = 0;
     return n < 0 ? -errno : total;
 }
+/* Keeps, in place, the lines of smaps that stay as they are between two
+   reads: each mapping's own line and its sizes and flags. Its counts of
+   resident, shared and referenced pages change as the kernel ages them. */
+static void pomaps_stable(char *text) {
+    static const char *const keys[] = {"Size:", "KernelPageSize:", "MMUPageSize:", "VmFlags:"};
+    char *out = text;
+    for (char *line = text; *line;) {
+        char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) + 1 : strlen(line);
+        /* A mapping's line starts with its address range, `start-end`. */
+        size_t hex = strspn(line, "0123456789abcdef");
+        int keep = hex > 0 && line[hex] == '-';
+        for (size_t k = 0; !keep && k < sizeof keys / sizeof *keys; k++) keep = !strncmp(line, keys[k], strlen(keys[k]));
+        if (keep) {
+            memmove(out, line, len);
+            out += len;
+        }
+        line += len;
+    }
+    *out = 0;
+}
 static int proc_other_maps_case(void) {
     /* What the child reads of itself, shared with this process, its
        pages touched before either reads. */
@@ -8861,7 +8882,9 @@ static int proc_other_maps_case(void) {
     printf(" task=%d", n > 0 && !strcmp(theirs, seen));
     snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
     n = pomaps_read(path, theirs);
-    printf(" smaps same=%d", n > 0 && !strcmp(theirs, seen + POM_SIZE));
+    pomaps_stable(theirs);
+    pomaps_stable(seen + POM_SIZE);
+    printf(" smaps same=%d", n > 0 && seen[POM_SIZE] && !strcmp(theirs, seen + POM_SIZE));
     /* This process's own are not the child's. */
     n = pomaps_read("/proc/self/maps", theirs);
     printf(" own differs=%d\n", n > 0 && strcmp(theirs, seen));

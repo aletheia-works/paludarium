@@ -31,8 +31,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `FPREM`、`FPREM1`、`FSCALE`、`FRNDINT`、`FXTRACT`、`FCOM` の仲間、`FLD` の定数、
   `FCMOV` と、glibc と musl の `long double` の数学関数が使う超越関数の命令
   （`FSIN`、`FCOS`、`FSINCOS`、`FPTAN`、`FPATAN`、`F2XM1`、`FYL2X`、`FYL2XP1`）も
-  正しく丸めて実行します。10 進数はまだ実装していません（[制限](./limitations)）。シグナルハンドラは、Linux と同じく x87 と SSE の状態を
-  リセット直後にして始まります。
+  正しく丸めて実行します。これは実際の CPU の最後のビットと同じとは限りません
+  （[制限](./limitations)）。10 進数はまだ実装していません。シグナルハンドラは、
+  Linux と同じく x87 と SSE の状態をリセット直後にして始まります。
 - AVX、AVX-512、MMX は対象外です。glibc が必須とするので `CPUID` は MMX を示しますが、
   その命令は `SIGILL` で止まります。
 

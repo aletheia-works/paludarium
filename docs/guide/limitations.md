@@ -6,9 +6,9 @@ verified.
 ## Not supported
 
 - **Part of x87, for now**: packed decimals (`FBLD`, `FBSTP`) are not
-  implemented yet, so a program stops with `SIGILL` where it reaches one. An x87 exception always takes its masked response: an
-  unmasked one sets the status word's summary and does not raise `SIGFPE`. The
-  16-bit forms of `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not
+  implemented yet, so a program stops with `SIGILL` where it reaches one. An
+  x87 exception always takes its masked response: an unmasked one sets the
+  status word's summary and does not raise `SIGFPE`. The 16-bit forms of `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not
   implemented either. `FISTTP` belongs to SSE3, which `CPUID` does not report,
   and is not implemented. Where `FPREM` and `FPREM1` stop on the way when their
   operands are far apart is each CPU's choice: the final remainder is the same.

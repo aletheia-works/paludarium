@@ -2298,8 +2298,9 @@ kernel.
   `mountinfo`, the directory each shows as its root). After `chroot` they show each mount point
   from the process's root and leave out those not under it, as Linux's
   `seq_path_root` does. Each file system has its own `st_dev`, as its
-  mounts' lines in `mountinfo` say, so `df` lists every mount; a bind mount
-  shares its source's, as in Linux. A pipe, a socket, a
+  mounts' lines in `mountinfo` say, so `df` lists every file system. A bind
+  mount shares its source's `st_dev`, as in Linux, so `df` leaves it out
+  once it has listed that device. A pipe, a socket, a
   pidfd, a memfd, a `memfd_secret` file, a namespace file and an anonymous
   inode (an eventfd, an epoll and the like) that no path opened are each on
   a device of their file system's own (pipefs, sockfs, pidfs, the internal

@@ -292,6 +292,7 @@ impl SyscallTable {
         handlers.insert(289, crate::signalfd::sys_signalfd4);
         handlers.insert(253, crate::inotify::sys_inotify_init);
         handlers.insert(300, crate::fanotify::sys_fanotify_init);
+        handlers.insert(298, crate::perf::sys_perf_event_open);
         handlers.insert(301, crate::fanotify::sys_fanotify_mark);
         handlers.insert(254, crate::inotify::sys_inotify_add_watch);
         handlers.insert(255, crate::inotify::sys_inotify_rm_watch);
@@ -3668,6 +3669,10 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         // A fanotify group's.
         if let Some(result) = crate::fanotify::ioctl(c, &file, a[1], a[2]) {
+            return result;
+        }
+        // A perf event's.
+        if let Some(result) = crate::perf::ioctl(c, &file, a[1], a[2]) {
             return result;
         }
         // A seccomp listener's.

@@ -2206,6 +2206,8 @@ impl Kernel {
             59 | 322 => match self.exec(thread, mem, n, a) {
                 Ok(closed) => {
                     self.close_on_exec(thread, mem, closed);
+                    // The events that wait for it start counting.
+                    crate::perf::exec(thread.tid);
                     return Some(Next::Resume);
                 }
                 Err(error) => Err(error),

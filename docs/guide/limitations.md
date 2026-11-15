@@ -179,6 +179,23 @@ verified.
   writes there: the call gives `EFAULT`, where Linux's copy of user memory
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
+- **perf events, in part**: only the software clocks count
+  (`cpu-clock`, `task-clock`) and the software events that never happen on
+  x86-64; page faults, context switches, CPU migrations and cgroup switches,
+  tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as are
+  hardware events even on a host with a PMU. A thread's CPU time is the one
+  it last accounted, at its latest system call, and an event of a CPU
+  counts the time that passes. There is no ring buffer: `mmap` of an event
+  is `ENODEV`, a sampling event takes no samples and sends no signal, and
+  `poll` never finds one readable. `inherit` is taken but children are not
+  counted, an event of a task on one CPU counts on any, and the cgroup mode
+  (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
+  ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
+  and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. The SIMD register
+  fields of Linux master's structure are not checked, and any use of them is
+  `EOPNOTSUPP`. `kernel.perf_event_paranoid` is always 2 (Debian's and
+  Ubuntu's kernels default to more), with no `/proc/sys/kernel` file for it,
+  and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its

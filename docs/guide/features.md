@@ -59,7 +59,7 @@ kernel.
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | Keys | `add_key`, `request_key`, `keyctl` |
-| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs` |
+| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs`, `perf_event_open` (see below) |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
@@ -2485,7 +2485,7 @@ kernel.
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
   for this process's entries), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
-  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]` or `[pidfd]` (an
+  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]`, `[perf_event]` or `[pidfd]` (an
   anonymous inode's name, which pidfs, from Linux 6.9, still gives),
   `anon_inode:inotify` (without brackets, as Linux names it), and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
@@ -2795,6 +2795,44 @@ kernel.
     `quotactl_fd` takes any descriptor (`EBADF`), checks the type
     (`EINVAL`) and gives `ENOSYS`, as Linux's `do_quotactl` does for a file
     system without quotas.
+- `perf_event_open` checks its arguments in the order of Linux's
+  `kernel/events/core.c`: unknown flags, then the structure
+  (`perf_copy_attr`: a size of 0 is the first one's 64 bytes, less than that
+  or more than a page `E2BIG`, which writes back the size Linux master
+  knows, 176, as does a larger one with bytes past that which are not 0;
+  then the reserved fields, unknown sample and read formats, branch
+  sampling without a branch, register masks with DS, ES, FS, GS or the
+  reserved bits, a user stack too large or not 8-byte aligned, both
+  weights, `inherit_thread` without `inherit`, `remove_on_exec` with
+  `enable_on_exec`, and `sigtrap` without `remove_on_exec`, all `EINVAL`),
+  then `perf_event_paranoid`, which is Linux's default 2: an event of the
+  kernel (one without `exclude_kernel`, `text_poke`, a kernel callchain,
+  physical addresses, kernel or hypervisor branches) and one of a CPU need
+  `CAP_PERFMON` or `CAP_SYS_ADMIN` (`EACCES`), as do `namespaces`. Then a
+  period with bit 63 or a frequency above `perf_event_max_sample_rate`
+  (100000) is `EINVAL`, `PERF_FLAG_PID_CGROUP` without a CPU and a task
+  `EINVAL`, a group descriptor that is no event `EBADF`, a task that is not
+  there `ESRCH`, no task and no CPU or a CPU past the last `EINVAL`, and an
+  unknown `clockid` `EINVAL`. The events that count are the software
+  `cpu-clock` and `task-clock`, in nanoseconds of the thread's CPU time (an
+  event of a CPU counts the time that passes), and `alignment-faults`,
+  `emulation-faults`, `dummy` and `bpf-output`, which count nothing, as on
+  x86-64; branch sampling or the XMM registers of one is `EOPNOTSUPP`.
+  Hardware, cache and raw events are `ENOENT`, as on a machine without a
+  PMU. An event of another process needs `CAP_PERFMON` or to be able to
+  read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the
+  times enabled and running, the ID and the lost samples (0) as the read
+  format asks, and with `PERF_FORMAT_GROUP` the whole group's, `ENOSPC` for
+  a buffer too small. A group member must be of its leader's task, CPU and
+  clock, and neither pinned nor exclusive (`EINVAL`); it counts only while
+  its leader is enabled. The ioctls `PERF_EVENT_IOC_ENABLE`, `DISABLE` and
+  `RESET`, each of the event or with `PERF_IOC_FLAG_GROUP` of its group,
+  and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
+  for an event that does not sample. `enable_on_exec` enables a disabled
+  event when its task runs `execve`, as `perf stat` uses it. The
+  descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  and writing, and a write is `EINVAL`. See [limitations](./limitations)
+  for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

@@ -25,6 +25,7 @@ const REGULAR: u32 = 0o100000;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
 const O_PATH: u32 = 0o10000000;
+const EROFS: Errno = Errno(30);
 const ETXTBSY: Errno = Errno(26);
 
 /// The page caches of one machine, by file.
@@ -774,6 +775,9 @@ pub(crate) struct CoherentFile {
     /// The write access a description open for writing holds, which a
     /// program run from the file refuses while it lasts.
     write: Option<WriteAccess>,
+    /// What its mount's count of writers holds for it while it lasts
+    /// (`mnt_get_write_access`).
+    writer: Option<paludarium_vfs::MountPin>,
     /// For a description the guest opened, whether for writing: its last
     /// close is `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` (`fsnotify_close`).
     opened: Option<bool>,
@@ -860,6 +864,7 @@ impl CoherentFile {
             device: Device::Fixed(device),
             key: OnceLock::new(),
             write: None,
+            writer: None,
             opened: None,
             quiet: quiet_now(),
         };
@@ -901,6 +906,19 @@ impl CoherentFile {
             && let Some(key) = self.key()
         {
             self.write = Some(self.caches.write_access(key)?);
+            // `file_get_write_access`: then the mount's (`EROFS` on a
+            // read-only one).
+            if let Device::Mount(fs, _, place, _) = &self.device {
+                let path = place
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .path
+                    .clone();
+                if fs.read_only(&path, true).mount {
+                    return Err(EROFS);
+                }
+                self.writer = fs.mount_writer(&path, true);
+            }
         }
         Ok(self)
     }
@@ -971,6 +989,7 @@ impl CoherentFile {
                 device: device.copy(),
                 key: key.map_or_else(OnceLock::new, OnceLock::from),
                 write: None,
+                writer: None,
                 opened: None,
                 quiet: Some(AtomicU32::new(flags)),
             }
@@ -1006,6 +1025,7 @@ impl FileHandle for CoherentFile {
                 .copied()
                 .map_or_else(OnceLock::new, OnceLock::from),
             write: None,
+            writer: None,
             opened: None,
             quiet: quiet_now(),
         }
@@ -1206,6 +1226,18 @@ impl FileSystem for CoherentFs {
     fn mount_pin(&self, path: &[u8]) -> Option<paludarium_vfs::MountPin> {
         self.inner.mount_pin(path)
     }
+    fn mount_writer(&self, path: &[u8], follow: bool) -> Option<paludarium_vfs::MountPin> {
+        self.inner.mount_writer(path, follow)
+    }
+    fn any_read_only(&self) -> bool {
+        self.inner.any_read_only()
+    }
+    fn read_only(&self, path: &[u8], follow: bool) -> paludarium_vfs::ReadOnly {
+        self.inner.read_only(path, follow)
+    }
+    fn statfs_flags(&self, path: &[u8]) -> u64 {
+        self.inner.statfs_flags(path)
+    }
     fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
         self.inner.memory_path(anchor, inode)
     }
@@ -1233,6 +1265,19 @@ impl HostFs for CoherentFs {
         // `IN_CREATE`, an old one emptied `IN_MODIFY`.
         let existed = (notify.watching() && flags & (O_CREAT | O_TRUNC) != 0)
             .then(|| self.inner.metadata(path, flags & O_NOFOLLOW == 0).ok());
+        // Nothing is made or emptied on a read-only mount, whatever the
+        // calls before found.
+        let follow = flags & O_NOFOLLOW == 0;
+        if flags & (O_CREAT | O_TRUNC) != 0
+            && flags & O_PATH == 0
+            && self.inner.read_only(path, follow).mount
+            && match self.inner.metadata(path, follow) {
+                Ok(stat) => flags & O_TRUNC != 0 && stat.mode & 0o170000 == REGULAR,
+                Err(_) => flags & O_CREAT != 0,
+            }
+        {
+            return Err(EROFS);
+        }
         let quiet = quiet_now();
         let inner = match self.inner.open(path, flags, mode) {
             Err(Errno::EISDIR) if quiet.is_some() => self.inner.open(path, flags & !3, mode)?,
@@ -1257,6 +1302,7 @@ impl HostFs for CoherentFs {
             ),
             key: OnceLock::new(),
             write: None,
+            writer: None,
             opened: None,
             quiet: quiet_now(),
         }

@@ -22,7 +22,8 @@ pub const NUMBERS: &[u64] = &[
 #[derive(Clone)]
 pub(crate) struct Descriptor {
     pub(crate) file: Arc<dyn FileHandle>,
-    path: Vec<u8>,
+    /// The path it was opened at, from the machine's root.
+    pub(crate) path: Vec<u8>,
     cloexec: bool,
     /// Its open file description came from an open by path, which gives
     /// it `O_LARGEFILE` ([`status_flags`]); a `dup` or `SCM_RIGHTS` copy
@@ -213,8 +214,28 @@ pub(crate) struct FilesView {
     space: std::sync::Weak<Mutex<Space>>,
     umask: std::sync::Weak<AtomicU32>,
     fds: std::sync::Weak<Mutex<BTreeMap<u32, Descriptor>>>,
+    /// The number of its table, the owner of the POSIX record locks set
+    /// through it.
+    table: u64,
 }
 impl FilesView {
+    /// Whose descriptors these are, as [`Holder::of`] tells this
+    /// process's: the file system its root sees and the number of its table,
+    /// with `pid`, the process's ID as the reader names it. `None` once the
+    /// process has ended.
+    pub(crate) fn holder(&self, pid: u32) -> Option<Holder> {
+        let space = self.space.upgrade()?;
+        let root = self.root.upgrade()?;
+        let fs = match &*root.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(root) => Arc::clone(&root.fs),
+            None => Arc::clone(&space.lock().unwrap_or_else(PoisonError::into_inner).machine),
+        };
+        Some(Holder {
+            fs,
+            pid,
+            table: self.table,
+        })
+    }
     pub(crate) fn cwd(&self) -> Option<Vec<u8>> {
         let cwd = self.cwd.upgrade()?;
         Some(cwd.lock().unwrap_or_else(PoisonError::into_inner).clone())
@@ -275,6 +296,16 @@ impl FilesView {
         let fds = fds.lock().unwrap_or_else(PoisonError::into_inner);
         fds.get(&fd).cloned()
     }
+    /// The open descriptors by number, which `/proc/<pid>/fd` lists.
+    pub(crate) fn all(&self) -> Vec<(u32, Descriptor)> {
+        self.fds.upgrade().map_or_else(Vec::new, |fds| {
+            fds.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|(&n, d)| (n, d.clone()))
+                .collect()
+        })
+    }
     /// One past the highest open descriptor.
     pub(crate) fn descriptors(&self) -> usize {
         self.fds.upgrade().map_or(0, |fds| {
@@ -295,6 +326,7 @@ impl Files {
             space: Arc::downgrade(&self.space),
             umask: Arc::downgrade(&self.umask),
             fds: Arc::downgrade(&self.fds),
+            table: self.table.0,
         }
     }
     /// What [`Self::view`] holds, to tell when it changes.
@@ -846,6 +878,37 @@ impl Files {
 /// The number of a descriptor table, which no other table has had.
 #[derive(Debug)]
 pub(crate) struct Table(u64);
+/// The process whose descriptor a `/proc` file shows, this one or another
+/// (Linux's task of the `fd` or `fdinfo` entry): a path the descriptor
+/// holds is found in the file system its root sees, its `/proc/self` is
+/// its own directory, and its record locks are its table's.
+pub(crate) struct Holder {
+    fs: Arc<dyn FileSystem>,
+    pid: u32,
+    table: u64,
+}
+impl Holder {
+    /// This process.
+    pub(crate) fn of(c: &Context<'_>) -> Self {
+        Self {
+            fs: c.files.fs(),
+            pid: c.process.pid,
+            table: c.files.table(),
+        }
+    }
+    /// The device of the file `d` holds ([`descriptor_device`]).
+    pub(crate) fn device(&self, d: &Descriptor) -> u64 {
+        descriptor_device_in(&*self.fs, d)
+    }
+    /// A path the descriptor's process opened under `/proc/self`, as the
+    /// directory of that process.
+    fn generated(&self, path: &[u8]) -> Vec<u8> {
+        match path.strip_prefix(b"/proc/self") {
+            Some(rest) => [format!("/proc/{}", self.pid).as_bytes(), rest].concat(),
+            None => path.to_vec(),
+        }
+    }
+}
 impl Table {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1172,18 +1235,25 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
         c.process.credentials.for_access()
     };
     let raw = path(c, ptr)?;
-    let stat = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
-        c.files.descriptor(dir)?.file.stat()?
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (stat, at, follow) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        let d = c.files.descriptor(dir)?;
+        (d.file.stat()?, d.path, false)
     } else {
         let p = c.files.path(dir, raw.clone())?;
-        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         crate::permissions::search(c.files, &creds, dir, &raw, follow)?;
-        match generated_stat(c, &p, follow)? {
+        let stat = match generated_stat(c, &p, follow)? {
             Some((stat, ..)) => stat,
             None => c.files.fs().metadata(&p, follow)?,
-        }
+        };
+        (stat, p, follow)
     };
     crate::permissions::permission(&creds, &stat, mode as u32)?;
+    // "SuS v2 requires we report a read only fs too": writing a file that
+    // is not special.
+    if mode & 2 != 0 && matches!(stat.mode & 0o170000, 0o100000 | 0o040000 | 0o120000) {
+        crate::permissions::want_write(c.files, &at, follow)?;
+    }
     Ok(0)
 }
 /// What `statfs` reports for a pipe, a socket, /proc or a terminal: an
@@ -1235,13 +1305,33 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
             .or_else(|_| c.files.fs().statfs(b"/"))?,
     })
 }
-/// Linux's 120-byte `struct statfs` of the file system on `device`.
-/// `f_flags` is ST_VALID and `f_fsid` [`crate::fanotify::fsid`]'s.
+/// `statfs`'s `f_flags` for `path`, whose file system `stats` describes:
+/// the mount's ([`paludarium_vfs::FileSystem::statfs_flags`]) for one a
+/// mount here holds, `ST_VALID` alone for the kernel's own.
+fn mount_statfs_flags(c: &Context<'_>, stats: &paludarium_host::FsStats, path: &[u8]) -> u64 {
+    let own = [
+        PROC_SUPER_MAGIC,
+        DEVPTS_SUPER_MAGIC,
+        MQUEUE_MAGIC,
+        PID_FS_MAGIC,
+    ]
+    .contains(&stats.kind)
+        || stats.kind == ANON_INODE_FS_MAGIC
+        || stats.kind == crate::memfd::SECRETMEM_MAGIC
+        || [0x5049_5045, 0x534F_434B].contains(&stats.kind);
+    if own || !path.starts_with(b"/") || generated(path) {
+        return 0x20;
+    }
+    c.files.fs().statfs_flags(path)
+}
+/// Linux's 120-byte `struct statfs` of the file system on `device`, with
+/// `f_flags` and `f_fsid` [`crate::fanotify::fsid`]'s.
 fn write_statfs(
     c: &Context<'_>,
     addr: u64,
     s: paludarium_host::FsStats,
     device: u64,
+    flags: u64,
 ) -> Result<u64, Errno> {
     let fsid = crate::fanotify::fsid(c, device, s.kind);
     let fsid = u64::from(fsid[0]) | u64::from(fsid[1]) << 32;
@@ -1257,7 +1347,7 @@ fn write_statfs(
         fsid,
         s.name_max,
         s.block_size, // f_frsize
-        0x20,         // f_flags: ST_VALID
+        flags,
     ]
     .iter()
     .enumerate()
@@ -1338,6 +1428,7 @@ fn set_times_at(
         } else {
             c.files.descriptor(a[0])?.file
         };
+        crate::permissions::want_write(c.files, &c.files.descriptor(a[0])?.path, false)?;
         crate::permissions::times(&c.process.credentials, &file.stat()?, touch, set)?;
         return file.set_times(atime, mtime).map(|()| 0);
     }
@@ -1346,6 +1437,7 @@ fn set_times_at(
     match reached(c, &p, follow)? {
         Some(Followed::Path { path, follow }) => {
             let stat = c.files.fs().metadata(&path, follow)?;
+            crate::permissions::want_write(c.files, &path, follow)?;
             crate::permissions::times(&c.process.credentials, &stat, touch, set)?;
             return c
                 .files
@@ -1354,11 +1446,13 @@ fn set_times_at(
                 .map(|()| 0);
         }
         Some(Followed::File(d)) => {
+            crate::permissions::want_write(c.files, &d.path, false)?;
             crate::permissions::times(&c.process.credentials, &d.file.stat()?, touch, set)?;
             return d.file.set_times(atime, mtime).map(|()| 0);
         }
         None => {}
     }
+    crate::permissions::want_write(c.files, &p, follow)?;
     if let Some(stat) = found.file {
         crate::permissions::times(&c.process.credentials, &stat, touch, set)?;
     }
@@ -1443,13 +1537,15 @@ fn mode_after_chown(mode: u32, keeps_sgid: bool) -> Option<u32> {
     }
     (kept != mode).then_some(kept & 0o7777)
 }
-/// `fchown(fd, owner, group)`.
+/// `fchown(fd, owner, group)` of a descriptor opened at `path`.
 fn chown_file(
     c: &Context<'_>,
     file: &Arc<dyn FileHandle>,
+    path: &[u8],
     uid: u64,
     gid: u64,
 ) -> Result<u64, Errno> {
+    crate::permissions::want_write(c.files, path, false)?;
     let stat = file.stat()?;
     let (uid, gid) = owner_ids(c, uid, gid)?;
     let keeps_sgid = crate::permissions::chown(&c.process.credentials, &stat, uid, gid)?;
@@ -1478,10 +1574,11 @@ fn chown_path(
 ) -> Result<u64, Errno> {
     match reached(c, path, follow)? {
         Some(Followed::Path { path, follow }) => return chown_path(c, &path, follow, uid, gid),
-        Some(Followed::File(d)) => return chown_file(c, &d.file, uid, gid),
+        Some(Followed::File(d)) => return chown_file(c, &d.file, &d.path, uid, gid),
         None => {}
     }
     let stat = c.files.fs().metadata(path, follow)?;
+    crate::permissions::want_write(c.files, path, follow)?;
     let (uid, gid) = owner_ids(c, uid, gid)?;
     let keeps_sgid = crate::permissions::chown(&c.process.credentials, &stat, uid, gid)?;
     c.files.fs().set_owner(path, follow, uid, gid)?;
@@ -1505,10 +1602,11 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let raw = path(c, a[1])?;
     let (p, stat) = if raw.is_empty() && a[3] & AT_EMPTY_PATH != 0 {
         if a[0] as i32 != -100 {
-            let file = c.files.descriptor(a[0])?.file;
+            let d = c.files.descriptor(a[0])?;
+            crate::permissions::want_write(c.files, &d.path, false)?;
             let mode =
-                crate::permissions::chmod(&c.process.credentials, &file.stat()?, a[2] as u32)?;
-            return file.set_mode(mode).map(|()| 0);
+                crate::permissions::chmod(&c.process.credentials, &d.file.stat()?, a[2] as u32)?;
+            return d.file.set_mode(mode).map(|()| 0);
         }
         let cwd = c
             .files
@@ -1531,6 +1629,7 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         };
         (p, stat)
     };
+    crate::permissions::want_write(c.files, &p, a[3] & AT_SYMLINK_NOFOLLOW == 0)?;
     if stat.mode & 0o170000 == 0o120000 {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -1661,9 +1760,11 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
         new_name_free(c, new_dir, &new_raw, &new)?;
         return Err(EXDEV);
     }
+    // `filename_create`'s EROFS comes before EXDEV.
+    crate::permissions::want_write_new(c.files, new_dir, &new_raw, false)?;
     let source = c.files.fs().metadata(&old, false).ok();
     if source.is_some() && device(c, &old) == device(c, &new) {
-        crate::permissions::create(c.files, &c.process.credentials, new_dir, &new_raw)?;
+        crate::permissions::create(c.files, &c.process.credentials, new_dir, &new_raw, false)?;
     }
     // Landlock's check (`hook_path_link`) of a new name on the same
     // filesystem, whatever the permission walk found.
@@ -1825,6 +1926,7 @@ fn chmod_followed(c: &Context<'_>, target: Followed, mode: u32) -> Result<u64, E
     match target {
         Followed::Path { path, follow } => {
             let stat = c.files.fs().metadata(&path, follow)?;
+            crate::permissions::want_write(c.files, &path, follow)?;
             if stat.mode & 0o170000 == 0o120000 {
                 return Err(Errno::EOPNOTSUPP);
             }
@@ -1832,6 +1934,7 @@ fn chmod_followed(c: &Context<'_>, target: Followed, mode: u32) -> Result<u64, E
             c.files.fs().set_mode(&path, mode).map(|()| 0)
         }
         Followed::File(d) => {
+            crate::permissions::want_write(c.files, &d.path, false)?;
             let mode = crate::permissions::chmod(creds, &d.file.stat()?, mode)?;
             d.file.set_mode(mode).map(|()| 0)
         }
@@ -1847,7 +1950,8 @@ fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let raw = path(c, a[1])?;
     if raw.is_empty() && a[4] & AT_EMPTY_PATH != 0 {
         if a[0] as i32 != -100 {
-            return chown_file(c, &c.files.descriptor(a[0])?.file, a[2], a[3]);
+            let d = c.files.descriptor(a[0])?;
+            return chown_file(c, &d.file, &d.path, a[2], a[3]);
         }
         let cwd = c
             .files
@@ -3639,16 +3743,17 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
 /// ([`Internal`]) has one of the small IDs below 21, as Linux's
 /// `kern_mount`s take theirs first, at boot.
 pub(crate) fn mount_id(c: &Context<'_>, device: u64, path: &[u8]) -> u64 {
+    mount_id_in(&*c.files.fs(), device, path)
+}
+/// [`mount_id`] in the file system `fs`.
+fn mount_id_in(fs: &dyn FileSystem, device: u64, path: &[u8]) -> u64 {
     if let Some(i) = Internal::ALL.iter().position(|fs| fs.device() == device) {
         return i as u64 + 1;
     }
-    let fs = c.files.fs();
     if path.first() == Some(&b'/') && !generated(path) && fs.device(path) == device {
         return fs.mount_id(path);
     }
-    c.files
-        .fs()
-        .mounts()
+    fs.mounts()
         .iter()
         .find(|m| m.device == device)
         .map_or(20 + (device & 0xff | (device >> 12) & !0xff), |m| m.id)
@@ -3774,6 +3879,10 @@ impl Internal {
 /// (an anonymous inode) that no path opened, else that of the mount holding
 /// its path.
 pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
+    descriptor_device_in(&*c.files.fs(), d)
+}
+/// [`descriptor_device`] of a path `d` holds in the file system `fs`.
+pub(crate) fn descriptor_device_in(fs: &dyn FileSystem, d: &Descriptor) -> u64 {
     let any = d.file.as_any();
     if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
         return crate::memfd::device(memfd);
@@ -3782,7 +3891,7 @@ pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
         return crate::namespaces::DEVICE;
     }
     if !d.path.is_empty() {
-        return device(c, &d.path);
+        return fs.device(&d.path);
     }
     if any.is_some_and(|v| v.is::<crate::processes::PidFd>()) {
         return Internal::Pidfs.device();
@@ -3791,7 +3900,7 @@ pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
         Ok(0o010000) => Internal::Pipefs.device(),
         Ok(0o140000) => Internal::Sockfs.device(),
         Ok(0) => Internal::AnonInodes.device(),
-        _ => device(c, &d.path),
+        _ => fs.device(&d.path),
     }
 }
 /// The minor number of the mount that holds `path` (the longest matching
@@ -4416,16 +4525,36 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     // does a queue's path in `/dev/mqueue`.
                     Some(Followed::Path { path, follow }) => {
                         let stat = c.files.fs().metadata(&path, follow)?;
-                        crate::permissions::truncate(&c.process.credentials, &stat)?;
+                        crate::permissions::truncate(&c.process.credentials, &stat, || {
+                            crate::permissions::want_write(c.files, &path, follow)
+                        })?;
                         crate::inotify::unnoticed(|| c.files.fs().open(&path, 1, 0))?
                     }
                     Some(Followed::File(d)) => {
-                        crate::permissions::truncate(&c.process.credentials, &d.file.stat()?)?;
+                        crate::permissions::truncate(
+                            &c.process.credentials,
+                            &d.file.stat()?,
+                            || crate::permissions::want_write(c.files, &d.path, false),
+                        )?;
                         crate::inotify::unnoticed(|| d.file.reopen(1))?
                     }
                     None => {
-                        if let Some(stat) = found.file {
-                            crate::permissions::truncate(&c.process.credentials, &stat)?;
+                        let writable = || crate::permissions::want_write(c.files, &p, true);
+                        match found.file {
+                            Some(stat) => {
+                                crate::permissions::truncate(
+                                    &c.process.credentials,
+                                    &stat,
+                                    writable,
+                                )?;
+                            }
+                            None => {
+                                if let Ok(stat) = c.files.fs().metadata(&p, true)
+                                    && stat.mode & 0o170000 == 0o100000
+                                {
+                                    writable()?;
+                                }
+                            }
                         }
                         crate::inotify::unnoticed(|| c.files.fs().open(&p, 1, 0))?
                     }
@@ -4652,7 +4781,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     landlock_name(c, &p, crate::landlock::MAKE_DIR)
                 });
             }
-            let created = crate::permissions::create(c.files, &c.process.credentials, dir, &raw)?;
+            let created =
+                crate::permissions::create(c.files, &c.process.credentials, dir, &raw, true)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
                 landlock_name(c, &p, crate::landlock::MAKE_DIR)?;
             }
@@ -4696,6 +4826,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 });
             }
             crate::permissions::delete(c.files, &c.process.credentials, at_dir, &raw)?;
+            crate::permissions::removable_name(c.files, at_dir, &raw, dir)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_some()) {
                 let request = if dir {
                     crate::landlock::REMOVE_DIR
@@ -4724,7 +4855,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     landlock_name(c, &p, crate::landlock::MAKE_SYM)
                 });
             }
-            let created = crate::permissions::create(c.files, &c.process.credentials, dir, &raw)?;
+            let created =
+                crate::permissions::create(c.files, &c.process.credentials, dir, &raw, false)?;
             if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
                 landlock_name(c, &p, crate::landlock::MAKE_SYM)?;
             }
@@ -4801,7 +4933,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         .files
                         .descriptor(u64::from(n))
                         .map_err(|_| Errno::ENOENT)?;
-                    from_reader(c, link_target(c, &d)?)
+                    from_reader(c, link_target(&Holder::of(c), &d)?)
                 }
             } else {
                 c.files.fs().readlink(&p)?
@@ -4831,6 +4963,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if let Some(target) = reached(c, &p, true)? {
                 return chmod_followed(c, target, mode as u32);
             }
+            crate::permissions::want_write(c.files, &p, true)?;
             let mode = match found.file {
                 Some(stat) => {
                     crate::permissions::chmod(&c.process.credentials, &stat, mode as u32)?
@@ -4841,6 +4974,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         }
         91 => {
             let file = io_descriptor(c, a[0])?;
+            crate::permissions::want_write(c.files, &c.files.descriptor(a[0])?.path, false)?;
             let mode =
                 crate::permissions::chmod(&c.process.credentials, &file.stat()?, a[1] as u32)?;
             file.set_mode(mode).map(|()| 0)
@@ -4854,7 +4988,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], n == 92)?;
             chown_path(c, &p, n == 92, a[1], a[2])
         }
-        93 => chown_file(c, &io_descriptor(c, a[0])?, a[1], a[2]),
+        93 => chown_file(
+            c,
+            &io_descriptor(c, a[0])?,
+            &c.files.descriptor(a[0])?.path,
+            a[1],
+            a[2],
+        ),
         260 => fchownat(c, a),
         280 => utimensat(c, a),
         132 => utime(c, a[0], a[1]),
@@ -4864,12 +5004,23 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         137 => {
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], true)?;
             let stats = path_statfs(c, &p)?;
-            write_statfs(c, a[1], stats, watched_device(c, &p, true))
+            let flags = mount_statfs_flags(c, &stats, &p);
+            write_statfs(c, a[1], stats, watched_device(c, &p, true), flags)
         }
         138 => {
             let d = c.files.descriptor(a[0])?;
             let stats = descriptor_statfs(c, &d)?;
-            write_statfs(c, a[1], stats, descriptor_device(c, &d))
+            // A memfd is on the kernel's own tmpfs mount.
+            let memfd = d
+                .file
+                .as_any()
+                .is_some_and(|v| v.is::<crate::memfd::Memfd>());
+            let flags = if memfd {
+                0x20
+            } else {
+                mount_statfs_flags(c, &stats, &d.path)
+            };
+            write_statfs(c, a[1], stats, descriptor_device(c, &d), flags)
         }
         // access, faccessat, faccessat2
         21 => access(c, (-100i32) as u64, a[0], a[1], 0),
@@ -5144,7 +5295,7 @@ impl LinkPath {
                     .files
                     .descriptor(u64::from(*n))
                     .map_err(|_| Errno::ENOENT)?;
-                link_target(c, &d)
+                link_target(&Holder::of(c), &d)
             }
         }
     }
@@ -6170,6 +6321,32 @@ fn open_path(
         if let crate::proc::TaskEntry::Maps(smaps) = path.entry {
             return Ok((tasks::maps(&task, smaps, flags, c.files.root()), p.to_vec()));
         }
+        // A link of `fd` opens its descriptor's file again, as this
+        // process's own does.
+        if let crate::proc::TaskEntry::Descriptor(n) = path.entry {
+            let d = tasks::descriptor(&task, n).ok_or(Errno::ENOENT)?;
+            if flags & 0o300 == 0o300 {
+                return Err(Errno::EEXIST);
+            }
+            if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 {
+                return Err(Errno(40)); // ELOOP
+            }
+            let holder = tasks::holder(&task).ok_or(Errno::ENOENT)?;
+            return reopen_descriptor(c, &holder, d, flags, mode);
+        }
+        if let crate::proc::TaskEntry::DescriptorInfo(n) = path.entry {
+            let d = tasks::descriptor(&task, n).ok_or(Errno::ENOENT)?;
+            let others: Vec<Descriptor> = tasks::descriptors(&task)
+                .into_iter()
+                .map(|(_, d)| d)
+                .collect();
+            let holder = tasks::holder(&task).ok_or(Errno::ENOENT)?;
+            let content = fdinfo(c, &holder, &d, &others);
+            return Ok((
+                Arc::new(crate::proc::GeneratedFile::open(content, flags)),
+                p.to_vec(),
+            ));
+        }
         if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
             Arc::new(crate::proc::GeneratedFile::open(content, flags))
         } else if let Some(target) = tasks::link(&task, path.entry) {
@@ -6331,11 +6508,22 @@ fn reopen(
     flags: u32,
     mode: u32,
 ) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
-    const ENXIO: Errno = Errno(6);
     let d = c
         .files
         .descriptor(u64::from(n))
         .map_err(|_| Errno::ENOENT)?;
+    let holder = Holder::of(c);
+    reopen_descriptor(c, &holder, d, flags, mode)
+}
+/// [`reopen`] of descriptor `d`, this process's or another's.
+fn reopen_descriptor(
+    c: &mut Context<'_>,
+    h: &Holder,
+    d: Descriptor,
+    flags: u32,
+    mode: u32,
+) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
+    const ENXIO: Errno = Errno(6);
     // The descriptor of a symbolic link itself: following its link reaches
     // that symbolic link, which an open does not follow again (ELOOP).
     if d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
@@ -6382,8 +6570,14 @@ fn reopen(
             Ok((crate::mqueue::reopened(c, &d.file, flags)?, d.path.clone()))
         }
         _ if d.path.is_empty() => Err(ENXIO),
-        _ if generated(&d.path) => open_path(c, &d.path.clone(), flags, mode),
-        _ => match current_path(c.files, &d, stat.inode) {
+        _ if generated(&d.path) => open_path(c, &h.generated(&d.path), flags, mode),
+        // A path in another file system than this process's (another
+        // process's root or mount namespace) is not this one's to open:
+        // the link leads to the file itself.
+        _ if !std::ptr::addr_eq(Arc::as_ptr(&h.fs), Arc::as_ptr(&c.files.fs())) => {
+            Ok((d.file.reopen(flags)?, d.path.clone()))
+        }
+        _ => match current_path_in(&*h.fs, &d, stat.inode) {
             Some(path) => open_path(c, &path, flags, mode),
             None => Ok((d.file.reopen(flags)?, d.path.clone())),
         },
@@ -6590,10 +6784,12 @@ pub(crate) fn resolved_in(fs: &dyn HostFs, path: &[u8]) -> Option<Vec<u8>> {
 /// The path that still names the file of `d` (its recorded path resolved),
 /// or `None` once nothing does.
 fn current_path(files: &Files, d: &Descriptor, inode: u64) -> Option<Vec<u8>> {
-    let path = resolved(files, &d.path)?;
-    files
-        .fs()
-        .metadata(&path, false)
+    current_path_in(&*files.fs(), d, inode)
+}
+/// [`current_path`] in the file system `fs`.
+fn current_path_in(fs: &dyn FileSystem, d: &Descriptor, inode: u64) -> Option<Vec<u8>> {
+    let path = resolved_in(fs, &d.path)?;
+    fs.metadata(&path, false)
         .is_ok_and(|s| s.inode == inode)
         .then_some(path)
 }
@@ -6924,7 +7120,7 @@ fn reached(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, 
 /// `anon_inode:[<kind>]` for a file of no type (`anon_inode:inotify` and
 /// `anon_inode:seccomp notify` without brackets), a memfd's own name, or a
 /// POSIX message queue's path in its filesystem.
-fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
+fn link_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     let any = d.file.as_any();
     if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
         return Ok(memfd.link_target());
@@ -6947,6 +7143,10 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     if any.is_some_and(|v| v.is::<crate::userfaultfd::UserfaultFile>()) {
         return Ok(b"anon_inode:[userfaultfd]".to_vec());
     }
+    // A BPF map's, `anon_inode_getfd("bpf-map", ...)`.
+    if any.is_some_and(|v| v.is::<crate::bpf::MapFile>()) {
+        return Ok(b"anon_inode:bpf-map".to_vec());
+    }
     // So is a seccomp listener: "seccomp notify".
     if crate::seccomp::is_listener(&d.file) {
         return Ok(b"anon_inode:seccomp notify".to_vec());
@@ -6963,6 +7163,7 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
             Some(v) if v.is::<crate::signalfd::SignalFile>() => "signalfd",
             Some(v) if v.is::<crate::landlock::Ruleset>() => "landlock-ruleset",
             Some(v) if v.is::<crate::io_uring::Ring>() => "io_uring",
+            Some(v) if v.is::<crate::perf::EventFile>() => "perf_event",
             // The last kind of no type; Linux 6.9 and later name it from
             // pidfs instead.
             _ => "pidfd",
@@ -6971,15 +7172,12 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
         _ if d.path == b"/proc/self" && any.is_some_and(|v| v.is::<LinkPath>()) => {
             b"/proc/self".to_vec()
         }
-        _ if generated(&d.path) => match d.path.strip_prefix(b"/proc/self") {
-            Some(rest) => [format!("/proc/{}", c.process.pid).as_bytes(), rest].concat(),
-            None => d.path.clone(),
-        },
+        _ if generated(&d.path) => h.generated(&d.path),
         // The descriptor of a symbolic link itself names the link.
         _ if any.is_some_and(|v| v.is::<LinkPath>()) => {
             paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
         }
-        _ => current_path(c.files, d, stat.inode).unwrap_or_else(|| {
+        _ => current_path_in(&*h.fs, d, stat.inode).unwrap_or_else(|| {
             let mut path = opened_path(d);
             path.extend_from_slice(b" (deleted)");
             path
@@ -7156,7 +7354,17 @@ fn other_generated_stat(
     }
     let stat = match entry {
         crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),
-        crate::proc::OwnEntry::Descriptors => crate::proc::descriptors_stat(),
+        // As Linux's `proc_fd_getattr`: its size is the number of open
+        // descriptors.
+        crate::proc::OwnEntry::Descriptors => FileStat {
+            size: c
+                .files
+                .fds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len() as u64,
+            ..crate::proc::descriptors_stat()
+        },
         crate::proc::OwnEntry::DescriptorInfos => crate::proc::directory_stat(),
         // As Linux's, of size 0, while the descriptor is open.
         crate::proc::OwnEntry::DescriptorInfo(n) => {
@@ -7306,25 +7514,39 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
 /// (as `statx` gives it) and its inode; then a `lock:` line for the
 /// description's `flock` lock and each record lock set through it
 /// ([`crate::record_locks::fdinfo`]), and the lines of an inotify instance,
-/// an eventfd, a signalfd, a timerfd or an epoll.
+/// an eventfd, a signalfd, a timerfd, an epoll or a BPF map.
 fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
-    const O_CLOEXEC: u32 = 0o2000000;
     let d = c.files.descriptor(u64::from(n)).ok()?;
+    let descriptors: Vec<Descriptor> = c
+        .files
+        .fds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    Some(fdinfo(c, &Holder::of(c), &d, &descriptors))
+}
+/// [`descriptor_info`] of descriptor `d`, this process's or another's,
+/// whose process has `descriptors` (for the devices an epoll shows).
+fn fdinfo(c: &Context<'_>, h: &Holder, d: &Descriptor, descriptors: &[Descriptor]) -> Vec<u8> {
+    const O_CLOEXEC: u32 = 0o2000000;
+    let d = d.clone();
     let flags = status_flags(&d) | if d.cloexec { O_CLOEXEC } else { 0 };
     // A file that cannot seek (a pipe, a socket) is at 0.
     let pos = d.file.seek(0, 1).unwrap_or(0);
     let ino = d.file.stat().map_or(0, |stat| stat.inode);
-    let mount = mount_id(c, descriptor_device(c, &d), &d.path);
+    let mount = mount_id_in(&*h.fs, descriptor_device_in(&*h.fs, &d), &d.path);
     let mut out =
         format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t{mount}\nino:\t{ino}\n").into_bytes();
-    out.extend(crate::record_locks::fdinfo(c, &d));
+    out.extend(crate::record_locks::fdinfo(c, &d, &*h.fs, h.table));
     let any = d.file.as_any();
     if let Some(instance) = crate::inotify::of(&d.file) {
         out.extend(instance.fdinfo());
     } else if let Some(group) = crate::fanotify::of(&d.file) {
         // Mount marks are kept by device, so a mark has no path to tell
         // the bind mounts of one file system apart: the first mount's ID.
-        out.extend(group.fdinfo(&|device| mount_id(c, device, b"")));
+        out.extend(group.fdinfo(&|device| mount_id_in(&*h.fs, device, b"")));
     } else if let Some(uffd) = crate::userfaultfd::of(&d.file) {
         out.extend(crate::userfaultfd::fdinfo(uffd));
     } else if let Some(counter) = any.and_then(|a| a.downcast_ref::<crate::events::EventCounter>())
@@ -7336,24 +7558,22 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     } else if let Some(timer) = any.and_then(|a| a.downcast_ref::<crate::timerfd::TimerFile>()) {
         out.extend(timer.fdinfo());
     } else if let Some(epoll) = any.and_then(|a| a.downcast_ref::<crate::epoll::EpollInstance>()) {
-        out.extend(epoll_fdinfo(c, epoll));
+        out.extend(epoll_fdinfo(&*h.fs, epoll, descriptors));
+    } else if let Some(lines) = crate::bpf::fdinfo(&d.file) {
+        out.extend(lines);
     }
-    Some(out)
+    out
 }
 /// An epoll's lines in `/proc/self/fdinfo`, as Linux's `ep_show_fdinfo`
 /// writes one for each file it watches: the descriptor it was added with,
 /// the events, the data, and the file's position, inode and device (the
-/// device of a descriptor this process has of it, or 0). They come by
+/// device of a descriptor its process has of it, or 0). They come by
 /// descriptor, where Linux's order follows its files' addresses.
-fn epoll_fdinfo(c: &Context<'_>, epoll: &crate::epoll::EpollInstance) -> Vec<u8> {
-    let descriptors: Vec<Descriptor> = c
-        .files
-        .fds
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .values()
-        .cloned()
-        .collect();
+fn epoll_fdinfo(
+    fs: &dyn FileSystem,
+    epoll: &crate::epoll::EpollInstance,
+    descriptors: &[Descriptor],
+) -> Vec<u8> {
     let mut out = Vec::new();
     for (fd, events, data, file) in epoll.targets() {
         let pos = file.seek(0, 1).unwrap_or(0);
@@ -7361,7 +7581,7 @@ fn epoll_fdinfo(c: &Context<'_>, epoll: &crate::epoll::EpollInstance) -> Vec<u8>
         let device = descriptors
             .iter()
             .find(|d| Arc::ptr_eq(&d.file, &file))
-            .map_or(0, |d| descriptor_device(c, d));
+            .map_or(0, |d| descriptor_device_in(fs, d));
         // `new_encode_dev` undone, then `MKDEV`.
         let major = (device >> 8) & 0xfff;
         let minor = (device & 0xff) | ((device >> 12) & !0xff);
@@ -7440,6 +7660,8 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
     match kind {
         0 | 0o100000 | 0o010000 | 0o140000 => {}
         0o020000 | 0o060000 => {
+            // `filename_create`'s EROFS comes before `vfs_mknod`'s EPERM.
+            crate::permissions::want_write_new(c.files, dir, raw, false)?;
             if c.process.credentials.landlock != Default::default() {
                 let p = c.files.path(dir, raw.to_vec())?;
                 if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
@@ -7452,7 +7674,7 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
         _ => return Err(Errno::EINVAL),
     }
     let p = c.files.path(dir, raw.to_vec())?;
-    let created = crate::permissions::create(c.files, &c.process.credentials, dir, raw)?;
+    let created = crate::permissions::create(c.files, &c.process.credentials, dir, raw, false)?;
     if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
         landlock_name(c, &p, crate::landlock::make_access(kind, 0))?;
     }

@@ -424,10 +424,16 @@ fn key(c: &Context<'_>, d: &Descriptor) -> Result<Key, Errno> {
 /// `show_fd_locks`: the description's `flock` lock, then the record locks
 /// set through it that this process or the description owns, by where they
 /// start, numbered from 1 across both.
-pub(crate) fn fdinfo(c: &Context<'_>, d: &Descriptor) -> Vec<u8> {
-    let Ok(key) = key(c, d) else {
+pub(crate) fn fdinfo(
+    c: &Context<'_>,
+    d: &Descriptor,
+    fs: &dyn paludarium_vfs::FileSystem,
+    table: u64,
+) -> Vec<u8> {
+    let Ok(inode) = d.file.stat().map(|stat| stat.inode) else {
         return Vec::new();
     };
+    let key = (crate::files::descriptor_device_in(fs, d), inode);
     // `new_encode_dev` undone.
     let (device, inode) = key;
     let major = (device >> 8) & 0xfff;
@@ -452,7 +458,7 @@ pub(crate) fn fdinfo(c: &Context<'_>, d: &Descriptor) -> Vec<u8> {
         );
     }
     let this = Arc::downgrade(&d.file);
-    let ours = Owner::Files(c.files.table());
+    let ours = Owner::Files(table);
     let table = locks.table();
     let Some(list) = table.files.get(&key) else {
         return out;

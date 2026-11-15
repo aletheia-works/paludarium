@@ -255,11 +255,17 @@ def check_gates(text, expensive=EXPENSIVE):
     missing = set(jobs) - {"ci-ok"} - jobs["ci-ok"][0]
     if missing:
         raise AssertionError(f"ci-ok does not need {sorted(missing)}")
+    # A skip passes down the needs too: polyglot-lint runs only on pull
+    # requests and lint only on Rust changes, so with the implicit success()
+    # an expensive job would be skipped whenever one of them was, although
+    # quick passed. The expensive jobs check quick's own result instead.
+    guard = "${{ !cancelled() && needs.quick.result == 'success' && "
     for job in expensive:
         if "quick" not in jobs[job][0]:
             raise AssertionError(f"{job} must need the quick stage")
-        if "always()" in jobs[job][1] or "cancelled()" in jobs[job][1]:
-            raise AssertionError(f"{job} must be skipped when the quick stage fails")
+        cond = jobs[job][1]
+        if not cond.startswith(guard) or not cond.endswith(" }}") or "always()" in cond:
+            raise AssertionError(f"{job} must run if and only if quick passed: if: {guard}...")
     return jobs
 
 
@@ -307,6 +313,7 @@ def self_test():
     jobs = check_gates(WORKFLOW.read_text(encoding="utf-8"))
     good = (
         "on: push\njobs:\n  a:\n    runs-on: x\n  b:\n    needs: [a, quick]\n"
+        "    if: ${{ !cancelled() && needs.quick.result == 'success' && true }}\n"
         "  quick:\n    if: ${{ !cancelled() }}\n    needs:\n      - a\n"
         "  ci-ok:\n    if: always()\n    needs:\n      - a\n      - b\n      - quick\n"
     )
@@ -314,7 +321,11 @@ def self_test():
     for text, refusal in (
         (good.replace("      - b\n", ""), "ci-ok does not need ['b']"),
         (good.replace("[a, quick]", "a"), "b must need the quick stage"),
-        (good.replace("[a, quick]\n", "[a, quick]\n    if: always()\n"), "b must be skipped"),
+        (
+            good.replace("${{ !cancelled() && needs.quick.result == 'success' && true }}", "true"),
+            "b must run if",
+        ),
+        (good.replace("&& true }}", "&& always() }}"), "b must run if"),
         (good.replace("  quick:\n    if: ${{ !cancelled() }}", "  quick:"), "quick must run"),
     ):
         try:

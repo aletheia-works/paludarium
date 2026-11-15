@@ -155,11 +155,25 @@ impl Task {
 }
 
 /// Refuses what the reader may not see of the task: `environ`, `maps`,
-/// `smaps`, `exe`, `cwd` and the links of `ns` (`EACCES`), as Linux's
-/// `proc_mem_open`, `proc_fd_access_allowed` and `proc_ns_get_link` do.
+/// `smaps`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
+/// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
+/// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself,
+/// read or looked in, as its mode lets (`proc_fd_permission`).
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
+        TaskEntry::Descriptors => descriptors_permission(c, task, crate::permissions::MAY_READ),
+        TaskEntry::Descriptor(_) => {
+            descriptors_permission(c, task, crate::permissions::MAY_EXEC)?;
+            if task.may_access(c, false) {
+                Ok(())
+            } else {
+                Err(Errno::EACCES)
+            }
+        }
+        TaskEntry::DescriptorInfos | TaskEntry::DescriptorInfo(_) if !task.may_access(c, false) => {
+            Err(Errno::EACCES)
+        }
         TaskEntry::Maps(_)
         | TaskEntry::Exe
         | TaskEntry::Cwd
@@ -170,6 +184,38 @@ pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<()
             Err(Errno::EACCES)
         }
         _ => Ok(()),
+    }
+}
+
+/// Whether the reader may read (`MAY_READ`) or look in (`MAY_EXEC`) the
+/// task's `fd`, 0500 and its owner's, as Linux's `proc_fd_permission`
+/// decides: by its mode, and always in the reader's own process.
+fn descriptors_permission(c: &Context<'_>, task: &Task, mask: u32) -> Result<(), Errno> {
+    if task.pid == c.process.pid {
+        return Ok(());
+    }
+    let stat = task.owned(crate::proc::descriptors_stat());
+    crate::permissions::permission(&c.process.credentials, &stat, mask)
+}
+/// Whose the task's descriptors are ([`super::Holder`]); `None` once it has
+/// ended.
+pub(super) fn holder(task: &Task) -> Option<super::Holder> {
+    task.live()
+        .then(|| task.public.files.holder(task.pid))
+        .flatten()
+}
+/// Descriptor `n` of the task while it is open; none once it has ended.
+pub(super) fn descriptor(task: &Task, n: u32) -> Option<super::Descriptor> {
+    task.live()
+        .then(|| task.public.files.descriptor(n))
+        .flatten()
+}
+/// The task's open descriptors, none once it has ended.
+pub(super) fn descriptors(task: &Task) -> Vec<(u32, super::Descriptor)> {
+    if task.live() {
+        task.public.files.all()
+    } else {
+        Vec::new()
     }
 }
 
@@ -304,10 +350,20 @@ pub(super) fn maps(
 
 /// Where `exe` or `cwd` leads: the program and the current directory, or
 /// ENOENT once the process has ended; `thread-self`, the thread's
-/// directory, relative to /proc as Linux's link reads; and what a link of
-/// `ns` reads, such as `uts:[4026531838]`. `None` for any other entry.
+/// directory, relative to /proc as Linux's link reads; what a link of
+/// `ns` reads, such as `uts:[4026531838]`; and a link of `fd`, ENOENT
+/// once its descriptor is closed. `None` for any other entry.
 pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errno>> {
     let target = match entry {
+        // What the descriptor's file is, as this process's own `fd` names
+        // it.
+        TaskEntry::Descriptor(n) => {
+            return Some(
+                descriptor(task, n)
+                    .ok_or(Errno::ENOENT)
+                    .and_then(|d| super::link_target(&holder(task).ok_or(Errno::ENOENT)?, &d)),
+            );
+        }
         TaskEntry::ThreadLink => Some(format!("{}/task/{}", task.pid, task.tid).into_bytes()),
         TaskEntry::Exe => task.live().then(|| task.view.group.executable()),
         TaskEntry::Cwd => task.live().then(|| task.public.files.cwd()).flatten(),
@@ -363,6 +419,42 @@ pub(super) fn stat(
         }
         TaskEntry::Namespace(_) => crate::proc::self_link_stat(),
         TaskEntry::Missing => return Err(Errno::ENOENT),
+        // As Linux's `proc_fd_getattr`: its size is the number of open
+        // descriptors.
+        TaskEntry::Descriptors => FileStat {
+            size: descriptors(task).len() as u64,
+            ..crate::proc::descriptors_stat()
+        },
+        TaskEntry::DescriptorInfos => FileStat {
+            mode: 0o040_555,
+            ..crate::proc::directory_stat()
+        },
+        // Looked up in `fd`, which its mode lets the reader look in, while
+        // the descriptor is open; followed, the file it leads to.
+        TaskEntry::Descriptor(n) => {
+            if follow {
+                check(c, task, entry)?;
+            } else {
+                descriptors_permission(c, task, crate::permissions::MAY_EXEC)?;
+            }
+            let d = descriptor(task, n).ok_or(Errno::ENOENT)?;
+            if follow {
+                let holder = holder(task).ok_or(Errno::ENOENT)?;
+                return Ok((
+                    d.file.stat()?,
+                    holder.device(&d),
+                    super::descriptor_block_size(c, &d),
+                ));
+            }
+            crate::proc::link_stat(d.file.flags() & 3)
+        }
+        // Of size 0, as Linux's, in `fdinfo`, which only a reader that may
+        // read the task looks in.
+        TaskEntry::DescriptorInfo(n) => {
+            check(c, task, entry)?;
+            descriptor(task, n).ok_or(Errno::ENOENT)?;
+            crate::proc::stat(0)
+        }
         // As Linux's, of size 0, as they are made as they are read.
         TaskEntry::Maps(_) => crate::proc::stat(0),
         // 0644, which their owner may write.
@@ -406,6 +498,18 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
                 .into_iter()
                 .map(|entry| (entry.name().to_vec(), DT_LNK)),
         ),
+        TaskEntry::Descriptors | TaskEntry::DescriptorInfos => {
+            let kind = if entry == TaskEntry::Descriptors {
+                DT_LNK
+            } else {
+                DT_REG
+            };
+            listing(
+                descriptors(task)
+                    .into_iter()
+                    .map(|(n, _)| (n.to_string().into_bytes(), kind)),
+            )
+        }
         TaskEntry::Threads => {
             let mut threads: Vec<u32> = task
                 .view

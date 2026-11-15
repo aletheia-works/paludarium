@@ -32,8 +32,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `FCMOV` と、glibc と musl の `long double` の数学関数が使う超越関数の命令
   （`FSIN`、`FCOS`、`FSINCOS`、`FPTAN`、`FPATAN`、`F2XM1`、`FYL2X`、`FYL2XP1`）も
   正しく丸めて実行します。これは実際の CPU の最後のビットと同じとは限りません
-  （[制限](./limitations)）。10 進数はまだ実装していません。シグナルハンドラは、
-  Linux と同じく x87 と SSE の状態をリセット直後にして始まります。
+  （[制限](./limitations)）。10 進数を読み書きし（`FBLD`、`FBSTP`）、`FNSAVE`、
+  `FRSTOR`、`FNSTENV`、`FLDENV` で、16 ビット形式（`0x66` プレフィックス付き）も
+  含めて、ユニットを保存して戻します。シグナルハンドラは、Linux と同じく x87 と
+  SSE の状態をリセット直後にして始まります。
 - AVX、AVX-512、MMX は対象外です。glibc が必須とするので `CPUID` は MMX を示しますが、
   その命令は `SIGILL` で止まります。
 
@@ -53,7 +55,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | 鍵 | `add_key`、`request_key`、`keyctl` |
-| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm`、`syslog`、`sysfs` |
+| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm`、`syslog`、`sysfs`、`perf_event_open`（下を参照） |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
@@ -63,6 +65,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
+| BPF | `bpf`、マップのみ（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -912,8 +915,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   呼び出しの操作は、すべてまとめて行うか、どれも行いません。すぐに通らない操作は、待つ
   ことになる操作に `IPC_NOWAIT` があれば `EAGAIN` で、なければ変更で通れるようになるか、
   セットが消える（`EIDRM`）か、シグナルが来る（`EINTR`。Linux と同じく再開しません）か、
-  `semtimedop` の時間切れ（`EAGAIN`）まで待ちます。変更のたびに、Linux の
-  `do_smart_update` と同じく待ちを試します。0 を待つものが先で、ほかは待ち始めた順です。
+  `semtimedop` の時間切れ（`EAGAIN`）まで待ちます。待ちは Linux と同じ待ち行列に入ります。
+  1 つのセマフォーだけへの操作はそのセマフォーの待ち行列に、複数のセマフォーへの操作はセットの
+  待ち行列に入り、後者が待っている間は、1 つのセマフォーを変える待ちもセットの待ち行列に
+  加わります。変更のたびに、Linux の `do_smart_update` と同じく、まず 0 にしたセマフォーで
+  0 を待つものを、次に値を変える待ちを、どの待ち行列も待ち始めた順に試します。
   `SEM_UNDO` の調整値はプロセスの undo リストに持ちます。このリストは `CLONE_SYSVSEM` で
   共有し（`pthread_create` はこれを渡します）、`fork` では共有しません。`SETVAL` と
   `SETALL` は調整値を消します。リストを共有する最後のスレッドが、終わるとき、または
@@ -1291,9 +1297,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ます。パスは通るディレクトリごとにいちばん上のマウントに入り、マウントのルートでの
   `..` はマウントした場所に出ます。マウントをまたぐ `rename` と `link` は `EXDEV`、
   マウントポイントの `rmdir`、`unlink`、`rename` は `EBUSY` で、名前の変更は動かす
-  ディレクトリの下のマウントも動かします。マウントのルートへの `MS_PRIVATE` と
-  `MS_SLAVE`（`MS_REC` 付きでもなしでも）は、`do_change_type` の確認（`EINVAL`）の
-  あと成功します。どのマウントもはじめからプライベートだからです。
+  ディレクトリの下のマウントも動かします。`MS_RDONLY` は新しいマウントとその
+  スーパーブロックを読み出し専用にし、`ro` オプションはスーパーブロックだけをそうします。
+  mountinfo の 2 つの `ro` の欄がそれを示します。共有マウントの上のマウントも、自分の
+  ピアグループで共有になります。
 - `MS_BIND` 付きの `mount` は、`CAP_SYS_ADMIN` までの同じ確認のあと、Linux の
   `do_loopback` と同じくバインドマウントを作ります。ソースが要り（ないものや空のものは
   `EINVAL`）、リンクをたどって探し（`ENOENT`、`ENOTDIR`、`ELOOP`、`EACCES`）、ターゲットの
@@ -1308,7 +1315,58 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   tmpfs は、最初のマウントを外したあとも、そのバインドマウントがある間は残ります。
   バインドマウントは、ソースの名前を変えたあともそれを見せ続けます。`statx` と
   `/proc/self/fdinfo` はファイルのマウント ID をパスから求めるので、バインドマウントの
-  ファイルはバインドマウントの ID を持ちます。
+  ファイルはバインドマウントの ID を持ちます。ソースのマウントがバインドできない
+  （unbindable）ものなら `EINVAL` で、`MS_REC` はその下のバインドできないマウントと
+  その上のものを除きます（ロックされたものは `EPERM`）。新しいマウントはソースの
+  マウントのピアで、そのマスターのスレーブです。共有マウントの上では共有になり、ソースの
+  マウントがどのピアグループにもなければ新しいグループに入ります。
+- `MS_REMOUNT` と `MS_BIND` 付きの `mount` は、Linux の `do_reconfigure_mnt` と同じく
+  マウントのフラグだけを変えます。ターゲットは呼び出し元の名前空間のマウントのルートで
+  （`EINVAL`）、より権限の少ない名前空間への写しでロックされたフラグはそのままで
+  （`EPERM`。`MNT_LOCK_READONLY`、`MNT_LOCK_NODEV`、`MNT_LOCK_NOSUID`、
+  `MNT_LOCK_NOEXEC`、`MNT_LOCK_ATIME`）、読み出し専用にするにはその上で書き込みのために
+  開いたファイルがないことが要ります（`EBUSY`）。フラグは呼び出しのもので、atime の
+  フラグはどれかを指定しなければそのままです。`MS_REMOUNT` だけのもの（`do_remount`）は
+  同じ確認のあと、マウントのファイルシステムのオプションを解釈し（`EINVAL`）、
+  スーパーブロックのユーザー名前空間に対する `CAP_SYS_ADMIN` が要り（`EPERM`）、
+  `reconfigure_super` と同じくスーパーブロックを設定し直します。マウントし直しで変えない
+  フラグのオプション（`dirsync`）は `EINVAL` で（フラグの `MS_DIRSYNC` は無視します）、
+  読み出し専用にするにはそのどのマウントにも書き込みのために開いたファイルがないことが
+  要り（`EBUSY`）、tmpfs のオプションは `shmem_reconfigure` と同じく確かめて変えます
+  （上限なしでマウントしたものへの上限、ファイルが使っている量より小さい上限、スワップ
+  するものへの `noswap`、クォータのないものへのクォータ、クォータの上限の変更は
+  `EINVAL`。`size`、`nr_blocks`、`nr_inodes`、`huge`、`inode32`、`inode64`、`mpol` は
+  変わり、`mode`、`uid`、`gid` は変わりません）。そのあとマウントは呼び出しのフラグを
+  持ちます。
+- 読み出し専用のマウントや、読み出し専用のスーパーブロックのマウントは、Linux の
+  `mnt_want_write` と同じところで、その前に来るエラーのあとに、書き込むものを `EROFS` で
+  断ります。名前を作るもの（`O_CREAT` と `O_TMPFILE` 付きの `open`、`mkdir`、`mknod`、
+  `symlink`、`link`、`AF_UNIX` ソケットの `bind`）は名前がないとわかったあと（`EEXIST` が
+  先）、ディレクトリに書く許可の前（と `link` の `EXDEV`、デバイスの `mknod` の `EPERM`
+  の前）です。`unlink`、`rmdir`、`rename` はディレクトリが見つかったあと、名前を探す前
+  です（なので、ない名前も `EROFS` です）。通常のファイルの `O_TRUNC` 付きの `open` と、
+  書き込みのために開くこと（許可と `ETXTBSY` のあと。FIFO、ソケット、デバイスは
+  開けます）、`EISDIR` と `EINVAL` のあとの `truncate`、許可の確認の前の `chmod`、
+  `chown`、`utimensat`、`utimes` とそのディスクリプタの形、`setxattr`、`removexattr` と
+  そのディスクリプタの形、`file_setattr`、`FS_IOC_SETFLAGS`、許可の確認のあとの `W_OK`
+  付きの `access` もそうです。読み出し専用のスーパーブロックは、通常のファイル、
+  ディレクトリ、シンボリックリンクに書くことも許可を確かめる前に断ります
+  （`sb_permission`）。`statfs` の `f_flags` は、`flags_by_mnt` と同じくマウントの
+  フラグ（`ST_RDONLY`、`ST_NOSUID`、`ST_NODEV`、`ST_NOEXEC`、`ST_NOATIME`、
+  `ST_NODIRATIME`、`ST_RELATIME`）を返します。
+- `MS_SHARED`、`MS_PRIVATE`、`MS_SLAVE`、`MS_UNBINDABLE` 付きの `mount`（`MS_REC` が
+  あればターゲットの上のマウントも）は、`do_change_type` の確認のあと、マウントの伝播の
+  種類を変えます。マウントのルートであること（`EINVAL`）、種類が 1 つでほかのフラグが
+  ないこと（`EINVAL`）、マウントの名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）が要ります。
+  共有マウントはピアグループに入り（どれにもなければ空いているいちばん小さい番号の新しい
+  もの）、バインドできないものではなくなります。ほかの種類にするとグループから出ます。
+  そのスレーブはピアに、ピアが残っていなければそのマウントのマスターにつきます。
+  `MS_SLAVE` は、ピアがあれば元のグループの、なければマスターのスレーブにし、
+  `MS_PRIVATE` と `MS_UNBINDABLE` はマスターをなくします。`/proc/self/mountinfo` は
+  Linux の `show_mountinfo` と同じく、それを `shared:N`、`master:N`、`propagate_from:N`、
+  `unbindable` で示します。新しいマウント名前空間への写しは写したマウントのピアで、
+  ユーザー名前空間がほかのものならそのスレーブです。外したマウントや、名前空間が
+  終わったマウントも、同じようにピアグループから出ます。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどります。そのあと Linux の `can_umount` と `do_umount`
   と同じく、マウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）、その名前空間のマウントの
@@ -1319,6 +1377,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   です。ただし `MNT_DETACH` は、それと上のマウントをすぐに外し、開いたファイルは読み書き
   できるままです。`MNT_EXPIRE`（`MNT_FORCE` や `MNT_DETACH` 付き、呼び出し元のルートでは
   `EINVAL`）は、だれも使っていないマウントに印を付け（`EAGAIN`）、次の呼び出しで外します。
+  Linux の `mntput` と同じく、マウントで終わる探索やその上のファイルを閉じることで印は
+  消えます。`MNT_DETACH` なしの呼び出し元のルートには、そのスーパーブロックのユーザー
+  名前空間に対する `CAP_SYS_ADMIN` が要り（`EPERM`）、マウントされたまま、
+  スーパーブロックを読み出し専用にマウントし直します（`do_umount_root`。その上で書き込みの
+  ために開いたファイルがあれば `EBUSY`）。
 - `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
   `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
@@ -1689,6 +1752,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     IPv6 は自分のアドレスにだけ bind できます。IPv4 にまだローカルの表がなければ、Linux の
     `inet_addr_type` がそのときどのアドレスもブロードキャストと見るのと同じく、ソケットは
     どの IPv4 のアドレスにも bind できます。
+  - **近隣:** `RTM_GETNEIGH` のダンプは、`neigh_dump_info` と同じくループバックの近隣
+    （下の通知の項のとおり、通信が作るもの）を返します。それぞれは、消えるときに伝える
+    `RTM_DELNEIGH` と同じ形の `RTM_NEWNEIGH` です。`AF_UNSPEC` では ARP（IPv4）の
+    ものに続けて近隣探索（IPv6）のものを、`AF_INET` と `AF_INET6` ではそのファミリーの
+    ものを返し、ほかのファミリーでは何も返しません。フラグが `NTF_PROXY` の `ndmsg` は
+    代理のエントリを求めますが、それはありません。`NDA_IFINDEX` と `NDA_MASTER` は
+    ダンプを絞り、どのメッセージにも `NLM_F_DUMP_FILTERED` を付けます。`lo` の番号の 1
+    と、マスターの -1（マスターなし）なら近隣を残し、ほかの値では何も返しません。
+    厳しく調べるときは、`neigh_valid_dump_req` と同じく、短い `ndmsg`、詰め物・番号・
+    状態・型・`NTF_PROXY` 以外のフラグを持つ `ndmsg`、ほかの属性は `EINVAL` です。
+    調べないときは、属性が `nda_policy` に合わないダンプは絞りません。`AF_MCTP` の
+    ダンプは近隣を返しません（`mctp_rtm_getneigh` と同じく、短い `ndmsg` は `EINVAL`）。
+    ダンプでないリクエストは、`neigh_get` と同じく、ファミリーとキー（`NDA_DST`）と
+    `lo` の番号で 1 つの近隣を指し、答えは引き当てが持つ参照も数えます。キーがない
+    （`NLMSGERR_ATTR_MISS_TYPE` で伝えます）、ほかの属性がある、キーの長さが違う、
+    デバイスがない、詰め物・状態・型・`NTF_PROXY` 以外のフラグがあるものは `EINVAL`、
+    IPv4 と IPv6 以外のファミリーは `EAFNOSUPPORT`、ほかのデバイスは `ENODEV`、`lo` に
+    ない近隣と代理のエントリは `ENOENT` です。
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
     `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
     1 から 39 で（0 とそれを超えるものは `EINVAL`、マルチキャストの経路の 30 と 31 には
@@ -2037,7 +2118,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
   `/proc/mounts` は呼び出し元のマウント名前空間のマウントの一覧です（ルートは `tmpfs`、
   `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs とバインドの
-  マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
+  マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリ、マウントと
+  スーパーブロックが読み出し専用かどうか、伝播の種類とともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。
   `/proc/<pid>/mountinfo` と `mounts`（`/proc/thread-self` と `/proc/<pid>/task/<tid>` のものも）は、
   Linux の `mounts_open_common` と同じくそのタスクのもので、そのマウント名前空間のマウントを
@@ -2104,7 +2186,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`maps`、`smaps`、`exe`、`cwd`、
-  `root`、`mounts`、`mountinfo`、`ns`（0511）、`task` があり、
+  `root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、`ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
@@ -2114,12 +2196,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`maps`、`smaps`、`exe`、`cwd`、`root`、`ns` のリンクはファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`maps`、`smaps`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
   同じです。ダンプできないプロセスの
-  ディレクトリの持ち主は root です。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
+  ディレクトリの持ち主は root です。`fd` そのものを読むことと中を探すことは、Linux の
+  `proc_fd_permission` と同じくそのモード（0500）が許す読み手だけができます。`fd` と
+  `fdinfo` は、このプロセス自身のもの（後述）と同じものを、ほかのプロセスのディスクリプタに
+  ついて示します。`fd` のリンクを開くと、そのディスクリプタのファイルを開き直します。
+  Linux の `d_path` と同じく、リンクは読み手のルートからのパスとして読めますが、ファイルは
+  そのプロセスが開いた場所、つまりそのプロセスのルートとマウント名前空間で探します。
+  そこでの `/proc/self` は、そのプロセスのディレクトリです。`fdinfo` は、そのプロセスの
+  ファイルのマウントと、そのプロセスが持つレコードロックを示します。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
   ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
   シグナルの扱い、メモリ（`cmdline`、`environ`、`maps`、`smaps`、`stat` の大きさ）、カレントディレクトリ、
@@ -2127,7 +2216,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
   コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
-  持ちません。Linux と同じく、`cmdline`、`environ`、`maps`、`smaps` は空で、`exe`、`cwd`、`root` は `ENOENT` です。
+  持ちません。Linux と同じく、`cmdline`、`environ`、`maps`、`smaps` は空、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` です。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、
@@ -2269,15 +2358,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   返しません。`lseek` は Linux の `mem_lseek` と同じく、始めか今の位置からどの位置にも
   動かせ、負の位置にもなります。そこからの `read` は `EINVAL` です。終わりからは
   `EINVAL` です。書き込めません（`EINVAL`。読むためだけに開いたディスクリプタでは `EBADF`）。
-- `/proc/self/fd`（モード 0500）は、`.`、`..` と、開いているディスクリプタごとの
-  リンクを並べます。名前は番号で、Linux と同じく先頭に 0 のない形で読みます。各リンクの
+- `/proc/self/fd`（モード 0500。大きさは Linux の `proc_fd_getattr` と同じく開いている
+  ディスクリプタの数）は、`.`、`..` と、開いているディスクリプタごとのリンクを並べます。名前は番号で、Linux と同じく先頭に 0 のない形で読みます。各リンクの
   `lstat` は、ユーザーのビットでディスクリプタのアクセスを示し、大きさは 64 です。`stat`
   はリンクをたどってファイルを示します。`readlink` は Linux と同じ名前を返します。
   `.`、`..` とシンボリックリンクを解決したファイルのパス（このプロセスのものは
   `/proc/<pid>/…`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに
   `pipe:[<inode>]`、`socket:[<inode>]`、`anon_inode:[eventfd]`・`[eventpoll]`・
-  `[timerfd]`・`[signalfd]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
-  名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`/memfd:<名前> (deleted)` です。
+  `[timerfd]`・`[signalfd]`・`[perf_event]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
+  名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`anon_inode:bpf-map`、`/memfd:<名前> (deleted)` です。
   そのためにパイプとソケットは自分の inode 番号を持ちます。リンクを開くと、ファイルを
   パスで開き直します。どのパスもそのファイルを指さなくなったとき（消された、または
   名前が変わった）は、同じファイルをそのハンドルから開き直し、オフセットは別に持ちます。
@@ -2545,6 +2634,60 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ブロックデバイスはないので `ENOTBLK` を返します。`quotactl_fd` はどのディスクリプタも
     受け付け（`EBADF`）、種類を確かめ（`EINVAL`）、クォータのないファイルシステムに
     対する Linux の `do_quotactl` と同じく `ENOSYS` を返します。
+- `perf_event_open` は、Linux の `kernel/events/core.c` の順に引数を確かめます。知らない
+  フラグ、次に構造体です（`perf_copy_attr`。サイズ 0 は最初の版の 64 バイトで、それより
+  小さいか 1 ページより大きいと `E2BIG` になり、Linux master の知るサイズ 176 を書き戻します。
+  それより大きくても、その先のバイトが 0 でなければ同じです。続いて予約フィールド、知らない
+  サンプルと読み込みの形式、分岐のない分岐サンプリング、DS・ES・FS・GS や予約ビットを含む
+  レジスタのマスク、大きすぎるか 8 バイト境界でないユーザースタック、両方の weight、
+  `inherit` なしの `inherit_thread`、`enable_on_exec` と一緒の `remove_on_exec`、
+  `remove_on_exec` なしの `sigtrap` がどれも `EINVAL` です）。次は `perf_event_paranoid` で、
+  Linux の既定の 2 です。カーネルのイベント（`exclude_kernel` なし、`text_poke`、カーネルの
+  コールチェーン、物理アドレス、カーネルかハイパーバイザーの分岐）と CPU のイベントには
+  `CAP_PERFMON` か `CAP_SYS_ADMIN` が要り（`EACCES`）、`namespaces` も同じです。そのあと、
+  ビット 63 の立った周期や `perf_event_max_sample_rate`（100000）を超える周波数は `EINVAL`、
+  CPU とタスクのない `PERF_FLAG_PID_CGROUP` は `EINVAL`、イベントでないグループの
+  ディスクリプタは `EBADF`、ないタスクは `ESRCH`、タスクも CPU もないときや最後より先の
+  CPU は `EINVAL`、知らない `clockid` は `EINVAL` です。数えるイベントは、ソフトウェアの
+  `cpu-clock` と `task-clock`（スレッドの CPU 時間をナノ秒で。CPU のイベントは経った時間）と、
+  x86-64 と同じく何も数えない `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output`
+  です。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
+  キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
+  イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
+  要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った
+  サンプル（0）を付けて返し、`PERF_FORMAT_GROUP` ではグループ全体を返します。バッファが
+  小さすぎると `ENOSPC` です。グループのメンバーはリーダーと同じタスク、CPU、クロックで、
+  pinned でも exclusive でもないこと（`EINVAL`）が要り、リーダーが有効な間だけ数えます。
+  ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
+  ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
+  と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
+  イベントをそのタスクの `execve` で有効にし、`remove_on_exec` はそのとき
+  イベントを以後ずっと無効にします。ディスクリプタのリンクは
+  `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
+  [制限](./limitations) を参照してください。
+- `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを
+  持ちます。どのコマンドも、まず union のサイズ（1 ページより大きいか、Linux master の 168
+  バイトより先に 0 でないバイトがあれば `E2BIG`）と、コマンド自身のフィールドより先
+  （`CHECK_ATTR`、`EINVAL`）を確かめます。`BPF_MAP_CREATE` は `BPF_MAP_TYPE_ARRAY`
+  （4 バイトのキーで、どの要素も初めからあって 0）か `BPF_MAP_TYPE_HASH` を、Linux の検査の
+  順に作ります。BTF の型 ID、`map_extra`、NUMA ノード（一つです）、型、型ごとのサイズと
+  フラグ（`EINVAL`。大きすぎるハッシュの要素は `E2BIG`、`CAP_SYS_ADMIN` なしの
+  `BPF_F_ZERO_SEED` は `EPERM`）、Linux の既定の 2 の `kernel.unprivileged_bpf_disabled`
+  （マップには `CAP_BPF` か `CAP_SYS_ADMIN` が要ります、`EPERM`）、名前（英数字、`_`、`.`）、
+  BTF（どのファイルも BTF ではありません、`EINVAL`）、`BPF_F_RDONLY` と `BPF_F_WRONLY` の
+  両方（`EINVAL`）の順です。ディスクリプタは close-on-exec で、`BPF_F_RDONLY` と
+  `BPF_F_WRONLY` に従って読み込み、書き込み、その両方で開かれ、リンクは
+  `anon_inode:bpf-map`、読み書きは `EINVAL` です。`BPF_MAP_LOOKUP_ELEM`、`UPDATE_ELEM`
+  （`BPF_ANY`、`BPF_NOEXIST`、`BPF_EXIST`。いっぱいのハッシュと配列の終わりより先の
+  添字は `E2BIG`）、`DELETE_ELEM`（配列では `EINVAL`）、`GET_NEXT_KEY`、
+  `LOOKUP_AND_DELETE_ELEM`（配列ではカーネルの `ENOTSUPP`、524）、`BPF_MAP_FREEZE`
+  （どのディスクリプタからの書き込みも止めるので、2 回目も `EPERM`）は、ディスクリプタのアクセスを
+  要ります（`EPERM`）。バッチのコマンドは、数を指定して検索、更新、削除、検索して削除を行い、
+  `count` を書き戻します（配列は削除できません、`ENOTSUPP`）。`BPF_OBJ_GET_INFO_BY_FD` は
+  マップの `struct bpf_map_info` を求められた長さまで返します（ディスクリプタがなければ
+  `EBADFD`、マップでなければ `EINVAL`）。fdinfo には `map_type`、`key_size`、`value_size`、
+  `max_entries`、`map_flags`、`map_extra`、`memlock`、`map_id`、`frozen` があります。
+  ないものは [制限](./limitations) を参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。
@@ -3130,8 +3273,30 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `-ERESTARTNOHAND`、`-ERESTART_RESTARTBLOCK`）を見せ、トレーサーが `rax` を変えるか
   `orig_rax` を -1 にしない限り、もう一度実行します。`orig_rax` を変えると、そのシステム
   コールが実行されます。
-- `PTRACE_SEIZE` 以外でトレースされたタスクは、`execve` の後に自分から `SIGTRAP` を受けます。
-  トレーサーのスレッドが終了するとトレース対象は手放され、`PTRACE_O_EXITKILL` を設定したものは
+- `PTRACE_SYSCALL` で再開したトレース対象は、システムコールの入口と出口ごとに止まります
+  （`SIGTRAP`、`PTRACE_O_TRACESYSGOOD` があれば `SIGTRAP | 0x80`）。`PTRACE_SYSEMU` では入口だけで
+  止まり、システムコールは実行されません。入口では `rax` が `-ENOSYS`、`orig_rax` がシステム
+  コールで、トレーサーはシステムコールと引数を変えられ、`orig_rax` を -1 にすると、`rax` を
+  残したい値にしたまま実行を飛ばします。出口では `rax` が戻り値で、トレーサーはそれを変え
+  られます。システムコール停止をシグナル付きで再開すると、そのシグナルはカーネルから
+  （`SI_KERNEL`）来ます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
+  同じく停止を示します。入口ではシステムコールと引数、出口では戻り値とエラーかどうか、
+  ほかの停止や `PTRACE_O_TRACESYSGOOD` なしでは命令ポインタとスタックポインタだけです。
+  `PTRACE_SET_SYSCALL_INFO` はシステムコール、引数、戻り値を変えます。種類の違う停止、
+  フラグ、足りないバッファは `EINVAL`、`int` に収まらない番号は `ERANGE` です。
+- `PTRACE_O_TRACEFORK`、`PTRACE_O_TRACEVFORK`、`PTRACE_O_TRACECLONE`、`PTRACE_O_TRACEEXEC`、
+  `PTRACE_O_TRACEVFORKDONE`、`PTRACE_O_TRACEEXIT` のイベントでは、トレース対象はステータスの
+  `SIGTRAP` の上にイベントを載せて止まり、`rax` は `-ENOSYS` です。`PTRACE_GETEVENTMSG` は
+  新しいタスク、`execve` 前のスレッド ID、終了ステータスを返します。トレーサーがイベントを
+  求めている間に `clone`、`fork`、`vfork` が作ったタスク、または `CLONE_PTRACE` 付きで作った
+  タスク（`CLONE_UNTRACED` 付きは除く）は、同じトレーサーに同じオプションでトレースされ、
+  SEIZE なら `PTRACE_EVENT_STOP` で、それ以外は保留中の `SIGSTOP` を持って始まります。
+  システムコール停止は持たずに始まります。`vfork` の親は、子が終了するか別のプログラムを
+  実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
+  `PTRACE_EVENT_EXIT` を報告し、それとともに終わるスレッドは報告しません。
+- `PTRACE_SEIZE` でも `PTRACE_O_TRACEEXEC` でもなくトレースされたタスクは、`execve` の後に
+  自分から `SIGTRAP` を受けます。リーダー以外のスレッドが `execve` すると、その後はリーダーの
+  番号でトレースされます。トレーサーのスレッドが終了するとトレース対象は手放され、`PTRACE_O_EXITKILL` を設定したものは
   殺されます。`/proc/<pid>/status` は `TracerPid` を示し、ptrace 停止中のトレース対象は
   `t (tracing stop)` です。
 

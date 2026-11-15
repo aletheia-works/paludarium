@@ -2,10 +2,12 @@
 # (-D warnings, also with the stable Rust of rust-version), dependency
 # checks, the x86-64 Linux differential tests and the 80% line-coverage
 # floor. A pull request runs the jobs its changed
-# files need (scripts/ci-changes.py) and a push to main runs every job.
-# The expensive jobs (differential tests, coverage, fuzzing, the guest
-# programs and the WebAssembly checks) start only after the quick stage
-# (lint, clippy, polyglot lint and the Linux unit tests) passed. ci-ok, the
+# files need (scripts/ci-changes.py) and a push to main runs every job but
+# the pull-request checks of other workflows (polyglot lint, the docs build
+# and the release check). The expensive jobs (differential tests, coverage,
+# fuzzing, the guest programs and the WebAssembly checks) start only after
+# the quick stage (lint, clippy, polyglot lint and the Linux unit tests)
+# passed. ci-ok, the
 # required check, passes only when every job passed or was not needed.
 # Actions are pinned by commit SHA and the default token is read-only.
 name: CI
@@ -35,7 +37,8 @@ env:
 
 jobs:
   # Which job groups this pull request's changed files need
-  # (scripts/ci-changes.py); a push to main runs every job.
+  # (scripts/ci-changes.py); a push to main needs every group, so it runs
+  # every job but the pull-request checks of other workflows.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -78,13 +81,13 @@ jobs:
 
   wasm-programs:
     needs: [changes, quick]
-    if: needs.changes.outputs.wasm == 'true'
+    if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.wasm == 'true' }}
     uses: ./.github/workflows/wasm-programs.yml
   # Only the targets the changes can affect. None chosen skips the job; a
   # failed choice fails changes, and so ci-ok.
   fuzz:
     needs: [changes, quick]
-    if: needs.changes.outputs.fuzz == 'true' && needs.changes.outputs.fuzz_targets != '[]'
+    if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.fuzz == 'true' && needs.changes.outputs.fuzz_targets != '[]' }}
     uses: ./.github/workflows/fuzz-pr.yml
     with:
       targets: ${{ needs.changes.outputs.fuzz_targets }}
@@ -108,7 +111,7 @@ jobs:
   programs:
     name: fixed guest programs
     needs: [changes, quick]
-    if: needs.changes.outputs.programs == 'true'
+    if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.programs == 'true' }}
     uses: ./.github/workflows/programs.yml
   # The pull-request checks of other workflows, so that ci-ok waits for them.
   polyglot-lint:
@@ -126,7 +129,7 @@ jobs:
   production-wasm:
     name: production wasm (shared Rust heap, nested Workers)
     needs: [changes, quick]
-    if: needs.changes.outputs.production_wasm == 'true'
+    if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.production_wasm == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -291,7 +294,7 @@ jobs:
   differential:
     name: differential tests (x86-64 Linux)
     needs: [changes, quick]
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.rust == 'true' }}
     # The native results are this kernel's (docs/design/quality.md).
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -354,7 +357,7 @@ jobs:
   differential-jit:
     name: differential tests with the native JIT (x86-64 Linux)
     needs: [changes, quick]
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -392,7 +395,7 @@ jobs:
   coverage:
     name: line coverage >= 80%
     needs: [changes, quick]
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.rust == 'true' }}
     # The native results are this kernel's (docs/design/quality.md).
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -578,7 +581,10 @@ jobs:
   # checks passed, so a head that fails them, or that a later push
   # supersedes early, does not take runners for the long jobs. A job that
   # needs this one is skipped when it fails; ci-ok still fails then, as it
-  # needs this job too.
+  # needs this job too. A skip also passes down the needs, and a quick check
+  # the change does not need is skipped (polyglot lint on a push, lint
+  # without a Rust change), so each expensive job tests this job's own
+  # result: if: ${{ !cancelled() && needs.quick.result == 'success' && ... }}.
   quick:
     name: quick checks
     # Not always(): a run a later push cancelled starts nothing more.

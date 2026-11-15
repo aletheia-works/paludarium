@@ -23,6 +23,141 @@ const DIRECTORY: u32 = 0o040000;
 const REGULAR: u32 = 0o100000;
 const SYMLINK: u32 = 0o120000;
 const TYPE: u32 = 0o170000;
+const EROFS: Errno = Errno(30);
+
+/// Whether `path` is in `/proc` or `/dev`, which the kernel makes and no
+/// mount here holds: Linux's are mounts of their own, written to whatever
+/// the root's flags.
+fn generated(path: &[u8]) -> bool {
+    let path = paludarium_vfs::normalize_path(path).unwrap_or_else(|_| path.to_vec());
+    let under =
+        |dir: &[u8]| path == dir || path.starts_with(dir) && path.get(dir.len()) == Some(&b'/');
+    under(b"/proc") || under(b"/dev")
+}
+/// `raw` without the slashes it ends in, but for a root.
+fn trimmed(raw: &[u8]) -> &[u8] {
+    let end = raw.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    &raw[..end]
+}
+/// Whether the last name of `raw` is a name (`LAST_NORM`), not `.`, `..`
+/// or a root.
+fn last_is_name(raw: &[u8]) -> bool {
+    let raw = trimmed(raw);
+    let name = raw.rsplit(|&b| b == b'/').next().unwrap_or(raw);
+    !name.is_empty() && name != b"." && name != b".."
+}
+/// The directory the last name of `raw` is in, from `dir`.
+fn directory_of(files: &Files, dir: u64, raw: &[u8]) -> Option<Vec<u8>> {
+    let raw = trimmed(raw);
+    let parent: &[u8] = match raw.iter().rposition(|&b| b == b'/') {
+        Some(0) => b"/",
+        Some(at) => &raw[..at],
+        None => b".",
+    };
+    files.path(dir, parent.to_vec()).ok()
+}
+
+/// `rmdir` and `unlink` of a last name that is no name, once the
+/// directory it is in is found (`filename_parentat`): `..` is ENOTEMPTY
+/// and `.` EINVAL to `rmdir` (a root EBUSY), and each EISDIR to `unlink`.
+pub(crate) fn removable_name(
+    files: &Files,
+    dir: u64,
+    raw: &[u8],
+    directory: bool,
+) -> Result<(), Errno> {
+    const ENOTEMPTY: Errno = Errno(39);
+    const EBUSY: Errno = Errno(16);
+    if last_is_name(raw) {
+        return Ok(());
+    }
+    let name = trimmed(raw);
+    let refused = |error: Errno| Err(if directory { error } else { Errno::EISDIR });
+    if name.is_empty() {
+        return refused(EBUSY);
+    }
+    let Some(parent) = directory_of(files, dir, raw) else {
+        return Ok(());
+    };
+    match files.fs().metadata(&parent, true) {
+        Ok(stat) if stat.mode & TYPE == DIRECTORY => {}
+        _ => return Ok(()),
+    }
+    if name.ends_with(b"..") {
+        refused(ENOTEMPTY)
+    } else {
+        refused(Errno::EINVAL)
+    }
+}
+/// `mnt_want_write` of the mount holding the file at `path`, its last
+/// link followed with `follow`: `EROFS` when it or its superblock is
+/// read-only. A file that is not there is the call's to find.
+pub(crate) fn want_write(files: &Files, path: &[u8], follow: bool) -> Result<(), Errno> {
+    let fs = files.fs();
+    if !path.starts_with(b"/")
+        || generated(path)
+        || !fs.read_only(path, follow).mount
+        || fs.metadata(path, follow).is_err()
+    {
+        return Ok(());
+    }
+    Err(EROFS)
+}
+/// `mnt_want_write` of the mount of the directory holding the last name of
+/// `raw` from `dir`, as `unlink`, `rmdir` and `rename` take it once the
+/// directory is found and the name is one (`filename_parentat`): before
+/// the name is looked up, or any permission to change the directory.
+pub(crate) fn want_write_parent(files: &Files, dir: u64, raw: &[u8]) -> Result<(), Errno> {
+    if !last_is_name(raw) || !files.fs().any_read_only() {
+        return Ok(());
+    }
+    let Some(parent) = directory_of(files, dir, raw) else {
+        return Ok(());
+    };
+    match files.fs().metadata(&parent, true) {
+        Ok(stat) if stat.mode & TYPE == DIRECTORY => want_write(files, &parent, true),
+        _ => Ok(()),
+    }
+}
+/// `filename_create`'s `mnt_want_write` of a new name `raw` from `dir`:
+/// once its directory is found, the name is one and is not there
+/// (`EEXIST` first), and it ends in no slash unless a directory is made
+/// (`ENOENT` first); before the permission to write the directory.
+pub(crate) fn want_write_new(
+    files: &Files,
+    dir: u64,
+    raw: &[u8],
+    directory: bool,
+) -> Result<(), Errno> {
+    if !last_is_name(raw) || raw.last() == Some(&b'/') && !directory || !files.fs().any_read_only()
+    {
+        return Ok(());
+    }
+    if files
+        .path(dir, trimmed(raw).to_vec())
+        .is_ok_and(|p| files.fs().metadata(&p, false).is_ok())
+    {
+        return Ok(());
+    }
+    want_write_parent(files, dir, raw)
+}
+/// `sb_permission`: writing a regular file, a directory or a symbolic
+/// link of a read-only superblock is `EROFS`, before its mode is checked.
+pub(crate) fn superblock_writable(
+    files: &Files,
+    path: &[u8],
+    follow: bool,
+    stat: &FileStat,
+) -> Result<(), Errno> {
+    if matches!(stat.mode & TYPE, REGULAR | DIRECTORY | SYMLINK)
+        && path.starts_with(b"/")
+        && !generated(path)
+        && files.fs().read_only(path, follow).superblock
+    {
+        return Err(EROFS);
+    }
+    Ok(())
+}
 
 /// `capable_wrt_inode_uidgid`: `capability` in the thread's own user
 /// namespace, which maps the file's owner and group.
@@ -267,6 +402,7 @@ pub(crate) fn open(
     const O_PATH: u32 = 0o10000000;
     let follow = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
     let found = search(files, creds, dir, raw, follow)?;
+    open_writable(files, dir, raw, flags, follow)?;
     match (found.parent, found.file) {
         (Some(parent), None) if flags & O_CREAT != 0 => {
             may_create(creds, &parent)?;
@@ -299,17 +435,72 @@ pub(crate) fn open(
     }
 }
 
-/// `mkdir`, `symlink` and `link`'s new name: a name that is not there yet
-/// goes into a directory the thread may write and search (one that is is
-/// EEXIST, which the call finds). Returns that directory's status, for the
-/// new file's owner ([`own`]).
+/// The `EROFS` of `open` that comes before its checks of permission: a
+/// new file on a read-only mount (`lookup_open`), `O_TRUNC` of a regular
+/// file there (`do_open`), and writing a file of a read-only superblock
+/// (`sb_permission`); `O_TMPFILE` in a directory there (`do_tmpfile`).
+/// Writing a file on a read-only mount is refused after them, as the file
+/// is opened (`file_get_write_access`).
+fn open_writable(
+    files: &Files,
+    dir: u64,
+    raw: &[u8],
+    flags: u32,
+    follow: bool,
+) -> Result<(), Errno> {
+    const O_CREAT: u32 = 0o100;
+    const O_EXCL: u32 = 0o200;
+    const O_TRUNC: u32 = 0o1000;
+    const O_DIRECTORY: u32 = 0o200000;
+    const O_PATH: u32 = 0o10000000;
+    const O_TMPFILE: u32 = 0o20000000;
+    if flags & O_PATH != 0 || !files.fs().any_read_only() {
+        return Ok(());
+    }
+    let Ok(path) = files.path(dir, raw.to_vec()) else {
+        return Ok(());
+    };
+    if flags & O_TMPFILE != 0 {
+        return want_write(files, &path, true);
+    }
+    let Ok(stat) = files.fs().metadata(&path, follow) else {
+        return if flags & O_CREAT != 0 {
+            want_write_new(files, dir, raw, false)
+        } else {
+            Ok(())
+        };
+    };
+    let kind = stat.mode & TYPE;
+    if flags & O_CREAT != 0 && (flags & O_EXCL != 0 || kind == DIRECTORY)
+        || flags & O_DIRECTORY != 0 && kind != DIRECTORY
+    {
+        return Ok(());
+    }
+    if flags & O_TRUNC != 0 && kind == REGULAR {
+        want_write(files, &path, follow)?;
+    }
+    if (flags & 3 != 0 || flags & O_TRUNC != 0) && kind != SYMLINK && kind != DIRECTORY {
+        superblock_writable(files, &path, follow, &stat)?;
+    }
+    Ok(())
+}
+
+/// `mkdir`, `symlink` and `link`'s new name (a `directory` for `mkdir`): a
+/// name that is not there yet goes into a directory on a mount that is
+/// not read-only (`EROFS`), which the thread may write and search (one
+/// that is is EEXIST, which the call finds). Returns that directory's
+/// status, for the new file's owner ([`own`]).
 pub(crate) fn create(
     files: &Files,
     creds: &Credentials,
     dir: u64,
     raw: &[u8],
+    directory: bool,
 ) -> Result<Option<FileStat>, Errno> {
     let found = search(files, creds, dir, raw, false)?;
+    if found.file.is_none() {
+        want_write_new(files, dir, raw, directory)?;
+    }
     match (found.parent, found.file) {
         (Some(parent), None) => may_create(creds, &parent).map(|()| Some(parent)),
         _ => Ok(None),
@@ -333,7 +524,9 @@ pub(crate) fn own(
         crate::inotify::unnoticed(|| files.fs().set_owner(path, follow, Some(creds.fsuid), group));
 }
 
-/// `unlink` and `rmdir`: [`may_delete`] on a file that is there.
+/// `unlink` and `rmdir`: a directory on a mount that is not read-only
+/// (`EROFS`, before the name is looked up), then [`may_delete`] on a file
+/// that is there.
 pub(crate) fn delete(
     files: &Files,
     creds: &Credentials,
@@ -341,6 +534,7 @@ pub(crate) fn delete(
     raw: &[u8],
 ) -> Result<(), Errno> {
     let found = search(files, creds, dir, raw, false)?;
+    want_write_parent(files, dir, raw)?;
     match (found.parent, found.file) {
         (Some(parent), Some(file)) => may_delete(creds, &parent, &file),
         _ => Ok(()),
@@ -348,7 +542,8 @@ pub(crate) fn delete(
 }
 
 /// `rename`'s checks, in `vfs_rename`'s order, when both names are on one
-/// filesystem (else EXDEV, which the call finds first): nothing when both
+/// filesystem (else EXDEV, which the call finds first): its mount not
+/// read-only (`EROFS`, before the names are looked up); nothing when both
 /// name one file; deleting the old name; deleting the file the new name
 /// replaces, or creating the name; and writing a directory that moves to
 /// another one, whose `..` changes.
@@ -362,6 +557,20 @@ pub(crate) fn rename(
 ) -> Result<(), Errno> {
     let from = search(files, creds, old.0, old.1, false)?;
     let to = search(files, creds, new.0, new.1, false)?;
+    // `filename_renameat2`: two names in directories of one mount
+    // (else EXDEV, which the call finds), then that mount writable.
+    if files.fs().any_read_only()
+        && last_is_name(old.1)
+        && last_is_name(new.1)
+        && let (Some(a), Some(b)) = (
+            directory_of(files, old.0, old.1),
+            directory_of(files, new.0, new.1),
+        )
+        && files.fs().metadata(&b, true).is_ok()
+        && files.fs().mount_id(&a) == files.fs().mount_id(&b)
+    {
+        want_write_parent(files, old.0, old.1)?;
+    }
     let (Some(old_parent), Some(source), Some(new_parent)) = (from.parent, from.file, to.parent)
     else {
         return Ok(());
@@ -516,12 +725,18 @@ pub(crate) fn times(
 }
 
 /// `truncate`'s checks (`vfs_truncate`), on a file found: a directory is
-/// EISDIR, any other file but a regular one EINVAL, and it needs
-/// permission to write, and not to be append-only (EPERM).
-pub(crate) fn truncate(creds: &Credentials, stat: &FileStat) -> Result<(), Errno> {
+/// EISDIR, any other file but a regular one EINVAL, it is on a mount that
+/// is not read-only (`writable`, EROFS), and it needs permission to
+/// write, and not to be append-only (EPERM).
+pub(crate) fn truncate(
+    creds: &Credentials,
+    stat: &FileStat,
+    writable: impl FnOnce() -> Result<(), Errno>,
+) -> Result<(), Errno> {
     match stat.mode & TYPE {
         DIRECTORY => Err(Errno::EISDIR),
         REGULAR => {
+            writable()?;
             permission(creds, stat, MAY_WRITE)?;
             if attributes::append_only(stat) {
                 return Err(Errno::EPERM);
@@ -703,9 +918,18 @@ mod permissions_tests {
             times(&user, &file(0o100644, 0, 0), true, false),
             Err(Errno::EACCES)
         );
-        assert_eq!(truncate(&user, &file(0o040777, 0, 0)), Err(Errno::EISDIR));
-        assert_eq!(truncate(&user, &file(0o010666, 0, 0)), Err(Errno::EINVAL));
-        assert_eq!(truncate(&user, &file(0o100644, 0, 0)), Err(Errno::EACCES));
+        assert_eq!(
+            truncate(&user, &file(0o040777, 0, 0), || Ok(())),
+            Err(Errno::EISDIR)
+        );
+        assert_eq!(
+            truncate(&user, &file(0o010666, 0, 0), || Ok(())),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            truncate(&user, &file(0o100644, 0, 0), || Ok(())),
+            Err(Errno::EACCES)
+        );
     }
 
     #[test]

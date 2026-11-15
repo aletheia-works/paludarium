@@ -132,8 +132,10 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 20] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 17] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 19] = [
     (b"task", 4),
+    (b"fd", 4),
+    (b"fdinfo", 4),
     (b"ns", 4),
     (b"environ", 8),
     (b"status", 8),
@@ -170,6 +172,12 @@ pub(crate) enum TaskEntry {
     Root,
     /// `maps`, and `smaps` (true), of the task's address space.
     Maps(bool),
+    /// `fd`, and one of its links by descriptor number.
+    Descriptors,
+    Descriptor(u32),
+    /// `fdinfo`, and its file of a descriptor by number.
+    DescriptorInfos,
+    DescriptorInfo(u32),
     /// `mountinfo` (true) or `mounts`: the mounts of the task's mount
     /// namespace, from its root.
     Mounts(bool),
@@ -235,11 +243,18 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"setgroups" => TaskEntry::Setgroups,
         _ => TaskEntry::Missing,
     };
-    // An entry of the task's directory, or a link of its `ns`.
+    // An entry of the task's directory, a link of its `ns` or `fd`, or a
+    // file of its `fdinfo`.
     let entry = |parts: &[&[u8]]| match parts {
+        [b"fd"] => TaskEntry::Descriptors,
+        [b"fdinfo"] => TaskEntry::DescriptorInfos,
         [name] => file(name),
         [b"ns", name] => {
             crate::namespaces::Entry::named(name).map_or(TaskEntry::Missing, TaskEntry::Namespace)
+        }
+        [b"fd", name] => descriptor_number(name).map_or(TaskEntry::Missing, TaskEntry::Descriptor),
+        [b"fdinfo", name] => {
+            descriptor_number(name).map_or(TaskEntry::Missing, TaskEntry::DescriptorInfo)
         }
         _ => TaskEntry::Missing,
     };
@@ -793,17 +808,22 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
         let source = escape(&mount.source);
         let (kind, options) = (mount.kind, &mount.options);
         let (common, fs) = (&mount.common_options, &mount.super_options);
+        let state = |read_only: bool| if read_only { "ro" } else { "rw" };
         if mountinfo {
             let device = mount.device;
             let major = (device >> 8) & 0xfff | (device >> 32) & !0xfff;
             let minor = device & 0xff | (device >> 12) & !0xff;
+            let (own, sb) = (state(mount.read_only), state(mount.super_read_only));
+            let tags = &mount.tags;
             out.push_str(&format!(
-                "{} {} {major}:{minor} {root} {path} rw{options} - {kind} {source} rw{common}{fs}\n",
+                "{} {} {major}:{minor} {root} {path} {own}{options}{tags} - {kind} {source} {sb}{common}{fs}\n",
                 mount.id, mount.parent
             ));
         } else {
+            // `show_vfsmnt`: read-only when the mount or its superblock is.
+            let both = state(mount.read_only || mount.super_read_only);
             out.push_str(&format!(
-                "{source} {path} {kind} rw{common}{options}{fs} 0 0\n"
+                "{source} {path} {kind} {both}{common}{options}{fs} 0 0\n"
             ));
         }
     }
@@ -1720,7 +1740,18 @@ mod tests {
             at(7, Some(9), TaskEntry::Maps(true))
         );
         assert_eq!(path(b"/proc/8/statm"), at(8, None, TaskEntry::Missing));
-        assert_eq!(path(b"/proc/8/fd/1"), at(8, None, TaskEntry::Missing));
+        assert_eq!(path(b"/proc/8/fd/1"), at(8, None, TaskEntry::Descriptor(1)));
+        assert_eq!(path(b"/proc/8/fd/"), at(8, None, TaskEntry::Descriptors));
+        assert_eq!(
+            path(b"/proc/8/fdinfo/12"),
+            at(8, None, TaskEntry::DescriptorInfo(12))
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/fdinfo"),
+            at(7, Some(9), TaskEntry::DescriptorInfos)
+        );
+        assert_eq!(path(b"/proc/8/fd/01"), at(8, None, TaskEntry::Missing));
+        assert_eq!(path(b"/proc/8/fd/1/x"), at(8, None, TaskEntry::Missing));
         assert_eq!(path(b"/proc/8/task"), at(8, None, TaskEntry::Threads));
         assert_eq!(path(b"/proc/self/task/"), at(7, None, TaskEntry::Threads));
         assert_eq!(

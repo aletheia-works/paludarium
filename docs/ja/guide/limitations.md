@@ -4,13 +4,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 
 ## できないこと
 
-- **今のところ x87 の一部**：10 進数（`FBLD`、`FBSTP`）はまだ実装していないので、
-  プログラムはそこで `SIGILL` で止まります。x87 の例外はつねにマスクされた
-  ときの動きをします。マスクされていない例外は状態ワードの要約を立てるだけで、`SIGFPE` には
-  なりません。16 ビット形式（`0x66` プレフィックス付き）の `FNSTENV` と `FLDENV` も実装
-  していません。`FISTTP` は `CPUID` が示さない SSE3 の命令なので実装していません。
-  オペランドが離れているときに `FPREM` と `FPREM1` が途中のどこで止まるかは CPU ごとに
-  異なりますが、最後の剰余は同じです。
+- **今のところ x87 の一部**：x87 の例外はつねにマスクされたときの動きをします。
+  マスクされていない例外は状態ワードの要約を立てるだけで、`SIGFPE` にはなりません。
+  `FISTTP` は `CPUID` が示さない SSE3 の命令なので実装していません。`FNSTENV`、
+  `FNSAVE`、`FXSAVE` が書く、最後の命令とそのメモリオペランドの場所は保っていません。
+  その欄は 0 で、Intel と AMD の CPU でも書く内容が異なります。オペランドが離れている
+  ときに `FPREM` と `FPREM1` が途中のどこで止まるかは CPU ごとに異なりますが、最後の
+  剰余は同じです。
 - **渡されていない動的リンクのプログラムのファイル**：Linux と同じくインタプリタと一緒に
   動かすので、musl と glibc の動的リンカーで動きます。インタプリタとライブラリは
   セッション自身のファイルから読むので、マウントするか渡す必要があります。
@@ -73,7 +73,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `fs` 以外の `/proc/sys` など）と、読むプロセス自身のディレクトリのほかの名前
   （`auxv`、`limits` など）は、ふつうのパスと同じように探すので、`--mount /:/` ではホストの
   `/proc` に届きます。ほかのプロセスのディレクトリでは、それらは `ENOENT` です。Linux は
-  root に `fd`、`statm` なども見せます。`stat` のページフォールト、常駐メモリ、
+  root に `statm` なども見せます。ほかのプロセスの `fd` のリンクの先へ続くパス
+  （`/proc/<pid>/fd/3/name`）は `ENOENT` です。Linux は、このプロセス自身のものと同じく、
+  リンクの先のディレクトリで続けます。`stat` のページフォールト、常駐メモリ、
   開始時刻、コードの範囲は 0 なので、`ps` の `RSS` は出ず、`STIME` と `START` は
   `/proc/stat` の起動時刻です。`/proc/stat` は CPU 時間、割り込み、コンテキストスイッチを
   数えず、割り込みの番号ごとの数も並べません。
@@ -184,6 +186,45 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   伸びず、その呼び出しは `EFAULT` になります。Linux では、ユーザーメモリのコピーが、
   ゲストでのフォルトと同じようにマッピングを伸ばします。`RLIMIT_AS` は、`mmap` を
   止めないのと同じく、伸びることも止めません。
+- **perf のイベントの一部**：数えるのはソフトウェアのクロック（`cpu-clock`、`task-clock`）と、
+  x86-64 で起きないソフトウェアのイベントだけです。ページフォルト、コンテキストスイッチ、
+  CPU の移動、cgroup の切り替え、トレースポイント、ブレークポイント、kprobe、uprobe は
+  `ENOENT` で、ハードウェアのイベントも、PMU のあるホストでも `ENOENT` です。スレッドの
+  CPU 時間は、最後のシステムコールで最後に記録したものです。CPU のイベントは経った時間を
+  数えます。リングバッファはないので、イベントの `mmap` は `ENODEV`、サンプリングする
+  イベントはサンプルを取らずシグナルも送らず、`poll` は読めるとは見ません。`inherit` は
+  受け付けますが子は数えず、一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
+  モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。`PERF_FLAG_FD_OUTPUT` と ioctl の
+  `SET_OUTPUT`、`SET_FILTER`、`SET_BPF`、`PAUSE_OUTPUT`、`QUERY_BPF`、
+  `MODIFY_ATTRIBUTES` は、何もしないか `ENOTTY` です。`remove_on_exec` は、タスクの
+  `execve` でイベントを無効にし、読めるまま残します。Linux はタスクのコンテキストから
+  取り除きます。それが率いたグループのメンバーは、それぞれで数え続けます。`execve` を待つ
+  イベントは、エミュレートするすべてのマシンで一つの一覧に置き、スレッドグループとスレッドで
+  照合して、閉じたときに除きます。グループのメンバーは、どのソフトウェアのクロックでも
+  数えます。Linux は、テストを動かす x86-64 のマシンで、`task-clock` のグループの
+  `cpu-clock` のメンバーに数を与えませんでした（理由は分かっていません）。Linux master の構造体の SIMD
+  レジスタのフィールドは確かめず、使うと `EOPNOTSUPP` です。`kernel.perf_event_paranoid` は
+  いつも 2 で（Debian と Ubuntu のカーネルの既定はそれより大きい）、それを示す
+  `/proc/sys/kernel` のファイルはなく、`prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と
+  `ENABLE` もありません。
+- **BPF はマップだけ**：`bpf` が作るのは配列とハッシュだけです。プログラム
+  （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
+  （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、ID（`BPF_*_GET_NEXT_ID`、`BPF_*_GET_FD_BY_ID`）、
+  トークン、イテレータ、統計は、Linux にあってここにないコマンドとして `ENOSYS` です。Linux に
+  コマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf はプログラムを読み込めず
+  （最小のプログラムでの確認が `ENOSYS` で失敗します）、`bpftool feature` は、
+  `BPF_PROG_LOAD` を呼んで `ENOSYS` かどうかを見るので、`bpf()` システムコールがないと
+  言います。ほかのマップの型は、それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。
+  CPU ごとの型（`BPF_MAP_TYPE_PERCPU_ARRAY`、`PERCPU_HASH`、`LRU_PERCPU_HASH`）は、
+  値が使いうる CPU ごとに一つあり、テストのマシンとエミュレータで CPU の数え方が違うので、
+  どのみち Linux と比べられません。ハッシュはキーをバイトの順に返します。Linux の順は
+  バケットとランダムなシードで決まります。そのバッチは要素一つずつをバケットとして扱うので、
+  `in_batch` と `out_batch` は要素を数えます。マップにはメモリの上限も、Linux が断る
+  `memlock` の課金もなく（大きなマップも作れます。Linux は `ENOMEM` を返すことがあります）、
+  fdinfo の `memlock` は要素の大きさだけです。`BPF_F_MMAPABLE` は受け付けますが、マップの
+  `mmap` は `ENODEV`、マップの SHA-256（`bpf_map_info.hash`）は `EINVAL` です。
+  `kernel.unprivileged_bpf_disabled` はいつも 2 で、それを示す `/proc/sys/kernel` の
+  ファイルはありません。
 - **仮想 CPU**：`rseq` を登録したスレッドは、ホストの CPU ではなく仮想 CPU で動きます。
   そのため、領域と `getcpu` が示す CPU は、ホストがそのスレッドを動かしている CPU では
   ありません。`/proc/<pid>/stat` は CPU 0 を示します。クリティカルセクションは、CPU が
@@ -347,18 +388,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     ファイルシステムの ID だけです。
   - `/proc/sys/fs/mqueue` のファイルは、書ける者を開くときに確かめます。Linux は書き込みの
     たびに書く者を確かめ直します。また、サイズとして値の長さを示します。Linux は 0 です。
-  - セットで待っているセマフォーの操作は、1 つの待ち行列で待ち始めた順に試します（0 を
-    待つものが先）。Linux はセマフォーごとの待ち行列と、複数のセマフォーへの操作の待ち行列を
-    分けて持つので、両方の種類の待ちが混ざると、どちらも通れる 2 つの待ちのどちらが先に
-    通るかが違うことがあります。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
-  - `ptrace` には、まだシステムコール停止、イベント、シングルステップ、LISTEN が
-    ありません。`PTRACE_SYSCALL`、`PTRACE_SYSEMU`、`PTRACE_SINGLESTEP`、
-    `PTRACE_LISTEN`、`PTRACE_PEEKSIGINFO`、`PTRACE_GETSIGMASK`、`PTRACE_SETSIGMASK`、
-    `PTRACE_GET_SYSCALL_INFO` と、機能の一覧にないほかの要求は `EIO` を返し、
-    `PTRACE_SETOPTIONS` はイベントのオプション（`PTRACE_O_TRACE*`）を受け付けますが、
-    そのために止まりません。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
+  - `ptrace` には、まだシングルステップと LISTEN がありません。`PTRACE_SINGLESTEP`、
+    `PTRACE_SYSEMU_SINGLESTEP`、`PTRACE_LISTEN`、`PTRACE_PEEKSIGINFO`、`PTRACE_GETSIGMASK`、
+    `PTRACE_SETSIGMASK` と、機能の一覧にないほかの要求は `EIO` を返し、
+    `PTRACE_O_TRACESECCOMP` は受け付けますが止まりません（`SECCOMP_RET_TRACE` はトレーサーが
+    ないときと同じく `ENOSYS` です）。システムコール停止をシグナル付きで再開すると、Linux は
+    プロセスに送りますが、ここでは止まったスレッドが受けます。`PTRACE_EVENT_EXIT` が示す
+    ステータスにはコアダンプのビットがありません。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
     ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
     `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。ハードウェアブレークポイントは
     なく、デバッグレジスタは未使用として読め（DR6 は `0xffff0ff0`）、DR7 を 0 にする以外の
@@ -402,24 +440,38 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   そこのファイルはまたすべて root のものに見えます。
 - **mount と umount2 の一部**：`mount` が作るのは tmpfs とバインドマウントだけで、ほかの型は、
   それがないカーネルと同じく `ENODEV` です。それより前の Linux の確認を通ったあと、
-  `MS_MOVE`、`MS_REMOUNT`、`MS_SHARED`、`MS_UNBINDABLE`、読み出し専用の tmpfs
-  （`MS_RDONLY` や `ro` オプション）、tmpfs の `MS_NOSYMFOLLOW`、生成される `/proc` や
-  `/dev`（とその中のファイル）へのマウントやそのバインドマウントは `EOPNOTSUPP` で、
-  プログラムはできないことを知れます。`fsopen`、`fsconfig`、
+  `MS_MOVE`、tmpfs の `MS_NOSYMFOLLOW` とマウントし直しで付ける `MS_NOSYMFOLLOW`、
+  生成される `/proc` や `/dev`（とその中のファイル）へのマウントやそのバインドマウントは
+  `EOPNOTSUPP` で、プログラムはできないことを知れます。`fsopen`、`fsconfig`、
   `fsmount`、`fspick`、`move_mount`、`open_tree`、`mount_setattr`、`statmount`、
-  `listmount`、`pivot_root` はありません（`ENOSYS`）。何も伝播しません。どのマウントも
-  プライベートで、mountinfo に `shared:` や `master:` の欄はありません。Linux では共有
-  マウントの写しがスレーブになることがあります。tmpfs のマウントの `size`、`nr_blocks`、
-  `nr_inodes` は返しますが効かせません（メモリ上のファイルシステムが埋まるまで埋まらず、
-  その大きさで `ENOSPC` にはなりません）。`noexec`、`nosuid`、`nodev`、atime のフラグも
-  効きません。`huge`、`mpol`、`noswap`、クォータのオプションは受け取って表示しますが何も
-  せず、`casefold` と `strict_encoding` は、`CONFIG_UNICODE` なしのカーネルと同じく
-  `EINVAL` です。起動したときからあるマウント（ルートと `--mount` ごとのもの）は外せません。
+  `listmount`、`pivot_root` はありません（`ENOSYS`）。伝播の種類は持って表示しますが、
+  何も伝播しません。共有マウントの下でのマウントやその解除は、Linux の `propagate_mnt` と
+  `propagate_umount` のようにはピアやスレーブに届かないので、ピアには写しが見えません。
+  起動したときからあるマウントはプライベートです。Linux のルートは共有（`shared:1`。
+  ほかのユーザー名前空間のマウント名前空間では `master:1`）のことがよくあります。ピア
+  グループの番号はこのマシンのマウントの中だけで 1 から数えます。Linux ではホストのものと
+  共通です。`propagate_from:` は名前空間のルートから求め、`chroot` のあとの読み手の
+  ルートからではありません。効かせるのは `MS_RDONLY`（`EROFS`）だけです。tmpfs の
+  マウントの `size`、`nr_blocks`、`nr_inodes` は返しますが効かせません（メモリ上の
+  ファイルシステムが埋まるまで埋まらず、その大きさで `ENOSPC` にはなりません）。
+  `noexec`、`nosuid`、`nodev`、atime のフラグ、`sync`、`dirsync`、`mand` も効きません。
+  `huge`、`mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて
+  （マウントし直しで `noswap` やクォータを有効にしたり、クォータの上限を変えたりすると
+  `EINVAL`）表示しますが、何もせず、
+  `casefold` と `strict_encoding` は、`CONFIG_UNICODE` なしのカーネルと同じく `EINVAL`
+  です。`statfs` の `f_flags` に `ST_SYNCHRONOUS` と `ST_MANDLOCK` は出しません。消した
+  けれどまだ開いているファイルがあっても、読み出し専用へのマウントし直しは断りません
+  （Linux の `s_remove_count`）。起動したときからあるマウントのマウントし直しで変わるのは、
+  スーパーブロックが読み出し専用かどうかだけです。`hostfs` のものは共通のもののほかに
+  オプションを受け取らず（`EINVAL`）、ルートの tmpfs のオプションは確かめますが何も
+  残しません。`fchmod`、`fchown`、`futimens`、`fsetxattr` などの `EROFS` のための
+  ディスクリプタのマウントは、それを開いたパスから求めます。`MNT_EXPIRE` の印は、
+  マウントで終わる探索とその上のファイルを閉じることで消えますが、通り過ぎるだけの探索では
+  消えません。Linux ではどの `mntput` でも消えます。
+  起動したときからあるマウント（ルートと `--mount` ごとのもの）は外せません。
   `umount2` は、ロックされていれば（新しいユーザー名前空間が作ったマウント名前空間の中。
   Linux の `/` が rootfs の上のロックされたマウントであるのと同じく、ルートもロックされ
-  ます）`EINVAL`、そうでなければ `EBUSY` を返し、`MNT_DETACH` なしの呼び出し元のルートには
-  `EBUSY` を返します。Linux はそれを読み出し専用にマウントし直します。`MNT_EXPIRE` の印は
-  次の `MNT_EXPIRE` まで残ります。Linux ではマウントを使うたびに消えます。マウントは
+  ます）`EINVAL`、そうでなければ `EBUSY` を返します。マウントは
   マウントポイントのパスで持つので、名前の変更がディレクトリの下のマウントを動かすのは
   呼び出し元の名前空間の中だけで、ほかの名前空間の写しは古いパスに残り、ほかの名前空間で
   マウントポイントになっているディレクトリの `rmdir` はそのマウントを残します。Linux では
@@ -553,10 +605,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Linux では、開いていない記述子なら `EBADF` です。汎用 netlink のファミリーは `nlctrl` だけで、Linux ではホストの
   カーネルとモジュールのもの（`ethtool`、`nl80211`、`devlink` など）があります。そのため
   それらを引くと `ENOENT` で、それらがグループをいくつ使っても、ソケットのグループは 64 です。
-  `NETLINK_ROUTE` にあるのはリンク、アドレス、経路のリクエストだけです。
-  近隣、ルール、キューイング規律などは
-  `EOPNOTSUPP` で、入力の経路の引き当て（`ip route get ... iif` が送る `RTA_IIF`）、
-  `lo` の名前の変更、ほかの属性の設定もそうです。経路は
+  `NETLINK_ROUTE` にあるのはリンク、アドレス、経路のリクエストと、近隣のダンプと取得
+  だけです。近隣の追加と削除（`RTM_NEWNEIGH`、`RTM_DELNEIGH`）、近隣の表
+  （`RTM_GETNEIGHTBL`）、ブリッジの転送データベース（`AF_BRIDGE` の `RTM_GETNEIGH`）、
+  ルール、キューイング規律などは `EOPNOTSUPP` で、入力の経路の引き当て
+  （`ip route get ... iif` が送る `RTA_IIF`）、`lo` の名前の変更、ほかの属性の設定も
+  そうです。経路は
   `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、
   カプセル化、ネクストホップのオブジェクト、
   realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の
@@ -595,8 +649,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `lo` を通る IPv4 の経路は、Linux と同じく何も伝えません。近隣を作るのは UDP と TCP の
   ハンドシェイクだけです。paludarium が `lo` に送るパケットはそれだけです（いっぱいの
   backlog に再送したハンドシェイクは、その答えの近隣を作りません）。近隣は時間切れでは
-  消えません（`gc_thresh1` に届きません）。近隣のダンプはなく（`RTM_GETNEIGH` は
-  `EOPNOTSUPP`）、キャッシュの情報はそれぞれを作ったときから数えます。
+  消えません（`gc_thresh1` に届きません）。ダンプはファミリーごとに新しい近隣から
+  返します。Linux はハッシュ表の順に返し、その順は乱数のキーで決まります。キャッシュの
+  情報はそれぞれを作ったときから数えます。
   機能のページに挙げていないオプションは `ENOPROTOOPT` です。名前空間の ID は
   その名前空間がなくなると消えますが、それを伝える `RTM_DELNSID` は送りません。
   ほかの名前空間のデバイスがないので、Linux の `peernet2id_alloc` のように ID を

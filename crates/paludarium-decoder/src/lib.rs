@@ -451,6 +451,10 @@ mnemonics!(
     Fninit,
     Fnstenv,
     Fldenv,
+    Fnsave,
+    Frstor,
+    Fbld,
+    Fbstp,
     Wait,
     Stmxcsr,
     Mfence,
@@ -1032,6 +1036,13 @@ mod tests {
         assert_eq!(size(&[0xdd, 0x00]), 8);
         assert_eq!(size(&[0xdb, 0x28]), 10);
         assert_eq!(size(&[0xd9, 0x30]), 28);
+        // The 16-bit environment and state, fnsave, frstor, fbld and fbstp.
+        assert_eq!(size(&[0x66, 0xd9, 0x30]), 14);
+        assert_eq!(size(&[0x66, 0xd9, 0x20]), 14);
+        assert_eq!(size(&[0xdd, 0x30]), 108);
+        assert_eq!(size(&[0x66, 0xdd, 0x20]), 94);
+        assert_eq!(size(&[0xdf, 0x20]), 10);
+        assert_eq!(size(&[0xdf, 0x30]), 10);
         // The waiting forms are a `wait` and the rest.
         let waiting = at(&[0x9b, 0xd9, 0x38]);
         assert_eq!((waiting.mnemonic, waiting.len), (Mnemonic::Wait, 1));

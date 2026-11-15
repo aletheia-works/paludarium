@@ -1,10 +1,11 @@
 //! System V semaphores: `semget`, `semop`, `semtimedop` and `semctl`, in
 //! the calling thread's IPC namespace, as Linux's `ipc/sem.c` has them.
 //!
-//! An operation that cannot go through waits in its set's queue, in the
-//! order the waits began. Whatever changes a set's values then tries the
-//! queue, as Linux's `do_smart_update`: the waits for zero first, then the
-//! others, from the start again after each one that changed a value. An
+//! An operation that cannot go through waits in one of its set's queues,
+//! which are Linux's: each semaphore's for the operations on it alone, and
+//! the set's for those on several ([`Queues`]). Whatever changes a set's
+//! values then tries them, as Linux's `do_smart_update`: the waits for zero
+//! on the semaphores it made 0, then the waits to change values. An
 //! operation done for a waiting thread is done as that thread's: with its
 //! process ID and its undo list.
 //!
@@ -126,7 +127,7 @@ impl Wake {
     }
 }
 
-/// An operation waiting in a set's queue (`struct sem_queue`).
+/// An operation waiting in one of a set's queues (`struct sem_queue`).
 struct Waiting {
     ops: Vec<Op>,
     /// The undo list it adjusts.
@@ -139,6 +140,146 @@ struct Waiting {
     wake: Arc<Wake>,
 }
 
+impl Waiting {
+    /// Whether it names more than one operation (Linux's complex one).
+    fn complex(&self) -> bool {
+        self.ops.len() > 1
+    }
+}
+
+/// A set's waiting operations, in Linux's lists. A simple operation, one
+/// that names one semaphore, waits in that semaphore's queue of changes
+/// (`pending_alter`) or of waits for zero (`pending_const`); a complex
+/// one waits in the set's queue of each kind. While any complex operation
+/// waits, the simple changes wait in the set's queue too, which they join
+/// in front of the first one (`merge_queues`) and leave once none is left
+/// (`unmerge_queues`).
+struct Queues {
+    /// Each semaphore's simple changes and waits for zero.
+    alter: Vec<Vec<Waiting>>,
+    zero: Vec<Vec<Waiting>>,
+    /// The set's.
+    set_alter: Vec<Waiting>,
+    set_zero: Vec<Waiting>,
+    /// How many complex operations wait (`complex_count`).
+    complex: usize,
+}
+
+impl Queues {
+    fn new(count: usize) -> Self {
+        Self {
+            alter: (0..count).map(|_| Vec::new()).collect(),
+            zero: (0..count).map(|_| Vec::new()).collect(),
+            set_alter: Vec::new(),
+            set_zero: Vec::new(),
+            complex: 0,
+        }
+    }
+    /// Semaphore `n`'s queue, or the set's for `None`, of changes or of
+    /// waits for zero.
+    fn list(&mut self, n: Option<usize>, zero: bool) -> &mut Vec<Waiting> {
+        match (n, zero) {
+            (Some(n), false) => &mut self.alter[n],
+            (Some(n), true) => &mut self.zero[n],
+            (None, false) => &mut self.set_alter,
+            (None, true) => &mut self.set_zero,
+        }
+    }
+    fn all(&self) -> impl Iterator<Item = &Waiting> {
+        self.alter
+            .iter()
+            .chain(&self.zero)
+            .flatten()
+            .chain(&self.set_alter)
+            .chain(&self.set_zero)
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.all().next().is_none()
+    }
+    /// Puts a wait at the end of its queue, as `do_semtimedop`.
+    fn push(&mut self, waiting: Waiting) {
+        if waiting.complex() {
+            if self.complex == 0 {
+                // Each semaphore's changes go in front of those before,
+                // so the last semaphore's come first (`list_splice_init`).
+                for alter in &mut self.alter {
+                    let mut moved = std::mem::take(alter);
+                    moved.append(&mut self.set_alter);
+                    self.set_alter = moved;
+                }
+            }
+            self.complex += 1;
+            if waiting.alters {
+                self.set_alter.push(waiting);
+            } else {
+                self.set_zero.push(waiting);
+            }
+        } else {
+            let n = usize::from(waiting.ops[0].num);
+            if !waiting.alters {
+                self.zero[n].push(waiting);
+            } else if self.complex > 0 {
+                self.set_alter.push(waiting);
+            } else {
+                self.alter[n].push(waiting);
+            }
+        }
+    }
+    /// Takes the wait at `at` out of its queue (`unlink_queue`).
+    fn take(&mut self, n: Option<usize>, zero: bool, at: usize) -> Waiting {
+        let waiting = self.list(n, zero).remove(at);
+        if waiting.complex() {
+            self.complex -= 1;
+        }
+        waiting
+    }
+    /// Takes the wait that `wake` tells out of its queue, if it is there.
+    fn forget(&mut self, wake: &Arc<Wake>) {
+        let count = self.alter.len();
+        let lists = (0..count)
+            .flat_map(|n| [(Some(n), false), (Some(n), true)])
+            .chain([(None, false), (None, true)]);
+        for (n, zero) in lists {
+            if let Some(at) = self
+                .list(n, zero)
+                .iter()
+                .position(|waiting| Arc::ptr_eq(&waiting.wake, wake))
+            {
+                self.take(n, zero, at);
+                return;
+            }
+        }
+    }
+    /// Gives the simple changes in the set's queue back to their
+    /// semaphores' once no complex operation waits, as Linux does as it
+    /// lets go of the set (`unmerge_queues` in `sem_unlock`).
+    fn settle(&mut self) {
+        if self.complex > 0 {
+            return;
+        }
+        for waiting in std::mem::take(&mut self.set_alter) {
+            let n = usize::from(waiting.ops[0].num);
+            self.alter[n].push(waiting);
+        }
+    }
+}
+
+/// Tells a wait how its operation went, and whether it was done.
+fn tell(waiting: &Waiting, attempt: &Attempt) -> bool {
+    match attempt {
+        Attempt::Done => {
+            waiting.wake.tell(0);
+            true
+        }
+        Attempt::Failed(error) => {
+            waiting.wake.tell(-i64::from(error.0));
+            false
+        }
+        Attempt::Blocked(_) => false,
+    }
+}
+
 struct Set {
     id: i32,
     perm: Perm,
@@ -147,7 +288,7 @@ struct Set {
     semaphores: Vec<Semaphore>,
     /// The adjustments of each undo list that has any for it, by list.
     undos: BTreeMap<u64, Vec<i32>>,
-    queue: Vec<Waiting>,
+    queues: Queues,
 }
 
 /// How an operation went.
@@ -223,61 +364,116 @@ fn attempt(
 }
 
 impl Set {
-    /// Tries the waiting operations after a change, as Linux's
-    /// `do_smart_update`: those that change no value first, then the
-    /// others, each in the order it began to wait, and again from the
-    /// start after one that changed a value. Each that is done or fails
-    /// leaves the queue and is told. Whether any was done, which counts as
-    /// an operation for `sem_otime`.
-    fn update(&mut self, now: i64) -> bool {
+    /// Tries the wait at `at` of a queue: one that still waits stays, and
+    /// one that is done or fails leaves it, as how it went.
+    fn try_wait(&mut self, n: Option<usize>, zero: bool, at: usize) -> (Attempt, Option<Waiting>) {
+        let waiting = &mut self.queues.list(n, zero)[at];
+        let attempt = attempt(
+            &mut self.semaphores,
+            &mut self.undos,
+            &waiting.ops,
+            waiting.undo,
+            &waiting.pid,
+        );
+        if let Attempt::Blocked(blocking) = attempt {
+            waiting.blocking = blocking;
+            return (attempt, None);
+        }
+        (attempt, Some(self.queues.take(n, zero, at)))
+    }
+    /// Tries a queue of waits for zero, each once in order
+    /// (`wake_const_ops`). Whether any was done.
+    fn wake_zero(&mut self, n: Option<usize>) -> bool {
         let mut completed = false;
-        'again: loop {
-            for alters in [false, true] {
-                let mut at = 0;
-                while at < self.queue.len() {
-                    let waiting = &mut self.queue[at];
-                    if waiting.alters != alters {
-                        at += 1;
-                        continue;
-                    }
-                    match attempt(
-                        &mut self.semaphores,
-                        &mut self.undos,
-                        &waiting.ops,
-                        waiting.undo,
-                        &waiting.pid,
-                    ) {
-                        Attempt::Blocked(blocking) => {
-                            waiting.blocking = blocking;
-                            at += 1;
-                        }
-                        Attempt::Done => {
-                            let waiting = self.queue.remove(at);
-                            waiting.wake.tell(0);
-                            completed = true;
-                            if waiting.alters {
-                                continue 'again;
-                            }
-                        }
-                        Attempt::Failed(error) => {
-                            let waiting = self.queue.remove(at);
-                            waiting.wake.tell(-i64::from(error.0));
+        let mut at = 0;
+        while at < self.queues.list(n, true).len() {
+            match self.try_wait(n, true, at) {
+                (_, None) => at += 1,
+                (attempt, Some(waiting)) => completed |= tell(&waiting, &attempt),
+            }
+        }
+        completed
+    }
+    /// Tries the waits for zero on the semaphores that `ops` name, or on
+    /// all for `None`, that are 0, then the set's if any was
+    /// (`do_smart_wakeup_zero`). Whether any was done.
+    fn wake_zeros(&mut self, ops: Option<&[Op]>) -> bool {
+        let named: Vec<usize> = match ops {
+            Some(ops) => ops.iter().map(|op| usize::from(op.num)).collect(),
+            None => (0..self.semaphores.len()).collect(),
+        };
+        let mut completed = false;
+        let mut got_zero = false;
+        for n in named {
+            if self.semaphores[n].value == 0 {
+                got_zero = true;
+                completed |= self.wake_zero(Some(n));
+            }
+        }
+        if got_zero {
+            completed |= self.wake_zero(None);
+        }
+        completed
+    }
+    /// Tries a queue of changes in order (`update_queue`): after each one
+    /// done, the waits for zero on what it named, and the queue again
+    /// from its start if it was complex or the set's queue of changes has
+    /// any. A semaphore's queue stops once its value is 0, as it holds
+    /// only decreases. Whether any was done.
+    fn update_queue(&mut self, n: Option<usize>) -> bool {
+        let mut completed = false;
+        let mut at = 0;
+        while at < self.queues.list(n, false).len() {
+            if n.is_some_and(|n| self.semaphores[n].value == 0) {
+                break;
+            }
+            match self.try_wait(n, false, at) {
+                (_, None) => at += 1,
+                (attempt, Some(waiting)) => {
+                    if tell(&waiting, &attempt) {
+                        completed = true;
+                        self.wake_zeros(Some(&waiting.ops));
+                        if !self.queues.set_alter.is_empty() || waiting.complex() {
+                            at = 0;
                         }
                     }
                 }
             }
-            break;
         }
-        if completed {
+        completed
+    }
+    /// Tries the waits after a change of the semaphores that `ops` name,
+    /// or of any for `None`, at `now`, as Linux's `do_smart_update`: the
+    /// waits for zero on those that are 0, then the set's queue of changes
+    /// if it has any, else the queues of those that `ops` increase (or of
+    /// all). The set's `sem_otime` is `now` if `otime`, or if any was done.
+    /// Whether any was.
+    fn update(&mut self, ops: Option<&[Op]>, otime: bool, now: i64) -> bool {
+        let mut completed = self.wake_zeros(ops);
+        if !self.queues.set_alter.is_empty() {
+            completed |= self.update_queue(None);
+        } else if let Some(ops) = ops {
+            for op in ops {
+                if op.op > 0 {
+                    completed |= self.update_queue(Some(usize::from(op.num)));
+                }
+            }
+        } else {
+            for n in 0..self.semaphores.len() {
+                completed |= self.update_queue(Some(n));
+            }
+        }
+        if otime || completed {
             self.otime = now;
         }
+        self.queues.settle();
         completed
     }
     /// How many waits wait on semaphore `n` going to 0 (`zero`) or up,
     /// as Linux's `count_semcnt` counts them by the operation each waits on.
     fn waiting_on(&self, n: usize, zero: bool) -> u64 {
-        self.queue
-            .iter()
+        self.queues
+            .all()
             .filter(|waiting| {
                 let op = waiting.ops[waiting.blocking];
                 usize::from(op.num) == n && if zero { op.op == 0 } else { op.op < 0 }
@@ -286,7 +482,7 @@ impl Set {
     }
     /// Tells every wait it is removed (`freeary`).
     fn remove(self) {
-        for waiting in self.queue {
+        for waiting in self.queues.all() {
             waiting.wake.tell(-i64::from(EIDRM.0));
         }
     }
@@ -342,8 +538,7 @@ impl UndoList {
                     semaphore.pid = pid.clone();
                 }
             }
-            set.update(now);
-            set.otime = now;
+            set.update(None, true, now);
         }
     }
     /// Keeps adjustments in `set` of `table`, from 0 (`find_alloc_undo`).
@@ -420,7 +615,7 @@ fn semget(c: &Context<'_>, key: i32, count: i32, flag: i32) -> Result<u64, Errno
             ctime: ipc::now(c),
             semaphores: vec![Semaphore::default(); count as usize],
             undos: BTreeMap::new(),
-            queue: Vec::new(),
+            queues: Queues::new(count as usize),
         },
     );
     table.used += count as u64;
@@ -524,9 +719,10 @@ fn semtimedop(
         let number = undo.as_ref().map(|list| list.number);
         match attempt(&mut set.semaphores, &mut set.undos, &ops, number, &pid) {
             Attempt::Done => {
-                set.otime = now;
                 if alters {
-                    set.update(now);
+                    set.update(Some(&ops), true, now);
+                } else {
+                    set.otime = now;
                 }
                 return Ok(0);
             }
@@ -536,7 +732,7 @@ fn semtimedop(
                     status: AtomicI64::new(WAITING),
                     token: WaitToken::default(),
                 });
-                set.queue.push(Waiting {
+                set.queues.push(Waiting {
                     ops,
                     undo: number,
                     pid,
@@ -576,8 +772,8 @@ fn wait(
             return told(status);
         }
         if let Ok(set) = table.checked(id) {
-            set.queue
-                .retain(|waiting| !Arc::ptr_eq(&waiting.wake, wake));
+            set.queues.forget(wake);
+            set.queues.settle();
         }
         Err(error)
     };
@@ -840,7 +1036,7 @@ fn main(c: &Context<'_>, id: i32, n: i32, cmd: i32, arg: u64) -> Result<u64, Err
                 adjustments.fill(0);
             }
             set.ctime = now;
-            set.update(now);
+            set.update(None, false, now);
             Ok(0)
         }
         _ => {
@@ -886,7 +1082,7 @@ fn setval(c: &Context<'_>, id: i32, n: i32, value: i32) -> Result<u64, Errno> {
     }
     set.semaphores[n] = Semaphore { value, pid };
     set.ctime = now;
-    set.update(now);
+    set.update(None, false, now);
     Ok(0)
 }
 
@@ -918,7 +1114,7 @@ mod tests {
                 })
                 .collect(),
             undos: BTreeMap::new(),
-            queue: Vec::new(),
+            queues: Queues::new(values.len()),
         }
     }
     fn values(set: &Set) -> Vec<i32> {
@@ -934,7 +1130,7 @@ mod tests {
             status: AtomicI64::new(WAITING),
             token: WaitToken::default(),
         });
-        set.queue.push(Waiting {
+        set.queues.push(Waiting {
             alters: ops.iter().any(|op| op.op != 0),
             ops,
             undo: None,
@@ -1095,13 +1291,13 @@ mod tests {
         assert_eq!((s.waiting_on(0, false), s.waiting_on(1, true)), (3, 1));
         assert_eq!(s.waiting_on(1, false), 0);
         s.semaphores[0].value = 2;
-        assert!(s.update(5));
+        assert!(s.update(None, false, 5));
         // The first takes both; the second waits on.
         assert_eq!(first.status.load(Ordering::SeqCst), 0);
         assert_eq!(second.status.load(Ordering::SeqCst), WAITING);
         assert_eq!(s.otime, 5);
         s.semaphores[0].value = 2;
-        assert!(s.update(6));
+        assert!(s.update(None, false, 6));
         // The second goes through, then the one on both, which makes
         // semaphore 1 zero for the wait for it.
         assert_eq!(second.status.load(Ordering::SeqCst), 0);
@@ -1109,7 +1305,72 @@ mod tests {
         assert_eq!(zero.status.load(Ordering::SeqCst), 0);
         assert_eq!(values(&s), [0, 0]);
         assert_eq!(s.semaphores[1].pid, KeptPid::of(1, 12));
-        assert!(s.queue.is_empty());
+        assert!(s.queues.is_empty());
+    }
+
+    fn pids(list: &[Waiting]) -> Vec<KeptPid> {
+        list.iter().map(|waiting| waiting.pid.clone()).collect()
+    }
+
+    #[test]
+    fn simple_changes_join_the_set_queue_while_a_complex_operation_waits() {
+        let mut s = set(&[0, 0]);
+        wait_for(&mut s, vec![op(0, -1, 0)], 1);
+        wait_for(&mut s, vec![op(1, -1, 0)], 2);
+        // A complex change takes the others in, the last semaphore's
+        // first, and a simple one that comes after it waits behind it.
+        let complex = wait_for(&mut s, vec![op(0, -1, 0), op(1, -1, 0)], 3);
+        let later = wait_for(&mut s, vec![op(1, -1, 0), op(0, -1, 0)], 4);
+        wait_for(&mut s, vec![op(0, -2, 0)], 5);
+        assert_eq!(
+            pids(&s.queues.set_alter),
+            [2, 1, 3, 4, 5].map(|pid| KeptPid::of(1, pid))
+        );
+        assert!(s.queues.alter.iter().all(Vec::is_empty));
+        assert_eq!((s.waiting_on(0, false), s.waiting_on(1, false)), (3, 2));
+        // Once no complex operation is left, the simple ones go back.
+        s.queues.forget(&complex);
+        s.queues.settle();
+        assert_eq!(s.queues.complex, 1);
+        s.queues.forget(&later);
+        s.queues.settle();
+        assert_eq!(s.queues.complex, 0);
+        assert!(s.queues.set_alter.is_empty());
+        assert_eq!(
+            pids(&s.queues.alter[0]),
+            [1, 5].map(|pid| KeptPid::of(1, pid))
+        );
+        assert_eq!(pids(&s.queues.alter[1]), [KeptPid::of(1, 2)]);
+        // A complex wait for zero counts as complex too.
+        s.semaphores[1].value = 1;
+        let zero = wait_for(&mut s, vec![op(0, 0, 0), op(1, 0, 0)], 6);
+        assert_eq!((s.queues.complex, s.queues.set_alter.len()), (1, 3));
+        assert_eq!(pids(&s.queues.set_zero), [KeptPid::of(1, 6)]);
+        assert_eq!(s.waiting_on(1, true), 1);
+        s.queues.forget(&zero);
+        s.queues.settle();
+        assert_eq!((s.queues.complex, s.queues.set_alter.len()), (0, 0));
+    }
+
+    #[test]
+    fn a_change_tries_only_the_queues_of_what_it_increases_or_makes_zero() {
+        let mut s = set(&[0, 1]);
+        let down = wait_for(&mut s, vec![op(0, -1, 0)], 1);
+        let zero = wait_for(&mut s, vec![op(1, 0, 0)], 2);
+        s.semaphores[0].value = 1;
+        s.semaphores[1].value = 0;
+        // A decrease of semaphore 0 that left it 1 lets neither through.
+        assert!(!s.update(Some(&[op(0, -1, 0)]), true, 3));
+        assert_eq!(s.otime, 3);
+        assert_eq!(down.status.load(Ordering::SeqCst), WAITING);
+        assert_eq!(zero.status.load(Ordering::SeqCst), WAITING);
+        assert!(s.update(Some(&[op(1, -1, 0)]), false, 4));
+        assert_eq!(zero.status.load(Ordering::SeqCst), 0);
+        assert_eq!(down.status.load(Ordering::SeqCst), WAITING);
+        assert!(s.update(Some(&[op(0, 1, 0)]), false, 5));
+        assert_eq!(down.status.load(Ordering::SeqCst), 0);
+        assert_eq!(s.otime, 5);
+        assert!(s.queues.is_empty());
     }
 
     #[test]

@@ -118,6 +118,7 @@ static void nl_ext_show(const unsigned char *buf, long n) {
                 case 1: printf(" msg=\"%.*s\"", vlen > 0 ? vlen - 1 : 0, v); break;
                 case 2: printf(" offs=%u", word); break;
                 case 4: printf(" policy{"); nl_ext_policy(v, vlen); printf(" }"); break;
+                case 5: printf(" miss-type=%u", word); break;
                 default: printf(" %u:%d", kind & 0x3fff, vlen); break;
                 }
                 at += (alen + 3) & ~3u;
@@ -1493,6 +1494,7 @@ static void nl_address_attribute(unsigned short type, const unsigned char *v, in
 /* Receives on `fd` until NLMSG_DONE or an error: prints each message of
    the answer to request `seq` from `port`, whatever datagrams carry them,
    and returns how many came, or -errno. */
+static void nl_neighbour_attribute(unsigned short type, const unsigned char *v, int len);
 static long nl_answer(int fd, long seq, unsigned port, const char *label) {
     long messages = 0;
     for (;;) {
@@ -1565,6 +1567,14 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
                 printf(" family=%u prefix=%u flags=%#x scope=%u index=%d attributes", body[0], body[1], body[2],
                        body[3], index);
                 nl_attributes(body + 8, body_len - 8, nl_address_attribute);
+            } else if (h->type == 28 && body_len >= 12) {
+                int index;
+                unsigned short state;
+                memcpy(&index, body + 4, 4);
+                memcpy(&state, body + 8, 2);
+                printf(" neigh family=%u index=%d state=%#x flags=%#x type=%u attributes", body[0], index, state,
+                       body[10], body[11]);
+                nl_attributes(body + 12, body_len - 12, nl_neighbour_attribute);
             }
             printf("\n");
         }
@@ -8934,6 +8944,406 @@ static int binds_case(void) {
     return 0;
 }
 
+/* The remounts case: MS_REMOUNT, read-only mounts and propagation types in
+   a mount namespace of a user namespace of its own, where the caller is
+   root. Each call is printed in turn as `name=errno`. Peer group numbers
+   are printed as letters in the order they are first seen; nothing of the
+   machine's own mount table is printed. */
+static char rm_base[] = "/tmp/paludarium-remounts-XXXXXX";
+static void rm_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", rm_base, name); }
+#define RM(name, call) printf(" %s=%d", name, mt_result(call))
+static long rm_groups[32];
+static char rm_letter(long id) {
+    for (int i = 0; i < 32; i++) {
+        if (rm_groups[i] == id) return (char)('A' + i);
+        if (!rm_groups[i]) {
+            rm_groups[i] = id;
+            return (char)('A' + i);
+        }
+    }
+    return '?';
+}
+/* The mountinfo line of the mount at `point` (the last one there): the
+   mount's ro or rw and options, its optional fields with peer groups as
+   letters, the superblock's ro or rw, and whether its options have
+   `want`. */
+static void rm_info(const char *label, const char *point, const char *want) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    char line[4096], shown[512] = "none";
+    while (f && fgets(line, sizeof line, f)) {
+        char at[1024], opts[512];
+        int used = 0;
+        if (sscanf(line, "%*d %*d %*s %*s %1023s %511s %n", at, opts, &used) != 2 || strcmp(at, point)) continue;
+        char tags[256] = "", *p = line + used;
+        while (*p && strncmp(p, "- ", 2)) {
+            char tag[64];
+            int n = 0;
+            if (sscanf(p, "%63s %n", tag, &n) != 1) break;
+            long id;
+            char kind[16];
+            if (sscanf(tag, "%15[^:]:%ld", kind, &id) == 2)
+                snprintf(tags + strlen(tags), sizeof tags - strlen(tags), " %s:%c", kind, rm_letter(id));
+            else
+                snprintf(tags + strlen(tags), sizeof tags - strlen(tags), " %s", tag);
+            p += n;
+        }
+        char sb[512] = "";
+        if (*p) sscanf(p, "- %*s %*s %511s", sb);
+        snprintf(shown, sizeof shown, "%s [%s] sb=%.2s%s", opts, tags[0] ? tags + 1 : "", sb,
+                 want && strstr(sb, want) ? " want" : "");
+    }
+    if (f) fclose(f);
+    printf("%s %s\n", label, shown);
+}
+/* The fourth field of the /proc/self/mounts line of `point`: ro or rw. */
+static void rm_mounts(const char *point) {
+    FILE *f = fopen("/proc/self/mounts", "r");
+    char line[4096], state[3] = "--";
+    while (f && fgets(line, sizeof line, f)) {
+        char at[1024], opts[512];
+        if (sscanf(line, "%*s %1023s %*s %511s", at, opts) == 2 && !strcmp(at, point)) memcpy(state, opts, 2);
+    }
+    if (f) fclose(f);
+    printf("mounts %s\n", state);
+}
+static long rm_statfs(const char *path) {
+    struct statfs fs;
+    return statfs(path, &fs) ? -errno : (long)fs.f_flags;
+}
+static int rm_open(const char *path, int flags) {
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return -1;
+    close(fd);
+    return 0;
+}
+static void rm_name(char *out, const char *m, const char *name) { snprintf(out, 300, "%s/%s", m, name); }
+/* Each call that writes, on a read-only mount at `m`, where `m/f` is a
+   file with data and `m/d` a directory. */
+static void rm_writes(const char *m) {
+    char f[300], d[300], g[300], nw[300], miss[300], deep[300], under[300], dot[300], dotdot[300], out[256];
+    rm_name(f, m, "f");
+    rm_name(d, m, "d");
+    rm_name(g, m, "g");
+    rm_name(nw, m, "new");
+    rm_name(miss, m, "missing");
+    rm_name(deep, m, "missing/x");
+    rm_name(under, m, "f/x");
+    rm_name(dot, m, "d/.");
+    rm_name(dotdot, m, "d/..");
+    rm_path(out, "out");
+    printf("open");
+    RM("wronly", rm_open(f, O_WRONLY));
+    RM("rdonly", rm_open(f, O_RDONLY));
+    RM("creat", rm_open(nw, O_WRONLY | O_CREAT));
+    RM("excl", rm_open(f, O_WRONLY | O_CREAT | O_EXCL));
+    RM("creat-there", rm_open(f, O_RDONLY | O_CREAT));
+    RM("trunc", rm_open(f, O_RDONLY | O_TRUNC));
+    RM("dir", rm_open(d, O_WRONLY));
+    RM("deep", rm_open(deep, O_WRONLY | O_CREAT));
+    RM("tmpfile", rm_open(d, O_TMPFILE | O_WRONLY));
+    printf("\nmkdir");
+    RM("there", mkdir(d, 0755));
+    RM("new", mkdir(nw, 0755));
+    RM("deep", mkdir(deep, 0755));
+    RM("under-file", mkdir(under, 0755));
+    printf("\nremove");
+    RM("unlink", unlink(f));
+    RM("missing", unlink(miss));
+    RM("unlink-dot", unlink(dot));
+    RM("rmdir", rmdir(d));
+    RM("dot", rmdir(dot));
+    RM("dotdot", rmdir(dotdot));
+    printf("\nrename");
+    RM("rename", rename(f, g));
+    RM("missing", rename(miss, g));
+    RM("across", rename(f, out));
+    printf("\nmake");
+    RM("link", link(f, g));
+    RM("there", link(f, d));
+    RM("symlink", symlink("x", g));
+    RM("fifo", mknod(g, S_IFIFO | 0644, 0));
+    RM("chr", mknod(g, S_IFCHR | 0644, makedev(1, 3)));
+    printf("\ntruncate");
+    RM("file", truncate(f, 0));
+    RM("dir", truncate(d, 0));
+    RM("missing", truncate(miss, 0));
+    struct timespec omit[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
+    printf("\nattributes");
+    RM("chmod", chmod(f, 0600));
+    RM("missing", chmod(miss, 0600));
+    RM("chown", chown(f, -1, -1));
+    RM("utimens", utimensat(AT_FDCWD, f, NULL, 0));
+    RM("omit", utimensat(AT_FDCWD, f, omit, 0));
+    RM("setxattr", syscall(SYS_setxattr, f, "user.x", "1", 1, 0));
+    RM("removexattr", syscall(SYS_removexattr, f, "user.x"));
+    RM("access-write", access(f, W_OK));
+    RM("access-read", access(f, R_OK));
+    int fd = open(f, O_RDONLY);
+    printf("\ndescriptor");
+    RM("fchmod", fchmod(fd, 0600));
+    RM("fchown", fchown(fd, -1, -1));
+    RM("futimens", futimens(fd, NULL));
+    RM("fsetxattr", syscall(SYS_fsetxattr, fd, "user.x", "1", 1, 0));
+    close(fd);
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s/sock", m);
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    RM("bind", bind(sock, (struct sockaddr *)&addr, sizeof addr));
+    close(sock);
+    char buf[16] = "";
+    printf(" read=%d %s\n", bd_read(f, buf, sizeof buf), buf);
+}
+/* In a user namespace below this one: the copy of `m`, read-only and
+   nosuid, keeps those flags and its access-time ones. */
+static int rm_locked(void) {
+    char m[256];
+    rm_path(m, "m");
+    if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) return 80;
+    printf("locked");
+    RM("rw", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_NOSUID, NULL));
+    RM("suid", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL));
+    RM("atime", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_STRICTATIME, NULL));
+    RM("same", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID, NULL));
+    RM("sb", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY | MS_NOSUID, NULL));
+    printf("\n");
+    return 0;
+}
+/* Chrooted into a tmpfs mount, `umount2("/")` remounts its superblock
+   read-only (`do_umount_root`). */
+static int rm_root(void) {
+    char r[256];
+    rm_path(r, "r");
+    if (chroot(r) || chdir("/")) return 81;
+    printf("root");
+    RM("umount", umount2("/", 0));
+    RM("mkdir", mkdir("/x", 0755));
+    printf("\n");
+    return 0;
+}
+static int rm_inner(void) {
+    char m[256], b[256], c[256], f[256], d[256], bf[256], bn[256], p1[256], p2[256], p3[256], q[256], qr[256],
+        qs[256], e[256], r[256], cd[256];
+    rm_path(m, "m");
+    rm_path(b, "b");
+    rm_path(c, "c");
+    rm_path(f, "m/f");
+    rm_path(d, "m/d");
+    rm_path(bf, "b/f");
+    rm_path(bn, "b/n");
+    rm_path(p1, "p1");
+    rm_path(p2, "p2");
+    rm_path(p3, "p3");
+    rm_path(q, "q");
+    rm_path(qr, "q/r");
+    rm_path(qs, "q/s");
+    rm_path(e, "e");
+    rm_path(r, "r");
+    rm_path(cd, "c/d");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    printf("tmpfs");
+    RM("mount", mount("none", m, "tmpfs", MS_NOSUID | MS_NOATIME, "size=1m"));
+    printf("\n");
+    mt_write_new(f, "data");
+    mkdir(d, 0755);
+    /* A mount's flags alone: read-only, keeping noatime, dropping nosuid. */
+    printf("bind");
+    RM("ro", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL));
+    printf("\n");
+    rm_info("ro", m, NULL);
+    rm_mounts(m);
+    printf("statfs=%#lx\n", rm_statfs(m));
+    rm_writes(m);
+    printf("remount");
+    RM("not-root", mount(NULL, d, NULL, MS_REMOUNT | MS_BIND, NULL));
+    RM("rw", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_NOATIME, NULL));
+    RM("write", rm_open(f, O_WRONLY));
+    printf("\n");
+    rm_info("rw", m, NULL);
+    /* A file open for writing keeps it writable. */
+    int fd = open(f, O_WRONLY);
+    printf("writer");
+    RM("ro", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL));
+    RM("sb", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, NULL));
+    close(fd);
+    RM("closed", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID, NULL));
+    printf("\n");
+    rm_info("ro-nosuid", m, NULL);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) _exit(rm_locked());
+    printf("locked=%d\n", reaped(child));
+    /* The superblock: a bind mount of it is read-only too. */
+    printf("superblock");
+    RM("unlocked", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND, NULL));
+    RM("bind", mount(m, b, NULL, MS_BIND, NULL));
+    RM("ro", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, "size=2m"));
+    printf("\n");
+    rm_info("sb m", m, ",size=2048k");
+    rm_info("sb b", b, ",size=2048k");
+    printf("via b");
+    RM("write", rm_open(bf, O_WRONLY));
+    RM("mkdir", mkdir(bn, 0755));
+    RM("rw", mount(NULL, b, NULL, MS_REMOUNT | MS_BIND, NULL));
+    RM("write", rm_open(bf, O_WRONLY));
+    printf("\nstatfs b=%#lx\n", rm_statfs(b));
+    /* Options: those a remount may not change, and tmpfs's own. */
+    printf("options");
+    RM("dirsync", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, "dirsync"));
+    RM("bogus", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, "bogus"));
+    RM("noswap", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, "noswap"));
+    RM("ignored", mount(NULL, m, NULL, MS_DIRSYNC | MS_REMOUNT | MS_RDONLY, NULL));
+    printf("\n");
+    rm_info("still", m, ",dirsync");
+    printf("options");
+    RM("mode", mount(NULL, m, NULL, MS_REMOUNT, "mode=700"));
+    RM("nr_inodes", mount(NULL, m, NULL, MS_REMOUNT, "nr_inodes=1000"));
+    printf("\n");
+    rm_info("sb rw", m, ",nr_inodes=1000");
+    struct stat st;
+    printf("mode=%o", stat(m, &st) ? 0 : st.st_mode & 07777);
+    RM("write", rm_open(f, O_WRONLY));
+    fd = open(f, O_WRONLY);
+    RM("writer-sb", mount(NULL, b, NULL, MS_REMOUNT | MS_RDONLY, NULL));
+    close(fd);
+    RM("umount-b", umount2(b, 0));
+    RM("umount-m", umount2(m, 0));
+    printf("\n");
+    /* A read-only tmpfs: MS_RDONLY makes the mount so too, `ro` only the
+       superblock. */
+    printf("new");
+    RM("ro", mount("none", c, "tmpfs", MS_RDONLY, NULL));
+    RM("mkdir", mkdir(cd, 0755));
+    printf("\n");
+    rm_info("new ro", c, NULL);
+    printf("new");
+    RM("umount", umount2(c, 0));
+    RM("option-ro", mount("none", c, "tmpfs", 0, "ro"));
+    RM("mkdir", mkdir(cd, 0755));
+    printf("\n");
+    rm_info("option ro", c, NULL);
+    rm_mounts(c);
+    printf("new");
+    RM("umount", umount2(c, 0));
+    printf("\n");
+    /* Propagation types. */
+    printf("propagation");
+    RM("p1", mount("none", p1, "tmpfs", 0, NULL));
+    RM("shared", mount(NULL, p1, NULL, MS_SHARED, NULL));
+    RM("bind", mount(p1, p2, NULL, MS_BIND, NULL));
+    printf("\n");
+    rm_info("p1", p1, NULL);
+    rm_info("p2", p2, NULL);
+    printf("propagation");
+    RM("slave", mount(NULL, p2, NULL, MS_SLAVE, NULL));
+    printf("\n");
+    rm_info("p1", p1, NULL);
+    rm_info("p2", p2, NULL);
+    printf("propagation");
+    RM("shared", mount(NULL, p2, NULL, MS_SHARED, NULL));
+    printf("\n");
+    rm_info("p2", p2, NULL);
+    printf("propagation");
+    RM("private", mount(NULL, p1, NULL, MS_PRIVATE, NULL));
+    printf("\n");
+    rm_info("p1", p1, NULL);
+    rm_info("p2", p2, NULL);
+    printf("propagation");
+    RM("unbindable", mount(NULL, p2, NULL, MS_UNBINDABLE, NULL));
+    RM("bind", mount(p2, p3, NULL, MS_BIND, NULL));
+    RM("slave-of-private", mount(NULL, p1, NULL, MS_SLAVE, NULL));
+    printf("\n");
+    rm_info("p2", p2, NULL);
+    rm_info("p1", p1, NULL);
+    printf("errors");
+    RM("two", mount(NULL, p1, NULL, MS_SHARED | MS_PRIVATE, NULL));
+    RM("not-root", mount(NULL, rm_base, NULL, MS_SHARED, NULL));
+    RM("other-flag", mount(NULL, p1, NULL, MS_SHARED | MS_NOSUID, NULL));
+    printf("\n");
+    /* MS_REC, and a mount made on a shared one; peer groups are lettered
+       again from here, as a freed number may be taken again. */
+    memset(rm_groups, 0, sizeof rm_groups);
+    mount("none", q, "tmpfs", 0, NULL);
+    mkdir(qr, 0755);
+    mkdir(qs, 0755);
+    mount("none", qr, "tmpfs", 0, NULL);
+    printf("rec");
+    RM("shared", mount(NULL, q, NULL, MS_REC | MS_SHARED, NULL));
+    RM("under", mount("none", qs, "tmpfs", 0, NULL));
+    printf("\n");
+    rm_info("q", q, NULL);
+    rm_info("q/r", qr, NULL);
+    rm_info("q/s", qs, NULL);
+    printf("rec");
+    RM("private", mount(NULL, q, NULL, MS_REC | MS_PRIVATE, NULL));
+    printf("\n");
+    rm_info("q/s", qs, NULL);
+    /* A slave whose master's last peer goes is private. */
+    memset(rm_groups, 0, sizeof rm_groups);
+    printf("master");
+    RM("shared", mount(NULL, p1, NULL, MS_SHARED, NULL));
+    RM("bind", mount(p1, p3, NULL, MS_BIND, NULL));
+    RM("slave", mount(NULL, p3, NULL, MS_SLAVE, NULL));
+    printf("\n");
+    rm_info("p3", p3, NULL);
+    printf("master");
+    RM("umount", umount2(p1, 0));
+    printf("\n");
+    rm_info("p3", p3, NULL);
+    /* A use of a mount clears MNT_EXPIRE's mark. */
+    mount("none", e, "tmpfs", 0, NULL);
+    printf("expire");
+    RM("first", umount2(e, MNT_EXPIRE));
+    RM("used", stat(e, &st));
+    RM("again", umount2(e, MNT_EXPIRE));
+    RM("then", umount2(e, MNT_EXPIRE));
+    printf("\n");
+    /* umount2 of a chrooted caller's root. */
+    mount("none", r, "tmpfs", 0, NULL);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) _exit(rm_root());
+    printf("rooted=%d\n", reaped(child));
+    rm_info("r", r, NULL);
+    return 0;
+}
+static int remounts_case(void) {
+    if (!mkdtemp(rm_base)) return 93;
+    chmod(rm_base, 0755);
+    const char *dirs[] = {"m", "b", "c", "p1", "p2", "p3", "q", "e", "r"};
+    char path[256];
+    for (unsigned i = 0; i < 9; i++) {
+        rm_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(rm_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    rm_path(path, "out");
+    unlink(path);
+    for (unsigned i = 0; i < 9; i++) {
+        rm_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(rm_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -9063,6 +9473,245 @@ static int proc_other_maps_case(void) {
     printf(" reaped=%ld\n", pomaps_read(path, theirs));
     munmap(seen, 2 * POM_SIZE);
     return 0;
+}
+
+/* The proc-other-fds case: another process's fd and fdinfo, as Linux's
+   fs/proc/fd.c makes them: fd is 0500 and its owner's, its links read and
+   lead to the descriptors' files for a reader that ptrace_may_access lets
+   read the process (PTRACE_MODE_READ_FSCREDS), as fdinfo is. */
+#define POF_SIZE 65536
+/* `dir`'s descriptors, each with its link and fdinfo, into `out`: their
+   number, or -errno. */
+static int pofd_describe(const char *dir, char *out) {
+    char path[128];
+    snprintf(path, sizeof path, "%s/fd", dir);
+    DIR *d = opendir(path);
+    if (!d) return -errno;
+    /* Its own listing has the descriptor that reads it, which is not one
+       to compare. */
+    int numbers[64], count = 0, reading = strcmp(dir, "/proc/self") ? -1 : dirfd(d);
+    for (struct dirent *e; (e = readdir(d)) && count < 64;)
+        if (e->d_name[0] != '.' && atoi(e->d_name) != reading) numbers[count++] = atoi(e->d_name);
+    closedir(d);
+    for (int i = 1; i < count; i++)
+        for (int j = i; j > 0 && numbers[j - 1] > numbers[j]; j--) {
+            int t = numbers[j];
+            numbers[j] = numbers[j - 1];
+            numbers[j - 1] = t;
+        }
+    size_t at = 0;
+    out[0] = 0;
+    for (int i = 0; i < count; i++) {
+        char link[512] = "", info[4096] = "";
+        snprintf(path, sizeof path, "%s/fd/%d", dir, numbers[i]);
+        ssize_t n = readlink(path, link, sizeof link - 1);
+        if (n >= 0) link[n] = 0;
+        snprintf(path, sizeof path, "%s/fdinfo/%d", dir, numbers[i]);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t m = read(fd, info, sizeof info - 1);
+            if (m >= 0) info[m] = 0;
+            close(fd);
+        }
+        at += (size_t)snprintf(out + at, POF_SIZE - at, "%d %s\n%s", numbers[i], link, info);
+    }
+    return count;
+}
+/* The text after `key` on its line of `path`'s contents, into `out`
+   (empty when there is none): -errno when it cannot be read. */
+static int pofd_field(const char *path, const char *key, char *out, size_t size) {
+    char text[4096];
+    out[0] = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n < 0) return -errno;
+    text[n] = 0;
+    for (char *line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL)
+        if (!strncmp(line, key, strlen(key))) {
+            size_t len = strcspn(line + strlen(key), "\n");
+            if (len >= size) len = size - 1;
+            memcpy(out, line + strlen(key), len);
+            out[len] = 0;
+            break;
+        }
+    return 0;
+}
+/* A process in a root of its own, with a file there it has a POSIX lock
+   on and its /proc/self/status open from before: another process reads
+   the links as paths from its own root (Linux's d_path), /proc/self as
+   that process's directory, and in fdinfo the file's mount and the lock,
+   owned by that process. */
+static int pofd_rooted(void) {
+    char base[] = "/tmp/paludarium-pofr-XXXXXX";
+    if (!mkdtemp(base)) return 86;
+    char inside[64];
+    snprintf(inside, sizeof inside, "%s/file", base);
+    int made = open(inside, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (made < 0 || write(made, "rooted", 6) != 6) return 87;
+    close(made);
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 88;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 89;
+    if (!kid) {
+        char byte = 'r';
+        int status = open("/proc/self/status", O_RDONLY);
+        if (status != 10 && dup2(status, 10) != 10) byte = 's';
+        if (chroot(base) || chdir("/")) byte = 'c';
+        int fd = open("/file", O_RDWR);
+        struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 1, .l_len = 2};
+        if (fd < 0 || (fd != 11 && dup2(fd, 11) != 11) || fcntl(11, F_SETLK, &lock)) byte = 'f';
+        if (write(ready[1], &byte, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte, path[128], link[256], want[256];
+    if (read(ready[0], &byte, 1) != 1) return 90;
+    snprintf(path, sizeof path, "/proc/%d/fd/11", (int)kid);
+    ssize_t n = readlink(path, link, sizeof link - 1);
+    link[n > 0 ? n : 0] = 0;
+    printf("rooted child=%c file link=%d", byte, n > 0 && !strcmp(link, inside));
+    int fd = open(path, O_RDONLY);
+    char text[8] = "";
+    ssize_t got = fd >= 0 ? read(fd, text, 6) : -1;
+    if (fd >= 0) close(fd);
+    printf(" read=%zd %.6s", got, text);
+    snprintf(path, sizeof path, "/proc/%d/fd/10", (int)kid);
+    n = readlink(path, link, sizeof link - 1);
+    link[n > 0 ? n : 0] = 0;
+    snprintf(want, sizeof want, "/proc/%d/status", (int)kid);
+    printf(" status link=%d\n", n > 0 && !strcmp(link, want));
+    /* The same file's mount, as this process's own descriptor of it has. */
+    char theirs[64], ours[64], locked[256];
+    snprintf(path, sizeof path, "/proc/%d/fdinfo/11", (int)kid);
+    int r = pofd_field(path, "mnt_id:", theirs, sizeof theirs);
+    pofd_field(path, "lock:", locked, sizeof locked);
+    int mine = open(inside, O_RDONLY);
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", mine);
+    pofd_field(path, "mnt_id:", ours, sizeof ours);
+    close(mine);
+    snprintf(want, sizeof want, "POSIX  ADVISORY  WRITE %d ", (int)kid);
+    char *at = strchr(locked, ':');
+    printf("rooted fdinfo=%d mnt_id same=%d lock=%d", r, theirs[0] && !strcmp(theirs, ours),
+           at && strstr(at, want) && strstr(at, " 1 2") != NULL);
+    if (write(done[1], "d", 1) != 1) return 91;
+    printf(" status=%d\n", reaped(kid));
+    unlink(inside);
+    rmdir(base);
+    return 0;
+}
+static int proc_other_fds_case(void) {
+    char *seen = mmap(NULL, POF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    static char theirs[POF_SIZE];
+    if (seen == MAP_FAILED) return 80;
+    char name[] = "/tmp/paludarium-pofd-XXXXXX";
+    int file = mkstemp(name);
+    if (file < 0 || write(file, "hello", 5) != 5) return 81;
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 82;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 83;
+    if (!kid) {
+        /* Descriptors of its own: the file at an offset, close-on-exec, a
+           pipe's ends and an eventfd. */
+        int again = open(name, O_RDONLY | O_CLOEXEC);
+        lseek(again, 2, SEEK_SET);
+        int ends[2];
+        char byte = again >= 0 && !pipe(ends) && eventfd(7, 0) >= 0 ? 'r' : 'o';
+        if (pofd_describe("/proc/self", seen) < 0) byte = 'd';
+        if (write(ready[1], &byte, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 84;
+    char dir[64], path[128];
+    snprintf(dir, sizeof dir, "/proc/%d", (int)kid);
+    int count = pofd_describe(dir, theirs);
+    printf("child=%c count=%d same=%d\n", byte, count, count > 0 && !strcmp(theirs, seen));
+    snprintf(dir, sizeof dir, "/proc/%d/task/%d", (int)kid, (int)kid);
+    count = pofd_describe(dir, theirs);
+    printf("task same=%d\n", count > 0 && !strcmp(theirs, seen));
+    /* The directories, a link not followed and followed, and the file
+       opened through it, at its own start. */
+    struct stat st, file_st;
+    fstat(file, &file_st);
+    snprintf(path, sizeof path, "/proc/%d/fd", (int)kid);
+    int r = stat(path, &st);
+    printf("fd stat=%d mode=%o size=%lld\n", r ? errno : 0, st.st_mode & 07777, (long long)st.st_size);
+    snprintf(path, sizeof path, "/proc/%d/fdinfo", (int)kid);
+    r = stat(path, &st);
+    printf("fdinfo stat=%d mode=%o\n", r ? errno : 0, st.st_mode & 07777);
+    /* The child's `again` is the lowest free number after the pipes. */
+    int again = -1;
+    for (int n = 3; n < 64 && again < 0; n++) {
+        snprintf(path, sizeof path, "/proc/%d/fd/%d", (int)kid, n);
+        if (!stat(path, &st) && st.st_ino == file_st.st_ino && st.st_dev == file_st.st_dev && n != file) again = n;
+    }
+    snprintf(path, sizeof path, "/proc/%d/fd/%d", (int)kid, again);
+    r = lstat(path, &st);
+    printf("link found=%d lstat=%d mode=%o size=%lld", again > 0, r ? errno : 0, st.st_mode & 07777,
+           (long long)st.st_size);
+    int fd = open(path, O_RDONLY);
+    int e = fd >= 0 ? 0 : errno;
+    char text[8] = "";
+    ssize_t got = fd >= 0 ? read(fd, text, 5) : -1;
+    printf(" open=%d read=%zd %.5s", e, got, text);
+    if (fd >= 0) close(fd);
+    printf(" nofollow=%d", open(path, O_RDONLY | O_NOFOLLOW) >= 0 ? 0 : errno);
+    snprintf(path, sizeof path, "/proc/%d/fd/63", (int)kid);
+    printf(" missing=%d", lstat(path, &st) ? errno : 0);
+    snprintf(path, sizeof path, "/proc/%d/fdinfo/63", (int)kid);
+    printf(" info missing=%d\n", open(path, O_RDONLY) >= 0 ? 0 : errno);
+    /* Another user: fd is not its to read or look in, and fdinfo and the
+       links are refused, though fdinfo can be found. */
+    fflush(stdout);
+    pid_t other = fork();
+    if (other == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        char link[256];
+        snprintf(path, sizeof path, "/proc/%d/fd", (int)kid);
+        DIR *d = opendir(path);
+        int e = d ? 0 : errno;
+        printf("other user fd=%d stat=%d", e, stat(path, &st) ? errno : 0);
+        if (d) closedir(d);
+        snprintf(path, sizeof path, "/proc/%d/fd/%d", (int)kid, again);
+        int l = lstat(path, &st) ? errno : 0;
+        int k = readlink(path, link, sizeof link) >= 0 ? 0 : errno;
+        printf(" lstat=%d readlink=%d", l, k);
+        snprintf(path, sizeof path, "/proc/%d/fdinfo", (int)kid);
+        d = opendir(path);
+        e = d ? 0 : errno;
+        printf(" fdinfo=%d stat=%d", e, stat(path, &st) ? errno : 0);
+        if (d) closedir(d);
+        snprintf(path, sizeof path, "/proc/%d/fdinfo/%d", (int)kid, again);
+        int o = open(path, O_RDONLY) >= 0 ? 0 : errno;
+        int s = stat(path, &st) ? errno : 0;
+        printf(" info=%d info stat=%d\n", o, s);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(other));
+    /* Ended and not reaped: no descriptors; reaped: not there. */
+    if (write(done[1], "d", 1) != 1) return 85;
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    snprintf(dir, sizeof dir, "/proc/%d", (int)kid);
+    snprintf(path, sizeof path, "/proc/%d/fd", (int)kid);
+    count = pofd_describe(dir, theirs);
+    r = stat(path, &st);
+    printf("zombie count=%d stat=%d size=%lld", count, r ? errno : 0, (long long)st.st_size);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d", (int)kid, again);
+    printf(" link=%d", lstat(path, &st) ? errno : 0);
+    printf(" status=%d", reaped(kid));
+    printf(" reaped=%d\n", pofd_describe(dir, theirs));
+    close(file);
+    unlink(name);
+    munmap(seen, POF_SIZE);
+    return pofd_rooted();
 }
 
 /* The proc-other-mounts case: another process's mountinfo and mounts, as
@@ -12736,6 +13385,16 @@ static pid_t semx_child(int id, unsigned short num, short op, short flags) {
     if (child == 0) _exit(semx_op(id, num, op, flags));
     return child;
 }
+/* A child that does two operations at once and exits with its error. */
+static pid_t semx_child2(int id, struct semx_op first, struct semx_op second) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct semx_op ops[2] = {first, second};
+        _exit(semx_errno(syscall(SYS_semop, id, ops, 2)));
+    }
+    return child;
+}
 static int semx_reaped(pid_t child) {
     int status;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
@@ -13217,6 +13876,37 @@ static int sem_case(void) {
     printf(" down=%d", semx_op(id, 2, -4, 0));
     printf(" zero=%d", semx_reaped(zero));
     printf(" by-zero=%d\n", semx_ctl(id, 2, SEMX_GETPID, 0) == zero);
+
+    /* Waits of both kinds: on one semaphore, which wait in its own queue,
+       and on two, after which the others wait in the set's queue too, in
+       the order they began. A complex change done lets through the wait for
+       zero it makes, then the rest of the queue again. */
+    int mixed = syscall(SYS_semget, 0, 2, 0600);
+    semx_ctl(mixed, 1, SEMX_SETVAL, 1);
+    pid_t simple = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 1);
+    pid_t complex = semx_child2(mixed, (struct semx_op){0, -1, 0}, (struct semx_op){1, -1, 0});
+    semx_await(mixed, 0, SEMX_GETNCNT, 2);
+    pid_t behind = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 3);
+    pid_t zeroed = semx_child(mixed, 1, 0, 0);
+    semx_await(mixed, 1, SEMX_GETZCNT, 1);
+    printf("mixed ncnt=%ld,%ld", semx_ctl(mixed, 0, SEMX_GETNCNT, 0), semx_ctl(mixed, 1, SEMX_GETNCNT, 0));
+    printf(" up=%d", semx_op(mixed, 0, 1, 0));
+    printf(" simple=%d", semx_reaped(simple));
+    printf(" by-simple=%d", semx_ctl(mixed, 0, SEMX_GETPID, 0) == simple);
+    printf(" ncnt=%ld", semx_ctl(mixed, 0, SEMX_GETNCNT, 0));
+    printf(" up=%d", semx_op(mixed, 0, 2, 0));
+    printf(" complex=%d behind=%d zeroed=%d", semx_reaped(complex), semx_reaped(behind), semx_reaped(zeroed));
+    printf(" by-behind=%d", semx_ctl(mixed, 0, SEMX_GETPID, 0) == behind);
+    printf(" by-zeroed=%d", semx_ctl(mixed, 1, SEMX_GETPID, 0) == zeroed);
+    printf(" values=%ld,%ld", semx_ctl(mixed, 0, SEMX_GETVAL, 0), semx_ctl(mixed, 1, SEMX_GETVAL, 0));
+    /* With no complex wait left, a simple one waits on its own again. */
+    pid_t again = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 1);
+    printf(" again-up=%d", semx_op(mixed, 0, 1, 0));
+    printf(" again=%d", semx_reaped(again));
+    printf(" removed=%ld\n", semx_ctl(mixed, 0, SEMX_RMID, 0));
 
     /* A signal ends a wait with EINTR, even with SA_RESTART. */
     fflush(stdout);
@@ -15799,6 +16489,153 @@ int main(int argc, char **argv) {
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 1, 0, 0, "down oif lo");
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 0, 0, 0, "down");
             nl_select(ctl, port, "224.0.0.1", 0, 0, "127.0.0.1", 0, 0, 0, "down all hosts from");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "neighbour-requests")) {
+        /* A child makes a network namespace with lo up and sends through it,
+           which makes IPv4's neighbour (0.0.0.0) and IPv6's ::1. RTM_GETNEIGH
+           dumps show them by family and filter, and a request without a dump
+           one of them, checked as neigh_valid_dump_req and
+           neigh_valid_get_req check them: dumps unchecked, then strictly
+           (NETLINK_GET_STRICT_CHK). */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            int u4 = socket(AF_INET, SOCK_DGRAM, 0), u6 = socket(AF_INET6, SOCK_DGRAM, 0);
+            struct sockaddr_in to4 = {.sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(0x7f000001)};
+            struct sockaddr_in6 to6 = {.sin6_family = AF_INET6, .sin6_port = htons(9)};
+            inet_pton(AF_INET6, "::1", &to6.sin6_addr);
+            printf("send4=%ld\n", netns_result(sendto(u4, "x", 1, 0, (void *)&to4, sizeof to4)));
+            printf("send6=%ld\n", netns_result(sendto(u6, "x", 1, 0, (void *)&to6, sizeof to6)));
+            /* Let ICMPv6's port unreachable come back through ::1. */
+            usleep(100000);
+            for (int strict = 0; strict < 2; strict++) {
+                if (strict) {
+                    int on = 1;
+                    printf("strict=%ld\n", netns_result(setsockopt(ctl, 270, 12, &on, sizeof on)));
+                }
+                const char *p = strict ? "strict " : "";
+                char label[64];
+                struct nl_body b;
+#define NEIGH_DUMP(text) (snprintf(label, sizeof label, "%s%s", p, text), nl_strict(ctl, port, 30, 1, &b, label))
+                b = nl_body(0, 1);
+                NEIGH_DUMP("family byte");
+                b = nl_body(0, 12);
+                NEIGH_DUMP("all");
+                b = nl_body(AF_INET, 12);
+                NEIGH_DUMP("inet");
+                b = nl_body(AF_INET6, 12);
+                NEIGH_DUMP("inet6");
+                b = nl_body(17, 12);
+                NEIGH_DUMP("packet");
+                b = nl_body(45, 1);
+                NEIGH_DUMP("mctp short");
+                b = nl_body(45, 12);
+                NEIGH_DUMP("mctp");
+                b = nl_body(0, 12);
+                b.bytes[10] = 8;
+                NEIGH_DUMP("proxy");
+                b.bytes[10] = 0x18;
+                NEIGH_DUMP("proxy and more");
+                b = nl_body(0, 12);
+                b.bytes[8] = 2;
+                NEIGH_DUMP("state");
+                b = nl_body(0, 12);
+                b.bytes[4] = 1;
+                NEIGH_DUMP("index");
+                b = nl_body(0, 8);
+                NEIGH_DUMP("short");
+                b = nl_body(0, 12);
+                nl_put32(&b, 8, 1);
+                NEIGH_DUMP("device 1");
+                b = nl_body(0, 12);
+                nl_put32(&b, 8, 2);
+                NEIGH_DUMP("device 2");
+                b = nl_body(0, 12);
+                nl_put32(&b, 9, -1);
+                NEIGH_DUMP("no master");
+                b = nl_body(0, 12);
+                nl_put32(&b, 9, 3);
+                NEIGH_DUMP("master 3");
+                b = nl_body(AF_INET, 12);
+                nl_put(&b, 1, "\0\0\0\0", 4);
+                NEIGH_DUMP("key");
+                b = nl_body(0, 12);
+                nl_put32(&b, 8, 2);
+                nl_put(&b, 16, "\0\0", 2);
+                NEIGH_DUMP("state mask");
+                b = nl_body(0, 12);
+                nl_put(&b, 8, "\2\0", 2);
+                NEIGH_DUMP("short index");
+                b = nl_body(0, 12);
+                nl_put32(&b, 15, 2);
+                NEIGH_DUMP("reserved flag");
+                b = nl_body(0, 12);
+                nl_put32(&b, 15, 1);
+                NEIGH_DUMP("managed flag");
+                b = nl_body(0, 12);
+                nl_put(&b, 15, "\1\0", 2);
+                NEIGH_DUMP("short flags");
+                b = nl_body(0, 12);
+                nl_put32(&b, 99, 1);
+                NEIGH_DUMP("past the last");
+#undef NEIGH_DUMP
+            }
+            /* One neighbour each, without a dump. */
+            struct nl_body b;
+#define NEIGH_GET(family, index, flags, key, len, text)                    \
+    (b = nl_body(family, 12), memcpy(b.bytes + 4, &(int){index}, 4), b.bytes[10] = flags, \
+     (len) ? nl_put(&b, 1, key, len) : (void)0, nl_strict(ctl, port, 30, 0, &b, text))
+            const unsigned char zero[16] = {0}, loopback6[16] = {[15] = 1}, loopback4[4] = {127, 0, 0, 1};
+            NEIGH_GET(AF_INET, 1, 0, zero, 4, "get inet");
+            NEIGH_GET(AF_INET6, 1, 0, loopback6, 16, "get inet6");
+            NEIGH_GET(AF_INET, 1, 0, loopback4, 4, "get absent");
+            NEIGH_GET(AF_INET6, 1, 0, zero, 16, "get absent6");
+            NEIGH_GET(AF_INET, 0, 0, zero, 4, "get no device");
+            NEIGH_GET(AF_INET, 0, 8, zero, 4, "get proxy");
+            NEIGH_GET(AF_INET, 1, 8, zero, 4, "get proxy on lo");
+            /* A new namespace can hold fallback tunnels (sit0 and others) after lo,
+               so ask for an index no device has. */
+            NEIGH_GET(AF_INET, 4096, 0, zero, 4, "get device 4096");
+            NEIGH_GET(AF_INET, -1, 0, zero, 4, "get device -1");
+            NEIGH_GET(AF_INET, 1, 0, zero, 16, "get long key");
+            NEIGH_GET(AF_INET6, 1, 0, zero, 4, "get short key6");
+            NEIGH_GET(17, 1, 0, zero, 4, "get packet");
+            NEIGH_GET(45, 1, 0, zero, 1, "get mctp");
+            NEIGH_GET(AF_INET, 1, 0x10, zero, 4, "get flags");
+            NEIGH_GET(AF_INET, 1, 0, zero, 0, "get no key");
+            /* The key with more: an index attribute, a state, padding. */
+            b = nl_body(AF_INET, 12);
+            b.bytes[4] = 1;
+            nl_put(&b, 1, zero, 4);
+            size_t keyed = b.len;
+            nl_put32(&b, 8, 1);
+            nl_strict(ctl, port, 30, 0, &b, "get index attribute");
+            b.len = keyed;
+            nl_put32(&b, 15, 2);
+            nl_strict(ctl, port, 30, 0, &b, "get reserved flag");
+            b.len = keyed;
+            b.bytes[8] = 2;
+            nl_strict(ctl, port, 30, 0, &b, "get state");
+            b.bytes[8] = 0;
+            b.bytes[1] = 1;
+            nl_strict(ctl, port, 30, 0, &b, "get padding");
+            b = nl_body(AF_INET, 8);
+            nl_strict(ctl, port, 30, 0, &b, "get short");
+#undef NEIGH_GET
             fflush(stdout);
             _exit(0);
         }
@@ -25476,8 +26313,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mounts")) return mounts_case(self);
     if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
     if (!strcmp(mode, "binds")) return binds_case();
+    if (!strcmp(mode, "remounts")) return remounts_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
+    if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

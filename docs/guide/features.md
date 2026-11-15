@@ -39,9 +39,10 @@ Linux.
   instructions (`FSIN`, `FCOS`, `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`,
   `FYL2XP1`) that the `long double` math of glibc and musl uses, correctly
   rounded, which is not always a real CPU's last bit
-  ([Limitations](./limitations)). Packed decimals are not implemented yet
-  ([Limitations](./limitations)). A signal handler starts with the x87 and SSE
-  state as after a reset, as on Linux.
+  ([Limitations](./limitations)). They load and store packed decimals (`FBLD`,
+  `FBSTP`), and save and restore the unit with `FNSAVE`, `FRSTOR`, `FNSTENV` and
+  `FLDENV`, also in their 16-bit forms (with a `0x66` prefix). A signal handler
+  starts with the x87 and SSE state as after a reset, as on Linux.
 - AVX, AVX-512 and MMX are out of scope: `CPUID` reports MMX because glibc
   requires it, but its instructions stop with `SIGILL`.
 
@@ -62,7 +63,7 @@ kernel.
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | Keys | `add_key`, `request_key`, `keyctl` |
-| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs` |
+| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs`, `perf_event_open` (see below) |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
@@ -72,6 +73,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
+| BPF | `bpf`, for maps (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -1018,9 +1020,13 @@ kernel.
   cannot go through waits, unless the operation it would wait on has
   `IPC_NOWAIT` (`EAGAIN`), until a change lets it through, the set is
   removed (`EIDRM`), a signal comes (`EINTR`, never restarted, as Linux) or
-  `semtimedop`'s timeout passes (`EAGAIN`). A change tries the waits as
-  Linux's `do_smart_update`: the waits for zero first, then the others in
-  the order they began. `SEM_UNDO` keeps the adjustments in the process's
+  `semtimedop`'s timeout passes (`EAGAIN`). The waits are kept in Linux's
+  queues: each semaphore's for operations on it alone, and the set's for
+  operations on several, which the waiting changes on one semaphore join
+  while any such operation waits. A change tries them as Linux's
+  `do_smart_update`: the waits for zero on the semaphores it made 0, then
+  the waits to change values, each queue in the order its waits began.
+  `SEM_UNDO` keeps the adjustments in the process's
   undo list, which `CLONE_SYSVSEM` shares (`pthread_create` passes it) and
   a `fork` does not; `SETVAL` and `SETALL` clear them. The last thread that
   shares the list applies it as it ends, or as it leaves it with `unshare`
@@ -1473,9 +1479,9 @@ kernel.
   mount's root goes to where it is mounted; `rename` and `link` from one
   mount to another are `EXDEV`, `rmdir`, `unlink` and `rename` of a mount
   point `EBUSY`, and a rename moves the mounts below the directory it
-  moves. `MS_PRIVATE` and `MS_SLAVE` (with `MS_REC` or not) of a mount's
-  root succeed, as every mount is private already, after
-  `do_change_type`'s checks (`EINVAL`).
+  moves. `MS_RDONLY` makes the new mount and its superblock read-only, and
+  the `ro` option the superblock alone, as mountinfo's two `ro` fields show.
+  A mount on a shared mount is shared too, in a peer group of its own.
 - `mount` with `MS_BIND` makes a bind mount, after the same checks up to
   `CAP_SYS_ADMIN`, as Linux's `do_loopback`: a source (`EINVAL` for none or
   an empty one), looked up with its links followed (`ENOENT`, `ENOTDIR`,
@@ -1492,7 +1498,64 @@ kernel.
   of it does, after its first mount goes, and a bind mount keeps showing its
   source after a rename of it. `statx` and `/proc/self/fdinfo` give a
   file's mount ID by its path, so a bind mount's files have the bind
-  mount's.
+  mount's. An unbindable source mount is `EINVAL`, and `MS_REC` leaves out
+  the unbindable mounts below it and what is on them (`EPERM` for a locked
+  one). The new mount is a peer of the source's mount and a slave of its
+  master; on a shared mount it is shared, in a new peer group if the
+  source's mount was in none.
+- `mount` with `MS_REMOUNT` and `MS_BIND` changes a mount's flags alone, as
+  Linux's `do_reconfigure_mnt`: the target is the root of a mount of the
+  caller's namespace (`EINVAL`), the flags a copy into a less privileged
+  namespace locked stay (`EPERM`: `MNT_LOCK_READONLY`, `MNT_LOCK_NODEV`,
+  `MNT_LOCK_NOSUID`, `MNT_LOCK_NOEXEC` and `MNT_LOCK_ATIME`), and making it
+  read-only needs no file open for writing on it (`EBUSY`). The flags are
+  those of the call, its access-time ones kept unless it names one.
+  `MS_REMOUNT` alone (`do_remount`) makes the same checks, then parses the
+  options of the mount's file system (`EINVAL`), needs `CAP_SYS_ADMIN` over
+  the superblock's user namespace (`EPERM`), and reconfigures the
+  superblock as `reconfigure_super` does: an option for a flag a remount
+  does not change (`dirsync`) is `EINVAL` (`MS_DIRSYNC` in the flags is
+  left out), making it read-only needs no file open for writing on any of
+  its mounts (`EBUSY`), and a tmpfs's own options are checked and changed
+  as `shmem_reconfigure` does them (`EINVAL` for a limit on one mounted
+  without it or below what its files use, `noswap` on one that swaps, a
+  quota on one without, a changed quota limit; `size`, `nr_blocks`,
+  `nr_inodes`, `huge`, `inode32`, `inode64` and `mpol` change, `mode`,
+  `uid` and `gid` do not). The mount then takes the call's flags.
+- A read-only mount, or one of a read-only superblock, refuses what writes
+  with `EROFS` where Linux's `mnt_want_write` does, after the errors that
+  come before it: creating a name (`open` with `O_CREAT`, `O_TMPFILE`,
+  `mkdir`, `mknod`, `symlink`, `link`, and `bind` of an `AF_UNIX` socket)
+  once the name is found not there (`EEXIST` first) and before the
+  permission to write its directory (and `link`'s `EXDEV` and `mknod`'s
+  `EPERM` for a device); `unlink`, `rmdir` and `rename` once the directory
+  is found and before the name is looked up (so a missing one is `EROFS`
+  too); `open` with `O_TRUNC` of a regular file, and opening one for
+  writing after its permission and `ETXTBSY` (a FIFO, a socket and a
+  device still open); `truncate` after `EISDIR` and `EINVAL`; `chmod`,
+  `chown`, `utimensat` and `utimes` and their descriptor forms, `setxattr`,
+  `removexattr` and their descriptor forms, `file_setattr` and
+  `FS_IOC_SETFLAGS` before their permission checks; and `access` with
+  `W_OK` after its permission check. A read-only superblock also refuses
+  writing a regular file, a directory or a symbolic link before its
+  permission is checked (`sb_permission`). `statfs`'s `f_flags` gives the
+  mount's flags (`ST_RDONLY`, `ST_NOSUID`, `ST_NODEV`, `ST_NOEXEC`,
+  `ST_NOATIME`, `ST_NODIRATIME`, `ST_RELATIME`), as `flags_by_mnt` does.
+- `mount` with `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` or `MS_UNBINDABLE` (and
+  `MS_REC` for the mounts on the target too) changes a mount's propagation
+  type, after `do_change_type`'s checks: the root of a mount (`EINVAL`),
+  one type and no other flag (`EINVAL`), and `CAP_SYS_ADMIN` over the
+  mount's namespace (`EPERM`). A shared mount is in a peer group, a new one
+  with the lowest free number if it was in none, and is no longer
+  unbindable. Any other type takes it out of its group: its slaves then
+  follow a peer, or with none left its own master; `MS_SLAVE` makes it a
+  slave of its old group if it had peers, else of its master, and
+  `MS_PRIVATE` and `MS_UNBINDABLE` leave it no master. `/proc/self/mountinfo`
+  shows these as Linux's `show_mountinfo` does: `shared:N`, `master:N`,
+  `propagate_from:N` and `unbindable`. A copy into a new mount namespace
+  is a peer of the mount it copies, or with another user namespace a slave
+  of it. A mount that is unmounted, or whose namespace ends, leaves its
+  peer group the same way.
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`; then, as Linux's
   `can_umount` and `do_umount`, it needs `CAP_SYS_ADMIN` over the mount
@@ -1504,7 +1567,12 @@ kernel.
   `EBUSY`, unless `MNT_DETACH` takes it and those on it away at once, their
   open files still reading and writing. `MNT_EXPIRE` (`EINVAL` with
   `MNT_FORCE` or `MNT_DETACH`, or of the caller's root) marks a mount no one
-  uses (`EAGAIN`) and unmounts it the next time.
+  uses (`EAGAIN`) and unmounts it the next time; a lookup that ends on the
+  mount, or the close of a file on it, clears the mark, as Linux's `mntput`
+  does. The caller's root without `MNT_DETACH` needs `CAP_SYS_ADMIN` over
+  its superblock's user namespace (`EPERM`), and then stays mounted: its
+  superblock is remounted read-only (`do_umount_root`, `EBUSY` with a file
+  open for writing on it).
 - `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
   with `CLONE_FS` its own working directory and umask, as Linux. With
   `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
@@ -1952,6 +2020,29 @@ kernel.
     makes) every address of its prefix; IPv6 binds only to its addresses.
     Before IPv4 has a local table, a socket binds to any IPv4 address, as
     Linux's `inet_addr_type` takes each as broadcast then.
+  - **Neighbours:** `RTM_GETNEIGH` dumps the loopback's neighbours (those
+    its traffic makes, as the notifications below tell) as
+    `neigh_dump_info` does, each an `RTM_NEWNEIGH` like the `RTM_DELNEIGH`
+    that tells of it as it goes: ARP's (IPv4's) and then neighbour
+    discovery's (IPv6's) for `AF_UNSPEC`, the one family's for `AF_INET`
+    or `AF_INET6`, and none for another family. An `ndmsg` whose flags
+    are `NTF_PROXY` asks for the proxy entries, of which there are none.
+    `NDA_IFINDEX` and `NDA_MASTER` narrow a dump, and mark each message
+    `NLM_F_DUMP_FILTERED`: `lo`'s index, 1, and a master of -1 (no master)
+    keep the neighbours, and any other shows none. Strictly, as
+    `neigh_valid_dump_req` checks, an `ndmsg` that is short or has
+    padding, an index, a state, a type or a flag but `NTF_PROXY`, and any
+    other attribute, are `EINVAL`; unchecked, a dump whose attributes
+    break `nda_policy` is not narrowed. An `AF_MCTP` dump shows no
+    neighbours (`EINVAL` for a short `ndmsg`, as `mctp_rtm_getneigh`).
+    Without a dump, as `neigh_get`, the request names one neighbour by its
+    family, key (`NDA_DST`) and `lo`'s index, and the answer counts the
+    reference the lookup holds. It is `EINVAL` without the key (told of
+    with `NLMSGERR_ATTR_MISS_TYPE`), with another attribute, a key of
+    another length, no device, or padding, a state, a type or a flag but
+    `NTF_PROXY`; `EAFNOSUPPORT` for a family but IPv4's and IPv6's;
+    `ENODEV` for another device; and `ENOENT` for a neighbour `lo` has
+    not, and for a proxy entry.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
@@ -2349,7 +2440,8 @@ kernel.
   and `/proc/mounts` list the mounts of the caller's mount namespace
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
   and the tmpfs and bind mounts `mount` made, with their sources and, in
-  `mountinfo`, the directory each shows as its root). After `chroot` they show each mount point
+  `mountinfo`, the directory each shows as its root, whether the mount
+  and its superblock are read-only, and its propagation). After `chroot` they show each mount point
   from the process's root and leave out those not under it, as Linux's
   `seq_path_root` does. `/proc/<pid>/mountinfo` and `mounts` (and those of
   `/proc/thread-self` and `/proc/<pid>/task/<tid>`) are those of that task,
@@ -2424,7 +2516,8 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `cmdline`, `environ` (0400), `comm`, `maps`, `smaps`, `exe`,
-  `cwd`, `root`, `mounts`, `mountinfo`, `ns` (0511) and `task`, made as
+  `cwd`, `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and
+  `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
@@ -2436,10 +2529,18 @@ kernel.
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
   gets `EACCES` for `environ` unless its real IDs, and for `maps`, `smaps`, `exe`, `cwd`,
-  `root` and the links of `ns` unless its filesystem IDs, are every user and group ID of a dumpable
+  `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
-  asks above; an undumpable process's directory is root's. What a process shows of
+  asks above; an undumpable process's directory is root's. `fd` itself is read
+  and looked in as its mode (0500) lets the reader, as Linux's
+  `proc_fd_permission` decides. `fd` and `fdinfo` are as this process's own
+  (below), of the other process's descriptors; a link of `fd` opens its
+  descriptor's file again. As on Linux, a link reads as a path from the
+  reader's root (`d_path`), but it is found where the other process opened
+  it: in its root and mount namespace, and a `/proc/self` there is that
+  process's directory. `fdinfo` gives the mount of that process's file and
+  the record locks that process holds. What a process shows of
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
@@ -2449,7 +2550,7 @@ kernel.
   reaped, `S (sleeping)` while its thread is in a system call, where it waits
   if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
-  `environ`, `maps` and `smaps` are empty and `exe`, `cwd` and `root` are `ENOENT`, as on Linux.
+  `environ`, `maps` and `smaps` are empty, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0
@@ -2616,16 +2717,17 @@ kernel.
   as Linux's `mem_lseek`, a negative one too, from which a read is `EINVAL`;
   from the end it is `EINVAL`. It cannot be written (`EINVAL`, `EBADF` on a
   descriptor open only for reading).
-- `/proc/self/fd` (mode 0500) lists `.`, `..` and a link per open
+- `/proc/self/fd` (mode 0500, its size the number of open descriptors, as
+  Linux's `proc_fd_getattr` gives it) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each
   link's `lstat` shows the descriptor's access in its user bits and size 64,
   and `stat` follows it to the file. `readlink` gives Linux's names: the
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
   for this process's entries), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
-  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]` or `[pidfd]` (an
+  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]`, `[perf_event]` or `[pidfd]` (an
   anonymous inode's name, which pidfs, from Linux 6.9, still gives),
-  `anon_inode:inotify` (without brackets, as Linux names it), and
+  `anon_inode:inotify` (without brackets, as Linux names it), `anon_inode:bpf-map`, and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
   own for it. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
@@ -2933,6 +3035,73 @@ kernel.
     `quotactl_fd` takes any descriptor (`EBADF`), checks the type
     (`EINVAL`) and gives `ENOSYS`, as Linux's `do_quotactl` does for a file
     system without quotas.
+- `perf_event_open` checks its arguments in the order of Linux's
+  `kernel/events/core.c`: unknown flags, then the structure
+  (`perf_copy_attr`: a size of 0 is the first one's 64 bytes, less than that
+  or more than a page `E2BIG`, which writes back the size Linux master
+  knows, 176, as does a larger one with bytes past that which are not 0;
+  then the reserved fields, unknown sample and read formats, branch
+  sampling without a branch, register masks with DS, ES, FS, GS or the
+  reserved bits, a user stack too large or not 8-byte aligned, both
+  weights, `inherit_thread` without `inherit`, `remove_on_exec` with
+  `enable_on_exec`, and `sigtrap` without `remove_on_exec`, all `EINVAL`),
+  then `perf_event_paranoid`, which is Linux's default 2: an event of the
+  kernel (one without `exclude_kernel`, `text_poke`, a kernel callchain,
+  physical addresses, kernel or hypervisor branches) and one of a CPU need
+  `CAP_PERFMON` or `CAP_SYS_ADMIN` (`EACCES`), as do `namespaces`. Then a
+  period with bit 63 or a frequency above `perf_event_max_sample_rate`
+  (100000) is `EINVAL`, `PERF_FLAG_PID_CGROUP` without a CPU and a task
+  `EINVAL`, a group descriptor that is no event `EBADF`, a task that is not
+  there `ESRCH`, no task and no CPU or a CPU past the last `EINVAL`, and an
+  unknown `clockid` `EINVAL`. The events that count are the software
+  `cpu-clock` and `task-clock`, in nanoseconds of the thread's CPU time (an
+  event of a CPU counts the time that passes), and `alignment-faults`,
+  `emulation-faults`, `dummy` and `bpf-output`, which count nothing, as on
+  x86-64; branch sampling or the XMM registers of one is `EOPNOTSUPP`.
+  Hardware, cache and raw events are `ENOENT`, as on a machine without a
+  PMU. An event of another process needs `CAP_PERFMON` or to be able to
+  read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the
+  times enabled and running, the ID and the lost samples (0) as the read
+  format asks, and with `PERF_FORMAT_GROUP` the whole group's, `ENOSPC` for
+  a buffer too small. A group member must be of its leader's task, CPU and
+  clock, and neither pinned nor exclusive (`EINVAL`); it counts only while
+  its leader is enabled. The ioctls `PERF_EVENT_IOC_ENABLE`, `DISABLE` and
+  `RESET`, each of the event or with `PERF_IOC_FLAG_GROUP` of its group,
+  and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
+  for an event that does not sample. `enable_on_exec` enables a disabled
+  event when its task runs `execve`, as `perf stat` uses it, and
+  `remove_on_exec` disables one then for good. The
+  descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  and writing, and a write is `EINVAL`. See [limitations](./limitations)
+  for what is not there.
+- `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and
+  `hashtab.c` have them. Every command first takes the size of its union
+  (more than a page, or bytes past Linux master's 168 that are not 0, is
+  `E2BIG`) and its fields past the command's own (`CHECK_ATTR`, `EINVAL`).
+  `BPF_MAP_CREATE` makes a `BPF_MAP_TYPE_ARRAY` (4-byte keys, every
+  element there and zero from the start) or a `BPF_MAP_TYPE_HASH`, in the
+  order of Linux's checks: BTF type IDs, `map_extra`, the NUMA node (there
+  is one), the type, the type's own sizes and flags (`EINVAL`, too large a
+  hash element `E2BIG`, `BPF_F_ZERO_SEED` without `CAP_SYS_ADMIN`
+  `EPERM`), `kernel.unprivileged_bpf_disabled`, which is Linux's default 2,
+  so that a map needs `CAP_BPF` or `CAP_SYS_ADMIN` (`EPERM`), the name
+  (letters, digits, `_` and `.`), BTF (no file is, `EINVAL`), and
+  `BPF_F_RDONLY` with `BPF_F_WRONLY` (`EINVAL`). The descriptor is
+  close-on-exec, open for reading, writing or both as `BPF_F_RDONLY` and
+  `BPF_F_WRONLY` say, its link is `anon_inode:bpf-map`, and a read or write
+  of it is `EINVAL`. `BPF_MAP_LOOKUP_ELEM`, `UPDATE_ELEM` (`BPF_ANY`,
+  `BPF_NOEXIST`, `BPF_EXIST`; a full hash is `E2BIG`, an index past an
+  array's end `E2BIG`), `DELETE_ELEM` (`EINVAL` for an array),
+  `GET_NEXT_KEY`, `LOOKUP_AND_DELETE_ELEM` (the kernel's `ENOTSUPP`, 524,
+  for an array) and `BPF_MAP_FREEZE` (which stops writes through every
+  descriptor, so that a second one is `EPERM` too) take the access the descriptor has
+  (`EPERM`). The batch commands look up, update, delete and look up and
+  delete by count, with `count` written back (an array deletes nothing,
+  `ENOTSUPP`). `BPF_OBJ_GET_INFO_BY_FD` gives a map's `struct bpf_map_info`
+  up to the length asked for (`EBADFD` for no descriptor, `EINVAL` for one
+  of no map). Its fdinfo has `map_type`, `key_size`, `value_size`,
+  `max_entries`, `map_flags`, `map_extra`, `memlock`, `map_id` and
+  `frozen`. See [limitations](./limitations) for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable
@@ -3580,8 +3749,37 @@ one only with an `--allow-net`.
   `rax` (`-ERESTARTSYS`, `-ERESTARTNOINTR`, `-ERESTARTNOHAND`,
   `-ERESTART_RESTARTBLOCK`): it runs again unless the tracer changes `rax`
   or sets `orig_rax` to -1, and another `orig_rax` is the call that runs.
-- After `execve`, a task traced without `PTRACE_SEIZE` gets `SIGTRAP` from
-  itself. A tracer thread's exit lets go of its tracees, killing those that
+- With `PTRACE_SYSCALL`, a tracee stops at the entry and at the exit of each
+  system call (`SIGTRAP`, or `SIGTRAP | 0x80` with `PTRACE_O_TRACESYSGOOD`),
+  and with `PTRACE_SYSEMU` at the entry only, where the call does not run.
+  At an entry `rax` is `-ENOSYS` and `orig_rax` the call: the tracer may
+  change the call and its arguments, or set `orig_rax` to -1 to skip it,
+  leaving the `rax` it wants; at an exit `rax` has what the call returned,
+  which the tracer may change. A signal the tracer resumes a syscall stop
+  with comes from the kernel (`SI_KERNEL`). `PTRACE_GET_SYSCALL_INFO`
+  describes the stop as Linux's `struct ptrace_syscall_info` does: the call
+  and its arguments at an entry, the return value and whether it is an
+  error at an exit, and only the instruction and stack pointers at another
+  stop or without `PTRACE_O_TRACESYSGOOD`. `PTRACE_SET_SYSCALL_INFO` changes
+  the call, its arguments or the return value, refusing another kind of
+  stop, flags or a short buffer (`EINVAL`) and a number that is not an
+  `int` (`ERANGE`).
+- The events of `PTRACE_O_TRACEFORK`, `PTRACE_O_TRACEVFORK`,
+  `PTRACE_O_TRACECLONE`, `PTRACE_O_TRACEEXEC`, `PTRACE_O_TRACEVFORKDONE` and
+  `PTRACE_O_TRACEEXIT` stop the tracee with the event above `SIGTRAP` in the
+  status, `rax` at `-ENOSYS`, and `PTRACE_GETEVENTMSG` gives the new task,
+  the thread's ID before `execve`, or the exit status. A task a `clone`,
+  `fork` or `vfork` makes while its maker's tracer asks for the event, or
+  with `CLONE_PTRACE` (never with `CLONE_UNTRACED`), is traced by the same
+  tracer with the same options, and starts in `PTRACE_EVENT_STOP` if
+  seized, otherwise with `SIGSTOP` pending; it starts with no syscall stops.
+  A `vfork` parent reports `PTRACE_EVENT_VFORK_DONE` once its child has
+  exited or run another program. The thread that ends its process reports
+  `PTRACE_EVENT_EXIT`; the threads that end with it do not.
+- After `execve`, a task traced without `PTRACE_SEIZE` or
+  `PTRACE_O_TRACEEXEC` gets `SIGTRAP` from itself. A thread other than the
+  leader that runs `execve` is traced by the leader's number after it. A
+  tracer thread's exit lets go of its tracees, killing those that
   set `PTRACE_O_EXITKILL`. `/proc/<pid>/status` shows `TracerPid`, and a
   tracee in a ptrace stop is in `t (tracing stop)`.
 

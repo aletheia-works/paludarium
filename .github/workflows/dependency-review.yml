@@ -1,7 +1,18 @@
 name: Dependency Review
 
+# Only pull requests that change what the dependency graph reads: Cargo and
+# npm/Bun manifests and lockfiles, and the actions that workflows and local
+# actions use. Not a required check, so a pull request it skips is not held.
 on:
   pull_request_target:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/bun.lock'
+      - '.github/workflows/**'
+      - '.github/actions/**'
 
 permissions:
   contents: read

@@ -1,7 +1,20 @@
 name: Fuzz the MMU, filesystem and kernel targets
+# The pull-request targets are the default below. ci.yml passes the ones a
+# pull request's changes can affect (scripts/ci-changes.py) and every one on
+# a push to main.
 on:
   workflow_call:
+    inputs:
+      targets:
+        description: JSON list of the targets to run
+        type: string
+        default: '["vfs_paths", "load_elf", "syscall_args", "kernel_threads", "kernel_futex", "kernel_events", "kernel_sockets"]'
   workflow_dispatch:
+    inputs:
+      targets:
+        description: JSON list of the targets to run
+        type: string
+        default: '["vfs_paths", "load_elf", "syscall_args", "kernel_threads", "kernel_futex", "kernel_events", "kernel_sockets"]'
 permissions:
   contents: read
 jobs:
@@ -11,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [vfs_paths, load_elf, syscall_args, kernel_threads, kernel_futex, kernel_events, kernel_sockets]
+        target: ${{ fromJSON(inputs.targets) }}
     container:
       image: rust:1-trixie
       options: --cap-add=SYS_PTRACE --security-opt=seccomp=unconfined --ulimit=stack=-1

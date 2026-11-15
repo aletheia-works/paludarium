@@ -49,8 +49,8 @@ verified.
   VMA has its full size from the start, where Linux's grows as it is used. A
   program's own segments and its interpreter's are named by the path it was
   started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `/proc/<pid>/maps` and `smaps` of another process,
-  `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+  symbolic links. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
+  do not exist.
 - **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
   page entries. `Referenced` is every page counted, a page that `fork`
   shares counts as shared (and half of it in `Pss`) even after the other
@@ -69,7 +69,7 @@ verified.
   (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
   the reader's own directory (`auxv`, `limits`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `fd`, `maps`,
+  process's directory they are `ENOENT`, where Linux shows root `fd`,
   `statm` and the rest. In `stat`, page faults, resident memory, the start
   time and the code range are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,

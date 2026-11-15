@@ -311,7 +311,7 @@ mod linux {
             };
             let host = Arc::new(RecordingHost::new());
             // Their timers and limits wait for CPU time, which the virtual
-            // clock does not pass.
+            // clock does not pass, and the perf cases' clocks count it.
             if matches!(
                 mode,
                 "cpu-itimer"
@@ -320,6 +320,8 @@ mod linux {
                     | "cpu-sleep"
                     | "cpu-sleep-others"
                     | "cpu-timer-others"
+                    | "perf-counts"
+                    | "perf-exec"
             ) {
                 host.measure_cpu_time();
             }

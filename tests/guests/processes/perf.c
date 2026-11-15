@@ -320,7 +320,9 @@ static int case_counts(void) {
     a.flags |= DISABLED;
     a.read_format = FORMAT_GROUP | FORMAT_ID;
     int leader = (int)open_event(&a, 0, -1, -1, 0);
-    struct attr b = software(0);
+    /* A member of the leader's own PMU: Linux gave a cpu-clock member of a
+       task-clock group no count on the CI machines. */
+    struct attr b = software(1);
     b.flags |= DISABLED;
     int member = (int)open_event(&b, 0, -1, leader, 0);
     say("member %d", member >= 0);

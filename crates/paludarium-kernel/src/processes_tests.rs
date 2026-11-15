@@ -4241,6 +4241,22 @@ mod shm {
     #[test]
     fn proc_sysvipc_lists_the_namespace_s_objects_as_linux_prints_them() {
         let (mut k, mut t, m) = setup();
+        // A path on past one of the files is ENOTDIR, as on Linux.
+        for path in [&b"/proc/sysvipc/msg/\0"[..], b"/proc/loadavg/x\0"] {
+            m.write(GuestAddr(DATA + 0x900), path).unwrap();
+            for number in [2, 4] {
+                assert_eq!(
+                    syscall(
+                        &mut k,
+                        &mut t,
+                        &m,
+                        number,
+                        [DATA + 0x900, DATA + 0x200, 0, 0, 0, 0]
+                    ),
+                    Errno::ENOTDIR.to_syscall_return()
+                );
+            }
+        }
         // Size 0, as Linux's, but read to the end.
         const STAT: u64 = DATA + 0x900;
         m.write(GuestAddr(STAT), b"/proc/sysvipc/shm\0").unwrap();

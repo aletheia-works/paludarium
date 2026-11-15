@@ -6115,6 +6115,8 @@ fn open_path(
         }
     } else if let Some(entry) = crate::sysctl::entry(p) {
         crate::sysctl::open(c, entry, flags)?
+    } else if crate::proc::below_system_entry(p) {
+        return Err(Errno::ENOTDIR);
     } else if crate::proc::is_sysvipc(p) {
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
@@ -6999,6 +7001,7 @@ fn known_stat(
             device(c, path),
             BLOCK_SIZE,
         ))),
+        None if crate::proc::below_system_entry(path) => Err(Errno::ENOTDIR),
         None => Ok(other_generated_stat(c, path, follow)),
     }
 }

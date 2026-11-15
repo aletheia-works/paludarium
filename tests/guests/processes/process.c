@@ -12223,6 +12223,17 @@ static int sysvipc_work(void) {
     errno = 0;
     r = stat("/proc/sysvipc/other", &st);
     printf("missing stat=%d errno=%d\n", r, errno);
+    /* On past one of the files, as past any file. */
+    const char *past[] = {"/proc/sysvipc/msg/", "/proc/sysvipc/shm/x", "/proc/loadavg/"};
+    for (int i = 0; i < 3; i++) {
+        errno = 0;
+        r = stat(past[i], &st);
+        int stat_errno = errno;
+        errno = 0;
+        int fd = open(past[i], O_RDONLY);
+        printf("past %s stat=%d errno=%d open=%d errno=%d\n", past[i], r, stat_errno, fd, errno);
+        if (fd >= 0) close(fd);
+    }
     int listed = 0;
     d = opendir("/proc");
     while (d && (e = readdir(d))) listed += !strcmp(e->d_name, "sysvipc") && e->d_type == DT_DIR;

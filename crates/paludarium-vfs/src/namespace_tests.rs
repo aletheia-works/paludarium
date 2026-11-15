@@ -388,3 +388,50 @@ fn a_bind_mount_follows_a_rename_of_its_source() {
     assert!(fs.metadata(b"/tmp/b/a", true).is_ok());
     assert_eq!(fs.mounts().pop().unwrap().root, b"/dst");
 }
+
+#[test]
+fn a_recursive_bind_of_the_root_copies_the_boot_mounts() {
+    let base = MemFs::new();
+    base.mkdir(b"/tmp", 0o1777).unwrap();
+    let host =
+        std::env::temp_dir().join(format!("paludarium-namespace-boot-{}", std::process::id()));
+    std::fs::create_dir(&host).unwrap();
+    let mut mounted = MountedFs::new(base);
+    mounted
+        .mount(
+            b"/data".to_vec(),
+            Arc::new(paludarium_host::NativeFs::new(&host).unwrap()),
+        )
+        .unwrap();
+    mounted.mkdir(b"/data/sub", 0o755).unwrap();
+    mounted
+        .open(b"/data/sub/x", 66, 0o644)
+        .unwrap()
+        .write(b"in")
+        .unwrap();
+    let lower: Arc<dyn FileSystem> = Arc::new(mounted);
+    let fs = NamespacedFs::new(Arc::clone(&lower), MountTable::new(&*lower));
+    fs.mkdir(b"/tmp/r", 0o755).unwrap();
+    fs.mkdir(b"/tmp/t", 0o755).unwrap();
+    fs.bind(b"/", b"/tmp/r", true).unwrap();
+    let x = fs.metadata(b"/tmp/r/data/sub/x", true).unwrap();
+    assert_eq!(x, fs.metadata(b"/data/sub/x", true).unwrap());
+    assert_eq!(fs.device(b"/tmp/r/data"), fs.device(b"/data"));
+    // A part of a boot mount, with its root in that mount's coordinates.
+    fs.bind(b"/data/sub", b"/tmp/t", false).unwrap();
+    assert_eq!(fs.metadata(b"/tmp/t/x", true).unwrap(), x);
+    let mounts = fs.mounts();
+    let at = |p: &[u8]| mounts.iter().find(|m| m.path == p).unwrap().clone();
+    let (r, copy, t) = (at(b"/tmp/r"), at(b"/tmp/r/data"), at(b"/tmp/t"));
+    assert_eq!(
+        (r.root.as_slice(), copy.root.as_slice()),
+        (&b"/"[..], &b"/"[..])
+    );
+    assert_eq!(copy.parent, r.id);
+    assert_eq!(copy.device, at(b"/data").device);
+    assert_eq!(t.root, b"/sub");
+    assert_eq!(fs.mount_id(b"/tmp/t/x"), t.id);
+    assert_eq!(fs.mount_id(b"/tmp/r/data/sub"), copy.id);
+    drop((fs, lower));
+    std::fs::remove_dir_all(&host).unwrap();
+}

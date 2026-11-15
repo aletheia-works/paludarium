@@ -51,13 +51,19 @@ jobs:
       production_wasm: ${{ steps.groups.outputs.production_wasm }}
       docs: ${{ steps.groups.outputs.docs }}
       release_check: ${{ steps.groups.outputs.release_check }}
+      fuzz_targets: ${{ steps.groups.outputs.fuzz_targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The fuzz selection reads cargo metadata; the runner's stable cargo
+      # does that without installing the pinned nightly.
       - run: python3 scripts/ci-changes.py --self-test
+        env:
+          RUSTUP_TOOLCHAIN: stable
       - id: groups
         env:
+          RUSTUP_TOOLCHAIN: stable
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
@@ -74,10 +80,31 @@ jobs:
     needs: [changes, quick]
     if: needs.changes.outputs.wasm == 'true'
     uses: ./.github/workflows/wasm-programs.yml
+  # Only the targets the changes can affect. None chosen skips the job; a
+  # failed choice fails changes, and so ci-ok.
   fuzz:
     needs: [changes, quick]
-    if: needs.changes.outputs.fuzz == 'true'
+    if: needs.changes.outputs.fuzz == 'true' && needs.changes.outputs.fuzz_targets != '[]'
     uses: ./.github/workflows/fuzz-pr.yml
+    with:
+      targets: ${{ needs.changes.outputs.fuzz_targets }}
+  # Every fuzz bin still compiles whenever the fuzz group is needed, also
+  # when the change reaches none of the targets fuzz runs (the JIT targets
+  # are only fuzzed nightly).
+  fuzz-build:
+    name: fuzz targets build
+    needs: changes
+    if: needs.changes.outputs.fuzz == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        # Retried: static.rust-lang.org downloads sometimes fail on CI.
+        uses: ./.github/actions/rust-toolchain
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
   programs:
     name: fixed guest programs
     needs: [changes, quick]
@@ -585,6 +612,7 @@ jobs:
       - changes
       - wasm-programs
       - fuzz
+      - fuzz-build
       - programs
       - polyglot-lint
       - docs

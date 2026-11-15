@@ -136,6 +136,20 @@ each run for 600 seconds with AddressSanitizer and LeakSanitizer, every night.
 Fuzzing for a fixed time does not prove that every input is safe, but it keeps
 checking that no guest input makes the emulator panic.
 
+A pull request also fuzzes seven of them (`vfs_paths`, `load_elf`,
+`syscall_args` and the four `kernel_*`), for the same 600 seconds with the
+same sanitizers, from `-seed=1` and an empty corpus. As the seed and corpus
+are fixed, a target that does not link the changed code repeats main's search,
+so only the targets that can see the change run. A target links the
+workspace packages its source names (with the modules it includes by
+`#[path]`) and their dependencies, which `scripts/ci-changes.py` reads from
+`cargo metadata`; a change to one of those packages runs the target. A
+change to a manifest, `Cargo.lock`, `rust-toolchain.toml`, `fuzz/`,
+`fuzz-pr.yml`, the selection script or anything else the fuzz group needs,
+and every push to main, run all seven. When no target can see the change,
+the fuzz job is skipped; a separate job still checks that all fourteen
+targets build whenever the change could affect them.
+
 ## Memory order
 
 Litmus tests (`crates/paludarium-cpu/tests/litmus.rs`) run small programs of
@@ -183,7 +197,7 @@ every test passing.
 
 | When | What |
 |---|---|
-| Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux; part of the fuzzing |
+| Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux; fuzzing of the seven pull-request targets the change can affect (above) |
 | Every night | fuzzing of the 14 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
 | Every day | every scheduled workflow is checked to have started on time; one that failed to start, did not run or was disabled opens an Issue |
 | Every week | the pinned nightly Rust, the workspace's `rust-version` (the latest stable Rust) and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
@@ -193,7 +207,7 @@ On a pull request and on a push to main, the expensive jobs — the
 differential tests, coverage, fuzzing, the guest programs and the
 WebAssembly checks — start only after the quick stage passed: lint, clippy
 (also with the stable Rust), polyglot lint and the Linux unit tests, which
-take about two minutes. A head that fails them, or that a later push
+take two to four minutes. A head that fails them, or that a later push
 supersedes in those minutes, takes no runners for the long jobs. `ci-ok`,
 the required check, needs every job itself, so a job skipped because the
 quick stage failed cannot make it pass; `scripts/ci-changes.py --self-test`

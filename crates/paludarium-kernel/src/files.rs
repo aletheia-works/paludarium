@@ -412,6 +412,38 @@ impl Files {
             limit,
         )
     }
+    /// Installs `file`, opened at `path` as an open by path makes it (a
+    /// descriptor a fanotify event gives).
+    pub(crate) fn install_at(
+        &mut self,
+        file: Arc<dyn FileHandle>,
+        path: Vec<u8>,
+        cloexec: bool,
+        limit: u64,
+    ) -> Result<u32, Errno> {
+        self.allocate(
+            Descriptor {
+                file,
+                path,
+                cloexec,
+                opened: true,
+                listed: Arc::default(),
+                landlock: crate::landlock::FS,
+            },
+            0,
+            limit,
+        )
+    }
+    /// Takes descriptor `fd` out again, as a read that installed it and then
+    /// failed does (`put_unused_fd`).
+    pub(crate) fn uninstall(&mut self, fd: u32) {
+        let closed = self
+            .fds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&fd);
+        drop(closed);
+    }
     /// Installs a pair, as pipe and socketpair do: both descriptors or, with
     /// fewer than two free below `limit`, neither (EMFILE). One lock covers
     /// both, so no other thread sees only the first.
@@ -890,6 +922,46 @@ pub(crate) fn watched(
     crate::permissions::permission(&c.process.credentials, &stat, 4)?;
     Ok(((device, stat.inode), kind))
 }
+/// What `fanotify_mark` marks (`fanotify_find_path`): the file the path at
+/// `ptr` names from `dir` (the last symbolic link itself without `follow`, a
+/// directory with `directory`), or the file of descriptor `dir` itself for
+/// no path; by its device and inode, with its status and file system.
+pub(crate) struct Marked {
+    pub(crate) key: crate::page_cache::Key,
+    pub(crate) stat: FileStat,
+    pub(crate) kind: u64,
+}
+pub(crate) fn marked(
+    c: &Context<'_>,
+    dir: u64,
+    ptr: u64,
+    follow: bool,
+    directory: bool,
+) -> Result<Marked, Errno> {
+    let (stat, device, kind) = if ptr == 0 {
+        let d = c.files.descriptor(dir)?;
+        if d.file.flags() & O_PATH != 0 {
+            return Err(Errno::EBADF);
+        }
+        let stat = d.file.stat()?;
+        if directory && stat.mode & 0o170000 != 0o040000 {
+            return Err(Errno::ENOTDIR);
+        }
+        (stat, descriptor_device(c, &d), descriptor_kind(c, &d)?)
+    } else {
+        let (p, _) = looked_up(c, dir, ptr, follow || directory)?;
+        let found = named(c, &p, follow || directory)?;
+        if directory && found.0.mode & 0o170000 != 0o040000 {
+            return Err(Errno::ENOTDIR);
+        }
+        found
+    };
+    Ok(Marked {
+        key: (device, stat.inode),
+        stat,
+        kind,
+    })
+}
 /// The device of the file `path` names, by the mount it is in once its
 /// links are resolved, as the changes inotify hears of name it.
 fn watched_device(c: &Context<'_>, path: &[u8], follow: bool) -> u64 {
@@ -985,8 +1057,16 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
             .or_else(|_| c.files.fs().statfs(b"/"))?,
     })
 }
-/// Linux's 120-byte `struct statfs`. `f_flags` is ST_VALID and `f_fsid` 0.
-fn write_statfs(c: &Context<'_>, addr: u64, s: paludarium_host::FsStats) -> Result<u64, Errno> {
+/// Linux's 120-byte `struct statfs` of the file system on `device`.
+/// `f_flags` is ST_VALID and `f_fsid` [`crate::fanotify::fsid`]'s.
+fn write_statfs(
+    c: &Context<'_>,
+    addr: u64,
+    s: paludarium_host::FsStats,
+    device: u64,
+) -> Result<u64, Errno> {
+    let fsid = crate::fanotify::fsid(c, device, s.kind);
+    let fsid = u64::from(fsid[0]) | u64::from(fsid[1]) << 32;
     let mut b = [0u8; 120];
     for (i, v) in [
         s.kind,
@@ -996,7 +1076,7 @@ fn write_statfs(c: &Context<'_>, addr: u64, s: paludarium_host::FsStats) -> Resu
         s.blocks_available,
         s.files,
         s.files_free,
-        0, // f_fsid
+        fsid,
         s.name_max,
         s.block_size, // f_frsize
         0x20,         // f_flags: ST_VALID
@@ -2591,7 +2671,20 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     if let Some(instance) = crate::inotify::of(&file) {
-        return readv_instance(c, instance, a, flags);
+        return readv_instance(
+            c,
+            &|c, base, length| crate::inotify::read_guest(c, instance, base, length),
+            a,
+            flags,
+        );
+    }
+    if let Some(group) = crate::fanotify::of(&file) {
+        return readv_instance(
+            c,
+            &|c, base, length| crate::fanotify::read_guest(c, group, base, length),
+            a,
+            flags,
+        );
     }
     let segments = iovecs(c, a[1], a[2], true)?;
     let total = segments.iter().map(|(_, length)| length).sum::<usize>();
@@ -2616,7 +2709,7 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
 /// nothing to do for no bytes, and any flag but `RWF_HIPRI` `EOPNOTSUPP`.
 fn readv_instance(
     c: &mut Context<'_>,
-    instance: &crate::inotify::Instance,
+    read_guest: &dyn Fn(&mut Context<'_>, u64, usize) -> Result<usize, Errno>,
     a: [u64; 6],
     flags: u32,
 ) -> Result<u64, Errno> {
@@ -2629,7 +2722,7 @@ fn readv_instance(
     }
     let mut done = 0;
     for (base, length) in segments {
-        match crate::inotify::read_guest(c, instance, base, length) {
+        match read_guest(c, base, length) {
             Ok(count) => {
                 done += count as u64;
                 if count != length {
@@ -2789,6 +2882,10 @@ fn read_waiting(
     }
     // An inotify instance reads its events.
     if let Some(result) = crate::inotify::read(c, file, b, nowait) {
+        return result;
+    }
+    // So does a fanotify group.
+    if let Some(result) = crate::fanotify::read(c, file, b, nowait) {
         return result;
     }
     // A socket's read waits as its SO_RCVLOWAT says. A pipe is a PipeEnd,
@@ -3005,7 +3102,7 @@ pub(crate) fn file_handle(kind: u64, device: u64, inode: u64) -> (u32, Vec<u8>) 
 /// Whether the file system `kind` has Linux's NFS export operations, so
 /// that it gives a handle that is not `AT_HANDLE_FID` and decodes one: tmpfs
 /// and pidfs here.
-fn exportable(kind: u64) -> bool {
+pub(crate) fn exportable(kind: u64) -> bool {
     matches!(kind, paludarium_vfs::TMPFS_MAGIC | PID_FS_MAGIC)
 }
 /// `name_to_handle_at(dirfd, path, handle, mount_id, flags)`, as Linux's
@@ -3341,7 +3438,7 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
 /// numbers it: its minor number is its position there, from 21. An internal
 /// file system's mount ([`Internal`]) has one of the small IDs below those,
 /// as Linux's `kern_mount`s take theirs first, at boot.
-fn mount_id(device: u64) -> u64 {
+pub(crate) fn mount_id(device: u64) -> u64 {
     match Internal::ALL.iter().position(|fs| fs.device() == device) {
         Some(i) => i as u64 + 1,
         None => 20 + (device & 0xff | (device >> 12) & !0xff),
@@ -3711,11 +3808,14 @@ fn notify_descriptor(c: &Context<'_>, fd: u64, mask: u32) {
     let Ok(stat) = d.file.stat() else {
         return;
     };
+    let fs = c.files.fs();
+    let opener = || crate::fanotify::path_opener(&fs, &d.path);
     c.files.caches.notify.file_event(
-        Some((&*c.files.fs(), &d.path, false)),
+        Some((&*fs, &d.path, false)),
         descriptor_device(c, &d),
         &stat,
         mask,
+        &opener,
     );
 }
 pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
@@ -3841,6 +3941,20 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             {
                 crate::sockets::access_ok_u64(a[1], a[2])?;
                 return crate::inotify::read_guest(c, instance, a[1], len).map(|n| n as u64);
+            }
+            if n == 0
+                && let Some(d) = &d
+                && let Some(group) = crate::fanotify::of(&d.file)
+            {
+                crate::sockets::access_ok_u64(a[1], a[2])?;
+                return crate::fanotify::read_guest(c, group, a[1], len).map(|n| n as u64);
+            }
+            // A fanotify group takes responses to its permission events.
+            if n == 1
+                && let Some(d) = &d
+                && let Some(result) = crate::fanotify::write(c, &d.file, a[1], len as u64)
+            {
+                return result;
             }
             if n == 1 {
                 c.mem
@@ -4531,12 +4645,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         137 => {
             let (p, _) = looked_up(c, (-100i32) as u64, a[0], true)?;
             let stats = path_statfs(c, &p)?;
-            write_statfs(c, a[1], stats)
+            write_statfs(c, a[1], stats, watched_device(c, &p, true))
         }
         138 => {
             let d = c.files.descriptor(a[0])?;
             let stats = descriptor_statfs(c, &d)?;
-            write_statfs(c, a[1], stats)
+            write_statfs(c, a[1], stats, descriptor_device(c, &d))
         }
         // access, faccessat, faccessat2
         21 => access(c, (-100i32) as u64, a[0], a[1], 0),
@@ -6572,6 +6686,10 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     if any.is_some_and(|v| v.is::<crate::inotify::Instance>()) {
         return Ok(b"anon_inode:inotify".to_vec());
     }
+    // `anon_inode_getfile_fmode("[fanotify]", ...)` with them.
+    if any.is_some_and(|v| v.is::<crate::fanotify::Group>()) {
+        return Ok(b"anon_inode:[fanotify]".to_vec());
+    }
     // So is a seccomp listener: "seccomp notify".
     if crate::seccomp::is_listener(&d.file) {
         return Ok(b"anon_inode:seccomp notify".to_vec());
@@ -6938,6 +7056,8 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     let any = d.file.as_any();
     if let Some(instance) = crate::inotify::of(&d.file) {
         out.extend(instance.fdinfo());
+    } else if let Some(group) = crate::fanotify::of(&d.file) {
+        out.extend(group.fdinfo());
     } else if let Some(counter) = any.and_then(|a| a.downcast_ref::<crate::events::EventCounter>())
     {
         out.extend(counter.fdinfo());

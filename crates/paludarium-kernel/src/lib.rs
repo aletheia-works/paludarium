@@ -23,6 +23,7 @@ mod aio;
 mod devices;
 mod epoll;
 mod events;
+mod fanotify;
 mod fasync;
 mod fifo;
 mod files;
@@ -580,6 +581,7 @@ impl Kernel {
         notify: &seccomp::Notify,
     ) -> Option<Next> {
         memfd::enter(self.group.memlock());
+        fanotify::enter(thread.state.pid, thread.tid);
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number,
@@ -1127,6 +1129,7 @@ impl Kernel {
             return Next::Resume;
         };
         memfd::enter(self.group.memlock());
+        fanotify::enter(thread.state.pid, thread.tid);
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number,
@@ -1182,6 +1185,8 @@ mod threads_tests;
 #[cfg(test)]
 mod events_tests;
 
+#[cfg(test)]
+mod fanotify_tests;
 #[cfg(test)]
 mod keys_tests;
 #[cfg(test)]

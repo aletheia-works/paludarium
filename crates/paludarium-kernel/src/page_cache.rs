@@ -390,6 +390,15 @@ impl PageCaches {
     }
     /// Write access to `key`, which a program running from it refuses
     /// (ETXTBSY), as Linux's `get_write_access`.
+    /// Whether a description of `key` is open for writing
+    /// (`inode_is_open_for_write`).
+    pub(crate) fn open_for_write(&self, key: Key) -> bool {
+        self.writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|&count| count > 0)
+    }
     pub(crate) fn write_access(self: &Arc<Self>, key: Key) -> Result<WriteAccess, Errno> {
         self.count(key, 1)
     }
@@ -757,6 +766,26 @@ pub(crate) struct CoherentFile {
     /// For a description the guest opened, whether for writing: its last
     /// close is `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` (`fsnotify_close`).
     opened: Option<bool>,
+    /// A description that tells no watch of anything (`FMODE_NONOTIFY`),
+    /// as the descriptor a fanotify event gives.
+    quiet: bool,
+}
+
+thread_local! {
+    /// Set while the kernel opens a description that tells no watch of
+    /// anything ([`nonotify`]).
+    static NONOTIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Runs `f`, whose opens make descriptions that tell no watch of anything
+/// (`FMODE_NONOTIFY`): the descriptors fanotify events give.
+pub(crate) fn nonotify<T>(f: impl FnOnce() -> T) -> T {
+    let was = NONOTIFY.with(|quiet| quiet.replace(true));
+    let value = f();
+    NONOTIFY.with(|quiet| quiet.set(was));
+    value
+}
+fn quiet_now() -> bool {
+    NONOTIFY.with(std::cell::Cell::get)
 }
 
 impl Drop for CoherentFile {
@@ -808,6 +837,7 @@ impl CoherentFile {
             key: OnceLock::new(),
             write: None,
             opened: None,
+            quiet: quiet_now(),
         };
         file.list();
         file
@@ -863,7 +893,7 @@ impl CoherentFile {
     /// watches hear `IN_OPEN` (`fsnotify_open`), and will hear its close.
     fn opened(mut self, flags: u32) -> Self {
         self.list();
-        if flags & O_PATH == 0 && crate::inotify::reported_open() {
+        if flags & O_PATH == 0 && !self.quiet && crate::inotify::reported_open() {
             self.opened = Some(flags & 3 != 0);
             self.event(crate::inotify::OPEN);
         }
@@ -880,7 +910,7 @@ impl CoherentFile {
     }
     fn tell(&self, mask: u32, content: bool) {
         let notify = &self.caches.notify;
-        if mask == 0 || !notify.watching() {
+        if mask == 0 || self.quiet || !notify.watching() {
             return;
         }
         let Ok(stat) = self.inner.stat() else {
@@ -900,10 +930,33 @@ impl CoherentFile {
             .as_ref()
             .map(|(fs, path, unlinked)| (&**fs, &path[..], *unlinked));
         if content {
-            notify.file_event(place, device, &stat, mask);
+            notify.file_event(place, device, &stat, mask, &|| self.opener());
         } else {
             notify.changed_file(place, device, &stat, mask);
         }
+    }
+    /// What opens this file again as a description that tells no watch of
+    /// anything, as fanotify's `dentry_open_nonotify` of its path does: the
+    /// same dentry, wherever it is now, removed or not.
+    fn opener(&self) -> crate::fanotify::Opener {
+        let inner = Arc::clone(&self.inner);
+        let caches = Arc::clone(&self.caches);
+        let device = self.device.copy();
+        let key = self.key.get().copied();
+        Arc::new(move |flags| {
+            let file = CoherentFile {
+                inner: inner.reopen(flags)?,
+                caches: Arc::clone(&caches),
+                device: device.copy(),
+                key: key.map_or_else(OnceLock::new, OnceLock::from),
+                write: None,
+                opened: None,
+                quiet: true,
+            }
+            .writing(flags)?
+            .opened(flags);
+            Ok(Arc::new(file) as Arc<dyn FileHandle>)
+        })
     }
     /// Writes the cache back before the file is read. A page that cannot be
     /// written stays dirty and the read goes on, as a Linux read does not
@@ -933,6 +986,7 @@ impl FileHandle for CoherentFile {
                 .map_or_else(OnceLock::new, OnceLock::from),
             write: None,
             opened: None,
+            quiet: self.quiet || quiet_now(),
         }
         .writing(flags)?
         .opened(flags);
@@ -1153,6 +1207,7 @@ impl HostFs for CoherentFs {
             key: OnceLock::new(),
             write: None,
             opened: None,
+            quiet: quiet_now(),
         }
         .writing(flags)?
         .opened(flags);

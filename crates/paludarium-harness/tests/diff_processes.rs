@@ -131,7 +131,8 @@ mod linux {
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
             // addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
-            // its own, for its counts), the keys cases, which set up keyrings as root
+            // its own, for its counts), the fanotify cases, whose groups and
+            // marks need CAP_SYS_ADMIN, the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
             // limits and become an unprivileged user, the scheduling-set case, which sets
@@ -176,6 +177,12 @@ mod linux {
                     | "mqueue-room"
                     | "mqueue-congested"
                     | "mqueue-links"
+                    | "fanotify-init"
+                    | "fanotify-marks"
+                    | "fanotify-events"
+                    | "fanotify-fid"
+                    | "fanotify-pidfd"
+                    | "fanotify-unprivileged"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -451,6 +458,12 @@ mod linux {
         inotify_exec_order => ("inotify-exec-order","inotify"),
         inotify_handles => ("inotify-handles","inotify"),
         inotify_open_handles => ("inotify-open-handles","inotify"),
+        fanotify_init => ("fanotify-init","fanotify"),
+        fanotify_marks => ("fanotify-marks","fanotify"),
+        fanotify_events => ("fanotify-events","fanotify"),
+        fanotify_fid => ("fanotify-fid","fanotify"),
+        fanotify_pidfd => ("fanotify-pidfd","fanotify"),
+        fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

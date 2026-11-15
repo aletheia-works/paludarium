@@ -17,7 +17,7 @@ use paludarium_host::{FileHandle, FileStat, HostFs};
 use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::{FileSystem, mount_device};
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
@@ -271,7 +271,9 @@ impl Closing {
         }
         if let Some(file) = &self.file {
             if !file.notify_event(mask) {
-                notify.file_event(None, self.device, &self.node, mask);
+                notify.file_event(None, self.device, &self.node, mask, &|| {
+                    Arc::new(|_| Err(Errno::ENOENT)) as crate::fanotify::Opener
+                });
             }
             return;
         }
@@ -283,7 +285,14 @@ impl Closing {
             Ok(now) if now.inode == node.inode && !unlinked => now.links,
             _ => 0,
         };
-        notify.file_event(Some((&*self.fs, &path, unlinked)), self.device, &node, mask);
+        let opener = || crate::fanotify::path_opener(&self.fs, &path);
+        notify.file_event(
+            Some((&*self.fs, &path, unlinked)),
+            self.device,
+            &node,
+            mask,
+            &opener,
+        );
     }
 }
 impl Drop for Closing {
@@ -333,12 +342,14 @@ pub(crate) struct Notifier {
     /// Files whose last link went while a description of them was open:
     /// their `IN_DELETE_SELF` waits for its last close, as Linux's waits
     /// for the dentry's last reference.
-    pending: Mutex<HashSet<Key>>,
+    pending: Mutex<HashMap<Key, Found>>,
     /// Whether `pending` holds any, which a close looks at first.
     waiting: AtomicUsize,
     /// Linux's `fsnotify_sync_cookie`, which ties a rename's two events.
     cookie: AtomicU32,
     registry: Mutex<Registry>,
+    /// The fanotify groups' marks, which hear of the same changes.
+    pub(crate) fan: Arc<crate::fanotify::Registry>,
 }
 
 #[derive(Default)]
@@ -351,23 +362,50 @@ struct Registry {
 
 /// A file a change names: where it is, if anywhere, and what is there.
 pub(crate) struct Named {
-    /// Its directory, when it has one, and its name in it.
+    /// Its directory, when it has one, with its file system (`f_type`),
+    /// and its name in it.
     parent: Option<Key>,
+    parent_kind: u64,
     name: Vec<u8>,
     file: Option<Found>,
 }
+impl Named {
+    /// Its directory, as fanotify names it.
+    fn directory(&self) -> Option<crate::fanotify::Object> {
+        self.parent.map(|key| crate::fanotify::Object {
+            key,
+            kind: self.parent_kind,
+            directory: true,
+            regular: false,
+        })
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Found {
+pub(crate) struct Found {
     key: Key,
     directory: bool,
     links: u64,
+    /// Its file system (`f_type`), when fanotify needs it, and whether it
+    /// is a regular file.
+    kind: u64,
+    regular: bool,
 }
 impl Found {
-    fn of(device: u64, stat: &FileStat) -> Self {
+    fn of(device: u64, stat: &FileStat, kind: u64) -> Self {
         Found {
             key: (device, stat.inode),
             directory: stat.mode & 0o170000 == 0o040000,
             links: stat.links,
+            kind,
+            regular: stat.mode & 0o170000 == 0o100000,
+        }
+    }
+    fn object(self) -> crate::fanotify::Object {
+        crate::fanotify::Object {
+            key: self.key,
+            kind: self.kind,
+            directory: self.directory,
+            regular: self.regular,
         }
     }
     fn isdir(self) -> u32 {
@@ -394,7 +432,7 @@ fn split(path: &[u8]) -> Option<(&[u8], &[u8])> {
 impl Notifier {
     /// Whether any watch exists, which a change must be told to.
     pub(crate) fn watching(&self) -> bool {
-        self.watches.load(Ordering::SeqCst) != 0 && !QUIET.with(Cell::get)
+        (self.watches.load(Ordering::SeqCst) != 0 || self.fan.active()) && !QUIET.with(Cell::get)
     }
     fn instances(&self) -> Vec<Arc<Instance>> {
         let registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
@@ -409,7 +447,7 @@ impl Notifier {
     }
     /// What `path` names in `fs`: the file itself with `follow`, the last
     /// symbolic link otherwise.
-    pub(crate) fn named(fs: &dyn FileSystem, path: &[u8], follow: bool) -> Option<Named> {
+    pub(crate) fn named(&self, fs: &dyn FileSystem, path: &[u8], follow: bool) -> Option<Named> {
         let path = if follow {
             resolved(fs, path)?
         } else {
@@ -422,20 +460,35 @@ impl Notifier {
             path
         };
         let mounts = fs.mounts();
+        // The file systems fanotify's handles name, looked at only for it.
+        let kinds = self.fan.active();
+        let kind = |p: &[u8]| {
+            if kinds {
+                fs.statfs(p).map_or(0, |s| s.kind)
+            } else {
+                0
+            }
+        };
         let file = fs
             .metadata(&path, false)
             .ok()
-            .map(|stat| Found::of(mount_device(&mounts, &path), &stat));
-        let (parent, name) = match split(&path) {
+            .map(|stat| Found::of(mount_device(&mounts, &path), &stat, kind(&path)));
+        let (parent, parent_kind, name) = match split(&path) {
             Some((directory, name)) => (
                 fs.metadata(directory, true)
                     .ok()
                     .map(|stat| (mount_device(&mounts, directory), stat.inode)),
+                kind(directory),
                 name.to_vec(),
             ),
-            None => (None, Vec::new()),
+            None => (None, 0, Vec::new()),
         };
-        Some(Named { parent, name, file })
+        Some(Named {
+            parent,
+            parent_kind,
+            name,
+            file,
+        })
     }
     /// An event of a directory's entry (`fsnotify_name`): to the watches of
     /// the directory, with the name.
@@ -453,17 +506,37 @@ impl Notifier {
         for instance in self.instances() {
             instance.report(file.key, mask | file.isdir(), b"", 0, false);
         }
+        self.fan.inode_event(mask, file.object());
     }
     /// An event of a file that its directory hears of too
     /// (`fsnotify_parent`): to the directory's watches with the file's name,
     /// then to the file's without.
-    fn child(&self, named: Option<&Named>, file: Found, mask: u32, unlinked: bool) {
-        let mask = mask | file.isdir();
+    fn child(
+        &self,
+        named: Option<&Named>,
+        file: Found,
+        mask: u32,
+        unlinked: bool,
+        path: Option<(&[u8], &dyn Fn() -> crate::fanotify::Opener)>,
+        special: bool,
+    ) {
         for instance in self.instances() {
             if let Some(parent) = named.and_then(|named| named.parent.map(|p| (p, named))) {
-                instance.report(parent.0, mask, &parent.1.name, 0, unlinked);
+                instance.report(parent.0, mask | file.isdir(), &parent.1.name, 0, unlinked);
             }
-            instance.report(file.key, mask, b"", 0, unlinked);
+            instance.report(file.key, mask | file.isdir(), b"", 0, unlinked);
+        }
+        if self.fan.active() {
+            let data = match path {
+                Some((path, opener)) => crate::fanotify::Data::Path {
+                    object: file.object(),
+                    path: path.to_vec(),
+                    opener,
+                },
+                None => crate::fanotify::Data::Inode(file.object()),
+            };
+            let parent = named.and_then(|named| Some((named.directory()?, &named.name[..])));
+            self.fan.parent_event(mask, data, parent, special);
         }
     }
     /// A file whose last link is gone (`fsnotify_inoderemove`): its watches
@@ -473,7 +546,7 @@ impl Notifier {
         if held(file.key) {
             {
                 let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-                if pending.insert(file.key) {
+                if pending.insert(file.key, file).is_none() {
                     self.waiting.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -484,19 +557,31 @@ impl Notifier {
             }
             return;
         }
-        self.gone(file.key);
+        self.gone(file);
     }
-    fn gone(&self, key: Key) {
+    fn gone(&self, file: Found) {
+        let key = file.key;
         for instance in self.instances() {
             instance.report(key, DELETE_SELF, b"", 0, false);
             instance.forget(key);
+        }
+        if self.fan.active() {
+            self.fan.inode_event(DELETE_SELF, file.object());
+            self.fan.gone(key);
         }
     }
     /// A file no name ever linked (a memfd), which ends, as a removed one
     /// does, at its last close.
     pub(crate) fn unlinked_from_start(&self, key: Key) {
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        if pending.insert(key) {
+        let file = Found {
+            key,
+            directory: false,
+            links: 0,
+            kind: paludarium_vfs::TMPFS_MAGIC,
+            regular: true,
+        };
+        if pending.insert(key, file).is_none() {
             self.waiting.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -511,9 +596,9 @@ impl Notifier {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
             pending.remove(&key)
         };
-        if removed {
+        if let Some(file) = removed {
             self.waiting.fetch_sub(1, Ordering::SeqCst);
-            self.gone(key);
+            self.gone(file);
         }
     }
 
@@ -522,10 +607,39 @@ impl Notifier {
         if !self.watching() {
             return;
         }
-        if let Some(named) = Self::named(fs, path, false) {
+        if let Some(named) = self.named(fs, path, false) {
             let isdir = named.file.map_or(0, Found::isdir);
             self.entry(named.parent, CREATE | isdir, &named.name, 0);
+            self.fan_entry(&named, CREATE | isdir, None);
         }
+    }
+    /// An event of a directory's entry, as the fanotify groups hear of it:
+    /// with the file it names, and for a rename's new entry the file moved
+    /// there.
+    fn fan_entry(&self, named: &Named, mask: u32, rename: Option<(Found, &Named)>) {
+        if !self.fan.active() {
+            return;
+        }
+        let Some(dir) = named.directory() else {
+            return;
+        };
+        let data = match rename {
+            Some((moved, to)) => {
+                let Some(to_dir) = to.directory() else {
+                    return;
+                };
+                crate::fanotify::Data::Rename {
+                    moved: moved.object(),
+                    dir: to_dir,
+                    name: &to.name,
+                }
+            }
+            None => match named.file {
+                Some(file) => crate::fanotify::Data::Inode(file.object()),
+                None => return,
+            },
+        };
+        self.fan.entry_event(mask, data, dir, &named.name);
     }
     /// A new link at `path` to a file (`fsnotify_link`): the file's link
     /// count, then the entry.
@@ -533,17 +647,18 @@ impl Notifier {
         if !self.watching() {
             return;
         }
-        if let Some(named) = Self::named(fs, path, false) {
+        if let Some(named) = self.named(fs, path, false) {
             if let Some(file) = named.file {
                 self.inode(file, ATTRIB);
             }
             self.entry(named.parent, CREATE, &named.name, 0);
+            self.fan_entry(&named, CREATE, None);
         }
     }
     /// What an `unlink` or `rmdir` of `path` is about to remove.
     pub(crate) fn before_removal(&self, fs: &dyn FileSystem, path: &[u8]) -> Option<Named> {
         self.watching()
-            .then(|| Self::named(fs, path, false))
+            .then(|| self.named(fs, path, false))
             .flatten()
     }
     /// `unlink` and `rmdir` (`vfs_unlink`, `vfs_rmdir`): a file's link
@@ -559,6 +674,7 @@ impl Notifier {
             self.removed(file, held);
         }
         self.entry(named.parent, DELETE | file.isdir(), &named.name, 0);
+        self.fan_entry(named, DELETE | file.isdir(), None);
     }
     /// What a rename from `old` to `new` is about to move and replace.
     pub(crate) fn before_rename(
@@ -570,7 +686,7 @@ impl Notifier {
         if !self.watching() {
             return None;
         }
-        Some((Self::named(fs, old, false)?, Self::named(fs, new, false)?))
+        Some((self.named(fs, old, false)?, self.named(fs, new, false)?))
     }
     /// `vfs_rename`'s `fsnotify_move`, twice for `RENAME_EXCHANGE`, then the
     /// end of a file it replaced, which goes as the call lets go of it.
@@ -601,8 +717,23 @@ impl Notifier {
     }
     fn moved(&self, from: &Named, to: &Named, source: Found, replaced: Option<Found>) {
         let cookie = self.cookie();
-        self.entry(from.parent, MOVED_FROM | source.isdir(), &from.name, cookie);
-        self.entry(to.parent, MOVED_TO | source.isdir(), &to.name, cookie);
+        let isdir = source.isdir();
+        // `FS_RENAME` first, to the old directory, of the file moved.
+        let from_source = Named {
+            parent: from.parent,
+            parent_kind: from.parent_kind,
+            name: from.name.clone(),
+            file: Some(source),
+        };
+        self.fan_entry(
+            &from_source,
+            crate::fanotify::RENAME | isdir,
+            Some((source, to)),
+        );
+        self.entry(from.parent, MOVED_FROM | isdir, &from.name, cookie);
+        self.fan_entry(&from_source, MOVED_FROM | isdir, None);
+        self.entry(to.parent, MOVED_TO | isdir, &to.name, cookie);
+        self.fan_entry(to, MOVED_TO | isdir, Some((source, to)));
         if let Some(target) = replaced {
             self.inode(target, ATTRIB);
         }
@@ -614,10 +745,10 @@ impl Notifier {
         if mask == 0 || !self.watching() {
             return;
         }
-        if let Some(named) = Self::named(fs, path, follow)
+        if let Some(named) = self.named(fs, path, follow)
             && let Some(file) = named.file
         {
-            self.child(Some(&named), file, mask, false);
+            self.child(Some(&named), file, mask, false, None, false);
         }
     }
     /// A change to an open file (`notify_change` of its dentry), which is
@@ -631,20 +762,22 @@ impl Notifier {
         stat: &FileStat,
         mask: u32,
     ) {
-        self.of_file(place, device, stat, mask, false);
+        self.of_file(place, device, stat, mask, None);
     }
     /// An event of an open file itself (`fsnotify_file`): opening,
     /// closing, reading or writing it. A watch with `IN_EXCL_UNLINK` does
     /// not hear of a file no name links any more, and the directory does
-    /// not hear of reads and writes of a FIFO or a device.
+    /// not hear of reads and writes of a FIFO or a device. A fanotify
+    /// group that reports descriptors opens one with `opener`.
     pub(crate) fn file_event(
         &self,
         place: Option<(&dyn FileSystem, &[u8], bool)>,
         device: u64,
         stat: &FileStat,
         mask: u32,
+        opener: &dyn Fn() -> crate::fanotify::Opener,
     ) {
-        self.of_file(place, device, stat, mask, true);
+        self.of_file(place, device, stat, mask, Some(opener));
     }
     fn of_file(
         &self,
@@ -652,12 +785,27 @@ impl Notifier {
         device: u64,
         stat: &FileStat,
         mask: u32,
-        content: bool,
+        opener: Option<&dyn Fn() -> crate::fanotify::Opener>,
     ) {
         if mask == 0 || !self.watching() {
             return;
         }
-        let file = Found::of(device, stat);
+        let content = opener.is_some();
+        // Its file system, for fanotify's handles: that of its path, or of
+        // the directory it was in, or shmem's for a file of a device of its
+        // own.
+        let kind = if self.fan.active() {
+            place
+                .and_then(|(fs, path, _)| {
+                    fs.statfs(path)
+                        .or_else(|_| fs.statfs(split(path).map_or(b"/", |(dir, _)| dir)))
+                        .ok()
+                })
+                .map_or(paludarium_vfs::TMPFS_MAGIC, |s| s.kind)
+        } else {
+            0
+        };
+        let file = Found::of(device, stat, kind);
         let special = !matches!(stat.mode & 0o170000, 0o100000 | 0o040000 | 0o120000);
         // An unlinked dentry keeps its name and directory, as it stays with
         // its parent; one whose path no longer names the file (a change the
@@ -666,9 +814,9 @@ impl Notifier {
         let named = place
             .and_then(|(fs, path, _)| {
                 if gone {
-                    Self::named(fs, path, false)
+                    self.named(fs, path, false)
                 } else {
-                    Self::named(fs, path, true)
+                    self.named(fs, path, true)
                         .filter(|named| named.file.is_some_and(|found| found.key == file.key))
                 }
             })
@@ -676,7 +824,17 @@ impl Notifier {
         // `fsnotify_handle_inode_event` skips either watch with
         // `IN_EXCL_UNLINK` for an unlinked dentry.
         let unlinked = content && gone;
-        self.child(named.as_ref(), file, mask, unlinked);
+        let path = opener
+            .zip(place)
+            .map(|(opener, (_, path, _))| (path, opener));
+        self.child(
+            named.as_ref(),
+            file,
+            mask,
+            unlinked,
+            path,
+            special && content,
+        );
     }
     /// The mask `set_times` reports (`fsnotify_change`): both times is
     /// `IN_ATTRIB`, only the access time `IN_ACCESS`, only the modification
@@ -1176,7 +1334,7 @@ pub(crate) fn read_guest(
 }
 
 /// How many of the `len` bytes at `at` the guest can write, from the start.
-fn writable(c: &Context<'_>, at: u64, len: usize) -> usize {
+pub(crate) fn writable(c: &Context<'_>, at: u64, len: usize) -> usize {
     let fits = |n: usize| n == 0 || c.mem.check_write(GuestAddr(at), n).is_ok();
     if fits(len) {
         return len;

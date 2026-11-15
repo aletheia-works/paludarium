@@ -9,7 +9,10 @@
 //! (`/proc/sys/fs/inotify`), as `fs/notify/inotify/inotify_user.c` has
 //! them, are root's in the same way: `max_user_instances` and
 //! `max_user_watches` unsigned longs from 0 to `INT_MAX`, and
-//! `max_queued_events` an `int` from 0.
+//! `max_queued_events` an `int` from 0; so are its fanotify limits
+//! (`/proc/sys/fs/fanotify`, `fs/notify/fanotify/fanotify_user.c`):
+//! `max_user_groups` and `max_user_marks` unsigned longs from 0 to
+//! `INT_MAX`, `max_queued_events` and `watchdog_timeout` `int`s from 0.
 //!
 //! Each file is the opener's IPC namespace's ([`crate::mqueue::Limits`]),
 //! so a new namespace shows Linux's defaults again. A read gives the value
@@ -45,6 +48,7 @@ pub(crate) enum Directory {
     Fs,
     Mqueue,
     Inotify,
+    Fanotify,
 }
 
 /// A file of `/proc/sys/fs/mqueue`.
@@ -105,6 +109,23 @@ const INOTIFY: [(&[u8], Inotify); 3] = [
     (b"max_user_watches", Inotify::UserWatches),
 ];
 
+/// A file of `/proc/sys/fs/fanotify`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fanotify {
+    QueuedEvents,
+    UserGroups,
+    UserMarks,
+    WatchdogTimeout,
+}
+
+/// The fanotify files by name, in the order Linux lists them (by name).
+const FANOTIFY: [(&[u8], Fanotify); 4] = [
+    (b"max_queued_events", Fanotify::QueuedEvents),
+    (b"max_user_groups", Fanotify::UserGroups),
+    (b"max_user_marks", Fanotify::UserMarks),
+    (b"watchdog_timeout", Fanotify::WatchdogTimeout),
+];
+
 /// What `path` names under `/proc/sys`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Entry {
@@ -112,6 +133,7 @@ pub(crate) enum Entry {
     Setting(Setting),
     Aio(Aio),
     Inotify(Inotify),
+    Fanotify(Fanotify),
 }
 
 /// The entry `path` names, if it is one of these.
@@ -126,9 +148,16 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
         b"/fs" => Some(Entry::Directory(Directory::Fs)),
         b"/fs/mqueue" => Some(Entry::Directory(Directory::Mqueue)),
         b"/fs/inotify" => Some(Entry::Directory(Directory::Inotify)),
+        b"/fs/fanotify" => Some(Entry::Directory(Directory::Fanotify)),
         b"/fs/aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
         b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
         _ => {
+            if let Some(name) = rest.strip_prefix(b"/fs/fanotify/") {
+                return FANOTIFY
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .map(|&(_, file)| Entry::Fanotify(file));
+            }
             if let Some(name) = rest.strip_prefix(b"/fs/inotify/") {
                 return INOTIFY
                     .iter()
@@ -151,11 +180,13 @@ pub(crate) fn entries(directory: Directory) -> Vec<DirectoryEntry> {
         Directory::Fs => vec![
             (b"aio-max-nr", DT_REG),
             (b"aio-nr", DT_REG),
+            (b"fanotify", DT_DIR),
             (b"inotify", DT_DIR),
             (b"mqueue", DT_DIR),
         ],
         Directory::Mqueue => SETTINGS.iter().map(|&(name, _)| (name, DT_REG)).collect(),
         Directory::Inotify => INOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
+        Directory::Fanotify => FANOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
     };
     [(&b"."[..], DT_DIR), (b"..", DT_DIR)]
         .into_iter()
@@ -205,6 +236,16 @@ fn inotify_line(limits: &crate::inotify::Limits, file: Inotify) -> Vec<u8> {
     }
 }
 
+/// The value of a fanotify file, as a line.
+fn fanotify_line(limits: &crate::fanotify::Limits, file: Fanotify) -> Vec<u8> {
+    match file {
+        Fanotify::QueuedEvents => line(limits.events.load(Ordering::SeqCst)),
+        Fanotify::WatchdogTimeout => line(limits.watchdog.load(Ordering::SeqCst)),
+        Fanotify::UserGroups => format!("{}\n", limits.groups.load(Ordering::SeqCst)).into_bytes(),
+        Fanotify::UserMarks => format!("{}\n", limits.marks.load(Ordering::SeqCst)).into_bytes(),
+    }
+}
+
 /// The status of `entry`: a directory anyone may read and search, a
 /// regular file of mode 0644, its owner's root's, or an aio file, root's,
 /// 0644 or for `aio-nr` 0444.
@@ -218,6 +259,10 @@ pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
         Entry::Inotify(file) => FileStat {
             mode: 0o100_644,
             ..crate::proc::stat(inotify_line(&c.files.caches.notify.limits, file).len())
+        },
+        Entry::Fanotify(file) => FileStat {
+            mode: 0o100_644,
+            ..crate::proc::stat(fanotify_line(&c.files.caches.notify.fan.limits, file).len())
         },
         Entry::Setting(setting) => {
             let (uid, gid) = owner(c);
@@ -273,6 +318,17 @@ pub(crate) fn open(
                 flags,
             }))
         }
+        Entry::Fanotify(file) => {
+            if flags & 3 != 0 && c.process.credentials.euid != 0 {
+                return Err(Errno::EACCES);
+            }
+            Ok(Arc::new(SettingFile {
+                value: Value::Fanotify(Arc::clone(&c.files.caches.notify.fan), file),
+                stat: stat(c, entry),
+                position: Mutex::new(0),
+                flags,
+            }))
+        }
         // `test_perm`: root has the owner's bits, everyone else the others'.
         Entry::Aio(aio) => {
             if flags & 3 != 0 && (aio == Aio::Nr || c.process.credentials.euid != 0) {
@@ -293,6 +349,7 @@ enum Value {
     Mqueue(Queues, Setting),
     Aio(Arc<crate::aio::Limits>, Aio),
     Inotify(Arc<crate::inotify::Notifier>, Inotify),
+    Fanotify(Arc<crate::fanotify::Registry>, Fanotify),
 }
 
 impl Value {
@@ -303,6 +360,7 @@ impl Value {
             }
             Self::Aio(limits, aio) => aio_line(limits, *aio),
             Self::Inotify(notifier, file) => inotify_line(&notifier.limits, *file),
+            Self::Fanotify(registry, file) => fanotify_line(&registry.limits, *file),
         }
     }
     /// Takes the value written at the start of the file: the bytes taken.
@@ -338,6 +396,30 @@ impl Value {
                     &limits.instances
                 } else {
                     &limits.watches
+                };
+                limit.store(value, Ordering::SeqCst);
+                Ok(consumed)
+            }
+            Self::Fanotify(registry, file) => {
+                let limits = &registry.limits;
+                let int = match file {
+                    Fanotify::QueuedEvents => Some(&limits.events),
+                    Fanotify::WatchdogTimeout => Some(&limits.watchdog),
+                    _ => None,
+                };
+                if let Some(int) = int {
+                    let (value, consumed) = parse(buf, Some((0, i32::MAX)))?;
+                    int.store(value, Ordering::SeqCst);
+                    return Ok(consumed);
+                }
+                let (negative, value, consumed) = scan(buf)?;
+                if negative || value > i32::MAX as u64 {
+                    return Err(Errno::EINVAL);
+                }
+                let limit = if *file == Fanotify::UserGroups {
+                    &limits.groups
+                } else {
+                    &limits.marks
                 };
                 limit.store(value, Ordering::SeqCst);
                 Ok(consumed)
@@ -533,7 +615,7 @@ mod tests {
             Some(Entry::Aio(Aio::MaxNr))
         );
         assert_eq!(entry(b"/proc/sys/fs/aio-nr"), Some(Entry::Aio(Aio::Nr)));
-        assert_eq!(entries(Directory::Fs).len(), 6);
+        assert_eq!(entries(Directory::Fs).len(), 7);
         assert_eq!(
             entry(b"/proc/sys/fs/inotify"),
             Some(Entry::Directory(Directory::Inotify))
@@ -544,6 +626,12 @@ mod tests {
         );
         assert_eq!(entry(b"/proc/sys/fs/inotify/other"), None);
         assert_eq!(entries(Directory::Inotify).len(), 5);
+        assert_eq!(entries(Directory::Fanotify).len(), 6);
+        assert_eq!(
+            entry(b"/proc/sys/fs/fanotify/max_user_marks"),
+            Some(Entry::Fanotify(Fanotify::UserMarks))
+        );
+        assert_eq!(entry(b"/proc/sys/fs/fanotify/other"), None);
         assert_eq!(entry(b"/proc/sys/kernel"), None);
         assert_eq!(entry(b"/proc/system"), None);
         assert_eq!(entries(Directory::Mqueue).len(), 7);

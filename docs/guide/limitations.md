@@ -496,6 +496,18 @@ verified.
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
+- **fanotify, in part**: permission events (`FAN_OPEN_PERM`,
+  `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM`) are taken by `fanotify_mark` but
+  never sent, so what they would ask is let through, and a response names no
+  event; `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
+  and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
+  never come. An evictable mark is never evicted. A group merges an event
+  into any like it still queued, where Linux looks only at the last 128 of
+  its hash bucket. Whether a directory watches its children is judged by the
+  fanotify marks alone, where Linux's counts inotify's too. A file a
+  descriptor does not hold (a program exec runs) is opened again by the path
+  it had, which fails once it is gone, and a FIFO's or device's read or
+  write is told of without its directory and name.
 - **Namespaces**: a user namespace has no `projid_map` and no
   `user.max_*` limits; its map files check a write with the credentials
   the file was opened with, where Linux also takes the writer's for the

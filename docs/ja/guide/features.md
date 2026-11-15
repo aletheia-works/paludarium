@@ -62,7 +62,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
-| イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
+| イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、`AF_MCTP` のデータグラム、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
 | 乱数 | `getrandom` |
@@ -2023,7 +2023,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   root（どのユーザー名前空間の外でもユーザー ID 0）だけです。どちらも Linux の
   `proc_doulongvec_minmax` と同じく unsigned long として読み書きし、書き込みは `-` を取らず
   （`EINVAL`）、それ以外は `/proc/sys/fs/mqueue` のファイルと同じに読みます。
-  `/proc/sys/fs` にあるのはこれらと `inotify`、`mqueue` だけです。
+  `/proc/sys/fs` にあるのはこれらと `fanotify`、`inotify`、`mqueue` だけです。
 - `/proc/sys/fs/inotify` はマシンの inotify の上限で、root の持つモード 0644 の
   通常のファイルです。書くために開けるのは root（どのユーザー名前空間の外でも
   ユーザー ID 0）だけで、上のファイルと同じに読み書きします。`max_user_instances`
@@ -2031,6 +2031,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   0 から `INT_MAX` までの unsigned long で、それ以後に各ユーザーが持てる数です。
   `max_queued_events`（最初は 16384）は 0 以上の `int` で、それ以後に作るインスタンスが
   `IN_Q_OVERFLOW` までに溜めるイベントの数です。
+- `/proc/sys/fs/fanotify` も同じく、マシンの fanotify の上限です。`max_user_groups`
+  （最初は 128）と `max_user_marks`（最初は 33979。`sysinfo` が示すメモリーの 1% を inode
+  2 つ分の大きさで割った数）は 0 から `INT_MAX` までの unsigned long、`max_queued_events`
+  （最初は 16384）と `watchdog_timeout`（0）は 0 以上の `int` です。
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
   と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
   （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、
@@ -2484,6 +2488,44 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベントが溜まっている間読めると見ます。エッジトリガーの `epoll` は、イベントが
   1 つ溜まるたびにエッジを受けます。インスタンスの最後のディスクリプタを閉じると
   ウォッチも消えます。書き込みは `EBADF`、`pread` は `ESPIPE`、`lseek` は 0 です。
+- fanotify のグループ（`fanotify_init`）は Linux の `fs/notify/fanotify` と同じです。
+  フラグはその順に確かめ（CAP_SYS_ADMIN がなければ `EPERM`。ただしファイルハンドルか
+  マウントを報告するグループは作れ、ディスクリプタもほかのプロセスの ID も報告しません）、
+  ユーザーのグループを数え（`EMFILE`）、ファイルは読み書きできる `anon_inode:[fanotify]`
+  で、`O_NONBLOCK` と `O_CLOEXEC` は求められたとおりです。`fanotify_mark` はファイル、
+  マウント、ファイルシステムへのマーク（マウント名前空間へのものも受け付けます）を足し、外し、
+  まとめて消します。確認もその順です。フラグとマスク（`EINVAL`）、ディスクリプタ
+  （`EBADF`、`EINVAL`）、グループのクラスとモード、パス（`ENOENT`、`ENOTDIR`）、
+  ファイルシステムが受け付けるイベント（/proc への許可イベントと、カーネル自身のファイル
+  システムへのマウントとファイルシステムのマークは `EINVAL`。新しいフラグでのファイルへの
+  ディレクトリのイベントは `ENOTDIR`）、読む許可（`EACCES`）、FID モードでのファイル
+  システムの ID とハンドル（`ENODEV`、`EOPNOTSUPP`、`EXDEV`）、無視マスクの規則
+  （`EISDIR`、`EEXIST`。書くために開かれているファイルには何もしません）、ユーザーの
+  マーク（`ENOSPC`）です。マークは Linux と同じく `FAN_EVENT_ON_CHILD` と `FAN_ONDIR` を
+  持ち（ディレクトリのマーク以外では前者を外し、`FAN_REPORT_DIR_FID` ではディレクトリと
+  名前がわかるように足します）、無視マスクは `FAN_MARK_IGNORED_SURV_MODIFY` がなければ
+  変更で消えます。
+  グループは inotify と同じフックで、Linux の `fsnotify` と同じくイベントを受けます。
+  ファイル、そのマウント、そのファイルシステムのマーク、子を見ているときのディレクトリの
+  マーク、`FAN_RENAME` では新しいディレクトリのマークです。イベントは
+  `fanotify_handle_event` と同じに作って溜めます。FID モードでなければ、通常のファイルか
+  ディレクトリを開く、読む、変える、閉じることだけで、グループのフラグで開き直した
+  ディスクリプタがつきます（どのウォッチにも何も知らせないもの。開けなければ
+  `FAN_REPORT_FD_ERROR` ではそのエラー、それ以外は read のエラーです）。FID モードでは
+  ファイルのハンドル（`name_to_handle_at` の識別子）、ディレクトリのハンドルと名前、
+  名前の変更での古いと新しいディレクトリと名前、ディレクトリ自身のイベントでの `.` の
+  レコードがつきます。まだ溜まっている同じ対象、同じプロセス、同じ種類のイベントには
+  まとめ、`max_queued_events` を超えると `FAN_Q_OVERFLOW` を 1 つ溜め、
+  `FAN_REPORT_PIDFD` ではプロセスの pidfd（`FAN_REPORT_TID` では `PIDFD_THREAD`）を
+  足します。read はイベントを丸ごと取り（最初のイベントが入らないバッファーは
+  `EINVAL`）、ノンブロッキングでなければ待ちます。`FIONREAD` は溜まったバイト数を返し、
+  `/proc/self/fdinfo` は `fanotify_show_fdinfo` と同じくフラグと各マークを新しい順に
+  示します。write は許可イベントへの応答で、Linux と同じに確かめます。許可イベントは
+  送らないので（制限事項を参照）、確認を通った応答はどのイベントも指さず `ENOENT` です。
+  `statfs` の `f_fsid` はイベントが示すファイルシステムの ID と同じです。カーネル自身の
+  ファイルシステム、/proc、devpts、mqueue では `simple_statfs` と同じくデバイス番号、
+  ほかのファイルシステムでは、tmpfs が UUID を引くように、ファイルシステムごとに引いた
+  数です。
 - POSIX タイマーは上の時計で動き、プロセスへの
   シグナル（`SIGEV_SIGNAL`。`SI_TIMER` の siginfo とオーバーランつき）か、プロセスの
   中の 1 つのスレッドへのシグナル（`SIGEV_THREAD_ID`）で知らせるか、何も知らせません

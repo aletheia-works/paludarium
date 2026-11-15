@@ -2006,6 +2006,17 @@ impl PidFd {
             flags: AtomicU32::new(2),
         }))
     }
+    /// The pidfd a fanotify event gives of task `pid` (`pidfd_prepare` with
+    /// `PIDFD_STALE`, so also of a process already reaped), of the thread
+    /// itself with `thread` (`PIDFD_THREAD`); close-on-exec.
+    pub(crate) fn stale(processes: &Arc<Processes>, pid: u32, thread: bool) -> Arc<Self> {
+        let thread = if thread { PIDFD_THREAD as u32 } else { 0 };
+        Arc::new(Self {
+            pid,
+            processes: Arc::clone(processes),
+            flags: AtomicU32::new(2 | thread),
+        })
+    }
     /// The pidfd `open_by_handle_at` makes from a pidfs handle naming inode
     /// `inode`, as Linux's `pidfs_fh_to_dentry` finds its `struct pid`
     /// ([`PidFd::inode`]) and `pidfs_export_open` opens it: `ESTALE` once the

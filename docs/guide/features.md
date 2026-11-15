@@ -70,7 +70,7 @@ kernel.
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
-| Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
+| Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6`, `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) and `AF_MCTP` datagrams with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
@@ -2325,7 +2325,7 @@ kernel.
   may open to write. Both are unsigned longs, as Linux's
   `proc_doulongvec_minmax` reads and writes them: a write takes no `-`
   (`EINVAL`) and otherwise reads as the files of `/proc/sys/fs/mqueue` do.
-  `/proc/sys/fs` lists only these, `inotify` and `mqueue`.
+  `/proc/sys/fs` lists only these, `fanotify`, `inotify` and `mqueue`.
 - `/proc/sys/fs/inotify` has the machine's inotify limits, root's regular
   files of mode 0644 that only root (user ID 0 outside any user namespace)
   may open to write, read and written as the files above:
@@ -2334,6 +2334,11 @@ kernel.
   each user may have from then on, and `max_queued_events` (16384 at first),
   an `int` from 0, is how many events an instance made from then on queues
   before `IN_Q_OVERFLOW`.
+- `/proc/sys/fs/fanotify` has the machine's fanotify limits in the same way:
+  `max_user_groups` (128 at first) and `max_user_marks` (33979 at first, 1%
+  of the memory `sysinfo` reports over twice an inode's size), unsigned
+  longs from 0 to `INT_MAX`, and `max_queued_events` (16384 at first) and
+  `watchdog_timeout` (0), `int`s from 0.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
   descriptor, as Linux's `seq_show` writes it: `pos`, the description's
   position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and
@@ -2852,6 +2857,49 @@ kernel.
   queued, and each queued event is an edge for edge-triggered `epoll`.
   Closing the last descriptor of an instance removes its watches. A write
   gives `EBADF`, `pread` `ESPIPE`, and `lseek` 0.
+- A fanotify group (`fanotify_init`) is as Linux's `fs/notify/fanotify`:
+  the flags are checked in its order (`EPERM` without CAP_SYS_ADMIN but for
+  a group that reports file handles or mounts, which reports no
+  descriptors and the IDs of no other process), the user's groups count
+  (`EMFILE`), and the file is `anon_inode:[fanotify]`, read and written,
+  with `O_NONBLOCK` and `O_CLOEXEC` as asked. `fanotify_mark` adds, removes
+  or flushes marks on a file, a mount or a file system (and takes a mount
+  namespace's), with its checks in its order: the flags and mask
+  (`EINVAL`), the descriptor (`EBADF`, `EINVAL`), the group's class and
+  modes, the path (`ENOENT`, `ENOTDIR`), the events the file system takes
+  (`EINVAL` for permission events on /proc, and for mount and file system
+  marks on the kernel's own file systems; `ENOTDIR` for directory events of
+  a file with the newer flags), read permission (`EACCES`), the file
+  system's ID and handles in the FID modes (`ENODEV`, `EOPNOTSUPP`,
+  `EXDEV`), the ignore masks' rules (`EISDIR`, `EEXIST`, and none for a
+  file open for writing), and the user's marks (`ENOSPC`). A mark keeps
+  `FAN_EVENT_ON_CHILD` and `FAN_ONDIR` as Linux does (taking off the first
+  but for a directory's mark, adding it in `FAN_REPORT_DIR_FID` so that the
+  directory and name are known), and its ignore mask ends at a
+  modification unless `FAN_MARK_IGNORED_SURV_MODIFY`.
+  The groups hear what inotify watches hear, by the same hooks, as Linux's
+  `fsnotify` sends it: the file's, its mount's and its file system's marks,
+  its directory's when it watches its children, and for `FAN_RENAME` the
+  new directory's. An event is queued as `fanotify_handle_event` makes it:
+  without a FID mode only the open, access, modification and close of a
+  regular file or directory, with a descriptor of it opened again with the
+  group's flags (one that tells no watch of anything, the error with
+  `FAN_REPORT_FD_ERROR`, else the read's); in the FID modes with the
+  records of the file's handle (`name_to_handle_at`'s identifier), its
+  directory's and its name, a rename's old and new directory and name, and
+  `.` for a directory's own event. An event of the same object, process and
+  kind as one still queued merges into it, past `max_queued_events` there is
+  one `FAN_Q_OVERFLOW`, and `FAN_REPORT_PIDFD` adds the process's pidfd
+  (`PIDFD_THREAD` with `FAN_REPORT_TID`). A read takes whole events (`EINVAL`
+  for a buffer too small for the first), waits unless non-blocking, and
+  `FIONREAD` gives the bytes queued; `/proc/self/fdinfo` shows the flags and
+  each mark, the newest first, as `fanotify_show_fdinfo`. A write is a
+  permission response, checked as Linux checks it; as no permission event
+  is ever sent (see the limitations), one that passes names no event
+  (`ENOENT`). `statfs`'s `f_fsid` is the file system ID the events give: the
+  device of the kernel's own file systems, /proc, devpts and mqueue, as
+  `simple_statfs` gives it, and a number drawn for each other file system,
+  as tmpfs draws a UUID.
 - POSIX timers run on the clocks above and notify with
   a signal to the process (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and
   overruns), a signal to one of its threads (`SIGEV_THREAD_ID`), or not at all

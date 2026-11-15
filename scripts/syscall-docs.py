@@ -296,6 +296,8 @@ NAMES = {
     296: "pwritev",
     297: "rt_tgsigqueueinfo",
     299: "recvmmsg",
+    300: "fanotify_init",
+    301: "fanotify_mark",
     302: "prlimit64",
     303: "name_to_handle_at",
     304: "open_by_handle_at",

@@ -1018,9 +1018,13 @@ kernel.
   cannot go through waits, unless the operation it would wait on has
   `IPC_NOWAIT` (`EAGAIN`), until a change lets it through, the set is
   removed (`EIDRM`), a signal comes (`EINTR`, never restarted, as Linux) or
-  `semtimedop`'s timeout passes (`EAGAIN`). A change tries the waits as
-  Linux's `do_smart_update`: the waits for zero first, then the others in
-  the order they began. `SEM_UNDO` keeps the adjustments in the process's
+  `semtimedop`'s timeout passes (`EAGAIN`). The waits are kept in Linux's
+  queues: each semaphore's for operations on it alone, and the set's for
+  operations on several, which the waiting changes on one semaphore join
+  while any such operation waits. A change tries them as Linux's
+  `do_smart_update`: the waits for zero on the semaphores it made 0, then
+  the waits to change values, each queue in the order its waits began.
+  `SEM_UNDO` keeps the adjustments in the process's
   undo list, which `CLONE_SYSVSEM` shares (`pthread_create` passes it) and
   a `fork` does not; `SETVAL` and `SETALL` clear them. The last thread that
   shares the list applies it as it ends, or as it leaves it with `unshare`

@@ -390,11 +390,6 @@ verified.
   - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
     where Linux checks the writer again at each write, and it reports its
     value's length as its size, where Linux reports 0.
-  - A set's waiting semaphore operations are tried in one queue in the
-    order they began, the waits for zero first. Linux keeps a queue for
-    each semaphore beside one for operations on several, and which of two
-    waits that both could go through goes first can differ where waits of
-    both kinds are mixed.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` has no system-call stops, events, single-stepping or

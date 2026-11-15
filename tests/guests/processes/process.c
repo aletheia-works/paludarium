@@ -12611,6 +12611,16 @@ static pid_t semx_child(int id, unsigned short num, short op, short flags) {
     if (child == 0) _exit(semx_op(id, num, op, flags));
     return child;
 }
+/* A child that does two operations at once and exits with its error. */
+static pid_t semx_child2(int id, struct semx_op first, struct semx_op second) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct semx_op ops[2] = {first, second};
+        _exit(semx_errno(syscall(SYS_semop, id, ops, 2)));
+    }
+    return child;
+}
 static int semx_reaped(pid_t child) {
     int status;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
@@ -13092,6 +13102,37 @@ static int sem_case(void) {
     printf(" down=%d", semx_op(id, 2, -4, 0));
     printf(" zero=%d", semx_reaped(zero));
     printf(" by-zero=%d\n", semx_ctl(id, 2, SEMX_GETPID, 0) == zero);
+
+    /* Waits of both kinds: on one semaphore, which wait in its own queue,
+       and on two, after which the others wait in the set's queue too, in
+       the order they began. A complex change done lets through the wait for
+       zero it makes, then the rest of the queue again. */
+    int mixed = syscall(SYS_semget, 0, 2, 0600);
+    semx_ctl(mixed, 1, SEMX_SETVAL, 1);
+    pid_t simple = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 1);
+    pid_t complex = semx_child2(mixed, (struct semx_op){0, -1, 0}, (struct semx_op){1, -1, 0});
+    semx_await(mixed, 0, SEMX_GETNCNT, 2);
+    pid_t behind = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 3);
+    pid_t zeroed = semx_child(mixed, 1, 0, 0);
+    semx_await(mixed, 1, SEMX_GETZCNT, 1);
+    printf("mixed ncnt=%ld,%ld", semx_ctl(mixed, 0, SEMX_GETNCNT, 0), semx_ctl(mixed, 1, SEMX_GETNCNT, 0));
+    printf(" up=%d", semx_op(mixed, 0, 1, 0));
+    printf(" simple=%d", semx_reaped(simple));
+    printf(" by-simple=%d", semx_ctl(mixed, 0, SEMX_GETPID, 0) == simple);
+    printf(" ncnt=%ld", semx_ctl(mixed, 0, SEMX_GETNCNT, 0));
+    printf(" up=%d", semx_op(mixed, 0, 2, 0));
+    printf(" complex=%d behind=%d zeroed=%d", semx_reaped(complex), semx_reaped(behind), semx_reaped(zeroed));
+    printf(" by-behind=%d", semx_ctl(mixed, 0, SEMX_GETPID, 0) == behind);
+    printf(" by-zeroed=%d", semx_ctl(mixed, 1, SEMX_GETPID, 0) == zeroed);
+    printf(" values=%ld,%ld", semx_ctl(mixed, 0, SEMX_GETVAL, 0), semx_ctl(mixed, 1, SEMX_GETVAL, 0));
+    /* With no complex wait left, a simple one waits on its own again. */
+    pid_t again = semx_child(mixed, 0, -1, 0);
+    semx_await(mixed, 0, SEMX_GETNCNT, 1);
+    printf(" again-up=%d", semx_op(mixed, 0, 1, 0));
+    printf(" again=%d", semx_reaped(again));
+    printf(" removed=%ld\n", semx_ctl(mixed, 0, SEMX_RMID, 0));
 
     /* A signal ends a wait with EINTR, even with SA_RESTART. */
     fflush(stdout);

@@ -315,6 +315,7 @@
     {"name":"mounts","binary":"process"},
     {"name":"binds","binary":"process"},
     {"name":"proc-other-mounts","binary":"process"},
+    {"name":"proc-other-maps","binary":"process"},
     {"name":"modify-ldt","binary":"process"},
     {"name":"port-access","binary":"process"},
     {"name":"timer-limits","binary":"process"},

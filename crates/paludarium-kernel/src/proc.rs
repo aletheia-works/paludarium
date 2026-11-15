@@ -128,7 +128,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 19] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 15] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 17] = [
     (b"task", 4),
     (b"ns", 4),
     (b"environ", 8),
@@ -136,11 +136,13 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 15] = [
     (b"comm", 8),
     (b"cmdline", 8),
     (b"stat", 8),
+    (b"maps", 8),
     (b"cwd", 10),
     (b"root", 10),
     (b"exe", 10),
     (b"mounts", 8),
     (b"mountinfo", 8),
+    (b"smaps", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
@@ -162,6 +164,8 @@ pub(crate) enum TaskEntry {
     Cwd,
     /// `root`, the task's root (`chroot`'s).
     Root,
+    /// `maps`, and `smaps` (true), of the task's address space.
+    Maps(bool),
     /// `mountinfo` (true) or `mounts`: the mounts of the task's mount
     /// namespace, from its root.
     Mounts(bool),
@@ -217,6 +221,8 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"exe" => TaskEntry::Exe,
         b"cwd" => TaskEntry::Cwd,
         b"root" => TaskEntry::Root,
+        b"maps" => TaskEntry::Maps(false),
+        b"smaps" => TaskEntry::Maps(true),
         b"mounts" => TaskEntry::Mounts(false),
         b"mountinfo" => TaskEntry::Mounts(true),
         b"ns" => TaskEntry::Namespaces,
@@ -1525,7 +1531,12 @@ mod tests {
             path(b"/proc/8/task/8/mounts"),
             at(8, Some(8), TaskEntry::Mounts(false))
         );
-        assert_eq!(path(b"/proc/8/maps"), at(8, None, TaskEntry::Missing));
+        assert_eq!(path(b"/proc/8/maps"), at(8, None, TaskEntry::Maps(false)));
+        assert_eq!(
+            path(b"/proc/7/task/9/smaps"),
+            at(7, Some(9), TaskEntry::Maps(true))
+        );
+        assert_eq!(path(b"/proc/8/statm"), at(8, None, TaskEntry::Missing));
         assert_eq!(path(b"/proc/8/fd/1"), at(8, None, TaskEntry::Missing));
         assert_eq!(path(b"/proc/8/task"), at(8, None, TaskEntry::Threads));
         assert_eq!(path(b"/proc/self/task/"), at(7, None, TaskEntry::Threads));

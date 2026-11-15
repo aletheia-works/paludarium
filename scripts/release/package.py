@@ -416,8 +416,11 @@ def package_check(root):
             )
             check.require_success(stable_result)
         stage = "production-wasm"
+        # No DWARF in the Wasm (as in mise-tasks/wasm/build.sh): it is about 80% of the
+        # module and would take the package over JSR's 20 MiB limit. The name
+        # section stays, so stacks still name functions.
         env["RUSTFLAGS"] = (
-            "-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--import-memory -C link-arg=--shared-memory -C link-arg=--max-memory=1073741824 -C link-arg=--export=__stack_pointer -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base"
+            "-C debuginfo=0 -C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--import-memory -C link-arg=--shared-memory -C link-arg=--max-memory=1073741824 -C link-arg=--export=__stack_pointer -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base"
         )
         check.require_success(
             check.run_command(

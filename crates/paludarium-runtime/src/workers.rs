@@ -178,20 +178,25 @@ impl Execution {
                 let pid = child.process().pid;
                 let child_memory = child.take_spawn_memory().unwrap_or_else(|| memory.clone());
                 let execution = self.clone();
-                match self.host.spawn_thread(Box::new(move || {
+                let started = match self.host.spawn_thread(Box::new(move || {
                     execution.execute_memory(&mut child, &mut child_thread, child_memory)
                 })) {
-                    Ok(handle) => self
-                        .handles
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push(handle),
+                    Ok(handle) => {
+                        self.handles
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(handle);
+                        true
+                    }
                     Err(error) => {
                         kernel.abandon_child(pid, tid);
                         thread.cpu.gpr[reg::RAX] = error.to_syscall_return();
+                        false
                     }
-                }
-                if let Err(error) = kernel.wait_vfork(&self.kill) {
+                };
+                // A traced parent reports the new task, if it started, and a
+                // vfork parent waits for it.
+                if let Err(error) = kernel.child_started(thread, started, &self.kill) {
                     thread.cpu.gpr[reg::RAX] = error.to_syscall_return();
                 }
             }

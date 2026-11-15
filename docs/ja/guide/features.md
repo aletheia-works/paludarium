@@ -55,7 +55,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | 鍵 | `add_key`、`request_key`、`keyctl` |
-| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm`、`syslog`、`sysfs` |
+| システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm`、`syslog`、`sysfs`、`perf_event_open`（下を参照） |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
@@ -2353,7 +2353,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `.`、`..` とシンボリックリンクを解決したファイルのパス（このプロセスのものは
   `/proc/<pid>/…`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに
   `pipe:[<inode>]`、`socket:[<inode>]`、`anon_inode:[eventfd]`・`[eventpoll]`・
-  `[timerfd]`・`[signalfd]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
+  `[timerfd]`・`[signalfd]`・`[perf_event]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
   名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`anon_inode:bpf-map`、`/memfd:<名前> (deleted)` です。
   そのためにパイプとソケットは自分の inode 番号を持ちます。リンクを開くと、ファイルを
   パスで開き直します。どのパスもそのファイルを指さなくなったとき（消された、または
@@ -2622,6 +2622,37 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ブロックデバイスはないので `ENOTBLK` を返します。`quotactl_fd` はどのディスクリプタも
     受け付け（`EBADF`）、種類を確かめ（`EINVAL`）、クォータのないファイルシステムに
     対する Linux の `do_quotactl` と同じく `ENOSYS` を返します。
+- `perf_event_open` は、Linux の `kernel/events/core.c` の順に引数を確かめます。知らない
+  フラグ、次に構造体です（`perf_copy_attr`。サイズ 0 は最初の版の 64 バイトで、それより
+  小さいか 1 ページより大きいと `E2BIG` になり、Linux master の知るサイズ 176 を書き戻します。
+  それより大きくても、その先のバイトが 0 でなければ同じです。続いて予約フィールド、知らない
+  サンプルと読み込みの形式、分岐のない分岐サンプリング、DS・ES・FS・GS や予約ビットを含む
+  レジスタのマスク、大きすぎるか 8 バイト境界でないユーザースタック、両方の weight、
+  `inherit` なしの `inherit_thread`、`enable_on_exec` と一緒の `remove_on_exec`、
+  `remove_on_exec` なしの `sigtrap` がどれも `EINVAL` です）。次は `perf_event_paranoid` で、
+  Linux の既定の 2 です。カーネルのイベント（`exclude_kernel` なし、`text_poke`、カーネルの
+  コールチェーン、物理アドレス、カーネルかハイパーバイザーの分岐）と CPU のイベントには
+  `CAP_PERFMON` か `CAP_SYS_ADMIN` が要り（`EACCES`）、`namespaces` も同じです。そのあと、
+  ビット 63 の立った周期や `perf_event_max_sample_rate`（100000）を超える周波数は `EINVAL`、
+  CPU とタスクのない `PERF_FLAG_PID_CGROUP` は `EINVAL`、イベントでないグループの
+  ディスクリプタは `EBADF`、ないタスクは `ESRCH`、タスクも CPU もないときや最後より先の
+  CPU は `EINVAL`、知らない `clockid` は `EINVAL` です。数えるイベントは、ソフトウェアの
+  `cpu-clock` と `task-clock`（スレッドの CPU 時間をナノ秒で。CPU のイベントは経った時間）と、
+  x86-64 と同じく何も数えない `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output`
+  です。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
+  キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
+  イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
+  要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った
+  サンプル（0）を付けて返し、`PERF_FORMAT_GROUP` ではグループ全体を返します。バッファが
+  小さすぎると `ENOSPC` です。グループのメンバーはリーダーと同じタスク、CPU、クロックで、
+  pinned でも exclusive でもないこと（`EINVAL`）が要り、リーダーが有効な間だけ数えます。
+  ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
+  ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
+  と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
+  イベントをそのタスクの `execve` で有効にし、`remove_on_exec` はそのとき
+  イベントを以後ずっと無効にします。ディスクリプタのリンクは
+  `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
+  [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを
   持ちます。どのコマンドも、まず union のサイズ（1 ページより大きいか、Linux master の 168
   バイトより先に 0 でないバイトがあれば `E2BIG`）と、コマンド自身のフィールドより先
@@ -3230,8 +3261,30 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `-ERESTARTNOHAND`、`-ERESTART_RESTARTBLOCK`）を見せ、トレーサーが `rax` を変えるか
   `orig_rax` を -1 にしない限り、もう一度実行します。`orig_rax` を変えると、そのシステム
   コールが実行されます。
-- `PTRACE_SEIZE` 以外でトレースされたタスクは、`execve` の後に自分から `SIGTRAP` を受けます。
-  トレーサーのスレッドが終了するとトレース対象は手放され、`PTRACE_O_EXITKILL` を設定したものは
+- `PTRACE_SYSCALL` で再開したトレース対象は、システムコールの入口と出口ごとに止まります
+  （`SIGTRAP`、`PTRACE_O_TRACESYSGOOD` があれば `SIGTRAP | 0x80`）。`PTRACE_SYSEMU` では入口だけで
+  止まり、システムコールは実行されません。入口では `rax` が `-ENOSYS`、`orig_rax` がシステム
+  コールで、トレーサーはシステムコールと引数を変えられ、`orig_rax` を -1 にすると、`rax` を
+  残したい値にしたまま実行を飛ばします。出口では `rax` が戻り値で、トレーサーはそれを変え
+  られます。システムコール停止をシグナル付きで再開すると、そのシグナルはカーネルから
+  （`SI_KERNEL`）来ます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
+  同じく停止を示します。入口ではシステムコールと引数、出口では戻り値とエラーかどうか、
+  ほかの停止や `PTRACE_O_TRACESYSGOOD` なしでは命令ポインタとスタックポインタだけです。
+  `PTRACE_SET_SYSCALL_INFO` はシステムコール、引数、戻り値を変えます。種類の違う停止、
+  フラグ、足りないバッファは `EINVAL`、`int` に収まらない番号は `ERANGE` です。
+- `PTRACE_O_TRACEFORK`、`PTRACE_O_TRACEVFORK`、`PTRACE_O_TRACECLONE`、`PTRACE_O_TRACEEXEC`、
+  `PTRACE_O_TRACEVFORKDONE`、`PTRACE_O_TRACEEXIT` のイベントでは、トレース対象はステータスの
+  `SIGTRAP` の上にイベントを載せて止まり、`rax` は `-ENOSYS` です。`PTRACE_GETEVENTMSG` は
+  新しいタスク、`execve` 前のスレッド ID、終了ステータスを返します。トレーサーがイベントを
+  求めている間に `clone`、`fork`、`vfork` が作ったタスク、または `CLONE_PTRACE` 付きで作った
+  タスク（`CLONE_UNTRACED` 付きは除く）は、同じトレーサーに同じオプションでトレースされ、
+  SEIZE なら `PTRACE_EVENT_STOP` で、それ以外は保留中の `SIGSTOP` を持って始まります。
+  システムコール停止は持たずに始まります。`vfork` の親は、子が終了するか別のプログラムを
+  実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
+  `PTRACE_EVENT_EXIT` を報告し、それとともに終わるスレッドは報告しません。
+- `PTRACE_SEIZE` でも `PTRACE_O_TRACEEXEC` でもなくトレースされたタスクは、`execve` の後に
+  自分から `SIGTRAP` を受けます。リーダー以外のスレッドが `execve` すると、その後はリーダーの
+  番号でトレースされます。トレーサーのスレッドが終了するとトレース対象は手放され、`PTRACE_O_EXITKILL` を設定したものは
   殺されます。`/proc/<pid>/status` は `TracerPid` を示し、ptrace 停止中のトレース対象は
   `t (tracing stop)` です。
 

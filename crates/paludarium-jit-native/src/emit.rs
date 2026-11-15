@@ -131,11 +131,16 @@ impl Emitter<'_, '_> {
         self.set_word(usize::from(index & 15), v);
     }
 
-    /// The value of `r` (a general register, not a high byte), masked to
-    /// its size.
+    /// The value of `r`, masked to its size.
     fn read(&mut self, r: Register) -> Value {
-        let Register::Gpr { index, size } = r else {
-            unreachable!("forms hold general registers only");
+        let (index, size) = match r {
+            Register::Gpr { index, size } => (index, size),
+            Register::GprHigh8 { index } => {
+                let v = self.gpr(index & 3);
+                let v = self.b.ins().ushr_imm_s(v, 8);
+                return self.b.ins().band_imm_s(v, 0xff);
+            }
+            _ => unreachable!("forms hold general or high-byte registers only"),
         };
         let v = self.gpr(index);
         if size == 8 {
@@ -146,10 +151,20 @@ impl Emitter<'_, '_> {
     }
 
     /// Writes `v` to `r` as `write_reg` does: whole, zero-extended from
-    /// 32 bits, or merged into the low 8 or 16 bits.
+    /// 32 bits, or merged into the low 8 or 16 bits or into bits 8 to 15.
     fn write(&mut self, r: Register, v: Value) {
-        let Register::Gpr { index, size } = r else {
-            unreachable!("forms hold general registers only");
+        let (index, size) = match r {
+            Register::Gpr { index, size } => (index, size),
+            Register::GprHigh8 { index } => {
+                let old = self.gpr(index & 3);
+                let kept = self.b.ins().band_imm_s(old, !0xff00);
+                let low = self.b.ins().band_imm_s(v, 0xff);
+                let new = self.b.ins().ishl_imm_s(low, 8);
+                let value = self.b.ins().bor(kept, new);
+                self.set_gpr(index & 3, value);
+                return;
+            }
+            _ => unreachable!("forms hold general or high-byte registers only"),
         };
         let value = match size {
             8 => v,

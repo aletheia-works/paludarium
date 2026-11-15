@@ -134,7 +134,8 @@ mod linux {
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
             // marks need CAP_SYS_ADMIN, the userfaultfd cases, whose files take
-            // the kernel's faults too (CAP_SYS_PTRACE), the bpf cases, whose
+            // the kernel's faults too (CAP_SYS_PTRACE), the perf cases, whose
+            // events of the kernel and of CPUs need CAP_PERFMON, the bpf cases, whose
             // maps need CAP_BPF, the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
@@ -197,6 +198,9 @@ mod linux {
                     | "userfaultfd-shared"
                     | "userfaultfd-wp"
                     | "userfaultfd-poison"
+                    | "perf-calls"
+                    | "perf-counts"
+                    | "perf-exec"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -323,7 +327,7 @@ mod linux {
             };
             let host = Arc::new(RecordingHost::new());
             // Their timers and limits wait for CPU time, which the virtual
-            // clock does not pass.
+            // clock does not pass, and the perf cases' clocks count it.
             if matches!(
                 mode,
                 "cpu-itimer"
@@ -332,6 +336,8 @@ mod linux {
                     | "cpu-sleep"
                     | "cpu-sleep-others"
                     | "cpu-timer-others"
+                    | "perf-counts"
+                    | "perf-exec"
             ) {
                 host.measure_cpu_time();
             }
@@ -469,6 +475,9 @@ mod linux {
         aio_full => ("aio-full","aio"),
         aio_lifetime => ("aio-lifetime","aio"),
         aio_mremap => ("aio-mremap","aio"),
+        perf_calls => ("perf-calls","perf"),
+        perf_counts => ("perf-counts","perf"),
+        perf_exec => ("perf-exec","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -531,6 +540,10 @@ mod linux {
         ptrace_memory => ("ptrace-memory","ptrace"),
         ptrace_thread => ("ptrace-thread","ptrace"),
         ptrace_sibling => ("ptrace-sibling","ptrace"),
+        ptrace_strace => ("ptrace-strace","ptrace-syscalls"),
+        ptrace_sysemu => ("ptrace-sysemu","ptrace-syscalls"),
+        ptrace_events => ("ptrace-events","ptrace-syscalls"),
+        ptrace_clone => ("ptrace-clone","ptrace-syscalls"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

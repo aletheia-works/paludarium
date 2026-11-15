@@ -2293,14 +2293,23 @@ impl Kernel {
             56 if a[0] & 0x10000 == 0 => self.clone_process(thread, mem, a),
             57 => self.clone_process(thread, mem, [17, 0, 0, 0, 0, 0]),
             58 => self.clone_process(thread, mem, [0x4111, 0, 0, 0, 0, 0]),
-            59 | 322 => match self.exec(thread, mem, n, a) {
-                Ok(closed) => {
-                    self.close_on_exec(thread, mem, closed);
-                    self.ptrace_exec(thread);
-                    return Some(Next::Resume);
+            59 | 322 => {
+                // The exec'ing thread, by the number it had: it takes the
+                // leader's, but its perf events are its own.
+                let tid = thread.tid;
+                match self.exec(thread, mem, n, a) {
+                    Ok(closed) => {
+                        self.close_on_exec(thread, mem, closed);
+                        // The events that wait for it start counting, as
+                        // `begin_new_exec` runs `perf_event_exec` before the
+                        // tracer's exec stop.
+                        crate::perf::exec(&self.group, tid);
+                        self.ptrace_exec(thread);
+                        return Some(Next::Resume);
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             61 => self.wait4(thread, mem, a),
             101 => self.ptrace(thread, mem, a),
             247 => self.waitid(thread, mem, a),
@@ -4614,6 +4623,9 @@ impl Kernel {
             // exec keeps the seccomp mode and filters.
             seccomp: std::mem::take(&mut thread.state.seccomp),
             seccomp_sync: thread.state.seccomp_sync,
+            // And the task's ptrace state: the call it is in, its ID before,
+            // the syscall-exit stop to come.
+            ptrace: std::mem::take(&mut thread.state.ptrace),
             ..ThreadState::default()
         };
         thread.state.name_after(&path);

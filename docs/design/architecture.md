@@ -108,15 +108,18 @@ out:
 - `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`;
 - `setcc` and `cmovcc`.
 
-Their operands are taken out in advance, so running them needs neither the
+A register in these forms may also be one of the high-byte registers `ah`, `ch`,
+`dh` and `bh`.
+
+The forms' operands are taken out in advance, so running them needs neither the
 general dispatch by mnemonic nor the general operand handling. Such a form
 changes the state only after everything that can fail. When it fails, nothing
 has changed, and the instruction runs again through the general path, which
 reports the fault. Both paths therefore mean the same thing, which a unit test
 checks for every form from random states. The cache keeps the form, with the
-address of the next instruction and three flags (within one 64-byte cache
-line), apart from the decoded instruction itself, which only the general path
-reads. A run of such forms therefore reads little host memory.
+address of the next instruction and three flags (within one 64-byte cache line),
+apart from the decoded instruction itself, which only the general path reads. A
+run of such forms therefore reads little host memory.
 
 ## The native JIT
 

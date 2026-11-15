@@ -316,6 +316,11 @@ impl ThreadGroup {
     pub(crate) fn set_killed(&self) {
         self.killed.store(true, Ordering::SeqCst);
     }
+    /// Whether a fatal signal was sent to the process ([`Self::set_killed`]):
+    /// for a traced process, only SIGKILL.
+    pub(crate) fn killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
     /// Whether the process is on its way out with nothing left to run, as
     /// Linux's `__task_will_free_mem` asks: a fatal signal was sent to it
     /// ([`Self::fatal_at_send`]) or it has begun to exit, and it is not
@@ -591,6 +596,17 @@ impl ThreadGroup {
                 .find(|(owner, _)| *owner == tid)
                 .map_or(0, |(_, used)| used.load(Ordering::SeqCst)),
         )
+    }
+    /// The CPU time thread `tid` last accounted, live or not: what a perf
+    /// event of it keeps once it has exited.
+    pub(crate) fn last_thread_cpu(&self, tid: u32) -> Option<u64> {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|(owner, _)| *owner == tid)
+            .map(|(_, used)| used.load(Ordering::SeqCst))
     }
     /// The time of a POSIX timer's CPU-time clock; ESRCH once the thread
     /// whose clock it is has exited (Linux's `timer_lock_sighand` finds no

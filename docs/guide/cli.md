@@ -100,7 +100,7 @@ gets `ENOSYS` and often carries on, so nothing is printed unless you ask with
 `--report-enosys`:
 
 ```text
-paludarium: unimplemented system calls (they returned ENOSYS): 101, 165, 298
+paludarium: unimplemented system calls (they returned ENOSYS): 134, 155, 212
 ```
 
 The numbers are those of the x86-64 Linux system call table. An error of the

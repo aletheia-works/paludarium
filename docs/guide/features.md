@@ -63,7 +63,7 @@ kernel.
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | Keys | `add_key`, `request_key`, `keyctl` |
-| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs` |
+| System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs`, `perf_event_open` (see below) |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
@@ -2709,7 +2709,7 @@ kernel.
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
   for this process's entries), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
-  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]` or `[pidfd]` (an
+  `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]`, `[perf_event]` or `[pidfd]` (an
   anonymous inode's name, which pidfs, from Linux 6.9, still gives),
   `anon_inode:inotify` (without brackets, as Linux names it), `anon_inode:bpf-map`, and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
@@ -3019,6 +3019,45 @@ kernel.
     `quotactl_fd` takes any descriptor (`EBADF`), checks the type
     (`EINVAL`) and gives `ENOSYS`, as Linux's `do_quotactl` does for a file
     system without quotas.
+- `perf_event_open` checks its arguments in the order of Linux's
+  `kernel/events/core.c`: unknown flags, then the structure
+  (`perf_copy_attr`: a size of 0 is the first one's 64 bytes, less than that
+  or more than a page `E2BIG`, which writes back the size Linux master
+  knows, 176, as does a larger one with bytes past that which are not 0;
+  then the reserved fields, unknown sample and read formats, branch
+  sampling without a branch, register masks with DS, ES, FS, GS or the
+  reserved bits, a user stack too large or not 8-byte aligned, both
+  weights, `inherit_thread` without `inherit`, `remove_on_exec` with
+  `enable_on_exec`, and `sigtrap` without `remove_on_exec`, all `EINVAL`),
+  then `perf_event_paranoid`, which is Linux's default 2: an event of the
+  kernel (one without `exclude_kernel`, `text_poke`, a kernel callchain,
+  physical addresses, kernel or hypervisor branches) and one of a CPU need
+  `CAP_PERFMON` or `CAP_SYS_ADMIN` (`EACCES`), as do `namespaces`. Then a
+  period with bit 63 or a frequency above `perf_event_max_sample_rate`
+  (100000) is `EINVAL`, `PERF_FLAG_PID_CGROUP` without a CPU and a task
+  `EINVAL`, a group descriptor that is no event `EBADF`, a task that is not
+  there `ESRCH`, no task and no CPU or a CPU past the last `EINVAL`, and an
+  unknown `clockid` `EINVAL`. The events that count are the software
+  `cpu-clock` and `task-clock`, in nanoseconds of the thread's CPU time (an
+  event of a CPU counts the time that passes), and `alignment-faults`,
+  `emulation-faults`, `dummy` and `bpf-output`, which count nothing, as on
+  x86-64; branch sampling or the XMM registers of one is `EOPNOTSUPP`.
+  Hardware, cache and raw events are `ENOENT`, as on a machine without a
+  PMU. An event of another process needs `CAP_PERFMON` or to be able to
+  read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the
+  times enabled and running, the ID and the lost samples (0) as the read
+  format asks, and with `PERF_FORMAT_GROUP` the whole group's, `ENOSPC` for
+  a buffer too small. A group member must be of its leader's task, CPU and
+  clock, and neither pinned nor exclusive (`EINVAL`); it counts only while
+  its leader is enabled. The ioctls `PERF_EVENT_IOC_ENABLE`, `DISABLE` and
+  `RESET`, each of the event or with `PERF_IOC_FLAG_GROUP` of its group,
+  and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
+  for an event that does not sample. `enable_on_exec` enables a disabled
+  event when its task runs `execve`, as `perf stat` uses it, and
+  `remove_on_exec` disables one then for good. The
+  descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  and writing, and a write is `EINVAL`. See [limitations](./limitations)
+  for what is not there.
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and
   `hashtab.c` have them. Every command first takes the size of its union
   (more than a page, or bytes past Linux master's 168 that are not 0, is
@@ -3694,8 +3733,37 @@ one only with an `--allow-net`.
   `rax` (`-ERESTARTSYS`, `-ERESTARTNOINTR`, `-ERESTARTNOHAND`,
   `-ERESTART_RESTARTBLOCK`): it runs again unless the tracer changes `rax`
   or sets `orig_rax` to -1, and another `orig_rax` is the call that runs.
-- After `execve`, a task traced without `PTRACE_SEIZE` gets `SIGTRAP` from
-  itself. A tracer thread's exit lets go of its tracees, killing those that
+- With `PTRACE_SYSCALL`, a tracee stops at the entry and at the exit of each
+  system call (`SIGTRAP`, or `SIGTRAP | 0x80` with `PTRACE_O_TRACESYSGOOD`),
+  and with `PTRACE_SYSEMU` at the entry only, where the call does not run.
+  At an entry `rax` is `-ENOSYS` and `orig_rax` the call: the tracer may
+  change the call and its arguments, or set `orig_rax` to -1 to skip it,
+  leaving the `rax` it wants; at an exit `rax` has what the call returned,
+  which the tracer may change. A signal the tracer resumes a syscall stop
+  with comes from the kernel (`SI_KERNEL`). `PTRACE_GET_SYSCALL_INFO`
+  describes the stop as Linux's `struct ptrace_syscall_info` does: the call
+  and its arguments at an entry, the return value and whether it is an
+  error at an exit, and only the instruction and stack pointers at another
+  stop or without `PTRACE_O_TRACESYSGOOD`. `PTRACE_SET_SYSCALL_INFO` changes
+  the call, its arguments or the return value, refusing another kind of
+  stop, flags or a short buffer (`EINVAL`) and a number that is not an
+  `int` (`ERANGE`).
+- The events of `PTRACE_O_TRACEFORK`, `PTRACE_O_TRACEVFORK`,
+  `PTRACE_O_TRACECLONE`, `PTRACE_O_TRACEEXEC`, `PTRACE_O_TRACEVFORKDONE` and
+  `PTRACE_O_TRACEEXIT` stop the tracee with the event above `SIGTRAP` in the
+  status, `rax` at `-ENOSYS`, and `PTRACE_GETEVENTMSG` gives the new task,
+  the thread's ID before `execve`, or the exit status. A task a `clone`,
+  `fork` or `vfork` makes while its maker's tracer asks for the event, or
+  with `CLONE_PTRACE` (never with `CLONE_UNTRACED`), is traced by the same
+  tracer with the same options, and starts in `PTRACE_EVENT_STOP` if
+  seized, otherwise with `SIGSTOP` pending; it starts with no syscall stops.
+  A `vfork` parent reports `PTRACE_EVENT_VFORK_DONE` once its child has
+  exited or run another program. The thread that ends its process reports
+  `PTRACE_EVENT_EXIT`; the threads that end with it do not.
+- After `execve`, a task traced without `PTRACE_SEIZE` or
+  `PTRACE_O_TRACEEXEC` gets `SIGTRAP` from itself. A thread other than the
+  leader that runs `execve` is traced by the leader's number after it. A
+  tracer thread's exit lets go of its tracees, killing those that
   set `PTRACE_O_EXITKILL`. `/proc/<pid>/status` shows `TracerPid`, and a
   tracee in a ptrace stop is in `t (tracing stop)`.
 

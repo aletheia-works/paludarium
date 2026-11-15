@@ -7036,6 +7036,7 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
             Some(v) if v.is::<crate::signalfd::SignalFile>() => "signalfd",
             Some(v) if v.is::<crate::landlock::Ruleset>() => "landlock-ruleset",
             Some(v) if v.is::<crate::io_uring::Ring>() => "io_uring",
+            Some(v) if v.is::<crate::perf::EventFile>() => "perf_event",
             // The last kind of no type; Linux 6.9 and later name it from
             // pidfs instead.
             _ => "pidfd",

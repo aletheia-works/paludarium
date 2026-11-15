@@ -9,11 +9,12 @@
 //! takes it back when it resumes, as Linux's tracer works on the
 //! `pt_regs` of a task in `TASK_TRACED`.
 use crate::processes::{ChildEvent, WaitFor, Wanted};
-use crate::{Kernel, Thread, signals};
+use crate::{Kernel, Next, Thread, signals};
 use paludarium_cpu::{CpuState, flag, reg};
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{Errno, ExitStatus, GuestAddr};
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
 
 pub(crate) const PTRACE_TRACEME: i64 = 0;
@@ -31,6 +32,9 @@ const PTRACE_GETFPREGS: i64 = 14;
 const PTRACE_SETFPREGS: i64 = 15;
 const PTRACE_ATTACH: i64 = 16;
 const PTRACE_DETACH: i64 = 17;
+const PTRACE_SYSCALL: i64 = 24;
+/// x86's `PTRACE_SYSEMU`.
+const PTRACE_SYSEMU: i64 = 31;
 const PTRACE_SETOPTIONS: i64 = 0x4200;
 const PTRACE_GETEVENTMSG: i64 = 0x4201;
 const PTRACE_GETSIGINFO: i64 = 0x4202;
@@ -39,6 +43,38 @@ const PTRACE_GETREGSET: i64 = 0x4204;
 const PTRACE_SETREGSET: i64 = 0x4205;
 const PTRACE_SEIZE: i64 = 0x4206;
 const PTRACE_INTERRUPT: i64 = 0x4207;
+const PTRACE_GET_SYSCALL_INFO: i64 = 0x420e;
+const PTRACE_SET_SYSCALL_INFO: i64 = 0x4212;
+
+/// `PTRACE_O_TRACESYSGOOD`: syscall stops report `SIGTRAP | 0x80`.
+const PTRACE_O_TRACESYSGOOD: u32 = 1;
+/// The events, each enabled by option bit `1 << event`.
+const PTRACE_EVENT_FORK: i32 = 1;
+const PTRACE_EVENT_VFORK: i32 = 2;
+const PTRACE_EVENT_CLONE: i32 = 3;
+const PTRACE_EVENT_EXEC: i32 = 4;
+const PTRACE_EVENT_VFORK_DONE: i32 = 5;
+const PTRACE_EVENT_EXIT: i32 = 6;
+/// `PTRACE_EVENT_SECCOMP`, whose stops come with `SECCOMP_RET_TRACE`.
+const PTRACE_EVENT_SECCOMP: i32 = 7;
+/// The message of a syscall-entry and a syscall-exit stop.
+const PTRACE_EVENTMSG_SYSCALL_ENTRY: u64 = 1;
+const PTRACE_EVENTMSG_SYSCALL_EXIT: u64 = 2;
+/// `PTRACE_SYSCALL_INFO_*`, the kinds of stop `ptrace_syscall_info`
+/// describes.
+const SYSCALL_INFO_NONE: u8 = 0;
+const SYSCALL_INFO_ENTRY: u8 = 1;
+const SYSCALL_INFO_EXIT: u8 = 2;
+const SYSCALL_INFO_SECCOMP: u8 = 3;
+/// `sizeof(struct ptrace_syscall_info)`.
+const SYSCALL_INFO_SIZE: usize = 88;
+/// `AUDIT_ARCH_X86_64`.
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+/// `CLONE_VFORK`, `CLONE_PTRACE` and `CLONE_UNTRACED`.
+const CLONE_VFORK: u64 = 0x4000;
+const CLONE_PTRACE: u64 = 0x2000;
+const CLONE_UNTRACED: u64 = 0x80_0000;
+const SIGCHLD: u64 = 17;
 
 /// `PTRACE_EVENT_STOP`, the event of a group stop or an interrupt of a
 /// seized tracee.
@@ -127,7 +163,8 @@ const SIGSTOP: i32 = 19;
 pub(crate) const CLD_TRAPPED: i32 = 4;
 
 /// What a thread keeps of ptrace: not copied to a new thread or process,
-/// which starts untraced.
+/// which starts untraced, but for `orig_rax`, the call that made it, as
+/// the registers a new task starts with are a copy of its maker's.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Local {
     /// The thread's own ID, as of its last stop at the kernel.
@@ -141,12 +178,44 @@ pub(crate) struct Local {
     /// Whether the thread has stopped for the group stop now in effect
     /// while traced, and was let run on by its tracer.
     pub(crate) group_stopped: bool,
+    /// The thread is returning from a system call, whose syscall-exit stop
+    /// the next checkpoint takes if its tracer asked for it.
+    pub(crate) in_syscall: bool,
+    /// A traced thread's `clone`, `fork` or `vfork`: its checkpoints wait
+    /// until the new task has started ([`Kernel::child_started`]), where
+    /// the thread reports the event, as Linux's `kernel_clone` does after
+    /// `wake_up_new_task`.
+    pub(crate) hold: bool,
+    clone: Option<Cloned>,
+    /// A traced thread's `execve` that has replaced the program, by the
+    /// thread's ID before it: the event the next checkpoint reports.
+    exec: Option<u32>,
+}
+
+/// The `clone` of a traced thread: its flags, the new task once it is
+/// made, and the event the tracer asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cloned {
+    flags: u64,
+    child: Option<u32>,
+    event: Option<i32>,
+}
+
+/// How the tracer last resumed a tracee: whether it stops at each system
+/// call (`PTRACE_SYSCALL`), or at each entry, which it then skips
+/// (`PTRACE_SYSEMU`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Mode {
+    #[default]
+    Cont,
+    Syscall,
+    Sysemu,
 }
 impl Clone for Local {
     fn clone(&self) -> Self {
         Self {
             forked_by: self.tid,
-            orig_rax: u64::MAX,
+            orig_rax: self.orig_rax,
             ..Self::default()
         }
     }
@@ -185,6 +254,7 @@ struct Tracee {
     pid: u32,
     seized: bool,
     options: u32,
+    mode: Mode,
     /// `JOBCTL_TRAP_STOP`: an interrupt, or an attach to a stopped task.
     trap_stop: bool,
     stop: Option<Stop>,
@@ -263,6 +333,11 @@ impl Traces {
         tracee.exited = Some((status, dumped, uid));
         Some((tracee.tracer_pid, uid))
     }
+    /// How tracee `tid` was last resumed, its options and whether it was
+    /// seized.
+    fn settings(&self, tid: u32) -> Option<(Mode, u32, bool)> {
+        self.lock().get(&tid).map(|t| (t.mode, t.options, t.seized))
+    }
     /// Forgets the tasks of process `pid`, which has been reaped.
     pub(crate) fn forget_process(&self, pid: u32) {
         self.lock().retain(|_, tracee| tracee.pid != pid);
@@ -296,6 +371,7 @@ impl crate::Processes {
                 pid,
                 seized,
                 options,
+                mode: Mode::Cont,
                 trap_stop: false,
                 stop: None,
                 exited: None,
@@ -686,11 +762,283 @@ impl Kernel {
     }
 
     /// Whether a fatal signal waits for the thread, which ends any ptrace
-    /// stop: SIGKILL, or the end of its process.
+    /// stop: SIGKILL, or the end of its process that another thread began
+    /// (Linux sends those threads SIGKILL; the thread that ends it still
+    /// stops for `PTRACE_EVENT_EXIT`).
     fn fatal_pending(&self, thread: &mut Thread) -> bool {
         self.group.drain_process(&mut thread.state);
         self.inbox.drain(&mut thread.state);
-        self.group.status().is_some() || thread.state.pending.iter().any(|s| s.number == SIGKILL)
+        (self.group.status().is_some() && thread.state.exit_status.is_none())
+            || self.group.killed()
+            || thread.state.pending.iter().any(|s| s.number == SIGKILL)
+    }
+
+    /// Linux's `ptrace_notify`: the thread stops with `code`, `SIGTRAP`
+    /// with an event or `0x80` above it, and `message`, its siginfo the
+    /// trap's own. The signal its tracer resumed it with, or none if it was
+    /// killed or is no longer traced.
+    fn ptrace_report(
+        &mut self,
+        thread: &mut Thread,
+        code: i32,
+        message: u64,
+        restart: &mut Restart,
+    ) -> Option<i32> {
+        let info = notify_siginfo(
+            SIGTRAP,
+            code,
+            self.pid_space(thread.tid).number(thread.tid),
+            thread.state.credentials.task_ids().uid,
+        );
+        match self.ptrace_stop(thread, code, false, message, Some(info), restart) {
+            Resumed::With(signal, _) => Some(signal),
+            Resumed::Not => None,
+        }
+    }
+
+    /// Linux's `ptrace_event`: the thread stops for `event` with `message`
+    /// if its tracer asked for it. A signal its tracer resumes it with is
+    /// not delivered. `rax` shows `-ENOSYS` while it waits, which a call
+    /// has until it returns, and keeps its value.
+    fn ptrace_event(&mut self, thread: &mut Thread, event: i32, message: u64) {
+        let Some((_, options, _)) = self.processes.traces.settings(thread.tid) else {
+            return;
+        };
+        if options & (1 << event) == 0 {
+            return;
+        }
+        let value = thread.cpu.gpr[reg::RAX];
+        thread.cpu.gpr[reg::RAX] = Errno::ENOSYS.to_syscall_return();
+        self.ptrace_report(
+            thread,
+            SIGTRAP | event << 8,
+            message,
+            &mut Restart::default(),
+        );
+        thread.cpu.gpr[reg::RAX] = value;
+    }
+
+    /// The syscall stop `code` of a thread traced with
+    /// `PTRACE_O_TRACESYSGOOD` or not.
+    fn syscall_code(options: u32) -> i32 {
+        SIGTRAP
+            | if options & PTRACE_O_TRACESYSGOOD != 0 {
+                0x80
+            } else {
+                0
+            }
+    }
+
+    /// Linux's `ptrace_report_syscall` for a signal the tracer resumed a
+    /// syscall stop with: `send_sig` with `SEND_SIG_PRIV`, which Linux sends
+    /// to the process; the thread that stopped takes it here.
+    fn syscall_signal(thread: &mut Thread, signal: Option<i32>) {
+        if let Some(signal) = signal.filter(|&s| s != 0) {
+            signals::queue(
+                &mut thread.state,
+                signals::PendingSignal::user(signal, 0x80),
+            );
+        }
+    }
+
+    /// The syscall-entry stop of a thread its tracer resumed with
+    /// `PTRACE_SYSCALL` or `PTRACE_SYSEMU` (`syscall_trace_enter`), with
+    /// `rax` at `-ENOSYS` and the call in `orig_rax`. Whether the call runs:
+    /// not when the thread was killed meanwhile, under `PTRACE_SYSEMU`, or
+    /// when the tracer made its number -1, where `rax` stays as the tracer
+    /// left it. Otherwise the call is the one `orig_rax` names now, with the
+    /// arguments the registers have.
+    pub(crate) fn ptrace_syscall_entry(&mut self, thread: &mut Thread) -> bool {
+        let Some((mode, options, _)) = self.processes.traces.settings(thread.tid) else {
+            return true;
+        };
+        if mode == Mode::Cont {
+            return true;
+        }
+        thread.cpu.gpr[reg::RAX] = Errno::ENOSYS.to_syscall_return();
+        let signal = self.ptrace_report(
+            thread,
+            Self::syscall_code(options),
+            PTRACE_EVENTMSG_SYSCALL_ENTRY,
+            &mut Restart::default(),
+        );
+        Self::syscall_signal(thread, signal);
+        if self.fatal_pending(thread) || mode == Mode::Sysemu {
+            return false;
+        }
+        let number = thread.state.ptrace.orig_rax;
+        if number as i32 == -1 {
+            return false;
+        }
+        thread.cpu.gpr[reg::RAX] = number;
+        true
+    }
+
+    /// The syscall-exit stop of a thread whose tracer resumed it with
+    /// `PTRACE_SYSCALL` (`syscall_exit_work`); `rax` has what the call
+    /// returned, or the code of its restart.
+    fn ptrace_syscall_exit(&mut self, thread: &mut Thread, restart: &mut Restart) {
+        let Some((Mode::Syscall, options, _)) = self.processes.traces.settings(thread.tid) else {
+            return;
+        };
+        let signal = self.ptrace_report(
+            thread,
+            Self::syscall_code(options),
+            PTRACE_EVENTMSG_SYSCALL_EXIT,
+            restart,
+        );
+        Self::syscall_signal(thread, signal);
+    }
+
+    /// A traced thread enters `clone` (56), `fork` (57) or `vfork` (58),
+    /// `clone` with flags `flags`.
+    pub(crate) fn ptrace_clone(&self, thread: &mut Thread, number: u64, flags: u64) {
+        let flags = match number {
+            57 => SIGCHLD,
+            58 => CLONE_VFORK | 0x100 | SIGCHLD,
+            _ => flags,
+        };
+        thread.state.ptrace.clone = Some(Cloned {
+            flags,
+            child: None,
+            event: None,
+        });
+    }
+
+    /// After a traced thread's `clone` made a task, which has not started:
+    /// the event its tracer asked for (`PTRACE_EVENT_FORK`, `VFORK` or
+    /// `CLONE`, none for `CLONE_UNTRACED`), and the new task traced by the
+    /// same tracer with the same options if it asked for the event or the
+    /// call for `CLONE_PTRACE` (`ptrace_init_task`): seized, it starts with
+    /// `PTRACE_EVENT_STOP`, otherwise with `SIGSTOP` pending. No task was
+    /// made: the checkpoint the call held back runs now.
+    pub(crate) fn ptrace_cloned(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        next: Next,
+    ) -> Next {
+        let Some(mut cloned) = thread.state.ptrace.clone else {
+            thread.state.ptrace.hold = false;
+            return next;
+        };
+        let Some((child, child_thread)) = self.pending_child.as_mut() else {
+            thread.state.ptrace.hold = false;
+            thread.state.ptrace.clone = None;
+            return self.checkpoint(thread, mem);
+        };
+        let flags = cloned.flags;
+        let event = if flags & CLONE_UNTRACED != 0 {
+            None
+        } else if flags & CLONE_VFORK != 0 {
+            Some(PTRACE_EVENT_VFORK)
+        } else if flags & 0xff != SIGCHLD {
+            Some(PTRACE_EVENT_CLONE)
+        } else {
+            Some(PTRACE_EVENT_FORK)
+        };
+        let traces = &self.processes.traces;
+        let parent = traces
+            .lock()
+            .get(&thread.tid)
+            .map(|t| (t.tracer, t.tracer_pid, t.seized, t.options));
+        if let Some((tracer, tracer_pid, seized, options)) = parent {
+            let event = event.filter(|&e| options & (1 << e) != 0);
+            if event.is_some() || flags & CLONE_PTRACE != 0 {
+                let tid = child_thread.tid;
+                let pid = child.process.pid;
+                if self.processes.trace(
+                    tid,
+                    pid,
+                    &child.group,
+                    (tracer, tracer_pid),
+                    seized,
+                    options,
+                ) {
+                    if seized {
+                        if let Some(tracee) = traces.lock().get_mut(&tid) {
+                            tracee.trap_stop = true;
+                        }
+                    } else {
+                        // `sigaddset` alone: no siginfo was queued, so it
+                        // is `SI_USER` from no one.
+                        signals::queue(
+                            &mut child_thread.state,
+                            signals::PendingSignal {
+                                queued: Some([0; 48]),
+                                ..signals::PendingSignal::thread(SIGSTOP, 0)
+                            },
+                        );
+                    }
+                }
+            }
+            cloned.event = event;
+            cloned.child = Some(child_thread.tid);
+        }
+        thread.state.ptrace.clone = Some(cloned);
+        next
+    }
+
+    /// The task a `clone` made has started, or failed to (`started`), when
+    /// the call fails and no event is reported, as in Linux's
+    /// `kernel_clone`. Once it started, the thread reports the event
+    /// its tracer asked for with the task as its tracer's PID namespace
+    /// numbers it, waits for a `vfork` child to exec or exit, then reports
+    /// `PTRACE_EVENT_VFORK_DONE`, as Linux's `kernel_clone` does; its
+    /// checkpoints go on after. The error of a wait the thread was killed
+    /// in.
+    ///
+    /// # Errors
+    ///
+    /// As [`Kernel::wait_vfork`].
+    pub fn child_started(
+        &mut self,
+        thread: &mut Thread,
+        started: bool,
+        kill: &AtomicBool,
+    ) -> Result<(), Errno> {
+        thread.state.ptrace.hold = false;
+        let cloned = thread.state.ptrace.clone.take();
+        // A task that never ran is not traced either.
+        if !started {
+            if let Some(Cloned {
+                child: Some(child), ..
+            }) = cloned
+            {
+                self.processes.traces.lock().remove(&child);
+            }
+            return self.wait_vfork(kill);
+        }
+        let tid = thread.tid;
+        let number = |kernel: &Self, child: u32| {
+            kernel
+                .processes
+                .traces
+                .tracer_of(tid)
+                .and_then(|tracer| kernel.processes.view(tracer))
+                .map_or(0, |view| u64::from(view.space.number(child)))
+        };
+        if let Some(Cloned {
+            child: Some(child),
+            event: Some(event),
+            ..
+        }) = cloned
+        {
+            let message = number(self, child);
+            self.ptrace_event(thread, event, message);
+        }
+        self.wait_vfork(kill)?;
+        if let Some(Cloned {
+            flags,
+            child: Some(child),
+            ..
+        }) = cloned
+            && flags & CLONE_VFORK != 0
+        {
+            let message = number(self, child);
+            self.ptrace_event(thread, PTRACE_EVENT_VFORK_DONE, message);
+        }
+        Ok(())
     }
 
     /// Linux's `ptrace_signal`: the thread reports signal `signal`, which
@@ -777,9 +1125,18 @@ impl Kernel {
     /// lets it (`do_signal_stop`, then `do_jobctl_trap`), and an interrupt
     /// (`PTRACE_INTERRUPT`, or an attach to a stopped task).
     pub(crate) fn ptrace_traps(&mut self, thread: &mut Thread, restart: &mut Restart) {
-        if !self.traced(thread.tid) {
+        let in_syscall = std::mem::take(&mut thread.state.ptrace.in_syscall);
+        if !self.group.traced() || !self.traced(thread.tid) {
             thread.state.ptrace.group_stopped = false;
+            thread.state.ptrace.exec = None;
             return;
+        }
+        // `execve` reports its event, then returns (`exec_binprm`).
+        if let Some(old) = thread.state.ptrace.exec.take() {
+            self.ptrace_exec_event(thread, old);
+        }
+        if in_syscall {
+            self.ptrace_syscall_exit(thread, restart);
         }
         loop {
             if thread.state.stopped {
@@ -849,17 +1206,45 @@ impl Kernel {
         }
     }
 
-    /// After an `execve`, a thread traced without `PTRACE_SEIZE` gets
-    /// `SIGTRAP` from itself, as Linux's `ptrace_event` sends it for
-    /// `PTRACE_EVENT_EXEC` when the tracer did not ask for the event.
+    /// After an `execve` of a traced thread, which reports it at its next
+    /// checkpoint: a thread other than the leader has taken the leader's
+    /// number, and is traced by that number now (`de_thread`).
     pub(crate) fn ptrace_exec(&mut self, thread: &mut Thread) {
-        let legacy = self
-            .processes
-            .traces
-            .lock()
-            .get(&thread.tid)
-            .is_some_and(|t| !t.seized);
-        if legacy {
+        if !self.group.traced() {
+            return;
+        }
+        let old = thread.state.ptrace.tid;
+        {
+            let mut tracees = self.processes.traces.lock();
+            if old != thread.tid
+                && let Some(tracee) = tracees.remove(&old)
+            {
+                tracees.insert(thread.tid, tracee);
+            }
+            if !tracees.contains_key(&thread.tid) {
+                return;
+            }
+        }
+        thread.state.ptrace.exec = Some(old);
+    }
+
+    /// `PTRACE_EVENT_EXEC` with the thread's ID before the `execve` as its
+    /// tracer's PID namespace numbers it, if its tracer asked for it; a
+    /// thread traced without `PTRACE_SEIZE` gets `SIGTRAP` from itself
+    /// otherwise.
+    fn ptrace_exec_event(&mut self, thread: &mut Thread, old: u32) {
+        let Some((_, options, seized)) = self.processes.traces.settings(thread.tid) else {
+            return;
+        };
+        if options & (1 << PTRACE_EVENT_EXEC) != 0 {
+            let message = self
+                .processes
+                .traces
+                .tracer_of(thread.tid)
+                .and_then(|tracer| self.processes.view(tracer))
+                .map_or(0, |view| u64::from(view.space.number(old)));
+            self.ptrace_event(thread, PTRACE_EVENT_EXEC, message);
+        } else if !seized {
             signals::queue(&mut thread.state, signals::PendingSignal::user(SIGTRAP, 0));
         }
     }
@@ -872,6 +1257,17 @@ impl Kernel {
     pub(crate) fn ptrace_exit(&mut self, thread: &Thread, status: ExitStatus) {
         if !self.processes.traces.any() {
             return;
+        }
+        // `do_exit` reports `PTRACE_EVENT_EXIT` with its code first: not a
+        // thread killed, or one the end of its process began elsewhere.
+        if self.group.traced() && self.traced(thread.tid) {
+            let code = match status {
+                ExitStatus::Exited(code) => ((code & 0xff) << 8) as u64,
+                ExitStatus::Signaled(signal) => signal as u64,
+                _ => 0,
+            };
+            let mut exiting = thread.clone();
+            self.ptrace_event(&mut exiting, PTRACE_EVENT_EXIT, code);
         }
         let tracees: Vec<(u32, u32, bool)> = self
             .processes
@@ -1085,14 +1481,38 @@ impl Kernel {
                     Ok(0)
                 })
             }
-            PTRACE_CONT => {
+            PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SYSEMU => {
                 let signal = valid_signal(data)?;
-                traces.stopped(tid, |stop| {
+                let mode = match request {
+                    PTRACE_SYSCALL => Mode::Syscall,
+                    PTRACE_SYSEMU => Mode::Sysemu,
+                    _ => Mode::Cont,
+                };
+                {
+                    let mut tracees = traces.lock();
+                    let tracee = tracees.get_mut(&tid).ok_or(esrch)?;
+                    let stop = tracee.stop.as_mut().ok_or(esrch)?;
                     stop.resumed = Some(signal);
-                    Ok(0)
-                })?;
+                    tracee.mode = mode;
+                }
                 self.processes.changed().notify();
                 Ok(0)
+            }
+            PTRACE_GET_SYSCALL_INFO => {
+                let (info, size) = traces.stopped(tid, |stop| Ok(syscall_info(stop)))?;
+                let length = size.min(usize::try_from(addr).unwrap_or(usize::MAX));
+                if length != 0 {
+                    put(data, &info[..length])?;
+                }
+                Ok(size as u64)
+            }
+            PTRACE_SET_SYSCALL_INFO => {
+                if addr < SYSCALL_INFO_SIZE as u64 {
+                    return Err(Errno::EINVAL);
+                }
+                let mut info = [0u8; SYSCALL_INFO_SIZE];
+                get(data, &mut info)?;
+                traces.stopped(tid, |stop| set_syscall_info(stop, &info))
             }
             PTRACE_KILL => {
                 self.processes
@@ -1305,6 +1725,103 @@ fn valid_signal(data: u64) -> Result<i32, Errno> {
     Ok(data as i32)
 }
 
+/// Linux's `ptrace_get_syscall_info_op`: the kind of stop a task is in,
+/// from the `si_code` of its siginfo and its message. Syscall stops are
+/// known only with `PTRACE_O_TRACESYSGOOD`.
+fn syscall_info_op(stop: &Stop) -> u8 {
+    let code = stop.siginfo.map_or(0, |info| {
+        i32::from_le_bytes([info[8], info[9], info[10], info[11]])
+    });
+    if code == SIGTRAP | 0x80 {
+        match stop.message {
+            PTRACE_EVENTMSG_SYSCALL_ENTRY => SYSCALL_INFO_ENTRY,
+            PTRACE_EVENTMSG_SYSCALL_EXIT => SYSCALL_INFO_EXIT,
+            _ => SYSCALL_INFO_NONE,
+        }
+    } else if code == SIGTRAP | PTRACE_EVENT_SECCOMP << 8 {
+        SYSCALL_INFO_SECCOMP
+    } else {
+        SYSCALL_INFO_NONE
+    }
+}
+
+/// The six argument registers of a call, in order.
+const ARGUMENTS: [usize; 6] = [reg::RDI, reg::RSI, reg::RDX, reg::R10, reg::R8, reg::R9];
+
+/// `struct ptrace_syscall_info` of a stopped task and the size of what
+/// describes its stop, as Linux's `ptrace_get_syscall_info` fills them:
+/// the call and its arguments at an entry (and the seccomp filter's data
+/// at a seccomp stop), the return value at an exit, an error being one of
+/// the last 4095 values.
+fn syscall_info(stop: &Stop) -> ([u8; SYSCALL_INFO_SIZE], usize) {
+    let mut info = [0u8; SYSCALL_INFO_SIZE];
+    let op = syscall_info_op(stop);
+    info[0] = op;
+    info[4..8].copy_from_slice(&AUDIT_ARCH_X86_64.to_le_bytes());
+    info[8..16].copy_from_slice(&stop.cpu.rip.0.to_le_bytes());
+    info[16..24].copy_from_slice(&stop.cpu.gpr[reg::RSP].to_le_bytes());
+    let size = match op {
+        SYSCALL_INFO_ENTRY | SYSCALL_INFO_SECCOMP => {
+            info[24..32].copy_from_slice(&stop.orig_rax.to_le_bytes());
+            for (slot, &r) in ARGUMENTS.iter().enumerate() {
+                let at = 32 + slot * 8;
+                info[at..at + 8].copy_from_slice(&stop.cpu.gpr[r].to_le_bytes());
+            }
+            if op == SYSCALL_INFO_SECCOMP {
+                info[80..84].copy_from_slice(&(stop.message as u32).to_le_bytes());
+                84
+            } else {
+                80
+            }
+        }
+        SYSCALL_INFO_EXIT => {
+            let value = stop.cpu.gpr[reg::RAX];
+            info[24..32].copy_from_slice(&value.to_le_bytes());
+            info[32] = u8::from(value >= (-4095i64) as u64);
+            33
+        }
+        _ => 24,
+    };
+    (info, size)
+}
+
+/// Linux's `ptrace_set_syscall_info`: the stop must be the kind `info`
+/// names, with no flags (`EINVAL`). At an entry or a seccomp stop, the call
+/// becomes `info`'s, an `int` (`ERANGE`), with its arguments unless it is
+/// -1; at an exit, `rax` becomes the return value, an error as an `int`.
+fn set_syscall_info(stop: &mut Stop, info: &[u8; SYSCALL_INFO_SIZE]) -> Result<u64, Errno> {
+    let word = |at: usize| u64::from_le_bytes(info[at..at + 8].try_into().unwrap_or_default());
+    let (op, reserved, flags) = (info[0], info[1], u16::from_le_bytes([info[2], info[3]]));
+    if flags != 0 || reserved != 0 || syscall_info_op(stop) != op {
+        return Err(Errno::EINVAL);
+    }
+    match op {
+        SYSCALL_INFO_ENTRY | SYSCALL_INFO_SECCOMP => {
+            let number = word(24);
+            if i64::from(number as i32) as u64 != number {
+                return Err(Errno::ERANGE);
+            }
+            stop.orig_rax = number;
+            if number as i32 != -1 {
+                for (slot, &r) in ARGUMENTS.iter().enumerate() {
+                    stop.cpu.gpr[r] = word(32 + slot * 8);
+                }
+            }
+        }
+        SYSCALL_INFO_EXIT => {
+            let value = word(24);
+            // `syscall_set_return_value`: an error is the `int` it is.
+            stop.cpu.gpr[reg::RAX] = if info[32] != 0 {
+                i64::from(value as i32) as u64
+            } else {
+                value
+            };
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(0)
+}
+
 /// `user_regs_struct` of a stopped task, as `genregs_get` writes it.
 fn general_bytes(stop: &Stop) -> [u8; REGS_SIZE as usize] {
     let mut bytes = [0u8; REGS_SIZE as usize];
@@ -1437,14 +1954,106 @@ mod tests {
         assert_eq!(valid_signal(65), Err(Errno::EIO));
     }
 
+    /// A syscall stop of a tracee traced with `PTRACE_O_TRACESYSGOOD`.
+    fn syscall_stop(message: u64) -> Stop {
+        let mut stop = stopped();
+        stop.siginfo = Some(notify_siginfo(SIGTRAP, SIGTRAP | 0x80, 1, 0));
+        stop.message = message;
+        stop.orig_rax = 39;
+        stop.cpu.rip = GuestAddr(0x40_1000);
+        stop.cpu.gpr[reg::RSP] = 0x7000;
+        stop.cpu.gpr[reg::RDI] = 11;
+        stop.cpu.gpr[reg::R9] = 66;
+        stop
+    }
+
+    #[test]
+    fn syscall_info_describes_the_stop() {
+        let word =
+            |info: &[u8], at: usize| u64::from_le_bytes(info[at..at + 8].try_into().unwrap());
+        let (info, size) = syscall_info(&syscall_stop(PTRACE_EVENTMSG_SYSCALL_ENTRY));
+        assert_eq!((info[0], size), (SYSCALL_INFO_ENTRY, 80));
+        assert_eq!(
+            u32::from_le_bytes(info[4..8].try_into().unwrap()),
+            AUDIT_ARCH_X86_64
+        );
+        assert_eq!((word(&info, 8), word(&info, 16)), (0x40_1000, 0x7000));
+        assert_eq!(
+            (word(&info, 24), word(&info, 32), word(&info, 72)),
+            (39, 11, 66)
+        );
+        let mut exit = syscall_stop(PTRACE_EVENTMSG_SYSCALL_EXIT);
+        exit.cpu.gpr[reg::RAX] = (-9i64) as u64;
+        let (info, size) = syscall_info(&exit);
+        assert_eq!(
+            (info[0], size, word(&info, 24), info[32]),
+            (SYSCALL_INFO_EXIT, 33, (-9i64) as u64, 1)
+        );
+        exit.cpu.gpr[reg::RAX] = (-4096i64) as u64;
+        assert_eq!(syscall_info(&exit).0[32], 0);
+        // A plain SIGTRAP, without PTRACE_O_TRACESYSGOOD, is no syscall stop.
+        let mut plain = syscall_stop(PTRACE_EVENTMSG_SYSCALL_ENTRY);
+        plain.siginfo = Some(notify_siginfo(SIGTRAP, SIGTRAP, 1, 0));
+        assert_eq!(syscall_info(&plain).1, 24);
+        let mut seccomp = syscall_stop(0x1234);
+        seccomp.siginfo = Some(notify_siginfo(
+            SIGTRAP,
+            SIGTRAP | PTRACE_EVENT_SECCOMP << 8,
+            1,
+            0,
+        ));
+        let (info, size) = syscall_info(&seccomp);
+        assert_eq!((info[0], size, info[80]), (SYSCALL_INFO_SECCOMP, 84, 0x34));
+    }
+
+    #[test]
+    fn syscall_info_changes_only_the_stop_it_describes() {
+        let mut stop = syscall_stop(PTRACE_EVENTMSG_SYSCALL_ENTRY);
+        let mut info = syscall_info(&stop).0;
+        info[2] = 1;
+        assert_eq!(set_syscall_info(&mut stop, &info), Err(Errno::EINVAL));
+        info[2] = 0;
+        info[0] = SYSCALL_INFO_EXIT;
+        assert_eq!(set_syscall_info(&mut stop, &info), Err(Errno::EINVAL));
+        info[0] = SYSCALL_INFO_ENTRY;
+        info[24..32].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        assert_eq!(set_syscall_info(&mut stop, &info), Err(Errno::ERANGE));
+        info[24..32].copy_from_slice(&102u64.to_le_bytes());
+        info[32..40].copy_from_slice(&5u64.to_le_bytes());
+        assert_eq!(set_syscall_info(&mut stop, &info), Ok(0));
+        assert_eq!((stop.orig_rax, stop.cpu.gpr[reg::RDI]), (102, 5));
+        // -1 skips the call and leaves the arguments, which share rax's
+        // registers on other machines.
+        info[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        info[32..40].copy_from_slice(&6u64.to_le_bytes());
+        assert_eq!(set_syscall_info(&mut stop, &info), Ok(0));
+        assert_eq!((stop.orig_rax, stop.cpu.gpr[reg::RDI]), (u64::MAX, 5));
+        let mut exit = syscall_stop(PTRACE_EVENTMSG_SYSCALL_EXIT);
+        let mut info = syscall_info(&exit).0;
+        info[24..32].copy_from_slice(&(-1i64 << 33 | 1).to_le_bytes());
+        info[32] = 1;
+        assert_eq!(set_syscall_info(&mut exit, &info), Ok(0));
+        assert_eq!(exit.cpu.gpr[reg::RAX], 1, "an error is an int");
+        info[32] = 0;
+        assert_eq!(set_syscall_info(&mut exit, &info), Ok(0));
+        assert_eq!(exit.cpu.gpr[reg::RAX], (-1i64 << 33 | 1) as u64);
+        let mut other = stopped();
+        assert_eq!(
+            set_syscall_info(&mut other, &[0; SYSCALL_INFO_SIZE]),
+            Err(Errno::EINVAL)
+        );
+    }
+
     #[test]
     fn a_new_thread_starts_untraced_and_knows_its_maker() {
         let mut local = Local::default();
-        local.enter(7, 60);
+        local.enter(7, 57);
         local.group_stopped = true;
+        local.in_syscall = true;
+        local.hold = true;
         let copy = local.clone();
         assert_eq!(copy.forked_by, 7);
-        assert_eq!(copy.orig_rax, u64::MAX);
-        assert!(!copy.group_stopped);
+        assert_eq!(copy.orig_rax, 57);
+        assert!(!copy.group_stopped && !copy.in_syscall && !copy.hold);
     }
 }

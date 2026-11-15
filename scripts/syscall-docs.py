@@ -298,6 +298,7 @@ NAMES = {
     295: "preadv",
     296: "pwritev",
     297: "rt_tgsigqueueinfo",
+    298: "perf_event_open",
     299: "recvmmsg",
     300: "fanotify_init",
     301: "fanotify_mark",

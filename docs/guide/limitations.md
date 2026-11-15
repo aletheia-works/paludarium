@@ -195,6 +195,31 @@ verified.
   writes there: the call gives `EFAULT`, where Linux's copy of user memory
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
+- **perf events, in part**: only the software clocks count
+  (`cpu-clock`, `task-clock`) and the software events that never happen on
+  x86-64; page faults, context switches, CPU migrations and cgroup switches,
+  tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as are
+  hardware events even on a host with a PMU. A thread's CPU time is the one
+  it last accounted, at its latest system call, and an event of a CPU
+  counts the time that passes. There is no ring buffer: `mmap` of an event
+  is `ENODEV`, a sampling event takes no samples and sends no signal, and
+  `poll` never finds one readable. `inherit` is taken but children are not
+  counted, an event of a task on one CPU counts on any, and the cgroup mode
+  (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
+  ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
+  and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
+  disables the event at its task's `execve` and leaves it to be read, where
+  Linux takes it out of the task's context, and the members of a group it
+  led count on their own. The events that wait for an `execve` are kept in
+  one list for every emulated machine, matched by thread group and thread,
+  and dropped as they close. A group's members count whatever software
+  clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
+  group no count on the x86-64 machines the tests run on (why was not found).
+  The SIMD register
+  fields of Linux master's structure are not checked, and any use of them is
+  `EOPNOTSUPP`. `kernel.perf_event_paranoid` is always 2 (Debian's and
+  Ubuntu's kernels default to more), with no `/proc/sys/kernel` file for it,
+  and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
 - **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
   links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), IDs
@@ -414,12 +439,14 @@ verified.
     value's length as its size, where Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
-  - `ptrace` has no system-call stops, events, single-stepping or
-    listening yet: `PTRACE_SYSCALL`, `PTRACE_SYSEMU`, `PTRACE_SINGLESTEP`,
-    `PTRACE_LISTEN`, `PTRACE_PEEKSIGINFO`, `PTRACE_GETSIGMASK`,
-    `PTRACE_SETSIGMASK`, `PTRACE_GET_SYSCALL_INFO` and the other requests
-    the features do not list give `EIO`, and `PTRACE_SETOPTIONS` takes the
-    event options (`PTRACE_O_TRACE*`) without stopping for them.
+  - `ptrace` has no single-stepping or listening yet:
+    `PTRACE_SINGLESTEP`, `PTRACE_SYSEMU_SINGLESTEP`, `PTRACE_LISTEN`,
+    `PTRACE_PEEKSIGINFO`, `PTRACE_GETSIGMASK`, `PTRACE_SETSIGMASK` and the
+    other requests the features do not list give `EIO`, and
+    `PTRACE_O_TRACESECCOMP` is taken without a stop (`SECCOMP_RET_TRACE`
+    gives `ENOSYS`, as with no tracer). A signal a tracer resumes a syscall
+    stop with is taken by the thread that stopped, where Linux sends it to
+    the process. The status `PTRACE_EVENT_EXIT` gives has no core-dump bit.
     `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
     checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
     without XSAVE, which the emulated CPU does not offer. There are no

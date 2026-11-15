@@ -48,6 +48,7 @@ mod mqueue;
 mod msg;
 mod namespaces;
 mod page_cache;
+mod perf;
 mod proc;
 mod process_vm;
 mod processes;
@@ -738,6 +739,10 @@ impl Kernel {
 
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
+        // A traced thread's clone goes on once the new task has started.
+        if thread.state.ptrace.hold {
+            return Next::Resume;
+        }
         // Only the checkpoint right after the syscall may restart it.
         let mut restart = ptrace::Restart {
             number: thread.state.restart.take(),
@@ -1187,6 +1192,11 @@ impl Kernel {
         self.group.apply_discards(&mut thread.state);
         self.group.sync_timer(&mut thread.state);
         account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
+        thread.state.ptrace.in_syscall = true;
+        // The tracer may see and change the call first, or skip it.
+        if self.group.traced() && !self.ptrace_syscall_entry(thread) {
+            return self.checkpoint(thread, mem);
+        }
         // The number is an int, as Linux's do_syscall_64 takes it, compared
         // unsigned: a dirty upper half of rax is not read, and a negative
         // number is past every table (ENOSYS).
@@ -1233,11 +1243,19 @@ impl Kernel {
                 }
             }
         }
+        // A traced thread's clone reports its event once the task it makes
+        // has started.
+        if number == 56 || number == 57 || number == 58 {
+            thread.state.ptrace.hold = self.group.traced() && self.traced(thread.tid);
+            if thread.state.ptrace.hold {
+                self.ptrace_clone(thread, number, args[0]);
+            }
+        }
         if let Some(next) = self.process_syscall(thread, mem, number, args) {
-            return next;
+            return self.ptrace_cloned(thread, mem, next);
         }
         if let Some(next) = self.thread_syscall(thread, mem, number, args) {
-            return next;
+            return self.ptrace_cloned(thread, mem, next);
         }
         let Some(handler) = self.table.get(number) else {
             self.unimplemented

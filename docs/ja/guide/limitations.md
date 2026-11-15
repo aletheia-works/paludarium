@@ -210,8 +210,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **BPF はマップだけ**：`bpf` が作るのは配列とハッシュだけです。プログラム
   （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
   （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
-  `BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、Linux にあってここにないコマンドとして `ENOSYS` です。Linux に
-  コマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf はプログラムを読み込めず
+  `BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、Linux にあってここにない
+  コマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf はプログラムを読み込めず
   （最小のプログラムでの確認が `ENOSYS` で失敗します）、`bpftool feature` は、
   `BPF_PROG_LOAD` を呼んで `ENOSYS` かどうかを見るので、`bpf()` システムコールがないと
   言います。ほかのマップの型は、それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。
@@ -225,8 +225,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   4 GiB より大きいマップだけで、Linux は実際にあるメモリが尽きても `ENOMEM` を返すことが
   あります。事前に確保するハッシュは、ホストの CPU ごとに予備の要素を数えます。Linux が
   数えるのは使いうる CPU で、それより多いことがあります。マップの ID はエミュレートする
-  マシンのものなので、1 から始まり、ホストのマップは見えません。`BPF_F_MMAPABLE` は受け付けますが、マップの
-  `mmap` は `ENODEV`、マップの SHA-256（`bpf_map_info.hash`）は `EINVAL` です。
+  マシンのものなので、1 から始まり、ホストのマップは見えません。`BPF_F_MMAPABLE` は
+  受け付けますが、マップの `mmap` は `ENODEV`、マップの SHA-256
+  （`bpf_map_info.hash`）は `EINVAL` です。
   `kernel.unprivileged_bpf_disabled` はいつも 2 で、それを示す `/proc/sys/kernel` の
   ファイルはありません。
 - **仮想 CPU**：`rseq` を登録したスレッドは、ホストの CPU ではなく仮想 CPU で動きます。

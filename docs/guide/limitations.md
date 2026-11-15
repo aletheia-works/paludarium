@@ -240,8 +240,9 @@ verified.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
   links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
   programs, BTF and links (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`
-  and the rest), tokens, iterators and statistics are `ENOSYS`, as each command Linux has that is not here; a
-  number Linux has no command for is `EINVAL`, as there. So libbpf finds no
+  and the rest), tokens, iterators and statistics are `ENOSYS`, as each
+  command Linux has that is not here; a number Linux has no command for is
+  `EINVAL`, as there. So libbpf finds no
   program loads (its trivial-program probe fails with `ENOSYS`) and
   `bpftool feature` says the `bpf()` system call is not there, as it asks
   `BPF_PROG_LOAD` and looks for `ENOSYS`. The other map types are `EINVAL`,

@@ -164,7 +164,8 @@ impl Ids {
     /// (`ENOSPC` with none free); the map made with it is published.
     fn publish(self: &Arc<Self>, make: impl FnOnce(u32) -> Map) -> Result<Arc<Map>, Errno> {
         let mut table = lock(&self.table);
-        let start = table.next.clamp(1, LAST_ID);
+        // Past the last ID the search starts again at 1.
+        let start = table.next.max(1);
         let id = (start..=LAST_ID)
             .chain(1..start)
             .find(|id| !table.maps.contains_key(id))
@@ -1314,6 +1315,8 @@ mod tests {
         lock(&ids.table).next = LAST_ID;
         let last = ids.publish(make).unwrap();
         assert_eq!(last.id, LAST_ID);
+        // The last one freed is not taken again before the others.
+        drop(last);
         assert_eq!(ids.publish(make).unwrap().id, 1);
         assert!(Arc::ptr_eq(&ids.find(2).unwrap(), &second));
     }

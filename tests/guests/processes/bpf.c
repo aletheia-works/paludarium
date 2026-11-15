@@ -426,6 +426,10 @@ static int case_batch(void) {
     r = batch(MAP_UPDATE_BATCH, hash, NULL, NULL, k, v, &count, 0);
     say("hash update batch %ld count %u", r, count);
     keys("hash", hash);
+    /* Addresses at the top of the address space wrap, and fault. */
+    count = 2;
+    r = batch(MAP_UPDATE_BATCH, hash, NULL, NULL, (void *)~(uintptr_t)3, v, &count, 0);
+    say("hash update batch from the top %ld count %u", r, count);
     count = 8;
     memset(gk, 0, sizeof gk);
     r = batch(MAP_LOOKUP_BATCH, hash, NULL, &out, gk, gv, &count, 0);

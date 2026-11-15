@@ -394,22 +394,36 @@ fn check_op_flags(flags: u64, allowed: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// `__bpf_copy_key`: the key, or none for a null pointer (`EFAULT` for one
-/// that cannot be read).
-fn read_key(c: &Context<'_>, map: &Map, at: u64) -> Result<Vec<u8>, Errno> {
-    let mut key = vec![0; map.key_size as usize];
+/// The address of element `i` of `size` bytes from `base`, wrapping as a
+/// guest's pointer may: an address that wraps is not mapped, so its copy is
+/// `EFAULT`.
+fn element(base: u64, i: u64, size: u64) -> u64 {
+    base.wrapping_add(i.wrapping_mul(size))
+}
+
+/// `len` bytes of the caller's memory at `at`, `EFAULT` for any that cannot
+/// be read; the range is checked before anything is allocated for it, so
+/// that a large size with no memory behind it costs nothing.
+fn read_bytes(c: &Context<'_>, at: u64, len: u32) -> Result<Vec<u8>, Errno> {
+    let len = len as usize;
     c.mem
-        .read(GuestAddr(at), &mut key)
+        .check_read(GuestAddr(at), len)
         .map_err(|_| Errno::EFAULT)?;
-    Ok(key)
+    let mut bytes = vec![0; len];
+    c.mem
+        .read(GuestAddr(at), &mut bytes)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(bytes)
+}
+
+/// `__bpf_copy_key`'s copy of a key (`EFAULT` for one that cannot be
+/// read); a caller that takes no key for a null pointer checks for it.
+fn read_key(c: &Context<'_>, map: &Map, at: u64) -> Result<Vec<u8>, Errno> {
+    read_bytes(c, at, map.key_size)
 }
 
 fn read_value(c: &Context<'_>, map: &Map, at: u64) -> Result<Vec<u8>, Errno> {
-    let mut value = vec![0; map.value_size as usize];
-    c.mem
-        .read(GuestAddr(at), &mut value)
-        .map_err(|_| Errno::EFAULT)?;
-    Ok(value)
+    read_bytes(c, at, map.value_size)
 }
 
 fn index(key: &[u8]) -> u32 {
@@ -511,10 +525,9 @@ impl Map {
     fn memory(&self) -> u64 {
         let elem = u64::from(self.value_size).next_multiple_of(8);
         match self.kind {
-            TYPE_ARRAY => u64::from(self.max_entries) * elem,
-            _ => {
-                u64::from(self.max_entries) * (u64::from(self.key_size).next_multiple_of(8) + elem)
-            }
+            TYPE_ARRAY => u64::from(self.max_entries).saturating_mul(elem),
+            _ => u64::from(self.max_entries)
+                .saturating_mul(u64::from(self.key_size).next_multiple_of(8) + elem),
         }
     }
 }
@@ -648,7 +661,7 @@ fn batch(c: &mut Context<'_>, attr: &[u8], at: u64, command: u32) -> Result<u64,
 const COUNT: u64 = 32;
 
 fn put_count(c: &Context<'_>, at: u64, count: u32) -> Result<(), Errno> {
-    write(c, at + COUNT, &count.to_le_bytes())
+    write(c, at.wrapping_add(COUNT), &count.to_le_bytes())
 }
 
 /// `generic_map_update_batch`.
@@ -666,8 +679,8 @@ fn update_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Result<u64,
     let mut result = Ok(0);
     while done < max {
         let i = u64::from(done);
-        let step = read_key(c, map, keys + i * key_size)
-            .and_then(|key| Ok((key, read_value(c, map, values + i * value_size)?)))
+        let step = read_key(c, map, element(keys, i, key_size))
+            .and_then(|key| Ok((key, read_value(c, map, element(values, i, value_size))?)))
             .and_then(|(key, value)| map.set(&key, value, flags));
         if let Err(e) = step {
             result = Err(e);
@@ -694,8 +707,12 @@ fn delete_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Result<u64,
     let mut done = 0;
     let mut result = Ok(0);
     while done < max {
-        let step = read_key(c, map, keys + u64::from(done) * u64::from(map.key_size))
-            .and_then(|key| map.remove(&key));
+        let step = read_key(
+            c,
+            map,
+            element(keys, u64::from(done), u64::from(map.key_size)),
+        )
+        .and_then(|key| map.remove(&key));
         if let Err(e) = step {
             result = Err(e);
             break;
@@ -734,8 +751,8 @@ fn array_lookup_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Resul
             }
         };
         let value = map.get(&key)?;
-        write(c, keys + u64::from(done) * key_size, &key)?;
-        write(c, values + u64::from(done) * value_size, &value)?;
+        write(c, element(keys, u64::from(done), key_size), &key)?;
+        write(c, element(values, u64::from(done), value_size), &value)?;
         done += 1;
         previous = Some(key);
     }
@@ -806,11 +823,15 @@ fn hash_lookup_batch(
     };
     let (key_size, value_size) = (u64::from(map.key_size), u64::from(map.value_size));
     for (i, (key, value)) in taken.iter().enumerate() {
-        write(c, keys + i as u64 * key_size, key)?;
-        write(c, values + i as u64 * value_size, value)?;
+        write(c, element(keys, i as u64, key_size), key)?;
+        write(c, element(values, i as u64, value_size), value)?;
     }
     let done = taken.len() as u32;
-    let next = if delete { start } else { start + done };
+    let next = if delete {
+        start
+    } else {
+        start.saturating_add(done)
+    };
     let remaining = {
         let Elements::Hash(all) = &*map.elements() else {
             return Err(Errno::EINVAL);
@@ -847,7 +868,7 @@ fn info(c: &mut Context<'_>, attr: &[u8], at: u64) -> Result<u64, Errno> {
     if len > KNOWN {
         let mut tail = vec![0; len - KNOWN];
         c.mem
-            .read(GuestAddr(uinfo + KNOWN as u64), &mut tail)
+            .read(GuestAddr(uinfo.wrapping_add(KNOWN as u64)), &mut tail)
             .map_err(|_| Errno::EFAULT)?;
         if tail.iter().any(|&b| b != 0) {
             return Err(E2BIG);
@@ -857,12 +878,12 @@ fn info(c: &mut Context<'_>, attr: &[u8], at: u64) -> Result<u64, Errno> {
     let mut info = [0u8; SIZE];
     if len >= 96 {
         c.mem
-            .read(GuestAddr(uinfo + 88), &mut info[88..96])
+            .read(GuestAddr(uinfo.wrapping_add(88)), &mut info[88..96])
             .map_err(|_| Errno::EFAULT)?;
     }
     if len >= KNOWN {
         c.mem
-            .read(GuestAddr(uinfo + 96), &mut info[96..100])
+            .read(GuestAddr(uinfo.wrapping_add(96)), &mut info[96..100])
             .map_err(|_| Errno::EFAULT)?;
     }
     let (hash, hash_size) = (word(&info, 88), half(&info, 96));
@@ -884,7 +905,7 @@ fn info(c: &mut Context<'_>, attr: &[u8], at: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     write(c, uinfo, &info[..len])?;
-    write(c, at + 4, &(len as u32).to_le_bytes())?;
+    write(c, at.wrapping_add(4), &(len as u32).to_le_bytes())?;
     Ok(0)
 }
 

@@ -164,6 +164,15 @@ impl Emitter<'_, '_> {
         self.set_gpr(index, value);
     }
 
+    /// `v` masked to `size` bytes.
+    fn masked(&mut self, v: Value, size: u8) -> Value {
+        if size == 8 {
+            v
+        } else {
+            self.b.ins().band_imm_s(v, mask(size))
+        }
+    }
+
     fn source(&mut self, src: Source, size: u8) -> Value {
         match src {
             Source::Register(r) => {
@@ -483,6 +492,33 @@ impl Emitter<'_, '_> {
                     self.b.ins().band_imm_s(a, mask(size))
                 };
                 let (_, f) = self.alu(op, a, b, size);
+                self.set_status(f);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::AluLoad { op, dst, mem } => {
+                let size = dst.size();
+                let address = self.linear(&mem);
+                let (b, status) = self.load(address, size);
+                self.unless_failed(status, n, rip);
+                let b = self.masked(b, size);
+                let a = self.read(dst);
+                let (r, f) = self.alu(op, a, b, size);
+                if op.writes() {
+                    self.write(dst, r);
+                }
+                self.set_status(f);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::AluStore { op, mem, src } => {
+                let size = mem.size;
+                let b = self.source(src, size);
+                let address = self.linear(&mem);
+                let (a, loaded) = self.load(address, size);
+                self.unless_failed(loaded, n, rip);
+                let a = self.masked(a, size);
+                let (r, f) = self.alu(op, a, b, size);
+                let status = self.store(address, size, r);
+                self.unless_failed(status, n, rip);
                 self.set_status(f);
                 self.unless_changed(status, n + 1, next);
             }

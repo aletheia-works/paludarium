@@ -306,6 +306,8 @@ pub(crate) struct Network {
     addresses: Mutex<crate::interface::Addresses>,
     /// The netlink sockets bound in it ([`crate::netlink`]).
     pub(crate) netlink: crate::netlink::Ports,
+    /// Its MCTP sockets' binds and tags ([`crate::mctp`]).
+    pub(crate) mctp: crate::mctp::Endpoints,
     /// Its TCP and UDP sockets, oldest first, which `sock_diag` lists.
     sockets: Mutex<Vec<Weak<InetSocket>>>,
     /// The user namespace that owns its network namespace, whose
@@ -332,6 +334,7 @@ impl Network {
             ever_up: AtomicBool::new(true),
             addresses: Mutex::new(crate::interface::Addresses::first()),
             netlink: crate::netlink::Ports::default(),
+            mctp: crate::mctp::Endpoints::default(),
             sockets: Mutex::default(),
             owner: None,
         }

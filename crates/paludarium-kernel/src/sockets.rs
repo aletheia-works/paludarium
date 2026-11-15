@@ -634,9 +634,11 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// The socket call `number` on the socket family of descriptor `a[0]`.
 fn route(c: &mut Context<'_>, number: u64, a: [u64; 6]) -> Result<u64, Errno> {
     (|| match number {
-        // AF_INET and AF_INET6, with a network, AF_UNIX and AF_NETLINK.
+        // AF_INET and AF_INET6, with a network, AF_UNIX, AF_NETLINK and
+        // AF_MCTP.
         41 if a[0] == 1 => crate::unix::socket(c, a),
         41 if a[0] == 16 => crate::netlink::socket(c, a),
+        41 if a[0] == crate::mctp::AF_MCTP => crate::mctp::socket(c, a),
         41 => match c.network() {
             Some(network) if matches!(a[0], 2 | 10) => {
                 if a[1] as u32 & !(NONBLOCK | CLOEXEC | 0xf) != 0 {
@@ -662,6 +664,14 @@ fn route(c: &mut Context<'_>, number: u64, a: [u64; 6]) -> Result<u64, Errno> {
             let file = c.files.descriptor(a[0])?.file;
             crate::netlink::dispatch(c, number, a, &file)
         }
+        42..=52 | 54 | 55 | 288
+            if c.files
+                .descriptor(a[0])
+                .is_ok_and(|d| crate::mctp::of(&d.file).is_some()) =>
+        {
+            let file = c.files.descriptor(a[0])?.file;
+            crate::mctp::dispatch(c, number, a, &file)
+        }
         42 | 43 | 49 | 50 | 51 | 52 | 288
             if let Some(socket) = c
                 .files
@@ -677,6 +687,12 @@ fn route(c: &mut Context<'_>, number: u64, a: [u64; 6]) -> Result<u64, Errno> {
             Err(Errno(88))
         }
         53 => {
+            if a[0] == crate::mctp::AF_MCTP {
+                c.mem
+                    .check_write(GuestAddr(a[3]), 8)
+                    .map_err(|_| Errno::EFAULT)?;
+                return crate::mctp::pair(c, a);
+            }
             if a[0] != 1 {
                 return Err(Errno(97));
             }
@@ -764,6 +780,7 @@ fn socket_of(c: &Context<'_>, fd: u64) -> Result<(), Errno> {
     let file = c.files.descriptor(fd)?.file;
     if crate::inet::of(&file).is_some()
         || crate::netlink::of(&file).is_some()
+        || crate::mctp::of(&file).is_some()
         || file.as_any().is_some_and(|v| v.is::<SocketPairEnd>())
     {
         Ok(())

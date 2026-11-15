@@ -277,16 +277,7 @@ impl Files {
     /// `path`, from the machine's root, as a path from the process's root:
     /// `None` when it is not under the root.
     pub(crate) fn seen_from_root(&self, path: &[u8]) -> Option<Vec<u8>> {
-        let root = self.root();
-        if root == b"/" {
-            return Some(path.to_vec());
-        }
-        let rest = path.strip_prefix(&root[..])?;
-        if rest.is_empty() {
-            Some(b"/".to_vec())
-        } else {
-            rest.starts_with(b"/").then(|| rest.to_vec())
-        }
+        seen_from(&self.root(), path)
     }
     /// Makes the directory at the resolved `path` the root, for every task
     /// that shares it (`set_fs_root`); `EINVAL` where the filesystem cannot
@@ -5777,7 +5768,7 @@ fn open_path(
             crate::devices::Entry::Link(target) => return open_path(c, target, flags, mode),
         }
     } else if let Some(mountinfo) = crate::proc::mount_table(p) {
-        let content = crate::proc::render(&c.files.fs().mounts(), mountinfo);
+        let content = crate::proc::render(&c.files.fs().mounts(), mountinfo, &c.files.root());
         Arc::new(crate::proc::GeneratedFile::open(content, flags))
     } else if tasks::is_root(p) {
         if flags & 3 != 0 {
@@ -5901,11 +5892,13 @@ fn open_path(
                 c.mem.view(),
                 c.group.start_stack(),
                 flags,
+                c.files.root(),
             )),
             crate::proc::OwnEntry::Smaps => Arc::new(crate::proc::MapsFile::open_as(
                 c.mem.view(),
                 c.group.start_stack(),
                 flags,
+                c.files.root(),
                 true,
             )),
             crate::proc::OwnEntry::Descriptor(n) => {
@@ -6618,6 +6611,19 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
         }),
     })
 }
+/// `path`, from the machine's root, as a path from `root`, a resolved path
+/// from there: `None` when it is not under `root`.
+pub(crate) fn seen_from(root: &[u8], path: &[u8]) -> Option<Vec<u8>> {
+    if root == b"/" {
+        return Some(path.to_vec());
+    }
+    let rest = path.strip_prefix(root)?;
+    if rest.is_empty() {
+        Some(b"/".to_vec())
+    } else {
+        rest.starts_with(b"/").then(|| rest.to_vec())
+    }
+}
 /// The path `d` was opened by, made plain.
 fn opened_path(d: &Descriptor) -> Vec<u8> {
     paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())
@@ -6724,7 +6730,7 @@ fn other_generated_stat(
     follow: bool,
 ) -> Option<(FileStat, u64, u32)> {
     if let Some(mountinfo) = crate::proc::mount_table(path) {
-        let length = crate::proc::render(&c.files.fs().mounts(), mountinfo).len();
+        let length = crate::proc::render(&c.files.fs().mounts(), mountinfo, &c.files.root()).len();
         return Some((crate::proc::stat(length), device(c, path), SMALL_BLOCK_SIZE));
     }
     // `/proc/self` itself, not followed, is the link to this process's

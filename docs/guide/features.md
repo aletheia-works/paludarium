@@ -71,7 +71,7 @@ kernel.
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
-| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6` and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
+| Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6`, `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) and `AF_MCTP` datagrams with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
 | Randomness | `getrandom` |
 
 - The `struct iovec` array of `readv`, `writev`, their positioned forms,
@@ -423,7 +423,7 @@ kernel.
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
 - Without a [network](#network), outside a new network namespace, `socket()` returns `EAFNOSUPPORT` for
-  `AF_INET`, `AF_INET6` and `AF_NETLINK`.
+  `AF_INET`, `AF_INET6`, `AF_NETLINK` and `AF_MCTP`.
 - `epoll_wait`, `epoll_pwait` and `epoll_pwait2` check their arguments in
   the order of the kernels after Linux 6.12 (6.12 itself checked
   `maxevents` before the descriptor): `epoll_pwait2` reads its timeout (a `struct timespec`, none
@@ -1894,6 +1894,61 @@ kernel.
     its addresses, state and timer alone.
   - **Groups:** a socket has 32 groups, as Linux makes the four of
     `sock_diag` 32, which anyone may join, and which hear nothing.
+- An MCTP socket (`AF_MCTP`, `SOCK_DGRAM` and protocol 0: `EPROTONOSUPPORT`
+  for another protocol, then `ESOCKTNOSUPPORT` for another type) sends and
+  receives messages between the MCTP endpoint IDs of its network
+  namespace's loopback, as Linux 7.0's `af_mctp` does on a kernel built with
+  `CONFIG_MCTP`.
+  - **Binds:** `bind` takes a `sockaddr_mctp` (`EINVAL` for a short one or
+    one with padding, `EAFNOSUPPORT` for another family, `EACCES` without
+    `CAP_NET_BIND_SERVICE`): a message type, its integrity check bit left
+    out, a local endpoint ID or `MCTP_ADDR_ANY`, and a network, the default
+    one (1) for `MCTP_NET_ANY` with an ID. No two sockets bind alike, and a
+    socket binds once (`EADDRINUSE`). A `connect` before it names the peer
+    and type the bind takes (`EINVAL` for a length other than 12, a tag or
+    the integrity check bit, and for a bind of another type or network;
+    `EADDRINUSE` after a bind or a connect).
+  - **Sending:** `sendto` and `sendmsg` need an address (`EDESTADDRREQ`, as
+    a `write` has none) that is whole, without padding, and with no tag
+    bits but the tag, `MCTP_TAG_OWNER` and `MCTP_TAG_PREALLOC`, the last
+    with the owner bit (`EINVAL`); and `CAP_NET_RAW` (`EACCES`). The
+    message, its type first, goes through the route to its endpoint ID, as
+    `mctp_route_lookup` follows gateways to a local route (`EHOSTUNREACH`
+    for none), from the loopback's first MCTP address, in packets of the
+    least MTU on the way, each taken in at once (`mctp_dst_input`), whose
+    error is the send's: `ENOENT` where no key or bind takes it, `ENOMEM`
+    for a full receive buffer (which counts each packet's `truesize`, as
+    Linux's does), and `EINVAL` for a message past 64 KiB, which no key
+    reassembles. One too long for a buffer (`kmalloc`'s 4 MiB) is
+    `ENOBUFS`.
+  - **Receiving:** a message goes to the socket of the key its tag and
+    addresses match, or, at the start of one whose tag its sender owns, to
+    the bind of its type, in Linux's order: of its destination and source,
+    of its source, of its destination, of any address in its network, then
+    of any network. `recvfrom` and `recvmsg` give its bytes and a
+    `sockaddr_mctp` of its network, source, type and tag, and take
+    `MSG_PEEK`, `MSG_TRUNC` and `MSG_DONTWAIT` alone (`EOPNOTSUPP`).
+  - **Tags:** a send with `MCTP_TAG_OWNER` takes the lowest tag no key for
+    its peer has (`EBUSY` when all eight are taken), whose key stays six
+    seconds or until the answer comes with it. `SIOCMCTPALLOCTAG` and
+    `SIOCMCTPALLOCTAG2` make one by hand (`EINVAL` for a request with a
+    tag, flags or a local ID), which a send with `MCTP_TAG_PREALLOC` uses
+    (`ENOENT` for one not made), and which stays until `SIOCMCTPDROPTAG` or
+    `SIOCMCTPDROPTAG2` drops it (`EINVAL` for none). Every other `ioctl`
+    of the socket's own is `EINVAL`, `FIONREAD` too.
+  - **Hardware addresses:** with `MCTP_OPT_ADDR_EXT` (`SOL_MCTP`, an `int`
+    exactly, else `EINVAL`), a `sockaddr_mctp_ext` sends out of the
+    loopback by its index and hardware address (`ENOENT` for another index,
+    `EINVAL` for an address of other than six bytes, or padding). The send
+    succeeds and the message is lost, as on Linux: while the loopback is
+    down its `noop` queueing discipline drops it, and while it is up it
+    comes back in, but `eth_type_trans` takes `ETH_P_MCTP` (0xfa), below
+    `ETH_P_802_3_MIN`, for an 802.3 length, so the frame goes to 802.2 and
+    never to MCTP. A socket with the option names, in a message it
+    receives, the interface it came in by, which is 0, none.
+  - **Others:** `getsockname`, `getpeername`, `listen`, `accept`,
+    `shutdown` and `socketpair` are `EOPNOTSUPP`; `setsockopt` and
+    `getsockopt` of a level but `SOL_SOCKET` and `SOL_MCTP` are `EINVAL`.
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,
@@ -2102,7 +2157,9 @@ kernel.
   space and inodes are what it holds, and a mounted host directory with the
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
-  `--mount`, without host paths). Each mount has its own `st_dev`, as its
+  `--mount`, without host paths). After `chroot` they show each mount point
+  from the process's root and leave out those not under it, as Linux's
+  `seq_path_root` does. Each mount has its own `st_dev`, as its
   line in `mountinfo` says, so `df` lists every mount. A pipe, a socket, a
   pidfd, a memfd, a `memfd_secret` file, a namespace file and an anonymous
   inode (an eventfd, an epoll and the like) that no path opened are each on
@@ -2154,10 +2211,11 @@ kernel.
   the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
-  unmarked. `status` has Linux's fields in Linux's order (umask, IDs, threads,
-  signal masks, capabilities and so on) and, of the memory ones, the locked
-  memory (`VmLck`); the other memory fields and the CPU ones are not there,
-  as nothing measures them. Any other path in this process's directory or
+  unmarked; `maps` and `smaps` name a mapped file the same way. `status`
+  has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
+  capabilities and so on) and, of the memory ones, the locked memory
+  (`VmLck`); the other memory fields and the CPU ones are not there, as
+  nothing measures them. Any other path in this process's directory or
   elsewhere under `/proc` is looked up in the filesystem like any path, so with
   `--mount /:/` it reaches the host's own `/proc`.
 - `/proc` lists what the filesystem has there that is not a process (with

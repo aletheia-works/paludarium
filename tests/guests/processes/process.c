@@ -1812,6 +1812,80 @@ static int nl_quiet(int fd, unsigned short type, unsigned short flags, const voi
     if (n >= 20 && ((struct nl_header *)buf)->type == 2) memcpy(&error, buf + 16, 4);
     return error;
 }
+/* The mctp-sockets case: struct sockaddr_mctp and sockaddr_mctp_ext, and
+   the tag ioctls' requests, written out, as musl-gcc has no kernel
+   headers. */
+struct mctp_name {
+    unsigned short family, pad0;
+    unsigned net;
+    unsigned char eid, type, tag, pad1;
+};
+struct mctp_name_ext {
+    struct mctp_name base;
+    int ifindex;
+    unsigned char halen, pad[3], haddr[32];
+};
+struct mctp_tag_ctl {
+    unsigned char peer, tag;
+    unsigned short flags;
+};
+struct mctp_tag_ctl2 {
+    unsigned net;
+    unsigned char peer, local;
+    unsigned short flags;
+    unsigned char tag;
+};
+static struct mctp_name mctp_name(unsigned net, int eid, int type, int tag) {
+    struct mctp_name name = {.family = 45, .net = net, .eid = eid, .type = type, .tag = tag};
+    return name;
+}
+/* Sends `len` bytes of a pattern from `fd` to `name` (of `size` bytes),
+   and prints what it gave. */
+static void mctp_send(int fd, const void *name, socklen_t size, size_t len, const char *label) {
+    static unsigned char bytes[70000];
+    /* One longer than a message may be is left zero, which takes the
+       emulator less time than the pattern would. */
+    unsigned char *at = len > sizeof bytes ? calloc(len, 1) : bytes;
+    for (size_t i = 0; at == bytes && i < len; i++) at[i] = 'a' + i % 26;
+    printf("%s: send=%ld\n", label, netns_result(sendto(fd, at, len, 0, name, size)));
+    if (at != bytes) free(at);
+}
+/* Receives on `fd` without waiting, with `flags`, into `room` bytes, and
+   prints what came: its length, its name, and its bytes (the first 16 and a
+   sum of them all). Of the tag, only whether its sender owns it: which one
+   it is depends on the keys of six seconds before, and a slow run may
+   outlast them. */
+static void mctp_receive(int fd, int flags, size_t room, const char *label) {
+    static unsigned char bytes[70000];
+    struct mctp_name_ext name;
+    memset(&name, 0x5a, sizeof name);
+    struct iovec iov = {bytes, room};
+    struct msghdr m = {.msg_name = &name, .msg_namelen = sizeof name, .msg_iov = &iov, .msg_iovlen = 1};
+    long n = netns_result(recvmsg(fd, &m, flags | MSG_DONTWAIT));
+    printf("%s: recv=%ld", label, n);
+    if (n < 0) {
+        printf("\n");
+        return;
+    }
+    unsigned sum = 0;
+    size_t got = (size_t)n < room ? (size_t)n : room;
+    for (size_t i = 0; i < got; i++) sum = sum * 31 + bytes[i];
+    printf(" flags=%#x namelen=%u family=%u pad=%u net=%u eid=%u type=%#x owned=%d high=%d pad=%u", m.msg_flags,
+           m.msg_namelen, name.base.family, name.base.pad0, name.base.net, name.base.eid, name.base.type,
+           !!(name.base.tag & 8), name.base.tag >> 4, name.base.pad1);
+    if (m.msg_namelen == sizeof name)
+        printf(" ifindex=%d halen=%u", name.ifindex, name.halen);
+    printf(" bytes='%.*s' sum=%u\n", (int)(got < 16 ? got : 16), bytes, sum);
+}
+/* Adds MCTP endpoint ID `eid` to lo through `ctl`, and prints its error. */
+static void mctp_address(int ctl, int eid) {
+    struct nl_body b = nl_body(45, 8);
+    unsigned index = 1;
+    memcpy(b.bytes + 4, &index, 4);
+    unsigned char value = eid;
+    nl_put(&b, 2, &value, 1);
+    printf("address %d: error=%d\n", eid, nl_quiet(ctl, 20, 0, b.bytes, b.len));
+}
 /* The netlink-strict case: request `type` with `flags` and body `b`,
    attribute `attr` of `len` bytes of `value` added to it; prints its
    error. */
@@ -8081,6 +8155,49 @@ static void cr_link(const char *label, int dir, const char *name) {
     else
         printf("%s: %s\n", label, buf);
 }
+/* The file of the mapping at `at` in dir/name (maps or smaps), BASE for
+   the base. */
+static void cr_mapped(const char *label, int dir, const char *name, void *at) {
+    static char buf[1 << 17];
+    int fd = openat(dir, name, O_RDONLY);
+    if (fd < 0) {
+        printf("%s: errno=%d\n", label, errno);
+        return;
+    }
+    size_t got = 0;
+    ssize_t n;
+    while (got < sizeof buf - 1 && (n = read(fd, buf + got, sizeof buf - 1 - got)) > 0) got += n;
+    close(fd);
+    buf[got] = 0;
+    for (char *line = buf, *end; (end = strchr(line, '\n')); line = end + 1) {
+        *end = 0;
+        unsigned long start;
+        if (sscanf(line, "%lx-", &start) != 1 || start != (unsigned long)at) continue;
+        char *path = strchr(line, '/');
+        char *base = path ? strstr(path, cr_base) : NULL;
+        if (base)
+            printf("%s: %.*sBASE%s\n", label, (int)(base - path), path, base + strlen(cr_base));
+        else
+            printf("%s: %s\n", label, path ? path : "(none)");
+        return;
+    }
+    printf("%s: not found\n", label);
+}
+/* The number of lines in dir/name. */
+static void cr_lines(const char *label, int dir, const char *name) {
+    int fd = openat(dir, name, O_RDONLY);
+    if (fd < 0) {
+        printf("%s: errno=%d\n", label, errno);
+        return;
+    }
+    char buf[4096];
+    ssize_t n;
+    int lines = 0;
+    while ((n = read(fd, buf, sizeof buf)) > 0)
+        for (ssize_t i = 0; i < n; i++) lines += buf[i] == '\n';
+    close(fd);
+    printf("%s: %d lines\n", label, lines);
+}
 static int chroot_exec_case(void) {
     cr_cwd("exec");
     cr_read("exec /f", "/f");
@@ -8146,6 +8263,7 @@ static int chroot_case(const char *self) {
         if (syscall(SYS_unshare, CLONE_NEWUSER)) _exit(90);
         if (chdir(cr_base)) _exit(91);
         int proc = open("/proc/self", O_RDONLY | O_DIRECTORY);
+        int outer = open("f", O_RDONLY);
         long rooted = cr_call(jail);
         printf("chroot=%ld\n", rooted);
         if (rooted) _exit(89);
@@ -8158,6 +8276,20 @@ static int chroot_case(const char *self) {
         char name[32];
         snprintf(name, sizeof name, "fd/%d", file);
         cr_link("own fd", proc, name);
+        /* Files mapped from under the new root and from outside it, named
+           from the root and from the machine's root; the mounts, none of
+           them under the new root. */
+        void *in_map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, file, 0);
+        void *out_map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, outer, 0);
+        cr_mapped("maps inside", proc, "maps", in_map);
+        cr_mapped("maps outside", proc, "maps", out_map);
+        cr_mapped("smaps inside", proc, "smaps", in_map);
+        cr_mapped("smaps outside", proc, "smaps", out_map);
+        cr_lines("mounts", proc, "mounts");
+        cr_lines("mountinfo", proc, "mountinfo");
+        munmap(in_map, 4096);
+        munmap(out_map, 4096);
+        close(outer);
         close(file);
         close(proc);
         /* The parent reads this root while it is there. */
@@ -13657,6 +13789,25 @@ int main(int argc, char **argv) {
                      "del6 metric 7");
             nl_route(ctl, port, 25, 0, "2001:db8:2::", 64, ROUTE6(.protocol = 0, .kind = 1), "del6 blackhole as unicast");
             nl_route(ctl, port, 25, 0, "2001:db8:77::", 64, ROUTE6(.protocol = 0, .kind = 0), "del6 missing");
+            /* A refused add makes its table only once its prefix is good:
+               a removal from a table never made is told the table does not
+               exist, one from a table made is told of no route. */
+            nl_route(ctl, port, 24, add, "10.0.0.1", 8, ROUTE4(.table = 500, .scope = 253, .oif = 1),
+                     "add bad prefix 500");
+            nl_route(ctl, port, 25, 0, "10.0.0.0", 8, ROUTE4(.table = 500, .protocol = 0, .scope = 255, .kind = 0),
+                     "del in 500");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 33, ROUTE4(.table = 501, .scope = 253, .oif = 1),
+                     "add prefix 33 in 501");
+            nl_route(ctl, port, 25, 0, "10.0.0.0", 8, ROUTE4(.table = 501, .protocol = 0, .scope = 255, .kind = 0),
+                     "del in 501");
+            nl_route(ctl, port, 24, add, "10.0.0.0", 8, ROUTE4(.table = 502, .scope = 254, .oif = 1, .gw = "127.0.0.2"),
+                     "add bad gateway 502");
+            nl_route(ctl, port, 25, 0, "10.0.0.0", 8, ROUTE4(.table = 502, .protocol = 0, .scope = 255, .kind = 0),
+                     "del in 502");
+            nl_route(ctl, port, 24, add, "2001:db8:8::", 129, ROUTE6(.table = 503, .oif = 1), "add6 prefix 129 in 503");
+            nl_route(ctl, port, 25, 0, "2001:db8:8::", 64, ROUTE6(.table = 503, .protocol = 0, .kind = 0), "del6 in 503");
+            nl_route(ctl, port, 24, add, "2001:db8:8::", 64, ROUTE6(.table = 504, .oif = 999), "add6 other device 504");
+            nl_route(ctl, port, 25, 0, "2001:db8:8::", 64, ROUTE6(.table = 504, .protocol = 0, .kind = 0), "del6 in 504");
             monitor_show(mon, port, "dels");
             /* An address's prefix route and the routes from it. */
             nl_route(ctl, port, 24, add, "2001:db8:a::", 64, ROUTE6(.oif = 1, .metric = 5), "add6 before address");
@@ -14591,8 +14742,13 @@ int main(int argc, char **argv) {
             monitor_show(mon, port, "up");
             const unsigned short add = 0x600;
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::1", 128, 1, NULL, 0, 0x02, "first6");
+            /* Read before the second address: Linux tells of an address's
+               prefix route at once but of the address and its local route
+               from its duplicate address detection's work, which would race
+               the second's prefix route. */
+            monitor_show(mon, port, "first address");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:5::2", 128, 1, NULL, 0, 0x02, "second6");
-            monitor_show(mon, port, "addresses");
+            monitor_show(mon, port, "second address");
             /* From ::1 to the first address, where nothing listens: its
                neighbour, then ::1's, which ICMPv6's port unreachable goes
                back to. Then TCP to the second, whose reset goes back to it,
@@ -14624,6 +14780,254 @@ int main(int argc, char **argv) {
             nl_addr(ctl, port, 21, 0, AF_INET, "127.0.0.1", 8, 254, 1, "last4");
             monitor_show(mon, port, "last4");
             printf("send4 after=%ld\n", netns_result(sendto(u4, "x", 1, 0, (void *)&to4, sizeof to4)));
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "mctp-sockets")) {
+        /* A child makes a network namespace and gives lo MCTP endpoint IDs
+           8 and 9: AF_MCTP datagram sockets bind to a message type, an ID
+           and a network, and messages reach them through the IDs' local
+           routes, a gateway's route in packets of its MTU, or out of lo by
+           its hardware address. A tag the sender owns has a key, which the
+           answer to it finds; SIOCMCTPALLOCTAG keeps one. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int sv[2];
+            printf("stream=%ld\n", netns_result(socket(45, SOCK_STREAM, 0)));
+            printf("stream protocol 1=%ld\n", netns_result(socket(45, SOCK_STREAM, 1)));
+            printf("dgram protocol 1=%ld\n", netns_result(socket(45, SOCK_DGRAM, 1)));
+            printf("socketpair=%ld\n", netns_result(socketpair(45, SOCK_DGRAM, 0, sv)));
+            int a = socket(45, SOCK_DGRAM, 0), b = socket(45, SOCK_DGRAM, 0), c = socket(45, SOCK_DGRAM, 0);
+            int d = socket(45, SOCK_DGRAM | SOCK_NONBLOCK, 0), e = socket(45, SOCK_DGRAM, 0);
+            printf("sockets=%d\n", a >= 0 && b >= 0 && c >= 0 && d >= 0 && e >= 0);
+            struct mctp_name name;
+            socklen_t len = sizeof name;
+            printf("getsockname=%ld\n", netns_result(getsockname(a, (void *)&name, &len)));
+            printf("getpeername=%ld\n", netns_result(getpeername(a, (void *)&name, &len)));
+            printf("listen=%ld\n", netns_result(listen(a, 1)));
+            printf("accept=%ld\n", netns_result(accept(a, NULL, NULL)));
+            printf("shutdown=%ld\n", netns_result(shutdown(a, SHUT_RD)));
+            int value = 0;
+            len = sizeof value;
+            printf("type=%ld", netns_result(getsockopt(a, SOL_SOCKET, SO_TYPE, &value, &len)));
+            printf(" %d", value);
+            printf(" domain=%ld", netns_result(getsockopt(a, SOL_SOCKET, SO_DOMAIN, &value, &len)));
+            printf(" %d", value);
+            printf(" protocol=%ld", netns_result(getsockopt(a, SOL_SOCKET, SO_PROTOCOL, &value, &len)));
+            printf(" %d\n", value);
+            printf("fionread=%ld\n", netns_result(ioctl(a, FIONREAD, &value)));
+            printf("ioctl other=%ld\n", netns_result(ioctl(a, 0x89e5, &value)));
+            /* Sends that go nowhere: no address, or none to reach. */
+            printf("send no address=%ld\n", netns_result(send(c, "x", 1, 0)));
+            printf("write=%ld\n", netns_result(write(c, "x", 1)));
+            name = mctp_name(0, 9, 1, 8);
+            mctp_send(c, &name, sizeof name, 5, "unreachable");
+            mctp_send(c, &name, 8, 5, "short name");
+            struct mctp_name bad = name;
+            bad.family = 2;
+            mctp_send(c, &bad, sizeof bad, 5, "family");
+            bad = name;
+            bad.pad1 = 1;
+            mctp_send(c, &bad, sizeof bad, 5, "padding");
+            bad = name;
+            bad.tag = 0x20;
+            mctp_send(c, &bad, sizeof bad, 5, "tag bits");
+            bad.tag = 0x10;
+            mctp_send(c, &bad, sizeof bad, 5, "prealloc unowned");
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK};
+            bind(ctl, (void *)&any, sizeof any);
+            mctp_address(ctl, 8);
+            mctp_address(ctl, 9);
+            /* IDs 30 to 60 through 9, whose tags no other part takes. */
+            nl_mctp_route(ctl, 24, 30, 1, 30, 0, 1, 9, 0, "route 30-60 by 9");
+            /* Binds. */
+            name = mctp_name(0, 0xff, 1, 0);
+            printf("bind short=%ld\n", netns_result(bind(a, (void *)&name, 8)));
+            bad = name;
+            bad.family = 2;
+            printf("bind family=%ld\n", netns_result(bind(a, (void *)&bad, sizeof bad)));
+            bad = name;
+            bad.pad0 = 1;
+            printf("bind padding=%ld\n", netns_result(bind(a, (void *)&bad, sizeof bad)));
+            printf("bind any=%ld\n", netns_result(bind(a, (void *)&name, sizeof name)));
+            printf("bind again=%ld\n", netns_result(bind(a, (void *)&name, sizeof name)));
+            name = mctp_name(1, 9, 1, 0);
+            printf("bind 9=%ld\n", netns_result(bind(b, (void *)&name, sizeof name)));
+            name = mctp_name(0, 9, 0x81, 0);
+            printf("bind 9 taken=%ld\n", netns_result(bind(d, (void *)&name, sizeof name)));
+            name = mctp_name(0, 8, 2, 0);
+            printf("connect short=%ld\n", netns_result(connect(d, (void *)&name, 11)));
+            bad = name;
+            bad.tag = 1;
+            printf("connect tag=%ld\n", netns_result(connect(d, (void *)&bad, sizeof bad)));
+            bad = name;
+            bad.type = 0x82;
+            printf("connect ic=%ld\n", netns_result(connect(d, (void *)&bad, sizeof bad)));
+            printf("connect=%ld\n", netns_result(connect(d, (void *)&name, sizeof name)));
+            printf("connect again=%ld\n", netns_result(connect(d, (void *)&name, sizeof name)));
+            name = mctp_name(0, 0xff, 3, 0);
+            printf("bind other type=%ld\n", netns_result(bind(d, (void *)&name, sizeof name)));
+            name = mctp_name(0, 0xff, 2, 0);
+            printf("bind connected=%ld\n", netns_result(bind(d, (void *)&name, sizeof name)));
+            /* MCTP_OPT_ADDR_EXT. */
+            len = sizeof value;
+            printf("ext get=%ld", netns_result(getsockopt(c, 285, 1, &value, &len)));
+            printf(" %d %u\n", value, len);
+            len = 8;
+            printf("ext get long=%ld\n", netns_result(getsockopt(c, 285, 1, &value, &len)));
+            value = 1;
+            printf("ext set short=%ld\n", netns_result(setsockopt(c, 285, 1, &value, 2)));
+            printf("ext set other level=%ld\n", netns_result(setsockopt(c, 0, 1, &value, sizeof value)));
+            printf("set other option=%ld\n", netns_result(setsockopt(c, 285, 2, &value, sizeof value)));
+            /* Messages, each to the bind of its type and ID, else of any. */
+            name = mctp_name(0, 9, 1, 8);
+            mctp_send(c, &name, sizeof name, 5, "to 9");
+            mctp_receive(b, 0, 100, "9 got");
+            mctp_receive(a, 0, 100, "any got");
+            name = mctp_name(1, 8, 1, 8);
+            mctp_send(c, &name, sizeof name, 3, "to 8");
+            mctp_receive(a, 0, 100, "any got");
+            name = mctp_name(0, 9, 2, 8);
+            mctp_send(c, &name, sizeof name, 4, "type 2");
+            mctp_receive(d, 0, 100, "connected got");
+            name.type = 3;
+            mctp_send(c, &name, sizeof name, 4, "type 3");
+            name.type = 0x81;
+            mctp_send(c, &name, sizeof name, 6, "integrity check");
+            mctp_receive(b, MSG_PEEK, 100, "9 peeked");
+            mctp_receive(b, MSG_OOB, 100, "9 oob");
+            mctp_receive(b, 0, 2, "9 short");
+            mctp_receive(b, 0, 100, "9 empty");
+            name.type = 1;
+            mctp_send(c, &name, sizeof name, 7, "to 9 again");
+            mctp_receive(b, MSG_TRUNC, 2, "9 truncated");
+            /* The answer to an owned tag finds its key, once. */
+            name = mctp_name(0, 8, 1, 0);
+            mctp_send(b, &name, sizeof name, 5, "answer");
+            mctp_receive(c, 0, 100, "answer got");
+            mctp_send(b, &name, sizeof name, 5, "answer again");
+            name = mctp_name(0, 9, 1, 0);
+            mctp_send(c, &name, sizeof name, 5, "unowned");
+            /* A full receive buffer. */
+            value = 1;
+            printf("rcvbuf=%ld\n", netns_result(setsockopt(e, SOL_SOCKET, SO_RCVBUF, &value, sizeof value)));
+            name = mctp_name(0, 8, 5, 0);
+            printf("bind 8 type 5=%ld\n", netns_result(bind(e, (void *)&name, sizeof name)));
+            name.tag = 8;
+            for (int i = 0; i < 5; i++) mctp_send(c, &name, sizeof name, 1, "to full");
+            for (int i = 0; i < 4; i++) mctp_receive(e, 0, 100, "full got");
+            /* Through a gateway's route of MTU 68, in packets; the longest
+               message lo's MTU takes; one longer; one too long to make. */
+            nl_mctp_route(ctl, 24, 0, 1, 20, 0, 1, 9, 68, "route 20 by 9");
+            name = mctp_name(0, 20, 1, 8);
+            mctp_send(c, &name, sizeof name, 200, "through 9");
+            mctp_receive(a, 0, 1000, "any got");
+            name = mctp_name(0, 31, 1, 8);
+            mctp_send(c, &name, sizeof name, 65535, "longest");
+            mctp_receive(a, 0, 70000, "any got");
+            mctp_send(c, &name, sizeof name, 65536, "longer");
+            mctp_receive(a, 0, 70000, "any got");
+            mctp_send(c, &name, sizeof name, 5 << 20, "too long");
+            /* Out of lo by its hardware address, which loses it: while it
+               is down, its noop qdisc drops it, and while it is up, it comes
+               back as an 802.2 frame, ETH_P_MCTP (0xfa) being below
+               ETH_P_802_3_MIN. */
+            value = 1;
+            printf("ext set=%ld\n", netns_result(setsockopt(c, 285, 1, &value, sizeof value)));
+            setsockopt(a, 285, 1, &value, sizeof value);
+            len = sizeof value;
+            value = 0;
+            printf("ext get=%ld", netns_result(getsockopt(c, 285, 1, &value, &len)));
+            printf(" %d\n", value);
+            struct mctp_name_ext ext = {.base = mctp_name(0, 32, 1, 8), .ifindex = 1, .halen = 6};
+            mctp_send(c, &ext, sizeof ext, 5, "ext down");
+            mctp_receive(a, 0, 100, "any got");
+            ext.ifindex = 2;
+            mctp_send(c, &ext, sizeof ext, 5, "ext index 2");
+            ext.ifindex = 1;
+            ext.halen = 5;
+            mctp_send(c, &ext, sizeof ext, 5, "ext halen 5");
+            ext.halen = 33;
+            mctp_send(c, &ext, sizeof ext, 5, "ext halen 33");
+            ext.halen = 6;
+            ext.pad[1] = 1;
+            mctp_send(c, &ext, sizeof ext, 5, "ext padding");
+            ext.pad[1] = 0;
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            mctp_send(c, &ext, sizeof ext, 5, "ext up");
+            mctp_receive(a, 0, 100, "any got");
+            name = mctp_name(0, 33, 1, 8);
+            mctp_send(c, &name, sizeof name, 5, "routed");
+            mctp_receive(a, 0, 100, "any got");
+            ext.base.eid = 70;
+            mctp_send(c, &ext, sizeof ext, 5, "ext nowhere");
+            /* Tags made by hand. */
+            struct mctp_tag_ctl tag = {.peer = 8};
+            printf("alloc=%ld", netns_result(ioctl(c, 0x89e0, &tag)));
+            printf(" flags=%#x\n", tag.tag & ~7);
+            struct mctp_tag_ctl tag2 = {.peer = 8, .tag = 1};
+            printf("alloc tagged=%ld\n", netns_result(ioctl(c, 0x89e0, &tag2)));
+            tag2.tag = 0;
+            tag2.flags = 1;
+            printf("alloc flags=%ld\n", netns_result(ioctl(c, 0x89e0, &tag2)));
+            struct mctp_tag_ctl2 v2 = {.net = 1, .peer = 8, .local = 5};
+            printf("alloc2 local=%ld\n", netns_result(ioctl(c, 0x89e2, &v2)));
+            v2.local = 0;
+            printf("alloc2=%ld", netns_result(ioctl(c, 0x89e2, &v2)));
+            printf(" flags=%#x net=%u\n", v2.tag & ~7, v2.net);
+            name = mctp_name(0, 8, 5, tag.tag);
+            mctp_send(c, &name, sizeof name, 3, "preallocated");
+            mctp_receive(e, 0, 100, "8 got");
+            name.tag = tag.tag & 7;
+            mctp_send(e, &name, sizeof name, 3, "answer");
+            mctp_receive(c, 0, 100, "answer got");
+            mctp_send(e, &name, sizeof name, 3, "answer again");
+            mctp_receive(c, 0, 100, "answer got");
+            name.tag = 0x1f;
+            mctp_send(c, &name, sizeof name, 3, "not preallocated");
+            printf("drop=%ld\n", netns_result(ioctl(c, 0x89e1, &tag)));
+            printf("drop again=%ld\n", netns_result(ioctl(c, 0x89e1, &tag)));
+            struct mctp_tag_ctl unowned = {.peer = 8, .tag = 0x10};
+            printf("drop unowned=%ld\n", netns_result(ioctl(c, 0x89e1, &unowned)));
+            printf("drop2=%ld\n", netns_result(ioctl(c, 0x89e3, &v2)));
+            /* A tag of MCTP_NET_ANY is that network's, which no message is
+               in: a send with it finds none, and only net 0 drops it. */
+            struct mctp_tag_ctl2 any_net = {.net = 0, .peer = 8};
+            printf("alloc2 net 0=%ld", netns_result(ioctl(c, 0x89e2, &any_net)));
+            printf(" flags=%#x\n", any_net.tag & ~7);
+            name = mctp_name(0, 8, 5, any_net.tag);
+            mctp_send(c, &name, sizeof name, 3, "net 0 preallocated");
+            any_net.net = 1;
+            printf("drop2 net 1=%ld\n", netns_result(ioctl(c, 0x89e3, &any_net)));
+            any_net.net = 0;
+            printf("drop2 net 0=%ld\n", netns_result(ioctl(c, 0x89e3, &any_net)));
+            /* Closed, its bind goes, and any's takes what it took. */
+            close(b);
+            name = mctp_name(0, 9, 1, 8);
+            mctp_send(c, &name, sizeof name, 2, "after close");
+            mctp_receive(a, 0, 100, "any got");
+            /* Owned tags for a peer no other part sends to run out after
+               eight, in a burst. */
+            name = mctp_name(0, 40, 1, 8);
+            for (int i = 0; i < 9; i++) mctp_send(c, &name, sizeof name, 1, "owned");
+            for (int i = 0; i < 9; i++) mctp_receive(a, 0, 100, "any got");
+            /* A close drops its keys. A new socket then sends out of lo to
+               MCTP_ADDR_NULL, which is lost as well: its tag is for any
+               peer, which every key of the local ID would hold back. */
+            close(c);
+            int f = socket(45, SOCK_DGRAM, 0);
+            value = 1;
+            setsockopt(f, 285, 1, &value, sizeof value);
+            ext.base.eid = 0;
+            mctp_send(f, &ext, sizeof ext, 5, "ext null");
+            mctp_receive(a, 0, 100, "any got");
             fflush(stdout);
             _exit(0);
         }

@@ -72,9 +72,9 @@ verified.
   root's `/proc` or `/dev`, so a program there finds only the files the
   directory holds. In a path that climbs above the root as written, `..` is
   taken from the names as written, where Linux takes a `..` after a
-  symbolic link from the link's target. `maps`, `smaps`, `mounts` and
-  `mountinfo` in `/proc` show paths from the machine's root, where Linux
-  shows them from the reader's root (its links do read from there).
+  symbolic link from the link's target. `maps` and `smaps` in `/proc` name
+  files from the root their opener had when it opened them, where Linux
+  takes the root of whoever reads them, at each read.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
@@ -570,8 +570,15 @@ verified.
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps
   IPv4's and IPv6's addresses and routes for those dumps, and takes no
-  MCTP address or route; MCTP's addresses and routes carry nothing, as
-  there are no `AF_MCTP` sockets (`EAFNOSUPPORT`). A link message's
+  MCTP address or route. MCTP messages go between the loopback's own
+  endpoint IDs alone, as there is no other interface; a tag's key runs out
+  by the host's monotonic clock. An `AF_MCTP` socket has `SO_SNDBUF`,
+  `SO_RCVBUF` and `SO_RCVTIMEO` alone of the `SOL_SOCKET` options (the
+  others are `ENOPROTOOPT`), no timestamps, and of the `ioctl` requests
+  Linux answers for every socket only those paludarium has for any. A send
+  by hardware address while the loopback has no MCTP address is
+  `EHOSTUNREACH`, as on Linux 7.0, where later kernels send it from
+  `MCTP_ADDR_NULL`. A link message's
   statistics are zero; its IPv4 and IPv6 settings are those of a kernel
   whose sysctls are as built, where Linux's new namespace copies the
   host's, and IPv6's creation time is 0 and its reachable time 30

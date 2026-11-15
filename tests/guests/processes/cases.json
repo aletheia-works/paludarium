@@ -288,6 +288,7 @@
     {"name":"time-set","binary":"process"},
     {"name":"chroot","binary":"process"},
     {"name":"modify-ldt","binary":"process"},
+    {"name":"thread-area","binary":"process"},
     {"name":"port-access","binary":"process"},
     {"name":"timer-limits","binary":"process"},
     {"name":"cpu-sleep","binary":"process"},

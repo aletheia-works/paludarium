@@ -341,6 +341,15 @@ fn a_fault_on_a_missing_page_waits_or_raises_sigbus() {
         f.fault(AREA + 5, true),
         Next::Exit(ExitStatus::Signaled(signal::SIGBUS))
     );
+    // A write the protection refuses is SIGSEGV, not a wait.
+    let mut f = fixture();
+    let fd = f.ready(0, 0);
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    assert_eq!(f.ret(10, &[AREA, PAGE, 1]), 0);
+    assert_eq!(
+        f.fault(AREA, true),
+        Next::Exit(ExitStatus::Signaled(signal::SIGSEGV))
+    );
     // A pending signal ends the wait at once, and takes its fault away;
     // the signal is delivered, here its default action.
     let mut f = fixture();

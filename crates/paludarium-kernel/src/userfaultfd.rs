@@ -300,7 +300,13 @@ fn create(c: &mut Context<'_>, flags: u32) -> Result<u64, Errno> {
 /// raises SIGBUS (`UFFD_FEATURE_SIGBUS`), `Some(false)` once the thread
 /// has waited, and `None` when there is no such context any more. Either
 /// way but SIGBUS the instruction runs again.
-pub(crate) fn fault(c: &mut Context<'_>, id: u64, address: u64, write: bool) -> Option<bool> {
+pub(crate) fn fault(
+    c: &mut Context<'_>,
+    id: u64,
+    address: u64,
+    write: bool,
+    fetch: bool,
+) -> Option<bool> {
     let context = find(id)?;
     let features = context.features();
     if features & FEATURE_SIGBUS != 0 {
@@ -328,7 +334,7 @@ pub(crate) fn fault(c: &mut Context<'_>, id: u64, address: u64, write: bool) -> 
         // at the page once the fault is queued: a fill that came first has
         // left it a page, and one that comes after will find the fault.
         if context.released.load(Ordering::SeqCst)
-            || c.mem.userfault_at(GuestAddr(address)) != Some(id)
+            || c.mem.userfault_for(GuestAddr(address), write, fetch) != Some(id)
         {
             return Some(false);
         }
@@ -489,8 +495,10 @@ fn put_word(c: &Context<'_>, at: u64, value: u64) -> Result<(), Errno> {
         .map_err(|_| Errno::EFAULT)
 }
 
-/// Linux's `validate_unaligned_range`: a whole number of pages, at least
-/// one, from at least `mmap_min_addr`, within the user half (`EINVAL`).
+/// Linux 7.0's `validate_unaligned_range`, which the CI runners have: a
+/// whole number of pages, at least one, from at least `mmap_min_addr`,
+/// within the user half (`EINVAL`). Linux master no longer asks for
+/// `mmap_min_addr`.
 fn validate_unaligned(start: u64, len: u64) -> Result<(), Errno> {
     if !len.is_multiple_of(PAGE)
         || len == 0

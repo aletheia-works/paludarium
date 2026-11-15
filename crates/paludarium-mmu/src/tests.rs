@@ -635,6 +635,17 @@ fn a_userfaultfd_registration_faults_on_missing_pages_only() {
     assert!(missing.mapped && !missing.present && !missing.write);
     assert_eq!(m.userfault_at(s), Some(7));
     assert_eq!(view.userfault_at(s.0 + 5), Some(7));
+    // An access the protection refuses is the CPU's fault.
+    assert_eq!(m.userfault_for(s, true, false), Some(7));
+    assert_eq!(m.userfault_for(s, false, true), None);
+    // A guarded page is neither a fault nor a page to fill.
+    m.guard(GuestAddr(s.0), s.0 + PAGE_SIZE, true).unwrap();
+    assert_eq!(m.userfault_for(s, false, false), None);
+    assert_eq!(
+        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, None),
+        Err(Errno::EEXIST)
+    );
+    m.guard(GuestAddr(s.0), s.0 + PAGE_SIZE, false).unwrap();
     let mut byte = [0];
     m.read(GuestAddr(s.0 + PAGE_SIZE), &mut byte).unwrap();
     assert_eq!(byte, [b'k']);

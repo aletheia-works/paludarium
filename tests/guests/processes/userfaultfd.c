@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -171,6 +172,15 @@ static void vma(const char *what, void *base, void *at) {
     printf("%s: none\n", what);
 }
 
+static void fdinfo(const char *what, int fd);
+
+static sigjmp_buf refused;
+static void on_segv(int sig, siginfo_t *info, void *context) {
+    (void)context;
+    printf("signal %d code %d\n", sig, info->si_code);
+    siglongjmp(refused, 1);
+}
+
 /* The calls' errors and their order. */
 static int case_calls(void) {
     printf("bad flags: %s\n", err(uffd(0x10)));
@@ -288,6 +298,19 @@ static int case_calls(void) {
     printf(" zeropage=%lld\n", (long long)done);
     printf("wake: %s\n", err(ioctl(fd, UFFDIO_WAKE, &(struct uffdio_range){(uintptr_t)base, PAGE})));
     printf("wake, len 0: %s\n", err(ioctl(fd, UFFDIO_WAKE, &(struct uffdio_range){(uintptr_t)base, 0})));
+    /* An access the protection refuses is SIGSEGV (SEGV_ACCERR), not a
+       fault for the userfaultfd. */
+    printf("register read-only: %s\n", err(reg(fd, base + 6 * PAGE, PAGE, 1, NULL)));
+    mprotect(base + 6 * PAGE, PAGE, PROT_READ);
+    struct sigaction segv = {0};
+    segv.sa_sigaction = on_segv;
+    segv.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &segv, NULL);
+    if (!sigsetjmp(refused, 1))
+        base[6 * PAGE] = 'x';
+    signal(SIGSEGV, SIG_DFL);
+    fdinfo("refused", fd);
+    mprotect(base + 6 * PAGE, PAGE, PROT_READ | PROT_WRITE);
     printf("unregister all: %s\n", err(unreg(fd, base, 8 * PAGE)));
     vma("all", base, base + 2 * PAGE);
     close(fd);

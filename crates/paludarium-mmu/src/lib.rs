@@ -3815,6 +3815,31 @@ impl AddressSpaceData {
         self.userfault_missing(&self.read_directory(), page)
     }
 
+    /// The `userfaultfd` a failed access to `addr` (a write with `write`,
+    /// a fetch with `fetch`) waits for: one the page's protection permits,
+    /// of a page with no guard, that [`Self::userfault_at`] waits for. Any
+    /// other is the CPU's fault, as Linux's `do_user_addr_fault` sends
+    /// SIGSEGV for an `access_error` before it handles the fault.
+    pub fn userfault_for(&self, addr: GuestAddr, write: bool, fetch: bool) -> Option<u64> {
+        let page = addr.page_align_down().0;
+        let access = if fetch {
+            Access::Fetch
+        } else if write {
+            Access::Write
+        } else {
+            Access::Read
+        };
+        let directory = self.read_directory();
+        if self.guarded(page)
+            || !self
+                .prot_at(&directory, page)
+                .is_some_and(|prot| access.permitted(prot))
+        {
+            return None;
+        }
+        self.userfault_missing(&directory, page)
+    }
+
     /// `UFFDIO_REGISTER` of `[start, end)` for the `userfaultfd` `context`
     /// with `modes`, as Linux's `userfaultfd_register`: the range must
     /// overlap a VMA (`EINVAL`), and each VMA it overlaps in turn must be
@@ -3961,7 +3986,10 @@ impl AddressSpaceData {
         let prot = self.mapping_at(page).map_or(mapping.prot, |m| m.prot);
         let mut directory = self.write_directory();
         let shared = self.shared_at(page);
+        // A guard marker is an entry too (`mfill_atomic_install_pte` takes
+        // only none or a `userfaultfd` marker).
         if lookup(&directory, page).is_some()
+            || self.guarded(page)
             || shared.is_some_and(|shared| shared.pages.has(page.wrapping_add(shared.shift)))
         {
             return Err(Errno::EEXIST);
@@ -5549,6 +5577,11 @@ impl AddressSpace {
     #[must_use]
     pub fn userfault_at(&self, addr: GuestAddr) -> Option<u64> {
         self.locked().userfault_at(addr)
+    }
+    /// See [`AddressSpaceData::userfault_for`].
+    #[must_use]
+    pub fn userfault_for(&self, addr: GuestAddr, write: bool, fetch: bool) -> Option<u64> {
+        self.locked().userfault_for(addr, write, fetch)
     }
     /// See [`AddressSpaceData::advise_flags`].
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {

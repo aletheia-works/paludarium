@@ -645,7 +645,7 @@ impl Kernel {
             group: &self.group,
             processes: &self.processes,
         };
-        let sigbus = userfaultfd::fault(&mut ctx, context, addr.0, write) == Some(true);
+        let sigbus = userfaultfd::fault(&mut ctx, context, addr.0, write, fetch) == Some(true);
         self.inbox.drain(&mut thread.state);
         if sigbus {
             signals::queue(
@@ -972,7 +972,7 @@ impl Kernel {
             mapped: true,
             present: false,
         } = reason
-            && let Some(context) = mem.userfault_at(addr)
+            && let Some(context) = mem.userfault_for(addr, write, fetch)
         {
             thread.cpu.rip = rip;
             return self.userfault(thread, mem, context, addr, write, fetch);

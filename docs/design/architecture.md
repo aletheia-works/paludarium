@@ -96,7 +96,8 @@ as a JIT does, fills the room with blocks of earlier generations again and again
 When an instruction is decoded, the most frequent simple
 forms (`nop` and `endbr64`, moves between registers and memory, `movzx` from
 memory, `lea`, `push` and `pop`, direct branches, `call`, `ret`, `add`, `sub`,
-`and`, `or`, `xor`, `cmp` and `test` on a register, and `cmp` and `test` on
+`and`, `or`, `xor`, `cmp` and `test` on a register, `cmp` and `test` on
+memory, and `inc`, `dec`, `neg` and `not` of a register or, without `lock`, of
 memory) are also worked out: their operands are taken out in advance,
 so running them needs neither the general dispatch by mnemonic nor the general
 operand handling. Such a form changes the state only after everything that can

@@ -42,7 +42,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   取り込みます（`fault_around_bytes`）。`MAP_POPULATE`、`MAP_LOCKED`、ロックが
   取り込むはずのページも、触れたときに数えます。ヒュージページもプロテクションキーも
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
-  `uw`、`ui`（提供しない `userfaultfd` の書き込み保護とマイナーのモード）、`ht`、`dp`
+  `ui`（提供しない `userfaultfd` のマイナーのモード）、`ht`、`dp`
   （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
@@ -63,8 +63,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   同じく 0 です。
 - **自分のルートの一部**：生成される `/proc` や `/dev`（またはその中のディレクトリ）への
   `chroot` は `EINVAL` を返します。Linux はそこをルートにします。`mount` は `/proc` や
-  `/dev` には何もマウントせず、バインドマウントもないため、新しいルートの `/proc` や `/dev`
-  には何もマウントできず、そこのプログラムが見つけるのは、そのディレクトリにあるファイル
+  `/dev` には何もマウントせず、それをバインドマウントすることもできないため、新しい
+  ルートの `/proc` や `/dev` には何もマウントできず、そこのプログラムが見つけるのは、そのディレクトリにあるファイル
   だけです。書かれたままでルートより上へ登るパスでは、`..` を書かれた
   名前から取ります。Linux は、シンボリックリンクのあとの `..` をリンク先から取ります。`/proc`
   の `maps` と `smaps` は、開いたプロセスが開いたときに持っていたルートからファイルを
@@ -299,9 +299,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - System V IPC の共有メモリ・セマフォー・メッセージキューの上限は Linux の既定値で、
     `/proc/sys/kernel` から変えられません。`/proc/sysvipc` は開いたときのオブジェクトを
     見せます。Linux は読み進めたところで、そのオブジェクトをその都度読みます。
-    入れ子の PID 名前空間では、セマフォーの `GETPID` はそのプロセスが回収されると 0 になります。
-    Linux はそこでも、その番号を返します。メッセージキューで
-    待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの
+    メッセージキューで待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの
     メッセージが入る間だけ、待ち始めた順に起こします。
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
@@ -368,11 +366,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルの持ち主とグループ、そしてゲストがそこに作ったファイルの持ち主とグループを、
   エミュレータが動いている間だけ覚えます。ホストのファイルには書きません。次に動かすと、
   そこのファイルはまたすべて root のものに見えます。
-- **mount と umount2 の一部**：`mount` が作るのは tmpfs のマウントだけで、ほかの型は、それが
-  ないカーネルと同じく `ENODEV` です。それより前の Linux の確認を通ったあと、`MS_BIND`、
-  `MS_MOVE`、`MS_REMOUNT`、`MS_SHARED`、`MS_UNBINDABLE`、読み出し専用のマウント
-  （`MS_RDONLY` や `ro` オプション）、`MS_NOSYMFOLLOW`、生成される `/proc` や `/dev` への
-  マウントは `EOPNOTSUPP` で、プログラムはできないことを知れます。`fsopen`、`fsconfig`、
+- **mount と umount2 の一部**：`mount` が作るのは tmpfs とバインドマウントだけで、ほかの型は、
+  それがないカーネルと同じく `ENODEV` です。それより前の Linux の確認を通ったあと、
+  `MS_MOVE`、`MS_REMOUNT`、`MS_SHARED`、`MS_UNBINDABLE`、読み出し専用の tmpfs
+  （`MS_RDONLY` や `ro` オプション）、tmpfs の `MS_NOSYMFOLLOW`、生成される `/proc` や
+  `/dev`（とその中のファイル）へのマウントやそのバインドマウントは `EOPNOTSUPP` で、
+  プログラムはできないことを知れます。`fsopen`、`fsconfig`、
   `fsmount`、`fspick`、`move_mount`、`open_tree`、`mount_setattr`、`statmount`、
   `listmount`、`pivot_root` はありません（`ENOSYS`）。何も伝播しません。どのマウントも
   プライベートで、mountinfo に `shared:` や `master:` の欄はありません。Linux では共有
@@ -392,7 +391,16 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マウントポイントになっているディレクトリの `rmdir` はそのマウントを残します。Linux では
   外れます。外したマウントの開いたファイルは使えますが、その中の作業ディレクトリや
   ディスクリプタはパスで使うので、もうそこにはたどり着きません。マウント ID は 21 からの
-  空いているいちばん小さいもので、ルートの親は 1 と表示します。
+  空いているいちばん小さいもので、ルートの親は 1 と表示します。起動したときからある
+  マウント（`--mount` のディレクトリ）を下に持つディレクトリを `MS_REC` なしで
+  バインドマウントすると、そこにはそのマウントのファイルが見えます。Linux はその下の
+  ディレクトリを見せます。バインドマウントはソースをパスで持つので、ほかの名前空間での
+  名前の変更では古いパスのままで、ソースを消すと何も見えなくなります。Linux は消えた
+  ディレクトリを持ち続け、mountinfo に `//deleted` と付けます。ディスクリプタのマウント
+  ID（`AT_EMPTY_PATH` 付きの `statx`、fdinfo）は、それを開いたパスから求めます。
+  fanotify のマウントへのマーク（`FAN_MARK_MOUNT`）はファイルシステムのデバイスで持つので、
+  そのファイルシステムのバインドマウントにも効き、fdinfo の行は最初のマウントの ID を
+  示します。Linux はその 1 つのマウントにだけ付けます。
 - **Landlock**：ABI バージョン 8 までです。記録のフラグは受け付けますが、何も記録しません。
   `LANDLOCK_RESTRICT_SELF_TSYNC` では、ほかのスレッドが自分の確認に新しいドメインを
   使うのは、次にカーネルに入るときからです。Linux は、すべてのスレッドが受け取るまで
@@ -459,15 +467,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **userfaultfd の一部**：登録するのはないページだけです。書き込み保護とマイナーの
-  モードは受け付けず（`EINVAL`）、`UFFDIO_WRITEPROTECT`、`UFFDIO_CONTINUE`、
+- **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
+  メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
+  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE`、
   `UFFDIO_MOVE`、`UFFDIO_POISON` もありません（`EINVAL`）。`fork`、`mremap`、
-  `madvise`、`munmap` のイベントと書き込み保護の機能もなく、`UFFDIO_API` はそれらを
-  示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す ioctl にも
-  入りません。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
+  `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
+  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
+  それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
+  ioctl にも入りません。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
+  ページの保護を外します。Linux はその印を PTE に残します。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
   登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
-  ないページへのシステムコール自身のコピーは、`UFFD_USER_MODE_ONLY` のときと同じく
-  `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
+  ないページか、書き込み保護されたページへのシステムコール自身のコピーは、
+  `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベント（`FAN_OPEN_PERM`、`FAN_ACCESS_PERM`、
   `FAN_OPEN_EXEC_PERM`）は `fanotify_mark` で受け付けますが送りません。そのため、求める
@@ -479,8 +490,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マークだけで決めます。Linux は inotify のものも数えます。ディスクリプタが持っていない
   ファイル（exec が動かすプログラム）は、そのときのパスで開き直すので、なくなっていれば
   開けません。FIFO やデバイスの読み書きは、ディレクトリと名前なしで知らせます。
-- **inotify の一部**：何もアンマウントしない（`umount2` がない）ので、`IN_UNMOUNT` は
-  送りません。 `/proc/self/fdinfo` では、epoll のファイルはディスクリプタの順に並びます。Linux はファイルのアドレスの
+- **inotify の一部**：`umount2` が見張っているファイルのマウントを外しても、`IN_UNMOUNT` も
+  そのあとの `IN_IGNORED` も送りません。 `/proc/self/fdinfo` では、epoll のファイルはディスクリプタの順に並びます。Linux はファイルのアドレスの
   順です。eventfd の番号はエミュレータの中で数えます。Linux の `eventfd-id` はシステム
   全体で数えます。マウントしたディレクトリにホストが加えた変更は見えず、ディスクリプタの
   場所もそれを追いません。

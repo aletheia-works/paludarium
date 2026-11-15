@@ -8376,6 +8376,11 @@ static int mt_write(const char *path, const char *text) {
     close(fd);
     return r;
 }
+static void mt_write_new(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0 && write(fd, text, strlen(text)) != (ssize_t)strlen(text)) perror("write");
+    if (fd >= 0) close(fd);
+}
 static dev_t mt_dev(const char *path) {
     struct stat st;
     return stat(path, &st) ? (dev_t)-1 : st.st_dev;
@@ -8603,6 +8608,204 @@ static int mounts_case(const char *self) {
         rmdir(path);
     }
     printf("cleaned=%d\n", rmdir(mt_base) == 0);
+    return 0;
+}
+
+/* The binds case: bind mounts in a mount namespace of a user namespace of
+   its own, where the caller is root. Only errno values and comparisons are
+   printed, nothing of the machine's own mount table. */
+static char bd_base[] = "/tmp/paludarium-binds-XXXXXX";
+static void bd_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", bd_base, name); }
+static ino_t bd_ino(const char *path) {
+    struct stat st;
+    return stat(path, &st) ? 0 : st.st_ino;
+}
+/* The mountinfo line of the mount at `point` (the last one there): its ID,
+   its parent's, its root field and its type; how many lines there are. */
+static int bd_line(const char *point, long *id, long *parent, char *root, char *kind) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    char line[4096];
+    int found = 0;
+    while (f && fgets(line, sizeof line, f)) {
+        long i, p;
+        char r[1024], at[1024];
+        if (sscanf(line, "%ld %ld %*s %1023s %1023s", &i, &p, r, at) != 4 || strcmp(at, point)) continue;
+        found++;
+        *id = i;
+        *parent = p;
+        strcpy(root, r);
+        char *tail = strstr(line, " - ");
+        if (tail) sscanf(tail, " - %63s", kind);
+    }
+    if (f) fclose(f);
+    return found;
+}
+/* stx_mnt_id (STATX_MNT_ID), or -1. */
+static long bd_mnt_id(const char *path) {
+    unsigned char sx[256] = {0};
+    if (syscall(SYS_statx, AT_FDCWD, path, 0, 0x1000, sx)) return -1;
+    unsigned long id;
+    memcpy(&id, sx + 144, sizeof id);
+    return (long)id;
+}
+static int bd_ends(const char *s, const char *end) {
+    size_t a = strlen(s), b = strlen(end);
+    return a >= b && !strcmp(s + a - b, end);
+}
+static int bd_read(const char *path, char *out, size_t size) {
+    memset(out, 0, size);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return errno;
+    ssize_t n = read(fd, out, size - 1);
+    close(fd);
+    return n < 0 ? errno : 0;
+}
+/* In a user namespace below this one, whose mount namespace's copies are
+   all locked. */
+static int bd_locked(void) {
+    char src[256], dst[256], under[256];
+    bd_path(src, "src");
+    bd_path(dst, "dst2");
+    bd_path(under, "dst2/sub/in");
+    if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) return 80;
+    printf("locked plain=%d", mt_result(mount(src, dst, NULL, MS_BIND, NULL)));
+    printf(" rec=%d", mt_result(mount(src, dst, NULL, MS_BIND | MS_REC, NULL)));
+    printf(" under=%d", access(under, F_OK) ? errno : 0);
+    char sub[256];
+    bd_path(sub, "dst2/sub");
+    printf(" umount-copy=%d umount-covered=%d\n", mt_result(umount2(sub, 0)), mt_result(umount2(dst, 0)));
+    return 0;
+}
+static int bd_inner(void) {
+    char src[256], dst[256], dst3[256], dst4[256], f[256], g[256], a[256], via[256], buf[64];
+    bd_path(src, "src");
+    bd_path(dst, "dst");
+    bd_path(dst3, "dst3");
+    bd_path(dst4, "dst4");
+    bd_path(f, "f");
+    bd_path(g, "g");
+    bd_path(a, "src/a");
+    bd_path(via, "dst/a");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    /* The type and the data are not looked at; MS_RDONLY changes nothing. */
+    printf("bind=%d\n", mt_result(mount(src, dst, "nosuchfs", MS_BIND | MS_RDONLY, "bogus")));
+    printf("same file=%d device=%d\n", bd_ino(via) == bd_ino(a) && bd_ino(a), mt_dev(dst) == mt_dev(src));
+    long id = 0, parent = 0, src_id = -2;
+    char root[1024] = "", kind[64] = "";
+    int lines = bd_line(dst, &id, &parent, root, kind);
+    printf("mountinfo lines=%d root=%d statx=%d own=%d\n", lines, bd_ends(root, "/src"), bd_mnt_id(via) == id,
+           id != (src_id = bd_mnt_id(src)) && src_id > 0);
+    char made[256], seen[256];
+    bd_path(made, "dst/made");
+    bd_path(seen, "src/made");
+    int fd = open(made, O_WRONLY | O_CREAT, 0600);
+    printf("write=%d", fd < 0 ? errno : (int)(write(fd, "both", 4) == 4 ? 0 : errno));
+    if (fd >= 0) close(fd);
+    printf(" seen=%d %s\n", bd_read(seen, buf, sizeof buf), buf);
+    char other[256], dotdot[256];
+    bd_path(other, "src/other");
+    bd_path(dotdot, "dst/..");
+    printf("link=%d rename=%d\n", mt_result(link(made, other)), mt_result(rename(made, other)));
+    printf("dotdot=%d\n", bd_ino(dotdot) == bd_ino(bd_base));
+    printf("rmdir=%d\n", mt_result(rmdir(dst)));
+    /* do_loopback's checks. */
+    printf("null=%d empty=%d missing=%d dir-on-file=%d file-on-dir=%d\n", mt_result(mount(NULL, dst3, NULL, MS_BIND, NULL)),
+           mt_result(mount("", dst3, NULL, MS_BIND, NULL)), mt_result(mount("/nonexistent/x", dst3, NULL, MS_BIND, NULL)),
+           mt_result(mount(src, g, NULL, MS_BIND, NULL)), mt_result(mount(f, dst3, NULL, MS_BIND, NULL)));
+    /* A file onto a file. */
+    printf("file=%d", mt_result(mount(f, g, NULL, MS_BIND, NULL)));
+    printf(" read=%d %s", bd_read(g, buf, sizeof buf), buf);
+    printf(" unlink=%d", mt_result(unlink(g)));
+    printf(" umount=%d", mt_result(umount2(g, 0)));
+    printf(" back=%d %s\n", bd_read(g, buf, sizeof buf), buf);
+    printf("umount=%d gone=%d\n", mt_result(umount2(dst, 0)), access(via, F_OK) ? errno : 0);
+    /* A tmpfs below the source: MS_REC takes it along. */
+    char sub[256], in[256], copy_in[256], copy_sub[256];
+    bd_path(sub, "src/sub");
+    bd_path(in, "src/sub/in");
+    bd_path(copy_in, "dst3/sub/in");
+    bd_path(copy_sub, "dst3/sub");
+    printf("tmpfs=%d", mt_result(mount("none", sub, "tmpfs", 0, NULL)));
+    close(open(in, O_WRONLY | O_CREAT, 0600));
+    printf(" plain=%d under=%d", mt_result(mount(src, dst3, NULL, MS_BIND, NULL)), access(copy_in, F_OK) ? errno : 0);
+    printf(" umount=%d", mt_result(umount2(dst3, 0)));
+    printf(" rec=%d under=%d\n", mt_result(mount(src, dst3, NULL, MS_BIND | MS_REC, NULL)),
+           access(copy_in, F_OK) ? errno : 0);
+    long top = 0, top_parent = 0, copy = 0, copy_parent = 0, orig = 0, orig_parent = 0;
+    char copy_kind[64] = "", copy_root[1024] = "";
+    bd_line(dst3, &top, &top_parent, root, kind);
+    int copies = bd_line(copy_sub, &copy, &copy_parent, copy_root, copy_kind);
+    bd_line(sub, &orig, &orig_parent, root, kind);
+    printf("copy lines=%d parent=%d kind=%s root=%s device=%d new=%d\n", copies, copy_parent == top, copy_kind,
+           copy_root, mt_dev(copy_sub) == mt_dev(sub), copy != orig);
+    printf("busy=%d detach=%d\n", mt_result(umount2(dst3, 0)), mt_result(umount2(dst3, MNT_DETACH)));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) _exit(bd_locked());
+    printf("locked=%d\n", reaped(child));
+    /* Part of a tmpfs, which stays after the first mount goes, and follows
+       a rename of the directory it was made from. */
+    char inner[256], renamed[256], kept[256];
+    bd_path(inner, "src/sub/inner");
+    bd_path(renamed, "src/sub/renamed");
+    bd_path(kept, "dst4/k");
+    mkdir(inner, 0755);
+    snprintf(buf, sizeof buf, "%s/k", inner);
+    close(open(buf, O_WRONLY | O_CREAT, 0600));
+    printf("part=%d", mt_result(mount(inner, dst4, NULL, MS_BIND, NULL)));
+    bd_line(dst4, &id, &parent, root, kind);
+    printf(" root=%s kind=%s device=%d", root, kind, mt_dev(dst4) == mt_dev(sub));
+    printf(" rename=%d", mt_result(rename(inner, renamed)));
+    bd_line(dst4, &id, &parent, root, kind);
+    printf(" root=%s", root);
+    printf(" first=%d kept=%d\n", mt_result(umount2(sub, 0)), access(kept, F_OK) ? errno : 0);
+    return 0;
+}
+static int binds_case(void) {
+    if (!mkdtemp(bd_base)) return 93;
+    chmod(bd_base, 0755);
+    const char *dirs[] = {"src", "src/sub", "dst", "dst2", "dst3", "dst4"};
+    char path[256];
+    for (unsigned i = 0; i < 6; i++) {
+        bd_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    bd_path(path, "src/a");
+    close(open(path, O_WRONLY | O_CREAT, 0644));
+    bd_path(path, "f");
+    mt_write_new(path, "eff");
+    bd_path(path, "g");
+    mt_write_new(path, "gee");
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(bd_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    const char *files[] = {"src/a", "src/made", "src/other", "f", "g"};
+    for (unsigned i = 0; i < 5; i++) {
+        bd_path(path, files[i]);
+        unlink(path);
+    }
+    const char *gone[] = {"src/sub", "src", "dst", "dst2", "dst3", "dst4"};
+    for (unsigned i = 0; i < 6; i++) {
+        bd_path(path, gone[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(bd_base) == 0);
     return 0;
 }
 
@@ -12480,6 +12683,13 @@ static void sysvipc_all(const char *label) {
     sysvipc_show(label, "sem", sysvipc_sem_times);
     sysvipc_show(label, "msg", sysvipc_msg_times);
 }
+/* GETPID and GETVAL of each of set `sem`'s three semaphores. */
+static void sysvipc_sempids(const char *label, int sem) {
+    printf("%s sempids:", label);
+    for (int n = 0; n < 3; n++)
+        printf(" %ld=%ld", semx_ctl(sem, n, SEMX_GETPID, 0), semx_ctl(sem, n, SEMX_GETVAL, 0));
+    printf("\n");
+}
 /* The work of the case, as PID 1 of its PID namespace. */
 static int sysvipc_work(void) {
     long page = sysconf(_SC_PAGESIZE);
@@ -12554,16 +12764,21 @@ static int sysvipc_work(void) {
     if (sem < 0 || msg < 0 || semx_op(sem, 1, 1, 0)) return 21;
     if (msgx_send(msg, 1, "hello", 0) || msgx_send(msg, 2, "abc", 0)) return 22;
     sysvipc_all("made");
-    /* PID 2 takes a message, and attaches the segment and detaches it. */
+    /* PID 2 takes a message, attaches the segment and detaches it, and
+       changes semaphore 2, and semaphore 0 with SEM_UNDO, which its exit
+       undoes. */
     fflush(stdout);
     pid_t taker = child();
     if (taker == 0) {
         long r = syscall(SYS_msgrcv, msg, &msgx_buf, sizeof msgx_buf.text, 0, 0);
         long at = syscall(SYS_shmat, shm, 0, 0);
-        _exit(r == 5 && at != -1 && syscall(SYS_shmdt, at) == 0 ? 0 : 1);
+        int changed = semx_op(sem, 2, 1, 0) == 0 && semx_op(sem, 0, 1, SEMX_UNDO) == 0;
+        _exit(r == 5 && at != -1 && syscall(SYS_shmdt, at) == 0 && changed ? 0 : 1);
     }
     result("taker", reaped(taker));
     sysvipc_all("taken");
+    /* The semaphores' last processes, PID 2 though it is reaped. */
+    sysvipc_sempids("taken", sem);
     /* Locked, then marked for removal while attached: key 0 and the mode
        bits SHM_LOCKED and SHM_DEST. */
     printf("lock=%ld\n", syscall(SYS_shmctl, shm, 11 /* SHM_LOCK */, NULL));
@@ -12575,6 +12790,7 @@ static int sysvipc_work(void) {
     pid_t nested = child();
     if (nested == 0) {
         sysvipc_all("nested");
+        sysvipc_sempids("nested", sem);
         fflush(stdout);
         _exit(0);
     }
@@ -25111,6 +25327,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "chroot-exec")) return chroot_exec_case();
     if (!strcmp(mode, "mounts")) return mounts_case(self);
     if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
+    if (!strcmp(mode, "binds")) return binds_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

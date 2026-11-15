@@ -636,13 +636,13 @@ fn a_userfaultfd_registration_faults_on_missing_pages_only() {
     assert_eq!(m.userfault_at(s), Some(7));
     assert_eq!(view.userfault_at(s.0 + 5), Some(7));
     // An access the protection refuses is the CPU's fault.
-    assert_eq!(m.userfault_for(s, true, false), Some(7));
+    assert_eq!(m.userfault_for(s, true, false), Some((7, false)));
     assert_eq!(m.userfault_for(s, false, true), None);
     // A guarded page is neither a fault nor a page to fill.
     m.guard(GuestAddr(s.0), s.0 + PAGE_SIZE, true).unwrap();
     assert_eq!(m.userfault_for(s, false, false), None);
     assert_eq!(
-        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, None),
+        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, None, false),
         Err(Errno::EEXIST)
     );
     m.guard(GuestAddr(s.0), s.0 + PAGE_SIZE, false).unwrap();
@@ -651,11 +651,11 @@ fn a_userfaultfd_registration_faults_on_missing_pages_only() {
     assert_eq!(byte, [b'k']);
     assert_eq!(view.userfault_target(s.0, s.0 + 2 * PAGE_SIZE), Ok(1));
     assert_eq!(
-        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0 + PAGE_SIZE, None),
+        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0 + PAGE_SIZE, None, false),
         Err(Errno::EEXIST)
     );
     assert_eq!(
-        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, Some(b"h")),
+        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, Some(b"h"), false),
         Ok(())
     );
     m.read(s, &mut byte).unwrap();
@@ -679,9 +679,133 @@ fn a_userfaultfd_registration_faults_on_missing_pages_only() {
         Err(Errno::ENOMEM)
     );
     assert_eq!(
-        gone.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, None),
+        gone.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, None, false),
         Err(Errno(3))
     );
     assert_eq!(gone.userfault_target(s.0, s.0 + PAGE_SIZE), Err(Errno(3)));
     assert!(gone.userfault_at(s.0).is_none());
+}
+
+#[test]
+fn a_userfaultfd_write_protection_faults_on_writes_while_registered() {
+    let mut m = AddressSpace::new();
+    let a = m
+        .map(
+            Some(GuestAddr(0x80000)),
+            3 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.write(a, b"a").unwrap();
+    let view = m.view();
+    // Neither minor faults nor write protection of shared memory are taken.
+    assert_eq!(
+        view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::MINOR),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        view.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true),
+        Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        view.userfault_register(a.0, a.0 + 2 * PAGE_SIZE, 7, Userfault::WP),
+        Ok(())
+    );
+    assert_eq!(
+        view.userfault_write_protect(a.0, a.0 + 3 * PAGE_SIZE, true),
+        Err(Errno::ENOENT)
+    );
+    // The VMA before the one not registered was protected, but only its
+    // page with an entry.
+    let page = GuestAddr(a.0 + PAGE_SIZE);
+    m.write(page, b"x").unwrap();
+    assert_eq!(
+        view.userfault_target(a.0, a.0 + PAGE_SIZE),
+        Ok(Userfault::WP)
+    );
+    let mut byte = [0];
+    m.read(a, &mut byte).unwrap();
+    let fault = m.write(a, b"c").unwrap_err();
+    assert!(fault.mapped && fault.present && fault.write);
+    assert_eq!(m.userfault_for(a, true, false), Some((7, true)));
+    assert_eq!(m.userfault_for(a, false, false), None);
+    // Read before the write: the thread's TLB entry is read-only too.
+    view.userfault_write_protect(page.0, page.0 + PAGE_SIZE, true)
+        .unwrap();
+    m.read(page, &mut byte).unwrap();
+    assert!(m.write(page, b"y").is_err());
+    // A protection that refuses writes is the CPU's fault; giving writes
+    // back keeps the page protected.
+    m.protect(a, PAGE_SIZE, Prot::READ).unwrap();
+    assert_eq!(m.userfault_for(a, true, false), None);
+    m.protect(a, PAGE_SIZE, Prot::READ_WRITE).unwrap();
+    assert!(m.write(a, b"d").is_err());
+    // A child's mapping is not registered, nor its pages protected.
+    let child = m.fork();
+    child.write(a, b"e").unwrap();
+    m.read(a, &mut byte).unwrap();
+    assert_eq!(byte, [b'a']);
+    assert_eq!(
+        view.userfault_write_protect(a.0, a.0 + PAGE_SIZE, false),
+        Ok(())
+    );
+    m.write(a, b"f").unwrap();
+    child.read(a, &mut byte).unwrap();
+    assert_eq!(byte, [b'e']);
+    // A fill may protect its page.
+    view.userfault_prepare_fill(a.0);
+    m.discard_shared(page, PAGE_SIZE).unwrap();
+    assert_eq!(
+        view.userfault_fill(page.0, page.0 + PAGE_SIZE, page.0, Some(b"g"), true),
+        Ok(())
+    );
+    assert!(m.write(page, b"h").is_err());
+    // Unregistering ends the protection.
+    view.userfault_unregister(a.0, a.0 + 2 * PAGE_SIZE, 7)
+        .unwrap();
+    m.write(page, b"i").unwrap();
+    assert!(m.mappings().all(|mapping| mapping.userfault.is_none()));
+    // As does a registration that replaces it with one for missing pages
+    // alone, though not one it has the modes of already; and the release.
+    view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::WP | Userfault::MISSING)
+        .unwrap();
+    view.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true)
+        .unwrap();
+    view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    assert!(m.write(a, b"j").is_err());
+    view.userfault_unregister(a.0, a.0 + PAGE_SIZE, 7).unwrap();
+    view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::WP)
+        .unwrap();
+    view.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true)
+        .unwrap();
+    view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    assert!(m.write(a, b"j").is_ok());
+    view.userfault_register(a.0, a.0 + PAGE_SIZE, 7, Userfault::WP)
+        .unwrap();
+    view.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true)
+        .unwrap();
+    view.userfault_release(7);
+    m.write(a, b"k").unwrap();
+    // Shared memory takes no write protection.
+    let s = m
+        .map_shared(
+            Some(GuestAddr(0x100000)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.mark_shared(s, PAGE_SIZE).unwrap();
+    assert_eq!(
+        view.userfault_register(s.0, s.0 + PAGE_SIZE, 7, Userfault::WP),
+        Err(Errno::EINVAL)
+    );
+    let gone = AddressSpace::new().view();
+    assert_eq!(
+        gone.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true),
+        Err(Errno(3))
+    );
 }

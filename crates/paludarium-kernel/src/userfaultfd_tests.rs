@@ -18,6 +18,7 @@ const UNREGISTER: u64 = 0x8010_aa01;
 const WAKE: u64 = 0x8010_aa02;
 const COPY: u64 = 0xc028_aa03;
 const ZEROPAGE: u64 = 0xc020_aa04;
+const WRITEPROTECT: u64 = 0xc018_aa06;
 
 const NONBLOCK: u64 = 0o4000;
 const SIGBUS: u64 = 1 << 7;
@@ -185,7 +186,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ret(16, &[fd, API, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, API, &[0xaa, SIGBUS | THREAD_ID, 0]);
     assert_eq!(ret, 0);
-    assert_eq!(out, vec![0xaa, 0x9b0, 1 << 63 | 3]);
+    assert_eq!(out, vec![0xaa, 0x9b1, 1 << 63 | 3]);
     assert_eq!(
         f.ioctl(fd, API, &[0xaa, 0, 0]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
@@ -193,7 +194,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ioctl(fd, 0xc018_aa3e, &[0, 0, 0]).0, errno(Errno::EINVAL));
     assert!(
         f.fdinfo(fd)
-            .ends_with("pending:\t0\ntotal:\t0\nAPI:\taa:80000180:800000000000001f\n")
+            .ends_with("pending:\t0\ntotal:\t0\nAPI:\taa:80000180:800000000000005f\n")
     );
     // Read, write and seek of the file.
     assert_eq!(f.ret(0, &[fd, ARG, 32]), errno(Errno::EAGAIN));
@@ -215,8 +216,8 @@ fn uffdio_register_checks_the_range_and_its_vmas() {
     let einval = errno(Errno::EINVAL);
     assert_eq!(f.ioctl(fd, REGISTER, &[AREA, PAGE, 0, 0]).0, einval);
     assert_eq!(f.ioctl(fd, REGISTER, &[AREA, PAGE, 8, 0]).0, einval);
-    // The write-protect and minor modes are not offered.
-    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, PAGE, 2, 0]).0, einval);
+    // The minor mode is not offered.
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, PAGE, 4, 0]).0, einval);
     assert_eq!(f.ioctl(fd, REGISTER, &[AREA + 1, PAGE, 1, 0]).0, einval);
     assert_eq!(f.ioctl(fd, REGISTER, &[AREA, PAGE + 1, 1, 0]).0, einval);
     assert_eq!(f.ioctl(fd, REGISTER, &[AREA, 0, 1, 0]).0, einval);
@@ -443,4 +444,131 @@ fn a_child_and_a_moved_mapping_leave_the_registration() {
     // mremap moves it without its registration (MREMAP_MAYMOVE).
     assert_eq!(f.ret(25, &[AREA, 2 * PAGE, 4 * PAGE, 1, 0]) & 0xfff, 0);
     assert!(f.mem.mappings().all(|m| m.userfault.is_none()));
+    // Nor the write protection of its pages, which a child does not get
+    // either.
+    let mut f = fixture();
+    let fd = f.ready(0, 0);
+    f.mem.write(GuestAddr(AREA), b"a").unwrap();
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 2, 0]).0, 0);
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, PAGE, 1]).0, 0);
+    let child = f.mem.fork();
+    child.write(GuestAddr(AREA), b"b").unwrap();
+    assert!(f.mem.write(GuestAddr(AREA), b"b").is_err());
+    let moved = f.ret(25, &[AREA, 2 * PAGE, 4 * PAGE, 1, 0]);
+    assert_ne!(moved, AREA);
+    f.mem.write(GuestAddr(moved), b"c").unwrap();
+}
+
+#[test]
+fn a_write_to_a_write_protected_page_faults_until_the_protection_ends() {
+    let mut f = fixture();
+    let fd = f.ready(NONBLOCK, 0);
+    // The minor mode is refused, the write-protect mode reports
+    // UFFDIO_WRITEPROTECT.
+    assert_eq!(
+        f.ioctl(fd, REGISTER, &[AREA, PAGE, 4, 0]).0,
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ioctl(fd, WRITEPROTECT, &[AREA, PAGE, 1]).0,
+        errno(Errno::ENOENT)
+    );
+    f.mem.write(GuestAddr(AREA), b"a").unwrap();
+    let (ret, out) = f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 3, 0]);
+    assert_eq!((ret, out[3]), (0, 0x5c));
+    assert_eq!(
+        f.userfault(AREA).map(|u| u.modes),
+        Some(Userfault::MISSING | Userfault::WP)
+    );
+    // The modes and the range are checked, and protecting does not take
+    // DONTWAKE.
+    for (words, error) in [
+        ([AREA, PAGE, 4], Errno::EINVAL),
+        ([AREA, PAGE, 3], Errno::EINVAL),
+        ([AREA + 1, PAGE, 1], Errno::EINVAL),
+        ([AREA, 0, 1], Errno::EINVAL),
+        ([AREA, 3 * PAGE, 1], Errno::ENOENT),
+    ] {
+        assert_eq!(f.ioctl(fd, WRITEPROTECT, &words).0, errno(error));
+    }
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, 2 * PAGE, 1]).0, 0);
+    // A system call's write there is EFAULT, its read is not.
+    assert_eq!(f.ret(1, &[1, AREA, 1]), 1);
+    assert_eq!(f.ret(0, &[fd, AREA, 32]), errno(Errno::EAGAIN));
+    // A write faults with the WP flag; the message waits for a read, which
+    // a signal does not take away here, as the wait ends at once.
+    let id = f.userfault(AREA).unwrap().context;
+    let context = crate::userfaultfd::find(id).unwrap();
+    crate::signals::queue(
+        &mut f.thread.state,
+        crate::signals::PendingSignal::user(10, 0),
+    );
+    let reason = ExitReason::PageFault {
+        rip: GuestAddr(0x1234),
+        addr: GuestAddr(AREA + 9),
+        write: true,
+        fetch: false,
+        mapped: true,
+        present: true,
+    };
+    assert_eq!(
+        f.kernel.handle(&mut f.thread, &f.mem, reason),
+        Next::Exit(ExitStatus::Signaled(10))
+    );
+    assert_eq!(crate::userfaultfd::tests::counts(&context), (0, 0));
+    // UFFDIO_WRITEPROTECT that ends the protection wakes the range, unless
+    // DONTWAKE.
+    let mut f = fixture();
+    let fd = f.ready(NONBLOCK, 0);
+    f.mem.write(GuestAddr(AREA), b"a").unwrap();
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, PAGE, 2, 0]).0, 0);
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, PAGE, 1]).0, 0);
+    let context = crate::userfaultfd::find(f.userfault(AREA).unwrap().context).unwrap();
+    crate::userfaultfd::tests::queue(&context, AREA, 3, 0);
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, PAGE, 2]).0, 0);
+    assert_eq!(crate::userfaultfd::tests::counts(&context), (1, 1));
+    f.mem.write(GuestAddr(AREA), b"b").unwrap();
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, PAGE, 0]).0, 0);
+    assert_eq!(crate::userfaultfd::tests::counts(&context), (0, 0));
+    // A copy may protect the page it fills; with SIGBUS the write raises it.
+    let mut f = fixture();
+    let fd = f.ready(0, SIGBUS);
+    assert_eq!(
+        f.ioctl(fd, COPY, &[AREA, SRC, PAGE, 2, 0]).0,
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    assert_eq!(
+        f.ioctl(fd, COPY, &[AREA, SRC, PAGE, 2, 0]).0,
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, PAGE, 3, 0]).0, 0);
+    assert_eq!(
+        f.ioctl(fd, COPY, &[AREA, SRC, PAGE, 2, 0]),
+        (0, vec![AREA, SRC, PAGE, 2, PAGE])
+    );
+    let mut byte = [0];
+    f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
+    assert!(f.mem.write(GuestAddr(AREA), b"c").is_err());
+    let reason = ExitReason::PageFault {
+        rip: GuestAddr(0x1234),
+        addr: GuestAddr(AREA),
+        write: true,
+        fetch: false,
+        mapped: true,
+        present: true,
+    };
+    assert_eq!(
+        f.kernel.handle(&mut f.thread, &f.mem, reason),
+        Next::Exit(ExitStatus::Signaled(signal::SIGBUS))
+    );
+    // Unregistering ends the protection.
+    let mut f = fixture();
+    let fd = f.ready(0, 0);
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, PAGE, 2, 0]).0, 0);
+    f.mem.write(GuestAddr(AREA), b"d").unwrap();
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, PAGE, 1]).0, 0);
+    assert!(f.mem.write(GuestAddr(AREA), b"e").is_err());
+    assert_eq!(f.ioctl(fd, UNREGISTER, &[AREA, PAGE]).0, 0);
+    f.mem.write(GuestAddr(AREA), b"e").unwrap();
 }

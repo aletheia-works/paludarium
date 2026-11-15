@@ -204,11 +204,13 @@ pub(crate) struct Root {
     fs: Arc<dyn FileSystem>,
 }
 /// What another process's `/proc/<pid>` shows of a process's files: its
-/// current directory, umask and descriptor table, as long as they last.
+/// current directory, root, mounts, umask and descriptor table, as long as
+/// they last.
 #[derive(Clone, Default)]
 pub(crate) struct FilesView {
     cwd: std::sync::Weak<Mutex<Vec<u8>>>,
     root: std::sync::Weak<Mutex<Option<Root>>>,
+    space: std::sync::Weak<Mutex<Space>>,
     umask: std::sync::Weak<AtomicU32>,
     fds: std::sync::Weak<Mutex<BTreeMap<u32, Descriptor>>>,
 }
@@ -226,6 +228,21 @@ impl FilesView {
             root.as_ref()
                 .map_or_else(|| b"/".to_vec(), |root| root.path.clone()),
         )
+    }
+    /// The mounts of its mount namespace, as its root sees the filesystem,
+    /// with that root, for `/proc/<pid>/mountinfo` and `mounts`.
+    pub(crate) fn mounts(&self) -> Option<(Vec<paludarium_vfs::MountPoint>, Vec<u8>)> {
+        let space = self.space.upgrade()?;
+        let root = self.root.upgrade()?;
+        let root = root.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        Some(match root {
+            Some(root) => (root.fs.mounts(), root.path),
+            None => {
+                let machine =
+                    Arc::clone(&space.lock().unwrap_or_else(PoisonError::into_inner).machine);
+                (machine.mounts(), b"/".to_vec())
+            }
+        })
     }
     pub(crate) fn umask(&self) -> u32 {
         self.umask
@@ -275,6 +292,7 @@ impl Files {
         FilesView {
             cwd: Arc::downgrade(&self.cwd),
             root: Arc::downgrade(&self.root),
+            space: Arc::downgrade(&self.space),
             umask: Arc::downgrade(&self.umask),
             fds: Arc::downgrade(&self.fds),
         }
@@ -6111,6 +6129,11 @@ fn open_path(
             };
             let file = crate::users::MapFile::open(user, ids, content, creds.clone(), flags);
             return Ok((Arc::new(file), p.to_vec()));
+        }
+        if let crate::proc::TaskEntry::Mounts(_) = path.entry
+            && tasks::mounts(&task).is_none()
+        {
+            return Err(Errno::EINVAL);
         }
         if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
             Arc::new(crate::proc::GeneratedFile::open(content, flags))

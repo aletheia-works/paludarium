@@ -1620,13 +1620,21 @@ kernel.
     the port and groups; a datagram to another socket's port reaches it
     (`ECONNREFUSED` for none). `recvmsg` gives the sender's `sockaddr_nl`,
     `MSG_PEEK` and `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`,
-    `SO_RCVTIMEO`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
-    `NETLINK_GET_STRICT_CHK` can be set. A message from the kernel that
+    `SO_RCVTIMEO`, `NETLINK_PKTINFO`, `NETLINK_BROADCAST_ERROR`,
+    `NETLINK_NO_ENOBUFS`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
+    `NETLINK_GET_STRICT_CHK` can be set; as in Linux's
+    `netlink_setsockopt`, a value shorter than an `int` is 0. With
+    `NETLINK_PKTINFO`, `recvmsg` gives each datagram's group (0 for one
+    to the socket's own port) in a `SOL_NETLINK` `NETLINK_PKTINFO` control
+    message, or `MSG_CTRUNC` when it does not fit.
+    `NETLINK_BROADCAST_ERROR` is only kept, as no notification here tells
+    anyone that it was not delivered. A message from the kernel that
     finds the receive buffer full is dropped, with `ENOBUFS` for the next
     receive, and the socket is then held congested, as Linux's
     `NETLINK_S_CONGESTED`: it drops the kernel's other messages too, with
-    no other `ENOBUFS`, until a receive finds its queue empty. A dump's
-    parts do not look at it. A datagram from another socket that finds no
+    no other `ENOBUFS`, until a receive finds its queue empty. A socket
+    with `NETLINK_NO_ENOBUFS` drops them with neither, and setting it
+    ends a congestion. A dump's parts do not look at it. A datagram from another socket that finds no
     room, or the socket congested, waits for room instead, or is `EAGAIN`
     with `MSG_DONTWAIT` or `O_NONBLOCK`, and overruns nothing.
   - **Requests:** the kernel, port 0, takes each message of a datagram as
@@ -2279,8 +2287,15 @@ kernel.
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
   and the tmpfs mounts `mount` made, with their sources). After `chroot` they show each mount point
   from the process's root and leave out those not under it, as Linux's
-  `seq_path_root` does. Each mount has its own `st_dev`, as its
-  line in `mountinfo` says, so `df` lists every mount. A pipe, a socket, a
+  `seq_path_root` does. `/proc/<pid>/mountinfo` and `mounts` (and those of
+  `/proc/thread-self` and `/proc/<pid>/task/<tid>`) are those of that task,
+  as Linux's `mounts_open_common` makes them: the mounts of its mount
+  namespace, from its root, for any reader; a process that has ended,
+  until it is reaped, has them, but they open as `EINVAL`, and so do a
+  process's when its leader ended before its other threads, whose own
+  under `task/<tid>` still open. Each
+  mount has its own `st_dev`, as its line in `mountinfo` says, so `df`
+  lists every mount. A pipe, a socket, a
   pidfd, a memfd, a `memfd_secret` file, a namespace file and an anonymous
   inode (an eventfd, an epoll and the like) that no path opened are each on
   a device of their file system's own (pipefs, sockfs, pidfs, the internal
@@ -2327,8 +2342,8 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
-  `root`, `maps`, `smaps`, `fd`, `fdinfo`, `ns` and `task`. `root` leads to
-  the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
+  `root`, `maps`, `mounts`, `mountinfo`, `smaps`, `fd`, `fdinfo`, `ns` and
+  `task`. `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
   unmarked; `maps` and `smaps` name a mapped file the same way. `status`
@@ -2343,8 +2358,8 @@ kernel.
   and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
-  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd`, `root`, `ns`
-  (0511) and `task`, made as
+  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd`, `root`,
+  `mounts`, `mountinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of

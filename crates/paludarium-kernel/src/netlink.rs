@@ -339,6 +339,9 @@ const IF_OPER_UNKNOWN: u8 = 0;
 const IF_OPER_DOWN: u8 = 2;
 const SOL_SOCKET: u64 = 1;
 const SOL_NETLINK: u64 = 270;
+const NETLINK_PKTINFO: u64 = 3;
+const NETLINK_BROADCAST_ERROR: u64 = 4;
+const NETLINK_NO_ENOBUFS: u64 = 5;
 const NETLINK_CAP_ACK: u64 = 10;
 const NETLINK_EXT_ACK: u64 = 11;
 const NETLINK_GET_STRICT_CHK: u64 = 12;
@@ -347,6 +350,8 @@ const MSG_OOB: u64 = 0x1;
 const MSG_PEEK: u64 = 0x2;
 const MSG_TRUNC: u64 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
+const MSG_CTRUNC: u32 = 0x8;
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 const EBUSY: Errno = Errno(16);
 const EEXIST: Errno = Errno(17);
 const ENODEV: Errno = Errno(19);
@@ -481,6 +486,15 @@ struct State {
     cap_ack: bool,
     ext_ack: bool,
     strict: bool,
+    /// `NETLINK_PKTINFO`: each `recvmsg` tells the group a datagram went
+    /// to in a control message.
+    pktinfo: bool,
+    /// `NETLINK_BROADCAST_ERROR`, which only a broadcast from inside the
+    /// kernel that looks at its result would see; none here does.
+    broadcast_error: bool,
+    /// `NETLINK_NO_ENOBUFS`: a message that finds no room is dropped
+    /// without `ENOBUFS`, and the socket is never congested.
+    no_enobufs: bool,
 }
 
 /// An `AF_NETLINK` socket of `NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` or
@@ -691,7 +705,8 @@ impl NetlinkSocket {
     /// Queues a datagram for this socket, as `netlink_attachskb`: one that
     /// finds the receive buffer full, or the socket congested, is dropped
     /// (`netlink_overrun`), and the first such one gives `ENOBUFS` for the
-    /// next receive and holds the socket congested until it is emptied.
+    /// next receive and holds the socket congested until it is emptied,
+    /// unless the socket has `NETLINK_NO_ENOBUFS`.
     fn deliver(&self, s: &mut State, from: u32, group: u32, bytes: Vec<u8>) {
         self.offer(s, (from, group, bytes), true);
     }
@@ -704,7 +719,7 @@ impl NetlinkSocket {
     fn offer(&self, s: &mut State, (from, group, bytes): (u32, u32, Vec<u8>), overrun: bool) {
         let full = Self::full(s);
         if overrun && (full || s.congested) {
-            if !s.congested {
+            if !s.congested && !s.no_enobufs {
                 s.congested = true;
                 s.error = Some(ENOBUFS);
             }
@@ -4382,9 +4397,31 @@ pub(crate) fn dispatch(
                     .write(GuestAddr(a[1] + 8), &(name.len() as u32).to_le_bytes())
                     .map_err(|_| Errno::EFAULT)?;
             }
-            let flags = if length > n { MSG_TRUNC as u32 } else { 0 };
+            // `____sys_recvmsg` starts the flags with `MSG_CMSG_CLOEXEC`.
+            let mut flags = (a[2] & MSG_CMSG_CLOEXEC) as u32;
+            if length > n {
+                flags |= MSG_TRUNC as u32;
+            }
+            let mut used = 0;
+            if socket.lock().pktinfo {
+                // `netlink_cmsg_recv_pktinfo`: `struct nl_pktinfo`, the
+                // group the datagram went to; with no control buffer, or
+                // one shorter than a `cmsghdr`, only `MSG_CTRUNC` tells of
+                // it (`put_cmsg`).
+                if header.control == 0 || header.control_len < 16 {
+                    flags |= MSG_CTRUNC;
+                } else {
+                    let mut room = (header.control, header.control_len);
+                    let (level, kind) = (SOL_NETLINK as u32, NETLINK_PKTINFO as u32);
+                    let info = group.to_le_bytes();
+                    if crate::sockets::put_control_at(c, &mut room, level, kind, &info) {
+                        flags |= MSG_CTRUNC;
+                    }
+                    used = header.control_len - room.1;
+                }
+            }
             c.mem
-                .write(GuestAddr(a[1] + 40), &0u64.to_le_bytes())
+                .write(GuestAddr(a[1] + 40), &used.to_le_bytes())
                 .map_err(|_| Errno::EFAULT)?;
             c.mem
                 .write(GuestAddr(a[1] + 48), &flags.to_le_bytes())
@@ -4452,12 +4489,32 @@ fn option_int(c: &Context<'_>, at: u64, len: u64) -> Result<i32, Errno> {
         .map_err(|_| Errno::EFAULT)?;
     Ok(i32::from_le_bytes(raw))
 }
+/// Reads the value of a `SOL_NETLINK` setsockopt as `netlink_setsockopt`
+/// does: an `int` when `len` has room for one, else 0, which is not read.
+/// A negative length is `EINVAL` (`do_sock_setsockopt`).
+fn netlink_option(c: &Context<'_>, at: u64, len: u64) -> Result<u32, Errno> {
+    let len = len as u32 as i32;
+    if len < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len < 4 {
+        return Ok(0);
+    }
+    let mut raw = [0; 4];
+    c.mem
+        .read(GuestAddr(at), &mut raw)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(u32::from_le_bytes(raw))
+}
 /// `setsockopt`: `SO_SNDBUF` and `SO_RCVBUF` (doubled, as Linux keeps
-/// them), `SO_RCVTIMEO`, and `SOL_NETLINK`'s `NETLINK_CAP_ACK`,
-/// `NETLINK_EXT_ACK`, by which acknowledgements tell why ([`extack`]), and
-/// `NETLINK_GET_STRICT_CHK`, by which dumps, link requests
-/// and route lookups are checked strictly. Any other option is
-/// `ENOPROTOOPT`.
+/// them), `SO_RCVTIMEO`, and `SOL_NETLINK`'s, as `netlink_setsockopt`:
+/// the memberships, and the flags `NETLINK_PKTINFO` (a control message of
+/// each datagram's group), `NETLINK_BROADCAST_ERROR`, `NETLINK_NO_ENOBUFS`
+/// (which also ends a congestion), `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK`, by
+/// which acknowledgements tell why ([`extack`]), and
+/// `NETLINK_GET_STRICT_CHK`, by which dumps, link requests and route
+/// lookups are checked strictly. A value shorter than an `int` is 0. Any
+/// other option is `ENOPROTOOPT`.
 fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Result<u64, Errno> {
     let (level, name, at, len) = (a[1], a[2], a[3], a[4]);
     match (level, name) {
@@ -4485,7 +4542,7 @@ fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
             // `netlink_setsockopt`: a group past `RTNLGRP_MAX`, or 0, is
             // `EINVAL`, and joining a multicast routing one needs
             // `CAP_NET_ADMIN` (`rtnetlink_bind`).
-            let group = option_int(c, at, len)? as u32;
+            let group = netlink_option(c, at, len)?;
             if group == 0 || group > socket.groups() {
                 return Err(Errno::EINVAL);
             }
@@ -4499,18 +4556,38 @@ fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
                 socket.lock().groups &= !bit;
             }
         }
-        (SOL_NETLINK, NETLINK_CAP_ACK | NETLINK_EXT_ACK | NETLINK_GET_STRICT_CHK) => {
-            let on = option_int(c, at, len)? != 0;
+        (
+            SOL_NETLINK,
+            NETLINK_PKTINFO
+            | NETLINK_BROADCAST_ERROR
+            | NETLINK_NO_ENOBUFS
+            | NETLINK_CAP_ACK
+            | NETLINK_EXT_ACK
+            | NETLINK_GET_STRICT_CHK,
+        ) => {
+            let on = netlink_option(c, at, len)? != 0;
             let mut s = socket.lock();
-            match name {
-                NETLINK_CAP_ACK => s.cap_ack = on,
-                NETLINK_EXT_ACK => s.ext_ack = on,
-                _ => s.strict = on,
+            *flag(&mut s, name) = on;
+            if name == NETLINK_NO_ENOBUFS && on {
+                // `clear_bit(NETLINK_S_CONGESTED)`, and a wake.
+                s.congested = false;
+                socket.hub.changed();
             }
         }
         _ => return Err(ENOPROTOOPT),
     }
     Ok(0)
+}
+/// The `SOL_NETLINK` flag `name` keeps.
+fn flag(s: &mut State, name: u64) -> &mut bool {
+    match name {
+        NETLINK_PKTINFO => &mut s.pktinfo,
+        NETLINK_BROADCAST_ERROR => &mut s.broadcast_error,
+        NETLINK_NO_ENOBUFS => &mut s.no_enobufs,
+        NETLINK_CAP_ACK => &mut s.cap_ack,
+        NETLINK_EXT_ACK => &mut s.ext_ack,
+        _ => &mut s.strict,
+    }
 }
 /// `getsockopt`: what [`set_option`] keeps, and `SO_TYPE`, `SO_ERROR`
 /// (which takes the pending error), `SO_PROTOCOL` and `SO_DOMAIN`. Any
@@ -4545,17 +4622,20 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
             (SOL_SOCKET, 8) => s.receive_buffer.to_le_bytes().to_vec(),
             (SOL_SOCKET, 38) => (socket.protocol as i32).to_le_bytes().to_vec(),
             (SOL_SOCKET, 39) => i32::from(AF_NETLINK).to_le_bytes().to_vec(),
-            (SOL_NETLINK, NETLINK_CAP_ACK | NETLINK_EXT_ACK | NETLINK_GET_STRICT_CHK) => {
+            (
+                SOL_NETLINK,
+                NETLINK_PKTINFO
+                | NETLINK_BROADCAST_ERROR
+                | NETLINK_NO_ENOBUFS
+                | NETLINK_CAP_ACK
+                | NETLINK_EXT_ACK
+                | NETLINK_GET_STRICT_CHK,
+            ) => {
                 // `netlink_getsockopt` wants room for an int.
                 if room < 4 {
                     return Err(Errno::EINVAL);
                 }
-                let on = match name {
-                    NETLINK_CAP_ACK => s.cap_ack,
-                    NETLINK_EXT_ACK => s.ext_ack,
-                    _ => s.strict,
-                };
-                i32::from(on).to_le_bytes().to_vec()
+                i32::from(*flag(&mut s, name)).to_le_bytes().to_vec()
             }
             _ => return Err(ENOPROTOOPT),
         }

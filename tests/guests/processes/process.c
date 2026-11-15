@@ -8606,6 +8606,187 @@ static int mounts_case(const char *self) {
     return 0;
 }
 
+/* The proc-other-mounts case: another process's mountinfo and mounts, as
+   Linux's mounts_open_common makes them from that task's mount namespace
+   and root, which anyone may read. */
+static char pom_text[2][65536];
+/* `path`'s lines into pom_text[slot]: their number, or -errno. */
+static int pom_read(const char *path, int slot) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    long total = 0, n;
+    while (total < (long)sizeof pom_text[slot] - 1 &&
+           (n = read(fd, pom_text[slot] + total, sizeof pom_text[slot] - 1 - (size_t)total)) > 0)
+        total += n;
+    close(fd);
+    pom_text[slot][total] = 0;
+    int lines = 0;
+    for (long i = 0; i < total; i++) lines += pom_text[slot][i] == '\n';
+    return lines;
+}
+/* Whether `path` reads as /proc/self's `name` does. */
+static int pom_same(const char *path, const char *name) {
+    char own[64];
+    snprintf(own, sizeof own, "/proc/self/%s", name);
+    int a = pom_read(own, 0), b = pom_read(path, 1);
+    return a > 0 && a == b && !strcmp(pom_text[0], pom_text[1]);
+}
+/* The mount points (mountinfo's 5th field, mounts' 2nd) in pom_text[slot]
+   that `point` is, and the lines. */
+static int pom_has(int slot, int mountinfo, const char *point) {
+    int found = 0;
+    char *save = NULL, copy[65536];
+    snprintf(copy, sizeof copy, "%s", pom_text[slot]);
+    for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char at[1024];
+        int got = mountinfo ? sscanf(line, "%*s %*s %*s %*s %1023s", at) : sscanf(line, "%*s %1023s", at);
+        found += got == 1 && !strcmp(at, point);
+    }
+    return found;
+}
+/* A thread that tells its ID, then waits for a byte, for a leader that ends
+   before it. */
+static int pom_wait[2], pom_told[2];
+static void *pom_thread(void *unused) {
+    (void)unused;
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    char byte;
+    if (write(pom_told[1], &tid, sizeof tid) != sizeof tid || read(pom_wait[0], &byte, 1) != 1) _exit(87);
+    _exit(0);
+}
+static int proc_other_mounts_case(void) {
+    char base[] = "/tmp/paludarium-pom-XXXXXX", m[256], path[256];
+    if (!mkdtemp(base)) return 80;
+    chmod(base, 0755);
+    snprintf(m, sizeof m, "%s/m", base);
+    mkdir(m, 0755);
+    /* This process's own, by its PID, its thread's and thread-self. */
+    snprintf(path, sizeof path, "/proc/%d/mountinfo", (int)getpid());
+    printf("own pid mountinfo=%d", pom_same(path, "mountinfo"));
+    snprintf(path, sizeof path, "/proc/%d/mounts", (int)getpid());
+    printf(" mounts=%d", pom_same(path, "mounts"));
+    snprintf(path, sizeof path, "/proc/self/task/%d/mountinfo", (int)syscall(SYS_gettid));
+    printf(" task=%d", pom_same(path, "mountinfo"));
+    printf(" thread-self=%d\n", pom_same("/proc/thread-self/mountinfo", "mountinfo"));
+    /* A child in this namespace shows the same mounts. */
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 81;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 82;
+    if (!kid) {
+        char byte;
+        if (write(ready[1], "r", 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 83;
+    snprintf(path, sizeof path, "/proc/%d/mountinfo", (int)kid);
+    printf("same namespace mountinfo=%d", pom_same(path, "mountinfo"));
+    snprintf(path, sizeof path, "/proc/%d/mounts", (int)kid);
+    printf(" mounts=%d", pom_same(path, "mounts"));
+    snprintf(path, sizeof path, "/proc/%d/task/%d/mountinfo", (int)kid, (int)kid);
+    printf(" task=%d\n", pom_same(path, "mountinfo"));
+    /* Its directory lists them. */
+    snprintf(path, sizeof path, "/proc/%d", (int)kid);
+    DIR *dir = opendir(path);
+    int listed = 0;
+    for (struct dirent *e; dir && (e = readdir(dir));)
+        listed += !strcmp(e->d_name, "mountinfo") || !strcmp(e->d_name, "mounts");
+    if (dir) closedir(dir);
+    snprintf(path, sizeof path, "/proc/%d/mountinfo", (int)kid);
+    struct stat st;
+    /* The call before the fields it fills: an argument list has no order. */
+    int r = stat(path, &st);
+    printf("listed=%d stat=%d mode=%o\n", listed, r ? errno : 0, st.st_mode & 07777);
+    if (write(done[1], "d", 1) != 1) return 84;
+    /* Ended and not reaped: the file is there, but opens as EINVAL. */
+    while (1) {
+        siginfo_t info;
+        memset(&info, 0, sizeof info);
+        if (waitid(P_PID, kid, &info, WEXITED | WNOWAIT) || info.si_pid == kid) break;
+    }
+    printf("zombie open=%d", pom_read(path, 1));
+    r = stat(path, &st);
+    printf(" stat=%d size=%lld", r ? errno : 0, (long long)st.st_size);
+    snprintf(path, sizeof path, "/proc/%d/mounts", (int)kid);
+    printf(" mounts=%d", pom_read(path, 1));
+    printf(" status=%d", reaped(kid));
+    printf(" reaped=%d\n", pom_read(path, 1));
+    /* A leader that ended before its other thread: the process's are EINVAL
+       too, as the leader has no nsproxy, but the thread's still open. */
+    if (pipe(pom_wait) || pipe(pom_told)) return 89;
+    fflush(stdout);
+    kid = fork();
+    if (kid < 0) return 90;
+    if (!kid) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, pom_thread, NULL)) _exit(86);
+        pthread_exit(NULL);
+    }
+    pid_t tid = 0;
+    if (read(pom_told[0], &tid, sizeof tid) != sizeof tid) return 91;
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    char stat_text[4096], *fields[8];
+    int ended = 0;
+    for (int i = 0; i < 100000 && !ended; i++) {
+        ended = proc_fields(path, stat_text, sizeof stat_text, fields, 8) > 0 && !strcmp(fields[0], "Z");
+        if (!ended) sched_yield();
+    }
+    snprintf(path, sizeof path, "/proc/%d/mountinfo", (int)kid);
+    printf("leader ended=%d open=%d", ended, pom_read(path, 1));
+    snprintf(path, sizeof path, "/proc/%d/task/%d/mountinfo", (int)kid, (int)tid);
+    printf(" thread=%d\n", pom_same(path, "mountinfo"));
+    if (write(pom_wait[1], "d", 1) != 1) return 92;
+    printf("status=%d\n", reaped(kid));
+    /* A child in a mount namespace of its own, with a mount of its own:
+       its mountinfo has it and this one's does not; then from its root
+       after chroot, which leaves out the mounts not under it. */
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    kid = fork();
+    if (kid < 0) return 85;
+    if (!kid) {
+        char result = 'x', map[64];
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            result = 'u';
+        } else {
+            snprintf(map, sizeof map, "0 %d 1", (int)uid);
+            mt_write("/proc/self/setgroups", "deny");
+            mt_write("/proc/self/uid_map", map);
+            snprintf(map, sizeof map, "0 %d 1", (int)gid);
+            mt_write("/proc/self/gid_map", map);
+            /* Changing propagation, if this kernel can; not compared. */
+            mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+            if (mount("none", m, "tmpfs", 0, "size=1m")) result = 'm';
+        }
+        if (write(ready[1], &result, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        if (chroot(base)) result = 'c';
+        if (write(ready[1], &result, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    if (read(ready[0], &byte, 1) != 1) return 86;
+    int own = pom_read("/proc/self/mountinfo", 0);
+    snprintf(path, sizeof path, "/proc/%d/mountinfo", (int)kid);
+    int theirs = pom_read(path, 1);
+    printf("namespace child=%c more=%d has=%d own has=%d\n", byte, theirs - own, pom_has(1, 1, m), pom_has(0, 1, m));
+    snprintf(path, sizeof path, "/proc/%d/mounts", (int)kid);
+    own = pom_read("/proc/self/mounts", 0);
+    theirs = pom_read(path, 1);
+    printf("namespace mounts more=%d has=%d own has=%d\n", theirs - own, pom_has(1, 0, m), pom_has(0, 0, m));
+    if (write(done[1], "d", 1) != 1 || read(ready[0], &byte, 1) != 1) return 87;
+    snprintf(path, sizeof path, "/proc/%d/mountinfo", (int)kid);
+    printf("rooted child=%c lines=%d has=%d", byte, pom_read(path, 1), pom_has(1, 1, "/m"));
+    snprintf(path, sizeof path, "/proc/%d/mounts", (int)kid);
+    printf(" mounts=%d has=%d\n", pom_read(path, 1), pom_has(1, 0, "/m"));
+    if (write(done[1], "d", 1) != 1) return 88;
+    printf("status=%d\n", reaped(kid));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(base) == 0);
+    return 0;
+}
+
 /* modify_ldt: Linux gives its int result as an unsigned int, so errors come
    back as large positive numbers, not -1 with errno. */
 static long ldt_call(long func, void *ptr, long count) {
@@ -24822,6 +25003,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "chroot-exec")) return chroot_exec_case();
     if (!strcmp(mode, "mounts")) return mounts_case(self);
     if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
+    if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

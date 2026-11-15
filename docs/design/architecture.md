@@ -104,7 +104,8 @@ out:
   immediates and memory (without `lock`);
 - `shl`, `shr`, `sar`, `rol` and `ror` of a register by an immediate;
 - `movzx` from a register, `movsx` and `movsxd` from a register or memory, and
-  `cbw`, `cwde` and `cdqe`.
+  `cbw`, `cwde` and `cdqe`;
+- `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`.
 
 Their operands are taken out in advance, so running them needs neither the
 general dispatch by mnemonic nor the general operand handling. Such a form

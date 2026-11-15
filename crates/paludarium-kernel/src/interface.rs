@@ -533,12 +533,16 @@ pub(crate) enum Event {
     DelAddr6(V6),
     NewRoute6(Route6, u16),
     DelRoute6(Route6),
+    /// A neighbour a request changed, told of as `__neigh_update` does,
+    /// naming the request's port.
+    NewNeighbour(Neighbour),
     DelNeighbour(Neighbour),
 }
 /// A neighbour of the loopback, as `___neigh_create` makes one for the
-/// next hop of a packet out through it. On a loopback each is `NUD_NOARP`
-/// with the device's address, all zeros: IPv4's one entry is keyed by
-/// `0.0.0.0` (`arp_constructor` keys a loopback's so), of type
+/// next hop of a packet out through it, or for a request
+/// (`RTM_NEWNEIGH`). On a loopback each is made `NUD_NOARP` with the
+/// device's address, all zeros: IPv4's one entry is keyed by `0.0.0.0`
+/// (`arp_constructor` keys a loopback's so, whatever is asked), of type
 /// `RTN_BROADCAST` (`inet_addr_type` of it); IPv6's are keyed by each next
 /// hop, of type `RTN_LOCAL`, or `RTN_MULTICAST` for a multicast one
 /// (`ndisc_constructor`).
@@ -547,9 +551,245 @@ pub(crate) struct Neighbour {
     pub ip: IpAddr,
     /// The `RTN_*` type.
     pub kind: u8,
-    /// When it was made, which is when it was last used and updated too,
-    /// as a loopback's output (`neigh_connected_output`) changes neither.
+    /// When it was made.
     pub made: u64,
+    /// Its `NUD_*` state.
+    pub state: u8,
+    /// Its `NTF_*` flags, the extended ones shifted by 8
+    /// (`NTF_EXT_SHIFT`), as `neigh->flags` has them.
+    pub flags: u32,
+    /// Its link-layer address, shown while its state is valid.
+    pub lladdr: [u8; 6],
+    /// The protocol a request gave it (`NDA_PROTOCOL`), 0 for none.
+    pub protocol: u8,
+    /// Its probes (`NDA_PROBES`).
+    pub probes: u32,
+    /// When it was last used and updated, as a loopback's output
+    /// (`neigh_connected_output`) changes neither.
+    pub used: u64,
+    pub updated: u64,
+    /// When it was confirmed: at `confirmed`, or, with `unconfirmed`, two
+    /// base reachable times (60 seconds) before it, as `neigh_alloc` and a
+    /// new link-layer address set it.
+    pub confirmed: u64,
+    pub unconfirmed: bool,
+    /// Whether its timer is pending, which holds a reference to it
+    /// (`neigh_add_timer`): one that a state of `NUD_REACHABLE`,
+    /// `NUD_DELAY` or `NUD_PROBE` sets. It never runs here.
+    pub timer: bool,
+}
+/// The `NUD_*` states.
+pub(crate) const NUD_INCOMPLETE: u8 = 0x01;
+pub(crate) const NUD_REACHABLE: u8 = 0x02;
+pub(crate) const NUD_STALE: u8 = 0x04;
+pub(crate) const NUD_DELAY: u8 = 0x08;
+pub(crate) const NUD_PROBE: u8 = 0x10;
+pub(crate) const NUD_FAILED: u8 = 0x20;
+pub(crate) const NUD_NOARP: u8 = 0x40;
+pub(crate) const NUD_PERMANENT: u8 = 0x80;
+/// `NUD_VALID` and `NUD_CONNECTED`.
+pub(crate) const NUD_VALID: u8 =
+    NUD_PERMANENT | NUD_NOARP | NUD_REACHABLE | NUD_PROBE | NUD_STALE | NUD_DELAY;
+const NUD_CONNECTED: u8 = NUD_PERMANENT | NUD_NOARP | NUD_REACHABLE;
+/// The `NTF_*` flags a neighbour keeps, the extended ones shifted by 8.
+pub(crate) const NTF_USE: u32 = 0x01;
+pub(crate) const NTF_EXT_LEARNED: u32 = 0x10;
+pub(crate) const NTF_ROUTER: u32 = 0x80;
+pub(crate) const NTF_MANAGED: u32 = 0x100;
+pub(crate) const NTF_EXT_VALIDATED: u32 = 0x400;
+/// `NLM_F_REPLACE`, `NLM_F_EXCL` and `NLM_F_CREATE`.
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_EXCL: u16 = 0x200;
+const NLM_F_CREATE: u16 = 0x400;
+/// `ENOBUFS`.
+const ENOBUFS: Errno = Errno(105);
+/// A neighbour a request adds or changes (`RTM_NEWNEIGH`), as `neigh_add`
+/// reads it, for `lo`: its key as asked, its state, flags (the extended
+/// ones shifted by 8), link-layer address (its first six bytes, or none),
+/// protocol (0 for none), and the request's `NLM_F_*`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NeighbourAsk {
+    pub ip: IpAddr,
+    pub state: u8,
+    pub flags: u32,
+    pub lladdr: Option<[u8; 6]>,
+    pub protocol: u8,
+    pub request: u16,
+}
+/// A proxy entry (`struct pneigh_entry`): one for `lo` (`device`) or for
+/// no device, with the flags (the extended ones shifted by 8) and
+/// protocol its last request gave it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Proxy {
+    pub ip: IpAddr,
+    pub device: bool,
+    pub flags: u32,
+    pub protocol: u8,
+    pub permanent: bool,
+}
+impl Proxy {
+    /// Its bucket of `pneigh_hash`, which folds the last four bytes of its
+    /// key as the CPU loads them.
+    fn bucket(&self) -> u32 {
+        let last = match self.ip {
+            IpAddr::V4(ip) => ip.octets(),
+            IpAddr::V6(ip) => {
+                let o = ip.octets();
+                [o[12], o[13], o[14], o[15]]
+            }
+        };
+        let mut hash = u32::from_le_bytes(last);
+        hash ^= hash >> 16;
+        hash ^= hash >> 8;
+        hash ^= hash >> 4;
+        hash & 0xf
+    }
+}
+/// What a change of a neighbour (`__neigh_update`) is asked to do, its
+/// `NEIGH_UPDATE_F_*`; every one here is an administrator's.
+#[derive(Clone, Copy, Debug, Default)]
+struct Update {
+    override_: bool,
+    override_router: bool,
+    learned: bool,
+    router: bool,
+    managed: bool,
+    use_: bool,
+    validated: bool,
+}
+impl Neighbour {
+    /// A neighbour as `___neigh_create` makes it for the loopback at
+    /// `now` with `flags`: `NUD_NOARP`, `lo`'s address, never confirmed.
+    fn new(ip: IpAddr, flags: u32, now: u64) -> Self {
+        let kind = match ip {
+            IpAddr::V4(_) => RTN_BROADCAST,
+            IpAddr::V6(ip) if ip.is_multicast() => RTN_MULTICAST,
+            IpAddr::V6(_) => RTN_LOCAL,
+        };
+        Self {
+            ip,
+            kind,
+            made: now,
+            state: NUD_NOARP,
+            flags,
+            lladdr: [0; 6],
+            protocol: 0,
+            probes: 0,
+            used: now,
+            updated: now,
+            confirmed: now,
+            unconfirmed: true,
+            timer: false,
+        }
+    }
+    /// `__neigh_update` with `lladdr` (or none) to state `new` at `now`:
+    /// whether it is told of, and its error. The flags it is asked for
+    /// come first (`neigh_update_flags`); `NTF_USE` and `NTF_MANAGED` only
+    /// take `NUD_PERMANENT` away; an invalid state is taken as it is; a
+    /// valid one needs an address, given or had while valid (`EINVAL`),
+    /// and without `override_` a new one changes nothing. Last, with
+    /// `override_router`, `NTF_ROUTER` becomes what `router` asks.
+    fn update(
+        &mut self,
+        lladdr: Option<[u8; 6]>,
+        new: u8,
+        f: Update,
+        now: u64,
+    ) -> (bool, Result<(), Errno>) {
+        let old = self.state;
+        let mut told = false;
+        let want = (if f.learned { NTF_EXT_LEARNED } else { 0 })
+            | (if f.managed { NTF_MANAGED } else { 0 })
+            | (if f.validated { NTF_EXT_VALIDATED } else { 0 });
+        for bit in [NTF_EXT_LEARNED, NTF_MANAGED, NTF_EXT_VALIDATED] {
+            if (self.flags ^ want) & bit != 0 {
+                self.flags ^= bit;
+                told = true;
+            }
+        }
+        if f.use_ || f.managed {
+            self.state = old & !NUD_PERMANENT;
+            return (told, Ok(()));
+        }
+        if new & NUD_VALID == 0 {
+            self.timer = false;
+            self.state = new;
+            // An assignment in Linux: what the flags told is lost.
+            told = old & NUD_VALID != 0
+                || (old & (NUD_INCOMPLETE | NUD_PROBE) != 0 && new & NUD_FAILED != 0);
+            return (told, Ok(()));
+        }
+        // Whether the address is a new one, which Linux tells by its
+        // pointer: one given, unless the same as that of a valid state.
+        let fresh = match lladdr {
+            Some(given) => !(old & NUD_VALID != 0 && given == self.lladdr),
+            None if old & NUD_VALID == 0 => {
+                return (
+                    told,
+                    Err(extack::message(
+                        Errno::EINVAL,
+                        "No link layer address given",
+                    )),
+                );
+            }
+            None => false,
+        };
+        if new & NUD_CONNECTED != 0 {
+            self.confirmed = now;
+            self.unconfirmed = false;
+        }
+        let mut router = f.override_router;
+        if old & NUD_VALID != 0 && fresh && !f.override_ {
+            router = false;
+        } else {
+            if new != old || fresh {
+                self.updated = now;
+            }
+            if new != old {
+                self.timer = new & (NUD_REACHABLE | NUD_DELAY | NUD_PROBE) != 0;
+                if new & NUD_PROBE != 0 {
+                    self.probes = 0;
+                }
+                self.state = new;
+                told = true;
+            }
+            if fresh {
+                self.lladdr = lladdr.unwrap_or_default();
+                if new & NUD_CONNECTED == 0 {
+                    self.confirmed = now;
+                    self.unconfirmed = true;
+                }
+                told = true;
+            }
+        }
+        if router && (self.flags & NTF_ROUTER != 0) != f.router {
+            self.flags ^= NTF_ROUTER;
+            told = true;
+        }
+        (told, Ok(()))
+    }
+    /// `neigh_event_send` at `now`, which a request with `NTF_USE` or
+    /// `NTF_MANAGED` makes: it is used; one connected, delaying or probing
+    /// stays so; one stale delays; any other but an incomplete one becomes
+    /// incomplete and sends its first probe (`neigh_probe`), its unicast
+    /// probes (3) and that one counted. Its timer never runs here, so it
+    /// neither probes again nor fails.
+    fn event(&mut self, now: u64) {
+        self.used = now;
+        if self.state & (NUD_CONNECTED | NUD_DELAY | NUD_PROBE) != 0 {
+            return;
+        }
+        if self.state & (NUD_STALE | NUD_INCOMPLETE) == 0 {
+            self.probes = 4;
+            self.state = NUD_INCOMPLETE;
+            self.updated = now;
+            self.timer = true;
+        } else if self.state & NUD_STALE != 0 {
+            self.state = NUD_DELAY;
+            self.updated = now;
+            self.timer = true;
+        }
+    }
 }
 
 /// An IPv4 route a request adds, as `rtm_to_fib_config` reads it.
@@ -638,6 +878,8 @@ pub(crate) struct Addresses {
     pub mctp_routes: Vec<MctpRoute>,
     /// The loopback's neighbours, the oldest first.
     neighbours: Vec<Neighbour>,
+    /// The proxy entries of the namespace, the oldest first.
+    proxies: Vec<Proxy>,
 }
 /// An MCTP route (`struct mctp_route`): a range of endpoint IDs in a
 /// network, either local through the loopback or through a gateway.
@@ -679,6 +921,7 @@ impl Addresses {
             mctp: Vec::new(),
             mctp_routes: Vec::new(),
             neighbours: Vec::new(),
+            proxies: Vec::new(),
         }
     }
     /// A packet goes out through the loopback to `next` at `now`, as
@@ -691,12 +934,194 @@ impl Addresses {
             IpAddr::V6(_) => (next, RTN_LOCAL),
         };
         if !self.neighbours.iter().any(|n| n.ip == ip) {
-            self.neighbours.push(Neighbour {
-                ip,
-                kind,
-                made: now,
-            });
+            let mut neighbour = Neighbour::new(ip, 0, now);
+            neighbour.kind = kind;
+            self.neighbours.push(neighbour);
         }
+    }
+    /// Adds or changes a neighbour of `lo` at `now`, as `neigh_add` does
+    /// once it has found the device and table and checked the key: what is
+    /// told of, and the error. One is looked up by the key asked, which for
+    /// IPv4 finds only `0.0.0.0`'s; `EEXIST` for it with `NLM_F_EXCL`, and
+    /// without `NLM_F_REPLACE` a new address changes nothing. Else
+    /// `NLM_F_CREATE` makes one (`ENOENT` without), and IPv4's is
+    /// `0.0.0.0`'s, which may be there already; `EINVAL` for a permanent
+    /// one `NTF_MANAGED`. `NTF_EXT_VALIDATED` needs a valid state, the
+    /// one it has for `NTF_USE` and `NTF_MANAGED` (`EINVAL`). Then
+    /// [`Neighbour::update`], and for those two, [`Neighbour::event`].
+    pub(crate) fn add_neighbour(
+        &mut self,
+        ask: NeighbourAsk,
+        now: u64,
+    ) -> (Vec<Event>, Result<(), Errno>) {
+        let flags = ask.flags;
+        let using = flags & (NTF_USE | NTF_MANAGED) != 0;
+        let mut f = Update {
+            override_: true,
+            override_router: true,
+            learned: flags & NTF_EXT_LEARNED != 0,
+            router: flags & NTF_ROUTER != 0,
+            managed: flags & NTF_MANAGED != 0,
+            use_: flags & NTF_USE != 0,
+            validated: flags & NTF_EXT_VALIDATED != 0,
+        };
+        let index = if let Some(i) = self.neighbours.iter().position(|n| n.ip == ask.ip) {
+            if ask.request & NLM_F_EXCL != 0 {
+                return (Vec::new(), Err(Errno::EEXIST));
+            }
+            if flags & NTF_EXT_VALIDATED != 0 {
+                let state = if using {
+                    self.neighbours[i].state & !NUD_PERMANENT
+                } else {
+                    ask.state
+                };
+                if state & NUD_VALID == 0 {
+                    return (
+                        Vec::new(),
+                        Err(extack::message(
+                            Errno::EINVAL,
+                            "Cannot mark neighbor as externally validated with an invalid state",
+                        )),
+                    );
+                }
+            }
+            if ask.request & NLM_F_REPLACE == 0 {
+                f.override_ = false;
+                f.override_router = false;
+            }
+            i
+        } else {
+            if ask.request & NLM_F_CREATE == 0 {
+                return (Vec::new(), Err(Errno::ENOENT));
+            }
+            if ask.state & NUD_PERMANENT != 0 && flags & NTF_MANAGED != 0 {
+                return (
+                    Vec::new(),
+                    Err(extack::message(
+                        Errno::EINVAL,
+                        "Invalid NTF_* flag for permanent entry",
+                    )),
+                );
+            }
+            if flags & NTF_EXT_VALIDATED != 0 {
+                let state = if using { 0 } else { ask.state };
+                if state & NUD_VALID == 0 {
+                    return (
+                        Vec::new(),
+                        Err(extack::message(
+                            Errno::EINVAL,
+                            "Cannot create externally validated neighbor with an invalid state",
+                        )),
+                    );
+                }
+            }
+            let ip = match ask.ip {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                ip => ip,
+            };
+            match self.neighbours.iter().position(|n| n.ip == ip) {
+                Some(i) => i,
+                None => {
+                    let kept = flags & (NTF_EXT_LEARNED | NTF_MANAGED | NTF_EXT_VALIDATED);
+                    self.neighbours.push(Neighbour::new(ip, kept, now));
+                    self.neighbours.len() - 1
+                }
+            }
+        };
+        let n = &mut self.neighbours[index];
+        if ask.protocol != 0 {
+            n.protocol = ask.protocol;
+        }
+        let (told, result) = n.update(ask.lladdr, ask.state, f, now);
+        let events = if told {
+            vec![Event::NewNeighbour(*n)]
+        } else {
+            Vec::new()
+        };
+        if result.is_ok() && using {
+            n.event(now);
+        }
+        (events, result)
+    }
+    /// Removes the neighbour of `lo` keyed by `ip`, as `neigh_delete`
+    /// does: `ENOENT` for none (IPv4's only by `0.0.0.0`). It fails first
+    /// (`NUD_FAILED`, told of if it was valid), then goes, told of with
+    /// `RTM_DELNEIGH` (`neigh_remove_one`).
+    pub(crate) fn delete_neighbour(&mut self, ip: IpAddr, now: u64) -> Result<Vec<Event>, Errno> {
+        let Some(index) = self.neighbours.iter().position(|n| n.ip == ip) else {
+            return Err(Errno::ENOENT);
+        };
+        let mut n = self.neighbours.remove(index);
+        let f = Update {
+            override_: true,
+            ..Update::default()
+        };
+        let (told, _) = n.update(None, NUD_FAILED, f, now);
+        let mut events = Vec::new();
+        if told {
+            events.push(Event::NewNeighbour(n));
+        }
+        events.push(Event::DelNeighbour(n));
+        Ok(events)
+    }
+    /// Adds or changes a proxy entry, as `pneigh_create` does: the one of
+    /// `ip` for `lo` or for no device changes, if there is one, else one
+    /// is made, which for IPv6 needs a device (`ENOBUFS`, as
+    /// `pndisc_constructor` refuses). Nothing is told.
+    pub(crate) fn add_proxy(&mut self, new: Proxy) -> Result<(), Errno> {
+        let found = self
+            .proxies
+            .iter()
+            .rposition(|p| p.ip == new.ip && (p.device == new.device || !p.device));
+        match found {
+            Some(i) => {
+                let p = &mut self.proxies[i];
+                p.flags = new.flags;
+                p.permanent = new.permanent;
+                if new.protocol != 0 {
+                    p.protocol = new.protocol;
+                }
+            }
+            None if new.ip.is_ipv6() && !new.device => return Err(ENOBUFS),
+            None => self.proxies.push(new),
+        }
+        Ok(())
+    }
+    /// Removes the proxy entry of `ip` for `lo` (`device`) or for no
+    /// device, which must be the one it has (`pneigh_delete`): `ENOENT`
+    /// for none.
+    pub(crate) fn delete_proxy(&mut self, ip: IpAddr, device: bool) -> Result<(), Errno> {
+        let Some(i) = self
+            .proxies
+            .iter()
+            .position(|p| p.ip == ip && p.device == device)
+        else {
+            return Err(Errno::ENOENT);
+        };
+        self.proxies.remove(i);
+        Ok(())
+    }
+    /// The proxy entries of a family, in the order of their hash's
+    /// buckets, the newest first in each, as `pneigh_dump_table` goes
+    /// through them.
+    pub(crate) fn proxies(&self, v6: bool) -> Vec<Proxy> {
+        let mut proxies: Vec<Proxy> = self
+            .proxies
+            .iter()
+            .rev()
+            .filter(|p| p.ip.is_ipv6() == v6)
+            .copied()
+            .collect();
+        proxies.sort_by_key(Proxy::bucket);
+        proxies
+    }
+    /// The proxy entry `pneigh_lookup` finds for `ip` on `lo` (`device`)
+    /// or no device: the first in its bucket that is for that device or
+    /// for none.
+    pub(crate) fn proxy(&self, ip: IpAddr, device: bool) -> Option<Proxy> {
+        self.proxies(ip.is_ipv6())
+            .into_iter()
+            .find(|p| p.ip == ip && (p.device == device || !p.device))
     }
     /// The loopback's neighbours, the oldest first.
     pub(crate) fn neighbours(&self) -> &[Neighbour] {
@@ -711,7 +1136,13 @@ impl Addresses {
             .drain(..)
             .partition::<Vec<_>, _>(|n| n.ip.is_ipv6() == v6);
         self.neighbours = kept;
-        events.extend(gone.into_iter().rev().map(Event::DelNeighbour));
+        events.extend(gone.into_iter().rev().map(|mut n| {
+            // `neigh_flush_one` stops its timer.
+            n.timer = false;
+            Event::DelNeighbour(n)
+        }));
+        // `pneigh_ifdown`: the proxy entries for the loopback, silently.
+        self.proxies.retain(|p| p.ip.is_ipv6() != v6 || !p.device);
     }
     /// The loopback comes up (`NETDEV_UP`) at `now`, and what Linux tells
     /// of it, in its order: `127.0.0.1/8` if it has it not, with its routes
@@ -1959,6 +2390,7 @@ mod tests {
                 Event::DelAddr6(a) => format!("-addr {}/{}", a.address, a.prefix),
                 Event::NewRoute6(r, flags) => format!("+route {} {flags:#x}", short6(r)),
                 Event::DelRoute6(r) => format!("-route {}", short6(r)),
+                Event::NewNeighbour(n) => format!("+neigh {} {:#x}", n.ip, n.state),
                 Event::DelNeighbour(n) => format!("-neigh {}", n.ip),
             })
             .collect()

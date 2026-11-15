@@ -1495,6 +1495,64 @@ static void nl_address_attribute(unsigned short type, const unsigned char *v, in
    the answer to request `seq` from `port`, whatever datagrams carry them,
    and returns how many came, or -errno. */
 static void nl_neighbour_attribute(unsigned short type, const unsigned char *v, int len);
+/* Whether the neighbour table parameters being shown are a device's
+   (NDTPA_IFINDEX), whose references are the namespace's alone. */
+static int nl_neightbl_device;
+/* An attribute of a neighbour table's parameters (NDTA_PARMS): each
+   value, but the table's own references, which count every namespace's
+   users, and the reachable time, random between half the base and one and
+   a half times it, shown as whether it is in that range. */
+static unsigned long long nl_neightbl_base;
+static void nl_neightbl_parm(unsigned short type, const unsigned char *v, int len) {
+    unsigned long long value = 0;
+    if (len == 4 || len == 8) memcpy(&value, v, len);
+    switch (type) {
+    case 1: nl_neightbl_device = 1; printf(" ifindex=%llu", value); break;
+    case 2:
+        if (nl_neightbl_device) printf(" refcnt=%llu", value);
+        else printf(" refcnt:%d", len);
+        break;
+    case 3: nl_neightbl_base = value; printf(" reachable:%d", len); break;
+    case 4:
+        printf(" base-reachable=%llu reachable-in-range=%d", value,
+               nl_neightbl_base >= value / 2 && nl_neightbl_base < value / 2 + value);
+        break;
+    default: printf(" %u:%d=%llu", type, len, value); break;
+    }
+}
+/* An attribute of RTM_NEWNEIGHTBL: of its configuration (NDTA_CONFIG) the
+   key and entry sizes and the chain and proxy queue, as the rest (its
+   entries, the times since its flush and new hash key, the key and the
+   mask) are every namespace's or random; of its statistics, which count
+   every namespace's, the length alone. */
+static void nl_neightbl_attribute(unsigned short type, const unsigned char *v, int len) {
+    unsigned long long value = 0;
+    if (len == 4 || len == 8) memcpy(&value, v, len);
+    switch (type) {
+    case 1: printf(" name=%.*s", len > 0 ? len - 1 : 0, v); break;
+    case 5:
+        if (len == 32) {
+            unsigned short key, entry;
+            unsigned chain, qlen;
+            memcpy(&key, v, 2);
+            memcpy(&entry, v + 2, 2);
+            memcpy(&chain, v + 24, 4);
+            memcpy(&qlen, v + 28, 4);
+            printf(" config key=%u entry=%u chain-gc=%u proxy-qlen=%u", key, entry, chain, qlen);
+        } else {
+            printf(" config:%d", len);
+        }
+        break;
+    case 6:
+        nl_neightbl_device = 0;
+        printf(" parms{");
+        nl_attributes(v, len, nl_neightbl_parm);
+        printf(" }");
+        break;
+    case 7: printf(" stats:%d", len); break;
+    default: printf(" %u:%d=%llu", type, len, value); break;
+    }
+}
 static long nl_answer(int fd, long seq, unsigned port, const char *label) {
     long messages = 0;
     for (;;) {
@@ -1575,6 +1633,9 @@ static long nl_answer(int fd, long seq, unsigned port, const char *label) {
                 printf(" neigh family=%u index=%d state=%#x flags=%#x type=%u attributes", body[0], index, state,
                        body[10], body[11]);
                 nl_attributes(body + 12, body_len - 12, nl_neighbour_attribute);
+            } else if (h->type == 64 && body_len >= 4) {
+                printf(" neightbl family=%u attributes", body[0]);
+                nl_attributes(body + 4, body_len - 4, nl_neightbl_attribute);
             }
             printf("\n");
         }
@@ -1774,6 +1835,31 @@ static struct nl_body nl_body(unsigned char family, size_t len) {
 static void nl_strict(int fd, unsigned port, unsigned short type, int dump, const struct nl_body *b,
                       const char *label) {
     nl_answer(fd, nl_send(fd, type, NL_F_REQUEST | (dump ? NL_F_DUMP : 0), b->bytes, b->len), port, label);
+}
+static int nl_lines_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+/* nl_strict, its lines printed in sorted order: for a neighbour dump,
+   which Linux gives in the order of its hash table, which a random key
+   sets. */
+static void nl_sorted(int fd, unsigned port, unsigned short type, int dump, const struct nl_body *b, const char *label) {
+    fflush(stdout);
+    int pipes[2], saved = dup(1);
+    if (pipe(pipes) < 0 || saved < 0) return;
+    dup2(pipes[1], 1);
+    close(pipes[1]);
+    nl_strict(fd, port, type, dump, b, label);
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+    static char text[65536];
+    size_t n = 0;
+    for (long got; n < sizeof text - 1 && (got = read(pipes[0], text + n, sizeof text - 1 - n)) > 0;) n += got;
+    close(pipes[0]);
+    text[n] = 0;
+    char *lines[256];
+    int count = 0;
+    for (char *line = strtok(text, "\n"); line && count < 256; line = strtok(NULL, "\n")) lines[count++] = line;
+    qsort(lines, count, sizeof lines[0], nl_lines_cmp);
+    for (int i = 0; i < count; i++) printf("%s\n", lines[i]);
 }
 static int nl_quiet(int fd, unsigned short type, unsigned short flags, const void *request, size_t len);
 /* The netlink-strict case: an MCTP address request `type` on `fd` (at
@@ -2649,9 +2735,9 @@ static void addresses_connect(const char *text, const char *when) {
     close(client), close(listener);
     if (accepted >= 0) close(accepted);
 }
-/* A neighbour message's attribute, for monitor_show: its address, the
-   length of its link-layer address, its probes, and of its cacheinfo the
-   references alone, as its times are the clock's. */
+/* A neighbour message's attribute, for monitor_show: its address, its
+   link-layer address, its probes, its protocol, its extended flags, and
+   of its cacheinfo the references alone, as its times are the clock's. */
 static void nl_neighbour_attribute(unsigned short type, const unsigned char *v, int len) {
     char text[INET6_ADDRSTRLEN] = "";
     unsigned value = 0;
@@ -2661,22 +2747,31 @@ static void nl_neighbour_attribute(unsigned short type, const unsigned char *v, 
         inet_ntop(len == 4 ? AF_INET : AF_INET6, v, text, sizeof text);
         printf(" dst=%s", len == 4 || len == 16 ? text : "?");
         break;
-    case 2: printf(" lladdr:%d", len); break;
+    case 2:
+        printf(" lladdr:%d=", len);
+        for (int i = 0; i < len; i++) printf("%s%02x", i ? ":" : "", v[i]);
+        break;
     case 3:
         if (len == 16) memcpy(&value, v + 12, 4);
         printf(" cacheinfo:%d refcnt=%u", len, value);
         break;
     case 4: printf(" probes=%u", value); break;
+    case 12: printf(" protocol:%d=%u", len, len >= 1 ? v[0] : 0); break;
+    case 15: printf(" flags-ext:%d=%#x", len, value); break;
     default: printf(" %u:%d", type, len); break;
     }
 }
 /* The monitor case: prints what the notifications `fd` has had are, until
    none has come for 700 ms, as Linux tells some of them a little later.
    `ctl` is the port of the socket that asked for the change. */
-static void monitor_show(int fd, unsigned ctl, const char *label) {
+static void monitor_wait(int fd, unsigned ctl, const char *label, int wait);
+static void monitor_show(int fd, unsigned ctl, const char *label) { monitor_wait(fd, ctl, label, 700); }
+/* monitor_show, waiting `wait` ms for each datagram: 0 takes only those
+   already queued, as Linux tells of a neighbour's change as it is made. */
+static void monitor_wait(int fd, unsigned ctl, const char *label, int wait) {
     for (;;) {
         struct pollfd ready = {.fd = fd, .events = POLLIN};
-        if (poll(&ready, 1, 700) <= 0) return;
+        if (poll(&ready, 1, wait) <= 0) return;
         static char buf[16384];
         struct nl_address from = {0};
         socklen_t from_len = sizeof from;
@@ -16641,6 +16736,217 @@ int main(int argc, char **argv) {
             b = nl_body(AF_INET, 8);
             nl_strict(ctl, port, 30, 0, &b, "get short");
 #undef NEIGH_GET
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "neighbour-changes")) {
+        /* A child makes a network namespace and adds neighbours of lo with
+           RTM_NEWNEIGH and removes them with RTM_DELNEIGH, checked as
+           neigh_add and neigh_delete check them, with what RTNLGRP_NEIGH
+           hears of each and dumps of what there is: IPv4's, which a
+           loopback keys by 0.0.0.0 whatever is asked, IPv6's, and proxy
+           entries (NTF_PROXY). Then the RTM_GETNEIGHTBL dumps, and lo up
+           and down, which takes its neighbours and proxy entries. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            /* RTNLGRP_NEIGH (3). */
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x4};
+            printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
+            struct nl_body b;
+            const unsigned short create = 0x400, excl = 0x200, replace = 0x100;
+            const unsigned char mac1[6] = {2, 0, 0, 0, 0, 1}, mac2[6] = {2, 0, 0, 0, 0, 2};
+            unsigned char a4[4], a6[16];
+#define NEIGH_BODY(family, index, state, flags)                                                                 \
+    (b = nl_body(family, 12), memcpy(b.bytes + 4, &(int){index}, 4), memcpy(b.bytes + 8, &(short){state}, 2), \
+     b.bytes[10] = flags)
+#define NEIGH_SEND(type, request, text)                                                     \
+    (printf("%s: error=%d\n", text, nl_quiet(ctl, type, request, b.bytes, b.len)), \
+     monitor_wait(mon, port, text, 0))
+#define NEIGH4(text) (inet_pton(AF_INET, text, a4), nl_put(&b, 1, a4, 4))
+#define NEIGH6(text) (inet_pton(AF_INET6, text, a6), nl_put(&b, 1, a6, 16))
+#define NEIGH_DUMP(family, flags, text) \
+    (b = nl_body(family, 12), b.bytes[10] = flags, nl_strict(ctl, port, 30, 1, &b, text))
+#define NEIGH_SORTED(family, text) (b = nl_body(family, 12), nl_sorted(ctl, port, 30, 1, &b, text))
+            /* IPv4: the key asked for is not the one made. */
+            NEIGH_BODY(AF_INET, 1, 0x80, 0), NEIGH4("10.0.0.1"), nl_put(&b, 2, mac1, 6);
+            NEIGH_SEND(28, 0, "add without create");
+            NEIGH_SEND(28, create, "add 10.0.0.1");
+            NEIGH_DUMP(AF_INET, 0, "dump after add");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0), NEIGH4("0.0.0.0"), nl_put(&b, 2, mac1, 6);
+            NEIGH_SEND(28, create | excl, "add 0.0.0.0 excl");
+            NEIGH_BODY(AF_INET, 1, 0x02, 0), NEIGH4("0.0.0.0"), nl_put(&b, 2, mac2, 6);
+            NEIGH_SEND(28, 0, "other lladdr");
+            NEIGH_SEND(28, replace, "other lladdr replace");
+            NEIGH_BODY(AF_INET, 1, 0x04, 0), NEIGH4("10.0.0.9");
+            NEIGH_SEND(28, create, "stale without lladdr");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0x80), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, 0, "router");
+            NEIGH_SEND(28, replace, "router replace");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0x10), NEIGH4("0.0.0.0"), nl_put(&b, 12, "\3", 1);
+            NEIGH_SEND(28, replace, "learned protocol");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, replace, "unlearned");
+            NEIGH_DUMP(0, 0, "dump changed");
+            NEIGH_BODY(AF_INET, 1, 0x00, 0), NEIGH4("0.0.0.0"), nl_put(&b, 2, mac1, 6);
+            NEIGH_SEND(28, replace, "state none");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, replace, "permanent without lladdr");
+            NEIGH_BODY(AF_INET, 1, 0x40, 0), NEIGH4("0.0.0.0"), nl_put(&b, 2, mac1, 6);
+            NEIGH_SEND(28, replace, "noarp");
+            NEIGH_BODY(AF_INET, 1, 0x40, 1), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, 0, "use");
+            /* What is refused. */
+            NEIGH_BODY(AF_INET, 1, 0x80, 0), NEIGH4("0.0.0.0"), nl_put(&b, 2, mac1, 3);
+            NEIGH_SEND(28, create, "short lladdr");
+            NEIGH_BODY(AF_INET, 0, 0x80, 0), NEIGH4("0.0.0.0"), nl_put(&b, 2, mac1, 3);
+            NEIGH_SEND(28, create, "short lladdr no device");
+            NEIGH_BODY(0, 1, 0x80, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, create, "add unspec");
+            NEIGH_BODY(17, 1, 0x80, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, create, "add packet");
+            NEIGH_BODY(AF_INET, 4096, 0x80, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, create, "add device 4096");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0);
+            NEIGH_SEND(28, create, "add no key");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0), nl_put(&b, 1, "\0\0", 2);
+            NEIGH_SEND(28, create, "add short key");
+            NEIGH_BODY(AF_INET, 0, 0x80, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, create, "add no device");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0), NEIGH4("0.0.0.0"), nl_put32(&b, 15, 2);
+            NEIGH_SEND(28, create, "add reserved flag");
+            NEIGH_BODY(AF_INET, 1, 0x80, 0), NEIGH4("0.0.0.0"), nl_put(&b, 16, "\0\0", 2);
+            NEIGH_SEND(28, create, "add state mask");
+            b = nl_body(AF_INET, 8);
+            NEIGH_SEND(28, create, "add short");
+            /* IPv6: a unicast address of lo is RTN_LOCAL, a multicast one
+               RTN_MULTICAST. */
+            NEIGH_BODY(AF_INET6, 1, 0x80, 0), NEIGH6("2001:db8::1"), nl_put(&b, 2, mac1, 6);
+            NEIGH_SEND(28, create, "add 2001:db8::1");
+            NEIGH_SEND(28, create | excl, "add 2001:db8::1 excl");
+            NEIGH_BODY(AF_INET6, 1, 0x02, 0), NEIGH6("ff02::1"), nl_put(&b, 2, mac2, 6);
+            NEIGH_SEND(28, create, "add ff02::1");
+            NEIGH_BODY(AF_INET6, 1, 0x40, 0), NEIGH6("ff02::2");
+            NEIGH_SEND(28, create, "add ff02::2 noarp");
+            NEIGH_BODY(AF_INET6, 1, 0x80, 0), NEIGH6("2001:db8::3"), nl_put(&b, 2, mac1, 6), nl_put32(&b, 15, 1);
+            NEIGH_SEND(28, create, "add managed permanent");
+            NEIGH_BODY(AF_INET6, 1, 0x80, 0), NEIGH6("2001:db8::3"), nl_put(&b, 2, mac1, 6), nl_put32(&b, 15, 4);
+            NEIGH_SEND(28, create, "add validated");
+            NEIGH_BODY(AF_INET6, 1, 0x00, 0), NEIGH6("2001:db8::3"), nl_put32(&b, 15, 4);
+            NEIGH_SEND(28, create, "add validated none");
+            NEIGH_BODY(AF_INET6, 1, 0x80, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(28, create, "add short key6");
+            NEIGH_SORTED(AF_INET6, "dump inet6");
+            /* Proxy entries: IPv4's with or without a device, IPv6's only
+               with one; listed by their hash's buckets, the newest first in
+               each. */
+            NEIGH_BODY(AF_INET, 0, 0x80, 8), NEIGH4("10.0.0.5");
+            NEIGH_SEND(28, 0, "proxy 10.0.0.5");
+            NEIGH_BODY(AF_INET, 1, 0, 8), NEIGH4("10.0.0.6"), nl_put(&b, 12, "\4", 1);
+            NEIGH_SEND(28, 0, "proxy 10.0.0.6 on lo");
+            NEIGH_BODY(AF_INET, 1, 0, 8), NEIGH4("10.0.0.21");
+            NEIGH_SEND(28, 0, "proxy 10.0.0.21 on lo");
+            NEIGH_BODY(AF_INET, 0, 0, 8), NEIGH4("10.1.0.5");
+            NEIGH_SEND(28, 0, "proxy 10.1.0.5");
+            NEIGH_BODY(AF_INET, 1, 0, 8 | 0x10), NEIGH4("10.0.0.5");
+            NEIGH_SEND(28, 0, "proxy 10.0.0.5 again on lo");
+            NEIGH_BODY(AF_INET, 1, 0, 8), NEIGH4("10.0.0.7"), nl_put32(&b, 15, 1);
+            NEIGH_SEND(28, 0, "proxy managed");
+            NEIGH_BODY(AF_INET6, 0, 0, 8), NEIGH6("2001:db8::5");
+            NEIGH_SEND(28, 0, "proxy6 no device");
+            NEIGH_BODY(AF_INET6, 1, 0, 8), NEIGH6("2001:db8::5");
+            NEIGH_SEND(28, 0, "proxy6 on lo");
+            NEIGH_DUMP(0, 8, "dump proxies");
+            const unsigned char p5[4] = {10, 0, 0, 5}, p6[4] = {10, 0, 0, 6};
+#define NEIGH_GET(family, index, flags, key, len, text)                    \
+    (b = nl_body(family, 12), memcpy(b.bytes + 4, &(int){index}, 4), b.bytes[10] = flags, \
+     nl_put(&b, 1, key, len), nl_strict(ctl, port, 30, 0, &b, text))
+            NEIGH_GET(AF_INET, 0, 8, p5, 4, "get proxy");
+            NEIGH_GET(AF_INET, 1, 8, p5, 4, "get proxy on lo");
+            NEIGH_GET(AF_INET, 0, 8, p6, 4, "get proxy of lo");
+            NEIGH_GET(AF_INET, 1, 0, "\0\0\0\0", 4, "get inet");
+#undef NEIGH_GET
+            /* Removals. */
+            NEIGH_BODY(AF_INET, 0, 0, 8), NEIGH4("10.0.0.6");
+            NEIGH_SEND(29, 0, "delete proxy of lo without device");
+            NEIGH_BODY(AF_INET, 1, 0, 8), NEIGH4("10.0.0.6");
+            NEIGH_SEND(29, 0, "delete proxy of lo");
+            NEIGH_SEND(29, 0, "delete proxy of lo again");
+            NEIGH_BODY(AF_INET, 1, 0, 0), NEIGH4("10.0.0.1");
+            NEIGH_SEND(29, 0, "delete 10.0.0.1");
+            NEIGH_BODY(AF_INET, 0, 0, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(29, 0, "delete no device");
+            NEIGH_BODY(0, 1, 0, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(29, 0, "delete unspec");
+            NEIGH_BODY(AF_INET, 4096, 0, 0), NEIGH4("0.0.0.0");
+            NEIGH_SEND(29, 0, "delete device 4096");
+            NEIGH_BODY(AF_INET, 1, 0, 0);
+            NEIGH_SEND(29, 0, "delete no key");
+            NEIGH_BODY(AF_INET, 1, 0, 0), nl_put(&b, 1, "\0\0", 2);
+            NEIGH_SEND(29, 0, "delete short key");
+            b = nl_body(AF_INET, 8);
+            NEIGH_SEND(29, 0, "delete short");
+            NEIGH_BODY(AF_INET, 1, 0, 0), NEIGH4("0.0.0.0"), nl_put32(&b, 99, 1);
+            NEIGH_SEND(29, 0, "delete 0.0.0.0");
+            NEIGH_SEND(29, 0, "delete 0.0.0.0 again");
+            NEIGH_BODY(AF_INET6, 1, 0, 0), NEIGH6("ff02::1");
+            NEIGH_SEND(29, 0, "delete ff02::1");
+            NEIGH_SORTED(0, "dump after removals");
+            /* The tables, unchecked and then strictly. */
+            for (int strict = 0; strict < 2; strict++) {
+                if (strict) {
+                    int on = 1;
+                    printf("strict=%ld\n", netns_result(setsockopt(ctl, 270, 12, &on, sizeof on)));
+                }
+                const char *p = strict ? "strict " : "";
+                char label[64];
+#define TABLE_DUMP(text) (snprintf(label, sizeof label, "%s%s", p, text), nl_strict(ctl, port, 66, 1, &b, label))
+                b = nl_body(0, 1);
+                TABLE_DUMP("tables family byte");
+                b = nl_body(0, 4);
+                TABLE_DUMP("tables");
+                b = nl_body(AF_INET, 4);
+                TABLE_DUMP("tables inet");
+                b = nl_body(AF_INET6, 4);
+                TABLE_DUMP("tables inet6");
+                b = nl_body(17, 4);
+                TABLE_DUMP("tables packet");
+                b = nl_body(0, 4);
+                b.bytes[1] = 1;
+                TABLE_DUMP("tables padding");
+                b = nl_body(0, 4);
+                nl_put32(&b, 2, 1);
+                TABLE_DUMP("tables attribute");
+#undef TABLE_DUMP
+            }
+            b = nl_body(0, 4);
+            nl_strict(ctl, port, 66, 0, &b, "tables without dump");
+            /* lo up, then down: its neighbours go, and its proxy entries,
+               but not those without a device. */
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            monitor_wait(mon, port, "up", 0);
+            link.flags = 0;
+            printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            monitor_wait(mon, port, "down", 0);
+            NEIGH_DUMP(0, 0, "dump after down");
+            NEIGH_DUMP(0, 8, "dump proxies after down");
+#undef NEIGH_BODY
+#undef NEIGH_SEND
+#undef NEIGH4
+#undef NEIGH6
+#undef NEIGH_DUMP
+#undef NEIGH_SORTED
             fflush(stdout);
             _exit(0);
         }

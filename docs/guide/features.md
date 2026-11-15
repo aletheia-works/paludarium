@@ -2034,15 +2034,18 @@ kernel.
     Before IPv4 has a local table, a socket binds to any IPv4 address, as
     Linux's `inet_addr_type` takes each as broadcast then.
   - **Neighbours:** `RTM_GETNEIGH` dumps the loopback's neighbours (those
-    its traffic makes, as the notifications below tell) as
+    its traffic makes, as the notifications below tell, and those requests
+    add) as
     `neigh_dump_info` does, each an `RTM_NEWNEIGH` like the `RTM_DELNEIGH`
     that tells of it as it goes: ARP's (IPv4's) and then neighbour
     discovery's (IPv6's) for `AF_UNSPEC`, the one family's for `AF_INET`
     or `AF_INET6`, and none for another family. An `ndmsg` whose flags
-    are `NTF_PROXY` asks for the proxy entries, of which there are none.
+    are `NTF_PROXY` asks for the proxy entries instead, in the order of
+    their hash's buckets (`pneigh_hash`), the newest first in each.
     `NDA_IFINDEX` and `NDA_MASTER` narrow a dump, and mark each message
     `NLM_F_DUMP_FILTERED`: `lo`'s index, 1, and a master of -1 (no master)
-    keep the neighbours, and any other shows none. Strictly, as
+    keep the neighbours (and of the proxy entries, `lo`'s alone for the
+    index), and any other shows none. Strictly, as
     `neigh_valid_dump_req` checks, an `ndmsg` that is short or has
     padding, an index, a state, a type or a flag but `NTF_PROXY`, and any
     other attribute, are `EINVAL`; unchecked, a dump whose attributes
@@ -2055,7 +2058,45 @@ kernel.
     another length, no device, or padding, a state, a type or a flag but
     `NTF_PROXY`; `EAFNOSUPPORT` for a family but IPv4's and IPv6's;
     `ENODEV` for another device; and `ENOENT` for a neighbour `lo` has
-    not, and for a proxy entry.
+    not, and for a proxy entry neither for the device asked nor for none.
+  - **Neighbour changes:** `RTM_NEWNEIGH` adds or changes one of `lo`'s
+    neighbours and `RTM_DELNEIGH` removes one, as `neigh_add` and
+    `neigh_delete` do, with `CAP_NET_ADMIN`. They check in Linux's order:
+    `nda_policy`, not strictly, for an addition, and a short `ndmsg`; no
+    `NDA_DST` (`EINVAL`); another device (`ENODEV`), and to add, a
+    link-layer address shorter than `lo`'s six bytes (`EINVAL`); a family
+    but IPv4's and IPv6's (`EAFNOSUPPORT`); a key shorter than the family's
+    (`EINVAL`). IPv4's neighbour of a loopback is keyed by `0.0.0.0`
+    whatever is asked, as `arp_constructor` keys it: a request for another
+    key makes or changes that one with `NLM_F_CREATE` (`ENOENT` without),
+    and removing it is `ENOENT`. An existing one with `NLM_F_EXCL` is
+    `EEXIST`, and without `NLM_F_REPLACE` keeps its link-layer address and
+    `NTF_ROUTER`. A neighbour is made `NUD_NOARP` with `lo`'s address, then
+    changed as `__neigh_update` does: its `NTF_EXT_LEARNED`,
+    `NTF_EXT_MANAGED` and `NTF_EXT_VALIDATED` become the request's; an
+    invalid state is taken as it is and drops the address; a valid one
+    takes the address given, or needs the one it has (`EINVAL`); and each
+    change is told to `RTNLGRP_NEIGH` with the requester's port.
+    `NTF_USE` and `NTF_MANAGED` take away `NUD_PERMANENT` alone, then use
+    it (`neigh_event_send`). A permanent neighbour `NTF_EXT_MANAGED`, and
+    one `NTF_EXT_VALIDATED` in an invalid state, are `EINVAL`. A removal
+    fails the neighbour (`NUD_FAILED`, told of if it was valid), then
+    tells it gone with `RTM_DELNEIGH`. With `NTF_PROXY` a request adds,
+    changes or removes a proxy entry instead, of `lo` or of no device
+    (IPv6's need `lo`, `ENOBUFS`), with the flags and protocol it gives, and
+    tells nothing; `NTF_EXT_MANAGED` or `NTF_EXT_VALIDATED` with it is
+    `EINVAL`. One is found for `lo` or for no device to change, and only
+    for its own device to remove (`ENOENT`). Without `NTF_PROXY`, a request
+    without a device is `EINVAL`. `lo` going down takes its neighbours and
+    proxy entries, as `neigh_ifdown` does, but not those of no device.
+  - **Neighbour tables:** an `RTM_GETNEIGHTBL` dump, as
+    `neightbl_dump_info`, gives each table the family names (ARP's and
+    neighbour discovery's for `AF_UNSPEC`, none for another family) with
+    its name, garbage collection's interval and thresholds, its
+    configuration, statistics and default parameters, then `lo`'s
+    parameters, which count its neighbours' references. Strictly, an
+    `ndtmsg` short, with padding or with attributes after it is `EINVAL`
+    (`neightbl_valid_dump_info`).
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
@@ -2077,7 +2118,8 @@ kernel.
     tentative and then not. An unbound socket hears nothing; the requester
     of an IPv4 address's or a route's change has the notification before
     its acknowledgement, and with `NLM_F_ECHO` as its own copy.
-    `RTNLGRP_NEIGH` hears of the loopback's neighbours as they go: a UDP
+    `RTNLGRP_NEIGH` hears of the loopback's neighbours as requests change
+    them (above) and as they go: a UDP
     datagram through `lo` (and ICMP's port unreachable back from a port
     where nothing listens) and a TCP handshake's first segment (and its
     answer back) make one for the next hop, silently, as

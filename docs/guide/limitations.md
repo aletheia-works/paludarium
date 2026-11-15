@@ -704,11 +704,12 @@ verified.
   of the host's kernel and modules (`ethtool`, `nl80211`, `devlink` and
   others), so a lookup of one is `ENOENT` and a socket has 64 groups
   however many those take. Of `NETLINK_ROUTE` there
-  are only the link, address and route requests and the neighbour dumps
-  and gets: adding and removing neighbours (`RTM_NEWNEIGH`,
-  `RTM_DELNEIGH`), the neighbour tables (`RTM_GETNEIGHTBL`), a bridge's
-  forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`), rules, queueing
-  disciplines and the rest are `EOPNOTSUPP`, as are an input route
+  are only the link, address, route and neighbour requests and the
+  neighbour table dump: setting a neighbour table (`RTM_SETNEIGHTBL`), MCTP's
+  neighbours (an `AF_MCTP` `RTM_NEWNEIGH` or `RTM_DELNEIGH`), a bridge's
+  forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`, `RTM_NEWNEIGH` or
+  `RTM_DELNEIGH`), rules, queueing disciplines and the rest are
+  `EOPNOTSUPP`, as are an input route
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), renaming `lo`
   and setting any other attribute of it. A
   route goes through `lo` or rejects: IPv6 gateways, multipath routes,
@@ -752,13 +753,30 @@ verified.
   Notifications go out for the link, its IPv6 information, addresses,
   routes, neighbours and namespace IDs alone, not for the other groups;
   IPv4's routes through `lo` go without one when it goes down, as on
-  Linux. A neighbour is made by UDP and TCP's handshakes alone, which are
-  the only packets paludarium sends through `lo` (a TCP handshake retried
-  into a full backlog makes none of its answer), and never times out
-  (`gc_thresh1` is never reached). A dump gives a family's neighbours
+  Linux. Traffic makes a neighbour through UDP and TCP's handshakes alone,
+  which are the only packets paludarium sends through `lo` (a TCP handshake
+  retried into a full backlog makes none of its answer), and none times
+  out (`gc_thresh1` is never reached). A dump gives a family's neighbours
   the newest first, where Linux gives them in the order of its hash
-  table, which a random key sets; their cache information counts from
-  when each was made.
+  table, which a random key sets. A neighbour's timer never runs: one
+  reachable never goes stale, one delaying or probing never probes nor
+  becomes reachable or failed, and one `NTF_USE` or `NTF_MANAGED` makes
+  incomplete counts its first probe but never sends another nor fails;
+  `NTF_EXT_MANAGED` ones are not probed from time to time. A neighbour's
+  state and link-layer address change nothing traffic does, where Linux's
+  `lo` holds a packet for one that is not valid until it resolves. Its
+  references count only those of the request and of its timer. An IPv6
+  proxy entry joins no solicited-node group (`pndisc_constructor`), and
+  no request is refused for IPv6 disabled on `lo` (`ndisc_allow_add`). A
+  neighbour table dump gives the tables' defaults, which no sysctl
+  (`net.ipv4.neigh.*`, `net.ipv6.neigh.*`) changes: a reachable time of
+  the base one, where Linux's is random from half to one and a half times
+  it; an entry's size and the queue's length in packets of x86-64's
+  `struct neighbour` and `SKB_TRUESIZE`. A table counts the namespace's
+  neighbours, with statistics of 0, the hash key and mask of a new table,
+  and the times since its flush and new key since the emulator began,
+  where Linux's count every namespace's; its own parameters' references
+  are 1.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
   ID goes when its namespace does, with no `RTM_DELNSID` to tell of it;
   an ID is given only by `RTM_NEWNSID`, as no device of another

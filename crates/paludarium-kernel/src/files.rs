@@ -7408,6 +7408,7 @@ fn status(c: &Context<'_>) -> Vec<u8> {
         tgid: c.process.pid,
         pid: c.process.pid,
         parent,
+        tracer: c.processes.traces.tracer_of(c.tid).unwrap_or(0),
         group_id,
         session,
         space: &space,

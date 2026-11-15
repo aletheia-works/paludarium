@@ -54,7 +54,7 @@ kernel.
 
 | Group | System calls |
 |---|---|
-| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
+| Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `ptrace` (see Threads and processes), `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl`, `modify_ldt` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
@@ -3400,6 +3400,52 @@ one only with an `--allow-net`.
   a process-directed signal in with the new handler. So a SIGCHLD handler
   set after a helper thread began to wait still runs, as Node.js's child
   processes need.
+- `ptrace` traces another task as Linux's `kernel/ptrace.c` does.
+  `PTRACE_TRACEME` makes the thread that forked the caller its tracer;
+  `PTRACE_ATTACH` sends the task `SIGSTOP` from the kernel, and
+  `PTRACE_SEIZE` stops it only at `PTRACE_INTERRUPT`. Both refuse a task of
+  the caller's own process, one already traced or exited, and one the caller
+  may not attach to (`ptrace_may_access` with the real IDs, and Yama's
+  `ptrace_scope` 1), with `EPERM`. Only the tracer thread may make requests,
+  and only of a tracee in a ptrace stop, but for `PTRACE_KILL` and
+  `PTRACE_INTERRUPT` (`ESRCH`).
+- A traced thread stops for its tracer at every signal it takes but
+  `SIGKILL`, ignored ones too, and at a group stop, which a seized task
+  reports as `PTRACE_EVENT_STOP` with its siginfo and one attached otherwise
+  as the stop signal alone. `PTRACE_CONT` resumes it with the signal it
+  stopped for, none or another, which then comes from the tracer
+  (`SI_USER`), or with the siginfo `PTRACE_SETSIGINFO` left; a signal it
+  blocks waits. A tracee resumed from a group stop runs while the group
+  stays stopped. `PTRACE_DETACH` lets it go with a signal, and `PTRACE_KILL`
+  sends its process `SIGKILL`. While traced, a process takes no fatal signal
+  but `SIGKILL` as it is sent: its tracer sees each first.
+- `wait4` and `waitid` report a tracee's ptrace stops to its tracer whatever
+  their options ask for (`CLD_TRAPPED`, the event above the signal in the
+  status), a traced thread without `__WALL` too, and with `__WNOTHREAD` only
+  what the calling thread traces. A parent that traces its child sees its
+  ptrace stops in place of its group stops. A traced thread that exits waits
+  for its tracer, and a process traced by another than its parent exits to
+  its tracer first, then to its parent.
+- While a tracee is stopped, its tracer reads and writes its memory with
+  `PTRACE_PEEKTEXT`/`PTRACE_PEEKDATA` and `PTRACE_POKETEXT`/`PTRACE_POKEDATA`
+  as `FOLL_FORCE` lets it: any mapped page reads, a private one that may not
+  be written takes a copy of its own, and a shared one that may not be
+  written refuses (`EIO`). It reads and writes the registers with
+  `PTRACE_PEEKUSER`/`PTRACE_POKEUSER` (`struct user`), `PTRACE_GETREGS`/
+  `PTRACE_SETREGS`, `PTRACE_GETFPREGS`/`PTRACE_SETFPREGS` and
+  `PTRACE_GETREGSET`/`PTRACE_SETREGSET` with `NT_PRSTATUS` and `NT_PRFPREG`,
+  as Linux's `putreg` takes them (only the flags a tracer may change, a
+  segment base below `TASK_SIZE_MAX`, `EIO` otherwise), and the stop's
+  siginfo with `PTRACE_GETSIGINFO`/`PTRACE_SETSIGINFO` (`EINVAL` for a stop
+  without one). `orig_rax` is the call the tracee stopped after, -1 after
+  anything else, and a call the stop interrupted shows its restart code in
+  `rax` (`-ERESTARTSYS`, `-ERESTARTNOINTR`, `-ERESTARTNOHAND`,
+  `-ERESTART_RESTARTBLOCK`): it runs again unless the tracer changes `rax`
+  or sets `orig_rax` to -1, and another `orig_rax` is the call that runs.
+- After `execve`, a task traced without `PTRACE_SEIZE` gets `SIGTRAP` from
+  itself. A tracer thread's exit lets go of its tracees, killing those that
+  set `PTRACE_O_EXITKILL`. `/proc/<pid>/status` shows `TracerPid`, and a
+  tracee in a ptrace stop is in `t (tracing stop)`.
 
 ## Signals
 

@@ -46,7 +46,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 | 分類 | システムコール |
 |---|---|
-| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
+| プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`ptrace`（スレッドとプロセスを参照）、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl`、`modify_ldt` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
@@ -2977,6 +2977,47 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   待ちなど）スレッドも、プロセスあてのシグナルを新しいハンドラで受け取ります。そのため、補助の
   スレッドが待ち始めた後に設定した SIGCHLD のハンドラも動きます。Node.js の子プロセスにはこれが
   必要です。
+- `ptrace` は Linux の `kernel/ptrace.c` と同じく、ほかのタスクをトレースします。
+  `PTRACE_TRACEME` では、呼び出したタスクを fork したスレッドがトレーサーになります。
+  `PTRACE_ATTACH` はカーネルからそのタスクに `SIGSTOP` を送り、`PTRACE_SEIZE` は
+  `PTRACE_INTERRUPT` のときだけ止めます。どちらも、呼び出したプロセス自身のタスク、すでに
+  トレースされているか終了したタスク、アタッチしてはいけないタスク（実 ID での
+  `ptrace_may_access` と、Yama の `ptrace_scope` 1）を `EPERM` で断ります。要求を出せるのは
+  トレーサーのスレッドだけで、相手が ptrace 停止にあるときだけです（`PTRACE_KILL` と
+  `PTRACE_INTERRUPT` を除き、`ESRCH`）。
+- トレースされたスレッドは、`SIGKILL` 以外の受け取るシグナルごと（無視するものも含む）と、
+  グループ停止でトレーサーのために止まります。グループ停止は、SEIZE したタスクなら siginfo
+  付きの `PTRACE_EVENT_STOP`、それ以外なら停止シグナルだけとして報告します。`PTRACE_CONT` は、
+  止まったシグナル、シグナルなし、別のシグナル（トレーサーからの `SI_USER` になります）、または
+  `PTRACE_SETSIGINFO` が残した siginfo で再開させます。ブロックしているシグナルは待ちます。
+  グループ停止から再開したトレース対象は、グループが止まったままでも動きます。
+  `PTRACE_DETACH` はシグナルを渡して手放し、`PTRACE_KILL` はそのプロセスに `SIGKILL` を
+  送ります。トレース中のプロセスは、`SIGKILL` 以外の致命的なシグナルを送られた時点では受けず、
+  まずトレーサーがそれを見ます。
+- `wait4` と `waitid` は、オプションが何を求めていても、トレース対象の ptrace 停止を
+  トレーサーに報告します（`CLD_TRAPPED`、状態ではシグナルの上にイベント）。トレースされた
+  スレッドは `__WALL` なしでも報告し、`__WNOTHREAD` では呼び出したスレッドがトレースする
+  ものだけです。子をトレースする親は、子のグループ停止の代わりに ptrace 停止を見ます。終了した
+  トレース対象のスレッドはトレーサーの wait を待ち、親以外にトレースされたプロセスの終了は、
+  まずトレーサーに、次に親に伝わります。
+- トレース対象が止まっている間、トレーサーは `PTRACE_PEEKTEXT`／`PTRACE_PEEKDATA` と
+  `PTRACE_POKETEXT`／`PTRACE_POKEDATA` で、`FOLL_FORCE` と同じくそのメモリを読み書きします。
+  マップされたページはどれも読め、書き込めない private のページには自分の写しができ、書き込めない
+  共有のページは断ります（`EIO`）。レジスタは `PTRACE_PEEKUSER`／`PTRACE_POKEUSER`
+  （`struct user`）、`PTRACE_GETREGS`／`PTRACE_SETREGS`、`PTRACE_GETFPREGS`／
+  `PTRACE_SETFPREGS`、`NT_PRSTATUS` と `NT_PRFPREG` の `PTRACE_GETREGSET`／
+  `PTRACE_SETREGSET` で読み書きし、Linux の `putreg` と同じ値を受け付けます（トレーサーが
+  変えてよいフラグだけ、セグメントのベースは `TASK_SIZE_MAX` 未満、それ以外は `EIO`）。停止の
+  siginfo は `PTRACE_GETSIGINFO`／`PTRACE_SETSIGINFO` で扱います（siginfo のない停止では
+  `EINVAL`）。`orig_rax` は止まる直前のシステムコール、それ以外の後では -1 です。停止が
+  割り込んだシステムコールは `rax` に再実行のコード（`-ERESTARTSYS`、`-ERESTARTNOINTR`、
+  `-ERESTARTNOHAND`、`-ERESTART_RESTARTBLOCK`）を見せ、トレーサーが `rax` を変えるか
+  `orig_rax` を -1 にしない限り、もう一度実行します。`orig_rax` を変えると、そのシステム
+  コールが実行されます。
+- `PTRACE_SEIZE` 以外でトレースされたタスクは、`execve` の後に自分から `SIGTRAP` を受けます。
+  トレーサーのスレッドが終了するとトレース対象は手放され、`PTRACE_O_EXITKILL` を設定したものは
+  殺されます。`/proc/<pid>/status` は `TracerPid` を示し、ptrace 停止中のトレース対象は
+  `t (tracing stop)` です。
 
 ## シグナル
 

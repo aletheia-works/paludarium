@@ -383,6 +383,20 @@ verified.
     both kinds are mixed.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
+  - `ptrace` has no system-call stops, events, single-stepping or
+    listening yet: `PTRACE_SYSCALL`, `PTRACE_SYSEMU`, `PTRACE_SINGLESTEP`,
+    `PTRACE_LISTEN`, `PTRACE_PEEKSIGINFO`, `PTRACE_GETSIGMASK`,
+    `PTRACE_SETSIGMASK`, `PTRACE_GET_SYSCALL_INFO` and the other requests
+    the features do not list give `EIO`, and `PTRACE_SETOPTIONS` takes the
+    event options (`PTRACE_O_TRACE*`) without stopping for them.
+    `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
+    checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
+    without XSAVE, which the emulated CPU does not offer. There are no
+    hardware breakpoints: the debug registers read as unused (DR6 as
+    `0xffff0ff0`), and a write to them other than clearing DR7 gives `EIO`.
+    A segment selector a tracer writes is checked but not changed. A
+    restart code a tracer changes into another restart code ends the
+    restart.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.

@@ -330,6 +330,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     通るかが違うことがあります。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
+  - `ptrace` には、まだシステムコール停止、イベント、シングルステップ、LISTEN が
+    ありません。`PTRACE_SYSCALL`、`PTRACE_SYSEMU`、`PTRACE_SINGLESTEP`、
+    `PTRACE_LISTEN`、`PTRACE_PEEKSIGINFO`、`PTRACE_GETSIGMASK`、`PTRACE_SETSIGMASK`、
+    `PTRACE_GET_SYSCALL_INFO` と、機能の一覧にないほかの要求は `EIO` を返し、
+    `PTRACE_SETOPTIONS` はイベントのオプション（`PTRACE_O_TRACE*`）を受け付けますが、
+    そのために止まりません。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
+    ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
+    `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。ハードウェアブレークポイントは
+    なく、デバッグレジスタは未使用として読め（DR6 は `0xffff0ff0`）、DR7 を 0 にする以外の
+    書き込みは `EIO` です。トレーサーが書いたセグメントセレクタは検査しますが、変わりません。
+    トレーサーが再実行のコードを別の再実行のコードに変えると、再実行は止まります。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
     読み込んだページも、触るまでは数えません。

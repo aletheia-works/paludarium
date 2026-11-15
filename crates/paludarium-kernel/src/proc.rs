@@ -579,6 +579,8 @@ pub(crate) struct Status<'a> {
     pub tgid: u32,
     pub pid: u32,
     pub parent: u32,
+    /// The process of the tracer, 0 for none.
+    pub tracer: u32,
     /// The process group and the session, by their IDs in the emulator.
     pub group_id: u32,
     pub session: u32,
@@ -654,7 +656,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         .map_or_else(String::new, |pages| format!("VmLck:\t{:8} kB\n", pages * 4));
     format!(
         "Name:\t{name}\n{umask}State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\n\
-         Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
+         Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
          FDSize:\t{fd_size}\nGroups:\t{groups} \n{numbers}{memory}Threads:\t{}\nSigQ:\t{}/{}\n\
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
          SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
@@ -662,6 +664,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
          NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n\
          voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         s.parent,
+        s.tracer,
         uid(c.uid),
         uid(c.euid),
         uid(c.suid),
@@ -1543,6 +1546,7 @@ mod tests {
             tgid: 3,
             pid: 4,
             parent: 1,
+            tracer: 0,
             group_id: 3,
             session: 2,
             space: &namespaces.pid,

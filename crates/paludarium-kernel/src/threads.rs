@@ -316,6 +316,11 @@ impl ThreadGroup {
     pub(crate) fn set_killed(&self) {
         self.killed.store(true, Ordering::SeqCst);
     }
+    /// Whether a fatal signal was sent to the process ([`Self::set_killed`]):
+    /// for a traced process, only SIGKILL.
+    pub(crate) fn killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
     /// Whether the process is on its way out with nothing left to run, as
     /// Linux's `__task_will_free_mem` asks: a fatal signal was sent to it
     /// ([`Self::fatal_at_send`]) or it has begun to exit, and it is not

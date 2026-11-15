@@ -3113,8 +3113,30 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `-ERESTARTNOHAND`、`-ERESTART_RESTARTBLOCK`）を見せ、トレーサーが `rax` を変えるか
   `orig_rax` を -1 にしない限り、もう一度実行します。`orig_rax` を変えると、そのシステム
   コールが実行されます。
-- `PTRACE_SEIZE` 以外でトレースされたタスクは、`execve` の後に自分から `SIGTRAP` を受けます。
-  トレーサーのスレッドが終了するとトレース対象は手放され、`PTRACE_O_EXITKILL` を設定したものは
+- `PTRACE_SYSCALL` で再開したトレース対象は、システムコールの入口と出口ごとに止まります
+  （`SIGTRAP`、`PTRACE_O_TRACESYSGOOD` があれば `SIGTRAP | 0x80`）。`PTRACE_SYSEMU` では入口だけで
+  止まり、システムコールは実行されません。入口では `rax` が `-ENOSYS`、`orig_rax` がシステム
+  コールで、トレーサーはシステムコールと引数を変えられ、`orig_rax` を -1 にすると、`rax` を
+  残したい値にしたまま実行を飛ばします。出口では `rax` が戻り値で、トレーサーはそれを変え
+  られます。システムコール停止をシグナル付きで再開すると、そのシグナルはカーネルから
+  （`SI_KERNEL`）来ます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
+  同じく停止を示します。入口ではシステムコールと引数、出口では戻り値とエラーかどうか、
+  ほかの停止や `PTRACE_O_TRACESYSGOOD` なしでは命令ポインタとスタックポインタだけです。
+  `PTRACE_SET_SYSCALL_INFO` はシステムコール、引数、戻り値を変えます。種類の違う停止、
+  フラグ、足りないバッファは `EINVAL`、`int` に収まらない番号は `ERANGE` です。
+- `PTRACE_O_TRACEFORK`、`PTRACE_O_TRACEVFORK`、`PTRACE_O_TRACECLONE`、`PTRACE_O_TRACEEXEC`、
+  `PTRACE_O_TRACEVFORKDONE`、`PTRACE_O_TRACEEXIT` のイベントでは、トレース対象はステータスの
+  `SIGTRAP` の上にイベントを載せて止まり、`rax` は `-ENOSYS` です。`PTRACE_GETEVENTMSG` は
+  新しいタスク、`execve` 前のスレッド ID、終了ステータスを返します。トレーサーがイベントを
+  求めている間に `clone`、`fork`、`vfork` が作ったタスク、または `CLONE_PTRACE` 付きで作った
+  タスク（`CLONE_UNTRACED` 付きは除く）は、同じトレーサーに同じオプションでトレースされ、
+  SEIZE なら `PTRACE_EVENT_STOP` で、それ以外は保留中の `SIGSTOP` を持って始まります。
+  システムコール停止は持たずに始まります。`vfork` の親は、子が終了するか別のプログラムを
+  実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
+  `PTRACE_EVENT_EXIT` を報告し、それとともに終わるスレッドは報告しません。
+- `PTRACE_SEIZE` でも `PTRACE_O_TRACEEXEC` でもなくトレースされたタスクは、`execve` の後に
+  自分から `SIGTRAP` を受けます。リーダー以外のスレッドが `execve` すると、その後はリーダーの
+  番号でトレースされます。トレーサーのスレッドが終了するとトレース対象は手放され、`PTRACE_O_EXITKILL` を設定したものは
   殺されます。`/proc/<pid>/status` は `TracerPid` を示し、ptrace 停止中のトレース対象は
   `t (tracing stop)` です。
 

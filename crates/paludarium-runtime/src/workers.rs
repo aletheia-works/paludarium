@@ -191,7 +191,9 @@ impl Execution {
                         thread.cpu.gpr[reg::RAX] = error.to_syscall_return();
                     }
                 }
-                if let Err(error) = kernel.wait_vfork(&self.kill) {
+                // A traced parent reports the new task, and a vfork parent
+                // waits for it.
+                if let Err(error) = kernel.child_started(thread, &self.kill) {
                     thread.cpu.gpr[reg::RAX] = error.to_syscall_return();
                 }
             }

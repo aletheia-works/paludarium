@@ -3561,8 +3561,37 @@ one only with an `--allow-net`.
   `rax` (`-ERESTARTSYS`, `-ERESTARTNOINTR`, `-ERESTARTNOHAND`,
   `-ERESTART_RESTARTBLOCK`): it runs again unless the tracer changes `rax`
   or sets `orig_rax` to -1, and another `orig_rax` is the call that runs.
-- After `execve`, a task traced without `PTRACE_SEIZE` gets `SIGTRAP` from
-  itself. A tracer thread's exit lets go of its tracees, killing those that
+- With `PTRACE_SYSCALL`, a tracee stops at the entry and at the exit of each
+  system call (`SIGTRAP`, or `SIGTRAP | 0x80` with `PTRACE_O_TRACESYSGOOD`),
+  and with `PTRACE_SYSEMU` at the entry only, where the call does not run.
+  At an entry `rax` is `-ENOSYS` and `orig_rax` the call: the tracer may
+  change the call and its arguments, or set `orig_rax` to -1 to skip it,
+  leaving the `rax` it wants; at an exit `rax` has what the call returned,
+  which the tracer may change. A signal the tracer resumes a syscall stop
+  with comes from the kernel (`SI_KERNEL`). `PTRACE_GET_SYSCALL_INFO`
+  describes the stop as Linux's `struct ptrace_syscall_info` does: the call
+  and its arguments at an entry, the return value and whether it is an
+  error at an exit, and only the instruction and stack pointers at another
+  stop or without `PTRACE_O_TRACESYSGOOD`. `PTRACE_SET_SYSCALL_INFO` changes
+  the call, its arguments or the return value, refusing another kind of
+  stop, flags or a short buffer (`EINVAL`) and a number that is not an
+  `int` (`ERANGE`).
+- The events of `PTRACE_O_TRACEFORK`, `PTRACE_O_TRACEVFORK`,
+  `PTRACE_O_TRACECLONE`, `PTRACE_O_TRACEEXEC`, `PTRACE_O_TRACEVFORKDONE` and
+  `PTRACE_O_TRACEEXIT` stop the tracee with the event above `SIGTRAP` in the
+  status, `rax` at `-ENOSYS`, and `PTRACE_GETEVENTMSG` gives the new task,
+  the thread's ID before `execve`, or the exit status. A task a `clone`,
+  `fork` or `vfork` makes while its maker's tracer asks for the event, or
+  with `CLONE_PTRACE` (never with `CLONE_UNTRACED`), is traced by the same
+  tracer with the same options, and starts in `PTRACE_EVENT_STOP` if
+  seized, otherwise with `SIGSTOP` pending; it starts with no syscall stops.
+  A `vfork` parent reports `PTRACE_EVENT_VFORK_DONE` once its child has
+  exited or run another program. The thread that ends its process reports
+  `PTRACE_EVENT_EXIT`; the threads that end with it do not.
+- After `execve`, a task traced without `PTRACE_SEIZE` or
+  `PTRACE_O_TRACEEXEC` gets `SIGTRAP` from itself. A thread other than the
+  leader that runs `execve` is traced by the leader's number after it. A
+  tracer thread's exit lets go of its tracees, killing those that
   set `PTRACE_O_EXITKILL`. `/proc/<pid>/status` shows `TracerPid`, and a
   tracee in a ptrace stop is in `t (tracing stop)`.
 

@@ -397,12 +397,14 @@ verified.
     both kinds are mixed.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
-  - `ptrace` has no system-call stops, events, single-stepping or
-    listening yet: `PTRACE_SYSCALL`, `PTRACE_SYSEMU`, `PTRACE_SINGLESTEP`,
-    `PTRACE_LISTEN`, `PTRACE_PEEKSIGINFO`, `PTRACE_GETSIGMASK`,
-    `PTRACE_SETSIGMASK`, `PTRACE_GET_SYSCALL_INFO` and the other requests
-    the features do not list give `EIO`, and `PTRACE_SETOPTIONS` takes the
-    event options (`PTRACE_O_TRACE*`) without stopping for them.
+  - `ptrace` has no single-stepping or listening yet:
+    `PTRACE_SINGLESTEP`, `PTRACE_SYSEMU_SINGLESTEP`, `PTRACE_LISTEN`,
+    `PTRACE_PEEKSIGINFO`, `PTRACE_GETSIGMASK`, `PTRACE_SETSIGMASK` and the
+    other requests the features do not list give `EIO`, and
+    `PTRACE_O_TRACESECCOMP` is taken without a stop (`SECCOMP_RET_TRACE`
+    gives `ENOSYS`, as with no tracer). A signal a tracer resumes a syscall
+    stop with is taken by the thread that stopped, where Linux sends it to
+    the process. The status `PTRACE_EVENT_EXIT` gives has no core-dump bit.
     `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
     checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
     without XSAVE, which the emulated CPU does not offer. There are no

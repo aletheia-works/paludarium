@@ -2838,6 +2838,14 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
             flags,
         );
     }
+    if let Some(uffd) = crate::userfaultfd::of(&file) {
+        return readv_instance(
+            c,
+            &|c, base, length| crate::userfaultfd::read_guest(c, uffd, base, length),
+            a,
+            flags,
+        );
+    }
     let segments = iovecs(c, a[1], a[2], true)?;
     let total = segments.iter().map(|(_, length)| length).sum::<usize>();
     let position = file.seek(0, 1).ok();
@@ -3038,6 +3046,10 @@ fn read_waiting(
     }
     // So does a fanotify group.
     if let Some(result) = crate::fanotify::read(c, file, b, nowait) {
+        return result;
+    }
+    // And a userfaultfd its faults.
+    if let Some(result) = crate::userfaultfd::read(c, file, b, nowait) {
         return result;
     }
     // A socket's read waits as its SO_RCVLOWAT says. A pipe is a PipeEnd,
@@ -4106,6 +4118,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             {
                 crate::sockets::access_ok_u64(a[1], a[2])?;
                 return crate::fanotify::read_guest(c, group, a[1], len).map(|n| n as u64);
+            }
+            if n == 0
+                && let Some(d) = &d
+                && let Some(uffd) = crate::userfaultfd::of(&d.file)
+            {
+                crate::sockets::access_ok_u64(a[1], a[2])?;
+                return crate::userfaultfd::read_guest(c, uffd, a[1], len).map(|n| n as u64);
             }
             // A fanotify group takes responses to its permission events.
             if n == 1
@@ -6853,6 +6872,9 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     if any.is_some_and(|v| v.is::<crate::fanotify::Group>()) {
         return Ok(b"anon_inode:[fanotify]".to_vec());
     }
+    if any.is_some_and(|v| v.is::<crate::userfaultfd::UserfaultFile>()) {
+        return Ok(b"anon_inode:[userfaultfd]".to_vec());
+    }
     // So is a seccomp listener: "seccomp notify".
     if crate::seccomp::is_listener(&d.file) {
         return Ok(b"anon_inode:seccomp notify".to_vec());
@@ -7228,6 +7250,8 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
         out.extend(instance.fdinfo());
     } else if let Some(group) = crate::fanotify::of(&d.file) {
         out.extend(group.fdinfo(&|device| mount_id(c, device)));
+    } else if let Some(uffd) = crate::userfaultfd::of(&d.file) {
+        out.extend(crate::userfaultfd::fdinfo(uffd));
     } else if let Some(counter) = any.and_then(|a| a.downcast_ref::<crate::events::EventCounter>())
     {
         out.extend(counter.fdinfo());

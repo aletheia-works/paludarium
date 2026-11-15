@@ -1448,8 +1448,6 @@ impl ThreadGroup {
     pub(crate) fn start_stack(&self) -> u64 {
         self.start_stack.load(Ordering::SeqCst)
     }
-    /// Starts a core dump for the fatal signal that ends the process, unless
-    /// the process is already ending.
     /// Whether the process is ending with a core dump ([`Self::begin_core`]).
     pub(crate) fn dumping_core(&self) -> bool {
         self.core
@@ -1457,6 +1455,8 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .is_some()
     }
+    /// Starts a core dump for the fatal signal that ends the process, unless
+    /// the process is already ending.
     pub(crate) fn begin_core(&self, dump: crate::coredump::Dump) {
         let mut core = self.core.lock().unwrap_or_else(PoisonError::into_inner);
         if core.is_none() && self.status().is_none() {

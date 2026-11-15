@@ -140,7 +140,7 @@ impl Emitter<'_, '_> {
                 let v = self.b.ins().ushr_imm_s(v, 8);
                 return self.b.ins().band_imm_s(v, 0xff);
             }
-            _ => unreachable!("forms hold general registers only"),
+            _ => unreachable!("forms hold general or high-byte registers only"),
         };
         let v = self.gpr(index);
         if size == 8 {
@@ -164,7 +164,7 @@ impl Emitter<'_, '_> {
                 self.set_gpr(index & 3, value);
                 return;
             }
-            _ => unreachable!("forms hold general registers only"),
+            _ => unreachable!("forms hold general or high-byte registers only"),
         };
         let value = match size {
             8 => v,

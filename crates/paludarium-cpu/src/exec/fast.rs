@@ -345,7 +345,6 @@ pub enum Fast {
     },
 }
 
-/// A general-purpose register that is not one of the high bytes.
 /// A general register, or one of the high-byte registers ah, ch, dh and bh.
 fn gpr(o: Option<Operand>) -> Option<Register> {
     match o {

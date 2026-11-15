@@ -888,6 +888,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `VM_FAULT_HWPOISON` を返すのと同じく、保護の確認の後、範囲がまだ登録されているか
   どうかにかかわらず、`BUS_MCEERR_AR` と `si_addr_lsb` 12 の SIGBUS を起こします。
   そこへのシステムコールのコピーは `EFAULT`、`MADV_POPULATE_READ` は `EHWPOISON` です。
+  `UFFDIO_COPY` は、Linux の `mfill_atomic_install_pte` がマーカーを受け付けるのと同じく、
+  poison にしたページを代わりに埋め、`UFFDIO_ZEROPAGE` はそこでは `EEXIST` です。
   poison は `mprotect` と `UFFDIO_UNREGISTER` では残り、`mremap` では一緒に動き、
   `fork` した子には、プライベートなメモリでは引き継がれ、共有メモリでは引き継がれず、
   `MADV_DONTNEED`、`MADV_FREE`、`MADV_GUARD_INSTALL`（ガードに置き換わります）、

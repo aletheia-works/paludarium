@@ -988,7 +988,9 @@ kernel.
   `BUS_MCEERR_AR` and `si_addr_lsb` 12, after the protection check and
   whether the range is still registered or not, as Linux's poison marker
   gives `VM_FAULT_HWPOISON`; a system call's copy there is `EFAULT` and
-  `MADV_POPULATE_READ` `EHWPOISON`. The poison stays through `mprotect`
+  `MADV_POPULATE_READ` `EHWPOISON`. A `UFFDIO_COPY` fills a poisoned page
+  in its place, as Linux's `mfill_atomic_install_pte` takes the marker, and
+  a `UFFDIO_ZEROPAGE` is `EEXIST` there. The poison stays through `mprotect`
   and `UFFDIO_UNREGISTER`, moves with `mremap`, goes to a `fork`ed child of
   private memory but not of shared, and goes with `MADV_DONTNEED`,
   `MADV_FREE`, `MADV_GUARD_INSTALL` (whose guard takes its place) and

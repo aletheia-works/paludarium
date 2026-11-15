@@ -8982,6 +8982,91 @@ static int pofd_describe(const char *dir, char *out) {
     }
     return count;
 }
+/* The text after `key` on its line of `path`'s contents, into `out`
+   (empty when there is none): -errno when it cannot be read. */
+static int pofd_field(const char *path, const char *key, char *out, size_t size) {
+    char text[4096];
+    out[0] = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n < 0) return -errno;
+    text[n] = 0;
+    for (char *line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL)
+        if (!strncmp(line, key, strlen(key))) {
+            size_t len = strcspn(line + strlen(key), "\n");
+            if (len >= size) len = size - 1;
+            memcpy(out, line + strlen(key), len);
+            out[len] = 0;
+            break;
+        }
+    return 0;
+}
+/* A process in a root of its own, with a file there it has a POSIX lock
+   on and its /proc/self/status open from before: another process reads
+   the links as paths from its own root (Linux's d_path), /proc/self as
+   that process's directory, and in fdinfo the file's mount and the lock,
+   owned by that process. */
+static int pofd_rooted(void) {
+    char base[] = "/tmp/paludarium-pofr-XXXXXX";
+    if (!mkdtemp(base)) return 86;
+    char inside[64];
+    snprintf(inside, sizeof inside, "%s/file", base);
+    int made = open(inside, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (made < 0 || write(made, "rooted", 6) != 6) return 87;
+    close(made);
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 88;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 89;
+    if (!kid) {
+        char byte = 'r';
+        int status = open("/proc/self/status", O_RDONLY);
+        if (status != 10 && dup2(status, 10) != 10) byte = 's';
+        if (chroot(base) || chdir("/")) byte = 'c';
+        int fd = open("/file", O_RDWR);
+        struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 1, .l_len = 2};
+        if (fd < 0 || (fd != 11 && dup2(fd, 11) != 11) || fcntl(11, F_SETLK, &lock)) byte = 'f';
+        if (write(ready[1], &byte, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte, path[128], link[256], want[256];
+    if (read(ready[0], &byte, 1) != 1) return 90;
+    snprintf(path, sizeof path, "/proc/%d/fd/11", (int)kid);
+    ssize_t n = readlink(path, link, sizeof link - 1);
+    link[n > 0 ? n : 0] = 0;
+    printf("rooted child=%c file link=%d", byte, n > 0 && !strcmp(link, inside));
+    int fd = open(path, O_RDONLY);
+    char text[8] = "";
+    ssize_t got = fd >= 0 ? read(fd, text, 6) : -1;
+    if (fd >= 0) close(fd);
+    printf(" read=%zd %.6s", got, text);
+    snprintf(path, sizeof path, "/proc/%d/fd/10", (int)kid);
+    n = readlink(path, link, sizeof link - 1);
+    link[n > 0 ? n : 0] = 0;
+    snprintf(want, sizeof want, "/proc/%d/status", (int)kid);
+    printf(" status link=%d\n", n > 0 && !strcmp(link, want));
+    /* The same file's mount, as this process's own descriptor of it has. */
+    char theirs[64], ours[64], locked[256];
+    snprintf(path, sizeof path, "/proc/%d/fdinfo/11", (int)kid);
+    int r = pofd_field(path, "mnt_id:", theirs, sizeof theirs);
+    pofd_field(path, "lock:", locked, sizeof locked);
+    int mine = open(inside, O_RDONLY);
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", mine);
+    pofd_field(path, "mnt_id:", ours, sizeof ours);
+    close(mine);
+    snprintf(want, sizeof want, "POSIX  ADVISORY  WRITE %d ", (int)kid);
+    char *at = strchr(locked, ':');
+    printf("rooted fdinfo=%d mnt_id same=%d lock=%d", r, theirs[0] && !strcmp(theirs, ours),
+           at && strstr(at, want) && strstr(at, " 1 2") != NULL);
+    if (write(done[1], "d", 1) != 1) return 91;
+    printf(" status=%d\n", reaped(kid));
+    unlink(inside);
+    rmdir(base);
+    return 0;
+}
 static int proc_other_fds_case(void) {
     char *seen = mmap(NULL, POF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     static char theirs[POF_SIZE];
@@ -9091,7 +9176,7 @@ static int proc_other_fds_case(void) {
     close(file);
     unlink(name);
     munmap(seen, POF_SIZE);
-    return 0;
+    return pofd_rooted();
 }
 
 /* The proc-other-mounts case: another process's mountinfo and mounts, as

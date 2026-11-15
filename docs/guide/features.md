@@ -2444,7 +2444,11 @@ kernel.
   and looked in as its mode (0500) lets the reader, as Linux's
   `proc_fd_permission` decides. `fd` and `fdinfo` are as this process's own
   (below), of the other process's descriptors; a link of `fd` opens its
-  descriptor's file again. What a process shows of
+  descriptor's file again. As on Linux, a link reads as a path from the
+  reader's root (`d_path`), but it is found where the other process opened
+  it: in its root and mount namespace, and a `/proc/self` there is that
+  process's directory. `fdinfo` gives the mount of that process's file and
+  the record locks that process holds. What a process shows of
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for

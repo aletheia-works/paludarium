@@ -198,6 +198,13 @@ fn descriptors_permission(c: &Context<'_>, task: &Task, mask: u32) -> Result<(),
     crate::permissions::permission(&c.process.credentials, &stat, mask)
 }
 /// Descriptor `n` of the task while it is open; none once it has ended.
+/// Whose the task's descriptors are ([`super::Holder`]); `None` once it has
+/// ended.
+pub(super) fn holder(task: &Task) -> Option<super::Holder> {
+    task.live()
+        .then(|| task.public.files.holder(task.pid))
+        .flatten()
+}
 pub(super) fn descriptor(task: &Task, n: u32) -> Option<super::Descriptor> {
     task.live()
         .then(|| task.public.files.descriptor(n))
@@ -346,11 +353,7 @@ pub(super) fn maps(
 /// directory, relative to /proc as Linux's link reads; what a link of
 /// `ns` reads, such as `uts:[4026531838]`; and a link of `fd`, ENOENT
 /// once its descriptor is closed. `None` for any other entry.
-pub(super) fn link(
-    c: &Context<'_>,
-    task: &Task,
-    entry: TaskEntry,
-) -> Option<Result<Vec<u8>, Errno>> {
+pub(super) fn link(task: &Task, entry: TaskEntry) -> Option<Result<Vec<u8>, Errno>> {
     let target = match entry {
         // What the descriptor's file is, as this process's own `fd` names
         // it.
@@ -358,7 +361,7 @@ pub(super) fn link(
             return Some(
                 descriptor(task, n)
                     .ok_or(Errno::ENOENT)
-                    .and_then(|d| super::link_target(c, &d)),
+                    .and_then(|d| super::link_target(&holder(task).ok_or(Errno::ENOENT)?, &d)),
             );
         }
         TaskEntry::ThreadLink => Some(format!("{}/task/{}", task.pid, task.tid).into_bytes()),
@@ -399,7 +402,7 @@ pub(super) fn stat(
         TaskEntry::ThreadLink => crate::proc::self_link_stat(),
         TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Root if follow => {
             check(c, task, entry)?;
-            let target = link(c, task, entry).ok_or(Errno::ENOENT)??;
+            let target = link(task, entry).ok_or(Errno::ENOENT)??;
             let stat = c.files.fs().metadata(&target, true)?;
             return Ok((stat, device(c, &target), BLOCK_SIZE));
         }
@@ -436,9 +439,10 @@ pub(super) fn stat(
             }
             let d = descriptor(task, n).ok_or(Errno::ENOENT)?;
             if follow {
+                let holder = holder(task).ok_or(Errno::ENOENT)?;
                 return Ok((
                     d.file.stat()?,
-                    super::descriptor_device(c, &d),
+                    holder.device(&d),
                     super::descriptor_block_size(c, &d),
                 ));
             }

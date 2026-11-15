@@ -1183,7 +1183,7 @@ impl Kernel {
     /// waits until it has.
     fn ptrace_attach(
         &mut self,
-        thread: &Thread,
+        thread: &mut Thread,
         tid: u32,
         seize: bool,
         addr: u64,
@@ -1235,9 +1235,11 @@ impl Kernel {
             }
             view.group.interrupt_thread(tid);
             // `wait_on_bit(JOBCTL_TRAPPING)`, killable: until it has
-            // stopped for the tracer or gone, or the caller's process ends;
-            // no other signal ends the wait, which would leave the attach
-            // half done.
+            // stopped for the tracer or gone, or a SIGKILL or the end of
+            // its process waits for the caller; no other signal ends the
+            // wait, which would leave the attach half done. Draining the
+            // caller's signals each pass keeps the wait from returning at
+            // once while one is pending.
             loop {
                 let ticket = self.processes.changed().value();
                 let trapping = self
@@ -1249,7 +1251,7 @@ impl Kernel {
                 if !trapping
                     || !view.group.has_member(tid)
                     || view.group.status().is_some()
-                    || self.group.status().is_some()
+                    || self.fatal_pending(thread)
                 {
                     break;
                 }

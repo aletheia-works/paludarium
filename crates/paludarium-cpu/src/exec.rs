@@ -40,7 +40,7 @@ type Result<T> = core::result::Result<T, Stop>;
 
 mod fast;
 pub(crate) use fast::execute as execute_fast;
-pub use fast::{Address, Alu, Fast, Source};
+pub use fast::{Address, Alu, Fast, Shift, Source};
 
 fn atomic_width(size: u8) -> Result<AtomicWidth> {
     match size {

@@ -325,7 +325,7 @@ def self_test():
             good.replace("${{ !cancelled() && needs.quick.result == 'success' && true }}", "true"),
             "b must run if",
         ),
-        (good.replace("!cancelled() && needs.quick", "always() || needs.quick"), "b must run if"),
+        (good.replace("&& true }}", "&& always() }}"), "b must run if"),
         (good.replace("  quick:\n    if: ${{ !cancelled() }}", "  quick:"), "quick must run"),
     ):
         try:

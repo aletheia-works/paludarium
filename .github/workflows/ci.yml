@@ -37,7 +37,8 @@ env:
 
 jobs:
   # Which job groups this pull request's changed files need
-  # (scripts/ci-changes.py); a push to main runs every job.
+  # (scripts/ci-changes.py); a push to main needs every group, so it runs
+  # every job but the pull-request checks of other workflows.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5

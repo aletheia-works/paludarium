@@ -119,6 +119,7 @@ NAMES = {
     98: "getrusage",
     99: "sysinfo",
     100: "times",
+    101: "ptrace",
     102: "getuid",
     103: "syslog",
     104: "getgid",

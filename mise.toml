@@ -155,8 +155,16 @@ run = "python3 -B scripts/syscall-docs.py"
 description = "Check the CLI, JavaScript and Rust pages against the code, the English pages against the Japanese ones, and links to headings (read-only)"
 run = "python3 -B scripts/interface-docs.py"
 
+[tasks."x87:table"]
+description = "Regenerate tests/guests/processes/x87_transcendental.h from its script (with mpmath)"
+run = "uv run --no-project --with mpmath python3 -B tests/guests/processes/x87_transcendental.py > tests/guests/processes/x87_transcendental.h"
+
+[tasks."x87:table:check"]
+description = "Check that tests/guests/processes/x87_transcendental.h is what its script writes (read-only)"
+run = "uv run --no-project --with mpmath python3 -B tests/guests/processes/x87_transcendental.py | diff -u tests/guests/processes/x87_transcendental.h -"
+
 [tasks."lint:all"]
-description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Ruff + Tombi + rumdl + system-call list + documented interfaces"
+description = "Run all formatters/linters (read-only) — Rust + ShellCheck + actionlint + Ruff + Tombi + rumdl + system-call list + documented interfaces + x87 table"
 depends = [
   "rust:check",
   "shell:check",
@@ -166,6 +174,7 @@ depends = [
   "markdown:check",
   "docs:syscalls",
   "docs:interfaces",
+  "x87:table:check",
 ]
 
 [tasks."lint:all:fix"]

@@ -633,6 +633,49 @@ impl Emitter<'_, '_> {
                 }
                 self.set_status(f);
             }
+            Fast::Set { condition, dst } => {
+                let holds = self.condition(condition);
+                let v = self.b.ins().uextend(I64, holds);
+                self.write(dst, v);
+            }
+            Fast::SetStore { condition, mem } => {
+                let holds = self.condition(condition);
+                let v = self.b.ins().uextend(I64, holds);
+                let address = self.linear(&mem);
+                let status = self.store(address, 1, v);
+                self.unless_failed(status, n, rip);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::Cmov {
+                condition,
+                dst,
+                src,
+            } => {
+                let v = self.read(src);
+                let old = self.read(dst);
+                let holds = self.condition(condition);
+                let v = self.b.ins().select(holds, v, old);
+                self.write(dst, v);
+            }
+            Fast::CmovLoad {
+                condition,
+                dst,
+                mem,
+            } => {
+                let address = self.linear(&mem);
+                let (v, status) = self.load(address, dst.size());
+                self.unless_failed(status, n, rip);
+                let v = if dst.size() == 8 {
+                    v
+                } else {
+                    self.b.ins().band_imm_s(v, mask(dst.size()))
+                };
+                let old = self.read(dst);
+                let holds = self.condition(condition);
+                let v = self.b.ins().select(holds, v, old);
+                self.write(dst, v);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::Unary { op, dst } => {
                 let a = self.read(dst);
                 let (r, update, f) = self.unary(op, a, dst.size());

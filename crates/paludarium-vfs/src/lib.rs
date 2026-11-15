@@ -114,6 +114,9 @@ const BLOCK: u64 = 4096;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountPoint {
     pub path: Vec<u8>,
+    /// Where its root is in its file system (`mnt_root`), as mountinfo's
+    /// fourth field shows it: `/` but for a bind mount.
+    pub root: Vec<u8>,
     pub kind: &'static str,
     /// The mount's ID, and its parent's (`mnt_id`, `mnt_parent->mnt_id`).
     pub id: u64,
@@ -138,6 +141,7 @@ impl MountPoint {
     pub fn boot(index: usize, path: Vec<u8>, kind: &'static str) -> Self {
         Self {
             path,
+            root: b"/".to_vec(),
             kind,
             id: 21 + index as u64,
             parent: if index == 0 { 1 } else { 21 },

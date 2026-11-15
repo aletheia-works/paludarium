@@ -2002,7 +2002,7 @@ fn strict_link_header(
 /// A link dump, as `rtnl_dump_ifinfo`: `lo`, as `IFLA_EXT_MASK` asks it.
 /// An `IFLA_MASTER` other than 0 shows only the devices of that master,
 /// which `lo` is not, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
-/// namespace has an ID. Unchecked, a request shorter than an `ifinfomsg`
+/// namespace's links are shown. Unchecked, a request shorter than an `ifinfomsg`
 /// is an old `rtgenmsg`, whose attributes follow its 4 bytes, and none
 /// is taken where one breaks `ifla_policy`, as a failed
 /// `nlmsg_parse_deprecated`; strictly, as `rtnl_valid_dump_ifinfo_req`, it
@@ -2140,7 +2140,7 @@ fn with_flags(mut messages: Vec<Vec<u8>>, flags: u16) -> Vec<Vec<u8>> {
 /// `EINVAL` for an `ifaddrmsg` short or with a prefix length, flags or a
 /// scope, then the family's policy's error (IPv4's for both), and
 /// `EINVAL` for any attribute (`IFA_TARGET_NETNSID` too, as no other
-/// namespace has an ID); an index other than 0 shows that device's
+/// namespace's addresses are shown); an index other than 0 shows that device's
 /// addresses alone, as `NLM_F_DUMP_FILTERED`, which `NLMSG_DONE` carries
 /// too, and is `ENODEV` for another than `lo`'s.
 #[expect(
@@ -2226,7 +2226,7 @@ fn address_dump(
 /// `ifa_ipv6_policy`'s error, with `EINVAL` for an attribute but
 /// `IFA_ADDRESS`, `IFA_LOCAL` and `IFA_TARGET_NETNSID`; unchecked, the
 /// policy's error alone. `IFA_TARGET_NETNSID` is `EINVAL`, as no other
-/// namespace has an ID. The address is `IFA_LOCAL`'s, or else
+/// namespace's addresses are shown. The address is `IFA_LOCAL`'s, or else
 /// `IFA_ADDRESS`'s (`extract_addr`), and `EINVAL` with neither;
 /// `EADDRNOTAVAIL` when `lo` has it not. The index is not checked:
 /// `ipv6_get_ifaddr` looks on any device when none has it.
@@ -5862,7 +5862,7 @@ mod tests {
             dump(&ifinfo(0, 0, &[(IFLA_LINKINFO, &[])]), true),
             Ok(plain.clone())
         );
-        // No namespace has an ID, checked or not.
+        // No other namespace's links are shown, checked or not.
         let netnsid = ifinfo(0, 0, &[(IFLA_TARGET_NETNSID, &1u32.to_le_bytes())]);
         assert_eq!(dump(&netnsid, true), Err(Errno::EINVAL));
         assert_eq!(dump(&netnsid, false), Err(Errno::EINVAL));

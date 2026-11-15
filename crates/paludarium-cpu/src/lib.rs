@@ -34,6 +34,7 @@ mod snapshot_tests;
 mod softfloat;
 mod sse;
 mod state;
+mod wide;
 mod x87;
 
 use paludarium_decoder::{DecodeError, Instruction, decode};

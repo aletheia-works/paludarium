@@ -25,6 +25,8 @@ pub(super) struct Task {
     public: PublicThread,
     /// The state's letter and its name in `status`.
     state: (char, &'static str),
+    /// The process tracing it, 0 for none (`TracerPid`).
+    tracer: u32,
 }
 
 /// The thread of `path`: ENOENT for a process that is not there (reaped,
@@ -56,6 +58,7 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
         _ if view.zombie => ('Z', "Z (zombie)"),
         // A leader that ended before its other threads.
         None => ('Z', "Z (zombie)"),
+        Some(_) if c.processes.traces.in_stop(tid) => ('t', "t (tracing stop)"),
         Some(_) if view.group.is_stopped() => ('T', "T (stopped)"),
         Some((_, in_call)) if in_call && tid != c.tid => ('S', "S (sleeping)"),
         Some(_) => ('R', "R (running)"),
@@ -70,6 +73,7 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
         view,
         public,
         state,
+        tracer: c.processes.traces.tracer_of(tid).unwrap_or(0),
     })
 }
 
@@ -150,13 +154,17 @@ impl Task {
     }
 }
 
-/// Refuses what the reader may not see of the task: `environ`, `exe`,
-/// `cwd` and the links of `ns` (`EACCES`), as Linux's `proc_mem_open`,
-/// `proc_fd_access_allowed` and `proc_ns_get_link` do.
+/// Refuses what the reader may not see of the task: `environ`, `maps`,
+/// `smaps`, `exe`, `cwd` and the links of `ns` (`EACCES`), as Linux's
+/// `proc_mem_open`, `proc_fd_access_allowed` and `proc_ns_get_link` do.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
-        TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Root | TaskEntry::Namespace(_)
+        TaskEntry::Maps(_)
+        | TaskEntry::Exe
+        | TaskEntry::Cwd
+        | TaskEntry::Root
+        | TaskEntry::Namespace(_)
             if !task.may_access(c, false) =>
         {
             Err(Errno::EACCES)
@@ -240,6 +248,7 @@ pub(super) fn content(
             tgid: task.pid,
             pid: task.tid,
             parent: task.view.parent,
+            tracer: task.tracer,
             group_id: task.view.group_id,
             session: task.view.session,
             space: &task.view.space,
@@ -270,6 +279,27 @@ pub(super) fn mounts(task: &Task) -> Option<(Vec<paludarium_vfs::MountPoint>, Ve
         return None;
     }
     task.public.files.mounts()
+}
+
+/// `maps` or `smaps` (`smaps` set) of the task, opened with `flags`, its
+/// files named from the reader's `root` as Linux's `seq_file_path` names
+/// them; empty once it has ended, as Linux's `m_start` finds no `mm`.
+pub(super) fn maps(
+    task: &Task,
+    smaps: bool,
+    flags: u32,
+    root: Vec<u8>,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    match task.memory() {
+        Some(memory) => std::sync::Arc::new(crate::proc::MapsFile::open_as(
+            memory.clone(),
+            task.start_stack(),
+            flags,
+            root,
+            smaps,
+        )),
+        None => std::sync::Arc::new(crate::proc::GeneratedFile::open(Vec::new(), flags)),
+    }
 }
 
 /// Where `exe` or `cwd` leads: the program and the current directory, or
@@ -333,6 +363,8 @@ pub(super) fn stat(
         }
         TaskEntry::Namespace(_) => crate::proc::self_link_stat(),
         TaskEntry::Missing => return Err(Errno::ENOENT),
+        // As Linux's, of size 0, as they are made as they are read.
+        TaskEntry::Maps(_) => crate::proc::stat(0),
         // 0644, which their owner may write.
         TaskEntry::IdMap(_) | TaskEntry::Setgroups => {
             let length = content(task, entry, &c.process.credentials.user).map_or(0, |c| c.len());

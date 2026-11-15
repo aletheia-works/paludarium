@@ -130,6 +130,11 @@ pub struct ThreadGroup {
     /// A SIGKILL was sent to the process, which Linux's `complete_signal`
     /// marks as the whole group's exit (SIGNAL_GROUP_EXIT) as it sends it.
     killed: std::sync::atomic::AtomicBool,
+    /// How many of its threads are traced ([`crate::ptrace`]).
+    traced: AtomicU32,
+    /// The signal of its last group stop (Linux's `group_exit_code` while
+    /// stopped).
+    stop_signal: std::sync::atomic::AtomicI32,
 }
 /// An interval timer of the process's CPU time, as Linux's `cpu_itimer`:
 /// when it expires, in the process's CPU time (0 while it is disarmed), and
@@ -235,6 +240,8 @@ impl Default for ThreadGroup {
             public: Mutex::default(),
             unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
+            traced: AtomicU32::new(0),
+            stop_signal: std::sync::atomic::AtomicI32::new(0),
         }
     }
 }
@@ -274,6 +281,11 @@ impl ThreadGroup {
     pub(crate) fn fatal_at_send(&self, number: i32, thread: Option<u32>) -> bool {
         if number == 9 {
             return true;
+        }
+        // A traced process takes every other signal at its tracer's word
+        // (`complete_signal` asks `!p->ptrace`).
+        if self.traced() {
+            return false;
         }
         // SIGCHLD, SIGCONT, SIGURG and SIGWINCH are ignored by default, and
         // SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU stop; SIGQUIT, SIGILL,
@@ -1497,6 +1509,38 @@ impl ThreadGroup {
     pub(crate) fn job_stop(&self) -> bool {
         !self.stopped.swap(true, Ordering::SeqCst)
     }
+    /// Counts one more traced thread, or one fewer.
+    pub(crate) fn set_traced(&self, traced: bool) {
+        if traced {
+            self.traced.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.traced.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    /// Whether any of its threads is traced.
+    pub(crate) fn traced(&self) -> bool {
+        self.traced.load(Ordering::SeqCst) != 0
+    }
+    /// Records the signal of the group stop that starts.
+    pub(crate) fn set_stop_signal(&self, signal: i32) {
+        self.stop_signal.store(signal, Ordering::SeqCst);
+    }
+    /// The signal of the last group stop.
+    pub(crate) fn stop_signal(&self) -> i32 {
+        self.stop_signal.load(Ordering::SeqCst)
+    }
+    /// Wakes thread `tid` from a wait, as Linux's `signal_wake_up` does
+    /// for a ptrace trap: a call it waits in ends to run again.
+    pub(crate) fn interrupt_thread(&self, tid: u32) {
+        if let Some(inbox) = self
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+        {
+            inbox.interrupt();
+        }
+    }
     pub(crate) fn job_continue(&self) {
         self.stopped.store(false, Ordering::SeqCst);
     }
@@ -1649,6 +1693,13 @@ impl Kernel {
             .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
     }
     pub fn finish_thread(&mut self, thread: &Thread, mem: &AddressSpace) {
+        // Its tracees are let go of, and its tracer told, before it goes.
+        let status = self
+            .group
+            .status()
+            .or(thread.state.exit_status)
+            .unwrap_or(ExitStatus::Exited(0));
+        self.ptrace_exit(thread, status);
         // The last task to let go of the table closes its files
         // (`put_files_struct`), each close dropping that task's process's
         // message queue registrations (`mqueue_flush_file`).

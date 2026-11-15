@@ -5,14 +5,13 @@ verified.
 
 ## Not supported
 
-- **Part of x87, for now**: the transcendental instructions (`FSIN`, `FCOS`,
-  `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`, `FYL2XP1`) and packed decimals
-  (`FBLD`, `FBSTP`) are not implemented yet, so a program stops with `SIGILL`
-  where it reaches one. An x87 exception always takes its masked response: an
-  unmasked one sets the status word's summary and does not raise `SIGFPE`. The
-  16-bit forms of `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not
-  implemented either. `FISTTP` belongs to SSE3, which `CPUID` does not report,
-  and is not implemented. Where `FPREM` and `FPREM1` stop on the way when their
+- **Part of x87, for now**: packed decimals (`FBLD`, `FBSTP`) are not
+  implemented yet, so a program stops with `SIGILL` where it reaches one. An
+  x87 exception always takes its masked response: an unmasked one sets the
+  status word's summary and does not raise `SIGFPE`. The 16-bit forms of
+  `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not implemented either.
+  `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
+  implemented. Where `FPREM` and `FPREM1` stop on the way when their
   operands are far apart is each CPU's choice: the final remainder is the same.
 - **A dynamically linked program's files, unless given**: a program runs with
   its interpreter as on Linux, on musl's dynamic linker or glibc's. A session
@@ -21,6 +20,21 @@ verified.
 - **32-bit x86, AVX, AVX-512, MMX**: out of scope. `CPUID` reports MMX because
   glibc requires it, but its instructions stop with `SIGILL`, as do the SSE and
   SSE2 ones that use MMX registers (`CVTPI2PS`, `MOVQ2DQ`, `PSHUFW` and the like).
+- **The last bit of x87's transcendental instructions**: `FSIN`, `FCOS`,
+  `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X` and `FYL2XP1` give the correctly
+  rounded result of what Intel's and AMD's CPUs compute (the four that take an
+  angle take multiples of π/2 away as π/2 cut to 66 bits, as both do). A real
+  CPU's result is within one unit in the last place of that, and differs from
+  it in a few values in a hundred, Intel's more often than AMD's, which differ
+  from each other too; C1 then goes by the CPU's own result. Where the result of
+  a tiny value is that value, Intel's CPUs give it as it is in every rounding
+  mode, and the emulator and AMD's round it. `FSINCOS` sets C1 by the sine, as
+  AMD's CPUs do (Intel's go by the cosine). So the `long double` functions of
+  glibc and musl that use these (`expl`, `logl`, `atan2l` and the like) can
+  differ from a real CPU's in their last bit or two. Where the manuals leave the
+  result undefined, the emulator does as both CPUs: `F2XM1` leaves a value
+  beyond ±1 as it is, and `FYL2XP1` a value where 1 + x is not positive. The
+  tests compare every bit where the CPUs agree, and that bound elsewhere.
 - **The exact results of `RCPPS`, `RCPSS`, `RSQRTPS` and `RSQRTSS`**: x86 only
   bounds their error (1.5 × 2⁻¹²), and each CPU answers from its own table. The
   emulator computes them by floating-point division (after a square root for
@@ -35,8 +49,8 @@ verified.
   VMA has its full size from the start, where Linux's grows as it is used. A
   program's own segments and its interpreter's are named by the path it was
   started by, never marked `(deleted)`, where Linux follows a rename and resolves
-  symbolic links. `/proc/<pid>/maps` and `smaps` of another process,
-  `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`) do not exist.
+  symbolic links. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
+  do not exist.
 - **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
   page entries. `Referenced` is every page counted, a page that `fork`
   shares counts as shared (and half of it in `Pss`) even after the other
@@ -55,7 +69,7 @@ verified.
   (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
   the reader's own directory (`auxv`, `limits`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `fd`, `maps`,
+  process's directory they are `ENOENT`, where Linux shows root `fd`,
   `statm` and the rest. In `stat`, page faults, resident memory, the start
   time and the code range are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
@@ -383,6 +397,20 @@ verified.
     both kinds are mixed.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
+  - `ptrace` has no system-call stops, events, single-stepping or
+    listening yet: `PTRACE_SYSCALL`, `PTRACE_SYSEMU`, `PTRACE_SINGLESTEP`,
+    `PTRACE_LISTEN`, `PTRACE_PEEKSIGINFO`, `PTRACE_GETSIGMASK`,
+    `PTRACE_SETSIGMASK`, `PTRACE_GET_SYSCALL_INFO` and the other requests
+    the features do not list give `EIO`, and `PTRACE_SETOPTIONS` takes the
+    event options (`PTRACE_O_TRACE*`) without stopping for them.
+    `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
+    checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
+    without XSAVE, which the emulated CPU does not offer. There are no
+    hardware breakpoints: the debug registers read as unused (DR6 as
+    `0xffff0ff0`), and a write to them other than clearing DR7 gives `EIO`.
+    A segment selector a tracer writes is checked but not changed. A
+    restart code a tracer changes into another restart code ends the
+    restart.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
@@ -659,8 +687,7 @@ verified.
   `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the
   cached route, so that later lookups through it are marked too.
   Notifications go out for the link, its IPv6 information, addresses,
-  routes and neighbours alone, not for the other groups, nor to a socket
-  in another namespace (`NETLINK_LISTEN_ALL_NSID` is not supported);
+  routes, neighbours and namespace IDs alone, not for the other groups;
   IPv4's routes through `lo` go without one when it goes down, as on
   Linux. A neighbour is made by UDP and TCP's handshakes alone, which are
   the only packets paludarium sends through `lo` (a TCP handshake retried
@@ -668,8 +695,14 @@ verified.
   (`gc_thresh1` is never reached); neighbours are not dumped
   (`RTM_GETNEIGH` is `EOPNOTSUPP`), and their cache information counts
   from when each was made.
-  `NETLINK_LISTEN_ALL_NSID` and the other options not listed in the
-  features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
+  The options not listed in the features are `ENOPROTOOPT`. A namespace
+  ID goes when its namespace does, with no `RTM_DELNSID` to tell of it;
+  an ID is given only by `RTM_NEWNSID`, as no device of another
+  namespace makes Linux's `peernet2id_alloc` give one; a request sent by
+  `write` rather than `send` names no process or descriptor (`ESRCH`,
+  `EBADF`), as no caller is known there; and `IFLA_TARGET_NETNSID` and
+  `IFA_TARGET_NETNSID` are `EINVAL` even for an ID a namespace has, as
+  no other namespace's links or addresses are dumped. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps

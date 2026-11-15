@@ -13,6 +13,11 @@ CI run produces them afresh on an x86-64 Linux runner.
   for byte.
 - Flags and values that x86 leaves undefined (AF after logic instructions,
   the flags after `div`, …) are skipped, following a per-instruction table.
+- Where x86 only bounds a result and Intel's and AMD's CPUs differ in it
+  (`RCPPS` and the like, and the last bit of x87's transcendental
+  instructions), a case prints whether the result is within that bound of a
+  reference, which each CPU's is, rather than its bits; it still prints every
+  bit where the CPUs agree. Limitations names each such place.
 - Values that change from run to run, such as pids, times, random numbers and
   addresses, are normalised or excluded before the comparison.
 - New instructions and system calls get their test cases, and the result on
@@ -149,7 +154,24 @@ every test passing.
 ## Coverage and static checks
 
 - Line coverage must stay at 80 % or more. The measurement before the first
-  release was about 94 % for the whole workspace.
+  release was about 94 % for the whole workspace. The `coverage` job of
+  `ci.yml` holds five gates to that floor, each counting only its own tests:
+  the whole workspace; the core packages, with the harness's tests run but
+  its own files left out; the Rust crates the WebAssembly build uses; the
+  crates behind the terminal; and the CPU and decoder under the encodings
+  tests.
+- The core and workspace gates share one instrumented build and one run of
+  each test. The core packages' and the harness's tests run first and the
+  core gate reports on their profiles; the other packages' tests then add
+  theirs and the workspace gate reports on all of them. Cargo builds the
+  same units for the two runs as for one run of the whole workspace, so both
+  numbers are the ones separate runs give. The other three gates each clean
+  and run their own tests, as a report counts every test binary in the
+  target directory; before the terminal gate the job removes the test
+  binaries of the packages outside the core gate, so it starts from what the
+  core run left, as it did when that run came last. The copy of this job in
+  `quality.yml` (nightly and before a release) still runs the two gates
+  separately, with the same numbers.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)
@@ -166,6 +188,18 @@ every test passing.
 | Every day | every scheduled workflow is checked to have started on time; one that failed to start, did not run or was disabled opens an Issue |
 | Every week | the pinned nightly Rust, the workspace's `rust-version` (the latest stable Rust) and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
 | Before a release | all of the above on the exact code being released (below) |
+
+On a pull request and on a push to main, the expensive jobs — the
+differential tests, coverage, fuzzing, the guest programs and the
+WebAssembly checks — start only after the quick stage passed: lint, clippy
+(also with the stable Rust), polyglot lint and the Linux unit tests, which
+take about two minutes. A head that fails them, or that a later push
+supersedes in those minutes, takes no runners for the long jobs. `ci-ok`,
+the required check, needs every job itself, so a job skipped because the
+quick stage failed cannot make it pass; `scripts/ci-changes.py --self-test`
+refuses a `ci.yml` where it does not. Dependency Review runs only on pull
+requests that change a Cargo or npm manifest or lockfile, a workflow or a
+local action.
 
 Before a guest program is built, its dependencies must pass `cargo deny`
 under the root policy. Only aube has exceptions: the licenses of two crates

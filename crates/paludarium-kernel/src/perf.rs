@@ -268,7 +268,8 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
         regs(attr.sample_regs_user)?;
     }
     if attr.sample_type & SAMPLE_STACK_USER != 0
-        && (attr.sample_stack_user >= u32::from(u16::MAX) || attr.sample_stack_user % 8 != 0)
+        && (attr.sample_stack_user >= u32::from(u16::MAX)
+            || !attr.sample_stack_user.is_multiple_of(8))
     {
         return Err(Errno::EINVAL);
     }

@@ -294,6 +294,7 @@ impl SyscallTable {
         handlers.insert(300, crate::fanotify::sys_fanotify_init);
         handlers.insert(298, crate::perf::sys_perf_event_open);
         handlers.insert(301, crate::fanotify::sys_fanotify_mark);
+        handlers.insert(323, crate::userfaultfd::sys_userfaultfd);
         handlers.insert(254, crate::inotify::sys_inotify_add_watch);
         handlers.insert(255, crate::inotify::sys_inotify_rm_watch);
         handlers.insert(294, crate::inotify::sys_inotify_init1);
@@ -3669,6 +3670,10 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
         // A fanotify group's.
         if let Some(result) = crate::fanotify::ioctl(c, &file, a[1], a[2]) {
+            return result;
+        }
+        // A userfaultfd's.
+        if let Some(result) = crate::userfaultfd::ioctl(c, &file, a[1], a[2]) {
             return result;
         }
         // A perf event's.

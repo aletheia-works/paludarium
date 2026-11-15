@@ -271,6 +271,7 @@
     {"name":"shm","binary":"process"},
     {"name":"sem","binary":"process"},
     {"name":"msg","binary":"process"},
+    {"name":"sysvipc-proc","binary":"process"},
     {"name":"rseq","binary":"process"},
     {"name":"pkey","binary":"process"},
     {"name":"vector-flags","binary":"process"},

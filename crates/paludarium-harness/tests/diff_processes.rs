@@ -129,9 +129,10 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
-            // its own, for its counts), the fanotify cases, whose groups and
+            // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
+            // for its IDs and PIDs), the fanotify cases, whose groups and
             // marks need CAP_SYS_ADMIN, the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
@@ -164,6 +165,7 @@ mod linux {
                     | "pid-set-tid"
                     | "net-namespaces"
                     | "msg"
+                    | "sysvipc-proc"
                     | "mqueue-calls"
                     | "mqueue-limits"
                     | "mqueue-wait"
@@ -592,6 +594,7 @@ mod linux {
         processes_shm => ("shm","process"),
         processes_sem => ("sem","process"),
         processes_msg => ("msg","process"),
+        processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),
         processes_vector_flags => ("vector-flags","process"),

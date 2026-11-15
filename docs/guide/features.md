@@ -2279,7 +2279,7 @@ kernel.
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
-  `/proc/stat` and `/proc/uptime` (below), `/proc/sys` with only
+  `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs/mqueue` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
@@ -2429,6 +2429,24 @@ kernel.
   the monotonic one in seconds, so `ps` finds the boot time; `processes`, the
   IDs handed out; `procs_running 1`, `procs_blocked 0`; and a `softirq` line
   of zeros.
+- `/proc/sysvipc` holds `msg`, `sem` and `shm`, listed in that order, each in
+  the format of Linux's `sysvipc_*_proc_show` on a 64-bit kernel.
+  - Each is a header, then a line for each queue, set or segment of the
+    reader's IPC namespace, by index.
+  - A line shows the key, ID and mode, with `SHM_DEST` and `SHM_LOCKED`
+    for a segment.
+  - It also shows the counts, the PIDs in the reader's PID namespace (0
+    for one it cannot see), the owner and creator in the reader's user
+    namespace, and the times.
+  - A segment's line adds the bytes of its pages in memory, and 0 swapped.
+  - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
+    once their process is gone, as the object keeps its `struct pid`.
+- These system files (`loadavg`, `meminfo`, `stat`, `uptime` and
+  `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
+  read goes on to the end of what they hold.
+- Root may open these system files for writing, but a write gives `EIO`,
+  as Linux's `pde_write` gives for a file without a write operation. A
+  process's own files give `EINVAL`.
 - `/proc/self/maps` lists the VMAs in Linux's format, with adjacent mappings
   merged and split as Linux does: the range, the protection, `s` or `p`, the
   offset in the file, the file's device and inode as `stat` gives them, and

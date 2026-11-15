@@ -1680,6 +1680,7 @@ fn directory_entries(
         {
             crate::sysctl::entries(directory)
         }
+        _ if crate::proc::is_sysvipc(&d.path) => crate::proc::sysvipc_entries(),
         _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
         Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c, false),
         Some(crate::proc::OwnEntry::DescriptorInfos) => descriptor_entries(c, true),
@@ -1864,14 +1865,16 @@ fn positioned(
     }
     Ok(file)
 }
-/// Where reads of a regular file stop: at its size, but for `maps`, which
-/// and `smaps`, which say 0 as Linux's /proc does and end where their
-/// `read` does.
+/// Where reads of a regular file stop: at its size, but for `maps` and
+/// `smaps`, and /proc's system-wide files, which say 0 as Linux's /proc
+/// does and end where their `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
-    if file
-        .as_any()
-        .is_some_and(|file| file.is::<crate::proc::MapsFile>())
-    {
+    if file.as_any().is_some_and(|file| {
+        file.is::<crate::proc::MapsFile>()
+            || file
+                .downcast_ref::<crate::proc::GeneratedFile>()
+                .is_some_and(crate::proc::GeneratedFile::is_entry)
+    }) {
         u64::MAX
     } else {
         metadata.size
@@ -6112,8 +6115,15 @@ fn open_path(
         }
     } else if let Some(entry) = crate::sysctl::entry(p) {
         crate::sysctl::open(c, entry, flags)?
+    } else if crate::proc::below_system_entry(p) {
+        return Err(Errno::ENOTDIR);
+    } else if crate::proc::is_sysvipc(p) {
+        if flags & 3 != 0 {
+            return Err(Errno::EISDIR);
+        }
+        Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
     } else if let Some(entry) = crate::proc::system_entry(p) {
-        Arc::new(crate::proc::GeneratedFile::open(
+        Arc::new(crate::proc::GeneratedFile::open_entry(
             system_file(c, entry),
             flags,
         ))
@@ -6991,6 +7001,7 @@ fn known_stat(
             device(c, path),
             BLOCK_SIZE,
         ))),
+        None if crate::proc::below_system_entry(path) => Err(Errno::ENOTDIR),
         None => Ok(other_generated_stat(c, path, follow)),
     }
 }
@@ -7020,9 +7031,15 @@ fn other_generated_stat(
             SMALL_BLOCK_SIZE,
         ));
     }
-    if let Some(entry) = crate::proc::system_entry(path) {
-        let length = system_file(c, entry).len();
-        return Some((crate::proc::stat(length), device(c, path), SMALL_BLOCK_SIZE));
+    if crate::proc::is_sysvipc(path) {
+        return Some((
+            crate::proc::directory_stat(),
+            device(c, path),
+            SMALL_BLOCK_SIZE,
+        ));
+    }
+    if crate::proc::system_entry(path).is_some() {
+        return Some((crate::proc::entry_stat(), device(c, path), SMALL_BLOCK_SIZE));
     }
     if tasks::is_root(path) {
         return Some((
@@ -7259,7 +7276,8 @@ fn epoll_fdinfo(c: &Context<'_>, epoll: &crate::epoll::EpollInstance) -> Vec<u8>
     }
     out
 }
-/// The contents of a system-wide /proc file, from what `sysinfo` reports.
+/// The contents of a system-wide /proc file: from what `sysinfo` reports,
+/// or the caller's IPC namespace's objects for `/proc/sysvipc`.
 fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
     match entry {
         crate::proc::SystemEntry::Loadavg => {
@@ -7286,6 +7304,9 @@ fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
                 .clock(paludarium_host::ClockId::Monotonic)
                 .unwrap_or(0),
         ),
+        crate::proc::SystemEntry::SysvipcMsg => crate::msg::proc_file(c),
+        crate::proc::SystemEntry::SysvipcSem => crate::sem::proc_file(c),
+        crate::proc::SystemEntry::SysvipcShm => crate::shm::proc_file(c),
     }
 }
 /// `mknod` and `mknodat`, as Linux's `do_mknodat`: a regular file (type 0

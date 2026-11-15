@@ -12157,6 +12157,165 @@ static void msgx_status(const char *label, int id, pid_t sender, pid_t receiver)
     printf("%s: stat=%ld mode=%o cbytes=%lu qnum=%lu qbytes=%lu lspid=%d lrpid=%d\n", label, r, mode, cbytes,
            qnum, qbytes, lspid == sender, lrpid == receiver);
 }
+/* The sysvipc-proc case: /proc/sysvipc's files, read whole. Each line
+   is printed as it is, but for its times, whose digits become T: the
+   case runs in an IPC and a PID namespace of its own, so its IDs, keys
+   and PIDs are the same each run. */
+static void sysvipc_show(const char *label, const char *name, const int *times) {
+    char path[64], line[512];
+    snprintf(path, sizeof path, "/proc/sysvipc/%s", name);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("%s %s: open errno=%d\n", label, name, errno);
+        return;
+    }
+    for (int row = 0; fgets(line, sizeof line, f); row++) {
+        /* Fields by number from 0, after the header. */
+        for (int field = 0, at = 0, n = (int)strlen(line); row > 0 && at < n; field++) {
+            while (at < n && (line[at] == ' ' || line[at] == '\n')) at++;
+            int start = at;
+            while (at < n && line[at] != ' ' && line[at] != '\n') at++;
+            for (const int *t = times; *t >= 0; t++)
+                if (*t == field && !(at - start == 1 && line[start] == '0'))
+                    memset(line + start, 'T', at - start);
+        }
+        printf("%s %s: %s", label, name, line);
+    }
+    fclose(f);
+}
+static const int sysvipc_shm_times[] = {11, 12, 13, -1};
+static const int sysvipc_sem_times[] = {8, 9, -1};
+static const int sysvipc_msg_times[] = {11, 12, 13, -1};
+static void sysvipc_all(const char *label) {
+    sysvipc_show(label, "shm", sysvipc_shm_times);
+    sysvipc_show(label, "sem", sysvipc_sem_times);
+    sysvipc_show(label, "msg", sysvipc_msg_times);
+}
+/* The work of the case, as PID 1 of its PID namespace. */
+static int sysvipc_work(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    sysvipc_all("empty");
+    /* The directory, its files and /proc's entry for it. */
+    DIR *d = opendir("/proc/sysvipc");
+    printf("opendir=%d", d != NULL);
+    struct dirent *e;
+    while (d && (e = readdir(d))) printf(" %s:%d", e->d_name, e->d_type);
+    if (d) closedir(d);
+    printf("\n");
+    struct stat st = {0};
+    int r = stat("/proc/sysvipc", &st);
+    printf("dir stat=%d mode=%o\n", r, st.st_mode);
+    r = stat("/proc/sysvipc/shm", &st);
+    printf("file stat=%d mode=%o uid=%d size=%ld\n", r, st.st_mode, st.st_uid, (long)st.st_size);
+    /* Size 0, as /proc's other files of the system, open or not. */
+    const char *sized[] = {"/proc/sysvipc/msg", "/proc/loadavg", "/proc/meminfo"};
+    for (int i = 0; i < 3; i++) {
+        int fd = open(sized[i], O_RDONLY);
+        struct stat open_st = {0};
+        r = stat(sized[i], &st);
+        int f = fstat(fd, &open_st);
+        char text[4096];
+        long n = read(fd, text, sizeof text);
+        printf("%s stat=%d size=%ld fstat=%d size=%ld read-some=%d\n", sized[i], r, (long)st.st_size, f,
+               (long)open_st.st_size, n > 0);
+        close(fd);
+    }
+    errno = 0;
+    r = stat("/proc/sysvipc/other", &st);
+    printf("missing stat=%d errno=%d\n", r, errno);
+    /* On past one of the files, as past any file. */
+    const char *past[] = {"/proc/sysvipc/msg/", "/proc/sysvipc/shm/x", "/proc/loadavg/"};
+    for (int i = 0; i < 3; i++) {
+        errno = 0;
+        r = stat(past[i], &st);
+        int stat_errno = errno;
+        errno = 0;
+        int fd = open(past[i], O_RDONLY);
+        printf("past %s stat=%d errno=%d open=%d errno=%d\n", past[i], r, stat_errno, fd, errno);
+        if (fd >= 0) close(fd);
+    }
+    int listed = 0;
+    d = opendir("/proc");
+    while (d && (e = readdir(d))) listed += !strcmp(e->d_name, "sysvipc") && e->d_type == DT_DIR;
+    if (d) closedir(d);
+    printf("in /proc=%d\n", listed);
+    /* Root opens them for writing, but they have no write operation, as
+       /proc's other files of the system (pde_write's EIO). */
+    const char *written[] = {"/proc/sysvipc/msg", "/proc/loadavg"};
+    for (int i = 0; i < 2; i++) {
+        int w = open(written[i], O_WRONLY);
+        errno = 0;
+        long wrote = w < 0 ? -1 : write(w, "x", 1);
+        printf("write %s open=%d write=%ld errno=%d\n", written[i], w >= 0, wrote, errno);
+        if (w >= 0) close(w);
+    }
+    errno = 0;
+    r = open("/proc/sysvipc", O_WRONLY);
+    printf("open dir write=%d errno=%d\n", r, errno);
+
+    /* A keyed segment with two pages written, and a private one. */
+    int shm = (int)syscall(SYS_shmget, 0x1234, 5000, SHMX_CREAT | 0640);
+    int other = (int)syscall(SYS_shmget, 0, 100, SHMX_CREAT | 0600);
+    char *a = (char *)syscall(SYS_shmat, shm, 0, 0);
+    if (shm < 0 || other < 0 || a == (char *)-1) return 20;
+    a[0] = 1, a[page] = 1;
+    /* A set with an operation done, and a queue with two messages. */
+    int sem = (int)syscall(SYS_semget, 0x2345, 3, 01000 | 0600);
+    int msg = (int)syscall(SYS_msgget, 0x3456, 01000 | 0620);
+    if (sem < 0 || msg < 0 || semx_op(sem, 1, 1, 0)) return 21;
+    if (msgx_send(msg, 1, "hello", 0) || msgx_send(msg, 2, "abc", 0)) return 22;
+    sysvipc_all("made");
+    /* PID 2 takes a message, and attaches the segment and detaches it. */
+    fflush(stdout);
+    pid_t taker = child();
+    if (taker == 0) {
+        long r = syscall(SYS_msgrcv, msg, &msgx_buf, sizeof msgx_buf.text, 0, 0);
+        long at = syscall(SYS_shmat, shm, 0, 0);
+        _exit(r == 5 && at != -1 && syscall(SYS_shmdt, at) == 0 ? 0 : 1);
+    }
+    result("taker", reaped(taker));
+    sysvipc_all("taken");
+    /* Locked, then marked for removal while attached: key 0 and the mode
+       bits SHM_LOCKED and SHM_DEST. */
+    printf("lock=%ld\n", syscall(SYS_shmctl, shm, 11 /* SHM_LOCK */, NULL));
+    printf("remove=%ld\n", syscall(SYS_shmctl, shm, 0 /* IPC_RMID */, NULL));
+    sysvipc_show("removed", "shm", sysvipc_shm_times);
+    /* A nested PID namespace sees no PID of these. */
+    if (syscall(SYS_unshare, CLONE_NEWPID)) return 23;
+    fflush(stdout);
+    pid_t nested = child();
+    if (nested == 0) {
+        sysvipc_all("nested");
+        fflush(stdout);
+        _exit(0);
+    }
+    result("nested", reaped(nested));
+    /* A new IPC namespace has none of them. */
+    if (syscall(SYS_unshare, CLONE_NEWIPC)) return 24;
+    sysvipc_all("new ipc");
+    return 0;
+}
+static int sysvipc_case(void) {
+    fflush(stdout);
+    pid_t maker = child();
+    if (maker == 0) {
+        long r = syscall(SYS_unshare, CLONE_NEWIPC | CLONE_NEWPID);
+        printf("unshare=%ld\n", r);
+        if (r) _exit(10);
+        fflush(stdout);
+        pid_t first = child();
+        if (first == 0) {
+            int status = sysvipc_work();
+            fflush(stdout);
+            _exit(status);
+        }
+        result("first", reaped(first));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("maker", reaped(maker));
+    return 0;
+}
 static int msg_case(void) {
     /* Its own IPC namespace, whose queues and counts are the case's. */
     if (syscall(SYS_unshare, CLONE_NEWIPC)) return 10;
@@ -24617,6 +24776,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "shm")) return shm_case();
     if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "msg")) return msg_case();
+    if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();

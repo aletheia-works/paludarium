@@ -1,6 +1,8 @@
 //! The /proc files paludarium has, generated when opened: the mount table
 //! (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's mounts,
 //! `loadavg`, `meminfo`, `stat` and `uptime`, `/proc/sys` ([`crate::sysctl`]),
+//! `/proc/sysvipc`'s `msg`, `sem` and `shm` ([`crate::msg`], [`crate::sem`],
+//! [`crate::shm`]),
 //! and this process's directory with its
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
 //! directory of links to the open descriptors, its `ns` directory of links
@@ -22,6 +24,11 @@ pub(crate) fn stat(length: usize) -> FileStat {
         links: 1,
         ..FileStat::default()
     }
+}
+/// A system-wide file's `stat` (`/proc/loadavg`, `/proc/sysvipc/shm`): a
+/// regular 0444 file of size 0, as Linux's `proc_create` makes them.
+pub(crate) fn entry_stat() -> FileStat {
+    stat(0)
 }
 /// `environ`'s `stat`: as [`stat`], but 0400, as Linux keeps it to the
 /// process's owner.
@@ -244,6 +251,10 @@ pub(crate) enum SystemEntry {
     Meminfo,
     Stat,
     Uptime,
+    /// `/proc/sysvipc`'s `msg`, `sem` and `shm`.
+    SysvipcMsg,
+    SysvipcSem,
+    SysvipcShm,
 }
 pub(crate) fn system_entry(path: &[u8]) -> Option<SystemEntry> {
     match path {
@@ -251,8 +262,47 @@ pub(crate) fn system_entry(path: &[u8]) -> Option<SystemEntry> {
         b"/proc/meminfo" => Some(SystemEntry::Meminfo),
         b"/proc/stat" => Some(SystemEntry::Stat),
         b"/proc/uptime" => Some(SystemEntry::Uptime),
-        _ => None,
+        _ => match path.strip_prefix(b"/proc/sysvipc/".as_slice())? {
+            b"msg" => Some(SystemEntry::SysvipcMsg),
+            b"sem" => Some(SystemEntry::SysvipcSem),
+            b"shm" => Some(SystemEntry::SysvipcShm),
+            _ => None,
+        },
     }
+}
+/// Whether `path` goes on past a system-wide file, as `/proc/loadavg/` or
+/// `/proc/sysvipc/msg/x` do, which Linux's walk finds `ENOTDIR`.
+pub(crate) fn below_system_entry(path: &[u8]) -> bool {
+    path.iter()
+        .enumerate()
+        .any(|(at, &byte)| byte == b'/' && system_entry(&path[..at]).is_some())
+}
+/// Whether `path` is `/proc/sysvipc`, the directory of the System V IPC
+/// files, which Linux's `ipc_init` makes.
+pub(crate) fn is_sysvipc(path: &[u8]) -> bool {
+    matches!(path, b"/proc/sysvipc" | b"/proc/sysvipc/")
+}
+/// The entries of `/proc/sysvipc` after `.` and `..`, in the order Linux's
+/// `proc_readdir_de` lists them: by the length of their names, then by
+/// name (`proc_match`).
+pub(crate) fn sysvipc_entries() -> Vec<paludarium_host::DirectoryEntry> {
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    [
+        (&b"."[..], DT_DIR),
+        (b"..", DT_DIR),
+        (b"msg", DT_REG),
+        (b"sem", DT_REG),
+        (b"shm", DT_REG),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (name, kind))| paludarium_host::DirectoryEntry {
+        name: name.to_vec(),
+        inode: i as u64 + 1,
+        kind,
+    })
+    .collect()
 }
 /// `/proc/loadavg` as Linux's `loadavg_proc_show` prints it. The averages
 /// are 0, as `sysinfo` reports them, since nothing measures the load.
@@ -739,20 +789,43 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
 pub(crate) struct GeneratedFile {
     content: Vec<u8>,
     position: Mutex<usize>,
-    writable: bool,
+    /// What a write gives on a descriptor opened for writing.
+    write_error: Option<Errno>,
+    /// A system-wide file, of size 0 as Linux's `proc_create` files are,
+    /// whose reads go to the end of its content.
+    entry: bool,
 }
 impl GeneratedFile {
     /// The files are 0444, but the guest is root, which may open them for
-    /// writing anyway; the write itself then fails, as on Linux.
+    /// writing anyway; the write itself then fails, as on Linux: `EINVAL`
+    /// for a process's own file, which has no write operation at all.
     pub(crate) fn open(content: Vec<u8>, flags: u32) -> Self {
+        Self::failing_writes(content, flags, Errno::EINVAL, false)
+    }
+    /// A system-wide file, which Linux makes with `proc_create`: of size 0
+    /// ([`entry_stat`]), and its writes go through `proc_reg_write` to
+    /// `pde_write`, `EIO` without a `proc_write`.
+    pub(crate) fn open_entry(content: Vec<u8>, flags: u32) -> Self {
+        Self::failing_writes(content, flags, Errno::EIO, true)
+    }
+    fn failing_writes(content: Vec<u8>, flags: u32, error: Errno, entry: bool) -> Self {
         Self {
             content,
             position: Mutex::new(0),
-            writable: flags & 3 != 0,
+            write_error: (flags & 3 != 0).then_some(error),
+            entry,
         }
+    }
+    /// Whether it is a system-wide file, which reads go to the end of
+    /// rather than to its size.
+    pub(crate) fn is_entry(&self) -> bool {
+        self.entry
     }
 }
 impl FileHandle for GeneratedFile {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
         let rest = self.content.get(*position..).unwrap_or(&[]);
@@ -761,14 +834,10 @@ impl FileHandle for GeneratedFile {
         *position += count;
         Ok(count)
     }
-    /// These files have no write operation: EINVAL, or EBADF on a
+    /// These files cannot be written: their error, or EBADF on a
     /// descriptor opened read-only.
     fn write(&self, _: &[u8]) -> Result<usize, Errno> {
-        Err(if self.writable {
-            Errno::EINVAL
-        } else {
-            Errno::EBADF
-        })
+        Err(self.write_error.unwrap_or(Errno::EBADF))
     }
     fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
         let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
@@ -786,7 +855,11 @@ impl FileHandle for GeneratedFile {
         Ok(target as u64)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(stat(self.content.len()))
+        Ok(if self.entry {
+            entry_stat()
+        } else {
+            stat(self.content.len())
+        })
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)

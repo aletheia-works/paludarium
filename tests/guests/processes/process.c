@@ -8696,7 +8696,9 @@ static int proc_other_mounts_case(void) {
     if (dir) closedir(dir);
     snprintf(path, sizeof path, "/proc/%d/mountinfo", (int)kid);
     struct stat st;
-    printf("listed=%d stat=%d mode=%o\n", listed, stat(path, &st) ? errno : 0, st.st_mode & 07777);
+    /* The call before the fields it fills: an argument list has no order. */
+    int r = stat(path, &st);
+    printf("listed=%d stat=%d mode=%o\n", listed, r ? errno : 0, st.st_mode & 07777);
     if (write(done[1], "d", 1) != 1) return 84;
     /* Ended and not reaped: the file is there, but opens as EINVAL. */
     while (1) {
@@ -8705,7 +8707,8 @@ static int proc_other_mounts_case(void) {
         if (waitid(P_PID, kid, &info, WEXITED | WNOWAIT) || info.si_pid == kid) break;
     }
     printf("zombie open=%d", pom_read(path, 1));
-    printf(" stat=%d size=%lld", stat(path, &st) ? errno : 0, (long long)st.st_size);
+    r = stat(path, &st);
+    printf(" stat=%d size=%lld", r ? errno : 0, (long long)st.st_size);
     snprintf(path, sizeof path, "/proc/%d/mounts", (int)kid);
     printf(" mounts=%d", pom_read(path, 1));
     printf(" status=%d", reaped(kid));

@@ -2295,8 +2295,8 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
-  `root`, `maps`, `mounts`, `mountinfo`, `smaps`, `fd`, `fdinfo`, `ns` and `task`. `root` leads to
-  the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
+  `root`, `maps`, `mounts`, `mountinfo`, `smaps`, `fd`, `fdinfo`, `ns` and
+  `task`. `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
   unmarked; `maps` and `smaps` name a mapped file the same way. `status`

@@ -13,6 +13,7 @@ use crate::ipc::{
     self, CAP_IPC_OWNER, CAP_SYS_ADMIN, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
     IPC_SET, IPC_STAT, Perm,
 };
+use crate::namespaces::KeptPid;
 use crate::syscalls::{Context, Outcome};
 use paludarium_mmu::{Backing, FileSize, MappingKind, PageSource, Placement, Prot, SharedPages};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
@@ -77,8 +78,9 @@ struct Segment {
     atime: i64,
     dtime: i64,
     ctime: i64,
-    cpid: u32,
-    lpid: u32,
+    /// The processes that made it and attached or detached it last.
+    cpid: KeptPid,
+    lpid: KeptPid,
     memory: SharedPages,
     /// `/SYSV<key> (deleted)`, after the key it was made with.
     name: Arc<[u8]>,
@@ -264,8 +266,8 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
             atime: 0,
             dtime: 0,
             ctime: ipc::now(c),
-            cpid: c.process.pid,
-            lpid: 0,
+            cpid: c.pid_space().keep(c.process.pid),
+            lpid: KeptPid::default(),
             memory: SharedPages::new(),
             name: name.into_bytes().into(),
             attachments: Vec::new(),
@@ -383,7 +385,7 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
     let mut table = shm.lock();
     if let Ok(segment) = table.checked(attachment.id) {
         segment.atime = ipc::now(c);
-        segment.lpid = c.process.pid;
+        segment.lpid = c.pid_space().keep(c.process.pid);
     }
     drop(table);
     drop(attachment);
@@ -456,7 +458,7 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
     // and only a closed one counts as a detach.
     if detached && let Ok(segment) = table.checked(id) {
         segment.dtime = ipc::now(c);
-        segment.lpid = c.process.pid;
+        segment.lpid = c.pid_space().keep(c.process.pid);
     }
     Ok(0)
 }
@@ -598,10 +600,47 @@ fn shmid_ds(
     put(56, &segment.atime.to_le_bytes());
     put(64, &segment.dtime.to_le_bytes());
     put(72, &segment.ctime.to_le_bytes());
-    put(80, &space.number(segment.cpid).to_le_bytes());
-    put(84, &space.number(segment.lpid).to_le_bytes());
+    put(80, &space.number_of(&segment.cpid).to_le_bytes());
+    put(84, &space.number_of(&segment.lpid).to_le_bytes());
     put(88, &segment.attached().to_le_bytes());
     ds
+}
+
+/// `/proc/sysvipc/shm`, as Linux's `sysvipc_shm_proc_show` prints it on a
+/// 64-bit kernel: its header, then each segment of the caller's IPC
+/// namespace by index, its processes as the caller's PID namespace numbers
+/// them and its owners as the caller's user namespace shows them, with the
+/// bytes of its pages in memory and none swapped.
+pub(crate) fn proc_file(c: &Context<'_>) -> Vec<u8> {
+    let mut out = String::from(
+        "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
+    );
+    let (space, user) = (c.pid_space(), &c.process.credentials.user);
+    let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
+    let shm = segments(c);
+    for s in shm.lock().segments.values() {
+        let perm = &s.perm;
+        out.push_str(&format!(
+            "{:10} {:10}  {:4o} {:21} {:5} {:5}  {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}\n",
+            perm.key,
+            s.id,
+            perm.mode,
+            s.size,
+            space.number_of(&s.cpid),
+            space.number_of(&s.lpid),
+            s.attached(),
+            user.shown(kind, perm.uid),
+            user.shown(group, perm.gid),
+            user.shown(kind, perm.cuid),
+            user.shown(group, perm.cgid),
+            s.atime,
+            s.dtime,
+            s.ctime,
+            s.memory.resident() * PAGE,
+            0,
+        ));
+    }
+    out.into_bytes()
 }
 
 /// `SHM_LOCK` and `SHM_UNLOCK`, as Linux's `shmctl_do_lock`: without

@@ -387,7 +387,7 @@ pub(super) fn entries(task: &Task, entry: TaskEntry) -> Vec<DirectoryEntry> {
 }
 
 /// The names /proc generates at its top, with their types.
-const ROOT_NAMES: [(&[u8], u8); 8] = [
+const ROOT_NAMES: [(&[u8], u8); 9] = [
     (b"self", DT_LNK),
     (b"thread-self", DT_LNK),
     (b"mounts", DT_LNK),
@@ -396,6 +396,7 @@ const ROOT_NAMES: [(&[u8], u8); 8] = [
     (b"stat", DT_REG),
     (b"uptime", DT_REG),
     (b"sys", DT_DIR),
+    (b"sysvipc", DT_DIR),
 ];
 
 /// The entries of /proc: what the filesystem has there that is not a

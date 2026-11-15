@@ -263,9 +263,9 @@ impl Traces {
         tracee.exited = Some((status, dumped, uid));
         Some((tracee.tracer_pid, uid))
     }
-    /// Forgets task `tid`, which has been reaped.
-    pub(crate) fn forget(&self, tid: u32) {
-        self.lock().remove(&tid);
+    /// Forgets the tasks of process `pid`, which has been reaped.
+    pub(crate) fn forget_process(&self, pid: u32) {
+        self.lock().retain(|_, tracee| tracee.pid != pid);
     }
 }
 
@@ -1232,8 +1232,10 @@ impl Kernel {
                 tracee.trap_stop = true;
             }
             view.group.interrupt_thread(tid);
-            // `wait_on_bit(JOBCTL_TRAPPING)`: until it has stopped for the
-            // tracer, or gone.
+            // `wait_on_bit(JOBCTL_TRAPPING)`, killable: until it has
+            // stopped for the tracer or gone, or the caller's process ends;
+            // no other signal ends the wait, which would leave the attach
+            // half done.
             loop {
                 let ticket = self.processes.changed().value();
                 let trapping = self
@@ -1242,10 +1244,14 @@ impl Kernel {
                     .lock()
                     .get(&tid)
                     .is_some_and(|t| t.trap_stop && t.exited.is_none());
-                if !trapping || !view.group.has_member(tid) || view.group.status().is_some() {
+                if !trapping
+                    || !view.group.has_member(tid)
+                    || view.group.status().is_some()
+                    || self.group.status().is_some()
+                {
                     break;
                 }
-                self.wait_for_children(ticket)?;
+                let _ = self.wait_for_children(ticket);
             }
         }
         Ok(0)

@@ -1051,7 +1051,7 @@ impl Processes {
         &self.changed
     }
     pub(crate) fn remove(&self, pid: u32) {
-        Self::release(
+        self.release(
             &mut self.entries.lock().unwrap_or_else(PoisonError::into_inner),
             pid,
         );
@@ -1184,7 +1184,7 @@ impl Processes {
             // As reparent_leader, also for a zombie reaped just now.
             Self::hang_up_orphaned(&mut entries, orphan, pid);
             if reaped {
-                Self::release(&mut entries, orphan);
+                self.release(&mut entries, orphan);
             }
         }
         Self::hang_up_orphaned(&mut entries, pid, pid);
@@ -1202,7 +1202,7 @@ impl Processes {
             // tracer has waited for it or let it go (`EXIT_TRACE`).
             self.traced_exit(&entries, pid, tracer);
         } else if Self::notify_parent(&entries, pid) {
-            Self::release(&mut entries, pid);
+            self.release(&mut entries, pid);
         }
         self.changed.notify();
     }
@@ -1253,7 +1253,7 @@ impl Processes {
             .is_some_and(|entry| entry.status.is_some())
             && Self::notify_parent(&entries, pid)
         {
-            Self::release(&mut entries, pid);
+            self.release(&mut entries, pid);
         }
         drop(entries);
         self.changed.notify();
@@ -1278,10 +1278,12 @@ impl Processes {
     /// Removes process `pid`, which is reaped, and forgets its numbers, as
     /// Linux's `release_task`. The init of a nested PID namespace that
     /// waited for it to be gone now tells its parent.
-    fn release(entries: &mut BTreeMap<u32, Entry>, pid: u32) {
+    fn release(&self, entries: &mut BTreeMap<u32, Entry>, pid: u32) {
         let Some(entry) = entries.remove(&pid) else {
             return;
         };
+        // Its tasks are no longer traced (`__ptrace_unlink`).
+        self.traces.forget_process(pid);
         entry.space.leave(pid);
         let held: Vec<u32> = entries
             .iter()
@@ -1297,7 +1299,7 @@ impl Processes {
                 other.held = false;
             }
             if Self::notify_parent(entries, init) {
-                Self::release(entries, init);
+                self.release(entries, init);
             }
         }
     }
@@ -1493,8 +1495,7 @@ impl Processes {
             match event {
                 // A reaped child's CPU time joins its parent's children's.
                 ChildEvent::Exited(_) | ChildEvent::Dumped(_) => {
-                    Self::release(&mut entries, pid);
-                    self.traces.forget(pid);
+                    self.release(&mut entries, pid);
                     if let Some(parent) = entries.get_mut(&parent) {
                         parent.children_cpu = parent.children_cpu.saturating_add(cpu);
                     }

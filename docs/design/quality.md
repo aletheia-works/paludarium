@@ -136,6 +136,20 @@ each run for 600 seconds with AddressSanitizer and LeakSanitizer, every night.
 Fuzzing for a fixed time does not prove that every input is safe, but it keeps
 checking that no guest input makes the emulator panic.
 
+A pull request also fuzzes seven of them (`vfs_paths`, `load_elf`,
+`syscall_args` and the four `kernel_*`), for the same 600 seconds with the
+same sanitizers, from `-seed=1` and an empty corpus. As the seed and corpus
+are fixed, a target that does not link the changed code repeats main's search,
+so only the targets that can see the change run. A target links the
+workspace packages its source names (with the modules it includes by
+`#[path]`) and their dependencies, which `scripts/ci-changes.py` reads from
+`cargo metadata`; a change to one of those packages runs the target. A
+change to a manifest, `Cargo.lock`, `rust-toolchain.toml`, `fuzz/`,
+`fuzz-pr.yml`, the selection script or anything else the fuzz group needs,
+and every push to main, run all seven. When no target can see the change,
+the fuzz job is skipped; a separate job still checks that all fourteen
+targets build whenever the change could affect them.
+
 ## Memory order
 
 Litmus tests (`crates/paludarium-cpu/tests/litmus.rs`) run small programs of
@@ -154,7 +168,24 @@ every test passing.
 ## Coverage and static checks
 
 - Line coverage must stay at 80 % or more. The measurement before the first
-  release was about 94 % for the whole workspace.
+  release was about 94 % for the whole workspace. The `coverage` job of
+  `ci.yml` holds five gates to that floor, each counting only its own tests:
+  the whole workspace; the core packages, with the harness's tests run but
+  its own files left out; the Rust crates the WebAssembly build uses; the
+  crates behind the terminal; and the CPU and decoder under the encodings
+  tests.
+- The core and workspace gates share one instrumented build and one run of
+  each test. The core packages' and the harness's tests run first and the
+  core gate reports on their profiles; the other packages' tests then add
+  theirs and the workspace gate reports on all of them. Cargo builds the
+  same units for the two runs as for one run of the whole workspace, so both
+  numbers are the ones separate runs give. The other three gates each clean
+  and run their own tests, as a report counts every test binary in the
+  target directory; before the terminal gate the job removes the test
+  binaries of the packages outside the core gate, so it starts from what the
+  core run left, as it did when that run came last. The copy of this job in
+  `quality.yml` (nightly and before a release) still runs the two gates
+  separately, with the same numbers.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)
@@ -166,11 +197,23 @@ every test passing.
 
 | When | What |
 |---|---|
-| Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux; part of the fuzzing |
+| Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux; fuzzing of the seven pull-request targets the change can affect (above) |
 | Every night | fuzzing of the 14 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
 | Every day | every scheduled workflow is checked to have started on time; one that failed to start, did not run or was disabled opens an Issue |
 | Every week | the pinned nightly Rust, the workspace's `rust-version` (the latest stable Rust) and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
 | Before a release | all of the above on the exact code being released (below) |
+
+On a pull request and on a push to main, the expensive jobs — the
+differential tests, coverage, fuzzing, the guest programs and the
+WebAssembly checks — start only after the quick stage passed: lint, clippy
+(also with the stable Rust), polyglot lint and the Linux unit tests, which
+take two to four minutes. A head that fails them, or that a later push
+supersedes in those minutes, takes no runners for the long jobs. `ci-ok`,
+the required check, needs every job itself, so a job skipped because the
+quick stage failed cannot make it pass; `scripts/ci-changes.py --self-test`
+refuses a `ci.yml` where it does not. Dependency Review runs only on pull
+requests that change a Cargo or npm manifest or lockfile, a workflow or a
+local action.
 
 Before a guest program is built, its dependencies must pass `cargo deny`
 under the root policy. Only aube has exceptions: the licenses of two crates

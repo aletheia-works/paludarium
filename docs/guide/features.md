@@ -2423,8 +2423,8 @@ kernel.
   and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
-  `stat`, `cmdline`, `environ` (0400), `comm`, `exe`, `cwd`, `root`,
-  `mounts`, `mountinfo`, `ns` (0511) and `task`, made as
+  `stat`, `cmdline`, `environ` (0400), `comm`, `maps`, `smaps`, `exe`,
+  `cwd`, `root`, `mounts`, `mountinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
@@ -2435,7 +2435,7 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `exe`, `cwd`,
+  gets `EACCES` for `environ` unless its real IDs, and for `maps`, `smaps`, `exe`, `cwd`,
   `root` and the links of `ns` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
@@ -2443,13 +2443,13 @@ kernel.
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
-  `cmdline`, `environ` and the sizes in `stat`), current directory, umask and
+  `cmdline`, `environ`, `maps`, `smaps` and the sizes in `stat`), current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is in a system call, where it waits
   if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
-  thread, and has no memory, umask or descriptors: its `cmdline` and
-  `environ` are empty and `exe`, `cwd` and `root` are `ENOENT`, as on Linux.
+  thread, and has no memory, umask or descriptors: its `cmdline`,
+  `environ`, `maps` and `smaps` are empty and `exe`, `cwd` and `root` are `ENOENT`, as on Linux.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0

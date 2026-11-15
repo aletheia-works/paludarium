@@ -164,6 +164,16 @@ impl Emitter<'_, '_> {
         self.set_gpr(index, value);
     }
 
+    /// `v`, masked to `size` bytes, sign-extended from them.
+    fn sign_extended(&mut self, v: Value, size: u8) -> Value {
+        if size == 8 {
+            return v;
+        }
+        let up = 64 - i64::from(size) * 8;
+        let high = self.b.ins().ishl_imm_s(v, up);
+        self.b.ins().sshr_imm_s(high, up)
+    }
+
     /// `v` masked to `size` bytes.
     fn masked(&mut self, v: Value, size: u8) -> Value {
         if size == 8 {
@@ -632,6 +642,32 @@ impl Emitter<'_, '_> {
                     self.write(dst, r);
                 }
                 self.set_status(f);
+            }
+            Fast::Extend { dst, src, signed } => {
+                let v = self.read(src);
+                let v = if signed {
+                    self.sign_extended(v, src.size())
+                } else {
+                    v
+                };
+                self.write(dst, v);
+            }
+            Fast::LoadSignExtended { dst, mem } => {
+                let address = self.linear(&mem);
+                let (v, status) = self.load(address, mem.size);
+                self.unless_failed(status, n, rip);
+                let v = self.sign_extended(v, mem.size);
+                let v = if dst.size() == 8 {
+                    v
+                } else {
+                    self.b.ins().band_imm_s(v, mask(dst.size()))
+                };
+                self.write(dst, v);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::LeaTruncated { dst, mem } => {
+                let v = self.address(&mem);
+                self.write(dst, v);
             }
             Fast::Set { condition, dst } => {
                 let holds = self.condition(condition);

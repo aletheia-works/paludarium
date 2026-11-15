@@ -55,3 +55,9 @@ macOS と Windows でも、Linux のバイナリを直接 exec するのでは�
   stable のリリースごとに上げ、CI はその版で Linux・macOS・Windows のターゲットに clippy を動かします。
   テストは nightly だけで動かします。
 - WebAssembly 版は nightly が必要です。`build-std` と、atomics の wait の機能を使います。
+- WebAssembly 版には DWARF のデバッグ情報を入れません（`mise-tasks/wasm/build.sh` とリリースのパッケージ検査の
+  `-C debuginfo=0`）。DWARF は `paludarium.wasm` の約 8 割を占め、npm と JSR のパッケージを JSR の 20 MiB の
+  上限ぎりぎりにしていました。ネイティブのビルドは行テーブルを残します（`Cargo.toml` の
+  `debug = "line-tables-only"`）。モジュールは `name` セクションを残すので、ブラウザや Node.js での panic
+  （Wasm の trap）のスタックには Rust の関数名が出ますが、ブラウザの開発者ツールでソースのファイルと行は
+  見られなくなります。

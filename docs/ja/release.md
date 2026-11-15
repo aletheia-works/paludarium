@@ -72,3 +72,6 @@ minor を上げることで互換を壊す変更をすることがあり、そ�
 最新の stable の Rust で（`scripts/bump-pins.py` がリリースごとに上げます）、パッケージの検査は crate の外の
 利用者をその stable の Rust でもビルドします。WebAssembly 版（Rust の Wasm アダプタと、wasm32 の
 `paludarium-host`）は、nightly の build-std と atomics の wait を使います。
+パッケージの検査は、本番の Wasm を診断用の機能なしで、DWARF のデバッグ情報も入れずに（`mise run wasm:build` と同じ
+`-C debuginfo=0`）ビルドし、JSR へのアップロード全体が JSR の上限の 20 MiB（jsr-io/jsr の `api/src/tarball.rs` の
+`MAX_TOTAL_FILE_SIZE`）未満であることを確かめます。

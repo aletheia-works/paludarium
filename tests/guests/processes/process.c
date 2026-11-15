@@ -6108,8 +6108,10 @@ static int pagemap_case(void) {
     PM_RESULT("negative-offset", pread(fd, &entry, 8, -8));
     PM_RESULT("bad-buffer", pread(fd, (void *)16, 8, 8));
     /* The position: lseek from the start and the current one only, to any
-       position; read moves it by what it read. */
-    off_t at = (off_t)((uintptr_t)(a + 2 * page) / 4096 * 8);
+       position; read moves it by what it read. The page is the file's
+       written one: the one fork shared is exclusive again on Linux once the
+       child is gone, which the emulator does not tell. */
+    off_t at = (off_t)((uintptr_t)(f + 2 * page) / 4096 * 8);
     printf("seek=%d\n", lseek(fd, at, SEEK_SET) == at);
     errno = 0;
     ssize_t n = read(fd, &entry, 8);

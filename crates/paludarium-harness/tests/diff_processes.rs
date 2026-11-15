@@ -132,7 +132,8 @@ mod linux {
             // addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts), the fanotify cases, whose groups and
-            // marks need CAP_SYS_ADMIN, the keys cases, which set up keyrings as root
+            // marks need CAP_SYS_ADMIN, the userfaultfd cases, whose files take
+            // the kernel's faults too (CAP_SYS_PTRACE), the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
             // limits and become an unprivileged user, the scheduling-set case, which sets
@@ -183,6 +184,11 @@ mod linux {
                     | "fanotify-fid"
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
+                    | "userfaultfd-calls"
+                    | "userfaultfd-faults"
+                    | "userfaultfd-signals"
+                    | "userfaultfd-sigbus"
+                    | "userfaultfd-shared"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -464,6 +470,11 @@ mod linux {
         fanotify_fid => ("fanotify-fid","fanotify"),
         fanotify_pidfd => ("fanotify-pidfd","fanotify"),
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
+        userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
+        userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
+        userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
+        userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
+        userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

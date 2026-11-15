@@ -141,9 +141,10 @@ mod linux {
             // real-time and deadline policies, the admin case, which makes a
             // user namespace with its capabilities (Ubuntu's AppArmor gives none
             // to one an unprivileged user makes) before it becomes one,
-            // the personality-layout case, which maps page 0, and the
+            // the personality-layout case, which maps page 0, the
             // proc-other-maps case, which reads a process's maps as another
-            // user.
+            // user, and the pagemap case, which becomes an unprivileged user,
+            // as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -235,6 +236,7 @@ mod linux {
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
+                    | "pagemap"
                     | "admin"
             );
             let native = if as_root && !running_as_root() {

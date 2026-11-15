@@ -2106,6 +2106,27 @@ fn proc_maps_reads_through_the_system_calls_though_its_size_is_zero() {
     assert_eq!(f.ret(3, &[fd]), 0);
 }
 #[test]
+fn proc_pagemap_reads_through_the_system_calls_and_opens_for_writing_for_root_only() {
+    let mut f = fixture();
+    let (path, buf) = (DATA, DATA + 0x400);
+    f.mem
+        .write(GuestAddr(path), b"/proc/self/pagemap\0")
+        .unwrap();
+    let fd = f.ret(2, &[path, 0]);
+    // The entry of the page `buf` is on: written, so present.
+    let at = buf / 4096 * 8;
+    assert_eq!(f.ret(17, &[fd, buf + 0x800, 8, at]), 8);
+    let mut entry = [0; 8];
+    f.mem.read(GuestAddr(buf + 0x800), &mut entry).unwrap();
+    assert_ne!(u64::from_le_bytes(entry) & 1 << 63, 0);
+    let root = f.ret(2, &[path, 2]);
+    assert!(root < 1 << 32, "{root:#x}");
+    // Without CAP_DAC_OVERRIDE: EACCES for writing, as its mode is 0400.
+    assert_eq!(f.ret(117, &[1000, 1000, 1000]), 0);
+    assert_eq!(f.ret(2, &[path, 2]), errno(Errno::EACCES));
+    assert!(f.ret(2, &[path, 0]) < 1 << 32);
+}
+#[test]
 fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
     let mut f = fixture();
     let (name, buf) = (DATA, DATA + 0x400);

@@ -163,11 +163,21 @@ static int exec_child(void) {
  * refusals of a second attach, of an attach to oneself, and of requests
  * to a task that is not stopped or not traced. */
 static int attach(void) {
+    int ready[2];
+    if (pipe(ready)) return 80;
     pid_t child = fork();
     if (child == 0) {
         signal(SIGUSR1, on_signal);
+        write(ready[1], "x", 1);
         for (;;) pause();
     }
+    /* Attaches once the child sleeps in pause, its only blocking call
+     * after the write, so that the stop is the same each run; the pause
+     * before each look lets the child leave the write. */
+    char byte, state = 0;
+    read(ready[0], &byte, 1);
+    do usleep(10000);
+    while (tracer_pid_of(child, &state) >= 0 && state != 'S');
     result("untraced", pt(PTRACE_CONT, child, 0, 0));
     result("self", pt(PTRACE_ATTACH, getpid(), 0, 0));
     result("attach", pt(PTRACE_ATTACH, child, 0, 0));

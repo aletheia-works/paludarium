@@ -103,7 +103,7 @@ operand handling. Such a form changes the state only after everything that can
 fail. When it fails, nothing has changed, and the instruction runs again
 through the general path, which reports the fault. Both paths therefore mean
 the same thing, which a unit test checks for every form from random states. The
-cache keeps the form, with the address of the next instruction and two flags
+cache keeps the form, with the address of the next instruction and three flags
 (within one 64-byte cache line), apart from the decoded instruction itself, which only the
 general path reads. A run of such forms therefore reads little host memory.
 

@@ -63,6 +63,48 @@ impl Alu {
     }
 }
 
+/// An operation of [`Fast`] on one operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Unary {
+    Inc,
+    Dec,
+    Neg,
+    Not,
+}
+
+impl Unary {
+    fn of(m: Mnemonic) -> Option<Self> {
+        Some(match m {
+            Mnemonic::Inc => Self::Inc,
+            Mnemonic::Dec => Self::Dec,
+            Mnemonic::Neg => Self::Neg,
+            Mnemonic::Not => Self::Not,
+            _ => return None,
+        })
+    }
+
+    /// The result of the operation on `a`, the flags it changes and their
+    /// values, as [`Exec::unary`] has them.
+    #[inline]
+    fn apply(self, a: u64, size: u8) -> (u64, u64, u64) {
+        match self {
+            Self::Inc => {
+                let (r, f) = alu::add(a, 1, false, size);
+                (r, flag::STATUS & !flag::CF, f)
+            }
+            Self::Dec => {
+                let (r, f) = alu::sub(a, 1, false, size);
+                (r, flag::STATUS & !flag::CF, f)
+            }
+            Self::Neg => {
+                let (r, f) = alu::sub(0, a, false, size);
+                (r, flag::STATUS, f)
+            }
+            Self::Not => (!a & size_mask(size), 0, 0),
+        }
+    }
+}
+
 /// A shift or rotate of [`Fast`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Shift {
@@ -234,6 +276,38 @@ pub enum Fast {
         mem: Address,
         src: Source,
     },
+    /// `setcc r8`.
+    Set {
+        condition: Condition,
+        dst: Register,
+    },
+    /// `setcc [m8]`.
+    SetStore {
+        condition: Condition,
+        mem: Address,
+    },
+    /// `cmovcc r, r`.
+    Cmov {
+        condition: Condition,
+        dst: Register,
+        src: Register,
+    },
+    /// `cmovcc r, [m]`: the memory is read whatever the condition.
+    CmovLoad {
+        condition: Condition,
+        dst: Register,
+        mem: Address,
+    },
+    /// `inc`, `dec`, `neg` or `not` of a register.
+    Unary {
+        op: Unary,
+        dst: Register,
+    },
+    /// `inc`, `dec`, `neg` or `not` of memory, without `lock`.
+    UnaryStore {
+        op: Unary,
+        mem: Address,
+    },
     /// `op r, [m]`.
     AluLoad {
         op: Alu,
@@ -353,8 +427,59 @@ impl Fast {
                 target: branch(a)?,
             },
             Mnemonic::Jmp => Self::Jmp(branch(a)?),
+            Mnemonic::Setcc(condition) => {
+                if b.is_some() {
+                    return None;
+                }
+                match gpr(a) {
+                    Some(dst) if dst.size() == 1 => Self::Set { condition, dst },
+                    Some(_) => return None,
+                    None => {
+                        let mem = address(a)?;
+                        if mem.size != 1 {
+                            return None;
+                        }
+                        Self::SetStore { condition, mem }
+                    }
+                }
+            }
+            Mnemonic::Cmovcc(condition) => {
+                let dst = gpr(a)?;
+                match gpr(b) {
+                    Some(src) if src.size() == dst.size() => Self::Cmov {
+                        condition,
+                        dst,
+                        src,
+                    },
+                    Some(_) => return None,
+                    None => {
+                        let mem = address(b)?;
+                        if mem.size != dst.size() {
+                            return None;
+                        }
+                        Self::CmovLoad {
+                            condition,
+                            dst,
+                            mem,
+                        }
+                    }
+                }
+            }
             Mnemonic::Call => Self::Call(branch(a)?),
             Mnemonic::Ret if a.is_none() => Self::Ret,
+            m if Unary::of(m).is_some() => {
+                if b.is_some() {
+                    return None;
+                }
+                let op = Unary::of(m)?;
+                match gpr(a) {
+                    Some(dst) => Self::Unary { op, dst },
+                    None => Self::UnaryStore {
+                        op,
+                        mem: address(a)?,
+                    },
+                }
+            }
             m if Shift::of(m).is_some() => {
                 let dst = gpr(a)?;
                 let count = match b {
@@ -509,6 +634,61 @@ pub(crate) fn execute(
             let a = x.load(x.fast_linear(&mem), size)?;
             let (_, flags) = op.apply(a, b, size);
             x.set_status(flag::STATUS, flags);
+            next
+        }
+        Fast::Set { condition, dst } => {
+            x.write_reg(dst, u64::from(alu::condition(x.s.rflags, condition)));
+            next
+        }
+        Fast::SetStore { condition, mem } => {
+            let v = u64::from(alu::condition(x.s.rflags, condition));
+            x.store(x.fast_linear(&mem), 1, v)?;
+            next
+        }
+        Fast::Cmov {
+            condition,
+            dst,
+            src,
+        } => {
+            let size = dst.size();
+            let v = if alu::condition(x.s.rflags, condition) {
+                x.read_reg(src)
+            } else {
+                x.read_reg(dst)
+            };
+            x.write_reg(dst, v & size_mask(size));
+            next
+        }
+        Fast::CmovLoad {
+            condition,
+            dst,
+            mem,
+        } => {
+            let size = dst.size();
+            let v = x.load(x.fast_linear(&mem), size)?;
+            let v = if alu::condition(x.s.rflags, condition) {
+                v
+            } else {
+                x.read_reg(dst)
+            };
+            x.write_reg(dst, v & size_mask(size));
+            next
+        }
+        Fast::Unary { op, dst } => {
+            let size = dst.size();
+            let a = x.read_reg(dst) & size_mask(size);
+            let (r, update, flags) = op.apply(a, size);
+            x.write_reg(dst, r);
+            x.set_status(update, flags);
+            next
+        }
+        Fast::UnaryStore { op, mem } => {
+            let size = mem.size;
+            let address = x.fast_linear(&mem);
+            let a = x.load(address, size)?;
+            let (r, update, flags) = op.apply(a, size);
+            x.store(address, size, r)?;
+            x.set_status(update, flags);
             next
         }
         Fast::AluLoad { op, dst, mem } => {

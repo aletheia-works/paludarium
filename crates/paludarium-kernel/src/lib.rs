@@ -50,6 +50,7 @@ mod page_cache;
 mod proc;
 mod process_vm;
 mod processes;
+mod ptrace;
 mod pty;
 mod record_locks;
 mod rseq;
@@ -257,6 +258,8 @@ pub struct ThreadState {
     /// handler (ERESTARTSYS, `false`), or after any handler (ERESTARTNOINTR,
     /// `true`). Taken with `restart`.
     pub(crate) seccomp_restart: Option<bool>,
+    /// What the thread keeps of ptrace ([`ptrace::Local`]).
+    pub(crate) ptrace: ptrace::Local,
 }
 
 impl ThreadState {
@@ -624,9 +627,7 @@ impl Kernel {
         thread: &mut Thread,
         mem: &AddressSpace,
         context: u64,
-        addr: paludarium_types::GuestAddr,
-        write: bool,
-        fetch: bool,
+        access: userfaultfd::Access,
     ) -> Next {
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
@@ -645,7 +646,7 @@ impl Kernel {
             group: &self.group,
             processes: &self.processes,
         };
-        let sigbus = userfaultfd::fault(&mut ctx, context, addr.0, write, fetch) == Some(true);
+        let sigbus = userfaultfd::fault(&mut ctx, context, access) == Some(true);
         self.inbox.drain(&mut thread.state);
         if sigbus {
             signals::queue(
@@ -654,9 +655,13 @@ impl Kernel {
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGBUS,
                     code: 2,
-                    addr: addr.0,
+                    addr: access.address,
                     trap: 14,
-                    error: 4 | (u64::from(write) * 2) | (u64::from(fetch) * 16),
+                    // A write-protected page is present.
+                    error: 4
+                        | u64::from(access.protected)
+                        | (u64::from(access.write) * 2)
+                        | (u64::from(access.fetch) * 16),
                     synchronous: true,
                     timer: None,
                     child: None,
@@ -733,8 +738,11 @@ impl Kernel {
     /// Delivers an unblocked pending signal at a CPU/Kernel boundary.
     pub fn checkpoint(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         // Only the checkpoint right after the syscall may restart it.
-        let restart = thread.state.restart.take();
-        let seccomp_restart = thread.state.seccomp_restart.take();
+        let mut restart = ptrace::Restart {
+            number: thread.state.restart.take(),
+            seccomp: thread.state.seccomp_restart.take(),
+            traced: false,
+        };
         if self.group.retired(thread.tid) {
             return Next::Exit(ExitStatus::Exited(0));
         }
@@ -763,8 +771,17 @@ impl Kernel {
         if let Ok(now) = self.host.clock(paludarium_host::ClockId::Monotonic) {
             self.group.expire_timer(&mut thread.state, now);
         }
+        self.ptrace_traps(thread, &mut restart);
         while let Some(index) = signals::next_pending(&thread.state, false) {
-            let signal = thread.state.pending.remove(index);
+            let mut signal = thread.state.pending.remove(index);
+            // A traced thread reports each signal but SIGKILL to its tracer
+            // first, which may cancel or change it (`ptrace_signal`).
+            if signal.number != signal::SIGKILL && self.traced(thread.tid) {
+                match self.ptrace_signal(thread, signal, &mut restart) {
+                    Some(given) => signal = given,
+                    None => continue,
+                }
+            }
             let action = thread
                 .state
                 .signal_actions
@@ -794,12 +811,20 @@ impl Kernel {
                 // A group stop is reported once, by the thread that starts it.
                 self.processes
                     .job_stop(self.process.pid, &self.group, signal.number);
+                // A traced thread stops for its tracer instead, which may let
+                // it run on.
+                if self.traced(thread.tid) {
+                    self.ptrace_group_stop(thread, &mut restart);
+                    if !thread.state.stopped {
+                        continue;
+                    }
+                }
                 // A temporary wait mask (rt_sigsuspend, epoll_pwait) ends here
                 // too, so a restarted call sees the original mask again.
                 if let Some(mask) = thread.state.wait_restore_mask.take() {
                     thread.state.signal_mask = mask;
                 }
-                Self::rewind_restart(thread, restart);
+                Self::rewind_restart(thread, restart.number);
                 return Next::Stopped;
             }
             if action.handler == 0 || signal.number == 9 {
@@ -811,11 +836,11 @@ impl Kernel {
             thread.state.restart_block = None;
             // With SA_RESTART the frame resumes at the syscall instruction,
             // so the call runs again when the handler returns.
-            if action.flags & signals::SA_RESTART != 0 || seccomp_restart == Some(true) {
+            if action.flags & signals::SA_RESTART != 0 || restart.seccomp == Some(true) {
                 Self::rewind_restart(
                     thread,
-                    restart.filter(|&number| {
-                        seccomp_restart.is_some() || signals::restarts_with_handler(number)
+                    restart.number.filter(|&number| {
+                        restart.seccomp.is_some() || signals::restarts_with_handler(number)
                     }),
                 );
             }
@@ -869,8 +894,12 @@ impl Kernel {
         if let Some(mask) = thread.state.wait_restore_mask.take() {
             thread.state.signal_mask = mask;
         }
+        // A call a ptrace stop interrupted runs again when no handler
+        // runs, as after any stop.
+        if thread.state.stopped || restart.traced {
+            Self::rewind_restart(thread, restart.number);
+        }
         if thread.state.stopped {
-            Self::rewind_restart(thread, restart);
             Next::Stopped
         } else {
             Next::Resume
@@ -933,6 +962,13 @@ impl Kernel {
 
     /// Handles a stop of `thread` (W3, W4).
     pub fn handle(&mut self, thread: &mut Thread, mem: &AddressSpace, reason: ExitReason) -> Next {
+        // `orig_rax`: the call it enters, as it entered it, or -1.
+        let orig_rax = if matches!(reason, ExitReason::Syscall { .. }) {
+            thread.cpu.gpr[reg::RAX]
+        } else {
+            u64::MAX
+        };
+        thread.state.ptrace.enter(thread.tid, orig_rax);
         // The thread runs no guest code until it takes a CPU again.
         self.leave_cpu();
         // A caller that did not finish the last exec finishes it now.
@@ -961,21 +997,27 @@ impl Kernel {
             thread.cpu.rip = rip;
             return self.checkpoint(thread, mem);
         }
-        // A page a `userfaultfd` registered, which has none: the thread
-        // waits for it, then the instruction runs again
-        // (`handle_userfault`).
+        // A page a `userfaultfd` registered, which has none, or a write to
+        // one it write-protected: the thread waits for it, then the
+        // instruction runs again (`handle_userfault`).
         if let ExitReason::PageFault {
             rip,
             addr,
             write,
             fetch,
             mapped: true,
-            present: false,
+            ..
         } = reason
-            && let Some(context) = mem.userfault_for(addr, write, fetch)
+            && let Some((context, protected)) = mem.userfault_for(addr, write, fetch)
         {
             thread.cpu.rip = rip;
-            return self.userfault(thread, mem, context, addr, write, fetch);
+            let access = userfaultfd::Access {
+                address: addr.0,
+                write,
+                fetch,
+                protected,
+            };
+            return self.userfault(thread, mem, context, access);
         }
         let fault = match reason {
             ExitReason::PageFault {

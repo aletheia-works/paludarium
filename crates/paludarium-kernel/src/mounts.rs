@@ -3,16 +3,17 @@
 //! ([`paludarium_vfs::MountTable`]).
 //!
 //! `mount` makes new tmpfs mounts (`shmem_parse_one`'s options, sizes and
-//! modes as `statfs` and `stat` report them, with nothing enforced) and
-//! changes a mount to `MS_PRIVATE` or `MS_SLAVE`, which every mount here
-//! already is, as none is shared. What it does not do yet gives
-//! `EOPNOTSUPP` once Linux's checks before it have passed: `MS_BIND`,
-//! `MS_MOVE`, `MS_REMOUNT`, `MS_SHARED` and `MS_UNBINDABLE`, a read-only
-//! mount (`MS_RDONLY` or `ro`), `MS_NOSYMFOLLOW`, and a mount on `/proc`
-//! or `/dev`, which the kernel generates. Any other file system type is
+//! modes as `statfs` and `stat` report them, with nothing enforced), bind
+//! mounts (`MS_BIND`, with `MS_REC` the mounts below too), and changes a
+//! mount to `MS_PRIVATE` or `MS_SLAVE`, which every mount here already is,
+//! as none is shared. What it does not do yet gives `EOPNOTSUPP` once
+//! Linux's checks before it have passed: `MS_MOVE`, `MS_REMOUNT`,
+//! `MS_SHARED` and `MS_UNBINDABLE`, a read-only tmpfs (`MS_RDONLY` or
+//! `ro`), `MS_NOSYMFOLLOW` on a tmpfs, and a mount on, or a bind mount of,
+//! `/proc` or `/dev`, which the kernel generates. Any other file system type is
 //! `ENODEV`, as from a kernel without it.
 //!
-//! `umount2` unmounts tmpfs mounts; a mount from start-up (the root, a
+//! `umount2` unmounts the mounts `mount` made; a mount from start-up (the root, a
 //! `--mount` directory) stays: `EINVAL` when it is locked, else `EBUSY`.
 use std::sync::Arc;
 
@@ -185,11 +186,17 @@ fn mount(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         // `/proc` and `/dev`, which the kernel generates, hold no mounts.
         return Err(Errno::EOPNOTSUPP);
     };
-    if flags & (MS_REMOUNT | MS_BIND | MS_MOVE) != 0 {
+    if flags & MS_REMOUNT != 0 {
         return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & MS_BIND != 0 {
+        return bind(c, source, &target, flags & MS_REC != 0, &namespaces.mnt);
     }
     if flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE) != 0 {
         return change_type(c, &target, flags, &namespaces.mnt);
+    }
+    if flags & MS_MOVE != 0 {
+        return Err(Errno::EOPNOTSUPP);
     }
     let fs = new_tmpfs(c, kind, source, data.as_deref(), flags, mount_flags)?;
     // do_add_mount: the parent is in the caller's namespace (`EINVAL`), then
@@ -205,6 +212,28 @@ fn mount(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(Errno::EOPNOTSUPP);
     }
     namespaced.mount(&target, fs)?;
+    Ok(0)
+}
+
+/// `do_loopback`: a source (`EINVAL` for none or an empty one), looked up
+/// with its last link followed (`kern_path`), and a target in the caller's
+/// namespace (`check_mnt`, `EINVAL`) before the bind mount is made
+/// ([`paludarium_vfs::NamespacedFs::bind`]). The flags other than `MS_REC`
+/// change nothing: the new mount has the source mount's. A source in
+/// `/proc` or `/dev`, which the kernel generates, is not supported yet.
+fn bind(
+    c: &Context<'_>,
+    source: Option<Vec<u8>>,
+    target: &[u8],
+    recurse: bool,
+    ns: &Namespace,
+) -> Result<u64, Errno> {
+    let source = source.filter(|s| !s.is_empty()).ok_or(Errno::EINVAL)?;
+    let source = crate::files::mount_path(c, source, true)?.ok_or(Errno::EOPNOTSUPP)?;
+    if !check_mnt(c, ns) {
+        return Err(Errno::EINVAL);
+    }
+    c.files.namespaced().bind(&source, target, recurse)?;
     Ok(0)
 }
 

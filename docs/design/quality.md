@@ -13,6 +13,11 @@ CI run produces them afresh on an x86-64 Linux runner.
   for byte.
 - Flags and values that x86 leaves undefined (AF after logic instructions,
   the flags after `div`, …) are skipped, following a per-instruction table.
+- Where x86 only bounds a result and Intel's and AMD's CPUs differ in it
+  (`RCPPS` and the like, and the last bit of x87's transcendental
+  instructions), a case prints whether the result is within that bound of a
+  reference, which each CPU's is, rather than its bits; it still prints every
+  bit where the CPUs agree. Limitations names each such place.
 - Values that change from run to run, such as pids, times, random numbers and
   addresses, are normalised or excluded before the comparison.
 - New instructions and system calls get their test cases, and the result on

@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use paludarium_cpu::compile::{Address, Alu, Fast, Form, Shift, Source};
+use paludarium_cpu::compile::{Address, Alu, Fast, Form, Shift, Source, Unary};
 use paludarium_cpu::flag;
 use paludarium_decoder::{Condition, Register, Segment};
 
@@ -337,12 +337,43 @@ impl Emitter<'_, '_> {
         self.set_flags(flag::STATUS, f);
     }
 
-    /// Sets the flags of `update` to `f`, which has no others.
+    /// Sets the flags of `update` to those of `f`.
     fn set_flags(&mut self, update: u64, f: Value) {
+        if update == 0 {
+            return;
+        }
         let old = self.word(RFLAGS);
         let kept = self.b.ins().band_imm_s(old, !(update as i64));
+        let f = if update == flag::STATUS {
+            f
+        } else {
+            self.b.ins().band_imm_s(f, update as i64)
+        };
         let new = self.b.ins().bor(kept, f);
         self.set_word(RFLAGS, new);
+    }
+
+    /// The result of `op` on `a` (masked to `size`), the flags it changes
+    /// and their values, as `Unary::apply` has them.
+    fn unary(&mut self, op: Unary, a: Value, size: u8) -> (Value, u64, Value) {
+        match op {
+            Unary::Inc | Unary::Dec => {
+                let one = self.constant(1);
+                let alu = if op == Unary::Inc { Alu::Add } else { Alu::Sub };
+                let (r, f) = self.alu(alu, a, one, size);
+                (r, flag::STATUS & !flag::CF, f)
+            }
+            Unary::Neg => {
+                let zero = self.constant(0);
+                let (r, f) = self.alu(Alu::Sub, zero, a, size);
+                (r, flag::STATUS, f)
+            }
+            Unary::Not => {
+                let r = self.b.ins().bxor_imm_s(a, mask(size));
+                let zero = self.constant(0);
+                (r, 0, zero)
+            }
+        }
     }
 
     /// Bit `n` of `v` as 0 or 1.
@@ -601,6 +632,71 @@ impl Emitter<'_, '_> {
                     self.write(dst, r);
                 }
                 self.set_status(f);
+            }
+            Fast::Set { condition, dst } => {
+                let holds = self.condition(condition);
+                let v = self.b.ins().uextend(I64, holds);
+                self.write(dst, v);
+            }
+            Fast::SetStore { condition, mem } => {
+                let holds = self.condition(condition);
+                let v = self.b.ins().uextend(I64, holds);
+                let address = self.linear(&mem);
+                let status = self.store(address, 1, v);
+                self.unless_failed(status, n, rip);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::Cmov {
+                condition,
+                dst,
+                src,
+            } => {
+                let v = self.read(src);
+                let old = self.read(dst);
+                let holds = self.condition(condition);
+                let v = self.b.ins().select(holds, v, old);
+                self.write(dst, v);
+            }
+            Fast::CmovLoad {
+                condition,
+                dst,
+                mem,
+            } => {
+                let address = self.linear(&mem);
+                let (v, status) = self.load(address, dst.size());
+                self.unless_failed(status, n, rip);
+                let v = if dst.size() == 8 {
+                    v
+                } else {
+                    self.b.ins().band_imm_s(v, mask(dst.size()))
+                };
+                let old = self.read(dst);
+                let holds = self.condition(condition);
+                let v = self.b.ins().select(holds, v, old);
+                self.write(dst, v);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::Unary { op, dst } => {
+                let a = self.read(dst);
+                let (r, update, f) = self.unary(op, a, dst.size());
+                self.write(dst, r);
+                self.set_flags(update, f);
+            }
+            Fast::UnaryStore { op, mem } => {
+                let size = mem.size;
+                let address = self.linear(&mem);
+                let (a, loaded) = self.load(address, size);
+                self.unless_failed(loaded, n, rip);
+                let a = if size == 8 {
+                    a
+                } else {
+                    self.b.ins().band_imm_s(a, mask(size))
+                };
+                let (r, update, f) = self.unary(op, a, size);
+                let status = self.store(address, size, r);
+                self.unless_failed(status, n, rip);
+                self.set_flags(update, f);
+                self.unless_changed(status, n + 1, next);
             }
             Fast::Shift { op, dst, count } => {
                 let a = self.read(dst);

@@ -18,6 +18,7 @@ use crate::ipc::{
     self, CAP_IPC_OWNER, CAP_SYS_ADMIN, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT, IPC_PRIVATE,
     IPC_RMID, IPC_SET, IPC_STAT, Perm,
 };
+use crate::namespaces::KeptPid;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{ClockId, WaitOutcome, WaitToken};
 use paludarium_types::{Errno, GuestAddr};
@@ -93,11 +94,13 @@ impl Table {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Semaphore {
     value: i32,
-    /// The process that changed it last (`sempid`).
-    pid: u32,
+    /// The process that changed it last (`sempid`), kept as Linux keeps
+    /// its `struct pid`, so that a PID namespace still numbers it once the
+    /// process is reaped.
+    pid: KeptPid,
 }
 
 /// `struct sembuf`.
@@ -128,7 +131,7 @@ struct Waiting {
     ops: Vec<Op>,
     /// The undo list it adjusts.
     undo: Option<u64>,
-    pid: u32,
+    pid: KeptPid,
     /// Whether it changes a value (any operation not 0).
     alters: bool,
     /// The operation it waits on, which `GETNCNT` and `GETZCNT` count.
@@ -167,7 +170,7 @@ fn attempt(
     undos: &mut BTreeMap<u64, Vec<i32>>,
     ops: &[Op],
     undo: Option<u64>,
-    pid: u32,
+    pid: &KeptPid,
 ) -> Attempt {
     let mut adjust = undo.and_then(|list| undos.get_mut(&list));
     let mut failure = None;
@@ -214,7 +217,7 @@ fn attempt(
         return failure;
     }
     for op in ops {
-        semaphores[usize::from(op.num)].pid = pid;
+        semaphores[usize::from(op.num)].pid = pid.clone();
     }
     Attempt::Done
 }
@@ -242,7 +245,7 @@ impl Set {
                         &mut self.undos,
                         &waiting.ops,
                         waiting.undo,
-                        waiting.pid,
+                        &waiting.pid,
                     ) {
                         Attempt::Blocked(blocking) => {
                             waiting.blocking = blocking;
@@ -317,7 +320,7 @@ impl UndoList {
     /// One thread of process `pid` leaves it, at `now` (`exit_sem`): the
     /// last one adds each set's adjustments to its values, cut to 0 and
     /// `SEMVMX`, as `pid`, and wakes those its change lets through.
-    pub fn leave(&self, pid: u32, now: i64) {
+    pub(crate) fn leave(&self, pid: &KeptPid, now: i64) {
         if self.users.fetch_sub(1, Ordering::SeqCst) != 1 {
             return;
         }
@@ -336,7 +339,7 @@ impl UndoList {
             for (semaphore, adjustment) in set.semaphores.iter_mut().zip(adjustments) {
                 if adjustment != 0 {
                     semaphore.value = (semaphore.value + adjustment).clamp(0, SEMVMX);
-                    semaphore.pid = pid;
+                    semaphore.pid = pid.clone();
                 }
             }
             set.update(now);
@@ -503,7 +506,7 @@ fn semtimedop(
     let undo = undoes.then(|| c.group.sem_undo_list(c.tid));
     let owner = ipc::capable(c, CAP_IPC_OWNER);
     let now = ipc::now(c);
-    let pid = c.process.pid;
+    let pid = c.pid_space().keep(c.process.pid);
     let sets = sets(c);
     let wake = {
         let mut table = sets.lock();
@@ -519,7 +522,7 @@ fn semtimedop(
             list.join(&sets.0, set);
         }
         let number = undo.as_ref().map(|list| list.number);
-        match attempt(&mut set.semaphores, &mut set.undos, &ops, number, pid) {
+        match attempt(&mut set.semaphores, &mut set.undos, &ops, number, &pid) {
             Attempt::Done => {
                 set.otime = now;
                 if alters {
@@ -826,11 +829,12 @@ fn main(c: &Context<'_>, id: i32, n: i32, cmd: i32, arg: u64) -> Result<u64, Err
             if values.iter().any(|&value| value > SEMVMX) {
                 return Err(Errno::ERANGE);
             }
+            let pid = c.pid_space().keep(c.process.pid);
             let mut table = sets.lock();
             let set = table.checked(id).map_err(|_| EIDRM)?;
             for (semaphore, value) in set.semaphores.iter_mut().zip(values) {
                 semaphore.value = value;
-                semaphore.pid = c.process.pid;
+                semaphore.pid = pid.clone();
             }
             for adjustments in set.undos.values_mut() {
                 adjustments.fill(0);
@@ -848,7 +852,7 @@ fn main(c: &Context<'_>, id: i32, n: i32, cmd: i32, arg: u64) -> Result<u64, Err
             let set = table.checked(id).map_err(|_| EIDRM)?;
             Ok(match cmd {
                 GETVAL => set.semaphores[n].value as u64,
-                GETPID => u64::from(c.pid_space().number(set.semaphores[n].pid)),
+                GETPID => u64::from(c.pid_space().number_of(&set.semaphores[n].pid)),
                 GETNCNT => set.waiting_on(n, false),
                 _ => set.waiting_on(n, true),
             })
@@ -866,6 +870,7 @@ fn setval(c: &Context<'_>, id: i32, n: i32, value: i32) -> Result<u64, Errno> {
     }
     let owner = ipc::capable(c, CAP_IPC_OWNER);
     let now = ipc::now(c);
+    let pid = c.pid_space().keep(c.process.pid);
     let sets = sets(c);
     let mut table = sets.lock();
     let set = table.checked(id)?;
@@ -879,10 +884,7 @@ fn setval(c: &Context<'_>, id: i32, n: i32, value: i32) -> Result<u64, Errno> {
     for adjustments in set.undos.values_mut() {
         adjustments[n] = 0;
     }
-    set.semaphores[n] = Semaphore {
-        value,
-        pid: c.process.pid,
-    };
+    set.semaphores[n] = Semaphore { value, pid };
     set.ctime = now;
     set.update(now);
     Ok(0)
@@ -910,7 +912,10 @@ mod tests {
             ctime: 0,
             semaphores: values
                 .iter()
-                .map(|&value| Semaphore { value, pid: 0 })
+                .map(|&value| Semaphore {
+                    value,
+                    pid: KeptPid::default(),
+                })
                 .collect(),
             undos: BTreeMap::new(),
             queue: Vec::new(),
@@ -920,7 +925,8 @@ mod tests {
         set.semaphores.iter().map(|s| s.value).collect()
     }
     fn wait_for(set: &mut Set, ops: Vec<Op>, pid: u32) -> Arc<Wake> {
-        let blocking = match attempt(&mut set.semaphores, &mut set.undos, &ops, None, pid) {
+        let pid = KeptPid::of(1, pid);
+        let blocking = match attempt(&mut set.semaphores, &mut set.undos, &ops, None, &pid) {
             Attempt::Blocked(at) => at,
             other => panic!("{other:?}"),
         };
@@ -944,22 +950,40 @@ mod tests {
         let mut s = set(&[1, 0]);
         let ops = [op(0, -1, 0), op(1, -1, 0)];
         assert_eq!(
-            attempt(&mut s.semaphores, &mut s.undos, &ops, None, 7),
+            attempt(
+                &mut s.semaphores,
+                &mut s.undos,
+                &ops,
+                None,
+                &KeptPid::of(1, 7)
+            ),
             Attempt::Blocked(1)
         );
         assert_eq!(values(&s), [1, 0]);
         let ops = [op(0, -1, 0), op(1, 1, 0)];
         assert_eq!(
-            attempt(&mut s.semaphores, &mut s.undos, &ops, None, 7),
+            attempt(
+                &mut s.semaphores,
+                &mut s.undos,
+                &ops,
+                None,
+                &KeptPid::of(1, 7)
+            ),
             Attempt::Done
         );
         assert_eq!(values(&s), [0, 1]);
-        assert_eq!(s.semaphores[0].pid, 7);
+        assert_eq!(s.semaphores[0].pid, KeptPid::of(1, 7));
         // In order, so a later operation on the same semaphore sees the
         // earlier one's value.
         let ops = [op(1, 1, 0), op(1, -2, 0)];
         assert_eq!(
-            attempt(&mut s.semaphores, &mut s.undos, &ops, None, 8),
+            attempt(
+                &mut s.semaphores,
+                &mut s.undos,
+                &ops,
+                None,
+                &KeptPid::of(1, 8)
+            ),
             Attempt::Done
         );
         assert_eq!(values(&s), [0, 0]);
@@ -970,17 +994,35 @@ mod tests {
         let mut s = set(&[0, SEMVMX]);
         let ops = [op(0, 0, 0), op(0, -1, IPC_NOWAIT as i16)];
         assert_eq!(
-            attempt(&mut s.semaphores, &mut s.undos, &ops, None, 1),
+            attempt(
+                &mut s.semaphores,
+                &mut s.undos,
+                &ops,
+                None,
+                &KeptPid::of(1, 1)
+            ),
             Attempt::Failed(Errno::EAGAIN)
         );
         let ops = [op(0, -1, 0), op(0, 0, IPC_NOWAIT as i16)];
         assert_eq!(
-            attempt(&mut s.semaphores, &mut s.undos, &ops, None, 1),
+            attempt(
+                &mut s.semaphores,
+                &mut s.undos,
+                &ops,
+                None,
+                &KeptPid::of(1, 1)
+            ),
             Attempt::Blocked(0)
         );
         let ops = [op(0, 5, 0), op(1, 1, 0)];
         assert_eq!(
-            attempt(&mut s.semaphores, &mut s.undos, &ops, None, 1),
+            attempt(
+                &mut s.semaphores,
+                &mut s.undos,
+                &ops,
+                None,
+                &KeptPid::of(1, 1)
+            ),
             Attempt::Failed(Errno::ERANGE)
         );
         assert_eq!(values(&s), [0, SEMVMX]);
@@ -992,13 +1034,25 @@ mod tests {
         s.undos.insert(3, vec![0]);
         let up = [op(0, SEMVMX as i16, SEM_UNDO)];
         assert_eq!(
-            attempt(&mut s.semaphores, &mut s.undos, &up, Some(3), 1),
+            attempt(
+                &mut s.semaphores,
+                &mut s.undos,
+                &up,
+                Some(3),
+                &KeptPid::of(1, 1)
+            ),
             Attempt::Done
         );
         assert_eq!(s.undos[&3], [-SEMVMX]);
         let down = [op(0, -1, SEM_UNDO)];
         assert_eq!(
-            attempt(&mut s.semaphores, &mut s.undos, &down, Some(3), 1),
+            attempt(
+                &mut s.semaphores,
+                &mut s.undos,
+                &down,
+                Some(3),
+                &KeptPid::of(1, 1)
+            ),
             Attempt::Done
         );
         assert_eq!(s.undos[&3], [-SEMVMX + 1]);
@@ -1010,7 +1064,7 @@ mod tests {
                 &mut s.undos,
                 &[op(0, 2, SEM_UNDO)],
                 Some(3),
-                1
+                &KeptPid::of(1, 1)
             ),
             Attempt::Done
         );
@@ -1021,7 +1075,7 @@ mod tests {
                 &mut s.undos,
                 &[op(0, 1, SEM_UNDO)],
                 Some(3),
-                1
+                &KeptPid::of(1, 1)
             ),
             Attempt::Failed(Errno::ERANGE)
         );
@@ -1054,7 +1108,7 @@ mod tests {
         assert_eq!(both.status.load(Ordering::SeqCst), 0);
         assert_eq!(zero.status.load(Ordering::SeqCst), 0);
         assert_eq!(values(&s), [0, 0]);
-        assert_eq!(s.semaphores[1].pid, 12);
+        assert_eq!(s.semaphores[1].pid, KeptPid::of(1, 12));
         assert!(s.queue.is_empty());
     }
 
@@ -1081,13 +1135,13 @@ mod tests {
             s.undos.insert(list.number, vec![-9, 3]);
             t.sets.insert(ipc::index(id), s);
         }
-        list.leave(42, 9);
+        list.leave(&KeptPid::of(1, 42), 9);
         assert_eq!(values(&table.lock().unwrap().sets[&0]), [5, 1]);
-        shared.leave(42, 9);
+        shared.leave(&KeptPid::of(1, 42), 9);
         let t = table.lock().unwrap();
         let s = &t.sets[&0];
         assert_eq!(values(s), [0, 4]);
-        assert_eq!((s.semaphores[0].pid, s.otime), (42, 9));
+        assert_eq!((&s.semaphores[0].pid, s.otime), (&KeptPid::of(1, 42), 9));
         assert!(s.undos.is_empty());
     }
 }

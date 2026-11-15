@@ -25,6 +25,8 @@ pub(super) struct Task {
     public: PublicThread,
     /// The state's letter and its name in `status`.
     state: (char, &'static str),
+    /// The process tracing it, 0 for none (`TracerPid`).
+    tracer: u32,
 }
 
 /// The thread of `path`: ENOENT for a process that is not there (reaped,
@@ -56,6 +58,7 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
         _ if view.zombie => ('Z', "Z (zombie)"),
         // A leader that ended before its other threads.
         None => ('Z', "Z (zombie)"),
+        Some(_) if c.processes.traces.in_stop(tid) => ('t', "t (tracing stop)"),
         Some(_) if view.group.is_stopped() => ('T', "T (stopped)"),
         Some((_, in_call)) if in_call && tid != c.tid => ('S', "S (sleeping)"),
         Some(_) => ('R', "R (running)"),
@@ -70,6 +73,7 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
         view,
         public,
         state,
+        tracer: c.processes.traces.tracer_of(tid).unwrap_or(0),
     })
 }
 
@@ -240,6 +244,7 @@ pub(super) fn content(
             tgid: task.pid,
             pid: task.tid,
             parent: task.view.parent,
+            tracer: task.tracer,
             group_id: task.view.group_id,
             session: task.view.session,
             space: &task.view.space,

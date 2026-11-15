@@ -306,8 +306,10 @@ impl Drop for Tracee {
 pub(crate) struct Traces {
     tracees: Mutex<BTreeMap<u32, Tracee>>,
     /// The signal each tracee its tracer let go of while it was stopped is
-    /// to resume with.
-    released: Mutex<BTreeMap<u32, i32>>,
+    /// to resume with, and its stop with what the tracer changed there
+    /// (registers, mask, siginfo), which Linux's requests write straight
+    /// into the task and a detach keeps.
+    released: Mutex<BTreeMap<u32, (i32, Stop)>>,
 }
 
 /// The tracer as a wait sees a tracee: whether `tid` of `pid` may report
@@ -418,10 +420,10 @@ impl crate::Processes {
     /// traced thread that has exited goes; a process whose exit its tracer
     /// held is its parent's to wait for now.
     pub(crate) fn untrace(&self, tid: u32, signal: Option<i32>) {
-        let Some(tracee) = self.traces.lock().remove(&tid) else {
+        let Some(mut tracee) = self.traces.lock().remove(&tid) else {
             return;
         };
-        if let Some(stop) = &tracee.stop {
+        if let Some(stop) = tracee.stop.take() {
             let code = if (1..=64).contains(&stop.code) {
                 stop.code
             } else {
@@ -431,7 +433,7 @@ impl crate::Processes {
                 .released
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(tid, signal.unwrap_or(code));
+                .insert(tid, (signal.unwrap_or(code), stop));
         }
         let (pid, exited) = (tracee.pid, tracee.exited.is_some());
         drop(tracee);
@@ -759,14 +761,14 @@ impl Kernel {
                             break Some((0, tracee.stop.take()));
                         }
                     }
-                    // Let go of: it resumes with what it had.
+                    // Let go of: it resumes with what its tracer left.
                     None => {
                         let released = traces
                             .released
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .remove(&thread.tid);
-                        break released.map(|signal| (signal, None));
+                        break released.map(|(signal, stop)| (signal, Some(stop)));
                     }
                 }
             }

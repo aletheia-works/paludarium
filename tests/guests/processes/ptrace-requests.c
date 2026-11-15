@@ -333,7 +333,8 @@ static int arch_rseq_case(void) {
     size = pt(REQ_GET_RSEQ_CONFIGURATION, child, 8, (unsigned long)&conf);
     printf("rseq-short size=%ld pointer=%d length=%u\n", size,
            conf.pointer == (uint64_t)(uintptr_t)&area, conf.size);
-    pt(PTRACE_CONT, child, 0, 0);
+    /* A detach keeps what the tracer set: the child reads its gs base. */
+    printf("detach=%ld\n", pt(PTRACE_DETACH, child, 0, 0));
     status = wait_status(child, 0);
     printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;

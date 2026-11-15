@@ -7230,6 +7230,8 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     if let Some(instance) = crate::inotify::of(&d.file) {
         out.extend(instance.fdinfo());
     } else if let Some(group) = crate::fanotify::of(&d.file) {
+        // Mount marks are kept by device, so a mark has no path to tell
+        // the bind mounts of one file system apart: the first mount's ID.
         out.extend(group.fdinfo(&|device| mount_id(c, device, b"")));
     } else if let Some(counter) = any.and_then(|a| a.downcast_ref::<crate::events::EventCounter>())
     {

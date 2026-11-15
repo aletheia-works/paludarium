@@ -1959,11 +1959,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   inode の数は、実際に持っているものです。マウントしたホストのディレクトリでは、
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
   `/proc/mounts` は呼び出し元のマウント名前空間のマウントの一覧です（ルートは `tmpfs`、
-  `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs のマウントは
-  ソースとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
+  `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs とバインドの
+  マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。
-  マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
-  `df` はどのマウントも表示します。パスから開いたのではないパイプ・ソケット・pidfd・
+  ファイルシステムごとに `mountinfo` のマウントの行と同じ `st_dev` を持つので、
+  `df` はどのマウントも表示します。バインドマウントは、Linux と同じく、ソースと同じものです。パスから開いたのではないパイプ・ソケット・pidfd・
   memfd・`memfd_secret` のファイル・名前空間のファイル・匿名 inode（eventfd や epoll
   など）は、Linux と同じく、それぞれのファイルシステム（pipefs・sockfs・pidfs・内部の
   tmpfs・secretmem・nsfs・anon_inodefs）が持つデバイスにあり、どれもマウントのもの

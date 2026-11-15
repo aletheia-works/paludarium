@@ -2255,10 +2255,12 @@ kernel.
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts of the caller's mount namespace
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
-  and the tmpfs mounts `mount` made, with their sources). After `chroot` they show each mount point
+  and the tmpfs and bind mounts `mount` made, with their sources and, in
+  `mountinfo`, the directory each shows as its root). After `chroot` they show each mount point
   from the process's root and leave out those not under it, as Linux's
-  `seq_path_root` does. Each mount has its own `st_dev`, as its
-  line in `mountinfo` says, so `df` lists every mount. A pipe, a socket, a
+  `seq_path_root` does. Each file system has its own `st_dev`, as its
+  mounts' lines in `mountinfo` say, so `df` lists every mount; a bind mount
+  shares its source's, as in Linux. A pipe, a socket, a
   pidfd, a memfd, a `memfd_secret` file, a namespace file and an anonymous
   inode (an eventfd, an epoll and the like) that no path opened are each on
   a device of their file system's own (pipefs, sockfs, pidfs, the internal

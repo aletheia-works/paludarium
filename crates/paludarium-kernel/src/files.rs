@@ -4773,9 +4773,12 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 c.process.pid.to_string().into_bytes()
             } else if let Some(path) = crate::proc::task_path(&p, c.process.pid, c.tid) {
                 let task = tasks::find(c, &path)?;
-                tasks::check(c, &task, path.entry)?;
                 match tasks::link(&task, path.entry) {
-                    Some(target) => from_reader(c, target?),
+                    // Only a link is checked: another file is `EINVAL`.
+                    Some(target) => {
+                        tasks::check(c, &task, path.entry)?;
+                        from_reader(c, target?)
+                    }
                     None if path.entry == crate::proc::TaskEntry::Missing => {
                         return Err(Errno::ENOENT);
                     }
@@ -5106,12 +5109,16 @@ impl LinkPath {
         }
         if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
             let task = tasks::find(c, &path)?;
-            tasks::check(c, &task, path.entry)?;
+            // Only a link is checked: `O_PATH` opens a file such as `maps`
+            // without its `open`, which is what refuses a reader.
             return match tasks::link(&task, path.entry) {
-                Some(target) => Ok(Some(Self {
-                    stat: crate::proc::self_link_stat(),
-                    target: LinkTarget::Fixed(target?),
-                })),
+                Some(target) => {
+                    tasks::check(c, &task, path.entry)?;
+                    Ok(Some(Self {
+                        stat: crate::proc::self_link_stat(),
+                        target: LinkTarget::Fixed(target?),
+                    }))
+                }
                 None => Ok(None),
             };
         }
@@ -6107,7 +6114,11 @@ fn open_path(
         Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
     } else if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
         let task = tasks::find(c, &path)?;
-        tasks::check(c, &task, path.entry)?;
+        // `O_PATH` does not open a file, so it skips the check that an open
+        // of `environ` or `maps` makes; a link is checked as it is followed.
+        if flags & O_PATH == 0 || tasks::link(&task, path.entry).is_some() {
+            tasks::check(c, &task, path.entry)?;
+        }
         // A link of `ns` leads to its namespace's file, which it opens as
         // Linux's `proc_ns_get_link` does.
         if let crate::proc::TaskEntry::Namespace(entry) = path.entry {
@@ -6154,6 +6165,9 @@ fn open_path(
             && tasks::mounts(&task).is_none()
         {
             return Err(Errno::EINVAL);
+        }
+        if let crate::proc::TaskEntry::Maps(smaps) = path.entry {
+            return Ok((tasks::maps(&task, smaps, flags, c.files.root()), p.to_vec()));
         }
         if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
             Arc::new(crate::proc::GeneratedFile::open(content, flags))

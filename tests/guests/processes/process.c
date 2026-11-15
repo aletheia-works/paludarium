@@ -12191,7 +12191,6 @@ static void sysvipc_all(const char *label) {
     sysvipc_show(label, "sem", sysvipc_sem_times);
     sysvipc_show(label, "msg", sysvipc_msg_times);
 }
-/* The work of the case, as PID 1 of its PID namespace. */
 /* GETPID and GETVAL of each of set `sem`'s three semaphores. */
 static void sysvipc_sempids(const char *label, int sem) {
     printf("%s sempids:", label);
@@ -12199,6 +12198,7 @@ static void sysvipc_sempids(const char *label, int sem) {
         printf(" %ld=%ld", semx_ctl(sem, n, SEMX_GETPID, 0), semx_ctl(sem, n, SEMX_GETVAL, 0));
     printf("\n");
 }
+/* The work of the case, as PID 1 of its PID namespace. */
 static int sysvipc_work(void) {
     long page = sysconf(_SC_PAGESIZE);
     sysvipc_all("empty");

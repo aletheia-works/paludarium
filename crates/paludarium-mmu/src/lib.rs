@@ -390,6 +390,10 @@ enum Access {
     /// A core dump reads any mapped page, as Linux's `get_dump_page` does
     /// with `FOLL_FORCE`.
     Dump,
+    /// `ptrace` writes with `FOLL_FORCE`: any page of a private mapping,
+    /// whose copy-on-write it breaks, and a shared one only where it may be
+    /// written (`check_vma_flags`).
+    ForceWrite,
 }
 
 impl Access {
@@ -398,12 +402,12 @@ impl Access {
             Access::Read => prot.allows_read(),
             Access::Write => prot.contains(Prot::WRITE),
             Access::Fetch => prot.contains(Prot::EXEC),
-            Access::Setup | Access::Dump => true,
+            Access::Setup | Access::Dump | Access::ForceWrite => true,
         }
     }
 
     fn is_write(self) -> bool {
-        matches!(self, Access::Write | Access::Setup)
+        matches!(self, Access::Write | Access::Setup | Access::ForceWrite)
     }
 }
 
@@ -2620,7 +2624,14 @@ impl AddressSpaceData {
                 });
             }
             match self.prot_at(directory, page) {
-                Some(prot) if access.permitted(prot) => {}
+                Some(prot) if access.permitted(prot) => {
+                    if access == Access::ForceWrite
+                        && !prot.contains(Prot::WRITE)
+                        && self.shared_at(page).is_some()
+                    {
+                        return Err(fault(at));
+                    }
+                }
                 _ => return Err(fault(at)),
             }
             // A page a `userfaultfd` waits for (`handle_userfault`): the
@@ -4889,6 +4900,57 @@ impl MemoryView {
         for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
             let at = GuestAddr(page + offset as u64);
             match guard.write_with(at, &buf[range.clone()], Access::Write) {
+                Ok(first) => {
+                    if first {
+                        guard.mark_written(at, range.len() as u64);
+                    }
+                }
+                Err(_) => break,
+            }
+            copied = range.end;
+        }
+        Some(copied)
+    }
+    /// Copies the space's memory at `addr` into `buf` as `ptrace` reads it
+    /// (Linux's `access_remote_vm` with `FOLL_FORCE`): page by page, any
+    /// mapped page whatever its protection, up to the first that is not
+    /// mapped or is a guard. How many bytes were copied, or `None` once the
+    /// space is gone.
+    #[must_use]
+    pub fn read_forced(&self, addr: u64, buf: &mut [u8]) -> Option<usize> {
+        self.with_data(|data| {
+            let mut copied = 0;
+            for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
+                let at = GuestAddr(page + offset as u64);
+                if data
+                    .read_with(at, &mut buf[range.clone()], Access::Dump)
+                    .is_err()
+                {
+                    break;
+                }
+                copied = range.end;
+            }
+            copied
+        })
+    }
+    /// Copies `buf` into the space at `addr` as `ptrace` writes it (Linux's
+    /// `access_remote_vm` with `FOLL_FORCE | FOLL_WRITE`): page by page, a
+    /// private page whatever its protection, which gets a copy of its own,
+    /// and a shared one only if it may be written. The store moves the code
+    /// generation on as any store does, so a breakpoint written into code
+    /// is seen. How many bytes were copied, or `None` once the space is gone.
+    #[must_use]
+    pub fn write_forced(&self, addr: u64, buf: &[u8]) -> Option<usize> {
+        let data = self.data.upgrade()?;
+        let serialization = lock_spinning(&self.serialization);
+        let mut guard = AddressSpaceGuard {
+            data: lock_spinning(&data),
+            _serialization: serialization,
+        };
+        let mut copied = 0;
+        for (page, offset, range) in chunks(GuestAddr(addr), buf.len()) {
+            let at = GuestAddr(page + offset as u64);
+            match guard.write_with(at, &buf[range.clone()], Access::ForceWrite) {
                 Ok(first) => {
                     if first {
                         guard.mark_written(at, range.len() as u64);

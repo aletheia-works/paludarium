@@ -22,6 +22,8 @@
 //! ([`crate::interface`]); `RTM_NEWLINK`
 //! and `RTM_SETLINK` bring it up or down with `IFF_UP`, given
 //! `CAP_NET_ADMIN` in the user namespace that owns the network namespace.
+//! `RTM_NEWNSID` and `RTM_GETNSID` give and tell the IDs of other
+//! network namespaces ([`nsid`]).
 //! An error, or a success the request asks for with `NLM_F_ACK`, is
 //! answered with `NLMSG_ERROR`, which tells why as Linux does for a socket
 //! with `NETLINK_EXT_ACK` ([`extack`]); any other request is `EOPNOTSUPP`. Each
@@ -47,6 +49,7 @@ mod diag;
 pub(crate) mod extack;
 mod generic;
 mod inet_diag;
+mod nsid;
 
 const AF_NETLINK: u16 = 16;
 const NETLINK_ROUTE: u32 = 0;
@@ -342,6 +345,8 @@ const SOL_NETLINK: u64 = 270;
 const NETLINK_PKTINFO: u64 = 3;
 const NETLINK_BROADCAST_ERROR: u64 = 4;
 const NETLINK_NO_ENOBUFS: u64 = 5;
+const NETLINK_LISTEN_ALL_NSID: u64 = 8;
+const CAP_NET_BROADCAST: u64 = 1 << 11;
 const NETLINK_CAP_ACK: u64 = 10;
 const NETLINK_EXT_ACK: u64 = 11;
 const NETLINK_GET_STRICT_CHK: u64 = 12;
@@ -391,6 +396,8 @@ pub(crate) struct Ports {
     route: Table,
     diag: Table,
     generic: Table,
+    /// Its IDs of its peers ([`nsid`]).
+    ids: nsid::Ids,
 }
 impl Ports {
     fn table(&self, protocol: u32) -> &Table {
@@ -433,6 +440,15 @@ impl Table {
     }
 }
 
+/// What a receive got: the bytes copied, the datagram's length, its sender
+/// and group, and the ID of the namespace it came from, if another.
+struct Got {
+    copied: usize,
+    length: usize,
+    from: u32,
+    group: u32,
+    nsid: Option<i32>,
+}
 /// A datagram waiting to be received: who sent it (0 for the kernel), and
 /// the group it went to.
 struct Datagram {
@@ -442,6 +458,9 @@ struct Datagram {
     /// What it takes of the receive buffer: its length, or a kernel
     /// buffer's `truesize` charged before it was queued.
     size: usize,
+    /// The ID of the namespace a notification came from, when that is
+    /// another ([`nsid`]).
+    nsid: Option<i32>,
 }
 
 #[derive(Default)]
@@ -495,6 +514,10 @@ struct State {
     /// `NETLINK_NO_ENOBUFS`: a message that finds no room is dropped
     /// without `ENOBUFS`, and the socket is never congested.
     no_enobufs: bool,
+    /// `NETLINK_LISTEN_ALL_NSID`: the socket hears the notifications of
+    /// the namespaces its own has an ID for, and a `recvmsg` tells that ID
+    /// ([`nsid`]).
+    listen_all_nsid: bool,
 }
 
 /// An `AF_NETLINK` socket of `NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` or
@@ -521,6 +544,9 @@ pub(crate) struct NetlinkSocket {
     /// `sock_diag` tells of (`sk_user_ns`), and the AF_UNIX sockets of its
     /// network namespace, which it lists.
     opener_user: crate::users::UserNs,
+    /// Whoever made it (the socket file's credentials), whose
+    /// capabilities over another namespace `file_ns_capable` asks.
+    opener: crate::credentials::Credentials,
     unix: Arc<crate::unix::Names>,
     /// The host, whose clock times the sockets `sock_diag` tells of.
     host: Arc<dyn paludarium_host::Host>,
@@ -584,6 +610,7 @@ pub(crate) fn socket(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         opener_pid: c.pid_space().number(c.process.pid),
         opener_uid: c.shown_uid(credentials.uid),
         opener_user: credentials.user.clone(),
+        opener: credentials.clone(),
         unix: c.unix_names(),
         host: Arc::clone(c.shared_host),
         hub: Arc::clone(&c.files.readiness),
@@ -708,15 +735,26 @@ impl NetlinkSocket {
     /// next receive and holds the socket congested until it is emptied,
     /// unless the socket has `NETLINK_NO_ENOBUFS`.
     fn deliver(&self, s: &mut State, from: u32, group: u32, bytes: Vec<u8>) {
-        self.offer(s, (from, group, bytes), true);
+        self.offer(s, (from, group, bytes), true, None);
+    }
+    /// [`Self::deliver`] of a notification of the namespace this one's
+    /// numbers `nsid`.
+    fn deliver_from_peer(&self, s: &mut State, group: u32, bytes: Vec<u8>, nsid: i32) {
+        self.offer(s, (0, group, bytes), true, Some(nsid));
     }
     /// Queues a part of a dump, as `netlink_dump` does without looking at
     /// congestion: one that finds the receive buffer full is dropped, with
     /// `ENOBUFS` for the next receive.
     fn deliver_dump(&self, s: &mut State, bytes: Vec<u8>) {
-        self.offer(s, (0, 0, bytes), false);
+        self.offer(s, (0, 0, bytes), false, None);
     }
-    fn offer(&self, s: &mut State, (from, group, bytes): (u32, u32, Vec<u8>), overrun: bool) {
+    fn offer(
+        &self,
+        s: &mut State,
+        (from, group, bytes): (u32, u32, Vec<u8>),
+        overrun: bool,
+        nsid: Option<i32>,
+    ) {
         let full = Self::full(s);
         if overrun && (full || s.congested) {
             if !s.congested && !s.no_enobufs {
@@ -726,7 +764,7 @@ impl NetlinkSocket {
         } else if full {
             s.error = Some(ENOBUFS);
         } else {
-            Self::push(s, from, group, bytes);
+            Self::push(s, from, group, bytes, nsid);
         }
         s.arrivals += 1;
         self.hub.changed();
@@ -739,7 +777,7 @@ impl NetlinkSocket {
         if Self::full(s) || s.congested {
             return false;
         }
-        Self::push(s, from, group, bytes.to_vec());
+        Self::push(s, from, group, bytes.to_vec(), None);
         s.arrivals += 1;
         self.hub.changed();
         true
@@ -747,7 +785,7 @@ impl NetlinkSocket {
     fn full(s: &State) -> bool {
         s.queued + s.charged >= usize::try_from(s.receive_buffer).unwrap_or(0)
     }
-    fn push(s: &mut State, from: u32, group: u32, bytes: Vec<u8>) {
+    fn push(s: &mut State, from: u32, group: u32, bytes: Vec<u8>, nsid: Option<i32>) {
         let size = bytes.len();
         s.queued += size;
         s.queue.push_back(Datagram {
@@ -755,6 +793,7 @@ impl NetlinkSocket {
             group,
             bytes,
             size,
+            nsid,
         });
     }
     /// Charges a kernel buffer of `truesize` bytes held for a later send to
@@ -792,6 +831,7 @@ impl NetlinkSocket {
             group: 0,
             bytes,
             size: truesize,
+            nsid: None,
         });
         s.arrivals += 1;
         self.hub.changed();
@@ -1047,6 +1087,9 @@ impl NetlinkSocket {
                     &mut answer,
                     now,
                 ),
+                (nsid::RTM_GETNSID, _) => {
+                    nsid::dump(&self.network, &self.opener, header, payload, port, strict)
+                }
                 (RTM_GETROUTE, _) => route_dump(
                     network,
                     payload,
@@ -1071,8 +1114,9 @@ impl NetlinkSocket {
             };
             // `inet6_dump_ifaddr` and `inet6_dump_ifinfo`, not split, put
             // `NLMSG_DONE` after their last message when that part has room
-            // for it.
-            let joined = matches!(header.kind, RTM_GETADDR | RTM_GETLINK) && family == AF_INET6;
+            // for it, and so does `rtnl_net_dumpid`, which returns 0.
+            let joined = matches!(header.kind, RTM_GETADDR | RTM_GETLINK) && family == AF_INET6
+                || header.kind == nsid::RTM_GETNSID;
             let first = messages.is_empty() || joined;
             let done = done_message(s, header, payload, port, answer, error, first);
             self.start_dump_as(s, messages, done, joined);
@@ -1143,6 +1187,21 @@ impl NetlinkSocket {
                     }
                 }
                 notices.extend(told);
+                Ok(false)
+            }
+            nsid::RTM_NEWNSID => {
+                let echo = header.flags & NLM_F_ECHO != 0;
+                let notice = nsid::new_id(&self.network, header, payload, port, echo)?;
+                if echo && port != 0 {
+                    self.deliver(s, 0, 0, notice.bytes.clone());
+                }
+                notices.push(notice);
+                Ok(false)
+            }
+            nsid::RTM_GETNSID => {
+                let reply =
+                    nsid::get_id(&self.network, &self.opener, header, payload, port, s.strict)?;
+                self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
             RTM_GETLINK => {
@@ -1313,9 +1372,8 @@ impl NetlinkSocket {
     }
     /// Receives one datagram into `buf`, as `netlink_recvmsg`: a pending
     /// error first, `EAGAIN` while there is none; `peek` leaves it. A
-    /// dump's `NLMSG_DONE` is queued after it. The bytes copied, the
-    /// datagram's length, and its sender and group.
-    fn receive(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, u32, u32), Errno> {
+    /// dump's `NLMSG_DONE` is queued after it. What it got.
+    fn receive(&self, buf: &mut [u8], peek: bool) -> Result<Got, Errno> {
         let mut s = self.lock();
         let got = self.next_datagram(&mut s, buf, peek);
         // `netlink_rcv_wake`, whatever the receive gave: an empty queue is
@@ -1327,12 +1385,7 @@ impl NetlinkSocket {
         got
     }
     /// [`Self::receive`] but for its wake.
-    fn next_datagram(
-        &self,
-        s: &mut State,
-        buf: &mut [u8],
-        peek: bool,
-    ) -> Result<(usize, usize, u32, u32), Errno> {
+    fn next_datagram(&self, s: &mut State, buf: &mut [u8], peek: bool) -> Result<Got, Errno> {
         if let Some(error) = s.error.take() {
             return Err(error);
         }
@@ -1341,7 +1394,13 @@ impl NetlinkSocket {
         };
         let n = buf.len().min(first.bytes.len());
         buf[..n].copy_from_slice(&first.bytes[..n]);
-        let got = (n, first.bytes.len(), first.from, first.group);
+        let got = Got {
+            copied: n,
+            length: first.bytes.len(),
+            from: first.from,
+            group: first.group,
+            nsid: first.nsid,
+        };
         if !peek {
             let size = first.size;
             s.queue.pop_front();
@@ -1411,7 +1470,7 @@ impl FileHandle for NetlinkSocket {
         Some(self)
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        self.receive(buf, false).map(|(n, ..)| n)
+        self.receive(buf, false).map(|got| got.copied)
     }
     /// A send to the peer; it binds with the opener's process ID and acts
     /// with the opener's capability, as no calling thread is known here.
@@ -4260,6 +4319,26 @@ fn notify(network: &Network, notices: Vec<Notice>, except: Option<&NetlinkSocket
         return;
     }
     let members = network.netlink.route.members();
+    // `do_one_broadcast` also sends to the sockets with
+    // `NETLINK_LISTEN_ALL_NSID` of each namespace that has an ID for this
+    // one, whose openers have `CAP_NET_BROADCAST` over it, with the ID.
+    let peers: Vec<(i32, Vec<Arc<NetlinkSocket>>)> = network
+        .netlink
+        .ids
+        .heard_by()
+        .into_iter()
+        .filter_map(|peer| {
+            let id = peer.netlink.ids.id_of(network)?;
+            let listening = peer
+                .netlink
+                .route
+                .members()
+                .into_iter()
+                .filter(|socket| socket.opener.capable_in(CAP_NET_BROADCAST, network.owner()))
+                .collect();
+            Some((id, listening))
+        })
+        .collect();
     for notice in notices {
         let bit = 1u64 << (notice.group - 1);
         for socket in &members {
@@ -4269,6 +4348,15 @@ fn notify(network: &Network, notices: Vec<Notice>, except: Option<&NetlinkSocket
             let mut s = socket.lock();
             if s.groups & bit != 0 && s.port.unwrap_or(0) != notice.origin {
                 socket.deliver(&mut s, 0, notice.group, notice.bytes.clone());
+            }
+        }
+        for (id, listening) in &peers {
+            for socket in listening {
+                let mut s = socket.lock();
+                if s.listen_all_nsid && s.groups & bit != 0 && s.port.unwrap_or(0) != notice.origin
+                {
+                    socket.deliver_from_peer(&mut s, notice.group, notice.bytes.clone(), *id);
+                }
             }
         }
     }
@@ -4367,7 +4455,13 @@ pub(crate) fn dispatch(
         45 => {
             let len = crate::sockets::user_buffer(a[1], a[2])?;
             let mut bytes = vec![0; len];
-            let (n, length, from, group) = receive(c, file, socket, &mut bytes, a[3])?;
+            let Got {
+                copied: n,
+                length,
+                from,
+                group,
+                ..
+            } = receive(c, file, socket, &mut bytes, a[3])?;
             c.mem
                 .write(GuestAddr(a[1]), &bytes[..n])
                 .map_err(|_| Errno::EFAULT)?;
@@ -4383,7 +4477,13 @@ pub(crate) fn dispatch(
             let mut bytes = Vec::new();
             bytes.try_reserve(total).map_err(|_| Errno::ENOMEM)?;
             bytes.resize(total, 0);
-            let (n, length, from, group) = receive(c, file, socket, &mut bytes, a[2])?;
+            let Got {
+                copied: n,
+                length,
+                from,
+                group,
+                nsid,
+            } = receive(c, file, socket, &mut bytes, a[2])?;
             crate::files::scatter(c, &header.iov, &bytes[..n])?;
             if header.has_name {
                 let name = encode_address(from, group_mask(group));
@@ -4402,24 +4502,43 @@ pub(crate) fn dispatch(
             if length > n {
                 flags |= MSG_TRUNC as u32;
             }
-            let mut used = 0;
-            if socket.lock().pktinfo {
-                // `netlink_cmsg_recv_pktinfo`: `struct nl_pktinfo`, the
-                // group the datagram went to; with no control buffer, or
-                // one shorter than a `cmsghdr`, only `MSG_CTRUNC` tells of
-                // it (`put_cmsg`).
-                if header.control == 0 || header.control_len < 16 {
+            // `netlink_cmsg_recv_pktinfo`: `struct nl_pktinfo`, the group
+            // the datagram went to; then `netlink_cmsg_listen_all_nsid`:
+            // the ID of the namespace a notification came from, when that
+            // is another. With no control buffer, or what is left of it
+            // shorter than a `cmsghdr`, only `MSG_CTRUNC` tells of one
+            // (`put_cmsg`).
+            let (pktinfo, listen_all_nsid) = {
+                let s = socket.lock();
+                (s.pktinfo, s.listen_all_nsid)
+            };
+            let mut controls = Vec::new();
+            if pktinfo {
+                controls.push((NETLINK_PKTINFO, group.to_le_bytes()));
+            }
+            if let Some(nsid) = nsid.filter(|_| listen_all_nsid) {
+                controls.push((NETLINK_LISTEN_ALL_NSID, nsid.to_le_bytes()));
+            }
+            let mut room = (header.control, header.control_len);
+            for (kind, data) in controls {
+                if header.control == 0
+                    || room.1 < 16
+                    || crate::sockets::put_control_at(
+                        c,
+                        &mut room,
+                        SOL_NETLINK as u32,
+                        kind as u32,
+                        &data,
+                    )
+                {
                     flags |= MSG_CTRUNC;
-                } else {
-                    let mut room = (header.control, header.control_len);
-                    let (level, kind) = (SOL_NETLINK as u32, NETLINK_PKTINFO as u32);
-                    let info = group.to_le_bytes();
-                    if crate::sockets::put_control_at(c, &mut room, level, kind, &info) {
-                        flags |= MSG_CTRUNC;
-                    }
-                    used = header.control_len - room.1;
                 }
             }
+            let used = if header.control == 0 {
+                0
+            } else {
+                header.control_len - room.1
+            };
             c.mem
                 .write(GuestAddr(a[1] + 40), &used.to_le_bytes())
                 .map_err(|_| Errno::EFAULT)?;
@@ -4451,6 +4570,7 @@ fn send(
         return Err(EOPNOTSUPP);
     }
     let dontwait = flags & MSG_DONTWAIT != 0 || socket.nonblocking();
+    let _resolved = (socket.protocol == NETLINK_ROUTE).then(|| nsid::resolve(c, bytes));
     loop {
         let ticket = c.files.readiness.token.value();
         match socket.send(bytes, to, sender) {
@@ -4467,7 +4587,7 @@ fn receive(
     socket: &NetlinkSocket,
     buf: &mut [u8],
     flags: u64,
-) -> Result<(usize, usize, u32, u32), Errno> {
+) -> Result<Got, Errno> {
     if flags & MSG_OOB != 0 {
         return Err(EOPNOTSUPP);
     }
@@ -4510,7 +4630,10 @@ fn netlink_option(c: &Context<'_>, at: u64, len: u64) -> Result<u32, Errno> {
 /// them), `SO_RCVTIMEO`, and `SOL_NETLINK`'s, as `netlink_setsockopt`:
 /// the memberships, and the flags `NETLINK_PKTINFO` (a control message of
 /// each datagram's group), `NETLINK_BROADCAST_ERROR`, `NETLINK_NO_ENOBUFS`
-/// (which also ends a congestion), `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK`, by
+/// (which also ends a congestion), `NETLINK_LISTEN_ALL_NSID` (the
+/// notifications of the namespaces its own has an ID for, which needs
+/// `CAP_NET_BROADCAST` over its own; [`nsid`]), `NETLINK_CAP_ACK`,
+/// `NETLINK_EXT_ACK`, by
 /// which acknowledgements tell why ([`extack`]), and
 /// `NETLINK_GET_STRICT_CHK`, by which dumps, link requests and route
 /// lookups are checked strictly. A value shorter than an `int` is 0. Any
@@ -4561,11 +4684,22 @@ fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
             NETLINK_PKTINFO
             | NETLINK_BROADCAST_ERROR
             | NETLINK_NO_ENOBUFS
+            | NETLINK_LISTEN_ALL_NSID
             | NETLINK_CAP_ACK
             | NETLINK_EXT_ACK
             | NETLINK_GET_STRICT_CHK,
         ) => {
             let on = netlink_option(c, at, len)? != 0;
+            // Listening to every namespace needs `CAP_NET_BROADCAST` in
+            // the user namespace that owns the socket's, either way.
+            if name == NETLINK_LISTEN_ALL_NSID
+                && !c
+                    .process
+                    .credentials
+                    .capable_in(CAP_NET_BROADCAST, socket.network.owner())
+            {
+                return Err(Errno::EPERM);
+            }
             let mut s = socket.lock();
             *flag(&mut s, name) = on;
             if name == NETLINK_NO_ENOBUFS && on {
@@ -4584,6 +4718,7 @@ fn flag(s: &mut State, name: u64) -> &mut bool {
         NETLINK_PKTINFO => &mut s.pktinfo,
         NETLINK_BROADCAST_ERROR => &mut s.broadcast_error,
         NETLINK_NO_ENOBUFS => &mut s.no_enobufs,
+        NETLINK_LISTEN_ALL_NSID => &mut s.listen_all_nsid,
         NETLINK_CAP_ACK => &mut s.cap_ack,
         NETLINK_EXT_ACK => &mut s.ext_ack,
         _ => &mut s.strict,
@@ -4627,6 +4762,7 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
                 NETLINK_PKTINFO
                 | NETLINK_BROADCAST_ERROR
                 | NETLINK_NO_ENOBUFS
+                | NETLINK_LISTEN_ALL_NSID
                 | NETLINK_CAP_ACK
                 | NETLINK_EXT_ACK
                 | NETLINK_GET_STRICT_CHK,

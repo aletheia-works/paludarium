@@ -365,6 +365,8 @@
     {"name":"ptrace-listen","binary":"ptrace-requests"},
     {"name":"ptrace-seccomp","binary":"ptrace-requests"},
     {"name":"ptrace-arch-rseq","binary":"ptrace-requests"},
+    {"name":"ptrace-syscall-signal","binary":"ptrace-requests"},
+    {"name":"ptrace-exit-core","binary":"ptrace-requests"},
     {"name":"spawn","binary":"command"},
     {"name":"status","binary":"command"},
     {"name":"output","binary":"command"},

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -363,6 +364,103 @@ static int arch_rseq_case(void) {
     return 0;
 }
 
+/* --- ptrace-syscall-signal ------------------------------------------- */
+
+#define REQ_SYSCALL 24
+#define O_TRACEEXIT 0x40
+
+static volatile int signal_code = -1;
+static void record_code(int number, siginfo_t *info, void *context) {
+    (void)number;
+    (void)context;
+    signal_code = info->si_code;
+}
+
+/* A signal the tracer gives at a syscall stop is sent to the process from
+ * the kernel: it waits in the process's queue, not the thread's. */
+static int syscall_signal_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sigaction action = {.sa_sigaction = record_code, .sa_flags = SA_SIGINFO};
+        sigaction(SIGUSR1, &action, NULL);
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGSTOP);
+        syscall(SYS_getppid);
+        _exit(signal_code == 0x80 ? 0 : 1);
+    }
+    int status = wait_status(child, 0);
+    show("stop", status);
+    pt(REQ_SYSCALL, child, 0, 0);
+    status = wait_status(child, 0);
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("entry signal=%d nr=%ld\n", WSTOPSIG(status), (long)regs.orig_rax);
+    pt(REQ_SYSCALL, child, 0, SIGUSR1);
+    status = wait_status(child, 0);
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("exit signal=%d nr=%ld\n", WSTOPSIG(status), (long)regs.orig_rax);
+    siginfo_t infos[2];
+    struct peek_args args = {0, 0, 2};
+    printf("thread-queue=%ld\n", pt(REQ_PEEKSIGINFO, child, (unsigned long)&args, (unsigned long)infos));
+    args.flags = 1;
+    long n = pt(REQ_PEEKSIGINFO, child, (unsigned long)&args, (unsigned long)infos);
+    printf("process-queue=%ld", n);
+    for (long i = 0; i < n; i++) printf(" %d/%#x", infos[i].si_signo, infos[i].si_code);
+    printf("\n");
+    pt(PTRACE_CONT, child, 0, 0);
+    status = wait_status(child, 0);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+    printf("delivery signal=%d si-code=%#x si-pid=%d\n", WSTOPSIG(status), info.si_code, info.si_pid);
+    pt(PTRACE_CONT, child, 0, WSTOPSIG(status));
+    status = wait_status(child, 0);
+    printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
+/* --- ptrace-exit-core ------------------------------------------------- */
+
+/* PTRACE_EVENT_EXIT of a process a fatal signal ends, with a core and
+ * without: the event's status has 0x80 only when it dumps one. */
+static void exit_core_round(const char *name, rlim_t limit) {
+    unlink("core");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct rlimit r;
+        getrlimit(RLIMIT_CORE, &r);
+        r.rlim_cur = limit < r.rlim_max ? limit : r.rlim_max;
+        setrlimit(RLIMIT_CORE, &r);
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGSTOP);
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGQUIT);
+        _exit(91);
+    }
+    int status = wait_status(child, 0);
+    pt(PTRACE_SETOPTIONS, child, 0, O_TRACEEXIT);
+    pt(PTRACE_CONT, child, 0, 0);
+    status = wait_status(child, 0);
+    printf("%s: delivery=%d\n", name, WSTOPSIG(status));
+    pt(PTRACE_CONT, child, 0, SIGQUIT);
+    status = wait_status(child, 0);
+    unsigned long message = 0;
+    pt(REQ_GETEVENTMSG, child, 0, (unsigned long)&message);
+    printf("%s: event=%d message=%#lx\n", name, status >> 16, message);
+    pt(PTRACE_CONT, child, 0, 0);
+    status = wait_status(child, 0);
+    printf("%s: signal=%d core=%d\n", name, WIFSIGNALED(status) ? WTERMSIG(status) : -1,
+           WCOREDUMP(status) ? 1 : 0);
+    unlink("core");
+}
+
+static int exit_core_case(void) {
+    exit_core_round("core", RLIM_INFINITY);
+    exit_core_round("no-core", 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 99;
     const char *mode = argv[1];
@@ -372,6 +470,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-listen")) code = listen_case();
     if (!strcmp(mode, "ptrace-seccomp")) code = seccomp_case();
     if (!strcmp(mode, "ptrace-arch-rseq")) code = arch_rseq_case();
+    if (!strcmp(mode, "ptrace-syscall-signal")) code = syscall_signal_case();
+    if (!strcmp(mode, "ptrace-exit-core")) code = exit_core_case();
     fflush(stdout);
     return code;
 }

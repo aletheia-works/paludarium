@@ -98,7 +98,11 @@ mod linux {
         }
         // Linux writes the core the cases read only with the kernel's
         // default core_pattern, which CI sets.
-        if mode == "core-dump" || mode == "core-mappings" || mode == "core-credentials" {
+        if mode == "core-dump"
+            || mode == "core-mappings"
+            || mode == "core-credentials"
+            || mode == "ptrace-exit-core"
+        {
             for (setting, wanted) in [("core_pattern", "core\n"), ("core_uses_pid", "0\n")] {
                 let value = std::fs::read_to_string(format!("/proc/sys/kernel/{setting}"))
                     .unwrap_or_default();
@@ -552,6 +556,8 @@ mod linux {
         ptrace_listen => ("ptrace-listen","ptrace-requests"),
         ptrace_seccomp => ("ptrace-seccomp","ptrace-requests"),
         ptrace_arch_rseq => ("ptrace-arch-rseq","ptrace-requests"),
+        ptrace_syscall_signal => ("ptrace-syscall-signal","ptrace-requests"),
+        ptrace_exit_core => ("ptrace-exit-core","ptrace-requests"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),

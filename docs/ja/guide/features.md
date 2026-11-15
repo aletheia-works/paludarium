@@ -3291,7 +3291,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   コールで、トレーサーはシステムコールと引数を変えられ、`orig_rax` を -1 にすると、`rax` を
   残したい値にしたまま実行を飛ばします。出口では `rax` が戻り値で、トレーサーはそれを変え
   られます。システムコール停止をシグナル付きで再開すると、そのシグナルはカーネルから
-  （`SI_KERNEL`）来ます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
+  （`SI_KERNEL`）プロセスに送られます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
   同じく停止を示します。入口ではシステムコールと引数、出口では戻り値とエラーかどうか、
   ほかの停止や `PTRACE_O_TRACESYSGOOD` なしでは命令ポインタとスタックポインタだけです。
   `PTRACE_SET_SYSCALL_INFO` はシステムコール、引数、戻り値を変えます。種類の違う停止、
@@ -3305,7 +3305,8 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   SEIZE なら `PTRACE_EVENT_STOP` で、それ以外は保留中の `SIGSTOP` を持って始まります。
   システムコール停止は持たずに始まります。`vfork` の親は、子が終了するか別のプログラムを
   実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
-  `PTRACE_EVENT_EXIT` を報告し、それとともに終わるスレッドは報告しません。
+  `PTRACE_EVENT_EXIT` を報告し（致命的なシグナルがコアをダンプするときは、ステータスに
+  0x80 が付きます）、それとともに終わるスレッドは報告しません。
 - `PTRACE_PEEKSIGINFO` は、止まっているトレース対象に、`PTRACE_PEEKSIGINFO_SHARED` 付きでは
   そのプロセスに保留中のシグナルの siginfo を、来た順に読みます。`PTRACE_GETSIGMASK` は
   ブロックしているシグナル（`sigsuspend` や `ppoll` の待ちの間は、戻すマスク）を示し、

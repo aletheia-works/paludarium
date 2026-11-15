@@ -1729,7 +1729,15 @@ mod tests {
     #[test]
     fn x87_faults_change_nothing() {
         // fld1, then a store past the stack's first page's end of mapping.
-        for store in [[0xdd, 0x18], [0xdb, 0x38], [0xdf, 0x18], [0xdd, 0x10]] {
+        // fstp qword, fstp tbyte, fistp word, fst qword, fbstp, fnsave.
+        for store in [
+            [0xdd, 0x18],
+            [0xdb, 0x38],
+            [0xdf, 0x18],
+            [0xdd, 0x10],
+            [0xdf, 0x30],
+            [0xdd, 0x30],
+        ] {
             let (mut s, mem) = machine(&[0xd9, 0xe8, store[0], store[1]]);
             s.gpr[0] = 0x1000;
             let reason = run(&mut s, &mem, 2);
@@ -1755,15 +1763,23 @@ mod tests {
         assert_eq!(s.x87.control_word(), 0x37f);
     }
     #[test]
-    fn x87_environment_of_another_size_is_not_run() {
-        // 66 fnstenv and 66 fldenv have the 14-byte layout.
-        for code in [[0x66, 0xd9, 0x30], [0x66, 0xd9, 0x20]] {
-            let (_, _, reason) = x87_run(&code, 1);
-            assert!(
-                matches!(reason, ExitReason::InvalidOpcode { .. }),
-                "{reason:?}"
-            );
-        }
+    fn x87_environment_of_16_bits_is_14_bytes() {
+        // fld1; 66 fnstenv [rax]; fninit; 66 fldenv [rax]
+        let code = [0xd9, 0xe8, 0x66, 0xd9, 0x30, 0xdb, 0xe3, 0x66, 0xd9, 0x20];
+        let (mut s, mem) = machine(&code);
+        s.gpr[0] = STACK_TOP - 0x2000;
+        mem.write(GuestAddr(STACK_TOP - 0x2000), &[0x55; 16])
+            .unwrap();
+        let reason = run(&mut s, &mem, 4);
+        assert!(
+            matches!(reason, ExitReason::BudgetExhausted { .. }),
+            "{reason:?}"
+        );
+        let mut area = [0; 16];
+        mem.read(GuestAddr(STACK_TOP - 0x2000), &mut area).unwrap();
+        assert_eq!(&area[..6], &[0x7f, 0x03, 0x00, 0x38, 0xff, 0x3f]);
+        assert_eq!(&area[6..], &[0, 0, 0, 0, 0, 0, 0, 0, 0x55, 0x55]);
+        assert_eq!(s.x87.status_word() >> 11 & 7, 7, "loaded");
     }
     #[test]
     fn fxsave_and_fxrstor_keep_the_x87_state() {

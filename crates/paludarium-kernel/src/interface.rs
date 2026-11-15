@@ -698,6 +698,10 @@ impl Addresses {
             });
         }
     }
+    /// The loopback's neighbours, the oldest first.
+    pub(crate) fn neighbours(&self) -> &[Neighbour] {
+        &self.neighbours
+    }
     /// The neighbours of one family flushed (`neigh_flush_dev`), told of
     /// with `RTM_DELNEIGH`, the newest first, as each was put at the head
     /// of the device's list.

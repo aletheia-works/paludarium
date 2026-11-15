@@ -7044,6 +7044,10 @@ fn link_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     if any.is_some_and(|v| v.is::<crate::userfaultfd::UserfaultFile>()) {
         return Ok(b"anon_inode:[userfaultfd]".to_vec());
     }
+    // A BPF map's, `anon_inode_getfd("bpf-map", ...)`.
+    if any.is_some_and(|v| v.is::<crate::bpf::MapFile>()) {
+        return Ok(b"anon_inode:bpf-map".to_vec());
+    }
     // So is a seccomp listener: "seccomp notify".
     if crate::seccomp::is_listener(&d.file) {
         return Ok(b"anon_inode:seccomp notify".to_vec());
@@ -7409,7 +7413,7 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
 /// (as `statx` gives it) and its inode; then a `lock:` line for the
 /// description's `flock` lock and each record lock set through it
 /// ([`crate::record_locks::fdinfo`]), and the lines of an inotify instance,
-/// an eventfd, a signalfd, a timerfd or an epoll.
+/// an eventfd, a signalfd, a timerfd, an epoll or a BPF map.
 fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     let d = c.files.descriptor(u64::from(n)).ok()?;
     let descriptors: Vec<Descriptor> = c
@@ -7454,6 +7458,8 @@ fn fdinfo(c: &Context<'_>, h: &Holder, d: &Descriptor, descriptors: &[Descriptor
         out.extend(timer.fdinfo());
     } else if let Some(epoll) = any.and_then(|a| a.downcast_ref::<crate::epoll::EpollInstance>()) {
         out.extend(epoll_fdinfo(&*h.fs, epoll, descriptors));
+    } else if let Some(lines) = crate::bpf::fdinfo(&d.file) {
+        out.extend(lines);
     }
     out
 }

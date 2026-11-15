@@ -9,7 +9,14 @@
    one in x87_transcendental.h, and its exceptions the same. The emulator
    gives that one, which its unit tests check. The long double functions of
    musl, which use these instructions, are compared rounded to double with
-   the double ones, which use none. */
+   the double ones, which use none.
+
+   x87-decimal: fbstp in each rounding, of each kind of value, and fbld, of
+   digits and of nibbles above 9.
+
+   x87-state: the 16-bit fnstenv and fldenv (with 0x66), and fnsave and
+   frstor of both sizes. Where the last instruction and operand were is left
+   out: CPUs differ, and the emulator keeps none. */
 #define _GNU_SOURCE
 #include <math.h>
 #include <stdint.h>
@@ -278,6 +285,142 @@ static void functions(void) {
     printf("special: %La %La %La %La %La\n", expl(0.0L), logl(1.0L), atan2l(0.0L, -1.0L), log2l(8.0L), expl(-INFINITY));
 }
 
+static void hex(const unsigned char *bytes, int size) {
+    for (int i = size; i-- > 0;) printf("%02x", bytes[i]);
+}
+
+static void decimal_cases(void) {
+    static const struct x87_value values[] = {
+        {0, 0}, {0, 0x8000}, {1ULL << 63, 0x3fff}, {1ULL << 63, 0xbfff}, {1ULL << 63, 0x3ffe}, {3ULL << 62, 0x3ffe},
+        {3ULL << 62, 0x3fff}, {5ULL << 61, 0x4000}, {5ULL << 61, 0xc000}, {7ULL << 61, 0x4000},
+        {0xde0b6b3a763fffffULL, 0x403a}, {0xde0b6b3a76400000ULL, 0x403a}, {0xde0b6b3a76400000ULL, 0xc03a},
+        {0xde0b6b3a763ffff8ULL, 0x403a}, {0xde0b6b3a763ffff0ULL, 0xc03a}, {0xde0b6b3a763ffffcULL, 0x403a},
+        {1ULL << 63, 0x403e}, {1ULL << 63, 0x7fff}, {1ULL << 63, 0xffff}, {3ULL << 62, 0x7fff},
+        {0xa000000000000000ULL, 0x7fff}, {1ULL << 62, 0x3fff}, {1, 0}, {1ULL << 63, 0}, {1ULL << 63, 0x3fbf},
+        {1ULL << 63, 0xbfbf}, {0xb3c4e1e8b6d3c4e0ULL, 0x4037}, {~0ULL, 0x403e},
+    };
+    for (int i = 0; i < COUNT(values); i++)
+        for (int mode = 0; mode < 4; mode++) {
+            uint16_t word = (uint16_t)(0x37f | mode << 10), sw;
+            unsigned char out[12];
+            memset(out, 0x55, sizeof out);
+            __asm__ volatile("fninit\n fldcw %3\n fld1\n fldt %2\n fnclex\n fbstp %0\n fnstsw %1"
+                             : "=m"(*(unsigned char(*)[10])out), "=m"(sw) : "m"(values[i]), "m"(word));
+            printf("fbstp %d %d: ", i, mode);
+            hex(out, 12);
+            printf(" sw=%04x\n", sw);
+        }
+    {
+        uint16_t sw;
+        unsigned char out[10];
+        __asm__ volatile("fninit\n fbstp %0\n fnstsw %1" : "=m"(out), "=m"(sw));
+        printf("fbstp empty: ");
+        hex(out, 10);
+        printf(" sw=%04x\n", sw);
+    }
+    static const unsigned char packed[][10] = {
+        {0x21, 0x43, 0x65, 0x87, 0x09, 0, 0, 0, 0, 0}, {0x21, 0x43, 0x65, 0x87, 0x09, 0, 0, 0, 0, 0x80},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80}, {0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0},
+        {0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0xff}, {0x0a, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0xa0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff}, {0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x7f}, {0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x01},
+        {0x0f, 0, 0, 0, 0, 0, 0, 0, 0, 0}, {0x1b, 0, 0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0, 0xf0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0}, {0x45, 0x23, 0x01, 0, 0, 0, 0, 0, 0, 0},
+    };
+    for (int i = 0; i < COUNT(packed); i++) {
+        unsigned char out[10];
+        uint16_t sw;
+        __asm__ volatile("fninit\n fnclex\n fbld %2\n fnstsw %1\n fstpt %0" : "=m"(out), "=m"(sw) : "m"(packed[i]));
+        printf("fbld %d: ", i);
+        hex(out, 10);
+        printf(" sw=%04x", sw);
+        __asm__ volatile("fninit\n fld1\n fld1\n fld1\n fld1\n fld1\n fld1\n fld1\n fld1\n fnclex\n fbld %2\n fnstsw %1\n fstpt %0"
+                         : "=m"(out), "=m"(sw) : "m"(packed[i]));
+        printf(" full ");
+        hex(out, 10);
+        printf(" sw=%04x\n", sw);
+    }
+}
+
+/* The words of an image, without where the last instruction and operand
+   were: 16 bits from byte 6 to 14 of the 16-bit one, and from 12 to 26 of the
+   other. */
+static void words(const char *label, const unsigned char *image, int wide) {
+    printf("%s: ", label);
+    if (wide) {
+        hex(image, 12);
+        printf(" ");
+        hex(image + 26, 2);
+    } else {
+        hex(image, 6);
+    }
+}
+
+static void state_cases(void) {
+    static const struct x87_value nan = {3ULL << 62, 0x7fff};
+    for (int k = 0; k < 2; k++) {
+        unsigned char env[32];
+        uint16_t after, word = k ? 0x0260 : 0x037f;
+        memset(env, 0x55, sizeof env);
+        __asm__ volatile("fninit\n fld1\n fldz\n fldt %2\n fldcw %3\n fadd %%st(0)\n .byte 0x66\n fnstenv %0\n fnstcw %1"
+                         : "=m"(env), "=m"(after) : "m"(nan), "m"(word));
+        words("fnstenv 16", env, 0);
+        printf(" then cw=%04x, after it ", after);
+        hex(env + 14, 18);
+        printf("\n");
+        memset(env + 14, 0xaa, 18);
+        uint16_t control, status;
+        unsigned char top[10];
+        __asm__ volatile("fninit\n .byte 0x66\n fldenv %3\n fnstcw %0\n fnstsw %1\n fstpt %2"
+                         : "=m"(control), "=m"(status), "=m"(top) : "m"(env));
+        printf("fldenv 16: cw=%04x sw=%04x st0=", control, status);
+        hex(top, 10);
+        printf("\n");
+    }
+    {
+        unsigned char env[14] = {0x7f, 0x03, 0x00, 0x30, 0xf3, 0xff, 1, 2, 3, 4, 5, 6, 7, 8};
+        uint16_t control, status;
+        static unsigned char area[512] __attribute__((aligned(16)));
+        __asm__ volatile("fninit\n .byte 0x66\n fldenv %3\n fnstcw %0\n fnstsw %1\n fxsave %2"
+                         : "=m"(control), "=m"(status), "=m"(area) : "m"(env));
+        printf("fldenv 16 made up: cw=%04x sw=%04x tags=%02x\n", control, status, area[4]);
+    }
+    for (int k = 0; k < 2; k++) {
+        unsigned char area[128];
+        uint16_t word = 0x0262, control, status;
+        memset(area, 0x55, sizeof area);
+        if (k)
+            __asm__ volatile("fninit\n fld1\n fldz\n fldpi\n fldcw %1\n fadd %%st(0)\n .byte 0x66\n fnsave %0" : "=m"(area) : "m"(word));
+        else
+            __asm__ volatile("fninit\n fld1\n fldz\n fldpi\n fldcw %1\n fadd %%st(0)\n fnsave %0" : "=m"(area) : "m"(word));
+        __asm__ volatile("fnstcw %0\n fnstsw %1" : "=m"(control), "=m"(status));
+        int environment = k ? 14 : 28;
+        words(k ? "fnsave 16" : "fnsave", area, !k);
+        printf(" then cw=%04x sw=%04x\n", control, status);
+        for (int r = 0; r < 8; r++) {
+            printf("  st%d ", r);
+            hex(area + environment + r * 10, 10);
+            printf("\n");
+        }
+        printf("  after it ");
+        hex(area + environment + 80, 128 - environment - 80);
+        printf("\n");
+        unsigned char st[3][10];
+        if (k)
+            __asm__ volatile(".byte 0x66\n frstor %5\n fnstcw %3\n fnstsw %4\n fstpt %0\n fstpt %1\n fstpt %2"
+                             : "=m"(st[0]), "=m"(st[1]), "=m"(st[2]), "=m"(control), "=m"(status) : "m"(area));
+        else
+            __asm__ volatile("frstor %5\n fnstcw %3\n fnstsw %4\n fstpt %0\n fstpt %1\n fstpt %2"
+                             : "=m"(st[0]), "=m"(st[1]), "=m"(st[2]), "=m"(control), "=m"(status) : "m"(area));
+        printf("frstor%s: cw=%04x sw=%04x ", k ? " 16" : "", control, status);
+        for (int r = 0; r < 3; r++) {
+            hex(st[r], 10);
+            printf(" ");
+        }
+        printf("\n");
+    }
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
@@ -286,6 +429,14 @@ int main(int argc, char **argv) {
         exact_cases();
         bounded_cases();
         functions();
+        return 0;
+    }
+    if (!strcmp(mode, "x87-decimal")) {
+        decimal_cases();
+        return 0;
+    }
+    if (!strcmp(mode, "x87-state")) {
+        state_cases();
         return 0;
     }
     printf("unknown mode %s\n", mode);

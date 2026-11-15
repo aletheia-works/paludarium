@@ -292,6 +292,7 @@ impl SyscallTable {
         handlers.insert(289, crate::signalfd::sys_signalfd4);
         handlers.insert(253, crate::inotify::sys_inotify_init);
         handlers.insert(300, crate::fanotify::sys_fanotify_init);
+        handlers.insert(321, crate::bpf::sys_bpf);
         handlers.insert(301, crate::fanotify::sys_fanotify_mark);
         handlers.insert(323, crate::userfaultfd::sys_userfaultfd);
         handlers.insert(254, crate::inotify::sys_inotify_add_watch);

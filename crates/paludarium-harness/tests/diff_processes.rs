@@ -129,12 +129,13 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
             // marks need CAP_SYS_ADMIN, the userfaultfd cases, whose files take
-            // the kernel's faults too (CAP_SYS_PTRACE), the keys cases, which set up keyrings as root
+            // the kernel's faults too (CAP_SYS_PTRACE), the bpf cases, whose
+            // maps need CAP_BPF, the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
             // limits and become an unprivileged user, the scheduling-set case, which sets
@@ -196,6 +197,9 @@ mod linux {
                     | "userfaultfd-sigbus"
                     | "userfaultfd-shared"
                     | "userfaultfd-wp"
+                    | "bpf-calls"
+                    | "bpf-elements"
+                    | "bpf-batch"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -211,6 +215,7 @@ mod linux {
                     | "route-selectors"
                     | "address-lifetimes"
                     | "neighbours"
+                    | "neighbour-requests"
                     | "mctp-sockets"
                     | "netlink-strict"
                     | "link-attributes"
@@ -225,6 +230,7 @@ mod linux {
                     | "ext-ack-route-metrics"
                     | "ext-ack-route-selectors"
                     | "ext-ack-address-lifetimes"
+                    | "ext-ack-neighbour-requests"
                     | "ext-ack-netlink-strict"
                     | "ext-ack-link-attributes"
                     | "ext-ack-generic-netlink"
@@ -378,6 +384,7 @@ mod linux {
         processes_route_selectors => ("route-selectors","process"),
         processes_address_lifetimes => ("address-lifetimes","process"),
         processes_neighbours => ("neighbours","process"),
+        processes_neighbour_requests => ("neighbour-requests","process"),
         processes_mctp_sockets => ("mctp-sockets","process"),
         processes_netlink_strict => ("netlink-strict","process"),
         processes_link_attributes => ("link-attributes","process"),
@@ -392,6 +399,7 @@ mod linux {
         processes_ext_ack_route_metrics => ("ext-ack-route-metrics","process"),
         processes_ext_ack_route_selectors => ("ext-ack-route-selectors","process"),
         processes_ext_ack_address_lifetimes => ("ext-ack-address-lifetimes","process"),
+        processes_ext_ack_neighbour_requests => ("ext-ack-neighbour-requests","process"),
         processes_ext_ack_netlink_strict => ("ext-ack-netlink-strict","process"),
         processes_ext_ack_link_attributes => ("ext-ack-link-attributes","process"),
         processes_ext_ack_generic_netlink => ("ext-ack-generic-netlink","process"),
@@ -461,6 +469,9 @@ mod linux {
         aio_full => ("aio-full","aio"),
         aio_lifetime => ("aio-lifetime","aio"),
         aio_mremap => ("aio-mremap","aio"),
+        bpf_calls => ("bpf-calls","bpf"),
+        bpf_elements => ("bpf-elements","bpf"),
+        bpf_batch => ("bpf-batch","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -545,6 +556,8 @@ mod linux {
         processes_x87 => ("x87","process"),
         processes_x87_arithmetic => ("x87-arithmetic","process"),
         processes_x87_transcendental => ("x87-transcendental","x87"),
+        processes_x87_decimal => ("x87-decimal","x87"),
+        processes_x87_state => ("x87-state","x87"),
         processes_robust_list => ("robust-list","process"),
         processes_futex_shared => ("futex-shared","process"),
         processes_late_handler => ("late-handler","process"),

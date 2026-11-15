@@ -39,9 +39,10 @@ Linux.
   instructions (`FSIN`, `FCOS`, `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`,
   `FYL2XP1`) that the `long double` math of glibc and musl uses, correctly
   rounded, which is not always a real CPU's last bit
-  ([Limitations](./limitations)). Packed decimals are not implemented yet
-  ([Limitations](./limitations)). A signal handler starts with the x87 and SSE
-  state as after a reset, as on Linux.
+  ([Limitations](./limitations)). They load and store packed decimals (`FBLD`,
+  `FBSTP`), and save and restore the unit with `FNSAVE`, `FRSTOR`, `FNSTENV` and
+  `FLDENV`, also in their 16-bit forms (with a `0x66` prefix). A signal handler
+  starts with the x87 and SSE state as after a reset, as on Linux.
 - AVX, AVX-512 and MMX are out of scope: `CPUID` reports MMX because glibc
   requires it, but its instructions stop with `SIGILL`.
 
@@ -72,6 +73,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
+| BPF | `bpf`, for maps (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -1018,9 +1020,13 @@ kernel.
   cannot go through waits, unless the operation it would wait on has
   `IPC_NOWAIT` (`EAGAIN`), until a change lets it through, the set is
   removed (`EIDRM`), a signal comes (`EINTR`, never restarted, as Linux) or
-  `semtimedop`'s timeout passes (`EAGAIN`). A change tries the waits as
-  Linux's `do_smart_update`: the waits for zero first, then the others in
-  the order they began. `SEM_UNDO` keeps the adjustments in the process's
+  `semtimedop`'s timeout passes (`EAGAIN`). The waits are kept in Linux's
+  queues: each semaphore's for operations on it alone, and the set's for
+  operations on several, which the waiting changes on one semaphore join
+  while any such operation waits. A change tries them as Linux's
+  `do_smart_update`: the waits for zero on the semaphores it made 0, then
+  the waits to change values, each queue in the order its waits began.
+  `SEM_UNDO` keeps the adjustments in the process's
   undo list, which `CLONE_SYSVSEM` shares (`pthread_create` passes it) and
   a `fork` does not; `SETVAL` and `SETALL` clear them. The last thread that
   shares the list applies it as it ends, or as it leaves it with `unshare`
@@ -1952,6 +1958,29 @@ kernel.
     makes) every address of its prefix; IPv6 binds only to its addresses.
     Before IPv4 has a local table, a socket binds to any IPv4 address, as
     Linux's `inet_addr_type` takes each as broadcast then.
+  - **Neighbours:** `RTM_GETNEIGH` dumps the loopback's neighbours (those
+    its traffic makes, as the notifications below tell) as
+    `neigh_dump_info` does, each an `RTM_NEWNEIGH` like the `RTM_DELNEIGH`
+    that tells of it as it goes: ARP's (IPv4's) and then neighbour
+    discovery's (IPv6's) for `AF_UNSPEC`, the one family's for `AF_INET`
+    or `AF_INET6`, and none for another family. An `ndmsg` whose flags
+    are `NTF_PROXY` asks for the proxy entries, of which there are none.
+    `NDA_IFINDEX` and `NDA_MASTER` narrow a dump, and mark each message
+    `NLM_F_DUMP_FILTERED`: `lo`'s index, 1, and a master of -1 (no master)
+    keep the neighbours, and any other shows none. Strictly, as
+    `neigh_valid_dump_req` checks, an `ndmsg` that is short or has
+    padding, an index, a state, a type or a flag but `NTF_PROXY`, and any
+    other attribute, are `EINVAL`; unchecked, a dump whose attributes
+    break `nda_policy` is not narrowed. An `AF_MCTP` dump shows no
+    neighbours (`EINVAL` for a short `ndmsg`, as `mctp_rtm_getneigh`).
+    Without a dump, as `neigh_get`, the request names one neighbour by its
+    family, key (`NDA_DST`) and `lo`'s index, and the answer counts the
+    reference the lookup holds. It is `EINVAL` without the key (told of
+    with `NLMSGERR_ATTR_MISS_TYPE`), with another attribute, a key of
+    another length, no device, or padding, a state, a type or a flag but
+    `NTF_PROXY`; `EAFNOSUPPORT` for a family but IPv4's and IPv6's;
+    `ENODEV` for another device; and `ENOENT` for a neighbour `lo` has
+    not, and for a proxy entry.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
@@ -2616,7 +2645,7 @@ kernel.
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
   `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]` or `[pidfd]` (an
   anonymous inode's name, which pidfs, from Linux 6.9, still gives),
-  `anon_inode:inotify` (without brackets, as Linux names it), and
+  `anon_inode:inotify` (without brackets, as Linux names it), `anon_inode:bpf-map`, and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
   own for it. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
@@ -2924,6 +2953,34 @@ kernel.
     `quotactl_fd` takes any descriptor (`EBADF`), checks the type
     (`EINVAL`) and gives `ENOSYS`, as Linux's `do_quotactl` does for a file
     system without quotas.
+- `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and
+  `hashtab.c` have them. Every command first takes the size of its union
+  (more than a page, or bytes past Linux master's 168 that are not 0, is
+  `E2BIG`) and its fields past the command's own (`CHECK_ATTR`, `EINVAL`).
+  `BPF_MAP_CREATE` makes a `BPF_MAP_TYPE_ARRAY` (4-byte keys, every
+  element there and zero from the start) or a `BPF_MAP_TYPE_HASH`, in the
+  order of Linux's checks: BTF type IDs, `map_extra`, the NUMA node (there
+  is one), the type, the type's own sizes and flags (`EINVAL`, too large a
+  hash element `E2BIG`, `BPF_F_ZERO_SEED` without `CAP_SYS_ADMIN`
+  `EPERM`), `kernel.unprivileged_bpf_disabled`, which is Linux's default 2,
+  so that a map needs `CAP_BPF` or `CAP_SYS_ADMIN` (`EPERM`), the name
+  (letters, digits, `_` and `.`), BTF (no file is, `EINVAL`), and
+  `BPF_F_RDONLY` with `BPF_F_WRONLY` (`EINVAL`). The descriptor is
+  close-on-exec, open for reading, writing or both as `BPF_F_RDONLY` and
+  `BPF_F_WRONLY` say, its link is `anon_inode:bpf-map`, and a read or write
+  of it is `EINVAL`. `BPF_MAP_LOOKUP_ELEM`, `UPDATE_ELEM` (`BPF_ANY`,
+  `BPF_NOEXIST`, `BPF_EXIST`; a full hash is `E2BIG`, an index past an
+  array's end `E2BIG`), `DELETE_ELEM` (`EINVAL` for an array),
+  `GET_NEXT_KEY`, `LOOKUP_AND_DELETE_ELEM` (the kernel's `ENOTSUPP`, 524,
+  for an array) and `BPF_MAP_FREEZE` (which stops writes through every
+  descriptor, so that a second one is `EPERM` too) take the access the descriptor has
+  (`EPERM`). The batch commands look up, update, delete and look up and
+  delete by count, with `count` written back (an array deletes nothing,
+  `ENOTSUPP`). `BPF_OBJ_GET_INFO_BY_FD` gives a map's `struct bpf_map_info`
+  up to the length asked for (`EBADFD` for no descriptor, `EINVAL` for one
+  of no map). Its fdinfo has `map_type`, `key_size`, `value_size`,
+  `max_entries`, `map_flags`, `map_extra`, `memlock`, `map_id` and
+  `frozen`. See [limitations](./limitations) for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

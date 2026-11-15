@@ -463,6 +463,10 @@ static int thread_case(void) {
         pthread_t thread;
         pthread_create(&thread, NULL, thread_main, NULL);
         pthread_join(thread, NULL);
+        /* Stays until the tracer has reaped the thread: once the group has
+         * exited, wait reports the group's exit code for the thread. */
+        char byte;
+        read(to_thread[0], &byte, 1);
         _exit(5);
     }
     close(to_thread[0]);
@@ -477,6 +481,7 @@ static int thread_case(void) {
     status = wait_status(tid, __WALL);
     result("thread-exited", WIFEXITED(status));
     result("thread-code", WEXITSTATUS(status));
+    write(to_thread[1], "x", 1);
     status = wait_status(child, 0);
     result("process-exit", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;

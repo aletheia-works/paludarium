@@ -402,7 +402,9 @@ impl crate::Processes {
                     if !wait.exits {
                         continue;
                     }
-                    let event = match status {
+                    // Once the group has exited, Linux's wait_task_zombie
+                    // reports the group's exit code for each of its threads.
+                    let event = match group.status().unwrap_or(status) {
                         ExitStatus::Signaled(signal) if dumped => ChildEvent::Dumped(signal),
                         status => ChildEvent::Exited(status),
                     };

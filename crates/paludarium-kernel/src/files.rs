@@ -211,6 +211,10 @@ pub(crate) struct Root {
 pub(crate) struct FilesView {
     cwd: std::sync::Weak<Mutex<Vec<u8>>>,
     root: std::sync::Weak<Mutex<Option<Root>>>,
+    /// The holds of the root and the working directory on their mounts,
+    /// which a move of them takes along ([`Files::relocate`]).
+    root_pin: std::sync::Weak<Mutex<Option<paludarium_vfs::MountPin>>>,
+    home: std::sync::Weak<Mutex<Option<crate::page_cache::Hold>>>,
     space: std::sync::Weak<Mutex<Space>>,
     umask: std::sync::Weak<AtomicU32>,
     fds: std::sync::Weak<Mutex<BTreeMap<u32, Descriptor>>>,
@@ -317,12 +321,109 @@ impl FilesView {
         })
     }
 }
+impl FilesView {
+    /// Puts the root at `root` and the working directory at `cwd`, both
+    /// from the machine's root, with their holds on the mounts there; a
+    /// working directory not under the root is the root.
+    fn relocate(&self, caches: &Arc<crate::page_cache::PageCaches>, root: Vec<u8>, cwd: &[u8]) {
+        let (Some(space), Some(root_cell), Some(cwd_cell)) = (
+            self.space.upgrade(),
+            self.root.upgrade(),
+            self.cwd.upgrade(),
+        ) else {
+            return;
+        };
+        let machine = Arc::clone(&space.lock().unwrap_or_else(PoisonError::into_inner).machine);
+        let fs = if root == b"/" {
+            Arc::clone(&machine)
+        } else {
+            match machine.rooted(&root) {
+                Some(fs) => fs,
+                None => return,
+            }
+        };
+        let cwd = seen_from(&root, cwd).unwrap_or_else(|| b"/".to_vec());
+        if let Some(pin) = self.root_pin.upgrade() {
+            *pin.lock().unwrap_or_else(PoisonError::into_inner) = machine.mount_pin(&root);
+        }
+        *root_cell.lock().unwrap_or_else(PoisonError::into_inner) = (root != b"/").then(|| Root {
+            path: root,
+            fs: Arc::clone(&fs),
+        });
+        if let Some(home) = self.home.upgrade() {
+            let hold = caches.hold(&*fs, &cwd);
+            let last = std::mem::replace(
+                &mut *home.lock().unwrap_or_else(PoisonError::into_inner),
+                hold,
+            );
+            drop(last);
+        }
+        *cwd_cell.lock().unwrap_or_else(PoisonError::into_inner) = cwd;
+    }
+}
 impl Files {
+    /// Moves the roots and working directories of every process on this
+    /// mount namespace's table, as the change `place` makes moves their
+    /// mounts (Linux's dentries go with a moved mount, and
+    /// `chroot_fs_refs` puts the old root's users on the new one): `place`
+    /// gets each root and then its working directory, from the machine's
+    /// root, and gives back where they now are.
+    pub(crate) fn relocate(
+        &self,
+        processes: &crate::processes::Processes,
+        place: impl FnOnce(&[Vec<u8>]) -> Result<Vec<Vec<u8>>, Errno>,
+    ) -> Result<(), Errno> {
+        let table = self.mount_table();
+        let mut views = vec![self.view()];
+        for pid in processes.pids() {
+            if let Some(group) = processes.group_of(pid) {
+                for (tid, _) in group.threads() {
+                    views.extend(group.public(tid).map(|public| public.files));
+                }
+            }
+        }
+        let mut seen = BTreeSet::new();
+        views.retain(|v| {
+            v.space.upgrade().is_some_and(|space| {
+                Arc::ptr_eq(
+                    space
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .namespaced
+                        .table(),
+                    &table,
+                )
+            }) && seen.insert(v.root.as_ptr().addr())
+        });
+        let mut paths = Vec::with_capacity(views.len() * 2);
+        for v in &views {
+            let root = v.root().unwrap_or_else(|| b"/".to_vec());
+            let cwd = v.cwd().unwrap_or_else(|| b"/".to_vec());
+            let at = if cwd == b"/" {
+                root.clone()
+            } else if root == b"/" {
+                cwd
+            } else {
+                [&root[..], &cwd[..]].concat()
+            };
+            paths.push(root);
+            paths.push(at);
+        }
+        let placed = place(&paths)?;
+        for (v, pair) in views.iter().zip(placed.chunks(2)) {
+            if let [root, cwd] = pair {
+                v.relocate(&self.caches, root.clone(), cwd);
+            }
+        }
+        Ok(())
+    }
     /// This process's files as [`FilesView`] shows them to others.
     pub(crate) fn view(&self) -> FilesView {
         FilesView {
             cwd: Arc::downgrade(&self.cwd),
             root: Arc::downgrade(&self.root),
+            root_pin: Arc::downgrade(&self.root_pin),
+            home: Arc::downgrade(&self.home),
             space: Arc::downgrade(&self.space),
             umask: Arc::downgrade(&self.umask),
             fds: Arc::downgrade(&self.fds),
@@ -1092,6 +1193,20 @@ pub(crate) fn mount_target(
     follow: bool,
 ) -> Result<Option<Vec<u8>>, Errno> {
     mount_path(c, path(c, ptr)?, follow)
+}
+/// [`mount_target`] of a directory, its links followed (`LOOKUP_FOLLOW |
+/// LOOKUP_DIRECTORY`, `ENOTDIR` for another file).
+pub(crate) fn mount_directory(c: &Context<'_>, ptr: u64) -> Result<Option<Vec<u8>>, Errno> {
+    let raw = path(c, ptr)?;
+    let found = mount_path(c, raw.clone(), true)?;
+    let mode = match &found {
+        Some(p) => c.files.namespaced().metadata(p, true)?.mode,
+        None => c.files.fs().metadata(&raw, true)?.mode,
+    };
+    if mode & 0o170000 != 0o040000 {
+        return Err(Errno::ENOTDIR);
+    }
+    Ok(found)
 }
 /// [`mount_target`] of the path `raw`, as `kern_path` finds a bind mount's
 /// source.

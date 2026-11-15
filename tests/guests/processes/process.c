@@ -9349,6 +9349,214 @@ static int remounts_case(void) {
     return 0;
 }
 
+/* The moves case: MS_MOVE and pivot_root in a mount namespace of a user
+   namespace of its own (Linux master's do_move_mount and path_pivot_root),
+   with the working directory going along with a moved mount, and the old
+   root under the new one. */
+static char mv_base[] = "/tmp/paludarium-moves-XXXXXX";
+static void mv_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", mv_base, name); }
+/* The mount point of the parent of the top mount at `point`, from the
+   base (`.` for the base, `outside` for a parent outside it), or `-` for
+   no mount there. */
+static void mv_parent(const char *label, const char *point) {
+    static long ids[512], parents[512];
+    static char paths[512][256];
+    int n = 0;
+    char line[4096], out[256];
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    while (f && n < 512 && fgets(line, sizeof line, f))
+        if (sscanf(line, "%ld %ld %*s %*s %255s", &ids[n], &parents[n], paths[n]) == 3) n++;
+    if (f) fclose(f);
+    const char *shown = "-";
+    for (int i = n - 1; i >= 0; i--) {
+        if (strcmp(paths[i], point)) continue;
+        shown = "outside";
+        size_t len = strlen(mv_base);
+        for (int j = 0; j < n; j++) {
+            if (ids[j] != parents[i] || strncmp(paths[j], mv_base, len)) continue;
+            if (paths[j][len] == 0) shown = ".";
+            else if (paths[j][len] == '/') {
+                snprintf(out, sizeof out, "%s", paths[j] + len + 1);
+                shown = out;
+            }
+        }
+        break;
+    }
+    printf("%s %s\n", label, shown);
+}
+/* Whether the working directory is `want`. */
+static int mv_cwd(const char *want) {
+    char cwd[512];
+    return getcwd(cwd, sizeof cwd) && !strcmp(cwd, want);
+}
+static long mv_pivot(const char *new_root, const char *put_old) {
+    return syscall(SYS_pivot_root, new_root, put_old);
+}
+/* The names in the directory at `path`, but for `.` and `..`, or -errno. */
+static int mv_names(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return -errno;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)))
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) n++;
+    closedir(d);
+    return n;
+}
+static int mv_inner(void) {
+    char a[256], b[256], c[256], s[256], f[256], n[256], path[512], other[512];
+    mv_path(a, "a");
+    mv_path(b, "b");
+    mv_path(c, "c");
+    mv_path(s, "s");
+    mv_path(f, "f");
+    mv_path(n, "n");
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("a", mount("none", a, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/in", a);
+    mkdir(path, 0755);
+    RM("in", mount("none", path, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/sub", a);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/x", a);
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    printf("\nmove");
+    RM("null", mount(NULL, b, NULL, MS_MOVE, NULL));
+    RM("empty", mount("", b, NULL, MS_MOVE, NULL));
+    mv_path(path, "missing");
+    RM("missing", mount(path, b, NULL, MS_MOVE, NULL));
+    RM("not-root", mount(mv_base, b, NULL, MS_MOVE, NULL));
+    RM("root", mount("/", b, NULL, MS_MOVE, NULL));
+    RM("onto-file", mount(a, f, NULL, MS_MOVE, NULL));
+    RM("onto-itself", mount(a, a, NULL, MS_MOVE, NULL));
+    snprintf(path, sizeof path, "%s/sub", a);
+    RM("into-itself", mount(a, path, NULL, MS_MOVE, NULL));
+    snprintf(path, sizeof path, "%s/in", a);
+    chdir(path);
+    RM("moved", mount(a, b, NULL, MS_MOVE, NULL));
+    snprintf(path, sizeof path, "%s/in", b);
+    printf(" cwd=%d", mv_cwd(path));
+    snprintf(path, sizeof path, "%s/x", a);
+    snprintf(other, sizeof other, "%s/x", b);
+    RM("old-x", access(path, F_OK));
+    RM("new-x", access(other, F_OK));
+    printf("\n");
+    mv_parent("a", a);
+    mv_parent("b", b);
+    snprintf(path, sizeof path, "%s/in", b);
+    mv_parent("b/in", path);
+    printf("child");
+    RM("moved", mount(path, c, NULL, MS_MOVE, NULL));
+    printf(" cwd=%d\n", mv_cwd(c));
+    mv_parent("c", c);
+    chdir("/");
+    printf("shared");
+    RM("s", mount("none", s, "tmpfs", 0, NULL));
+    RM("make", mount(NULL, s, NULL, MS_SHARED, NULL));
+    snprintf(path, sizeof path, "%s/t", s);
+    mkdir(path, 0755);
+    snprintf(other, sizeof other, "%s/u", s);
+    mkdir(other, 0755);
+    RM("onto-shared", mount(c, path, NULL, MS_MOVE, NULL));
+    printf("\n");
+    rm_info("s", s, NULL);
+    rm_info("s/t", path, NULL);
+    printf("from-shared");
+    RM("out", mount(path, c, NULL, MS_MOVE, NULL));
+    RM("unbindable", mount(NULL, b, NULL, MS_UNBINDABLE, NULL));
+    RM("onto-shared", mount(b, other, NULL, MS_MOVE, NULL));
+    printf("\npivot");
+    RM("n", mount("none", n, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/old", n);
+    mkdir(path, 0755);
+    snprintf(other, sizeof other, "%s/hello", n);
+    close(open(other, O_CREAT | O_WRONLY, 0644));
+    mv_path(other, "missing");
+    RM("missing", mv_pivot(other, n));
+    RM("file", mv_pivot(f, n));
+    RM("old-missing", mv_pivot(n, other));
+    RM("old-file", mv_pivot(n, f));
+    RM("outside", mv_pivot(n, b));
+    RM("not-root", mv_pivot(path, path));
+    RM("root", mv_pivot("/", path));
+    RM("make", mount(NULL, n, NULL, MS_SHARED, NULL));
+    RM("shared", mv_pivot(n, path));
+    RM("unmake", mount(NULL, n, NULL, MS_PRIVATE, NULL));
+    printf("\n");
+    struct stat before;
+    stat(mv_base, &before);
+    chdir(n);
+    printf("pivoted");
+    RM("pivot", mv_pivot(".", "old"));
+    printf(" cwd=%d", mv_cwd("/"));
+    RM("hello", access("/hello", F_OK));
+    snprintf(path, sizeof path, "/old%s/f", mv_base);
+    RM("old-f", access(path, F_OK));
+    snprintf(path, sizeof path, "/old%s/n/hello", mv_base);
+    RM("under", access(path, F_OK));
+    struct stat root, old, base;
+    stat("/", &root);
+    stat("/old", &old);
+    snprintf(path, sizeof path, "/old%s", mv_base);
+    stat(path, &base);
+    printf(" devices=%d base=%d", root.st_dev != old.st_dev,
+           base.st_dev == before.st_dev && base.st_ino == before.st_ino);
+    RM("busy", umount2("/old", 0));
+    RM("detach", umount2("/old", MNT_DETACH));
+    printf(" names=%d\n", mv_names("/old"));
+    printf("again");
+    mkdir("/next", 0755);
+    RM("next", mount("none", "/next", "tmpfs", 0, NULL));
+    close(open("/next/mark", O_CREAT | O_WRONLY, 0644));
+    chdir("/next");
+    RM("pivot", mv_pivot(".", "."));
+    RM("detach", umount2(".", MNT_DETACH));
+    chdir("/");
+    RM("mark", access("/mark", F_OK));
+    printf(" names=%d\n", mv_names("/"));
+    return 0;
+}
+static int moves_case(void) {
+    if (!mkdtemp(mv_base)) return 93;
+    chmod(mv_base, 0755);
+    const char *dirs[] = {"a", "b", "c", "s", "n"};
+    char path[256];
+    for (unsigned i = 0; i < 5; i++) {
+        mv_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    mv_path(path, "f");
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(mv_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    mv_path(path, "f");
+    unlink(path);
+    for (unsigned i = 0; i < 5; i++) {
+        mv_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(mv_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -26319,6 +26527,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
     if (!strcmp(mode, "binds")) return binds_case();
     if (!strcmp(mode, "remounts")) return remounts_case();
+    if (!strcmp(mode, "moves")) return moves_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();

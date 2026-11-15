@@ -512,13 +512,12 @@ verified.
   every file there as root's again.
 - **mount and umount2, in part**: `mount` makes only tmpfs and bind mounts;
   any other type is `ENODEV`, as from a kernel without it. Once Linux's
-  checks before them pass, `MS_MOVE`, `MS_NOSYMFOLLOW` on a tmpfs or set by
-  a remount, and a mount on, or a bind mount of, the
-  generated `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a
-  program learns they are not supported; `fsopen`,
-  `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`,
-  `mount_setattr`, `statmount`, `listmount` and `pivot_root` are not there
-  (`ENOSYS`). Propagation types are kept and shown, but nothing
+  checks before them pass, `MS_NOSYMFOLLOW` on a tmpfs or set by a
+  remount, and a mount on, a bind mount of or a move of the generated
+  `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a program
+  learns they are not supported; `fsopen`, `fsconfig`, `fsmount`,
+  `fspick`, `move_mount`, `open_tree`, `mount_setattr`, `statmount` and
+  `listmount` are not there (`ENOSYS`). Propagation types are kept and shown, but nothing
   propagates: a mount or an unmount under a shared mount does not reach
   its peers and slaves, as Linux's `propagate_mnt` and `propagate_umount`
   make it, so a peer of it shows no copy. The mounts from start-up are
@@ -549,7 +548,17 @@ verified.
   The mounts from start-up (the root and each `--mount`) cannot be
   unmounted: `umount2` gives `EINVAL` when one is locked (in a mount
   namespace a new user namespace made, where the root is locked too, as
-  Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise.
+  Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise, and
+  `MS_MOVE` of one gives `EOPNOTSUPP`: the lower filesystem shows each
+  `--mount` itself, so taking one away would show it again, not the
+  directory under it. After `pivot_root` the old root can go, but a
+  `--mount` under it still stays, and a new root that is a `--mount`
+  shows its files at its old place under `put_old` too, where Linux shows
+  the directory it covered. The generated `/proc` and `/dev` stay at the
+  root's `/proc` and `/dev` after `pivot_root`, where Linux's go to
+  `put_old` with the old root. A move or a `pivot_root` takes the roots
+  and working directories along, but an open descriptor keeps the path it
+  was opened at for what it does by path (`fchdir`, a lookup from it).
   Mounts are kept by their mount
   points' paths: a rename moves the mounts below the directory in the
   caller's namespace only, so another namespace's copies stay at the old
@@ -578,9 +587,7 @@ verified.
   comes before them, which shows only when both refuse. A rule on a file under
   `/proc` does not count for `execve`. An open checks the file its path
   reaches before it opens it (and the file it made after), so another thread
-  renaming the name in between can make the two differ. There is no
-  `pivot_root` (`ENOSYS`), which Linux refuses a thread in a domain
-  (`EPERM`), as `mount` and `umount2` here do.
+  renaming the name in between can make the two differ.
 - **seccomp**: a call that `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` keeps
   waiting for its listener looks for a fatal signal every 10 ms rather than
   waking for it. Nothing is logged (`SECCOMP_FILTER_FLAG_LOG`,

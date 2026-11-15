@@ -380,6 +380,10 @@ struct Entry {
     /// The peer group it is a slave of (its `mnt_master`'s), 0 for none.
     master: u64,
     unbindable: bool,
+    /// The mount below the namespace's root that `pivot_root` and a move
+    /// of a mount from start-up leave (Linux's rootfs): the lower
+    /// filesystem from its root, which no list shows and no walk enters.
+    hidden: bool,
 }
 impl Entry {
     fn id(&self) -> u64 {
@@ -461,8 +465,8 @@ pub struct MountTable {
     entries: RwLock<Arc<Vec<Entry>>>,
     /// Whether every mount is a boot one, so calls go straight through.
     boot_only: AtomicBool,
-    /// How many boot mounts there are: the first entries.
-    boot: usize,
+    /// Where the lower filesystem has its mounts, which it shows itself.
+    lower_points: Arc<Vec<Vec<u8>>>,
     numbers: Arc<Numbers>,
 }
 impl std::fmt::Debug for MountTable {
@@ -498,13 +502,14 @@ impl MountTable {
                     group: 0,
                     master: 0,
                     unbindable: false,
+                    hidden: false,
                 }
             })
             .collect();
         Self::registered(Self {
             entries: RwLock::new(Arc::new(entries)),
             boot_only: AtomicBool::new(true),
-            boot: mounts.len(),
+            lower_points: Arc::new(mounts.iter().map(|m| m.path.clone()).collect()),
             numbers,
         })
     }
@@ -527,11 +532,23 @@ impl MountTable {
     pub fn copy(&self, locked: bool) -> Arc<Self> {
         use mount_flags::*;
         let old = self.snapshot();
-        let mut ids = BTreeMap::new();
+        // Each copy's ID first, as a parent may come after a mount on it
+        // once a `pivot_root` moved them; the mount below the root keeps
+        // the number it is shown by.
+        let ids: BTreeMap<u64, u64> = old
+            .iter()
+            .map(|e| {
+                let id = if e.hidden {
+                    e.id()
+                } else {
+                    Numbers::take(&self.numbers.ids, 21)
+                };
+                (e.id(), id)
+            })
+            .collect();
         let mut entries = Vec::with_capacity(old.len());
         for e in old.iter() {
-            let id = Numbers::take(&self.numbers.ids, 21);
-            ids.insert(e.id(), id);
+            let id = ids[&e.id()];
             let (group, master) = match (locked, e.group) {
                 (true, 0) => (0, e.master),
                 (true, group) => (0, group),
@@ -569,7 +586,7 @@ impl MountTable {
         Self::registered(Self {
             entries: RwLock::new(Arc::new(entries)),
             boot_only: AtomicBool::new(self.boot_only.load(Ordering::SeqCst)),
-            boot: self.boot,
+            lower_points: Arc::clone(&self.lower_points),
             numbers: Arc::clone(&self.numbers),
         })
     }
@@ -581,7 +598,7 @@ impl MountTable {
         let mut entries = (**guard).clone();
         let out = f(&mut entries)?;
         self.boot_only
-            .store(entries.len() == self.boot, Ordering::SeqCst);
+            .store(entries.iter().all(|e| !e.runtime()), Ordering::SeqCst);
         *guard = Arc::new(entries);
         Ok(out)
     }
@@ -591,10 +608,10 @@ impl MountTable {
     }
     /// The boot mount holding `path`: the longest mount point.
     fn boot_index(&self, entries: &[Entry], path: &[u8]) -> usize {
-        entries[..self.boot]
+        entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| within(path, &e.point))
+            .filter(|(_, e)| !e.runtime() && within(path, &e.point))
             .max_by_key(|(_, e)| e.point.len())
             .map_or(0, |(i, _)| i)
     }
@@ -671,7 +688,9 @@ pub struct Target {
     pub id: u64,
     /// The path is the mount's root (Linux's `path_mounted`).
     pub root: bool,
-    /// The mount exists from start-up.
+    /// The mount is one from start-up that the lower filesystem shows
+    /// where it is, so taking it away would show that again, not the
+    /// directory under it: it cannot be unmounted or moved.
     pub boot: bool,
     /// The namespace's own root, which has no parent.
     pub namespace_root: bool,
@@ -766,13 +785,32 @@ impl NamespacedFs {
         let (fs, path) = self.backing(entries, loc);
         fs.metadata(&path, false)
     }
+    /// The namespace's root mount: the first, or once a `pivot_root` or a
+    /// move left the mount below it, the first on that one's root.
+    fn root_index(entries: &[Entry]) -> usize {
+        entries
+            .iter()
+            .find(|e| e.hidden)
+            .and_then(|below| {
+                entries
+                    .iter()
+                    .position(|e| !e.hidden && e.parent == below.id() && e.point == b"/")
+            })
+            .unwrap_or(0)
+    }
+    /// Where a walk starts: the machine's root, on the namespace's root
+    /// mount.
+    fn start(entries: &[Entry]) -> Loc {
+        let i = Self::root_index(entries);
+        Loc {
+            at: entries.get(i).filter(|e| e.runtime()).map(|_| i),
+            path: b"/".to_vec(),
+        }
+    }
     /// Where the process's root is: its path walked from the machine's
     /// root, stepping into each mount on the way.
     fn root_loc(&self, entries: &[Entry]) -> Loc {
-        let mut loc = Loc {
-            at: None,
-            path: b"/".to_vec(),
-        };
+        let mut loc = Self::start(entries);
         for part in self.root.split(|b| *b == b'/').filter(|p| !p.is_empty()) {
             loc.path = child_path(&loc.path, part);
             loc = self.cross(entries, loc);
@@ -817,10 +855,7 @@ impl NamespacedFs {
             .filter(|p| !p.is_empty())
             .map(Vec::from)
             .collect();
-        let mut current = Loc {
-            at: None,
-            path: b"/".to_vec(),
-        };
+        let mut current = Self::start(entries);
         let mut links = 0;
         while let Some(part) = queue.pop_front() {
             if self.lstat(entries, &current)?.mode & S_IFMT != S_IFDIR {
@@ -898,10 +933,7 @@ impl NamespacedFs {
                 return loc;
             }
             if path.len() <= 1 {
-                return Loc {
-                    at: None,
-                    path: b"/".to_vec(),
-                };
+                return Self::start(entries);
             }
             path = parent_path(&path);
         }
@@ -929,18 +961,100 @@ impl NamespacedFs {
         }
         out
     }
+    /// Whether taking mount `e` away would leave the lower filesystem's
+    /// own mount showing (see [`Target::boot`]): one from start-up not yet
+    /// made movable, or one on a mount of the lower filesystem's files at a
+    /// place where that filesystem has another mount.
+    fn stays(&self, entries: &[Entry], e: &Entry) -> bool {
+        if !e.runtime() {
+            return true;
+        }
+        let Some(parent) = entries
+            .iter()
+            .find(|p| p.id() == e.parent && p.id() != e.id())
+        else {
+            return false;
+        };
+        if parent.memory().is_some() {
+            return false;
+        }
+        let at = parent.inside(&e.point);
+        at != parent.root && self.table.lower_points.contains(&at)
+    }
+    /// Makes the mounts from start-up movable (`pivot_root`): each becomes
+    /// a mount of the lower filesystem's files where it is, as a bind
+    /// mount of them is, and the lower filesystem from its root goes below
+    /// the namespace's root, hidden, numbered as the root's parent is shown
+    /// (Linux's rootfs).
+    fn materialize(entries: &mut Vec<Entry>, numbers: &Arc<Numbers>) {
+        if entries.iter().any(|e| e.hidden) {
+            return;
+        }
+        let Some(Entry {
+            parent,
+            backing: Backing::Boot { kind, device },
+            ..
+        }) = entries.first().cloned()
+        else {
+            return;
+        };
+        for e in entries.iter_mut() {
+            if let Backing::Boot { kind, device } = e.backing {
+                e.backing = Backing::Lower {
+                    kind,
+                    device,
+                    base: e.point.clone(),
+                };
+                e.root.clone_from(&e.point);
+            }
+        }
+        entries.insert(
+            0,
+            Entry {
+                token: Token::new(parent, numbers, None, Arc::default()),
+                parent,
+                point: b"/".to_vec(),
+                backing: Backing::Boot { kind, device },
+                root: b"/".to_vec(),
+                flags: mount_flags::RELATIME,
+                locks: 0,
+                locked: false,
+                source: Vec::new(),
+                group: 0,
+                master: 0,
+                unbindable: false,
+                hidden: true,
+            },
+        );
+    }
     /// What `umount2` and `mount` find at the resolved `path` (whose last
     /// symbolic link is not followed).
     pub fn target(&self, path: &[u8]) -> Result<Target, Errno> {
+        self.target_crossing(path, false)
+    }
+    /// [`Self::target`] as `umount2` looks it up (`LOOKUP_MOUNTPOINT`):
+    /// stepping into a mount on where the path starts too, as a mount on
+    /// the root or on the working directory.
+    pub fn umount_target(&self, path: &[u8]) -> Result<Target, Errno> {
+        self.target_crossing(path, true)
+    }
+    fn target_crossing(&self, path: &[u8], start: bool) -> Result<Target, Errno> {
         let entries = self.table.snapshot();
         let loc = self.walk_keeping(&entries, path, false, false, true)?;
+        let loc = if start {
+            self.cross(&entries, loc)
+        } else {
+            loc
+        };
         let e = self.entry(&entries, &loc);
         let id = e.id();
         Ok(Target {
             id,
             root: e.point == loc.path,
-            boot: !e.runtime(),
-            namespace_root: entries.first().is_some_and(|first| first.id() == id),
+            boot: self.stays(&entries, e),
+            namespace_root: entries
+                .get(Self::root_index(&entries))
+                .is_some_and(|root| root.id() == id),
             locked: e.locked,
             covered: entries.iter().any(|c| c.parent == id && c.id() != id),
             owner: e.memory().and_then(|sb| sb.owner.clone()),
@@ -992,6 +1106,7 @@ impl NamespacedFs {
             group: 0,
             master: 0,
             unbindable: false,
+            hidden: false,
         };
         // `attach_recursive_mnt`: a mount on a shared one is shared too.
         if parent.group != 0 {
@@ -1082,6 +1197,230 @@ impl NamespacedFs {
             entries.extend(new);
             Ok(())
         })
+    }
+    /// The ID of the mount `path` resolves to (its nearest directory that
+    /// is there, for one that is not), leaving the expiry marks.
+    fn mount_of(&self, entries: &[Entry], path: &[u8]) -> u64 {
+        let mut path = path.to_vec();
+        loop {
+            if let Ok(loc) = self.walk_keeping(entries, &path, true, true, true) {
+                return self.id_of(entries, &loc);
+            }
+            if path.len() <= 1 {
+                return self.id_of(entries, &Self::start(entries));
+            }
+            path = parent_path(&path);
+        }
+    }
+    /// The entry numbered `id`, if this table has it (the root's parent,
+    /// before a `pivot_root`, it has not).
+    fn by_id(entries: &[Entry], id: u64) -> Option<&Entry> {
+        entries.iter().find(|e| e.id() == id)
+    }
+    /// Whether the mount `from`, going up from mount `mount` at `path`
+    /// through each mount's parent, is reached at or below `at`
+    /// (`is_path_reachable`).
+    fn reachable<'a>(
+        entries: &'a [Entry],
+        mut mount: &'a Entry,
+        mut path: Vec<u8>,
+        from: &Entry,
+        at: &[u8],
+    ) -> bool {
+        while mount.id() != from.id() {
+            match Self::by_id(entries, mount.parent).filter(|p| !p.hidden && p.id() != mount.id()) {
+                Some(parent) => {
+                    path.clone_from(&mount.point);
+                    mount = parent;
+                }
+                None => return false,
+            }
+        }
+        within(&path, at)
+    }
+    /// `MS_MOVE` (`do_move_mount`, Linux master's order): the resolved
+    /// `source` is a mount's root (`EINVAL`), a directory goes on a
+    /// directory and a file on a file (`EINVAL`), and the mount on top at
+    /// the resolved `target` takes it. The namespace's root, a locked
+    /// mount and one on a shared mount are `EINVAL`; a tree with an
+    /// unbindable mount onto a shared one is `EINVAL`, and onto itself or
+    /// a mount on it `ELOOP`. A mount the lower filesystem shows where it
+    /// is ([`Target::boot`]) is not supported (`EOPNOTSUPP`). The mount and
+    /// those on it move with their mount points, made shared on a shared
+    /// mount (`attach_recursive_mnt`). Each of `paths`, a root or a working
+    /// directory from the machine's root, comes back where it now is.
+    pub fn move_mount(
+        &self,
+        source: &[u8],
+        target: &[u8],
+        paths: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, Errno> {
+        let entries = self.table.snapshot();
+        let from = self.walk(&entries, source, true, false, true)?;
+        let old = self.entry(&entries, &from);
+        if old.point != from.path {
+            return Err(Errno::EINVAL);
+        }
+        let to = self.walk(&entries, target, true, false, true)?;
+        let directory = |loc: &Loc| -> Result<bool, Errno> {
+            Ok(self.lstat(&entries, loc)?.mode & S_IFMT == S_IFDIR)
+        };
+        if directory(&from)? != directory(&to)? {
+            return Err(Errno::EINVAL);
+        }
+        let root = &entries[Self::root_index(&entries)];
+        if old.id() == root.id() || old.locked {
+            return Err(Errno::EINVAL);
+        }
+        if Self::by_id(&entries, old.parent).is_some_and(|p| p.group != 0) {
+            return Err(Errno::EINVAL);
+        }
+        let dest = self.entry(&entries, &to);
+        let moving = Self::tree(&entries, old.id(), true);
+        let has = |id: &u64| Self::by_id(&entries, *id);
+        if dest.group != 0 && moving.iter().filter_map(has).any(|e| e.unbindable) {
+            return Err(Errno::EINVAL);
+        }
+        let mut up = Some(dest);
+        while let Some(at) = up {
+            if at.id() == old.id() {
+                return Err(ELOOP);
+            }
+            up = Self::by_id(&entries, at.parent).filter(|p| p.id() != at.id());
+        }
+        if self.stays(&entries, old) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let (id, point, parent) = (old.id(), old.point.clone(), dest.id());
+        let shared = dest.group != 0;
+        let mut fresh = Vec::new();
+        if shared {
+            for e in moving.iter().filter_map(has).filter(|e| e.group == 0) {
+                fresh.push((e.id(), self.table.new_group()));
+            }
+        }
+        let placed = paths
+            .iter()
+            .map(|p| {
+                if moving.contains(&self.mount_of(&entries, p)) {
+                    joined(&to.path, &relative(&point, p))
+                } else {
+                    p.clone()
+                }
+            })
+            .collect();
+        self.table.update(|entries| {
+            for e in entries.iter_mut().filter(|e| moving.contains(&e.id())) {
+                e.point = joined(&to.path, &relative(&point, &e.point));
+                if let Some((_, group)) = fresh.iter().find(|(id, _)| *id == e.id()) {
+                    e.group = *group;
+                }
+                if e.id() == id {
+                    e.parent = parent;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(placed)
+    }
+    /// `pivot_root` (`path_pivot_root`, Linux master's order), with the
+    /// resolved `new` root, `put_old` and the caller's `root`, each from the
+    /// machine's root: a shared mount at `put_old`, under `new` or under the
+    /// root is `EINVAL`, a locked `new` too; `new` or `put_old` on the
+    /// root's mount `EBUSY`; then the root and `new` must be mounts' roots
+    /// (`EINVAL`), `put_old` at or below `new`, and `new` below the root
+    /// (`EINVAL`). The mount of `new` and those on it take the root's
+    /// place, and the root's mount with the rest of its tree goes on
+    /// `put_old`, `new` taking over its lock (`MNT_LOCKED`). Each of
+    /// `paths` comes back where it now is, the root itself staying the
+    /// root (`chroot_fs_refs`).
+    pub fn pivot_root(
+        &self,
+        new: &[u8],
+        put_old: &[u8],
+        root: &[u8],
+        paths: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, Errno> {
+        let entries = self.table.snapshot();
+        let new_loc = self.walk(&entries, new, true, false, true)?;
+        let old_loc = self.walk(&entries, put_old, true, false, true)?;
+        let root_loc = self.walk(&entries, root, true, false, true)?;
+        let new_mnt = self.entry(&entries, &new_loc);
+        let old_mnt = self.entry(&entries, &old_loc);
+        let root_mnt = self.entry(&entries, &root_loc);
+        let shared = |id: u64| Self::by_id(&entries, id).is_some_and(|e| e.group != 0);
+        if old_mnt.group != 0 || shared(new_mnt.parent) || shared(root_mnt.parent) {
+            return Err(Errno::EINVAL);
+        }
+        if new_mnt.locked {
+            return Err(Errno::EINVAL);
+        }
+        if new_mnt.id() == root_mnt.id() || old_mnt.id() == root_mnt.id() {
+            return Err(EBUSY);
+        }
+        if root_loc.path != root_mnt.point || new_loc.path != new_mnt.point {
+            return Err(Errno::EINVAL);
+        }
+        if !Self::reachable(
+            &entries,
+            old_mnt,
+            old_loc.path.clone(),
+            new_mnt,
+            &new_loc.path,
+        ) || !Self::reachable(
+            &entries,
+            new_mnt,
+            new_loc.path.clone(),
+            root_mnt,
+            &root_loc.path,
+        ) {
+            return Err(Errno::EINVAL);
+        }
+        let new_tree = Self::tree(&entries, new_mnt.id(), true);
+        let old_tree: Vec<u64> = Self::tree(&entries, root_mnt.id(), true)
+            .into_iter()
+            .filter(|id| !new_tree.contains(id))
+            .collect();
+        let (n, r) = (new_mnt.point.clone(), root_mnt.point.clone());
+        let put = joined(&r, &relative(&n, &old_loc.path));
+        let place = |p: &[u8], id: u64| {
+            if new_tree.contains(&id) {
+                joined(&r, &relative(&n, p))
+            } else if old_tree.contains(&id) {
+                joined(&put, &relative(&r, p))
+            } else {
+                p.to_vec()
+            }
+        };
+        let placed = paths
+            .iter()
+            .map(|p| {
+                if *p == root_loc.path {
+                    p.clone()
+                } else {
+                    place(p, self.mount_of(&entries, p))
+                }
+            })
+            .collect();
+        let (new_id, root_id, old_id) = (new_mnt.id(), root_mnt.id(), old_mnt.id());
+        let (root_parent, root_locked) = (root_mnt.parent, root_mnt.locked);
+        let numbers = Arc::clone(&self.table.numbers);
+        self.table.update(|entries| {
+            Self::materialize(entries, &numbers);
+            for e in entries.iter_mut() {
+                let id = e.id();
+                e.point = place(&e.point, id);
+                if id == new_id {
+                    e.parent = root_parent;
+                    e.locked |= root_locked;
+                } else if id == root_id {
+                    e.parent = old_id;
+                    e.locked = false;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(placed)
     }
     /// Unmounts the tmpfs mount `id` (`umount_tree`): with `detach` it and
     /// every mount on it go at once, its open files staying usable;
@@ -1316,6 +1655,7 @@ impl FileSystem for NamespacedFs {
         let entries = self.table.snapshot();
         entries
             .iter()
+            .filter(|e| !e.hidden)
             .map(|e| {
                 let (kind, device, root, common_options, super_options) = match &e.backing {
                     Backing::Boot { kind, device } => {

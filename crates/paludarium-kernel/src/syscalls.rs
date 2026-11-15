@@ -349,6 +349,7 @@ impl SyscallTable {
         handlers.insert(103, crate::syslog::sys_syslog);
         handlers.insert(165, crate::mounts::sys_mount);
         handlers.insert(166, crate::mounts::sys_umount2);
+        handlers.insert(155, crate::mounts::sys_pivot_root);
         handlers.insert(167, crate::admin::sys_swapon);
         handlers.insert(168, crate::admin::sys_swapoff);
         handlers.insert(175, crate::admin::sys_init_module);

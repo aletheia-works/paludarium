@@ -569,3 +569,236 @@ fn an_expiry_mark_goes_with_a_use() {
     keeping_expiry(|| fs.metadata(b"/tmp/m", true)).unwrap();
     fs.expire(id).unwrap();
 }
+
+#[test]
+fn a_moved_mount_takes_the_mounts_on_it_and_uncovers_its_old_place() {
+    let (_, fs) = machine();
+    fs.mkdir(b"/tmp/n", 0o755).unwrap();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d", 0o755).unwrap();
+    fs.mount(b"/tmp/m/d", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/d/x", 66, 0o644)
+        .unwrap()
+        .write(b"in")
+        .unwrap();
+    let (m, d) = (
+        fs.target(b"/tmp/m").unwrap().id,
+        fs.target(b"/tmp/m/d").unwrap().id,
+    );
+    let n = fs.mount_id(b"/tmp/n");
+    let paths = [b"/tmp/m/d".to_vec(), b"/tmp/m".to_vec(), b"/tmp".to_vec()];
+    let placed = fs.move_mount(b"/tmp/m", b"/tmp/n", &paths).unwrap();
+    assert_eq!(
+        placed,
+        [b"/tmp/n/d".to_vec(), b"/tmp/n".to_vec(), b"/tmp".to_vec()]
+    );
+    assert_eq!(&*fs.read_file(b"/tmp/n/d/x").unwrap(), b"in");
+    assert!(fs.metadata(b"/tmp/m/under", true).is_ok());
+    let mounts = fs.mounts();
+    let at = |id: u64| mounts.iter().find(|e| e.id == id).unwrap().clone();
+    assert_eq!((at(m).path, at(m).parent), (b"/tmp/n".to_vec(), n));
+    assert_eq!((at(d).path, at(d).parent), (b"/tmp/n/d".to_vec(), m));
+    // A move onto a shared mount makes the tree shared.
+    fs.mkdir(b"/tmp/s", 0o755).unwrap();
+    fs.mount(b"/tmp/s", tmpfs(0)).unwrap();
+    let s = fs.target(b"/tmp/s").unwrap().id;
+    fs.change_type(s, Propagation::Shared, false).unwrap();
+    fs.mkdir(b"/tmp/s/in", 0o755).unwrap();
+    fs.move_mount(b"/tmp/n", b"/tmp/s/in", &[]).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/s/in"), " shared:2");
+    assert_eq!(tags(&fs, b"/tmp/s/in/d"), " shared:3");
+}
+
+#[test]
+fn a_move_is_checked_in_linux_order() {
+    let (_, fs) = machine();
+    fs.mkdir(b"/tmp/n", 0o755).unwrap();
+    // Not a mount's root, then the root of the namespace.
+    assert_eq!(fs.move_mount(b"/tmp", b"/tmp/n", &[]), Err(Errno::EINVAL));
+    assert_eq!(fs.move_mount(b"/", b"/tmp/n", &[]), Err(Errno::EINVAL));
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/in", 0o755).unwrap();
+    // A directory onto a file, onto itself and into itself.
+    assert_eq!(fs.move_mount(b"/tmp/m", b"/tmp/f", &[]), Err(Errno::EINVAL));
+    assert_eq!(fs.move_mount(b"/tmp/m", b"/tmp/m", &[]), Err(ELOOP));
+    assert_eq!(fs.move_mount(b"/tmp/m", b"/tmp/m/in", &[]), Err(ELOOP));
+    // One on a shared mount.
+    fs.mount(b"/tmp/m/in", tmpfs(0)).unwrap();
+    let m = fs.target(b"/tmp/m").unwrap().id;
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    assert_eq!(
+        fs.move_mount(b"/tmp/m/in", b"/tmp/n", &[]),
+        Err(Errno::EINVAL)
+    );
+    // An unbindable tree onto a shared mount.
+    fs.change_type(m, Propagation::Unbindable, false).unwrap();
+    fs.mkdir(b"/tmp/n/s", 0o755).unwrap();
+    fs.mount(b"/tmp/n/s", tmpfs(0)).unwrap();
+    let s = fs.target(b"/tmp/n/s").unwrap().id;
+    fs.change_type(s, Propagation::Shared, false).unwrap();
+    assert_eq!(
+        fs.move_mount(b"/tmp/m", b"/tmp/n/s", &[]),
+        Err(Errno::EINVAL)
+    );
+}
+
+/// A machine with `/tmp`, `/new` and a mount from start-up of a host
+/// directory, named `name`, at `/data` holding `/data/x`; the directory
+/// goes when the guard does.
+fn machine_with_data(name: &str) -> (NamespacedFs, HostDir) {
+    let base = MemFs::new();
+    base.mkdir(b"/tmp", 0o1777).unwrap();
+    base.mkdir(b"/new", 0o755).unwrap();
+    let host = std::env::temp_dir().join(format!(
+        "paludarium-namespace-{name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&host).unwrap();
+    std::fs::write(host.join("x"), b"data").unwrap();
+    let mut mounted = MountedFs::new(base);
+    mounted
+        .mount(
+            b"/data".to_vec(),
+            Arc::new(paludarium_host::NativeFs::new(&host).unwrap()),
+        )
+        .unwrap();
+    let lower: Arc<dyn FileSystem> = Arc::new(mounted);
+    let fs = NamespacedFs::new(Arc::clone(&lower), MountTable::new(&*lower));
+    (fs, HostDir(host))
+}
+/// The names in the directory at `path`, but for `.` and `..`.
+fn names(fs: &NamespacedFs, path: &[u8]) -> Vec<Vec<u8>> {
+    fs.read_dir(path)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n != b"." && n != b"..")
+        .collect()
+}
+/// A host directory removed when it goes.
+struct HostDir(std::path::PathBuf);
+impl Drop for HostDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn pivot_root_puts_the_old_root_under_the_new() {
+    let (fs, _host) = machine_with_data("pivot");
+    let lower = Arc::clone(&fs.lower);
+    let boot = fs.mounts();
+    let (root, data) = (boot[0].clone(), boot[1].clone());
+    // A mount from start-up stays where the lower filesystem has it.
+    assert!(fs.target(b"/data").unwrap().boot);
+    assert_eq!(
+        fs.move_mount(b"/data", b"/tmp", &[]),
+        Err(Errno::EOPNOTSUPP)
+    );
+    fs.mount(b"/new", tmpfs(0)).unwrap();
+    fs.mkdir(b"/new/old", 0o755).unwrap();
+    fs.open(b"/new/file", 66, 0o644)
+        .unwrap()
+        .write(b"new")
+        .unwrap();
+    let new = fs.target(b"/new").unwrap().id;
+    let paths = [
+        b"/".to_vec(),
+        b"/new".to_vec(),
+        b"/tmp".to_vec(),
+        b"/data".to_vec(),
+    ];
+    let placed = fs.pivot_root(b"/new", b"/new/old", b"/", &paths).unwrap();
+    assert_eq!(
+        placed,
+        [
+            b"/".to_vec(),
+            b"/".to_vec(),
+            b"/old/tmp".to_vec(),
+            b"/old/data".to_vec()
+        ]
+    );
+    assert_eq!(&*fs.read_file(b"/file").unwrap(), b"new");
+    assert_eq!(&*fs.read_file(b"/old/data/x").unwrap(), b"data");
+    assert!(fs.metadata(b"/old/tmp", true).is_ok());
+    // The old root's place under it is the new root's mount point.
+    assert_eq!(names(&fs, b"/old/new"), Vec::<Vec<u8>>::new());
+    let mounts = fs.mounts();
+    let at = |id: u64| mounts.iter().find(|e| e.id == id).unwrap().clone();
+    assert_eq!(mounts.len(), 3);
+    assert_eq!((at(new).path, at(new).parent), (b"/".to_vec(), root.parent));
+    assert_eq!(
+        (at(root.id).path, at(root.id).parent),
+        (b"/old".to_vec(), new)
+    );
+    assert_eq!(
+        (at(data.id).path, at(data.id).parent),
+        (b"/old/data".to_vec(), root.id)
+    );
+    assert_eq!(
+        (at(root.id).root, at(data.id).root),
+        (b"/".to_vec(), b"/".to_vec())
+    );
+    let found = fs.target(b"/").unwrap();
+    assert!(found.namespace_root && found.id == new);
+    // The data mount still stays; the old root goes, with it.
+    assert!(fs.target(b"/old/data").unwrap().boot);
+    let old = fs.target(b"/old").unwrap();
+    assert!(!old.boot && !old.namespace_root);
+    // A copy keeps it all.
+    let copy = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(false));
+    assert_eq!(&*copy.read_file(b"/old/data/x").unwrap(), b"data");
+    assert_eq!(copy.mounts().len(), 3);
+    // In the order they were made, as Linux lists them by their IDs.
+    let copied = copy.mounts();
+    assert_eq!(copied[2].path, b"/");
+    assert_eq!(copied[2].parent, root.parent);
+    assert_eq!(copied[0].parent, copied[2].id);
+    fs.umount(old.id, true).unwrap();
+    assert_eq!(names(&fs, b"/old"), Vec::<Vec<u8>>::new());
+    assert_eq!(fs.mounts().len(), 1);
+}
+
+#[test]
+fn pivot_root_is_checked_in_linux_order() {
+    let (fs, _host) = machine_with_data("pivot-order");
+    fs.mount(b"/new", tmpfs(0)).unwrap();
+    fs.mkdir(b"/new/old", 0o755).unwrap();
+    fs.mkdir(b"/new/sub", 0o755).unwrap();
+    // On the root's mount, or the root itself.
+    assert_eq!(fs.pivot_root(b"/new", b"/tmp", b"/", &[]), Err(EBUSY));
+    assert_eq!(fs.pivot_root(b"/", b"/new/old", b"/", &[]), Err(EBUSY));
+    // Not a mount's root.
+    assert_eq!(
+        fs.pivot_root(b"/new/sub", b"/new/old", b"/", &[]),
+        Err(Errno::EINVAL)
+    );
+    // put_old not under the new root.
+    assert_eq!(
+        fs.pivot_root(b"/new", b"/data", b"/", &[]),
+        Err(Errno::EINVAL)
+    );
+    // A shared new root's parent, then a locked new root.
+    let new = fs.target(b"/new").unwrap().id;
+    fs.change_type(new, Propagation::Shared, false).unwrap();
+    assert_eq!(
+        fs.pivot_root(b"/new", b"/new/old", b"/", &[]),
+        Err(Errno::EINVAL)
+    );
+    fs.change_type(new, Propagation::Private, false).unwrap();
+    let locked = NamespacedFs::new(Arc::clone(&fs.lower), fs.table().copy(true));
+    assert_eq!(
+        locked.pivot_root(b"/new", b"/new/old", b"/", &[]),
+        Err(Errno::EINVAL)
+    );
+    // The new root takes over the old root's lock.
+    let (first, _locked_host) = machine_with_data("pivot-locked");
+    let fs = NamespacedFs::new(Arc::clone(&first.lower), first.table().copy(true));
+    fs.mkdir(b"/tmp/new", 0o755).unwrap();
+    fs.mount(b"/tmp/new", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/new/old", 0o755).unwrap();
+    fs.pivot_root(b"/tmp/new", b"/tmp/new/old", b"/", &[])
+        .unwrap();
+    assert!(fs.target(b"/").unwrap().locked);
+    assert!(!fs.target(b"/old").unwrap().locked);
+}

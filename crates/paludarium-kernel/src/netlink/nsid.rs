@@ -114,6 +114,7 @@ impl Drop for Resolved {
 /// `EBADF` for a descriptor.
 pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
     let mut found = Vec::new();
+    let mut any = false;
     while bytes.len() >= 16 {
         let header = Header::read(bytes);
         let len = header.len as usize;
@@ -121,6 +122,7 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
             break;
         }
         if matches!(header.kind, RTM_NEWNSID | RTM_GETNSID) {
+            any = true;
             let mut attributes = bytes[16..len].get(4..).unwrap_or_default();
             while attributes.len() >= 4 {
                 let size = usize::from(u16::from_le_bytes([attributes[0], attributes[1]]));
@@ -144,8 +146,9 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
         }
         bytes = &bytes[super::align(len).min(bytes.len())..];
     }
-    let credentials = c.process.credentials.clone();
-    RESOLVED.with(|r| *r.borrow_mut() = (found, Some(credentials)));
+    // Only those requests read the sender's credentials (`admin_over`).
+    let credentials = any.then(|| c.process.credentials.clone());
+    RESOLVED.with(|r| *r.borrow_mut() = (found, credentials));
     Resolved
 }
 /// The namespace `reference` names, for [`resolve`].

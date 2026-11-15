@@ -22,10 +22,14 @@ fn tmpfs(blocks: u64) -> NewTmpfs {
     fs.set_mode(b"/", 0o1777).unwrap();
     NewTmpfs {
         fs,
-        blocks,
-        inodes: 0,
-        common_options: String::new(),
-        super_options: format!(",size={}k", blocks * 4),
+        settings: Settings {
+            blocks,
+            inodes: 0,
+            common_options: String::new(),
+            super_options: format!(",size={}k", blocks * 4),
+            parsed: Arc::new(()),
+        },
+        read_only: false,
         flags: mount_flags::RELATIME,
         source: b"none".to_vec(),
         owner: None,
@@ -434,4 +438,134 @@ fn a_recursive_bind_of_the_root_copies_the_boot_mounts() {
     assert_eq!(fs.mount_id(b"/tmp/r/data/sub"), copy.id);
     drop((fs, lower));
     std::fs::remove_dir_all(&host).unwrap();
+}
+
+/// The optional fields of the mountinfo line at `path`.
+fn tags(fs: &NamespacedFs, path: &[u8]) -> String {
+    fs.mounts()
+        .into_iter()
+        .rev()
+        .find(|m| m.path == path)
+        .unwrap()
+        .tags
+}
+
+#[test]
+fn a_read_only_mount_is_found_by_its_paths() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d", 0o755).unwrap();
+    assert!(!fs.any_read_only());
+    let id = fs.target(b"/tmp/m").unwrap().id;
+    fs.reconfigure_mount(id, mount_flags::READONLY | mount_flags::NOATIME)
+        .unwrap();
+    assert!(fs.any_read_only());
+    let ro = ReadOnly {
+        mount: true,
+        superblock: false,
+    };
+    assert_eq!(fs.read_only(b"/tmp/m/d", true), ro);
+    // A missing name is on its directory's mount.
+    assert_eq!(fs.read_only(b"/tmp/m/new", true), ro);
+    assert_eq!(fs.read_only(b"/tmp/f", true), ReadOnly::default());
+    let line = fs.mounts().pop().unwrap();
+    assert!(line.read_only && !line.super_read_only);
+    assert_eq!(line.options, ",noatime");
+    assert_eq!(fs.statfs_flags(b"/tmp/m"), 0x421);
+}
+
+#[test]
+fn a_writer_keeps_a_mount_and_its_superblock_writable() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.bind(b"/tmp/m", b"/tmp/b", false).unwrap();
+    let (m, b) = (
+        fs.target(b"/tmp/m").unwrap().id,
+        fs.target(b"/tmp/b").unwrap().id,
+    );
+    fs.open(b"/tmp/m/f", 66, 0o600).unwrap();
+    let writer = fs.mount_writer(b"/tmp/m/f", true);
+    assert!(writer.is_some());
+    assert_eq!(fs.reconfigure_mount(m, mount_flags::READONLY), Err(EBUSY));
+    // The bind mount has no writer of its own, but its superblock has.
+    fs.reconfigure_mount(b, mount_flags::READONLY).unwrap();
+    let mut keep = |_: InUse<'_>| Ok(None);
+    assert_eq!(fs.reconfigure(b, true, 0, &mut keep), Err(EBUSY));
+    drop(writer);
+    fs.reconfigure(b, true, mount_flags::RELATIME, &mut keep)
+        .unwrap();
+    let ro = fs.read_only(b"/tmp/m", true);
+    assert!(ro.mount && ro.superblock);
+    let lines = fs.mounts();
+    let m_line = lines.iter().find(|l| l.id == m).unwrap();
+    assert!(!m_line.read_only && m_line.super_read_only);
+}
+
+#[test]
+fn propagation_types_show_peer_groups_and_masters() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    let m = fs.target(b"/tmp/m").unwrap().id;
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    fs.bind(b"/tmp/m", b"/tmp/b", false).unwrap();
+    let b = fs.target(b"/tmp/b").unwrap().id;
+    assert_eq!(tags(&fs, b"/tmp/m"), " shared:1");
+    assert_eq!(tags(&fs, b"/tmp/b"), " shared:1");
+    fs.change_type(b, Propagation::Slave, false).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/b"), " master:1");
+    fs.change_type(b, Propagation::Shared, false).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/b"), " shared:2 master:1");
+    // The master's last peer goes: its slave follows its master, none.
+    fs.change_type(m, Propagation::Private, false).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/m"), "");
+    assert_eq!(tags(&fs, b"/tmp/b"), " shared:2");
+    fs.change_type(b, Propagation::Unbindable, false).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/b"), " unbindable");
+    fs.mkdir(b"/tmp/c", 0o755).unwrap();
+    assert_eq!(fs.bind(b"/tmp/b", b"/tmp/c", false), Err(Errno::EINVAL));
+    // Group 1 is free again, and a mount on a shared one is shared.
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/m"), " shared:1");
+    fs.mkdir(b"/tmp/m/d", 0o755).unwrap();
+    fs.mount(b"/tmp/m/d", tmpfs(0)).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/m/d"), " shared:2");
+    fs.change_type(m, Propagation::Private, true).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/m/d"), "");
+}
+
+#[test]
+fn a_copy_into_another_user_namespace_is_a_locked_slave() {
+    let (lower, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    let m = fs.target(b"/tmp/m").unwrap().id;
+    fs.reconfigure_mount(m, mount_flags::READONLY | mount_flags::NOSUID)
+        .unwrap();
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    let peer = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(false));
+    assert_eq!(tags(&peer, b"/tmp/m"), " shared:1");
+    let slave = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(true));
+    assert_eq!(tags(&slave, b"/tmp/m"), " master:1");
+    let found = slave.target(b"/tmp/m").unwrap();
+    use mount_flags::*;
+    assert_eq!(found.locks, LOCK_ATIME | LOCK_READONLY | LOCK_NOSUID);
+    // The first namespace's mount goes private; a peer is left in the copy.
+    fs.change_type(m, Propagation::Private, false).unwrap();
+    assert_eq!(tags(&slave, b"/tmp/m"), " master:1");
+    drop(peer);
+    // With the last peer gone, the slave is private.
+    assert_eq!(tags(&slave, b"/tmp/m"), "");
+}
+
+#[test]
+fn an_expiry_mark_goes_with_a_use() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    let id = fs.target(b"/tmp/m").unwrap().id;
+    assert_eq!(fs.expire(id), Err(Errno::EAGAIN));
+    fs.metadata(b"/tmp/m", true).unwrap();
+    assert_eq!(fs.expire(id), Err(Errno::EAGAIN));
+    keeping_expiry(|| fs.metadata(b"/tmp/m", true)).unwrap();
+    fs.expire(id).unwrap();
 }

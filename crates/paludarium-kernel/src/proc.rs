@@ -789,17 +789,22 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
         let source = escape(&mount.source);
         let (kind, options) = (mount.kind, &mount.options);
         let (common, fs) = (&mount.common_options, &mount.super_options);
+        let state = |read_only: bool| if read_only { "ro" } else { "rw" };
         if mountinfo {
             let device = mount.device;
             let major = (device >> 8) & 0xfff | (device >> 32) & !0xfff;
             let minor = device & 0xff | (device >> 12) & !0xff;
+            let (own, sb) = (state(mount.read_only), state(mount.super_read_only));
+            let tags = &mount.tags;
             out.push_str(&format!(
-                "{} {} {major}:{minor} {root} {path} rw{options} - {kind} {source} rw{common}{fs}\n",
+                "{} {} {major}:{minor} {root} {path} {own}{options}{tags} - {kind} {source} {sb}{common}{fs}\n",
                 mount.id, mount.parent
             ));
         } else {
+            // `show_vfsmnt`: read-only when the mount or its superblock is.
+            let both = state(mount.read_only || mount.super_read_only);
             out.push_str(&format!(
-                "{source} {path} {kind} rw{common}{options}{fs} 0 0\n"
+                "{source} {path} {kind} {both}{common}{options}{fs} 0 0\n"
             ));
         }
     }

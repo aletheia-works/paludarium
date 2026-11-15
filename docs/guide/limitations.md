@@ -48,11 +48,11 @@ verified.
   those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `um`, `uw` or `ui` (`userfaultfd`), and no `ht` or `dp` (`MAP_HUGETLB`,
-  `MAP_DROPPABLE`).
+  `uw` or `ui` (`userfaultfd`'s write-protect and minor modes, which are
+  not offered), and no `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, `/proc/sys` but for `fs/mqueue`, ...) and the other names in
+  (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
   the reader's own directory (`auxv`, `limits`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `fd`, `maps`,
@@ -530,6 +530,19 @@ verified.
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
+- **userfaultfd, in part**: only missing pages are registered. The
+  write-protect and minor modes are refused (`EINVAL`), and
+  `UFFDIO_WRITEPROTECT`, `UFFDIO_CONTINUE`, `UFFDIO_MOVE` and
+  `UFFDIO_POISON` are not offered (`EINVAL`), nor the events of `fork`,
+  `mremap`, `madvise` and `munmap` or the write-protect features, which
+  `UFFDIO_API` does not report and refuses (`EINVAL`); the ioctls
+  `UFFDIO_REGISTER` and `fdinfo` report leave them out too. Shared memory
+  of a file (a memfd, a tmpfs file, System V shared memory) cannot be
+  registered (`EINVAL`), where Linux takes any shmem. A system call's own
+  copy to or from a missing page of a registered range is `EFAULT`, as with
+  `UFFD_USER_MODE_ONLY`, where Linux waits for the page as for an
+  instruction. There is no `/dev/userfaultfd` and no
+  `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: permission events (`FAN_OPEN_PERM`,
   `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM`) are taken by `fanotify_mark` but
   never sent, so what they would ask is let through, and a response names no

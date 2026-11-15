@@ -66,6 +66,7 @@ mod threads;
 mod timerfd;
 mod timers;
 mod unix;
+mod userfaultfd;
 mod users;
 pub use processes::Processes;
 pub use threads::ThreadGroup;
@@ -614,6 +615,61 @@ impl Kernel {
         Some(self.checkpoint(thread, mem))
     }
 
+    /// The fault of `thread` on a page the `userfaultfd` numbered `context`
+    /// waits for ([`userfaultfd::fault`]): it waits, or with
+    /// `UFFD_FEATURE_SIGBUS` takes SIGBUS (`BUS_ADRERR`), as Linux's
+    /// `do_sigbus` sends it for the address.
+    fn userfault(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        context: u64,
+        addr: paludarium_types::GuestAddr,
+        write: bool,
+        fetch: bool,
+    ) -> Next {
+        memfd::enter(self.group.memlock());
+        fanotify::enter(thread.state.pid, thread.tid);
+        signalfd::observe(&thread.state, &self.inbox, &self.group);
+        let mut ctx = syscalls::Context {
+            number: 0,
+            tid: thread.tid,
+            host: &*self.host,
+            shared_host: &self.host,
+            files: &mut self.files,
+            process: &mut thread.state,
+            cpu: &mut thread.cpu,
+            mem,
+            cancellation: &self.cancellation,
+            inbox: &self.inbox,
+            group: &self.group,
+            processes: &self.processes,
+        };
+        let sigbus = userfaultfd::fault(&mut ctx, context, addr.0, write, fetch) == Some(true);
+        self.inbox.drain(&mut thread.state);
+        if sigbus {
+            signals::queue(
+                &mut thread.state,
+                signals::PendingSignal {
+                    target: signals::PendingTarget::Thread,
+                    number: signal::SIGBUS,
+                    code: 2,
+                    addr: addr.0,
+                    trap: 14,
+                    error: 4 | (u64::from(write) * 2) | (u64::from(fetch) * 16),
+                    synchronous: true,
+                    timer: None,
+                    child: None,
+                    sender: None,
+                    sender_uid: None,
+                    queued: None,
+                    born: signals::generation(),
+                },
+            );
+        }
+        self.checkpoint(thread, mem)
+    }
+
     /// Queues a signal in a thread's process-pending view (manual Kernel clients).
     pub fn queue_signal(
         &mut self,
@@ -905,6 +961,22 @@ impl Kernel {
             thread.cpu.rip = rip;
             return self.checkpoint(thread, mem);
         }
+        // A page a `userfaultfd` registered, which has none: the thread
+        // waits for it, then the instruction runs again
+        // (`handle_userfault`).
+        if let ExitReason::PageFault {
+            rip,
+            addr,
+            write,
+            fetch,
+            mapped: true,
+            present: false,
+        } = reason
+            && let Some(context) = mem.userfault_for(addr, write, fetch)
+        {
+            thread.cpu.rip = rip;
+            return self.userfault(thread, mem, context, addr, write, fetch);
+        }
         let fault = match reason {
             ExitReason::PageFault {
                 rip,
@@ -1192,5 +1264,7 @@ mod fanotify_tests;
 mod keys_tests;
 #[cfg(test)]
 mod processes_tests;
+#[cfg(test)]
+mod userfaultfd_tests;
 #[cfg(test)]
 mod wasm_tests;

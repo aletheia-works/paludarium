@@ -94,8 +94,9 @@ otherwise. It copies nothing either way: a program that changes its code often,
 as a JIT does, fills the room with blocks of earlier generations again and again.
 
 When an instruction is decoded, the most frequent simple
-forms (`nop` and `endbr64`, moves between registers and memory, `movzx` from
-memory, `lea`, `push` and `pop`, direct branches, `call`, `ret`, `add`, `sub`,
+forms (`nop` and `endbr64`, moves between registers and memory, `movzx`,
+`movsx` and `movsxd` from a register or memory, `cbw`, `cwde` and `cdqe`,
+`lea`, `push` and `pop`, direct branches, `call`, `ret`, `add`, `sub`,
 `and`, `or`, `xor`, `cmp` and `test` on a register, and `cmp` and `test` on
 memory) are also worked out: their operands are taken out in advance,
 so running them needs neither the general dispatch by mnemonic nor the general

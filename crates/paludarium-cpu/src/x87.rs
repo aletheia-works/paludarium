@@ -1650,9 +1650,8 @@ impl X87 {
         self.summarize();
         image
     }
-    /// `fldenv`, which takes the status word as it is, with its summary, as a
-    /// CPU does.
-    /// [`ENVIRONMENT`] or [`ENVIRONMENT_16`] bytes.
+    /// `fldenv` of an image of [`ENVIRONMENT`] or [`ENVIRONMENT_16`] bytes,
+    /// which takes the status word as it is, with its summary, as a CPU does.
     pub(crate) fn load_environment(&mut self, image: &[u8]) {
         let step = if image.len() == ENVIRONMENT { 4 } else { 2 };
         let word = |at: usize| u16::from_le_bytes([image[at * step], image[at * step + 1]]);

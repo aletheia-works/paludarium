@@ -65,7 +65,9 @@ verified.
   what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is not
   seen. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
-  used.
+  used. A generated file's `stat` gives its length as its size
+  (`mountinfo`, `status`, `stat`, `loadavg` and the like), where Linux's
+  seq files are of size 0; `maps`, `smaps` and `fdinfo` are 0 as on Linux.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
   root. As `mount` mounts nothing on `/proc` or `/dev` and cannot bind
@@ -648,8 +650,8 @@ verified.
   (`gc_thresh1` is never reached); neighbours are not dumped
   (`RTM_GETNEIGH` is `EOPNOTSUPP`), and their cache information counts
   from when each was made.
-  `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
-  listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
+  `NETLINK_LISTEN_ALL_NSID` and the other options not listed in the
+  features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps

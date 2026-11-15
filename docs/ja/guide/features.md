@@ -1430,12 +1430,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `getsockname` と `getpeername` はポートとグループを返し、ほかのソケットのポートへの
     データグラムはそのソケットに届きます（なければ `ECONNREFUSED`）。`recvmsg` は送り手の
     `sockaddr_nl` を返し、`MSG_PEEK` と `MSG_TRUNC` が使えます。`SO_RCVBUF`、
-    `SO_SNDBUF`、`SO_RCVTIMEO`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
-    `NETLINK_GET_STRICT_CHK` を設定できます。受信バッファーがいっぱいのときにカーネルから来た
+    `SO_SNDBUF`、`SO_RCVTIMEO`、`NETLINK_PKTINFO`、`NETLINK_BROADCAST_ERROR`、
+    `NETLINK_NO_ENOBUFS`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
+    `NETLINK_GET_STRICT_CHK` を設定できます。Linux の `netlink_setsockopt` と同じく、
+    `int` より短い値は 0 です。`NETLINK_PKTINFO` を付けると、`recvmsg` はデータグラムの
+    グループ（ソケット自身のポートに来たものは 0）を `SOL_NETLINK` の `NETLINK_PKTINFO`
+    制御メッセージで返し、入らなければ `MSG_CTRUNC` を立てます。`NETLINK_BROADCAST_ERROR`
+    は覚えるだけです。ここでは届かなかった通知を誰かに伝えることがないからです。
+    受信バッファーがいっぱいのときにカーネルから来た
     メッセージは捨て、次の受信で `ENOBUFS` を返します。そのあとソケットは、Linux の
     `NETLINK_S_CONGESTED` と同じく混んでいるとされ、受信でキューが空になるまで、カーネルから
-    来るほかのメッセージも捨てます（`ENOBUFS` は繰り返しません）。ダンプの続きはこれを
-    見ません。ほかのソケットから来るデータグラムは、空きがないかソケットが混んでいれば、
+    来るほかのメッセージも捨てます（`ENOBUFS` は繰り返しません）。`NETLINK_NO_ENOBUFS`
+    を付けたソケットは、どちらもなしに捨てます。これを付けると混んだ状態も終わります。
+    ダンプの続きはこれを見ません。ほかのソケットから来るデータグラムは、空きがないかソケットが混んでいれば、
     空きができるまで待ちます（`MSG_DONTWAIT` か `O_NONBLOCK` なら `EAGAIN`）。こちらは
     あふれたことにはなりません。
   - **リクエスト:** カーネル（ポート 0）は、`rtnetlink` と同じくデータグラムのメッセージを
@@ -1995,6 +2002,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs とバインドの
   マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。
+  `/proc/<pid>/mountinfo` と `mounts`（`/proc/thread-self` と `/proc/<pid>/task/<tid>` のものも）は、
+  Linux の `mounts_open_common` と同じくそのタスクのもので、そのマウント名前空間のマウントを
+  そのルートから見せます。読むのは誰でもかまいません。終わったプロセスは、回収されるまで
+  これらのファイルを持ちますが、開くと `EINVAL` です。ほかのスレッドより先に終わった
+  リーダーのプロセスのもの（`/proc/<pid>/mountinfo`）も、開くと `EINVAL` です。残った
+  スレッドの `task/<tid>` のものは開けます。
   ファイルシステムごとに `mountinfo` のマウントの行と同じ `st_dev` を持つので、
   `df` はどのファイルシステムも表示します。バインドマウントは、Linux と同じく、ソースと同じ
   `st_dev` を持つので、`df` はそのデバイスを一度表示したあとは出しません。パスから開いたのではないパイプ・ソケット・pidfd・
@@ -2038,8 +2051,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`root`、`maps`、`smaps`、`fd`、`fdinfo`、`ns`、`task` があります。`root` は
-  ルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  `cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`fd`、`fdinfo`、`ns`、`task`
+  があります。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を
@@ -2053,8 +2066,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
-  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`root`、`ns`（0511）、
-  `task` があり、
+  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`root`、`mounts`、
+  `mountinfo`、`ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、

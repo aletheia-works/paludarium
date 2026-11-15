@@ -338,9 +338,12 @@ verified.
     a pidfd with `PIDFD_THREAD` has the inode of its whole process. A pidfd
     opened from a handle with `O_EXCL` does not keep `PIDFD_THREAD`, as on
     the CI runners' Linux 7.0, where Linux 7.2 and later keep it.
-  - System V IPC has no `/proc/sysvipc`, and the limits of its shared
-    memory, semaphores and message queues are Linux's defaults, which
-    `/proc/sys/kernel` cannot change. A message queue's waiting senders
+  - The limits of System V IPC's shared memory, semaphores and message
+    queues are Linux's defaults, which `/proc/sys/kernel` cannot change.
+    `/proc/sysvipc` shows its objects as they were when it was opened,
+    where Linux reads each one as the read reaches it. A semaphore's
+    `GETPID` gives 0 in a nested PID namespace once that process is reaped,
+    where Linux still gives its number there. A message queue's waiting senders
     all look again whenever it changes, where Linux wakes them in the order
     they began only while each one's message fits.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:

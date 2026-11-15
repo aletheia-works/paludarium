@@ -4224,6 +4224,129 @@ mod shm {
         );
     }
 
+    /// The whole of `path`, read through `open` and `read`.
+    fn read_proc(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, path: &str) -> String {
+        const PATH: u64 = DATA + 0x900;
+        const BUF: u64 = DATA + 0xa00;
+        m.write(GuestAddr(PATH), format!("{path}\0").as_bytes())
+            .unwrap();
+        let fd = syscall(k, t, m, 2, [PATH, 0, 0, 0, 0, 0]);
+        let n = syscall(k, t, m, 0, [fd, BUF, 0x600, 0, 0, 0]);
+        assert_eq!(syscall(k, t, m, 3, [fd, 0, 0, 0, 0, 0]), 0);
+        let mut text = vec![0; n as usize];
+        m.read(GuestAddr(BUF), &mut text).unwrap();
+        String::from_utf8(text).unwrap()
+    }
+
+    #[test]
+    fn proc_sysvipc_lists_the_namespace_s_objects_as_linux_prints_them() {
+        let (mut k, mut t, m) = setup();
+        // A path on past one of the files is ENOTDIR, as on Linux.
+        for path in [&b"/proc/sysvipc/msg/\0"[..], b"/proc/loadavg/x\0"] {
+            m.write(GuestAddr(DATA + 0x900), path).unwrap();
+            for number in [2, 4] {
+                assert_eq!(
+                    syscall(
+                        &mut k,
+                        &mut t,
+                        &m,
+                        number,
+                        [DATA + 0x900, DATA + 0x200, 0, 0, 0, 0]
+                    ),
+                    Errno::ENOTDIR.to_syscall_return()
+                );
+            }
+        }
+        // Size 0, as Linux's, but read to the end.
+        const STAT: u64 = DATA + 0x900;
+        m.write(GuestAddr(STAT), b"/proc/sysvipc/shm\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 4, [STAT, DATA + 0x200, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 0x200 + 48)).unwrap(), 0);
+        let shm_header = "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sysvipc/shm"),
+            shm_header
+        );
+        // A keyed segment with a page written, marked for removal while
+        // attached: key 0 and SHM_DEST.
+        let id = shmget(&mut k, &mut t, &m, 0x1234, 5000, IPC_CREAT | 0o640);
+        let a = shmat(&mut k, &mut t, &m, id, 0, 0);
+        m.write(GuestAddr(a + PAGE_SIZE), b"x").unwrap();
+        assert_eq!(shmget(&mut k, &mut t, &m, 0, 100, IPC_CREAT | 0o600), 1);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [id, IPC_RMID, 0, 0, 0, 0]),
+            0
+        );
+        let shm = read_proc(&mut k, &mut t, &m, "/proc/sysvipc/shm");
+        let lines: Vec<&str> = shm.lines().collect();
+        assert_eq!(lines.len(), 3, "{shm}");
+        assert_eq!(&shm[..shm_header.len()], shm_header);
+        assert_eq!(
+            &lines[1][..68],
+            "         0          0  1640                  5000     1     1      1"
+        );
+        let fields: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(&fields[7..11], ["0", "0", "0", "0"]);
+        assert_eq!(&fields[14..], ["4096", "0"]);
+        assert_eq!(lines[1].len(), lines[0].len());
+        assert!(
+            lines[2].starts_with(
+                "         0          1   600                   100     1     0      0"
+            )
+        );
+        // A set and a queue, each in its own file.
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                64,
+                [0x2345, 3, IPC_CREAT | 0o600, 0, 0, 0]
+            ),
+            0
+        );
+        let sem = read_proc(&mut k, &mut t, &m, "/proc/sysvipc/sem");
+        let sem: Vec<&str> = sem.lines().collect();
+        assert_eq!(
+            sem[0],
+            "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime"
+        );
+        assert!(sem[1].starts_with(
+            "      9029          0   600          3     0     0     0     0          0 "
+        ));
+        assert_eq!(sem[1].len(), sem[0].len());
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                68,
+                [0x3456, IPC_CREAT | 0o620, 0, 0, 0, 0]
+            ),
+            0
+        );
+        m.write(
+            GuestAddr(DATA + 0x800),
+            &[1, 0, 0, 0, 0, 0, 0, 0, b'h', b'i'],
+        )
+        .unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 69, [0, DATA + 0x800, 2, 0, 0, 0]),
+            0
+        );
+        let msg = read_proc(&mut k, &mut t, &m, "/proc/sysvipc/msg");
+        let msg: Vec<&str> = msg.lines().collect();
+        assert_eq!(
+            msg[0],
+            "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime"
+        );
+        assert!(msg[1].starts_with("     13398          0   620           2          1     1     0     0     0     0     0 "));
+        assert_eq!(msg[1].len(), msg[0].len());
+    }
+
     #[test]
     fn attachments_share_memory_and_count_as_their_mappings() {
         let (mut k, mut t, m) = setup();

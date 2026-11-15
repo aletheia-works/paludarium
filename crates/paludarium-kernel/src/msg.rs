@@ -13,6 +13,7 @@ use crate::ipc::{
     self, CAP_IPC_OWNER, CAP_SYS_ADMIN, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT, IPC_PRIVATE,
     IPC_RMID, IPC_SET, IPC_STAT, Perm,
 };
+use crate::namespaces::KeptPid;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{ClockId, WaitOutcome, WaitToken};
 use paludarium_types::{Errno, GuestAddr};
@@ -189,7 +190,7 @@ struct Receiver {
     search: Search,
     /// The most bytes it takes; `i32::MAX` with `MSG_NOERROR`.
     most: u64,
-    pid: u32,
+    pid: KeptPid,
     slot: Arc<Slot>,
 }
 
@@ -211,8 +212,8 @@ struct Queue {
     qbytes: u64,
     messages: VecDeque<Message>,
     /// The processes that sent and received last.
-    lspid: u32,
-    lrpid: u32,
+    lspid: KeptPid,
+    lrpid: KeptPid,
     receivers: Vec<Receiver>,
     changes: Arc<Changes>,
 }
@@ -303,8 +304,8 @@ fn msgget(c: &Context<'_>, key: i32, flag: i32) -> Result<u64, Errno> {
             bytes: 0,
             qbytes: MSGMNB,
             messages: VecDeque::new(),
-            lspid: 0,
-            lrpid: 0,
+            lspid: KeptPid::default(),
+            lrpid: KeptPid::default(),
             receivers: Vec::new(),
             changes: Arc::default(),
         },
@@ -333,7 +334,7 @@ fn msgsnd(c: &mut Context<'_>, id: i32, at: u64, size: u64, flag: i32) -> Result
         .read(GuestAddr(at.wrapping_add(8)), &mut text)
         .map_err(|_| Errno::EFAULT)?;
     let message = Message { kind, text };
-    let pid = c.process.pid;
+    let pid = c.pid_space().keep(c.process.pid);
     let queues = queues(c);
     let changes = Arc::clone(&queues.lock().checked(id)?.changes);
     loop {
@@ -351,7 +352,7 @@ fn msgsnd(c: &mut Context<'_>, id: i32, at: u64, size: u64, flag: i32) -> Result
                 return Err(Errno::EACCES);
             }
             if queue.fits(size) {
-                queue.lspid = pid;
+                queue.lspid = pid.clone();
                 queue.stime = now;
                 if !queue.hand_over(&message, now) {
                     queue.bytes += size;
@@ -400,7 +401,7 @@ fn msgrcv(
         return Err(Errno::EINVAL);
     }
     let search = Search::of(kind, flag);
-    let pid = c.process.pid;
+    let pid = c.pid_space().keep(c.process.pid);
     let queues = queues(c);
     queues.lock().checked(id)?;
     let message = loop {
@@ -433,7 +434,7 @@ fn msgrcv(
                 });
                 queue.bytes -= length;
                 queue.rtime = now;
-                queue.lrpid = pid;
+                queue.lrpid = pid.clone();
                 queue.changes.token.notify();
                 table.messages -= 1;
                 table.bytes -= length;
@@ -450,7 +451,7 @@ fn msgrcv(
                 } else {
                     size
                 },
-                pid,
+                pid: pid.clone(),
                 slot: Arc::clone(&slot),
             });
             slot
@@ -666,6 +667,40 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
     }
 }
 
+/// `/proc/sysvipc/msg`, as Linux's `sysvipc_msg_proc_show` prints it: its
+/// header, then each queue of the caller's IPC namespace by index, its
+/// processes as the caller's PID namespace numbers them and its owners as
+/// the caller's user namespace shows them.
+pub(crate) fn proc_file(c: &Context<'_>) -> Vec<u8> {
+    let mut out = String::from(
+        "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
+    );
+    let (space, user) = (c.pid_space(), &c.process.credentials.user);
+    let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
+    let queues = queues(c);
+    for queue in queues.lock().queues.values() {
+        let perm = &queue.perm;
+        out.push_str(&format!(
+            "{:10} {:10}  {:4o}  {:10} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}\n",
+            perm.key,
+            queue.id,
+            perm.mode,
+            queue.bytes,
+            queue.messages.len(),
+            space.number_of(&queue.lspid),
+            space.number_of(&queue.lrpid),
+            user.shown(kind, perm.uid),
+            user.shown(group, perm.gid),
+            user.shown(kind, perm.cuid),
+            user.shown(group, perm.cgid),
+            queue.stime,
+            queue.rtime,
+            queue.ctime,
+        ));
+    }
+    out.into_bytes()
+}
+
 /// `struct msqid64_ds` of `queue`, as x86-64 lays it out: its owners as the
 /// caller's user namespace shows them, its processes as its PID namespace
 /// numbers them.
@@ -682,8 +717,8 @@ fn msqid_ds(c: &Context<'_>, queue: &Queue) -> [u8; DS_SIZE] {
     put(72, &queue.bytes.to_le_bytes());
     put(80, &(queue.messages.len() as u64).to_le_bytes());
     put(88, &queue.qbytes.to_le_bytes());
-    put(96, &space.number(queue.lspid).to_le_bytes());
-    put(100, &space.number(queue.lrpid).to_le_bytes());
+    put(96, &space.number_of(&queue.lspid).to_le_bytes());
+    put(100, &space.number_of(&queue.lrpid).to_le_bytes());
     ds
 }
 
@@ -730,8 +765,8 @@ mod tests {
             bytes: 0,
             qbytes: MSGMNB,
             messages: VecDeque::new(),
-            lspid: 0,
-            lrpid: 0,
+            lspid: KeptPid::default(),
+            lrpid: KeptPid::default(),
             receivers: Vec::new(),
             changes: Arc::default(),
         };
@@ -745,16 +780,16 @@ mod tests {
             });
             slot
         };
-        let other = wait(Search::Equal(2), 100, 10);
-        let small = wait(Search::Any, 0, 11);
-        let taker = wait(Search::Any, 100, 12);
+        let other = wait(Search::Equal(2), 100, KeptPid::of(1, 10));
+        let small = wait(Search::Any, 0, KeptPid::of(1, 11));
+        let taker = wait(Search::Any, 100, KeptPid::of(1, 12));
         assert!(queue.hand_over(&message(1), 5));
         assert!(other.take().is_none());
         assert_eq!(small.take(), Some(Err(E2BIG)));
         assert_eq!(taker.take(), Some(Ok(message(1))));
         assert_eq!(
-            (queue.lrpid, queue.rtime, queue.receivers.len()),
-            (12, 5, 1)
+            (queue.lrpid.clone(), queue.rtime, queue.receivers.len()),
+            (KeptPid::of(1, 12), 5, 1)
         );
         // None that takes it: it is queued.
         assert!(!queue.hand_over(&message(3), 6));

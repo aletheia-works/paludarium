@@ -1980,7 +1980,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `openat2` は自身の解決の中で扱います）。`/proc` のディスクリプタや `/proc` の中の
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`（後述）、
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
   `fs/mqueue` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
@@ -2110,6 +2110,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   0 です。続いて `intr 0`、`ctxt 0`、`btime`（実時間の時計から単調時計を引いた秒数で、`ps` は
   これで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running 1`、
   `procs_blocked 0`、0 が並ぶ `softirq` の行です。
+- `/proc/sysvipc` には `msg`、`sem`、`shm` がこの順に並びます。どれも 64 ビットのカーネルでの
+  Linux の `sysvipc_*_proc_show` と同じ形式です。
+  - 見出しの行に続けて、読み手の IPC 名前空間のキュー、セット、セグメントを、インデックスの順に
+    1 行ずつ並べます。
+  - 行にはキー、ID、モードがあります。セグメントのモードには `SHM_DEST` と `SHM_LOCKED` も
+    入ります。
+  - 数、読み手の PID 名前空間での PID（見えないものは 0）、読み手のユーザー名前空間での
+    所有者と作成者、時刻も入ります。
+  - セグメントの行には、メモリにあるページのバイト数と、スワップした 0 も入ります。
+  - セグメントやキューの PID は、`IPC_STAT` が返すものも、そのプロセスがなくなっても見えます。
+    オブジェクトがその `struct pid` を持ち続けるためです。
+- これらのシステムのファイル（`loadavg`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
+  サイズは、Linux の `proc_create` が作るものと同じく 0 です。読み込みは中身の終わりまで進みます。
+- root はこれらのシステムのファイルを書き込み用に開けますが、書き込みは `EIO` です。書き込みの
+  操作がないファイルに Linux の `pde_write` が返すのと同じです。プロセス自身のファイルへの書き込みは
+  `EINVAL` です。
 - `/proc/self/maps` は VMA を Linux の形式で並べます。隣り合うマッピングの併合と
   分割も Linux と同じです。項目は、範囲、保護、`s` か `p`、ファイル内のオフセット、
   `stat` と同じファイルのデバイスと inode、Linux と同じ桁に置く名前です。名前は

@@ -297,6 +297,21 @@ struct Pids {
     depth: u32,
     numbers: Mutex<Numbers>,
 }
+/// A task's number in each PID namespace it was in, by the namespace's
+/// inode, taken as the task acted. A System V IPC object keeps these for
+/// the last tasks to use it after they are gone, as it keeps their `struct
+/// pid`, whose `numbers` Linux's `pid_nr_ns` reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeptPid(Vec<(u32, u32)>);
+
+#[cfg(test)]
+impl KeptPid {
+    /// Task `number` of the namespace of inode `inode` alone.
+    pub(crate) fn of(inode: u32, number: u32) -> Self {
+        Self(vec![(inode, number)])
+    }
+}
+
 #[derive(Debug, Default)]
 struct Numbers {
     /// The last number handed out.
@@ -396,6 +411,27 @@ impl Namespace {
     /// The signal its init ends with after `reboot`, if it was called.
     pub(crate) fn reboot(&self) -> Option<i32> {
         self.numbers().reboot
+    }
+    /// Task `id`'s numbers in this PID namespace, its own, and each one it
+    /// is in; none for 0.
+    pub(crate) fn keep(&self, id: u32) -> KeptPid {
+        if id == 0 {
+            return KeptPid::default();
+        }
+        KeptPid(
+            self.levels()
+                .into_iter()
+                .map(|space| (space.inode, space.number(id)))
+                .collect(),
+        )
+    }
+    /// The number this PID namespace knew a kept task by: 0 for a task that
+    /// was outside it, and for none.
+    pub(crate) fn number_of(&self, pid: &KeptPid) -> u32 {
+        pid.0
+            .iter()
+            .find(|(inode, _)| *inode == self.inode)
+            .map_or(0, |&(_, number)| number)
     }
     /// This PID namespace and each one it is in, from the first down to it,
     /// as Linux's `pid->numbers` holds a task's numbers by level.

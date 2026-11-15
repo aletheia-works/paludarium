@@ -453,8 +453,11 @@ fn new_fd(c: &mut Context<'_>, map: Arc<Map>, access: u32) -> Result<u64, Errno>
         .map(u64::from)
 }
 
-/// Linux 7.0's `sizeof(struct bpf_array)` on x86-64, before the values.
-const ARRAY_HEADER: u64 = 304;
+/// `sizeof(struct bpf_array)` before the values, as the test machines'
+/// Linux 7.0 (Ubuntu's) has it on x86-64: 8 bytes more than upstream
+/// v7.0's 304, whose `struct bpf_map` is 288 bytes, in the size the native
+/// runs give.
+const ARRAY_HEADER: u64 = 312;
 /// Linux 7.0's `sizeof(struct bpf_htab)`, `sizeof(struct htab_elem)`
 /// before the key, and `sizeof(struct bucket)`, on x86-64.
 const HASH_HEADER: u64 = 896;
@@ -1325,8 +1328,8 @@ mod tests {
     fn memory_is_what_linux_7_0_counts_on_x86_64() {
         let ids = Arc::default();
         let array = |entries, value, flags| shaped(TYPE_ARRAY, entries, value, flags, &ids, 1);
-        assert_eq!(array(1, 8, 0).memory(), 312);
-        assert_eq!(array(10, 3, 0).memory(), 304 + 80);
+        assert_eq!(array(1, 8, 0).memory(), 320);
+        assert_eq!(array(10, 3, 0).memory(), 312 + 80);
         assert_eq!(array(10, 24, flag::MMAPABLE).memory(), 8192);
         let hash = |entries, flags| shaped(TYPE_HASH, entries, 8, flags, &ids, 1);
         // 3 entries take 4 buckets; elements are 48 + 8 + 8 bytes.

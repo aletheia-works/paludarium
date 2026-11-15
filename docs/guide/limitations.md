@@ -69,8 +69,8 @@ verified.
   `task/<tid>` or another process's directory. Its entries come from the
   emulator's page entries, as `smaps`'s counts do: a page that a `fork`
   shared is not exclusive (bit 56) until this process writes it, even
-  after the other has let it go, and a page of shared memory is exclusive
-  whoever else maps it. A page of a loaded program's segment, or of a
+  after the other has let it go, and a page of shared memory or of a file
+  is exclusive whoever else maps it. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
   written, not until the page was. A read of a file's page gives only
   that page an entry, where Linux's fault maps the pages around it too

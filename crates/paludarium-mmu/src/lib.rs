@@ -2399,7 +2399,8 @@ impl AddressSpaceData {
     /// that a read of private anonymous memory shows is only that. Any other
     /// is a file's or shared memory's, unless it is anonymous as `usage`
     /// counts it, and mapped only here unless `fork` shares it until a
-    /// write.
+    /// write: Linux counts a page's mappings, which are not kept here, so a
+    /// file's or shared memory's page that another process maps is too.
     fn pagemap(&self, start: u64, count: u64) -> Vec<u64> {
         let directory = self.read_directory();
         (0..count)

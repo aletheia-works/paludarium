@@ -1620,13 +1620,21 @@ kernel.
     the port and groups; a datagram to another socket's port reaches it
     (`ECONNREFUSED` for none). `recvmsg` gives the sender's `sockaddr_nl`,
     `MSG_PEEK` and `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`,
-    `SO_RCVTIMEO`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
-    `NETLINK_GET_STRICT_CHK` can be set. A message from the kernel that
+    `SO_RCVTIMEO`, `NETLINK_PKTINFO`, `NETLINK_BROADCAST_ERROR`,
+    `NETLINK_NO_ENOBUFS`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
+    `NETLINK_GET_STRICT_CHK` can be set; as in Linux's
+    `netlink_setsockopt`, a value shorter than an `int` is 0. With
+    `NETLINK_PKTINFO`, `recvmsg` gives each datagram's group (0 for one
+    to the socket's own port) in a `SOL_NETLINK` `NETLINK_PKTINFO` control
+    message, or `MSG_CTRUNC` when it does not fit.
+    `NETLINK_BROADCAST_ERROR` is only kept, as no notification here tells
+    anyone that it was not delivered. A message from the kernel that
     finds the receive buffer full is dropped, with `ENOBUFS` for the next
     receive, and the socket is then held congested, as Linux's
     `NETLINK_S_CONGESTED`: it drops the kernel's other messages too, with
-    no other `ENOBUFS`, until a receive finds its queue empty. A dump's
-    parts do not look at it. A datagram from another socket that finds no
+    no other `ENOBUFS`, until a receive finds its queue empty. A socket
+    with `NETLINK_NO_ENOBUFS` drops them with neither, and setting it
+    ends a congestion. A dump's parts do not look at it. A datagram from another socket that finds no
     room, or the socket congested, waits for room instead, or is `EAGAIN`
     with `MSG_DONTWAIT` or `O_NONBLOCK`, and overruns nothing.
   - **Requests:** the kernel, port 0, takes each message of a datagram as

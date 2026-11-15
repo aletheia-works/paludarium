@@ -196,7 +196,10 @@ verified.
   Linux takes it out of the task's context, and the members of a group it
   led count on their own. The events that wait for an `execve` are kept in
   one list for every emulated machine, matched by thread group and thread,
-  and dropped as they close. The SIMD register
+  and dropped as they close. A group's members count whatever software
+  clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
+  group no count on the x86-64 machines the tests run on (why was not found).
+  The SIMD register
   fields of Linux master's structure are not checked, and any use of them is
   `EOPNOTSUPP`. `kernel.perf_event_paranoid` is always 2 (Debian's and
   Ubuntu's kernels default to more), with no `/proc/sys/kernel` file for it,
@@ -659,8 +662,8 @@ verified.
   (`gc_thresh1` is never reached); neighbours are not dumped
   (`RTM_GETNEIGH` is `EOPNOTSUPP`), and their cache information counts
   from when each was made.
-  `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
-  listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
+  `NETLINK_LISTEN_ALL_NSID` and the other options not listed in the
+  features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps

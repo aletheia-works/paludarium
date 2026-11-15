@@ -627,6 +627,33 @@ impl Emitter<'_, '_> {
                 self.set_status(f);
                 self.unless_changed(status, n + 1, next);
             }
+            Fast::AluLoad { op, dst, mem } => {
+                let size = dst.size();
+                let address = self.linear(&mem);
+                let (b, status) = self.load(address, size);
+                self.unless_failed(status, n, rip);
+                let b = self.masked(b, size);
+                let a = self.read(dst);
+                let (r, f) = self.alu(op, a, b, size);
+                if op.writes() {
+                    self.write(dst, r);
+                }
+                self.set_status(f);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::AluStore { op, mem, src } => {
+                let size = mem.size;
+                let b = self.source(src, size);
+                let address = self.linear(&mem);
+                let (a, loaded) = self.load(address, size);
+                self.unless_failed(loaded, n, rip);
+                let a = self.masked(a, size);
+                let (r, f) = self.alu(op, a, b, size);
+                let status = self.store(address, size, r);
+                self.unless_failed(status, n, rip);
+                self.set_status(f);
+                self.unless_changed(status, n + 1, next);
+            }
         }
         true
     }

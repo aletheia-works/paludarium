@@ -172,7 +172,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `execve` でイベントを無効にし、読めるまま残します。Linux はタスクのコンテキストから
   取り除きます。それが率いたグループのメンバーは、それぞれで数え続けます。`execve` を待つ
   イベントは、エミュレートするすべてのマシンで一つの一覧に置き、スレッドグループとスレッドで
-  照合して、閉じたときに除きます。Linux master の構造体の SIMD
+  照合して、閉じたときに除きます。グループのメンバーは、どのソフトウェアのクロックでも
+  数えます。Linux は、テストを動かす x86-64 のマシンで、`task-clock` のグループの
+  `cpu-clock` のメンバーに数を与えませんでした（理由は分かっていません）。Linux master の構造体の SIMD
   レジスタのフィールドは確かめず、使うと `EOPNOTSUPP` です。`kernel.perf_event_paranoid` は
   いつも 2 で（Debian と Ubuntu のカーネルの既定はそれより大きい）、それを示す
   `/proc/sys/kernel` のファイルはなく、`prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と
@@ -570,7 +572,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   backlog に再送したハンドシェイクは、その答えの近隣を作りません）。近隣は時間切れでは
   消えません（`gc_thresh1` に届きません）。近隣のダンプはなく（`RTM_GETNEIGH` は
   `EOPNOTSUPP`）、キャッシュの情報はそれぞれを作ったときから数えます。
-  `NETLINK_PKTINFO`、`NETLINK_NO_ENOBUFS` など、機能のページに挙げていないオプションは
+  `NETLINK_LISTEN_ALL_NSID` など、機能のページに挙げていないオプションは
   `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、
   `CONFIG_MCTP` を組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。
   組み込んでいないカーネルは載せず、`AF_MCTP` のアドレスと経路のダンプを扱う処理も

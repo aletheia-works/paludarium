@@ -321,7 +321,8 @@ static int case_counts(void) {
     a.read_format = FORMAT_GROUP | FORMAT_ID;
     int leader = (int)open_event(&a, 0, -1, -1, 0);
     /* A member of the leader's own PMU: Linux gave a cpu-clock member of a
-       task-clock group no count on the CI machines. */
+       task-clock group no count on x86-64 CI (actions run 43694940135),
+       where the emulator counts one (see the limitations page). */
     struct attr b = software(1);
     b.flags |= DISABLED;
     int member = (int)open_event(&b, 0, -1, leader, 0);

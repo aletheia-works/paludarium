@@ -108,6 +108,26 @@ const FORMS: &[&[u8]] = &[
     &[0xf6, 0x03, 0x01],
     &[0x48, 0x85, 0x03],
     &[0x66, 0x83, 0x7b, 0x02, 0xff],
+    // op r, [m]
+    &[0x48, 0x03, 0x03],
+    &[0x2b, 0x43, 0x08],
+    &[0x64, 0x48, 0x2b, 0x03],
+    &[0x48, 0x3b, 0x03],
+    &[0x23, 0x03],
+    &[0x0a, 0x03],
+    &[0x66, 0x33, 0x43, 0x01],
+    &[0x48, 0x3b, 0x04, 0xcb],
+    &[0x44, 0x2b, 0x03],
+    // op [m], r/imm
+    &[0x48, 0x01, 0x03],
+    &[0x48, 0x83, 0x03, 0x01],
+    &[0x81, 0x2b, 0x00, 0x01, 0x00, 0x00],
+    &[0x09, 0x43, 0x04],
+    &[0x80, 0x23, 0x0f],
+    &[0x66, 0x31, 0x03],
+    &[0x48, 0x83, 0x6c, 0x24, 0x08, 0x01],
+    &[0x64, 0x48, 0x01, 0x03],
+    &[0x30, 0x03],
     // shifts and rotates by an immediate
     &[0x48, 0xc1, 0xe8, 0x05],
     &[0xc1, 0xe8, 0x1f],
@@ -300,6 +320,27 @@ fn a_form_that_faults_runs_nothing() {
         0
     );
     assert_eq!(state, before);
+}
+
+#[test]
+fn an_operation_on_memory_it_cannot_write_runs_nothing() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    // add [rbx], rax with rbx at the code, which reads but does not write.
+    let code = [0x48, 0x01, 0x03];
+    let compiled = compiler.compile(&forms(&code)).unwrap();
+    let memory = space(&code, &[]);
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    state.gpr[reg::RBX] = CODE;
+    state.gpr[reg::RAX] = 1;
+    let before = state.clone();
+    assert_eq!(
+        compiled.run(&mut state, &memory, memory.code_generation_cached()),
+        0
+    );
+    assert_eq!(state, before);
+    let mut first = [0; 3];
+    memory.read(GuestAddr(CODE), &mut first).unwrap();
+    assert_eq!(first, code);
 }
 
 /// How long compiling takes, for measuring: `cargo test --release -p

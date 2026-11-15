@@ -6259,6 +6259,17 @@ fn open_path(
                 true,
             )),
             crate::proc::OwnEntry::Pagemap => {
+                // 0400, its owner the process's effective IDs: opening it
+                // for writing takes CAP_DAC_OVERRIDE (`EACCES`).
+                if flags & 3 != 0 {
+                    let creds = &c.process.credentials;
+                    let stat = paludarium_host::FileStat {
+                        uid: creds.euid,
+                        gid: creds.egid,
+                        ..crate::proc::private_stat(0)
+                    };
+                    crate::permissions::permission(creds, &stat, crate::permissions::MAY_WRITE)?;
+                }
                 Arc::new(crate::proc::PagemapFile::open(c.mem.view(), flags))
             }
             crate::proc::OwnEntry::Descriptor(n) => {

@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Which CI job groups a pull request's changed files need; unknown paths need every group."""
+"""Which CI job groups a pull request's changed files need; unknown paths need every group.
+
+It also picks the pull-request fuzz targets the changes can affect: a target
+runs when a changed crate is one its source names or one of their Cargo
+dependencies (from cargo metadata). Any other change the fuzz group needs
+runs every target.
+"""
 
 import argparse
+import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,7 +29,10 @@ ALL = frozenset(GROUPS)
 NONE = frozenset()
 # The pull-request files API lists at most 3000 files; a longer list may be cut.
 API_LIMIT = 3000
-WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/ci.yml"
+ROOT = Path(__file__).resolve().parent.parent
+WORKFLOW = ROOT / ".github/workflows/ci.yml"
+FUZZ_WORKFLOW = ROOT / ".github/workflows/fuzz-pr.yml"
+FUZZ_TARGETS = ROOT / "fuzz/fuzz_targets"
 # The jobs that start only after the quick stage passed.
 EXPENSIVE = frozenset(
     {
@@ -130,6 +141,87 @@ def needed(paths):
     return frozenset().union(*(groups_for(p) for p in paths))
 
 
+def pr_fuzz_targets(text=None):
+    """The pull-request fuzz targets: the default of fuzz-pr.yml's targets input."""
+    text = FUZZ_WORKFLOW.read_text(encoding="utf-8") if text is None else text
+    lists = {tuple(json.loads(d)) for d in re.findall(r"^ +default: '(\[.*\])'$", text, re.M)}
+    if len(lists) != 1:
+        raise AssertionError("fuzz-pr.yml must give one default list of targets")
+    return list(lists.pop())
+
+
+def crate_graph(metadata):
+    """Each workspace package: its directory and the path packages it links."""
+    root = Path(metadata["workspace_root"])
+    graph = {}
+    for package in metadata["packages"]:
+        links = {d["name"] for d in package["dependencies"] if d.get("path") and d["kind"] != "dev"}
+        directory = Path(package["manifest_path"]).parent.relative_to(root).as_posix()
+        graph[package["name"]] = (directory, frozenset(links))
+    return graph
+
+
+def load_crate_graph():
+    # cargo honours RUSTUP_TOOLCHAIN; CI sets it to the runner's stable so the
+    # pinned nightly is not installed for this.
+    command = [os.environ.get("CARGO", "cargo"), "metadata", "--no-deps", "--locked"]
+    command += ["--format-version", "1", "--manifest-path", str(ROOT / "Cargo.toml")]
+    out = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+    return crate_graph(json.loads(out[out.index("{") :]))
+
+
+def linked_crates(target, graph, read=None):
+    """The workspace packages a fuzz target's source names, with their dependencies."""
+    read = read or (lambda path: (FUZZ_TARGETS / path).read_text(encoding="utf-8"))
+    files, seen, named = [f"{target}.rs"], set(), set()
+    while files:
+        path = files.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        text = read(path)
+        named |= {n.replace("_", "-") for n in re.findall(r"\b(paludarium_[a-z0-9_]+)", text)}
+        base = path.rpartition("/")[0]
+        for module in re.findall(r'#\[path = "([^"]+)"\]', text):
+            files.append(f"{base}/{module}" if base else module)
+    unknown = named - set(graph)
+    if unknown:
+        raise AssertionError(
+            f"{target} names packages cargo metadata does not list: {sorted(unknown)}"
+        )
+    linked, todo = set(), list(named)
+    while todo:
+        name = todo.pop()
+        if name not in linked:
+            linked.add(name)
+            todo.extend(graph[name][1])
+    return frozenset(linked)
+
+
+def fuzz_selection(paths, targets, graph=None, read=None):
+    """The fuzz targets that the changed paths can affect, in fuzz-pr.yml's order."""
+    paths = [p for p in paths if p]
+    if not paths or len(paths) >= API_LIMIT:
+        return list(targets)
+    fuzzed = [p for p in paths if "fuzz" in groups_for(p)]
+    if not fuzzed:
+        return []
+    changed = set()
+    for path in fuzzed:
+        crate = re.match(r"(crates/[^/]+)/(.+)$", path)
+        # Only a crate's own files narrow the choice; a manifest, the lockfile,
+        # the toolchain, fuzz/, the workflows and this script run every target.
+        if not crate or crate.group(2) == "Cargo.toml":
+            return list(targets)
+        if graph is None:
+            graph = load_crate_graph()
+        owners = [name for name, (d, _) in graph.items() if d == crate.group(1)]
+        if not owners:
+            return list(targets)
+        changed.update(owners)
+    return [t for t in targets if linked_crates(t, graph, read) & changed]
+
+
 def workflow_jobs(text):
     """Each job of a workflow with the jobs it needs and its condition."""
     jobs = {}
@@ -232,7 +324,81 @@ def self_test():
                 raise
         else:
             raise AssertionError(f"not refused: {refusal}")
-    print(f"ci-changes ready: {len(cases)} paths and {len(jobs)} jobs checked")
+    fuzz_cases = fuzz_self_test()
+    print(
+        f"ci-changes ready: {len(cases)} paths, {len(jobs)} jobs and {fuzz_cases} fuzz selections checked"
+    )
+
+
+def fuzz_self_test():
+    targets = pr_fuzz_targets()
+    bins = re.findall(r'^name = "([a-z0-9_]+)"$', (ROOT / "fuzz/Cargo.toml").read_text(), re.M)
+    if not set(targets) <= set(bins) or len(targets) != len(set(targets)):
+        raise AssertionError(f"fuzz-pr.yml lists targets fuzz/Cargo.toml does not: {targets}")
+    # The real targets' sources and the real graph resolve.
+    graph = load_crate_graph()
+    for target in targets:
+        if not linked_crates(target, graph):
+            raise AssertionError(f"{target} names no workspace package")
+    # The selection on a fixed graph, shaped like the workspace's.
+    deps = {
+        "types": "",
+        "host": "types",
+        "mmu": "types",
+        "decoder": "types",
+        "vfs": "host types",
+        "cpu": "decoder mmu types",
+        "loader": "mmu types vfs",
+        "kernel": "cpu host loader mmu types vfs",
+        "jit": "cpu decoder mmu types",
+        "runtime": "cpu host jit kernel loader mmu types vfs",
+    }
+    fixed = {
+        f"paludarium-{n}": (
+            f"crates/paludarium-{n}",
+            frozenset(f"paludarium-{d}" for d in ds.split()),
+        )
+        for n, ds in deps.items()
+    }
+    sources = {
+        "vfs_paths.rs": "use paludarium_vfs::Vfs;",
+        "load_elf.rs": "use paludarium_loader::load; use paludarium_mmu::Mmu;",
+        "syscall_args.rs": '#[path = "support/host.rs"]\nmod host;\nuse paludarium_kernel::K;',
+        "support/host.rs": "use paludarium_host::Host;",
+        "kernel_threads.rs": "use paludarium_kernel::K;",
+        "kernel_futex.rs": "use paludarium_kernel::K;",
+    }
+    names = [n.removesuffix(".rs") for n in sources if "/" not in n]
+    cases = {
+        ("crates/paludarium-kernel/src/lib.rs",): [
+            "syscall_args",
+            "kernel_threads",
+            "kernel_futex",
+        ],
+        ("crates/paludarium-vfs/src/path.rs",): names,
+        ("crates/paludarium-jit/src/lib.rs",): [],
+        ("crates/paludarium-runtime/src/lib.rs", "docs/a.md"): [],
+        ("Cargo.lock",): names,
+        ("crates/paludarium-jit/Cargo.toml",): names,
+        ("rust-toolchain.toml",): names,
+        ("fuzz/lsan.supp",): names,
+        (".github/workflows/fuzz-pr.yml",): names,
+        ("scripts/ci-changes.py",): names,
+        ("crates/paludarium-new/src/lib.rs",): names,
+        ("docs/a.md",): [],
+        (): names,
+    }
+    for paths, expected in cases.items():
+        got = fuzz_selection(paths, names, fixed, sources.__getitem__)
+        if got != expected:
+            raise AssertionError(f"{paths}: fuzz {got} != {expected}")
+    try:
+        linked_crates("x", fixed, {"x.rs": "use paludarium_gone::X;"}.__getitem__)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a package cargo metadata does not list must be refused")
+    return len(cases)
 
 
 def main():
@@ -243,8 +409,12 @@ def main():
     if args.self_test:
         self_test()
         return
-    groups = ALL if args.all else needed(sys.stdin.read().splitlines())
+    paths = None if args.all else sys.stdin.read().splitlines()
+    groups = ALL if args.all else needed(paths)
+    targets = pr_fuzz_targets()
+    fuzz = targets if args.all else fuzz_selection(paths, targets)
     lines = [f"{g}={'true' if g in groups else 'false'}" for g in GROUPS]
+    lines.append(f"fuzz_targets={json.dumps(fuzz, separators=(',', ':'))}")
     print("\n".join(lines))
     output = os.environ.get("GITHUB_OUTPUT")
     if output:

@@ -8644,6 +8644,16 @@ static int pom_has(int slot, int mountinfo, const char *point) {
     }
     return found;
 }
+/* A thread that tells its ID, then waits for a byte, for a leader that ends
+   before it. */
+static int pom_wait[2], pom_told[2];
+static void *pom_thread(void *unused) {
+    (void)unused;
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    char byte;
+    if (write(pom_told[1], &tid, sizeof tid) != sizeof tid || read(pom_wait[0], &byte, 1) != 1) _exit(87);
+    _exit(0);
+}
 static int proc_other_mounts_case(void) {
     char base[] = "/tmp/paludarium-pom-XXXXXX", m[256], path[256];
     if (!mkdtemp(base)) return 80;
@@ -8700,6 +8710,32 @@ static int proc_other_mounts_case(void) {
     printf(" mounts=%d", pom_read(path, 1));
     printf(" status=%d", reaped(kid));
     printf(" reaped=%d\n", pom_read(path, 1));
+    /* A leader that ended before its other thread: the process's are EINVAL
+       too, as the leader has no nsproxy, but the thread's still open. */
+    if (pipe(pom_wait) || pipe(pom_told)) return 89;
+    fflush(stdout);
+    kid = fork();
+    if (kid < 0) return 90;
+    if (!kid) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, pom_thread, NULL)) _exit(86);
+        pthread_exit(NULL);
+    }
+    pid_t tid = 0;
+    if (read(pom_told[0], &tid, sizeof tid) != sizeof tid) return 91;
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    char stat_text[4096], *fields[8];
+    int ended = 0;
+    for (int i = 0; i < 100000 && !ended; i++) {
+        ended = proc_fields(path, stat_text, sizeof stat_text, fields, 8) > 0 && !strcmp(fields[0], "Z");
+        if (!ended) sched_yield();
+    }
+    snprintf(path, sizeof path, "/proc/%d/mountinfo", (int)kid);
+    printf("leader ended=%d open=%d", ended, pom_read(path, 1));
+    snprintf(path, sizeof path, "/proc/%d/task/%d/mountinfo", (int)kid, (int)tid);
+    printf(" thread=%d\n", pom_same(path, "mountinfo"));
+    if (write(pom_wait[1], "d", 1) != 1) return 92;
+    printf("status=%d\n", reaped(kid));
     /* A child in a mount namespace of its own, with a mount of its own:
        its mountinfo has it and this one's does not; then from its root
        after chroot, which leaves out the mounts not under it. */

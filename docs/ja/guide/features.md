@@ -1950,7 +1950,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>/mountinfo` と `mounts`（`/proc/thread-self` と `/proc/<pid>/task/<tid>` のものも）は、
   Linux の `mounts_open_common` と同じくそのタスクのもので、そのマウント名前空間のマウントを
   そのルートから見せます。読むのは誰でもかまいません。終わったプロセスは、回収されるまで
-  これらのファイルを持ちますが、開くと `EINVAL` です。
+  これらのファイルを持ちますが、開くと `EINVAL` です。ほかのスレッドより先に終わった
+  リーダーのプロセスのもの（`/proc/<pid>/mountinfo`）も、開くと `EINVAL` です。残った
+  スレッドの `task/<tid>` のものは開けます。
   マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
   `df` はどのマウントも表示します。パスから開いたのではないパイプ・ソケット・pidfd・
   memfd・`memfd_secret` のファイル・名前空間のファイル・匿名 inode（eventfd や epoll

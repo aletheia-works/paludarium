@@ -2244,8 +2244,11 @@ kernel.
   `/proc/thread-self` and `/proc/<pid>/task/<tid>`) are those of that task,
   as Linux's `mounts_open_common` makes them: the mounts of its mount
   namespace, from its root, for any reader; a process that has ended,
-  until it is reaped, has them, but they open as `EINVAL`. Each mount has its own `st_dev`, as its
-  line in `mountinfo` says, so `df` lists every mount. A pipe, a socket, a
+  until it is reaped, has them, but they open as `EINVAL`, and so do a
+  process's when its leader ended before its other threads, whose own
+  under `task/<tid>` still open. Each
+  mount has its own `st_dev`, as its line in `mountinfo` says, so `df`
+  lists every mount. A pipe, a socket, a
   pidfd, a memfd, a `memfd_secret` file, a namespace file and an anonymous
   inode (an eventfd, an epoll and the like) that no path opened are each on
   a device of their file system's own (pipefs, sockfs, pidfs, the internal

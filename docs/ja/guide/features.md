@@ -29,8 +29,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - x87 の命令は、すべての丸めモードで、値の移動、変換、比較と、制御ワード、状態ワード、
   環境、スタックの操作を行います。すべての丸めモードと精度で、加減乗除と平方根を計算し、
   `FPREM`、`FPREM1`、`FSCALE`、`FRNDINT`、`FXTRACT`、`FCOM` の仲間、`FLD` の定数、
-  `FCMOV` も実行します。超越関数の命令と 10 進数はまだ実装していません
-  （[制限](./limitations)）。シグナルハンドラは、Linux と同じく x87 と SSE の状態を
+  `FCMOV` と、glibc と musl の `long double` の数学関数が使う超越関数の命令
+  （`FSIN`、`FCOS`、`FSINCOS`、`FPTAN`、`FPATAN`、`F2XM1`、`FYL2X`、`FYL2XP1`）も
+  正しく丸めて実行します。10 進数はまだ実装していません（[制限](./limitations)）。シグナルハンドラは、Linux と同じく x87 と SSE の状態を
   リセット直後にして始まります。
 - AVX、AVX-512、MMX は対象外です。glibc が必須とするので `CPUID` は MMX を示しますが、
   その命令は `SIGILL` で止まります。

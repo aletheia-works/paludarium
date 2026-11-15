@@ -5,6 +5,7 @@
 use core::cmp::Ordering;
 
 use crate::softfloat::{self, Format};
+use crate::wide::{self, Wide};
 
 const INVALID: u16 = 1;
 const DENORMAL: u16 = 1 << 1;
@@ -99,8 +100,8 @@ fn parts(value: u128) -> Parts {
     }
 }
 
-fn join(negative: bool, exponent: u16, mantissa: u64) -> u128 {
-    u128::from(negative) << 79 | u128::from(exponent) << 64 | u128::from(mantissa)
+const fn join(negative: bool, exponent: u16, mantissa: u64) -> u128 {
+    (negative as u128) << 79 | (exponent as u128) << 64 | mantissa as u128
 }
 
 impl Parts {
@@ -714,6 +715,261 @@ fn scale(first: u128, second: u128, control: u16) -> (u128, u16, bool) {
     (value, flags | more, up)
 }
 
+/// A finite value that is not zero, as a wide one.
+fn wide_value(v: Parts) -> Wide {
+    let (mantissa, power) = normalized(v);
+    Wide::new(v.negative, u128::from(mantissa), power)
+}
+
+/// A wide result in the 80-bit format. A CPU notes every result these
+/// instructions work out as inexact, even one that is not, and so one below
+/// the normal range as an underflow.
+fn round_wide(value: Wide, control: u16) -> (u128, u16, bool) {
+    let (magnitude, power) = value.rounding();
+    let (value, flags, up) = round_extended(value.negative, magnitude, power, control, 64);
+    // What is inexact and below the normal range underflows.
+    let tiny = if parts(value).exponent == 0 {
+        UNDERFLOW
+    } else {
+        0
+    };
+    (value, flags | INEXACT | tiny, up)
+}
+
+/// π/2 cut to 66 bits, in units of 2⁻⁶⁵: what `fsin`, `fcos`, `fsincos` and
+/// `fptan` take multiples of away, as Intel and AMD CPUs do.
+const REDUCTION_HALF_PI: u128 = 0x3_243f_6a88_85a3_08d3;
+/// √2 as a 64-bit mantissa, cut.
+const SQUARE_ROOT_2: u64 = 0xb504_f333_f9de_6484;
+
+/// Where a value below 2⁶³ in size lands after its multiples of π/2 (as
+/// [`REDUCTION_HALF_PI`]) are taken away: the sine and cosine of the value.
+fn sine_cosine(v: Parts) -> (Wide, Wide) {
+    let (mantissa, power) = normalized(v);
+    let (rest, quarter) = if power < -65 {
+        (
+            wide_value(Parts {
+                negative: false,
+                ..v
+            }),
+            0,
+        )
+    } else {
+        let units = u128::from(mantissa) << (power + 65);
+        let (quotient, rest) = (units / REDUCTION_HALF_PI, units % REDUCTION_HALF_PI);
+        if rest * 2 > REDUCTION_HALF_PI {
+            (Wide::new(true, REDUCTION_HALF_PI - rest, -65), quotient + 1)
+        } else {
+            (Wide::new(false, rest, -65), quotient)
+        }
+    };
+    let (sine, cosine) = wide::sine_cosine(rest);
+    let (sine, cosine) = match quarter & 3 {
+        0 => (sine, cosine),
+        1 => (cosine, sine.negate()),
+        2 => (sine.negate(), cosine.negate()),
+        _ => (cosine.negate(), sine),
+    };
+    (if v.negative { sine.negate() } else { sine }, cosine)
+}
+
+/// log2 of a positive wide value. Its mantissa is taken between √½ and √2,
+/// so that what is left for the series is small.
+fn logarithm_2(value: Wide) -> Wide {
+    let mut exponent = value.magnitude();
+    let mut mantissa = value.scale(-exponent);
+    if mantissa.compare_size(Wide::new(false, u128::from(SQUARE_ROOT_2), -63)) == Ordering::Greater
+    {
+        mantissa = mantissa.scale(-1);
+        exponent += 1;
+    }
+    let s = mantissa.subtract(wide::ONE).divide(mantissa.add(wide::ONE));
+    let fraction = wide::double_inverse_tanh(s).multiply(wide::LOG2_E);
+    Wide::new(exponent < 0, u128::from(exponent.unsigned_abs()), 0).add(fraction)
+}
+
+/// The largest value whose `fyl2xp1` the manuals define: 1 - √½.
+const LOG_1P_LIMIT: u128 = join(false, 0x3ffd, 0x95f6_1998_0c43_36f7);
+
+/// `fyl2x`, or with `plus_one` `fyl2xp1`: the first value times log2 of the
+/// second, or of the second plus one.
+fn logarithm(first: u128, second: u128, plus_one: bool, control: u16) -> (u128, u16, bool) {
+    if let Some((value, flags)) = not_numbers(first, second) {
+        return (value, flags, false);
+    }
+    let (y, x) = (parts(first), parts(second));
+    let flags = if y.denormal() || x.denormal() {
+        DENORMAL
+    } else {
+        0
+    };
+    let invalid = (INDEFINITE, INVALID, false);
+    let infinity = |negative| (join(negative, EXPONENT_MAX, INTEGER_BIT), flags, false);
+    let zero = |negative| (join(negative, 0, 0), flags, false);
+    // Whether the logarithm is negative, or zero.
+    let (below, nothing) = if plus_one {
+        (x.negative, x.zero())
+    } else {
+        (
+            below_one(x),
+            x.exponent == BIAS as u16 && x.mantissa == INTEGER_BIT,
+        )
+    };
+    if !plus_one {
+        if x.negative && !x.zero() {
+            return invalid;
+        }
+        if x.zero() {
+            return if y.zero() {
+                invalid
+            } else if y.infinity() {
+                infinity(!y.negative)
+            } else {
+                // As when dividing by zero, a CPU notes no denormal.
+                (
+                    join(!y.negative, EXPONENT_MAX, INTEGER_BIT),
+                    ZERO_DIVIDE,
+                    false,
+                )
+            };
+        }
+    } else if x.infinity() && x.negative {
+        return invalid;
+    }
+    if x.infinity() {
+        return if y.zero() {
+            invalid
+        } else {
+            infinity(y.negative)
+        };
+    }
+    if nothing {
+        return if y.infinity() {
+            invalid
+        } else {
+            zero(y.negative != x.negative)
+        };
+    }
+    if y.infinity() {
+        return infinity(y.negative != below);
+    }
+    if y.zero() {
+        return zero(y.negative != below);
+    }
+    if plus_one && x.negative && order_size(second, ONE) != Ordering::Less {
+        // Where 1 + x is not positive a CPU leaves x as it is, as `f2xm1`
+        // does beyond its range.
+        return (second, flags | INEXACT, false);
+    }
+    let x_wide = wide_value(x);
+    let log = if plus_one && order_size(second, LOG_1P_LIMIT) != Ordering::Greater {
+        let s = x_wide.divide(x_wide.add(wide::ONE.scale(1)));
+        wide::double_inverse_tanh(s).multiply(wide::LOG2_E)
+    } else if plus_one {
+        logarithm_2(x_wide.add(wide::ONE))
+    } else {
+        logarithm_2(x_wide)
+    };
+    let (value, more, up) = round_wide(wide_value(y).multiply(log), control);
+    (value, flags | more, up)
+}
+
+/// Whether a positive finite value is below one.
+fn below_one(x: Parts) -> bool {
+    !x.zero() && i32::from(x.exponent) < BIAS
+}
+
+/// Compares the sizes of two finite values.
+fn order_size(first: u128, second: u128) -> Ordering {
+    (first & !(1 << 79)).cmp(&(second & !(1 << 79)))
+}
+
+/// `fpatan`: the angle of the point (second, first), as atan2(first, second).
+fn arctangent(first: u128, second: u128, control: u16) -> (u128, u16, bool) {
+    if let Some((value, flags)) = not_numbers(first, second) {
+        return (value, flags, false);
+    }
+    let (y, x) = (parts(first), parts(second));
+    let flags = if y.denormal() || x.denormal() {
+        DENORMAL
+    } else {
+        0
+    };
+    let pi = wide::HALF_PI.scale(1);
+    let angle = if y.zero() {
+        if !x.negative {
+            return (join(y.negative, 0, 0), flags, false);
+        }
+        pi
+    } else if y.infinity() {
+        match (x.infinity(), x.negative) {
+            (true, false) => wide::HALF_PI.scale(-1),
+            (true, true) => wide::HALF_PI.add(wide::HALF_PI.scale(-1)),
+            _ => wide::HALF_PI,
+        }
+    } else if x.zero() {
+        wide::HALF_PI
+    } else if x.infinity() {
+        if !x.negative {
+            return (join(y.negative, 0, 0), flags, false);
+        }
+        pi
+    } else {
+        let (size_y, size_x) = (
+            wide_value(Parts {
+                negative: false,
+                ..y
+            }),
+            wide_value(Parts {
+                negative: false,
+                ..x
+            }),
+        );
+        let steep = size_y.compare_size(size_x) == Ordering::Greater;
+        let angle = if steep {
+            wide::HALF_PI.subtract(wide::inverse_tangent(size_x.divide(size_y)))
+        } else {
+            wide::inverse_tangent(size_y.divide(size_x))
+        };
+        if x.negative {
+            pi.subtract(angle)
+        } else {
+            angle
+        }
+    };
+    let angle = if y.negative { angle.negate() } else { angle };
+    let (value, more, up) = round_wide(angle, control);
+    (value, flags | more, up)
+}
+
+/// `f2xm1`: 2 to the power of a value, less one. Beyond ±1, where the manuals
+/// leave the result undefined, a CPU leaves the value as it is.
+fn power_of_two_minus_one(value: u128, control: u16) -> (u128, u16, bool) {
+    if let Some((value, flags)) = not_numbers(value, value) {
+        return (value, flags, false);
+    }
+    let v = parts(value);
+    if v.zero() {
+        return (value, 0, false);
+    }
+    if v.infinity() {
+        let minus_one = join(true, BIAS as u16, INTEGER_BIT);
+        return (if v.negative { minus_one } else { value }, 0, false);
+    }
+    let flags = if v.denormal() { DENORMAL } else { 0 };
+    if order_size(value, ONE) == Ordering::Greater {
+        return (value, flags | INEXACT, false);
+    }
+    let result = if order_size(value, ONE) == Ordering::Equal {
+        // Exactly 1, or -½.
+        Wide::new(v.negative, 1, if v.negative { -1 } else { 0 })
+    } else {
+        wide::exponential_minus_one(wide_value(v).multiply(wide::LN_2))
+    };
+    let (value, more, up) = round_wide(result, control);
+    (value, flags | more, up)
+}
+
 /// An integer in the 80-bit format, which always holds it.
 pub(crate) fn integer_value(value: i64) -> u128 {
     if value == 0 {
@@ -1086,6 +1342,149 @@ impl X87 {
         self.raise(flags);
         self.put(0, exponent);
         self.push(mantissa);
+    }
+    /// What `fsin`, `fcos`, `fsincos` and `fptan` do before they work a value
+    /// out: `Err` with the result for a value that is no finite number,
+    /// `Ok(None)` for one too large, for which C2 is set and the stack is
+    /// left as it is, and otherwise the value, noting a denormal.
+    fn trigonometric(&mut self) -> Result<Option<Parts>, u128> {
+        self.condition(C1, false);
+        self.condition(C2, false);
+        let Some(value) = self.get(0) else {
+            self.raise(INVALID | STACK_FAULT);
+            return Err(INDEFINITE);
+        };
+        if let Some((value, flags)) = not_numbers(value, value) {
+            self.raise(flags);
+            return Err(value);
+        }
+        let v = parts(value);
+        if v.infinity() {
+            self.raise(INVALID);
+            return Err(INDEFINITE);
+        }
+        if v.power() >= 0 {
+            self.condition(C2, true);
+            return Ok(None);
+        }
+        if v.denormal() {
+            self.raise(DENORMAL);
+        }
+        Ok(Some(v))
+    }
+    /// `fsin`, or with `cosine` `fcos`.
+    pub(crate) fn sine_or_cosine(&mut self, cosine: bool) {
+        let v = match self.trigonometric() {
+            Err(value) => return self.put(0, value),
+            Ok(None) => return,
+            Ok(Some(v)) => v,
+        };
+        if v.zero() {
+            return self.put(0, if cosine { ONE } else { join(v.negative, 0, 0) });
+        }
+        let (sine, cos) = sine_cosine(v);
+        let result = round_wide(if cosine { cos } else { sine }, self.control);
+        self.finish(0, result);
+    }
+    /// `fsincos`: the sine in st(0), and then the cosine pushed onto it. C1
+    /// says whether the sine went up, as on AMD's CPUs (Intel's go by the
+    /// cosine).
+    pub(crate) fn sine_and_cosine(&mut self) {
+        if self.overflows() {
+            return;
+        }
+        let v = match self.trigonometric() {
+            Err(value) => return self.put_twice(value),
+            Ok(None) => return,
+            Ok(Some(v)) => v,
+        };
+        if v.zero() {
+            return self.put_and_push(join(v.negative, 0, 0), ONE, (0, false));
+        }
+        let (sine, cosine) = sine_cosine(v);
+        let (sine, flags, up) = round_wide(sine, self.control);
+        let (cosine, more, _) = round_wide(cosine, self.control);
+        self.put_and_push(sine, cosine, (flags | more, up));
+    }
+    /// `fptan`: the tangent in st(0), and then 1 pushed onto it.
+    pub(crate) fn partial_tangent(&mut self) {
+        if self.overflows() {
+            return;
+        }
+        let v = match self.trigonometric() {
+            Err(value) => return self.put_twice(value),
+            Ok(None) => return,
+            Ok(Some(v)) => v,
+        };
+        if v.zero() {
+            return self.put_and_push(join(v.negative, 0, 0), ONE, (0, false));
+        }
+        let tangent = if v.power() < -128 {
+            // tan(x) = x + x³/3 + ..., where the quotient's bits would not
+            // reach the second term.
+            let x = wide_value(v);
+            x.add(x.multiply(x).multiply(x).divide_small(3))
+        } else {
+            let (sine, cosine) = sine_cosine(v);
+            sine.divide(cosine)
+        };
+        let (tangent, flags, up) = round_wide(tangent, self.control);
+        self.put_and_push(tangent, ONE, (flags, up));
+    }
+    /// What `fsincos` and `fptan` leave where they have no number: the same
+    /// value in st(0) and pushed onto it.
+    fn put_twice(&mut self, value: u128) {
+        self.put_and_push(value, value, (0, false));
+    }
+    /// Where `fsincos` and `fptan` have a value but no room to push, before
+    /// they look at it: the invalid result in st(0) and pushed.
+    fn overflows(&mut self) -> bool {
+        let full = self.get(0).is_some() && self.get(7).is_some();
+        if full {
+            self.condition(C2, false);
+            self.put(0, INDEFINITE);
+            self.push(INDEFINITE);
+        }
+        full
+    }
+    /// A first result in st(0), and a second pushed.
+    fn put_and_push(&mut self, first: u128, second: u128, (flags, up): (u16, bool)) {
+        self.raise(flags);
+        self.put(0, first);
+        self.push(second);
+        self.condition(C1, up);
+    }
+    /// `f2xm1`.
+    pub(crate) fn power_of_two_minus_one(&mut self) {
+        self.condition(C1, false);
+        let Some(value) = self.get(0) else {
+            self.raise(INVALID | STACK_FAULT);
+            self.put(0, INDEFINITE);
+            return;
+        };
+        let result = power_of_two_minus_one(value, self.control);
+        self.finish(0, result);
+    }
+    /// What `fpatan`, `fyl2x` and `fyl2xp1` do: st(1) gets the result of
+    /// st(1) and st(0), and the stack pops.
+    fn onto_second(&mut self, calculate: impl FnOnce(u128, u128, u16) -> (u128, u16, bool)) {
+        self.condition(C1, false);
+        if let (Some(first), Some(second)) = (self.get(1), self.get(0)) {
+            let result = calculate(first, second, self.control);
+            self.finish(1, result);
+        } else {
+            self.raise(INVALID | STACK_FAULT);
+            self.put(1, INDEFINITE);
+        }
+        self.pop();
+    }
+    /// `fpatan`.
+    pub(crate) fn partial_arctangent(&mut self) {
+        self.onto_second(arctangent);
+    }
+    /// `fyl2x`, or with `plus_one` `fyl2xp1`.
+    pub(crate) fn logarithm(&mut self, plus_one: bool) {
+        self.onto_second(|first, second, control| logarithm(first, second, plus_one, control));
     }
     /// `fcmov`: empty registers are invalid whether it moves or not.
     pub(crate) fn conditional_move(&mut self, index: u8, taken: bool) {
@@ -2210,5 +2609,274 @@ mod tests {
         assert_eq!(x.control_word(), INITIAL_CONTROL);
         assert_eq!((x.status_word(), x.used), (0, 0));
         assert_eq!(x.registers[7], ONE);
+    }
+
+    /// The unit after one instruction on the given values, st(0) last.
+    fn after(values: &[u128], instruction: impl FnOnce(&mut X87)) -> X87 {
+        let mut x = X87::default();
+        for &value in values {
+            x.load_extended(value);
+        }
+        instruction(&mut x);
+        x
+    }
+    const QUIET: u128 = 0x7fff_c000_0000_0000_0000;
+    const SIGNALING: u128 = 0x7fff_a000_0000_0000_0000;
+
+    #[test]
+    fn the_angles_take_away_multiples_of_a_pi_cut_to_66_bits() {
+        // pi rounded up, and so pi/2: what is left is what the 66 bits
+        // leave, as on Intel's and AMD's CPUs, not sin(pi) of its true value.
+        let pi = join(false, 0x4000, PI.mantissa + 1);
+        let x = after(&[pi], |x| x.sine_or_cosine(false));
+        assert_eq!(x.get(0), Some(join(true, 0x3fbf, INTEGER_BIT)));
+        let x = after(&[pi - (1 << 64)], |x| x.sine_or_cosine(true));
+        assert_eq!(x.get(0), Some(join(true, 0x3fbe, INTEGER_BIT)));
+        assert_eq!(x.status_word() & (C1 | EXCEPTIONS), C1 | INEXACT);
+        // The tangent of what is just past a quarter turn.
+        let x = after(&[pi], |x| x.partial_tangent());
+        assert_eq!(
+            (x.get(0), x.get(1)),
+            (Some(ONE), Some(join(false, 0x3fbf, INTEGER_BIT)))
+        );
+    }
+
+    #[test]
+    fn the_angles_of_what_is_too_large_are_left_with_c2() {
+        for instruction in [
+            X87::sine_and_cosine as fn(&mut X87),
+            X87::partial_tangent,
+            |x: &mut X87| x.sine_or_cosine(false),
+        ] {
+            let x = after(&[number(1, 63)], instruction);
+            assert_eq!((x.get(0), x.get(1)), (Some(number(1, 63)), None));
+            assert_eq!(x.status_word() & (C2 | EXCEPTIONS), C2);
+            let x = after(&[number(-1, 62)], instruction);
+            assert_eq!(x.status_word() & C2, 0);
+        }
+    }
+
+    #[test]
+    fn the_angles_of_what_is_no_number_or_zero() {
+        let of = |value, instruction: fn(&mut X87)| {
+            let x = after(&[value], instruction);
+            (x.get(0), x.get(1), x.status_word() & EXCEPTIONS)
+        };
+        let cosine = |x: &mut X87| x.sine_or_cosine(true);
+        assert_eq!(of(INFINITY, cosine), (Some(INDEFINITE), None, INVALID));
+        assert_eq!(
+            of(SIGNALING, cosine),
+            (Some(SIGNALING | 1 << 62), None, INVALID)
+        );
+        assert_eq!(of(1 << 79, cosine), (Some(ONE), None, 0));
+        assert_eq!(of(1, cosine), (Some(ONE), None, DENORMAL | INEXACT));
+        assert_eq!(
+            of(QUIET, X87::partial_tangent),
+            (Some(QUIET), Some(QUIET), 0)
+        );
+        assert_eq!(
+            of(1 << 79, X87::partial_tangent),
+            (Some(ONE), Some(1 << 79), 0)
+        );
+        assert_eq!(
+            of(1 << 79, X87::sine_and_cosine),
+            (Some(ONE), Some(1 << 79), 0)
+        );
+        // A tiny value's tangent is above it, and so not rounded down to it.
+        let x = after(&[1 | 1 << 79], |x| {
+            x.set_control(EXTENDED | DOWN);
+            x.partial_tangent();
+        });
+        assert_eq!(x.get(1), Some(2 | 1 << 79));
+        assert_eq!(x.status_word() & EXCEPTIONS, DENORMAL | UNDERFLOW | INEXACT);
+    }
+
+    #[test]
+    fn what_pushes_finds_no_room_on_a_full_stack_before_it_looks() {
+        let full = [0, 0, 0, 0, 0, 0, ONE, number(1, 63)];
+        let x = after(&full, X87::sine_and_cosine);
+        assert_eq!(
+            (x.get(0), x.get(1), x.get(2)),
+            (Some(INDEFINITE), Some(INDEFINITE), Some(ONE))
+        );
+        assert_eq!(
+            x.status_word() & (C1 | C2 | EXCEPTIONS | STACK_FAULT),
+            C1 | INVALID | STACK_FAULT
+        );
+        let x = after(&[], X87::partial_tangent);
+        assert_eq!((x.get(0), x.get(1)), (Some(INDEFINITE), Some(INDEFINITE)));
+        assert_eq!(x.status_word() & 0x41, 0x41);
+    }
+
+    #[test]
+    fn two_to_a_power_leaves_what_is_beyond_one_as_it_is() {
+        let of = |value, control| {
+            let x = after(&[value], |x| {
+                x.set_control(control);
+                x.power_of_two_minus_one();
+            });
+            (x.get(0), x.status_word() & (C1 | EXCEPTIONS))
+        };
+        assert_eq!(of(number(2, 0), EXTENDED), (Some(number(2, 0)), INEXACT));
+        assert_eq!(
+            of(number(-3, 62), EXTENDED),
+            (Some(number(-3, 62)), INEXACT)
+        );
+        assert_eq!(of(ONE, EXTENDED | DOWN), (Some(ONE), INEXACT));
+        assert_eq!(of(ONE | 1 << 79, EXTENDED), (Some(number(-1, -1)), INEXACT));
+        assert_eq!(of(INFINITY | 1 << 79, EXTENDED), (Some(ONE | 1 << 79), 0));
+        assert_eq!(of(INFINITY, EXTENDED), (Some(INFINITY), 0));
+        assert_eq!(of(1 << 79, EXTENDED), (Some(1 << 79), 0));
+        // 2^x - 1 of a tiny x is x ln 2, below the normal range.
+        assert_eq!(
+            of(SMALLEST_NORMAL, EXTENDED),
+            (Some(0x58b9_0bfb_e8e7_bcd6), C1 | INEXACT | UNDERFLOW)
+        );
+    }
+
+    #[test]
+    fn the_logarithms_of_what_has_none() {
+        let of = |y, x, plus_one| {
+            let x = after(&[y, x], |x| x.logarithm(plus_one));
+            (x.get(0), x.get(1), x.status_word() & EXCEPTIONS)
+        };
+        assert_eq!(
+            of(ONE, ONE | 1 << 79, false),
+            (Some(INDEFINITE), None, INVALID)
+        );
+        assert_eq!(
+            of(ONE, 1 << 79, false),
+            (Some(INFINITY | 1 << 79), None, ZERO_DIVIDE)
+        );
+        // No denormal is noted where it divides by zero.
+        assert_eq!(
+            of(1, 0, false),
+            (Some(INFINITY | 1 << 79), None, ZERO_DIVIDE)
+        );
+        assert_eq!(of(0, 0, false), (Some(INDEFINITE), None, INVALID));
+        assert_eq!(of(INFINITY, ONE, false), (Some(INDEFINITE), None, INVALID));
+        assert_eq!(of(ONE | 1 << 79, ONE, false), (Some(1 << 79), None, 0));
+        assert_eq!(of(0, INFINITY, false), (Some(INDEFINITE), None, INVALID));
+        assert_eq!(
+            of(ONE | 1 << 79, INFINITY, false),
+            (Some(INFINITY | 1 << 79), None, 0)
+        );
+        assert_eq!(
+            of(INFINITY, number(1, -1), false),
+            (Some(INFINITY | 1 << 79), None, 0)
+        );
+        assert_eq!(of(1 << 79, number(1, -1), false), (Some(0), None, 0));
+        // A power of two has a whole logarithm, noted as inexact all the same.
+        assert_eq!(
+            of(number(3, 0), number(1, 62), false),
+            (Some(number(186, 0)), None, INEXACT)
+        );
+        assert_eq!(of(ONE, 1 << 79, true), (Some(1 << 79), None, 0));
+        assert_eq!(of(INFINITY, 0, true), (Some(INDEFINITE), None, INVALID));
+        assert_eq!(
+            of(ONE, INFINITY | 1 << 79, true),
+            (Some(INDEFINITE), None, INVALID)
+        );
+        assert_eq!(
+            of(INFINITY, number(-1, -2), true),
+            (Some(INFINITY | 1 << 79), None, 0)
+        );
+        // Where 1 + x is not positive, x is left.
+        assert_eq!(
+            of(number(3, 0), ONE | 1 << 79, true),
+            (Some(ONE | 1 << 79), None, INEXACT)
+        );
+        assert_eq!(
+            of(ONE, number(-1, 63), true),
+            (Some(number(-1, 63)), None, INEXACT)
+        );
+    }
+
+    #[test]
+    fn the_angle_of_a_point_on_an_axis_or_at_infinity() {
+        let of = |y, x| {
+            let x = after(&[y, x], X87::partial_arctangent);
+            (x.get(0), x.get(1), x.status_word() & EXCEPTIONS)
+        };
+        let pi = join(false, 0x4000, PI.mantissa + 1);
+        let half_pi = pi - (1 << 64);
+        let quarter_pi = pi - (2 << 64);
+        assert_eq!(of(1 << 79, ONE), (Some(1 << 79), None, 0));
+        assert_eq!(of(0, 1 << 79), (Some(pi), None, INEXACT));
+        assert_eq!(
+            of(1 << 79, INFINITY | 1 << 79),
+            (Some(pi | 1 << 79), None, INEXACT)
+        );
+        assert_eq!(of(ONE, 0), (Some(half_pi), None, INEXACT));
+        assert_eq!(of(INFINITY, INFINITY), (Some(quarter_pi), None, INEXACT));
+        assert_eq!(
+            of(INFINITY | 1 << 79, INFINITY | 1 << 79),
+            (Some(0xc000_96cb_e3f9_990e_91a8), None, INEXACT)
+        );
+        assert_eq!(of(ONE, INFINITY), (Some(0), None, 0));
+        assert_eq!(of(ONE, ONE), (Some(quarter_pi), None, INEXACT));
+        assert_eq!(of(1, ONE), (Some(1), None, DENORMAL | UNDERFLOW | INEXACT));
+        assert_eq!(of(QUIET, SIGNALING), (Some(QUIET), None, INVALID));
+        let x = after(&[ONE], X87::partial_arctangent);
+        assert_eq!((x.get(0), x.status_word() & 0x41), (Some(INDEFINITE), 0x41));
+    }
+}
+#[cfg(test)]
+mod expected_tests {
+    use super::*;
+    /// The correctly rounded results the x87-transcendental case compares a
+    /// CPU with, which this unit gives every bit of.
+    const EXPECTED: &str = include_str!("../../../tests/guests/processes/x87_transcendental.h");
+
+    #[test]
+    fn the_transcendental_results_are_rounded_correctly() {
+        let mut checked = 0;
+        for line in EXPECTED.lines().filter(|line| line.starts_with("    {\"")) {
+            let fields: Vec<&str> = line
+                .trim_start_matches("    {")
+                .trim_end_matches("},")
+                .split(", ")
+                .map(|field| field.trim_matches('"'))
+                .collect();
+            let value = |field: &str| u128::from_str_radix(field, 16).unwrap_or(0);
+            let (op, mode) = (fields[0], fields[1].parse::<u16>().unwrap());
+            let mut unit = X87::default();
+            unit.set_control(INITIAL_CONTROL & !(3 << 10) | mode << 10);
+            unit.load_extended(value(fields[2]));
+            if !fields[3].is_empty() {
+                unit.load_extended(value(fields[3]));
+            }
+            match op {
+                "fsin" => unit.sine_or_cosine(false),
+                "fcos" => unit.sine_or_cosine(true),
+                "fsincos" => unit.sine_and_cosine(),
+                "fptan" => unit.partial_tangent(),
+                "f2xm1" => unit.power_of_two_minus_one(),
+                "fpatan" => unit.partial_arctangent(),
+                "fyl2x" => unit.logarithm(false),
+                _ => unit.logarithm(true),
+            }
+            let flags = unit.status_word() & (EXCEPTIONS | C1);
+            let mut results = vec![unit.store_extended()];
+            if !fields[5].is_empty() {
+                unit.pop();
+                results.insert(0, unit.store_extended());
+            }
+            let expected: Vec<u128> = fields[4..6]
+                .iter()
+                .filter(|f| !f.is_empty())
+                .map(|f| value(f))
+                .collect();
+            assert_eq!(
+                (results, flags),
+                (
+                    expected,
+                    u16::from_str_radix(fields[6].trim_start_matches("0x"), 16).unwrap()
+                ),
+                "{line}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 1500);
     }
 }

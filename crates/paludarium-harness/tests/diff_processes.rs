@@ -509,6 +509,7 @@ mod linux {
         processes_cpu_state => ("cpu-state","process"),
         processes_x87 => ("x87","process"),
         processes_x87_arithmetic => ("x87-arithmetic","process"),
+        processes_x87_transcendental => ("x87-transcendental","x87"),
         processes_robust_list => ("robust-list","process"),
         processes_futex_shared => ("futex-shared","process"),
         processes_late_handler => ("late-handler","process"),

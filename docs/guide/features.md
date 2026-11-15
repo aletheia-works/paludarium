@@ -35,8 +35,10 @@ Linux.
   control and status words, environment and stack, in every rounding mode. They
   add, subtract, multiply, divide and take square roots in every rounding mode
   and precision, and do `FPREM`, `FPREM1`, `FSCALE`, `FRNDINT`, `FXTRACT`, the
-  `FCOM` family, the `FLD` constants and `FCMOV`. The transcendental
-  instructions and packed decimals are not implemented yet
+  `FCOM` family, the `FLD` constants and `FCMOV`, and the transcendental
+  instructions (`FSIN`, `FCOS`, `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`,
+  `FYL2XP1`) that the `long double` math of glibc and musl uses, correctly
+  rounded. Packed decimals are not implemented yet
   ([Limitations](./limitations)). A signal handler starts with the x87 and SSE
   state as after a reset, as on Linux.
 - AVX, AVX-512 and MMX are out of scope: `CPUID` reports MMX because glibc

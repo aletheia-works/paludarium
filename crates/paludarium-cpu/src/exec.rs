@@ -1438,6 +1438,14 @@ impl Exec<'_> {
             (M::Fprem, None) => unit.remainder(false),
             (M::Fprem1, None) => unit.remainder(true),
             (M::Fxtract, None) => unit.extract(),
+            (M::Fsin, None) => unit.sine_or_cosine(false),
+            (M::Fcos, None) => unit.sine_or_cosine(true),
+            (M::Fsincos, None) => unit.sine_and_cosine(),
+            (M::Fptan, None) => unit.partial_tangent(),
+            (M::Fpatan, None) => unit.partial_arctangent(),
+            (M::F2xm1, None) => unit.power_of_two_minus_one(),
+            (M::Fyl2x, None) => unit.logarithm(false),
+            (M::Fyl2xp1, None) => unit.logarithm(true),
             (
                 M::Fcmovb
                 | M::Fcmove
@@ -2274,6 +2282,14 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
         | Mnemonic::Frndint
         | Mnemonic::Fscale
         | Mnemonic::Fxtract
+        | Mnemonic::Fsin
+        | Mnemonic::Fcos
+        | Mnemonic::Fsincos
+        | Mnemonic::Fptan
+        | Mnemonic::Fpatan
+        | Mnemonic::F2xm1
+        | Mnemonic::Fyl2x
+        | Mnemonic::Fyl2xp1
         | Mnemonic::Fcom
         | Mnemonic::Fcomp
         | Mnemonic::Fcompp

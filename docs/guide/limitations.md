@@ -5,10 +5,8 @@ verified.
 
 ## Not supported
 
-- **Part of x87, for now**: the transcendental instructions (`FSIN`, `FCOS`,
-  `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`, `FYL2XP1`) and packed decimals
-  (`FBLD`, `FBSTP`) are not implemented yet, so a program stops with `SIGILL`
-  where it reaches one. An x87 exception always takes its masked response: an
+- **Part of x87, for now**: packed decimals (`FBLD`, `FBSTP`) are not
+  implemented yet, so a program stops with `SIGILL` where it reaches one. An x87 exception always takes its masked response: an
   unmasked one sets the status word's summary and does not raise `SIGFPE`. The
   16-bit forms of `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not
   implemented either. `FISTTP` belongs to SSE3, which `CPUID` does not report,
@@ -21,6 +19,21 @@ verified.
 - **32-bit x86, AVX, AVX-512, MMX**: out of scope. `CPUID` reports MMX because
   glibc requires it, but its instructions stop with `SIGILL`, as do the SSE and
   SSE2 ones that use MMX registers (`CVTPI2PS`, `MOVQ2DQ`, `PSHUFW` and the like).
+- **The last bit of x87's transcendental instructions**: `FSIN`, `FCOS`,
+  `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X` and `FYL2XP1` give the correctly
+  rounded result of what Intel's and AMD's CPUs compute (the four that take an
+  angle take multiples of π/2 away as π/2 cut to 66 bits, as both do). A real
+  CPU's result is within one unit in the last place of that, and differs from
+  it in a few values in a hundred, Intel's more often than AMD's, which differ
+  from each other too; C1 then goes by the CPU's own result. Where the result of
+  a tiny value is that value, Intel's CPUs give it as it is in every rounding
+  mode, and the emulator and AMD's round it. `FSINCOS` sets C1 by the sine, as
+  AMD's CPUs do (Intel's go by the cosine). So the `long double` functions of
+  glibc and musl that use these (`expl`, `logl`, `atan2l` and the like) can
+  differ from a real CPU's in their last bit or two. Where the manuals leave the
+  result undefined, the emulator does as both CPUs: `F2XM1` leaves a value
+  beyond ±1 as it is, and `FYL2XP1` a value where 1 + x is not positive. The
+  tests compare every bit where the CPUs agree, and that bound elsewhere.
 - **The exact results of `RCPPS`, `RCPSS`, `RSQRTPS` and `RSQRTSS`**: x86 only
   bounds their error (1.5 × 2⁻¹²), and each CPU answers from its own table. The
   emulator computes them by floating-point division (after a square root for

@@ -949,7 +949,9 @@ kernel.
   1024000000, `SEMOPM` 500, `SEMMNI` 32000, `SEMVMX` 32767); a set's IDs are
   given out as a segment's. `semctl` has `IPC_STAT`, `IPC_SET`, `IPC_RMID`,
   `IPC_INFO`, `SEM_INFO`, `SEM_STAT`, `SEM_STAT_ANY`, `GETVAL`, `SETVAL`,
-  `GETALL`, `SETALL`, `GETPID` (in the caller's PID namespace), `GETNCNT`
+  `GETALL`, `SETALL`, `GETPID` (in the caller's PID namespace, still once
+  that process is reaped, as each semaphore keeps its `struct pid`, the
+  undo at its exit's included), `GETNCNT`
   and `GETZCNT` (counted by the operation each wait waits on). The
   operations of one call are done all at once or not at all; one that
   cannot go through waits, unless the operation it would wait on has
@@ -2439,7 +2441,8 @@ kernel.
     for one it cannot see), the owner and creator in the reader's user
     namespace, and the times.
   - A segment's line adds the bytes of its pages in memory, and 0 swapped.
-  - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
+  - A segment's or queue's PIDs, which `IPC_STAT` gives too (and a
+    semaphore's, which `GETPID` gives), still show
     once their process is gone, as the object keeps its `struct pid`.
 - These system files (`loadavg`, `meminfo`, `stat`, `uptime` and
   `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a

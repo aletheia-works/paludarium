@@ -407,7 +407,7 @@ impl ThreadGroup {
     /// which the last thread to leave applies (`exit_sem`).
     pub(crate) fn leave_sem_undo_list(&self, tid: u32, pid: u32, now: i64) {
         if let Some(list) = self.take_sem_undo_list(tid) {
-            list.leave(pid, now);
+            list.leave(&self.namespaces(tid).pid.keep(pid), now);
         }
     }
     pub(crate) fn retired(&self, tid: u32) -> bool {

@@ -12192,6 +12192,13 @@ static void sysvipc_all(const char *label) {
     sysvipc_show(label, "msg", sysvipc_msg_times);
 }
 /* The work of the case, as PID 1 of its PID namespace. */
+/* GETPID and GETVAL of each of set `sem`'s three semaphores. */
+static void sysvipc_sempids(const char *label, int sem) {
+    printf("%s sempids:", label);
+    for (int n = 0; n < 3; n++)
+        printf(" %ld=%ld", semx_ctl(sem, n, SEMX_GETPID, 0), semx_ctl(sem, n, SEMX_GETVAL, 0));
+    printf("\n");
+}
 static int sysvipc_work(void) {
     long page = sysconf(_SC_PAGESIZE);
     sysvipc_all("empty");
@@ -12265,16 +12272,21 @@ static int sysvipc_work(void) {
     if (sem < 0 || msg < 0 || semx_op(sem, 1, 1, 0)) return 21;
     if (msgx_send(msg, 1, "hello", 0) || msgx_send(msg, 2, "abc", 0)) return 22;
     sysvipc_all("made");
-    /* PID 2 takes a message, and attaches the segment and detaches it. */
+    /* PID 2 takes a message, attaches the segment and detaches it, and
+       changes semaphore 2, and semaphore 0 with SEM_UNDO, which its exit
+       undoes. */
     fflush(stdout);
     pid_t taker = child();
     if (taker == 0) {
         long r = syscall(SYS_msgrcv, msg, &msgx_buf, sizeof msgx_buf.text, 0, 0);
         long at = syscall(SYS_shmat, shm, 0, 0);
-        _exit(r == 5 && at != -1 && syscall(SYS_shmdt, at) == 0 ? 0 : 1);
+        int changed = semx_op(sem, 2, 1, 0) == 0 && semx_op(sem, 0, 1, SEMX_UNDO) == 0;
+        _exit(r == 5 && at != -1 && syscall(SYS_shmdt, at) == 0 && changed ? 0 : 1);
     }
     result("taker", reaped(taker));
     sysvipc_all("taken");
+    /* The semaphores' last processes, PID 2 though it is reaped. */
+    sysvipc_sempids("taken", sem);
     /* Locked, then marked for removal while attached: key 0 and the mode
        bits SHM_LOCKED and SHM_DEST. */
     printf("lock=%ld\n", syscall(SYS_shmctl, shm, 11 /* SHM_LOCK */, NULL));
@@ -12286,6 +12298,7 @@ static int sysvipc_work(void) {
     pid_t nested = child();
     if (nested == 0) {
         sysvipc_all("nested");
+        sysvipc_sempids("nested", sem);
         fflush(stdout);
         _exit(0);
     }

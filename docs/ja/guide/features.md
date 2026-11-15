@@ -855,7 +855,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux の既定値（`SEMMSL` 32000、`SEMMNS` 1024000000、`SEMOPM` 500、`SEMMNI` 32000、
   `SEMVMX` 32767）です。セットの ID はセグメントと同じように割り当てます。`semctl` には
   `IPC_STAT`、`IPC_SET`、`IPC_RMID`、`IPC_INFO`、`SEM_INFO`、`SEM_STAT`、`SEM_STAT_ANY`、
-  `GETVAL`、`SETVAL`、`GETALL`、`SETALL`、`GETPID`（呼び出し元の PID 名前空間の番号）、
+  `GETVAL`、`SETVAL`、`GETALL`、`SETALL`、`GETPID`（呼び出し元の PID 名前空間の番号。セマフォーがその `struct pid` を持ち続けるので、
+  そのプロセスが回収された後も返します。終了時の取り消しで変わったものも同じです）、
   `GETNCNT` と `GETZCNT`（待ちがどの操作で待っているかで数えます）があります。1 回の
   呼び出しの操作は、すべてまとめて行うか、どれも行いません。すぐに通らない操作は、待つ
   ことになる操作に `IPC_NOWAIT` があれば `EAGAIN` で、なければ変更で通れるようになるか、
@@ -2120,6 +2121,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     所有者と作成者、時刻も入ります。
   - セグメントの行には、メモリにあるページのバイト数と、スワップした 0 も入ります。
   - セグメントやキューの PID は、`IPC_STAT` が返すものも、そのプロセスがなくなっても見えます。
+    `GETPID` が返すセマフォーの PID も同じです。
     オブジェクトがその `struct pid` を持ち続けるためです。
 - これらのシステムのファイル（`loadavg`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
   サイズは、Linux の `proc_create` が作るものと同じく 0 です。読み込みは中身の終わりまで進みます。

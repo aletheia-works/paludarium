@@ -8405,7 +8405,40 @@ static void mt_mountinfo(const char *point) {
     printf("mountinfo lines=%d tmpfs=%d source=%d device=%d size=%d mode=%d\n", found, kind, source, device, size,
            mode);
 }
-static int mt_inner(void) {
+/* The program run from a tmpfs: the device `maps` names its own mapping
+   with is the device `stat` gives its file. */
+static int mt_exe_case(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[512];
+    unsigned major = 0, minor = 0;
+    if (!f || !fgets(line, sizeof line, f) || sscanf(line, "%*s %*s %*s %x:%x", &major, &minor) != 2) return 81;
+    fclose(f);
+    struct stat st;
+    if (stat("/proc/self/exe", &st)) return 82;
+    printf("exe device=%d\n", makedev(major, minor) == st.st_dev);
+    return 0;
+}
+static void mt_run_from(const char *self, const char *dir) {
+    char copy[300];
+    snprintf(copy, sizeof copy, "%s/self", dir);
+    int in = open(self, O_RDONLY), out = open(copy, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    char chunk[65536];
+    ssize_t n;
+    while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
+        if (write(out, chunk, n) != n) break;
+    close(in);
+    close(out);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char *args[] = {"x", "mounts-exe", copy, NULL};
+        execv(copy, args);
+        _exit(98);
+    }
+    printf("exe status=%d\n", reaped(child));
+    unlink(copy);
+}
+static int mt_inner(const char *self) {
     char m[256], m2[256], f[256], h[256], hx[256], sub[256], m3[256], m4[256], other[256];
     mt_path(m, "m");
     mt_path(m2, "m2");
@@ -8432,6 +8465,7 @@ static int mt_inner(void) {
     snprintf(dotdot, sizeof dotdot, "%s/..", m);
     printf("dotdot=%d\n", !stat(dotdot, &up) && !stat(mt_base, &outer) && up.st_ino == outer.st_ino &&
                               up.st_dev == outer.st_dev);
+    mt_run_from(self, m);
     /* The defaults: 01777, owned by the caller, and nr_inodes in statfs. */
     printf("default=%d\n", mt_result(mount("none", m2, "tmpfs", MS_NOSUID, "nr_inodes=100")));
     if (!stat(m2, &st)) printf("default mode=%o uid=%d gid=%d\n", st.st_mode & 07777, (int)st.st_uid, (int)st.st_gid);
@@ -8526,7 +8560,7 @@ static int mt_inner(void) {
     printf("left=%d\n", mt_dev(other) == base);
     return 0;
 }
-static int mounts_case(void) {
+static int mounts_case(const char *self) {
     if (!mkdtemp(mt_base)) return 93;
     chmod(mt_base, 0755);
     const char *dirs[] = {"m", "m2", "h", "m3", "m4"};
@@ -8555,7 +8589,7 @@ static int mounts_case(void) {
         int uids = mt_write("/proc/self/uid_map", map);
         snprintf(map, sizeof map, "0 %d 1", (int)gid);
         printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
-        _exit(mt_inner());
+        _exit(mt_inner(self));
     }
     printf("status=%d\n", reaped(child));
     const char *files[] = {"f", "h/x"};
@@ -24594,7 +24628,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "time-set")) return time_set_case();
     if (!strcmp(mode, "chroot")) return chroot_case(self);
     if (!strcmp(mode, "chroot-exec")) return chroot_exec_case();
-    if (!strcmp(mode, "mounts")) return mounts_case();
+    if (!strcmp(mode, "mounts")) return mounts_case(self);
+    if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

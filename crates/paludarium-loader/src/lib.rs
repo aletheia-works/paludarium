@@ -601,7 +601,7 @@ fn load_image(
     let identity = |path: &[u8]| {
         files.as_ref().map_or((0, 0), |(fs, _)| {
             let inode = fs.metadata(path, true).map_or(0, |stat| stat.inode);
-            (paludarium_vfs::mount_device(&fs.mounts(), path), inode)
+            (fs.device(path), inode)
         })
     };
     let own = name.map_or((0, 0), identity);

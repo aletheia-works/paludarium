@@ -472,8 +472,9 @@ verified.
   are reported but not enforced (it fills up only as the in-memory
   filesystem does, never `ENOSPC` at its size), nor are `noexec`,
   `nosuid`, `nodev`, the atime flags, `sync`, `dirsync` and `mand`;
-  `huge`, `mpol`, `noswap` and the quota options are taken and shown and
-  do nothing, and `casefold` and `strict_encoding` are `EINVAL`, as from a
+  `huge`, `mpol`, `noswap` and the quota options are taken, checked as
+  Linux checks them (a remount that turns on `noswap` or quotas, or
+  changes a quota limit, is `EINVAL`) and shown, but do nothing, and `casefold` and `strict_encoding` are `EINVAL`, as from a
   kernel without `CONFIG_UNICODE`. `statfs`'s `f_flags` leaves out
   `ST_SYNCHRONOUS` and `ST_MANDLOCK`. A remount read-only is not refused
   for a file that is unlinked but still open (Linux's `s_remove_count`).

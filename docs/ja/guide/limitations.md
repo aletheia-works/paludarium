@@ -406,7 +406,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マウントの `size`、`nr_blocks`、`nr_inodes` は返しますが効かせません（メモリ上の
   ファイルシステムが埋まるまで埋まらず、その大きさで `ENOSPC` にはなりません）。
   `noexec`、`nosuid`、`nodev`、atime のフラグ、`sync`、`dirsync`、`mand` も効きません。
-  `huge`、`mpol`、`noswap`、クォータのオプションは受け取って表示しますが何もせず、
+  `huge`、`mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて
+  （マウントし直しで `noswap` やクォータを有効にしたり、クォータの上限を変えたりすると
+  `EINVAL`）表示しますが、何もせず、
   `casefold` と `strict_encoding` は、`CONFIG_UNICODE` なしのカーネルと同じく `EINVAL`
   です。`statfs` の `f_flags` に `ST_SYNCHRONOUS` と `ST_MANDLOCK` は出しません。消した
   けれどまだ開いているファイルがあっても、読み出し専用へのマウントし直しは断りません

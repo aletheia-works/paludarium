@@ -5,14 +5,14 @@ verified.
 
 ## Not supported
 
-- **Part of x87, for now**: packed decimals (`FBLD`, `FBSTP`) are not
-  implemented yet, so a program stops with `SIGILL` where it reaches one. An
-  x87 exception always takes its masked response: an unmasked one sets the
-  status word's summary and does not raise `SIGFPE`. The 16-bit forms of
-  `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not implemented either.
-  `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
-  implemented. Where `FPREM` and `FPREM1` stop on the way when their
-  operands are far apart is each CPU's choice: the final remainder is the same.
+- **Part of x87, for now**: an x87 exception always takes its masked
+  response: an unmasked one sets the status word's summary and does not raise
+  `SIGFPE`. `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
+  implemented. Where the last instruction and its memory operand were, which
+  `FNSTENV`, `FNSAVE` and `FXSAVE` write, is not kept: those fields are zero,
+  and Intel's and AMD's CPUs fill them in differently. Where `FPREM` and
+  `FPREM1` stop on the way when their operands are far apart is each CPU's
+  choice: the final remainder is the same.
 - **A dynamically linked program's files, unless given**: a program runs with
   its interpreter as on Linux, on musl's dynamic linker or glibc's. A session
   reads the interpreter and the libraries from its own files, so they must be

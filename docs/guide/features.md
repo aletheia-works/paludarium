@@ -39,9 +39,10 @@ Linux.
   instructions (`FSIN`, `FCOS`, `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`,
   `FYL2XP1`) that the `long double` math of glibc and musl uses, correctly
   rounded, which is not always a real CPU's last bit
-  ([Limitations](./limitations)). Packed decimals are not implemented yet
-  ([Limitations](./limitations)). A signal handler starts with the x87 and SSE
-  state as after a reset, as on Linux.
+  ([Limitations](./limitations)). They load and store packed decimals (`FBLD`,
+  `FBSTP`), and save and restore the unit with `FNSAVE`, `FRSTOR`, `FNSTENV` and
+  `FLDENV`, also in their 16-bit forms (with a `0x66` prefix). A signal handler
+  starts with the x87 and SSE state as after a reset, as on Linux.
 - AVX, AVX-512 and MMX are out of scope: `CPUID` reports MMX because glibc
   requires it, but its instructions stop with `SIGILL`.
 

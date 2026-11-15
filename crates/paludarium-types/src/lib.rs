@@ -255,6 +255,9 @@ pub enum ExitReason {
     ArithmeticFault { rip: GuestAddr },
     /// An unmasked SIMD floating-point exception (Linux SIGFPE, trap 19).
     FloatingPointFault { rip: GuestAddr, code: u8 },
+    /// An unmasked x87 floating-point exception, which the next x87
+    /// instruction that waits finds pending (Linux SIGFPE, trap 16).
+    MathFault { rip: GuestAddr, code: u8 },
     /// The instruction budget was used up; the loop may resume.
     BudgetExhausted { rip: GuestAddr },
 }
@@ -272,6 +275,7 @@ impl ExitReason {
             | ExitReason::GeneralProtection { rip }
             | ExitReason::ArithmeticFault { rip }
             | ExitReason::FloatingPointFault { rip, .. }
+            | ExitReason::MathFault { rip, .. }
             | ExitReason::BudgetExhausted { rip } => rip,
         }
     }

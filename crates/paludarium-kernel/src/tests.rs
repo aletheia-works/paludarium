@@ -739,6 +739,18 @@ fn floating_point_fault_codes_terminate_with_sigfpe() {
             ),
             Next::Exit(ExitStatus::Signaled(signal::SIGFPE))
         );
+        let mut f = fixture();
+        assert_eq!(
+            f.kernel.handle(
+                &mut f.thread,
+                &f.mem,
+                ExitReason::MathFault {
+                    rip: GuestAddr(0x1000),
+                    code
+                }
+            ),
+            Next::Exit(ExitStatus::Signaled(signal::SIGFPE))
+        );
     }
 }
 

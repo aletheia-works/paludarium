@@ -47,7 +47,15 @@ Linux.
   requires it, but its instructions stop with `SIGILL`.
 
 When a guest reaches an instruction it cannot run, it gets `SIGILL`, as on real
-Linux. Page faults raise `SIGSEGV`, and integer division by zero `SIGFPE`.
+Linux. Page faults raise `SIGSEGV`, and integer division by zero `SIGFPE`, as
+does an unmasked floating-point exception. An SSE one, which MXCSR unmasks,
+raises it at the instruction itself: the destination is left as it was, and
+MXCSR keeps the instruction's exception flags, as a signal handler sees them.
+An x87 one raises it at the next x87 instruction that waits, which is where a
+CPU raises it, and leaves its own instruction's result as on a CPU: an invalid
+operation, a division by zero or an arithmetic denormal operand changes no
+register, and an overflow or underflow rebiases a register's result by 2²⁴⁵⁷⁶
+and stores nothing to memory.
 
 ## System calls
 

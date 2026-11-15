@@ -1127,14 +1127,19 @@ impl Kernel {
                     born: signals::generation(),
                 })
             }
-            ExitReason::FloatingPointFault { rip, code } => {
+            ExitReason::FloatingPointFault { rip, code } | ExitReason::MathFault { rip, code } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGFPE,
                     code: i32::from(code),
                     addr: rip.0,
-                    trap: 19,
+                    // #XF for SIMD, #MF for the x87 unit.
+                    trap: if matches!(reason, ExitReason::MathFault { .. }) {
+                        16
+                    } else {
+                        19
+                    },
                     error: 0,
                     synchronous: true,
                     timer: None,
@@ -1180,9 +1185,9 @@ impl Kernel {
             | ExitReason::GeneralProtection { .. }
             | ExitReason::Halt { .. } => self.terminate(thread, signal::SIGSEGV),
             ExitReason::InvalidOpcode { .. } => self.terminate(thread, signal::SIGILL),
-            ExitReason::ArithmeticFault { .. } | ExitReason::FloatingPointFault { .. } => {
-                self.terminate(thread, signal::SIGFPE)
-            }
+            ExitReason::ArithmeticFault { .. }
+            | ExitReason::FloatingPointFault { .. }
+            | ExitReason::MathFault { .. } => self.terminate(thread, signal::SIGFPE),
             ExitReason::BudgetExhausted { .. } => self.checkpoint(thread, mem),
             // Later units add stop reasons; until then they end the process.
             _ => self.terminate(thread, signal::SIGSEGV),

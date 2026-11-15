@@ -5,9 +5,7 @@ verified.
 
 ## Not supported
 
-- **Part of x87, for now**: an x87 exception always takes its masked
-  response: an unmasked one sets the status word's summary and does not raise
-  `SIGFPE`. `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
+- **Part of x87, for now**: `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
   implemented. Where the last instruction and its memory operand were, which
   `FNSTENV`, `FNSAVE` and `FXSAVE` write, is not kept: those fields are zero,
   and Intel's and AMD's CPUs fill them in differently. Where `FPREM` and

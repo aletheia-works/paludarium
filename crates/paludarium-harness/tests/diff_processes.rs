@@ -580,6 +580,7 @@ mod linux {
         processes_x87_transcendental => ("x87-transcendental","x87"),
         processes_x87_decimal => ("x87-decimal","x87"),
         processes_x87_state => ("x87-state","x87"),
+        processes_x87_exceptions => ("x87-exceptions","x87"),
         processes_robust_list => ("robust-list","process"),
         processes_futex_shared => ("futex-shared","process"),
         processes_late_handler => ("late-handler","process"),

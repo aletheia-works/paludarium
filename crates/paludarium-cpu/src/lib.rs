@@ -695,6 +695,7 @@ fn execute_decoded(
         Stop::GeneralProtection => ExitReason::GeneralProtection { rip },
         Stop::ArithmeticFault => ExitReason::ArithmeticFault { rip },
         Stop::FloatingPointFault(code) => ExitReason::FloatingPointFault { rip, code },
+        Stop::MathFault(code) => ExitReason::MathFault { rip, code },
         Stop::Syscall => ExitReason::Syscall { rip: state.rip },
     })
 }
@@ -1726,6 +1727,28 @@ mod tests {
         assert_ne!(s.x87.status_word() & 1 << 9, 0, "fxam: negative");
         let (s, _, _) = x87_run(&[0xd9, 0xe8, 0xd9, 0xe0, 0xd9, 0xe1, 0xd9, 0xe5], 4);
         assert_eq!(s.x87.status_word() & 1 << 9, 0, "fxam: positive");
+    }
+    #[test]
+    fn a_pending_x87_exception_faults_where_the_next_instruction_waits() {
+        // fldcw [rax] unmasking a division by zero; fldz; fld1; fdiv st, st(1);
+        // then fnstsw ax, which does not wait, and fwait, which does.
+        let code = [
+            0xd9, 0x28, 0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1, 0xdf, 0xe0, 0x9b,
+        ];
+        let (mut s, mem) = machine(&code);
+        s.gpr[0] = STACK_TOP - 0x2000;
+        mem.write(GuestAddr(STACK_TOP - 0x2000), &0x37bu16.to_le_bytes())
+            .unwrap();
+        let reason = run(&mut s, &mem, 10);
+        assert_eq!(
+            reason,
+            ExitReason::MathFault {
+                rip: GuestAddr(CODE + 10),
+                code: 3
+            }
+        );
+        assert_eq!(s.gpr[0] & 0xffff, 0xb084);
+        assert_eq!(s.x87.status_word(), 0xb084, "the fault changes nothing");
     }
     #[test]
     fn x87_faults_change_nothing() {

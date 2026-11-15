@@ -16,9 +16,16 @@
 
    x87-state: the 16-bit fnstenv and fldenv (with 0x66), and fnsave and
    frstor of both sizes. Where the last instruction and operand were is left
-   out: CPUs differ, and the emulator keeps none. */
+   out: CPUs differ, and the emulator keeps none.
+
+   x87-exceptions: what each instruction leaves where its exception is not
+   masked, which SIGFPE then comes at the next instruction that waits, with
+   its si_code, and the process it ends without a handler. */
 #define _GNU_SOURCE
 #include <math.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <ucontext.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -421,6 +428,185 @@ static void state_cases(void) {
     }
 }
 
+/* x87-exceptions: what an instruction leaves where its exception is not
+   masked, read by fnsave, which does not wait; then where SIGFPE comes, and
+   its si_code. */
+static unsigned char saved[108];
+static unsigned char target[16];
+static const long double huge = 1e4000L, minus_one = -1.0L, two = 2.0L;
+static const uint32_t float_snan = 0x7f800001, float_denormal = 1;
+static const struct x87_value smallest = {1ULL << 63, 0x0001}, largest = {~0ULL, 0x7ffe}, denormal = {1, 0},
+                              snan = {0xa000000000000000ULL, 0x7fff}, infinity = {1ULL << 63, 0x7fff};
+static void saved_show(const char *label, uint16_t word) {
+    printf("%s cw=%04x: ", label, word);
+    hex(saved, 2);
+    printf(" ");
+    hex(saved + 4, 2);
+    printf(" ");
+    hex(saved + 8, 2);
+    for (int r = 0; r < 3; r++) {
+        printf(" ");
+        hex(saved + 28 + r * 10, 10);
+    }
+    printf(" memory ");
+    hex(target, 10);
+    printf("\n");
+}
+/* With only `flags` unmasked. %3 to %12 are the values above. */
+#define UNMASKED(label, setup, op, flags) do { \
+        uint16_t word_ = (uint16_t)(0x37f & ~(flags)); \
+        memset(target, 0x55, sizeof target); \
+        __asm__ volatile("fninit\n fldcw %2\n " setup "\n " op "\n fnsave %0" \
+                         : "=m"(saved), "+m"(target) \
+                         : "m"(word_), "m"(infinity), "m"(minus_one), "m"(float_snan), "m"(snan), "m"(huge), \
+                           "m"(denormal), "m"(float_denormal), "m"(largest), "m"(smallest), "m"(two) \
+                         : "memory"); \
+        saved_show(label, word_); \
+    } while (0)
+static volatile int faulted;
+static volatile uintptr_t faulted_at;
+static void fpe(int number, siginfo_t *info, void *context) {
+    ucontext_t *uc = context;
+    unsigned char *fp = (unsigned char *)uc->uc_mcontext.fpregs;
+    uint16_t status, word, now_word, now_status;
+    uint32_t mxcsr;
+    memcpy(&word, fp, 2);
+    memcpy(&status, fp + 2, 2);
+    memcpy(&mxcsr, fp + 24, 4);
+    faulted++;
+    faulted_at = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    __asm__ volatile("fnstcw %0\n fnstsw %1" : "=m"(now_word), "=m"(now_status));
+    printf("  SIGFPE %d code=%d at rip=%d trap=%lld error=%lld frame sw=%04x cw=%04x mxcsr=%04x, handler cw=%04x sw=%04x\n",
+           number, info->si_code, info->si_addr == (void *)faulted_at, (long long)uc->uc_mcontext.gregs[REG_TRAPNO],
+           (long long)uc->uc_mcontext.gregs[REG_ERR], status, word, mxcsr & 0xffc0, now_word, now_status);
+    /* Cleared, so that the instruction runs when it returns. */
+    status &= (uint16_t)~0x80ff;
+    memcpy(fp + 2, &status, 2);
+}
+/* A division by zero pending, unmasked, and then `next`. */
+#define NEXT(label, next) do { \
+        uintptr_t at_; \
+        uint16_t word_ = 0x37b, status_; \
+        faulted = 0; \
+        faulted_at = 0; \
+        __asm__ volatile("fninit\n fldcw %2\n fldz\n fld1\n fdiv %%st(1), %%st\n lea 1f(%%rip), %0\n 1: " next "\n fnstsw %1\n fninit" \
+                         : "=&r"(at_), "=m"(status_) : "m"(word_), "m"(saved) : "memory", "xmm0"); \
+        printf("after %s: %d faults, %s, sw=%04x\n", label, faulted, \
+               faulted_at == 0 ? "none" : faulted_at == at_ ? "there" : "elsewhere", status_); \
+    } while (0)
+static void exception_cases(void) {
+    UNMASKED("ie fadd inf-inf", "fldt %3\n fldt %3\n fchs", "fadd %%st(1), %%st", 1);
+    UNMASKED("ie faddp inf-inf", "fldt %3\n fldt %3\n fchs", "faddp", 1);
+    UNMASKED("ie fsqrt -1", "fldt %4", "fsqrt", 1);
+    UNMASKED("ie flds snan", "fld1", "flds %5", 1);
+    UNMASKED("ie fstps snan", "fldt %6", "fstps %1", 1);
+    UNMASKED("ie fistp nan", "fldt %3\n fldt %3\n fchs\n fadd %%st(1), %%st\n fnclex", "fistpl %1", 1);
+    UNMASKED("ie fistp huge", "fldt %7", "fistpl %1", 1);
+    UNMASKED("ie fcom snan", "fldt %6\n fld1", "fcom %%st(1)", 1);
+    UNMASKED("ie fsin inf", "fldt %3", "fsin", 1);
+    UNMASKED("ie fptan inf", "fldt %3", "fptan", 1);
+    UNMASKED("ie fbstp huge", "fldt %7", "fbstp %1", 1);
+    UNMASKED("is fadd empty", "fld1\n ffree %%st(0)\n fld1", "fadd %%st(1), %%st", 1);
+    UNMASKED("is fld full", "fld1\n fld1\n fld1\n fld1\n fld1\n fld1\n fld1\n fld1", "fldz", 1);
+    UNMASKED("is fstp empty", "", "fstpt %1", 1);
+    UNMASKED("is fxch empty", "fld1", "fxch %%st(1)", 1);
+    UNMASKED("de fadd", "fldt %8\n fld1", "fadd %%st(1), %%st", 2);
+    UNMASKED("de flds", "fld1", "flds %9", 2);
+    UNMASKED("de fsin", "fldt %8", "fsin", 2);
+    UNMASKED("de fcom", "fldt %8\n fld1", "fcom %%st(1)", 2);
+    UNMASKED("ze fdiv", "fldz\n fld1", "fdiv %%st(1), %%st", 4);
+    UNMASKED("ze fdivp", "fldz\n fld1", "fdivp", 4);
+    UNMASKED("ze fyl2x", "fld1\n fldz", "fyl2x", 4);
+    UNMASKED("ze fxtract", "fldz", "fxtract", 4);
+    UNMASKED("oe fmul", "fldt %10\n fldt %10", "fmul %%st(1), %%st", 8);
+    UNMASKED("oe fmulp", "fldt %10\n fldt %10", "fmulp", 8);
+    UNMASKED("oe fstps", "fldt %7", "fstps %1", 8);
+    UNMASKED("oe fstpl", "fldt %7", "fstpl %1", 8);
+    UNMASKED("oe fscale", "fld1\n fld1\n fscale\n fstp %%st(1)\n fldt %10\n fxch\n fadd %%st(0)\n fxch", "fscale", 8);
+    UNMASKED("ue fmul", "fldt %11\n fldt %11", "fmul %%st(1), %%st", 0x10);
+    UNMASKED("ue fstps", "fldt %11", "fstps %1", 0x10);
+    UNMASKED("ue fstpl", "fldt %11", "fstpl %1", 0x10);
+    UNMASKED("ue f2xm1", "fldt %11", "f2xm1", 0x10);
+    UNMASKED("ue exact fmul", "fld1\n fldt %11\n fmul %%st(1), %%st\n fstp %%st(1)\n fld1\n fchs\n fld1\n fscale\n fstp %%st(1)",
+             "fmul %%st(1), %%st", 0x10);
+    UNMASKED("pe fadd", "fldt %11\n fld1", "fadd %%st(1), %%st", 0x20);
+    UNMASKED("pe fsqrt", "fldt %12", "fsqrt", 0x20);
+    UNMASKED("pe fstps", "fldpi", "fstps %1", 0x20);
+    UNMASKED("pe fistp", "fldpi", "fistpl %1", 0x20);
+    UNMASKED("pe fsin", "fld1", "fsin", 0x20);
+    UNMASKED("pe fldpi", "", "fldpi", 0x20);
+    UNMASKED("all fdiv", "fldz\n fld1", "fdiv %%st(1), %%st", 0x3f);
+    UNMASKED("ie+pe fistp", "fldt %7", "fistpl %1", 0x21);
+    struct sigaction action = {0};
+    action.sa_sigaction = fpe;
+    action.sa_flags = SA_SIGINFO;
+    sigaction(SIGFPE, &action, NULL);
+    NEXT("fwait", "fwait");
+    NEXT("fnop", "fnop");
+    NEXT("fld1", "fld1");
+    NEXT("fxch", "fxch");
+    NEXT("fstp st0", "fstp %%st(0)");
+    NEXT("ffree", "ffree %%st(0)");
+    NEXT("fincstp", "fincstp");
+    NEXT("fldcw", "fldcw %2");
+    NEXT("fnstcw", "fnstcw %3");
+    NEXT("fnstsw", "fnstsw %%ax");
+    NEXT("fnclex", "fnclex");
+    NEXT("fninit", "fninit");
+    NEXT("fnstenv", "fnstenv %3");
+    NEXT("fldenv", "fnstenv %3\n fldenv %3");
+    NEXT("fnsave", "fnsave %3");
+    NEXT("frstor", "frstor %3");
+    NEXT("fxsave", "fxsave64 %3");
+    NEXT("fucomi", "fucomi %%st(0), %%st");
+    NEXT("fcmov", "fcmovb %%st(0), %%st");
+    NEXT("fstsw", "fstsw %%ax");
+    NEXT("addsd", "addsd %%xmm0, %%xmm0");
+    NEXT("nop", "nop");
+    /* Each exception's si_code. */
+    static const uint16_t words[] = {0x37e, 0x37d, 0x37b, 0x377, 0x36f, 0x35f, 0x37e};
+    for (int k = 0; k < 7; k++) {
+        uint16_t word = words[k];
+        printf("code %d:\n", k);
+        switch (k) {
+        case 0: __asm__ volatile("fninit\n fldcw %0\n fld1\n fchs\n fsqrt\n fwait\n fninit" : : "m"(word)); break;
+        case 1: __asm__ volatile("fninit\n fldcw %0\n fldt %1\n fld1\n fadd %%st(1), %%st\n fwait\n fninit" : : "m"(word), "m"(denormal)); break;
+        case 2: __asm__ volatile("fninit\n fldcw %0\n fldz\n fld1\n fdiv %%st(1), %%st\n fwait\n fninit" : : "m"(word)); break;
+        case 3: __asm__ volatile("fninit\n fldcw %0\n fldt %1\n fld %%st(0)\n fmul %%st(1), %%st\n fwait\n fninit" : : "m"(word), "m"(largest)); break;
+        case 4: __asm__ volatile("fninit\n fldcw %0\n fldt %1\n fld %%st(0)\n fmul %%st(1), %%st\n fwait\n fninit" : : "m"(word), "m"(smallest)); break;
+        case 5: __asm__ volatile("fninit\n fldcw %0\n fldpi\n fsqrt\n fwait\n fninit" : : "m"(word)); break;
+        default: __asm__ volatile("fninit\n fldcw %0\n fadd %%st(1), %%st\n fwait\n fninit" : : "m"(word)); break;
+        }
+    }
+    {
+        /* Several at once: the division by zero comes first. */
+        uint16_t word = 0x340;
+        printf("code several:\n");
+        __asm__ volatile("fninit\n fldt %1\n fld1\n fadd %%st(1), %%st\n fldz\n fld1\n fdiv %%st(1), %%st\n fldcw %0\n fwait\n fninit"
+                         : : "m"(word), "m"(denormal));
+    }
+    {
+        /* Unmasked by fldcw after it was set: the next that waits faults. */
+        uint16_t word = 0x37b, status;
+        faulted = 0;
+        printf("unmasked later:\n");
+        __asm__ volatile("fninit\n fldz\n fld1\n fdiv %%st(1), %%st\n fldcw %1\n fnstsw %0\n fwait\n fninit" : "=m"(status) : "m"(word));
+        printf("  before fwait sw=%04x, %d faults\n", status, faulted);
+    }
+    /* With no handler, the process ends by SIGFPE. */
+    signal(SIGFPE, SIG_DFL);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        uint16_t word = 0x37b;
+        __asm__ volatile("fninit\n fldcw %0\n fldz\n fld1\n fdiv %%st(1), %%st\n fwait" : : "m"(word));
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("child: signaled=%d signal=%d\n", WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
@@ -437,6 +623,10 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "x87-state")) {
         state_cases();
+        return 0;
+    }
+    if (!strcmp(mode, "x87-exceptions")) {
+        exception_cases();
         return 0;
     }
     printf("unknown mode %s\n", mode);

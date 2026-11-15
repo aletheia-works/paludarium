@@ -203,6 +203,7 @@
     {"name":"x87-transcendental","binary":"x87"},
     {"name":"x87-decimal","binary":"x87"},
     {"name":"x87-state","binary":"x87"},
+    {"name":"x87-exceptions","binary":"x87"},
     {"name":"robust-list","binary":"process"},
     {"name":"futex-shared","binary":"process"},
     {"name":"late-handler","binary":"process"},

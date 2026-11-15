@@ -5,8 +5,6 @@
  * expected. */
 #define _GNU_SOURCE
 #include <errno.h>
-#include <linux/filter.h>
-#include <linux/seccomp.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -31,6 +29,31 @@
 #define REQ_ARCH_PRCTL 30
 #define O_TRACESECCOMP 0x80
 #define EVENT_STOP 128
+
+/* The classic BPF and seccomp ABI, which musl's headers do not have. */
+struct sock_filter {
+    uint16_t code;
+    uint8_t jt, jf;
+    uint32_t k;
+};
+struct sock_fprog {
+    unsigned short len;
+    struct sock_filter *filter;
+};
+#define BPF_LD 0x00
+#define BPF_W 0x00
+#define BPF_ABS 0x20
+#define BPF_JMP 0x05
+#define BPF_JEQ 0x10
+#define BPF_K 0x00
+#define BPF_RET 0x06
+#define BPF_STMT(code, k) {(uint16_t)(code), 0, 0, (k)}
+#define BPF_JUMP(code, k, jt, jf) {(uint16_t)(code), (jt), (jf), (k)}
+#define SECCOMP_SET_MODE_FILTER 1
+#define SECCOMP_RET_TRACE 0x7ff00000U
+#define SECCOMP_RET_ALLOW 0x7fff0000U
+/* seccomp_data begins with the call's number. */
+#define SECCOMP_DATA_NR 0
 
 static long pt(long request, pid_t pid, unsigned long addr, unsigned long data) {
     errno = 0;
@@ -208,7 +231,7 @@ static int listen_case(void) {
 
 static int install_filter(void) {
     struct sock_filter code[] = {
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE | 0x42),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getuid, 0, 1),

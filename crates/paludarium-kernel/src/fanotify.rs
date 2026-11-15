@@ -11,8 +11,9 @@
 //! records of its file handles, its name and the pidfd of the process.
 //!
 //! Permission events (`FAN_OPEN_PERM`, `FAN_ACCESS_PERM`,
-//! `FAN_OPEN_EXEC_PERM`, `FAN_PRE_ACCESS`) are taken by `fanotify_mark` but
-//! never sent: what they ask is let through, as no listener answered.
+//! `FAN_OPEN_EXEC_PERM`) are taken by `fanotify_mark` but never sent: what
+//! they ask is let through, as no listener answered. `FAN_PRE_ACCESS` is
+//! `EOPNOTSUPP`, as no file system here allows pre-content events.
 use crate::events::{IN, ReadinessHub};
 use crate::page_cache::Key;
 use crate::syscalls::{Context, Outcome};

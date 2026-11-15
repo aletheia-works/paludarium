@@ -111,8 +111,9 @@ or run a task.
   coverage, probe, aube and ripgrep differential tests, the WebAssembly acceptance
   tests, polyglot lint, the documentation build and the release package
   check. A pull request runs the jobs its changed files need
-  (`scripts/ci-changes.py`); `ci-ok`, the required check, passes when every
-  job passed or was not needed.
+  (`scripts/ci-changes.py`); the expensive jobs start once lint, clippy,
+  polyglot lint and the Linux unit tests passed; `ci-ok`, the required check,
+  passes when every job passed or was not needed.
 - `nightly.yml`: fuzzing of every target for 600 seconds with ASan and LSan,
   and the full quality run (macOS, Windows, Node.js, Chromium, Firefox and the
   real Safari, with and without the JIT). A failure opens an issue; the next

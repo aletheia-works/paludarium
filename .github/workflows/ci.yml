@@ -2,10 +2,12 @@
 # (-D warnings, also with the stable Rust of rust-version), dependency
 # checks, the x86-64 Linux differential tests and the 80% line-coverage
 # floor. A pull request runs the jobs its changed
-# files need (scripts/ci-changes.py) and a push to main runs every job;
-# ci-ok, the required check, passes only when every job passed or was not
-# needed. Actions are pinned by commit SHA and the default token is
-# read-only.
+# files need (scripts/ci-changes.py) and a push to main runs every job.
+# The expensive jobs (differential tests, coverage, fuzzing, the guest
+# programs and the WebAssembly checks) start only after the quick stage
+# (lint, clippy, polyglot lint and the Linux unit tests) passed. ci-ok, the
+# required check, passes only when every job passed or was not needed.
+# Actions are pinned by commit SHA and the default token is read-only.
 name: CI
 
 on:
@@ -69,16 +71,16 @@ jobs:
           fi
 
   wasm-programs:
-    needs: changes
+    needs: [changes, quick]
     if: needs.changes.outputs.wasm == 'true'
     uses: ./.github/workflows/wasm-programs.yml
   fuzz:
-    needs: changes
+    needs: [changes, quick]
     if: needs.changes.outputs.fuzz == 'true'
     uses: ./.github/workflows/fuzz-pr.yml
   programs:
     name: fixed guest programs
-    needs: changes
+    needs: [changes, quick]
     if: needs.changes.outputs.programs == 'true'
     uses: ./.github/workflows/programs.yml
   # The pull-request checks of other workflows, so that ci-ok waits for them.
@@ -96,7 +98,7 @@ jobs:
 
   production-wasm:
     name: production wasm (shared Rust heap, nested Workers)
-    needs: changes
+    needs: [changes, quick]
     if: needs.changes.outputs.production_wasm == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -129,17 +131,15 @@ jobs:
             target/production-wasm-evidence/
             packages/paludarium-wasm/paludarium.wasm
           retention-days: 7
-  test:
-    name: unit tests (${{ matrix.os }})
+  # The Linux unit tests are part of the quick stage; macOS and Windows run
+  # beside it. The two jobs run the same steps.
+  test-linux:
+    name: unit tests (ubuntu-latest)
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    steps:
+    steps: &unit-test-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -158,6 +158,18 @@ jobs:
           RUST_BACKTRACE: "1"
       - name: Harness unit tests
         run: cargo test --locked -p paludarium-harness --lib
+
+  test:
+    name: unit tests (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps: *unit-test-steps
 
   lint:
     needs: changes
@@ -251,7 +263,7 @@ jobs:
 
   differential:
     name: differential tests (x86-64 Linux)
-    needs: changes
+    needs: [changes, quick]
     if: needs.changes.outputs.rust == 'true'
     # The native results are this kernel's (docs/design/quality.md).
     runs-on: ubuntu-26.04
@@ -314,7 +326,7 @@ jobs:
   # guests' instructions (docs/design/quality.md).
   differential-jit:
     name: differential tests with the native JIT (x86-64 Linux)
-    needs: changes
+    needs: [changes, quick]
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -352,7 +364,7 @@ jobs:
 
   coverage:
     name: line coverage >= 80%
-    needs: changes
+    needs: [changes, quick]
     if: needs.changes.outputs.rust == 'true'
     # The native results are this kernel's (docs/design/quality.md).
     runs-on: ubuntu-26.04
@@ -509,7 +521,38 @@ jobs:
           path: target/terminal-coverage.lcov
           retention-days: 7
 
+  # The quick stage: the expensive jobs above start only once these cheap
+  # checks passed, so a head that fails them, or that a later push
+  # supersedes early, does not take runners for the long jobs. A job that
+  # needs this one is skipped when it fails; ci-ok still fails then, as it
+  # needs this job too.
+  quick:
+    name: quick checks
+    # Not always(): a run a later push cancelled starts nothing more.
+    if: ${{ !cancelled() }}
+    needs:
+      - changes
+      - polyglot-lint
+      - test-linux
+      - lint
+      - stable-clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done
+
   # The one required check: every job above passed or was not needed.
+  # scripts/ci-changes.py --self-test checks that it needs every job, so a
+  # job skipped because a job it needs failed never hides that failure.
   ci-ok:
     if: always()
     needs:
@@ -521,6 +564,7 @@ jobs:
       - docs
       - release-check
       - production-wasm
+      - test-linux
       - test
       - lint
       - stable-clippy
@@ -528,6 +572,7 @@ jobs:
       - differential
       - differential-jit
       - coverage
+      - quick
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

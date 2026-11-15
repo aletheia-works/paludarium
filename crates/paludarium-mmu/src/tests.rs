@@ -610,3 +610,78 @@ fn a_locked_mapping_grows_down_within_the_lock_limit() {
     assert!(m.grow_down(GuestAddr(top - PAGE_SIZE), u64::MAX, 2));
     assert_eq!(m.locked_pages(), 2);
 }
+
+#[test]
+fn a_userfaultfd_registration_faults_on_missing_pages_only() {
+    let m = AddressSpace::new();
+    let s = m
+        .map_shared(
+            Some(GuestAddr(0x40000)),
+            2 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.mark_shared(s, 2 * PAGE_SIZE).unwrap();
+    let child = m.fork();
+    // A page the child's mapping of the memory has is no missing page.
+    child.write(GuestAddr(s.0 + PAGE_SIZE), b"k").unwrap();
+    let view = m.view();
+    assert_eq!(
+        view.userfault_register(s.0, s.0 + 2 * PAGE_SIZE, 7, 1),
+        Ok(())
+    );
+    let missing = m.read(s, &mut [0]).unwrap_err();
+    assert!(missing.mapped && !missing.present && !missing.write);
+    assert_eq!(m.userfault_at(s), Some(7));
+    assert_eq!(view.userfault_at(s.0 + 5), Some(7));
+    // An access the protection refuses is the CPU's fault.
+    assert_eq!(m.userfault_for(s, true, false), Some(7));
+    assert_eq!(m.userfault_for(s, false, true), None);
+    // A guarded page is neither a fault nor a page to fill.
+    m.guard(GuestAddr(s.0), s.0 + PAGE_SIZE, true).unwrap();
+    assert_eq!(m.userfault_for(s, false, false), None);
+    assert_eq!(
+        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, None),
+        Err(Errno::EEXIST)
+    );
+    m.guard(GuestAddr(s.0), s.0 + PAGE_SIZE, false).unwrap();
+    let mut byte = [0];
+    m.read(GuestAddr(s.0 + PAGE_SIZE), &mut byte).unwrap();
+    assert_eq!(byte, [b'k']);
+    assert_eq!(view.userfault_target(s.0, s.0 + 2 * PAGE_SIZE), Ok(1));
+    assert_eq!(
+        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0 + PAGE_SIZE, None),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        view.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, Some(b"h")),
+        Ok(())
+    );
+    m.read(s, &mut byte).unwrap();
+    assert_eq!(byte, [b'h']);
+    // The child sees the page the fill gave the memory.
+    child.read(s, &mut byte).unwrap();
+    assert_eq!(byte, [b'h']);
+    // The registration is the space's own, and goes with release.
+    assert!(child.userfault_at(s).is_none());
+    view.userfault_release(7);
+    assert!(m.mappings().all(|mapping| mapping.userfault.is_none()));
+    // A space that is gone takes none.
+    let gone = AddressSpace::new().view();
+    assert!(!gone.lives());
+    assert_eq!(
+        gone.userfault_register(s.0, s.0 + PAGE_SIZE, 7, 1),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!(
+        gone.userfault_unregister(s.0, s.0 + PAGE_SIZE, 7),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!(
+        gone.userfault_fill(s.0, s.0 + PAGE_SIZE, s.0, None),
+        Err(Errno(3))
+    );
+    assert_eq!(gone.userfault_target(s.0, s.0 + PAGE_SIZE), Err(Errno(3)));
+    assert!(gone.userfault_at(s.0).is_none());
+}

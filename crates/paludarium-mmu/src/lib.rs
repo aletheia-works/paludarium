@@ -141,6 +141,28 @@ pub struct Mapping {
     /// page below it extends it ([`AddressSpace::grow_down`]), and no
     /// mapping is placed within [`STACK_GUARD_GAP`] below it.
     pub grows_down: bool,
+    /// A `userfaultfd` registered it (Linux's `vm_userfaultfd_ctx` and
+    /// `VM_UFFD_*`), which a `fork`ed child and a move by `mremap` do not
+    /// keep, as Linux's do not without `UFFD_FEATURE_EVENT_FORK` and
+    /// `UFFD_FEATURE_EVENT_REMAP`.
+    pub userfault: Option<Userfault>,
+}
+
+/// The `userfaultfd` a mapping reports its faults to, and why
+/// ([`Mapping::userfault`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Userfault {
+    /// The kernel's number for the `userfaultfd`.
+    pub context: u64,
+    /// The modes, as `UFFDIO_REGISTER` numbers them: only
+    /// [`Userfault::MISSING`] so far.
+    pub modes: u8,
+}
+
+impl Userfault {
+    /// `UFFDIO_REGISTER_MODE_MISSING` (`VM_UFFD_MISSING`): an access to a
+    /// page that has none faults to the `userfaultfd`.
+    pub const MISSING: u8 = 1;
 }
 
 /// How a mapping is read ([`Mapping::read_hint`]).
@@ -173,6 +195,7 @@ pub mod vm {
     pub const NORESERVE: u64 = 1 << 21;
     pub const WIPEONFORK: u64 = 1 << 25;
     pub const DONTDUMP: u64 = 1 << 26;
+    pub const UFFD_MISSING: u64 = 1 << 9;
     pub const SOFTDIRTY: u64 = 1 << 27;
     pub const MIXEDMAP: u64 = 1 << 28;
     pub const HUGEPAGE: u64 = 1 << 29;
@@ -993,6 +1016,11 @@ impl SharedPages {
             .range(first..end)
             .map(|(&key, frame)| (key, frame.clone()))
             .collect()
+    }
+    /// Whether the memory has a page at `key`, with contents or none yet,
+    /// as a page is in Linux's page cache once something touched it.
+    fn has(&self, key: u64) -> bool {
+        self.lock().contains_key(&key)
     }
     /// Whether the page at `key` has contents.
     #[must_use]
@@ -2403,8 +2431,11 @@ impl AddressSpaceData {
             .unwrap_or_else(PoisonError::into_inner) = directory;
         copy.drop_refaultable_pages();
         // A child's VMAs are not locked (`dup_mmap` clears `VMA_LOCKED_MASK`).
+        // Nor registered with a `userfaultfd` (`dup_userfaultfd`, without
+        // `UFFD_FEATURE_EVENT_FORK`).
         for mapping in copy.mappings.values_mut() {
             mapping.locked = None;
+            mapping.userfault = None;
         }
         // MADV_DONTFORK leaves the child a hole; MADV_WIPEONFORK leaves it
         // the mapping with no page and no `anon_vma`, as Linux's `dup_mmap`
@@ -2564,6 +2595,18 @@ impl AddressSpaceData {
             match self.prot_at(directory, page) {
                 Some(prot) if access.permitted(prot) => {}
                 _ => return Err(fault(at)),
+            }
+            // A page a `userfaultfd` waits for (`handle_userfault`): the
+            // kernel takes the fault of an instruction, and a system call's
+            // copy is `EFAULT`, as with `UFFD_USER_MODE_ONLY`.
+            if matches!(access, Access::Read | Access::Write | Access::Fetch)
+                && self.userfault_missing(directory, page).is_some()
+            {
+                return Err(Fault {
+                    mapped: true,
+                    present: false,
+                    ..fault(at)
+                });
             }
             let file = lookup(directory, page).map_or_else(
                 || {
@@ -3023,7 +3066,12 @@ impl AddressSpaceData {
             | bit(m.huge_pages == Some(true), vm::HUGEPAGE)
             | bit(m.huge_pages == Some(false), vm::NOHUGEPAGE)
             | bit(m.mergeable, vm::MERGEABLE)
-            | bit(m.sealed, vm::SEALED);
+            | bit(m.sealed, vm::SEALED)
+            | bit(
+                m.userfault
+                    .is_some_and(|u| u.modes & Userfault::MISSING != 0),
+                vm::UFFD_MISSING,
+            );
         for piece in pieces {
             flags |= bit(piece.maybe_guard, vm::MAYBE_GUARD)
                 | bit(piece.kind != MappingKind::Stack, vm::SOFTDIRTY);
@@ -3184,6 +3232,7 @@ impl AddressSpaceData {
                 huge_pages: None,
                 mergeable: false,
                 grows_down: kind == MappingKind::Stack,
+                userfault: None,
             },
         );
         Ok(GuestAddr(start))
@@ -3313,6 +3362,7 @@ impl AddressSpaceData {
             && a.huge_pages == b.huge_pages
             && a.mergeable == b.mergeable
             && a.grows_down == b.grows_down
+            && a.userfault == b.userfault
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -3439,11 +3489,14 @@ impl AddressSpaceData {
                 },
             );
         }
+        // The moved VMA leaves its `userfaultfd` (`mremap_userfaultfd_prep`
+        // without `UFFD_FEATURE_EVENT_REMAP`).
         self.mappings.insert(
             to,
             Mapping {
                 start: GuestAddr(to),
                 length: new_len,
+                userfault: None,
                 ..mapping
             },
         );
@@ -3706,6 +3759,257 @@ impl AddressSpaceData {
         } else {
             Ok(())
         }
+    }
+
+    /// The mappings that overlap `[start, end)`.
+    fn mappings_in(&self, start: u64, end: u64) -> Vec<Mapping> {
+        self.mappings
+            .range(..end)
+            .filter(|(_, m)| m.end() > start)
+            .map(|(_, m)| *m)
+            .collect()
+    }
+
+    /// Whether a `userfaultfd` may register `m`, as Linux's
+    /// `vma_can_userfault` allows anonymous memory and shmem: private
+    /// memory of no file, and shared memory of none (`MAP_SHARED |
+    /// MAP_ANONYMOUS`), which Linux keeps in shmem.
+    fn userfault_capable(&self, m: &Mapping) -> bool {
+        match self.shared_at(m.start.0) {
+            Some(shared) => shared.pages.source.is_none(),
+            None => {
+                self.backing_at(m.start.0).is_none()
+                    && matches!(
+                        m.kind,
+                        MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
+                    )
+            }
+        }
+    }
+
+    /// The `userfaultfd` an access to `page` waits for: the page is of a
+    /// mapping registered for missing pages, and has none, as Linux's
+    /// `do_anonymous_page` and `shmem_get_folio_gfp` find it: private
+    /// memory nothing touched since it was mapped or discarded, or shared
+    /// memory with no page there in any mapping of it.
+    fn userfault_missing(&self, directory: &Directory, page: u64) -> Option<u64> {
+        let registration = self
+            .mapping_at(page)?
+            .userfault
+            .filter(|u| u.modes & Userfault::MISSING != 0)?;
+        if lookup(directory, page).is_some() {
+            return None;
+        }
+        if let Some(shared) = self.shared_at(page)
+            && shared.pages.has(page.wrapping_add(shared.shift))
+        {
+            return None;
+        }
+        Some(registration.context)
+    }
+
+    /// The `userfaultfd` an access to the page at `addr` waits for
+    /// ([`Self::userfault_missing`]).
+    pub fn userfault_at(&self, addr: GuestAddr) -> Option<u64> {
+        let page = addr.page_align_down().0;
+        self.userfault_missing(&self.read_directory(), page)
+    }
+
+    /// The `userfaultfd` a failed access to `addr` (a write with `write`,
+    /// a fetch with `fetch`) waits for: one the page's protection permits,
+    /// of a page with no guard, that [`Self::userfault_at`] waits for. Any
+    /// other is the CPU's fault, as Linux's `do_user_addr_fault` sends
+    /// SIGSEGV for an `access_error` before it handles the fault.
+    pub fn userfault_for(&self, addr: GuestAddr, write: bool, fetch: bool) -> Option<u64> {
+        let page = addr.page_align_down().0;
+        let access = if fetch {
+            Access::Fetch
+        } else if write {
+            Access::Write
+        } else {
+            Access::Read
+        };
+        let directory = self.read_directory();
+        if self.guarded(page)
+            || !self
+                .prot_at(&directory, page)
+                .is_some_and(|prot| access.permitted(prot))
+        {
+            return None;
+        }
+        self.userfault_missing(&directory, page)
+    }
+
+    /// `UFFDIO_REGISTER` of `[start, end)` for the `userfaultfd` `context`
+    /// with `modes`, as Linux's `userfaultfd_register`: the range must
+    /// overlap a VMA (`EINVAL`), and each VMA it overlaps in turn must be
+    /// one a `userfaultfd` may register (`EINVAL`), one that may become
+    /// writable (`EPERM`, Linux's `VM_MAYWRITE`) and one no other
+    /// `userfaultfd` registered (`EBUSY`). Then the part of each in the
+    /// range takes the modes, unless it has them from this one already.
+    pub fn userfault_register(
+        &mut self,
+        start: u64,
+        end: u64,
+        context: u64,
+        modes: u8,
+    ) -> Result<(), Errno> {
+        let pieces = self.mappings_in(start, end);
+        if pieces.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        for m in &pieces {
+            if !self.userfault_capable(m) {
+                return Err(Errno::EINVAL);
+            }
+            if self
+                .shared_at(m.start.0)
+                .is_some_and(|shared| !shared.may_write)
+            {
+                return Err(Errno::EPERM);
+            }
+            if m.userfault.is_some_and(|u| u.context != context) {
+                return Err(Errno(16)); // EBUSY
+            }
+        }
+        let registration = Userfault { context, modes };
+        for m in pieces {
+            if m.userfault.is_some_and(|u| u.modes & modes == modes) {
+                continue;
+            }
+            let (from, to) = (m.start.0.max(start), m.end().min(end));
+            self.split_at(from);
+            self.split_at(to);
+            for (_, piece) in self.mappings.range_mut(from..to) {
+                piece.userfault = Some(registration);
+            }
+        }
+        Ok(())
+    }
+
+    /// `UFFDIO_UNREGISTER` of `[start, end)` for the `userfaultfd`
+    /// `context`, as Linux's `userfaultfd_unregister`: the range must
+    /// overlap a VMA, and none it overlaps may be another `userfaultfd`'s
+    /// or one no `userfaultfd` may register (`EINVAL`). Then the parts of
+    /// them in the range leave it. Returns the ranges that were registered
+    /// for missing pages, whose waits end.
+    pub fn userfault_unregister(
+        &mut self,
+        start: u64,
+        end: u64,
+        context: u64,
+    ) -> Result<Vec<(u64, u64)>, Errno> {
+        let pieces = self.mappings_in(start, end);
+        if pieces.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        if pieces.iter().any(|m| {
+            m.userfault.is_some_and(|u| u.context != context) || !self.userfault_capable(m)
+        }) {
+            return Err(Errno::EINVAL);
+        }
+        let mut ended = Vec::new();
+        for m in pieces {
+            let Some(registration) = m.userfault else {
+                continue;
+            };
+            let (from, to) = (m.start.0.max(start), m.end().min(end));
+            if registration.modes & Userfault::MISSING != 0 {
+                ended.push((from, to));
+            }
+            self.split_at(from);
+            self.split_at(to);
+            for (_, piece) in self.mappings.range_mut(from..to) {
+                piece.userfault = None;
+            }
+        }
+        Ok(ended)
+    }
+
+    /// Takes every mapping out of the `userfaultfd` `context`, as Linux's
+    /// `userfaultfd_release_all` does as its file is closed.
+    pub fn userfault_release(&mut self, context: u64) {
+        for m in self.mappings.values_mut() {
+            if m.userfault.is_some_and(|u| u.context == context) {
+                m.userfault = None;
+            }
+        }
+    }
+
+    /// Whether a fill at `start` must first mark the private mapping there
+    /// written, as Linux's `find_vma_and_prepare_anon` gives it an
+    /// `anon_vma` ([`Self::userfault_prepare_fill`]).
+    pub fn userfault_fill_unprepared(&self, start: u64) -> bool {
+        self.mapping_at(start)
+            .is_some_and(|m| !m.written && self.shared_at(start).is_none())
+    }
+
+    /// Marks the private mapping at `start` written, with the Linux VMA it
+    /// is part of, as a fill there does first.
+    pub fn userfault_prepare_fill(&mut self, start: u64) {
+        if self.userfault_fill_unprepared(start) {
+            self.mark_written(GuestAddr(start), 1);
+        }
+    }
+
+    /// The mapping at `start` of a fill of `[start, end)`, as Linux's
+    /// `uffd_mfill_lock` and `mfill_atomic` check it: the range lies in one
+    /// VMA, which a `userfaultfd` registered (`ENOENT`, Linux's
+    /// `validate_dst_vma`), and which is memory a `userfaultfd` fills
+    /// (`EINVAL`).
+    pub fn userfault_target(&self, start: u64, end: u64) -> Result<Mapping, Errno> {
+        let (_, last) = self.region_at(start).ok_or(Errno::ENOENT)?;
+        let mapping = *self.mapping_at(start).ok_or(Errno::ENOENT)?;
+        if end > last || mapping.userfault.is_none() {
+            return Err(Errno::ENOENT);
+        }
+        if !self.userfault_capable(&mapping) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(mapping)
+    }
+
+    /// One page of a `UFFDIO_COPY` (`bytes`) or a `UFFDIO_ZEROPAGE` (`None`)
+    /// of `[start, end)`, at `page`, as Linux's `mfill_atomic`: the range
+    /// must lie in one VMA, which a `userfaultfd` registered (`ENOENT`); a
+    /// page that has one already is `EEXIST`, and contents the meter has no
+    /// room for `ENOMEM`. A private page of zeros is Linux's zero page; a
+    /// shared one is a page of shmem.
+    pub fn userfault_fill(
+        &self,
+        start: u64,
+        end: u64,
+        page: u64,
+        bytes: Option<&[u8]>,
+    ) -> Result<(), Errno> {
+        let mapping = self.userfault_target(start, end)?;
+        let prot = self.mapping_at(page).map_or(mapping.prot, |m| m.prot);
+        let mut directory = self.write_directory();
+        let shared = self.shared_at(page);
+        // A guard marker is an entry too (`mfill_atomic_install_pte` takes
+        // only none or a `userfaultfd` marker).
+        if lookup(&directory, page).is_some()
+            || self.guarded(page)
+            || shared.is_some_and(|shared| shared.pages.has(page.wrapping_add(shared.shift)))
+        {
+            return Err(Errno::EEXIST);
+        }
+        let contents = match bytes {
+            Some(bytes) => Some(
+                FrameBytes::new(self.meter.as_ref(), || page_words(bytes)).ok_or(Errno::ENOMEM)?,
+            ),
+            None => None,
+        };
+        let entry = self.page(page, prot);
+        if let Some(contents) = contents {
+            let _ = entry.frame.set(contents);
+        }
+        let (dir, slot) = page_index(page);
+        directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
+        if let Some(shared) = shared {
+            shared.pages.changed();
+        }
+        Ok(())
     }
 
     /// Locks or unlocks `[addr, end)` (`lock`), as Linux's
@@ -4512,6 +4816,88 @@ impl MemoryView {
     pub fn locked_pages(&self) -> Option<u64> {
         self.with_data(AddressSpaceData::locked_pages)
     }
+    /// Runs `f` on the space's data to change it, as
+    /// [`AddressSpaceGuard`]'s mutable borrow does, if the space still
+    /// lives.
+    fn with_data_mut<T>(&self, f: impl FnOnce(&mut AddressSpaceData) -> T) -> Option<T> {
+        let data = self.data.upgrade()?;
+        let _serialization = self
+            .serialization
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut data = data.lock().unwrap_or_else(PoisonError::into_inner);
+        data.code.bump_epoch();
+        data.code.layout.fetch_add(1, Ordering::Release);
+        Some(f(&mut data))
+    }
+    /// See [`AddressSpaceData::userfault_register`]; `ENOMEM` once the
+    /// space is gone, as Linux's `mmget_not_zero` fails.
+    pub fn userfault_register(
+        &self,
+        start: u64,
+        end: u64,
+        context: u64,
+        modes: u8,
+    ) -> Result<(), Errno> {
+        self.with_data_mut(|data| data.userfault_register(start, end, context, modes))
+            .unwrap_or(Err(Errno::ENOMEM))
+    }
+    /// See [`AddressSpaceData::userfault_unregister`]; `ENOMEM` once the
+    /// space is gone.
+    pub fn userfault_unregister(
+        &self,
+        start: u64,
+        end: u64,
+        context: u64,
+    ) -> Result<Vec<(u64, u64)>, Errno> {
+        self.with_data_mut(|data| data.userfault_unregister(start, end, context))
+            .unwrap_or(Err(Errno::ENOMEM))
+    }
+    /// See [`AddressSpaceData::userfault_release`].
+    pub fn userfault_release(&self, context: u64) {
+        self.with_data_mut(|data| data.userfault_release(context));
+    }
+    /// Whether the space still lives, as Linux's `mmget_not_zero` asks.
+    #[must_use]
+    pub fn lives(&self) -> bool {
+        self.data.strong_count() > 0
+    }
+    /// See [`AddressSpaceData::userfault_prepare_fill`].
+    pub fn userfault_prepare_fill(&self, start: u64) {
+        if self
+            .with_data(|data| data.userfault_fill_unprepared(start))
+            .unwrap_or(false)
+        {
+            self.with_data_mut(|data| data.userfault_prepare_fill(start));
+        }
+    }
+    /// See [`AddressSpaceData::userfault_fill`]; `ESRCH` once the space is
+    /// gone.
+    pub fn userfault_fill(
+        &self,
+        start: u64,
+        end: u64,
+        page: u64,
+        bytes: Option<&[u8]>,
+    ) -> Result<(), Errno> {
+        self.with_data(|data| data.userfault_fill(start, end, page, bytes))
+            .unwrap_or(Err(Errno(3))) // ESRCH
+    }
+    /// See [`AddressSpaceData::userfault_target`]: the modes the mapping
+    /// was registered with; `ESRCH` once the space is gone.
+    pub fn userfault_target(&self, start: u64, end: u64) -> Result<u8, Errno> {
+        self.with_data(|data| {
+            data.userfault_target(start, end)
+                .map(|m| m.userfault.map_or(0, |u| u.modes))
+        })
+        .unwrap_or(Err(Errno(3))) // ESRCH
+    }
+    /// See [`AddressSpaceData::userfault_at`].
+    #[must_use]
+    pub fn userfault_at(&self, addr: u64) -> Option<u64> {
+        self.with_data(|data| data.userfault_at(GuestAddr(addr)))
+            .flatten()
+    }
     /// The total length of the space's mappings and its initial break, or
     /// `None` once it is gone.
     #[must_use]
@@ -5186,6 +5572,16 @@ impl AddressSpace {
     #[must_use]
     pub fn removals(&self, addr: GuestAddr, end: u64) -> (Vec<Result<Removal, Errno>>, bool) {
         self.locked().removals(addr.0, end)
+    }
+    /// See [`AddressSpaceData::userfault_at`].
+    #[must_use]
+    pub fn userfault_at(&self, addr: GuestAddr) -> Option<u64> {
+        self.locked().userfault_at(addr)
+    }
+    /// See [`AddressSpaceData::userfault_for`].
+    #[must_use]
+    pub fn userfault_for(&self, addr: GuestAddr, write: bool, fetch: bool) -> Option<u64> {
+        self.locked().userfault_for(addr, write, fetch)
     }
     /// See [`AddressSpaceData::advise_flags`].
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {

@@ -128,7 +128,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 19] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 13] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 15] = [
     (b"task", 4),
     (b"ns", 4),
     (b"environ", 8),
@@ -139,6 +139,8 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 13] = [
     (b"cwd", 10),
     (b"root", 10),
     (b"exe", 10),
+    (b"mounts", 8),
+    (b"mountinfo", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
@@ -160,6 +162,9 @@ pub(crate) enum TaskEntry {
     Cwd,
     /// `root`, the task's root (`chroot`'s).
     Root,
+    /// `mountinfo` (true) or `mounts`: the mounts of the task's mount
+    /// namespace, from its root.
+    Mounts(bool),
     /// `/proc/thread-self`, a link to the reading thread's directory.
     ThreadLink,
     /// `ns`, the directory of the task's namespaces, and one of its links.
@@ -212,6 +217,8 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"exe" => TaskEntry::Exe,
         b"cwd" => TaskEntry::Cwd,
         b"root" => TaskEntry::Root,
+        b"mounts" => TaskEntry::Mounts(false),
+        b"mountinfo" => TaskEntry::Mounts(true),
         b"ns" => TaskEntry::Namespaces,
         b"uid_map" => TaskEntry::IdMap(crate::users::Ids::User),
         b"gid_map" => TaskEntry::IdMap(crate::users::Ids::Group),
@@ -234,9 +241,13 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         [b"task"] => (None, TaskEntry::Threads),
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
         [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
-        // The process's own `ns` and user namespace files are here; the
-        // rest of its own directory is `own_entry`'s.
-        [b"ns", ..] | [b"uid_map" | b"gid_map" | b"setgroups"] => (None, entry(&parts)),
+        // The process's own `ns`, user namespace files and mount tables
+        // are here (`/proc/self/mountinfo` and `mounts` are
+        // [`mount_table`]'s); the rest of its own directory is
+        // `own_entry`'s.
+        [b"ns", ..] | [b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo"] => {
+            (None, entry(&parts))
+        }
         _ if pid == own => return None,
         [] => (None, TaskEntry::Directory),
         _ => (None, entry(&parts)),
@@ -579,6 +590,8 @@ pub(crate) struct Status<'a> {
     pub tgid: u32,
     pub pid: u32,
     pub parent: u32,
+    /// The process of the tracer, 0 for none.
+    pub tracer: u32,
     /// The process group and the session, by their IDs in the emulator.
     pub group_id: u32,
     pub session: u32,
@@ -654,7 +667,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         .map_or_else(String::new, |pages| format!("VmLck:\t{:8} kB\n", pages * 4));
     format!(
         "Name:\t{name}\n{umask}State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\n\
-         Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
+         Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
          FDSize:\t{fd_size}\nGroups:\t{groups} \n{numbers}{memory}Threads:\t{}\nSigQ:\t{}/{}\n\
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
          SigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\n\
@@ -662,6 +675,7 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
          NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n\
          voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         s.parent,
+        s.tracer,
         uid(c.uid),
         uid(c.euid),
         uid(c.suid),
@@ -765,6 +779,7 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
             continue;
         };
         let path = escape(&path);
+        let root = escape(&mount.root);
         let source = escape(&mount.source);
         let (kind, options) = (mount.kind, &mount.options);
         let (common, fs) = (&mount.common_options, &mount.super_options);
@@ -773,7 +788,7 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
             let major = (device >> 8) & 0xfff | (device >> 32) & !0xfff;
             let minor = device & 0xff | (device >> 12) & !0xff;
             out.push_str(&format!(
-                "{} {} {major}:{minor} / {path} rw{options} - {kind} {source} rw{common}{fs}\n",
+                "{} {} {major}:{minor} {root} {path} rw{options} - {kind} {source} rw{common}{fs}\n",
                 mount.id, mount.parent
             ));
         } else {
@@ -1493,6 +1508,23 @@ mod tests {
             path(b"/proc/thread-self/stat"),
             at(7, Some(9), TaskEntry::Stat)
         );
+        // Every task's mount tables, the reader's own too.
+        assert_eq!(
+            path(b"/proc/8/mountinfo"),
+            at(8, None, TaskEntry::Mounts(true))
+        );
+        assert_eq!(
+            path(b"/proc/7/mounts"),
+            at(7, None, TaskEntry::Mounts(false))
+        );
+        assert_eq!(
+            path(b"/proc/thread-self/mountinfo"),
+            at(7, Some(9), TaskEntry::Mounts(true))
+        );
+        assert_eq!(
+            path(b"/proc/8/task/8/mounts"),
+            at(8, Some(8), TaskEntry::Mounts(false))
+        );
         assert_eq!(path(b"/proc/8/maps"), at(8, None, TaskEntry::Missing));
         assert_eq!(path(b"/proc/8/fd/1"), at(8, None, TaskEntry::Missing));
         assert_eq!(path(b"/proc/8/task"), at(8, None, TaskEntry::Threads));
@@ -1543,6 +1575,7 @@ mod tests {
             tgid: 3,
             pid: 4,
             parent: 1,
+            tracer: 0,
             group_id: 3,
             session: 2,
             space: &namespaces.pid,

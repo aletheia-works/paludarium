@@ -25,6 +25,8 @@ pub(super) struct Task {
     public: PublicThread,
     /// The state's letter and its name in `status`.
     state: (char, &'static str),
+    /// The process tracing it, 0 for none (`TracerPid`).
+    tracer: u32,
 }
 
 /// The thread of `path`: ENOENT for a process that is not there (reaped,
@@ -56,6 +58,7 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
         _ if view.zombie => ('Z', "Z (zombie)"),
         // A leader that ended before its other threads.
         None => ('Z', "Z (zombie)"),
+        Some(_) if c.processes.traces.in_stop(tid) => ('t', "t (tracing stop)"),
         Some(_) if view.group.is_stopped() => ('T', "T (stopped)"),
         Some((_, in_call)) if in_call && tid != c.tid => ('S', "S (sleeping)"),
         Some(_) => ('R', "R (running)"),
@@ -70,6 +73,7 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
         view,
         public,
         state,
+        tracer: c.processes.traces.tracer_of(tid).unwrap_or(0),
     })
 }
 
@@ -178,6 +182,10 @@ pub(super) fn content(
         TaskEntry::Comm => crate::proc::render_comm(&public.name),
         TaskEntry::IdMap(ids) => public.credentials.user.map_text(ids, reader),
         TaskEntry::Setgroups => public.credentials.user.setgroups_text().to_vec(),
+        // Nothing once it has ended, whose open is `EINVAL` ([`mounts`]).
+        TaskEntry::Mounts(mountinfo) => mounts(task).map_or_else(Vec::new, |(mounts, root)| {
+            crate::proc::render(&mounts, mountinfo, &root)
+        }),
         // The argument or environment strings as they are in its memory now;
         // nothing for a zombie.
         TaskEntry::Cmdline | TaskEntry::Environ => {
@@ -236,6 +244,7 @@ pub(super) fn content(
             tgid: task.pid,
             pid: task.tid,
             parent: task.view.parent,
+            tracer: task.tracer,
             group_id: task.view.group_id,
             session: task.view.session,
             space: &task.view.space,
@@ -255,6 +264,17 @@ pub(super) fn content(
         }),
         _ => return None,
     })
+}
+
+/// The mounts of the task's mount namespace and its root, which
+/// `mountinfo` and `mounts` show; `None` for a task that has ended, whose
+/// open Linux's `mounts_open_common` refuses (`EINVAL`) as it has no
+/// `nsproxy`, the leader of live threads too.
+pub(super) fn mounts(task: &Task) -> Option<(Vec<paludarium_vfs::MountPoint>, Vec<u8>)> {
+    if task.state.0 == 'Z' {
+        return None;
+    }
+    task.public.files.mounts()
 }
 
 /// Where `exe` or `cwd` leads: the program and the current directory, or

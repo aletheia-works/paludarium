@@ -178,6 +178,13 @@ enum Backing {
         device: u64,
     },
     Memory(Arc<Superblock>),
+    /// A bind mount of the lower filesystem's files, in the boot mount at
+    /// `base`, whose type and device it shows.
+    Lower {
+        kind: &'static str,
+        device: u64,
+        base: Vec<u8>,
+    },
 }
 
 #[derive(Clone)]
@@ -186,6 +193,10 @@ struct Entry {
     parent: u64,
     point: Vec<u8>,
     backing: Backing,
+    /// Where its root is in its file system (`mnt_root`): `/` for a new
+    /// tmpfs, the directory or file a bind mount was made from, a path
+    /// from the machine's root for one of the lower filesystem's.
+    root: Vec<u8>,
     flags: u32,
     locked: bool,
     /// `MNT_EXPIRE`'s mark (`mnt_expiry_mark`).
@@ -199,7 +210,23 @@ impl Entry {
     fn memory(&self) -> Option<&Arc<Superblock>> {
         match &self.backing {
             Backing::Memory(sb) => Some(sb),
-            Backing::Boot { .. } => None,
+            Backing::Boot { .. } | Backing::Lower { .. } => None,
+        }
+    }
+    /// Made after start-up, by `mount`: a walk steps into it itself.
+    fn runtime(&self) -> bool {
+        !matches!(self.backing, Backing::Boot { .. })
+    }
+    /// The path in its file system of `path`, a path in the mount.
+    fn inside(&self, path: &[u8]) -> Vec<u8> {
+        joined(&self.root, &relative(&self.point, path))
+    }
+    /// Whether it shows the same file system as `other`.
+    fn same_files(&self, other: &Self) -> bool {
+        match (&self.backing, &other.backing) {
+            (Backing::Memory(a), Backing::Memory(b)) => Arc::ptr_eq(a, b),
+            (Backing::Memory(_), _) | (_, Backing::Memory(_)) => false,
+            _ => true,
         }
     }
 }
@@ -243,6 +270,7 @@ impl MountTable {
                         kind: m.kind,
                         device: m.device,
                     },
+                    root: m.path.clone(),
                     flags: mount_flags::RELATIME,
                     locked: false,
                     expiring: false,
@@ -328,6 +356,16 @@ fn relative(point: &[u8], path: &[u8]) -> Vec<u8> {
         path[point.len()..].to_vec()
     }
 }
+/// `rest`, a path from a directory, from where the directory is, `at`.
+fn joined(at: &[u8], rest: &[u8]) -> Vec<u8> {
+    if rest == b"/" {
+        at.to_vec()
+    } else if at == b"/" {
+        rest.to_vec()
+    } else {
+        [at, rest].concat()
+    }
+}
 /// `name` in the directory `dir`.
 fn child_path(dir: &[u8], name: &[u8]) -> Vec<u8> {
     let mut out = dir.to_vec();
@@ -400,12 +438,13 @@ impl NamespacedFs {
     fn fast(&self) -> bool {
         self.table.boot_only.load(Ordering::SeqCst)
     }
-    /// The index of the tmpfs mount numbered `id`, none for a boot one.
-    fn memory_index(entries: &[Entry], id: u64) -> Option<usize> {
+    /// The index of the mount numbered `id` that `mount` made, none for a
+    /// boot one.
+    fn runtime_index(entries: &[Entry], id: u64) -> Option<usize> {
         entries
             .iter()
             .position(|e| e.id() == id)
-            .filter(|&i| entries[i].memory().is_some())
+            .filter(|&i| entries[i].runtime())
     }
     fn id_of(&self, entries: &[Entry], loc: &Loc) -> u64 {
         match loc.at {
@@ -424,7 +463,7 @@ impl NamespacedFs {
         let id = self.id_of(entries, loc);
         entries
             .iter()
-            .position(|e| e.memory().is_some() && e.parent == id && e.point == loc.path)
+            .position(|e| e.runtime() && e.parent == id && e.point == loc.path)
     }
     /// Into the topmost mount on `loc` (`handle_mounts`).
     fn cross(&self, entries: &[Entry], mut loc: Loc) -> Loc {
@@ -433,13 +472,15 @@ impl NamespacedFs {
         }
         loc
     }
-    fn backing<'a>(&'a self, entries: &'a [Entry], loc: &Loc) -> (&'a dyn HostFs, Vec<u8>) {
-        // A walk is only ever on a tmpfs mount or the lower filesystem.
-        match loc
-            .at
-            .and_then(|i| Some((&entries[i], entries[i].memory()?)))
-        {
-            Some((e, sb)) => (&*sb.fs, relative(&e.point, &loc.path)),
+    /// The file system `loc` is on and its path there.
+    fn backing<'a>(&'a self, entries: &'a [Entry], loc: &Loc) -> (&'a dyn FileSystem, Vec<u8>) {
+        // A walk is only ever on a mount `mount` made or the lower
+        // filesystem.
+        match loc.at.map(|i| &entries[i]) {
+            Some(e) => (
+                e.memory().map_or(&*self.lower, |sb| &*sb.fs),
+                e.inside(&loc.path),
+            ),
             None => (&*self.lower, loc.path.clone()),
         }
     }
@@ -501,7 +542,7 @@ impl NamespacedFs {
                     while let Some(i) = current.at
                         && entries[i].point == current.path
                     {
-                        current.at = Self::memory_index(entries, entries[i].parent);
+                        current.at = Self::runtime_index(entries, entries[i].parent);
                     }
                     current.path = parent_path(&current.path);
                 }
@@ -577,13 +618,13 @@ impl NamespacedFs {
         let entries = self.table.snapshot();
         let below = |p: &[u8]| p.len() > old.len() && within(p, old) && old != b"/";
         let mut out = Vec::new();
-        for e in entries.iter().filter(|e| e.memory().is_some()) {
+        for e in entries.iter().filter(|e| e.runtime()) {
             if !below(&e.point) {
                 continue;
             }
             // The mount of the topmost of its ancestors still below `old`.
             let mut at = e;
-            while let Some(i) = Self::memory_index(&entries, at.parent)
+            while let Some(i) = Self::runtime_index(&entries, at.parent)
                 && below(&entries[i].point)
             {
                 at = &entries[i];
@@ -604,7 +645,7 @@ impl NamespacedFs {
         Ok(Target {
             id,
             root: e.point == loc.path,
-            boot: e.memory().is_none(),
+            boot: !e.runtime(),
             namespace_root: entries.first().is_some_and(|first| first.id() == id),
             locked: e.locked,
             covered: entries.iter().any(|c| c.parent == id && c.id() != id),
@@ -642,6 +683,7 @@ impl NamespacedFs {
             parent,
             point: loc.path,
             backing: Backing::Memory(sb),
+            root: b"/".to_vec(),
             flags: new.flags,
             locked: false,
             expiring: false,
@@ -652,13 +694,92 @@ impl NamespacedFs {
             Ok(())
         })
     }
+    /// Binds what the resolved `source` names onto the resolved `target`
+    /// (`do_loopback`), both with their last links followed: a new mount of
+    /// the source's mount's file system, rooted there, with that mount's
+    /// flags, its source and its type, not locked. With `recurse`
+    /// (`copy_tree`) the mounts below the source come along, each still
+    /// locked if it was; without, a locked one below it is `EINVAL`
+    /// (`has_locked_children`). A directory goes on a directory, a file on
+    /// a file (`graft_tree`, `ENOTDIR`).
+    pub fn bind(&self, source: &[u8], target: &[u8], recurse: bool) -> Result<(), Errno> {
+        let entries = self.table.snapshot();
+        let from = self.walk(&entries, source, true, false, true)?;
+        let to = self.walk(&entries, target, true, false, true)?;
+        let old = self.entry(&entries, &from);
+        let below =
+            |e: &Entry| e.parent == old.id() && e.id() != old.id() && within(&e.point, &from.path);
+        if !recurse && entries.iter().any(|e| below(e) && e.locked) {
+            return Err(Errno::EINVAL);
+        }
+        let directory = |loc: &Loc| -> Result<bool, Errno> {
+            Ok(self.lstat(&entries, loc)?.mode & S_IFMT == S_IFDIR)
+        };
+        if directory(&from)? != directory(&to)? {
+            return Err(Errno::ENOTDIR);
+        }
+        let numbers = &self.table.numbers;
+        // `clone_mnt` of `e`, rooted at `root` in its file system.
+        let clone = |e: &Entry, root: Vec<u8>, parent: u64, point: Vec<u8>, locked: bool| Entry {
+            token: Arc::new(Token {
+                id: Numbers::take(&numbers.ids, 21),
+                numbers: Arc::clone(numbers),
+                _superblock: e.memory().cloned(),
+                pins: AtomicUsize::new(0),
+            }),
+            parent,
+            point,
+            backing: match &e.backing {
+                Backing::Boot { kind, device } => Backing::Lower {
+                    kind,
+                    device: *device,
+                    base: e.point.clone(),
+                },
+                other => other.clone(),
+            },
+            root,
+            flags: e.flags,
+            locked,
+            expiring: false,
+            source: e.source.clone(),
+        };
+        let top = clone(
+            old,
+            self.backing(&entries, &from).1,
+            self.id_of(&entries, &to),
+            to.path.clone(),
+            false,
+        );
+        let mut new = vec![top];
+        if recurse {
+            // Each mount below, its parent's copy before it (`next_mnt`).
+            let mut copies = BTreeMap::from([(old.id(), new[0].id())]);
+            let mut queue: Vec<&Entry> = entries.iter().filter(|e| below(e)).rev().collect();
+            while let Some(e) = queue.pop() {
+                let point = joined(&to.path, &relative(&from.path, &e.point));
+                let copy = clone(e, e.root.clone(), copies[&e.parent], point, e.locked);
+                copies.insert(e.id(), copy.id());
+                new.push(copy);
+                queue.extend(
+                    entries
+                        .iter()
+                        .filter(|c| c.parent == e.id() && c.id() != e.id())
+                        .rev(),
+                );
+            }
+        }
+        self.table.update(|entries| {
+            entries.extend(new);
+            Ok(())
+        })
+    }
     /// Unmounts the tmpfs mount `id` (`umount_tree`): with `detach` it and
     /// every mount on it go at once, its open files staying usable;
     /// without, a mount in use or with others on it is `EBUSY`
     /// (`propagate_mount_busy`).
     pub fn umount(&self, id: u64, detach: bool) -> Result<(), Errno> {
         self.table.update(|entries| {
-            let i = Self::memory_index(entries, id).ok_or(Errno::EINVAL)?;
+            let i = Self::runtime_index(entries, id).ok_or(Errno::EINVAL)?;
             if !detach
                 && (entries.iter().any(|e| e.parent == id)
                     || entries[i].token.pins.load(Ordering::SeqCst) != 0)
@@ -687,7 +808,7 @@ impl NamespacedFs {
     /// mount does.
     pub fn expire(&self, id: u64) -> Result<(), Errno> {
         let marked = self.table.update(|entries| {
-            let i = Self::memory_index(entries, id).ok_or(Errno::EINVAL)?;
+            let i = Self::runtime_index(entries, id).ok_or(Errno::EINVAL)?;
             if entries.iter().any(|e| e.parent == id)
                 || entries[i].token.pins.load(Ordering::SeqCst) != 0
             {
@@ -721,16 +842,28 @@ impl FileSystem for NamespacedFs {
         entries
             .iter()
             .map(|e| {
-                let (kind, device, common_options, super_options) = match &e.backing {
+                let (kind, device, root, common_options, super_options) = match &e.backing {
                     Backing::Boot { kind, device } => {
-                        (*kind, *device, String::new(), String::new())
+                        (*kind, *device, b"/".to_vec(), String::new(), String::new())
                     }
-                    Backing::Memory(sb) => {
-                        ("tmpfs", sb.device(), sb.common.clone(), sb.shown.clone())
-                    }
+                    Backing::Lower { kind, device, base } => (
+                        *kind,
+                        *device,
+                        relative(base, &e.root),
+                        String::new(),
+                        String::new(),
+                    ),
+                    Backing::Memory(sb) => (
+                        "tmpfs",
+                        sb.device(),
+                        e.root.clone(),
+                        sb.common.clone(),
+                        sb.shown.clone(),
+                    ),
                 };
                 MountPoint {
                     path: e.point.clone(),
+                    root,
                     kind,
                     id: e.id(),
                     parent: e.parent,
@@ -749,9 +882,9 @@ impl FileSystem for NamespacedFs {
         }
         let entries = self.table.snapshot();
         let loc = self.locate(&entries, path);
-        match loc.at {
-            Some(i) => entries[i].memory().map_or(1, |sb| sb.device()),
-            None => self.lower.device(&loc.path),
+        match loc.at.and_then(|i| entries[i].memory()) {
+            Some(sb) => sb.device(),
+            None => self.lower.device(&self.backing(&entries, &loc).1),
         }
     }
     fn mount_id(&self, path: &[u8]) -> u64 {
@@ -784,22 +917,15 @@ impl FileSystem for NamespacedFs {
         }
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, anchor, true, false, true).ok()?;
-        match loc.at {
-            Some(i) => {
-                let e = &entries[i];
-                let found = e
-                    .memory()?
-                    .fs
-                    .memory_path(&relative(&e.point, &loc.path), inode)?;
-                Some(if found == b"/" {
-                    e.point.clone()
-                } else if e.point == b"/" {
-                    found
-                } else {
-                    [&e.point[..], &found].concat()
-                })
+        let (fs, at) = self.backing(&entries, &loc);
+        let found = fs.memory_path(&at, inode)?;
+        match loc.at.map(|i| &entries[i]) {
+            // Reached from the mount's root, which a bind mount may not
+            // be its file system's.
+            Some(e) => {
+                within(&found, &e.root).then(|| joined(&e.point, &relative(&e.root, &found)))
             }
-            None => self.lower.memory_path(&loc.path, inode),
+            None => Some(found),
         }
     }
 }
@@ -870,8 +996,9 @@ impl HostFs for NamespacedFs {
         let (fs, at) = self.backing(&entries, &loc);
         fs.make_fifo(&at, mode)
     }
-    /// A mount point in this namespace is `EBUSY` to `rmdir`, as Linux's
-    /// `vfs_rmdir` finds it `is_local_mountpoint`.
+    /// A mount point in this namespace is `EBUSY` to `rmdir` and `unlink`,
+    /// as Linux's `vfs_rmdir` and `vfs_unlink` find it
+    /// `is_local_mountpoint`.
     fn unlink(&self, path: &[u8], directory: bool) -> Result<(), Errno> {
         if self.fast() {
             return self.view.unlink(path, directory);
@@ -879,7 +1006,7 @@ impl HostFs for NamespacedFs {
         let entries = self.table.snapshot();
         self.trailing_directory(&entries, path)?;
         let loc = self.walk(&entries, path, false, false, false)?;
-        if directory && self.covering(&entries, &loc).is_some() {
+        if self.covering(&entries, &loc).is_some() {
             return Err(EBUSY);
         }
         let (fs, at) = self.backing(&entries, &loc);
@@ -923,7 +1050,8 @@ impl HostFs for NamespacedFs {
     }
     /// Across mounts `EXDEV`; of a mount point in this namespace `EBUSY`
     /// (`vfs_rename`'s `is_local_mountpoint`). The mounts below a renamed
-    /// directory move with it.
+    /// directory move with it, and a bind mount of a file it renames
+    /// keeps showing that file, as a mount holds its root's dentry.
     fn rename_with(&self, old: &[u8], new: &[u8], flags: u32) -> Result<(), Errno> {
         if self.fast() {
             return self.view.rename_with(old, new, flags);
@@ -950,11 +1078,28 @@ impl HostFs for NamespacedFs {
         let (fs, a) = self.backing(&entries, &from);
         let (_, b) = self.backing(&entries, &to);
         fs.rename_with(&a, &b, flags)?;
-        if !moves.is_empty() {
+        let on = self.entry(&entries, &from).clone();
+        let mut roots = Vec::new();
+        for e in entries.iter().filter(|e| e.runtime() && e.same_files(&on)) {
+            let renamed = |old: &[u8], new: &[u8]| {
+                (old != b"/" && within(&e.root, old)).then(|| joined(new, &relative(old, &e.root)))
+            };
+            let root = renamed(&a, &b)
+                .or_else(|| (flags & EXCHANGE != 0).then(|| renamed(&b, &a)).flatten());
+            if let Some(root) = root {
+                roots.push((e.id(), root));
+            }
+        }
+        if !moves.is_empty() || !roots.is_empty() {
             self.table.update(|entries| {
                 for (id, point) in moves {
                     if let Some(e) = entries.iter_mut().find(|e| e.id() == id) {
                         e.point = point;
+                    }
+                }
+                for (id, root) in roots {
+                    if let Some(e) = entries.iter_mut().find(|e| e.id() == id) {
+                        e.root = root;
                     }
                 }
                 Ok(())

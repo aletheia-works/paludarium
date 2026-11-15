@@ -224,6 +224,8 @@ pub struct Processes {
     pub(crate) secret_pages: Arc<crate::memfd::SecretPages>,
     /// The machine's keys and keyrings.
     pub(crate) keys: crate::keys::Keys,
+    /// The traced tasks ([`crate::ptrace`]).
+    pub(crate) traces: crate::ptrace::Traces,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -247,6 +249,7 @@ impl Processes {
             mqueue_mount: group.namespaces(1).ipc.mq.clone(),
             kcmp_cookies: std::sync::OnceLock::new(),
             aio: Arc::default(),
+            traces: crate::ptrace::Traces::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -1048,7 +1051,7 @@ impl Processes {
         &self.changed
     }
     pub(crate) fn remove(&self, pid: u32) {
-        Self::release(
+        self.release(
             &mut self.entries.lock().unwrap_or_else(PoisonError::into_inner),
             pid,
         );
@@ -1181,7 +1184,7 @@ impl Processes {
             // As reparent_leader, also for a zombie reaped just now.
             Self::hang_up_orphaned(&mut entries, orphan, pid);
             if reaped {
-                Self::release(&mut entries, orphan);
+                self.release(&mut entries, orphan);
             }
         }
         Self::hang_up_orphaned(&mut entries, pid, pid);
@@ -1191,10 +1194,79 @@ impl Processes {
             if let Some(entry) = entries.get_mut(&pid) {
                 entry.held = true;
             }
+        } else if let Some(tracer) = entries
+            .get(&pid)
+            .and_then(|entry| self.traces.tracer_of(pid).filter(|&t| t != entry.parent))
+        {
+            // Its tracer hears of the exit first; its parent once the
+            // tracer has waited for it or let it go (`EXIT_TRACE`).
+            self.traced_exit(&entries, pid, tracer);
         } else if Self::notify_parent(&entries, pid) {
-            Self::release(&mut entries, pid);
+            self.release(&mut entries, pid);
         }
         self.changed.notify();
+    }
+    /// The processes, by PID, with their thread groups, process groups
+    /// and parents, for a tracer's wait.
+    pub(crate) fn traced_groups(&self) -> BTreeMap<u32, (Arc<ThreadGroup>, u32, u32)> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(&pid, entry)| (pid, (entry.group.clone(), entry.pgid, entry.parent)))
+            .collect()
+    }
+    /// The process `pid`, traced by process `tracer` that is not its
+    /// parent, has exited: its tracer is told (`do_notify_parent` with
+    /// SIGCHLD) and is the one to wait for it first.
+    fn traced_exit(&self, entries: &BTreeMap<u32, Entry>, pid: u32, tracer: u32) {
+        let Some(entry) = entries.get(&pid) else {
+            return;
+        };
+        let status = entry.status.unwrap_or(ExitStatus::Exited(0));
+        self.traces.exited(pid, status, entry.dumped);
+        if let Some(tracing) = entries.get(&tracer) {
+            let (code, status) = match status {
+                ExitStatus::Signaled(signal) if entry.dumped => (signals::CLD_DUMPED, signal),
+                ExitStatus::Signaled(signal) => (signals::CLD_KILLED, signal),
+                ExitStatus::Exited(code) => (signals::CLD_EXITED, code & 255),
+                _ => (signals::CLD_EXITED, 0),
+            };
+            tracing.group.notify_child(
+                code,
+                signals::ChildSignal {
+                    pid: tracing.space.number(pid),
+                    uid: entry.group.task_ids(pid, pid).uid,
+                    status,
+                    cpu: entry.group.process_cpu(),
+                },
+            );
+        }
+    }
+    /// Process `pid`, whose exit its tracer held, is no longer traced:
+    /// its parent learns of the exit now, and reaps it at once if it
+    /// would have.
+    pub(crate) fn exit_untraced(&self, pid: u32) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries
+            .get(&pid)
+            .is_some_and(|entry| entry.status.is_some())
+            && Self::notify_parent(&entries, pid)
+        {
+            self.release(&mut entries, pid);
+        }
+        drop(entries);
+        self.changed.notify();
+    }
+    /// `SIGKILL` to process `pid` for `PTRACE_KILL` from `sender` (with
+    /// its real user ID), or from the kernel for `PTRACE_O_EXITKILL`.
+    pub(crate) fn kill_traced(&self, pid: u32, sender: Option<(u32, u32)>) {
+        let signal = match sender {
+            Some((sender, uid)) => Self::from_process(9, sender, uid),
+            None => Self::from_kernel(9),
+        };
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = self.send(&mut entries, pid, None, signal);
     }
     /// Whether a process other than `init` is in PID namespace `space` or
     /// one nested in it.
@@ -1206,10 +1278,12 @@ impl Processes {
     /// Removes process `pid`, which is reaped, and forgets its numbers, as
     /// Linux's `release_task`. The init of a nested PID namespace that
     /// waited for it to be gone now tells its parent.
-    fn release(entries: &mut BTreeMap<u32, Entry>, pid: u32) {
+    fn release(&self, entries: &mut BTreeMap<u32, Entry>, pid: u32) {
         let Some(entry) = entries.remove(&pid) else {
             return;
         };
+        // Its tasks are no longer traced (`__ptrace_unlink`).
+        self.traces.forget_process(pid);
         entry.space.leave(pid);
         let held: Vec<u32> = entries
             .iter()
@@ -1225,7 +1299,7 @@ impl Processes {
                 other.held = false;
             }
             if Self::notify_parent(entries, init) {
-                Self::release(entries, init);
+                self.release(entries, init);
             }
         }
     }
@@ -1393,17 +1467,21 @@ impl Processes {
             if !matching(pid, entry) {
                 return None;
             }
-            // A held init has not finished exiting yet.
-            if entry.held {
+            // A held init has not finished exiting yet, nor has a process
+            // whose exit waits for its tracer (`EXIT_TRACE`).
+            if entry.held || entry.status.is_some() && self.traces.holds_exit(pid, parent) {
                 return None;
             }
+            // The parent that traces its child sees its ptrace stops, not
+            // its group stops ([`Self::reap_traced`]).
+            let traced = self.traces.tracer_of(pid) == Some(parent);
             let event = match entry.status {
                 Some(ExitStatus::Signaled(signal)) if entry.dumped => {
                     wait.exits.then_some(ChildEvent::Dumped(signal))
                 }
                 Some(status) => wait.exits.then_some(ChildEvent::Exited(status)),
                 None => match entry.stop_report {
-                    Some(signal) if wait.stops => Some(ChildEvent::Stopped(signal)),
+                    Some(signal) if wait.stops && !traced => Some(ChildEvent::Stopped(signal)),
                     _ => (wait.continues && entry.continue_report).then_some(ChildEvent::Continued),
                 },
             }?;
@@ -1417,7 +1495,7 @@ impl Processes {
             match event {
                 // A reaped child's CPU time joins its parent's children's.
                 ChildEvent::Exited(_) | ChildEvent::Dumped(_) => {
-                    Self::release(&mut entries, pid);
+                    self.release(&mut entries, pid);
                     if let Some(parent) = entries.get_mut(&parent) {
                         parent.children_cpu = parent.children_cpu.saturating_add(cpu);
                     }
@@ -1432,6 +1510,7 @@ impl Processes {
                         entry.continue_report = false;
                     }
                 }
+                ChildEvent::Trapped(_) => {}
             }
         }
         Ok(ready
@@ -1447,6 +1526,7 @@ impl Processes {
         if !group.job_stop() {
             return;
         }
+        group.set_stop_signal(signal);
         let Some(entry) = entries.get_mut(&pid) else {
             return;
         };
@@ -1454,6 +1534,11 @@ impl Processes {
         entry.continue_report = false;
         self.changed.notify();
         let parent = entry.parent;
+        // A parent that traces the process hears of its stops as a tracer
+        // only (`ptrace_stop` tells the real parent only when reparented).
+        if self.traces.tracer_of(pid) == Some(parent) {
+            return;
+        }
         let child = signals::ChildSignal {
             pid,
             uid: group.task_ids(pid, pid).uid,
@@ -1965,6 +2050,9 @@ pub(crate) enum ChildEvent {
     /// Ended by this signal after writing a core.
     Dumped(i32),
     Stopped(i32),
+    /// In a ptrace stop with this code, which has the event above the
+    /// signal.
+    Trapped(i32),
     Continued,
 }
 
@@ -1981,6 +2069,8 @@ pub(crate) const NOBODY: u32 = u32::MAX;
 const WNOHANG: u64 = 1;
 const WEXITED: u64 = 4;
 const WNOWAIT: u64 = 0x0100_0000;
+/// `__WNOTHREAD`: only what the calling thread traces.
+const WNOTHREAD: u64 = 0x2000_0000;
 const PIDFD_NONBLOCK: u64 = 0x800;
 const PIDFD_THREAD: u64 = 0x80;
 /// `O_CLOEXEC`, which a pidfd from `open_by_handle_at` keeps in its flags.
@@ -2173,7 +2263,7 @@ impl Kernel {
     /// was taken from [`Processes::changed`], or at most 10 ms pass, as the
     /// thread's wake token (any other signal) is polled; a host without
     /// tickets waits out the time.
-    fn wait_for_children(&self, ticket: u32) -> Result<(), Errno> {
+    pub(crate) fn wait_for_children(&self, ticket: u32) -> Result<(), Errno> {
         let end = self
             .host
             .clock(ClockId::Monotonic)?
@@ -2206,11 +2296,13 @@ impl Kernel {
             59 | 322 => match self.exec(thread, mem, n, a) {
                 Ok(closed) => {
                     self.close_on_exec(thread, mem, closed);
+                    self.ptrace_exec(thread);
                     return Some(Next::Resume);
                 }
                 Err(error) => Err(error),
             },
             61 => self.wait4(thread, mem, a),
+            101 => self.ptrace(thread, mem, a),
             247 => self.waitid(thread, mem, a),
             434 => self.pidfd_open(thread, a),
             424 => self.pidfd_send_signal(thread, a),
@@ -3253,8 +3345,7 @@ impl Kernel {
         loop {
             let ticket = self.processes.changed().value();
             if let Some((pid, event, cpu, _)) =
-                self.processes
-                    .reap(self.process.pid, &space, wanted, wait)?
+                self.reap_any(thread, &space, wanted, wait, a[2] & WNOTHREAD != 0)?
             {
                 let raw = match event {
                     ChildEvent::Exited(ExitStatus::Exited(code)) => (code & 255) << 8,
@@ -3262,7 +3353,9 @@ impl Kernel {
                     // WCOREDUMP.
                     ChildEvent::Dumped(signal) => signal & 127 | 0x80,
                     ChildEvent::Exited(_) => return Err(Errno::EINVAL),
-                    ChildEvent::Stopped(signal) => (signal << 8) | 0x7f,
+                    ChildEvent::Stopped(signal) | ChildEvent::Trapped(signal) => {
+                        (signal << 8) | 0x7f
+                    }
                     ChildEvent::Continued => 0xffff,
                 };
                 // Native wait-fault oracle: Linux consumes the zombie before copyout.
@@ -3290,6 +3383,34 @@ impl Kernel {
             self.wait_for_children(ticket)?;
         }
     }
+    /// What a wait finds, as Linux's `__do_wait` looks: the caller's
+    /// children ([`Processes::reap`]), then the tasks it traces
+    /// ([`Processes::reap_traced`]), those of its thread alone with
+    /// `__WNOTHREAD`. `ECHILD` only when neither has one it wants.
+    fn reap_any(
+        &self,
+        thread: &Thread,
+        space: &Namespace,
+        wanted: Wanted,
+        wait: WaitFor,
+        only_thread: bool,
+    ) -> Result<Option<(u32, ChildEvent, u64, u32)>, Errno> {
+        let own = self.processes.reap(self.process.pid, space, wanted, wait);
+        if matches!(own, Ok(Some(_))) || !self.processes.traces.any() {
+            return own;
+        }
+        let waiter = crate::ptrace::Waiter {
+            pid: self.process.pid,
+            tid: thread.tid,
+            only_thread,
+        };
+        let (traced, any) = self.processes.reap_traced(waiter, space, wanted, wait);
+        match (traced, own) {
+            (Some(found), _) => Ok(Some(found)),
+            (None, Err(_)) if any => Ok(None),
+            (None, own) => own,
+        }
+    }
     /// `waitid(idtype, id, infop, options, rusage)` with Linux's checks and
     /// copy-out: the siginfo fields (`si_signo`, `si_errno`, `si_code`,
     /// `si_pid`, `si_uid`, `si_status`) are written, as zeros when no child
@@ -3314,6 +3435,9 @@ impl Kernel {
                 Ok(Some((pid, ChildEvent::Dumped(signal), _, uid))) => (17, 3, pid, uid, signal),
                 // CLD_STOPPED and CLD_CONTINUED.
                 Ok(Some((pid, ChildEvent::Stopped(signal), _, uid))) => (17, 5, pid, uid, signal),
+                Ok(Some((pid, ChildEvent::Trapped(code), _, uid))) => {
+                    (17, crate::ptrace::CLD_TRAPPED, pid, uid, code)
+                }
                 Ok(Some((pid, ChildEvent::Continued, _, uid))) => (17, 6, pid, uid, 18),
                 _ => (0, 0, 0, 0, 0),
             };
@@ -3373,8 +3497,8 @@ impl Kernel {
         };
         loop {
             let ticket = self.processes.changed().value();
-            let found = self.processes.reap(
-                self.process.pid,
+            let found = self.reap_any(
+                thread,
                 &space,
                 wanted,
                 WaitFor {
@@ -3383,6 +3507,7 @@ impl Kernel {
                     stops: options & 2 != 0,
                     continues: options & 8 != 0,
                 },
+                options & WNOTHREAD != 0,
             )?;
             if found.is_some() || options & WNOHANG != 0 {
                 return Ok(found);
@@ -3584,7 +3709,7 @@ impl Kernel {
     /// Debian's and Ubuntu's, lets it in
     /// ([`Processes::yama_allows`], or `CAP_SYS_PTRACE` in the target's
     /// user namespace).
-    fn may_attach(
+    pub(crate) fn may_attach(
         &self,
         thread: &Thread,
         pid: u32,
@@ -4965,7 +5090,7 @@ fn queued_siginfo(
 /// Linux's `known_siginfo_layout`: `SI_KERNEL`; another positive code up to
 /// the last one of its signal (`NSIGILL`, `NSIGFPE`, ...; `NSIGPOLL` for the
 /// rest); `SI_USER` down to `SI_DETHREAD`; and `SI_ASYNCNL`.
-fn known_layout(number: i32, code: i32) -> bool {
+pub(crate) fn known_layout(number: i32, code: i32) -> bool {
     let last = match number {
         4 => 11,  // SIGILL
         5 => 6,   // SIGTRAP

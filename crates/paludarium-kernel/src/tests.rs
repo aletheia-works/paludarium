@@ -8225,8 +8225,13 @@ fn mount_checks_in_linux_order() {
         mount(&mut f, [none, file, tmpfs, 0, 0]),
         errno(Errno::ENOTDIR)
     );
+    // A bind mount looks its source up (`none` is not there).
+    assert_eq!(
+        mount(&mut f, [none, target, tmpfs, 4096, 0]),
+        errno(Errno::ENOENT)
+    );
     // What is not supported yet, after the checks before it.
-    for flags in [4096, 8192, 32, 32 | 4096, 1 << 20, 1 << 17, 1, 256] {
+    for flags in [8192, 32, 32 | 4096, 1 << 20, 1 << 17, 1, 256] {
         let at = if flags & (1 << 20 | 1 << 17) != 0 {
             put(&mut f, 0x180, b"/")
         } else {

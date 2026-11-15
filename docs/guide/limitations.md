@@ -5,14 +5,13 @@ verified.
 
 ## Not supported
 
-- **Part of x87, for now**: the transcendental instructions (`FSIN`, `FCOS`,
-  `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`, `FYL2XP1`) and packed decimals
-  (`FBLD`, `FBSTP`) are not implemented yet, so a program stops with `SIGILL`
-  where it reaches one. An x87 exception always takes its masked response: an
-  unmasked one sets the status word's summary and does not raise `SIGFPE`. The
-  16-bit forms of `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not
-  implemented either. `FISTTP` belongs to SSE3, which `CPUID` does not report,
-  and is not implemented. Where `FPREM` and `FPREM1` stop on the way when their
+- **Part of x87, for now**: packed decimals (`FBLD`, `FBSTP`) are not
+  implemented yet, so a program stops with `SIGILL` where it reaches one. An
+  x87 exception always takes its masked response: an unmasked one sets the
+  status word's summary and does not raise `SIGFPE`. The 16-bit forms of
+  `FNSTENV` and `FLDENV` (with a `0x66` prefix) are not implemented either.
+  `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
+  implemented. Where `FPREM` and `FPREM1` stop on the way when their
   operands are far apart is each CPU's choice: the final remainder is the same.
 - **A dynamically linked program's files, unless given**: a program runs with
   its interpreter as on Linux, on musl's dynamic linker or glibc's. A session
@@ -21,6 +20,21 @@ verified.
 - **32-bit x86, AVX, AVX-512, MMX**: out of scope. `CPUID` reports MMX because
   glibc requires it, but its instructions stop with `SIGILL`, as do the SSE and
   SSE2 ones that use MMX registers (`CVTPI2PS`, `MOVQ2DQ`, `PSHUFW` and the like).
+- **The last bit of x87's transcendental instructions**: `FSIN`, `FCOS`,
+  `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X` and `FYL2XP1` give the correctly
+  rounded result of what Intel's and AMD's CPUs compute (the four that take an
+  angle take multiples of π/2 away as π/2 cut to 66 bits, as both do). A real
+  CPU's result is within one unit in the last place of that, and differs from
+  it in a few values in a hundred, Intel's more often than AMD's, which differ
+  from each other too; C1 then goes by the CPU's own result. Where the result of
+  a tiny value is that value, Intel's CPUs give it as it is in every rounding
+  mode, and the emulator and AMD's round it. `FSINCOS` sets C1 by the sine, as
+  AMD's CPUs do (Intel's go by the cosine). So the `long double` functions of
+  glibc and musl that use these (`expl`, `logl`, `atan2l` and the like) can
+  differ from a real CPU's in their last bit or two. Where the manuals leave the
+  result undefined, the emulator does as both CPUs: `F2XM1` leaves a value
+  beyond ±1 as it is, and `FYL2XP1` a value where 1 + x is not positive. The
+  tests compare every bit where the CPUs agree, and that bound elsewhere.
 - **The exact results of `RCPPS`, `RCPSS`, `RSQRTPS` and `RSQRTSS`**: x86 only
   bounds their error (1.5 × 2⁻¹²), and each CPU answers from its own table. The
   emulator computes them by floating-point division (after a square root for
@@ -48,8 +62,8 @@ verified.
   those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `uw` or `ui` (`userfaultfd`'s write-protect and minor modes, which are
-  not offered), and no `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
+  `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
+  `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
@@ -65,11 +79,13 @@ verified.
   what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is not
   seen. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
-  used.
+  used. A generated file's `stat` gives its length as its size
+  (`mountinfo`, `status`, `stat`, `loadavg` and the like), where Linux's
+  seq files are of size 0; `maps`, `smaps` and `fdinfo` are 0 as on Linux.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
-  root. As `mount` mounts nothing on `/proc` or `/dev` and has no bind
-  mounts, nothing can be mounted on the new root's `/proc` or `/dev`, so a
+  root. As `mount` mounts nothing on `/proc` or `/dev` and cannot bind
+  them, nothing can be mounted on the new root's `/proc` or `/dev`, so a
   program there finds only the files the directory holds. In a path that climbs above the root as written, `..` is
   taken from the names as written, where Linux takes a `..` after a
   symbolic link from the link's target. `maps` and `smaps` in `/proc` name
@@ -341,10 +357,8 @@ verified.
   - The limits of System V IPC's shared memory, semaphores and message
     queues are Linux's defaults, which `/proc/sys/kernel` cannot change.
     `/proc/sysvipc` shows its objects as they were when it was opened,
-    where Linux reads each one as the read reaches it. A semaphore's
-    `GETPID` gives 0 in a nested PID namespace once that process is reaped,
-    where Linux still gives its number there. A message queue's waiting senders
-    all look again whenever it changes, where Linux wakes them in the order
+    where Linux reads each one as the read reaches it. A message queue's
+    waiting senders all look again whenever it changes, where Linux wakes them in the order
     they began only while each one's message fits.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
@@ -383,6 +397,20 @@ verified.
     both kinds are mixed.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
+  - `ptrace` has no system-call stops, events, single-stepping or
+    listening yet: `PTRACE_SYSCALL`, `PTRACE_SYSEMU`, `PTRACE_SINGLESTEP`,
+    `PTRACE_LISTEN`, `PTRACE_PEEKSIGINFO`, `PTRACE_GETSIGMASK`,
+    `PTRACE_SETSIGMASK`, `PTRACE_GET_SYSCALL_INFO` and the other requests
+    the features do not list give `EIO`, and `PTRACE_SETOPTIONS` takes the
+    event options (`PTRACE_O_TRACE*`) without stopping for them.
+    `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
+    checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
+    without XSAVE, which the emulated CPU does not offer. There are no
+    hardware breakpoints: the debug registers read as unused (DR6 as
+    `0xffff0ff0`), and a write to them other than clearing DR7 gives `EIO`.
+    A segment selector a tracer writes is checked but not changed. A
+    restart code a tracer changes into another restart code ends the
+    restart.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.
@@ -423,12 +451,13 @@ verified.
   `chown` gives a file, and those of a file a guest makes there, are kept
   only while the emulator runs, not on the host file. The next run sees
   every file there as root's again.
-- **mount and umount2, in part**: `mount` makes only tmpfs mounts; any
-  other type is `ENODEV`, as from a kernel without it. Once Linux's checks
-  before them pass, `MS_BIND`, `MS_MOVE`, `MS_REMOUNT`, `MS_SHARED`,
-  `MS_UNBINDABLE`, a read-only mount (`MS_RDONLY` or the `ro` option),
-  `MS_NOSYMFOLLOW` and a mount on the generated `/proc` or `/dev` give
-  `EOPNOTSUPP`, so a program learns they are not supported; `fsopen`,
+- **mount and umount2, in part**: `mount` makes only tmpfs and bind mounts;
+  any other type is `ENODEV`, as from a kernel without it. Once Linux's
+  checks before them pass, `MS_MOVE`, `MS_REMOUNT`, `MS_SHARED`,
+  `MS_UNBINDABLE`, a read-only tmpfs (`MS_RDONLY` or the `ro` option),
+  `MS_NOSYMFOLLOW` on a tmpfs, and a mount on, or a bind mount of, the
+  generated `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a
+  program learns they are not supported; `fsopen`,
   `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`,
   `mount_setattr`, `statmount`, `listmount` and `pivot_root` are not there
   (`ENOSYS`). Nothing propagates: every mount is private, and mountinfo
@@ -452,7 +481,17 @@ verified.
   namespace leaves that mount there, where Linux detaches it. A detached
   mount's open files keep working, but a working directory or a descriptor
   in it is used by its path, which no longer leads there. A mount ID is the
-  lowest free one from 21, and the root's parent is shown as 1.
+  lowest free one from 21, and the root's parent is shown as 1. A bind
+  mount without `MS_REC` of a directory with a mount from start-up below it
+  (a `--mount` directory) shows that mount's files there, where Linux shows
+  the directory under it. A bind mount keeps its source by path: a rename
+  in another namespace leaves it at the old path, and when its source is
+  removed it shows nothing, where Linux keeps the deleted directory and
+  mountinfo marks it `//deleted`. A descriptor's mount ID (`statx` with
+  `AT_EMPTY_PATH`, fdinfo) is found by the path it was opened by. A
+  fanotify mount mark (`FAN_MARK_MOUNT`) is kept by the file system's
+  device, so it also covers the bind mounts of that file system, and its
+  fdinfo line shows the first mount's ID, where Linux marks that one mount.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the
@@ -530,18 +569,23 @@ verified.
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
-- **userfaultfd, in part**: only missing pages are registered. The
-  write-protect and minor modes are refused (`EINVAL`), and
-  `UFFDIO_WRITEPROTECT`, `UFFDIO_CONTINUE`, `UFFDIO_MOVE` and
-  `UFFDIO_POISON` are not offered (`EINVAL`), nor the events of `fork`,
-  `mremap`, `madvise` and `munmap` or the write-protect features, which
+- **userfaultfd, in part**: missing pages and the write protection of
+  private anonymous memory are registered. The minor mode is refused
+  (`EINVAL`), as is the write-protect mode for shared memory, which Linux
+  takes, and `UFFDIO_CONTINUE`, `UFFDIO_MOVE` and `UFFDIO_POISON` are not
+  offered (`EINVAL`), nor the events of `fork`, `mremap`, `madvise` and
+  `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
+  `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
   `UFFDIO_API` does not report and refuses (`EINVAL`); the ioctls
-  `UFFDIO_REGISTER` and `fdinfo` report leave them out too. Shared memory
+  `UFFDIO_REGISTER` and `fdinfo` report leave them out too. A
+  registration that replaces the write-protect mode with others ends the
+  protection of the range's pages, whose marks Linux leaves in their PTEs.
+  Shared memory
   of a file (a memfd, a tmpfs file, System V shared memory) cannot be
   registered (`EINVAL`), where Linux takes any shmem. A system call's own
-  copy to or from a missing page of a registered range is `EFAULT`, as with
-  `UFFD_USER_MODE_ONLY`, where Linux waits for the page as for an
-  instruction. There is no `/dev/userfaultfd` and no
+  copy to or from a missing page of a registered range, or to a
+  write-protected one, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
+  Linux waits for the page as for an instruction. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: permission events (`FAN_OPEN_PERM`,
   `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM`) are taken by `fanotify_mark` but
@@ -631,8 +675,7 @@ verified.
   `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the
   cached route, so that later lookups through it are marked too.
   Notifications go out for the link, its IPv6 information, addresses,
-  routes and neighbours alone, not for the other groups, nor to a socket
-  in another namespace (`NETLINK_LISTEN_ALL_NSID` is not supported);
+  routes, neighbours and namespace IDs alone, not for the other groups;
   IPv4's routes through `lo` go without one when it goes down, as on
   Linux. A neighbour is made by UDP and TCP's handshakes alone, which are
   the only packets paludarium sends through `lo` (a TCP handshake retried
@@ -641,8 +684,14 @@ verified.
   the newest first, where Linux gives them in the order of its hash
   table, which a random key sets; their cache information counts from
   when each was made.
-  `NETLINK_LISTEN_ALL_NSID` and the other options not listed in the
-  features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
+  The options not listed in the features are `ENOPROTOOPT`. A namespace
+  ID goes when its namespace does, with no `RTM_DELNSID` to tell of it;
+  an ID is given only by `RTM_NEWNSID`, as no device of another
+  namespace makes Linux's `peernet2id_alloc` give one; a request sent by
+  `write` rather than `send` names no process or descriptor (`ESRCH`,
+  `EBADF`), as no caller is known there; and `IFLA_TARGET_NETNSID` and
+  `IFA_TARGET_NETNSID` are `EINVAL` even for an ID a namespace has, as
+  no other namespace's links or addresses are dumped. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps

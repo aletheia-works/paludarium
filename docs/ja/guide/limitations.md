@@ -4,9 +4,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 
 ## できないこと
 
-- **今のところ x87 の一部**：超越関数の命令（`FSIN`、`FCOS`、`FSINCOS`、`FPTAN`、
-  `FPATAN`、`F2XM1`、`FYL2X`、`FYL2XP1`）と 10 進数（`FBLD`、`FBSTP`）はまだ実装して
-  いないので、プログラムはそこで `SIGILL` で止まります。x87 の例外はつねにマスクされた
+- **今のところ x87 の一部**：10 進数（`FBLD`、`FBSTP`）はまだ実装していないので、
+  プログラムはそこで `SIGILL` で止まります。x87 の例外はつねにマスクされた
   ときの動きをします。マスクされていない例外は状態ワードの要約を立てるだけで、`SIGFPE` には
   なりません。16 ビット形式（`0x66` プレフィックス付き）の `FNSTENV` と `FLDENV` も実装
   していません。`FISTTP` は `CPUID` が示さない SSE3 の命令なので実装していません。
@@ -18,6 +17,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **32-bit の x86、AVX、AVX-512、MMX**：対象外です。glibc が必須とするので `CPUID` は
   MMX を示しますが、その命令は `SIGILL` で止まります。MMX レジスタを使う SSE と SSE2 の
   命令（`CVTPI2PS`、`MOVQ2DQ`、`PSHUFW` など）も同じです。
+- **x87 の超越関数の命令の最後のビット**：`FSIN`、`FCOS`、`FSINCOS`、`FPTAN`、
+  `FPATAN`、`F2XM1`、`FYL2X`、`FYL2XP1` は、Intel と AMD の CPU が計算するものを正しく
+  丸めた結果を返します（角度を取る 4 つは、どちらの CPU とも同じく、66 ビットで切った
+  π/2 の倍数を引きます）。実際の CPU の結果はその最後の位の 1 単位以内で、100 個の値の
+  うちいくつかで異なります。Intel のほうが AMD より多く、両者の間でも異なります。そのとき
+  C1 は CPU 自身の結果に従います。小さな値の結果がその値そのものになるとき、Intel の CPU
+  はどの丸めモードでもその値を返し、エミュレーターと AMD の CPU は丸めます。`FSINCOS`
+  は AMD の CPU と同じく正弦で C1 を決めます（Intel の CPU は余弦で決めます）。そのため、
+  これらを使う glibc と musl の `long double` の関数（`expl`、`logl`、`atan2l` など）は、
+  実際の CPU と最後の 1、2 ビットが異なることがあります。マニュアルが結果を決めていない
+  ところでは、エミュレーターは両方の CPU と同じく、`F2XM1` は ±1 を超える値を、`FYL2XP1`
+  は 1 + x が正でない値を、そのまま残します。テストでは、CPU どうしが一致するところは
+  すべてのビットを、それ以外ではこの範囲を確かめています。
 - **`RCPPS`、`RCPSS`、`RSQRTPS`、`RSQRTSS` の正確な結果**：x86 が決めているのは誤差の
   範囲（1.5 × 2⁻¹²）だけで、CPU はそれぞれの表から答えます。エミュレーターは浮動小数点
   の除算（`RSQRT` はその前に平方根）で計算するので、下位のビットが実際の CPU と異なる
@@ -43,7 +55,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   取り込みます（`fault_around_bytes`）。`MAP_POPULATE`、`MAP_LOCKED`、ロックが
   取り込むはずのページも、触れたときに数えます。ヒュージページもプロテクションキーも
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
-  `uw`、`ui`（提供しない `userfaultfd` の書き込み保護とマイナーのモード）、`ht`、`dp`
+  `ui`（提供しない `userfaultfd` のマイナーのモード）、`ht`、`dp`
   （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
@@ -58,11 +70,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   どうかではなく、スレッドがシステムコールの中にいるかどうかから決めます。スレッドが
   ほかのプロセスに見せるのは最後のシステムコールかシグナルの確認で公開したものなので、
   呼び出しの間だけ変えたマスク（`rt_sigsuspend`、`ppoll`）は見えません。`meminfo` は
-  `sysinfo` と同じ固定の 4 GiB を、何も使っていないものとして返します。
+  `sysinfo` と同じ固定の 4 GiB を、何も使っていないものとして返します。生成するファイルの
+  `stat` は、その長さを大きさとして返します（`mountinfo`、`status`、`stat`、`loadavg`
+  など）。Linux の seq ファイルの大きさは 0 です。`maps`、`smaps`、`fdinfo` は Linux と
+  同じく 0 です。
 - **自分のルートの一部**：生成される `/proc` や `/dev`（またはその中のディレクトリ）への
   `chroot` は `EINVAL` を返します。Linux はそこをルートにします。`mount` は `/proc` や
-  `/dev` には何もマウントせず、バインドマウントもないため、新しいルートの `/proc` や `/dev`
-  には何もマウントできず、そこのプログラムが見つけるのは、そのディレクトリにあるファイル
+  `/dev` には何もマウントせず、それをバインドマウントすることもできないため、新しい
+  ルートの `/proc` や `/dev` には何もマウントできず、そこのプログラムが見つけるのは、そのディレクトリにあるファイル
   だけです。書かれたままでルートより上へ登るパスでは、`..` を書かれた
   名前から取ります。Linux は、シンボリックリンクのあとの `..` をリンク先から取ります。`/proc`
   の `maps` と `smaps` は、開いたプロセスが開いたときに持っていたルートからファイルを
@@ -297,9 +312,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - System V IPC の共有メモリ・セマフォー・メッセージキューの上限は Linux の既定値で、
     `/proc/sys/kernel` から変えられません。`/proc/sysvipc` は開いたときのオブジェクトを
     見せます。Linux は読み進めたところで、そのオブジェクトをその都度読みます。
-    入れ子の PID 名前空間では、セマフォーの `GETPID` はそのプロセスが回収されると 0 になります。
-    Linux はそこでも、その番号を返します。メッセージキューで
-    待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの
+    メッセージキューで待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの
     メッセージが入る間だけ、待ち始めた順に起こします。
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
@@ -330,6 +343,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     通るかが違うことがあります。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
+  - `ptrace` には、まだシステムコール停止、イベント、シングルステップ、LISTEN が
+    ありません。`PTRACE_SYSCALL`、`PTRACE_SYSEMU`、`PTRACE_SINGLESTEP`、
+    `PTRACE_LISTEN`、`PTRACE_PEEKSIGINFO`、`PTRACE_GETSIGMASK`、`PTRACE_SETSIGMASK`、
+    `PTRACE_GET_SYSCALL_INFO` と、機能の一覧にないほかの要求は `EIO` を返し、
+    `PTRACE_SETOPTIONS` はイベントのオプション（`PTRACE_O_TRACE*`）を受け付けますが、
+    そのために止まりません。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
+    ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
+    `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。ハードウェアブレークポイントは
+    なく、デバッグレジスタは未使用として読め（DR6 は `0xffff0ff0`）、DR7 を 0 にする以外の
+    書き込みは `EIO` です。トレーサーが書いたセグメントセレクタは検査しますが、変わりません。
+    トレーサーが再実行のコードを別の再実行のコードに変えると、再実行は止まります。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
     読み込んだページも、触るまでは数えません。
@@ -366,11 +390,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルの持ち主とグループ、そしてゲストがそこに作ったファイルの持ち主とグループを、
   エミュレータが動いている間だけ覚えます。ホストのファイルには書きません。次に動かすと、
   そこのファイルはまたすべて root のものに見えます。
-- **mount と umount2 の一部**：`mount` が作るのは tmpfs のマウントだけで、ほかの型は、それが
-  ないカーネルと同じく `ENODEV` です。それより前の Linux の確認を通ったあと、`MS_BIND`、
-  `MS_MOVE`、`MS_REMOUNT`、`MS_SHARED`、`MS_UNBINDABLE`、読み出し専用のマウント
-  （`MS_RDONLY` や `ro` オプション）、`MS_NOSYMFOLLOW`、生成される `/proc` や `/dev` への
-  マウントは `EOPNOTSUPP` で、プログラムはできないことを知れます。`fsopen`、`fsconfig`、
+- **mount と umount2 の一部**：`mount` が作るのは tmpfs とバインドマウントだけで、ほかの型は、
+  それがないカーネルと同じく `ENODEV` です。それより前の Linux の確認を通ったあと、
+  `MS_MOVE`、`MS_REMOUNT`、`MS_SHARED`、`MS_UNBINDABLE`、読み出し専用の tmpfs
+  （`MS_RDONLY` や `ro` オプション）、tmpfs の `MS_NOSYMFOLLOW`、生成される `/proc` や
+  `/dev`（とその中のファイル）へのマウントやそのバインドマウントは `EOPNOTSUPP` で、
+  プログラムはできないことを知れます。`fsopen`、`fsconfig`、
   `fsmount`、`fspick`、`move_mount`、`open_tree`、`mount_setattr`、`statmount`、
   `listmount`、`pivot_root` はありません（`ENOSYS`）。何も伝播しません。どのマウントも
   プライベートで、mountinfo に `shared:` や `master:` の欄はありません。Linux では共有
@@ -390,7 +415,16 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マウントポイントになっているディレクトリの `rmdir` はそのマウントを残します。Linux では
   外れます。外したマウントの開いたファイルは使えますが、その中の作業ディレクトリや
   ディスクリプタはパスで使うので、もうそこにはたどり着きません。マウント ID は 21 からの
-  空いているいちばん小さいもので、ルートの親は 1 と表示します。
+  空いているいちばん小さいもので、ルートの親は 1 と表示します。起動したときからある
+  マウント（`--mount` のディレクトリ）を下に持つディレクトリを `MS_REC` なしで
+  バインドマウントすると、そこにはそのマウントのファイルが見えます。Linux はその下の
+  ディレクトリを見せます。バインドマウントはソースをパスで持つので、ほかの名前空間での
+  名前の変更では古いパスのままで、ソースを消すと何も見えなくなります。Linux は消えた
+  ディレクトリを持ち続け、mountinfo に `//deleted` と付けます。ディスクリプタのマウント
+  ID（`AT_EMPTY_PATH` 付きの `statx`、fdinfo）は、それを開いたパスから求めます。
+  fanotify のマウントへのマーク（`FAN_MARK_MOUNT`）はファイルシステムのデバイスで持つので、
+  そのファイルシステムのバインドマウントにも効き、fdinfo の行は最初のマウントの ID を
+  示します。Linux はその 1 つのマウントにだけ付けます。
 - **Landlock**：ABI バージョン 8 までです。記録のフラグは受け付けますが、何も記録しません。
   `LANDLOCK_RESTRICT_SELF_TSYNC` では、ほかのスレッドが自分の確認に新しいドメインを
   使うのは、次にカーネルに入るときからです。Linux は、すべてのスレッドが受け取るまで
@@ -457,15 +491,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **userfaultfd の一部**：登録するのはないページだけです。書き込み保護とマイナーの
-  モードは受け付けず（`EINVAL`）、`UFFDIO_WRITEPROTECT`、`UFFDIO_CONTINUE`、
+- **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
+  メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
+  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE`、
   `UFFDIO_MOVE`、`UFFDIO_POISON` もありません（`EINVAL`）。`fork`、`mremap`、
-  `madvise`、`munmap` のイベントと書き込み保護の機能もなく、`UFFDIO_API` はそれらを
-  示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す ioctl にも
-  入りません。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
+  `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
+  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
+  それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
+  ioctl にも入りません。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
+  ページの保護を外します。Linux はその印を PTE に残します。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
   登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
-  ないページへのシステムコール自身のコピーは、`UFFD_USER_MODE_ONLY` のときと同じく
-  `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
+  ないページか、書き込み保護されたページへのシステムコール自身のコピーは、
+  `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベント（`FAN_OPEN_PERM`、`FAN_ACCESS_PERM`、
   `FAN_OPEN_EXEC_PERM`）は `fanotify_mark` で受け付けますが送りません。そのため、求める
@@ -477,8 +514,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マークだけで決めます。Linux は inotify のものも数えます。ディスクリプタが持っていない
   ファイル（exec が動かすプログラム）は、そのときのパスで開き直すので、なくなっていれば
   開けません。FIFO やデバイスの読み書きは、ディレクトリと名前なしで知らせます。
-- **inotify の一部**：何もアンマウントしない（`umount2` がない）ので、`IN_UNMOUNT` は
-  送りません。 `/proc/self/fdinfo` では、epoll のファイルはディスクリプタの順に並びます。Linux はファイルのアドレスの
+- **inotify の一部**：`umount2` が見張っているファイルのマウントを外しても、`IN_UNMOUNT` も
+  そのあとの `IN_IGNORED` も送りません。 `/proc/self/fdinfo` では、epoll のファイルはディスクリプタの順に並びます。Linux はファイルのアドレスの
   順です。eventfd の番号はエミュレータの中で数えます。Linux の `eventfd-id` はシステム
   全体で数えます。マウントしたディレクトリにホストが加えた変更は見えず、ディスクリプタの
   場所もそれを追いません。
@@ -545,17 +582,22 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   グループでもローカルになります。引き当ての
   `rta_cacheinfo` は参照を 1 つと数えます。Linux はキャッシュされた経路を使うほかのものも
   数えます。`RTM_F_NOTIFY` は、その引き当ての答えにだけ印を付けます。Linux はキャッシュ
-  された経路に印を付けるので、その経路を通るあとの引き当てにも印が付きます。通知はリンクとその IPv6 の情報、アドレス、経路、近隣
-  のものだけで、ほかのグループには送らず、ほかの名前空間のソケットにも
-  送りません（`NETLINK_LISTEN_ALL_NSID` はありません）。`lo` を落としたときに消える、
+  された経路に印を付けるので、その経路を通るあとの引き当てにも印が付きます。通知はリンクとその IPv6 の情報、アドレス、経路、近隣、
+  名前空間の ID のものだけで、ほかのグループには送りません。`lo` を落としたときに消える、
   `lo` を通る IPv4 の経路は、Linux と同じく何も伝えません。近隣を作るのは UDP と TCP の
   ハンドシェイクだけです。paludarium が `lo` に送るパケットはそれだけです（いっぱいの
   backlog に再送したハンドシェイクは、その答えの近隣を作りません）。近隣は時間切れでは
   消えません（`gc_thresh1` に届きません）。ダンプはファミリーごとに新しい近隣から
   返します。Linux はハッシュ表の順に返し、その順は乱数のキーで決まります。キャッシュの
   情報はそれぞれを作ったときから数えます。
-  `NETLINK_LISTEN_ALL_NSID` など、機能のページに挙げていないオプションは
-  `ENOPROTOOPT` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、
+  機能のページに挙げていないオプションは `ENOPROTOOPT` です。名前空間の ID は
+  その名前空間がなくなると消えますが、それを伝える `RTM_DELNSID` は送りません。
+  ほかの名前空間のデバイスがないので、Linux の `peernet2id_alloc` のように ID を
+  ひとりでに与えることはなく、`RTM_NEWNSID` だけが与えます。`send` でなく `write`
+  で送ったリクエストは、呼び出し元が分からないので、プロセスも記述子も指せません
+  （`ESRCH`、`EBADF`）。ほかの名前空間のリンクやアドレスはダンプしないので、
+  `IFLA_TARGET_NETNSID` と `IFA_TARGET_NETNSID` は、名前空間が持つ ID でも
+  `EINVAL` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、
   `CONFIG_MCTP` を組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。
   組み込んでいないカーネルは載せず、`AF_MCTP` のアドレスと経路のダンプを扱う処理も
   ないので、それらのダンプには IPv4 と IPv6 のアドレスと経路を返し、MCTP のアドレスも

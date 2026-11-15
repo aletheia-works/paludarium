@@ -129,7 +129,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -191,6 +191,7 @@ mod linux {
                     | "userfaultfd-signals"
                     | "userfaultfd-sigbus"
                     | "userfaultfd-shared"
+                    | "userfaultfd-wp"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -228,6 +229,8 @@ mod linux {
                     | "netlink-option-flags"
                     | "netlink-pktinfo"
                     | "netlink-no-enobufs"
+                    | "netlink-nsid"
+                    | "netlink-listen-all-nsid"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -395,6 +398,8 @@ mod linux {
         netlink_option_flags => ("netlink-option-flags","netlink-options"),
         netlink_pktinfo => ("netlink-pktinfo","netlink-options"),
         netlink_no_enobufs => ("netlink-no-enobufs","netlink-options"),
+        netlink_nsid => ("netlink-nsid","netlink-options"),
+        netlink_listen_all_nsid => ("netlink-listen-all-nsid","netlink-options"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
@@ -487,6 +492,7 @@ mod linux {
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
         userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
+        userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -505,6 +511,14 @@ mod linux {
         keys_threads => ("keys-threads","keys"),
         keys_parent => ("keys-parent","keys"),
         keys_permissions => ("keys-permissions","keys"),
+        ptrace_traceme => ("ptrace-traceme","ptrace"),
+        ptrace_attach => ("ptrace-attach","ptrace"),
+        ptrace_seize => ("ptrace-seize","ptrace"),
+        ptrace_signals => ("ptrace-signals","ptrace"),
+        ptrace_regs => ("ptrace-regs","ptrace"),
+        ptrace_memory => ("ptrace-memory","ptrace"),
+        ptrace_thread => ("ptrace-thread","ptrace"),
+        ptrace_sibling => ("ptrace-sibling","ptrace"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),
@@ -530,6 +544,7 @@ mod linux {
         processes_cpu_state => ("cpu-state","process"),
         processes_x87 => ("x87","process"),
         processes_x87_arithmetic => ("x87-arithmetic","process"),
+        processes_x87_transcendental => ("x87-transcendental","x87"),
         processes_robust_list => ("robust-list","process"),
         processes_futex_shared => ("futex-shared","process"),
         processes_late_handler => ("late-handler","process"),
@@ -645,6 +660,8 @@ mod linux {
         processes_time_set => ("time-set","process"),
         processes_chroot => ("chroot","process"),
         processes_mounts => ("mounts","process"),
+        processes_binds => ("binds","process"),
+        processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),

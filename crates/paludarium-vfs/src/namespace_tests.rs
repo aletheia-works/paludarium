@@ -256,3 +256,182 @@ fn mountinfo_fields_of_a_tmpfs() {
     assert_eq!(line.super_options, ",size=1024k");
     assert_eq!(line.source, b"none");
 }
+
+#[test]
+fn a_bind_mount_shows_the_same_files_from_its_root() {
+    let (lower, fs) = machine();
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.bind(b"/tmp/m", b"/tmp/b", false).unwrap();
+    // The directory under the source, on the same device, a mount of its own.
+    assert_eq!(
+        fs.metadata(b"/tmp/b/under", true).unwrap().inode,
+        fs.metadata(b"/tmp/m/under", true).unwrap().inode
+    );
+    assert_eq!(fs.device(b"/tmp/b"), lower.device(b"/tmp/m"));
+    assert_ne!(fs.mount_id(b"/tmp/b"), fs.mount_id(b"/tmp/m"));
+    // A file made through one is in the other.
+    fs.open(b"/tmp/b/new", 66, 0o600)
+        .unwrap()
+        .write(b"x")
+        .unwrap();
+    assert_eq!(&*lower.read_file(b"/tmp/m/new").unwrap(), b"x");
+    // `..` from its root leaves it for where it is mounted.
+    assert_eq!(&*fs.read_file(b"/tmp/b/../f").unwrap(), b"out");
+    let line = fs.mounts().pop().unwrap();
+    assert_eq!(
+        (&line.path[..], &line.root[..]),
+        (&b"/tmp/b"[..], &b"/tmp/m"[..])
+    );
+    assert_eq!(line.parent, fs.mounts()[0].id);
+    // Linking or renaming across the two mounts is EXDEV.
+    assert_eq!(fs.link(b"/tmp/m/new", b"/tmp/b/again"), Err(EXDEV));
+    assert_eq!(fs.rename(b"/tmp/b/new", b"/tmp/m/moved"), Err(EXDEV));
+    fs.rename(b"/tmp/b/new", b"/tmp/b/moved").unwrap();
+    assert!(fs.metadata(b"/tmp/m/moved", true).is_ok());
+    let id = fs.target(b"/tmp/b").unwrap().id;
+    fs.umount(id, false).unwrap();
+    assert_eq!(fs.metadata(b"/tmp/b/under", true), Err(Errno::ENOENT));
+}
+
+#[test]
+fn a_bind_mount_of_a_tmpfs_keeps_it_after_the_first_goes() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(256)).unwrap();
+    fs.mkdir(b"/tmp/m/sub", 0o755).unwrap();
+    fs.open(b"/tmp/m/sub/a", 66, 0o600)
+        .unwrap()
+        .write(b"in")
+        .unwrap();
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.bind(b"/tmp/m/sub", b"/tmp/b", false).unwrap();
+    assert_eq!(fs.device(b"/tmp/b/a"), fs.device(b"/tmp/m"));
+    let line = fs.mounts().pop().unwrap();
+    assert_eq!((line.kind, &line.root[..]), ("tmpfs", &b"/sub"[..]));
+    assert_eq!(fs.statfs(b"/tmp/b").unwrap().blocks, 256);
+    // The first mount is not in use by the second.
+    let first = fs.target(b"/tmp/m").unwrap().id;
+    fs.umount(first, false).unwrap();
+    assert_eq!(&*fs.read_file(b"/tmp/b/a").unwrap(), b"in");
+    // `..` at the bind's root goes up where it is mounted, not to `/sub`'s.
+    assert_eq!(&*fs.read_file(b"/tmp/b/../f").unwrap(), b"out");
+}
+
+#[test]
+fn a_file_binds_onto_a_file_only() {
+    let (_, fs) = machine();
+    fs.open(b"/tmp/g", 66, 0o644)
+        .unwrap()
+        .write(b"gee")
+        .unwrap();
+    assert_eq!(fs.bind(b"/tmp/f", b"/tmp/m", false), Err(Errno::ENOTDIR));
+    assert_eq!(fs.bind(b"/tmp/m", b"/tmp/g", false), Err(Errno::ENOTDIR));
+    fs.bind(b"/tmp/f", b"/tmp/g", false).unwrap();
+    assert_eq!(&*fs.read_file(b"/tmp/g").unwrap(), b"out");
+    // The file under it is in use, to unlink and rename.
+    assert_eq!(fs.unlink(b"/tmp/g", false), Err(EBUSY));
+    assert_eq!(fs.rename(b"/tmp/g", b"/tmp/h"), Err(EBUSY));
+    let id = fs.target(b"/tmp/g").unwrap().id;
+    fs.umount(id, false).unwrap();
+    assert_eq!(&*fs.read_file(b"/tmp/g").unwrap(), b"gee");
+}
+
+#[test]
+fn a_recursive_bind_copies_the_mounts_below() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m/under", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/under/in", 66, 0o600).unwrap();
+    fs.mkdir(b"/tmp/m/under/deep", 0o755).unwrap();
+    fs.mount(b"/tmp/m/under/deep", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/under/deep/z", 66, 0o600).unwrap();
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.mkdir(b"/tmp/c", 0o755).unwrap();
+    // Without MS_REC the mount on `under` stays behind.
+    fs.bind(b"/tmp/m", b"/tmp/b", false).unwrap();
+    assert_eq!(fs.metadata(b"/tmp/b/under/in", true), Err(Errno::ENOENT));
+    fs.bind(b"/tmp/m", b"/tmp/c", true).unwrap();
+    assert!(fs.metadata(b"/tmp/c/under/in", true).is_ok());
+    assert!(fs.metadata(b"/tmp/c/under/deep/z", true).is_ok());
+    let mounts = fs.mounts();
+    let at = |p: &[u8]| mounts.iter().find(|m| m.path == p).unwrap().clone();
+    let (c, under, deep) = (at(b"/tmp/c"), at(b"/tmp/c/under"), at(b"/tmp/c/under/deep"));
+    assert_eq!((under.parent, deep.parent), (c.id, under.id));
+    assert_eq!(under.device, at(b"/tmp/m/under").device);
+    // The copies' order is the tree's.
+    assert!(c.id < under.id && under.id < deep.id);
+}
+
+#[test]
+fn a_bind_below_locked_mounts_needs_recursion() {
+    let (lower, fs) = machine();
+    fs.mount(b"/tmp/m/under", tmpfs(0)).unwrap();
+    let copy = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(true));
+    copy.mkdir(b"/tmp/b", 0o755).unwrap();
+    assert_eq!(copy.bind(b"/tmp/m", b"/tmp/b", false), Err(Errno::EINVAL));
+    // The source itself may be locked; only mounts below it count.
+    copy.bind(b"/tmp/m/under", b"/tmp/b", false).unwrap();
+    assert!(!copy.target(b"/tmp/b").unwrap().locked);
+    copy.mkdir(b"/tmp/c", 0o755).unwrap();
+    copy.bind(b"/tmp/m", b"/tmp/c", true).unwrap();
+    assert!(!copy.target(b"/tmp/c").unwrap().locked);
+    assert!(copy.target(b"/tmp/c/under").unwrap().locked);
+}
+
+#[test]
+fn a_bind_mount_follows_a_rename_of_its_source() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/src", 0o755).unwrap();
+    fs.open(b"/tmp/m/src/a", 66, 0o600).unwrap();
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.bind(b"/tmp/m/src", b"/tmp/b", false).unwrap();
+    fs.rename(b"/tmp/m/src", b"/tmp/m/dst").unwrap();
+    assert!(fs.metadata(b"/tmp/b/a", true).is_ok());
+    assert_eq!(fs.mounts().pop().unwrap().root, b"/dst");
+}
+
+#[test]
+fn a_recursive_bind_of_the_root_copies_the_boot_mounts() {
+    let base = MemFs::new();
+    base.mkdir(b"/tmp", 0o1777).unwrap();
+    let host =
+        std::env::temp_dir().join(format!("paludarium-namespace-boot-{}", std::process::id()));
+    std::fs::create_dir(&host).unwrap();
+    let mut mounted = MountedFs::new(base);
+    mounted
+        .mount(
+            b"/data".to_vec(),
+            Arc::new(paludarium_host::NativeFs::new(&host).unwrap()),
+        )
+        .unwrap();
+    mounted.mkdir(b"/data/sub", 0o755).unwrap();
+    mounted
+        .open(b"/data/sub/x", 66, 0o644)
+        .unwrap()
+        .write(b"in")
+        .unwrap();
+    let lower: Arc<dyn FileSystem> = Arc::new(mounted);
+    let fs = NamespacedFs::new(Arc::clone(&lower), MountTable::new(&*lower));
+    fs.mkdir(b"/tmp/r", 0o755).unwrap();
+    fs.mkdir(b"/tmp/t", 0o755).unwrap();
+    fs.bind(b"/", b"/tmp/r", true).unwrap();
+    let x = fs.metadata(b"/tmp/r/data/sub/x", true).unwrap();
+    assert_eq!(x, fs.metadata(b"/data/sub/x", true).unwrap());
+    assert_eq!(fs.device(b"/tmp/r/data"), fs.device(b"/data"));
+    // A part of a boot mount, with its root in that mount's coordinates.
+    fs.bind(b"/data/sub", b"/tmp/t", false).unwrap();
+    assert_eq!(fs.metadata(b"/tmp/t/x", true).unwrap(), x);
+    let mounts = fs.mounts();
+    let at = |p: &[u8]| mounts.iter().find(|m| m.path == p).unwrap().clone();
+    let (r, copy, t) = (at(b"/tmp/r"), at(b"/tmp/r/data"), at(b"/tmp/t"));
+    assert_eq!(
+        (r.root.as_slice(), copy.root.as_slice()),
+        (&b"/"[..], &b"/"[..])
+    );
+    assert_eq!(copy.parent, r.id);
+    assert_eq!(copy.device, at(b"/data").device);
+    assert_eq!(t.root, b"/sub");
+    assert_eq!(fs.mount_id(b"/tmp/t/x"), t.id);
+    assert_eq!(fs.mount_id(b"/tmp/r/data/sub"), copy.id);
+    drop((fs, lower));
+    std::fs::remove_dir_all(&host).unwrap();
+}

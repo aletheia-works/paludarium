@@ -269,7 +269,7 @@ pub(crate) type Opener = Arc<dyn Fn(u32) -> Result<Arc<dyn FileHandle>, Errno> +
 /// does not keep as a description (a program exec runs) has.
 pub(crate) fn path_opener(fs: &Arc<dyn paludarium_vfs::FileSystem>, path: &[u8]) -> Opener {
     let (fs, path) = (Arc::clone(fs), path.to_vec());
-    Arc::new(move |flags| crate::page_cache::nonotify(|| fs.open(&path, flags, 0)))
+    Arc::new(move |flags| crate::page_cache::nonotify(flags, || fs.open(&path, flags, 0)))
 }
 
 /// What an event comes with, as `fsnotify`'s data types.
@@ -1219,6 +1219,11 @@ fn init(c: &mut Context<'_>, flags: u32, event_flags: u32) -> Result<u64, Errno>
     }
     let internal = if admin { 0 } else { UNPRIV };
     if flags & !(INIT_FLAGS | ENABLE_AUDIT) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // Linux 7.0's, which the CI runners have: a pidfd is of a process, so
+    // not with thread IDs (master takes both, with `PIDFD_THREAD`).
+    if flags & REPORT_PIDFD != 0 && flags & REPORT_TID != 0 {
         return Err(Errno::EINVAL);
     }
     if flags & REPORT_MNT != 0 && (class != 0 || flags & (FID_BITS | REPORT_FD_ERROR) != 0) {

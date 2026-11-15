@@ -403,9 +403,9 @@ fn path_events_give_descriptors_and_merge() {
     assert_eq!(seen[0].pid, 1);
     let event_fd = seen[0].fd as u64;
     assert_eq!(f.link(event_fd), "/tmp/f");
-    // Close-on-exec, as the flags asked; read only.
+    // Close-on-exec, as the flags asked, which `F_GETFL` keeps; read only.
     assert_eq!(f.ret(72, &[event_fd, 1]), 1);
-    assert_eq!(f.ret(72, &[event_fd, 3]) & 3, 0);
+    assert_eq!(f.ret(72, &[event_fd, 3]) & 0o2_000_003, 0o2_000_000);
     // Reading the descriptor tells no one.
     assert_eq!(f.ret(0, &[event_fd, BUF, 1]), 1);
     f.close(event_fd);
@@ -455,9 +455,19 @@ fn path_events_give_descriptors_and_merge() {
     assert_eq!(f.mark(plain, ADD, OPEN | ONDIR, "/tmp/d"), 0);
     let dir = f.open("/tmp/d", 0o200_000);
     f.close(dir);
-    assert_eq!(f.read(err, 4096).unwrap()[0].fd, -21);
-    assert_eq!(f.read(plain, 4096).unwrap_err(), errno(Errno::EISDIR));
+    // A directory opens for writing too, as `dentry_open` checks nothing.
+    let seen = f.read(err, 4096).unwrap();
+    assert!(seen[0].fd >= 0);
+    assert_eq!(f.ret(72, &[seen[0].fd as u64, 3]) & 3, 2);
+    assert_eq!(f.read(plain, 4096).unwrap().len(), 1);
     assert_eq!(f.read(plain, 4096).unwrap_err(), errno(Errno::EAGAIN));
+    // Both groups' reads give descriptors; a full table gives the error.
+    let nofile = f.put(&[1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    let dir = f.open("/tmp/d", 0o200_000);
+    f.close(dir);
+    assert_eq!(f.ret(160, &[7, nofile]), 0);
+    assert_eq!(f.read(err, 4096).unwrap()[0].fd, -24);
+    assert_eq!(f.read(plain, 4096).unwrap_err(), errno(Errno::EMFILE));
     let _ = f.read(fan, 4096);
     // Truncation by path is no path event.
     let path = f.put(b"/tmp/f");
@@ -578,6 +588,7 @@ fn fid_modes_report_handles_and_names() {
 fn pidfds_overflow_and_responses() {
     let mut f = fixture();
     f.touch("/tmp/f");
+    assert_eq!(f.init(REPORT_PIDFD | REPORT_TID, 0), errno(Errno::EINVAL));
     let fan = f.init(NONBLOCK | REPORT_FID | REPORT_PIDFD, 0);
     assert_eq!(f.mark(fan, ADD, OPEN, "/tmp/f"), 0);
     let fd = f.open("/tmp/f", 0);

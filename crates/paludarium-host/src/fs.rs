@@ -65,6 +65,12 @@ pub trait FileHandle: Send + Sync {
     fn notify_event(&self, _mask: u32) -> bool {
         false
     }
+    /// The flags of its open this description keeps among its status
+    /// flags, which an open by path drops (`O_CLOEXEC` of one fanotify
+    /// opened, as `dentry_open` keeps all it is given).
+    fn kept_open_flags(&self) -> u32 {
+        0
+    }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno>;
     fn write(&self, buf: &[u8]) -> Result<usize, Errno>;
     fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno>;

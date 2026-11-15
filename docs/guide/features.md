@@ -2883,14 +2883,17 @@ kernel.
   new directory's. An event is queued as `fanotify_handle_event` makes it:
   without a FID mode only the open, access, modification and close of a
   regular file or directory, with a descriptor of it opened again with the
-  group's flags (one that tells no watch of anything, the error with
+  group's flags, which `F_GETFL` shows with `O_CLOEXEC` and which a
+  directory gets for writing too, as `dentry_open` gives it (one that tells
+  no watch of anything, the error with
   `FAN_REPORT_FD_ERROR`, else the read's); in the FID modes with the
   records of the file's handle (`name_to_handle_at`'s identifier), its
   directory's and its name, a rename's old and new directory and name, and
   `.` for a directory's own event. An event of the same object, process and
   kind as one still queued merges into it, past `max_queued_events` there is
   one `FAN_Q_OVERFLOW`, and `FAN_REPORT_PIDFD` adds the process's pidfd
-  (`PIDFD_THREAD` with `FAN_REPORT_TID`). A read takes whole events (`EINVAL`
+  (with `FAN_REPORT_TID` it is `EINVAL`, as on Linux 7.0, which the CI
+  runners have; master takes both and gives the thread's). A read takes whole events (`EINVAL`
   for a buffer too small for the first), waits unless non-blocking, and
   `FIONREAD` gives the bytes queued; `/proc/self/fdinfo` shows the flags and
   each mark, the newest first, as `fanotify_show_fdinfo`. A write is a

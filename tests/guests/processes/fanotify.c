@@ -336,10 +336,13 @@ static int case_marks(void) {
            fan_mark(1, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, at("f")));
     printf("mount event=%ld mntns=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_MNT_ATTACH, AT_FDCWD, at("f")),
            fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_OPEN, AT_FDCWD, at("f")));
+    /* A permission mark on a file the case never opens, as Linux would
+       wait for an answer. */
+    touch(at("p"));
     printf("perm notif=%ld perm content=%ld pre content=%ld\n",
-           fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, at("f")),
-           fan_mark(content, FAN_MARK_ADD, FAN_OPEN_PERM | FAN_ACCESS_PERM, AT_FDCWD, at("f")),
-           fan_mark(content, FAN_MARK_ADD, FAN_PRE_ACCESS, AT_FDCWD, at("f")));
+           fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, at("p")),
+           fan_mark(content, FAN_MARK_ADD, FAN_OPEN_PERM | FAN_ACCESS_PERM, AT_FDCWD, at("p")),
+           fan_mark(content, FAN_MARK_ADD, FAN_PRE_ACCESS, AT_FDCWD, at("p")));
     printf("fs error inode=%ld\n", fan_mark(fid, FAN_MARK_ADD, FAN_FS_ERROR, AT_FDCWD, at("f")));
     printf("evictable mount=%ld\n", fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MOUNT | FAN_MARK_EVICTABLE, FAN_OPEN, AT_FDCWD, base));
     printf("inode event fd mode=%ld fid mount=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_CREATE, AT_FDCWD, at("d")),
@@ -525,8 +528,10 @@ static void show_fid_events(const char *label, int fan) {
         memcpy(&m, p, sizeof m);
         int ours = 0;
         char line[1024];
-        int used = snprintf(line, sizeof line, "  mask=%#llx fd=%d pid=%s len=%u", (unsigned long long)m.mask, m.fd,
-                            m.pid == getpid() ? "self" : m.pid == 0 ? "0" : "other", m.event_len);
+        /* The lengths of the handles are the file system's: /tmp's may be
+           another on Linux, so they are not shown. */
+        int used = snprintf(line, sizeof line, "  mask=%#llx fd=%d pid=%s", (unsigned long long)m.mask, m.fd,
+                            m.pid == getpid() ? "self" : m.pid == 0 ? "0" : "other");
         for (char *q = p + m.metadata_len; q < p + m.event_len;) {
             struct info_header hdr;
             memcpy(&hdr, q, sizeof hdr);
@@ -546,9 +551,9 @@ static void show_fid_events(const char *label, int fan) {
                 memcpy(&bytes, record, 4);
                 const char *name = (const char *)record + 8 + bytes;
                 int has_name = hdr.type == 2 || hdr.type == 10 || hdr.type == 12;
-                used += snprintf(line + used, sizeof line - used, " [type %u %s fsid=%s%s%s len=%u]", hdr.type, which,
+                used += snprintf(line + used, sizeof line - used, " [type %u %s fsid=%s%s%s]", hdr.type, which,
                                  same_fsid(base, (unsigned char *)q + 4) ? "statfs" : "other", has_name ? " name=" : "",
-                                 has_name ? name : "", hdr.len);
+                                 has_name ? name : "");
             }
             q += hdr.len;
         }

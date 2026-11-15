@@ -14,7 +14,7 @@ use paludarium_mmu::{FileSize, MemoryMeter, SharedPages};
 use paludarium_types::{Errno, PAGE_SIZE};
 use paludarium_vfs::{FileSystem, MountPoint};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 /// A file, as `stat` names it: its device (the mount's number, or a
@@ -766,26 +766,39 @@ pub(crate) struct CoherentFile {
     /// For a description the guest opened, whether for writing: its last
     /// close is `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` (`fsnotify_close`).
     opened: Option<bool>,
-    /// A description that tells no watch of anything (`FMODE_NONOTIFY`),
-    /// as the descriptor a fanotify event gives.
-    quiet: bool,
+    /// For a description that tells no watch of anything
+    /// (`FMODE_NONOTIFY`), as the descriptor a fanotify event gives: its
+    /// status flags, all those it was opened with, as `dentry_open` keeps
+    /// them.
+    quiet: Option<AtomicU32>,
 }
 
 thread_local! {
-    /// Set while the kernel opens a description that tells no watch of
-    /// anything ([`nonotify`]).
-    static NONOTIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The flags of the description that tells no watch of anything that
+    /// the kernel opens now ([`nonotify`]).
+    static NONOTIFY: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
-/// Runs `f`, whose opens make descriptions that tell no watch of anything
-/// (`FMODE_NONOTIFY`): the descriptors fanotify events give.
-pub(crate) fn nonotify<T>(f: impl FnOnce() -> T) -> T {
-    let was = NONOTIFY.with(|quiet| quiet.replace(true));
+/// Runs `f`, whose open with `flags` makes a description that tells no
+/// watch of anything (`FMODE_NONOTIFY`): the descriptors fanotify events
+/// give, which `dentry_open` opens with no check of a directory's access.
+pub(crate) fn nonotify<T>(flags: u32, f: impl FnOnce() -> T) -> T {
+    let was = NONOTIFY.with(|quiet| quiet.replace(Some(flags)));
     let value = f();
     NONOTIFY.with(|quiet| quiet.set(was));
     value
 }
-fn quiet_now() -> bool {
-    NONOTIFY.with(std::cell::Cell::get)
+fn quiet_now() -> Option<AtomicU32> {
+    NONOTIFY.with(std::cell::Cell::get).map(AtomicU32::new)
+}
+/// The flags `F_SETFL` changes.
+const SETTABLE: u32 = 0o2000 | 0o4000 | 0o20000 | 0o40000 | 0o1000000;
+/// `inner.reopen(flags)`, or for a directory opened for writing by fanotify
+/// (`dentry_open`, which does not refuse it) the same opened for reading.
+fn reopen_unchecked(inner: &Arc<dyn FileHandle>, flags: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+    match inner.reopen(flags) {
+        Err(Errno::EISDIR) => inner.reopen(flags & !3),
+        result => result,
+    }
 }
 
 impl Drop for CoherentFile {
@@ -893,7 +906,7 @@ impl CoherentFile {
     /// watches hear `IN_OPEN` (`fsnotify_open`), and will hear its close.
     fn opened(mut self, flags: u32) -> Self {
         self.list();
-        if flags & O_PATH == 0 && !self.quiet && crate::inotify::reported_open() {
+        if flags & O_PATH == 0 && self.quiet.is_none() && crate::inotify::reported_open() {
             self.opened = Some(flags & 3 != 0);
             self.event(crate::inotify::OPEN);
         }
@@ -910,7 +923,7 @@ impl CoherentFile {
     }
     fn tell(&self, mask: u32, content: bool) {
         let notify = &self.caches.notify;
-        if mask == 0 || self.quiet || !notify.watching() {
+        if mask == 0 || self.quiet.is_some() || !notify.watching() {
             return;
         }
         let Ok(stat) = self.inner.stat() else {
@@ -945,13 +958,13 @@ impl CoherentFile {
         let key = self.key.get().copied();
         Arc::new(move |flags| {
             let file = CoherentFile {
-                inner: inner.reopen(flags)?,
+                inner: reopen_unchecked(&inner, flags)?,
                 caches: Arc::clone(&caches),
                 device: device.copy(),
                 key: key.map_or_else(OnceLock::new, OnceLock::from),
                 write: None,
                 opened: None,
-                quiet: true,
+                quiet: Some(AtomicU32::new(flags)),
             }
             .writing(flags)?
             .opened(flags);
@@ -986,7 +999,7 @@ impl FileHandle for CoherentFile {
                 .map_or_else(OnceLock::new, OnceLock::from),
             write: None,
             opened: None,
-            quiet: self.quiet || quiet_now(),
+            quiet: quiet_now(),
         }
         .writing(flags)?
         .opened(flags);
@@ -1049,10 +1062,23 @@ impl FileHandle for CoherentFile {
         self.inner.flock(op)
     }
     fn flags(&self) -> u32 {
-        self.inner.flags()
+        match &self.quiet {
+            Some(status) => status.load(Ordering::SeqCst),
+            None => self.inner.flags(),
+        }
     }
     fn set_flags(&self, flags: u32) -> Result<(), Errno> {
-        self.inner.set_flags(flags)
+        self.inner.set_flags(flags)?;
+        if let Some(status) = &self.quiet {
+            let old = status.load(Ordering::SeqCst);
+            status.store(old & !SETTABLE | flags & SETTABLE, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    fn kept_open_flags(&self) -> u32 {
+        self.quiet
+            .as_ref()
+            .map_or(0, |status| status.load(Ordering::SeqCst) & 0o2_000_000)
     }
     fn with_xattrs(&self, f: &mut dyn FnMut(&mut paludarium_host::Xattrs)) -> Result<(), Errno> {
         let (result, changed) = crate::inotify::changing_xattrs(|| self.inner.with_xattrs(f));
@@ -1187,7 +1213,11 @@ impl HostFs for CoherentFs {
         // `IN_CREATE`, an old one emptied `IN_MODIFY`.
         let existed = (notify.watching() && flags & (O_CREAT | O_TRUNC) != 0)
             .then(|| self.inner.metadata(path, flags & O_NOFOLLOW == 0).ok());
-        let inner = self.inner.open(path, flags, mode)?;
+        let quiet = quiet_now();
+        let inner = match self.inner.open(path, flags, mode) {
+            Err(Errno::EISDIR) if quiet.is_some() => self.inner.open(path, flags & !3, mode)?,
+            result => result?,
+        };
         let created = matches!(existed, Some(None)) && flags & O_CREAT != 0;
         if created {
             notify.created(&*self.inner, path);

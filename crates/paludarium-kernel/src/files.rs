@@ -5006,6 +5006,7 @@ fn status_flags(d: &Descriptor) -> u32 {
     } else {
         OPEN_ONLY
     };
+    let open_only = open_only & !d.file.kept_open_flags();
     flags & !open_only | if opened { O_LARGEFILE } else { 0 }
 }
 /// How often a thread looks at a host's standard stream for `O_ASYNC`.

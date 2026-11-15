@@ -887,7 +887,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   そこへのシステムコールのコピーは `EFAULT`、`MADV_POPULATE_READ` は `EHWPOISON` です。
   poison は `mprotect` と `UFFDIO_UNREGISTER` では残り、`mremap` では一緒に動き、
   `fork` した子には、プライベートなメモリでは引き継がれ、共有メモリでは引き継がれず、
-  `MADV_DONTNEED`、`MADV_FREE`、`munmap` で消えます。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
+  `MADV_DONTNEED`、`MADV_FREE`、`MADV_GUARD_INSTALL`（ガードに置き換わります）、
+  `munmap` で消えます。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
   `EINVAL`）、ノンブロッキングでなければ待ちます。`poll` は、Linux と同じく
   `UFFDIO_API` の前とブロックするファイルでは `POLLERR`、それ以外ではまだ読まれていない
   フォールトがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と

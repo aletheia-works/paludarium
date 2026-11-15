@@ -989,7 +989,8 @@ kernel.
   `MADV_POPULATE_READ` `EHWPOISON`. The poison stays through `mprotect`
   and `UFFDIO_UNREGISTER`, moves with `mremap`, goes to a `fork`ed child of
   private memory but not of shared, and goes with `MADV_DONTNEED`,
-  `MADV_FREE` and `munmap`. A read takes whole messages (`EINVAL` for a buffer
+  `MADV_FREE`, `MADV_GUARD_INSTALL` (whose guard takes its place) and
+  `munmap`. A read takes whole messages (`EINVAL` for a buffer
   too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
   `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
   Linux's does, else `POLLIN` while a fault is not read yet.

@@ -11,7 +11,8 @@
    to it; and UFFDIO_POISON: its errors, the SIGBUS of an access to a
    poisoned page (si_code and si_addr_lsb), a system call's copy and
    MADV_POPULATE_READ there, and what mprotect, fork, unregistering,
-   mremap, MADV_DONTNEED, MADV_FREE and munmap do to the poison, of
+   mremap, MADV_DONTNEED, MADV_FREE, MADV_GUARD_INSTALL and munmap do to
+   the poison, of
    private and of shared anonymous memory.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
@@ -71,6 +72,10 @@
 #define POISON_IOCTL (1ULL << 8)
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22
+#endif
+#ifndef MADV_GUARD_INSTALL
+#define MADV_GUARD_INSTALL 102
+#define MADV_GUARD_REMOVE 103
 #endif
 #define PAGE 4096
 
@@ -830,6 +835,12 @@ static int case_poison(void) {
     access_at("after free", base, base + 2 * PAGE, 0);
     printf("register again: %s\n", err(reg(fd, base + 3 * PAGE, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
     printf("poison: %s\n", err(poison(fd, base + 3 * PAGE, PAGE, 0, NULL)));
+    /* A guard replaces the poison; removing it leaves an empty page, which
+       takes poison again (a read would wait for the missing page). */
+    printf("guard: %s\n", err(madvise(base + 3 * PAGE, PAGE, MADV_GUARD_INSTALL)));
+    access_at("guarded", base, base + 3 * PAGE, 0);
+    printf("unguard: %s\n", err(madvise(base + 3 * PAGE, PAGE, MADV_GUARD_REMOVE)));
+    printf("poison again: %s\n", err(poison(fd, base + 3 * PAGE, PAGE, 0, NULL)));
     munmap(base + 3 * PAGE, PAGE);
     char *again = mmap(base + 3 * PAGE, PAGE, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);

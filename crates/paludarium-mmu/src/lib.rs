@@ -4510,6 +4510,9 @@ impl AddressSpaceData {
                 mapping.maybe_guard = true;
             }
         }
+        // The zap before the markers go in (`madvise_guard_install`) takes
+        // any poison marker away too.
+        self.poisons.clear(from, to);
         self.add_guards(from, to);
         self.bump_code_generation();
     }

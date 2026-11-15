@@ -885,7 +885,17 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
     let mut byte = [0];
     m.read(GuestAddr(moved.0 + PAGE_SIZE), &mut byte).unwrap();
     assert_eq!(byte, [b'a']);
+    // A guard replaces it, and removing the guard leaves an empty page.
+    m.guard(moved, moved.0 + PAGE_SIZE, true).unwrap();
+    assert!(!m.read(moved, &mut [0]).unwrap_err().poison);
+    m.guard(moved, moved.0 + PAGE_SIZE, false).unwrap();
+    m.read(moved, &mut byte).unwrap();
+    assert_eq!(byte, [0]);
     // A discard ends it, as an unmap does; so does `MADV_FREE`'s.
+    assert!(child.read(a, &mut [0]).unwrap_err().poison);
+    child.discard_shared(a, PAGE_SIZE).unwrap();
+    child.read(a, &mut byte).unwrap();
+    assert_eq!(byte, [0]);
     m.discard_shared(moved, PAGE_SIZE).unwrap();
     m.read(moved, &mut byte).unwrap();
     assert_eq!(byte, [0]);

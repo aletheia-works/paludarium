@@ -86,7 +86,7 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 - 直接の分岐、`call`、`ret`
 - レジスタ、即値、メモリの間の（`lock` なしの）`add`、`sub`、`and`、`or`、`xor`、`cmp`、`test`
 - レジスタの即値による `shl`、`shr`、`sar`、`rol`、`ror`
-- レジスタからの `movzx`、レジスタまたはメモリからの `movsx` と `movsxd`、`cbw`、`cwde`、`cdqe`
+- レジスタからの `movzx`、レジスタまたはメモリからの `movsx` と `movsxd`、`cbw`、`cwde`、`cdqe`、16 ビットか 32 ビットのレジスタへの `lea`
 - レジスタと（`lock` なしの）メモリに対する `inc`、`dec`、`neg`、`not`
 
 オペランドを前もって取り出しておくので、実行するときにニーモニックによる

@@ -103,8 +103,8 @@ out:
 - `add`, `sub`, `and`, `or`, `xor`, `cmp` and `test` between registers,
   immediates and memory (without `lock`);
 - `shl`, `shr`, `sar`, `rol` and `ror` of a register by an immediate;
-- `movzx` from a register, `movsx` and `movsxd` from a register or memory, and
-  `cbw`, `cwde` and `cdqe`;
+- `movzx` from a register, `movsx` and `movsxd` from a register or memory,
+  `cbw`, `cwde` and `cdqe`, and `lea` into a 16- or 32-bit register;
 - `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`.
 
 Their operands are taken out in advance, so running them needs neither the

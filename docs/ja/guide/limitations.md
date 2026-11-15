@@ -43,11 +43,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   取り込みます（`fault_around_bytes`）。`MAP_POPULATE`、`MAP_LOCKED`、ロックが
   取り込むはずのページも、触れたときに数えます。ヒュージページもプロテクションキーも
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
-  `um`、`uw`、`ui`（`userfaultfd`）、`ht`、`dp`（`MAP_HUGETLB`、`MAP_DROPPABLE`）が
-  ありません。
+  `uw`、`ui`（提供しない `userfaultfd` の書き込み保護とマイナーのモード）、`ht`、`dp`
+  （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
-  `fs/mqueue` 以外の `/proc/sys` など）と、読むプロセス自身のディレクトリのほかの名前
+  `fs` 以外の `/proc/sys` など）と、読むプロセス自身のディレクトリのほかの名前
   （`auxv`、`limits` など）は、ふつうのパスと同じように探すので、`--mount /:/` ではホストの
   `/proc` に届きます。ほかのプロセスのディレクトリでは、それらは `ENOENT` です。Linux は
   root に `fd`、`maps`、`statm` なども見せます。`stat` のページフォールト、常駐メモリ、
@@ -294,8 +294,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux は `ESTALE` を返します。`PIDFD_THREAD` の pidfd の inode はプロセス全体のものです。
     `O_EXCL` を付けてハンドルから開いた pidfd には、CI の Linux 7.0 と同じく `PIDFD_THREAD`
     が残りません。Linux 7.2 以降は残します。
-  - System V IPC には `/proc/sysvipc` がなく、共有メモリ・セマフォー・メッセージキューの
-    上限は Linux の既定値で、`/proc/sys/kernel` から変えられません。メッセージキューで
+  - System V IPC の共有メモリ・セマフォー・メッセージキューの上限は Linux の既定値で、
+    `/proc/sys/kernel` から変えられません。`/proc/sysvipc` は開いたときのオブジェクトを
+    見せます。Linux は読み進めたところで、そのオブジェクトをその都度読みます。
+    入れ子の PID 名前空間では、セマフォーの `GETPID` はそのプロセスが回収されると 0 になります。
+    Linux はそこでも、その番号を返します。メッセージキューで
     待っている送信者は、キューが変わるたびにすべて確かめ直します。Linux は、それぞれの
     メッセージが入る間だけ、待ち始めた順に起こします。
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
@@ -464,6 +467,16 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
+- **userfaultfd の一部**：登録するのはないページだけです。書き込み保護とマイナーの
+  モードは受け付けず（`EINVAL`）、`UFFDIO_WRITEPROTECT`、`UFFDIO_CONTINUE`、
+  `UFFDIO_MOVE`、`UFFDIO_POISON` もありません（`EINVAL`）。`fork`、`mremap`、
+  `madvise`、`munmap` のイベントと書き込み保護の機能もなく、`UFFDIO_API` はそれらを
+  示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す ioctl にも
+  入りません。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
+  登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
+  ないページへのシステムコール自身のコピーは、`UFFD_USER_MODE_ONLY` のときと同じく
+  `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
+  `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベント（`FAN_OPEN_PERM`、`FAN_ACCESS_PERM`、
   `FAN_OPEN_EXEC_PERM`）は `fanotify_mark` で受け付けますが送りません。そのため、求める
   はずだったことはそのまま通り、応答はどのイベントも指しません。`FAN_PRE_ACCESS` は

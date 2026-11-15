@@ -47,7 +47,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 分類 | システムコール |
 |---|---|
 | プロセスとスレッド | `clone`、`clone3`、`fork`、`vfork`、`execve`、`execveat`、`wait4`、`waitid`、`pidfd_open`、`pidfd_send_signal`、`pidfd_getfd`、`kcmp`、`process_vm_readv`／`process_vm_writev`、`exit`、`exit_group`、`getpid`、`getppid`、`gettid`、`set_tid_address`、`futex`、`futex_waitv`、`futex_wake`／`futex_wait`／`futex_requeue`、`set_robust_list`、`get_robust_list`、`sched_setaffinity`／`sched_getaffinity`、`getcpu`、`sched_yield`、`sched_setscheduler`／`sched_getscheduler`、`sched_setparam`／`sched_getparam`、`sched_setattr`／`sched_getattr`、`sched_get_priority_max`／`sched_get_priority_min`、`sched_rr_get_interval`、`ioprio_set`／`ioprio_get`、`personality`、`unshare`、`setns`、`membarrier`、`rseq`、`setpgid`／`getpgid`／`getpgrp`、`setsid`／`getsid`、`getpriority`／`setpriority`、`prlimit64`／`getrlimit`／`setrlimit`、`prctl` |
-| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl`、`modify_ldt` |
+| メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl`、`modify_ldt`、`userfaultfd`（下を参照） |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
 | 鍵 | `add_key`、`request_key`、`keyctl` |
@@ -832,6 +832,39 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （行き先を空け、縮めて落とす分を外したあとで `EINVAL`）、コンテキストも一緒に移ります。
 - `msync` は、引数と範囲を確かめ、`MS_SYNC` か `MS_ASYNC` なら共有のファイルの
   マッピングへの書き込みをファイルに書き戻します。
+- `userfaultfd` は、登録したメモリでほかのスレッドが起こすフォールトをスレッドが
+  さばくためのファイルを、Linux の `fs/userfaultfd.c` と同じに作ります。カーネル自身の
+  フォールトも届くもの（`UFFD_USER_MODE_ONLY` なし）には `CAP_SYS_PTRACE` が要り
+  （`vm.unprivileged_userfaultfd` が 0 なので `EPERM`）、これはフラグ（`EINVAL`）より
+  先に確かめます。ファイルは読み出し用の `anon_inode:[userfaultfd]` で、誰が持っていても
+  作られたアドレス空間のものです。`UFFDIO_API` はバージョンと機能を一度だけ受け取り
+  （2 度目は `EINVAL`）、提供する機能と ioctl を書き戻します。失敗したときは 0 を
+  書きます。提供する機能は `UFFD_FEATURE_SIGBUS`、`UFFD_FEATURE_THREAD_ID`、
+  `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
+  `UFFD_FEATURE_MISSING_HUGETLBFS` で、`UFFD_FEATURE_EVENT_FORK` には
+  `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
+  メモリと共有の anonymous メモリを、ないページについて登録します
+  （`UFFDIO_REGISTER_MODE_MISSING`）。確かめることと順は Linux と同じで（範囲、次に
+  各 VMA。登録できないものは `EINVAL`、ほかの `userfaultfd` のものは `EBUSY`）、
+  登録した部分は `/proc/<pid>/maps` に見えるとおり VMA に分かれ、`smaps` に `um` が
+  つきます。`fork` した子と、`mremap` が動かしたマッピングには引き継がれず、
+  `UFFDIO_UNREGISTER` とファイルを閉じることで外れます。登録したページでまだない
+  もの（共有メモリでは、どのマッピングにもないもの）に命令が触れると待ち、ファイルは
+  そのフォールトを古い順に `uffd_msg` として読みます。書き込みかどうか、ページの
+  アドレス（`UFFD_FEATURE_EXACT_ADDRESS` ではアドレスそのもの）、
+  `UFFD_FEATURE_THREAD_ID` ではスレッドの ID が入ります。待ちは、`UFFDIO_COPY` か
+  `UFFDIO_ZEROPAGE` がページを埋めたとき（`DONTWAKE` でなければ）、`UFFDIO_WAKE` か
+  `UFFDIO_UNREGISTER` がその範囲を取ったとき、ファイルが閉じられたとき、シグナルが
+  来たときに終わり、命令は、Linux がフォールトをやり直すのと同じくもう一度動きます。
+  `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。`UFFDIO_COPY` と
+  `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
+  VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
+  `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
+  です。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
+  `EINVAL`）、ノンブロッキングでなければ待ちます。`poll` は、Linux と同じく
+  `UFFDIO_API` の前とブロックするファイルでは `POLLERR`、それ以外ではまだ読まれていない
+  フォールトがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と
+  同じく、読まれていないフォールトの数、待っているもの全部の数、API を示します。
 - `remap_file_pages` は、共有のマッピングの範囲を、そのファイルや共有メモリの別の
   ページに張り直します。Linux がマッピング自身のファイルを `mmap` し直すのと同じで、
   保護はそのままです。Linux と同じく、`prot` は 0 でなければならず、範囲は、ファイルを
@@ -1995,8 +2028,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `openat2` は自身の解決の中で扱います）。`/proc` のディスクリプタや `/proc` の中の
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
-- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`（後述）、
-  `fs/mqueue` だけを持つ `/proc/sys`（後述）、
+- `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
+  `fs` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
@@ -2125,6 +2158,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   0 です。続いて `intr 0`、`ctxt 0`、`btime`（実時間の時計から単調時計を引いた秒数で、`ps` は
   これで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running 1`、
   `procs_blocked 0`、0 が並ぶ `softirq` の行です。
+- `/proc/sysvipc` には `msg`、`sem`、`shm` がこの順に並びます。どれも 64 ビットのカーネルでの
+  Linux の `sysvipc_*_proc_show` と同じ形式です。
+  - 見出しの行に続けて、読み手の IPC 名前空間のキュー、セット、セグメントを、インデックスの順に
+    1 行ずつ並べます。
+  - 行にはキー、ID、モードがあります。セグメントのモードには `SHM_DEST` と `SHM_LOCKED` も
+    入ります。
+  - 数、読み手の PID 名前空間での PID（見えないものは 0）、読み手のユーザー名前空間での
+    所有者と作成者、時刻も入ります。
+  - セグメントの行には、メモリにあるページのバイト数と、スワップした 0 も入ります。
+  - セグメントやキューの PID は、`IPC_STAT` が返すものも、そのプロセスがなくなっても見えます。
+    オブジェクトがその `struct pid` を持ち続けるためです。
+- これらのシステムのファイル（`loadavg`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
+  サイズは、Linux の `proc_create` が作るものと同じく 0 です。読み込みは中身の終わりまで進みます。
+- root はこれらのシステムのファイルを書き込み用に開けますが、書き込みは `EIO` です。書き込みの
+  操作がないファイルに Linux の `pde_write` が返すのと同じです。プロセス自身のファイルへの書き込みは
+  `EINVAL` です。
 - `/proc/self/maps` は VMA を Linux の形式で並べます。隣り合うマッピングの併合と
   分割も Linux と同じです。項目は、範囲、保護、`s` か `p`、ファイル内のオフセット、
   `stat` と同じファイルのデバイスと inode、Linux と同じ桁に置く名前です。名前は
@@ -2146,7 +2195,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フラグを Linux と同じ順番で並べます。保護とそのなれる先（`mr`、`mw`、`me`、`ms`。
   読むためだけに開いたファイルと書き込みを封じたファイルには `mw` がなく、AIO と
   `io_uring` のリングと秘密のメモリには、何も実行しない疑似ファイルシステムなので
-  `me` がありません）、`sh`、最初のスタックの `gd`、ロック（`lo`、`lf`）、ガード
+  `me` がありません）、`sh`、最初のスタックの `gd`、`userfaultfd` が登録した範囲の `um`、ロック（`lo`、`lf`）、ガード
   （`gu`）、アドバイス（`sr`、`rr`、`dc`、`wf`、`dd`、`hg`、`nh`、`mg`）、リングと秘密の
   メモリの `de`、`mm`、`dd`、課金（`ac`。書き込めたプライベートメモリが持ち、
   `MAP_NORESERVE` なら代わりに `nr` を持ちます。一度も書いていない匿名メモリは書き込め

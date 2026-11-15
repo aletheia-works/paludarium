@@ -1689,6 +1689,7 @@ fn directory_entries(
         {
             crate::sysctl::entries(directory)
         }
+        _ if crate::proc::is_sysvipc(&d.path) => crate::proc::sysvipc_entries(),
         _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
         Some(crate::proc::OwnEntry::Descriptors) => descriptor_entries(c, false),
         Some(crate::proc::OwnEntry::DescriptorInfos) => descriptor_entries(c, true),
@@ -1873,14 +1874,16 @@ fn positioned(
     }
     Ok(file)
 }
-/// Where reads of a regular file stop: at its size, but for `maps`, which
-/// and `smaps`, which say 0 as Linux's /proc does and end where their
-/// `read` does.
+/// Where reads of a regular file stop: at its size, but for `maps` and
+/// `smaps`, and /proc's system-wide files, which say 0 as Linux's /proc
+/// does and end where their `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
-    if file
-        .as_any()
-        .is_some_and(|file| file.is::<crate::proc::MapsFile>())
-    {
+    if file.as_any().is_some_and(|file| {
+        file.is::<crate::proc::MapsFile>()
+            || file
+                .downcast_ref::<crate::proc::GeneratedFile>()
+                .is_some_and(crate::proc::GeneratedFile::is_entry)
+    }) {
         u64::MAX
     } else {
         metadata.size
@@ -2844,6 +2847,14 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
             flags,
         );
     }
+    if let Some(uffd) = crate::userfaultfd::of(&file) {
+        return readv_instance(
+            c,
+            &|c, base, length| crate::userfaultfd::read_guest(c, uffd, base, length),
+            a,
+            flags,
+        );
+    }
     let segments = iovecs(c, a[1], a[2], true)?;
     let total = segments.iter().map(|(_, length)| length).sum::<usize>();
     let position = file.seek(0, 1).ok();
@@ -3044,6 +3055,10 @@ fn read_waiting(
     }
     // So does a fanotify group.
     if let Some(result) = crate::fanotify::read(c, file, b, nowait) {
+        return result;
+    }
+    // And a userfaultfd its faults.
+    if let Some(result) = crate::userfaultfd::read(c, file, b, nowait) {
         return result;
     }
     // A socket's read waits as its SO_RCVLOWAT says. A pipe is a PipeEnd,
@@ -4123,6 +4138,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             {
                 crate::sockets::access_ok_u64(a[1], a[2])?;
                 return crate::fanotify::read_guest(c, group, a[1], len).map(|n| n as u64);
+            }
+            if n == 0
+                && let Some(d) = &d
+                && let Some(uffd) = crate::userfaultfd::of(&d.file)
+            {
+                crate::sockets::access_ok_u64(a[1], a[2])?;
+                return crate::userfaultfd::read_guest(c, uffd, a[1], len).map(|n| n as u64);
             }
             // A fanotify group takes responses to its permission events.
             if n == 1
@@ -6132,8 +6154,15 @@ fn open_path(
         }
     } else if let Some(entry) = crate::sysctl::entry(p) {
         crate::sysctl::open(c, entry, flags)?
+    } else if crate::proc::below_system_entry(p) {
+        return Err(Errno::ENOTDIR);
+    } else if crate::proc::is_sysvipc(p) {
+        if flags & 3 != 0 {
+            return Err(Errno::EISDIR);
+        }
+        Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
     } else if let Some(entry) = crate::proc::system_entry(p) {
-        Arc::new(crate::proc::GeneratedFile::open(
+        Arc::new(crate::proc::GeneratedFile::open_entry(
             system_file(c, entry),
             flags,
         ))
@@ -6863,6 +6892,9 @@ fn link_target(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     if any.is_some_and(|v| v.is::<crate::fanotify::Group>()) {
         return Ok(b"anon_inode:[fanotify]".to_vec());
     }
+    if any.is_some_and(|v| v.is::<crate::userfaultfd::UserfaultFile>()) {
+        return Ok(b"anon_inode:[userfaultfd]".to_vec());
+    }
     // So is a seccomp listener: "seccomp notify".
     if crate::seccomp::is_listener(&d.file) {
         return Ok(b"anon_inode:seccomp notify".to_vec());
@@ -7011,6 +7043,7 @@ fn known_stat(
             device(c, path),
             BLOCK_SIZE,
         ))),
+        None if crate::proc::below_system_entry(path) => Err(Errno::ENOTDIR),
         None => Ok(other_generated_stat(c, path, follow)),
     }
 }
@@ -7040,9 +7073,15 @@ fn other_generated_stat(
             SMALL_BLOCK_SIZE,
         ));
     }
-    if let Some(entry) = crate::proc::system_entry(path) {
-        let length = system_file(c, entry).len();
-        return Some((crate::proc::stat(length), device(c, path), SMALL_BLOCK_SIZE));
+    if crate::proc::is_sysvipc(path) {
+        return Some((
+            crate::proc::directory_stat(),
+            device(c, path),
+            SMALL_BLOCK_SIZE,
+        ));
+    }
+    if crate::proc::system_entry(path).is_some() {
+        return Some((crate::proc::entry_stat(), device(c, path), SMALL_BLOCK_SIZE));
     }
     if tasks::is_root(path) {
         return Some((
@@ -7233,6 +7272,8 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
         // Mount marks are kept by device, so a mark has no path to tell
         // the bind mounts of one file system apart: the first mount's ID.
         out.extend(group.fdinfo(&|device| mount_id(c, device, b"")));
+    } else if let Some(uffd) = crate::userfaultfd::of(&d.file) {
+        out.extend(crate::userfaultfd::fdinfo(uffd));
     } else if let Some(counter) = any.and_then(|a| a.downcast_ref::<crate::events::EventCounter>())
     {
         out.extend(counter.fdinfo());
@@ -7281,7 +7322,8 @@ fn epoll_fdinfo(c: &Context<'_>, epoll: &crate::epoll::EpollInstance) -> Vec<u8>
     }
     out
 }
-/// The contents of a system-wide /proc file, from what `sysinfo` reports.
+/// The contents of a system-wide /proc file: from what `sysinfo` reports,
+/// or the caller's IPC namespace's objects for `/proc/sysvipc`.
 fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
     match entry {
         crate::proc::SystemEntry::Loadavg => {
@@ -7308,6 +7350,9 @@ fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
                 .clock(paludarium_host::ClockId::Monotonic)
                 .unwrap_or(0),
         ),
+        crate::proc::SystemEntry::SysvipcMsg => crate::msg::proc_file(c),
+        crate::proc::SystemEntry::SysvipcSem => crate::sem::proc_file(c),
+        crate::proc::SystemEntry::SysvipcShm => crate::shm::proc_file(c),
     }
 }
 /// `mknod` and `mknodat`, as Linux's `do_mknodat`: a regular file (type 0

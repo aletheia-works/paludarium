@@ -129,10 +129,12 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
-            // its own, for its counts), the fanotify cases, whose groups and
-            // marks need CAP_SYS_ADMIN, the keys cases, which set up keyrings as root
+            // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
+            // for its IDs and PIDs), the fanotify cases, whose groups and
+            // marks need CAP_SYS_ADMIN, the userfaultfd cases, whose files take
+            // the kernel's faults too (CAP_SYS_PTRACE), the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
             // limits and become an unprivileged user, the scheduling-set case, which sets
@@ -164,6 +166,7 @@ mod linux {
                     | "pid-set-tid"
                     | "net-namespaces"
                     | "msg"
+                    | "sysvipc-proc"
                     | "mqueue-calls"
                     | "mqueue-limits"
                     | "mqueue-wait"
@@ -183,6 +186,11 @@ mod linux {
                     | "fanotify-fid"
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
+                    | "userfaultfd-calls"
+                    | "userfaultfd-faults"
+                    | "userfaultfd-signals"
+                    | "userfaultfd-sigbus"
+                    | "userfaultfd-shared"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -464,6 +472,11 @@ mod linux {
         fanotify_fid => ("fanotify-fid","fanotify"),
         fanotify_pidfd => ("fanotify-pidfd","fanotify"),
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
+        userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
+        userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
+        userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
+        userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
+        userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -592,6 +605,7 @@ mod linux {
         processes_shm => ("shm","process"),
         processes_sem => ("sem","process"),
         processes_msg => ("msg","process"),
+        processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),
         processes_vector_flags => ("vector-flags","process"),

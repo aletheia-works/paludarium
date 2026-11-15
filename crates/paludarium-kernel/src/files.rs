@@ -275,6 +275,16 @@ impl FilesView {
         let fds = fds.lock().unwrap_or_else(PoisonError::into_inner);
         fds.get(&fd).cloned()
     }
+    /// The open descriptors by number, which `/proc/<pid>/fd` lists.
+    pub(crate) fn all(&self) -> Vec<(u32, Descriptor)> {
+        self.fds.upgrade().map_or_else(Vec::new, |fds| {
+            fds.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|(&n, d)| (n, d.clone()))
+                .collect()
+        })
+    }
     /// One past the highest open descriptor.
     pub(crate) fn descriptors(&self) -> usize {
         self.fds.upgrade().map_or(0, |fds| {
@@ -4773,7 +4783,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 c.process.pid.to_string().into_bytes()
             } else if let Some(path) = crate::proc::task_path(&p, c.process.pid, c.tid) {
                 let task = tasks::find(c, &path)?;
-                match tasks::link(&task, path.entry) {
+                match tasks::link(c, &task, path.entry) {
                     // Only a link is checked: another file is `EINVAL`.
                     Some(target) => {
                         tasks::check(c, &task, path.entry)?;
@@ -5111,7 +5121,7 @@ impl LinkPath {
             let task = tasks::find(c, &path)?;
             // Only a link is checked: `O_PATH` opens a file such as `maps`
             // without its `open`, which is what refuses a reader.
-            return match tasks::link(&task, path.entry) {
+            return match tasks::link(c, &task, path.entry) {
                 Some(target) => {
                     tasks::check(c, &task, path.entry)?;
                     Ok(Some(Self {
@@ -6039,7 +6049,7 @@ fn own_link_target(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
     }
     let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
     let task = tasks::find(c, &task_path).ok()?;
-    tasks::link(&task, task_path.entry)?.ok()
+    tasks::link(c, &task, task_path.entry)?.ok()
 }
 /// The file that opening guest path `p` gives, and the path its descriptor
 /// records: the generated files, a link in `/proc/self/fd` opened again,
@@ -6116,7 +6126,7 @@ fn open_path(
         let task = tasks::find(c, &path)?;
         // `O_PATH` does not open a file, so it skips the check that an open
         // of `environ` or `maps` makes; a link is checked as it is followed.
-        if flags & O_PATH == 0 || tasks::link(&task, path.entry).is_some() {
+        if flags & O_PATH == 0 || tasks::link(c, &task, path.entry).is_some() {
             tasks::check(c, &task, path.entry)?;
         }
         // A link of `ns` leads to its namespace's file, which it opens as
@@ -6169,9 +6179,33 @@ fn open_path(
         if let crate::proc::TaskEntry::Maps(smaps) = path.entry {
             return Ok((tasks::maps(&task, smaps, flags, c.files.root()), p.to_vec()));
         }
+        // A link of `fd` opens its descriptor's file again, as this
+        // process's own does.
+        if let crate::proc::TaskEntry::Descriptor(n) = path.entry {
+            let d = tasks::descriptor(&task, n).ok_or(Errno::ENOENT)?;
+            if flags & 0o300 == 0o300 {
+                return Err(Errno::EEXIST);
+            }
+            if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 {
+                return Err(Errno(40)); // ELOOP
+            }
+            return reopen_descriptor(c, d, flags, mode);
+        }
+        if let crate::proc::TaskEntry::DescriptorInfo(n) = path.entry {
+            let d = tasks::descriptor(&task, n).ok_or(Errno::ENOENT)?;
+            let others: Vec<Descriptor> = tasks::descriptors(&task)
+                .into_iter()
+                .map(|(_, d)| d)
+                .collect();
+            let content = fdinfo(c, &d, &others);
+            return Ok((
+                Arc::new(crate::proc::GeneratedFile::open(content, flags)),
+                p.to_vec(),
+            ));
+        }
         if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
             Arc::new(crate::proc::GeneratedFile::open(content, flags))
-        } else if let Some(target) = tasks::link(&task, path.entry) {
+        } else if let Some(target) = tasks::link(c, &task, path.entry) {
             // `exe`, `cwd` and `thread-self` are links, which O_NOFOLLOW
             // does not follow; `thread-self`'s is relative to /proc.
             let mut target = target?;
@@ -6316,11 +6350,20 @@ fn reopen(
     flags: u32,
     mode: u32,
 ) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
-    const ENXIO: Errno = Errno(6);
     let d = c
         .files
         .descriptor(u64::from(n))
         .map_err(|_| Errno::ENOENT)?;
+    reopen_descriptor(c, d, flags, mode)
+}
+/// [`reopen`] of descriptor `d`, this process's or another's.
+fn reopen_descriptor(
+    c: &mut Context<'_>,
+    d: Descriptor,
+    flags: u32,
+    mode: u32,
+) -> Result<(Arc<dyn FileHandle>, Vec<u8>), Errno> {
+    const ENXIO: Errno = Errno(6);
     // The descriptor of a symbolic link itself: following its link reaches
     // that symbolic link, which an open does not follow again (ELOOP).
     if d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
@@ -7141,7 +7184,17 @@ fn other_generated_stat(
     }
     let stat = match entry {
         crate::proc::OwnEntry::Directory => crate::proc::directory_stat(),
-        crate::proc::OwnEntry::Descriptors => crate::proc::descriptors_stat(),
+        // As Linux's `proc_fd_getattr`: its size is the number of open
+        // descriptors.
+        crate::proc::OwnEntry::Descriptors => FileStat {
+            size: c
+                .files
+                .fds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len() as u64,
+            ..crate::proc::descriptors_stat()
+        },
         crate::proc::OwnEntry::DescriptorInfos => crate::proc::directory_stat(),
         // As Linux's, of size 0, while the descriptor is open.
         crate::proc::OwnEntry::DescriptorInfo(n) => {
@@ -7292,8 +7345,22 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
 /// ([`crate::record_locks::fdinfo`]), and the lines of an inotify instance,
 /// an eventfd, a signalfd, a timerfd or an epoll.
 fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
-    const O_CLOEXEC: u32 = 0o2000000;
     let d = c.files.descriptor(u64::from(n)).ok()?;
+    let descriptors: Vec<Descriptor> = c
+        .files
+        .fds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    Some(fdinfo(c, &d, &descriptors))
+}
+/// [`descriptor_info`] of descriptor `d`, this process's or another's,
+/// whose process has `descriptors` (for the devices an epoll shows).
+fn fdinfo(c: &Context<'_>, d: &Descriptor, descriptors: &[Descriptor]) -> Vec<u8> {
+    const O_CLOEXEC: u32 = 0o2000000;
+    let d = d.clone();
     let flags = status_flags(&d) | if d.cloexec { O_CLOEXEC } else { 0 };
     // A file that cannot seek (a pipe, a socket) is at 0.
     let pos = d.file.seek(0, 1).unwrap_or(0);
@@ -7320,24 +7387,20 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     } else if let Some(timer) = any.and_then(|a| a.downcast_ref::<crate::timerfd::TimerFile>()) {
         out.extend(timer.fdinfo());
     } else if let Some(epoll) = any.and_then(|a| a.downcast_ref::<crate::epoll::EpollInstance>()) {
-        out.extend(epoll_fdinfo(c, epoll));
+        out.extend(epoll_fdinfo(c, epoll, descriptors));
     }
-    Some(out)
+    out
 }
 /// An epoll's lines in `/proc/self/fdinfo`, as Linux's `ep_show_fdinfo`
 /// writes one for each file it watches: the descriptor it was added with,
 /// the events, the data, and the file's position, inode and device (the
-/// device of a descriptor this process has of it, or 0). They come by
+/// device of a descriptor its process has of it, or 0). They come by
 /// descriptor, where Linux's order follows its files' addresses.
-fn epoll_fdinfo(c: &Context<'_>, epoll: &crate::epoll::EpollInstance) -> Vec<u8> {
-    let descriptors: Vec<Descriptor> = c
-        .files
-        .fds
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .values()
-        .cloned()
-        .collect();
+fn epoll_fdinfo(
+    c: &Context<'_>,
+    epoll: &crate::epoll::EpollInstance,
+    descriptors: &[Descriptor],
+) -> Vec<u8> {
     let mut out = Vec::new();
     for (fd, events, data, file) in epoll.targets() {
         let pos = file.seek(0, 1).unwrap_or(0);

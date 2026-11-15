@@ -2424,7 +2424,8 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `cmdline`, `environ` (0400), `comm`, `maps`, `smaps`, `exe`,
-  `cwd`, `root`, `mounts`, `mountinfo`, `ns` (0511) and `task`, made as
+  `cwd`, `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and
+  `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
@@ -2436,10 +2437,14 @@ kernel.
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
   gets `EACCES` for `environ` unless its real IDs, and for `maps`, `smaps`, `exe`, `cwd`,
-  `root` and the links of `ns` unless its filesystem IDs, are every user and group ID of a dumpable
+  `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
-  asks above; an undumpable process's directory is root's. What a process shows of
+  asks above; an undumpable process's directory is root's. `fd` itself is read
+  and looked in as its mode (0500) lets the reader, as Linux's
+  `proc_fd_permission` decides. `fd` and `fdinfo` are as this process's own
+  (below), of the other process's descriptors; a link of `fd` opens its
+  descriptor's file again. What a process shows of
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
@@ -2449,7 +2454,7 @@ kernel.
   reaped, `S (sleeping)` while its thread is in a system call, where it waits
   if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
-  `environ`, `maps` and `smaps` are empty and `exe`, `cwd` and `root` are `ENOENT`, as on Linux.
+  `environ`, `maps` and `smaps` are empty, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0
@@ -2597,7 +2602,8 @@ kernel.
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never
   written gives back as it stops being writable), `nh` of a `MAP_STACK`
   mapping, the seal (`sl`), and `sd` on every VMA but the initial stack.
-- `/proc/self/fd` (mode 0500) lists `.`, `..` and a link per open
+- `/proc/self/fd` (mode 0500, its size the number of open descriptors, as
+  Linux's `proc_fd_getattr` gives it) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each
   link's `lstat` shows the descriptor's access in its user bits and size 64,
   and `stat` follows it to the file. `readlink` gives Linux's names: the

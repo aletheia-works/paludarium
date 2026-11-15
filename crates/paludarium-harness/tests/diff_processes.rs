@@ -142,8 +142,8 @@ mod linux {
             // user namespace with its capabilities (Ubuntu's AppArmor gives none
             // to one an unprivileged user makes) before it becomes one,
             // the personality-layout case, which maps page 0, and the
-            // proc-other-maps case, which reads a process's maps as another
-            // user.
+            // proc-other-maps and proc-other-fds cases, which read a
+            // process's maps and descriptors as another user.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -160,6 +160,7 @@ mod linux {
                     | "script-exec"
                     | "proc-maps"
                     | "proc-other-maps"
+                    | "proc-other-fds"
                     | "dynamic-exec"
                     | "pty-vhangup"
                     | "pid-namespace"
@@ -662,6 +663,7 @@ mod linux {
         processes_binds => ("binds","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_proc_other_maps => ("proc-other-maps","process"),
+        processes_proc_other_fds => ("proc-other-fds","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),

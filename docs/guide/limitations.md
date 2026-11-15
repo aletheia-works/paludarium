@@ -69,8 +69,10 @@ verified.
   (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
   the reader's own directory (`auxv`, `limits`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `fd`,
-  `statm` and the rest. In `stat`, page faults, resident memory, the start
+  process's directory they are `ENOENT`, where Linux shows root `statm` and
+  the rest. A path that goes on through a link of another process's `fd`
+  (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
+  directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
   time and the code range are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and

@@ -208,7 +208,11 @@ differential tests, coverage, fuzzing, the guest programs and the
 WebAssembly checks — start only after the quick stage passed: lint, clippy
 (also with the stable Rust), polyglot lint and the Linux unit tests, which
 take two to four minutes. A head that fails them, or that a later push
-supersedes in those minutes, takes no runners for the long jobs. `ci-ok`,
+supersedes in those minutes, takes no runners for the long jobs. A quick
+check the change does not need is skipped (polyglot lint on a push to main,
+lint and clippy when no Rust changed), and a skip would pass down to every
+job that needs it, so each expensive job tests the quick stage's own result
+instead. `ci-ok`,
 the required check, needs every job itself, so a job skipped because the
 quick stage failed cannot make it pass; `scripts/ci-changes.py --self-test`
 refuses a `ci.yml` where it does not. Dependency Review runs only on pull

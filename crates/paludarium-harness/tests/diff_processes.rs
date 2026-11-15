@@ -129,7 +129,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -223,6 +223,9 @@ mod linux {
                     | "ext-ack-netlink-strict"
                     | "ext-ack-link-attributes"
                     | "ext-ack-generic-netlink"
+                    | "netlink-option-flags"
+                    | "netlink-pktinfo"
+                    | "netlink-no-enobufs"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -385,6 +388,9 @@ mod linux {
         processes_ext_ack_netlink_strict => ("ext-ack-netlink-strict","process"),
         processes_ext_ack_link_attributes => ("ext-ack-link-attributes","process"),
         processes_ext_ack_generic_netlink => ("ext-ack-generic-netlink","process"),
+        netlink_option_flags => ("netlink-option-flags","netlink-options"),
+        netlink_pktinfo => ("netlink-pktinfo","netlink-options"),
+        netlink_no_enobufs => ("netlink-no-enobufs","netlink-options"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),

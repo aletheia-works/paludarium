@@ -1415,12 +1415,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `getsockname` と `getpeername` はポートとグループを返し、ほかのソケットのポートへの
     データグラムはそのソケットに届きます（なければ `ECONNREFUSED`）。`recvmsg` は送り手の
     `sockaddr_nl` を返し、`MSG_PEEK` と `MSG_TRUNC` が使えます。`SO_RCVBUF`、
-    `SO_SNDBUF`、`SO_RCVTIMEO`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
-    `NETLINK_GET_STRICT_CHK` を設定できます。受信バッファーがいっぱいのときにカーネルから来た
+    `SO_SNDBUF`、`SO_RCVTIMEO`、`NETLINK_PKTINFO`、`NETLINK_BROADCAST_ERROR`、
+    `NETLINK_NO_ENOBUFS`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
+    `NETLINK_GET_STRICT_CHK` を設定できます。Linux の `netlink_setsockopt` と同じく、
+    `int` より短い値は 0 です。`NETLINK_PKTINFO` を付けると、`recvmsg` はデータグラムの
+    グループ（ソケット自身のポートに来たものは 0）を `SOL_NETLINK` の `NETLINK_PKTINFO`
+    制御メッセージで返し、入らなければ `MSG_CTRUNC` を立てます。`NETLINK_BROADCAST_ERROR`
+    は覚えるだけです。ここでは届かなかった通知を誰かに伝えることがないからです。
+    受信バッファーがいっぱいのときにカーネルから来た
     メッセージは捨て、次の受信で `ENOBUFS` を返します。そのあとソケットは、Linux の
     `NETLINK_S_CONGESTED` と同じく混んでいるとされ、受信でキューが空になるまで、カーネルから
-    来るほかのメッセージも捨てます（`ENOBUFS` は繰り返しません）。ダンプの続きはこれを
-    見ません。ほかのソケットから来るデータグラムは、空きがないかソケットが混んでいれば、
+    来るほかのメッセージも捨てます（`ENOBUFS` は繰り返しません）。`NETLINK_NO_ENOBUFS`
+    を付けたソケットは、どちらもなしに捨てます。これを付けると混んだ状態も終わります。
+    ダンプの続きはこれを見ません。ほかのソケットから来るデータグラムは、空きがないかソケットが混んでいれば、
     空きができるまで待ちます（`MSG_DONTWAIT` か `O_NONBLOCK` なら `EAGAIN`）。こちらは
     あふれたことにはなりません。
   - **リクエスト:** カーネル（ポート 0）は、`rtnetlink` と同じくデータグラムのメッセージを

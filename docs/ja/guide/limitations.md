@@ -343,11 +343,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     通るかが違うことがあります。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
-  - `ptrace` には、まだシングルステップと LISTEN がありません。`PTRACE_SINGLESTEP`、
-    `PTRACE_SYSEMU_SINGLESTEP`、`PTRACE_LISTEN`、`PTRACE_PEEKSIGINFO`、`PTRACE_GETSIGMASK`、
-    `PTRACE_SETSIGMASK` と、機能の一覧にないほかの要求は `EIO` を返し、
-    `PTRACE_O_TRACESECCOMP` は受け付けますが止まりません（`SECCOMP_RET_TRACE` はトレーサーが
-    ないときと同じく `ENOSYS` です）。システムコール停止をシグナル付きで再開すると、Linux は
+  - `ptrace` には、まだシングルステップがありません。`PTRACE_SINGLESTEP`、
+    `PTRACE_SYSEMU_SINGLESTEP` と、機能の一覧にないほかの要求は `EIO` を返します。
+    `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
+    ほかは `EINVAL` です。`PTRACE_LISTEN` のトレース対象は、グループ停止の変化に 10 ms 以内に
+    気づきます。システムコール停止をシグナル付きで再開すると、Linux は
     プロセスに送りますが、ここでは止まったスレッドが受けます。`PTRACE_EVENT_EXIT` が示す
     ステータスにはコアダンプのビットがありません。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
     ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく

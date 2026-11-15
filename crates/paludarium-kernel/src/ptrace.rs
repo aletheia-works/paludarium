@@ -33,6 +33,8 @@ const PTRACE_SETFPREGS: i64 = 15;
 const PTRACE_ATTACH: i64 = 16;
 const PTRACE_DETACH: i64 = 17;
 const PTRACE_SYSCALL: i64 = 24;
+/// x86's `PTRACE_ARCH_PRCTL`.
+const PTRACE_ARCH_PRCTL: i64 = 30;
 /// x86's `PTRACE_SYSEMU`.
 const PTRACE_SYSEMU: i64 = 31;
 const PTRACE_SETOPTIONS: i64 = 0x4200;
@@ -43,6 +45,20 @@ const PTRACE_GETREGSET: i64 = 0x4204;
 const PTRACE_SETREGSET: i64 = 0x4205;
 const PTRACE_SEIZE: i64 = 0x4206;
 const PTRACE_INTERRUPT: i64 = 0x4207;
+const PTRACE_LISTEN: i64 = 0x4208;
+const PTRACE_PEEKSIGINFO: i64 = 0x4209;
+const PTRACE_GETSIGMASK: i64 = 0x420a;
+const PTRACE_SETSIGMASK: i64 = 0x420b;
+const PTRACE_GET_RSEQ_CONFIGURATION: i64 = 0x420f;
+/// `PTRACE_PEEKSIGINFO_SHARED`: the process's queue, not the thread's.
+const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
+/// `PTRACE_O_TRACESECCOMP`.
+const PTRACE_O_TRACESECCOMP: u32 = 1 << PTRACE_EVENT_SECCOMP;
+/// `arch_prctl`'s base requests.
+const ARCH_SET_GS: u64 = 0x1001;
+const ARCH_SET_FS: u64 = 0x1002;
+const ARCH_GET_FS: u64 = 0x1003;
+const ARCH_GET_GS: u64 = 0x1004;
 const PTRACE_GET_SYSCALL_INFO: i64 = 0x420e;
 const PTRACE_SET_SYSCALL_INFO: i64 = 0x4212;
 
@@ -241,6 +257,23 @@ struct Stop {
     code: i32,
     /// The signal the tracer resumed it with.
     resumed: Option<i32>,
+    /// The signals it blocks, as `PTRACE_GETSIGMASK` shows them (the mask
+    /// a `sigsuspend` or `ppoll` puts back, while it waits), and the mask a
+    /// `PTRACE_SETSIGMASK` gave it for when it goes on.
+    mask: u64,
+    new_mask: Option<u64>,
+    /// The siginfo of each signal pending for the task and for its process,
+    /// in the order they came (`PTRACE_PEEKSIGINFO`).
+    queued: Vec<[u8; 128]>,
+    shared: Vec<[u8; 128]>,
+    /// Its `rseq` registration (`PTRACE_GET_RSEQ_CONFIGURATION`).
+    rseq: Option<crate::rseq::Registration>,
+    /// `JOBCTL_LISTENING`: after `PTRACE_LISTEN`, it stays stopped but is
+    /// not in a stop a wait or a request sees, until the group stop it was
+    /// in (`group_stopped`) changes or an interrupt comes, when it traps
+    /// again.
+    listening: bool,
+    group_stopped: bool,
 }
 
 /// One traced task, which its process's thread group counts while it is
@@ -490,6 +523,7 @@ impl crate::Processes {
                 any = true;
                 if let Some(stop) = tracee.stop.as_mut()
                     && stop.code != 0
+                    && !stop.listening
                 {
                     let code = stop.code;
                     if !wait.keep {
@@ -665,6 +699,7 @@ impl Kernel {
             }
             tracee.trap_stop = false;
             restart.traced = true;
+            let (queued, shared) = self.pending_siginfos(thread);
             tracee.stop = Some(Stop {
                 cpu,
                 orig_rax: thread.state.ptrace.orig_rax,
@@ -672,6 +707,16 @@ impl Kernel {
                 message,
                 code,
                 resumed: None,
+                mask: thread
+                    .state
+                    .wait_restore_mask
+                    .unwrap_or(thread.state.signal_mask),
+                new_mask: None,
+                queued,
+                shared,
+                rseq: thread.state.rseq,
+                listening: false,
+                group_stopped: self.group.is_stopped(),
             });
             tracee.tracer_pid
         };
@@ -703,6 +748,16 @@ impl Kernel {
                         if let Some(signal) = tracee.stop.as_ref().and_then(|stop| stop.resumed) {
                             break Some((signal, tracee.stop.take()));
                         }
+                        // A listening tracee traps again once its group
+                        // stop changes or an interrupt comes
+                        // (`ptrace_trap_notify`).
+                        if let Some(stop) = &tracee.stop
+                            && stop.listening
+                            && (stop.group_stopped != self.group.is_stopped() || tracee.trap_stop)
+                        {
+                            tracee.trap_stop = true;
+                            break Some((0, tracee.stop.take()));
+                        }
                     }
                     // Let go of: it resumes with what it had.
                     None => {
@@ -720,6 +775,16 @@ impl Kernel {
                     tracee.stop = None;
                 }
                 break None;
+            }
+            // Signals that came meanwhile, for PTRACE_PEEKSIGINFO.
+            let (queued, shared) = self.pending_siginfos(thread);
+            if let Some(stop) = traces
+                .lock()
+                .get_mut(&thread.tid)
+                .and_then(|t| t.stop.as_mut())
+            {
+                stop.queued = queued;
+                stop.shared = shared;
             }
             let _ = self.wait_for_children(ticket);
         };
@@ -741,6 +806,11 @@ impl Kernel {
     fn take_registers(thread: &mut Thread, stop: &Stop, shown: Option<u64>, restart: &mut Restart) {
         let before = thread.state.ptrace.orig_rax;
         thread.cpu = stop.cpu.clone();
+        // PTRACE_SETSIGMASK: the mask, and no other to put back.
+        if let Some(mask) = stop.new_mask {
+            thread.state.signal_mask = mask;
+            thread.state.wait_restore_mask = None;
+        }
         if let Some(shown) = shown {
             if thread.cpu.gpr[reg::RAX] == shown {
                 thread.cpu.gpr[reg::RAX] = Errno(4).to_syscall_return();
@@ -771,6 +841,51 @@ impl Kernel {
         (self.group.status().is_some() && thread.state.exit_status.is_none())
             || self.group.killed()
             || thread.state.pending.iter().any(|s| s.number == SIGKILL)
+    }
+
+    /// The siginfo of each signal pending for the thread, then for its
+    /// process, in the order they came.
+    fn pending_siginfos(&self, thread: &Thread) -> (Vec<[u8; 128]>, Vec<[u8; 128]>) {
+        let info = |signal: &signals::PendingSignal| signals::siginfo(&thread.state, signal);
+        let queued = thread.state.pending.iter().map(info).collect();
+        let shared = self
+            .group
+            .process_pending_signals()
+            .iter()
+            .map(info)
+            .collect();
+        (queued, shared)
+    }
+
+    /// `SECCOMP_RET_TRACE` with the filter's `data` (`__seccomp_filter`):
+    /// without a tracer that asked for `PTRACE_EVENT_SECCOMP`, the call
+    /// returns `ENOSYS`; otherwise the thread stops for the event with
+    /// `data` as its message and `rax` at `-ENOSYS`. The call to run then,
+    /// which the filters see again, unless the thread was killed or the
+    /// tracer set `orig_rax` below 0, when it does not run and `rax` stays.
+    pub(crate) fn ptrace_seccomp(&mut self, thread: &mut Thread, data: u16) -> Option<u64> {
+        thread.cpu.gpr[reg::RAX] = Errno::ENOSYS.to_syscall_return();
+        let enabled = self.group.traced()
+            && self
+                .processes
+                .traces
+                .settings(thread.tid)
+                .is_some_and(|(_, options, _)| options & PTRACE_O_TRACESECCOMP != 0);
+        if !enabled {
+            return None;
+        }
+        self.ptrace_report(
+            thread,
+            SIGTRAP | PTRACE_EVENT_SECCOMP << 8,
+            u64::from(data),
+            &mut Restart::default(),
+        );
+        let number = thread.state.ptrace.orig_rax;
+        if self.fatal_pending(thread) || (number as i32) < 0 {
+            return None;
+        }
+        thread.cpu.gpr[reg::RAX] = number;
+        Some(u64::from(number as u32))
     }
 
     /// Linux's `ptrace_notify`: the thread stops with `code`, `SIGTRAP`
@@ -1178,19 +1293,36 @@ impl Kernel {
         else {
             return;
         };
-        let stopped = self.group.is_stopped();
-        let stop_signal = if stopped { self.group.stop_signal() } else { 0 };
         if seized {
-            let signal = if stopped { stop_signal } else { SIGTRAP };
-            let code = signal | PTRACE_EVENT_STOP << 8;
-            let info = notify_siginfo(
-                signal,
-                code,
-                self.pid_space(thread.tid).number(thread.tid),
-                thread.state.credentials.task_ids().uid,
-            );
-            self.ptrace_stop(thread, code, true, 0, Some(info), restart);
+            // A listening tracee woken by a change traps again at once.
+            loop {
+                let stopped = self.group.is_stopped();
+                let signal = if stopped {
+                    self.group.stop_signal()
+                } else {
+                    SIGTRAP
+                };
+                let code = signal | PTRACE_EVENT_STOP << 8;
+                let info = notify_siginfo(
+                    signal,
+                    code,
+                    self.pid_space(thread.tid).number(thread.tid),
+                    thread.state.credentials.task_ids().uid,
+                );
+                self.ptrace_stop(thread, code, true, 0, Some(info), restart);
+                let again = self
+                    .processes
+                    .traces
+                    .lock()
+                    .get_mut(&thread.tid)
+                    .is_some_and(|t| std::mem::take(&mut t.trap_stop));
+                if !again || self.fatal_pending(thread) {
+                    break;
+                }
+            }
         } else {
+            let stopped = self.group.is_stopped();
+            let stop_signal = if stopped { self.group.stop_signal() } else { 0 };
             let signal = if stopped { stop_signal } else { SIGSTOP };
             self.ptrace_stop(thread, signal, true, 0, None, restart);
         }
@@ -1498,6 +1630,118 @@ impl Kernel {
                 self.processes.changed().notify();
                 Ok(0)
             }
+            PTRACE_LISTEN => {
+                let seized = traces.lock().get(&tid).is_some_and(|t| t.seized);
+                traces.stopped(tid, |stop| {
+                    let event = stop.siginfo.map(|info| {
+                        i32::from_le_bytes([info[8], info[9], info[10], info[11]]) >> 8
+                    });
+                    if !seized || event != Some(PTRACE_EVENT_STOP) {
+                        return Err(Errno::EIO);
+                    }
+                    stop.listening = true;
+                    Ok(0)
+                })?;
+                self.processes.changed().notify();
+                Ok(0)
+            }
+            PTRACE_PEEKSIGINFO => {
+                let mut args = [0u8; 16];
+                get(addr, &mut args)?;
+                let offset = u64::from_le_bytes(args[..8].try_into().unwrap_or_default());
+                let flags = u32::from_le_bytes(args[8..12].try_into().unwrap_or_default());
+                let count = i32::from_le_bytes(args[12..].try_into().unwrap_or_default());
+                if flags & !PTRACE_PEEKSIGINFO_SHARED != 0 || count < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let list = traces.stopped(tid, |stop| {
+                    Ok(if flags & PTRACE_PEEKSIGINFO_SHARED != 0 {
+                        stop.shared.clone()
+                    } else {
+                        stop.queued.clone()
+                    })
+                })?;
+                let mut copied = 0u64;
+                for (slot, info) in list
+                    .iter()
+                    .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+                    .take(count as usize)
+                    .enumerate()
+                {
+                    if put(data.wrapping_add(slot as u64 * 128), info).is_err() {
+                        return if copied > 0 {
+                            Ok(copied)
+                        } else {
+                            Err(Errno::EFAULT)
+                        };
+                    }
+                    copied += 1;
+                }
+                Ok(copied)
+            }
+            PTRACE_GETSIGMASK => {
+                if addr != 8 {
+                    return Err(Errno::EINVAL);
+                }
+                let mask = traces.stopped(tid, |stop| Ok(stop.mask))?;
+                put(data, &mask.to_le_bytes())?;
+                Ok(0)
+            }
+            PTRACE_SETSIGMASK => {
+                if addr != 8 {
+                    return Err(Errno::EINVAL);
+                }
+                let mut mask = [0u8; 8];
+                get(data, &mut mask)?;
+                // Never SIGKILL or SIGSTOP.
+                let mask = u64::from_le_bytes(mask) & !(1 << (SIGKILL - 1) | 1 << (SIGSTOP - 1));
+                traces.stopped(tid, |stop| {
+                    stop.mask = mask;
+                    stop.new_mask = Some(mask);
+                    Ok(0)
+                })
+            }
+            PTRACE_GET_RSEQ_CONFIGURATION => {
+                let rseq = traces.stopped(tid, |stop| Ok(stop.rseq))?;
+                let mut conf = [0u8; 24];
+                if let Some(rseq) = rseq {
+                    conf[..8].copy_from_slice(&rseq.address.to_le_bytes());
+                    conf[8..12].copy_from_slice(&rseq.length.to_le_bytes());
+                    conf[12..16].copy_from_slice(&rseq.signature.to_le_bytes());
+                }
+                let length = usize::try_from(addr).unwrap_or(usize::MAX).min(conf.len());
+                if length != 0 {
+                    put(data, &conf[..length])?;
+                }
+                Ok(conf.len() as u64)
+            }
+            PTRACE_ARCH_PRCTL => match data {
+                ARCH_SET_FS | ARCH_SET_GS => {
+                    if addr >= TASK_SIZE_MAX {
+                        return Err(Errno::EPERM);
+                    }
+                    traces.stopped(tid, |stop| {
+                        if data == ARCH_SET_FS {
+                            stop.cpu.fs_base = addr;
+                        } else {
+                            stop.cpu.gs_base = addr;
+                        }
+                        Ok(0)
+                    })
+                }
+                ARCH_GET_FS | ARCH_GET_GS => {
+                    let base = traces.stopped(tid, |stop| {
+                        Ok(if data == ARCH_GET_FS {
+                            stop.cpu.fs_base
+                        } else {
+                            stop.cpu.gs_base
+                        })
+                    })?;
+                    put(addr, &base.to_le_bytes())?;
+                    Ok(0)
+                }
+                _ => Err(Errno::EINVAL),
+            },
             PTRACE_GET_SYSCALL_INFO => {
                 let (info, size) = traces.stopped(tid, |stop| Ok(syscall_info(stop)))?;
                 let length = size.min(usize::try_from(addr).unwrap_or(usize::MAX));
@@ -1530,7 +1774,7 @@ impl Kernel {
                     return Err(Errno::EIO);
                 }
                 if let Some(tracee) = traces.lock().get_mut(&tid)
-                    && tracee.stop.is_none()
+                    && tracee.stop.as_ref().is_none_or(|stop| stop.listening)
                 {
                     tracee.trap_stop = true;
                 }
@@ -1699,7 +1943,7 @@ impl Kernel {
             && tracee
                 .stop
                 .as_ref()
-                .is_none_or(|stop| stop.resumed.is_some())
+                .is_none_or(|stop| stop.resumed.is_some() || stop.listening)
         {
             return Err(Errno(3));
         }
@@ -1872,6 +2116,13 @@ mod tests {
             message: 0,
             code: SIGSTOP,
             resumed: None,
+            mask: 0,
+            new_mask: None,
+            queued: Vec::new(),
+            shared: Vec::new(),
+            rseq: None,
+            listening: false,
+            group_stopped: false,
         }
     }
 

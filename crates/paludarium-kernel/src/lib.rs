@@ -543,6 +543,11 @@ impl Kernel {
         thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
         match verdict {
             seccomp::Verdict::Allow | seccomp::Verdict::Notify(_) => Next::Resume,
+            // Decided before (`ptrace_seccomp`); ENOSYS as with no tracer.
+            seccomp::Verdict::Trace(_) => {
+                thread.cpu.gpr[reg::RAX] = paludarium_types::Errno::ENOSYS.to_syscall_return();
+                self.checkpoint(thread, mem)
+            }
             seccomp::Verdict::Return(value) => {
                 thread.cpu.gpr[reg::RAX] = value;
                 self.checkpoint(thread, mem)
@@ -1206,7 +1211,36 @@ impl Kernel {
         ];
         self.group.take_seccomp(thread.tid, &mut thread.state);
         if thread.state.seccomp.mode != 0 {
-            match seccomp::check(&thread.state.seccomp, number as u32, args, thread.cpu.rip.0) {
+            let mut verdict =
+                seccomp::check(&thread.state.seccomp, number as u32, args, thread.cpu.rip.0);
+            // SECCOMP_RET_TRACE: the tracer may change or skip the call,
+            // which the filters then see again (`__seccomp_filter`).
+            if let seccomp::Verdict::Trace(data) = verdict {
+                let Some(traced) = self.ptrace_seccomp(thread, data) else {
+                    thread.state.restart = None;
+                    thread.state.syscall_rax = thread.cpu.gpr[reg::RAX];
+                    return self.checkpoint(thread, mem);
+                };
+                number = traced;
+                args = [
+                    thread.cpu.gpr[reg::RDI],
+                    thread.cpu.gpr[reg::RSI],
+                    thread.cpu.gpr[reg::RDX],
+                    thread.cpu.gpr[reg::R10],
+                    thread.cpu.gpr[reg::R8],
+                    thread.cpu.gpr[reg::R9],
+                ];
+                verdict = match seccomp::check(
+                    &thread.state.seccomp,
+                    number as u32,
+                    args,
+                    thread.cpu.rip.0,
+                ) {
+                    seccomp::Verdict::Trace(_) => seccomp::Verdict::Allow,
+                    verdict => verdict,
+                };
+            }
+            match verdict {
                 seccomp::Verdict::Allow => {}
                 seccomp::Verdict::Notify(notify) => {
                     if let Some(next) = self.notify(thread, mem, number, &notify) {

@@ -3,7 +3,7 @@
 //! system call first runs the thread's classic BPF programs over its
 //! `seccomp_data`. The lowest action of all of them decides: kill the
 //! process or the thread with SIGSYS, a SIGSYS the thread may handle
-//! (TRAP), an errno, ENOSYS for TRACE (no tracer), a wait for the filter's
+//! (TRAP), an errno, the tracer's word for TRACE (ENOSYS without one), a wait for the filter's
 //! listener to answer (USER_NOTIF, ENOSYS once it has none), or the call
 //! itself (LOG, ALLOW).
 //!
@@ -316,6 +316,9 @@ pub(crate) enum Verdict {
     Allow,
     /// It does not run, and returns this value.
     Return(u64),
+    /// `SECCOMP_RET_TRACE` with this data: its tracer decides, if it asked
+    /// for `PTRACE_EVENT_SECCOMP`; otherwise it returns `ENOSYS`.
+    Trace(u16),
     /// It does not run, and SIGSYS with this siginfo is forced on the thread.
     Trap([u8; 48]),
     /// The thread, or the process when `process` or when it is the last
@@ -366,8 +369,9 @@ pub(crate) fn check(state: &Seccomp, number: u32, args: [u64; 6], rip: u64) -> V
                         data,
                     })
                 }
-                // No tracer, or a filter made without a listener.
-                RET_TRACE | RET_USER_NOTIF => Verdict::Return(Errno::ENOSYS.to_syscall_return()),
+                RET_TRACE => Verdict::Trace(value as u16),
+                // A filter made without a listener.
+                RET_USER_NOTIF => Verdict::Return(Errno::ENOSYS.to_syscall_return()),
                 RET_LOG | RET_ALLOW => Verdict::Allow,
                 action => Verdict::Kill {
                     process: action != RET_KILL_THREAD,

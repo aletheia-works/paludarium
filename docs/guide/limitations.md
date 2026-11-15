@@ -397,12 +397,12 @@ verified.
     both kinds are mixed.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
-  - `ptrace` has no single-stepping or listening yet:
-    `PTRACE_SINGLESTEP`, `PTRACE_SYSEMU_SINGLESTEP`, `PTRACE_LISTEN`,
-    `PTRACE_PEEKSIGINFO`, `PTRACE_GETSIGMASK`, `PTRACE_SETSIGMASK` and the
-    other requests the features do not list give `EIO`, and
-    `PTRACE_O_TRACESECCOMP` is taken without a stop (`SECCOMP_RET_TRACE`
-    gives `ENOSYS`, as with no tracer). A signal a tracer resumes a syscall
+  - `ptrace` has no single-stepping yet: `PTRACE_SINGLESTEP`,
+    `PTRACE_SYSEMU_SINGLESTEP` and the other requests the features do not
+    list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
+    as the emulator's `arch_prctl`, and gives `EINVAL` for the rest. A
+    `PTRACE_LISTEN` tracee notices the change of its group stop within
+    10 ms. A signal a tracer resumes a syscall
     stop with is taken by the thread that stopped, where Linux sends it to
     the process. The status `PTRACE_EVENT_EXIT` gives has no core-dump bit.
     `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without

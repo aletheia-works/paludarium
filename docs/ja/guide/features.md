@@ -3134,6 +3134,15 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   システムコール停止は持たずに始まります。`vfork` の親は、子が終了するか別のプログラムを
   実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
   `PTRACE_EVENT_EXIT` を報告し、それとともに終わるスレッドは報告しません。
+- `PTRACE_PEEKSIGINFO` は、止まっているトレース対象に、`PTRACE_PEEKSIGINFO_SHARED` 付きでは
+  そのプロセスに保留中のシグナルの siginfo を、来た順に読みます。`PTRACE_GETSIGMASK` は
+  ブロックしているシグナル（`sigsuspend` や `ppoll` の待ちの間は、戻すマスク）を示し、
+  `PTRACE_SETSIGMASK` は再開後のそれを設定します（SIGKILL と SIGSTOP は含めません）。
+  `PTRACE_LISTEN` は、グループ停止中の SEIZE されたトレース対象を、wait やほかの要求から
+  停止に見えないまま待たせます。グループ停止が終わるか始まり直すか、`PTRACE_INTERRUPT` が
+  来ると、もう一度 `PTRACE_EVENT_STOP` を報告します。`PTRACE_ARCH_PRCTL` は `arch_prctl` と
+  同じく `fs` と `gs` のベースを読み書きし、`PTRACE_GET_RSEQ_CONFIGURATION` はトレース対象の
+  `rseq` の登録を示します。
 - `PTRACE_SEIZE` でも `PTRACE_O_TRACEEXEC` でもなくトレースされたタスクは、`execve` の後に
   自分から `SIGTRAP` を受けます。リーダー以外のスレッドが `execve` すると、その後はリーダーの
   番号でトレースされます。トレーサーのスレッドが終了するとトレース対象は手放され、`PTRACE_O_EXITKILL` を設定したものは
@@ -3236,7 +3245,10 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `SECCOMP_RET_TRAP` は `SIGSYS` を強制し、`SYS_SECCOMP`、`si_errno` のデータ、
   呼び出しのアドレス、番号、アーキテクチャを渡し、`rax` には呼び出しの番号を戻します。
   `SECCOMP_RET_ERRNO` はデータ（4095 まで）をエラーとして返します。
-  `SECCOMP_RET_TRACE` は、トレーサーがないときと同じく `ENOSYS` です。
+  `SECCOMP_RET_TRACE` は、トレーサーが `PTRACE_O_TRACESECCOMP` で求めていれば、データを
+  イベントのメッセージにして `PTRACE_EVENT_SECCOMP` でスレッドを止めます。トレーサーは呼び出しを
+  変えるか、`orig_rax` を 0 未満にして飛ばせ、呼び出しはもう一度フィルターを通ります。そういう
+  トレーサーがなければ `ENOSYS` です。
   `SECCOMP_RET_USER_NOTIF` はフィルターのリスナー（下に書きます）の答えを待ち、
   フィルターにリスナーがなければ `ENOSYS` です。`SECCOMP_RET_LOG` と
   `SECCOMP_RET_ALLOW` は呼び出しをそのまま行います。`SECCOMP_FILTER_FLAG_TSYNC` は新しいフィルターを

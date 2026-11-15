@@ -3588,6 +3588,17 @@ one only with an `--allow-net`.
   A `vfork` parent reports `PTRACE_EVENT_VFORK_DONE` once its child has
   exited or run another program. The thread that ends its process reports
   `PTRACE_EVENT_EXIT`; the threads that end with it do not.
+- `PTRACE_PEEKSIGINFO` reads the siginfo of the signals pending for a
+  stopped tracee, or with `PTRACE_PEEKSIGINFO_SHARED` for its process, in
+  the order they came. `PTRACE_GETSIGMASK` shows the signals it blocks
+  (the mask a `sigsuspend` or `ppoll` puts back while it waits), and
+  `PTRACE_SETSIGMASK` sets them, never SIGKILL or SIGSTOP, for when it goes
+  on. `PTRACE_LISTEN` lets a seized tracee in a group stop wait there
+  without being in a stop that wait or another request sees, until the
+  group stop ends or begins again or `PTRACE_INTERRUPT` comes, when it
+  reports `PTRACE_EVENT_STOP` again. `PTRACE_ARCH_PRCTL` reads and sets the
+  `fs` and `gs` bases as `arch_prctl` does, and
+  `PTRACE_GET_RSEQ_CONFIGURATION` shows the tracee's `rseq` registration.
 - After `execve`, a task traced without `PTRACE_SEIZE` or
   `PTRACE_O_TRACEEXEC` gets `SIGTRAP` from itself. A thread other than the
   leader that runs `execve` is traced by the leader's number after it. A
@@ -3704,7 +3715,11 @@ one only with an `--allow-net`.
   `SECCOMP_RET_TRAP` forces a `SIGSYS` with `SYS_SECCOMP`, the data in
   `si_errno`, the call's address, number and architecture, and the call's
   number back in `rax`; `SECCOMP_RET_ERRNO` returns its data, at most 4095,
-  as an error; `SECCOMP_RET_TRACE` gives `ENOSYS`, as with no tracer;
+  as an error; `SECCOMP_RET_TRACE` stops the thread for its tracer with
+  `PTRACE_EVENT_SECCOMP` and the data as the event's message if the tracer
+  asked for it with `PTRACE_O_TRACESECCOMP`, and the call, which the tracer
+  may change or skip by setting `orig_rax` below 0, runs past the filters
+  again; without such a tracer it gives `ENOSYS`;
   `SECCOMP_RET_USER_NOTIF` waits for the filter's listener (below), or gives
   `ENOSYS` when the filter has none; `SECCOMP_RET_LOG` and
   `SECCOMP_RET_ALLOW` run the call. `SECCOMP_FILTER_FLAG_TSYNC` gives the new

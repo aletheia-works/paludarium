@@ -208,6 +208,7 @@
     {"name":"late-handler","binary":"process"},
     {"name":"mincore","binary":"process"},
     {"name":"pagemap","binary":"process"},
+    {"name":"proc-owners","binary":"process"},
     {"name":"memory-locks","binary":"process"},
     {"name":"proc-maps","binary":"process"},
     {"name":"fifo","binary":"process"},

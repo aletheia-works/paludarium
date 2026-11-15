@@ -2513,7 +2513,17 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
   `root`, `maps`, `mounts`, `mountinfo`, `smaps`, `pagemap`, `fd`, `fdinfo`,
-  `ns` and `task`. `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
+  `ns` and `task`. They and the directory are owned by the process's
+  effective user and group, or by root once it is not dumpable (after a
+  change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
+  gives them; `/proc/self` itself is root's. `stat` shows that owner and
+  the mode, 0400 for `environ` and `pagemap` and 0444 for the other files,
+  and `fstat` of an open one the owner it had when it was opened, where
+  Linux's is the owner of that moment. An open checks the mode for that owner, as Linux's
+  `generic_permission` does, so opening one for writing is `EACCES` without
+  `CAP_DAC_OVERRIDE`, and so is reading `environ` or `pagemap` once the
+  process is not dumpable; root's write to one it opened is `EINVAL`.
+  `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
   unmarked; `maps` and `smaps` name a mapped file the same way. `status`

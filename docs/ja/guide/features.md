@@ -2183,7 +2183,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
   `cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、`fd`、`fdinfo`、`ns`、
-  `task` があります。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  `task` があります。これらとディレクトリの持ち主は、Linux の `task_dump_owner` と同じく
+  プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
+  `PR_SET_DUMPABLE` まで）root です。`/proc/self` そのものは root のものです。`stat` は
+  その持ち主とモード（`environ` と `pagemap` は 0400、ほかのファイルは 0444）を示し、
+  開いたものの `fstat` は開いたときの持ち主を示します。Linux はその時点の持ち主です。開くときは Linux の `generic_permission` と同じくその
+  持ち主に対してモードを確かめるので、`CAP_DAC_OVERRIDE` なしに書き込み用に開くと
+  `EACCES` で、ダンプできないプロセスが `environ` や `pagemap` を読むために開いても
+  `EACCES` です。root が開いたものへの書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を

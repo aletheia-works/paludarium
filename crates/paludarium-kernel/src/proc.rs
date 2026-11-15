@@ -839,6 +839,10 @@ pub(crate) struct GeneratedFile {
     /// A system-wide file, of size 0 as Linux's `proc_create` files are,
     /// whose reads go to the end of its content.
     entry: bool,
+    /// The mode and owner `fstat` gives with the content's size, those of
+    /// the file it was opened as ([`Self::with_stat`]); a plain 0444 file of
+    /// root's without.
+    stat: Option<FileStat>,
 }
 impl GeneratedFile {
     /// The files are 0444, but the guest is root, which may open them for
@@ -859,6 +863,15 @@ impl GeneratedFile {
             position: Mutex::new(0),
             write_error: (flags & 3 != 0).then_some(error),
             entry,
+            stat: None,
+        }
+    }
+    /// The same, with the mode and owner of `stat`, the file it is
+    /// (a process's own file is its owner's, as Linux's `task_dump_owner`).
+    pub(crate) fn with_stat(self, stat: FileStat) -> Self {
+        Self {
+            stat: Some(stat),
+            ..self
         }
     }
     /// Whether it is a system-wide file, which reads go to the end of
@@ -900,10 +913,13 @@ impl FileHandle for GeneratedFile {
         Ok(target as u64)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(if self.entry {
-            entry_stat()
-        } else {
-            stat(self.content.len())
+        Ok(match self.stat {
+            Some(file) => FileStat {
+                size: self.content.len() as u64,
+                ..file
+            },
+            None if self.entry => entry_stat(),
+            None => stat(self.content.len()),
         })
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
@@ -1085,6 +1101,8 @@ pub(crate) struct MapsFile {
     root: Vec<u8>,
     writable: bool,
     position: Mutex<MapsPosition>,
+    /// Its owner's user and group ([`Self::owned`]).
+    owner: (u32, u32),
 }
 impl MapsFile {
     pub(crate) fn open(memory: MemoryView, start_stack: u64, flags: u32, root: Vec<u8>) -> Self {
@@ -1111,6 +1129,14 @@ impl MapsFile {
                 position: 0,
                 buffer: MAPS_BUFFER,
             }),
+            owner: (0, 0),
+        }
+    }
+    /// The same, owned by `uid` and `gid`, as `fstat` shows it.
+    pub(crate) fn owned(self, (uid, gid): (u32, u32)) -> Self {
+        Self {
+            owner: (uid, gid),
+            ..self
         }
     }
     /// The line of the VMA at `next` or after it, and where the next starts.
@@ -1230,7 +1256,12 @@ impl FileHandle for MapsFile {
     }
     /// Size 0, as Linux's /proc: a reader goes by what `read` gives.
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(stat(0))
+        let (uid, gid) = self.owner;
+        Ok(FileStat {
+            uid,
+            gid,
+            ..stat(0)
+        })
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)
@@ -1258,13 +1289,16 @@ pub(crate) struct PagemapFile {
     memory: MemoryView,
     writable: bool,
     position: Mutex<u64>,
+    /// Its owner's user and group, as `fstat` shows them.
+    owner: (u32, u32),
 }
 impl PagemapFile {
-    pub(crate) fn open(memory: MemoryView, flags: u32) -> Self {
+    pub(crate) fn open(memory: MemoryView, flags: u32, owner: (u32, u32)) -> Self {
         Self {
             memory,
             writable: flags & 3 != 0,
             position: Mutex::new(0),
+            owner,
         }
     }
 }
@@ -1329,7 +1363,12 @@ impl FileHandle for PagemapFile {
     }
     /// Size 0 and only its owner may read it, as Linux's (0400).
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(private_stat(0))
+        let (uid, gid) = self.owner;
+        Ok(FileStat {
+            uid,
+            gid,
+            ..private_stat(0)
+        })
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)
@@ -1413,7 +1452,7 @@ mod tests {
         mem.read(GuestAddr(0x11000), &mut byte).unwrap();
         mem.write(GuestAddr(0x12000), b"x").unwrap();
         mem.guard(GuestAddr(0x13000), 0x14000, true).unwrap();
-        let file = PagemapFile::open(mem.view(), 0);
+        let file = PagemapFile::open(mem.view(), 0, (0, 0));
         assert_eq!(
             pagemap_entries(&file, at.0 - 0x1000, 7),
             [
@@ -1429,7 +1468,7 @@ mod tests {
         // `fork` shares the written page until either writes it.
         let child = mem.fork();
         assert_eq!(pagemap_entries(&file, 0x12000, 1), [SOFT_DIRTY | PRESENT]);
-        let theirs = PagemapFile::open(child.view(), 0);
+        let theirs = PagemapFile::open(child.view(), 0, (0, 0));
         assert_eq!(pagemap_entries(&theirs, 0x12000, 1), [SOFT_DIRTY | PRESENT]);
         child.write(GuestAddr(0x12000), b"y").unwrap();
         assert_eq!(
@@ -1441,7 +1480,7 @@ mod tests {
     #[test]
     fn pagemap_reads_whole_entries_up_to_the_end_of_user_space() {
         let mem = AddressSpace::new();
-        let file = PagemapFile::open(mem.view(), 0);
+        let file = PagemapFile::open(mem.view(), 0, (0, 0));
         let mut buf = [0xffu8; 16];
         assert_eq!(file.read_at(4, &mut buf[..8]), Err(Errno::EINVAL));
         assert_eq!(file.read_at(8, &mut buf[..12]), Err(Errno::EINVAL));

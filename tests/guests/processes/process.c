@@ -12206,7 +12206,20 @@ static int sysvipc_work(void) {
     int r = stat("/proc/sysvipc", &st);
     printf("dir stat=%d mode=%o\n", r, st.st_mode);
     r = stat("/proc/sysvipc/shm", &st);
-    printf("file stat=%d mode=%o uid=%d\n", r, st.st_mode, st.st_uid);
+    printf("file stat=%d mode=%o uid=%d size=%ld\n", r, st.st_mode, st.st_uid, (long)st.st_size);
+    /* Size 0, as /proc's other files of the system, open or not. */
+    const char *sized[] = {"/proc/sysvipc/msg", "/proc/loadavg", "/proc/meminfo"};
+    for (int i = 0; i < 3; i++) {
+        int fd = open(sized[i], O_RDONLY);
+        struct stat open_st = {0};
+        r = stat(sized[i], &st);
+        int f = fstat(fd, &open_st);
+        char text[4096];
+        long n = read(fd, text, sizeof text);
+        printf("%s stat=%d size=%ld fstat=%d size=%ld read-some=%d\n", sized[i], r, (long)st.st_size, f,
+               (long)open_st.st_size, n > 0);
+        close(fd);
+    }
     errno = 0;
     r = stat("/proc/sysvipc/other", &st);
     printf("missing stat=%d errno=%d\n", r, errno);

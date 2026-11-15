@@ -4241,6 +4241,14 @@ mod shm {
     #[test]
     fn proc_sysvipc_lists_the_namespace_s_objects_as_linux_prints_them() {
         let (mut k, mut t, m) = setup();
+        // Size 0, as Linux's, but read to the end.
+        const STAT: u64 = DATA + 0x900;
+        m.write(GuestAddr(STAT), b"/proc/sysvipc/shm\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 4, [STAT, DATA + 0x200, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(m.read_u64(GuestAddr(DATA + 0x200 + 48)).unwrap(), 0);
         let shm_header = "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
         assert_eq!(
             read_proc(&mut k, &mut t, &m, "/proc/sysvipc/shm"),

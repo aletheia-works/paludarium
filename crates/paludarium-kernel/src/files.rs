@@ -1865,14 +1865,16 @@ fn positioned(
     }
     Ok(file)
 }
-/// Where reads of a regular file stop: at its size, but for `maps`, which
-/// and `smaps`, which say 0 as Linux's /proc does and end where their
-/// `read` does.
+/// Where reads of a regular file stop: at its size, but for `maps` and
+/// `smaps`, and /proc's system-wide files, which say 0 as Linux's /proc
+/// does and end where their `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
-    if file
-        .as_any()
-        .is_some_and(|file| file.is::<crate::proc::MapsFile>())
-    {
+    if file.as_any().is_some_and(|file| {
+        file.is::<crate::proc::MapsFile>()
+            || file
+                .downcast_ref::<crate::proc::GeneratedFile>()
+                .is_some_and(crate::proc::GeneratedFile::is_entry)
+    }) {
         u64::MAX
     } else {
         metadata.size
@@ -7033,9 +7035,8 @@ fn other_generated_stat(
             SMALL_BLOCK_SIZE,
         ));
     }
-    if let Some(entry) = crate::proc::system_entry(path) {
-        let length = system_file(c, entry).len();
-        return Some((crate::proc::stat(length), device(c, path), SMALL_BLOCK_SIZE));
+    if crate::proc::system_entry(path).is_some() {
+        return Some((crate::proc::entry_stat(), device(c, path), SMALL_BLOCK_SIZE));
     }
     if tasks::is_root(path) {
         return Some((

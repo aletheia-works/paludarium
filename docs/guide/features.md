@@ -2441,6 +2441,9 @@ kernel.
   - A segment's line adds the bytes of its pages in memory, and 0 swapped.
   - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
     once their process is gone, as the object keeps its `struct pid`.
+- These system files (`loadavg`, `meminfo`, `stat`, `uptime` and
+  `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
+  read goes on to the end of what they hold.
 - Root may open these system files for writing, but a write gives `EIO`,
   as Linux's `pde_write` gives for a file without a write operation. A
   process's own files give `EINVAL`.

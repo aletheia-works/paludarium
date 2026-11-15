@@ -25,6 +25,11 @@ pub(crate) fn stat(length: usize) -> FileStat {
         ..FileStat::default()
     }
 }
+/// A system-wide file's `stat` (`/proc/loadavg`, `/proc/sysvipc/shm`): a
+/// regular 0444 file of size 0, as Linux's `proc_create` makes them.
+pub(crate) fn entry_stat() -> FileStat {
+    stat(0)
+}
 /// `environ`'s `stat`: as [`stat`], but 0400, as Linux keeps it to the
 /// process's owner.
 pub(crate) fn private_stat(length: usize) -> FileStat {
@@ -779,29 +784,41 @@ pub(crate) struct GeneratedFile {
     position: Mutex<usize>,
     /// What a write gives on a descriptor opened for writing.
     write_error: Option<Errno>,
+    /// A system-wide file, of size 0 as Linux's `proc_create` files are,
+    /// whose reads go to the end of its content.
+    entry: bool,
 }
 impl GeneratedFile {
     /// The files are 0444, but the guest is root, which may open them for
     /// writing anyway; the write itself then fails, as on Linux: `EINVAL`
     /// for a process's own file, which has no write operation at all.
     pub(crate) fn open(content: Vec<u8>, flags: u32) -> Self {
-        Self::failing_writes(content, flags, Errno::EINVAL)
+        Self::failing_writes(content, flags, Errno::EINVAL, false)
     }
-    /// A system-wide file, which Linux makes with `proc_create` and whose
-    /// writes go through `proc_reg_write` to `pde_write`: `EIO` without a
-    /// `proc_write`.
+    /// A system-wide file, which Linux makes with `proc_create`: of size 0
+    /// ([`entry_stat`]), and its writes go through `proc_reg_write` to
+    /// `pde_write`, `EIO` without a `proc_write`.
     pub(crate) fn open_entry(content: Vec<u8>, flags: u32) -> Self {
-        Self::failing_writes(content, flags, Errno::EIO)
+        Self::failing_writes(content, flags, Errno::EIO, true)
     }
-    fn failing_writes(content: Vec<u8>, flags: u32, error: Errno) -> Self {
+    fn failing_writes(content: Vec<u8>, flags: u32, error: Errno, entry: bool) -> Self {
         Self {
             content,
             position: Mutex::new(0),
             write_error: (flags & 3 != 0).then_some(error),
+            entry,
         }
+    }
+    /// Whether it is a system-wide file, which reads go to the end of
+    /// rather than to its size.
+    pub(crate) fn is_entry(&self) -> bool {
+        self.entry
     }
 }
 impl FileHandle for GeneratedFile {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
         let rest = self.content.get(*position..).unwrap_or(&[]);
@@ -831,7 +848,11 @@ impl FileHandle for GeneratedFile {
         Ok(target as u64)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(stat(self.content.len()))
+        Ok(if self.entry {
+            entry_stat()
+        } else {
+            stat(self.content.len())
+        })
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)

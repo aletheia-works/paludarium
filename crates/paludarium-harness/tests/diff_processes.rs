@@ -129,7 +129,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -200,6 +200,7 @@ mod linux {
                     | "route-selectors"
                     | "address-lifetimes"
                     | "neighbours"
+                    | "neighbour-requests"
                     | "mctp-sockets"
                     | "netlink-strict"
                     | "link-attributes"
@@ -214,6 +215,7 @@ mod linux {
                     | "ext-ack-route-metrics"
                     | "ext-ack-route-selectors"
                     | "ext-ack-address-lifetimes"
+                    | "ext-ack-neighbour-requests"
                     | "ext-ack-netlink-strict"
                     | "ext-ack-link-attributes"
                     | "ext-ack-generic-netlink"
@@ -362,6 +364,7 @@ mod linux {
         processes_route_selectors => ("route-selectors","process"),
         processes_address_lifetimes => ("address-lifetimes","process"),
         processes_neighbours => ("neighbours","process"),
+        processes_neighbour_requests => ("neighbour-requests","process"),
         processes_mctp_sockets => ("mctp-sockets","process"),
         processes_netlink_strict => ("netlink-strict","process"),
         processes_link_attributes => ("link-attributes","process"),
@@ -376,6 +379,7 @@ mod linux {
         processes_ext_ack_route_metrics => ("ext-ack-route-metrics","process"),
         processes_ext_ack_route_selectors => ("ext-ack-route-selectors","process"),
         processes_ext_ack_address_lifetimes => ("ext-ack-address-lifetimes","process"),
+        processes_ext_ack_neighbour_requests => ("ext-ack-neighbour-requests","process"),
         processes_ext_ack_netlink_strict => ("ext-ack-netlink-strict","process"),
         processes_ext_ack_link_attributes => ("ext-ack-link-attributes","process"),
         processes_ext_ack_generic_netlink => ("ext-ack-generic-netlink","process"),

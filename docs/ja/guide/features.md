@@ -1597,6 +1597,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     IPv6 は自分のアドレスにだけ bind できます。IPv4 にまだローカルの表がなければ、Linux の
     `inet_addr_type` がそのときどのアドレスもブロードキャストと見るのと同じく、ソケットは
     どの IPv4 のアドレスにも bind できます。
+  - **近隣:** `RTM_GETNEIGH` のダンプは、`neigh_dump_info` と同じくループバックの近隣
+    （下の通知の項のとおり、通信が作るもの）を返します。それぞれは、消えるときに伝える
+    `RTM_DELNEIGH` と同じ形の `RTM_NEWNEIGH` です。`AF_UNSPEC` では ARP（IPv4）の
+    ものに続けて近隣探索（IPv6）のものを、`AF_INET` と `AF_INET6` ではそのファミリーの
+    ものを返し、ほかのファミリーでは何も返しません。フラグが `NTF_PROXY` の `ndmsg` は
+    代理のエントリを求めますが、それはありません。`NDA_IFINDEX` と `NDA_MASTER` は
+    ダンプを絞り、どのメッセージにも `NLM_F_DUMP_FILTERED` を付けます。`lo` の番号の 1
+    と、マスターの -1（マスターなし）なら近隣を残し、ほかの値では何も返しません。
+    厳しく調べるときは、`neigh_valid_dump_req` と同じく、短い `ndmsg`、詰め物・番号・
+    状態・型・`NTF_PROXY` 以外のフラグを持つ `ndmsg`、ほかの属性は `EINVAL` です。
+    調べないときは、属性が `nda_policy` に合わないダンプは絞りません。`AF_MCTP` の
+    ダンプは近隣を返しません（`mctp_rtm_getneigh` と同じく、短い `ndmsg` は `EINVAL`）。
+    ダンプでないリクエストは、`neigh_get` と同じく、ファミリーとキー（`NDA_DST`）と
+    `lo` の番号で 1 つの近隣を指し、答えは引き当てが持つ参照も数えます。キーがない
+    （`NLMSGERR_ATTR_MISS_TYPE` で伝えます）、ほかの属性がある、キーの長さが違う、
+    デバイスがない、詰め物・状態・型・`NTF_PROXY` 以外のフラグがあるものは `EINVAL`、
+    IPv4 と IPv6 以外のファミリーは `EAFNOSUPPORT`、ほかのデバイスは `ENODEV`、`lo` に
+    ない近隣と代理のエントリは `ENOENT` です。
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
     `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
     1 から 39 で（0 とそれを超えるものは `EINVAL`、マルチキャストの経路の 30 と 31 には

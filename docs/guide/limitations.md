@@ -572,7 +572,10 @@ verified.
   of the host's kernel and modules (`ethtool`, `nl80211`, `devlink` and
   others), so a lookup of one is `ENOENT` and a socket has 64 groups
   however many those take. Of `NETLINK_ROUTE` there
-  are only the link, address and route requests: neighbours, rules, queueing
+  are only the link, address and route requests and the neighbour dumps
+  and gets: adding and removing neighbours (`RTM_NEWNEIGH`,
+  `RTM_DELNEIGH`), the neighbour tables (`RTM_GETNEIGHTBL`), a bridge's
+  forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`), rules, queueing
   disciplines and the rest are `EOPNOTSUPP`, as are an input route
   lookup (`RTA_IIF`, as `ip route get ... iif` sends), renaming `lo`
   and setting any other attribute of it. A
@@ -621,9 +624,10 @@ verified.
   Linux. A neighbour is made by UDP and TCP's handshakes alone, which are
   the only packets paludarium sends through `lo` (a TCP handshake retried
   into a full backlog makes none of its answer), and never times out
-  (`gc_thresh1` is never reached); neighbours are not dumped
-  (`RTM_GETNEIGH` is `EOPNOTSUPP`), and their cache information counts
-  from when each was made.
+  (`gc_thresh1` is never reached). A dump gives a family's neighbours
+  the newest first, where Linux gives them in the order of its hash
+  table, which a random key sets; their cache information counts from
+  when each was made.
   `NETLINK_PKTINFO`, `NETLINK_NO_ENOBUFS` and the other options not
   listed in the features are `ENOPROTOOPT`. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries

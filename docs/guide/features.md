@@ -1842,6 +1842,29 @@ kernel.
     makes) every address of its prefix; IPv6 binds only to its addresses.
     Before IPv4 has a local table, a socket binds to any IPv4 address, as
     Linux's `inet_addr_type` takes each as broadcast then.
+  - **Neighbours:** `RTM_GETNEIGH` dumps the loopback's neighbours (those
+    its traffic makes, as the notifications below tell) as
+    `neigh_dump_info` does, each an `RTM_NEWNEIGH` like the `RTM_DELNEIGH`
+    that tells of it as it goes: ARP's (IPv4's) and then neighbour
+    discovery's (IPv6's) for `AF_UNSPEC`, the one family's for `AF_INET`
+    or `AF_INET6`, and none for another family. An `ndmsg` whose flags
+    are `NTF_PROXY` asks for the proxy entries, of which there are none.
+    `NDA_IFINDEX` and `NDA_MASTER` narrow a dump, and mark each message
+    `NLM_F_DUMP_FILTERED`: `lo`'s index, 1, and a master of -1 (no master)
+    keep the neighbours, and any other shows none. Strictly, as
+    `neigh_valid_dump_req` checks, an `ndmsg` that is short or has
+    padding, an index, a state, a type or a flag but `NTF_PROXY`, and any
+    other attribute, are `EINVAL`; unchecked, a dump whose attributes
+    break `nda_policy` is not narrowed. An `AF_MCTP` dump shows no
+    neighbours (`EINVAL` for a short `ndmsg`, as `mctp_rtm_getneigh`).
+    Without a dump, as `neigh_get`, the request names one neighbour by its
+    family, key (`NDA_DST`) and `lo`'s index, and the answer counts the
+    reference the lookup holds. It is `EINVAL` without the key (told of
+    with `NLMSGERR_ATTR_MISS_TYPE`), with another attribute, a key of
+    another length, no device, or padding, a state, a type or a flag but
+    `NTF_PROXY`; `EAFNOSUPPORT` for a family but IPv4's and IPv6's;
+    `ENODEV` for another device; and `ENOENT` for a neighbour `lo` has
+    not, and for a proxy entry.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the

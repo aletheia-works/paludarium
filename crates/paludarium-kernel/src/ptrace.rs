@@ -978,7 +978,9 @@ impl Kernel {
         next
     }
 
-    /// The task a `clone` made has started: the thread reports the event
+    /// The task a `clone` made has started, or failed to (`started`), when
+    /// the call fails and no event is reported, as in Linux's
+    /// `kernel_clone`. Once it started, the thread reports the event
     /// its tracer asked for with the task as its tracer's PID namespace
     /// numbers it, waits for a `vfork` child to exec or exit, then reports
     /// `PTRACE_EVENT_VFORK_DONE`, as Linux's `kernel_clone` does; its
@@ -988,9 +990,14 @@ impl Kernel {
     /// # Errors
     ///
     /// As [`Kernel::wait_vfork`].
-    pub fn child_started(&mut self, thread: &mut Thread, kill: &AtomicBool) -> Result<(), Errno> {
+    pub fn child_started(
+        &mut self,
+        thread: &mut Thread,
+        started: bool,
+        kill: &AtomicBool,
+    ) -> Result<(), Errno> {
         thread.state.ptrace.hold = false;
-        let cloned = thread.state.ptrace.clone.take();
+        let cloned = thread.state.ptrace.clone.take().filter(|_| started);
         let tid = thread.tid;
         let number = |kernel: &Self, child: u32| {
             kernel

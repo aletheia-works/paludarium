@@ -197,7 +197,6 @@ fn descriptors_permission(c: &Context<'_>, task: &Task, mask: u32) -> Result<(),
     let stat = task.owned(crate::proc::descriptors_stat());
     crate::permissions::permission(&c.process.credentials, &stat, mask)
 }
-/// Descriptor `n` of the task while it is open; none once it has ended.
 /// Whose the task's descriptors are ([`super::Holder`]); `None` once it has
 /// ended.
 pub(super) fn holder(task: &Task) -> Option<super::Holder> {
@@ -205,6 +204,7 @@ pub(super) fn holder(task: &Task) -> Option<super::Holder> {
         .then(|| task.public.files.holder(task.pid))
         .flatten()
 }
+/// Descriptor `n` of the task while it is open; none once it has ended.
 pub(super) fn descriptor(task: &Task, n: u32) -> Option<super::Descriptor> {
     task.live()
         .then(|| task.public.files.descriptor(n))

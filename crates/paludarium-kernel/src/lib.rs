@@ -1085,19 +1085,22 @@ impl Kernel {
                 })
             }
             // Past the end of a mapped file: BUS_ADRERR, with the page
-            // fault's trap and error code, as Linux's do_sigbus sends it.
+            // fault's trap and error code, as Linux's do_sigbus sends it; a
+            // poisoned page BUS_MCEERR_AR, whose `si_addr_lsb` is the page
+            // shift ([`signals::siginfo`]).
             ExitReason::BusError {
                 rip,
                 addr,
                 write,
                 fetch,
                 present,
+                poison,
             } => {
                 thread.cpu.rip = rip;
                 Some(signals::PendingSignal {
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGBUS,
-                    code: 2,
+                    code: if poison { signals::BUS_MCEERR_AR } else { 2 },
                     addr: addr.0,
                     trap: 14,
                     error: 4

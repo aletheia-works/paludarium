@@ -228,7 +228,7 @@ pub enum ExitReason {
         present: bool,
     },
     /// A memory access reached a page of a file mapping wholly past the end
-    /// of its file (SIGBUS, as on Linux).
+    /// of its file, or a poisoned page (SIGBUS, as on Linux).
     BusError {
         rip: GuestAddr,
         addr: GuestAddr,
@@ -237,6 +237,9 @@ pub enum ExitReason {
         fetch: bool,
         /// Resident user page captured by the MMU when it faulted.
         present: bool,
+        /// The page is poisoned (`UFFDIO_POISON`): Linux's
+        /// `VM_FAULT_HWPOISON`, SIGBUS with `BUS_MCEERR_AR`.
+        poison: bool,
     },
     /// The instruction could not be decoded or is not implemented (SIGILL).
     InvalidOpcode {

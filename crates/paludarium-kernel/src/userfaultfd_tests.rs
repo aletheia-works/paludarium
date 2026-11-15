@@ -19,11 +19,13 @@ const WAKE: u64 = 0x8010_aa02;
 const COPY: u64 = 0xc028_aa03;
 const ZEROPAGE: u64 = 0xc020_aa04;
 const WRITEPROTECT: u64 = 0xc018_aa06;
+const POISON: u64 = 0xc020_aa08;
 
 const NONBLOCK: u64 = 0o4000;
 const SIGBUS: u64 = 1 << 7;
 const THREAD_ID: u64 = 1 << 8;
 const EXACT_ADDRESS: u64 = 1 << 11;
+const FEATURE_POISON: u64 = 1 << 14;
 
 struct Fixture {
     kernel: Kernel,
@@ -186,7 +188,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ret(16, &[fd, API, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, API, &[0xaa, SIGBUS | THREAD_ID, 0]);
     assert_eq!(ret, 0);
-    assert_eq!(out, vec![0xaa, 0x9b1, 1 << 63 | 3]);
+    assert_eq!(out, vec![0xaa, 0x49b1, 1 << 63 | 3]);
     assert_eq!(
         f.ioctl(fd, API, &[0xaa, 0, 0]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
@@ -194,7 +196,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ioctl(fd, 0xc018_aa3e, &[0, 0, 0]).0, errno(Errno::EINVAL));
     assert!(
         f.fdinfo(fd)
-            .ends_with("pending:\t0\ntotal:\t0\nAPI:\taa:80000180:800000000000005f\n")
+            .ends_with("pending:\t0\ntotal:\t0\nAPI:\taa:80000180:800000000000015f\n")
     );
     // Read, write and seek of the file.
     assert_eq!(f.ret(0, &[fd, ARG, 32]), errno(Errno::EAGAIN));
@@ -227,7 +229,7 @@ fn uffdio_register_checks_the_range_and_its_vmas() {
     assert_eq!(f.ioctl(fd, REGISTER, &[0x4000_0000, PAGE, 1, 0]).0, einval);
     assert_eq!(f.ret(16, &[fd, REGISTER, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, REGISTER, &[AREA + PAGE, 2 * PAGE, 1, 0]);
-    assert_eq!((ret, out[3]), (0, 0x1c));
+    assert_eq!((ret, out[3]), (0, 0x11c));
     assert!(f.userfault(AREA).is_none());
     assert_eq!(f.userfault(AREA + PAGE).map(|u| u.modes), Some(1));
     assert!(f.userfault(AREA + 3 * PAGE).is_none());
@@ -475,7 +477,7 @@ fn a_write_to_a_write_protected_page_faults_until_the_protection_ends() {
     );
     f.mem.write(GuestAddr(AREA), b"a").unwrap();
     let (ret, out) = f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 3, 0]);
-    assert_eq!((ret, out[3]), (0, 0x5c));
+    assert_eq!((ret, out[3]), (0, 0x15c));
     assert_eq!(
         f.userfault(AREA).map(|u| u.modes),
         Some(Userfault::MISSING | Userfault::WP)
@@ -571,4 +573,72 @@ fn a_write_to_a_write_protected_page_faults_until_the_protection_ends() {
     assert!(f.mem.write(GuestAddr(AREA), b"e").is_err());
     assert_eq!(f.ioctl(fd, UNREGISTER, &[AREA, PAGE]).0, 0);
     f.mem.write(GuestAddr(AREA), b"e").unwrap();
+}
+
+#[test]
+fn uffdio_poison_poisons_pages_that_have_none() {
+    let mut f = fixture();
+    let fd = f.ready(0, FEATURE_POISON);
+    // A range no userfaultfd registered.
+    assert_eq!(
+        f.ioctl(fd, POISON, &[AREA, PAGE, 0, 0]),
+        (
+            errno(Errno::ENOENT),
+            vec![AREA, PAGE, 0, errno(Errno::ENOENT)]
+        )
+    );
+    f.mem.write(GuestAddr(AREA + PAGE), b"x").unwrap();
+    assert_eq!(f.register(fd, AREA, 2 * PAGE), 0);
+    // DONTWAKE is the only mode, and the range is whole pages.
+    assert_eq!(
+        f.ioctl(fd, POISON, &[AREA, PAGE, 2, 0]).0,
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ioctl(fd, POISON, &[AREA + 1, PAGE, 0, 0]).0,
+        errno(Errno::EINVAL)
+    );
+    // It stops at a page that has an entry, short of the range.
+    assert_eq!(
+        f.ioctl(fd, POISON, &[AREA, 2 * PAGE, 0, 0]),
+        (errno(Errno::EAGAIN), vec![AREA, 2 * PAGE, 0, PAGE])
+    );
+    assert_eq!(
+        f.ioctl(fd, COPY, &[AREA, SRC, PAGE, 0, 0]).1[4],
+        errno(Errno::EEXIST)
+    );
+    // A system call's copy is EFAULT, MADV_POPULATE_READ EHWPOISON.
+    assert_eq!(f.ret(1, &[1, AREA, 1]), errno(Errno::EFAULT));
+    assert_eq!(f.ret(28, &[AREA, PAGE, 22]), errno(Errno(133)));
+    // An access raises SIGBUS with BUS_MCEERR_AR and the page's shift.
+    let act = DATA + 0x200;
+    let words: Vec<u8> = [0x5000u64, 0x0400_0004, 0x5100, 0]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    f.mem.write(GuestAddr(act), &words).unwrap();
+    assert_eq!(f.ret(13, &[7, act, 0, 8]), 0);
+    f.thread.cpu.gpr[reg::RSP] = DATA + 0x6000;
+    let reason = ExitReason::BusError {
+        rip: GuestAddr(0x1234),
+        addr: GuestAddr(AREA + 5),
+        write: false,
+        fetch: false,
+        present: false,
+        poison: true,
+    };
+    assert_eq!(f.kernel.handle(&mut f.thread, &f.mem, reason), Next::Resume);
+    let mut info = [0u8; 32];
+    f.mem
+        .read(GuestAddr(f.thread.cpu.gpr[reg::RSI]), &mut info)
+        .unwrap();
+    assert_eq!(info[0..4], 7u32.to_le_bytes());
+    assert_eq!(info[8..12], 4u32.to_le_bytes());
+    assert_eq!(info[16..24], (AREA + 5).to_le_bytes());
+    assert_eq!(info[24..26], 12u16.to_le_bytes());
+    // The poison outlasts the registration; MADV_DONTNEED ends it.
+    assert_eq!(f.ioctl(fd, UNREGISTER, &[AREA, 2 * PAGE]).0, 0);
+    assert!(f.mem.read(GuestAddr(AREA), &mut [0]).unwrap_err().poison);
+    assert_eq!(f.ret(28, &[AREA, PAGE, 4]), 0);
+    f.mem.read(GuestAddr(AREA), &mut [0]).unwrap();
 }

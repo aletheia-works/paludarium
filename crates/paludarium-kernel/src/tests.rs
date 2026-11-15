@@ -686,7 +686,8 @@ fn guest_exceptions_end_the_process_with_signals() {
             addr: GuestAddr(0x5000),
             write: true,
             fetch: false,
-            present: true
+            present: true,
+            poison: false,
         }),
         Next::Exit(ExitStatus::Signaled(signal::SIGBUS))
     );

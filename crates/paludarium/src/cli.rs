@@ -398,9 +398,10 @@ pub fn describe_stop(reason: &ExitReason) -> Option<String> {
             addr,
             write,
             fetch,
+            poison,
             ..
         } => format!(
-            "{} address {:#x}, past the end of its mapped file, at {:#x}",
+            "{} address {:#x}, {}, at {:#x}",
             if fetch {
                 "instruction fetch from"
             } else if write {
@@ -409,6 +410,11 @@ pub fn describe_stop(reason: &ExitReason) -> Option<String> {
                 "read of"
             },
             addr.0,
+            if poison {
+                "on a poisoned page"
+            } else {
+                "past the end of its mapped file"
+            },
             rip.0
         ),
         ExitReason::Halt { rip } => format!("privileged instruction at {:#x}", rip.0),
@@ -827,8 +833,20 @@ mod tests {
                     write: false,
                     fetch: false,
                     present: true,
+                    poison: false,
                 },
                 "read of address 0x4000, past the end of its mapped file, at 0x10",
+            ),
+            (
+                ExitReason::BusError {
+                    rip,
+                    addr: GuestAddr(0x5000),
+                    write: true,
+                    fetch: false,
+                    present: false,
+                    poison: true,
+                },
+                "write to address 0x5000, on a poisoned page, at 0x10",
             ),
         ] {
             assert_eq!(describe_stop(&reason).as_deref(), Some(text));

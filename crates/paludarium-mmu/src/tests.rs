@@ -46,6 +46,7 @@ fn failed_cmpxchg_requires_write_permission() {
             mapped: true,
             present: true,
             bus: false,
+            poison: false,
         })
     );
     assert_eq!(m.read_u64(GuestAddr(0x10000)).unwrap(), 7);
@@ -63,6 +64,7 @@ fn cross_page_fault_has_no_partial_write() {
             mapped: false,
             present: false,
             bus: false,
+            poison: false,
         })
     );
     let mut b = [0; 4];
@@ -806,6 +808,122 @@ fn a_userfaultfd_write_protection_faults_on_writes_while_registered() {
     let gone = AddressSpace::new().view();
     assert_eq!(
         gone.userfault_write_protect(a.0, a.0 + PAGE_SIZE, true),
+        Err(Errno(3))
+    );
+}
+#[test]
+fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
+    let mut m = AddressSpace::new();
+    let a = m
+        .map(
+            Some(GuestAddr(0x90000)),
+            3 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    let page = |n: u64| GuestAddr(a.0 + n * PAGE_SIZE);
+    m.write(page(1), b"a").unwrap();
+    let view = m.view();
+    // Only a registered range is poisoned.
+    assert_eq!(
+        view.userfault_poison(a.0, a.0 + PAGE_SIZE, a.0),
+        Err(Errno::ENOENT)
+    );
+    view.userfault_register(a.0, a.0 + 3 * PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    view.userfault_prepare_fill(a.0);
+    assert_eq!(view.userfault_poison(a.0, a.0 + PAGE_SIZE, a.0), Ok(()));
+    // A page with an entry or poison already is `EEXIST`, for a fill too.
+    assert_eq!(
+        view.userfault_poison(a.0, a.0 + 2 * PAGE_SIZE, page(1).0),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        view.userfault_poison(a.0, a.0 + PAGE_SIZE, a.0),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        view.userfault_fill(a.0, a.0 + PAGE_SIZE, a.0, None, false),
+        Err(Errno::EEXIST)
+    );
+    // Every access is the poison's bus error, not the userfaultfd's wait.
+    for fault in [
+        m.read(a, &mut [0]).unwrap_err(),
+        m.write(GuestAddr(a.0 + 9), b"b").unwrap_err(),
+    ] {
+        assert!(fault.poison && fault.bus && fault.mapped && !fault.present);
+    }
+    assert_eq!(m.userfault_at(a), None);
+    // An access the protection refuses is the CPU's fault before it.
+    m.protect(a, PAGE_SIZE, Prot::READ).unwrap();
+    let refused = m.write(a, b"c").unwrap_err();
+    assert!(!refused.poison && !refused.bus);
+    m.protect(a, PAGE_SIZE, Prot::READ_WRITE).unwrap();
+    // The poison outlasts the registration, and a child of private memory
+    // has it too.
+    view.userfault_unregister(a.0, a.0 + 3 * PAGE_SIZE, 7)
+        .unwrap();
+    assert!(m.read(a, &mut [0]).unwrap_err().poison);
+    let child = m.fork();
+    assert!(child.read(a, &mut [0]).unwrap_err().poison);
+    // It moves with the pages.
+    let moved = m
+        .remap_shared(
+            a,
+            2 * PAGE_SIZE,
+            2 * PAGE_SIZE,
+            Remap {
+                may_move: true,
+                fixed: true,
+                keep_old: false,
+                new_addr: GuestAddr(0xa0000),
+            },
+        )
+        .unwrap();
+    assert!(m.read(moved, &mut [0]).unwrap_err().poison);
+    let mut byte = [0];
+    m.read(GuestAddr(moved.0 + PAGE_SIZE), &mut byte).unwrap();
+    assert_eq!(byte, [b'a']);
+    // A discard ends it, as an unmap does; so does `MADV_FREE`'s.
+    m.discard_shared(moved, PAGE_SIZE).unwrap();
+    m.read(moved, &mut byte).unwrap();
+    assert_eq!(byte, [0]);
+    child.unmap_shared(a, PAGE_SIZE).unwrap();
+    child
+        .map_shared(Some(a), PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap();
+    child.read(a, &mut byte).unwrap();
+    assert_eq!(byte, [0]);
+    // Shared memory is poisoned in this mapping only, and a child's mapping
+    // of it does not have the poison.
+    let s = m
+        .map_shared(
+            Some(GuestAddr(0xb0000)),
+            PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    m.mark_shared(s, PAGE_SIZE).unwrap();
+    let sharer = m.fork();
+    sharer.write(s, b"s").unwrap();
+    view.userfault_register(s.0, s.0 + PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    assert_eq!(view.userfault_poison(s.0, s.0 + PAGE_SIZE, s.0), Ok(()));
+    assert!(m.read(s, &mut [0]).unwrap_err().poison);
+    sharer.read(s, &mut byte).unwrap();
+    assert_eq!(byte, [b's']);
+    let other = m.fork();
+    other.read(s, &mut byte).unwrap();
+    assert_eq!(byte, [b's']);
+    m.clear_poisons(s, PAGE_SIZE);
+    m.read(s, &mut byte).unwrap();
+    assert_eq!(byte, [b's']);
+    // A space that is gone takes none.
+    let gone = AddressSpace::new().view();
+    assert_eq!(
+        gone.userfault_poison(a.0, a.0 + PAGE_SIZE, a.0),
         Err(Errno(3))
     );
 }

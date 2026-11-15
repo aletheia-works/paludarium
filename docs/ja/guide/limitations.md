@@ -492,8 +492,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
   メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
-  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE`、
-  `UFFDIO_MOVE`、`UFFDIO_POISON` もありません（`EINVAL`）。`fork`、`mremap`、
+  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE` と
+  `UFFDIO_MOVE` もありません（`EINVAL`）。`fork`、`mremap`、
   `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
   それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す

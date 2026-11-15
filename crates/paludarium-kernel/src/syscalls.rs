@@ -2932,9 +2932,12 @@ pub(crate) fn advise(
     }
     if advice == MADV_FREE {
         // Linux frees such pages only under memory pressure, which the
-        // emulator never has, so their contents stay as they are.
+        // emulator never has, so their contents stay as they are; their
+        // poison markers go at once (`madvise_free_pte_range`).
         return short_of_locked(mem, addr, end, true, |to| {
-            mem.check_private_anonymous(GuestAddr(addr), to - addr)
+            mem.check_private_anonymous(GuestAddr(addr), to - addr)?;
+            mem.clear_poisons(GuestAddr(addr), to - addr);
+            Ok(())
         });
     }
     // MADV_COLD and MADV_PAGEOUT take no locked VMA (`can_madv_lru_vma`).
@@ -3022,7 +3025,8 @@ fn remove(
 /// no mapping holds ends it with `ENOMEM`, one whose mapping may not be read
 /// (or, with `write`, written), or that maps a `memfd_secret` file, with
 /// `EINVAL`, and one that cannot be brought in (past the end of its file,
-/// `SIGBUS`) with `EFAULT`, after the pages before it. A read maps what a read would (the zero page of
+/// `SIGBUS`) with `EFAULT`, or poisoned (`UFFDIO_POISON`) with `EHWPOISON`,
+/// after the pages before it. A read maps what a read would (the zero page of
 /// private anonymous memory); a write breaks copy-on-write as a write
 /// would, and leaves the bytes as they are.
 fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), Errno> {
@@ -3043,12 +3047,15 @@ fn populate(mem: &AddressSpace, addr: u64, end: u64, write: bool) -> Result<(), 
                     paludarium_mmu::AtomicWidth::W8,
                     paludarium_mmu::AtomicOp::Add(0),
                 )
-                .is_ok()
+                .err()
             } else {
-                mem.read(GuestAddr(at), &mut [0]).is_ok()
+                mem.read(GuestAddr(at), &mut [0]).err()
             };
-            if !faulted {
-                return Err(Errno::EFAULT);
+            match faulted {
+                // `VM_FAULT_HWPOISON` is `EHWPOISON`.
+                Some(fault) if fault.poison => return Err(Errno(133)),
+                Some(_) => return Err(Errno::EFAULT),
+                None => {}
             }
             if write {
                 mem.mark_written(GuestAddr(at), 1);

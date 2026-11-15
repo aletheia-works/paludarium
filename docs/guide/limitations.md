@@ -572,8 +572,8 @@ verified.
 - **userfaultfd, in part**: missing pages and the write protection of
   private anonymous memory are registered. The minor mode is refused
   (`EINVAL`), as is the write-protect mode for shared memory, which Linux
-  takes, and `UFFDIO_CONTINUE`, `UFFDIO_MOVE` and `UFFDIO_POISON` are not
-  offered (`EINVAL`), nor the events of `fork`, `mremap`, `madvise` and
+  takes, and `UFFDIO_CONTINUE` and `UFFDIO_MOVE` are not offered
+  (`EINVAL`), nor the events of `fork`, `mremap`, `madvise` and
   `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
   `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
   `UFFDIO_API` does not report and refuses (`EINVAL`); the ioctls

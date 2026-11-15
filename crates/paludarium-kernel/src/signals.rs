@@ -139,6 +139,8 @@ pub(crate) const SI_TKILL: i32 = -6;
 /// `si_code` of a signal the kernel sends itself (`SEND_SIG_PRIV`), which
 /// carries no sender: `si_pid` and `si_uid` stay 0.
 pub(crate) const SI_KERNEL: i32 = 0x80;
+/// SIGBUS's `BUS_MCEERR_AR`: a memory error consumed by the access.
+pub(crate) const BUS_MCEERR_AR: i32 = 4;
 /// The 128-byte `siginfo_t` of `signal`, as Linux fills it for the frame and
 /// for `rt_sigtimedwait`.
 pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128] {
@@ -156,6 +158,11 @@ pub(crate) fn siginfo(process: &ThreadState, signal: &PendingSignal) -> [u8; 128
         info[24..32].copy_from_slice(&timer.value.to_le_bytes());
     } else if signal.synchronous {
         info[16..24].copy_from_slice(&signal.addr.to_le_bytes());
+        // `force_sig_mceerr` gives the poisoned page's size (`PAGE_SHIFT`)
+        // as `si_addr_lsb`.
+        if signal.number == crate::signal::SIGBUS && signal.code == BUS_MCEERR_AR {
+            info[24..26].copy_from_slice(&12u16.to_le_bytes());
+        }
     } else if let Some(child) = signal.child {
         // Times are in USER_HZ ticks.
         info[16..20].copy_from_slice(&child.pid.to_le_bytes());

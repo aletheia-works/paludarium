@@ -378,6 +378,10 @@ pub struct Fault {
     /// The page of a file mapping lies wholly past the end of its file,
     /// where Linux raises SIGBUS.
     pub bus: bool,
+    /// The page is poisoned (`UFFDIO_POISON`, Linux's `PTE_MARKER_POISONED`):
+    /// Linux's `handle_pte_marker` gives `VM_FAULT_HWPOISON`, SIGBUS with
+    /// `BUS_MCEERR_AR`, and a system call's copy `EFAULT`. `bus` is set too.
+    pub poison: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -735,6 +739,72 @@ impl Drop for FrameBytes {
         if let Some(meter) = &self.meter {
             meter.used.fetch_sub(PAGE_SIZE, Ordering::SeqCst);
         }
+    }
+}
+
+/// Page-aligned ranges of an address space, from start to end, kept merged:
+/// the guard and poison markers of its page tables.
+#[derive(Clone, Debug, Default)]
+struct PageRanges(BTreeMap<u64, u64>);
+
+impl PageRanges {
+    /// Whether `page` lies in one of the ranges.
+    fn contains(&self, page: u64) -> bool {
+        self.0
+            .range(..=page)
+            .next_back()
+            .is_some_and(|(_, &end)| page < end)
+    }
+
+    /// Whether `[start, end)` meets one of the ranges.
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.0
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, &e)| e > start)
+    }
+
+    /// Adds `[start, end)`, merging it with the ranges it touches.
+    fn add(&mut self, mut start: u64, mut end: u64) {
+        if let Some((&before, &before_end)) = self.0.range(..=start).next_back()
+            && before_end >= start
+        {
+            start = before;
+            end = end.max(before_end);
+        }
+        let touched: Vec<(u64, u64)> = self.0.range(start..=end).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in touched {
+            self.0.remove(&s);
+            end = end.max(e);
+        }
+        self.0.insert(start, end);
+    }
+
+    /// Takes `[start, end)` out, and gives the parts of it that were in.
+    fn clear(&mut self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let mut cleared = Vec::new();
+        if end <= start || self.0.is_empty() {
+            return cleared;
+        }
+        let first = self
+            .0
+            .range(..start)
+            .next_back()
+            .filter(|&(_, &e)| e > start)
+            .map_or(start, |(&s, _)| s);
+        let overlapping: Vec<(u64, u64)> =
+            self.0.range(first..end).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in overlapping {
+            self.0.remove(&s);
+            if s < start {
+                self.0.insert(s, start);
+            }
+            if e > end {
+                self.0.insert(end, e);
+            }
+            cleared.push((s.max(start), e.min(end)));
+        }
+        cleared
     }
 }
 
@@ -1770,7 +1840,13 @@ struct AddressSpaceData {
     /// Linux's guard PTE markers, a property of the page tables and not of
     /// the VMAs, so they neither split nor stop a merge. An access to one
     /// faults as one to no mapping would.
-    guards: BTreeMap<u64, u64>,
+    guards: PageRanges,
+    /// The pages `UFFDIO_POISON` poisoned: Linux's poison PTE markers,
+    /// which, like the guards, belong to the page tables. A discard drops
+    /// them (`zap_nonpresent_ptes`, `madvise_free_pte_range`), as an unmap
+    /// does; they move with `mremap`, and a `fork` child of private memory
+    /// gets them (`copy_nonpresent_pte`).
+    poisons: PageRanges,
     /// How a new mapping is locked: `mlockall` with `MCL_FUTURE` (Linux's
     /// `def_flags`), which neither `fork` nor `exec` keeps.
     future_lock: Option<Lock>,
@@ -1853,7 +1929,8 @@ impl AddressSpaceData {
             directory: RwLock::new(BTreeMap::new()),
             shared: BTreeMap::new(),
             backing: BTreeMap::new(),
-            guards: BTreeMap::new(),
+            guards: PageRanges::default(),
+            poisons: PageRanges::default(),
             future_lock: None,
             code: Arc::default(),
             mappings: BTreeMap::new(),
@@ -2413,6 +2490,15 @@ impl AddressSpaceData {
         // Linux's `VM_COPY_ON_FORK` has `VM_MAYBE_GUARD`: the child gets the
         // guard markers with the page tables.
         copy.guards = self.guards.clone();
+        // The poison markers of private memory, which a fill gave an
+        // `anon_vma`, are copied with its page tables (`vma_needs_copy`);
+        // shared memory's are copied only with `VM_MAYBE_GUARD`.
+        copy.poisons = self.poisons.clone();
+        for m in self.mappings.values() {
+            if self.shared_at(m.start.0).is_some() && !m.maybe_guard {
+                copy.poisons.clear(m.start.0, m.end());
+            }
+        }
         copy.initial_break = self.initial_break;
         copy.current_break = self.current_break;
         copy.mmap_top = self.mmap_top;
@@ -2483,6 +2569,7 @@ impl AddressSpaceData {
             } else {
                 copy.for_populated(m.start.0, m.end(), |entry| *entry = None);
                 copy.clear_guards(m.start.0, m.end());
+                copy.poisons.clear(m.start.0, m.end());
                 copy.bump_code_generation();
                 if let Some(child) = copy.mappings.get_mut(&m.start.0) {
                     child.written = false;
@@ -2603,6 +2690,7 @@ impl AddressSpaceData {
             present: lookup(directory, at).is_some()
                 && self.prot_at(directory, at) != Some(Prot::NONE),
             bus: false,
+            poison: false,
         };
         let wide = u64::try_from(len).map_err(|_| fault(addr.0))?;
         addr.0.checked_add(wide).ok_or_else(|| fault(addr.0))?;
@@ -2633,6 +2721,18 @@ impl AddressSpaceData {
                     }
                 }
                 _ => return Err(fault(at)),
+            }
+            // A poisoned page, past the protection check `access_error`
+            // makes first: `handle_pte_marker` gives `VM_FAULT_HWPOISON`,
+            // ahead of any `userfaultfd`.
+            if access != Access::Setup && self.poisoned(page) {
+                return Err(Fault {
+                    mapped: true,
+                    present: false,
+                    bus: true,
+                    poison: true,
+                    ..fault(at)
+                });
             }
             // A page a `userfaultfd` waits for (`handle_userfault`): the
             // kernel takes the fault of an instruction, and a system call's
@@ -2837,6 +2937,7 @@ impl AddressSpaceData {
             mapped: true,
             present: false,
             bus: false,
+            poison: false,
         }
     }
 
@@ -2926,6 +3027,7 @@ impl AddressSpaceData {
                     mapped: false,
                     present: false,
                     bus: false,
+                    poison: false,
                 });
             };
             let (dir, slot) = page_index(page);
@@ -2940,6 +3042,7 @@ impl AddressSpaceData {
                     mapped: true,
                     present: false,
                     bus: false,
+                    poison: false,
                 });
             }
             if let Some(p) = lookup(&directory, page)
@@ -2979,6 +3082,7 @@ impl AddressSpaceData {
             mapped: false,
             present: false,
             bus: false,
+            poison: false,
         })
     }
 
@@ -3349,6 +3453,7 @@ impl AddressSpaceData {
     /// sealed or not.
     fn remove(&mut self, addr: u64, end: u64) {
         self.clear_guards(addr, end);
+        self.poisons.clear(addr, end);
         let addr = GuestAddr(addr);
         let affected: Vec<_> = self
             .shared
@@ -3492,6 +3597,7 @@ impl AddressSpaceData {
         // The guard markers move with the page tables, and leave the old
         // range even when `MREMAP_DONTUNMAP` keeps it.
         let guards = self.clear_guards(old, old + old_len);
+        let poisons = self.poisons.clear(old, old + old_len);
         // MREMAP_DONTUNMAP leaves the old range unlocked (`VMA_LOCKED_MASK`).
         if keep_old {
             self.split_at(old);
@@ -3554,6 +3660,9 @@ impl AddressSpaceData {
         }
         for (start, end) in guards {
             self.add_guards(start - old + to, end - old + to);
+        }
+        for (start, end) in poisons {
+            self.poisons.add(start - old + to, end - old + to);
         }
         self.bump_code_generation();
     }
@@ -3847,7 +3956,7 @@ impl AddressSpaceData {
             .mapping_at(page)?
             .userfault
             .filter(|u| u.modes & Userfault::MISSING != 0)?;
-        if lookup(directory, page).is_some() {
+        if lookup(directory, page).is_some() || self.poisoned(page) {
             return None;
         }
         if let Some(shared) = self.shared_at(page)
@@ -4104,10 +4213,12 @@ impl AddressSpaceData {
         let prot = self.mapping_at(page).map_or(mapping.prot, |m| m.prot);
         let mut directory = self.write_directory();
         let shared = self.shared_at(page);
-        // A guard marker is an entry too (`mfill_atomic_install_pte` takes
-        // only none or a `userfaultfd` marker).
+        // A guard or poison marker is an entry too
+        // (`mfill_atomic_install_pte` takes only none or a `userfaultfd`
+        // marker).
         if lookup(&directory, page).is_some()
             || self.guarded(page)
+            || self.poisoned(page)
             || shared.is_some_and(|shared| shared.pages.has(page.wrapping_add(shared.shift)))
         {
             return Err(Errno::EEXIST);
@@ -4128,6 +4239,23 @@ impl AddressSpaceData {
         if let Some(shared) = shared {
             shared.pages.changed();
         }
+        Ok(())
+    }
+
+    /// One page of a `UFFDIO_POISON` of `[start, end)`, at `page`, as
+    /// Linux's `mfill_atomic_pte_poison`: the range is checked as a fill's
+    /// ([`Self::userfault_target`]), and a page with an entry or a marker,
+    /// even one whose shared memory has it but this mapping has not yet
+    /// faulted it in, is `EEXIST`: only the entry is looked at.
+    pub fn userfault_poison(&mut self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
+        self.userfault_target(start, end)?;
+        if lookup(&self.read_directory(), page).is_some()
+            || self.guarded(page)
+            || self.poisoned(page)
+        {
+            return Err(Errno::EEXIST);
+        }
+        self.poisons.add(page, page + PAGE_SIZE);
         Ok(())
     }
 
@@ -4388,69 +4516,37 @@ impl AddressSpaceData {
 
     /// Whether the page at `page` is a guard page.
     fn guarded(&self, page: u64) -> bool {
-        self.guards
-            .range(..=page)
-            .next_back()
-            .is_some_and(|(_, &end)| page < end)
+        self.guards.contains(page)
     }
 
     /// Adds `[start, end)` to the guards, merging it with those it touches.
-    fn add_guards(&mut self, mut start: u64, mut end: u64) {
-        if let Some((&before, &before_end)) = self.guards.range(..=start).next_back()
-            && before_end >= start
-        {
-            start = before;
-            end = end.max(before_end);
-        }
-        let touched: Vec<(u64, u64)> = self
-            .guards
-            .range(start..=end)
-            .map(|(&s, &e)| (s, e))
-            .collect();
-        for (s, e) in touched {
-            self.guards.remove(&s);
-            end = end.max(e);
-        }
-        self.guards.insert(start, end);
+    fn add_guards(&mut self, start: u64, end: u64) {
+        self.guards.add(start, end);
     }
 
     /// Takes `[start, end)` out of the guards, and gives the parts of it
     /// that were guards.
     fn clear_guards(&mut self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        let mut cleared = Vec::new();
-        if end <= start || self.guards.is_empty() {
-            return cleared;
-        }
-        let first = self
-            .guards
-            .range(..start)
-            .next_back()
-            .filter(|&(_, &e)| e > start)
-            .map_or(start, |(&s, _)| s);
-        let overlapping: Vec<(u64, u64)> = self
-            .guards
-            .range(first..end)
-            .map(|(&s, &e)| (s, e))
-            .collect();
-        for (s, e) in overlapping {
-            self.guards.remove(&s);
-            if s < start {
-                self.guards.insert(s, start);
-            }
-            if e > end {
-                self.guards.insert(end, e);
-            }
-            cleared.push((s.max(start), e.min(end)));
-        }
-        cleared
+        self.guards.clear(start, end)
     }
 
     /// Whether `[start, end)` has a guard page.
     fn has_guards(&self, start: u64, end: u64) -> bool {
-        self.guards
-            .range(..end)
-            .next_back()
-            .is_some_and(|(_, &e)| e > start)
+        self.guards.overlaps(start, end)
+    }
+
+    /// Whether the page at `page` is poisoned (`UFFDIO_POISON`).
+    fn poisoned(&self, page: u64) -> bool {
+        self.poisons.contains(page)
+    }
+
+    /// Drops the poison of `[addr, addr+len)`, as `MADV_FREE` drops the
+    /// poison markers of the private anonymous memory it frees
+    /// (`madvise_free_pte_range`).
+    pub fn clear_poisons(&mut self, addr: GuestAddr, len: u64) {
+        if let Ok(end) = checked_range(addr, len) {
+            self.poisons.clear(addr.0, end);
+        }
     }
 
     /// Whether `m`, sealed, refuses to have its pages discarded
@@ -4585,6 +4681,7 @@ impl AddressSpaceData {
         let mut covered = addr.0;
         let mut hole = false;
         let mut private = Vec::new();
+        let mut poisoned = Vec::new();
         let mut sealed = false;
         for (_, m) in self.mappings.range(..end) {
             if m.end() <= addr.0 {
@@ -4598,6 +4695,9 @@ impl AddressSpaceData {
             hole |= m.start.0 > covered;
             covered = m.end();
             let start = m.start.0.max(addr.0);
+            // Every page table entry goes, poison markers too
+            // (`zap_nonpresent_ptes` with no `zap_details`), shared or not.
+            poisoned.push((start, m.end().min(end)));
             // An ELF segment or a file mapping without its file keeps its
             // contents: there is nothing to read it from again.
             let backed = matches!(m.kind, MappingKind::ElfSegment | MappingKind::File)
@@ -4609,6 +4709,9 @@ impl AddressSpaceData {
             }
         }
         hole |= !sealed && covered < end;
+        for (start, end) in poisoned {
+            self.poisons.clear(start, end);
+        }
         if !private.is_empty() {
             self.bump_code_generation();
         }
@@ -5052,6 +5155,12 @@ impl MemoryView {
         protect: bool,
     ) -> Result<(), Errno> {
         self.with_data(|data| data.userfault_fill(start, end, page, bytes, protect))
+            .unwrap_or(Err(Errno(3))) // ESRCH
+    }
+    /// See [`AddressSpaceData::userfault_poison`]; `ESRCH` once the space
+    /// is gone.
+    pub fn userfault_poison(&self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
+        self.with_data_mut(|data| data.userfault_poison(start, end, page))
             .unwrap_or(Err(Errno(3))) // ESRCH
     }
     /// See [`AddressSpaceData::userfault_write_protect`]; `ESRCH` once the
@@ -5837,6 +5946,10 @@ impl AddressSpace {
     pub fn discard_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.locked().discard(addr, len)
     }
+    /// See [`AddressSpaceData::clear_poisons`].
+    pub fn clear_poisons(&self, addr: GuestAddr, len: u64) {
+        self.locked().clear_poisons(addr, len);
+    }
     /// See [`AddressSpaceData::back_with_file`].
     pub fn back_with_file(
         &self,
@@ -6276,6 +6389,7 @@ mod tests {
                 mapped: false,
                 present: false,
                 bus: false,
+                poison: false,
             }
         );
         let err = space.write(GuestAddr(0x5000), &buf).unwrap_err();
@@ -6288,6 +6402,7 @@ mod tests {
                 mapped: false,
                 present: false,
                 bus: false,
+                poison: false,
             }
         );
         // Addresses beyond the user range and overflowing ranges fault too.

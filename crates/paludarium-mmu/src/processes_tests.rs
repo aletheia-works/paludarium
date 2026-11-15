@@ -133,6 +133,7 @@ fn the_meter_counts_written_frames_once_until_they_go() {
             mapped: true,
             present: false,
             bus: false,
+            poison: false,
         })
     );
     assert!(p.take_out_of_memory());

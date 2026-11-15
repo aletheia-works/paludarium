@@ -219,6 +219,9 @@ enum Layout {
     Timer,
     Poll,
     Fault,
+    /// SIGBUS's `BUS_MCEERR_AR` and `BUS_MCEERR_AO` (`SIL_FAULT_MCEERR`),
+    /// which carry `si_addr_lsb` too.
+    MemoryError,
     Child,
     Rt,
     Sys,
@@ -231,6 +234,7 @@ fn layout(number: i32, code: i32) -> Layout {
     if code > SI_USER && code < SI_KERNEL {
         // The signals whose codes Linux defines, with the highest of them.
         match (number, code) {
+            (7, 4 | 5) => Layout::MemoryError,
             (4, ..=11) | (8, ..=15) | (11, ..=10) | (7, ..=5) | (5, ..=6) => Layout::Fault,
             (17, ..=6) => Layout::Child,
             (29, ..=6) => Layout::Poll,
@@ -278,6 +282,11 @@ fn siginfo(info: &[u8; 128]) -> [u8; RECORD] {
             put(20, &word(24).to_le_bytes());
         }
         Layout::Fault => put(72, &quad(16).to_le_bytes()),
+        // ssi_addr_lsb 80.
+        Layout::MemoryError => {
+            put(72, &quad(16).to_le_bytes());
+            put(80, &info[24..26]);
+        }
         Layout::Child => {
             put(12, &word(16).to_le_bytes());
             put(16, &word(20).to_le_bytes());

@@ -19,7 +19,11 @@
 //! such a page is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where Linux
 //! waits as for an instruction unless that flag was given.
 //!
-//! The minor mode, `UFFDIO_CONTINUE`, `UFFDIO_POISON` and `UFFDIO_MOVE`,
+//! `UFFDIO_POISON` poisons pages that have none: an access to one raises
+//! SIGBUS (`BUS_MCEERR_AR`), registered or not, as Linux's poison marker
+//! gives `VM_FAULT_HWPOISON`, until a discard or an unmap drops it.
+//!
+//! The minor mode, `UFFDIO_CONTINUE` and `UFFDIO_MOVE`,
 //! the write protection of shared memory and of pages with no entry
 //! (`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`, `UFFD_FEATURE_WP_UNPOPULATED`,
 //! `UFFD_FEATURE_WP_ASYNC`), and the events of `fork`, `mremap`,
@@ -67,6 +71,8 @@ const FEATURE_THREAD_ID: u64 = 1 << 8;
 /// itself, not its page's.
 const FEATURE_EXACT_ADDRESS: u64 = 1 << 11;
 const FEATURE_WP_UNPOPULATED: u64 = 1 << 13;
+/// `UFFD_FEATURE_POISON`: `UFFDIO_POISON` is there.
+const FEATURE_POISON: u64 = 1 << 14;
 /// `UFFD_FEATURE_WP_ASYNC`, which takes `UFFD_FEATURE_WP_UNPOPULATED`.
 const FEATURE_WP_ASYNC: u64 = 1 << 15;
 /// The features `UFFDIO_API` offers.
@@ -75,7 +81,8 @@ const FEATURES: u64 = FEATURE_PAGEFAULT_FLAG_WP
     | FEATURE_MISSING_SHMEM
     | FEATURE_SIGBUS
     | FEATURE_THREAD_ID
-    | FEATURE_EXACT_ADDRESS;
+    | FEATURE_EXACT_ADDRESS
+    | FEATURE_POISON;
 /// The context's features once `UFFDIO_API` took them
 /// (`UFFD_FEATURE_INITIALIZED`).
 const INITIALIZED: u32 = 1 << 31;
@@ -83,10 +90,10 @@ const INITIALIZED: u32 = 1 << 31;
 /// The ioctls of a context (`UFFD_API_IOCTLS`): `UFFDIO_REGISTER`,
 /// `UFFDIO_UNREGISTER` and `UFFDIO_API`, by their numbers.
 const API_IOCTLS: u64 = 1 << 0 | 1 << 1 | 1 << 0x3f;
-/// The ioctls of a registered range: `UFFDIO_WAKE`, `UFFDIO_COPY` and
-/// `UFFDIO_ZEROPAGE`, and [`WRITEPROTECT_IOCTL`] for one registered for
-/// write protection.
-const RANGE_IOCTLS: u64 = 1 << 2 | 1 << 3 | 1 << 4;
+/// The ioctls of a registered range: `UFFDIO_WAKE`, `UFFDIO_COPY`,
+/// `UFFDIO_ZEROPAGE` and `UFFDIO_POISON`, and [`WRITEPROTECT_IOCTL`] for
+/// one registered for write protection.
+const RANGE_IOCTLS: u64 = 1 << 2 | 1 << 3 | 1 << 4 | 1 << 8;
 /// `UFFDIO_WRITEPROTECT`, by its number.
 const WRITEPROTECT_IOCTL: u64 = 1 << 6;
 
@@ -97,12 +104,14 @@ const UFFDIO_WAKE: u32 = 0x8010_aa02;
 const UFFDIO_COPY: u32 = 0xc028_aa03;
 const UFFDIO_ZEROPAGE: u32 = 0xc020_aa04;
 const UFFDIO_WRITEPROTECT: u32 = 0xc018_aa06;
+const UFFDIO_POISON: u32 = 0xc020_aa08;
 
 /// `UFFDIO_REGISTER_MODE_WP`.
 const MODE_WP: u64 = 2;
 /// `UFFDIO_REGISTER_MODE_MISSING`, `_WP` and `_MINOR`.
 const MODES: u64 = 7;
-/// `UFFDIO_COPY_MODE_DONTWAKE`, which `UFFDIO_ZEROPAGE` has as well.
+/// `UFFDIO_COPY_MODE_DONTWAKE`, which `UFFDIO_ZEROPAGE` and
+/// `UFFDIO_POISON` have as well.
 const DONTWAKE: u64 = 1;
 /// `UFFDIO_COPY_MODE_WP`.
 const COPY_MODE_WP: u64 = 2;
@@ -520,8 +529,9 @@ pub(crate) fn ioctl(
         UFFDIO_REGISTER => register(c, &context, arg),
         UFFDIO_UNREGISTER => unregister(c, &context, arg),
         UFFDIO_WAKE => wake(c, &context, arg),
-        UFFDIO_COPY => fill(c, &context, arg, true),
-        UFFDIO_ZEROPAGE => fill(c, &context, arg, false),
+        UFFDIO_COPY => fill(c, &context, arg, Fill::Copy),
+        UFFDIO_ZEROPAGE => fill(c, &context, arg, Fill::Zeros),
+        UFFDIO_POISON => fill(c, &context, arg, Fill::Poison),
         UFFDIO_WRITEPROTECT => write_protect(c, &context, arg),
         _ => Err(Errno::EINVAL),
     })
@@ -686,13 +696,25 @@ fn wake(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64, Err
     Ok(0)
 }
 
-/// `UFFDIO_COPY` (`copy`, from the caller's memory) or `UFFDIO_ZEROPAGE`,
-/// as Linux's `userfaultfd_copy`, `userfaultfd_zeropage` and
+/// What a fill puts in the pages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// `UFFDIO_COPY`: bytes from the caller's memory.
+    Copy,
+    /// `UFFDIO_ZEROPAGE`: zeros.
+    Zeros,
+    /// `UFFDIO_POISON`: poison ([`paludarium_mmu::MemoryView::userfault_poison`]).
+    Poison,
+}
+
+/// `UFFDIO_COPY`, `UFFDIO_ZEROPAGE` or `UFFDIO_POISON` (`kind`), as Linux's
+/// `userfaultfd_copy`, `userfaultfd_zeropage`, `userfaultfd_poison` and
 /// `mfill_atomic` have them: page by page until one fails, which is the
 /// error if it is the first; the bytes filled, or the error, are written to
 /// the struct's last field (`EFAULT`), then the waits for them end unless
 /// `DONTWAKE`, and a fill that stopped short is `EAGAIN`.
-fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, copy: bool) -> Result<u64, Errno> {
+fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Result<u64, Errno> {
+    let copy = kind == Fill::Copy;
     let (dst, src, len, mode, result_at) = if copy {
         let [dst, src, len, mode] = words::<4>(c, arg)?;
         validate_unaligned(src, len)?;
@@ -739,7 +761,12 @@ fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, copy: bool) -> Res
         } else {
             None
         };
-        match memory.userfault_fill(dst, end, dst + filled, bytes, mode & COPY_MODE_WP != 0) {
+        let done = if kind == Fill::Poison {
+            memory.userfault_poison(dst, end, dst + filled)
+        } else {
+            memory.userfault_fill(dst, end, dst + filled, bytes, mode & COPY_MODE_WP != 0)
+        };
+        match done {
             Ok(()) => filled += PAGE,
             Err(e) => error = Some(e),
         }

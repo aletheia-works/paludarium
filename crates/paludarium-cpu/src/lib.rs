@@ -499,7 +499,7 @@ impl DecodeCache {
 }
 
 /// The stop for the MMU fault `f` at `rip`: a bus error past the end of a
-/// mapped file, else a page fault.
+/// mapped file or on a poisoned page, else a page fault.
 fn memory_fault(rip: GuestAddr, f: paludarium_mmu::Fault, write: bool, fetch: bool) -> ExitReason {
     if f.bus {
         ExitReason::BusError {
@@ -508,6 +508,7 @@ fn memory_fault(rip: GuestAddr, f: paludarium_mmu::Fault, write: bool, fetch: bo
             write,
             fetch,
             present: f.present,
+            poison: f.poison,
         }
     } else {
         ExitReason::PageFault {

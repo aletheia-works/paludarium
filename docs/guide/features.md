@@ -938,8 +938,8 @@ kernel.
   offers and its ioctls, or zeros when it fails; it offers
   `UFFD_FEATURE_PAGEFAULT_FLAG_WP`, `UFFD_FEATURE_SIGBUS`,
   `UFFD_FEATURE_THREAD_ID`,
-  `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM` and
-  `UFFD_FEATURE_MISSING_HUGETLBFS`, and `UFFD_FEATURE_EVENT_FORK` needs
+  `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
+  `UFFD_FEATURE_MISSING_HUGETLBFS` and `UFFD_FEATURE_POISON`, and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory and shared anonymous memory for missing pages
   (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
@@ -979,7 +979,17 @@ kernel.
   `EEXIST` for a page that has one, `EFAULT` for a source that cannot be
   read, and `EAGAIN` once one stops short, with what was filled in the
   struct's last field; `UFFDIO_COPY_MODE_WP` fills write-protected pages,
-  in a range registered for write protection (`EINVAL`). A read takes whole messages (`EINVAL` for a buffer
+  in a range registered for write protection (`EINVAL`). `UFFDIO_POISON`
+  (`UFFD_FEATURE_POISON`) poisons the pages of a registered range the same
+  way, its only mode `DONTWAKE`, and is `EEXIST` for a page this mapping
+  has, or a guard: an access to a poisoned page raises SIGBUS with
+  `BUS_MCEERR_AR` and `si_addr_lsb` 12, after the protection check and
+  whether the range is still registered or not, as Linux's poison marker
+  gives `VM_FAULT_HWPOISON`; a system call's copy there is `EFAULT` and
+  `MADV_POPULATE_READ` `EHWPOISON`. The poison stays through `mprotect`
+  and `UFFDIO_UNREGISTER`, moves with `mremap`, goes to a `fork`ed child of
+  private memory but not of shared, and goes with `MADV_DONTNEED`,
+  `MADV_FREE` and `munmap`. A read takes whole messages (`EINVAL` for a buffer
   too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
   `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
   Linux's does, else `POLLIN` while a fault is not read yet.

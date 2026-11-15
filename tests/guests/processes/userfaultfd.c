@@ -8,7 +8,11 @@
    UFFDIO_REGISTER_MODE_WP (the `uw` of smaps), UFFDIO_WRITEPROTECT and
    UFFDIO_COPY_MODE_WP, the faults of writes to protected pages, which
    end with the protection, and what mprotect, fork and unregistering do
-   to it.
+   to it; and UFFDIO_POISON: its errors, the SIGBUS of an access to a
+   poisoned page (si_code and si_addr_lsb), a system call's copy and
+   MADV_POPULATE_READ there, and what mprotect, fork, unregistering,
+   mremap, MADV_DONTNEED, MADV_FREE and munmap do to the poison, of
+   private and of shared anonymous memory.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
    whether they are the faulting thread's. Of what UFFDIO_API and
@@ -42,6 +46,7 @@
 #define UFFD_FEATURE_SIGBUS (1ULL << 7)
 #define UFFD_FEATURE_THREAD_ID (1ULL << 8)
 #define UFFD_FEATURE_EXACT_ADDRESS (1ULL << 11)
+#define UFFD_FEATURE_POISON (1ULL << 14)
 #define UFFDIO_REGISTER_MODE_MISSING 1ULL
 #define UFFDIO_REGISTER_MODE_WP 2ULL
 #define UFFDIO_REGISTER_MODE_MINOR 4ULL
@@ -50,6 +55,7 @@
 #define UFFDIO_WRITEPROTECT_MODE_DONTWAKE 2ULL
 #define UFFDIO_COPY_MODE_DONTWAKE 1ULL
 #define UFFDIO_ZEROPAGE_MODE_DONTWAKE 1ULL
+#define UFFDIO_POISON_MODE_DONTWAKE 1ULL
 
 #define UFFDIO_API 0xc018aa3f
 #define UFFDIO_REGISTER 0xc020aa00
@@ -58,9 +64,14 @@
 #define UFFDIO_COPY 0xc028aa03
 #define UFFDIO_ZEROPAGE 0xc020aa04
 #define UFFDIO_WRITEPROTECT 0xc018aa06
+#define UFFDIO_POISON 0xc020aa08
 
 #define RANGE_IOCTLS ((1ULL << 2) | (1ULL << 3) | (1ULL << 4))
 #define WRITEPROTECT_IOCTL (1ULL << 6)
+#define POISON_IOCTL (1ULL << 8)
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
 #define PAGE 4096
 
 struct uffdio_api {
@@ -85,6 +96,11 @@ struct uffdio_zeropage {
 struct uffdio_writeprotect {
     struct uffdio_range range;
     uint64_t mode;
+};
+struct uffdio_poison {
+    struct uffdio_range range;
+    uint64_t mode;
+    int64_t updated;
 };
 struct uffd_msg {
     uint8_t event, reserved1;
@@ -155,6 +171,14 @@ static long zeropage(int fd, void *dst, size_t len, uint64_t mode, int64_t *done
     long ret = ioctl(fd, UFFDIO_ZEROPAGE, &z);
     if (done)
         *done = z.zeropage;
+    return ret;
+}
+
+static long poison(int fd, void *at, size_t len, uint64_t mode, int64_t *done) {
+    struct uffdio_poison p = {{(uintptr_t)at, len}, mode, 0x5a5a};
+    long ret = ioctl(fd, UFFDIO_POISON, &p);
+    if (done)
+        *done = p.updated;
     return ret;
 }
 
@@ -716,6 +740,127 @@ static int case_wp(void) {
     return 0;
 }
 
+static sigjmp_buf faulted;
+static char *fault_base;
+static void on_fault(int sig, siginfo_t *info, void *context) {
+    (void)context;
+    printf("  signal %d code %d at %ld", sig, info->si_code,
+           (long)((char *)info->si_addr - fault_base));
+    if (sig == SIGBUS)
+        printf(" lsb %d", info->si_addr_lsb);
+    printf("\n");
+    siglongjmp(faulted, 1);
+}
+
+/* A read (or a write, with `write`) of `at`, and the signal it raises. */
+static void access_at(const char *what, char *base, volatile char *at, int write) {
+    printf("%s:\n", what);
+    fault_base = base;
+    if (sigsetjmp(faulted, 1) == 0) {
+        char c = write ? (*at = 'w') : *at;
+        printf("  no signal, byte %d\n", c);
+    }
+}
+
+/* UFFDIO_POISON. */
+static int case_poison(void) {
+    struct sigaction sa = {0};
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
+    int fd = uffd(O_NONBLOCK);
+    struct uffdio_api api = {UFFD_API, UFFD_FEATURE_POISON, 0};
+    printf("api: %s", err(ioctl(fd, UFFDIO_API, &api)));
+    printf(" poison=%d\n", (api.features & UFFD_FEATURE_POISON) != 0);
+    char *base = anon(4 * PAGE);
+    base[PAGE] = 'a';
+    int64_t done;
+    printf("not registered: %s", err(poison(fd, base, PAGE, 0, &done)));
+    printf(" updated=%lld\n", (long long)done);
+    uint64_t ioctls;
+    printf("register: %s", err(reg(fd, base, 4 * PAGE, UFFDIO_REGISTER_MODE_MISSING, &ioctls)));
+    printf(" poison=%d\n", (ioctls & POISON_IOCTL) != 0);
+    printf("bad mode: %s\n", err(poison(fd, base, PAGE, 2, NULL)));
+    printf("unaligned: %s\n", err(poison(fd, base + 1, PAGE, 0, NULL)));
+    printf("empty: %s\n", err(poison(fd, base, 0, 0, NULL)));
+    printf("up to a page: %s", err(poison(fd, base, 2 * PAGE, 0, &done)));
+    printf(" updated=%lld\n", (long long)done);
+    printf("again: %s", err(poison(fd, base, PAGE, 0, &done)));
+    printf(" updated=%lld\n", (long long)done);
+    char src[PAGE];
+    memset(src, 'c', sizeof src);
+    printf("copy: %s\n", err(copy(fd, base, src, PAGE, 0, NULL)));
+    printf("zeropage: %s\n", err(zeropage(fd, base, PAGE, 0, NULL)));
+    printf("dontwake: %s", err(poison(fd, base + 2 * PAGE, PAGE, UFFDIO_POISON_MODE_DONTWAKE, &done)));
+    printf(" updated=%lld\n", (long long)done);
+    int pipes[2];
+    pipe(pipes);
+    printf("write from it: %s\n", err(write(pipes[1], base, 1)));
+    long populated = madvise(base, PAGE, MADV_POPULATE_READ);
+    printf("populate read: %ld errno=%d\n", populated, populated ? errno : 0);
+    access_at("read", base, base + 5, 0);
+    access_at("write", base, base + 2 * PAGE + 9, 1);
+    access_at("filled page", base, base + PAGE, 0);
+    mprotect(base, PAGE, PROT_READ);
+    access_at("write refused", base, base, 1);
+    mprotect(base, PAGE, PROT_NONE);
+    access_at("read refused", base, base, 0);
+    mprotect(base, PAGE, PROT_READ | PROT_WRITE);
+    access_at("protection back", base, base, 0);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        access_at("child", base, base, 0);
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    printf("unregister: %s\n", err(unreg(fd, base, 4 * PAGE)));
+    access_at("unregistered", base, base, 0);
+    /* The poison moves with mremap. */
+    char *to = anon(2 * PAGE);
+    char *moved = mremap(base, 2 * PAGE, 2 * PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, to);
+    printf("mremap: %d\n", moved == to);
+    access_at("moved", moved, moved + 1, 0);
+    access_at("moved, filled", moved, moved + PAGE, 0);
+    printf("dontneed: %s\n", err(madvise(moved, PAGE, MADV_DONTNEED)));
+    access_at("after dontneed", moved, moved, 0);
+    access_at("before free", base, base + 2 * PAGE, 0);
+    printf("free: %s\n", err(madvise(base + 2 * PAGE, PAGE, MADV_FREE)));
+    access_at("after free", base, base + 2 * PAGE, 0);
+    printf("register again: %s\n", err(reg(fd, base + 3 * PAGE, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    printf("poison: %s\n", err(poison(fd, base + 3 * PAGE, PAGE, 0, NULL)));
+    munmap(base + 3 * PAGE, PAGE);
+    char *again = mmap(base + 3 * PAGE, PAGE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    access_at("mapped again", base, again, 0);
+    /* Shared memory: the poison is this mapping's, whatever the memory
+       has, and a child's mapping does not get it. */
+    char *shared = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        shared[0] = 's';
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    printf("register shared: %s\n", err(reg(fd, shared, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    printf("poison shared: %s", err(poison(fd, shared, PAGE, 0, &done)));
+    printf(" updated=%lld\n", (long long)done);
+    access_at("shared", shared, shared, 0);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        access_at("shared, child", shared, shared, 0);
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    printf("dontneed shared: %s\n", err(madvise(shared, PAGE, MADV_DONTNEED)));
+    access_at("shared after dontneed", shared, shared, 0);
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -726,6 +871,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-sigbus")) return case_sigbus();
     if (!strcmp(mode, "userfaultfd-shared")) return case_shared();
     if (!strcmp(mode, "userfaultfd-wp")) return case_wp();
+    if (!strcmp(mode, "userfaultfd-poison")) return case_poison();
     printf("unknown mode %s\n", mode);
     return 2;
 }

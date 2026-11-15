@@ -844,7 +844,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書きます。提供する機能は `UFFD_FEATURE_PAGEFAULT_FLAG_WP`、`UFFD_FEATURE_SIGBUS`、
   `UFFD_FEATURE_THREAD_ID`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
-  `UFFD_FEATURE_MISSING_HUGETLBFS` で、`UFFD_FEATURE_EVENT_FORK` には
+  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON` で、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
   メモリと共有の anonymous メモリを、ないページについて登録し
   （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
@@ -878,7 +878,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
   `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
   です。`UFFDIO_COPY_MODE_WP` は書き込み保護したページを埋め、範囲は書き込み保護に
-  ついて登録したものでなければなりません（`EINVAL`）。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
+  ついて登録したものでなければなりません（`EINVAL`）。`UFFDIO_POISON`
+  （`UFFD_FEATURE_POISON`）は、登録した範囲のページを同じやり方で poison にします。
+  モードは `DONTWAKE` だけで、このマッピングにページかガードがあるところは `EEXIST`
+  です。poison にしたページへのアクセスは、Linux の poison マーカーが
+  `VM_FAULT_HWPOISON` を返すのと同じく、保護の確認の後、範囲がまだ登録されているか
+  どうかにかかわらず、`BUS_MCEERR_AR` と `si_addr_lsb` 12 の SIGBUS を起こします。
+  そこへのシステムコールのコピーは `EFAULT`、`MADV_POPULATE_READ` は `EHWPOISON` です。
+  poison は `mprotect` と `UFFDIO_UNREGISTER` では残り、`mremap` では一緒に動き、
+  `fork` した子には、プライベートなメモリでは引き継がれ、共有メモリでは引き継がれず、
+  `MADV_DONTNEED`、`MADV_FREE`、`munmap` で消えます。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
   `EINVAL`）、ノンブロッキングでなければ待ちます。`poll` は、Linux と同じく
   `UFFDIO_API` の前とブロックするファイルでは `POLLERR`、それ以外ではまだ読まれていない
   フォールトがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と

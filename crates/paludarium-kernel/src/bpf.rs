@@ -434,6 +434,15 @@ impl Map {
     fn elements(&self) -> MutexGuard<'_, Elements> {
         lock(&self.elements)
     }
+    /// Whether it holds `key`: `ENOENT` for an index past an array's end
+    /// and a key a hash does not hold.
+    fn holds(&self, key: &[u8]) -> Result<(), Errno> {
+        let held = match &*self.elements() {
+            Elements::Array(_) => index(key) < self.max_entries,
+            Elements::Hash(values) => values.contains_key(key),
+        };
+        if held { Ok(()) } else { Err(Errno::ENOENT) }
+    }
     /// `map_lookup_elem` of the map's type: `ENOENT` for none.
     fn get(&self, key: &[u8]) -> Result<Vec<u8>, Errno> {
         match &*self.elements() {
@@ -545,9 +554,20 @@ fn lookup(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     }
     check_op_flags(word(attr, 24), F_LOCK | F_CPU)?;
     let key = read_key(c, &map, word(attr, 8))?;
-    let value = map.get(&key)?;
-    write(c, word(attr, 16), &value)?;
+    copy_value(c, &map, &key, word(attr, 16))?;
     Ok(0)
+}
+
+/// Writes the value `key` holds at `at`: `ENOENT` for none, then `EFAULT`
+/// where it cannot go, which is checked before the value is made, so that a
+/// large array element that was never written costs nothing to refuse.
+fn copy_value(c: &Context<'_>, map: &Map, key: &[u8], at: u64) -> Result<(), Errno> {
+    map.holds(key)?;
+    c.mem
+        .check_write(GuestAddr(at), map.value_size as usize)
+        .map_err(|_| Errno::EFAULT)?;
+    let value = map.get(key)?;
+    write(c, at, &value)
 }
 
 /// `BPF_MAP_UPDATE_ELEM`, as Linux's `map_update_elem`.
@@ -750,9 +770,8 @@ fn array_lookup_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Resul
                 break;
             }
         };
-        let value = map.get(&key)?;
         write(c, element(keys, u64::from(done), key_size), &key)?;
-        write(c, element(values, u64::from(done), value_size), &value)?;
+        copy_value(c, map, &key, element(values, u64::from(done), value_size))?;
         done += 1;
         previous = Some(key);
     }

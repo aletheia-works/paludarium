@@ -1806,6 +1806,19 @@ mod tests {
         assert_eq!(s.x87.status_word() >> 11 & 7, 7, "loaded");
     }
     #[test]
+    fn ffreep_frees_a_register_and_pops() {
+        // fld1; fldz; fldpi; ffreep st(1); fxsave [rax]: st(1), then the top,
+        // are freed, which leaves the one from fld1.
+        let code = [
+            0xd9, 0xe8, 0xd9, 0xee, 0xd9, 0xeb, 0xdf, 0xc1, 0x0f, 0xae, 0x00,
+        ];
+        let (s, mem, _) = x87_run(&code, 5);
+        let mut area = [0; 5];
+        mem.read(GuestAddr(STACK_TOP - 0x2000), &mut area).unwrap();
+        assert_eq!(area[4], 0x80, "only R7 is in use");
+        assert_eq!(s.x87.status_word() & 0x3fff, 0x3000, "top 6, no exception");
+    }
+    #[test]
     fn fxsave_and_fxrstor_keep_the_x87_state() {
         // fld1; fxsave [rax]; fninit; fxrstor [rax]
         let code = [0xd9, 0xe8, 0x0f, 0xae, 0x00, 0xdb, 0xe3, 0x0f, 0xae, 0x08];

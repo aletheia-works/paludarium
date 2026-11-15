@@ -1508,6 +1508,10 @@ impl Exec<'_> {
             (M::Fldl2e, None) => unit.load_constant(LOG2_E),
             (M::Fldl2t, None) => unit.load_constant(LOG2_10),
             (M::Ffree, None) => unit.free(register),
+            (M::Ffreep, None) => {
+                unit.free(register);
+                unit.pop();
+            }
             (M::Fincstp, None) => unit.increment_top(),
             (M::Fdecstp, None) => unit.decrement_top(),
             (M::Fnop | M::Wait, None) => {}
@@ -2368,6 +2372,7 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
         | Mnemonic::Fcmovnu
         | Mnemonic::Fnop
         | Mnemonic::Ffree
+        | Mnemonic::Ffreep
         | Mnemonic::Fincstp
         | Mnemonic::Fdecstp
         | Mnemonic::Fnstcw

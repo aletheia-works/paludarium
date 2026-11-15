@@ -14,9 +14,10 @@
    x87-decimal: fbstp in each rounding, of each kind of value, and fbld, of
    digits and of nibbles above 9.
 
-   x87-state: the 16-bit fnstenv and fldenv (with 0x66), and fnsave and
-   frstor of both sizes. Where the last instruction and operand were is left
-   out: CPUs differ, and the emulator keeps none.
+   x87-state: the 16-bit fnstenv and fldenv (with 0x66), fnstenv with 0x66
+   and REX.W both, fnsave and frstor of both sizes, and ffreep. Where the
+   last instruction and operand were is left out: CPUs differ, and the
+   emulator keeps none.
 
    x87-exceptions: what each instruction leaves where its exception is not
    masked, which SIGFPE then comes at the next instruction that waits, with
@@ -363,8 +364,34 @@ static void words(const char *label, const unsigned char *image, int wide) {
     }
 }
 
+/* ffreep st(i) frees st(i) and pops, with no exception: the tags and the
+   top it leaves, from st(1) of three values and from an empty st(0). C0 to
+   C3 are left out, as the manuals leave them undefined after it. */
+static void ffreep_cases(void) {
+    static unsigned char area[512] __attribute__((aligned(16)));
+    uint16_t status;
+    __asm__ volatile("fninit\n fld1\n fldz\n fldpi\n ffreep %%st(1)\n fnstsw %0\n fxsave %1"
+                     : "=m"(status), "=m"(area));
+    printf("ffreep st(1): sw=%04x tags=%02x\n", status & ~0x4700, area[4]);
+    __asm__ volatile("fninit\n ffreep %%st(0)\n fnstsw %0\n fxsave %1" : "=m"(status), "=m"(area));
+    printf("ffreep empty: sw=%04x tags=%02x\n", status & ~0x4700, area[4]);
+}
+
 static void state_cases(void) {
     static const struct x87_value nan = {3ULL << 62, 0x7fff};
+    {
+        /* With REX.W as well, 0x66 does not give the 14-byte layout. A
+           static image, which is addressed from rip, so that no other REX
+           comes after this one. */
+        static unsigned char env[32];
+        memset(env, 0x55, sizeof env);
+        __asm__ volatile("fninit\n fld1\n .byte 0x66, 0x48\n fnstenv %0" : "=m"(env));
+        words("fnstenv 66 rex.w", env, 1);
+        printf(" after it ");
+        hex(env + 28, 4);
+        printf("\n");
+    }
+    ffreep_cases();
     for (int k = 0; k < 2; k++) {
         unsigned char env[32];
         uint16_t after, word = k ? 0x0260 : 0x037f;

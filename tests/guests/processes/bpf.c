@@ -4,11 +4,16 @@
    batch commands, BPF_OBJ_GET_INFO_BY_FD, fdinfo, and the rule that keeps
    a user without CAP_BPF out (kernel.unprivileged_bpf_disabled, 2).
 
+   The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
+   what they find, and the memory fdinfo gives a map (memlock), with the
+   ENOMEM of a map larger than any machine, as Linux 7.0 counts it.
+
    A hash's keys come in an order of its buckets, which a random seed
-   picks: they are given sorted. Map IDs, the memory a map is charged and
-   the size Linux knows of its union are not printed, as they differ
-   between runs or kernels. Programs, BTF and links are not used. The
-   cases run as root, as the guest does. */
+   picks: they are given sorted. The IDs themselves, which other maps on
+   the machine move, the memory of a preallocated hash, which counts the
+   possible CPUs, but for its difference between sizes, and the size Linux
+   knows of its union are not printed. Programs, BTF and links are not
+   used. The cases run as root, as the guest does. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -26,6 +31,8 @@
 #define MAP_UPDATE_ELEM 2
 #define MAP_DELETE_ELEM 3
 #define MAP_GET_NEXT_KEY 4
+#define MAP_GET_NEXT_ID 12
+#define MAP_GET_FD_BY_ID 14
 #define OBJ_GET_INFO_BY_FD 15
 #define MAP_LOOKUP_AND_DELETE_ELEM 21
 #define MAP_FREEZE 22
@@ -37,6 +44,7 @@
 #define TYPE_HASH 1
 #define TYPE_ARRAY 2
 
+#define F_NO_PREALLOC (1 << 0)
 #define F_NO_COMMON_LRU (1 << 1)
 #define F_NUMA_NODE (1 << 2)
 #define F_RDONLY (1 << 3)
@@ -44,6 +52,7 @@
 #define F_ZERO_SEED (1 << 6)
 #define F_RDONLY_PROG (1 << 7)
 #define F_WRONLY_PROG (1 << 8)
+#define F_MMAPABLE (1 << 10)
 #define F_PRESERVE_ELEMS (1 << 11)
 
 #define ANY 0
@@ -73,6 +82,9 @@ union attr {
         uint32_t bpf_fd, info_len;
         uint64_t info;
     } info;
+    struct {
+        uint32_t start_id, next_id, open_flags;
+    } id;
     unsigned char bytes[128];
 };
 
@@ -470,11 +482,194 @@ static int case_batch(void) {
     return 0;
 }
 
+/* The ID BPF_OBJ_GET_INFO_BY_FD gives a map. */
+static uint32_t id_of(int fd) {
+    struct map_info mi;
+    memset(&mi, 0, sizeof mi);
+    union attr q;
+    memset(&q, 0, sizeof q);
+    q.info.bpf_fd = (uint32_t)fd;
+    q.info.info_len = sizeof mi;
+    q.info.info = (uintptr_t)&mi;
+    return bpf(OBJ_GET_INFO_BY_FD, &q, sizeof q) < 0 ? 0 : mi.id;
+}
+
+static long next_id(uint32_t start, uint32_t *next) {
+    union attr a;
+    memset(&a, 0, sizeof a);
+    a.id.start_id = start;
+    a.id.next_id = 12345;
+    long r = bpf(MAP_GET_NEXT_ID, &a, sizeof a);
+    *next = a.id.next_id;
+    return r;
+}
+
+static long fd_by_id(uint32_t id, uint32_t open_flags) {
+    union attr a;
+    memset(&a, 0, sizeof a);
+    a.id.start_id = id;
+    a.id.open_flags = open_flags;
+    return bpf(MAP_GET_FD_BY_ID, &a, sizeof a);
+}
+
+/* Whether an ID is among those BPF_MAP_GET_NEXT_ID walks from 0, and how
+   the walk ends. */
+static int listed(uint32_t id, long *end) {
+    uint32_t at = 0, next;
+    int found = 0;
+    while ((*end = next_id(at, &next)) == 0) {
+        if (next == id) found = 1;
+        if (next <= at) break;
+        at = next;
+    }
+    return found;
+}
+
+static int case_ids(void) {
+    int map = make(TYPE_ARRAY, 4, 8, 4, 0);
+    int other = make(TYPE_HASH, 4, 8, 4, 0);
+    uint32_t id = id_of(map), second = id_of(other), next = 0;
+    say("ids %d increasing %d", id > 0, second > id);
+    long r = next_id(id - 1, &next);
+    say("next of the one before %ld is it %d", r, next == id);
+    r = next_id(id, &next);
+    say("next %ld past it %d", r, next > id);
+    long end;
+    int found = listed(id, &end);
+    say("listed %d end %ld", found, end);
+    say("next from the last %ld", next_id(0x7ffffffe, &next));
+    say("next from int max %ld", next_id(0x7fffffff, &next));
+    union attr a;
+    memset(&a, 0, sizeof a);
+    a.bytes[8] = 1;
+    say("next with more %ld", bpf(MAP_GET_NEXT_ID, &a, sizeof a));
+
+    long fd = fd_by_id(id, 0);
+    say("fd by id %s same %d cloexec %d access %d", fd >= 0 ? "fd" : "error", fd >= 0 && id_of((int)fd) == id,
+        fd >= 0 && (fcntl((int)fd, F_GETFD) & FD_CLOEXEC) != 0, fd >= 0 ? fcntl((int)fd, F_GETFL) & O_ACCMODE : -1);
+    uint32_t key = 2;
+    uint64_t value = 77, got = 0;
+    elem(MAP_UPDATE_ELEM, map, &key, &value, ANY);
+    r = elem(MAP_LOOKUP_ELEM, (int)fd, &key, &got, 0);
+    say("seen through it %ld %llu", r, (unsigned long long)got);
+    long readonly = fd_by_id(id, F_RDONLY), writeonly = fd_by_id(id, F_WRONLY);
+    say("read only access %d update %ld write only access %d lookup %ld",
+        readonly >= 0 ? fcntl((int)readonly, F_GETFL) & O_ACCMODE : (int)readonly,
+        elem(MAP_UPDATE_ELEM, (int)readonly, &key, &value, ANY),
+        writeonly >= 0 ? fcntl((int)writeonly, F_GETFL) & O_ACCMODE : (int)writeonly,
+        elem(MAP_LOOKUP_ELEM, (int)writeonly, &key, &got, 0));
+    close((int)readonly);
+    close((int)writeonly);
+    say("both access %ld", fd_by_id(id, F_RDONLY | F_WRONLY));
+    say("other flag %ld", fd_by_id(id, 1));
+    memset(&a, 0, sizeof a);
+    a.id.start_id = id;
+    a.bytes[12] = 1;
+    say("fd by id with more %ld", bpf(MAP_GET_FD_BY_ID, &a, sizeof a));
+    say("fd by id 0 %ld", fd_by_id(0, 0));
+
+    /* A map stays while a descriptor has it, and its ID goes with it. */
+    close(map);
+    r = elem(MAP_LOOKUP_ELEM, (int)fd, &key, &got, 0);
+    long again = fd_by_id(id, 0);
+    say("after its first closes %ld %llu again %s", r, (unsigned long long)got, again >= 0 ? "fd" : "error");
+    close((int)again);
+    close((int)fd);
+    say("after all close %ld", fd_by_id(id, 0));
+    r = next_id(id - 1, &next);
+    say("next of the one before %d", r == -ENOENT || next != id);
+    found = listed(id, &end);
+    say("listed after %d end %ld", found, end);
+
+    /* Without CAP_SYS_ADMIN, the IDs are not given; the attributes are
+       checked first. */
+    pid_t child = fork();
+    if (child == 0) {
+        if (setresuid(65534, 65534, 65534) < 0) _exit(1);
+        say("unprivileged next %ld", next_id(0, &next));
+        say("unprivileged fd by id %ld", fd_by_id(second, 0));
+        say("unprivileged next from int max %ld", next_id(0x7fffffff, &next));
+        say("unprivileged other flag %ld", fd_by_id(second, 1));
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    say("child status %d", status);
+    close(other);
+    return 0;
+}
+
+/* The memlock line of a map's fdinfo. */
+static unsigned long long memlock(int fd) {
+    char path[64], line[128];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    FILE *info = fopen(path, "r");
+    unsigned long long value = 0;
+    while (info && fgets(line, sizeof line, info))
+        if (sscanf(line, "memlock: %llu", &value) == 1) break;
+    if (info) fclose(info);
+    return value;
+}
+
+static void array_memory(uint32_t value, uint32_t entries, uint32_t flags) {
+    int fd = make(TYPE_ARRAY, 4, value, entries, flags);
+    say("array value %u entries %u flags %#x memlock %llu", value, entries, flags, memlock(fd));
+    close(fd);
+}
+
+static int case_memory(void) {
+    array_memory(8, 1, 0);
+    array_memory(8, 1000, 0);
+    array_memory(1, 3, 0);
+    array_memory(24, 10, F_MMAPABLE);
+    array_memory(4097, 3, F_MMAPABLE);
+
+    /* A hash made as it is filled, by the elements it holds. */
+    int hash = make(TYPE_HASH, 4, 8, 4, F_NO_PREALLOC);
+    say("sparse hash empty %llu", memlock(hash));
+    uint64_t value = 1;
+    for (uint32_t key = 0; key < 3; key++) elem(MAP_UPDATE_ELEM, hash, &key, &value, ANY);
+    say("sparse hash of 3 %llu", memlock(hash));
+    uint32_t key = 1;
+    elem(MAP_DELETE_ELEM, hash, &key, NULL, 0);
+    say("sparse hash of 2 %llu", memlock(hash));
+    close(hash);
+    hash = make(TYPE_HASH, 9, 3, 100, F_NO_PREALLOC);
+    say("sparse hash key 9 value 3 %llu", memlock(hash));
+    close(hash);
+
+    /* A preallocated one, which counts a spare element a CPU: how sizes
+       differ, and that what it holds does not change it. */
+    int one = make(TYPE_HASH, 4, 8, 1, 0), hundred = make(TYPE_HASH, 4, 8, 100, 0);
+    unsigned long long before = memlock(hundred);
+    say("hash of 100 less hash of 1 %llu", before - memlock(one));
+    key = 5;
+    elem(MAP_UPDATE_ELEM, hundred, &key, &value, ANY);
+    say("hash filled same %d", memlock(hundred) == before);
+    close(one);
+    close(hundred);
+
+    /* More than any machine has. */
+    create("huge array", map_attr(TYPE_ARRAY, 4, 1 << 30, 1 << 20, 0));
+    create("huge mmapable array", map_attr(TYPE_ARRAY, 4, 1 << 30, 1 << 20, F_MMAPABLE));
+    create("huge hash", map_attr(TYPE_HASH, 4, 1 << 21, 1 << 20, 0));
+    union attr a = map_attr(TYPE_HASH, 4, 1 << 21, 1 << 20, F_NO_PREALLOC);
+    long fd = bpf(MAP_CREATE, &a, sizeof a);
+    say("huge sparse hash %s memlock %llu", fd >= 0 ? "fd" : "error", fd >= 0 ? memlock((int)fd) : 0);
+    if (fd >= 0) close((int)fd);
+    create("hash past the buckets", map_attr(TYPE_HASH, 4, 8, (1u << 27) + 1, F_NO_PREALLOC));
+    create("hash past 2^31", map_attr(TYPE_HASH, 4, 8, (1u << 31) + 1, F_NO_PREALLOC));
+    return 0;
+}
+
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
     if (!strcmp(mode, "bpf-calls")) return case_calls();
     if (!strcmp(mode, "bpf-elements")) return case_elements();
     if (!strcmp(mode, "bpf-batch")) return case_batch();
+    if (!strcmp(mode, "bpf-ids")) return case_ids();
+    if (!strcmp(mode, "bpf-memory")) return case_memory();
     return 2;
 }

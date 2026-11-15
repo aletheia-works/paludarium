@@ -209,8 +209,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `ENABLE` もありません。
 - **BPF はマップだけ**：`bpf` が作るのは配列とハッシュだけです。プログラム
   （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
-  （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、ID（`BPF_*_GET_NEXT_ID`、`BPF_*_GET_FD_BY_ID`）、
-  トークン、イテレータ、統計は、Linux にあってここにないコマンドとして `ENOSYS` です。Linux に
+  （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
+  `BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、Linux にあってここにないコマンドとして `ENOSYS` です。Linux に
   コマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf はプログラムを読み込めず
   （最小のプログラムでの確認が `ENOSYS` で失敗します）、`bpftool feature` は、
   `BPF_PROG_LOAD` を呼んで `ENOSYS` かどうかを見るので、`bpf()` システムコールがないと
@@ -219,9 +219,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   値が使いうる CPU ごとに一つあり、テストのマシンとエミュレータで CPU の数え方が違うので、
   どのみち Linux と比べられません。ハッシュはキーをバイトの順に返します。Linux の順は
   バケットとランダムなシードで決まります。そのバッチは要素一つずつをバケットとして扱うので、
-  `in_batch` と `out_batch` は要素を数えます。マップにはメモリの上限も、Linux が断る
-  `memlock` の課金もなく（大きなマップも作れます。Linux は `ENOMEM` を返すことがあります）、
-  fdinfo の `memlock` は要素の大きさだけです。`BPF_F_MMAPABLE` は受け付けますが、マップの
+  `in_batch` と `out_batch` は要素を数えます。マップのメモリは Linux master ではなく
+  Linux 7.0 の構造体の大きさに従います（master のハッシュの要素はもっと小さい）。要素は書き込む
+  までマシンから取らず、メモリの cgroup にも課金しません。`ENOMEM` になるのはマシンの
+  4 GiB より大きいマップだけで、Linux は実際にあるメモリが尽きても `ENOMEM` を返すことが
+  あります。事前に確保するハッシュは、ホストの CPU ごとに予備の要素を数えます。Linux が
+  数えるのは使いうる CPU で、それより多いことがあります。マップの ID はエミュレートする
+  マシンのものなので、1 から始まり、ホストのマップは見えません。`BPF_F_MMAPABLE` は受け付けますが、マップの
   `mmap` は `ENODEV`、マップの SHA-256（`bpf_map_info.hash`）は `EINVAL` です。
   `kernel.unprivileged_bpf_disabled` はいつも 2 で、それを示す `/proc/sys/kernel` の
   ファイルはありません。

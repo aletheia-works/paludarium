@@ -238,9 +238,9 @@ verified.
   and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
 - **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
-  links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), IDs
-  (`BPF_*_GET_NEXT_ID`, `BPF_*_GET_FD_BY_ID`), tokens, iterators and
-  statistics are `ENOSYS`, as each command Linux has that is not here; a
+  links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
+  programs, BTF and links (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`
+  and the rest), tokens, iterators and statistics are `ENOSYS`, as each command Linux has that is not here; a
   number Linux has no command for is `EINVAL`, as there. So libbpf finds no
   program loads (its trivial-program probe fails with `ENOSYS`) and
   `bpftool feature` says the `bpf()` system call is not there, as it asks
@@ -251,10 +251,15 @@ verified.
   which a test machine and the emulator count differently. A hash gives
   its keys in the order of their bytes, where Linux's order follows its
   buckets and a random seed, and a batch of it takes each element as a
-  bucket of its own, so `in_batch` and `out_batch` count elements. Maps
-  take no memory limit and no `memlock` charge Linux would refuse (a huge
-  map is made, where Linux may give `ENOMEM`), and fdinfo's `memlock` is
-  the elements' size alone. `BPF_F_MMAPABLE` is taken but `mmap` of a map
+  bucket of its own, so `in_batch` and `out_batch` count elements. A map's
+  memory follows the sizes of Linux 7.0's structures, not Linux master's,
+  whose hash elements are smaller, and the elements are not taken from
+  the machine until they are written: no memory cgroup is charged, and
+  only a map larger than the machine's 4 GiB is `ENOMEM`, where Linux may
+  also run out of the memory it really has. A preallocated hash counts a
+  spare element for each CPU of the host, where Linux counts the possible
+  CPUs, which may be more. Map IDs are the emulated machine's, so they
+  start at 1 and do not see the host's maps. `BPF_F_MMAPABLE` is taken but `mmap` of a map
   is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
   `kernel.unprivileged_bpf_disabled` is always 2, with no
   `/proc/sys/kernel` file for it.

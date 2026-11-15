@@ -3112,8 +3112,25 @@ kernel.
   delete by count, with `count` written back (an array deletes nothing,
   `ENOTSUPP`). `BPF_OBJ_GET_INFO_BY_FD` gives a map's `struct bpf_map_info`
   up to the length asked for (`EBADFD` for no descriptor, `EINVAL` for one
-  of no map). Its fdinfo has `map_type`, `key_size`, `value_size`,
-  `max_entries`, `map_flags`, `map_extra`, `memlock`, `map_id` and
+  of no map). Every map has an ID of the machine's, handed out from 1 up
+  as Linux's `idr_alloc_cyclic` does and freed as the map's last
+  reference goes: `BPF_MAP_GET_NEXT_ID` gives the first one past
+  `start_id` (`ENOENT` past the last, `EINVAL` from `INT_MAX`) and
+  `BPF_MAP_GET_FD_BY_ID` a new close-on-exec descriptor of a map, open as
+  `open_flags` (`BPF_F_RDONLY` or `BPF_F_WRONLY`) asks (`ENOENT` for an ID
+  no map has); both need `CAP_SYS_ADMIN` (`EPERM`), after their fields are
+  checked (`EINVAL`). A map takes the memory Linux 7.0, which the x86-64
+  test machines run, gives it on x86-64: an array its 304-byte header and
+  every value rounded up to 8 bytes (a mappable one each page-aligned), a
+  hash its 896-byte header, 16 bytes a bucket (as many as `max_entries`
+  rounded up to a power of two; more than 2^31 entries, or buckets past
+  4 GiB, are `E2BIG`) and its elements, 48 bytes and the key and value
+  each rounded up to 8: every one and a spare a CPU, with 8 bytes a CPU
+  for it, when preallocated, or those it holds and 8 bytes each with
+  `BPF_F_NO_PREALLOC`. A map whose memory is more than the machine's
+  (`sysinfo`'s 4 GiB), checked as `vmalloc` checks it, is `ENOMEM`. Its
+  fdinfo has `map_type`, `key_size`, `value_size`, `max_entries`,
+  `map_flags`, `map_extra`, `memlock` (that memory), `map_id` and
   `frozen`. See [limitations](./limitations) for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns

@@ -226,6 +226,8 @@ pub struct Processes {
     pub(crate) keys: crate::keys::Keys,
     /// The traced tasks ([`crate::ptrace`]).
     pub(crate) traces: crate::ptrace::Traces,
+    /// The machine's BPF maps by ID.
+    pub(crate) bpf_maps: Arc<crate::bpf::Ids>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -250,6 +252,7 @@ impl Processes {
             kcmp_cookies: std::sync::OnceLock::new(),
             aio: Arc::default(),
             traces: crate::ptrace::Traces::default(),
+            bpf_maps: Arc::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {

@@ -2697,9 +2697,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   要ります（`EPERM`）。バッチのコマンドは、数を指定して検索、更新、削除、検索して削除を行い、
   `count` を書き戻します（配列は削除できません、`ENOTSUPP`）。`BPF_OBJ_GET_INFO_BY_FD` は
   マップの `struct bpf_map_info` を求められた長さまで返します（ディスクリプタがなければ
-  `EBADFD`、マップでなければ `EINVAL`）。fdinfo には `map_type`、`key_size`、`value_size`、
-  `max_entries`、`map_flags`、`map_extra`、`memlock`、`map_id`、`frozen` があります。
-  ないものは [制限](./limitations) を参照してください。
+  `EBADFD`、マップでなければ `EINVAL`）。どのマップにもマシンの ID があり、Linux の
+  `idr_alloc_cyclic` と同じく 1 から順に渡され、マップの最後の参照がなくなると空きます。
+  `BPF_MAP_GET_NEXT_ID` は `start_id` より後の最初の ID を返し（最後より後は `ENOENT`、
+  `INT_MAX` からは `EINVAL`）、`BPF_MAP_GET_FD_BY_ID` はマップの新しい close-on-exec の
+  ディスクリプタを `open_flags`（`BPF_F_RDONLY` か `BPF_F_WRONLY`）に従って開きます
+  （どのマップの ID でもなければ `ENOENT`）。どちらも、フィールドを確かめた（`EINVAL`）あとで
+  `CAP_SYS_ADMIN` が要ります（`EPERM`）。マップが取るメモリは、x86-64 のテストのマシンが
+  動かす Linux 7.0 が x86-64 で与えるものです。配列は 304 バイトのヘッダーと、8 バイトに
+  切り上げたすべての値です（マップできるものはそれぞれをページに揃えます）。ハッシュは
+  896 バイトのヘッダー、バケット一つに 16 バイト（`max_entries` を 2 のべき乗に切り上げた数。
+  2^31 を超えるエントリや 4 GiB を超えるバケットは `E2BIG`）と要素で、要素は 48 バイトと、
+  それぞれ 8 バイトに切り上げたキーと値です。事前に確保するものはすべての要素と CPU ごとに
+  予備を一つ、それを指す CPU ごとの 8 バイトを、`BPF_F_NO_PREALLOC` では持っている要素と
+  一つにつき 8 バイトを数えます。そのメモリがマシンのメモリ（`sysinfo` の 4 GiB）を、
+  `vmalloc` と同じ確かめ方で超えるマップは `ENOMEM` です。fdinfo には `map_type`、
+  `key_size`、`value_size`、`max_entries`、`map_flags`、`map_extra`、`memlock`
+  （そのメモリ）、`map_id`、`frozen` があります。ないものは [制限](./limitations) を
+  参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。

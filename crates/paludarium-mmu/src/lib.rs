@@ -1884,6 +1884,9 @@ impl Default for AddressSpaceData {
     }
 }
 
+/// `EBUSY`, which [`Errno`] does not name.
+const EBUSY: Errno = Errno(16);
+
 fn page_index(addr: u64) -> (u64, usize) {
     let page = addr / PAGE_SIZE;
     let dir = page / ENTRIES_PER_TABLE;
@@ -4123,7 +4126,7 @@ impl AddressSpaceData {
                 return Err(Errno::EPERM);
             }
             if m.userfault.is_some_and(|u| u.context != context) {
-                return Err(Errno(16)); // EBUSY
+                return Err(EBUSY);
             }
         }
         let registration = Userfault { context, modes };
@@ -4438,7 +4441,7 @@ impl AddressSpaceData {
             };
             let zero = entry.frame.get().is_none() && !entry.file;
             if !zero && entry.cow {
-                error = Some(Errno(16)); // EBUSY
+                error = Some(EBUSY);
                 break;
             }
             let taken = directory

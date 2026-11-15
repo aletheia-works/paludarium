@@ -993,7 +993,7 @@ fn a_userfaultfd_move_moves_exclusive_pages_and_refuses_markers() {
     let child = m.fork();
     assert_eq!(
         view.userfault_move(dst, src, PAGE_SIZE, 7, false),
-        (0, Some(Errno(16)))
+        (0, Some(Errno(16))) // EBUSY
     );
     m.write(GuestAddr(src + 1), b"t").unwrap();
     assert_eq!(

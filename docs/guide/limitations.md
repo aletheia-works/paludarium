@@ -68,8 +68,8 @@ verified.
   used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
-  root. As `mount` mounts nothing on `/proc` or `/dev` and has no bind
-  mounts, nothing can be mounted on the new root's `/proc` or `/dev`, so a
+  root. As `mount` mounts nothing on `/proc` or `/dev` and cannot bind
+  them, nothing can be mounted on the new root's `/proc` or `/dev`, so a
   program there finds only the files the directory holds. In a path that climbs above the root as written, `..` is
   taken from the names as written, where Linux takes a `..` after a
   symbolic link from the link's target. `maps` and `smaps` in `/proc` name
@@ -420,12 +420,13 @@ verified.
   `chown` gives a file, and those of a file a guest makes there, are kept
   only while the emulator runs, not on the host file. The next run sees
   every file there as root's again.
-- **mount and umount2, in part**: `mount` makes only tmpfs mounts; any
-  other type is `ENODEV`, as from a kernel without it. Once Linux's checks
-  before them pass, `MS_BIND`, `MS_MOVE`, `MS_REMOUNT`, `MS_SHARED`,
-  `MS_UNBINDABLE`, a read-only mount (`MS_RDONLY` or the `ro` option),
-  `MS_NOSYMFOLLOW` and a mount on the generated `/proc` or `/dev` give
-  `EOPNOTSUPP`, so a program learns they are not supported; `fsopen`,
+- **mount and umount2, in part**: `mount` makes only tmpfs and bind mounts;
+  any other type is `ENODEV`, as from a kernel without it. Once Linux's
+  checks before them pass, `MS_MOVE`, `MS_REMOUNT`, `MS_SHARED`,
+  `MS_UNBINDABLE`, a read-only tmpfs (`MS_RDONLY` or the `ro` option),
+  `MS_NOSYMFOLLOW` on a tmpfs, and a mount on, or a bind mount of, the
+  generated `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a
+  program learns they are not supported; `fsopen`,
   `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`,
   `mount_setattr`, `statmount`, `listmount` and `pivot_root` are not there
   (`ENOSYS`). Nothing propagates: every mount is private, and mountinfo
@@ -449,7 +450,14 @@ verified.
   namespace leaves that mount there, where Linux detaches it. A detached
   mount's open files keep working, but a working directory or a descriptor
   in it is used by its path, which no longer leads there. A mount ID is the
-  lowest free one from 21, and the root's parent is shown as 1.
+  lowest free one from 21, and the root's parent is shown as 1. A bind
+  mount without `MS_REC` of a directory with a mount from start-up below it
+  (a `--mount` directory) shows that mount's files there, where Linux shows
+  the directory under it. A bind mount keeps its source by path: a rename
+  in another namespace leaves it at the old path, and when its source is
+  removed it shows nothing, where Linux keeps the deleted directory and
+  mountinfo marks it `//deleted`. A descriptor's mount ID (`statx` with
+  `AT_EMPTY_PATH`, fdinfo) is found by the path it was opened by.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the

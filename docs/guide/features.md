@@ -1408,11 +1408,28 @@ kernel.
   and tmpfs's options as Linux's `shmem_show_options` prints them. A path
   steps into the topmost mount on each directory it passes, and `..` at a
   mount's root goes to where it is mounted; `rename` and `link` from one
-  mount to another are `EXDEV`, `rmdir` and `rename` of a mount point
-  `EBUSY`, and a rename moves the mounts below the directory it moves.
-  `MS_PRIVATE` and `MS_SLAVE` (with `MS_REC` or not) of a mount's root
-  succeed, as every mount is private already, after `do_change_type`'s
-  checks (`EINVAL`).
+  mount to another are `EXDEV`, `rmdir`, `unlink` and `rename` of a mount
+  point `EBUSY`, and a rename moves the mounts below the directory it
+  moves. `MS_PRIVATE` and `MS_SLAVE` (with `MS_REC` or not) of a mount's
+  root succeed, as every mount is private already, after
+  `do_change_type`'s checks (`EINVAL`).
+- `mount` with `MS_BIND` makes a bind mount, after the same checks up to
+  `CAP_SYS_ADMIN`, as Linux's `do_loopback`: a source (`EINVAL` for none or
+  an empty one), looked up with its links followed (`ENOENT`, `ENOTDIR`,
+  `ELOOP`, `EACCES`), a target whose mount is in the caller's namespace
+  (`EINVAL`), and a directory on a directory or a file on a file
+  (`ENOTDIR`). The new mount shows the source's mount's file system from
+  the source down, with that mount's device, type, source and flags (the
+  type, the data and the other flags of the call change nothing, so
+  `MS_RDONLY` with it does not make it read-only), an ID of its own, and the
+  source as its root in mountinfo's fourth field. It is not locked; without
+  `MS_REC` a locked mount below the source is `EINVAL`
+  (`has_locked_children`), and with it the mounts below come along as
+  copies, each locked if its original was. A tmpfs stays while a bind mount
+  of it does, after its first mount goes, and a bind mount keeps showing its
+  source after a rename of it. `statx` and `/proc/self/fdinfo` give a
+  file's mount ID by its path, so a bind mount's files have the bind
+  mount's.
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`; then, as Linux's
   `can_umount` and `do_umount`, it needs `CAP_SYS_ADMIN` over the mount

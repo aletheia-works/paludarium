@@ -4809,8 +4809,9 @@ pub(crate) fn dispatch(
         _ => Err(Errno::ENOSYS),
     }
 }
-/// For a `write` to a `NETLINK_ROUTE` socket, the peers its requests name
-/// as the writer sees them, and its credentials, which the send takes, as
+/// For a `write` to a `NETLINK_ROUTE` socket, [`nsid::resolve`]: the
+/// peers its ID requests name as the writer sees them, and the writer's
+/// credentials for their `CAP_NET_ADMIN`, which the send takes, as
 /// Linux's `netlink_sendmsg` runs in the writer's `current`.
 pub(crate) fn resolving(
     c: &Context<'_>,

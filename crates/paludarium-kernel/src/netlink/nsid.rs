@@ -282,8 +282,6 @@ fn named<'a>(tb: &[Option<&'a [u8]>; 6]) -> Option<(Found, &'a [u8])> {
         tb[usize::from(NETNSA_FD)].map(|value| (resolved(Reference::Fd(u32_of(value))), value))
     }
 }
-/// An `RTM_NEWNSID` message of `nsid`, and with `current` its
-/// `NETNSA_CURRENT_NSID` (`rtnl_net_fill`).
 /// `rtnl_net_fill`: a `kind` message with the ID `nsid`, and `current`
 /// as `NETNSA_CURRENT_NSID`.
 fn fill(kind: u16, flags: u16, seq: u32, port: u32, nsid: i32, current: Option<i32>) -> Vec<u8> {

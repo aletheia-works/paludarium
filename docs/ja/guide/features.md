@@ -29,9 +29,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - x87 の命令は、すべての丸めモードで、値の移動、変換、比較と、制御ワード、状態ワード、
   環境、スタックの操作を行います。すべての丸めモードと精度で、加減乗除と平方根を計算し、
   `FPREM`、`FPREM1`、`FSCALE`、`FRNDINT`、`FXTRACT`、`FCOM` の仲間、`FLD` の定数、
-  `FCMOV` も実行します。超越関数の命令と 10 進数はまだ実装していません
-  （[制限](./limitations)）。シグナルハンドラは、Linux と同じく x87 と SSE の状態を
-  リセット直後にして始まります。
+  `FCMOV` と、glibc と musl の `long double` の数学関数が使う超越関数の命令
+  （`FSIN`、`FCOS`、`FSINCOS`、`FPTAN`、`FPATAN`、`F2XM1`、`FYL2X`、`FYL2XP1`）も
+  正しく丸めて実行します。これは実際の CPU の最後のビットと同じとは限りません
+  （[制限](./limitations)）。10 進数はまだ実装していません。シグナルハンドラは、
+  Linux と同じく x87 と SSE の状態をリセット直後にして始まります。
 - AVX、AVX-512、MMX は対象外です。glibc が必須とするので `CPUID` は MMX を示しますが、
   その命令は `SIGILL` で止まります。
 
@@ -839,28 +841,44 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   先に確かめます。ファイルは読み出し用の `anon_inode:[userfaultfd]` で、誰が持っていても
   作られたアドレス空間のものです。`UFFDIO_API` はバージョンと機能を一度だけ受け取り
   （2 度目は `EINVAL`）、提供する機能と ioctl を書き戻します。失敗したときは 0 を
-  書きます。提供する機能は `UFFD_FEATURE_SIGBUS`、`UFFD_FEATURE_THREAD_ID`、
+  書きます。提供する機能は `UFFD_FEATURE_PAGEFAULT_FLAG_WP`、`UFFD_FEATURE_SIGBUS`、
+  `UFFD_FEATURE_THREAD_ID`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
   `UFFD_FEATURE_MISSING_HUGETLBFS` で、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
-  メモリと共有の anonymous メモリを、ないページについて登録します
-  （`UFFDIO_REGISTER_MODE_MISSING`）。確かめることと順は Linux と同じで（範囲、次に
-  各 VMA。登録できないものは `EINVAL`、ほかの `userfaultfd` のものは `EBUSY`）、
-  登録した部分は `/proc/<pid>/maps` に見えるとおり VMA に分かれ、`smaps` に `um` が
+  メモリと共有の anonymous メモリを、ないページについて登録し
+  （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
+  ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
+  が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
+  ものは `EINVAL`、ほかの `userfaultfd` のものは `EBUSY`）、モードは、VMA がすでに
+  持っていなければその VMA のモードに置き換わります。登録した部分は
+  `/proc/<pid>/maps` に見えるとおり VMA に分かれ、`smaps` に `um` と `uw` が
   つきます。`fork` した子と、`mremap` が動かしたマッピングには引き継がれず、
-  `UFFDIO_UNREGISTER` とファイルを閉じることで外れます。登録したページでまだない
-  もの（共有メモリでは、どのマッピングにもないもの）に命令が触れると待ち、ファイルは
-  そのフォールトを古い順に `uffd_msg` として読みます。書き込みかどうか、ページの
-  アドレス（`UFFD_FEATURE_EXACT_ADDRESS` ではアドレスそのもの）、
-  `UFFD_FEATURE_THREAD_ID` ではスレッドの ID が入ります。待ちは、`UFFDIO_COPY` か
-  `UFFDIO_ZEROPAGE` がページを埋めたとき（`DONTWAKE` でなければ）、`UFFDIO_WAKE` か
-  `UFFDIO_UNREGISTER` がその範囲を取ったとき、ファイルが閉じられたとき、シグナルが
-  来たときに終わり、命令は、Linux がフォールトをやり直すのと同じくもう一度動きます。
-  `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。`UFFDIO_COPY` と
+  `UFFDIO_UNREGISTER` とファイルを閉じることで外れます。ないページについて登録した
+  ページでまだないもの（共有メモリでは、どのマッピングにもないもの）に命令が触れるか、
+  書き込み保護について登録した範囲の保護されたページに書き込むと待ち、ファイルは
+  そのフォールトを古い順に `uffd_msg` として読みます。書き込みかどうか、保護された
+  ページなら `UFFD_PAGEFAULT_FLAG_WP`、ページのアドレス
+  （`UFFD_FEATURE_EXACT_ADDRESS` ではアドレスそのもの）、`UFFD_FEATURE_THREAD_ID`
+  ではスレッドの ID が入ります。待ちは、`UFFDIO_COPY` か `UFFDIO_ZEROPAGE` がページを
+  埋めたときか `UFFDIO_WRITEPROTECT` が保護を解いたとき（`DONTWAKE` でなければ）、
+  `UFFDIO_WAKE` がその範囲を取ったとき、`UFFDIO_UNREGISTER` がないページについて
+  登録した範囲からそれを取ったとき、ファイルが閉じられたとき、シグナルが来たときに
+  終わり、命令は、Linux がフォールトをやり直すのと同じくもう一度動きます。
+  `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。
+  `UFFDIO_WRITEPROTECT` は、`mwriteprotect_range` と同じく VMA ごとに、範囲のページを
+  保護するか保護を解きます。どの VMA も書き込み保護について登録したものでなければ
+  ならず（`ENOENT`。それより前の VMA は変わったあとです）、保護するときは
+  `DONTWAKE` を受け付けません（`EINVAL`）。エントリーのないページは、Linux に
+  present の PTE がないので保護しません。読んだだけのページは Linux のゼロページで、
+  保護します。`mprotect` は保護を残し、許さない書き込みはこれまでどおり SIGSEGV です。
+  `fork` した子、`mremap` による移動、`UFFDIO_UNREGISTER`、ファイルを閉じること、
+  書き込み保護のモードを置き換える登録で保護は外れます。`UFFDIO_COPY` と
   `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
   VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
   `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
-  です。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
+  です。`UFFDIO_COPY_MODE_WP` は書き込み保護したページを埋め、範囲は書き込み保護に
+  ついて登録したものでなければなりません（`EINVAL`）。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
   `EINVAL`）、ノンブロッキングでなければ待ちます。`poll` は、Linux と同じく
   `UFFDIO_API` の前とブロックするファイルでは `POLLERR`、それ以外ではまだ読まれていない
   フォールトがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と
@@ -888,7 +906,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux の既定値（`SEMMSL` 32000、`SEMMNS` 1024000000、`SEMOPM` 500、`SEMMNI` 32000、
   `SEMVMX` 32767）です。セットの ID はセグメントと同じように割り当てます。`semctl` には
   `IPC_STAT`、`IPC_SET`、`IPC_RMID`、`IPC_INFO`、`SEM_INFO`、`SEM_STAT`、`SEM_STAT_ANY`、
-  `GETVAL`、`SETVAL`、`GETALL`、`SETALL`、`GETPID`（呼び出し元の PID 名前空間の番号）、
+  `GETVAL`、`SETVAL`、`GETALL`、`SETALL`、`GETPID`（呼び出し元の PID 名前空間の番号。セマフォーがその `struct pid` を持ち続けるので、
+  そのプロセスが回収された後も返します。終了時の取り消しで変わったものも同じです）、
   `GETNCNT` と `GETZCNT`（待ちがどの操作で待っているかで数えます）があります。1 回の
   呼び出しの操作は、すべてまとめて行うか、どれも行いません。すぐに通らない操作は、待つ
   ことになる操作に `IPC_NOWAIT` があれば `EAGAIN` で、なければ変更で通れるようになるか、
@@ -1271,10 +1290,25 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `relatime`、Linux の `shmem_show_options` が出す tmpfs のオプションとともにそれを並べ
   ます。パスは通るディレクトリごとにいちばん上のマウントに入り、マウントのルートでの
   `..` はマウントした場所に出ます。マウントをまたぐ `rename` と `link` は `EXDEV`、
-  マウントポイントの `rmdir` と `rename` は `EBUSY` で、名前の変更は動かすディレクトリの
-  下のマウントも動かします。マウントのルートへの `MS_PRIVATE` と `MS_SLAVE`（`MS_REC`
-  付きでもなしでも）は、`do_change_type` の確認（`EINVAL`）のあと成功します。どの
-  マウントもはじめからプライベートだからです。
+  マウントポイントの `rmdir`、`unlink`、`rename` は `EBUSY` で、名前の変更は動かす
+  ディレクトリの下のマウントも動かします。マウントのルートへの `MS_PRIVATE` と
+  `MS_SLAVE`（`MS_REC` 付きでもなしでも）は、`do_change_type` の確認（`EINVAL`）の
+  あと成功します。どのマウントもはじめからプライベートだからです。
+- `MS_BIND` 付きの `mount` は、`CAP_SYS_ADMIN` までの同じ確認のあと、Linux の
+  `do_loopback` と同じくバインドマウントを作ります。ソースが要り（ないものや空のものは
+  `EINVAL`）、リンクをたどって探し（`ENOENT`、`ENOTDIR`、`ELOOP`、`EACCES`）、ターゲットの
+  マウントが呼び出し元の名前空間にあること（`EINVAL`）、ディレクトリの上にはディレクトリ、
+  ファイルの上にはファイルであること（`ENOTDIR`）が要ります。新しいマウントは、ソースの
+  マウントのファイルシステムをソースから下で見せます。デバイス、型、ソース、フラグは
+  そのマウントのものです（呼び出しの型、データ、ほかのフラグは何も変えないので、
+  `MS_RDONLY` を付けても読み出し専用になりません）。ID は自分のものを持ち、mountinfo の
+  4 つ目の欄にはソースをルートとして出します。ロックはされません。`MS_REC` がなければ、
+  ソースの下にロックされたマウントがあると `EINVAL`（`has_locked_children`）で、あれば
+  下のマウントも写しとして付いてきます。元がロックされていた写しはロックされます。
+  tmpfs は、最初のマウントを外したあとも、そのバインドマウントがある間は残ります。
+  バインドマウントは、ソースの名前を変えたあともそれを見せ続けます。`statx` と
+  `/proc/self/fdinfo` はファイルのマウント ID をパスから求めるので、バインドマウントの
+  ファイルはバインドマウントの ID を持ちます。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどります。そのあと Linux の `can_umount` と `do_umount`
   と同じく、マウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）、その名前空間のマウントの
@@ -1416,7 +1450,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     データグラムはそのソケットに届きます（なければ `ECONNREFUSED`）。`recvmsg` は送り手の
     `sockaddr_nl` を返し、`MSG_PEEK` と `MSG_TRUNC` が使えます。`SO_RCVBUF`、
     `SO_SNDBUF`、`SO_RCVTIMEO`、`NETLINK_PKTINFO`、`NETLINK_BROADCAST_ERROR`、
-    `NETLINK_NO_ENOBUFS`、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
+    `NETLINK_NO_ENOBUFS`、`NETLINK_LISTEN_ALL_NSID`（ソケットの名前空間への
+    `CAP_NET_BROADCAST` が要ります）、`NETLINK_CAP_ACK`、`NETLINK_EXT_ACK`、
     `NETLINK_GET_STRICT_CHK` を設定できます。Linux の `netlink_setsockopt` と同じく、
     `int` より短い値は 0 です。`NETLINK_PKTINFO` を付けると、`recvmsg` はデータグラムの
     グループ（ソケット自身のポートに来たものは 0）を `SOL_NETLINK` の `NETLINK_PKTINFO`
@@ -1458,7 +1493,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `inet_rtm_valid_getroute_req`、`inet6_rtm_valid_getroute_req` と同じく、アドレス
     全体の接頭辞長と経路を選ぶ属性だけを取ります。検査の有無にかかわらず、`lo` には
     マスターがないのでリンクのダンプの `IFLA_MASTER` はどのデバイスも見せず、ほかの
-    名前空間には ID がないので `IFLA_TARGET_NETNSID` は `EINVAL` です。`lo` には
+    名前空間のリンクは見せないので `IFLA_TARGET_NETNSID` は `EINVAL` です。`lo` には
     プレフィックス経路がないので、`RTM_F_PREFIX` はどの経路もダンプしません。
   - **属性のポリシー:** 各リクエストの属性は、まず Linux がそのリクエストに持つ
     ポリシー（`ifla_policy`、`ifa_ipv4_policy`、`ifa_ipv6_policy`、`rtm_ipv4_policy`、
@@ -1472,6 +1507,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     属性がポリシーに反するリンクのダンプは、属性をどれも使いません。リンクの変更は
     `IFLA_NET_NS_PID`、`IFLA_NET_NS_FD`、`IFLA_TARGET_NETNSID` のうち一つまでを
     取ります（`EINVAL`）。リンクの取得は、はじめの二つのどちらも取りません（`EOPNOTSUPP`）。
+  - **名前空間の ID:** Linux の `net_namespace.c` と同じく、`RTM_NEWNSID` は、
+    プロセス（`NETNSA_PID`、なければ `ESRCH`）か `/proc/<pid>/ns/net` の記述子
+    （`NETNSA_FD`、`EBADF`、ほかのファイルなら `EINVAL`）のネットワーク名前空間に
+    ID `NETNSA_NSID` を、負の値なら空いている一番小さい ID を与えます。どちらもなければ
+    `EINVAL`、すでに ID がある名前空間や使われている ID は `EEXIST` で、それぞれ Linux の
+    拡張 ACK のメッセージを付けます。`RTNLGRP_NSID` のメンバーは新しい ID を知らされます
+    （`NLM_F_ECHO` なら、そのうちリクエストした側だけが受け取ります）。`RTM_GETNSID` は、
+    プロセス、記述子、ID で指した名前空間の ID（なければ -1、だれも持たない ID は
+    `ENOENT`）を返し、`NETNSA_TARGET_NSID` を付けるとその名前空間が与えた ID を、
+    こちらの ID を `NETNSA_CURRENT_NSID` に添えて返します（その名前空間がなければ
+    `EINVAL`、それへの `CAP_NET_ADMIN` がなければ `EACCES`）。そのダンプは ID を順に
+    並べ、厳密な検査では `rtnl_net_dumpid` と同じく `NETNSA_TARGET_NSID` でほかの
+    名前空間を指せ、それ以外は取りません。`NETLINK_LISTEN_ALL_NSID` を付けたソケットは、
+    自分の名前空間が ID を与えた名前空間の通知も、開いた側がその名前空間への
+    `CAP_NET_BROADCAST` を持てば受け取ります。`recvmsg` はその ID を、
+    `do_one_broadcast` と `netlink_cmsg_listen_all_nsid` と同じく `NETLINK_PKTINFO`
+    の後の `SOL_NETLINK` の `NETLINK_LISTEN_ALL_NSID` 制御メッセージで返します。
   - **リンク:** `RTM_GETLINK` には、ダンプでも、インデックスか `IFLA_IFNAME` で指しても、
     `lo`（インデックス 1）を返します（ほかは `ENODEV`）。属性は Linux 7.0 と同じものを
     同じ順に載せます。フラグ、名前、キュー、状態、MTU、キューの数、セグメントの大きさ、キャリア、
@@ -1984,8 +2036,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   inode の数は、実際に持っているものです。マウントしたホストのディレクトリでは、
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
   `/proc/mounts` は呼び出し元のマウント名前空間のマウントの一覧です（ルートは `tmpfs`、
-  `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs のマウントは
-  ソースとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
+  `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs とバインドの
+  マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。
   `/proc/<pid>/mountinfo` と `mounts`（`/proc/thread-self` と `/proc/<pid>/task/<tid>` のものも）は、
   Linux の `mounts_open_common` と同じくそのタスクのもので、そのマウント名前空間のマウントを
@@ -1993,8 +2045,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   これらのファイルを持ちますが、開くと `EINVAL` です。ほかのスレッドより先に終わった
   リーダーのプロセスのもの（`/proc/<pid>/mountinfo`）も、開くと `EINVAL` です。残った
   スレッドの `task/<tid>` のものは開けます。
-  マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
-  `df` はどのマウントも表示します。パスから開いたのではないパイプ・ソケット・pidfd・
+  ファイルシステムごとに `mountinfo` のマウントの行と同じ `st_dev` を持つので、
+  `df` はどのファイルシステムも表示します。バインドマウントは、Linux と同じく、ソースと同じ
+  `st_dev` を持つので、`df` はそのデバイスを一度表示したあとは出しません。パスから開いたのではないパイプ・ソケット・pidfd・
   memfd・`memfd_secret` のファイル・名前空間のファイル・匿名 inode（eventfd や epoll
   など）は、Linux と同じく、それぞれのファイルシステム（pipefs・sockfs・pidfs・内部の
   tmpfs・secretmem・nsfs・anon_inodefs）が持つデバイスにあり、どれもマウントのもの
@@ -2193,7 +2246,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フラグを Linux と同じ順番で並べます。保護とそのなれる先（`mr`、`mw`、`me`、`ms`。
   読むためだけに開いたファイルと書き込みを封じたファイルには `mw` がなく、AIO と
   `io_uring` のリングと秘密のメモリには、何も実行しない疑似ファイルシステムなので
-  `me` がありません）、`sh`、最初のスタックの `gd`、`userfaultfd` が登録した範囲の `um`、ロック（`lo`、`lf`）、ガード
+  `me` がありません）、`sh`、最初のスタックの `gd`、`userfaultfd` が登録した範囲の `um` と `uw`、ロック（`lo`、`lf`）、ガード
   （`gu`）、アドバイス（`sr`、`rr`、`dc`、`wf`、`dd`、`hg`、`nh`、`mg`）、リングと秘密の
   メモリの `de`、`mm`、`dd`、課金（`ac`。書き込めたプライベートメモリが持ち、
   `MAP_NORESERVE` なら代わりに `nr` を持ちます。一度も書いていない匿名メモリは書き込め

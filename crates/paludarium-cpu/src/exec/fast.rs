@@ -292,6 +292,28 @@ pub enum Fast {
         dst: Register,
         mem: Address,
     },
+    /// `setcc r8`.
+    Set {
+        condition: Condition,
+        dst: Register,
+    },
+    /// `setcc [m8]`.
+    SetStore {
+        condition: Condition,
+        mem: Address,
+    },
+    /// `cmovcc r, r`.
+    Cmov {
+        condition: Condition,
+        dst: Register,
+        src: Register,
+    },
+    /// `cmovcc r, [m]`: the memory is read whatever the condition.
+    CmovLoad {
+        condition: Condition,
+        dst: Register,
+        mem: Address,
+    },
     /// `inc`, `dec`, `neg` or `not` of a register.
     Unary {
         op: Unary,
@@ -462,6 +484,44 @@ impl Fast {
                 target: branch(a)?,
             },
             Mnemonic::Jmp => Self::Jmp(branch(a)?),
+            Mnemonic::Setcc(condition) => {
+                if b.is_some() {
+                    return None;
+                }
+                match gpr(a) {
+                    Some(dst) if dst.size() == 1 => Self::Set { condition, dst },
+                    Some(_) => return None,
+                    None => {
+                        let mem = address(a)?;
+                        if mem.size != 1 {
+                            return None;
+                        }
+                        Self::SetStore { condition, mem }
+                    }
+                }
+            }
+            Mnemonic::Cmovcc(condition) => {
+                let dst = gpr(a)?;
+                match gpr(b) {
+                    Some(src) if src.size() == dst.size() => Self::Cmov {
+                        condition,
+                        dst,
+                        src,
+                    },
+                    Some(_) => return None,
+                    None => {
+                        let mem = address(b)?;
+                        if mem.size != dst.size() {
+                            return None;
+                        }
+                        Self::CmovLoad {
+                            condition,
+                            dst,
+                            mem,
+                        }
+                    }
+                }
+            }
             Mnemonic::Call => Self::Call(branch(a)?),
             Mnemonic::Ret if a.is_none() => Self::Ret,
             m if Unary::of(m).is_some() => {
@@ -651,6 +711,44 @@ pub(crate) fn execute(
         Fast::LeaTruncated { dst, mem } => {
             let ea = x.fast_address(&mem).0;
             x.write_reg(dst, ea & size_mask(dst.size()));
+            next
+        }
+        Fast::Set { condition, dst } => {
+            x.write_reg(dst, u64::from(alu::condition(x.s.rflags, condition)));
+            next
+        }
+        Fast::SetStore { condition, mem } => {
+            let v = u64::from(alu::condition(x.s.rflags, condition));
+            x.store(x.fast_linear(&mem), 1, v)?;
+            next
+        }
+        Fast::Cmov {
+            condition,
+            dst,
+            src,
+        } => {
+            let size = dst.size();
+            let v = if alu::condition(x.s.rflags, condition) {
+                x.read_reg(src)
+            } else {
+                x.read_reg(dst)
+            };
+            x.write_reg(dst, v & size_mask(size));
+            next
+        }
+        Fast::CmovLoad {
+            condition,
+            dst,
+            mem,
+        } => {
+            let size = dst.size();
+            let v = x.load(x.fast_linear(&mem), size)?;
+            let v = if alu::condition(x.s.rflags, condition) {
+                v
+            } else {
+                x.read_reg(dst)
+            };
+            x.write_reg(dst, v & size_mask(size));
             next
         }
         Fast::Unary { op, dst } => {

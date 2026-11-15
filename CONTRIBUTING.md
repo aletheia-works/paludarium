@@ -76,6 +76,9 @@ Japanese page with the same headings, and that every link to a heading
 id, so a link to a Japanese heading with a dakuten such as プ does not match it;
 give such a heading an explicit id, such as
 `## 確かめたプログラム {#programs-verified}`.
+`lint:all` also checks that `tests/guests/processes/x87_transcendental.h`, the
+x87 transcendental results, is what `x87_transcendental.py` writes; after
+changing the script, `mise run x87:table` writes the header again.
 
 The emulator is correct when it matches native x86-64 Linux. Differential tests,
 line coverage (80% floor), and fuzzing only produce real evidence on x86-64

@@ -1028,7 +1028,16 @@ pub(crate) fn mount_target(
     ptr: u64,
     follow: bool,
 ) -> Result<Option<Vec<u8>>, Errno> {
-    let p = looked_up(c, (-100i32) as u64, ptr, follow)?.0;
+    mount_path(c, path(c, ptr)?, follow)
+}
+/// [`mount_target`] of the path `raw`, as `kern_path` finds a bind mount's
+/// source.
+pub(crate) fn mount_path(
+    c: &Context<'_>,
+    raw: Vec<u8>,
+    follow: bool,
+) -> Result<Option<Vec<u8>>, Errno> {
+    let p = lookup(c, (-100i32) as u64, raw, follow)?.0;
     let p = match followed(c, &p, follow)? {
         Some(Followed::Path { path, .. }) => path,
         Some(Followed::File(d)) => d.path,
@@ -3166,7 +3175,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // Whether the file keeps inode flags, as a tmpfs one does, whose
     // `shmem_getattr` gives them as attributes.
     let noop = &mut |_: &mut u32| {};
-    let (s, device, block_size, kept) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    let (s, device, block_size, kept, at) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dir as i32 == -100 {
             let cwd = c
                 .files
@@ -3179,6 +3188,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 device(c, &cwd),
                 path_block_size(&cwd),
                 c.files.fs().with_attributes(&cwd, true, noop).is_ok(),
+                cwd,
             )
         } else {
             let d = c.files.descriptor(dir)?;
@@ -3187,18 +3197,20 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 descriptor_device(c, &d),
                 descriptor_block_size(c, &d),
                 d.file.with_attributes(noop).is_ok(),
+                d.path.clone(),
             )
         }
     } else {
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         let (p, _) = lookup(c, dir, raw, follow)?;
         match generated_stat(c, &p, follow)? {
-            Some((stat, device, block_size)) => (stat, device, block_size, false),
+            Some((stat, device, block_size)) => (stat, device, block_size, false, Vec::new()),
             None => (
                 c.files.fs().metadata(&p, follow)?,
                 device(c, &p),
                 path_block_size(&p),
                 c.files.fs().with_attributes(&p, follow, noop).is_ok(),
+                p,
             ),
         }
     };
@@ -3214,7 +3226,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // the unique one if that was, the one mountinfo shows otherwise, whose
     // IDs start at 21; an internal file system's mount has a small one that
     // mountinfo does not show, as Linux's internal mounts are not shown.
-    let id = mount_id(c, device);
+    let id = mount_id(c, device, &at);
     let (bit, id) = if mask & STATX_MNT_ID_UNIQUE != 0 {
         (STATX_MNT_ID_UNIQUE, 1 << 31 | id)
     } else {
@@ -3308,7 +3320,7 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let raw = path(c, a[1])?;
-    let (stat, device, kind) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    let (stat, device, kind, at) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dir as i32 == -100 {
             let cwd = c
                 .files
@@ -3316,19 +3328,22 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
-            named(c, &cwd, true)?
+            let (stat, device, kind) = named(c, &cwd, true)?;
+            (stat, device, kind, cwd)
         } else {
             let d = c.files.descriptor(dir)?;
             (
                 d.file.stat()?,
                 descriptor_device(c, &d),
                 descriptor_kind(c, &d)?,
+                d.path.clone(),
             )
         }
     } else {
         let follow = flags & AT_SYMLINK_FOLLOW != 0;
         let (p, _) = lookup(c, dir, raw, follow)?;
-        named(c, &p, follow)?
+        let (stat, device, kind) = named(c, &p, follow)?;
+        (stat, device, kind, p)
     };
     if flags & AT_HANDLE_CONNECTABLE != 0 || (flags & AT_HANDLE_FID == 0 && !exportable(kind)) {
         return Err(Errno::EOPNOTSUPP);
@@ -3348,7 +3363,7 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (kind, bytes) = file_handle(kind, device, stat.inode);
     // The file system takes the size in 4-byte words, as it encodes them.
     let fits = given >> 2 >= bytes.len() as u32 >> 2;
-    let id = mount_id(c, device);
+    let id = mount_id(c, device, &at);
     if flags & AT_HANDLE_MNT_ID_UNIQUE != 0 {
         output(c, mount, &(1u64 << 31 | id).to_le_bytes())?;
     } else {
@@ -3615,15 +3630,20 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
         c.files.fs().statfs(p)?
     })
 }
-/// The ID of the mount whose device is `device`, as `/proc/self/mountinfo`
-/// numbers it (each mount here has a superblock of its own, so the device
-/// names it); a detached one's, which mountinfo no longer lists, is 20 and
-/// its minor number. An internal file system's mount ([`Internal`]) has one
-/// of the small IDs below 21, as Linux's `kern_mount`s take theirs first,
-/// at boot.
-pub(crate) fn mount_id(c: &Context<'_>, device: u64) -> u64 {
+/// The ID of the mount holding `path`, a file whose device is `device`, as
+/// `/proc/self/mountinfo` numbers it: by the path while it is still on that
+/// device (a bind mount shares its superblock's device), else the first
+/// mount of the device; a detached one's, which mountinfo no longer lists,
+/// is 20 and its minor number. An internal file system's mount
+/// ([`Internal`]) has one of the small IDs below 21, as Linux's
+/// `kern_mount`s take theirs first, at boot.
+pub(crate) fn mount_id(c: &Context<'_>, device: u64, path: &[u8]) -> u64 {
     if let Some(i) = Internal::ALL.iter().position(|fs| fs.device() == device) {
         return i as u64 + 1;
+    }
+    let fs = c.files.fs();
+    if path.first() == Some(&b'/') && !generated(path) && fs.device(path) == device {
+        return fs.mount_id(path);
     }
     c.files
         .fs()
@@ -7264,7 +7284,7 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     // A file that cannot seek (a pipe, a socket) is at 0.
     let pos = d.file.seek(0, 1).unwrap_or(0);
     let ino = d.file.stat().map_or(0, |stat| stat.inode);
-    let mount = mount_id(c, descriptor_device(c, &d));
+    let mount = mount_id(c, descriptor_device(c, &d), &d.path);
     let mut out =
         format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t{mount}\nino:\t{ino}\n").into_bytes();
     out.extend(crate::record_locks::fdinfo(c, &d));
@@ -7272,7 +7292,9 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     if let Some(instance) = crate::inotify::of(&d.file) {
         out.extend(instance.fdinfo());
     } else if let Some(group) = crate::fanotify::of(&d.file) {
-        out.extend(group.fdinfo(&|device| mount_id(c, device)));
+        // Mount marks are kept by device, so a mark has no path to tell
+        // the bind mounts of one file system apart: the first mount's ID.
+        out.extend(group.fdinfo(&|device| mount_id(c, device, b"")));
     } else if let Some(uffd) = crate::userfaultfd::of(&d.file) {
         out.extend(crate::userfaultfd::fdinfo(uffd));
     } else if let Some(counter) = any.and_then(|a| a.downcast_ref::<crate::events::EventCounter>())

@@ -23,8 +23,6 @@ Nothing here is a promise, but these are on the table:
   their next releases pass the guest audit (the current ones are held back
   by yanked crates and security advisories in their dependencies).
 - More system calls and instructions (see [Limitations](../guide/limitations)).
-- x87's transcendental instructions for the `long double` math of programs on
-  glibc that reach them.
 - The native JIT (`--jit`, experimental on Linux x86-64): turning it on by
   default, other hosts (Arm64, macOS, Windows), and compiling more of each
   block (more instructions, blocks joined to each other, flags worked out

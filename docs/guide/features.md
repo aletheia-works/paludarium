@@ -35,8 +35,11 @@ Linux.
   control and status words, environment and stack, in every rounding mode. They
   add, subtract, multiply, divide and take square roots in every rounding mode
   and precision, and do `FPREM`, `FPREM1`, `FSCALE`, `FRNDINT`, `FXTRACT`, the
-  `FCOM` family, the `FLD` constants and `FCMOV`. The transcendental
-  instructions and packed decimals are not implemented yet
+  `FCOM` family, the `FLD` constants and `FCMOV`, and the transcendental
+  instructions (`FSIN`, `FCOS`, `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`,
+  `FYL2XP1`) that the `long double` math of glibc and musl uses, correctly
+  rounded, which is not always a real CPU's last bit
+  ([Limitations](./limitations)). Packed decimals are not implemented yet
   ([Limitations](./limitations)). A signal handler starts with the x87 and SSE
   state as after a reset, as on Linux.
 - AVX, AVX-512 and MMX are out of scope: `CPUID` reports MMX because glibc
@@ -933,31 +936,50 @@ kernel.
   space it was made in, whoever holds it. `UFFDIO_API` takes the version
   and the features once (`EINVAL` again), writing back the features it
   offers and its ioctls, or zeros when it fails; it offers
-  `UFFD_FEATURE_SIGBUS`, `UFFD_FEATURE_THREAD_ID`,
+  `UFFD_FEATURE_PAGEFAULT_FLAG_WP`, `UFFD_FEATURE_SIGBUS`,
+  `UFFD_FEATURE_THREAD_ID`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM` and
   `UFFD_FEATURE_MISSING_HUGETLBFS`, and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory and shared anonymous memory for missing pages
-  (`UFFDIO_REGISTER_MODE_MISSING`), with Linux's checks in its order (the
+  (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
+  protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
+  to the ioctls it reports), with Linux's checks in its order (the
   range, then each VMA: `EINVAL` for one that cannot be registered,
-  `EBUSY` for one another `userfaultfd` has), making VMAs of their own, as
-  `/proc/<pid>/maps` shows them, with `um` in `smaps`; a `fork`ed child and a
-  mapping `mremap` moves do not keep it, and `UFFDIO_UNREGISTER` and closing
-  the file take it away. An instruction that touches a registered page
-  that has none (in shared memory, one no mapping of it has) waits, and the
-  file reads the fault as a `uffd_msg`, the oldest first: whether it was a
-  write, the page's address (the exact one with
-  `UFFD_FEATURE_EXACT_ADDRESS`) and, with `UFFD_FEATURE_THREAD_ID`, the
-  thread's ID. The wait ends when `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` fills
-  the page (unless `DONTWAKE`), `UFFDIO_WAKE` or `UFFDIO_UNREGISTER` takes
-  its range, or the file is closed, and a signal ends it too; then the
-  instruction runs again, as Linux retries the fault. With
-  `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`) instead.
+  `EBUSY` for one another `userfaultfd` has); the modes replace a VMA's
+  own unless it has them already. The ranges make VMAs of their own, as
+  `/proc/<pid>/maps` shows them, with `um` and `uw` in `smaps`; a `fork`ed
+  child and a mapping `mremap` moves do not keep it, and
+  `UFFDIO_UNREGISTER` and closing the file take it away. An instruction
+  that touches a page registered for missing pages that has none (in
+  shared memory, one no mapping of it has), or that writes to a
+  write-protected page of a range registered for write protection, waits,
+  and the file reads the fault as a `uffd_msg`, the oldest first: whether
+  it was a write, `UFFD_PAGEFAULT_FLAG_WP` for a protected page, the page's
+  address (the exact one with `UFFD_FEATURE_EXACT_ADDRESS`) and, with
+  `UFFD_FEATURE_THREAD_ID`, the thread's ID. The wait ends when
+  `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` fills the page or
+  `UFFDIO_WRITEPROTECT` ends its protection (unless `DONTWAKE`),
+  `UFFDIO_WAKE` takes its range, `UFFDIO_UNREGISTER` takes it from a range
+  registered for missing pages, or the file is closed, and a signal ends
+  it too; then the instruction runs again, as Linux retries the fault.
+  With `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`)
+  instead. `UFFDIO_WRITEPROTECT` protects the pages of its range, or ends
+  their protection, VMA by VMA as `mwriteprotect_range` does: each must be
+  registered for write protection (`ENOENT`, once the ones before it
+  changed), and protecting does not take `DONTWAKE` (`EINVAL`). A page
+  with no entry, which Linux has no present PTE for, is not protected; one
+  only read is Linux's zero page, and is. `mprotect` keeps the protection,
+  and refuses a write it does not permit with SIGSEGV as before; a
+  `fork`ed child, a move by `mremap`, `UFFDIO_UNREGISTER`, closing the
+  file and a registration that replaces the write-protect mode take it
+  away.
   `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
   does: `ENOENT` for a range that does not lie in one registered VMA,
   `EEXIST` for a page that has one, `EFAULT` for a source that cannot be
   read, and `EAGAIN` once one stops short, with what was filled in the
-  struct's last field. A read takes whole messages (`EINVAL` for a buffer
+  struct's last field; `UFFDIO_COPY_MODE_WP` fills write-protected pages,
+  in a range registered for write protection (`EINVAL`). A read takes whole messages (`EINVAL` for a buffer
   too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
   `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
   Linux's does, else `POLLIN` while a fault is not read yet.
@@ -988,7 +1010,9 @@ kernel.
   1024000000, `SEMOPM` 500, `SEMMNI` 32000, `SEMVMX` 32767); a set's IDs are
   given out as a segment's. `semctl` has `IPC_STAT`, `IPC_SET`, `IPC_RMID`,
   `IPC_INFO`, `SEM_INFO`, `SEM_STAT`, `SEM_STAT_ANY`, `GETVAL`, `SETVAL`,
-  `GETALL`, `SETALL`, `GETPID` (in the caller's PID namespace), `GETNCNT`
+  `GETALL`, `SETALL`, `GETPID` (in the caller's PID namespace, still once
+  that process is reaped, as each semaphore keeps its `struct pid`, the
+  undo at its exit's included), `GETNCNT`
   and `GETZCNT` (counted by the operation each wait waits on). The
   operations of one call are done all at once or not at all; one that
   cannot go through waits, unless the operation it would wait on has
@@ -1447,11 +1471,28 @@ kernel.
   and tmpfs's options as Linux's `shmem_show_options` prints them. A path
   steps into the topmost mount on each directory it passes, and `..` at a
   mount's root goes to where it is mounted; `rename` and `link` from one
-  mount to another are `EXDEV`, `rmdir` and `rename` of a mount point
-  `EBUSY`, and a rename moves the mounts below the directory it moves.
-  `MS_PRIVATE` and `MS_SLAVE` (with `MS_REC` or not) of a mount's root
-  succeed, as every mount is private already, after `do_change_type`'s
-  checks (`EINVAL`).
+  mount to another are `EXDEV`, `rmdir`, `unlink` and `rename` of a mount
+  point `EBUSY`, and a rename moves the mounts below the directory it
+  moves. `MS_PRIVATE` and `MS_SLAVE` (with `MS_REC` or not) of a mount's
+  root succeed, as every mount is private already, after
+  `do_change_type`'s checks (`EINVAL`).
+- `mount` with `MS_BIND` makes a bind mount, after the same checks up to
+  `CAP_SYS_ADMIN`, as Linux's `do_loopback`: a source (`EINVAL` for none or
+  an empty one), looked up with its links followed (`ENOENT`, `ENOTDIR`,
+  `ELOOP`, `EACCES`), a target whose mount is in the caller's namespace
+  (`EINVAL`), and a directory on a directory or a file on a file
+  (`ENOTDIR`). The new mount shows the source's mount's file system from
+  the source down, with that mount's device, type, source and flags (the
+  type, the data and the other flags of the call change nothing, so
+  `MS_RDONLY` with it does not make it read-only), an ID of its own, and the
+  source as its root in mountinfo's fourth field. It is not locked; without
+  `MS_REC` a locked mount below the source is `EINVAL`
+  (`has_locked_children`), and with it the mounts below come along as
+  copies, each locked if its original was. A tmpfs stays while a bind mount
+  of it does, after its first mount goes, and a bind mount keeps showing its
+  source after a rename of it. `statx` and `/proc/self/fdinfo` give a
+  file's mount ID by its path, so a bind mount's files have the bind
+  mount's.
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`; then, as Linux's
   `can_umount` and `do_umount`, it needs `CAP_SYS_ADMIN` over the mount
@@ -1621,8 +1662,9 @@ kernel.
     (`ECONNREFUSED` for none). `recvmsg` gives the sender's `sockaddr_nl`,
     `MSG_PEEK` and `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`,
     `SO_RCVTIMEO`, `NETLINK_PKTINFO`, `NETLINK_BROADCAST_ERROR`,
-    `NETLINK_NO_ENOBUFS`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
-    `NETLINK_GET_STRICT_CHK` can be set; as in Linux's
+    `NETLINK_NO_ENOBUFS`, `NETLINK_LISTEN_ALL_NSID` (which needs
+    `CAP_NET_BROADCAST` over the socket's namespace), `NETLINK_CAP_ACK`,
+    `NETLINK_EXT_ACK` and `NETLINK_GET_STRICT_CHK` can be set; as in Linux's
     `netlink_setsockopt`, a value shorter than an `int` is 0. With
     `NETLINK_PKTINFO`, `recvmsg` gives each datagram's group (0 for one
     to the socket's own port) in a `SOL_NETLINK` `NETLINK_PKTINFO` control
@@ -1672,7 +1714,7 @@ kernel.
     `inet_rtm_valid_getroute_req` and `inet6_rtm_valid_getroute_req`.
     Checked or not, a link dump's `IFLA_MASTER` shows no device, as `lo`
     has no master, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
-    namespace has an ID; `RTM_F_PREFIX` dumps no route, as `lo` has no
+    namespace's links are shown; `RTM_F_PREFIX` dumps no route, as `lo` has no
     prefix route.
   - **Attribute policies:** each request's attributes are checked first,
     in their order, against the policy Linux has for it (`ifla_policy`,
@@ -1690,6 +1732,27 @@ kernel.
     takes none of them. A change of the link takes one of
     `IFLA_NET_NS_PID`, `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` at most
     (`EINVAL`), and a get neither of the first two (`EOPNOTSUPP`).
+  - **Namespace IDs:** as Linux's `net_namespace.c`, `RTM_NEWNSID` gives
+    the network namespace of a process (`NETNSA_PID`, `ESRCH` for none) or
+    of a `/proc/<pid>/ns/net` descriptor (`NETNSA_FD`, `EBADF`, or `EINVAL`
+    for another file) the ID `NETNSA_NSID`, or with a negative one the
+    lowest free; one without either is `EINVAL`, and a namespace that has
+    an ID, or an ID taken, `EEXIST`, each with Linux's extended-ack
+    message. The members of `RTNLGRP_NSID` hear of each new ID
+    (`NLM_F_ECHO` sends it to the requester alone of them). `RTM_GETNSID`
+    answers with the ID of a namespace named by process, descriptor or ID
+    (`ENOENT` for an ID none has), -1 for none, and with
+    `NETNSA_TARGET_NSID` with the ID that namespace gives it and this
+    one's in `NETNSA_CURRENT_NSID` (`EINVAL` for no such namespace,
+    `EACCES` without `CAP_NET_ADMIN` over it); its dump lists the IDs in
+    order, and strictly may name another namespace by
+    `NETNSA_TARGET_NSID` and nothing else, as `rtnl_net_dumpid` does. A
+    socket with `NETLINK_LISTEN_ALL_NSID` also hears the notifications of
+    each namespace its own has an ID for, when its opener has
+    `CAP_NET_BROADCAST` over that namespace, and `recvmsg` gives that ID
+    in a `SOL_NETLINK` `NETLINK_LISTEN_ALL_NSID` control message, after
+    `NETLINK_PKTINFO`'s, as `do_one_broadcast` and
+    `netlink_cmsg_listen_all_nsid` do.
   - **The link:** `RTM_GETLINK` answers with `lo` (index 1), in a dump or
     for its index or `IFLA_IFNAME` (`ENODEV` for another), with Linux
     7.0's attributes in its order: its flags, name, queue, state, MTU,
@@ -2285,7 +2348,8 @@ kernel.
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
   and `/proc/mounts` list the mounts of the caller's mount namespace
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
-  and the tmpfs mounts `mount` made, with their sources). After `chroot` they show each mount point
+  and the tmpfs and bind mounts `mount` made, with their sources and, in
+  `mountinfo`, the directory each shows as its root). After `chroot` they show each mount point
   from the process's root and leave out those not under it, as Linux's
   `seq_path_root` does. `/proc/<pid>/mountinfo` and `mounts` (and those of
   `/proc/thread-self` and `/proc/<pid>/task/<tid>`) are those of that task,
@@ -2293,9 +2357,10 @@ kernel.
   namespace, from its root, for any reader; a process that has ended,
   until it is reaped, has them, but they open as `EINVAL`, and so do a
   process's when its leader ended before its other threads, whose own
-  under `task/<tid>` still open. Each
-  mount has its own `st_dev`, as its line in `mountinfo` says, so `df`
-  lists every mount. A pipe, a socket, a
+  under `task/<tid>` still open. Each file system has its own `st_dev`, as
+  its mounts' lines in `mountinfo` say, so `df` lists every file system. A
+  bind mount shares its source's `st_dev`, as in Linux, so `df` leaves it
+  out once it has listed that device. A pipe, a socket, a
   pidfd, a memfd, a `memfd_secret` file, a namespace file and an anonymous
   inode (an eventfd, an epoll and the like) that no path opened are each on
   a device of their file system's own (pipefs, sockfs, pidfs, the internal
@@ -2526,7 +2591,7 @@ kernel.
   `ms`, without `mw` for a file open only for reading or sealed against
   writes, and without `me` for the rings of AIO and `io_uring` and secret
   memory, whose pseudo file systems run nothing), `sh`, `gd` for the initial
-  stack, `um` for a range a `userfaultfd` registered, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
+  stack, `um` and `uw` for a range a `userfaultfd` registered, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
   `dc`, `wf`, `dd`, `hg`, `nh`, `mg`), `de`, `mm` and `dd` of the rings and
   secret memory, the charge (`ac`, which private memory that was writable
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never

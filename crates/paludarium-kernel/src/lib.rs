@@ -624,9 +624,7 @@ impl Kernel {
         thread: &mut Thread,
         mem: &AddressSpace,
         context: u64,
-        addr: paludarium_types::GuestAddr,
-        write: bool,
-        fetch: bool,
+        access: userfaultfd::Access,
     ) -> Next {
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
@@ -645,7 +643,7 @@ impl Kernel {
             group: &self.group,
             processes: &self.processes,
         };
-        let sigbus = userfaultfd::fault(&mut ctx, context, addr.0, write, fetch) == Some(true);
+        let sigbus = userfaultfd::fault(&mut ctx, context, access) == Some(true);
         self.inbox.drain(&mut thread.state);
         if sigbus {
             signals::queue(
@@ -654,9 +652,13 @@ impl Kernel {
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGBUS,
                     code: 2,
-                    addr: addr.0,
+                    addr: access.address,
                     trap: 14,
-                    error: 4 | (u64::from(write) * 2) | (u64::from(fetch) * 16),
+                    // A write-protected page is present.
+                    error: 4
+                        | u64::from(access.protected)
+                        | (u64::from(access.write) * 2)
+                        | (u64::from(access.fetch) * 16),
                     synchronous: true,
                     timer: None,
                     child: None,
@@ -961,21 +963,27 @@ impl Kernel {
             thread.cpu.rip = rip;
             return self.checkpoint(thread, mem);
         }
-        // A page a `userfaultfd` registered, which has none: the thread
-        // waits for it, then the instruction runs again
-        // (`handle_userfault`).
+        // A page a `userfaultfd` registered, which has none, or a write to
+        // one it write-protected: the thread waits for it, then the
+        // instruction runs again (`handle_userfault`).
         if let ExitReason::PageFault {
             rip,
             addr,
             write,
             fetch,
             mapped: true,
-            present: false,
+            ..
         } = reason
-            && let Some(context) = mem.userfault_for(addr, write, fetch)
+            && let Some((context, protected)) = mem.userfault_for(addr, write, fetch)
         {
             thread.cpu.rip = rip;
-            return self.userfault(thread, mem, context, addr, write, fetch);
+            let access = userfaultfd::Access {
+                address: addr.0,
+                write,
+                fetch,
+                protected,
+            };
+            return self.userfault(thread, mem, context, access);
         }
         let fault = match reason {
             ExitReason::PageFault {

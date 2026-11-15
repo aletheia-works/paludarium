@@ -776,6 +776,7 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
             continue;
         };
         let path = escape(&path);
+        let root = escape(&mount.root);
         let source = escape(&mount.source);
         let (kind, options) = (mount.kind, &mount.options);
         let (common, fs) = (&mount.common_options, &mount.super_options);
@@ -784,7 +785,7 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
             let major = (device >> 8) & 0xfff | (device >> 32) & !0xfff;
             let minor = device & 0xff | (device >> 12) & !0xff;
             out.push_str(&format!(
-                "{} {} {major}:{minor} / {path} rw{options} - {kind} {source} rw{common}{fs}\n",
+                "{} {} {major}:{minor} {root} {path} rw{options} - {kind} {source} rw{common}{fs}\n",
                 mount.id, mount.parent
             ));
         } else {

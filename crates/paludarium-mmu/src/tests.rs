@@ -834,7 +834,8 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
         .unwrap();
     view.userfault_prepare_fill(a.0);
     assert_eq!(view.userfault_poison(a.0, a.0 + PAGE_SIZE, a.0), Ok(()));
-    // A page with an entry or poison already is `EEXIST`, for a fill too.
+    // A page with an entry or poison already is `EEXIST`, for a zero page
+    // too; a copy replaces the poison.
     assert_eq!(
         view.userfault_poison(a.0, a.0 + 2 * PAGE_SIZE, page(1).0),
         Err(Errno::EEXIST)
@@ -845,6 +846,22 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
     );
     assert_eq!(
         view.userfault_fill(a.0, a.0 + PAGE_SIZE, a.0, None, false),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        view.userfault_poison(a.0, a.0 + 3 * PAGE_SIZE, page(2).0),
+        Ok(())
+    );
+    let copied = [b'c'; PAGE_SIZE as usize];
+    assert_eq!(
+        view.userfault_fill(page(2).0, page(3).0, page(2).0, Some(&copied), false),
+        Ok(())
+    );
+    let mut byte = [0];
+    m.read(GuestAddr(page(2).0 + 7), &mut byte).unwrap();
+    assert_eq!(byte, [b'c']);
+    assert_eq!(
+        view.userfault_fill(page(2).0, page(3).0, page(2).0, Some(&copied), false),
         Err(Errno::EEXIST)
     );
     // Every access is the poison's bus error, not the userfaultfd's wait.
@@ -882,7 +899,6 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
         )
         .unwrap();
     assert!(m.read(moved, &mut [0]).unwrap_err().poison);
-    let mut byte = [0];
     m.read(GuestAddr(moved.0 + PAGE_SIZE), &mut byte).unwrap();
     assert_eq!(byte, [b'a']);
     // A guard replaces it, and removing the guard leaves an empty page.

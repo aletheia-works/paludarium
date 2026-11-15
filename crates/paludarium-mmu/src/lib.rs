@@ -4198,11 +4198,14 @@ impl AddressSpaceData {
     /// of `[start, end)`, at `page`, as Linux's `mfill_atomic`: the range
     /// must lie in one VMA, which a `userfaultfd` registered (`ENOENT`); a
     /// page that has one already is `EEXIST`, and contents the meter has no
-    /// room for `ENOMEM`. A private page of zeros is Linux's zero page; a
-    /// shared one is a page of shmem. With `protect` (`UFFDIO_COPY_MODE_WP`)
-    /// the page is write-protected.
+    /// room for `ENOMEM`. A copy replaces a poison marker, as
+    /// `mfill_atomic_install_pte` takes the markers `pte_is_uffd_marker`
+    /// names; a zero page does not (`mfill_atomic_pte_zeropage` takes only
+    /// none). A private page of zeros is Linux's zero page; a shared one is a
+    /// page of shmem. With `protect` (`UFFDIO_COPY_MODE_WP`) the page is
+    /// write-protected.
     pub fn userfault_fill(
-        &self,
+        &mut self,
         start: u64,
         end: u64,
         page: u64,
@@ -4213,12 +4216,12 @@ impl AddressSpaceData {
         let prot = self.mapping_at(page).map_or(mapping.prot, |m| m.prot);
         let mut directory = self.write_directory();
         let shared = self.shared_at(page);
-        // A guard or poison marker is an entry too
-        // (`mfill_atomic_install_pte` takes only none or a `userfaultfd`
-        // marker).
+        // A guard marker is an entry too, and so is a poison marker to a
+        // zero page.
+        let poisoned = self.poisoned(page);
         if lookup(&directory, page).is_some()
             || self.guarded(page)
-            || self.poisoned(page)
+            || (poisoned && bytes.is_none())
             || shared.is_some_and(|shared| shared.pages.has(page.wrapping_add(shared.shift)))
         {
             return Err(Errno::EEXIST);
@@ -4238,6 +4241,10 @@ impl AddressSpaceData {
         directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
         if let Some(shared) = shared {
             shared.pages.changed();
+        }
+        drop(directory);
+        if poisoned {
+            self.poisons.clear(page, page + PAGE_SIZE);
         }
         Ok(())
     }
@@ -5157,7 +5164,7 @@ impl MemoryView {
         bytes: Option<&[u8]>,
         protect: bool,
     ) -> Result<(), Errno> {
-        self.with_data(|data| data.userfault_fill(start, end, page, bytes, protect))
+        self.with_data_mut(|data| data.userfault_fill(start, end, page, bytes, protect))
             .unwrap_or(Err(Errno(3))) // ESRCH
     }
     /// See [`AddressSpaceData::userfault_poison`]; `ESRCH` once the space

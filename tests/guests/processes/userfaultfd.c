@@ -793,10 +793,17 @@ static int case_poison(void) {
     printf(" updated=%lld\n", (long long)done);
     printf("again: %s", err(poison(fd, base, PAGE, 0, &done)));
     printf(" updated=%lld\n", (long long)done);
+    /* A zero page does not replace the poison, and a copy does; a
+       discard then empties the page for the steps below. */
     char src[PAGE];
     memset(src, 'c', sizeof src);
-    printf("copy: %s\n", err(copy(fd, base, src, PAGE, 0, NULL)));
-    printf("zeropage: %s\n", err(zeropage(fd, base, PAGE, 0, NULL)));
+    printf("poison last: %s\n", err(poison(fd, base + 3 * PAGE, PAGE, 0, NULL)));
+    printf("zeropage: %s\n", err(zeropage(fd, base + 3 * PAGE, PAGE, 0, NULL)));
+    printf("copy: %s\n", err(copy(fd, base + 3 * PAGE, src, PAGE, 0, NULL)));
+    access_at("copied", base, base + 3 * PAGE + 7, 0);
+    printf("zeropage on it: %s\n", err(zeropage(fd, base + 3 * PAGE, PAGE, 0, NULL)));
+    printf("copy on it: %s\n", err(copy(fd, base + 3 * PAGE, src, PAGE, 0, NULL)));
+    printf("discard it: %s\n", err(madvise(base + 3 * PAGE, PAGE, MADV_DONTNEED)));
     printf("dontwake: %s", err(poison(fd, base + 2 * PAGE, PAGE, UFFDIO_POISON_MODE_DONTWAKE, &done)));
     printf(" updated=%lld\n", (long long)done);
     int pipes[2];

@@ -603,8 +603,9 @@ fn uffdio_poison_poisons_pages_that_have_none() {
         f.ioctl(fd, POISON, &[AREA, 2 * PAGE, 0, 0]),
         (errno(Errno::EAGAIN), vec![AREA, 2 * PAGE, 0, PAGE])
     );
+    // A zero page does not replace the poison.
     assert_eq!(
-        f.ioctl(fd, COPY, &[AREA, SRC, PAGE, 0, 0]).1[4],
+        f.ioctl(fd, ZEROPAGE, &[AREA, PAGE, 0, 0]).1[3],
         errno(Errno::EEXIST)
     );
     // A system call's copy is EFAULT, MADV_POPULATE_READ EHWPOISON.
@@ -641,4 +642,13 @@ fn uffdio_poison_poisons_pages_that_have_none() {
     assert!(f.mem.read(GuestAddr(AREA), &mut [0]).unwrap_err().poison);
     assert_eq!(f.ret(28, &[AREA, PAGE, 4]), 0);
     f.mem.read(GuestAddr(AREA), &mut [0]).unwrap();
+    // A copy replaces the poison (the read left a page to discard first).
+    assert_eq!(f.ret(28, &[AREA, PAGE, 4]), 0);
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    assert_eq!(f.ioctl(fd, POISON, &[AREA, PAGE, 0, 0]).0, 0);
+    f.mem.write(GuestAddr(SRC), b"q").unwrap();
+    assert_eq!(f.ioctl(fd, COPY, &[AREA, SRC, PAGE, 0, 0]).1[4], PAGE);
+    let mut byte = [0];
+    f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
+    assert_eq!(byte, *b"q");
 }

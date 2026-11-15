@@ -308,6 +308,14 @@ pub(crate) fn fault(
     fetch: bool,
 ) -> Option<bool> {
     let context = find(id)?;
+    // Linux decides under the mmap lock, where the page is still missing
+    // and the context not released; here the access failed before, and a
+    // fill or a close since leaves it to run again, not to SIGBUS.
+    if context.released.load(Ordering::SeqCst)
+        || c.mem.userfault_for(GuestAddr(address), write, fetch) != Some(id)
+    {
+        return Some(false);
+    }
     let features = context.features();
     if features & FEATURE_SIGBUS != 0 {
         return Some(true);

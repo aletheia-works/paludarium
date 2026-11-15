@@ -2319,7 +2319,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
   `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
-  `fs/mqueue` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
+  `fs` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -2511,7 +2511,7 @@ kernel.
   `ms`, without `mw` for a file open only for reading or sealed against
   writes, and without `me` for the rings of AIO and `io_uring` and secret
   memory, whose pseudo file systems run nothing), `sh`, `gd` for the initial
-  stack, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
+  stack, `um` for a range a `userfaultfd` registered, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
   `dc`, `wf`, `dd`, `hg`, `nh`, `mg`), `de`, `mm` and `dd` of the rings and
   secret memory, the charge (`ac`, which private memory that was writable
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never

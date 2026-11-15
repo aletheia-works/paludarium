@@ -27,8 +27,8 @@
 //! space, into a registered range that has none, as Linux's `move_pages`
 //! does ([`paludarium_mmu::MemoryView::userfault_move`]).
 //!
-//! The minor mode and `UFFDIO_CONTINUE`, the write protection of shared memory and of pages with no entry
-//! (`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`, `UFFD_FEATURE_WP_UNPOPULATED`,
+//! The minor mode, `UFFDIO_CONTINUE`, the write protection of shared
+//! memory and of pages with no entry (`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`, `UFFD_FEATURE_WP_UNPOPULATED`,
 //! `UFFD_FEATURE_WP_ASYNC`), and the events of `fork`, `mremap`,
 //! `madvise` and `munmap` are not offered: `UFFDIO_API` does not report
 //! their features, which it refuses (`EINVAL`), and `UFFDIO_REGISTER`

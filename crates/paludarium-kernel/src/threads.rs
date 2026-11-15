@@ -1279,7 +1279,6 @@ impl ThreadGroup {
             }
         }
     }
-    /// After exec, thread `pid` is all there is.
     /// Thread `tid`'s keyrings.
     pub(crate) fn keyrings(&self, tid: u32) -> crate::keys::Keyrings {
         self.keyrings
@@ -1316,6 +1315,7 @@ impl ThreadGroup {
         self.set_keyrings(pid, keyrings);
         drop(old);
     }
+    /// After exec, thread `pid` is all there is.
     pub(crate) fn reset_task_ids(&self, pid: u32, ids: TaskIds) {
         let mut all = self.task_ids.lock().unwrap_or_else(PoisonError::into_inner);
         all.clear();

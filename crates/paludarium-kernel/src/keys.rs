@@ -588,7 +588,8 @@ impl Keys {
     /// The keys whose links the garbage collector would have taken away by
     /// `now`: invalidated ones, and those expired `kernel.keys.gc_delay`
     /// ago (`keyring_gc`). The links of a revoked or invalidated keyring
-    /// stay, and so does what a link charged its keyring's owner.
+    /// stay, and so does what a link charged its keyring's owner, as
+    /// `keyring_gc` calls no `key_payload_reserve`.
     fn collect(&self, now: i64) {
         let keyrings: Vec<Arc<Key>> = self
             .registry()
@@ -609,13 +610,17 @@ impl Keys {
                 }
                 state.links.clone()
             };
-            if links.iter().any(dead) {
+            // Judged without the keyring's lock, which is never held while
+            // a key it links is locked.
+            let gone: Vec<Arc<Key>> = links.into_iter().filter(dead).collect();
+            if !gone.is_empty() {
                 let mut state = keyring.lock();
                 let removed: Vec<Arc<Key>> = {
-                    let (gone, kept): (Vec<_>, Vec<_>) =
-                        std::mem::take(&mut state.links).into_iter().partition(dead);
+                    let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.links)
+                        .into_iter()
+                        .partition(|key| gone.iter().any(|g| Arc::ptr_eq(g, key)));
                     state.links = kept;
-                    gone
+                    removed
                 };
                 drop(state);
                 drop(removed);
@@ -1814,7 +1819,7 @@ fn read(c: &Context<'_>, id: i32, buffer: u64, len: u64) -> Result<u64, Errno> {
             // `keyring_read` refuses a buffer that is not of whole serial
             // numbers, but only one `keyctl_read_key` passes it: one of at
             // most a page.
-            if buffer != 0 && len != 0 && len <= PAGE_SIZE && len % 4 != 0 {
+            if buffer != 0 && len != 0 && len <= PAGE_SIZE && !len.is_multiple_of(4) {
                 return Err(Errno::EINVAL);
             }
             state

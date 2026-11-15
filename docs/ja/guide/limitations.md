@@ -43,7 +43,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   取り込みます（`fault_around_bytes`）。`MAP_POPULATE`、`MAP_LOCKED`、ロックが
   取り込むはずのページも、触れたときに数えます。ヒュージページもプロテクションキーも
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
-  `uw`、`ui`（提供しない `userfaultfd` の書き込み保護とマイナーのモード）、`ht`、`dp`
+  `ui`（提供しない `userfaultfd` のマイナーのモード）、`ht`、`dp`
   （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
@@ -58,7 +58,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   どうかではなく、スレッドがシステムコールの中にいるかどうかから決めます。スレッドが
   ほかのプロセスに見せるのは最後のシステムコールかシグナルの確認で公開したものなので、
   呼び出しの間だけ変えたマスク（`rt_sigsuspend`、`ppoll`）は見えません。`meminfo` は
-  `sysinfo` と同じ固定の 4 GiB を、何も使っていないものとして返します。
+  `sysinfo` と同じ固定の 4 GiB を、何も使っていないものとして返します。生成するファイルの
+  `stat` は、その長さを大きさとして返します（`mountinfo`、`status`、`stat`、`loadavg`
+  など）。Linux の seq ファイルの大きさは 0 です。`maps`、`smaps`、`fdinfo` は Linux と
+  同じく 0 です。
 - **自分のルートの一部**：生成される `/proc` や `/dev`（またはその中のディレクトリ）への
   `chroot` は `EINVAL` を返します。Linux はそこをルートにします。`mount` は `/proc` や
   `/dev` には何もマウントせず、バインドマウントもないため、新しいルートの `/proc` や `/dev`
@@ -475,15 +478,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **userfaultfd の一部**：登録するのはないページだけです。書き込み保護とマイナーの
-  モードは受け付けず（`EINVAL`）、`UFFDIO_WRITEPROTECT`、`UFFDIO_CONTINUE`、
+- **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
+  メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
+  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE`、
   `UFFDIO_MOVE`、`UFFDIO_POISON` もありません（`EINVAL`）。`fork`、`mremap`、
-  `madvise`、`munmap` のイベントと書き込み保護の機能もなく、`UFFDIO_API` はそれらを
-  示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す ioctl にも
-  入りません。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
+  `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
+  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
+  それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
+  ioctl にも入りません。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
+  ページの保護を外します。Linux はその印を PTE に残します。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
   登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
-  ないページへのシステムコール自身のコピーは、`UFFD_USER_MODE_ONLY` のときと同じく
-  `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
+  ないページか、書き込み保護されたページへのシステムコール自身のコピーは、
+  `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベント（`FAN_OPEN_PERM`、`FAN_ACCESS_PERM`、
   `FAN_OPEN_EXEC_PERM`）は `fanotify_mark` で受け付けますが送りません。そのため、求める

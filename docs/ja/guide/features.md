@@ -840,28 +840,44 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   先に確かめます。ファイルは読み出し用の `anon_inode:[userfaultfd]` で、誰が持っていても
   作られたアドレス空間のものです。`UFFDIO_API` はバージョンと機能を一度だけ受け取り
   （2 度目は `EINVAL`）、提供する機能と ioctl を書き戻します。失敗したときは 0 を
-  書きます。提供する機能は `UFFD_FEATURE_SIGBUS`、`UFFD_FEATURE_THREAD_ID`、
+  書きます。提供する機能は `UFFD_FEATURE_PAGEFAULT_FLAG_WP`、`UFFD_FEATURE_SIGBUS`、
+  `UFFD_FEATURE_THREAD_ID`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
   `UFFD_FEATURE_MISSING_HUGETLBFS` で、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
-  メモリと共有の anonymous メモリを、ないページについて登録します
-  （`UFFDIO_REGISTER_MODE_MISSING`）。確かめることと順は Linux と同じで（範囲、次に
-  各 VMA。登録できないものは `EINVAL`、ほかの `userfaultfd` のものは `EBUSY`）、
-  登録した部分は `/proc/<pid>/maps` に見えるとおり VMA に分かれ、`smaps` に `um` が
+  メモリと共有の anonymous メモリを、ないページについて登録し
+  （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
+  ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
+  が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
+  ものは `EINVAL`、ほかの `userfaultfd` のものは `EBUSY`）、モードは、VMA がすでに
+  持っていなければその VMA のモードに置き換わります。登録した部分は
+  `/proc/<pid>/maps` に見えるとおり VMA に分かれ、`smaps` に `um` と `uw` が
   つきます。`fork` した子と、`mremap` が動かしたマッピングには引き継がれず、
-  `UFFDIO_UNREGISTER` とファイルを閉じることで外れます。登録したページでまだない
-  もの（共有メモリでは、どのマッピングにもないもの）に命令が触れると待ち、ファイルは
-  そのフォールトを古い順に `uffd_msg` として読みます。書き込みかどうか、ページの
-  アドレス（`UFFD_FEATURE_EXACT_ADDRESS` ではアドレスそのもの）、
-  `UFFD_FEATURE_THREAD_ID` ではスレッドの ID が入ります。待ちは、`UFFDIO_COPY` か
-  `UFFDIO_ZEROPAGE` がページを埋めたとき（`DONTWAKE` でなければ）、`UFFDIO_WAKE` か
-  `UFFDIO_UNREGISTER` がその範囲を取ったとき、ファイルが閉じられたとき、シグナルが
-  来たときに終わり、命令は、Linux がフォールトをやり直すのと同じくもう一度動きます。
-  `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。`UFFDIO_COPY` と
+  `UFFDIO_UNREGISTER` とファイルを閉じることで外れます。ないページについて登録した
+  ページでまだないもの（共有メモリでは、どのマッピングにもないもの）に命令が触れるか、
+  書き込み保護について登録した範囲の保護されたページに書き込むと待ち、ファイルは
+  そのフォールトを古い順に `uffd_msg` として読みます。書き込みかどうか、保護された
+  ページなら `UFFD_PAGEFAULT_FLAG_WP`、ページのアドレス
+  （`UFFD_FEATURE_EXACT_ADDRESS` ではアドレスそのもの）、`UFFD_FEATURE_THREAD_ID`
+  ではスレッドの ID が入ります。待ちは、`UFFDIO_COPY` か `UFFDIO_ZEROPAGE` がページを
+  埋めたときか `UFFDIO_WRITEPROTECT` が保護を解いたとき（`DONTWAKE` でなければ）、
+  `UFFDIO_WAKE` がその範囲を取ったとき、`UFFDIO_UNREGISTER` がないページについて
+  登録した範囲からそれを取ったとき、ファイルが閉じられたとき、シグナルが来たときに
+  終わり、命令は、Linux がフォールトをやり直すのと同じくもう一度動きます。
+  `UFFD_FEATURE_SIGBUS` では待たずに SIGBUS（`BUS_ADRERR`）にします。
+  `UFFDIO_WRITEPROTECT` は、`mwriteprotect_range` と同じく VMA ごとに、範囲のページを
+  保護するか保護を解きます。どの VMA も書き込み保護について登録したものでなければ
+  ならず（`ENOENT`。それより前の VMA は変わったあとです）、保護するときは
+  `DONTWAKE` を受け付けません（`EINVAL`）。エントリーのないページは、Linux に
+  present の PTE がないので保護しません。読んだだけのページは Linux のゼロページで、
+  保護します。`mprotect` は保護を残し、許さない書き込みはこれまでどおり SIGSEGV です。
+  `fork` した子、`mremap` による移動、`UFFDIO_UNREGISTER`、ファイルを閉じること、
+  書き込み保護のモードを置き換える登録で保護は外れます。`UFFDIO_COPY` と
   `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
   VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
   `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
-  です。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
+  です。`UFFDIO_COPY_MODE_WP` は書き込み保護したページを埋め、範囲は書き込み保護に
+  ついて登録したものでなければなりません（`EINVAL`）。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
   `EINVAL`）、ノンブロッキングでなければ待ちます。`poll` は、Linux と同じく
   `UFFDIO_API` の前とブロックするファイルでは `POLLERR`、それ以外ではまだ読まれていない
   フォールトがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と
@@ -1988,6 +2004,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs のマウントは
   ソースとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。
+  `/proc/<pid>/mountinfo` と `mounts`（`/proc/thread-self` と `/proc/<pid>/task/<tid>` のものも）は、
+  Linux の `mounts_open_common` と同じくそのタスクのもので、そのマウント名前空間のマウントを
+  そのルートから見せます。読むのは誰でもかまいません。終わったプロセスは、回収されるまで
+  これらのファイルを持ちますが、開くと `EINVAL` です。ほかのスレッドより先に終わった
+  リーダーのプロセスのもの（`/proc/<pid>/mountinfo`）も、開くと `EINVAL` です。残った
+  スレッドの `task/<tid>` のものは開けます。
   マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
   `df` はどのマウントも表示します。パスから開いたのではないパイプ・ソケット・pidfd・
   memfd・`memfd_secret` のファイル・名前空間のファイル・匿名 inode（eventfd や epoll
@@ -2030,8 +2052,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`root`、`maps`、`smaps`、`fd`、`fdinfo`、`ns`、`task` があります。`root` は
-  ルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  `cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`fd`、`fdinfo`、`ns`、`task`
+  があります。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を
@@ -2045,8 +2067,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
-  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`root`、`ns`（0511）、
-  `task` があり、
+  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`exe`、`cwd`、`root`、`mounts`、
+  `mountinfo`、`ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
@@ -2188,7 +2210,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   フラグを Linux と同じ順番で並べます。保護とそのなれる先（`mr`、`mw`、`me`、`ms`。
   読むためだけに開いたファイルと書き込みを封じたファイルには `mw` がなく、AIO と
   `io_uring` のリングと秘密のメモリには、何も実行しない疑似ファイルシステムなので
-  `me` がありません）、`sh`、最初のスタックの `gd`、`userfaultfd` が登録した範囲の `um`、ロック（`lo`、`lf`）、ガード
+  `me` がありません）、`sh`、最初のスタックの `gd`、`userfaultfd` が登録した範囲の `um` と `uw`、ロック（`lo`、`lf`）、ガード
   （`gu`）、アドバイス（`sr`、`rr`、`dc`、`wf`、`dd`、`hg`、`nh`、`mg`）、リングと秘密の
   メモリの `de`、`mm`、`dd`、課金（`ac`。書き込めたプライベートメモリが持ち、
   `MAP_NORESERVE` なら代わりに `nr` を持ちます。一度も書いていない匿名メモリは書き込め

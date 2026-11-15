@@ -178,6 +178,10 @@ pub(super) fn content(
         TaskEntry::Comm => crate::proc::render_comm(&public.name),
         TaskEntry::IdMap(ids) => public.credentials.user.map_text(ids, reader),
         TaskEntry::Setgroups => public.credentials.user.setgroups_text().to_vec(),
+        // Nothing once it has ended, whose open is `EINVAL` ([`mounts`]).
+        TaskEntry::Mounts(mountinfo) => mounts(task).map_or_else(Vec::new, |(mounts, root)| {
+            crate::proc::render(&mounts, mountinfo, &root)
+        }),
         // The argument or environment strings as they are in its memory now;
         // nothing for a zombie.
         TaskEntry::Cmdline | TaskEntry::Environ => {
@@ -255,6 +259,17 @@ pub(super) fn content(
         }),
         _ => return None,
     })
+}
+
+/// The mounts of the task's mount namespace and its root, which
+/// `mountinfo` and `mounts` show; `None` for a task that has ended, whose
+/// open Linux's `mounts_open_common` refuses (`EINVAL`) as it has no
+/// `nsproxy`, the leader of live threads too.
+pub(super) fn mounts(task: &Task) -> Option<(Vec<paludarium_vfs::MountPoint>, Vec<u8>)> {
+    if task.state.0 == 'Z' {
+        return None;
+    }
+    task.public.files.mounts()
 }
 
 /// Where `exe` or `cwd` leads: the program and the current directory, or

@@ -45,7 +45,8 @@ retains argv, tool SHA, stdout, stderr, real exit/timeout/reaping, source and
 lock before/after hashes. The original source is never rewritten. It builds
 twelve real `.crate` files, checks all members and normalized dependencies,
 builds a crate-external consumer from a temporary sparse registry, also with
-the latest stable Rust, and builds the production Wasm without diagnostic features.
+the latest stable Rust, and builds the production Wasm without diagnostic features
+and without DWARF debug information (`-C debuginfo=0`, as `mise run wasm:build`).
 One npm tarball is inspected and used for all seven distribution boundary
 checks, including real Wasm hello, invalid guest cleanup, missing JS and a
 corrupt Wasm. The JSR upload is that tarball's files without `package.json`,

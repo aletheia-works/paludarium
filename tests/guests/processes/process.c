@@ -6024,9 +6024,12 @@ static int pagemap_case(void) {
     long page = 4096;
     /* Run as root, it becomes an unprivileged user first, so that Linux and
        the emulator read it the same: without CAP_SYS_ADMIN (no frame
-       numbers) and CAP_DAC_OVERRIDE (no opening it for writing). */
+       numbers) and CAP_DAC_OVERRIDE (no opening it for writing). The change
+       of IDs makes it undumpable, whose /proc files root owns, so it is made
+       dumpable again, to own them. */
     if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534))
         return 79;
+    if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)) return 78;
     int fd = open("/proc/self/pagemap", O_RDONLY);
     if (fd < 0) return 80;
     struct stat st;

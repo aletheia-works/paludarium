@@ -127,6 +127,11 @@ impl PartialEq for Landlock {
 impl Eq for Landlock {}
 
 impl Landlock {
+    /// Whether a domain handles any file system right, which then refuses
+    /// `mount` and `umount2` (`hook_sb_mount`, `hook_sb_umount`).
+    pub(crate) fn handles_fs(&self) -> bool {
+        self.applicable(FS).is_some()
+    }
     /// The domain, if one handles any of the file system rights `request`.
     fn applicable(&self, request: u64) -> Option<&Domain> {
         self.0
@@ -253,21 +258,9 @@ pub(crate) fn parent(path: &[u8]) -> &[u8] {
     }
 }
 
-/// The mount that holds `path`: the longest mount point that is `path` or
-/// one of its ancestors.
+/// The mount point of the mount that holds `path`.
 fn mount_root(c: &Context<'_>, path: &[u8]) -> Vec<u8> {
-    c.files
-        .fs()
-        .mounts()
-        .into_iter()
-        .map(|m| m.path)
-        .filter(|root| {
-            root == b"/"
-                || path == &root[..]
-                || path.starts_with(root) && path.get(root.len()) == Some(&b'/')
-        })
-        .max_by_key(Vec::len)
-        .unwrap_or_else(|| b"/".to_vec())
+    c.files.fs().mount_root(path)
 }
 
 /// How a check names the object at a resolved path.

@@ -109,11 +109,45 @@ pub const TMPFS_MAGIC: u64 = 0x0102_1994;
 /// The size the in-memory filesystem reports, the memory `sysinfo` reports.
 pub const MEMORY_BYTES: u64 = 4 << 30;
 const BLOCK: u64 = 4096;
-/// One line of the mount table: where, and which filesystem type.
+/// One line of the mount table: where, which filesystem type, and what
+/// `/proc/self/mountinfo` shows of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountPoint {
     pub path: Vec<u8>,
     pub kind: &'static str,
+    /// The mount's ID, and its parent's (`mnt_id`, `mnt_parent->mnt_id`).
+    pub id: u64,
+    pub parent: u64,
+    /// Its superblock's device, in `stat`'s encoding (`new_encode_dev`).
+    pub device: u64,
+    /// What it was mounted from (`mnt_devname`).
+    pub source: Vec<u8>,
+    /// The per-mount options after `rw` (`show_vfsmnt_opts`): `,relatime`.
+    pub options: String,
+    /// The superblock's common options after `rw` (`show_sb_opts`):
+    /// `,sync`, `,dirsync`, `,lazytime`.
+    pub common_options: String,
+    /// The file system's own options (`show_options`): `,size=1024k`.
+    pub super_options: String,
+}
+impl MountPoint {
+    /// The `index`th mount that exists from start-up, at `path`: its ID is
+    /// 21 on, its parent the first one's (the first one's parent 1), its
+    /// device minor `index + 1`, and its type its source.
+    #[must_use]
+    pub fn boot(index: usize, path: Vec<u8>, kind: &'static str) -> Self {
+        Self {
+            path,
+            kind,
+            id: 21 + index as u64,
+            parent: if index == 0 { 1 } else { 21 },
+            device: index as u64 + 1,
+            source: kind.as_bytes().to_vec(),
+            options: ",relatime".to_string(),
+            common_options: String::new(),
+            super_options: String::new(),
+        }
+    }
 }
 /// The number of the mount holding `path` (the longest matching mount
 /// point, counting from 1), which `stat` gives as the device minor.
@@ -140,10 +174,37 @@ pub trait FileSystem: HostFs {
     }
     /// The mounts, root first, for `/proc/self/mountinfo`.
     fn mounts(&self) -> Vec<MountPoint> {
-        vec![MountPoint {
-            path: b"/".to_vec(),
-            kind: "tmpfs",
-        }]
+        vec![MountPoint::boot(0, b"/".to_vec(), "tmpfs")]
+    }
+    /// The device of the mount holding `path`, as `stat` gives it
+    /// (`st_dev`): of the longest mount point here.
+    fn device(&self, path: &[u8]) -> u64 {
+        mount_device(&self.mounts(), path)
+    }
+    /// The ID of the mount holding `path`, as `/proc/self/mountinfo` and
+    /// `statx` give it.
+    fn mount_id(&self, path: &[u8]) -> u64 {
+        let mounts = self.mounts();
+        let device = mount_device(&mounts, path);
+        mounts
+            .iter()
+            .find(|m| m.device == device)
+            .map_or(20 + device, |m| m.id)
+    }
+    /// The mount point of the mount holding `path`.
+    fn mount_root(&self, path: &[u8]) -> Vec<u8> {
+        let mounts = self.mounts();
+        let device = mount_device(&mounts, path);
+        mounts
+            .into_iter()
+            .find(|m| m.device == device)
+            .map_or_else(|| b"/".to_vec(), |m| m.path)
+    }
+    /// What keeps the mount holding `path` in use while it lasts, as an
+    /// open file, a working directory or a root holds Linux's mount: none
+    /// for a mount that cannot be unmounted.
+    fn mount_pin(&self, _path: &[u8]) -> Option<MountPin> {
+        None
     }
     /// The path of the file numbered `inode` on the in-memory file system
     /// that holds `anchor`, as a tmpfs file handle decoded on that mount
@@ -515,6 +576,9 @@ pub use entries::{EntryKind, GuestEntry, MAX_ENTRIES, MAX_ENTRY_BYTES};
 
 mod mount;
 pub use mount::MountedFs;
+
+mod namespace;
+pub use namespace::{MountPin, MountTable, NamespacedFs, NewTmpfs, Target, mount_flags};
 
 mod open_file;
 use open_file::MemFile;

@@ -15,7 +15,7 @@ use crate::page_cache::{Key, PageCaches, Place};
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat, HostFs};
 use paludarium_types::{Errno, GuestAddr};
-use paludarium_vfs::{FileSystem, mount_device};
+use paludarium_vfs::FileSystem;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -421,16 +421,15 @@ impl Notifier {
             path.extend_from_slice(name);
             path
         };
-        let mounts = fs.mounts();
         let file = fs
             .metadata(&path, false)
             .ok()
-            .map(|stat| Found::of(mount_device(&mounts, &path), &stat));
+            .map(|stat| Found::of(fs.device(&path), &stat));
         let (parent, name) = match split(&path) {
             Some((directory, name)) => (
                 fs.metadata(directory, true)
                     .ok()
-                    .map(|stat| (mount_device(&mounts, directory), stat.inode)),
+                    .map(|stat| (fs.device(directory), stat.inode)),
                 name.to_vec(),
             ),
             None => (None, Vec::new()),

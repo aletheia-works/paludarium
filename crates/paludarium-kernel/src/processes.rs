@@ -2691,9 +2691,18 @@ impl Kernel {
         let credentials =
             crate::namespaces::user_for(&own, &thread.state.credentials, flags, msgqueue)?;
         crate::namespaces::check(flags, credentials.administers_own())?;
+        let mut mounts = None;
         if flags & NAMESPACES != 0 {
             let mut namespaces = own.unshared(flags, &credentials.user.0)?;
             namespaces.user = Arc::clone(&credentials.user.0);
+            if flags & NEWNS != 0 {
+                mounts = Some(crate::namespaces::copy_mounts(
+                    &namespaces.mnt,
+                    &own.mnt,
+                    &credentials.user.0,
+                    &self.files,
+                ));
+            }
             if flags & crate::namespaces::CLONE_NEWIPC != 0 {
                 namespaces.ipc.mq.made_by(
                     credentials.fsuid,
@@ -2711,6 +2720,11 @@ impl Kernel {
             self.files = self.files.unshared(flags & FS == 0);
         } else if flags & FS != 0 {
             self.files = self.files.for_clone(true, false);
+        }
+        // CLONE_NEWNS took a working directory and root of the thread's own,
+        // which are now on the new namespace's copies.
+        if let Some(mounts) = mounts {
+            self.files.set_mount_table(mounts);
         }
         if flags & (SYSVSEM | crate::namespaces::CLONE_NEWIPC) != 0 {
             self.group
@@ -2952,6 +2966,8 @@ impl Kernel {
                 Kind::Pid => mine.pid_for_children = new,
                 Kind::User => mine.user = new,
                 Kind::Mnt => {
+                    self.files
+                        .set_mount_table(crate::namespaces::mount_table(&new, &self.files));
                     mine.mnt = new;
                     self.files.enter_root();
                 }
@@ -3030,6 +3046,14 @@ impl Kernel {
         let mut child_namespaces =
             own.for_child(namespaces, flags & 0x100 != 0, &credentials.user.0)?;
         child_namespaces.user = Arc::clone(&credentials.user.0);
+        let mounts = (namespaces & crate::namespaces::CLONE_NEWNS != 0).then(|| {
+            crate::namespaces::copy_mounts(
+                &child_namespaces.mnt,
+                &own.mnt,
+                &credentials.user.0,
+                &self.files,
+            )
+        });
         if namespaces & crate::namespaces::CLONE_NEWIPC != 0 {
             child_namespaces.ipc.mq.made_by(
                 credentials.fsuid,
@@ -3163,6 +3187,9 @@ impl Kernel {
             set_tid: Vec::new(),
             seat: None,
         };
+        if let Some(mounts) = mounts {
+            child.files.set_mount_table(mounts);
+        }
         // Shown in /proc from the start, before its first system call.
         let memory = child.spawn_memory.clone();
         child.publish(pid, &state, memory.as_deref().unwrap_or(mem));
@@ -4058,7 +4085,7 @@ impl Kernel {
                 // removed file walks up from where it was, the file itself
                 // still the object it was (a memfd is in no hierarchy).
                 if let Some(path) = &removed {
-                    let device = crate::page_cache::mount_device(&self.files.fs().mounts(), path);
+                    let device = self.files.fs().device(path);
                     let files = &self.files;
                     crate::landlock::check_with(
                         &creds.landlock,
@@ -4076,7 +4103,7 @@ impl Kernel {
                 // A memfd is on a device of its own; a removed file still on
                 // its mount's.
                 let device = match &removed {
-                    Some(path) => crate::page_cache::mount_device(&self.files.fs().mounts(), path),
+                    Some(path) => self.files.fs().device(path),
                     None => crate::memfd::DEVICE,
                 };
                 // `do_open_execat` opens the descriptor's file again.
@@ -4665,7 +4692,7 @@ fn exec_opened(
     }
     let path = crate::files::resolved(files, path)?;
     let node = files.fs().metadata(&path, false).ok()?;
-    let device = crate::page_cache::mount_device(&files.fs().mounts(), &path);
+    let device = files.fs().device(&path);
     Some(crate::inotify::Closing::open(
         &files.caches,
         &files.fs(),
@@ -4691,10 +4718,7 @@ pub(crate) fn deny_writes(
     if stat.mode & 0o170000 != 0o100000 {
         return Ok(None);
     }
-    let key = (
-        crate::page_cache::mount_device(&files.fs().mounts(), path),
-        stat.inode,
-    );
+    let key = (files.fs().device(path), stat.inode);
     files.caches.deny_write_access(key).map(Some)
 }
 /// All of `file`, read from its start, for exec of a file only a

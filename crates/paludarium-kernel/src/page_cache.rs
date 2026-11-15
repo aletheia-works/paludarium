@@ -67,12 +67,16 @@ pub(crate) struct PageCaches {
 pub(crate) struct Hold {
     caches: Arc<PageCaches>,
     key: Key,
+    /// What keeps the file's mount in use, as Linux's `fs->pwd` holds it.
+    pin: Option<paludarium_vfs::MountPin>,
 }
 
 impl Hold {
     /// Another hold on the same file, as `copy_fs_struct` takes one.
     pub(crate) fn copy(&self) -> Hold {
-        self.caches.hold_of(self.key)
+        let mut hold = self.caches.hold_of(self.key);
+        hold.pin.clone_from(&self.pin);
+        hold
     }
 }
 
@@ -261,7 +265,7 @@ impl PageCaches {
             opens
                 .values()
                 .filter_map(|(_, device, _)| match device {
-                    Device::Mount(mount, _, place) if Arc::ptr_eq(mount, fs) => {
+                    Device::Mount(mount, _, place, _) if Arc::ptr_eq(mount, fs) => {
                         Some(Arc::clone(place))
                     }
                     _ => None,
@@ -307,7 +311,7 @@ impl PageCaches {
         }
         if let (Ok(from), Ok(to)) = (fs.metadata(old, false), fs.metadata(new, false))
             && from.inode == to.inode
-            && mount_device(&fs.mounts(), old) == mount_device(&fs.mounts(), new)
+            && fs.device(old) == fs.device(new)
         {
             return None;
         }
@@ -346,7 +350,9 @@ impl PageCaches {
     pub(crate) fn hold(self: &Arc<Self>, fs: &dyn FileSystem, path: &[u8]) -> Option<Hold> {
         let path = crate::files::resolved_in(fs, path)?;
         let stat = fs.metadata(&path, false).ok()?;
-        Some(self.hold_of((mount_device(&fs.mounts(), &path), stat.inode)))
+        let mut hold = self.hold_of((fs.device(&path), stat.inode));
+        hold.pin = fs.mount_pin(&path);
+        Some(hold)
     }
     fn hold_of(self: &Arc<Self>, key: Key) -> Hold {
         *self
@@ -358,6 +364,7 @@ impl PageCaches {
         Hold {
             caches: Arc::clone(self),
             key,
+            pin: None,
         }
     }
     /// The cache of `key`, made now, with the file's `size`, if the file has
@@ -716,31 +723,35 @@ impl paludarium_mmu::PageSource for FilePages {
 
 /// Where a file handle's device comes from.
 enum Device {
-    /// The mount holding the path it was opened at, and where the file is.
-    Mount(Arc<dyn FileSystem>, Vec<u8>, Arc<Mutex<Place>>),
+    /// The mount holding the path it was opened at: the file system, the
+    /// mount's device then, where the file is, and what keeps the mount in
+    /// use while the description lasts (as Linux's `f_path` holds it).
+    Mount(
+        Arc<dyn FileSystem>,
+        u64,
+        Arc<Mutex<Place>>,
+        Option<paludarium_vfs::MountPin>,
+    ),
     /// A device of its own (a memfd's).
     Fixed(u64),
 }
 impl Device {
     fn number(&self) -> u64 {
         match self {
-            Device::Mount(fs, path, _) => mount_device(&fs.mounts(), path),
-            Device::Fixed(device) => *device,
+            Device::Mount(_, device, ..) | Device::Fixed(device) => *device,
         }
     }
     /// The same device, for another description of the same dentry (a
     /// reopen), which shares its place.
     fn copy(&self) -> Device {
         match self {
-            Device::Mount(fs, path, place) => {
-                Device::Mount(Arc::clone(fs), path.clone(), Arc::clone(place))
+            Device::Mount(fs, device, place, pin) => {
+                Device::Mount(Arc::clone(fs), *device, Arc::clone(place), pin.clone())
             }
             Device::Fixed(device) => Device::Fixed(*device),
         }
     }
 }
-
-pub(crate) use paludarium_vfs::mount_device;
 
 /// A file handle that keeps its file and the file's page cache in step
 /// (see the module). Every other method is passed on unchanged.
@@ -833,10 +844,7 @@ impl CoherentFile {
     pub(crate) fn key(&self) -> Option<Key> {
         *self.key.get_or_init(|| {
             let stat = self.inner.stat().ok()?;
-            let device = match &self.device {
-                Device::Mount(fs, path, _) => mount_device(&fs.mounts(), path),
-                Device::Fixed(device) => *device,
-            };
+            let device = self.device.number();
             (stat.mode & 0o170000 == REGULAR).then_some((device, stat.inode))
         })
     }
@@ -887,11 +895,11 @@ impl CoherentFile {
             return;
         };
         let (place, device) = match &self.device {
-            Device::Mount(fs, path, place) => {
+            Device::Mount(fs, device, place, _) => {
                 let place = place.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     Some((Arc::clone(fs), place.path.clone(), place.unlinked)),
-                    mount_device(&fs.mounts(), path),
+                    *device,
                 )
             }
             Device::Fixed(device) => (None, *device),
@@ -1106,6 +1114,18 @@ impl FileSystem for CoherentFs {
     fn mounts(&self) -> Vec<MountPoint> {
         self.inner.mounts()
     }
+    fn device(&self, path: &[u8]) -> u64 {
+        self.inner.device(path)
+    }
+    fn mount_id(&self, path: &[u8]) -> u64 {
+        self.inner.mount_id(path)
+    }
+    fn mount_root(&self, path: &[u8]) -> Vec<u8> {
+        self.inner.mount_root(path)
+    }
+    fn mount_pin(&self, path: &[u8]) -> Option<paludarium_vfs::MountPin> {
+        self.inner.mount_pin(path)
+    }
     fn memory_path(&self, anchor: &[u8], inode: u64) -> Option<Vec<u8>> {
         self.inner.memory_path(anchor, inode)
     }
@@ -1124,7 +1144,7 @@ impl HostFs for CoherentFs {
             && let Ok(stat) = self.inner.metadata(path, flags & O_NOFOLLOW == 0)
             && stat.mode & 0o170000 == REGULAR
         {
-            let key = (mount_device(&self.inner.mounts(), path), stat.inode);
+            let key = (self.inner.device(path), stat.inode);
             drop(self.caches.write_access(key)?);
         }
         const O_CREAT: u32 = 0o100;
@@ -1143,12 +1163,13 @@ impl HostFs for CoherentFs {
             caches: Arc::clone(&self.caches),
             device: Device::Mount(
                 Arc::clone(&self.inner),
-                path.to_vec(),
+                self.inner.device(path),
                 Arc::new(Mutex::new(Place {
                     path: path.to_vec(),
                     resolved: false,
                     unlinked: false,
                 })),
+                self.inner.mount_pin(path),
             ),
             key: OnceLock::new(),
             write: None,
@@ -1175,7 +1196,7 @@ impl HostFs for CoherentFs {
         if !self.caches.any() || stat.mode & 0o170000 != REGULAR {
             return Ok(stat);
         }
-        let key = (mount_device(&self.inner.mounts(), path), stat.inode);
+        let key = (self.inner.device(path), stat.inode);
         match self.caches.find(key).map(|cache| cache.write_back()) {
             Some(Ok(true)) => self.inner.metadata(path, follow),
             _ => Ok(stat),

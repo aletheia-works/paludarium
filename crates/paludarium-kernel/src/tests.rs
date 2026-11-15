@@ -8128,6 +8128,249 @@ mod admin {
         assert_eq!(f.ret(443, &[99, info, 0, 0]), errno(Errno::EBADF));
     }
 }
+/// Writes `text` and a 0 at `DATA + at`, for a call's string argument.
+fn put(f: &mut Fixture, at: u64, text: &[u8]) -> u64 {
+    let mut bytes = text.to_vec();
+    bytes.push(0);
+    f.mem.write(GuestAddr(DATA + at), &bytes).unwrap();
+    DATA + at
+}
+/// The whole of the file at `path`, read through a descriptor.
+fn whole(f: &mut Fixture, path: &[u8]) -> Vec<u8> {
+    let p = put(f, 0x1800, path);
+    let fd = f.ret(2, &[p, 0, 0]);
+    let mut out = Vec::new();
+    loop {
+        let n = f.ret(0, &[fd, DATA + 0x1000, 0x400]);
+        if n == 0 || n as i64 <= 0 {
+            break;
+        }
+        let mut chunk = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x1000), &mut chunk).unwrap();
+        out.extend(chunk);
+    }
+    f.ret(3, &[fd]);
+    out
+}
+/// mount(2)'s checks come in Linux's order: the strings and options are
+/// copied, the target looked up, then the flags, the capability and the
+/// type and options of a new mount.
+#[test]
+fn mount_checks_in_linux_order() {
+    let mut f = fixture();
+    let (none, tmpfs, dir) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"), 0x40);
+    let target = put(&mut f, dir, b"/tmp/m");
+    assert_eq!(f.ret(83, &[target, 0o755]), 0);
+    let missing = put(&mut f, 0x80, b"/tmp/none");
+    let file = put(&mut f, 0xc0, b"/tmp/file");
+    f.ret(2, &[file, 0o101, 0o644]);
+    let mount = |f: &mut Fixture, a: [u64; 5]| f.ret(165, &a);
+    // The type, the source, then the options, before the target.
+    assert_eq!(
+        mount(&mut f, [none, missing, 8, 0, 0]),
+        errno(Errno::EFAULT)
+    );
+    assert_eq!(
+        mount(&mut f, [8, missing, tmpfs, 0, 0]),
+        errno(Errno::EFAULT)
+    );
+    assert_eq!(
+        mount(&mut f, [none, missing, tmpfs, 0, 8]),
+        errno(Errno::EFAULT)
+    );
+    assert_eq!(
+        mount(&mut f, [none, missing, tmpfs, 0, 0]),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(mount(&mut f, [none, 0, tmpfs, 0, 0]), errno(Errno::EFAULT));
+    // A string ends within PATH_MAX bytes, its 0 included (strndup_user).
+    let long = put(&mut f, 0x800, &[b'a'; 4095]);
+    assert_eq!(
+        mount(&mut f, [none, missing, long, 0, 0]),
+        errno(Errno::ENOENT)
+    );
+    let long = put(&mut f, 0x800, &[b'a'; 4096]);
+    assert_eq!(
+        mount(&mut f, [none, missing, long, 0, 0]),
+        errno(Errno::EINVAL)
+    );
+    // The magic number goes; MS_NOUSER is EINVAL.
+    assert_eq!(
+        mount(&mut f, [none, target, tmpfs, 1 << 31, 0]),
+        errno(Errno::EINVAL)
+    );
+    // A new mount: a type, a known one, its options.
+    assert_eq!(mount(&mut f, [none, target, 0, 0, 0]), errno(Errno::EINVAL));
+    let ext4 = put(&mut f, 0x100, b"ext4");
+    assert_eq!(mount(&mut f, [none, target, ext4, 0, 0]), errno(Errno(19)));
+    for bad in [
+        &b"bogus"[..],
+        b"size",
+        b"size=",
+        b"size=1q",
+        b"mode=8",
+        b"inode64=1",
+        b"casefold",
+        b"uid=-1",
+    ] {
+        let data = put(&mut f, 0x140, bad);
+        assert_eq!(
+            mount(&mut f, [none, target, tmpfs, 0, data]),
+            errno(Errno::EINVAL),
+            "{}",
+            String::from_utf8_lossy(bad)
+        );
+    }
+    assert_eq!(
+        mount(&mut f, [none, file, tmpfs, 0, 0]),
+        errno(Errno::ENOTDIR)
+    );
+    // What is not supported yet, after the checks before it.
+    for flags in [4096, 8192, 32, 32 | 4096, 1 << 20, 1 << 17, 1, 256] {
+        let at = if flags & (1 << 20 | 1 << 17) != 0 {
+            put(&mut f, 0x180, b"/")
+        } else {
+            target
+        };
+        assert_eq!(
+            mount(&mut f, [none, at, tmpfs, flags, 0]),
+            errno(Errno::EOPNOTSUPP),
+            "{flags:#x}"
+        );
+    }
+    let ro = put(&mut f, 0x140, b"ro");
+    assert_eq!(
+        mount(&mut f, [none, target, tmpfs, 0, ro]),
+        errno(Errno::EOPNOTSUPP)
+    );
+    // Propagation: of a mount's root, one type, which every mount has.
+    let root = put(&mut f, 0x180, b"/");
+    assert_eq!(mount(&mut f, [0, root, 0, 1 << 14 | 1 << 18, 0]), 0);
+    assert_eq!(mount(&mut f, [0, root, 0, 1 << 19, 0]), 0);
+    assert_eq!(
+        mount(&mut f, [0, target, 0, 1 << 18, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        mount(&mut f, [0, root, 0, 1 << 18 | 1 << 19, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        mount(&mut f, [0, root, 0, 1 << 18 | 1, 0]),
+        errno(Errno::EINVAL)
+    );
+    // Without CAP_SYS_ADMIN: EPERM, after the lookup.
+    f.thread.state.credentials.effective = 0;
+    assert_eq!(
+        mount(&mut f, [none, missing, tmpfs, 0, 0]),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(
+        mount(&mut f, [none, target, tmpfs, 0, 0]),
+        errno(Errno::EPERM)
+    );
+    assert_eq!(f.ret(166, &[target, 0]), errno(Errno::EPERM));
+}
+/// A tmpfs mount: its own device, size and mode, a line in mountinfo, and
+/// `umount2` in Linux's order.
+#[test]
+fn a_tmpfs_mount_and_its_umount() {
+    let mut f = fixture();
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let (tmp, target) = (put(&mut f, 0x20, b"/tmp"), put(&mut f, 0x40, b"/tmp/m"));
+    assert_eq!(f.ret(83, &[target, 0o755]), 0);
+    let stat = DATA + 0x400;
+    assert_eq!(f.ret(4, &[tmp, stat]), 0);
+    let outer = f.mem.read_u64(GuestAddr(stat)).unwrap();
+    let data = put(&mut f, 0x80, b"size=1m,mode=0750,nr_inodes=100");
+    assert_eq!(f.ret(165, &[none, target, tmpfs, 2 | 8, data]), 0);
+    assert_eq!(f.ret(4, &[target, stat]), 0);
+    let device = f.mem.read_u64(GuestAddr(stat)).unwrap();
+    assert_ne!(device, outer);
+    assert_eq!(f.mem.read_u64(GuestAddr(stat + 8)).unwrap(), 1);
+    assert_eq!(
+        f.mem.read_u64(GuestAddr(stat + 24)).unwrap() as u32,
+        0o040_750
+    );
+    assert_eq!(f.ret(137, &[target, stat]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(stat)).unwrap(), 0x0102_1994);
+    assert_eq!(f.mem.read_u64(GuestAddr(stat + 16)).unwrap(), 256);
+    assert_eq!(f.mem.read_u64(GuestAddr(stat + 40)).unwrap(), 100);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(&format!(
+            " 21 0:{device} / /tmp/m rw,nosuid,noexec,relatime - tmpfs none rw,size=1024k,nr_inodes=100,mode=750,inode64\n"
+        )),
+        "{info}"
+    );
+    let mounts = String::from_utf8(whole(&mut f, b"/proc/self/mounts")).unwrap();
+    assert!(mounts.ends_with("none /tmp/m tmpfs rw,nosuid,noexec,relatime,size=1024k,nr_inodes=100,mode=750,inode64 0 0\n"), "{mounts}");
+    // A file in it, and what umount2 checks first.
+    let inside = put(&mut f, 0xc0, b"/tmp/m/f");
+    let fd = f.ret(2, &[inside, 0o102, 0o600]);
+    assert_eq!(f.ret(1, &[fd, none, 4]), 4);
+    assert_eq!(f.ret(166, &[target, 0x10]), errno(Errno::EINVAL));
+    let missing = put(&mut f, 0x100, b"/tmp/none");
+    assert_eq!(f.ret(166, &[missing, 0]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(166, &[tmp, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(166, &[target, 4 | 2]), errno(Errno::EINVAL));
+    // The root from start-up stays.
+    let root = put(&mut f, 0x100, b"/");
+    assert_eq!(f.ret(166, &[root, 0]), errno(Errno(16)));
+    // In use by the open file: EBUSY; MNT_EXPIRE too.
+    assert_eq!(f.ret(166, &[target, 0]), errno(Errno(16)));
+    assert_eq!(f.ret(166, &[target, 4]), errno(Errno(16)));
+    // Through a working directory in it, then gone.
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(80, &[target]), 0);
+    assert_eq!(f.ret(166, &[target, 0]), errno(Errno(16)));
+    assert_eq!(f.ret(80, &[tmp]), 0);
+    let fd = f.ret(2, &[inside, 0, 0]);
+    // Detached, the open file stays readable, and the directory is back.
+    assert_eq!(f.ret(166, &[target, 2]), 0);
+    assert_eq!(f.ret(0, &[fd, DATA + 0x600, 16]), 4);
+    assert_eq!(f.ret(4, &[target, stat]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(stat)).unwrap(), outer);
+    assert_eq!(f.ret(4, &[inside, stat]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(166, &[target, 0]), errno(Errno::EINVAL));
+    // MNT_EXPIRE marks a mount in use by nothing, then unmounts it.
+    assert_eq!(f.ret(165, &[none, target, tmpfs, 0, 0]), 0);
+    assert_eq!(f.ret(166, &[target, 4]), errno(Errno::EAGAIN));
+    assert_eq!(f.ret(166, &[target, 4]), 0);
+}
+
+/// A new mount namespace has copies of the mounts, with new IDs, on the
+/// same file systems, and mounts of its own; the first keeps its own.
+#[test]
+fn unshare_newns_copies_the_mounts() {
+    let mut f = fixture();
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let target = put(&mut f, 0x40, b"/tmp/m");
+    assert_eq!(f.ret(83, &[target, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, target, tmpfs, 0, 0]), 0);
+    let inside = put(&mut f, 0x80, b"/tmp/m/f");
+    let fd = f.ret(2, &[inside, 0o102, 0o600]);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    let first = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(first.starts_with("21 1 0:1 / / ") && first.contains("\n22 21 0:2 / /tmp/m "));
+    assert_eq!(f.ret(272, &[0x2_0000]), 0);
+    let copy = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        copy.starts_with("23 1 0:1 / / ") && copy.contains("\n24 23 0:2 / /tmp/m "),
+        "{copy}"
+    );
+    let stat = DATA + 0x400;
+    assert_eq!(f.ret(4, &[inside, stat]), 0);
+    // Gone from the copy, it is still in the first namespace.
+    assert_eq!(f.ret(166, &[target, 0]), 0);
+    assert_eq!(f.ret(4, &[inside, stat]), errno(Errno::ENOENT));
+    let first_table = Arc::clone(f.kernel.files.first_mounts());
+    assert!(!Arc::ptr_eq(&first_table, &f.kernel.files.mount_table()));
+    let lower =
+        paludarium_vfs::NamespacedFs::new(Arc::new(paludarium_vfs::MemFs::new()), first_table);
+    assert_eq!(paludarium_vfs::FileSystem::mounts(&lower).len(), 2);
+}
+
 /// chroot keeps absolute paths, links and `..` inside the new root, and
 /// leaves the working directory where it was.
 #[test]

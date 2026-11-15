@@ -107,9 +107,13 @@ pub struct Files {
     pub(crate) unix: Arc<crate::unix::Names>,
     /// The machine's pseudo-terminals.
     pub(crate) devpts: Arc<crate::pty::Devpts>,
-    /// The machine's filesystem, from its root ([`Self::fs`] keeps to the
-    /// process's).
-    machine_fs: Arc<dyn FileSystem>,
+    /// The machine's filesystem through the mount namespace's table, from
+    /// the machine's root ([`Self::fs`] keeps to the process's), shared with
+    /// the working directory (`CLONE_FS`), as Linux's `fs_struct` holds the
+    /// mounts of its root and working directory.
+    space: Arc<Mutex<Space>>,
+    /// The first mount namespace's table, which every process's files share.
+    first_mounts: Arc<paludarium_vfs::MountTable>,
     pub(crate) fds: Arc<Mutex<BTreeMap<u32, Descriptor>>>,
     /// The table's number, shared exactly as `fds` is: the owner of the POSIX
     /// record locks set through it (Linux's `files_struct` as `flc_owner`).
@@ -127,25 +131,59 @@ pub struct Files {
     /// The root `chroot` gave, `None` for the machine's: Linux's
     /// `fs->root`, shared with the cwd.
     root: Arc<Mutex<Option<Root>>>,
+    /// What keeps the root's mount in use, shared with the root, and let go
+    /// of with the working directory.
+    root_pin: Arc<Mutex<Option<paludarium_vfs::MountPin>>>,
     /// The page caches of the files mapped shared, which `fs` keeps its
     /// files in step with; one for the whole machine.
     pub(crate) caches: Arc<crate::page_cache::PageCaches>,
+}
+/// The machine's filesystem as a mount namespace's table shows it: the
+/// lower filesystem (its mounts from start-up), the table's view of it, and
+/// that view with its files in step with their page caches.
+#[derive(Clone)]
+struct Space {
+    lower: Arc<dyn FileSystem>,
+    namespaced: Arc<paludarium_vfs::NamespacedFs>,
+    machine: Arc<dyn FileSystem>,
+}
+impl Space {
+    fn new(
+        lower: Arc<dyn FileSystem>,
+        table: Arc<paludarium_vfs::MountTable>,
+        caches: &Arc<crate::page_cache::PageCaches>,
+    ) -> Self {
+        let namespaced = Arc::new(paludarium_vfs::NamespacedFs::new(Arc::clone(&lower), table));
+        let machine = Arc::new(crate::page_cache::CoherentFs::new(
+            Arc::clone(&namespaced) as Arc<dyn FileSystem>,
+            Arc::clone(caches),
+        ));
+        Self {
+            lower,
+            namespaced,
+            machine,
+        }
+    }
 }
 impl Default for Files {
     fn default() -> Self {
         let fs = MemFs::new();
         let _ = fs.mkdir(b"/tmp", 0o1777);
         let caches = Arc::default();
+        let lower: Arc<dyn FileSystem> = Arc::new(fs);
+        let first_mounts = paludarium_vfs::MountTable::new(&*lower);
         Self {
             readiness: Arc::default(),
             terminal_size: None,
             network: None,
             unix: Arc::default(),
             devpts: Arc::default(),
-            machine_fs: Arc::new(crate::page_cache::CoherentFs::new(
-                Arc::new(fs),
-                Arc::clone(&caches),
-            )),
+            space: Arc::new(Mutex::new(Space::new(
+                lower,
+                Arc::clone(&first_mounts),
+                &caches,
+            ))),
+            first_mounts,
             fds: Arc::new(Mutex::new(BTreeMap::new())),
             table: Arc::new(Table::new()),
             reserved: Arc::default(),
@@ -153,6 +191,7 @@ impl Default for Files {
             home: Arc::default(),
             umask: Arc::new(AtomicU32::new(0o022)),
             root: Arc::default(),
+            root_pin: Arc::default(),
             caches,
         }
     }
@@ -251,19 +290,69 @@ impl Files {
     /// Uses `fs`, keeping its files in step with their page caches.
     /// The root goes back to the machine's, as a view of the old
     /// filesystem would keep showing it.
+    /// Its mounts are the first mount namespace's.
     pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
-        self.machine_fs = Arc::new(crate::page_cache::CoherentFs::new(
-            fs,
-            Arc::clone(&self.caches),
-        ));
+        self.first_mounts = paludarium_vfs::MountTable::new(&*fs);
+        *self.space.lock().unwrap_or_else(PoisonError::into_inner) =
+            Space::new(fs, Arc::clone(&self.first_mounts), &self.caches);
         *self.root.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.root_pin.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
     /// The filesystem as this process sees it: from its root.
     pub(crate) fn fs(&self) -> Arc<dyn FileSystem> {
         match &*self.root.lock().unwrap_or_else(PoisonError::into_inner) {
             Some(root) => Arc::clone(&root.fs),
-            None => Arc::clone(&self.machine_fs),
+            None => self.machine_fs(),
         }
+    }
+    fn machine_fs(&self) -> Arc<dyn FileSystem> {
+        Arc::clone(
+            &self
+                .space
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .machine,
+        )
+    }
+    /// The machine's filesystem through the mount table, from the machine's
+    /// root, which `mount` and `umount2` change.
+    pub(crate) fn namespaced(&self) -> Arc<paludarium_vfs::NamespacedFs> {
+        Arc::clone(
+            &self
+                .space
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .namespaced,
+        )
+    }
+    /// The mount table the root and working directory are in.
+    pub(crate) fn mount_table(&self) -> Arc<paludarium_vfs::MountTable> {
+        Arc::clone(self.namespaced().table())
+    }
+    /// The first mount namespace's table.
+    pub(crate) fn first_mounts(&self) -> &Arc<paludarium_vfs::MountTable> {
+        &self.first_mounts
+    }
+    /// Sees the filesystem through `table`, for every task that shares the
+    /// working directory: the root and the working directory stay at their
+    /// paths, now on that table's mounts, as `copy_mnt_ns` and
+    /// `mntns_install` move `fs->root` and `fs->pwd`.
+    pub(crate) fn set_mount_table(&self, table: Arc<paludarium_vfs::MountTable>) {
+        {
+            let mut space = self.space.lock().unwrap_or_else(PoisonError::into_inner);
+            let lower = Arc::clone(&space.lower);
+            *space = Space::new(lower, table, &self.caches);
+        }
+        let root = self.root();
+        if root != b"/" {
+            let _ = self.set_root(root);
+        }
+        let cwd = self
+            .cwd
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.change_directory(cwd);
     }
     /// The process's root, a resolved path from the machine's root: `/`
     /// unless `chroot` moved it.
@@ -283,13 +372,16 @@ impl Files {
     /// that shares it (`set_fs_root`); `EINVAL` where the filesystem cannot
     /// keep to one.
     pub(crate) fn set_root(&self, path: Vec<u8>) -> Result<(), Errno> {
+        let machine = self.machine_fs();
+        let pin = machine.mount_pin(&path);
         let root = if path == b"/" {
             None
         } else {
-            let fs = self.machine_fs.rooted(&path).ok_or(Errno::EINVAL)?;
+            let fs = machine.rooted(&path).ok_or(Errno::EINVAL)?;
             Some(Root { path, fs })
         };
         *self.root.lock().unwrap_or_else(PoisonError::into_inner) = root;
+        *self.root_pin.lock().unwrap_or_else(PoisonError::into_inner) = pin;
         Ok(())
     }
     pub(crate) fn set_current_directory(&mut self, path: &[u8]) -> Result<(), Errno> {
@@ -321,6 +413,7 @@ impl Files {
     /// does: the last task sharing it ends its hold on the directory.
     pub(crate) fn release_home(&mut self) {
         self.home = Arc::default();
+        self.root_pin = Arc::default();
     }
     /// Detaches this worker's table reference without closing a table still
     /// shared by live CLONE_FILES siblings; the last task to let go gets the
@@ -636,6 +729,7 @@ impl Files {
     /// Linux's `mntns_install` sets it.
     pub(crate) fn enter_root(&self) {
         *self.root.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.root_pin.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.change_directory(b"/".to_vec());
     }
     /// This task's own copy of the descriptor table, as `unshare_fd` gives
@@ -679,6 +773,18 @@ impl Files {
             child.umask = Arc::new(AtomicU32::new(self.umask.load(Ordering::SeqCst)));
             child.root = Arc::new(Mutex::new(
                 self.root
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ));
+            child.root_pin = Arc::new(Mutex::new(
+                self.root_pin
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ));
+            child.space = Arc::new(Mutex::new(
+                self.space
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone(),
@@ -861,6 +967,51 @@ fn lookup(
     let p = c.files.path(dir, raw.clone())?;
     let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
     Ok((p, found))
+}
+/// The target of `mount` or `umount2` at `ptr`, as `user_path_at` finds it
+/// (search permission on the way, then the file; its last link followed
+/// with `follow`, as `LOOKUP_FOLLOW`): its resolved path from the machine's
+/// root, or none for `/proc` and `/dev`, which the kernel generates and no
+/// mount holds.
+pub(crate) fn mount_target(
+    c: &Context<'_>,
+    ptr: u64,
+    follow: bool,
+) -> Result<Option<Vec<u8>>, Errno> {
+    let p = looked_up(c, (-100i32) as u64, ptr, follow)?.0;
+    let p = match followed(c, &p, follow)? {
+        Some(Followed::Path { path, .. }) => path,
+        Some(Followed::File(d)) => d.path,
+        None => p,
+    };
+    if generated(&p)
+        || paludarium_vfs::normalize_path(&p).is_ok_and(|p| p == b"/proc" || p == b"/dev")
+    {
+        return Ok(None);
+    }
+    c.files.fs().metadata(&p, follow)?;
+    let resolved = if follow {
+        resolved(c.files, &p)
+    } else {
+        let p = paludarium_vfs::normalize_in(&c.files.root(), &p)?;
+        match p.iter().rposition(|&b| b == b'/') {
+            Some(at) if p.len() > 1 => {
+                let directory = resolved(c.files, &p[..at.max(1)]);
+                directory.map(|d| child_of(&d, &p[at + 1..]))
+            }
+            _ => Some(p),
+        }
+    };
+    resolved.map(Some).ok_or(Errno::ENOENT)
+}
+/// `name` in directory `dir`.
+fn child_of(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut out = dir.to_vec();
+    if out != b"/" {
+        out.push(b'/');
+    }
+    out.extend_from_slice(name);
+    out
 }
 /// [`lookup`] of the path at `ptr`.
 fn looked_up(
@@ -1506,22 +1657,20 @@ fn directory_entries(
 /// `ustat(dev, ubuf)`, as Linux's: the free blocks and inodes of the
 /// filesystem whose device `dev` is, in the "new" encoding `stat`'s
 /// `st_dev` has (`new_decode_dev`), else `EINVAL`. The devices here are the
-/// mounts' (0:1 the root, as [`device`] numbers them) and the internal file
-/// systems' ([`Internal`]), which have none free, as their `simple_statfs`
+/// mounts' superblocks' (0:1 the root, as [`device`] numbers them), as
+/// `user_get_super` finds them, and the internal file systems'
+/// ([`Internal`]), which have none free, as their `simple_statfs`
 /// and the `shmem_statfs` of a tmpfs of no limits give. The 32-byte
 /// `struct ustat` has an `int f_tfree`, which takes the count's low bits as
 /// C's conversion does, and an `unsigned long f_tinode`; its names are
 /// empty.
 fn ustat(c: &Context<'_>, dev: u32, buf: u64) -> Result<u64, Errno> {
-    let major = (dev & 0xfff00) >> 8;
-    let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
     let mut b = [0u8; 32];
     if !Internal::ALL.iter().any(|fs| fs.device() == u64::from(dev)) {
         let mounts = c.files.fs().mounts();
-        let mount = (major == 0)
-            .then(|| minor.checked_sub(1))
-            .flatten()
-            .and_then(|i| mounts.get(i as usize))
+        let mount = mounts
+            .iter()
+            .find(|m| m.device == u64::from(dev))
             .ok_or(Errno::EINVAL)?;
         let stats = c.files.fs().statfs(&mount.path)?;
         b[0..4].copy_from_slice(&(stats.blocks_free as i32).to_le_bytes());
@@ -2932,11 +3081,10 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         b[56..64].copy_from_slice(&u64::from(STATX_ATTR_FLAGS).to_le_bytes());
     }
     // As Linux's vfs_statx, the mount's ID whether or not it was asked for:
-    // the unique one if that was, the one mountinfo shows otherwise. A
-    // mount's minor number is its position in mountinfo, whose IDs start at
-    // 21; an internal file system's mount has a small one that mountinfo
-    // does not show, as Linux's internal mounts are not shown.
-    let id = mount_id(device);
+    // the unique one if that was, the one mountinfo shows otherwise, whose
+    // IDs start at 21; an internal file system's mount has a small one that
+    // mountinfo does not show, as Linux's internal mounts are not shown.
+    let id = mount_id(c, device);
     let (bit, id) = if mask & STATX_MNT_ID_UNIQUE != 0 {
         (STATX_MNT_ID_UNIQUE, 1 << 31 | id)
     } else {
@@ -3070,7 +3218,7 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let (kind, bytes) = file_handle(kind, device, stat.inode);
     // The file system takes the size in 4-byte words, as it encodes them.
     let fits = given >> 2 >= bytes.len() as u32 >> 2;
-    let id = mount_id(device);
+    let id = mount_id(c, device);
     if flags & AT_HANDLE_MNT_ID_UNIQUE != 0 {
         output(c, mount, &(1u64 << 31 | id).to_le_bytes())?;
     } else {
@@ -3338,14 +3486,21 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
     })
 }
 /// The ID of the mount whose device is `device`, as `/proc/self/mountinfo`
-/// numbers it: its minor number is its position there, from 21. An internal
-/// file system's mount ([`Internal`]) has one of the small IDs below those,
-/// as Linux's `kern_mount`s take theirs first, at boot.
-fn mount_id(device: u64) -> u64 {
-    match Internal::ALL.iter().position(|fs| fs.device() == device) {
-        Some(i) => i as u64 + 1,
-        None => 20 + (device & 0xff | (device >> 12) & !0xff),
+/// numbers it (each mount here has a superblock of its own, so the device
+/// names it); a detached one's, which mountinfo no longer lists, is 20 and
+/// its minor number. An internal file system's mount ([`Internal`]) has one
+/// of the small IDs below 21, as Linux's `kern_mount`s take theirs first,
+/// at boot.
+fn mount_id(c: &Context<'_>, device: u64) -> u64 {
+    if let Some(i) = Internal::ALL.iter().position(|fs| fs.device() == device) {
+        return i as u64 + 1;
     }
+    c.files
+        .fs()
+        .mounts()
+        .iter()
+        .find(|m| m.device == device)
+        .map_or(20 + (device & 0xff | (device >> 12) & !0xff), |m| m.id)
 }
 /// `struct statx` with what [`encode_stat`] gives a `struct stat`: the basic
 /// fields, no birth time, and the mount's number as the device minor.
@@ -3491,7 +3646,7 @@ pub(crate) fn descriptor_device(c: &Context<'_>, d: &Descriptor) -> u64 {
 /// The minor number of the mount that holds `path` (the longest matching
 /// mount point), so that each mount is its own device.
 fn device(c: &Context<'_>, path: &[u8]) -> u64 {
-    crate::page_cache::mount_device(&c.files.fs().mounts(), path)
+    c.files.fs().device(path)
 }
 /// The block size of a guest's file: `st_blksize`, `stx_blksize`,
 /// `FIGETBSZ`, and `f_bsize` of a pipe or a socket, which Linux all take from
@@ -6126,10 +6281,7 @@ pub(crate) fn identity(c: &Context<'_>, path: &[u8]) -> Option<crate::landlock::
 /// only the files.
 pub(crate) fn file_identity(files: &Files, path: &[u8]) -> Option<crate::landlock::Object> {
     let stat = files.fs().metadata(path, false).ok()?;
-    Some((
-        crate::page_cache::mount_device(&files.fs().mounts(), path),
-        stat.inode,
-    ))
+    Some((files.fs().device(path), stat.inode))
 }
 /// The object of a Landlock rule's `parent_fd`, and whether it is a
 /// directory: the file a descriptor (`O_PATH` too) holds. A ruleset, a pipe,
@@ -6931,7 +7083,7 @@ fn descriptor_info(c: &Context<'_>, n: u32) -> Option<Vec<u8>> {
     // A file that cannot seek (a pipe, a socket) is at 0.
     let pos = d.file.seek(0, 1).unwrap_or(0);
     let ino = d.file.stat().map_or(0, |stat| stat.inode);
-    let mount = mount_id(descriptor_device(c, &d));
+    let mount = mount_id(c, descriptor_device(c, &d));
     let mut out =
         format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t{mount}\nino:\t{ino}\n").into_bytes();
     out.extend(crate::record_locks::fdinfo(c, &d));

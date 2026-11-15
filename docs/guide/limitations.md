@@ -65,7 +65,9 @@ verified.
   what it published at its last system call or signal check, so a mask
   changed only for the length of a call (`rt_sigsuspend`, `ppoll`) is not
   seen. `meminfo` shows the fixed 4 GiB that `sysinfo` reports, with nothing
-  used.
+  used. A generated file's `stat` gives its length as its size
+  (`mountinfo`, `status`, `stat`, `loadavg` and the like), where Linux's
+  seq files are of size 0; `maps`, `smaps` and `fdinfo` are 0 as on Linux.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
   root. As `mount` mounts nothing on `/proc` or `/dev` and has no bind

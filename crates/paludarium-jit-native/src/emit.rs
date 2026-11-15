@@ -411,6 +411,62 @@ impl Emitter<'_, '_> {
         self.b.ins().band_imm_s(down, 1)
     }
 
+    /// The result of `shl`, `shr` or `sar` of `a` (masked to `size`) by
+    /// `count`, a value already masked to 31 or 63, and the status flags of
+    /// a count that is not 0, as `Shift::apply` has them. A count of 0
+    /// gives back `a`.
+    fn shift_by(&mut self, op: Shift, a: Value, count: Value, size: u8) -> (Value, Value) {
+        let width = i64::from(size) * 8;
+        let one = self.constant(1);
+        let less = self.b.ins().isub(count, one);
+        let (r, cf, of) = match op {
+            Shift::Shl => {
+                // `a` has `width` bits and the count is at most 63, so the
+                // bits that leave stay in `wide` unless `width` is 64.
+                let wide = self.b.ins().ishl(a, count);
+                let r = self.masked(wide, size);
+                let cf = if size == 8 {
+                    let w = self.constant(64);
+                    let back = self.b.ins().isub(w, count);
+                    let out = self.b.ins().ushr(a, back);
+                    self.b.ins().band_imm_s(out, 1)
+                } else {
+                    let out = self.b.ins().ushr_imm_s(wide, width);
+                    self.b.ins().band_imm_s(out, 1)
+                };
+                let top = self.bit_of(r, (width - 1) as u32);
+                let of = self.b.ins().bxor(top, cf);
+                (r, cf, Some(of))
+            }
+            Shift::Shr => {
+                let r = self.b.ins().ushr(a, count);
+                let out = self.b.ins().ushr(a, less);
+                let cf = self.b.ins().band_imm_s(out, 1);
+                let of = self.bit_of(a, (width - 1) as u32);
+                (r, cf, Some(of))
+            }
+            Shift::Sar => {
+                let signed = self.sign_extended(a, size);
+                let shifted = self.b.ins().sshr(signed, count);
+                let r = self.masked(shifted, size);
+                let out = self.b.ins().sshr(signed, less);
+                let cf = self.b.ins().band_imm_s(out, 1);
+                (r, cf, None)
+            }
+            Shift::Rol | Shift::Ror => unreachable!("rotates by cl have no form"),
+        };
+        let mut f = self.zf_sf_pf(r, size);
+        f = self.b.ins().bor(f, cf);
+        if let Some(of) = of {
+            let of = self
+                .b
+                .ins()
+                .ishl_imm_s(of, i64::from(flag::OF.trailing_zeros()));
+            f = self.b.ins().bor(f, of);
+        }
+        (r, f)
+    }
+
     /// The result of `op` on `a` (masked to `size`) by `count` (already
     /// masked, not 0), the flags it changes and their values, as
     /// `Shift::apply` has them.
@@ -607,6 +663,15 @@ impl Emitter<'_, '_> {
                 self.set_gpr(4, rsp);
                 self.unless_changed(status, n + 1, next);
             }
+            Fast::PushImmediate(v) => {
+                let v = self.constant(v as i64);
+                let rsp = self.gpr(4);
+                let rsp = self.b.ins().iadd_imm_s(rsp, -8);
+                let status = self.store(rsp, 8, v);
+                self.unless_failed(status, n, rip);
+                self.set_gpr(4, rsp);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::Pop(r) => {
                 let rsp = self.gpr(4);
                 let (v, status) = self.load(rsp, 8);
@@ -758,6 +823,24 @@ impl Emitter<'_, '_> {
                     self.write(dst, r);
                     self.set_flags(update, f);
                 }
+            }
+            Fast::ShiftByCl { op, dst } => {
+                let size = dst.size();
+                let a = self.read(dst);
+                let rcx = self.gpr(1);
+                let count = self
+                    .b
+                    .ins()
+                    .band_imm_s(rcx, if size == 8 { 63 } else { 31 });
+                let (r, f) = self.shift_by(op, a, count, size);
+                self.write(dst, r);
+                // A count of 0 changes no flag.
+                let old = self.word(RFLAGS);
+                let kept = self.b.ins().band_imm_s(old, !(flag::STATUS as i64));
+                let new = self.b.ins().bor(kept, f);
+                let zero = self.b.ins().icmp_imm_s(IntCC::Equal, count, 0);
+                let flags = self.b.ins().select(zero, old, new);
+                self.set_word(RFLAGS, flags);
             }
             Fast::Compare { op, mem, src } => {
                 let size = mem.size;

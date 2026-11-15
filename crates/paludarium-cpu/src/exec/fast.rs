@@ -254,6 +254,8 @@ pub enum Fast {
     },
     /// `push r64`.
     Push(u8),
+    /// `push imm`, the immediate sign-extended to 64 bits.
+    PushImmediate(u64),
     /// `pop r64`.
     Pop(u8),
     Jcc {
@@ -342,6 +344,12 @@ pub enum Fast {
         op: Shift,
         dst: Register,
         count: u8,
+    },
+    /// `shl`, `shr` or `sar` of a register by `cl`, masked as the
+    /// instruction masks it.
+    ShiftByCl {
+        op: Shift,
+        dst: Register,
     },
 }
 
@@ -479,7 +487,10 @@ impl Fast {
                     }
                 }
             },
-            Mnemonic::Push if i.implicit_size == 8 && b.is_none() => Self::Push(gpr64(a)?),
+            Mnemonic::Push if i.implicit_size == 8 && b.is_none() => match a {
+                Some(Operand::Immediate(v)) => Self::PushImmediate(v),
+                _ => Self::Push(gpr64(a)?),
+            },
             Mnemonic::Pop if i.implicit_size == 8 && b.is_none() => Self::Pop(gpr64(a)?),
             Mnemonic::Jcc(condition) => Self::Jcc {
                 condition,
@@ -541,13 +552,19 @@ impl Fast {
             }
             m if Shift::of(m).is_some() => {
                 let dst = gpr(a)?;
+                let op = Shift::of(m)?;
                 let count = match b {
                     None => 1,
                     Some(Operand::Immediate(v)) => v,
+                    Some(Operand::Register(Register::Gpr { index: 1, size: 1 }))
+                        if matches!(op, Shift::Shl | Shift::Shr | Shift::Sar) =>
+                    {
+                        return Some(Self::ShiftByCl { op, dst });
+                    }
                     Some(_) => return None,
                 } & if dst.size() == 8 { 63 } else { 31 };
                 Self::Shift {
-                    op: Shift::of(m)?,
+                    op,
                     dst,
                     count: count as u8,
                 }
@@ -655,6 +672,10 @@ pub(crate) fn execute(
         }
         Fast::Push(r) => {
             let v = x.s.gpr[usize::from(r)];
+            x.push(v, 8)?;
+            next
+        }
+        Fast::PushImmediate(v) => {
             x.push(v, 8)?;
             next
         }
@@ -794,6 +815,15 @@ pub(crate) fn execute(
         Fast::Shift { op, dst, count } => {
             let size = dst.size();
             let a = x.read_reg(dst) & size_mask(size);
+            let (r, update, flags) = op.apply(a, count, size);
+            x.write_reg(dst, r);
+            x.set_status(update, flags);
+            next
+        }
+        Fast::ShiftByCl { op, dst } => {
+            let size = dst.size();
+            let a = x.read_reg(dst) & size_mask(size);
+            let count = x.s.gpr[1] as u8 & if size == 8 { 63 } else { 31 };
             let (r, update, flags) = op.apply(a, count, size);
             x.write_reg(dst, r);
             x.set_status(update, flags);

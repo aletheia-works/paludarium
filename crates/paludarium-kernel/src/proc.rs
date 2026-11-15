@@ -1268,7 +1268,7 @@ impl FileHandle for PagemapFile {
         if self.memory.pagemap(0, 0).is_none() {
             return Ok(0);
         }
-        if offset % 8 != 0 || buf.len() % 8 != 0 {
+        if !offset.is_multiple_of(8) || !buf.len().is_multiple_of(8) {
             return Err(Errno::EINVAL);
         }
         let start = (offset / 8).saturating_mul(4096);

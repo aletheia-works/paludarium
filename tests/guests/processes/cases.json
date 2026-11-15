@@ -152,6 +152,7 @@
     {"name":"userfaultfd-shared","binary":"userfaultfd"},
     {"name":"userfaultfd-wp","binary":"userfaultfd"},
     {"name":"userfaultfd-poison","binary":"userfaultfd"},
+    {"name":"userfaultfd-move","binary":"userfaultfd"},
     {"name":"mqueue-calls","binary":"mqueue"},
     {"name":"mqueue-limits","binary":"mqueue"},
     {"name":"mqueue-wait","binary":"mqueue"},

@@ -555,8 +555,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
   メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
-  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE` と
-  `UFFDIO_MOVE` もありません（`EINVAL`）。`fork`、`mremap`、
+  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE` も
+  ありません（`EINVAL`）。`fork`、`mremap`、
   `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
   それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
@@ -564,7 +564,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページの保護を外します。Linux はその印を PTE に残します。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
   登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
   ないページか、書き込み保護されたページへのシステムコール自身のコピーは、
-  `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
+  `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`UFFDIO_MOVE` の
+  動かし元の穴は、ここでその周りの 2 MiB にどれも触れていなければ、Linux にそこの
+  ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
+  ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベント（`FAN_OPEN_PERM`、`FAN_ACCESS_PERM`、
   `FAN_OPEN_EXEC_PERM`）は `fanotify_mark` で受け付けますが送りません。そのため、求める

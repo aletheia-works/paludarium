@@ -941,7 +941,7 @@ kernel.
   `UFFD_FEATURE_PAGEFAULT_FLAG_WP`, `UFFD_FEATURE_SIGBUS`,
   `UFFD_FEATURE_THREAD_ID`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
-  `UFFD_FEATURE_MISSING_HUGETLBFS` and `UFFD_FEATURE_POISON`, and `UFFD_FEATURE_EVENT_FORK` needs
+  `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_POISON` and `UFFD_FEATURE_MOVE`, and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory and shared anonymous memory for missing pages
   (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
@@ -994,7 +994,23 @@ kernel.
   and `UFFDIO_UNREGISTER`, moves with `mremap`, goes to a `fork`ed child of
   private memory but not of shared, and goes with `MADV_DONTNEED`,
   `MADV_FREE`, `MADV_GUARD_INSTALL` (whose guard takes its place) and
-  `munmap`. A read takes whole messages (`EINVAL` for a buffer
+  `munmap`. `UFFDIO_MOVE` moves private anonymous pages of the
+  context's own address space (`EINVAL` from another) into a registered
+  range, whether or not `UFFD_FEATURE_MOVE` was asked for, as Linux's
+  `move_pages`: each start in a VMA (`ENOENT`); neither VMA shared, each
+  holding its whole range, the same protection, which lets writes, both
+  locked or neither, the destination registered with this `userfaultfd`,
+  and both anonymous memory (`EINVAL`). Then page by page: `EEXIST` for a
+  destination page that has one, or a marker; `ENOENT` for a source page
+  with none, which `UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES` counts as moved
+  instead; `EFAULT` for a source poison or guard; and `EBUSY` for a page a
+  `fork` shares until a write gives it its own (`PageAnonExclusive`). The
+  zero page moves as the zero page; any other page takes the
+  destination's protection, writable and no longer write-protected, and
+  the source has none. What was moved, or the error, goes in the
+  struct's last field, the waits for the moved pages end unless
+  `DONTWAKE`, and one that stops short is `EAGAIN`.
+  A read takes whole messages (`EINVAL` for a buffer
   too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
   `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
   Linux's does, else `POLLIN` while a fault is not read yet.

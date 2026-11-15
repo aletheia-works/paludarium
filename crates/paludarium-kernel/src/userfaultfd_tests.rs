@@ -20,6 +20,7 @@ const COPY: u64 = 0xc028_aa03;
 const ZEROPAGE: u64 = 0xc020_aa04;
 const WRITEPROTECT: u64 = 0xc018_aa06;
 const POISON: u64 = 0xc020_aa08;
+const MOVE: u64 = 0xc028_aa05;
 
 const NONBLOCK: u64 = 0o4000;
 const SIGBUS: u64 = 1 << 7;
@@ -188,7 +189,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ret(16, &[fd, API, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, API, &[0xaa, SIGBUS | THREAD_ID, 0]);
     assert_eq!(ret, 0);
-    assert_eq!(out, vec![0xaa, 0x49b1, 1 << 63 | 3]);
+    assert_eq!(out, vec![0xaa, 0x1_49b1, 1 << 63 | 3]);
     assert_eq!(
         f.ioctl(fd, API, &[0xaa, 0, 0]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
@@ -196,7 +197,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ioctl(fd, 0xc018_aa3e, &[0, 0, 0]).0, errno(Errno::EINVAL));
     assert!(
         f.fdinfo(fd)
-            .ends_with("pending:\t0\ntotal:\t0\nAPI:\taa:80000180:800000000000015f\n")
+            .ends_with("pending:\t0\ntotal:\t0\nAPI:\taa:80000180:800000000000017f\n")
     );
     // Read, write and seek of the file.
     assert_eq!(f.ret(0, &[fd, ARG, 32]), errno(Errno::EAGAIN));
@@ -229,7 +230,7 @@ fn uffdio_register_checks_the_range_and_its_vmas() {
     assert_eq!(f.ioctl(fd, REGISTER, &[0x4000_0000, PAGE, 1, 0]).0, einval);
     assert_eq!(f.ret(16, &[fd, REGISTER, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, REGISTER, &[AREA + PAGE, 2 * PAGE, 1, 0]);
-    assert_eq!((ret, out[3]), (0, 0x11c));
+    assert_eq!((ret, out[3]), (0, 0x13c));
     assert!(f.userfault(AREA).is_none());
     assert_eq!(f.userfault(AREA + PAGE).map(|u| u.modes), Some(1));
     assert!(f.userfault(AREA + 3 * PAGE).is_none());
@@ -477,7 +478,7 @@ fn a_write_to_a_write_protected_page_faults_until_the_protection_ends() {
     );
     f.mem.write(GuestAddr(AREA), b"a").unwrap();
     let (ret, out) = f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 3, 0]);
-    assert_eq!((ret, out[3]), (0, 0x15c));
+    assert_eq!((ret, out[3]), (0, 0x17c));
     assert_eq!(
         f.userfault(AREA).map(|u| u.modes),
         Some(Userfault::MISSING | Userfault::WP)
@@ -651,4 +652,82 @@ fn uffdio_poison_poisons_pages_that_have_none() {
     let mut byte = [0];
     f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
     assert_eq!(byte, *b"q");
+}
+
+#[test]
+fn uffdio_move_moves_private_anonymous_pages_into_a_registered_range() {
+    let mut f = fixture();
+    let fd = f.ready(0, 0);
+    assert_eq!(f.register(fd, AREA, 4 * PAGE), 0);
+    let src = AREA + 4 * PAGE;
+    f.mem.write(GuestAddr(src), b"x").unwrap();
+    f.mem.write(GuestAddr(src + PAGE), b"y").unwrap();
+    let einval = errno(Errno::EINVAL);
+    // Modes it knows, and whole pages.
+    assert_eq!(f.ioctl(fd, MOVE, &[AREA, src, PAGE, 4, 0]).0, einval);
+    assert_eq!(f.ioctl(fd, MOVE, &[AREA, src + 1, PAGE, 0, 0]).0, einval);
+    assert_eq!(f.ioctl(fd, MOVE, &[AREA, src, 0, 0, 0]).0, einval);
+    // A start in no VMA is ENOENT; a destination not registered EINVAL.
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[AREA, 0x30_0000, PAGE, 0, 0]).1[4],
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[src + 2 * PAGE, src, PAGE, 0, 0]).1[4],
+        einval
+    );
+    // A page moves, with its contents, and the source has none.
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[AREA, src, PAGE, 0, 0]),
+        (0, vec![AREA, src, PAGE, 0, PAGE])
+    );
+    let mut byte = [0];
+    f.mem.read(GuestAddr(AREA), &mut byte).unwrap();
+    assert_eq!(byte, *b"x");
+    // A destination page that has one is EEXIST, a source page with none
+    // ENOENT, unless holes are allowed, which count as moved.
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[AREA, src + PAGE, PAGE, 0, 0]).1[4],
+        errno(Errno::EEXIST)
+    );
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[AREA + PAGE, src, PAGE, 0, 0]).1[4],
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[AREA + PAGE, src, 2 * PAGE, 2, 0]),
+        (0, vec![AREA + PAGE, src, 2 * PAGE, 2, 2 * PAGE])
+    );
+    f.mem.read(GuestAddr(AREA + 2 * PAGE), &mut byte).unwrap();
+    assert_eq!(byte, *b"y");
+    // A range past its VMA is EINVAL, written back as well.
+    f.mem.write(GuestAddr(src + 2 * PAGE), b"z").unwrap();
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[AREA + 3 * PAGE, src + 2 * PAGE, 2 * PAGE, 0, 0]),
+        (
+            einval,
+            vec![AREA + 3 * PAGE, src + 2 * PAGE, 2 * PAGE, 0, einval]
+        )
+    );
+    // A move that stops short is EAGAIN, with the bytes it moved.
+    f.mem.write(GuestAddr(src), b"v").unwrap();
+    f.mem.write(GuestAddr(src + PAGE), b"w").unwrap();
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[AREA + PAGE, src, 2 * PAGE, 1, 0]),
+        (
+            errno(Errno::EAGAIN),
+            vec![AREA + PAGE, src, 2 * PAGE, 1, PAGE]
+        )
+    );
+    f.mem.read(GuestAddr(AREA + PAGE), &mut byte).unwrap();
+    assert_eq!(byte, *b"v");
+    // Both VMAs need the same protection.
+    f.mem
+        .protect(GuestAddr(src + 2 * PAGE), PAGE, Prot::READ)
+        .unwrap();
+    assert_eq!(
+        f.ioctl(fd, MOVE, &[AREA + 3 * PAGE, src + 2 * PAGE, PAGE, 0, 0])
+            .1[4],
+        einval
+    );
 }

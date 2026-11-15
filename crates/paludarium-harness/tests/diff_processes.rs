@@ -201,6 +201,7 @@ mod linux {
                     | "userfaultfd-shared"
                     | "userfaultfd-wp"
                     | "userfaultfd-poison"
+                    | "userfaultfd-move"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -518,6 +519,7 @@ mod linux {
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
         userfaultfd_poison => ("userfaultfd-poison","userfaultfd"),
+        userfaultfd_move => ("userfaultfd-move","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

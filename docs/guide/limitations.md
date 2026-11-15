@@ -647,8 +647,7 @@ verified.
 - **userfaultfd, in part**: missing pages and the write protection of
   private anonymous memory are registered. The minor mode is refused
   (`EINVAL`), as is the write-protect mode for shared memory, which Linux
-  takes, and `UFFDIO_CONTINUE` and `UFFDIO_MOVE` are not offered
-  (`EINVAL`), nor the events of `fork`, `mremap`, `madvise` and
+  takes, and `UFFDIO_CONTINUE` is not offered (`EINVAL`), nor the events of `fork`, `mremap`, `madvise` and
   `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
   `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
   `UFFDIO_API` does not report and refuses (`EINVAL`); the ioctls
@@ -660,7 +659,10 @@ verified.
   registered (`EINVAL`), where Linux takes any shmem. A system call's own
   copy to or from a missing page of a registered range, or to a
   write-protected one, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
-  Linux waits for the page as for an instruction. There is no `/dev/userfaultfd` and no
+  Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
+  hole is `ENOENT` before the destination is looked at when nothing
+  touched the 2 MiB around it here, as when Linux has no page table there,
+  which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: permission events (`FAN_OPEN_PERM`,
   `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM`) are taken by `fanotify_mark` but

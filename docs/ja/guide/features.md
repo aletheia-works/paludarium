@@ -847,7 +847,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書きます。提供する機能は `UFFD_FEATURE_PAGEFAULT_FLAG_WP`、`UFFD_FEATURE_SIGBUS`、
   `UFFD_FEATURE_THREAD_ID`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
-  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON` で、`UFFD_FEATURE_EVENT_FORK` には
+  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
   メモリと共有の anonymous メモリを、ないページについて登録し
   （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
@@ -893,7 +893,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   poison は `mprotect` と `UFFDIO_UNREGISTER` では残り、`mremap` では一緒に動き、
   `fork` した子には、プライベートなメモリでは引き継がれ、共有メモリでは引き継がれず、
   `MADV_DONTNEED`、`MADV_FREE`、`MADV_GUARD_INSTALL`（ガードに置き換わります）、
-  `munmap` で消えます。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
+  `munmap` で消えます。`UFFDIO_MOVE` は、Linux の `move_pages` と同じく、
+  コンテキスト自身のアドレス空間（ほかの空間からは `EINVAL`）のプライベートな
+  anonymous のページを、登録した範囲へ動かします。`UFFD_FEATURE_MOVE` を求めたか
+  どうかは問いません。それぞれの先頭が VMA にあること（`ENOENT`）、どちらの VMA も
+  共有でなく、それぞれの範囲を丸ごと持ち、保護が同じで書き込めること、どちらも
+  ロックしているかどちらもしていないこと、動かし先がこの `userfaultfd` に登録した
+  もので、どちらも anonymous のメモリであること（`EINVAL`）を確かめます。そのあと
+  1 ページずつ、動かし先にページかマーカーがあれば `EEXIST`、動かし元にページが
+  なければ `ENOENT`（`UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES` では動かしたものとして
+  数えます）、動かし元の poison やガードは `EFAULT`、`fork` が共有していて、書き込みで
+  自分のものになっていないページは `EBUSY`（`PageAnonExclusive`）です。ゼロページは
+  ゼロページのまま動き、ほかのページは動かし先の保護で書き込めるようになり、書き込み
+  保護は外れ、動かし元にはページがなくなります。動かした分かエラーは構造体の最後の
+  フィールドに入り、`DONTWAKE` でなければ動かしたページの待ちが終わり、途中で止まると
+  `EAGAIN` です。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
   `EINVAL`）、ノンブロッキングでなければ待ちます。`poll` は、Linux と同じく
   `UFFDIO_API` の前とブロックするファイルでは `POLLERR`、それ以外ではまだ読まれていない
   フォールトがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と

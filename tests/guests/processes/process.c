@@ -8677,17 +8677,24 @@ static int proc_other_maps_case(void) {
     if (dir) closedir(dir);
     printf("listed=%d\n", listed);
     /* A reader that may not read it: EACCES at open, but O_PATH and stat
-       reach the file. */
+       reach the file, and readlink says it is no link (EINVAL). */
     fflush(stdout);
     pid_t other = fork();
     if (other == 0) {
         if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
         snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
         long m = pomaps_read(path, theirs);
-        int o = open(path, O_PATH);
-        printf("other user maps=%ld path=%d stat=%d", m, o >= 0 ? 0 : errno, stat(path, &st) ? errno : 0);
+        int o = open(path, O_PATH) >= 0 ? 0 : errno;
+        int s = stat(path, &st) ? errno : 0;
+        char link[16];
+        int l = readlink(path, link, sizeof link) >= 0 ? 0 : errno;
+        printf("other user maps=%ld path=%d stat=%d readlink=%d", m, o, s, l);
         snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
-        printf(" smaps=%ld\n", pomaps_read(path, theirs));
+        printf(" smaps=%ld", pomaps_read(path, theirs));
+        snprintf(path, sizeof path, "/proc/%d/environ", (int)kid);
+        o = open(path, O_PATH) >= 0 ? 0 : errno;
+        l = readlink(path, link, sizeof link) >= 0 ? 0 : errno;
+        printf(" environ path=%d readlink=%d\n", o, l);
         fflush(stdout);
         _exit(0);
     }

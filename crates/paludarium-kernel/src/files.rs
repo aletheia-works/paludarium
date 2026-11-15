@@ -5086,12 +5086,16 @@ impl LinkPath {
         }
         if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
             let task = tasks::find(c, &path)?;
-            tasks::check(c, &task, path.entry)?;
+            // Only a link is checked: `O_PATH` opens a file such as `maps`
+            // without its `open`, which is what refuses a reader.
             return match tasks::link(&task, path.entry) {
-                Some(target) => Ok(Some(Self {
-                    stat: crate::proc::self_link_stat(),
-                    target: LinkTarget::Fixed(target?),
-                })),
+                Some(target) => {
+                    tasks::check(c, &task, path.entry)?;
+                    Ok(Some(Self {
+                        stat: crate::proc::self_link_stat(),
+                        target: LinkTarget::Fixed(target?),
+                    }))
+                }
                 None => Ok(None),
             };
         }
@@ -6134,6 +6138,9 @@ fn open_path(
             && tasks::mounts(&task).is_none()
         {
             return Err(Errno::EINVAL);
+        }
+        if let crate::proc::TaskEntry::Maps(smaps) = path.entry {
+            return Ok((tasks::maps(&task, smaps, flags, c.files.root()), p.to_vec()));
         }
         if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
             Arc::new(crate::proc::GeneratedFile::open(content, flags))

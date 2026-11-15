@@ -8606,6 +8606,107 @@ static int mounts_case(const char *self) {
     return 0;
 }
 
+/* The proc-other-maps case: another process's maps and smaps, which Linux's
+   proc_maps_open makes from its address space for a reader that
+   ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
+#define POM_SIZE (1 << 20)
+/* `path` into `buffer`: its length, or -errno. */
+static long pomaps_read(const char *path, char *buffer) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    long total = 0, n;
+    while (total < POM_SIZE - 1 && (n = read(fd, buffer + total, POM_SIZE - 1 - (size_t)total)) > 0) total += n;
+    close(fd);
+    buffer[total] = 0;
+    return n < 0 ? -errno : total;
+}
+static int proc_other_maps_case(void) {
+    /* What the child reads of itself, shared with this process, its
+       pages touched before either reads. */
+    char *seen = mmap(NULL, 2 * POM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    static char theirs[POM_SIZE];
+    if (seen == MAP_FAILED) return 80;
+    memset(seen, 1, 2 * POM_SIZE);
+    memset(theirs, 1, sizeof theirs);
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 81;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 82;
+    if (!kid) {
+        /* Mappings of its own: anonymous ones, one named by a file. */
+        void *anonymous = mmap(NULL, 3 * 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int fd = open("/proc/self/exe", O_RDONLY);
+        void *file = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+        char *touched = mmap(NULL, 8 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        for (int i = 0; i < 5; i++) touched[i * 4096] = 1;
+        /* A fork leaves a shared mapping's pages to fault in again. */
+        memset(seen, 2, 2 * POM_SIZE);
+        char byte = anonymous != MAP_FAILED && file != MAP_FAILED && touched != MAP_FAILED ? 'r' : 'm';
+        if (pomaps_read("/proc/self/maps", seen) < 0 || pomaps_read("/proc/self/smaps", seen + POM_SIZE) < 0) byte = 'o';
+        if (write(ready[1], &byte, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 83;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
+    long n = pomaps_read(path, theirs);
+    printf("child=%c maps same=%d", byte, n > 0 && !strcmp(theirs, seen));
+    snprintf(path, sizeof path, "/proc/%d/task/%d/maps", (int)kid, (int)kid);
+    n = pomaps_read(path, theirs);
+    printf(" task=%d", n > 0 && !strcmp(theirs, seen));
+    snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
+    n = pomaps_read(path, theirs);
+    printf(" smaps same=%d", n > 0 && !strcmp(theirs, seen + POM_SIZE));
+    /* This process's own are not the child's. */
+    n = pomaps_read("/proc/self/maps", theirs);
+    printf(" own differs=%d\n", n > 0 && strcmp(theirs, seen));
+    struct stat st;
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
+    int r = stat(path, &st);
+    printf("maps stat=%d mode=%o size=%lld", r ? errno : 0, st.st_mode & 07777, (long long)st.st_size);
+    snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
+    r = stat(path, &st);
+    printf(" smaps stat=%d mode=%o size=%lld\n", r ? errno : 0, st.st_mode & 07777, (long long)st.st_size);
+    snprintf(path, sizeof path, "/proc/%d", (int)kid);
+    DIR *dir = opendir(path);
+    int listed = 0;
+    for (struct dirent *e; dir && (e = readdir(dir));)
+        listed += !strcmp(e->d_name, "maps") || !strcmp(e->d_name, "smaps");
+    if (dir) closedir(dir);
+    printf("listed=%d\n", listed);
+    /* A reader that may not read it: EACCES at open, but O_PATH and stat
+       reach the file. */
+    fflush(stdout);
+    pid_t other = fork();
+    if (other == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
+        long m = pomaps_read(path, theirs);
+        int o = open(path, O_PATH);
+        printf("other user maps=%ld path=%d stat=%d", m, o >= 0 ? 0 : errno, stat(path, &st) ? errno : 0);
+        snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
+        printf(" smaps=%ld\n", pomaps_read(path, theirs));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(other));
+    /* Ended and not reaped: empty; reaped: not there. */
+    if (write(done[1], "d", 1) != 1) return 84;
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
+    printf("zombie maps=%ld", pomaps_read(path, theirs));
+    snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
+    printf(" smaps=%ld", pomaps_read(path, theirs));
+    printf(" status=%d", reaped(kid));
+    printf(" reaped=%ld\n", pomaps_read(path, theirs));
+    munmap(seen, 2 * POM_SIZE);
+    return 0;
+}
+
 /* The proc-other-mounts case: another process's mountinfo and mounts, as
    Linux's mounts_open_common makes them from that task's mount namespace
    and root, which anyone may read. */
@@ -25004,6 +25105,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mounts")) return mounts_case(self);
     if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
+    if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

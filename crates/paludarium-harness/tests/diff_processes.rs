@@ -141,7 +141,9 @@ mod linux {
             // real-time and deadline policies, the admin case, which makes a
             // user namespace with its capabilities (Ubuntu's AppArmor gives none
             // to one an unprivileged user makes) before it becomes one,
-            // and the personality-layout case, which maps page 0.
+            // the personality-layout case, which maps page 0, and the
+            // proc-other-maps case, which reads a process's maps as another
+            // user.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -157,6 +159,7 @@ mod linux {
                     | "file-capabilities"
                     | "script-exec"
                     | "proc-maps"
+                    | "proc-other-maps"
                     | "dynamic-exec"
                     | "pty-vhangup"
                     | "pid-namespace"
@@ -642,6 +645,7 @@ mod linux {
         processes_chroot => ("chroot","process"),
         processes_mounts => ("mounts","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
+        processes_proc_other_maps => ("proc-other-maps","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),

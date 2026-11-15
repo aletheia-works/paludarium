@@ -1739,10 +1739,10 @@ kernel.
     device, and through `lo` to a local group (224.0.0.0/24) or the
     broadcast address, it is made with no table looked in (of TOS 0 and no
     table, and `EHOSTUNREACH` with `RTM_F_FIB_MATCH`), from an address of
-    link scope where no source is named. An IPv6 answer gives the request's source as
-    `RTA_SRC`, and an output device but `lo` finds no route
-    (`ENETUNREACH`) without a source, or to a loopback, link-local or
-    multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
+    link scope where no source is named. An IPv6 answer gives the
+    request's source as `RTA_SRC`, and an output device but `lo` finds no
+    route (`ENETUNREACH`) without a source, or to a loopback, link-local
+    or multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
     and the family's ICMP, and `RTA_IIF` is `ENODEV` for a device there is
     not. The mark, the user ID, the protocol and the ports choose among
     policy rules and multipath routes, which there are none of, so they

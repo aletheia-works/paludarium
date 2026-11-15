@@ -8809,6 +8809,406 @@ static int binds_case(void) {
     return 0;
 }
 
+/* The remounts case: MS_REMOUNT, read-only mounts and propagation types in
+   a mount namespace of a user namespace of its own, where the caller is
+   root. Each call is printed in turn as `name=errno`. Peer group numbers
+   are printed as letters in the order they are first seen; nothing of the
+   machine's own mount table is printed. */
+static char rm_base[] = "/tmp/paludarium-remounts-XXXXXX";
+static void rm_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", rm_base, name); }
+#define RM(name, call) printf(" %s=%d", name, mt_result(call))
+static long rm_groups[32];
+static char rm_letter(long id) {
+    for (int i = 0; i < 32; i++) {
+        if (rm_groups[i] == id) return (char)('A' + i);
+        if (!rm_groups[i]) {
+            rm_groups[i] = id;
+            return (char)('A' + i);
+        }
+    }
+    return '?';
+}
+/* The mountinfo line of the mount at `point` (the last one there): the
+   mount's ro or rw and options, its optional fields with peer groups as
+   letters, the superblock's ro or rw, and whether its options have
+   `want`. */
+static void rm_info(const char *label, const char *point, const char *want) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    char line[4096], shown[512] = "none";
+    while (f && fgets(line, sizeof line, f)) {
+        char at[1024], opts[512];
+        int used = 0;
+        if (sscanf(line, "%*d %*d %*s %*s %1023s %511s %n", at, opts, &used) != 2 || strcmp(at, point)) continue;
+        char tags[256] = "", *p = line + used;
+        while (*p && strncmp(p, "- ", 2)) {
+            char tag[64];
+            int n = 0;
+            if (sscanf(p, "%63s %n", tag, &n) != 1) break;
+            long id;
+            char kind[16];
+            if (sscanf(tag, "%15[^:]:%ld", kind, &id) == 2)
+                snprintf(tags + strlen(tags), sizeof tags - strlen(tags), " %s:%c", kind, rm_letter(id));
+            else
+                snprintf(tags + strlen(tags), sizeof tags - strlen(tags), " %s", tag);
+            p += n;
+        }
+        char sb[512] = "";
+        if (*p) sscanf(p, "- %*s %*s %511s", sb);
+        snprintf(shown, sizeof shown, "%s [%s] sb=%.2s%s", opts, tags[0] ? tags + 1 : "", sb,
+                 want && strstr(sb, want) ? " want" : "");
+    }
+    if (f) fclose(f);
+    printf("%s %s\n", label, shown);
+}
+/* The fourth field of the /proc/self/mounts line of `point`: ro or rw. */
+static void rm_mounts(const char *point) {
+    FILE *f = fopen("/proc/self/mounts", "r");
+    char line[4096], state[3] = "--";
+    while (f && fgets(line, sizeof line, f)) {
+        char at[1024], opts[512];
+        if (sscanf(line, "%*s %1023s %*s %511s", at, opts) == 2 && !strcmp(at, point)) memcpy(state, opts, 2);
+    }
+    if (f) fclose(f);
+    printf("mounts %s\n", state);
+}
+static long rm_statfs(const char *path) {
+    struct statfs fs;
+    return statfs(path, &fs) ? -errno : (long)fs.f_flags;
+}
+static int rm_open(const char *path, int flags) {
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return -1;
+    close(fd);
+    return 0;
+}
+static void rm_name(char *out, const char *m, const char *name) { snprintf(out, 300, "%s/%s", m, name); }
+/* Each call that writes, on a read-only mount at `m`, where `m/f` is a
+   file with data and `m/d` a directory. */
+static void rm_writes(const char *m) {
+    char f[300], d[300], g[300], nw[300], miss[300], deep[300], under[300], dot[300], dotdot[300], out[256];
+    rm_name(f, m, "f");
+    rm_name(d, m, "d");
+    rm_name(g, m, "g");
+    rm_name(nw, m, "new");
+    rm_name(miss, m, "missing");
+    rm_name(deep, m, "missing/x");
+    rm_name(under, m, "f/x");
+    rm_name(dot, m, "d/.");
+    rm_name(dotdot, m, "d/..");
+    rm_path(out, "out");
+    printf("open");
+    RM("wronly", rm_open(f, O_WRONLY));
+    RM("rdonly", rm_open(f, O_RDONLY));
+    RM("creat", rm_open(nw, O_WRONLY | O_CREAT));
+    RM("excl", rm_open(f, O_WRONLY | O_CREAT | O_EXCL));
+    RM("creat-there", rm_open(f, O_RDONLY | O_CREAT));
+    RM("trunc", rm_open(f, O_RDONLY | O_TRUNC));
+    RM("dir", rm_open(d, O_WRONLY));
+    RM("deep", rm_open(deep, O_WRONLY | O_CREAT));
+    RM("tmpfile", rm_open(d, O_TMPFILE | O_WRONLY));
+    printf("\nmkdir");
+    RM("there", mkdir(d, 0755));
+    RM("new", mkdir(nw, 0755));
+    RM("deep", mkdir(deep, 0755));
+    RM("under-file", mkdir(under, 0755));
+    printf("\nremove");
+    RM("unlink", unlink(f));
+    RM("missing", unlink(miss));
+    RM("unlink-dot", unlink(dot));
+    RM("rmdir", rmdir(d));
+    RM("dot", rmdir(dot));
+    RM("dotdot", rmdir(dotdot));
+    printf("\nrename");
+    RM("rename", rename(f, g));
+    RM("missing", rename(miss, g));
+    RM("across", rename(f, out));
+    printf("\nmake");
+    RM("link", link(f, g));
+    RM("there", link(f, d));
+    RM("symlink", symlink("x", g));
+    RM("fifo", mknod(g, S_IFIFO | 0644, 0));
+    RM("chr", mknod(g, S_IFCHR | 0644, makedev(1, 3)));
+    printf("\ntruncate");
+    RM("file", truncate(f, 0));
+    RM("dir", truncate(d, 0));
+    RM("missing", truncate(miss, 0));
+    struct timespec omit[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
+    printf("\nattributes");
+    RM("chmod", chmod(f, 0600));
+    RM("missing", chmod(miss, 0600));
+    RM("chown", chown(f, -1, -1));
+    RM("utimens", utimensat(AT_FDCWD, f, NULL, 0));
+    RM("omit", utimensat(AT_FDCWD, f, omit, 0));
+    RM("setxattr", syscall(SYS_setxattr, f, "user.x", "1", 1, 0));
+    RM("removexattr", syscall(SYS_removexattr, f, "user.x"));
+    RM("access-write", access(f, W_OK));
+    RM("access-read", access(f, R_OK));
+    int fd = open(f, O_RDONLY);
+    printf("\ndescriptor");
+    RM("fchmod", fchmod(fd, 0600));
+    RM("fchown", fchown(fd, -1, -1));
+    RM("futimens", futimens(fd, NULL));
+    RM("fsetxattr", syscall(SYS_fsetxattr, fd, "user.x", "1", 1, 0));
+    close(fd);
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s/sock", m);
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    RM("bind", bind(sock, (struct sockaddr *)&addr, sizeof addr));
+    close(sock);
+    char buf[16] = "";
+    printf(" read=%d %s\n", bd_read(f, buf, sizeof buf), buf);
+}
+/* In a user namespace below this one: the copy of `m`, read-only and
+   nosuid, keeps those flags and its access-time ones. */
+static int rm_locked(void) {
+    char m[256];
+    rm_path(m, "m");
+    if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) return 80;
+    printf("locked");
+    RM("rw", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_NOSUID, NULL));
+    RM("suid", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL));
+    RM("atime", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_STRICTATIME, NULL));
+    RM("same", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID, NULL));
+    RM("sb", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY | MS_NOSUID, NULL));
+    printf("\n");
+    return 0;
+}
+/* Chrooted into a tmpfs mount, `umount2("/")` remounts its superblock
+   read-only (`do_umount_root`). */
+static int rm_root(void) {
+    char r[256];
+    rm_path(r, "r");
+    if (chroot(r) || chdir("/")) return 81;
+    printf("root");
+    RM("umount", umount2("/", 0));
+    RM("mkdir", mkdir("/x", 0755));
+    printf("\n");
+    return 0;
+}
+static int rm_inner(void) {
+    char m[256], b[256], c[256], f[256], d[256], bf[256], bn[256], p1[256], p2[256], p3[256], q[256], qr[256],
+        qs[256], e[256], r[256], cd[256];
+    rm_path(m, "m");
+    rm_path(b, "b");
+    rm_path(c, "c");
+    rm_path(f, "m/f");
+    rm_path(d, "m/d");
+    rm_path(bf, "b/f");
+    rm_path(bn, "b/n");
+    rm_path(p1, "p1");
+    rm_path(p2, "p2");
+    rm_path(p3, "p3");
+    rm_path(q, "q");
+    rm_path(qr, "q/r");
+    rm_path(qs, "q/s");
+    rm_path(e, "e");
+    rm_path(r, "r");
+    rm_path(cd, "c/d");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    printf("tmpfs");
+    RM("mount", mount("none", m, "tmpfs", MS_NOSUID | MS_NOATIME, "size=1m"));
+    printf("\n");
+    mt_write_new(f, "data");
+    mkdir(d, 0755);
+    /* A mount's flags alone: read-only, keeping noatime, dropping nosuid. */
+    printf("bind");
+    RM("ro", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL));
+    printf("\n");
+    rm_info("ro", m, NULL);
+    rm_mounts(m);
+    printf("statfs=%#lx\n", rm_statfs(m));
+    rm_writes(m);
+    printf("remount");
+    RM("not-root", mount(NULL, d, NULL, MS_REMOUNT | MS_BIND, NULL));
+    RM("rw", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_NOATIME, NULL));
+    RM("write", rm_open(f, O_WRONLY));
+    printf("\n");
+    rm_info("rw", m, NULL);
+    /* A file open for writing keeps it writable. */
+    int fd = open(f, O_WRONLY);
+    printf("writer");
+    RM("ro", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL));
+    RM("sb", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, NULL));
+    close(fd);
+    RM("closed", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID, NULL));
+    printf("\n");
+    rm_info("ro-nosuid", m, NULL);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) _exit(rm_locked());
+    printf("locked=%d\n", reaped(child));
+    /* The superblock: a bind mount of it is read-only too. */
+    printf("superblock");
+    RM("unlocked", mount(NULL, m, NULL, MS_REMOUNT | MS_BIND, NULL));
+    RM("bind", mount(m, b, NULL, MS_BIND, NULL));
+    RM("ro", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, "size=2m"));
+    printf("\n");
+    rm_info("sb m", m, ",size=2048k");
+    rm_info("sb b", b, ",size=2048k");
+    printf("via b");
+    RM("write", rm_open(bf, O_WRONLY));
+    RM("mkdir", mkdir(bn, 0755));
+    RM("rw", mount(NULL, b, NULL, MS_REMOUNT | MS_BIND, NULL));
+    RM("write", rm_open(bf, O_WRONLY));
+    printf("\nstatfs b=%#lx\n", rm_statfs(b));
+    /* Options: those a remount may not change, and tmpfs's own. */
+    printf("options");
+    RM("dirsync", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, "dirsync"));
+    RM("bogus", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, "bogus"));
+    RM("noswap", mount(NULL, m, NULL, MS_REMOUNT | MS_RDONLY, "noswap"));
+    RM("ignored", mount(NULL, m, NULL, MS_DIRSYNC | MS_REMOUNT | MS_RDONLY, NULL));
+    printf("\n");
+    rm_info("still", m, ",dirsync");
+    printf("options");
+    RM("mode", mount(NULL, m, NULL, MS_REMOUNT, "mode=700"));
+    RM("nr_inodes", mount(NULL, m, NULL, MS_REMOUNT, "nr_inodes=1000"));
+    printf("\n");
+    rm_info("sb rw", m, ",nr_inodes=1000");
+    struct stat st;
+    printf("mode=%o", stat(m, &st) ? 0 : st.st_mode & 07777);
+    RM("write", rm_open(f, O_WRONLY));
+    fd = open(f, O_WRONLY);
+    RM("writer-sb", mount(NULL, b, NULL, MS_REMOUNT | MS_RDONLY, NULL));
+    close(fd);
+    RM("umount-b", umount2(b, 0));
+    RM("umount-m", umount2(m, 0));
+    printf("\n");
+    /* A read-only tmpfs: MS_RDONLY makes the mount so too, `ro` only the
+       superblock. */
+    printf("new");
+    RM("ro", mount("none", c, "tmpfs", MS_RDONLY, NULL));
+    RM("mkdir", mkdir(cd, 0755));
+    printf("\n");
+    rm_info("new ro", c, NULL);
+    printf("new");
+    RM("umount", umount2(c, 0));
+    RM("option-ro", mount("none", c, "tmpfs", 0, "ro"));
+    RM("mkdir", mkdir(cd, 0755));
+    printf("\n");
+    rm_info("option ro", c, NULL);
+    rm_mounts(c);
+    printf("new");
+    RM("umount", umount2(c, 0));
+    printf("\n");
+    /* Propagation types. */
+    printf("propagation");
+    RM("p1", mount("none", p1, "tmpfs", 0, NULL));
+    RM("shared", mount(NULL, p1, NULL, MS_SHARED, NULL));
+    RM("bind", mount(p1, p2, NULL, MS_BIND, NULL));
+    printf("\n");
+    rm_info("p1", p1, NULL);
+    rm_info("p2", p2, NULL);
+    printf("propagation");
+    RM("slave", mount(NULL, p2, NULL, MS_SLAVE, NULL));
+    printf("\n");
+    rm_info("p1", p1, NULL);
+    rm_info("p2", p2, NULL);
+    printf("propagation");
+    RM("shared", mount(NULL, p2, NULL, MS_SHARED, NULL));
+    printf("\n");
+    rm_info("p2", p2, NULL);
+    printf("propagation");
+    RM("private", mount(NULL, p1, NULL, MS_PRIVATE, NULL));
+    printf("\n");
+    rm_info("p1", p1, NULL);
+    rm_info("p2", p2, NULL);
+    printf("propagation");
+    RM("unbindable", mount(NULL, p2, NULL, MS_UNBINDABLE, NULL));
+    RM("bind", mount(p2, p3, NULL, MS_BIND, NULL));
+    RM("slave-of-private", mount(NULL, p1, NULL, MS_SLAVE, NULL));
+    printf("\n");
+    rm_info("p2", p2, NULL);
+    rm_info("p1", p1, NULL);
+    printf("errors");
+    RM("two", mount(NULL, p1, NULL, MS_SHARED | MS_PRIVATE, NULL));
+    RM("not-root", mount(NULL, rm_base, NULL, MS_SHARED, NULL));
+    RM("other-flag", mount(NULL, p1, NULL, MS_SHARED | MS_NOSUID, NULL));
+    printf("\n");
+    /* MS_REC, and a mount made on a shared one; peer groups are lettered
+       again from here, as a freed number may be taken again. */
+    memset(rm_groups, 0, sizeof rm_groups);
+    mount("none", q, "tmpfs", 0, NULL);
+    mkdir(qr, 0755);
+    mkdir(qs, 0755);
+    mount("none", qr, "tmpfs", 0, NULL);
+    printf("rec");
+    RM("shared", mount(NULL, q, NULL, MS_REC | MS_SHARED, NULL));
+    RM("under", mount("none", qs, "tmpfs", 0, NULL));
+    printf("\n");
+    rm_info("q", q, NULL);
+    rm_info("q/r", qr, NULL);
+    rm_info("q/s", qs, NULL);
+    printf("rec");
+    RM("private", mount(NULL, q, NULL, MS_REC | MS_PRIVATE, NULL));
+    printf("\n");
+    rm_info("q/s", qs, NULL);
+    /* A slave whose master's last peer goes is private. */
+    memset(rm_groups, 0, sizeof rm_groups);
+    printf("master");
+    RM("shared", mount(NULL, p1, NULL, MS_SHARED, NULL));
+    RM("bind", mount(p1, p3, NULL, MS_BIND, NULL));
+    RM("slave", mount(NULL, p3, NULL, MS_SLAVE, NULL));
+    printf("\n");
+    rm_info("p3", p3, NULL);
+    printf("master");
+    RM("umount", umount2(p1, 0));
+    printf("\n");
+    rm_info("p3", p3, NULL);
+    /* A use of a mount clears MNT_EXPIRE's mark. */
+    mount("none", e, "tmpfs", 0, NULL);
+    printf("expire");
+    RM("first", umount2(e, MNT_EXPIRE));
+    RM("used", stat(e, &st));
+    RM("again", umount2(e, MNT_EXPIRE));
+    RM("then", umount2(e, MNT_EXPIRE));
+    printf("\n");
+    /* umount2 of a chrooted caller's root. */
+    mount("none", r, "tmpfs", 0, NULL);
+    fflush(stdout);
+    child = fork();
+    if (child == 0) _exit(rm_root());
+    printf("rooted=%d\n", reaped(child));
+    rm_info("r", r, NULL);
+    return 0;
+}
+static int remounts_case(void) {
+    if (!mkdtemp(rm_base)) return 93;
+    chmod(rm_base, 0755);
+    const char *dirs[] = {"m", "b", "c", "p1", "p2", "p3", "q", "e", "r"};
+    char path[256];
+    for (unsigned i = 0; i < 9; i++) {
+        rm_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(rm_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    rm_path(path, "out");
+    unlink(path);
+    for (unsigned i = 0; i < 9; i++) {
+        rm_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(rm_base) == 0);
+    return 0;
+}
+
 /* The proc-other-mounts case: another process's mountinfo and mounts, as
    Linux's mounts_open_common makes them from that task's mount namespace
    and root, which anyone may read. */
@@ -25220,6 +25620,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mounts")) return mounts_case(self);
     if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
     if (!strcmp(mode, "binds")) return binds_case();
+    if (!strcmp(mode, "remounts")) return remounts_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {

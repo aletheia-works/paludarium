@@ -38,8 +38,10 @@ pub(super) enum Target {
         follow: bool,
         stat: FileStat,
     },
+    /// A descriptor's file, opened at `path`.
     File {
         file: Arc<dyn FileHandle>,
+        path: Vec<u8>,
         stat: FileStat,
     },
     /// A file the kernel makes up, as under `/proc`: it holds none.
@@ -58,7 +60,11 @@ impl Target {
             Some(Followed::Path { path, follow }) => return Self::found(c, path, follow, None),
             Some(Followed::File(d)) => {
                 let stat = d.file.stat()?;
-                return Ok(Self::File { file: d.file, stat });
+                return Ok(Self::File {
+                    file: d.file,
+                    path: d.path,
+                    stat,
+                });
             }
             None => {}
         }
@@ -120,12 +126,26 @@ impl Target {
         Ok(Self::Path { path, follow, stat })
     }
     fn at_descriptor(c: &Context<'_>, fd: u64) -> Result<Self, Errno> {
-        let file = c.files.descriptor(fd)?.file;
-        if file.flags() & O_PATH != 0 {
+        let d = c.files.descriptor(fd)?;
+        if d.file.flags() & O_PATH != 0 {
             return Err(Errno::EBADF);
         }
-        let stat = file.stat()?;
-        Ok(Self::File { file, stat })
+        let stat = d.file.stat()?;
+        Ok(Self::File {
+            file: d.file,
+            path: d.path,
+            stat,
+        })
+    }
+    /// `mnt_want_write` of its mount: `EROFS` on a read-only one.
+    pub(super) fn want_write(&self, c: &Context<'_>) -> Result<(), Errno> {
+        match self {
+            Self::Path { path, follow, .. } => {
+                crate::permissions::want_write(c.files, path, *follow)
+            }
+            Self::File { path, .. } => crate::permissions::want_write(c.files, path, false),
+            Self::Generated { .. } => Ok(()),
+        }
     }
     pub(super) fn stat(&self) -> &FileStat {
         match self {
@@ -402,6 +422,7 @@ fn set(
         .read(GuestAddr(addr), &mut value)
         .map_err(|_| Errno::EFAULT)?;
     let target = target(c)?;
+    target.want_write(c)?;
     let creds = &c.process.credentials;
     // `vfs_setxattr` converts file capabilities before it checks anything
     // else of the change.
@@ -434,6 +455,7 @@ fn remove(
 ) -> Result<u64, Errno> {
     let name = name(c, ptr)?;
     let target = target(c)?;
+    target.want_write(c)?;
     permitted(&c.process.credentials, target.stat(), &name, true)?;
     security_permitted(&c.process.credentials, target.stat(), &name, true)?;
     namespace(&name)?;

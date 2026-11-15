@@ -1289,9 +1289,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ます。パスは通るディレクトリごとにいちばん上のマウントに入り、マウントのルートでの
   `..` はマウントした場所に出ます。マウントをまたぐ `rename` と `link` は `EXDEV`、
   マウントポイントの `rmdir`、`unlink`、`rename` は `EBUSY` で、名前の変更は動かす
-  ディレクトリの下のマウントも動かします。マウントのルートへの `MS_PRIVATE` と
-  `MS_SLAVE`（`MS_REC` 付きでもなしでも）は、`do_change_type` の確認（`EINVAL`）の
-  あと成功します。どのマウントもはじめからプライベートだからです。
+  ディレクトリの下のマウントも動かします。`MS_RDONLY` は新しいマウントとその
+  スーパーブロックを読み出し専用にし、`ro` オプションはスーパーブロックだけをそうします。
+  mountinfo の 2 つの `ro` の欄がそれを示します。共有マウントの上のマウントも、自分の
+  ピアグループで共有になります。
 - `MS_BIND` 付きの `mount` は、`CAP_SYS_ADMIN` までの同じ確認のあと、Linux の
   `do_loopback` と同じくバインドマウントを作ります。ソースが要り（ないものや空のものは
   `EINVAL`）、リンクをたどって探し（`ENOENT`、`ENOTDIR`、`ELOOP`、`EACCES`）、ターゲットの
@@ -1306,7 +1307,58 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   tmpfs は、最初のマウントを外したあとも、そのバインドマウントがある間は残ります。
   バインドマウントは、ソースの名前を変えたあともそれを見せ続けます。`statx` と
   `/proc/self/fdinfo` はファイルのマウント ID をパスから求めるので、バインドマウントの
-  ファイルはバインドマウントの ID を持ちます。
+  ファイルはバインドマウントの ID を持ちます。ソースのマウントがバインドできない
+  （unbindable）ものなら `EINVAL` で、`MS_REC` はその下のバインドできないマウントと
+  その上のものを除きます（ロックされたものは `EPERM`）。新しいマウントはソースの
+  マウントのピアで、そのマスターのスレーブです。共有マウントの上では共有になり、ソースの
+  マウントがどのピアグループにもなければ新しいグループに入ります。
+- `MS_REMOUNT` と `MS_BIND` 付きの `mount` は、Linux の `do_reconfigure_mnt` と同じく
+  マウントのフラグだけを変えます。ターゲットは呼び出し元の名前空間のマウントのルートで
+  （`EINVAL`）、より権限の少ない名前空間への写しでロックされたフラグはそのままで
+  （`EPERM`。`MNT_LOCK_READONLY`、`MNT_LOCK_NODEV`、`MNT_LOCK_NOSUID`、
+  `MNT_LOCK_NOEXEC`、`MNT_LOCK_ATIME`）、読み出し専用にするにはその上で書き込みのために
+  開いたファイルがないことが要ります（`EBUSY`）。フラグは呼び出しのもので、atime の
+  フラグはどれかを指定しなければそのままです。`MS_REMOUNT` だけのもの（`do_remount`）は
+  同じ確認のあと、マウントのファイルシステムのオプションを解釈し（`EINVAL`）、
+  スーパーブロックのユーザー名前空間に対する `CAP_SYS_ADMIN` が要り（`EPERM`）、
+  `reconfigure_super` と同じくスーパーブロックを設定し直します。マウントし直しで変えない
+  フラグのオプション（`dirsync`）は `EINVAL` で（フラグの `MS_DIRSYNC` は無視します）、
+  読み出し専用にするにはそのどのマウントにも書き込みのために開いたファイルがないことが
+  要り（`EBUSY`）、tmpfs のオプションは `shmem_reconfigure` と同じく確かめて変えます
+  （上限なしでマウントしたものへの上限、ファイルが使っている量より小さい上限、スワップ
+  するものへの `noswap`、クォータのないものへのクォータ、クォータの上限の変更は
+  `EINVAL`。`size`、`nr_blocks`、`nr_inodes`、`huge`、`inode32`、`inode64`、`mpol` は
+  変わり、`mode`、`uid`、`gid` は変わりません）。そのあとマウントは呼び出しのフラグを
+  持ちます。
+- 読み出し専用のマウントや、読み出し専用のスーパーブロックのマウントは、Linux の
+  `mnt_want_write` と同じところで、その前に来るエラーのあとに、書き込むものを `EROFS` で
+  断ります。名前を作るもの（`O_CREAT` と `O_TMPFILE` 付きの `open`、`mkdir`、`mknod`、
+  `symlink`、`link`、`AF_UNIX` ソケットの `bind`）は名前がないとわかったあと（`EEXIST` が
+  先）、ディレクトリに書く許可の前（と `link` の `EXDEV`、デバイスの `mknod` の `EPERM`
+  の前）です。`unlink`、`rmdir`、`rename` はディレクトリが見つかったあと、名前を探す前
+  です（なので、ない名前も `EROFS` です）。通常のファイルの `O_TRUNC` 付きの `open` と、
+  書き込みのために開くこと（許可と `ETXTBSY` のあと。FIFO、ソケット、デバイスは
+  開けます）、`EISDIR` と `EINVAL` のあとの `truncate`、許可の確認の前の `chmod`、
+  `chown`、`utimensat`、`utimes` とそのディスクリプタの形、`setxattr`、`removexattr` と
+  そのディスクリプタの形、`file_setattr`、`FS_IOC_SETFLAGS`、許可の確認のあとの `W_OK`
+  付きの `access` もそうです。読み出し専用のスーパーブロックは、通常のファイル、
+  ディレクトリ、シンボリックリンクに書くことも許可を確かめる前に断ります
+  （`sb_permission`）。`statfs` の `f_flags` は、`flags_by_mnt` と同じくマウントの
+  フラグ（`ST_RDONLY`、`ST_NOSUID`、`ST_NODEV`、`ST_NOEXEC`、`ST_NOATIME`、
+  `ST_NODIRATIME`、`ST_RELATIME`）を返します。
+- `MS_SHARED`、`MS_PRIVATE`、`MS_SLAVE`、`MS_UNBINDABLE` 付きの `mount`（`MS_REC` が
+  あればターゲットの上のマウントも）は、`do_change_type` の確認のあと、マウントの伝播の
+  種類を変えます。マウントのルートであること（`EINVAL`）、種類が 1 つでほかのフラグが
+  ないこと（`EINVAL`）、マウントの名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）が要ります。
+  共有マウントはピアグループに入り（どれにもなければ空いているいちばん小さい番号の新しい
+  もの）、バインドできないものではなくなります。ほかの種類にするとグループから出ます。
+  そのスレーブはピアに、ピアが残っていなければそのマウントのマスターにつきます。
+  `MS_SLAVE` は、ピアがあれば元のグループの、なければマスターのスレーブにし、
+  `MS_PRIVATE` と `MS_UNBINDABLE` はマスターをなくします。`/proc/self/mountinfo` は
+  Linux の `show_mountinfo` と同じく、それを `shared:N`、`master:N`、`propagate_from:N`、
+  `unbindable` で示します。新しいマウント名前空間への写しは写したマウントのピアで、
+  ユーザー名前空間がほかのものならそのスレーブです。外したマウントや、名前空間が
+  終わったマウントも、同じようにピアグループから出ます。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどります。そのあと Linux の `can_umount` と `do_umount`
   と同じく、マウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）、その名前空間のマウントの
@@ -1317,6 +1369,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   です。ただし `MNT_DETACH` は、それと上のマウントをすぐに外し、開いたファイルは読み書き
   できるままです。`MNT_EXPIRE`（`MNT_FORCE` や `MNT_DETACH` 付き、呼び出し元のルートでは
   `EINVAL`）は、だれも使っていないマウントに印を付け（`EAGAIN`）、次の呼び出しで外します。
+  Linux の `mntput` と同じく、マウントで終わる探索やその上のファイルを閉じることで印は
+  消えます。`MNT_DETACH` なしの呼び出し元のルートには、そのスーパーブロックのユーザー
+  名前空間に対する `CAP_SYS_ADMIN` が要り（`EPERM`）、マウントされたまま、
+  スーパーブロックを読み出し専用にマウントし直します（`do_umount_root`。その上で書き込みの
+  ために開いたファイルがあれば `EBUSY`）。
 - `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
   `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
@@ -2017,7 +2074,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
   `/proc/mounts` は呼び出し元のマウント名前空間のマウントの一覧です（ルートは `tmpfs`、
   `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs とバインドの
-  マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
+  マウントは、ソースと、`mountinfo` ではルートとして見せるディレクトリ、マウントと
+  スーパーブロックが読み出し専用かどうか、伝播の種類とともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。
   `/proc/<pid>/mountinfo` と `mounts`（`/proc/thread-self` と `/proc/<pid>/task/<tid>` のものも）は、
   Linux の `mounts_open_common` と同じくそのタスクのもので、そのマウント名前空間のマウントを

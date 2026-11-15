@@ -1470,9 +1470,9 @@ kernel.
   mount's root goes to where it is mounted; `rename` and `link` from one
   mount to another are `EXDEV`, `rmdir`, `unlink` and `rename` of a mount
   point `EBUSY`, and a rename moves the mounts below the directory it
-  moves. `MS_PRIVATE` and `MS_SLAVE` (with `MS_REC` or not) of a mount's
-  root succeed, as every mount is private already, after
-  `do_change_type`'s checks (`EINVAL`).
+  moves. `MS_RDONLY` makes the new mount and its superblock read-only, and
+  the `ro` option the superblock alone, as mountinfo's two `ro` fields show.
+  A mount on a shared mount is shared too, in a peer group of its own.
 - `mount` with `MS_BIND` makes a bind mount, after the same checks up to
   `CAP_SYS_ADMIN`, as Linux's `do_loopback`: a source (`EINVAL` for none or
   an empty one), looked up with its links followed (`ENOENT`, `ENOTDIR`,
@@ -1489,7 +1489,64 @@ kernel.
   of it does, after its first mount goes, and a bind mount keeps showing its
   source after a rename of it. `statx` and `/proc/self/fdinfo` give a
   file's mount ID by its path, so a bind mount's files have the bind
-  mount's.
+  mount's. An unbindable source mount is `EINVAL`, and `MS_REC` leaves out
+  the unbindable mounts below it and what is on them (`EPERM` for a locked
+  one). The new mount is a peer of the source's mount and a slave of its
+  master; on a shared mount it is shared, in a new peer group if the
+  source's mount was in none.
+- `mount` with `MS_REMOUNT` and `MS_BIND` changes a mount's flags alone, as
+  Linux's `do_reconfigure_mnt`: the target is the root of a mount of the
+  caller's namespace (`EINVAL`), the flags a copy into a less privileged
+  namespace locked stay (`EPERM`: `MNT_LOCK_READONLY`, `MNT_LOCK_NODEV`,
+  `MNT_LOCK_NOSUID`, `MNT_LOCK_NOEXEC` and `MNT_LOCK_ATIME`), and making it
+  read-only needs no file open for writing on it (`EBUSY`). The flags are
+  those of the call, its access-time ones kept unless it names one.
+  `MS_REMOUNT` alone (`do_remount`) makes the same checks, then parses the
+  options of the mount's file system (`EINVAL`), needs `CAP_SYS_ADMIN` over
+  the superblock's user namespace (`EPERM`), and reconfigures the
+  superblock as `reconfigure_super` does: an option for a flag a remount
+  does not change (`dirsync`) is `EINVAL` (`MS_DIRSYNC` in the flags is
+  left out), making it read-only needs no file open for writing on any of
+  its mounts (`EBUSY`), and a tmpfs's own options are checked and changed
+  as `shmem_reconfigure` does them (`EINVAL` for a limit on one mounted
+  without it or below what its files use, `noswap` on one that swaps, a
+  quota on one without, a changed quota limit; `size`, `nr_blocks`,
+  `nr_inodes`, `huge`, `inode32`, `inode64` and `mpol` change, `mode`,
+  `uid` and `gid` do not). The mount then takes the call's flags.
+- A read-only mount, or one of a read-only superblock, refuses what writes
+  with `EROFS` where Linux's `mnt_want_write` does, after the errors that
+  come before it: creating a name (`open` with `O_CREAT`, `O_TMPFILE`,
+  `mkdir`, `mknod`, `symlink`, `link`, and `bind` of an `AF_UNIX` socket)
+  once the name is found not there (`EEXIST` first) and before the
+  permission to write its directory (and `link`'s `EXDEV` and `mknod`'s
+  `EPERM` for a device); `unlink`, `rmdir` and `rename` once the directory
+  is found and before the name is looked up (so a missing one is `EROFS`
+  too); `open` with `O_TRUNC` of a regular file, and opening one for
+  writing after its permission and `ETXTBSY` (a FIFO, a socket and a
+  device still open); `truncate` after `EISDIR` and `EINVAL`; `chmod`,
+  `chown`, `utimensat` and `utimes` and their descriptor forms, `setxattr`,
+  `removexattr` and their descriptor forms, `file_setattr` and
+  `FS_IOC_SETFLAGS` before their permission checks; and `access` with
+  `W_OK` after its permission check. A read-only superblock also refuses
+  writing a regular file, a directory or a symbolic link before its
+  permission is checked (`sb_permission`). `statfs`'s `f_flags` gives the
+  mount's flags (`ST_RDONLY`, `ST_NOSUID`, `ST_NODEV`, `ST_NOEXEC`,
+  `ST_NOATIME`, `ST_NODIRATIME`, `ST_RELATIME`), as `flags_by_mnt` does.
+- `mount` with `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` or `MS_UNBINDABLE` (and
+  `MS_REC` for the mounts on the target too) changes a mount's propagation
+  type, after `do_change_type`'s checks: the root of a mount (`EINVAL`),
+  one type and no other flag (`EINVAL`), and `CAP_SYS_ADMIN` over the
+  mount's namespace (`EPERM`). A shared mount is in a peer group, a new one
+  with the lowest free number if it was in none, and is no longer
+  unbindable. Any other type takes it out of its group: its slaves then
+  follow a peer, or with none left its own master; `MS_SLAVE` makes it a
+  slave of its old group if it had peers, else of its master, and
+  `MS_PRIVATE` and `MS_UNBINDABLE` leave it no master. `/proc/self/mountinfo`
+  shows these as Linux's `show_mountinfo` does: `shared:N`, `master:N`,
+  `propagate_from:N` and `unbindable`. A copy into a new mount namespace
+  is a peer of the mount it copies, or with another user namespace a slave
+  of it. A mount that is unmounted, or whose namespace ends, leaves its
+  peer group the same way.
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`; then, as Linux's
   `can_umount` and `do_umount`, it needs `CAP_SYS_ADMIN` over the mount
@@ -1501,7 +1558,12 @@ kernel.
   `EBUSY`, unless `MNT_DETACH` takes it and those on it away at once, their
   open files still reading and writing. `MNT_EXPIRE` (`EINVAL` with
   `MNT_FORCE` or `MNT_DETACH`, or of the caller's root) marks a mount no one
-  uses (`EAGAIN`) and unmounts it the next time.
+  uses (`EAGAIN`) and unmounts it the next time; a lookup that ends on the
+  mount, or the close of a file on it, clears the mark, as Linux's `mntput`
+  does. The caller's root without `MNT_DETACH` needs `CAP_SYS_ADMIN` over
+  its superblock's user namespace (`EPERM`), and then stays mounted: its
+  superblock is remounted read-only (`do_umount_root`, `EBUSY` with a file
+  open for writing on it).
 - `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
   with `CLONE_FS` its own working directory and umask, as Linux. With
   `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
@@ -2324,7 +2386,8 @@ kernel.
   and `/proc/mounts` list the mounts of the caller's mount namespace
   (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
   and the tmpfs and bind mounts `mount` made, with their sources and, in
-  `mountinfo`, the directory each shows as its root). After `chroot` they show each mount point
+  `mountinfo`, the directory each shows as its root, whether the mount
+  and its superblock are read-only, and its propagation). After `chroot` they show each mount point
   from the process's root and leave out those not under it, as Linux's
   `seq_path_root` does. `/proc/<pid>/mountinfo` and `mounts` (and those of
   `/proc/thread-self` and `/proc/<pid>/task/<tid>`) are those of that task,

@@ -125,8 +125,17 @@ pub struct MountPoint {
     pub device: u64,
     /// What it was mounted from (`mnt_devname`).
     pub source: Vec<u8>,
-    /// The per-mount options after `rw` (`show_vfsmnt_opts`): `,relatime`.
+    /// The per-mount options after `rw` or `ro` (`show_vfsmnt_opts`):
+    /// `,relatime`.
     pub options: String,
+    /// The mount is read-only (`MNT_READONLY`), as mountinfo's sixth field
+    /// shows it, and its superblock is (`SB_RDONLY`), as the field after the
+    /// source shows it.
+    pub read_only: bool,
+    pub super_read_only: bool,
+    /// mountinfo's optional fields, each with a space before it:
+    /// ` shared:1 master:2 unbindable`.
+    pub tags: String,
     /// The superblock's common options after `rw` (`show_sb_opts`):
     /// `,sync`, `,dirsync`, `,lazytime`.
     pub common_options: String,
@@ -148,10 +157,23 @@ impl MountPoint {
             device: index as u64 + 1,
             source: kind.as_bytes().to_vec(),
             options: ",relatime".to_string(),
+            read_only: false,
+            super_read_only: false,
+            tags: String::new(),
             common_options: String::new(),
             super_options: String::new(),
         }
     }
+}
+/// Whether writing through a path's mount is refused (`EROFS`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadOnly {
+    /// The mount or its superblock is read-only (`__mnt_is_readonly`),
+    /// which `mnt_want_write` refuses.
+    pub mount: bool,
+    /// The superblock is (`sb_rdonly`), which `inode_permission` refuses
+    /// before it checks the file's mode (`sb_permission`).
+    pub superblock: bool,
 }
 /// The number of the mount holding `path` (the longest matching mount
 /// point, counting from 1), which `stat` gives as the device minor.
@@ -208,6 +230,27 @@ pub trait FileSystem: HostFs {
     /// open file, a working directory or a root holds Linux's mount: none
     /// for a mount that cannot be unmounted.
     fn mount_pin(&self, _path: &[u8]) -> Option<MountPin> {
+        None
+    }
+    /// `statfs`'s `f_flags` for `path`: `ST_VALID`, and `ST_RELATIME` as
+    /// mountinfo shows.
+    fn statfs_flags(&self, _path: &[u8]) -> u64 {
+        0x1020
+    }
+    /// Whether any mount or superblock here is read-only, before a
+    /// lookup of one is worth making.
+    fn any_read_only(&self) -> bool {
+        false
+    }
+    /// Whether the mount holding `path` (its last link followed with
+    /// `follow`) is read-only: nothing is, but for mounts made so.
+    fn read_only(&self, _path: &[u8], _follow: bool) -> ReadOnly {
+        ReadOnly::default()
+    }
+    /// What keeps the mount holding `path` written to while it lasts, as a
+    /// file open for writing holds Linux's (`mnt_get_write_access`), which
+    /// a remount read-only refuses (`EBUSY`).
+    fn mount_writer(&self, _path: &[u8], _follow: bool) -> Option<MountPin> {
         None
     }
     /// The path of the file numbered `inode` on the in-memory file system
@@ -582,7 +625,10 @@ mod mount;
 pub use mount::MountedFs;
 
 mod namespace;
-pub use namespace::{MountPin, MountTable, NamespacedFs, NewTmpfs, Target, mount_flags};
+pub use namespace::{
+    InUse, MountPin, MountTable, NamespacedFs, NewTmpfs, Propagation, Settings, Target,
+    keeping_expiry, mount_flags,
+};
 
 mod open_file;
 use open_file::MemFile;

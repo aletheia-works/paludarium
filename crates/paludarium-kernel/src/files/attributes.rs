@@ -338,6 +338,7 @@ fn file_setattr(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         ..Kattr::from_xflags(xflags as u32 & !XFLAG_RDONLY)
     };
     let target = Target::at(c, [a[0], a[1], flags], true)?;
+    target.want_write(c)?;
     set(
         (&c.process.credentials, &c.files.caches.flagged),
         target.stat(),
@@ -363,6 +364,7 @@ pub(super) fn call(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
 pub(crate) fn ioctl(
     c: &Context<'_>,
     file: &dyn FileHandle,
+    path: &[u8],
     cmd: u32,
     arg: u64,
 ) -> Option<Result<u64, Errno>> {
@@ -408,12 +410,16 @@ pub(crate) fn ioctl(
     Some((|| {
         let current = current?;
         match (cmd, change) {
-            (_, Some(fa)) => set(
-                (&c.process.credentials, &c.files.caches.flagged),
-                &file.stat()?,
-                &with,
-                fa,
-            )?,
+            (_, Some(fa)) => {
+                // `mnt_want_write_file`, before `vfs_fileattr_set`.
+                crate::permissions::want_write(c.files, path, false)?;
+                set(
+                    (&c.process.credentials, &c.files.caches.flagged),
+                    &file.stat()?,
+                    &with,
+                    fa,
+                )?;
+            }
             (FS_IOC_GETFLAGS, None) => output(c, arg, &current.to_le_bytes())?,
             _ => {
                 let mut out = [0; FSXATTR_SIZE];

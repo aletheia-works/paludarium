@@ -425,28 +425,43 @@ verified.
   every file there as root's again.
 - **mount and umount2, in part**: `mount` makes only tmpfs and bind mounts;
   any other type is `ENODEV`, as from a kernel without it. Once Linux's
-  checks before them pass, `MS_MOVE`, `MS_REMOUNT`, `MS_SHARED`,
-  `MS_UNBINDABLE`, a read-only tmpfs (`MS_RDONLY` or the `ro` option),
-  `MS_NOSYMFOLLOW` on a tmpfs, and a mount on, or a bind mount of, the
+  checks before them pass, `MS_MOVE`, `MS_NOSYMFOLLOW` on a tmpfs or set by
+  a remount, and a mount on, or a bind mount of, the
   generated `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a
   program learns they are not supported; `fsopen`,
   `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`,
   `mount_setattr`, `statmount`, `listmount` and `pivot_root` are not there
-  (`ENOSYS`). Nothing propagates: every mount is private, and mountinfo
-  shows no `shared:` or `master:` field, where Linux's copies of a shared
-  mount may be slaves. A tmpfs mount's `size`, `nr_blocks` and `nr_inodes`
+  (`ENOSYS`). Propagation types are kept and shown, but nothing
+  propagates: a mount or an unmount under a shared mount does not reach
+  its peers and slaves, as Linux's `propagate_mnt` and `propagate_umount`
+  make it, so a peer of it shows no copy. The mounts from start-up are
+  private, where Linux's root is often shared (`shared:1`, and `master:1`
+  in a mount namespace of another user namespace). Peer group numbers
+  count from 1 among this machine's mounts alone, where Linux's are
+  shared with the host's. `propagate_from:` is found from the namespace's
+  root, not the reader's after `chroot`. Only `MS_RDONLY` is enforced
+  (`EROFS`): a tmpfs mount's `size`, `nr_blocks` and `nr_inodes`
   are reported but not enforced (it fills up only as the in-memory
   filesystem does, never `ENOSPC` at its size), nor are `noexec`,
-  `nosuid`, `nodev` and the atime flags; `huge`, `mpol`, `noswap` and the
-  quota options are taken and shown and do nothing, and `casefold` and
-  `strict_encoding` are `EINVAL`, as from a kernel without `CONFIG_UNICODE`.
+  `nosuid`, `nodev`, the atime flags, `sync`, `dirsync` and `mand`;
+  `huge`, `mpol`, `noswap` and the quota options are taken and shown and
+  do nothing, and `casefold` and `strict_encoding` are `EINVAL`, as from a
+  kernel without `CONFIG_UNICODE`. `statfs`'s `f_flags` leaves out
+  `ST_SYNCHRONOUS` and `ST_MANDLOCK`. A remount read-only is not refused
+  for a file that is unlinked but still open (Linux's `s_remove_count`).
+  A remount of a mount from start-up changes only whether its superblock
+  is read-only: a `hostfs` one takes no option but the common ones
+  (`EINVAL`), and the root's tmpfs options are checked but keep nothing.
+  A descriptor's mount, for `EROFS` of `fchmod`, `fchown`, `futimens`,
+  `fsetxattr` and the like, is found by the path it was opened at.
+  `MNT_EXPIRE`'s mark is cleared by a lookup that ends on the mount and by
+  the close of a file on it, but not by a lookup that only passes through
+  it, as Linux's every `mntput` does.
   The mounts from start-up (the root and each `--mount`) cannot be
   unmounted: `umount2` gives `EINVAL` when one is locked (in a mount
   namespace a new user namespace made, where the root is locked too, as
-  Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise, and
-  `EBUSY` for the caller's root without `MNT_DETACH`, which Linux remounts
-  read-only. `MNT_EXPIRE`'s mark stays until the next `MNT_EXPIRE`, where
-  any use of the mount clears Linux's. Mounts are kept by their mount
+  Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise.
+  Mounts are kept by their mount
   points' paths: a rename moves the mounts below the directory in the
   caller's namespace only, so another namespace's copies stay at the old
   path, and `rmdir` of a directory that is a mount point in another

@@ -369,24 +369,36 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   そこのファイルはまたすべて root のものに見えます。
 - **mount と umount2 の一部**：`mount` が作るのは tmpfs とバインドマウントだけで、ほかの型は、
   それがないカーネルと同じく `ENODEV` です。それより前の Linux の確認を通ったあと、
-  `MS_MOVE`、`MS_REMOUNT`、`MS_SHARED`、`MS_UNBINDABLE`、読み出し専用の tmpfs
-  （`MS_RDONLY` や `ro` オプション）、tmpfs の `MS_NOSYMFOLLOW`、生成される `/proc` や
-  `/dev`（とその中のファイル）へのマウントやそのバインドマウントは `EOPNOTSUPP` で、
-  プログラムはできないことを知れます。`fsopen`、`fsconfig`、
+  `MS_MOVE`、tmpfs の `MS_NOSYMFOLLOW` とマウントし直しで付ける `MS_NOSYMFOLLOW`、
+  生成される `/proc` や `/dev`（とその中のファイル）へのマウントやそのバインドマウントは
+  `EOPNOTSUPP` で、プログラムはできないことを知れます。`fsopen`、`fsconfig`、
   `fsmount`、`fspick`、`move_mount`、`open_tree`、`mount_setattr`、`statmount`、
-  `listmount`、`pivot_root` はありません（`ENOSYS`）。何も伝播しません。どのマウントも
-  プライベートで、mountinfo に `shared:` や `master:` の欄はありません。Linux では共有
-  マウントの写しがスレーブになることがあります。tmpfs のマウントの `size`、`nr_blocks`、
-  `nr_inodes` は返しますが効かせません（メモリ上のファイルシステムが埋まるまで埋まらず、
-  その大きさで `ENOSPC` にはなりません）。`noexec`、`nosuid`、`nodev`、atime のフラグも
-  効きません。`huge`、`mpol`、`noswap`、クォータのオプションは受け取って表示しますが何も
-  せず、`casefold` と `strict_encoding` は、`CONFIG_UNICODE` なしのカーネルと同じく
-  `EINVAL` です。起動したときからあるマウント（ルートと `--mount` ごとのもの）は外せません。
+  `listmount`、`pivot_root` はありません（`ENOSYS`）。伝播の種類は持って表示しますが、
+  何も伝播しません。共有マウントの下でのマウントやその解除は、Linux の `propagate_mnt` と
+  `propagate_umount` のようにはピアやスレーブに届かないので、ピアには写しが見えません。
+  起動したときからあるマウントはプライベートです。Linux のルートは共有（`shared:1`。
+  ほかのユーザー名前空間のマウント名前空間では `master:1`）のことがよくあります。ピア
+  グループの番号はこのマシンのマウントの中だけで 1 から数えます。Linux ではホストのものと
+  共通です。`propagate_from:` は名前空間のルートから求め、`chroot` のあとの読み手の
+  ルートからではありません。効かせるのは `MS_RDONLY`（`EROFS`）だけです。tmpfs の
+  マウントの `size`、`nr_blocks`、`nr_inodes` は返しますが効かせません（メモリ上の
+  ファイルシステムが埋まるまで埋まらず、その大きさで `ENOSPC` にはなりません）。
+  `noexec`、`nosuid`、`nodev`、atime のフラグ、`sync`、`dirsync`、`mand` も効きません。
+  `huge`、`mpol`、`noswap`、クォータのオプションは受け取って表示しますが何もせず、
+  `casefold` と `strict_encoding` は、`CONFIG_UNICODE` なしのカーネルと同じく `EINVAL`
+  です。`statfs` の `f_flags` に `ST_SYNCHRONOUS` と `ST_MANDLOCK` は出しません。消した
+  けれどまだ開いているファイルがあっても、読み出し専用へのマウントし直しは断りません
+  （Linux の `s_remove_count`）。起動したときからあるマウントのマウントし直しで変わるのは、
+  スーパーブロックが読み出し専用かどうかだけです。`hostfs` のものは共通のもののほかに
+  オプションを受け取らず（`EINVAL`）、ルートの tmpfs のオプションは確かめますが何も
+  残しません。`fchmod`、`fchown`、`futimens`、`fsetxattr` などの `EROFS` のための
+  ディスクリプタのマウントは、それを開いたパスから求めます。`MNT_EXPIRE` の印は、
+  マウントで終わる探索とその上のファイルを閉じることで消えますが、通り過ぎるだけの探索では
+  消えません。Linux ではどの `mntput` でも消えます。
+  起動したときからあるマウント（ルートと `--mount` ごとのもの）は外せません。
   `umount2` は、ロックされていれば（新しいユーザー名前空間が作ったマウント名前空間の中。
   Linux の `/` が rootfs の上のロックされたマウントであるのと同じく、ルートもロックされ
-  ます）`EINVAL`、そうでなければ `EBUSY` を返し、`MNT_DETACH` なしの呼び出し元のルートには
-  `EBUSY` を返します。Linux はそれを読み出し専用にマウントし直します。`MNT_EXPIRE` の印は
-  次の `MNT_EXPIRE` まで残ります。Linux ではマウントを使うたびに消えます。マウントは
+  ます）`EINVAL`、そうでなければ `EBUSY` を返します。マウントは
   マウントポイントのパスで持つので、名前の変更がディレクトリの下のマウントを動かすのは
   呼び出し元の名前空間の中だけで、ほかの名前空間の写しは古いパスに残り、ほかの名前空間で
   マウントポイントになっているディレクトリの `rmdir` はそのマウントを残します。Linux では

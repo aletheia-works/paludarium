@@ -512,7 +512,7 @@ impl UnixSocket {
     fn bind_path(&self, c: &Context<'_>, path: &[u8]) -> Result<(), Errno> {
         const AT_FDCWD: u64 = -100i64 as u64;
         let creds = &c.process.credentials;
-        let parent = crate::permissions::create(c.files, creds, AT_FDCWD, path)?;
+        let parent = crate::permissions::create(c.files, creds, AT_FDCWD, path, false)?;
         let full = c.files.exec_path(path.to_vec())?;
         // Landlock's MAKE_SOCK on its directory, for a name not there yet.
         if c.files.fs().metadata(&full, false).is_err() {

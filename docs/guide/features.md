@@ -63,7 +63,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | Security modules | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` |
 | Probes | `uprobe`, `uretprobe` |
@@ -1384,6 +1384,47 @@ kernel.
   rename moves it with its directory, and `setns` into a mount namespace
   goes back to the machine's root. The generated `/proc` and `/dev` are not
   under another root, as no `proc` filesystem is mounted there.
+- `mount` mounts a new tmpfs on a directory of the caller's mount namespace,
+  after Linux's checks in Linux's order: the type, the source and the
+  options are copied (`EFAULT`; a string with no end in 4096 bytes is
+  `EINVAL`), the target is looked up with its links followed (`ENOENT`,
+  `ENOTDIR`, `ELOOP`, `EACCES`), `MS_NOUSER` is `EINVAL`, a Landlock domain
+  that handles file access `EPERM`, and `CAP_SYS_ADMIN` over the mount
+  namespace is needed (`EPERM`). A new mount then needs a type (`EINVAL`)
+  that is `tmpfs` (`ENODEV` for any other), options tmpfs takes (`EINVAL`
+  for any other or a value of the wrong kind: `size`, `nr_blocks`,
+  `nr_inodes`, `mode`, `uid`, `gid`, `huge`, `mpol`, `inode32`, `inode64`,
+  `noswap`, the quota ones, and the common `sync`, `dirsync`, `lazytime` and
+  `mand` and their opposites), `CAP_SYS_ADMIN` in the caller's user
+  namespace (`EPERM`), and a directory (`ENOTDIR`) whose mount is in the
+  caller's namespace (`EINVAL`). The mount hides what is under it and has a
+  device and an ID of its own, the lowest free ones, as Linux hands them out;
+  its root is a directory of mode 01777 owned by the caller's filesystem
+  IDs, unless `mode`, `uid` and `gid` say otherwise. `statfs` gives it
+  `TMPFS_MAGIC` and the size and inodes it was mounted with (half the
+  memory `sysinfo` reports by default, 0 for no limit), and
+  `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
+  its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,
+  and tmpfs's options as Linux's `shmem_show_options` prints them. A path
+  steps into the topmost mount on each directory it passes, and `..` at a
+  mount's root goes to where it is mounted; `rename` and `link` from one
+  mount to another are `EXDEV`, `rmdir` and `rename` of a mount point
+  `EBUSY`, and a rename moves the mounts below the directory it moves.
+  `MS_PRIVATE` and `MS_SLAVE` (with `MS_REC` or not) of a mount's root
+  succeed, as every mount is private already, after `do_change_type`'s
+  checks (`EINVAL`).
+- `umount2` checks its flags (`EINVAL`) before it looks the target up, its
+  last link followed unless `UMOUNT_NOFOLLOW`; then, as Linux's
+  `can_umount` and `do_umount`, it needs `CAP_SYS_ADMIN` over the mount
+  namespace (`EPERM`), the root of a mount of that namespace that is not
+  locked (`EINVAL`), for `MNT_FORCE` `CAP_SYS_ADMIN` over the superblock's
+  user namespace (`EPERM`), and no Landlock domain that handles file access
+  (`EPERM`). A mount in use, by an open file (an `O_PATH` one and a mapping
+  too), a working directory or a root, or with other mounts on it, is
+  `EBUSY`, unless `MNT_DETACH` takes it and those on it away at once, their
+  open files still reading and writing. `MNT_EXPIRE` (`EINVAL` with
+  `MNT_FORCE` or `MNT_DETACH`, or of the caller's root) marks a mount no one
+  uses (`EAGAIN`) and unmounts it the next time.
 - `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
   with `CLONE_FS` its own working directory and umask, as Linux. With
   `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
@@ -1403,7 +1444,11 @@ kernel.
   it) in the user namespace the thread then has, so a new one with them
   gives it. A new UTS namespace starts
   with a copy of the host and domain names, which `sethostname` and
-  `setdomainname` then change for it alone. A new time namespace is the one
+  `setdomainname` then change for it alone. A new mount namespace starts
+  with a copy of each mount, with a new ID, on the same file system, locked
+  when the new namespace's user namespace is another (`lock_mnt_tree`), and
+  `mount` and `umount2` in it change its mounts alone; the thread's root and
+  working directory stay at their paths, on the copies. A new time namespace is the one
   the thread's children enter: a child that does not share its memory
   enters it, and so does the thread when it runs a program. `clone` refuses
   `CLONE_NEWNS` with `CLONE_FS` and `CLONE_NEWIPC` with `CLONE_SYSVSEM`
@@ -2191,8 +2236,9 @@ kernel.
 - `statfs` reports the in-memory filesystem as a 4 GiB tmpfs whose used
   space and inodes are what it holds, and a mounted host directory with the
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
-  and `/proc/mounts` list the mounts (`tmpfs` for the root, `hostfs` for each
-  `--mount`, without host paths). After `chroot` they show each mount point
+  and `/proc/mounts` list the mounts of the caller's mount namespace
+  (`tmpfs` for the root, `hostfs` for each `--mount`, without host paths,
+  and the tmpfs mounts `mount` made, with their sources). After `chroot` they show each mount point
   from the process's root and leave out those not under it, as Linux's
   `seq_path_root` does. Each mount has its own `st_dev`, as its
   line in `mountinfo` says, so `df` lists every mount. A pipe, a socket, a

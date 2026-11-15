@@ -116,7 +116,7 @@ impl Namespace {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
-    fn is_first_user(&self) -> bool {
+    pub(crate) fn is_first_user(&self) -> bool {
         self.users.parent.is_none()
     }
     /// A new user namespace in `parent`, made by a thread with `creds`, as

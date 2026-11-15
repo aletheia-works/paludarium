@@ -239,15 +239,11 @@ impl FileSystem for MountedFs {
     fn mounts(&self) -> Vec<MountPoint> {
         let mut out = Vec::new();
         if !self.mounts.iter().any(|(root, _)| root == b"/") {
-            out.push(MountPoint {
-                path: b"/".to_vec(),
-                kind: "tmpfs",
-            });
+            out.push(MountPoint::boot(0, b"/".to_vec(), "tmpfs"));
         }
-        out.extend(self.mounts.iter().map(|(root, _)| MountPoint {
-            path: root.clone(),
-            kind: "hostfs",
-        }));
+        for (root, _) in &self.mounts {
+            out.push(MountPoint::boot(out.len(), root.clone(), "hostfs"));
+        }
         out
     }
 }

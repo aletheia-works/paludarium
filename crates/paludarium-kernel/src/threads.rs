@@ -1985,6 +1985,14 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let child_namespaces = own.for_child(namespaces, true, &parent.state.credentials.user.0)?;
+        let mounts = (namespaces & crate::namespaces::CLONE_NEWNS != 0).then(|| {
+            crate::namespaces::copy_mounts(
+                &child_namespaces.mnt,
+                &own.mnt,
+                &parent.state.credentials.user.0,
+                &self.files,
+            )
+        });
         let set_tid = std::mem::take(&mut self.set_tid);
         let tid = self.processes.allocate_in(
             &child_namespaces.pid,
@@ -2048,6 +2056,9 @@ impl Kernel {
             set_tid: Vec::new(),
             seat: None,
         };
+        if let Some(mounts) = mounts {
+            child.files.set_mount_table(mounts);
+        }
         // A new thread starts with its creator's nice value, set before it
         // is registered so that no one sees it without one, and its
         // scheduling attributes as sched_fork passes them on.

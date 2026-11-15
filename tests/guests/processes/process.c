@@ -32,6 +32,7 @@
 #include <utime.h>
 #include <sys/socket.h>
 #include <sys/msg.h>
+#include <sys/mount.h>
 #include <grp.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -8359,6 +8360,249 @@ static int chroot_case(const char *self) {
     snprintf(path, sizeof path, "%s/f", cr_base);
     unlink(path);
     printf("cleaned=%d\n", rmdir(cr_base) == 0);
+    return 0;
+}
+
+/* The mounts case: tmpfs mounts and umount2 in a mount namespace of a user
+   namespace of its own, where the caller is root. Only errno values and
+   comparisons are printed, nothing of the machine's own mount table. */
+static char mt_base[] = "/tmp/paludarium-mounts-XXXXXX";
+static int mt_result(long r) { return r ? errno : 0; }
+static void mt_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", mt_base, name); }
+static int mt_write(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return errno;
+    int r = write(fd, text, strlen(text)) == (ssize_t)strlen(text) ? 0 : errno;
+    close(fd);
+    return r;
+}
+static dev_t mt_dev(const char *path) {
+    struct stat st;
+    return stat(path, &st) ? (dev_t)-1 : st.st_dev;
+}
+/* The mountinfo line of the mount at `point`: whether there is one, its
+   type and source, its device against st_dev, and size and mode in its
+   options. */
+static void mt_mountinfo(const char *point) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    char line[4096];
+    int found = 0, kind = 0, source = 0, device = 0, size = 0, mode = 0;
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned major, minor;
+        char at[1024];
+        if (sscanf(line, "%*d %*d %u:%u %*s %1023s", &major, &minor, at) != 3 || strcmp(at, point)) continue;
+        found++;
+        char *tail = strstr(line, " - ");
+        if (tail) {
+            kind = !strncmp(tail, " - tmpfs none ", 14);
+            source = kind;
+            size = strstr(tail, ",size=1024k") != NULL;
+            mode = strstr(tail, ",mode=750") != NULL;
+        }
+        device = makedev(major, minor) == mt_dev(point);
+    }
+    if (f) fclose(f);
+    printf("mountinfo lines=%d tmpfs=%d source=%d device=%d size=%d mode=%d\n", found, kind, source, device, size,
+           mode);
+}
+/* The program run from a tmpfs: the device `maps` names its own mapping
+   with is the device `stat` gives its file. */
+static int mt_exe_case(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[512];
+    unsigned major = 0, minor = 0;
+    if (!f || !fgets(line, sizeof line, f) || sscanf(line, "%*s %*s %*s %x:%x", &major, &minor) != 2) return 81;
+    fclose(f);
+    struct stat st;
+    if (stat("/proc/self/exe", &st)) return 82;
+    printf("exe device=%d\n", makedev(major, minor) == st.st_dev);
+    return 0;
+}
+static void mt_run_from(const char *self, const char *dir) {
+    char copy[300];
+    snprintf(copy, sizeof copy, "%s/self", dir);
+    int in = open(self, O_RDONLY), out = open(copy, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    char chunk[65536];
+    ssize_t n;
+    while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
+        if (write(out, chunk, n) != n) break;
+    close(in);
+    close(out);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char *args[] = {"x", "mounts-exe", copy, NULL};
+        execv(copy, args);
+        _exit(98);
+    }
+    printf("exe status=%d\n", reaped(child));
+    unlink(copy);
+}
+static int mt_inner(const char *self) {
+    char m[256], m2[256], f[256], h[256], hx[256], sub[256], m3[256], m4[256], other[256];
+    mt_path(m, "m");
+    mt_path(m2, "m2");
+    mt_path(f, "f");
+    mt_path(h, "h");
+    mt_path(hx, "h/x");
+    mt_path(m3, "m3");
+    mt_path(m4, "m4");
+    snprintf(sub, sizeof sub, "%s/sub", m);
+    dev_t base = mt_dev(mt_base);
+    /* Changing propagation, if this kernel can; not compared. */
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    printf("mount=%d\n", mt_result(mount("none", m, "tmpfs", 0, "size=1m,mode=0750")));
+    printf("own device=%d\n", mt_dev(m) != base && mt_dev(m) != (dev_t)-1);
+    mt_mountinfo(m);
+    struct statfs fs;
+    if (!statfs(m, &fs))
+        printf("statfs tmpfs=%d bsize=%ld blocks=%ld free=%d\n", fs.f_type == 0x01021994, (long)fs.f_bsize,
+               (long)fs.f_blocks, fs.f_bfree == fs.f_blocks);
+    struct stat st;
+    if (!stat(m, &st)) printf("root mode=%o uid=%d gid=%d\n", st.st_mode & 07777, (int)st.st_uid, (int)st.st_gid);
+    struct stat up, outer;
+    char dotdot[300];
+    snprintf(dotdot, sizeof dotdot, "%s/..", m);
+    printf("dotdot=%d\n", !stat(dotdot, &up) && !stat(mt_base, &outer) && up.st_ino == outer.st_ino &&
+                              up.st_dev == outer.st_dev);
+    mt_run_from(self, m);
+    /* The defaults: 01777, owned by the caller, and nr_inodes in statfs. */
+    printf("default=%d\n", mt_result(mount("none", m2, "tmpfs", MS_NOSUID, "nr_inodes=100")));
+    if (!stat(m2, &st)) printf("default mode=%o uid=%d gid=%d\n", st.st_mode & 07777, (int)st.st_uid, (int)st.st_gid);
+    if (!statfs(m2, &fs)) printf("default files=%ld free=%ld\n", (long)fs.f_files, (long)fs.f_ffree);
+    printf("umount default=%d\n", mt_result(umount2(m2, 0)));
+    /* mount's checks. */
+    printf("null-type=%d unknown-type=%d bad-option=%d flag-value=%d missing=%d not-dir=%d nouser=%d\n",
+           mt_result(mount("none", m2, NULL, 0, NULL)), mt_result(mount("none", m2, "nosuchfs", 0, NULL)),
+           mt_result(mount("none", m2, "tmpfs", 0, "bogus=1")), mt_result(mount("none", m2, "tmpfs", 0, "inode64=1")),
+           mt_result(mount("none", "/nonexistent/x", "tmpfs", 0, NULL)), mt_result(mount("none", f, "tmpfs", 0, NULL)),
+           mt_result(mount("none", m2, "tmpfs", MS_NOUSER, NULL)));
+    printf("fault type=%d source=%d data=%d target=%d\n", mt_result(mount("none", m2, (char *)8, 0, NULL)),
+           mt_result(mount((char *)8, m2, "tmpfs", 0, NULL)), mt_result(mount("none", m2, "tmpfs", 0, (void *)8)),
+           mt_result(mount("none", (char *)8, "tmpfs", 0, NULL)));
+    printf("private not-root=%d two-types=%d\n", mt_result(mount(NULL, m2, NULL, MS_PRIVATE, NULL)),
+           mt_result(mount(NULL, "/", NULL, MS_PRIVATE | MS_SLAVE, NULL)));
+    /* umount2's checks. */
+    printf("umount flags=%d not-mount=%d missing=%d expire-detach=%d locked-root=%d\n",
+           mt_result(umount2(m, 0x10)), mt_result(umount2(mt_base, 0)), mt_result(umount2("/nonexistent/x", 0)),
+           mt_result(umount2(m, MNT_EXPIRE | MNT_DETACH)), mt_result(umount2("/", 0)));
+    /* The mount point is busy for rmdir and rename; nothing crosses it. */
+    char moved[256], inside[300];
+    mt_path(moved, "moved");
+    snprintf(inside, sizeof inside, "%s/f", m);
+    printf("rmdir=%d rename=%d\n", mt_result(rmdir(m)), mt_result(rename(m, moved)));
+    printf("cross rename=%d link=%d\n", mt_result(rename(f, inside)), mt_result(link(f, inside)));
+    /* In use: an open file, then a working directory. */
+    int fd = open(inside, O_RDWR | O_CREAT, 0600);
+    printf("open busy=%d\n", mt_result(umount2(m, 0)));
+    if (write(fd, "data", 4) != 4) perror("write");
+    close(fd);
+    int entered = mt_result(chdir(m));
+    printf("cwd=%d busy=%d\n", entered, entered ? -1 : mt_result(umount2(m, 0)));
+    if (chdir(mt_base)) return 91;
+    fd = open(inside, O_RDONLY);
+    /* A mount on it makes it busy too. */
+    mkdir(sub, 0755);
+    int mounted = mt_result(mount("none", sub, "tmpfs", 0, NULL));
+    int covered = mt_result(umount2(m, 0));
+    printf("sub=%d covered=%d sub-umount=%d\n", mounted, covered, mt_result(umount2(sub, 0)));
+    /* Detached, the open file still reads, and the directory is back. */
+    char buf[8] = {0};
+    printf("detach=%d", mt_result(umount2(m, MNT_DETACH)));
+    printf(" read=%zd %.4s back=%d gone=%d\n", read(fd, buf, sizeof buf), buf, mt_dev(m) == base,
+           access(inside, F_OK) ? errno : 0);
+    close(fd);
+    printf("umount again=%d\n", mt_result(umount2(m, 0)));
+    /* A mount hides what is under it. */
+    printf("hidden mount=%d", mt_result(mount("none", h, "tmpfs", 0, NULL)));
+    printf(" under=%d", access(hx, F_OK) ? errno : 0);
+    printf(" umount=%d", mt_result(umount2(h, 0)));
+    printf(" under=%d\n", access(hx, F_OK) ? errno : 0);
+    /* A child in a mount namespace of its own: its mount is its own, and
+       setns into that namespace sees it. */
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 92;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char byte = 'x';
+        if (syscall(SYS_unshare, CLONE_NEWNS)) byte = 'u';
+        else if (mount("none", m3, "tmpfs", 0, NULL)) byte = 'm';
+        if (write(ready[1], &byte, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte = 0;
+    if (read(ready[0], &byte, 1) != 1) byte = 'r';
+    printf("child mount=%c parent sees=%d\n", byte, mt_dev(m3) != base);
+    fflush(stdout);
+    pid_t joiner = fork();
+    if (joiner == 0) {
+        char ns[64];
+        snprintf(ns, sizeof ns, "/proc/%d/ns/mnt", (int)child);
+        int nsfd = open(ns, O_RDONLY);
+        int entered = mt_result(syscall(SYS_setns, nsfd, CLONE_NEWNS));
+        char cwd[256] = "";
+        printf("setns=%d sees=%d cwd=%s\n", entered, mt_dev(m3) != base, getcwd(cwd, sizeof cwd) ? cwd : "?");
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("joiner=%d\n", reaped(joiner));
+    if (write(done[1], "d", 1) != 1) perror("write");
+    printf("child=%d\n", reaped(child));
+    /* A child that shares the namespace shares its mounts. */
+    fflush(stdout);
+    pid_t sharer = fork();
+    if (sharer == 0) _exit(mt_result(mount("none", m4, "tmpfs", 0, NULL)));
+    int shared_status = reaped(sharer);
+    int shared = mt_dev(m4) != base;
+    printf("sharer=%d shared=%d umount=%d\n", shared_status, shared, mt_result(umount2(m4, 0)));
+    mt_path(other, "m");
+    printf("left=%d\n", mt_dev(other) == base);
+    return 0;
+}
+static int mounts_case(const char *self) {
+    if (!mkdtemp(mt_base)) return 93;
+    chmod(mt_base, 0755);
+    const char *dirs[] = {"m", "m2", "h", "m3", "m4"};
+    char path[256];
+    for (unsigned i = 0; i < 5; i++) {
+        mt_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    mt_path(path, "f");
+    close(open(path, O_WRONLY | O_CREAT, 0644));
+    mt_path(path, "h/x");
+    close(open(path, O_WRONLY | O_CREAT, 0644));
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(mt_inner(self));
+    }
+    printf("status=%d\n", reaped(child));
+    const char *files[] = {"f", "h/x"};
+    for (unsigned i = 0; i < 2; i++) {
+        mt_path(path, files[i]);
+        unlink(path);
+    }
+    const char *gone[] = {"m/sub", "m", "m2", "h", "m3", "m4"};
+    for (unsigned i = 0; i < 6; i++) {
+        mt_path(path, gone[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(mt_base) == 0);
     return 0;
 }
 
@@ -24416,6 +24660,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "time-set")) return time_set_case();
     if (!strcmp(mode, "chroot")) return chroot_case(self);
     if (!strcmp(mode, "chroot-exec")) return chroot_exec_case();
+    if (!strcmp(mode, "mounts")) return mounts_case(self);
+    if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

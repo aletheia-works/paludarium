@@ -42,6 +42,7 @@ pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;
 mod memfd;
 mod mempolicy;
+mod mounts;
 mod mqueue;
 mod msg;
 mod namespaces;

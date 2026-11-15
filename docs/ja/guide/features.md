@@ -55,7 +55,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
@@ -1219,6 +1219,39 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   一緒にルートも動かし、マウント名前空間への `setns` はマシンのルートに戻します。生成される
   `/proc` と `/dev` は、ほかのルートの下にはありません。そこには `proc` ファイルシステムが
   マウントされていないからです。
+- `mount` は、呼び出し元のマウント名前空間のディレクトリに新しい tmpfs をマウントします。
+  その前に Linux と同じ順に確かめます。型・ソース・オプションを写し（`EFAULT`。4096 バイト
+  の中で終わらない文字列は `EINVAL`）、リンクをたどってターゲットを探し（`ENOENT`、
+  `ENOTDIR`、`ELOOP`、`EACCES`）、`MS_NOUSER` は `EINVAL`、ファイルへのアクセスを扱う
+  Landlock のドメインは `EPERM` で、マウント名前空間に対する `CAP_SYS_ADMIN` が要ります
+  （`EPERM`）。新しいマウントには、型（`EINVAL`）が `tmpfs` であること（ほかは `ENODEV`）、
+  tmpfs が受け取るオプション（ほかのもの、種類の違う値は `EINVAL`。`size`、`nr_blocks`、
+  `nr_inodes`、`mode`、`uid`、`gid`、`huge`、`mpol`、`inode32`、`inode64`、`noswap`、
+  クォータのもの、共通の `sync`、`dirsync`、`lazytime`、`mand` とその反対）、呼び出し元の
+  ユーザー名前空間での `CAP_SYS_ADMIN`（`EPERM`）、マウントが呼び出し元の名前空間にある
+  （`EINVAL`）ディレクトリ（`ENOTDIR`）が要ります。マウントはその下にあるものを隠し、
+  Linux と同じく空いているいちばん小さいデバイスと ID を持ちます。ルートは、`mode`、`uid`、
+  `gid` で変えなければ、呼び出し元のファイルシステム ID が持つモード 01777 のディレクトリ
+  です。`statfs` は `TMPFS_MAGIC` と、マウントしたときの大きさと inode の数（既定は
+  `sysinfo` が返すメモリーの半分、0 は上限なし）を返し、`/proc/self/mountinfo` と
+  `/proc/self/mounts` は、ソース、`nosuid`・`nodev`・`noexec`・`noatime`・`nodiratime`・
+  `relatime`、Linux の `shmem_show_options` が出す tmpfs のオプションとともにそれを並べ
+  ます。パスは通るディレクトリごとにいちばん上のマウントに入り、マウントのルートでの
+  `..` はマウントした場所に出ます。マウントをまたぐ `rename` と `link` は `EXDEV`、
+  マウントポイントの `rmdir` と `rename` は `EBUSY` で、名前の変更は動かすディレクトリの
+  下のマウントも動かします。マウントのルートへの `MS_PRIVATE` と `MS_SLAVE`（`MS_REC`
+  付きでもなしでも）は、`do_change_type` の確認（`EINVAL`）のあと成功します。どの
+  マウントもはじめからプライベートだからです。
+- `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
+  `UMOUNT_NOFOLLOW` がなければたどります。そのあと Linux の `can_umount` と `do_umount`
+  と同じく、マウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）、その名前空間のマウントの
+  ルートで、ロックされていないこと（`EINVAL`）、`MNT_FORCE` にはスーパーブロックのユーザー
+  名前空間での `CAP_SYS_ADMIN`（`EPERM`）、ファイルへのアクセスを扱う Landlock のドメインが
+  ないこと（`EPERM`）が要ります。開いたファイル（`O_PATH` のものとマッピングも）・作業
+  ディレクトリ・ルートが使っているマウントや、上にほかのマウントがあるマウントは `EBUSY`
+  です。ただし `MNT_DETACH` は、それと上のマウントをすぐに外し、開いたファイルは読み書き
+  できるままです。`MNT_EXPIRE`（`MNT_FORCE` や `MNT_DETACH` 付き、呼び出し元のルートでは
+  `EINVAL`）は、だれも使っていないマウントに印を付け（`EAGAIN`）、次の呼び出しで外します。
 - `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
   `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
@@ -1237,7 +1270,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `CAP_SYS_ADMIN` が要り（なければ `EPERM`）、いっしょに作る新しいユーザーの名前空間が
   それを与えます。新しい UTS 名前空間はホスト名と
   ドメイン名の写しで始まり、その後の `sethostname` と `setdomainname` はその名前空間だけを
-  変えます。新しい time 名前空間は、スレッドの子が入るものです。メモリーを共有しない子は
+  変えます。新しいマウント名前空間は、マウントごとに新しい ID の写しを同じファイルシステムに
+  持って始まり、新しい名前空間のユーザー名前空間がほかのものならそれをロックします
+  （`lock_mnt_tree`）。その中の `mount` と `umount2` は、その名前空間のマウントだけを変え
+  ます。スレッドのルートと作業ディレクトリは同じパスのまま写しの上に移ります。新しい time 名前空間は、スレッドの子が入るものです。メモリーを共有しない子は
   それに入り、スレッドもプログラムを実行するとそれに入ります。`clone` は、Linux と同じく
   `CLONE_FS` 付きの `CLONE_NEWNS` と `CLONE_SYSVSEM` 付きの `CLONE_NEWIPC` を `EINVAL`
   で断ります。`/proc/<pid>/ns`（と `/proc/thread-self/ns`、`/proc/<pid>/task/<tid>/ns`）
@@ -1907,8 +1943,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `statfs` は、メモリ上のファイルシステムを 4 GiB の tmpfs として返します。使用量と
   inode の数は、実際に持っているものです。マウントしたホストのディレクトリでは、
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
-  `/proc/mounts` はマウントの一覧です（ルートは `tmpfs`、`--mount` ごとに `hostfs`。
-  ホストのパスは見せません）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
+  `/proc/mounts` は呼び出し元のマウント名前空間のマウントの一覧です（ルートは `tmpfs`、
+  `--mount` ごとに `hostfs`。ホストのパスは見せません。`mount` が作った tmpfs のマウントは
+  ソースとともに出します）。`chroot` のあとは、Linux の `seq_path_root` と同じく、
   マウントポイントをプロセスのルートから見せ、ルートの下にないものは出しません。
   マウントごとに `mountinfo` の行と同じ `st_dev` を持つので、
   `df` はどのマウントも表示します。パスから開いたのではないパイプ・ソケット・pidfd・

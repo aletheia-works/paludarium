@@ -284,10 +284,7 @@ fn statfs_reports_a_tmpfs_with_what_the_tree_holds() {
     assert_eq!(fs.statfs(b"/missing"), Err(Errno::ENOENT));
     assert_eq!(
         fs.mounts(),
-        vec![MountPoint {
-            path: b"/".to_vec(),
-            kind: "tmpfs"
-        }]
+        vec![MountPoint::boot(0, b"/".to_vec(), "tmpfs")]
     );
 }
 mod sparse {

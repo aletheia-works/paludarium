@@ -68,9 +68,9 @@ verified.
   used.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
-  root. As `mount` is not implemented, nothing can be mounted on the new
-  root's `/proc` or `/dev`, so a program there finds only the files the
-  directory holds. In a path that climbs above the root as written, `..` is
+  root. As `mount` mounts nothing on `/proc` or `/dev` and has no bind
+  mounts, nothing can be mounted on the new root's `/proc` or `/dev`, so a
+  program there finds only the files the directory holds. In a path that climbs above the root as written, `..` is
   taken from the names as written, where Linux takes a `..` after a
   symbolic link from the link's target. `maps` and `smaps` in `/proc` name
   files from the root their opener had when it opened them, where Linux
@@ -420,6 +420,36 @@ verified.
   `chown` gives a file, and those of a file a guest makes there, are kept
   only while the emulator runs, not on the host file. The next run sees
   every file there as root's again.
+- **mount and umount2, in part**: `mount` makes only tmpfs mounts; any
+  other type is `ENODEV`, as from a kernel without it. Once Linux's checks
+  before them pass, `MS_BIND`, `MS_MOVE`, `MS_REMOUNT`, `MS_SHARED`,
+  `MS_UNBINDABLE`, a read-only mount (`MS_RDONLY` or the `ro` option),
+  `MS_NOSYMFOLLOW` and a mount on the generated `/proc` or `/dev` give
+  `EOPNOTSUPP`, so a program learns they are not supported; `fsopen`,
+  `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`,
+  `mount_setattr`, `statmount`, `listmount` and `pivot_root` are not there
+  (`ENOSYS`). Nothing propagates: every mount is private, and mountinfo
+  shows no `shared:` or `master:` field, where Linux's copies of a shared
+  mount may be slaves. A tmpfs mount's `size`, `nr_blocks` and `nr_inodes`
+  are reported but not enforced (it fills up only as the in-memory
+  filesystem does, never `ENOSPC` at its size), nor are `noexec`,
+  `nosuid`, `nodev` and the atime flags; `huge`, `mpol`, `noswap` and the
+  quota options are taken and shown and do nothing, and `casefold` and
+  `strict_encoding` are `EINVAL`, as from a kernel without `CONFIG_UNICODE`.
+  The mounts from start-up (the root and each `--mount`) cannot be
+  unmounted: `umount2` gives `EINVAL` when one is locked (in a mount
+  namespace a new user namespace made, where the root is locked too, as
+  Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise, and
+  `EBUSY` for the caller's root without `MNT_DETACH`, which Linux remounts
+  read-only. `MNT_EXPIRE`'s mark stays until the next `MNT_EXPIRE`, where
+  any use of the mount clears Linux's. Mounts are kept by their mount
+  points' paths: a rename moves the mounts below the directory in the
+  caller's namespace only, so another namespace's copies stay at the old
+  path, and `rmdir` of a directory that is a mount point in another
+  namespace leaves that mount there, where Linux detaches it. A detached
+  mount's open files keep working, but a working directory or a descriptor
+  in it is used by its path, which no longer leads there. A mount ID is the
+  lowest free one from 21, and the root's parent is shown as 1.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the
@@ -430,9 +460,9 @@ verified.
   comes before them, which shows only when both refuse. A rule on a file under
   `/proc` does not count for `execve`. An open checks the file its path
   reaches before it opens it (and the file it made after), so another thread
-  renaming the name in between can make the two differ. There is no `mount`,
-  `umount2` or `pivot_root` (`ENOSYS`), which Linux refuses a thread in a
-  domain (`EPERM`).
+  renaming the name in between can make the two differ. There is no
+  `pivot_root` (`ENOSYS`), which Linux refuses a thread in a domain
+  (`EPERM`), as `mount` and `umount2` here do.
 - **seccomp**: a call that `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` keeps
   waiting for its listener looks for a fatal signal every 10 ms rather than
   waking for it. Nothing is logged (`SECCOMP_FILTER_FLAG_LOG`,
@@ -449,15 +479,16 @@ verified.
   ends, with that thread's. Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
-  act as 0, the kernel's defaults, which many distributions raise. No mount
-  is `nosuid`, and a set-user-ID or set-group-ID program takes its owner or
-  group, and a program with file capabilities takes them, even when another
-  process shares the caller's working directory (`CLONE_FS`), where Linux
-  takes the real IDs as effective unless the caller has `CAP_SETUID` and
-  gives no more capabilities than the caller had. `execveat`'s
-  `AT_EXECVE_CHECK` (Linux 6.14), with which user space checks a file before
-  it runs it under `SECBIT_EXEC_RESTRICT_FILE`, is `EINVAL`: the securebits
-  for those checks are kept and shown, but nothing here acts on them.
+  act as 0, the kernel's defaults, which many distributions raise. A mount's
+  `nosuid` is not enforced, and a set-user-ID or set-group-ID program takes
+  its owner or group, and a program with file capabilities takes them, even
+  when another process shares the caller's working directory (`CLONE_FS`),
+  where Linux takes the real IDs as effective unless the caller has
+  `CAP_SETUID` and gives no more capabilities than the caller had.
+  `execveat`'s `AT_EXECVE_CHECK` (Linux 6.14), with which user space checks
+  a file before it runs it under `SECBIT_EXEC_RESTRICT_FILE`, is `EINVAL`:
+  the securebits for those checks are kept and shown, but nothing here acts
+  on them.
   `/proc/self/status` shows the calling thread's credentials, where Linux
   shows the thread group leader's.
 - **Socket messages**: `sendmsg` and `recvmsg` pass descriptors with
@@ -490,8 +521,8 @@ verified.
   takes it in, at its next system call or within 10 ms of a wait, where
   Linux's `signalfd_notify` wakes the file as the signal is sent; an
   `epoll_wait` that does not wait can come before it.
-- **inotify, in part**: `IN_UNMOUNT` is never sent, as nothing is ever
-  unmounted (there is no `umount2`). `/proc/self/fdinfo` lists an epoll's files by
+- **inotify, in part**: `IN_UNMOUNT` is never sent, nor the `IN_IGNORED`
+  after it, when `umount2` takes away the mount of a watched file. `/proc/self/fdinfo` lists an epoll's files by
   descriptor where Linux's order follows the files' addresses, and numbers
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
@@ -627,10 +658,9 @@ verified.
   waiting. A `write` to a netlink socket acts with the capability of the
   thread that opened it alone. The other namespaces keep nothing apart
   that paludarium has, but for the System V shared memory, semaphores and
-  message queues and the POSIX message queues of an IPC namespace: there is
-  no `mount` for a mount namespace (whose mounts keep their IDs
-  in `/proc/self/mountinfo`, where Linux gives a new namespace's copies new
-  ones), no `/proc/self/cgroup` for a cgroup namespace, and no
+  message queues and the POSIX message queues of an IPC namespace and the
+  mounts of a mount namespace: there is no `/proc/self/cgroup` for a cgroup
+  namespace, and no
   `/proc/<pid>/timens_offsets` for a time namespace, whose clocks are the
   first one's. A PID namespace hands out its numbers once each, where
   Linux's wrap at `pid_max` and are used again; for the same reason

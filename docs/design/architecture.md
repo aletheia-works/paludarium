@@ -23,7 +23,7 @@ Every crate uses the shared types of `paludarium-types`.
 | `paludarium-decoder` | A decoder wrapping iced-x86; only its own instruction types are visible outside |
 | `paludarium-mmu` | A software MMU: two-level page tables of 4 KiB pages |
 | `paludarium-host` | The host boundary (the `Host` trait) and its Linux, macOS, Windows and WebAssembly implementations |
-| `paludarium-vfs` | A safe in-memory filesystem and host directory mounts |
+| `paludarium-vfs` | A safe in-memory filesystem, host directory mounts, and the mount namespaces' tables of mounts |
 | `paludarium-loader` | Loading ELF files, with the interpreter they ask for, and building the initial stack (argv, envp, auxiliary vector) |
 | `paludarium-cpu` | The x86-64 interpreter |
 | `paludarium-jit` | The code cache interface and the WebAssembly JIT |

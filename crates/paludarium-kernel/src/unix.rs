@@ -412,8 +412,7 @@ fn path_of(name: &[u8]) -> Vec<u8> {
 }
 /// The socket file at `path` with inode `inode`, as [`Names`] keys it.
 fn inode(c: &Context<'_>, path: &[u8], inode: u64) -> Inode {
-    let mounts = c.files.fs().mounts();
-    (crate::page_cache::mount_device(&mounts, path), inode)
+    (c.files.fs().device(path), inode)
 }
 
 impl UnixSocket {

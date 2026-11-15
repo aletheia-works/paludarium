@@ -703,28 +703,32 @@ fn escape(path: &[u8]) -> String {
     out
 }
 
-/// `mountinfo` or `mounts` lines for `mounts`; each filesystem type is also
-/// its source, so host paths are not shown. Mount points are shown from
-/// `root`, the process's root, and those not under it are left out, as
+/// `mountinfo` or `mounts` lines for `mounts`, as Linux's `show_mountinfo`
+/// and `show_vfsmnt` print them; a mount from start-up has its filesystem
+/// type as its source, so host paths are not shown. Mount points are shown
+/// from `root`, the process's root, and those not under it are left out, as
 /// Linux's `seq_path_root` skips them.
 pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec<u8> {
     let mut out = String::new();
-    for (i, mount) in mounts.iter().enumerate() {
+    for mount in mounts {
         let Some(path) = crate::files::seen_from(root, &mount.path) else {
             continue;
         };
         let path = escape(&path);
+        let source = escape(&mount.source);
+        let (kind, options) = (mount.kind, &mount.options);
+        let (common, fs) = (&mount.common_options, &mount.super_options);
         if mountinfo {
-            let (id, parent) = (21 + i, if i == 0 { 1 } else { 21 });
+            let device = mount.device;
+            let major = (device >> 8) & 0xfff | (device >> 32) & !0xfff;
+            let minor = device & 0xff | (device >> 12) & !0xff;
             out.push_str(&format!(
-                "{id} {parent} 0:{} / {path} rw,relatime - {kind} {kind} rw\n",
-                i + 1,
-                kind = mount.kind
+                "{} {} {major}:{minor} / {path} rw{options} - {kind} {source} rw{common}{fs}\n",
+                mount.id, mount.parent
             ));
         } else {
             out.push_str(&format!(
-                "{kind} {path} {kind} rw,relatime 0 0\n",
-                kind = mount.kind
+                "{source} {path} {kind} rw{common}{options}{fs} 0 0\n"
             ));
         }
     }
@@ -1525,14 +1529,8 @@ mod tests {
     #[test]
     fn mount_table_lines_escape_paths() {
         let mounts = [
-            MountPoint {
-                path: b"/".to_vec(),
-                kind: "tmpfs",
-            },
-            MountPoint {
-                path: b"/my dir".to_vec(),
-                kind: "hostfs",
-            },
+            MountPoint::boot(0, b"/".to_vec(), "tmpfs"),
+            MountPoint::boot(1, b"/my dir".to_vec(), "hostfs"),
         ];
         assert_eq!(
             String::from_utf8(render(&mounts, true, b"/")).unwrap(),

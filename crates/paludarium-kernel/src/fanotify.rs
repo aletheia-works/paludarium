@@ -1122,8 +1122,8 @@ impl Group {
 
     /// What `/proc/self/fdinfo` shows after the lines every descriptor
     /// has, as Linux's `fanotify_show_fdinfo`: the flags, then a line for
-    /// each mark, the newest first.
-    pub(crate) fn fdinfo(&self) -> Vec<u8> {
+    /// each mark, the newest first; a mount's by the ID `mount_id` gives.
+    pub(crate) fn fdinfo(&self, mount_id: &dyn Fn(u64) -> u64) -> Vec<u8> {
         let mut out = format!(
             "fanotify flags:{:x} event-flags:{:x}\n",
             self.flags & INIT_FLAGS,
@@ -1155,7 +1155,7 @@ impl Group {
                 }
                 Target::Mount(device) => format!(
                     "fanotify mnt_id:{:x} mflags:{:x} mask:{:x} ignored_mask:{:x}\n",
-                    crate::files::mount_id(device),
+                    mount_id(device),
                     m.user_flags(),
                     m.mask,
                     m.ignore

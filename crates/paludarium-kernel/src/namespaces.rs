@@ -5,10 +5,10 @@
 //! namespace the System V shared memory segments, and a PID namespace the
 //! numbers it gives the tasks in it ([`Pids`]), and a nested network
 //! namespace its own network, with only a loopback, and abstract socket
-//! names ([`Sockets`]); the mount, cgroup and time namespaces have nothing
-//! in them that paludarium keeps apart (there is no `mount`, no cgroup file
-//! and no clock offset), so a new one differs only in its identity. The
-//! user namespace is the first one only.
+//! names ([`Sockets`]), and a mount namespace its own table of mounts
+//! ([`Namespace::mounts`]); the cgroup and time namespaces have nothing in
+//! them that paludarium keeps apart (there is no cgroup file and no clock
+//! offset), so a new one differs only in its identity.
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use std::collections::BTreeMap;
@@ -124,6 +124,31 @@ impl Kind {
     }
 }
 
+/// The mounts of mount namespace `ns`: its own table, or for the first
+/// namespace the first table, which `files` has.
+pub(crate) fn mount_table(
+    ns: &Namespace,
+    files: &crate::files::Files,
+) -> Arc<paludarium_vfs::MountTable> {
+    ns.mounts
+        .get()
+        .map_or_else(|| Arc::clone(files.first_mounts()), Arc::clone)
+}
+/// A new mount namespace's mounts (`copy_mnt_ns`): a copy of those of
+/// `old`, the thread's, locked when `owner`, the new one's user namespace,
+/// is not the one that owns `old` (`lock_mnt_tree`).
+pub(crate) fn copy_mounts(
+    new: &Namespace,
+    old: &Namespace,
+    owner: &Namespace,
+    files: &crate::files::Files,
+) -> Arc<paludarium_vfs::MountTable> {
+    let locked = !std::ptr::eq(old.owner(), owner);
+    let table = mount_table(old, files).copy(locked);
+    let _ = new.mounts.set(Arc::clone(&table));
+    table
+}
+
 /// The host and domain names of a UTS namespace, as `sethostname` and
 /// `setdomainname` set them: at most [`NAME_LENGTH`] bytes each.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +177,9 @@ pub(crate) struct Namespace {
     pids: Pids,
     /// A nested network namespace's sockets.
     pub sockets: Sockets,
+    /// A mount namespace's mounts; the first one has none here, and its
+    /// mounts are the files' first table ([`mount_table`]).
+    pub mounts: OnceLock<Arc<paludarium_vfs::MountTable>>,
     /// What a user namespace holds ([`crate::users`]).
     pub users: crate::users::Users,
     /// The user namespace that owns it, whose capabilities act on it
@@ -196,6 +224,7 @@ impl Namespace {
             mq: crate::mqueue::Queues::default(),
             pids,
             sockets: Sockets::default(),
+            mounts: OnceLock::new(),
             users: crate::users::Users::default(),
             owner,
         })
@@ -219,6 +248,7 @@ impl Namespace {
             mq: crate::mqueue::Queues::default(),
             pids: Pids::default(),
             sockets: Sockets::default(),
+            mounts: OnceLock::new(),
             owner: users.parent().cloned(),
             users,
         })

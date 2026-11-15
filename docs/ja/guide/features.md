@@ -2181,24 +2181,30 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `AT_SYMLINK_NOFOLLOW` の `fstatat` や `statx` はリンクを返し、`stat` と末尾の `/` は
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
-  名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、`fd`、`fdinfo`、`ns`、
-  `task` があります。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
+  `limits`、`comm`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、
+  `fd`、`fdinfo`、`ns`、`task` があります。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を
   同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。メモリの項目は
   ロックしたメモリ（`VmLck`）だけで、何も測っていないほかのメモリの項目と CPU の
-  項目はありません。自分のディレクトリと `/proc` の下の
+  項目はありません。`statm` は、Linux の `task_statm` が数えるものをページ単位で示します。
+  マップの大きさ、常駐しているページ、そのうちファイルか共有メモリのもの、コード（`stat`
+  と同じく 0）、0、書き込めるプライベートなマップとスタック、0 です。`limits` は、
+  `prlimit` が返すソフトとハードのリソース制限を Linux と同じ列で並べます。`auxv`（0400）は、
+  プログラムの `execve` がスタックに書いた補助ベクトルです。Linux の `saved_auxv` と同じく、
+  プログラムがそのあとスタックに何をしても、`fork` しても残ります。自分のディレクトリと `/proc` の下の
   それ以外のパスは、ふつうのパスと同じようにファイルシステムで探します。
   そのため `--mount /:/` では、ホストの `/proc` に届きます。
 - `/proc` は、ファイルシステムがそこに持つプロセス以外のもの（`--mount /:/` では、
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
-  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`maps`、`smaps`、`exe`、`cwd`、
-  `root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、`ns`（0511）、`task` があり、
+  `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`comm`、
+  `maps`、`smaps`、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、`ns`（0511）、
+  `task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
@@ -2208,12 +2214,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`maps`、`smaps`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
   同じです。ダンプできないプロセスの
-  ディレクトリの持ち主は root です。`fd` そのものを読むことと中を探すことは、Linux の
+  ディレクトリの持ち主は root です。`statm` と `limits` は、Linux と同じく誰でも読めます。
+  `fd` そのものを読むことと中を探すことは、Linux の
   `proc_fd_permission` と同じくそのモード（0500）が許す読み手だけができます。`fd` と
   `fdinfo` は、このプロセス自身のもの（後述）と同じものを、ほかのプロセスのディスクリプタに
   ついて示します。`fd` のリンクを開くと、そのディスクリプタのファイルを開き直します。
@@ -2223,12 +2230,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルのマウントと、そのプロセスが持つレコードロックを示します。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
   ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
-  シグナルの扱い、メモリ（`cmdline`、`environ`、`maps`、`smaps`、`stat` の大きさ）、カレントディレクトリ、
+  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
   コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
-  持ちません。Linux と同じく、`cmdline`、`environ`、`maps`、`smaps` は空、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` です。
+  持ちません。Linux と同じく、`cmdline`、`environ`、`auxv`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。
+  Linux の `proc_mem_open` はメモリが残るプロセスだけを確かめるので、ゾンビの `auxv` は
+  どの読み手も開けます。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、

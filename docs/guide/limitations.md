@@ -81,13 +81,13 @@ verified.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
-  the reader's own directory (`auxv`, `limits`, ...) are looked up like any
+  the reader's own directory (`io`, `personality`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `statm` and
-  the rest. A path that goes on through a link of another process's `fd`
+  process's directory they are `ENOENT`, where Linux shows root `io`, `wchan`
+  and the rest. A path that goes on through a link of another process's `fd`
   (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
   directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
-  time and the code range are 0, so `ps` shows no `RSS`, and its `STIME` and
+  time and the code range are 0, as is the code in `statm`, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
   another process's state is taken from where its thread is (in a system

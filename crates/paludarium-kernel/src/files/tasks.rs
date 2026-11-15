@@ -124,13 +124,13 @@ impl Task {
             },
         )
     }
-    /// Its files' owner: the task's effective IDs, as Linux's
-    /// `task_dump_owner` gives a dumpable task's, and root an undumpable
-    /// one's.
     /// The user namespace of the task's credentials.
     pub(super) fn user(&self) -> std::sync::Arc<crate::namespaces::Namespace> {
         std::sync::Arc::clone(&self.public.credentials.user.0)
     }
+    /// Its files' owner: the task's effective IDs, as Linux's
+    /// `task_dump_owner` gives a dumpable task's, and root an undumpable
+    /// one's.
     fn owned(&self, stat: FileStat) -> FileStat {
         let ids = &self.public.credentials;
         let (uid, gid) = if self.view.dumpable {
@@ -154,14 +154,19 @@ impl Task {
     }
 }
 
-/// Refuses what the reader may not see of the task: `environ`, `maps`,
-/// `smaps`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
+/// Refuses what the reader may not see of the task: `environ`, `auxv`,
+/// `maps`, `smaps`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
 /// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
 /// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself,
-/// read or looked in, as its mode lets (`proc_fd_permission`).
+/// read or looked in, as its mode lets (`proc_fd_permission`). `auxv` of a
+/// task with no memory left opens for anyone, as `proc_mem_open` checks
+/// only a task that has its memory.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
+        TaskEntry::Auxv if task.memory().is_some() && !task.may_access(c, false) => {
+            Err(Errno::EACCES)
+        }
         TaskEntry::Descriptors => descriptors_permission(c, task, crate::permissions::MAY_READ),
         TaskEntry::Descriptor(_) => {
             descriptors_permission(c, task, crate::permissions::MAY_EXEC)?;
@@ -219,8 +224,8 @@ pub(super) fn descriptors(task: &Task) -> Vec<(u32, super::Descriptor)> {
     }
 }
 
-/// The contents of `status`, `stat`, `cmdline` or `comm`; `None` for any
-/// other entry.
+/// The contents of `status`, `stat`, `statm`, `limits`, `auxv`, `cmdline`
+/// or `comm`, and the others made when opened; `None` for any other entry.
 pub(super) fn content(
     task: &Task,
     entry: TaskEntry,
@@ -230,6 +235,12 @@ pub(super) fn content(
     let (ignored, caught) = task.handled();
     Some(match entry {
         TaskEntry::Comm => crate::proc::render_comm(&public.name),
+        TaskEntry::Statm => crate::proc::render_statm(task.memory()),
+        TaskEntry::Limits => crate::proc::render_limits(&task.view.limits),
+        // What its exec saved, as Linux's `auxv_read`; nothing once its
+        // memory is gone.
+        TaskEntry::Auxv if task.memory().is_some() => task.view.group.auxv(),
+        TaskEntry::Auxv => Vec::new(),
         TaskEntry::IdMap(ids) => public.credentials.user.map_text(ids, reader),
         TaskEntry::Setgroups => public.credentials.user.setgroups_text().to_vec(),
         // Nothing once it has ended, whose open is `EINVAL` ([`mounts`]).
@@ -465,7 +476,7 @@ pub(super) fn stat(
                 ..crate::proc::stat(length)
             }
         }
-        TaskEntry::Environ => crate::proc::private_stat(
+        TaskEntry::Environ | TaskEntry::Auxv => crate::proc::private_stat(
             content(task, entry, &c.process.credentials.user).map_or(0, |content| content.len()),
         ),
         _ => crate::proc::stat(

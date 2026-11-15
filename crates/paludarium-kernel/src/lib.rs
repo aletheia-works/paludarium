@@ -490,7 +490,7 @@ impl Kernel {
     pub fn spawn_initial(&self, image: &LoadedImage) -> Thread {
         self.group
             .register(self.process.pid, Arc::clone(&self.inbox));
-        self.group.set_start_stack(image.initial_stack_pointer.0);
+        self.group.set_program(image);
         Thread {
             tid: self.process.pid,
             cpu: CpuState::new(image.entry_point, image.initial_stack_pointer),

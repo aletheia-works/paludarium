@@ -48,8 +48,8 @@ verified.
   those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `uw` or `ui` (`userfaultfd`'s write-protect and minor modes, which are
-  not offered), and no `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
+  `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
+  `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
@@ -530,18 +530,23 @@ verified.
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
-- **userfaultfd, in part**: only missing pages are registered. The
-  write-protect and minor modes are refused (`EINVAL`), and
-  `UFFDIO_WRITEPROTECT`, `UFFDIO_CONTINUE`, `UFFDIO_MOVE` and
-  `UFFDIO_POISON` are not offered (`EINVAL`), nor the events of `fork`,
-  `mremap`, `madvise` and `munmap` or the write-protect features, which
+- **userfaultfd, in part**: missing pages and the write protection of
+  private anonymous memory are registered. The minor mode is refused
+  (`EINVAL`), as is the write-protect mode for shared memory, which Linux
+  takes, and `UFFDIO_CONTINUE`, `UFFDIO_MOVE` and `UFFDIO_POISON` are not
+  offered (`EINVAL`), nor the events of `fork`, `mremap`, `madvise` and
+  `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
+  `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
   `UFFDIO_API` does not report and refuses (`EINVAL`); the ioctls
-  `UFFDIO_REGISTER` and `fdinfo` report leave them out too. Shared memory
+  `UFFDIO_REGISTER` and `fdinfo` report leave them out too. A
+  registration that replaces the write-protect mode with others ends the
+  protection of the range's pages, whose marks Linux leaves in their PTEs.
+  Shared memory
   of a file (a memfd, a tmpfs file, System V shared memory) cannot be
   registered (`EINVAL`), where Linux takes any shmem. A system call's own
-  copy to or from a missing page of a registered range is `EFAULT`, as with
-  `UFFD_USER_MODE_ONLY`, where Linux waits for the page as for an
-  instruction. There is no `/dev/userfaultfd` and no
+  copy to or from a missing page of a registered range, or to a
+  write-protected one, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
+  Linux waits for the page as for an instruction. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: permission events (`FAN_OPEN_PERM`,
   `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM`) are taken by `fanotify_mark` but

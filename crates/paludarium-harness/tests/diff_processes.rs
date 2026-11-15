@@ -191,6 +191,7 @@ mod linux {
                     | "userfaultfd-signals"
                     | "userfaultfd-sigbus"
                     | "userfaultfd-shared"
+                    | "userfaultfd-wp"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -477,6 +478,7 @@ mod linux {
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
         userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
+        userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

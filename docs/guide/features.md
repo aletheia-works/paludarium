@@ -933,31 +933,50 @@ kernel.
   space it was made in, whoever holds it. `UFFDIO_API` takes the version
   and the features once (`EINVAL` again), writing back the features it
   offers and its ioctls, or zeros when it fails; it offers
-  `UFFD_FEATURE_SIGBUS`, `UFFD_FEATURE_THREAD_ID`,
+  `UFFD_FEATURE_PAGEFAULT_FLAG_WP`, `UFFD_FEATURE_SIGBUS`,
+  `UFFD_FEATURE_THREAD_ID`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM` and
   `UFFD_FEATURE_MISSING_HUGETLBFS`, and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory and shared anonymous memory for missing pages
-  (`UFFDIO_REGISTER_MODE_MISSING`), with Linux's checks in its order (the
+  (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
+  protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
+  to the ioctls it reports), with Linux's checks in its order (the
   range, then each VMA: `EINVAL` for one that cannot be registered,
-  `EBUSY` for one another `userfaultfd` has), making VMAs of their own, as
-  `/proc/<pid>/maps` shows them, with `um` in `smaps`; a `fork`ed child and a
-  mapping `mremap` moves do not keep it, and `UFFDIO_UNREGISTER` and closing
-  the file take it away. An instruction that touches a registered page
-  that has none (in shared memory, one no mapping of it has) waits, and the
-  file reads the fault as a `uffd_msg`, the oldest first: whether it was a
-  write, the page's address (the exact one with
-  `UFFD_FEATURE_EXACT_ADDRESS`) and, with `UFFD_FEATURE_THREAD_ID`, the
-  thread's ID. The wait ends when `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` fills
-  the page (unless `DONTWAKE`), `UFFDIO_WAKE` or `UFFDIO_UNREGISTER` takes
-  its range, or the file is closed, and a signal ends it too; then the
-  instruction runs again, as Linux retries the fault. With
-  `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`) instead.
+  `EBUSY` for one another `userfaultfd` has); the modes replace a VMA's
+  own unless it has them already. The ranges make VMAs of their own, as
+  `/proc/<pid>/maps` shows them, with `um` and `uw` in `smaps`; a `fork`ed
+  child and a mapping `mremap` moves do not keep it, and
+  `UFFDIO_UNREGISTER` and closing the file take it away. An instruction
+  that touches a page registered for missing pages that has none (in
+  shared memory, one no mapping of it has), or that writes to a
+  write-protected page of a range registered for write protection, waits,
+  and the file reads the fault as a `uffd_msg`, the oldest first: whether
+  it was a write, `UFFD_PAGEFAULT_FLAG_WP` for a protected page, the page's
+  address (the exact one with `UFFD_FEATURE_EXACT_ADDRESS`) and, with
+  `UFFD_FEATURE_THREAD_ID`, the thread's ID. The wait ends when
+  `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` fills the page or
+  `UFFDIO_WRITEPROTECT` ends its protection (unless `DONTWAKE`),
+  `UFFDIO_WAKE` takes its range, `UFFDIO_UNREGISTER` takes it from a range
+  registered for missing pages, or the file is closed, and a signal ends
+  it too; then the instruction runs again, as Linux retries the fault.
+  With `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`)
+  instead. `UFFDIO_WRITEPROTECT` protects the pages of its range, or ends
+  their protection, VMA by VMA as `mwriteprotect_range` does: each must be
+  registered for write protection (`ENOENT`, once the ones before it
+  changed), and protecting does not take `DONTWAKE` (`EINVAL`). A page
+  with no entry, which Linux has no present PTE for, is not protected; one
+  only read is Linux's zero page, and is. `mprotect` keeps the protection,
+  and refuses a write it does not permit with SIGSEGV as before; a
+  `fork`ed child, a move by `mremap`, `UFFDIO_UNREGISTER`, closing the
+  file and a registration that replaces the write-protect mode take it
+  away.
   `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
   does: `ENOENT` for a range that does not lie in one registered VMA,
   `EEXIST` for a page that has one, `EFAULT` for a source that cannot be
   read, and `EAGAIN` once one stops short, with what was filled in the
-  struct's last field. A read takes whole messages (`EINVAL` for a buffer
+  struct's last field; `UFFDIO_COPY_MODE_WP` fills write-protected pages,
+  in a range registered for write protection (`EINVAL`). A read takes whole messages (`EINVAL` for a buffer
   too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
   `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
   Linux's does, else `POLLIN` while a fault is not read yet.
@@ -2511,7 +2530,7 @@ kernel.
   `ms`, without `mw` for a file open only for reading or sealed against
   writes, and without `me` for the rings of AIO and `io_uring` and secret
   memory, whose pseudo file systems run nothing), `sh`, `gd` for the initial
-  stack, `um` for a range a `userfaultfd` registered, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
+  stack, `um` and `uw` for a range a `userfaultfd` registered, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
   `dc`, `wf`, `dd`, `hg`, `nh`, `mg`), `de`, `mm` and `dd` of the rings and
   secret memory, the charge (`ac`, which private memory that was writable
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never

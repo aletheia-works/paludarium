@@ -321,6 +321,7 @@ NAMES = {
     320: "kexec_file_load",
     321: "bpf",
     322: "execveat",
+    323: "userfaultfd",
     324: "membarrier",
     325: "mlock2",
     326: "copy_file_range",

@@ -133,8 +133,9 @@ mod linux {
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
-            // marks need CAP_SYS_ADMIN, the bpf cases, whose maps need CAP_BPF,
-            // the keys cases, which set up keyrings as root
+            // marks need CAP_SYS_ADMIN, the userfaultfd cases, whose files take
+            // the kernel's faults too (CAP_SYS_PTRACE), the bpf cases, whose
+            // maps need CAP_BPF, the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
             // limits and become an unprivileged user, the scheduling-set case, which sets
@@ -186,6 +187,11 @@ mod linux {
                     | "fanotify-fid"
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
+                    | "userfaultfd-calls"
+                    | "userfaultfd-faults"
+                    | "userfaultfd-signals"
+                    | "userfaultfd-sigbus"
+                    | "userfaultfd-shared"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -473,6 +479,11 @@ mod linux {
         fanotify_fid => ("fanotify-fid","fanotify"),
         fanotify_pidfd => ("fanotify-pidfd","fanotify"),
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
+        userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
+        userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
+        userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
+        userfaultfd_sigbus => ("userfaultfd-sigbus","userfaultfd"),
+        userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use paludarium_cpu::compile::{Address, Alu, Fast, Form, Source};
+use paludarium_cpu::compile::{Address, Alu, Fast, Form, Shift, Source};
 use paludarium_cpu::flag;
 use paludarium_decoder::{Condition, Register, Segment};
 
@@ -162,6 +162,15 @@ impl Emitter<'_, '_> {
             }
         };
         self.set_gpr(index, value);
+    }
+
+    /// `v` masked to `size` bytes.
+    fn masked(&mut self, v: Value, size: u8) -> Value {
+        if size == 8 {
+            v
+        } else {
+            self.b.ins().band_imm_s(v, mask(size))
+        }
     }
 
     fn source(&mut self, src: Source, size: u8) -> Value {
@@ -325,10 +334,132 @@ impl Emitter<'_, '_> {
     }
 
     fn set_status(&mut self, f: Value) {
+        self.set_flags(flag::STATUS, f);
+    }
+
+    /// Sets the flags of `update` to `f`, which has no others.
+    fn set_flags(&mut self, update: u64, f: Value) {
         let old = self.word(RFLAGS);
-        let kept = self.b.ins().band_imm_s(old, !(flag::STATUS as i64));
+        let kept = self.b.ins().band_imm_s(old, !(update as i64));
         let new = self.b.ins().bor(kept, f);
         self.set_word(RFLAGS, new);
+    }
+
+    /// Bit `n` of `v` as 0 or 1.
+    fn bit_of(&mut self, v: Value, n: u32) -> Value {
+        let down = if n == 0 {
+            v
+        } else {
+            self.b.ins().ushr_imm_s(v, i64::from(n))
+        };
+        self.b.ins().band_imm_s(down, 1)
+    }
+
+    /// The result of `op` on `a` (masked to `size`) by `count` (already
+    /// masked, not 0), the flags it changes and their values, as
+    /// `Shift::apply` has them.
+    fn shift(&mut self, op: Shift, a: Value, count: u8, size: u8) -> (Value, u64, Value) {
+        let width = u32::from(size) * 8;
+        let c = u32::from(count);
+        let cf_bit = flag::CF.trailing_zeros();
+        let of_bit = flag::OF.trailing_zeros();
+        let (r, cf, of) = match op {
+            Shift::Shl => {
+                let r = if c >= width {
+                    self.constant(0)
+                } else {
+                    let r = self.b.ins().ishl_imm_s(a, i64::from(c));
+                    self.masked(r, size)
+                };
+                let cf = if c <= width {
+                    self.bit_of(a, width - c)
+                } else {
+                    self.constant(0)
+                };
+                let top = self.bit_of(r, width - 1);
+                let of = self.b.ins().bxor(top, cf);
+                (r, cf, Some(of))
+            }
+            Shift::Shr => {
+                let r = if c >= width {
+                    self.constant(0)
+                } else {
+                    self.b.ins().ushr_imm_s(a, i64::from(c))
+                };
+                let cf = if c <= width {
+                    self.bit_of(a, c - 1)
+                } else {
+                    self.constant(0)
+                };
+                let of = self.bit_of(a, width - 1);
+                (r, cf, Some(of))
+            }
+            Shift::Sar => {
+                let up = 64 - width;
+                let signed = if up == 0 {
+                    a
+                } else {
+                    let high = self.b.ins().ishl_imm_s(a, i64::from(up));
+                    self.b.ins().sshr_imm_s(high, i64::from(up))
+                };
+                let shifted = self.b.ins().sshr_imm_s(signed, i64::from(c.min(63)));
+                let r = self.masked(shifted, size);
+                let out = self.b.ins().sshr_imm_s(signed, i64::from((c - 1).min(63)));
+                let cf = self.b.ins().band_imm_s(out, 1);
+                (r, cf, None)
+            }
+            Shift::Rol | Shift::Ror => {
+                let left = op == Shift::Rol;
+                let turn = c % width;
+                let r = if turn == 0 {
+                    a
+                } else if width == 64 {
+                    if left {
+                        self.b.ins().rotl_imm_s(a, i64::from(turn))
+                    } else {
+                        self.b.ins().rotr_imm_s(a, i64::from(turn))
+                    }
+                } else {
+                    let (l, rr) = if left {
+                        (turn, width - turn)
+                    } else {
+                        (width - turn, turn)
+                    };
+                    let high = self.b.ins().ishl_imm_s(a, i64::from(l));
+                    let low = self.b.ins().ushr_imm_s(a, i64::from(rr));
+                    let both = self.b.ins().bor(high, low);
+                    self.masked(both, size)
+                };
+                let cf = if left {
+                    self.bit_of(r, 0)
+                } else {
+                    self.bit_of(r, width - 1)
+                };
+                let of = if left {
+                    let top = self.bit_of(r, width - 1);
+                    self.b.ins().bxor(top, cf)
+                } else {
+                    let top = self.bit_of(r, width - 1);
+                    let next = self.bit_of(r, width - 2);
+                    self.b.ins().bxor(top, next)
+                };
+                let cf_flag = self.b.ins().ishl_imm_s(cf, i64::from(cf_bit));
+                if count == 1 {
+                    let of_flag = self.b.ins().ishl_imm_s(of, i64::from(of_bit));
+                    let f = self.b.ins().bor(cf_flag, of_flag);
+                    return (r, flag::CF | flag::OF, f);
+                }
+                return (r, flag::CF, cf_flag);
+            }
+        };
+        let mut f = self.zf_sf_pf(r, size);
+        let cf_flag = self.b.ins().ishl_imm_s(cf, i64::from(cf_bit));
+        f = self.b.ins().bor(f, cf_flag);
+        if let Some(of) = of {
+            let of_flag = self.b.ins().ishl_imm_s(of, i64::from(of_bit));
+            f = self.b.ins().bor(f, of_flag);
+        }
+        (r, flag::STATUS, f)
     }
 
     /// Whether `condition` holds for the current flags, as `alu::condition`.
@@ -470,6 +601,16 @@ impl Emitter<'_, '_> {
                     self.write(dst, r);
                 }
                 self.set_status(f);
+            }
+            Fast::Shift { op, dst, count } => {
+                let a = self.read(dst);
+                if count == 0 {
+                    self.write(dst, a);
+                } else {
+                    let (r, update, f) = self.shift(op, a, count, dst.size());
+                    self.write(dst, r);
+                    self.set_flags(update, f);
+                }
             }
             Fast::Compare { op, mem, src } => {
                 let size = mem.size;

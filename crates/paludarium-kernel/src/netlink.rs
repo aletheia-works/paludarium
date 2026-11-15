@@ -4346,6 +4346,7 @@ fn neighbour_dump(
     strict: bool,
     now: u64,
 ) -> Result<Vec<Vec<u8>>, Errno> {
+    // `ndm_flags == NTF_PROXY`, as Linux tests it: not the bit alone.
     let proxy = payload.len() >= 12 && payload[10] == NTF_PROXY;
     let (device, master) = match neighbour_filter(payload, strict) {
         Ok(filter) => filter,
@@ -5068,6 +5069,12 @@ mod tests {
         assert_eq!(dump(&ndmsg(AF_INET6, 0, 0), true).map(|m| m.len()), Ok(2));
         assert_eq!(dump(&ndmsg(17, 0, 0), true), Ok(Vec::new()));
         assert_eq!(dump(&ndmsg(0, 0, NTF_PROXY), true), Ok(Vec::new()));
+        // Only flags of `NTF_PROXY` alone ask for the proxy entries:
+        // unchecked, another flag with it is an ordinary dump.
+        assert_eq!(
+            dump(&ndmsg(0, 0, NTF_PROXY | 0x10), false),
+            Ok(everything.clone())
+        );
         // The filters: lo, another device, no master, and a master.
         let device = |index: u32| with(ndmsg(AF_INET, 0, 0), NDA_IFINDEX, &index.to_le_bytes());
         assert_eq!(dump(&device(1), true), Ok(vec![(filtered, any4, 0)]));

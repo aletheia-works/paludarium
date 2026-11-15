@@ -830,7 +830,8 @@ impl Kernel {
     }
 
     /// Linux's `ptrace_report_syscall` for a signal the tracer resumed a
-    /// syscall stop with: `send_sig` with `SEND_SIG_PRIV`, to the process.
+    /// syscall stop with: `send_sig` with `SEND_SIG_PRIV`, which Linux sends
+    /// to the process; the thread that stopped takes it here.
     fn syscall_signal(thread: &mut Thread, signal: Option<i32>) {
         if let Some(signal) = signal.filter(|&s| s != 0) {
             signals::queue(
@@ -997,7 +998,17 @@ impl Kernel {
         kill: &AtomicBool,
     ) -> Result<(), Errno> {
         thread.state.ptrace.hold = false;
-        let cloned = thread.state.ptrace.clone.take().filter(|_| started);
+        let cloned = thread.state.ptrace.clone.take();
+        // A task that never ran is not traced either.
+        if !started {
+            if let Some(Cloned {
+                child: Some(child), ..
+            }) = cloned
+            {
+                self.processes.traces.lock().remove(&child);
+            }
+            return self.wait_vfork(kill);
+        }
         let tid = thread.tid;
         let number = |kernel: &Self, child: u32| {
             kernel

@@ -13750,6 +13750,65 @@ static int msg_case(void) {
     errno = 0;
     long removed = syscall(SYS_msgctl, id, 2, ds);
     printf("stat-removed=%ld errno=%d\n", removed, errno);
+    /* Waiting senders, as another user that may write only by the mode: a
+       change wakes only those whose messages then fit, which look at the
+       permission again, so one whose message does not fit sleeps through
+       the write permission's loss. */
+    if (geteuid() == 0) {
+        int full = (int)syscall(SYS_msgget, IPC_PRIVATE, 0622);
+        if (full < 0) return 16;
+        syscall(SYS_msgctl, full, 2, ds);
+        qbytes = 4;
+        memcpy(ds + 88, &qbytes, 8);
+        syscall(SYS_msgctl, full, 1, ds);
+        long filled = msgx_send(full, 1, "abcd", 0);
+        pid_t senders[2];
+        const char *sent[] = {"xy", "xyz"};
+        for (int i = 0; i < 2; i++) {
+            fflush(stdout);
+            senders[i] = child();
+            if (senders[i] == 0) {
+                alarm(10);
+                if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534))
+                    _exit(93);
+                if (write(ready[1], "x", 1) != 1) _exit(94);
+                /* Its result is its exit status (the errno), so that it
+                   prints nothing as it wakes. */
+                _exit((int)-msgx_send(full, 1, sent[i], 0));
+            }
+            if (read(ready[0], &byte, 1) != 1) return 17;
+            usleep(100000);
+            unsigned mode;
+            if (i == 0) {
+                /* No room: no wake, through the loss and the return of the
+                   write permission, until a receive makes room. */
+                mode = 0600;
+                memcpy(ds + 20, &mode, 4);
+                long lost = syscall(SYS_msgctl, full, 1, ds);
+                usleep(100000);
+                mode = 0622;
+                memcpy(ds + 20, &mode, 4);
+                long back = syscall(SYS_msgctl, full, 1, ds);
+                usleep(100000);
+                printf("senders lost=%ld back=%ld", lost, back);
+                msgx_show("room", full, 64, 0, 0);
+                printf("\n");
+            } else {
+                /* Room with the permission gone: the wake finds it gone. */
+                mode = 0600;
+                memcpy(ds + 20, &mode, 4);
+                qbytes = 8;
+                memcpy(ds + 88, &qbytes, 8);
+                long grown = syscall(SYS_msgctl, full, 1, ds);
+                printf("senders grown=%ld\n", grown);
+            }
+            fflush(stdout);
+            result(i ? "sender1" : "sender0", reaped(senders[i]));
+        }
+        msgx_status("senders-after", full, senders[0], getpid());
+        printf("senders filled=%ld\n", filled);
+        syscall(SYS_msgctl, full, IPC_RMID, NULL);
+    }
     /* The namespace's limits and what is in use in it. */
     int info[8] = {0};
     long max = syscall(SYS_msgctl, 0, 3 /* IPC_INFO */, info);

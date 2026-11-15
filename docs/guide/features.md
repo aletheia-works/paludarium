@@ -1050,8 +1050,11 @@ kernel.
   `ipc/msg.c`) and its default limits (`MSGMAX` 8192, `MSGMNB` 16384,
   `MSGMNI` 32000). A queue holds as many bytes as its `msg_qbytes`, and as
   many messages; a send to a full one waits, unless `IPC_NOWAIT`
-  (`EAGAIN`), until a receive or `IPC_SET` makes room, the queue is
-  removed (`EIDRM`) or a signal comes. `msgrcv` takes the first message, the
+  (`EAGAIN`), in the queue's list of senders until a receive or `IPC_SET`
+  makes room for its message, the queue is removed (`EIDRM`) or a signal
+  comes. As Linux's `ss_wakeup`, a change wakes only the senders whose
+  messages then fit, which check the permission again, and moves the
+  others behind them in their order. `msgrcv` takes the first message, the
   first of a type, the first of another type (`MSG_EXCEPT`) or the lowest
   type up to a bound (a negative `msgtyp`); one longer than the buffer is
   `E2BIG`, unless `MSG_NOERROR` cuts it, and `MSG_COPY` with `IPC_NOWAIT`

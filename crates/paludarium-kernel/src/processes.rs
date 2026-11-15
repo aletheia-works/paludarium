@@ -4614,6 +4614,9 @@ impl Kernel {
             // exec keeps the seccomp mode and filters.
             seccomp: std::mem::take(&mut thread.state.seccomp),
             seccomp_sync: thread.state.seccomp_sync,
+            // And the task's ptrace state: the call it is in, its ID before,
+            // the syscall-exit stop to come.
+            ptrace: std::mem::take(&mut thread.state.ptrace),
             ..ThreadState::default()
         };
         thread.state.name_after(&path);

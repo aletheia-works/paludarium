@@ -760,11 +760,11 @@ verified.
   table, which a random key sets; their cache information counts from
   when each was made.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
-  ID goes when its namespace does, with no `RTM_DELNSID` to tell of it;
-  an ID is given only by `RTM_NEWNSID`, as no device of another
-  namespace makes Linux's `peernet2id_alloc` give one; a request sent by
-  `write` rather than `send` names no process or descriptor (`ESRCH`,
-  `EBADF`), as no caller is known there; and `IFLA_TARGET_NETNSID` and
+  ID is given only by `RTM_NEWNSID`, as no device of another namespace
+  makes Linux's `peernet2id_alloc` give one; the `RTM_DELNSID` of a
+  namespace that goes is sent as its last holder lets it go, where
+  Linux sends it a little later, from a work queue; and
+  `IFLA_TARGET_NETNSID` and
   `IFA_TARGET_NETNSID` are `EINVAL` even for an ID a namespace has, as
   no other namespace's links or addresses are dumped. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries

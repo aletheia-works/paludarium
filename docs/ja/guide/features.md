@@ -1588,7 +1588,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ID `NETNSA_NSID` を、負の値なら空いている一番小さい ID を与えます。どちらもなければ
     `EINVAL`、すでに ID がある名前空間や使われている ID は `EEXIST` で、それぞれ Linux の
     拡張 ACK のメッセージを付けます。`RTNLGRP_NSID` のメンバーは新しい ID を知らされます
-    （`NLM_F_ECHO` なら、そのうちリクエストした側だけが受け取ります）。`RTM_GETNSID` は、
+    （`NLM_F_ECHO` なら、そのうちリクエストした側だけが受け取ります）。名前空間が
+    なくなって ID が消えるときも、`unhash_nsid` と同じく `RTM_DELNSID` で知らされます。
+    なくなるのは、それを持つプロセス、記述子、ソケットがなくなったときで、その ID は
+    また空きます。リクエストが指すプロセスや記述子は、`send` でも `write` でも送り手から
+    見たもので、`CAP_NET_ADMIN` は開いた側だけでなく書いた側にも要ります。`RTM_GETNSID` は、
     プロセス、記述子、ID で指した名前空間の ID（なければ -1、だれも持たない ID は
     `ENOENT`）を返し、`NETNSA_TARGET_NSID` を付けるとその名前空間が与えた ID を、
     こちらの ID を `NETNSA_CURRENT_NSID` に添えて返します（その名前空間がなければ

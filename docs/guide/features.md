@@ -1820,7 +1820,12 @@ kernel.
     lowest free; one without either is `EINVAL`, and a namespace that has
     an ID, or an ID taken, `EEXIST`, each with Linux's extended-ack
     message. The members of `RTNLGRP_NSID` hear of each new ID
-    (`NLM_F_ECHO` sends it to the requester alone of them). `RTM_GETNSID`
+    (`NLM_F_ECHO` sends it to the requester alone of them), and with
+    `RTM_DELNSID` of each that goes with its namespace, once no process,
+    descriptor or socket holds that, as `unhash_nsid` tells it; the ID is
+    free again then. A request names a process or descriptor as its
+    sender sees them, whether sent by `send` or by `write`, and
+    `CAP_NET_ADMIN` is the writer's as well as the opener's. `RTM_GETNSID`
     answers with the ID of a namespace named by process, descriptor or ID
     (`ENOENT` for an ID none has), -1 for none, and with
     `NETNSA_TARGET_NSID` with the ID that namespace gives it and this

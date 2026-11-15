@@ -5102,6 +5102,8 @@ fn write_io_with(
     nosignal: bool,
     dontwait: bool,
 ) -> Result<u64, Errno> {
+    // A netlink request names peers as the writer sees them.
+    let _resolved = crate::netlink::resolving(c, file, bytes);
     // A pseudo-terminal writes all, unless it does not block.
     if let Some(result) = crate::pty::write(c, file, bytes) {
         return result;

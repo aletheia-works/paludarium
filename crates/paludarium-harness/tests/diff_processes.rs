@@ -124,14 +124,15 @@ mod linux {
             let args = [mode.to_owned(), self_path.clone()];
             // The credentials, permissions, setuid, signal-permissions,
             // limit-permissions, peer-credentials, core-credentials,
-            // set-id-writes, socket-owners, capabilities and script-exec cases
+            // set-id-writes, socket-owners, capabilities, file-capabilities and script-exec cases
             // change IDs as root, pty-vhangup needs root's capabilities and
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
             // addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-* and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
-            // its own, for its counts), the mqueue cases, which make IPC and
+            // its own, for its counts), the keys cases, which set up keyrings as root
+            // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
             // limits and become an unprivileged user, the scheduling-set case, which sets
             // real-time and deadline policies, the admin case, which makes a
@@ -150,6 +151,7 @@ mod linux {
                     | "set-id-writes"
                     | "socket-owners"
                     | "capabilities"
+                    | "file-capabilities"
                     | "script-exec"
                     | "proc-maps"
                     | "dynamic-exec"
@@ -174,6 +176,11 @@ mod linux {
                     | "mqueue-room"
                     | "mqueue-congested"
                     | "mqueue-links"
+                    | "keys-calls"
+                    | "keys-keyrings"
+                    | "keys-threads"
+                    | "keys-parent"
+                    | "keys-permissions"
                     | "netlink"
                     | "unix-interfaces"
                     | "addresses"
@@ -457,6 +464,11 @@ mod linux {
         mqueue_room => ("mqueue-room","mqueue"),
         mqueue_congested => ("mqueue-congested","mqueue"),
         mqueue_links => ("mqueue-links","mqueue"),
+        keys_calls => ("keys-calls","keys"),
+        keys_keyrings => ("keys-keyrings","keys"),
+        keys_threads => ("keys-threads","keys"),
+        keys_parent => ("keys-parent","keys"),
+        keys_permissions => ("keys-permissions","keys"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),
@@ -498,6 +510,7 @@ mod linux {
         processes_dynamic_exec => ("dynamic-exec","process"),
         processes_script_exec => ("script-exec","process"),
         processes_capabilities => ("capabilities","process"),
+        processes_file_capabilities => ("file-capabilities","process"),
         processes_set_id_writes => ("set-id-writes","process"),
         processes_socket_owners => ("socket-owners","process"),
         processes_peer_credentials => ("peer-credentials","process"),

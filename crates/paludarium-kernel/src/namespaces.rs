@@ -64,14 +64,7 @@ pub(crate) fn user_for(
         return Ok(creds.clone());
     }
     let user = Namespace::new_user(&creds.user.0, namespaces.next_inode(), creds, msgqueue)?;
-    Ok(crate::credentials::Credentials {
-        user: crate::users::UserNs(user),
-        permitted: crate::credentials::ALL_CAPABILITIES,
-        effective: crate::credentials::ALL_CAPABILITIES,
-        inheritable: 0,
-        keep_caps: false,
-        ..creds.clone()
-    })
+    Ok(creds.in_user_namespace(crate::users::UserNs(user)))
 }
 /// `__NEW_UTS_LEN`: the longest host or domain name.
 pub(crate) const NAME_LENGTH: usize = 64;

@@ -1969,6 +1969,63 @@ mod exec {
         assert_eq!(m.read_u64(GuestAddr(DATA + 64)), Ok(8 << 20));
     }
     #[test]
+    fn exec_gives_a_program_its_file_capabilities_or_refuses_bad_ones() {
+        let (mut k, mut t, m) = exec_setup();
+        let set = |k: &Kernel, file: &[u8], value: Vec<u8>| {
+            k.files
+                .fs()
+                .with_xattrs(file, true, &mut |map| {
+                    map.insert(crate::permissions::CAPS.to_vec(), value.clone());
+                })
+                .unwrap();
+        };
+        // CAP_NET_BIND_SERVICE (10), effective, for a user who keeps
+        // CAP_CHOWN (0) inheritable, which the file may inherit too.
+        let mut v = 0x0200_0001u32.to_le_bytes().to_vec();
+        v.extend_from_slice(&(1u32 << 10).to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&[0; 8]);
+        set(&k, b"/child", v);
+        // PR_CAPBSET_DROP of CAP_SYS_ADMIN, which the thread's own `prctl`
+        // reads back.
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [24, 21, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 157, [23, 21, 0, 0, 0, 0]), 0);
+        t.state.credentials = t
+            .state
+            .credentials
+            .capset(
+                crate::credentials::ALL_CAPABILITIES,
+                crate::credentials::ALL_CAPABILITIES,
+                1,
+            )
+            .and_then(|c| c.setresuid(1000, 1000, 1000))
+            .unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]), 0);
+        let c = &t.state.credentials;
+        assert_eq!((c.permitted, c.effective), (1 << 10 | 1, 1 << 10 | 1));
+        assert_eq!(
+            c.bounding,
+            crate::credentials::ALL_CAPABILITIES & !(1 << 21)
+        );
+        // A value of no revision refuses the exec, which leaves the thread
+        // as it was, but only once the program is known to be one: a file
+        // that is not is ENOEXEC first.
+        set(&k, b"/child", vec![0; 4]);
+        set(&k, b"/bad", vec![0; 4]);
+        t.cpu.fs_base = 123;
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]),
+            (-22i64) as u64
+        );
+        assert_eq!(t.cpu.fs_base, 123);
+        assert_eq!(t.state.credentials.permitted, 1 << 10 | 1);
+        m.write(GuestAddr(DATA), b"/bad\0").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 59, [DATA, 0, 0, 0, 0, 0]),
+            (-8i64) as u64
+        );
+    }
+    #[test]
     fn failed_exec_preserves_state_and_fds() {
         let (mut k, mut t, m) = exec_setup();
         t.cpu.fs_base = 123;

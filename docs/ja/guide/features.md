@@ -50,6 +50,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | メモリ | `mmap`（anonymous と、プライベートまたは共有のファイル）、`munmap`、`mremap`、`mprotect`、`pkey_mprotect`／`pkey_alloc`／`pkey_free`、`mseal`、`madvise`、`process_madvise`、`process_mrelease`、`mincore`、`cachestat`、`mlock`／`mlock2`／`munlock`／`mlockall`／`munlockall`、`mbind`、`set_mempolicy`／`get_mempolicy`、`set_mempolicy_home_node`、`migrate_pages`、`move_pages`、`map_shadow_stack`、`msync`、`remap_file_pages`、`brk`、`arch_prctl`、`modify_ldt` |
 | System V IPC | `shmget`、`shmat`、`shmdt`、`shmctl`（共有メモリ）、`semget`、`semop`、`semtimedop`、`semctl`（セマフォー）、`msgget`、`msgsnd`、`msgrcv`、`msgctl`（メッセージキュー） |
 | POSIX メッセージキュー | `mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr` |
+| 鍵 | `add_key`、`request_key`、`keyctl` |
 | システムの情報 | `uname`、`sethostname`、`setdomainname`、`sysinfo`、`getrusage`、`times`、`acct`、`iopl`、`ioperm`、`syslog`、`sysfs` |
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
@@ -155,7 +156,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EINVAL`）。読むときは、読み手の名前空間がその root を 0 以外の ID にマップしていれば
   リビジョン 3、その名前空間かその上で root ならリビジョン 2 の値を返し、どちらでも
   なければ `EOVERFLOW` です。ファイルへの書き込みと切り詰め、ディレクトリ以外の
-  `chown` は、誰がしてもファイルケーパビリティを取り除きます。
+  `chown` は、誰がしてもファイルケーパビリティを取り除きます。`execve` は、実行する
+  プログラムにそれを与えます（下の資格情報を見てください）。
 - `setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`（Linux 6.13）は、
   ディレクトリのディスクリプタからファイルを探し、受け付けるフラグは
   `AT_SYMLINK_NOFOLLOW` と `AT_EMPTY_PATH` だけです（`EINVAL`）。`AT_EMPTY_PATH` では、
@@ -968,6 +970,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   パスをたどったあと（途中の各ディレクトリを検索でき、なければ `EACCES`）で `EXDEV`
   （`rename` は名前を引く前）、その中では `EPERM` です。ただし、名前をそれ自身へ `rename`
   すると何もせずに成功します。
+- 鍵の保管サービス（`add_key`、`request_key`、`keyctl`）は Linux の `security/keys`
+  と同じです。`keyring`、`user`、`logon` の鍵があり、それぞれに通し番号、所有者、グループ、
+  許可（所持者、ユーザー、グループ、その他）、期限があります。スレッドはスレッド、
+  プロセス、セッションのキーリングを持ちます（`fork` と `exec` はセッションのものを残し、
+  新しいスレッドは、作ったスレッドが持っていれば自分のスレッドのキーリングを持ちます。
+  スレッドのキーリングはファイルシステムの ID に従います）。ユーザーはユーザー名前空間に
+  `_uid.<uid>`、`_uid_ses.<uid>`、`_persistent.<uid>` のキーリングを持ちます。検索は
+  `search_nested_keyrings` と同じく入れ子のキーリングを 6 段までたどり、エラーの順
+  （`EKEYREVOKED`、`EKEYEXPIRED`、`EACCES`、否定の鍵のエラー）もそのとおりです。スレッドの
+  キーリングから見つかった鍵は所持しているものとします。ユーザーごとに Linux と同じ割り当て
+  （鍵 200 個と 20000 バイト。ルートは 100 万個と 25 MB）があり、キーリングのリンクも
+  そこに数えます。`keyctl` は、big key、Diffie-Hellman、非対称鍵、通知のないカーネルの
+  すべてのオプションを受け付けます。`GET_KEYRING_ID`、`JOIN_SESSION_KEYRING`（名前付きの
+  セッションも）、`UPDATE`、`REVOKE`、`CHOWN`、`SETPERM`、`DESCRIBE`、`CLEAR`、`LINK`、
+  `UNLINK`、`SEARCH`、`READ`、`SET_REQKEY_KEYRING`、`SET_TIMEOUT`、`GET_SECURITY`、
+  `SESSION_TO_PARENT`、`INVALIDATE`、`GET_PERSISTENT`、`RESTRICT_KEYRING`（これ以上リンクを
+  取らないものだけ。ここの型には制限がなく `ENOENT`）、`MOVE`、`CAPABILITIES` です。ほかは `EOPNOTSUPP` です。呼び出し情報つきの
+  `request_key` は、`/sbin/request-key` が失敗したときと同じく鍵を 60 秒の否定の鍵にして
+  `ENOENT` を返します。そのため `INSTANTIATE`、`NEGATE`、`REJECT`、`INSTANTIATE_IOV` は
+  権限を見つけられず（`EPERM`）、鍵の `ASSUME_AUTHORITY` は `ENOKEY` です。
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。
@@ -1754,14 +1776,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ケーパビリティを持つ）として、Linux の最初のプロセスと同じく補助グループなしで
   始まります。ネイティブのプログラムは、起動したものの補助グループを持ちます。
   Linux と同じく、資格情報はスレッドごとにあります。実・実効・保存・ファイル
-  システム用のユーザー ID とグループ ID、補助グループ、許可、実効、継承の
-  ケーパビリティです。`capget` は、どのスレッドのケーパビリティでも、ヘッダーの
-  3 つの版のどれでも読み、`capset` は、呼んだスレッドの
-  ケーパビリティを、持っている範囲で Linux の規則どおりに変えます。`set*id` 系と
+  システム用のユーザー ID とグループ ID、補助グループ、許可、実効、継承、
+  バウンディング、アンビエントのケーパビリティ、securebits です。`capget` は、
+  どのスレッドのケーパビリティでも、ヘッダーの 3 つの版のどれでも読み、`capset` は、
+  呼んだスレッドのケーパビリティを、持っている範囲で Linux の規則どおりに変えます
+  （継承のものはバウンディングセットの範囲でもあります）。アンビエントセットには、
+  新しい許可と継承のセットの両方にあるものだけを残します。`set*id` 系と
   `setgroups` は、Linux の規則どおりにそれらを変えます。ID は、そのスレッド自身の
   ID のどれかにするか、`CAP_SETUID` や `CAP_SETGID` があれば何にでもできます。
-  ユーザー ID がすべて root でなくなるとケーパビリティを失います（`PR_SET_KEEPCAPS`
-  があれば、許可されたものは残ります）。実効 ID が root でなくなると実効
+  `SECBIT_NO_SETUID_FIXUP` がなければ、ユーザー ID がすべて root でなくなると
+  ケーパビリティ（`PR_SET_KEEPCAPS` があれば、許可されたものは残ります）と
+  アンビエントのものを失います。実効 ID が root でなくなると実効
   ケーパビリティを失い、root に戻ると取り戻します。ファイルシステム用の ID も、
   ファイルシステムのケーパビリティについて同じです。実効 ID かファイルシステム用の
   ID が変わると、プロセスはダンプできなくなり（`fs.suid_dumpable` は 0）、親の
@@ -1772,9 +1797,25 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   グループでも補助グループでもないグループが実効グループになる）か、ケーパビリティが
   増える exec では、実 ID を実効 ID にして、ケーパビリティも元より増やしません。
   そのうえで `execve` は、保存 ID とファイルシステム用の ID を実効 ID にそろえ、
-  （実 ID か実効 ID が）root ならすべてのケーパビリティを与え、ほかには与えず、
-  `PR_SET_KEEPCAPS` を消します。exec で実効 ID が変わるとき、exec の前の実 ID と
-  違うとき、root でないユーザーがケーパビリティを持つときは `AT_SECURE` を
+  Linux の `cap_bprm_creds_from_file` と同じくケーパビリティを与えます。
+  - **ファイルケーパビリティ**：プログラムの `security.capability` は、その許可の
+    ものをバウンディングセットの範囲で、継承のものをスレッドの継承セットの範囲で
+    与え、実効フラグがあれば実効にもします。リビジョン 3 の値は、その root が
+    スレッドのユーザー名前空間かその上で root のときだけ効きます。どのリビジョン
+    でもない値と、実効フラグがあって許可のものをバウンディングセットがすべては
+    認めない値では、プログラムとそのインタープリタを読んだあとで exec を断ります
+    （`EINVAL`、`EPERM`）。
+  - **root**：`SECBIT_NOROOT` がなければ、（実 ID か実効 ID が）root ならバウンディング
+    セットと継承セットを与え、実効 ID が root なら実効にもします。ただし、
+    ファイルケーパビリティのある set-user-ID の root のプログラムを別のユーザーが
+    実行するときは別です。
+  - **アンビエント**：ファイルケーパビリティか実効 ID の変化があればアンビエント
+    セットを消し、残ったものは許可にも実効にもなります。
+  - `PR_SET_KEEPCAPS` を消し、ほかの securebits、バウンディングセット、継承セットは
+    残します。
+
+  exec で実効 ID が変わるとき、exec の前の実 ID と違うとき、root でないユーザーが
+  実効フラグかアンビエントを超える許可のケーパビリティを得るときは `AT_SECURE` を
   立てます。この安全な exec は、
   親の終了で受けるシグナルを消し、`RLIMIT_STACK` のソフトの上限を 8 MiB まで
   下げます。`execve` の後、プロセスはまたダンプできるようになります。ただし、
@@ -2499,7 +2540,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、
   `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`
   （`execve` は、上に書いた場合のほかは、またダンプできるようにします）、
-  `PR_SET_KEEPCAPS`（スレッドごとで、`execve` で消えます）、
+  `PR_SET_KEEPCAPS`（スレッドごとで、`execve` で消えます）、ケーパビリティモジュールの
+  `PR_CAPBSET_READ`、`PR_CAPBSET_DROP`（`CAP_SETPCAP` が要ります）、`PR_GET_SECUREBITS`、
+  `PR_SET_SECUREBITS`（ロックされたビットは変えません。`CAP_SETPCAP` がなければ、
+  ユーザー空間で exec を確かめるための 2 つのビットだけを、変えるときだけ変えられます）、
+  `PR_CAP_AMBIENT`（上げるケーパビリティは許可と継承の両方になければならず、
+  `SECBIT_NO_CAP_AMBIENT_RAISE` があれば断ります）（どれもスレッドごと）、
   `PR_SET_CHILD_SUBREAPER`（`fork` では受け継がれず、`execve` では残ります）、
   `PR_SET_NO_NEW_PRIVS`、`PR_SET_SECCOMP`（下の seccomp を見てください）と、
   それぞれの `PR_GET_*`、そして Yama の `PR_SET_PTRACER` に対応します。`PR_SET_PTRACER` は

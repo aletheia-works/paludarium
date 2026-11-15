@@ -41,6 +41,10 @@ pub struct ThreadGroup {
     /// What signalling each thread looks at, for other processes to read;
     /// a thread without one is root's ([`TaskIds`]).
     task_ids: Mutex<BTreeMap<u32, TaskIds>>,
+    /// Each thread's keyrings ([`crate::keys::Keyrings`]), which Linux
+    /// keeps in its credentials, for the thread and for a child giving it a
+    /// session keyring.
+    keyrings: Mutex<BTreeMap<u32, crate::keys::Keyrings>>,
     /// Each thread's namespaces, which Linux keeps per thread (`nsproxy`),
     /// for the thread itself and for other processes to read; a thread
     /// without them has the first ones, which every process made from this
@@ -195,6 +199,7 @@ impl Default for ThreadGroup {
             numa: crate::mempolicy::Numa::default(),
             aio: crate::aio::Contexts::default(),
             task_ids: Mutex::default(),
+            keyrings: Mutex::default(),
             namespaces: Mutex::default(),
             first_namespaces: Arc::default(),
             landlock_syncs: AtomicU64::new(0),
@@ -1257,6 +1262,12 @@ impl ThreadGroup {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&tid);
+            let keyrings = self
+                .keyrings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&tid);
+            drop(keyrings);
             let namespaces = self
                 .namespaces
                 .lock()
@@ -1267,6 +1278,42 @@ impl ThreadGroup {
                 namespaces.pid.leave(tid);
             }
         }
+    }
+    /// Thread `tid`'s keyrings.
+    pub(crate) fn keyrings(&self, tid: u32) -> crate::keys::Keyrings {
+        self.keyrings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .cloned()
+            .unwrap_or_default()
+    }
+    pub(crate) fn set_keyrings(&self, tid: u32, keyrings: crate::keys::Keyrings) {
+        let old = self
+            .keyrings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tid, keyrings);
+        drop(old);
+    }
+    /// The thread and keyrings of a group of one thread.
+    pub(crate) fn only_keyrings(&self) -> Option<(u32, crate::keys::Keyrings)> {
+        let tid = {
+            let members = self.members.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut tids = members.keys();
+            match (tids.next(), tids.next()) {
+                (Some(&tid), None) => tid,
+                _ => return None,
+            }
+        };
+        Some((tid, self.keyrings(tid)))
+    }
+    /// After exec, thread `pid`, with `keyrings`, is all there is.
+    pub(crate) fn reset_keyrings(&self, pid: u32, keyrings: crate::keys::Keyrings) {
+        let old =
+            std::mem::take(&mut *self.keyrings.lock().unwrap_or_else(PoisonError::into_inner));
+        self.set_keyrings(pid, keyrings);
+        drop(old);
     }
     /// After exec, thread `pid` is all there is.
     pub(crate) fn reset_task_ids(&self, pid: u32, ids: TaskIds) {
@@ -1963,6 +2010,14 @@ impl Kernel {
         let mut state = parent.state.clone();
         self.group
             .set_task_ids(tid, parent.state.credentials.task_ids());
+        // A new thread of a thread with a thread keyring gets one of its
+        // own; it shares the process keyring (`copy_creds`).
+        let keyrings = self.group.keyrings(parent.tid);
+        let thread_keyring = keyrings.has_thread_keyring().then(|| {
+            crate::keys::thread_keyring_for(&self.processes, &*self.host, &parent.state.credentials)
+        });
+        self.group
+            .set_keyrings(tid, keyrings.with_thread_keyring(thread_keyring.flatten()));
         (state.seccomp, state.seccomp_sync) =
             self.group
                 .seccomp_for_thread(parent.tid, &parent.state.seccomp, tid);

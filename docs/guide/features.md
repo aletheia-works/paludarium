@@ -58,6 +58,7 @@ kernel.
 | Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl`, `modify_ldt` |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
+| Keys | `add_key`, `request_key`, `keyctl` |
 | System information | `uname`, `sethostname`, `setdomainname`, `sysinfo`, `getrusage`, `times`, `acct`, `iopl`, `ioperm`, `syslog`, `sysfs` |
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
@@ -173,7 +174,8 @@ kernel.
   value when the reader's namespace maps that root to an ID other than 0, a
   revision 2 one when it is root there or above, and `EOVERFLOW` otherwise.
   A write or truncation of the file, and a `chown` of anything but a
-  directory, takes them away, whoever does it.
+  directory, takes them away, whoever does it. `execve` gives them to the
+  program it runs (see the credentials below).
 - `setxattrat`, `getxattrat`, `listxattrat` and `removexattrat` (Linux 6.13)
   find the file from a directory descriptor, and take `AT_SYMLINK_NOFOLLOW`
   and `AT_EMPTY_PATH` only (`EINVAL`). With `AT_EMPTY_PATH`, a null or empty
@@ -1093,6 +1095,31 @@ kernel.
   on the way, `EACCES`; `rename` before it looks the names up), and
   `EPERM` within it, but for a `rename` of a name onto itself, which does
   nothing.
+- The key retention service (`add_key`, `request_key`, `keyctl`), as
+  Linux's `security/keys`: `keyring`, `user` and `logon` keys, each with
+  its serial number, owner, group, permissions (possessor, user, group and
+  other) and expiry. A thread has its thread, process and session keyrings
+  (`fork` and `exec` keep the session one, a new thread gets a thread
+  keyring of its own when its creator has one, and a thread keyring
+  follows the file-system IDs), and each user its `_uid.<uid>`,
+  `_uid_ses.<uid>` and `_persistent.<uid>` keyrings in its user namespace.
+  A search walks nested keyrings as `search_nested_keyrings` does, six
+  deep, with its order of errors (`EKEYREVOKED`, `EKEYEXPIRED`, `EACCES`,
+  a negative key's error), and a key found through the thread's keyrings
+  is possessed. Each user has Linux's quotas (200 keys and 20000 bytes, a
+  million keys and 25 MB for root), which a keyring's links count against
+  too. `keyctl` takes every option of a kernel built without big keys,
+  Diffie-Hellman, asymmetric keys and notifications: `GET_KEYRING_ID`,
+  `JOIN_SESSION_KEYRING` (named sessions too), `UPDATE`, `REVOKE`, `CHOWN`,
+  `SETPERM`, `DESCRIBE`, `CLEAR`, `LINK`, `UNLINK`, `SEARCH`, `READ`,
+  `SET_REQKEY_KEYRING`, `SET_TIMEOUT`, `GET_SECURITY`,
+  `SESSION_TO_PARENT`, `INVALIDATE`, `GET_PERSISTENT`, `RESTRICT_KEYRING`
+  (to take no more links: these types have no restrictions, `ENOENT`), `MOVE` and `CAPABILITIES`; the
+  others give `EOPNOTSUPP`. `request_key` with callout information makes
+  the key negative for 60 seconds, as a failed `/sbin/request-key` does,
+  and gives `ENOENT`, so `INSTANTIATE`, `NEGATE`, `REJECT` and
+  `INSTANTIATE_IOV` find no authority (`EPERM`) and `ASSUME_AUTHORITY` of
+  a key `ENOKEY`.
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux
@@ -2025,16 +2052,20 @@ kernel.
   group 0, with every capability) without supplementary groups, as Linux's
   first process does; a native program has its launcher's instead. Each
   thread has its own credentials, as on Linux: the real, effective, saved
-  and filesystem user and group IDs, the supplementary groups and the
-  permitted, effective and inheritable capabilities.
+  and filesystem user and group IDs, the supplementary groups, the
+  permitted, effective, inheritable, bounding and ambient capabilities and
+  the securebits.
   `capget` reads any thread's capabilities in all three header versions, and
-  `capset` changes the calling thread's, within what it holds by Linux's rules.
+  `capset` changes the calling thread's, within what it holds by Linux's rules
+  (an inheritable one also within the bounding set), and keeps the ambient
+  set within the new permitted and inheritable ones.
   The `set*id` calls and `setgroups` change them by Linux's rules: an ID
   goes to one of the thread's own, or anywhere with `CAP_SETUID` or
-  `CAP_SETGID`; leaving root in every user ID drops the capabilities (but
-  for the permitted ones with `PR_SET_KEEPCAPS`), the effective ID leaving
-  root drops the effective ones and coming back raises them, and the
-  filesystem ID does the same for the filesystem capabilities. A change of
+  `CAP_SETGID`; unless `SECBIT_NO_SETUID_FIXUP`, leaving root in every
+  user ID drops the capabilities (but for the permitted ones with
+  `PR_SET_KEEPCAPS`) and the ambient ones, the effective ID leaving root
+  drops the effective ones and coming back raises them, and the filesystem
+  ID does the same for the filesystem capabilities. A change of
   an effective or filesystem ID makes the process undumpable
   (`fs.suid_dumpable` is 0) and clears its parent-death signal. `execve`
   of a set-user-ID program makes its owner the effective user ID, and of a
@@ -2044,11 +2075,29 @@ kernel.
   thread is not in by its filesystem or a supplementary group) or gain
   capabilities takes the real IDs as effective and keeps no more
   capabilities than the thread had. `execve` then makes the saved and
-  filesystem IDs the effective ones, gives root (by its real or effective
-  ID) every capability and anyone else none, and clears `PR_SET_KEEPCAPS`.
+  filesystem IDs the effective ones and gives the capabilities as Linux's
+  `cap_bprm_creds_from_file` does:
+  - **File capabilities:** a program's `security.capability` gives its
+    permitted ones within the bounding set and its inheritable ones within
+    the thread's, effective too when its effective flag is set. A revision 3
+    value counts only where its root is root in the thread's user namespace
+    or one above it. A value of no known revision, or one whose effective
+    flag is set and whose permitted capabilities the bounding set does not
+    all allow, refuses the exec (`EINVAL`, `EPERM`), after the program and
+    its interpreter are read.
+  - **Root:** unless `SECBIT_NOROOT`, root (by its real or effective ID)
+    gets the bounding and inheritable sets, effective by its effective ID,
+    but not a set-user-ID root program with file capabilities that another
+    user runs.
+  - **Ambient:** file capabilities or a change of the effective IDs clear
+    the ambient set; what stays of it is permitted and effective.
+  - It clears `PR_SET_KEEPCAPS` and keeps the other securebits, the bounding
+    set and the inheritable set.
+
   It sets `AT_SECURE` when it changes the effective IDs, when they differ
-  from the real ones before it, or when a user other than root keeps
-  capabilities, and such a secure exec
+  from the real ones before it, or when a user other than root takes the
+  effective flag or permitted capabilities beyond its ambient ones, and
+  such a secure exec
   clears the parent-death signal and lowers the `RLIMIT_STACK` soft limit
   to 8 MiB. The process is dumpable again after `execve` unless its
   effective IDs differed from its real ones before it, it may not read the
@@ -2872,7 +2921,13 @@ kernel.
   threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
   parent exits), `PR_SET_DUMPABLE` (`execve` makes the process dumpable
   again, but for the cases above), `PR_SET_KEEPCAPS` (per thread, cleared
-  by `execve`), `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
+  by `execve`), the capability module's `PR_CAPBSET_READ`, `PR_CAPBSET_DROP`
+  (with `CAP_SETPCAP`), `PR_GET_SECUREBITS`, `PR_SET_SECUREBITS` (which
+  changes no locked bit; without `CAP_SETPCAP` only the two bits for exec's
+  checks in user space, and only a change) and `PR_CAP_AMBIENT` (a raised
+  capability must be permitted and inheritable, unless
+  `SECBIT_NO_CAP_AMBIENT_RAISE` refuses it), all per thread,
+  `PR_SET_CHILD_SUBREAPER` (not inherited on `fork`, kept on
   `execve`), `PR_SET_NO_NEW_PRIVS` and `PR_SET_SECCOMP` (see seccomp below)
   with their `PR_GET_*`, and Yama's `PR_SET_PTRACER`, which reads no other
   argument: 0 clears it, `PR_SET_PTRACER_ANY` (or -1 as an `int`) lets any

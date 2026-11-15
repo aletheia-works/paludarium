@@ -3551,6 +3551,202 @@ static void *caps_thread(void *unused) {
     while (!caps_thread_done) sched_yield();
     return NULL;
 }
+/* The file-capabilities case: the bounding and ambient sets, the securebits,
+   and exec of a copy of this program ("prog") that root gives file
+   capabilities. Each step runs in a child of root's. */
+#define FCAPS_REVISION_2 0x02000000u
+#define FCAPS_REVISION_3 0x03000000u
+#define FCAPS_EFFECTIVE 1u
+static long fcaps_prctl(long option, long arg2, long arg3, long arg4, long arg5) {
+    return syscall(SYS_prctl, option, arg2, arg3, arg4, arg5);
+}
+static void fcaps_set(const char *name, uint32_t magic, uint64_t permitted_set, uint64_t inheritable,
+                      uint32_t root) {
+    uint32_t v[6] = {magic, (uint32_t)permitted_set, (uint32_t)inheritable, (uint32_t)(permitted_set >> 32),
+                     (uint32_t)(inheritable >> 32), root};
+    size_t size = (magic & 0xff000000u) == FCAPS_REVISION_3 ? 24 : (magic & 0xff000000u) == 0x01000000u ? 12 : 20;
+    permitted(name, syscall(SYS_setxattr, "prog", "security.capability", v, size, 0));
+}
+static void fcaps_status(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "Cap", 3)) printf("  %s", line);
+    if (f) fclose(f);
+}
+/* Becomes user 2000 (with PR_SET_KEEPCAPS, keeping the permitted set). */
+static void fcaps_user(int keep) {
+    if (keep && fcaps_prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0)) _exit(90);
+    if (syscall(SYS_setresgid, 2000, 2000, 2000) || syscall(SYS_setresuid, 2000, 2000, 2000)) _exit(91);
+}
+static void fcaps_exec(const char *name) {
+    char *args[] = {"./prog", "file-capabilities-show", (char *)name, NULL};
+    char *env[] = {NULL};
+    fflush(stdout);
+    execve("./prog", args, env);
+    printf("%s: exec: %s\n", name, strerror(errno));
+    fflush(stdout);
+    _exit(0);
+}
+static int file_capabilities_case(const char *self) {
+    char dir[] = "/tmp/file-capabilities-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir)) return 80;
+    umask(022);
+    /* sudo leaves root's group among the supplementary ones. */
+    if (setgroups(0, NULL)) return 80;
+    if (chmod(".", 0777)) return 80;
+    if (caps_copy(self)) return 80;
+    fcaps_status();
+    /* The bounding set: read, dropped only with CAP_SETPCAP (EPERM before
+       EINVAL), then neither inheritable nor taken by root's exec. */
+    outcome("bset-0", fcaps_prctl(PR_CAPBSET_READ, 0, 0, 0, 0));
+    outcome("bset-last", fcaps_prctl(PR_CAPBSET_READ, 40, 0, 0, 0));
+    outcome("bset-past", fcaps_prctl(PR_CAPBSET_READ, 41, 0, 0, 0));
+    outcome("bset-drop-past", fcaps_prctl(PR_CAPBSET_DROP, 41, 0, 0, 0));
+    AS_SENDER(0, 0, 0, {
+        outcome("bset-drop", fcaps_prctl(PR_CAPBSET_DROP, 21, 0, 0, 0));
+        outcome("bset-dropped", fcaps_prctl(PR_CAPBSET_READ, 21, 0, 0, 0));
+        permitted("bset-inherit-dropped", caps_set(CAPS_ALL, CAPS_ALL, CAP_BIT(21)));
+        permitted("bset-inherit", caps_set(CAPS_ALL, CAPS_ALL, CAP_BIT(1)));
+        fcaps_exec("bset-root");
+    });
+    AS_SENDER(0, 0, 0, {
+        fcaps_user(0);
+        outcome("bset-drop-user", fcaps_prctl(PR_CAPBSET_DROP, 41, 0, 0, 0));
+        outcome("bset-read-user", fcaps_prctl(PR_CAPBSET_READ, 21, 0, 0, 0));
+    });
+    /* The ambient set: within the permitted and inheritable ones, its
+       arguments checked, cleared by leaving root and kept by exec. */
+    AS_SENDER(0, 0, 0, {
+        outcome("ambient-is-set", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 10, 0, 0));
+        outcome("ambient-not-inheritable", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 10, 0, 0));
+        outcome("ambient-clear-args", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 1, 0, 0));
+        outcome("ambient-past", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 41, 0, 0));
+        outcome("ambient-arg5", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 0, 0, 1));
+        outcome("ambient-unknown", fcaps_prctl(PR_CAP_AMBIENT, 9, 0, 0, 0));
+        if (caps_set(CAPS_ALL, CAPS_ALL, CAP_BIT(10) | CAP_BIT(0))) _exit(92);
+        outcome("ambient-raise", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 10, 0, 0));
+        outcome("ambient-raised", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 10, 0, 0));
+        fcaps_user(1);
+        outcome("ambient-left-root", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 10, 0, 0));
+        outcome("ambient-raise-user", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 10, 0, 0));
+        outcome("ambient-raise-chown", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 0, 0, 0));
+        outcome("ambient-raise-other", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 1, 0, 0));
+        fcaps_status();
+        /* capset keeps only what stays permitted and inheritable. */
+        permitted("ambient-capset", caps_set(0, CAPS_ALL, CAP_BIT(10)));
+        fcaps_status();
+        fcaps_exec("ambient-exec");
+    });
+    AS_SENDER(0, 0, 0, {
+        if (caps_set(CAPS_ALL, CAPS_ALL, CAP_BIT(10))) _exit(92);
+        outcome("ambient-raise", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 10, 0, 0));
+        outcome("ambient-lower", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER, 10, 0, 0));
+        outcome("ambient-raise-again", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 10, 0, 0));
+        outcome("ambient-clear", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0));
+        outcome("ambient-cleared", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 10, 0, 0));
+    });
+    /* The securebits: locks, unknown bits, what a user may change, and what
+       exec and set*id calls make of them. */
+    AS_SENDER(0, 0, 0, {
+        outcome("securebits", fcaps_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0));
+        outcome("securebits-unknown", fcaps_prctl(PR_SET_SECUREBITS, 0x1000, 0, 0, 0));
+        outcome("securebits-same", fcaps_prctl(PR_SET_SECUREBITS, 0, 0, 0, 0));
+        outcome("securebits-keep-locked", fcaps_prctl(PR_SET_SECUREBITS, 0x30, 0, 0, 0));
+        outcome("keepcaps-locked", fcaps_prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0));
+        outcome("securebits-locked-bit", fcaps_prctl(PR_SET_SECUREBITS, 0x20, 0, 0, 0));
+        outcome("securebits-unlock", fcaps_prctl(PR_SET_SECUREBITS, 0x10, 0, 0, 0));
+        outcome("securebits-ambient", fcaps_prctl(PR_SET_SECUREBITS, 0x70, 0, 0, 0));
+        if (caps_set(CAPS_ALL, CAPS_ALL, CAP_BIT(10))) _exit(92);
+        outcome("ambient-no-raise", fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 10, 0, 0));
+        fcaps_exec("securebits-exec");
+    });
+    AS_SENDER(0, 0, 0, {
+        outcome("securebits-noroot", fcaps_prctl(PR_SET_SECUREBITS, 0x1, 0, 0, 0));
+        fcaps_exec("noroot-exec");
+    });
+    AS_SENDER(0, 0, 0, {
+        outcome("securebits-no-fixup", fcaps_prctl(PR_SET_SECUREBITS, 0x4, 0, 0, 0));
+        fcaps_user(0);
+        fcaps_status();
+        /* Root's capabilities stay, CAP_SETPCAP among them. */
+        outcome("securebits-no-fixup-same", fcaps_prctl(PR_SET_SECUREBITS, 0x4, 0, 0, 0));
+        fcaps_exec("no-fixup-exec");
+    });
+    AS_SENDER(0, 0, 0, {
+        fcaps_user(0);
+        outcome("securebits-user-none", fcaps_prctl(PR_SET_SECUREBITS, 0, 0, 0, 0));
+        outcome("securebits-user-exec-bit", fcaps_prctl(PR_SET_SECUREBITS, 0x100, 0, 0, 0));
+        outcome("securebits-user-privileged", fcaps_prctl(PR_SET_SECUREBITS, 0x101, 0, 0, 0));
+        outcome("securebits-user-exec-lock", fcaps_prctl(PR_SET_SECUREBITS, 0x300, 0, 0, 0));
+        outcome("securebits-user-locked", fcaps_prctl(PR_SET_SECUREBITS, 0x200, 0, 0, 0));
+        outcome("securebits-user", fcaps_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0));
+        fcaps_exec("securebits-user-exec");
+    });
+    /* File capabilities: what each revision and flag gives a user, root and
+       the bounding set, and the ambient set they clear. */
+    fcaps_set("set-v1", 0x01000000u, CAP_BIT(10), 0, 0);
+    fcaps_set("set-effective", FCAPS_REVISION_2 | FCAPS_EFFECTIVE, CAP_BIT(10), 0, 0);
+    AS_SENDER(0, 0, 0, {
+        fcaps_user(0);
+        fcaps_exec("effective-user");
+    });
+    AS_SENDER(0, 0, 0, { fcaps_exec("effective-root"); });
+    AS_SENDER(0, 0, 0, {
+        if (fcaps_prctl(PR_CAPBSET_DROP, 10, 0, 0, 0)) _exit(92);
+        fcaps_user(0);
+        fcaps_exec("effective-bounded");
+    });
+    AS_SENDER(0, 0, 0, {
+        if (fcaps_prctl(PR_SET_SECUREBITS, 0x1, 0, 0, 0)) _exit(92);
+        fcaps_exec("effective-noroot");
+    });
+    fcaps_set("set-inheritable", FCAPS_REVISION_2, CAP_BIT(10), CAP_BIT(0) | CAP_BIT(1), 0);
+    AS_SENDER(0, 0, 0, {
+        if (caps_set(CAPS_ALL, CAPS_ALL, CAP_BIT(0) | CAP_BIT(2))) _exit(92);
+        fcaps_user(0);
+        fcaps_exec("inheritable-user");
+    });
+    AS_SENDER(0, 0, 0, {
+        if (fcaps_prctl(PR_CAPBSET_DROP, 10, 0, 0, 0)) _exit(92);
+        fcaps_user(0);
+        fcaps_exec("not-effective-bounded");
+    });
+    AS_SENDER(0, 0, 0, {
+        if (caps_set(CAPS_ALL, CAPS_ALL, CAP_BIT(3))) _exit(92);
+        fcaps_user(1);
+        if (fcaps_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 3, 0, 0)) _exit(93);
+        fcaps_exec("ambient-file");
+    });
+    /* A set-user-ID root program with file capabilities gives a user those
+       alone. chown takes them away, so it comes first. */
+    if (chown("prog", 0, 0) || chmod("prog", 04755)) return 81;
+    fcaps_set("set-setuid", FCAPS_REVISION_2 | FCAPS_EFFECTIVE, CAP_BIT(10), 0, 0);
+    AS_SENDER(0, 0, 0, {
+        fcaps_user(0);
+        fcaps_exec("setuid-user");
+    });
+    AS_SENDER(0, 0, 0, {
+        if (syscall(SYS_setresuid, 0, 2000, 0)) _exit(92);
+        fcaps_exec("setuid-real-root");
+    });
+    if (chmod("prog", 0755)) return 81;
+    /* A revision 3 value counts only where its root is root. */
+    fcaps_set("set-v3-other", FCAPS_REVISION_3 | FCAPS_EFFECTIVE, CAP_BIT(10), 0, 1000);
+    AS_SENDER(0, 0, 0, {
+        fcaps_user(0);
+        fcaps_exec("v3-other-user");
+    });
+    fcaps_set("set-v3-root", FCAPS_REVISION_3 | FCAPS_EFFECTIVE, CAP_BIT(10), 0, 0);
+    AS_SENDER(0, 0, 0, {
+        fcaps_user(0);
+        fcaps_exec("v3-root-user");
+    });
+    fflush(stdout);
+    unlink("prog");
+    if (chdir("/") || rmdir(dir)) return 89;
+    return 0;
+}
 /* The limit-permissions case: a process that waits with the given IDs. */
 static pid_t limit_target(unsigned real, unsigned effective, unsigned saved, unsigned gid,
                           unsigned egid, unsigned sgid) {
@@ -24080,6 +24276,15 @@ int main(int argc, char **argv) {
         if (chdir("/") || rmdir(dir)) return 89;
         return 0;
     }
+    if (!strcmp(mode, "file-capabilities-show")) {
+        printf("%s: secure=%lu uid=%d euid=%d securebits=%ld keepcaps=%ld\n", self, getauxval(AT_SECURE),
+               (int)getuid(), (int)geteuid(), fcaps_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0),
+               fcaps_prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0));
+        caps_show("  sets", 0);
+        fcaps_status();
+        return 0;
+    }
+    if (!strcmp(mode, "file-capabilities")) return file_capabilities_case(self);
     if (!strcmp(mode, "capabilities-show")) {
         caps_show("after-exec", 0);
         caps_status();

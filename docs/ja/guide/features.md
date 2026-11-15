@@ -61,6 +61,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
+| BPF | `bpf`、マップのみ（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -2161,7 +2162,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/<pid>/…`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに
   `pipe:[<inode>]`、`socket:[<inode>]`、`anon_inode:[eventfd]`・`[eventpoll]`・
   `[timerfd]`・`[signalfd]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
-  名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`/memfd:<名前> (deleted)` です。
+  名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`anon_inode:bpf-map`、`/memfd:<名前> (deleted)` です。
   そのためにパイプとソケットは自分の inode 番号を持ちます。リンクを開くと、ファイルを
   パスで開き直します。どのパスもそのファイルを指さなくなったとき（消された、または
   名前が変わった）は、同じファイルをそのハンドルから開き直し、オフセットは別に持ちます。
@@ -2429,6 +2430,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ブロックデバイスはないので `ENOTBLK` を返します。`quotactl_fd` はどのディスクリプタも
     受け付け（`EBADF`）、種類を確かめ（`EINVAL`）、クォータのないファイルシステムに
     対する Linux の `do_quotactl` と同じく `ENOSYS` を返します。
+- `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを
+  持ちます。どのコマンドも、まず union のサイズ（1 ページより大きいか、Linux master の 168
+  バイトより先に 0 でないバイトがあれば `E2BIG`）と、コマンド自身のフィールドより先
+  （`CHECK_ATTR`、`EINVAL`）を確かめます。`BPF_MAP_CREATE` は `BPF_MAP_TYPE_ARRAY`
+  （4 バイトのキーで、どの要素も初めからあって 0）か `BPF_MAP_TYPE_HASH` を、Linux の検査の
+  順に作ります。BTF の型 ID、`map_extra`、NUMA ノード（一つです）、型、型ごとのサイズと
+  フラグ（`EINVAL`。大きすぎるハッシュの要素は `E2BIG`、`CAP_SYS_ADMIN` なしの
+  `BPF_F_ZERO_SEED` は `EPERM`）、Linux の既定の 2 の `kernel.unprivileged_bpf_disabled`
+  （マップには `CAP_BPF` か `CAP_SYS_ADMIN` が要ります、`EPERM`）、名前（英数字、`_`、`.`）、
+  BTF（どのファイルも BTF ではありません、`EINVAL`）、`BPF_F_RDONLY` と `BPF_F_WRONLY` の
+  両方（`EINVAL`）の順です。ディスクリプタは close-on-exec で、`BPF_F_RDONLY` と
+  `BPF_F_WRONLY` に従って読み込み、書き込み、その両方で開かれ、リンクは
+  `anon_inode:bpf-map`、読み書きは `EINVAL` です。`BPF_MAP_LOOKUP_ELEM`、`UPDATE_ELEM`
+  （`BPF_ANY`、`BPF_NOEXIST`、`BPF_EXIST`。いっぱいのハッシュと配列の終わりより先の
+  添字は `E2BIG`）、`DELETE_ELEM`（配列では `EINVAL`）、`GET_NEXT_KEY`、
+  `LOOKUP_AND_DELETE_ELEM`（配列ではカーネルの `ENOTSUPP`、524）、`BPF_MAP_FREEZE`
+  （どのディスクリプタからの書き込みも止めるので、2 回目も `EPERM`）は、ディスクリプタのアクセスを
+  要ります（`EPERM`）。バッチのコマンドは、数を指定して検索、更新、削除、検索して削除を行い、
+  `count` を書き戻します（配列は削除できません、`ENOTSUPP`）。`BPF_OBJ_GET_INFO_BY_FD` は
+  マップの `struct bpf_map_info` を求められた長さまで返します（ディスクリプタがなければ
+  `EBADFD`、マップでなければ `EINVAL`）。fdinfo には `map_type`、`key_size`、`value_size`、
+  `max_entries`、`map_flags`、`map_extra`、`memlock`、`map_id`、`frozen` があります。
+  ないものは [制限](./limitations) を参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。

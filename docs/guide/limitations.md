@@ -179,6 +179,28 @@ verified.
   writes there: the call gives `EFAULT`, where Linux's copy of user memory
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
+- **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
+  Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
+  links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), IDs
+  (`BPF_*_GET_NEXT_ID`, `BPF_*_GET_FD_BY_ID`), tokens, iterators and
+  statistics are `ENOSYS`, as each command Linux has that is not here; a
+  number Linux has no command for is `EINVAL`, as there. So libbpf finds no
+  program loads (its trivial-program probe fails with `ENOSYS`) and
+  `bpftool feature` says the `bpf()` system call is not there, as it asks
+  `BPF_PROG_LOAD` and looks for `ENOSYS`. The other map types are `EINVAL`,
+  as on a kernel built without them; the per-CPU ones
+  (`BPF_MAP_TYPE_PERCPU_ARRAY`, `PERCPU_HASH`, `LRU_PERCPU_HASH`) could not
+  be compared with Linux anyway, as their values are one per possible CPU,
+  which a test machine and the emulator count differently. A hash gives
+  its keys in the order of their bytes, where Linux's order follows its
+  buckets and a random seed, and a batch of it takes each element as a
+  bucket of its own, so `in_batch` and `out_batch` count elements. Maps
+  take no memory limit and no `memlock` charge Linux would refuse (a huge
+  map is made, where Linux may give `ENOMEM`), and fdinfo's `memlock` is
+  the elements' size alone. `BPF_F_MMAPABLE` is taken but `mmap` of a map
+  is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
+  `kernel.unprivileged_bpf_disabled` is always 2, with no
+  `/proc/sys/kernel` file for it.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its

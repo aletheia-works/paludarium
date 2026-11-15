@@ -133,7 +133,8 @@ mod linux {
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
-            // marks need CAP_SYS_ADMIN, the keys cases, which set up keyrings as root
+            // marks need CAP_SYS_ADMIN, the bpf cases, whose maps need CAP_BPF,
+            // the keys cases, which set up keyrings as root
             // and become other users, the mqueue cases, which make IPC and
             // network namespaces of their own for the namespace's default
             // limits and become an unprivileged user, the scheduling-set case, which sets
@@ -185,6 +186,9 @@ mod linux {
                     | "fanotify-fid"
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
+                    | "bpf-calls"
+                    | "bpf-elements"
+                    | "bpf-batch"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -440,6 +444,9 @@ mod linux {
         aio_full => ("aio-full","aio"),
         aio_lifetime => ("aio-lifetime","aio"),
         aio_mremap => ("aio-mremap","aio"),
+        bpf_calls => ("bpf-calls","bpf"),
+        bpf_elements => ("bpf-elements","bpf"),
+        bpf_batch => ("bpf-batch","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),

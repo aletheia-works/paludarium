@@ -69,6 +69,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
+| BPF | `bpf`, for maps (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -2487,7 +2488,7 @@ kernel.
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
   `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]` or `[pidfd]` (an
   anonymous inode's name, which pidfs, from Linux 6.9, still gives),
-  `anon_inode:inotify` (without brackets, as Linux names it), and
+  `anon_inode:inotify` (without brackets, as Linux names it), `anon_inode:bpf-map`, and
   `/memfd:<name> (deleted)`; pipes and sockets have inode numbers of their
   own for it. Opening a link opens the file again by its path, or, for a
   file no path names any more (removed, or renamed away), the same file
@@ -2795,6 +2796,34 @@ kernel.
     `quotactl_fd` takes any descriptor (`EBADF`), checks the type
     (`EINVAL`) and gives `ENOSYS`, as Linux's `do_quotactl` does for a file
     system without quotas.
+- `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and
+  `hashtab.c` have them. Every command first takes the size of its union
+  (more than a page, or bytes past Linux master's 168 that are not 0, is
+  `E2BIG`) and its fields past the command's own (`CHECK_ATTR`, `EINVAL`).
+  `BPF_MAP_CREATE` makes a `BPF_MAP_TYPE_ARRAY` (4-byte keys, every
+  element there and zero from the start) or a `BPF_MAP_TYPE_HASH`, in the
+  order of Linux's checks: BTF type IDs, `map_extra`, the NUMA node (there
+  is one), the type, the type's own sizes and flags (`EINVAL`, too large a
+  hash element `E2BIG`, `BPF_F_ZERO_SEED` without `CAP_SYS_ADMIN`
+  `EPERM`), `kernel.unprivileged_bpf_disabled`, which is Linux's default 2,
+  so that a map needs `CAP_BPF` or `CAP_SYS_ADMIN` (`EPERM`), the name
+  (letters, digits, `_` and `.`), BTF (no file is, `EINVAL`), and
+  `BPF_F_RDONLY` with `BPF_F_WRONLY` (`EINVAL`). The descriptor is
+  close-on-exec, open for reading, writing or both as `BPF_F_RDONLY` and
+  `BPF_F_WRONLY` say, its link is `anon_inode:bpf-map`, and a read or write
+  of it is `EINVAL`. `BPF_MAP_LOOKUP_ELEM`, `UPDATE_ELEM` (`BPF_ANY`,
+  `BPF_NOEXIST`, `BPF_EXIST`; a full hash is `E2BIG`, an index past an
+  array's end `E2BIG`), `DELETE_ELEM` (`EINVAL` for an array),
+  `GET_NEXT_KEY`, `LOOKUP_AND_DELETE_ELEM` (the kernel's `ENOTSUPP`, 524,
+  for an array) and `BPF_MAP_FREEZE` (which stops writes through every
+  descriptor, so that a second one is `EPERM` too) take the access the descriptor has
+  (`EPERM`). The batch commands look up, update, delete and look up and
+  delete by count, with `count` written back (an array deletes nothing,
+  `ENOTSUPP`). `BPF_OBJ_GET_INFO_BY_FD` gives a map's `struct bpf_map_info`
+  up to the length asked for (`EBADFD` for no descriptor, `EINVAL` for one
+  of no map). Its fdinfo has `map_type`, `key_size`, `value_size`,
+  `max_entries`, `map_flags`, `map_extra`, `memlock`, `map_id` and
+  `frozen`. See [limitations](./limitations) for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

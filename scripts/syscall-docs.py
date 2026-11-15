@@ -319,6 +319,7 @@ NAMES = {
     318: "getrandom",
     319: "memfd_create",
     320: "kexec_file_load",
+    321: "bpf",
     322: "execveat",
     324: "membarrier",
     325: "mlock2",

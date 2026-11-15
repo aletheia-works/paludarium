@@ -910,22 +910,17 @@ fn info(c: &mut Context<'_>, attr: &[u8], at: u64) -> Result<u64, Errno> {
 }
 
 /// What `/proc/self/fdinfo` adds for a map, as Linux's
-/// `bpf_map_show_fdinfo`.
+/// `bpf_map_show_fdinfo`. The kernel's `%#x` writes 0 as `0x0`, unlike C's.
 pub(crate) fn fdinfo(file: &Arc<dyn FileHandle>) -> Option<Vec<u8>> {
     let map = &of(file)?.map;
     Some(
         format!(
-            "map_type:\t{}\nkey_size:\t{}\nvalue_size:\t{}\nmax_entries:\t{}\nmap_flags:\t{}\nmap_extra:\t0\nmemlock:\t{}\nmap_id:\t{}\nfrozen:\t{}\n",
+            "map_type:\t{}\nkey_size:\t{}\nvalue_size:\t{}\nmax_entries:\t{}\nmap_flags:\t{:#x}\nmap_extra:\t0x0\nmemlock:\t{}\nmap_id:\t{}\nfrozen:\t{}\n",
             map.kind,
             map.key_size,
             map.value_size,
             map.max_entries,
-            // `%#x`, which writes 0 without the prefix.
-            if map.flags == 0 {
-                "0".to_owned()
-            } else {
-                format!("{:#x}", map.flags)
-            },
+            map.flags,
             map.memory(),
             map.id,
             u8::from(map.frozen.load(Ordering::SeqCst))

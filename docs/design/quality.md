@@ -149,7 +149,24 @@ every test passing.
 ## Coverage and static checks
 
 - Line coverage must stay at 80 % or more. The measurement before the first
-  release was about 94 % for the whole workspace.
+  release was about 94 % for the whole workspace. The `coverage` job of
+  `ci.yml` holds five gates to that floor, each counting only its own tests:
+  the whole workspace; the core packages, with the harness's tests run but
+  its own files left out; the Rust crates the WebAssembly build uses; the
+  crates behind the terminal; and the CPU and decoder under the encodings
+  tests.
+- The core and workspace gates share one instrumented build and one run of
+  each test. The core packages' and the harness's tests run first and the
+  core gate reports on their profiles; the other packages' tests then add
+  theirs and the workspace gate reports on all of them. Cargo builds the
+  same units for the two runs as for one run of the whole workspace, so both
+  numbers are the ones separate runs give. The other three gates each clean
+  and run their own tests, as a report counts every test binary in the
+  target directory; before the terminal gate the job removes the test
+  binaries of the packages outside the core gate, so it starts from what the
+  core run left, as it did when that run came last. The copy of this job in
+  `quality.yml` (nightly and before a release) still runs the two gates
+  separately, with the same numbers.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)

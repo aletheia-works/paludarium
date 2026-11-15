@@ -546,11 +546,12 @@ verified.
   `lo` while it is down is `ENETUNREACH`, where Linux's goes out and is
   dropped, and so is one to an IPv6 address in a prefix that is not one
   of `lo`'s, which Linux's prefix route sends to it and drops; an IPv6
-  lookup while `lo` is down is `ENETUNREACH` too. A route lookup of a
-  multicast or the limited broadcast address answers with the route the
-  tables give, where Linux's answer is of the multicast or broadcast kind
-  `__mkroute_output` makes for them; its `rta_cacheinfo` counts one
-  reference, where Linux counts the other users of the cached route too.
+  lookup while `lo` is down is `ENETUNREACH` too. A route lookup's answer
+  for a multicast address is local (`RTCF_LOCAL`) only for 224.0.0.1, the
+  group `lo` is a member of while up, as no socket here joins a group,
+  where Linux's is local for each group a socket joined on `lo` too. A
+  lookup's `rta_cacheinfo` counts one reference, where Linux counts the
+  other users of the cached route too.
   `RTM_F_NOTIFY` marks a lookup's own answer alone, where Linux marks the
   cached route, so that later lookups through it are marked too.
   Notifications go out for the link, its IPv6 information, addresses,

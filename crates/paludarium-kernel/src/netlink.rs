@@ -144,10 +144,16 @@ const RTM_F_FIB_MATCH: u32 = 0x2000;
 /// `RTM_F_LOOKUP_TABLE`: a lookup's answer names the table it came from.
 const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 /// The flags of a lookup's answer: `RTM_F_CLONED`, with `RTCF_LOCAL`, and
-/// `RTCF_BROADCAST` for the broadcast address.
+/// `RTCF_BROADCAST` or `RTCF_MULTICAST` for a broadcast or multicast one.
 const RTM_F_CLONED: u32 = 0x200;
 const RTCF_LOCAL: u32 = 0x8000_0000;
 const RTCF_BROADCAST: u32 = 0x1000_0000;
+const RTCF_MULTICAST: u32 = 0x2000_0000;
+/// `RTN_MULTICAST`, the type of a looked-up route to a multicast address.
+const RTN_MULTICAST: u8 = 5;
+/// `IGMP_ALL_HOSTS`, the one group `lo` is a member of while it is up
+/// (`ip_mc_up`), as no socket here joins one.
+const ALL_HOSTS: core::net::Ipv4Addr = core::net::Ipv4Addr::new(224, 0, 0, 1);
 /// The mark `RTM_F_NOTIFY` leaves on a looked-up route.
 const RTCF_NOTIFY: u32 = 0x0001_0000;
 const RTA_OIF: u16 = 4;
@@ -3429,8 +3435,17 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// the source, or else from `127.0.0.1` (with a device, from the address
 /// `inet_select_addr` picks of host scope). The tables are looked in by the
 /// request's TOS; where they give an error and a device is named, the
-/// route is on link through it instead, from an address of link scope. The
-/// answer gives the TOS of the route that matched, the source as `RTA_SRC`
+/// route is on link through it instead, from an address of link scope. To
+/// a multicast or the limited broadcast address from a source and no
+/// device, or through `lo` to a local group (224.0.0.0/24) or the limited
+/// broadcast address (from an address of link scope where none is named),
+/// the route is made with no table looked in: of TOS 0 and no table, and
+/// `EHOSTUNREACH` with `RTM_F_FIB_MATCH`. As `__mkroute_output` makes it,
+/// the answer for the limited broadcast address is of the broadcast type,
+/// with no gateway or metrics, and for a multicast one of the multicast
+/// type, local only for a group of `lo`'s, and without them through a
+/// route shorter than 224.0.0.0/4's prefix. The answer gives the TOS of
+/// the route that matched, the source as `RTA_SRC`
 /// where the request names one, and else the source the route leaves from
 /// as `RTA_PREFSRC`; the `RTA_MARK` it names, but 0 (`ERANGE` when shorter
 /// than 4 bytes); and the `RTA_UID` it names (`ERANGE` when shorter than 4
@@ -3438,7 +3453,8 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// the caller's. It names the main table but with `RTM_F_LOOKUP_TABLE`,
 /// the table it came from (the main one for the local one, whose trie it
 /// shares), or 0 where no table gave it. With `RTM_F_FIB_MATCH` the answer
-/// is the table's entry that matched, and `EHOSTUNREACH` where none did.
+/// is the table's entry that matched, of the type of the route made, and
+/// `EHOSTUNREACH` where none did.
 /// With `RTM_F_NOTIFY` its flags have `RTM_F_NOTIFY` and `RTCF_NOTIFY`,
 /// which Linux keeps on the cached route, so that later lookups through it
 /// show them too, and this does not.
@@ -3564,6 +3580,11 @@ fn lookup(
     let ip = Ipv4Addr::from(address);
     let named = Ipv4Addr::from(asked_source);
     let mut source = named;
+    // Whether the route is made at once, with no table looked in: to a
+    // multicast or the limited broadcast address from a source of the
+    // loopback's and no device, or through a device to a local multicast
+    // (224.0.0.0/24) or the limited broadcast one.
+    let mut direct = false;
     if !named.is_unspecified() {
         if named.is_multicast() || named.is_broadcast() {
             return Err(Errno::EINVAL);
@@ -3571,6 +3592,7 @@ fn lookup(
         if !addresses.is_local4(named) {
             return Err(ENETUNREACH);
         }
+        direct = oif == 0 && (ip.is_multicast() || ip.is_broadcast());
     }
     if oif != 0 {
         if oif != 1 {
@@ -3579,8 +3601,11 @@ fn lookup(
         if !network.is_up() {
             return Err(ENETUNREACH);
         }
+        direct = u32::from(ip) & 0xffff_ff00 == 0xe000_0000 || ip.is_broadcast();
         if source.is_unspecified() {
-            let scope = if ip.is_multicast() {
+            let scope = if direct {
+                Some(SCOPE_LINK)
+            } else if ip.is_multicast() {
                 Some(SCOPE_UNIVERSE)
             } else if ip.is_unspecified() {
                 Some(SCOPE_HOST)
@@ -3610,6 +3635,12 @@ fn lookup(
             source = Ipv4Addr::LOCALHOST;
         }
         (kind, matched_tos, gateway, table, metrics) = (Kind::Local, 0, None, None, NO_METRICS);
+    } else if direct {
+        // No table gave it, so `RTM_F_FIB_MATCH` has no entry to give.
+        if fib_match {
+            return Err(EHOSTUNREACH);
+        }
+        (kind, matched_tos, gateway, table, metrics) = (Kind::Unicast, 0, None, None, NO_METRICS);
     } else {
         match addresses.lookup4_flow(ip, tos, oif) {
             Ok(route) => {
@@ -3620,7 +3651,15 @@ fn lookup(
                 };
                 if fib_match {
                     let named = if lookup_table { from } else { TABLE_MAIN };
-                    return Ok(ipv4_route_of(RTM_NEWROUTE, &route, named, seq, port, 0));
+                    let mut answer = ipv4_route_of(RTM_NEWROUTE, &route, named, seq, port, 0);
+                    // Of the type of the route `__mkroute_output` made
+                    // (`rt_type`), as `inet_rtm_getroute` gives it.
+                    if ip.is_broadcast() {
+                        answer[23] = Kind::Broadcast.code();
+                    } else if ip.is_multicast() {
+                        answer[23] = RTN_MULTICAST;
+                    }
+                    return Ok(answer);
                 }
                 if source.is_unspecified()
                     && let Some(picked) = addresses.source4(&route, ip)
@@ -3628,16 +3667,13 @@ fn lookup(
                     source = picked;
                 }
                 // `__mkroute_output` drops the route's `fib_info`, and so
-                // its metrics, for the limited broadcast address, and for a
-                // multicast one when the route is shorter than
-                // 224.0.0.0/4's prefix (the default route, which it takes
-                // for want of a multicast one).
-                let held = if ip.is_broadcast() || (ip.is_multicast() && route.len < 4) {
-                    NO_METRICS
-                } else {
-                    route.metrics
-                };
-                let via = route.gateway.filter(|_| route.uses_gateway);
+                // its metrics and gateway, for the limited broadcast
+                // address, and for a multicast one when the route is
+                // shorter than 224.0.0.0/4's prefix (the default route,
+                // which it takes for want of a multicast one).
+                let dropped = ip.is_broadcast() || (ip.is_multicast() && route.len < 4);
+                let held = if dropped { NO_METRICS } else { route.metrics };
+                let via = route.gateway.filter(|_| route.uses_gateway && !dropped);
                 (kind, matched_tos, gateway, table, metrics) =
                     (route.kind, route.tos, via, Some(from), held);
             }
@@ -3662,12 +3698,24 @@ fn lookup(
     } else {
         TABLE_MAIN
     };
-    // `rt_fill_info` of the cached route the lookup made, which is local as
-    // it goes through `lo`.
-    let mut flags = if kind == Kind::Broadcast {
-        RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST
+    // `rt_fill_info` of the route `__mkroute_output` made, which is local as
+    // it goes through `lo`. Its type is broadcast for the limited broadcast
+    // address, multicast for a multicast one, and else the table's; a
+    // multicast one is local only to a group `lo` is a member of
+    // (`ip_check_mc_rcu`).
+    let (code, mut flags) = if ip.is_broadcast() {
+        (
+            Kind::Broadcast.code(),
+            RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST,
+        )
+    } else if ip.is_multicast() {
+        let member = ip == ALL_HOSTS && network.is_up();
+        let local = if member { RTCF_LOCAL } else { 0 };
+        (RTN_MULTICAST, RTM_F_CLONED | RTCF_MULTICAST | local)
+    } else if kind == Kind::Broadcast {
+        (kind.code(), RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST)
     } else {
-        RTM_F_CLONED | RTCF_LOCAL
+        (kind.code(), RTM_F_CLONED | RTCF_LOCAL)
     };
     if request_flags & RTM_F_NOTIFY != 0 {
         flags |= RTM_F_NOTIFY | RTCF_NOTIFY;
@@ -3680,7 +3728,7 @@ fn lookup(
         table_byte(table),
         0,
         RT_SCOPE_UNIVERSE,
-        kind.code(),
+        code,
     ];
     body.extend_from_slice(&flags.to_le_bytes());
     attribute(&mut body, RTA_TABLE, &table.to_le_bytes());
@@ -4699,6 +4747,109 @@ mod tests {
             Err(Errno::EINVAL)
         );
         assert!(request(RTM_DELROUTE, 0, &net6, 16, Some(&bad)).is_ok());
+    }
+
+    #[test]
+    fn lookups_of_groups_and_the_broadcast_take_mkroute_outputs_kind() {
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true, 0);
+        // A lookup with `tos`, `flags` and the attributes: its answer's
+        // rtmsg and attributes.
+        let get = |tos: u8, flags: u32, attrs: &[(u16, &[u8])]| {
+            let mut payload = vec![AF_INET, 0, 0, tos, 0, 0, 0, 0];
+            payload.extend_from_slice(&flags.to_le_bytes());
+            for &(kind, value) in attrs {
+                attribute(&mut payload, kind, value);
+            }
+            lookup(&network, &payload, 1, 7, 0, 0).map(|answer| {
+                let found: Vec<(u16, Vec<u8>)> = attributes(&answer[28..])
+                    .into_iter()
+                    .map(|(k, v)| (k, v.to_vec()))
+                    .collect();
+                (answer[16..28].to_vec(), found)
+            })
+        };
+        let flags = |header: &[u8]| u32::from_le_bytes(header[8..12].try_into().unwrap());
+        let has = |found: &[(u16, Vec<u8>)], kind: u16| found.iter().any(|(k, _)| *k == kind);
+        let source = [127, 0, 0, 1];
+        let one = 1u32.to_le_bytes();
+        // No route reaches a group or the broadcast address.
+        assert_eq!(get(0, 0, &[(RTA_DST, &[224, 0, 0, 1])]), Err(ENETUNREACH));
+        assert_eq!(get(0, 0, &[(RTA_DST, &[255; 4])]), Err(ENETUNREACH));
+        // From a source of the loopback's, the route is made with no
+        // table: of TOS 0, from no table, and no entry to match.
+        for (to, kind, expected) in [
+            ([224, 0, 0, 1], RTN_MULTICAST, RTCF_MULTICAST | RTCF_LOCAL),
+            ([224, 0, 0, 251], RTN_MULTICAST, RTCF_MULTICAST),
+            ([239, 1, 1, 1], RTN_MULTICAST, RTCF_MULTICAST),
+            ([255; 4], 3, RTCF_BROADCAST | RTCF_LOCAL),
+        ] {
+            let attrs: [(u16, &[u8]); 2] = [(RTA_DST, &to), (RTA_SRC, &source)];
+            let (header, found) = get(0x10, RTM_F_LOOKUP_TABLE, &attrs).unwrap();
+            assert_eq!((header[3], header[4], header[7]), (0, 0, kind), "{to:?}");
+            assert_eq!(flags(&header), RTM_F_CLONED | expected, "{to:?}");
+            assert!(found.contains(&(RTA_TABLE, vec![0; 4])));
+            assert!(!has(&found, RTA_PREFSRC));
+            assert_eq!(get(0, RTM_F_FIB_MATCH, &attrs), Err(EHOSTUNREACH));
+        }
+        // Through lo, so to a local group and the broadcast address, which
+        // no table is looked in for, and to another group on link.
+        for (to, kind) in [
+            ([224, 0, 0, 5], RTN_MULTICAST),
+            ([255; 4], 3),
+            ([239, 1, 1, 1], RTN_MULTICAST),
+        ] {
+            let attrs: [(u16, &[u8]); 2] = [(RTA_DST, &to), (RTA_OIF, &one)];
+            let (header, found) = get(0, RTM_F_LOOKUP_TABLE, &attrs).unwrap();
+            assert_eq!((header[4], header[7]), (0, kind), "{to:?}");
+            assert!(found.contains(&(RTA_TABLE, vec![0; 4])));
+            assert_eq!(get(0, RTM_F_FIB_MATCH, &attrs), Err(EHOSTUNREACH));
+        }
+        // Through the default route, a group's answer keeps its gateway
+        // only by a route of 224.0.0.0/4 or longer, and the broadcast
+        // address's never.
+        let add = |dst: [u8; 4], len: u8, gateway: Option<[u8; 4]>| {
+            let mut payload = vec![AF_INET, len, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
+            attribute(&mut payload, RTA_DST, &dst);
+            match gateway {
+                Some(gateway) => attribute(&mut payload, RTA_GATEWAY, &gateway),
+                None => {
+                    payload[6] = 253;
+                    attribute(&mut payload, RTA_OIF, &1u32.to_le_bytes());
+                }
+            }
+            let header = Header {
+                len: 0,
+                kind: RTM_NEWROUTE,
+                flags: NLM_F_REQUEST | 0x600,
+                seq: 1,
+            };
+            change_route(&network, &header, &payload).unwrap();
+        };
+        add([127, 1, 0, 0], 16, None);
+        add([0; 4], 0, Some([127, 1, 0, 1]));
+        let (header, found) = get(0, RTM_F_LOOKUP_TABLE, &[(RTA_DST, &[10, 1, 1, 1])]).unwrap();
+        assert_eq!((header[4], header[7]), (254, 1));
+        assert!(has(&found, RTA_GATEWAY));
+        for (to, kind) in [([224, 0, 0, 1], RTN_MULTICAST), ([255; 4], 3)] {
+            let (header, found) = get(0, RTM_F_LOOKUP_TABLE, &[(RTA_DST, &to)]).unwrap();
+            assert_eq!((header[4], header[7]), (254, kind), "{to:?}");
+            assert!(!has(&found, RTA_GATEWAY), "{to:?}");
+        }
+        // RTM_F_FIB_MATCH gives the table's entry, of the type made.
+        let (header, _) = get(0, RTM_F_FIB_MATCH, &[(RTA_DST, &[224, 0, 0, 1])]).unwrap();
+        assert_eq!((header[1], header[7]), (0, RTN_MULTICAST));
+        let (header, _) = get(0, RTM_F_FIB_MATCH, &[(RTA_DST, &[255; 4])]).unwrap();
+        assert_eq!((header[1], header[7]), (0, 3));
+        add([224, 0, 0, 0], 4, Some([127, 1, 0, 1]));
+        let (header, found) = get(0, 0, &[(RTA_DST, &[224, 0, 0, 1])]).unwrap();
+        assert_eq!(header[7], RTN_MULTICAST);
+        assert!(has(&found, RTA_GATEWAY));
+        // While lo is down, no group has it as a member.
+        network.set_up(false, 0);
+        let attrs: [(u16, &[u8]); 2] = [(RTA_DST, &[224, 0, 0, 1]), (RTA_SRC, &source)];
+        let (header, _) = get(0, 0, &attrs).unwrap();
+        assert_eq!(flags(&header), RTM_F_CLONED | RTCF_MULTICAST);
     }
 
     #[test]

@@ -14511,10 +14511,42 @@ int main(int argc, char **argv) {
             nl_select(ctl, port, "2001:db8::9", 0, 0, NULL, none, 0, 0, "six other oif none");
             nl_select(ctl, port, "2001:db8::9", 0, 0, "::1", none, 0, 0, "six other oif none from");
             /* Down: a device is ENETUNREACH. */
+            /* Groups and the limited broadcast address, whose answers are
+               of their own kind: made with no table from a source of the
+               loopback's, or through lo to a local group or the broadcast
+               address, and else by the tables. A group's is local only
+               while lo is a member of it, as of 224.0.0.1 while up. */
+            nl_select(ctl, port, "224.0.0.1", 0, 0, NULL, 0, 0, 0, "all hosts");
+            nl_select(ctl, port, "255.255.255.255", 0, 0, NULL, 0, 0, 0, "broadcast");
+            nl_select(ctl, port, "224.0.0.1", 0x10, 0x1000, "127.0.0.1", 0, 0, 0, "all hosts from");
+            nl_select(ctl, port, "224.0.0.251", 0, 0, "127.0.0.5", 0, 0, 0, "group from");
+            nl_select(ctl, port, "239.1.1.1", 0, 0x2000, "127.0.0.1", 0, 0, 0, "group from fibmatch");
+            nl_select(ctl, port, "255.255.255.255", 0, 0x1000, "127.0.0.1", 0, 0, 0, "broadcast from");
+            nl_select(ctl, port, "224.0.0.5", 0, 0x1000, NULL, 1, 0, 0, "local group oif lo");
+            nl_select(ctl, port, "224.0.0.5", 0, 0x2000, NULL, 1, 0, 0, "local group oif lo fibmatch");
+            nl_select(ctl, port, "239.1.1.1", 0, 0x1000, NULL, 1, 0, 0, "group oif lo");
+            nl_select(ctl, port, "255.255.255.255", 0, 0, NULL, 1, 0, 0, "broadcast oif lo");
+            /* Through a default route by a gateway, which a group's answer
+               keeps only by a route of 224.0.0.0/4 or longer, and the
+               broadcast address's never. */
+#define ROUTE4(...) ((struct nl_rt){.family = AF_INET, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+            nl_route(ctl, port, 24, add, "10.20.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "add link");
+            nl_route(ctl, port, 24, add, NULL, 0, ROUTE4(.gw = "10.20.0.1"), "add default");
+            nl_select(ctl, port, "10.30.1.1", 0, 0x1000, NULL, 0, 0, 0, "default");
+            nl_select(ctl, port, "224.0.0.1", 0, 0x1000, NULL, 0, 0, 0, "all hosts by default");
+            nl_select(ctl, port, "224.0.0.1", 0, 0x2000, NULL, 0, 0, 0, "all hosts by default fibmatch");
+            nl_select(ctl, port, "239.1.1.1", 0, 0, NULL, 0, 0, 0, "group by default");
+            nl_select(ctl, port, "255.255.255.255", 0, 0x1000, NULL, 0, 0, 0, "broadcast by default");
+            nl_select(ctl, port, "255.255.255.255", 0, 0x2000, NULL, 0, 0, 0, "broadcast by default fibmatch");
+            nl_route(ctl, port, 24, add, "224.0.0.0", 4, ROUTE4(.gw = "10.20.0.1"), "add groups");
+            nl_select(ctl, port, "224.0.0.1", 0, 0x1000, NULL, 0, 0, 0, "all hosts by groups");
+            nl_select(ctl, port, "239.1.1.1", 0, 0, NULL, 1, 0, 0, "group by groups oif lo");
+#undef ROUTE4
             link.flags = 0;
             printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 1, 0, 0, "down oif lo");
             nl_select(ctl, port, "127.0.0.1", 0, 0, NULL, 0, 0, 0, "down");
+            nl_select(ctl, port, "224.0.0.1", 0, 0, "127.0.0.1", 0, 0, 0, "down all hosts from");
             fflush(stdout);
             _exit(0);
         }

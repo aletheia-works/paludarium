@@ -1730,7 +1730,16 @@ kernel.
     `RTM_F_FIB_MATCH` makes `EHOSTUNREACH`), and `0.0.0.0` leaves from the
     address of host scope it picks. The IPv4 tables match a route's TOS
     against the request's legacy TOS bits, and the answer gives the TOS of
-    the route that matched. An IPv6 answer gives the request's source as
+    the route that matched. An IPv4 answer for a multicast or the limited
+    broadcast address is of the multicast or broadcast type, as
+    `__mkroute_output` makes it (`RTCF_MULTICAST` or `RTCF_BROADCAST`, and
+    `RTCF_LOCAL` for the broadcast address and a group `lo` is a member
+    of, 224.0.0.1 while it is up), and with `RTM_F_FIB_MATCH` the table's
+    entry takes that type too; from a source of the loopback's and no
+    device, and through `lo` to a local group (224.0.0.0/24) or the
+    broadcast address, it is made with no table looked in (of TOS 0 and no
+    table, and `EHOSTUNREACH` with `RTM_F_FIB_MATCH`), from an address of
+    link scope where no source is named. An IPv6 answer gives the request's source as
     `RTA_SRC`, and an output device but `lo` finds no route
     (`ENETUNREACH`) without a source, or to a loopback, link-local or
     multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
@@ -1750,7 +1759,7 @@ kernel.
     dump, a notification and a lookup's answer give a route's metrics but
     those of 0, as `rtnetlink_put_metrics` does (none for the limited
     broadcast address, and for a multicast one through a route of a prefix
-    shorter than 4, whose lookups drop them); an IPv4 removal that
+    shorter than 4, whose lookups drop them with the route's gateway); an IPv4 removal that
     names metrics takes only a route that has them, as `fib_metrics_match`
     compares them (unheld, so an MTU of 70000 is not the 65520 kept), and
     IPv6's does not look.

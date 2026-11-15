@@ -63,6 +63,72 @@ impl Alu {
     }
 }
 
+/// A shift or rotate of [`Fast`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Shift {
+    Shl,
+    Shr,
+    Sar,
+    Rol,
+    Ror,
+}
+
+impl Shift {
+    fn of(m: Mnemonic) -> Option<Self> {
+        Some(match m {
+            Mnemonic::Shl => Self::Shl,
+            Mnemonic::Shr => Self::Shr,
+            Mnemonic::Sar => Self::Sar,
+            Mnemonic::Rol => Self::Rol,
+            Mnemonic::Ror => Self::Ror,
+            _ => return None,
+        })
+    }
+
+    /// The result, the flags it changes and their values, of shifting or
+    /// rotating `a` by `count`, already masked, as [`Exec::shift`] and
+    /// [`Exec::rotate`] have them.
+    #[inline]
+    fn apply(self, a: u64, count: u8, size: u8) -> (u64, u64, u64) {
+        let kind = match self {
+            Self::Shl => alu::ShiftKind::Shl,
+            Self::Shr => alu::ShiftKind::Shr,
+            Self::Sar => alu::ShiftKind::Sar,
+            Self::Rol | Self::Ror => return self.rotate(a, count, size),
+        };
+        match alu::shift(kind, a, u64::from(count), size) {
+            Some((r, f)) => (r, flag::STATUS, f),
+            None => (a, 0, 0),
+        }
+    }
+
+    fn rotate(self, a: u64, count: u8, size: u8) -> (u64, u64, u64) {
+        if count == 0 {
+            return (a, 0, 0);
+        }
+        let width = alu::bits(size);
+        let c = u32::from(count) % width;
+        let left = self == Self::Rol;
+        let r = if c == 0 {
+            a
+        } else if left {
+            ((a << c) | (a >> (width - c))) & size_mask(size)
+        } else {
+            ((a >> c) | (a << (width - c))) & size_mask(size)
+        };
+        let top = 1u64 << (width - 1);
+        let cf = if left { r & 1 != 0 } else { r & top != 0 };
+        let of = if left {
+            (r & top != 0) != cf
+        } else {
+            ((r >> (width - 1)) ^ (r >> (width - 2))) & 1 != 0
+        };
+        let update = flag::CF | if count == 1 { flag::OF } else { 0 };
+        let flags = if cf { flag::CF } else { 0 } | if of { flag::OF } else { 0 };
+        (r, update, flags)
+    }
+}
+
 /// A second operand of [`Fast`]: a register or an immediate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
@@ -168,6 +234,25 @@ pub enum Fast {
         mem: Address,
         src: Source,
     },
+    /// `op r, [m]`.
+    AluLoad {
+        op: Alu,
+        dst: Register,
+        mem: Address,
+    },
+    /// `op [m], r/imm` for an operation that writes its result (no `lock`).
+    AluStore {
+        op: Alu,
+        mem: Address,
+        src: Source,
+    },
+    /// `shl`, `shr`, `sar`, `rol` or `ror` of a register by an immediate
+    /// (or 1), masked as the instruction masks it.
+    Shift {
+        op: Shift,
+        dst: Register,
+        count: u8,
+    },
 }
 
 /// A general-purpose register that is not one of the high bytes.
@@ -270,22 +355,38 @@ impl Fast {
             Mnemonic::Jmp => Self::Jmp(branch(a)?),
             Mnemonic::Call => Self::Call(branch(a)?),
             Mnemonic::Ret if a.is_none() => Self::Ret,
+            m if Shift::of(m).is_some() => {
+                let dst = gpr(a)?;
+                let count = match b {
+                    None => 1,
+                    Some(Operand::Immediate(v)) => v,
+                    Some(_) => return None,
+                } & if dst.size() == 8 { 63 } else { 31 };
+                Self::Shift {
+                    op: Shift::of(m)?,
+                    dst,
+                    count: count as u8,
+                }
+            }
             m => {
                 let op = Alu::of(m)?;
                 if let Some(dst) = gpr(a) {
-                    Self::Alu {
-                        op,
-                        dst,
-                        src: source(b, dst.size())?,
+                    match address(b) {
+                        Some(mem) if mem.size == dst.size() => Self::AluLoad { op, dst, mem },
+                        Some(_) => return None,
+                        None => Self::Alu {
+                            op,
+                            dst,
+                            src: source(b, dst.size())?,
+                        },
                     }
-                } else if op.writes() {
-                    return None;
                 } else {
                     let mem = address(a)?;
-                    Self::Compare {
-                        op,
-                        mem,
-                        src: source(b, mem.size)?,
+                    let src = source(b, mem.size)?;
+                    if op.writes() {
+                        Self::AluStore { op, mem, src }
+                    } else {
+                        Self::Compare { op, mem, src }
                     }
                 }
             }
@@ -408,6 +509,35 @@ pub(crate) fn execute(
             let a = x.load(x.fast_linear(&mem), size)?;
             let (_, flags) = op.apply(a, b, size);
             x.set_status(flag::STATUS, flags);
+            next
+        }
+        Fast::AluLoad { op, dst, mem } => {
+            let size = dst.size();
+            let b = x.load(x.fast_linear(&mem), size)?;
+            let a = x.read_reg(dst) & size_mask(size);
+            let (r, flags) = op.apply(a, b, size);
+            if op.writes() {
+                x.write_reg(dst, r & size_mask(size));
+            }
+            x.set_status(flag::STATUS, flags);
+            next
+        }
+        Fast::AluStore { op, mem, src } => {
+            let size = mem.size;
+            let b = x.source(src, size);
+            let address = x.fast_linear(&mem);
+            let a = x.load(address, size)?;
+            let (r, flags) = op.apply(a, b, size);
+            x.store(address, size, r & size_mask(size))?;
+            x.set_status(flag::STATUS, flags);
+            next
+        }
+        Fast::Shift { op, dst, count } => {
+            let size = dst.size();
+            let a = x.read_reg(dst) & size_mask(size);
+            let (r, update, flags) = op.apply(a, count, size);
+            x.write_reg(dst, r);
+            x.set_status(update, flags);
             next
         }
     };

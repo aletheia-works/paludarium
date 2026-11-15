@@ -1700,6 +1700,16 @@ fn put_pidfd(c: &mut Context<'_>, room: &mut (u64, u64), pid: u32) -> bool {
 /// even its header fits, and `room` as it was when it cannot be written.
 /// Returns whether it was cut.
 pub(crate) fn put_control(c: &Context<'_>, room: &mut (u64, u64), kind: u32, data: &[u8]) -> bool {
+    put_control_at(c, room, SOL_SOCKET, kind, data)
+}
+/// [`put_control`] of a message of another `level`.
+pub(crate) fn put_control_at(
+    c: &Context<'_>,
+    room: &mut (u64, u64),
+    level: u32,
+    kind: u32,
+    data: &[u8],
+) -> bool {
     let (at, left) = *room;
     if left < CMSG_HEADER as u64 {
         return true;
@@ -1708,7 +1718,7 @@ pub(crate) fn put_control(c: &Context<'_>, room: &mut (u64, u64), kind: u32, dat
     let len = usize::try_from(left).unwrap_or(usize::MAX).min(full);
     let mut cmsg = Vec::with_capacity(full);
     cmsg.extend((len as u64).to_le_bytes());
-    cmsg.extend(SOL_SOCKET.to_le_bytes());
+    cmsg.extend(level.to_le_bytes());
     cmsg.extend(kind.to_le_bytes());
     cmsg.extend(data);
     if c.mem.write(GuestAddr(at), &cmsg[..len]).is_ok() {

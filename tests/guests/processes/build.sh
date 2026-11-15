@@ -10,7 +10,9 @@ musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/keys" "$here/keys.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/inotify" "$here/inotify.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/fanotify" "$here/fanotify.c"
+musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/userfaultfd" "$here/userfaultfd.c"
 musl-gcc -static -pthread -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/aio" "$here/aio.c"
+musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/netlink-options" "$here/netlink-options.c"
 musl-gcc -static -O1 -fno-stack-protector -fcf-protection=none -fno-pie -no-pie -o "$out/x87" "$here/x87.c" -lm
 # The same on musl's dynamic linker by a name exec finds in the working
 # directory, where inotify-interpreter puts a copy of it.

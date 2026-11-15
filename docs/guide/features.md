@@ -58,7 +58,7 @@ kernel.
 | Group | System calls |
 |---|---|
 | Processes and threads | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `wait4`, `waitid`, `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `kcmp`, `process_vm_readv`/`process_vm_writev`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `set_tid_address`, `futex`, `futex_waitv`, `futex_wake`/`futex_wait`/`futex_requeue`, `set_robust_list`, `get_robust_list`, `sched_setaffinity`/`sched_getaffinity`, `getcpu`, `sched_yield`, `sched_setscheduler`/`sched_getscheduler`, `sched_setparam`/`sched_getparam`, `sched_setattr`/`sched_getattr`, `sched_get_priority_max`/`sched_get_priority_min`, `sched_rr_get_interval`, `ioprio_set`/`ioprio_get`, `personality`, `unshare`, `setns`, `membarrier`, `rseq`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid`, `getpriority`/`setpriority`, `prlimit64`/`getrlimit`/`setrlimit`, `prctl` |
-| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl`, `modify_ldt` |
+| Memory | `mmap` (anonymous, and files private or shared), `munmap`, `mremap`, `mprotect`, `pkey_mprotect`/`pkey_alloc`/`pkey_free`, `mseal`, `madvise`, `process_madvise`, `process_mrelease`, `mincore`, `cachestat`, `mlock`/`mlock2`/`munlock`/`mlockall`/`munlockall`, `mbind`, `set_mempolicy`/`get_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`, `move_pages`, `map_shadow_stack`, `msync`, `remap_file_pages`, `brk`, `arch_prctl`, `modify_ldt`, `userfaultfd` (see below) |
 | System V IPC | `shmget`, `shmat`, `shmdt`, `shmctl` (shared memory); `semget`, `semop`, `semtimedop`, `semctl` (semaphores); `msgget`, `msgsnd`, `msgrcv`, `msgctl` (message queues) |
 | POSIX message queues | `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` |
 | Keys | `add_key`, `request_key`, `keyctl` |
@@ -927,6 +927,45 @@ kernel.
   free and what a shrink drops is gone), with its context.
 - `msync` checks its arguments and the range, and with `MS_SYNC` or
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
+- `userfaultfd` makes a file through which a thread handles the faults of
+  others on memory it registered, as Linux's `fs/userfaultfd.c`. One that
+  the kernel's own faults reach as well (without `UFFD_USER_MODE_ONLY`)
+  needs `CAP_SYS_PTRACE` (`EPERM`, as `vm.unprivileged_userfaultfd` is 0),
+  checked before the flags (`EINVAL`). The file is
+  `anon_inode:[userfaultfd]`, open for reading, and belongs to the address
+  space it was made in, whoever holds it. `UFFDIO_API` takes the version
+  and the features once (`EINVAL` again), writing back the features it
+  offers and its ioctls, or zeros when it fails; it offers
+  `UFFD_FEATURE_SIGBUS`, `UFFD_FEATURE_THREAD_ID`,
+  `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM` and
+  `UFFD_FEATURE_MISSING_HUGETLBFS`, and `UFFD_FEATURE_EVENT_FORK` needs
+  `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
+  memory and shared anonymous memory for missing pages
+  (`UFFDIO_REGISTER_MODE_MISSING`), with Linux's checks in its order (the
+  range, then each VMA: `EINVAL` for one that cannot be registered,
+  `EBUSY` for one another `userfaultfd` has), making VMAs of their own, as
+  `/proc/<pid>/maps` shows them, with `um` in `smaps`; a `fork`ed child and a
+  mapping `mremap` moves do not keep it, and `UFFDIO_UNREGISTER` and closing
+  the file take it away. An instruction that touches a registered page
+  that has none (in shared memory, one no mapping of it has) waits, and the
+  file reads the fault as a `uffd_msg`, the oldest first: whether it was a
+  write, the page's address (the exact one with
+  `UFFD_FEATURE_EXACT_ADDRESS`) and, with `UFFD_FEATURE_THREAD_ID`, the
+  thread's ID. The wait ends when `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` fills
+  the page (unless `DONTWAKE`), `UFFDIO_WAKE` or `UFFDIO_UNREGISTER` takes
+  its range, or the file is closed, and a signal ends it too; then the
+  instruction runs again, as Linux retries the fault. With
+  `UFFD_FEATURE_SIGBUS` the fault raises SIGBUS (`BUS_ADRERR`) instead.
+  `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
+  does: `ENOENT` for a range that does not lie in one registered VMA,
+  `EEXIST` for a page that has one, `EFAULT` for a source that cannot be
+  read, and `EAGAIN` once one stops short, with what was filled in the
+  struct's last field. A read takes whole messages (`EINVAL` for a buffer
+  too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
+  `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
+  Linux's does, else `POLLIN` while a fault is not read yet.
+  `/proc/self/fdinfo` shows the faults not read and all those waiting, and
+  the API, as `userfaultfd_show_fdinfo`.
 - `remap_file_pages` maps a range of a shared mapping again at another page
   of its file or shared memory, as Linux's `mmap` of the mapping's own file
   does, keeping its protection. As on Linux, `prot` must be 0 and the range
@@ -1584,13 +1623,21 @@ kernel.
     the port and groups; a datagram to another socket's port reaches it
     (`ECONNREFUSED` for none). `recvmsg` gives the sender's `sockaddr_nl`,
     `MSG_PEEK` and `MSG_TRUNC` work, and `SO_RCVBUF`, `SO_SNDBUF`,
-    `SO_RCVTIMEO`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
-    `NETLINK_GET_STRICT_CHK` can be set. A message from the kernel that
+    `SO_RCVTIMEO`, `NETLINK_PKTINFO`, `NETLINK_BROADCAST_ERROR`,
+    `NETLINK_NO_ENOBUFS`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
+    `NETLINK_GET_STRICT_CHK` can be set; as in Linux's
+    `netlink_setsockopt`, a value shorter than an `int` is 0. With
+    `NETLINK_PKTINFO`, `recvmsg` gives each datagram's group (0 for one
+    to the socket's own port) in a `SOL_NETLINK` `NETLINK_PKTINFO` control
+    message, or `MSG_CTRUNC` when it does not fit.
+    `NETLINK_BROADCAST_ERROR` is only kept, as no notification here tells
+    anyone that it was not delivered. A message from the kernel that
     finds the receive buffer full is dropped, with `ENOBUFS` for the next
     receive, and the socket is then held congested, as Linux's
     `NETLINK_S_CONGESTED`: it drops the kernel's other messages too, with
-    no other `ENOBUFS`, until a receive finds its queue empty. A dump's
-    parts do not look at it. A datagram from another socket that finds no
+    no other `ENOBUFS`, until a receive finds its queue empty. A socket
+    with `NETLINK_NO_ENOBUFS` drops them with neither, and setting it
+    ends a congestion. A dump's parts do not look at it. A datagram from another socket that finds no
     room, or the socket congested, waits for room instead, or is `EAGAIN`
     with `MSG_DONTWAIT` or `O_NONBLOCK`, and overruns nothing.
   - **Requests:** the kernel, port 0, takes each message of a datagram as
@@ -2283,7 +2330,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
   `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
-  `fs/mqueue` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
+  `fs` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -2475,7 +2522,7 @@ kernel.
   `ms`, without `mw` for a file open only for reading or sealed against
   writes, and without `me` for the rings of AIO and `io_uring` and secret
   memory, whose pseudo file systems run nothing), `sh`, `gd` for the initial
-  stack, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
+  stack, `um` for a range a `userfaultfd` registered, the locks (`lo`, `lf`), the guards (`gu`), the advice (`sr`, `rr`,
   `dc`, `wf`, `dd`, `hg`, `nh`, `mg`), `de`, `mm` and `dd` of the rings and
   secret memory, the charge (`ac`, which private memory that was writable
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never

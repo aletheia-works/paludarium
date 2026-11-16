@@ -871,6 +871,7 @@ impl Kernel {
             if forced && signal.number == signal::SIGSEGV {
                 return self.terminate(thread, signal::SIGSEGV);
             }
+            let stepped = self.ptrace_handler_entering(thread);
             let limits = self.stack_limits(thread);
             if signals::install(
                 &mut thread.state,
@@ -903,7 +904,9 @@ impl Kernel {
                 signals::queue(&mut thread.state, rseq::forced_sigsegv());
                 continue;
             }
-            self.ptrace_handler_entered(thread, &mut restart);
+            if stepped {
+                self.ptrace_handler_entered(thread, &mut restart);
+            }
             return Next::Resume;
         }
         if let Some(mask) = thread.state.wait_restore_mask.take() {

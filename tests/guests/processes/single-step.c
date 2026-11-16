@@ -265,9 +265,9 @@ static int ptrace_case(void) {
     return 0;
 }
 
-/* A trap flag the tracer set is in the frame of a handler the tracee
- * enters while stepped; the tracer then lets it run, and rt_sigreturn
- * gives the flag back, as the tracee's own. */
+/* A tracee stepped into a handler: stepping ends there, so the handler's
+ * frame keeps no trap flag the tracer set, and nothing traps once the
+ * tracer lets it run. */
 static void frame_handler(int number) { (void)number; }
 
 static int forced_frame_case(void) {
@@ -304,7 +304,7 @@ static int forced_frame_case(void) {
     pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
     printf("handler: signal=%d code=%#x in-handler=%d tf-shown=%d\n", WSTOPSIG(status),
            info.si_code, regs.rip == (uint64_t)(uintptr_t)frame_handler, (regs.eflags & TF) != 0);
-    /* Let run: the flag comes back with the frame. */
+    /* Let run: rt_sigreturn gives back no flag. */
     for (int i = 0; i < 10; i++) {
         pt(PTRACE_CONT, child, 0, 0);
         status = wait_status(child);

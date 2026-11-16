@@ -1113,18 +1113,38 @@ impl Kernel {
         self.syscall_signal(signal);
     }
 
+    /// A thread is about to enter a signal handler: if it is
+    /// single-stepped, stepping ends before its frame is written, so that
+    /// the frame does not keep a trap flag its tracer set, as Linux's
+    /// `handle_signal` calls `user_disable_single_step` first. Whether it
+    /// was stepped, for [`Self::ptrace_handler_entered`].
+    pub(crate) fn ptrace_handler_entering(&mut self, thread: &mut Thread) -> bool {
+        if !self.group.traced() {
+            return false;
+        }
+        let mut tracees = self.processes.traces.lock();
+        let Some(tracee) = tracees.get_mut(&thread.tid) else {
+            return false;
+        };
+        if !matches!(tracee.mode, Mode::Step | Mode::SysemuStep) {
+            return false;
+        }
+        tracee.mode = if tracee.mode == Mode::SysemuStep {
+            Mode::Sysemu
+        } else {
+            Mode::Cont
+        };
+        if std::mem::take(&mut thread.state.ptrace.forced_tf) {
+            thread.cpu.rflags &= !flag::TF;
+        }
+        true
+    }
+
     /// A single-stepped thread has entered a signal handler: it stops with
     /// SIGTRAP before the handler's first instruction, as Linux's
     /// `signal_delivered` reports it (`ptrace_notify`).
     pub(crate) fn ptrace_handler_entered(&mut self, thread: &mut Thread, restart: &mut Restart) {
-        if !self.group.traced() {
-            return;
-        }
-        if let Some((Mode::Step | Mode::SysemuStep, _, _)) =
-            self.processes.traces.settings(thread.tid)
-        {
-            self.ptrace_report(thread, SIGTRAP, 0, restart);
-        }
+        self.ptrace_report(thread, SIGTRAP, 0, restart);
     }
 
     /// A traced thread enters `clone` (56), `fork` (57) or `vfork` (58),

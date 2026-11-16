@@ -4063,7 +4063,8 @@ one only with an `--allow-net`.
   (`TIF_FORCED_TF`), and any other resume takes it back: the tracee stops
   with `SIGTRAP` after one instruction, and after a `syscall` at the call's
   exit with `TRAP_BRKPT`. A single-stepped tracee entering a signal handler
-  stops with `SIGTRAP` before it. `PTRACE_SYSEMU_SINGLESTEP` steps as well,
+  stops with `SIGTRAP` before it, and is no longer stepped: the handler's
+  frame keeps no trap flag the tracer set. `PTRACE_SYSEMU_SINGLESTEP` steps as well,
   and stops at each call's entry, which does not run, as `PTRACE_SYSEMU`.
 - `PTRACE_PEEKSIGINFO` reads the siginfo of the signals pending for a
   stopped tracee, or with `PTRACE_PEEKSIGINFO_SHARED` for its process, in

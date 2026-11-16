@@ -3537,7 +3537,8 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   自分で立てたのでなければ、トレーサーにはレジスタで見えず（`TIF_FORCED_TF`）、ほかの再開で
   消えます。トレース対象は 1 命令の後に `SIGTRAP` で止まり、`syscall` の後はその出口で
   `TRAP_BRKPT` で止まります。シングルステップ中のトレース対象は、シグナルハンドラーに入る前に
-  `SIGTRAP` で止まります。`PTRACE_SYSEMU_SINGLESTEP` も同じくステップし、さらに
+  `SIGTRAP` で止まり、そこでステップは終わります。ハンドラーのフレームには、トレーサーが
+  立てたトラップフラグは残りません。`PTRACE_SYSEMU_SINGLESTEP` も同じくステップし、さらに
   `PTRACE_SYSEMU` と同じく、各システムコールの入口で止まって実行しません。
 - `PTRACE_PEEKSIGINFO` は、止まっているトレース対象に、`PTRACE_PEEKSIGINFO_SHARED` 付きでは
   そのプロセスに保留中のシグナルの siginfo を、来た順に読みます。`PTRACE_GETSIGMASK` は

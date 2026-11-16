@@ -18996,6 +18996,156 @@ int main(int argc, char **argv) {
         result("maker", reaped(maker));
         return 0;
     }
+    if (!strcmp(mode, "route-input")) {
+        /* A child makes a network namespace with lo up, addresses and
+           routes, and looks routes up as packets coming in on lo would
+           take them (RTA_IIF, as `ip route get ... iif lo` sends):
+           ip_route_input_slow and ip6_route_input_lookup. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            /* A new namespace takes the first one's IPv4 settings, which a
+               host may have changed (Docker turns forwarding on, Ubuntu
+               reverse path filtering to 2); Linux's own, which the
+               emulator has and has no files for, are set: both off. */
+            static const char *const settings[] = {
+                "/proc/sys/net/ipv4/conf/all/forwarding", "/proc/sys/net/ipv4/conf/all/rp_filter",
+                "/proc/sys/net/ipv4/conf/default/rp_filter", "/proc/sys/net/ipv4/conf/lo/rp_filter"};
+            for (size_t i = 0; i < sizeof settings / sizeof settings[0]; i++) {
+                int fd = open(settings[i], O_WRONLY);
+                if (fd < 0) {
+                    /* A read-only /proc/sys (a container's) leaves the
+                       host's. */
+                    if (errno != ENOENT) printf("%s: open=%d\n", settings[i], -errno);
+                    continue;
+                }
+                if (write(fd, "0", 1) < 0) printf("%s: write=%d\n", settings[i], -errno);
+                close(fd);
+            }
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            const unsigned short add = 0x600;
+            /* While lo is down. */
+            nl_select(ctl, port, "127.0.0.1", 0, 0, "192.0.2.1", 0, 1, 0, "down local");
+            nl_select(ctl, port, "::1", 0, 0, "2001:db8:ff::1", 0, 1, 0, "down local6");
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            nl_addr_life(ctl, port, add, AF_INET, "10.9.0.1", 24, 1, NULL, 0, -1, "addr4");
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:9::1", 64, 1, NULL, 0, 0x02, "addr6");
+#define ROUTE4(...) ((struct nl_rt){.family = AF_INET, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+#define ROUTE6(...) ((struct nl_rt){.family = AF_INET6, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+            nl_route(ctl, port, 24, add, "10.20.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "unicast4");
+            nl_route(ctl, port, 24, add, "10.21.0.0", 16, ROUTE4(.kind = 6), "blackhole4");
+            nl_route(ctl, port, 24, add, "10.22.0.0", 16, ROUTE4(.kind = 7), "unreachable4");
+            nl_route(ctl, port, 24, add, "10.23.0.0", 16, ROUTE4(.kind = 8), "prohibit4");
+            nl_route(ctl, port, 24, add, "10.24.0.0", 16, ROUTE4(.tos = 0x10, .scope = 253, .oif = 1), "tos4");
+            nl_route(ctl, port, 24, add, "2001:db8:20::", 48, ROUTE6(.oif = 1), "unicast6");
+            nl_route(ctl, port, 24, add, "2001:db8:21::", 48, ROUTE6(.kind = 6), "blackhole6");
+            nl_route(ctl, port, 24, add, "2001:db8:22::", 48, ROUTE6(.kind = 7), "unreachable6");
+            nl_route(ctl, port, 24, add, "2001:db8:23::", 48, ROUTE6(.kind = 8), "prohibit6");
+            /* IPv4: a local destination from another host, with the
+               flags; from a source that is martian or local; to martian
+               destinations; broadcasts; multicast; what has no route or is
+               not local, as forwarding is off. */
+            static const struct {
+                const char *dst, *src;
+                unsigned tos, flags;
+                const char *label;
+            } asked4[] = {
+                {"10.9.0.1", "192.0.2.1", 0, 0, "local"},
+                {"10.9.0.1", "192.0.2.1", 0, 0x1000, "local lookup table"},
+                {"10.9.0.1", "192.0.2.1", 0, 0x2000, "local fibmatch"},
+                {"10.9.0.1", "192.0.2.1", 0x10, 0, "local tos"},
+                {"10.9.0.1", NULL, 0, 0, "local no source"},
+                {"10.9.0.1", "10.9.0.1", 0, 0, "local from itself"},
+                {"10.9.0.1", "10.9.0.2", 0, 0, "local from its subnet"},
+                {"10.9.0.1", "127.0.0.1", 0, 0, "local from loopback"},
+                {"10.9.0.1", "224.0.0.5", 0, 0, "local from multicast"},
+                {"10.9.0.1", "255.255.255.255", 0, 0, "local from broadcast"},
+                {"127.0.0.1", "192.0.2.1", 0, 0, "loopback"},
+                {"0.0.0.0", "192.0.2.1", 0, 0, "zero"},
+                {"0.0.0.0", NULL, 0, 0, "zero from zero"},
+                {"255.255.255.255", "192.0.2.1", 0, 0, "broadcast"},
+                {"255.255.255.255", NULL, 0, 0, "broadcast from zero"},
+                {"255.255.255.255", "10.9.0.1", 0, 0, "broadcast from local"},
+                {"255.255.255.255", "192.0.2.1", 0, 0x2000, "broadcast fibmatch"},
+                {"10.9.0.255", "192.0.2.1", 0, 0, "subnet broadcast"},
+                {"10.9.0.255", "192.0.2.1", 0, 0x1000, "subnet broadcast lookup table"},
+                {"224.0.0.1", "192.0.2.1", 0, 0, "all hosts"},
+                {"224.0.0.1", NULL, 0, 0, "all hosts from zero"},
+                {"224.0.0.1", "10.9.0.1", 0, 0, "all hosts from local"},
+                {"224.0.0.1", "192.0.2.1", 0, 0x1000, "all hosts lookup table"},
+                {"224.0.0.1", "192.0.2.1", 0, 0x2000, "all hosts fibmatch"},
+                {"239.1.1.1", "192.0.2.1", 0, 0, "group"},
+                {"10.20.1.1", "192.0.2.1", 0, 0, "unicast"},
+                {"10.21.1.1", "192.0.2.1", 0, 0, "blackhole"},
+                {"10.22.1.1", "192.0.2.1", 0, 0, "unreachable"},
+                {"10.23.1.1", "192.0.2.1", 0, 0, "prohibit"},
+                {"10.24.1.1", "192.0.2.1", 0x10, 0, "tos route"},
+                {"8.8.8.8", "192.0.2.1", 0, 0, "no route"},
+            };
+            for (size_t i = 0; i < sizeof asked4 / sizeof asked4[0]; i++)
+                nl_select(ctl, port, asked4[i].dst, asked4[i].tos, asked4[i].flags, asked4[i].src, 0, 1, 0,
+                          asked4[i].label);
+            nl_select(ctl, port, "10.9.0.1", 0, 0, "192.0.2.1", 0, 1, 6, "local tcp");
+            nl_select(ctl, port, "10.9.0.1", 0, 0, "192.0.2.1", 1, 1, 0, "local oif");
+            nl_select(ctl, port, "10.9.0.1", 0, 0, "192.0.2.1", 0, 4096, 0, "other device");
+            /* Last before a route is added, which flushes the cache: Linux
+               marks the cached route with RTCF_NOTIFY, so that later
+               lookups through it are marked too. */
+            nl_select(ctl, port, "10.9.0.1", 0, 0x100, "192.0.2.1", 0, 1, 0, "local notify");
+            /* With a local route of its own, the source is checked by a
+               lookup of it (__fib_validate_source). */
+            nl_route(ctl, port, 24, add, "10.40.0.0", 16, ROUTE4(.table = 255, .scope = 254, .kind = 2, .oif = 1),
+                     "custom local");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "192.0.2.1", 0, 1, 0, "custom local from host");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "10.20.1.1", 0, 1, 0, "custom local from unicast");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "10.21.1.1", 0, 1, 0, "custom local from blackhole");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "10.9.0.1", 0, 1, 0, "custom local from local");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "10.9.0.255", 0, 1, 0, "custom local from broadcast");
+            /* IPv6. */
+            static const struct {
+                const char *dst, *src;
+                unsigned flags;
+                const char *label;
+            } asked6[] = {
+                {"2001:db8:9::1", "2001:db8:ff::1", 0, "local6"},
+                {"2001:db8:9::1", "2001:db8:ff::1", 0x2000, "local6 fibmatch"},
+                {"2001:db8:9::1", NULL, 0, "local6 no source"},
+                {"2001:db8:9::1", "2001:db8:9::1", 0, "local6 from itself"},
+                {"::1", "2001:db8:ff::1", 0, "loopback6"},
+                {"::1", NULL, 0, "loopback6 no source"},
+                {"2001:db8:9::2", "2001:db8:ff::1", 0, "prefix6"},
+                {"fe80::1", "2001:db8:ff::1", 0, "link local6"},
+                {"ff02::1", "2001:db8:ff::1", 0, "all nodes6"},
+                {"2001:db8:20::1", "2001:db8:ff::1", 0, "unicast6"},
+                {"2001:db8:21::1", "2001:db8:ff::1", 0, "blackhole6"},
+                {"2001:db8:22::1", "2001:db8:ff::1", 0, "unreachable6"},
+                {"2001:db8:23::1", "2001:db8:ff::1", 0, "prohibit6"},
+                {"2001:4860::8888", "2001:db8:ff::1", 0, "no route6"},
+                {"::", NULL, 0, "zero6"},
+            };
+            for (size_t i = 0; i < sizeof asked6 / sizeof asked6[0]; i++)
+                nl_select(ctl, port, asked6[i].dst, 0, asked6[i].flags, asked6[i].src, 0, 1, 0, asked6[i].label);
+            nl_select(ctl, port, "2001:db8:9::1", 0, 0, "2001:db8:ff::1", 0, 4096, 0, "other device6");
+#undef ROUTE4
+#undef ROUTE6
+            link.flags = 0;
+            printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            nl_select(ctl, port, "10.9.0.1", 0, 0, "192.0.2.1", 0, 1, 0, "down local again");
+            nl_select(ctl, port, "10.20.1.1", 0, 0, "192.0.2.1", 0, 1, 0, "down unicast");
+            nl_select(ctl, port, "2001:db8:9::1", 0, 0, "2001:db8:ff::1", 0, 1, 0, "down local6 again");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
     if (!strcmp(mode, "route-metrics")) {
         /* A child makes a network namespace with lo up and adds IPv4 and
            IPv6 routes with metrics (RTA_METRICS, as `ip route add ... mtu`

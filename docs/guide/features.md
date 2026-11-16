@@ -2165,7 +2165,19 @@ kernel.
     route (`ENETUNREACH`) without a source, or to a loopback, link-local
     or multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
     and the family's ICMP, and `RTA_IIF` is `ENODEV` for a device there is
-    not. The mark, the user ID, the protocol and the ports choose among
+    not. With `RTA_IIF` of `lo`, a route is looked up as a packet coming in
+    on it would take it (`ip_route_input_slow`, `ip6_route_input_lookup`),
+    and the answer names `lo` as `RTA_IIF`. IPv4 drops martians
+    (`EINVAL`): a multicast, limited broadcast, loopback or 0.0.0.0
+    source, a loopback or 0.0.0.0 destination, a group `lo` has not
+    joined, and a source of the namespace's own, or with a local route a
+    request added, one a lookup finds a route to that is not unicast
+    (`fib_validate_source`). A local, broadcast or multicast destination
+    gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,
+    `RTCF_MULTICAST`), of the TOS of the route that matched and without a
+    preferred source; anything else would be forwarded, and is
+    `EHOSTUNREACH`. IPv6 gives the route the tables do, whatever its
+    source. The mark, the user ID, the protocol and the ports choose among
     policy rules and multipath routes, which there are none of, so they
     change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its

@@ -133,7 +133,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -235,6 +235,7 @@ mod linux {
                     | "route-dump"
                     | "route-metrics"
                     | "route-selectors"
+                    | "route-input"
                     | "address-lifetimes"
                     | "neighbours"
                     | "neighbour-requests"
@@ -252,6 +253,7 @@ mod linux {
                     | "ext-ack-route-dump"
                     | "ext-ack-route-metrics"
                     | "ext-ack-route-selectors"
+                    | "ext-ack-route-input"
                     | "ext-ack-address-lifetimes"
                     | "ext-ack-neighbour-requests"
                     | "ext-ack-neighbour-changes"
@@ -415,6 +417,7 @@ mod linux {
         processes_route_dump => ("route-dump","process"),
         processes_route_metrics => ("route-metrics","process"),
         processes_route_selectors => ("route-selectors","process"),
+        processes_route_input => ("route-input","process"),
         processes_address_lifetimes => ("address-lifetimes","process"),
         processes_neighbours => ("neighbours","process"),
         processes_neighbour_requests => ("neighbour-requests","process"),
@@ -432,6 +435,7 @@ mod linux {
         processes_ext_ack_route_dump => ("ext-ack-route-dump","process"),
         processes_ext_ack_route_metrics => ("ext-ack-route-metrics","process"),
         processes_ext_ack_route_selectors => ("ext-ack-route-selectors","process"),
+        processes_ext_ack_route_input => ("ext-ack-route-input","process"),
         processes_ext_ack_address_lifetimes => ("ext-ack-address-lifetimes","process"),
         processes_ext_ack_neighbour_requests => ("ext-ack-neighbour-requests","process"),
         processes_ext_ack_neighbour_changes => ("ext-ack-neighbour-changes","process"),

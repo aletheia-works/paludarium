@@ -648,9 +648,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ダンプだけです。近隣の表の設定（`RTM_SETNEIGHTBL`）、MCTP の近隣（`AF_MCTP` の
   `RTM_NEWNEIGH` と `RTM_DELNEIGH`）、ブリッジの転送データベース（`AF_BRIDGE` の
   `RTM_GETNEIGH`、`RTM_NEWNEIGH`、`RTM_DELNEIGH`）、ルール、キューイング規律などは
-  `EOPNOTSUPP` で、入力の経路の引き当て
-  （`ip route get ... iif` が送る `RTA_IIF`）、`lo` の名前の変更、ほかの属性の設定も
-  そうです。経路は
+  `EOPNOTSUPP` で、`lo` の名前の変更、ほかの属性の設定もそうです。入力の経路の
+  引き当て（`RTA_IIF`）は、Linux 自身の設定と同じく、転送も逆経路のフィルターも
+  切ったものとします。Linux の新しい名前空間は IPv4 の設定を最初の名前空間から
+  受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
+  フィルターを 2 にします）。それを変えるファイル（`/proc/sys/net/ipv4/conf`）も
+  ありません。経路は
   `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、
   カプセル化、ネクストホップのオブジェクト、
   realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の

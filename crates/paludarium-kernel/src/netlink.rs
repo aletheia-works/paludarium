@@ -3748,8 +3748,8 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// `ERANGE`), and a longer one counts as its first bytes; `EOPNOTSUPP` for
 /// an `RTA_IP_PROTO` but TCP, UDP and the family's ICMP
 /// (`rtm_getroute_parse_ip_proto`); then `ENODEV` for an input route
-/// (`RTA_IIF`) of another device than `lo`, and `EOPNOTSUPP` for one of
-/// `lo`, which is not supported.
+/// (`RTA_IIF`) of another device than `lo`, and one of `lo` is looked up
+/// as a packet coming in on it would be ([`input4`], [`input6`]).
 ///
 /// IPv4, as `ip_route_output_key_hash_rcu`: a source (`RTA_SRC`) is
 /// `EINVAL` when multicast or the limited broadcast address and
@@ -3844,11 +3844,28 @@ fn lookup(
     if proto.is_some_and(|p| !matches!(p, 6 | 17) && p != icmp) {
         return Err(extack::message(EOPNOTSUPP, "Unsupported ip proto"));
     }
-    if iif != 0 {
-        return Err(if iif == 1 { EOPNOTSUPP } else { ENODEV });
+    if iif != 0 && iif != 1 {
+        return Err(ENODEV);
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
     let addresses = network.addresses();
+    if iif == 1 {
+        let input = Input {
+            tos,
+            flags: request_flags,
+            mark,
+            uid: asked_uid,
+            reply: (seq, port),
+        };
+        return if v6 {
+            input6(&addresses, address6, source6, &input, now)
+        } else {
+            let four = |value: Option<&[u8]>| -> Result<[u8; 4], Errno> {
+                value.map_or(Ok([0; 4]), |v| v.first_chunk().copied().ok_or(ERANGE))
+            };
+            input4(network, &addresses, four(dst)?, four(src)?, &input)
+        };
+    }
     if v6 {
         let ip = Ipv6Addr::from(address6);
         if !network.is_up() {
@@ -4078,6 +4095,208 @@ fn lookup(
         attribute(&mut body, RTA_UID, &uid.to_le_bytes());
     }
     attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
+    Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
+}
+/// What an input route lookup asks besides its addresses: the TOS, the
+/// `rtm_flags`, the mark, the user ID it names, if any, and the request's
+/// sequence number and port.
+struct Input {
+    tos: u8,
+    flags: u32,
+    mark: u32,
+    uid: Option<u32>,
+    reply: (u32, u32),
+}
+/// An IPv4 route lookup for a packet in on `lo` to `address` from
+/// `source` (`RTA_IIF`), as `inet_rtm_getroute` takes it through
+/// `ip_route_input_rcu`, with forwarding off and reverse path filtering
+/// off, Linux's own settings, which a new namespace of Linux takes from
+/// the first one's instead. `EINVAL` for what `ip_route_input_slow` drops,
+/// in its order: a multicast destination of a group `lo` has not joined
+/// (only 224.0.0.1, while it is up), or from a multicast, limited
+/// broadcast or loopback source, from none but to a group of the local
+/// net, or from a source of the namespace ([`Addresses::valid_source4`]);
+/// a multicast or limited broadcast source; then, but to the limited
+/// broadcast address or from and to 0.0.0.0, a source or destination of
+/// 0.0.0.0 or of the loopback net. A multicast or broadcast one (also a
+/// destination a broadcast route has) is checked by its source too, as is
+/// a local one. Any other is `EHOSTUNREACH`, as it would be forwarded, and
+/// so is one no route takes (`fib_lookup`'s error). The answer, as
+/// `rt_fill_info` gives an input route: of the route's type (or broadcast
+/// or multicast), with `RTCF_LOCAL` and `RTCF_BROADCAST` or
+/// `RTCF_MULTICAST`, of the TOS of the route that matched, the source as
+/// `RTA_SRC` where there is one, `lo` as `RTA_OIF` and `RTA_IIF`, no
+/// metrics, and the mark and user ID it names. With `RTM_F_LOOKUP_TABLE`
+/// it names the table the route came from, 0 for none; with
+/// `RTM_F_FIB_MATCH` it is the route that matched, of the type made, and
+/// `EHOSTUNREACH` where no table gave one.
+///
+/// [`Addresses::valid_source4`]: crate::interface::Addresses::valid_source4
+fn input4(
+    network: &Network,
+    addresses: &crate::interface::Addresses,
+    address: [u8; 4],
+    asked_source: [u8; 4],
+    input: &Input,
+) -> Result<Vec<u8>, Errno> {
+    use crate::interface::{Kind, TABLE_LOCAL, TABLE_MAIN};
+    use core::net::Ipv4Addr;
+    let (ip, src) = (Ipv4Addr::from(address), Ipv4Addr::from(asked_source));
+    let martian = |src: Ipv4Addr| src.is_multicast() || src.is_broadcast();
+    // The route's type and flags, and the table entry it came from.
+    let (code, flags, route) = if ip.is_multicast() {
+        // `ip_route_input_mc`, for a group `lo` has joined
+        // (`ip_check_mc_rcu`), after `ip_mc_validate_source`.
+        if ip != ALL_HOSTS || !network.is_up() || martian(src) || src.is_loopback() {
+            return Err(Errno::EINVAL);
+        }
+        let local_group = u32::from(ip) & 0xffff_ff00 == 0xe000_0000;
+        if src.is_unspecified() && !local_group
+            || !src.is_unspecified() && !addresses.valid_source4(src)
+        {
+            return Err(Errno::EINVAL);
+        }
+        (RTN_MULTICAST, RTCF_MULTICAST | RTCF_LOCAL, None)
+    } else if martian(src) {
+        return Err(Errno::EINVAL);
+    } else if ip.is_broadcast() || src.is_unspecified() && ip.is_unspecified() {
+        // `brd_input`, before any lookup.
+        if !src.is_unspecified() && !addresses.valid_source4(src) {
+            return Err(Errno::EINVAL);
+        }
+        (Kind::Broadcast.code(), RTCF_BROADCAST | RTCF_LOCAL, None)
+    } else if src.is_unspecified() || ip.is_unspecified() || ip.is_loopback() || src.is_loopback() {
+        return Err(Errno::EINVAL);
+    } else {
+        // Forwarding off, what no route takes is `EHOSTUNREACH`, and so is
+        // what is not local nor broadcast.
+        let route = addresses
+            .lookup4_flow(ip, input.tos, 0)
+            .map_err(|_| EHOSTUNREACH)?;
+        match route.kind {
+            Kind::Broadcast | Kind::Local => {
+                if !addresses.valid_source4(src) {
+                    return Err(Errno::EINVAL);
+                }
+                let flags = if route.kind == Kind::Broadcast {
+                    RTCF_BROADCAST | RTCF_LOCAL
+                } else {
+                    RTCF_LOCAL
+                };
+                (route.kind.code(), flags, Some(route))
+            }
+            _ => return Err(EHOSTUNREACH),
+        }
+    };
+    let (seq, port) = input.reply;
+    // The local table shares the main one's trie.
+    let from = route.map_or(0, |r| {
+        if r.table == TABLE_LOCAL {
+            TABLE_MAIN
+        } else {
+            r.table
+        }
+    });
+    let table = if input.flags & RTM_F_LOOKUP_TABLE != 0 {
+        from
+    } else {
+        TABLE_MAIN
+    };
+    if input.flags & RTM_F_FIB_MATCH != 0 {
+        let Some(route) = route else {
+            return Err(EHOSTUNREACH);
+        };
+        let mut answer = ipv4_route_of(RTM_NEWROUTE, &route, table, seq, port, 0);
+        answer[23] = code;
+        return Ok(answer);
+    }
+    let mut flags = RTM_F_CLONED | flags;
+    if input.flags & RTM_F_NOTIFY != 0 {
+        flags |= RTM_F_NOTIFY | RTCF_NOTIFY;
+    }
+    let mut body = vec![
+        AF_INET,
+        32,
+        if src.is_unspecified() { 0 } else { 32 },
+        route.map_or(0, |r| r.tos),
+        table_byte(table),
+        0,
+        RT_SCOPE_UNIVERSE,
+        code,
+    ];
+    body.extend_from_slice(&flags.to_le_bytes());
+    attribute(&mut body, RTA_TABLE, &table.to_le_bytes());
+    attribute(&mut body, RTA_DST, &address);
+    if !src.is_unspecified() {
+        attribute(&mut body, RTA_SRC, &asked_source);
+    }
+    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    if input.mark != 0 {
+        attribute(&mut body, RTA_MARK, &input.mark.to_le_bytes());
+    }
+    if let Some(uid) = input.uid.filter(|&uid| uid != u32::MAX) {
+        attribute(&mut body, RTA_UID, &uid.to_le_bytes());
+    }
+    attribute(&mut body, RTA_IIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
+    Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
+}
+/// An IPv6 route lookup for a packet in on `lo` to `address` from
+/// `source` (`RTA_IIF`), as `inet6_rtm_getroute` takes it through
+/// `ip6_route_input_lookup`: the route the tables give
+/// ([`Addresses::lookup6`]: a rejecting route's error, `ENETUNREACH` for
+/// none, as for a link-local or multicast address, which no route of `lo`
+/// takes), whatever its source. The answer, as `rt6_fill_node` gives it
+/// with an input device: as an output lookup's, but `RTA_IIF` where that
+/// gives the source it leaves from, and with `RTM_F_FIB_MATCH` the route's
+/// own entry with `RTA_IIF`.
+///
+/// [`Addresses::lookup6`]: crate::interface::Addresses::lookup6
+fn input6(
+    addresses: &crate::interface::Addresses,
+    address: [u8; 16],
+    source: [u8; 16],
+    input: &Input,
+    now: u64,
+) -> Result<Vec<u8>, Errno> {
+    let route = addresses.lookup6(core::net::Ipv6Addr::from(address))?;
+    let (seq, port) = input.reply;
+    let fib_match = input.flags & RTM_F_FIB_MATCH != 0;
+    let mut body = vec![
+        AF_INET6,
+        if fib_match { route.len } else { 128 },
+        if fib_match { 0 } else { 128 },
+        0,
+        table_byte(route.table),
+        route.proto,
+        RT_SCOPE_UNIVERSE,
+        route.kind.code(),
+    ];
+    body.extend_from_slice(&0u32.to_le_bytes());
+    attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
+    if fib_match {
+        if route.len != 0 {
+            attribute(&mut body, RTA_DST, &route.dst.octets());
+        }
+    } else {
+        attribute(&mut body, RTA_DST, &address);
+        attribute(&mut body, RTA_SRC, &source);
+    }
+    attribute(&mut body, RTA_IIF, &1u32.to_le_bytes());
+    if let Some(source) = route.prefsrc {
+        attribute(&mut body, RTA_PREFSRC, &source.octets());
+    }
+    put_metrics(&mut body, &route.metrics);
+    attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    if fib_match {
+        let mut cache = [0; RTA_CACHEINFO_LEN];
+        cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
+        attribute(&mut body, RTA_CACHEINFO, &cache);
+    } else {
+        attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
+    }
+    attribute(&mut body, RTA_PREF, &[0]);
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }
 /// An `RTM_NEWROUTE` or `RTM_DELROUTE` request, as `inet_rtm_newroute`,
@@ -6373,7 +6592,31 @@ mod tests {
             Err(EOPNOTSUPP)
         );
         assert_eq!(get(AF_INET, 0, 0, &[(RTA_IIF, &[2, 0, 0, 0])]), Err(ENODEV));
-        assert_eq!(get(AF_INET, 0, 0, &[(RTA_IIF, &one)]), Err(EOPNOTSUPP));
+        // In on lo: martians are EINVAL, a local destination from another
+        // host is a local input route with RTA_IIF, and what would be
+        // forwarded EHOSTUNREACH.
+        let input = |to: [u8; 4], from: [u8; 4], flags: u32| {
+            get(
+                AF_INET,
+                0,
+                flags,
+                &[(RTA_DST, &to), (RTA_SRC, &from), (RTA_IIF, &one)],
+            )
+        };
+        let host = [192, 0, 2, 1];
+        assert_eq!(input([127, 0, 0, 1], host, 0), Err(Errno::EINVAL));
+        assert_eq!(input([0; 4], host, 0), Err(Errno::EINVAL));
+        assert_eq!(input([10, 9, 1, 1], [224, 0, 0, 5], 0), Err(Errno::EINVAL));
+        assert_eq!(input([10, 9, 1, 1], [0; 4], 0), Err(Errno::EINVAL));
+        assert_eq!(input([239, 1, 1, 1], host, 0), Err(Errno::EINVAL));
+        assert_eq!(input([8, 8, 8, 8], host, 0), Err(EHOSTUNREACH));
+        assert_eq!(input([127, 255, 255, 255], [0; 4], 0), Err(Errno::EINVAL));
+        let (header, found) = input([255; 4], host, 0).unwrap();
+        assert_eq!(header[7], 3);
+        assert_eq!(value(&found, RTA_IIF), Some(one.to_vec()));
+        assert_eq!(input([255; 4], host, RTM_F_FIB_MATCH), Err(EHOSTUNREACH));
+        let (header, _) = input([224, 0, 0, 1], host, RTM_F_LOOKUP_TABLE).unwrap();
+        assert_eq!((header[4], header[7]), (0, RTN_MULTICAST));
         // Down, a device is ENETUNREACH.
         network.set_up(false, 0);
         assert_eq!(through([127, 0, 0, 1], 0, 1), Err(ENETUNREACH));

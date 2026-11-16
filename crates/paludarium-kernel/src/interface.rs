@@ -876,6 +876,11 @@ pub(crate) struct Addresses {
     /// the head of the namespace's list: the local route of each of the
     /// loopback's addresses, and those added through gateways.
     pub mctp_routes: Vec<MctpRoute>,
+    /// Whether a request has added an IPv4 local route
+    /// (`fib_has_custom_local_routes`), which is never cleared: a packet's
+    /// source is then checked by a lookup of it
+    /// ([`Self::valid_source4`]).
+    custom_local4: bool,
     /// The loopback's neighbours, the oldest first.
     neighbours: Vec<Neighbour>,
     /// The proxy entries of the namespace, the oldest first.
@@ -920,6 +925,7 @@ impl Addresses {
             tables6: vec![TABLE_MAIN, TABLE_LOCAL],
             mctp: Vec::new(),
             mctp_routes: Vec::new(),
+            custom_local4: false,
             neighbours: Vec::new(),
             proxies: Vec::new(),
         }
@@ -1820,6 +1826,14 @@ impl Addresses {
     /// metrics' error comes after the scope's, as `fib_create_info` makes
     /// them.
     pub(crate) fn add_route4(&mut self, ask: &Ask4, up: bool) -> Result<Vec<Event>, Errno> {
+        let added = self.insert_route4(ask, up);
+        if added.is_ok() && ask.kind == Kind::Local.code() {
+            self.custom_local4 = true;
+        }
+        added
+    }
+    /// [`Self::add_route4`], but for what it marks.
+    fn insert_route4(&mut self, ask: &Ask4, up: bool) -> Result<Vec<Event>, Errno> {
         let table = if ask.table == 0 {
             TABLE_MAIN
         } else {
@@ -2179,6 +2193,19 @@ impl Addresses {
     /// The route to `ip` of a flow of `tos` through `oif` (any for 0).
     pub(crate) fn lookup4_flow(&self, ip: Ipv4Addr, tos: u8, oif: u32) -> Result<Route4, Errno> {
         self.lookup4_in(ip, SCOPE_UNIVERSE, oif, tos)
+    }
+    /// Whether a packet in on `lo` from `src` may come, as
+    /// `fib_validate_source` checks it with reverse path filtering off, as
+    /// a namespace has it: from none of the namespace's addresses; or,
+    /// once a request has added a local route, from a source a lookup
+    /// finds no route to or a unicast one (`__fib_validate_source`).
+    pub(crate) fn valid_source4(&self, src: Ipv4Addr) -> bool {
+        if !self.custom_local4 {
+            return !self.v4.iter().any(|a| a.local == src);
+        }
+        self.lookup4(src)
+            .ok()
+            .is_none_or(|route| route.kind == Kind::Unicast)
     }
     /// Whether `ip` is the loopback's (`__ip_dev_find`): one of its
     /// addresses, or else local to the local table's routes.

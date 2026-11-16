@@ -71,6 +71,8 @@ struct Emitter<'a, 'b> {
     load_sig: cranelift_codegen::ir::SigRef,
     store_sig: cranelift_codegen::ir::SigRef,
     move128_sig: cranelift_codegen::ir::SigRef,
+    /// Whether the code reaches the xmm words of the register block.
+    vector: bool,
 }
 
 impl Emitter<'_, '_> {
@@ -114,6 +116,7 @@ impl Emitter<'_, '_> {
     }
 
     fn word(&mut self, word: usize) -> Value {
+        self.vector |= word >= XMM;
         self.b.ins().load(
             I64,
             MemFlagsData::trusted(),
@@ -123,6 +126,7 @@ impl Emitter<'_, '_> {
     }
 
     fn set_word(&mut self, word: usize, v: Value) {
+        self.vector |= word >= XMM;
         self.b.ins().store(
             MemFlagsData::trusted(),
             v,
@@ -276,6 +280,7 @@ impl Emitter<'_, '_> {
 
     /// The address of xmm register `n` in the register block.
     fn xmm_slot(&mut self, n: u8) -> Value {
+        self.vector = true;
         let offset = ((XMM + 2 * usize::from(n & 15)) * 8) as i64;
         self.b.ins().iadd_imm_s(self.registers, offset)
     }
@@ -1052,12 +1057,14 @@ pub(crate) fn block_signature() -> Signature {
     sig
 }
 
-/// The function that runs `forms`.
+/// The function that runs `forms`, and whether it reaches the xmm words
+/// of the register block: the block it is given has [`WORDS`] words then,
+/// and [`XMM`] otherwise.
 pub(crate) fn function(
     forms: &[Form],
     helpers: Helpers,
     config: cranelift_codegen::isa::TargetFrontendConfig,
-) -> Function {
+) -> (Function, bool) {
     let mut func = Function::with_name_signature(UserFuncName::user(0, 0), block_signature());
     let mut context = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(&mut func, &mut context);
@@ -1098,6 +1105,7 @@ pub(crate) fn function(
         load_sig,
         store_sig,
         move128_sig,
+        vector: false,
     };
     let mut open = true;
     for (n, form) in forms.iter().enumerate() {
@@ -1110,10 +1118,11 @@ pub(crate) fn function(
         e.leave_at(forms.len(), last.next);
     }
 
+    let vector = e.vector;
     b.switch_to_block(exit);
     b.ins().store(flags, rip, registers, (RIP * 8) as i32);
     b.ins().return_(&[count]);
     b.seal_all_blocks();
     b.finalize(config);
-    func
+    (func, vector)
 }

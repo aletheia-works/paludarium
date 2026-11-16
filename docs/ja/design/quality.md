@@ -101,7 +101,7 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   確かめます。CI では `wasm-browser-network.mjs` が、Chromium、Firefox、WebKit、Safari で
   ゲストに中継を通させます。
 - 毎晩、Debian の動的リンクのプログラムを、Debian のコンテナの中で本物の Linux と
-  エミュレーターの両方で動かし、終了コードと標準出力を比べます
+  エミュレーターの両方で動かし（エミュレーターではネイティブの JIT なしとありで 1 回ずつ）、終了コードと標準出力を比べます
   （`tests/guests/distro/compare.py`）。シェル（fish も含む）、awk、Perl、Python、Ruby、PHP、Lua、Tcl、
   Node.js、Go、Java、Erlang、LuaJIT、OCaml、R、Guile、SBCL、pandoc、Emacs、BusyBox、SQLite、PostgreSQL、Redis、memcached、nginx、圧縮のツール、Git、OpenSSL、GnuPG、rsync、
   make、CMake、Ninja、gcc、g++、binutils などです。シグナルとタイマー、子プロセスとスレッド、ループバックのソケット、
@@ -157,7 +157,7 @@ lock 付きの命令のフェンスを外しても、テストはすべて通り
 | いつ | 何を |
 |---|---|
 | プルリクエストごと | Linux・macOS・Windows の単体テスト、lint、依存の検査、WebAssembly のビルド、x86-64 Linux での差分テスト（ネイティブの JIT ありでも）、カバレッジ、probe・aube・ripgrep の差分テスト、4 つの WebAssembly の環境と x86-64 Linux の WebKit での受け入れのテスト（x87 のプロセスのケースを x86-64 Linux とバイト単位で比べるものを含みます）、プルリクエストの 7 つの対象のうち変更が届くもののファジング（上を参照） |
-| 毎晩 | 14 の対象のファジング、macOS と Windows での差分テスト、x86-64 Linux での Debian のプログラム、4 つの WebAssembly の環境と x86-64 Linux の WebKit での JIT ありとなし、速さの測定 |
+| 毎晩 | 14 の対象のファジング、macOS と Windows での差分テスト、x86-64 Linux での Debian のプログラム（ネイティブの JIT ありとなし）、4 つの WebAssembly の環境と x86-64 Linux の WebKit での JIT ありとなし、速さの測定 |
 | 毎日 | 定期実行のワークフローが時間どおりに始まったかを確かめます。始まらなかった、動かなかった、無効になっていたときは Issue を立てます |
 | 毎週 | 固定した nightly の Rust、workspace の `rust-version`（最新の stable の Rust）、aube と ripgrep のゲストを最新のリリースへ上げます。それぞれのプルリクエストは、検査が通ると自分でマージされます |
 | 公開の前 | 公開する同じコードで、上のすべて（下を参照） |

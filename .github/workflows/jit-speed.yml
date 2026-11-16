@@ -1,0 +1,81 @@
+# The native JIT's speed against the interpreter, on one runner: the probe,
+# ripgrep and aube cases, Perl's benchmarks and 12 Debian programs, three
+# rounds each (two for the Debian programs), with and without the JIT.
+# .github/jit-bench/check.py fails the run when the JIT makes a case slower
+# than every round without it, one of the criteria for turning the JIT on by
+# default (docs/design/decisions.md). Run by hand; actions are pinned by
+# commit SHA and the default token is read-only.
+name: Native JIT speed
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BENCH: .github/jit-bench
+
+jobs:
+  speed:
+    name: native JIT speed (x86-64 Linux)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.x'
+          check-latest: true
+      - uses: ./.github/actions/guest-toolchain
+        with:
+          packages: musl-tools cmake perl make pkg-config
+      - uses: ./.github/actions/rust-toolchain
+      - run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl --toolchain "$RUST_TOOLCHAIN"
+      - name: Build the emulator, and a wrapper that turns the JIT on
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)'
+          cargo build --locked --release --target x86_64-unknown-linux-musl -p paludarium
+          mkdir -p bin
+          cp target/x86_64-unknown-linux-musl/release/paludarium bin/interpreter
+          cat > bin/jit <<'SH'
+          #!/bin/sh
+          exec "$(dirname "$0")/interpreter" --jit=100 "$@"
+          SH
+          chmod +x bin/*
+      - name: Build the guests
+        run: python tests/guests/programs/build.py target/guests/programs
+      - run: docker build --pull -t paludarium-distro tests/guests/distro
+      - name: Time with and without the JIT
+        run: |
+          for _ in 1 2 3; do
+            for v in interpreter jit; do
+              bash "$BENCH/programs.sh" "$PWD/bin/$v" "$v"
+              docker run --rm -v "$PWD/bin:/bin2:ro" -v "$PWD/$BENCH:/bench:ro" paludarium-distro bash /bench/perl.sh "/bin2/$v" "$v"
+            done
+          done 2>&1 | tee times.txt
+          docker run --rm -v "$PWD/tests/guests/distro:/distro:ro" -v "$PWD/bin:/bin2:ro" paludarium-distro bash -c '
+            for r in 1 2; do
+              for v in interpreter jit; do
+                python3 -B /distro/compare.py --emulator /bin2/$v --work /tmp/w-$v-$r --output /tmp/o-$v-$r --jobs 1 \
+                  parallel perl java compressors sbcl postgresql gcc python3 luajit mkfifo ocaml emacs >/dev/null 2>&1 || true
+                python3 -c "import json,sys; [print(\"case\", c[\"name\"], sys.argv[1], c[\"emulated\"][\"seconds\"], c[\"same\"]) for c in json.load(open(sys.argv[2]))]" $v /tmp/o-$v-$r/results.json
+              done
+            done
+          ' 2>&1 | tee -a times.txt
+          if grep -E '^DIFFERENT|^case .* False$' times.txt; then exit 1; fi
+      - name: Compare
+        run: python3 "$BENCH/check.py" times.txt | tee summary.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: jit-speed
+          path: |
+            times.txt
+            summary.txt

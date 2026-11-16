@@ -9681,7 +9681,8 @@ static int proc_other_limits_case(void) {
         _exit(0);
     }
     printf("other=%d\n", reaped(reader));
-    /* Ended and not reaped: no memory, the same limits; reaped: not there. */
+    /* Ended and not reaped: no memory, whose auxv and environ no longer
+       open (ESRCH), the same limits; reaped: not there. */
     snprintf(path, sizeof path, "/proc/%d/limits", (int)kid);
     pol_read(path, expected);
     if (write(done[1], "d", 1) != 1) return 84;
@@ -9693,6 +9694,8 @@ static int proc_other_limits_case(void) {
     printf("zombie statm=%ld [%.*s]", n, (int)strcspn(theirs, "\n"), theirs);
     snprintf(path, sizeof path, "/proc/%d/auxv", (int)kid);
     printf(" auxv=%ld", pol_read(path, theirs));
+    snprintf(path, sizeof path, "/proc/%d/environ", (int)kid);
+    printf(" environ=%ld", pol_read(path, theirs));
     snprintf(path, sizeof path, "/proc/%d/limits", (int)kid);
     n = pol_read(path, theirs);
     printf(" limits same=%d", n > 0 && !strcmp(theirs, expected));

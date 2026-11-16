@@ -2571,9 +2571,10 @@ kernel.
   reaped, `S (sleeping)` while its thread is in a system call, where it waits
   if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
-  `environ`, `auxv`, `maps` and `smaps` are empty, its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. A zombie's
-  `auxv` opens for any reader, as Linux's `proc_mem_open` checks only a
-  process that still has its memory.
+  `maps` and `smaps` are empty, its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
+  `environ` and `auxv` do not open (`ESRCH`, for any reader), as Linux's
+  `__mem_open` refuses a process with no memory before it checks the
+  reader.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0

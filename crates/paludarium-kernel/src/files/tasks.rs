@@ -158,15 +158,14 @@ impl Task {
 /// `maps`, `smaps`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
 /// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
 /// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself,
-/// read or looked in, as its mode lets (`proc_fd_permission`). `auxv` of a
-/// task with no memory left opens for anyone, as `proc_mem_open` checks
-/// only a task that has its memory.
+/// read or looked in, as its mode lets (`proc_fd_permission`). `environ`
+/// and `auxv` of a task with no memory left are `ESRCH` for anyone, as
+/// Linux's `__mem_open` refuses them before it checks the reader.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
+        TaskEntry::Environ | TaskEntry::Auxv if task.memory().is_none() => Err(Errno(3)), // ESRCH
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
-        TaskEntry::Auxv if task.memory().is_some() && !task.may_access(c, false) => {
-            Err(Errno::EACCES)
-        }
+        TaskEntry::Auxv if !task.may_access(c, false) => Err(Errno::EACCES),
         TaskEntry::Descriptors => descriptors_permission(c, task, crate::permissions::MAY_READ),
         TaskEntry::Descriptor(_) => {
             descriptors_permission(c, task, crate::permissions::MAY_EXEC)?;
@@ -238,7 +237,7 @@ pub(super) fn content(
         TaskEntry::Statm => crate::proc::render_statm(task.memory()),
         TaskEntry::Limits => crate::proc::render_limits(&task.view.limits),
         // What its exec saved, as Linux's `auxv_read`; nothing once its
-        // memory is gone.
+        // memory is gone, when it no longer opens.
         TaskEntry::Auxv if task.memory().is_some() => task.view.group.auxv(),
         TaskEntry::Auxv => Vec::new(),
         TaskEntry::IdMap(ids) => public.credentials.user.map_text(ids, reader),

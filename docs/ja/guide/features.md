@@ -2235,9 +2235,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
   コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
-  持ちません。Linux と同じく、`cmdline`、`environ`、`auxv`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。
-  Linux の `proc_mem_open` はメモリが残るプロセスだけを確かめるので、ゾンビの `auxv` は
-  どの読み手も開けます。
+  持ちません。Linux と同じく、`cmdline`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。
+  Linux の `__mem_open` は、読み手を確かめる前にメモリのないプロセスを断るので、
+  ゾンビの `environ` と `auxv` は、どの読み手にも開けません（`ESRCH`）。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、

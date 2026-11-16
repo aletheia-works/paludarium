@@ -427,8 +427,9 @@ verified.
     `ipcmni_extend` boot option, and an ID a `*_next_id` asks for whose
     index and all after it below 32768 are taken is `ENOSPC`, where Linux
     gives an index past them. A read of `shm_rmid_forced` set removes no
-    orphans, where Linux's does as its write does. `/proc/sysvipc` shows its objects as they were when it was opened,
-    where Linux reads each one as the read reaches it.
+    orphans, where Linux's does as its write does. `/proc/sysvipc` shows
+    its objects as they were when it was opened, where Linux reads each one
+    as the read reaches it.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
     `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,

@@ -2412,7 +2412,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`proc_dointvec`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
   と同じく、`CAP_SYS_ADMIN` のある書き手から（`EPERM`）0 から 2 まで（`EINVAL`）を
   取り、いったん 1 になるとほかの値を取りません（`EPERM`）。`perf_event_open` と `bpf` は
-  そのときの値を確かめます。`/proc/sys/kernel` にあるのはこれらだけです。
+  そのときの値を確かめます。`shm_rmid_forced`（0 か 1。持ち主と書ける者は上限と同じ）を
+  設定すると、Linux の `shm_close` と `exit_shm` と同じく、セグメントは最後に外れたときに
+  消え、作ったスレッドが一度もつながなかったものは、そのスレッドが終わるか名前空間を
+  離れたときに消えます。設定したときには、どのマッピングにもない孤児のセグメントを
+  消します（`shm_destroy_orphaned`）。`auto_msgmni` は 0 を読め、0 か 1 を書いても何も
+  起きません。`shm_next_id`、`sem_next_id`、`msg_next_id`（モード 0444。名前空間の
+  ユーザー名前空間で `CAP_CHECKPOINT_RESTORE` か `CAP_SYS_ADMIN` を持つ者は書けます）は、
+  その種類の次のオブジェクトが一度だけ取る ID で、なければ -1 です。書けるのは 0 から
+  `INT_MAX` までで、オブジェクトはそのシーケンス番号と、その添字から最初の空いている
+  添字を取ります。`/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
+  ディレクトリも、Linux の木と同じく、名前の順に並べます。
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
   と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
   （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、

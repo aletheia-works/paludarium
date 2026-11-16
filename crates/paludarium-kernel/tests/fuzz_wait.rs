@@ -59,7 +59,9 @@ fn empty_pipe_read_consumes_fuzz_wait_quota() {
             rip: GuestAddr(0x1000),
         },
     );
-    finished.send(()).unwrap();
+    finished
+        .send(())
+        .expect("the watchdog cancelled the read after 1 s of real time");
     watchdog.join().unwrap();
     assert_eq!(thread.cpu.gpr[reg::RAX], Errno(4).to_syscall_return());
     assert_eq!(

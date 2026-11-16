@@ -375,10 +375,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux は `ESTALE` を返します。`PIDFD_THREAD` の pidfd の inode はプロセス全体のものです。
     `O_EXCL` を付けてハンドルから開いた pidfd には、CI の Linux 7.0 と同じく `PIDFD_THREAD`
     が残りません。Linux 7.2 以降は残します。
-  - System V IPC には、`/proc/sys/kernel` の `shm_rmid_forced`、`auto_msgmni`、
-    `shm_next_id`、`sem_next_id`、`msg_next_id` がありません。`IPCMNI` は、起動
-    オプション `ipcmni_extend` がないときと同じく、いつも 32768 です。`/proc/sysvipc` は開いたときのオブジェクトを
-    見せます。Linux は読み進めたところで、そのオブジェクトをその都度読みます。
+  - System V IPC の `IPCMNI` は、起動オプション `ipcmni_extend` がないときと同じく、
+    いつも 32768 です。`*_next_id` が求める ID は、その添字から 32768 未満がすべて
+    使われていれば `ENOSPC` です。Linux はその先の添字を与えます。設定した
+    `shm_rmid_forced` を読んでも孤児は消えません。Linux は書いたときと同じく消します。
+    `/proc/sysvipc` は開いたときのオブジェクトを見せます。Linux は読み進めたところで、
+    そのオブジェクトをその都度読みます。
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
     並びません。そこでは `open`、`stat`、`access`、`getdents`、`unlink`、`rmdir`、`statfs`、

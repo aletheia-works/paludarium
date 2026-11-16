@@ -2886,6 +2886,11 @@ impl Kernel {
             self.group
                 .leave_sem_undo_list(thread.tid, self.process.pid, self.wall_seconds());
         }
+        // ksys_unshare: CLONE_NEWIPC orphans the segments it made in the old
+        // namespace (`exit_shm`).
+        if flags & crate::namespaces::CLONE_NEWIPC != 0 {
+            self.group.leave_shm(thread.tid);
+        }
         Ok(0)
     }
     /// `setpriority(which, who, nice)`: sets the nice value of every thread
@@ -3104,7 +3109,8 @@ impl Kernel {
             match kind {
                 Kind::Net => mine.net = new,
                 Kind::Uts => mine.uts = new,
-                // ipcns_install leaves the semaphore undo list (`exit_sem`).
+                // ipcns_install leaves the semaphore undo list (`exit_sem`),
+                // and commit_nsset orphans the segments made (`exit_shm`).
                 Kind::Ipc => {
                     mine.ipc = new;
                     self.group.leave_sem_undo_list(
@@ -3112,6 +3118,7 @@ impl Kernel {
                         self.process.pid,
                         self.wall_seconds(),
                     );
+                    self.group.leave_shm(thread.tid);
                 }
                 Kind::Pid => mine.pid_for_children = new,
                 Kind::User => mine.user = new,
@@ -4623,6 +4630,12 @@ impl Kernel {
             && let Some(list) = self.group.take_sem_undo_list(thread.tid)
         {
             self.group.set_sem_undo_list(self.process.pid, list);
+        }
+        // So do the segments it made, which stay its own (the task's
+        // `shm_clist`).
+        if thread.tid != self.process.pid {
+            self.group
+                .renumber_shm_creator(thread.tid, self.process.pid);
         }
         thread.tid = self.process.pid;
         let closed = self.files.take_close_on_exec();

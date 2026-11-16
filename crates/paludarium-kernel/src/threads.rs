@@ -115,6 +115,9 @@ pub struct ThreadGroup {
     /// Each thread's System V semaphore undo list, once it has one, which
     /// `CLONE_SYSVSEM` shares (Linux's `sysvsem.undo_list`).
     sem_undo: Mutex<BTreeMap<u32, Arc<crate::sem::UndoList>>>,
+    /// What tells the System V shared memory segments each thread made
+    /// that it still runs (Linux's `sysvshm.shm_clist`).
+    shm_creators: Mutex<BTreeMap<u32, Arc<crate::shm::Creator>>>,
     /// The path of the program the process runs, which `/proc/self/exe`
     /// names (Linux's `exe_file`).
     executable: Mutex<Vec<u8>>,
@@ -239,6 +242,7 @@ impl Default for ThreadGroup {
             auxv: Mutex::default(),
             robust_lists: Mutex::default(),
             sem_undo: Mutex::default(),
+            shm_creators: Mutex::default(),
             executable: Mutex::default(),
             exe_file: Mutex::default(),
             public: Mutex::default(),
@@ -433,6 +437,53 @@ impl ThreadGroup {
             // (`setns` changes only the one its children go in), and the
             // leader keeps its numbers until the process is reaped.
             list.leave(&self.namespaces(tid).pid.keep(pid), now);
+        }
+    }
+    /// What marks the segments of `segments` that thread `tid` makes as its
+    /// own, which it is given now if it has none for them.
+    pub(crate) fn shm_creator(
+        &self,
+        tid: u32,
+        segments: &crate::shm::Segments,
+    ) -> Arc<crate::shm::Creator> {
+        let mut creators = self
+            .shm_creators
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let creator = creators.entry(tid).or_insert_with(|| segments.creator());
+        if !creator.of(segments) {
+            *creator = segments.creator();
+        }
+        Arc::clone(creator)
+    }
+    /// Thread `tid` leaves the segments it made, as it ends or leaves its
+    /// IPC namespace (Linux's `exit_shm`).
+    pub(crate) fn leave_shm(&self, tid: u32) {
+        let creator = self
+            .shm_creators
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tid);
+        if let Some(creator) = creator {
+            crate::shm::leave(creator);
+        }
+    }
+    /// The segments thread `from` made are its again under the number `to`,
+    /// as an exec gives it the leader's.
+    /// One the leader still had is left first, as the leader's exit does.
+    pub(crate) fn renumber_shm_creator(&self, from: u32, to: u32) {
+        let left = {
+            let mut creators = self
+                .shm_creators
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match creators.remove(&from) {
+                Some(creator) => creators.insert(to, creator),
+                None => None,
+            }
+        };
+        if let Some(creator) = left {
+            crate::shm::leave(creator);
         }
     }
     pub(crate) fn retired(&self, tid: u32) -> bool {
@@ -1733,6 +1784,7 @@ impl Kernel {
         };
         self.group
             .leave_sem_undo_list(tid, self.process.pid, self.wall_seconds());
+        self.group.leave_shm(tid);
         // As in `finish_thread`: no thread left runs the program.
         if alone {
             self.group.set_exe_file(None);
@@ -1826,6 +1878,8 @@ impl Kernel {
         // exit_sem: the last thread sharing the undo list applies it.
         self.group
             .leave_sem_undo_list(thread.tid, self.process.pid, self.wall_seconds());
+        // exit_shm: the segments it made are orphans now.
+        self.group.leave_shm(thread.tid);
         let alone = {
             let mut members = self
                 .group

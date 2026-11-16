@@ -18,11 +18,15 @@ await mkdir(outputDirectory, { recursive: true });
 const persist = () => writeFile(resolve(outputDirectory, "observations.json"), JSON.stringify(report, null, 2) + "\n"); await persist();
 const page = `<!doctype html><script type="module">
 import {runSuite} from '/packages/paludarium-wasm/tests/wasm-suite.mjs';
-// Safari's TypeError for a failed fetch says only "Load failed"; name the request and when it failed.
+// Safari's TypeError for a failed fetch says only "Load failed"; name the request, whether its
+// headers or its body failed, and when. A body read fails after the fetch itself has resolved.
 const plainFetch = globalThis.fetch;
 globalThis.fetch = async (resource, options) => {
- try { return await plainFetch(resource, options); }
- catch (error) { if (!(error instanceof TypeError)) throw error; throw new TypeError(error.message + ' (' + (options?.method ?? 'GET') + ' ' + String(resource) + ' at ' + Math.round(performance.now()) + ' ms)', { cause: error }); }
+ const named = (error, part) => { if (!(error instanceof TypeError)) return error; return new TypeError(error.message + ' (' + part + ' of ' + (options?.method ?? 'GET') + ' ' + String(resource) + ' at ' + Math.round(performance.now()) + ' ms)', { cause: error }); };
+ let response;
+ try { response = await plainFetch(resource, options); } catch (error) { throw named(error, 'headers'); }
+ for (const method of ['arrayBuffer', 'blob', 'json', 'text']) { const read = response[method].bind(response); response[method] = async () => { try { return await read(); } catch (error) { throw named(error, 'body'); } }; }
+ return response;
 };
 try {
  if (!crossOriginIsolated) throw new Error('Shared memory unavailable');
@@ -32,6 +36,10 @@ try {
 } catch(error) {window.__wasmReport={passed:false,complete:false,error:String(error)};}
 </script>`;
 const server = createServer(async (request, response) => {
+  // For a client error on this connection, which names no request: the connection's latest request,
+  // its response, and the bytes queued before it (a kept-alive connection counts all its responses;
+  // Node counts bytes queued, not sent, so whether the response finished tells a cut-off one apart).
+  Object.assign(request.socket, { lastRequest: request.method + " " + request.url, lastResponse: response, bytesBefore: request.socket.bytesWritten });
   const headers = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp", "Cache-Control": "no-store" };
   try {
     if (request.url === "/") response.writeHead(200, { ...headers, "Content-Type": "text/html" }).end(page);
@@ -57,7 +65,7 @@ const server = createServer(async (request, response) => {
 // shows here too.
 const CLIENT_ERROR_STATUS = { ERR_HTTP_REQUEST_TIMEOUT: "408 Request Timeout", HPE_HEADER_OVERFLOW: "431 Request Header Fields Too Large" };
 server.on("clientError", (error, socket) => {
-  console.error(JSON.stringify({ client_error: String(error), code: error.code ?? null }));
+  console.error(JSON.stringify({ client_error: String(error), code: error.code ?? null, last_request: socket.lastRequest ?? null, response_bytes_queued: socket.lastRequest ? socket.bytesWritten - socket.bytesBefore : null, response_finished: socket.lastResponse?.writableFinished ?? null }));
   if (socket.writable && socket.bytesWritten === 0) socket.end(`HTTP/1.1 ${CLIENT_ERROR_STATUS[error.code] ?? "400 Bad Request"}\r\n\r\n`);
   else socket.destroy();
 });

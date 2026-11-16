@@ -73,6 +73,11 @@ impl Queues {
     pub(crate) fn with_limits<R>(&self, f: impl FnOnce(&mut Limits) -> R) -> R {
         f(&mut self.lock().limits)
     }
+    /// Its IDs, whose next one `/proc/sys/kernel` reads and sets
+    /// ([`crate::sysctl`]).
+    pub(crate) fn with_ids<R>(&self, f: impl FnOnce(&mut ipc::Ids) -> R) -> R {
+        f(&mut self.lock().ids)
+    }
 }
 
 /// An IPC namespace's `kernel.msgmax`, `msgmnb` and `msgmni` (Linux's

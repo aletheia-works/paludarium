@@ -104,7 +104,14 @@ pub struct LoadedImage {
     pub initial_stack_pointer: GuestAddr,
     pub initial_break: GuestAddr,
     pub load_base: GuestAddr,
+    /// The auxiliary vector the initial stack holds, up to and with
+    /// `AT_NULL`, which Linux keeps as `saved_auxv` for
+    /// `/proc/<pid>/auxv` whatever the program then does to its stack.
+    pub auxv: [(u64, u64); AUXV_ENTRIES],
 }
+
+/// The entries of [`LoadedImage::auxv`], `AT_NULL`'s with them.
+pub const AUXV_ENTRIES: usize = 19;
 
 /// Decides about the interpreter a program asks for by name: returns the path
 /// to read it from, with what its mappings keep while they last (as each
@@ -385,12 +392,12 @@ impl StackWriter<'_> {
 }
 
 /// Builds the initial stack. Returns the 16-byte aligned stack pointer,
-/// which points at argc.
+/// which points at argc, and the auxiliary vector it holds.
 fn build_stack(
     mem: &mut AddressSpace,
     start: &StartInfo<'_>,
     image: &LoadedImage,
-) -> Result<u64, LoadError> {
+) -> Result<(u64, [(u64, u64); AUXV_ENTRIES]), LoadError> {
     let strings: u64 = start
         .argv
         .iter()
@@ -429,7 +436,7 @@ fn build_stack(
     let random = w.push_bytes(&start.random)?;
 
     use auxv::*;
-    let aux: [(u64, u64); 19] = [
+    let aux: [(u64, u64); AUXV_ENTRIES] = [
         (AT_PHDR, image.program_header_address.0),
         (AT_PHENT, elf::PHDR_SIZE),
         (AT_PHNUM, u64::from(image.program_header_count)),
@@ -465,7 +472,7 @@ fn build_stack(
         w.sp -= 8;
     }
     let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
-    w.push_bytes(&bytes)
+    Ok((w.push_bytes(&bytes)?, aux))
 }
 
 /// Loads the program at `path` from `fs` into `mem` and builds its stack.
@@ -643,8 +650,11 @@ fn load_image(
         initial_stack_pointer: GuestAddr(0),
         initial_break,
         load_base: GuestAddr(base),
+        auxv: [(0, 0); AUXV_ENTRIES],
     };
-    image.initial_stack_pointer = GuestAddr(build_stack(mem, start, &image)?);
+    let (stack, auxv) = build_stack(mem, start, &image)?;
+    image.initial_stack_pointer = GuestAddr(stack);
+    image.auxv = auxv;
     Ok(image)
 }
 

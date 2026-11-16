@@ -1498,7 +1498,9 @@ impl FileHandle for NetlinkSocket {
         self.receive(buf, false).map(|got| got.copied)
     }
     /// A send to the peer; it binds with the opener's process ID and acts
-    /// with the opener's capability, as no calling thread is known here.
+    /// with the opener's capability, as no calling thread is known here,
+    /// but for the namespaces an ID request names and the `CAP_NET_ADMIN`
+    /// it needs over them, which are the writer's ([`resolving`]).
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
         let sender = Sender {
             pid: self.opener_pid,
@@ -4806,6 +4808,19 @@ pub(crate) fn dispatch(
         }
         _ => Err(Errno::ENOSYS),
     }
+}
+/// For a `write` to a `NETLINK_ROUTE` socket, [`nsid::resolve`]: the
+/// peers its ID requests name as the writer sees them, and the writer's
+/// credentials for their `CAP_NET_ADMIN`, which the send takes, as
+/// Linux's `netlink_sendmsg` runs in the writer's `current`.
+pub(crate) fn resolving(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    bytes: &[u8],
+) -> Option<nsid::Resolved> {
+    of(file)
+        .filter(|socket| socket.protocol == NETLINK_ROUTE)
+        .map(|_| nsid::resolve(c, bytes))
 }
 /// What a receive returns: with `MSG_TRUNC`, the datagram's whole length.
 fn returned(n: usize, length: usize, flags: u64) -> u64 {

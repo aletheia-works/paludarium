@@ -109,16 +109,19 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 20] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 23] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
     (b"ns", 4),
     (b"environ", 8),
+    (b"auxv", 8),
     (b"status", 8),
+    (b"limits", 8),
     (b"comm", 8),
     (b"cmdline", 8),
     (b"stat", 8),
+    (b"statm", 8),
     (b"maps", 8),
     (b"cwd", 10),
     (b"root", 10),
@@ -132,16 +135,19 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 20] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 19] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 22] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
     (b"ns", 4),
     (b"environ", 8),
+    (b"auxv", 8),
     (b"status", 8),
+    (b"limits", 8),
     (b"comm", 8),
     (b"cmdline", 8),
     (b"stat", 8),
+    (b"statm", 8),
     (b"maps", 8),
     (b"cwd", 10),
     (b"root", 10),
@@ -165,6 +171,11 @@ pub(crate) enum TaskEntry {
     Stat,
     Cmdline,
     Environ,
+    /// `auxv`, the auxiliary vector its program was started with.
+    Auxv,
+    /// `limits`, its resource limits, and `statm`, its memory in pages.
+    Limits,
+    Statm,
     Comm,
     Exe,
     Cwd,
@@ -229,6 +240,9 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"stat" => TaskEntry::Stat,
         b"cmdline" => TaskEntry::Cmdline,
         b"environ" => TaskEntry::Environ,
+        b"auxv" => TaskEntry::Auxv,
+        b"limits" => TaskEntry::Limits,
+        b"statm" => TaskEntry::Statm,
         b"comm" => TaskEntry::Comm,
         b"exe" => TaskEntry::Exe,
         b"cwd" => TaskEntry::Cwd,
@@ -266,13 +280,15 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         [b"task"] => (None, TaskEntry::Threads),
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
         [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
-        // The process's own `ns`, user namespace files and mount tables
-        // are here (`/proc/self/mountinfo` and `mounts` are
-        // [`mount_table`]'s); the rest of its own directory is
+        // The process's own `ns`, user namespace files, mount tables,
+        // `auxv`, `limits` and `statm` are here (`/proc/self/mountinfo` and
+        // `mounts` are [`mount_table`]'s); the rest of its own directory is
         // `own_entry`'s.
-        [b"ns", ..] | [b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo"] => {
-            (None, entry(&parts))
-        }
+        [b"ns", ..]
+        | [
+            b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo" | b"auxv" | b"limits"
+            | b"statm",
+        ] => (None, entry(&parts)),
         _ if pid == own => return None,
         [] => (None, TaskEntry::Directory),
         _ => (None, entry(&parts)),
@@ -536,6 +552,78 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
     line.extend(s.name.iter().take_while(|&&b| b != 0));
     line.extend(format!(") {}\n", fields.join(" ")).into_bytes());
     line
+}
+/// `/proc/<pid>/statm`, as Linux's `proc_pid_statm` writes `task_statm`'s
+/// counts, in pages: the size of the mappings, the resident pages, those of
+/// them a file's or shared memory's, the program's code, 0, the private
+/// writable mappings and the stack (`data_vm` and `stack_vm`), and 0; all 0
+/// without memory, as a zombie's. The code is 0, as `stat`'s code range is.
+pub(crate) fn render_statm(memory: Option<&MemoryView>) -> Vec<u8> {
+    const PAGE: u64 = 4096;
+    let Some(memory) = memory else {
+        return b"0 0 0 0 0 0 0\n".to_vec();
+    };
+    let (mut size, mut resident, mut shared, mut data) = (0, 0, 0, 0);
+    let mut next = 0;
+    while let Some(vma) = memory.vma_from(next) {
+        let pages = (vma.end - vma.start) / PAGE;
+        let usage = memory.usage(vma.start, vma.end).unwrap_or_default();
+        size += pages;
+        resident += usage.resident;
+        shared += usage.resident.saturating_sub(usage.anonymous);
+        // Linux's `is_data_mapping` and `is_stack_mapping`.
+        let stack = vma.flags & vm::GROWSDOWN != 0;
+        if stack || vma.flags & (vm::WRITE | vm::SHARED) == vm::WRITE {
+            data += pages;
+        }
+        next = vma.end;
+    }
+    format!("{size} {resident} {shared} 0 0 {data} 0\n").into_bytes()
+}
+/// `/proc/<pid>/limits`, as Linux's `proc_pid_limits` writes the soft and
+/// hard limits, from `RLIMIT_CPU` to `RLIMIT_RTTIME`.
+pub(crate) fn render_limits(limits: &[(u64, u64); crate::processes::RLIMITS]) -> Vec<u8> {
+    const NAMES: [(&str, &str); crate::processes::RLIMITS] = [
+        ("Max cpu time", "seconds"),
+        ("Max file size", "bytes"),
+        ("Max data size", "bytes"),
+        ("Max stack size", "bytes"),
+        ("Max core file size", "bytes"),
+        ("Max resident set", "bytes"),
+        ("Max processes", "processes"),
+        ("Max open files", "files"),
+        ("Max locked memory", "bytes"),
+        ("Max address space", "bytes"),
+        ("Max file locks", "locks"),
+        ("Max pending signals", "signals"),
+        ("Max msgqueue size", "bytes"),
+        ("Max nice priority", ""),
+        ("Max realtime priority", ""),
+        ("Max realtime timeout", "us"),
+    ];
+    let value = |limit: u64| {
+        if limit == u64::MAX {
+            "unlimited".to_owned()
+        } else {
+            limit.to_string()
+        }
+    };
+    let mut text = String::from(
+        "Limit                     Soft Limit           Hard Limit           Units     \n",
+    );
+    for (&(soft, hard), (name, unit)) in limits.iter().zip(NAMES) {
+        text.push_str(&format!(
+            "{name:<25} {:<20} {:<20} ",
+            value(soft),
+            value(hard)
+        ));
+        if unit.is_empty() {
+            text.push('\n');
+        } else {
+            text.push_str(&format!("{unit:<10}\n"));
+        }
+    }
+    text.into_bytes()
 }
 /// `/proc/<pid>/comm`: the name, up to its NUL, and a newline.
 pub(crate) fn render_comm(name: &[u8]) -> Vec<u8> {
@@ -1729,6 +1817,46 @@ mod tests {
         assert_eq!(own_entry(b"/proc/selfish", 7), None);
     }
     #[test]
+    fn limits_are_as_linux_writes_them() {
+        let mut limits = [(u64::MAX, u64::MAX); crate::processes::RLIMITS];
+        limits[7] = (1024, 4096);
+        limits[13] = (0, 0);
+        let text = String::from_utf8(render_limits(&limits)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 17);
+        assert_eq!(
+            lines[0],
+            "Limit                     Soft Limit           Hard Limit           Units     "
+        );
+        assert_eq!(
+            lines[1],
+            "Max cpu time              unlimited            unlimited            seconds   "
+        );
+        assert_eq!(
+            lines[8],
+            "Max open files            1024                 4096                 files     "
+        );
+        assert_eq!(
+            lines[14],
+            "Max nice priority         0                    0                    "
+        );
+        assert!(text.ends_with("us        \n"), "{text}");
+    }
+    #[test]
+    fn statm_counts_pages() {
+        use paludarium_mmu::{AddressSpace, MappingKind};
+        assert_eq!(render_statm(None), b"0 0 0 0 0 0 0\n");
+        let mut mem = AddressSpace::new();
+        let at = mem
+            .map(None, 3 * 4096, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        mem.map(None, 4096, Prot::READ, MappingKind::Anonymous)
+            .unwrap();
+        mem.write(at, &[1]).unwrap();
+        mem.write(GuestAddr(at.0 + 4096), &[1]).unwrap();
+        assert_eq!(render_statm(Some(&mem.view())), b"4 2 0 0 0 3 0\n");
+    }
+    #[test]
     fn task_paths_are_other_processes_and_threads() {
         let path = |p: &[u8]| task_path(p, 7, 9);
         let at = |pid, tid, entry| Some(TaskPath { pid, tid, entry });
@@ -1778,7 +1906,18 @@ mod tests {
             path(b"/proc/7/task/9/smaps"),
             at(7, Some(9), TaskEntry::Maps(true))
         );
-        assert_eq!(path(b"/proc/8/statm"), at(8, None, TaskEntry::Missing));
+        // `auxv`, `limits` and `statm` of every task, the reader's own too.
+        assert_eq!(path(b"/proc/8/statm"), at(8, None, TaskEntry::Statm));
+        assert_eq!(path(b"/proc/7/auxv"), at(7, None, TaskEntry::Auxv));
+        assert_eq!(path(b"/proc/self/limits"), at(7, None, TaskEntry::Limits));
+        assert_eq!(
+            path(b"/proc/8/task/8/auxv"),
+            at(8, Some(8), TaskEntry::Auxv)
+        );
+        assert_eq!(
+            path(b"/proc/8/personality"),
+            at(8, None, TaskEntry::Missing)
+        );
         assert_eq!(path(b"/proc/8/fd/1"), at(8, None, TaskEntry::Descriptor(1)));
         assert_eq!(path(b"/proc/8/fd/"), at(8, None, TaskEntry::Descriptors));
         assert_eq!(
@@ -1810,7 +1949,7 @@ mod tests {
         for none in [
             &b"/proc/7"[..],
             b"/proc/self/stat",
-            b"/proc/7/auxv",
+            b"/proc/7/personality",
             b"/proc/08",
             b"/proc/0",
             b"/proc/loadavg",

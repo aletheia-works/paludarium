@@ -9418,6 +9418,214 @@ static int remounts_case(void) {
     return 0;
 }
 
+/* The moves case: MS_MOVE and pivot_root in a mount namespace of a user
+   namespace of its own (Linux master's do_move_mount and path_pivot_root),
+   with the working directory going along with a moved mount, and the old
+   root under the new one. */
+static char mv_base[] = "/tmp/paludarium-moves-XXXXXX";
+static void mv_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", mv_base, name); }
+/* The mount point of the parent of the top mount at `point`, from the
+   base (`.` for the base, `outside` for a parent outside it), or `-` for
+   no mount there. */
+static void mv_parent(const char *label, const char *point) {
+    static long ids[512], parents[512];
+    static char paths[512][256];
+    int n = 0;
+    char line[4096], out[256];
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    while (f && n < 512 && fgets(line, sizeof line, f))
+        if (sscanf(line, "%ld %ld %*s %*s %255s", &ids[n], &parents[n], paths[n]) == 3) n++;
+    if (f) fclose(f);
+    const char *shown = "-";
+    for (int i = n - 1; i >= 0; i--) {
+        if (strcmp(paths[i], point)) continue;
+        shown = "outside";
+        size_t len = strlen(mv_base);
+        for (int j = 0; j < n; j++) {
+            if (ids[j] != parents[i] || strncmp(paths[j], mv_base, len)) continue;
+            if (paths[j][len] == 0) shown = ".";
+            else if (paths[j][len] == '/') {
+                snprintf(out, sizeof out, "%s", paths[j] + len + 1);
+                shown = out;
+            }
+        }
+        break;
+    }
+    printf("%s %s\n", label, shown);
+}
+/* Whether the working directory is `want`. */
+static int mv_cwd(const char *want) {
+    char cwd[512];
+    return getcwd(cwd, sizeof cwd) && !strcmp(cwd, want);
+}
+static long mv_pivot(const char *new_root, const char *put_old) {
+    return syscall(SYS_pivot_root, new_root, put_old);
+}
+/* The names in the directory at `path`, but for `.` and `..`, or -errno. */
+static int mv_names(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return -errno;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)))
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) n++;
+    closedir(d);
+    return n;
+}
+static int mv_inner(void) {
+    char a[256], b[256], c[256], s[256], f[256], n[256], path[512], other[512];
+    mv_path(a, "a");
+    mv_path(b, "b");
+    mv_path(c, "c");
+    mv_path(s, "s");
+    mv_path(f, "f");
+    mv_path(n, "n");
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("a", mount("none", a, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/in", a);
+    mkdir(path, 0755);
+    RM("in", mount("none", path, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/sub", a);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/x", a);
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    printf("\nmove");
+    RM("null", mount(NULL, b, NULL, MS_MOVE, NULL));
+    RM("empty", mount("", b, NULL, MS_MOVE, NULL));
+    mv_path(path, "missing");
+    RM("missing", mount(path, b, NULL, MS_MOVE, NULL));
+    RM("not-root", mount(mv_base, b, NULL, MS_MOVE, NULL));
+    RM("root", mount("/", b, NULL, MS_MOVE, NULL));
+    RM("onto-file", mount(a, f, NULL, MS_MOVE, NULL));
+    RM("onto-itself", mount(a, a, NULL, MS_MOVE, NULL));
+    snprintf(path, sizeof path, "%s/sub", a);
+    RM("into-itself", mount(a, path, NULL, MS_MOVE, NULL));
+    snprintf(path, sizeof path, "%s/in", a);
+    chdir(path);
+    RM("moved", mount(a, b, NULL, MS_MOVE, NULL));
+    snprintf(path, sizeof path, "%s/in", b);
+    printf(" cwd=%d", mv_cwd(path));
+    snprintf(path, sizeof path, "%s/x", a);
+    snprintf(other, sizeof other, "%s/x", b);
+    RM("old-x", access(path, F_OK));
+    RM("new-x", access(other, F_OK));
+    printf("\n");
+    mv_parent("a", a);
+    mv_parent("b", b);
+    snprintf(path, sizeof path, "%s/in", b);
+    mv_parent("b/in", path);
+    printf("child");
+    RM("moved", mount(path, c, NULL, MS_MOVE, NULL));
+    printf(" cwd=%d\n", mv_cwd(c));
+    mv_parent("c", c);
+    chdir("/");
+    printf("shared");
+    RM("s", mount("none", s, "tmpfs", 0, NULL));
+    RM("make", mount(NULL, s, NULL, MS_SHARED, NULL));
+    snprintf(path, sizeof path, "%s/t", s);
+    mkdir(path, 0755);
+    snprintf(other, sizeof other, "%s/u", s);
+    mkdir(other, 0755);
+    RM("onto-shared", mount(c, path, NULL, MS_MOVE, NULL));
+    printf("\n");
+    rm_info("s", s, NULL);
+    rm_info("s/t", path, NULL);
+    printf("from-shared");
+    RM("out", mount(path, c, NULL, MS_MOVE, NULL));
+    RM("unbindable", mount(NULL, b, NULL, MS_UNBINDABLE, NULL));
+    RM("onto-shared", mount(b, other, NULL, MS_MOVE, NULL));
+    printf("\npivot");
+    RM("n", mount("none", n, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/old", n);
+    mkdir(path, 0755);
+    snprintf(other, sizeof other, "%s/hello", n);
+    close(open(other, O_CREAT | O_WRONLY, 0644));
+    mv_path(other, "missing");
+    RM("missing", mv_pivot(other, n));
+    RM("file", mv_pivot(f, n));
+    RM("old-missing", mv_pivot(n, other));
+    RM("old-file", mv_pivot(n, f));
+    RM("outside", mv_pivot(n, b));
+    RM("not-root", mv_pivot(path, path));
+    RM("root", mv_pivot("/", path));
+    RM("make", mount(NULL, n, NULL, MS_SHARED, NULL));
+    RM("shared", mv_pivot(n, path));
+    RM("unmake", mount(NULL, n, NULL, MS_PRIVATE, NULL));
+    printf("\n");
+    struct stat before;
+    stat(mv_base, &before);
+    chdir(n);
+    printf("pivoted");
+    RM("pivot", mv_pivot(".", "old"));
+    printf(" cwd=%d", mv_cwd("/"));
+    RM("hello", access("/hello", F_OK));
+    snprintf(path, sizeof path, "/old%s/f", mv_base);
+    RM("old-f", access(path, F_OK));
+    snprintf(path, sizeof path, "/old%s/n/hello", mv_base);
+    RM("under", access(path, F_OK));
+    struct stat root, old, base;
+    stat("/", &root);
+    stat("/old", &old);
+    snprintf(path, sizeof path, "/old%s", mv_base);
+    stat(path, &base);
+    printf(" devices=%d base=%d", root.st_dev != old.st_dev,
+           base.st_dev == before.st_dev && base.st_ino == before.st_ino);
+    RM("busy", umount2("/old", 0));
+    RM("detach", umount2("/old", MNT_DETACH));
+    printf(" names=%d\n", mv_names("/old"));
+    printf("again");
+    mkdir("/next", 0755);
+    RM("next", mount("none", "/next", "tmpfs", 0, NULL));
+    close(open("/next/mark", O_CREAT | O_WRONLY, 0644));
+    chdir("/next");
+    RM("pivot", mv_pivot(".", "."));
+    RM("detach", umount2(".", MNT_DETACH));
+    chdir("/");
+    RM("mark", access("/mark", F_OK));
+    printf(" names=%d\n", mv_names("/"));
+    return 0;
+}
+static int moves_case(void) {
+    if (!mkdtemp(mv_base)) return 93;
+    chmod(mv_base, 0755);
+    const char *dirs[] = {"a", "b", "c", "s", "n"};
+    char path[256];
+    for (unsigned i = 0; i < 5; i++) {
+        mv_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    mv_path(path, "f");
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(mv_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    mv_path(path, "f");
+    unlink(path);
+    for (unsigned i = 0; i < 5; i++) {
+        mv_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(mv_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -9549,6 +9757,231 @@ static int proc_other_maps_case(void) {
     return 0;
 }
 
+/* The proc-other-limits case: another process's statm, auxv and limits,
+   and this process's own, as Linux's proc_pid_statm, auxv_read and
+   proc_pid_limits make them: statm and limits for anyone, auxv for a reader
+   that ptrace_may_access lets read the process (PTRACE_MODE_READ_FSCREDS). */
+#define POL_SIZE 16384
+/* `path` into `buffer`, of POL_SIZE bytes: its length, or -errno. */
+static long pol_read(const char *path, char *buffer) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    long total = 0, n;
+    while (total < POL_SIZE - 1 && (n = read(fd, buffer + total, POL_SIZE - 1 - (size_t)total)) > 0) total += n;
+    close(fd);
+    buffer[total] = 0;
+    return n < 0 ? -errno : total;
+}
+/* The limits text of `pid`, as Linux writes it, from prlimit. */
+static void pol_limits(pid_t pid, char *out) {
+    static const char *const names[16][2] = {
+        {"Max cpu time", "seconds"},  {"Max file size", "bytes"},         {"Max data size", "bytes"},
+        {"Max stack size", "bytes"},  {"Max core file size", "bytes"},    {"Max resident set", "bytes"},
+        {"Max processes", "processes"}, {"Max open files", "files"},      {"Max locked memory", "bytes"},
+        {"Max address space", "bytes"}, {"Max file locks", "locks"},      {"Max pending signals", "signals"},
+        {"Max msgqueue size", "bytes"}, {"Max nice priority", ""},        {"Max realtime priority", ""},
+        {"Max realtime timeout", "us"},
+    };
+    int at = snprintf(out, POL_SIZE, "Limit                     Soft Limit           Hard Limit           Units     \n");
+    for (int i = 0; i < 16; i++) {
+        struct rlimit limit = {0, 0};
+        syscall(SYS_prlimit64, pid, i, NULL, &limit);
+        char soft[24], hard[24];
+        if (limit.rlim_cur == RLIM_INFINITY) snprintf(soft, sizeof soft, "unlimited");
+        else snprintf(soft, sizeof soft, "%llu", (unsigned long long)limit.rlim_cur);
+        if (limit.rlim_max == RLIM_INFINITY) snprintf(hard, sizeof hard, "unlimited");
+        else snprintf(hard, sizeof hard, "%llu", (unsigned long long)limit.rlim_max);
+        at += snprintf(out + at, POL_SIZE - at, "%-25s %-20s %-20s ", names[i][0], soft, hard);
+        if (*names[i][1]) at += snprintf(out + at, POL_SIZE - at, "%-10s\n", names[i][1]);
+        else at += snprintf(out + at, POL_SIZE - at, "\n");
+    }
+}
+/* The line of `text` that starts with `key`, without its newline. */
+static void pol_line(const char *text, const char *key, char *out, size_t size) {
+    const char *line = strstr(text, key);
+    size_t len = line ? strcspn(line, "\n") : 0;
+    if (len >= size) len = size - 1;
+    memcpy(out, line ? line : "", len);
+    out[len] = 0;
+}
+/* The fields of statm `text`: how many there are (7 on Linux). */
+static int pol_statm(const char *text, unsigned long long field[7]) {
+    return sscanf(text, "%llu %llu %llu %llu %llu %llu %llu", &field[0], &field[1], &field[2], &field[3], &field[4],
+                  &field[5], &field[6]);
+}
+/* The pages of `maps` in all, and those of its private writable mappings
+   and its stack (Linux's data_vm and stack_vm), [vsyscall] left out, as it
+   is no mapping of the process's own. */
+static void pol_maps_pages(const char *maps, unsigned long long *size, unsigned long long *data) {
+    *size = *data = 0;
+    for (const char *line = maps; *line;) {
+        unsigned long long start, end;
+        char perms[8] = "";
+        if (sscanf(line, "%llx-%llx %7s", &start, &end, perms) == 3) {
+            size_t len = strcspn(line, "\n");
+            int vsyscall = len >= 10 && !strncmp(line + len - 10, "[vsyscall]", 10);
+            if (!vsyscall) {
+                *size += (end - start) / 4096;
+                int stack = len >= 7 && !strncmp(line + len - 7, "[stack]", 7);
+                if (stack || (perms[1] == 'w' && perms[3] == 'p')) *data += (end - start) / 4096;
+            }
+        }
+        const char *next = strchr(line, '\n');
+        if (!next) break;
+        line = next + 1;
+    }
+}
+/* Whether auxv `bytes` of `n` bytes is whole pairs that end with AT_NULL,
+   and has `type` with `value`. */
+static int pol_auxv_has(const char *bytes, long n, unsigned long type, unsigned long value) {
+    const unsigned long *words = (const unsigned long *)bytes;
+    long pairs = n / 16;
+    if (n <= 0 || n % 16 || words[2 * pairs - 2] != AT_NULL || words[2 * pairs - 1] != 0) return 0;
+    for (long i = 0; i < pairs; i++)
+        if (words[2 * i] == type) return words[2 * i + 1] == value;
+    return 0;
+}
+static int proc_other_limits_case(void) {
+    /* What the child reads of itself: statm, auxv and limits. */
+    char *seen = mmap(NULL, 4 * POL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    static char theirs[POL_SIZE], expected[POL_SIZE], maps[1 << 16];
+    if (seen == MAP_FAILED) return 80;
+    long *seen_lengths = (long *)(seen + 3 * POL_SIZE);
+    memset(seen, 1, 4 * POL_SIZE);
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 81;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 82;
+    if (!kid) {
+        struct rlimit files = {100, 200}, core = {0, 1 << 20};
+        char byte = setrlimit(RLIMIT_NOFILE, &files) || setrlimit(RLIMIT_CORE, &core) ? 'l' : 'r';
+        seen_lengths[0] = pol_read("/proc/self/statm", seen);
+        seen_lengths[1] = pol_read("/proc/self/auxv", seen + POL_SIZE);
+        seen_lengths[2] = pol_read("/proc/self/limits", seen + 2 * POL_SIZE);
+        if (write(ready[1], &byte, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 83;
+    char path[64], line[128];
+    unsigned long long mine[7], other[7];
+    /* limits: the child's soft and hard limits, as prlimit gives them. */
+    snprintf(path, sizeof path, "/proc/%d/limits", (int)kid);
+    long n = pol_read(path, theirs);
+    pol_limits(kid, expected);
+    printf("child=%c limits match=%d seen=%d", byte, n > 0 && !strcmp(theirs, expected),
+           seen_lengths[2] > 0 && !strcmp(theirs, seen + 2 * POL_SIZE));
+    pol_line(theirs, "Max open files", line, sizeof line);
+    printf(" [%s]", line);
+    pol_line(theirs, "Max core file size", line, sizeof line);
+    printf(" [%s]\n", line);
+    n = pol_read("/proc/self/limits", theirs);
+    pol_limits(getpid(), expected);
+    printf("own limits match=%d", n > 0 && !strcmp(theirs, expected));
+    pol_line(theirs, "Limit", line, sizeof line);
+    printf(" [%s]\n", line);
+    /* statm: as the child reads it, but for its resident pages, which may
+       change between the reads. */
+    snprintf(path, sizeof path, "/proc/%d/statm", (int)kid);
+    n = pol_read(path, theirs);
+    int fields = pol_statm(theirs, other);
+    int seen_fields = pol_statm(seen, mine);
+    printf("statm fields=%d seen=%d", fields, seen_fields);
+    if (fields == 7 && seen_fields == 7)
+        printf(" size=%d shared<=resident=%d text=%d data=%d zeros=%d", other[0] == mine[0], other[2] <= other[1],
+               other[3] == mine[3], other[5] == mine[5], !other[4] && !other[6]);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/statm", (int)kid, (int)kid);
+    n = pol_read(path, expected);
+    printf(" task=%d\n", n > 0 && pol_statm(expected, mine) == 7 && mine[0] == other[0]);
+    /* This process's own statm against its maps: the size and the data. */
+    unsigned long long size, data;
+    long m = pol_read("/proc/self/statm", theirs);
+    int r = open("/proc/self/maps", O_RDONLY);
+    long got = 0, k;
+    while (r >= 0 && got < (long)sizeof maps - 1 && (k = read(r, maps + got, sizeof maps - 1 - (size_t)got)) > 0) got += k;
+    if (r >= 0) close(r);
+    maps[got] = 0;
+    pol_maps_pages(maps, &size, &data);
+    fields = pol_statm(theirs, mine);
+    printf("own statm read=%d fields=%d", m > 0, fields);
+    if (fields == 7) printf(" size=%d data=%d resident=%d", mine[0] == size, mine[5] == data, mine[1] > 0);
+    printf("\n");
+    /* auxv: the vector the child's exec saved, which its fork keeps. */
+    snprintf(path, sizeof path, "/proc/%d/auxv", (int)kid);
+    n = pol_read(path, theirs);
+    printf("auxv same=%d whole=%d", n > 0 && n == seen_lengths[1] && !memcmp(theirs, seen + POL_SIZE, (size_t)n),
+           pol_auxv_has(theirs, n, AT_PAGESZ, 4096));
+    printf(" entry=%d", pol_auxv_has(theirs, n, AT_ENTRY, getauxval(AT_ENTRY)));
+    m = pol_read("/proc/self/auxv", expected);
+    printf(" own same=%d", m == n && !memcmp(theirs, expected, (size_t)n));
+    printf(" own random=%d phdr=%d", pol_auxv_has(expected, m, AT_RANDOM, getauxval(AT_RANDOM)),
+           pol_auxv_has(expected, m, AT_PHDR, getauxval(AT_PHDR)));
+    snprintf(path, sizeof path, "/proc/%d/task/%d/auxv", (int)kid, (int)kid);
+    m = pol_read(path, expected);
+    printf(" task=%d\n", m == n && !memcmp(theirs, expected, (size_t)n));
+    /* Their modes, and their names in the directories. */
+    static const char *const names[] = {"statm", "auxv", "limits"};
+    for (int i = 0; i < 3; i++) {
+        struct stat st;
+        snprintf(path, sizeof path, "/proc/%d/%s", (int)kid, names[i]);
+        r = stat(path, &st);
+        printf("%s%s stat=%d mode=%o", i ? " " : "", names[i], r ? errno : 0, st.st_mode & 07777);
+    }
+    printf("\n");
+    for (int self = 0; self < 2; self++) {
+        if (self) snprintf(path, sizeof path, "/proc/self");
+        else snprintf(path, sizeof path, "/proc/%d", (int)kid);
+        DIR *dir = opendir(path);
+        int listed = 0;
+        for (struct dirent *e; dir && (e = readdir(dir));)
+            for (int i = 0; i < 3; i++) listed += !strcmp(e->d_name, names[i]);
+        if (dir) closedir(dir);
+        printf("%slisted=%d", self ? " own " : "", listed);
+    }
+    printf("\n");
+    /* A reader that is not the child's owner: statm and limits, but not
+       auxv (EACCES). */
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        snprintf(path, sizeof path, "/proc/%d/statm", (int)kid);
+        long s = pol_read(path, theirs);
+        snprintf(path, sizeof path, "/proc/%d/limits", (int)kid);
+        long l = pol_read(path, theirs);
+        snprintf(path, sizeof path, "/proc/%d/auxv", (int)kid);
+        long a = pol_read(path, theirs);
+        int o = open(path, O_PATH) >= 0 ? 0 : errno;
+        printf("other user statm=%d limits=%d auxv=%ld path=%d\n", s > 0, l > 0, a, o);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(reader));
+    /* Ended and not reaped: no memory, whose auxv and environ no longer
+       open (ESRCH), the same limits; reaped: not there. */
+    snprintf(path, sizeof path, "/proc/%d/limits", (int)kid);
+    pol_read(path, expected);
+    if (write(done[1], "d", 1) != 1) return 84;
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    snprintf(path, sizeof path, "/proc/%d/statm", (int)kid);
+    n = pol_read(path, theirs);
+    printf("zombie statm=%ld [%.*s]", n, (int)strcspn(theirs, "\n"), theirs);
+    snprintf(path, sizeof path, "/proc/%d/auxv", (int)kid);
+    printf(" auxv=%ld", pol_read(path, theirs));
+    snprintf(path, sizeof path, "/proc/%d/environ", (int)kid);
+    printf(" environ=%ld", pol_read(path, theirs));
+    snprintf(path, sizeof path, "/proc/%d/limits", (int)kid);
+    n = pol_read(path, theirs);
+    printf(" limits same=%d", n > 0 && !strcmp(theirs, expected));
+    printf(" status=%d", reaped(kid));
+    snprintf(path, sizeof path, "/proc/%d/statm", (int)kid);
+    printf(" reaped=%ld\n", pol_read(path, theirs));
+    munmap(seen, 4 * POL_SIZE);
+    return 0;
+}
 /* The proc-other-fds case: another process's fd and fdinfo, as Linux's
    fs/proc/fd.c makes them: fd is 0500 and its owner's, its links read and
    lead to the descriptors' files for a reader that ptrace_may_access lets
@@ -26633,9 +27066,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mounts-exe")) return mt_exe_case();
     if (!strcmp(mode, "binds")) return binds_case();
     if (!strcmp(mode, "remounts")) return remounts_case();
+    if (!strcmp(mode, "moves")) return moves_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();
+    if (!strcmp(mode, "proc-other-limits")) return proc_other_limits_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

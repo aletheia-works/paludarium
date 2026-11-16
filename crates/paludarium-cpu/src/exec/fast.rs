@@ -256,6 +256,17 @@ pub enum Fast {
     Push(u8),
     /// `push imm`, the immediate sign-extended to 64 bits.
     PushImmediate(u64),
+    /// `mul r` or `imul r`: rax times `src` into rdx:rax (ax for a byte).
+    MulWide {
+        src: Register,
+        signed: bool,
+    },
+    /// `imul r, r` (`a` is `dst`) or `imul r, r, imm`.
+    Imul {
+        dst: Register,
+        a: Register,
+        b: Source,
+    },
     /// `pop r64`.
     Pop(u8),
     Jcc {
@@ -411,10 +422,27 @@ impl Fast {
 
     fn form(i: &Instruction) -> Option<Self> {
         let (a, b) = (i.operand(0), i.operand(1));
+        if i.mnemonic == Mnemonic::Imul && b.is_some() {
+            let dst = gpr(a)?;
+            let src = gpr(b)?;
+            if src.size() != dst.size() {
+                return None;
+            }
+            let (a, b) = match i.operand(2) {
+                None => (dst, Source::Register(src)),
+                Some(Operand::Immediate(v)) => (src, Source::Immediate(v)),
+                Some(_) => return None,
+            };
+            return Some(Self::Imul { dst, a, b });
+        }
         if i.operand(2).is_some() {
             return None;
         }
         Some(match i.mnemonic {
+            Mnemonic::Mul | Mnemonic::Imul if b.is_none() => Self::MulWide {
+                src: gpr(a)?,
+                signed: i.mnemonic == Mnemonic::Imul,
+            },
             Mnemonic::Nop | Mnemonic::Endbr64 => Self::Nop,
             Mnemonic::Mov => {
                 if let Some(dst) = gpr(a) {
@@ -677,6 +705,33 @@ pub(crate) fn execute(
         }
         Fast::PushImmediate(v) => {
             x.push(v, 8)?;
+            next
+        }
+        Fast::MulWide { src, signed } => {
+            let size = src.size();
+            let b = x.read_reg(src) & size_mask(size);
+            let a = x.s.gpr[0] & size_mask(size);
+            let (full, overflow) = if signed {
+                let full = i128::from(sign_extend(a, size) as i64)
+                    * i128::from(sign_extend(b, size) as i64);
+                (full as u128, alu::imul(a, b, size).1)
+            } else {
+                let full = u128::from(a) * u128::from(b);
+                (full, full >> alu::bits(size) != 0)
+            };
+            x.write_wide(size, full)?;
+            let f = if overflow { flag::CF | flag::OF } else { 0 };
+            x.set_status(flag::CF | flag::OF, f);
+            next
+        }
+        Fast::Imul { dst, a, b } => {
+            let size = dst.size();
+            let a = x.read_reg(a) & size_mask(size);
+            let b = x.source(b, size);
+            let (r, overflow) = alu::imul(a, b, size);
+            x.write_reg(dst, r);
+            let f = if overflow { flag::CF | flag::OF } else { 0 };
+            x.set_status(flag::CF | flag::OF, f);
             next
         }
         Fast::Pop(r) => {

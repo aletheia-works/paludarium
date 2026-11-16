@@ -107,6 +107,9 @@ pub struct ThreadGroup {
     /// The initial stack pointer of the running program (argc, argv, envp
     /// and the auxiliary vector), for a core dump.
     start_stack: AtomicU64,
+    /// The running program's auxiliary vector as its exec wrote it, which
+    /// `/proc/<pid>/auxv` shows (Linux's `mm->saved_auxv`).
+    auxv: Mutex<Vec<u8>>,
     /// The head `set_robust_list` gave each thread that called it.
     robust_lists: Mutex<BTreeMap<u32, u64>>,
     /// Each thread's System V semaphore undo list, once it has one, which
@@ -233,6 +236,7 @@ impl Default for ThreadGroup {
             cpu_watched: std::sync::atomic::AtomicBool::new(false),
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
+            auxv: Mutex::default(),
             robust_lists: Mutex::default(),
             sem_undo: Mutex::default(),
             executable: Mutex::default(),
@@ -529,6 +533,7 @@ impl ThreadGroup {
             // A fork keeps the memory, and so the program's initial stack
             // and the program itself (Linux's `exe_file`).
             start_stack: AtomicU64::new(self.start_stack()),
+            auxv: Mutex::new(self.auxv()),
             executable: Mutex::new(self.executable()),
             first_namespaces: self.first_namespaces.clone(),
             exe_file: Mutex::new(
@@ -1447,6 +1452,23 @@ impl ThreadGroup {
     }
     pub(crate) fn start_stack(&self) -> u64 {
         self.start_stack.load(Ordering::SeqCst)
+    }
+    /// Records the stack and the auxiliary vector of the program an exec
+    /// loaded.
+    pub(crate) fn set_program(&self, image: &paludarium_loader::LoadedImage) {
+        self.set_start_stack(image.initial_stack_pointer.0);
+        *self.auxv.lock().unwrap_or_else(PoisonError::into_inner) = image
+            .auxv
+            .iter()
+            .flat_map(|&(kind, value)| [kind.to_le_bytes(), value.to_le_bytes()])
+            .flatten()
+            .collect();
+    }
+    pub(crate) fn auxv(&self) -> Vec<u8> {
+        self.auxv
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
     /// Whether the process is ending with a core dump ([`Self::begin_core`]).
     pub(crate) fn dumping_core(&self) -> bool {

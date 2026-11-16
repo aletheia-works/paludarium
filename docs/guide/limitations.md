@@ -80,13 +80,13 @@ verified.
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs` and
   `kernel` it has, ...) and the other names in
-  the reader's own directory (`auxv`, `limits`, ...) are looked up like any
+  the reader's own directory (`io`, `personality`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `statm` and
-  the rest. A path that goes on through a link of another process's `fd`
+  process's directory they are `ENOENT`, where Linux shows root `io`, `wchan`
+  and the rest. A path that goes on through a link of another process's `fd`
   (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
   directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
-  time and the code range are 0, so `ps` shows no `RSS`, and its `STIME` and
+  time and the code range are 0, as is the code in `statm`, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
   another process's state is taken from where its thread is (in a system
@@ -515,13 +515,12 @@ verified.
   every file there as root's again.
 - **mount and umount2, in part**: `mount` makes only tmpfs and bind mounts;
   any other type is `ENODEV`, as from a kernel without it. Once Linux's
-  checks before them pass, `MS_MOVE`, `MS_NOSYMFOLLOW` on a tmpfs or set by
-  a remount, and a mount on, or a bind mount of, the
-  generated `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a
-  program learns they are not supported; `fsopen`,
-  `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`,
-  `mount_setattr`, `statmount`, `listmount` and `pivot_root` are not there
-  (`ENOSYS`). Propagation types are kept and shown, but nothing
+  checks before them pass, `MS_NOSYMFOLLOW` on a tmpfs or set by a
+  remount, and a mount on, a bind mount of or a move of the generated
+  `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a program
+  learns they are not supported; `fsopen`, `fsconfig`, `fsmount`,
+  `fspick`, `move_mount`, `open_tree`, `mount_setattr`, `statmount` and
+  `listmount` are not there (`ENOSYS`). Propagation types are kept and shown, but nothing
   propagates: a mount or an unmount under a shared mount does not reach
   its peers and slaves, as Linux's `propagate_mnt` and `propagate_umount`
   make it, so a peer of it shows no copy. The mounts from start-up are
@@ -536,7 +535,8 @@ verified.
   `nosuid`, `nodev`, the atime flags, `sync`, `dirsync` and `mand`;
   `huge`, `mpol`, `noswap` and the quota options are taken, checked as
   Linux checks them (a remount that turns on `noswap` or quotas, or
-  changes a quota limit, is `EINVAL`) and shown, but do nothing, and `casefold` and `strict_encoding` are `EINVAL`, as from a
+  changes a quota limit, is `EINVAL`) and shown, but do nothing, and
+  `casefold` and `strict_encoding` are `EINVAL`, as from a
   kernel without `CONFIG_UNICODE`. `statfs`'s `f_flags` leaves out
   `ST_SYNCHRONOUS` and `ST_MANDLOCK`. A remount read-only is not refused
   for a file that is unlinked but still open (Linux's `s_remove_count`).
@@ -551,7 +551,17 @@ verified.
   The mounts from start-up (the root and each `--mount`) cannot be
   unmounted: `umount2` gives `EINVAL` when one is locked (in a mount
   namespace a new user namespace made, where the root is locked too, as
-  Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise.
+  Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise, and
+  `MS_MOVE` of one gives `EOPNOTSUPP`: the lower filesystem shows each
+  `--mount` itself, so taking one away would show it again, not the
+  directory under it. After `pivot_root` the old root can go, but a
+  `--mount` under it still stays, and a new root that is a `--mount`
+  shows its files at its old place under `put_old` too, where Linux shows
+  the directory it covered. The generated `/proc` and `/dev` stay at the
+  root's `/proc` and `/dev` after `pivot_root`, where Linux's go to
+  `put_old` with the old root. A move or a `pivot_root` takes the roots
+  and working directories along, but an open descriptor keeps the path it
+  was opened at for what it does by path (`fchdir`, a lookup from it).
   Mounts are kept by their mount
   points' paths: a rename moves the mounts below the directory in the
   caller's namespace only, so another namespace's copies stay at the old
@@ -580,9 +590,7 @@ verified.
   comes before them, which shows only when both refuse. A rule on a file under
   `/proc` does not count for `execve`. An open checks the file its path
   reaches before it opens it (and the file it made after), so another thread
-  renaming the name in between can make the two differ. There is no
-  `pivot_root` (`ENOSYS`), which Linux refuses a thread in a domain
-  (`EPERM`), as `mount` and `umount2` here do.
+  renaming the name in between can make the two differ.
 - **seccomp**: a call that `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` keeps
   waiting for its listener looks for a fatal signal every 10 ms rather than
   waking for it. Nothing is logged (`SECCOMP_FILTER_FLAG_LOG`,
@@ -765,11 +773,11 @@ verified.
   table, which a random key sets; their cache information counts from
   when each was made.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
-  ID goes when its namespace does, with no `RTM_DELNSID` to tell of it;
-  an ID is given only by `RTM_NEWNSID`, as no device of another
-  namespace makes Linux's `peernet2id_alloc` give one; a request sent by
-  `write` rather than `send` names no process or descriptor (`ESRCH`,
-  `EBADF`), as no caller is known there; and `IFLA_TARGET_NETNSID` and
+  ID is given only by `RTM_NEWNSID`, as no device of another namespace
+  makes Linux's `peernet2id_alloc` give one; the `RTM_DELNSID` of a
+  namespace that goes is sent as its last holder lets it go, where
+  Linux sends it a little later, from a work queue; and
+  `IFLA_TARGET_NETNSID` and
   `IFA_TARGET_NETNSID` are `EINVAL` even for an ID a namespace has, as
   no other namespace's links or addresses are dumped. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries

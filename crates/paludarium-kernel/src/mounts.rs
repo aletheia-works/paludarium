@@ -8,16 +8,20 @@
 //! superblock (`MS_REMOUNT`) or a mount's flags alone (`MS_REMOUNT |
 //! MS_BIND`), and changes a mount's propagation type (`MS_SHARED`,
 //! `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE`, with `MS_REC` the mounts on
-//! it too), which mountinfo shows; nothing propagates between peers.
-//! Read-only mounts and superblocks refuse writes (`EROFS`, in the calls
-//! that write). What it does not do yet gives `EOPNOTSUPP` once Linux's
-//! checks before it have passed: `MS_MOVE`, `MS_NOSYMFOLLOW` on a tmpfs or
-//! set by a remount, and a mount on, or a bind mount of, `/proc` or
-//! `/dev`, which the kernel generates. Any other file system type is
-//! `ENODEV`, as from a kernel without it.
+//! it too), which mountinfo shows; nothing propagates between peers. It
+//! moves a mount and those on it (`MS_MOVE`), and `pivot_root` puts the
+//! old root under a new one; both take the roots and working directories
+//! of the processes along. Read-only mounts and superblocks refuse writes
+//! (`EROFS`, in the calls that write). What it does not do yet gives
+//! `EOPNOTSUPP` once Linux's checks before it have passed: `MS_NOSYMFOLLOW`
+//! on a tmpfs or set by a remount, a mount on, a bind mount of or a move of
+//! `/proc` or `/dev`, which the kernel generates, and a move of a mount
+//! from start-up that the lower filesystem shows. Any other file system
+//! type is `ENODEV`, as from a kernel without it.
 //!
-//! `umount2` unmounts the mounts `mount` made; a mount from start-up (the root, a
-//! `--mount` directory) stays: `EINVAL` when it is locked, else `EBUSY`.
+//! `umount2` unmounts the mounts `mount` made, and the old root after a
+//! `pivot_root`; a mount from start-up (the root, a `--mount` directory)
+//! otherwise stays: `EINVAL` when it is locked, else `EBUSY`.
 use std::sync::Arc;
 
 use paludarium_host::{ClockId, HostFs};
@@ -77,6 +81,9 @@ pub(crate) fn sys_mount(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 pub(crate) fn sys_umount2(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome(umount(c, a[0], a[1] as u32 as u64))
+}
+pub(crate) fn sys_pivot_root(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(pivot_root(c, a[0], a[1]))
 }
 
 /// `copy_mount_string`: none for a null pointer, else the string as
@@ -228,7 +235,7 @@ fn mount(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return change_type(c, &target, flags, &namespaces.mnt);
     }
     if flags & MS_MOVE != 0 {
-        return Err(Errno::EOPNOTSUPP);
+        return move_mount(c, source, &target, &namespaces.mnt);
     }
     let fs = new_tmpfs(c, kind, source, data.as_deref(), sb_flags, mount_flags)?;
     // do_add_mount: the parent is in the caller's namespace (`EINVAL`), then
@@ -266,6 +273,63 @@ fn bind(
         return Err(Errno::EINVAL);
     }
     c.files.namespaced().bind(&source, target, recurse)?;
+    Ok(0)
+}
+
+/// `do_move_mount_old` (`MS_MOVE`): a source (`EINVAL` for none or an
+/// empty one), looked up with its last link followed, in the caller's
+/// namespace (`check_mnt`, `EINVAL`); then the mount at its root goes,
+/// with those on it, onto the target
+/// ([`paludarium_vfs::NamespacedFs::move_mount`]), and the roots and
+/// working directories in them with it. A source in `/proc` or `/dev`,
+/// which the kernel generates, is not supported.
+fn move_mount(
+    c: &mut Context<'_>,
+    source: Option<Vec<u8>>,
+    target: &[u8],
+    ns: &Namespace,
+) -> Result<u64, Errno> {
+    let source = source.filter(|s| !s.is_empty()).ok_or(Errno::EINVAL)?;
+    let source = crate::files::mount_path(c, source, true)?.ok_or(Errno::EOPNOTSUPP)?;
+    if !check_mnt(c, ns) {
+        return Err(Errno::EINVAL);
+    }
+    let namespaced = c.files.namespaced();
+    c.files.relocate(c.processes, |paths| {
+        namespaced.move_mount(&source, target, paths)
+    })?;
+    Ok(0)
+}
+
+/// `pivot_root(new_root, put_old)`, as Linux master's `SYSCALL_DEFINE2(pivot_root)`
+/// and `path_pivot_root`: both are looked up as directories with their
+/// links followed (`ENOENT`, `ENOTDIR` and the like, the new root first);
+/// then CAP_SYS_ADMIN over the caller's mount namespace (`EPERM`), a
+/// Landlock domain `EPERM` (`hook_sb_pivotroot`), and the caller's root
+/// and working directory on its namespace's mounts (`check_mnt`,
+/// `EINVAL`) before the mounts change places
+/// ([`paludarium_vfs::NamespacedFs::pivot_root`]). Each process on the
+/// namespace whose root or working directory was the old root is on the
+/// new one, and the others' stay with their mounts. `/proc` and `/dev`,
+/// which the kernel generates, are no mounts to take part (`EINVAL`).
+fn pivot_root(c: &mut Context<'_>, new: u64, put_old: u64) -> Result<u64, Errno> {
+    let new = crate::files::mount_directory(c, new)?;
+    let put_old = crate::files::mount_directory(c, put_old)?;
+    let namespaces = c.group.namespaces(c.tid);
+    if !may_mount(c, &namespaces.mnt) || c.process.credentials.landlock.handles_fs() {
+        return Err(Errno::EPERM);
+    }
+    if !check_mnt(c, &namespaces.mnt) {
+        return Err(Errno::EINVAL);
+    }
+    let (Some(new), Some(put_old)) = (new, put_old) else {
+        return Err(Errno::EINVAL);
+    };
+    let root = c.files.root();
+    let namespaced = c.files.namespaced();
+    c.files.relocate(c.processes, |paths| {
+        namespaced.pivot_root(&new, &put_old, &root, paths)
+    })?;
     Ok(0)
 }
 
@@ -949,8 +1013,9 @@ fn new_tmpfs(
 /// time; the caller's root without `MNT_DETACH` is `EPERM` without
 /// CAP_SYS_ADMIN over its superblock, else stays with its superblock
 /// remounted read-only (`do_umount_root`); the namespace's root `EINVAL`; and a mount in use `EBUSY`
-/// unless `MNT_DETACH` takes it away at once. A mount from start-up cannot
-/// go: `EBUSY`.
+/// unless `MNT_DETACH` takes it away at once. The target is looked up as
+/// Linux's `LOOKUP_MOUNTPOINT` does, into a mount on where it starts. A
+/// mount from start-up that the lower filesystem shows cannot go: `EBUSY`.
 fn umount(c: &mut Context<'_>, ptr: u64, flags: u64) -> Result<u64, Errno> {
     if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
         return Err(Errno::EINVAL);
@@ -966,7 +1031,7 @@ fn umount(c: &mut Context<'_>, ptr: u64, flags: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     };
     let namespaced = c.files.namespaced();
-    let found = namespaced.target(&target)?;
+    let found = namespaced.umount_target(&target)?;
     if !found.root || !check_mnt(c, &namespaces.mnt) || found.locked {
         return Err(Errno::EINVAL);
     }

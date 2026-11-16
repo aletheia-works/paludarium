@@ -178,6 +178,8 @@ pub(crate) struct ProcessView {
     /// The RLIMIT_RSS and RLIMIT_SIGPENDING soft limits.
     pub rss_limit: u64,
     pub queue_limit: u64,
+    /// The resource limits, soft and hard, which `/proc/<pid>/limits` shows.
+    pub limits: [(u64, u64); RLIMITS],
     pub no_new_privs: bool,
     pub dumpable: bool,
     /// It has ended and waits to be reaped.
@@ -1029,6 +1031,7 @@ impl Processes {
             children_cpu: entry.children_cpu,
             rss_limit: entry.limits[5].0,
             queue_limit: entry.limits[11].0,
+            limits: entry.limits(),
             no_new_privs: entry.no_new_privs,
             dumpable: entry.dumpable,
             zombie: entry.status.is_some(),
@@ -4602,7 +4605,7 @@ impl Kernel {
         self.files = self.files.for_exec();
         self.group.exec_actions();
         thread.cpu = CpuState::new(image.entry_point, image.initial_stack_pointer);
-        self.group.set_start_stack(image.initial_stack_pointer.0);
+        self.group.set_program(&image);
         self.group.set_executable(match held {
             Some((_, name, _)) => name,
             None => crate::files::resolved(&self.files, &loaded).unwrap_or(loaded),

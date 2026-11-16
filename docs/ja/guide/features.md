@@ -65,7 +65,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
@@ -1411,8 +1411,33 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `unbindable` で示します。新しいマウント名前空間への写しは写したマウントのピアで、
   ユーザー名前空間がほかのものならそのスレーブです。外したマウントや、名前空間が
   終わったマウントも、同じようにピアグループから出ます。
+- `MS_MOVE` 付きの `mount` は、Linux master の `do_move_mount` と同じ確認のあと、
+  マウントを動かします。ソースがあること（ないか空なら `EINVAL`）、最後のリンクを
+  たどって探したソースがマウントのルートであること（`EINVAL`）、ディレクトリーは
+  ディレクトリーの上に、ファイルはファイルの上に置くこと（`EINVAL`）を確かめ、
+  そのあと名前空間のルート、ロックされたマウント、共有マウントの上のマウントは
+  `EINVAL`、バインドできないマウントを含む木を共有マウントの上に置くのも `EINVAL`、
+  そのマウント自身かその上のマウントの上に置くのは `ELOOP` です。マウントは、上の
+  マウントとともにターゲットにあるものの上に行き、元の場所には下のディレクトリーが
+  また見えます。共有マウントの上では、それぞれが共有になります（どのピアグループにも
+  なければ新しいものに入ります）。その中のルートと作業ディレクトリーも一緒に動きます。
+- `pivot_root`（Linux master の `path_pivot_root`）は、2 つのパスを、リンクをたどって
+  ディレクトリーとして新しいルートから探します。そのあと、マウント名前空間に対する
+  `CAP_SYS_ADMIN` と、ファイルへのアクセスを扱う Landlock のドメインがないこと
+  （`EPERM`）が要ります。`put_old`・新しいルートの下・呼び出し元のルートの下に共有
+  マウントがあるか、新しいルートがロックされていれば `EINVAL`、新しいルートや `put_old`
+  がルートのマウントにあれば `EBUSY` です。ルートと新しいルートはマウントのルートで、
+  `put_old` は新しいルートかその下に、新しいルートはルートの下にあることが要ります
+  （`EINVAL`）。新しいルートのマウントは上のマウントとともにルートの場所に入り、古い
+  ルートはその木の残りとともに `put_old` に行きます。古いルートのロックは新しいルートが
+  引き継ぐので、新しいユーザー名前空間のマウント名前空間でも古いルートを外せます。
+  名前空間の中で、ルートか作業ディレクトリーが古いルートだったプロセスはどれも新しい
+  ルートに移り（`chroot_fs_refs`）、ほかのプロセスのものはそのマウントとともに動きます。
+  `pivot_root(".", ".")` は古いルートを新しいルートの上に重ね、それを
+  `umount2(".", MNT_DETACH)` で外せます。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
-  `UMOUNT_NOFOLLOW` がなければたどります。そのあと Linux の `can_umount` と `do_umount`
+  `UMOUNT_NOFOLLOW` がなければたどり、パスの始まりの上のマウントにも入ります
+  （`LOOKUP_MOUNTPOINT`）。そのあと Linux の `can_umount` と `do_umount`
   と同じく、マウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）、その名前空間のマウントの
   ルートで、ロックされていないこと（`EINVAL`）、`MNT_FORCE` にはスーパーブロックのユーザー
   名前空間での `CAP_SYS_ADMIN`（`EPERM`）、ファイルへのアクセスを扱う Landlock のドメインが
@@ -1620,7 +1645,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ID `NETNSA_NSID` を、負の値なら空いている一番小さい ID を与えます。どちらもなければ
     `EINVAL`、すでに ID がある名前空間や使われている ID は `EEXIST` で、それぞれ Linux の
     拡張 ACK のメッセージを付けます。`RTNLGRP_NSID` のメンバーは新しい ID を知らされます
-    （`NLM_F_ECHO` なら、そのうちリクエストした側だけが受け取ります）。`RTM_GETNSID` は、
+    （`NLM_F_ECHO` なら、そのうちリクエストした側だけが受け取ります）。名前空間が
+    なくなって ID が消えるときも、`unhash_nsid` と同じく `RTM_DELNSID` で知らされます。
+    なくなるのは、それを持つプロセス、記述子、ソケットがなくなったときで、その ID は
+    また空きます。リクエストが指すプロセスや記述子は、`send` でも `write` でも送り手から
+    見たもので、`CAP_NET_ADMIN` は開いた側だけでなく書いた側にも要ります。`RTM_GETNSID` は、
     プロセス、記述子、ID で指した名前空間の ID（なければ -1、だれも持たない ID は
     `ENOENT`）を返し、`NETNSA_TARGET_NSID` を付けるとその名前空間が与えた ID を、
     こちらの ID を `NETNSA_CURRENT_NSID` に添えて返します（その名前空間がなければ
@@ -2213,15 +2242,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `AT_SYMLINK_NOFOLLOW` の `fstatat` や `statx` はリンクを返し、`stat` と末尾の `/` は
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
-  名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
-  `cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、`fd`、`fdinfo`、`ns`、
-  `task` があります。これらとディレクトリの持ち主は、Linux の `task_dump_owner` と同じく
+  名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
+  `limits`、`comm`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、
+  `fd`、`fdinfo`、`ns`、`task` があります。これらとディレクトリの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。`/proc/self` そのものは root のものです。`stat` は
-  その持ち主とモード（`environ` と `pagemap` は 0400、ほかのファイルは 0444）を示し、
+  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、ほかのファイルは 0444）を示し、
   開いたものの `fstat` は開いたときの持ち主を示します。Linux はその時点の持ち主です。開くときは Linux の `generic_permission` と同じくその
   持ち主に対してモードを確かめるので、`CAP_DAC_OVERRIDE` なしに書き込み用に開くと
-  `EACCES` で、ダンプできないプロセスが `environ` や `pagemap` を読むために開いても
+  `EACCES` で、ダンプできないプロセスが `environ`、`auxv`、`pagemap` を読むために開いても
   `EACCES` です。root が開いたものへの書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
@@ -2229,15 +2258,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じ順番で持ちます
   （umask、ID、スレッドの数、シグナルのマスク、ケーパビリティなど）。メモリの項目は
   ロックしたメモリ（`VmLck`）だけで、何も測っていないほかのメモリの項目と CPU の
-  項目はありません。自分のディレクトリと `/proc` の下の
+  項目はありません。`statm` は、Linux の `task_statm` が数えるものをページ単位で示します。
+  マップの大きさ、常駐しているページ、そのうちファイルか共有メモリのもの、コード（`stat`
+  と同じく 0）、0、書き込めるプライベートなマップとスタック、0 です。`limits` は、
+  `prlimit` が返すソフトとハードのリソース制限を Linux と同じ列で並べます。`auxv`（0400）は、
+  プログラムの `execve` がスタックに書いた補助ベクトルです。Linux の `saved_auxv` と同じく、
+  プログラムがそのあとスタックに何をしても、`fork` しても残ります。自分のディレクトリと `/proc` の下の
   それ以外のパスは、ふつうのパスと同じようにファイルシステムで探します。
   そのため `--mount /:/` では、ホストの `/proc` に届きます。
 - `/proc` は、ファイルシステムがそこに持つプロセス以外のもの（`--mount /:/` では、
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
-  `status`、`stat`、`cmdline`、`environ`（0400）、`comm`、`maps`、`smaps`、`exe`、`cwd`、
-  `root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、`ns`（0511）、`task` があり、
+  `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`comm`、
+  `maps`、`smaps`、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、`ns`（0511）、
+  `task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
@@ -2247,12 +2282,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`maps`、`smaps`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
   同じです。ダンプできないプロセスの
-  ディレクトリの持ち主は root です。`fd` そのものを読むことと中を探すことは、Linux の
+  ディレクトリの持ち主は root です。`statm` と `limits` は、Linux と同じく誰でも読めます。
+  `fd` そのものを読むことと中を探すことは、Linux の
   `proc_fd_permission` と同じくそのモード（0500）が許す読み手だけができます。`fd` と
   `fdinfo` は、このプロセス自身のもの（後述）と同じものを、ほかのプロセスのディスクリプタに
   ついて示します。`fd` のリンクを開くと、そのディスクリプタのファイルを開き直します。
@@ -2262,12 +2298,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルのマウントと、そのプロセスが持つレコードロックを示します。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
   ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
-  シグナルの扱い、メモリ（`cmdline`、`environ`、`maps`、`smaps`、`stat` の大きさ）、カレントディレクトリ、
+  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
   コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
-  持ちません。Linux と同じく、`cmdline`、`environ`、`maps`、`smaps` は空、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` です。
+  持ちません。Linux と同じく、`cmdline`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。
+  Linux の `__mem_open` は、読み手を確かめる前にメモリのないプロセスを断るので、
+  ゾンビの `environ` と `auxv` は、どの読み手にも開けません（`ESRCH`）。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、

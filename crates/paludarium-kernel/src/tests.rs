@@ -8307,15 +8307,25 @@ fn mount_checks_in_linux_order() {
         mount(&mut f, [none, target, tmpfs, 4096, 0]),
         errno(Errno::ENOENT)
     );
-    // What is not supported yet, after the checks before it: MS_MOVE,
+    // A move needs a source, which it looks up, and the source's root.
+    assert_eq!(
+        mount(&mut f, [0, target, tmpfs, 8192, 0]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        mount(&mut f, [none, target, tmpfs, 8192, 0]),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(
+        mount(&mut f, [target, target, tmpfs, 8192, 0]),
+        errno(Errno::EINVAL)
+    );
+    // What is not supported yet, after the checks before it:
     // MS_NOSYMFOLLOW.
-    for flags in [8192, 256] {
-        assert_eq!(
-            mount(&mut f, [none, target, tmpfs, flags, 0]),
-            errno(Errno::EOPNOTSUPP),
-            "{flags:#x}"
-        );
-    }
+    assert_eq!(
+        mount(&mut f, [none, target, tmpfs, 256, 0]),
+        errno(Errno::EOPNOTSUPP)
+    );
     // A remount is of a mount's root.
     assert_eq!(
         mount(&mut f, [none, target, tmpfs, 32, 0]),
@@ -8507,6 +8517,76 @@ fn read_only_mounts_remounts_and_propagation() {
     assert_eq!(f.ret(165, &[0, target, 0, private | rec, 0]), 0);
     let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
     assert!(!info.contains("shared:"), "{info}");
+}
+
+/// A moved mount takes the working directory in it along, and
+/// `pivot_root` puts the old root under the new one, the working
+/// directory at the new root with it.
+#[test]
+fn a_move_and_pivot_root_take_the_working_directory_along() {
+    let mut f = fixture();
+    let cwd = |f: &mut Fixture| -> Vec<u8> {
+        let n = f.ret(79, &[DATA + 0x1000, 256]);
+        let mut out = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x1000), &mut out).unwrap();
+        out.pop();
+        out
+    };
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let (m, n) = (put(&mut f, 0x40, b"/tmp/m"), put(&mut f, 0x60, b"/tmp/n"));
+    assert_eq!(f.ret(83, &[m, 0o755]), 0);
+    assert_eq!(f.ret(83, &[n, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+    let d = put(&mut f, 0x80, b"/tmp/m/d");
+    assert_eq!(f.ret(83, &[d, 0o755]), 0);
+    assert_eq!(f.ret(80, &[d]), 0);
+    let r#move = 8192;
+    assert_eq!(f.ret(165, &[m, n, 0, r#move, 0]), 0);
+    assert_eq!(cwd(&mut f), b"/tmp/n/d");
+    // Onto a file, and into itself.
+    let file = put(&mut f, 0xc0, b"/tmp/file");
+    assert!(f.ret(2, &[file, 0o101, 0o644]) as i64 >= 0);
+    assert_eq!(f.ret(165, &[n, file, 0, r#move, 0]), errno(Errno::EINVAL));
+    let inside = put(&mut f, 0x100, b"/tmp/n/d");
+    assert_eq!(f.ret(165, &[n, inside, 0, r#move, 0]), errno(Errno(40)));
+    // pivot_root: directories (the new root first), then the checks.
+    let (dot, old, missing) = (
+        put(&mut f, 0x140, b"."),
+        put(&mut f, 0x150, b"old"),
+        put(&mut f, 0x160, b"/missing"),
+    );
+    assert_eq!(f.ret(155, &[missing, file]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(155, &[file, missing]), errno(Errno::ENOTDIR));
+    assert_eq!(f.ret(155, &[n, missing]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(155, &[inside, inside]), errno(Errno::EINVAL));
+    let old_dir = put(&mut f, 0x180, b"/tmp/n/old");
+    assert_eq!(f.ret(83, &[old_dir, 0o755]), 0);
+    assert_eq!(f.ret(80, &[n]), 0);
+    assert_eq!(f.ret(155, &[dot, old]), 0);
+    assert_eq!(cwd(&mut f), b"/");
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(info.contains(" / / rw,relatime - tmpfs none "), "{info}");
+    assert!(info.contains(" / /old rw,relatime - "), "{info}");
+    let tmp = put(&mut f, 0x1a0, b"/old/tmp/file");
+    assert_eq!(f.ret(21, &[tmp, 0]), 0);
+    // The old root goes with what is on it.
+    let gone = put(&mut f, 0x1c0, b"/old");
+    assert_eq!(f.ret(166, &[gone, 2]), 0);
+    assert_eq!(f.ret(21, &[tmp, 0]), errno(Errno::ENOENT));
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert_eq!(info.lines().count(), 1, "{info}");
+    // `pivot_root(".", ".")` stacks the old root on the new, and an
+    // unmount of `.` takes it off.
+    let next = put(&mut f, 0x1e0, b"/next");
+    assert_eq!(f.ret(83, &[next, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, next, tmpfs, 0, 0]), 0);
+    assert_eq!(f.ret(80, &[next]), 0);
+    assert_eq!(f.ret(155, &[dot, dot]), 0);
+    assert_eq!(cwd(&mut f), b"/");
+    assert_eq!(f.ret(166, &[dot, 2]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert_eq!(info.lines().count(), 1, "{info}");
+    assert!(info.contains(" / / rw,relatime - tmpfs none "), "{info}");
 }
 
 /// A new mount namespace has copies of the mounts, with new IDs, on the

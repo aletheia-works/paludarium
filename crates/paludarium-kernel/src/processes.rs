@@ -1646,7 +1646,6 @@ impl Processes {
             entry.dumped = true;
         }
     }
-    /// Whether `pid` has exited: `None` once it is reaped (or never was).
     /// Task `tid`'s numbers in each PID namespace from the first down to
     /// its own (Linux's `pid->numbers`), while it is there, a zombie's
     /// too; none once it is reaped (`pid_has_task`).
@@ -1664,6 +1663,7 @@ impl Processes {
                 .collect(),
         )
     }
+    /// Whether `pid` has exited: `None` once it is reaped (or never was).
     fn exited(&self, pid: u32) -> Option<bool> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.get(&pid).map(|entry| entry.status.is_some())

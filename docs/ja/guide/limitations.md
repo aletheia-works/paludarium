@@ -410,12 +410,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
   - `ptrace` の、機能の一覧にない要求は `EIO` を返します。
     `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
-    ほかは `EINVAL` です。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
-    ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
+    ほかは `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
     `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。ハードウェアブレークポイントは
     なく、デバッグレジスタは未使用として読め（DR6 は `0xffff0ff0`）、DR7 を 0 にする以外の
-    書き込みは `EIO` です。トレーサーが書いたセグメントセレクタは検査しますが、変わりません。
-    トレーサーが再実行のコードを別の再実行のコードに変えると、再実行は止まります。
+    書き込みは `EIO` です。トレーサーが 64 ビットのユーザーのもの以外の `cs` や `ss` を書くと、
+    そのセレクタは残って見えますが、トレース対象は 64 ビットのまま動きます。Linux ではその
+    セグメントで動くか、フォールトします。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
     Linux はページキャッシュを調べます。`MAP_POPULATE` や `MAP_LOCKED`、メモリのロックで
     読み込んだページも、触るまでは数えません。

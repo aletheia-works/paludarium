@@ -214,7 +214,18 @@ pub(crate) struct Local {
     /// `TIF_FORCED_TF`: the trap flag is set because the tracer
     /// single-steps the thread, not because the thread set it.
     pub(crate) forced_tf: bool,
+    /// The segment selectors a tracer wrote, `ds`, `es`, `fs`, `gs`, `cs`
+    /// and `ss` (`thread.ds` and the others); none for the ones every task
+    /// starts with, which an exec gives back.
+    pub(crate) selectors: Option<[u16; 6]>,
 }
+
+/// The selectors of a 64-bit task: null data and `fs`/`gs` selectors,
+/// `__USER_CS` and `__USER_DS`.
+const SELECTORS: [u16; 6] = [0, 0, 0, 0, 0x33, 0x2b];
+
+/// Where each selector is in `user_regs_struct`, in [`SELECTORS`]' order.
+const SELECTOR_SLOTS: [u64; 6] = [DS, ES, FS, GS, CS, SS];
 
 /// The `clone` of a traced thread: its flags, the new task once it is
 /// made, and the event the tracer asked for.
@@ -244,6 +255,8 @@ impl Clone for Local {
         Self {
             forked_by: self.tid,
             orig_rax: self.orig_rax,
+            // `copy_thread` copies the selectors.
+            selectors: self.selectors,
             ..Self::default()
         }
     }
@@ -288,6 +301,8 @@ struct Stop {
     group_stopped: bool,
     /// The thread's `TIF_FORCED_TF`, which a tracer's requests change.
     forced_tf: bool,
+    /// Its segment selectors, which a tracer may write.
+    selectors: [u16; 6],
 }
 
 /// One traced task, which its process's thread group counts while it is
@@ -585,7 +600,9 @@ fn regs(stop: &Stop) -> [u64; 27] {
     }
     out[ORIG_RAX as usize] = stop.orig_rax;
     out[RIP as usize] = cpu.rip.0;
-    out[CS as usize] = 0x33;
+    for (&slot, &selector) in SELECTOR_SLOTS.iter().zip(&stop.selectors) {
+        out[slot as usize] = u64::from(selector);
+    }
     // A trap flag the tracer set is not shown (`get_flags`).
     out[EFLAGS as usize] = if stop.forced_tf {
         cpu.rflags & !flag::TF
@@ -593,7 +610,6 @@ fn regs(stop: &Stop) -> [u64; 27] {
         cpu.rflags
     };
     out[RSP as usize] = cpu.gpr[reg::RSP];
-    out[SS as usize] = 0x2b;
     out[FS_BASE as usize] = cpu.fs_base;
     out[GS_BASE as usize] = cpu.gs_base;
     out
@@ -623,10 +639,16 @@ fn putreg(stop: &mut Stop, index: u64, value: u64) -> Result<(), Errno> {
             let cpu = &mut stop.cpu;
             cpu.rflags = (cpu.rflags & !FLAG_MASK) | (value & FLAG_MASK);
         }
+        // `set_segment_reg`: a null or user selector, `cs` and `ss` not
+        // null; it is kept as written. A new `fs` or `gs` selector leaves the
+        // base as it is, as with FSGSBASE.
         CS | SS | DS | ES | FS | GS => {
             let selector = value as u16;
             if selector != 0 && selector & 3 != 3 || matches!(index, CS | SS) && selector == 0 {
                 return Err(Errno::EIO);
+            }
+            if let Some(slot) = SELECTOR_SLOTS.iter().position(|&s| s == index) {
+                stop.selectors[slot] = selector;
             }
         }
         FS_BASE | GS_BASE => {
@@ -667,6 +689,9 @@ pub(crate) fn restart_code(restart: Option<u64>, seccomp: Option<bool>) -> Optio
 pub(crate) struct Restart {
     pub number: Option<u64>,
     pub seccomp: Option<bool>,
+    /// `-ERESTARTNOHAND` or `-ERESTART_RESTARTBLOCK` a tracer left: no
+    /// restart once a handler runs.
+    pub no_handler: bool,
     /// The thread has stopped for its tracer since.
     pub traced: bool,
 }
@@ -715,8 +740,18 @@ impl Kernel {
         restart: &mut Restart,
     ) -> Resumed {
         let traces = &self.processes.traces;
-        let shown = restart_code(restart.number, restart.seccomp)
-            .filter(|_| thread.cpu.gpr[reg::RAX] == Errno(4).to_syscall_return());
+        let shown = if restart.no_handler {
+            restart.number.map(|number| {
+                if number == 219 {
+                    ERESTART_RESTARTBLOCK
+                } else {
+                    ERESTARTNOHAND
+                }
+            })
+        } else {
+            restart_code(restart.number, restart.seccomp)
+        }
+        .filter(|_| thread.cpu.gpr[reg::RAX] == Errno(4).to_syscall_return());
         if self.fatal_pending(thread) {
             return Resumed::Not;
         }
@@ -750,6 +785,7 @@ impl Kernel {
                 listening: false,
                 group_stopped: self.group.is_stopped(),
                 forced_tf: thread.state.ptrace.forced_tf,
+                selectors: thread.state.ptrace.selectors.unwrap_or(SELECTORS),
             });
             tracee.tracer_pid
         };
@@ -848,23 +884,44 @@ impl Kernel {
             thread.state.signal_mask = mask;
             thread.state.wait_restore_mask = None;
         }
-        if let Some(shown) = shown {
-            if thread.cpu.gpr[reg::RAX] == shown {
-                thread.cpu.gpr[reg::RAX] = Errno(4).to_syscall_return();
-            } else {
-                restart.number = None;
-                restart.seccomp = None;
-            }
+        thread.state.ptrace.selectors = (stop.selectors != SELECTORS).then_some(stop.selectors);
+        let orig = stop.orig_rax;
+        if orig != before {
+            thread.state.ptrace.orig_rax = orig;
         }
-        if stop.orig_rax != before {
-            thread.state.ptrace.orig_rax = stop.orig_rax;
-            if (stop.orig_rax as i64) < 0 {
+        // The restart of a call a signal interrupted goes by the restart
+        // code in rax, as Linux's `arch_do_signal_or_restart` and
+        // `handle_signal` take it, whichever the call left or the tracer
+        // wrote: the call in `orig_rax` runs again, as `restart_syscall` for
+        // `-ERESTART_RESTARTBLOCK`. Anything else in rax, or `orig_rax`
+        // below 0, ends the restart, and the thread sees what rax has.
+        let code = thread.cpu.gpr[reg::RAX];
+        match code {
+            ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND | ERESTART_RESTARTBLOCK
+                if shown.is_some() && (orig as i64) >= 0 =>
+            {
+                thread.cpu.gpr[reg::RAX] = Errno(4).to_syscall_return();
+                restart.number = Some(if code == ERESTART_RESTARTBLOCK {
+                    219
+                } else {
+                    u64::from(orig as u32)
+                });
+                restart.seccomp = match code {
+                    ERESTARTNOINTR => Some(true),
+                    ERESTARTSYS => Some(false),
+                    _ => None,
+                };
+                restart.no_handler = matches!(code, ERESTARTNOHAND | ERESTART_RESTARTBLOCK);
+                if code != ERESTART_RESTARTBLOCK {
+                    thread.state.syscall_rax = orig;
+                }
+            }
+            _ if shown.is_some() || (orig as i64) < 0 => {
                 restart.number = None;
                 restart.seccomp = None;
-            } else if restart.number.is_some() {
-                restart.number = Some(u64::from(stop.orig_rax as u32));
-                thread.state.syscall_rax = stop.orig_rax;
+                restart.no_handler = false;
             }
+            _ => {}
         }
     }
 
@@ -1493,6 +1550,37 @@ impl Kernel {
         }
     }
 
+    /// Whether the thread may set `options`: `PTRACE_O_SUSPEND_SECCOMP`
+    /// needs `CAP_SYS_ADMIN` and a tracer under no seccomp mode nor itself
+    /// a tracee whose seccomp is suspended (`EPERM`), as Linux's
+    /// `check_ptrace_options` asks of a kernel with checkpoint and restore.
+    fn may_suspend_seccomp(&self, thread: &Thread, options: u32) -> Result<(), Errno> {
+        if options & PTRACE_O_SUSPEND_SECCOMP == 0 {
+            return Ok(());
+        }
+        const CAP_SYS_ADMIN: u64 = 1 << 21;
+        let suspended = self.seccomp_suspended(thread.tid);
+        if !thread.state.credentials.capable(CAP_SYS_ADMIN)
+            || thread.state.seccomp.mode != 0
+            || suspended
+        {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
+    }
+
+    /// Whether task `tid` is traced with `PTRACE_O_SUSPEND_SECCOMP`, which
+    /// its filters and strict mode then let every call through
+    /// (`PT_SUSPEND_SECCOMP`).
+    pub(crate) fn seccomp_suspended(&self, tid: u32) -> bool {
+        self.group.traced()
+            && self
+                .processes
+                .traces
+                .settings(tid)
+                .is_some_and(|(_, options, _)| options & PTRACE_O_SUSPEND_SECCOMP != 0)
+    }
+
     /// `ptrace(request, pid, addr, data)`.
     pub(crate) fn ptrace(
         &mut self,
@@ -1649,6 +1737,7 @@ impl Kernel {
             }
             PTRACE_SETOPTIONS => {
                 let options = check_options(data)?;
+                self.may_suspend_seccomp(thread, options)?;
                 if let Some(tracee) = traces.lock().get_mut(&tid) {
                     tracee.options = options;
                 }
@@ -1954,7 +2043,9 @@ impl Kernel {
             if addr != 0 || data & !PTRACE_O_MASK != 0 {
                 return Err(Errno::EIO);
             }
-            check_options(data)?
+            let options = check_options(data)?;
+            self.may_suspend_seccomp(thread, options)?;
+            options
         } else {
             0
         };
@@ -2049,10 +2140,8 @@ impl Kernel {
 }
 
 /// Linux's `check_ptrace_options`: only the known options (`EINVAL`).
-/// `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL` too, as on a Linux built
-/// without checkpoint and restore.
 fn check_options(data: u64) -> Result<u32, Errno> {
-    if data & !PTRACE_O_MASK != 0 || data & u64::from(PTRACE_O_SUSPEND_SECCOMP) != 0 {
+    if data & !PTRACE_O_MASK != 0 {
         return Err(Errno::EINVAL);
     }
     Ok(data as u32)
@@ -2221,6 +2310,7 @@ mod tests {
             listening: false,
             group_stopped: false,
             forced_tf: false,
+            selectors: SELECTORS,
         }
     }
 
@@ -2289,15 +2379,58 @@ mod tests {
     }
 
     #[test]
+    fn selectors_a_tracer_writes_are_kept_and_shown() {
+        let mut stop = stopped();
+        assert_eq!(putreg(&mut stop, DS, 0x2b), Ok(()));
+        assert_eq!(putreg(&mut stop, ES, 0x1_0033), Ok(()));
+        assert_eq!(putreg(&mut stop, FS, 0x28), Err(Errno::EIO));
+        assert_eq!(putreg(&mut stop, SS, 0), Err(Errno::EIO));
+        let shown = regs(&stop);
+        assert_eq!((shown[DS as usize], shown[ES as usize]), (0x2b, 0x33));
+        assert_eq!((shown[CS as usize], shown[SS as usize]), (0x33, 0x2b));
+    }
+
+    #[test]
+    fn a_restart_code_the_tracer_writes_decides_the_restart() {
+        let mut thread = Thread::new(1, CpuState::default());
+        let mut stop = stopped();
+        stop.orig_rax = 0;
+        let mut restart = Restart {
+            number: Some(0),
+            seccomp: None,
+            ..Restart::default()
+        };
+        // -ERESTARTSYS shown, -ERESTARTNOINTR left: it restarts whatever
+        // the handler.
+        stop.cpu.gpr[reg::RAX] = ERESTARTNOINTR;
+        Kernel::take_registers(&mut thread, &stop, Some(ERESTARTSYS), &mut restart);
+        assert_eq!(thread.cpu.gpr[reg::RAX], Errno(4).to_syscall_return());
+        assert_eq!((restart.number, restart.seccomp), (Some(0), Some(true)));
+        // -ERESTART_RESTARTBLOCK: restart_syscall, never after a handler.
+        stop.cpu.gpr[reg::RAX] = ERESTART_RESTARTBLOCK;
+        Kernel::take_registers(&mut thread, &stop, Some(ERESTARTSYS), &mut restart);
+        assert_eq!((restart.number, restart.no_handler), (Some(219), true));
+        // orig_rax below 0: no restart, and the code stays.
+        stop.orig_rax = u64::MAX;
+        stop.cpu.gpr[reg::RAX] = ERESTARTNOHAND;
+        Kernel::take_registers(&mut thread, &stop, Some(ERESTARTSYS), &mut restart);
+        assert_eq!(
+            (restart.number, thread.cpu.gpr[reg::RAX]),
+            (None, ERESTARTNOHAND)
+        );
+    }
+
+    #[test]
     fn options_and_signals_are_checked() {
         assert_eq!(
             check_options(PTRACE_O_EXITKILL.into()),
             Ok(PTRACE_O_EXITKILL)
         );
         assert_eq!(check_options(1 << 30), Err(Errno::EINVAL));
+        // Known: whether the caller may set it is asked apart.
         assert_eq!(
             check_options(PTRACE_O_SUSPEND_SECCOMP.into()),
-            Err(Errno::EINVAL)
+            Ok(PTRACE_O_SUSPEND_SECCOMP)
         );
         assert_eq!(valid_signal(64), Ok(64));
         assert_eq!(valid_signal(65), Err(Errno::EIO));

@@ -88,11 +88,29 @@ __asm__(".text\n"
         "  nop\n"
         "  nop\n"
         "seq_trace_end:\n"
+        "  ret\n"
+        /* kill(rdi, SIGSTOP), then kill(rdi, SIGUSR1) for a tracer to step
+         * into the handler, and the rest stepped by the flag the frame
+         * gives back. */
+        ".globl seq_frame, seq_frame_end\n"
+        "seq_frame:\n"
+        "  movl $19, %esi\n"
+        "  movl $62, %eax\n"
+        "  syscall\n"
+        "  movl $10, %esi\n"
+        "  movl $62, %eax\n"
+        "  syscall\n"
+        "  nop\n"
+        "  pushfq\n"
+        "  andq $~0x100, (%rsp)\n"
+        "  popfq\n"
+        "seq_frame_end:\n"
         "  ret\n");
 
-void seq_flag(void), seq_syscall(void), seq_signal(int), seq_int3(void), seq_trace(int);
+void seq_flag(void), seq_syscall(void), seq_signal(int), seq_int3(void), seq_trace(int),
+    seq_frame(int);
 extern char seq_flag_end[], seq_syscall_end[], seq_signal_end[], seq_int3_end[], seq_trace_from[],
-    seq_trace_end[];
+    seq_trace_end[], seq_frame_end[];
 
 /* What each SIGTRAP showed: where, why, and the flags. */
 struct trap {
@@ -247,6 +265,64 @@ static int ptrace_case(void) {
     return 0;
 }
 
+/* A trap flag the tracer set is in the frame of a handler the tracee
+ * enters while stepped; the tracer then lets it run, and rt_sigreturn
+ * gives the flag back, as the tracee's own. */
+static void frame_handler(int number) { (void)number; }
+
+static int forced_frame_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        signal(SIGUSR1, frame_handler);
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        seq_frame(getpid());
+        _exit((flags_now() & TF) ? 1 : 0);
+    }
+    uint64_t start = (uint64_t)(uintptr_t)seq_frame, end = (uint64_t)(uintptr_t)seq_frame_end;
+    wait_status(child);
+    int status = 0;
+    struct user_regs_struct regs;
+    siginfo_t info;
+    /* Step to the stop for SIGUSR1. */
+    for (int i = 0; i < 20; i++) {
+        pt(PTRACE_SINGLESTEP, child, 0, 0);
+        status = wait_status(child);
+        if (!WIFSTOPPED(status) || WSTOPSIG(status) == SIGUSR1) break;
+        memset(&info, 0, sizeof info);
+        pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+        pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+        printf("step: signal=%d code=%#x at=%lld\n", WSTOPSIG(status), info.si_code,
+               (long long)(regs.rip - start));
+    }
+    printf("delivery: signal=%d\n", WIFSTOPPED(status) ? WSTOPSIG(status) : -1);
+    /* Into the handler: the stop before it. */
+    pt(PTRACE_SINGLESTEP, child, 0, SIGUSR1);
+    status = wait_status(child);
+    memset(&info, 0, sizeof info);
+    pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("handler: signal=%d code=%#x in-handler=%d tf-shown=%d\n", WSTOPSIG(status),
+           info.si_code, regs.rip == (uint64_t)(uintptr_t)frame_handler, (regs.eflags & TF) != 0);
+    /* Let run: the flag comes back with the frame. */
+    for (int i = 0; i < 10; i++) {
+        pt(PTRACE_CONT, child, 0, 0);
+        status = wait_status(child);
+        if (!WIFSTOPPED(status)) break;
+        memset(&info, 0, sizeof info);
+        pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+        pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+        printf("after: signal=%d code=%#x at=", WSTOPSIG(status), info.si_code);
+        if (regs.rip >= start && regs.rip <= end)
+            printf("%llu", (unsigned long long)(regs.rip - start));
+        else
+            printf("outside");
+        printf(" tf-shown=%d\n", (regs.eflags & TF) != 0);
+    }
+    printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 99;
     const char *mode = argv[1];
@@ -257,6 +333,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "trap-flag-signal")) code = signal_case();
     if (!strcmp(mode, "int3")) code = int3_case();
     if (!strcmp(mode, "ptrace-singlestep")) code = ptrace_case();
+    if (!strcmp(mode, "ptrace-forced-frame")) code = forced_frame_case();
     fflush(stdout);
     return code;
 }

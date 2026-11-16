@@ -4012,13 +4012,23 @@ one only with an `--allow-net`.
   `PTRACE_SETREGS`, `PTRACE_GETFPREGS`/`PTRACE_SETFPREGS` and
   `PTRACE_GETREGSET`/`PTRACE_SETREGSET` with `NT_PRSTATUS` and `NT_PRFPREG`,
   as Linux's `putreg` takes them (only the flags a tracer may change, a
-  segment base below `TASK_SIZE_MAX`, `EIO` otherwise), and the stop's
+  segment base below `TASK_SIZE_MAX`, a null or user segment selector and
+  `cs` and `ss` not null, `EIO` otherwise; a selector is kept as written,
+  and a new `fs` or `gs` selector leaves the base, as with FSGSBASE; exec
+  gives back the ones a task starts with), and the stop's
   siginfo with `PTRACE_GETSIGINFO`/`PTRACE_SETSIGINFO` (`EINVAL` for a stop
   without one). `orig_rax` is the call the tracee stopped after, -1 after
   anything else, and a call the stop interrupted shows its restart code in
   `rax` (`-ERESTARTSYS`, `-ERESTARTNOINTR`, `-ERESTARTNOHAND`,
-  `-ERESTART_RESTARTBLOCK`): it runs again unless the tracer changes `rax`
-  or sets `orig_rax` to -1, and another `orig_rax` is the call that runs.
+  `-ERESTART_RESTARTBLOCK`): the code the tracer leaves there decides
+  whether it runs again, as Linux restarts by it (another restart code
+  restarts as that one does, `-ERESTART_RESTARTBLOCK` as `restart_syscall`),
+  any other value ends the restart, `orig_rax` set to -1 too, when the code
+  is what the call returns, and another `orig_rax` is the call that runs.
+  `PTRACE_O_SUSPEND_SECCOMP` lets the tracee's calls past its seccomp
+  filters and strict mode; setting it needs `CAP_SYS_ADMIN` and a tracer
+  under no seccomp mode (`EPERM`), as on a Linux with checkpoint and
+  restore.
 - With `PTRACE_SYSCALL`, a tracee stops at the entry and at the exit of each
   system call (`SIGTRAP`, or `SIGTRAP | 0x80` with `PTRACE_O_TRACESYSGOOD`),
   and with `PTRACE_SYSEMU` at the entry only, where the call does not run.

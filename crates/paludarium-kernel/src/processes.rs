@@ -4713,6 +4713,8 @@ impl Kernel {
             ptrace: std::mem::take(&mut thread.state.ptrace),
             ..ThreadState::default()
         };
+        // `start_thread` loads the selectors a new program starts with.
+        thread.state.ptrace.selectors = None;
         thread.state.name_after(&path);
         // Linux decides from the IDs before exec, then installs the new ones
         // as a change of credentials (`commit_creds`). A program the thread

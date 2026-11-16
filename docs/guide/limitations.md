@@ -477,14 +477,13 @@ verified.
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
-    `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
-    checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
+    `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
     without XSAVE, which the emulated CPU does not offer. There are no
     hardware breakpoints: the debug registers read as unused (DR6 as
     `0xffff0ff0`), and a write to them other than clearing DR7 gives `EIO`.
-    A segment selector a tracer writes is checked but not changed. A
-    restart code a tracer changes into another restart code ends the
-    restart.
+    A `cs` or `ss` selector a tracer writes other than the 64-bit user ones
+    is kept and shown, but the tracee runs on in 64-bit mode, where Linux
+    would run it in that segment or fault.
   - `mincore` counts a page of a file as in memory whenever it lies within the
     file, where Linux asks its page cache, and does not count a page that
     `MAP_POPULATE`, `MAP_LOCKED` or a memory lock brought in until it is touched.

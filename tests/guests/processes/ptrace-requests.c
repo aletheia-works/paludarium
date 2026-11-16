@@ -461,6 +461,130 @@ static int exit_core_case(void) {
     return 0;
 }
 
+/* --- ptrace-restart-codes --------------------------------------------- */
+
+/* The restart code a tracer leaves in rax at the stop for the signal that
+ * interrupted a read decides whether it runs again. */
+static int restart_pipe[2];
+static void restart_handler(int number) { (void)number; }
+
+static long blocked_read(void) {
+    char byte;
+    long r = syscall(SYS_read, restart_pipe[0], &byte, 1);
+    return r < 0 ? -errno : r;
+}
+
+/* Waits until the child sleeps, then sends it `number`, and stops it there;
+ * shows rax, and leaves `rax` and `orig_rax` as asked (`keep` for none). */
+static void interrupt(pid_t child, int number, long rax, long orig, int resume) {
+    do usleep(10000);
+    while (state_of(child) != 'S');
+    kill(child, number);
+    int status = wait_status(child, 0);
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("stop=%d rax=%lld\n", WIFSTOPPED(status) ? WSTOPSIG(status) : -1,
+           (long long)regs.rax);
+    regs.rax = rax;
+    if (orig) regs.orig_rax = orig;
+    pt(PTRACE_SETREGS, child, 0, (unsigned long)&regs);
+    pt(PTRACE_CONT, child, 0, resume);
+}
+
+static int restart_codes_case(void) {
+    if (pipe(restart_pipe)) return 80;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sigaction plain = {.sa_handler = restart_handler};
+        struct sigaction restarting = {.sa_handler = restart_handler, .sa_flags = SA_RESTART};
+        sigaction(SIGUSR1, &plain, NULL);
+        sigaction(SIGUSR2, &restarting, NULL);
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGSTOP);
+        long nointr = blocked_read();
+        long nohand = blocked_read();
+        long literal = blocked_read();
+        long block = blocked_read();
+        printf("nointr=%ld nohand=%ld literal=%ld block=%ld\n", nointr, nohand, literal, block);
+        fflush(stdout);
+        _exit(0);
+    }
+    wait_status(child, 0);
+    pt(PTRACE_CONT, child, 0, 0);
+    /* -ERESTARTSYS made -ERESTARTNOINTR: it runs again after the handler,
+     * and reads the byte written meanwhile. */
+    interrupt(child, SIGUSR1, -513, 0, SIGUSR1);
+    write(restart_pipe[1], "x", 1);
+    /* -ERESTARTNOHAND: EINTR after a handler, even an SA_RESTART one. */
+    interrupt(child, SIGUSR2, -514, 0, SIGUSR2);
+    /* orig_rax -1: no call to restart, and rax is what the read returns. */
+    interrupt(child, SIGUSR1, -512, -1, SIGUSR1);
+    /* -ERESTART_RESTARTBLOCK, the signal taken back so no handler runs:
+     * restart_syscall, with nothing to resume, gives EINTR. */
+    interrupt(child, SIGUSR1, -516, 0, 0);
+    int status = wait_status(child, 0);
+    printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
+/* --- ptrace-selectors -------------------------------------------------- */
+
+static int selectors_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGSTOP);
+        _exit(0);
+    }
+    wait_status(child, 0);
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("ds=%#llx es=%#llx fs=%#llx gs=%#llx cs=%#llx ss=%#llx\n", regs.ds, regs.es, regs.fs,
+           regs.gs, regs.cs, regs.ss);
+    long ds = offsetof(struct user_regs_struct, ds), cs = offsetof(struct user_regs_struct, cs);
+    printf("poke-ds=%ld\n", pt(PTRACE_POKEUSER, child, ds, 0x2b));
+    unsigned long word = 0;
+    long peeked = pt(PTRACE_PEEKUSER, child, ds, (unsigned long)&word);
+    printf("peek-ds=%ld word=%#lx\n", peeked, word);
+    printf("poke-ds-kernel=%ld\n", pt(PTRACE_POKEUSER, child, ds, 0x10));
+    printf("poke-cs-null=%ld\n", pt(PTRACE_POKEUSER, child, cs, 0));
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    regs.es = 0x1002b;
+    printf("setregs=%ld\n", pt(PTRACE_SETREGS, child, 0, (unsigned long)&regs));
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("ds=%#llx es=%#llx\n", regs.ds, regs.es);
+    pt(PTRACE_CONT, child, 0, 0);
+    int status = wait_status(child, 0);
+    printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
+/* --- ptrace-suspend-seccomp -------------------------------------------- */
+
+/* A tracer under seccomp may not suspend its tracee's (EPERM), whatever
+ * its capabilities. */
+static int suspend_seccomp_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGSTOP);
+        _exit(0);
+    }
+    wait_status(child, 0);
+    struct sock_filter code[] = {BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+    struct sock_fprog program = {1, code};
+    printf("no-new-privs=%d\n", prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
+    printf("filter=%ld\n", syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program));
+    printf("setoptions=%ld\n", pt(PTRACE_SETOPTIONS, child, 0, 1 << 21));
+    pt(PTRACE_CONT, child, 0, 0);
+    int status = wait_status(child, 0);
+    printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 99;
     const char *mode = argv[1];
@@ -472,6 +596,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-arch-rseq")) code = arch_rseq_case();
     if (!strcmp(mode, "ptrace-syscall-signal")) code = syscall_signal_case();
     if (!strcmp(mode, "ptrace-exit-core")) code = exit_core_case();
+    if (!strcmp(mode, "ptrace-restart-codes")) code = restart_codes_case();
+    if (!strcmp(mode, "ptrace-selectors")) code = selectors_case();
+    if (!strcmp(mode, "ptrace-suspend-seccomp")) code = suspend_seccomp_case();
     fflush(stdout);
     return code;
 }

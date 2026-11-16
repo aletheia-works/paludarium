@@ -522,3 +522,62 @@ fn a_string_instruction_without_a_repeat_hits_a_data_breakpoint() {
         }
     );
 }
+
+/// Whether one instruction of `code`, from `setup`'s registers, hits a
+/// breakpoint on `length` bytes at `address` that breaks `on`.
+fn hits_breakpoint(
+    code: &[u8],
+    setup: impl Fn(&mut CpuState),
+    address: u64,
+    length: u8,
+    on: crate::breakpoints::BreakOn,
+) -> bool {
+    use crate::breakpoints::{Breakpoint, Breakpoints, run_watched};
+    let (mut s, mem) = fixture(code);
+    s.gpr[reg::RSP] = 0x4000_1000;
+    setup(&mut s);
+    let mut set = Breakpoints::default();
+    set.0[0] = Some(Breakpoint {
+        address,
+        length,
+        on,
+    });
+    matches!(
+        run_watched(&mut s, &mem, 1, &mut DecodeCache::new(), &set),
+        ExitReason::HardwareBreakpoint { .. }
+    )
+}
+
+#[test]
+fn save_areas_and_implicit_accesses_hit_data_breakpoints() {
+    use crate::breakpoints::BreakOn::{Access, Write};
+    // fxsave [0x40000000] writes its 512 bytes.
+    let fxsave = [0x0f, 0xae, 0x04, 0x25, 0, 0, 0, 0x40];
+    assert!(hits_breakpoint(&fxsave, |_| {}, 0x4000_01f8, 8, Write));
+    assert!(!hits_breakpoint(&fxsave, |_| {}, 0x4000_0200, 8, Write));
+    // xlat reads [rbx + al], and writes nothing.
+    let at_8 = |s: &mut CpuState| {
+        s.gpr[reg::RBX] = 0x4000_0000;
+        s.gpr[reg::RAX] = 8;
+    };
+    assert!(hits_breakpoint(&[0xd7], at_8, 0x4000_0008, 1, Access));
+    assert!(!hits_breakpoint(&[0xd7], at_8, 0x4000_0008, 1, Write));
+    // leave pops rbp from where rbp points; enter pushes it.
+    let frame = |s: &mut CpuState| s.gpr[reg::RBP] = 0x4000_0100;
+    assert!(hits_breakpoint(&[0xc9], frame, 0x4000_0100, 8, Access));
+    assert!(hits_breakpoint(
+        &[0xc8, 0x10, 0, 0],
+        frame,
+        0x4000_0ff8,
+        8,
+        Write
+    ));
+    // maskmovdqu writes only the bytes its mask selects.
+    let masked = |s: &mut CpuState| {
+        s.gpr[reg::RDI] = 0x4000_0010;
+        s.xmm[1] = 0x80 << 24;
+    };
+    let maskmovdqu = [0x66, 0x0f, 0xf7, 0xc1];
+    assert!(hits_breakpoint(&maskmovdqu, masked, 0x4000_0013, 1, Write));
+    assert!(!hits_breakpoint(&maskmovdqu, masked, 0x4000_0014, 1, Write));
+}

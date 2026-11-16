@@ -608,6 +608,7 @@ mod linux {
         ptrace_singlestep => ("ptrace-singlestep","single-step"),
         ptrace_forced_frame => ("ptrace-forced-frame","single-step"),
         ptrace_hw_breakpoint => ("ptrace-hw-breakpoint","single-step"),
+        ptrace_hw_implicit => ("ptrace-hw-implicit","single-step"),
         ptrace_restart_codes => ("ptrace-restart-codes","ptrace-requests"),
         ptrace_selectors => ("ptrace-selectors","ptrace-requests"),
         ptrace_suspend_seccomp => ("ptrace-suspend-seccomp","ptrace-requests"),

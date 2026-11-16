@@ -71,7 +71,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **4 段のページングだけ**：エミュレートするマシンは、ホストの CPU にかかわらず常に 4 段の
   ページテーブルを持ちます。ユーザー空間は 2^47 バイト未満で終わり、`TASK_SIZE_MAX` を使う
   検査ではすべて 2^47 - 4096 です。`ptrace` の `PTRACE_POKEUSER`、`PTRACE_SETREGS`、
-  `PTRACE_ARCH_PRCTL` が受け取る `fs` と `gs` のベース（`EIO`、`EPERM`）がそうです。5 段のページング（LA57）の CPU の Linux は、
+  `PTRACE_ARCH_PRCTL` が受け取る `fs` と `gs` のベース（`EIO`、`EPERM`）と、デバッグレジスタの
+  ハードウェアブレークポイントの範囲（`EINVAL`）がそうです。5 段のページング（LA57）の CPU の Linux は、
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
@@ -421,12 +422,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - `ptrace` の、機能の一覧にない要求は `EIO` を返します。
     `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
     ほかは `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
-    `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。データのブレークポイントが
-    見るのは、命令のメモリオペランド、スタックへの push、pop、call、return、繰り返しのない
-    文字列命令のアクセスです。次のものでは、CPU と違って止まりません。`rep` 付きの文字列命令
-    （CPU は範囲に触れた回の後で止めます）、`fxsave`、`fxrstor`、`xsave`、`xrstor`、`fsave`、
-    `frstor`、`fnstenv`、`fldenv` の保存領域、`enter`、`leave`、`xlat`、`maskmovdqu` の暗黙の
-    アクセスです。トレーサーが 64 ビットのユーザーのもの以外の `cs` や `ss` を書くと、
+    `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。データのブレークポイントは、
+    `rep` 付きの文字列命令を見ません。CPU のものは、範囲に触れた回の後で止めます。トレーサーが 64 ビットのユーザーのもの以外の `cs` や `ss` を書くと、
     そのセレクタは残って見えますが、トレース対象は 64 ビットのまま動きます。Linux ではその
     セグメントで動くか、フォールトします。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。

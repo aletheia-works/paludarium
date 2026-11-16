@@ -121,15 +121,45 @@ __asm__(".text\n"
         "  movq watched(%rip), %rdx\n"
         "seq_hw_end:\n"
         "  ret\n"
+        /* kill(rdi, SIGSTOP), then an fxsave, an xlat and a leave whose
+         * memory breakpoints watch; the callee-saved registers are kept. */
+        ".globl seq_hw2, seq_hw2_end\n"
+        "seq_hw2:\n"
+        "  pushq %rbx\n"
+        "  pushq %rbp\n"
+        "  pushq %r12\n"
+        "  movl $19, %esi\n"
+        "  movl $62, %eax\n"
+        "  syscall\n"
+        "  leaq fxarea(%rip), %rax\n"
+        "  fxsave (%rax)\n"
+        "  leaq table(%rip), %rbx\n"
+        "  movl $8, %eax\n"
+        "  xlat\n"
+        "  movq %rsp, %r12\n"
+        "  leaq leaveslot(%rip), %rbp\n"
+        "  leave\n"
+        "  movq %r12, %rsp\n"
+        "seq_hw2_end:\n"
+        "  popq %r12\n"
+        "  popq %rbp\n"
+        "  popq %rbx\n"
+        "  ret\n"
         ".data\n"
         ".balign 8\n"
         ".globl watched\n"
         "watched: .quad 0\n"
+        ".balign 16\n"
+        ".globl fxarea, table, leaveslot\n"
+        "fxarea: .zero 512\n"
+        "table: .zero 16\n"
+        "leaveslot: .quad 0\n"
         ".text\n");
 
 void seq_flag(void), seq_syscall(void), seq_signal(int), seq_int3(void), seq_trace(int),
     seq_frame(int), seq_hw(int);
-extern char seq_hw_exec[], seq_hw_end[];
+extern char seq_hw_exec[], seq_hw_end[], seq_hw2_end[], fxarea[], table[], leaveslot[];
+void seq_hw2(int);
 extern uint64_t watched;
 extern char seq_flag_end[], seq_syscall_end[], seq_signal_end[], seq_int3_end[], seq_trace_from[],
     seq_trace_end[], seq_frame_end[];
@@ -415,6 +445,51 @@ static int hw_breakpoint_case(void) {
     return 0;
 }
 
+/* Data breakpoints on an fxsave's area, an xlat's table entry and the
+ * word a leave pops. */
+static void hw2_stop(pid_t child, const char *name) {
+    int status = wait_status(child);
+    if (!WIFSTOPPED(status)) {
+        printf("%s: exited=%d\n", name, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return;
+    }
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("%s: signal=%d code=%d at=%lld dr6=%#lx\n", name, WSTOPSIG(status), info.si_code,
+           (long long)(regs.rip - (uint64_t)(uintptr_t)seq_hw2), (unsigned long)peek_debug(child, 6));
+}
+
+static int hw_implicit_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        seq_hw2(getpid());
+        _exit(0);
+    }
+    wait_status(child);
+    pt(PTRACE_POKEUSER, child, DEBUGREG(0), (unsigned long)(fxarea + 504));
+    pt(PTRACE_POKEUSER, child, DEBUGREG(1), (unsigned long)(table + 8));
+    pt(PTRACE_POKEUSER, child, DEBUGREG(2), (unsigned long)leaveslot);
+    /* DR0: an 8-byte write; DR1: a 1-byte read or write; DR2: an 8-byte
+     * read or write. */
+    unsigned long dr7 = 1 | 1 << 2 | 1 << 4 | 0x9UL << 16 | 0x3UL << 20 | 0xbUL << 24;
+    printf("dr7=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), dr7));
+    pt(PTRACE_CONT, child, 0, 0);
+    hw2_stop(child, "fxsave");
+    pt(PTRACE_CONT, child, 0, 0);
+    hw2_stop(child, "xlat");
+    pt(PTRACE_CONT, child, 0, 0);
+    hw2_stop(child, "leave");
+    pt(PTRACE_POKEUSER, child, DEBUGREG(7), 0);
+    pt(PTRACE_CONT, child, 0, 0);
+    hw2_stop(child, "end");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 99;
     const char *mode = argv[1];
@@ -427,6 +502,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-singlestep")) code = ptrace_case();
     if (!strcmp(mode, "ptrace-forced-frame")) code = forced_frame_case();
     if (!strcmp(mode, "ptrace-hw-breakpoint")) code = hw_breakpoint_case();
+    if (!strcmp(mode, "ptrace-hw-implicit")) code = hw_implicit_case();
     fflush(stdout);
     return code;
 }

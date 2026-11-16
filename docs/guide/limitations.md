@@ -82,7 +82,8 @@ verified.
   tables, whatever CPU the host has: user space ends below 2^47 bytes, and
   `TASK_SIZE_MAX` is 2^47 - 4096 for every check that asks for it, as the
   `fs` and `gs` bases `ptrace`'s `PTRACE_POKEUSER`, `PTRACE_SETREGS` and
-  `PTRACE_ARCH_PRCTL` take (`EIO`, `EPERM`). Linux on a CPU with 5-level paging (LA57) maps
+  `PTRACE_ARCH_PRCTL` take (`EIO`, `EPERM`) and the range of a hardware
+  breakpoint in a debug register (`EINVAL`). Linux on a CPU with 5-level paging (LA57) maps
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
@@ -494,13 +495,8 @@ verified.
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
     without XSAVE, which the emulated CPU does not offer. A data
-    breakpoint sees the accesses of an instruction's memory operands, of
-    its push, pop, call or return on the stack, and of a string
-    instruction without a repeat. These do not hit one, where the CPU's
-    would: a `rep` string instruction (the CPU stops after the iteration
-    that touched the range); the save areas of `fxsave`, `fxrstor`,
-    `xsave`, `xrstor`, `fsave`, `frstor`, `fnstenv` and `fldenv`; the
-    implicit accesses of `enter`, `leave`, `xlat` and `maskmovdqu`.
+    breakpoint does not see a `rep` string instruction, which the CPU's
+    stops after the iteration that touched its range.
     A `cs` or `ss` selector a tracer writes other than the 64-bit user ones
     is kept and shown, but the tracee runs on in 64-bit mode, where Linux
     would run it in that segment or fault.

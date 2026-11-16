@@ -403,6 +403,7 @@
     {"name":"ptrace-singlestep","binary":"single-step"},
     {"name":"ptrace-forced-frame","binary":"single-step"},
     {"name":"ptrace-hw-breakpoint","binary":"single-step"},
+    {"name":"ptrace-hw-implicit","binary":"single-step"},
     {"name":"ptrace-restart-codes","binary":"ptrace-requests"},
     {"name":"ptrace-selectors","binary":"ptrace-requests"},
     {"name":"ptrace-suspend-seccomp","binary":"ptrace-requests"},

@@ -5,11 +5,13 @@
 //! address (`rip` stays, and RF lets that instruction run once it goes on),
 //! and a data breakpoint traps after an instruction that accesses its
 //! range, as the CPU raises #DB. An access is what the instruction's
-//! explicit memory operands, its push, pop, call or return on the stack,
-//! and a string instruction without a repeat touch; a write breakpoint
-//! takes only what an instruction writes. A repeated string instruction,
-//! which the CPU stops after the iteration that touched the range, is not
-//! looked at yet.
+//! explicit memory operands touch (the whole save area of `fxsave`,
+//! `fnsave`, `fnstenv` and their restores, the bytes `maskmovdqu`'s mask
+//! selects), its stack accesses (push, pop, call, return, `enter`,
+//! `leave`), and a string instruction's element without a repeat; a write
+//! breakpoint takes only what an instruction writes. A repeated string
+//! instruction, which the CPU stops after the iteration that touched the
+//! range, is not looked at yet.
 use crate::{CpuState, DecodeCache, flag, reg, step_cached};
 use paludarium_decoder::{
     Instruction, MemoryOperand, Mnemonic, Operand, Register, RepPrefix, Segment,
@@ -74,7 +76,7 @@ impl Breakpoints {
 #[derive(Clone, Copy, Debug)]
 struct Access {
     address: u64,
-    length: u8,
+    length: u16,
     write: bool,
 }
 
@@ -120,6 +122,11 @@ fn reads_destination(m: Mnemonic) -> bool {
             | M::Fldcw
             | M::Ldmxcsr
             | M::Clflush
+            | M::Xlatb
+            | M::Fldenv
+            | M::Frstor
+            | M::Fxrstor
+            | M::Fxrstor64
     )
 }
 
@@ -152,29 +159,50 @@ fn linear(state: &CpuState, m: &MemoryOperand) -> u64 {
 fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
     let mut out = Vec::new();
     // `lea` takes no memory, and the hints (`nop`, which the prefetches
-    // decode as) never access it. The save areas are not looked at.
-    if matches!(
-        insn.mnemonic,
-        Mnemonic::Lea
-            | Mnemonic::Nop
-            | Mnemonic::Fxsave
-            | Mnemonic::Fxsave64
-            | Mnemonic::Fxrstor
-            | Mnemonic::Fxrstor64
-            | Mnemonic::Fnsave
-            | Mnemonic::Frstor
-            | Mnemonic::Fnstenv
-            | Mnemonic::Fldenv
-    ) {
+    // decode as) never access it.
+    if matches!(insn.mnemonic, Mnemonic::Lea | Mnemonic::Nop) {
+        return out;
+    }
+    // `maskmovdqu`: the bytes its mask selects, at rdi.
+    if insn.mnemonic == Mnemonic::Maskmovdqu {
+        if let (Some(Operand::Memory(m)), Some(Operand::Register(Register::Xmm(n)))) =
+            (insn.operand(0), insn.operand(2))
+        {
+            let wrap = if m.address_size_32 {
+                0xffff_ffff
+            } else {
+                u64::MAX
+            };
+            let base = linear(state, &m);
+            let mask = state.xmm[usize::from(n & 15)].to_le_bytes();
+            for (byte, selector) in mask.iter().enumerate() {
+                if selector & 0x80 != 0 {
+                    out.push(Access {
+                        address: base.wrapping_add(byte as u64) & wrap,
+                        length: 1,
+                        write: true,
+                    });
+                }
+            }
+        }
         return out;
     }
     for (n, operand) in insn.operands().enumerate() {
-        if let Operand::Memory(m) = operand
-            && m.size != 0
-        {
+        if let Operand::Memory(m) = operand {
+            // The area `fxsave` and `fxrstor` take is 512 bytes, more than
+            // an operand size holds; the x87 ones have theirs there.
+            let length = match insn.mnemonic {
+                Mnemonic::Fxsave | Mnemonic::Fxsave64 | Mnemonic::Fxrstor | Mnemonic::Fxrstor64 => {
+                    512
+                }
+                _ => u16::from(m.size),
+            };
+            if length == 0 {
+                continue;
+            }
             out.push(Access {
                 address: linear(state, &m),
-                length: m.size,
+                length,
                 write: n == 0 && !reads_destination(insn.mnemonic)
                     || insn.mnemonic == Mnemonic::Xchg,
             });
@@ -205,7 +233,7 @@ fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
             _ => {
                 out.push(Access {
                     address: destination,
-                    length: size,
+                    length: u16::from(size),
                     write: false,
                 });
                 (Some(source), None)
@@ -215,7 +243,7 @@ fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
             if let Some(address) = address {
                 out.push(Access {
                     address,
-                    length: size,
+                    length: u16::from(size),
                     write,
                 });
             }
@@ -224,11 +252,54 @@ fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
     }
     let rsp = state.gpr[reg::RSP];
     let size = insn.implicit_size.max(1);
+    let length = u16::from(size);
+    let step = u64::from(size);
     match insn.mnemonic {
         Mnemonic::Push | Mnemonic::Pushf | Mnemonic::Pushfq => out.push(Access {
-            address: rsp.wrapping_sub(u64::from(size)),
-            length: size,
+            address: rsp.wrapping_sub(step),
+            length,
             write: true,
+        }),
+        // `enter`: rbp pushed, then for a nesting level the frame pointers
+        // read below the old rbp and pushed, and the new frame pushed last.
+        Mnemonic::Enter => {
+            let nesting = match insn.operand(1) {
+                Some(Operand::Immediate(level)) => level & 31,
+                _ => 0,
+            };
+            let old_bp = state.gpr[reg::RBP];
+            let mut pushed = 1;
+            out.push(Access {
+                address: rsp.wrapping_sub(step),
+                length,
+                write: true,
+            });
+            if nesting != 0 {
+                for level in 1..nesting {
+                    out.push(Access {
+                        address: old_bp.wrapping_sub(level * step),
+                        length,
+                        write: false,
+                    });
+                    pushed += 1;
+                    out.push(Access {
+                        address: rsp.wrapping_sub(pushed * step),
+                        length,
+                        write: true,
+                    });
+                }
+                out.push(Access {
+                    address: rsp.wrapping_sub((pushed + 1) * step),
+                    length,
+                    write: true,
+                });
+            }
+        }
+        // `leave` pops rbp from where rbp points.
+        Mnemonic::Leave => out.push(Access {
+            address: state.gpr[reg::RBP],
+            length,
+            write: false,
         }),
         Mnemonic::Call => out.push(Access {
             address: rsp.wrapping_sub(8),
@@ -237,7 +308,7 @@ fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
         }),
         Mnemonic::Pop | Mnemonic::Popf | Mnemonic::Popfq => out.push(Access {
             address: rsp,
-            length: size,
+            length,
             write: false,
         }),
         Mnemonic::Ret => out.push(Access {

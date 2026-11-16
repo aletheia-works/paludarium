@@ -56,19 +56,27 @@ impl Ids {
     /// An ID `kernel.*_next_id` set is taken instead, once (`ipc_idr_alloc`
     /// with `next_id`): its sequence number, and the first free index from
     /// its own, which leaves the turn and the sequence number as they were.
-    /// Linux looks past `IPCMNI` for a free index; here none past it is
-    /// `ENOSPC`.
-    pub fn allocate<T>(&mut self, objects: &BTreeMap<u32, T>, limit: usize) -> Result<i32, Errno> {
+    /// As Linux's `idr_alloc` from it, that index may be past `IPCMNI`: the
+    /// ID then adds it to the sequence number shifted, as Linux's does, and
+    /// names the object at its low bits' index, so no call finds the
+    /// object by it, though it counts and `/proc/sysvipc` lists it.
+    ///
+    /// The ID, and the index the object goes in.
+    pub fn allocate<T>(
+        &mut self,
+        objects: &BTreeMap<u32, T>,
+        limit: usize,
+    ) -> Result<(i32, u32), Errno> {
         let in_use = objects.len();
         if in_use >= limit {
             return Err(Errno::ENOSPC);
         }
         if let Some(wanted) = self.wanted.take() {
             let seq = wanted as u32 >> SEQ_SHIFT;
-            let index = (index(wanted)..IPCMNI)
+            let index = (index(wanted)..=i32::MAX as u32)
                 .find(|index| !objects.contains_key(index))
                 .ok_or(Errno::ENOSPC)?;
-            return Ok(((seq << SEQ_SHIFT) + index) as i32);
+            return Ok(((seq << SEQ_SHIFT).wrapping_add(index) as i32, index));
         }
         let end = (in_use * 3 / 2).clamp(MIN_CYCLE, IPCMNI as usize) as u32;
         let free = |from: u32| (from..end).find(|index| !objects.contains_key(index));
@@ -81,7 +89,7 @@ impl Ids {
             }
         }
         self.last = Some(index);
-        Ok(((self.seq << SEQ_SHIFT) + index) as i32)
+        Ok((((self.seq << SEQ_SHIFT) + index) as i32, index))
     }
 }
 
@@ -215,23 +223,32 @@ mod tests {
         let mut ids = Ids::default();
         let mut objects: BTreeMap<u32, ()> = BTreeMap::new();
         for _ in 0..2 {
-            let id = ids.allocate(&objects, 10).unwrap();
-            objects.insert(index(id), ());
+            let (_, at) = ids.allocate(&objects, 10).unwrap();
+            objects.insert(at, ());
         }
         // Index 5 is taken, so the next ID asked for gets 6, its sequence
         // number kept.
         objects.insert(5, ());
         ids.set_next_id((3 << SEQ_SHIFT) + 5);
         assert_eq!(ids.next_id(), (3 << SEQ_SHIFT) + 5);
-        let id = ids.allocate(&objects, 10).unwrap();
-        assert_eq!(id, (3 << SEQ_SHIFT) + 6);
+        let (id, at) = ids.allocate(&objects, 10).unwrap();
+        assert_eq!((id, at), ((3 << SEQ_SHIFT) + 6, 6));
         assert_eq!(ids.next_id(), -1);
-        objects.insert(index(id), ());
+        objects.insert(at, ());
         // The turn goes on from where it was, sequence 0.
-        assert_eq!(ids.allocate(&objects, 10), Ok(2));
+        assert_eq!(ids.allocate(&objects, 10), Ok((2, 2)));
         // At the limit it is not taken.
         ids.set_next_id(9);
         assert_eq!(ids.allocate(&objects, 4), Err(Errno::ENOSPC));
         assert_eq!(ids.next_id(), 9);
+        // An index past IPCMNI, as Linux's idr gives it, whose ID adds it to
+        // the sequence number.
+        let mut ids = Ids::default();
+        let full: BTreeMap<u32, ()> = (IPCMNI - 2..IPCMNI).map(|at| (at, ())).collect();
+        ids.set_next_id((1 << SEQ_SHIFT) + (IPCMNI as i32 - 2));
+        assert_eq!(
+            ids.allocate(&full, 10),
+            Ok((((1 << SEQ_SHIFT) + IPCMNI) as i32, IPCMNI))
+        );
     }
 }

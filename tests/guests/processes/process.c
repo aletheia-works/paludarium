@@ -15021,6 +15021,37 @@ static int ipc_sysctl_more(void) {
     printf(" made=%d exited=%ld own=%ld", made, ksys_exists(left), ksys_exists(own));
     printf(" unset=%ld\n", ksys_write("shm_rmid_forced", "0"));
     syscall(SYS_shmctl, own, IPC_RMID, NULL);
+
+    /* A next ID whose index is taken goes to the next free one, past
+       IPCMNI too: its ID adds that index to the sequence number, and names
+       another index, so nothing finds the segment by it. It stays until
+       the namespace goes, with this child. */
+    ksys_write("shm_next_id", "32767");
+    int last = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    ksys_write("shm_next_id", "32767");
+    int past = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    unsigned long shminfo[9] = {0};
+    long max = syscall(SYS_shmctl, 0, 3 /* IPC_INFO */, shminfo);
+    printf("past-ipcmni: last=%d past=%d stat=%ld max=%ld\n", last, past, ksys_exists(past), max);
+    syscall(SYS_shmctl, last, IPC_RMID, NULL);
+
+    /* Another user writing through root's descriptor is refused at the
+       write (proc_sys_call_handler's EPERM). */
+    long held = ksys_open("msgmax", O_WRONLY);
+    fflush(stdout);
+    pid_t other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        errno = 0;
+        long n = write((int)held, "100", 3);
+        printf("held-write: open=%d write=%ld", held >= 0, n < 0 ? -errno : n);
+        ksys_show("msgmax");
+        printf("\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    result("held-write", reaped(other));
+    if (held >= 0) close((int)held);
     return 0;
 }
 static int ipc_sysctl_case(void) {
@@ -15197,6 +15228,24 @@ static int kernel_sysctl_case(void) {
         _exit(0);
     }
     result("other", reaped(other));
+    /* Root's descriptor, written through by another user: refused at the
+       write (EPERM). It writes 2, the default, so even a write that went
+       through would leave the machine as it was. */
+    errno = 0;
+    int held = open("/proc/sys/kernel/unprivileged_bpf_disabled", O_WRONLY | O_CLOEXEC);
+    printf("held: open=%d\n", held >= 0 ? 0 : -errno);
+    fflush(stdout);
+    other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        errno = 0;
+        long n = held < 0 ? 0 : write(held, "2", 1);
+        printf("held-write: write=%ld\n", n < 0 ? -errno : n);
+        fflush(stdout);
+        _exit(0);
+    }
+    result("held-write", reaped(other));
+    if (held >= 0) close(held);
     return 0;
 }
 static int sem_case(void) {

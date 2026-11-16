@@ -376,10 +376,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `O_EXCL` を付けてハンドルから開いた pidfd には、CI の Linux 7.0 と同じく `PIDFD_THREAD`
     が残りません。Linux 7.2 以降は残します。
   - System V IPC の `IPCMNI` は、起動オプション `ipcmni_extend` がないときと同じく、
-    いつも 32768 です。`*_next_id` が求める ID は、その添字から 32768 未満がすべて
-    使われていれば `ENOSPC` です。Linux はその先の添字を与えます。設定した
-    `shm_rmid_forced` を読んでも孤児は消えません。Linux は書いたときと同じく消します。
-    `/proc/sysvipc` は開いたときのオブジェクトを見せます。Linux は読み進めたところで、
+    いつも 32768 です。`/proc/sysvipc` は開いたときのオブジェクトを見せます。Linux は読み進めたところで、
     そのオブジェクトをその都度読みます。
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
@@ -402,10 +399,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     専用のワーカーではなく、次の鍵の呼び出しの始めに行います。最後のリンクを失った鍵は
     すぐになくなり、割り当ても戻ります。Linux では少しあとで解放します。スレッドのキーリングが従うのは、`setfsuid` や `setuid` などが変える
     ファイルシステムの ID だけです。
-  - `/proc/sys/fs/mqueue` と `/proc/sys/kernel` のファイルは、書ける者を（
-    `unprivileged_bpf_disabled` は書き手に `CAP_SYS_ADMIN` があるかも）開くときに
-    確かめます。Linux は書き込みの
-    たびに書く者を確かめ直します。また、サイズとして値の長さを示します。Linux は 0 です。
+  - `/proc/sys` のファイルは、`write`、`writev`、aio、`sendfile` での書き込みでは書き手を
+    確かめ直しますが、位置を指定した書き込み（`pwrite64`、位置を指定した `pwritev`）
+    では開いたときにしか確かめません。Linux はどの書き込みでも確かめます。また、サイズ
+    として値の長さを示します。Linux は 0 です。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
   - `ptrace` の、機能の一覧にない要求は `EIO` を返します。

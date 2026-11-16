@@ -47,7 +47,9 @@
 //! it; a write elsewhere is taken and does nothing, as
 //! `sysctl_writes_strict` has it. A file's mode is 0644, and only the root
 //! of the user namespace that owns the IPC namespace may open it to write
-//! (`mq_permissions`, `EACCES`).
+//! (`mq_permissions`, `EACCES`). A write through `write`, `writev`, aio or
+//! `sendfile` asks the writer again, as Linux's `proc_sys_call_handler`
+//! does (`EPERM`) ([`write`]).
 use crate::ipc::IPCMNI;
 use crate::mqueue::{HARD_MSGMAX, HARD_MSGSIZEMAX, Limits, Queues};
 use crate::namespaces::Namespace;
@@ -561,91 +563,105 @@ pub(crate) fn open(
     entry: Entry,
     flags: u32,
 ) -> Result<Arc<dyn FileHandle>, Errno> {
-    match entry {
-        Entry::Directory(_) if flags & 3 != 0 => Err(Errno::EISDIR),
-        Entry::Directory(_) => Ok(Arc::new(crate::proc::OwnDirectory::new(
-            crate::proc::directory_stat(),
-        ))),
-        Entry::Setting(setting) => {
-            if flags & 3 != 0 && c.process.credentials.euid != owner(c).0 {
-                return Err(Errno::EACCES);
-            }
-            Ok(Arc::new(SettingFile {
-                value: Value::Mqueue(queues(c), setting),
-                stat: stat(c, entry),
-                position: Mutex::new(0),
-                flags,
-            }))
+    let (value, writers) = match entry {
+        Entry::Directory(_) if flags & 3 != 0 => return Err(Errno::EISDIR),
+        Entry::Directory(_) => {
+            return Ok(Arc::new(crate::proc::OwnDirectory::new(
+                crate::proc::directory_stat(),
+            )));
         }
+        Entry::Setting(setting) => (
+            Value::Mqueue(queues(c), setting),
+            Writers::Owner(owner(c).0),
+        ),
         // The machine's: root's, which only root may open to write.
-        Entry::Kernel(file) if !file.ipc() => {
-            let credentials = &c.process.credentials;
-            if flags & 3 != 0 && credentials.euid != 0 {
-                return Err(Errno::EACCES);
-            }
-            Ok(Arc::new(SettingFile {
-                value: Value::Machine(
-                    Arc::clone(&c.processes.sysctls),
-                    file,
-                    credentials.capable(crate::credentials::CAP_SYS_ADMIN),
-                ),
-                stat: stat(c, entry),
-                position: Mutex::new(0),
-                flags,
-            }))
+        Entry::Kernel(file) if !file.ipc() => (
+            Value::Machine(Arc::clone(&c.processes.sysctls), file),
+            Writers::Root,
+        ),
+        Entry::Kernel(file) if file.next_id() => {
+            (Value::Kernel(ipc(c), file), Writers::Restorer(ipc(c)))
         }
-        Entry::Kernel(file) => {
-            let writer = if file.next_id() {
-                crate::ipc::capable(c, crate::credentials::CAP_CHECKPOINT_RESTORE)
-                    || crate::ipc::capable(c, crate::ipc::CAP_SYS_ADMIN)
-            } else {
-                c.process.credentials.euid == owner(c).0
-            };
-            if flags & 3 != 0 && !writer {
-                return Err(Errno::EACCES);
-            }
-            Ok(Arc::new(SettingFile {
-                value: Value::Kernel(ipc(c), file),
-                stat: stat(c, entry),
-                position: Mutex::new(0),
-                flags,
-            }))
-        }
-        Entry::Inotify(file) => {
-            if flags & 3 != 0 && c.process.credentials.euid != 0 {
-                return Err(Errno::EACCES);
-            }
-            Ok(Arc::new(SettingFile {
-                value: Value::Inotify(Arc::clone(&c.files.caches.notify), file),
-                stat: stat(c, entry),
-                position: Mutex::new(0),
-                flags,
-            }))
-        }
-        Entry::Fanotify(file) => {
-            if flags & 3 != 0 && c.process.credentials.euid != 0 {
-                return Err(Errno::EACCES);
-            }
-            Ok(Arc::new(SettingFile {
-                value: Value::Fanotify(Arc::clone(&c.files.caches.notify.fan), file),
-                stat: stat(c, entry),
-                position: Mutex::new(0),
-                flags,
-            }))
-        }
+        Entry::Kernel(file) => (Value::Kernel(ipc(c), file), Writers::Owner(owner(c).0)),
+        Entry::Inotify(file) => (
+            Value::Inotify(Arc::clone(&c.files.caches.notify), file),
+            Writers::Root,
+        ),
+        Entry::Fanotify(file) => (
+            Value::Fanotify(Arc::clone(&c.files.caches.notify.fan), file),
+            Writers::Root,
+        ),
         // `test_perm`: root has the owner's bits, everyone else the others'.
-        Entry::Aio(aio) => {
-            if flags & 3 != 0 && (aio == Aio::Nr || c.process.credentials.euid != 0) {
-                return Err(Errno::EACCES);
+        Entry::Aio(aio) => (
+            Value::Aio(Arc::clone(&c.processes.aio), aio),
+            if aio == Aio::Nr {
+                Writers::None
+            } else {
+                Writers::Root
+            },
+        ),
+    };
+    let credentials = &c.process.credentials;
+    if flags & 3 != 0 && !writers.allow(credentials) {
+        return Err(Errno::EACCES);
+    }
+    Ok(Arc::new(SettingFile {
+        value,
+        admin: credentials.capable(crate::credentials::CAP_SYS_ADMIN),
+        writers,
+        stat: stat(c, entry),
+        position: Mutex::new(0),
+        flags,
+    }))
+}
+
+/// Who may write an open sysctl file, which Linux's `sysctl_perm` asks at
+/// the open (`EACCES`) and again at each write (`proc_sys_call_handler`,
+/// `EPERM`).
+enum Writers {
+    /// No one (`aio-nr`).
+    None,
+    /// Root: user ID 0 outside any user namespace (`test_perm`).
+    Root,
+    /// The root of the user namespace that owns the IPC namespace, by its
+    /// user ID (`mq_permissions`, `ipc_permissions`).
+    Owner(u32),
+    /// Whoever has `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` over the user
+    /// namespace that owns this IPC namespace (`ipc_permissions` for the
+    /// `*_next_id` files).
+    Restorer(Arc<Namespace>),
+}
+
+impl Writers {
+    fn allow(&self, credentials: &crate::credentials::Credentials) -> bool {
+        match self {
+            Self::None => false,
+            Self::Root => credentials.euid == 0,
+            Self::Owner(uid) => credentials.euid == *uid,
+            Self::Restorer(ipc) => {
+                let owner = ipc.owner();
+                credentials.capable_in(crate::credentials::CAP_CHECKPOINT_RESTORE, owner)
+                    || credentials.capable_in(crate::credentials::CAP_SYS_ADMIN, owner)
             }
-            Ok(Arc::new(SettingFile {
-                value: Value::Aio(Arc::clone(&c.processes.aio), aio),
-                stat: stat(c, entry),
-                position: Mutex::new(0),
-                flags,
-            }))
         }
     }
+}
+
+/// A write of an open sysctl file by the calling thread, whom Linux's
+/// `proc_sys_call_handler` checks again (`EPERM`): one the open let write
+/// may since have lost the right, and `unprivileged_bpf_disabled` asks for
+/// `CAP_SYS_ADMIN` of the writer, not the opener.
+pub(crate) fn write(
+    c: &Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    buf: &[u8],
+) -> Option<Result<u64, Errno>> {
+    let setting = file.as_any()?.downcast_ref::<SettingFile>()?;
+    Some(
+        setting
+            .write_by(buf, Some(&c.process.credentials))
+            .map(|n| n as u64),
+    )
 }
 
 /// What an open sysctl file shows.
@@ -655,8 +671,8 @@ enum Value {
     Inotify(Arc<crate::inotify::Notifier>, Inotify),
     Fanotify(Arc<crate::fanotify::Registry>, Fanotify),
     Kernel(Arc<Namespace>, Kernel),
-    /// The machine's, and whether the opener had `CAP_SYS_ADMIN`.
-    Machine(Arc<Machine>, Kernel, bool),
+    /// The machine's.
+    Machine(Arc<Machine>, Kernel),
 }
 
 impl Value {
@@ -669,11 +685,21 @@ impl Value {
             Self::Inotify(notifier, file) => inotify_line(&notifier.limits, *file),
             Self::Fanotify(registry, file) => fanotify_line(&registry.limits, *file),
             Self::Kernel(ipc, file) => kernel_line(ipc, *file),
-            Self::Machine(machine, file, _) => machine.line(*file),
+            Self::Machine(machine, file) => machine.line(*file),
         }
     }
-    /// Takes the value written at the start of the file: the bytes taken.
-    fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
+    /// After a write that went through, one past the start too: a set
+    /// `kernel.shm_rmid_forced` removes the orphans no mapping shows, as
+    /// Linux master's `proc_ipc_dointvec_minmax_orphans` does (7.0's did so
+    /// after a read too).
+    fn touched(&self) {
+        if let Self::Kernel(ipc, Kernel::ShmRmidForced) = self {
+            ipc.shm.remove_orphans();
+        }
+    }
+    /// Takes the value written at the start of the file, by a writer with
+    /// `CAP_SYS_ADMIN` (`admin`) or without: the bytes taken.
+    fn write(&self, buf: &[u8], admin: bool) -> Result<usize, Errno> {
         match self {
             Self::Mqueue(queues, setting) => {
                 let (value, bounds) = setting.of(queues.limits());
@@ -682,7 +708,7 @@ impl Value {
                 Ok(consumed)
             }
             Self::Kernel(ipc, file) => kernel_write(ipc, *file, buf),
-            Self::Machine(machine, file, admin) => machine.write(*file, buf, *admin),
+            Self::Machine(machine, file) => machine.write(*file, buf, admin),
             Self::Aio(limits, _) => {
                 let (negative, value, consumed) = scan(buf)?;
                 if negative {
@@ -742,6 +768,10 @@ impl Value {
 /// An open file of `/proc/sys`.
 struct SettingFile {
     value: Value,
+    /// Who may write it, and whether the opener had `CAP_SYS_ADMIN`, for a
+    /// write that does not say who makes it.
+    writers: Writers,
+    admin: bool,
     stat: FileStat,
     position: Mutex<u64>,
     flags: u32,
@@ -750,6 +780,46 @@ struct SettingFile {
 impl SettingFile {
     fn position(&self) -> MutexGuard<'_, u64> {
         self.position.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// A write by `writer`, checked again as Linux's `proc_sys_call_handler`
+    /// does (`EPERM`), or, for none, by the opener.
+    fn write_by(
+        &self,
+        buf: &[u8],
+        writer: Option<&crate::credentials::Credentials>,
+    ) -> Result<usize, Errno> {
+        if self.flags & 3 == 0 {
+            return Err(Errno::EBADF);
+        }
+        let admin = match writer {
+            Some(credentials) => {
+                if !self.writers.allow(credentials) {
+                    return Err(Errno::EPERM);
+                }
+                credentials.capable(crate::credentials::CAP_SYS_ADMIN)
+            }
+            None => self.admin,
+        };
+        let written = self.take(buf, admin);
+        if written.is_ok() {
+            self.value.touched();
+        }
+        written
+    }
+    fn take(&self, buf: &[u8], admin: bool) -> Result<usize, Errno> {
+        let mut position = self.position();
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // `sysctl_writes_strict`: a write past the start is taken whole and
+        // changes nothing.
+        if *position != 0 {
+            *position += buf.len() as u64;
+            return Ok(buf.len());
+        }
+        let consumed = self.value.write(buf, admin)?;
+        *position += consumed as u64;
+        Ok(consumed)
     }
 }
 
@@ -770,23 +840,12 @@ impl FileHandle for SettingFile {
         *position += count as u64;
         Ok(count)
     }
+    /// A write that does not say who makes it, checked at the open only.
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
-        if self.flags & 3 == 0 {
-            return Err(Errno::EBADF);
-        }
-        let mut position = self.position();
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // `sysctl_writes_strict`: a write past the start is taken whole and
-        // changes nothing.
-        if *position != 0 {
-            *position += buf.len() as u64;
-            return Ok(buf.len());
-        }
-        let consumed = self.value.write(buf)?;
-        *position += consumed as u64;
-        Ok(consumed)
+        self.write_by(buf, None)
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
     /// `default_llseek`, whose end is the size of 0 a sysctl reports.
     fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {

@@ -4547,6 +4547,47 @@ mod shm {
     }
 
     #[test]
+    fn a_sysctl_checks_its_writer_again_at_each_write() {
+        let (mut k, mut t, m) = setup();
+        const PATH: u64 = DATA + 0x900;
+        const BUF: u64 = DATA + 0xa00;
+        let open = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, name: &str| {
+            m.write(
+                GuestAddr(PATH),
+                format!("/proc/sys/kernel/{name}\0").as_bytes(),
+            )
+            .unwrap();
+            syscall(k, t, m, 2, [PATH, 1, 0, 0, 0, 0])
+        };
+        let write = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, fd: u64, text: &[u8]| {
+            m.write(GuestAddr(BUF), text).unwrap();
+            syscall(k, t, m, 1, [fd, BUF, text.len() as u64, 0, 0, 0])
+        };
+        // Root opens them; another user who has the descriptor may not
+        // write through it (`proc_sys_call_handler`'s `EPERM`).
+        let msgmax = open(&mut k, &mut t, &m, "msgmax");
+        let bpf = open(&mut k, &mut t, &m, "unprivileged_bpf_disabled");
+        let root = t.state.credentials.clone();
+        t.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(write(&mut k, &mut t, &m, msgmax, b"100"), e(Errno::EPERM));
+        assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), e(Errno::EPERM));
+        // Root without CAP_SYS_ADMIN may write msgmax, but not
+        // unprivileged_bpf_disabled, which asks the writer's capability.
+        let mut bare = root.clone();
+        bare.effective &= !crate::credentials::CAP_SYS_ADMIN;
+        t.state.credentials = bare;
+        assert_eq!(write(&mut k, &mut t, &m, msgmax, b"100"), 3);
+        assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), e(Errno::EPERM));
+        t.state.credentials = root;
+        let bpf = open(&mut k, &mut t, &m, "unprivileged_bpf_disabled");
+        assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), 1);
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/msgmax"),
+            "100\n"
+        );
+    }
+
+    #[test]
     fn root_sets_the_machine_s_perf_and_bpf_sysctls_and_they_take_effect() {
         let (mut k, mut t, m) = setup();
         let read = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, name: &str| {

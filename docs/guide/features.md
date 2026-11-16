@@ -2832,7 +2832,15 @@ kernel.
   the namespace's user namespace may write) are the ID the next object of
   their kind takes, once, -1 for none: a write sets it from 0 to `INT_MAX`,
   and the object takes its sequence number and the first free index from
-  its own. `/proc/sys/kernel` lists only these, and each directory of
+  its own, as Linux's `idr_alloc` gives it, past 32768 too: such an ID adds
+  the index to the sequence number shifted and so names another index, and
+  no call finds the object by it, though it counts and `/proc/sysvipc`
+  lists it. A write of any of these files is checked again at the write,
+  as Linux's `proc_sys_call_handler` does: a writer who may not write it
+  now is `EPERM`, though the open let it, and `unprivileged_bpf_disabled`
+  asks the writer, not the opener, for `CAP_SYS_ADMIN`. Only a write that
+  sets `shm_rmid_forced` removes orphans, as Linux master's handler; 7.0's
+  did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
   `/proc/sys` lists its entries by name, as Linux's tree of them keeps
   them.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open

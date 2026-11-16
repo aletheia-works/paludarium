@@ -435,10 +435,7 @@ verified.
     opened from a handle with `O_EXCL` does not keep `PIDFD_THREAD`, as on
     the CI runners' Linux 7.0, where Linux 7.2 and later keep it.
   - System V IPC's `IPCMNI` is always 32768, as without the
-    `ipcmni_extend` boot option, and an ID a `*_next_id` asks for whose
-    index and all after it below 32768 are taken is `ENOSPC`, where Linux
-    gives an index past them. A read of `shm_rmid_forced` set removes no
-    orphans, where Linux's does as its write does. `/proc/sysvipc` shows
+    `ipcmni_extend` boot option. `/proc/sysvipc` shows
     its objects as they were when it was opened, where Linux reads each one
     as the read reaches it.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
@@ -468,11 +465,11 @@ verified.
     little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
-  - A `/proc/sys/fs/mqueue` file and the files of `/proc/sys/kernel`
-    check who may write them, and `unprivileged_bpf_disabled` whether the
-    writer has `CAP_SYS_ADMIN`, when they are opened,
-    where Linux checks the writer again at each write, and each reports its
-    value's length as its size, where Linux reports 0.
+  - The files of `/proc/sys` check their writer again at a write through
+    `write`, `writev`, aio or `sendfile`, but a positioned write (`pwrite64`,
+    `pwritev` at an offset) only as they were opened, where Linux checks
+    every write; and each reports its value's length as its size, where
+    Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,

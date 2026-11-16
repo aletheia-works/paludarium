@@ -5253,6 +5253,10 @@ fn write_io_with(
     if let Some(result) = crate::pty::write(c, file, bytes) {
         return result;
     }
+    // A sysctl checks its writer again.
+    if let Some(result) = crate::sysctl::write(c, file, bytes) {
+        return result;
+    }
     // A socket's writes carry the credentials of their process.
     if let Some(socket) = file
         .as_any()

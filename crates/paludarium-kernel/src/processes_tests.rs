@@ -3,6 +3,8 @@ use super::*;
 use paludarium_mmu::{MappingKind, Prot};
 use paludarium_types::{Errno, GuestAddr, PAGE_SIZE};
 const DATA: u64 = 0x600000;
+#[path = "ptrace_replay_tests.rs"]
+mod ptrace_replay;
 #[path = "replay_tests.rs"]
 mod replay;
 mod fd {

@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "binary": "x87",
+  "cases": ["x87-transcendental", "x87-decimal", "x87-state", "x87-exceptions"]
+}

@@ -5,7 +5,8 @@
 //! commands, `BPF_OBJ_GET_INFO_BY_FD`, the map IDs (`BPF_MAP_GET_NEXT_ID`,
 //! `BPF_MAP_GET_FD_BY_ID`) and the descriptor's fdinfo, with the checks
 //! every command makes first (`bpf_check_uarg_tail_zero`, `CHECK_ATTR`)
-//! and `kernel.unprivileged_bpf_disabled` at Linux's default 2.
+//! and the machine's `kernel.unprivileged_bpf_disabled`, which starts at
+//! Linux's default 2 and root may write ([`crate::sysctl::Machine`]).
 //!
 //! The memory a map takes (fdinfo's `memlock`, and the `ENOMEM` of one
 //! larger than the machine's memory) is counted as Linux 7.0, the kernel

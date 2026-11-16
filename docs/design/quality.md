@@ -237,6 +237,15 @@ skipped because the quick stage failed cannot make it pass;
 Dependency Review runs only on pull requests that change a Cargo or npm
 manifest or lockfile, a workflow or a local action.
 
+GitHub cancels a job that no hosted runner acquires, as macOS arm64 runners
+run short of capacity, with an annotation ("not acquired by Runner") and no
+step run. `ci-ok` fails then, as those tests did not run. When such jobs
+are a CI run's only failures but for `ci-ok`, `rerun-unacquired.yml`
+reruns the failed jobs with `gh run rerun --failed`, at most twice per run,
+and not when a later run of the branch replaced it. A job that ran a step
+and failed is never rerun, and then nothing is. Its log says why each run
+was or was not rerun; `scripts/ci-rerun.py --self-test` checks the decision.
+
 Before a guest program is built, its dependencies must pass `cargo deny`
 under the root policy. Only aube has exceptions: the licenses of two crates
 and, for now, three RustSec advisories against `zstd` 0.13.3 and `zstd-safe`

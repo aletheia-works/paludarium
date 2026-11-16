@@ -760,7 +760,10 @@ verified.
   the newest first, where Linux gives them in the order of its hash
   table, which a random key sets. Proxy entries of one hash bucket come
   the newest first, as `pneigh_create` puts each at its head, but one
-  x86-64 runner's Linux gave two of them the other way. A neighbour's
+  x86-64 runner's Linux gave two of them the other way. One without a
+  device goes with its namespace, where Linux 7.0, whose proxy table is
+  every namespace's, keeps it, for a namespace made later where that one
+  was to see (Linux's master gives each namespace its own). A neighbour's
   timer never runs: one
   reachable never goes stale, one delaying or probing never probes nor
   becomes reachable or failed, and one `NTF_USE` or `NTF_MANAGED` makes

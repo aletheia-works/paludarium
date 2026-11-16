@@ -17075,6 +17075,14 @@ int main(int argc, char **argv) {
             monitor_wait(mon, port, "down", 0);
             NEIGH_DUMP(0, 0, "dump after down");
             NEIGH_DUMP(0, 8, "dump proxies after down");
+            /* Those of no device go too: Linux 7.0's proxy table is every
+               namespace's, and keeps them past the namespace, for a later
+               one that the kernel puts where it was to see. */
+            NEIGH_BODY(AF_INET, 0, 0, 8), NEIGH4("10.0.0.2");
+            NEIGH_SEND(29, 0, "delete proxy 10.0.0.2");
+            NEIGH_BODY(AF_INET, 0, 0, 8), NEIGH4("10.0.0.5");
+            NEIGH_SEND(29, 0, "delete proxy 10.0.0.5");
+            NEIGH_DUMP(0, 8, "dump proxies at the end");
 #undef NEIGH_BODY
 #undef NEIGH_SEND
 #undef NEIGH4

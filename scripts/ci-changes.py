@@ -33,9 +33,9 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
 FUZZ_WORKFLOW = ROOT / ".github/workflows/fuzz-pr.yml"
 FUZZ_TARGETS = ROOT / "fuzz/fuzz_targets"
-# The jobs that start only after the quick stage passed.
 # The jobs the quick stage waits for.
 QUICK = frozenset({"changes", "polyglot-lint", "test-linux", "lint", "stable-clippy"})
+# The jobs that start only after the quick stage passed.
 EXPENSIVE = frozenset(
     {
         "wasm-programs",

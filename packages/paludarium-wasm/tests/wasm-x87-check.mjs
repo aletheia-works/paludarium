@@ -68,6 +68,7 @@ try {
     report.rows = result.rows ?? report.rows;
   } finally { await new Promise(done => server.close(done)); }
 }
-report.complete = Object.keys(report.rows).join() === cases.join() && Object.values(report.rows).every(row => row.pass);
+// Safari's WebDriver returns the report without its key order.
+report.complete = [...Object.keys(report.rows)].sort().join() === [...cases].sort().join() && Object.values(report.rows).every(row => row.pass);
 await persist();
 if (!report.complete) throw new Error("x87 cases differ from x86-64 Linux");

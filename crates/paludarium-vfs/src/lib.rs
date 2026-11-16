@@ -39,12 +39,14 @@ fn validate(path: &[u8]) -> Result<(), Errno> {
     if path.len() >= PATH_MAX {
         return Err(Errno::ENAMETOOLONG);
     }
-    if path.contains(&0) {
-        return Err(Errno::EINVAL);
-    }
     for p in path.split(|b| *b == b'/') {
         if p.len() > NAME_MAX {
             return Err(Errno::ENAMETOOLONG);
+        }
+        // A 0 starts only the name of a detached mount tree, which no path
+        // a program gives can hold ([`NamespacedFs::clone_tree`]).
+        if p.iter().skip(1).any(|&b| b == 0) {
+            return Err(Errno::EINVAL);
         }
     }
     Ok(())

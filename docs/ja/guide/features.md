@@ -65,7 +65,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`open_tree`、`move_mount`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
@@ -1435,6 +1435,27 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ルートに移り（`chroot_fs_refs`）、ほかのプロセスのものはそのマウントとともに動きます。
   `pivot_root(".", ".")` は古いルートを新しいルートの上に重ね、それを
   `umount2(".", MNT_DETACH)` で外せます。
+- `open_tree`（Linux master の `vfs_open_tree`）は、まずフラグを確かめ（知らない
+  もの、写しなしの `AT_RECURSIVE`、再帰的な写しなしの `OPEN_TREE_DROP_MNTNS_MOUNTS`
+  は `EINVAL`）、`OPEN_TREE_CLONE` にはマウント名前空間に対する `CAP_SYS_ADMIN` を
+  求め（`EPERM`）、そのあとパスを探します。最後のリンクは `AT_SYMLINK_NOFOLLOW`
+  がなければたどり、`AT_EMPTY_PATH` があれば空のパスは `dfd` 自身です。ファイルの
+  `O_PATH` のディスクリプタを返し、`OPEN_TREE_CLONE` ではそのマウントの写し
+  （`AT_RECURSIVE` があれば、バインドマウントと同じく下のマウントも）を、自分だけの
+  木として返します。この木にはどのパスからも mountinfo からも届かず、`move_mount`
+  でつながなければディスクリプタを最後に閉じたときになくなります。ディスクリプタからの
+  パスは写しの中に入り、`..` はその根にとどまります。
+- `move_mount`（Linux master のもの）は、マウント名前空間に対する
+  `CAP_SYS_ADMIN`（`EPERM`）と、知っているフラグ（`EINVAL`。`MOVE_MOUNT_BENEATH` と
+  `MOVE_MOUNT_SET_GROUP` の両方も）を求め、ターゲット、ソースの順に探します。それぞれ
+  `MOVE_MOUNT_*_SYMLINKS` があるときだけ最後のリンクをたどり、`MOVE_MOUNT_*_EMPTY_PATH`
+  があれば空のパスはディスクリプタ自身です。Landlock のドメインでは `EPERM` です。
+  マウントを `MS_MOVE` と同じく動かすか、`open_tree` の木をつなぎます。つなげるのは
+  その根だけで（`EINVAL`）、自分の木の上にはつなげず（`EINVAL`）、名前空間のマウントは
+  切り離された木の上には行きません（`EINVAL`）。`MOVE_MOUNT_SET_GROUP` は、ターゲットを
+  ソースのピアグループに入れます（`do_set_group`）。どちらもマウントのルートで、同じ
+  スーパーブロックのもの、ターゲットのルートはソースのルートかその下、ターゲットは
+  プライベート、ソースは共有かスレーブであることが要ります（`EINVAL`）。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどり、パスの始まりの上のマウントにも入ります
   （`LOOKUP_MOUNTPOINT`）。そのあと Linux の `can_umount` と `do_umount`

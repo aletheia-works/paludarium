@@ -725,6 +725,7 @@ mod linux {
         processes_binds => ("binds","process"),
         processes_remounts => ("remounts","process"),
         processes_moves => ("moves","process"),
+        processes_trees => ("trees","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_proc_other_maps => ("proc-other-maps","process"),
         processes_proc_other_fds => ("proc-other-fds","process"),

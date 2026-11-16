@@ -1051,8 +1051,14 @@ impl FileHandle for CoherentFile {
     fn stdio_channel(&self) -> Option<u32> {
         self.inner.stdio_channel()
     }
+    /// Where the file is now, as its [`Place`] keeps it: the path it was
+    /// opened at, moved by each rename since. Not the handle's own path in
+    /// its file system, which is another place on a mount.
     fn guest_path_hint(&self) -> Option<Vec<u8>> {
-        self.inner.guest_path_hint()
+        match &self.device {
+            Device::Mount(_, _, place, _) => Some(Place::at(place).0),
+            Device::Fixed(_) => self.inner.guest_path_hint(),
+        }
     }
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         self.write_back();

@@ -338,6 +338,7 @@
     {"name":"binds","binary":"process"},
     {"name":"remounts","binary":"process"},
     {"name":"moves","binary":"process"},
+    {"name":"trees","binary":"process"},
     {"name":"proc-other-mounts","binary":"process"},
     {"name":"proc-other-maps","binary":"process"},
     {"name":"proc-other-fds","binary":"process"},

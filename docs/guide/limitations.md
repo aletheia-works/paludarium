@@ -518,9 +518,15 @@ verified.
   checks before them pass, `MS_NOSYMFOLLOW` on a tmpfs or set by a
   remount, and a mount on, a bind mount of or a move of the generated
   `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a program
-  learns they are not supported; `fsopen`, `fsconfig`, `fsmount`,
-  `fspick`, `move_mount`, `open_tree`, `mount_setattr`, `statmount` and
-  `listmount` are not there (`ENOSYS`). Propagation types are kept and shown, but nothing
+  learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
+  (new in Linux master) and `move_mount`'s `MOVE_MOUNT_BENEATH`; `fsopen`,
+  `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `statmount` and
+  `listmount` are not there (`ENOSYS`). A detached tree from `open_tree`
+  belongs to the table of the mount namespace it was made in, where Linux
+  gives it an anonymous namespace of its own: after an
+  `unshare(CLONE_NEWNS)` its descriptor no longer reaches it, and only a
+  tree from the caller's namespace attaches. It goes at the next change of
+  the mounts after its descriptor's last close, not at the close. Propagation types are kept and shown, but nothing
   propagates: a mount or an unmount under a shared mount does not reach
   its peers and slaves, as Linux's `propagate_mnt` and `propagate_umount`
   make it, so a peer of it shows no copy. The mounts from start-up are

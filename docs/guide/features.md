@@ -75,7 +75,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `pivot_root`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | Security modules | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` |
 | Probes | `uprobe`, `uretprobe` |
@@ -1630,6 +1630,30 @@ kernel.
   old root is then on the new one (`chroot_fs_refs`), and the others' stay
   with their mounts. `pivot_root(".", ".")` stacks the old root on the new
   one, which `umount2(".", MNT_DETACH)` then takes off.
+- `open_tree` (Linux master's `vfs_open_tree`) checks its flags first
+  (`EINVAL` for an unknown one, `AT_RECURSIVE` without a copy, and
+  `OPEN_TREE_DROP_MNTNS_MOUNTS` without a recursive one), then
+  `CAP_SYS_ADMIN` over the mount namespace for `OPEN_TREE_CLONE` (`EPERM`),
+  then looks the path up, its last link followed unless
+  `AT_SYMLINK_NOFOLLOW`, an empty one naming `dfd` with `AT_EMPTY_PATH`.
+  It gives an `O_PATH` descriptor of the file, or with `OPEN_TREE_CLONE` of
+  a copy of its mount (with `AT_RECURSIVE` the mounts below it too, as a
+  bind mount copies them) in a tree of its own, which no path and no
+  mountinfo reaches, and which goes with the descriptor's last close
+  unless `move_mount` attached it. A path from the descriptor goes into
+  the copy, and `..` stays at its root.
+- `move_mount` (Linux master's) needs `CAP_SYS_ADMIN` over the mount
+  namespace (`EPERM`) and known flags (`EINVAL`, also for
+  `MOVE_MOUNT_BENEATH` with `MOVE_MOUNT_SET_GROUP`); it looks up the target
+  and then the source, each following its last link only with its
+  `MOVE_MOUNT_*_SYMLINKS` and naming its descriptor when empty with its
+  `MOVE_MOUNT_*_EMPTY_PATH`, and a Landlock domain is `EPERM`. It moves a
+  mount as `MS_MOVE` does, or attaches a tree from `open_tree`: only its
+  root (`EINVAL`), not onto its own tree (`EINVAL`); a mount of the
+  namespace goes onto no detached tree (`EINVAL`). `MOVE_MOUNT_SET_GROUP`
+  puts the target in the source's peer group (`do_set_group`): both mounts'
+  roots, of one superblock, the target's root at or below the source's,
+  the target private and the source shared or a slave (`EINVAL`).
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`, stepping into a mount on
   where the path starts too (`LOOKUP_MOUNTPOINT`); then, as Linux's

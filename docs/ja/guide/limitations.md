@@ -443,9 +443,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   それがないカーネルと同じく `ENODEV` です。それより前の Linux の確認を通ったあと、
   tmpfs の `MS_NOSYMFOLLOW` とマウントし直しで付ける `MS_NOSYMFOLLOW`、生成される
   `/proc` や `/dev`（とその中のファイル）へのマウント、そのバインドマウントや移動は
-  `EOPNOTSUPP` で、プログラムはできないことを知れます。`fsopen`、`fsconfig`、
-  `fsmount`、`fspick`、`move_mount`、`open_tree`、`mount_setattr`、`statmount`、
-  `listmount` はありません（`ENOSYS`）。伝播の種類は持って表示しますが、
+  `EOPNOTSUPP` で、プログラムはできないことを知れます。`open_tree` の
+  `OPEN_TREE_NAMESPACE`（Linux master で新しいもの）と `move_mount` の
+  `MOVE_MOUNT_BENEATH` も同じです。`fsopen`、`fsconfig`、`fsmount`、`fspick`、
+  `mount_setattr`、`statmount`、`listmount` はありません（`ENOSYS`）。
+  `open_tree` の切り離された木は、それを作ったマウント名前空間の表に属します。Linux は
+  それに自分だけの匿名の名前空間を与えます。そのため `unshare(CLONE_NEWNS)` のあとは
+  そのディスクリプタから届かず、つなげるのは呼び出し元の名前空間の木だけです。
+  ディスクリプタを最後に閉じたとき、ではなく、そのあと次にマウントが変わるときに
+  なくなります。伝播の種類は持って表示しますが、
   何も伝播しません。共有マウントの下でのマウントやその解除は、Linux の `propagate_mnt` と
   `propagate_umount` のようにはピアやスレーブに届かないので、ピアには写しが見えません。
   起動したときからあるマウントはプライベートです。Linux のルートは共有（`shared:1`。

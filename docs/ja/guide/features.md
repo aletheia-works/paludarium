@@ -70,7 +70,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`open_tree`、`move_mount`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`open_tree`、`move_mount`、`fsopen`、`fsconfig`、`fsmount`、`fspick`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
@@ -1461,6 +1461,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ソースのピアグループに入れます（`do_set_group`）。どちらもマウントのルートで、同じ
   スーパーブロックのもの、ターゲットのルートはソースのルートかその下、ターゲットは
   プライベート、ソースは共有かスレーブであることが要ります（`EINVAL`）。
+- `fsopen`、`fsconfig`、`fsmount`、`fspick`（Linux master の `fs/fsopen.c`）は、
+  ファイルシステムのコンテキストを通して tmpfs を作ります。コンテキストは
+  ディスクリプタ（`anon_inode:[fscontext]`）で、`fsconfig` が中身を入れて操作します。
+  `fsopen` はマウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）と知っているフラグ
+  （`EINVAL`）を求め、tmpfs 以外の型は `ENODEV` です。`fsconfig` はコマンドごとの
+  引数（`EINVAL`。知らないコマンドは `EOPNOTSUPP`）、次にディスクリプタ（`EBADF`。
+  ほかのファイルなら `EINVAL`）を確かめます。`mount` が受け取るパラメーターを 1 つずつ
+  同じ確認で受け取り、断ったものごとに Linux が記録するメッセージを、ディスクリプタの
+  `read` が古い順に返し（`e tmpfs: Bad value for 'size'`、`e tmpfs: Unknown parameter
+  'x'` など）、なくなると `ENODATA` です。`FSCONFIG_CMD_CREATE` はスーパーブロックを
+  作り（ユーザー名前空間に対する `CAP_SYS_ADMIN`、`EPERM`）、そのあとコンテキストは
+  パラメーターを受け取りません（`EBUSY`）。`fsmount` はフラグとマウントの属性を確かめ
+  （`EINVAL`）、`open_tree` と同じ切り離された木にそれをマウントします（スーパー
+  ブロックを作る前は `EINVAL`、マウントしたあとは `EBUSY`）。`move_mount` でそれを
+  つなげ、コンテキストはそのあとそれをマウントし直すものになります。`fspick` は
+  マウントのスーパーブロックのコンテキストを返し（マウントのルートでなければ
+  `EINVAL`）、その `FSCONFIG_CMD_RECONFIGURE` は、名前を挙げたフラグと tmpfs の
+  オプションを `MS_REMOUNT` と同じく変えます（スーパーブロックのユーザー名前空間に
+  対する `CAP_SYS_ADMIN` がなければ `EPERM` で、コンテキストは失敗した状態になり、
+  それからは `EBUSY` です）。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどり、パスの始まりの上のマウントにも入ります
   （`LOOKUP_MOUNTPOINT`）。そのあと Linux の `can_umount` と `do_umount`

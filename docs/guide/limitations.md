@@ -531,9 +531,15 @@ verified.
   remount, and a mount on, a bind mount of or a move of the generated
   `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a program
   learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
-  (new in Linux master) and `move_mount`'s `MOVE_MOUNT_BENEATH`; `fsopen`,
-  `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `statmount` and
-  `listmount` are not there (`ENOSYS`). A detached tree from `open_tree`
+  (new in Linux master), `move_mount`'s `MOVE_MOUNT_BENEATH`, `fsmount`'s
+  `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
+  a tmpfs, and `fspick` of `/proc` or `/dev`; `mount_setattr`, `statmount`
+  and `listmount` are not there (`ENOSYS`). A file system context makes
+  only a tmpfs, as `mount` does, and logs no message but those of its
+  parameters and of a reconfiguration; one of a superblock from start-up
+  takes only the common flags (`ro`, `sync`, ...). A context keeps its
+  superblock by its mount, so once that mount is gone its
+  reconfiguration is `EINVAL`, where Linux's keeps the superblock. A detached tree from `open_tree`
   belongs to the table of the mount namespace it was made in, where Linux
   gives it an anonymous namespace of its own: after an
   `unshare(CLONE_NEWNS)` its descriptor no longer reaches it, and only a

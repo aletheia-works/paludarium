@@ -8628,6 +8628,102 @@ fn a_path_from_a_directory_descriptor_on_a_mount() {
     assert!((f.ret(257, &[fd, rel, 0o200000, 0]) as i64) >= 0);
 }
 
+/// `fsopen`, `fsconfig` and `fsmount` make and mount a tmpfs, logging why a
+/// parameter is refused; `fspick` reconfigures a mounted one.
+#[test]
+fn a_file_system_context_makes_and_reconfigures_a_tmpfs() {
+    let mut f = fixture();
+    let message = |f: &mut Fixture, fd: u64| -> Result<String, u64> {
+        let n = f.ret(0, &[fd, DATA + 0x1000, 256]);
+        if (n as i64) < 0 {
+            return Err(n);
+        }
+        let mut out = vec![0; n as usize];
+        f.mem.read(GuestAddr(DATA + 0x1000), &mut out).unwrap();
+        Ok(String::from_utf8(out).unwrap())
+    };
+    let (tmpfs, nope) = (put(&mut f, 0x10, b"tmpfs"), put(&mut f, 0x20, b"nope"));
+    assert_eq!(f.ret(430, &[tmpfs, 2]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(430, &[nope, 0]), errno(Errno(19)));
+    let fd = f.ret(430, &[tmpfs, 0]);
+    assert!((fd as i64) >= 0);
+    let (size, two_m, bogus, inode32, x, source) = (
+        put(&mut f, 0x40, b"size"),
+        put(&mut f, 0x50, b"1m"),
+        put(&mut f, 0x60, b"bogus"),
+        put(&mut f, 0x70, b"inode32"),
+        put(&mut f, 0x80, b"x"),
+        put(&mut f, 0x90, b"source"),
+    );
+    // The arguments first, then the descriptor.
+    assert_eq!(f.ret(431, &[u64::MAX, 0, size, 0, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(431, &[fd, 99, 0, 0, 0]), errno(Errno::EOPNOTSUPP));
+    assert_eq!(f.ret(431, &[fd, 0, size, two_m, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(431, &[99, 0, size, 0, 0]), errno(Errno::EBADF));
+    assert_eq!(f.ret(431, &[0, 0, size, 0, 0]), errno(Errno::EINVAL));
+    // Each refused parameter logs a message.
+    assert_eq!(f.ret(431, &[fd, 0, size, 0, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(431, &[fd, 1, inode32, x, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(431, &[fd, 0, bogus, 0, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(431, &[fd, 0, source, 0, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(431, &[fd, 1, source, x, 0]), 0);
+    assert_eq!(f.ret(431, &[fd, 1, source, x, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(431, &[fd, 1, size, two_m, 0]), 0);
+    assert_eq!(
+        message(&mut f, fd).unwrap(),
+        "e tmpfs: Bad value for 'size'\n"
+    );
+    assert_eq!(
+        message(&mut f, fd).unwrap(),
+        "e tmpfs: Unexpected value for 'inode32'\n"
+    );
+    assert_eq!(
+        message(&mut f, fd).unwrap(),
+        "e tmpfs: Unknown parameter 'bogus'\n"
+    );
+    assert_eq!(message(&mut f, fd).unwrap(), "e Non-string source\n");
+    assert_eq!(message(&mut f, fd).unwrap(), "e Multiple sources\n");
+    assert_eq!(message(&mut f, fd), Err(errno(Errno(61))));
+    // Nothing to mount before the superblock is made, nor twice.
+    assert_eq!(f.ret(432, &[fd, 0, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(431, &[fd, 7, 0, 0, 0]), errno(Errno(16)));
+    assert_eq!(f.ret(431, &[fd, 6, 0, 0, 0]), 0);
+    assert_eq!(f.ret(431, &[fd, 6, 0, 0, 0]), errno(Errno(16)));
+    assert_eq!(f.ret(431, &[fd, 1, size, two_m, 0]), errno(Errno(16)));
+    assert_eq!(f.ret(432, &[fd, 4, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(432, &[fd, 0, 0x40]), errno(Errno::EINVAL));
+    let mounted = f.ret(432, &[fd, 0, 0x10]);
+    assert!((mounted as i64) >= 0);
+    assert_eq!(f.ret(432, &[fd, 0, 0]), errno(Errno(16)));
+    let (m, nothing) = (put(&mut f, 0xa0, b"/tmp/m"), put(&mut f, 0xb0, b""));
+    assert_eq!(f.ret(83, &[m, 0o755]), 0);
+    let fdcwd = (-100i64) as u64;
+    assert_eq!(f.ret(429, &[mounted, nothing, fdcwd, m, 4]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" / /tmp/m rw,noatime - tmpfs x rw,size=1024k"),
+        "{info}"
+    );
+    // The context now reconfigures the mounted one.
+    let four_m = put(&mut f, 0xc0, b"4m");
+    assert_eq!(f.ret(431, &[fd, 1, size, four_m, 0]), 0);
+    assert_eq!(f.ret(431, &[fd, 7, 0, 0, 0]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(info.contains(" - tmpfs x rw,size=4096k"), "{info}");
+    // fspick of a mount's root.
+    let tmp = put(&mut f, 0xd0, b"/tmp");
+    assert_eq!(f.ret(433, &[fdcwd, tmp, 16]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(433, &[fdcwd, tmp, 0]), errno(Errno::EINVAL));
+    let picked = f.ret(433, &[fdcwd, m, 0]);
+    assert!((picked as i64) >= 0);
+    let ro = put(&mut f, 0xe0, b"ro");
+    assert_eq!(f.ret(431, &[picked, 0, ro, 0, 0]), 0);
+    assert_eq!(f.ret(431, &[picked, 6, 0, 0, 0]), errno(Errno(16)));
+    assert_eq!(f.ret(431, &[picked, 7, 0, 0, 0]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(info.contains(" - tmpfs x ro,size=4096k"), "{info}");
+}
+
 /// `open_tree` gives a descriptor of a file or of a detached copy of its
 /// mount, which `move_mount` attaches; a copy no one attached goes with
 /// its descriptor.

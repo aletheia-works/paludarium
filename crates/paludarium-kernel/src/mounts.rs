@@ -31,6 +31,9 @@ use paludarium_vfs::{MemFs, NewTmpfs, Propagation, Settings, Target, mount_flags
 use crate::namespaces::Namespace;
 use crate::syscalls::{Context, Outcome};
 
+mod context;
+pub(crate) use context::{FsContext, sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick};
+
 const CAP_SYS_ADMIN: u64 = 1 << 21;
 const EBUSY: Errno = Errno(16);
 const ENODEV: Errno = Errno(19);
@@ -251,11 +254,17 @@ fn move_mount_call(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// `strndup_user(s, PATH_MAX)` takes it: `EFAULT` where it cannot be read,
 /// `EINVAL` when no 0 ends it within `PATH_MAX` bytes.
 fn mount_string(c: &Context<'_>, addr: u64) -> Result<Option<Vec<u8>>, Errno> {
+    user_string(c, addr, PATH_MAX)
+}
+/// `strndup_user(s, limit)`: none for a null pointer, else the string,
+/// `EFAULT` where it cannot be read, `EINVAL` when no 0 ends it within
+/// `limit` bytes.
+fn user_string(c: &Context<'_>, addr: u64, limit: u64) -> Result<Option<Vec<u8>>, Errno> {
     if addr == 0 {
         return Ok(None);
     }
     let mut out = Vec::new();
-    for i in 0..PATH_MAX {
+    for i in 0..limit {
         let mut byte = [0];
         c.mem
             .read(
@@ -603,7 +612,7 @@ fn remount(
             continue;
         };
         if found.kind == "tmpfs" {
-            asked.parse(c, key, value)?;
+            asked.parse(c, key, Value::of(value))?;
         } else if !asked.parse_common(key) {
             return Err(Errno::EINVAL);
         }
@@ -619,20 +628,49 @@ fn remount(
         return Err(Errno::EOPNOTSUPP);
     }
     let requested = (sb_flags | asked.sb_set) & !asked.sb_clear;
+    reconfigure_superblock(
+        c,
+        found,
+        &asked,
+        requested & MS_RDONLY != 0,
+        mask,
+        requested,
+        flags,
+    )?;
+    Ok(0)
+}
+
+/// `reconfigure_super` of `found`'s superblock as `asked` asks, with the
+/// flags in `mask` taken from `requested` and read-only with `read_only`
+/// (`EBUSY` with a file open for writing on it), then tmpfs's own
+/// (`shmem_reconfigure`); the mount then takes `flags`.
+fn reconfigure_superblock(
+    c: &Context<'_>,
+    found: &Target,
+    asked: &Tmpfs,
+    read_only: bool,
+    mask: u64,
+    requested: u64,
+    flags: u32,
+) -> Result<(), Refused> {
+    let mut message = String::new();
     c.files
         .namespaced()
-        .reconfigure(found.id, requested & MS_RDONLY != 0, flags, &mut |old| {
+        .reconfigure(found.id, read_only, flags, &mut |old| {
             let Some((settings, used, files)) = old else {
                 return Ok(None);
             };
             let Some(old) = settings.parsed.downcast_ref::<Tmpfs>() else {
                 return Ok(None);
             };
-            let mut new = old.reconfigured(&asked, used, files)?;
+            let mut new = old.reconfigured(asked, used, files).map_err(|refused| {
+                message = refused.message;
+                refused.errno
+            })?;
             new.sb_flags = old.sb_flags & !mask | requested & mask;
             Ok(Some(new.settings()))
-        })?;
-    Ok(0)
+        })
+        .map_err(|errno| Refused { errno, message })
 }
 
 /// Whether the caller has CAP_SYS_ADMIN over the user namespace that owns
@@ -659,6 +697,57 @@ fn option_pair(option: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
         Some(0) => None,
         Some(at) => Some((&option[..at], Some(&option[at + 1..]))),
         None => Some((option, None)),
+    }
+}
+
+/// A parameter's value, as `fsconfig` gives it (`fs_value_is_*`): none
+/// (`FSCONFIG_SET_FLAG`, an option without `=`), a string, or another kind
+/// (a blob, a path or a descriptor), which no tmpfs parameter takes.
+#[derive(Clone, Copy)]
+enum Value<'a> {
+    Flag,
+    String(&'a [u8]),
+    Other,
+}
+impl<'a> Value<'a> {
+    /// The value of an option of `mount`'s data.
+    fn of(value: Option<&'a [u8]>) -> Self {
+        value.map_or(Value::Flag, Value::String)
+    }
+}
+/// A parameter or a change refused: its errno, and the message Linux logs
+/// in the file system context, which `fsconfig`'s descriptor reads back
+/// (`invalf`, or `invalfc` with the type's name before it), without the
+/// level and the newline; empty for none.
+#[derive(Debug)]
+struct Refused {
+    errno: Errno,
+    message: String,
+}
+impl From<Errno> for Refused {
+    fn from(errno: Errno) -> Self {
+        Self {
+            errno,
+            message: String::new(),
+        }
+    }
+}
+impl From<Refused> for Errno {
+    fn from(refused: Refused) -> Self {
+        refused.errno
+    }
+}
+impl Refused {
+    /// `invalfc` of tmpfs: `EINVAL`, the message after `tmpfs: `.
+    fn tmpfs(message: String) -> Self {
+        Self::plain(format!("tmpfs: {message}"))
+    }
+    /// `invalf`: `EINVAL`, the message as it is.
+    fn plain(message: String) -> Self {
+        Self {
+            errno: Errno::EINVAL,
+            message,
+        }
     }
 }
 
@@ -849,56 +938,59 @@ impl Tmpfs {
         self.sb_clear = (self.sb_clear | off) & !on;
         true
     }
-    /// One `key[=value]` of the options (`vfs_parse_fs_param`): a common
-    /// superblock flag, then tmpfs's own (`shmem_fs_parameters`), then the
-    /// source; anything else, or a value of the wrong kind, is `EINVAL`.
-    fn parse(&mut self, c: &Context<'_>, key: &[u8], value: Option<&[u8]>) -> Result<(), Errno> {
+    /// One parameter (`vfs_parse_fs_param`): a common superblock flag, of
+    /// any value, then tmpfs's own (`shmem_fs_parameters`, `shmem_parse_one`),
+    /// then the source; anything else, or a value of the wrong kind, is
+    /// refused with the message Linux logs for it.
+    fn parse(&mut self, c: &Context<'_>, key: &[u8], value: Value<'_>) -> Result<(), Refused> {
         if self.parse_common(key) {
             return Ok(());
         }
         let creds = &c.process.credentials;
         let first = creds.user.is_first_user();
-        let bad = Err(Errno::EINVAL);
-        // A string parameter given no value, and a flag given one, are bad.
-        let string = |value: Option<&[u8]>| match value {
-            Some(v) if !v.is_empty() => Ok(v.to_vec()),
-            _ => Err(Errno::EINVAL),
+        let name = String::from_utf8_lossy(key).into_owned();
+        let bad = || Refused::tmpfs(format!("Bad value for '{name}'"));
+        // `fs_param_is_string` and the like: a string, not empty.
+        let string = || match value {
+            Value::String(v) if !v.is_empty() => Ok(v.to_vec()),
+            _ => Err(bad()),
         };
-        let flag = |value: Option<&[u8]>| match value {
-            None => Ok(()),
-            Some(_) => Err(Errno::EINVAL),
+        // A flag parameter given a value (`__fs_parse`).
+        let flag = || match value {
+            Value::Flag => Ok(()),
+            _ => Err(Refused::tmpfs(format!("Unexpected value for '{name}'"))),
         };
         match key {
             b"size" => {
-                let v = string(value)?;
+                let v = string()?;
                 let (mut size, mut rest) = memparse(&v);
                 if rest.first() == Some(&b'%') {
                     size = (size << 12).wrapping_mul(RAM_PAGES) / 100;
                     rest = &rest[1..];
                 }
                 if !rest.is_empty() {
-                    return bad;
+                    return Err(bad());
                 }
                 self.blocks = Some(size.div_ceil(PAGE));
             }
             b"nr_blocks" => {
-                let v = string(value)?;
+                let v = string()?;
                 let (blocks, rest) = memparse(&v);
                 if !rest.is_empty() || blocks > i64::MAX as u64 {
-                    return bad;
+                    return Err(bad());
                 }
                 self.blocks = Some(blocks);
             }
             b"nr_inodes" => {
-                let v = string(value)?;
+                let v = string()?;
                 let (inodes, rest) = memparse(&v);
                 if !rest.is_empty() || inodes > u64::MAX / BOGO_INODE_SIZE {
-                    return bad;
+                    return Err(bad());
                 }
                 self.inodes = Some(inodes);
             }
             b"mode" => {
-                let mode = kstrtouint(&string(value)?, 8).ok_or(Errno::EINVAL)?;
+                let mode = kstrtouint(&string()?, 8).ok_or_else(bad)?;
                 self.mode = mode & 0o7777;
             }
             b"uid" | b"gid" => {
@@ -907,9 +999,16 @@ impl Tmpfs {
                 } else {
                     crate::users::Ids::Group
                 };
-                let id = kstrtouint(&string(value)?, 0).ok_or(Errno::EINVAL)?;
-                // make_kuid, then kuid_has_mapping in the same namespace.
-                let kernel = creds.user.kernel_of(ids, id).ok_or(Errno::EINVAL)?;
+                let text = string()?;
+                let id = kstrtouint(&text, 0).ok_or_else(bad)?;
+                // `fs_param_is_uid`'s make_kuid in the caller's namespace,
+                // whose mapping `shmem_parse_one` then needs.
+                let kernel = creds.user.kernel_of(ids, id).ok_or_else(|| {
+                    Refused::tmpfs(format!(
+                        "Invalid {name} '{}'",
+                        String::from_utf8_lossy(&text)
+                    ))
+                })?;
                 if key == b"uid" {
                     self.uid = kernel;
                 } else {
@@ -917,37 +1016,41 @@ impl Tmpfs {
                 }
             }
             b"huge" => {
-                self.huge = Some(match &string(value)?[..] {
+                self.huge = Some(match &string()?[..] {
                     b"never" => "never",
                     b"always" => "always",
                     b"within_size" => "within_size",
                     b"advise" => "advise",
-                    _ => return bad,
+                    _ => return Err(bad()),
                 });
             }
             b"mpol" => {
-                let v = string(value)?;
+                let v = string()?;
                 if !mpol_valid(&v) {
-                    return bad;
+                    return Err(bad());
                 }
                 self.mpol = Some(v);
             }
             b"inode32" | b"inode64" => {
-                flag(value)?;
+                flag()?;
                 self.inode32 = key == b"inode32";
                 self.inums_seen = true;
             }
             b"noswap" => {
-                flag(value)?;
+                flag()?;
                 if !first || !creds.capable(CAP_SYS_ADMIN) {
-                    return bad;
+                    return Err(Refused::tmpfs(
+                        "Turning off swap in unprivileged tmpfs mounts unsupported".into(),
+                    ));
                 }
                 self.noswap = true;
             }
             b"quota" | b"usrquota" | b"grpquota" => {
-                flag(value)?;
+                flag()?;
                 if !first {
-                    return bad;
+                    return Err(Refused::tmpfs(
+                        "Quotas in unprivileged tmpfs mounts are unsupported".into(),
+                    ));
                 }
                 self.quota.0 |= key != b"grpquota";
                 self.quota.1 |= key != b"usrquota";
@@ -956,33 +1059,46 @@ impl Tmpfs {
             | b"usrquota_inode_hardlimit"
             | b"grpquota_block_hardlimit"
             | b"grpquota_inode_hardlimit" => {
-                let v = string(value)?;
+                let v = string()?;
                 let (limit, rest) = memparse(&v);
-                if !rest.is_empty() || limit == 0 || limit > QUOTA_MAX {
-                    return bad;
+                if !rest.is_empty() || limit == 0 {
+                    return Err(bad());
                 }
-                let at = match key {
-                    b"usrquota_block_hardlimit" => 0,
-                    b"grpquota_block_hardlimit" => 1,
-                    b"usrquota_inode_hardlimit" => 2,
-                    _ => 3,
+                let (at, what) = match key {
+                    b"usrquota_block_hardlimit" => (0, "User quota block"),
+                    b"grpquota_block_hardlimit" => (1, "Group quota block"),
+                    b"usrquota_inode_hardlimit" => (2, "User quota inode"),
+                    _ => (3, "Group quota inode"),
                 };
+                if limit > QUOTA_MAX {
+                    return Err(Refused::tmpfs(format!("{what} hardlimit too large.")));
+                }
                 self.limits[at] = Some(limit);
             }
             // Case folding needs CONFIG_UNICODE, which this kernel is
-            // built without, as tmpfs then refuses it.
-            b"casefold" | b"strict_encoding" => return bad,
+            // built without, as tmpfs then refuses it (its message has its
+            // own prefix and newline).
+            b"casefold" | b"strict_encoding" => {
+                if key == b"strict_encoding" {
+                    flag()?;
+                } else if matches!(value, Value::Other) {
+                    return Err(bad());
+                }
+                return Err(Refused::tmpfs(
+                    "tmpfs: Kernel not built with CONFIG_UNICODE\n".into(),
+                ));
+            }
             // vfs_parse_fs_param_source.
             b"source" => {
-                let Some(value) = value else {
-                    return bad;
+                let Value::String(value) = value else {
+                    return Err(Refused::plain("Non-string source".into()));
                 };
                 if self.source.is_some() {
-                    return bad;
+                    return Err(Refused::plain("Multiple sources".into()));
                 }
                 self.source = Some(value.to_vec());
             }
-            _ => return bad,
+            _ => return Err(Refused::plain(format!("tmpfs: Unknown parameter '{name}'"))),
         }
         Ok(())
     }
@@ -992,31 +1108,37 @@ impl Tmpfs {
     /// is `EINVAL`, as are `noswap` on one that swaps, quotas on one
     /// without them and a changed quota limit. The size, inodes, `huge`,
     /// `inode32` and `mpol` given change; the mode and owner do not.
-    fn reconfigured(&self, asked: &Self, used: u64, files: u64) -> Result<Self, Errno> {
-        let bad = Err(Errno::EINVAL);
+    fn reconfigured(&self, asked: &Self, used: u64, files: u64) -> Result<Self, Refused> {
+        let refused = |message: &str| Err(Refused::tmpfs(message.into()));
         let blocks = self.blocks.unwrap_or(DEFAULT_BLOCKS);
         let inodes = self.inodes.unwrap_or(DEFAULT_INODES);
-        if let Some(new) = asked.blocks.filter(|&b| b != 0)
-            && (blocks == 0 || used > new)
-        {
-            return bad;
+        if let Some(new) = asked.blocks.filter(|&b| b != 0) {
+            if blocks == 0 {
+                return refused("Cannot retroactively limit size");
+            }
+            if used > new {
+                return refused("Too small a size for current use");
+            }
         }
-        if let Some(new) = asked.inodes.filter(|&i| i != 0)
-            && (inodes == 0 || new < files)
-        {
-            return bad;
+        if let Some(new) = asked.inodes.filter(|&i| i != 0) {
+            if inodes == 0 {
+                return refused("Cannot retroactively limit inodes");
+            }
+            if new < files {
+                return refused("Too few inodes for current use");
+            }
         }
         if asked.noswap && !self.noswap {
-            return bad;
+            return refused("Cannot disable swap on remount");
         }
         if (asked.quota.0 || asked.quota.1) && !(self.quota.0 || self.quota.1) {
-            return bad;
+            return refused("Cannot enable quota on remount");
         }
         for (new, old) in asked.limits.iter().zip(&self.limits) {
             if let Some(new) = new
                 && Some(*new) != *old
             {
-                return bad;
+                return refused("Cannot change global quota limit on remount");
             }
         }
         let mut out = Self {
@@ -1139,11 +1261,23 @@ fn new_tmpfs(
         let Some((key, value)) = option_pair(option) else {
             continue;
         };
-        options.parse(c, key, value)?;
+        options.parse(c, key, Value::of(value))?;
     }
     if !creds.administers_own() {
         return Err(Errno::EPERM);
     }
+    built_tmpfs(c, options, sb_flags, mount_flags)
+}
+/// The new tmpfs `shmem_fill_super` makes of `options`, with the
+/// superblock flags `sb_flags` and those they set, and the mount flags
+/// `mount_flags`.
+fn built_tmpfs(
+    c: &Context<'_>,
+    mut options: Tmpfs,
+    sb_flags: u64,
+    mount_flags: u32,
+) -> Result<NewTmpfs, Errno> {
+    let creds = &c.process.credentials;
     options.sb_flags = (sb_flags | options.sb_set) & !options.sb_clear;
     let host = Arc::clone(c.shared_host);
     let fs = MemFs::with_clock(Arc::new(move || host.clock(ClockId::Realtime)));

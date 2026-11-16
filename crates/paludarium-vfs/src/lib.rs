@@ -629,7 +629,7 @@ pub use mount::MountedFs;
 mod namespace;
 pub use namespace::{
     InUse, MountPin, MountTable, NamespacedFs, NewTmpfs, Propagation, Settings, Target,
-    keeping_expiry, mount_flags,
+    UnmountHook, keeping_expiry, mount_flags,
 };
 
 mod open_file;

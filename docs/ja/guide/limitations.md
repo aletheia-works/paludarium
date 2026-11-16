@@ -458,8 +458,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc` や `/dev`（とその中のファイル）へのマウント、そのバインドマウントや移動は
   `EOPNOTSUPP` で、プログラムはできないことを知れます。`open_tree` の
   `OPEN_TREE_NAMESPACE`（Linux master で新しいもの）と `move_mount` の
-  `MOVE_MOUNT_BENEATH` も同じです。`fsopen`、`fsconfig`、`fsmount`、`fspick`、
+  `MOVE_MOUNT_BENEATH`、`fsmount` の `FSMOUNT_NAMESPACE`（Linux master で新しいもの）と
+  tmpfs への `MOUNT_ATTR_NOSYMFOLLOW`、`/proc` や `/dev` の `fspick` も同じです。
   `mount_setattr`、`statmount`、`listmount` はありません（`ENOSYS`）。
+  ファイルシステムのコンテキストが作るのは、`mount` と同じく tmpfs だけで、記録する
+  メッセージはパラメーターとマウントし直しのものだけです。起動したときからある
+  スーパーブロックのコンテキストは、共通のフラグ（`ro`、`sync` など）しか受け取りません。
+  コンテキストはスーパーブロックをそのマウントで持つので、そのマウントがなくなると
+  マウントし直しは `EINVAL` です。Linux はスーパーブロックを持ち続けます。
   `open_tree` の切り離された木は、それを作ったマウント名前空間の表に属します。Linux は
   それに自分だけの匿名の名前空間を与えます。そのため `unshare(CLONE_NEWNS)` のあとは
   そのディスクリプタから届かず、つなげるのは呼び出し元の名前空間の木だけです。

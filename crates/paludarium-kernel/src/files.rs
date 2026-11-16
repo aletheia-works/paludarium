@@ -7344,6 +7344,9 @@ fn named_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     if any.is_some_and(|v| v.is::<crate::userfaultfd::UserfaultFile>()) {
         return Ok(b"anon_inode:[userfaultfd]".to_vec());
     }
+    if any.is_some_and(|v| v.is::<crate::mounts::FsContext>()) {
+        return Ok(b"anon_inode:[fscontext]".to_vec());
+    }
     // A BPF map's, `anon_inode_getfd("bpf-map", ...)`.
     if any.is_some_and(|v| v.is::<crate::bpf::MapFile>()) {
         return Ok(b"anon_inode:bpf-map".to_vec());

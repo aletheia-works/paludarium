@@ -9976,6 +9976,161 @@ static int trees_case(void) {
     return 0;
 }
 
+/* The contexts case: fsopen, fsconfig, fsmount and fspick (Linux master's
+   fs/fsopen.c) in a mount namespace of a user namespace of its own: a tmpfs
+   made, mounted and reconfigured through its context, the messages a
+   refused parameter logs, and a picked superblock. */
+static char fc_base[] = "/tmp/paludarium-contexts-XXXXXX";
+static long fc_open(const char *name, unsigned flags) { return syscall(430, name, flags); }
+static long fc_config(int fd, unsigned cmd, const char *key, const void *value, int aux) {
+    return syscall(431, fd, cmd, key, value, aux);
+}
+static long fc_mount(int fd, unsigned flags, unsigned attrs) { return syscall(432, fd, flags, attrs); }
+static long fc_pick(int dfd, const char *path, unsigned flags) { return syscall(433, dfd, path, flags); }
+/* The context's messages, each in quotes, then `end=` and the errno of
+   the read after the last. */
+static void fc_messages(int fd) {
+    char buf[300];
+    long n;
+    while ((n = read(fd, buf, sizeof buf - 1)) > 0) {
+        buf[n] = 0;
+        if (n && buf[n - 1] == '\n') buf[n - 1] = 0;
+        printf(" \"%s\"", buf);
+    }
+    printf(" end=%d\n", n < 0 ? errno : 0);
+}
+/* The fields of the mountinfo line at `point`: the mount's options, the
+   type, the source and the superblock's options up to `size=`. */
+static void fc_info(const char *label, const char *point) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    char line[4096], shown[1200] = "none";
+    while (f && fgets(line, sizeof line, f)) {
+        char at[1024], opts[256];
+        if (sscanf(line, "%*d %*d %*s %*s %1023s %255s", at, opts) != 2 || strcmp(at, point)) continue;
+        char *dash = strstr(line, " - ");
+        char kind[64] = "", source[256] = "", sb[512] = "";
+        if (dash) sscanf(dash, " - %63s %255s %511s", kind, source, sb);
+        char *cut = strstr(sb, ",nr_inodes");
+        if (cut) *cut = 0;
+        snprintf(shown, sizeof shown, "%s %s %s %s", opts, kind, source, sb);
+    }
+    if (f) fclose(f);
+    printf("%s %s\n", label, shown);
+}
+static int fc_inner(void) {
+    char m[256], path[512];
+    snprintf(m, sizeof m, "%s/m", fc_base);
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("fsopen");
+    RM("bad", fc_open("tmpfs", 2));
+    RM("nope", fc_open("nope", 0));
+    RM("null", fc_open(NULL, 0));
+    long fd = fc_open("tmpfs", 0);
+    snprintf(path, sizeof path, "/proc/self/fd/%ld", fd);
+    char link[64] = "";
+    readlink(path, link, sizeof link - 1);
+    printf(" link=%s\n", link);
+    printf("fsconfig");
+    RM("negative", fc_config(-1, 0, "size", NULL, 0));
+    RM("cmd", fc_config((int)fd, 99, NULL, NULL, 0));
+    RM("flag-value", fc_config((int)fd, 0, "size", "1m", 0));
+    RM("string-none", fc_config((int)fd, 1, "size", NULL, 0));
+    RM("create-key", fc_config((int)fd, 6, "size", NULL, 0));
+    RM("badf", fc_config(99, 0, "ro", NULL, 0));
+    RM("not-context", fc_config(1, 0, "ro", NULL, 0));
+    RM("size-flag", fc_config((int)fd, 0, "size", NULL, 0));
+    RM("size-bad", fc_config((int)fd, 1, "size", "1q", 0));
+    RM("inode32-value", fc_config((int)fd, 1, "inode32", "x", 0));
+    RM("bogus", fc_config((int)fd, 0, "bogus", NULL, 0));
+    RM("source-flag", fc_config((int)fd, 0, "source", NULL, 0));
+    RM("source", fc_config((int)fd, 1, "source", "src", 0));
+    RM("source-again", fc_config((int)fd, 1, "source", "src", 0));
+    RM("size", fc_config((int)fd, 1, "size", "1m", 0));
+    RM("mode", fc_config((int)fd, 1, "mode", "700", 0));
+    RM("ro", fc_config((int)fd, 0, "ro", NULL, 0));
+    RM("rw", fc_config((int)fd, 0, "rw", NULL, 0));
+    printf("\nmessages");
+    fc_messages((int)fd);
+    printf("fsmount");
+    RM("before", fc_mount((int)fd, 0, 0));
+    RM("reconfigure", fc_config((int)fd, 7, NULL, NULL, 0));
+    RM("create", fc_config((int)fd, 6, NULL, NULL, 0));
+    RM("again", fc_config((int)fd, 6, NULL, NULL, 0));
+    RM("param", fc_config((int)fd, 1, "size", "2m", 0));
+    RM("flags", fc_mount((int)fd, 4, 0));
+    RM("attrs", fc_mount((int)fd, 0, 0x40));
+    RM("badf", fc_mount(99, 0, 0));
+    long mfd = fc_mount((int)fd, 0, 0x10 | 0x02);
+    printf(" mounted=%d", mfd >= 0);
+    RM("twice", fc_mount((int)fd, 0, 0));
+    RM("move", syscall(429, (int)mfd, "", AT_FDCWD, m, 4));
+    close((int)mfd);
+    printf("\n");
+    fc_info("m", m);
+    struct statfs st;
+    statfs(m, &st);
+    snprintf(path, sizeof path, "%s/file", m);
+    struct stat root;
+    stat(m, &root);
+    printf("blocks=%ld mode=%o\n", (long)st.f_blocks, root.st_mode & 07777);
+    printf("reconfigure");
+    RM("size", fc_config((int)fd, 1, "size", "4m", 0));
+    RM("noswap", fc_config((int)fd, 0, "noswap", NULL, 0));
+    RM("apply", fc_config((int)fd, 7, NULL, NULL, 0));
+    statfs(m, &st);
+    printf(" blocks=%ld", (long)st.f_blocks);
+    printf("\nmessages");
+    fc_messages((int)fd);
+    close((int)fd);
+    printf("fspick");
+    RM("bad", fc_pick(AT_FDCWD, m, 16));
+    RM("not-root", fc_pick(AT_FDCWD, fc_base, 0));
+    snprintf(path, sizeof path, "%s/missing", fc_base);
+    RM("missing", fc_pick(AT_FDCWD, path, 0));
+    long picked = fc_pick(AT_FDCWD, m, 0);
+    RM("ro", fc_config((int)picked, 0, "ro", NULL, 0));
+    RM("create", fc_config((int)picked, 6, NULL, NULL, 0));
+    RM("apply", fc_config((int)picked, 7, NULL, NULL, 0));
+    close((int)picked);
+    long root_fd = fc_pick(AT_FDCWD, "/", 0);
+    printf(" root=%d", root_fd >= 0);
+    RM("root-apply", fc_config((int)root_fd, 7, NULL, NULL, 0));
+    RM("root-again", fc_config((int)root_fd, 7, NULL, NULL, 0));
+    close((int)root_fd);
+    printf("\n");
+    fc_info("m", m);
+    return 0;
+}
+static int contexts_case(void) {
+    if (!mkdtemp(fc_base)) return 93;
+    chmod(fc_base, 0755);
+    char path[256];
+    snprintf(path, sizeof path, "%s/m", fc_base);
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(fc_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(fc_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -27968,6 +28123,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "remounts")) return remounts_case();
     if (!strcmp(mode, "moves")) return moves_case();
     if (!strcmp(mode, "trees")) return trees_case();
+    if (!strcmp(mode, "contexts")) return contexts_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();

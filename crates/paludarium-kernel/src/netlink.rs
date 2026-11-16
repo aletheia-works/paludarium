@@ -1694,10 +1694,11 @@ fn with_attribute_at(message: Vec<u8>, at: usize, kind: u16, id: i32) -> Vec<u8>
     out
 }
 /// A link message with `IFLA_TARGET_NETNSID` (`IFLA_IF_NETNSID`) of `id`
-/// after its name, as `rtnl_fill_ifinfo` puts it.
+/// first, before its name, as Linux 7.0's `rtnl_fill_ifinfo` puts it
+/// (Linux master puts it after the name and the alternative names).
 fn with_link_netnsid(message: Vec<u8>, id: i32) -> Vec<u8> {
-    // The header, the `ifinfomsg`, and `IFLA_IFNAME`'s "lo".
-    with_attribute_at(message, 16 + 16 + 8, IFLA_TARGET_NETNSID, id)
+    // After the header and the `ifinfomsg`.
+    with_attribute_at(message, 16 + 16, IFLA_TARGET_NETNSID, id)
 }
 /// An address message with `IFA_TARGET_NETNSID` of `id` first, as
 /// `inet_fill_ifaddr` and `inet6_fill_ifaddr` put it.
@@ -2130,7 +2131,7 @@ fn strict_link_header(
 /// A link dump, as `rtnl_dump_ifinfo`: `lo`, as `IFLA_EXT_MASK` asks it.
 /// An `IFLA_MASTER` other than 0 shows only the devices of that master,
 /// which `lo` is not, and `IFLA_TARGET_NETNSID` shows the namespace's
-/// whose ID it is, as `target` finds it, with that ID after the name
+/// whose ID it is, as `target` finds it, with that ID before the name
 /// ([`with_link_netnsid`]). Unchecked, a request shorter than an `ifinfomsg`
 /// is an old `rtgenmsg`, whose attributes follow its 4 bytes, and none
 /// is taken where one breaks `ifla_policy`, as a failed
@@ -6919,14 +6920,14 @@ mod tests {
             _ => Err(Errno::EINVAL),
         };
         let id = |n: i32| ifinfo(0, 0, &[(IFLA_TARGET_NETNSID, &n.to_le_bytes())]);
-        // The peer's lo, up, with the ID right after its name.
+        // The peer's lo, up, with the ID first, before its name.
         let dumped = link_dump(&network, &id(4), (1, 7), true, &target).unwrap();
         let link = &dumped[0];
         assert_eq!(
             attribute_kinds(&link[32..])[..3],
-            [IFLA_IFNAME, IFLA_TARGET_NETNSID, IFLA_TXQLEN]
+            [IFLA_TARGET_NETNSID, IFLA_IFNAME, IFLA_TXQLEN]
         );
-        assert_eq!(link[40..48], [8, 0, 46, 0, 4, 0, 0, 0]);
+        assert_eq!(link[32..40], [8, 0, 46, 0, 4, 0, 0, 0]);
         assert_eq!(
             with_link_netnsid(link_message(&peer, 1, 7, NLM_F_MULTI, 0), 4),
             *link

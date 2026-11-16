@@ -151,7 +151,9 @@ impl Drop for Resolved {
 /// Finds, as the caller of `c` sees them, the namespaces each
 /// `RTM_NEWNSID` and `RTM_GETNSID` request of `bytes` names by
 /// `NETNSA_PID` (`get_net_ns_by_pid`) or `NETNSA_FD` (`get_net_ns_by_fd`),
-/// for the kernel to take as it reaches them; finding one changes nothing.
+/// and each `RTM_NEWLINK` and `RTM_SETLINK` by `IFLA_NET_NS_PID` or
+/// `IFLA_NET_NS_FD`, for the kernel to take as it reaches them; finding
+/// one changes nothing.
 /// A `write` finds them as its caller sees them too ([`super::resolving`]),
 /// as Linux looks in `current`'s.
 pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
@@ -165,21 +167,33 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
         }
         // A link or address request may name a peer by its ID, which
         // needs the sender's `CAP_NET_ADMIN` over it too.
-        if matches!(header.kind, super::RTM_GETLINK | super::RTM_GETADDR) {
+        if matches!(
+            header.kind,
+            super::RTM_GETLINK | super::RTM_GETADDR | super::RTM_DELLINK
+        ) {
             any = true;
         }
-        if matches!(header.kind, RTM_NEWNSID | RTM_GETNSID) {
+        // After an `rtgenmsg`, or a link's `ifinfomsg`: the types that name
+        // a process and a descriptor.
+        let named = match header.kind {
+            RTM_NEWNSID | RTM_GETNSID => Some((4, NETNSA_PID, NETNSA_FD)),
+            super::RTM_NEWLINK | super::RTM_SETLINK => {
+                Some((16, super::IFLA_NET_NS_PID, super::IFLA_NET_NS_FD))
+            }
+            _ => None,
+        };
+        if let Some((skip, by_pid, by_fd)) = named {
             any = true;
-            let mut attributes = bytes[16..len].get(4..).unwrap_or_default();
+            let mut attributes = bytes[16..len].get(skip..).unwrap_or_default();
             while attributes.len() >= 4 {
                 let size = usize::from(u16::from_le_bytes([attributes[0], attributes[1]]));
                 if size < 4 || size > attributes.len() {
                     break;
                 }
                 let kind = u16::from_le_bytes([attributes[2], attributes[3]]) & 0x3fff;
-                if size >= 8 && matches!(kind, NETNSA_PID | NETNSA_FD) {
+                if size >= 8 && (kind == by_pid || kind == by_fd) {
                     let value = u32::from_le_bytes(attributes[4..8].try_into().unwrap_or_default());
-                    let reference = if kind == NETNSA_PID {
+                    let reference = if kind == by_pid {
                         Reference::Pid(value)
                     } else {
                         Reference::Fd(value)
@@ -256,6 +270,29 @@ fn admin_over(opener: &Credentials, network: &Network) -> bool {
             .as_ref()
             .unwrap_or(opener)
             .capable_in(CAP_NET_ADMIN, network.owner())
+}
+/// `rtnl_link_get_net_capable`: the namespace a link change names by
+/// `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD`, as [`resolve`] found it, or by
+/// `IFLA_TARGET_NETNSID` (`EINVAL` for an ID none has); `EPERM` without
+/// `CAP_NET_ADMIN` over it, the sender's and the opener's
+/// (`netlink_ns_capable`). None for a change that names none.
+pub(super) fn link_target(
+    network: &Network,
+    opener: &Credentials,
+    pid: Option<u32>,
+    fd: Option<u32>,
+    id: Option<i32>,
+) -> Result<Option<Arc<Network>>, Errno> {
+    let named = match (pid, fd, id) {
+        (Some(pid), ..) => resolved(Reference::Pid(pid))?,
+        (_, Some(fd), _) => resolved(Reference::Fd(fd))?,
+        (.., Some(id)) => network.netlink.ids.peer(id).ok_or(Errno::EINVAL)?,
+        _ => return Ok(None),
+    };
+    if !admin_over(opener, &named) {
+        return Err(Errno::EPERM);
+    }
+    Ok(Some(named))
 }
 /// `rtnl_get_net_ns_capable`: the peer of `id`, `EINVAL` for none and
 /// `EACCES` without `CAP_NET_ADMIN` over it.

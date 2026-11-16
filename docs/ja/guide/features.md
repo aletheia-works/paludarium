@@ -1678,6 +1678,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     属性がポリシーに反するリンクのダンプは、属性をどれも使いません。リンクの変更は
     `IFLA_NET_NS_PID`、`IFLA_NET_NS_FD`、`IFLA_TARGET_NETNSID` のうち一つまでを
     取ります（`EINVAL`）。リンクの取得は、はじめの二つのどちらも取りません（`EOPNOTSUPP`）。
+  - **リンクの変更とほかの名前空間:** `RTM_SETLINK` と `RTM_NEWLINK` は、
+    `rtnl_link_get_net_capable` と同じく、`lo` を探す前に、それらが指す名前空間を探します。
+    どれも指さないプロセス、記述子、ID は `ESRCH`、`EBADF`、`EINVAL` で、その名前空間への
+    `CAP_NET_ADMIN` が、開いた側と送り手のどちらかになければ `EPERM` です。`lo` が見つかると
+    （`NLM_F_CREATE` と `NLM_F_EXCL` の `RTM_NEWLINK` はその名前空間で探し、そこにも
+    あるので `EEXIST`）、ほかの名前空間への移動は、ほかのどの属性よりも先に、`lo` の名前空間は
+    変えられないので `EINVAL` です（`__dev_change_net_namespace`）。プロセス、記述子、ID で
+    自分の名前空間を指すのは移動ではありません。`RTM_DELLINK` は、`rtnl_dellink` と同じく
+    ID だけを取り（はじめの二つは `EOPNOTSUPP`）、`rtnl_get_net_ns_capable` と同じく
+    その名前空間を探して（`EINVAL`、`EACCES`）、そこでインデックスか名前で `lo` を探します。
+    `lo` は消せません（`rtnl_link_ops` がないので `EOPNOTSUPP`）。ほかのリンクは `ENODEV` で、
+    どちらもなければ、`IFLA_GROUP` がグループ 0 なら `EPERM`、ほかなら `ENODEV`、
+    何もなければ `EINVAL` です。
   - **名前空間の ID:** Linux の `net_namespace.c` と同じく、`RTM_NEWNSID` は、
     プロセス（`NETNSA_PID`、なければ `ESRCH`）か `/proc/<pid>/ns/net` の記述子
     （`NETNSA_FD`、`EBADF`、ほかのファイルなら `EINVAL`）のネットワーク名前空間に

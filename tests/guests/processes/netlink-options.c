@@ -940,6 +940,97 @@ static void target_case(void) {
     peer_stop(&p);
 }
 
+#define IFLA_MTU 4
+#define IFLA_GROUP 27
+#define IFLA_NET_NS_FD 28
+
+/* Sends a link change of `type` with `flags` for `index`, with
+   `ifi_flags` and `ifi_change` of `up`, and the attributes `add` puts. */
+#define LINK_REQUEST(fd, type, flags, index, up, ...)                                                              \
+    do {                                                                                                          \
+        begin_body(&r, type, flags, seq++, 16, 0, index);                                                         \
+        unsigned updown = (up);                                                                                   \
+        memcpy(r.body + 8, &updown, 4);                                                                           \
+        memcpy(r.body + 12, &updown, 4);                                                                          \
+        __VA_ARGS__;                                                                                              \
+        send_request(fd, &r);                                                                                     \
+    } while (0)
+
+static void link_netns_case(void) {
+    struct peer p = peer_start();
+    int ctl = acked_socket();
+    /* Opened without capabilities, used by root. */
+    if (setresuid(0, 65534, 0)) exit(92);
+    int weak = acked_socket();
+    if (setresuid(0, 0, 0)) exit(93);
+    struct request r;
+    unsigned seq = 1;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/ns/net", p.pid);
+    int peer_fd = open(path, O_RDONLY), self_fd = open("/proc/self/ns/net", O_RDONLY),
+        uts_fd = open("/proc/self/ns/uts", O_RDONLY);
+    begin(&r, RTM_NEWNSID, 0x5, seq++);
+    put32(&r, NETNSA_NSID, 3);
+    put32(&r, NETNSA_PID, p.pid);
+    send_request(ctl, &r);
+    begin(&r, RTM_NEWNSID, 0x5, seq++);
+    put32(&r, NETNSA_NSID, 2);
+    put32(&r, NETNSA_FD, self_fd);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    printf("-- setlink\n");
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 9));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, -1));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_NET_NS_PID, p.pid));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_NET_NS_PID, 999999));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_NET_NS_FD, peer_fd));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_NET_NS_FD, 9999));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_NET_NS_FD, uts_fd));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 3), put32(&r, IFLA_NET_NS_PID, p.pid));
+    LINK_REQUEST(ctl, 19, 0x5, 5, 0, put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 19, 0x5, 0, 0, put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 3), put32(&r, IFLA_MTU, 1500));
+    show(ctl, "ctl");
+    printf("-- setlink in its own namespace\n");
+    LINK_REQUEST(ctl, 19, 0x5, 1, IFF_UP, put32(&r, IFLA_TARGET_NETNSID, 2));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_NET_NS_PID, getpid()));
+    LINK_REQUEST(ctl, 19, 0x5, 1, 0, put32(&r, IFLA_NET_NS_FD, self_fd));
+    begin_body(&r, 18, 0x1, seq++, 16, 0, 1);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    printf("-- newlink\n");
+    LINK_REQUEST(ctl, 16, 0x605, 0, 0, put(&r, IFLA_IFNAME, "lo", 3), put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 16, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 16, 0x405, 0, 0, put(&r, IFLA_IFNAME, "dummy0", 7), put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 16, 0x5, 0, 0, put(&r, IFLA_IFNAME, "dummy0", 7), put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 16, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 9));
+    LINK_REQUEST(ctl, 16, 0x5, 1, 0, put32(&r, IFLA_NET_NS_PID, p.pid));
+    show(ctl, "ctl");
+    printf("-- dellink\n");
+    LINK_REQUEST(ctl, 17, 0x5, 1, 0);
+    LINK_REQUEST(ctl, 17, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 17, 0x5, 5, 0, put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 17, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 9));
+    LINK_REQUEST(ctl, 17, 0x5, 1, 0, put32(&r, IFLA_NET_NS_PID, p.pid));
+    LINK_REQUEST(ctl, 17, 0x5, 0, 0);
+    LINK_REQUEST(ctl, 17, 0x5, 0, 0, put32(&r, IFLA_GROUP, 0));
+    LINK_REQUEST(ctl, 17, 0x5, 0, 0, put32(&r, IFLA_GROUP, 5));
+    LINK_REQUEST(ctl, 17, 0x5, 0, 0, put(&r, IFLA_IFNAME, "lo", 3), put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(ctl, 17, 0x5, 0, 0, put(&r, IFLA_IFNAME, "nope", 5));
+    show(ctl, "ctl");
+    printf("-- without CAP_NET_ADMIN\n");
+    LINK_REQUEST(weak, 19, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 3));
+    LINK_REQUEST(weak, 17, 0x5, 1, 0, put32(&r, IFLA_TARGET_NETNSID, 3));
+    show(weak, "weak");
+    printf("-- the peer is as it was\n");
+    begin_body(&r, 18, 0x1, seq++, 16, 0, 1);
+    put32(&r, IFLA_TARGET_NETNSID, 3);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    peer_stop(&p);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -955,6 +1046,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(mode, "netlink-nsid-gone")) gone_case();
         else if (!strcmp(mode, "netlink-nsid-write")) write_case();
         else if (!strcmp(mode, "netlink-target-netnsid")) target_case();
+        else if (!strcmp(mode, "netlink-link-netns")) link_netns_case();
         else return 2;
         fflush(stdout);
         _exit(0);

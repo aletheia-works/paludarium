@@ -78,6 +78,7 @@ const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
 const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
@@ -1290,6 +1291,7 @@ impl NetlinkSocket {
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
+            RTM_DELLINK => self.delete_link(payload),
             RTM_NEWLINK | RTM_SETLINK => {
                 let (flags, change, _) = self.find_link(payload, header, None)?;
                 // `rtnl_dev_combine_flags`: only the flags `ifi_change`
@@ -1316,10 +1318,14 @@ impl NetlinkSocket {
     /// ([`parse_policy`]). To set, more than one of `IFLA_NET_NS_PID`,
     /// `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` is `EINVAL`
     /// (`rtnl_ensure_unique_netns`), `RTM_NEWLINK` checks what
-    /// `IFLA_LINKINFO` holds against `ifla_info_policy`, `NLM_F_EXCL` is
-    /// `EEXIST` and `NLM_F_REPLACE` `EOPNOTSUPP` for `RTM_NEWLINK`, and of
-    /// the attributes only the name `lo` and `IFLA_EXT_MASK` are taken
-    /// (`EOPNOTSUPP` for others). To get, `strict` is `Some` with whether
+    /// `IFLA_LINKINFO` holds against `ifla_info_policy`, then the namespace
+    /// those name is found ([`nsid::link_target`]: `ESRCH`, `EBADF`,
+    /// `EINVAL`, `EPERM`); once `lo` is found, `NLM_F_EXCL` is `EEXIST` and
+    /// `NLM_F_REPLACE` `EOPNOTSUPP` for `RTM_NEWLINK`, a move to another
+    /// namespace is `EINVAL`, as `lo` may not move
+    /// (`__dev_change_net_namespace`), and of the other attributes only the
+    /// name `lo` and `IFLA_EXT_MASK` are taken (`EOPNOTSUPP` for others),
+    /// as `do_setlink` looks at them after the move. To get, `strict` is `Some` with whether
     /// the socket checks strictly, which takes, as `rtnl_valid_getlink_req`
     /// does, no type, flags or change mask (`EINVAL`), and of the
     /// attributes only the names, `IFLA_EXT_MASK` and
@@ -1374,16 +1380,22 @@ impl NetlinkSocket {
             // `rtnl_newlink` parses it without a report.
             extack::quietly(|| parse_policy(info, &IFLA_INFO_POLICY, false))?;
         }
-        for &(kind, _) in &attributes {
-            match kind {
-                IFLA_IFNAME | IFLA_ALT_IFNAME | IFLA_EXT_MASK => {}
-                _ if get => {}
-                _ => return Err(EOPNOTSUPP),
-            }
-        }
         // `rtnl_dev_get`: the last `IFLA_IFNAME`, or else `IFLA_ALT_IFNAME`,
         // to its NUL.
         let by_kind = by_type(&attributes);
+        // `rtnl_link_get_net_capable`, before `lo` is looked for.
+        let moving = if get {
+            None
+        } else {
+            let value = |kind: u16| by_kind.get(&kind).map(|v| u32_value(v).unwrap_or(0));
+            nsid::link_target(
+                &self.network,
+                &self.opener,
+                value(IFLA_NET_NS_PID),
+                value(IFLA_NET_NS_FD),
+                by_kind.get(&IFLA_TARGET_NETNSID).map(|v| s32_value(v)),
+            )?
+        };
         let mut target = None;
         let name = by_kind
             .get(&IFLA_IFNAME)
@@ -1439,11 +1451,11 @@ impl NetlinkSocket {
             }
             return Err(ENODEV);
         }
-        // Renaming `lo` to another name is not supported.
-        if !get && index > 0 && name.is_some_and(|name| name != b"lo") {
-            return Err(EOPNOTSUPP);
+        if get {
+            return Ok((word(8), word(12), target));
         }
-        if !get && header.kind == RTM_NEWLINK {
+        // `rtnl_changelink`, then `do_setlink`.
+        if header.kind == RTM_NEWLINK {
             if header.flags & NLM_F_EXCL != 0 {
                 return Err(EEXIST);
             }
@@ -1451,7 +1463,70 @@ impl NetlinkSocket {
                 return Err(EOPNOTSUPP);
             }
         }
-        Ok((word(8), word(12), target))
+        // `lo` is `netns_immutable`; its own namespace is no move.
+        if moving.is_some_and(|to| !Arc::ptr_eq(&to, &self.network)) {
+            return Err(extack::message(
+                Errno::EINVAL,
+                "The interface netns is immutable",
+            ));
+        }
+        let namespaces = [IFLA_NET_NS_PID, IFLA_NET_NS_FD, IFLA_TARGET_NETNSID];
+        if attributes.iter().any(|&(kind, _)| {
+            !matches!(kind, IFLA_IFNAME | IFLA_ALT_IFNAME | IFLA_EXT_MASK)
+                && !namespaces.contains(&kind)
+        }) {
+            return Err(EOPNOTSUPP);
+        }
+        // Renaming `lo` to another name is not supported.
+        if index > 0 && name.is_some_and(|name| name != b"lo") {
+            return Err(EOPNOTSUPP);
+        }
+        Ok((word(8), word(12), None))
+    }
+    /// `RTM_DELLINK`, as `rtnl_dellink`: the attributes are checked
+    /// against `ifla_policy`, `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are
+    /// `EOPNOTSUPP`, and `IFLA_TARGET_NETNSID` names the namespace whose
+    /// link it is ([`nsid::target`]: `EINVAL`, `EACCES`). A positive index
+    /// or a name finds `lo` there, which may not be deleted
+    /// (`EOPNOTSUPP`, as it has no `rtnl_link_ops`), or nothing
+    /// (`ENODEV`); without either, `IFLA_GROUP` is `EPERM` for group 0 and
+    /// `ENODEV` for another, which `lo` is not in, and nothing `EINVAL`.
+    fn delete_link(&self, payload: &[u8]) -> Result<bool, Errno> {
+        if payload.len() < 16 {
+            return Err(extack::message(Errno::EINVAL, "Invalid header length"));
+        }
+        let index = i32::from_le_bytes(payload[4..8].try_into().unwrap_or_default());
+        let attributes = parse_policy(&payload[16..], &IFLA_POLICY, false)?;
+        let by_kind = by_type(&attributes);
+        if by_kind.contains_key(&IFLA_NET_NS_PID) || by_kind.contains_key(&IFLA_NET_NS_FD) {
+            return Err(extack::message(
+                EOPNOTSUPP,
+                "specified netns attribute not supported",
+            ));
+        }
+        if let Some(value) = by_kind.get(&IFLA_TARGET_NETNSID) {
+            nsid::target(&self.network, &self.opener, s32_value(value))?;
+        }
+        let name = by_kind
+            .get(&IFLA_IFNAME)
+            .or_else(|| by_kind.get(&IFLA_ALT_IFNAME))
+            .map(|value| {
+                let end = value.iter().position(|&b| b == 0).unwrap_or(value.len());
+                &value[..end]
+            });
+        let found = match (index, name) {
+            (i, _) if i > 0 => i == 1,
+            (_, Some(name)) => name == b"lo",
+            (_, None) => {
+                // `rtnl_group_dellink`.
+                return Err(match by_kind.get(&IFLA_GROUP) {
+                    Some(group) if u32_value(group).unwrap_or(0) == 0 => Errno::EPERM,
+                    Some(_) => ENODEV,
+                    None => Errno::EINVAL,
+                });
+            }
+        };
+        Err(if found { EOPNOTSUPP } else { ENODEV })
     }
     /// Receives one datagram into `buf`, as `netlink_recvmsg`: a pending
     /// error first, `EAGAIN` while there is none; `peek` leaves it. A

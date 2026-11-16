@@ -47,7 +47,15 @@ Linux.
   requires it, but its instructions stop with `SIGILL`.
 
 When a guest reaches an instruction it cannot run, it gets `SIGILL`, as on real
-Linux. Page faults raise `SIGSEGV`, and integer division by zero `SIGFPE`.
+Linux. Page faults raise `SIGSEGV`, and integer division by zero `SIGFPE`, as
+does an unmasked floating-point exception. An SSE one, which MXCSR unmasks,
+raises it at the instruction itself: the destination is left as it was, and
+MXCSR keeps the instruction's exception flags, as a signal handler sees them.
+An x87 one raises it at the next x87 instruction that waits, which is where a
+CPU raises it, and leaves its own instruction's result as on a CPU: an invalid
+operation, a division by zero or an arithmetic denormal operand changes no
+register, and an overflow or underflow rebiases a register's result by 2²⁴⁵⁷⁶
+and stores nothing to memory.
 
 ## System calls
 
@@ -941,7 +949,8 @@ kernel.
   `UFFD_FEATURE_PAGEFAULT_FLAG_WP`, `UFFD_FEATURE_SIGBUS`,
   `UFFD_FEATURE_THREAD_ID`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
-  `UFFD_FEATURE_MISSING_HUGETLBFS` and `UFFD_FEATURE_POISON`, and `UFFD_FEATURE_EVENT_FORK` needs
+  `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_POISON` and
+  `UFFD_FEATURE_MOVE`, and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory and shared anonymous memory for missing pages
   (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
@@ -994,7 +1003,23 @@ kernel.
   and `UFFDIO_UNREGISTER`, moves with `mremap`, goes to a `fork`ed child of
   private memory but not of shared, and goes with `MADV_DONTNEED`,
   `MADV_FREE`, `MADV_GUARD_INSTALL` (whose guard takes its place) and
-  `munmap`. A read takes whole messages (`EINVAL` for a buffer
+  `munmap`. `UFFDIO_MOVE` moves private anonymous pages of the
+  context's own address space (`EINVAL` from another) into a registered
+  range, whether or not `UFFD_FEATURE_MOVE` was asked for, as Linux's
+  `move_pages`: each start in a VMA (`ENOENT`); neither VMA shared, each
+  holding its whole range, the same protection, which lets writes, both
+  locked or neither, the destination registered with this `userfaultfd`,
+  and both anonymous memory (`EINVAL`). Then page by page: `EEXIST` for a
+  destination page that has one, or a marker; `ENOENT` for a source page
+  with none, which `UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES` counts as moved
+  instead; `EFAULT` for a source poison or guard; and `EBUSY` for a page a
+  `fork` shares until a write gives it its own (`PageAnonExclusive`). The
+  zero page moves as the zero page; any other page takes the
+  destination's protection, writable and no longer write-protected, and
+  the source has none. What was moved, or the error, goes in the
+  struct's last field, the waits for the moved pages end unless
+  `DONTWAKE`, and one that stops short is `EAGAIN`.
+  A read takes whole messages (`EINVAL` for a buffer
   too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
   `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
   Linux's does, else `POLLIN` while a fault is not read yet.
@@ -1050,8 +1075,11 @@ kernel.
   `ipc/msg.c`) and its default limits (`MSGMAX` 8192, `MSGMNB` 16384,
   `MSGMNI` 32000). A queue holds as many bytes as its `msg_qbytes`, and as
   many messages; a send to a full one waits, unless `IPC_NOWAIT`
-  (`EAGAIN`), until a receive or `IPC_SET` makes room, the queue is
-  removed (`EIDRM`) or a signal comes. `msgrcv` takes the first message, the
+  (`EAGAIN`), in the queue's list of senders until a receive or `IPC_SET`
+  makes room for its message, the queue is removed (`EIDRM`) or a signal
+  comes. As Linux's `ss_wakeup`, a change wakes only the senders whose
+  messages then fit, which check the permission again, and moves the
+  others behind them in their order. `msgrcv` takes the first message, the
   first of a type, the first of another type (`MSG_EXCEPT`) or the lowest
   type up to a bound (a negative `msgtyp`); one longer than the buffer is
   `E2BIG`, unless `MSG_NOERROR` cuts it, and `MSG_COPY` with `IPC_NOWAIT`
@@ -1820,7 +1848,12 @@ kernel.
     lowest free; one without either is `EINVAL`, and a namespace that has
     an ID, or an ID taken, `EEXIST`, each with Linux's extended-ack
     message. The members of `RTNLGRP_NSID` hear of each new ID
-    (`NLM_F_ECHO` sends it to the requester alone of them). `RTM_GETNSID`
+    (`NLM_F_ECHO` sends it to the requester alone of them), and with
+    `RTM_DELNSID` of each that goes with its namespace, once no process,
+    descriptor or socket holds that, as `unhash_nsid` tells it; the ID is
+    free again then. A request names a process or descriptor as its
+    sender sees them, whether sent by `send` or by `write`, and
+    `CAP_NET_ADMIN` is the writer's as well as the opener's. `RTM_GETNSID`
     answers with the ID of a namespace named by process, descriptor or ID
     (`ENOENT` for an ID none has), -1 for none, and with
     `NETNSA_TARGET_NSID` with the ID that namespace gives it and this
@@ -2555,7 +2588,17 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `cmdline`, `environ`, `comm`, `exe`, `cwd`,
   `root`, `maps`, `mounts`, `mountinfo`, `smaps`, `pagemap`, `fd`, `fdinfo`,
-  `ns` and `task`. `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
+  `ns` and `task`. They and the directory are owned by the process's
+  effective user and group, or by root once it is not dumpable (after a
+  change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
+  gives them; `/proc/self` itself is root's. `stat` shows that owner and
+  the mode, 0400 for `environ` and `pagemap` and 0444 for the other files,
+  and `fstat` of an open one the owner it had when it was opened, where
+  Linux's is the owner of that moment. An open checks the mode for that owner, as Linux's
+  `generic_permission` does, so opening one for writing is `EACCES` without
+  `CAP_DAC_OVERRIDE`, and so is reading `environ` or `pagemap` once the
+  process is not dumpable; root's write to one it opened is `EINVAL`.
+  `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
   unmarked; `maps` and `smaps` name a mapped file the same way. `status`
@@ -3154,8 +3197,25 @@ kernel.
   delete by count, with `count` written back (an array deletes nothing,
   `ENOTSUPP`). `BPF_OBJ_GET_INFO_BY_FD` gives a map's `struct bpf_map_info`
   up to the length asked for (`EBADFD` for no descriptor, `EINVAL` for one
-  of no map). Its fdinfo has `map_type`, `key_size`, `value_size`,
-  `max_entries`, `map_flags`, `map_extra`, `memlock`, `map_id` and
+  of no map). Every map has an ID of the machine's, handed out from 1 up
+  as Linux's `idr_alloc_cyclic` does and freed as the map's last
+  reference goes: `BPF_MAP_GET_NEXT_ID` gives the first one past
+  `start_id` (`ENOENT` past the last, `EINVAL` from `INT_MAX`) and
+  `BPF_MAP_GET_FD_BY_ID` a new close-on-exec descriptor of a map, open as
+  `open_flags` (`BPF_F_RDONLY` or `BPF_F_WRONLY`) asks (`ENOENT` for an ID
+  no map has); both need `CAP_SYS_ADMIN` (`EPERM`), after their fields are
+  checked (`EINVAL`). A map takes the memory Linux 7.0, which the x86-64
+  test machines run, gives it on x86-64: an array its 312-byte header and
+  every value rounded up to 8 bytes (a mappable one each page-aligned), a
+  hash its 896-byte header, 16 bytes a bucket (as many as `max_entries`
+  rounded up to a power of two; more than 2^31 entries, or buckets past
+  4 GiB, are `E2BIG`) and its elements, 48 bytes and the key and value
+  each rounded up to 8: every one and a spare a CPU, with 8 bytes a CPU
+  for it, when preallocated, or those it holds and 8 bytes each with
+  `BPF_F_NO_PREALLOC`. A map whose memory is more than the machine's
+  (`sysinfo`'s 4 GiB), checked as `vmalloc` checks it, is `ENOMEM`. Its
+  fdinfo has `map_type`, `key_size`, `value_size`, `max_entries`,
+  `map_flags`, `map_extra`, `memlock` (that memory), `map_id` and
   `frozen`. See [limitations](./limitations) for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
@@ -3811,7 +3871,8 @@ one only with an `--allow-net`.
   change the call and its arguments, or set `orig_rax` to -1 to skip it,
   leaving the `rax` it wants; at an exit `rax` has what the call returned,
   which the tracer may change. A signal the tracer resumes a syscall stop
-  with comes from the kernel (`SI_KERNEL`). `PTRACE_GET_SYSCALL_INFO`
+  with is sent to the process from the kernel (`SI_KERNEL`).
+  `PTRACE_GET_SYSCALL_INFO`
   describes the stop as Linux's `struct ptrace_syscall_info` does: the call
   and its arguments at an entry, the return value and whether it is an
   error at an exit, and only the instruction and stack pointers at another
@@ -3830,7 +3891,8 @@ one only with an `--allow-net`.
   seized, otherwise with `SIGSTOP` pending; it starts with no syscall stops.
   A `vfork` parent reports `PTRACE_EVENT_VFORK_DONE` once its child has
   exited or run another program. The thread that ends its process reports
-  `PTRACE_EVENT_EXIT`; the threads that end with it do not.
+  `PTRACE_EVENT_EXIT`, its status with 0x80 when a fatal signal dumps a
+  core; the threads that end with it do not.
 - `PTRACE_PEEKSIGINFO` reads the siginfo of the signals pending for a
   stopped tracee, or with `PTRACE_PEEKSIGINFO_SHARED` for its process, in
   the order they came. `PTRACE_GETSIGMASK` shows the signals it blocks
@@ -4006,7 +4068,7 @@ one only with an `--allow-net`.
 - **probe**: a Rust program that checks eight thread and filesystem features
   (a tokio timer, a UNIX socket pair, rayon parallelism, Mutex and Condvar,
   file operations, hard links, symbolic links and `flock`).
-- **aube**: a Node.js package manager written in Rust (v2.9.0). `--version`,
+- **aube**: a Node.js package manager written in Rust (v2.10.0). `--version`,
   `install`, `install --frozen-lockfile` and `list` give the same output and
   exit status as on real Linux.
 - **ripgrep**: a text search tool written in Rust (15.2.0), which runs its

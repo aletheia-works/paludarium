@@ -23,14 +23,17 @@
 //! SIGBUS (`BUS_MCEERR_AR`), registered or not, as Linux's poison marker
 //! gives `VM_FAULT_HWPOISON`, until a discard or an unmap drops it.
 //!
-//! The minor mode, `UFFDIO_CONTINUE` and `UFFDIO_MOVE`,
-//! the write protection of shared memory and of pages with no entry
+//! `UFFDIO_MOVE` moves private anonymous pages, of the context's own
+//! space, into a registered range that has none, as Linux's `move_pages`
+//! does ([`paludarium_mmu::MemoryView::userfault_move`]).
+//!
+//! Not offered: the minor mode and `UFFDIO_CONTINUE`; the write
+//! protection of shared memory and of pages with no entry
 //! (`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`, `UFFD_FEATURE_WP_UNPOPULATED`,
-//! `UFFD_FEATURE_WP_ASYNC`), and the events of `fork`, `mremap`,
-//! `madvise` and `munmap` are not offered: `UFFDIO_API` does not report
-//! their features, which it refuses (`EINVAL`), and `UFFDIO_REGISTER`
-//! refuses the minor mode, and the write-protect mode of shared memory
-//! (`EINVAL`).
+//! `UFFD_FEATURE_WP_ASYNC`); and the events of `fork`, `mremap`,
+//! `madvise` and `munmap`. `UFFDIO_API` does not report their features,
+//! which it refuses (`EINVAL`), and `UFFDIO_REGISTER` refuses the minor
+//! mode and the write-protect mode of shared memory (`EINVAL`).
 
 use crate::events::{IN, ReadinessHub};
 use crate::syscalls::{Context, Outcome};
@@ -75,6 +78,9 @@ const FEATURE_WP_UNPOPULATED: u64 = 1 << 13;
 const FEATURE_POISON: u64 = 1 << 14;
 /// `UFFD_FEATURE_WP_ASYNC`, which takes `UFFD_FEATURE_WP_UNPOPULATED`.
 const FEATURE_WP_ASYNC: u64 = 1 << 15;
+/// `UFFD_FEATURE_MOVE`: `UFFDIO_MOVE` is there, which works whether a
+/// context asked for it or not, as Linux's does.
+const FEATURE_MOVE: u64 = 1 << 16;
 /// The features `UFFDIO_API` offers.
 const FEATURES: u64 = FEATURE_PAGEFAULT_FLAG_WP
     | FEATURE_MISSING_HUGETLBFS
@@ -82,7 +88,8 @@ const FEATURES: u64 = FEATURE_PAGEFAULT_FLAG_WP
     | FEATURE_SIGBUS
     | FEATURE_THREAD_ID
     | FEATURE_EXACT_ADDRESS
-    | FEATURE_POISON;
+    | FEATURE_POISON
+    | FEATURE_MOVE;
 /// The context's features once `UFFDIO_API` took them
 /// (`UFFD_FEATURE_INITIALIZED`).
 const INITIALIZED: u32 = 1 << 31;
@@ -91,9 +98,9 @@ const INITIALIZED: u32 = 1 << 31;
 /// `UFFDIO_UNREGISTER` and `UFFDIO_API`, by their numbers.
 const API_IOCTLS: u64 = 1 << 0 | 1 << 1 | 1 << 0x3f;
 /// The ioctls of a registered range: `UFFDIO_WAKE`, `UFFDIO_COPY`,
-/// `UFFDIO_ZEROPAGE` and `UFFDIO_POISON`, and [`WRITEPROTECT_IOCTL`] for
-/// one registered for write protection.
-const RANGE_IOCTLS: u64 = 1 << 2 | 1 << 3 | 1 << 4 | 1 << 8;
+/// `UFFDIO_ZEROPAGE`, `UFFDIO_MOVE` and `UFFDIO_POISON`, and
+/// [`WRITEPROTECT_IOCTL`] for one registered for write protection.
+const RANGE_IOCTLS: u64 = 1 << 2 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 8;
 /// `UFFDIO_WRITEPROTECT`, by its number.
 const WRITEPROTECT_IOCTL: u64 = 1 << 6;
 
@@ -103,6 +110,7 @@ const UFFDIO_UNREGISTER: u32 = 0x8010_aa01;
 const UFFDIO_WAKE: u32 = 0x8010_aa02;
 const UFFDIO_COPY: u32 = 0xc028_aa03;
 const UFFDIO_ZEROPAGE: u32 = 0xc020_aa04;
+const UFFDIO_MOVE: u32 = 0xc028_aa05;
 const UFFDIO_WRITEPROTECT: u32 = 0xc018_aa06;
 const UFFDIO_POISON: u32 = 0xc020_aa08;
 
@@ -118,6 +126,9 @@ const COPY_MODE_WP: u64 = 2;
 /// `UFFDIO_WRITEPROTECT_MODE_WP` and `_DONTWAKE`.
 const WRITEPROTECT_MODE_WP: u64 = 1;
 const WRITEPROTECT_MODE_DONTWAKE: u64 = 2;
+/// `UFFDIO_MOVE_MODE_DONTWAKE` and `_ALLOW_SRC_HOLES`.
+const MOVE_MODE_DONTWAKE: u64 = 1;
+const MOVE_MODE_ALLOW_SRC_HOLES: u64 = 2;
 
 /// `UFFD_EVENT_PAGEFAULT`.
 const EVENT_PAGEFAULT: u8 = 0x12;
@@ -532,6 +543,7 @@ pub(crate) fn ioctl(
         UFFDIO_COPY => fill(c, &context, arg, Fill::Copy),
         UFFDIO_ZEROPAGE => fill(c, &context, arg, Fill::Zeros),
         UFFDIO_POISON => fill(c, &context, arg, Fill::Poison),
+        UFFDIO_MOVE => move_pages(c, &context, arg),
         UFFDIO_WRITEPROTECT => write_protect(c, &context, arg),
         _ => Err(Errno::EINVAL),
     })
@@ -783,6 +795,49 @@ fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Res
         context.wake(dst, filled);
     }
     if filled == len {
+        Ok(0)
+    } else {
+        Err(Errno::EAGAIN)
+    }
+}
+
+/// `UFFDIO_MOVE` (`userfaultfd_move`): the `struct uffdio_move` but its
+/// last field (`EFAULT`), from a thread of the context's own space
+/// (`EINVAL`), with page-aligned ranges ([`validate`]) and modes it knows
+/// (`EINVAL`); then the space's move
+/// ([`paludarium_mmu::MemoryView::userfault_move`]). The bytes moved, or
+/// the error if none were, are written to the last field (`EFAULT`); the
+/// waits for the moved pages end unless `DONTWAKE`, and a move that
+/// stopped short is `EAGAIN`.
+fn move_pages(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64, Errno> {
+    let [dst, src, len, mode] = words::<4>(c, arg)?;
+    if c.mem.view().identity() != context.memory.identity() {
+        return Err(Errno::EINVAL);
+    }
+    validate(dst, len)?;
+    validate(src, len)?;
+    if mode & !(MOVE_MODE_DONTWAKE | MOVE_MODE_ALLOW_SRC_HOLES) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (moved, error) = context.memory.userfault_move(
+        dst,
+        src,
+        len,
+        context.id,
+        mode & MOVE_MODE_ALLOW_SRC_HOLES != 0,
+    );
+    let result = match error {
+        Some(e) if moved == 0 => e.to_syscall_return(),
+        _ => moved,
+    };
+    put_word(c, arg + 32, result)?;
+    if moved == 0 {
+        return Err(error.unwrap_or(Errno::EINVAL));
+    }
+    if mode & MOVE_MODE_DONTWAKE == 0 {
+        context.wake(dst, moved);
+    }
+    if moved == len {
         Ok(0)
     } else {
         Err(Errno::EAGAIN)

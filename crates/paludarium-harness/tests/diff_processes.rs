@@ -98,7 +98,11 @@ mod linux {
         }
         // Linux writes the core the cases read only with the kernel's
         // default core_pattern, which CI sets.
-        if mode == "core-dump" || mode == "core-mappings" || mode == "core-credentials" {
+        if mode == "core-dump"
+            || mode == "core-mappings"
+            || mode == "core-credentials"
+            || mode == "ptrace-exit-core"
+        {
             for (setting, wanted) in [("core_pattern", "core\n"), ("core_uses_pid", "0\n")] {
                 let value = std::fs::read_to_string(format!("/proc/sys/kernel/{setting}"))
                     .unwrap_or_default();
@@ -129,7 +133,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -146,8 +150,8 @@ mod linux {
             // the personality-layout case, which maps page 0, the
             // proc-other-maps and proc-other-fds cases, which read a
             // process's maps and descriptors as another user, and the
-            // pagemap case, which becomes an unprivileged user, as the
-            // emulator's guest starts as root.
+            // pagemap and proc-owners cases, which become an unprivileged
+            // user, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -201,12 +205,15 @@ mod linux {
                     | "userfaultfd-shared"
                     | "userfaultfd-wp"
                     | "userfaultfd-poison"
+                    | "userfaultfd-move"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
+                    | "bpf-ids"
+                    | "bpf-memory"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -248,10 +255,13 @@ mod linux {
                     | "netlink-no-enobufs"
                     | "netlink-nsid"
                     | "netlink-listen-all-nsid"
+                    | "netlink-nsid-gone"
+                    | "netlink-nsid-write"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
                     | "pagemap"
+                    | "proc-owners"
                     | "admin"
             );
             let native = if as_root && !running_as_root() {
@@ -422,6 +432,8 @@ mod linux {
         netlink_no_enobufs => ("netlink-no-enobufs","netlink-options"),
         netlink_nsid => ("netlink-nsid","netlink-options"),
         netlink_listen_all_nsid => ("netlink-listen-all-nsid","netlink-options"),
+        netlink_nsid_gone => ("netlink-nsid-gone","netlink-options"),
+        netlink_nsid_write => ("netlink-nsid-write","netlink-options"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
@@ -489,6 +501,8 @@ mod linux {
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
+        bpf_ids => ("bpf-ids","bpf"),
+        bpf_memory => ("bpf-memory","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -522,6 +536,7 @@ mod linux {
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
         userfaultfd_poison => ("userfaultfd-poison","userfaultfd"),
+        userfaultfd_move => ("userfaultfd-move","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -556,6 +571,8 @@ mod linux {
         ptrace_listen => ("ptrace-listen","ptrace-requests"),
         ptrace_seccomp => ("ptrace-seccomp","ptrace-requests"),
         ptrace_arch_rseq => ("ptrace-arch-rseq","ptrace-requests"),
+        ptrace_syscall_signal => ("ptrace-syscall-signal","ptrace-requests"),
+        ptrace_exit_core => ("ptrace-exit-core","ptrace-requests"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),
@@ -584,11 +601,13 @@ mod linux {
         processes_x87_transcendental => ("x87-transcendental","x87"),
         processes_x87_decimal => ("x87-decimal","x87"),
         processes_x87_state => ("x87-state","x87"),
+        processes_x87_exceptions => ("x87-exceptions","x87"),
         processes_robust_list => ("robust-list","process"),
         processes_futex_shared => ("futex-shared","process"),
         processes_late_handler => ("late-handler","process"),
         processes_mincore => ("mincore","process"),
         processes_pagemap => ("pagemap","process"),
+        processes_proc_owners => ("proc-owners","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),
         processes_fifo => ("fifo","process"),

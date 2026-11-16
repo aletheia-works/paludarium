@@ -254,6 +254,19 @@ pub enum Fast {
     },
     /// `push r64`.
     Push(u8),
+    /// `push imm`, the immediate sign-extended to 64 bits.
+    PushImmediate(u64),
+    /// `mul r` or `imul r`: rax times `src` into rdx:rax (ax for a byte).
+    MulWide {
+        src: Register,
+        signed: bool,
+    },
+    /// `imul r, r` (`a` is `dst`) or `imul r, r, imm`.
+    Imul {
+        dst: Register,
+        a: Register,
+        b: Source,
+    },
     /// `pop r64`.
     Pop(u8),
     Jcc {
@@ -343,6 +356,12 @@ pub enum Fast {
         dst: Register,
         count: u8,
     },
+    /// `shl`, `shr` or `sar` of a register by `cl`, masked as the
+    /// instruction masks it.
+    ShiftByCl {
+        op: Shift,
+        dst: Register,
+    },
 }
 
 /// A general register, or one of the high-byte registers ah, ch, dh and bh.
@@ -403,10 +422,27 @@ impl Fast {
 
     fn form(i: &Instruction) -> Option<Self> {
         let (a, b) = (i.operand(0), i.operand(1));
+        if i.mnemonic == Mnemonic::Imul && b.is_some() {
+            let dst = gpr(a)?;
+            let src = gpr(b)?;
+            if src.size() != dst.size() {
+                return None;
+            }
+            let (a, b) = match i.operand(2) {
+                None => (dst, Source::Register(src)),
+                Some(Operand::Immediate(v)) => (src, Source::Immediate(v)),
+                Some(_) => return None,
+            };
+            return Some(Self::Imul { dst, a, b });
+        }
         if i.operand(2).is_some() {
             return None;
         }
         Some(match i.mnemonic {
+            Mnemonic::Mul | Mnemonic::Imul if b.is_none() => Self::MulWide {
+                src: gpr(a)?,
+                signed: i.mnemonic == Mnemonic::Imul,
+            },
             Mnemonic::Nop | Mnemonic::Endbr64 => Self::Nop,
             Mnemonic::Mov => {
                 if let Some(dst) = gpr(a) {
@@ -479,7 +515,10 @@ impl Fast {
                     }
                 }
             },
-            Mnemonic::Push if i.implicit_size == 8 && b.is_none() => Self::Push(gpr64(a)?),
+            Mnemonic::Push if i.implicit_size == 8 && b.is_none() => match a {
+                Some(Operand::Immediate(v)) => Self::PushImmediate(v),
+                _ => Self::Push(gpr64(a)?),
+            },
             Mnemonic::Pop if i.implicit_size == 8 && b.is_none() => Self::Pop(gpr64(a)?),
             Mnemonic::Jcc(condition) => Self::Jcc {
                 condition,
@@ -541,13 +580,19 @@ impl Fast {
             }
             m if Shift::of(m).is_some() => {
                 let dst = gpr(a)?;
+                let op = Shift::of(m)?;
                 let count = match b {
                     None => 1,
                     Some(Operand::Immediate(v)) => v,
+                    Some(Operand::Register(Register::Gpr { index: 1, size: 1 }))
+                        if matches!(op, Shift::Shl | Shift::Shr | Shift::Sar) =>
+                    {
+                        return Some(Self::ShiftByCl { op, dst });
+                    }
                     Some(_) => return None,
                 } & if dst.size() == 8 { 63 } else { 31 };
                 Self::Shift {
-                    op: Shift::of(m)?,
+                    op,
                     dst,
                     count: count as u8,
                 }
@@ -656,6 +701,37 @@ pub(crate) fn execute(
         Fast::Push(r) => {
             let v = x.s.gpr[usize::from(r)];
             x.push(v, 8)?;
+            next
+        }
+        Fast::PushImmediate(v) => {
+            x.push(v, 8)?;
+            next
+        }
+        Fast::MulWide { src, signed } => {
+            let size = src.size();
+            let b = x.read_reg(src) & size_mask(size);
+            let a = x.s.gpr[0] & size_mask(size);
+            let (full, overflow) = if signed {
+                let full = i128::from(sign_extend(a, size) as i64)
+                    * i128::from(sign_extend(b, size) as i64);
+                (full as u128, alu::imul(a, b, size).1)
+            } else {
+                let full = u128::from(a) * u128::from(b);
+                (full, full >> alu::bits(size) != 0)
+            };
+            x.write_wide(size, full)?;
+            let f = if overflow { flag::CF | flag::OF } else { 0 };
+            x.set_status(flag::CF | flag::OF, f);
+            next
+        }
+        Fast::Imul { dst, a, b } => {
+            let size = dst.size();
+            let a = x.read_reg(a) & size_mask(size);
+            let b = x.source(b, size);
+            let (r, overflow) = alu::imul(a, b, size);
+            x.write_reg(dst, r);
+            let f = if overflow { flag::CF | flag::OF } else { 0 };
+            x.set_status(flag::CF | flag::OF, f);
             next
         }
         Fast::Pop(r) => {
@@ -794,6 +870,15 @@ pub(crate) fn execute(
         Fast::Shift { op, dst, count } => {
             let size = dst.size();
             let a = x.read_reg(dst) & size_mask(size);
+            let (r, update, flags) = op.apply(a, count, size);
+            x.write_reg(dst, r);
+            x.set_status(update, flags);
+            next
+        }
+        Fast::ShiftByCl { op, dst } => {
+            let size = dst.size();
+            let a = x.read_reg(dst) & size_mask(size);
+            let count = x.s.gpr[1] as u8 & if size == 8 { 63 } else { 31 };
             let (r, update, flags) = op.apply(a, count, size);
             x.write_reg(dst, r);
             x.set_status(update, flags);

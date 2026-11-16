@@ -953,3 +953,106 @@ fn a_userfaultfd_poison_raises_a_bus_error_until_a_discard() {
         Err(Errno(3))
     );
 }
+
+#[test]
+fn a_userfaultfd_move_moves_exclusive_pages_and_refuses_markers() {
+    let mut m = AddressSpace::new();
+    let dst = m
+        .map(
+            Some(GuestAddr(0x90000)),
+            4 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap()
+        .0;
+    let src = m
+        .map(
+            Some(GuestAddr(0xa0000)),
+            4 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap()
+        .0;
+    let view = m.view();
+    view.userfault_register(
+        dst,
+        dst + 4 * PAGE_SIZE,
+        7,
+        Userfault::MISSING | Userfault::WP,
+    )
+    .unwrap();
+    // Another context's range is EINVAL.
+    m.write(GuestAddr(src), b"s").unwrap();
+    assert_eq!(
+        view.userfault_move(dst, src, PAGE_SIZE, 8, false),
+        (0, Some(Errno::EINVAL))
+    );
+    // A page `fork` shares is EBUSY until a write gives it its own.
+    let child = m.fork();
+    assert_eq!(
+        view.userfault_move(dst, src, PAGE_SIZE, 7, false),
+        (0, Some(Errno(16))) // EBUSY
+    );
+    m.write(GuestAddr(src + 1), b"t").unwrap();
+    assert_eq!(
+        view.userfault_move(dst, src, PAGE_SIZE, 7, false),
+        (PAGE_SIZE, None)
+    );
+    let mut bytes = [0; 2];
+    m.read(GuestAddr(dst), &mut bytes).unwrap();
+    assert_eq!(&bytes, b"st");
+    assert_eq!(m.page_state(GuestAddr(src)), Some(PageState::Absent));
+    child.read(GuestAddr(src), &mut bytes).unwrap();
+    assert_eq!(&bytes, b"s\0");
+    // The zero page moves as the zero page.
+    m.read(GuestAddr(src + PAGE_SIZE), &mut bytes).unwrap();
+    assert_eq!(
+        view.userfault_move(dst + PAGE_SIZE, src + PAGE_SIZE, PAGE_SIZE, 7, false),
+        (PAGE_SIZE, None)
+    );
+    assert_eq!(
+        m.page_state(GuestAddr(dst + PAGE_SIZE)),
+        Some(PageState::Zero)
+    );
+    // A marker at the destination is EEXIST, at the source EFAULT.
+    view.userfault_poison(dst, dst + 4 * PAGE_SIZE, dst + 2 * PAGE_SIZE)
+        .unwrap();
+    m.write(GuestAddr(src + 2 * PAGE_SIZE), b"u").unwrap();
+    assert_eq!(
+        view.userfault_move(
+            dst + 2 * PAGE_SIZE,
+            src + 2 * PAGE_SIZE,
+            PAGE_SIZE,
+            7,
+            false
+        ),
+        (0, Some(Errno::EEXIST))
+    );
+    m.guard(GuestAddr(src + 3 * PAGE_SIZE), src + 4 * PAGE_SIZE, true)
+        .unwrap();
+    assert_eq!(
+        view.userfault_move(dst + 3 * PAGE_SIZE, src + 3 * PAGE_SIZE, PAGE_SIZE, 7, true),
+        (0, Some(Errno::EFAULT))
+    );
+    // A moved page is writable, and no longer write-protected.
+    m.write(GuestAddr(dst), b"w").unwrap();
+    view.userfault_register(src, src + 4 * PAGE_SIZE, 7, Userfault::WP)
+        .unwrap();
+    view.userfault_write_protect(src + 2 * PAGE_SIZE, src + 3 * PAGE_SIZE, true)
+        .unwrap();
+    assert_eq!(
+        view.userfault_move(
+            dst + 3 * PAGE_SIZE,
+            src + 2 * PAGE_SIZE,
+            PAGE_SIZE,
+            7,
+            false
+        ),
+        (PAGE_SIZE, None)
+    );
+    m.write(GuestAddr(dst + 3 * PAGE_SIZE + 1), b"v").unwrap();
+    m.read(GuestAddr(dst + 3 * PAGE_SIZE), &mut bytes).unwrap();
+    assert_eq!(&bytes, b"uv");
+}

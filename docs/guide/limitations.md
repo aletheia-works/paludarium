@@ -5,14 +5,12 @@ verified.
 
 ## Not supported
 
-- **Part of x87, for now**: an x87 exception always takes its masked
-  response: an unmasked one sets the status word's summary and does not raise
-  `SIGFPE`. `FISTTP` belongs to SSE3, which `CPUID` does not report, and is not
-  implemented. Where the last instruction and its memory operand were, which
-  `FNSTENV`, `FNSAVE` and `FXSAVE` write, is not kept: those fields are zero,
-  and Intel's and AMD's CPUs fill them in differently. Where `FPREM` and
-  `FPREM1` stop on the way when their operands are far apart is each CPU's
-  choice: the final remainder is the same.
+- **Part of x87, for now**: `FISTTP` belongs to SSE3, which `CPUID` does not
+  report, and is not implemented. Where the last instruction and its memory
+  operand were, which `FNSTENV`, `FNSAVE` and `FXSAVE` write, is not kept:
+  those fields are zero, and Intel's and AMD's CPUs fill them in differently.
+  Where `FPREM` and `FPREM1` stop on the way when their operands are far apart
+  is each CPU's choice: the final remainder is the same.
 - **A dynamically linked program's files, unless given**: a program runs with
   its interpreter as on Linux, on musl's dynamic linker or glibc's. A session
   reads the interpreter and the libraries from its own files, so they must be
@@ -238,10 +236,11 @@ verified.
   and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
 - **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
-  links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), IDs
-  (`BPF_*_GET_NEXT_ID`, `BPF_*_GET_FD_BY_ID`), tokens, iterators and
-  statistics are `ENOSYS`, as each command Linux has that is not here; a
-  number Linux has no command for is `EINVAL`, as there. So libbpf finds no
+  links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
+  programs, BTF and links (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`
+  and the rest), tokens, iterators and statistics are `ENOSYS`, as each
+  command Linux has that is not here; a number Linux has no command for is
+  `EINVAL`, as there. So libbpf finds no
   program loads (its trivial-program probe fails with `ENOSYS`) and
   `bpftool feature` says the `bpf()` system call is not there, as it asks
   `BPF_PROG_LOAD` and looks for `ENOSYS`. The other map types are `EINVAL`,
@@ -251,10 +250,15 @@ verified.
   which a test machine and the emulator count differently. A hash gives
   its keys in the order of their bytes, where Linux's order follows its
   buckets and a random seed, and a batch of it takes each element as a
-  bucket of its own, so `in_batch` and `out_batch` count elements. Maps
-  take no memory limit and no `memlock` charge Linux would refuse (a huge
-  map is made, where Linux may give `ENOMEM`), and fdinfo's `memlock` is
-  the elements' size alone. `BPF_F_MMAPABLE` is taken but `mmap` of a map
+  bucket of its own, so `in_batch` and `out_batch` count elements. A map's
+  memory follows the sizes of Linux 7.0's structures, not Linux master's,
+  whose hash elements are smaller, and the elements are not taken from
+  the machine until they are written: no memory cgroup is charged, and
+  only a map larger than the machine's 4 GiB is `ENOMEM`, where Linux may
+  also run out of the memory it really has. A preallocated hash counts a
+  spare element for each CPU of the host, where Linux counts the possible
+  CPUs, which may be more. Map IDs are the emulated machine's, so they
+  start at 1 and do not see the host's maps. `BPF_F_MMAPABLE` is taken but `mmap` of a map
   is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
   `kernel.unprivileged_bpf_disabled` is always 2, with no
   `/proc/sys/kernel` file for it.
@@ -419,9 +423,7 @@ verified.
   - The limits of System V IPC's shared memory, semaphores and message
     queues are Linux's defaults, which `/proc/sys/kernel` cannot change.
     `/proc/sysvipc` shows its objects as they were when it was opened,
-    where Linux reads each one as the read reaches it. A message queue's
-    waiting senders all look again whenever it changes, where Linux wakes them in the order
-    they began only while each one's message fits.
+    where Linux reads each one as the read reaches it.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
     `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,
@@ -457,11 +459,7 @@ verified.
   - `ptrace` has no single-stepping yet: `PTRACE_SINGLESTEP`,
     `PTRACE_SYSEMU_SINGLESTEP` and the other requests the features do not
     list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
-    as the emulator's `arch_prctl`, and gives `EINVAL` for the rest. A
-    `PTRACE_LISTEN` tracee notices the change of its group stop within
-    10 ms. A signal a tracer resumes a syscall
-    stop with is taken by the thread that stopped, where Linux sends it to
-    the process. The status `PTRACE_EVENT_EXIT` gives has no core-dump bit.
+    as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
     checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
     without XSAVE, which the emulated CPU does not offer. There are no
@@ -647,9 +645,8 @@ verified.
 - **userfaultfd, in part**: missing pages and the write protection of
   private anonymous memory are registered. The minor mode is refused
   (`EINVAL`), as is the write-protect mode for shared memory, which Linux
-  takes, and `UFFDIO_CONTINUE` and `UFFDIO_MOVE` are not offered
-  (`EINVAL`), nor the events of `fork`, `mremap`, `madvise` and
-  `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
+  takes, and `UFFDIO_CONTINUE` is not offered (`EINVAL`), nor the events
+  of `fork`, `mremap`, `madvise` and `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
   `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
   `UFFDIO_API` does not report and refuses (`EINVAL`); the ioctls
   `UFFDIO_REGISTER` and `fdinfo` report leave them out too. A
@@ -660,7 +657,10 @@ verified.
   registered (`EINVAL`), where Linux takes any shmem. A system call's own
   copy to or from a missing page of a registered range, or to a
   write-protected one, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
-  Linux waits for the page as for an instruction. There is no `/dev/userfaultfd` and no
+  Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
+  hole is `ENOENT` before the destination is looked at when nothing
+  touched the 2 MiB around it here, as when Linux has no page table there,
+  which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: permission events (`FAN_OPEN_PERM`,
   `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM`) are taken by `fanotify_mark` but
@@ -783,11 +783,11 @@ verified.
   where Linux's count every namespace's; its own parameters' references
   are 1.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
-  ID goes when its namespace does, with no `RTM_DELNSID` to tell of it;
-  an ID is given only by `RTM_NEWNSID`, as no device of another
-  namespace makes Linux's `peernet2id_alloc` give one; a request sent by
-  `write` rather than `send` names no process or descriptor (`ESRCH`,
-  `EBADF`), as no caller is known there; and `IFLA_TARGET_NETNSID` and
+  ID is given only by `RTM_NEWNSID`, as no device of another namespace
+  makes Linux's `peernet2id_alloc` give one; the `RTM_DELNSID` of a
+  namespace that goes is sent as its last holder lets it go, where
+  Linux sends it a little later, from a work queue; and
+  `IFLA_TARGET_NETNSID` and
   `IFA_TARGET_NETNSID` are `EINVAL` even for an ID a namespace has, as
   no other namespace's links or addresses are dumped. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries

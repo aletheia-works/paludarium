@@ -1374,6 +1374,26 @@ mod tests {
     }
 
     #[test]
+    fn a_change_of_unknown_semaphores_tries_every_queue() {
+        // As SETVAL, SETALL and an exit's undo: the waits for zero on each
+        // semaphore that is 0, then each semaphore's changes in order.
+        let mut s = set(&[1, 0, 1]);
+        let zero = wait_for(&mut s, vec![op(0, 0, 0)], 1);
+        let down = wait_for(&mut s, vec![op(1, -1, 0)], 2);
+        let other = wait_for(&mut s, vec![op(2, 0, 0)], 3);
+        s.semaphores[0].value = 0;
+        s.semaphores[1].value = 1;
+        assert!(s.update(None, false, 7));
+        assert_eq!(zero.status.load(Ordering::SeqCst), 0);
+        assert_eq!(down.status.load(Ordering::SeqCst), 0);
+        assert_eq!(other.status.load(Ordering::SeqCst), WAITING);
+        assert_eq!((values(&s), s.otime), (vec![0, 0, 1], 7));
+        // With nothing done, SETVAL and SETALL leave sem_otime as it was.
+        assert!(!s.update(None, false, 8));
+        assert_eq!(s.otime, 7);
+    }
+
+    #[test]
     fn removal_tells_every_wait() {
         let mut s = set(&[0]);
         let wake = wait_for(&mut s, vec![op(0, -1, 0)], 1);

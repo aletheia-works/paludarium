@@ -25,6 +25,8 @@ pub(crate) enum Stop {
     GeneralProtection,
     ArithmeticFault,
     FloatingPointFault(u8),
+    /// An unmasked x87 exception found pending: the `si_code` Linux gives.
+    MathFault(u8),
     /// `syscall` executed; the state already points past it.
     Syscall,
 }
@@ -1298,6 +1300,20 @@ impl Exec<'_> {
         });
         let register = register.unwrap_or(0);
         let mut unit = self.s.x87;
+        // All but these wait, and fault first where an unmasked exception is
+        // pending, as on Intel's and AMD's CPUs. `FLDCW` waits. `FXSAVE`, which
+        // does not wait either, never comes here: it is dispatched on its own,
+        // before the x87 instructions.
+        let waits = !matches!(
+            m,
+            M::Fninit | M::Fnclex | M::Fnstcw | M::Fnstsw | M::Fnstenv | M::Fldenv | M::Fnsave
+        );
+        if waits && let Some(code) = unit.pending() {
+            return Err(Stop::MathFault(code));
+        }
+        let before = unit;
+        let to_memory =
+            memory.is_some() && matches!(m, M::Fst | M::Fstp | M::Fist | M::Fistp | M::Fbstp);
         match (m, memory) {
             (M::Fld, Some(memory)) => match memory.size {
                 4 => unit.load_float(F32, self.load(self.linear(&memory), 4)?),
@@ -1314,17 +1330,23 @@ impl Exec<'_> {
                 match memory.size {
                     4 => {
                         let bits = unit.store_float(F32);
-                        self.store(self.linear(&memory), 4, bits)?;
+                        if unit.may_store(&before) {
+                            self.store(self.linear(&memory), 4, bits)?;
+                        }
                     }
                     8 => {
                         let bits = unit.store_float(F64);
-                        self.store(self.linear(&memory), 8, bits)?;
+                        if unit.may_store(&before) {
+                            self.store(self.linear(&memory), 8, bits)?;
+                        }
                     }
                     10 => {
                         let value = unit.store_extended();
-                        let at = self.linear(&memory);
-                        self.mem.check_write(at, 10)?;
-                        self.mem.write(at, &value.to_le_bytes()[..10])?;
+                        if unit.may_store(&before) {
+                            let at = self.linear(&memory);
+                            self.mem.check_write(at, 10)?;
+                            self.mem.write(at, &value.to_le_bytes()[..10])?;
+                        }
                     }
                     _ => return Err(Stop::Invalid),
                 }
@@ -1340,7 +1362,9 @@ impl Exec<'_> {
             }
             (M::Fist | M::Fistp, Some(memory)) => {
                 let bits = unit.store_integer(u32::from(memory.size) * 8);
-                self.store(self.linear(&memory), memory.size, bits)?;
+                if unit.may_store(&before) {
+                    self.store(self.linear(&memory), memory.size, bits)?;
+                }
                 if m == M::Fistp {
                     unit.pop();
                 }
@@ -1484,6 +1508,10 @@ impl Exec<'_> {
             (M::Fldl2e, None) => unit.load_constant(LOG2_E),
             (M::Fldl2t, None) => unit.load_constant(LOG2_10),
             (M::Ffree, None) => unit.free(register),
+            (M::Ffreep, None) => {
+                unit.free(register);
+                unit.pop();
+            }
             (M::Fincstp, None) => unit.increment_top(),
             (M::Fdecstp, None) => unit.decrement_top(),
             (M::Fnop | M::Wait, None) => {}
@@ -1540,13 +1568,16 @@ impl Exec<'_> {
             }
             (M::Fbstp, Some(memory)) if memory.size == 10 => {
                 let image = unit.store_decimal();
-                let at = self.linear(&memory);
-                self.mem.check_write(at, 10)?;
-                self.mem.write(at, &image)?;
+                if unit.may_store(&before) {
+                    let at = self.linear(&memory);
+                    self.mem.check_write(at, 10)?;
+                    self.mem.write(at, &image)?;
+                }
                 unit.pop();
             }
             _ => return Err(Stop::Invalid),
         }
+        unit.settle(&before, to_memory, m == M::Fld && memory.is_some());
         self.s.x87 = unit;
         Ok(())
     }
@@ -2341,6 +2372,7 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
         | Mnemonic::Fcmovnu
         | Mnemonic::Fnop
         | Mnemonic::Ffree
+        | Mnemonic::Ffreep
         | Mnemonic::Fincstp
         | Mnemonic::Fdecstp
         | Mnemonic::Fnstcw

@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <poll.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -387,7 +389,7 @@ static void show(int fd, const char *label) {
                 memcpy(&error, body, 4);
                 printf(" done=%d", error);
                 if (h->flags & 0x200) attrs = 4;
-            } else if (h->type == RTM_NEWNSID) {
+            } else if (h->type == RTM_NEWNSID || h->type == RTM_DELNSID) {
                 attrs = 4;
             } else if (h->type == 20 || h->type == 21) {
                 attrs = 8;
@@ -401,7 +403,7 @@ static void show(int fd, const char *label) {
                 if (h->type == 2 || h->type == 3) {
                     if (atype == 1) printf(" msg=\"%.*s\"", alen - 5, value);
                     if (atype == 2) printf(" offset=%u", *(unsigned *)value);
-                } else if (h->type == RTM_NEWNSID) {
+                } else if (h->type == RTM_NEWNSID || h->type == RTM_DELNSID) {
                     printf(" nsa%u=%d", atype, *(int *)value);
                 } else if (atype == 2 /* IFA_LOCAL */ && alen == 8) {
                     printf(" local=%u.%u.%u.%u", value[0], value[1], value[2], value[3]);
@@ -662,6 +664,129 @@ static void listen_case(void) {
     peer_stop(&p);
 }
 
+/* Waits up to 10 s for `fd` to have something, as Linux tells of a
+   namespace that went from a work queue, a little later. */
+static void await(int fd, const char *label) {
+    struct pollfd pfd = {fd, POLLIN, 0};
+    printf("%s: ready=%d\n", label, poll(&pfd, 1, 10000));
+}
+
+static void gone_case(void) {
+    int ctl = acked_socket(), mon = bound_socket();
+    int group = RTNLGRP_NSID;
+    printf("join=%ld\n", result(setsockopt(mon, SOL_NETLINK_, ADD_MEMBERSHIP, &group, sizeof group)));
+    int self_fd = open("/proc/self/ns/net", O_RDONLY);
+    struct request r;
+    begin(&r, RTM_NEWNSID, 0x5, 1);
+    put32(&r, NETNSA_NSID, 2);
+    put32(&r, NETNSA_FD, self_fd);
+    send_request(ctl, &r);
+    struct peer p = peer_start(), q = peer_start();
+    begin(&r, RTM_NEWNSID, 0x5, 2);
+    put32(&r, NETNSA_NSID, 4);
+    put32(&r, NETNSA_PID, p.pid);
+    send_request(ctl, &r);
+    begin(&r, RTM_NEWNSID, 0x5, 3);
+    put32(&r, NETNSA_NSID, 7);
+    put32(&r, NETNSA_PID, q.pid);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    show(mon, "mon");
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/ns/net", q.pid);
+    int q_fd = open(path, O_RDONLY);
+    printf("-- the first peer goes\n");
+    peer_stop(&p);
+    await(mon, "mon");
+    show(mon, "mon");
+    begin(&r, RTM_GETNSID, 0x301, 4);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    printf("-- the second goes, but a descriptor holds it\n");
+    peer_stop(&q);
+    struct pollfd pfd = {mon, POLLIN, 0};
+    printf("held: ready=%d\n", poll(&pfd, 1, 500));
+    close(q_fd);
+    await(mon, "mon");
+    show(mon, "mon");
+    printf("-- the IDs are free again\n");
+    struct peer n = peer_start();
+    begin(&r, RTM_NEWNSID, 0x5, 5);
+    put32(&r, NETNSA_NSID, 4);
+    put32(&r, NETNSA_PID, n.pid);
+    send_request(ctl, &r);
+    begin(&r, RTM_GETNSID, 0x1, 6);
+    put32(&r, NETNSA_PID, n.pid);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    show(mon, "mon");
+    begin(&r, RTM_GETNSID, 0x301, 7);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    peer_stop(&n);
+    await(mon, "mon");
+    show(mon, "mon");
+}
+
+static void write_case(void) {
+    struct peer p = peer_start();
+    int ctl = acked_socket(), mon = bound_socket();
+    int group = RTNLGRP_NSID;
+    setsockopt(mon, SOL_NETLINK_, ADD_MEMBERSHIP, &group, sizeof group);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/ns/net", p.pid);
+    int peer_fd = open(path, O_RDONLY);
+    struct request r;
+    printf("-- write\n");
+    begin(&r, RTM_NEWNSID, 0x5, 1);
+    put32(&r, NETNSA_NSID, 3);
+    put32(&r, NETNSA_PID, p.pid);
+    printf("write=%d\n", write(ctl, &r, r.h.len) == r.h.len);
+    begin(&r, RTM_GETNSID, 0x1, 2);
+    put32(&r, NETNSA_FD, peer_fd);
+    printf("write=%d\n", write(ctl, &r, r.h.len) == r.h.len);
+    begin(&r, RTM_GETNSID, 0x1, 3);
+    put32(&r, NETNSA_PID, 999999);
+    printf("write=%d\n", write(ctl, &r, r.h.len) == r.h.len);
+    begin(&r, RTM_GETNSID, 0x1, 4);
+    put32(&r, NETNSA_FD, 9999);
+    printf("write=%d\n", write(ctl, &r, r.h.len) == r.h.len);
+    show(ctl, "ctl");
+    show(mon, "mon");
+    printf("-- writev\n");
+    begin(&r, RTM_GETNSID, 0x1, 5);
+    put32(&r, NETNSA_PID, p.pid);
+    struct iovec parts[2] = {{&r, 16}, {(char *)&r + 16, r.h.len - 16}};
+    printf("writev=%d\n", writev(ctl, parts, 2) == r.h.len);
+    show(ctl, "ctl");
+    printf("-- a writer without CAP_NET_ADMIN, on root's socket\n");
+    fflush(stdout);
+    pid_t user = fork();
+    if (user == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        begin(&r, RTM_GETNSID, 0x1, 6);
+        put32(&r, NETNSA_PID, p.pid);
+        put32(&r, NETNSA_TARGET_NSID, 3);
+        write(ctl, &r, r.h.len);
+        begin(&r, RTM_GETNSID, 0x1, 7);
+        put32(&r, NETNSA_PID, p.pid);
+        write(ctl, &r, r.h.len);
+        show(ctl, "user");
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(user, &status, 0);
+    printf("user status=%#x\n", status);
+    begin(&r, RTM_GETNSID, 0x1, 8);
+    put32(&r, NETNSA_PID, p.pid);
+    put32(&r, NETNSA_TARGET_NSID, 3);
+    write(ctl, &r, r.h.len);
+    show(ctl, "ctl");
+    close(peer_fd);
+    peer_stop(&p);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -674,6 +799,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(mode, "netlink-no-enobufs")) no_enobufs_case();
         else if (!strcmp(mode, "netlink-nsid")) nsid_case();
         else if (!strcmp(mode, "netlink-listen-all-nsid")) listen_case();
+        else if (!strcmp(mode, "netlink-nsid-gone")) gone_case();
+        else if (!strcmp(mode, "netlink-nsid-write")) write_case();
         else return 2;
         fflush(stdout);
         _exit(0);

@@ -2,9 +2,15 @@
 //! `hashtab.c` have them: `BPF_MAP_CREATE` of `BPF_MAP_TYPE_ARRAY` and
 //! `BPF_MAP_TYPE_HASH`, their elements (`LOOKUP`, `UPDATE`, `DELETE`,
 //! `GET_NEXT_KEY`, `LOOKUP_AND_DELETE`), `BPF_MAP_FREEZE`, the batch
-//! commands, `BPF_OBJ_GET_INFO_BY_FD` and the descriptor's fdinfo, with
-//! the checks every command makes first (`bpf_check_uarg_tail_zero`,
-//! `CHECK_ATTR`) and `kernel.unprivileged_bpf_disabled` at Linux's default 2.
+//! commands, `BPF_OBJ_GET_INFO_BY_FD`, the map IDs (`BPF_MAP_GET_NEXT_ID`,
+//! `BPF_MAP_GET_FD_BY_ID`) and the descriptor's fdinfo, with the checks
+//! every command makes first (`bpf_check_uarg_tail_zero`, `CHECK_ATTR`)
+//! and `kernel.unprivileged_bpf_disabled` at Linux's default 2.
+//!
+//! The memory a map takes (fdinfo's `memlock`, and the `ENOMEM` of one
+//! larger than the machine's memory) is counted as Linux 7.0, the kernel
+//! the x86-64 test machines run, lays out its structures on x86-64; Linux
+//! master's hash elements are smaller.
 //!
 //! A command Linux has that is not here (programs, BTF, links, pins and the
 //! rest) is `ENOSYS`; one Linux does not have is `EINVAL`, as there. Map
@@ -14,8 +20,8 @@ use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr, PAGE_SIZE};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 /// `sizeof(union bpf_attr)` in Linux master.
 const ATTR_SIZE: usize = 168;
@@ -26,7 +32,9 @@ const UNPRIVILEGED_DISABLED: i32 = 2;
 const CAP_SYS_ADMIN: u64 = 1 << 21;
 const CAP_BPF: u64 = 1 << 39;
 const E2BIG: Errno = Errno(7);
+const ENOMEM: Errno = Errno(12);
 const EBUSY: Errno = Errno(16);
+const ENOSPC: Errno = Errno(28);
 const EBADFD: Errno = Errno(77);
 /// The kernel's own `ENOTSUPP`, which reaches user space as it is.
 const ENOTSUPP: Errno = Errno(524);
@@ -40,6 +48,8 @@ mod cmd {
     pub const MAP_UPDATE_ELEM: u32 = 2;
     pub const MAP_DELETE_ELEM: u32 = 3;
     pub const MAP_GET_NEXT_KEY: u32 = 4;
+    pub const MAP_GET_NEXT_ID: u32 = 12;
+    pub const MAP_GET_FD_BY_ID: u32 = 14;
     pub const OBJ_GET_INFO_BY_FD: u32 = 15;
     pub const MAP_LOOKUP_AND_DELETE_ELEM: u32 = 21;
     pub const MAP_FREEZE: u32 = 22;
@@ -124,11 +134,73 @@ pub(crate) struct Map {
     flags: u32,
     name: [u8; 16],
     id: u32,
+    /// The table that holds the ID, which gives it back when the map goes.
+    ids: Arc<Ids>,
+    /// `num_possible_cpus()`, which a hash's spare elements count.
+    cpus: u64,
     frozen: AtomicBool,
     elements: Mutex<Elements>,
 }
 
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// The machine's maps by ID: Linux's `map_idr`.
+#[derive(Default)]
+pub(crate) struct Ids {
+    table: Mutex<IdTable>,
+}
+
+#[derive(Default)]
+struct IdTable {
+    /// Where the next search starts (`idr_next`).
+    next: u32,
+    maps: BTreeMap<u32, Weak<Map>>,
+}
+
+/// The IDs `bpf_map_alloc_id` hands out: 1 up to `INT_MAX`, less 1.
+const LAST_ID: u32 = i32::MAX as u32 - 1;
+
+impl Ids {
+    /// `bpf_map_alloc_id`: `idr_alloc_cyclic` from 1 to `INT_MAX`, the
+    /// first free ID from where the last search ended, around to 1
+    /// (`ENOSPC` with none free); the map made with it is published.
+    fn publish(self: &Arc<Self>, make: impl FnOnce(u32) -> Map) -> Result<Arc<Map>, Errno> {
+        let mut table = lock(&self.table);
+        // Past the last ID the search starts again at 1.
+        let start = table.next.max(1);
+        let id = (start..=LAST_ID)
+            .chain(1..start)
+            .find(|id| !table.maps.contains_key(id))
+            .ok_or(ENOSPC)?;
+        let map = Arc::new(make(id));
+        table.maps.insert(id, Arc::downgrade(&map));
+        table.next = id + 1;
+        Ok(map)
+    }
+
+    /// `idr_get_next`: the first ID from `id` on.
+    fn next_from(&self, id: u32) -> Option<u32> {
+        lock(&self.table).maps.range(id..).next().map(|(&id, _)| id)
+    }
+
+    /// `idr_find` and `__bpf_map_inc_not_zero`: the map of `id`, while it
+    /// is there.
+    fn find(&self, id: u32) -> Option<Arc<Map>> {
+        lock(&self.table).maps.get(&id).and_then(Weak::upgrade)
+    }
+}
+
+impl Drop for Map {
+    /// `bpf_map_free_id`, as the last reference goes.
+    fn drop(&mut self) {
+        let mut table = lock(&self.ids.table);
+        if table
+            .maps
+            .get(&self.id)
+            .is_some_and(|map| map.strong_count() == 0)
+        {
+            table.maps.remove(&self.id);
+        }
+    }
+}
 
 /// The open file: Linux's `bpf-map`.
 pub(crate) struct MapFile {
@@ -182,6 +254,8 @@ fn dispatch(c: &mut Context<'_>, command: u32, at: u64, size: u32) -> Result<u64
         | cmd::MAP_LOOKUP_AND_DELETE_BATCH
         | cmd::MAP_UPDATE_BATCH
         | cmd::MAP_DELETE_BATCH => batch(c, &attr, at, command),
+        cmd::MAP_GET_NEXT_ID => next_id(c, &attr, at),
+        cmd::MAP_GET_FD_BY_ID => fd_by_id(c, &attr),
         cmd::OBJ_GET_INFO_BY_FD => info(c, &attr, at),
         command if command < cmd::MAX => Err(Errno::ENOSYS),
         _ => Err(Errno::EINVAL),
@@ -324,6 +398,16 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     if kind == TYPE_ARRAY && !bypass_spec && max_entries.checked_next_power_of_two().is_none() {
         return Err(E2BIG);
     }
+    let cpus = c.host.cpu_count().clamp(1, 8192) as u64;
+    allocate(
+        kind,
+        value_size,
+        key_size,
+        max_entries,
+        flags,
+        bypass_spec,
+        cpus,
+    )?;
     let name = name(&attr[28..44])?;
     if btf_key != 0 || btf_value != 0 || btf_vmlinux_value != 0 {
         // No file is BTF.
@@ -340,32 +424,170 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     } else if excl_hash_size != 0 {
         return Err(Errno::EINVAL);
     }
-    // bpf_get_file_flag.
-    let access = match (flags & flag::RDONLY != 0, flags & flag::WRONLY != 0) {
-        (true, true) => return Err(Errno::EINVAL),
-        (true, false) => O_RDONLY,
-        (false, true) => O_WRONLY,
-        (false, false) => O_RDWR,
-    };
-    let map = Arc::new(Map {
+    let access = file_access(flags)?;
+    let ids = &c.processes.bpf_maps;
+    let map = ids.publish(|id| Map {
         kind,
         key_size,
         value_size,
         max_entries,
         flags,
         name,
-        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        id,
+        ids: Arc::clone(ids),
+        cpus,
         frozen: AtomicBool::new(false),
         elements: Mutex::new(if kind == TYPE_ARRAY {
             Elements::Array(BTreeMap::new())
         } else {
             Elements::Hash(BTreeMap::new())
         }),
-    });
-    // `bpf_map_new_fd` opens it close-on-exec.
+    })?;
+    new_fd(c, map, access)
+}
+
+/// `bpf_map_new_fd`: a descriptor of the map, close-on-exec.
+fn new_fd(c: &mut Context<'_>, map: Arc<Map>, access: u32) -> Result<u64, Errno> {
     c.files
         .install(Arc::new(MapFile { map, access }), true, c.group.nofile())
         .map(u64::from)
+}
+
+/// `sizeof(struct bpf_array)` before the values, as the test machines'
+/// Linux 7.0 (Ubuntu's) has it on x86-64: 8 bytes more than upstream
+/// v7.0's 304, whose `struct bpf_map` is 288 bytes, in the size the native
+/// runs give.
+const ARRAY_HEADER: u64 = 312;
+/// Linux 7.0's `sizeof(struct bpf_htab)`, `sizeof(struct htab_elem)`
+/// before the key, and `sizeof(struct bucket)`, on x86-64.
+const HASH_HEADER: u64 = 896;
+const HASH_ELEMENT: u64 = 48;
+const BUCKET: u64 = 16;
+/// `sizeof(struct llist_node)` and `sizeof(struct htab_elem *)`.
+const POINTER: u64 = 8;
+/// `totalram_pages()`: the memory `sysinfo` reports, in pages.
+const RAM_PAGES: u64 = crate::syscalls::SYSINFO_RAM / PAGE_SIZE;
+
+/// `bpf_map_area_alloc`: `vmalloc` takes no more pages than the machine
+/// has (`ENOMEM`). The memory is not taken here until it is written.
+fn area(size: u64) -> Result<(), Errno> {
+    if size / PAGE_SIZE > RAM_PAGES {
+        Err(ENOMEM)
+    } else {
+        Ok(())
+    }
+}
+
+/// `round_up(size, 8)`, the room a key or value takes.
+fn round8(size: u32) -> u64 {
+    u64::from(size).next_multiple_of(8)
+}
+
+/// A hash's buckets: `roundup_pow_of_two(max_entries)`.
+fn buckets(max_entries: u32) -> u64 {
+    u64::from(max_entries).next_power_of_two()
+}
+
+/// `htab->elem_size`.
+fn hash_element(key_size: u32, value_size: u32) -> u64 {
+    HASH_ELEMENT + round8(key_size) + round8(value_size)
+}
+
+/// An array's header and values, as `array_map_alloc` sizes them and
+/// `array_map_mem_usage` counts them: a mappable one page-aligned.
+fn array_size(entries: u64, value_size: u32, flags: u32) -> u64 {
+    let values = entries * round8(value_size);
+    if flags & flag::MMAPABLE != 0 {
+        ARRAY_HEADER.next_multiple_of(PAGE_SIZE) + values.next_multiple_of(PAGE_SIZE)
+    } else {
+        ARRAY_HEADER + values
+    }
+}
+
+/// The map type's `map_alloc`, for what it takes from the machine's memory:
+/// an array all its values (rounded up to a power of two of them without
+/// `bpf_bypass_spec_v1`), a hash its buckets (more than 2^31 entries, or
+/// buckets past `U32_MAX` bytes, `E2BIG`) and, preallocated, every element
+/// and one spare a CPU.
+fn allocate(
+    kind: u32,
+    value_size: u32,
+    key_size: u32,
+    max_entries: u32,
+    flags: u32,
+    bypass_spec: bool,
+    cpus: u64,
+) -> Result<(), Errno> {
+    if kind == TYPE_ARRAY {
+        let entries = if bypass_spec {
+            u64::from(max_entries)
+        } else {
+            buckets(max_entries)
+        };
+        return area(array_size(entries, value_size, flags));
+    }
+    if max_entries > 1 << 31 {
+        return Err(E2BIG);
+    }
+    let buckets = buckets(max_entries);
+    if buckets > u64::from(u32::MAX) / BUCKET {
+        return Err(E2BIG);
+    }
+    area(buckets * BUCKET)?;
+    if flags & flag::NO_PREALLOC == 0 {
+        area(hash_element(key_size, value_size) * (u64::from(max_entries) + cpus))?;
+    }
+    Ok(())
+}
+
+/// `BPF_MAP_GET_NEXT_ID`: the first map ID past `start_id`
+/// (`bpf_obj_get_next_id`), for `CAP_SYS_ADMIN` alone.
+fn next_id(c: &mut Context<'_>, attr: &[u8], at: u64) -> Result<u64, Errno> {
+    let start = half(attr, 0);
+    // BPF_OBJ_GET_NEXT_ID_LAST_FIELD is next_id.
+    check_attr(attr, 8)?;
+    if start >= i32::MAX as u32 {
+        return Err(Errno::EINVAL);
+    }
+    if !c.process.credentials.capable(CAP_SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let next = c
+        .processes
+        .bpf_maps
+        .next_from(start + 1)
+        .ok_or(Errno::ENOENT)?;
+    write(c, at.wrapping_add(4), &next.to_le_bytes())?;
+    Ok(0)
+}
+
+/// `BPF_MAP_GET_FD_BY_ID`: a new descriptor of the map with `map_id`, open
+/// as `open_flags` asks (`bpf_map_get_fd_by_id`), for `CAP_SYS_ADMIN`
+/// alone.
+fn fd_by_id(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
+    let (id, open_flags) = (half(attr, 0), half(attr, 8));
+    // BPF_MAP_GET_FD_BY_ID_LAST_FIELD is open_flags.
+    check_attr(attr, 12)?;
+    if open_flags & !(flag::RDONLY | flag::WRONLY) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if !c.process.credentials.capable(CAP_SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let access = file_access(open_flags)?;
+    let map = c.processes.bpf_maps.find(id).ok_or(Errno::ENOENT)?;
+    new_fd(c, map, access)
+}
+
+/// `bpf_get_file_flag`: the access `BPF_F_RDONLY` and `BPF_F_WRONLY` ask
+/// for, not both (`EINVAL`).
+fn file_access(flags: u32) -> Result<u32, Errno> {
+    match (flags & flag::RDONLY != 0, flags & flag::WRONLY != 0) {
+        (true, true) => Err(Errno::EINVAL),
+        (true, false) => Ok(O_RDONLY),
+        (false, true) => Ok(O_WRONLY),
+        (false, false) => Ok(O_RDWR),
+    }
 }
 
 /// `__bpf_map_get`: `EBADF` for no descriptor, `EINVAL` for one that is
@@ -529,14 +751,24 @@ impl Map {
             }
         }
     }
-    /// The memory Linux charges it, as `bpf_map_memory_usage` counts it
-    /// without the kernel's own structures.
+    /// The memory it takes, as `bpf_map_memory_usage` counts it: an array's
+    /// header and values, a hash's header, buckets and elements, all of
+    /// them and one spare a CPU with a pointer to it when preallocated, or
+    /// those it holds with a list node each when not.
     fn memory(&self) -> u64 {
-        let elem = u64::from(self.value_size).next_multiple_of(8);
-        match self.kind {
-            TYPE_ARRAY => u64::from(self.max_entries).saturating_mul(elem),
-            _ => u64::from(self.max_entries)
-                .saturating_mul(u64::from(self.key_size).next_multiple_of(8) + elem),
+        if self.kind == TYPE_ARRAY {
+            return array_size(u64::from(self.max_entries), self.value_size, self.flags);
+        }
+        let element = hash_element(self.key_size, self.value_size);
+        let table = HASH_HEADER + BUCKET * buckets(self.max_entries);
+        if self.flags & flag::NO_PREALLOC == 0 {
+            table + element * (u64::from(self.max_entries) + self.cpus) + POINTER * self.cpus
+        } else {
+            let held = match &*self.elements() {
+                Elements::Hash(elements) => elements.len() as u64,
+                Elements::Array(_) => 0,
+            };
+            table + (element + POINTER) * held
         }
     }
 }
@@ -989,14 +1221,27 @@ mod tests {
     use super::*;
 
     fn map(kind: u32, max_entries: u32) -> Map {
+        shaped(kind, max_entries, 8, 0, &Arc::default(), 1)
+    }
+
+    fn shaped(
+        kind: u32,
+        max_entries: u32,
+        value_size: u32,
+        flags: u32,
+        ids: &Arc<Ids>,
+        id: u32,
+    ) -> Map {
         Map {
             kind,
             key_size: 4,
-            value_size: 8,
+            value_size,
             max_entries,
-            flags: 0,
+            flags,
             name: [0; 16],
-            id: 1,
+            id,
+            ids: Arc::clone(ids),
+            cpus: 2,
             frozen: AtomicBool::new(false),
             elements: Mutex::new(if kind == TYPE_ARRAY {
                 Elements::Array(BTreeMap::new())
@@ -1053,6 +1298,77 @@ mod tests {
         assert_eq!(m.next(Some(&k(2))), Err(Errno::ENOENT));
         assert_eq!(m.remove(&k(1)), Ok(vec![1; 8]));
         assert_eq!(m.remove(&k(1)), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn ids_go_round_from_where_the_last_ended_and_come_back_as_maps_go() {
+        let ids = Arc::new(Ids::default());
+        let make = |id| shaped(TYPE_ARRAY, 1, 8, 0, &ids, id);
+        let first = ids.publish(make).unwrap();
+        let second = ids.publish(make).unwrap();
+        assert_eq!((first.id, second.id), (1, 2));
+        assert_eq!(ids.next_from(0), Some(1));
+        assert_eq!(ids.next_from(2), Some(2));
+        assert_eq!(ids.next_from(3), None);
+        drop(first);
+        assert!(ids.find(1).is_none());
+        assert_eq!(ids.next_from(0), Some(2));
+        // An ID is not taken again until they have gone round.
+        assert_eq!(ids.publish(make).unwrap().id, 3);
+        lock(&ids.table).next = LAST_ID;
+        let last = ids.publish(make).unwrap();
+        assert_eq!(last.id, LAST_ID);
+        // The last one freed is not taken again before the others.
+        drop(last);
+        assert_eq!(ids.publish(make).unwrap().id, 1);
+        assert!(Arc::ptr_eq(&ids.find(2).unwrap(), &second));
+    }
+
+    #[test]
+    fn memory_is_what_linux_7_0_counts_on_x86_64() {
+        let ids = Arc::default();
+        let array = |entries, value, flags| shaped(TYPE_ARRAY, entries, value, flags, &ids, 1);
+        assert_eq!(array(1, 8, 0).memory(), 320);
+        assert_eq!(array(10, 3, 0).memory(), 312 + 80);
+        assert_eq!(array(10, 24, flag::MMAPABLE).memory(), 8192);
+        let hash = |entries, flags| shaped(TYPE_HASH, entries, 8, flags, &ids, 1);
+        // 3 entries take 4 buckets; elements are 48 + 8 + 8 bytes.
+        assert_eq!(hash(3, 0).memory(), 896 + 64 + 64 * 5 + 16);
+        let sparse = hash(3, flag::NO_PREALLOC);
+        assert_eq!(sparse.memory(), 896 + 64);
+        sparse.set(&1u32.to_le_bytes(), vec![0; 8], 0).unwrap();
+        assert_eq!(sparse.memory(), 896 + 64 + 72);
+    }
+
+    #[test]
+    fn maps_larger_than_the_machine_are_enomem() {
+        assert_eq!(
+            allocate(TYPE_ARRAY, 1 << 30, 4, 1 << 20, 0, true, 2),
+            Err(ENOMEM)
+        );
+        assert_eq!(allocate(TYPE_ARRAY, 8, 4, 1 << 20, 0, true, 2), Ok(()));
+        // Without bypass_spec_v1 the entries are rounded up first.
+        assert_eq!(
+            allocate(TYPE_ARRAY, 1 << 10, 4, (1 << 22) + 1, 0, true, 2),
+            Ok(())
+        );
+        assert_eq!(
+            allocate(TYPE_ARRAY, 1 << 10, 4, (1 << 22) + 1, 0, false, 2),
+            Err(ENOMEM)
+        );
+        assert_eq!(
+            allocate(TYPE_HASH, 1 << 21, 4, 1 << 20, 0, true, 2),
+            Err(ENOMEM)
+        );
+        assert_eq!(
+            allocate(TYPE_HASH, 1 << 21, 4, 1 << 20, flag::NO_PREALLOC, true, 2),
+            Ok(())
+        );
+        assert_eq!(
+            allocate(TYPE_HASH, 8, 4, (1 << 27) + 1, 0, true, 2),
+            Err(E2BIG)
+        );
+        assert_eq!(allocate(TYPE_HASH, 8, 4, u32::MAX, 0, true, 2), Err(E2BIG));
     }
 
     #[test]

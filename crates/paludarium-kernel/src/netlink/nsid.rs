@@ -6,10 +6,11 @@
 //! notifications of each peer its namespace has an ID for, with that ID in
 //! a control message, as `do_one_broadcast` sends them.
 //!
-//! An ID goes when its peer does, but no `RTM_DELNSID` tells of it; only
-//! the first ID of each peer is given, by a request, never on its own as
-//! Linux's `peernet2id_alloc` does for devices in other namespaces, of
-//! which there are none here.
+//! An ID goes when its peer does, and `RTNLGRP_NSID` hears of it with
+//! `RTM_DELNSID`, as `unhash_nsid` tells it. Only the first ID of each
+//! peer is given, by a request, never on its own as Linux's
+//! `peernet2id_alloc` does for devices in other namespaces, of which there
+//! are none here.
 use super::{
     Errno, Header, NLM_F_MULTI, Nla, Notice, Policy, attribute, extack, message, parse_policy,
 };
@@ -21,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 pub(super) const RTM_NEWNSID: u16 = 88;
+const RTM_DELNSID: u16 = 89;
 pub(super) const RTM_GETNSID: u16 = 90;
 /// The group that hears of new IDs.
 pub(super) const RTNLGRP_NSID: u32 = 28;
@@ -57,11 +59,10 @@ pub(crate) struct Ids {
     heard_by: Mutex<Vec<Weak<Network>>>,
 }
 impl Ids {
-    /// The IDs whose peers are still there; the others are forgotten.
+    /// The IDs, with those of peers that are going until their [`Drop`]
+    /// takes them, as Linux keeps them until `cleanup_net`.
     fn live(&self) -> MutexGuard<'_, BTreeMap<i32, Weak<Network>>> {
-        let mut ids = self.ids.lock().unwrap_or_else(PoisonError::into_inner);
-        ids.retain(|_, peer| peer.strong_count() > 0);
-        ids
+        self.ids.lock().unwrap_or_else(PoisonError::into_inner)
     }
     /// The ID of `peer` (`__peernet2id`), if it has one.
     pub(super) fn id_of(&self, peer: &Network) -> Option<i32> {
@@ -79,6 +80,42 @@ impl Ids {
         let mut all = self.heard_by.lock().unwrap_or_else(PoisonError::into_inner);
         all.retain(|network| network.strong_count() > 0);
         all.iter().filter_map(Weak::upgrade).collect()
+    }
+}
+
+impl Drop for Ids {
+    /// `unhash_nsid`: each namespace that has an ID for this one, which is
+    /// going, forgets it and tells `RTNLGRP_NSID` with `RTM_DELNSID`. Its
+    /// own IDs go with it, untold.
+    fn drop(&mut self) {
+        let heard_by = std::mem::take(
+            self.heard_by
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for peer in heard_by.iter().filter_map(Weak::upgrade) {
+            // This namespace is the one that is going; another going at the
+            // same time is told of here or by its own drop, once.
+            let gone: Vec<i32> = {
+                let mut ids = peer.netlink.ids.live();
+                let gone = ids
+                    .iter()
+                    .filter(|(_, p)| p.strong_count() == 0)
+                    .map(|(&id, _)| id)
+                    .collect();
+                ids.retain(|_, p| p.strong_count() > 0);
+                gone
+            };
+            let notices = gone
+                .into_iter()
+                .map(|id| Notice {
+                    group: RTNLGRP_NSID,
+                    origin: 0,
+                    bytes: fill(RTM_DELNSID, 0, 0, 0, id, None),
+                })
+                .collect();
+            super::notify(&peer, notices, None);
+        }
     }
 }
 
@@ -100,7 +137,7 @@ thread_local! {
         const { RefCell::new((Vec::new(), None)) };
 }
 /// What [`resolve`] found, until it is dropped.
-pub(super) struct Resolved;
+pub(crate) struct Resolved;
 impl Drop for Resolved {
     fn drop(&mut self) {
         RESOLVED.with(|r| *r.borrow_mut() = (Vec::new(), None));
@@ -110,8 +147,8 @@ impl Drop for Resolved {
 /// `RTM_NEWNSID` and `RTM_GETNSID` request of `bytes` names by
 /// `NETNSA_PID` (`get_net_ns_by_pid`) or `NETNSA_FD` (`get_net_ns_by_fd`),
 /// for the kernel to take as it reaches them; finding one changes nothing.
-/// A send without a caller (a `write`) finds none: `ESRCH` for a process,
-/// `EBADF` for a descriptor.
+/// A `write` finds them as its caller sees them too ([`super::resolving`]),
+/// as Linux looks in `current`'s.
 pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
     let mut found = Vec::new();
     let mut any = false;
@@ -245,15 +282,15 @@ fn named<'a>(tb: &[Option<&'a [u8]>; 6]) -> Option<(Found, &'a [u8])> {
         tb[usize::from(NETNSA_FD)].map(|value| (resolved(Reference::Fd(u32_of(value))), value))
     }
 }
-/// An `RTM_NEWNSID` message of `nsid`, and with `current` its
-/// `NETNSA_CURRENT_NSID` (`rtnl_net_fill`).
-fn fill(flags: u16, seq: u32, port: u32, nsid: i32, current: Option<i32>) -> Vec<u8> {
+/// `rtnl_net_fill`: a `kind` message with the ID `nsid`, and `current`
+/// as `NETNSA_CURRENT_NSID`.
+fn fill(kind: u16, flags: u16, seq: u32, port: u32, nsid: i32, current: Option<i32>) -> Vec<u8> {
     let mut payload = vec![0; 4];
     attribute(&mut payload, NETNSA_NSID, &nsid.to_le_bytes());
     if let Some(current) = current {
         attribute(&mut payload, NETNSA_CURRENT_NSID, &current.to_le_bytes());
     }
-    message(RTM_NEWNSID, flags, seq, port, &payload)
+    message(kind, flags, seq, port, &payload)
 }
 
 /// `RTM_NEWNSID`, as `rtnl_net_newid`: gives the peer `NETNSA_PID` or
@@ -328,7 +365,7 @@ pub(super) fn new_id(
     Ok(Notice {
         group: RTNLGRP_NSID,
         origin: if echo { port } else { 0 },
-        bytes: fill(0, header.seq, port, id, None),
+        bytes: fill(RTM_NEWNSID, 0, header.seq, port, id, None),
     })
 }
 
@@ -373,7 +410,7 @@ pub(super) fn get_id(
         None => (Arc::clone(network), None),
     };
     let nsid = target.netlink.ids.id_of(&peer).unwrap_or(NOT_ASSIGNED);
-    Ok(fill(0, header.seq, port, nsid, current))
+    Ok(fill(RTM_NEWNSID, 0, header.seq, port, nsid, current))
 }
 
 /// An `RTM_GETNSID` dump, as `rtnl_net_dumpid`: each ID and its peer, in
@@ -422,7 +459,7 @@ pub(super) fn dump(
                 peer.and_then(|peer| network.netlink.ids.id_of(&peer))
                     .unwrap_or(NOT_ASSIGNED)
             });
-            fill(NLM_F_MULTI, header.seq, port, id, current)
+            fill(RTM_NEWNSID, NLM_F_MULTI, header.seq, port, id, current)
         })
         .collect())
 }

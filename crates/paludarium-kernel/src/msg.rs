@@ -7,8 +7,10 @@
 //! the waits began, and a message sent then goes to the first of them that
 //! wants it, as Linux's `pipelined_send` hands it over, before it is
 //! queued: one whose buffer is too small is told `E2BIG` and the next is
-//! tried. A sender that finds the queue full waits until a receive, an
-//! `IPC_SET` or the queue's removal changes it, then checks again.
+//! tried. A sender that finds the queue full waits in its list of senders.
+//! A receive or an `IPC_SET` wakes those whose messages then fit, which
+//! check again, and moves the others behind them in their order, as Linux's
+//! `ss_wakeup`; the queue's removal wakes them all.
 use crate::ipc::{
     self, CAP_IPC_OWNER, CAP_SYS_ADMIN, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT, IPC_PRIVATE,
     IPC_RMID, IPC_SET, IPC_STAT, Perm,
@@ -194,11 +196,26 @@ struct Receiver {
     slot: Arc<Slot>,
 }
 
-/// What a waiting sender looks at: the queue changed, or it went.
+/// What wakes a waiting sender: room for its message, or the queue's
+/// removal.
 #[derive(Default)]
-struct Changes {
+struct Waker {
     token: WaitToken,
+    woken: AtomicBool,
     removed: AtomicBool,
+}
+
+impl Waker {
+    fn wake(&self) {
+        self.woken.store(true, Ordering::SeqCst);
+        self.token.notify();
+    }
+}
+
+/// A sender waiting for room in a queue (`struct msg_sender`).
+struct Sender {
+    size: u64,
+    waker: Arc<Waker>,
 }
 
 struct Queue {
@@ -215,7 +232,8 @@ struct Queue {
     lspid: KeptPid,
     lrpid: KeptPid,
     receivers: Vec<Receiver>,
-    changes: Arc<Changes>,
+    /// In the order Linux keeps `q_senders`.
+    senders: Vec<Sender>,
 }
 
 impl Queue {
@@ -245,13 +263,33 @@ impl Queue {
         }
         false
     }
-    /// Tells every waiting receiver `error` (`expunge_all`) and every
-    /// waiting sender to look again.
+    /// Wakes the waiting senders whose messages fit, which stay in the list
+    /// until they run, and moves the others behind them in their order, as
+    /// Linux's `ss_wakeup`; with `removed`, wakes them all to find the queue
+    /// gone.
+    fn wake_senders(&mut self, removed: bool) {
+        if removed {
+            for sender in self.senders.drain(..) {
+                sender.waker.removed.store(true, Ordering::SeqCst);
+                sender.waker.wake();
+            }
+            return;
+        }
+        let (fit, rest): (Vec<Sender>, Vec<Sender>) = std::mem::take(&mut self.senders)
+            .into_iter()
+            .partition(|sender| self.fits(sender.size));
+        for sender in &fit {
+            sender.waker.wake();
+        }
+        self.senders = fit.into_iter().chain(rest).collect();
+    }
+    /// Tells every waiting receiver `error` (`expunge_all`), then wakes the
+    /// waiting senders, all of them for the queue's removal (`EIDRM`).
     fn wake_all(&mut self, error: Errno) {
         for receiver in self.receivers.drain(..) {
             receiver.slot.give(Err(error));
         }
-        self.changes.token.notify();
+        self.wake_senders(error == EIDRM);
     }
 }
 
@@ -307,7 +345,7 @@ fn msgget(c: &Context<'_>, key: i32, flag: i32) -> Result<u64, Errno> {
             lspid: KeptPid::default(),
             lrpid: KeptPid::default(),
             receivers: Vec::new(),
-            changes: Arc::default(),
+            senders: Vec::new(),
         },
     );
     Ok(u64::from(id as u32))
@@ -336,16 +374,11 @@ fn msgsnd(c: &mut Context<'_>, id: i32, at: u64, size: u64, flag: i32) -> Result
     let message = Message { kind, text };
     let pid = c.pid_space().keep(c.process.pid);
     let queues = queues(c);
-    let changes = Arc::clone(&queues.lock().checked(id)?.changes);
     loop {
-        let ticket = changes.token.value();
         let owner = ipc::capable(c, CAP_IPC_OWNER);
         let now = ipc::now(c);
-        {
+        let waker = {
             let mut table = queues.lock();
-            if changes.removed.load(Ordering::SeqCst) {
-                return Err(EIDRM);
-            }
             let table = &mut *table;
             let queue = table.checked(id)?;
             if !queue.perm.permitted(&c.process.credentials, 0o222, owner) {
@@ -365,8 +398,31 @@ fn msgsnd(c: &mut Context<'_>, id: i32, at: u64, size: u64, flag: i32) -> Result
             if flag & IPC_NOWAIT != 0 {
                 return Err(Errno::EAGAIN);
             }
+            let waker = Arc::new(Waker::default());
+            queue.senders.push(Sender {
+                size,
+                waker: Arc::clone(&waker),
+            });
+            waker
+        };
+        let ticket = waker.token.value();
+        let waited = wait(c, &waker.token, ticket, &|| {
+            waker.woken.load(Ordering::SeqCst)
+        });
+        // As `do_msgsnd` after its sleep: the queue's removal first, then
+        // the sender leaves the list, then a signal ends the send.
+        {
+            let mut table = queues.lock();
+            if waker.removed.load(Ordering::SeqCst) {
+                return Err(EIDRM);
+            }
+            if let Ok(queue) = table.checked(id) {
+                queue
+                    .senders
+                    .retain(|sender| !Arc::ptr_eq(&sender.waker, &waker));
+            }
         }
-        wait(c, &changes.token, ticket, &|| false)?;
+        waited?;
     }
 }
 
@@ -435,7 +491,7 @@ fn msgrcv(
                 queue.bytes -= length;
                 queue.rtime = now;
                 queue.lrpid = pid.clone();
-                queue.changes.token.notify();
+                queue.wake_senders(false);
                 table.messages -= 1;
                 table.bytes -= length;
                 break message;
@@ -658,7 +714,6 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
             if let Some(mut queue) = table.queues.remove(&ipc::index(id)) {
                 table.messages -= queue.messages.len() as u64;
                 table.bytes -= queue.bytes;
-                queue.changes.removed.store(true, Ordering::SeqCst);
                 queue.wake_all(EIDRM);
             }
             Ok(0)
@@ -754,22 +809,26 @@ mod tests {
         assert_eq!(Search::of(-1, MSG_COPY).find(&queue), None);
     }
 
-    #[test]
-    fn a_message_goes_to_the_first_waiting_receiver_that_takes_it() {
-        let mut queue = Queue {
+    fn queue(qbytes: u64) -> Queue {
+        Queue {
             id: 0,
             perm: Perm::new(0, &crate::credentials::Credentials::default(), 0o600),
             stime: 0,
             rtime: 0,
             ctime: 0,
             bytes: 0,
-            qbytes: MSGMNB,
+            qbytes,
             messages: VecDeque::new(),
             lspid: KeptPid::default(),
             lrpid: KeptPid::default(),
             receivers: Vec::new(),
-            changes: Arc::default(),
-        };
+            senders: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_message_goes_to_the_first_waiting_receiver_that_takes_it() {
+        let mut queue = queue(MSGMNB);
         let mut wait = |search, most, pid| {
             let slot = Arc::new(Slot::default());
             queue.receivers.push(Receiver {
@@ -795,5 +854,59 @@ mod tests {
         assert!(!queue.hand_over(&message(3), 6));
         queue.wake_all(EIDRM);
         assert_eq!(other.take(), Some(Err(EIDRM)));
+    }
+
+    #[test]
+    fn a_change_wakes_the_senders_whose_messages_fit_and_moves_the_others_behind() {
+        let mut queue = queue(4);
+        queue.bytes = 3;
+        queue.messages.push_back(message(1));
+        let wakers: Vec<Arc<Waker>> = [2, 1, 3, 1]
+            .into_iter()
+            .map(|size| {
+                let waker = Arc::new(Waker::default());
+                queue.senders.push(Sender {
+                    size,
+                    waker: Arc::clone(&waker),
+                });
+                waker
+            })
+            .collect();
+        let woken = || -> Vec<bool> {
+            wakers
+                .iter()
+                .map(|waker| waker.woken.swap(false, Ordering::SeqCst))
+                .collect()
+        };
+        let order = |queue: &Queue| -> Vec<usize> {
+            queue
+                .senders
+                .iter()
+                .map(|sender| {
+                    wakers
+                        .iter()
+                        .position(|waker| Arc::ptr_eq(waker, &sender.waker))
+                        .unwrap_or(usize::MAX)
+                })
+                .collect()
+        };
+        queue.wake_senders(false);
+        assert_eq!(woken(), [false, true, false, true]);
+        // The woken stay until they run; the others follow, in their order.
+        assert_eq!(order(&queue), [1, 3, 0, 2]);
+        // A full queue wakes none, and keeps the order.
+        queue.bytes = 4;
+        queue.wake_all(Errno::EAGAIN);
+        assert_eq!(woken(), [false; 4]);
+        assert_eq!(order(&queue), [1, 3, 0, 2]);
+        // The removal wakes them all, to find the queue gone.
+        queue.wake_all(EIDRM);
+        assert_eq!(woken(), [true; 4]);
+        assert!(
+            wakers
+                .iter()
+                .all(|waker| waker.removed.load(Ordering::SeqCst))
+        );
+        assert!(queue.senders.is_empty());
     }
 }

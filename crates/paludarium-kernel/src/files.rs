@@ -7743,6 +7743,7 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
                 threads: c.group.active_threads(),
                 virtual_size: c.mem.mappings().map(|m| m.length).sum(),
                 rss_limit,
+                code: c.group.code(),
                 start_stack,
                 start_brk: c.mem.initial_break().0,
                 arguments,

@@ -88,6 +88,14 @@ impl Task {
     fn read(&self, at: u64, buf: &mut [u8]) -> bool {
         self.memory().is_some_and(|memory| memory.read(at, buf))
     }
+    /// Its program's code range, which a zombie no longer has.
+    fn code(&self) -> (u64, u64) {
+        if self.live() {
+            self.view.group.code()
+        } else {
+            (0, 0)
+        }
+    }
     fn start_stack(&self) -> u64 {
         if self.live() {
             self.view.group.start_stack()
@@ -244,7 +252,7 @@ pub(super) fn content(
     let (ignored, caught) = task.handled();
     Some(match entry {
         TaskEntry::Comm => crate::proc::render_comm(&public.name),
-        TaskEntry::Statm => crate::proc::render_statm(task.memory()),
+        TaskEntry::Statm => crate::proc::render_statm(task.memory(), task.code()),
         TaskEntry::Limits => crate::proc::render_limits(&task.view.limits),
         // What its exec saved, as Linux's `auxv_read`; nothing once its
         // memory is gone, when it no longer opens.
@@ -297,6 +305,7 @@ pub(super) fn content(
                 threads,
                 virtual_size,
                 rss_limit: task.view.rss_limit,
+                code: task.code(),
                 start_stack: task.start_stack(),
                 start_brk,
                 arguments,

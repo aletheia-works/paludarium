@@ -88,7 +88,7 @@ verified.
   and the rest. A path that goes on through a link of another process's `fd`
   (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
   directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
-  time and the code range are 0, as is the code in `statm`, so `ps` shows no `RSS`, and its `STIME` and
+  time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
   another process's state is taken from where its thread is (in a system

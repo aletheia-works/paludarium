@@ -480,6 +480,8 @@ pub(crate) struct ProcessStat<'a> {
     /// The total size of the mappings, in bytes.
     pub virtual_size: u64,
     pub rss_limit: u64,
+    /// `start_code` and `end_code`, the program's code; 0 without memory.
+    pub code: (u64, u64),
     pub start_stack: u64,
     pub start_brk: u64,
     /// `[arg_start, arg_end)` and `[env_start, env_end)`.
@@ -491,8 +493,8 @@ pub(crate) struct ProcessStat<'a> {
     pub caught: u64,
 }
 /// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it: 52 fields, and
-/// 0 for what nothing measures (page faults, resident memory, start time,
-/// the code range and the scheduler's figures).
+/// 0 for what nothing measures (page faults, resident memory, start time
+/// and the scheduler's figures).
 pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
     /// USER_HZ, the unit of the times, as on x86-64 Linux.
     const TICKS: u64 = 100;
@@ -523,8 +525,8 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         s.virtual_size.to_string(),
         "0".into(), // rss
         s.rss_limit.to_string(),
-        "0".into(), // startcode
-        "0".into(), // endcode
+        s.code.0.to_string(),
+        s.code.1.to_string(),
         s.start_stack.to_string(),
         "0".into(), // kstkesp
         "0".into(), // kstkeip
@@ -559,10 +561,10 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
 }
 /// `/proc/<pid>/statm`, as Linux's `proc_pid_statm` writes `task_statm`'s
 /// counts, in pages: the size of the mappings, the resident pages, those of
-/// them a file's or shared memory's, the program's code, 0, the private
-/// writable mappings and the stack (`data_vm` and `stack_vm`), and 0; all 0
-/// without memory, as a zombie's. The code is 0, as `stat`'s code range is.
-pub(crate) fn render_statm(memory: Option<&MemoryView>) -> Vec<u8> {
+/// them a file's or shared memory's, the pages of the program's `code`
+/// range, 0, the private writable mappings and the stack (`data_vm` and
+/// `stack_vm`), and 0; all 0 without memory, as a zombie's.
+pub(crate) fn render_statm(memory: Option<&MemoryView>, code: (u64, u64)) -> Vec<u8> {
     const PAGE: u64 = 4096;
     let Some(memory) = memory else {
         return b"0 0 0 0 0 0 0\n".to_vec();
@@ -582,7 +584,11 @@ pub(crate) fn render_statm(memory: Option<&MemoryView>) -> Vec<u8> {
         }
         next = vma.end;
     }
-    format!("{size} {resident} {shared} 0 0 {data} 0\n").into_bytes()
+    // As Linux's `task_statm`, in unsigned arithmetic:
+    // `PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)`, in pages.
+    let text =
+        (code.1.wrapping_add(PAGE - 1) & !(PAGE - 1)).wrapping_sub(code.0 & !(PAGE - 1)) / PAGE;
+    format!("{size} {resident} {shared} {text} 0 {data} 0\n").into_bytes()
 }
 /// `/proc/<pid>/limits`, as Linux's `proc_pid_limits` writes the soft and
 /// hard limits, from `RLIMIT_CPU` to `RLIMIT_RTTIME`.
@@ -1849,7 +1855,7 @@ mod tests {
     #[test]
     fn statm_counts_pages() {
         use paludarium_mmu::{AddressSpace, MappingKind};
-        assert_eq!(render_statm(None), b"0 0 0 0 0 0 0\n");
+        assert_eq!(render_statm(None, (0x1000, 0x2000)), b"0 0 0 0 0 0 0\n");
         let mut mem = AddressSpace::new();
         let at = mem
             .map(None, 3 * 4096, Prot::READ_WRITE, MappingKind::Anonymous)
@@ -1858,7 +1864,12 @@ mod tests {
             .unwrap();
         mem.write(at, &[1]).unwrap();
         mem.write(GuestAddr(at.0 + 4096), &[1]).unwrap();
-        assert_eq!(render_statm(Some(&mem.view())), b"4 2 0 0 0 3 0\n");
+        assert_eq!(render_statm(Some(&mem.view()), (0, 0)), b"4 2 0 0 0 3 0\n");
+        // The code's pages, from the page of its start to its end's.
+        assert_eq!(
+            render_statm(Some(&mem.view()), (0x40_1000, 0x40_5abc)),
+            b"4 2 0 5 0 3 0\n"
+        );
     }
     #[test]
     fn task_paths_are_other_processes_and_threads() {
@@ -2140,6 +2151,7 @@ mod generated_tests {
             threads: 2,
             virtual_size: 8192,
             rss_limit: u64::MAX,
+            code: (0x40_1000, 0x40_5abc),
             start_stack: 0x7fff_0000,
             start_brk: 0x60_0000,
             arguments: (10, 20),
@@ -2162,6 +2174,7 @@ mod generated_tests {
         assert_eq!(fields[13], "2");
         assert_eq!(&fields[15..18], ["23", "3", "2"]);
         assert_eq!(fields[22], "18446744073709551615");
+        assert_eq!(&fields[23..25], ["4198400", "4217532"]);
         assert_eq!(&fields[28..32], ["0", "512", "2048", "1"]);
         assert_eq!(fields[35], "17");
         assert_eq!(&fields[45..49], ["10", "20", "20", "30"]);

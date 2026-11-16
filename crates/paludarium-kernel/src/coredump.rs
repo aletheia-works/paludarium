@@ -68,6 +68,9 @@ pub(crate) struct Identity {
     /// The initial stack pointer, where argc, argv, envp and the
     /// auxiliary vector start.
     pub start_stack: u64,
+    /// The auxiliary vector its exec saved, which `NT_AUXV` holds (Linux's
+    /// `mm->saved_auxv`, whatever the program did to its stack).
+    pub auxv: Vec<u8>,
     /// The process's PID namespace, which numbers the IDs the core shows
     /// (Linux's `task_pid_vnr` of the dumping task).
     pub space: std::sync::Arc<crate::namespaces::Namespace>,
@@ -269,7 +272,7 @@ fn notes(dump: &Dump, who: &Identity, mem: &AddressSpace, files: &[u8]) -> Vec<V
         if index == 0 {
             notes.push(note(b"CORE", 3, &prpsinfo(who, thread, mem)));
             notes.push(note(b"CORE", 0x5349_4749, &dump.siginfo));
-            notes.push(note(b"CORE", 6, &auxv(who, mem)));
+            notes.push(note(b"CORE", 6, &who.auxv));
             notes.push(note(b"CORE", 0x4649_4c45, files));
         }
         notes.push(note(b"CORE", 2, &fpregset(&thread.cpu)));
@@ -487,33 +490,6 @@ fn files(mem: &AddressSpace, vmas: &[Mapping]) -> Vec<u8> {
         &names,
     ]
     .concat()
-}
-
-/// The auxiliary vector from the initial stack, up to and with `AT_NULL`.
-fn auxv(who: &Identity, mem: &AddressSpace) -> Vec<u8> {
-    let read = |at: u64| mem.read_u64(GuestAddr(at)).ok();
-    let mut at = who.start_stack;
-    let Some(count) = read(at) else {
-        return Vec::new();
-    };
-    at += 8 * (count + 2);
-    // envp ends at a NULL.
-    while let Some(pointer) = read(at) {
-        at += 8;
-        if pointer == 0 {
-            break;
-        }
-    }
-    let mut vector = Vec::new();
-    while let (Some(kind), Some(value)) = (read(at), read(at + 8)) {
-        vector.extend_from_slice(&kind.to_le_bytes());
-        vector.extend_from_slice(&value.to_le_bytes());
-        at += 16;
-        if kind == 0 || vector.len() >= 64 * 16 {
-            break;
-        }
-    }
-    vector
 }
 
 /// `struct user_i387_struct` (512 bytes, the `fxsave` layout).

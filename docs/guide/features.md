@@ -2689,7 +2689,7 @@ kernel.
   (`VmLck`); the other memory fields and the CPU ones are not there, as
   nothing measures them. `statm` has, in pages, what Linux's `task_statm`
   counts: the size of the mappings, the resident pages, those of them a
-  file's or shared memory's, the code (0, as in `stat`), 0, the private
+  file's or shared memory's, the pages of the code range `stat` gives, 0, the private
   writable mappings and the stack, and 0. `limits` lists the soft and hard
   resource limits as `prlimit` gives them, in Linux's columns. `auxv` (0400)
   is the auxiliary vector the program's `execve` wrote on its stack, kept
@@ -2755,13 +2755,15 @@ kernel.
   and session, the controlling terminal's device and foreground group (0
   and -1 without one), the CPU time of the process and of its waited-for
   children in `USER_HZ` (100) ticks, the priority and nice value, the threads,
-  the size of the mappings, the `RLIMIT_RSS` limit, the start of the stack and
-  of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
+  the size of the mappings, the `RLIMIT_RSS` limit, the start and end of
+  the program's code (Linux's `start_code` and `end_code`, as
+  `load_elf_binary` finds them: the lowest address and the highest end in
+  the file of its executable `PT_LOAD` segments; 0 for a zombie), the start
+  of the stack and of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
   waits, as Linux shows root, though not for a process of more than one thread
   as a whole), `exit_signal` (17 for the reader's own), and where
   the argument and environment strings lie. What nothing measures is 0: page
-  faults, resident memory, the start time, the code range and the scheduler's
-  figures. `cmdline` and `environ` are the argument and environment strings
+  faults, resident memory, the start time and the scheduler's figures. `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.
 - `/proc/self/exe` and `/proc/self/cwd` are symbolic links (0777, size 0) to
@@ -3666,7 +3668,8 @@ kernel.
     written where it may not write or replace the file. The core has each
     thread's registers (`NT_PRSTATUS`), the process with its leader's real
     user and group (`NT_PRPSINFO`), the fatal
-    signal (`NT_SIGINFO`), the auxiliary vector, the mapped files (`NT_FILE`:
+    signal (`NT_SIGINFO`), the auxiliary vector its exec saved (Linux's
+    `saved_auxv`, whatever the program did to its stack), the mapped files (`NT_FILE`:
     each VMA that maps a file, by its path, followed by `(deleted)` once
     unlinked, and shared anonymous memory as `/dev/zero (deleted)`, as Linux
     names it) and the memory. It has no `NT_X86_XSTATE` note, as Linux writes

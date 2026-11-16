@@ -55,7 +55,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const DT_DIR: u8 = 4;
-const CAP_CHECKPOINT_RESTORE: u64 = 1 << 40;
 const DT_REG: u8 = 8;
 
 /// The least of `msg_max` and `msg_default` (`MIN_MSGMAX`), and of
@@ -517,7 +516,7 @@ pub(crate) fn open(
         }
         Entry::Kernel(file) => {
             let writer = if file.next_id() {
-                crate::ipc::capable(c, CAP_CHECKPOINT_RESTORE)
+                crate::ipc::capable(c, crate::credentials::CAP_CHECKPOINT_RESTORE)
                     || crate::ipc::capable(c, crate::ipc::CAP_SYS_ADMIN)
             } else {
                 file.ipc() && c.process.credentials.euid == owner(c).0

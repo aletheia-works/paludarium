@@ -856,8 +856,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で、
   `UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
-  メモリ、共有の anonymous メモリ、shmem のファイル（memfd、tmpfs のファイル。Linux が
-  VMA を shmem のものと数えない System V の共有メモリは除きます）の共有または
+  メモリ、共有の anonymous メモリ、shmem の memfd（Linux が VMA を shmem のものと
+  数えない System V の共有メモリは除きます）の共有または
   プライベートなマッピングを、ないページについて登録し
   （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`

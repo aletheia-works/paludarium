@@ -666,8 +666,10 @@ verified.
   `UFFDIO_REGISTER` and `fdinfo` report leave them out too. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
-  A file on a host's tmpfs counts as holding every page,
-  so its mappings never wait. A zero page `UFFDIO_ZEROPAGE` gives a
+  Of shmem's files only a memfd is registered: a tmpfs file
+  is refused (`EINVAL`), where Linux takes it, as the in-memory file
+  system says it is a tmpfs but stands for the files a guest has on disk,
+  and a host's tmpfs file is not kept here. A zero page `UFFDIO_ZEROPAGE` gives a
   private mapping of a shmem file is a page of zeros of its own, which
   `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
   zero page. A system call's own

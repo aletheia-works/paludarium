@@ -569,8 +569,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
   それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
   ioctl にも入りません。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
-  ページの保護を外します。Linux はその印を PTE に残します。ホストの tmpfs のファイルは
-  どのページも持っているものとして扱い、そのマッピングは待ちません。shmem のファイルの
+  ページの保護を外します。Linux はその印を PTE に残します。shmem のファイルで登録
+  するのは memfd だけです。tmpfs のファイルは、Linux は受け付けますが、ここでは
+  断ります（`EINVAL`）。メモリ上のファイルシステムは tmpfs を名乗りますが、ゲストが
+  ディスクに持つファイルを表すからで、ホストの tmpfs のファイルはここで持っていません。shmem のファイルの
   プライベートなマッピングに `UFFDIO_ZEROPAGE` が入れるゼロページは、そのマッピング
   自身のゼロのページで、`/proc/<pid>/pagemap` と `smaps` もそう数えます。Linux は
   そのゼロページを対応付けます。登録した範囲のまだ

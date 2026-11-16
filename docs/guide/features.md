@@ -953,8 +953,8 @@ kernel.
   `UFFD_FEATURE_MOVE`, and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory, shared anonymous memory and the shared or private mappings of a
-  shmem file (a memfd, a tmpfs file; not System V shared memory, whose
-  VMAs Linux does not count as shmem's) for missing pages
+  memfd, which is shmem's (not System V shared memory, whose VMAs Linux
+  does not count as shmem's), for missing pages
   (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
   protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
   to the ioctls it reports), with Linux's checks in its order (the

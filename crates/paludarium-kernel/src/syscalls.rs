@@ -356,6 +356,8 @@ impl SyscallTable {
         handlers.insert(431, crate::mounts::sys_fsconfig);
         handlers.insert(432, crate::mounts::sys_fsmount);
         handlers.insert(433, crate::mounts::sys_fspick);
+        handlers.insert(442, crate::mounts::sys_mount_setattr);
+        handlers.insert(467, crate::mounts::sys_open_tree_attr);
         handlers.insert(167, crate::admin::sys_swapon);
         handlers.insert(168, crate::admin::sys_swapoff);
         handlers.insert(175, crate::admin::sys_init_module);

@@ -356,6 +356,7 @@ NAMES = {
     439: "faccessat2",
     440: "process_madvise",
     441: "epoll_pwait2",
+    442: "mount_setattr",
     443: "quotactl_fd",
     444: "landlock_create_ruleset",
     445: "landlock_add_rule",
@@ -378,6 +379,7 @@ NAMES = {
     464: "getxattrat",
     465: "listxattrat",
     466: "removexattrat",
+    467: "open_tree_attr",
     468: "file_getattr",
     469: "file_setattr",
 }

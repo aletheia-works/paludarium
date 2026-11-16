@@ -348,6 +348,7 @@
     {"name":"moves","binary":"process"},
     {"name":"trees","binary":"process"},
     {"name":"contexts","binary":"process"},
+    {"name":"setattrs","binary":"process"},
     {"name":"proc-other-mounts","binary":"process"},
     {"name":"proc-other-maps","binary":"process"},
     {"name":"proc-other-fds","binary":"process"},

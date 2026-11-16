@@ -456,8 +456,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `EOPNOTSUPP` で、プログラムはできないことを知れます。`open_tree` の
   `OPEN_TREE_NAMESPACE`（Linux master で新しいもの）と `move_mount` の
   `MOVE_MOUNT_BENEATH`、`fsmount` の `FSMOUNT_NAMESPACE`（Linux master で新しいもの）と
-  tmpfs への `MOUNT_ATTR_NOSYMFOLLOW`、`/proc` や `/dev` の `fspick` も同じです。
-  `mount_setattr`、`statmount`、`listmount` はありません（`ENOSYS`）。
+  tmpfs への `MOUNT_ATTR_NOSYMFOLLOW`、`/proc` や `/dev` の `fspick`、ID を
+  マップしたマウント（`mount_setattr` と `open_tree_attr` の `MOUNT_ATTR_IDMAP`。その
+  ユーザー名前空間のディスクリプタを確かめたあと）も同じです。`statmount`、`listmount`
+  はありません（`ENOSYS`）。
   ファイルシステムのコンテキストが作るのは、`mount` と同じく tmpfs だけで、記録する
   メッセージはパラメーターとマウントし直しのものだけです。起動したときからある
   スーパーブロックのコンテキストは、共通のフラグ（`ro`、`sync` など）しか受け取りません。

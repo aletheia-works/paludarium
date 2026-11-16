@@ -1824,6 +1824,70 @@ impl NamespacedFs {
         }
         Ok(())
     }
+    /// `mount_setattr`'s change of mount `id` and, with `recurse`, of each
+    /// mount on it (`mount_setattr_prepare`, then `mount_setattr_commit`):
+    /// each one's flags lose `clear` and gain `set`; one whose locked flags
+    /// would change is `EPERM` (`can_change_locked_flags`), and one made
+    /// read-only with a file open for writing on it `EBUSY`
+    /// (`mnt_hold_writers`), changing none. Then each takes `propagation`,
+    /// as [`Self::change_type`] gives it. A mount of a detached tree but
+    /// for its root is `EINVAL` (`anon_ns_root`).
+    pub fn set_attributes(
+        &self,
+        id: u64,
+        recurse: bool,
+        clear: u32,
+        set: u32,
+        propagation: Option<Propagation>,
+    ) -> Result<(), Errno> {
+        use mount_flags::*;
+        self.swept();
+        let entries = self.table.snapshot();
+        let e = Self::by_id(&entries, id).ok_or(Errno::EINVAL)?;
+        if detached(&e.point) && e.parent != e.id() {
+            return Err(Errno::EINVAL);
+        }
+        let ids = Self::tree(&entries, id, recurse);
+        let mut changed = Vec::with_capacity(ids.len());
+        for at in &ids {
+            let Some(m) = Self::by_id(&entries, *at) else {
+                continue;
+            };
+            let flags = (m.flags & !clear | set) & SETTABLE;
+            for (lock, flag) in [
+                (LOCK_READONLY, READONLY),
+                (LOCK_NODEV, NODEV),
+                (LOCK_NOSUID, NOSUID),
+                (LOCK_NOEXEC, NOEXEC),
+            ] {
+                if m.locks & lock != 0 && flags & flag == 0 {
+                    return Err(Errno::EPERM);
+                }
+            }
+            if m.locks & LOCK_ATIME != 0 && m.flags & ATIME != flags & ATIME {
+                return Err(Errno::EPERM);
+            }
+            if set & READONLY != 0
+                && m.flags & READONLY == 0
+                && m.token.writers.load(Ordering::SeqCst) != 0
+            {
+                return Err(EBUSY);
+            }
+            changed.push((*at, flags));
+        }
+        self.table.update(|entries| {
+            for (at, flags) in &changed {
+                if let Some(e) = entries.iter_mut().find(|e| e.id() == *at) {
+                    e.flags = *flags;
+                }
+            }
+            Ok(())
+        })?;
+        if let Some(kind) = propagation {
+            self.change_type(id, kind, recurse)?;
+        }
+        Ok(())
+    }
     /// `do_reconfigure_mnt` of mount `id` (`MS_REMOUNT | MS_BIND`): its
     /// flags become `flags`; to make it read-only, no file may be open for
     /// writing on it (`mnt_make_readonly`, `EBUSY`).

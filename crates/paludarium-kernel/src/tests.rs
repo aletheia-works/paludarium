@@ -8724,6 +8724,93 @@ fn a_file_system_context_makes_and_reconfigures_a_tmpfs() {
     assert!(info.contains(" - tmpfs x ro,size=4096k"), "{info}");
 }
 
+/// `mount_setattr` sets and clears a mount's flags and its propagation, and
+/// `open_tree_attr` a new copy's.
+#[test]
+fn mount_setattr_changes_flags_and_propagation() {
+    let mut f = fixture();
+    let attr = |f: &mut Fixture, at: u64, words: [u64; 5]| -> u64 {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        f.mem.write(GuestAddr(DATA + at), &bytes).unwrap();
+        DATA + at
+    };
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let (m, inner) = (
+        put(&mut f, 0x40, b"/tmp/m"),
+        put(&mut f, 0x60, b"/tmp/m/in"),
+    );
+    assert_eq!(f.ret(83, &[m, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+    assert_eq!(f.ret(83, &[inner, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, inner, tmpfs, 0, 0]), 0);
+    let fdcwd = (-100i64) as u64;
+    let (ro, recursive) = (1, 0x8000);
+    let set_ro = attr(&mut f, 0x200, [ro, 0, 0, 0, 0]);
+    // The flags, then the size, then the attributes.
+    assert_eq!(f.ret(442, &[fdcwd, m, 1, set_ro, 32]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, set_ro, 16]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, set_ro, 8192]), errno(Errno(7)));
+    let tail = attr(&mut f, 0x240, [ro, 0, 0, 0, 1]);
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, tail, 40]), errno(Errno(7)));
+    let nothing = attr(&mut f, 0x280, [0, 0, 0, 0, 0]);
+    let missing = put(&mut f, 0x80, b"/missing");
+    assert_eq!(f.ret(442, &[fdcwd, missing, 0, nothing, 32]), 0);
+    let two = attr(&mut f, 0x2c0, [0, 0, (1 << 18) | (1 << 20), 0, 0]);
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, two, 32]), errno(Errno::EINVAL));
+    let atime_alone = attr(&mut f, 0x300, [0x10, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(442, &[fdcwd, m, 0, atime_alone, 32]),
+        errno(Errno::EINVAL)
+    );
+    let atime_part = attr(&mut f, 0x340, [0x10, 0x10, 0, 0, 0]);
+    assert_eq!(
+        f.ret(442, &[fdcwd, m, 0, atime_part, 32]),
+        errno(Errno::EINVAL)
+    );
+    let tmp = put(&mut f, 0xa0, b"/tmp");
+    assert_eq!(
+        f.ret(442, &[fdcwd, tmp, 0, set_ro, 32]),
+        errno(Errno::EINVAL)
+    );
+    // Busy while a file is open for writing, then read-only.
+    let file = put(&mut f, 0xc0, b"/tmp/m/f");
+    let fd = f.ret(2, &[file, 0o101, 0o644]);
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, set_ro, 32]), errno(Errno(16)));
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(442, &[fdcwd, m, recursive, set_ro, 32]), 0);
+    let deep = put(&mut f, 0xe0, b"/tmp/m/in/g");
+    assert_eq!(f.ret(83, &[deep, 0o755]), errno(Errno(30)));
+    // Clear it again, take noatime, and a peer group.
+    let rw_noatime_shared = attr(&mut f, 0x380, [0x10, ro | 0x70, 1 << 20, 0, 0]);
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, rw_noatime_shared, 32]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" / /tmp/m rw,noatime shared:1 - tmpfs"),
+        "{info}"
+    );
+    assert!(info.contains(" / /tmp/m/in ro,relatime - tmpfs"), "{info}");
+    // open_tree_attr: a size without attributes, then a copy made read-only.
+    assert_eq!(f.ret(467, &[fdcwd, m, 1, 0, 32]), errno(Errno::EINVAL));
+    let tree = f.ret(467, &[fdcwd, m, 1, set_ro, 32]);
+    assert!((tree as i64) >= 0);
+    let (n, empty) = (put(&mut f, 0x100, b"/tmp/n"), put(&mut f, 0x120, b""));
+    assert_eq!(f.ret(83, &[n, 0o755]), 0);
+    assert_eq!(f.ret(429, &[tree, empty, fdcwd, n, 4]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" / /tmp/n ro,noatime shared:1 - tmpfs"),
+        "{info}"
+    );
+    // A failure takes the descriptor away.
+    let before = f.ret(32, &[0]);
+    assert_eq!(f.ret(3, &[before]), 0);
+    assert_eq!(
+        f.ret(467, &[fdcwd, tmp, 0, set_ro, 32]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(32, &[0]), before);
+}
+
 /// `open_tree` gives a descriptor of a file or of a detached copy of its
 /// mount, which `move_mount` attaches; a copy no one attached goes with
 /// its descriptor.

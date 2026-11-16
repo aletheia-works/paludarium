@@ -10162,6 +10162,138 @@ static int contexts_case(void) {
     return 0;
 }
 
+/* The setattrs case: mount_setattr and open_tree_attr (Linux master's) in a
+   mount namespace of a user namespace of its own: the checks of a struct
+   mount_attr, a mount's flags set and cleared with the mounts below it,
+   its propagation, and a new copy's attributes. */
+static char sa_base[] = "/tmp/paludarium-setattrs-XXXXXX";
+static void sa_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", sa_base, name); }
+static long sa_set(int dfd, const char *path, unsigned flags, const void *attr, size_t size) {
+    return syscall(442, dfd, path, flags, attr, size);
+}
+static long sa_tree(int dfd, const char *path, unsigned flags, const void *attr, size_t size) {
+    return syscall(467, dfd, path, flags, attr, size);
+}
+static int sa_inner(void) {
+    char a[256], inner[256], b[256], l[256], path[512];
+    sa_path(a, "a");
+    sa_path(b, "b");
+    sa_path(l, "l");
+    snprintf(inner, sizeof inner, "%s/in", a);
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("a", mount("none", a, "tmpfs", 0, NULL));
+    mkdir(inner, 0755);
+    RM("in", mount("none", inner, "tmpfs", 0, NULL));
+    symlink(a, l);
+    unsigned long long ro[5] = {1, 0, 0, 0, 0};
+    printf("\nchecks");
+    RM("flags", sa_set(AT_FDCWD, a, 1, ro, 32));
+    RM("small", sa_set(AT_FDCWD, a, 0, ro, 16));
+    RM("big", sa_set(AT_FDCWD, a, 0, ro, 8192));
+    unsigned long long tail[5] = {1, 0, 0, 0, 1};
+    RM("tail", sa_set(AT_FDCWD, a, 0, tail, 40));
+    unsigned long long nothing[5] = {0};
+    sa_path(path, "missing");
+    RM("nothing", sa_set(AT_FDCWD, path, 0, nothing, 32));
+    RM("missing", sa_set(AT_FDCWD, path, 0, ro, 32));
+    unsigned long long two[5] = {0, 0, MS_PRIVATE | MS_SHARED, 0, 0};
+    RM("two", sa_set(AT_FDCWD, a, 0, two, 32));
+    unsigned long long kind[5] = {0, 0, MS_RDONLY, 0, 0};
+    RM("kind", sa_set(AT_FDCWD, a, 0, kind, 32));
+    unsigned long long unknown[5] = {0x40000000, 0, 0, 0, 0};
+    RM("unknown", sa_set(AT_FDCWD, a, 0, unknown, 32));
+    unsigned long long alone[5] = {0x10, 0, 0, 0, 0};
+    RM("atime-alone", sa_set(AT_FDCWD, a, 0, alone, 32));
+    unsigned long long part[5] = {0x10, 0x10, 0, 0, 0};
+    RM("atime-part", sa_set(AT_FDCWD, a, 0, part, 32));
+    unsigned long long both[5] = {0x30, 0x70, 0, 0, 0};
+    RM("atime-both", sa_set(AT_FDCWD, a, 0, both, 32));
+    unsigned long long clr_idmap[5] = {0, 0x100000, 0, 0, 0};
+    RM("idmap-clear", sa_set(AT_FDCWD, a, 0, clr_idmap, 32));
+    unsigned long long big_fd[5] = {0x100000, 0, 0, 1ULL << 32, 0};
+    RM("idmap-fd", sa_set(AT_FDCWD, a, 0, big_fd, 32));
+    unsigned long long bad_fd[5] = {0x100000, 0, 0, 99, 0};
+    RM("idmap-badf", sa_set(AT_FDCWD, a, 0, bad_fd, 32));
+    int mntns = open("/proc/self/ns/mnt", O_RDONLY);
+    unsigned long long not_user[5] = {0x100000, 0, 0, (unsigned long long)mntns, 0};
+    RM("idmap-mnt", sa_set(AT_FDCWD, a, 0, not_user, 32));
+    close(mntns);
+    RM("not-root", sa_set(AT_FDCWD, sa_base, 0, ro, 32));
+    unsigned long long noatime[5] = {0x10, 0x70, 0, 0, 0};
+    RM("locked", sa_set(AT_FDCWD, "/", 0, noatime, 32));
+    printf("\nflags");
+    snprintf(path, sizeof path, "%s/f", a);
+    int fd = open(path, O_CREAT | O_WRONLY, 0644);
+    RM("busy", sa_set(AT_FDCWD, a, 0, ro, 32));
+    close(fd);
+    RM("ro", sa_set(AT_FDCWD, a, AT_RECURSIVE, ro, 32));
+    snprintf(path, sizeof path, "%s/x", inner);
+    RM("erofs", mkdir(path, 0755));
+    unsigned long long rw[5] = {0x10, 1 | 0x70, MS_SHARED, 0, 0};
+    RM("rw", sa_set(AT_FDCWD, a, 0, rw, 32));
+    RM("link-nofollow", sa_set(AT_FDCWD, l, AT_SYMLINK_NOFOLLOW, ro, 32));
+    unsigned long long nosuid[5] = {2, 0, 0, 0, 0};
+    RM("link", sa_set(AT_FDCWD, l, 0, nosuid, 32));
+    int at = open(a, O_PATH);
+    unsigned long long nodev[5] = {4, 0, 0, 0, 0};
+    RM("empty", sa_set(at, "", AT_EMPTY_PATH, nodev, 32));
+    RM("empty-no-flag", sa_set(at, "", 0, nodev, 32));
+    close(at);
+    printf("\n");
+    rm_info("a", a, NULL);
+    rm_info("a/in", inner, NULL);
+    printf("open_tree_attr");
+    RM("size-alone", sa_tree(AT_FDCWD, a, 1, NULL, 32));
+    RM("plain-not-root", sa_tree(AT_FDCWD, sa_base, 0, ro, 32));
+    unsigned long long copy[5] = {1, 0, MS_PRIVATE, 0, 0};
+    long tree = sa_tree(AT_FDCWD, a, 1 | AT_RECURSIVE, copy, 32);
+    printf(" tree=%d", tree >= 0);
+    RM("attach", syscall(429, (int)tree, "", AT_FDCWD, b, 4));
+    close((int)tree);
+    printf("\n");
+    snprintf(path, sizeof path, "%s/in", b);
+    rm_info("b", b, NULL);
+    rm_info("b/in", path, NULL);
+    return 0;
+}
+static int setattrs_case(void) {
+    if (!mkdtemp(sa_base)) return 93;
+    chmod(sa_base, 0755);
+    char path[256];
+    sa_path(path, "a");
+    mkdir(path, 0755);
+    sa_path(path, "b");
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(sa_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    sa_path(path, "l");
+    unlink(path);
+    sa_path(path, "a");
+    rmdir(path);
+    sa_path(path, "b");
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(sa_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -28231,6 +28363,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "moves")) return moves_case();
     if (!strcmp(mode, "trees")) return trees_case();
     if (!strcmp(mode, "contexts")) return contexts_case();
+    if (!strcmp(mode, "setattrs")) return setattrs_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();

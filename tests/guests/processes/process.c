@@ -10012,6 +10012,14 @@ static void fc_info(const char *label, const char *point) {
         if (dash) sscanf(dash, " - %63s %255s %511s", kind, source, sb);
         char *cut = strstr(sb, ",nr_inodes");
         if (cut) *cut = 0;
+        /* The owner shows only when it is not the first namespace's root,
+           which the caller of the test may be or not. */
+        for (const char *id = ",uid="; id; id = id[1] == 'u' ? ",gid=" : NULL) {
+            char *at = strstr(sb, id);
+            if (!at) continue;
+            char *end = strchr(at + 1, ',');
+            memmove(at, end ? end : at + strlen(at), strlen(end ? end : at + strlen(at)) + 1);
+        }
         snprintf(shown, sizeof shown, "%s %s %s %s", opts, kind, source, sb);
     }
     if (f) fclose(f);

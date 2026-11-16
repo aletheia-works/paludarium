@@ -1343,9 +1343,10 @@ impl NetlinkSocket {
     /// namespace is `EINVAL`, as `lo` may not move
     /// (`__dev_change_net_namespace`), and of the other attributes only the
     /// name `lo` and `IFLA_EXT_MASK` are taken (`EOPNOTSUPP` for others),
-    /// as `do_setlink` looks at them after the move. To get, `strict` is `Some` with whether
-    /// the socket checks strictly, which takes, as `rtnl_valid_getlink_req`
-    /// does, no type, flags or change mask (`EINVAL`), and of the
+    /// as `do_setlink` looks at them after the move. To get, `strict` is
+    /// `Some` with whether the socket checks strictly, which takes, as
+    /// `rtnl_valid_getlink_req` does, no type, flags or change mask
+    /// (`EINVAL`), and of the
     /// attributes only the names, `IFLA_EXT_MASK` and
     /// `IFLA_TARGET_NETNSID` (`EINVAL` for others); either way
     /// `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are then `EOPNOTSUPP`, and

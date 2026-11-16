@@ -181,6 +181,7 @@ mod linux {
                     | "msg"
                     | "ipc-sysctl"
                     | "sysvipc-proc"
+                    | "kernel-sysctl"
                     | "mqueue-calls"
                     | "mqueue-limits"
                     | "mqueue-wait"
@@ -693,6 +694,7 @@ mod linux {
         processes_msg => ("msg","process"),
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
+        processes_kernel_sysctl => ("kernel-sysctl","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),
         processes_vector_flags => ("vector-flags","process"),

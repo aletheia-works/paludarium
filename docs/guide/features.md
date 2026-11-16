@@ -2758,9 +2758,15 @@ kernel.
   `sem` sets as many as it gives, as Linux's `proc_dointvec` reads a
   vector: a bad one is `EINVAL` and leaves the ones before it set, and
   `semmni` goes back to what it was unless it ends from 0 to 32768
-  (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them, `perf_event_paranoid` and
-  `unprivileged_bpf_disabled` read 2, Linux's defaults, and no one may
-  open them to write (`EACCES`). `/proc/sys/kernel` lists only these.
+  (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them are the machine's
+  `perf_event_paranoid` and `unprivileged_bpf_disabled`, one each for the
+  whole emulated machine and 2 at first, Linux's defaults: root's files of
+  mode 0644, which only root (user ID 0 outside any user namespace) may
+  open to write (`EACCES`). `perf_event_paranoid` takes any `int`
+  (`proc_dointvec`); `unprivileged_bpf_disabled` takes 0 to 2 (`EINVAL`)
+  from a writer with `CAP_SYS_ADMIN` (`EPERM`), and once 1 it takes no
+  other value (`EPERM`), as Linux's `bpf_unpriv_handler`; `perf_event_open`
+  and `bpf` check what they are now. `/proc/sys/kernel` lists only these.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
   descriptor, as Linux's `seq_show` writes it: `pos`, the description's
   position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and
@@ -3201,10 +3207,12 @@ kernel.
   reserved bits, a user stack too large or not 8-byte aligned, both
   weights, `inherit_thread` without `inherit`, `remove_on_exec` with
   `enable_on_exec`, and `sigtrap` without `remove_on_exec`, all `EINVAL`),
-  then `perf_event_paranoid`, which is Linux's default 2: an event of the
+  then the machine's `perf_event_paranoid` (2, Linux's default, until root
+  writes `/proc/sys/kernel/perf_event_paranoid`): above 1, an event of the
   kernel (one without `exclude_kernel`, `text_poke`, a kernel callchain,
-  physical addresses, kernel or hypervisor branches) and one of a CPU need
-  `CAP_PERFMON` or `CAP_SYS_ADMIN` (`EACCES`), as do `namespaces`. Then a
+  physical addresses, kernel or hypervisor branches), and above 0, one of a
+  CPU, need `CAP_PERFMON` or `CAP_SYS_ADMIN` (`EACCES`); `namespaces`
+  always does. Then a
   period with bit 63 or a frequency above `perf_event_max_sample_rate`
   (100000) is `EINVAL`, `PERF_FLAG_PID_CGROUP` without a CPU and a task
   `EINVAL`, a group descriptor that is no event `EBADF`, a task that is not
@@ -3239,8 +3247,9 @@ kernel.
   order of Linux's checks: BTF type IDs, `map_extra`, the NUMA node (there
   is one), the type, the type's own sizes and flags (`EINVAL`, too large a
   hash element `E2BIG`, `BPF_F_ZERO_SEED` without `CAP_SYS_ADMIN`
-  `EPERM`), `kernel.unprivileged_bpf_disabled`, which is Linux's default 2,
-  so that a map needs `CAP_BPF` or `CAP_SYS_ADMIN` (`EPERM`), the name
+  `EPERM`), the machine's `kernel.unprivileged_bpf_disabled` (2, Linux's
+  default, until root writes it), with which, unless it is 0, a map needs
+  `CAP_BPF` or `CAP_SYS_ADMIN` (`EPERM`), the name
   (letters, digits, `_` and `.`), BTF (no file is, `EINVAL`), and
   `BPF_F_RDONLY` with `BPF_F_WRONLY` (`EINVAL`). The descriptor is
   close-on-exec, open for reading, writing or both as `BPF_F_RDONLY` and

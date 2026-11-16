@@ -2392,9 +2392,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `semmni` の 4 つの `int` で、タブで区切って読めます。`sem` への書き込みは、Linux の
   `proc_dointvec` がベクトルを読むのと同じく、与えた数だけを設定します。不正な値は
   `EINVAL` で、その前の値は設定されたままです。`semmni` は、最後に 0 から 32768 の間に
-  なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに `perf_event_paranoid` と
-  `unprivileged_bpf_disabled` があり、Linux の既定値の 2 を読めますが、誰も書くために
-  開けません（`EACCES`）。`/proc/sys/kernel` にあるのはこれらだけです。
+  なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに、マシンの
+  `perf_event_paranoid` と `unprivileged_bpf_disabled` があります。エミュレートする
+  マシン全体に 1 つずつで、最初は Linux の既定値の 2 です。root の持つモード 0644 の
+  ファイルで、書くために開けるのは root（どのユーザー名前空間の外でもユーザー ID 0）
+  だけです（`EACCES`）。`perf_event_paranoid` は任意の `int` を取ります
+  （`proc_dointvec`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
+  と同じく、`CAP_SYS_ADMIN` のある書き手から（`EPERM`）0 から 2 まで（`EINVAL`）を
+  取り、いったん 1 になるとほかの値を取りません（`EPERM`）。`perf_event_open` と `bpf` は
+  そのときの値を確かめます。`/proc/sys/kernel` にあるのはこれらだけです。
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
   と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
   （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、
@@ -2776,10 +2782,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   サンプルと読み込みの形式、分岐のない分岐サンプリング、DS・ES・FS・GS や予約ビットを含む
   レジスタのマスク、大きすぎるか 8 バイト境界でないユーザースタック、両方の weight、
   `inherit` なしの `inherit_thread`、`enable_on_exec` と一緒の `remove_on_exec`、
-  `remove_on_exec` なしの `sigtrap` がどれも `EINVAL` です）。次は `perf_event_paranoid` で、
-  Linux の既定の 2 です。カーネルのイベント（`exclude_kernel` なし、`text_poke`、カーネルの
-  コールチェーン、物理アドレス、カーネルかハイパーバイザーの分岐）と CPU のイベントには
-  `CAP_PERFMON` か `CAP_SYS_ADMIN` が要り（`EACCES`）、`namespaces` も同じです。そのあと、
+  `remove_on_exec` なしの `sigtrap` がどれも `EINVAL` です）。次はマシンの
+  `perf_event_paranoid`（root が `/proc/sys/kernel/perf_event_paranoid` に書くまでは
+  Linux の既定の 2）です。1 より大きければカーネルのイベント（`exclude_kernel` なし、
+  `text_poke`、カーネルのコールチェーン、物理アドレス、カーネルかハイパーバイザーの
+  分岐）に、0 より大きければ CPU のイベントに、`CAP_PERFMON` か `CAP_SYS_ADMIN` が要ります
+  （`EACCES`）。`namespaces` にはいつも要ります。そのあと、
   ビット 63 の立った周期や `perf_event_max_sample_rate`（100000）を超える周波数は `EINVAL`、
   CPU とタスクのない `PERF_FLAG_PID_CGROUP` は `EINVAL`、イベントでないグループの
   ディスクリプタは `EBADF`、ないタスクは `ESRCH`、タスクも CPU もないときや最後より先の
@@ -2807,8 +2815,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （4 バイトのキーで、どの要素も初めからあって 0）か `BPF_MAP_TYPE_HASH` を、Linux の検査の
   順に作ります。BTF の型 ID、`map_extra`、NUMA ノード（一つです）、型、型ごとのサイズと
   フラグ（`EINVAL`。大きすぎるハッシュの要素は `E2BIG`、`CAP_SYS_ADMIN` なしの
-  `BPF_F_ZERO_SEED` は `EPERM`）、Linux の既定の 2 の `kernel.unprivileged_bpf_disabled`
-  （マップには `CAP_BPF` か `CAP_SYS_ADMIN` が要ります、`EPERM`）、名前（英数字、`_`、`.`）、
+  `BPF_F_ZERO_SEED` は `EPERM`）、マシンの `kernel.unprivileged_bpf_disabled`
+  （root が書くまでは Linux の既定の 2。0 でなければマップには `CAP_BPF` か
+  `CAP_SYS_ADMIN` が要ります、`EPERM`）、名前（英数字、`_`、`.`）、
   BTF（どのファイルも BTF ではありません、`EINVAL`）、`BPF_F_RDONLY` と `BPF_F_WRONLY` の
   両方（`EINVAL`）の順です。ディスクリプタは close-on-exec で、`BPF_F_RDONLY` と
   `BPF_F_WRONLY` に従って読み込み、書き込み、その両方で開かれ、リンクは

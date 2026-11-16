@@ -14621,6 +14621,47 @@ static int ipc_sysctl_case(void) {
     ksys_all("kept");
     return 0;
 }
+/* The kernel-sysctl case: the machine's perf_event_paranoid and
+   unprivileged_bpf_disabled, read, and refused to another user's write.
+   Root writes nothing: these are the machine's own, the test runner's on
+   native Linux. perf_event_paranoid's value is not printed: Debian's and
+   Ubuntu's kernels default to more than Linux's 2. */
+static int kernel_sysctl_case(void) {
+    const char *names[] = {"perf_event_paranoid", "unprivileged_bpf_disabled"};
+    for (int i = 0; i < 2; i++) {
+        char path[96], text[32] = {0};
+        snprintf(path, sizeof path, "/proc/sys/kernel/%s", names[i]);
+        struct stat st;
+        errno = 0;
+        long stated = stat(path, &st) ? -errno : 0;
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        long n = fd < 0 ? -errno : read(fd, text, sizeof text - 1);
+        if (fd >= 0) close(fd);
+        char *end = NULL;
+        long value = strtol(text, &end, 10);
+        printf("%s: stat=%ld mode=%o uid=%d gid=%d read=%d", names[i], stated, st.st_mode, st.st_uid, st.st_gid,
+               n > 0 && *end == '\n');
+        if (i == 1) printf(" value=%ld", value);
+        printf("\n");
+    }
+    fflush(stdout);
+    pid_t other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        for (int i = 0; i < 2; i++) {
+            char path[96];
+            snprintf(path, sizeof path, "/proc/sys/kernel/%s", names[i]);
+            errno = 0;
+            int fd = open(path, O_WRONLY | O_CLOEXEC);
+            printf("other %s: write=%d\n", names[i], fd < 0 ? -errno : 0);
+            if (fd >= 0) close(fd);
+        }
+        fflush(stdout);
+        _exit(0);
+    }
+    result("other", reaped(other));
+    return 0;
+}
 static int sem_case(void) {
     int key = 0x5c000000 | (getpid() & 0xffffff);
     printf("get too-many=%d", semx_errno(syscall(SYS_semget, 0, 32001, 0600)));
@@ -27339,6 +27380,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
+    if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();

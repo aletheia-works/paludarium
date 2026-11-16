@@ -306,6 +306,7 @@
     {"name":"msg","binary":"process"},
     {"name":"ipc-sysctl","binary":"process"},
     {"name":"sysvipc-proc","binary":"process"},
+    {"name":"kernel-sysctl","binary":"process"},
     {"name":"rseq","binary":"process"},
     {"name":"pkey","binary":"process"},
     {"name":"vector-flags","binary":"process"},

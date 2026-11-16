@@ -21,10 +21,14 @@
 //! `semopm`, `semmni`) read with tabs between them and written as many as
 //! are given, the ones before a bad one kept, and `semmni` back as it was
 //! unless it ends from 0 to `IPCMNI` (`ERANGE`, `proc_ipc_sem_dointvec`). Their
-//! owners and who may write them are the mqueue files'. Beside them are
-//! `perf_event_paranoid` and `unprivileged_bpf_disabled`, the values
-//! [`crate::perf`] and [`crate::bpf`] keep to (2, Linux's defaults), which
-//! no one may write.
+//! owners and who may write them are the mqueue files'. Beside them are the
+//! machine's `perf_event_paranoid` and `unprivileged_bpf_disabled`
+//! ([`Machine`]), which [`crate::perf`] and [`crate::bpf`] check: root's
+//! files of mode 0644, which only root opens to write.
+//! `perf_event_paranoid` takes any `int` (`proc_dointvec`);
+//! `unprivileged_bpf_disabled` takes 0 to 2 from a writer with
+//! `CAP_SYS_ADMIN` (`EPERM`), and once 1 it stays (`EPERM`), as Linux's
+//! `bpf_unpriv_handler`.
 //!
 //! Each file is the opener's IPC namespace's ([`crate::mqueue::Limits`]),
 //! so a new namespace shows Linux's defaults again. A read gives the value
@@ -173,13 +177,70 @@ const KERNEL: [(&[u8], Kernel); 9] = [
 ];
 
 impl Kernel {
-    /// Whether it is one of the IPC namespace's limits; else it is a
-    /// fixed value no one may write.
+    /// Whether it is one of the IPC namespace's limits; else it is the
+    /// machine's ([`Machine`]).
     fn ipc(self) -> bool {
         !matches!(
             self,
             Self::PerfEventParanoid | Self::UnprivilegedBpfDisabled
         )
+    }
+}
+
+/// The machine's `kernel.perf_event_paranoid` and
+/// `kernel.unprivileged_bpf_disabled`, one each for the whole emulated
+/// machine as Linux's are for the whole kernel, at Linux's defaults at
+/// first.
+pub(crate) struct Machine {
+    perf_event_paranoid: AtomicI32,
+    unprivileged_bpf_disabled: AtomicI32,
+}
+
+impl Default for Machine {
+    fn default() -> Self {
+        Self {
+            perf_event_paranoid: AtomicI32::new(crate::perf::PARANOID),
+            unprivileged_bpf_disabled: AtomicI32::new(crate::bpf::UNPRIVILEGED_DISABLED),
+        }
+    }
+}
+
+impl Machine {
+    /// What `perf_event_open` checks (`sysctl_perf_event_paranoid`).
+    pub(crate) fn perf_event_paranoid(&self) -> i32 {
+        self.perf_event_paranoid.load(Ordering::SeqCst)
+    }
+    /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
+    pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
+        self.unprivileged_bpf_disabled.load(Ordering::SeqCst)
+    }
+    fn line(&self, file: Kernel) -> Vec<u8> {
+        line(if file == Kernel::PerfEventParanoid {
+            self.perf_event_paranoid()
+        } else {
+            self.unprivileged_bpf_disabled()
+        })
+    }
+    /// Takes a value written at the start of the file, by a writer with
+    /// `CAP_SYS_ADMIN` (`admin`) or without.
+    fn write(&self, file: Kernel, buf: &[u8], admin: bool) -> Result<usize, Errno> {
+        if file == Kernel::PerfEventParanoid {
+            let (value, consumed) = parse(buf, None)?;
+            self.perf_event_paranoid.store(value, Ordering::SeqCst);
+            return Ok(consumed);
+        }
+        // `bpf_unpriv_handler`.
+        if !admin {
+            return Err(Errno::EPERM);
+        }
+        let locked = self.unprivileged_bpf_disabled() == 1;
+        let (value, consumed) = parse(buf, Some((0, 2)))?;
+        if locked && value != 1 {
+            return Err(Errno::EPERM);
+        }
+        self.unprivileged_bpf_disabled
+            .store(value, Ordering::SeqCst);
+        Ok(consumed)
     }
 }
 
@@ -301,8 +362,8 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
             let [msl, mns, opm, mni] = ipc.sem.with_limits(|limits| limits.0);
             format!("{msl}\t{mns}\t{opm}\t{mni}\n").into_bytes()
         }
-        Kernel::PerfEventParanoid => line(crate::perf::PARANOID),
-        Kernel::UnprivilegedBpfDisabled => line(crate::bpf::UNPRIVILEGED_DISABLED),
+        // The machine's ([`Machine`]), which are not the namespace's.
+        Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => Vec::new(),
     }
 }
 
@@ -411,8 +472,8 @@ pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
             ..crate::proc::stat(fanotify_line(&c.files.caches.notify.fan.limits, file).len())
         },
         Entry::Kernel(file) if !file.ipc() => FileStat {
-            mode: 0o100_444,
-            ..crate::proc::stat(kernel_line(&ipc(c), file).len())
+            mode: 0o100_644,
+            ..crate::proc::stat(c.processes.sysctls.line(file).len())
         },
         Entry::Kernel(file) => {
             let (uid, gid) = owner(c);
@@ -468,8 +529,25 @@ pub(crate) fn open(
                 flags,
             }))
         }
+        // The machine's: root's, which only root may open to write.
+        Entry::Kernel(file) if !file.ipc() => {
+            let credentials = &c.process.credentials;
+            if flags & 3 != 0 && credentials.euid != 0 {
+                return Err(Errno::EACCES);
+            }
+            Ok(Arc::new(SettingFile {
+                value: Value::Machine(
+                    Arc::clone(&c.processes.sysctls),
+                    file,
+                    credentials.capable(crate::credentials::CAP_SYS_ADMIN),
+                ),
+                stat: stat(c, entry),
+                position: Mutex::new(0),
+                flags,
+            }))
+        }
         Entry::Kernel(file) => {
-            if flags & 3 != 0 && (!file.ipc() || c.process.credentials.euid != owner(c).0) {
+            if flags & 3 != 0 && c.process.credentials.euid != owner(c).0 {
                 return Err(Errno::EACCES);
             }
             Ok(Arc::new(SettingFile {
@@ -523,6 +601,8 @@ enum Value {
     Inotify(Arc<crate::inotify::Notifier>, Inotify),
     Fanotify(Arc<crate::fanotify::Registry>, Fanotify),
     Kernel(Arc<Namespace>, Kernel),
+    /// The machine's, and whether the opener had `CAP_SYS_ADMIN`.
+    Machine(Arc<Machine>, Kernel, bool),
 }
 
 impl Value {
@@ -535,6 +615,7 @@ impl Value {
             Self::Inotify(notifier, file) => inotify_line(&notifier.limits, *file),
             Self::Fanotify(registry, file) => fanotify_line(&registry.limits, *file),
             Self::Kernel(ipc, file) => kernel_line(ipc, *file),
+            Self::Machine(machine, file, _) => machine.line(*file),
         }
     }
     /// Takes the value written at the start of the file: the bytes taken.
@@ -547,6 +628,7 @@ impl Value {
                 Ok(consumed)
             }
             Self::Kernel(ipc, file) => kernel_write(ipc, *file, buf),
+            Self::Machine(machine, file, admin) => machine.write(*file, buf, *admin),
             Self::Aio(limits, _) => {
                 let (negative, value, consumed) = scan(buf)?;
                 if negative {

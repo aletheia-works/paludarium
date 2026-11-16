@@ -61,11 +61,11 @@ mod native {
     use cranelift_codegen::isa::OwnedTargetIsa;
     use cranelift_codegen::settings::{self, Configurable};
     use paludarium_cpu::CpuState;
-    use paludarium_cpu::compile::{CompiledBlock, Compiler, Form};
+    use paludarium_cpu::compile::{CompiledBlock, Compiler, Fast, Form};
     use paludarium_mmu::AddressSpace;
     use paludarium_types::GuestAddr;
 
-    use crate::emit::{self, FS_BASE, GS_BASE, RFLAGS, RIP, WORDS};
+    use crate::emit::{self, FS_BASE, GS_BASE, RFLAGS, RIP, WORDS, XMM};
     use crate::exec::{self, Code, Context};
 
     /// Counts of what the compiler did, for measuring.
@@ -252,6 +252,7 @@ mod native {
                 let block = Arc::new(PendingBlock {
                     code: OnceLock::new(),
                     len: forms.len(),
+                    vector: forms.iter().any(|f| uses_xmm(&f.fast)),
                 });
                 kept.insert(forms.to_vec(), block.clone());
                 block
@@ -278,6 +279,20 @@ mod native {
     pub(crate) struct PendingBlock {
         code: OnceLock<Option<Code>>,
         len: usize,
+        /// Whether a form reads or writes an xmm register: only then are
+        /// they copied into the register block and back.
+        vector: bool,
+    }
+
+    fn uses_xmm(f: &Fast) -> bool {
+        matches!(
+            f,
+            Fast::XmmMove { .. }
+                | Fast::XmmLoad { .. }
+                | Fast::XmmStore { .. }
+                | Fast::XmmXor { .. }
+                | Fast::MoveScalar { .. }
+        )
     }
 
     impl CompiledBlock for PendingBlock {
@@ -291,6 +306,12 @@ mod native {
             registers[RIP] = state.rip.0;
             registers[FS_BASE] = state.fs_base;
             registers[GS_BASE] = state.gs_base;
+            if self.vector {
+                for (n, x) in state.xmm.iter().enumerate() {
+                    registers[XMM + 2 * n] = *x as u64;
+                    registers[XMM + 2 * n + 1] = (*x >> 64) as u64;
+                }
+            }
             let context = Context { mem, generation };
             let ran = code.run(&mut registers, &context);
             let ran = usize::try_from(ran).unwrap_or(0).min(self.len);
@@ -298,6 +319,12 @@ mod native {
                 state.gpr.copy_from_slice(&registers[..16]);
                 state.rflags = registers[RFLAGS];
                 state.rip = GuestAddr(registers[RIP]);
+                if self.vector {
+                    for (n, x) in state.xmm.iter_mut().enumerate() {
+                        *x = u128::from(registers[XMM + 2 * n])
+                            | (u128::from(registers[XMM + 2 * n + 1]) << 64);
+                    }
+                }
             }
             ran
         }

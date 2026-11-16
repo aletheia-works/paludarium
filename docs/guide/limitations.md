@@ -78,7 +78,8 @@ verified.
   user space ends at 2^47 bytes, as with 4-level page tables.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, `/proc/sys` but for `fs` and `kernel`, ...) and the other names in
+  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs` and
+  `kernel` it has, ...) and the other names in
   the reader's own directory (`auxv`, `limits`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `statm` and

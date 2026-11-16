@@ -677,7 +677,7 @@ verified.
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: of the permission events, only `FAN_OPEN_PERM` of
   an open by `open`, `openat`, `openat2`, `creat` or `open_by_handle_at`
-  is sent; `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM` and exec's
+  (a link in `/proc/self/fd` too) is sent; `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM` and exec's
   `FAN_OPEN_PERM` are taken by `fanotify_mark` but never sent, so what they
   would ask is let through, and exec's open is told as `FAN_OPEN` without
   `FAN_OPEN_EXEC`.

@@ -1313,6 +1313,8 @@ impl Group {
             return None;
         };
         answers.states.remove(&id);
+        // An errno in the response is only ever a pre-content group's, as
+        // [`write`] refuses one from any other.
         Some(match response & (ALLOW | DENY) {
             ALLOW => Ok(()),
             _ => Err(match response >> 24 {

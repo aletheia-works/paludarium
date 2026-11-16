@@ -3443,7 +3443,8 @@ kernel.
   each mark, the newest first, as `fanotify_show_fdinfo`. A write is a
   permission response, checked as Linux checks it, to the read event its
   descriptor names (`ENOENT` when none waits by it). An open by `open`,
-  `openat`, `openat2`, `creat` or `open_by_handle_at` of a file a content or pre-content
+  `openat`, `openat2`, `creat` or `open_by_handle_at`, a link in
+  `/proc/self/fd` too, of a file a content or pre-content
   group's mark wants `FAN_OPEN_PERM` of waits for each such group's
   answer in turn, the pre-content ones first, as `fanotify_get_response`:
   `FAN_DENY` fails it with `EPERM`, `FAN_ALLOW` lets it through, and so

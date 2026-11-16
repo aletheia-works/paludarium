@@ -2986,7 +2986,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/self/fdinfo` は `fanotify_show_fdinfo` と同じくフラグと各マークを新しい順に
   示します。write は許可イベントへの応答で、Linux と同じに確かめ、そのディスクリプタが指す読まれた
   イベントに答えます（待つものがなければ `ENOENT`）。`open`、`openat`、`openat2`、`creat`、
-  `open_by_handle_at` で開くファイルについて、コンテンツかプレコンテンツのグループのマークが `FAN_OPEN_PERM` を
+  `open_by_handle_at` で（`/proc/self/fd` のリンクからも）開くファイルについて、コンテンツかプレコンテンツのグループのマークが `FAN_OPEN_PERM` を
   求めると、`fanotify_get_response` と同じく、プレコンテンツのものから順にそれぞれのグループの
   答えを待ちます。`FAN_DENY` は `EPERM` で失敗させ、`FAN_ALLOW` とグループの最後のクローズは
   通します。待つのを止めるのは致命的なシグナルだけです。`FAN_OPEN` は通ってから届き、拒まれた

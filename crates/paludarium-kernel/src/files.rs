@@ -5968,13 +5968,16 @@ fn open_at(
                     crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
                 }
             })?;
-            if answered? {
-                opened.0.notify_event(crate::inotify::OPEN);
-            }
+            let answered = answered?;
             let landlock = match landlock {
                 Some(rights) => rights,
                 None => landlock_after_open(c, &p, flags)?,
             };
+            // `fsnotify_open` comes after the security hooks: an open
+            // Landlock refuses tells nothing.
+            if answered {
+                opened.0.notify_event(crate::inotify::OPEN);
+            }
             Ok((opened, landlock))
         }),
         Err(error) => Err(error),

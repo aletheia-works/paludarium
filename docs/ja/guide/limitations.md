@@ -577,7 +577,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベントで送るのは、`open`、`openat`、`openat2`、`creat`、
-  `open_by_handle_at` でのオープンの `FAN_OPEN_PERM` だけです。`FAN_ACCESS_PERM`、
+  `open_by_handle_at` での（`/proc/self/fd` のリンクからも）オープンの `FAN_OPEN_PERM` だけです。`FAN_ACCESS_PERM`、
   `FAN_OPEN_EXEC_PERM`、exec の `FAN_OPEN_PERM` は `fanotify_mark` で受け付けますが
   送らないので、求めるはずだったことはそのまま通ります。exec のオープンは
   `FAN_OPEN_EXEC` なしの `FAN_OPEN` として伝えます。

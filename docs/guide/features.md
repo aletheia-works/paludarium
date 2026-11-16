@@ -3801,7 +3801,8 @@ one only with an `--allow-net`.
   change the call and its arguments, or set `orig_rax` to -1 to skip it,
   leaving the `rax` it wants; at an exit `rax` has what the call returned,
   which the tracer may change. A signal the tracer resumes a syscall stop
-  with comes from the kernel (`SI_KERNEL`). `PTRACE_GET_SYSCALL_INFO`
+  with is sent to the process from the kernel (`SI_KERNEL`).
+  `PTRACE_GET_SYSCALL_INFO`
   describes the stop as Linux's `struct ptrace_syscall_info` does: the call
   and its arguments at an entry, the return value and whether it is an
   error at an exit, and only the instruction and stack pointers at another
@@ -3820,7 +3821,8 @@ one only with an `--allow-net`.
   seized, otherwise with `SIGSTOP` pending; it starts with no syscall stops.
   A `vfork` parent reports `PTRACE_EVENT_VFORK_DONE` once its child has
   exited or run another program. The thread that ends its process reports
-  `PTRACE_EVENT_EXIT`; the threads that end with it do not.
+  `PTRACE_EVENT_EXIT`, its status with 0x80 when a fatal signal dumps a
+  core; the threads that end with it do not.
 - `PTRACE_PEEKSIGINFO` reads the siginfo of the signals pending for a
   stopped tracee, or with `PTRACE_PEEKSIGINFO_SHARED` for its process, in
   the order they came. `PTRACE_GETSIGMASK` shows the signals it blocks

@@ -752,7 +752,10 @@ impl Kernel {
                         }
                         // A listening tracee traps again once its group
                         // stop changes or an interrupt comes
-                        // (`ptrace_trap_notify`).
+                        // (`ptrace_trap_notify`). Each wakes it at once: a
+                        // stop and a SIGCONT notify the wait, and an
+                        // interrupt its inbox; the wait's 10 ms deadline
+                        // is only for a wake-up missed.
                         if let Some(stop) = &tracee.stop
                             && stop.listening
                             && (stop.group_stopped != self.group.is_stopped() || tracee.trap_stop)
@@ -947,14 +950,11 @@ impl Kernel {
     }
 
     /// Linux's `ptrace_report_syscall` for a signal the tracer resumed a
-    /// syscall stop with: `send_sig` with `SEND_SIG_PRIV`, which Linux sends
-    /// to the process; the thread that stopped takes it here.
-    fn syscall_signal(thread: &mut Thread, signal: Option<i32>) {
+    /// syscall stop with: `send_sig` with `SEND_SIG_PRIV`, to the process
+    /// (`PIDTYPE_TGID`) from the kernel.
+    fn syscall_signal(&self, signal: Option<i32>) {
         if let Some(signal) = signal.filter(|&s| s != 0) {
-            signals::queue(
-                &mut thread.state,
-                signals::PendingSignal::user(signal, 0x80),
-            );
+            self.processes.signal_from_kernel(self.process.pid, signal);
         }
     }
 
@@ -979,7 +979,7 @@ impl Kernel {
             PTRACE_EVENTMSG_SYSCALL_ENTRY,
             &mut Restart::default(),
         );
-        Self::syscall_signal(thread, signal);
+        self.syscall_signal(signal);
         if self.fatal_pending(thread) || mode == Mode::Sysemu {
             return false;
         }
@@ -1004,7 +1004,7 @@ impl Kernel {
             PTRACE_EVENTMSG_SYSCALL_EXIT,
             restart,
         );
-        Self::syscall_signal(thread, signal);
+        self.syscall_signal(signal);
     }
 
     /// A traced thread enters `clone` (56), `fork` (57) or `vfork` (58),
@@ -1393,10 +1393,13 @@ impl Kernel {
             return;
         }
         // `do_exit` reports `PTRACE_EVENT_EXIT` with its code first: not a
-        // thread killed, or one the end of its process began elsewhere.
+        // thread killed, or one the end of its process began elsewhere. A
+        // fatal signal's code has 0x80 when it dumps a core, which Linux has
+        // written by then (`coredump_finish`).
         if self.group.traced() && self.traced(thread.tid) {
             let code = match status {
                 ExitStatus::Exited(code) => ((code & 0xff) << 8) as u64,
+                ExitStatus::Signaled(signal) if self.group.dumping_core() => signal as u64 | 0x80,
                 ExitStatus::Signaled(signal) => signal as u64,
                 _ => 0,
             };

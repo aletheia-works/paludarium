@@ -389,10 +389,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - `ptrace` には、まだシングルステップがありません。`PTRACE_SINGLESTEP`、
     `PTRACE_SYSEMU_SINGLESTEP` と、機能の一覧にないほかの要求は `EIO` を返します。
     `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
-    ほかは `EINVAL` です。`PTRACE_LISTEN` のトレース対象は、グループ停止の変化に 10 ms 以内に
-    気づきます。システムコール停止をシグナル付きで再開すると、Linux は
-    プロセスに送りますが、ここでは止まったスレッドが受けます。`PTRACE_EVENT_EXIT` が示す
-    ステータスにはコアダンプのビットがありません。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
+    ほかは `EINVAL` です。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
     ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
     `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。ハードウェアブレークポイントは
     なく、デバッグレジスタは未使用として読め（DR6 は `0xffff0ff0`）、DR7 を 0 にする以外の

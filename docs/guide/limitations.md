@@ -453,11 +453,7 @@ verified.
   - `ptrace` has no single-stepping yet: `PTRACE_SINGLESTEP`,
     `PTRACE_SYSEMU_SINGLESTEP` and the other requests the features do not
     list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
-    as the emulator's `arch_prctl`, and gives `EINVAL` for the rest. A
-    `PTRACE_LISTEN` tracee notices the change of its group stop within
-    10 ms. A signal a tracer resumes a syscall
-    stop with is taken by the thread that stopped, where Linux sends it to
-    the process. The status `PTRACE_EVENT_EXIT` gives has no core-dump bit.
+    as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
     checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
     without XSAVE, which the emulated CPU does not offer. There are no

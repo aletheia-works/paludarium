@@ -3226,8 +3226,16 @@ kernel.
   and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
   for an event that does not sample. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
-  `remove_on_exec` disables one then for good. The
-  descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  `remove_on_exec` disables one then for good. `prctl`'s
+  `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` disable and enable every
+  event the calling thread opened, whatever task it counts (one opened
+  disabled too), and read no other argument; a thread that runs `execve`
+  keeps the events it opened. With `sample_simd_regs_enabled`, the SIMD
+  register fields of Linux master's structure are checked as x86's
+  `perf_simd_reg_validate` checks them (`EINVAL`): XMM or YMM (2 or 4
+  quadwords) all 16 registers, ZMM (8) all 32, the opmask ones (1) all 8,
+  or none; a valid use of them is `EOPNOTSUPP`, as a software event takes
+  none. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and

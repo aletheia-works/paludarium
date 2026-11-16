@@ -225,17 +225,20 @@ verified.
   and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
   disables the event at its task's `execve` and leaves it to be read, where
   Linux takes it out of the task's context, and the members of a group it
-  led count on their own. The events that wait for an `execve` are kept in
-  one list for every emulated machine, matched by thread group and thread,
-  and dropped as they close. A group's members count whatever software
+  led count on their own. The events that wait for an `execve`, and those
+  each thread opened, are kept per emulated machine, matched by thread
+  group and thread, and dropped as they close. A thread that ends without
+  an `execve` keeps the events it opened, where Linux takes them from it,
+  so a later thread of the same number in that group, once the numbers
+  have gone round, would find them. A group's members count whatever software
   clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
   group no count on the x86-64 machines the tests run on (why was not found).
-  The SIMD register
-  fields of Linux master's structure are not checked, and any use of them is
-  `EOPNOTSUPP`. `kernel.perf_event_paranoid` is always 2 (Debian's and
+  The SIMD register fields of Linux master's 176-byte structure are checked
+  as master checks them and not compared with Linux: the test machines'
+  Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
+  0. `kernel.perf_event_paranoid` is always 2 (Debian's and
   Ubuntu's kernels default to more), and its `/proc/sys/kernel` file cannot
-  be written (mode 0444), where Linux's root may write Linux's (0644),
-  and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
+  be written (mode 0444), where Linux's root may write Linux's (0644).
 - **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
   links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
@@ -264,7 +267,12 @@ verified.
   only a map larger than the machine's 4 GiB is `ENOMEM`, where Linux may
   also run out of the memory it really has. A preallocated hash counts a
   spare element for each CPU of the host, where Linux counts the possible
-  CPUs, which may be more. Map IDs are the emulated machine's, so they
+  CPUs, which may be more. The checks follow Linux master where the test
+  machines' Linux 7.0 differs: a hash whose key and value take 4 MiB less
+  64 bytes or more is `E2BIG` (7.0 takes up to 4 MiB less 48), and
+  `BPF_F_RDONLY` with `BPF_F_WRONLY` is refused once the map is made (7.0
+  refuses it before the NUMA node and the type, so another error may come
+  first here). Map IDs are the emulated machine's, so they
   start at 1 and do not see the host's maps. `BPF_F_MMAPABLE` is taken but `mmap` of a map
   is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
   `kernel.unprivileged_bpf_disabled` is always 2, and its

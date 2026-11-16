@@ -10,8 +10,10 @@
 //!
 //! An event is read (`read`), enabled, disabled and reset (the `ioctl`s,
 //! with `PERF_IOC_FLAG_GROUP`), and grouped; `enable_on_exec` enables it
-//! when its task runs `execve`. There is no ring buffer: `mmap` of an
-//! event is `ENODEV`, and a sampling event takes no samples.
+//! when its task runs `execve`, and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE`
+//! and `ENABLE` disable and enable those the calling thread opened. The
+//! machine keeps both lists ([`Events`]). There is no ring buffer: `mmap`
+//! of an event is `ENODEV`, and a sampling event takes no samples.
 use crate::ThreadGroup;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{ClockId, FileHandle, FileStat, Host};
@@ -92,6 +94,11 @@ const FORMAT_MAX: u64 = 32;
 /// extended registers no software event takes.
 const REGS_REFUSED: u64 = 0xf << 12 | 0xff << 24;
 const REGS_EXTENDED: u64 = 0xffff_ffff << 32;
+/// With SIMD registers, `perf_reg_validate` refuses DS, ES, FS and GS
+/// (`REG_NOSUPPORT`) and the bits from `PERF_REG_MISC_MAX` (41) on
+/// (`PERF_REG_X86_EXT_RESERVED`): the mask then names the general
+/// registers, the extended ones (R16 to R31) and SSP.
+const REGS_SIMD_REFUSED: u64 = 0xf << 12 | !((1 << 41) - 1);
 
 /// The bits of the flags word, by position.
 mod bit {
@@ -131,7 +138,16 @@ struct Attr {
     aux_action: u32,
     reserved_2: u16,
     simd_enabled: u16,
+    /// `sample_simd_pred_reg_qwords` and `sample_simd_vec_reg_qwords`.
+    pred_qwords: u16,
+    vec_qwords: u16,
     reserved_4: u16,
+    /// `sample_simd_pred_reg_intr`, `_user`, and `sample_simd_vec_reg_intr`,
+    /// `_user`.
+    pred_intr: u32,
+    pred_user: u32,
+    vec_intr: u64,
+    vec_user: u64,
 }
 
 impl Attr {
@@ -223,7 +239,13 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
         reserved_2: quarter(&b, 110),
         aux_action: half(&b, 116),
         simd_enabled: quarter(&b, 144),
+        pred_qwords: quarter(&b, 146),
+        vec_qwords: quarter(&b, 148),
         reserved_4: quarter(&b, 150),
+        pred_intr: half(&b, 152),
+        pred_user: half(&b, 156),
+        vec_intr: word(&b, 160),
+        vec_user: word(&b, 168),
     };
     if attr.flags >> bit::RESERVED != 0
         || attr.reserved_2 != 0
@@ -256,17 +278,8 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
             allow_kernel(c)?;
         }
     }
-    // Without SIMD registers; their own checks (`perf_simd_reg_validate`)
-    // are not made, as no software event takes them.
-    let regs = |mask: u64| {
-        if attr.simd_enabled == 0 && (mask == 0 || mask & REGS_REFUSED != 0) {
-            Err(Errno::EINVAL)
-        } else {
-            Ok(())
-        }
-    };
     if attr.sample_type & SAMPLE_REGS_USER != 0 {
-        regs(attr.sample_regs_user)?;
+        regs(&attr, attr.sample_regs_user, attr.vec_user, attr.pred_user)?;
     }
     if attr.sample_type & SAMPLE_STACK_USER != 0
         && (attr.sample_stack_user >= u32::from(u16::MAX)
@@ -275,7 +288,7 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
         return Err(Errno::EINVAL);
     }
     if attr.sample_type & SAMPLE_REGS_INTR != 0 {
-        regs(attr.sample_regs_intr)?;
+        regs(&attr, attr.sample_regs_intr, attr.vec_intr, attr.pred_intr)?;
     }
     if attr.sample_type & SAMPLE_WEIGHT != 0 && attr.sample_type & SAMPLE_WEIGHT_STRUCT != 0 {
         return Err(Errno::EINVAL);
@@ -290,6 +303,60 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
         return Err(Errno::EINVAL);
     }
     Ok(attr)
+}
+
+/// x86-64's `perf_reg_validate` of a register mask and, with SIMD
+/// registers (`sample_simd_regs_enabled`), `perf_simd_reg_validate` of the
+/// vector and predicate ones (`EINVAL`).
+fn regs(attr: &Attr, mask: u64, vector: u64, predicate: u32) -> Result<(), Errno> {
+    if attr.simd_enabled == 0 {
+        return if mask == 0 || mask & REGS_REFUSED != 0 {
+            Err(Errno::EINVAL)
+        } else {
+            Ok(())
+        };
+    }
+    // The mask may be 0 when only the SIMD registers are asked for.
+    if mask & REGS_SIMD_REFUSED != 0 {
+        return Err(Errno::EINVAL);
+    }
+    simd_regs(attr.vec_qwords, vector, attr.pred_qwords, predicate)
+}
+
+/// x86's `perf_simd_reg_validate`: vector registers of XMM (2 quadwords),
+/// YMM (4) or ZMM (8) size, all 16, 16 or 32 of them or none, and the
+/// opmask registers (1 quadword), all 8 or none, for no more than half of
+/// a 64 KiB sample with the 4 quadwords before them.
+fn simd_regs(vec_qwords: u16, vector: u64, pred_qwords: u16, predicate: u32) -> Result<(), Errno> {
+    /// Whether the first `n` registers of `mask` are all there, or none is.
+    fn whole(mask: u64, n: u32) -> bool {
+        let first = (1u64 << n) - 1;
+        mask == 0 || mask & first == first
+    }
+    if vec_qwords == 0 && pred_qwords == 0 && (vector != 0 || predicate != 0) {
+        return Err(Errno::EINVAL);
+    }
+    if vec_qwords != 0 {
+        let registers = match vec_qwords {
+            2 | 4 => 16,
+            8 => 32,
+            _ => return Err(Errno::EINVAL),
+        };
+        if vector >> 32 != 0 || !whole(vector, registers) {
+            return Err(Errno::EINVAL);
+        }
+    }
+    if pred_qwords != 0 && (pred_qwords != 1 || predicate >> 8 != 0 || !whole(predicate.into(), 8))
+    {
+        return Err(Errno::EINVAL);
+    }
+    let qwords = 4
+        + u64::from(vector.count_ones()) * u64::from(vec_qwords)
+        + u64::from(predicate.count_ones()) * u64::from(pred_qwords);
+    if qwords * 8 >= u64::from(u16::MAX) / 2 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 /// What an event counts.
@@ -345,10 +412,97 @@ pub(crate) struct Event {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-/// The events that wait for their task's `execve` (`enable_on_exec` and
-/// `remove_on_exec`), of every emulated machine: each is matched by its
-/// task's thread group as well as its thread ID.
-static ON_EXEC: Mutex<Vec<Weak<Event>>> = Mutex::new(Vec::new());
+
+/// The machine's events by the thread that opened them (each task's
+/// `perf_event_list`, for `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE`), and
+/// those that wait for their task's `execve` (`enable_on_exec` and
+/// `remove_on_exec`), each matched by its task's thread group as well as
+/// its thread ID.
+#[derive(Default)]
+pub(crate) struct Events {
+    lists: Mutex<Lists>,
+}
+
+#[derive(Default)]
+struct Lists {
+    owned: Vec<Owned>,
+    on_exec: Vec<Erased>,
+}
+
+/// A reference that holds an [`Event`] or a [`ThreadGroup`] by no
+/// particular type. `Processes` keeps these lists, and an event holds its
+/// task's group, which leads back to `Processes`: kept by their own types,
+/// the compiler's checks of what may be sent between threads would go
+/// round that loop past their limit.
+type Erased = Weak<dyn std::any::Any + Send + Sync>;
+
+fn erase<T: Send + Sync + 'static>(value: &Arc<T>) -> Erased {
+    let value: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(value) as _;
+    Arc::downgrade(&value)
+}
+
+/// The event an [`Erased`] holds, while it is there.
+fn event(erased: &Erased) -> Option<Arc<Event>> {
+    erased.upgrade()?.downcast::<Event>().ok()
+}
+
+/// An event and the thread that opened it (`event->owner`).
+struct Owned {
+    group: Erased,
+    tid: u32,
+    event: Erased,
+}
+
+impl Owned {
+    fn of(&self, group: &ThreadGroup) -> bool {
+        std::ptr::addr_eq(self.group.as_ptr(), group)
+    }
+}
+
+impl Events {
+    /// A new event, opened by thread `tid` of `group`; those of events that
+    /// are gone go first.
+    fn add(&self, event: &Arc<Event>, group: &Arc<ThreadGroup>, tid: u32) {
+        let mut lists = lock(&self.lists);
+        lists.owned.retain(|owned| owned.event.strong_count() > 0);
+        lists.on_exec.retain(|event| event.strong_count() > 0);
+        lists.owned.push(Owned {
+            group: erase(group),
+            tid,
+            event: erase(event),
+        });
+        let attr = &event.attr;
+        if attr.flag(bit::DISABLED) && attr.flag(bit::ENABLE_ON_EXEC)
+            || attr.flag(bit::REMOVE_ON_EXEC)
+        {
+            lists.on_exec.push(erase(event));
+        }
+    }
+
+    /// The events thread `tid` of `group` opened.
+    fn owned_by(&self, group: &ThreadGroup, tid: u32) -> Vec<Arc<Event>> {
+        lock(&self.lists)
+            .owned
+            .iter()
+            .filter(|owned| owned.tid == tid && owned.of(group))
+            .filter_map(|owned| event(&owned.event))
+            .collect()
+    }
+}
+
+/// `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` (`perf_event_task_disable`,
+/// `perf_event_task_enable`): every event the calling thread opened,
+/// whatever task it counts, is disabled or enabled, as its ioctl without
+/// `PERF_IOC_FLAG_GROUP` does; the other arguments are not read.
+pub(crate) fn prctl_task_events(events: &Events, group: &ThreadGroup, tid: u32, enable: bool) {
+    for event in events.owned_by(group, tid) {
+        if enable {
+            event.enable();
+        } else {
+            event.disable();
+        }
+    }
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -695,13 +849,9 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if !attr.flag(bit::DISABLED) {
         event.enable();
     }
-    if attr.flag(bit::DISABLED) && attr.flag(bit::ENABLE_ON_EXEC) || attr.flag(bit::REMOVE_ON_EXEC)
-    {
-        let mut waiting = lock(&ON_EXEC);
-        // Those of events that are gone go first.
-        waiting.retain(|event| event.strong_count() > 0);
-        waiting.push(Arc::downgrade(&event));
-    }
+    // The caller's own group, which owns the event.
+    let own = c.processes.view(c.process.pid).ok_or(ESRCH)?.group;
+    c.processes.perf_events.add(&event, &own, c.tid);
     let cloexec = flags & PERF_FLAG_FD_CLOEXEC != 0;
     c.files
         .install(Arc::new(EventFile { event }), cloexec, c.group.nofile())
@@ -741,15 +891,25 @@ fn init(attr: &Attr) -> Result<Counter, Errno> {
     }
 }
 
-/// What an `execve` by thread `tid` (its number before the exec) of thread
-/// group `group` does to the
-/// events that wait for it: one with `enable_on_exec` is enabled
-/// (`perf_event_enable_on_exec`), and one with `remove_on_exec` is
-/// disabled for good (`perf_event_remove_on_exec`).
-pub(crate) fn exec(group: &ThreadGroup, tid: u32) {
-    let mut waiting = lock(&ON_EXEC);
-    waiting.retain(|event| {
-        let Some(event) = event.upgrade() else {
+/// What an `execve` by thread `tid` (its number before the exec, `new_tid`
+/// after it) of thread group `group` does to the machine's events: one
+/// with `enable_on_exec` that waits for it is enabled
+/// (`perf_event_enable_on_exec`), one with `remove_on_exec` is disabled for
+/// good (`perf_event_remove_on_exec`); the events the thread opened stay
+/// its own under its new number, and those the group's other threads, which
+/// the exec ends, opened have no owner any more (`perf_event_exit_task`).
+pub(crate) fn exec(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32) {
+    let mut lists = lock(&events.lists);
+    lists
+        .owned
+        .retain(|owned| !owned.of(group) || owned.tid == tid);
+    for owned in &mut lists.owned {
+        if owned.of(group) {
+            owned.tid = new_tid;
+        }
+    }
+    lists.on_exec.retain(|waiting| {
+        let Some(event) = event(waiting) else {
             return false;
         };
         match &event.target {
@@ -911,5 +1071,42 @@ mod tests {
             ..attr(1, 0)
         };
         assert_eq!(init(&branch), Err(Errno::EOPNOTSUPP));
+    }
+
+    #[test]
+    fn simd_registers_are_checked_as_x86_checks_them() {
+        let simd = |vec_qwords, pred_qwords| Attr {
+            simd_enabled: 1,
+            vec_qwords,
+            pred_qwords,
+            ..Attr::default()
+        };
+        // Without SIMD registers, a mask is needed, without DS to GS.
+        assert_eq!(regs(&Attr::default(), 0, 0, 0), Err(Errno::EINVAL));
+        assert_eq!(regs(&Attr::default(), 1 << 12, 0, 0), Err(Errno::EINVAL));
+        assert_eq!(regs(&Attr::default(), 1, 0, 0), Ok(()));
+        // With them, the mask may be 0 and may name R16 to R31 and SSP.
+        assert_eq!(regs(&simd(0, 0), 0, 0, 0), Ok(()));
+        assert_eq!(regs(&simd(0, 0), 1 << 40, 0, 0), Ok(()));
+        assert_eq!(regs(&simd(0, 0), 1 << 41, 0, 0), Err(Errno::EINVAL));
+        assert_eq!(regs(&simd(0, 0), 1 << 15, 0, 0), Err(Errno::EINVAL));
+        // Registers without a size.
+        assert_eq!(regs(&simd(0, 0), 0, 0xffff, 0), Err(Errno::EINVAL));
+        // All 16 XMM or YMM registers, all 32 ZMM ones, or none.
+        assert_eq!(regs(&simd(2, 0), 0, 0xffff, 0), Ok(()));
+        assert_eq!(regs(&simd(4, 0), 0, 0xffff, 0), Ok(()));
+        assert_eq!(regs(&simd(2, 0), 0, 0xff, 0), Err(Errno::EINVAL));
+        assert_eq!(regs(&simd(8, 0), 0, 0xffff, 0), Err(Errno::EINVAL));
+        assert_eq!(regs(&simd(8, 0), 0, 0xffff_ffff, 0), Ok(()));
+        assert_eq!(regs(&simd(8, 0), 0, 1 << 32, 0), Err(Errno::EINVAL));
+        assert_eq!(regs(&simd(3, 0), 0, 0, 0), Err(Errno::EINVAL));
+        assert_eq!(regs(&simd(2, 0), 0, 0, 0), Ok(()));
+        // The 8 opmask registers, of 1 quadword.
+        assert_eq!(regs(&simd(0, 1), 0, 0, 0xff), Ok(()));
+        assert_eq!(regs(&simd(0, 1), 0, 0, 0x7f), Err(Errno::EINVAL));
+        assert_eq!(regs(&simd(0, 1), 0, 0, 0x1ff), Err(Errno::EINVAL));
+        assert_eq!(regs(&simd(0, 2), 0, 0, 0xff), Err(Errno::EINVAL));
+        // 4 + 32 * 8 + 8 quadwords fit in half of 64 KiB.
+        assert_eq!(regs(&simd(8, 1), 0, 0xffff_ffff, 0xff), Ok(()));
     }
 }

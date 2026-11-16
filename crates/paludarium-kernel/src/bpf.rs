@@ -7,11 +7,14 @@
 //! every command makes first (`bpf_check_uarg_tail_zero`, `CHECK_ATTR`)
 //! and `kernel.unprivileged_bpf_disabled` at Linux's default 2.
 //!
-//! The memory a map takes (fdinfo's `memlock`, and the `ENOMEM` of one
-//! larger than the machine's memory) is counted with the x86-64 structure
-//! sizes of the kernel the test machines run, Ubuntu's Linux 7.0 builds,
-//! which the differential tests compare with; see [`ARRAY_HEADER`] and
-//! [`HASH_HEADER`] for where they part from upstream v7.0 and master.
+//! The checks and their order follow Linux master, where the x86-64 test
+//! machines' kernel (Ubuntu's Linux 7.0) differs too: a hash's key and
+//! value limit, and where `BPF_F_RDONLY` with `BPF_F_WRONLY` is refused.
+//! Only what the differential tests compare with that kernel keeps its
+//! values until it catches up with master: the memory a map takes
+//! (fdinfo's `memlock`, and the `ENOMEM` of one larger than the machine's
+//! memory), counted with its x86-64 structure sizes; see [`ARRAY_HEADER`]
+//! and [`HASH_HEADER`] for where they part from upstream v7.0 and master.
 //!
 //! A command Linux has that is not here (programs, BTF, links, pins and the
 //! rest) is `ENOSYS`; one Linux does not have is `EINVAL`, as there. Map
@@ -372,7 +375,9 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
                 return Err(Errno::EINVAL);
             }
             // KMALLOC_MAX_SIZE, 4 MiB with SLUB on x86-64, less the LRU
-            // element's header.
+            // element's header (64 bytes), as Linux master has it; the test
+            // machines' Linux 7.0 takes 16 bytes more (less 48, the size of
+            // its `struct htab_elem`).
             if u64::from(key_size) + u64::from(value_size) >= (1 << 22) - 64 {
                 return Err(E2BIG);
             }
@@ -426,6 +431,9 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     } else if excl_hash_size != 0 {
         return Err(Errno::EINVAL);
     }
+    // As Linux master's `map_create`, once the map is made; the test
+    // machines' Linux 7.0 refuses both flags before the NUMA node and the
+    // type.
     let access = file_access(flags)?;
     let ids = &c.processes.bpf_maps;
     let map = ids.publish(|id| Map {

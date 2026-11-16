@@ -2797,7 +2797,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
   と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
   イベントをそのタスクの `execve` で有効にし、`remove_on_exec` はそのとき
-  イベントを以後ずっと無効にします。ディスクリプタのリンクは
+  イベントを以後ずっと無効にします。`prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と `ENABLE` は、
+  呼んだスレッドが開いたすべてのイベントを、どのタスクを数えるものでも（無効で開いたものも）
+  無効または有効にし、ほかの引数は読みません。`execve` を実行したスレッドは、開いたイベントを
+  そのまま持ちます。`sample_simd_regs_enabled` があると、Linux master の構造体の SIMD
+  レジスタのフィールドを、x86 の `perf_simd_reg_validate` と同じく確かめます（`EINVAL`）。
+  XMM か YMM（2 か 4 クワッドワード）は 16 個すべて、ZMM（8）は 32 個すべて、opmask（1）は
+  8 個すべてか、どれもないかです。正しく使っても、ソフトウェアのイベントは取らないので
+  `EOPNOTSUPP` です。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを

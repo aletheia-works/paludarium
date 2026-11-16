@@ -230,6 +230,9 @@ pub struct Processes {
     pub(crate) traces: crate::ptrace::Traces,
     /// The machine's BPF maps by ID.
     pub(crate) bpf_maps: Arc<crate::bpf::Ids>,
+    /// The machine's perf events by the thread that opened them, and those
+    /// that wait for an `execve`.
+    pub(crate) perf_events: crate::perf::Events,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -255,6 +258,7 @@ impl Processes {
             aio: Arc::default(),
             traces: crate::ptrace::Traces::default(),
             bpf_maps: Arc::default(),
+            perf_events: crate::perf::Events::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -2315,7 +2319,12 @@ impl Kernel {
                         // The events that wait for it start counting, as
                         // `begin_new_exec` runs `perf_event_exec` before the
                         // tracer's exec stop.
-                        crate::perf::exec(&self.group, tid);
+                        crate::perf::exec(
+                            &self.processes.perf_events,
+                            &self.group,
+                            tid,
+                            thread.tid,
+                        );
                         self.ptrace_exec(thread);
                         return Some(Next::Resume);
                     }
@@ -2474,6 +2483,17 @@ impl Kernel {
                 if let Some(done) = thread.state.credentials.prctl(a) {
                     return done;
                 }
+            }
+            // PR_TASK_PERF_EVENTS_DISABLE and ENABLE: the events the thread
+            // opened.
+            31 | 32 => {
+                crate::perf::prctl_task_events(
+                    &self.processes.perf_events,
+                    &self.group,
+                    thread.tid,
+                    a[0] == 32,
+                );
+                return Ok(0);
             }
             // PR_GET_SECCOMP, PR_SET_SECCOMP
             21 => return Ok(crate::seccomp::mode(&thread.state)),

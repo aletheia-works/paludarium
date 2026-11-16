@@ -38,6 +38,11 @@ jobs:
           packages: musl-tools cmake perl make pkg-config
       - uses: ./.github/actions/rust-toolchain
       - run: bash scripts/rustup-retry.sh target add x86_64-unknown-linux-musl --toolchain "$RUST_TOOLCHAIN"
+      # The guests' build checks their dependencies with cargo-deny.
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          install_args: cargo-deny
+          cache: false
       - name: Build the emulator, and a wrapper that turns the JIT on
         run: |
           lscpu | grep -E 'Model name|^CPU\(s\)'

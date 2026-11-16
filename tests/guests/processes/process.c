@@ -10246,6 +10246,10 @@ static int sa_inner(void) {
     printf("open_tree_attr");
     RM("size-alone", sa_tree(AT_FDCWD, a, 1, NULL, 32));
     RM("plain-not-root", sa_tree(AT_FDCWD, sa_base, 0, ro, 32));
+    unsigned long long noexec[5] = {8, 0, 0, 0, 0};
+    long plain = sa_tree(AT_FDCWD, a, 0, noexec, 32);
+    printf(" plain=%d", plain >= 0);
+    close((int)plain);
     unsigned long long copy[5] = {1, 0, MS_PRIVATE, 0, 0};
     long tree = sa_tree(AT_FDCWD, a, 1 | AT_RECURSIVE, copy, 32);
     printf(" tree=%d", tree >= 0);
@@ -10253,6 +10257,7 @@ static int sa_inner(void) {
     close((int)tree);
     printf("\n");
     snprintf(path, sizeof path, "%s/in", b);
+    rm_info("a", a, NULL);
     rm_info("b", b, NULL);
     rm_info("b/in", path, NULL);
     return 0;

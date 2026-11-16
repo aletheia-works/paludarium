@@ -1831,7 +1831,8 @@ impl NamespacedFs {
     /// read-only with a file open for writing on it `EBUSY`
     /// (`mnt_hold_writers`), changing none. Then each takes `propagation`,
     /// as [`Self::change_type`] gives it. A mount of a detached tree but
-    /// for its root is `EINVAL` (`anon_ns_root`).
+    /// for its root is `EINVAL` (`anon_ns_root`). Setting `NOSYMFOLLOW` on
+    /// a mount without it is not supported (`EOPNOTSUPP`).
     pub fn set_attributes(
         &self,
         id: u64,
@@ -1873,10 +1874,18 @@ impl NamespacedFs {
             {
                 return Err(EBUSY);
             }
-            changed.push((*at, flags));
+            changed.push((*at, flags, m.flags));
+        }
+        // Setting `MNT_NOSYMFOLLOW`, which no mount here keeps to, is not
+        // supported, on any mount of the tree.
+        if changed
+            .iter()
+            .any(|(_, new, old)| new & !old & NOSYMFOLLOW != 0)
+        {
+            return Err(Errno::EOPNOTSUPP);
         }
         self.table.update(|entries| {
-            for (at, flags) in &changed {
+            for (at, flags, _) in &changed {
                 if let Some(e) = entries.iter_mut().find(|e| e.id() == *at) {
                     e.flags = *flags;
                 }

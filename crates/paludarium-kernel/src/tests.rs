@@ -8777,6 +8777,12 @@ fn mount_setattr_changes_flags_and_propagation() {
     let fd = f.ret(2, &[file, 0o101, 0o644]);
     assert_eq!(f.ret(442, &[fdcwd, m, 0, set_ro, 32]), errno(Errno(16)));
     assert_eq!(f.ret(3, &[fd]), 0);
+    // NOSYMFOLLOW, on the mount below too, is not supported.
+    let nosymfollow = attr(&mut f, 0x3c0, [0x0020_0000, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(442, &[fdcwd, m, recursive, nosymfollow, 32]),
+        errno(Errno::EOPNOTSUPP)
+    );
     assert_eq!(f.ret(442, &[fdcwd, m, recursive, set_ro, 32]), 0);
     let deep = put(&mut f, 0xe0, b"/tmp/m/in/g");
     assert_eq!(f.ret(83, &[deep, 0o755]), errno(Errno(30)));

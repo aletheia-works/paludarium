@@ -261,17 +261,14 @@ fn wanted_change(
 
 /// `do_mount_setattr` at the resolved `path`: a mount's root (`EINVAL`),
 /// of the namespace or a detached tree's root (`EINVAL`), then the change
-/// ([`paludarium_vfs::NamespacedFs::set_attributes`]). Setting
-/// `MOUNT_ATTR_NOSYMFOLLOW` on a mount that has it not is not supported
+/// ([`paludarium_vfs::NamespacedFs::set_attributes`]), where setting
+/// `MOUNT_ATTR_NOSYMFOLLOW` on any mount that has it not is not supported
 /// (`EOPNOTSUPP`).
 fn apply_change(c: &Context<'_>, path: &[u8], change: &Change) -> Result<(), Errno> {
     let namespaced = c.files.namespaced();
     let found = namespaced.target(path)?;
     if !found.root {
         return Err(Errno::EINVAL);
-    }
-    if change.set & !found.flags & mnt::NOSYMFOLLOW != 0 {
-        return Err(Errno::EOPNOTSUPP);
     }
     namespaced.set_attributes(
         found.id,

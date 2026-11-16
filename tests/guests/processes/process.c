@@ -14631,7 +14631,7 @@ static int kernel_sysctl_case(void) {
     for (int i = 0; i < 2; i++) {
         char path[96], text[32] = {0};
         snprintf(path, sizeof path, "/proc/sys/kernel/%s", names[i]);
-        struct stat st;
+        struct stat st = {0};
         errno = 0;
         long stated = stat(path, &st) ? -errno : 0;
         int fd = open(path, O_RDONLY | O_CLOEXEC);

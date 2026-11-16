@@ -507,8 +507,9 @@ fn line(value: i32) -> Vec<u8> {
 /// setting to write only by the root of the namespace's owner (`EACCES`),
 /// as `mq_permissions` lets the owner's root have the owner's bits and
 /// everyone else the others', and so a `/proc/sys/kernel` IPC limit
-/// (`ipc_permissions`); `perf_event_paranoid` and
-/// `unprivileged_bpf_disabled` to no one (`EACCES`).
+/// (`ipc_permissions`); the machine's `perf_event_paranoid` and
+/// `unprivileged_bpf_disabled` to write only by root (`EACCES`), as
+/// `test_perm` gives the root user ID the owner's bits.
 pub(crate) fn open(
     c: &Context<'_>,
     entry: Entry,

@@ -1872,7 +1872,10 @@ kernel.
     last `rtnetlink` knows (`RTM_MAX`, 123) is sent, and answered with
     `EOPNOTSUPP`, as `rtnetlink_rcv_msg` does. Anything but a `GET` needs `CAP_NET_ADMIN` in
     the user namespace that owns the network namespace, for the sending
-    thread and the socket's opener (`EPERM`).
+    thread and the socket's opener (`EPERM`); a send that names an
+    address (`sendto`, `sendmsg` with a name) needs the sending thread's
+    alone, as `netlink_sendmsg` marks it `NETLINK_SKB_DST`, which
+    `__netlink_ns_capable` passes the opener over for.
   - **Strict checking:** with `NETLINK_GET_STRICT_CHK`, as iproute2 sets
     it, requests are checked as Linux checks them. A dump takes a whole
     header with nothing in it but what may narrow it, and of the
@@ -1926,7 +1929,8 @@ kernel.
     find the namespace those name as `rtnl_link_get_net_capable` does,
     before `lo` is looked for: `ESRCH`, `EBADF` or `EINVAL` for a process,
     descriptor or ID that names none, and `EPERM` without
-    `CAP_NET_ADMIN` over it, the opener's and the sender's. `lo` is found
+    `CAP_NET_ADMIN` over it, the opener's and the sender's (the sender's
+    alone for a send that names an address, as above). `lo` is found
     (`RTM_NEWLINK` with `NLM_F_CREATE` and `NLM_F_EXCL` finds it in that
     namespace, where it is too, so `EEXIST`), and moving it to another
     namespace is `EINVAL`, as its namespace is immutable

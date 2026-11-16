@@ -133,19 +133,20 @@ enum Reference {
 /// A peer a request names, as found.
 type Found = Result<Arc<Network>, Errno>;
 /// What [`resolve`] found, and the sender's credentials.
-type Resolution = (Vec<(Reference, Found)>, Option<Credentials>);
+type Resolution = (Vec<(Reference, Found)>, Option<Credentials>, bool);
 thread_local! {
     /// The peers the requests of the datagram being sent name, found with
-    /// the sender's view before the kernel takes them, and the sender's
-    /// credentials ([`resolve`]).
+    /// the sender's view before the kernel takes them, the sender's
+    /// credentials, and whether the send names an address
+    /// (`NETLINK_SKB_DST`) ([`resolve`]).
     static RESOLVED: RefCell<Resolution> =
-        const { RefCell::new((Vec::new(), None)) };
+        const { RefCell::new((Vec::new(), None, false)) };
 }
 /// What [`resolve`] found, until it is dropped.
 pub(crate) struct Resolved;
 impl Drop for Resolved {
     fn drop(&mut self) {
-        RESOLVED.with(|r| *r.borrow_mut() = (Vec::new(), None));
+        RESOLVED.with(|r| *r.borrow_mut() = (Vec::new(), None, false));
     }
 }
 /// Finds, as the caller of `c` sees them, the namespaces each
@@ -155,8 +156,9 @@ impl Drop for Resolved {
 /// `IFLA_NET_NS_FD`, for the kernel to take as it reaches them; finding
 /// one changes nothing.
 /// A `write` finds them as its caller sees them too ([`super::resolving`]),
-/// as Linux looks in `current`'s.
-pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
+/// as Linux looks in `current`'s. `addressed` is whether the send names
+/// an address, as a `write` does not.
+pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8], addressed: bool) -> Resolved {
     let mut found = Vec::new();
     let mut any = false;
     while bytes.len() >= 16 {
@@ -209,7 +211,7 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
     }
     // Only those requests read the sender's credentials ([`admin_over`]).
     let credentials = any.then(|| c.process.credentials.clone());
-    RESOLVED.with(|r| *r.borrow_mut() = (found, credentials));
+    RESOLVED.with(|r| *r.borrow_mut() = (found, credentials, addressed));
     Resolved
 }
 /// The namespace `reference` names, for [`resolve`].
@@ -274,8 +276,10 @@ fn admin_over(opener: &Credentials, network: &Network) -> bool {
 /// `rtnl_link_get_net_capable`: the namespace a link change names by
 /// `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD`, as [`resolve`] found it, or by
 /// `IFLA_TARGET_NETNSID` (`EINVAL` for an ID none has); `EPERM` without
-/// `CAP_NET_ADMIN` over it, the sender's and the opener's
-/// (`netlink_ns_capable`). None for a change that names none.
+/// `CAP_NET_ADMIN` over it, the sender's and the opener's, or with a send
+/// that names an address the sender's alone (`netlink_ns_capable`, which
+/// passes over the opener for `NETLINK_SKB_DST`). None for a change that
+/// names none.
 pub(super) fn link_target(
     network: &Network,
     opener: &Credentials,
@@ -289,7 +293,19 @@ pub(super) fn link_target(
         (.., Some(id)) => network.netlink.ids.peer(id).ok_or(Errno::EINVAL)?,
         _ => return Ok(None),
     };
-    if !admin_over(opener, &named) {
+    let (current, addressed) = RESOLVED.with(|r| {
+        let r = r.borrow();
+        (r.1.clone(), r.2)
+    });
+    let capable = if addressed {
+        current
+            .as_ref()
+            .unwrap_or(opener)
+            .capable_in(CAP_NET_ADMIN, named.owner())
+    } else {
+        admin_over(opener, &named)
+    };
+    if !capable {
         return Err(Errno::EPERM);
     }
     Ok(Some(named))

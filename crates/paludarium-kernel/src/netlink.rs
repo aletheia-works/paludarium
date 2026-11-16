@@ -578,7 +578,12 @@ pub(crate) struct NetlinkSocket {
 #[derive(Clone, Copy)]
 struct Sender {
     pid: u32,
+    /// `CAP_NET_ADMIN` over the socket's namespace, the caller's and the
+    /// opener's (`netlink_net_capable`).
     admin: bool,
+    /// The caller's own, which alone counts for a send that names an
+    /// address (`NETLINK_SKB_DST`).
+    current_admin: bool,
     /// `CAP_BPF` or `CAP_SYS_ADMIN` over the machine (`bpf_capable`).
     bpf: bool,
     uid: u32,
@@ -701,12 +706,14 @@ impl NetlinkSocket {
     /// The calling thread, as a sender: Linux's `netlink_ns_capable` wants
     /// the capability of both it and whoever opened the socket.
     fn sender(&self, c: &Context<'_>) -> Sender {
+        let current_admin = c
+            .process
+            .credentials
+            .capable_in(CAP_NET_ADMIN, self.namespace.owner());
         Sender {
             pid: c.pid_space().number(c.process.pid),
-            admin: self.opener_admin
-                && c.process
-                    .credentials
-                    .capable_in(CAP_NET_ADMIN, self.namespace.owner()),
+            admin: self.opener_admin && current_admin,
+            current_admin,
             bpf: bpf_capable(&c.process.credentials),
             uid: c.shown_uid(c.process.credentials.uid),
         }
@@ -907,6 +914,17 @@ impl NetlinkSocket {
     /// binds first; more than the send buffer takes is `EMSGSIZE`; another
     /// socket's port that none has is `ECONNREFUSED`.
     fn send(&self, bytes: &[u8], to: Option<(u32, u32)>, sender: Sender) -> Result<usize, Errno> {
+        // `netlink_sendmsg` marks a send that names an address
+        // (`NETLINK_SKB_DST`), for which `__netlink_ns_capable` looks at
+        // the sender's own capability alone, not the opener's.
+        let sender = if to.is_some() {
+            Sender {
+                admin: sender.current_admin,
+                ..sender
+            }
+        } else {
+            sender
+        };
         let mut s = self.lock();
         let (to, group) = match to {
             Some((port, groups)) => {
@@ -1640,6 +1658,7 @@ impl FileHandle for NetlinkSocket {
         let sender = Sender {
             pid: self.opener_pid,
             admin: self.opener_admin,
+            current_admin: self.opener_admin,
             bpf: self.opener_bpf,
             uid: self.opener_uid,
         };
@@ -5350,7 +5369,7 @@ pub(crate) fn resolving(
 ) -> Option<nsid::Resolved> {
     of(file)
         .filter(|socket| socket.protocol == NETLINK_ROUTE)
-        .map(|_| nsid::resolve(c, bytes))
+        .map(|_| nsid::resolve(c, bytes, false))
 }
 /// What a receive returns: with `MSG_TRUNC`, the datagram's whole length.
 fn returned(n: usize, length: usize, flags: u64) -> u64 {
@@ -5372,7 +5391,8 @@ fn send(
         return Err(EOPNOTSUPP);
     }
     let dontwait = flags & MSG_DONTWAIT != 0 || socket.nonblocking();
-    let _resolved = (socket.protocol == NETLINK_ROUTE).then(|| nsid::resolve(c, bytes));
+    let _resolved =
+        (socket.protocol == NETLINK_ROUTE).then(|| nsid::resolve(c, bytes, to.is_some()));
     loop {
         let ticket = c.files.readiness.token.value();
         match socket.send(bytes, to, sender) {

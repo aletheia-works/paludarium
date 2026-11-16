@@ -1638,7 +1638,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`RTM_MAX`、123）より後の型のメッセージも送れて、`rtnetlink_rcv_msg` と同じく
     `EOPNOTSUPP` を返します。`GET` のほかには、ネットワーク
     名前空間を持つユーザーの名前空間での `CAP_NET_ADMIN` が、送るスレッドとソケットを
-    開いたものの両方に要ります（なければ `EPERM`）。
+    開いたものの両方に要ります（なければ `EPERM`）。アドレスを指して送るとき
+    （`sendto`、名前を付けた `sendmsg`）は、`netlink_sendmsg` がそれに `NETLINK_SKB_DST` の
+    印を付け、`__netlink_ns_capable` が開いた側を見ないので、送るスレッドのものだけが要ります。
   - **厳密な検査:** iproute2 と同じく `NETLINK_GET_STRICT_CHK` を設定すると、Linux と
     同じくリクエストを調べます。ダンプには、絞り込みに使うもの以外は空のヘッダーが
     そろっていて、属性は絞り込みに使うものだけで、型が知られたもので、余るバイトが
@@ -1681,7 +1683,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **リンクの変更とほかの名前空間:** `RTM_SETLINK` と `RTM_NEWLINK` は、
     `rtnl_link_get_net_capable` と同じく、`lo` を探す前に、それらが指す名前空間を探します。
     どれも指さないプロセス、記述子、ID は `ESRCH`、`EBADF`、`EINVAL` で、その名前空間への
-    `CAP_NET_ADMIN` が、開いた側と送り手のどちらかになければ `EPERM` です。`lo` が見つかると
+    `CAP_NET_ADMIN` が、開いた側と送り手のどちらかになければ `EPERM` です（アドレスを指して
+    送るときは、前述のとおり送り手のものだけを見ます）。`lo` が見つかると
     （`NLM_F_CREATE` と `NLM_F_EXCL` の `RTM_NEWLINK` はその名前空間で探し、そこにも
     あるので `EEXIST`）、ほかの名前空間への移動は、ほかのどの属性よりも先に、`lo` の名前空間は
     変えられないので `EINVAL` です（`__dev_change_net_namespace`）。プロセス、記述子、ID で

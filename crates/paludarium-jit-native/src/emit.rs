@@ -354,6 +354,44 @@ impl Emitter<'_, '_> {
         let (b0, b1) = self.xmm_words(src);
         let (low, high) = match op {
             Mnemonic::Punpcklqdq => (a0, b0),
+            Mnemonic::Paddq => (self.b.ins().iadd(a0, b0), self.b.ins().iadd(a1, b1)),
+            Mnemonic::Psubq => (self.b.ins().isub(a0, b0), self.b.ins().isub(a1, b1)),
+            Mnemonic::Pand => (self.b.ins().band(a0, b0), self.b.ins().band(a1, b1)),
+            Mnemonic::Por => (self.b.ins().bor(a0, b0), self.b.ins().bor(a1, b1)),
+            Mnemonic::Pandn => (self.b.ins().band_not(b0, a0), self.b.ins().band_not(b1, a1)),
+            Mnemonic::Paddd | Mnemonic::Psubd => {
+                let add = op == Mnemonic::Paddd;
+                let mut out = [a0, a1];
+                for (w, (a, b)) in out.iter_mut().zip([(a0, b0), (a1, b1)]) {
+                    // Each dword on its own, so that no carry or borrow
+                    // crosses into the other.
+                    let low = if add {
+                        self.b.ins().iadd(a, b)
+                    } else {
+                        self.b.ins().isub(a, b)
+                    };
+                    let low = self.b.ins().band_imm_s(low, 0xffff_ffff);
+                    let a_up = self.b.ins().ushr_imm_s(a, 32);
+                    let b_up = self.b.ins().ushr_imm_s(b, 32);
+                    let up = if add {
+                        self.b.ins().iadd(a_up, b_up)
+                    } else {
+                        self.b.ins().isub(a_up, b_up)
+                    };
+                    let up = self.b.ins().ishl_imm_s(up, 32);
+                    *w = self.b.ins().bor(low, up);
+                }
+                (out[0], out[1])
+            }
+            Mnemonic::Pmuludq => {
+                let mut out = [a0, a1];
+                for (w, (a, b)) in out.iter_mut().zip([(a0, b0), (a1, b1)]) {
+                    let a = self.b.ins().band_imm_s(a, 0xffff_ffff);
+                    let b = self.b.ins().band_imm_s(b, 0xffff_ffff);
+                    *w = self.b.ins().imul(a, b);
+                }
+                (out[0], out[1])
+            }
             Mnemonic::Punpckldq => {
                 let a = self.b.ins().band_imm_s(a0, 0xffff_ffff);
                 let b = self.b.ins().ishl_imm_s(b0, 32);

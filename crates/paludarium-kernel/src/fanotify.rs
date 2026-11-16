@@ -1,7 +1,8 @@
 //! fanotify: `fanotify_init` and `fanotify_mark`, as Linux's
 //! `fs/notify/fanotify`. A group's marks are on files (by their device and
-//! inode, [`Key`]), on mounts and on file systems (both by the device, as
-//! every mount here is a file system of its own), and the machine's
+//! inode, [`Key`]), on mounts (by their ID, so a bind mount of the same
+//! file system has marks of its own) and on file systems (by the device),
+//! and the machine's
 //! [`crate::inotify::Notifier`] tells the groups ([`Registry::dispatch`])
 //! what Linux's `fsnotify` hooks tell them: the same events, with the file,
 //! its directory and its name where Linux has them. A group queues what its

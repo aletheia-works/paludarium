@@ -3218,7 +3218,11 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -
         b"noop\0"
     };
     attribute(&mut body, IFLA_QDISC, qdisc);
-    attribute(&mut body, IFLA_AF_SPEC, &af_spec(up, stats));
+    attribute(
+        &mut body,
+        IFLA_AF_SPEC,
+        &af_spec(network.lo_conf(), up, stats),
+    );
     attribute(&mut body, IFLA_MAP, &[0; 32]);
     attribute(&mut body, IFLA_DEVLINK_PORT | NLA_F_NESTED, &[]);
     attribute(&mut body, IFLA_DPLL_PIN | NLA_F_NESTED, &[]);
@@ -3228,19 +3232,24 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -
 /// `inet6_fill_link_af` give it. Its IPv4 and IPv6 settings are those of a kernel whose sysctls
 /// are as built, a loopback's (no IPsec policy, no temporary addresses, no
 /// duplicate address detection, its MTU), not the host's a new namespace
-/// copies on Linux. IPv6 is ready while `lo` is up; its creation time is
-/// 0, its reachable time the base 30 seconds, where Linux's is random; its
-/// statistics are zero and left out without `stats`.
-fn af_spec(up: bool, stats: bool) -> Vec<u8> {
-    const INET: [i32; 33] = [
+/// copies on Linux, but for those `conf` has, as `/proc/sys/net` sets them
+/// ([`crate::netconf`]). IPv6 is ready while `lo` is up with IPv6 on; its
+/// creation time is 0, its reachable time the base 30 seconds, where
+/// Linux's is random; its statistics are zero and left out without
+/// `stats`.
+fn af_spec(conf: (crate::netdev::Conf4, crate::netdev::Conf6), up: bool, stats: bool) -> Vec<u8> {
+    let mut inet: [i32; 33] = [
         0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10000, 1000,
         0, 0, 0, 0, 1,
     ];
-    let mut inet = Vec::new();
+    // `IPV4_DEVCONF_FORWARDING` and `IPV4_DEVCONF_RP_FILTER`, less one.
+    inet[0] = conf.0.forwarding;
+    inet[7] = conf.0.rp_filter;
+    let mut settings = Vec::new();
     attribute(
-        &mut inet,
+        &mut settings,
         IFLA_INET_CONF,
-        &INET
+        &inet
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<u8>>(),
@@ -3252,18 +3261,25 @@ fn af_spec(up: bool, stats: bool) -> Vec<u8> {
     attribute(&mut mctp, IFLA_MCTP_PHYS_BINDING, &[0]);
     let mut spec = Vec::new();
     attribute(&mut spec, u16::from(AF_MCTP), &mctp);
-    attribute(&mut spec, u16::from(AF_INET), &inet);
-    attribute(&mut spec, u16::from(AF_INET6), &inet6_settings(up, stats));
+    attribute(&mut spec, u16::from(AF_INET), &settings);
+    attribute(
+        &mut spec,
+        u16::from(AF_INET6),
+        &inet6_settings(conf.1, up, stats),
+    );
     spec
 }
 /// `lo`'s IPv6 settings, as `inet6_fill_ifla6_attrs` gives them, for
 /// [`af_spec`] and [`inet6_link_message`].
-fn inet6_settings(up: bool, stats: bool) -> Vec<u8> {
-    const INET6: [i32; 60] = [
+fn inet6_settings(conf: crate::netdev::Conf6, up: bool, stats: bool) -> Vec<u8> {
+    let mut values: [i32; 60] = [
         0, 64, 65536, 1, 1, 1, 1, -1, 4000, 1000, -1, 172_800, 86400, 3, 600, 16, 0, 1, 1, 1,
         60000, 0, 0, 0, 0, 0, 0, -1, 0, 0, 10000, 1000, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 3_600_000,
         0, 0, 1, 0, 0, 0, 0, 0, 1024, 0, 65535, -1, 1, 0, 0, 0,
     ];
+    // `DEVCONF_FORWARDING` and `DEVCONF_DISABLE_IPV6`.
+    values[0] = conf.forwarding;
+    values[26] = conf.disable_ipv6;
     let words =
         |values: &[i32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
     let counters = |count: u64| -> Vec<u8> {
@@ -3272,7 +3288,13 @@ fn inet6_settings(up: bool, stats: bool) -> Vec<u8> {
         raw
     };
     let mut inet6 = Vec::new();
-    let ready: u32 = if up { IF_READY } else { 0 };
+    // `addrconf_notify` makes it ready as it comes up with IPv6 on, and
+    // `addrconf_ifdown` takes that back.
+    let ready: u32 = if up && conf.disable_ipv6 == 0 {
+        IF_READY
+    } else {
+        0
+    };
     attribute(&mut inet6, IFLA_INET6_FLAGS, &ready.to_le_bytes());
     // `ifla_cacheinfo`: the largest reassembly, creation time, reachable
     // and retransmission times.
@@ -3281,7 +3303,7 @@ fn inet6_settings(up: bool, stats: bool) -> Vec<u8> {
         IFLA_INET6_CACHEINFO,
         &words(&[65535, 0, 30000, 1000]),
     );
-    attribute(&mut inet6, IFLA_INET6_CONF, &words(&INET6));
+    attribute(&mut inet6, IFLA_INET6_CONF, &words(&values));
     if stats {
         attribute(&mut inet6, IFLA_INET6_STATS, &counters(IPSTATS_MIB_MAX));
         attribute(&mut inet6, IFLA_INET6_ICMP6STATS, &counters(ICMP6_MIB_MAX));
@@ -3306,7 +3328,11 @@ fn inet6_link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec
     attribute(&mut body, IFLA_MTU, &LO_MTU.to_le_bytes());
     let operstate = if up { IF_OPER_UNKNOWN } else { IF_OPER_DOWN };
     attribute(&mut body, IFLA_OPERSTATE, &[operstate]);
-    attribute(&mut body, IFLA_PROTINFO, &inet6_settings(up, true));
+    attribute(
+        &mut body,
+        IFLA_PROTINFO,
+        &inet6_settings(network.lo_conf().1, up, true),
+    );
     message(RTM_NEWLINK, flags, seq, port, &body)
 }
 /// `RTM_NEWLINK` for the IPv4 multicast routing table in an
@@ -3641,6 +3667,13 @@ fn change_address(
         if replace {
             return Err(Errno::EINVAL);
         }
+    }
+    // `addrconf_add_dev`: a device with `disable_ipv6` takes no new one.
+    if exists.is_none() && network.ipv6_off() {
+        return Err(extack::message(
+            Errno::EACCES,
+            "ipv6: IPv6 is disabled on this device",
+        ));
     }
     // `ipv6_add_addr`, for a new address.
     if exists.is_none() {
@@ -5342,7 +5375,8 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
         bytes: link,
     }];
     notices.extend(told(events, 0, 0, false, false, now));
-    if up {
+    // `addrconf_notify` does nothing for `NETDEV_UP` with `disable_ipv6`.
+    if up && !network.ipv6_off() {
         notices.push(Notice {
             group: RTNLGRP_IPV6_IFINFO,
             origin: 0,
@@ -5350,6 +5384,23 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
         });
     }
     notices
+}
+/// Turns `network`'s loopback's IPv6 off or on at `now`, as a change of
+/// its `disable_ipv6` does ([`Network::set_ipv6`]), and tells netlink's
+/// members of what went or came; coming on while `lo` is up, last, IPv6's
+/// own `RTM_NEWLINK` for `RTNLGRP_IPV6_IFINFO`, as `addrconf_notify` sends
+/// it at the end of `NETDEV_UP` (`inet6_ifinfo_notify`).
+pub(crate) fn set_ipv6(network: &Network, on: bool, now: u64) {
+    let events = network.set_ipv6(on, now);
+    let mut notices = told(events, 0, 0, false, false, now);
+    if on && network.is_up() {
+        notices.push(Notice {
+            group: RTNLGRP_IPV6_IFINFO,
+            origin: 0,
+            bytes: inet6_link_message(network, 0, 0, 0),
+        });
+    }
+    notify(network, notices, None);
 }
 /// What has run out of `network`'s addresses and routes by `now`
 /// ([`Network::expire`]), told to netlink's members of its groups, as
@@ -6872,7 +6923,10 @@ mod tests {
             inet6.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [1, 5, 2, 3, 6, 7, 8]
         );
-        assert_eq!(found[4].1, inet6_settings(false, true));
+        assert_eq!(
+            found[4].1,
+            inet6_settings(crate::netdev::Conf6::default(), false, true)
+        );
         network.set_up(true, 0);
         let link = inet6_link_message(&network, 4, 7, NLM_F_MULTI);
         let found = attributes(&link[32..]);

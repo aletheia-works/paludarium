@@ -88,8 +88,8 @@ verified.
   the two that paludarium refuses ([decisions](../design/decisions)).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs` and
-  `kernel` it has, ...) and the other names in
+  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
+  `kernel` and `net` it has, ...) and the other names in
   the reader's own directory (`io`, `personality`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `io`, `wchan`
@@ -778,7 +778,13 @@ verified.
   filtering to be off, as Linux's own settings have them, where a new
   namespace of Linux takes the first one's for IPv4, which a host may
   have changed (Docker turns forwarding on, Ubuntu reverse path filtering
-  to 2), and there are no files to change them (`/proc/sys/net/ipv4/conf`).
+  to 2); it does not look yet at the `forwarding` and `rp_filter` of
+  `/proc/sys/net/ipv4/conf`. `/proc/sys/net` has only `ip_forward` and
+  the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default` and
+  `lo`, where Linux has many more; their first namespace's values are as
+  Linux is built, not a host's, so a new namespace starts from those. A
+  change of them sends no `RTM_NEWNETCONF`, and IPv6's `forwarding` joins
+  no router multicast or anycast address.
   A
   route goes through `lo` or rejects: IPv6 gateways, multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences

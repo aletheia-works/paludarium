@@ -2888,6 +2888,7 @@ impl Kernel {
         let mut mounts = None;
         if flags & NAMESPACES != 0 {
             let mut namespaces = own.unshared(flags, &credentials.user.0)?;
+            crate::netconf::inherit_new(&namespaces, flags, self.files.network.as_ref());
             namespaces.user = Arc::clone(&credentials.user.0);
             if flags & NEWNS != 0 {
                 mounts = Some(crate::namespaces::copy_mounts(
@@ -3240,6 +3241,7 @@ impl Kernel {
         }
         let mut child_namespaces =
             own.for_child(namespaces, flags & 0x100 != 0, &credentials.user.0)?;
+        crate::netconf::inherit_new(&child_namespaces, namespaces, self.files.network.as_ref());
         child_namespaces.user = Arc::clone(&credentials.user.0);
         let mounts = (namespaces & crate::namespaces::CLONE_NEWNS != 0).then(|| {
             crate::namespaces::copy_mounts(

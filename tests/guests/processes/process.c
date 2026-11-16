@@ -15629,6 +15629,195 @@ static int kernel_sysctl_case(void) {
     if (held >= 0) close(held);
     return 0;
 }
+/* The net-sysctl case's files, under /proc/sys/net. */
+static long ns_read(const char *name) {
+    char path[128], text[32] = {0};
+    snprintf(path, sizeof path, "/proc/sys/net/%s", name);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    long n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n <= 0 || text[n - 1] != '\n') return -1000;
+    return strtol(text, NULL, 10);
+}
+/* Writes `text` to a file at its start: what the write returns. */
+static long ns_write(const char *name, const char *text) {
+    char path[128];
+    snprintf(path, sizeof path, "/proc/sys/net/%s", name);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    long n = write(fd, text, strlen(text));
+    if (n < 0) n = -errno;
+    close(fd);
+    return n;
+}
+static void ns_show(const char *label) {
+    static const char *names[] = {
+        "ipv4/ip_forward",           "ipv4/conf/all/forwarding",  "ipv4/conf/default/forwarding",
+        "ipv4/conf/lo/forwarding",   "ipv4/conf/all/rp_filter",   "ipv4/conf/default/rp_filter",
+        "ipv4/conf/lo/rp_filter",    "ipv6/conf/all/forwarding",  "ipv6/conf/default/forwarding",
+        "ipv6/conf/lo/forwarding",   "ipv6/conf/all/disable_ipv6", "ipv6/conf/default/disable_ipv6",
+        "ipv6/conf/lo/disable_ipv6",
+    };
+    printf("%s:", label);
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) printf(" %ld", ns_read(names[i]));
+    printf("\n");
+}
+static void ns_wrote(const char *name, const char *text) {
+    char shown[64] = {0};
+    for (size_t i = 0, at = 0; text[i] && at + 3 < sizeof shown; i++) {
+        if (text[i] == '\n') {
+            shown[at++] = '\\';
+            shown[at++] = 'n';
+        } else {
+            shown[at++] = text[i];
+        }
+    }
+    printf("write %s \"%s\"=%ld\n", name, shown, ns_write(name, text));
+}
+/* Whether ::1 can be bound, which only an address of the namespace can. */
+static long ns_bind_loopback6(void) {
+    int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 at = {.sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT};
+    long r = bind(fd, (void *)&at, sizeof at) ? -errno : 0;
+    close(fd);
+    return r;
+}
+/* The net-sysctl case: /proc/sys/net's forwarding, rp_filter and
+   disable_ipv6 of all, default and lo, in a network namespace of its own,
+   as root. A new namespace copies the first one's all and default, which
+   are the test runner's own on Linux, so it writes Linux's built-in values
+   to all of them first and prints none it found. */
+static int net_sysctl_case(void) {
+    fflush(stdout);
+    pid_t maker = child();
+    if (maker == 0) {
+        printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+        static const char *stated[] = {"/proc/sys/net", "/proc/sys/net/ipv4/conf/lo", "/proc/sys/net/ipv4/ip_forward",
+                                       "/proc/sys/net/ipv6/conf/all/disable_ipv6", "/proc/sys/net/ipv6/conf/eth9"};
+        for (size_t i = 0; i < sizeof stated / sizeof stated[0]; i++) {
+            struct stat st = {0};
+            long r = stat(stated[i], &st) ? -errno : 0;
+            printf("stat %s=%ld mode=%o uid=%d gid=%d\n", stated[i], r, st.st_mode, st.st_uid, st.st_gid);
+        }
+        static const char *built[] = {"ipv4/conf/all/forwarding",   "ipv4/conf/all/rp_filter",
+                                      "ipv4/conf/default/rp_filter", "ipv4/conf/lo/rp_filter",
+                                      "ipv6/conf/all/forwarding",   "ipv6/conf/all/disable_ipv6"};
+        for (size_t i = 0; i < sizeof built / sizeof built[0]; i++) ns_write(built[i], "0");
+        ns_show("built");
+        printf("-- ipv4 forwarding\n");
+        ns_wrote("ipv4/ip_forward", "1\n");
+        ns_show("all on");
+        ns_wrote("ipv4/conf/lo/forwarding", "0");
+        ns_wrote("ipv4/conf/all/forwarding", "1");
+        ns_show("all again");
+        ns_wrote("ipv4/conf/default/forwarding", "0");
+        ns_wrote("ipv4/conf/all/forwarding", "0");
+        ns_show("all off");
+        static const char *bad[] = {"abc", "", "  7  \n", "9 9", "2147483648", "-1", "0x10", "5x"};
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            ns_wrote("ipv4/conf/lo/forwarding", bad[i]);
+            printf("  now %ld\n", ns_read("ipv4/conf/lo/forwarding"));
+        }
+        int fd = open("/proc/sys/net/ipv4/conf/lo/forwarding", O_WRONLY | O_CLOEXEC);
+        printf("past start: seek=%ld write=%ld now %ld\n", (long)lseek(fd, 1, SEEK_SET), (long)write(fd, "3", 1),
+               ns_read("ipv4/conf/lo/forwarding"));
+        close(fd);
+        printf("-- rp_filter\n");
+        ns_wrote("ipv4/conf/lo/rp_filter", "1");
+        ns_wrote("ipv4/conf/default/rp_filter", "2");
+        ns_wrote("ipv4/conf/lo/rp_filter", "x");
+        ns_wrote("ipv4/conf/all/rp_filter", "2");
+        ns_show("rp_filter");
+        printf("-- ipv6 forwarding\n");
+        ns_wrote("ipv6/conf/all/forwarding", "1\n");
+        ns_show("all on");
+        ns_wrote("ipv6/conf/lo/forwarding", "0\n");
+        ns_wrote("ipv6/conf/default/forwarding", "0\n");
+        ns_wrote("ipv6/conf/default/forwarding", "zz");
+        ns_wrote("ipv6/conf/lo/forwarding", "zz");
+        ns_wrote("ipv6/conf/lo/forwarding", "");
+        ns_show("each");
+        fd = open("/proc/sys/net/ipv6/conf/all/forwarding", O_WRONLY | O_CLOEXEC);
+        long first = write(fd, "0\n", 2), second = write(fd, "1", 1);
+        printf("same descriptor: %ld %ld\n", first, second);
+        close(fd);
+        ns_show("again");
+        ns_wrote("ipv6/conf/all/forwarding", "0");
+        printf("-- disable_ipv6\n");
+        int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+        struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+        socklen_t name_len = sizeof name;
+        bind(ctl, (void *)&any, sizeof any);
+        getsockname(ctl, (void *)&name, &name_len);
+        unsigned port = name.pid;
+        struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0xd51};
+        bind(mon, (void *)&members, sizeof members);
+        int udp = socket(AF_INET, SOCK_DGRAM, 0);
+        netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
+        monitor_show(mon, port, "up");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "1\n");
+        monitor_show(mon, port, "lo off");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        nl_addr(ctl, port, 20, 0x600, AF_INET6, "2001:db8::1", 64, 0, 1, "add while off");
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "1");
+        monitor_show(mon, port, "lo off again");
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "0");
+        monitor_show(mon, port, "lo on");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        ns_wrote("ipv6/conf/all/disable_ipv6", "3");
+        monitor_show(mon, port, "all off");
+        ns_show("all off");
+        ns_wrote("ipv6/conf/all/disable_ipv6", "0");
+        monitor_show(mon, port, "all on");
+        ns_wrote("ipv6/conf/default/disable_ipv6", "1");
+        monitor_show(mon, port, "default");
+        ns_show("default");
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "bad");
+        netns_lo(udp, SIOCSIFFLAGS, "lo", 0);
+        monitor_show(mon, port, "down");
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "1");
+        netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
+        monitor_show(mon, port, "up with ipv6 off");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "0");
+        monitor_show(mon, port, "on while up");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        printf("-- permissions\n");
+        int held = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY | O_CLOEXEC);
+        fflush(stdout);
+        pid_t other = child();
+        if (other == 0) {
+            if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+            errno = 0;
+            int w = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY | O_CLOEXEC);
+            long opened = w < 0 ? -errno : 0, value = ns_read("ipv4/ip_forward");
+            long written = netns_result(write(held, "0", 1));
+            printf("other: open write=%ld read=%ld held write=%ld\n", opened, value, written);
+            fflush(stdout);
+            _exit(0);
+        }
+        result("other", reaped(other));
+        fflush(stdout);
+        other = child();
+        if (other == 0) {
+            caps_only(CAPS_ALL & ~(1ULL << 12));
+            ns_wrote("ipv4/ip_forward", "0");
+            ns_wrote("ipv4/conf/lo/forwarding", "0");
+            ns_wrote("ipv4/conf/lo/rp_filter", "0");
+            ns_wrote("ipv6/conf/all/forwarding", "0");
+            ns_wrote("ipv6/conf/lo/disable_ipv6", "0");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("root without CAP_NET_ADMIN", reaped(other));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("maker", reaped(maker));
+    return 0;
+}
 static int sem_case(void) {
     int key = 0x5c000000 | (getpid() & 0xffffff);
     printf("get too-many=%d", semx_errno(syscall(SYS_semget, 0, 32001, 0600)));
@@ -28548,6 +28737,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
+    if (!strcmp(mode, "net-sysctl")) return net_sysctl_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();

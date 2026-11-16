@@ -184,6 +184,7 @@ mod linux {
                     | "ipc-sysctl"
                     | "sysvipc-proc"
                     | "kernel-sysctl"
+                    | "net-sysctl"
                     | "mqueue-calls"
                     | "mqueue-limits"
                     | "mqueue-wait"
@@ -730,6 +731,7 @@ mod linux {
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
+        processes_net_sysctl => ("net-sysctl","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),
         processes_vector_flags => ("vector-flags","process"),

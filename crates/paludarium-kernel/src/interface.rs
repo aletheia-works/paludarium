@@ -912,7 +912,7 @@ impl Addresses {
     /// The first namespace's: `127.0.0.1/8` and `::1`, up.
     pub(crate) fn first() -> Self {
         let mut addresses = Self::isolated();
-        let _ = addresses.up(0);
+        let _ = addresses.up(0, true);
         addresses
     }
     /// A new namespace's: none.
@@ -1156,8 +1156,9 @@ impl Addresses {
     /// (`inetdev_event`); the routes every IPv4 address has then that are
     /// not there, in the addresses' order (`fib_netdev_event`); the prefix
     /// route of each permanent IPv6 address added while it was down
-    /// (`addrconf_permanent_addr`); and `::1` with its route.
-    pub(crate) fn up(&mut self, now: u64) -> Vec<Event> {
+    /// (`addrconf_permanent_addr`); and `::1` with its route. With `v6`
+    /// false (`disable_ipv6`) IPv6 does none of it ([`Self::up6`]).
+    pub(crate) fn up(&mut self, now: u64, v6: bool) -> Vec<Event> {
         let mut events = Vec::new();
         let loopback = V4::new(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 8, SCOPE_HOST);
         // The kernel's own, which reports nothing when it is there.
@@ -1170,6 +1171,17 @@ impl Addresses {
                 self.kernel_add4(route, &mut events);
             }
         }
+        if v6 {
+            events.extend(self.up6(now));
+        }
+        events
+    }
+    /// IPv6's part of [`Self::up`], as `addrconf_notify` does it for
+    /// `NETDEV_UP`: the prefix route of each permanent address
+    /// (`addrconf_permanent_addr`), then `::1` with its route
+    /// (`init_loopback`).
+    pub(crate) fn up6(&mut self, now: u64) -> Vec<Event> {
+        let mut events = Vec::new();
         for address in self.v6.clone() {
             if address.flags & PERMANENT != 0
                 && let Some(route) = address.prefix_route()
@@ -1201,7 +1213,14 @@ impl Addresses {
         // (`rt6_disable_ip`) and its addresses.
         let mut events = Vec::new();
         self.flush(false, &mut events);
-        events.extend(self.dump6().into_iter().map(Event::DelRoute6));
+        events.extend(self.down6());
+        events
+    }
+    /// IPv6's part of [`Self::down`], as `addrconf_ifdown` does it: every
+    /// route, told of in the order of a dump (`rt6_disable_ip`), the
+    /// neighbours, then every address.
+    pub(crate) fn down6(&mut self) -> Vec<Event> {
+        let mut events: Vec<Event> = self.dump6().into_iter().map(Event::DelRoute6).collect();
         self.routes6.clear();
         self.flush(true, &mut events);
         events.extend(self.v6.drain(..).map(Event::DelAddr6));
@@ -2483,7 +2502,7 @@ mod tests {
         // Up: 127.0.0.1/8 and its routes, the routes the up brings the
         // other address, IPv6's prefix route, then ::1.
         assert_eq!(
-            told(&a.up(0)),
+            told(&a.up(0, true)),
             [
                 "+addr 127.0.0.1/8",
                 "+route 255 127.0.0.1/32 Local 0x600",
@@ -2577,7 +2596,7 @@ mod tests {
         );
         assert!(!a.bindable4("10.9.9.9".parse().unwrap()));
         assert_eq!(a.dump6().len(), 1);
-        a.up(0);
+        a.up(0, true);
         // 127.0.0.1/8, of host scope, goes first; a secondary goes last.
         a.add_v4(
             v4("10.1.2.9", 24),
@@ -2672,7 +2691,7 @@ mod tests {
         a.down();
         assert!(a.v6.is_empty());
         assert_eq!(a.dump4().len(), 6);
-        a.up(0);
+        a.up(0, true);
         assert_eq!(a.v6.len(), 1);
         // A primary takes its secondary; 127.0.0.1 comes back with the next
         // up.
@@ -2690,7 +2709,7 @@ mod tests {
         );
         a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();
         assert!(!a.bindable4(Ipv4Addr::LOCALHOST));
-        a.up(0);
+        a.up(0, true);
         assert!(a.bindable4(Ipv4Addr::LOCALHOST));
     }
 
@@ -2703,7 +2722,7 @@ mod tests {
             a.add_route4(&ask4("10.9.0.0", 16, 1, 0x600), false),
             Err(ENETDOWN)
         );
-        a.up(0);
+        a.up(0, true);
         // The same prefix: prepended, replaced, appended.
         let mut ask = ask4("10.9.0.0", 16, 1, 0x600);
         assert_eq!(
@@ -2801,7 +2820,7 @@ mod tests {
             ]
         );
         // IPv6: by metric within a prefix, the walk's order across them.
-        a.up(0);
+        a.up(0, true);
         let ask6 = |dst: &str, len, metric| Ask6 {
             table: TABLE_MAIN,
             dst: dst.parse().unwrap(),
@@ -3078,7 +3097,7 @@ mod tests {
         let address = down.iter().position(|e| matches!(e, Event::DelAddr6(_)));
         assert!(route < first6 && first6 < address);
         assert!(gone(&a.down()).is_empty());
-        let _ = a.up(10);
+        let _ = a.up(10, true);
         a.output(IpAddr::V4(Ipv4Addr::LOCALHOST), 11);
         a.output(IpAddr::V6("ff02::1".parse().unwrap()), 12);
         let last = a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();

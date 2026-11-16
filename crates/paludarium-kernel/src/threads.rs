@@ -2168,6 +2168,7 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let child_namespaces = own.for_child(namespaces, true, &parent.state.credentials.user.0)?;
+        crate::netconf::inherit_new(&child_namespaces, namespaces, self.files.network.as_ref());
         let mounts = (namespaces & crate::namespaces::CLONE_NEWNS != 0).then(|| {
             crate::namespaces::copy_mounts(
                 &child_namespaces.mnt,

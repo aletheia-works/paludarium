@@ -674,6 +674,8 @@ impl Namespaces {
         }
         if flags & CLONE_NEWNET != 0 {
             new.net = self.fresh(&self.net, owner);
+            // Its settings come from the first namespace's network, which
+            // the caller has ([`crate::netconf::inherit_new`]).
             let network = Arc::new(crate::inet::Network::isolated(owner));
             let _ = new.net.sockets.network.set(network);
         }

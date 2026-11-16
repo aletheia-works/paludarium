@@ -2737,7 +2737,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
   `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
-  `fs` and `kernel` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
+  `fs`, `kernel` and `net` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -2923,6 +2923,38 @@ kernel.
   did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
   `/proc/sys` lists its entries by name, as Linux's tree of them keeps
   them.
+- `/proc/sys/net` has the settings of the opener's network namespace, as
+  Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
+  `all`, `default` and each device (`lo`): `ipv4/ip_forward`,
+  `ipv4/conf/<device>/forwarding` and `rp_filter`, and
+  `ipv6/conf/<device>/disable_ipv6` and `forwarding`. They and their
+  directories belong to the root of the user namespace that owns the
+  network namespace; the files are 0644, which root and whoever has
+  `CAP_NET_ADMIN` over that namespace may open to write
+  (`net_ctl_permissions`, `EACCES`, and `EPERM` at a write that may not).
+  Each takes an `int` as `proc_dointvec` does. The first namespace starts
+  with them all 0, as Linux is built; a new one copies the first one's
+  IPv4 `all` and `default` and starts IPv6's as built
+  (`devconf_inherit_init_net` at 0), and its `lo` takes its `default`. As
+  the handlers:
+  - IPv4's `forwarding` (`ip_forward` is `all`'s) needs `CAP_NET_ADMIN`
+    of the writer (`EPERM`, `devinet_sysctl_forward`); `all`'s, when it
+    changes, sets `default`'s and every device's, while `default`'s
+    reaches no device.
+  - `rp_filter` set on a device stays its own; one set on `default` goes
+    to every device that has not been set, even by a write that failed
+    (`devinet_conf_proc`).
+  - IPv6's two never fail: a bad value is left as it was and the write
+    takes everything; `forwarding` of `all` or of a device returns 1 and
+    leaves the position, as `addrconf_sysctl_forward` does. `all`'s sets
+    `default`'s and every device's. A device whose `disable_ipv6` turns
+    on loses its IPv6 addresses and routes, told of as when it goes down
+    (`addrconf_ifdown`); turning off while it is up gives `::1` back, and
+    IPv6's own `RTM_NEWLINK` (`RTNLGRP_IPV6_IFINFO`), as `NETDEV_UP`
+    does. While it is on, `lo` coming up takes no IPv6 and a new IPv6
+    address is `EACCES` (`addrconf_add_dev`).
+  - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
+    and IPv6 is ready only with `disable_ipv6` off.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
   descriptor, as Linux's `seq_show` writes it: `pos`, the description's
   position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and

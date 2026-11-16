@@ -1970,9 +1970,9 @@ fn directory_entries(
     let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
         _ if tasks::is_root(&d.path) => tasks::root_entries(c),
         _ if let Some(crate::sysctl::Entry::Directory(directory)) =
-            crate::sysctl::entry(&d.path) =>
+            crate::sysctl::entry(c, &d.path) =>
         {
-            crate::sysctl::entries(directory)
+            crate::sysctl::entries(c, directory)
         }
         _ if crate::proc::is_sysvipc(&d.path) => crate::proc::sysvipc_entries(),
         _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
@@ -6624,7 +6624,7 @@ fn open_path(
             }
             Arc::new(crate::proc::OwnDirectory::new(stat))
         }
-    } else if let Some(entry) = crate::sysctl::entry(p) {
+    } else if let Some(entry) = crate::sysctl::entry(c, p) {
         crate::sysctl::open(c, entry, flags)?
     } else if crate::proc::below_system_entry(p) {
         return Err(Errno::ENOTDIR);
@@ -7643,7 +7643,7 @@ fn other_generated_stat(
             SMALL_BLOCK_SIZE,
         ));
     }
-    if let Some(entry) = crate::sysctl::entry(path) {
+    if let Some(entry) = crate::sysctl::entry(c, path) {
         return Some((
             crate::sysctl::stat(c, entry),
             device(c, path),

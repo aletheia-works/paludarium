@@ -7,8 +7,8 @@
 //! Each device carries its own settings (Linux's `ipv4_devconf` and
 //! `ipv6_devconf` of its `in_device` and `inet6_dev`), and the namespace
 //! those of `all` and `default`, which the files under
-//! `/proc/sys/net/ipv4/conf` and `/proc/sys/net/ipv6/conf` are to show.
-//! None of them is kept yet; [`Conf4`] and [`Conf6`] are where they go.
+//! `/proc/sys/net/ipv4/conf` and `/proc/sys/net/ipv6/conf` show and set
+//! ([`crate::netconf`]).
 
 /// The loopback's index (`LOOPBACK_IFINDEX`), as an `ifinfomsg`'s
 /// `ifi_index` and an `ndmsg`'s `ndm_ifindex` have it, and as `RTA_OIF`,
@@ -25,14 +25,25 @@ pub(crate) enum DeviceKind {
 }
 
 /// A device's IPv4 settings, or those of `all` or `default`
-/// (`struct ipv4_devconf`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Conf4 {}
+/// (`struct ipv4_devconf`), as Linux is built: all 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Conf4 {
+    /// `IPV4_DEVCONF_FORWARDING`.
+    pub forwarding: i32,
+    /// `IPV4_DEVCONF_RP_FILTER`.
+    pub rp_filter: i32,
+    /// Whether a write has set `rp_filter` (its bit of `cnf->state`), so
+    /// that `default`'s no longer does.
+    pub rp_filter_set: bool,
+}
 
 /// A device's IPv6 settings, or those of `all` or `default`
-/// (`struct ipv6_devconf`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Conf6 {}
+/// (`struct ipv6_devconf`), as Linux is built: all 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Conf6 {
+    pub forwarding: i32,
+    pub disable_ipv6: i32,
+}
 
 /// One network device.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +121,14 @@ impl Devices {
     /// The devices, in the order of their indices.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Device> {
         self.list.iter()
+    }
+    /// The devices, to change their settings.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Device> {
+        self.list.iter_mut()
+    }
+    /// The device of `index`, to change its settings.
+    pub(crate) fn by_index_mut(&mut self, index: i32) -> Option<&mut Device> {
+        self.list.iter_mut().find(|d| d.index == index)
     }
 }
 

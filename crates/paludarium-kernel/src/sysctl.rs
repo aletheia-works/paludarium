@@ -53,6 +53,7 @@
 use crate::ipc::IPCMNI;
 use crate::mqueue::{HARD_MSGMAX, HARD_MSGSIZEMAX, Limits, Queues};
 use crate::namespaces::Namespace;
+use crate::netconf::Target;
 use crate::syscalls::Context;
 use crate::users::Ids as Kind;
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat};
@@ -77,7 +78,60 @@ pub(crate) enum Directory {
     Inotify,
     Fanotify,
     Kernel,
+    /// `net`, and in it `ipv4`, `ipv6`, their `conf` and a device's
+    /// directory in each.
+    Net,
+    Ipv4,
+    Ipv6,
+    Conf4,
+    Conf6,
+    Device4(Target),
+    Device6(Target),
 }
+
+impl Directory {
+    /// Whether it is one of `/proc/sys/net`'s, which belong to the root of
+    /// the user namespace that owns the network namespace
+    /// (`net_ctl_set_ownership`).
+    fn net(self) -> bool {
+        matches!(
+            self,
+            Self::Net
+                | Self::Ipv4
+                | Self::Ipv6
+                | Self::Conf4
+                | Self::Conf6
+                | Self::Device4(_)
+                | Self::Device6(_)
+        )
+    }
+}
+
+/// A file of `/proc/sys/net`, of the caller's network namespace
+/// ([`crate::netconf`]): `ipv4/ip_forward` (`all`'s forwarding),
+/// `ipv4/conf/<device>/forwarding` and `rp_filter`, and
+/// `ipv6/conf/<device>/disable_ipv6` and `forwarding`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Net {
+    IpForward,
+    Forwarding(Target),
+    RpFilter(Target),
+    DisableIpv6(Target),
+    Forwarding6(Target),
+}
+
+/// A file of a device's directory, by name, and what it is for a device.
+type DeviceFile = (&'static [u8], fn(Target) -> Net);
+/// The files of a device's directory of `ipv4/conf` and `ipv6/conf`, in
+/// Linux's order.
+const CONF4: [DeviceFile; 2] = [
+    (b"forwarding", Net::Forwarding),
+    (b"rp_filter", Net::RpFilter),
+];
+const CONF6: [DeviceFile; 2] = [
+    (b"disable_ipv6", Net::DisableIpv6),
+    (b"forwarding", Net::Forwarding6),
+];
 
 /// A file of `/proc/sys/fs/mqueue`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,10 +333,59 @@ pub(crate) enum Entry {
     Inotify(Inotify),
     Fanotify(Fanotify),
     Kernel(Kernel),
+    Net(Net),
 }
 
-/// The entry `path` names, if it is one of these.
-pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
+/// The entry under `/proc/sys/net` that `rest` (the path after it) names,
+/// whose devices are `network`'s.
+fn net_entry(rest: &[u8], network: &crate::inet::Network) -> Option<Entry> {
+    let directory = |d| Some(Entry::Directory(d));
+    match rest {
+        b"" => return directory(Directory::Net),
+        b"/ipv4" => return directory(Directory::Ipv4),
+        b"/ipv6" => return directory(Directory::Ipv6),
+        b"/ipv4/conf" => return directory(Directory::Conf4),
+        b"/ipv6/conf" => return directory(Directory::Conf6),
+        b"/ipv4/ip_forward" => return Some(Entry::Net(Net::IpForward)),
+        _ => {}
+    }
+    let (v6, rest) = if let Some(rest) = rest.strip_prefix(b"/ipv4/conf/") {
+        (false, rest)
+    } else {
+        (true, rest.strip_prefix(b"/ipv6/conf/")?)
+    };
+    let (name, file) = match rest.iter().position(|&b| b == b'/') {
+        Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+        None => (rest, None),
+    };
+    let device = match name {
+        b"all" => Target::All,
+        b"default" => Target::Default,
+        _ => Target::Device(network.devices().by_name(name)?.index),
+    };
+    let Some(file) = file else {
+        return directory(if v6 {
+            Directory::Device6(device)
+        } else {
+            Directory::Device4(device)
+        });
+    };
+    let files: &[DeviceFile] = if v6 { &CONF6 } else { &CONF4 };
+    files
+        .iter()
+        .find(|(known, _)| *known == file)
+        .map(|&(_, make)| Entry::Net(make(device)))
+}
+
+/// The entry `path` names, if it is one of these, for the caller, whose
+/// network namespace `/proc/sys/net` shows.
+pub(crate) fn entry(c: &Context<'_>, path: &[u8]) -> Option<Entry> {
+    lookup(path, c.network().as_deref())
+}
+
+/// The entry `path` names, with `/proc/sys/net` that of `network`, which
+/// has none without one.
+fn lookup(path: &[u8], network: Option<&crate::inet::Network>) -> Option<Entry> {
     if !path.starts_with(b"/proc/sys") {
         return None;
     }
@@ -298,6 +401,11 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
         b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
         b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
         _ => {
+            if let Some(rest) = rest.strip_prefix(b"/net")
+                && (rest.is_empty() || rest.starts_with(b"/"))
+            {
+                return net_entry(rest, network?);
+            }
             if let Some(name) = rest.strip_prefix(b"/kernel/") {
                 return KERNEL
                     .iter()
@@ -325,10 +433,31 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
     }
 }
 
-/// The entries of `directory`.
-pub(crate) fn entries(directory: Directory) -> Vec<DirectoryEntry> {
+/// The entries of `directory`, for the caller.
+pub(crate) fn entries(c: &Context<'_>, directory: Directory) -> Vec<DirectoryEntry> {
+    entries_of(directory, c.network().as_deref())
+}
+
+/// The entries of `directory`, a device directory's being `network`'s
+/// devices after `all` and `default`, all by name, as Linux's tree of
+/// them keeps them.
+fn entries_of(directory: Directory, network: Option<&crate::inet::Network>) -> Vec<DirectoryEntry> {
+    let mut devices: Vec<Vec<u8>> = vec![b"all".to_vec(), b"default".to_vec()];
+    if let Some(network) = network {
+        devices.extend(network.devices().iter().map(|d| d.name.clone()));
+    }
+    devices.sort();
     let names: Vec<(&[u8], u8)> = match directory {
-        Directory::Sys => vec![(b"fs", DT_DIR), (b"kernel", DT_DIR)],
+        Directory::Sys => vec![(b"fs", DT_DIR), (b"kernel", DT_DIR), (b"net", DT_DIR)],
+        Directory::Net => vec![(b"ipv4", DT_DIR), (b"ipv6", DT_DIR)],
+        Directory::Ipv4 => vec![(b"conf", DT_DIR), (b"ip_forward", DT_REG)],
+        Directory::Ipv6 => vec![(b"conf", DT_DIR)],
+        Directory::Conf4 | Directory::Conf6 => devices
+            .iter()
+            .map(|name| (name.as_slice(), DT_DIR))
+            .collect(),
+        Directory::Device4(_) => CONF4.iter().map(|&(name, _)| (name, DT_REG)).collect(),
+        Directory::Device6(_) => CONF6.iter().map(|&(name, _)| (name, DT_REG)).collect(),
         Directory::Fs => vec![
             (b"aio-max-nr", DT_REG),
             (b"aio-nr", DT_REG),
@@ -363,6 +492,17 @@ fn queues(c: &Context<'_>) -> Queues {
 fn owner(c: &Context<'_>) -> (u32, u32) {
     let namespaces = c.group.namespaces(c.tid);
     let user = namespaces.ipc.owner();
+    (
+        user.kernel_of(Kind::User, 0).unwrap_or(0),
+        user.kernel_of(Kind::Group, 0).unwrap_or(0),
+    )
+}
+
+/// The root of the user namespace that owns the caller's network
+/// namespace, whom `/proc/sys/net` belongs to (`net_ctl_set_ownership`).
+fn net_owner(c: &Context<'_>) -> (u32, u32) {
+    let namespaces = c.group.namespaces(c.tid);
+    let user = namespaces.net.owner();
     (
         user.kernel_of(Kind::User, 0).unwrap_or(0),
         user.kernel_of(Kind::Group, 0).unwrap_or(0),
@@ -507,7 +647,27 @@ fn fanotify_line(limits: &crate::fanotify::Limits, file: Fanotify) -> Vec<u8> {
 /// 0644 or for `aio-nr` 0444.
 pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
     match entry {
+        Entry::Directory(directory) if directory.net() => {
+            let (uid, gid) = net_owner(c);
+            FileStat {
+                uid,
+                gid,
+                ..crate::proc::directory_stat()
+            }
+        }
         Entry::Directory(_) => crate::proc::directory_stat(),
+        Entry::Net(file) => {
+            let (uid, gid) = net_owner(c);
+            FileStat {
+                mode: 0o100_644,
+                uid,
+                gid,
+                ..crate::proc::stat(
+                    c.network()
+                        .map_or(0, |network| line(net_value(&network, file)).len()),
+                )
+            }
+        }
         Entry::Aio(aio) => FileStat {
             mode: if aio == Aio::Nr { 0o100_444 } else { 0o100_644 },
             ..crate::proc::stat(aio_line(&c.processes.aio, aio).len())
@@ -551,6 +711,27 @@ fn line(value: i32) -> Vec<u8> {
     format!("{value}\n").into_bytes()
 }
 
+/// What a file of `/proc/sys/net` of `network` shows: 0 for a device it
+/// no longer has.
+fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
+    let target = match file {
+        Net::IpForward => Target::All,
+        Net::Forwarding(target)
+        | Net::RpFilter(target)
+        | Net::DisableIpv6(target)
+        | Net::Forwarding6(target) => target,
+    };
+    let Some((conf4, conf6)) = crate::netconf::get(&network.devices(), target) else {
+        return 0;
+    };
+    match file {
+        Net::IpForward | Net::Forwarding(_) => conf4.forwarding,
+        Net::RpFilter(_) => conf4.rp_filter,
+        Net::DisableIpv6(_) => conf6.disable_ipv6,
+        Net::Forwarding6(_) => conf6.forwarding,
+    }
+}
+
 /// Opens `entry` with `flags`: a directory only to read (`EISDIR`), a
 /// setting to write only by the root of the namespace's owner (`EACCES`),
 /// as `mq_permissions` lets the owner's root have the owner's bits and
@@ -587,6 +768,16 @@ pub(crate) fn open(
             Value::Inotify(Arc::clone(&c.files.caches.notify), file),
             Writers::Root,
         ),
+        // `net_ctl_permissions`: whoever has `CAP_NET_ADMIN` over the
+        // namespace has the owner's bits, and so has root (`test_perm`).
+        Entry::Net(file) => (
+            Value::Net(NetFile {
+                file,
+                network: c.network().ok_or(Errno::ENOENT)?,
+                host: Arc::clone(c.shared_host),
+            }),
+            Writers::NetAdmin(Arc::clone(&c.group.namespaces(c.tid).net)),
+        ),
         Entry::Fanotify(file) => (
             Value::Fanotify(Arc::clone(&c.files.caches.notify.fan), file),
             Writers::Root,
@@ -605,9 +796,11 @@ pub(crate) fn open(
     if flags & 3 != 0 && !writers.allow(credentials) {
         return Err(Errno::EACCES);
     }
+    let net_admin = writers.net_admin(credentials);
     Ok(Arc::new(SettingFile {
         value,
         admin: credentials.capable(crate::credentials::CAP_SYS_ADMIN),
+        net_admin,
         writers,
         stat: stat(c, entry),
         position: Mutex::new(0),
@@ -630,6 +823,9 @@ enum Writers {
     /// namespace that owns this IPC namespace (`ipc_permissions` for the
     /// `*_next_id` files).
     Restorer(Arc<Namespace>),
+    /// Root, or whoever has `CAP_NET_ADMIN` over the user namespace that
+    /// owns this network namespace (`net_ctl_permissions`).
+    NetAdmin(Arc<Namespace>),
 }
 
 impl Writers {
@@ -643,6 +839,17 @@ impl Writers {
                 credentials.capable_in(crate::credentials::CAP_CHECKPOINT_RESTORE, owner)
                     || credentials.capable_in(crate::credentials::CAP_SYS_ADMIN, owner)
             }
+            Self::NetAdmin(_) => credentials.euid == 0 || self.net_admin(credentials),
+        }
+    }
+    /// Whether `credentials` have `CAP_NET_ADMIN` over the network
+    /// namespace, which IPv4's `forwarding` asks of its writer
+    /// (`devinet_sysctl_forward`); never for another file.
+    fn net_admin(&self, credentials: &crate::credentials::Credentials) -> bool {
+        const CAP_NET_ADMIN: u64 = 1 << 12;
+        match self {
+            Self::NetAdmin(net) => credentials.capable_in(CAP_NET_ADMIN, net.owner()),
+            _ => false,
         }
     }
 }
@@ -680,6 +887,109 @@ enum Value {
     Kernel(Arc<Namespace>, Kernel),
     /// The machine's.
     Machine(Arc<Machine>, Kernel),
+    Net(NetFile),
+}
+
+/// A file of `/proc/sys/net` as opened: of the opener's network
+/// namespace, whose devices have the settings and follow them.
+struct NetFile {
+    file: Net,
+    network: Arc<crate::inet::Network>,
+    host: Arc<dyn paludarium_host::Host>,
+}
+
+impl NetFile {
+    /// A write of `buf` at `position` by a writer with `CAP_NET_ADMIN`
+    /// over the namespace (`net_admin`) or without, as each handler takes
+    /// it: what the write returns.
+    /// - IPv4's `forwarding` (`devinet_sysctl_forward`) is `EPERM` without
+    ///   `CAP_NET_ADMIN`, then takes an `int` as `proc_dointvec` does.
+    /// - `rp_filter` (`devinet_conf_proc`) takes one so, and marks the
+    ///   device as set whatever comes of it.
+    /// - IPv6's (`addrconf_sysctl_disable`, `addrconf_sysctl_forward`)
+    ///   read one so but never fail: a bad one leaves the value, and the
+    ///   write takes it all without moving the position; and `forwarding`
+    ///   of `all` or a device returns 1 and leaves the position, as
+    ///   `addrconf_fixup_forwarding` returns 1.
+    fn take(&self, buf: &[u8], position: &mut u64, net_admin: bool) -> Result<usize, Errno> {
+        // `proc_first_pos_non_zero_ignore`: past the start, a write is
+        // taken whole and sets nothing.
+        let parsed = if *position != 0 {
+            Err(true)
+        } else {
+            parse(buf, None).map_err(|_| false)
+        };
+        let advance = |position: &mut u64, by: usize| {
+            *position += by as u64;
+            Ok(by)
+        };
+        match self.file {
+            Net::IpForward | Net::Forwarding(_) => {
+                if !net_admin {
+                    return Err(Errno::EPERM);
+                }
+                let target = match self.file {
+                    Net::Forwarding(target) => target,
+                    _ => Target::All,
+                };
+                match parsed {
+                    Ok((value, consumed)) => {
+                        crate::netconf::set_forwarding(&mut self.network.devices(), target, value);
+                        advance(position, consumed)
+                    }
+                    Err(true) => advance(position, buf.len()),
+                    Err(false) => Err(Errno::EINVAL),
+                }
+            }
+            Net::RpFilter(target) => {
+                crate::netconf::set_rp_filter(
+                    &mut self.network.devices(),
+                    target,
+                    parsed.ok().map(|(value, _)| value),
+                );
+                match parsed {
+                    Ok((_, consumed)) => advance(position, consumed),
+                    Err(true) => advance(position, buf.len()),
+                    Err(false) => Err(Errno::EINVAL),
+                }
+            }
+            Net::DisableIpv6(target) | Net::Forwarding6(target) => {
+                let old = net_value(&self.network, self.file);
+                let (value, taken) = match parsed {
+                    Ok((value, consumed)) => (value, consumed),
+                    Err(true) => (old, buf.len()),
+                    Err(false) => (old, 0),
+                };
+                if let Net::Forwarding6(_) = self.file {
+                    crate::netconf::set_forwarding6(&mut self.network.devices(), target, value);
+                    if target != Target::Default {
+                        return Ok(1);
+                    }
+                } else {
+                    let changed = crate::netconf::set_disable_ipv6(
+                        &mut self.network.devices(),
+                        target,
+                        value,
+                    );
+                    let now = self
+                        .host
+                        .clock(paludarium_host::ClockId::Monotonic)
+                        .unwrap_or(0);
+                    for (index, change) in changed {
+                        if index == crate::netdev::LOOPBACK_INDEX {
+                            crate::netlink::set_ipv6(
+                                &self.network,
+                                change == crate::netconf::Change::On,
+                                now,
+                            );
+                        }
+                    }
+                }
+                *position += taken as u64;
+                Ok(if taken == 0 { buf.len() } else { taken })
+            }
+        }
+    }
 }
 
 impl Value {
@@ -693,6 +1003,7 @@ impl Value {
             Self::Fanotify(registry, file) => fanotify_line(&registry.limits, *file),
             Self::Kernel(ipc, file) => kernel_line(ipc, *file),
             Self::Machine(machine, file) => machine.line(*file),
+            Self::Net(net) => line(net_value(&net.network, net.file)),
         }
     }
     /// After a write that went through, one past the start too: a set
@@ -716,6 +1027,8 @@ impl Value {
             }
             Self::Kernel(ipc, file) => kernel_write(ipc, *file, buf),
             Self::Machine(machine, file) => machine.write(*file, buf, admin),
+            // Taken whole by [`NetFile::take`].
+            Self::Net(_) => Err(Errno::EINVAL),
             Self::Aio(limits, _) => {
                 let (negative, value, consumed) = scan(buf)?;
                 if negative {
@@ -779,6 +1092,9 @@ struct SettingFile {
     /// write that does not say who makes it.
     writers: Writers,
     admin: bool,
+    /// Whether the opener had `CAP_NET_ADMIN` over the network namespace,
+    /// for a write of `/proc/sys/net` that does not say who makes it.
+    net_admin: bool,
     stat: FileStat,
     position: Mutex<u64>,
     flags: u32,
@@ -798,25 +1114,31 @@ impl SettingFile {
         if self.flags & 3 == 0 {
             return Err(Errno::EBADF);
         }
-        let admin = match writer {
+        let (admin, net_admin) = match writer {
             Some(credentials) => {
                 if !self.writers.allow(credentials) {
                     return Err(Errno::EPERM);
                 }
-                credentials.capable(crate::credentials::CAP_SYS_ADMIN)
+                (
+                    credentials.capable(crate::credentials::CAP_SYS_ADMIN),
+                    self.writers.net_admin(credentials),
+                )
             }
-            None => self.admin,
+            None => (self.admin, self.net_admin),
         };
-        let written = self.take(buf, admin);
+        let written = self.take(buf, admin, net_admin);
         if written.is_ok() {
             self.value.touched();
         }
         written
     }
-    fn take(&self, buf: &[u8], admin: bool) -> Result<usize, Errno> {
+    fn take(&self, buf: &[u8], admin: bool, net_admin: bool) -> Result<usize, Errno> {
         let mut position = self.position();
         if buf.is_empty() {
             return Ok(0);
+        }
+        if let Value::Net(net) = &self.value {
+            return net.take(buf, &mut position, net_admin);
         }
         // `sysctl_writes_strict`: a write past the start is taken whole and
         // changes nothing.
@@ -992,56 +1314,115 @@ mod tests {
 
     #[test]
     fn paths_name_the_directories_and_settings() {
-        assert_eq!(entry(b"/proc/sys"), Some(Entry::Directory(Directory::Sys)));
-        assert_eq!(entry(b"/proc/sys/"), Some(Entry::Directory(Directory::Sys)));
         assert_eq!(
-            entry(b"/proc/sys/fs"),
+            lookup(b"/proc/sys", None),
+            Some(Entry::Directory(Directory::Sys))
+        );
+        assert_eq!(
+            lookup(b"/proc/sys/", None),
+            Some(Entry::Directory(Directory::Sys))
+        );
+        assert_eq!(
+            lookup(b"/proc/sys/fs", None),
             Some(Entry::Directory(Directory::Fs))
         );
         assert_eq!(
-            entry(b"/proc/sys/fs/mqueue/"),
+            lookup(b"/proc/sys/fs/mqueue/", None),
             Some(Entry::Directory(Directory::Mqueue))
         );
         assert_eq!(
-            entry(b"/proc/sys/fs/mqueue/msg_max"),
+            lookup(b"/proc/sys/fs/mqueue/msg_max", None),
             Some(Entry::Setting(Setting::MsgMax))
         );
-        assert_eq!(entry(b"/proc/sys/fs/mqueue/other"), None);
+        assert_eq!(lookup(b"/proc/sys/fs/mqueue/other", None), None);
         assert_eq!(
-            entry(b"/proc/sys/fs/aio-max-nr"),
+            lookup(b"/proc/sys/fs/aio-max-nr", None),
             Some(Entry::Aio(Aio::MaxNr))
         );
-        assert_eq!(entry(b"/proc/sys/fs/aio-nr"), Some(Entry::Aio(Aio::Nr)));
-        assert_eq!(entries(Directory::Fs).len(), 7);
         assert_eq!(
-            entry(b"/proc/sys/fs/inotify"),
+            lookup(b"/proc/sys/fs/aio-nr", None),
+            Some(Entry::Aio(Aio::Nr))
+        );
+        assert_eq!(entries_of(Directory::Fs, None).len(), 7);
+        assert_eq!(
+            lookup(b"/proc/sys/fs/inotify", None),
             Some(Entry::Directory(Directory::Inotify))
         );
         assert_eq!(
-            entry(b"/proc/sys/fs/inotify/max_user_watches"),
+            lookup(b"/proc/sys/fs/inotify/max_user_watches", None),
             Some(Entry::Inotify(Inotify::UserWatches))
         );
-        assert_eq!(entry(b"/proc/sys/fs/inotify/other"), None);
-        assert_eq!(entries(Directory::Inotify).len(), 5);
-        assert_eq!(entries(Directory::Fanotify).len(), 6);
+        assert_eq!(lookup(b"/proc/sys/fs/inotify/other", None), None);
+        assert_eq!(entries_of(Directory::Inotify, None).len(), 5);
+        assert_eq!(entries_of(Directory::Fanotify, None).len(), 6);
         assert_eq!(
-            entry(b"/proc/sys/fs/fanotify/max_user_marks"),
+            lookup(b"/proc/sys/fs/fanotify/max_user_marks", None),
             Some(Entry::Fanotify(Fanotify::UserMarks))
         );
-        assert_eq!(entry(b"/proc/sys/fs/fanotify/other"), None);
+        assert_eq!(lookup(b"/proc/sys/fs/fanotify/other", None), None);
         assert_eq!(
-            entry(b"/proc/sys/kernel"),
+            lookup(b"/proc/sys/kernel", None),
             Some(Entry::Directory(Directory::Kernel))
         );
         assert_eq!(
-            entry(b"/proc/sys/kernel/sem"),
+            lookup(b"/proc/sys/kernel/sem", None),
             Some(Entry::Kernel(Kernel::Sem))
         );
-        assert_eq!(entry(b"/proc/sys/kernel/other"), None);
-        assert_eq!(entries(Directory::Sys).len(), 4);
-        assert_eq!(entries(Directory::Kernel).len(), 16);
-        assert_eq!(entry(b"/proc/system"), None);
-        assert_eq!(entries(Directory::Mqueue).len(), 7);
+        assert_eq!(lookup(b"/proc/sys/kernel/other", None), None);
+        assert_eq!(entries_of(Directory::Sys, None).len(), 5);
+        assert_eq!(entries_of(Directory::Kernel, None).len(), 16);
+        assert_eq!(lookup(b"/proc/system", None), None);
+        assert_eq!(entries_of(Directory::Mqueue, None).len(), 7);
+    }
+
+    #[test]
+    fn net_paths_name_their_directories_and_files() {
+        let network = crate::inet::Network::isolated(crate::users::first());
+        let named = |path: &[u8]| lookup(path, Some(&network));
+        assert_eq!(
+            named(b"/proc/sys/net"),
+            Some(Entry::Directory(Directory::Net))
+        );
+        assert_eq!(lookup(b"/proc/sys/net", None), None);
+        assert_eq!(named(b"/proc/sys/network"), None);
+        assert_eq!(
+            named(b"/proc/sys/net/ipv4/"),
+            Some(Entry::Directory(Directory::Ipv4))
+        );
+        assert_eq!(
+            named(b"/proc/sys/net/ipv4/ip_forward"),
+            Some(Entry::Net(Net::IpForward))
+        );
+        let lo = Target::Device(crate::netdev::LOOPBACK_INDEX);
+        assert_eq!(
+            named(b"/proc/sys/net/ipv6/conf/lo"),
+            Some(Entry::Directory(Directory::Device6(lo)))
+        );
+        assert_eq!(
+            named(b"/proc/sys/net/ipv6/conf/all/disable_ipv6"),
+            Some(Entry::Net(Net::DisableIpv6(Target::All)))
+        );
+        assert_eq!(
+            named(b"/proc/sys/net/ipv4/conf/default/rp_filter"),
+            Some(Entry::Net(Net::RpFilter(Target::Default)))
+        );
+        assert_eq!(named(b"/proc/sys/net/ipv4/conf/eth0/rp_filter"), None);
+        assert_eq!(named(b"/proc/sys/net/ipv6/conf/lo/rp_filter"), None);
+        assert_eq!(named(b"/proc/sys/net/ipv6/ip_forward"), None);
+        let names = |d| -> Vec<Vec<u8>> {
+            entries_of(d, Some(&network))
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        assert_eq!(
+            names(Directory::Conf4),
+            [&b"."[..], b"..", b"all", b"default", b"lo"]
+        );
+        assert_eq!(
+            names(Directory::Device6(lo)),
+            [&b"."[..], b"..", b"disable_ipv6", b"forwarding"]
+        );
     }
 
     #[test]

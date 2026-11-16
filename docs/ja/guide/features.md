@@ -2375,7 +2375,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
-  `fs` と `kernel` だけを持つ `/proc/sys`（後述）、
+  `fs`、`kernel`、`net` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
@@ -2534,6 +2534,34 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
   `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
+- `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
+  `default`、デバイスごと（`lo`）に持つのと同じく、開いたプロセスのネットワーク名前空間の
+  設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
+  `ipv6/conf/<デバイス>/disable_ipv6` と `forwarding` です。ファイルとディレクトリは、
+  ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
+  書き込みで開けるのは、root と、その名前空間への `CAP_NET_ADMIN` を持つものです
+  （`net_ctl_permissions`。開けなければ `EACCES`、書き込みのときに書けなければ
+  `EPERM`）。どれも `proc_dointvec` と同じく `int` を 1 つ取ります。最初の名前空間は、
+  Linux の組み込みの値と同じく、どれも 0 で始まります。新しい名前空間は、最初の名前空間の
+  IPv4 の `all` と `default` を写し、IPv6 のものは組み込みの値で始めます
+  （`devconf_inherit_init_net` が 0 のとき）。その `lo` は `default` を写します。
+  ハンドラーと同じく:
+  - IPv4 の `forwarding`（`ip_forward` は `all` のもの）には、書き手の `CAP_NET_ADMIN` が
+    要ります（`EPERM`、`devinet_sysctl_forward`）。`all` のものが変わると、`default` と
+    すべてのデバイスのものも変わります。`default` のものはどのデバイスにも及びません。
+  - デバイスに設定した `rp_filter` はそのデバイスのものになります。`default` に設定すると、
+    まだ設定していないすべてのデバイスに及びます。失敗した書き込みでも、設定したことに
+    なります（`devinet_conf_proc`）。
+  - IPv6 の 2 つは失敗しません。正しくない値では値は変わらず、書き込みは全部を取ります。
+    `all` かデバイスの `forwarding` は、`addrconf_sysctl_forward` と同じく 1 を返し、
+    位置を動かしません。`all` のものは `default` とすべてのデバイスのものを変えます。
+    デバイスの `disable_ipv6` を入れると、そのデバイスは IPv6 のアドレスと経路を失い、
+    落ちたときと同じく知らせます（`addrconf_ifdown`）。上がっている間に切ると、
+    `NETDEV_UP` と同じく `::1` が戻り、IPv6 自身の `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を
+    知らせます。入っている間は、`lo` が上がっても IPv6 は何もせず、新しい IPv6 の
+    アドレスは `EACCES` です（`addrconf_add_dev`）。
+  - リンクの `IFLA_AF_SPEC` の IPv4 と IPv6 の設定にこれらが出ます。IPv6 は
+    `disable_ipv6` が切れているときだけ準備ができています。
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
   と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
   （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、

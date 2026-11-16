@@ -458,6 +458,17 @@ impl Network {
     pub(crate) fn owner(&self) -> &crate::namespaces::Namespace {
         self.owner.as_deref().unwrap_or(crate::users::first())
     }
+    /// The loopback's settings ([`crate::netconf`]).
+    pub(crate) fn lo_conf(&self) -> (crate::netdev::Conf4, crate::netdev::Conf6) {
+        self.devices()
+            .by_index(crate::netdev::LOOPBACK_INDEX)
+            .map(|lo| (lo.conf4, lo.conf6))
+            .unwrap_or_default()
+    }
+    /// Whether the loopback's IPv6 is off (`disable_ipv6`).
+    pub(crate) fn ipv6_off(&self) -> bool {
+        self.lo_conf().1.disable_ipv6 != 0
+    }
     /// Whether the loopback is up.
     pub(crate) fn is_up(&self) -> bool {
         self.up.load(Ordering::SeqCst)
@@ -472,18 +483,36 @@ impl Network {
     /// `None` when it already is, else what happened to the addresses and
     /// routes at `now`, for netlink to tell ([`crate::netlink::set_up`]).
     pub(crate) fn set_up(&self, up: bool, now: u64) -> Option<Vec<crate::interface::Event>> {
+        // The devices, alone, before the addresses.
+        let v6 = !self.ipv6_off();
         let mut addresses = self.addresses();
         if up == self.is_up() {
             return None;
         }
         let events = if up {
             self.ever_up.store(true, Ordering::SeqCst);
-            addresses.up(now)
+            addresses.up(now, v6)
         } else {
             addresses.down()
         };
         self.up.store(up, Ordering::SeqCst);
         Some(events)
+    }
+    /// Turns the loopback's IPv6 off or on, as a change of its
+    /// `disable_ipv6` does (`dev_disable_change`): off, it loses its IPv6
+    /// addresses and routes (`addrconf_ifdown`); on, while it is up, it
+    /// takes `::1` and its permanent addresses' routes back at `now`
+    /// (`NETDEV_UP`). What happened, for netlink to tell
+    /// ([`crate::netlink::set_ipv6`]).
+    pub(crate) fn set_ipv6(&self, on: bool, now: u64) -> Vec<crate::interface::Event> {
+        let mut addresses = self.addresses();
+        if !on {
+            addresses.down6()
+        } else if self.is_up() {
+            addresses.up6(now)
+        } else {
+            Vec::new()
+        }
     }
     /// `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` on the interface
     /// `name` (the `ifr_name` of a `struct ifreq`): the loopback `lo`, index

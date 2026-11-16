@@ -770,8 +770,11 @@ verified.
   An address runs out as its lifetime ends, where Linux's checks are
   deferrable work, which comes up to a second later (`round_jiffies_up`)
   and, on an idle machine, may wait seconds more, unless an address of the
-  family is added or changed, which has them run at once. An IPv6
-  route that has run out goes from its table at once, where Linux's, which lookups pass over, stays in dumps until its
+  family is added or changed, which has them run at once. What a socket
+  that binds or sends finds run out is told of when a netlink socket of
+  the namespace next reads, polls or writes, where Linux tells of it as
+  its check runs. An IPv6 route that has run out goes from its table at
+  once, where Linux's, which lookups pass over, stays in dumps until its
   garbage collection (`gc_interval`, 30 seconds), and from 7.3 marks its
   notification of that with `RTA_DEL_REASON`. A change that gives a
   permanent IPv6 address a lifetime gives its prefix route the same, as

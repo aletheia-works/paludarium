@@ -2775,7 +2775,8 @@ static void monitor_show(int fd, unsigned ctl, const char *label) { monitor_wait
    lines that name `skip`: the address-lifetimes case's own change, which
    makes Linux check the lifetimes, and which Linux tells of before what
    that check finds, where the emulator, whose addresses run out on time,
-   told of that first. */
+   told of that first. What a wait prints goes through a pipe, which holds
+   64 KiB: far more than one change tells. */
 static void monitor_but(int fd, unsigned ctl, const char *label, const char *const skip[2]) {
     fflush(stdout);
     int pipes[2], saved = dup(1);
@@ -2793,6 +2794,7 @@ static void monitor_but(int fd, unsigned ctl, const char *label, const char *con
     text[n] = 0;
     for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n"))
         if (!strstr(line, skip[0]) && !strstr(line, skip[1])) printf("%s\n", line);
+    if (n == sizeof text - 1) printf("%s: more than %zu bytes heard\n", label, n);
 }
 /* monitor_show, waiting `wait` ms for each datagram: 0 takes only those
    already queued, as Linux tells of a neighbour's change as it is made. */

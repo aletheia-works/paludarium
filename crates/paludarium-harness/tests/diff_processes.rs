@@ -200,6 +200,7 @@ mod linux {
                     | "fanotify-fid"
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
+                    | "fanotify-mounts"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -531,6 +532,7 @@ mod linux {
         fanotify_fid => ("fanotify-fid","fanotify"),
         fanotify_pidfd => ("fanotify-pidfd","fanotify"),
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
+        fanotify_mounts => ("fanotify-mounts","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),

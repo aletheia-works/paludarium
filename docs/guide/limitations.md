@@ -576,10 +576,11 @@ verified.
   in another namespace leaves it at the old path, and when its source is
   removed it shows nothing, where Linux keeps the deleted directory and
   mountinfo marks it `//deleted`. A descriptor's mount ID (`statx` with
-  `AT_EMPTY_PATH`, fdinfo) is found by the path it was opened by. A
-  fanotify mount mark (`FAN_MARK_MOUNT`) is kept by the file system's
-  device, so it also covers the bind mounts of that file system, and its
-  fdinfo line shows the first mount's ID, where Linux marks that one mount.
+  `AT_EMPTY_PATH`, fdinfo) is found by the path it was opened by, and so
+  is the mount of a descriptor's events for fanotify's mount marks
+  (`FAN_MARK_MOUNT`). Such a mark stays after its mount is unmounted, where
+  Linux removes it, and then also hears of a new mount of the same file
+  system that takes the mount's free ID.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the

@@ -1631,6 +1631,7 @@ impl Processes {
         leader: crate::credentials::TaskIds,
         cpu: u64,
         start_stack: u64,
+        auxv: Vec<u8>,
     ) -> Option<crate::coredump::Identity> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = entries.get(&pid)?;
@@ -1645,6 +1646,7 @@ impl Processes {
             cpu,
             children_cpu: entry.children_cpu,
             start_stack,
+            auxv,
             space: entry.space.clone(),
         })
     }
@@ -4715,6 +4717,8 @@ impl Kernel {
         };
         // `start_thread` loads the selectors a new program starts with.
         thread.state.ptrace.selectors = None;
+        // And `flush_thread` the hardware breakpoints.
+        thread.state.ptrace.debug = crate::ptrace::Debug::default();
         thread.state.name_after(&path);
         // Linux decides from the IDs before exec, then installs the new ones
         // as a change of credentials (`commit_creds`). A program the thread

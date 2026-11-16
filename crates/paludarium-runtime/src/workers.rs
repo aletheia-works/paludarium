@@ -1,4 +1,5 @@
 //! Each real Host worker owns CPU/decoder/thread context and shares only process resources.
+use paludarium_cpu::breakpoints::run_watched;
 use paludarium_cpu::compile::{Compiler, run_compiled};
 use paludarium_cpu::{
     DecodeCache, flag, reg, run_cached, run_cached_with_counted_hook, step_traced,
@@ -135,7 +136,21 @@ impl Execution {
             // budgets retain exact interpreter checkpoint/kill semantics.
             // With the trap flag set, one instruction runs and traps; checked
             // once per run here, so a run without it pays nothing more.
-            let reason = if thread.cpu.rflags & flag::TF != 0 {
+            let breakpoints = thread.breakpoints();
+            // RF holds back only an execute breakpoint for one instruction.
+            if breakpoints.is_none() {
+                thread.cpu.rflags &= !flag::RF;
+            }
+            let reason = if let Some(breakpoints) = &breakpoints {
+                // A tracer's hardware breakpoints: one instruction at a time,
+                // one alone with the trap flag.
+                let budget = if thread.cpu.rflags & flag::TF != 0 {
+                    1
+                } else {
+                    self.budget
+                };
+                run_watched(&mut thread.cpu, memory, budget, &mut decode, breakpoints)
+            } else if thread.cpu.rflags & flag::TF != 0 {
                 step_traced(&mut thread.cpu, memory, &mut decode)
             } else if self.accelerated && self.budget >= 64 {
                 run_cached_with_counted_hook(

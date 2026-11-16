@@ -110,6 +110,9 @@ pub struct ThreadGroup {
     /// The running program's auxiliary vector as its exec wrote it, which
     /// `/proc/<pid>/auxv` shows (Linux's `mm->saved_auxv`).
     auxv: Mutex<Vec<u8>>,
+    /// Where the running program's code starts and ends (Linux's
+    /// `start_code` and `end_code`), which `stat` and `statm` show.
+    code: Mutex<(u64, u64)>,
     /// The head `set_robust_list` gave each thread that called it.
     robust_lists: Mutex<BTreeMap<u32, u64>>,
     /// Each thread's System V semaphore undo list, once it has one, which
@@ -240,6 +243,7 @@ impl Default for ThreadGroup {
             core: Mutex::default(),
             start_stack: AtomicU64::new(0),
             auxv: Mutex::default(),
+            code: Mutex::default(),
             robust_lists: Mutex::default(),
             sem_undo: Mutex::default(),
             shm_creators: Mutex::default(),
@@ -585,6 +589,7 @@ impl ThreadGroup {
             // and the program itself (Linux's `exe_file`).
             start_stack: AtomicU64::new(self.start_stack()),
             auxv: Mutex::new(self.auxv()),
+            code: Mutex::new(self.code()),
             executable: Mutex::new(self.executable()),
             first_namespaces: self.first_namespaces.clone(),
             exe_file: Mutex::new(
@@ -1504,8 +1509,8 @@ impl ThreadGroup {
     pub(crate) fn start_stack(&self) -> u64 {
         self.start_stack.load(Ordering::SeqCst)
     }
-    /// Records the stack and the auxiliary vector of the program an exec
-    /// loaded.
+    /// Records the stack, the auxiliary vector and the code range of the
+    /// program an exec loaded.
     pub(crate) fn set_program(&self, image: &paludarium_loader::LoadedImage) {
         self.set_start_stack(image.initial_stack_pointer.0);
         *self.auxv.lock().unwrap_or_else(PoisonError::into_inner) = image
@@ -1514,6 +1519,10 @@ impl ThreadGroup {
             .flat_map(|&(kind, value)| [kind.to_le_bytes(), value.to_le_bytes()])
             .flatten()
             .collect();
+        *self.code.lock().unwrap_or_else(PoisonError::into_inner) = image.code;
+    }
+    pub(crate) fn code(&self) -> (u64, u64) {
+        *self.code.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub(crate) fn auxv(&self) -> Vec<u8> {
         self.auxv
@@ -1923,6 +1932,7 @@ impl Kernel {
             self.group.task_ids(pid, pid),
             self.group.process_cpu(),
             self.group.start_stack(),
+            self.group.auxv(),
         ) else {
             return;
         };

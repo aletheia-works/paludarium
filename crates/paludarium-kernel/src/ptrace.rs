@@ -10,6 +10,7 @@
 //! `pt_regs` of a task in `TASK_TRACED`.
 use crate::processes::{ChildEvent, WaitFor, Wanted};
 use crate::{Kernel, Next, Thread, signals};
+use paludarium_cpu::breakpoints::{BreakOn, Breakpoint, Breakpoints};
 use paludarium_cpu::{CpuState, flag, reg};
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{Errno, ExitStatus, GuestAddr};
@@ -218,6 +219,134 @@ pub(crate) struct Local {
     /// and `ss` (`thread.ds` and the others); none for the ones every task
     /// starts with, which an exec gives back.
     pub(crate) selectors: Option<[u16; 6]>,
+    /// The debug registers a tracer set (`ptrace_bps`, `ptrace_dr7`,
+    /// `virtual_dr6`), which a new task does not take and exec clears.
+    pub(crate) debug: Debug,
+}
+
+/// DR6's single-step bit (`DR_STEP`).
+pub(crate) const DR_STEP: u64 = 0x4000;
+/// DR7's bits no breakpoint reads (`DR_CONTROL_RESERVED`).
+const DR_CONTROL_RESERVED: u64 = 0xffff_ffff_0000_fc00;
+
+/// One debug register a breakpoint was made for: its address, its length
+/// and type as DR7 last gave them (1 byte and a write, until then), and
+/// whether DR7 enables it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slot {
+    address: u64,
+    length: u8,
+    on: BreakOn,
+    enabled: bool,
+}
+
+/// A task's debug registers, as Linux's `ptrace_get_debugreg` and
+/// `ptrace_set_debugreg` keep them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Debug {
+    slots: [Option<Slot>; 4],
+    /// DR7 as written.
+    dr7: u64,
+    /// DR6 as Linux's `virtual_dr6` has it: the bits of the last #DB.
+    pub(crate) dr6: u64,
+    /// The breakpoints DR7 enables, which the CPU matches.
+    active: Option<Breakpoints>,
+}
+
+impl Debug {
+    /// The breakpoints the CPU is to match, if any is enabled.
+    pub(crate) fn active(&self) -> Option<&Breakpoints> {
+        self.active.as_ref()
+    }
+    fn update(&mut self) {
+        let mut set = Breakpoints::default();
+        for (n, slot) in self.slots.iter().enumerate() {
+            set.0[n] = slot.filter(|s| s.enabled).map(|s| Breakpoint {
+                address: s.address,
+                length: s.length,
+                on: s.on,
+            });
+        }
+        self.active = set.0.iter().any(Option::is_some).then_some(set);
+    }
+    /// `PTRACE_PEEKUSER` of debug register `n`.
+    fn get(&self, n: u64) -> u64 {
+        match n {
+            0..=3 => self.slots[n as usize].map_or(0, |s| s.address),
+            6 => self.dr6 ^ DR6_RESERVED,
+            7 => self.dr7,
+            _ => 0,
+        }
+    }
+    /// `PTRACE_POKEUSER` of debug register `n` (`ptrace_set_debugreg`):
+    /// an address goes to its breakpoint, which must be of user space and
+    /// aligned to its length (`EINVAL`); DR7 enables and shapes the four,
+    /// all or none (`ptrace_write_dr7`); there is no DR4 or DR5 (`EIO`).
+    fn set(&mut self, n: u64, value: u64) -> Result<(), Errno> {
+        match n {
+            0..=3 => {
+                let slot = &mut self.slots[n as usize];
+                let mut new = slot.unwrap_or(Slot {
+                    address: 0,
+                    length: 1,
+                    on: BreakOn::Write,
+                    enabled: false,
+                });
+                new.address = value;
+                check_breakpoint(new.address, new.length)?;
+                *slot = Some(new);
+            }
+            6 => self.dr6 = value ^ DR6_RESERVED,
+            7 => {
+                let data = value & !DR_CONTROL_RESERVED;
+                let mut slots = self.slots;
+                for (n, slot) in slots.iter_mut().enumerate() {
+                    let enabled = (data >> (n * 2)) & 3 != 0;
+                    if slot.is_none() && !enabled {
+                        continue;
+                    }
+                    let control = (data >> (16 + n * 4)) & 0xf;
+                    let length = match control >> 2 {
+                        0 => 1,
+                        1 => 2,
+                        2 => 8,
+                        _ => 4,
+                    };
+                    // `arch_bp_generic_fields`: an execute breakpoint is
+                    // 1 byte; I/O breakpoints are not taken.
+                    let on = match control & 3 {
+                        0 if length == 1 => BreakOn::Execute,
+                        1 => BreakOn::Write,
+                        3 => BreakOn::Access,
+                        _ => return Err(Errno::EINVAL),
+                    };
+                    let address = slot.map_or(0, |s| s.address);
+                    check_breakpoint(address, length)?;
+                    *slot = Some(Slot {
+                        address,
+                        length,
+                        on,
+                        enabled,
+                    });
+                }
+                self.slots = slots;
+                self.dr7 = value;
+            }
+            _ => return Err(Errno::EIO),
+        }
+        self.update();
+        Ok(())
+    }
+}
+
+/// `hw_breakpoint_arch_parse`: a breakpoint's address is aligned to its
+/// length and its range in user space (`EINVAL`).
+fn check_breakpoint(address: u64, length: u8) -> Result<(), Errno> {
+    let last = address.wrapping_add(u64::from(length) - 1);
+    if address & (u64::from(length) - 1) != 0 || address >= TASK_SIZE_MAX || last >= TASK_SIZE_MAX {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 /// The selectors of a 64-bit task: null data and `fs`/`gs` selectors,
@@ -303,6 +432,8 @@ struct Stop {
     forced_tf: bool,
     /// Its segment selectors, which a tracer may write.
     selectors: [u16; 6],
+    /// Its debug registers, which a tracer may write.
+    debug: Debug,
 }
 
 /// One traced task, which its process's thread group counts while it is
@@ -786,6 +917,7 @@ impl Kernel {
                 group_stopped: self.group.is_stopped(),
                 forced_tf: thread.state.ptrace.forced_tf,
                 selectors: thread.state.ptrace.selectors.unwrap_or(SELECTORS),
+                debug: thread.state.ptrace.debug,
             });
             tracee.tracer_pid
         };
@@ -885,6 +1017,7 @@ impl Kernel {
             thread.state.wait_restore_mask = None;
         }
         thread.state.ptrace.selectors = (stop.selectors != SELECTORS).then_some(stop.selectors);
+        thread.state.ptrace.debug = stop.debug;
         let orig = stop.orig_rax;
         if orig != before {
             thread.state.ptrace.orig_rax = orig;
@@ -1659,10 +1792,7 @@ impl Kernel {
                     Ok(if addr < REGS_SIZE {
                         regs(stop)[(addr / 8) as usize]
                     } else if (DEBUGREG..DEBUGREG + 64).contains(&addr) {
-                        match (addr - DEBUGREG) / 8 {
-                            6 => DR6_RESERVED,
-                            _ => 0,
-                        }
+                        stop.debug.get((addr - DEBUGREG) / 8)
                     } else {
                         0
                     })
@@ -1678,11 +1808,8 @@ impl Kernel {
                     if addr < REGS_SIZE {
                         putreg(stop, addr / 8, data)?;
                         Ok(0)
-                    } else if (DEBUGREG..DEBUGREG + 64).contains(&addr)
-                        && (addr - DEBUGREG) / 8 == 7
-                        && data == 0
-                    {
-                        // Disabling every hardware breakpoint; there are none.
+                    } else if (DEBUGREG..DEBUGREG + 64).contains(&addr) {
+                        stop.debug.set((addr - DEBUGREG) / 8, data)?;
                         Ok(0)
                     } else {
                         Err(Errno::EIO)
@@ -2331,6 +2458,7 @@ mod tests {
             group_stopped: false,
             forced_tf: false,
             selectors: SELECTORS,
+            debug: Debug::default(),
         }
     }
 
@@ -2438,6 +2566,77 @@ mod tests {
             (restart.number, thread.cpu.gpr[reg::RAX]),
             (None, ERESTARTNOHAND)
         );
+    }
+
+    #[test]
+    fn suspending_seccomp_needs_cap_sys_admin_and_a_tracer_free_of_it() {
+        let kernel = Kernel::new(Arc::new(paludarium_host::testing::RecordingHost::new()));
+        let mut thread = Thread::new(1, CpuState::default());
+        let suspend = PTRACE_O_SUSPEND_SECCOMP;
+        assert_eq!(
+            kernel.may_suspend_seccomp(&thread, PTRACE_O_EXITKILL),
+            Ok(())
+        );
+        assert_eq!(kernel.may_suspend_seccomp(&thread, suspend), Ok(()));
+        // Without CAP_SYS_ADMIN.
+        let mut unprivileged = Thread::new(1, CpuState::default());
+        unprivileged.state.credentials.euid = 1000;
+        unprivileged.state.credentials.effective = 0;
+        assert_eq!(
+            kernel.may_suspend_seccomp(&unprivileged, suspend),
+            Err(Errno::EPERM)
+        );
+        // A tracer under a seccomp mode.
+        thread.state.seccomp.mode = 2;
+        assert_eq!(
+            kernel.may_suspend_seccomp(&thread, suspend),
+            Err(Errno::EPERM)
+        );
+        thread.state.seccomp.mode = 0;
+        // A tracer whose own seccomp is suspended by its tracer.
+        let group = kernel.group.clone();
+        assert!(kernel.processes.trace(1, 1, &group, (9, 9), false, suspend));
+        assert_eq!(
+            kernel.may_suspend_seccomp(&thread, suspend),
+            Err(Errno::EPERM)
+        );
+        assert!(kernel.seccomp_suspended(1));
+    }
+
+    #[test]
+    fn debug_registers_take_what_linux_takes() {
+        let mut debug = Debug::default();
+        // An address alone makes a disabled 1-byte write breakpoint.
+        assert_eq!(debug.set(0, 0x1000), Ok(()));
+        assert_eq!((debug.get(0), debug.active()), (0x1000, None));
+        assert_eq!(debug.set(1, TASK_SIZE_MAX), Err(Errno::EINVAL));
+        assert_eq!(debug.set(4, 0), Err(Errno::EIO));
+        // DR0 enabled as a 4-byte write: the address is aligned to it.
+        assert_eq!(debug.set(7, 1 | 0b1101 << 16), Ok(()));
+        assert_eq!(debug.get(7), 1 | 0b1101 << 16);
+        let active = *debug.active().unwrap();
+        assert_eq!(
+            active.0[0],
+            Some(Breakpoint {
+                address: 0x1000,
+                length: 4,
+                on: BreakOn::Write
+            })
+        );
+        assert_eq!(debug.set(0, 0x1002), Err(Errno::EINVAL));
+        // An execute breakpoint is 1 byte; I/O breakpoints are refused, and
+        // a refused DR7 leaves the old one.
+        assert_eq!(debug.set(7, 1 | 0b0100 << 16), Err(Errno::EINVAL));
+        assert_eq!(debug.set(7, 1 | 0b0010 << 16), Err(Errno::EINVAL));
+        assert_eq!(debug.get(7), 1 | 0b1101 << 16);
+        assert_eq!(debug.set(7, 1), Ok(()));
+        assert_eq!(debug.active().unwrap().0[0].unwrap().on, BreakOn::Execute);
+        // DR6 is kept with its reserved bits flipped, as virtual_dr6.
+        assert_eq!(debug.get(6), DR6_RESERVED);
+        assert_eq!(debug.set(6, DR6_RESERVED | DR_STEP), Ok(()));
+        assert_eq!(debug.dr6, DR_STEP);
+        assert_eq!(debug.set(7, 0), Ok(()));
+        assert_eq!(debug.active(), None);
     }
 
     #[test]

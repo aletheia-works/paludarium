@@ -88,6 +88,14 @@ impl Task {
     fn read(&self, at: u64, buf: &mut [u8]) -> bool {
         self.memory().is_some_and(|memory| memory.read(at, buf))
     }
+    /// Its program's code range, which a zombie no longer has.
+    fn code(&self) -> (u64, u64) {
+        if self.live() {
+            self.view.group.code()
+        } else {
+            (0, 0)
+        }
+    }
     fn start_stack(&self) -> u64 {
         if self.live() {
             self.view.group.start_stack()
@@ -159,15 +167,15 @@ impl Task {
     }
 }
 
-/// Refuses what the reader may not see of the task: `environ`, `auxv`,
-/// `maps`, `smaps`, `pagemap`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
+/// Refuses what the reader may not see of the task: `environ`, `auxv`, `maps`,
+/// `smaps`, `pagemap`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
 /// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
-/// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself,
-/// read or looked in, as its mode lets (`proc_fd_permission`). `environ`,
-/// `auxv` and `pagemap` of a task with no memory left are `ESRCH` for
-/// anyone, as Linux's `__mem_open` and `pagemap_open` refuse them before
-/// they check the reader, while `maps` and `smaps` (`proc_maps_open`) then
-/// open for anyone and read nothing.
+/// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself, read or
+/// looked in, as its mode lets (`proc_fd_permission`). `environ`, `auxv` and
+/// `pagemap` of a task with no memory left are `ESRCH` for anyone, as Linux's
+/// `__mem_open` and `pagemap_open` refuse them before they check the reader,
+/// while `maps` and `smaps` (`proc_maps_open`) then open for anyone and read
+/// nothing.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
         TaskEntry::Environ | TaskEntry::Auxv | TaskEntry::Pagemap if task.memory().is_none() => {
@@ -244,7 +252,7 @@ pub(super) fn content(
     let (ignored, caught) = task.handled();
     Some(match entry {
         TaskEntry::Comm => crate::proc::render_comm(&public.name),
-        TaskEntry::Statm => crate::proc::render_statm(task.memory()),
+        TaskEntry::Statm => crate::proc::render_statm(task.memory(), task.code()),
         TaskEntry::Limits => crate::proc::render_limits(&task.view.limits),
         // What its exec saved, as Linux's `auxv_read`; nothing once its
         // memory is gone, when it no longer opens.
@@ -297,6 +305,7 @@ pub(super) fn content(
                 threads,
                 virtual_size,
                 rss_limit: task.view.rss_limit,
+                code: task.code(),
                 start_stack: task.start_stack(),
                 start_brk,
                 arguments,

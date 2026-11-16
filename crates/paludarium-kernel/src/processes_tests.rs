@@ -4573,6 +4573,12 @@ mod shm {
         t.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
         assert_eq!(write(&mut k, &mut t, &m, msgmax, b"100"), e(Errno::EPERM));
         assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), e(Errno::EPERM));
+        // So does a positioned write (pwrite64).
+        m.write(GuestAddr(BUF), b"100").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 18, [msgmax, BUF, 3, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
         // Root without CAP_SYS_ADMIN may write msgmax, but not
         // unprivileged_bpf_disabled, which asks the writer's capability.
         let mut bare = root.clone();
@@ -4583,9 +4589,15 @@ mod shm {
         t.state.credentials = root;
         let bpf = open(&mut k, &mut t, &m, "unprivileged_bpf_disabled");
         assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), 1);
+        // Root's positioned write at the start sets the value.
+        m.write(GuestAddr(BUF), b"200").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 18, [msgmax, BUF, 3, 0, 0, 0]),
+            3
+        );
         assert_eq!(
             read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/msgmax"),
-            "100\n"
+            "200\n"
         );
     }
 

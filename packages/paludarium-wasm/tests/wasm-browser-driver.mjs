@@ -40,8 +40,33 @@ async function stopSafari() {
 
 const RETRY_PAUSE_MS = 2000;
 
+// A Safari that was told to quit (the CI warm-up's, or an earlier session's) may still be exiting when the next
+// session is asked for; safaridriver then attaches to it as it goes, which is one way its "host application never
+// became ready". Before a session, wait until no Safari process is left, polled with `pgrep -x Safari` and bounded:
+// past the bound the session is asked for anyway, and the log says so. The tests shorten the bound.
+export const safariExit = { waitMs: 15000, pollMs: 250 };
+function safariRunning() {
+  const probe = spawn("/usr/bin/pgrep", ["-x", "Safari"], { stdio: "ignore" });
+  return new Promise(resolve => {
+    probe.once("exit", code => resolve(code === 0));
+    probe.once("error", () => resolve(false));
+  });
+}
+async function untilSafariExited() {
+  const start = Date.now();
+  let polls = 0;
+  while (await safariRunning()) {
+    polls += 1;
+    const waited = Date.now() - start;
+    if (waited >= safariExit.waitMs) return { exited: false, waited_ms: waited, polls };
+    await sleep(safariExit.pollMs);
+  }
+  return { exited: true, waited_ms: Date.now() - start, polls };
+}
+
 async function safari(url, timeout) {
   let first;
+  const started = Date.now();
   try {
     const result = await safariAttempt(url, timeout);
     return { ...result, session_retry: { attempts: 1, retried: false, first_failure: null } };
@@ -49,13 +74,19 @@ async function safari(url, timeout) {
     if (!isSafariLaunchFailure(error)) throw error;
     first = error;
   }
+  const failedAfter = Date.now() - started;
   const stopped = await stopSafari();
-  // Logged, never hidden: the first failure goes to stderr (kept by the suite supervisor) and into the result.
-  console.error(JSON.stringify({ safari_session_retry: { attempt: 1, failure: first.message, safari_stopped: stopped } }));
+  // Logged, never hidden: the first failure goes to stderr (kept by the suite supervisor) and into the result,
+  // with when it came and how long the attempt took, so how often it happens can be counted from the logs.
+  const retry = { attempt: 1, failure: first.message, at: new Date().toISOString(), failed_after_ms: failedAfter,
+    session_requested_after_ms: first.sessionRequestedAfter ?? null, safari_exit_wait: first.safariExitWait ?? null,
+    safari_stopped: stopped, pause_ms: RETRY_PAUSE_MS };
+  console.error(JSON.stringify({ safari_session_retry: retry }));
   await sleep(RETRY_PAUSE_MS);
   try {
     const result = await safariAttempt(url, timeout);
-    return { ...result, session_retry: { attempts: 2, retried: true, first_failure: first.message, safari_stopped: stopped } };
+    return { ...result, session_retry: { attempts: 2, retried: true, first_failure: first.message, safari_stopped: stopped,
+      first_failed_after_ms: failedAfter } };
   } catch (error) {
     error.message += `; first attempt (retried once): ${first.message}`;
     error.firstFailure = first;
@@ -66,7 +97,8 @@ async function safari(url, timeout) {
 async function safariAttempt(url, timeout) {
   const port = 4455, base = `http://127.0.0.1:${port}`;
   const driver = spawn("/usr/bin/safaridriver", ["--port", String(port)], { stdio: ["ignore", "pipe", "pipe"] });
-  let driverError, sessionId, log = "", phase = "driver-startup", failure;
+  const started = Date.now();
+  let driverError, sessionId, log = "", phase = "driver-startup", failure, exitWait = null, sessionRequestedAfter = null;
   driver.on("error", error => { driverError = error; });
   for (const stream of [driver.stdout, driver.stderr]) stream.on("data", bytes => { log = (log + bytes.toString()).slice(-8192); });
   try {
@@ -77,7 +109,11 @@ async function safariAttempt(url, timeout) {
       try { await webdriverRequest(base, "GET", "/status"); break; }
       catch (error) { if (Date.now() >= startup) throw error; await sleep(100); }
     }
+    phase = "safari-exit-wait";
+    exitWait = await untilSafariExited();
+    if (exitWait.polls > 0) console.error(JSON.stringify({ safari_exit_wait: exitWait }));
     phase = "session-creation";
+    sessionRequestedAfter = Date.now() - started;
     const session = await webdriverRequest(base, "POST", "/session", { capabilities: { alwaysMatch: { browserName: "safari" } } }, 60000);
     sessionId = session.sessionId;
     if (!sessionId) throw new Error("Safari did not return a session ID");
@@ -87,13 +123,15 @@ async function safariAttempt(url, timeout) {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       const report = await webdriverRequest(base, "POST", `/session/${sessionId}/execute/sync`, { script: "return window.__wasmReport || null;", args: [] });
-      if (report) return { environment: "safari", version: session.capabilities?.browserVersion ?? "unknown", ...report };
+      if (report) return { environment: "safari", version: session.capabilities?.browserVersion ?? "unknown", safari_exit_wait: exitWait, ...report };
       await sleep(100);
     }
     throw new Error("Safari page report exceeded external suite deadline");
   } catch (cause) {
     failure = new Error(`Safari ${phase}: ${cause}; driver exit=${driver.exitCode}, signal=${driver.signalCode}, log=${log}`, { cause });
     failure.phase = phase;
+    failure.safariExitWait = exitWait;
+    failure.sessionRequestedAfter = sessionRequestedAfter;
     throw failure;
   } finally {
     let cleanupError;

@@ -405,3 +405,120 @@ fn popf_clearing_the_trap_flag_still_traps_after_itself() {
     );
     assert_eq!(s.rflags & flag::TF, 0);
 }
+
+#[test]
+fn an_execute_breakpoint_faults_before_its_instruction_once() {
+    use crate::breakpoints::{BreakOn, Breakpoint, Breakpoints, run_watched};
+    // nop; nop
+    let (mut s, mem) = fixture(&[0x90, 0x90]);
+    let mut cache = DecodeCache::new();
+    let mut set = Breakpoints::default();
+    set.0[2] = Some(Breakpoint {
+        address: 0x10001,
+        length: 1,
+        on: BreakOn::Execute,
+    });
+    assert_eq!(
+        run_watched(&mut s, &mem, 10, &mut cache, &set),
+        ExitReason::HardwareBreakpoint {
+            rip: GuestAddr(0x10001),
+            hits: 0b100,
+            step: false
+        }
+    );
+    assert_ne!(s.rflags & flag::RF, 0);
+    // Resumed with RF, the instruction runs.
+    assert_eq!(
+        run_watched(&mut s, &mem, 1, &mut cache, &set),
+        ExitReason::BudgetExhausted {
+            rip: GuestAddr(0x10002)
+        }
+    );
+    assert_eq!(s.rflags & flag::RF, 0);
+}
+
+#[test]
+fn a_data_breakpoint_traps_after_the_access_it_watches() {
+    use crate::breakpoints::{BreakOn, Breakpoint, Breakpoints, run_watched};
+    // mov [0x40000008], ecx (disp32 absolute); mov edx, [0x40000008]; push rax
+    let code = [
+        0x89, 0x0c, 0x25, 0x08, 0, 0, 0x40, //
+        0x8b, 0x14, 0x25, 0x08, 0, 0, 0x40, //
+        0x50,
+    ];
+    let (mut s, mem) = fixture(&code);
+    s.gpr[reg::RSP] = 0x4000_1000;
+    let mut cache = DecodeCache::new();
+    let mut set = Breakpoints::default();
+    set.0[1] = Some(Breakpoint {
+        address: 0x4000_0008,
+        length: 8,
+        on: BreakOn::Write,
+    });
+    let hit = |rip| ExitReason::HardwareBreakpoint {
+        rip: GuestAddr(rip),
+        hits: 0b10,
+        step: false,
+    };
+    assert_eq!(
+        run_watched(&mut s, &mem, 10, &mut cache, &set),
+        hit(0x10007)
+    );
+    // A read does not hit a write breakpoint; a read or write one, it does.
+    set.0[1].as_mut().unwrap().on = BreakOn::Access;
+    let mut writes_only = set;
+    writes_only.0[1].as_mut().unwrap().on = BreakOn::Write;
+    let mut probe = s.clone();
+    assert_eq!(
+        run_watched(&mut probe, &mem, 1, &mut cache, &writes_only),
+        ExitReason::BudgetExhausted {
+            rip: GuestAddr(0x1000e)
+        }
+    );
+    assert_eq!(
+        run_watched(&mut s, &mem, 10, &mut cache, &set),
+        hit(0x1000e)
+    );
+    // A push writes the stack under rsp.
+    set.0[1] = Some(Breakpoint {
+        address: 0x4000_0ff8,
+        length: 8,
+        on: BreakOn::Write,
+    });
+    assert_eq!(
+        run_watched(&mut s, &mem, 10, &mut cache, &set),
+        hit(0x1000f)
+    );
+}
+
+#[test]
+fn a_string_instruction_without_a_repeat_hits_a_data_breakpoint() {
+    use crate::breakpoints::{BreakOn, Breakpoint, Breakpoints, run_watched};
+    // stosq; rep stosq
+    let (mut s, mem) = fixture(&[0x48, 0xab, 0xf3, 0x48, 0xab]);
+    s.gpr[reg::RDI] = 0x4000_0010;
+    s.gpr[reg::RCX] = 1;
+    let mut cache = DecodeCache::new();
+    let mut set = Breakpoints::default();
+    set.0[3] = Some(Breakpoint {
+        address: 0x4000_0010,
+        length: 8,
+        on: BreakOn::Write,
+    });
+    assert_eq!(
+        run_watched(&mut s, &mem, 10, &mut cache, &set),
+        ExitReason::HardwareBreakpoint {
+            rip: GuestAddr(0x10002),
+            hits: 0b1000,
+            step: false
+        }
+    );
+    // A repeated one is not looked at yet.
+    set.0[3].as_mut().unwrap().address = 0x4000_0018;
+    assert_eq!(
+        run_watched(&mut s, &mem, 1, &mut cache, &set),
+        ExitReason::BudgetExhausted {
+            rip: GuestAddr(0x10005)
+        }
+    );
+}

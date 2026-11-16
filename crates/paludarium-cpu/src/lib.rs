@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod alu;
+pub mod breakpoints;
 pub mod compile;
 #[cfg(test)]
 mod counted_hook_tests;
@@ -747,6 +748,21 @@ pub fn step_traced(
         }
         Err(reason) => reason,
     }
+}
+
+/// The instruction at `state.rip`, decoded through `cache` as
+/// [`step_cached`] runs it.
+#[inline(never)]
+pub(crate) fn fetch_cached(
+    state: &mut CpuState,
+    mem: &AddressSpace,
+    cache: &mut DecodeCache,
+) -> Result<Instruction, ExitReason> {
+    let generation = mem.code_generation_cached();
+    let block = cache.block(state.rip.0, generation, |code| {
+        decode_block(state, mem, code)
+    })?;
+    Ok(cache.code.instructions[block.start])
 }
 
 /// Appends to `code` the first instruction of the block at `state.rip`:

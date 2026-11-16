@@ -108,6 +108,10 @@ pub struct LoadedImage {
     /// `AT_NULL`, which Linux keeps as `saved_auxv` for
     /// `/proc/<pid>/auxv` whatever the program then does to its stack.
     pub auxv: [(u64, u64); AUXV_ENTRIES],
+    /// Where the program's code starts and ends (Linux's `start_code` and
+    /// `end_code`), as `load_elf_binary` finds them: the lowest address and
+    /// the highest end in the file of its executable `PT_LOAD` segments.
+    pub code: (u64, u64),
 }
 
 /// The entries of [`LoadedImage::auxv`], `AT_NULL`'s with them.
@@ -355,6 +359,21 @@ fn file_pages(
             SegmentImage::Data(pages)
         }
     }
+}
+
+/// `start_code` and `end_code` of the program loaded at `base`: the lowest
+/// `p_vaddr` and the highest `p_vaddr + p_filesz` of its `PT_LOAD` segments
+/// with `PF_X`, moved by `base`, as Linux's `load_elf_binary` computes them
+/// (wrapping from `!0` and 0 when there is none).
+fn code_range(info: &ElfInfo, base: u64) -> (u64, u64) {
+    let (start, end) = info
+        .headers
+        .iter()
+        .filter(|h| h.kind == elf::PT_LOAD && h.flags & elf::PF_X != 0)
+        .fold((u64::MAX, 0), |(start, end), h| {
+            (start.min(h.vaddr), end.max(h.vaddr.wrapping_add(h.filesz)))
+        });
+    (start.wrapping_add(base), end.wrapping_add(base))
 }
 
 /// Address of the program headers in guest memory (`AT_PHDR`).
@@ -651,6 +670,7 @@ fn load_image(
         initial_break,
         load_base: GuestAddr(base),
         auxv: [(0, 0); AUXV_ENTRIES],
+        code: code_range(&info, base),
     };
     let (stack, auxv) = build_stack(mem, start, &image)?;
     image.initial_stack_pointer = GuestAddr(stack);

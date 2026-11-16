@@ -205,8 +205,43 @@ compiling about three times faster and the code faster too.
 In a same-runner comparison on CI (x86-64 Linux), against the interpreter
 without it, `--jit` made Perl's hash and string benchmarks 15% and 27%
 faster, LuaJIT 15% and OCaml 8%, with every Debian program still giving
-native Linux's results; programs that run briefly changed within the
+native Linux's results; programs that run briefly changed within that
 measurement's noise. It is off by default until it has more to show.
+
+### When the native JIT is turned on by default
+
+On Linux x86-64 hosts the native JIT is to be on by default, with `--no-jit`
+to turn it off, once all of the following hold. Other hosts and the
+WebAssembly package keep the behaviour they have. Each criterion is read off
+CI's own records, so anyone can check it:
+
+1. **Correctness on main, 14 days in a row.** Every run of the
+   `differential-jit` job on main passed (`ci.yml`, which runs on each push to
+   main that changes Rust), and so did every night's Debian comparison with
+   the JIT (the `jit` run of `distro-programs.yml`), with every case giving
+   native Linux's result. One failure starts the count again. The two
+   complement each other: the first compiles every block the first time it
+   runs, over the differential tests; the second uses the default threshold,
+   over Debian's real programs.
+2. **Fuzzing.** The nightly `jit_native` fuzz target, which compares compiled
+   code with the interpreter for arbitrary instruction bytes, found nothing in
+   each of those 14 nights. The target exists already, so no new one is needed.
+3. **No open correctness bug.** No open issue labelled `type: bug` is about
+   the native JIT (`gh issue list --state open --label "type: bug" --search
+   jit`).
+4. **Speed.** The `Native JIT speed` workflow (`jit-speed.yml`), run by hand
+   on the commit that turns the JIT on, passes. On one runner it times the
+   probe, ripgrep and aube cases, Perl's benchmarks and 12 Debian programs,
+   with and without the JIT. It fails when the JIT makes a case slower than
+   every round without it. Short programs count as much as long ones, since
+   turning the JIT on by default would add its cost to every command.
+
+The last criterion does not hold yet. In the last same-runner runs (fork run
+43897560585), the JIT made long programs much faster: Perl's hash benchmark
+42%, Java 44% and OCaml 41%. But 15 of the 36 cases were slower than every
+round without it, all of them programs that take 15–200 ms: the probe cases
+by 4–30%, ripgrep's by 5–12% and two of aube's by 7–10%. That is a cost the
+JIT pays at start, so it has to go before the switch.
 
 ## One way to create a filesystem
 
@@ -232,7 +267,22 @@ interpreter runs one instruction and reports the trap, so a run without it
 pays one test and nothing per instruction. `popf`, the only instruction
 that sets the flag, ends its run when it does, so the next one is stepped;
 the kernel sets it only between runs (`rt_sigreturn`, a tracer). Neither
-JIT needs to know of the flag.
+JIT needs to know of the flag. Hardware breakpoints go the same way: while
+a tracer has one enabled, the interpreter runs the guest one instruction at
+a time and matches it against them, and a guest without any pays nothing
+for them.
+
+## A machine with 4-level paging
+
+paludarium is always a machine with 4-level page tables: user space ends
+below 2^47 bytes, and `TASK_SIZE_MAX` is 2^47 - 4096, on every host. A guest
+then behaves the same on a Linux host with 5-level paging, on macOS and in
+WebAssembly, and its results do not depend on the paging depth of the
+machine it runs on. Little is lost: Linux maps above 2^47 only for a
+process that asks for it with an `mmap` hint there. What differs from a
+Linux on a CPU with 5-level paging is listed in the
+[limitations](../guide/limitations); the differential tests use no value
+whose result there would depend on the paging depth.
 
 ## Explicit CPU differences
 

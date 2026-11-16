@@ -285,8 +285,9 @@ pub enum Fast {
         dst: u8,
         src: u8,
     },
-    /// `punpcklbw`, `punpckldq` or `punpcklqdq` of xmm register `src` into
-    /// `dst`, `pshufd` of `src` into `dst` by `imm`, or `pslld` or `psrld`
+    /// `punpcklbw`, `punpckldq`, `punpcklqdq`, `paddd`, `psubd`, `paddq`,
+    /// `psubq`, `pmuludq`, `pand`, `por` or `pandn` of xmm register `src`
+    /// into `dst`, `pshufd` of `src` into `dst` by `imm`, or `pslld` or `psrld`
     /// of `dst` by `imm` (`src` is `dst`), as [`crate::sse::packed`] has
     /// them.
     XmmPacked {
@@ -504,7 +505,17 @@ impl Fast {
             return None;
         }
         Some(match i.mnemonic {
-            Mnemonic::Punpcklbw | Mnemonic::Punpckldq | Mnemonic::Punpcklqdq => Self::XmmPacked {
+            Mnemonic::Punpcklbw
+            | Mnemonic::Punpckldq
+            | Mnemonic::Punpcklqdq
+            | Mnemonic::Paddd
+            | Mnemonic::Psubd
+            | Mnemonic::Paddq
+            | Mnemonic::Psubq
+            | Mnemonic::Pmuludq
+            | Mnemonic::Pand
+            | Mnemonic::Por
+            | Mnemonic::Pandn => Self::XmmPacked {
                 op: i.mnemonic,
                 dst: xmm(a)?,
                 src: xmm(b)?,

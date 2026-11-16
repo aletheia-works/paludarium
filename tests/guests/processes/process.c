@@ -10379,6 +10379,36 @@ static int pol_auxv_has(const char *bytes, long n, unsigned long type, unsigned 
         if (words[2 * i] == type) return words[2 * i + 1] == value;
     return 0;
 }
+/* start_code and end_code of this program as Linux's load_elf_binary finds
+   them in its program headers: the lowest address and the highest end in
+   the file of its executable PT_LOAD segments, moved by the load bias. */
+static void pol_code(unsigned long long *start, unsigned long long *end) {
+    const ElfW(Phdr) *ph = (const ElfW(Phdr) *)getauxval(AT_PHDR);
+    unsigned long count = getauxval(AT_PHNUM), bias = 0;
+    for (unsigned long i = 0; i < count; i++)
+        if (ph[i].p_type == PT_PHDR) bias = getauxval(AT_PHDR) - ph[i].p_vaddr;
+    *start = ~0ULL;
+    *end = 0;
+    for (unsigned long i = 0; i < count; i++) {
+        if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
+        if (ph[i].p_vaddr < *start) *start = ph[i].p_vaddr;
+        if (ph[i].p_vaddr + ph[i].p_filesz > *end) *end = ph[i].p_vaddr + ph[i].p_filesz;
+    }
+    *start += bias;
+    *end += bias;
+}
+/* Fields 26 and 27 of stat `text`, startcode and endcode. */
+static int pol_stat_code(const char *text, unsigned long long *start, unsigned long long *end) {
+    const char *p = strrchr(text, ')');
+    if (!p) return 0;
+    p += 2;
+    for (int field = 3; field < 26; field++) {
+        p = strchr(p, ' ');
+        if (!p) return 0;
+        p++;
+    }
+    return sscanf(p, "%llu %llu", start, end) == 2;
+}
 static int proc_other_limits_case(void) {
     /* What the child reads of itself: statm, auxv and limits. */
     char *seen = mmap(NULL, 4 * POL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -10445,6 +10475,18 @@ static int proc_other_limits_case(void) {
     printf("own statm read=%d fields=%d", m > 0, fields);
     if (fields == 7) printf(" size=%d data=%d resident=%d", mine[0] == size, mine[5] == data, mine[1] > 0);
     printf("\n");
+    /* The code range in stat, its own and the child's (which its fork
+       keeps), and its pages in statm. */
+    unsigned long long code_start, code_end, start, end;
+    pol_code(&code_start, &code_end);
+    unsigned long long text_pages = (((code_end + 4095) & ~4095ULL) - (code_start & ~4095ULL)) / 4096;
+    pol_read("/proc/self/stat", theirs);
+    int own_code = pol_stat_code(theirs, &start, &end) && start == code_start && end == code_end;
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    pol_read(path, theirs);
+    int child_code = pol_stat_code(theirs, &start, &end) && start == code_start && end == code_end;
+    printf("code stat=%d child=%d statm=%d other=%d some=%d\n", own_code, child_code,
+           fields == 7 && mine[3] == text_pages, other[3] == text_pages, code_end > code_start);
     /* auxv: the vector the child's exec saved, which its fork keeps. */
     snprintf(path, sizeof path, "/proc/%d/auxv", (int)kid);
     n = pol_read(path, theirs);
@@ -10507,6 +10549,9 @@ static int proc_other_limits_case(void) {
     snprintf(path, sizeof path, "/proc/%d/statm", (int)kid);
     n = pol_read(path, theirs);
     printf("zombie statm=%ld [%.*s]", n, (int)strcspn(theirs, "\n"), theirs);
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    pol_read(path, theirs);
+    printf(" code=%d", pol_stat_code(theirs, &start, &end) && !start && !end);
     snprintf(path, sizeof path, "/proc/%d/auxv", (int)kid);
     printf(" auxv=%ld", pol_read(path, theirs));
     snprintf(path, sizeof path, "/proc/%d/environ", (int)kid);
@@ -15186,9 +15231,13 @@ static int ipc_sysctl_more(void) {
     if (read(ids[0], &orphan, sizeof orphan) != sizeof orphan) return 12;
     int made = reaped(maker);
     printf(" made=%d orphan-kept=%ld", made, ksys_exists(orphan));
-    /* Setting it removes the orphans no mapping shows. */
-    printf(" set=%ld orphan=%ld own=%ld", ksys_write("shm_rmid_forced", "1"), ksys_exists(orphan),
-           ksys_exists(own));
+    /* Setting it removes the orphans no mapping shows. Each call is its
+       own statement: the order of a call's arguments is unspecified, and
+       gcc took the checks before the write. */
+    long set = ksys_write("shm_rmid_forced", "1");
+    long orphan_now = ksys_exists(orphan);
+    long own_now = ksys_exists(own);
+    printf(" set=%ld orphan=%ld own=%ld", set, orphan_now, own_now);
     /* Set, a segment goes at its last detach. */
     int detached = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
     void *at = (void *)syscall(SYS_shmat, detached, 0, 0);
@@ -15235,7 +15284,11 @@ static int ipc_sysctl_more(void) {
         if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
         errno = 0;
         long n = write((int)held, "100", 3);
-        printf("held-write: open=%d write=%ld", held >= 0, n < 0 ? -errno : n);
+        long written = n < 0 ? -errno : n;
+        errno = 0;
+        n = pwrite((int)held, "100", 3, 0);
+        long positioned = n < 0 ? -errno : n;
+        printf("held-write: open=%d write=%ld pwrite=%ld", held >= 0, written, positioned);
         ksys_show("msgmax");
         printf("\n");
         fflush(stdout);
@@ -26087,12 +26140,25 @@ int main(int argc, char **argv) {
         at[16][page] = 0x5a;
         if (mprotect(at[16], 2 * page, PROT_NONE)) return 85;
         (void)sink;
+        /* NT_AUXV is the vector exec saved, which the fork keeps, whatever
+           the child does to the copy on its stack (Linux's saved_auxv). */
+        static unsigned char saved_auxv[4096];
+        long saved = 0, got;
+        int auxv_fd = open("/proc/self/auxv", O_RDONLY);
+        while (auxv_fd >= 0 && saved < (long)sizeof saved_auxv &&
+               (got = read(auxv_fd, saved_auxv + saved, sizeof saved_auxv - (size_t)saved)) > 0)
+            saved += got;
+        if (auxv_fd >= 0) close(auxv_fd);
         pid_t pid = fork();
         if (pid == 0) {
             struct rlimit r;
             getrlimit(RLIMIT_CORE, &r);
             r.rlim_cur = r.rlim_max;
             setrlimit(RLIMIT_CORE, &r);
+            extern char **environ;
+            char **end = environ;
+            while (*end) end++;
+            for (unsigned long *pair = (unsigned long *)(end + 1); pair[0]; pair += 2) pair[1] ^= 0x5a5a;
             at[11][0] = 1;
             *(volatile int *)0 = 1;
             _exit(70);
@@ -26146,7 +26212,7 @@ int main(int argc, char **argv) {
         int osxsave = ecx >> 27 & 1;
         if (osxsave) __cpuid_count(0xd, 0, eax, xsave_size, ecx, edx);
         uint64_t files = 0;
-        int after_auxv = 0, xstate = 0, xstate_whole = 0;
+        int after_auxv = 0, xstate = 0, xstate_whole = 0, auxv_same = -1;
         for (int k = 0; k < (int)le(56, 2); k++) {
             uint64_t h = le(32, 8) + 56 * (uint64_t)k, offset = le(h + 8, 8), filesz = le(h + 32, 8);
             if (le(h, 4) != 4) continue;
@@ -26155,6 +26221,9 @@ int main(int argc, char **argv) {
                 uint64_t namesz = le(q, 4), descsz = le(q + 4, 4), type = le(q + 8, 4);
                 uint64_t desc = q + 12 + ((namesz + 3) & ~3ULL);
                 if (type == 0x46494c45 && !files) files = desc, after_auxv = previous == 6;
+                if (type == 6 && auxv_same < 0)
+                    auxv_same = saved > 0 && descsz == (uint64_t)saved && desc + descsz <= core_size &&
+                                !memcmp(core_bytes + desc, saved_auxv, (size_t)saved);
                 if (type == 0x202 && !xstate++)
                     xstate_whole = previous == 2 && descsz == xsave_size && namesz == 6 &&
                                    !memcmp(core_bytes + q + 12, "LINUX", 6);
@@ -26163,6 +26232,7 @@ int main(int argc, char **argv) {
             }
         }
         printf("files: page=%llu after-auxv=%d\n", (unsigned long long)le(files + 8, 8), after_auxv);
+        printf("auxv: saved=%d\n", auxv_same);
         char cwd[PATH_MAX], data_path[PATH_MAX + 8], gone_path[PATH_MAX + 24];
         if (!getcwd(cwd, sizeof cwd)) return 88;
         snprintf(data_path, sizeof data_path, "%s/data", cwd);

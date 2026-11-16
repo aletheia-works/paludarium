@@ -1896,7 +1896,14 @@ kernel.
     thread and the socket's opener (`EPERM`); a send that names an
     address (`sendto`, `sendmsg` with a name) needs the sending thread's
     alone, as `netlink_sendmsg` marks it `NETLINK_SKB_DST`, which
-    `__netlink_ns_capable` passes the opener over for.
+    `__netlink_ns_capable` passes the opener over for. A `write` (and
+    `writev`, `sendfile`, `splice` and AIO writes) sends as `send` without
+    an address does, as the writing thread, since `netlink_sendmsg` runs
+    in it: an autobind takes its process ID for the port, a route lookup
+    its user ID for `RTA_UID`, and a change needs its `CAP_NET_ADMIN` and
+    the opener's. `bind`'s and `NETLINK_ADD_MEMBERSHIP`'s multicast routing
+    groups and `connect` to another port or a group ask the calling
+    thread alone (`rtnetlink_bind`, `netlink_allowed`).
   - **Strict checking:** with `NETLINK_GET_STRICT_CHK`, as iproute2 sets
     it, requests are checked as Linux checks them. A dump takes a whole
     header with nothing in it but what may narrow it, and of the
@@ -2270,7 +2277,8 @@ kernel.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
-    multicast routing groups 30 and 31 need `CAP_NET_ADMIN`, `EPERM`);
+    multicast routing groups 30 and 31 need the caller's `CAP_NET_ADMIN`,
+    `EPERM`);
     `NETLINK_DROP_MEMBERSHIP` leaves one, and `NETLINK_LIST_MEMBERSHIPS`
     gives them all as two words. A change to `lo` is told to the members
     of its group in the namespace, each notification its own datagram,
@@ -2745,7 +2753,8 @@ kernel.
   (`VmLck`); the other memory fields and the CPU ones are not there, as
   nothing measures them. `statm` has, in pages, what Linux's `task_statm`
   counts: the size of the mappings, the resident pages, those of them a
-  file's or shared memory's, the code (0, as in `stat`), 0, the private
+  file's or shared memory's, the pages of the code range `stat` gives, 0,
+  the private
   writable mappings and the stack, and 0. `limits` lists the soft and hard
   resource limits as `prlimit` gives them, in Linux's columns. `auxv` (0400)
   is the auxiliary vector the program's `execve` wrote on its stack, kept
@@ -2811,13 +2820,16 @@ kernel.
   and session, the controlling terminal's device and foreground group (0
   and -1 without one), the CPU time of the process and of its waited-for
   children in `USER_HZ` (100) ticks, the priority and nice value, the threads,
-  the size of the mappings, the `RLIMIT_RSS` limit, the start of the stack and
-  of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
+  the size of the mappings, the `RLIMIT_RSS` limit, the start and end of
+  the program's code (Linux's `start_code` and `end_code`, as
+  `load_elf_binary` finds them: the lowest address and the highest end in
+  the file of its executable `PT_LOAD` segments; 0 for a zombie), the start
+  of the stack and of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
   waits, as Linux shows root, though not for a process of more than one thread
   as a whole), `exit_signal` (17 for the reader's own), and where
   the argument and environment strings lie. What nothing measures is 0: page
-  faults, resident memory, the start time, the code range and the scheduler's
-  figures. `cmdline` and `environ` are the argument and environment strings
+  faults, resident memory, the start time and the scheduler's figures.
+  `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.
 - `/proc/self/exe` and `/proc/self/cwd` are symbolic links (0777, size 0) to
@@ -3744,7 +3756,9 @@ kernel.
     written where it may not write or replace the file. The core has each
     thread's registers (`NT_PRSTATUS`), the process with its leader's real
     user and group (`NT_PRPSINFO`), the fatal
-    signal (`NT_SIGINFO`), the auxiliary vector, the mapped files (`NT_FILE`:
+    signal (`NT_SIGINFO`), the auxiliary vector its exec saved (Linux's
+    `saved_auxv`, whatever the program did to its stack), the mapped files
+    (`NT_FILE`:
     each VMA that maps a file, by its path, followed by `(deleted)` once
     unlinked, and shared anonymous memory as `/dev/zero (deleted)`, as Linux
     names it) and the memory. It has no `NT_X86_XSTATE` note, as Linux writes
@@ -4136,6 +4150,20 @@ one only with an `--allow-net`.
   exited or run another program. The thread that ends its process reports
   `PTRACE_EVENT_EXIT`, its status with 0x80 when a fatal signal dumps a
   core; the threads that end with it do not.
+- A tracer sets hardware breakpoints in the debug registers with
+  `PTRACE_POKEUSER`, as Linux's `ptrace_set_debugreg` takes them: DR0–DR3
+  hold the addresses, which must be in user space and aligned to the
+  breakpoint's length (`EINVAL`), and DR7 enables them and gives each its
+  type, an instruction (1 byte), a write, or a read or write, and its
+  length, 1, 2, 4 or 8 (`EINVAL` for an I/O breakpoint or a longer
+  instruction one, leaving DR7 as it was); there is no DR4 or DR5 (`EIO`).
+  An instruction breakpoint stops the tracee before the instruction, with
+  RF set so that it runs once resumed, and a data one after the instruction
+  that accesses the range: `SIGTRAP` with `TRAP_HWBKPT` and the address in
+  `rip`, and DR6 with the breakpoint's bit, and with `DR_STEP` after a
+  single step. A new task has none, and exec clears them. While none is
+  set, the guest runs as fast as before; while one is, it runs one
+  instruction at a time.
 - `PTRACE_SINGLESTEP` resumes a tracee with the trap flag set, which the
   tracer does not see in its registers unless the tracee set it itself
   (`TIF_FORCED_TF`), and any other resume takes it back: the tracee stops

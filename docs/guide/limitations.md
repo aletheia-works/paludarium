@@ -78,6 +78,14 @@ verified.
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; nothing
   clears the soft-dirty bit (`/proc/<pid>/clear_refs` is not there); and
   user space ends at 2^47 bytes, as with 4-level page tables.
+- **4-level paging only**: the emulated machine always has 4-level page
+  tables, whatever CPU the host has: user space ends below 2^47 bytes, and
+  `TASK_SIZE_MAX` is 2^47 - 4096 for every check that asks for it, as the
+  `fs` and `gs` bases `ptrace`'s `PTRACE_POKEUSER`, `PTRACE_SETREGS` and
+  `PTRACE_ARCH_PRCTL` take (`EIO`, `EPERM`). Linux on a CPU with 5-level paging (LA57) maps
+  above 2^47 only for a process that asks with an `mmap` hint there, but
+  its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
+  the two that paludarium refuses ([decisions](../design/decisions)).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs` and
@@ -88,7 +96,7 @@ verified.
   and the rest. A path that goes on through a link of another process's `fd`
   (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
   directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
-  time and the code range are 0, as is the code in `statm`, so `ps` shows no `RSS`, and its `STIME` and
+  time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
   another process's state is taken from where its thread is (in a system
@@ -466,19 +474,23 @@ verified.
     little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
-  - The files of `/proc/sys` check their writer again at a write through
-    `write`, `writev`, aio or `sendfile`, but a positioned write (`pwrite64`,
-    `pwritev` at an offset) only as they were opened, where Linux checks
-    every write; and each reports its value's length as its size, where
-    Linux reports 0.
+  - The files of `/proc/sys` check their writer again at each write but one
+    through `copy_file_range`, which they check only as they were opened,
+    where Linux checks every write; and each reports its value's length as
+    its size, where Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
-    without XSAVE, which the emulated CPU does not offer. There are no
-    hardware breakpoints: the debug registers read as unused (DR6 as
-    `0xffff0ff0`), and a write to them other than clearing DR7 gives `EIO`.
+    without XSAVE, which the emulated CPU does not offer. A data
+    breakpoint sees the accesses of an instruction's memory operands, of
+    its push, pop, call or return on the stack, and of a string
+    instruction without a repeat. These do not hit one, where the CPU's
+    would: a `rep` string instruction (the CPU stops after the iteration
+    that touched the range); the save areas of `fxsave`, `fxrstor`,
+    `xsave`, `xrstor`, `fsave`, `frstor`, `fnstenv` and `fldenv`; the
+    implicit accesses of `enter`, `leave`, `xlat` and `maskmovdqu`.
     A `cs` or `ss` selector a tracer writes other than the 64-bit user ones
     is kept and shown, but the tracee runs on in 64-bit mode, where Linux
     would run it in that segment or fault.
@@ -874,8 +886,7 @@ verified.
   takes is 321, as for Ubuntu's kernel (`MAX_TCP_HEADER` + 1), where
   another build's may differ. A socket
   whose receive buffer is full drops an answer with `ENOBUFS` without
-  waiting. A `write` to a netlink socket acts with the capability of the
-  thread that opened it alone. The other namespaces keep nothing apart
+  waiting. The other namespaces keep nothing apart
   that paludarium has, but for the System V shared memory, semaphores and
   message queues and the POSIX message queues of an IPC namespace and the
   mounts of a mount namespace: there is no `/proc/self/cgroup` for a cgroup
@@ -969,9 +980,13 @@ verified.
   contents, pipe and socket buffers or the emulator's own memory
   ([command line](./cli), [Rust](./rust),
   [JavaScript](./javascript#run-options)).
-- Automated Safari tests sometimes timed out while waiting for the browser to
-  start. A fix passed ten times in a row, which does not guarantee it never
-  happens again.
+- Automated Safari tests on CI sometimes fail to start a session: safaridriver
+  times out launching Safari, or the launched Safari never becomes ready. The
+  test driver waits, up to 15 seconds, until a Safari told to quit has exited
+  before it asks for a session, and asks once more after either failure,
+  never for a third time. It retries nothing else, no test and no result, and
+  each retry is logged with its error and timing. These failures come and go,
+  so a run that passes does not show they are gone.
 
 ## Found a problem?
 

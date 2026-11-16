@@ -106,6 +106,12 @@ pub struct Thread {
     pub state: ThreadState,
 }
 impl Thread {
+    /// The hardware breakpoints a tracer enabled for the thread, which the
+    /// CPU matches while it runs ([`paludarium_cpu::breakpoints::run_watched`]).
+    #[must_use]
+    pub fn breakpoints(&self) -> Option<paludarium_cpu::breakpoints::Breakpoints> {
+        self.state.ptrace.debug.active().copied()
+    }
     #[must_use]
     pub fn new(tid: u32, cpu: CpuState) -> Self {
         Self {
@@ -1162,10 +1168,35 @@ impl Kernel {
             // (send_sigtrap, trap 1).
             ExitReason::SingleStep { rip } => {
                 thread.cpu.rip = rip;
+                // DR6 as a tracer reads it: the step (`virtual_dr6`).
+                thread.state.ptrace.debug.dr6 = ptrace::DR_STEP;
                 Some(signals::PendingSignal {
                     target: signals::PendingTarget::Thread,
                     number: signal::SIGTRAP,
                     code: 2,
+                    addr: rip.0,
+                    trap: 1,
+                    error: 0,
+                    synchronous: true,
+                    timer: None,
+                    child: None,
+                    sender: None,
+                    sender_uid: None,
+                    queued: None,
+                    born: signals::generation(),
+                })
+            }
+            // A hardware breakpoint: SIGTRAP with TRAP_HWBKPT, or TRAP_TRACE
+            // when a step came with it (`get_si_code`), at the address the
+            // thread is at, and DR6 with the breakpoints hit.
+            ExitReason::HardwareBreakpoint { rip, hits, step } => {
+                thread.cpu.rip = rip;
+                thread.state.ptrace.debug.dr6 =
+                    u64::from(hits) | if step { ptrace::DR_STEP } else { 0 };
+                Some(signals::PendingSignal {
+                    target: signals::PendingTarget::Thread,
+                    number: signal::SIGTRAP,
+                    code: if step { 2 } else { 4 },
                     addr: rip.0,
                     trap: 1,
                     error: 0,

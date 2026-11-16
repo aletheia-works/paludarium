@@ -962,9 +962,13 @@ verified.
   contents, pipe and socket buffers or the emulator's own memory
   ([command line](./cli), [Rust](./rust),
   [JavaScript](./javascript#run-options)).
-- Automated Safari tests sometimes timed out while waiting for the browser to
-  start. A fix passed ten times in a row, which does not guarantee it never
-  happens again.
+- Automated Safari tests on CI sometimes fail to start a session: safaridriver
+  times out launching Safari, or the launched Safari never becomes ready. The
+  test driver waits, up to 15 seconds, until a Safari told to quit has exited
+  before it asks for a session, and asks once more after either failure,
+  never for a third time. It retries nothing else, no test and no result, and
+  each retry is logged with its error and timing. These failures come and go,
+  so a run that passes does not show they are gone.
 
 ## Found a problem?
 

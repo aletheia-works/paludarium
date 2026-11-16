@@ -1524,7 +1524,9 @@ static void nl_neightbl_parm(unsigned short type, const unsigned char *v, int le
    key and entry sizes and the chain and proxy queue, as the rest (its
    entries, the times since its flush and new hash key, the key and the
    mask) are every namespace's or random; of its statistics, which count
-   every namespace's, the length alone. */
+   every namespace's, and of its garbage collection's thresholds, which
+   are the host's sysctls (an AWS runner's image raises the second and
+   third), the length alone. */
 static void nl_neightbl_attribute(unsigned short type, const unsigned char *v, int len) {
     unsigned long long value = 0;
     if (len == 4 || len == 8) memcpy(&value, v, len);
@@ -1549,6 +1551,9 @@ static void nl_neightbl_attribute(unsigned short type, const unsigned char *v, i
         nl_attributes(v, len, nl_neightbl_parm);
         printf(" }");
         break;
+    case 2:
+    case 3:
+    case 4: printf(" thresh%u:%d", type - 1, len); break;
     case 7: printf(" stats:%d", len); break;
     default: printf(" %u:%d=%llu", type, len, value); break;
     }

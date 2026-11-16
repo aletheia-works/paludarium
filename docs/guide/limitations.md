@@ -772,7 +772,9 @@ verified.
   proxy entry joins no solicited-node group (`pndisc_constructor`), and
   no request is refused for IPv6 disabled on `lo` (`ndisc_allow_add`). A
   neighbour table dump gives the tables' defaults, which no sysctl
-  (`net.ipv4.neigh.*`, `net.ipv6.neigh.*`) changes: a reachable time of
+  (`net.ipv4.neigh.*`, `net.ipv6.neigh.*`) changes, nor the host's (its
+  garbage collection's thresholds are 128, 512 and 1024, where an AWS
+  runner's Linux has its second and third raised to 15360 and 16384): a reachable time of
   the base one, where Linux's is random from half to one and a half times
   it; an entry's size and the queue's length in packets of x86-64's
   `struct neighbour` and `SKB_TRUESIZE`. A table counts the namespace's

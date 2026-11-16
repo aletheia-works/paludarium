@@ -2962,7 +2962,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   一つにつき 8 バイトを数えます。そのメモリがマシンのメモリ（`sysinfo` の 4 GiB）を、
   `vmalloc` と同じ確かめ方で超えるマップは `ENOMEM` です。fdinfo には `map_type`、
   `key_size`、`value_size`、`max_entries`、`map_flags`、`map_extra`、`memlock`
-  （そのメモリ）、`map_id`、`frozen` があります。ないものは [制限](./limitations) を
+  （そのメモリ）、`map_id`、`frozen` があります。`BPF_MAP_TYPE_LRU_HASH` は、いっぱいに
+  なると `E2BIG` にせず、新しいキーのために一つのキーを手放すハッシュで、手放すキーは Linux の
+  `bpf_lru_list.c` と同じ選び方です。要素は空き、active、inactive のリストと、CPU の
+  ローカルな空きと保留のリストのあいだを動くので、手放すキーは、更新が拒まれたときや
+  キーを置き換えたとき（どちらも先に要素を取ります）も Linux と同じです。どのユーザーでも
+  マップを作れる設定でも `CAP_BPF` が要り（`EPERM`）、いつも事前に確保され
+  （`BPF_F_NO_PREALLOC` は `ENOTSUPP`）、`BPF_F_NO_COMMON_LRU` では CPU ごとにリストを持ちます
+  （`max_entries` を CPU の数の倍数に切り上げ、どの CPU も同じ数です。`BPF_F_NUMA_NODE` と
+  一緒なら `EINVAL`）。メモリは予備のない要素だけを数えます。ないものは [制限](./limitations) を
   参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの

@@ -3418,7 +3418,18 @@ kernel.
   (`sysinfo`'s 4 GiB), checked as `vmalloc` checks it, is `ENOMEM`. Its
   fdinfo has `map_type`, `key_size`, `value_size`, `max_entries`,
   `map_flags`, `map_extra`, `memlock` (that memory), `map_id` and
-  `frozen`. See [limitations](./limitations) for what is not there.
+  `frozen`. A `BPF_MAP_TYPE_LRU_HASH` is a hash that, when full, gives up
+  a key for a new one instead of `E2BIG`, as Linux's `bpf_lru_list.c`
+  chooses it: its elements move between the free, active and inactive
+  lists and a CPU's local free and pending lists, so that the key that
+  goes is the one Linux gives up, also when an update is refused or
+  replaces a key, which takes an element first. It needs `CAP_BPF` even
+  where any user may make maps (`EPERM`), is always preallocated
+  (`BPF_F_NO_PREALLOC` is `ENOTSUPP`), and with `BPF_F_NO_COMMON_LRU` keeps
+  lists for each CPU (`max_entries` rounded up to a multiple of the CPUs,
+  as many for each; with `BPF_F_NUMA_NODE` `EINVAL`). It takes the memory
+  of its elements alone, with no spares. See [limitations](./limitations)
+  for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

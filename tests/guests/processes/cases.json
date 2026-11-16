@@ -128,6 +128,7 @@
     {"name":"bpf-batch","binary":"bpf"},
     {"name":"bpf-ids","binary":"bpf"},
     {"name":"bpf-memory","binary":"bpf"},
+    {"name":"bpf-lru","binary":"bpf"},
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"inotify-directory","binary":"inotify"},
     {"name":"inotify-files","binary":"inotify"},

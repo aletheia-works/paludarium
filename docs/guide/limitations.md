@@ -241,7 +241,8 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
+- **BPF, maps only**: `bpf` makes arrays, hashes and LRU hashes and nothing
+  else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
   links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
   programs, BTF and links (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`
@@ -257,7 +258,11 @@ verified.
   which a test machine and the emulator count differently. A hash gives
   its keys in the order of their bytes, where Linux's order follows its
   buckets and a random seed, and a batch of it takes each element as a
-  bucket of its own, so `in_batch` and `out_batch` count elements. A map's
+  bucket of its own, so `in_batch` and `out_batch` count elements. An LRU
+  hash keeps the lists of one CPU, which every command uses: on Linux each
+  CPU has its own local lists, so where updates of one map come from
+  several CPUs, the key that goes when it is full may be another (the
+  differential test pins itself to one CPU). A map's
   memory follows the structure sizes of the test machines' kernel,
   Ubuntu's Linux 7.0, not upstream Linux's: its `struct bpf_map` carries
   the `u32 excl` that Ubuntu took from Linux 7.2 (0fb6c9ed6493, removed in

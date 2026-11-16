@@ -3,6 +3,9 @@
    (lookup, update, delete, next key, lookup and delete), freezing, the
    batch commands, BPF_OBJ_GET_INFO_BY_FD, fdinfo, and the rule that keeps
    a user without CAP_BPF out (kernel.unprivileged_bpf_disabled, 2).
+   bpf-lru: LRU hashes, which give up a key when they are full; the case
+   runs on one CPU, as the emulator does, since each CPU has its own free
+   and pending lists, which decide which key goes.
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -17,6 +20,7 @@
    used. The cases run as root, as the guest does. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -44,6 +48,7 @@
 
 #define TYPE_HASH 1
 #define TYPE_ARRAY 2
+#define TYPE_LRU_HASH 9
 
 #define F_NO_PREALLOC (1 << 0)
 #define F_NO_COMMON_LRU (1 << 1)
@@ -664,6 +669,88 @@ static int case_memory(void) {
 }
 
 
+/* Updates key with value, and says what that gave. */
+static void put(const char *name, int fd, uint32_t key, uint64_t value, uint64_t flags) {
+    say("%s %u: %ld", name, key, elem(MAP_UPDATE_ELEM, fd, &key, &value, flags));
+}
+
+static int case_lru(void) {
+    /* One CPU, so that every command uses the same lists. */
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(sched_getcpu(), &one);
+    if (sched_setaffinity(0, sizeof one, &one) < 0) return 1;
+
+    create("lru no prealloc", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_NO_PREALLOC));
+    create("lru no common lru numa", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_NO_COMMON_LRU | F_NUMA_NODE));
+    create("lru numa", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_NUMA_NODE));
+    create("lru key 0", map_attr(TYPE_LRU_HASH, 0, 8, 4, 0));
+    create("lru entries 0", map_attr(TYPE_LRU_HASH, 4, 8, 0, 0));
+    create("lru mmapable", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_MMAPABLE));
+    create("lru zero seed", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_ZERO_SEED));
+    create("lru too big", map_attr(TYPE_LRU_HASH, 4, 1 << 22, 4, 0));
+    create("lru no common lru", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_NO_COMMON_LRU));
+
+    /* Four entries: a CPU takes one free element at a time, on any machine
+       of two CPUs or more. */
+    int lru = make(TYPE_LRU_HASH, 4, 8, 4, 0);
+    say("lru memlock %llu", memlock(lru));
+    for (uint32_t key = 1; key <= 5; key++) put("add", lru, key, key, ANY);
+    keys("lru full", lru);
+    put("replace", lru, 2, 20, ANY);
+    keys("lru replaced", lru);
+    put("add", lru, 6, 6, ANY);
+    keys("lru added", lru);
+    put("refused", lru, 6, 60, NOEXIST);
+    keys("lru refused", lru);
+    put("missing", lru, 9, 9, EXIST);
+    keys("lru missing", lru);
+    uint32_t key = 6;
+    uint64_t value = 0;
+    long r = elem(MAP_LOOKUP_ELEM, lru, &key, &value, 0);
+    say("lookup 6 %ld value %llu", r, (unsigned long long)value);
+    key = 5;
+    say("delete 5 %ld", elem(MAP_DELETE_ELEM, lru, &key, NULL, 0));
+    say("delete 5 again %ld", elem(MAP_DELETE_ELEM, lru, &key, NULL, 0));
+    keys("lru deleted", lru);
+    for (key = 7; key <= 9; key++) put("add", lru, key, key, ANY);
+    keys("lru refilled", lru);
+    key = 8;
+    value = 0;
+    r = elem(MAP_LOOKUP_AND_DELETE_ELEM, lru, &key, &value, 0);
+    say("lookup and delete 8 %ld value %llu", r, (unsigned long long)value);
+    keys("lru after lookup and delete", lru);
+    /* Replaced keys are referenced, and outlast the others. */
+    for (key = 10; key <= 30; key++) {
+        put("add", lru, key, key, ANY);
+        if (key % 3 == 0) put("replace", lru, key, key + 100, ANY);
+    }
+    keys("lru after many", lru);
+    uint32_t k[8] = {40, 41, 42, 43, 44, 45, 46, 47}, count = 6, gk[8];
+    uint64_t v[8] = {0}, gv[8];
+    r = batch(MAP_UPDATE_BATCH, lru, NULL, NULL, k, v, &count, 0);
+    say("update batch %ld count %u", r, count);
+    keys("lru after batch", lru);
+    count = 8;
+    uint32_t out = 0;
+    r = batch(MAP_LOOKUP_AND_DELETE_BATCH, lru, NULL, &out, gk, gv, &count, 0);
+    qsort(gk, count, sizeof gk[0], compare);
+    printf("lookup and delete batch %ld count %u keys", r, count);
+    for (uint32_t i = 0; i < count; i++) printf(" %u", gk[i]);
+    putchar('\n');
+    keys("lru emptied", lru);
+    say("lru memlock after %llu", memlock(lru));
+    close(lru);
+
+    /* Lists for each CPU: one entry is one for each, so this CPU holds just
+       one key. */
+    lru = make(TYPE_LRU_HASH, 4, 8, 1, F_NO_COMMON_LRU);
+    for (key = 1; key <= 3; key++) put("own add", lru, key, key, ANY);
+    keys("own lists", lru);
+    close(lru);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -672,5 +759,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-batch")) return case_batch();
     if (!strcmp(mode, "bpf-ids")) return case_ids();
     if (!strcmp(mode, "bpf-memory")) return case_memory();
+    if (!strcmp(mode, "bpf-lru")) return case_lru();
     return 2;
 }

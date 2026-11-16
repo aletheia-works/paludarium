@@ -1,6 +1,7 @@
-//! `bpf`, for its maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and
-//! `hashtab.c` have them: `BPF_MAP_CREATE` of `BPF_MAP_TYPE_ARRAY` and
-//! `BPF_MAP_TYPE_HASH`, their elements (`LOOKUP`, `UPDATE`, `DELETE`,
+//! `bpf`, for its maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
+//! `hashtab.c` and `bpf_lru_list.c` have them: `BPF_MAP_CREATE` of
+//! `BPF_MAP_TYPE_ARRAY`, `BPF_MAP_TYPE_HASH` and `BPF_MAP_TYPE_LRU_HASH`,
+//! their elements (`LOOKUP`, `UPDATE`, `DELETE`,
 //! `GET_NEXT_KEY`, `LOOKUP_AND_DELETE`), `BPF_MAP_FREEZE`, the batch
 //! commands, `BPF_OBJ_GET_INFO_BY_FD`, the map IDs (`BPF_MAP_GET_NEXT_ID`,
 //! `BPF_MAP_GET_FD_BY_ID`) and the descriptor's fdinfo, with the checks
@@ -69,6 +70,7 @@ mod cmd {
 
 const TYPE_HASH: u32 = 1;
 const TYPE_ARRAY: u32 = 2;
+const TYPE_LRU_HASH: u32 = 9;
 /// `__MAX_BPF_MAP_TYPE` in Linux master.
 const TYPE_MAX: u32 = 39;
 /// `BPF_MAP_TYPE_STRUCT_OPS`, the one `btf_vmlinux_value_type_id` is for.
@@ -129,6 +131,9 @@ enum Elements {
     Array(BTreeMap<u32, Vec<u8>>),
     /// A hash's, by key.
     Hash(BTreeMap<Vec<u8>, Vec<u8>>),
+    /// An LRU hash's, with the lists that choose which goes when it is
+    /// full.
+    Lru(Box<Lru>),
 }
 
 /// A map: Linux's `struct bpf_map`.
@@ -361,7 +366,8 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
                 return Err(E2BIG);
             }
         }
-        TYPE_HASH => {
+        TYPE_HASH | TYPE_LRU_HASH => {
+            let lru = kind == TYPE_LRU_HASH;
             if flags & flag::ZERO_SEED != 0 && !c.process.credentials.capable(CAP_SYS_ADMIN) {
                 return Err(Errno::EPERM);
             }
@@ -369,7 +375,15 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
                 return Err(Errno::EINVAL);
             }
             // BPF_F_NO_COMMON_LRU is for LRU maps only.
-            if flags & flag::NO_COMMON_LRU != 0 {
+            if !lru && flags & flag::NO_COMMON_LRU != 0 {
+                return Err(Errno::EINVAL);
+            }
+            // An LRU hash is always preallocated.
+            if lru && flags & flag::NO_PREALLOC != 0 {
+                return Err(ENOTSUPP);
+            }
+            // Lists of their own for each CPU are on no one NUMA node.
+            if flags & flag::NO_COMMON_LRU != 0 && flags & flag::NUMA_NODE != 0 {
                 return Err(Errno::EINVAL);
             }
             if max_entries == 0 || key_size == 0 || value_size == 0 {
@@ -397,6 +411,11 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     if c.processes.sysctls.unprivileged_bpf_disabled() != 0 && !bpf_capable(c) {
         return Err(Errno::EPERM);
     }
+    // The privileged map types, which need CAP_BPF even where any user
+    // may make maps.
+    if kind == TYPE_LRU_HASH && !bpf_capable(c) {
+        return Err(Errno::EPERM);
+    }
     // array_map_alloc: without `bpf_bypass_spec_v1` (CAP_PERFMON) the
     // array is rounded up to a power of two, which may overflow.
     let bypass_spec = {
@@ -407,6 +426,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         return Err(E2BIG);
     }
     let cpus = c.host.cpu_count().clamp(1, 8192) as u64;
+    let max_entries = entries(kind, max_entries, flags, cpus);
     allocate(
         kind,
         value_size,
@@ -448,13 +468,36 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         ids: Arc::clone(ids),
         cpus,
         frozen: AtomicBool::new(false),
-        elements: Mutex::new(if kind == TYPE_ARRAY {
-            Elements::Array(BTreeMap::new())
-        } else {
-            Elements::Hash(BTreeMap::new())
-        }),
+        elements: Mutex::new(elements(kind, max_entries, flags, cpus)),
     })?;
     new_fd(c, map, access)
+}
+
+/// A new map's elements: none.
+fn elements(kind: u32, max_entries: u32, flags: u32, cpus: u64) -> Elements {
+    match kind {
+        TYPE_ARRAY => Elements::Array(BTreeMap::new()),
+        TYPE_LRU_HASH => Elements::Lru(Box::new(Lru::new(
+            max_entries,
+            cpus,
+            flags & flag::NO_COMMON_LRU != 0,
+        ))),
+        _ => Elements::Hash(BTreeMap::new()),
+    }
+}
+
+/// The entries a map has: an LRU hash with lists for each CPU gives each
+/// as many, rounded up to a multiple of the CPUs (down where that would
+/// not fit), as `htab_map_alloc` makes it.
+fn entries(kind: u32, max_entries: u32, flags: u32, cpus: u64) -> u32 {
+    if kind != TYPE_LRU_HASH || flags & flag::NO_COMMON_LRU == 0 {
+        return max_entries;
+    }
+    let cpus = cpus as u32;
+    match max_entries.checked_next_multiple_of(cpus) {
+        Some(up) => up,
+        None => max_entries - max_entries % cpus,
+    }
 }
 
 /// `bpf_map_new_fd`: a descriptor of the map, close-on-exec.
@@ -527,7 +570,7 @@ fn array_size(entries: u64, value_size: u32, flags: u32) -> u64 {
 /// an array all its values (rounded up to a power of two of them without
 /// `bpf_bypass_spec_v1`), a hash its buckets (more than 2^31 entries, or
 /// buckets past `U32_MAX` bytes, `E2BIG`) and, preallocated, every element
-/// and one spare a CPU.
+/// and one spare a CPU (an LRU hash none).
 fn allocate(
     kind: u32,
     value_size: u32,
@@ -554,7 +597,9 @@ fn allocate(
     }
     area(buckets * BUCKET)?;
     if flags & flag::NO_PREALLOC == 0 {
-        area(hash_element(key_size, value_size) * (u64::from(max_entries) + cpus))?;
+        // An LRU hash has no spare elements.
+        let spares = if kind == TYPE_LRU_HASH { 0 } else { cpus };
+        area(hash_element(key_size, value_size) * (u64::from(max_entries) + spares))?;
     }
     Ok(())
 }
@@ -675,12 +720,17 @@ impl Map {
     fn elements(&self) -> MutexGuard<'_, Elements> {
         lock(&self.elements)
     }
+    /// A hash or an LRU hash, which share their batch and delete commands.
+    fn hashed(&self) -> bool {
+        matches!(self.kind, TYPE_HASH | TYPE_LRU_HASH)
+    }
     /// Whether it holds `key`: `ENOENT` for an index past an array's end
     /// and a key a hash does not hold.
     fn holds(&self, key: &[u8]) -> Result<(), Errno> {
         let held = match &*self.elements() {
             Elements::Array(_) => index(key) < self.max_entries,
             Elements::Hash(values) => values.contains_key(key),
+            Elements::Lru(lru) => lru.table.contains_key(key),
         };
         if held { Ok(()) } else { Err(Errno::ENOENT) }
     }
@@ -698,6 +748,9 @@ impl Map {
                     .unwrap_or_else(|| vec![0; self.value_size as usize]))
             }
             Elements::Hash(values) => values.get(key).cloned().ok_or(Errno::ENOENT),
+            // As `htab_lru_map_lookup_elem_sys`, which leaves the
+            // reference alone.
+            Elements::Lru(lru) => lru.get(key).cloned().ok_or(Errno::ENOENT),
         }
     }
     /// `map_update_elem` of the map's type.
@@ -730,6 +783,7 @@ impl Map {
                 }
                 values.insert(key.to_vec(), value);
             }
+            Elements::Lru(lru) => lru.update(key, value, mode)?,
         }
         Ok(())
     }
@@ -738,6 +792,7 @@ impl Map {
         match &mut *self.elements() {
             Elements::Array(_) => Err(Errno::EINVAL),
             Elements::Hash(values) => values.remove(key).ok_or(Errno::ENOENT),
+            Elements::Lru(lru) => lru.delete(key),
         }
     }
     /// `map_get_next_key`: the first key after `key`, or the first of all
@@ -755,41 +810,62 @@ impl Map {
                 }
                 Ok((i + 1).to_le_bytes().to_vec())
             }
-            Elements::Hash(values) => {
-                let after = key.filter(|key| values.contains_key(*key));
-                let next = match after {
-                    Some(key) => values
-                        .range::<[u8], _>((
-                            std::ops::Bound::Excluded(key),
-                            std::ops::Bound::Unbounded,
-                        ))
-                        .next(),
-                    None => values.iter().next(),
-                };
-                next.map(|(key, _)| key.clone()).ok_or(Errno::ENOENT)
-            }
+            Elements::Lru(lru) => next_in(&lru.table, key),
+            Elements::Hash(values) => next_in(values, key),
+        }
+    }
+    /// The keys and values it holds, by key: a hash's and an LRU hash's.
+    fn held(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match &*self.elements() {
+            Elements::Hash(values) => values.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Elements::Lru(lru) => lru
+                .table
+                .iter()
+                .map(|(k, &i)| (k.clone(), lru.values[i].clone()))
+                .collect(),
+            Elements::Array(_) => Vec::new(),
+        }
+    }
+    /// How many keys it holds.
+    fn len(&self) -> usize {
+        match &*self.elements() {
+            Elements::Hash(values) => values.len(),
+            Elements::Lru(lru) => lru.table.len(),
+            Elements::Array(_) => 0,
         }
     }
     /// The memory it takes, as `bpf_map_memory_usage` counts it: an array's
     /// header and values, a hash's header, buckets and elements, all of
-    /// them and one spare a CPU with a pointer to it when preallocated, or
-    /// those it holds with a list node each when not.
+    /// them and one spare a CPU with a pointer to it when preallocated (an
+    /// LRU hash's all of them alone), or those it holds with a list node
+    /// each when not.
     fn memory(&self) -> u64 {
         if self.kind == TYPE_ARRAY {
             return array_size(u64::from(self.max_entries), self.value_size, self.flags);
         }
         let element = hash_element(self.key_size, self.value_size);
         let table = HASH_HEADER + BUCKET * buckets(self.max_entries);
-        if self.flags & flag::NO_PREALLOC == 0 {
+        if self.kind == TYPE_LRU_HASH {
+            table + element * u64::from(self.max_entries)
+        } else if self.flags & flag::NO_PREALLOC == 0 {
             table + element * (u64::from(self.max_entries) + self.cpus) + POINTER * self.cpus
         } else {
-            let held = match &*self.elements() {
-                Elements::Hash(elements) => elements.len() as u64,
-                Elements::Array(_) => 0,
-            };
-            table + (element + POINTER) * held
+            table + (element + POINTER) * self.len() as u64
         }
     }
+}
+
+/// `htab_map_get_next_key`, in the order of the keys: the first after
+/// `key`, or the first of all for none or a key it does not hold; `ENOENT`
+/// past the last.
+fn next_in<V>(table: &BTreeMap<Vec<u8>, V>, key: Option<&[u8]>) -> Result<Vec<u8>, Errno> {
+    let next = match key.filter(|key| table.contains_key(*key)) {
+        Some(key) => table
+            .range::<[u8], _>((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+            .next(),
+        None => table.iter().next(),
+    };
+    next.map(|(key, _)| key.clone()).ok_or(Errno::ENOENT)
 }
 
 fn write(c: &Context<'_>, at: u64, bytes: &[u8]) -> Result<(), Errno> {
@@ -880,7 +956,7 @@ fn lookup_and_delete(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let key = read_key(c, &map, word(attr, 8))?;
-    if map.kind != TYPE_HASH {
+    if !map.hashed() {
         return Err(ENOTSUPP);
     }
     let value = map.remove(&key)?;
@@ -917,7 +993,7 @@ fn batch(c: &mut Context<'_>, attr: &[u8], at: u64, command: u32) -> Result<u64,
     if reads && !readable || writes && !writable {
         return Err(Errno::EPERM);
     }
-    let hash = map.kind == TYPE_HASH;
+    let hash = map.hashed();
     match command {
         cmd::MAP_LOOKUP_BATCH if hash => hash_lookup_batch(c, &map, attr, at, false),
         cmd::MAP_LOOKUP_AND_DELETE_BATCH if hash => hash_lookup_batch(c, &map, attr, at, true),
@@ -1073,24 +1149,17 @@ fn hash_lookup_batch(
     if start >= buckets {
         return Err(Errno::ENOENT);
     }
-    let taken: Vec<(Vec<u8>, Vec<u8>)> = {
-        let mut elements = map.elements();
-        let Elements::Hash(all) = &mut *elements else {
-            return Err(Errno::EINVAL);
-        };
-        let chosen: Vec<(Vec<u8>, Vec<u8>)> = all
-            .iter()
-            .skip(start as usize)
-            .take(max as usize)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if delete {
-            for (key, _) in &chosen {
-                all.remove(key);
-            }
+    let taken: Vec<(Vec<u8>, Vec<u8>)> = map
+        .held()
+        .into_iter()
+        .skip(start as usize)
+        .take(max as usize)
+        .collect();
+    if delete {
+        for (key, _) in &taken {
+            map.remove(key)?;
         }
-        chosen
-    };
+    }
     let (key_size, value_size) = (u64::from(map.key_size), u64::from(map.value_size));
     for (i, (key, value)) in taken.iter().enumerate() {
         write(c, element(keys, i as u64, key_size), key)?;
@@ -1102,12 +1171,7 @@ fn hash_lookup_batch(
     } else {
         start.saturating_add(done)
     };
-    let remaining = {
-        let Elements::Hash(all) = &*map.elements() else {
-            return Err(Errno::EINVAL);
-        };
-        all.len() as u32 > next
-    };
+    let remaining = map.len() as u32 > next;
     put_count(c, at, done)?;
     write(c, out_batch, &next.to_le_bytes())?;
     if done == 0 || !remaining && done < max {
@@ -1235,6 +1299,393 @@ impl FileHandle for MapFile {
     }
 }
 
+/// What an LRU hash's element is on: Linux's `enum bpf_lru_list_type`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    Active,
+    Inactive,
+    Free,
+    LocalFree,
+    LocalPending,
+}
+
+/// The lists of an LRU hash, as Linux's `bpf_lru_list.c` keeps them for the
+/// one CPU every command here runs on (a test on Linux pins itself to one):
+/// the active, inactive and free lists, and for a common LRU that CPU's
+/// local free and pending lists. Elements, as `bpf_lru_node`s, are linked
+/// in rings with a head each, so that each list's order, and so which key
+/// goes when the map is full, is the one Linux's gives.
+struct Lru {
+    /// Each element's links, then each list head's.
+    next: Vec<usize>,
+    prev: Vec<usize>,
+    place: Vec<Place>,
+    /// `bpf_lru_node.ref`, which only replacing a key sets from user space.
+    referenced: Vec<bool>,
+    keys: Vec<Vec<u8>>,
+    values: Vec<Vec<u8>>,
+    /// The hash table: which element holds each key.
+    table: BTreeMap<Vec<u8>, usize>,
+    /// How many are active and inactive (`counts`).
+    active: usize,
+    inactive: usize,
+    /// `next_inactive_rotation`: an element, or the inactive list's head.
+    rotation: usize,
+    /// `target_free` (a common LRU) and `nr_scans`.
+    target_free: usize,
+    scans: usize,
+    /// `BPF_F_NO_COMMON_LRU`: the CPU's own lists, without local ones.
+    per_cpu: bool,
+}
+
+/// `LOCAL_FREE_TARGET`, `PERCPU_FREE_TARGET`: also each kind's `nr_scans`.
+const LOCAL_FREE_TARGET: usize = 128;
+const PERCPU_FREE_TARGET: usize = 4;
+
+impl Lru {
+    /// `bpf_lru_init` and `bpf_lru_populate`: every element on the free list,
+    /// each put at its head. A common LRU has them all, with a target of
+    /// half a CPU's share between 1 and 128; one per CPU has this CPU's
+    /// share.
+    fn new(max_entries: u32, cpus: u64, per_cpu: bool) -> Lru {
+        let share = (u64::from(max_entries) / cpus.max(1)) as usize;
+        let elements = if per_cpu { share } else { max_entries as usize };
+        let heads = elements + 5;
+        let mut lru = Lru {
+            next: (0..heads).collect(),
+            prev: (0..heads).collect(),
+            place: vec![Place::Free; elements],
+            referenced: vec![false; elements],
+            keys: vec![Vec::new(); elements],
+            values: vec![Vec::new(); elements],
+            table: BTreeMap::new(),
+            active: 0,
+            inactive: 0,
+            rotation: elements + 1,
+            target_free: (share / 2).clamp(1, LOCAL_FREE_TARGET),
+            scans: if per_cpu {
+                PERCPU_FREE_TARGET
+            } else {
+                LOCAL_FREE_TARGET
+            },
+            per_cpu,
+        };
+        for i in 0..elements {
+            lru.add(i, lru.head(Place::Free));
+        }
+        lru
+    }
+    /// The head of a list, past the elements.
+    fn head(&self, place: Place) -> usize {
+        self.place.len()
+            + match place {
+                Place::Active => 0,
+                Place::Inactive => 1,
+                Place::Free => 2,
+                Place::LocalFree => 3,
+                Place::LocalPending => 4,
+            }
+    }
+    fn unlink(&mut self, i: usize) {
+        let (p, n) = (self.prev[i], self.next[i]);
+        self.next[p] = n;
+        self.prev[n] = p;
+    }
+    /// `list_add`: at the head.
+    fn add(&mut self, i: usize, head: usize) {
+        let first = self.next[head];
+        self.next[i] = first;
+        self.prev[i] = head;
+        self.prev[first] = i;
+        self.next[head] = i;
+    }
+    /// `list_move`: to the head of another list, or its own.
+    fn relink(&mut self, i: usize, head: usize) {
+        self.unlink(i);
+        self.add(i, head);
+    }
+    fn first(&self, place: Place) -> Option<usize> {
+        let head = self.head(place);
+        (self.next[head] != head).then_some(self.next[head])
+    }
+    fn count(&mut self, place: Place, by: isize) {
+        match place {
+            Place::Active => self.active = self.active.wrapping_add_signed(by),
+            Place::Inactive => self.inactive = self.inactive.wrapping_add_signed(by),
+            _ => {}
+        }
+    }
+    /// `__bpf_lru_node_move_to_free`.
+    fn move_to_free(&mut self, i: usize, head: usize, place: Place) {
+        if i == self.rotation {
+            self.rotation = self.prev[self.rotation];
+        }
+        self.count(self.place[i], -1);
+        self.place[i] = place;
+        self.relink(i, head);
+    }
+    /// `__bpf_lru_node_move_in`, from a local list.
+    fn move_in(&mut self, i: usize, place: Place) {
+        self.count(place, 1);
+        self.place[i] = place;
+        self.referenced[i] = false;
+        self.relink(i, self.head(place));
+    }
+    /// `__bpf_lru_node_move`, between the active, inactive and free lists.
+    fn shift(&mut self, i: usize, place: Place) {
+        if self.place[i] != place {
+            self.count(self.place[i], -1);
+            self.count(place, 1);
+            self.place[i] = place;
+        }
+        self.referenced[i] = false;
+        if i == self.rotation {
+            self.rotation = self.prev[self.rotation];
+        }
+        self.relink(i, self.head(place));
+    }
+    /// `htab_lru_map_delete_node`: takes the element's key out of the table
+    /// if it is still there.
+    fn take_out(&mut self, i: usize) -> bool {
+        if self.table.get(&self.keys[i]) == Some(&i) {
+            self.table.remove(&self.keys[i]);
+            true
+        } else {
+            false
+        }
+    }
+    /// `__bpf_lru_list_rotate_active`: from the tail, up to `nr_scans`
+    /// elements back to the first, a referenced one to the active list's
+    /// head and the rest to the inactive list's.
+    fn rotate_active(&mut self) {
+        let head = self.head(Place::Active);
+        let first = self.next[head];
+        let mut i = self.prev[head];
+        let mut scanned = 0;
+        while i != head {
+            let before = self.prev[i];
+            let to = if self.referenced[i] {
+                Place::Active
+            } else {
+                Place::Inactive
+            };
+            self.shift(i, to);
+            scanned += 1;
+            if scanned == self.scans || i == first {
+                break;
+            }
+            i = before;
+        }
+    }
+    /// `__bpf_lru_list_rotate_inactive`: from `next_inactive_rotation`
+    /// towards the head, up to `nr_scans` elements, a referenced one to the
+    /// active list; where it stops is where the next starts.
+    fn rotate_inactive(&mut self) {
+        let head = self.head(Place::Inactive);
+        if self.next[head] == head {
+            return;
+        }
+        let mut last = self.next[self.rotation];
+        if last == head {
+            last = self.next[last];
+        }
+        let (mut current, mut next) = (self.rotation, head);
+        let mut scanned = 0;
+        while scanned < self.scans {
+            if current == head {
+                current = self.prev[current];
+                continue;
+            }
+            next = self.prev[current];
+            if self.referenced[current] {
+                self.shift(current, Place::Active);
+            }
+            if current == last {
+                break;
+            }
+            current = next;
+            scanned += 1;
+        }
+        self.rotation = next;
+    }
+    /// `__bpf_lru_list_rotate`: the active list when the inactive one has
+    /// fewer, then the inactive list.
+    fn rotate(&mut self) {
+        if self.inactive < self.active {
+            self.rotate_active();
+        }
+        self.rotate_inactive();
+    }
+    /// `__bpf_lru_list_shrink`: up to `target` unreferenced elements from the
+    /// inactive list's tail onto a free list, within `nr_scans`; failing
+    /// that, the last of the inactive list, or else of the active one,
+    /// whatever its reference.
+    fn shrink(&mut self, target: usize, free: usize, place: Place) {
+        let head = self.head(Place::Inactive);
+        let (mut i, mut scanned, mut shrunk) = (self.prev[head], 0, 0);
+        while i != head {
+            let before = self.prev[i];
+            if self.referenced[i] {
+                self.shift(i, Place::Active);
+            } else if self.take_out(i) {
+                self.move_to_free(i, free, place);
+                shrunk += 1;
+                if shrunk == target {
+                    break;
+                }
+            }
+            scanned += 1;
+            if scanned == self.scans {
+                break;
+            }
+            i = before;
+        }
+        if shrunk > 0 {
+            return;
+        }
+        let forced = if self.next[head] != head {
+            head
+        } else {
+            self.head(Place::Active)
+        };
+        let mut i = self.prev[forced];
+        while i != forced {
+            let before = self.prev[i];
+            if self.take_out(i) {
+                self.move_to_free(i, free, place);
+                return;
+            }
+            i = before;
+        }
+    }
+    /// `bpf_lru_list_pop_free_to_local`: the pending elements into the
+    /// lists, a rotation, then up to `target_free` free ones to the local
+    /// free list, and what is missing shrunk onto it.
+    fn pop_free_to_local(&mut self) {
+        let pending = self.head(Place::LocalPending);
+        let mut i = self.prev[pending];
+        while i != pending {
+            let before = self.prev[i];
+            let to = if self.referenced[i] {
+                Place::Active
+            } else {
+                Place::Inactive
+            };
+            self.move_in(i, to);
+            i = before;
+        }
+        self.rotate();
+        let (free, local) = (self.head(Place::Free), self.head(Place::LocalFree));
+        let mut moved = 0;
+        let mut i = self.next[free];
+        while i != free {
+            let after = self.next[i];
+            self.move_to_free(i, local, Place::LocalFree);
+            moved += 1;
+            if moved == self.target_free {
+                break;
+            }
+            i = after;
+        }
+        if moved < self.target_free {
+            self.shrink(self.target_free - moved, local, Place::LocalFree);
+        }
+    }
+    /// `__local_list_pop_pending`: the oldest pending element whose key can
+    /// be taken out, unreferenced first.
+    fn pop_pending(&mut self) -> Option<usize> {
+        let pending = self.head(Place::LocalPending);
+        for force in [false, true] {
+            let mut i = self.prev[pending];
+            while i != pending {
+                if (!self.referenced[i] || force) && self.take_out(i) {
+                    self.unlink(i);
+                    return Some(i);
+                }
+                i = self.prev[i];
+            }
+        }
+        None
+    }
+    /// `bpf_lru_pop_free`: an element for a new key, which may take another
+    /// key out of the table.
+    fn pop_free(&mut self) -> Option<usize> {
+        if self.per_cpu {
+            self.rotate();
+            let free = self.head(Place::Free);
+            if self.next[free] == free {
+                self.shrink(PERCPU_FREE_TARGET, free, Place::Free);
+            }
+            let i = self.first(Place::Free)?;
+            self.referenced[i] = false;
+            self.shift(i, Place::Inactive);
+            return Some(i);
+        }
+        let mut i = self.first(Place::LocalFree);
+        if i.is_none() {
+            self.pop_free_to_local();
+            i = self.first(Place::LocalFree);
+        }
+        let i = match i {
+            Some(i) => {
+                self.unlink(i);
+                i
+            }
+            // Stolen back from the CPU's own pending list: every other
+            // CPU's local lists are empty.
+            None => self.pop_pending()?,
+        };
+        self.place[i] = Place::LocalPending;
+        self.referenced[i] = false;
+        self.add(i, self.head(Place::LocalPending));
+        Some(i)
+    }
+    /// `bpf_lru_push_free`: a pending element back to the local free list,
+    /// any other to the free list.
+    fn push_free(&mut self, i: usize) {
+        if !self.per_cpu && self.place[i] == Place::LocalPending {
+            self.place[i] = Place::LocalFree;
+            self.referenced[i] = false;
+            self.relink(i, self.head(Place::LocalFree));
+        } else {
+            self.shift(i, Place::Free);
+        }
+    }
+    /// `htab_lru_map_update_elem`: an element is taken first, then the flags
+    /// are checked; a key replaced is referenced in its new element.
+    fn update(&mut self, key: &[u8], value: Vec<u8>, mode: u64) -> Result<(), Errno> {
+        let i = self.pop_free().ok_or(ENOMEM)?;
+        self.keys[i] = key.to_vec();
+        self.values[i] = value;
+        let old = self.table.get(key).copied();
+        let refused = match (old, mode) {
+            (Some(_), NOEXIST) => Some(Errno::EEXIST),
+            (None, EXIST) => Some(Errno::ENOENT),
+            _ => None,
+        };
+        if let Some(e) = refused {
+            self.push_free(i);
+            return Err(e);
+        }
+        self.table.insert(key.to_vec(), i);
+        if let Some(old) = old {
+            self.referenced[i] = true;
+            self.push_free(old);
+        }
+        Ok(())
+    }
+    /// `htab_lru_map_delete_elem`.
+    fn delete(&mut self, key: &[u8]) -> Result<Vec<u8>, Errno> {
+        let i = self.table.remove(key).ok_or(Errno::ENOENT)?;
+        let value = std::mem::take(&mut self.values[i]);
+        self.push_free(i);
+        Ok(value)
+    }
+    fn get(&self, key: &[u8]) -> Option<&Vec<u8>> {
+        self.table.get(key).map(|&i| &self.values[i])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,11 +1713,7 @@ mod tests {
             ids: Arc::clone(ids),
             cpus: 2,
             frozen: AtomicBool::new(false),
-            elements: Mutex::new(if kind == TYPE_ARRAY {
-                Elements::Array(BTreeMap::new())
-            } else {
-                Elements::Hash(BTreeMap::new())
-            }),
+            elements: Mutex::new(elements(kind, max_entries, flags, 2)),
         }
     }
 
@@ -1388,6 +1835,86 @@ mod tests {
             Err(E2BIG)
         );
         assert_eq!(allocate(TYPE_HASH, 8, 4, u32::MAX, 0, true, 2), Err(E2BIG));
+    }
+
+    fn held_keys(m: &Map) -> Vec<u32> {
+        m.held().iter().map(|(k, _)| index(k)).collect()
+    }
+
+    #[test]
+    fn a_full_lru_hash_gives_up_its_oldest_key() {
+        // Two CPUs: a target of one free element at a time.
+        let m = map(TYPE_LRU_HASH, 4);
+        let k = |i: u32| i.to_le_bytes();
+        for i in 1..=5 {
+            m.set(&k(i), vec![i as u8; 8], 0).unwrap();
+        }
+        assert_eq!(held_keys(&m), [2, 3, 4, 5]);
+        // The oldest is taken out for the new element before a key is
+        // replaced, even the very key replaced.
+        m.set(&k(2), vec![9; 8], 0).unwrap();
+        assert_eq!(held_keys(&m), [2, 3, 4, 5]);
+        m.set(&k(6), vec![6; 8], 0).unwrap();
+        assert_eq!(held_keys(&m), [2, 4, 5, 6]);
+        // A refused update still takes an element, and so the oldest key.
+        assert_eq!(m.set(&k(6), vec![0; 8], NOEXIST), Err(Errno::EEXIST));
+        assert_eq!(held_keys(&m), [2, 5, 6]);
+        assert_eq!(m.set(&k(9), vec![0; 8], EXIST), Err(Errno::ENOENT));
+        assert_eq!(m.get(&k(6)), Ok(vec![6; 8]));
+        // What is deleted is free again, and nothing else goes.
+        assert_eq!(m.remove(&k(5)), Ok(vec![5; 8]));
+        assert_eq!(m.remove(&k(5)), Err(Errno::ENOENT));
+        m.set(&k(7), vec![7; 8], 0).unwrap();
+        m.set(&k(8), vec![8; 8], 0).unwrap();
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.next(None), Ok(k(held_keys(&m)[0]).to_vec()));
+    }
+
+    #[test]
+    fn a_replaced_key_is_referenced_and_outlives_older_ones() {
+        let m = map(TYPE_LRU_HASH, 4);
+        let k = |i: u32| i.to_le_bytes();
+        for i in 1..=4 {
+            m.set(&k(i), vec![0; 8], 0).unwrap();
+        }
+        // Replacing 4 takes 1 out and references 4's new element.
+        m.set(&k(4), vec![1; 8], 0).unwrap();
+        assert_eq!(held_keys(&m), [2, 3, 4]);
+        for i in 5..=7 {
+            m.set(&k(i), vec![0; 8], 0).unwrap();
+        }
+        assert!(held_keys(&m).contains(&4), "{:?}", held_keys(&m));
+    }
+
+    #[test]
+    fn lists_of_each_cpus_own_hold_its_share() {
+        // Two CPUs, so 3 entries are 4, two for this CPU.
+        assert_eq!(entries(TYPE_LRU_HASH, 3, flag::NO_COMMON_LRU, 2), 4);
+        assert_eq!(
+            entries(TYPE_LRU_HASH, u32::MAX, flag::NO_COMMON_LRU, 2),
+            u32::MAX - 1
+        );
+        assert_eq!(entries(TYPE_LRU_HASH, 3, 0, 2), 3);
+        let m = shaped(TYPE_LRU_HASH, 4, 8, flag::NO_COMMON_LRU, &Arc::default(), 1);
+        let k = |i: u32| i.to_le_bytes();
+        // Full, it frees up to four at once: both of its own go.
+        m.set(&k(1), vec![0; 8], 0).unwrap();
+        m.set(&k(2), vec![0; 8], 0).unwrap();
+        assert_eq!(held_keys(&m), [1, 2]);
+        m.set(&k(3), vec![0; 8], 0).unwrap();
+        assert_eq!(held_keys(&m), [3]);
+    }
+
+    #[test]
+    fn an_lru_hash_counts_its_elements_without_spares() {
+        let ids = Arc::default();
+        let m = shaped(TYPE_LRU_HASH, 3, 8, 0, &ids, 1);
+        assert_eq!(m.memory(), 896 + 64 + 64 * 3);
+        assert_eq!(allocate(TYPE_LRU_HASH, 8, 4, 3, 0, true, 2), Ok(()));
+        assert_eq!(
+            allocate(TYPE_LRU_HASH, 1 << 21, 4, 1 << 20, 0, true, 2),
+            Err(ENOMEM)
+        );
     }
 
     #[test]

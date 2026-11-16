@@ -2760,7 +2760,19 @@ kernel.
   `semmni` goes back to what it was unless it ends from 0 to 32768
   (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them, `perf_event_paranoid` and
   `unprivileged_bpf_disabled` read 2, Linux's defaults, and no one may
-  open them to write (`EACCES`). `/proc/sys/kernel` lists only these.
+  open them to write (`EACCES`). `shm_rmid_forced` (0 or 1, owned and
+  written as the limits) makes a segment go at its last detach and those
+  its maker never attached go when it exits or leaves the namespace, as
+  Linux's `shm_close` and `exit_shm` do; setting it removes the orphans no
+  mapping shows (`shm_destroy_orphaned`). `auto_msgmni` reads 0 and takes 0
+  or 1 to no effect. `shm_next_id`, `sem_next_id` and `msg_next_id` (mode
+  0444, which whoever has `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` over
+  the namespace's user namespace may write) are the ID the next object of
+  their kind takes, once, -1 for none: a write sets it from 0 to `INT_MAX`,
+  and the object takes its sequence number and the first free index from
+  its own. `/proc/sys/kernel` lists only these, and each directory of
+  `/proc/sys` lists its entries by name, as Linux's tree of them keeps
+  them.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
   descriptor, as Linux's `seq_show` writes it: `pos`, the description's
   position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and

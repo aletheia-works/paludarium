@@ -14494,6 +14494,116 @@ static int ksys_lists(const char *path, const char *name) {
     closedir(dir);
     return found;
 }
+/* The names of directory `path` that are among `names`, in the order
+   readdir gives them: Linux lists more beside them. */
+static void ksys_order(const char *label, const char *path, const char *const *names, int count) {
+    printf("%s:", label);
+    DIR *dir = opendir(path);
+    if (!dir) {
+        printf(" opendir=%d\n", -errno);
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(dir)))
+        for (int i = 0; i < count; i++)
+            if (!strcmp(e->d_name, names[i])) printf(" %s", e->d_name);
+    closedir(dir);
+    printf("\n");
+}
+static long ksys_exists(int id) {
+    struct shmid_ds ds;
+    return ksys_errno(syscall(SYS_shmctl, id, IPC_STAT, &ds));
+}
+/* In an IPC namespace of its own: the listing order, auto_msgmni, the next
+   IDs and shm_rmid_forced. */
+static int ipc_sysctl_more(void) {
+    const char *mqueue[] = {"queues_max", "msg_max", "msgsize_max", "msg_default", "msgsize_default"};
+    ksys_order("order-mqueue", "/proc/sys/fs/mqueue", mqueue, 5);
+    const char *kernel[] = {"shmmax",          "shmall",      "shmmni",      "msgmax",      "msgmnb",
+                            "msgmni",          "sem",         "auto_msgmni", "msg_next_id", "sem_next_id",
+                            "shm_next_id",     "shm_rmid_forced"};
+    ksys_order("order-kernel", "/proc/sys/kernel", kernel, 12);
+    printf("auto_msgmni:");
+    ksys_show("auto_msgmni");
+    printf(" one=%ld two=%ld", ksys_write("auto_msgmni", "1"), ksys_write("auto_msgmni", "2"));
+    ksys_show("auto_msgmni");
+    printf("\n");
+    struct stat st;
+    long stated = ksys_errno(stat("/proc/sys/kernel/shm_next_id", &st));
+    printf("next-id: stat=%ld mode=%o", stated, st.st_mode);
+    ksys_show("shm_next_id");
+    printf(" negative=%ld set=%ld", ksys_write("shm_next_id", "-1"), ksys_write("shm_next_id", "65541"));
+    ksys_show("shm_next_id");
+    int shm = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    printf(" shm=%d", shm);
+    ksys_show("shm_next_id");
+    ksys_write("msg_next_id", "7");
+    int msg = (int)syscall(SYS_msgget, IPC_PRIVATE, 0600);
+    ksys_write("sem_next_id", "32769");
+    int sem = (int)syscall(SYS_semget, IPC_PRIVATE, 1, 0600);
+    printf(" msg=%d sem=%d\n", msg, sem);
+    syscall(SYS_shmctl, shm, IPC_RMID, NULL);
+    syscall(SYS_msgctl, msg, IPC_RMID, NULL);
+    semx_ctl(sem, 0, IPC_RMID, 0);
+    /* Another user may read a next ID but not set it. */
+    fflush(stdout);
+    pid_t other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        printf("next-id-other: write=%ld", ksys_write("msg_next_id", "3"));
+        ksys_show("msg_next_id");
+        printf("\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    result("next-id-other", reaped(other));
+
+    /* shm_rmid_forced. Its own segment, never attached, stays throughout
+       while it runs. */
+    printf("rmid:");
+    ksys_show("shm_rmid_forced");
+    printf(" bad=%ld", ksys_write("shm_rmid_forced", "2"));
+    int own = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    /* A child makes one, never attached, and exits: an orphan, kept while
+       the sysctl is 0. */
+    int ids[2];
+    if (pipe(ids)) return 11;
+    fflush(stdout);
+    pid_t maker = child();
+    if (maker == 0) {
+        int id = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+        if (write(ids[1], &id, sizeof id) != sizeof id) _exit(93);
+        _exit(0);
+    }
+    int orphan = -1;
+    if (read(ids[0], &orphan, sizeof orphan) != sizeof orphan) return 12;
+    int made = reaped(maker);
+    printf(" made=%d orphan-kept=%ld", made, ksys_exists(orphan));
+    /* Setting it removes the orphans no mapping shows. */
+    printf(" set=%ld orphan=%ld own=%ld", ksys_write("shm_rmid_forced", "1"), ksys_exists(orphan),
+           ksys_exists(own));
+    /* Set, a segment goes at its last detach. */
+    int detached = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    void *at = (void *)syscall(SYS_shmat, detached, 0, 0);
+    printf(" attached=%ld", ksys_exists(detached));
+    syscall(SYS_shmdt, at);
+    printf(" detached=%ld", ksys_exists(detached));
+    /* And those a child made and never attached go when it exits. */
+    fflush(stdout);
+    maker = child();
+    if (maker == 0) {
+        int id = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+        if (write(ids[1], &id, sizeof id) != sizeof id) _exit(93);
+        _exit(0);
+    }
+    int left = -1;
+    if (read(ids[0], &left, sizeof left) != sizeof left) return 13;
+    made = reaped(maker);
+    printf(" made=%d exited=%ld own=%ld", made, ksys_exists(left), ksys_exists(own));
+    printf(" unset=%ld\n", ksys_write("shm_rmid_forced", "0"));
+    syscall(SYS_shmctl, own, IPC_RMID, NULL);
+    return 0;
+}
 static int ipc_sysctl_case(void) {
     /* Its own IPC namespace, whose limits the writes change. */
     if (syscall(SYS_unshare, CLONE_NEWIPC)) return 10;
@@ -14619,6 +14729,14 @@ static int ipc_sysctl_case(void) {
     }
     result("fresh", reaped(fresh));
     ksys_all("kept");
+    fflush(stdout);
+    pid_t more = child();
+    if (more == 0) {
+        int r = syscall(SYS_unshare, CLONE_NEWIPC) ? 92 : ipc_sysctl_more();
+        fflush(stdout);
+        _exit(r);
+    }
+    result("more", reaped(more));
     return 0;
 }
 static int sem_case(void) {

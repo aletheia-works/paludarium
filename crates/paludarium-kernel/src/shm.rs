@@ -78,6 +78,8 @@ pub(crate) struct Limits {
     pub max: u64,
     pub all: u64,
     pub mni: i32,
+    /// `kernel.shm_rmid_forced`, 0 or 1 ([`Segments::set_rmid_forced`]).
+    pub rmid_forced: i32,
 }
 
 impl Default for Limits {
@@ -86,6 +88,46 @@ impl Default for Limits {
             max: SHMMAX,
             all: SHMALL,
             mni: SHMMNI as i32,
+            rmid_forced: 0,
+        }
+    }
+}
+
+/// What a thread holds while it runs, which tells the segments it made in
+/// one IPC namespace (Linux's `shm_clist` and `shm_creator`): once it is
+/// gone, they are orphans, which `kernel.shm_rmid_forced` removes.
+pub(crate) struct Creator {
+    table: Weak<Mutex<Table>>,
+}
+
+impl Creator {
+    /// Whether it is for the segments of `segments`.
+    pub(crate) fn of(&self, segments: &Segments) -> bool {
+        std::ptr::eq(self.table.as_ptr(), Arc::as_ptr(&segments.0))
+    }
+}
+
+/// A thread leaves the segments it made, as Linux's `exit_shm`: with
+/// `kernel.shm_rmid_forced`, those no mapping shows go at once, and the
+/// others at their last detach; all of them are orphans from now on.
+pub(crate) fn leave(creator: Arc<Creator>) {
+    let Some(table) = creator.table.upgrade() else {
+        return;
+    };
+    let mut table = table.lock().unwrap_or_else(PoisonError::into_inner);
+    table.purge();
+    if table.limits.rmid_forced != 0 {
+        let made: Vec<u32> = table
+            .segments
+            .iter()
+            .filter(|(_, segment)| {
+                segment.attached() == 0
+                    && std::ptr::eq(segment.creator.as_ptr(), Arc::as_ptr(&creator))
+            })
+            .map(|(&index, _)| index)
+            .collect();
+        for index in made {
+            table.destroy(index);
         }
     }
 }
@@ -95,6 +137,8 @@ struct Segment {
     /// Its key, `IPC_PRIVATE` once it is marked for removal, and its
     /// permissions with `SHM_DEST` and `SHM_LOCKED`.
     perm: Perm,
+    /// The thread that made it, while it runs in the namespace.
+    creator: Weak<Creator>,
     size: u64,
     atime: i64,
     dtime: i64,
@@ -174,9 +218,22 @@ impl PageSource for Attachment {
 }
 
 impl Drop for Attachment {
+    /// The last mapping of a `shmat` goes (`shm_close`): a segment marked
+    /// for removal goes with its last attachment, and so does any with
+    /// `kernel.shm_rmid_forced`.
     fn drop(&mut self) {
         if let Some(table) = self.table.upgrade() {
-            table.lock().unwrap_or_else(PoisonError::into_inner).purge();
+            let mut table = table.lock().unwrap_or_else(PoisonError::into_inner);
+            table.purge();
+            let index = ipc::index(self.id);
+            if table.limits.rmid_forced != 0
+                && table
+                    .segments
+                    .get(&index)
+                    .is_some_and(|segment| segment.id == self.id && segment.attached() == 0)
+            {
+                table.destroy(index);
+            }
         }
     }
 }
@@ -187,10 +244,40 @@ impl Segments {
     pub(crate) fn with_limits<R>(&self, f: impl FnOnce(&mut Limits) -> R) -> R {
         f(&mut self.lock().limits)
     }
+    /// Its IDs, whose next one `/proc/sys/kernel` reads and sets
+    /// ([`crate::sysctl`]).
+    pub(crate) fn with_ids<R>(&self, f: impl FnOnce(&mut ipc::Ids) -> R) -> R {
+        f(&mut self.lock().ids)
+    }
     fn lock(&self) -> MutexGuard<'_, Table> {
         let mut table = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         table.purge();
         table
+    }
+    /// A new mark for the segments a thread makes here.
+    pub(crate) fn creator(&self) -> Arc<Creator> {
+        Arc::new(Creator {
+            table: Arc::downgrade(&self.0),
+        })
+    }
+    /// Sets `kernel.shm_rmid_forced`; set, it removes the orphans no
+    /// mapping shows, as Linux's `shm_destroy_orphaned`.
+    pub(crate) fn set_rmid_forced(&self, value: i32) {
+        let mut table = self.lock();
+        table.limits.rmid_forced = value;
+        if value != 0 {
+            let orphans: Vec<u32> = table
+                .segments
+                .iter()
+                .filter(|(_, segment)| {
+                    segment.attached() == 0 && segment.creator.strong_count() == 0
+                })
+                .map(|(&index, _)| index)
+                .collect();
+            for index in orphans {
+                table.destroy(index);
+            }
+        }
     }
 }
 
@@ -205,9 +292,13 @@ impl Table {
             .map(|(&index, _)| index)
             .collect();
         for index in doomed {
-            if let Some(segment) = self.segments.remove(&index) {
-                self.pages -= segment.pages();
-            }
+            self.destroy(index);
+        }
+    }
+    /// Removes the segment at `index` (`shm_destroy`).
+    fn destroy(&mut self, index: u32) {
+        if let Some(segment) = self.segments.remove(&index) {
+            self.pages -= segment.pages();
         }
     }
     /// The segment with this ID, `EINVAL` for none (Linux's
@@ -247,6 +338,7 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
     let credentials = &c.process.credentials;
     let owner = ipc::capable(c, CAP_IPC_OWNER);
     let shm = segments(c);
+    let creator = c.group.shm_creator(c.tid, &shm);
     let mut table = shm.lock();
     if key != IPC_PRIVATE {
         if let Some(segment) = table
@@ -298,6 +390,7 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
         Segment {
             id,
             perm: Perm::new(key, credentials, flag),
+            creator: Arc::downgrade(&creator),
             size,
             atime: 0,
             dtime: 0,

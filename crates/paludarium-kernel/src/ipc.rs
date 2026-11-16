@@ -41,6 +41,9 @@ pub(crate) struct Ids {
     /// The index given out last, and where the search for the next starts.
     last: Option<u32>,
     next: u32,
+    /// The ID the next object takes, once, which `kernel.*_next_id` sets
+    /// (Linux's `ids->next_id`, -1 for none).
+    wanted: Option<i32>,
 }
 
 impl Ids {
@@ -49,10 +52,23 @@ impl Ids {
     /// given out, below the larger of 64 and half as many again as are in
     /// use, or the first free one from 0, which starts a new sequence
     /// number.
+    ///
+    /// An ID `kernel.*_next_id` set is taken instead, once (`ipc_idr_alloc`
+    /// with `next_id`): its sequence number, and the first free index from
+    /// its own, which leaves the turn and the sequence number as they were.
+    /// Linux looks past `IPCMNI` for a free index; here none past it is
+    /// `ENOSPC`.
     pub fn allocate<T>(&mut self, objects: &BTreeMap<u32, T>, limit: usize) -> Result<i32, Errno> {
         let in_use = objects.len();
         if in_use >= limit {
             return Err(Errno::ENOSPC);
+        }
+        if let Some(wanted) = self.wanted.take() {
+            let seq = wanted as u32 >> SEQ_SHIFT;
+            let index = (index(wanted)..IPCMNI)
+                .find(|index| !objects.contains_key(index))
+                .ok_or(Errno::ENOSPC)?;
+            return Ok(((seq << SEQ_SHIFT) + index) as i32);
         }
         let end = (in_use * 3 / 2).clamp(MIN_CYCLE, IPCMNI as usize) as u32;
         let free = |from: u32| (from..end).find(|index| !objects.contains_key(index));
@@ -66,6 +82,17 @@ impl Ids {
         }
         self.last = Some(index);
         Ok(((self.seq << SEQ_SHIFT) + index) as i32)
+    }
+}
+
+impl Ids {
+    /// What `kernel.*_next_id` shows: the ID the next object takes, or -1.
+    pub fn next_id(&self) -> i32 {
+        self.wanted.unwrap_or(-1)
+    }
+    /// Sets it, as a write of `kernel.*_next_id` does (from 0).
+    pub fn set_next_id(&mut self, id: i32) {
+        self.wanted = Some(id);
     }
 }
 
@@ -177,4 +204,34 @@ pub(crate) fn now(c: &Context<'_>) -> i64 {
     c.host
         .clock(ClockId::Realtime)
         .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_next_id_set_is_taken_once_and_leaves_the_turn_as_it_was() {
+        let mut ids = Ids::default();
+        let mut objects: BTreeMap<u32, ()> = BTreeMap::new();
+        for _ in 0..2 {
+            let id = ids.allocate(&objects, 10).unwrap();
+            objects.insert(index(id), ());
+        }
+        // Index 5 is taken, so the next ID asked for gets 6, its sequence
+        // number kept.
+        objects.insert(5, ());
+        ids.set_next_id((3 << SEQ_SHIFT) + 5);
+        assert_eq!(ids.next_id(), (3 << SEQ_SHIFT) + 5);
+        let id = ids.allocate(&objects, 10).unwrap();
+        assert_eq!(id, (3 << SEQ_SHIFT) + 6);
+        assert_eq!(ids.next_id(), -1);
+        objects.insert(index(id), ());
+        // The turn goes on from where it was, sequence 0.
+        assert_eq!(ids.allocate(&objects, 10), Ok(2));
+        // At the limit it is not taken.
+        ids.set_next_id(9);
+        assert_eq!(ids.allocate(&objects, 4), Err(Errno::ENOSPC));
+        assert_eq!(ids.next_id(), 9);
+    }
 }

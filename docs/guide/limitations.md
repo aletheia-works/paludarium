@@ -423,10 +423,11 @@ verified.
     a pidfd with `PIDFD_THREAD` has the inode of its whole process. A pidfd
     opened from a handle with `O_EXCL` does not keep `PIDFD_THREAD`, as on
     the CI runners' Linux 7.0, where Linux 7.2 and later keep it.
-  - System V IPC has no `shm_rmid_forced`, `auto_msgmni`,
-    `shm_next_id`, `sem_next_id` or `msg_next_id` in `/proc/sys/kernel`,
-    and `IPCMNI` is always 32768, as without the `ipcmni_extend` boot
-    option. `/proc/sysvipc` shows its objects as they were when it was opened,
+  - System V IPC's `IPCMNI` is always 32768, as without the
+    `ipcmni_extend` boot option, and an ID a `*_next_id` asks for whose
+    index and all after it below 32768 are taken is `ENOSPC`, where Linux
+    gives an index past them. A read of `shm_rmid_forced` set removes no
+    orphans, where Linux's does as its write does. `/proc/sysvipc` shows its objects as they were when it was opened,
     where Linux reads each one as the read reaches it.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and

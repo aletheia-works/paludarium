@@ -5,8 +5,8 @@
 //! address (`rip` stays, and RF lets that instruction run once it goes on),
 //! and a data breakpoint traps after an instruction that accesses its
 //! range, as the CPU raises #DB. An access is what the instruction's
-//! explicit memory operands touch (the whole save area of `fxsave`,
-//! `fnsave`, `fnstenv` and their restores, the bytes `maskmovdqu`'s mask
+//! explicit memory operands touch (the state `fxsave`, `fnsave` and
+//! `fnstenv` write and their restores read, the bytes `maskmovdqu`'s mask
 //! selects), its stack accesses (push, pop, call, return, `enter`,
 //! `leave`), and a string instruction's element without a repeat; a write
 //! breakpoint takes only what an instruction writes. A repeated string
@@ -189,11 +189,13 @@ fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
     }
     for (n, operand) in insn.operands().enumerate() {
         if let Operand::Memory(m) = operand {
-            // The area `fxsave` and `fxrstor` take is 512 bytes, more than
-            // an operand size holds; the x87 ones have theirs there.
+            // `fxsave` writes, and `fxrstor` reads, the front of its
+            // 512-byte area: the x87 state, MXCSR and the XMM registers,
+            // not the bytes the CPU leaves to software. The x87 save
+            // instructions have their area's length as their operand size.
             let length = match insn.mnemonic {
                 Mnemonic::Fxsave | Mnemonic::Fxsave64 | Mnemonic::Fxrstor | Mnemonic::Fxrstor64 => {
-                    512
+                    crate::state::FX_WRITTEN as u16
                 }
                 _ => u16::from(m.size),
             };

@@ -471,12 +471,16 @@ static int hw_implicit_case(void) {
         _exit(0);
     }
     wait_status(child);
-    pt(PTRACE_POKEUSER, child, DEBUGREG(0), (unsigned long)(fxarea + 504));
+    /* DR0: XMM0 in the fxsave area, which it writes; DR3: its last bytes,
+     * which it leaves to software and never writes. */
+    pt(PTRACE_POKEUSER, child, DEBUGREG(0), (unsigned long)(fxarea + 160));
     pt(PTRACE_POKEUSER, child, DEBUGREG(1), (unsigned long)(table + 8));
     pt(PTRACE_POKEUSER, child, DEBUGREG(2), (unsigned long)leaveslot);
-    /* DR0: an 8-byte write; DR1: a 1-byte read or write; DR2: an 8-byte
-     * read or write. */
-    unsigned long dr7 = 1 | 1 << 2 | 1 << 4 | 0x9UL << 16 | 0x3UL << 20 | 0xbUL << 24;
+    pt(PTRACE_POKEUSER, child, DEBUGREG(3), (unsigned long)(fxarea + 504));
+    /* DR0 and DR3: 8-byte writes; DR1: a 1-byte read or write; DR2: an
+     * 8-byte read or write. */
+    unsigned long dr7 = 1 | 1 << 2 | 1 << 4 | 1 << 6 | 0x9UL << 16 | 0x3UL << 20 | 0xbUL << 24 |
+                        0x9UL << 28;
     printf("dr7=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), dr7));
     pt(PTRACE_CONT, child, 0, 0);
     hw2_stop(child, "fxsave");

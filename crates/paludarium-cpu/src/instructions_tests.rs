@@ -551,10 +551,12 @@ fn hits_breakpoint(
 #[test]
 fn save_areas_and_implicit_accesses_hit_data_breakpoints() {
     use crate::breakpoints::BreakOn::{Access, Write};
-    // fxsave [0x40000000] writes its 512 bytes.
+    // fxsave [0x40000000] writes its state, up to the XMM registers, and
+    // not the bytes past them that software may use.
     let fxsave = [0x0f, 0xae, 0x04, 0x25, 0, 0, 0, 0x40];
-    assert!(hits_breakpoint(&fxsave, |_| {}, 0x4000_01f8, 8, Write));
-    assert!(!hits_breakpoint(&fxsave, |_| {}, 0x4000_0200, 8, Write));
+    assert!(hits_breakpoint(&fxsave, |_| {}, 0x4000_00a0, 8, Write));
+    assert!(hits_breakpoint(&fxsave, |_| {}, 0x4000_0198, 8, Write));
+    assert!(!hits_breakpoint(&fxsave, |_| {}, 0x4000_01f8, 8, Write));
     // xlat reads [rbx + al], and writes nothing.
     let at_8 = |s: &mut CpuState| {
         s.gpr[reg::RBX] = 0x4000_0000;

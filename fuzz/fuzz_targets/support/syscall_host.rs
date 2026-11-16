@@ -74,7 +74,10 @@ impl Host for BoundedHost {
         // Reach the deadline at once on the virtual clocks. RecordingHost's
         // own wait first gives other threads up to 10 ms of real time to end
         // it; nothing here can, so the 64 waits of one blocking syscall would
-        // spend 640 ms of real time for nothing.
+        // spend 640 ms of real time for nothing. RecordingHost's
+        // interrupt_next_wait is not honoured here, and the two clocks are
+        // read and set apart; nothing in the fuzz harness interrupts a wait
+        // or waits from a second thread.
         let elapsed = d.saturating_sub(self.clock(c)?);
         for clock in [ClockId::Monotonic, ClockId::Realtime] {
             let now = self.clock(clock)?;

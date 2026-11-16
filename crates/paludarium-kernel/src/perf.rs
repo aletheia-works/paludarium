@@ -393,9 +393,10 @@ struct State {
     since: u64,
     /// The task is gone: its last time stays.
     last: u64,
-    /// `remove_on_exec` took it out of its task and its group at the task's
-    /// `execve` (Linux's `PERF_EVENT_STATE_EXIT`): it counts no more, is not
-    /// enabled again, and its last count and times stay to be read.
+    /// In Linux's `PERF_EVENT_STATE_EXIT`: `remove_on_exec` took it out of
+    /// its task and its group at the task's `execve`, or its task ended. It
+    /// counts no more, is not enabled again, and its last count and times
+    /// stay to be read.
     removed: bool,
 }
 
@@ -431,6 +432,8 @@ pub(crate) struct Events {
 struct Lists {
     owned: Vec<Owned>,
     on_exec: Vec<Erased>,
+    /// The events that count a thread, for its exit.
+    counting: Vec<Erased>,
 }
 
 /// A reference that holds an [`Event`] or a [`ThreadGroup`] by no
@@ -470,6 +473,10 @@ impl Events {
         let mut lists = lock(&self.lists);
         lists.owned.retain(|owned| owned.event.strong_count() > 0);
         lists.on_exec.retain(|event| event.strong_count() > 0);
+        lists.counting.retain(|event| event.strong_count() > 0);
+        if matches!(event.target, Target::Thread { .. }) {
+            lists.counting.push(erase(event));
+        }
         lists.owned.push(Owned {
             group: erase(group),
             tid,
@@ -776,9 +783,9 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map_err(|_| EBADF)?
             .file;
         let event = Arc::clone(of(&file).ok_or(EBADF)?);
-        // One `remove_on_exec` took out is in Linux's `EXIT` state, which
-        // no group may be led by (`ENODEV`, as Linux master since 7.2's
-        // fa091f46c383; the test machines' 7.0 takes it).
+        // One `remove_on_exec` took out, or whose task ended, is in Linux's
+        // `EXIT` state, which no group may be led by (`ENODEV`, as Linux
+        // master since 7.2's fa091f46c383; the test machines' 7.0 takes it).
         if lock(&event.state).removed {
             return Err(Errno::ENODEV);
         }
@@ -923,13 +930,40 @@ fn init(attr: &Attr) -> Result<Counter, Errno> {
 }
 
 /// `perf_event_exit_task`: thread `tid` of `group` ends without an
-/// `execve`, and the events it opened have no owner any more, so that
+/// `execve`. The events it opened have no owner any more, so that
 /// `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` of a later thread of that
-/// number do not reach them. They go on counting what they count.
+/// number do not reach them, and those that count it go to Linux's `EXIT`
+/// state (`perf_event_exit_task_context`, `DETACH_EXIT`): they count no
+/// more, keep their last count and times to be read, stay in their group,
+/// are not enabled again and lead no new group (`ENODEV`).
 pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, tid: u32) {
-    lock(&events.lists)
-        .owned
-        .retain(|owned| owned.tid != tid || !owned.of(group));
+    let counting: Vec<Arc<Event>> = {
+        let mut lists = lock(&events.lists);
+        lists
+            .owned
+            .retain(|owned| owned.tid != tid || !owned.of(group));
+        let mut gone = Vec::new();
+        lists.counting.retain(|erased| {
+            let Some(event) = event(erased) else {
+                return false;
+            };
+            match &event.target {
+                Target::Thread {
+                    group: target,
+                    tid: target_tid,
+                } if *target_tid == tid && std::ptr::eq(Arc::as_ptr(target), group) => {
+                    gone.push(event);
+                    false
+                }
+                _ => true,
+            }
+        });
+        gone
+    };
+    for event in counting {
+        event.disable();
+        event.settle().removed = true;
+    }
 }
 
 /// What an `execve` by thread `tid` (its number before the exec, `new_tid`
@@ -1124,11 +1158,15 @@ mod tests {
     }
 
     fn event(leader: Option<&Arc<Event>>) -> Arc<Event> {
+        counting(leader, Target::Cpu)
+    }
+
+    fn counting(leader: Option<&Arc<Event>>, target: Target) -> Arc<Event> {
         let event = Arc::new(Event {
             id: 0,
             attr: Attr::default(),
             counter: Counter::Zero,
-            target: Target::Cpu,
+            target,
             cpu: 0,
             clockid: None,
             host: Arc::new(paludarium_host::testing::RecordingHost::default()),
@@ -1181,6 +1219,37 @@ mod tests {
         exit_thread(&events, &group, 5);
         assert!(events.owned_by(&group, 5).is_empty());
         assert_eq!(ids(&events.owned_by(&group, 6)), ids(&[other]));
+    }
+
+    #[test]
+    fn the_events_that_count_a_thread_that_ends_are_in_the_exit_state() {
+        let events = Events::default();
+        let group = Arc::new(ThreadGroup::default());
+        let of = |tid| Target::Thread {
+            group: Arc::clone(&group),
+            tid,
+        };
+        let leader = counting(None, of(5));
+        let member = counting(Some(&leader), of(5));
+        let other = counting(None, of(6));
+        for event in [&leader, &member, &other] {
+            event.enable();
+            events.add(event, &group, 1);
+        }
+        exit_thread(&events, &group, 5);
+        for event in [&leader, &member] {
+            let state = lock(&event.state);
+            assert!(state.removed && !state.enabled);
+        }
+        // They stay in their group, and are not enabled again.
+        assert_eq!(
+            ids(&leader.group()),
+            ids(&[Arc::clone(&leader), Arc::clone(&member)])
+        );
+        leader.enable();
+        assert!(!leader.enabled());
+        let state = lock(&other.state);
+        assert!(!state.removed && state.enabled);
     }
 
     #[test]

@@ -231,11 +231,16 @@ verified.
   takes it as a leader, so these are checked by the unit tests alone. The
   events that wait for an `execve`, and those each thread opened, are kept
   per emulated machine, matched by thread group and thread, and dropped as
-  they close. An event whose task has ended is not in Linux's `EXIT`
-  state here, so it may still lead a new group, where master gives
-  `ENODEV`. A group's members count whatever software
-  clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
-  group no count on the x86-64 machines the tests run on (why was not found).
+  they close. An event whose task has ended also leads no new group
+  (`ENODEV`), as in master, where the test machines' 7.0 takes it. A
+  group's members count whenever their leader does, whatever software
+  event they are. In Linux, a member of another software PMU than its
+  leader's (a `cpu-clock` member of a `task-clock` group, the other way
+  round, or either with `dummy`) keeps its own PMU's context
+  (`find_get_pmu_context`), which is scheduled in and out apart from its
+  leader's, so it runs for a part of its leader's time that changes from
+  run to run, from none to nearly all, on the x86-64 test machines; the
+  tests group only events of one PMU.
   The SIMD register fields of Linux master's 176-byte structure are checked
   as master checks them and not compared with Linux: the test machines'
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not

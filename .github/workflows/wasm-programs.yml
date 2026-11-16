@@ -32,10 +32,11 @@ jobs:
         run: python3 -m unittest discover -s tests/guests/wasm/runner-tests -p 'test_*.py'
       - name: Build fixed guests and audit dependencies
         run: python tests/guests/programs/build.py target/guests/programs
-      - name: Fresh Linux oracle with filesystem metadata
-        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/programs --output target/wasm/native
+      # Before the oracle, whose sudo makes target/wasm root's.
       - name: The x87 guest and what it prints on this x86-64 CPU
         run: python3 tests/guests/wasm/x87.py target/wasm/x87
+      - name: Fresh Linux oracle with filesystem metadata
+        run: sudo unshare --net python3 scripts/wasm-run.py --native-only --guest-dir target/guests/programs --output target/wasm/native
       - name: Build one production wasm module for every environment
         run: bash mise-tasks/wasm/build.sh
       - name: Preserve inputs and fresh oracle

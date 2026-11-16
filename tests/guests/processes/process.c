@@ -14007,6 +14007,7 @@ static int ipc_sysctl_case(void) {
         _exit(0);
     }
     result("other", reaped(other));
+    fflush(stdout);
     pid_t fresh = child();
     if (fresh == 0) {
         if (syscall(SYS_unshare, CLONE_NEWIPC)) _exit(91);

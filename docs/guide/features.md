@@ -2647,7 +2647,7 @@ kernel.
   `sem` sets as many as it gives, as Linux's `proc_dointvec` reads a
   vector: a bad one is `EINVAL` and leaves the ones before it set, and
   `semmni` goes back to what it was unless it ends from 0 to 32768
-  (`proc_ipc_sem_dointvec`). Beside them, `perf_event_paranoid` and
+  (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them, `perf_event_paranoid` and
   `unprivileged_bpf_disabled` read 2, Linux's defaults, and no one may
   open them to write (`EACCES`). `/proc/sys/kernel` lists only these.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open

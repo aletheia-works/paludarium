@@ -2297,7 +2297,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `semmni` の 4 つの `int` で、タブで区切って読めます。`sem` への書き込みは、Linux の
   `proc_dointvec` がベクトルを読むのと同じく、与えた数だけを設定します。不正な値は
   `EINVAL` で、その前の値は設定されたままです。`semmni` は、最後に 0 から 32768 の間に
-  なければ元に戻ります（`proc_ipc_sem_dointvec`）。ほかに `perf_event_paranoid` と
+  なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに `perf_event_paranoid` と
   `unprivileged_bpf_disabled` があり、Linux の既定値の 2 を読めますが、誰も書くために
   開けません（`EACCES`）。`/proc/sys/kernel` にあるのはこれらだけです。
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`

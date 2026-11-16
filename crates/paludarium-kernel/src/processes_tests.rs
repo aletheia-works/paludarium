@@ -4439,7 +4439,7 @@ mod shm {
         assert_eq!(read(&mut k, &mut t, &m, "sem"), "1\t2\t500\t32000\n");
         assert_eq!(
             write_kernel(&mut k, &mut t, &m, "sem", b"7 8 9 40000"),
-            e(Errno::EINVAL)
+            e(Errno::ERANGE)
         );
         assert_eq!(read(&mut k, &mut t, &m, "sem"), "7\t8\t9\t32000\n");
         assert_eq!(

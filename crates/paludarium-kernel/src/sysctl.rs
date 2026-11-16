@@ -20,7 +20,7 @@
 //! and `msgmnb` `int`s from 0, and `sem`, four `int`s (`semmsl`, `semmns`,
 //! `semopm`, `semmni`) read with tabs between them and written as many as
 //! are given, the ones before a bad one kept, and `semmni` back as it was
-//! unless it ends from 0 to `IPCMNI` (`proc_ipc_sem_dointvec`). Their
+//! unless it ends from 0 to `IPCMNI` (`ERANGE`, `proc_ipc_sem_dointvec`). Their
 //! owners and who may write them are the mqueue files'. Beside them are
 //! `perf_event_paranoid` and `unprivileged_bpf_disabled`, the values
 //! [`crate::perf`] and [`crate::bpf`] keep to (2, Linux's defaults), which
@@ -342,14 +342,15 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
             Ok(consumed)
         }
         // `proc_ipc_sem_dointvec`: the values before a bad one stay, and
-        // `semmni` goes back unless it ends in its bounds.
+        // `semmni` goes back unless it ends in its bounds (`ERANGE`,
+        // `sem_check_semmni`).
         Kernel::Sem => ipc.sem.with_limits(|limits| {
             let semmni = limits.0[3];
             let written = parse_ints(buf, &mut limits.0).and_then(|consumed| {
                 if (0..=IPCMNI as i32).contains(&limits.0[3]) {
                     Ok(consumed)
                 } else {
-                    Err(Errno::EINVAL)
+                    Err(Errno::ERANGE)
                 }
             });
             if written.is_err() {

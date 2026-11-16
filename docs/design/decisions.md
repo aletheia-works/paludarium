@@ -234,6 +234,18 @@ that sets the flag, ends its run when it does, so the next one is stepped;
 the kernel sets it only between runs (`rt_sigreturn`, a tracer). Neither
 JIT needs to know of the flag.
 
+## A machine with 4-level paging
+
+paludarium is always a machine with 4-level page tables: user space ends
+below 2^47 bytes, and `TASK_SIZE_MAX` is 2^47 - 4096, on every host. A guest
+then behaves the same on a Linux host with 5-level paging, on macOS and in
+WebAssembly, and its results do not depend on the paging depth of the
+machine it runs on. Little is lost: Linux maps above 2^47 only for a
+process that asks for it with an `mmap` hint there. What differs from a
+Linux on a CPU with 5-level paging is listed in the
+[limitations](../guide/limitations); the differential tests use no value
+whose result there would depend on the paging depth.
+
 ## Explicit CPU differences
 
 When a `REP` instruction faults midway, Intel and AMD leave different flags.

@@ -78,6 +78,14 @@ verified.
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; nothing
   clears the soft-dirty bit (`/proc/<pid>/clear_refs` is not there); and
   user space ends at 2^47 bytes, as with 4-level page tables.
+- **4-level paging only**: the emulated machine always has 4-level page
+  tables, whatever CPU the host has: user space ends below 2^47 bytes, and
+  `TASK_SIZE_MAX` is 2^47 - 4096 for every check that asks for it, as the
+  `fs` and `gs` bases `ptrace`'s `PTRACE_POKEUSER`, `PTRACE_SETREGS` and
+  `PTRACE_ARCH_PRCTL` take (`EIO`, `EPERM`). Linux on a CPU with 5-level paging (LA57) maps
+  above 2^47 only for a process that asks with an `mmap` hint there, but
+  its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
+  the two that paludarium refuses ([decisions](../design/decisions)).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs` and

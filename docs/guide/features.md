@@ -1863,10 +1863,11 @@ kernel.
     dump with `IFA_TARGET_NETNSID`, show the link or addresses of the
     namespace that ID names (see Namespace IDs below), with that ID in
     the answer: `IFLA_TARGET_NETNSID` (`IFLA_IF_NETNSID`) first, before
-    the link's name, as Linux 7.0's `rtnl_fill_ifinfo` puts it (master
-    puts it after the name), and `IFA_TARGET_NETNSID` first in each
-    address, as `inet_fill_ifaddr` and `inet6_fill_ifaddr` put it; an `AF_UNSPEC` dump's MCTP addresses are still the socket's
-    own namespace's. An ID none has is `EINVAL`, and a namespace whose
+    the link's name, as Linux 7.0's `rtnl_fill_ifinfo` puts it (Linux's
+    master branch puts it after the name), and `IFA_TARGET_NETNSID` first
+    in each address, as `inet_fill_ifaddr` and `inet6_fill_ifaddr` put
+    it; an `AF_UNSPEC` dump's MCTP addresses are still the socket's own
+    namespace's. An ID none has is `EINVAL`, and a namespace whose
     owner the socket's opener or the sender lacks `CAP_NET_ADMIN` in is
     `EACCES` (`rtnl_get_net_ns_capable`), with Linux's extended-ack
     message in a dump. A single IPv6 address (`RTM_GETADDR` with

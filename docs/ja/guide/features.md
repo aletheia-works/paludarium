@@ -1630,9 +1630,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （検査の有無にかかわらず）と、`IFA_TARGET_NETNSID` を付けた厳密な検査のアドレスの
     ダンプは、その ID が指す名前空間（後述の名前空間の ID を参照）のリンクやアドレスを
     見せます。答えにはその ID を載せます。リンクでは、Linux 7.0 の `rtnl_fill_ifinfo` と
-    同じく名前より前の先頭の `IFLA_TARGET_NETNSID`（`IFLA_IF_NETNSID`）です（master は
-    名前の後に置きます）。アドレスでは、`inet_fill_ifaddr`、`inet6_fill_ifaddr` と同じく
-    それぞれの先頭の `IFA_TARGET_NETNSID` です。
+    同じく名前より前の先頭の `IFLA_TARGET_NETNSID`（`IFLA_IF_NETNSID`）です（Linux の
+    master ブランチは名前の後に置きます）。アドレスでは、`inet_fill_ifaddr`、
+    `inet6_fill_ifaddr` と同じくそれぞれの先頭の `IFA_TARGET_NETNSID` です。
     `AF_UNSPEC` のダンプの MCTP のアドレスは、ソケット自身の名前空間のままです。だれも
     持たない ID は `EINVAL`、ソケットを開いた側か送り手がその名前空間の持ち主で
     `CAP_NET_ADMIN` を持たなければ `EACCES` で（`rtnl_get_net_ns_capable`）、ダンプでは

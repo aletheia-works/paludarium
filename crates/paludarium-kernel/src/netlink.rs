@@ -1695,7 +1695,8 @@ fn with_attribute_at(message: Vec<u8>, at: usize, kind: u16, id: i32) -> Vec<u8>
 }
 /// A link message with `IFLA_TARGET_NETNSID` (`IFLA_IF_NETNSID`) of `id`
 /// first, before its name, as Linux 7.0's `rtnl_fill_ifinfo` puts it
-/// (Linux master puts it after the name and the alternative names).
+/// (Linux's master branch puts it after the name and the alternative
+/// names).
 fn with_link_netnsid(message: Vec<u8>, id: i32) -> Vec<u8> {
     // After the header and the `ifinfomsg`.
     with_attribute_at(message, 16 + 16, IFLA_TARGET_NETNSID, id)

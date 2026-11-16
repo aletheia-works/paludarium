@@ -13,7 +13,7 @@ use paludarium_decoder::{
 use paludarium_mmu::AddressSpace;
 use paludarium_types::GuestAddr;
 
-use super::{Exec, Result};
+use super::{Exec, Result, Stop};
 use crate::alu::{self, sign_extend, size_mask};
 use crate::state::{CpuState, flag};
 
@@ -261,6 +261,38 @@ pub enum Fast {
         src: Register,
         signed: bool,
     },
+    /// `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` or `movupd` of an
+    /// xmm register into another.
+    XmmMove {
+        dst: u8,
+        src: u8,
+    },
+    /// The same of 16 bytes of memory into an xmm register. `aligned`
+    /// for the moves that require a 16-byte aligned address.
+    XmmLoad {
+        dst: u8,
+        mem: Address,
+        aligned: bool,
+    },
+    /// The same of an xmm register into 16 bytes of memory.
+    XmmStore {
+        mem: Address,
+        src: u8,
+        aligned: bool,
+    },
+    /// `pxor` or `xorps` of an xmm register into another.
+    XmmXor {
+        dst: u8,
+        src: u8,
+    },
+    /// `movd` (`size` 4) or `movq` (8) between an xmm register and a
+    /// general one, or `movq` between xmm registers: the low `size` bytes,
+    /// zero-extended into the whole destination.
+    MoveScalar {
+        dst: Register,
+        src: Register,
+        size: u8,
+    },
     /// `imul r, r` (`a` is `dst`) or `imul r, r, imm`.
     Imul {
         dst: Register,
@@ -399,6 +431,13 @@ fn memory(o: Option<Operand>) -> Option<MemoryOperand> {
     }
 }
 
+fn xmm(o: Option<Operand>) -> Option<u8> {
+    match o {
+        Some(Operand::Register(Register::Xmm(n))) => Some(n & 15),
+        _ => None,
+    }
+}
+
 fn address(o: Option<Operand>) -> Option<Address> {
     Address::of(memory(o)?)
 }
@@ -439,6 +478,50 @@ impl Fast {
             return None;
         }
         Some(match i.mnemonic {
+            Mnemonic::Movaps
+            | Mnemonic::Movups
+            | Mnemonic::Movdqa
+            | Mnemonic::Movdqu
+            | Mnemonic::Movapd
+            | Mnemonic::Movupd => {
+                let aligned = matches!(
+                    i.mnemonic,
+                    Mnemonic::Movaps | Mnemonic::Movdqa | Mnemonic::Movapd
+                );
+                match (xmm(a), xmm(b)) {
+                    (Some(dst), Some(src)) => Self::XmmMove { dst, src },
+                    (Some(dst), None) => Self::XmmLoad {
+                        dst,
+                        mem: address(b).filter(|m| m.size == 16)?,
+                        aligned,
+                    },
+                    (None, Some(src)) => Self::XmmStore {
+                        mem: address(a).filter(|m| m.size == 16)?,
+                        src,
+                        aligned,
+                    },
+                    (None, None) => return None,
+                }
+            }
+            Mnemonic::Pxor | Mnemonic::Xorps => Self::XmmXor {
+                dst: xmm(a)?,
+                src: xmm(b)?,
+            },
+            Mnemonic::Movd | Mnemonic::Movq => {
+                let size = if i.mnemonic == Mnemonic::Movd { 4 } else { 8 };
+                let scalar = |o: Option<Operand>| match o {
+                    Some(Operand::Register(r @ Register::Xmm(_))) => Some(r),
+                    Some(Operand::Register(r @ Register::Gpr { size: s, .. })) if s == size => {
+                        Some(r)
+                    }
+                    _ => None,
+                };
+                let (dst, src) = (scalar(a)?, scalar(b)?);
+                if !matches!(dst, Register::Xmm(_)) && !matches!(src, Register::Xmm(_)) {
+                    return None;
+                }
+                Self::MoveScalar { dst, src, size }
+            }
             Mnemonic::Mul | Mnemonic::Imul if b.is_none() => Self::MulWide {
                 src: gpr(a)?,
                 signed: i.mnemonic == Mnemonic::Imul,
@@ -722,6 +805,38 @@ pub(crate) fn execute(
             x.write_wide(size, full)?;
             let f = if overflow { flag::CF | flag::OF } else { 0 };
             x.set_status(flag::CF | flag::OF, f);
+            next
+        }
+        Fast::XmmMove { dst, src } => {
+            x.s.xmm[usize::from(dst)] = x.s.xmm[usize::from(src)];
+            next
+        }
+        Fast::XmmLoad { dst, mem, aligned } => {
+            let address = x.fast_linear(&mem);
+            if aligned && !address.0.is_multiple_of(16) {
+                return Err(Stop::GeneralProtection);
+            }
+            let mut bytes = [0; 16];
+            x.mem.read(address, &mut bytes)?;
+            x.s.xmm[usize::from(dst)] = u128::from_le_bytes(bytes);
+            next
+        }
+        Fast::XmmStore { mem, src, aligned } => {
+            let address = x.fast_linear(&mem);
+            if aligned && !address.0.is_multiple_of(16) {
+                return Err(Stop::GeneralProtection);
+            }
+            x.mem
+                .write(address, &x.s.xmm[usize::from(src)].to_le_bytes())?;
+            next
+        }
+        Fast::XmmXor { dst, src } => {
+            x.s.xmm[usize::from(dst)] ^= x.s.xmm[usize::from(src)];
+            next
+        }
+        Fast::MoveScalar { dst, src, size } => {
+            let v = x.read_reg(src) & size_mask(size);
+            x.write_reg(dst, v);
             next
         }
         Fast::Imul { dst, a, b } => {

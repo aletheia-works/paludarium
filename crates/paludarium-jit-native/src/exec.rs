@@ -69,13 +69,45 @@ extern "sysv64" fn store(context: *const Context<'_>, address: u64, size: u64, v
     }
 }
 
+extern "sysv64" fn load128(context: *const Context<'_>, address: u64, to: *mut u64) -> i64 {
+    // SAFETY: as in `load`.
+    let context = unsafe { &*context };
+    let mut bytes = [0; 16];
+    if context.mem.read(GuestAddr(address), &mut bytes).is_err() {
+        return FAILED;
+    }
+    let value = u128::from_le_bytes(bytes);
+    // SAFETY: compiled code passes the address of an xmm register's two
+    // words in the register block it was given (`emit::XMM`).
+    unsafe {
+        to.write(value as u64);
+        to.add(1).write((value >> 64) as u64);
+    }
+    done(context)
+}
+
+extern "sysv64" fn store128(context: *const Context<'_>, address: u64, from: *const u64) -> i64 {
+    // SAFETY: as in `load`.
+    let context = unsafe { &*context };
+    // SAFETY: as in `load128`.
+    let value = unsafe { u128::from(from.read()) | (u128::from(from.add(1).read()) << 64) };
+    match context.mem.write(GuestAddr(address), &value.to_le_bytes()) {
+        Ok(()) => done(context),
+        Err(_) => FAILED,
+    }
+}
+
 /// The helpers' addresses, for [`crate::emit::function`].
 pub(crate) fn helpers() -> Helpers {
     type Load = extern "sysv64" fn(*const Context<'static>, u64, u64) -> Loaded;
     type Store = extern "sysv64" fn(*const Context<'static>, u64, u64, u64) -> i64;
+    type Load128 = extern "sysv64" fn(*const Context<'static>, u64, *mut u64) -> i64;
+    type Store128 = extern "sysv64" fn(*const Context<'static>, u64, *const u64) -> i64;
     Helpers {
         load: load as Load as usize as u64,
         store: store as Store as usize as u64,
+        load128: load128 as Load128 as usize as u64,
+        store128: store128 as Store128 as usize as u64,
     }
 }
 

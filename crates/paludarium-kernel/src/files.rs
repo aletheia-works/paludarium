@@ -6385,9 +6385,24 @@ fn open_path(
         Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
     } else if let Some(path) = crate::proc::task_path(p, c.process.pid, c.tid) {
         let task = tasks::find(c, &path)?;
+        let link = tasks::link(&task, path.entry).is_some();
+        // What the file is, and whose: an open checks a regular file's mode
+        // for its owner first, as Linux's `may_open` does before the file's
+        // own open (`generic_permission`, `EACCES`); `O_PATH` checks nothing.
+        let file_stat = match () {
+            () if link => None,
+            () if flags & O_PATH != 0 => tasks::stat(c, p, &task, path.entry, false).ok(),
+            () => Some(tasks::stat(c, p, &task, path.entry, false)?),
+        }
+        .map(|(stat, ..)| stat);
+        if flags & O_PATH == 0
+            && let Some(stat) = file_stat.filter(|stat| stat.mode & 0o170000 == 0o100000)
+        {
+            crate::permissions::permission(&c.process.credentials, &stat, open_mask(flags))?;
+        }
         // `O_PATH` does not open a file, so it skips the check that an open
         // of `environ` or `maps` makes; a link is checked as it is followed.
-        if flags & O_PATH == 0 || tasks::link(&task, path.entry).is_some() {
+        if flags & O_PATH == 0 || link {
             tasks::check(c, &task, path.entry)?;
         }
         // A link of `ns` leads to its namespace's file, which it opens as
@@ -6440,6 +6455,9 @@ fn open_path(
         if let crate::proc::TaskEntry::Maps(smaps) = path.entry {
             return Ok((tasks::maps(&task, smaps, flags, c.files.root()), p.to_vec()));
         }
+        if path.entry == crate::proc::TaskEntry::Pagemap {
+            return Ok((tasks::pagemap(&task, flags)?, p.to_vec()));
+        }
         // A link of `fd` opens its descriptor's file again, as this
         // process's own does.
         if let crate::proc::TaskEntry::Descriptor(n) = path.entry {
@@ -6461,13 +6479,21 @@ fn open_path(
                 .collect();
             let holder = tasks::holder(&task).ok_or(Errno::ENOENT)?;
             let content = fdinfo(c, &holder, &d, &others);
+            let file = crate::proc::GeneratedFile::open(content, flags);
             return Ok((
-                Arc::new(crate::proc::GeneratedFile::open(content, flags)),
+                Arc::new(match file_stat {
+                    Some(stat) => file.with_stat(stat),
+                    None => file,
+                }),
                 p.to_vec(),
             ));
         }
         if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
-            Arc::new(crate::proc::GeneratedFile::open(content, flags))
+            let file = crate::proc::GeneratedFile::open(content, flags);
+            Arc::new(match file_stat {
+                Some(stat) => file.with_stat(stat),
+                None => file,
+            })
         } else if let Some(target) = tasks::link(&task, path.entry) {
             // `exe`, `cwd` and `thread-self` are links, which O_NOFOLLOW
             // does not follow; `thread-self`'s is relative to /proc.
@@ -7456,12 +7482,16 @@ fn own_open_check(c: &Context<'_>, p: &[u8], flags: u32) -> Result<(), Errno> {
     if stat.mode & 0o170000 != 0o100000 {
         return Ok(());
     }
-    let mask = match flags & 3 {
+    crate::permissions::permission(&c.process.credentials, &stat, open_mask(flags))
+}
+/// What an open with `flags` asks of a file's mode: to read, to write, or
+/// both.
+fn open_mask(flags: u32) -> u32 {
+    match flags & 3 {
         0 => crate::permissions::MAY_READ,
         1 => crate::permissions::MAY_WRITE,
         _ => crate::permissions::MAY_READ | crate::permissions::MAY_WRITE,
-    };
-    crate::permissions::permission(&c.process.credentials, &stat, mask)
+    }
 }
 /// [`generated_stat`] of a path outside `/dev`.
 fn other_generated_stat(
@@ -7542,11 +7572,14 @@ fn other_generated_stat(
             crate::proc::stat(0)
         }
         crate::proc::OwnEntry::Status => crate::proc::stat(status(c).len()),
-        crate::proc::OwnEntry::Stat
-        | crate::proc::OwnEntry::Cmdline
-        | crate::proc::OwnEntry::Comm => {
+        crate::proc::OwnEntry::Stat | crate::proc::OwnEntry::Cmdline => {
             crate::proc::stat(own_file(c, entry).map_or(0, |content| content.len()))
         }
+        // 0644, which its owner may open for writing, as Linux's.
+        crate::proc::OwnEntry::Comm => FileStat {
+            mode: 0o100_644,
+            ..crate::proc::stat(own_file(c, entry).map_or(0, |content| content.len()))
+        },
         crate::proc::OwnEntry::Environ => {
             crate::proc::private_stat(own_file(c, entry).map_or(0, |content| content.len()))
         }

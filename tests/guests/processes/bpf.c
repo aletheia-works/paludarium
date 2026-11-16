@@ -6,7 +6,8 @@
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
-   ENOMEM of a map larger than any machine, as Linux 7.0 counts it.
+   ENOMEM of a map larger than any machine, as the CI machines' kernel
+   (Ubuntu's Linux 7.0) counts it.
 
    A hash's keys come in an order of its buckets, which a random seed
    picks: they are given sorted. The IDs themselves, which other maps on

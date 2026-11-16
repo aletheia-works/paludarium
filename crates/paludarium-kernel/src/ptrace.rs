@@ -32,6 +32,11 @@ const PTRACE_GETFPREGS: i64 = 14;
 const PTRACE_SETFPREGS: i64 = 15;
 const PTRACE_ATTACH: i64 = 16;
 const PTRACE_DETACH: i64 = 17;
+const PTRACE_SINGLESTEP: i64 = 9;
+/// x86's `PTRACE_SYSEMU_SINGLESTEP`.
+const PTRACE_SYSEMU_SINGLESTEP: i64 = 32;
+/// `si_code` of a single-step trap after a system call (`TRAP_BRKPT`).
+const TRAP_BRKPT: i32 = 1;
 const PTRACE_SYSCALL: i64 = 24;
 /// x86's `PTRACE_ARCH_PRCTL`.
 const PTRACE_ARCH_PRCTL: i64 = 30;
@@ -206,6 +211,9 @@ pub(crate) struct Local {
     /// A traced thread's `execve` that has replaced the program, by the
     /// thread's ID before it: the event the next checkpoint reports.
     exec: Option<u32>,
+    /// `TIF_FORCED_TF`: the trap flag is set because the tracer
+    /// single-steps the thread, not because the thread set it.
+    pub(crate) forced_tf: bool,
 }
 
 /// The `clone` of a traced thread: its flags, the new task once it is
@@ -226,6 +234,10 @@ enum Mode {
     Cont,
     Syscall,
     Sysemu,
+    /// `PTRACE_SINGLESTEP` (`TIF_SINGLESTEP`), and `PTRACE_SYSEMU_SINGLESTEP`
+    /// with the syscall-entry stops of `PTRACE_SYSEMU`.
+    Step,
+    SysemuStep,
 }
 impl Clone for Local {
     fn clone(&self) -> Self {
@@ -274,6 +286,8 @@ struct Stop {
     /// again.
     listening: bool,
     group_stopped: bool,
+    /// The thread's `TIF_FORCED_TF`, which a tracer's requests change.
+    forced_tf: bool,
 }
 
 /// One traced task, which its process's thread group counts while it is
@@ -572,7 +586,12 @@ fn regs(stop: &Stop) -> [u64; 27] {
     out[ORIG_RAX as usize] = stop.orig_rax;
     out[RIP as usize] = cpu.rip.0;
     out[CS as usize] = 0x33;
-    out[EFLAGS as usize] = cpu.rflags;
+    // A trap flag the tracer set is not shown (`get_flags`).
+    out[EFLAGS as usize] = if stop.forced_tf {
+        cpu.rflags & !flag::TF
+    } else {
+        cpu.rflags
+    };
     out[RSP as usize] = cpu.gpr[reg::RSP];
     out[SS as usize] = 0x2b;
     out[FS_BASE as usize] = cpu.fs_base;
@@ -592,7 +611,18 @@ fn putreg(stop: &mut Stop, index: u64, value: u64) -> Result<(), Errno> {
         ORIG_RAX => stop.orig_rax = value,
         RIP => cpu.rip = GuestAddr(value),
         RSP => cpu.gpr[reg::RSP] = value,
-        EFLAGS => cpu.rflags = (cpu.rflags & !FLAG_MASK) | (value & FLAG_MASK),
+        EFLAGS => {
+            // `set_flags`: a trap flag written is the thread's own; one the
+            // tracer set stays while it steps.
+            let mut value = value;
+            if value & flag::TF != 0 {
+                stop.forced_tf = false;
+            } else if stop.forced_tf {
+                value |= flag::TF;
+            }
+            let cpu = &mut stop.cpu;
+            cpu.rflags = (cpu.rflags & !FLAG_MASK) | (value & FLAG_MASK);
+        }
         CS | SS | DS | ES | FS | GS => {
             let selector = value as u16;
             if selector != 0 && selector & 3 != 3 || matches!(index, CS | SS) && selector == 0 {
@@ -719,6 +749,7 @@ impl Kernel {
                 rseq: thread.state.rseq,
                 listening: false,
                 group_stopped: self.group.is_stopped(),
+                forced_tf: thread.state.ptrace.forced_tf,
             });
             tracee.tracer_pid
         };
@@ -811,6 +842,7 @@ impl Kernel {
     fn take_registers(thread: &mut Thread, stop: &Stop, shown: Option<u64>, restart: &mut Restart) {
         let before = thread.state.ptrace.orig_rax;
         thread.cpu = stop.cpu.clone();
+        thread.state.ptrace.forced_tf = stop.forced_tf;
         // PTRACE_SETSIGMASK: the mask, and no other to put back.
         if let Some(mask) = stop.new_mask {
             thread.state.signal_mask = mask;
@@ -969,7 +1001,7 @@ impl Kernel {
         let Some((mode, options, _)) = self.processes.traces.settings(thread.tid) else {
             return true;
         };
-        if mode == Mode::Cont {
+        if matches!(mode, Mode::Cont | Mode::Step) {
             return true;
         }
         thread.cpu.gpr[reg::RAX] = Errno::ENOSYS.to_syscall_return();
@@ -980,7 +1012,7 @@ impl Kernel {
             &mut Restart::default(),
         );
         self.syscall_signal(signal);
-        if self.fatal_pending(thread) || mode == Mode::Sysemu {
+        if self.fatal_pending(thread) || matches!(mode, Mode::Sysemu | Mode::SysemuStep) {
             return false;
         }
         let number = thread.state.ptrace.orig_rax;
@@ -995,8 +1027,25 @@ impl Kernel {
     /// `PTRACE_SYSCALL` (`syscall_exit_work`); `rax` has what the call
     /// returned, or the code of its restart.
     fn ptrace_syscall_exit(&mut self, thread: &mut Thread, restart: &mut Restart) {
-        let Some((Mode::Syscall, options, _)) = self.processes.traces.settings(thread.tid) else {
-            return;
+        let options = match self.processes.traces.settings(thread.tid) {
+            Some((Mode::Syscall, options, _)) => options,
+            // Single-stepped over the call: the trap its instruction would
+            // have given comes now (`user_single_step_report`, SIGTRAP with
+            // TRAP_BRKPT at the address after it).
+            Some((Mode::Step, _, _)) => {
+                signals::queue(
+                    &mut thread.state,
+                    signals::PendingSignal {
+                        target: signals::PendingTarget::Thread,
+                        addr: thread.cpu.rip.0,
+                        trap: 1,
+                        synchronous: true,
+                        ..signals::PendingSignal::thread(SIGTRAP, TRAP_BRKPT)
+                    },
+                );
+                return;
+            }
+            _ => return,
         };
         let signal = self.ptrace_report(
             thread,
@@ -1005,6 +1054,20 @@ impl Kernel {
             restart,
         );
         self.syscall_signal(signal);
+    }
+
+    /// A single-stepped thread has entered a signal handler: it stops with
+    /// SIGTRAP before the handler's first instruction, as Linux's
+    /// `signal_delivered` reports it (`ptrace_notify`).
+    pub(crate) fn ptrace_handler_entered(&mut self, thread: &mut Thread, restart: &mut Restart) {
+        if !self.group.traced() {
+            return;
+        }
+        if let Some((Mode::Step | Mode::SysemuStep, _, _)) =
+            self.processes.traces.settings(thread.tid)
+        {
+            self.ptrace_report(thread, SIGTRAP, 0, restart);
+        }
     }
 
     /// A traced thread enters `clone` (56), `fork` (57) or `vfork` (58),
@@ -1059,6 +1122,11 @@ impl Kernel {
             .lock()
             .get(&thread.tid)
             .map(|t| (t.tracer, t.tracer_pid, t.seized, t.options));
+        // `copy_process`'s `user_disable_single_step`: the new task does
+        // not keep a trap flag its maker's tracer set.
+        if thread.state.ptrace.forced_tf {
+            child_thread.cpu.rflags &= !flag::TF;
+        }
         if let Some((tracer, tracer_pid, seized, options)) = parent {
             let event = event.filter(|&e| options & (1 << e) != 0);
             if event.is_some() || flags & CLONE_PTRACE != 0 {
@@ -1618,11 +1686,17 @@ impl Kernel {
                     Ok(0)
                 })
             }
-            PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SYSEMU => {
+            PTRACE_CONT
+            | PTRACE_SYSCALL
+            | PTRACE_SYSEMU
+            | PTRACE_SINGLESTEP
+            | PTRACE_SYSEMU_SINGLESTEP => {
                 let signal = valid_signal(data)?;
                 let mode = match request {
                     PTRACE_SYSCALL => Mode::Syscall,
                     PTRACE_SYSEMU => Mode::Sysemu,
+                    PTRACE_SINGLESTEP => Mode::Step,
+                    PTRACE_SYSEMU_SINGLESTEP => Mode::SysemuStep,
                     _ => Mode::Cont,
                 };
                 {
@@ -1631,6 +1705,17 @@ impl Kernel {
                     let stop = tracee.stop.as_mut().ok_or(esrch)?;
                     stop.resumed = Some(signal);
                     tracee.mode = mode;
+                    // `user_enable_single_step` sets the trap flag unless the
+                    // thread has it; `user_disable_single_step` takes back
+                    // only one it set.
+                    if matches!(mode, Mode::Step | Mode::SysemuStep) {
+                        if stop.cpu.rflags & flag::TF == 0 {
+                            stop.cpu.rflags |= flag::TF;
+                            stop.forced_tf = true;
+                        }
+                    } else if std::mem::take(&mut stop.forced_tf) {
+                        stop.cpu.rflags &= !flag::TF;
+                    }
                 }
                 self.processes.changed().notify();
                 Ok(0)
@@ -1770,6 +1855,13 @@ impl Kernel {
             }
             PTRACE_DETACH => {
                 let signal = valid_signal(data)?;
+                // `ptrace_detach`'s `user_disable_single_step`.
+                let _ = traces.stopped(tid, |stop| {
+                    if std::mem::take(&mut stop.forced_tf) {
+                        stop.cpu.rflags &= !flag::TF;
+                    }
+                    Ok(())
+                });
                 self.processes.untrace(tid, Some(signal));
                 Ok(0)
             }
@@ -2128,6 +2220,7 @@ mod tests {
             rseq: None,
             listening: false,
             group_stopped: false,
+            forced_tf: false,
         }
     }
 

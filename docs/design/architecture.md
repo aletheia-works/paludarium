@@ -69,16 +69,21 @@ The code generation is a counter of the address space. It moves on when the
 mappings change (`mmap`, `munmap`, `mprotect`, `mremap`, `brk`, `shmat`,
 `shmdt`), when `madvise` with `MADV_DONTNEED` discards private pages, when any
 process or the kernel stores to a shared mapping or page cache the space may run
-code from, and when the space stores to an executable page that an instruction
-has been fetched from. Each page remembers whether an instruction was fetched
-from it. The mark is never cleared, and the copy that copy-on-write or `fork`
-makes of a page keeps it. A store to an executable page that nothing was fetched
-from leaves the generation, so it makes no decoded instruction stale: SBCL's
-heap is readable, writable and executable, and before this every store to it
-made the interpreter decode everything again. The first fetch from a page sets
-the mark under the address space's lock, after moving the TLB epoch on, which
-waits for the stores under way without the lock. Either a store sees the mark
-and moves the generation on after its bytes, or the fetch sees the bytes.
+code from, when the space stores to an executable page that an instruction has
+been fetched from, and when pages change under it otherwise: a stack grows down,
+`MADV_GUARD_INSTALL` puts guards on pages, `UFFDIO_MOVE` moves pages, a private
+copy of a page that a truncation left past the end of its file shows the file
+again, or `fork` leaves out of the child the areas advised `MADV_DONTFORK` or
+`MADV_WIPEONFORK` and the pages that a fault fills again. Each page remembers
+whether an instruction was fetched from it. The mark is never cleared, and the
+copy that copy-on-write or `fork` makes of a page keeps it. A store to an
+executable page that nothing was fetched from leaves the generation, so it makes
+no decoded instruction stale: SBCL's heap is readable, writable and executable,
+and before this every store to it made the interpreter decode everything again.
+The first fetch from a page sets the mark under the address space's lock, after
+moving the TLB epoch on, which waits for the stores under way without the lock.
+Either a store sees the mark and moves the generation on after its bytes, or the
+fetch sees the bytes.
 
 A block starts with its first instruction and grows as it runs. An instruction
 that runs right after the last one of a block is decoded on its own, as it would
@@ -109,7 +114,10 @@ out:
 - `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`;
 - `setcc` and `cmovcc`;
 - `mul` and `imul` of a register into rdx:rax, and `imul` of two registers or of
-  a register and an immediate.
+  a register and an immediate;
+- `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
+  registers and memory, `pxor` and `xorps` of xmm registers, and `movd` and
+  `movq` between xmm registers and general ones.
 
 A register in these forms may also be one of the high-byte registers `ah`, `ch`,
 `dh` and `bh`.
@@ -136,13 +144,14 @@ and executable at once. Until the code is ready, and when compiling fails,
 the interpreter runs the block as before.
 
 Compiled code means exactly what the interpreter's forms mean. It works on a
-copy of the registers, reads and writes them in memory, and reaches guest
-memory only through the MMU's own loads and stores, with their checks. It
-stops before an instruction whose load or store fails, having changed nothing
-for it, so that the interpreter runs it again and reports the fault, and
-after a load or store that moved the code generation on. A taken branch,
-`jmp`, `call` and `ret` end it. It returns how many instructions ran, and the
-interpreter goes on from the next one.
+copy of the registers, reads and writes them in memory (the xmm registers too,
+copied only for a block that uses them), and reaches guest memory only through
+the MMU's own loads and stores, with their checks. It stops before an
+instruction whose load or store fails, having changed nothing for it, so that
+the interpreter runs it again and reports the fault, and after a load or store
+that moved the code generation on. A taken branch, `jmp`, `call` and `ret` end
+it. It returns how many instructions ran, and the interpreter goes on from the
+next one.
 
 When the code generation moves on, the interpreter decodes every block again,
 mostly to the same forms. The JIT keeps the code it compiled by its forms (up

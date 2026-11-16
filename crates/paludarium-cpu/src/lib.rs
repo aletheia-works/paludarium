@@ -678,7 +678,7 @@ fn execute_decoded(
                 snapshot.restore(state);
             }
             state.mxcsr = mxcsr;
-        } else if stop != Stop::Syscall
+        } else if !matches!(stop, Stop::Syscall | Stop::Breakpoint | Stop::TrapFlagSet)
             && let Some(snapshot) = snapshot
         {
             snapshot.restore(state);
@@ -697,6 +697,9 @@ fn execute_decoded(
         Stop::FloatingPointFault(code) => ExitReason::FloatingPointFault { rip, code },
         Stop::MathFault(code) => ExitReason::MathFault { rip, code },
         Stop::Syscall => ExitReason::Syscall { rip: state.rip },
+        Stop::Breakpoint => ExitReason::Breakpoint { rip: state.rip },
+        // The run ends early; the caller steps on from here.
+        Stop::TrapFlagSet => ExitReason::BudgetExhausted { rip: state.rip },
     })
 }
 
@@ -725,6 +728,25 @@ pub fn step_cached(
         &code.decoded[block.start],
         &code.instructions[block.start],
     )
+}
+
+/// Runs the one instruction at `state.rip` single-stepped, as the CPU does
+/// while the trap flag is set: a trap (#DB) follows it, unless it stopped
+/// otherwise. `syscall` takes none, as the flag is masked off on entry
+/// (`IA32_FMASK`) and Linux returns with `iret`, which traps only after
+/// the next instruction. Callers run this in place of [`run_cached`] and
+/// its accelerated forms while `rflags` has `TF`.
+pub fn step_traced(
+    state: &mut CpuState,
+    mem: &AddressSpace,
+    cache: &mut DecodeCache,
+) -> ExitReason {
+    match step_cached(state, mem, cache) {
+        Ok(()) | Err(ExitReason::BudgetExhausted { .. }) => {
+            ExitReason::SingleStep { rip: state.rip }
+        }
+        Err(reason) => reason,
+    }
 }
 
 /// Appends to `code` the first instruction of the block at `state.rip`:

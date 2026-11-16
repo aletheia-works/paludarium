@@ -152,6 +152,7 @@ impl fmt::Display for Errno {
 /// Linux signal numbers used by the core emulator.
 pub mod signal {
     pub const SIGILL: i32 = 4;
+    pub const SIGTRAP: i32 = 5;
     pub const SIGBUS: i32 = 7;
     pub const SIGFPE: i32 = 8;
     pub const SIGKILL: i32 = 9;
@@ -260,6 +261,11 @@ pub enum ExitReason {
     MathFault { rip: GuestAddr, code: u8 },
     /// The instruction budget was used up; the loop may resume.
     BudgetExhausted { rip: GuestAddr },
+    /// The single-step trap (#DB) after an instruction run with the trap
+    /// flag set; `rip` points past it (SIGTRAP, `TRAP_TRACE`).
+    SingleStep { rip: GuestAddr },
+    /// `int3` (#BP, a trap); `rip` points past it (SIGTRAP, `SI_KERNEL`).
+    Breakpoint { rip: GuestAddr },
 }
 
 impl ExitReason {
@@ -276,7 +282,9 @@ impl ExitReason {
             | ExitReason::ArithmeticFault { rip }
             | ExitReason::FloatingPointFault { rip, .. }
             | ExitReason::MathFault { rip, .. }
-            | ExitReason::BudgetExhausted { rip } => rip,
+            | ExitReason::BudgetExhausted { rip }
+            | ExitReason::SingleStep { rip }
+            | ExitReason::Breakpoint { rip } => rip,
         }
     }
 }

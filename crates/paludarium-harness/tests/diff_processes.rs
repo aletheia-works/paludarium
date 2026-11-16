@@ -148,9 +148,9 @@ mod linux {
             // user namespace with its capabilities (Ubuntu's AppArmor gives none
             // to one an unprivileged user makes) before it becomes one,
             // the personality-layout case, which maps page 0, the
-            // proc-other-maps, proc-other-fds and proc-other-limits cases,
-            // which read a process's maps, descriptors and auxv as another
-            // user, and the pagemap and proc-owners cases, which become an
+            // proc-other-maps, proc-other-fds, proc-other-limits and
+            // proc-other-pagemap cases, which read a process's maps,
+            // descriptors, auxv and pagemap as other users, and the pagemap and proc-owners cases, which become an
             // unprivileged user, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
@@ -170,6 +170,7 @@ mod linux {
                     | "proc-other-maps"
                     | "proc-other-fds"
                     | "proc-other-limits"
+                    | "proc-other-pagemap"
                     | "dynamic-exec"
                     | "pty-vhangup"
                     | "pid-namespace"
@@ -212,6 +213,7 @@ mod linux {
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
+                    | "perf-prctl"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -357,6 +359,7 @@ mod linux {
                     | "cpu-timer-others"
                     | "perf-counts"
                     | "perf-exec"
+                    | "perf-prctl"
             ) {
                 host.measure_cpu_time();
             }
@@ -501,6 +504,7 @@ mod linux {
         perf_calls => ("perf-calls","perf"),
         perf_counts => ("perf-counts","perf"),
         perf_exec => ("perf-exec","perf"),
+        perf_prctl => ("perf-prctl","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -576,6 +580,11 @@ mod linux {
         ptrace_arch_rseq => ("ptrace-arch-rseq","ptrace-requests"),
         ptrace_syscall_signal => ("ptrace-syscall-signal","ptrace-requests"),
         ptrace_exit_core => ("ptrace-exit-core","ptrace-requests"),
+        trap_flag => ("trap-flag","single-step"),
+        trap_flag_syscall => ("trap-flag-syscall","single-step"),
+        trap_flag_signal => ("trap-flag-signal","single-step"),
+        int3 => ("int3","single-step"),
+        ptrace_singlestep => ("ptrace-singlestep","single-step"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),
@@ -731,6 +740,7 @@ mod linux {
         processes_proc_other_maps => ("proc-other-maps","process"),
         processes_proc_other_fds => ("proc-other-fds","process"),
         processes_proc_other_limits => ("proc-other-limits","process"),
+        processes_proc_other_pagemap => ("proc-other-pagemap","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),

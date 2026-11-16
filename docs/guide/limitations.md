@@ -62,9 +62,11 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
   `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
-- **`/proc/self/pagemap`, in part**: it is there for the reader itself
-  only (`/proc/self` and its own PID), not in `/proc/thread-self`,
-  `task/<tid>` or another process's directory. Its entries come from the
+- **Writing `comm`**: a write to `/proc/<pid>/comm` or
+  `/proc/<pid>/task/<tid>/comm` is `EINVAL`, where Linux renames the thread
+  when the writer is of its process (musl's `pthread_setname_np` of another
+  thread writes there; `prctl(PR_SET_NAME)` works).
+- **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do: a page that a `fork`
   shared is not exclusive (bit 56) until this process writes it, even
   after the other has let it go, and a page of shared memory or of a file
@@ -225,15 +227,19 @@ verified.
   and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
   disables the event at its task's `execve` and leaves it to be read, where
   Linux takes it out of the task's context, and the members of a group it
-  led count on their own. The events that wait for an `execve` are kept in
-  one list for every emulated machine, matched by thread group and thread,
-  and dropped as they close. A group's members count whatever software
+  led count on their own. The events that wait for an `execve`, and those
+  each thread opened, are kept per emulated machine, matched by thread
+  group and thread, and dropped as they close. A thread that ends without
+  an `execve` keeps the events it opened, where Linux takes them from it,
+  so a later thread of the same number in that group, once the numbers
+  have gone round, would find them. A group's members count whatever software
   clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
   group no count on the x86-64 machines the tests run on (why was not found).
-  The SIMD register
-  fields of Linux master's structure are not checked, and any use of them is
-  `EOPNOTSUPP`. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's
-  and Ubuntu's kernels default to more), and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
+  The SIMD register fields of Linux master's 176-byte structure are checked
+  as master checks them and not compared with Linux: the test machines'
+  Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
+  0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
+  Ubuntu's kernels default to more).
 - **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
   links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
@@ -251,13 +257,23 @@ verified.
   its keys in the order of their bytes, where Linux's order follows its
   buckets and a random seed, and a batch of it takes each element as a
   bucket of its own, so `in_batch` and `out_batch` count elements. A map's
-  memory follows the sizes of Linux 7.0's structures, not Linux master's,
-  whose hash elements are smaller, and the elements are not taken from
+  memory follows the structure sizes of the test machines' kernel,
+  Ubuntu's Linux 7.0, not upstream Linux's: its `struct bpf_map` carries
+  the `u32 excl` that Ubuntu took from Linux 7.2 (0fb6c9ed6493, removed in
+  7.3), so an array's header is 312 bytes where upstream v7.0's is 304.
+  Linux master's array header is 312 bytes too, through another field,
+  but its hash header (832 bytes) and elements are smaller than the 896
+  and 48 bytes here. The elements are not taken from
   the machine until they are written: no memory cgroup is charged, and
   only a map larger than the machine's 4 GiB is `ENOMEM`, where Linux may
   also run out of the memory it really has. A preallocated hash counts a
   spare element for each CPU of the host, where Linux counts the possible
-  CPUs, which may be more. Map IDs are the emulated machine's, so they
+  CPUs, which may be more. The checks follow Linux master where the test
+  machines' Linux 7.0 differs: a hash whose key and value take 4 MiB less
+  64 bytes or more is `E2BIG` (7.0 takes up to 4 MiB less 48), and
+  `BPF_F_RDONLY` with `BPF_F_WRONLY` is refused once the map is made (7.0
+  refuses it before the NUMA node and the type, so another error may come
+  first here). Map IDs are the emulated machine's, so they
   start at 1 and do not see the host's maps. `BPF_F_MMAPABLE` is taken but `mmap` of a map
   is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
@@ -457,9 +473,7 @@ verified.
     value's length as its size, where Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
-  - `ptrace` has no single-stepping yet: `PTRACE_SINGLESTEP`,
-    `PTRACE_SYSEMU_SINGLESTEP` and the other requests the features do not
-    list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
+  - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
     checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU

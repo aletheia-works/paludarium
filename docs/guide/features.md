@@ -3660,7 +3660,10 @@ kernel.
   `copy_file_range`) waits for the answers the same way, after the checks
   of the descriptor, the buffer, the size and the position, as
   `rw_verify_area` asks it; `readv` and `preadv` of no bytes ask nothing,
-  as `vfs_readv`, where `read` and `pread64` of none ask too. `statfs`'s `f_fsid` is the file system ID the events give: the
+  as `vfs_readv`, where `read` and `pread64` of none ask too. An AIO read
+  (`IOCB_CMD_PREAD`, `IOCB_CMD_PREADV`) asks at `io_submit`, as `aio_read`
+  calls `rw_verify_area` there, for no bytes too: a denied one fails that
+  request as `io_submit` fails any (`EPERM` when it is the first). `statfs`'s `f_fsid` is the file system ID the events give: the
   device of the kernel's own file systems, /proc, devpts and mqueue, as
   `simple_statfs` gives it, and a number drawn for each other file system,
   as tmpfs draws a UUID.

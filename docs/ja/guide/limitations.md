@@ -619,9 +619,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベントで送るのは、`open`、`openat`、`openat2`、`creat`、
   `open_by_handle_at` での（`/proc/self/fd` のリンクからも）オープンの `FAN_OPEN_PERM` と、
-  `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range` での
-  読み出しの `FAN_ACCESS_PERM` だけです。`FAN_OPEN_EXEC_PERM`、
-  exec の `FAN_OPEN_PERM`、exec・AIO・`io_uring` の読み出しの `FAN_ACCESS_PERM` は
+  `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range`、
+  AIO の要求での読み出しの `FAN_ACCESS_PERM` だけです（ここの `io_uring` には読み出しの
+  操作がありません）。`FAN_OPEN_EXEC_PERM`、exec の `FAN_OPEN_PERM`、exec の読み出しの
+  `FAN_ACCESS_PERM` は
   `fanotify_mark` で受け付けますが送らないので、求めるはずだったことはそのまま通ります。
   `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント

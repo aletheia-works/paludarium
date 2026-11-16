@@ -27,6 +27,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FAN_ACCESS 0x1
@@ -976,6 +977,77 @@ static int case_access_perm(void) {
     return 0;
 }
 
+/* An AIO request's layout (`struct iocb`) and its completion. */
+struct aio_request {
+    uint64_t data;
+    uint32_t key, rw_flags;
+    uint16_t opcode;
+    int16_t reqprio;
+    uint32_t fildes;
+    uint64_t buf, nbytes;
+    int64_t offset;
+    uint64_t reserved2;
+    uint32_t flags, resfd;
+};
+struct aio_completion {
+    uint64_t data, obj;
+    int64_t res, res2;
+};
+
+/* FAN_ACCESS_PERM of an AIO read: io_submit asks it at submission, as
+   aio_read's rw_verify_area does, and waits for the answer before the read;
+   a denied one fails io_submit (EPERM), one let through completes. The
+   child's results come back through a pipe. */
+static int case_aio_perm(void) {
+    make_base("aio");
+    int file = open(at("f"), O_WRONLY | O_CREAT, 0644);
+    if (file < 0 || write(file, "data", 4) != 4) return 80;
+    close(file);
+    int fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    if (fan < 0) return 81;
+    printf("mark=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD, at("f")));
+    int results[2];
+    if (pipe(results)) return 82;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(fan);
+        close(results[0]);
+        long out[4] = {0};
+        unsigned long ctx = 0;
+        char c[4];
+        int fd = open(at("f"), O_RDONLY);
+        if (syscall(SYS_io_setup, 4, &ctx) != 0) _exit(1);
+        struct aio_request req = {.opcode = 0 /* IOCB_CMD_PREAD */, .fildes = (uint32_t)fd,
+                                  .buf = (uint64_t)(uintptr_t)c, .nbytes = 4};
+        struct aio_request *list[] = {&req};
+        out[0] = e(syscall(SYS_io_submit, ctx, 1, list));
+        out[1] = e(syscall(SYS_io_submit, ctx, 1, list));
+        struct aio_completion done;
+        struct timespec wait = {5, 0};
+        out[2] = e(syscall(SYS_io_getevents, ctx, 1, 1, &done, &wait));
+        out[3] = out[2] == 1 ? done.res : -1000;
+        if (write(results[1], out, sizeof out) != (ssize_t)sizeof out) _exit(1);
+        _exit(0);
+    }
+    close(results[1]);
+    int fd = read_perm("aio read", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    fd = read_perm("aio read again", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    long out[4] = {0};
+    long n = read(results[0], out, sizeof out);
+    printf("child=%d results=%ld\n", child_result(child), n);
+    printf("denied submit=%ld allowed submit=%ld events=%ld res=%ld\n", out[0], out[1], out[2], out[3]);
+    struct pollfd p = {fan, POLLIN, 0};
+    printf("more=%d\n", poll(&p, 1, 0));
+    close(fan);
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -988,6 +1060,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
     if (!strcmp(mode, "fanotify-mounts")) return case_mounts();
     if (!strcmp(mode, "fanotify-open-exec")) return case_open_exec(argc > 2 ? argv[2] : "");
+    if (!strcmp(mode, "fanotify-aio-perm")) return case_aio_perm();
     if (!strcmp(mode, "fanotify-noop")) return 0;
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
     if (!strcmp(mode, "fanotify-access-perm")) return case_access_perm();

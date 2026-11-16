@@ -724,11 +724,11 @@ verified.
 - **fanotify, in part**: of the permission events, only `FAN_OPEN_PERM` of
   an open by `open`, `openat`, `openat2`, `creat` or `open_by_handle_at`
   (a link in `/proc/self/fd` too), and `FAN_ACCESS_PERM` of a read by
-  `read`, `pread64`, `readv`, `preadv`, `preadv2`, `sendfile`, `splice` or
-  `copy_file_range`, are sent; `FAN_OPEN_EXEC_PERM`, exec's `FAN_OPEN_PERM`
-  and the `FAN_ACCESS_PERM` of exec's and AIO's and `io_uring`'s reads are
-  taken by `fanotify_mark` but never sent, so what they would ask is let
-  through.
+  `read`, `pread64`, `readv`, `preadv`, `preadv2`, `sendfile`, `splice`,
+  `copy_file_range` or an AIO request, are sent (`io_uring` has no read
+  operation here); `FAN_OPEN_EXEC_PERM`, exec's `FAN_OPEN_PERM` and the
+  `FAN_ACCESS_PERM` of exec's reads are taken by `fanotify_mark` but never
+  sent, so what they would ask is let through.
   `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
   and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
   never come. An evictable mark is never evicted. A group merges an event

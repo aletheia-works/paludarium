@@ -3169,7 +3169,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `readv`、`preadv`、`preadv2`、`sendfile`・`splice`・`copy_file_range` の入力）も、
   `rw_verify_area` と同じくディスクリプタ、バッファ、大きさ、位置の確認のあとに同じように
   答えを待ちます。`vfs_readv` と同じく、0 バイトの `readv` と `preadv` は何も尋ねず、
-  0 バイトの `read` と `pread64` は尋ねます。
+  0 バイトの `read` と `pread64` は尋ねます。AIO の読み出し（`IOCB_CMD_PREAD`、
+  `IOCB_CMD_PREADV`）は、`aio_read` が `rw_verify_area` を呼ぶのと同じく `io_submit` の
+  ときに、0 バイトでも尋ねます。拒まれたものは、`io_submit` がほかの失敗と同じく
+  その要求で失敗させます（最初のものなら `EPERM`）。
   `statfs` の `f_fsid` はイベントが示すファイルシステムの ID と同じです。カーネル自身の
   ファイルシステム、/proc、devpts、mqueue では `simple_statfs` と同じくデバイス番号、
   ほかのファイルシステムでは、tmpfs が UUID を引くように、ファイルシステムごとに引いた

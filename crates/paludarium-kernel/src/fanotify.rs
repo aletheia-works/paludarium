@@ -328,6 +328,9 @@ pub(crate) struct Registry {
     users: Mutex<HashMap<u32, (u64, u64)>>,
     /// What each file system's `f_fsid` is drawn from.
     salt: OnceLock<u64>,
+    /// The mounts freed since the marks were last looked at, whose marks
+    /// go then ([`Registry::unmounted`]).
+    released: Mutex<Vec<u64>>,
 }
 
 /// The machine's limits of `/proc/sys/fs/fanotify`.
@@ -817,11 +820,51 @@ impl Registry {
         self.marks.load(Ordering::SeqCst) != 0
     }
     fn groups(&self) -> Vec<Arc<Group>> {
+        self.purge();
+        self.live_groups()
+    }
+    fn live_groups(&self) -> Vec<Arc<Group>> {
         lock(&self.groups)
             .iter()
             .filter_map(Weak::upgrade)
             .map(Grouped::group)
             .collect()
+    }
+    /// The mount numbered `id` was freed, as Linux's
+    /// `fsnotify_vfsmount_delete` at its last `mntput`: the marks on it go,
+    /// so a mount that takes the number next is not marked. They go when
+    /// the marks are next looked at ([`Self::purge`]), as this runs where
+    /// the mount went, which may hold a group's queue.
+    pub(crate) fn unmounted(&self, id: u64) {
+        if self.active() {
+            lock(&self.released).push(id);
+        }
+    }
+    /// Takes off the marks of the mounts freed since the last look, as
+    /// `fsnotify_destroy_marks` does, giving them back to their users.
+    fn purge(&self) {
+        let released = std::mem::take(&mut *lock(&self.released));
+        if released.is_empty() {
+            return;
+        }
+        for group in self.live_groups() {
+            let removed = {
+                let mut queue = group.queue();
+                let before = queue.marks.len();
+                queue.marks.retain(
+                    |m| !matches!(m.target, Target::Mount(id, _) if released.contains(&id)),
+                );
+                (before - queue.marks.len()) as u64
+            };
+            if removed > 0 {
+                self.release(
+                    group.owner,
+                    removed,
+                    group.flags & UNLIMITED_MARKS == 0,
+                    false,
+                );
+            }
+        }
     }
     fn add_group(&self, user: u32) -> Result<(), Errno> {
         let mut users = lock(&self.users);
@@ -1438,6 +1481,7 @@ impl Group {
     /// has, as Linux's `fanotify_show_fdinfo`: the flags, then a line for
     /// each mark, the newest first; a mount's by its ID.
     pub(crate) fn fdinfo(&self) -> Vec<u8> {
+        self.fan().purge();
         let mut out = format!(
             "fanotify flags:{:x} event-flags:{:x}\n",
             self.flags & INIT_FLAGS,
@@ -1644,6 +1688,9 @@ fn mark(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let file = group_file(c, a[0])?;
     let group = of(&file).ok_or(Errno::EINVAL)?;
+    // A freed mount's marks go before any is added, so a mark on a mount
+    // that took its number stays.
+    group.fan().purge();
     if group.flags & REPORT_MNT != 0 {
         if mask & !MOUNT_EVENTS != 0 || mark_type != MARK_MNTNS {
             return Err(Errno::EINVAL);

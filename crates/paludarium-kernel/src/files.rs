@@ -166,6 +166,20 @@ impl Space {
         }
     }
 }
+/// Tells the machine's fanotify of each mount of `table`, and of every
+/// table copied from it, that is freed ([`crate::fanotify::Registry::unmounted`]),
+/// as Linux's `cleanup_mnt` calls `fsnotify_vfsmount_delete`.
+fn released_to_fanotify(
+    table: &paludarium_vfs::MountTable,
+    caches: &Arc<crate::page_cache::PageCaches>,
+) {
+    let fan = Arc::downgrade(&caches.notify.fan);
+    table.set_release_hook(Some(Arc::new(move |id| {
+        if let Some(fan) = fan.upgrade() {
+            fan.unmounted(id);
+        }
+    })));
+}
 impl Default for Files {
     fn default() -> Self {
         let fs = MemFs::new();
@@ -173,6 +187,7 @@ impl Default for Files {
         let caches = Arc::default();
         let lower: Arc<dyn FileSystem> = Arc::new(fs);
         let first_mounts = paludarium_vfs::MountTable::new(&*lower);
+        released_to_fanotify(&first_mounts, &caches);
         Self {
             readiness: Arc::default(),
             terminal_size: None,
@@ -444,6 +459,7 @@ impl Files {
     /// Its mounts are the first mount namespace's.
     pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
         self.first_mounts = paludarium_vfs::MountTable::new(&*fs);
+        released_to_fanotify(&self.first_mounts, &self.caches);
         *self.space.lock().unwrap_or_else(PoisonError::into_inner) =
             Space::new(fs, Arc::clone(&self.first_mounts), &self.caches);
         *self.root.lock().unwrap_or_else(PoisonError::into_inner) = None;

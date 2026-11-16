@@ -3554,7 +3554,11 @@ kernel.
   or flushes marks on a file, a mount or a file system (and takes a mount
   namespace's); a mount's mark, by the mount's ID, hears only of the paths
   in that mount, not of a bind mount of the same file system, and fdinfo
-  shows that ID. It makes its checks in its order: the flags and mask
+  shows that ID; it goes when its mount is freed (`fsnotify_vfsmount_delete`),
+  so a mount that takes the ID next is not marked. Exec's open of the
+  program and its interpreter is told as `FAN_OPEN` with `FAN_OPEN_EXEC`,
+  as `do_open_execat` opens them with `__FMODE_EXEC`; inotify hears it as
+  `IN_OPEN`. It makes its checks in its order: the flags and mask
   (`EINVAL`), the descriptor (`EBADF`, `EINVAL`), the group's class and
   modes, the path (`ENOENT`, `ENOTDIR`), the events the file system takes
   (`EINVAL` for permission events on /proc, and for mount and file system

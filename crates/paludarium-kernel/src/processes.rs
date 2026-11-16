@@ -4954,7 +4954,8 @@ fn program_capabilities(
     }
 }
 
-/// Tells inotify of exec's open of the file at `path` (`IN_OPEN`), and gives
+/// Tells inotify of exec's open of the file at `path` (`IN_OPEN`, fanotify's
+/// `FAN_OPEN` with `FAN_OPEN_EXEC`), and gives
 /// what tells it of the file's read and its close: none for a file that
 /// cannot be looked at, or when the open is not the guest's (`report`).
 fn exec_opened(
@@ -4968,13 +4969,12 @@ fn exec_opened(
     let path = crate::files::resolved(files, path)?;
     let node = files.fs().metadata(&path, false).ok()?;
     let device = files.fs().device(&path);
-    Some(crate::inotify::Closing::open(
+    Some(crate::inotify::Closing::exec(
         &files.caches,
         &files.fs(),
         &path,
         device,
         &node,
-        0,
     ))
 }
 /// Write access to the regular file `path` names denied (ETXTBSY while a

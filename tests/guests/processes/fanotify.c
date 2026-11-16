@@ -851,8 +851,55 @@ static int case_mounts(void) {
     printf("mark a by descriptor=%ld\n", fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_CLOSE_WRITE, dir, NULL));
     close(dir);
     show_mount_marks(fan, a, b);
+    /* An unmounted mount's marks go with it, and a new mount at b, which
+       may take its ID, is not marked. */
+    printf("umount b=%ld\n", e(umount2(at("b"), 0)));
+    show_mount_marks(fan, a, b);
+    printf("tmpfs at b=%ld\n", e(mount("none", at("b"), "tmpfs", 0, NULL)));
+    touch(at("b/g"));
+    show_fd_events("through the new b", fan, 0);
     close(fan);
     printf("umount=%ld %ld\n", e(umount2(at("b"), 0)), e(umount2(at("a"), 0)));
+    remove_base();
+    return 0;
+}
+
+/* FAN_OPEN_EXEC: exec's open of a program, a copy of this one under the
+   base, is told as FAN_OPEN with FAN_OPEN_EXEC, as do_open_execat opens it
+   with __FMODE_EXEC; a mark on FAN_OPEN_EXEC alone hears only that, and
+   an open of the program to read it is FAN_OPEN alone. */
+static int case_open_exec(const char *self) {
+    make_base("exec");
+    int from = open(self, O_RDONLY), to = open(at("prog"), O_WRONLY | O_CREAT, 0755);
+    if (from < 0 || to < 0) return 80;
+    char buf[65536];
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return 81;
+    close(from);
+    close(to);
+    int exec_only = fan_init(FAN_NONBLOCK, O_RDONLY);
+    int both = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (exec_only < 0 || both < 0) return 82;
+    printf("mark exec=%ld\n", fan_mark(exec_only, FAN_MARK_ADD, FAN_OPEN_EXEC, AT_FDCWD, at("prog")));
+    printf("mark both=%ld\n", fan_mark(both, FAN_MARK_ADD, FAN_OPEN | FAN_OPEN_EXEC, AT_FDCWD, at("prog")));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        execl(at("prog"), "prog", "fanotify-noop", (char *)NULL);
+        _exit(127);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("exec status=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    show_fd_events("exec, FAN_OPEN_EXEC", exec_only, child);
+    show_fd_events("exec, both", both, child);
+    int fd = open(at("prog"), O_RDONLY);
+    if (fd >= 0) close(fd);
+    show_fd_events("open, FAN_OPEN_EXEC", exec_only, 0);
+    show_fd_events("open, both", both, 0);
+    close(exec_only);
+    close(both);
     remove_base();
     return 0;
 }
@@ -928,6 +975,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-pidfd")) return case_pidfd();
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
     if (!strcmp(mode, "fanotify-mounts")) return case_mounts();
+    if (!strcmp(mode, "fanotify-open-exec")) return case_open_exec(argc > 2 ? argv[2] : "");
+    if (!strcmp(mode, "fanotify-noop")) return 0;
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
     if (!strcmp(mode, "fanotify-access-perm")) return case_access_perm();
     printf("unknown mode %s\n", mode);

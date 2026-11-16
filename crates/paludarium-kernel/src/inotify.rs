@@ -220,12 +220,28 @@ impl Closing {
         }
         let mut closing = Self::unopened(caches, fs, Arc::default(), device, node, 0);
         closing.file = Some(Arc::clone(file));
-        closing.tell(OPEN);
+        closing.tell(OPEN | crate::fanotify::OPEN_EXEC);
         Some(closing)
     }
     /// The device of the file's node.
     pub(crate) fn device(&self) -> u64 {
         self.device
+    }
+    /// [`open`](Self::open) of a program exec runs or its interpreter
+    /// (`do_open_execat`, `__FMODE_EXEC`): `fsnotify_open` adds
+    /// `FS_OPEN_EXEC` to its `IN_OPEN`, which fanotify hears as
+    /// `FAN_OPEN_EXEC` and inotify does not.
+    pub(crate) fn exec(
+        caches: &Arc<PageCaches>,
+        fs: &Arc<dyn FileSystem>,
+        path: &[u8],
+        device: u64,
+        node: &FileStat,
+    ) -> Self {
+        let place = caches.keep_place((device, node.inode), path);
+        let closing = Self::unopened(caches, fs, place, device, node, 0);
+        closing.tell(OPEN | crate::fanotify::OPEN_EXEC);
+        closing
     }
     fn open_at(
         caches: &Arc<PageCaches>,
@@ -1106,7 +1122,9 @@ impl Instance {
             return;
         }
         let oneshot = watch.mask & ONESHOT != 0;
-        // inotify never reported IN_ISDIR with these.
+        // `inotify_mask_to_arg`: none of fsnotify's other bits (fanotify's
+        // `FS_OPEN_EXEC`); and inotify never reported IN_ISDIR with these.
+        let mask = mask & (ALL_EVENTS | ISDIR | UNMOUNT | IGNORED | Q_OVERFLOW);
         let mask = if mask & (MOVE_SELF | DELETE_SELF) != 0 {
             mask & !ISDIR
         } else {

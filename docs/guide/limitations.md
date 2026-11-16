@@ -601,9 +601,7 @@ verified.
   is the mount of a descriptor's events for fanotify's mount marks
   (`FAN_MARK_MOUNT`); once that path no longer leads to the file's file
   system (renamed or replaced since), the event is the first mount's of
-  that file system. Such a mark stays after its mount is unmounted, where
-  Linux removes it, and then also hears of a new mount of the same file
-  system that takes the mount's free ID.
+  that file system.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the
@@ -706,7 +704,7 @@ verified.
   `copy_file_range`, are sent; `FAN_OPEN_EXEC_PERM`, exec's `FAN_OPEN_PERM`
   and the `FAN_ACCESS_PERM` of exec's and AIO's and `io_uring`'s reads are
   taken by `fanotify_mark` but never sent, so what they would ask is let
-  through, and exec's open is told as `FAN_OPEN` without `FAN_OPEN_EXEC`.
+  through.
   `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
   and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
   never come. An evictable mark is never evicted. A group merges an event

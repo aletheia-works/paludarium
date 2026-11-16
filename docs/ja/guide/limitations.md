@@ -518,8 +518,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   fanotify のマウントへのマーク（`FAN_MARK_MOUNT`）にとってのディスクリプタのイベントの
   マウントも同じです。そのパスがもうそのファイルのファイルシステムに届かない（その後に
   名前が変わった、置き換わった）とき、イベントはそのファイルシステムの最初のマウントの
-  ものになります。このマークはマウントを外したあとも残り、Linux はそこで消します。
-  そのため、空いたその ID を得た同じファイルシステムの新しいマウントのイベントも受けます。
+  ものになります。
 - **Landlock**：ABI バージョン 8 までです。記録のフラグは受け付けますが、何も記録しません。
   `LANDLOCK_RESTRICT_SELF_TSYNC` では、ほかのスレッドが自分の確認に新しいドメインを
   使うのは、次にカーネルに入るときからです。Linux は、すべてのスレッドが受け取るまで
@@ -605,8 +604,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range` での
   読み出しの `FAN_ACCESS_PERM` だけです。`FAN_OPEN_EXEC_PERM`、
   exec の `FAN_OPEN_PERM`、exec・AIO・`io_uring` の読み出しの `FAN_ACCESS_PERM` は
-  `fanotify_mark` で受け付けますが送らないので、求めるはずだったことはそのまま通ります。exec のオープンは
-  `FAN_OPEN_EXEC` なしの `FAN_OPEN` として伝えます。
+  `fanotify_mark` で受け付けますが送らないので、求めるはずだったことはそのまま通ります。
   `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント
   （`FAN_MNT_ATTACH`、`FAN_MNT_DETACH`）と `FAN_FS_ERROR` は来ません。追い出せるマークも

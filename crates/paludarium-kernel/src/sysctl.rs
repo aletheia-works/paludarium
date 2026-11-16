@@ -233,13 +233,14 @@ impl Machine {
         if !admin {
             return Err(Errno::EPERM);
         }
-        let locked = self.unprivileged_bpf_disabled() == 1;
         let (value, consumed) = parse(buf, Some((0, 2)))?;
-        if locked && value != 1 {
-            return Err(Errno::EPERM);
-        }
+        // Once 1, it stays: checked and set in one step, so that writers at
+        // once cannot take it from 1.
         self.unprivileged_bpf_disabled
-            .store(value, Ordering::SeqCst);
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                (now != 1 || value == 1).then_some(value)
+            })
+            .map_err(|_| Errno::EPERM)?;
         Ok(consumed)
     }
 }

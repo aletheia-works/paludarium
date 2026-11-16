@@ -34,6 +34,8 @@ WORKFLOW = ROOT / ".github/workflows/ci.yml"
 FUZZ_WORKFLOW = ROOT / ".github/workflows/fuzz-pr.yml"
 FUZZ_TARGETS = ROOT / "fuzz/fuzz_targets"
 # The jobs that start only after the quick stage passed.
+# The jobs the quick stage waits for.
+QUICK = frozenset({"changes", "polyglot-lint", "test-linux", "lint", "stable-clippy"})
 EXPENSIVE = frozenset(
     {
         "wasm-programs",
@@ -241,7 +243,7 @@ def workflow_jobs(text):
     return jobs
 
 
-def check_gates(text, expensive=EXPENSIVE):
+def check_gates(text, expensive=EXPENSIVE, quick=QUICK):
     """ci-ok needs every job and the expensive jobs wait for the quick stage.
 
     A job whose needed job failed is skipped, and ci-ok accepts a skipped job,
@@ -252,6 +254,8 @@ def check_gates(text, expensive=EXPENSIVE):
     for gate, cond in (("ci-ok", "always()"), ("quick", "${{ !cancelled() }}")):
         if jobs[gate][1] != cond:
             raise AssertionError(f"{gate} must run with if: {cond}")
+    if jobs["quick"][0] != quick:
+        raise AssertionError(f"quick must need exactly {sorted(quick)}")
     missing = set(jobs) - {"ci-ok"} - jobs["ci-ok"][0]
     if missing:
         raise AssertionError(f"ci-ok does not need {sorted(missing)}")
@@ -317,9 +321,13 @@ def self_test():
         "  quick:\n    if: ${{ !cancelled() }}\n    needs:\n      - a\n"
         "  ci-ok:\n    if: always()\n    needs:\n      - a\n      - b\n      - quick\n"
     )
-    check_gates(good, {"b"})
+    check_gates(good, {"b"}, {"a"})
     for text, refusal in (
         (good.replace("      - b\n", ""), "ci-ok does not need ['b']"),
+        (
+            good.replace("    needs:\n      - a\n  ci-ok:", "    needs: []\n  ci-ok:"),
+            "quick must need exactly",
+        ),
         (good.replace("[a, quick]", "a"), "b must need the quick stage"),
         (
             good.replace("${{ !cancelled() && needs.quick.result == 'success' && true }}", "true"),
@@ -329,7 +337,7 @@ def self_test():
         (good.replace("  quick:\n    if: ${{ !cancelled() }}", "  quick:"), "quick must run"),
     ):
         try:
-            check_gates(text, {"b"})
+            check_gates(text, {"b"}, {"a"})
         except AssertionError as e:
             if refusal not in str(e):
                 raise

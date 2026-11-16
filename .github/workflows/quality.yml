@@ -490,29 +490,14 @@ jobs:
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov
           cache: false
-      # Fails below 80% of lines. The floor is never lowered.
-      - name: Workspace line coverage >= 80%
-        run: |
-          cargo llvm-cov clean --workspace
-          (
-            # shellcheck disable=SC1090
-            source <(cargo llvm-cov show-env --sh)
-            cargo build --locked -p paludarium --target-dir target/llvm-cov-target
-          )
-          cargo llvm-cov --no-clean --locked --workspace --fail-under-lines 80
-        env:
-          # Instrumented independent cases run serially; race cases still
-          # launch their own host workers and retain the 30-second watchdog.
-          RUST_TEST_THREADS: "1"
-      - name: Wasm changed Rust components line coverage >= 80%
-        run: |
-          cargo llvm-cov --locked -p paludarium-host -p paludarium-vfs -p paludarium-kernel -p paludarium-runtime -p paludarium-wasm --lib --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|jit)/' --fail-under-lines 80 --lcov --output-path target/wasm-coverage.lcov
-      - name: Retain wasm coverage observations
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: wasm-coverage-lcov
-          path: target/wasm-coverage.lcov
+      # Every gate fails below 80% of lines. The floors are never lowered.
+      # The core gate and the workspace gate share one instrumented build and
+      # one run of each test: the core packages' and the harness's tests run
+      # first and the core gate reports on their profiles alone; the
+      # remaining workspace tests then add theirs and the workspace gate
+      # reports on all of them. Cargo builds the same units either way
+      # (docs/design/quality.md). --no-report also leaves the target
+      # directory as it is, as --no-clean does.
       - name: Core package line coverage >= 80%
         # Keep the same core production file set; fresh architectural tests live
         # in Harness and must execute when measuring the newly shared CPU code.
@@ -524,10 +509,51 @@ jobs:
             cargo build --locked -p paludarium --target-dir target/llvm-cov-target
           )
           read -r -a packages <<< "$CORE_PACKAGES"
-          cargo llvm-cov --no-clean --locked "${packages[@]}" -p paludarium-harness --ignore-filename-regex 'paludarium-harness/' --fail-under-lines 80
+          cargo llvm-cov --no-report --locked "${packages[@]}" -p paludarium-harness
+          cargo llvm-cov report "${packages[@]}" -p paludarium-harness --ignore-filename-regex 'paludarium-harness/' --fail-under-lines 80
+        env:
+          # Instrumented independent cases run serially; race cases still
+          # launch their own host workers and retain the 30-second watchdog.
+          RUST_TEST_THREADS: "1"
+      - name: Workspace line coverage >= 80%
+        run: |
+          read -r -a packages <<< "$CORE_PACKAGES"
+          excludes=(--exclude paludarium-harness)
+          for package in "${packages[@]}"; do
+            if [ "$package" != -p ]; then
+              excludes+=(--exclude "$package")
+            fi
+          done
+          cargo llvm-cov --no-report --locked --workspace "${excludes[@]}"
+          cargo llvm-cov report --workspace --fail-under-lines 80
         env:
           RUST_TEST_THREADS: "1"
-
+      - name: Wasm changed Rust components line coverage >= 80%
+        run: |
+          cargo llvm-cov --locked -p paludarium-host -p paludarium-vfs -p paludarium-kernel -p paludarium-runtime -p paludarium-wasm --lib --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|jit)/' --fail-under-lines 80 --lcov --output-path target/wasm-coverage.lcov
+      - name: Retain wasm coverage observations
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: wasm-coverage-lcov
+          path: target/wasm-coverage.lcov
+      # A report reads every test binary left in the target directory, and
+      # cleans only the packages it measures. The terminal step used to start
+      # from what the core run left, so remove what the other workspace
+      # packages' tests built above.
+      - name: Leave only the core run's test binaries
+        run: |
+          read -r -a packages <<< "$CORE_PACKAGES"
+          core=" ${packages[*]} -p paludarium-harness "
+          # A failure inside the loop's word list would not stop the step.
+          set -o pipefail
+          names=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[].name')
+          test -n "$names"
+          for package in $names; do
+            if [[ "$core" != *" -p $package "* ]]; then
+              cargo clean --locked --target-dir target/llvm-cov-target -p "$package"
+            fi
+          done
       - name: Terminal target crates line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/' --fail-under-lines 80 --lcov --output-path target/terminal-coverage.lcov

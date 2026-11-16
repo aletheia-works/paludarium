@@ -7,8 +7,8 @@
 # and the release check). The expensive jobs (differential tests, coverage,
 # fuzzing, the guest programs and the WebAssembly checks) start only after
 # the quick stage (lint, clippy, polyglot lint and the Linux unit tests)
-# passed. ci-ok, the
-# required check, passes only when every job passed or was not needed.
+# passed. ci-ok, the required check, passes only when every job passed or
+# was not needed.
 # Actions are pinned by commit SHA and the default token is read-only.
 name: CI
 

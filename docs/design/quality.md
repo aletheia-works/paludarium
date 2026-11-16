@@ -184,8 +184,11 @@ every test passing.
   target directory; before the terminal gate the job removes the test
   binaries of the packages outside the core gate, so it starts from what the
   core run left, as it did when that run came last. The copy of this job in
-  `quality.yml` (nightly and before a release) still runs the two gates
-  separately, with the same numbers.
+  `quality.yml` (nightly and before a release) runs the gates the same way,
+  and `mise run coverage` runs the core and workspace gates so. On one
+  commit, the separate runs and the shared run counted the same lines in
+  every gate, and their missed lines differed only in a few lines that
+  depend on thread timing.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)

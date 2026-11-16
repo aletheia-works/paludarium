@@ -469,4 +469,56 @@ mod tests {
         assert!(close(sine.multiply(sine).add(cosine.multiply(cosine)), ONE));
         assert_eq!(top(sine), 0xae7f_e0b5_fc78_6b2d);
     }
+
+    /// How long each step and each instruction's work takes, printed rather
+    /// than checked: `cargo test --release -p paludarium-cpu -- --ignored
+    /// --nocapture wide::tests::timing`.
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let time = |label: &str, work: &dyn Fn() -> Wide| {
+            let mut runs = 1u32;
+            loop {
+                let start = Instant::now();
+                for _ in 0..runs {
+                    black_box(work());
+                }
+                let spent = start.elapsed();
+                if spent.as_millis() >= 200 {
+                    let each = spent.as_nanos() / u128::from(runs);
+                    println!("{label:>22}: {each:>8} ns");
+                    return;
+                }
+                runs *= 2;
+            }
+        };
+        let a = black_box(Wide::new(false, 0xb504_f333_f9de_6484_5979_1234_5678_9abd, -128));
+        let b = black_box(Wide::new(false, 0xc90f_daa2_2168_c234_c4c6_628b_80dc_1cd1, -129));
+        time("multiply", &|| a.multiply(b));
+        time("add", &|| a.add(b));
+        time("divide", &|| a.divide(b));
+        let small = black_box(9_702);
+        time("divide_small", &|| a.divide_small(small));
+        time("square_root", &|| a.square_root());
+        // What each instruction works out, as x87.rs asks for it.
+        let r = black_box(Wide::new(false, 0xa2f9_836e_4e44_1529_fc27_57d1_f534_ddc1, -128));
+        time("fsin, fcos (series)", &|| sine_cosine(r).0);
+        time("fptan", &|| {
+            let (sine, cosine) = sine_cosine(r);
+            sine.divide(cosine)
+        });
+        time("f2xm1", &|| exponential_minus_one(r.multiply(LN_2)));
+        let x = black_box(Wide::new(false, 0xd413_cccf_e779_9211_65f6_26cd_d52a_fa7d, -128));
+        time("fyl2x", &|| {
+            let s = x.subtract(ONE).divide(x.add(ONE));
+            double_inverse_tanh(s).multiply(LOG2_E).multiply(b)
+        });
+        time("fyl2xp1", &|| {
+            let s = r.scale(-3).divide(r.scale(-3).add(ONE.scale(1)));
+            double_inverse_tanh(s).multiply(LOG2_E).multiply(b)
+        });
+        time("fpatan", &|| inverse_tangent(r.divide(a)));
+    }
 }

@@ -189,6 +189,14 @@ every test passing.
   commit, the separate runs and the shared run counted the same lines in
   every gate, and their missed lines differed only in a few lines that
   depend on thread timing.
+- Each gate's printed table counts the same packages and files as the
+  gate. A `cargo llvm-cov report` without `-p` counts every workspace
+  member whose code the test binaries link, so the terminal and encodings
+  reports used to add `paludarium-jit-native`, which the `paludarium`
+  binary and the harness link, at 0%: their totals read below the
+  measured rates (79.86% for 80.83%). Starting a gate from a clean target
+  directory instead of the earlier steps' binaries gave the same lines
+  and the same rates, but for lines that depend on thread timing.
 - The terminal gate runs the libraries' unit tests, not the harness's
   differential tests. So that the system calls those check count there too,
   some kernel unit tests (`crates/paludarium-kernel/src/replay_tests.rs`)

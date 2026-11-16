@@ -214,6 +214,13 @@ class Evidence(unittest.TestCase):
         self.assertIn("--lcov", args)
         self.assertEqual(args[args.index("--output-path") + 1], str(c.output / "reexport.lcov"))
 
+    def test_exports_report_the_measured_packages(self):
+        c = self.capture()
+        for kind in ("json", "report"):
+            args = P.export_command(Path("/actual/cargo"), kind, c.output)
+            packages = [args[i + 1] for i, arg in enumerate(args) if arg == "-p"]
+            self.assertEqual(packages, P.PACKAGES)
+
     def test_other_exports_keep_stdout_mode(self):
         c = self.capture()
         for kind in ("json", "report"):

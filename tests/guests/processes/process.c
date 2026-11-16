@@ -15433,6 +15433,19 @@ static int ipc_sysctl_more(void) {
     }
     result("held-write", reaped(writer));
     if (held >= 0) close((int)held);
+
+    /* copy_file_range into a sysctl from another filesystem, a memfd, is
+       EXDEV (generic_copy_file_checks), so it writes nothing. */
+    int memfd = (int)syscall(SYS_memfd_create, "sysctl-source", 0);
+    long fed = memfd < 0 ? -1 : write(memfd, "100\n", 4);
+    long target = ksys_open("msgmax", O_WRONLY);
+    errno = 0;
+    long copied = syscall(SYS_copy_file_range, memfd, NULL, (int)target, NULL, 4, 0);
+    printf("copy-range: fed=%ld copied=%ld errno=%d", fed, copied, copied < 0 ? errno : 0);
+    ksys_show("msgmax");
+    printf("\n");
+    if (target >= 0) close((int)target);
+    if (memfd >= 0) close(memfd);
     return 0;
 }
 static int ipc_sysctl_case(void) {

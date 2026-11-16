@@ -1387,6 +1387,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EINVAL`。`size`、`nr_blocks`、`nr_inodes`、`huge`、`inode32`、`inode64`、`mpol` は
   変わり、`mode`、`uid`、`gid` は変わりません）。そのあとマウントは呼び出しのフラグを
   持ちます。
+- `noexec` のマウントは、Linux の `path_noexec` と同じく何も実行しません。そこにある
+  プログラム、スクリプトのインタープリター、ELF のインタープリターの `execve` は、許可の
+  前に `EACCES` で、通常のファイルへの `X_OK` 付きの `access` も同じです。そこのファイルを
+  `PROT_EXEC` で `mmap` すると `EPERM`、`READ_IMPLIES_EXEC` はそれに `PROT_EXEC` を足さず、
+  `mprotect` もそのマッピングを実行できるようにはしません（`EACCES`。VMA に `VM_MAYEXEC`
+  がありません）。`nodev` のマウントは、そこのデバイスを開きません（`EACCES`。
+  `may_open_dev`。root でも同じです）。`nosuid` のマウントや、呼び出し元がいない
+  ユーザー名前空間のスーパーブロックにあるプログラムは、set-user-ID と set-group-ID の
+  ビットもファイルケーパビリティもなしに実行します（`mnt_may_suid`）。
 - 読み出し専用のマウントや、読み出し専用のスーパーブロックのマウントは、Linux の
   `mnt_want_write` と同じところで、その前に来るエラーのあとに、書き込むものを `EROFS` で
   断ります。名前を作るもの（`O_CREAT` と `O_TMPFILE` 付きの `open`、`mkdir`、`mknod`、

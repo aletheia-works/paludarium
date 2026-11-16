@@ -573,11 +573,13 @@ verified.
   in a mount namespace of another user namespace). Peer group numbers
   count from 1 among this machine's mounts alone, where Linux's are
   shared with the host's. `propagate_from:` is found from the namespace's
-  root, not the reader's after `chroot`. Only `MS_RDONLY` is enforced
-  (`EROFS`): a tmpfs mount's `size`, `nr_blocks` and `nr_inodes`
-  are reported but not enforced (it fills up only as the in-memory
-  filesystem does, never `ENOSPC` at its size), nor are `noexec`,
-  `nosuid`, `nodev`, the atime flags, `sync`, `dirsync` and `mand`;
+  root, not the reader's after `chroot`. `MS_RDONLY` (`EROFS`), `noexec`,
+  `nodev` and `nosuid` are enforced, but a tmpfs mount's `size`,
+  `nr_blocks` and `nr_inodes` are reported and not enforced (it fills up
+  only as the in-memory filesystem does, never `ENOSPC` at its size), nor
+  are the atime flags, `sync`, `dirsync` and `mand`; no mount here holds a
+  device node but a host directory's (`mknod` of one is `EPERM`), so
+  `nodev` only refuses those;
   `huge`, `mpol`, `noswap` and the quota options are taken, checked as
   Linux checks them (a remount that turns on `noswap` or quotas, or
   changes a quota limit, is `EINVAL`) and shown, but do nothing, and
@@ -653,10 +655,10 @@ verified.
   ends, with that thread's. Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
-  act as 0, the kernel's defaults, which many distributions raise. A mount's
-  `nosuid` is not enforced, and a set-user-ID or set-group-ID program takes
-  its owner or group, and a program with file capabilities takes them, even
-  when another process shares the caller's working directory (`CLONE_FS`),
+  act as 0, the kernel's defaults, which many distributions raise. A
+  set-user-ID or set-group-ID program takes its owner or group, and a
+  program with file capabilities takes them, even when another process
+  shares the caller's working directory (`CLONE_FS`),
   where Linux takes the real IDs as effective unless the caller has
   `CAP_SETUID` and gives no more capabilities than the caller had.
   `execveat`'s `AT_EXECVE_CHECK` (Linux 6.14), with which user space checks

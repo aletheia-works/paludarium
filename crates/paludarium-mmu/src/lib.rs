@@ -146,6 +146,10 @@ pub struct Mapping {
     /// keep, as Linux's do not without `UFFD_FEATURE_EVENT_FORK` and
     /// `UFFD_FEATURE_EVENT_REMAP`.
     pub userfault: Option<Userfault>,
+    /// A file on a mount that runs nothing (`noexec`) backs it, so it may
+    /// never be executable: Linux's `do_mmap` clears its `VM_MAYEXEC`, and
+    /// `mprotect` then refuses `PROT_EXEC` (`EACCES`).
+    pub no_exec: bool,
 }
 
 /// The `userfaultfd` a mapping reports its faults to, and why
@@ -3155,6 +3159,14 @@ impl AddressSpaceData {
         })
     }
 
+    /// Marks the mappings in `[addr, addr+len)` as of a file on a `noexec`
+    /// mount ([`Mapping::no_exec`]).
+    pub fn set_no_exec(&mut self, addr: GuestAddr, len: u64) {
+        let end = addr.0.saturating_add(len);
+        for (_, m) in self.mappings.range_mut(addr.0..end) {
+            m.no_exec = true;
+        }
+    }
     /// Marks the private mappings `[addr, addr+len)` touches written, each
     /// with the whole Linux VMA it is part of ([`Mapping::written`]).
     pub fn mark_written(&mut self, addr: GuestAddr, len: u64) {
@@ -3256,7 +3268,7 @@ impl AddressSpaceData {
             return 0;
         };
         let bit = |on: bool, flag: u64| if on { flag } else { 0 };
-        let mut flags = u64::from(m.prot.bits()) | vm::MAYREAD | vm::MAYEXEC;
+        let mut flags = u64::from(m.prot.bits()) | vm::MAYREAD | bit(!m.no_exec, vm::MAYEXEC);
         match self.shared_at(start) {
             Some(shared) => {
                 flags |= vm::MAYSHARE
@@ -3448,6 +3460,7 @@ impl AddressSpaceData {
                 mergeable: false,
                 grows_down: kind == MappingKind::Stack,
                 userfault: None,
+                no_exec: false,
             },
         );
         Ok(GuestAddr(start))
@@ -3579,6 +3592,7 @@ impl AddressSpaceData {
             && a.mergeable == b.mergeable
             && a.grows_down == b.grows_down
             && a.userfault == b.userfault
+            && a.no_exec == b.no_exec
             && match (self.shared_at(a.start.0), self.shared_at(b.start.0)) {
                 (None, None) => match (self.backing_at(a.start.0), self.backing_at(b.start.0)) {
                     (None, None) => true,
@@ -4800,6 +4814,12 @@ impl AddressSpaceData {
             if m.start.0 > covered {
                 break;
             }
+            // One of a file on a `noexec` mount never runs
+            // (`VM_MAYEXEC`).
+            if prot.contains(Prot::EXEC) && m.no_exec {
+                denied = Some(Errno::EACCES);
+                break;
+            }
             // A shared file mapping may become writable only when its file
             // was open for writing.
             if prot.contains(Prot::WRITE)
@@ -5709,6 +5729,11 @@ impl AddressSpace {
     /// populates a writable private mapping ([`Mapping::written`]).
     pub fn mark_written(&self, addr: GuestAddr, len: u64) {
         self.locked().mark_written(addr, len);
+    }
+    /// Marks the mappings in `[addr, addr+len)` as of a file on a `noexec`
+    /// mount, which never becomes executable ([`Mapping::no_exec`]).
+    pub fn set_no_exec(&self, addr: GuestAddr, len: u64) {
+        self.locked().set_no_exec(addr, len);
     }
     /// The start and length of the Linux VMA holding `addr`: the mapping
     /// there and the adjacent ones Linux would have merged with it.

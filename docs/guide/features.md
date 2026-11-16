@@ -1578,6 +1578,16 @@ kernel.
   quota on one without, a changed quota limit; `size`, `nr_blocks`,
   `nr_inodes`, `huge`, `inode32`, `inode64` and `mpol` change, `mode`,
   `uid` and `gid` do not). The mount then takes the call's flags.
+- A `noexec` mount runs nothing, as Linux's `path_noexec`: `execve` of a
+  program there, a script's interpreter there and an ELF interpreter
+  there are `EACCES` before their permission, as is `access` with `X_OK`
+  of a regular file; `mmap` of a file there with `PROT_EXEC` is `EPERM`,
+  `READ_IMPLIES_EXEC` adds no `PROT_EXEC` to it, and `mprotect` gives its
+  mapping none (`EACCES`, the VMA without `VM_MAYEXEC`). A `nodev` mount
+  opens no device there (`EACCES`, `may_open_dev`, for root too). A
+  program on a `nosuid` mount, or on a superblock of a user namespace the
+  caller is not in, runs without its set-user-ID and set-group-ID bits and
+  its file capabilities (`mnt_may_suid`).
 - A read-only mount, or one of a read-only superblock, refuses what writes
   with `EROFS` where Linux's `mnt_want_write` does, after the errors that
   come before it: creating a name (`open` with `O_CREAT`, `O_TMPFILE`,

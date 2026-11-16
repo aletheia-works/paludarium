@@ -151,8 +151,9 @@ mod linux {
             // proc-other-maps, proc-other-fds, proc-other-limits and
             // proc-other-pagemap cases, which read a process's maps,
             // descriptors, auxv and pagemap as other users, and the pagemap
-            // and proc-owners cases, which become an unprivileged user, as
-            // the emulator's guest starts as root.
+            // and proc-owners cases, which become an unprivileged user, and
+            // the mount-flags case, which runs a program of another user's
+            // on its own mounts, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -279,6 +280,7 @@ mod linux {
                     | "pagemap"
                     | "proc-owners"
                     | "admin"
+                    | "mount-flags"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -766,6 +768,7 @@ mod linux {
         processes_trees => ("trees","process"),
         processes_contexts => ("contexts","process"),
         processes_setattrs => ("setattrs","process"),
+        processes_mount_flags => ("mount-flags","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_proc_other_maps => ("proc-other-maps","process"),
         processes_proc_other_fds => ("proc-other-fds","process"),

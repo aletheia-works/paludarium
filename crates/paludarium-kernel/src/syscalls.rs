@@ -2284,7 +2284,6 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let Some(prot) = Prot::from_bits(prot) else {
         return err(Errno::EINVAL);
     };
-    let prot = read_implies_exec(c.process, prot);
     if offset & 4095 != 0 {
         return err(Errno::EINVAL);
     }
@@ -2295,6 +2294,16 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
     } else {
         None
+    };
+    // A file on a mount that runs nothing (`path_noexec`): READ_IMPLIES_EXEC
+    // adds no PROT_EXEC to its mapping, which may never run.
+    let noexec = descriptor
+        .as_ref()
+        .is_some_and(|d| crate::files::mount_says(c.files, &d.path, crate::files::ST_NOEXEC));
+    let prot = if noexec {
+        prot
+    } else {
+        read_implies_exec(c.process, prot)
     };
     let file = descriptor.as_ref().map(|d| d.file.clone());
     if len == 0 || !matches!(flags & (MAP_SHARED | MAP_PRIVATE), MAP_SHARED | MAP_PRIVATE) {
@@ -2320,7 +2329,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         };
     }
     if let Some(file) = &file
-        && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len)
+        && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len, noexec)
     {
         return err(e);
     }
@@ -2416,6 +2425,9 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     match result {
         Ok(a) => {
             let end = a.0.saturating_add(len.next_multiple_of(4096));
+            if noexec {
+                c.mem.set_no_exec(a, end - a.0);
+            }
             if flags & MAP_LOCKED != 0
                 && let Some(lock) = lock
             {
@@ -2491,6 +2503,7 @@ fn check_mappable(
     flags: u64,
     offset: u64,
     len: u64,
+    noexec: bool,
 ) -> Result<(), Errno> {
     let regular = file.stat()?.mode & 0o170000 == 0o100000;
     // A regular file's mapping must end within the largest file size.
@@ -2511,6 +2524,10 @@ fn check_mappable(
             .is_ok_and(|stat| crate::files::attributes::append_only(&stat))
     {
         return Err(Errno::EACCES);
+    }
+    // A file on a `noexec` mount maps for no execution (`EPERM`).
+    if noexec && prot.contains(Prot::EXEC) {
+        return Err(Errno::EPERM);
     }
     // Neither a file that is not regular nor one that /proc generates can
     // be read at an offset, which a mapping needs.

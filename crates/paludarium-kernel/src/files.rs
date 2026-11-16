@@ -1210,6 +1210,18 @@ pub(crate) fn mount_target(
 ) -> Result<Option<Vec<u8>>, Errno> {
     mount_path(c, path(c, ptr)?, follow)
 }
+/// `statfs`'s `ST_NOSUID`, `ST_NODEV` and `ST_NOEXEC`: the mount flags
+/// [`mount_says`] asks of.
+pub(crate) const ST_NOSUID: u64 = 0x2;
+pub(crate) const ST_NODEV: u64 = 0x4;
+pub(crate) const ST_NOEXEC: u64 = 0x8;
+/// Whether the mount of the file at `path`, its links followed, has the
+/// `statfs` flag `flag` (`MNT_NOEXEC` for `path_noexec`, `MNT_NODEV` for
+/// `may_open_dev`, `MNT_NOSUID` for `mnt_may_suid`). `/proc` and `/dev`,
+/// which the kernel generates, are Linux's own mounts, which have none.
+pub(crate) fn mount_says(files: &Files, path: &[u8], flag: u64) -> bool {
+    !path.is_empty() && !generated(path) && files.fs().statfs_flags(path) & flag != 0
+}
 /// [`mount_target`] of a directory, its links followed (`LOOKUP_FOLLOW |
 /// LOOKUP_DIRECTORY`, `ENOTDIR` for another file).
 pub(crate) fn mount_directory(c: &Context<'_>, ptr: u64) -> Result<Option<Vec<u8>>, Errno> {
@@ -1414,6 +1426,10 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
         };
         (stat, p, follow)
     };
+    // Executing a regular file on a `noexec` mount (`path_noexec`).
+    if mode & 1 != 0 && stat.mode & 0o170000 == 0o100000 && mount_says(c.files, &at, ST_NOEXEC) {
+        return Err(Errno::EACCES);
+    }
     crate::permissions::permission(&creds, &stat, mode as u32)?;
     // "SuS v2 requires we report a read only fs too": writing a file that
     // is not special.

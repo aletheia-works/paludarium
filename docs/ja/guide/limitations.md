@@ -492,10 +492,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ほかのユーザー名前空間のマウント名前空間では `master:1`）のことがよくあります。ピア
   グループの番号はこのマシンのマウントの中だけで 1 から数えます。Linux ではホストのものと
   共通です。`propagate_from:` は名前空間のルートから求め、`chroot` のあとの読み手の
-  ルートからではありません。効かせるのは `MS_RDONLY`（`EROFS`）だけです。tmpfs の
-  マウントの `size`、`nr_blocks`、`nr_inodes` は返しますが効かせません（メモリ上の
-  ファイルシステムが埋まるまで埋まらず、その大きさで `ENOSPC` にはなりません）。
-  `noexec`、`nosuid`、`nodev`、atime のフラグ、`sync`、`dirsync`、`mand` も効きません。
+  ルートからではありません。`MS_RDONLY`（`EROFS`）、`noexec`、`nodev`、`nosuid` は
+  効かせますが、tmpfs のマウントの `size`、`nr_blocks`、`nr_inodes` は返すだけで効かせ
+  ません（メモリ上のファイルシステムが埋まるまで埋まらず、その大きさで `ENOSPC` には
+  なりません）。atime のフラグ、`sync`、`dirsync`、`mand` も効きません。ここのマウントが
+  持つデバイスノードはホストのディレクトリのものだけなので（その `mknod` は `EPERM`）、
+  `nodev` が断るのもそれだけです。
   `huge`、`mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて
   （マウントし直しで `noswap` やクォータを有効にしたり、クォータの上限を変えたりすると
   `EINVAL`）表示しますが、何もせず、
@@ -564,7 +566,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルのうち、`/proc` と `/dev` の下は確かめません。`fs.protected_hardlinks`、
   `fs.protected_symlinks`、`fs.protected_fifos`、`fs.protected_regular` は、
   カーネルの既定値の 0 として振る舞います。多くのディストリビューションは
-  これらを上げています。マウントの `nosuid` は効きません。set-user-ID や
+  これらを上げています。set-user-ID や
   set-group-ID のプログラムは持ち主やグループになり、ファイルケーパビリティの
   あるプログラムはそれを得ます。ほかのプロセスが呼んだ側と作業ディレクトリを
   共有していても（`CLONE_FS`）同じです。Linux なら `CAP_SETUID` がなければ実 ID を

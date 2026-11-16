@@ -10301,6 +10301,127 @@ static int setattrs_case(void) {
     return 0;
 }
 
+/* The mount-flags case, as root: what noexec and nosuid mounts refuse, as
+   Linux enforces them: exec and access(X_OK) of a file on a noexec mount
+   (EACCES, a script's interpreter there too), its mapping for execution
+   (mmap EPERM, mprotect EACCES), and a set-user-ID and set-group-ID program
+   on a nosuid mount, which runs with the caller's IDs. */
+static char mf_base[] = "/tmp/paludarium-mount-flags-XXXXXX";
+static void mf_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", mf_base, name); }
+/* Copies `from` to `to` as a set-user-ID and set-group-ID program of user
+   and group 1000; 0 or the errno. */
+static int mf_copy(const char *from, const char *to) {
+    int in = open(from, O_RDONLY), out = open(to, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    if (in < 0 || out < 0) return errno;
+    char buf[65536];
+    long n;
+    while ((n = read(in, buf, sizeof buf)) > 0)
+        if (write(out, buf, (size_t)n) != n) return errno;
+    close(in);
+    close(out);
+    if (chown(to, 1000, 1000) || chmod(to, 06755)) return errno;
+    return 0;
+}
+/* Runs `path` as the mount-flags-id mode in a child: its line, or the
+   errno of its execve. */
+static void mf_run(const char *label, const char *path) {
+    fflush(stdout);
+    int pipefd[2];
+    if (pipe(pipefd)) return;
+    pid_t child = fork();
+    if (child == 0) {
+        dup2(pipefd[1], 1);
+        char *argv[] = {"process", "mount-flags-id", "x", NULL};
+        execve(path, argv, environ);
+        printf("execve=%d\n", errno);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    char line[128] = "";
+    long n = read(pipefd[0], line, sizeof line - 1);
+    close(pipefd[0]);
+    reaped(child);
+    if (n > 0) line[n] = 0;
+    char *end = strchr(line, '\n');
+    if (end) *end = 0;
+    printf("%s %s\n", label, line);
+}
+static int mf_inner(const char *self) {
+    char x[256], n[256], s[256], path[512];
+    mf_path(x, "x");
+    mf_path(n, "n");
+    mf_path(s, "s");
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("x", mount("none", x, "tmpfs", 0, NULL));
+    RM("n", mount("none", n, "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV, NULL));
+    RM("s", mount("none", s, "tmpfs", MS_NOSUID, NULL));
+    char xp[512], np[512], sp[512];
+    snprintf(xp, sizeof xp, "%s/prog", x);
+    snprintf(np, sizeof np, "%s/prog", n);
+    snprintf(sp, sizeof sp, "%s/prog", s);
+    printf(" copies=%d %d %d\n", mf_copy(self, xp), mf_copy(self, np), mf_copy(self, sp));
+    printf("access");
+    RM("x", access(xp, X_OK));
+    RM("n", access(np, X_OK));
+    RM("n-read", access(np, R_OK));
+    printf("\n");
+    mf_run("exec-x", xp);
+    mf_run("exec-n", np);
+    mf_run("exec-s", sp);
+    snprintf(path, sizeof path, "%s/script", x);
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    char text[600];
+    int len = snprintf(text, sizeof text, "#!%s\n", np);
+    write(fd, text, (size_t)len);
+    close(fd);
+    mf_run("script-n", path);
+    printf("mmap");
+    fd = open(np, O_RDONLY);
+    void *at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    printf(" n-exec=%d", at == MAP_FAILED ? errno : 0);
+    at = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    printf(" n-read=%d", at == MAP_FAILED ? errno : 0);
+    RM("n-mprotect", mprotect(at, 4096, PROT_READ | PROT_EXEC));
+    close(fd);
+    fd = open(xp, O_RDONLY);
+    at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    printf(" x-exec=%d\n", at == MAP_FAILED ? errno : 0);
+    close(fd);
+    printf("remount");
+    RM("n", mount(NULL, n, NULL, MS_REMOUNT | MS_BIND | MS_NOSUID, NULL));
+    printf("\n");
+    mf_run("exec-n", np);
+    return 0;
+}
+static int mount_flags_case(const char *self) {
+    if (!mkdtemp(mf_base)) return 93;
+    chmod(mf_base, 0755);
+    const char *dirs[] = {"x", "n", "s"};
+    char path[256];
+    for (unsigned i = 0; i < 3; i++) {
+        mf_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        _exit(mf_inner(self));
+    }
+    printf("status=%d\n", reaped(child));
+    for (unsigned i = 0; i < 3; i++) {
+        mf_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(mf_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -28600,6 +28721,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "trees")) return trees_case();
     if (!strcmp(mode, "contexts")) return contexts_case();
     if (!strcmp(mode, "setattrs")) return setattrs_case();
+    if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
+    if (!strcmp(mode, "mount-flags-id")) {
+        printf("euid=%d egid=%d\n", (int)geteuid(), (int)getegid());
+        return 0;
+    }
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();

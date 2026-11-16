@@ -4308,6 +4308,12 @@ impl Kernel {
                 if stat.mode & 0o170000 != 0o100000 {
                     return Err(Errno::EACCES);
                 }
+                // A removed file is still on its mount (`path_noexec`).
+                if let Some(path) = &removed
+                    && crate::files::mount_says(&self.files, path, crate::files::ST_NOEXEC)
+                {
+                    return Err(Errno::EACCES);
+                }
                 crate::permissions::permission(creds, &stat, crate::permissions::MAY_EXEC)?;
                 let readable =
                     crate::permissions::permission(creds, &stat, crate::permissions::MAY_READ)
@@ -4514,9 +4520,23 @@ impl Kernel {
         // Linux takes the new credentials once the loader has read the
         // program and opened its interpreter (`begin_new_exec`), so their
         // error comes after the loader's.
+        // `mnt_may_suid`: a program on a `nosuid` mount, or on a superblock
+        // of a user namespace the caller is not in, gives neither its
+        // set-ID bits (`bprm_fill_uid`) nor its file capabilities
+        // (`get_file_caps`).
+        let may_suid = !crate::files::mount_says(&self.files, &loaded, crate::files::ST_NOSUID)
+            && crate::files::resolved(&self.files, &loaded)
+                .and_then(|at| self.files.namespaced().target(&at).ok())
+                .and_then(|found| found.owner)
+                .and_then(|owner| {
+                    owner
+                        .downcast_ref::<crate::namespaces::Namespace>()
+                        .map(|owner| thread.state.credentials.in_user_namespace_of(owner))
+                })
+                .unwrap_or(true);
         let exec_credentials = thread.state.credentials.after_exec(
-            program.as_ref(),
-            capabilities.as_deref(),
+            program.as_ref().filter(|_| may_suid),
+            capabilities.as_deref().filter(|_| may_suid),
             no_new_privs,
         );
         let (credentials, secure) = exec_credentials

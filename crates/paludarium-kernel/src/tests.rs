@@ -8817,6 +8817,54 @@ fn mount_setattr_changes_flags_and_propagation() {
     assert_eq!(f.ret(32, &[0]), before);
 }
 
+/// A file on a `noexec` mount does not run (`EACCES`), `access` does not
+/// let it, and it maps for no execution: `mmap` with `PROT_EXEC` is
+/// `EPERM` and `mprotect` to it `EACCES`.
+#[test]
+fn a_noexec_mount_runs_nothing() {
+    let mut f = fixture();
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let (n, x) = (put(&mut f, 0x40, b"/tmp/n"), put(&mut f, 0x60, b"/tmp/x"));
+    assert_eq!(f.ret(83, &[n, 0o755]), 0);
+    assert_eq!(f.ret(83, &[x, 0o755]), 0);
+    let noexec = 8;
+    assert_eq!(f.ret(165, &[none, n, tmpfs, noexec, 0]), 0);
+    assert_eq!(f.ret(165, &[none, x, tmpfs, 0, 0]), 0);
+    let (np, xp) = (
+        put(&mut f, 0x80, b"/tmp/n/prog"),
+        put(&mut f, 0xa0, b"/tmp/x/prog"),
+    );
+    for p in [np, xp] {
+        let fd = f.ret(2, &[p, 0o101, 0o755]);
+        assert_eq!(f.ret(1, &[fd, DATA, 4096]), 4096);
+        assert_eq!(f.ret(3, &[fd]), 0);
+    }
+    // Not run, before its format is looked at.
+    let argv = DATA + 0x400;
+    f.mem.write(GuestAddr(argv), &np.to_le_bytes()).unwrap();
+    f.mem
+        .write(GuestAddr(argv + 8), &0u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(59, &[np, argv, 0]), errno(Errno::EACCES));
+    assert_eq!(f.ret(59, &[xp, argv, 0]), errno(Errno(8)));
+    assert_eq!(f.ret(21, &[np, 1]), errno(Errno::EACCES));
+    assert_eq!(f.ret(21, &[xp, 1]), 0);
+    assert_eq!(f.ret(21, &[np, 4]), 0);
+    // Mapped for reading only.
+    let (read, exec) = (1, 4);
+    let fd = f.ret(2, &[np, 0, 0]);
+    assert_eq!(
+        f.ret(9, &[0, 4096, read | exec, 2, fd, 0]),
+        errno(Errno::EPERM)
+    );
+    let at = f.ret(9, &[0, 4096, read, 2, fd, 0]);
+    assert!((at as i64) > 0);
+    assert_eq!(f.ret(10, &[at, 4096, read | exec]), errno(Errno::EACCES));
+    let xfd = f.ret(2, &[xp, 0, 0]);
+    let xat = f.ret(9, &[0, 4096, read | exec, 2, xfd, 0]);
+    assert!((xat as i64) > 0);
+}
+
 /// `open_tree` gives a descriptor of a file or of a detached copy of its
 /// mount, which `move_mount` attaches; a copy no one attached goes with
 /// its descriptor.

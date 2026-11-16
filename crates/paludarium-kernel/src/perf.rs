@@ -328,7 +328,9 @@ fn regs(attr: &Attr, mask: u64, vector: u64, predicate: u32) -> Result<(), Errno
 /// opmask registers (1 quadword), all 8 or none, for no more than half of
 /// a 64 KiB sample with the 4 quadwords before them.
 fn simd_regs(vec_qwords: u16, vector: u64, pred_qwords: u16, predicate: u32) -> Result<(), Errno> {
-    /// Whether the first `n` registers of `mask` are all there, or none is.
+    /// Whether the first `n` registers of `mask` are all there, or none is
+    /// (`bitmap_full(&mask, n)`, which looks at those bits alone: more of
+    /// them, up to the 32 vector registers, are let through, as on Linux).
     fn whole(mask: u64, n: u32) -> bool {
         let first = (1u64 << n) - 1;
         mask == 0 || mask & first == first
@@ -1096,6 +1098,10 @@ mod tests {
         assert_eq!(regs(&simd(2, 0), 0, 0xffff, 0), Ok(()));
         assert_eq!(regs(&simd(4, 0), 0, 0xffff, 0), Ok(()));
         assert_eq!(regs(&simd(2, 0), 0, 0xff, 0), Err(Errno::EINVAL));
+        // `bitmap_full` looks at the first 16 bits alone, and only bits past
+        // the 32 vector registers are refused, so more registers pass.
+        assert_eq!(regs(&simd(2, 0), 0, 0x1_ffff, 0), Ok(()));
+        assert_eq!(regs(&simd(4, 0), 0, 0xffff_ffff, 0), Ok(()));
         assert_eq!(regs(&simd(8, 0), 0, 0xffff, 0), Err(Errno::EINVAL));
         assert_eq!(regs(&simd(8, 0), 0, 0xffff_ffff, 0), Ok(()));
         assert_eq!(regs(&simd(8, 0), 0, 1 << 32, 0), Err(Errno::EINVAL));

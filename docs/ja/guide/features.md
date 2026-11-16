@@ -911,8 +911,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピングの中に隙間なく収まっていなければなりません（`EINVAL`）。
   ファイルが届かないページは `EOVERFLOW` です。
 - System V の共有メモリ（`shmget`、`shmat`、`shmdt`、`shmctl`）は、スレッドの IPC
-  名前空間のものです。新しい IPC 名前空間にはセグメントがありません。確かめる内容とその
-  順序、既定の上限は Linux と同じです。
+  名前空間のものです。確かめる内容とその順序は Linux と同じで、上限はその名前空間の
+  `/proc/sys/kernel` のファイル（後述）です。大きさは 1 から `shmmax` まで（`EINVAL`）、
+  ページの数が桁あふれする大きさは `ENOSPC`、全セグメントのページは `shmall` まで、
+  セグメントの数は `shmmni` まで（どちらも `ENOSPC`）です。新しい IPC 名前空間には
+  セグメントがなく、上限は Linux の既定値です。
   セグメントの ID は添字とシーケンス番号からなり、Linux と同じ順に割り当てます。
   `/proc/<pid>/maps` は、つないだ領域をデバイス 00:01 の `/SYSV<key> (deleted)` と示し、
   inode は ID です。つないでいる数（`shm_nattch`）は、Linux と同じく、どのプロセスでも
@@ -924,8 +927,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `SHM_HUGETLB` は、hugetlbfs なしでビルドしたカーネルと同じく `ENOSYS` です。
 - System V のセマフォー（`semget`、`semop`、`semtimedop`、`semctl`）も、スレッドの IPC
   名前空間のものです。確かめる内容とその順序は Linux の `ipc/sem.c` と同じで、上限は
-  Linux の既定値（`SEMMSL` 32000、`SEMMNS` 1024000000、`SEMOPM` 500、`SEMMNI` 32000、
-  `SEMVMX` 32767）です。セットの ID はセグメントと同じように割り当てます。`semctl` には
+  その名前空間の `/proc/sys/kernel/sem`（Linux の既定値は `SEMMSL` 32000、`SEMMNS`
+  1024000000、`SEMOPM` 500、`SEMMNI` 32000。`SEMVMX` 32767 は固定）です。`semget`、
+  全セットのセマフォーの数、`semop` がこれに従います（`semopm` は符号なしで比べるので、
+  負の値は何も制限しません）。セットの ID はセグメントと同じように割り当てます。`semctl` には
   `IPC_STAT`、`IPC_SET`、`IPC_RMID`、`IPC_INFO`、`SEM_INFO`、`SEM_STAT`、`SEM_STAT_ANY`、
   `GETVAL`、`SETVAL`、`GETALL`、`SETALL`、`GETPID`（呼び出し元の PID 名前空間の番号。セマフォーがその `struct pid` を持ち続けるので、
   そのプロセスが回収された後も返します。終了時の取り消しで変わったものも同じです）、
@@ -945,7 +950,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リストを離れるときに、Linux と同じく 0 と `SEMVMX` の間に収めて値に足します。
 - System V のメッセージキュー（`msgget`、`msgsnd`、`msgrcv`、`msgctl`）も、スレッドの
   IPC 名前空間のものです。確かめる内容とその順序は Linux の `ipc/msg.c` と同じで、上限は
-  Linux の既定値（`MSGMAX` 8192、`MSGMNB` 16384、`MSGMNI` 32000）です。キューは
+  その名前空間の `/proc/sys/kernel` のファイル（Linux の既定値は `MSGMAX` 8192、`MSGMNB`
+  16384、`MSGMNI` 32000）です。メッセージの大きさ、新しいキューが持つバイト数（
+  `CAP_SYS_RESOURCE` なしの `IPC_SET` が与えられる上限でもあります）、キューの数が
+  これに従います。キューは
   `msg_qbytes` のバイト数まで、同じ数のメッセージまで持ちます。いっぱいのキューへの送信は、
   `IPC_NOWAIT` があれば `EAGAIN` で、なければキューの送信者の列で、受信か `IPC_SET` で
   そのメッセージが入る空きができるか、キューが消える（`EIDRM`）か、シグナルが来るまで
@@ -2183,7 +2191,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
-  `fs` だけを持つ `/proc/sys`（後述）、
+  `fs` と `kernel` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
@@ -2281,6 +2289,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （最初は 128）と `max_user_marks`（最初は 33979。`sysinfo` が示すメモリーの 1% を inode
   2 つ分の大きさで割った数）は 0 から `INT_MAX` までの unsigned long、`max_queued_events`
   （最初は 16384）と `watchdog_timeout`（0）は 0 以上の `int` です。
+- `/proc/sys/kernel` には、Linux の `ipc/ipc_sysctl.c` と同じく、開くプロセスの IPC
+  名前空間の System V IPC の上限があります。新しい名前空間では Linux の既定値で、持ち主と
+  書くために開ける者は `/proc/sys/fs/mqueue` のファイルと同じです。`shmmax` と `shmall`
+  は（`aio-max-nr` と同じ）unsigned long、`shmmni` と `msgmni` は 0 から 32768 までの
+  `int`、`msgmax` と `msgmnb` は 0 以上の `int`、`sem` は `semmsl`、`semmns`、`semopm`、
+  `semmni` の 4 つの `int` で、タブで区切って読めます。`sem` への書き込みは、Linux の
+  `proc_dointvec` がベクトルを読むのと同じく、与えた数だけを設定します。不正な値は
+  `EINVAL` で、その前の値は設定されたままです。`semmni` は、最後に 0 から 32768 の間に
+  なければ元に戻ります（`proc_ipc_sem_dointvec`）。ほかに `perf_event_paranoid` と
+  `unprivileged_bpf_disabled` があり、Linux の既定値の 2 を読めますが、誰も書くために
+  開けません（`EACCES`）。`/proc/sys/kernel` にあるのはこれらだけです。
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
   と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
   （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、

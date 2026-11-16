@@ -1015,8 +1015,11 @@ kernel.
   writing (`VM_SHARED`, which a memfd's seals leave), with no hole
   (`EINVAL`), and a page past what a file can reach is `EOVERFLOW`.
 - System V shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) belongs to
-  the thread's IPC namespace, with Linux's checks in Linux's order and its
-  default limits; a new IPC namespace starts with no segments. A segment's ID is its index and a sequence number, given
+  the thread's IPC namespace, with Linux's checks in Linux's order and the
+  namespace's limits, its `/proc/sys/kernel` files (below): a size from 1
+  to `shmmax` (`EINVAL`), one whose pages wrap (`ENOSPC`), all the pages to
+  `shmall` and the segments to `shmmni` (`ENOSPC`); a new IPC namespace
+  starts with no segments and Linux's defaults. A segment's ID is its index and a sequence number, given
   out in turn as Linux gives them, and `/proc/<pid>/maps` names an attachment
   `/SYSV<key> (deleted)` on device 00:01, with the ID as its inode. The count
   of attachments (`shm_nattch`) counts each VMA that shows the segment, in
@@ -1029,8 +1032,11 @@ kernel.
   from a kernel built without hugetlbfs.
 - System V semaphores (`semget`, `semop`, `semtimedop`, `semctl`) belong to
   the thread's IPC namespace too, with Linux's checks in Linux's order (as
-  `ipc/sem.c`) and its default limits (`SEMMSL` 32000, `SEMMNS`
-  1024000000, `SEMOPM` 500, `SEMMNI` 32000, `SEMVMX` 32767); a set's IDs are
+  `ipc/sem.c`) and the namespace's limits of `/proc/sys/kernel/sem` (Linux's
+  defaults `SEMMSL` 32000, `SEMMNS` 1024000000, `SEMOPM` 500 and `SEMMNI`
+  32000; `SEMVMX` 32767 is fixed), which `semget`, the semaphores of all
+  sets and `semop` keep to (`semopm` compared unsigned, so a negative one
+  bounds nothing); a set's IDs are
   given out as a segment's. `semctl` has `IPC_STAT`, `IPC_SET`, `IPC_RMID`,
   `IPC_INFO`, `SEM_INFO`, `SEM_STAT`, `SEM_STAT_ANY`, `GETVAL`, `SETVAL`,
   `GETALL`, `SETALL`, `GETPID` (in the caller's PID namespace, still once
@@ -1055,8 +1061,10 @@ kernel.
   cut to 0 and `SEMVMX` as Linux cuts them.
 - System V message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) belong to
   the thread's IPC namespace too, with Linux's checks in Linux's order (as
-  `ipc/msg.c`) and its default limits (`MSGMAX` 8192, `MSGMNB` 16384,
-  `MSGMNI` 32000). A queue holds as many bytes as its `msg_qbytes`, and as
+  `ipc/msg.c`) and the namespace's limits of `/proc/sys/kernel` (Linux's
+  defaults `MSGMAX` 8192, `MSGMNB` 16384, `MSGMNI` 32000): a message's
+  size, the bytes a new queue holds and that `IPC_SET` may give without
+  `CAP_SYS_RESOURCE`, and the number of queues. A queue holds as many bytes as its `msg_qbytes`, and as
   many messages; a send to a full one waits, unless `IPC_NOWAIT`
   (`EAGAIN`), in the queue's list of senders until a receive or `IPC_SET`
   makes room for its message, the queue is removed (`EIDRM`) or a signal
@@ -2515,7 +2523,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
   `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
-  `fs` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
+  `fs` and `kernel` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -2629,6 +2637,19 @@ kernel.
   of the memory `sysinfo` reports over twice an inode's size), unsigned
   longs from 0 to `INT_MAX`, and `max_queued_events` (16384 at first) and
   `watchdog_timeout` (0), `int`s from 0.
+- `/proc/sys/kernel` has the System V IPC limits of the opener's IPC
+  namespace, as Linux's `ipc/ipc_sysctl.c`, each a new namespace has at
+  Linux's defaults, owned and opened to write as the files of
+  `/proc/sys/fs/mqueue`: `shmmax` and `shmall` (unsigned longs, as
+  `aio-max-nr`), `shmmni` and `msgmni` (`int`s from 0 to 32768), `msgmax`
+  and `msgmnb` (`int`s from 0), and `sem`, its four `int`s `semmsl`,
+  `semmns`, `semopm` and `semmni` read with tabs between them. A write to
+  `sem` sets as many as it gives, as Linux's `proc_dointvec` reads a
+  vector: a bad one is `EINVAL` and leaves the ones before it set, and
+  `semmni` goes back to what it was unless it ends from 0 to 32768
+  (`proc_ipc_sem_dointvec`). Beside them, `perf_event_paranoid` and
+  `unprivileged_bpf_disabled` read 2, Linux's defaults, and no one may
+  open them to write (`EACCES`). `/proc/sys/kernel` lists only these.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
   descriptor, as Linux's `seq_show` writes it: `pos`, the description's
   position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and

@@ -36,7 +36,7 @@ const SHM_INFO: i32 = 14;
 const SHM_STAT_ANY: i32 = 15;
 
 /// Linux's defaults of `kernel.shmmax`, `kernel.shmall` (in pages) and
-/// `kernel.shmmni`.
+/// `kernel.shmmni`, which each IPC namespace starts with ([`Limits`]).
 const SHMMIN: u64 = 1;
 const SHMMAX: u64 = u64::MAX - (1 << 24);
 const SHMALL: u64 = u64::MAX - (1 << 24);
@@ -67,6 +67,27 @@ struct Table {
     ids: ipc::Ids,
     /// The pages of all segments (Linux's `shm_tot`).
     pages: u64,
+    limits: Limits,
+}
+
+/// An IPC namespace's `kernel.shmmax`, `shmall` and `shmmni` (Linux's
+/// `shm_ctlmax`, `shm_ctlall` and `shm_ctlmni`), which a new one has at
+/// Linux's defaults (`shm_init_ns`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    pub max: u64,
+    pub all: u64,
+    pub mni: i32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max: SHMMAX,
+            all: SHMALL,
+            mni: SHMMNI as i32,
+        }
+    }
 }
 
 struct Segment {
@@ -161,6 +182,11 @@ impl Drop for Attachment {
 }
 
 impl Segments {
+    /// Its limits, which `/proc/sys/kernel` reads and sets
+    /// ([`crate::sysctl`]).
+    pub(crate) fn with_limits<R>(&self, f: impl FnOnce(&mut Limits) -> R) -> R {
+        f(&mut self.lock().limits)
+    }
     fn lock(&self) -> MutexGuard<'_, Table> {
         let mut table = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         table.purge();
@@ -207,9 +233,12 @@ fn result(value: Result<u64, Errno>) -> Outcome {
 /// use gives its segment unless `IPC_CREAT | IPC_EXCL` (`EEXIST`), the size
 /// is more than it has (`EINVAL`) or the permissions asked for are not
 /// granted (`EACCES`); a key not in use is `ENOENT` without `IPC_CREAT`.
-/// A new segment's checks are its size (`EINVAL`), the pages of all
-/// segments (`ENOSPC`), `SHM_HUGETLB` (`ENOSYS`, as from a kernel built
-/// without hugetlbfs) and the number of segments (`ENOSPC`).
+/// A new segment's checks are its size, from 1 to `kernel.shmmax`
+/// (`EINVAL`), its pages, which a size near the top of 64 bits wraps
+/// (`ENOSPC`), the pages of all segments against `kernel.shmall`
+/// (`ENOSPC`), `SHM_HUGETLB` (`ENOSYS`, as from a kernel built without
+/// hugetlbfs) and the number of segments against `kernel.shmmni`
+/// (`ENOSPC`).
 pub(crate) fn sys_shmget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     result(shmget(c, a[0] as i32, a[1], a[2] as i32))
 }
@@ -240,14 +269,19 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
             return Err(Errno::ENOENT);
         }
     }
-    if !(SHMMIN..=SHMMAX).contains(&size) {
+    let limits = table.limits;
+    if !(SHMMIN..=limits.max).contains(&size) {
         return Err(Errno::EINVAL);
     }
-    let pages = size.div_ceil(PAGE);
+    // `newseg`'s page count, which wraps as Linux's does.
+    let pages = size.wrapping_add(PAGE - 1) / PAGE;
+    if pages.wrapping_mul(PAGE) < size {
+        return Err(Errno::ENOSPC);
+    }
     if table
         .pages
         .checked_add(pages)
-        .is_none_or(|total| total > SHMALL)
+        .is_none_or(|total| total > limits.all)
     {
         return Err(Errno::ENOSPC);
     }
@@ -255,7 +289,9 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
         return Err(Errno::ENOSYS);
     }
     let table = &mut *table;
-    let id = table.ids.allocate(&table.segments, SHMMNI)?;
+    let id = table
+        .ids
+        .allocate(&table.segments, limits.mni.max(0) as usize)?;
     let name = format!("/SYSV{:08x} (deleted)", key as u32);
     table.segments.insert(
         ipc::index(id),
@@ -479,11 +515,17 @@ fn shmctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
             .map_err(|_| Errno::EFAULT)
     };
     match cmd {
-        // `struct shminfo64`, and the highest index in use.
+        // `struct shminfo64`, the namespace's limits, `shmseg` its
+        // `shmmni` too, and the highest index in use.
         IPC_INFO => {
-            let max = ipc::max_index(&segments(c).lock().segments);
+            let (max, limits) = {
+                let shm = segments(c);
+                let table = shm.lock();
+                (ipc::max_index(&table.segments), table.limits)
+            };
+            let mni = limits.mni as i64 as u64;
             let mut info = [0u8; 72];
-            for (n, value) in [SHMMAX, SHMMIN, SHMMNI as u64, SHMMNI as u64, SHMALL]
+            for (n, value) in [limits.max, SHMMIN, mni, mni, limits.all]
                 .into_iter()
                 .enumerate()
             {

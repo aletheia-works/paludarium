@@ -45,7 +45,8 @@ const SEM_INFO: i32 = 19;
 const SEM_STAT_ANY: i32 = 20;
 
 /// Linux's defaults of `kernel.sem` (`SEMMSL`, `SEMMNS`, `SEMOPM` and
-/// `SEMMNI`), and the limits that are fixed.
+/// `SEMMNI`), which each IPC namespace starts with ([`Limits`]), and the
+/// limits that are fixed.
 const SEMMSL: i32 = 32000;
 const SEMMNI: usize = 32000;
 const SEMMNS: u64 = SEMMSL as u64 * SEMMNI as u64;
@@ -74,6 +75,39 @@ impl Sets {
     fn lock(&self) -> MutexGuard<'_, Table> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Its limits, which `/proc/sys/kernel/sem` reads and sets
+    /// ([`crate::sysctl`]).
+    pub(crate) fn with_limits<R>(&self, f: impl FnOnce(&mut Limits) -> R) -> R {
+        f(&mut self.lock().limits)
+    }
+}
+
+/// An IPC namespace's `kernel.sem`, in its order: `semmsl`, `semmns`,
+/// `semopm` and `semmni` (Linux's `sem_ctls`), which a new one has at
+/// Linux's defaults (`sem_init_ns`). Only `semmni` is bounded, so the
+/// others may be negative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits(pub [i32; 4]);
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self([SEMMSL, SEMMNS as i32, SEMOPM as i32, SEMMNI as i32])
+    }
+}
+
+impl Limits {
+    fn msl(self) -> i32 {
+        self.0[0]
+    }
+    fn mns(self) -> i32 {
+        self.0[1]
+    }
+    fn opm(self) -> i32 {
+        self.0[2]
+    }
+    fn mni(self) -> i32 {
+        self.0[3]
+    }
 }
 
 #[derive(Default)]
@@ -83,6 +117,7 @@ struct Table {
     ids: ipc::Ids,
     /// The semaphores of all sets (Linux's `used_sems`).
     used: u64,
+    limits: Limits,
 }
 
 impl Table {
@@ -563,24 +598,26 @@ fn result(value: Result<u64, Errno>) -> Outcome {
 }
 
 /// `semget(key, nsems, semflg)`, as Linux's `ksys_semget` and `ipcget`: a
-/// count above `SEMMSL` or below 0 is `EINVAL`; a key in use gives its set
+/// count above `semmsl` or below 0 is `EINVAL`; a key in use gives its set
 /// unless `IPC_CREAT | IPC_EXCL` (`EEXIST`), the count is more than it has
 /// (`EINVAL`) or the permissions asked for are not granted (`EACCES`); a
 /// key not in use is `ENOENT` without `IPC_CREAT`. A new set's checks are
-/// its count (`EINVAL` for 0), the semaphores of all sets (`ENOSPC`) and
-/// the number of sets (`ENOSPC`).
+/// its count (`EINVAL` for 0), the semaphores of all sets against `semmns`
+/// (`ENOSPC`) and the number of sets against `semmni` (`ENOSPC`), the
+/// limits of `kernel.sem`.
 pub(crate) fn sys_semget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     result(semget(c, a[0] as i32, a[1] as i32, a[2] as i32))
 }
 
 fn semget(c: &Context<'_>, key: i32, count: i32, flag: i32) -> Result<u64, Errno> {
-    if !(0..=SEMMSL).contains(&count) {
+    let sets = sets(c);
+    let mut table = sets.lock();
+    let limits = table.limits;
+    if count < 0 || count > limits.msl() {
         return Err(Errno::EINVAL);
     }
     let credentials = &c.process.credentials;
     let owner = ipc::capable(c, CAP_IPC_OWNER);
-    let sets = sets(c);
-    let mut table = sets.lock();
     if key != IPC_PRIVATE {
         if let Some(set) = table.sets.values().find(|set| set.perm.key == key) {
             if flag & IPC_CREAT != 0 && flag & IPC_EXCL != 0 {
@@ -601,11 +638,13 @@ fn semget(c: &Context<'_>, key: i32, count: i32, flag: i32) -> Result<u64, Errno
     if count == 0 {
         return Err(Errno::EINVAL);
     }
-    if table.used + count as u64 > SEMMNS {
+    if table.used as i64 + i64::from(count) > i64::from(limits.mns()) {
         return Err(Errno::ENOSPC);
     }
     let table = &mut *table;
-    let id = table.ids.allocate(&table.sets, SEMMNI)?;
+    let id = table
+        .ids
+        .allocate(&table.sets, limits.mni().max(0) as usize)?;
     table.sets.insert(
         ipc::index(id),
         Set {
@@ -644,7 +683,8 @@ pub(crate) fn sys_semtimedop(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 /// The operations at `at`, in Linux's order (`do_semtimedop` and
-/// `__do_semtimedop`): more than `SEMOPM` is `E2BIG` and none `EINVAL`,
+/// `__do_semtimedop`): more than `semopm` of `kernel.sem` is `E2BIG`
+/// (compared unsigned, so a negative one bounds nothing) and none `EINVAL`,
 /// then the operations are read (`EFAULT`); a negative ID or an invalid
 /// timeout is `EINVAL`; then the set (`EINVAL`), a semaphore number beyond
 /// it (`EFBIG`) and the permission to change it, or to read it when no
@@ -660,7 +700,7 @@ fn semtimedop(
     count: u32,
     timeout: Option<(i64, i64)>,
 ) -> Result<u64, Errno> {
-    if count > SEMOPM {
+    if count > sets(c).lock().limits.opm() as u32 {
         return Err(E2BIG);
     }
     if count < 1 {
@@ -843,13 +883,14 @@ fn semctl(c: &Context<'_>, id: i32, n: i32, cmd: i32, arg: u64) -> Result<u64, E
     };
     match cmd {
         IPC_INFO | SEM_INFO => {
-            let (max, sets_in_use, used) = {
+            let (max, sets_in_use, used, limits) = {
                 let sets = sets(c);
                 let table = sets.lock();
                 (
                     ipc::max_index(&table.sets),
                     table.sets.len() as i32,
                     table.used as i32,
+                    table.limits,
                 )
             };
             let (usz, aem) = if cmd == SEM_INFO {
@@ -860,11 +901,11 @@ fn semctl(c: &Context<'_>, id: i32, n: i32, cmd: i32, arg: u64) -> Result<u64, E
             // `struct seminfo`.
             let info = [
                 SEMMAP,
-                SEMMNI as i32,
-                SEMMNS as i32,
+                limits.mni(),
+                limits.mns(),
                 SEMMNU,
-                SEMMSL,
-                SEMOPM as i32,
+                limits.msl(),
+                limits.opm(),
                 SEMUME,
                 usz,
                 SEMVMX,

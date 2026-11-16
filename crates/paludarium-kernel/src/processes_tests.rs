@@ -4347,6 +4347,166 @@ mod shm {
         assert_eq!(msg[1].len(), msg[0].len());
     }
 
+    /// A write of `text` to `/proc/sys/kernel/<name>`: its result, or the
+    /// open's.
+    fn write_kernel(
+        k: &mut Kernel,
+        t: &mut Thread,
+        m: &AddressSpace,
+        name: &str,
+        text: &[u8],
+    ) -> u64 {
+        const PATH: u64 = DATA + 0x900;
+        const BUF: u64 = DATA + 0xa00;
+        m.write(
+            GuestAddr(PATH),
+            format!("/proc/sys/kernel/{name}\0").as_bytes(),
+        )
+        .unwrap();
+        let fd = syscall(k, t, m, 2, [PATH, 1, 0, 0, 0, 0]);
+        if fd >= 1 << 63 {
+            return fd;
+        }
+        m.write(GuestAddr(BUF), text).unwrap();
+        let n = syscall(k, t, m, 1, [fd, BUF, text.len() as u64, 0, 0, 0]);
+        assert_eq!(syscall(k, t, m, 3, [fd, 0, 0, 0, 0, 0]), 0);
+        n
+    }
+
+    #[test]
+    fn proc_sys_kernel_sets_and_enforces_the_namespace_s_ipc_limits() {
+        let (mut k, mut t, m) = setup();
+        let read = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, name: &str| {
+            read_proc(k, t, m, &format!("/proc/sys/kernel/{name}"))
+        };
+        for (name, value) in [
+            ("shmmax", "18446744073692774399\n"),
+            ("shmall", "18446744073692774399\n"),
+            ("shmmni", "4096\n"),
+            ("msgmax", "8192\n"),
+            ("msgmnb", "16384\n"),
+            ("msgmni", "32000\n"),
+            ("sem", "32000\t1024000000\t500\t32000\n"),
+            ("perf_event_paranoid", "2\n"),
+            ("unprivileged_bpf_disabled", "2\n"),
+        ] {
+            assert_eq!(read(&mut k, &mut t, &m, name), value, "{name}");
+        }
+        // No one writes the fixed ones.
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "perf_event_paranoid", b"1"),
+            e(Errno::EACCES)
+        );
+        // Shared memory: a segment's size, all their pages, their number.
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "shmmax", b"8192\n"), 5);
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "shmmax", b"-1"),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "shmall", b"2"), 1);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "shmmni", b"1"), 1);
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "shmmni", b"32769"),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(shmget(&mut k, &mut t, &m, 0, 8193, 0o600), e(Errno::EINVAL));
+        assert!(shmget(&mut k, &mut t, &m, 0, 8192, 0o600) < 1 << 31);
+        assert_eq!(shmget(&mut k, &mut t, &m, 0, 1, 0o600), e(Errno::ENOSPC));
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "shmall", b"10"), 2);
+        assert_eq!(shmget(&mut k, &mut t, &m, 0, 1, 0o600), e(Errno::ENOSPC));
+        // A size whose pages wrap.
+        write_kernel(&mut k, &mut t, &m, "shmmax", b"18446744073709551615");
+        write_kernel(&mut k, &mut t, &m, "shmmni", b"5");
+        write_kernel(&mut k, &mut t, &m, "shmall", b"18446744073709551615");
+        assert_eq!(
+            shmget(&mut k, &mut t, &m, 0, 0xffff_ffff_ffff_f001, 0o600),
+            e(Errno::ENOSPC)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [0, IPC_INFO, DS, 0, 0, 0]),
+            0
+        );
+        let info: Vec<u64> = (0..5)
+            .map(|n| m.read_u64(GuestAddr(DS + n * 8)).unwrap())
+            .collect();
+        assert_eq!(info, [u64::MAX, 1, 5, 5, u64::MAX]);
+        // Semaphores: a vector, the values before a bad one kept, semmni
+        // back unless in its bounds.
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "sem", b"1 2 x"),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "sem"), "1\t2\t500\t32000\n");
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "sem", b"7 8 9 40000"),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "sem"), "7\t8\t9\t32000\n");
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "sem", b"11 22 33 1 99"),
+            11
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "sem"), "11\t22\t33\t1\n");
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "sem", b" \n"),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 64, [0, 12, 0o600, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        assert!(syscall(&mut k, &mut t, &m, 64, [0, 11, 0o600, 0, 0, 0]) < 1 << 31);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 64, [0, 1, 0o600, 0, 0, 0]),
+            e(Errno::ENOSPC)
+        );
+        // Message queues: a message's size, a new queue's bytes.
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "msgmax", b"4"), 1);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "msgmnb", b"100"), 3);
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "msgmni", b"32769"),
+            e(Errno::EINVAL)
+        );
+        let queue = syscall(&mut k, &mut t, &m, 68, [0, 0o600, 0, 0, 0, 0]);
+        assert!(queue < 1 << 31);
+        m.write_u64(GuestAddr(DATA + 0x400), 1).unwrap();
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                69,
+                [queue, DATA + 0x400, 5, 0o4000, 0, 0]
+            ),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            syscall(
+                &mut k,
+                &mut t,
+                &m,
+                69,
+                [queue, DATA + 0x400, 4, 0o4000, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 71, [queue, IPC_STAT, DS, 0, 0, 0]),
+            0
+        );
+        assert_eq!(m.read_u64(GuestAddr(DS + 88)).unwrap(), 100);
+        // A new IPC namespace has Linux's defaults again.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 272, [0x0800_0000, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "msgmax"), "8192\n");
+        assert_eq!(
+            read(&mut k, &mut t, &m, "sem"),
+            "32000\t1024000000\t500\t32000\n"
+        );
+    }
+
     #[test]
     fn attachments_share_memory_and_count_as_their_mappings() {
         let (mut k, mut t, m) = setup();

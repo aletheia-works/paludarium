@@ -14,6 +14,17 @@
 //! `max_user_groups` and `max_user_marks` unsigned longs from 0 to
 //! `INT_MAX`, `max_queued_events` and `watchdog_timeout` `int`s from 0.
 //!
+//! `/proc/sys/kernel` has the System V IPC limits of the opener's IPC
+//! namespace, as Linux's `ipc/ipc_sysctl.c` has them: `shmmax` and `shmall`
+//! unsigned longs, `shmmni` and `msgmni` `int`s from 0 to `IPCMNI`, `msgmax`
+//! and `msgmnb` `int`s from 0, and `sem`, four `int`s (`semmsl`, `semmns`,
+//! `semopm`, `semmni`) read with tabs between them and written as many as
+//! are given, the ones before a bad one kept, and `semmni` back as it was
+//! unless it ends from 0 to `IPCMNI` (`proc_ipc_sem_dointvec`). Their
+//! owners and who may write them are the mqueue files'. Beside them are
+//! `perf_event_paranoid` and `unprivileged_bpf_disabled`, 2 as on Linux's
+//! defaults, which no one may write.
+//!
 //! Each file is the opener's IPC namespace's ([`crate::mqueue::Limits`]),
 //! so a new namespace shows Linux's defaults again. A read gives the value
 //! and a newline from the start of the file, nothing from elsewhere; a
@@ -25,7 +36,9 @@
 //! `sysctl_writes_strict` has it. A file's mode is 0644, and only the root
 //! of the user namespace that owns the IPC namespace may open it to write
 //! (`mq_permissions`, `EACCES`).
+use crate::ipc::IPCMNI;
 use crate::mqueue::{HARD_MSGMAX, HARD_MSGSIZEMAX, Limits, Queues};
+use crate::namespaces::Namespace;
 use crate::syscalls::Context;
 use crate::users::Ids as Kind;
 use paludarium_host::{DirectoryEntry, FileHandle, FileStat};
@@ -49,6 +62,7 @@ pub(crate) enum Directory {
     Mqueue,
     Inotify,
     Fanotify,
+    Kernel,
 }
 
 /// A file of `/proc/sys/fs/mqueue`.
@@ -126,6 +140,48 @@ const FANOTIFY: [(&[u8], Fanotify); 4] = [
     (b"watchdog_timeout", Fanotify::WatchdogTimeout),
 ];
 
+/// A file of `/proc/sys/kernel`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kernel {
+    Msgmax,
+    Msgmnb,
+    Msgmni,
+    PerfEventParanoid,
+    Sem,
+    Shmall,
+    Shmmax,
+    Shmmni,
+    UnprivilegedBpfDisabled,
+}
+
+/// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
+/// name).
+const KERNEL: [(&[u8], Kernel); 9] = [
+    (b"msgmax", Kernel::Msgmax),
+    (b"msgmnb", Kernel::Msgmnb),
+    (b"msgmni", Kernel::Msgmni),
+    (b"perf_event_paranoid", Kernel::PerfEventParanoid),
+    (b"sem", Kernel::Sem),
+    (b"shmall", Kernel::Shmall),
+    (b"shmmax", Kernel::Shmmax),
+    (b"shmmni", Kernel::Shmmni),
+    (
+        b"unprivileged_bpf_disabled",
+        Kernel::UnprivilegedBpfDisabled,
+    ),
+];
+
+impl Kernel {
+    /// Whether it is one of the IPC namespace's limits; else it is a
+    /// fixed value no one may write.
+    fn ipc(self) -> bool {
+        !matches!(
+            self,
+            Self::PerfEventParanoid | Self::UnprivilegedBpfDisabled
+        )
+    }
+}
+
 /// What `path` names under `/proc/sys`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Entry {
@@ -134,6 +190,7 @@ pub(crate) enum Entry {
     Aio(Aio),
     Inotify(Inotify),
     Fanotify(Fanotify),
+    Kernel(Kernel),
 }
 
 /// The entry `path` names, if it is one of these.
@@ -151,7 +208,14 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
         b"/fs/fanotify" => Some(Entry::Directory(Directory::Fanotify)),
         b"/fs/aio-max-nr" => Some(Entry::Aio(Aio::MaxNr)),
         b"/fs/aio-nr" => Some(Entry::Aio(Aio::Nr)),
+        b"/kernel" => Some(Entry::Directory(Directory::Kernel)),
         _ => {
+            if let Some(name) = rest.strip_prefix(b"/kernel/") {
+                return KERNEL
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .map(|&(_, file)| Entry::Kernel(file));
+            }
             if let Some(name) = rest.strip_prefix(b"/fs/fanotify/") {
                 return FANOTIFY
                     .iter()
@@ -176,7 +240,7 @@ pub(crate) fn entry(path: &[u8]) -> Option<Entry> {
 /// The entries of `directory`.
 pub(crate) fn entries(directory: Directory) -> Vec<DirectoryEntry> {
     let names: Vec<(&[u8], u8)> = match directory {
-        Directory::Sys => vec![(b"fs", DT_DIR)],
+        Directory::Sys => vec![(b"fs", DT_DIR), (b"kernel", DT_DIR)],
         Directory::Fs => vec![
             (b"aio-max-nr", DT_REG),
             (b"aio-nr", DT_REG),
@@ -187,6 +251,7 @@ pub(crate) fn entries(directory: Directory) -> Vec<DirectoryEntry> {
         Directory::Mqueue => SETTINGS.iter().map(|&(name, _)| (name, DT_REG)).collect(),
         Directory::Inotify => INOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
         Directory::Fanotify => FANOTIFY.iter().map(|&(name, _)| (name, DT_REG)).collect(),
+        Directory::Kernel => KERNEL.iter().map(|&(name, _)| (name, DT_REG)).collect(),
     };
     [(&b"."[..], DT_DIR), (b"..", DT_DIR)]
         .into_iter()
@@ -214,6 +279,84 @@ fn owner(c: &Context<'_>) -> (u32, u32) {
         user.kernel_of(Kind::User, 0).unwrap_or(0),
         user.kernel_of(Kind::Group, 0).unwrap_or(0),
     )
+}
+
+/// The caller's IPC namespace.
+fn ipc(c: &Context<'_>) -> Arc<Namespace> {
+    Arc::clone(&c.group.namespaces(c.tid).ipc)
+}
+
+/// The value of a `/proc/sys/kernel` file of `ipc`, as a line: `sem`'s
+/// four with tabs between them.
+fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
+    match file {
+        Kernel::Shmmax => format!("{}\n", ipc.shm.with_limits(|limits| limits.max)).into_bytes(),
+        Kernel::Shmall => format!("{}\n", ipc.shm.with_limits(|limits| limits.all)).into_bytes(),
+        Kernel::Shmmni => line(ipc.shm.with_limits(|limits| limits.mni)),
+        Kernel::Msgmax => line(ipc.msg.with_limits(|limits| limits.max)),
+        Kernel::Msgmnb => line(ipc.msg.with_limits(|limits| limits.mnb)),
+        Kernel::Msgmni => line(ipc.msg.with_limits(|limits| limits.mni)),
+        Kernel::Sem => {
+            let [msl, mns, opm, mni] = ipc.sem.with_limits(|limits| limits.0);
+            format!("{msl}\t{mns}\t{opm}\t{mni}\n").into_bytes()
+        }
+        Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => line(2),
+    }
+}
+
+/// Takes the value of a `/proc/sys/kernel` file of `ipc` written at the
+/// start of the file: the bytes taken.
+fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errno> {
+    let mni = Some((0, IPCMNI as i32));
+    let int = Some((0, i32::MAX));
+    match file {
+        // `proc_doulongvec_minmax`, with no bounds.
+        Kernel::Shmmax | Kernel::Shmall => {
+            let (negative, value, consumed) = scan(buf)?;
+            if negative {
+                return Err(Errno::EINVAL);
+            }
+            ipc.shm.with_limits(|limits| {
+                if file == Kernel::Shmmax {
+                    limits.max = value;
+                } else {
+                    limits.all = value;
+                }
+            });
+            Ok(consumed)
+        }
+        Kernel::Shmmni => {
+            let (value, consumed) = parse(buf, mni)?;
+            ipc.shm.with_limits(|limits| limits.mni = value);
+            Ok(consumed)
+        }
+        Kernel::Msgmax | Kernel::Msgmnb | Kernel::Msgmni => {
+            let (value, consumed) = parse(buf, if file == Kernel::Msgmni { mni } else { int })?;
+            ipc.msg.with_limits(|limits| match file {
+                Kernel::Msgmax => limits.max = value,
+                Kernel::Msgmnb => limits.mnb = value,
+                _ => limits.mni = value,
+            });
+            Ok(consumed)
+        }
+        // `proc_ipc_sem_dointvec`: the values before a bad one stay, and
+        // `semmni` goes back unless it ends in its bounds.
+        Kernel::Sem => ipc.sem.with_limits(|limits| {
+            let semmni = limits.0[3];
+            let written = parse_ints(buf, &mut limits.0).and_then(|consumed| {
+                if (0..=IPCMNI as i32).contains(&limits.0[3]) {
+                    Ok(consumed)
+                } else {
+                    Err(Errno::EINVAL)
+                }
+            });
+            if written.is_err() {
+                limits.0[3] = semmni;
+            }
+            written
+        }),
+        Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => Err(Errno::EINVAL),
+    }
 }
 
 /// The value of an aio file, as a line.
@@ -264,6 +407,19 @@ pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
             mode: 0o100_644,
             ..crate::proc::stat(fanotify_line(&c.files.caches.notify.fan.limits, file).len())
         },
+        Entry::Kernel(file) if !file.ipc() => FileStat {
+            mode: 0o100_444,
+            ..crate::proc::stat(line(2).len())
+        },
+        Entry::Kernel(file) => {
+            let (uid, gid) = owner(c);
+            FileStat {
+                mode: 0o100_644,
+                uid,
+                gid,
+                ..crate::proc::stat(kernel_line(&ipc(c), file).len())
+            }
+        }
         Entry::Setting(setting) => {
             let (uid, gid) = owner(c);
             let queues = queues(c);
@@ -285,7 +441,9 @@ fn line(value: i32) -> Vec<u8> {
 /// Opens `entry` with `flags`: a directory only to read (`EISDIR`), a
 /// setting to write only by the root of the namespace's owner (`EACCES`),
 /// as `mq_permissions` lets the owner's root have the owner's bits and
-/// everyone else the others'.
+/// everyone else the others', and so a `/proc/sys/kernel` IPC limit
+/// (`ipc_permissions`); `perf_event_paranoid` and
+/// `unprivileged_bpf_disabled` to no one (`EACCES`).
 pub(crate) fn open(
     c: &Context<'_>,
     entry: Entry,
@@ -302,6 +460,17 @@ pub(crate) fn open(
             }
             Ok(Arc::new(SettingFile {
                 value: Value::Mqueue(queues(c), setting),
+                stat: stat(c, entry),
+                position: Mutex::new(0),
+                flags,
+            }))
+        }
+        Entry::Kernel(file) => {
+            if flags & 3 != 0 && (!file.ipc() || c.process.credentials.euid != owner(c).0) {
+                return Err(Errno::EACCES);
+            }
+            Ok(Arc::new(SettingFile {
+                value: Value::Kernel(ipc(c), file),
                 stat: stat(c, entry),
                 position: Mutex::new(0),
                 flags,
@@ -350,6 +519,7 @@ enum Value {
     Aio(Arc<crate::aio::Limits>, Aio),
     Inotify(Arc<crate::inotify::Notifier>, Inotify),
     Fanotify(Arc<crate::fanotify::Registry>, Fanotify),
+    Kernel(Arc<Namespace>, Kernel),
 }
 
 impl Value {
@@ -361,6 +531,7 @@ impl Value {
             Self::Aio(limits, aio) => aio_line(limits, *aio),
             Self::Inotify(notifier, file) => inotify_line(&notifier.limits, *file),
             Self::Fanotify(registry, file) => fanotify_line(&registry.limits, *file),
+            Self::Kernel(ipc, file) => kernel_line(ipc, *file),
         }
     }
     /// Takes the value written at the start of the file: the bytes taken.
@@ -372,6 +543,7 @@ impl Value {
                 value.store(parsed, Ordering::SeqCst);
                 Ok(consumed)
             }
+            Self::Kernel(ipc, file) => kernel_write(ipc, *file, buf),
             Self::Aio(limits, _) => {
                 let (negative, value, consumed) = scan(buf)?;
                 if negative {
@@ -569,6 +741,26 @@ fn parse(buf: &[u8], bounds: Option<(i32, i32)>) -> Result<(i32, usize), Errno> 
     Ok((value, consumed))
 }
 
+/// The `int`s of a vector written to a sysctl, as Linux's
+/// `__do_proc_dointvec` reads them into `values`: each as [`parse`] reads
+/// one, until the end or the last of `values`. A bad one ends it with
+/// `EINVAL`, the ones before it kept; none at all is `EINVAL` too. The
+/// bytes taken, the spaces after the last one too.
+fn parse_ints(buf: &[u8], values: &mut [i32]) -> Result<usize, Errno> {
+    let buf = &buf[..buf.len().min(4095)];
+    let mut at = 0;
+    for (n, value) in values.iter_mut().enumerate() {
+        at += buf[at..].iter().take_while(|&&b| space(b)).count();
+        if at == buf.len() {
+            return if n == 0 { Err(Errno::EINVAL) } else { Ok(at) };
+        }
+        let (parsed, consumed) = parse(&buf[at..], None)?;
+        *value = parsed;
+        at += consumed;
+    }
+    Ok(at)
+}
+
 /// `strtoul` with base 0 on digits that start with a digit: 16 after `0x`
 /// followed by a hexadecimal digit, 8 after another `0`, else 10. The value
 /// and the characters it took; none when it overflows.
@@ -632,7 +824,17 @@ mod tests {
             Some(Entry::Fanotify(Fanotify::UserMarks))
         );
         assert_eq!(entry(b"/proc/sys/fs/fanotify/other"), None);
-        assert_eq!(entry(b"/proc/sys/kernel"), None);
+        assert_eq!(
+            entry(b"/proc/sys/kernel"),
+            Some(Entry::Directory(Directory::Kernel))
+        );
+        assert_eq!(
+            entry(b"/proc/sys/kernel/sem"),
+            Some(Entry::Kernel(Kernel::Sem))
+        );
+        assert_eq!(entry(b"/proc/sys/kernel/other"), None);
+        assert_eq!(entries(Directory::Sys).len(), 4);
+        assert_eq!(entries(Directory::Kernel).len(), 11);
         assert_eq!(entry(b"/proc/system"), None);
         assert_eq!(entries(Directory::Mqueue).len(), 7);
     }
@@ -673,5 +875,24 @@ mod tests {
         assert_eq!(scan(b"18446744073709551615\n"), Ok((false, u64::MAX, 21)));
         assert_eq!(scan(b"-1"), Ok((true, 1, 2)));
         assert_eq!(scan(b"18446744073709551616"), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn a_vector_takes_the_ints_given_and_keeps_those_before_a_bad_one() {
+        let mut values = [1, 2, 3, 4];
+        assert_eq!(parse_ints(b"10\t20\t5\t3\n", &mut values), Ok(10));
+        assert_eq!(values, [10, 20, 5, 3]);
+        assert_eq!(parse_ints(b"  6  7  ", &mut values), Ok(8));
+        assert_eq!(values, [6, 7, 5, 3]);
+        // Past the last value the rest is not taken.
+        assert_eq!(parse_ints(b"11 22 33 1 99", &mut values), Ok(11));
+        assert_eq!(values, [11, 22, 33, 1]);
+        assert_eq!(parse_ints(b"8 9 x", &mut values), Err(Errno::EINVAL));
+        assert_eq!(values, [8, 9, 33, 1]);
+        assert_eq!(parse_ints(b"-1", &mut values), Ok(2));
+        assert_eq!(values[0], -1);
+        for none in [&b""[..], b" \n"] {
+            assert_eq!(parse_ints(none, &mut values), Err(Errno::EINVAL));
+        }
     }
 }

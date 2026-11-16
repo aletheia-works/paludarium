@@ -78,7 +78,7 @@ verified.
   user space ends at 2^47 bytes, as with 4-level page tables.
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, `/proc/sys` but for `fs`, ...) and the other names in
+  (`/proc/cpuinfo`, `/proc/sys` but for `fs` and `kernel`, ...) and the other names in
   the reader's own directory (`auxv`, `limits`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `statm` and
@@ -232,7 +232,8 @@ verified.
   The SIMD register
   fields of Linux master's structure are not checked, and any use of them is
   `EOPNOTSUPP`. `kernel.perf_event_paranoid` is always 2 (Debian's and
-  Ubuntu's kernels default to more), with no `/proc/sys/kernel` file for it,
+  Ubuntu's kernels default to more), and its `/proc/sys/kernel` file cannot
+  be written (mode 0444), where Linux's root may write Linux's (0644),
   and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
 - **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
@@ -254,8 +255,9 @@ verified.
   map is made, where Linux may give `ENOMEM`), and fdinfo's `memlock` is
   the elements' size alone. `BPF_F_MMAPABLE` is taken but `mmap` of a map
   is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
-  `kernel.unprivileged_bpf_disabled` is always 2, with no
-  `/proc/sys/kernel` file for it.
+  `kernel.unprivileged_bpf_disabled` is always 2, and its
+  `/proc/sys/kernel` file cannot be written (mode 0444), where Linux's
+  root may write Linux's (0644).
 - **Virtual CPUs**: a thread that has registered `rseq` runs on a virtual
   CPU, not on a CPU of the host's, so the CPU its area and `getcpu` show is
   not where the host runs it, and `/proc/<pid>/stat` shows CPU 0. Its
@@ -414,9 +416,10 @@ verified.
     a pidfd with `PIDFD_THREAD` has the inode of its whole process. A pidfd
     opened from a handle with `O_EXCL` does not keep `PIDFD_THREAD`, as on
     the CI runners' Linux 7.0, where Linux 7.2 and later keep it.
-  - The limits of System V IPC's shared memory, semaphores and message
-    queues are Linux's defaults, which `/proc/sys/kernel` cannot change.
-    `/proc/sysvipc` shows its objects as they were when it was opened,
+  - System V IPC has no `shm_rmid_forced`, `auto_msgmni`,
+    `shm_next_id`, `sem_next_id` or `msg_next_id` in `/proc/sys/kernel`,
+    and `IPCMNI` is always 32768, as without the `ipcmni_extend` boot
+    option. `/proc/sysvipc` shows its objects as they were when it was opened,
     where Linux reads each one as the read reaches it.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
@@ -445,8 +448,9 @@ verified.
     little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
-  - A `/proc/sys/fs/mqueue` file checks who may write it when it is opened,
-    where Linux checks the writer again at each write, and it reports its
+  - A `/proc/sys/fs/mqueue` file and an IPC limit of `/proc/sys/kernel`
+    check who may write them when they are opened,
+    where Linux checks the writer again at each write, and each reports its
     value's length as its size, where Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.

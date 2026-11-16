@@ -36,8 +36,9 @@ const EIDRM: Errno = Errno(43);
 const ENOMSG: Errno = Errno(42);
 const EINTR: Errno = Errno(4);
 
-/// Linux's defaults of `kernel.msgmni`, `msgmax` and `msgmnb`, and the
-/// values `msginfo` reports from them.
+/// Linux's defaults of `kernel.msgmni`, `msgmax` and `msgmnb`, which each
+/// IPC namespace starts with ([`Limits`]), and the values `msginfo` reports
+/// from them whatever the namespace's are.
 const MSGMNI: usize = 32000;
 const MSGMAX: u64 = 8192;
 const MSGMNB: u64 = 16384;
@@ -67,6 +68,31 @@ impl Queues {
     fn lock(&self) -> MutexGuard<'_, Table> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Its limits, which `/proc/sys/kernel` reads and sets
+    /// ([`crate::sysctl`]).
+    pub(crate) fn with_limits<R>(&self, f: impl FnOnce(&mut Limits) -> R) -> R {
+        f(&mut self.lock().limits)
+    }
+}
+
+/// An IPC namespace's `kernel.msgmax`, `msgmnb` and `msgmni` (Linux's
+/// `msg_ctlmax`, `msg_ctlmnb` and `msg_ctlmni`), which a new one has at
+/// Linux's defaults (`msg_init_ns`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    pub max: i32,
+    pub mnb: i32,
+    pub mni: i32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max: MSGMAX as i32,
+            mnb: MSGMNB as i32,
+            mni: MSGMNI as i32,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -78,6 +104,7 @@ struct Table {
     /// `percpu_msg_hdrs` and `percpu_msg_bytes`).
     messages: u64,
     bytes: u64,
+    limits: Limits,
 }
 
 impl Table {
@@ -306,7 +333,8 @@ fn result(value: Result<u64, Errno>) -> Outcome {
 /// `msgget(key, msgflg)`, as Linux's `ksys_msgget` and `ipcget`: a key in
 /// use gives its queue unless `IPC_CREAT | IPC_EXCL` (`EEXIST`) or the
 /// permissions asked for are not granted (`EACCES`); a key not in use is
-/// `ENOENT` without `IPC_CREAT`; a new queue past `MSGMNI` is `ENOSPC`.
+/// `ENOENT` without `IPC_CREAT`; a new queue past `kernel.msgmni` is
+/// `ENOSPC`, and it holds `kernel.msgmnb` bytes.
 pub(crate) fn sys_msgget(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     result(msgget(c, a[0] as i32, a[1] as i32))
 }
@@ -331,7 +359,10 @@ fn msgget(c: &Context<'_>, key: i32, flag: i32) -> Result<u64, Errno> {
         }
     }
     let table = &mut *table;
-    let id = table.ids.allocate(&table.queues, MSGMNI)?;
+    let limits = table.limits;
+    let id = table
+        .ids
+        .allocate(&table.queues, limits.mni.max(0) as usize)?;
     table.queues.insert(
         ipc::index(id),
         Queue {
@@ -341,7 +372,7 @@ fn msgget(c: &Context<'_>, key: i32, flag: i32) -> Result<u64, Errno> {
             rtime: 0,
             ctime: ipc::now(c),
             bytes: 0,
-            qbytes: MSGMNB,
+            qbytes: limits.mnb as u64,
             messages: VecDeque::new(),
             lspid: KeptPid::default(),
             lrpid: KeptPid::default(),
@@ -353,7 +384,7 @@ fn msgget(c: &Context<'_>, key: i32, flag: i32) -> Result<u64, Errno> {
 }
 
 /// `msgsnd(msqid, msgp, msgsz, msgflg)`, in Linux's order (`ksys_msgsnd`,
-/// `do_msgsnd`): the type is read (`EFAULT`); a size past `MSGMAX` or a
+/// `do_msgsnd`): the type is read (`EFAULT`); a size past `kernel.msgmax` or a
 /// negative ID is `EINVAL`, and so is a type below 1; the text is read
 /// (`EFAULT`); then the queue (`EINVAL`), the permission to write it
 /// (`EACCES`) and, while it is full, `EAGAIN` with `IPC_NOWAIT`, or a wait
@@ -365,7 +396,9 @@ pub(crate) fn sys_msgsnd(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 
 fn msgsnd(c: &mut Context<'_>, id: i32, at: u64, size: u64, flag: i32) -> Result<u64, Errno> {
     let kind = c.mem.read_u64(GuestAddr(at)).map_err(|_| Errno::EFAULT)? as i64;
-    if size > MSGMAX || id < 0 || kind < 1 {
+    let queues = queues(c);
+    let most = queues.lock().limits.max as u64;
+    if size > most || (size as i64) < 0 || id < 0 || kind < 1 {
         return Err(Errno::EINVAL);
     }
     let mut text = vec![0u8; size as usize];
@@ -374,7 +407,6 @@ fn msgsnd(c: &mut Context<'_>, id: i32, at: u64, size: u64, flag: i32) -> Result
         .map_err(|_| Errno::EFAULT)?;
     let message = Message { kind, text };
     let pid = c.pid_space().keep(c.process.pid);
-    let queues = queues(c);
     loop {
         let owner = ipc::capable(c, CAP_IPC_OWNER);
         let now = ipc::now(c);
@@ -467,6 +499,7 @@ fn msgrcv(
         let slot = {
             let mut table = queues.lock();
             let table = &mut *table;
+            let most = table.limits.max as u64;
             let Ok(queue) = table.checked(id) else {
                 return Err(EIDRM);
             };
@@ -479,8 +512,9 @@ fn msgrcv(
                     return Err(E2BIG);
                 }
                 if flag & MSG_COPY != 0 {
-                    // `copy_msg` into a copy of at most `MSGMAX` bytes.
-                    if length > size.min(MSGMAX) {
+                    // `copy_msg` into a copy of at most `kernel.msgmax`
+                    // bytes.
+                    if length > size.min(most) {
                         return Err(Errno::EINVAL);
                     }
                     break queue.messages[found].clone();
@@ -619,7 +653,7 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
         // `msgctl_info`: `struct msginfo`, with what is in use for
         // `MSG_INFO`; the highest index in use.
         IPC_INFO | MSG_INFO => {
-            let (max, in_use, messages, bytes) = {
+            let (max, in_use, messages, bytes, limits) = {
                 let queues = queues(c);
                 let table = queues.lock();
                 (
@@ -627,6 +661,7 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                     table.queues.len() as i32,
                     table.messages.min(i32::MAX as u64) as i32,
                     table.bytes.min(i32::MAX as u64) as i32,
+                    table.limits,
                 )
             };
             let (pool, map, tql) = if cmd == MSG_INFO {
@@ -635,17 +670,9 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                 (MSGPOOL, MSGMAP, MSGTQL)
             };
             let mut info = [0u8; INFO_SIZE];
-            for (at, value) in [
-                pool,
-                map,
-                MSGMAX as i32,
-                MSGMNB as i32,
-                MSGMNI as i32,
-                MSGSSZ,
-                tql,
-            ]
-            .into_iter()
-            .enumerate()
+            for (at, value) in [pool, map, limits.max, limits.mnb, limits.mni, MSGSSZ, tql]
+                .into_iter()
+                .enumerate()
             {
                 info[at * 4..at * 4 + 4].copy_from_slice(&value.to_le_bytes());
             }
@@ -681,7 +708,7 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
             Ok(returned)
         }
         // `msgctl_down`: the owner, the creator or CAP_SYS_ADMIN over the
-        // IPC namespace (`EPERM`); `IPC_SET` past `MSGMNB` needs
+        // IPC namespace (`EPERM`); `IPC_SET` past `kernel.msgmnb` needs
         // CAP_SYS_RESOURCE (`EPERM`), and the owner must be one the caller's
         // user namespace maps (`EINVAL`). The waits look again.
         IPC_SET | IPC_RMID => {
@@ -698,12 +725,13 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
             let queues = queues(c);
             let mut table = queues.lock();
             let credentials = &c.process.credentials;
+            let most = table.limits.mnb as u64;
             let queue = table.checked(id)?;
             if !queue.perm.owned_by(credentials) && !admin {
                 return Err(Errno::EPERM);
             }
             if cmd == IPC_SET {
-                if qbytes > MSGMNB && !resource {
+                if qbytes > most && !resource {
                     return Err(Errno::EPERM);
                 }
                 queue.perm.update(&ds, &credentials.user)?;

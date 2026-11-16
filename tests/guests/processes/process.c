@@ -13834,6 +13834,190 @@ static int msg_case(void) {
     syscall(SYS_msgctl, other, IPC_RMID, NULL);
     return 0;
 }
+/* The ipc-sysctl case: /proc/sys/kernel's System V IPC limits of the
+   case's own IPC namespace, how a write sets them, and what they change. */
+static long ksys_open(const char *name, int flags) {
+    char path[96];
+    snprintf(path, sizeof path, "/proc/sys/kernel/%s", name);
+    errno = 0;
+    long fd = open(path, flags | O_CLOEXEC);
+    return fd < 0 ? -errno : fd;
+}
+/* The file's text, its tabs as commas and without its newline, or the
+   error. */
+static void ksys_show(const char *name) {
+    char text[128] = {0};
+    long fd = ksys_open(name, O_RDONLY);
+    if (fd < 0) {
+        printf(" %s=%ld", name, fd);
+        return;
+    }
+    long n = read((int)fd, text, sizeof text - 1);
+    close((int)fd);
+    if (n < 0) {
+        printf(" %s=-%d", name, errno);
+        return;
+    }
+    for (long i = 0; i < n; i++)
+        if (text[i] == '\t') text[i] = ',';
+    if (n > 0 && text[n - 1] == '\n') text[n - 1] = 0;
+    printf(" %s=%s", name, text);
+}
+/* A write of `text` to a newly opened file: its result, or the open's. */
+static long ksys_write(const char *name, const char *text) {
+    long fd = ksys_open(name, O_WRONLY);
+    if (fd < 0) return fd;
+    errno = 0;
+    long n = write((int)fd, text, strlen(text));
+    long r = n < 0 ? -errno : n;
+    close((int)fd);
+    return r;
+}
+static long ksys_errno(long r) { return r < 0 ? -errno : r; }
+static const char *const ksys_names[] = {"shmmax", "shmall", "shmmni", "msgmax", "msgmnb", "msgmni", "sem"};
+static void ksys_all(const char *label) {
+    printf("%s:", label);
+    for (int i = 0; i < 7; i++) ksys_show(ksys_names[i]);
+    printf("\n");
+}
+/* Whether directory `path` lists `name` as a directory (1), as something
+   else (2) or not at all (0); Linux lists more beside it. */
+static int ksys_lists(const char *path, const char *name) {
+    DIR *dir = opendir(path);
+    if (!dir) return -errno;
+    int found = 0;
+    struct dirent *e;
+    while ((e = readdir(dir)))
+        if (!strcmp(e->d_name, name)) found = e->d_type == DT_DIR ? 1 : 2;
+    closedir(dir);
+    return found;
+}
+static int ipc_sysctl_case(void) {
+    /* Its own IPC namespace, whose limits the writes change. */
+    if (syscall(SYS_unshare, CLONE_NEWIPC)) return 10;
+    ksys_all("defaults");
+    printf("lists: sys-kernel=%d", ksys_lists("/proc/sys", "kernel"));
+    for (int i = 0; i < 7; i++) printf(" %s=%d", ksys_names[i], ksys_lists("/proc/sys/kernel", ksys_names[i]));
+    printf("\n");
+    struct stat st;
+    long stated = ksys_errno(stat("/proc/sys/kernel/sem", &st));
+    printf("stat=%ld mode=%o uid=%d gid=%d\n", stated, st.st_mode, st.st_uid, st.st_gid);
+
+    /* What writes take: bounds, signs, and sem's vector. */
+    printf("bounds:");
+    const char *writes[][2] = {
+        {"msgmni", "32769"}, {"msgmni", "32768"}, {"msgmni", "-1"},  {"shmmni", "32769"},
+        {"shmmni", "0"},     {"msgmax", "-1"},    {"msgmnb", "0x7fffffff"}, {"shmmax", "-1"},
+        {"shmall", "18446744073709551615\n"},     {"shmmax", "abc"},
+    };
+    for (unsigned i = 0; i < sizeof writes / sizeof *writes; i++)
+        printf(" %s:%s=%ld", writes[i][0], writes[i][1][0] == '1' && writes[i][1][1] == '8' ? "max" : writes[i][1],
+               ksys_write(writes[i][0], writes[i][1]));
+    printf("\n");
+    ksys_all("after-bounds");
+    printf("sem:");
+    const char *sems[] = {"10\t20\t5\t3\n", "4", "1 2 x", "7 8 9 40000", "11 22 33 1 99", " \n", "  6  7  "};
+    for (unsigned i = 0; i < sizeof sems / sizeof *sems; i++) {
+        printf(" [%u]=%ld", i, ksys_write("sem", sems[i]));
+        ksys_show("sem");
+    }
+    printf("\n");
+    ksys_write("sem", "10 20 5 3");
+
+    /* What the limits change: semaphores. */
+    printf("semget: over=%d", semx_errno(syscall(SYS_semget, IPC_PRIVATE, 11, 0600)));
+    int sets[3];
+    for (int i = 0; i < 2; i++) sets[i] = (int)syscall(SYS_semget, IPC_PRIVATE, 10, 0600);
+    printf(" made=%d,%d", sets[0] >= 0, sets[1] >= 0);
+    printf(" semmns=%d", semx_errno(syscall(SYS_semget, IPC_PRIVATE, 1, 0600)));
+    semx_ctl(sets[1], 0, IPC_RMID, 0);
+    sets[1] = (int)syscall(SYS_semget, IPC_PRIVATE, 1, 0600);
+    sets[2] = (int)syscall(SYS_semget, IPC_PRIVATE, 1, 0600);
+    printf(" remade=%d,%d", sets[1] >= 0, sets[2] >= 0);
+    printf(" semmni=%d", semx_errno(syscall(SYS_semget, IPC_PRIVATE, 1, 0600)));
+    static struct semx_op many[501];
+    for (int i = 0; i < 501; i++) many[i] = (struct semx_op){0, 0, IPC_NOWAIT};
+    printf(" opm6=%d opm5=%d", semx_errno(syscall(SYS_semop, sets[0], many, 6)),
+           semx_errno(syscall(SYS_semop, sets[0], many, 5)));
+    /* A negative semopm is compared unsigned, and bounds nothing. */
+    ksys_write("sem", "10 20 -1 3");
+    printf(" negative-opm=%d", semx_errno(syscall(SYS_semop, sets[0], many, 501)));
+    int seminfo[10] = {0};
+    long max = syscall(SYS_semctl, 0, 0, 3 /* IPC_INFO */, seminfo);
+    printf(" info=%ld mni=%d mns=%d msl=%d opm=%d\n", max >= 0, seminfo[1], seminfo[2], seminfo[4], seminfo[5]);
+    for (int i = 0; i < 3; i++) semx_ctl(sets[i], 0, IPC_RMID, 0);
+
+    /* Message queues. */
+    ksys_write("msgmax", "100");
+    ksys_write("msgmnb", "300");
+    ksys_write("msgmni", "1");
+    int queue = (int)syscall(SYS_msgget, IPC_PRIVATE, 0600);
+    unsigned char ds[120] = {0};
+    syscall(SYS_msgctl, queue, 2 /* IPC_STAT */, ds);
+    unsigned long qbytes;
+    memcpy(&qbytes, ds + 88, 8);
+    static struct {
+        long kind;
+        char text[200];
+    } message = {1, {0}};
+    printf("msg: made=%d qbytes=%lu msgmni=%ld", queue >= 0, qbytes,
+           ksys_errno(syscall(SYS_msgget, IPC_PRIVATE, 0600)));
+    printf(" over=%ld most=%ld", ksys_errno(syscall(SYS_msgsnd, queue, &message, 101, IPC_NOWAIT)),
+           ksys_errno(syscall(SYS_msgsnd, queue, &message, 100, IPC_NOWAIT)));
+    /* MSG_COPY copies at most msgmax bytes. */
+    ksys_write("msgmax", "50");
+    printf(" copy=%ld", ksys_errno(syscall(SYS_msgrcv, queue, &message, 200, 0, 040000 | IPC_NOWAIT)));
+    int msginfo[8] = {0};
+    max = syscall(SYS_msgctl, 0, 3 /* IPC_INFO */, msginfo);
+    printf(" info=%ld max=%d mnb=%d mni=%d\n", max, msginfo[2], msginfo[3], msginfo[4]);
+    syscall(SYS_msgctl, queue, IPC_RMID, NULL);
+
+    /* Shared memory. */
+    ksys_write("shmmax", "8192");
+    ksys_write("shmall", "3");
+    ksys_write("shmmni", "2");
+    errno = 0;
+    printf("shm: over=%ld", ksys_errno(syscall(SYS_shmget, IPC_PRIVATE, 8193, 0600)));
+    int first = (int)syscall(SYS_shmget, IPC_PRIVATE, 8192, 0600);
+    printf(" made=%d shmall=%ld", first >= 0, ksys_errno(syscall(SYS_shmget, IPC_PRIVATE, 4097, 0600)));
+    int second = (int)syscall(SYS_shmget, IPC_PRIVATE, 4096, 0600);
+    ksys_write("shmall", "100");
+    printf(" second=%d shmmni=%ld", second >= 0, ksys_errno(syscall(SYS_shmget, IPC_PRIVATE, 1, 0600)));
+    syscall(SYS_shmctl, second, IPC_RMID, NULL);
+    /* A size whose pages wrap: ENOSPC once shmmax lets it through. */
+    ksys_write("shmmax", "18446744073709551615");
+    ksys_write("shmall", "18446744073709551615");
+    printf(" wrap=%ld", ksys_errno(syscall(SYS_shmget, IPC_PRIVATE, 0xfffffffffffff001UL, 0600)));
+    unsigned long shminfo[9] = {0};
+    max = syscall(SYS_shmctl, 0, 3 /* IPC_INFO */, shminfo);
+    printf(" info=%ld max=%lu min=%lu mni=%lu seg=%lu all=%lu\n", max >= 0, shminfo[0], shminfo[1], shminfo[2],
+           shminfo[3], shminfo[4]);
+    syscall(SYS_shmctl, first, IPC_RMID, NULL);
+
+    /* Another user reads them but may not open them to write; a new IPC
+       namespace has the defaults again. */
+    fflush(stdout);
+    pid_t other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        printf("other: write=%ld", ksys_write("msgmax", "10"));
+        ksys_show("msgmax");
+        printf("\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    result("other", reaped(other));
+    pid_t fresh = child();
+    if (fresh == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWIPC)) _exit(91);
+        ksys_all("fresh");
+        fflush(stdout);
+        _exit(0);
+    }
+    result("fresh", reaped(fresh));
+    ksys_all("kept");
+    return 0;
+}
 static int sem_case(void) {
     int key = 0x5c000000 | (getpid() & 0xffffff);
     printf("get too-many=%d", semx_errno(syscall(SYS_semget, 0, 32001, 0600)));
@@ -26330,6 +26514,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "shm")) return shm_case();
     if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "msg")) return msg_case();
+    if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();

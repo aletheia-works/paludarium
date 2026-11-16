@@ -174,6 +174,7 @@ mod linux {
                     | "pid-set-tid"
                     | "net-namespaces"
                     | "msg"
+                    | "ipc-sysctl"
                     | "sysvipc-proc"
                     | "mqueue-calls"
                     | "mqueue-limits"
@@ -667,6 +668,7 @@ mod linux {
         processes_shm => ("shm","process"),
         processes_sem => ("sem","process"),
         processes_msg => ("msg","process"),
+        processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),

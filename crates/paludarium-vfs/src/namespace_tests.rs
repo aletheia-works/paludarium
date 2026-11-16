@@ -901,3 +901,31 @@ fn set_group_joins_a_peer_group() {
         Err(Errno::EINVAL)
     );
 }
+
+#[test]
+fn a_file_open_in_a_detached_tree_outlasts_the_tree() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/in", 0o755).unwrap();
+    fs.mount(b"/tmp/m/in", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/in/y", 66, 0o644)
+        .unwrap()
+        .write(b"y")
+        .unwrap();
+    let (tree, pin) = fs.clone_tree(b"/tmp/m", true, true).unwrap();
+    let y = [&tree[..], b"/in/y"].concat();
+    let file = fs.open(&y, 2, 0).unwrap();
+    let held = fs.mount_pin(&y);
+    // The tree goes with its root's last hold, as Linux's dissolves at the
+    // last close of `open_tree`'s descriptor (`umount_tree` with
+    // `UMOUNT_COVER`); the file on its mount below still reads and writes.
+    drop(pin);
+    let _ = fs.mounts();
+    assert_eq!(fs.metadata(&tree, true), Err(Errno::ENOENT));
+    file.write(b"z").unwrap();
+    let mut out = [0; 2];
+    file.seek(0, 0).unwrap();
+    assert_eq!(file.read(&mut out).unwrap(), 1);
+    assert_eq!(&out[..1], b"z");
+    drop(held);
+}

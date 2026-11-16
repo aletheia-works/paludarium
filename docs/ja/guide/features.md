@@ -2863,8 +2863,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
   と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
-  イベントをそのタスクの `execve` で有効にし、`remove_on_exec` はそのとき
-  イベントを以後ずっと無効にします。`prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と `ENABLE` は、
+  イベントをそのタスクの `execve` で有効にし、`remove_on_exec` は、Linux master と同じく、そのとき
+  イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
+  持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで
+  数えます。そうしたイベントは新しいグループを率いられません（`ENODEV`）。`execve` なしで
+  終わったスレッドは、開いたイベントの持ち主でなくなります（`perf_event_exit_task`）。
+  `prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と `ENABLE` は、
   呼んだスレッドが開いたすべてのイベントを、どのタスクを数えるものでも（無効で開いたものも）
   無効または有効にし、ほかの引数は読みません。`execve` を実行したスレッドは、開いたイベントを
   そのまま持ちます。`sample_simd_regs_enabled` があると、Linux master の構造体の SIMD

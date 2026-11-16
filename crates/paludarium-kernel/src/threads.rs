@@ -1773,6 +1773,10 @@ impl Kernel {
         self.pending_child.take()
     }
     pub fn abandon_thread(&self, tid: u32) {
+        // perf_event_exit_task, while the thread is still a member: an
+        // `execve` that waits for it gives its number to the thread that
+        // runs it only afterwards.
+        crate::perf::exit_thread(&self.processes.perf_events, &self.group, tid);
         let alone = {
             let mut members = self
                 .group
@@ -1880,6 +1884,8 @@ impl Kernel {
             .leave_sem_undo_list(thread.tid, self.process.pid, self.wall_seconds());
         // exit_shm: the segments it made are orphans now.
         self.group.leave_shm(thread.tid);
+        // perf_event_exit_task: the events it opened have no owner.
+        crate::perf::exit_thread(&self.processes.perf_events, &self.group, thread.tid);
         let alone = {
             let mut members = self
                 .group

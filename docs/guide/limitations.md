@@ -225,14 +225,15 @@ verified.
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
   ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
   and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
-  disables the event at its task's `execve` and leaves it to be read, where
-  Linux takes it out of the task's context, and the members of a group it
-  led count on their own. The events that wait for an `execve`, and those
-  each thread opened, are kept per emulated machine, matched by thread
-  group and thread, and dropped as they close. A thread that ends without
-  an `execve` keeps the events it opened, where Linux takes them from it,
-  so a later thread of the same number in that group, once the numbers
-  have gone round, would find them. A group's members count whatever software
+  takes the event out of its group as Linux master has done since 7.2
+  (037a3c43edfb), and such an event leads no new group (`ENODEV`,
+  fa091f46c383); the test machines' Linux 7.0 leaves it in its group and
+  takes it as a leader, so these are checked by the unit tests alone. The
+  events that wait for an `execve`, and those each thread opened, are kept
+  per emulated machine, matched by thread group and thread, and dropped as
+  they close. An event whose task has ended is not in Linux's `EXIT`
+  state here, so it may still lead a new group, where master gives
+  `ENODEV`. A group's members count whatever software
   clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
   group no count on the x86-64 machines the tests run on (why was not found).
   The SIMD register fields of Linux master's 176-byte structure are checked

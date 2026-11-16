@@ -3305,7 +3305,12 @@ kernel.
   and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
   for an event that does not sample. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
-  `remove_on_exec` disables one then for good. `prctl`'s
+  `remove_on_exec` takes one out then for good, as Linux master does: it
+  counts no more, keeps its last count and times to be read, has no owner
+  any more and leaves its group, whose members, if it led one, each count
+  on their own; such an event leads no new group (`ENODEV`). A thread that
+  ends without an `execve` owns the events it opened no more
+  (`perf_event_exit_task`). `prctl`'s
   `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` disable and enable every
   event the calling thread opened, whatever task it counts (one opened
   disabled too), and read no other argument; a thread that runs `execve`

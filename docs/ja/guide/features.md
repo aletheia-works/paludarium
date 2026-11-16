@@ -3069,6 +3069,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   通します。待つのを止めるのは致命的なシグナルだけです。`FAN_OPEN` は通ってから届き、拒まれた
   ものは開かれないのでクローズも伝えません。許可イベントはまとめません。キューがいっぱいなら
   溢れのイベントのあとに通し、ディスクリプタを渡せない読み出しはそれを拒みます。
+  `do_dentry_open` が `security_file_open` を先に呼ぶのと同じく、このオープンの
+  `FAN_OPEN_PERM` は Landlock の確認を通ってから尋ねます。グループのマークが
+  `FAN_ACCESS_PERM` を求めていたときに開いたファイル記述の読み出し（`read`、`pread64`、
+  `readv`、`preadv`、`preadv2`、`sendfile`・`splice`・`copy_file_range` の入力）も、
+  `rw_verify_area` と同じくディスクリプタ、バッファ、大きさ、位置の確認のあとに同じように
+  答えを待ちます。`vfs_readv` と同じく、0 バイトの `readv` と `preadv` は何も尋ねず、
+  0 バイトの `read` と `pread64` は尋ねます。
   `statfs` の `f_fsid` はイベントが示すファイルシステムの ID と同じです。カーネル自身の
   ファイルシステム、/proc、devpts、mqueue では `simple_statfs` と同じくデバイス番号、
   ほかのファイルシステムでは、tmpfs が UUID を引くように、ファイルシステムごとに引いた

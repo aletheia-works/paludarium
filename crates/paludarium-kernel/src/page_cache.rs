@@ -791,6 +791,10 @@ pub(crate) struct CoherentFile {
     /// they let it through, and a denied one is never opened, so it tells
     /// no close either.
     held: AtomicBool,
+    /// Its reads ask fanotify's `FAN_ACCESS_PERM`, as a group's mark
+    /// wanted it of the file when it was opened
+    /// (`FMODE_FSNOTIFY_ACCESS_PERM`).
+    access_perm: bool,
 }
 
 thread_local! {
@@ -872,6 +876,7 @@ impl CoherentFile {
             writer: None,
             opened: None,
             held: AtomicBool::new(false),
+            access_perm: false,
             quiet: quiet_now(),
         };
         file.list();
@@ -942,6 +947,8 @@ impl CoherentFile {
             self.opened = Some(flags & 3 != 0);
             let asked = crate::fanotify::asked();
             self.event(crate::fanotify::OPEN_PERM);
+            self.access_perm =
+                crate::fanotify::probing(|| self.event(crate::fanotify::ACCESS_PERM));
             if crate::fanotify::asked() > asked {
                 self.held = AtomicBool::new(true);
             } else {
@@ -1004,6 +1011,7 @@ impl CoherentFile {
                 writer: None,
                 opened: None,
                 held: AtomicBool::new(false),
+                access_perm: false,
                 quiet: Some(AtomicU32::new(flags)),
             }
             .writing(flags)?
@@ -1041,6 +1049,7 @@ impl FileHandle for CoherentFile {
             writer: None,
             opened: None,
             held: AtomicBool::new(false),
+            access_perm: false,
             quiet: quiet_now(),
         }
         .writing(flags)?
@@ -1060,6 +1069,13 @@ impl FileHandle for CoherentFile {
         // now, and its close in time, whatever device it is on.
         if mask == crate::inotify::OPEN && self.held.swap(false, Ordering::SeqCst) {
             self.event(mask);
+            return true;
+        }
+        // A read's `FAN_ACCESS_PERM`, of a description opened to ask it.
+        if mask == crate::fanotify::ACCESS_PERM {
+            if self.access_perm {
+                self.event(mask);
+            }
             return true;
         }
         if matches!(self.device, Device::Fixed(_)) {
@@ -1331,6 +1347,7 @@ impl HostFs for CoherentFs {
             writer: None,
             opened: None,
             held: AtomicBool::new(false),
+            access_perm: false,
             quiet: quiet_now(),
         }
         .writing(flags)?

@@ -155,6 +155,7 @@
     {"name":"fanotify-unprivileged","binary":"fanotify"},
     {"name":"fanotify-mounts","binary":"fanotify"},
     {"name":"fanotify-perm","binary":"fanotify"},
+    {"name":"fanotify-access-perm","binary":"fanotify"},
     {"name":"userfaultfd-calls","binary":"userfaultfd"},
     {"name":"userfaultfd-faults","binary":"userfaultfd"},
     {"name":"userfaultfd-signals","binary":"userfaultfd"},

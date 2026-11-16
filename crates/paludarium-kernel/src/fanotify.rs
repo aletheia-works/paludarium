@@ -673,20 +673,52 @@ thread_local! {
 /// A permission event asked of a group, not queued yet.
 type Asked = (Weak<Group>, Event);
 
-/// Runs `f`, a file operation whose permission events (an open's) are
-/// asked of the groups, then waits for their answers ([`await_answers`]):
-/// what `f` gives, or the error a group denies it with.
+/// Runs `f`, a file operation whose permission events are asked of the
+/// groups, then waits for their answers ([`await_answers`]): what `f`
+/// gives, or the error a group denies it with.
 pub(crate) fn asking<T>(
     c: &mut Context<'_>,
     f: impl FnOnce(&mut Context<'_>) -> T,
 ) -> (T, Result<bool, Errno>) {
+    let (result, asked) = asked_by(c, f);
+    let answered = answers(c, asked);
+    (result, answered)
+}
+
+/// The permission events [`asked_by`] gathered, which [`answers`] queues
+/// and waits for, or which go unasked when what follows fails first.
+pub(crate) struct Pending(Vec<Asked>);
+
+/// Runs `f` and gives what it asked of the groups without asking yet: an
+/// open's `FAN_OPEN_PERM`, which waits until the security checks that
+/// come before it (Landlock's `file_open`) have passed, as
+/// `do_dentry_open` calls `security_file_open` first.
+pub(crate) fn asked_by<T>(
+    c: &mut Context<'_>,
+    f: impl FnOnce(&mut Context<'_>) -> T,
+) -> (T, Pending) {
     let outer = ASKED.with(|asked| asked.borrow_mut().replace(Vec::new()));
     let result = f(c);
     let asked = ASKED
         .with(|asked| std::mem::replace(&mut *asked.borrow_mut(), outer))
         .unwrap_or_default();
-    let answered = await_answers(c, asked);
-    (result, answered)
+    (result, Pending(asked))
+}
+
+/// Asks the groups what [`asked_by`] gathered and waits for their
+/// answers: whether any was asked, or the denial.
+pub(crate) fn answers(c: &mut Context<'_>, pending: Pending) -> Result<bool, Errno> {
+    await_answers(c, pending.0)
+}
+
+/// Whether `f`, which tells the groups of a permission event, finds any
+/// group that wants it, without asking it: how an open learns whether its
+/// reads ask `FAN_ACCESS_PERM` (`fsnotify_open_perm_and_set_mode`).
+pub(crate) fn probing(f: impl FnOnce()) -> bool {
+    let outer = ASKED.with(|asked| asked.borrow_mut().replace(Vec::new()));
+    f();
+    let asked = ASKED.with(|asked| std::mem::replace(&mut *asked.borrow_mut(), outer));
+    asked.is_some_and(|asked| !asked.is_empty())
 }
 
 /// How many permission events this thread's operation has asked so far,

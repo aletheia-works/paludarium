@@ -204,6 +204,7 @@ mod linux {
                     | "fanotify-unprivileged"
                     | "fanotify-mounts"
                     | "fanotify-perm"
+                    | "fanotify-access-perm"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -542,6 +543,7 @@ mod linux {
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
         fanotify_mounts => ("fanotify-mounts","fanotify"),
         fanotify_perm => ("fanotify-perm","fanotify"),
+        fanotify_access_perm => ("fanotify-access-perm","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),

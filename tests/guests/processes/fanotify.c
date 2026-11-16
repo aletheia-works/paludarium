@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -856,6 +857,63 @@ static int case_mounts(void) {
     return 0;
 }
 
+/* FAN_ACCESS_PERM: a read of a description opened while a mark wanted
+   it waits for the group's answer, which denies it (EPERM) or lets it
+   through; a pread of no bytes asks too, a readv of none does not, and a
+   description opened before the mark never asks. The child's results come
+   back through a pipe, in order. */
+static int case_access_perm(void) {
+    make_base("access");
+    int file = open(at("f"), O_WRONLY | O_CREAT, 0644);
+    if (file < 0 || write(file, "data", 4) != 4) return 80;
+    close(file);
+    int early = open(at("f"), O_RDONLY);
+    int fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    if (early < 0 || fan < 0) return 81;
+    printf("mark=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD, at("f")));
+    int results[2];
+    if (pipe(results)) return 82;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(fan);
+        close(results[0]);
+        char c[4];
+        long out[5];
+        int fd = open(at("f"), O_RDONLY);
+        out[0] = e(read(fd, c, 1));
+        out[1] = e(read(fd, c, 1));
+        out[2] = e(pread(fd, c, 0, 0));
+        struct iovec none = {c, 0};
+        out[3] = e(readv(fd, &none, 1));
+        out[4] = e(read(early, c, 1));
+        if (write(results[1], out, sizeof out) != (ssize_t)sizeof out) _exit(1);
+        _exit(0);
+    }
+    close(results[1]);
+    int fd = read_perm("read", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    fd = read_perm("read again", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    fd = read_perm("pread of none", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    long out[5] = {0};
+    long n = read(results[0], out, sizeof out);
+    printf("child=%d results=%ld\n", child_result(child), n);
+    printf("denied read=%ld allowed read=%ld pread of none=%ld readv of none=%ld early read=%ld\n",
+           out[0], out[1], out[2], out[3], out[4]);
+    /* Nothing else was asked. */
+    struct pollfd p = {fan, POLLIN, 0};
+    printf("more=%d\n", poll(&p, 1, 0));
+    close(early);
+    close(fan);
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -868,6 +926,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
     if (!strcmp(mode, "fanotify-mounts")) return case_mounts();
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
+    if (!strcmp(mode, "fanotify-access-perm")) return case_access_perm();
     printf("unknown mode %s\n", mode);
     return 2;
 }

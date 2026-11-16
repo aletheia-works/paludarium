@@ -3542,7 +3542,15 @@ kernel.
   `FAN_OPEN` comes once it is let through, and a denied open is never
   opened, so it tells no close. A permission event is never merged; a full
   queue lets it through after the overflow event; a read that cannot give
-  it a descriptor denies it. `statfs`'s `f_fsid` is the file system ID the events give: the
+  it a descriptor denies it. Such an open's `FAN_OPEN_PERM` is asked once
+  Landlock's check of it has passed, as `do_dentry_open` calls
+  `security_file_open` first. A read of a description opened while a
+  group's mark wanted `FAN_ACCESS_PERM` of the file (`read`, `pread64`,
+  `readv`, `preadv`, `preadv2`, and the input of `sendfile`, `splice` and
+  `copy_file_range`) waits for the answers the same way, after the checks
+  of the descriptor, the buffer, the size and the position, as
+  `rw_verify_area` asks it; `readv` and `preadv` of no bytes ask nothing,
+  as `vfs_readv`, where `read` and `pread64` of none ask too. `statfs`'s `f_fsid` is the file system ID the events give: the
   device of the kernel's own file systems, /proc, devpts and mqueue, as
   `simple_statfs` gives it, and a number drawn for each other file system,
   as tmpfs draws a UUID.

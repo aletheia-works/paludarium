@@ -2585,6 +2585,8 @@ fn copy_file_range(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     if from.checked_add(a[4]).is_none() || to.checked_add(a[4]).is_none() {
         return Err(Errno::EOVERFLOW);
     }
+    // `rw_verify_area` of the input, after `generic_copy_file_checks`.
+    access_permission(c, &input.file)?;
     // Shortened to the input's end, then to what RLIMIT_FSIZE allows.
     let mut count = if (from as i64) >= 0 && from >= source.size {
         0
@@ -2670,6 +2672,7 @@ fn send(
     {
         return Err(Errno::EINVAL);
     }
+    access_permission(c, &input)?;
     let count = count.min(MAX_RW_COUNT as u64);
     let output = c.files.descriptor(out)?.file;
     if output.flags() & 3 == 0 {
@@ -3139,6 +3142,10 @@ fn readv(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
         return Ok(0);
     }
     let flags = rw_flags(&file, flags, false)?;
+    // `vfs_readv` asks only for some bytes.
+    if total > 0 {
+        access_permission(c, &file)?;
+    }
     let mut b = buffer(len)?;
     let count = read_waiting(c, &file, &mut b, flags & RWF_NOWAIT != 0)?;
     scatter(c, &segments, &b[..count])?;
@@ -3267,6 +3274,9 @@ fn positioned_vector(
     }
     let flags = rw_flags(&file, flags, write)?;
     if !write {
+        if total > 0 {
+            access_permission(c, &file)?;
+        }
         let mut b = buffer(len)?;
         let count = read_at(&file, a[3], &mut b)?;
         scatter(c, &segments, &b[..count])?;
@@ -3297,6 +3307,21 @@ fn positioned_vector(
         crate::permissions::remove_set_ids(&c.process.credentials, &*file);
     }
     sync_written(&file, flags, written as u64)
+}
+/// The `FAN_ACCESS_PERM` of a read of `file` (`fsnotify_file_area_perm`,
+/// at the end of `rw_verify_area`): a description opened while a group's
+/// mark wanted it waits for the groups' answers, the denial its error.
+pub(crate) fn access_permission(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+) -> Result<(), Errno> {
+    if !c.files.caches.notify.fan.active() {
+        return Ok(());
+    }
+    let ((), answered) = crate::fanotify::asking(c, |_| {
+        file.notify_event(crate::fanotify::ACCESS_PERM);
+    });
+    answered.map(|_| ())
 }
 /// A read that waits while a blocking file has nothing to give yet.
 fn read_blocking(
@@ -4312,6 +4337,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.mem
                 .check_write(GuestAddr(a[1]), len)
                 .map_err(|_| Errno::EFAULT)?;
+            access_permission(c, &file)?;
             let mut b = buffer(len)?;
             let count = read_at(&file, a[3], &mut b)?;
             output(c, a[1], &b[..count])?;
@@ -4450,6 +4476,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return write_io(c, &d.ok_or(Errno::EBADF)?.file, &b, false);
             }
             let count = if let Some(d) = d {
+                access_permission(c, &d.file)?;
                 read_blocking(c, &d.file, &mut b)?
             } else if a[0] == 0 {
                 c.host.read_stdin(&mut b)?
@@ -5995,22 +6022,21 @@ pub(crate) fn open_at(
     let credentials = &c.process.credentials;
     let opened = match crate::permissions::open(c.files, credentials, dir, &raw, flags) {
         Ok(created) => landlock_before_open(c, &p, flags).and_then(|landlock| {
-            // Its `FAN_OPEN_PERM` waits for the groups' answers, then its
-            // `IN_OPEN`; a denied file goes, never opened.
-            let (opened, answered) = crate::fanotify::asking(c, |c| open_path(c, &p, flags, mode));
+            // Its `FAN_OPEN_PERM`, asked once Landlock's check passed (as
+            // `do_dentry_open` calls `security_file_open` first), waits for
+            // the groups' answers, then its `IN_OPEN`; a file refused or
+            // denied goes, never opened, and tells nothing.
+            let (opened, pending) = crate::fanotify::asked_by(c, |c| open_path(c, &p, flags, mode));
             let opened = opened.inspect(|_| {
                 if let Some(parent) = created {
                     crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
                 }
             })?;
-            let answered = answered?;
             let landlock = match landlock {
                 Some(rights) => rights,
                 None => landlock_after_open(c, &p, flags)?,
             };
-            // `fsnotify_open` comes after the security hooks: an open
-            // Landlock refuses tells nothing.
-            if answered {
+            if crate::fanotify::answers(c, pending)? {
                 opened.0.notify_event(crate::inotify::OPEN);
             }
             Ok((opened, landlock))

@@ -230,6 +230,7 @@ fn do_splice(
                 None => input.seek(0, 1).unwrap_or(0),
             };
             verify_area(start, len)?;
+            super::access_permission(c, input)?;
             let nonblock = nonblock || nonblocking(output);
             let read = to_pipe(c, input, start, off_in.is_some(), output, to, len, nonblock)?;
             let end = start + read;

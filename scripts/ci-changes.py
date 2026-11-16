@@ -99,8 +99,9 @@ RULES = (
     ({"docs"}, ("docs/", ".github/workflows/docs.yml", ".github/workflows/docs-build.yml")),
     # Run by the polyglot lint, which every pull request runs.
     (NONE, ("scripts/syscall-docs.py", "scripts/interface-docs.py")),
-    # The x87 guest also runs in the wasm programs' x87 step.
-    ({"rust", "wasm"}, ("tests/guests/processes/x87.c",)),
+    # The x87 guest, and the script that builds it, also run in the wasm
+    # programs' x87 step.
+    ({"rust", "wasm"}, ("tests/guests/processes/x87.c", "tests/guests/processes/build.sh")),
     # Guests, coverage scripts and their tests are used by the Rust jobs.
     ({"rust"}, ("tests/", "scripts/", "tools/")),
     # Documentation, infrastructure, the other workflows, lint settings and
@@ -296,6 +297,7 @@ def self_test():
         "packages/paludarium-wasm/index.mjs": {"wasm", "production_wasm", "release_check"},
         "tests/guests/programs/cases.json": {"programs", "wasm"},
         "tests/guests/processes/x87.c": {"rust", "wasm"},
+        "tests/guests/processes/build.sh": {"rust", "wasm"},
         "tests/guests/processes/process.c": {"rust"},
         "tests/guests/encodings/observe.c": {"rust"},
         "tests/guests/distro/compare.py": {"rust"},

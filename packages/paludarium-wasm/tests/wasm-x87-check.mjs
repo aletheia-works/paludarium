@@ -30,7 +30,8 @@ try {
  if (!crossOriginIsolated) throw new Error('Shared memory unavailable');
  const input = await (await fetch('/input.json')).json();
  const x87 = Uint8Array.from(atob(input.x87), char => char.charCodeAt(0));
- const rows = await observeX87(() => createPaludarium({wasmUrl: '/production.wasm'}), {x87, cases: input.cases, native: input.native});
+ const onRow = async (name, row) => { await fetch('/row', {method: 'POST', body: JSON.stringify({name, row})}); };
+ const rows = await observeX87(() => createPaludarium({wasmUrl: '/production.wasm'}), {x87, cases: input.cases, native: input.native, onRow});
  window.__wasmReport = {rows, passed: Object.values(rows).every(row => row.pass), complete: true};
 } catch (error) { window.__wasmReport = {passed: false, complete: false, error: String(error)}; }
 </script>`;
@@ -40,6 +41,14 @@ try {
     try {
       if (request.url === "/") response.writeHead(200, { ...headers, "Content-Type": "text/html" }).end(page);
       else if (request.url === "/input.json") response.writeHead(200, { ...headers, "Content-Type": "application/json" }).end(input);
+      else if (request.url === "/row" && request.method === "POST") {
+        // Each row as it comes, so that a case that hangs leaves the ones before it.
+        const chunks = []; let size = 0;
+        for await (const chunk of request) { size += chunk.length; if (size > 16 * 1024 * 1024) throw new Error("row too large"); chunks.push(chunk); }
+        const { name, row } = JSON.parse(Buffer.concat(chunks));
+        if (cases.includes(name)) { report.rows[name] = row; await persist(); show(name, row); }
+        response.writeHead(200, headers).end();
+      }
       else {
         const path = request.url === "/production.wasm" ? resolve(modulePath) : resolve(root, "." + new URL(request.url, "http://localhost").pathname);
         if (request.url !== "/production.wasm" && !path.startsWith(root + sep)) throw new Error("invalid path");
@@ -56,8 +65,7 @@ try {
     const result = await runBrowser(environment, `http://127.0.0.1:${server.address().port}/`, 600000);
     if (result.error) throw new Error(result.error);
     report.version = result.version;
-    report.rows = result.rows ?? {};
-    for (const [name, row] of Object.entries(report.rows)) show(name, row);
+    report.rows = result.rows ?? report.rows;
   } finally { await new Promise(done => server.close(done)); }
 }
 report.complete = Object.keys(report.rows).join() === cases.join() && Object.values(report.rows).every(row => row.pass);

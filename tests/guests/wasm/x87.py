@@ -4,21 +4,34 @@ this x86-64 Linux CPU, which the wasm environments are then compared with.
 
     python3 tests/guests/wasm/x87.py <output directory>
 
-The guest is built as tests/guests/processes/build.sh builds it; each case
-is the guest run with its name, as the differential process cases run it.
+The guest is built by the very line of tests/guests/processes/build.sh that
+builds it for the differential process cases, and each case is the guest run
+with its name, as those cases run it.
 """
 
 import hashlib
 import json
 import pathlib
 import platform
+import shlex
 import subprocess
 import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 CASES = pathlib.Path(__file__).resolve().parent / "x87-cases.json"
-FLAGS = ["-static", "-O1", "-fno-stack-protector", "-fcf-protection=none", "-fno-pie", "-no-pie"]
+BUILD = ROOT / "tests/guests/processes/build.sh"
+
+
+def build_command(output):
+    """build.sh's command for the x87 guest, writing it into output."""
+    lines = [line for line in BUILD.read_text().splitlines() if '-o "$out/x87" ' in line]
+    if len(lines) != 1:
+        raise SystemExit("build.sh must build the x87 guest on exactly one line")
+    here = str(BUILD.parent)
+    return [
+        word.replace("$out", str(output)).replace("$here", here) for word in shlex.split(lines[0])
+    ]
 
 
 def cpu():
@@ -35,8 +48,9 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     config = json.loads(CASES.read_text())
     binary = output / config["binary"]
-    source = ROOT / "tests/guests/processes/x87.c"
-    subprocess.run(["musl-gcc", *FLAGS, "-o", str(binary), str(source), "-lm"], check=True)
+    if binary.name != "x87":
+        raise SystemExit("build.sh writes the x87 guest as x87")
+    subprocess.run(build_command(output), check=True)
     rows = {}
     for name in config["cases"]:
         started = time.monotonic()

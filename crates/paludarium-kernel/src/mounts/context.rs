@@ -532,6 +532,11 @@ fn fsmount(c: &mut Context<'_>, fd: u64, flags: u64, attrs: u64) -> Result<u64, 
         return Err(EBUSY);
     };
     new.flags = mount_flags;
+    // As Linux master's `fsmount`, the mount is made and the context
+    // cleaned before the descriptor is: a descriptor it cannot have
+    // (`EMFILE`) leaves the context cleaned, and the mount goes with the
+    // last hold on it (`dissolve_on_fput`), so a second `fsmount` is
+    // `EBUSY` there too. Making the mount itself does not fail.
     let (point, pin, id) = c.files.namespaced().mount_detached(new)?;
     // `vfs_clean_context`: the context now reconfigures the new mount.
     state.purpose = Purpose::Reconfigure {

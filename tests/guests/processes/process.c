@@ -2771,6 +2771,29 @@ static void nl_neighbour_attribute(unsigned short type, const unsigned char *v, 
    `ctl` is the port of the socket that asked for the change. */
 static void monitor_wait(int fd, unsigned ctl, const char *label, int wait);
 static void monitor_show(int fd, unsigned ctl, const char *label) { monitor_wait(fd, ctl, label, 700); }
+/* What the member `fd` hears until none has come for 300 ms, but the
+   lines that name `skip`: the address-lifetimes case's own change, which
+   makes Linux check the lifetimes, and which Linux tells of before what
+   that check finds, where the emulator, whose addresses run out on time,
+   told of that first. */
+static void monitor_but(int fd, unsigned ctl, const char *label, const char *const skip[2]) {
+    fflush(stdout);
+    int pipes[2], saved = dup(1);
+    if (pipe(pipes) < 0 || saved < 0) return;
+    dup2(pipes[1], 1);
+    close(pipes[1]);
+    monitor_wait(fd, ctl, label, 300);
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+    static char text[65536];
+    size_t n = 0;
+    for (long got; n < sizeof text - 1 && (got = read(pipes[0], text + n, sizeof text - 1 - n)) > 0;) n += got;
+    close(pipes[0]);
+    text[n] = 0;
+    for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n"))
+        if (!strstr(line, skip[0]) && !strstr(line, skip[1])) printf("%s\n", line);
+}
 /* monitor_show, waiting `wait` ms for each datagram: 0 takes only those
    already queued, as Linux tells of a neighbour's change as it is made. */
 static void monitor_wait(int fd, unsigned ctl, const char *label, int wait) {
@@ -18636,22 +18659,46 @@ int main(int argc, char **argv) {
             /* How addresses run out, IPv4's two seconds apart from IPv6's,
                as Linux checks each family's on its own: one becomes
                deprecated when its preferred lifetime ends, and goes with its
-               routes when its valid one does. A request a second after each
-               finds them as they are, and its notifications are read before
-               the next. */
+               routes when its valid one does. Linux's checks are deferrable
+               work, which an idle machine may run seconds late, so half a
+               second after each lifetime ends the case replaces a permanent
+               address of that family, which makes Linux check at once
+               (check_lifetime queued, addrconf_verify_rtnl in the request);
+               then what the member hears, and a dump. */
+            static const char *const kicks[2] = {"10.250.0.1", "2001:db8:fa::1"};
+            nl_addr_life(ctl, port, add, AF_INET, kicks[0], 32, 1, NULL, 0, -1, "kick4");
+            nl_addr_life(ctl, port, add, AF_INET6, kicks[1], 128, 1, NULL, 0, 0x02, "kick6");
+            monitor_but(mon, port, "kicks", kicks);
             struct timespec start;
             clock_gettime(CLOCK_MONOTONIC, &start);
             const unsigned life4[2] = {1, 5}, life6[2] = {3, 7};
             nl_addr_life(ctl, port, add, AF_INET, "10.9.0.1", 24, 1, life4, 0, -1, "short4");
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:9::1", 64, 1, life6, 0, -1, "short6");
-            static const double checks[] = {1.5, 3.5, 5.5, 7.5};
-            for (size_t i = 0; i < sizeof checks / sizeof checks[0]; i++) {
-                sleep_until(&start, checks[i]);
-                char label[32];
-                snprintf(label, sizeof label, "at %.1fs", checks[i]);
-                nl_answer(ctl, nl_send(ctl, 22, NL_F_REQUEST | dump, everything, 8), port, label);
-                monitor_show(mon, port, label);
+            /* Their notifications, IPv6's address again once its duplicate
+               address detection ends. */
+            monitor_wait(mon, port, "short", 300);
+            static const struct {
+                double at;
+                int v6;
+                const char *label;
+            } changes[] = {{1.5, 0, "deprecated4"}, {3.5, 1, "deprecated6"}, {5.5, 0, "gone4"}, {7.5, 1, "gone6"}};
+            for (size_t i = 0; i < sizeof changes / sizeof changes[0]; i++) {
+                sleep_until(&start, changes[i].at);
+                int v6 = changes[i].v6;
+                nl_addr_life(ctl, port, replace, v6 ? AF_INET6 : AF_INET, kicks[v6], v6 ? 128 : 32, 1, NULL, 0,
+                             v6 ? 0x02 : -1, changes[i].label);
+                monitor_but(mon, port, changes[i].label, kicks);
+                nl_answer(ctl, nl_send(ctl, 22, NL_F_REQUEST | dump, everything, 8), port, changes[i].label);
             }
+            /* A socket finds them gone. */
+            int u4 = socket(AF_INET, SOCK_DGRAM, 0), u6 = socket(AF_INET6, SOCK_DGRAM, 0);
+            struct sockaddr_in gone4 = {.sin_family = AF_INET};
+            struct sockaddr_in6 gone6 = {.sin6_family = AF_INET6};
+            inet_pton(AF_INET, "10.9.0.1", &gone4.sin_addr);
+            inet_pton(AF_INET6, "2001:db8:9::1", &gone6.sin6_addr);
+            printf("bind gone4=%ld\n", netns_result(bind(u4, (void *)&gone4, sizeof gone4)));
+            printf("bind gone6=%ld\n", netns_result(bind(u6, (void *)&gone6, sizeof gone6)));
+            close(u4), close(u6);
             /* Lifetimes: both, deprecated at once, and a valid one with a
                preferred one that never ends, which is longer, so refused. */
             const unsigned both[2] = {500, 1000}, deprecated[2] = {0, 1000}, valid[2] = {0xffffffff, 1000};

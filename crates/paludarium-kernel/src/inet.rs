@@ -304,6 +304,10 @@ pub(crate) struct Network {
     /// which say what is local; locked after a socket's state, never
     /// before.
     addresses: Mutex<crate::interface::Addresses>,
+    /// What has run out of the addresses and routes, as a socket found it
+    /// ([`Self::addresses_at`]), for netlink to tell of
+    /// ([`crate::netlink::expire`]); locked after the addresses.
+    expired: Mutex<Vec<crate::interface::Event>>,
     /// The netlink sockets bound in it ([`crate::netlink`]).
     pub(crate) netlink: crate::netlink::Ports,
     /// Its MCTP sockets' binds and tags ([`crate::mctp`]).
@@ -333,6 +337,7 @@ impl Network {
             up: AtomicBool::new(true),
             ever_up: AtomicBool::new(true),
             addresses: Mutex::new(crate::interface::Addresses::first()),
+            expired: Mutex::new(Vec::new()),
             netlink: crate::netlink::Ports::default(),
             mctp: crate::mctp::Endpoints::default(),
             sockets: Mutex::default(),
@@ -349,6 +354,7 @@ impl Network {
             up: AtomicBool::new(false),
             ever_up: AtomicBool::new(false),
             addresses: Mutex::new(crate::interface::Addresses::isolated()),
+            expired: Mutex::new(Vec::new()),
             ..Self::new(NetworkPolicy::default())
         }
     }
@@ -357,12 +363,12 @@ impl Network {
     /// one, which goes to `127.0.0.1` or `::1`
     /// ([`crate::loopback::destination`]); `None` off it, which only the
     /// first namespace has a route to. `ENETUNREACH` where no route goes.
-    fn route(&self, to: SocketAddr) -> Result<Option<SocketAddr>, Errno> {
+    fn route(&self, to: SocketAddr, now: Option<u64>) -> Result<Option<SocketAddr>, Errno> {
         let up = self.is_up();
         let local = match to.ip() {
             ip if ip.is_unspecified() => crate::loopback::destination(to),
-            IpAddr::V4(ip) => self.addresses().local4(ip).then_some(to),
-            IpAddr::V6(ip) => self.addresses().local6(ip).then_some(to),
+            IpAddr::V4(ip) => self.addresses_at(now).local4(ip).then_some(to),
+            IpAddr::V6(ip) => self.addresses_at(now).local6(ip).then_some(to),
         };
         match local {
             Some(_) if !up => Err(ENETUNREACH),
@@ -381,24 +387,54 @@ impl Network {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+    /// The loopback's addresses at the host's monotonic `now`, which a
+    /// socket uses: what has run out by then goes first, as Linux's work
+    /// would have taken it on time, and what that tells is kept for
+    /// netlink ([`crate::netlink::expire`]).
+    pub(crate) fn addresses_at(
+        &self,
+        now: Option<u64>,
+    ) -> MutexGuard<'_, crate::interface::Addresses> {
+        let mut addresses = self.addresses();
+        if let Some(now) = now {
+            let events = addresses.expire(now);
+            if !events.is_empty() {
+                self.expired
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(events);
+            }
+        }
+        addresses
+    }
+    /// What has run out by `now`, as [`Self::addresses_at`] takes it, after
+    /// what a socket found before, in the order it went.
+    pub(crate) fn expire(&self, now: u64) -> Vec<crate::interface::Event> {
+        let mut addresses = self.addresses();
+        let fresh = addresses.expire(now);
+        let mut events =
+            core::mem::take(&mut *self.expired.lock().unwrap_or_else(PoisonError::into_inner));
+        events.extend(fresh);
+        events
+    }
     /// The address a connection or datagram to `to` on the loopback leaves
-    /// from: its route's preferred source.
-    pub(crate) fn source(&self, to: SocketAddr) -> IpAddr {
-        self.addresses().source(to.ip())
+    /// from at `now`: its route's preferred source.
+    pub(crate) fn source(&self, to: SocketAddr, now: Option<u64>) -> IpAddr {
+        self.addresses_at(now).source(to.ip())
     }
     /// Whether a socket may bind to `ip`: the unspecified address, an IPv4
     /// multicast or limited broadcast one, one a local or broadcast route
     /// has (any IPv4 one before there is a route at all, as Linux's
     /// `inet_addr_type` finds none), or an IPv6 address of the loopback.
-    fn bindable(&self, ip: IpAddr) -> bool {
+    fn bindable(&self, ip: IpAddr, now: Option<u64>) -> bool {
         match ip {
             IpAddr::V4(ip) => {
                 ip.is_unspecified()
                     || ip.is_multicast()
                     || ip.is_broadcast()
-                    || self.addresses().bindable4(ip)
+                    || self.addresses_at(now).bindable4(ip)
             }
-            IpAddr::V6(ip) => ip.is_unspecified() || self.addresses().local6(ip),
+            IpAddr::V6(ip) => ip.is_unspecified() || self.addresses_at(now).local6(ip),
         }
     }
     /// The user namespace whose `CAP_NET_ADMIN` changes this network, as
@@ -1313,9 +1349,10 @@ impl InetSocket {
                 Connection::Connected => return Err(EISCONN),
                 Connection::Connecting => EALREADY,
                 Connection::Unconnected => {
-                    let to = self
-                        .network
-                        .route(SocketAddr::new(plain(address.ip()), address.port()))?;
+                    let to = self.network.route(
+                        SocketAddr::new(plain(address.ip()), address.port()),
+                        self.now(),
+                    )?;
                     // The handshake's first segment goes out through the
                     // loopback, whatever answers it.
                     if let Some(to) = to {
@@ -1344,7 +1381,7 @@ impl InetSocket {
                                 // to the address the connection leaves from.
                                 let from = match s.bound.map(|b| b.ip()).or(s.address) {
                                     Some(ip) if !ip.is_unspecified() => ip,
-                                    _ => self.network.source(to),
+                                    _ => self.network.source(to, self.now()),
                                 };
                                 self.network.output(from, self.now());
                                 return self.refused(&mut s, address);
@@ -1516,7 +1553,7 @@ impl InetSocket {
         if self.family == Family::V6 && options.v6_only && to.is_ipv4() {
             return Err(ENETUNREACH);
         }
-        match self.network.route(to)? {
+        match self.network.route(to, self.now())? {
             Some(to) => {
                 let from = self.datagram_source(&mut s, to, &options)?;
                 self.ports().connect(&self.this, from, Some(to));
@@ -1577,7 +1614,7 @@ impl InetSocket {
     ) -> Result<SocketAddr, Errno> {
         let bound = self.autobind(s, options)?;
         let ip = if bound.ip().is_unspecified() {
-            self.network.source(to)
+            self.network.source(to, self.now())
         } else {
             bound.ip()
         };
@@ -1599,7 +1636,7 @@ impl InetSocket {
             None => Ok(()),
         };
         let plain_to = SocketAddr::new(plain(to.ip()), to.port());
-        if let Some(dest) = self.network.route(plain_to)? {
+        if let Some(dest) = self.network.route(plain_to, self.now())? {
             if self.family == Family::V6 && options.v6_only && dest.is_ipv4() {
                 return Err(ENETUNREACH);
             }
@@ -1831,7 +1868,7 @@ impl InetSocket {
         let taken = |s: &State| s.bound.is_some() || s.stream.is_some();
         // The addresses the loopback's routes have, which IPv4's local
         // routes keep while it is down.
-        let own = |ip: Ipv4Addr| self.network.bindable(IpAddr::V4(ip));
+        let own = |ip: Ipv4Addr| self.network.bindable(IpAddr::V4(ip), self.now());
         let address = match self.family {
             Family::V4 => {
                 if raw.len() < 16 {
@@ -1877,7 +1914,7 @@ impl InetSocket {
                         return Err(EADDRNOTAVAIL);
                     }
                     SocketAddr::from((v4, port))
-                } else if self.network.bindable(IpAddr::V6(ip)) {
+                } else if self.network.bindable(IpAddr::V6(ip), self.now()) {
                     SocketAddr::from((ip, port))
                 } else if ip.segments()[0] & 0xffc0 == 0xfe80 && scope == 0 {
                     // A link-local address needs its interface.
@@ -2200,7 +2237,7 @@ impl InetSocket {
         to: SocketAddr,
         options: &Options,
     ) -> Result<SocketAddr, Errno> {
-        let source = self.network.source(to);
+        let source = self.network.source(to, self.now());
         let mut ports = self.ports();
         let from = match s.bound {
             Some(bound) if !bound.ip().is_unspecified() => bound,
@@ -3840,6 +3877,43 @@ mod tests {
         ] {
             assert!(NetworkPolicy::new().allow(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn addresses_run_out_as_a_socket_finds_them_and_netlink_hears_of_it_after() {
+        use crate::interface::{Event, Lifetimes, V4};
+        use core::net::{Ipv4Addr, SocketAddr};
+        const SECOND: u64 = 1_000_000_000;
+        let network = Network::isolated(crate::users::first());
+        network.set_up(true, 0);
+        let ip = Ipv4Addr::new(10, 9, 0, 1);
+        let life = Lifetimes {
+            valid: 2,
+            preferred: 1,
+        };
+        network
+            .addresses()
+            .add_v4(V4::new(ip, ip, 24, 0), life, false, true, 0)
+            .unwrap();
+        let at = |now: u64| network.bindable(IpAddr::V4(ip), Some(now));
+        // Usable until its valid lifetime ends, without a request.
+        assert!(at(SECOND + SECOND / 2));
+        assert!(!at(2 * SECOND));
+        assert!(
+            network
+                .route(SocketAddr::new(IpAddr::V4(ip), 9), Some(3 * SECOND))
+                .is_err()
+        );
+        // What the socket found goes to netlink first, in its order: the
+        // address deprecated, then gone with its routes.
+        let events = network.expire(4 * SECOND);
+        assert!(matches!(events.first(), Some(Event::NewAddr4(a)) if a.local == ip));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::DelAddr4(a) if a.local == ip))
+        );
+        assert!(network.expire(5 * SECOND).is_empty());
     }
 
     #[test]

@@ -285,6 +285,21 @@ pub enum Fast {
         dst: u8,
         src: u8,
     },
+    /// `punpcklbw`, `punpckldq` or `punpcklqdq` of xmm register `src` into
+    /// `dst`, `pshufd` of `src` into `dst` by `imm`, or `pslld` or `psrld`
+    /// of `dst` by `imm` (`src` is `dst`), as [`crate::sse::packed`] has
+    /// them.
+    XmmPacked {
+        op: Mnemonic,
+        dst: u8,
+        src: u8,
+        imm: u8,
+    },
+    /// `pmovmskb r, xmm`: the top bit of each byte of `src`.
+    Pmovmskb {
+        dst: Register,
+        src: u8,
+    },
     /// `movd` (`size` 4) or `movq` (8) between an xmm register and a
     /// general one, or `movq` between xmm registers: the low `size` bytes,
     /// zero-extended into the whole destination.
@@ -474,10 +489,45 @@ impl Fast {
             };
             return Some(Self::Imul { dst, a, b });
         }
+        if i.mnemonic == Mnemonic::Pshufd {
+            let Some(Operand::Immediate(imm)) = i.operand(2) else {
+                return None;
+            };
+            return Some(Self::XmmPacked {
+                op: i.mnemonic,
+                dst: xmm(a)?,
+                src: xmm(b)?,
+                imm: imm as u8,
+            });
+        }
         if i.operand(2).is_some() {
             return None;
         }
         Some(match i.mnemonic {
+            Mnemonic::Punpcklbw | Mnemonic::Punpckldq | Mnemonic::Punpcklqdq => Self::XmmPacked {
+                op: i.mnemonic,
+                dst: xmm(a)?,
+                src: xmm(b)?,
+                imm: 0,
+            },
+            Mnemonic::Pslld | Mnemonic::Psrld => {
+                let dst = xmm(a)?;
+                let Some(Operand::Immediate(count)) = b else {
+                    return None;
+                };
+                Self::XmmPacked {
+                    op: i.mnemonic,
+                    dst,
+                    src: dst,
+                    imm: count.min(255) as u8,
+                }
+            }
+            Mnemonic::Pmovmskb => match a {
+                Some(Operand::Register(dst @ Register::Gpr { size: 4 | 8, .. })) => {
+                    Self::Pmovmskb { dst, src: xmm(b)? }
+                }
+                _ => return None,
+            },
             Mnemonic::Movaps
             | Mnemonic::Movups
             | Mnemonic::Movdqa
@@ -832,6 +882,28 @@ pub(crate) fn execute(
         }
         Fast::XmmXor { dst, src } => {
             x.s.xmm[usize::from(dst)] ^= x.s.xmm[usize::from(src)];
+            next
+        }
+        Fast::XmmPacked { op, dst, src, imm } => {
+            let a = x.s.xmm[usize::from(dst)];
+            let b = if matches!(op, Mnemonic::Pslld | Mnemonic::Psrld) {
+                u128::from(imm)
+            } else {
+                x.s.xmm[usize::from(src)]
+            };
+            let Some(v) = crate::sse::packed(op, a, b, imm, x.s.xmm[0]) else {
+                return Err(Stop::Invalid);
+            };
+            x.s.xmm[usize::from(dst)] = v;
+            next
+        }
+        Fast::Pmovmskb { dst, src } => {
+            let v = x.s.xmm[usize::from(src)];
+            let mut mask = 0;
+            for n in 0..16 {
+                mask |= ((v >> (n * 8 + 7)) as u64 & 1) << n;
+            }
+            x.write_reg(dst, mask);
             next
         }
         Fast::MoveScalar { dst, src, size } => {

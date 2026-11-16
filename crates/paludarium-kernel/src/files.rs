@@ -1316,6 +1316,9 @@ pub(crate) struct Marked {
     pub(crate) key: crate::page_cache::Key,
     pub(crate) stat: FileStat,
     pub(crate) kind: u64,
+    /// The ID of the mount it is in, by the path that named it (or the
+    /// descriptor's).
+    pub(crate) mount: u64,
 }
 pub(crate) fn marked(
     c: &Context<'_>,
@@ -1324,7 +1327,7 @@ pub(crate) fn marked(
     follow: bool,
     directory: bool,
 ) -> Result<Marked, Errno> {
-    let (stat, device, kind) = if ptr == 0 {
+    let ((stat, device, kind), path) = if ptr == 0 {
         let d = c.files.descriptor(dir)?;
         if d.file.flags() & O_PATH != 0 {
             return Err(Errno::EBADF);
@@ -1333,19 +1336,21 @@ pub(crate) fn marked(
         if directory && stat.mode & 0o170000 != 0o040000 {
             return Err(Errno::ENOTDIR);
         }
-        (stat, descriptor_device(c, &d), descriptor_kind(c, &d)?)
+        let device = descriptor_device(c, &d);
+        ((stat, device, descriptor_kind(c, &d)?), d.path)
     } else {
         let (p, _) = looked_up(c, dir, ptr, follow || directory)?;
         let found = named(c, &p, follow || directory)?;
         if directory && found.0.mode & 0o170000 != 0o040000 {
             return Err(Errno::ENOTDIR);
         }
-        found
+        (found, p)
     };
     Ok(Marked {
         key: (device, stat.inode),
         stat,
         kind,
+        mount: mount_id(c, device, &path),
     })
 }
 /// The device of the file `path` names, by the mount it is in once its
@@ -3891,7 +3896,7 @@ pub(crate) fn mount_id(c: &Context<'_>, device: u64, path: &[u8]) -> u64 {
     mount_id_in(&*c.files.fs(), device, path)
 }
 /// [`mount_id`] in the file system `fs`.
-fn mount_id_in(fs: &dyn FileSystem, device: u64, path: &[u8]) -> u64 {
+pub(crate) fn mount_id_in(fs: &dyn FileSystem, device: u64, path: &[u8]) -> u64 {
     if let Some(i) = Internal::ALL.iter().position(|fs| fs.device() == device) {
         return i as u64 + 1;
     }
@@ -7798,9 +7803,7 @@ fn fdinfo(c: &Context<'_>, h: &Holder, d: &Descriptor, descriptors: &[Descriptor
     if let Some(instance) = crate::inotify::of(&d.file) {
         out.extend(instance.fdinfo());
     } else if let Some(group) = crate::fanotify::of(&d.file) {
-        // Mount marks are kept by device, so a mark has no path to tell
-        // the bind mounts of one file system apart: the first mount's ID.
-        out.extend(group.fdinfo(&|device| mount_id_in(&*h.fs, device, b"")));
+        out.extend(group.fdinfo());
     } else if let Some(pidfd) = any.and_then(|a| a.downcast_ref::<crate::processes::PidFd>()) {
         out.extend(pidfd.fdinfo());
     } else if let Some(uffd) = crate::userfaultfd::of(&d.file) {

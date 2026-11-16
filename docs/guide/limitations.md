@@ -225,14 +225,15 @@ verified.
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
   ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
   and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
-  disables the event at its task's `execve` and leaves it to be read, where
-  Linux takes it out of the task's context, and the members of a group it
-  led count on their own. The events that wait for an `execve`, and those
-  each thread opened, are kept per emulated machine, matched by thread
-  group and thread, and dropped as they close. A thread that ends without
-  an `execve` keeps the events it opened, where Linux takes them from it,
-  so a later thread of the same number in that group, once the numbers
-  have gone round, would find them. A group's members count whatever software
+  takes the event out of its group as Linux master has done since 7.2
+  (037a3c43edfb), and such an event leads no new group (`ENODEV`,
+  fa091f46c383); the test machines' Linux 7.0 leaves it in its group and
+  takes it as a leader, so these are checked by the unit tests alone. The
+  events that wait for an `execve`, and those each thread opened, are kept
+  per emulated machine, matched by thread group and thread, and dropped as
+  they close. An event whose task has ended is not in Linux's `EXIT`
+  state here, so it may still lead a new group, where master gives
+  `ENODEV`. A group's members count whatever software
   clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
   group no count on the x86-64 machines the tests run on (why was not found).
   The SIMD register fields of Linux master's 176-byte structure are checked
@@ -594,10 +595,13 @@ verified.
   in another namespace leaves it at the old path, and when its source is
   removed it shows nothing, where Linux keeps the deleted directory and
   mountinfo marks it `//deleted`. A descriptor's mount ID (`statx` with
-  `AT_EMPTY_PATH`, fdinfo) is found by the path it was opened by. A
-  fanotify mount mark (`FAN_MARK_MOUNT`) is kept by the file system's
-  device, so it also covers the bind mounts of that file system, and its
-  fdinfo line shows the first mount's ID, where Linux marks that one mount.
+  `AT_EMPTY_PATH`, fdinfo) is found by the path it was opened by, and so
+  is the mount of a descriptor's events for fanotify's mount marks
+  (`FAN_MARK_MOUNT`); once that path no longer leads to the file's file
+  system (renamed or replaced since), the event is the first mount's of
+  that file system. Such a mark stays after its mount is unmounted, where
+  Linux removes it, and then also hears of a new mount of the same file
+  system that takes the mount's free ID.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the
@@ -759,11 +763,11 @@ verified.
   are their defaults whatever its route holds. A route may name no
   congestion control but `cubic` and `reno` (`EINVAL`), where Linux, for a
   caller with `CAP_NET_ADMIN`, loads the module of another first.
-  An address's lifetimes run out only when a netlink request in its
-  namespace next comes, which first tells of it, where Linux's work finds
-  them on time: until then a socket may still use an address past its
-  valid lifetime. An IPv6 route that has run out goes from its table then
-  too, where Linux's, which lookups pass over, stays in dumps until its
+  An address runs out as its lifetime ends, where Linux's checks are
+  deferrable work, which comes up to a second later (`round_jiffies_up`)
+  and, on an idle machine, may wait seconds more, unless an address of the
+  family is added or changed, which has them run at once. An IPv6
+  route that has run out goes from its table at once, where Linux's, which lookups pass over, stays in dumps until its
   garbage collection (`gc_interval`, 30 seconds), and from 7.3 marks its
   notification of that with `RTA_DEL_REASON`. A change that gives a
   permanent IPv6 address a lifetime gives its prefix route the same, as

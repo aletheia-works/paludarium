@@ -95,6 +95,7 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 - `setcc` と `cmovcc`
 - レジスタによる rdx:rax への `mul` と `imul`、2 つのレジスタまたはレジスタと即値の `imul`
 - xmm レジスタとメモリの間の `movaps`、`movups`、`movdqa`、`movdqu`、`movapd`、`movupd`、xmm レジスタどうしの `pxor` と `xorps`、xmm レジスタと汎用レジスタの間の `movd` と `movq`
+- xmm レジスタどうしの `pshufd`、`punpcklbw`、`punpckldq`、`punpcklqdq`、即値による `pslld` と `psrld`、`pmovmskb`
 
 これらの形のレジスタは、上位バイトのレジスタ `ah`、`ch`、`dh`、`bh` でもかまいません。
 

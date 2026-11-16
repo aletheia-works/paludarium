@@ -978,14 +978,7 @@ impl NetlinkSocket {
                 // What has run out by now, which Linux's work would have
                 // found as it did, is told of first.
                 let now = self.clock();
-                let expired = told(
-                    self.network.addresses().expire(now),
-                    0,
-                    0,
-                    false,
-                    false,
-                    now,
-                );
+                let expired = told(self.network.expire(now), 0, 0, false, false, now);
                 for notice in &expired {
                     if s.groups & (1u64 << (notice.group - 1)) != 0 {
                         self.deliver(s, 0, notice.group, notice.bytes.clone());
@@ -1457,6 +1450,7 @@ impl NetlinkSocket {
     /// error first, `EAGAIN` while there is none; `peek` leaves it. A
     /// dump's `NLMSG_DONE` is queued after it. What it got.
     fn receive(&self, buf: &mut [u8], peek: bool) -> Result<Got, Errno> {
+        expire(&self.network, self.clock());
         let mut s = self.lock();
         let got = self.next_datagram(&mut s, buf, peek);
         // `netlink_rcv_wake`, whatever the receive gave: an empty queue is
@@ -1544,6 +1538,7 @@ impl FileHandle for NetlinkSocket {
     /// As `datagram_poll`: always writable, readable with a datagram or an
     /// error waiting.
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
+        expire(&self.network, self.clock());
         let s = self.lock();
         let error = u32::from(s.error.is_some()) * 8;
         let ready = u32::from(!s.queue.is_empty()) * IN;
@@ -5016,6 +5011,18 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
         });
     }
     notices
+}
+/// What has run out of `network`'s addresses and routes by `now`
+/// ([`Network::expire`]), told to netlink's members of its groups, as
+/// Linux's work (`check_lifetime`, `addrconf_verify_rtnl`, `fib6_run_gc`)
+/// tells of it as it comes: a socket waiting on its group hears of it as
+/// its wait looks again, and so does one that reads or polls. No socket is
+/// locked.
+pub(crate) fn expire(network: &Network, now: u64) {
+    let events = network.expire(now);
+    if !events.is_empty() {
+        notify(network, told(events, 0, 0, false, false, now), None);
+    }
 }
 /// Brings `network`'s loopback up or down, as `SIOCSIFFLAGS` does, and
 /// tells netlink's members of it, at `now`.

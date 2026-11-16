@@ -328,7 +328,9 @@ fn regs(attr: &Attr, mask: u64, vector: u64, predicate: u32) -> Result<(), Errno
 /// opmask registers (1 quadword), all 8 or none, for no more than half of
 /// a 64 KiB sample with the 4 quadwords before them.
 fn simd_regs(vec_qwords: u16, vector: u64, pred_qwords: u16, predicate: u32) -> Result<(), Errno> {
-    /// Whether the first `n` registers of `mask` are all there, or none is.
+    /// Whether the first `n` registers of `mask` are all there, or none is
+    /// (`bitmap_full(&mask, n)`, which looks at those bits alone: more of
+    /// them, up to the 32 vector registers, are let through, as on Linux).
     fn whole(mask: u64, n: u32) -> bool {
         let first = (1u64 << n) - 1;
         mask == 0 || mask & first == first
@@ -391,8 +393,9 @@ struct State {
     since: u64,
     /// The task is gone: its last time stays.
     last: u64,
-    /// `remove_on_exec` took it out at its task's `execve`: it counts no
-    /// more and is not enabled again.
+    /// `remove_on_exec` took it out of its task and its group at the task's
+    /// `execve` (Linux's `PERF_EVENT_STATE_EXIT`): it counts no more, is not
+    /// enabled again, and its last count and times stay to be read.
     removed: bool,
 }
 
@@ -405,8 +408,9 @@ pub(crate) struct Event {
     cpu: i32,
     clockid: Option<i32>,
     host: Arc<dyn Host>,
-    /// The group's leader, `None` for one that leads its own.
-    leader: Option<Arc<Event>>,
+    /// The group's leader, `None` for one that leads its own: taken away
+    /// when either leaves the group (`perf_group_detach`).
+    leader: Mutex<Option<Arc<Event>>>,
     siblings: Mutex<Vec<Weak<Event>>>,
     state: Mutex<State>,
 }
@@ -567,7 +571,7 @@ impl Event {
             state.enabled = enabled;
         }
         // A leader takes its group in and out with it.
-        if self.leader.is_none() {
+        if lock(&self.leader).is_none() {
             for member in self.members() {
                 member.set_paused(!enabled);
             }
@@ -584,12 +588,33 @@ impl Event {
         self.settle().count = 0;
     }
     /// The group's leader: the event itself or the one it joined.
-    fn leader(self: &Arc<Self>) -> &Arc<Event> {
-        self.leader.as_ref().unwrap_or(self)
+    fn leader(self: &Arc<Self>) -> Arc<Event> {
+        lock(&self.leader)
+            .clone()
+            .unwrap_or_else(|| Arc::clone(self))
+    }
+    /// `perf_group_detach`: a member leaves its leader's group, and a
+    /// leader's members each lead a group of their own, counting while they
+    /// are enabled.
+    fn detach(self: &Arc<Self>) {
+        let leader = lock(&self.leader).take();
+        if let Some(leader) = leader {
+            lock(&leader.siblings)
+                .retain(|member| !std::ptr::eq(member.as_ptr(), Arc::as_ptr(self)));
+            return;
+        }
+        let members: Vec<Arc<Event>> = std::mem::take(&mut *lock(&self.siblings))
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for member in members {
+            *lock(&member.leader) = None;
+            member.set_paused(false);
+        }
     }
     /// The group's events, the leader first.
     fn group(self: &Arc<Self>) -> Vec<Arc<Event>> {
-        let leader = Arc::clone(self.leader());
+        let leader = self.leader();
         let mut events = vec![Arc::clone(&leader)];
         events.extend(lock(&leader.siblings).iter().filter_map(Weak::upgrade));
         events
@@ -751,6 +776,12 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             .map_err(|_| EBADF)?
             .file;
         let event = Arc::clone(of(&file).ok_or(EBADF)?);
+        // One `remove_on_exec` took out is in Linux's `EXIT` state, which
+        // no group may be led by (`ENODEV`, as Linux master since 7.2's
+        // fa091f46c383; the test machines' 7.0 takes it).
+        if lock(&event.state).removed {
+            return Err(Errno::ENODEV);
+        }
         if flags & PERF_FLAG_FD_NO_GROUP == 0 {
             leader = Some(event);
         }
@@ -820,7 +851,7 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             (Target::Cpu, Target::Cpu) => true,
             _ => false,
         };
-        if leader.leader.is_some()
+        if lock(&leader.leader).is_some()
             || leader.clockid != clockid
             || leader.cpu != cpu
             || !same_target
@@ -838,7 +869,7 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         cpu,
         clockid,
         host: Arc::clone(c.shared_host),
-        leader: leader.clone(),
+        leader: Mutex::new(leader.clone()),
         siblings: Mutex::default(),
         state: Mutex::default(),
     });
@@ -891,6 +922,16 @@ fn init(attr: &Attr) -> Result<Counter, Errno> {
     }
 }
 
+/// `perf_event_exit_task`: thread `tid` of `group` ends without an
+/// `execve`, and the events it opened have no owner any more, so that
+/// `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` of a later thread of that
+/// number do not reach them. They go on counting what they count.
+pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, tid: u32) {
+    lock(&events.lists)
+        .owned
+        .retain(|owned| owned.tid != tid || !owned.of(group));
+}
+
 /// What an `execve` by thread `tid` (its number before the exec, `new_tid`
 /// after it) of thread group `group` does to the machine's events: one
 /// with `enable_on_exec` that waits for it is enabled
@@ -908,6 +949,7 @@ pub(crate) fn exec(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32)
             owned.tid = new_tid;
         }
     }
+    let mut removed = Vec::new();
     lists.on_exec.retain(|waiting| {
         let Some(event) = event(waiting) else {
             return false;
@@ -918,12 +960,14 @@ pub(crate) fn exec(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32)
                 tid: target_tid,
             } if *target_tid == tid && std::ptr::eq(Arc::as_ptr(target), group) => {
                 if event.attr.flag(bit::REMOVE_ON_EXEC) {
+                    // `perf_event_exit_event` with `DETACH_GROUP`, after
+                    // `perf_remove_from_owner`, as Linux master since 7.2's
+                    // 037a3c43edfb; the test machines' 7.0 leaves the event
+                    // in its group.
                     event.disable();
                     event.settle().removed = true;
-                    // The members of a group it led count on their own.
-                    for member in event.members() {
-                        member.set_paused(false);
-                    }
+                    event.detach();
+                    removed.push(Arc::as_ptr(&event));
                 } else {
                     event.enable();
                 }
@@ -931,6 +975,12 @@ pub(crate) fn exec(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32)
             }
             _ => true,
         }
+    });
+    // An event removed so has no owner any more.
+    lists.owned.retain(|owned| {
+        !removed
+            .iter()
+            .any(|&gone| std::ptr::addr_eq(owned.event.as_ptr(), gone))
     });
 }
 
@@ -1073,6 +1123,66 @@ mod tests {
         assert_eq!(init(&branch), Err(Errno::EOPNOTSUPP));
     }
 
+    fn event(leader: Option<&Arc<Event>>) -> Arc<Event> {
+        let event = Arc::new(Event {
+            id: 0,
+            attr: Attr::default(),
+            counter: Counter::Zero,
+            target: Target::Cpu,
+            cpu: 0,
+            clockid: None,
+            host: Arc::new(paludarium_host::testing::RecordingHost::default()),
+            leader: Mutex::new(leader.cloned()),
+            siblings: Mutex::default(),
+            state: Mutex::default(),
+        });
+        if let Some(leader) = leader {
+            lock(&leader.siblings).push(Arc::downgrade(&event));
+        }
+        event
+    }
+
+    fn ids(events: &[Arc<Event>]) -> Vec<*const Event> {
+        events.iter().map(Arc::as_ptr).collect()
+    }
+
+    #[test]
+    fn a_member_that_leaves_its_group_leads_its_own() {
+        let leader = event(None);
+        let (gone, stays) = (event(Some(&leader)), event(Some(&leader)));
+        gone.detach();
+        assert_eq!(
+            ids(&leader.group()),
+            ids(&[Arc::clone(&leader), Arc::clone(&stays)])
+        );
+        assert_eq!(ids(&gone.group()), ids(&[Arc::clone(&gone)]));
+        assert_eq!(ids(&stays.group()), ids(&leader.group()));
+    }
+
+    #[test]
+    fn a_leader_that_leaves_lets_its_members_count_alone() {
+        let leader = event(None);
+        let member = event(Some(&leader));
+        member.enable();
+        member.set_paused(true);
+        leader.detach();
+        assert_eq!(ids(&leader.group()), ids(&[Arc::clone(&leader)]));
+        assert_eq!(ids(&member.group()), ids(&[Arc::clone(&member)]));
+        assert!(!lock(&member.state).paused);
+    }
+
+    #[test]
+    fn a_thread_that_ends_owns_its_events_no_more() {
+        let events = Events::default();
+        let group = Arc::new(ThreadGroup::default());
+        let (mine, other) = (event(None), event(None));
+        events.add(&mine, &group, 5);
+        events.add(&other, &group, 6);
+        exit_thread(&events, &group, 5);
+        assert!(events.owned_by(&group, 5).is_empty());
+        assert_eq!(ids(&events.owned_by(&group, 6)), ids(&[other]));
+    }
+
     #[test]
     fn simd_registers_are_checked_as_x86_checks_them() {
         let simd = |vec_qwords, pred_qwords| Attr {
@@ -1096,6 +1206,10 @@ mod tests {
         assert_eq!(regs(&simd(2, 0), 0, 0xffff, 0), Ok(()));
         assert_eq!(regs(&simd(4, 0), 0, 0xffff, 0), Ok(()));
         assert_eq!(regs(&simd(2, 0), 0, 0xff, 0), Err(Errno::EINVAL));
+        // `bitmap_full` looks at the first 16 bits alone, and only bits past
+        // the 32 vector registers are refused, so more registers pass.
+        assert_eq!(regs(&simd(2, 0), 0, 0x1_ffff, 0), Ok(()));
+        assert_eq!(regs(&simd(4, 0), 0, 0xffff_ffff, 0), Ok(()));
         assert_eq!(regs(&simd(8, 0), 0, 0xffff, 0), Err(Errno::EINVAL));
         assert_eq!(regs(&simd(8, 0), 0, 0xffff_ffff, 0), Ok(()));
         assert_eq!(regs(&simd(8, 0), 0, 1 << 32, 0), Err(Errno::EINVAL));

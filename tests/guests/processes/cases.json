@@ -153,6 +153,7 @@
     {"name":"fanotify-fid","binary":"fanotify"},
     {"name":"fanotify-pidfd","binary":"fanotify"},
     {"name":"fanotify-unprivileged","binary":"fanotify"},
+    {"name":"fanotify-mounts","binary":"fanotify"},
     {"name":"fanotify-perm","binary":"fanotify"},
     {"name":"userfaultfd-calls","binary":"userfaultfd"},
     {"name":"userfaultfd-faults","binary":"userfaultfd"},

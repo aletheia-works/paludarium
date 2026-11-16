@@ -1,7 +1,8 @@
 //! fanotify: `fanotify_init` and `fanotify_mark`, as Linux's
 //! `fs/notify/fanotify`. A group's marks are on files (by their device and
-//! inode, [`Key`]), on mounts and on file systems (both by the device, as
-//! every mount here is a file system of its own), and the machine's
+//! inode, [`Key`]), on mounts (by their ID, so a bind mount of the same
+//! file system has marks of its own) and on file systems (by the device),
+//! and the machine's
 //! [`crate::inotify::Notifier`] tells the groups ([`Registry::dispatch`])
 //! what Linux's `fsnotify` hooks tell them: the same events, with the file,
 //! its directory and its name where Linux has them. A group queues what its
@@ -276,10 +277,12 @@ pub(crate) fn path_opener(fs: &Arc<dyn paludarium_vfs::FileSystem>, path: &[u8])
 /// What an event comes with, as `fsnotify`'s data types.
 pub(crate) enum Data<'a> {
     /// A path (`FSNOTIFY_EVENT_PATH`): an open file, which a descriptor can
-    /// be opened of again, by `opener`, at `path` (where it was then).
+    /// be opened of again, by `opener`, at `path` (where it was then), in
+    /// the mount numbered `mount`, whose marks hear of it.
     Path {
         object: Object,
         path: Vec<u8>,
+        mount: u64,
         opener: &'a dyn Fn() -> Opener,
     },
     /// A file without a path (`FSNOTIFY_EVENT_DENTRY` and `_INODE`).
@@ -293,6 +296,14 @@ pub(crate) enum Data<'a> {
     },
 }
 impl Data<'_> {
+    /// The mount a path event is in: none for the others, which no mount
+    /// mark hears of.
+    fn mount(&self) -> Option<u64> {
+        match self {
+            Data::Path { mount, .. } => Some(*mount),
+            _ => None,
+        }
+    }
     fn object(&self) -> Object {
         match self {
             Data::Path { object, .. } | Data::Inode(object) => *object,
@@ -357,7 +368,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Target {
     Inode(Key),
-    Mount(u64),
+    /// A mount, by its ID (`mnt_id`), on the file system of the device.
+    Mount(u64, u64),
     FileSystem(u64),
     /// A mount namespace, by its inode, which only mount events (never
     /// sent here) are of.
@@ -431,7 +443,7 @@ impl Mark {
     /// The device of the file system it is in.
     fn device(&self) -> u64 {
         match self.target {
-            Target::Inode((device, _)) | Target::Mount(device) | Target::FileSystem(device) => {
+            Target::Inode((device, _)) | Target::Mount(_, device) | Target::FileSystem(device) => {
                 device
             }
             Target::Namespace(_) => crate::namespaces::DEVICE,
@@ -852,10 +864,16 @@ impl Registry {
             })
         })
     }
-    /// Whether the marks of a file, of its mount (for a path event) or of
-    /// its file system want its directory and name for `mask`
+    /// Whether the marks of a file, of its mount (`mount`, for a path
+    /// event) or of its file system want its directory and name for `mask`
     /// (`fsnotify_event_needs_parent`).
-    fn needs_parent(&self, groups: &[Arc<Group>], object: Object, path: bool, mask: u32) -> bool {
+    fn needs_parent(
+        &self,
+        groups: &[Arc<Group>],
+        object: Object,
+        mount: Option<u64>,
+        mask: u32,
+    ) -> bool {
         if mask & ONDIR != 0 {
             return false;
         }
@@ -863,7 +881,7 @@ impl Registry {
             group.queue().marks.iter().any(|m| {
                 let on = match m.target {
                     Target::Inode(key) => key == object.key,
-                    Target::Mount(device) => path && device == object.key.0,
+                    Target::Mount(id, _) => mount == Some(id),
                     Target::FileSystem(device) => device == object.key.0,
                     Target::Namespace(_) => false,
                 };
@@ -893,7 +911,8 @@ impl Registry {
         let (mut dir, mut name, mut on_child) = (None, None, false);
         if let Some((parent, file_name)) = parent {
             let watched = self.watches_children(&groups, parent.key, FS_EVENTS_POSS_ON_CHILD);
-            let needed = !object.directory && self.needs_parent(&groups, object, path, mask);
+            let needed =
+                !object.directory && self.needs_parent(&groups, object, data.mount(), mask);
             // A directory is told of with its parent only when the parent
             // watches its children.
             if (watched || needed) && !(object.directory && !watched) {
@@ -965,10 +984,7 @@ impl Registry {
             (Some(_), _) if mask & EVENT_ON_CHILD != 0 => (dir, Iter::Parent),
             _ => (None, Iter::Parent),
         };
-        let mount = match data {
-            Data::Path { object, .. } => Some(object.key.0),
-            _ => None,
-        };
+        let mount = data.mount();
         let device = object.key.0;
         for group in groups {
             Group::handle(
@@ -1026,7 +1042,7 @@ impl Group {
                         found[iter as usize] = Some(i);
                     }
                 }
-                Target::Mount(d) if Some(d) == mount => found[Iter::Mount as usize] = Some(i),
+                Target::Mount(id, _) if Some(id) == mount => found[Iter::Mount as usize] = Some(i),
                 Target::FileSystem(d) if d == device => {
                     found[Iter::FileSystem as usize] = Some(i);
                 }
@@ -1232,6 +1248,7 @@ impl Group {
             object,
             path,
             opener,
+            ..
         } = data
         {
             Body::Path {
@@ -1387,8 +1404,8 @@ impl Group {
 
     /// What `/proc/self/fdinfo` shows after the lines every descriptor
     /// has, as Linux's `fanotify_show_fdinfo`: the flags, then a line for
-    /// each mark, the newest first; a mount's by the ID `mount_id` gives.
-    pub(crate) fn fdinfo(&self, mount_id: &dyn Fn(u64) -> u64) -> Vec<u8> {
+    /// each mark, the newest first; a mount's by its ID.
+    pub(crate) fn fdinfo(&self) -> Vec<u8> {
         let mut out = format!(
             "fanotify flags:{:x} event-flags:{:x}\n",
             self.flags & INIT_FLAGS,
@@ -1418,9 +1435,9 @@ impl Group {
                         handle.kind,
                     )
                 }
-                Target::Mount(device) => format!(
+                Target::Mount(id, _) => format!(
                     "fanotify mnt_id:{:x} mflags:{:x} mask:{:x} ignored_mask:{:x}\n",
-                    mount_id(device),
+                    id,
                     m.user_flags(),
                     m.mask,
                     m.ignore
@@ -1636,7 +1653,7 @@ fn mark(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
                 !matches!(
                     (m.target, mark_type),
                     (Target::Inode(_), 0)
-                        | (Target::Mount(_), MARK_MOUNT)
+                        | (Target::Mount(..), MARK_MOUNT)
                         | (Target::FileSystem(_), MARK_FILESYSTEM)
                         | (Target::Namespace(_), MARK_MNTNS)
                 )
@@ -1698,7 +1715,7 @@ fn mark(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let target = match mark_type {
         0 => Target::Inode(found.key),
-        MARK_MOUNT => Target::Mount(found.key.0),
+        MARK_MOUNT => Target::Mount(found.mount, found.key.0),
         MARK_FILESYSTEM => Target::FileSystem(found.key.0),
         _ => {
             // A mount namespace file names the namespace.

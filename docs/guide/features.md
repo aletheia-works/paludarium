@@ -1992,9 +1992,12 @@ kernel.
     `IFA_CACHEINFO` are kept. An address with a valid lifetime is not
     `IFA_F_PERMANENT`, one with a preferred lifetime of 0 is
     `IFA_F_DEPRECATED`, and `IFA_CACHEINFO` tells what each has left and
-    when the address was made and its lifetimes set. As Linux's checks do,
-    an address becomes deprecated when its preferred lifetime ends, and
-    goes with its routes when its valid one does. An IPv6 prefix route does
+    when the address was made and its lifetimes set. As Linux's checks do
+    (`check_lifetime`, `addrconf_verify_rtnl`), an address becomes
+    deprecated when its preferred lifetime ends, and goes with its routes
+    when its valid one does, on time without a request: a socket that
+    binds or sends finds it gone, and a member of the address and route
+    groups waiting in `poll`, `epoll` or a read hears of it as it happens. An IPv6 prefix route does
     not run out by itself, as on Linux, whose routes through a loopback
     lose `RTF_EXPIRES` as they are made (`fib6_is_reject`); it takes a
     lifetime (`rta_expires`) when a change gives its permanent address one
@@ -3305,7 +3308,12 @@ kernel.
   and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
   for an event that does not sample. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
-  `remove_on_exec` disables one then for good. `prctl`'s
+  `remove_on_exec` takes one out then for good, as Linux master does: it
+  counts no more, keeps its last count and times to be read, has no owner
+  any more and leaves its group, whose members, if it led one, each count
+  on their own; such an event leads no new group (`ENODEV`). A thread that
+  ends without an `execve` owns the events it opened no more
+  (`perf_event_exit_task`). `prctl`'s
   `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` disable and enable every
   event the calling thread opened, whatever task it counts (one opened
   disabled too), and read no other argument; a thread that runs `execve`
@@ -3496,7 +3504,9 @@ kernel.
   (`EMFILE`), and the file is `anon_inode:[fanotify]`, read and written,
   with `O_NONBLOCK` and `O_CLOEXEC` as asked. `fanotify_mark` adds, removes
   or flushes marks on a file, a mount or a file system (and takes a mount
-  namespace's), with its checks in its order: the flags and mask
+  namespace's); a mount's mark, by the mount's ID, hears only of the paths
+  in that mount, not of a bind mount of the same file system, and fdinfo
+  shows that ID. It makes its checks in its order: the flags and mask
   (`EINVAL`), the descriptor (`EBADF`, `EINVAL`), the group's class and
   modes, the path (`ENOENT`, `ENOTDIR`), the events the file system takes
   (`EINVAL` for permission events on /proc, and for mount and file system

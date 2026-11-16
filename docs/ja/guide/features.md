@@ -1734,8 +1734,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     アドレスの接頭辞の経路のメトリックになる `IFA_RT_PRIORITY`、`IFA_CACHEINFO` の寿命を
     保ちます。有効な寿命のあるアドレスは `IFA_F_PERMANENT` でなく、推奨の寿命が 0 のものは
     `IFA_F_DEPRECATED` で、`IFA_CACHEINFO` はそれぞれの残りと、アドレスが作られた時刻と
-    寿命を決めた時刻を伝えます。Linux の確認と同じく、推奨の寿命が尽きたアドレスは非推奨に
-    なり、有効な寿命が尽きると経路とともに消えます。IPv6 の接頭辞の経路は、Linux と同じく
+    寿命を決めた時刻を伝えます。Linux の確認（`check_lifetime`、`addrconf_verify_rtnl`）と
+    同じく、推奨の寿命が尽きたアドレスは非推奨になり、有効な寿命が尽きると経路とともに
+    消えます。要求がなくても時間どおりです。bind や送信をするソケットは消えたことに気づき、
+    アドレスと経路のグループのメンバーが `poll`、`epoll`、読み込みで待っていれば、そのとき
+    に伝わります。IPv6 の接頭辞の経路は、Linux と同じく
     ひとりでには尽きません。Linux ではループバックを通る経路は作るときに `RTF_EXPIRES` を
     失います（`fib6_is_reject`）。変更が永続のアドレスに寿命を与えたとき
     （`modify_prefix_route`）か、接頭辞のアドレスの 1 つが消えて残りに寿命があるときに、
@@ -2863,8 +2866,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
   と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
-  イベントをそのタスクの `execve` で有効にし、`remove_on_exec` はそのとき
-  イベントを以後ずっと無効にします。`prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と `ENABLE` は、
+  イベントをそのタスクの `execve` で有効にし、`remove_on_exec` は、Linux master と同じく、そのとき
+  イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
+  持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで
+  数えます。そうしたイベントは新しいグループを率いられません（`ENODEV`）。`execve` なしで
+  終わったスレッドは、開いたイベントの持ち主でなくなります（`perf_event_exit_task`）。
+  `prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と `ENABLE` は、
   呼んだスレッドが開いたすべてのイベントを、どのタスクを数えるものでも（無効で開いたものも）
   無効または有効にし、ほかの引数は読みません。`execve` を実行したスレッドは、開いたイベントを
   そのまま持ちます。`sample_simd_regs_enabled` があると、Linux master の構造体の SIMD
@@ -3031,7 +3038,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザーのグループを数え（`EMFILE`）、ファイルは読み書きできる `anon_inode:[fanotify]`
   で、`O_NONBLOCK` と `O_CLOEXEC` は求められたとおりです。`fanotify_mark` はファイル、
   マウント、ファイルシステムへのマーク（マウント名前空間へのものも受け付けます）を足し、外し、
-  まとめて消します。確認もその順です。フラグとマスク（`EINVAL`）、ディスクリプタ
+  まとめて消します。マウントへのマークはマウントの ID で持ち、同じファイルシステムの
+  バインドマウントではなくそのマウントの中のパスのイベントだけを受け、fdinfo はその ID を
+  示します。確認もその順です。フラグとマスク（`EINVAL`）、ディスクリプタ
   （`EBADF`、`EINVAL`）、グループのクラスとモード、パス（`ENOENT`、`ENOTDIR`）、
   ファイルシステムが受け付けるイベント（/proc への許可イベントと、カーネル自身のファイル
   システムへのマウントとファイルシステムのマークは `EINVAL`。新しいフラグでのファイルへの

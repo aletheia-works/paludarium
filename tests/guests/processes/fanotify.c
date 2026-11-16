@@ -19,7 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -786,6 +788,74 @@ static int case_perm(void) {
     return 0;
 }
 
+/* The mount ID statx gives for `path` (STATX_MNT_ID), or 0. */
+static uint64_t mount_of(const char *path) {
+    unsigned char buf[256] = {0};
+    if (syscall(SYS_statx, AT_FDCWD, path, 0, 0x1000, buf) != 0) return 0;
+    uint64_t id;
+    memcpy(&id, buf + 144, 8);
+    return id;
+}
+/* The mnt_id of each mount mark fdinfo shows for `fan`, as whose mount it
+   is: `a`'s, `b`'s or another's. */
+static void show_mount_marks(int fan, uint64_t a, uint64_t b) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fan);
+    FILE *info = fopen(path, "r");
+    char line[512];
+    while (info && fgets(line, sizeof line, info)) {
+        char *p = strstr(line, "mnt_id:");
+        if (!p) continue;
+        unsigned long long id = strtoull(p + 7, NULL, 16);
+        printf("  mount mark of %s\n", id == a ? "a" : id == b ? "b" : "another");
+    }
+    if (info) fclose(info);
+}
+
+/* A mount mark hears only of its own mount: in a mount namespace of its
+   own, a tmpfs at a and a bind mount of it at b, so one file system with
+   two mounts. A mark on a hears of a/f, not of b/f, the same file, and
+   fdinfo gives the mark's mount by its ID. */
+static int case_mounts(void) {
+    make_base("mounts");
+    mkdir(at("a"), 0755);
+    mkdir(at("b"), 0755);
+    printf("unshare=%ld\n", e(unshare(CLONE_NEWNS)));
+    printf("private=%ld\n", e(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("tmpfs=%ld\n", e(mount("none", at("a"), "tmpfs", 0, NULL)));
+    touch(at("a/f"));
+    printf("bind=%ld\n", e(mount(at("a"), at("b"), NULL, MS_BIND, NULL)));
+    uint64_t a = mount_of(at("a")), b = mount_of(at("b"));
+    printf("own ids=%d same file=%d\n", a != 0 && b != 0 && a != b, mount_of(at("a/f")) == a);
+    int fan = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (fan < 0) return 80;
+    printf("mark a=%ld\n", fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN | FAN_CLOSE_WRITE, AT_FDCWD, at("a")));
+    show_mount_marks(fan, a, b);
+    touch(at("b/f"));
+    show_fd_events("through b", fan, 0);
+    touch(at("a/f"));
+    show_fd_events("through a", fan, 0);
+    /* A mark on b too: each mount's events are its own mark's. */
+    printf("mark b=%ld\n", fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN, AT_FDCWD, at("b")));
+    show_mount_marks(fan, a, b);
+    touch(at("b/f"));
+    show_fd_events("through b, marked", fan, 0);
+    /* Removing a's mark leaves b's. */
+    printf("remove a=%ld\n", fan_mark(fan, FAN_MARK_REMOVE | FAN_MARK_MOUNT, FAN_OPEN | FAN_CLOSE_WRITE, AT_FDCWD, at("a")));
+    show_mount_marks(fan, a, b);
+    touch(at("a/f"));
+    show_fd_events("through a, unmarked", fan, 0);
+    /* A descriptor names its mount for a mark too (dfd, NULL path). */
+    int dir = open(at("a"), O_RDONLY | O_DIRECTORY);
+    printf("mark a by descriptor=%ld\n", fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_CLOSE_WRITE, dir, NULL));
+    close(dir);
+    show_mount_marks(fan, a, b);
+    close(fan);
+    printf("umount=%ld %ld\n", e(umount2(at("b"), 0)), e(umount2(at("a"), 0)));
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -796,6 +866,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-fid")) return case_fid();
     if (!strcmp(mode, "fanotify-pidfd")) return case_pidfd();
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
+    if (!strcmp(mode, "fanotify-mounts")) return case_mounts();
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
     printf("unknown mode %s\n", mode);
     return 2;

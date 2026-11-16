@@ -530,7 +530,7 @@ jobs:
           RUST_TEST_THREADS: "1"
       - name: Wasm changed Rust components line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-host -p paludarium-vfs -p paludarium-kernel -p paludarium-runtime -p paludarium-wasm --lib --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|jit)/' --fail-under-lines 80 --lcov --output-path target/wasm-coverage.lcov
+          cargo llvm-cov --locked -p paludarium-host -p paludarium-vfs -p paludarium-kernel -p paludarium-runtime -p paludarium-wasm --lib --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|jit|jit-native)/' --fail-under-lines 80 --lcov --output-path target/wasm-coverage.lcov
       - name: Retain wasm coverage observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -556,8 +556,8 @@ jobs:
           done
       - name: Terminal target crates line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/' --fail-under-lines 80 --lcov --output-path target/terminal-coverage.lcov
-          cargo llvm-cov report --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/'
+          cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|jit-native|harness)/' --fail-under-lines 80 --lcov --output-path target/terminal-coverage.lcov
+          cargo llvm-cov report -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|jit-native|harness)/'
         env:
           RUST_TEST_THREADS: "1"
       # The CPU and decoder only: the command crate (crates/paludarium), which
@@ -565,8 +565,8 @@ jobs:
       # report as it is out of the measured lines.
       - name: Encodings CPU and Decoder line coverage >= 80%
         run: |
-          cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/|crates/paludarium/' --fail-under-lines 80 --lcov --output-path target/encodings-coverage.lcov
-          cargo llvm-cov report --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|runtime|harness)/|crates/paludarium/'
+          cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|jit-native|runtime|harness)/|crates/paludarium/' --fail-under-lines 80 --lcov --output-path target/encodings-coverage.lcov
+          cargo llvm-cov report -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|jit-native|runtime|harness)/|crates/paludarium/'
         env:
           RUST_TEST_THREADS: "1"
       - name: Retain encodings coverage observations

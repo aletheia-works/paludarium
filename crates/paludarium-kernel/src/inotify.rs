@@ -516,7 +516,7 @@ impl Notifier {
         file: Found,
         mask: u32,
         unlinked: bool,
-        path: Option<(&[u8], &dyn Fn() -> crate::fanotify::Opener)>,
+        path: Option<PathEvent<'_>>,
         special: bool,
     ) {
         for instance in self.instances() {
@@ -527,9 +527,10 @@ impl Notifier {
         }
         if self.fan.active() {
             let data = match path {
-                Some((path, opener)) => crate::fanotify::Data::Path {
+                Some((path, mount, opener)) => crate::fanotify::Data::Path {
                     object: file.object(),
                     path: path.to_vec(),
+                    mount,
                     opener,
                 },
                 None => crate::fanotify::Data::Inode(file.object()),
@@ -823,9 +824,15 @@ impl Notifier {
         // `fsnotify_handle_inode_event` skips either watch with
         // `IN_EXCL_UNLINK` for an unlinked dentry.
         let unlinked = content && gone;
-        let path = opener
-            .zip(place)
-            .map(|(opener, (_, path, _))| (path, opener));
+        // The mount the path is in, for fanotify's mount marks.
+        let path = opener.zip(place).map(|(opener, (fs, path, _))| {
+            let mount = if self.fan.active() {
+                crate::files::mount_id_in(fs, device, path)
+            } else {
+                0
+            };
+            (path, mount, opener)
+        });
         self.child(
             named.as_ref(),
             file,
@@ -1485,3 +1492,7 @@ impl FileHandle for Instance {
         Ok(())
     }
 }
+
+/// A path event's path, the ID of the mount it is in (for fanotify's mount
+/// marks), and what opens its file again.
+type PathEvent<'a> = (&'a [u8], u64, &'a dyn Fn() -> crate::fanotify::Opener);

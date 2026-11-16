@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IGNORE = "paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|harness)/"
+IGNORE = "paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|jit-native|harness)/"
 PACKAGES = [
     "paludarium-host",
     "paludarium-kernel",
@@ -156,7 +156,12 @@ def source_snapshot(scope):
 
 
 def export_command(cargo, kind, output):
-    argv = [str(cargo), "llvm-cov", "report", "--ignore-filename-regex", IGNORE]
+    # The packages of the measured run: without them a report counts every
+    # workspace member whose test binaries are in the target directory.
+    argv = [str(cargo), "llvm-cov", "report"]
+    for package in PACKAGES:
+        argv += ["-p", package]
+    argv += ["--ignore-filename-regex", IGNORE]
     if kind != "report":
         argv += ["--" + kind]
     if kind == "lcov":

@@ -870,7 +870,8 @@ impl NetlinkSocket {
         {
             return Err(Errno::EINVAL);
         }
-        if self.privileged(u64::from(groups)) && !sender.admin {
+        // `rtnetlink_bind` asks the caller alone (`ns_capable`).
+        if self.privileged(u64::from(groups)) && !sender.current_admin {
             return Err(Errno::EPERM);
         }
         if s.port.is_none() {
@@ -892,7 +893,8 @@ impl NetlinkSocket {
             return Ok(0);
         }
         let (port, groups) = address(raw)?;
-        if (port != 0 || groups != 0) && !sender.admin {
+        // `netlink_allowed` asks the caller alone (`ns_capable`).
+        if (port != 0 || groups != 0) && !sender.current_admin {
             return Err(Errno::EPERM);
         }
         self.port(&mut s, sender.pid)?;
@@ -1326,26 +1328,32 @@ impl NetlinkSocket {
     /// short message, for neither to get or set (`RTM_SETLINK`), and for a
     /// negative index to make (`RTM_NEWLINK`); `ENODEV` for another
     /// interface. The attributes are checked against `ifla_policy` first
-    /// ([`parse_policy`]). To set, more than one of `IFLA_NET_NS_PID`,
-    /// `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` is `EINVAL`
-    /// (`rtnl_ensure_unique_netns`), `RTM_NEWLINK` checks what
-    /// `IFLA_LINKINFO` holds against `ifla_info_policy`, then the namespace
-    /// those name is found ([`nsid::link_target`]: `ESRCH`, `EBADF`,
-    /// `EINVAL`, `EPERM`); once `lo` is found, `NLM_F_EXCL` is `EEXIST` and
-    /// `NLM_F_REPLACE` `EOPNOTSUPP` for `RTM_NEWLINK`, a move to another
-    /// namespace is `EINVAL`, as `lo` may not move
-    /// (`__dev_change_net_namespace`), and of the other attributes only the
-    /// name `lo` and `IFLA_EXT_MASK` are taken (`EOPNOTSUPP` for others),
-    /// as `do_setlink` looks at them after the move. To get, `strict` is
-    /// `Some` with whether the socket checks strictly, which takes, as
-    /// `rtnl_valid_getlink_req` does, no type, flags or change mask
-    /// (`EINVAL`), and of the
-    /// attributes only the names, `IFLA_EXT_MASK` and
-    /// `IFLA_TARGET_NETNSID` (`EINVAL` for others); either way
-    /// `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are then `EOPNOTSUPP`, and
-    /// `IFLA_TARGET_NETNSID` names the namespace whose link it is, as
-    /// [`nsid::target`] finds it (`EINVAL`, `EACCES`). The flags, the
-    /// change mask, and that ID and namespace.
+    /// ([`parse_policy`]).
+    ///
+    /// To set (`strict` is `None`):
+    /// - more than one of `IFLA_NET_NS_PID`, `IFLA_NET_NS_FD` and
+    ///   `IFLA_TARGET_NETNSID` is `EINVAL` (`rtnl_ensure_unique_netns`);
+    /// - `RTM_NEWLINK` checks what `IFLA_LINKINFO` holds against
+    ///   `ifla_info_policy`;
+    /// - the namespace those attributes name is found
+    ///   ([`nsid::link_target`]: `ESRCH`, `EBADF`, `EINVAL`, `EPERM`);
+    /// - once `lo` is found, `NLM_F_EXCL` is `EEXIST` and `NLM_F_REPLACE`
+    ///   `EOPNOTSUPP` for `RTM_NEWLINK`;
+    /// - a move to another namespace is `EINVAL`, as `lo` may not move
+    ///   (`__dev_change_net_namespace`);
+    /// - of the other attributes only the name `lo` and `IFLA_EXT_MASK` are
+    ///   taken (`EOPNOTSUPP` for others), as `do_setlink` looks at them
+    ///   after the move.
+    ///
+    /// To get, `strict` is `Some` with whether the socket checks strictly,
+    /// which takes, as `rtnl_valid_getlink_req` does, no type, flags or
+    /// change mask (`EINVAL`), and of the attributes only the names,
+    /// `IFLA_EXT_MASK` and `IFLA_TARGET_NETNSID` (`EINVAL` for others).
+    /// Either way `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are then
+    /// `EOPNOTSUPP`, and `IFLA_TARGET_NETNSID` names the namespace whose
+    /// link it is, as [`nsid::target`] finds it (`EINVAL`, `EACCES`).
+    ///
+    /// The flags, the change mask, and, for a get, that ID and namespace.
     fn find_link(
         &self,
         payload: &[u8],
@@ -1644,12 +1652,9 @@ impl FileHandle for NetlinkSocket {
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         self.receive(buf, false).map(|got| got.copied)
     }
-    /// A send to the peer; it binds with the opener's process ID and acts
-    /// with the opener's capability, as no calling thread is known here.
-    /// An ID request's `NETNSA_PID` and `NETNSA_FD` are the writer's,
-    /// though, and a namespace named by its ID (`NETNSA_TARGET_NSID`,
-    /// `IFLA_TARGET_NETNSID`, `IFA_TARGET_NETNSID`) needs the writer's
-    /// `CAP_NET_ADMIN` as well as the opener's ([`resolving`]).
+    /// A send to the peer without a calling thread, as the opener: the
+    /// system calls that write go through [`crate::netlink::write`], as
+    /// the writer.
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
         let sender = Sender {
             pid: self.opener_pid,
@@ -5366,18 +5371,31 @@ pub(crate) fn dispatch(
         _ => Err(Errno::ENOSYS),
     }
 }
-/// For a `write` to a `NETLINK_ROUTE` socket, [`nsid::resolve`]: the
-/// peers its ID requests name as the writer sees them, and the writer's
-/// credentials for their `CAP_NET_ADMIN`, which the send takes, as
-/// Linux's `netlink_sendmsg` runs in the writer's `current`.
-pub(crate) fn resolving(
-    c: &Context<'_>,
+/// A `write` (or `writev`, `sendfile`, `splice`, an AIO write) to a
+/// netlink socket, which sends as `send` without an address does, as the
+/// writer: Linux's `netlink_sendmsg` runs in the writer's `current`, so
+/// the port an autobind takes is its process ID, a route lookup's
+/// `RTA_UID` its user ID, and `netlink_net_capable` wants its
+/// `CAP_NET_ADMIN` as well as the opener's; the namespaces an ID request
+/// names are as it sees them ([`nsid::resolve`]). `None` for another file.
+pub(crate) fn write(
+    c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     bytes: &[u8],
-) -> Option<nsid::Resolved> {
-    of(file)
-        .filter(|socket| socket.protocol == NETLINK_ROUTE)
-        .map(|_| nsid::resolve(c, bytes, false))
+    nosignal: bool,
+    dontwait: bool,
+) -> Option<Result<u64, Errno>> {
+    let socket = of(file)?;
+    let sender = socket.sender(c);
+    let _resolved = (socket.protocol == NETLINK_ROUTE).then(|| nsid::resolve(c, bytes, false));
+    Some(crate::files::write_with(
+        c,
+        file,
+        bytes,
+        nosignal,
+        dontwait,
+        |b| socket.send(b, None, sender),
+    ))
 }
 /// What a receive returns: with `MSG_TRUNC`, the datagram's whole length.
 fn returned(n: usize, length: usize, flags: u64) -> u64 {
@@ -5501,7 +5519,8 @@ fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
             }
             let bit = 1u64 << (group - 1);
             if name == NETLINK_ADD_MEMBERSHIP {
-                if socket.privileged(bit) && !socket.sender(c).admin {
+                // `rtnetlink_bind` asks the caller alone (`ns_capable`).
+                if socket.privileged(bit) && !socket.sender(c).current_admin {
                     return Err(Errno::EPERM);
                 }
                 socket.lock().groups |= bit;

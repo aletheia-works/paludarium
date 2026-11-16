@@ -749,8 +749,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IFLA_GSO_IPV4_MAX_SIZE` の最小値は、Ubuntu のカーネルと同じく 321
   （`MAX_TCP_HEADER` + 1）です。ほかのビルドでは違うことがあります。
   受信バッファがいっぱいのソケットへの答えは、待たずに
-  `ENOBUFS` で捨てます。netlink のソケットへの `write` は、ソケットを開いたスレッドの
-  ケーパビリティだけで動きます。ほかの名前空間は、paludarium に分けるものが
+  `ENOBUFS` で捨てます。ほかの名前空間は、paludarium に分けるものが
   ありません（IPC 名前空間の System V の共有メモリ・セマフォー・メッセージキューと
   POSIX メッセージキュー、マウント名前空間のマウントを除きます）。cgroup 名前空間には
   `/proc/self/cgroup` がなく、time 名前空間には `/proc/<pid>/timens_offsets` がなく、

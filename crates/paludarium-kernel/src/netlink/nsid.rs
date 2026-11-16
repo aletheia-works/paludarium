@@ -155,7 +155,7 @@ impl Drop for Resolved {
 /// and each `RTM_NEWLINK` and `RTM_SETLINK` by `IFLA_NET_NS_PID` or
 /// `IFLA_NET_NS_FD`, for the kernel to take as it reaches them; finding
 /// one changes nothing.
-/// A `write` finds them as its caller sees them too ([`super::resolving`]),
+/// A `write` finds them as its caller sees them too ([`super::write`]),
 /// as Linux looks in `current`'s. `addressed` is whether the send names
 /// an address, as a `write` does not.
 pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8], addressed: bool) -> Resolved {

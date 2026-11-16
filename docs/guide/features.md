@@ -1896,7 +1896,14 @@ kernel.
     thread and the socket's opener (`EPERM`); a send that names an
     address (`sendto`, `sendmsg` with a name) needs the sending thread's
     alone, as `netlink_sendmsg` marks it `NETLINK_SKB_DST`, which
-    `__netlink_ns_capable` passes the opener over for.
+    `__netlink_ns_capable` passes the opener over for. A `write` (and
+    `writev`, `sendfile`, `splice` and AIO writes) sends as `send` without
+    an address does, as the writing thread, since `netlink_sendmsg` runs
+    in it: an autobind takes its process ID for the port, a route lookup
+    its user ID for `RTA_UID`, and a change needs its `CAP_NET_ADMIN` and
+    the opener's. `bind`'s and `NETLINK_ADD_MEMBERSHIP`'s multicast routing
+    groups and `connect` to another port or a group ask the calling
+    thread alone (`rtnetlink_bind`, `netlink_allowed`).
   - **Strict checking:** with `NETLINK_GET_STRICT_CHK`, as iproute2 sets
     it, requests are checked as Linux checks them. A dump takes a whole
     header with nothing in it but what may narrow it, and of the
@@ -2258,7 +2265,8 @@ kernel.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
-    multicast routing groups 30 and 31 need `CAP_NET_ADMIN`, `EPERM`);
+    multicast routing groups 30 and 31 need the caller's `CAP_NET_ADMIN`,
+    `EPERM`);
     `NETLINK_DROP_MEMBERSHIP` leaves one, and `NETLINK_LIST_MEMBERSHIPS`
     gives them all as two words. A change to `lo` is told to the members
     of its group in the namespace, each notification its own datagram,

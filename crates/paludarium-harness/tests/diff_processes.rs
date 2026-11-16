@@ -133,7 +133,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -267,6 +267,7 @@ mod linux {
                     | "netlink-nsid-write"
                     | "netlink-target-netnsid"
                     | "netlink-link-netns"
+                    | "netlink-write-credentials"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -447,6 +448,7 @@ mod linux {
         netlink_nsid_write => ("netlink-nsid-write","netlink-options"),
         netlink_target_netnsid => ("netlink-target-netnsid","netlink-options"),
         netlink_link_netns => ("netlink-link-netns","netlink-options"),
+        netlink_write_credentials => ("netlink-write-credentials","netlink-options"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),

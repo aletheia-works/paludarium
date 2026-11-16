@@ -867,8 +867,7 @@ verified.
   takes is 321, as for Ubuntu's kernel (`MAX_TCP_HEADER` + 1), where
   another build's may differ. A socket
   whose receive buffer is full drops an answer with `ENOBUFS` without
-  waiting. A `write` to a netlink socket acts with the capability of the
-  thread that opened it alone. The other namespaces keep nothing apart
+  waiting. The other namespaces keep nothing apart
   that paludarium has, but for the System V shared memory, semaphores and
   message queues and the POSIX message queues of an IPC namespace and the
   mounts of a mount namespace: there is no `/proc/self/cgroup` for a cgroup

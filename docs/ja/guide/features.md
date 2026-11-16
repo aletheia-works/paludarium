@@ -1661,6 +1661,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     開いたものの両方に要ります（なければ `EPERM`）。アドレスを指して送るとき
     （`sendto`、名前を付けた `sendmsg`）は、`netlink_sendmsg` がそれに `NETLINK_SKB_DST` の
     印を付け、`__netlink_ns_capable` が開いた側を見ないので、送るスレッドのものだけが要ります。
+    `write`（と `writev`、`sendfile`、`splice`、AIO の書き込み）は、`netlink_sendmsg` が
+    書くスレッドで動くので、アドレスのない `send` と同じく、書くスレッドとして送ります。
+    自動のバインドはそのプロセス ID をポートにし、経路の検索はそのユーザー ID を `RTA_UID`
+    にし、変更にはその `CAP_NET_ADMIN` と開いた側のものが要ります。`bind` と
+    `NETLINK_ADD_MEMBERSHIP` のマルチキャストの経路のグループ、ほかのポートやグループへの
+    `connect` は、呼び出したスレッドのものだけを見ます（`rtnetlink_bind`、`netlink_allowed`）。
   - **厳密な検査:** iproute2 と同じく `NETLINK_GET_STRICT_CHK` を設定すると、Linux と
     同じくリクエストを調べます。ダンプには、絞り込みに使うもの以外は空のヘッダーが
     そろっていて、属性は絞り込みに使うものだけで、型が知られたもので、余るバイトが
@@ -1959,7 +1965,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
     `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
     1 から 39 で（0 とそれを超えるものは `EINVAL`、マルチキャストの経路の 30 と 31 には
-    `CAP_NET_ADMIN` が要り、なければ `EPERM`）、`NETLINK_DROP_MEMBERSHIP` で抜け、
+    呼び出し元の `CAP_NET_ADMIN` が要り、なければ `EPERM`）、`NETLINK_DROP_MEMBERSHIP` で抜け、
     `NETLINK_LIST_MEMBERSHIPS` は 2 ワードで全部を返します。`lo` の変化は、名前空間の中の
     そのグループのメンバーに、1 つずつ別のデータグラムで、Linux の順に伝えます。上げ下げには
     `ifi_change` に `IFF_UP` を持つ `RTM_NEWLINK`（`RTNLGRP_LINK`）を、それから

@@ -591,7 +591,10 @@ verified.
   is read-only: a `hostfs` one takes no option but the common ones
   (`EINVAL`), and the root's tmpfs options are checked but keep nothing.
   A descriptor's mount, for `EROFS` of `fchmod`, `fchown`, `futimens`,
-  `fsetxattr` and the like, is found by the path it was opened at.
+  `fsetxattr` and the like, is found by the path it was opened at, and for
+  `noexec` of `mmap` by where its file now is, so a remount or a mount on
+  that path since the open counts, where Linux's keeps the file's own
+  mount.
   `MNT_EXPIRE`'s mark is cleared by a lookup that ends on the mount and by
   the close of a file on it, but not by a lookup that only passes through
   it, as Linux's every `mntput` does.

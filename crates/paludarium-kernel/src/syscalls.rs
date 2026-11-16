@@ -2297,9 +2297,12 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     };
     // A file on a mount that runs nothing (`path_noexec`): READ_IMPLIES_EXEC
     // adds no PROT_EXEC to its mapping, which may never run.
-    let noexec = descriptor
-        .as_ref()
-        .is_some_and(|d| crate::files::mount_says(c.files, &d.path, crate::files::ST_NOEXEC));
+    // Its mount is found by where the file now is, as its open description
+    // keeps that through renames, not by its mount itself.
+    let noexec = descriptor.as_ref().is_some_and(|d| {
+        let at = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
+        crate::files::mount_says(c.files, &at, crate::files::ST_NOEXEC)
+    });
     let prot = if noexec {
         prot
     } else {

@@ -4517,13 +4517,11 @@ impl Kernel {
             Some((_, _, capabilities)) => capabilities.clone(),
             None => program_capabilities(|f| self.files.fs().with_xattrs(&loaded, true, f))?,
         };
-        // Linux takes the new credentials once the loader has read the
-        // program and opened its interpreter (`begin_new_exec`), so their
-        // error comes after the loader's.
-        // `mnt_may_suid`: a program on a `nosuid` mount, or on a superblock
-        // of a user namespace the caller is not in, gives neither its
-        // set-ID bits (`bprm_fill_uid`) nor its file capabilities
-        // (`get_file_caps`).
+        // `mnt_may_suid`: the file that runs (a script's interpreter, as
+        // Linux's `bprm_creds_from_file` takes `bprm->file`) on a `nosuid`
+        // mount, or on a superblock of a user namespace the caller is not
+        // in, gives neither its set-ID bits (`bprm_fill_uid`) nor its file
+        // capabilities (`get_file_caps`).
         let may_suid = !crate::files::mount_says(&self.files, &loaded, crate::files::ST_NOSUID)
             && crate::files::resolved(&self.files, &loaded)
                 .and_then(|at| self.files.namespaced().target(&at).ok())
@@ -4534,6 +4532,9 @@ impl Kernel {
                         .map(|owner| thread.state.credentials.in_user_namespace_of(owner))
                 })
                 .unwrap_or(true);
+        // Linux takes the new credentials once the loader has read the
+        // program and opened its interpreter (`begin_new_exec`), so their
+        // error comes after the loader's.
         let exec_credentials = thread.state.credentials.after_exec(
             program.as_ref().filter(|_| may_suid),
             capabilities.as_deref().filter(|_| may_suid),

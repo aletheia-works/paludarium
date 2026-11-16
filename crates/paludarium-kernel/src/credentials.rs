@@ -297,8 +297,6 @@ impl Credentials {
                 && target.permitted & !caps == 0)
             && crate::landlock::may_trace(&self.landlock, &target.landlock)
     }
-    /// Whether the thread has `cap` in user namespace `ns`, as Linux's
-    /// `ns_capable` ([`crate::namespaces::Namespace::grants`]).
     /// Whether its user namespace is `ns` or one below it
     /// (`current_in_userns`).
     pub(crate) fn in_user_namespace_of(&self, ns: &crate::namespaces::Namespace) -> bool {
@@ -314,6 +312,8 @@ impl Credentials {
             at = up;
         }
     }
+    /// Whether the thread has `cap` in user namespace `ns`, as Linux's
+    /// `ns_capable` ([`crate::namespaces::Namespace::grants`]).
     pub(crate) fn capable_in(&self, cap: u64, ns: &crate::namespaces::Namespace) -> bool {
         ns.grants(&self.user, self.euid, self.effective, cap)
     }

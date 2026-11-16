@@ -1587,7 +1587,8 @@ kernel.
   opens no device there (`EACCES`, `may_open_dev`, for root too). A
   program on a `nosuid` mount, or on a superblock of a user namespace the
   caller is not in, runs without its set-user-ID and set-group-ID bits and
-  its file capabilities (`mnt_may_suid`).
+  its file capabilities (`mnt_may_suid`); for a script that is its
+  interpreter, the file that runs.
 - A read-only mount, or one of a read-only superblock, refuses what writes
   with `EROFS` where Linux's `mnt_want_write` does, after the errors that
   come before it: creating a name (`open` with `O_CREAT`, `O_TMPFILE`,

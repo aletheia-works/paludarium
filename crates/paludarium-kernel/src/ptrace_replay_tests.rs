@@ -91,6 +91,10 @@ const RESTORER: u64 = 0x40_3000;
 /// The tracee's word that the tracer peeks and pokes.
 const WORD: u64 = HEAP + 0x800;
 
+/// How long a test waits for a task to reach a state before it fails, so
+/// that a tracee that went wrong fails the test instead of hanging it.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn neg(r: u64) -> i64 {
     r as i64
 }
@@ -143,10 +147,17 @@ impl Tracee {
             {
                 return Err(status);
             }
+            let deadline = std::time::Instant::now() + PATIENCE;
             loop {
                 match self.k.checkpoint(&mut self.t, &self.m) {
                     Next::Exit(status) => return Err(status),
-                    Next::Stopped => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Next::Stopped => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "tracee stayed stopped"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                     Next::Resume => break,
                 }
             }
@@ -245,8 +256,16 @@ impl Tracer {
         let pid = u64::from(t.tid);
         let thread = std::thread::spawn(move || {
             let mut tracee = Tracee { k, t, m };
-            let status = body(&mut tracee);
-            tracee.end(status);
+            // A tracee that fails ends its process, so that the tracer's
+            // wait returns and the test reports the failure from join.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut tracee)));
+            match run {
+                Ok(status) => tracee.end(status),
+                Err(panic) => {
+                    tracee.end(ExitStatus::Signaled(9));
+                    std::panic::resume_unwind(panic);
+                }
+            }
         });
         (pid, thread)
     }
@@ -320,7 +339,9 @@ impl Tracer {
     }
     /// Waits until `pid` sleeps, as the guest does before it attaches.
     fn until_sleeping(&mut self, pid: u64) {
+        let deadline = std::time::Instant::now() + PATIENCE;
         while self.status_of(pid).1 != b'S' {
+            assert!(std::time::Instant::now() < deadline, "{pid} did not sleep");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }

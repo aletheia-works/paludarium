@@ -19036,7 +19036,16 @@ int main(int argc, char **argv) {
             struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
             printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
             nl_addr_life(ctl, port, add, AF_INET, "10.9.0.1", 24, 1, NULL, 0, -1, "addr4");
+            /* Linux adds an IPv6 address's local route in its duplicate
+               address detection's work, even without it (IFA_F_NODAD):
+               what a member of IPv6's address group hears of it comes
+               then. */
+            int mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x100};
+            printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
             nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:9::1", 64, 1, NULL, 0, 0x02, "addr6");
+            monitor_show(mon, port, "addr6");
+            close(mon);
 #define ROUTE4(...) ((struct nl_rt){.family = AF_INET, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
 #define ROUTE6(...) ((struct nl_rt){.family = AF_INET6, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
             nl_route(ctl, port, 24, add, "10.20.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "unicast4");

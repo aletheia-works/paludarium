@@ -6295,6 +6295,67 @@ static int proc_owners_case(void) {
     return 0;
 }
 
+/* The Pid and NSpid lines of `fd`'s fdinfo: each as the number `pid` is
+   (1), -1, or another (0); and how many numbers NSpid has. */
+static void pf_show(const char *label, int fd, pid_t pid) {
+    char path[64], line[256];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    FILE *info = fopen(path, "r");
+    int found = 0;
+    while (info && fgets(line, sizeof line, info)) {
+        if (!strncmp(line, "Pid:\t", 5)) {
+            long n = strtol(line + 5, NULL, 10);
+            printf("%s: Pid=%s\n", label, n == pid ? "pid" : n == -1 ? "-1" : "other");
+            found++;
+        } else if (!strncmp(line, "NSpid:\t", 7)) {
+            char *p = line + 7;
+            long first = strtol(p, &p, 10);
+            int count = 1;
+            while (*p == '\t') {
+                strtol(p + 1, &p, 10);
+                count++;
+            }
+            printf("%s: NSpid=%s count=%d\n", label, first == pid ? "pid" : first == -1 ? "-1" : "other", count);
+            found++;
+        }
+    }
+    if (info) fclose(info);
+    printf("%s: lines=%d\n", label, found);
+}
+
+/* The pidfd-fdinfo case: a pidfd's fdinfo names its process by its PID,
+   as Linux's pidfd_show_fdinfo, a zombie's too, and -1 once it is
+   reaped. */
+static int pidfd_fdinfo_case(void) {
+    int own = syscall(SYS_pidfd_open, getpid(), 0);
+    if (own < 0) return 80;
+    pf_show("self", own, getpid());
+    int ready[2];
+    if (pipe(ready)) return 81;
+    pid_t child = fork();
+    if (child < 0) return 82;
+    if (!child) {
+        char c;
+        close(ready[1]);
+        if (read(ready[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    close(ready[0]);
+    int fd = syscall(SYS_pidfd_open, child, 0);
+    if (fd < 0) return 83;
+    pf_show("running", fd, child);
+    if (write(ready[1], "x", 1) != 1) return 84;
+    siginfo_t info;
+    /* A zombie keeps its number. */
+    waitid(P_PIDFD, fd, &info, WEXITED | WNOWAIT);
+    pf_show("zombie", fd, child);
+    waitid(P_PIDFD, fd, &info, WEXITED);
+    pf_show("reaped", fd, child);
+    close(fd);
+    close(own);
+    return 0;
+}
+
 static int mincore_show(const char *label, void *at, size_t length, size_t pages) {
     unsigned char vec[16];
     memset(vec, 7, sizeof vec);
@@ -27369,6 +27430,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "kernel-info")) return kernel_info_case();
     if (!strcmp(mode, "admin")) return admin_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "pidfd-fdinfo")) return pidfd_fdinfo_case();
     if (!strcmp(mode, "cpu-timer-others")) return cpu_timer_others_case();
     if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();

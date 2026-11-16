@@ -2405,7 +2405,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`MKDEV`）でのファイルシステムのデバイス、`mask:` に与えたマスクを 16 進で書き、
   `ignored_mask:0` と、`show_mark_fhandle` と同じファイルのハンドルが続きます。
   `fhandle-bytes:` と `fhandle-type:` は 16 進で、`f_handle:` はそのバイトで、
-  `AT_HANDLE_FID` の `name_to_handle_at` が返す識別子です。ほかの種類のファイルも Linux と同じ行を加えます。
+  `AT_HANDLE_FID` の `name_to_handle_at` が返す識別子です。pidfd では、`pidfd_show_fdinfo` と
+  同じく `Pid:` と `NSpid:` が加わります。そのプロセス（またはスレッド）の、`/proc` の PID
+  名前空間である最初の名前空間での番号（ゾンビでも同じで、回収されると -1）と、その下の
+  名前空間それぞれでの自分の名前空間までの番号です。ほかの種類のファイルも Linux と同じ行を加えます。
   最初の 4 行の後には `lock:` の行が続きます（`show_fd_locks`）。まずファイル記述の
   `flock` のロック、次にそのファイル記述を通して掛けたレコードロックのうちプロセスの表か
   ファイル記述が持つものが始まりの順に並び、両方を通して 1 から番号が付きます。各行には

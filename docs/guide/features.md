@@ -2772,7 +2772,10 @@ kernel.
   hexadecimal, then `ignored_mask:0` and the file's handle as
   `show_mark_fhandle` writes it: `fhandle-bytes:` and `fhandle-type:` in
   hexadecimal, and `f_handle:`, its bytes, the identifier
-  `name_to_handle_at` gives with `AT_HANDLE_FID`. The other kinds add Linux's lines
+  `name_to_handle_at` gives with `AT_HANDLE_FID`. A pidfd's adds `Pid:` and
+  `NSpid:`, as `pidfd_show_fdinfo`: the number of its process (or thread) in
+  the first PID namespace, that of `/proc`, a zombie's too, or -1 once it is
+  reaped, then its numbers in each namespace below down to its own. The other kinds add Linux's lines
   too. After the first four come `lock:` lines (`show_fd_locks`): the
   description's `flock` lock, then each record lock set through it that the
   process's table or the description owns, by where they start, numbered from 1

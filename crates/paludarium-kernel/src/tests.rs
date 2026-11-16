@@ -2183,6 +2183,29 @@ fn own_proc_files_are_the_process_owners_and_open_as_their_modes_let() {
     assert_eq!(ids(&mut f, 5, fd), (0o100444, 1000, 2000));
 }
 #[test]
+fn a_pidfds_fdinfo_names_its_process() {
+    let mut f = fixture();
+    let pid = f.ret(39, &[]);
+    let fd = f.ret(434, &[pid, 0]);
+    assert!(fd < 1 << 32, "{fd:#x}");
+    let (path, buf) = (DATA, DATA + 0x400);
+    f.mem
+        .write(
+            GuestAddr(path),
+            format!("/proc/self/fdinfo/{fd}\0").as_bytes(),
+        )
+        .unwrap();
+    let info = f.ret(2, &[path, 0]);
+    let count = f.ret(0, &[info, buf, 512]);
+    let mut text = vec![0; count as usize];
+    f.mem.read(GuestAddr(buf), &mut text).unwrap();
+    let text = String::from_utf8(text).unwrap();
+    assert!(
+        text.ends_with(&format!("Pid:\t{pid}\nNSpid:\t{pid}\n")),
+        "{text}"
+    );
+}
+#[test]
 fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
     let mut f = fixture();
     let (name, buf) = (DATA, DATA + 0x400);

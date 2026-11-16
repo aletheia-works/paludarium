@@ -710,6 +710,7 @@ mod linux {
         processes_kernel_info => ("kernel-info","process"),
         processes_admin => ("admin","process"),
         processes_pidfd_getfd => ("pidfd-getfd","process"),
+        processes_pidfd_fdinfo => ("pidfd-fdinfo","process"),
         processes_cpu_clock_ids => ("cpu-clock-ids","process"),
         processes_alarm_clocks => ("alarm-clocks","process"),
         processes_yama => ("yama","process"),

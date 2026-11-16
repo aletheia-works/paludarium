@@ -1647,6 +1647,23 @@ impl Processes {
         }
     }
     /// Whether `pid` has exited: `None` once it is reaped (or never was).
+    /// Task `tid`'s numbers in each PID namespace from the first down to
+    /// its own (Linux's `pid->numbers`), while it is there, a zombie's
+    /// too; none once it is reaped (`pid_has_task`).
+    fn pid_numbers(&self, tid: u32) -> Option<Vec<u32>> {
+        let space = {
+            let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            let pid = process_of(&entries, tid)?;
+            Arc::clone(&entries.get(&pid)?.space)
+        };
+        Some(
+            space
+                .levels()
+                .iter()
+                .map(|level| level.number(tid))
+                .collect(),
+        )
+    }
     fn exited(&self, pid: u32) -> Option<bool> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.get(&pid).map(|entry| entry.status.is_some())
@@ -2150,6 +2167,25 @@ impl PidFd {
     /// ID does.
     pub(crate) fn inode(&self) -> u64 {
         u64::from(self.pid)
+    }
+}
+impl PidFd {
+    /// What `/proc/self/fdinfo` adds for it, as Linux's
+    /// `pidfd_show_fdinfo`: `Pid`, its task's number in the first PID
+    /// namespace, that of `/proc`, or -1 once the task is reaped; then
+    /// `NSpid`, that number and the task's in each namespace below it down
+    /// to its own.
+    pub(crate) fn fdinfo(&self) -> Vec<u8> {
+        let Some(numbers) = self.processes.pid_numbers(self.pid) else {
+            return b"Pid:\t-1\nNSpid:\t-1\n".to_vec();
+        };
+        let mut out = format!("Pid:\t{}\nNSpid:", numbers.first().copied().unwrap_or(0));
+        for number in numbers {
+            out.push('\t');
+            out.push_str(&number.to_string());
+        }
+        out.push('\n');
+        out.into_bytes()
     }
 }
 impl paludarium_host::FileHandle for PidFd {

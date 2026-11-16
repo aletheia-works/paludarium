@@ -7717,6 +7717,8 @@ fn fdinfo(c: &Context<'_>, h: &Holder, d: &Descriptor, descriptors: &[Descriptor
         // Mount marks are kept by device, so a mark has no path to tell
         // the bind mounts of one file system apart: the first mount's ID.
         out.extend(group.fdinfo(&|device| mount_id_in(&*h.fs, device, b"")));
+    } else if let Some(pidfd) = any.and_then(|a| a.downcast_ref::<crate::processes::PidFd>()) {
+        out.extend(pidfd.fdinfo());
     } else if let Some(uffd) = crate::userfaultfd::of(&d.file) {
         out.extend(crate::userfaultfd::fdinfo(uffd));
     } else if let Some(counter) = any.and_then(|a| a.downcast_ref::<crate::events::EventCounter>())

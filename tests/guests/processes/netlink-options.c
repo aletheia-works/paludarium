@@ -392,7 +392,11 @@ static void show(int fd, const char *label) {
             } else if (h->type == RTM_NEWNSID || h->type == RTM_DELNSID) {
                 attrs = 4;
             } else if (h->type == 20 || h->type == 21) {
+                printf(" family=%u prefix=%u index=%u", body[0], body[1], *(unsigned *)(body + 4));
                 attrs = 8;
+            } else if (h->type == 16) {
+                printf(" index=%d up=%u", *(int *)(body + 4), *(unsigned *)(body + 8) & 1);
+                attrs = 16;
             }
             while (attrs >= 0 && attrs + 4 <= body_len) {
                 unsigned short alen, atype;
@@ -405,8 +409,13 @@ static void show(int fd, const char *label) {
                     if (atype == 2) printf(" offset=%u", *(unsigned *)value);
                 } else if (h->type == RTM_NEWNSID || h->type == RTM_DELNSID) {
                     printf(" nsa%u=%d", atype, *(int *)value);
+                } else if (h->type == 16) {
+                    if (atype == 3) printf(" name=%s", value);
+                    if (atype == 46) printf(" netnsid=%d", *(int *)value);
                 } else if (atype == 2 /* IFA_LOCAL */ && alen == 8) {
                     printf(" local=%u.%u.%u.%u", value[0], value[1], value[2], value[3]);
+                } else if (atype == 10 /* IFA_TARGET_NETNSID */) {
+                    printf(" netnsid=%d", *(int *)value);
                 }
                 attrs += (alen + 3) & ~3;
             }
@@ -787,6 +796,150 @@ static void write_case(void) {
     peer_stop(&p);
 }
 
+/* Starts a request of `type` whose body is `body` zero bytes, with
+   `family` first and `index` at byte 4. */
+static void begin_body(struct request *r, unsigned short type, unsigned short flags, unsigned seq, int body,
+                       unsigned char family, int index) {
+    begin(r, type, flags, seq);
+    r->h.len = sizeof r->h + body;
+    r->body[0] = family;
+    memcpy(r->body + 4, &index, 4);
+}
+
+#define IFLA_IFNAME 3
+#define IFLA_NET_NS_PID 19
+#define IFLA_TARGET_NETNSID 46
+#define IFA_ADDRESS 1
+#define IFA_TARGET_NETNSID 10
+
+static void target_case(void) {
+    struct peer p = peer_start();
+    peer_do(&p, 'u');
+    peer_do(&p, '1');
+    int ctl = acked_socket(), one = 1;
+    /* Opened without capabilities, used by root. */
+    if (setresuid(0, 65534, 0)) exit(92);
+    int weak = acked_socket();
+    if (setresuid(0, 0, 0)) exit(93);
+    struct request r;
+    unsigned seq = 1;
+    int self_fd = open("/proc/self/ns/net", O_RDONLY);
+    begin(&r, RTM_NEWNSID, 0x5, seq++);
+    put32(&r, NETNSA_NSID, 3);
+    put32(&r, NETNSA_PID, p.pid);
+    send_request(ctl, &r);
+    begin(&r, RTM_NEWNSID, 0x5, seq++);
+    put32(&r, NETNSA_NSID, 2);
+    put32(&r, NETNSA_FD, self_fd);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    static const unsigned char loopback6[16] = {[15] = 1};
+    for (int strict = 0; strict < 2; strict++) {
+        printf("-- strict=%d\n", strict);
+        setsockopt(ctl, SOL_NETLINK_, STRICT_CHK, &strict, sizeof strict);
+        printf("link dumps\n");
+        static const int ids[] = {3, 2, 9, -1};
+        for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++) {
+            begin_body(&r, 18, 0x301, seq++, 16, 0, 0);
+            put32(&r, IFLA_TARGET_NETNSID, ids[i]);
+            send_request(ctl, &r);
+            show(ctl, "ctl");
+        }
+        printf("link gets\n");
+        begin_body(&r, 18, 0x1, seq++, 16, 0, 1);
+        put32(&r, IFLA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        begin_body(&r, 18, 0x1, seq++, 16, 0, 0);
+        put(&r, IFLA_IFNAME, "lo", 3);
+        put32(&r, IFLA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        begin_body(&r, 18, 0x1, seq++, 16, 0, 5);
+        put32(&r, IFLA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        begin_body(&r, 18, 0x1, seq++, 16, 0, 0);
+        put32(&r, IFLA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        begin_body(&r, 18, 0x1, seq++, 16, 0, 1);
+        put32(&r, IFLA_TARGET_NETNSID, 9);
+        send_request(ctl, &r);
+        begin_body(&r, 18, 0x1, seq++, 16, 0, 1);
+        put32(&r, IFLA_TARGET_NETNSID, 3);
+        put32(&r, IFLA_NET_NS_PID, p.pid);
+        send_request(ctl, &r);
+        show(ctl, "ctl");
+        printf("address dumps\n");
+        static const unsigned char families[] = {AF_UNSPEC, AF_INET, AF_INET6};
+        for (size_t i = 0; i < sizeof families; i++) {
+            begin_body(&r, 22, 0x301, seq++, 8, families[i], 0);
+            put32(&r, IFA_TARGET_NETNSID, 3);
+            send_request(ctl, &r);
+            show(ctl, "ctl");
+        }
+        begin_body(&r, 22, 0x301, seq++, 8, AF_INET, 1);
+        put32(&r, IFA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        show(ctl, "ctl");
+        begin_body(&r, 22, 0x301, seq++, 8, AF_INET6, 0);
+        put32(&r, IFA_TARGET_NETNSID, 9);
+        send_request(ctl, &r);
+        show(ctl, "ctl");
+        begin_body(&r, 22, 0x301, seq++, 8, AF_INET, 0);
+        put(&r, IFA_ADDRESS, "\x7f\0\0\1", 4);
+        put32(&r, IFA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        show(ctl, "ctl");
+        printf("address gets\n");
+        /* Answered to this port in the other namespace, which none has. */
+        begin_body(&r, 22, 0x5, seq++, 8, AF_INET6, 0);
+        put(&r, IFA_ADDRESS, loopback6, 16);
+        put32(&r, IFA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        begin_body(&r, 22, 0x5, seq++, 8, AF_INET6, 0);
+        put(&r, IFA_ADDRESS, loopback6, 16);
+        put32(&r, IFA_TARGET_NETNSID, 9);
+        send_request(ctl, &r);
+        show(ctl, "ctl");
+    }
+    printf("-- own namespace by its ID\n");
+    lo_up();
+    begin_body(&r, 22, 0x5, seq++, 8, AF_INET6, 0);
+    put(&r, IFA_ADDRESS, loopback6, 16);
+    put32(&r, IFA_TARGET_NETNSID, 2);
+    send_request(ctl, &r);
+    show(ctl, "ctl");
+    printf("-- without CAP_NET_ADMIN\n");
+    setsockopt(weak, SOL_NETLINK_, STRICT_CHK, &one, sizeof one);
+    begin_body(&r, 18, 0x301, seq++, 16, 0, 0);
+    put32(&r, IFLA_TARGET_NETNSID, 3);
+    send_request(weak, &r);
+    show(weak, "weak");
+    begin_body(&r, 18, 0x1, seq++, 16, 0, 1);
+    put32(&r, IFLA_TARGET_NETNSID, 3);
+    send_request(weak, &r);
+    show(weak, "weak");
+    fflush(stdout);
+    pid_t user = fork();
+    if (user == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        begin_body(&r, 22, 0x301, seq++, 8, AF_INET, 0);
+        put32(&r, IFA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        show(ctl, "user");
+        begin_body(&r, 18, 0x1, seq++, 16, 0, 1);
+        put32(&r, IFLA_TARGET_NETNSID, 3);
+        send_request(ctl, &r);
+        begin_body(&r, 18, 0x1, seq++, 16, 0, 1);
+        send_request(ctl, &r);
+        show(ctl, "user");
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(user, &status, 0);
+    printf("user status=%#x\n", status);
+    peer_stop(&p);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -801,6 +954,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(mode, "netlink-listen-all-nsid")) listen_case();
         else if (!strcmp(mode, "netlink-nsid-gone")) gone_case();
         else if (!strcmp(mode, "netlink-nsid-write")) write_case();
+        else if (!strcmp(mode, "netlink-target-netnsid")) target_case();
         else return 2;
         fflush(stdout);
         _exit(0);

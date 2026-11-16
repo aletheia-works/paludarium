@@ -799,13 +799,13 @@ verified.
   where Linux's count every namespace's; its own parameters' references
   are 1.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
-  ID is given only by `RTM_NEWNSID`, as no device of another namespace
-  makes Linux's `peernet2id_alloc` give one; the `RTM_DELNSID` of a
+  ID is given only by `RTM_NEWNSID`: Linux's `peernet2id_alloc` gives one
+  on its own only for what lies in another namespace than the one
+  telling of it (a device's link or a device that moves there, a queue
+  lease, a devlink instance, a PSP device, an ovpn peer, an openvswitch
+  vport), none of which is here, and `lo` may not move; the `RTM_DELNSID` of a
   namespace that goes is sent as its last holder lets it go, where
-  Linux sends it a little later, from a work queue; and
-  `IFLA_TARGET_NETNSID` and
-  `IFA_TARGET_NETNSID` are `EINVAL` even for an ID a namespace has, as
-  no other namespace's links or addresses are dumped. MCTP is as Ubuntu's kernel,
+  Linux sends it a little later, from a work queue. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps

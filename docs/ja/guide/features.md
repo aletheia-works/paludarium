@@ -1624,9 +1624,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `IFLA_TARGET_NETNSID` だけを取ります。経路の検索は、`rtnl_valid_getlink_req`、
     `inet_rtm_valid_getroute_req`、`inet6_rtm_valid_getroute_req` と同じく、アドレス
     全体の接頭辞長と経路を選ぶ属性だけを取ります。検査の有無にかかわらず、`lo` には
-    マスターがないのでリンクのダンプの `IFLA_MASTER` はどのデバイスも見せず、ほかの
-    名前空間のリンクは見せないので `IFLA_TARGET_NETNSID` は `EINVAL` です。`lo` には
+    マスターがないのでリンクのダンプの `IFLA_MASTER` はどのデバイスも見せません。`lo` には
     プレフィックス経路がないので、`RTM_F_PREFIX` はどの経路もダンプしません。
+  - **ID で指したほかの名前空間:** `IFLA_TARGET_NETNSID` を付けたリンクのダンプと取得
+    （検査の有無にかかわらず）と、`IFA_TARGET_NETNSID` を付けた厳密な検査のアドレスの
+    ダンプは、その ID が指す名前空間（後述の名前空間の ID を参照）のリンクやアドレスを
+    見せます。答えには、`rtnl_fill_ifinfo`、`inet_fill_ifaddr`、`inet6_fill_ifaddr` と
+    同じく、その ID を載せます。リンクでは名前の後の `IFLA_TARGET_NETNSID`
+    （`IFLA_IF_NETNSID`）、アドレスではそれぞれの先頭の `IFA_TARGET_NETNSID` です。
+    `AF_UNSPEC` のダンプの MCTP のアドレスは、ソケット自身の名前空間のままです。だれも
+    持たない ID は `EINVAL`、ソケットを開いた側か送り手がその名前空間の持ち主で
+    `CAP_NET_ADMIN` を持たなければ `EACCES` で（`rtnl_get_net_ns_capable`）、ダンプでは
+    Linux の拡張 ACK のメッセージを付けます。IPv6 のアドレス 1 つ（`IFA_TARGET_NETNSID`
+    を付けた `RTM_GETADDR`）は、その名前空間で探します。その答えは、`inet6_rtm_getaddr` が
+    `rtnl_unicast` で送るのと同じく、その名前空間でリクエストした側のポートを持つ
+    ソケットに届きます。そのようなソケットがなければ、リクエストは `ECONNREFUSED` です。
   - **属性のポリシー:** 各リクエストの属性は、まず Linux がそのリクエストに持つ
     ポリシー（`ifla_policy`、`ifa_ipv4_policy`、`ifa_ipv6_policy`、`rtm_ipv4_policy`、
     `rtm_ipv6_policy`、新しいリンクの `IFLA_LINKINFO` の中では `ifla_info_policy`）で、

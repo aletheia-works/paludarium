@@ -56,6 +56,7 @@
     {"name":"netlink-listen-all-nsid","binary":"netlink-options"},
     {"name":"netlink-nsid-gone","binary":"netlink-options"},
     {"name":"netlink-nsid-write","binary":"netlink-options"},
+    {"name":"netlink-target-netnsid","binary":"netlink-options"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},

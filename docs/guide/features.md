@@ -1856,9 +1856,24 @@ kernel.
     the attributes that select a route, as `rtnl_valid_getlink_req`,
     `inet_rtm_valid_getroute_req` and `inet6_rtm_valid_getroute_req`.
     Checked or not, a link dump's `IFLA_MASTER` shows no device, as `lo`
-    has no master, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
-    namespace's links are shown; `RTM_F_PREFIX` dumps no route, as `lo` has no
-    prefix route.
+    has no master; `RTM_F_PREFIX` dumps no route, as `lo` has no prefix
+    route.
+  - **Another namespace by its ID:** a link dump or get with
+    `IFLA_TARGET_NETNSID`, checked or not, and a strictly checked address
+    dump with `IFA_TARGET_NETNSID`, show the link or addresses of the
+    namespace that ID names (see Namespace IDs below), with that ID in
+    the answer: `IFLA_TARGET_NETNSID` (`IFLA_IF_NETNSID`) after the
+    link's name, `IFA_TARGET_NETNSID` first in each address, as
+    `rtnl_fill_ifinfo`, `inet_fill_ifaddr` and `inet6_fill_ifaddr` put
+    them; an `AF_UNSPEC` dump's MCTP addresses are still the socket's
+    own namespace's. An ID none has is `EINVAL`, and a namespace whose
+    owner the socket's opener or the sender lacks `CAP_NET_ADMIN` in is
+    `EACCES` (`rtnl_get_net_ns_capable`), with Linux's extended-ack
+    message in a dump. A single IPv6 address (`RTM_GETADDR` with
+    `IFA_TARGET_NETNSID`) is looked for in that namespace, and its
+    answer, as `inet6_rtm_getaddr` sends it with `rtnl_unicast`, goes to
+    the socket that has the requester's port there; with none, the
+    request is `ECONNREFUSED`.
   - **Attribute policies:** each request's attributes are checked first,
     in their order, against the policy Linux has for it (`ifla_policy`,
     `ifa_ipv4_policy`, `ifa_ipv6_policy`, `rtm_ipv4_policy`,

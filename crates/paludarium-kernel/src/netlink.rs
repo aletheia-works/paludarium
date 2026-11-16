@@ -6991,7 +6991,7 @@ mod tests {
             dump(&ifinfo(0, 0, &[(IFLA_LINKINFO, &[])]), true),
             Ok(plain.clone())
         );
-        // No other namespace's links are shown, checked or not.
+        // An ID no namespace has is EINVAL, checked or not.
         let netnsid = ifinfo(0, 0, &[(IFLA_TARGET_NETNSID, &1u32.to_le_bytes())]);
         assert_eq!(dump(&netnsid, true), Err(Errno::EINVAL));
         assert_eq!(dump(&netnsid, false), Err(Errno::EINVAL));

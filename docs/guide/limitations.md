@@ -758,7 +758,10 @@ verified.
   retried into a full backlog makes none of its answer), and none times
   out (`gc_thresh1` is never reached). A dump gives a family's neighbours
   the newest first, where Linux gives them in the order of its hash
-  table, which a random key sets. A neighbour's timer never runs: one
+  table, which a random key sets. Proxy entries of one hash bucket come
+  the newest first, as `pneigh_create` puts each at its head, but one
+  x86-64 runner's Linux gave two of them the other way. A neighbour's
+  timer never runs: one
   reachable never goes stale, one delaying or probing never probes nor
   becomes reachable or failed, and one `NTF_USE` or `NTF_MANAGED` makes
   incomplete counts its first probe but never sends another nor fails;

@@ -16848,16 +16848,17 @@ int main(int argc, char **argv) {
             NEIGH_SEND(28, create, "add short key6");
             NEIGH_SORTED(AF_INET6, "dump inet6");
             /* Proxy entries: IPv4's with or without a device, IPv6's only
-               with one; listed by their hash's buckets, the newest first in
-               each. */
+               with one; listed by their hash's buckets (pneigh_hash: these
+               are 8, 12, 14 and 15), each in a bucket of its own, as one
+               x86-64 runner gave two in one bucket in the other order. */
             NEIGH_BODY(AF_INET, 0, 0x80, 8), NEIGH4("10.0.0.5");
             NEIGH_SEND(28, 0, "proxy 10.0.0.5");
             NEIGH_BODY(AF_INET, 1, 0, 8), NEIGH4("10.0.0.6"), nl_put(&b, 12, "\4", 1);
             NEIGH_SEND(28, 0, "proxy 10.0.0.6 on lo");
             NEIGH_BODY(AF_INET, 1, 0, 8), NEIGH4("10.0.0.21");
             NEIGH_SEND(28, 0, "proxy 10.0.0.21 on lo");
-            NEIGH_BODY(AF_INET, 0, 0, 8), NEIGH4("10.1.0.5");
-            NEIGH_SEND(28, 0, "proxy 10.1.0.5");
+            NEIGH_BODY(AF_INET, 0, 0, 8), NEIGH4("10.0.0.2");
+            NEIGH_SEND(28, 0, "proxy 10.0.0.2");
             NEIGH_BODY(AF_INET, 1, 0, 8 | 0x10), NEIGH4("10.0.0.5");
             NEIGH_SEND(28, 0, "proxy 10.0.0.5 again on lo");
             NEIGH_BODY(AF_INET, 1, 0, 8), NEIGH4("10.0.0.7"), nl_put32(&b, 15, 1);

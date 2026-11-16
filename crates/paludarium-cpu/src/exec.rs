@@ -1301,7 +1301,9 @@ impl Exec<'_> {
         let register = register.unwrap_or(0);
         let mut unit = self.s.x87;
         // All but these wait, and fault first where an unmasked exception is
-        // pending, as on Intel's and AMD's CPUs.
+        // pending, as on Intel's and AMD's CPUs. `FLDCW` waits. `FXSAVE`, which
+        // does not wait either, never comes here: it is dispatched on its own,
+        // before the x87 instructions.
         let waits = !matches!(
             m,
             M::Fninit | M::Fnclex | M::Fnstcw | M::Fnstsw | M::Fnstenv | M::Fldenv | M::Fnsave
@@ -1506,6 +1508,10 @@ impl Exec<'_> {
             (M::Fldl2e, None) => unit.load_constant(LOG2_E),
             (M::Fldl2t, None) => unit.load_constant(LOG2_10),
             (M::Ffree, None) => unit.free(register),
+            (M::Ffreep, None) => {
+                unit.free(register);
+                unit.pop();
+            }
             (M::Fincstp, None) => unit.increment_top(),
             (M::Fdecstp, None) => unit.decrement_top(),
             (M::Fnop | M::Wait, None) => {}
@@ -2366,6 +2372,7 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
         | Mnemonic::Fcmovnu
         | Mnemonic::Fnop
         | Mnemonic::Ffree
+        | Mnemonic::Ffreep
         | Mnemonic::Fincstp
         | Mnemonic::Fdecstp
         | Mnemonic::Fnstcw

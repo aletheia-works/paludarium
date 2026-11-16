@@ -12,8 +12,10 @@
    poisoned page (si_code and si_addr_lsb), a system call's copy and
    MADV_POPULATE_READ there, and what mprotect, fork, unregistering,
    mremap, MADV_DONTNEED, MADV_FREE, MADV_GUARD_INSTALL and munmap do to
-   the poison, of
-   private and of shared anonymous memory.
+   the poison, of private and of shared anonymous memory; and
+   UFFDIO_MOVE: its errors and their order, a hole, a move that stops
+   short, the wake of a fault, a page fork shares, the zero page, and
+   guards at either end.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
    whether they are the faulting thread's. Of what UFFDIO_API and
@@ -48,6 +50,7 @@
 #define UFFD_FEATURE_THREAD_ID (1ULL << 8)
 #define UFFD_FEATURE_EXACT_ADDRESS (1ULL << 11)
 #define UFFD_FEATURE_POISON (1ULL << 14)
+#define UFFD_FEATURE_MOVE (1ULL << 16)
 #define UFFDIO_REGISTER_MODE_MISSING 1ULL
 #define UFFDIO_REGISTER_MODE_WP 2ULL
 #define UFFDIO_REGISTER_MODE_MINOR 4ULL
@@ -57,6 +60,8 @@
 #define UFFDIO_COPY_MODE_DONTWAKE 1ULL
 #define UFFDIO_ZEROPAGE_MODE_DONTWAKE 1ULL
 #define UFFDIO_POISON_MODE_DONTWAKE 1ULL
+#define UFFDIO_MOVE_MODE_DONTWAKE 1ULL
+#define UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES 2ULL
 
 #define UFFDIO_API 0xc018aa3f
 #define UFFDIO_REGISTER 0xc020aa00
@@ -64,12 +69,14 @@
 #define UFFDIO_WAKE 0x8010aa02
 #define UFFDIO_COPY 0xc028aa03
 #define UFFDIO_ZEROPAGE 0xc020aa04
+#define UFFDIO_MOVE 0xc028aa05
 #define UFFDIO_WRITEPROTECT 0xc018aa06
 #define UFFDIO_POISON 0xc020aa08
 
 #define RANGE_IOCTLS ((1ULL << 2) | (1ULL << 3) | (1ULL << 4))
 #define WRITEPROTECT_IOCTL (1ULL << 6)
 #define POISON_IOCTL (1ULL << 8)
+#define MOVE_IOCTL (1ULL << 5)
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22
 #endif
@@ -106,6 +113,10 @@ struct uffdio_poison {
     struct uffdio_range range;
     uint64_t mode;
     int64_t updated;
+};
+struct uffdio_move {
+    uint64_t dst, src, len, mode;
+    int64_t move;
 };
 struct uffd_msg {
     uint8_t event, reserved1;
@@ -184,6 +195,14 @@ static long poison(int fd, void *at, size_t len, uint64_t mode, int64_t *done) {
     long ret = ioctl(fd, UFFDIO_POISON, &p);
     if (done)
         *done = p.updated;
+    return ret;
+}
+
+static long move(int fd, void *dst, void *src, size_t len, uint64_t mode, int64_t *done) {
+    struct uffdio_move m = {(uintptr_t)dst, (uintptr_t)src, len, mode, 0x5a5a};
+    long ret = ioctl(fd, UFFDIO_MOVE, &m);
+    if (done)
+        *done = m.move;
     return ret;
 }
 
@@ -879,6 +898,95 @@ static int case_poison(void) {
     return 0;
 }
 
+/* UFFDIO_MOVE: private anonymous pages move into a registered range that
+   has none, page by page, and wake its faults. */
+static int case_move(void) {
+    int fd = uffd(O_NONBLOCK);
+    struct uffdio_api api = {UFFD_API, UFFD_FEATURE_MOVE, 0};
+    printf("api: %s", err(ioctl(fd, UFFDIO_API, &api)));
+    printf(" move=%d\n", (api.features & UFFD_FEATURE_MOVE) != 0);
+    char *dst = anon(6 * PAGE);
+    char *src = anon(4 * PAGE);
+    memset(src, 's', PAGE);
+    memset(src + PAGE, 't', PAGE);
+    int64_t done;
+    printf("not registered: %s", err(move(fd, dst, src, PAGE, 0, &done)));
+    printf(" move=%lld\n", (long long)done);
+    uint64_t ioctls;
+    printf("register: %s", err(reg(fd, dst, 6 * PAGE, UFFDIO_REGISTER_MODE_MISSING, &ioctls)));
+    printf(" move=%d\n", (ioctls & MOVE_IOCTL) != 0);
+    printf("bad mode: %s\n", err(move(fd, dst, src, PAGE, 4, NULL)));
+    printf("unaligned: %s\n", err(move(fd, dst, src + 1, PAGE, 0, NULL)));
+    printf("empty: %s\n", err(move(fd, dst, src, 0, 0, NULL)));
+    printf("move: %s", err(move(fd, dst, src, PAGE, 0, &done)));
+    printf(" move=%lld\n", (long long)done);
+    printf("moved: %c %c, source %d\n", dst[0], dst[PAGE - 1], src[5]);
+    printf("again: %s", err(move(fd, dst, src + PAGE, PAGE, 0, &done)));
+    printf(" move=%lld\n", (long long)done);
+    printf("hole: %s", err(move(fd, dst + PAGE, src + 2 * PAGE, PAGE, 0, &done)));
+    printf(" move=%lld\n", (long long)done);
+    printf("holes allowed: %s", err(move(fd, dst + PAGE, src + 2 * PAGE, PAGE,
+                                         UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES, &done)));
+    printf(" move=%lld\n", (long long)done);
+    printf("short: %s", err(move(fd, dst + PAGE, src + PAGE, 2 * PAGE, 0, &done)));
+    printf(" move=%lld", (long long)done);
+    printf(" byte=%c\n", dst[PAGE + 9]);
+
+    /* A move into a missing page ends the fault that waits for it. */
+    memset(src + 3 * PAGE, 'u', PAGE);
+    struct toucher t = {dst + 2 * PAGE + 3, 0, 0, 0};
+    pthread_t thread;
+    pthread_create(&thread, NULL, touch, &t);
+    wait_message(fd);
+    message("fault", fd, dst, 0);
+    printf("move it: %s\n", err(move(fd, dst + 2 * PAGE, src + 3 * PAGE, PAGE, 0, NULL)));
+    pthread_join(thread, NULL);
+    printf("seen: %c\n", t.seen);
+
+    /* A page fork shares is EBUSY until a write gives it its own. */
+    memset(src, 'v', PAGE);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0)
+        _exit(0);
+    waitpid(child, NULL, 0);
+    printf("shared by fork: %s\n", err(move(fd, dst + 3 * PAGE, src, PAGE, 0, NULL)));
+    src[0] = 'w';
+    printf("written: %s", err(move(fd, dst + 3 * PAGE, src, PAGE, 0, NULL)));
+    printf(" byte=%c\n", dst[3 * PAGE]);
+
+    /* The zero page moves as one. */
+    volatile char zero = src[3 * PAGE];
+    (void)zero;
+    printf("zero page: %s", err(move(fd, dst + 4 * PAGE, src + 3 * PAGE, PAGE, 0, NULL)));
+    printf(" byte=%d\n", dst[4 * PAGE]);
+    dst[4 * PAGE] = 'z';
+
+    /* The VMAs: the same protection, neither shared, both mapped. */
+    memset(src + PAGE, 'x', PAGE);
+    mprotect(src + PAGE, PAGE, PROT_READ);
+    printf("read-only source: %s\n", err(move(fd, dst + 5 * PAGE, src + PAGE, PAGE, 0, NULL)));
+    mprotect(src + PAGE, PAGE, PROT_READ | PROT_WRITE);
+    char *shared = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    shared[0] = 'h';
+    printf("shared source: %s\n", err(move(fd, dst + 5 * PAGE, shared, PAGE, 0, NULL)));
+    char *gone = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(gone, PAGE);
+    printf("unmapped source: %s\n", err(move(fd, dst + 5 * PAGE, gone, PAGE, 0, NULL)));
+    printf("past the source: %s\n", err(move(fd, dst + 4 * PAGE, src + 3 * PAGE, 2 * PAGE, 0, NULL)));
+
+    /* A guard at the source is EFAULT, at the destination EEXIST. */
+    printf("guard source: %s\n", err(madvise(src + 2 * PAGE, PAGE, MADV_GUARD_INSTALL)));
+    printf("from a guard: %s\n", err(move(fd, dst + 5 * PAGE, src + 2 * PAGE, PAGE,
+                                          UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES, NULL)));
+    printf("guard destination: %s\n", err(madvise(dst + 5 * PAGE, PAGE, MADV_GUARD_INSTALL)));
+    printf("onto a guard: %s\n", err(move(fd, dst + 5 * PAGE, src + PAGE, PAGE, 0, NULL)));
+    printf("unregister: %s\n", err(unreg(fd, dst, 6 * PAGE)));
+    printf("unregistered: %s\n", err(move(fd, dst + 5 * PAGE, src + PAGE, PAGE, 0, NULL)));
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -890,6 +998,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-shared")) return case_shared();
     if (!strcmp(mode, "userfaultfd-wp")) return case_wp();
     if (!strcmp(mode, "userfaultfd-poison")) return case_poison();
+    if (!strcmp(mode, "userfaultfd-move")) return case_move();
     printf("unknown mode %s\n", mode);
     return 2;
 }

@@ -6257,8 +6257,10 @@ fn open_path(
             crate::devices::Entry::Link(target) => return open_path(c, target, flags, mode),
         }
     } else if let Some(mountinfo) = crate::proc::mount_table(p) {
+        own_open_check(c, p, flags)?;
         let content = crate::proc::render(&c.files.fs().mounts(), mountinfo, &c.files.root());
-        Arc::new(crate::proc::GeneratedFile::open(content, flags))
+        let stat = own_stat(c, crate::proc::stat(0));
+        Arc::new(crate::proc::GeneratedFile::open(content, flags).with_stat(stat))
     } else if tasks::is_root(p) {
         if flags & 3 != 0 {
             return Err(Errno::EISDIR);
@@ -6382,9 +6384,15 @@ fn open_path(
             flags,
         ))
     } else if let Some(entry) = crate::proc::own_entry(p, c.process.pid) {
+        own_open_check(c, p, flags)?;
         if let Some(content) = own_file(c, entry) {
+            let stat = other_generated_stat(c, p, false).map(|(stat, ..)| stat);
+            let file = crate::proc::GeneratedFile::open(content, flags);
             return Ok((
-                Arc::new(crate::proc::GeneratedFile::open(content, flags)),
+                Arc::new(match stat {
+                    Some(stat) => file.with_stat(stat),
+                    None => file,
+                }),
                 p.to_vec(),
             ));
         }
@@ -6400,20 +6408,22 @@ fn open_path(
             crate::proc::OwnEntry::Directory if p == b"/proc/self" && flags & O_NOFOLLOW != 0 => {
                 return Err(Errno(40)); // ELOOP
             }
-            crate::proc::OwnEntry::Directory => {
-                Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
-            }
+            crate::proc::OwnEntry::Directory => Arc::new(crate::proc::OwnDirectory::new(own_stat(
+                c,
+                crate::proc::directory_stat(),
+            ))),
             crate::proc::OwnEntry::Descriptors => Arc::new(crate::proc::OwnDirectory::new(
-                crate::proc::descriptors_stat(),
+                own_stat(c, crate::proc::descriptors_stat()),
             )),
-            crate::proc::OwnEntry::DescriptorInfos => {
-                Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
-            }
+            crate::proc::OwnEntry::DescriptorInfos => Arc::new(crate::proc::OwnDirectory::new(
+                own_stat(c, crate::proc::directory_stat()),
+            )),
             // Opened above while the descriptor is open.
             crate::proc::OwnEntry::DescriptorInfo(_) => return Err(Errno::ENOENT),
-            crate::proc::OwnEntry::Status => {
-                Arc::new(crate::proc::GeneratedFile::open(status(c), flags))
-            }
+            crate::proc::OwnEntry::Status => Arc::new(
+                crate::proc::GeneratedFile::open(status(c), flags)
+                    .with_stat(own_stat(c, crate::proc::stat(0))),
+            ),
             // Opened above.
             crate::proc::OwnEntry::Stat
             | crate::proc::OwnEntry::Cmdline
@@ -6422,33 +6432,30 @@ fn open_path(
             | crate::proc::OwnEntry::Exe
             | crate::proc::OwnEntry::Cwd
             | crate::proc::OwnEntry::Root => return Err(Errno::ENOENT),
-            crate::proc::OwnEntry::Maps => Arc::new(crate::proc::MapsFile::open(
+            crate::proc::OwnEntry::Maps => Arc::new(
+                crate::proc::MapsFile::open(
+                    c.mem.view(),
+                    c.group.start_stack(),
+                    flags,
+                    c.files.root(),
+                )
+                .owned(own_owner(c)),
+            ),
+            crate::proc::OwnEntry::Smaps => Arc::new(
+                crate::proc::MapsFile::open_as(
+                    c.mem.view(),
+                    c.group.start_stack(),
+                    flags,
+                    c.files.root(),
+                    true,
+                )
+                .owned(own_owner(c)),
+            ),
+            crate::proc::OwnEntry::Pagemap => Arc::new(crate::proc::PagemapFile::open(
                 c.mem.view(),
-                c.group.start_stack(),
                 flags,
-                c.files.root(),
+                own_owner(c),
             )),
-            crate::proc::OwnEntry::Smaps => Arc::new(crate::proc::MapsFile::open_as(
-                c.mem.view(),
-                c.group.start_stack(),
-                flags,
-                c.files.root(),
-                true,
-            )),
-            crate::proc::OwnEntry::Pagemap => {
-                // 0400, its owner the process's effective IDs: opening it
-                // for writing takes CAP_DAC_OVERRIDE (`EACCES`).
-                if flags & 3 != 0 {
-                    let creds = &c.process.credentials;
-                    let stat = paludarium_host::FileStat {
-                        uid: creds.euid,
-                        gid: creds.egid,
-                        ..crate::proc::private_stat(0)
-                    };
-                    crate::permissions::permission(creds, &stat, crate::permissions::MAY_WRITE)?;
-                }
-                Arc::new(crate::proc::PagemapFile::open(c.mem.view(), flags))
-            }
             crate::proc::OwnEntry::Descriptor(n) => {
                 // A link for a descriptor that is not open is not there
                 // (ENOENT), whatever the flags. One that is, is a symbolic
@@ -7297,6 +7304,48 @@ fn known_stat(
         None => Ok(other_generated_stat(c, path, follow)),
     }
 }
+/// The owner of this process's files in `/proc`, as Linux's
+/// `task_dump_owner` gives them: its effective user and group, or root's
+/// once it is not dumpable.
+fn own_owner(c: &Context<'_>) -> (u32, u32) {
+    let dumpable = c
+        .processes
+        .view(c.process.pid)
+        .is_none_or(|view| view.dumpable);
+    let creds = &c.process.credentials;
+    if dumpable {
+        (creds.euid, creds.egid)
+    } else {
+        (0, 0)
+    }
+}
+/// `stat` owned by this process's files' owner ([`own_owner`]).
+fn own_stat(c: &Context<'_>, stat: FileStat) -> FileStat {
+    let (uid, gid) = own_owner(c);
+    FileStat { uid, gid, ..stat }
+}
+/// The open of one of this process's regular files in `/proc` (`p`), as
+/// Linux's `may_open` checks the inode's mode for its owner
+/// (`generic_permission`): reading needs its read bit, writing its write
+/// bit, or CAP_DAC_OVERRIDE (`EACCES`). `O_PATH` checks nothing, nor does
+/// this a link (`exe`, `fd/<n>`), whose file its open checks.
+fn own_open_check(c: &Context<'_>, p: &[u8], flags: u32) -> Result<(), Errno> {
+    if flags & O_PATH != 0 {
+        return Ok(());
+    }
+    let Some((stat, ..)) = other_generated_stat(c, p, false) else {
+        return Ok(());
+    };
+    if stat.mode & 0o170000 != 0o100000 {
+        return Ok(());
+    }
+    let mask = match flags & 3 {
+        0 => crate::permissions::MAY_READ,
+        1 => crate::permissions::MAY_WRITE,
+        _ => crate::permissions::MAY_READ | crate::permissions::MAY_WRITE,
+    };
+    crate::permissions::permission(&c.process.credentials, &stat, mask)
+}
 /// [`generated_stat`] of a path outside `/dev`.
 fn other_generated_stat(
     c: &Context<'_>,
@@ -7305,7 +7354,11 @@ fn other_generated_stat(
 ) -> Option<(FileStat, u64, u32)> {
     if let Some(mountinfo) = crate::proc::mount_table(path) {
         let length = crate::proc::render(&c.files.fs().mounts(), mountinfo, &c.files.root()).len();
-        return Some((crate::proc::stat(length), device(c, path), SMALL_BLOCK_SIZE));
+        return Some((
+            own_stat(c, crate::proc::stat(length)),
+            device(c, path),
+            SMALL_BLOCK_SIZE,
+        ));
     }
     // `/proc/self` itself, not followed, is the link to this process's
     // directory; `/proc/self/` follows it.
@@ -7347,7 +7400,7 @@ fn other_generated_stat(
             return Some((stat, device(c, &target), BLOCK_SIZE));
         }
         return Some((
-            crate::proc::self_link_stat(),
+            own_stat(c, crate::proc::self_link_stat()),
             device(c, path),
             SMALL_BLOCK_SIZE,
         ));
@@ -7397,7 +7450,7 @@ fn other_generated_stat(
             crate::proc::link_stat(d.file.flags() & 3)
         }
     };
-    Some((stat, device(c, path), SMALL_BLOCK_SIZE))
+    Some((own_stat(c, stat), device(c, path), SMALL_BLOCK_SIZE))
 }
 
 /// The names in this process's /proc directory.

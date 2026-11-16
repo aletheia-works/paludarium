@@ -226,6 +226,8 @@ pub struct Processes {
     pub(crate) keys: crate::keys::Keys,
     /// The traced tasks ([`crate::ptrace`]).
     pub(crate) traces: crate::ptrace::Traces,
+    /// The machine's BPF maps by ID.
+    pub(crate) bpf_maps: Arc<crate::bpf::Ids>,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -250,6 +252,7 @@ impl Processes {
             kcmp_cookies: std::sync::OnceLock::new(),
             aio: Arc::default(),
             traces: crate::ptrace::Traces::default(),
+            bpf_maps: Arc::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -1267,6 +1270,12 @@ impl Processes {
         };
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = self.send(&mut entries, pid, None, signal);
+    }
+    /// `number` from the kernel (`SI_KERNEL`) to process `pid`, as Linux's
+    /// `send_sig` with `SEND_SIG_PRIV` sends it.
+    pub(crate) fn signal_from_kernel(&self, pid: u32, number: i32) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = self.send(&mut entries, pid, None, Self::from_kernel(number));
     }
     /// Whether a process other than `init` is in PID namespace `space` or
     /// one nested in it.

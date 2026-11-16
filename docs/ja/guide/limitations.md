@@ -4,11 +4,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 
 ## できないこと
 
-- **今のところ x87 の一部**：`FISTTP` は `CPUID` が示さない SSE3 の命令なので実装していません。`FNSTENV`、
-  `FNSAVE`、`FXSAVE` が書く、最後の命令とそのメモリオペランドの場所は保っていません。
-  その欄は 0 で、Intel と AMD の CPU でも書く内容が異なります。オペランドが離れている
-  ときに `FPREM` と `FPREM1` が途中のどこで止まるかは CPU ごとに異なりますが、最後の
-  剰余は同じです。
+- **今のところ x87 の一部**：`FISTTP` は `CPUID` が示さない SSE3 の命令なので
+  実装していません。`FNSTENV`、`FNSAVE`、`FXSAVE` が書く、最後の命令とそのメモリ
+  オペランドの場所は保っていません。その欄は 0 で、Intel と AMD の CPU でも書く内容が
+  異なります。オペランドが離れているときに `FPREM` と `FPREM1` が途中のどこで止まるかは
+  CPU ごとに異なりますが、最後の剰余は同じです。
 - **渡されていない動的リンクのプログラムのファイル**：Linux と同じくインタプリタと一緒に
   動かすので、musl と glibc の動的リンカーで動きます。インタプリタとライブラリは
   セッション自身のファイルから読むので、マウントするか渡す必要があります。
@@ -208,9 +208,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `ENABLE` もありません。
 - **BPF はマップだけ**：`bpf` が作るのは配列とハッシュだけです。プログラム
   （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
-  （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、ID（`BPF_*_GET_NEXT_ID`、`BPF_*_GET_FD_BY_ID`）、
-  トークン、イテレータ、統計は、Linux にあってここにないコマンドとして `ENOSYS` です。Linux に
-  コマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf はプログラムを読み込めず
+  （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
+  `BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、Linux にあってここにない
+  コマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf はプログラムを読み込めず
   （最小のプログラムでの確認が `ENOSYS` で失敗します）、`bpftool feature` は、
   `BPF_PROG_LOAD` を呼んで `ENOSYS` かどうかを見るので、`bpf()` システムコールがないと
   言います。ほかのマップの型は、それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。
@@ -218,10 +218,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   値が使いうる CPU ごとに一つあり、テストのマシンとエミュレータで CPU の数え方が違うので、
   どのみち Linux と比べられません。ハッシュはキーをバイトの順に返します。Linux の順は
   バケットとランダムなシードで決まります。そのバッチは要素一つずつをバケットとして扱うので、
-  `in_batch` と `out_batch` は要素を数えます。マップにはメモリの上限も、Linux が断る
-  `memlock` の課金もなく（大きなマップも作れます。Linux は `ENOMEM` を返すことがあります）、
-  fdinfo の `memlock` は要素の大きさだけです。`BPF_F_MMAPABLE` は受け付けますが、マップの
-  `mmap` は `ENODEV`、マップの SHA-256（`bpf_map_info.hash`）は `EINVAL` です。
+  `in_batch` と `out_batch` は要素を数えます。マップのメモリは Linux master ではなく
+  Linux 7.0 の構造体の大きさに従います（master のハッシュの要素はもっと小さい）。要素は書き込む
+  までマシンから取らず、メモリの cgroup にも課金しません。`ENOMEM` になるのはマシンの
+  4 GiB より大きいマップだけで、Linux は実際にあるメモリが尽きても `ENOMEM` を返すことが
+  あります。事前に確保するハッシュは、ホストの CPU ごとに予備の要素を数えます。Linux が
+  数えるのは使いうる CPU で、それより多いことがあります。マップの ID はエミュレートする
+  マシンのものなので、1 から始まり、ホストのマップは見えません。`BPF_F_MMAPABLE` は
+  受け付けますが、マップの `mmap` は `ENODEV`、マップの SHA-256
+  （`bpf_map_info.hash`）は `EINVAL` です。
   `kernel.unprivileged_bpf_disabled` はいつも 2 で、その `/proc/sys/kernel` の
   ファイルには書けません（モード 0444。Linux のファイルは 0644 で、root が書けます）。
 - **仮想 CPU**：`rseq` を登録したスレッドは、ホストの CPU ではなく仮想 CPU で動きます。
@@ -392,10 +397,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   - `ptrace` には、まだシングルステップがありません。`PTRACE_SINGLESTEP`、
     `PTRACE_SYSEMU_SINGLESTEP` と、機能の一覧にないほかの要求は `EIO` を返します。
     `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
-    ほかは `EINVAL` です。`PTRACE_LISTEN` のトレース対象は、グループ停止の変化に 10 ms 以内に
-    気づきます。システムコール停止をシグナル付きで再開すると、Linux は
-    プロセスに送りますが、ここでは止まったスレッドが受けます。`PTRACE_EVENT_EXIT` が示す
-    ステータスにはコアダンプのビットがありません。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
+    ほかは `EINVAL` です。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
     ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
     `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。ハードウェアブレークポイントは
     なく、デバッグレジスタは未使用として読め（DR6 は `0xffff0ff0`）、DR7 を 0 にする以外の
@@ -554,8 +556,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
   メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
-  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE` と
-  `UFFDIO_MOVE` もありません（`EINVAL`）。`fork`、`mremap`、
+  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE` も
+  ありません（`EINVAL`）。`fork`、`mremap`、
   `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
   それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
@@ -563,7 +565,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページの保護を外します。Linux はその印を PTE に残します。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
   登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
   ないページか、書き込み保護されたページへのシステムコール自身のコピーは、
-  `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`/dev/userfaultfd` と
+  `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`UFFDIO_MOVE` の
+  動かし元の穴は、ここでその周りの 2 MiB にどれも触れていなければ、Linux にそこの
+  ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
+  ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベント（`FAN_OPEN_PERM`、`FAN_ACCESS_PERM`、
   `FAN_OPEN_EXEC_PERM`）は `fanotify_mark` で受け付けますが送りません。そのため、求める

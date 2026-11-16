@@ -853,7 +853,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書きます。提供する機能は `UFFD_FEATURE_PAGEFAULT_FLAG_WP`、`UFFD_FEATURE_SIGBUS`、
   `UFFD_FEATURE_THREAD_ID`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
-  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON` で、`UFFD_FEATURE_EVENT_FORK` には
+  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で、
+  `UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
   メモリと共有の anonymous メモリを、ないページについて登録し
   （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
@@ -899,7 +900,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   poison は `mprotect` と `UFFDIO_UNREGISTER` では残り、`mremap` では一緒に動き、
   `fork` した子には、プライベートなメモリでは引き継がれ、共有メモリでは引き継がれず、
   `MADV_DONTNEED`、`MADV_FREE`、`MADV_GUARD_INSTALL`（ガードに置き換わります）、
-  `munmap` で消えます。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
+  `munmap` で消えます。`UFFDIO_MOVE` は、Linux の `move_pages` と同じく、
+  コンテキスト自身のアドレス空間（ほかの空間からは `EINVAL`）のプライベートな
+  anonymous のページを、登録した範囲へ動かします。`UFFD_FEATURE_MOVE` を求めたか
+  どうかは問いません。それぞれの先頭が VMA にあること（`ENOENT`）、どちらの VMA も
+  共有でなく、それぞれの範囲を丸ごと持ち、保護が同じで書き込めること、どちらも
+  ロックしているかどちらもしていないこと、動かし先がこの `userfaultfd` に登録した
+  もので、どちらも anonymous のメモリであること（`EINVAL`）を確かめます。そのあと
+  1 ページずつ、動かし先にページかマーカーがあれば `EEXIST`、動かし元にページが
+  なければ `ENOENT`（`UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES` では動かしたものとして
+  数えます）、動かし元の poison やガードは `EFAULT`、`fork` が共有していて、書き込みで
+  自分のものになっていないページは `EBUSY`（`PageAnonExclusive`）です。ゼロページは
+  ゼロページのまま動き、ほかのページは動かし先の保護で書き込めるようになり、書き込み
+  保護は外れ、動かし元にはページがなくなります。動かした分かエラーは構造体の最後の
+  フィールドに入り、`DONTWAKE` でなければ動かしたページの待ちが終わり、途中で止まると
+  `EAGAIN` です。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
   `EINVAL`）、ノンブロッキングでなければ待ちます。`poll` は、Linux と同じく
   `UFFDIO_API` の前とブロックするファイルでは `POLLERR`、それ以外ではまだ読まれていない
   フォールトがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と
@@ -2200,7 +2215,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`cmdline`、`environ`、`comm`、`exe`、
   `cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、`fd`、`fdinfo`、`ns`、
-  `task` があります。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  `task` があります。これらとディレクトリの持ち主は、Linux の `task_dump_owner` と同じく
+  プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
+  `PR_SET_DUMPABLE` まで）root です。`/proc/self` そのものは root のものです。`stat` は
+  その持ち主とモード（`environ` と `pagemap` は 0400、ほかのファイルは 0444）を示し、
+  開いたものの `fstat` は開いたときの持ち主を示します。Linux はその時点の持ち主です。開くときは Linux の `generic_permission` と同じくその
+  持ち主に対してモードを確かめるので、`CAP_DAC_OVERRIDE` なしに書き込み用に開くと
+  `EACCES` で、ダンプできないプロセスが `environ` や `pagemap` を読むために開いても
+  `EACCES` です。root が開いたものへの書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を
@@ -2725,9 +2747,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   要ります（`EPERM`）。バッチのコマンドは、数を指定して検索、更新、削除、検索して削除を行い、
   `count` を書き戻します（配列は削除できません、`ENOTSUPP`）。`BPF_OBJ_GET_INFO_BY_FD` は
   マップの `struct bpf_map_info` を求められた長さまで返します（ディスクリプタがなければ
-  `EBADFD`、マップでなければ `EINVAL`）。fdinfo には `map_type`、`key_size`、`value_size`、
-  `max_entries`、`map_flags`、`map_extra`、`memlock`、`map_id`、`frozen` があります。
-  ないものは [制限](./limitations) を参照してください。
+  `EBADFD`、マップでなければ `EINVAL`）。どのマップにもマシンの ID があり、Linux の
+  `idr_alloc_cyclic` と同じく 1 から順に渡され、マップの最後の参照がなくなると空きます。
+  `BPF_MAP_GET_NEXT_ID` は `start_id` より後の最初の ID を返し（最後より後は `ENOENT`、
+  `INT_MAX` からは `EINVAL`）、`BPF_MAP_GET_FD_BY_ID` はマップの新しい close-on-exec の
+  ディスクリプタを `open_flags`（`BPF_F_RDONLY` か `BPF_F_WRONLY`）に従って開きます
+  （どのマップの ID でもなければ `ENOENT`）。どちらも、フィールドを確かめた（`EINVAL`）あとで
+  `CAP_SYS_ADMIN` が要ります（`EPERM`）。マップが取るメモリは、x86-64 のテストのマシンが
+  動かす Linux 7.0 が x86-64 で与えるものです。配列は 312 バイトのヘッダーと、8 バイトに
+  切り上げたすべての値です（マップできるものはそれぞれをページに揃えます）。ハッシュは
+  896 バイトのヘッダー、バケット一つに 16 バイト（`max_entries` を 2 のべき乗に切り上げた数。
+  2^31 を超えるエントリや 4 GiB を超えるバケットは `E2BIG`）と要素で、要素は 48 バイトと、
+  それぞれ 8 バイトに切り上げたキーと値です。事前に確保するものはすべての要素と CPU ごとに
+  予備を一つ、それを指す CPU ごとの 8 バイトを、`BPF_F_NO_PREALLOC` では持っている要素と
+  一つにつき 8 バイトを数えます。そのメモリがマシンのメモリ（`sysinfo` の 4 GiB）を、
+  `vmalloc` と同じ確かめ方で超えるマップは `ENOMEM` です。fdinfo には `map_type`、
+  `key_size`、`value_size`、`max_entries`、`map_flags`、`map_extra`、`memlock`
+  （そのメモリ）、`map_id`、`frozen` があります。ないものは [制限](./limitations) を
+  参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。
@@ -3319,7 +3356,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   コールで、トレーサーはシステムコールと引数を変えられ、`orig_rax` を -1 にすると、`rax` を
   残したい値にしたまま実行を飛ばします。出口では `rax` が戻り値で、トレーサーはそれを変え
   られます。システムコール停止をシグナル付きで再開すると、そのシグナルはカーネルから
-  （`SI_KERNEL`）来ます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
+  （`SI_KERNEL`）プロセスに送られます。`PTRACE_GET_SYSCALL_INFO` は Linux の `struct ptrace_syscall_info` と
   同じく停止を示します。入口ではシステムコールと引数、出口では戻り値とエラーかどうか、
   ほかの停止や `PTRACE_O_TRACESYSGOOD` なしでは命令ポインタとスタックポインタだけです。
   `PTRACE_SET_SYSCALL_INFO` はシステムコール、引数、戻り値を変えます。種類の違う停止、
@@ -3333,7 +3370,8 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   SEIZE なら `PTRACE_EVENT_STOP` で、それ以外は保留中の `SIGSTOP` を持って始まります。
   システムコール停止は持たずに始まります。`vfork` の親は、子が終了するか別のプログラムを
   実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
-  `PTRACE_EVENT_EXIT` を報告し、それとともに終わるスレッドは報告しません。
+  `PTRACE_EVENT_EXIT` を報告し（致命的なシグナルがコアをダンプするときは、ステータスに
+  0x80 が付きます）、それとともに終わるスレッドは報告しません。
 - `PTRACE_PEEKSIGINFO` は、止まっているトレース対象に、`PTRACE_PEEKSIGINFO_SHARED` 付きでは
   そのプロセスに保留中のシグナルの siginfo を、来た順に読みます。`PTRACE_GETSIGMASK` は
   ブロックしているシグナル（`sigsuspend` や `ppoll` の待ちの間は、戻すマスク）を示し、
@@ -3492,7 +3530,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
 - **probe**：スレッドとファイルシステムの機能を 8 項目で確かめる Rust のプログラム
   （tokio のタイマー、UNIX のソケットの組、rayon の並列処理、Mutex と Condvar、
   ファイル操作、ハードリンク、シンボリックリンク、`flock`）。
-- **aube**：Rust で書かれた Node.js のパッケージマネージャ（v2.9.0）。`--version`、
+- **aube**：Rust で書かれた Node.js のパッケージマネージャ（v2.10.0）。`--version`、
   `install`、`install --frozen-lockfile`、`list` の 4 つの操作が、本物の Linux と
   同じ出力と終了コードになります。
 - **ripgrep**：Rust で書かれたテキストの検索のツール（15.2.0）。検索を複数のスレッドで

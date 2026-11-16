@@ -2135,9 +2135,52 @@ fn proc_pagemap_reads_through_the_system_calls_and_opens_for_writing_for_root_on
     let root = f.ret(2, &[path, 2]);
     assert!(root < 1 << 32, "{root:#x}");
     // Without CAP_DAC_OVERRIDE: EACCES for writing, as its mode is 0400.
+    // The change of IDs makes the process undumpable, whose files root owns:
+    // PR_SET_DUMPABLE gives them back.
     assert_eq!(f.ret(117, &[1000, 1000, 1000]), 0);
+    assert_eq!(f.ret(157, &[4, 1]), 0);
     assert_eq!(f.ret(2, &[path, 2]), errno(Errno::EACCES));
     assert!(f.ret(2, &[path, 0]) < 1 << 32);
+}
+#[test]
+fn own_proc_files_are_the_process_owners_and_open_as_their_modes_let() {
+    let mut f = fixture();
+    let (status, environ, buf) = (DATA, DATA + 0x100, DATA + 0x400);
+    f.mem
+        .write(GuestAddr(status), b"/proc/self/status\0")
+        .unwrap();
+    f.mem
+        .write(GuestAddr(environ), b"/proc/self/environ\0")
+        .unwrap();
+    // st_mode at 24, st_uid at 28 and st_gid at 32 of a struct stat.
+    let ids = |f: &mut Fixture, n: u64, a: u64| {
+        assert_eq!(f.ret(n, &[a, buf]), 0);
+        let mut b = [0; 12];
+        f.mem.read(GuestAddr(buf + 24), &mut b).unwrap();
+        let word = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        (word(0), word(4), word(8))
+    };
+    // Root may open even a 0444 file for writing.
+    let fd = f.ret(2, &[status, 1]);
+    assert!(fd < 1 << 32, "{fd:#x}");
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(119, &[2000, 2000, 2000]), 0);
+    assert_eq!(f.ret(117, &[1000, 1000, 1000]), 0);
+    // Undumpable after the change of IDs: root's.
+    assert_eq!(ids(&mut f, 4, status), (0o100444, 0, 0));
+    assert_eq!(f.ret(2, &[environ, 0]), errno(Errno::EACCES));
+    assert_eq!(f.ret(157, &[4, 1]), 0);
+    assert_eq!(ids(&mut f, 4, status), (0o100444, 1000, 2000));
+    assert_eq!(ids(&mut f, 4, environ), (0o100400, 1000, 2000));
+    // Its files open as their modes let it: none for writing.
+    for (path, access) in [(status, 1), (status, 2), (environ, 1), (environ, 2)] {
+        assert_eq!(f.ret(2, &[path, access]), errno(Errno::EACCES));
+    }
+    let fd = f.ret(2, &[environ, 0]);
+    assert!(fd < 1 << 32, "{fd:#x}");
+    assert_eq!(ids(&mut f, 5, fd), (0o100400, 1000, 2000));
+    let fd = f.ret(2, &[status, 0]);
+    assert_eq!(ids(&mut f, 5, fd), (0o100444, 1000, 2000));
 }
 #[test]
 fn proc_fd_links_resolve_at_most_forty_symbolic_links() {

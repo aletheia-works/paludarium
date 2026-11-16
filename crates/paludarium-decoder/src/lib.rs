@@ -442,6 +442,7 @@ mnemonics!(
     Fcmovnu,
     Fnop,
     Ffree,
+    Ffreep,
     Fincstp,
     Fdecstp,
     Fnstcw,
@@ -1043,6 +1044,27 @@ mod tests {
         assert_eq!(size(&[0x66, 0xdd, 0x20]), 94);
         assert_eq!(size(&[0xdf, 0x20]), 10);
         assert_eq!(size(&[0xdf, 0x30]), 10);
+        // The CPU crate runs fnstenv, fldenv, fnsave and frstor only at these
+        // sizes and stops with SIGILL at any other, so every prefix gives
+        // one of them: 0x66 halves the size, unless REX.W is also there.
+        for (opcode, full, half) in [
+            ([0xd9, 0x30], 28, 14),
+            ([0xd9, 0x20], 28, 14),
+            ([0xdd, 0x30], 108, 94),
+            ([0xdd, 0x20], 108, 94),
+        ] {
+            for (prefixes, expected) in [
+                (&[][..], full),
+                (&[0x48], full),
+                (&[0x66], half),
+                (&[0x66, 0x48], full),
+                (&[0x66, 0x66], half),
+                (&[0x66, 0x41], half),
+            ] {
+                let bytes = [prefixes, &opcode[..]].concat();
+                assert_eq!(size(&bytes), expected, "{bytes:02x?}");
+            }
+        }
         // The waiting forms are a `wait` and the rest.
         let waiting = at(&[0x9b, 0xd9, 0x38]);
         assert_eq!((waiting.mnemonic, waiting.len), (Mnemonic::Wait, 1));

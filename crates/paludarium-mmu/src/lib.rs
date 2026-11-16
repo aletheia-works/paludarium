@@ -1884,6 +1884,9 @@ impl Default for AddressSpaceData {
     }
 }
 
+/// `EBUSY`, which [`Errno`] does not name.
+const EBUSY: Errno = Errno(16);
+
 fn page_index(addr: u64) -> (u64, usize) {
     let page = addr / PAGE_SIZE;
     let dir = page / ENTRIES_PER_TABLE;
@@ -4123,7 +4126,7 @@ impl AddressSpaceData {
                 return Err(Errno::EPERM);
             }
             if m.userfault.is_some_and(|u| u.context != context) {
-                return Err(Errno(16)); // EBUSY
+                return Err(EBUSY);
             }
         }
         let registration = Userfault { context, modes };
@@ -4330,6 +4333,138 @@ impl AddressSpaceData {
         }
         self.poisons.add(page, page + PAGE_SIZE);
         Ok(())
+    }
+
+    /// The checks of a `UFFDIO_MOVE` of `len` bytes from `src` to `dst`
+    /// for the `userfaultfd` numbered `context`, as Linux's
+    /// `uffd_move_lock`, `move_pages` and `validate_move_areas` make them:
+    /// each start lies in a VMA (`ENOENT`); neither VMA is shared, and each
+    /// holds its whole range (`EINVAL`); the two have the same protection,
+    /// which lets writes, and are both locked or neither; the destination is
+    /// registered with the context, and both are anonymous memory
+    /// (`EINVAL`).
+    fn userfault_move_check(
+        &self,
+        dst: u64,
+        src: u64,
+        len: u64,
+        context: u64,
+    ) -> Result<(Mapping, Mapping), Errno> {
+        let (dst_start, dst_end) = self.region_at(dst).ok_or(Errno::ENOENT)?;
+        let (_, src_end) = if (dst_start..dst_end).contains(&src) {
+            (dst_start, dst_end)
+        } else {
+            self.region_at(src).ok_or(Errno::ENOENT)?
+        };
+        let dst_mapping = *self.mapping_at(dst).ok_or(Errno::ENOENT)?;
+        let src_mapping = *self.mapping_at(src).ok_or(Errno::ENOENT)?;
+        let vm_shared = |page| self.shared_at(page).is_some_and(|s| s.vm_shared);
+        if vm_shared(src) || src + len > src_end || vm_shared(dst) || dst + len > dst_end {
+            return Err(Errno::EINVAL);
+        }
+        let anonymous = |m: &Mapping| {
+            self.shared_at(m.start.0).is_none()
+                && self.backing_at(m.start.0).is_none()
+                && matches!(
+                    m.kind,
+                    MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
+                )
+        };
+        if src_mapping.prot != dst_mapping.prot
+            || src_mapping.locked.is_some() != dst_mapping.locked.is_some()
+            || !src_mapping.prot.contains(Prot::WRITE)
+            || dst_mapping.userfault.is_none_or(|u| u.context != context)
+            || !anonymous(&src_mapping)
+            || !anonymous(&dst_mapping)
+        {
+            return Err(Errno::EINVAL);
+        }
+        Ok((dst_mapping, src_mapping))
+    }
+
+    /// `UFFDIO_MOVE` of `len` bytes from `src` to `dst` (page-aligned, the
+    /// ranges checked) for the `userfaultfd` numbered `context`, with
+    /// `holes` (`UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES`), as Linux's
+    /// `move_pages` and `move_pages_ptes` have it: after
+    /// [`Self::userfault_move_check`], page by page, a destination page with
+    /// an entry or a marker is `EEXIST`; a source page with none is
+    /// `ENOENT`, or counts as moved with `holes` (and so does one whose page
+    /// table, the 2 MiB around it, nothing touched, which is `ENOENT` before
+    /// the destination is looked at without `holes`); a source marker
+    /// (poison, a guard) is `EFAULT`; and a page `fork` shares is `EBUSY`
+    /// (`PageAnonExclusive`). The zero page moves as the zero page; any
+    /// other page takes the destination's protection, writable and no
+    /// longer write-protected, and the source has none. The bytes moved,
+    /// and the error that stopped it short.
+    pub fn userfault_move(
+        &mut self,
+        dst: u64,
+        src: u64,
+        len: u64,
+        context: u64,
+        holes: bool,
+    ) -> (u64, Option<Errno>) {
+        // Linux gives the destination VMA its `anon_vma` first.
+        self.userfault_prepare_fill(dst);
+        let (dst_mapping, _) = match self.userfault_move_check(dst, src, len, context) {
+            Ok(mappings) => mappings,
+            Err(e) => return (0, Some(e)),
+        };
+        let mut moved = 0;
+        let mut error = None;
+        let mut changed = false;
+        while moved < len {
+            let (from, to) = (src + moved, dst + moved);
+            let markers = |page| self.guarded(page) || self.poisoned(page);
+            let mut directory = self.write_directory();
+            let table = directory.contains_key(&page_index(from).0) || markers(from);
+            if !table && !holes {
+                error = Some(Errno::ENOENT);
+                break;
+            }
+            if lookup(&directory, to).is_some() || markers(to) {
+                error = Some(Errno::EEXIST);
+                break;
+            }
+            if markers(from) {
+                error = Some(Errno::EFAULT);
+                break;
+            }
+            let (dir, slot) = page_index(from);
+            let Some(entry) = lookup(&directory, from) else {
+                if !holes {
+                    error = Some(Errno::ENOENT);
+                    break;
+                }
+                moved += PAGE_SIZE;
+                continue;
+            };
+            let zero = entry.frame.get().is_none() && !entry.file;
+            if !zero && entry.cow {
+                error = Some(EBUSY);
+                break;
+            }
+            let taken = directory
+                .get_mut(&dir)
+                .and_then(|table| table.pages[slot].take());
+            let entry = match taken {
+                Some(entry) if !zero => Page {
+                    prot: dst_mapping.prot,
+                    uffd_wp: false,
+                    ..entry
+                },
+                _ => self.page(to, dst_mapping.prot),
+            };
+            let (dir, slot) = page_index(to);
+            directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
+            drop(directory);
+            changed = true;
+            moved += PAGE_SIZE;
+        }
+        if changed {
+            self.bump_code_generation();
+        }
+        (moved, error)
     }
 
     /// Locks or unlocks `[addr, end)` (`lock`), as Linux's
@@ -5244,6 +5379,19 @@ impl MemoryView {
     pub fn userfault_poison(&self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
         self.with_data_mut(|data| data.userfault_poison(start, end, page))
             .unwrap_or(Err(Errno(3))) // ESRCH
+    }
+    /// See [`AddressSpaceData::userfault_move`]; `ESRCH` once the space is
+    /// gone.
+    pub fn userfault_move(
+        &self,
+        dst: u64,
+        src: u64,
+        len: u64,
+        context: u64,
+        holes: bool,
+    ) -> (u64, Option<Errno>) {
+        self.with_data_mut(|data| data.userfault_move(dst, src, len, context, holes))
+            .unwrap_or((0, Some(Errno(3)))) // ESRCH
     }
     /// See [`AddressSpaceData::userfault_write_protect`]; `ESRCH` once the
     /// space is gone, as Linux's `mmget_not_zero` fails.

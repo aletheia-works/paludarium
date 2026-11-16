@@ -98,7 +98,11 @@ mod linux {
         }
         // Linux writes the core the cases read only with the kernel's
         // default core_pattern, which CI sets.
-        if mode == "core-dump" || mode == "core-mappings" || mode == "core-credentials" {
+        if mode == "core-dump"
+            || mode == "core-mappings"
+            || mode == "core-credentials"
+            || mode == "ptrace-exit-core"
+        {
             for (setting, wanted) in [("core_pattern", "core\n"), ("core_uses_pid", "0\n")] {
                 let value = std::fs::read_to_string(format!("/proc/sys/kernel/{setting}"))
                     .unwrap_or_default();
@@ -146,8 +150,8 @@ mod linux {
             // the personality-layout case, which maps page 0, the
             // proc-other-maps and proc-other-fds cases, which read a
             // process's maps and descriptors as another user, and the
-            // pagemap case, which becomes an unprivileged user, as the
-            // emulator's guest starts as root.
+            // pagemap and proc-owners cases, which become an unprivileged
+            // user, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -202,12 +206,15 @@ mod linux {
                     | "userfaultfd-shared"
                     | "userfaultfd-wp"
                     | "userfaultfd-poison"
+                    | "userfaultfd-move"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
+                    | "bpf-ids"
+                    | "bpf-memory"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -251,6 +258,7 @@ mod linux {
                     | "scheduling-set"
                     | "personality-layout"
                     | "pagemap"
+                    | "proc-owners"
                     | "admin"
             );
             let native = if as_root && !running_as_root() {
@@ -486,6 +494,8 @@ mod linux {
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
+        bpf_ids => ("bpf-ids","bpf"),
+        bpf_memory => ("bpf-memory","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -519,6 +529,7 @@ mod linux {
         userfaultfd_shared => ("userfaultfd-shared","userfaultfd"),
         userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
         userfaultfd_poison => ("userfaultfd-poison","userfaultfd"),
+        userfaultfd_move => ("userfaultfd-move","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -553,6 +564,8 @@ mod linux {
         ptrace_listen => ("ptrace-listen","ptrace-requests"),
         ptrace_seccomp => ("ptrace-seccomp","ptrace-requests"),
         ptrace_arch_rseq => ("ptrace-arch-rseq","ptrace-requests"),
+        ptrace_syscall_signal => ("ptrace-syscall-signal","ptrace-requests"),
+        ptrace_exit_core => ("ptrace-exit-core","ptrace-requests"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),
@@ -587,6 +600,7 @@ mod linux {
         processes_late_handler => ("late-handler","process"),
         processes_mincore => ("mincore","process"),
         processes_pagemap => ("pagemap","process"),
+        processes_proc_owners => ("proc-owners","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),
         processes_fifo => ("fifo","process"),

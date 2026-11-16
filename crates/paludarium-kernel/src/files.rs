@@ -5960,11 +5960,17 @@ fn open_at(
     let credentials = &c.process.credentials;
     let opened = match crate::permissions::open(c.files, credentials, dir, &raw, flags) {
         Ok(created) => landlock_before_open(c, &p, flags).and_then(|landlock| {
-            let opened = open_path(c, &p, flags, mode).inspect(|_| {
+            // Its `FAN_OPEN_PERM` waits for the groups' answers, then its
+            // `IN_OPEN`; a denied file goes, never opened.
+            let (opened, answered) = crate::fanotify::asking(c, |c| open_path(c, &p, flags, mode));
+            let opened = opened.inspect(|_| {
                 if let Some(parent) = created {
                     crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
                 }
             })?;
+            if answered? {
+                opened.0.notify_event(crate::inotify::OPEN);
+            }
             let landlock = match landlock {
                 Some(rights) => rights,
                 None => landlock_after_open(c, &p, flags)?,

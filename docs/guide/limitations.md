@@ -675,10 +675,13 @@ verified.
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
-- **fanotify, in part**: permission events (`FAN_OPEN_PERM`,
-  `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM`) are taken by `fanotify_mark` but
-  never sent, so what they would ask is let through, and a response names no
-  event; `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
+- **fanotify, in part**: of the permission events, only `FAN_OPEN_PERM` of
+  an open by `open`, `openat`, `openat2`, `creat` or `open_by_handle_at`
+  is sent; `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM` and exec's
+  `FAN_OPEN_PERM` are taken by `fanotify_mark` but never sent, so what they
+  would ask is let through, and exec's open is told as `FAN_OPEN` without
+  `FAN_OPEN_EXEC`.
+  `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
   and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
   never come. An evictable mark is never evicted. A group merges an event
   into any like it still queued, where Linux looks only at the last 128 of

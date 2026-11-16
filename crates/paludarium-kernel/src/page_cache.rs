@@ -14,7 +14,7 @@ use paludarium_mmu::{FileSize, MemoryMeter, SharedPages};
 use paludarium_types::{Errno, PAGE_SIZE};
 use paludarium_vfs::{FileSystem, MountPoint};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 /// A file, as `stat` names it: its device (the mount's number, or a
@@ -786,6 +786,11 @@ pub(crate) struct CoherentFile {
     /// status flags, all those it was opened with, as `dentry_open` keeps
     /// them.
     quiet: Option<AtomicU32>,
+    /// Its open waits for fanotify's answers to its `FAN_OPEN_PERM`
+    /// (`fsnotify_open_perm_and_set_mode`): its `IN_OPEN` is held back until
+    /// they let it through, and a denied one is never opened, so it tells
+    /// no close either.
+    held: AtomicBool,
 }
 
 thread_local! {
@@ -818,7 +823,7 @@ fn reopen_unchecked(inner: &Arc<dyn FileHandle>, flags: u32) -> Result<Arc<dyn F
 
 impl Drop for CoherentFile {
     fn drop(&mut self) {
-        if let Some(writing) = self.opened {
+        if let Some(writing) = self.opened.filter(|_| !*self.held.get_mut()) {
             self.event(if writing {
                 crate::inotify::CLOSE_WRITE
             } else {
@@ -866,6 +871,7 @@ impl CoherentFile {
             write: None,
             writer: None,
             opened: None,
+            held: AtomicBool::new(false),
             quiet: quiet_now(),
         };
         file.list();
@@ -934,7 +940,13 @@ impl CoherentFile {
         self.list();
         if flags & O_PATH == 0 && self.quiet.is_none() && crate::inotify::reported_open() {
             self.opened = Some(flags & 3 != 0);
-            self.event(crate::inotify::OPEN);
+            let asked = crate::fanotify::asked();
+            self.event(crate::fanotify::OPEN_PERM);
+            if crate::fanotify::asked() > asked {
+                self.held = AtomicBool::new(true);
+            } else {
+                self.event(crate::inotify::OPEN);
+            }
         }
         self
     }
@@ -991,6 +1003,7 @@ impl CoherentFile {
                 write: None,
                 writer: None,
                 opened: None,
+                held: AtomicBool::new(false),
                 quiet: Some(AtomicU32::new(flags)),
             }
             .writing(flags)?
@@ -1027,6 +1040,7 @@ impl FileHandle for CoherentFile {
             write: None,
             writer: None,
             opened: None,
+            held: AtomicBool::new(false),
             quiet: quiet_now(),
         }
         .writing(flags)?
@@ -1044,6 +1058,11 @@ impl FileHandle for CoherentFile {
     fn notify_event(&self, mask: u32) -> bool {
         if matches!(self.device, Device::Fixed(_)) {
             return false;
+        }
+        // The open its permission events let through has its `IN_OPEN`
+        // now, and its close in time.
+        if mask == crate::inotify::OPEN {
+            self.held.store(false, Ordering::SeqCst);
         }
         self.event(mask);
         true
@@ -1304,6 +1323,7 @@ impl HostFs for CoherentFs {
             write: None,
             writer: None,
             opened: None,
+            held: AtomicBool::new(false),
             quiet: quiet_now(),
         }
         .writing(flags)?

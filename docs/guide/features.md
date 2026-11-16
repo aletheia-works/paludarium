@@ -3441,9 +3441,17 @@ kernel.
   for a buffer too small for the first), waits unless non-blocking, and
   `FIONREAD` gives the bytes queued; `/proc/self/fdinfo` shows the flags and
   each mark, the newest first, as `fanotify_show_fdinfo`. A write is a
-  permission response, checked as Linux checks it; as no permission event
-  is ever sent (see the limitations), one that passes names no event
-  (`ENOENT`). `statfs`'s `f_fsid` is the file system ID the events give: the
+  permission response, checked as Linux checks it, to the read event its
+  descriptor names (`ENOENT` when none waits by it). An open by `open`,
+  `openat`, `openat2`, `creat` or `open_by_handle_at` of a file a content or pre-content
+  group's mark wants `FAN_OPEN_PERM` of waits for each such group's
+  answer in turn, the pre-content ones first, as `fanotify_get_response`:
+  `FAN_DENY` fails it with `EPERM`, `FAN_ALLOW` lets it through, and so
+  does the group's last close; only a fatal signal ends the wait. Its
+  `FAN_OPEN` comes once it is let through, and a denied open is never
+  opened, so it tells no close. A permission event is never merged; a full
+  queue lets it through after the overflow event; a read that cannot give
+  it a descriptor denies it. `statfs`'s `f_fsid` is the file system ID the events give: the
   device of the kernel's own file systems, /proc, devpts and mqueue, as
   `simple_statfs` gives it, and a number drawn for each other file system,
   as tmpfs draws a UUID.

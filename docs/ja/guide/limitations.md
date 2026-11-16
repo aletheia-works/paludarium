@@ -576,9 +576,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
   ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
-- **fanotify の一部**：許可イベント（`FAN_OPEN_PERM`、`FAN_ACCESS_PERM`、
-  `FAN_OPEN_EXEC_PERM`）は `fanotify_mark` で受け付けますが送りません。そのため、求める
-  はずだったことはそのまま通り、応答はどのイベントも指しません。`FAN_PRE_ACCESS` は
+- **fanotify の一部**：許可イベントで送るのは、`open`、`openat`、`openat2`、`creat`、
+  `open_by_handle_at` でのオープンの `FAN_OPEN_PERM` だけです。`FAN_ACCESS_PERM`、
+  `FAN_OPEN_EXEC_PERM`、exec の `FAN_OPEN_PERM` は `fanotify_mark` で受け付けますが
+  送らないので、求めるはずだったことはそのまま通ります。exec のオープンは
+  `FAN_OPEN_EXEC` なしの `FAN_OPEN` として伝えます。
+  `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント
   （`FAN_MNT_ATTACH`、`FAN_MNT_DETACH`）と `FAN_FS_ERROR` は来ません。追い出せるマークも
   追い出しません。グループは、まだ溜まっている似たイベントのどれにもまとめます。Linux は

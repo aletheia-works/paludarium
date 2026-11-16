@@ -700,6 +700,92 @@ static int case_unprivileged(void) {
     return 0;
 }
 
+/* A child that opens `path` for reading: its exit status is 0 when the
+   open succeeded, or the errno it failed with. It first closes its copy
+   of the group `fan`, whose last close would otherwise be its own. */
+static pid_t open_in_child(const char *path, int fan) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(fan);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) _exit(errno);
+        close(fd);
+        _exit(0);
+    }
+    return child;
+}
+static int child_result(pid_t child) {
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+/* Reads one permission event from `fan`, which waits for it: the mask,
+   the file it names, whether the pid is `child`'s; its descriptor. */
+static int read_perm(const char *label, int fan, pid_t child) {
+    char buf[256];
+    long n = e(read(fan, buf, sizeof buf));
+    if (n < (long)sizeof(struct metadata)) {
+        printf("%s: read=%ld\n", label, n);
+        return -1;
+    }
+    struct metadata m;
+    memcpy(&m, buf, sizeof m);
+    char name[256];
+    printf("%s: mask=%#llx file=%s pid=%s more=%d\n", label, (unsigned long long)m.mask,
+           m.fd >= 0 ? named(m.fd, name, sizeof name) : "none", m.pid == child ? "child" : "other",
+           n > (long)m.event_len);
+    return m.fd;
+}
+static long respond(int fan, int fd, uint32_t response) {
+    struct {
+        int32_t fd;
+        uint32_t response;
+    } r = {fd, response};
+    return e(write(fan, &r, sizeof r));
+}
+
+/* Permission events (FAN_OPEN_PERM): an open of a marked file waits for
+   the group's answer, which a read event's descriptor names; FAN_DENY
+   fails it with EPERM, FAN_ALLOW lets it through, and so does the group's
+   close. A notification group hears FAN_OPEN only of an open let
+   through, and no close of a denied one. */
+static int case_perm(void) {
+    make_base("perm");
+    touch(at("f"));
+    int fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    int notif = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (fan < 0 || notif < 0) return 80;
+    printf("mark=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, at("f")));
+    printf("notif=%ld\n", fan_mark(notif, FAN_MARK_ADD, FAN_OPEN | FAN_CLOSE, AT_FDCWD, at("f")));
+    /* A response no read event waits by. */
+    printf("unknown=%ld negative=%ld\n", respond(fan, 99, 1), respond(fan, -1, 1));
+    pid_t child = open_in_child(at("f"), fan);
+    int fd = read_perm("deny", fan, child);
+    printf("deny errno=%ld\n", respond(fan, fd, 2 | (1u << 24)));
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    printf("again=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    printf("denied child=%d\n", child_result(child));
+    show_fd_events("after deny", notif, child);
+    child = open_in_child(at("f"), fan);
+    fd = read_perm("allow", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    printf("allowed child=%d\n", child_result(child));
+    show_fd_events("after allow", notif, child);
+    /* The group's close lets through what waits, read or not. */
+    child = open_in_child(at("f"), fan);
+    fd = read_perm("unanswered", fan, child);
+    if (fd >= 0) close(fd);
+    close(fan);
+    printf("closed child=%d\n", child_result(child));
+    show_fd_events("after close", notif, child);
+    close(notif);
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -710,6 +796,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-fid")) return case_fid();
     if (!strcmp(mode, "fanotify-pidfd")) return case_pidfd();
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
+    if (!strcmp(mode, "fanotify-perm")) return case_perm();
     printf("unknown mode %s\n", mode);
     return 2;
 }

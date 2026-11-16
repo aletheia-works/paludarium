@@ -150,8 +150,9 @@ mod linux {
             // the personality-layout case, which maps page 0, the
             // proc-other-maps, proc-other-fds, proc-other-limits and
             // proc-other-pagemap cases, which read a process's maps,
-            // descriptors, auxv and pagemap as other users, and the pagemap and proc-owners cases, which become an
-            // unprivileged user, as the emulator's guest starts as root.
+            // descriptors, auxv and pagemap as other users, and the pagemap
+            // and proc-owners cases, which become an unprivileged user, as
+            // the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"

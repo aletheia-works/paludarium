@@ -43,15 +43,22 @@ jobs:
         with:
           install_args: cargo-deny
           cache: false
-      - name: Build the emulator, and a wrapper that turns the JIT on
+      # Both modes start through the same kind of shell wrapper, so that its
+      # start (a few milliseconds, as much as the shortest cases' difference)
+      # counts on both sides alike.
+      - name: Build the emulator, and a wrapper for each mode
         run: |
           lscpu | grep -E 'Model name|^CPU\(s\)'
           cargo build --locked --release --target x86_64-unknown-linux-musl -p paludarium
           mkdir -p bin
-          cp target/x86_64-unknown-linux-musl/release/paludarium bin/interpreter
+          cp target/x86_64-unknown-linux-musl/release/paludarium bin/paludarium
+          cat > bin/interpreter <<'SH'
+          #!/bin/sh
+          exec "$(dirname "$0")/paludarium" "$@"
+          SH
           cat > bin/jit <<'SH'
           #!/bin/sh
-          exec "$(dirname "$0")/interpreter" --jit=100 "$@"
+          exec "$(dirname "$0")/paludarium" --jit=100 "$@"
           SH
           chmod +x bin/*
       - name: Build the guests

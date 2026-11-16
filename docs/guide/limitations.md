@@ -476,9 +476,14 @@ verified.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
-    without XSAVE, which the emulated CPU does not offer. There are no
-    hardware breakpoints: the debug registers read as unused (DR6 as
-    `0xffff0ff0`), and a write to them other than clearing DR7 gives `EIO`.
+    without XSAVE, which the emulated CPU does not offer. A data
+    breakpoint sees the accesses of an instruction's memory operands, of
+    its push, pop, call or return on the stack, and of a string
+    instruction without a repeat. These do not hit one, where the CPU's
+    would: a `rep` string instruction (the CPU stops after the iteration
+    that touched the range); the save areas of `fxsave`, `fxrstor`,
+    `xsave`, `xrstor`, `fsave`, `frstor`, `fnstenv` and `fldenv`; the
+    implicit accesses of `enter`, `leave`, `xlat` and `maskmovdqu`.
     A `cs` or `ss` selector a tracer writes other than the 64-bit user ones
     is kept and shown, but the tracee runs on in 64-bit mode, where Linux
     would run it in that segment or fault.

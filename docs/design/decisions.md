@@ -232,7 +232,10 @@ interpreter runs one instruction and reports the trap, so a run without it
 pays one test and nothing per instruction. `popf`, the only instruction
 that sets the flag, ends its run when it does, so the next one is stepped;
 the kernel sets it only between runs (`rt_sigreturn`, a tracer). Neither
-JIT needs to know of the flag.
+JIT needs to know of the flag. Hardware breakpoints go the same way: while
+a tracer has one enabled, the interpreter runs the guest one instruction at
+a time and matches it against them, and a guest without any pays nothing
+for them.
 
 ## Explicit CPU differences
 

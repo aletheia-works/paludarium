@@ -4124,6 +4124,20 @@ one only with an `--allow-net`.
   exited or run another program. The thread that ends its process reports
   `PTRACE_EVENT_EXIT`, its status with 0x80 when a fatal signal dumps a
   core; the threads that end with it do not.
+- A tracer sets hardware breakpoints in the debug registers with
+  `PTRACE_POKEUSER`, as Linux's `ptrace_set_debugreg` takes them: DR0–DR3
+  hold the addresses, which must be in user space and aligned to the
+  breakpoint's length (`EINVAL`), and DR7 enables them and gives each its
+  type, an instruction (1 byte), a write, or a read or write, and its
+  length, 1, 2, 4 or 8 (`EINVAL` for an I/O breakpoint or a longer
+  instruction one, leaving DR7 as it was); there is no DR4 or DR5 (`EIO`).
+  An instruction breakpoint stops the tracee before the instruction, with
+  RF set so that it runs once resumed, and a data one after the instruction
+  that accesses the range: `SIGTRAP` with `TRAP_HWBKPT` and the address in
+  `rip`, and DR6 with the breakpoint's bit, and with `DR_STEP` after a
+  single step. A new task has none, and exec clears them. While none is
+  set, the guest runs as fast as before; while one is, it runs one
+  instruction at a time.
 - `PTRACE_SINGLESTEP` resumes a tracee with the trap flag set, which the
   tracer does not see in its registers unless the tracee set it itself
   (`TIF_FORCED_TF`), and any other resume takes it back: the tracee stops

@@ -6,6 +6,7 @@
  * an address is printed only as its offset into its sequence. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stddef.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -105,10 +106,31 @@ __asm__(".text\n"
         "  andq $~0x100, (%rsp)\n"
         "  popfq\n"
         "seq_frame_end:\n"
-        "  ret\n");
+        "  ret\n"
+        /* kill(rdi, SIGSTOP), then an instruction an execute breakpoint
+         * watches, a write and a read of `watched`. */
+        ".globl seq_hw, seq_hw_exec, seq_hw_end\n"
+        "seq_hw:\n"
+        "  movl $19, %esi\n"
+        "  movl $62, %eax\n"
+        "  syscall\n"
+        "  nop\n"
+        "seq_hw_exec:\n"
+        "  movl $1, %ecx\n"
+        "  movq %rcx, watched(%rip)\n"
+        "  movq watched(%rip), %rdx\n"
+        "seq_hw_end:\n"
+        "  ret\n"
+        ".data\n"
+        ".balign 8\n"
+        ".globl watched\n"
+        "watched: .quad 0\n"
+        ".text\n");
 
 void seq_flag(void), seq_syscall(void), seq_signal(int), seq_int3(void), seq_trace(int),
-    seq_frame(int);
+    seq_frame(int), seq_hw(int);
+extern char seq_hw_exec[], seq_hw_end[];
+extern uint64_t watched;
 extern char seq_flag_end[], seq_syscall_end[], seq_signal_end[], seq_int3_end[], seq_trace_from[],
     seq_trace_end[], seq_frame_end[];
 
@@ -323,6 +345,76 @@ static int forced_frame_case(void) {
     return 0;
 }
 
+/* --- hardware breakpoints ------------------------------------------------ */
+
+#define DEBUGREG(n) (offsetof(struct user, u_debugreg) + (n) * 8)
+
+static long peek_debug(pid_t child, int n) {
+    unsigned long word = 0;
+    long r = pt(PTRACE_PEEKUSER, child, DEBUGREG(n), (unsigned long)&word);
+    return r ? r : (long)word;
+}
+
+/* One stop of the breakpoint case: why, where in seq_hw, and DR6. */
+static void hw_stop(pid_t child, const char *name) {
+    int status = wait_status(child);
+    if (!WIFSTOPPED(status)) {
+        printf("%s: exited=%d\n", name, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return;
+    }
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    uint64_t start = (uint64_t)(uintptr_t)seq_hw;
+    printf("%s: signal=%d code=%d at=%lld addr-is-rip=%d rf=%d dr6=%#lx\n", name, WSTOPSIG(status),
+           info.si_code, (long long)(regs.rip - start),
+           (uint64_t)(uintptr_t)info.si_addr == regs.rip, (int)(regs.eflags >> 16 & 1),
+           (unsigned long)peek_debug(child, 6));
+}
+
+static int hw_breakpoint_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        seq_hw(getpid());
+        _exit(watched == 1 ? 0 : 1);
+    }
+    wait_status(child);
+    printf("dr0=%ld dr6=%#lx dr7=%ld\n", peek_debug(child, 0), (unsigned long)peek_debug(child, 6),
+           peek_debug(child, 7));
+    /* One step first: DR6 then has the step. */
+    pt(PTRACE_SINGLESTEP, child, 0, 0);
+    hw_stop(child, "step");
+    unsigned long exec = (unsigned long)seq_hw_exec, data = (unsigned long)&watched;
+    printf("poke-dr0=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(0), exec));
+    printf("poke-dr1=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(1), data));
+    printf("poke-dr4=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(4), 0));
+    printf("poke-kernel=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(2), 1UL << 63));
+    /* DR0 executes; DR1 is an 8-byte write; an I/O one and a long
+     * execute one are refused, and leave DR7 as it was. */
+    unsigned long dr7 = 1 | 1 << 2 | 0x9UL << 20;
+    printf("poke-dr7-io=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), 1 | 0x2UL << 16));
+    printf("poke-dr7-long=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), 1 | 0x4UL << 16));
+    printf("poke-dr7=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), dr7));
+    printf("dr7=%#lx misaligned=%ld\n", (unsigned long)peek_debug(child, 7),
+           pt(PTRACE_POKEUSER, child, DEBUGREG(1), data + 4));
+    pt(PTRACE_CONT, child, 0, 0);
+    hw_stop(child, "execute");
+    pt(PTRACE_CONT, child, 0, 0);
+    hw_stop(child, "write");
+    /* DR1 now reads or writes, DR0 off: the read hits. */
+    pt(PTRACE_POKEUSER, child, DEBUGREG(7), 1 << 2 | 0xbUL << 20);
+    pt(PTRACE_CONT, child, 0, 0);
+    hw_stop(child, "read");
+    pt(PTRACE_POKEUSER, child, DEBUGREG(7), 0);
+    pt(PTRACE_CONT, child, 0, 0);
+    hw_stop(child, "end");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 99;
     const char *mode = argv[1];
@@ -334,6 +426,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "int3")) code = int3_case();
     if (!strcmp(mode, "ptrace-singlestep")) code = ptrace_case();
     if (!strcmp(mode, "ptrace-forced-frame")) code = forced_frame_case();
+    if (!strcmp(mode, "ptrace-hw-breakpoint")) code = hw_breakpoint_case();
     fflush(stdout);
     return code;
 }

@@ -2357,14 +2357,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
   `limits`、`comm`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、
-  `fd`、`fdinfo`、`ns`、`task` があります。これらとディレクトリの持ち主は、Linux の `task_dump_owner` と同じく
+  `fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
-  `PR_SET_DUMPABLE` まで）root です。`/proc/self` そのものは root のものです。`stat` は
-  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、`comm` は 0644、ほかのファイルは 0444）を示し、
-  開いたものの `fstat` は開いたときの持ち主を示します。Linux はその時点の持ち主です。開くときは Linux の `generic_permission` と同じくその
+  `PR_SET_DUMPABLE` まで）root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
+  プロセスのもので、`/proc/self` そのものは root のものです。`stat` は
+  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、`comm` は 0644、ほかのファイルは 0444）を示します。
+  開いたファイルの `fstat` は、そのパスを最後に探したとき（どのプロセスの open や `stat` でも）の
+  持ち主を示します。Linux の inode と同じで、開いたファイルが押さえるパスを探すたびに新しく
+  なります（`pid_revalidate`）。開いたディレクトリとその `ns` の `fstat` は、Linux の
+  `pid_getattr` と同じくその時点の持ち主を示します。開くときは Linux の `generic_permission` と同じくその
   持ち主に対してモードを確かめるので、`CAP_DAC_OVERRIDE` なしに書き込み用に開くと
   `EACCES` で、ダンプできないプロセスが `environ`、`auxv`、`pagemap` を読むために開いても
-  `EACCES` です。書き込み用に開いたもの（root のものや、持ち主が開いた `comm`）への書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  `EACCES` です。書き込み用に開いたもの（root のもの）への書き込みは `EINVAL` です。ただし `comm` への書き込みは、
+  Linux の `comm_write` と同じくスレッドの名前を変えます。書き手がそのスレッドのプロセスのものなら、
+  最初の 15 バイト（NUL まで）を名前にして、書いた数をすべて返します（スレッドは次のシステムコールで
+  その名前になり、`/proc` にはすぐ出ます）。ほかのプロセスからは `EINVAL`、スレッドがもういなければ
+  `ESRCH` です。musl の `pthread_setname_np` は、ほかのスレッドの名前をここに書きます。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を
@@ -2399,13 +2407,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
-  同じです。ダンプできないプロセスの
-  ディレクトリの持ち主は root です。ファイルの持ち主はこのプロセス自身のもの（前述）と
-  同じで、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
+  同じです。ファイルの持ち主はこのプロセス自身のもの（前述）と
+  同じで（ダンプできないプロセスのディレクトリ（0555）もそのプロセスのものです）、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
   ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
   `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
   `auxv`、`pagemap` を読むには持ち主か `CAP_DAC_OVERRIDE` が要ります。開いたものの `fstat` は、
-  開いたときの持ち主を示します。`statm` と `limits` は、Linux と同じく誰でも読めます。
+  このプロセス自身のもの（前述）と同じく持ち主を示します。`statm` と `limits` は、Linux と同じく誰でも読めます。
   `fd` そのものを読むことと中を探すことは、Linux の
   `proc_fd_permission` と同じくそのモード（0500）が許す読み手だけができます。`fd` と
   `fdinfo` は、このプロセス自身のもの（後述）と同じものを、ほかのプロセスのディスクリプタに

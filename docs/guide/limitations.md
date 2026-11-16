@@ -62,10 +62,6 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
   `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
-- **Writing `comm`**: a write to `/proc/<pid>/comm` or
-  `/proc/<pid>/task/<tid>/comm` is `EINVAL`, where Linux renames the thread
-  when the writer is of its process (musl's `pthread_setname_np` of another
-  thread writes there; `prctl(PR_SET_NAME)` works).
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do: a page that a `fork`
   shared is not exclusive (bit 56) until this process writes it, even

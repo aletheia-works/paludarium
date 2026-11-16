@@ -10732,6 +10732,156 @@ static int proc_other_pagemap_case(void) {
     munmap(seen, 4096);
     return 0;
 }
+/* The proc-owner-rename case: the owner fstat shows of an open file in a
+   process's /proc directory, which is its inode's as the last lookup of its
+   path set it (pid_revalidate), and of the process's directory and its ns,
+   which pid_getattr takes at each fstat; and writes to comm, which rename
+   the thread when the writer is of its process (comm_write). */
+/* The owner fstat gives of `fd`: its user, or -errno. */
+static long por_fowner(int fd) {
+    struct stat st;
+    return fstat(fd, &st) ? -errno : (long)st.st_uid;
+}
+/* The owner stat gives of `path`: its user, or -errno. */
+static long por_owner(const char *path) {
+    struct stat st;
+    return stat(path, &st) ? -errno : (long)st.st_uid;
+}
+/* The calling thread's name, as PR_GET_NAME gives it, in `out`. */
+static void por_name(char out[17]) {
+    memset(out, 0, 17);
+    prctl(PR_GET_NAME, out, 0, 0, 0);
+}
+/* `name` with its unprintable bytes as `\xNN`. */
+static void por_show(const char *label, const char *name) {
+    printf(" %s=", label);
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+        if (*p >= 0x20 && *p < 0x7f) putchar(*p);
+        else printf("\\x%02x", *p);
+}
+static pthread_barrier_t por_barrier;
+static char por_seen[17];
+static void *por_thread(void *unused) {
+    (void)unused;
+    pthread_barrier_wait(&por_barrier);
+    /* Renamed by the main thread meanwhile. */
+    pthread_barrier_wait(&por_barrier);
+    por_name(por_seen);
+    pthread_barrier_wait(&por_barrier);
+    return NULL;
+}
+static int proc_owner_rename_case(void) {
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 81;
+    if (!kid) {
+        /* User 1000's, dumpable; then not dumpable; then dumpable again. */
+        /* Each step's result goes back as a byte, 'r' when it worked, even
+           after a failure, so that the parent never waits on a step. */
+        close(ready[0]);
+        close(go[1]);
+        char byte = 'r', next;
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000) || prctl(PR_SET_DUMPABLE, 1)) byte = 'u';
+        for (int step = 0; step < 3; step++) {
+            if (write(ready[1], &byte, 1) != 1 || read(go[0], &next, 1) != 1) _exit(88);
+            if (byte == 'r' && step == 0 && prctl(PR_SET_DUMPABLE, 0)) byte = 'd';
+            if (byte == 'r' && step == 1 && prctl(PR_SET_DUMPABLE, 1)) byte = 'e';
+        }
+        _exit(0);
+    }
+    close(ready[1]);
+    close(go[0]);
+    char byte, path[64];
+    if (read(ready[0], &byte, 1) != 1) return 82;
+    snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+    int status = open(path, O_RDONLY);
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
+    int maps = open(path, O_RDONLY);
+    snprintf(path, sizeof path, "/proc/%d", (int)kid);
+    int dir = open(path, O_RDONLY | O_DIRECTORY);
+    snprintf(path, sizeof path, "/proc/%d/ns", (int)kid);
+    int ns = open(path, O_RDONLY | O_DIRECTORY);
+    printf("child=%c opened: status=%ld maps=%ld dir=%ld ns=%ld\n", byte, por_fowner(status), por_fowner(maps),
+           por_fowner(dir), por_fowner(ns));
+    /* Not dumpable: root's files, but the directory stays its user's. Open
+       files keep their owner until a lookup of their path. */
+    if (write(go[1], "1", 1) != 1 || read(ready[0], &byte, 1) != 1) return 83;
+    printf("undumpable(%c): status=%ld maps=%ld dir=%ld ns=%ld", byte, por_fowner(status), por_fowner(maps), por_fowner(dir),
+           por_fowner(ns));
+    snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+    long looked = por_owner(path);
+    printf(" lookup=%ld then status=%ld maps=%ld", looked, por_fowner(status), por_fowner(maps));
+    snprintf(path, sizeof path, "/proc/%d", (int)kid);
+    printf(" directory=%ld\n", por_owner(path));
+    /* Dumpable again: the directory's ns follows at once, the open status
+       only after a lookup again. */
+    if (write(go[1], "2", 1) != 1 || read(ready[0], &byte, 1) != 1) return 84;
+    printf("dumpable(%c): status=%ld ns=%ld", byte, por_fowner(status), por_fowner(ns));
+    snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+    looked = por_owner(path);
+    printf(" lookup=%ld then status=%ld\n", looked, por_fowner(status));
+    /* Another process's comm, which root may open for writing: EINVAL. */
+    snprintf(path, sizeof path, "/proc/%d/comm", (int)kid);
+    int comm = open(path, O_WRONLY);
+    long w = comm >= 0 ? write(comm, "other", 5) : -2;
+    int e = errno;
+    printf("other comm: opened=%d write=%ld/%d\n", comm >= 0, w, w < 0 ? e : 0);
+    if (comm >= 0) close(comm);
+    if (write(go[1], "3", 1) != 1) return 85;
+    printf("status=%d\n", reaped(kid));
+    close(status);
+    close(maps);
+    close(dir);
+    close(ns);
+    /* Its own comm: the first 15 bytes, up to a NUL; the whole count. */
+    char name[17];
+    comm = open("/proc/self/comm", O_WRONLY);
+    w = write(comm, "abcdefghijklmnopq", 17);
+    por_name(name);
+    printf("own: write=%ld", w);
+    por_show("name", name);
+    w = write(comm, "ab\0cd", 5);
+    por_name(name);
+    printf(" write=%ld", w);
+    por_show("nul", name);
+    w = write(comm, "line\n", 5);
+    por_name(name);
+    printf(" write=%ld", w);
+    por_show("newline", name);
+    w = pwrite(comm, "pw", 2, 7);
+    por_name(name);
+    printf(" pwrite=%ld", w);
+    por_show("name", name);
+    close(comm);
+    int fd = open("/proc/self/comm", O_RDONLY);
+    char text[32] = "";
+    ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+    if (fd >= 0) close(fd);
+    text[n > 0 ? n : 0] = 0;
+    por_show("read", text);
+    printf("\n");
+    /* Another thread of its own: musl's pthread_setname_np writes its comm
+       under task, and pthread_getname_np reads it. */
+    pthread_t thread;
+    pthread_barrier_init(&por_barrier, NULL, 2);
+    if (pthread_create(&thread, NULL, por_thread, NULL)) return 86;
+    pthread_barrier_wait(&por_barrier);
+    int set = pthread_setname_np(thread, "worker-two");
+    char got[17] = "";
+    int get = pthread_getname_np(thread, got, sizeof got);
+    pthread_barrier_wait(&por_barrier);
+    pthread_barrier_wait(&por_barrier);
+    pthread_join(thread, NULL);
+    printf("thread: set=%d get=%d", set, get);
+    por_show("got", got);
+    por_show("seen", por_seen);
+    por_name(name);
+    por_show("main", name);
+    printf("\n");
+    return 0;
+}
 /* The proc-other-fds case: another process's fd and fdinfo, as Linux's
    fs/proc/fd.c makes them: fd is 0500 and its owner's, its links read and
    lead to the descriptors' files for a reader that ptrace_may_access lets
@@ -28298,6 +28448,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();
     if (!strcmp(mode, "proc-other-limits")) return proc_other_limits_case();
     if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
+    if (!strcmp(mode, "proc-owner-rename")) return proc_owner_rename_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

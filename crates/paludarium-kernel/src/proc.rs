@@ -12,7 +12,7 @@ use paludarium_host::{FileHandle, FileStat};
 use paludarium_mmu::{MemoryView, Prot, Usage, Vma, vm};
 use paludarium_types::Errno;
 use paludarium_vfs::MountPoint;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// What `stat` reports for one of these files: a regular 0444 file. Linux's
 /// /proc reports size 0; this reports the real length, because reads of a
@@ -833,12 +833,25 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
 pub(crate) struct OwnDirectory {
     stat: FileStat,
     position: Mutex<u64>,
+    /// Who owns it at each `fstat`, for a process's directory, as Linux's
+    /// `pid_getattr` asks `task_dump_owner` then.
+    owner: Option<LiveOwner>,
 }
+/// The owner of a process's directory as it is now.
+pub(crate) type LiveOwner = Arc<dyn Fn() -> (u32, u32) + Send + Sync>;
 impl OwnDirectory {
     pub(crate) fn new(stat: FileStat) -> Self {
         Self {
             stat,
             position: Mutex::new(0),
+            owner: None,
+        }
+    }
+    /// The same, owned at each `fstat` by whom `owner` gives.
+    pub(crate) fn owned_by(self, owner: LiveOwner) -> Self {
+        Self {
+            owner: Some(owner),
+            ..self
         }
     }
 }
@@ -862,7 +875,17 @@ impl FileHandle for OwnDirectory {
         Ok(*position)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(self.stat)
+        Ok(match &self.owner {
+            Some(owner) => {
+                let (uid, gid) = owner();
+                FileStat {
+                    uid,
+                    gid,
+                    ..self.stat
+                }
+            }
+            None => self.stat,
+        })
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EISDIR)
@@ -928,6 +951,70 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
     out.into_bytes()
 }
 
+/// The owner a file of a process's `/proc` directory has: Linux's inode's
+/// `i_uid` and `i_gid`, which `fstat` of an open one shows.
+pub(crate) type Owner = Arc<Mutex<(u32, u32)>>;
+/// `stat` with `owner`'s user and group.
+fn owned(stat: FileStat, owner: &Owner) -> FileStat {
+    let (uid, gid) = *owner.lock().unwrap_or_else(PoisonError::into_inner);
+    FileStat { uid, gid, ..stat }
+}
+/// A file of a process's `/proc` directory as Linux's dentry names it: the
+/// process, the thread for one under `task/<tid>` or `thread-self`, and the
+/// path below.
+pub(crate) type Dentry = (u32, Option<u32>, Vec<u8>);
+/// The owners of the open files in the processes' `/proc` directories, one
+/// for each [`Dentry`] while a file of it is open, as Linux keeps an inode
+/// for the dentry an open file pins: each lookup of the path gives it the
+/// owner of that moment (`pid_revalidate`), which `fstat` of every open
+/// file of it then shows, until the next.
+#[derive(Default)]
+pub(crate) struct Owners(Mutex<std::collections::HashMap<Dentry, Inode>>);
+/// The owner cell of an open file's inode, gone once no file holds it.
+type Inode = std::sync::Weak<Mutex<(u32, u32)>>;
+impl Owners {
+    /// A lookup of `dentry`, whose owner is now `owner`: the owner of its
+    /// inode, the open files' if there are any.
+    pub(crate) fn lookup(&self, dentry: Dentry, owner: (u32, u32)) -> Owner {
+        let mut inodes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(inode) = inodes.get(&dentry).and_then(std::sync::Weak::upgrade) {
+            *inode.lock().unwrap_or_else(PoisonError::into_inner) = owner;
+            return inode;
+        }
+        inodes.retain(|_, inode| inode.strong_count() > 0);
+        let inode = Arc::new(Mutex::new(owner));
+        inodes.insert(dentry, Arc::downgrade(&inode));
+        inode
+    }
+}
+/// The [`Dentry`] of `path`, under `/proc/<pid>`, `/proc/self` or
+/// `/proc/thread-self` (the reading process `own` and thread `own_tid`).
+pub(crate) fn dentry(path: &[u8], own: u32, own_tid: u32) -> Option<Dentry> {
+    let path = paludarium_vfs::normalize_path(path).ok()?;
+    let mut parts = path.strip_prefix(b"/proc/")?.split(|&b| b == b'/');
+    let (pid, mut tid) = match parts.next()? {
+        b"self" => (own, None),
+        b"thread-self" => (own, Some(own_tid)),
+        head => (descriptor_number(head).filter(|&pid| pid != 0)?, None),
+    };
+    let mut rest: Vec<&[u8]> = parts.filter(|part| !part.is_empty()).collect();
+    if tid.is_none() && rest.len() >= 2 && rest[0] == b"task" {
+        tid = Some(descriptor_number(rest[1])?);
+        rest.drain(..2);
+    }
+    Some((pid, tid, rest.join(&b'/')))
+}
+
+thread_local! {
+    /// The process whose system call runs on this host thread, which a write
+    /// to `comm` asks of its writer (Linux's `current`).
+    static WRITER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+/// Records, as a system call starts, the process `pid` it is of.
+pub(crate) fn enter(pid: u32) {
+    WRITER.with(|writer| writer.set(pid));
+}
+
 /// A file whose contents were fixed when it was opened.
 pub(crate) struct GeneratedFile {
     content: Vec<u8>,
@@ -941,6 +1028,16 @@ pub(crate) struct GeneratedFile {
     /// the file it was opened as ([`Self::with_stat`]); a plain 0444 file of
     /// root's without.
     stat: Option<FileStat>,
+    /// The owner its inode has now ([`Owners`]), over `stat`'s.
+    owner: Option<Owner>,
+    /// The thread a write renames, for `comm` ([`Self::renaming`]).
+    comm: Option<Comm>,
+}
+/// The thread whose `comm` a file is.
+struct Comm {
+    group: Arc<crate::threads::ThreadGroup>,
+    pid: u32,
+    tid: u32,
 }
 impl GeneratedFile {
     /// The files are 0444, but the guest is root, which may open them for
@@ -962,6 +1059,28 @@ impl GeneratedFile {
             write_error: (flags & 3 != 0).then_some(error),
             entry,
             stat: None,
+            owner: None,
+            comm: None,
+        }
+    }
+    /// The same, owned by whom its inode's `owner` says when `fstat` asks.
+    pub(crate) fn with_owner(self, owner: Owner) -> Self {
+        Self {
+            owner: Some(owner),
+            ..self
+        }
+    }
+    /// `comm` of thread `tid` of process `pid`, of `group`: a write renames
+    /// that thread, as Linux's `comm_write`.
+    pub(crate) fn renaming(
+        self,
+        group: Arc<crate::threads::ThreadGroup>,
+        pid: u32,
+        tid: u32,
+    ) -> Self {
+        Self {
+            comm: Some(Comm { group, pid, tid }),
+            ..self
         }
     }
     /// The same, with the mode and owner of `stat`, the file it is
@@ -992,8 +1111,30 @@ impl FileHandle for GeneratedFile {
     }
     /// These files cannot be written: their error, or EBADF on a
     /// descriptor opened read-only.
-    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
-        Err(self.write_error.unwrap_or(Errno::EBADF))
+    /// `comm` opened for writing renames its thread as Linux's `comm_write`
+    /// does: to the first 15 bytes, up to a NUL, when the writer is of the
+    /// thread's process, `EINVAL` from any other and `ESRCH` once the thread
+    /// is gone; the whole count is taken.
+    fn write(&self, b: &[u8]) -> Result<usize, Errno> {
+        let error = self.write_error.ok_or(Errno::EBADF)?;
+        let Some(comm) = &self.comm else {
+            return Err(error);
+        };
+        if !comm.group.threads().iter().any(|&(tid, _)| tid == comm.tid) {
+            return Err(Errno(3)); // ESRCH
+        }
+        if WRITER.with(std::cell::Cell::get) != comm.pid {
+            return Err(Errno::EINVAL);
+        }
+        let mut name = [0; 16];
+        for (to, &from) in name
+            .iter_mut()
+            .zip(b.iter().take(15).take_while(|&&byte| byte != 0))
+        {
+            *to = from;
+        }
+        comm.group.rename(comm.tid, name);
+        Ok(b.len())
     }
     fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
         let mut position = self.position.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1011,13 +1152,17 @@ impl FileHandle for GeneratedFile {
         Ok(target as u64)
     }
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(match self.stat {
+        let stat = match self.stat {
             Some(file) => FileStat {
                 size: self.content.len() as u64,
                 ..file
             },
             None if self.entry => entry_stat(),
             None => stat(self.content.len()),
+        };
+        Ok(match &self.owner {
+            Some(owner) => owned(stat, owner),
+            None => stat,
         })
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
@@ -1199,8 +1344,8 @@ pub(crate) struct MapsFile {
     root: Vec<u8>,
     writable: bool,
     position: Mutex<MapsPosition>,
-    /// Its owner's user and group ([`Self::owned`]).
-    owner: (u32, u32),
+    /// Its inode's owner ([`Self::owned`]).
+    owner: Owner,
 }
 impl MapsFile {
     pub(crate) fn open(memory: MemoryView, start_stack: u64, flags: u32, root: Vec<u8>) -> Self {
@@ -1227,15 +1372,12 @@ impl MapsFile {
                 position: 0,
                 buffer: MAPS_BUFFER,
             }),
-            owner: (0, 0),
+            owner: Arc::default(),
         }
     }
-    /// The same, owned by `uid` and `gid`, as `fstat` shows it.
-    pub(crate) fn owned(self, (uid, gid): (u32, u32)) -> Self {
-        Self {
-            owner: (uid, gid),
-            ..self
-        }
+    /// The same, owned by whom its inode's `owner` says when `fstat` asks.
+    pub(crate) fn owned(self, owner: Owner) -> Self {
+        Self { owner, ..self }
     }
     /// The line of the VMA at `next` or after it, and where the next starts.
     fn take_line(&self, next: u64) -> Option<(Vec<u8>, u64)> {
@@ -1354,12 +1496,7 @@ impl FileHandle for MapsFile {
     }
     /// Size 0, as Linux's /proc: a reader goes by what `read` gives.
     fn stat(&self) -> Result<FileStat, Errno> {
-        let (uid, gid) = self.owner;
-        Ok(FileStat {
-            uid,
-            gid,
-            ..stat(0)
-        })
+        Ok(owned(stat(0), &self.owner))
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)
@@ -1387,11 +1524,11 @@ pub(crate) struct PagemapFile {
     memory: MemoryView,
     writable: bool,
     position: Mutex<u64>,
-    /// Its owner's user and group, as `fstat` shows them.
-    owner: (u32, u32),
+    /// Its inode's owner, as `fstat` shows it.
+    owner: Owner,
 }
 impl PagemapFile {
-    pub(crate) fn open(memory: MemoryView, flags: u32, owner: (u32, u32)) -> Self {
+    pub(crate) fn open(memory: MemoryView, flags: u32, owner: Owner) -> Self {
         Self {
             memory,
             writable: flags & 3 != 0,
@@ -1461,12 +1598,7 @@ impl FileHandle for PagemapFile {
     }
     /// Size 0 and only its owner may read it, as Linux's (0400).
     fn stat(&self) -> Result<FileStat, Errno> {
-        let (uid, gid) = self.owner;
-        Ok(FileStat {
-            uid,
-            gid,
-            ..private_stat(0)
-        })
+        Ok(owned(private_stat(0), &self.owner))
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)
@@ -1550,7 +1682,7 @@ mod tests {
         mem.read(GuestAddr(0x11000), &mut byte).unwrap();
         mem.write(GuestAddr(0x12000), b"x").unwrap();
         mem.guard(GuestAddr(0x13000), 0x14000, true).unwrap();
-        let file = PagemapFile::open(mem.view(), 0, (0, 0));
+        let file = PagemapFile::open(mem.view(), 0, Arc::default());
         assert_eq!(
             pagemap_entries(&file, at.0 - 0x1000, 7),
             [
@@ -1566,7 +1698,7 @@ mod tests {
         // `fork` shares the written page until either writes it.
         let child = mem.fork();
         assert_eq!(pagemap_entries(&file, 0x12000, 1), [SOFT_DIRTY | PRESENT]);
-        let theirs = PagemapFile::open(child.view(), 0, (0, 0));
+        let theirs = PagemapFile::open(child.view(), 0, Arc::default());
         assert_eq!(pagemap_entries(&theirs, 0x12000, 1), [SOFT_DIRTY | PRESENT]);
         child.write(GuestAddr(0x12000), b"y").unwrap();
         assert_eq!(
@@ -1578,7 +1710,7 @@ mod tests {
     #[test]
     fn pagemap_reads_whole_entries_up_to_the_end_of_user_space() {
         let mem = AddressSpace::new();
-        let file = PagemapFile::open(mem.view(), 0, (0, 0));
+        let file = PagemapFile::open(mem.view(), 0, Arc::default());
         let mut buf = [0xffu8; 16];
         assert_eq!(file.read_at(4, &mut buf[..8]), Err(Errno::EINVAL));
         assert_eq!(file.read_at(8, &mut buf[..12]), Err(Errno::EINVAL));
@@ -1825,6 +1957,38 @@ mod tests {
         assert_eq!(own_entry(b"/proc/8/status", 7), None);
         assert_eq!(own_entry(b"/proc/self/statm", 7), None);
         assert_eq!(own_entry(b"/proc/selfish", 7), None);
+    }
+    #[test]
+    fn dentries_name_a_file_of_a_process_or_thread() {
+        let at = |path: &[u8]| dentry(path, 7, 9);
+        assert_eq!(
+            at(b"/proc/self/status"),
+            Some((7, None, b"status".to_vec()))
+        );
+        assert_eq!(at(b"/proc/7/status"), at(b"/proc/self/status"));
+        assert_eq!(
+            at(b"/proc/thread-self/comm"),
+            Some((7, Some(9), b"comm".to_vec()))
+        );
+        assert_eq!(at(b"/proc/7/task/9/comm"), at(b"/proc/thread-self/comm"));
+        assert_eq!(at(b"/proc/8/fd/3"), Some((8, None, b"fd/3".to_vec())));
+        assert_eq!(at(b"/proc/8/"), Some((8, None, Vec::new())));
+        assert_eq!(at(b"/proc/loadavg"), None);
+        assert_eq!(at(b"/proc/0/status"), None);
+    }
+    #[test]
+    fn a_lookup_gives_the_open_files_inode_its_owner() {
+        let owners = Owners::default();
+        let key = || (8, None, b"status".to_vec());
+        let open = owners.lookup(key(), (1000, 1000));
+        // Another lookup of the path, after the task changed its IDs, while
+        // the file is open: the same inode, with the owner of that moment.
+        let again = owners.lookup(key(), (0, 0));
+        assert!(Arc::ptr_eq(&open, &again));
+        assert_eq!(*open.lock().unwrap(), (0, 0));
+        // Once no file holds it, a lookup makes a new one.
+        drop((open, again));
+        assert_eq!(*owners.lookup(key(), (5, 5)).lock().unwrap(), (5, 5));
     }
     #[test]
     fn limits_are_as_linux_writes_them() {

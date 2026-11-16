@@ -6531,11 +6531,20 @@ fn open_path(
         {
             return Err(Errno::EINVAL);
         }
+        // The inode an open file holds, whose owner each later lookup of
+        // its path gives it (`pid_revalidate`).
+        let owner = file_stat
+            .as_ref()
+            .and_then(|stat| proc_lookup(c, p, stat))
+            .unwrap_or_default();
         if let crate::proc::TaskEntry::Maps(smaps) = path.entry {
-            return Ok((tasks::maps(&task, smaps, flags, c.files.root()), p.to_vec()));
+            return Ok((
+                tasks::maps(&task, smaps, flags, c.files.root(), owner),
+                p.to_vec(),
+            ));
         }
         if path.entry == crate::proc::TaskEntry::Pagemap {
-            return Ok((tasks::pagemap(&task, flags)?, p.to_vec()));
+            return Ok((tasks::pagemap(&task, flags, owner)?, p.to_vec()));
         }
         // A link of `fd` opens its descriptor's file again, as this
         // process's own does.
@@ -6561,16 +6570,20 @@ fn open_path(
             let file = crate::proc::GeneratedFile::open(content, flags);
             return Ok((
                 Arc::new(match file_stat {
-                    Some(stat) => file.with_stat(stat),
+                    Some(stat) => file.with_stat(stat).with_owner(owner),
                     None => file,
                 }),
                 p.to_vec(),
             ));
         }
         if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
-            let file = crate::proc::GeneratedFile::open(content, flags);
+            let mut file = crate::proc::GeneratedFile::open(content, flags);
+            if path.entry == crate::proc::TaskEntry::Comm {
+                let (group, pid, tid) = tasks::comm(&task);
+                file = file.renaming(group, pid, tid);
+            }
             Arc::new(match file_stat {
-                Some(stat) => file.with_stat(stat),
+                Some(stat) => file.with_stat(stat).with_owner(owner),
                 None => file,
             })
         } else if let Some(target) = tasks::link(&task, path.entry) {
@@ -6589,7 +6602,23 @@ fn open_path(
             if flags & 3 != 0 {
                 return Err(Errno::EISDIR);
             }
-            Arc::new(crate::proc::OwnDirectory::new(stat))
+            let directory = crate::proc::OwnDirectory::new(stat);
+            // The process's or thread's directory and its `ns` take their
+            // owner at each `fstat` (`pid_getattr`); the others their
+            // inode's, as the files do.
+            Arc::new(match path.entry {
+                crate::proc::TaskEntry::Directory | crate::proc::TaskEntry::Namespaces => directory
+                    .owned_by(tasks::live_owner(
+                        c.processes,
+                        &task,
+                        path.entry == crate::proc::TaskEntry::Directory,
+                    )),
+                _ => directory.owned_by(Arc::new(move || {
+                    *owner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                })),
+            })
         }
     } else if let Some(entry) = crate::sysctl::entry(p) {
         crate::sysctl::open(c, entry, flags)?
@@ -6607,12 +6636,23 @@ fn open_path(
         ))
     } else if let Some(entry) = crate::proc::own_entry(p, c.process.pid) {
         own_open_check(c, p, flags)?;
+        // The inode an open file holds, whose owner each later lookup of
+        // its path gives it (`pid_revalidate`).
+        let stat = other_generated_stat(c, p, false).map(|(stat, ..)| stat);
+        let owner = stat
+            .as_ref()
+            .and_then(|stat| proc_lookup(c, p, stat))
+            .unwrap_or_default();
         if let Some(content) = own_file(c, entry) {
-            let stat = other_generated_stat(c, p, false).map(|(stat, ..)| stat);
-            let file = crate::proc::GeneratedFile::open(content, flags);
+            let mut file = crate::proc::GeneratedFile::open(content, flags);
+            if entry == crate::proc::OwnEntry::Comm
+                && let Some(view) = c.processes.view(c.process.pid)
+            {
+                file = file.renaming(view.group, c.process.pid, c.process.pid);
+            }
             return Ok((
                 Arc::new(match stat {
-                    Some(stat) => file.with_stat(stat),
+                    Some(stat) => file.with_stat(stat).with_owner(owner),
                     None => file,
                 }),
                 p.to_vec(),
@@ -6630,21 +6670,34 @@ fn open_path(
             crate::proc::OwnEntry::Directory if p == b"/proc/self" && flags & O_NOFOLLOW != 0 => {
                 return Err(Errno(40)); // ELOOP
             }
-            crate::proc::OwnEntry::Directory => Arc::new(crate::proc::OwnDirectory::new(own_stat(
-                c,
-                crate::proc::directory_stat(),
-            ))),
-            crate::proc::OwnEntry::Descriptors => Arc::new(crate::proc::OwnDirectory::new(
-                own_stat(c, crate::proc::descriptors_stat()),
-            )),
-            crate::proc::OwnEntry::DescriptorInfos => Arc::new(crate::proc::OwnDirectory::new(
-                own_stat(c, crate::proc::directory_stat()),
-            )),
+            // Its owner at each `fstat` (`pid_getattr`).
+            crate::proc::OwnEntry::Directory => Arc::new(
+                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::directory_stat()))
+                    .owned_by(tasks::own_live_owner(
+                        c.processes,
+                        c.process.pid,
+                        c.process.pid,
+                        true,
+                    )),
+            ),
+            crate::proc::OwnEntry::Descriptors => Arc::new(
+                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::descriptors_stat()))
+                    .owned_by(Arc::new(move || {
+                        *owner.lock().unwrap_or_else(PoisonError::into_inner)
+                    })),
+            ),
+            crate::proc::OwnEntry::DescriptorInfos => Arc::new(
+                crate::proc::OwnDirectory::new(own_stat(c, crate::proc::directory_stat()))
+                    .owned_by(Arc::new(move || {
+                        *owner.lock().unwrap_or_else(PoisonError::into_inner)
+                    })),
+            ),
             // Opened above while the descriptor is open.
             crate::proc::OwnEntry::DescriptorInfo(_) => return Err(Errno::ENOENT),
             crate::proc::OwnEntry::Status => Arc::new(
                 crate::proc::GeneratedFile::open(status(c), flags)
-                    .with_stat(own_stat(c, crate::proc::stat(0))),
+                    .with_stat(own_stat(c, crate::proc::stat(0)))
+                    .with_owner(owner),
             ),
             // Opened above.
             crate::proc::OwnEntry::Stat
@@ -6661,7 +6714,7 @@ fn open_path(
                     flags,
                     c.files.root(),
                 )
-                .owned(own_owner(c)),
+                .owned(owner),
             ),
             crate::proc::OwnEntry::Smaps => Arc::new(
                 crate::proc::MapsFile::open_as(
@@ -6671,13 +6724,11 @@ fn open_path(
                     c.files.root(),
                     true,
                 )
-                .owned(own_owner(c)),
+                .owned(owner),
             ),
-            crate::proc::OwnEntry::Pagemap => Arc::new(crate::proc::PagemapFile::open(
-                c.mem.view(),
-                flags,
-                own_owner(c),
-            )),
+            crate::proc::OwnEntry::Pagemap => {
+                Arc::new(crate::proc::PagemapFile::open(c.mem.view(), flags, owner))
+            }
             crate::proc::OwnEntry::Descriptor(n) => {
                 // A link for a descriptor that is not open is not there
                 // (ENOENT), whatever the flags. One that is, is a symbolic
@@ -7495,9 +7546,24 @@ fn generated_stat(
     // there, rather than whatever a mounted directory holds at the path.
     if let Some(task_path) = crate::proc::task_path(path, c.process.pid, c.tid) {
         let task = tasks::find(c, &task_path)?;
-        return tasks::stat(c, path, &task, task_path.entry, follow).map(Some);
+        let stat = tasks::stat(c, path, &task, task_path.entry, follow)?;
+        if tasks::link(&task, task_path.entry).is_none() {
+            proc_lookup(c, path, &stat.0);
+        }
+        return Ok(Some(stat));
     }
     known_stat(c, path, follow)
+}
+/// A lookup of `path` in a process's `/proc` directory, which gives its
+/// inode the owner `stat` has now ([`crate::proc::Owners`]): that inode,
+/// for a file of one.
+fn proc_lookup(c: &Context<'_>, path: &[u8], stat: &FileStat) -> Option<crate::proc::Owner> {
+    let dentry = crate::proc::dentry(path, c.process.pid, c.tid)?;
+    Some(
+        c.processes
+            .proc_owners()
+            .lookup(dentry, (stat.uid, stat.gid)),
+    )
 }
 /// [`generated_stat`] of the files that are always there. A name in
 /// `/dev/pts` that no slave has is `ENOENT`, as devpts holds no other.
@@ -7558,7 +7624,13 @@ fn own_owner(c: &Context<'_>) -> (u32, u32) {
 }
 /// `stat` owned by this process's files' owner ([`own_owner`]).
 fn own_stat(c: &Context<'_>, stat: FileStat) -> FileStat {
-    let (uid, gid) = own_owner(c);
+    // A directory any reader may read and look in is the process's
+    // whether or not it is dumpable (`task_dump_owner`).
+    let (uid, gid) = if stat.mode == tasks::OPEN_DIRECTORY {
+        (c.process.credentials.euid, c.process.credentials.egid)
+    } else {
+        own_owner(c)
+    };
     FileStat { uid, gid, ..stat }
 }
 /// The open of one of this process's regular files in `/proc` (`p`), as
@@ -7694,7 +7766,9 @@ fn other_generated_stat(
             crate::proc::link_stat(d.file.flags() & 3)
         }
     };
-    Some((own_stat(c, stat), device(c, path), SMALL_BLOCK_SIZE))
+    let stat = own_stat(c, stat);
+    proc_lookup(c, path, &stat);
+    Some((stat, device(c, path), SMALL_BLOCK_SIZE))
 }
 
 /// The names in this process's /proc directory.

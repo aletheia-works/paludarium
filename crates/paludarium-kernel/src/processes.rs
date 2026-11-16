@@ -209,6 +209,8 @@ pub struct Processes {
     file_owners: Mutex<crate::fasync::Owners>,
     /// The machine's byte-range locks (`fcntl`'s `F_SETLK` and OFD locks).
     locks: crate::record_locks::Locks,
+    /// The owners of the open files of the processes' `/proc` directories.
+    proc_owners: crate::proc::Owners,
     /// The machine's FIFOs, which every process opening one joins.
     fifos: Arc<crate::fifo::Fifos>,
     /// The machine's virtual CPUs, which threads with `rseq` run on.
@@ -251,6 +253,7 @@ impl Processes {
             changed: WaitToken::default(),
             file_owners: Mutex::default(),
             locks: crate::record_locks::Locks::default(),
+            proc_owners: crate::proc::Owners::default(),
             fifos: Arc::default(),
             cpus: Arc::default(),
             mqueue_charges: Arc::default(),
@@ -1069,6 +1072,9 @@ impl Processes {
             &mut self.entries.lock().unwrap_or_else(PoisonError::into_inner),
             pid,
         );
+    }
+    pub(crate) fn proc_owners(&self) -> &crate::proc::Owners {
+        &self.proc_owners
     }
     pub(crate) fn locks(&self) -> &crate::record_locks::Locks {
         &self.locks

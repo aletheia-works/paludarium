@@ -11,6 +11,9 @@ use paludarium_host::{DirectoryEntry, FileStat};
 use paludarium_types::Errno;
 
 const DT_DIR: u8 = 4;
+/// `S_IFDIR | S_IRUGO | S_IXUGO`, the mode of the directories whose owner
+/// `task_dump_owner` takes whether or not the task is dumpable.
+pub(super) const OPEN_DIRECTORY: u32 = 0o040_555;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
@@ -138,20 +141,16 @@ impl Task {
     }
     /// Its files' owner: the task's effective IDs, as Linux's
     /// `task_dump_owner` gives a dumpable task's, and root an undumpable
-    /// one's.
+    /// one's but for a directory any reader may read and look in (0555),
+    /// which is always the task's.
     pub(super) fn owned(&self, stat: FileStat) -> FileStat {
         let ids = &self.public.credentials;
-        let (uid, gid) = if self.view.dumpable {
+        let (uid, gid) = if self.view.dumpable || stat.mode == OPEN_DIRECTORY {
             (ids.euid, ids.egid)
         } else {
             (0, 0)
         };
         FileStat { uid, gid, ..stat }
-    }
-    /// Its files' owner's user and group ([`Self::owned`]).
-    pub(super) fn owner(&self) -> (u32, u32) {
-        let stat = self.owned(FileStat::default());
-        (stat.uid, stat.gid)
     }
     /// Whether the reader may see the task's memory and links, as Linux's
     /// `ptrace_may_access` in read mode decides: its own process, or what
@@ -364,15 +363,17 @@ pub(super) fn maps(
     smaps: bool,
     flags: u32,
     root: Vec<u8>,
+    owner: crate::proc::Owner,
 ) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
     match task.memory() {
         Some(memory) => std::sync::Arc::new(
             crate::proc::MapsFile::open_as(memory.clone(), task.start_stack(), flags, root, smaps)
-                .owned(task.owner()),
+                .owned(owner),
         ),
         None => std::sync::Arc::new(
             crate::proc::GeneratedFile::open(Vec::new(), flags)
-                .with_stat(task.owned(crate::proc::stat(0))),
+                .with_stat(crate::proc::stat(0))
+                .with_owner(owner),
         ),
     }
 }
@@ -381,13 +382,49 @@ pub(super) fn maps(
 pub(super) fn pagemap(
     task: &Task,
     flags: u32,
+    owner: crate::proc::Owner,
 ) -> Result<std::sync::Arc<dyn paludarium_host::FileHandle>, Errno> {
     let memory = task.memory().ok_or(Errno(3))?; // ESRCH
     Ok(std::sync::Arc::new(crate::proc::PagemapFile::open(
         memory.clone(),
         flags,
-        task.owner(),
+        owner,
     )))
+}
+/// Who owns, at each `fstat`, the task's directory, or its `ns` (`open`
+/// false), as Linux's `pid_getattr` asks `task_dump_owner` then: root once
+/// the task is gone.
+pub(super) fn live_owner(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    open: bool,
+) -> crate::proc::LiveOwner {
+    own_live_owner(processes, task.pid, task.tid, open)
+}
+/// [`live_owner`] of thread `tid` of process `pid`.
+pub(crate) fn own_live_owner(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    pid: u32,
+    tid: u32,
+    open: bool,
+) -> crate::proc::LiveOwner {
+    let processes = std::sync::Arc::clone(processes);
+    std::sync::Arc::new(move || {
+        let Some(view) = processes.view(pid) else {
+            return (0, 0);
+        };
+        let public = view.group.public(tid);
+        match public {
+            Some(public) if open || view.dumpable => {
+                (public.credentials.euid, public.credentials.egid)
+            }
+            _ => (0, 0),
+        }
+    })
+}
+/// The group of the task and the thread a write to its `comm` renames.
+pub(super) fn comm(task: &Task) -> (std::sync::Arc<crate::threads::ThreadGroup>, u32, u32) {
+    (std::sync::Arc::clone(&task.view.group), task.pid, task.tid)
 }
 
 /// Where `exe` or `cwd` leads: the program and the current directory, or

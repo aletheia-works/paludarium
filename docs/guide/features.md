@@ -2713,17 +2713,26 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `comm`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
-  `smaps`, `pagemap`, `fd`, `fdinfo`, `ns` and `task`. They and the directory are owned by the process's
+  `smaps`, `pagemap`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
-  gives them; `/proc/self` itself is root's. `stat` shows that owner and
-  the mode, 0400 for `environ`, `auxv` and `pagemap`, 0644 for `comm` and 0444 for the other files,
-  and `fstat` of an open one the owner it had when it was opened, where
-  Linux's is the owner of that moment. An open checks the mode for that owner, as Linux's
+  gives them; the directory, `task` and `fdinfo` (0555) are the process's
+  either way, and `/proc/self` itself is root's. `stat` shows that owner and
+  the mode, 0400 for `environ`, `auxv` and `pagemap`, 0644 for `comm` and 0444 for the other files.
+  `fstat` of an open file shows its owner as of the last lookup of its path
+  (an open, a `stat`, by any process), as Linux's inode, which each lookup
+  of the path an open file pins brings up to date (`pid_revalidate`); of
+  the open directory and its `ns`, the owner at that moment, as Linux's
+  `pid_getattr` asks it. An open checks the mode for that owner, as Linux's
   `generic_permission` does, so opening one for writing is `EACCES` without
   `CAP_DAC_OVERRIDE`, and so is reading `environ`, `auxv` or `pagemap` once the
-  process is not dumpable; a write to one opened for writing (root's, or
-  `comm` by its owner) is `EINVAL`.
+  process is not dumpable; a write to one opened for writing (root's) is
+  `EINVAL`, but to `comm`, which renames the thread as Linux's
+  `comm_write` does: to its first 15 bytes, up to a NUL, taking the whole
+  count, when the writer is of the thread's process (the thread takes
+  the name at its next system call; `/proc` shows it at once), `EINVAL`
+  from another process and `ESRCH` once the thread is gone. musl's
+  `pthread_setname_np` of another thread writes there.
   `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
@@ -2764,14 +2773,15 @@ kernel.
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
-  asks above; an undumpable process's directory is root's. Its files are
-  owned as this process's own are (above), and an open checks a regular
+  asks above. Its files are
+  owned as this process's own are (above), an undumpable process's
+  directory (0555) staying its own, and an open checks a regular
   file's mode for that owner before anything else, as Linux's
   `generic_permission` does (`EACCES`): writing needs `CAP_DAC_OVERRIDE`
   but for `comm`, `uid_map`, `gid_map` and `setgroups` (0644), and
   reading `environ`, `auxv` or `pagemap` needs the owner or
-  `CAP_DAC_OVERRIDE`. `fstat` of an opened one shows the owner it had
-  when it was opened. `statm` and `limits` are anyone's to read, as on Linux. `fd` itself is read
+  `CAP_DAC_OVERRIDE`. `fstat` of an opened one shows the owner as this
+  process's own do (above). `statm` and `limits` are anyone's to read, as on Linux. `fd` itself is read
   and looked in as its mode (0500) lets the reader, as Linux's
   `proc_fd_permission` decides. `fd` and `fdinfo` are as this process's own
   (below), of the other process's descriptors; a link of `fd` opens its

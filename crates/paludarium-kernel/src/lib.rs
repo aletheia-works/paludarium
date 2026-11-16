@@ -594,6 +594,7 @@ impl Kernel {
     ) -> Option<Next> {
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
+        proc::enter(thread.state.pid);
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number,
@@ -638,6 +639,7 @@ impl Kernel {
     ) -> Next {
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
+        proc::enter(thread.state.pid);
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number: 0,
@@ -761,6 +763,9 @@ impl Kernel {
         self.group.register(thread.tid, Arc::clone(&self.inbox));
         if let Some(status) = self.group.status() {
             return Next::Exit(status);
+        }
+        if let Some(name) = self.group.take_rename(thread.tid) {
+            thread.state.name = name;
         }
         self.publish(thread.tid, &thread.state, mem);
         // A write found no memory under the session's limit: the process
@@ -1354,6 +1359,12 @@ impl Kernel {
         };
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
+        proc::enter(thread.state.pid);
+        // A rename through `comm` comes before what the call does, as
+        // Linux's takes effect when it is written.
+        if let Some(name) = self.group.take_rename(thread.tid) {
+            thread.state.name = name;
+        }
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number,

@@ -342,6 +342,7 @@
     {"name":"proc-other-maps","binary":"process"},
     {"name":"proc-other-fds","binary":"process"},
     {"name":"proc-other-limits","binary":"process"},
+    {"name":"proc-other-pagemap","binary":"process"},
     {"name":"modify-ldt","binary":"process"},
     {"name":"port-access","binary":"process"},
     {"name":"timer-limits","binary":"process"},

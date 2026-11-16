@@ -2626,12 +2626,13 @@ kernel.
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them; `/proc/self` itself is root's. `stat` shows that owner and
-  the mode, 0400 for `environ`, `auxv` and `pagemap` and 0444 for the other files,
+  the mode, 0400 for `environ`, `auxv` and `pagemap`, 0644 for `comm` and 0444 for the other files,
   and `fstat` of an open one the owner it had when it was opened, where
   Linux's is the owner of that moment. An open checks the mode for that owner, as Linux's
   `generic_permission` does, so opening one for writing is `EACCES` without
   `CAP_DAC_OVERRIDE`, and so is reading `environ`, `auxv` or `pagemap` once the
-  process is not dumpable; root's write to one it opened is `EINVAL`.
+  process is not dumpable; a write to one opened for writing (root's, or
+  `comm` by its owner) is `EINVAL`.
   `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
@@ -2655,8 +2656,8 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`,
-  `comm`, `maps`, `smaps`, `exe`, `cwd`, `root`, `mounts`, `mountinfo`,
-  `fd`, `fdinfo`, `ns` (0511) and `task`, made as
+  `comm`, `maps`, `smaps`, `pagemap` (0400), `exe`, `cwd`, `root`, `mounts`,
+  `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
@@ -2667,12 +2668,18 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `exe`, `cwd`,
+  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `pagemap`, `exe`, `cwd`,
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
-  asks above; an undumpable process's directory is root's. `statm` and
-  `limits` are anyone's to read, as on Linux. `fd` itself is read
+  asks above; an undumpable process's directory is root's. Its files are
+  owned as this process's own are (above), and an open checks a regular
+  file's mode for that owner before anything else, as Linux's
+  `generic_permission` does (`EACCES`): writing needs `CAP_DAC_OVERRIDE`
+  but for `comm`, `uid_map`, `gid_map` and `setgroups` (0644), and
+  reading `environ`, `auxv` or `pagemap` needs the owner or
+  `CAP_DAC_OVERRIDE`. `fstat` of an opened one shows the owner it had
+  when it was opened. `statm` and `limits` are anyone's to read, as on Linux. `fd` itself is read
   and looked in as its mode (0500) lets the reader, as Linux's
   `proc_fd_permission` decides. `fd` and `fdinfo` are as this process's own
   (below), of the other process's descriptors; a link of `fd` opens its
@@ -2684,16 +2691,18 @@ kernel.
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
-  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
+  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is in a system call, where it waits
   if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
-  `maps` and `smaps` are empty, its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
-  `environ` and `auxv` do not open (`ESRCH`, for any reader), as Linux's
-  `__mem_open` refuses a process with no memory before it checks the
-  reader.
+  `maps` and `smaps` are empty, and open for any reader their mode lets,
+  as Linux's `proc_mem_open` checks the reader only of a process with
+  memory; its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
+  `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
+  their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
+  process with no memory before they check the reader.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0

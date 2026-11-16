@@ -10082,6 +10082,175 @@ static int proc_other_limits_case(void) {
     munmap(seen, 4 * POL_SIZE);
     return 0;
 }
+/* The proc-other-pagemap case: another process's pagemap, as Linux's
+   pagemap_open opens it for a reader that ptrace_may_access lets read the
+   process (PTRACE_MODE_READ_FSCREDS); the owner its opened files show; the
+   mode an open checks first (generic_permission); and a zombie's maps and
+   smaps, which open for anyone and read nothing, and its pagemap, which no
+   longer opens (ESRCH). */
+/* The entry of the page at `addr` in pagemap `path` without its frame
+   number, which only a reader with CAP_SYS_ADMIN sees on Linux: its flag
+   bits (55 to 63), or -errno. */
+static long long popm_flags(const char *path, const void *addr) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    unsigned long long entry = 0;
+    ssize_t n = pread(fd, &entry, sizeof entry, (off_t)((uintptr_t)addr / 4096 * 8));
+    int error = errno;
+    close(fd);
+    if (n < 0) return -error;
+    return n == sizeof entry ? (long long)(entry >> 55) : -1000 - n;
+}
+/* What `path` opened with `flags` gives: -errno, or its owner and mode as
+   fstat shows them, as `uid:mode`. */
+static void popm_open(const char *path, int flags, char *out, size_t size) {
+    int fd = open(path, flags);
+    if (fd < 0) {
+        snprintf(out, size, "%d", -errno);
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st)) snprintf(out, size, "fstat%d", -errno);
+    else snprintf(out, size, "%u:%o", (unsigned)st.st_uid, (unsigned)st.st_mode & 07777);
+    close(fd);
+}
+/* The length `path` reads, or -errno. */
+static long popm_length(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    char buffer[4096];
+    long total = 0, n;
+    while ((n = read(fd, buffer, sizeof buffer)) > 0) total += n;
+    int error = errno;
+    close(fd);
+    return n < 0 ? -error : total;
+}
+/* As user `uid`, which may not read the child: each of `names` in its
+   directory opened with `flags`. */
+static void popm_as(uid_t uid, pid_t kid, const char *const *names, int count, int flags) {
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        if (setresgid(uid, uid, uid) || setresuid(uid, uid, uid)) _exit(90);
+        printf("as %u%s:", (unsigned)uid, flags == O_WRONLY ? " writing" : "");
+        for (int i = 0; i < count; i++) {
+            char path[64], got[32];
+            snprintf(path, sizeof path, "/proc/%d/%s", (int)kid, names[i]);
+            popm_open(path, flags, got, sizeof got);
+            printf(" %s=%s", names[i], got);
+        }
+        printf("\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("reader=%d\n", reaped(reader));
+}
+static int proc_other_pagemap_case(void) {
+    /* Pages the child touches or leaves alone, at addresses this process
+       knows: one written, one only read, one never touched. */
+    char *pages = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long long *seen = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED || seen == MAP_FAILED) return 80;
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 81;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 82;
+    if (!kid) {
+        /* User 1000's, and dumpable again after the change of IDs, so its
+           files are user 1000's. */
+        char byte = 'r';
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000) || prctl(PR_SET_DUMPABLE, 1)) byte = 'u';
+        pages[0] = 1;
+        volatile char read_only = pages[4096];
+        (void)read_only;
+        for (int i = 0; i < 3; i++) seen[i] = popm_flags("/proc/self/pagemap", pages + i * 4096);
+        if (write(ready[1], &byte, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 83;
+    char path[64], got[32];
+    /* pagemap: what the child reads of itself, through each directory. */
+    printf("child=%c", byte);
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "/proc/%d/pagemap", (int)kid);
+        long long theirs = popm_flags(path, pages + i * 4096);
+        snprintf(path, sizeof path, "/proc/%d/task/%d/pagemap", (int)kid, (int)kid);
+        long long task = popm_flags(path, pages + i * 4096);
+        printf(" page%d=%llx same=%d task=%d", i, (unsigned long long)theirs, theirs == seen[i], task == theirs);
+    }
+    printf("\n");
+    /* This process's own, through thread-self and task/<tid>. */
+    pages[0] = 2;
+    long long own = popm_flags("/proc/self/pagemap", pages);
+    printf("own=%llx thread-self=%d", (unsigned long long)own, popm_flags("/proc/thread-self/pagemap", pages) == own);
+    snprintf(path, sizeof path, "/proc/self/task/%d/pagemap", (int)getpid());
+    printf(" task=%d\n", popm_flags(path, pages) == own);
+    /* The owner its files and their opened files show, and their modes. */
+    static const char *const names[] = {"pagemap", "maps", "smaps", "status", "environ", "statm", "auxv", "fdinfo/0"};
+    int count = (int)(sizeof names / sizeof *names);
+    printf("root:");
+    for (int i = 0; i < count; i++) {
+        struct stat st;
+        snprintf(path, sizeof path, "/proc/%d/%s", (int)kid, names[i]);
+        int r = stat(path, &st) ? -errno : 0;
+        popm_open(path, O_RDONLY, got, sizeof got);
+        printf(" %s=%s", names[i], got);
+        if (r) printf("[%d]", r);
+        else printf("[%u:%o]", (unsigned)st.st_uid, (unsigned)st.st_mode & 07777);
+    }
+    printf("\n");
+    /* Root may open them for writing (CAP_DAC_OVERRIDE); a write is then
+       EINVAL, as they have no write of their own. */
+    snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+    int fd = open(path, O_WRONLY);
+    int opened = fd >= 0 ? 0 : -errno;
+    long w = fd >= 0 ? write(fd, "x", 1) : 0;
+    int werror = errno;
+    if (fd >= 0) close(fd);
+    printf("root writing status=%d write=%ld/%d\n", opened, w, w < 0 ? werror : 0);
+    /* Its owner, another user, and a user that may not read it at all. */
+    static const char *const readable[] = {"pagemap", "maps", "status", "environ", "auxv", "fdinfo/0"};
+    static const char *const writable[] = {"status", "statm", "comm"};
+    popm_as(1000, kid, readable, 6, O_RDONLY);
+    popm_as(1000, kid, writable, 3, O_WRONLY);
+    popm_as(2000, kid, readable, 6, O_RDONLY);
+    popm_as(2000, kid, writable, 3, O_WRONLY);
+    /* Ended and not reaped: maps and smaps open for anyone the mode lets,
+       without the check of the reader, and read nothing; pagemap and environ
+       are ESRCH, after the mode's check (EACCES). */
+    if (write(done[1], "d", 1) != 1) return 84;
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    snprintf(path, sizeof path, "/proc/%d/pagemap", (int)kid);
+    printf("zombie pagemap=%ld", popm_length(path));
+    snprintf(path, sizeof path, "/proc/%d/task/%d/pagemap", (int)kid, (int)kid);
+    printf(" task=%ld\n", popm_length(path));
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        if (setresgid(2000, 2000, 2000) || setresuid(2000, 2000, 2000)) _exit(90);
+        snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
+        printf("zombie as 2000: maps=%ld", popm_length(path));
+        snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
+        printf(" smaps=%ld", popm_length(path));
+        snprintf(path, sizeof path, "/proc/%d/pagemap", (int)kid);
+        printf(" pagemap=%ld", popm_length(path));
+        snprintf(path, sizeof path, "/proc/%d/environ", (int)kid);
+        printf(" environ=%ld\n", popm_length(path));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("reader=%d", reaped(reader));
+    printf(" status=%d", reaped(kid));
+    snprintf(path, sizeof path, "/proc/%d/pagemap", (int)kid);
+    printf(" reaped=%ld\n", popm_length(path));
+    munmap(pages, 3 * 4096);
+    munmap(seen, 4096);
+    return 0;
+}
 /* The proc-other-fds case: another process's fd and fdinfo, as Linux's
    fs/proc/fd.c makes them: fd is 0500 and its owner's, its links read and
    lead to the descriptors' files for a reader that ptrace_may_access lets
@@ -27391,6 +27560,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();
     if (!strcmp(mode, "proc-other-limits")) return proc_other_limits_case();
+    if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

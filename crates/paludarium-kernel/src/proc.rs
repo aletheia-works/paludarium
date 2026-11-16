@@ -135,7 +135,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 23] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 22] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 23] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -155,6 +155,7 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 22] = [
     (b"mounts", 8),
     (b"mountinfo", 8),
     (b"smaps", 8),
+    (b"pagemap", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
@@ -183,6 +184,8 @@ pub(crate) enum TaskEntry {
     Root,
     /// `maps`, and `smaps` (true), of the task's address space.
     Maps(bool),
+    /// `pagemap`, the entry of each page of its address space.
+    Pagemap,
     /// `fd`, and one of its links by descriptor number.
     Descriptors,
     Descriptor(u32),
@@ -249,6 +252,7 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"root" => TaskEntry::Root,
         b"maps" => TaskEntry::Maps(false),
         b"smaps" => TaskEntry::Maps(true),
+        b"pagemap" => TaskEntry::Pagemap,
         b"mounts" => TaskEntry::Mounts(false),
         b"mountinfo" => TaskEntry::Mounts(true),
         b"ns" => TaskEntry::Namespaces,
@@ -1905,6 +1909,11 @@ mod tests {
         assert_eq!(
             path(b"/proc/7/task/9/smaps"),
             at(7, Some(9), TaskEntry::Maps(true))
+        );
+        assert_eq!(path(b"/proc/8/pagemap"), at(8, None, TaskEntry::Pagemap));
+        assert_eq!(
+            path(b"/proc/thread-self/pagemap"),
+            at(7, Some(9), TaskEntry::Pagemap)
         );
         // `auxv`, `limits` and `statm` of every task, the reader's own too.
         assert_eq!(path(b"/proc/8/statm"), at(8, None, TaskEntry::Statm));

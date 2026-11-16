@@ -62,9 +62,11 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
   `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
-- **`/proc/self/pagemap`, in part**: it is there for the reader itself
-  only (`/proc/self` and its own PID), not in `/proc/thread-self`,
-  `task/<tid>` or another process's directory. Its entries come from the
+- **Writing `comm`**: a write to `/proc/<pid>/comm` or
+  `/proc/<pid>/task/<tid>/comm` is `EINVAL`, where Linux renames the thread
+  when the writer is of its process (musl's `pthread_setname_np` of another
+  thread writes there; `prctl(PR_SET_NAME)` works).
+- **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do: a page that a `fork`
   shared is not exclusive (bit 56) until this process writes it, even
   after the other has let it go, and a page of shared memory or of a file

@@ -54,9 +54,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
   `ui`（提供しない `userfaultfd` のマイナーのモード）、`ht`、`dp`
   （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
-- **`/proc/self/pagemap` の一部**：読み手自身の分（`/proc/self` と自分の PID）だけで、
-  `/proc/thread-self`、`task/<tid>`、ほかのプロセスのディレクトリにはありません。
-  エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
+- **`comm` への書き込み**：`/proc/<pid>/comm` や `/proc/<pid>/task/<tid>/comm` への
+  書き込みは `EINVAL` です。Linux は、書き手がそのプロセスのものならスレッドの名前を
+  変えます（musl の `pthread_setname_np` はほかのスレッドの名前をここに書きます。
+  `prctl(PR_SET_NAME)` は使えます）。
+- **`/proc/<pid>/pagemap` の一部**：エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
   `fork` が共有したページは、相手が手放したあとも、このプロセスが書き込むまで
   ここだけのもの（ビット 56）になりません。共有メモリやファイルのページは、ほかに誰が
   マップしていてもここだけのものです。読み込んだプログラムのセグメントやファイルのプライベートな

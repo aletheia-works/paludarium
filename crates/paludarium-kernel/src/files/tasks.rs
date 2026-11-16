@@ -131,7 +131,7 @@ impl Task {
     /// Its files' owner: the task's effective IDs, as Linux's
     /// `task_dump_owner` gives a dumpable task's, and root an undumpable
     /// one's.
-    fn owned(&self, stat: FileStat) -> FileStat {
+    pub(super) fn owned(&self, stat: FileStat) -> FileStat {
         let ids = &self.public.credentials;
         let (uid, gid) = if self.view.dumpable {
             (ids.euid, ids.egid)
@@ -139,6 +139,11 @@ impl Task {
             (0, 0)
         };
         FileStat { uid, gid, ..stat }
+    }
+    /// Its files' owner's user and group ([`Self::owned`]).
+    pub(super) fn owner(&self) -> (u32, u32) {
+        let stat = self.owned(FileStat::default());
+        (stat.uid, stat.gid)
     }
     /// Whether the reader may see the task's memory and links, as Linux's
     /// `ptrace_may_access` in read mode decides: its own process, or what
@@ -155,15 +160,19 @@ impl Task {
 }
 
 /// Refuses what the reader may not see of the task: `environ`, `auxv`,
-/// `maps`, `smaps`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
+/// `maps`, `smaps`, `pagemap`, `exe`, `cwd`, the links of `ns` and `fd`, and `fdinfo`
 /// (`EACCES`), as Linux's `proc_mem_open`, `proc_fd_access_allowed`,
 /// `proc_ns_get_link` and `proc_fdinfo_permission` do; and `fd` itself,
-/// read or looked in, as its mode lets (`proc_fd_permission`). `environ`
-/// and `auxv` of a task with no memory left are `ESRCH` for anyone, as
-/// Linux's `__mem_open` refuses them before it checks the reader.
+/// read or looked in, as its mode lets (`proc_fd_permission`). `environ`,
+/// `auxv` and `pagemap` of a task with no memory left are `ESRCH` for
+/// anyone, as Linux's `__mem_open` and `pagemap_open` refuse them before
+/// they check the reader, while `maps` and `smaps` (`proc_maps_open`) then
+/// open for anyone and read nothing.
 pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<(), Errno> {
     match entry {
-        TaskEntry::Environ | TaskEntry::Auxv if task.memory().is_none() => Err(Errno(3)), // ESRCH
+        TaskEntry::Environ | TaskEntry::Auxv | TaskEntry::Pagemap if task.memory().is_none() => {
+            Err(Errno(3)) // ESRCH
+        }
         TaskEntry::Environ if !task.may_access(c, true) => Err(Errno::EACCES),
         TaskEntry::Auxv if !task.may_access(c, false) => Err(Errno::EACCES),
         TaskEntry::Descriptors => descriptors_permission(c, task, crate::permissions::MAY_READ),
@@ -178,11 +187,12 @@ pub(super) fn check(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Result<()
         TaskEntry::DescriptorInfos | TaskEntry::DescriptorInfo(_) if !task.may_access(c, false) => {
             Err(Errno::EACCES)
         }
-        TaskEntry::Maps(_)
-        | TaskEntry::Exe
-        | TaskEntry::Cwd
-        | TaskEntry::Root
-        | TaskEntry::Namespace(_)
+        // Without memory, `proc_mem_open` has no mm and checks nothing.
+        TaskEntry::Maps(_) if task.memory().is_some() && !task.may_access(c, false) => {
+            Err(Errno::EACCES)
+        }
+        TaskEntry::Pagemap if !task.may_access(c, false) => Err(Errno::EACCES),
+        TaskEntry::Exe | TaskEntry::Cwd | TaskEntry::Root | TaskEntry::Namespace(_)
             if !task.may_access(c, false) =>
         {
             Err(Errno::EACCES)
@@ -347,15 +357,28 @@ pub(super) fn maps(
     root: Vec<u8>,
 ) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
     match task.memory() {
-        Some(memory) => std::sync::Arc::new(crate::proc::MapsFile::open_as(
-            memory.clone(),
-            task.start_stack(),
-            flags,
-            root,
-            smaps,
-        )),
-        None => std::sync::Arc::new(crate::proc::GeneratedFile::open(Vec::new(), flags)),
+        Some(memory) => std::sync::Arc::new(
+            crate::proc::MapsFile::open_as(memory.clone(), task.start_stack(), flags, root, smaps)
+                .owned(task.owner()),
+        ),
+        None => std::sync::Arc::new(
+            crate::proc::GeneratedFile::open(Vec::new(), flags)
+                .with_stat(task.owned(crate::proc::stat(0))),
+        ),
     }
+}
+/// `pagemap` of the task, opened with `flags`: its pages' entries;
+/// `ESRCH` once it has no memory, as Linux's `pagemap_open`.
+pub(super) fn pagemap(
+    task: &Task,
+    flags: u32,
+) -> Result<std::sync::Arc<dyn paludarium_host::FileHandle>, Errno> {
+    let memory = task.memory().ok_or(Errno(3))?; // ESRCH
+    Ok(std::sync::Arc::new(crate::proc::PagemapFile::open(
+        memory.clone(),
+        flags,
+        task.owner(),
+    )))
 }
 
 /// Where `exe` or `cwd` leads: the program and the current directory, or
@@ -467,8 +490,10 @@ pub(super) fn stat(
         }
         // As Linux's, of size 0, as they are made as they are read.
         TaskEntry::Maps(_) => crate::proc::stat(0),
+        // 0400, as Linux's.
+        TaskEntry::Pagemap => crate::proc::private_stat(0),
         // 0644, which their owner may write.
-        TaskEntry::IdMap(_) | TaskEntry::Setgroups => {
+        TaskEntry::IdMap(_) | TaskEntry::Setgroups | TaskEntry::Comm => {
             let length = content(task, entry, &c.process.credentials.user).map_or(0, |c| c.len());
             FileStat {
                 mode: 0o100_644,

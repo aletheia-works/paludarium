@@ -2282,11 +2282,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `fd`、`fdinfo`、`ns`、`task` があります。これらとディレクトリの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。`/proc/self` そのものは root のものです。`stat` は
-  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、ほかのファイルは 0444）を示し、
+  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、`comm` は 0644、ほかのファイルは 0444）を示し、
   開いたものの `fstat` は開いたときの持ち主を示します。Linux はその時点の持ち主です。開くときは Linux の `generic_permission` と同じくその
   持ち主に対してモードを確かめるので、`CAP_DAC_OVERRIDE` なしに書き込み用に開くと
   `EACCES` で、ダンプできないプロセスが `environ`、`auxv`、`pagemap` を読むために開いても
-  `EACCES` です。root が開いたものへの書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  `EACCES` です。書き込み用に開いたもの（root のものや、持ち主が開いた `comm`）への書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を
@@ -2306,8 +2306,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`comm`、
-  `maps`、`smaps`、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、`ns`（0511）、
-  `task` があり、
+  `maps`、`smaps`、`pagemap`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
@@ -2317,12 +2317,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`pagemap`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
   同じです。ダンプできないプロセスの
-  ディレクトリの持ち主は root です。`statm` と `limits` は、Linux と同じく誰でも読めます。
+  ディレクトリの持ち主は root です。ファイルの持ち主はこのプロセス自身のもの（前述）と
+  同じで、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
+  ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
+  `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
+  `auxv`、`pagemap` を読むには持ち主か `CAP_DAC_OVERRIDE` が要ります。開いたものの `fstat` は、
+  開いたときの持ち主を示します。`statm` と `limits` は、Linux と同じく誰でも読めます。
   `fd` そのものを読むことと中を探すことは、Linux の
   `proc_fd_permission` と同じくそのモード（0500）が許す読み手だけができます。`fd` と
   `fdinfo` は、このプロセス自身のもの（後述）と同じものを、ほかのプロセスのディスクリプタに
@@ -2333,14 +2338,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルのマウントと、そのプロセスが持つレコードロックを示します。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
   ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
-  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
+  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`pagemap`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
   コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
   持ちません。Linux と同じく、`cmdline`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。
-  Linux の `__mem_open` は、読み手を確かめる前にメモリのないプロセスを断るので、
-  ゾンビの `environ` と `auxv` は、どの読み手にも開けません（`ESRCH`）。
+  Linux の `proc_mem_open` はメモリのあるプロセスについてだけ読み手を確かめるので、
+  ゾンビの `maps` と `smaps` は、モードが許すどの読み手も開けます。Linux の `__mem_open` と
+  `pagemap_open` は、読み手を確かめる前にメモリのないプロセスを断るので、ゾンビの
+  `environ`、`auxv`、`pagemap` は、モードが許すどの読み手にも開けません（`ESRCH`）。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、

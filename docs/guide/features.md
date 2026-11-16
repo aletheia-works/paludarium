@@ -952,18 +952,23 @@ kernel.
   `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_POISON` and
   `UFFD_FEATURE_MOVE`, and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
-  memory and shared anonymous memory for missing pages
+  memory, shared anonymous memory and the shared or private mappings of a
+  shmem file (a memfd, a tmpfs file; not System V shared memory, whose
+  VMAs Linux does not count as shmem's) for missing pages
   (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
   protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
   to the ioctls it reports), with Linux's checks in its order (the
   range, then each VMA: `EINVAL` for one that cannot be registered,
-  `EBUSY` for one another `userfaultfd` has); the modes replace a VMA's
+  `EPERM` for a shared one that may not write its file, `EBUSY` for one
+  another `userfaultfd` has); the modes replace a VMA's
   own unless it has them already. The ranges make VMAs of their own, as
   `/proc/<pid>/maps` shows them, with `um` and `uw` in `smaps`; a `fork`ed
   child and a mapping `mremap` moves do not keep it, and
   `UFFDIO_UNREGISTER` and closing the file take it away. An instruction
   that touches a page registered for missing pages that has none (in
-  shared memory, one no mapping of it has), or that writes to a
+  shmem, one its page cache does not have: no mapping of it brought the
+  page in and the file does not hold it, as written or allocated, and a
+  page past the file's end is SIGBUS first), or that writes to a
   write-protected page of a range registered for write protection, waits,
   and the file reads the fault as a `uffd_msg`, the oldest first: whether
   it was a write, `UFFD_PAGEFAULT_FLAG_WP` for a protected page, the page's
@@ -988,9 +993,13 @@ kernel.
   `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
   does: `ENOENT` for a range that does not lie in one registered VMA,
   `EEXIST` for a page that has one, `EFAULT` for a source that cannot be
-  read, and `EAGAIN` once one stops short, with what was filled in the
+  read or a page past a shmem file's end, and `EAGAIN` once one stops short, with what was filled in the
   struct's last field; `UFFDIO_COPY_MODE_WP` fills write-protected pages,
-  in a range registered for write protection (`EINVAL`). `UFFDIO_POISON`
+  in a range registered for write protection (`EINVAL`). A fill of a
+  shared mapping of a shmem file is `EEXIST` where the file's page cache
+  has the page, and puts the page in the file, which `read` then sees; one
+  of a private mapping gives the mapping a page of its own and leaves the
+  file as it was. `UFFDIO_POISON`
   (`UFFD_FEATURE_POISON`) poisons the pages of a registered range the same
   way, its only mode `DONTWAKE`, and is `EEXIST` for a page this mapping
   has, or a guard: an access to a poisoned page raises SIGBUS with

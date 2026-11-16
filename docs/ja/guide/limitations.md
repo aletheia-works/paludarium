@@ -562,14 +562,18 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
   メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
-  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE` も
+  受け付ける shmem（共有の anonymous メモリと、プライベートも含む shmem のファイルの
+  マッピング）の書き込み保護のモードも同じです。`UFFDIO_CONTINUE` も
   ありません（`EINVAL`）。`fork`、`mremap`、
   `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
   それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
   ioctl にも入りません。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
-  ページの保護を外します。Linux はその印を PTE に残します。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
-  登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
+  ページの保護を外します。Linux はその印を PTE に残します。ホストの tmpfs のファイルは
+  どのページも持っているものとして扱い、そのマッピングは待ちません。shmem のファイルの
+  プライベートなマッピングに `UFFDIO_ZEROPAGE` が入れるゼロページは、そのマッピング
+  自身のゼロのページで、`/proc/<pid>/pagemap` と `smaps` もそう数えます。Linux は
+  そのゼロページを対応付けます。登録した範囲のまだ
   ないページか、書き込み保護されたページへのシステムコール自身のコピーは、
   `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`UFFDIO_MOVE` の
   動かし元の穴は、ここでその周りの 2 MiB にどれも触れていなければ、Linux にそこの

@@ -856,16 +856,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で、
   `UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
-  メモリと共有の anonymous メモリを、ないページについて登録し
+  メモリ、共有の anonymous メモリ、shmem のファイル（memfd、tmpfs のファイル。Linux が
+  VMA を shmem のものと数えない System V の共有メモリは除きます）の共有または
+  プライベートなマッピングを、ないページについて登録し
   （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
   が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
-  ものは `EINVAL`、ほかの `userfaultfd` のものは `EBUSY`）、モードは、VMA がすでに
+  ものは `EINVAL`、ファイルに書き込めない共有のものは `EPERM`、ほかの `userfaultfd` の
+  ものは `EBUSY`）、モードは、VMA がすでに
   持っていなければその VMA のモードに置き換わります。登録した部分は
   `/proc/<pid>/maps` に見えるとおり VMA に分かれ、`smaps` に `um` と `uw` が
   つきます。`fork` した子と、`mremap` が動かしたマッピングには引き継がれず、
   `UFFDIO_UNREGISTER` とファイルを閉じることで外れます。ないページについて登録した
-  ページでまだないもの（共有メモリでは、どのマッピングにもないもの）に命令が触れるか、
+  ページでまだないもの（shmem では、そのページキャッシュにないもの。どのマッピングも
+  持ち込んでおらず、ファイルも書き込みや割り当てで持っていないページで、ファイルの
+  終わりより先のページは先に SIGBUS です）に命令が触れるか、
   書き込み保護について登録した範囲の保護されたページに書き込むと待ち、ファイルは
   そのフォールトを古い順に `uffd_msg` として読みます。書き込みかどうか、保護された
   ページなら `UFFD_PAGEFAULT_FLAG_WP`、ページのアドレス
@@ -886,9 +891,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書き込み保護のモードを置き換える登録で保護は外れます。`UFFDIO_COPY` と
   `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
   VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
-  `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
+  `EFAULT`、shmem のファイルの終わりより先のページも `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
   です。`UFFDIO_COPY_MODE_WP` は書き込み保護したページを埋め、範囲は書き込み保護に
-  ついて登録したものでなければなりません（`EINVAL`）。`UFFDIO_POISON`
+  ついて登録したものでなければなりません（`EINVAL`）。shmem のファイルの共有の
+  マッピングを埋めるときは、ファイルのページキャッシュにページがあれば `EEXIST` で、
+  ページはファイルに入り、`read` からも見えます。プライベートなマッピングを埋めると、
+  マッピングが自分のページを持ち、ファイルは変わりません。`UFFDIO_POISON`
   （`UFFD_FEATURE_POISON`）は、登録した範囲のページを同じやり方で poison にします。
   モードは `DONTWAKE` だけで、このマッピングにページかガードがあるところは `EEXIST`
   です。poison にしたページへのアクセスは、Linux の poison マーカーが

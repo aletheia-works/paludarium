@@ -543,8 +543,14 @@ impl FileCache {
         let end = offset.saturating_add(len);
         let mut page = vec![0; PAGE_SIZE as usize];
         let mut key = offset;
+        // A tmpfs file's hole stays out of the cache until a mapping
+        // touches it, as shmem's page cache has no folio there: a
+        // `userfaultfd` waits for it.
+        let shmem = charge.is_none() && file.file_system() == Some(paludarium_vfs::TMPFS_MAGIC);
         while key < end.min(size) {
-            if !self.pages.contains(key) {
+            if !self.pages.contains(key)
+                && (!shmem || file.cached_pages(key / PAGE_SIZE, key / PAGE_SIZE) > 0)
+            {
                 let n = file.read_at(key, &mut page)?;
                 self.pages.fill(key, &page[..n], self.meter.as_ref())?;
             }
@@ -715,6 +721,15 @@ impl paludarium_mmu::PageSource for FilePages {
     }
     fn secret(&self) -> bool {
         self.secret
+    }
+    /// A tmpfs file or a memfd that is not secret (Linux's `vma_is_shmem`).
+    fn shmem(&self) -> bool {
+        !self.secret && self.file.file_system() == Some(paludarium_vfs::TMPFS_MAGIC)
+    }
+    /// Whether tmpfs holds the page, as its page cache has a folio there.
+    fn holds(&self, offset: u64) -> bool {
+        let index = offset / PAGE_SIZE;
+        self.file.cached_pages(index, index) > 0
     }
     /// `secretmem_mmap_prepare` adds `VM_DONTDUMP`; secretmem's pseudo file
     /// system runs nothing.

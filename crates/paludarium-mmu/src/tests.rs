@@ -1056,3 +1056,124 @@ fn a_userfaultfd_move_moves_exclusive_pages_and_refuses_markers() {
     m.read(GuestAddr(dst + 3 * PAGE_SIZE), &mut bytes).unwrap();
     assert_eq!(&bytes, b"uv");
 }
+
+/// A shmem file of `size` bytes that holds the pages in `held`.
+struct Shmem {
+    size: u64,
+    held: Vec<u64>,
+    shmem: bool,
+}
+
+impl PageSource for Shmem {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let n = buf
+            .len()
+            .min(usize::try_from(self.size.saturating_sub(offset)).unwrap_or(0));
+        buf[..n].fill(b'f');
+        Ok(n)
+    }
+    fn size(&self) -> Option<u64> {
+        Some(self.size)
+    }
+    fn shmem(&self) -> bool {
+        self.shmem
+    }
+    fn holds(&self, offset: u64) -> bool {
+        self.held.contains(&(offset / PAGE_SIZE))
+    }
+}
+
+#[test]
+fn a_userfaultfd_registers_shmem_files_and_waits_for_their_holes() {
+    let file = |shmem| -> Arc<dyn PageSource> {
+        Arc::new(Shmem {
+            size: 2 * PAGE_SIZE,
+            held: vec![1],
+            shmem,
+        })
+    };
+    let m = AddressSpace::new();
+    let view = m.view();
+    let map = |source: &Arc<dyn PageSource>| {
+        let pages = SharedPages::new().with_source(Arc::clone(source));
+        let at = m
+            .map_shared(None, 3 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        m.share_pages(at, 3 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+            .unwrap();
+        (at.0, pages)
+    };
+    // A file that is not shmem's is not registered, nor shmem for write
+    // protection.
+    let (other, _) = map(&file(false));
+    assert_eq!(
+        view.userfault_register(other, other + PAGE_SIZE, 7, Userfault::MISSING),
+        Err(Errno::EINVAL)
+    );
+    let (at, pages) = map(&file(true));
+    assert_eq!(
+        view.userfault_register(at, at + PAGE_SIZE, 7, Userfault::WP),
+        Err(Errno::EINVAL)
+    );
+    view.userfault_register(at, at + 3 * PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    // A hole waits; a page the file holds does not, nor one past its end,
+    // which is a bus error.
+    assert_eq!(m.userfault_at(GuestAddr(at)), Some(7));
+    assert_eq!(m.userfault_at(GuestAddr(at + PAGE_SIZE)), None);
+    assert_eq!(m.userfault_at(GuestAddr(at + 2 * PAGE_SIZE)), None);
+    assert!(
+        m.read(GuestAddr(at + 2 * PAGE_SIZE), &mut [0])
+            .unwrap_err()
+            .bus
+    );
+    let bytes = [b'c'; PAGE_SIZE as usize];
+    let end = at + 3 * PAGE_SIZE;
+    assert_eq!(
+        view.userfault_fill(at, end, at + 2 * PAGE_SIZE, Some(&bytes), false),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(
+        view.userfault_poison(at, end, at + 2 * PAGE_SIZE),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(
+        view.userfault_fill(at, end, at + PAGE_SIZE, Some(&bytes), false),
+        Err(Errno::EEXIST)
+    );
+    // A fill of the hole is the file's, for write-back.
+    assert_eq!(
+        view.userfault_fill(at, end, at, Some(&bytes), false),
+        Ok(())
+    );
+    let mut written = Vec::new();
+    pages
+        .write_back(|key, page| {
+            written.push((key, page[0]));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(written, [(0, b'c')]);
+    // A private mapping's fill is its own: the cache keeps its hole.
+    let private_pages = SharedPages::new().with_source(file(true));
+    let private = m
+        .map_shared(None, 2 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.back_with_cache(private, 2 * PAGE_SIZE, &private_pages, 0)
+        .unwrap();
+    let private = private.0;
+    view.userfault_register(private, private + 2 * PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    assert_eq!(m.userfault_at(GuestAddr(private)), Some(7));
+    let end = private + 2 * PAGE_SIZE;
+    assert_eq!(
+        view.userfault_fill(private, end, private, None, false),
+        Ok(())
+    );
+    assert!(!private_pages.contains(0));
+    let mut b = [1];
+    m.read(GuestAddr(private + 3), &mut b).unwrap();
+    assert_eq!(b, [0]);
+    m.read(GuestAddr(private + PAGE_SIZE), &mut b).unwrap();
+    assert_eq!(b, *b"f");
+}

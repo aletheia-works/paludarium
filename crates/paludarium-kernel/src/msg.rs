@@ -284,12 +284,13 @@ impl Queue {
         self.senders = fit.into_iter().chain(rest).collect();
     }
     /// Tells every waiting receiver `error` (`expunge_all`), then wakes the
-    /// waiting senders, all of them for the queue's removal (`EIDRM`).
-    fn wake_all(&mut self, error: Errno) {
+    /// waiting senders, all of them for the queue's removal (`removed`), as
+    /// Linux's `freeque` and `msgctl_down` do.
+    fn wake_all(&mut self, error: Errno, removed: bool) {
         for receiver in self.receivers.drain(..) {
             receiver.slot.give(Err(error));
         }
-        self.wake_senders(error == EIDRM);
+        self.wake_senders(removed);
     }
 }
 
@@ -708,13 +709,13 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
                 queue.perm.update(&ds, &credentials.user)?;
                 queue.qbytes = qbytes;
                 queue.ctime = now;
-                queue.wake_all(Errno::EAGAIN);
+                queue.wake_all(Errno::EAGAIN, false);
                 return Ok(0);
             }
             if let Some(mut queue) = table.queues.remove(&ipc::index(id)) {
                 table.messages -= queue.messages.len() as u64;
                 table.bytes -= queue.bytes;
-                queue.wake_all(EIDRM);
+                queue.wake_all(EIDRM, true);
             }
             Ok(0)
         }
@@ -852,7 +853,7 @@ mod tests {
         );
         // None that takes it: it is queued.
         assert!(!queue.hand_over(&message(3), 6));
-        queue.wake_all(EIDRM);
+        queue.wake_all(EIDRM, true);
         assert_eq!(other.take(), Some(Err(EIDRM)));
     }
 
@@ -896,11 +897,11 @@ mod tests {
         assert_eq!(order(&queue), [1, 3, 0, 2]);
         // A full queue wakes none, and keeps the order.
         queue.bytes = 4;
-        queue.wake_all(Errno::EAGAIN);
+        queue.wake_all(Errno::EAGAIN, false);
         assert_eq!(woken(), [false; 4]);
         assert_eq!(order(&queue), [1, 3, 0, 2]);
         // The removal wakes them all, to find the queue gone.
-        queue.wake_all(EIDRM);
+        queue.wake_all(EIDRM, true);
         assert_eq!(woken(), [true; 4]);
         assert!(
             wakers

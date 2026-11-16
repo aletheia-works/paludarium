@@ -221,7 +221,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   比べていません。テストのマシンの Linux 7.0 は 144 バイトまでしか知らず、0 でないものには
   `E2BIG` を返します。`kernel.perf_event_paranoid` は
   最初 Linux の 2 です（Debian と Ubuntu のカーネルの既定はそれより大きい）。
-- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュだけです。プログラム
+- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュ、キュー、スタックだけです。プログラム
   （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
   （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
   `BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、Linux にあってここにない

@@ -254,8 +254,8 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays, hashes and LRU hashes and nothing
-  else.
+- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes, queues and
+  stacks and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
   links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
   programs, BTF and links (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`

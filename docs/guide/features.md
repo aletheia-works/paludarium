@@ -3467,8 +3467,18 @@ kernel.
   (`BPF_F_NO_PREALLOC` is `ENOTSUPP`), and with `BPF_F_NO_COMMON_LRU` keeps
   lists for each CPU (`max_entries` rounded up to a multiple of the CPUs,
   as many for each; with `BPF_F_NUMA_NODE` `EINVAL`). It takes the memory
-  of its elements alone, with no spares. See [limitations](./limitations)
-  for what is not there.
+  of its elements alone, with no spares. `BPF_MAP_TYPE_QUEUE` and
+  `BPF_MAP_TYPE_STACK` hold values without keys (`key_size` 0, and a key
+  pointer that is not null is `EINVAL`), as Linux's `queue_stack_maps.c`:
+  `UPDATE_ELEM` pushes (a full one is `E2BIG`, unless `BPF_EXIST` makes room
+  by giving up the oldest; `BPF_NOEXIST` is `EINVAL`), `LOOKUP_ELEM` peeks
+  and `LOOKUP_AND_DELETE_ELEM` pops, a queue its oldest value and a stack
+  its newest (`ENOENT` for none); `DELETE_ELEM` and `GET_NEXT_KEY` are
+  `EINVAL` and the batch commands `ENOTSUPP`. They need `CAP_BPF`, take
+  only `BPF_F_NUMA_NODE` and the access flags, and refuse a value past
+  4 MiB or `max_entries` times the value size past 32 bits (`E2BIG`, as
+  Linux master). One takes a 312-byte header and `max_entries + 1` value
+  slots. See [limitations](./limitations) for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

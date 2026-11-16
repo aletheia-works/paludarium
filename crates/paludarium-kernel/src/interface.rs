@@ -20,6 +20,7 @@
 //! then the default table's (253) where they have no answer. IPv6 looks in
 //! the local table, then the main one. The other tables are kept and shown,
 //! but no lookup reaches them.
+use crate::netdev::LOOPBACK_OIF;
 use crate::netlink::extack;
 use core::cmp::{Ordering, Reverse};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1899,7 +1900,7 @@ impl Addresses {
                     "Route with host scope can not have a gateway",
                 ));
             }
-            if ask.oif != 1 {
+            if ask.oif != LOOPBACK_OIF {
                 return Err(Errno::ENODEV);
             }
         } else if let Some(gateway) = ask.gateway {
@@ -1909,7 +1910,7 @@ impl Addresses {
                 Errno::EINVAL,
                 "Invalid flags for nexthop - PERVASIVE and ONLINK can not be set",
             ));
-        } else if ask.oif != 1 {
+        } else if ask.oif != LOOPBACK_OIF {
             return Err(Errno::ENODEV);
         } else if !up {
             return Err(extack::message(ENETDOWN, "Device for nexthop is not up"));
@@ -1936,7 +1937,7 @@ impl Addresses {
             if ask.scope >= SCOPE_LINK {
                 return Err(extack::message(Errno::EINVAL, "Nexthop has invalid scope"));
             }
-            if ask.oif != 1 {
+            if ask.oif != LOOPBACK_OIF {
                 return Err(extack::message(
                     Errno::ENODEV,
                     "Nexthop device required for onlink",
@@ -2013,7 +2014,7 @@ impl Addresses {
                     && (select.scope == SCOPE_NOWHERE || r.scope == select.scope)
                     && select.prefsrc.is_none_or(|s| r.prefsrc == Some(s))
                     && (select.proto == 0 || r.proto == select.proto)
-                    && (select.oif == 0 || (r.device && select.oif == 1))
+                    && (select.oif == 0 || (r.device && select.oif == LOOPBACK_OIF))
                     && select.gateway.is_none_or(|g| r.gateway == Some(g))
                     && select
                         .metrics
@@ -2047,7 +2048,7 @@ impl Addresses {
                 .filter(|k| *k != Kind::Broadcast)
                 .ok_or(EOPNOTSUPP)?,
         };
-        if ask.oif != 0 && ask.oif != 1 {
+        if ask.oif != 0 && ask.oif != LOOPBACK_OIF {
             return Err(Errno::ENODEV);
         }
         if kind.error().is_none() {
@@ -2103,7 +2104,7 @@ impl Addresses {
                     && r.len == ask.len
                     && (ask.metric == 0 || r.metric == ask.metric)
                     && (ask.proto == 0 || r.proto == ask.proto)
-                    && (ask.oif == 0 || ask.oif == 1)
+                    && (ask.oif == 0 || ask.oif == LOOPBACK_OIF)
             })
             .ok_or(ESRCH)?;
         Ok(vec![Event::DelRoute6(self.routes6.remove(at))])
@@ -2167,7 +2168,7 @@ impl Addresses {
                 if let Some(e) = r.kind.error() {
                     return Err(e);
                 }
-                if oif != 0 && !(r.device && oif == 1) {
+                if oif != 0 && !(r.device && oif == LOOPBACK_OIF) {
                     continue;
                 }
                 return Ok(*r);

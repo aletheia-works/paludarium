@@ -189,6 +189,12 @@ every test passing.
   commit, the separate runs and the shared run counted the same lines in
   every gate, and their missed lines differed only in a few lines that
   depend on thread timing.
+- The terminal gate runs the libraries' unit tests, not the harness's
+  differential tests. So that the system calls those check count there too,
+  some kernel unit tests (`crates/paludarium-kernel/src/replay_tests.rs`)
+  make a differential guest's calls in the same order and compare its lines
+  with what the guest printed on native Linux 7.0. The differential tests
+  still compare the whole guests with Linux on every run.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)

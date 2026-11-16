@@ -54,9 +54,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
   `ui`（提供しない `userfaultfd` のマイナーのモード）、`ht`、`dp`
   （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
-- **`/proc/self/pagemap` の一部**：読み手自身の分（`/proc/self` と自分の PID）だけで、
-  `/proc/thread-self`、`task/<tid>`、ほかのプロセスのディレクトリにはありません。
-  エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
+- **`comm` への書き込み**：`/proc/<pid>/comm` や `/proc/<pid>/task/<tid>/comm` への
+  書き込みは `EINVAL` です。Linux は、書き手がそのプロセスのものならスレッドの名前を
+  変えます（musl の `pthread_setname_np` はほかのスレッドの名前をここに書きます。
+  `prctl(PR_SET_NAME)` は使えます）。
+- **`/proc/<pid>/pagemap` の一部**：エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
   `fork` が共有したページは、相手が手放したあとも、このプロセスが書き込むまで
   ここだけのもの（ビット 56）になりません。共有メモリやファイルのページは、ほかに誰が
   マップしていてもここだけのものです。読み込んだプログラムのセグメントやファイルのプライベートな
@@ -197,15 +199,19 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `MODIFY_ATTRIBUTES` は、何もしないか `ENOTTY` です。`remove_on_exec` は、タスクの
   `execve` でイベントを無効にし、読めるまま残します。Linux はタスクのコンテキストから
   取り除きます。それが率いたグループのメンバーは、それぞれで数え続けます。`execve` を待つ
-  イベントは、エミュレートするすべてのマシンで一つの一覧に置き、スレッドグループとスレッドで
-  照合して、閉じたときに除きます。グループのメンバーは、どのソフトウェアのクロックでも
+  イベントと、それぞれのスレッドが開いたイベントは、エミュレートするマシンごとに置き、
+  スレッドグループとスレッドで照合して、閉じたときに除きます。`execve` なしで終わった
+  スレッドは開いたイベントを持ったままで（Linux はそのスレッドから外します）、番号が一巡した
+  あと、そのグループで同じ番号の新しいスレッドがそれを見つけます。グループのメンバーは、
+  どのソフトウェアのクロックでも
   数えます。Linux は、テストを動かす x86-64 のマシンで、`task-clock` のグループの
-  `cpu-clock` のメンバーに数を与えませんでした（理由は分かっていません）。Linux master の構造体の SIMD
-  レジスタのフィールドは確かめず、使うと `EOPNOTSUPP` です。`kernel.perf_event_paranoid` は
+  `cpu-clock` のメンバーに数を与えませんでした（理由は分かっていません）。Linux master の
+  176 バイトの構造体の SIMD レジスタのフィールドは、master と同じく確かめますが、Linux とは
+  比べていません。テストのマシンの Linux 7.0 は 144 バイトまでしか知らず、0 でないものには
+  `E2BIG` を返します。`kernel.perf_event_paranoid` は
   いつも 2 で（Debian と Ubuntu のカーネルの既定はそれより大きい）、その
   `/proc/sys/kernel` のファイルには書けません（モード 0444。Linux のファイルは 0644 で、
-  root が書けます）。`prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と
-  `ENABLE` もありません。
+  root が書けます）。
 - **BPF はマップだけ**：`bpf` が作るのは配列とハッシュだけです。プログラム
   （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
   （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
@@ -218,12 +224,21 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   値が使いうる CPU ごとに一つあり、テストのマシンとエミュレータで CPU の数え方が違うので、
   どのみち Linux と比べられません。ハッシュはキーをバイトの順に返します。Linux の順は
   バケットとランダムなシードで決まります。そのバッチは要素一つずつをバケットとして扱うので、
-  `in_batch` と `out_batch` は要素を数えます。マップのメモリは Linux master ではなく
-  Linux 7.0 の構造体の大きさに従います（master のハッシュの要素はもっと小さい）。要素は書き込む
+  `in_batch` と `out_batch` は要素を数えます。マップのメモリは、上流の Linux
+  ではなく、テストのマシンのカーネル（Ubuntu の Linux 7.0）の構造体の大きさに従います。その
+  `struct bpf_map` には、Ubuntu が Linux 7.2 から取り込んだ `u32 excl`（0fb6c9ed6493。7.3 で
+  削除）があるので、配列のヘッダーは 312 バイトで、上流の v7.0 の 304 バイトより大きくなります。
+  Linux master の配列のヘッダーも別のフィールドで 312 バイトですが、ハッシュのヘッダー
+  （832 バイト）と要素は、ここの 896 バイトと 48 バイトより小さくなります。要素は書き込む
   までマシンから取らず、メモリの cgroup にも課金しません。`ENOMEM` になるのはマシンの
   4 GiB より大きいマップだけで、Linux は実際にあるメモリが尽きても `ENOMEM` を返すことが
   あります。事前に確保するハッシュは、ホストの CPU ごとに予備の要素を数えます。Linux が
-  数えるのは使いうる CPU で、それより多いことがあります。マップの ID はエミュレートする
+  数えるのは使いうる CPU で、それより多いことがあります。確かめ方は、テストのマシンの
+  Linux 7.0 と違うところでは
+  Linux master に従います。キーと値が 4 MiB から 64 バイト引いた大きさ以上のハッシュは `E2BIG`
+  です（7.0 は 4 MiB から 48 バイト引いた大きさまで受け付けます）。`BPF_F_RDONLY` と
+  `BPF_F_WRONLY` の両方は、マップを作ったあとで断ります（7.0 は NUMA ノードと型より前に断るので、
+  ここでは別のエラーが先に来ることがあります）。マップの ID はエミュレートする
   マシンのものなので、1 から始まり、ホストのマップは見えません。`BPF_F_MMAPABLE` は
   受け付けますが、マップの `mmap` は `ENODEV`、マップの SHA-256
   （`bpf_map_info.hash`）は `EINVAL` です。
@@ -364,10 +379,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     Linux は `ESTALE` を返します。`PIDFD_THREAD` の pidfd の inode はプロセス全体のものです。
     `O_EXCL` を付けてハンドルから開いた pidfd には、CI の Linux 7.0 と同じく `PIDFD_THREAD`
     が残りません。Linux 7.2 以降は残します。
-  - System V IPC には、`/proc/sys/kernel` の `shm_rmid_forced`、`auto_msgmni`、
-    `shm_next_id`、`sem_next_id`、`msg_next_id` がありません。`IPCMNI` は、起動
-    オプション `ipcmni_extend` がないときと同じく、いつも 32768 です。`/proc/sysvipc` は開いたときのオブジェクトを
-    見せます。Linux は読み進めたところで、そのオブジェクトをその都度読みます。
+  - System V IPC の `IPCMNI` は、起動オプション `ipcmni_extend` がないときと同じく、
+    いつも 32768 です。`*_next_id` が求める ID は、その添字から 32768 未満がすべて
+    使われていれば `ENOSPC` です。Linux はその先の添字を与えます。設定した
+    `shm_rmid_forced` を読んでも孤児は消えません。Linux は書いたときと同じく消します。
+    `/proc/sysvipc` は開いたときのオブジェクトを見せます。Linux は読み進めたところで、
+    そのオブジェクトをその都度読みます。
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
     並びません。そこでは `open`、`stat`、`access`、`getdents`、`unlink`、`rmdir`、`statfs`、
@@ -394,8 +411,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     たびに書く者を確かめ直します。また、サイズとして値の長さを示します。Linux は 0 です。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
-  - `ptrace` には、まだシングルステップがありません。`PTRACE_SINGLESTEP`、
-    `PTRACE_SYSEMU_SINGLESTEP` と、機能の一覧にないほかの要求は `EIO` を返します。
+  - `ptrace` の、機能の一覧にない要求は `EIO` を返します。
     `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
     ほかは `EINVAL` です。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
     ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
@@ -687,12 +703,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   始まってからのものです。Linux はすべての名前空間のものを数えます。表そのものの
   パラメーターの参照は 1 です。
   機能のページに挙げていないオプションは `ENOPROTOOPT` です。
-  ほかの名前空間のデバイスがないので、Linux の `peernet2id_alloc` のように ID を
-  ひとりでに与えることはなく、`RTM_NEWNSID` だけが与えます。なくなる名前空間の
+  名前空間の ID を与えるのは `RTM_NEWNSID` だけです。Linux の `peernet2id_alloc` が
+  ひとりでに ID を与えるのは、知らせる名前空間とは別の名前空間にあるもの（デバイスの
+  リンクの先やそこへ移るデバイス、キューのリース、devlink のインスタンス、PSP の
+  デバイス、ovpn のピア、openvswitch の vport）についてだけで、ここにはそのどれもなく、
+  `lo` は移せません。なくなる名前空間の
   `RTM_DELNSID` は、最後に持っていたものが手放したときに送ります。Linux は
-  ワークキューから少し遅れて送ります。ほかの名前空間のリンクやアドレスはダンプしないので、
-  `IFLA_TARGET_NETNSID` と `IFA_TARGET_NETNSID` は、名前空間が持つ ID でも
-  `EINVAL` です。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、
+  ワークキューから少し遅れて送ります。リンクのメッセージの統計は 0 です。その `IFLA_AF_SPEC` は、
   `CONFIG_MCTP` を組み込んだ Ubuntu のカーネルと同じく MCTP の設定を載せます。
   組み込んでいないカーネルは載せず、`AF_MCTP` のアドレスと経路のダンプを扱う処理も
   ないので、それらのダンプには IPv4 と IPv6 のアドレスと経路を返し、MCTP のアドレスも

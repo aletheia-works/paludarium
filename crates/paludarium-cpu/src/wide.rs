@@ -141,6 +141,157 @@ fn compare_long(a: &Long, b: &Long) -> Ordering {
     a.iter().rev().cmp(b.iter().rev())
 }
 
+/// Half of a value, rounded down.
+fn halve(value: Long) -> Long {
+    let mut out = [0; 8];
+    for at in 0..8 {
+        let high = if at < 7 { value[at + 1] << 63 } else { 0 };
+        out[at] = value[at] >> 1 | high;
+    }
+    out
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How often divide_long has given the divisor back, which its tests
+    /// check that they make it do.
+    static GIVEN_BACK: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// The 32-bit digits of a value, lowest first.
+fn digits(value: &Long) -> [u32; 16] {
+    let mut out = [0; 16];
+    for (at, &limb) in value.iter().enumerate() {
+        out[at * 2] = limb as u32;
+        out[at * 2 + 1] = (limb >> 32) as u32;
+    }
+    out
+}
+
+fn from_digits(digits: &[u32]) -> Long {
+    let mut out = [0; 8];
+    for (at, &digit) in digits.iter().enumerate().take(16) {
+        out[at / 2] |= u64::from(digit) << (at % 2 * 32);
+    }
+    out
+}
+
+/// `dividend / divisor` and whether anything is left over, exactly, for a
+/// divisor that is not zero. Long division by 32-bit digits, each guessed
+/// from the top two of what is left and the divisor's top one, then
+/// corrected (Knuth's algorithm D): what comes out is the same whole quotient
+/// as dividing bit by bit gives, only in far fewer steps.
+fn divide_long(dividend: &Long, divisor: &Long) -> (Long, bool) {
+    let divisor_digits = digits(divisor);
+    let length = divisor_digits
+        .iter()
+        .rposition(|&d| d != 0)
+        .map_or(0, |at| at + 1);
+    let mut rest = [0u32; 17];
+    rest[..16].copy_from_slice(&digits(dividend));
+    if length == 1 {
+        let d = u64::from(divisor_digits[0]);
+        let mut quotient = [0u32; 16];
+        let mut carry = 0u64;
+        for at in (0..16).rev() {
+            let part = carry << 32 | u64::from(rest[at]);
+            quotient[at] = (part / d) as u32;
+            carry = part % d;
+        }
+        return (from_digits(&quotient), carry != 0);
+    }
+    // Shift both so that the divisor's top digit has its top bit set, which
+    // keeps every guess at most two above the digit it stands for.
+    let shift = divisor_digits[length - 1].leading_zeros();
+    let shifted = |digits: &[u32], into: &mut [u32]| {
+        for at in (0..into.len()).rev() {
+            let high = u64::from(digits.get(at).copied().unwrap_or(0)) << shift;
+            let low = if at > 0 && shift != 0 {
+                u64::from(digits[at - 1]) >> (32 - shift)
+            } else {
+                0
+            };
+            into[at] = (high | low) as u32;
+        }
+    };
+    let mut v = [0u32; 16];
+    shifted(&divisor_digits[..length], &mut v[..length]);
+    let mut u = [0u32; 17];
+    shifted(&rest[..16], &mut u);
+    let (top, next) = (u64::from(v[length - 1]), u64::from(v[length - 2]));
+    let mut quotient = [0u32; 16];
+    for j in (0..=16 - length).rev() {
+        let pair = u64::from(u[j + length]) << 32 | u64::from(u[j + length - 1]);
+        let (mut guess, mut remainder) = (pair / top, pair % top);
+        while guess >> 32 != 0 || guess * next > (remainder << 32 | u64::from(u[j + length - 2])) {
+            guess -= 1;
+            remainder += top;
+            if remainder >> 32 != 0 {
+                break;
+            }
+        }
+        // Take guess * v away, digit by digit.
+        let mut borrow = 0i64;
+        let mut carry = 0u64;
+        for at in 0..length {
+            let product = guess * u64::from(v[at]) + carry;
+            carry = product >> 32;
+            let difference = i64::from(u[j + at]) - borrow - (product & 0xffff_ffff) as i64;
+            u[j + at] = difference as u32;
+            borrow = i64::from(difference < 0);
+        }
+        let difference = i64::from(u[j + length]) - borrow - carry as i64;
+        u[j + length] = difference as u32;
+        if difference < 0 {
+            // The guess was one too many: give v back.
+            #[cfg(test)]
+            GIVEN_BACK.with(|count| count.set(count.get() + 1));
+            guess -= 1;
+            let mut carry = 0u64;
+            for at in 0..length {
+                let sum = u64::from(u[j + at]) + u64::from(v[at]) + carry;
+                u[j + at] = sum as u32;
+                carry = sum >> 32;
+            }
+            u[j + length] = u[j + length].wrapping_add(carry as u32);
+        }
+        quotient[j] = guess as u32;
+    }
+    (from_digits(&quotient), u.iter().any(|&d| d != 0))
+}
+
+/// The whole part of the square root of a radicand of 511 or 512 bits, with
+/// its lowest bit set if that is not all of it. Newton's steps from above
+/// never go below the whole part and stop where they no longer go down; the
+/// root of the top 128 bits, plus one, is above it to start with.
+fn root_long(radicand: &Long) -> Long {
+    let top = u128::from(radicand[7]) << 64 | u128::from(radicand[6]);
+    let start = top.isqrt() + 1;
+    let mut root = [0u64; 8];
+    root[3] = start as u64;
+    root[4] = (start >> 64) as u64;
+    loop {
+        let (quotient, _) = divide_long(radicand, &root);
+        let next = halve(add_long(&root, &quotient));
+        if compare_long(&next, &root) != Ordering::Less {
+            break;
+        }
+        root = next;
+    }
+    let mut square = [0u64; 8];
+    for i in 0..LIMBS {
+        let mut carry = 0u128;
+        for j in 0..LIMBS {
+            let sum = u128::from(root[i]) * u128::from(root[j]) + u128::from(square[i + j]) + carry;
+            square[i + j] = sum as u64;
+            carry = sum >> 64;
+        }
+        square[i + LIMBS] = carry as u64;
+    }
+    root[0] |= u64::from(square != *radicand);
+    root
+}
+
 impl Wide {
     /// `value * 2^power`, rounded to odd into 256 bits.
     fn from_long(negative: bool, value: Long, power: i32) -> Wide {
@@ -255,19 +406,9 @@ impl Wide {
         if self.zero() {
             return Wide { negative, ..ZERO };
         }
-        // 512 bits over 256, by bits: a quotient of 256 or 257 bits.
-        let dividend = shift_left(self.long(), 256);
-        let divisor = other.long();
-        let (mut quotient, mut rest) = ([0u64; 8], [0u64; 8]);
-        for bit in (0..512).rev() {
-            rest = shift_left(rest, 1);
-            rest[0] |= dividend[bit / 64] >> (bit % 64) & 1;
-            if compare_long(&rest, &divisor) != Ordering::Less {
-                rest = subtract_long(&rest, &divisor);
-                quotient[bit / 64] |= 1 << (bit % 64);
-            }
-        }
-        quotient[0] |= u64::from(rest != [0; 8]);
+        // 512 bits over 256: a quotient of 256 or 257 bits.
+        let (mut quotient, rest) = divide_long(&shift_left(self.long(), 256), &other.long());
+        quotient[0] |= u64::from(rest);
         Wide::from_long(negative, quotient, self.power - 256 - other.power)
     }
     /// Divided by a small whole number, which is not zero.
@@ -297,20 +438,7 @@ impl Wide {
         } else {
             (shift_left(self.long(), 255), self.power - 255)
         };
-        let (mut root, mut rest) = ([0u64; 8], [0u64; 8]);
-        for pair in (0..256).rev() {
-            rest = shift_left(rest, 2);
-            rest[0] |= radicand[pair * 2 / 64] >> (pair * 2 % 64) & 3;
-            let mut trial = shift_left(root, 2);
-            trial[0] |= 1;
-            root = shift_left(root, 1);
-            if compare_long(&rest, &trial) != Ordering::Less {
-                rest = subtract_long(&rest, &trial);
-                root[0] |= 1;
-            }
-        }
-        root[0] |= u64::from(rest != [0; 8]);
-        Wide::from_long(false, root, power / 2)
+        Wide::from_long(false, root_long(&radicand), power / 2)
     }
     /// Its top 128 bits, the lowest of them set if any bit below is, and what
     /// they are multiplied by as a power of two: what the 80-bit rounding
@@ -468,5 +596,190 @@ mod tests {
         let (sine, cosine) = sine_cosine(Wide::new(false, 3, -2));
         assert!(close(sine.multiply(sine).add(cosine.multiply(cosine)), ONE));
         assert_eq!(top(sine), 0xae7f_e0b5_fc78_6b2d);
+    }
+
+    /// The slow ways, by bits, which the fast ones must agree with exactly.
+    fn divide_by_bits(dividend: &Long, divisor: &Long) -> (Long, bool) {
+        let (mut quotient, mut rest) = ([0u64; 8], [0u64; 8]);
+        for bit in (0..512).rev() {
+            rest = shift_left(rest, 1);
+            rest[0] |= dividend[bit / 64] >> (bit % 64) & 1;
+            if compare_long(&rest, divisor) != Ordering::Less {
+                rest = subtract_long(&rest, divisor);
+                quotient[bit / 64] |= 1 << (bit % 64);
+            }
+        }
+        (quotient, rest != [0; 8])
+    }
+    fn root_by_bits(radicand: &Long) -> (Long, bool) {
+        let (mut root, mut rest) = ([0u64; 8], [0u64; 8]);
+        for pair in (0..256).rev() {
+            rest = shift_left(rest, 2);
+            rest[0] |= radicand[pair * 2 / 64] >> (pair * 2 % 64) & 3;
+            let mut trial = shift_left(root, 2);
+            trial[0] |= 1;
+            root = shift_left(root, 1);
+            if compare_long(&rest, &trial) != Ordering::Less {
+                rest = subtract_long(&rest, &trial);
+                root[0] |= 1;
+            }
+        }
+        (root, rest != [0; 8])
+    }
+
+    #[test]
+    fn long_division_and_roots_agree_with_doing_them_by_bits() {
+        // A guess one too many even after its correction, so that the
+        // divisor is given back: found by search, and placed higher by whole
+        // digits, which keeps it so.
+        let dividend = from_digits(&[0x7fff_ffff, 0, 0, 0xffff_ffff, 0x7fff_ffff]);
+        let divisor = from_digits(&[0xffff_ffff, 0x8000_0000, 1, 0x8000_0001]);
+        for shift in [0, 32, 96, 352] {
+            let dividend = shift_left(dividend, shift);
+            GIVEN_BACK.with(|count| count.set(0));
+            assert_eq!(
+                divide_long(&dividend, &divisor),
+                divide_by_bits(&dividend, &divisor)
+            );
+            assert_ne!(GIVEN_BACK.with(core::cell::Cell::get), 0, "given back");
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in 0..3000 {
+            let mut dividend = [0u64; 8];
+            let mut divisor = [0u64; 8];
+            for limb in &mut dividend {
+                *limb = next();
+            }
+            // Divisors of every length, with runs of ones and zeros, as
+            // the steps meet them, and the edges where a guess is corrected.
+            let length = 1 + n % 8;
+            for limb in &mut divisor[..length] {
+                *limb = match next() % 4 {
+                    0 => u64::MAX,
+                    1 => 0,
+                    _ => next(),
+                };
+            }
+            if divisor[length - 1] == 0 {
+                divisor[length - 1] = 1 << (next() % 64);
+            }
+            if n % 5 == 0 {
+                dividend[..].copy_from_slice(&shift_left(divisor, (next() % 200) as u32));
+                dividend[0] = dividend[0].wrapping_sub(n as u64 % 3);
+            }
+            if n % 7 == 0 {
+                divisor[length - 1] |= 1 << 63;
+            }
+            assert_eq!(
+                divide_long(&dividend, &divisor),
+                divide_by_bits(&dividend, &divisor),
+                "{dividend:x?} / {divisor:x?}"
+            );
+            // A radicand of 511 or 512 bits, as square_root makes.
+            let mut radicand = dividend;
+            radicand[7] |= 1 << 62;
+            if n % 2 == 0 {
+                radicand[7] |= 1 << 63;
+            }
+            if n % 11 == 0 {
+                // A square, and one either side of it.
+                let mut root = [0u64; 8];
+                root[..4].copy_from_slice(&radicand[4..]);
+                let mut square = [0u64; 8];
+                for i in 0..4 {
+                    let mut carry = 0u128;
+                    for j in 0..4 {
+                        let sum = u128::from(root[i]) * u128::from(root[j])
+                            + u128::from(square[i + j])
+                            + carry;
+                        square[i + j] = sum as u64;
+                        carry = sum >> 64;
+                    }
+                    square[i + 4] = carry as u64;
+                }
+                if square[7] >> 62 != 0 {
+                    radicand = square;
+                    radicand[0] = radicand[0].wrapping_add(n as u64 % 3).wrapping_sub(1);
+                }
+            }
+            let (root, rest) = root_by_bits(&radicand);
+            let mut by_bits = root;
+            by_bits[0] |= u64::from(rest);
+            assert_eq!(root_long(&radicand), by_bits, "sqrt {radicand:x?}");
+        }
+    }
+
+    /// How long each step and each instruction's work takes, printed rather
+    /// than checked: `cargo test --release -p paludarium-cpu -- --ignored
+    /// --nocapture wide::tests::timing`.
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let time = |label: &str, work: &dyn Fn() -> Wide| {
+            let mut runs = 1u32;
+            loop {
+                let start = Instant::now();
+                for _ in 0..runs {
+                    black_box(work());
+                }
+                let spent = start.elapsed();
+                if spent.as_millis() >= 200 {
+                    let each = spent.as_nanos() / u128::from(runs);
+                    println!("{label:>22}: {each:>8} ns");
+                    return;
+                }
+                runs *= 2;
+            }
+        };
+        let a = black_box(Wide::new(
+            false,
+            0xb504_f333_f9de_6484_5979_1234_5678_9abd,
+            -128,
+        ));
+        let b = black_box(Wide::new(
+            false,
+            0xc90f_daa2_2168_c234_c4c6_628b_80dc_1cd1,
+            -129,
+        ));
+        time("multiply", &|| a.multiply(b));
+        time("add", &|| a.add(b));
+        time("divide", &|| a.divide(b));
+        let small = black_box(9_702);
+        time("divide_small", &|| a.divide_small(small));
+        time("square_root", &|| a.square_root());
+        // What each instruction works out, as x87.rs asks for it.
+        let r = black_box(Wide::new(
+            false,
+            0xa2f9_836e_4e44_1529_fc27_57d1_f534_ddc1,
+            -128,
+        ));
+        time("fsin, fcos (series)", &|| sine_cosine(r).0);
+        time("fptan", &|| {
+            let (sine, cosine) = sine_cosine(r);
+            sine.divide(cosine)
+        });
+        time("f2xm1", &|| exponential_minus_one(r.multiply(LN_2)));
+        let x = black_box(Wide::new(
+            false,
+            0xd413_cccf_e779_9211_65f6_26cd_d52a_fa7d,
+            -128,
+        ));
+        time("fyl2x", &|| {
+            let s = x.subtract(ONE).divide(x.add(ONE));
+            double_inverse_tanh(s).multiply(LOG2_E).multiply(b)
+        });
+        time("fyl2xp1", &|| {
+            let s = r.scale(-3).divide(r.scale(-3).add(ONE.scale(1)));
+            double_inverse_tanh(s).multiply(LOG2_E).multiply(b)
+        });
+        time("fpatan", &|| inverse_tangent(r.divide(a)));
     }
 }

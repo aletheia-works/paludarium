@@ -1,7 +1,8 @@
 /* perf_event_open, compared with Linux: the order of its checks and their
    errors, and the software events the emulator counts (task-clock,
    cpu-clock and the dummy event) with read, the read formats, groups, the
-   ENABLE, DISABLE, RESET and ID ioctls, and enable_on_exec.
+   ENABLE, DISABLE, RESET and ID ioctls, enable_on_exec, and prctl's
+   PR_TASK_PERF_EVENTS_DISABLE and ENABLE of the events a thread opened.
 
    Counts and times are given as whether they are 0, grew or stayed,
    never as values, and IDs as whether they match. Hardware events are not
@@ -17,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -386,11 +388,47 @@ static int case_exec(const char *self) {
     return 0;
 }
 
+#define TASK_PERF_EVENTS_DISABLE 31
+#define TASK_PERF_EVENTS_ENABLE 32
+
+/* PR_TASK_PERF_EVENTS_DISABLE and ENABLE: every event this thread opened,
+   one opened disabled too, whatever its other arguments; a child's own
+   prctl leaves its parent's events alone. */
+static int case_prctl(void) {
+    struct attr a = software(1);
+    int on = (int)open_event(&a, 0, -1, -1, 0);
+    a.flags |= DISABLED;
+    int off = (int)open_event(&a, 0, -1, -1, 0);
+    spin();
+    say("disable %ld", TRY(prctl(TASK_PERF_EVENTS_DISABLE, 0, 0, 0, 0)));
+    uint64_t was_on = count(on), was_off = count(off);
+    spin();
+    say("disabled: on stayed %d off stayed %d at 0 %d", count(on) == was_on, count(off) == was_off, was_off == 0);
+    say("enable with other arguments %ld", TRY(prctl(TASK_PERF_EVENTS_ENABLE, 1, 2, 3, 4)));
+    spin();
+    say("enabled: on grew %d off grew %d", count(on) > was_on, count(off) > was_off);
+
+    pid_t child = fork();
+    if (child == 0) {
+        prctl(TASK_PERF_EVENTS_DISABLE, 0, 0, 0, 0);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    was_on = count(on);
+    spin();
+    say("after a child's disable: on grew %d status %d", count(on) > was_on, status);
+    close(on);
+    close(off);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
     if (!strcmp(mode, "perf-calls")) return case_calls();
     if (!strcmp(mode, "perf-counts")) return case_counts();
+    if (!strcmp(mode, "perf-prctl")) return case_prctl();
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {
         spin();

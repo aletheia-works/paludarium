@@ -133,7 +133,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -148,9 +148,9 @@ mod linux {
             // user namespace with its capabilities (Ubuntu's AppArmor gives none
             // to one an unprivileged user makes) before it becomes one,
             // the personality-layout case, which maps page 0, the
-            // proc-other-maps, proc-other-fds and proc-other-limits cases,
-            // which read a process's maps, descriptors and auxv as another
-            // user, and the pagemap and proc-owners cases, which become an
+            // proc-other-maps, proc-other-fds, proc-other-limits and
+            // proc-other-pagemap cases, which read a process's maps,
+            // descriptors, auxv and pagemap as other users, and the pagemap and proc-owners cases, which become an
             // unprivileged user, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
@@ -170,6 +170,7 @@ mod linux {
                     | "proc-other-maps"
                     | "proc-other-fds"
                     | "proc-other-limits"
+                    | "proc-other-pagemap"
                     | "dynamic-exec"
                     | "pty-vhangup"
                     | "pid-namespace"
@@ -212,6 +213,7 @@ mod linux {
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
+                    | "perf-prctl"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -260,6 +262,7 @@ mod linux {
                     | "netlink-listen-all-nsid"
                     | "netlink-nsid-gone"
                     | "netlink-nsid-write"
+                    | "netlink-target-netnsid"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
@@ -357,6 +360,7 @@ mod linux {
                     | "cpu-timer-others"
                     | "perf-counts"
                     | "perf-exec"
+                    | "perf-prctl"
             ) {
                 host.measure_cpu_time();
             }
@@ -437,6 +441,7 @@ mod linux {
         netlink_listen_all_nsid => ("netlink-listen-all-nsid","netlink-options"),
         netlink_nsid_gone => ("netlink-nsid-gone","netlink-options"),
         netlink_nsid_write => ("netlink-nsid-write","netlink-options"),
+        netlink_target_netnsid => ("netlink-target-netnsid","netlink-options"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
@@ -501,6 +506,7 @@ mod linux {
         perf_calls => ("perf-calls","perf"),
         perf_counts => ("perf-counts","perf"),
         perf_exec => ("perf-exec","perf"),
+        perf_prctl => ("perf-prctl","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -577,6 +583,11 @@ mod linux {
         ptrace_arch_rseq => ("ptrace-arch-rseq","ptrace-requests"),
         ptrace_syscall_signal => ("ptrace-syscall-signal","ptrace-requests"),
         ptrace_exit_core => ("ptrace-exit-core","ptrace-requests"),
+        trap_flag => ("trap-flag","single-step"),
+        trap_flag_syscall => ("trap-flag-syscall","single-step"),
+        trap_flag_signal => ("trap-flag-signal","single-step"),
+        int3 => ("int3","single-step"),
+        ptrace_singlestep => ("ptrace-singlestep","single-step"),
         processes_pgid_exec => ("pgid-exec","process"),
         processes_priority => ("priority","process"),
         processes_sysinfo => ("sysinfo","process"),
@@ -712,6 +723,7 @@ mod linux {
         processes_kernel_info => ("kernel-info","process"),
         processes_admin => ("admin","process"),
         processes_pidfd_getfd => ("pidfd-getfd","process"),
+        processes_pidfd_fdinfo => ("pidfd-fdinfo","process"),
         processes_cpu_clock_ids => ("cpu-clock-ids","process"),
         processes_alarm_clocks => ("alarm-clocks","process"),
         processes_yama => ("yama","process"),
@@ -731,6 +743,7 @@ mod linux {
         processes_proc_other_maps => ("proc-other-maps","process"),
         processes_proc_other_fds => ("proc-other-fds","process"),
         processes_proc_other_limits => ("proc-other-limits","process"),
+        processes_proc_other_pagemap => ("proc-other-pagemap","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),

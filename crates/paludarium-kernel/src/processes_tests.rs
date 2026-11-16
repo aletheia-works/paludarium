@@ -3,6 +3,8 @@ use super::*;
 use paludarium_mmu::{MappingKind, Prot};
 use paludarium_types::{Errno, GuestAddr, PAGE_SIZE};
 const DATA: u64 = 0x600000;
+#[path = "replay_tests.rs"]
+mod replay;
 mod fd {
     use super::*;
     #[test]
@@ -4495,6 +4497,48 @@ mod shm {
             0
         );
         assert_eq!(m.read_u64(GuestAddr(DS + 88)).unwrap(), 100);
+        // auto_msgmni reads 0 and takes 0 or 1 to no effect.
+        assert_eq!(read(&mut k, &mut t, &m, "auto_msgmni"), "0\n");
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "auto_msgmni", b"1"), 1);
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "auto_msgmni", b"2"),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "auto_msgmni"), "0\n");
+        // A next ID is taken once, from 0.
+        assert_eq!(read(&mut k, &mut t, &m, "msg_next_id"), "-1\n");
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "msg_next_id", b"-1"),
+            e(Errno::EINVAL)
+        );
+        write_kernel(&mut k, &mut t, &m, "msgmni", b"10");
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "msg_next_id", b"65541"), 5);
+        assert_eq!(read(&mut k, &mut t, &m, "msg_next_id"), "65541\n");
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 68, [0, 0o600, 0, 0, 0, 0]),
+            65541
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "msg_next_id"), "-1\n");
+        // shm_rmid_forced: a segment goes at its last detach.
+        assert_eq!(read(&mut k, &mut t, &m, "shm_rmid_forced"), "0\n");
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "shm_rmid_forced", b"2"),
+            e(Errno::EINVAL)
+        );
+        let kept = shmget(&mut k, &mut t, &m, 0, 1, 0o600);
+        let gone = shmget(&mut k, &mut t, &m, 0, 1, 0o600);
+        assert_eq!(write_kernel(&mut k, &mut t, &m, "shm_rmid_forced", b"1"), 1);
+        let a = shmat(&mut k, &mut t, &m, gone, 0, 0);
+        assert_eq!(syscall(&mut k, &mut t, &m, 67, [a, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [gone, IPC_STAT, DS, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        // One its maker, still running, never attached stays.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [kept, IPC_STAT, DS, 0, 0, 0]),
+            0
+        );
         // A new IPC namespace has Linux's defaults again.
         assert_eq!(
             syscall(&mut k, &mut t, &m, 272, [0x0800_0000, 0, 0, 0, 0, 0]),

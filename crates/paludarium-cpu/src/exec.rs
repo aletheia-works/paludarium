@@ -29,6 +29,11 @@ pub(crate) enum Stop {
     MathFault(u8),
     /// `syscall` executed; the state already points past it.
     Syscall,
+    /// `int3` executed (#BP, a trap); the state points past it.
+    Breakpoint,
+    /// The instruction set the trap flag, so that the next one runs
+    /// single-stepped; the state already points past it.
+    TrapFlagSet,
 }
 
 impl From<Fault> for Stop {
@@ -2176,6 +2181,12 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
             let writable = flag::USER_WRITABLE & size_mask(i.implicit_size);
             let keep = x.s.rflags & !writable;
             x.s.rflags = keep | (v & writable) | flag::RESERVED1;
+            // The instructions after it trap one by one: the run ends here
+            // for the caller to step them ([`crate::step_traced`]).
+            if x.s.rflags & flag::TF != 0 {
+                x.s.rip = next;
+                return Err(Stop::TrapFlagSet);
+            }
         }
         Mnemonic::Call => {
             let t = x.branch_target()?;
@@ -2254,6 +2265,10 @@ pub(crate) fn execute(s: &mut CpuState, mem: &AddressSpace, i: &Instruction) -> 
             return Err(Stop::Syscall);
         }
         Mnemonic::Hlt => return Err(Stop::Halt),
+        Mnemonic::Int3 => {
+            x.s.rip = next;
+            return Err(Stop::Breakpoint);
+        }
         Mnemonic::Cld => x.s.set_flag(flag::DF, false),
         Mnemonic::Std => x.s.set_flag(flag::DF, true),
         m @ (Mnemonic::Movsb

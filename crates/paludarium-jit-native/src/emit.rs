@@ -18,12 +18,14 @@ use paludarium_cpu::flag;
 use paludarium_decoder::{Condition, Register, Segment};
 
 /// Words of the register block the code runs on: the general registers,
-/// then RFLAGS, RIP, and the FS and GS bases (read only).
+/// then RFLAGS, RIP, the FS and GS bases (read only), and the xmm
+/// registers, each as its low word and its high word.
 pub(crate) const RFLAGS: usize = 16;
 pub(crate) const RIP: usize = 17;
 pub(crate) const FS_BASE: usize = 18;
 pub(crate) const GS_BASE: usize = 19;
-pub(crate) const WORDS: usize = 20;
+pub(crate) const XMM: usize = 20;
+pub(crate) const WORDS: usize = XMM + 32;
 
 /// What a helper reports: the access was made, it failed (nothing was
 /// done), or it was made and the code generation changed.
@@ -38,6 +40,11 @@ pub(crate) struct Helpers {
     pub load: u64,
     /// `(context, address, size, value) -> status`.
     pub store: u64,
+    /// `(context, address, to) -> status`: 16 bytes into the two words at
+    /// `to`, which it leaves alone when it fails.
+    pub load128: u64,
+    /// `(context, address, from) -> status`: the two words at `from`.
+    pub store128: u64,
 }
 
 const I64: Type = types::I64;
@@ -63,6 +70,9 @@ struct Emitter<'a, 'b> {
     helpers: Helpers,
     load_sig: cranelift_codegen::ir::SigRef,
     store_sig: cranelift_codegen::ir::SigRef,
+    move128_sig: cranelift_codegen::ir::SigRef,
+    /// Whether the code reaches the xmm words of the register block.
+    vector: bool,
 }
 
 impl Emitter<'_, '_> {
@@ -106,6 +116,7 @@ impl Emitter<'_, '_> {
     }
 
     fn word(&mut self, word: usize) -> Value {
+        self.vector |= word >= XMM;
         self.b.ins().load(
             I64,
             MemFlagsData::trusted(),
@@ -115,6 +126,7 @@ impl Emitter<'_, '_> {
     }
 
     fn set_word(&mut self, word: usize, v: Value) {
+        self.vector |= word >= XMM;
         self.b.ins().store(
             MemFlagsData::trusted(),
             v,
@@ -263,6 +275,41 @@ impl Emitter<'_, '_> {
             callee,
             &[self.context, address, size, value],
         );
+        self.b.inst_results(call)[0]
+    }
+
+    /// The address of xmm register `n` in the register block.
+    fn xmm_slot(&mut self, n: u8) -> Value {
+        self.vector = true;
+        let offset = ((XMM + 2 * usize::from(n & 15)) * 8) as i64;
+        self.b.ins().iadd_imm_s(self.registers, offset)
+    }
+
+    /// Moves 16 bytes between `address` and xmm register `n` with
+    /// `helper` (`load128` or `store128`); leaves at `rip` before it when
+    /// `aligned` and the address is not a multiple of 16.
+    fn move128(
+        &mut self,
+        helper: u64,
+        address: Value,
+        n: u8,
+        aligned: bool,
+        count: usize,
+        rip: u64,
+    ) -> Value {
+        if aligned {
+            let low = self.b.ins().band_imm_s(address, 15);
+            let off = self.b.ins().icmp_imm_s(IntCC::NotEqual, low, 0);
+            let wide = self.b.ins().uextend(I64, off);
+            // FAILED is 1: a misaligned address fails as the helper would.
+            self.unless_failed(wide, count, rip);
+        }
+        let slot = self.xmm_slot(n);
+        let callee = self.constant(helper as i64);
+        let call =
+            self.b
+                .ins()
+                .call_indirect(self.move128_sig, callee, &[self.context, address, slot]);
         self.b.inst_results(call)[0]
     }
 
@@ -735,6 +782,47 @@ impl Emitter<'_, '_> {
                 }
                 self.set_carry_overflow(overflow);
             }
+            Fast::XmmMove { dst, src } => {
+                let low = self.word(XMM + 2 * usize::from(src));
+                let high = self.word(XMM + 2 * usize::from(src) + 1);
+                self.set_word(XMM + 2 * usize::from(dst), low);
+                self.set_word(XMM + 2 * usize::from(dst) + 1, high);
+            }
+            Fast::XmmLoad { dst, mem, aligned } => {
+                let address = self.linear(&mem);
+                let status = self.move128(self.helpers.load128, address, dst, aligned, n, rip);
+                self.unless_failed(status, n, rip);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::XmmStore { mem, src, aligned } => {
+                let address = self.linear(&mem);
+                let status = self.move128(self.helpers.store128, address, src, aligned, n, rip);
+                self.unless_failed(status, n, rip);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::XmmXor { dst, src } => {
+                for half in 0..2 {
+                    let a = self.word(XMM + 2 * usize::from(dst) + half);
+                    let b = self.word(XMM + 2 * usize::from(src) + half);
+                    let v = self.b.ins().bxor(a, b);
+                    self.set_word(XMM + 2 * usize::from(dst) + half, v);
+                }
+            }
+            Fast::MoveScalar { dst, src, size } => {
+                let v = match src {
+                    Register::Xmm(n) => self.word(XMM + 2 * usize::from(n & 15)),
+                    r => self.read(r),
+                };
+                let v = self.masked(v, size);
+                match dst {
+                    Register::Xmm(n) => {
+                        let zero = self.constant(0);
+                        self.set_word(XMM + 2 * usize::from(n & 15), v);
+                        self.set_word(XMM + 2 * usize::from(n & 15) + 1, zero);
+                    }
+                    r => self.write(r, v),
+                }
+            }
             Fast::Imul { dst, a, b } => {
                 let size = dst.size();
                 let a = self.read(a);
@@ -969,12 +1057,14 @@ pub(crate) fn block_signature() -> Signature {
     sig
 }
 
-/// The function that runs `forms`.
+/// The function that runs `forms`, and whether it reaches the xmm words
+/// of the register block: the block it is given has [`WORDS`] words then,
+/// and [`XMM`] otherwise.
 pub(crate) fn function(
     forms: &[Form],
     helpers: Helpers,
     config: cranelift_codegen::isa::TargetFrontendConfig,
-) -> Function {
+) -> (Function, bool) {
     let mut func = Function::with_name_signature(UserFuncName::user(0, 0), block_signature());
     let mut context = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(&mut func, &mut context);
@@ -987,6 +1077,10 @@ pub(crate) fn function(
     store_sig.params.extend([AbiParam::new(I64); 4]);
     store_sig.returns.push(AbiParam::new(I64));
     let store_sig = b.import_signature(store_sig);
+    let mut move128_sig = Signature::new(CallConv::SystemV);
+    move128_sig.params.extend([AbiParam::new(I64); 3]);
+    move128_sig.returns.push(AbiParam::new(I64));
+    let move128_sig = b.import_signature(move128_sig);
 
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
@@ -1010,6 +1104,8 @@ pub(crate) fn function(
         helpers,
         load_sig,
         store_sig,
+        move128_sig,
+        vector: false,
     };
     let mut open = true;
     for (n, form) in forms.iter().enumerate() {
@@ -1022,10 +1118,11 @@ pub(crate) fn function(
         e.leave_at(forms.len(), last.next);
     }
 
+    let vector = e.vector;
     b.switch_to_block(exit);
     b.ins().store(flags, rip, registers, (RIP * 8) as i32);
     b.ins().return_(&[count]);
     b.seal_all_blocks();
     b.finalize(config);
-    func
+    (func, vector)
 }

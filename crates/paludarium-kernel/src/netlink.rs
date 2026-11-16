@@ -264,7 +264,7 @@ const IFLA_TAILROOM: u16 = 69;
 /// What a link dump takes besides `IFLA_EXT_MASK`: a master to show the
 /// devices of, a kind (whose devices `lo` is none of, but the kinds there
 /// are depend on the modules loaded, so it is taken without effect), and
-/// another namespace's ID, of which none is given.
+/// the ID of a namespace whose link to show ([`nsid::target`]).
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_TARGET_NETNSID: u16 = 46;
@@ -527,6 +527,9 @@ struct State {
     /// the namespaces its own has an ID for, and a `recvmsg` tells that ID
     /// ([`nsid`]).
     listen_all_nsid: bool,
+    /// Answers a request sent to a socket of another namespace, which go
+    /// once this one is unlocked (`inet6_rtm_getaddr`'s `rtnl_unicast`).
+    unicasts: Vec<(Arc<NetlinkSocket>, Vec<u8>)>,
 }
 
 /// An `AF_NETLINK` socket of `NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` or
@@ -940,7 +943,12 @@ impl NetlinkSocket {
         }
         let mut notices = Vec::new();
         self.take(&mut s, bytes, port, sender, &mut notices);
+        let unicasts = core::mem::take(&mut s.unicasts);
         drop(s);
+        for (socket, bytes) in unicasts {
+            let mut t = socket.lock();
+            socket.deliver(&mut t, 0, 0, bytes);
+        }
         notify(&self.network, notices, Some(self));
         Ok(bytes.len())
     }
@@ -1054,6 +1062,7 @@ impl NetlinkSocket {
             let strict = s.strict;
             let mut answer = 0;
             let (seq, network) = (header.seq, &*self.network);
+            let target = |id| nsid::target(&self.network, &self.opener, id);
             let dump = match (header.kind, family) {
                 // `rtnl_bridge_getlink` has no bridge port to show.
                 (RTM_GETLINK, AF_BRIDGE) => bridge_dump_check(payload, strict).map(|()| Vec::new()),
@@ -1079,7 +1088,7 @@ impl NetlinkSocket {
                     ],
                 )
                 .map(|()| vec![ipmr_link_message(seq, port)]),
-                (RTM_GETLINK, _) => link_dump(network, payload, seq, port, strict),
+                (RTM_GETLINK, _) => link_dump(network, payload, (seq, port), strict, &target),
                 // `mctp_dump_addrinfo`: `lo`'s MCTP addresses.
                 (RTM_GETADDR, AF_MCTP) => mctp_address_dump_check(payload, strict)
                     .map(|()| mctp_addresses(network, payload, seq, port)),
@@ -1090,11 +1099,11 @@ impl NetlinkSocket {
                     network,
                     payload,
                     family,
-                    seq,
-                    port,
+                    (seq, port),
                     strict,
                     &mut answer,
                     now,
+                    &target,
                 ),
                 (nsid::RTM_GETNSID, _) => {
                     nsid::dump(&self.network, &self.opener, header, payload, port, strict)
@@ -1161,8 +1170,31 @@ impl NetlinkSocket {
             // Only IPv6 answers a single address (`inet6_rtm_getaddr`);
             // IPv4 and MCTP have no `doit`, nor the `PF_UNSPEC` fallback.
             RTM_GETADDR if family == AF_INET6 => {
-                let reply = address_get(&self.network, payload, header.seq, port, s.strict, now)?;
-                self.deliver(s, 0, 0, reply);
+                let target = |id| nsid::target(&self.network, &self.opener, id);
+                let (peer, reply) = address_get(
+                    &self.network,
+                    payload,
+                    (header.seq, port),
+                    s.strict,
+                    now,
+                    &target,
+                )?;
+                // `rtnl_unicast` to the requester's port in the namespace
+                // it asked of, where another socket may have it, or none
+                // (`ECONNREFUSED`).
+                match peer {
+                    Some(peer) if !Arc::ptr_eq(&peer, &self.network) => {
+                        let socket = peer
+                            .netlink
+                            .route
+                            .lock()
+                            .get(&port)
+                            .and_then(Weak::upgrade)
+                            .ok_or(ECONNREFUSED)?;
+                        s.unicasts.push((socket, reply));
+                    }
+                    _ => self.deliver(s, 0, 0, reply),
+                }
                 Ok(false)
             }
             RTM_GETROUTE if matches!(family, AF_INET | AF_INET6) => {
@@ -1247,13 +1279,19 @@ impl NetlinkSocket {
                 Ok(false)
             }
             RTM_GETLINK => {
-                self.find_link(payload, header, Some(s.strict))?;
-                let reply = link_message(&self.network, header.seq, port, 0, ext_mask(payload));
+                let (.., target) = self.find_link(payload, header, Some(s.strict))?;
+                let mask = ext_mask(payload);
+                let reply = match target {
+                    Some((id, peer)) => {
+                        with_link_netnsid(link_message(&peer, header.seq, port, 0, mask), id)
+                    }
+                    None => link_message(&self.network, header.seq, port, 0, mask),
+                };
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
             RTM_NEWLINK | RTM_SETLINK => {
-                let (flags, change) = self.find_link(payload, header, None)?;
+                let (flags, change, _) = self.find_link(payload, header, None)?;
                 // `rtnl_dev_combine_flags`: only the flags `ifi_change`
                 // names, or all with none named; of them only `IFF_UP`.
                 if flags != 0 || change != 0 {
@@ -1287,14 +1325,15 @@ impl NetlinkSocket {
     /// attributes only the names, `IFLA_EXT_MASK` and
     /// `IFLA_TARGET_NETNSID` (`EINVAL` for others); either way
     /// `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are then `EOPNOTSUPP`, and
-    /// another namespace's ID `EINVAL`, as there is none. The flags and the
-    /// change mask.
+    /// `IFLA_TARGET_NETNSID` names the namespace whose link it is, as
+    /// [`nsid::target`] finds it (`EINVAL`, `EACCES`). The flags, the
+    /// change mask, and that ID and namespace.
     fn find_link(
         &self,
         payload: &[u8],
         header: &Header,
         strict: Option<bool>,
-    ) -> Result<(u32, u32), Errno> {
+    ) -> Result<(u32, u32, Option<Named>), Errno> {
         let get = strict.is_some();
         if payload.len() < 16 {
             return Err(extack::message(
@@ -1345,6 +1384,7 @@ impl NetlinkSocket {
         // `rtnl_dev_get`: the last `IFLA_IFNAME`, or else `IFLA_ALT_IFNAME`,
         // to its NUL.
         let by_kind = by_type(&attributes);
+        let mut target = None;
         let name = by_kind
             .get(&IFLA_IFNAME)
             .or_else(|| by_kind.get(&IFLA_ALT_IFNAME))
@@ -1374,8 +1414,9 @@ impl NetlinkSocket {
                     "specified netns attribute not supported",
                 ));
             }
-            if named(IFLA_TARGET_NETNSID) {
-                return Err(Errno::EINVAL);
+            if let Some(value) = by_kind.get(&IFLA_TARGET_NETNSID) {
+                let id = s32_value(value);
+                target = Some((id, nsid::target(&self.network, &self.opener, id)?));
             }
         }
         // A positive index names the link; otherwise its name does, which
@@ -1410,7 +1451,7 @@ impl NetlinkSocket {
                 return Err(EOPNOTSUPP);
             }
         }
-        Ok((word(8), word(12)))
+        Ok((word(8), word(12), target))
     }
     /// Receives one datagram into `buf`, as `netlink_recvmsg`: a pending
     /// error first, `EAGAIN` while there is none; `peek` leaves it. A
@@ -1515,9 +1556,11 @@ impl FileHandle for NetlinkSocket {
         self.receive(buf, false).map(|got| got.copied)
     }
     /// A send to the peer; it binds with the opener's process ID and acts
-    /// with the opener's capability, as no calling thread is known here,
-    /// but for the namespaces an ID request names and the `CAP_NET_ADMIN`
-    /// it needs over them, which are the writer's ([`resolving`]).
+    /// with the opener's capability, as no calling thread is known here.
+    /// An ID request's `NETNSA_PID` and `NETNSA_FD` are the writer's,
+    /// though, and a namespace named by its ID (`NETNSA_TARGET_NSID`,
+    /// `IFLA_TARGET_NETNSID`, `IFA_TARGET_NETNSID`) needs the writer's
+    /// `CAP_NET_ADMIN` as well as the opener's ([`resolving`]).
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
         let sender = Sender {
             pid: self.opener_pid,
@@ -1636,6 +1679,39 @@ fn attribute(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(value);
     out.resize(align(out.len()), 0);
+}
+/// An ID a request names another namespace by, and that namespace.
+type Named = (i32, Arc<Network>);
+/// A namespace an ID names, as [`nsid::target`] finds it for a request.
+type Target<'a> = &'a dyn Fn(i32) -> Result<Arc<Network>, Errno>;
+/// `message` with attribute `kind` of `id` put in at `at`.
+fn with_attribute_at(message: Vec<u8>, at: usize, kind: u16, id: i32) -> Vec<u8> {
+    let mut out = message[..at].to_vec();
+    attribute(&mut out, kind, &id.to_le_bytes());
+    out.extend_from_slice(&message[at..]);
+    let len = out.len() as u32;
+    out[..4].copy_from_slice(&len.to_le_bytes());
+    out
+}
+/// A link message with `IFLA_TARGET_NETNSID` (`IFLA_IF_NETNSID`) of `id`
+/// first, before its name, as Linux 7.0's `rtnl_fill_ifinfo` puts it
+/// (Linux's master branch puts it after the name and the alternative
+/// names).
+fn with_link_netnsid(message: Vec<u8>, id: i32) -> Vec<u8> {
+    // After the header and the `ifinfomsg`.
+    with_attribute_at(message, 16 + 16, IFLA_TARGET_NETNSID, id)
+}
+/// An address message with `IFA_TARGET_NETNSID` of `id` first, as
+/// `inet_fill_ifaddr` and `inet6_fill_ifaddr` put it.
+fn with_address_netnsid(message: Vec<u8>, id: i32) -> Vec<u8> {
+    with_attribute_at(message, 16 + 8, IFA_TARGET_NETNSID, id)
+}
+/// The value of an `NLA_S32` attribute, which the policy has made 4 bytes
+/// long at least.
+fn s32_value(value: &[u8]) -> i32 {
+    value
+        .first_chunk::<4>()
+        .map_or(0, |b| i32::from_le_bytes(*b))
 }
 /// The types of the attributes of `bytes`, for tests.
 #[cfg(test)]
@@ -2055,8 +2131,9 @@ fn strict_link_header(
 }
 /// A link dump, as `rtnl_dump_ifinfo`: `lo`, as `IFLA_EXT_MASK` asks it.
 /// An `IFLA_MASTER` other than 0 shows only the devices of that master,
-/// which `lo` is not, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
-/// namespace's links are shown. Unchecked, a request shorter than an `ifinfomsg`
+/// which `lo` is not, and `IFLA_TARGET_NETNSID` shows the namespace's
+/// whose ID it is, as `target` finds it, with that ID before the name
+/// ([`with_link_netnsid`]). Unchecked, a request shorter than an `ifinfomsg`
 /// is an old `rtgenmsg`, whose attributes follow its 4 bytes, and none
 /// is taken where one breaks `ifla_policy`, as a failed
 /// `nlmsg_parse_deprecated`; strictly, as `rtnl_valid_dump_ifinfo_req`, it
@@ -2066,9 +2143,9 @@ fn strict_link_header(
 fn link_dump(
     network: &Network,
     payload: &[u8],
-    seq: u32,
-    port: u32,
+    (seq, port): (u32, u32),
     strict: bool,
+    target: Target<'_>,
 ) -> Result<Vec<Vec<u8>>, Errno> {
     let parsed = if strict {
         strict_link_header(
@@ -2104,12 +2181,13 @@ fn link_dump(
         )
     };
     // In the order of their types, as `rtnl_dump_ifinfo` looks at them.
-    for &kind in attributes.keys() {
+    let mut shown = None;
+    for (&kind, value) in &attributes {
         if kind == IFLA_TARGET_NETNSID {
-            return Err(extack::message(
-                Errno::EINVAL,
-                "Invalid target network namespace id",
-            ));
+            let id = s32_value(value);
+            let peer = target(id)
+                .map_err(|e| extack::message(e, "Invalid target network namespace id"))?;
+            shown = Some((id, peer));
         }
         if strict && !known(kind) {
             return Err(extack::message(
@@ -2127,7 +2205,12 @@ fn link_dump(
     if master != 0 {
         return Ok(Vec::new());
     }
-    Ok(vec![link_message(network, seq, port, NLM_F_MULTI, mask)])
+    Ok(vec![match shown {
+        Some((id, peer)) => {
+            with_link_netnsid(link_message(&peer, seq, port, NLM_F_MULTI, mask), id)
+        }
+        None => link_message(network, seq, port, NLM_F_MULTI, mask),
+    }])
 }
 /// Strictly, a bridge link dump (`valid_bridge_getlink_req`) takes no
 /// type, flags, change mask or index (`EINVAL`), then breaks no rule of
@@ -2193,8 +2276,11 @@ fn with_flags(mut messages: Vec<Vec<u8>>, flags: u16) -> Vec<Vec<u8>> {
 /// `inet_valid_dump_ifaddr_req` and `inet6_valid_dump_ifaddr_req`, it is
 /// `EINVAL` for an `ifaddrmsg` short or with a prefix length, flags or a
 /// scope, then the family's policy's error (IPv4's for both), and
-/// `EINVAL` for any attribute (`IFA_TARGET_NETNSID` too, as no other
-/// namespace's addresses are shown); an index other than 0 shows that device's
+/// `EINVAL` for any attribute but `IFA_TARGET_NETNSID`, which shows the
+/// addresses of the namespace whose ID it is, as `target` finds it, each
+/// with that ID first ([`with_address_netnsid`]); MCTP's are this
+/// namespace's still, as `mctp_dump_addrinfo` looks at no ID. Unchecked,
+/// no attribute counts. An index other than 0 shows that device's
 /// addresses alone, as `NLM_F_DUMP_FILTERED`, which `NLMSG_DONE` carries
 /// too, and is `ENODEV` for another than `lo`'s.
 #[expect(
@@ -2205,13 +2291,14 @@ fn address_dump(
     network: &Network,
     payload: &[u8],
     family: u8,
-    seq: u32,
-    port: u32,
+    (seq, port): (u32, u32),
     strict: bool,
     answer: &mut u16,
     now: u64,
+    target: Target<'_>,
 ) -> Result<Vec<Vec<u8>>, Errno> {
     let mut flags = 0;
+    let mut shown = None;
     if strict {
         // `rtnl_dump_all` asks IPv4's first, whose error ends the dump.
         let (policy, messages) = if family == AF_INET6 {
@@ -2247,24 +2334,31 @@ fn address_dump(
             flags = NLM_F_DUMP_FILTERED;
         }
         let attributes = parse_policy(&payload[8..], policy, true)?;
-        if let Some(&kind) = by_type(&attributes).keys().next() {
-            let message = if kind == IFA_TARGET_NETNSID {
-                messages[2]
-            } else {
-                messages[3]
-            };
-            return Err(extack::message(Errno::EINVAL, message));
+        for (&kind, value) in &by_type(&attributes) {
+            if kind != IFA_TARGET_NETNSID {
+                return Err(extack::message(Errno::EINVAL, messages[3]));
+            }
+            let id = s32_value(value);
+            let peer = target(id).map_err(|e| extack::message(e, messages[2]))?;
+            shown = Some((id, peer));
         }
         if index > 1 {
             return Err(ENODEV);
         }
     }
     let mut messages = Vec::new();
+    let of = shown.as_ref().map_or(network, |(_, peer)| &**peer);
     if family != AF_INET6 {
-        messages.extend(ipv4_message(network, seq, port, now));
+        messages.extend(ipv4_message(of, seq, port, now));
     }
     if family != AF_INET {
-        messages.extend(ipv6_message(network, seq, port, now));
+        messages.extend(ipv6_message(of, seq, port, now));
+    }
+    if let Some((id, _)) = shown {
+        messages = messages
+            .into_iter()
+            .map(|message| with_address_netnsid(message, id))
+            .collect();
     }
     let mut messages = with_flags(messages, flags);
     // `rtnl_dump_all` goes on to MCTP's, which marks nothing.
@@ -2279,19 +2373,22 @@ fn address_dump(
 /// then, strictly, `EINVAL` for a prefix length, flags or a scope, and
 /// `ifa_ipv6_policy`'s error, with `EINVAL` for an attribute but
 /// `IFA_ADDRESS`, `IFA_LOCAL` and `IFA_TARGET_NETNSID`; unchecked, the
-/// policy's error alone. `IFA_TARGET_NETNSID` is `EINVAL`, as no other
-/// namespace's addresses are shown. The address is `IFA_LOCAL`'s, or else
+/// policy's error alone. `IFA_TARGET_NETNSID` names the namespace the
+/// address is looked for in, as `target` finds it (`EINVAL`, `EACCES`),
+/// and the answer carries that ID first; that namespace is given back,
+/// as `rtnl_unicast` sends the answer to the requester's port there. The
+/// address is `IFA_LOCAL`'s, or else
 /// `IFA_ADDRESS`'s (`extract_addr`), and `EINVAL` with neither;
 /// `EADDRNOTAVAIL` when `lo` has it not. The index is not checked:
 /// `ipv6_get_ifaddr` looks on any device when none has it.
 fn address_get(
     network: &Network,
     payload: &[u8],
-    seq: u32,
-    port: u32,
+    (seq, port): (u32, u32),
     strict: bool,
     now: u64,
-) -> Result<Vec<u8>, Errno> {
+    target: Target<'_>,
+) -> Result<(Option<Arc<Network>>, Vec<u8>), Errno> {
     if payload.len() < 8 {
         return Err(extack::message(
             Errno::EINVAL,
@@ -2316,9 +2413,13 @@ fn address_get(
         ));
     }
     let by_kind = by_type(&attributes);
-    if by_kind.contains_key(&IFA_TARGET_NETNSID) {
-        return Err(Errno::EINVAL);
-    }
+    let shown = match by_kind.get(&IFA_TARGET_NETNSID) {
+        Some(value) => {
+            let id = s32_value(value);
+            Some((id, target(id)?))
+        }
+        None => None,
+    };
     // The policy has made each at least 16 bytes long.
     let wanted = by_kind
         .get(&IFA_LOCAL)
@@ -2326,12 +2427,17 @@ fn address_get(
         .and_then(|value| value.first_chunk::<16>())
         .map(|octets| core::net::Ipv6Addr::from(*octets))
         .ok_or(Errno::EINVAL)?;
-    let addresses = network.addresses().v6.clone();
+    let of = shown.as_ref().map_or(network, |(_, peer)| &**peer);
+    let addresses = of.addresses().v6.clone();
     let address = addresses
         .iter()
         .find(|address| address.address == wanted)
         .ok_or(EADDRNOTAVAIL)?;
-    Ok(ipv6_address(address, false, RTM_NEWADDR, 0, seq, port, now))
+    let reply = ipv6_address(address, false, RTM_NEWADDR, 0, seq, port, now);
+    Ok(match shown {
+        Some((id, peer)) => (Some(peer), with_address_netnsid(reply, id)),
+        None => (None, reply),
+    })
 }
 /// Strictly, an MCTP address dump (`mctp_dump_addrinfo`) needs a whole
 /// `ifaddrmsg` (`EINVAL`), and nothing else: its index only narrows it,
@@ -5410,6 +5516,11 @@ fn get_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A namespace with no IDs, as [`nsid::target`] finds none.
+    fn no_ids(_: i32) -> Result<Arc<Network>, Errno> {
+        Err(Errno::EINVAL)
+    }
     /// A route dump of `family`'s routes alone, unchecked, to port 7.
     fn routes(network: &Network, family: u8, seq: u32) -> Vec<Vec<u8>> {
         route_dump(network, &[family], family, seq, 7, false, &mut 0, 0).unwrap()
@@ -6800,10 +6911,66 @@ mod tests {
     }
 
     #[test]
+    fn another_namespaces_link_and_addresses_carry_its_id() {
+        let peer = Arc::new(Network::isolated(crate::users::first()));
+        peer.set_up(true, 0);
+        let network = Network::isolated(crate::users::first());
+        let target = |id: i32| match id {
+            4 => Ok(Arc::clone(&peer)),
+            5 => Err(Errno(13)),
+            _ => Err(Errno::EINVAL),
+        };
+        let id = |n: i32| ifinfo(0, 0, &[(IFLA_TARGET_NETNSID, &n.to_le_bytes())]);
+        // The peer's lo, up, with the ID first, before its name.
+        let dumped = link_dump(&network, &id(4), (1, 7), true, &target).unwrap();
+        let link = &dumped[0];
+        assert_eq!(
+            attribute_kinds(&link[32..])[..3],
+            [IFLA_TARGET_NETNSID, IFLA_IFNAME, IFLA_TXQLEN]
+        );
+        assert_eq!(link[32..40], [8, 0, 46, 0, 4, 0, 0, 0]);
+        assert_eq!(
+            with_link_netnsid(link_message(&peer, 1, 7, NLM_F_MULTI, 0), 4),
+            *link
+        );
+        // Unchecked, the ID counts too; its errors pass through.
+        assert_eq!(
+            link_dump(&network, &id(4), (1, 7), false, &target),
+            Ok(dumped)
+        );
+        assert_eq!(
+            link_dump(&network, &id(5), (1, 7), true, &target),
+            Err(Errno(13))
+        );
+        assert_eq!(
+            link_dump(&network, &id(6), (1, 7), false, &target),
+            Err(Errno::EINVAL)
+        );
+        // Each address has the ID first; unchecked, no attribute counts.
+        let request = |strict| {
+            let mut payload = vec![0; 8];
+            attribute(&mut payload, IFA_TARGET_NETNSID, &4i32.to_le_bytes());
+            address_dump(
+                &network,
+                &payload,
+                AF_INET,
+                (1, 7),
+                strict,
+                &mut 0,
+                0,
+                &target,
+            )
+        };
+        let addresses = request(true).unwrap();
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(attribute_kinds(&addresses[0][24..])[0], IFA_TARGET_NETNSID);
+        assert_eq!(request(false), Ok(ipv4_message(&network, 1, 7, 0)));
+    }
+    #[test]
     fn strict_link_dumps_take_only_their_filters() {
         let network = Network::isolated(crate::users::first());
         network.set_up(true, 0);
-        let dump = |payload: &[u8], strict| link_dump(&network, payload, 1, 7, strict);
+        let dump = |payload: &[u8], strict| link_dump(&network, payload, (1, 7), strict, &no_ids);
         let skip = RTEXT_FILTER_SKIP_STATS.to_le_bytes();
         let plain = dump(&ifinfo(0, 0, &[]), true).unwrap();
         assert_eq!(plain, vec![link_message(&network, 1, 7, NLM_F_MULTI, 0)]);
@@ -6826,7 +6993,7 @@ mod tests {
             dump(&ifinfo(0, 0, &[(IFLA_LINKINFO, &[])]), true),
             Ok(plain.clone())
         );
-        // No other namespace's links are shown, checked or not.
+        // An ID no namespace has is EINVAL, checked or not.
         let netnsid = ifinfo(0, 0, &[(IFLA_TARGET_NETNSID, &1u32.to_le_bytes())]);
         assert_eq!(dump(&netnsid, true), Err(Errno::EINVAL));
         assert_eq!(dump(&netnsid, false), Err(Errno::EINVAL));
@@ -6882,11 +7049,22 @@ mod tests {
         let network = Network::isolated(crate::users::first());
         network.set_up(true, 0);
         let mut answer = 0;
-        let all = address_dump(&network, &[0; 8], 0, 1, 7, true, &mut answer, 0).unwrap();
+        let all =
+            address_dump(&network, &[0; 8], 0, (1, 7), true, &mut answer, 0, &no_ids).unwrap();
         assert_eq!((all.len(), answer), (2, 0));
         let mut by_index = vec![AF_INET6, 0, 0, 0];
         by_index.extend_from_slice(&1u32.to_le_bytes());
-        let lo = address_dump(&network, &by_index, AF_INET6, 1, 7, true, &mut answer, 0).unwrap();
+        let lo = address_dump(
+            &network,
+            &by_index,
+            AF_INET6,
+            (1, 7),
+            true,
+            &mut answer,
+            0,
+            &no_ids,
+        )
+        .unwrap();
         assert_eq!(lo.len(), 1);
         assert_eq!(
             Header::read(&lo[0]).flags,
@@ -6896,16 +7074,35 @@ mod tests {
         // Another index is ENODEV, after the filter is marked.
         by_index[4] = 2;
         answer = 0;
-        let other = address_dump(&network, &by_index, 0, 1, 7, true, &mut answer, 0);
+        let other = address_dump(
+            &network,
+            &by_index,
+            0,
+            (1, 7),
+            true,
+            &mut answer,
+            0,
+            &no_ids,
+        );
         assert_eq!((other, answer), (Err(ENODEV), NLM_F_DUMP_FILTERED));
         // Unchecked, the index changes nothing.
         answer = 0;
-        let loose = address_dump(&network, &by_index, 0, 1, 7, false, &mut answer, 0).unwrap();
+        let loose = address_dump(
+            &network,
+            &by_index,
+            0,
+            (1, 7),
+            false,
+            &mut answer,
+            0,
+            &no_ids,
+        )
+        .unwrap();
         assert_eq!((loose, answer), (all, 0));
         let mut label = vec![0; 8];
         attribute(&mut label, IFA_LABEL, b"lo\0");
         for bad in [&[0][..], &[0, 8, 0, 0, 0, 0, 0, 0], &label] {
-            let found = address_dump(&network, bad, 0, 1, 7, true, &mut 0, 0);
+            let found = address_dump(&network, bad, 0, (1, 7), true, &mut 0, 0, &no_ids);
             assert_eq!(found, Err(Errno::EINVAL));
         }
     }
@@ -6929,22 +7126,26 @@ mod tests {
             let got = address_get(
                 &network,
                 &request(index, &[(IFA_ADDRESS, &one)]),
-                3,
-                7,
+                (3, 7),
                 strict,
                 0,
+                &no_ids,
             );
-            let got = got.unwrap();
+            let got = got.unwrap().1;
             assert_eq!(Header::read(&got).flags, 0);
             assert_eq!((&got[..6], &got[8..]), (&dumped[..6], &dumped[8..]));
         }
         // IFA_LOCAL is the address, before IFA_ADDRESS.
         let other = core::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).octets();
         let local = request(0, &[(IFA_ADDRESS, &other), (IFA_LOCAL, &one)]);
-        assert!(address_get(&network, &local, 3, 7, true, 0).is_ok());
+        assert!(
+            address_get(&network, &local, (3, 7), true, 0, &no_ids)
+                .map(|(_, m)| m)
+                .is_ok()
+        );
         let missing = request(0, &[(IFA_ADDRESS, &one), (IFA_LOCAL, &other)]);
         assert_eq!(
-            address_get(&network, &missing, 3, 7, true, 0),
+            address_get(&network, &missing, (3, 7), true, 0, &no_ids).map(|(_, m)| m),
             Err(EADDRNOTAVAIL)
         );
         // With neither, a short header or another namespace: EINVAL;
@@ -6959,12 +7160,15 @@ mod tests {
         for strict in [true, false] {
             for bad in [&request(0, &[])[..], &[AF_INET6, 0, 0, 0], &netnsid] {
                 assert_eq!(
-                    address_get(&network, bad, 3, 7, strict, 0),
+                    address_get(&network, bad, (3, 7), strict, 0, &no_ids).map(|(_, m)| m),
                     Err(Errno::EINVAL)
                 );
             }
             let short = request(0, &[(IFA_ADDRESS, &one[..4])]);
-            assert_eq!(address_get(&network, &short, 3, 7, strict, 0), Err(ERANGE));
+            assert_eq!(
+                address_get(&network, &short, (3, 7), strict, 0, &no_ids).map(|(_, m)| m),
+                Err(ERANGE)
+            );
         }
         // Strictly, a prefix length, flags, a scope or another attribute is
         // EINVAL; unchecked, they are taken.
@@ -6973,10 +7177,14 @@ mod tests {
         let flagged = request(0, &[(IFA_ADDRESS, &one), (IFA_FLAGS, &0u32.to_le_bytes())]);
         for loose in [&prefixed, &flagged] {
             assert_eq!(
-                address_get(&network, loose, 3, 7, true, 0),
+                address_get(&network, loose, (3, 7), true, 0, &no_ids).map(|(_, m)| m),
                 Err(Errno::EINVAL)
             );
-            assert!(address_get(&network, loose, 3, 7, false, 0).is_ok());
+            assert!(
+                address_get(&network, loose, (3, 7), false, 0, &no_ids)
+                    .map(|(_, m)| m)
+                    .is_ok()
+            );
         }
     }
 
@@ -7195,9 +7403,19 @@ mod tests {
         );
         // rtnl_dump_all's dumps end with MCTP's; a family's own do not.
         network.set_up(true, 0);
-        let all = address_dump(&network, &[0], 0, 4, 7, false, &mut 0, 0).unwrap();
+        let all = address_dump(&network, &[0], 0, (4, 7), false, &mut 0, 0, &no_ids).unwrap();
         assert_eq!(all[all.len() - 3..], dumped[..]);
-        let four = address_dump(&network, &[AF_INET], AF_INET, 4, 7, false, &mut 0, 0).unwrap();
+        let four = address_dump(
+            &network,
+            &[AF_INET],
+            AF_INET,
+            (4, 7),
+            false,
+            &mut 0,
+            0,
+            &no_ids,
+        )
+        .unwrap();
         assert!(!four.iter().any(|m| m[16] == AF_MCTP));
         let all = routes(&network, 0, 4);
         assert_eq!(all.iter().filter(|m| m[16] == AF_MCTP).count(), 3);

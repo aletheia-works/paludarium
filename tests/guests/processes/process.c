@@ -6295,6 +6295,67 @@ static int proc_owners_case(void) {
     return 0;
 }
 
+/* The Pid and NSpid lines of `fd`'s fdinfo: each as the number `pid` is
+   (1), -1, or another (0); and how many numbers NSpid has. */
+static void pf_show(const char *label, int fd, pid_t pid) {
+    char path[64], line[256];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    FILE *info = fopen(path, "r");
+    int found = 0;
+    while (info && fgets(line, sizeof line, info)) {
+        if (!strncmp(line, "Pid:\t", 5)) {
+            long n = strtol(line + 5, NULL, 10);
+            printf("%s: Pid=%s\n", label, n == pid ? "pid" : n == -1 ? "-1" : "other");
+            found++;
+        } else if (!strncmp(line, "NSpid:\t", 7)) {
+            char *p = line + 7;
+            long first = strtol(p, &p, 10);
+            int count = 1;
+            while (*p == '\t') {
+                strtol(p + 1, &p, 10);
+                count++;
+            }
+            printf("%s: NSpid=%s count=%d\n", label, first == pid ? "pid" : first == -1 ? "-1" : "other", count);
+            found++;
+        }
+    }
+    if (info) fclose(info);
+    printf("%s: lines=%d\n", label, found);
+}
+
+/* The pidfd-fdinfo case: a pidfd's fdinfo names its process by its PID,
+   as Linux's pidfd_show_fdinfo, a zombie's too, and -1 once it is
+   reaped. */
+static int pidfd_fdinfo_case(void) {
+    int own = syscall(SYS_pidfd_open, getpid(), 0);
+    if (own < 0) return 80;
+    pf_show("self", own, getpid());
+    int ready[2];
+    if (pipe(ready)) return 81;
+    pid_t child = fork();
+    if (child < 0) return 82;
+    if (!child) {
+        char c;
+        close(ready[1]);
+        if (read(ready[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    close(ready[0]);
+    int fd = syscall(SYS_pidfd_open, child, 0);
+    if (fd < 0) return 83;
+    pf_show("running", fd, child);
+    if (write(ready[1], "x", 1) != 1) return 84;
+    siginfo_t info;
+    /* A zombie keeps its number. */
+    waitid(P_PIDFD, fd, &info, WEXITED | WNOWAIT);
+    pf_show("zombie", fd, child);
+    waitid(P_PIDFD, fd, &info, WEXITED);
+    pf_show("reaped", fd, child);
+    close(fd);
+    close(own);
+    return 0;
+}
+
 static int mincore_show(const char *label, void *at, size_t length, size_t pages) {
     unsigned char vec[16];
     memset(vec, 7, sizeof vec);
@@ -10080,6 +10141,175 @@ static int proc_other_limits_case(void) {
     snprintf(path, sizeof path, "/proc/%d/statm", (int)kid);
     printf(" reaped=%ld\n", pol_read(path, theirs));
     munmap(seen, 4 * POL_SIZE);
+    return 0;
+}
+/* The proc-other-pagemap case: another process's pagemap, as Linux's
+   pagemap_open opens it for a reader that ptrace_may_access lets read the
+   process (PTRACE_MODE_READ_FSCREDS); the owner its opened files show; the
+   mode an open checks first (generic_permission); and a zombie's maps and
+   smaps, which open for anyone and read nothing, and its pagemap, which no
+   longer opens (ESRCH). */
+/* The entry of the page at `addr` in pagemap `path` without its frame
+   number, which only a reader with CAP_SYS_ADMIN sees on Linux: its flag
+   bits (55 to 63), or -errno. */
+static long long popm_flags(const char *path, const void *addr) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    unsigned long long entry = 0;
+    ssize_t n = pread(fd, &entry, sizeof entry, (off_t)((uintptr_t)addr / 4096 * 8));
+    int error = errno;
+    close(fd);
+    if (n < 0) return -error;
+    return n == sizeof entry ? (long long)(entry >> 55) : -1000 - n;
+}
+/* What `path` opened with `flags` gives: -errno, or its owner and mode as
+   fstat shows them, as `uid:mode`. */
+static void popm_open(const char *path, int flags, char *out, size_t size) {
+    int fd = open(path, flags);
+    if (fd < 0) {
+        snprintf(out, size, "%d", -errno);
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st)) snprintf(out, size, "fstat%d", -errno);
+    else snprintf(out, size, "%u:%o", (unsigned)st.st_uid, (unsigned)st.st_mode & 07777);
+    close(fd);
+}
+/* The length `path` reads, or -errno. */
+static long popm_length(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    char buffer[4096];
+    long total = 0, n;
+    while ((n = read(fd, buffer, sizeof buffer)) > 0) total += n;
+    int error = errno;
+    close(fd);
+    return n < 0 ? -error : total;
+}
+/* As user `uid`, which may not read the child: each of `names` in its
+   directory opened with `flags`. */
+static void popm_as(uid_t uid, pid_t kid, const char *const *names, int count, int flags) {
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        if (setresgid(uid, uid, uid) || setresuid(uid, uid, uid)) _exit(90);
+        printf("as %u%s:", (unsigned)uid, flags == O_WRONLY ? " writing" : "");
+        for (int i = 0; i < count; i++) {
+            char path[64], got[32];
+            snprintf(path, sizeof path, "/proc/%d/%s", (int)kid, names[i]);
+            popm_open(path, flags, got, sizeof got);
+            printf(" %s=%s", names[i], got);
+        }
+        printf("\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("reader=%d\n", reaped(reader));
+}
+static int proc_other_pagemap_case(void) {
+    /* Pages the child touches or leaves alone, at addresses this process
+       knows: one written, one only read, one never touched. */
+    char *pages = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long long *seen = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED || seen == MAP_FAILED) return 80;
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 81;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 82;
+    if (!kid) {
+        /* User 1000's, and dumpable again after the change of IDs, so its
+           files are user 1000's. */
+        char byte = 'r';
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000) || prctl(PR_SET_DUMPABLE, 1)) byte = 'u';
+        pages[0] = 1;
+        volatile char read_only = pages[4096];
+        (void)read_only;
+        for (int i = 0; i < 3; i++) seen[i] = popm_flags("/proc/self/pagemap", pages + i * 4096);
+        if (write(ready[1], &byte, 1) != 1 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 83;
+    char path[64], got[32];
+    /* pagemap: what the child reads of itself, through each directory. */
+    printf("child=%c", byte);
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "/proc/%d/pagemap", (int)kid);
+        long long theirs = popm_flags(path, pages + i * 4096);
+        snprintf(path, sizeof path, "/proc/%d/task/%d/pagemap", (int)kid, (int)kid);
+        long long task = popm_flags(path, pages + i * 4096);
+        printf(" page%d=%llx same=%d task=%d", i, (unsigned long long)theirs, theirs == seen[i], task == theirs);
+    }
+    printf("\n");
+    /* This process's own, through thread-self and task/<tid>. */
+    pages[0] = 2;
+    long long own = popm_flags("/proc/self/pagemap", pages);
+    printf("own=%llx thread-self=%d", (unsigned long long)own, popm_flags("/proc/thread-self/pagemap", pages) == own);
+    snprintf(path, sizeof path, "/proc/self/task/%d/pagemap", (int)getpid());
+    printf(" task=%d\n", popm_flags(path, pages) == own);
+    /* The owner its files and their opened files show, and their modes. */
+    static const char *const names[] = {"pagemap", "maps", "smaps", "status", "environ", "statm", "auxv", "fdinfo/0"};
+    int count = (int)(sizeof names / sizeof *names);
+    printf("root:");
+    for (int i = 0; i < count; i++) {
+        struct stat st;
+        snprintf(path, sizeof path, "/proc/%d/%s", (int)kid, names[i]);
+        int r = stat(path, &st) ? -errno : 0;
+        popm_open(path, O_RDONLY, got, sizeof got);
+        printf(" %s=%s", names[i], got);
+        if (r) printf("[%d]", r);
+        else printf("[%u:%o]", (unsigned)st.st_uid, (unsigned)st.st_mode & 07777);
+    }
+    printf("\n");
+    /* Root may open them for writing (CAP_DAC_OVERRIDE); a write is then
+       EINVAL, as they have no write of their own. */
+    snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+    int fd = open(path, O_WRONLY);
+    int opened = fd >= 0 ? 0 : -errno;
+    long w = fd >= 0 ? write(fd, "x", 1) : 0;
+    int werror = errno;
+    if (fd >= 0) close(fd);
+    printf("root writing status=%d write=%ld/%d\n", opened, w, w < 0 ? werror : 0);
+    /* Its owner, another user, and a user that may not read it at all. */
+    static const char *const readable[] = {"pagemap", "maps", "status", "environ", "auxv", "fdinfo/0"};
+    static const char *const writable[] = {"status", "statm", "comm"};
+    popm_as(1000, kid, readable, 6, O_RDONLY);
+    popm_as(1000, kid, writable, 3, O_WRONLY);
+    popm_as(2000, kid, readable, 6, O_RDONLY);
+    popm_as(2000, kid, writable, 3, O_WRONLY);
+    /* Ended and not reaped: maps and smaps open for anyone the mode lets,
+       without the check of the reader, and read nothing; pagemap and environ
+       are ESRCH, after the mode's check (EACCES). */
+    if (write(done[1], "d", 1) != 1) return 84;
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    snprintf(path, sizeof path, "/proc/%d/pagemap", (int)kid);
+    printf("zombie pagemap=%ld", popm_length(path));
+    snprintf(path, sizeof path, "/proc/%d/task/%d/pagemap", (int)kid, (int)kid);
+    printf(" task=%ld\n", popm_length(path));
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader == 0) {
+        if (setresgid(2000, 2000, 2000) || setresuid(2000, 2000, 2000)) _exit(90);
+        snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
+        printf("zombie as 2000: maps=%ld", popm_length(path));
+        snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
+        printf(" smaps=%ld", popm_length(path));
+        snprintf(path, sizeof path, "/proc/%d/pagemap", (int)kid);
+        printf(" pagemap=%ld", popm_length(path));
+        snprintf(path, sizeof path, "/proc/%d/environ", (int)kid);
+        printf(" environ=%ld\n", popm_length(path));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("reader=%d", reaped(reader));
+    printf(" status=%d", reaped(kid));
+    snprintf(path, sizeof path, "/proc/%d/pagemap", (int)kid);
+    printf(" reaped=%ld\n", popm_length(path));
+    munmap(pages, 3 * 4096);
+    munmap(seen, 4096);
     return 0;
 }
 /* The proc-other-fds case: another process's fd and fdinfo, as Linux's
@@ -14494,6 +14724,116 @@ static int ksys_lists(const char *path, const char *name) {
     closedir(dir);
     return found;
 }
+/* The names of directory `path` that are among `names`, in the order
+   readdir gives them: Linux lists more beside them. */
+static void ksys_order(const char *label, const char *path, const char *const *names, int count) {
+    printf("%s:", label);
+    DIR *dir = opendir(path);
+    if (!dir) {
+        printf(" opendir=%d\n", -errno);
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(dir)))
+        for (int i = 0; i < count; i++)
+            if (!strcmp(e->d_name, names[i])) printf(" %s", e->d_name);
+    closedir(dir);
+    printf("\n");
+}
+static long ksys_exists(int id) {
+    struct shmid_ds ds;
+    return ksys_errno(syscall(SYS_shmctl, id, IPC_STAT, &ds));
+}
+/* In an IPC namespace of its own: the listing order, auto_msgmni, the next
+   IDs and shm_rmid_forced. */
+static int ipc_sysctl_more(void) {
+    const char *mqueue[] = {"queues_max", "msg_max", "msgsize_max", "msg_default", "msgsize_default"};
+    ksys_order("order-mqueue", "/proc/sys/fs/mqueue", mqueue, 5);
+    const char *kernel[] = {"shmmax",          "shmall",      "shmmni",      "msgmax",      "msgmnb",
+                            "msgmni",          "sem",         "auto_msgmni", "msg_next_id", "sem_next_id",
+                            "shm_next_id",     "shm_rmid_forced"};
+    ksys_order("order-kernel", "/proc/sys/kernel", kernel, 12);
+    printf("auto_msgmni:");
+    ksys_show("auto_msgmni");
+    printf(" one=%ld two=%ld", ksys_write("auto_msgmni", "1"), ksys_write("auto_msgmni", "2"));
+    ksys_show("auto_msgmni");
+    printf("\n");
+    struct stat st;
+    long stated = ksys_errno(stat("/proc/sys/kernel/shm_next_id", &st));
+    printf("next-id: stat=%ld mode=%o", stated, st.st_mode);
+    ksys_show("shm_next_id");
+    printf(" negative=%ld set=%ld", ksys_write("shm_next_id", "-1"), ksys_write("shm_next_id", "65541"));
+    ksys_show("shm_next_id");
+    int shm = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    printf(" shm=%d", shm);
+    ksys_show("shm_next_id");
+    ksys_write("msg_next_id", "7");
+    int msg = (int)syscall(SYS_msgget, IPC_PRIVATE, 0600);
+    ksys_write("sem_next_id", "32769");
+    int sem = (int)syscall(SYS_semget, IPC_PRIVATE, 1, 0600);
+    printf(" msg=%d sem=%d\n", msg, sem);
+    syscall(SYS_shmctl, shm, IPC_RMID, NULL);
+    syscall(SYS_msgctl, msg, IPC_RMID, NULL);
+    semx_ctl(sem, 0, IPC_RMID, 0);
+    /* Another user may read a next ID but not set it. */
+    fflush(stdout);
+    pid_t other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        printf("next-id-other: write=%ld", ksys_write("msg_next_id", "3"));
+        ksys_show("msg_next_id");
+        printf("\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    result("next-id-other", reaped(other));
+
+    /* shm_rmid_forced. Its own segment, never attached, stays throughout
+       while it runs. */
+    printf("rmid:");
+    ksys_show("shm_rmid_forced");
+    printf(" bad=%ld", ksys_write("shm_rmid_forced", "2"));
+    int own = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    /* A child makes one, never attached, and exits: an orphan, kept while
+       the sysctl is 0. */
+    int ids[2];
+    if (pipe(ids)) return 11;
+    fflush(stdout);
+    pid_t maker = child();
+    if (maker == 0) {
+        int id = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+        if (write(ids[1], &id, sizeof id) != sizeof id) _exit(93);
+        _exit(0);
+    }
+    int orphan = -1;
+    if (read(ids[0], &orphan, sizeof orphan) != sizeof orphan) return 12;
+    int made = reaped(maker);
+    printf(" made=%d orphan-kept=%ld", made, ksys_exists(orphan));
+    /* Setting it removes the orphans no mapping shows. */
+    printf(" set=%ld orphan=%ld own=%ld", ksys_write("shm_rmid_forced", "1"), ksys_exists(orphan),
+           ksys_exists(own));
+    /* Set, a segment goes at its last detach. */
+    int detached = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    void *at = (void *)syscall(SYS_shmat, detached, 0, 0);
+    printf(" attached=%ld", ksys_exists(detached));
+    syscall(SYS_shmdt, at);
+    printf(" detached=%ld", ksys_exists(detached));
+    /* And those a child made and never attached go when it exits. */
+    fflush(stdout);
+    maker = child();
+    if (maker == 0) {
+        int id = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+        if (write(ids[1], &id, sizeof id) != sizeof id) _exit(93);
+        _exit(0);
+    }
+    int left = -1;
+    if (read(ids[0], &left, sizeof left) != sizeof left) return 13;
+    made = reaped(maker);
+    printf(" made=%d exited=%ld own=%ld", made, ksys_exists(left), ksys_exists(own));
+    printf(" unset=%ld\n", ksys_write("shm_rmid_forced", "0"));
+    syscall(SYS_shmctl, own, IPC_RMID, NULL);
+    return 0;
+}
 static int ipc_sysctl_case(void) {
     /* Its own IPC namespace, whose limits the writes change. */
     if (syscall(SYS_unshare, CLONE_NEWIPC)) return 10;
@@ -14619,6 +14959,14 @@ static int ipc_sysctl_case(void) {
     }
     result("fresh", reaped(fresh));
     ksys_all("kept");
+    fflush(stdout);
+    pid_t more = child();
+    if (more == 0) {
+        int r = syscall(SYS_unshare, CLONE_NEWIPC) ? 92 : ipc_sysctl_more();
+        fflush(stdout);
+        _exit(r);
+    }
+    result("more", reaped(more));
     return 0;
 }
 static int sem_case(void) {
@@ -27369,6 +27717,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "kernel-info")) return kernel_info_case();
     if (!strcmp(mode, "admin")) return admin_case();
     if (!strcmp(mode, "pidfd-getfd")) return pidfd_getfd_case();
+    if (!strcmp(mode, "pidfd-fdinfo")) return pidfd_fdinfo_case();
     if (!strcmp(mode, "cpu-timer-others")) return cpu_timer_others_case();
     if (!strcmp(mode, "cpu-clock-ids")) return cpu_clock_ids_case();
     if (!strcmp(mode, "alarm-clocks")) return alarm_clocks_case();
@@ -27391,6 +27740,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();
     if (!strcmp(mode, "proc-other-limits")) return proc_other_limits_case();
+    if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

@@ -2183,6 +2183,29 @@ fn own_proc_files_are_the_process_owners_and_open_as_their_modes_let() {
     assert_eq!(ids(&mut f, 5, fd), (0o100444, 1000, 2000));
 }
 #[test]
+fn a_pidfds_fdinfo_names_its_process() {
+    let mut f = fixture();
+    let pid = f.ret(39, &[]);
+    let fd = f.ret(434, &[pid, 0]);
+    assert!(fd < 1 << 32, "{fd:#x}");
+    let (path, buf) = (DATA, DATA + 0x400);
+    f.mem
+        .write(
+            GuestAddr(path),
+            format!("/proc/self/fdinfo/{fd}\0").as_bytes(),
+        )
+        .unwrap();
+    let info = f.ret(2, &[path, 0]);
+    let count = f.ret(0, &[info, buf, 512]);
+    let mut text = vec![0; count as usize];
+    f.mem.read(GuestAddr(buf), &mut text).unwrap();
+    let text = String::from_utf8(text).unwrap();
+    assert!(
+        text.ends_with(&format!("Pid:\t{pid}\nNSpid:\t{pid}\n")),
+        "{text}"
+    );
+}
+#[test]
 fn proc_fd_links_resolve_at_most_forty_symbolic_links() {
     let mut f = fixture();
     let (name, buf) = (DATA, DATA + 0x400);
@@ -8758,4 +8781,47 @@ fn proc_links_read_from_the_root() {
     // unmarked.
     assert_eq!(f.ret(81, &[out]), 0);
     assert_eq!(link(&mut f, proc, b"cwd"), b"/out");
+}
+/// `bpf(BPF_MAP_CREATE)` of a map of `kind`, `key`, `value`, `entries` and
+/// `flags`, in the fixture.
+fn create_map(f: &mut Fixture, kind: u32, key: u32, value: u32, entries: u32, flags: u32) -> u64 {
+    let mut attr = [0u8; 72];
+    for (i, field) in [kind, key, value, entries, flags].iter().enumerate() {
+        attr[i * 4..i * 4 + 4].copy_from_slice(&field.to_le_bytes());
+    }
+    f.mem.write(GuestAddr(DATA), &attr).unwrap();
+    f.ret(321, &[0, DATA, 72])
+}
+#[test]
+fn bpf_follows_linux_master_where_the_ci_kernel_differs() {
+    let mut f = fixture();
+    let (hash, array, rdonly_wronly) = (1, 2, 1 << 3 | 1 << 4);
+    // A hash's key and value: E2BIG from KMALLOC_MAX_SIZE less 64, as
+    // master's `htab_map_alloc_check` has it (Linux 7.0 takes 16 more).
+    let limit = (1 << 22) - 64;
+    assert_eq!(
+        create_map(&mut f, hash, 4, limit - 4, 1, 0),
+        errno(Errno(7))
+    );
+    assert!(create_map(&mut f, hash, 4, limit - 5, 1, 0) < 1 << 20);
+    // BPF_F_RDONLY with BPF_F_WRONLY is checked after the map is made, as
+    // master's `map_create` does (Linux 7.0 checks it before the type).
+    assert_eq!(
+        create_map(&mut f, hash, 4, limit, 1, rdonly_wronly),
+        errno(Errno(7))
+    );
+    assert_eq!(
+        create_map(&mut f, array, 4, 1 << 30, 1 << 20, rdonly_wronly),
+        errno(Errno::ENOMEM)
+    );
+    assert_eq!(
+        create_map(&mut f, array, 4, 8, 1, rdonly_wronly),
+        errno(Errno::EINVAL)
+    );
+}
+#[test]
+fn prctl_task_perf_events_take_any_arguments() {
+    let mut f = fixture();
+    assert_eq!(f.ret(157, &[31, 0, 0, 0, 0]), 0); // PR_TASK_PERF_EVENTS_DISABLE
+    assert_eq!(f.ret(157, &[32, 1, 2, 3, 4]), 0); // PR_TASK_PERF_EVENTS_ENABLE
 }

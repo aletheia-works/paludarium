@@ -64,8 +64,9 @@ pub mod flag {
     pub const ID: u64 = 1 << 21;
     /// The six arithmetic status flags.
     pub const STATUS: u64 = CF | PF | AF | ZF | SF | OF;
-    /// Flags a user-mode `popfq` may change (TF is not emulated).
-    pub const USER_WRITABLE: u64 = STATUS | DF | NT | AC | ID;
+    /// Flags a user-mode `popfq` may change, and `rt_sigreturn` restores
+    /// (Linux's `FIX_EFLAGS`).
+    pub const USER_WRITABLE: u64 = STATUS | TF | DF | NT | AC | ID;
 }
 
 /// Initial `rflags` of a new thread (IF set, reserved bit 1 set).

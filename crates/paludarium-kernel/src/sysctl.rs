@@ -21,7 +21,14 @@
 //! `semopm`, `semmni`) read with tabs between them and written as many as
 //! are given, the ones before a bad one kept, and `semmni` back as it was
 //! unless it ends from 0 to `IPCMNI` (`ERANGE`, `proc_ipc_sem_dointvec`). Their
-//! owners and who may write them are the mqueue files'. Beside them are
+//! owners and who may write them are the mqueue files'. So are those of
+//! `shm_rmid_forced`, 0 or 1, which removes the orphaned segments no mapping
+//! shows once set ([`crate::shm::Segments::set_rmid_forced`]), and
+//! `auto_msgmni`, which reads 0 and takes 0 or 1 to no effect. Each
+//! `*_next_id` (`shm`, `sem`, `msg`) is the ID the next object of its kind
+//! takes, -1 for none, which a write from 0 sets: mode 0444, which
+//! `ipc_permissions` makes 0666 for whoever has `CAP_CHECKPOINT_RESTORE` or
+//! `CAP_SYS_ADMIN` over the namespace's user namespace. Beside them are
 //! `perf_event_paranoid` and `unprivileged_bpf_disabled`, the values
 //! [`crate::perf`] and [`crate::bpf`] keep to (2, Linux's defaults), which
 //! no one may write.
@@ -76,13 +83,15 @@ pub(crate) enum Setting {
     QueuesMax,
 }
 
-/// The settings by name, in the order Linux lists them.
+/// The settings by name, in the order Linux lists them: a directory's
+/// entries by name, as its tree keeps them (`namecmp`, which puts a name
+/// before a longer one it begins).
 const SETTINGS: [(&[u8], Setting); 5] = [
-    (b"queues_max", Setting::QueuesMax),
-    (b"msg_max", Setting::MsgMax),
-    (b"msgsize_max", Setting::MsgsizeMax),
     (b"msg_default", Setting::MsgDefault),
+    (b"msg_max", Setting::MsgMax),
     (b"msgsize_default", Setting::MsgsizeDefault),
+    (b"msgsize_max", Setting::MsgsizeMax),
+    (b"queues_max", Setting::QueuesMax),
 ];
 
 impl Setting {
@@ -144,11 +153,16 @@ const FANOTIFY: [(&[u8], Fanotify); 4] = [
 /// A file of `/proc/sys/kernel`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kernel {
+    AutoMsgmni,
+    MsgNextId,
     Msgmax,
     Msgmnb,
     Msgmni,
     PerfEventParanoid,
     Sem,
+    SemNextId,
+    ShmNextId,
+    ShmRmidForced,
     Shmall,
     Shmmax,
     Shmmni,
@@ -157,12 +171,17 @@ pub(crate) enum Kernel {
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
 /// name).
-const KERNEL: [(&[u8], Kernel); 9] = [
+const KERNEL: [(&[u8], Kernel); 14] = [
+    (b"auto_msgmni", Kernel::AutoMsgmni),
+    (b"msg_next_id", Kernel::MsgNextId),
     (b"msgmax", Kernel::Msgmax),
     (b"msgmnb", Kernel::Msgmnb),
     (b"msgmni", Kernel::Msgmni),
     (b"perf_event_paranoid", Kernel::PerfEventParanoid),
     (b"sem", Kernel::Sem),
+    (b"sem_next_id", Kernel::SemNextId),
+    (b"shm_next_id", Kernel::ShmNextId),
+    (b"shm_rmid_forced", Kernel::ShmRmidForced),
     (b"shmall", Kernel::Shmall),
     (b"shmmax", Kernel::Shmmax),
     (b"shmmni", Kernel::Shmmni),
@@ -180,6 +199,10 @@ impl Kernel {
             self,
             Self::PerfEventParanoid | Self::UnprivilegedBpfDisabled
         )
+    }
+    /// Whether it is one of the IPC namespace's next IDs.
+    fn next_id(self) -> bool {
+        matches!(self, Self::MsgNextId | Self::SemNextId | Self::ShmNextId)
     }
 }
 
@@ -301,6 +324,11 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
             let [msl, mns, opm, mni] = ipc.sem.with_limits(|limits| limits.0);
             format!("{msl}\t{mns}\t{opm}\t{mni}\n").into_bytes()
         }
+        Kernel::AutoMsgmni => line(0),
+        Kernel::ShmRmidForced => line(ipc.shm.with_limits(|limits| limits.rmid_forced)),
+        Kernel::ShmNextId => line(ipc.shm.with_ids(|ids| ids.next_id())),
+        Kernel::SemNextId => line(ipc.sem.with_ids(|ids| ids.next_id())),
+        Kernel::MsgNextId => line(ipc.msg.with_ids(|ids| ids.next_id())),
         Kernel::PerfEventParanoid => line(crate::perf::PARANOID),
         Kernel::UnprivilegedBpfDisabled => line(crate::bpf::UNPRIVILEGED_DISABLED),
     }
@@ -325,6 +353,24 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
                     limits.all = value;
                 }
             });
+            Ok(consumed)
+        }
+        // `proc_ipc_auto_msgmni`: 0 or 1, to no effect.
+        Kernel::AutoMsgmni => Ok(parse(buf, Some((0, 1)))?.1),
+        // `proc_ipc_dointvec_minmax_orphans`.
+        Kernel::ShmRmidForced => {
+            let (value, consumed) = parse(buf, Some((0, 1)))?;
+            ipc.shm.set_rmid_forced(value);
+            Ok(consumed)
+        }
+        Kernel::ShmNextId | Kernel::SemNextId | Kernel::MsgNextId => {
+            let (value, consumed) = parse(buf, int)?;
+            let set = |ids: &mut crate::ipc::Ids| ids.set_next_id(value);
+            match file {
+                Kernel::ShmNextId => ipc.shm.with_ids(set),
+                Kernel::SemNextId => ipc.sem.with_ids(set),
+                _ => ipc.msg.with_ids(set),
+            }
             Ok(consumed)
         }
         Kernel::Shmmni => {
@@ -417,7 +463,7 @@ pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
         Entry::Kernel(file) => {
             let (uid, gid) = owner(c);
             FileStat {
-                mode: 0o100_644,
+                mode: if file.next_id() { 0o100_444 } else { 0o100_644 },
                 uid,
                 gid,
                 ..crate::proc::stat(kernel_line(&ipc(c), file).len())
@@ -469,7 +515,13 @@ pub(crate) fn open(
             }))
         }
         Entry::Kernel(file) => {
-            if flags & 3 != 0 && (!file.ipc() || c.process.credentials.euid != owner(c).0) {
+            let writer = if file.next_id() {
+                crate::ipc::capable(c, crate::credentials::CAP_CHECKPOINT_RESTORE)
+                    || crate::ipc::capable(c, crate::ipc::CAP_SYS_ADMIN)
+            } else {
+                file.ipc() && c.process.credentials.euid == owner(c).0
+            };
+            if flags & 3 != 0 && !writer {
                 return Err(Errno::EACCES);
             }
             Ok(Arc::new(SettingFile {
@@ -837,7 +889,7 @@ mod tests {
         );
         assert_eq!(entry(b"/proc/sys/kernel/other"), None);
         assert_eq!(entries(Directory::Sys).len(), 4);
-        assert_eq!(entries(Directory::Kernel).len(), 11);
+        assert_eq!(entries(Directory::Kernel).len(), 16);
         assert_eq!(entry(b"/proc/system"), None);
         assert_eq!(entries(Directory::Mqueue).len(), 7);
     }

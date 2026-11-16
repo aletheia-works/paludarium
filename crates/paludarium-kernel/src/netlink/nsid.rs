@@ -7,10 +7,15 @@
 //! a control message, as `do_one_broadcast` sends them.
 //!
 //! An ID goes when its peer does, and `RTNLGRP_NSID` hears of it with
-//! `RTM_DELNSID`, as `unhash_nsid` tells it. Only the first ID of each
-//! peer is given, by a request, never on its own as Linux's
-//! `peernet2id_alloc` does for devices in other namespaces, of which there
-//! are none here.
+//! `RTM_DELNSID`, as `unhash_nsid` tells it. A link or address request
+//! may name a peer by its ID (`IFLA_TARGET_NETNSID`,
+//! `IFA_TARGET_NETNSID`), as [`target`] finds it.
+//!
+//! Only a request gives an ID. Linux's `peernet2id_alloc` also gives one
+//! on its own, for what lies in another namespace than the one telling
+//! of it: a device whose link is there or that moves there, a queue lease,
+//! a devlink instance, a PSP device, an ovpn peer or an openvswitch vport.
+//! None of those is here, and `lo` may not move.
 use super::{
     Errno, Header, NLM_F_MULTI, Nla, Notice, Policy, attribute, extack, message, parse_policy,
 };
@@ -158,6 +163,11 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
         if len < 16 || bytes.len() < len {
             break;
         }
+        // A link or address request may name a peer by its ID, which
+        // needs the sender's `CAP_NET_ADMIN` over it too.
+        if matches!(header.kind, super::RTM_GETLINK | super::RTM_GETADDR) {
+            any = true;
+        }
         if matches!(header.kind, RTM_NEWNSID | RTM_GETNSID) {
             any = true;
             let mut attributes = bytes[16..len].get(4..).unwrap_or_default();
@@ -183,7 +193,7 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8]) -> Resolved {
         }
         bytes = &bytes[super::align(len).min(bytes.len())..];
     }
-    // Only those requests read the sender's credentials (`admin_over`).
+    // Only those requests read the sender's credentials ([`admin_over`]).
     let credentials = any.then(|| c.process.credentials.clone());
     RESOLVED.with(|r| *r.borrow_mut() = (found, credentials));
     Resolved
@@ -249,7 +259,11 @@ fn admin_over(opener: &Credentials, network: &Network) -> bool {
 }
 /// `rtnl_get_net_ns_capable`: the peer of `id`, `EINVAL` for none and
 /// `EACCES` without `CAP_NET_ADMIN` over it.
-fn target(network: &Network, opener: &Credentials, id: i32) -> Result<Arc<Network>, Errno> {
+pub(super) fn target(
+    network: &Network,
+    opener: &Credentials,
+    id: i32,
+) -> Result<Arc<Network>, Errno> {
     let target = network.netlink.ids.peer(id).ok_or(Errno::EINVAL)?;
     if !admin_over(opener, &target) {
         return Err(EACCES);

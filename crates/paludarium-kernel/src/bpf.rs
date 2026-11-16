@@ -7,10 +7,14 @@
 //! every command makes first (`bpf_check_uarg_tail_zero`, `CHECK_ATTR`)
 //! and `kernel.unprivileged_bpf_disabled` at Linux's default 2.
 //!
-//! The memory a map takes (fdinfo's `memlock`, and the `ENOMEM` of one
-//! larger than the machine's memory) is counted as Linux 7.0, the kernel
-//! the x86-64 test machines run, lays out its structures on x86-64; Linux
-//! master's hash elements are smaller.
+//! The checks and their order follow Linux master, where the x86-64 test
+//! machines' kernel (Ubuntu's Linux 7.0) differs too: a hash's key and
+//! value limit, and where `BPF_F_RDONLY` with `BPF_F_WRONLY` is refused.
+//! Only what the differential tests compare with that kernel keeps its
+//! values until it catches up with master: the memory a map takes
+//! (fdinfo's `memlock`, and the `ENOMEM` of one larger than the machine's
+//! memory), counted with its x86-64 structure sizes; see [`ARRAY_HEADER`]
+//! and [`HASH_HEADER`] for where they part from upstream v7.0 and master.
 //!
 //! A command Linux has that is not here (programs, BTF, links, pins and the
 //! rest) is `ENOSYS`; one Linux does not have is `EINVAL`, as there. Map
@@ -371,7 +375,9 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
                 return Err(Errno::EINVAL);
             }
             // KMALLOC_MAX_SIZE, 4 MiB with SLUB on x86-64, less the LRU
-            // element's header.
+            // element's header (64 bytes), as Linux master has it; the test
+            // machines' Linux 7.0 takes 16 bytes more (less 48, the size of
+            // its `struct htab_elem`).
             if u64::from(key_size) + u64::from(value_size) >= (1 << 22) - 64 {
                 return Err(E2BIG);
             }
@@ -425,6 +431,9 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     } else if excl_hash_size != 0 {
         return Err(Errno::EINVAL);
     }
+    // As Linux master's `map_create`, once the map is made; the test
+    // machines' Linux 7.0 refuses both flags before the NUMA node and the
+    // type.
     let access = file_access(flags)?;
     let ids = &c.processes.bpf_maps;
     let map = ids.publish(|id| Map {
@@ -454,13 +463,21 @@ fn new_fd(c: &mut Context<'_>, map: Arc<Map>, access: u32) -> Result<u64, Errno>
         .map(u64::from)
 }
 
-/// `sizeof(struct bpf_array)` before the values, as the test machines'
-/// Linux 7.0 (Ubuntu's) has it on x86-64: 8 bytes more than upstream
-/// v7.0's 304, whose `struct bpf_map` is 288 bytes, in the size the native
-/// runs give.
+/// `sizeof(struct bpf_array)` before the values on x86-64, 312 bytes on the
+/// test machines' kernel (`Ubuntu-azure-7.0.0-1019.20`, Ubuntu-7.0.0-44.44
+/// too): Ubuntu carries `u32 excl` after `struct bpf_map`'s `sha`, from
+/// Linux 7.2's 0fb6c9ed6493 ("libbpf: Reject non-exclusive metadata maps
+/// in the signed loader"), which Linux 7.3 removed again (a2d784869a0f).
+/// Upstream v7.0 and its stable releases have 304. Linux master has 312
+/// as well, by another field: `unsigned long user` (a04286f6d828, "bpf:
+/// Recognize pointers to functions in read-only maps", in 7.4-rc1).
 const ARRAY_HEADER: u64 = 312;
-/// Linux 7.0's `sizeof(struct bpf_htab)`, `sizeof(struct htab_elem)`
-/// before the key, and `sizeof(struct bucket)`, on x86-64.
+/// `sizeof(struct bpf_htab)`, `sizeof(struct htab_elem)` before the key,
+/// and `sizeof(struct bucket)` on x86-64, as Linux 7.0 has them (the test
+/// machines' 8 more bytes of `struct bpf_map` vanish in `bpf_htab`'s
+/// 64-byte alignment). Linux master's differ: its `bpf_htab` is 832 bytes
+/// without the per-CPU counter (1cd28b5354ab) and its elements smaller
+/// (26c9dc906692, 0d0421c96f67), so these stay the test machines'.
 const HASH_HEADER: u64 = 896;
 const HASH_ELEMENT: u64 = 48;
 const BUCKET: u64 = 16;

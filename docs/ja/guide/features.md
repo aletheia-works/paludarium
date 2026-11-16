@@ -11,6 +11,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MOVBE`、`ENTER`／`LEAVE` など。
 - **ヒントの命令**：`PAUSE` と、プリフェッチの `PREFETCHNTA`／`PREFETCHT0`／`T1`／`T2`。
   状態を何も変えず、フォールトも起こしません。
+- **トラップ**：トラップフラグでシングルステップします。`TF` が立っている間（`popf`、
+  `rt_sigreturn`、トレーサーが立てられます）、各命令の後に `TRAP_TRACE` の `SIGTRAP` が
+  来て、アドレスは命令の次です（トラップ 1）。`syscall` だけは、カーネルの中でフラグが
+  消され、Linux が `iret` で戻るので来ません。シグナルハンドラーはフラグを消して始まります。
+  `int3` は、カーネルからの（`SI_KERNEL`、トラップ 3）`SIGTRAP` で、`rip` はその次です。
 - **SSE 系**：MMX レジスタを使うものを除く SSE と SSE2 のすべての命令（エンコーディング
   ごとにテストで動かしています。フェンスの `MFENCE`／`LFENCE`／`SFENCE` を含みます）。
   それより後の命令セットは、実際のプログラム（probe、aube、pitchfork）が使う命令と、
@@ -1624,9 +1629,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `IFLA_TARGET_NETNSID` だけを取ります。経路の検索は、`rtnl_valid_getlink_req`、
     `inet_rtm_valid_getroute_req`、`inet6_rtm_valid_getroute_req` と同じく、アドレス
     全体の接頭辞長と経路を選ぶ属性だけを取ります。検査の有無にかかわらず、`lo` には
-    マスターがないのでリンクのダンプの `IFLA_MASTER` はどのデバイスも見せず、ほかの
-    名前空間のリンクは見せないので `IFLA_TARGET_NETNSID` は `EINVAL` です。`lo` には
+    マスターがないのでリンクのダンプの `IFLA_MASTER` はどのデバイスも見せません。`lo` には
     プレフィックス経路がないので、`RTM_F_PREFIX` はどの経路もダンプしません。
+  - **ID で指したほかの名前空間:** `IFLA_TARGET_NETNSID` を付けたリンクのダンプと取得
+    （検査の有無にかかわらず）と、`IFA_TARGET_NETNSID` を付けた厳密な検査のアドレスの
+    ダンプは、その ID が指す名前空間（後述の名前空間の ID を参照）のリンクやアドレスを
+    見せます。答えにはその ID を載せます。リンクでは、Linux 7.0 の `rtnl_fill_ifinfo` と
+    同じく名前より前の先頭の `IFLA_TARGET_NETNSID`（`IFLA_IF_NETNSID`）です（Linux の
+    master ブランチは名前の後に置きます）。アドレスでは、`inet_fill_ifaddr`、
+    `inet6_fill_ifaddr` と同じくそれぞれの先頭の `IFA_TARGET_NETNSID` です。
+    `AF_UNSPEC` のダンプの MCTP のアドレスは、ソケット自身の名前空間のままです。だれも
+    持たない ID は `EINVAL`、ソケットを開いた側か送り手がその名前空間の持ち主で
+    `CAP_NET_ADMIN` を持たなければ `EACCES` で（`rtnl_get_net_ns_capable`）、ダンプでは
+    Linux の拡張 ACK のメッセージを付けます。IPv6 のアドレス 1 つ（`IFA_TARGET_NETNSID`
+    を付けた `RTM_GETADDR`）は、その名前空間で探します。その答えは、`inet6_rtm_getaddr` が
+    `rtnl_unicast` で送るのと同じく、その名前空間でリクエストした側のポートを持つ
+    ソケットに届きます。そのようなソケットがなければ、リクエストは `ECONNREFUSED` です。
   - **属性のポリシー:** 各リクエストの属性は、まず Linux がそのリクエストに持つ
     ポリシー（`ifla_policy`、`ifa_ipv4_policy`、`ifa_ipv6_policy`、`rtm_ipv4_policy`、
     `rtm_ipv6_policy`、新しいリンクの `IFLA_LINKINFO` の中では `ifla_info_policy`）で、
@@ -2282,11 +2300,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `fd`、`fdinfo`、`ns`、`task` があります。これらとディレクトリの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。`/proc/self` そのものは root のものです。`stat` は
-  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、ほかのファイルは 0444）を示し、
+  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、`comm` は 0644、ほかのファイルは 0444）を示し、
   開いたものの `fstat` は開いたときの持ち主を示します。Linux はその時点の持ち主です。開くときは Linux の `generic_permission` と同じくその
   持ち主に対してモードを確かめるので、`CAP_DAC_OVERRIDE` なしに書き込み用に開くと
   `EACCES` で、ダンプできないプロセスが `environ`、`auxv`、`pagemap` を読むために開いても
-  `EACCES` です。root が開いたものへの書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  `EACCES` です。書き込み用に開いたもの（root のものや、持ち主が開いた `comm`）への書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を
@@ -2306,8 +2324,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`comm`、
-  `maps`、`smaps`、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、`ns`（0511）、
-  `task` があり、
+  `maps`、`smaps`、`pagemap`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
   ホストの `/proc` に何があっても `ENOENT` です。`task` はプロセスのスレッドを並べ、
@@ -2317,12 +2335,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンク（0777）で、`<pid>/task/<tid>` と読めます。スレッド自身の ID も、Linux と同じく、
   そのスレッドから見たプロセスのディレクトリを指し、`/proc` には並びません。Linux の
   `ptrace_may_access` と同じく、同じプロセスでなく `CAP_SYS_PTRACE` もない読み手には、
-  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
+  `environ` は実 ID が、`auxv`、`maps`、`smaps`、`pagemap`、`exe`、`cwd`、`root`、`fdinfo`、`ns` と `fd` のリンクはファイルシステムの ID が、ダンプできるプロセスの
   ユーザーとグループのすべての ID と同じで、そのプロセスが同じユーザー名前空間にいて、
   その許可されたケーパビリティを読み手のもの（ファイルシステムの ID の場合は実効
   ケーパビリティ）が含むのでなければ `EACCES` です。上に書いた、ほかのプロセスを読む場合と
   同じです。ダンプできないプロセスの
-  ディレクトリの持ち主は root です。`statm` と `limits` は、Linux と同じく誰でも読めます。
+  ディレクトリの持ち主は root です。ファイルの持ち主はこのプロセス自身のもの（前述）と
+  同じで、開くときは Linux の `generic_permission` と同じく、ほかの何よりも先に通常の
+  ファイルのモードをその持ち主に対して確かめます（`EACCES`）。書き込むには、`comm`、
+  `uid_map`、`gid_map`、`setgroups`（0644）を除いて `CAP_DAC_OVERRIDE` が要り、`environ`、
+  `auxv`、`pagemap` を読むには持ち主か `CAP_DAC_OVERRIDE` が要ります。開いたものの `fstat` は、
+  開いたときの持ち主を示します。`statm` と `limits` は、Linux と同じく誰でも読めます。
   `fd` そのものを読むことと中を探すことは、Linux の
   `proc_fd_permission` と同じくそのモード（0500）が許す読み手だけができます。`fd` と
   `fdinfo` は、このプロセス自身のもの（後述）と同じものを、ほかのプロセスのディスクリプタに
@@ -2333,14 +2356,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルのマウントと、そのプロセスが持つレコードロックを示します。ほかのプロセスについて見えるのは、そのプロセスのスレッドが
   最後のシステムコールかシグナルの確認で公開したもの（名前（`PR_SET_NAME`、`execve`）、
   ブロックしているシグナルと保留中のシグナル、資格情報）と、その時点のプロセスの
-  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
+  シグナルの扱い、メモリ（`cmdline`、`environ`、`auxv`、`maps`、`smaps`、`pagemap`、`statm`、`stat` の大きさ）、リソース制限、カレントディレクトリ、
   umask、ディスクリプタです。状態は、読んでいるプロセスなら `R`、ジョブ制御で止まって
   いる間は `T (stopped)`、終わってから回収されるまでは `Z (zombie)`、スレッドがシステム
   コールの中にいる間（待つならそこで待つので）は `S (sleeping)`、それ以外は `R` です。
   ゾンビは名前と ID を残し、スレッドは 1 つと数え、メモリも umask もディスクリプタも
   持ちません。Linux と同じく、`cmdline`、`maps`、`smaps` は空、`statm` はすべて 0、`fd` と `fdinfo` には何もなく、`exe`、`cwd`、`root` は `ENOENT` で、`limits` は残ります。
-  Linux の `__mem_open` は、読み手を確かめる前にメモリのないプロセスを断るので、
-  ゾンビの `environ` と `auxv` は、どの読み手にも開けません（`ESRCH`）。
+  Linux の `proc_mem_open` はメモリのあるプロセスについてだけ読み手を確かめるので、
+  ゾンビの `maps` と `smaps` は、モードが許すどの読み手も開けます。Linux の `__mem_open` と
+  `pagemap_open` は、読み手を確かめる前にメモリのないプロセスを断るので、ゾンビの
+  `environ`、`auxv`、`pagemap` は、モードが許すどの読み手にも開けません（`ESRCH`）。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、
@@ -2394,7 +2419,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EINVAL` で、その前の値は設定されたままです。`semmni` は、最後に 0 から 32768 の間に
   なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに `perf_event_paranoid` と
   `unprivileged_bpf_disabled` があり、Linux の既定値の 2 を読めますが、誰も書くために
-  開けません（`EACCES`）。`/proc/sys/kernel` にあるのはこれらだけです。
+  開けません（`EACCES`）。`shm_rmid_forced`（0 か 1。持ち主と書ける者は上限と同じ）を
+  設定すると、Linux の `shm_close` と `exit_shm` と同じく、セグメントは最後に外れたときに
+  消え、作ったスレッドが一度もつながなかったものは、そのスレッドが終わるか名前空間を
+  離れたときに消えます。設定したときには、どのマッピングにもない孤児のセグメントを
+  消します（`shm_destroy_orphaned`）。`auto_msgmni` は 0 を読め、0 か 1 を書いても何も
+  起きません。`shm_next_id`、`sem_next_id`、`msg_next_id`（モード 0444。名前空間の
+  ユーザー名前空間で `CAP_CHECKPOINT_RESTORE` か `CAP_SYS_ADMIN` を持つ者は書けます）は、
+  その種類の次のオブジェクトが一度だけ取る ID で、なければ -1 です。書けるのは 0 から
+  `INT_MAX` までで、オブジェクトはそのシーケンス番号と、その添字から最初の空いている
+  添字を取ります。`/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
+  ディレクトリも、Linux の木と同じく、名前の順に並べます。
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
   と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
   （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、
@@ -2405,7 +2440,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`MKDEV`）でのファイルシステムのデバイス、`mask:` に与えたマスクを 16 進で書き、
   `ignored_mask:0` と、`show_mark_fhandle` と同じファイルのハンドルが続きます。
   `fhandle-bytes:` と `fhandle-type:` は 16 進で、`f_handle:` はそのバイトで、
-  `AT_HANDLE_FID` の `name_to_handle_at` が返す識別子です。ほかの種類のファイルも Linux と同じ行を加えます。
+  `AT_HANDLE_FID` の `name_to_handle_at` が返す識別子です。pidfd では、`pidfd_show_fdinfo` と
+  同じく `Pid:` と `NSpid:` が加わります。そのプロセス（またはスレッド）の、`/proc` の PID
+  名前空間である最初の名前空間での番号（ゾンビでも同じで、回収されると -1）と、その下の
+  名前空間それぞれでの自分の名前空間までの番号です。ほかの種類のファイルも Linux と同じ行を加えます。
   最初の 4 行の後には `lock:` の行が続きます（`show_fd_locks`）。まずファイル記述の
   `flock` のロック、次にそのファイル記述を通して掛けたレコードロックのうちプロセスの表か
   ファイル記述が持つものが始まりの順に並び、両方を通して 1 から番号が付きます。各行には
@@ -2797,7 +2835,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
   と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
   イベントをそのタスクの `execve` で有効にし、`remove_on_exec` はそのとき
-  イベントを以後ずっと無効にします。ディスクリプタのリンクは
+  イベントを以後ずっと無効にします。`prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と `ENABLE` は、
+  呼んだスレッドが開いたすべてのイベントを、どのタスクを数えるものでも（無効で開いたものも）
+  無効または有効にし、ほかの引数は読みません。`execve` を実行したスレッドは、開いたイベントを
+  そのまま持ちます。`sample_simd_regs_enabled` があると、Linux master の構造体の SIMD
+  レジスタのフィールドを、x86 の `perf_simd_reg_validate` と同じく確かめます（`EINVAL`）。
+  XMM か YMM（2 か 4 クワッドワード）は 16 個すべて、ZMM（8）は 32 個すべて、opmask（1）は
+  8 個すべてか、どれもないかです。正しく使っても、ソフトウェアのイベントは取らないので
+  `EOPNOTSUPP` です。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを
@@ -2826,9 +2871,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `INT_MAX` からは `EINVAL`）、`BPF_MAP_GET_FD_BY_ID` はマップの新しい close-on-exec の
   ディスクリプタを `open_flags`（`BPF_F_RDONLY` か `BPF_F_WRONLY`）に従って開きます
   （どのマップの ID でもなければ `ENOENT`）。どちらも、フィールドを確かめた（`EINVAL`）あとで
-  `CAP_SYS_ADMIN` が要ります（`EPERM`）。マップが取るメモリは、x86-64 のテストのマシンが
-  動かす Linux 7.0 が x86-64 で与えるものです。配列は 312 バイトのヘッダーと、8 バイトに
-  切り上げたすべての値です（マップできるものはそれぞれをページに揃えます）。ハッシュは
+  `CAP_SYS_ADMIN` が要ります（`EPERM`）。マップが取るメモリは、x86-64 のテストのマシンの
+  カーネル（Ubuntu の Linux 7.0）が x86-64 で与えるものです。配列は 312 バイトの
+  ヘッダーと、8 バイトに切り上げたすべての値です（マップできるものはそれぞれをページに揃えます）。ハッシュは
   896 バイトのヘッダー、バケット一つに 16 バイト（`max_entries` を 2 のべき乗に切り上げた数。
   2^31 を超えるエントリや 4 GiB を超えるバケットは `E2BIG`）と要素で、要素は 48 バイトと、
   それぞれ 8 バイトに切り上げたキーと値です。事前に確保するものはすべての要素と CPU ごとに
@@ -3447,6 +3492,12 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
   `PTRACE_EVENT_EXIT` を報告し（致命的なシグナルがコアをダンプするときは、ステータスに
   0x80 が付きます）、それとともに終わるスレッドは報告しません。
+- `PTRACE_SINGLESTEP` はトラップフラグを立ててトレース対象を再開します。トレース対象が
+  自分で立てたのでなければ、トレーサーにはレジスタで見えず（`TIF_FORCED_TF`）、ほかの再開で
+  消えます。トレース対象は 1 命令の後に `SIGTRAP` で止まり、`syscall` の後はその出口で
+  `TRAP_BRKPT` で止まります。シングルステップ中のトレース対象は、シグナルハンドラーに入る前に
+  `SIGTRAP` で止まります。`PTRACE_SYSEMU_SINGLESTEP` も同じくステップし、さらに
+  `PTRACE_SYSEMU` と同じく、各システムコールの入口で止まって実行しません。
 - `PTRACE_PEEKSIGINFO` は、止まっているトレース対象に、`PTRACE_PEEKSIGINFO_SHARED` 付きでは
   そのプロセスに保留中のシグナルの siginfo を、来た順に読みます。`PTRACE_GETSIGMASK` は
   ブロックしているシグナル（`sigsuspend` や `ppoll` の待ちの間は、戻すマスク）を示し、

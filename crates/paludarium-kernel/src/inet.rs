@@ -1250,6 +1250,11 @@ impl InetSocket {
         let Some(stream) = s.stream.clone() else {
             return Err(Errno::EPIPE);
         };
+        // Read before the write: a connection open then was open for it,
+        // so its EAGAIN is a full buffer and not one still connecting,
+        // which Linux's `sk_stream_wait_connect` refuses without
+        // `SOCKWQ_ASYNC_NOSPACE`.
+        let was_open = stream.phase() == Phase::Open;
         let written = stream.write(bytes);
         if let Ok(n) = written
             && n > 0
@@ -1270,7 +1275,7 @@ impl InetSocket {
             {
                 Err(s.error.take().unwrap_or(Errno::EPIPE))
             }
-            Err(e) if e == Errno::EAGAIN && stream.phase() == Phase::Open => {
+            Err(e) if e == Errno::EAGAIN && was_open => {
                 self.signals.full();
                 Err(e)
             }
@@ -2396,6 +2401,14 @@ impl FileHandle for InetSocket {
         // order never show a failed connection without its error, as
         // Linux's `tcp_done_with_error` writes `sk_err` before the state; a
         // change after them wakes the wait again.
+        // A connection already open before the readiness was read was open
+        // in it, so only then is a stream not writable full: one that
+        // opened in between was read while connecting, which Linux's
+        // `tcp_poll` leaves without `SOCKWQ_ASYNC_NOSPACE`.
+        let was_open = s
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.phase() == Phase::Open);
         let read = s
             .stream
             .as_ref()
@@ -2421,7 +2434,7 @@ impl FileHandle for InetSocket {
             Phase::Connecting => 0,
             Phase::Failed(_) => IN | OUT | POLLHUP | POLLRDHUP,
             Phase::Open => {
-                if !ready.writable {
+                if was_open && !ready.writable {
                     self.signals.full();
                 }
                 let read_end = ready.read_closed || s.read_shut;

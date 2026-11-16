@@ -62,9 +62,11 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
   `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
-- **`/proc/self/pagemap`, in part**: it is there for the reader itself
-  only (`/proc/self` and its own PID), not in `/proc/thread-self`,
-  `task/<tid>` or another process's directory. Its entries come from the
+- **Writing `comm`**: a write to `/proc/<pid>/comm` or
+  `/proc/<pid>/task/<tid>/comm` is `EINVAL`, where Linux renames the thread
+  when the writer is of its process (musl's `pthread_setname_np` of another
+  thread writes there; `prctl(PR_SET_NAME)` works).
+- **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do: a page that a `fork`
   shared is not exclusive (bit 56) until this process writes it, even
   after the other has let it go, and a page of shared memory or of a file
@@ -225,17 +227,20 @@ verified.
   and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
   disables the event at its task's `execve` and leaves it to be read, where
   Linux takes it out of the task's context, and the members of a group it
-  led count on their own. The events that wait for an `execve` are kept in
-  one list for every emulated machine, matched by thread group and thread,
-  and dropped as they close. A group's members count whatever software
+  led count on their own. The events that wait for an `execve`, and those
+  each thread opened, are kept per emulated machine, matched by thread
+  group and thread, and dropped as they close. A thread that ends without
+  an `execve` keeps the events it opened, where Linux takes them from it,
+  so a later thread of the same number in that group, once the numbers
+  have gone round, would find them. A group's members count whatever software
   clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
   group no count on the x86-64 machines the tests run on (why was not found).
-  The SIMD register
-  fields of Linux master's structure are not checked, and any use of them is
-  `EOPNOTSUPP`. `kernel.perf_event_paranoid` is always 2 (Debian's and
+  The SIMD register fields of Linux master's 176-byte structure are checked
+  as master checks them and not compared with Linux: the test machines'
+  Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
+  0. `kernel.perf_event_paranoid` is always 2 (Debian's and
   Ubuntu's kernels default to more), and its `/proc/sys/kernel` file cannot
-  be written (mode 0444), where Linux's root may write Linux's (0644),
-  and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` are not there.
+  be written (mode 0444), where Linux's root may write Linux's (0644).
 - **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
   links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
@@ -253,13 +258,23 @@ verified.
   its keys in the order of their bytes, where Linux's order follows its
   buckets and a random seed, and a batch of it takes each element as a
   bucket of its own, so `in_batch` and `out_batch` count elements. A map's
-  memory follows the sizes of Linux 7.0's structures, not Linux master's,
-  whose hash elements are smaller, and the elements are not taken from
+  memory follows the structure sizes of the test machines' kernel,
+  Ubuntu's Linux 7.0, not upstream Linux's: its `struct bpf_map` carries
+  the `u32 excl` that Ubuntu took from Linux 7.2 (0fb6c9ed6493, removed in
+  7.3), so an array's header is 312 bytes where upstream v7.0's is 304.
+  Linux master's array header is 312 bytes too, through another field,
+  but its hash header (832 bytes) and elements are smaller than the 896
+  and 48 bytes here. The elements are not taken from
   the machine until they are written: no memory cgroup is charged, and
   only a map larger than the machine's 4 GiB is `ENOMEM`, where Linux may
   also run out of the memory it really has. A preallocated hash counts a
   spare element for each CPU of the host, where Linux counts the possible
-  CPUs, which may be more. Map IDs are the emulated machine's, so they
+  CPUs, which may be more. The checks follow Linux master where the test
+  machines' Linux 7.0 differs: a hash whose key and value take 4 MiB less
+  64 bytes or more is `E2BIG` (7.0 takes up to 4 MiB less 48), and
+  `BPF_F_RDONLY` with `BPF_F_WRONLY` is refused once the map is made (7.0
+  refuses it before the NUMA node and the type, so another error may come
+  first here). Map IDs are the emulated machine's, so they
   start at 1 and do not see the host's maps. `BPF_F_MMAPABLE` is taken but `mmap` of a map
   is `ENODEV`, and a map's SHA-256 (`bpf_map_info.hash`) is `EINVAL`.
   `kernel.unprivileged_bpf_disabled` is always 2, and its
@@ -423,11 +438,13 @@ verified.
     a pidfd with `PIDFD_THREAD` has the inode of its whole process. A pidfd
     opened from a handle with `O_EXCL` does not keep `PIDFD_THREAD`, as on
     the CI runners' Linux 7.0, where Linux 7.2 and later keep it.
-  - System V IPC has no `shm_rmid_forced`, `auto_msgmni`,
-    `shm_next_id`, `sem_next_id` or `msg_next_id` in `/proc/sys/kernel`,
-    and `IPCMNI` is always 32768, as without the `ipcmni_extend` boot
-    option. `/proc/sysvipc` shows its objects as they were when it was opened,
-    where Linux reads each one as the read reaches it.
+  - System V IPC's `IPCMNI` is always 32768, as without the
+    `ipcmni_extend` boot option, and an ID a `*_next_id` asks for whose
+    index and all after it below 32768 are taken is `ENOSPC`, where Linux
+    gives an index past them. A read of `shm_rmid_forced` set removes no
+    orphans, where Linux's does as its write does. `/proc/sysvipc` shows
+    its objects as they were when it was opened, where Linux reads each one
+    as the read reaches it.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
     `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,
@@ -461,9 +478,7 @@ verified.
     value's length as its size, where Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
-  - `ptrace` has no single-stepping yet: `PTRACE_SINGLESTEP`,
-    `PTRACE_SYSEMU_SINGLESTEP` and the other requests the features do not
-    list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
+  - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
     checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
@@ -802,13 +817,13 @@ verified.
   where Linux's count every namespace's; its own parameters' references
   are 1.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
-  ID is given only by `RTM_NEWNSID`, as no device of another namespace
-  makes Linux's `peernet2id_alloc` give one; the `RTM_DELNSID` of a
+  ID is given only by `RTM_NEWNSID`: Linux's `peernet2id_alloc` gives one
+  on its own only for what lies in another namespace than the one
+  telling of it (a device's link or a device that moves there, a queue
+  lease, a devlink instance, a PSP device, an ovpn peer, an openvswitch
+  vport), none of which is here, and `lo` may not move; the `RTM_DELNSID` of a
   namespace that goes is sent as its last holder lets it go, where
-  Linux sends it a little later, from a work queue; and
-  `IFLA_TARGET_NETNSID` and
-  `IFA_TARGET_NETNSID` are `EINVAL` even for an ID a namespace has, as
-  no other namespace's links or addresses are dumped. MCTP is as Ubuntu's kernel,
+  Linux sends it a little later, from a work queue. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries
   MCTP's settings and `AF_MCTP` address and route dumps have their own
   answers, where a kernel without it gives no MCTP settings, dumps

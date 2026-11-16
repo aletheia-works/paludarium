@@ -13,6 +13,13 @@ Linux.
   `MOVBE`, `ENTER`/`LEAVE` and more.
 - **Hints**: `PAUSE` and the `PREFETCHNTA`/`PREFETCHT0`/`T1`/`T2` prefetches,
   which change nothing and never fault.
+- **Traps**: the trap flag single-steps: with `TF` set, which `popf`,
+  `rt_sigreturn` and a tracer may set, each instruction is followed by a
+  `SIGTRAP` with `TRAP_TRACE` and its address past the instruction (trap
+  1), except `syscall`, as the flag is masked off in the kernel and Linux
+  returns with `iret`; a signal handler starts with the flag cleared.
+  `int3` gives `SIGTRAP` from the kernel (`SI_KERNEL`, trap 3) with `rip`
+  past it.
 - **SSE**: every SSE and SSE2 instruction, except those that use MMX registers
   (a test runs each encoding), the `MFENCE`/`LFENCE`/`SFENCE` fences among them.
   Of the later sets, the instructions real programs (probe, aube and pitchfork)
@@ -1856,9 +1863,25 @@ kernel.
     the attributes that select a route, as `rtnl_valid_getlink_req`,
     `inet_rtm_valid_getroute_req` and `inet6_rtm_valid_getroute_req`.
     Checked or not, a link dump's `IFLA_MASTER` shows no device, as `lo`
-    has no master, and `IFLA_TARGET_NETNSID` is `EINVAL`, as no other
-    namespace's links are shown; `RTM_F_PREFIX` dumps no route, as `lo` has no
-    prefix route.
+    has no master; `RTM_F_PREFIX` dumps no route, as `lo` has no prefix
+    route.
+  - **Another namespace by its ID:** a link dump or get with
+    `IFLA_TARGET_NETNSID`, checked or not, and a strictly checked address
+    dump with `IFA_TARGET_NETNSID`, show the link or addresses of the
+    namespace that ID names (see Namespace IDs below), with that ID in
+    the answer: `IFLA_TARGET_NETNSID` (`IFLA_IF_NETNSID`) first, before
+    the link's name, as Linux 7.0's `rtnl_fill_ifinfo` puts it (Linux's
+    master branch puts it after the name), and `IFA_TARGET_NETNSID` first
+    in each address, as `inet_fill_ifaddr` and `inet6_fill_ifaddr` put
+    it; an `AF_UNSPEC` dump's MCTP addresses are still the socket's own
+    namespace's. An ID none has is `EINVAL`, and a namespace whose
+    owner the socket's opener or the sender lacks `CAP_NET_ADMIN` in is
+    `EACCES` (`rtnl_get_net_ns_capable`), with Linux's extended-ack
+    message in a dump. A single IPv6 address (`RTM_GETADDR` with
+    `IFA_TARGET_NETNSID`) is looked for in that namespace, and its
+    answer, as `inet6_rtm_getaddr` sends it with `rtnl_unicast`, goes to
+    the socket that has the requester's port there; with none, the
+    request is `ECONNREFUSED`.
   - **Attribute policies:** each request's attributes are checked first,
     in their order, against the policy Linux has for it (`ifla_policy`,
     `ifa_ipv4_policy`, `ifa_ipv6_policy`, `rtm_ipv4_policy`,
@@ -2626,12 +2649,13 @@ kernel.
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them; `/proc/self` itself is root's. `stat` shows that owner and
-  the mode, 0400 for `environ`, `auxv` and `pagemap` and 0444 for the other files,
+  the mode, 0400 for `environ`, `auxv` and `pagemap`, 0644 for `comm` and 0444 for the other files,
   and `fstat` of an open one the owner it had when it was opened, where
   Linux's is the owner of that moment. An open checks the mode for that owner, as Linux's
   `generic_permission` does, so opening one for writing is `EACCES` without
   `CAP_DAC_OVERRIDE`, and so is reading `environ`, `auxv` or `pagemap` once the
-  process is not dumpable; root's write to one it opened is `EINVAL`.
+  process is not dumpable; a write to one opened for writing (root's, or
+  `comm` by its owner) is `EINVAL`.
   `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
@@ -2655,8 +2679,8 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`,
-  `comm`, `maps`, `smaps`, `exe`, `cwd`, `root`, `mounts`, `mountinfo`,
-  `fd`, `fdinfo`, `ns` (0511) and `task`, made as
+  `comm`, `maps`, `smaps`, `pagemap` (0400), `exe`, `cwd`, `root`, `mounts`,
+  `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
@@ -2667,12 +2691,18 @@ kernel.
   thread's own ID names a directory of its process as that thread sees it,
   which `/proc` does not list, as on Linux. As Linux's `ptrace_may_access`
   decides, a reader that is not of the process and has no `CAP_SYS_PTRACE`
-  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `exe`, `cwd`,
+  gets `EACCES` for `environ` unless its real IDs, and for `auxv`, `maps`, `smaps`, `pagemap`, `exe`, `cwd`,
   `root`, `fdinfo` and the links of `ns` and `fd` unless its filesystem IDs, are every user and group ID of a dumpable
   process in its user namespace whose permitted capabilities its own cover
   (its effective ones for the filesystem IDs), as reading another process
-  asks above; an undumpable process's directory is root's. `statm` and
-  `limits` are anyone's to read, as on Linux. `fd` itself is read
+  asks above; an undumpable process's directory is root's. Its files are
+  owned as this process's own are (above), and an open checks a regular
+  file's mode for that owner before anything else, as Linux's
+  `generic_permission` does (`EACCES`): writing needs `CAP_DAC_OVERRIDE`
+  but for `comm`, `uid_map`, `gid_map` and `setgroups` (0644), and
+  reading `environ`, `auxv` or `pagemap` needs the owner or
+  `CAP_DAC_OVERRIDE`. `fstat` of an opened one shows the owner it had
+  when it was opened. `statm` and `limits` are anyone's to read, as on Linux. `fd` itself is read
   and looked in as its mode (0500) lets the reader, as Linux's
   `proc_fd_permission` decides. `fd` and `fdinfo` are as this process's own
   (below), of the other process's descriptors; a link of `fd` opens its
@@ -2684,16 +2714,18 @@ kernel.
   another is what that process's threads published at their last system call
   or signal check: the name (`PR_SET_NAME`, `execve`), the blocked and pending
   signals and the credentials, with the process's dispositions, memory (for
-  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
+  `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `pagemap`, `statm` and the sizes in `stat`), resource limits, current directory, umask and
   descriptors as they are. Its state is `R` for the reader, `T (stopped)`
   during a job-control stop, `Z (zombie)` once it has ended and until it is
   reaped, `S (sleeping)` while its thread is in a system call, where it waits
   if it waits, and `R` otherwise. A zombie keeps its name and IDs, counts one
   thread, and has no memory, umask or descriptors: its `cmdline`,
-  `maps` and `smaps` are empty, its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
-  `environ` and `auxv` do not open (`ESRCH`, for any reader), as Linux's
-  `__mem_open` refuses a process with no memory before it checks the
-  reader.
+  `maps` and `smaps` are empty, and open for any reader their mode lets,
+  as Linux's `proc_mem_open` checks the reader only of a process with
+  memory; its `statm` is all 0, its `fd` and `fdinfo` list nothing, and `exe`, `cwd` and `root` are `ENOENT`, as on Linux; its `limits` stay. Its
+  `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
+  their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
+  process with no memory before they check the reader.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0
@@ -2760,7 +2792,19 @@ kernel.
   `semmni` goes back to what it was unless it ends from 0 to 32768
   (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them, `perf_event_paranoid` and
   `unprivileged_bpf_disabled` read 2, Linux's defaults, and no one may
-  open them to write (`EACCES`). `/proc/sys/kernel` lists only these.
+  open them to write (`EACCES`). `shm_rmid_forced` (0 or 1, owned and
+  written as the limits) makes a segment go at its last detach and those
+  its maker never attached go when it exits or leaves the namespace, as
+  Linux's `shm_close` and `exit_shm` do; setting it removes the orphans no
+  mapping shows (`shm_destroy_orphaned`). `auto_msgmni` reads 0 and takes 0
+  or 1 to no effect. `shm_next_id`, `sem_next_id` and `msg_next_id` (mode
+  0444, which whoever has `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` over
+  the namespace's user namespace may write) are the ID the next object of
+  their kind takes, once, -1 for none: a write sets it from 0 to `INT_MAX`,
+  and the object takes its sequence number and the first free index from
+  its own. `/proc/sys/kernel` lists only these, and each directory of
+  `/proc/sys` lists its entries by name, as Linux's tree of them keeps
+  them.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
   descriptor, as Linux's `seq_show` writes it: `pos`, the description's
   position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and
@@ -2772,7 +2816,10 @@ kernel.
   hexadecimal, then `ignored_mask:0` and the file's handle as
   `show_mark_fhandle` writes it: `fhandle-bytes:` and `fhandle-type:` in
   hexadecimal, and `f_handle:`, its bytes, the identifier
-  `name_to_handle_at` gives with `AT_HANDLE_FID`. The other kinds add Linux's lines
+  `name_to_handle_at` gives with `AT_HANDLE_FID`. A pidfd's adds `Pid:` and
+  `NSpid:`, as `pidfd_show_fdinfo`: the number of its process (or thread) in
+  the first PID namespace, that of `/proc`, a zombie's too, or -1 once it is
+  reaped, then its numbers in each namespace below down to its own. The other kinds add Linux's lines
   too. After the first four come `lock:` lines (`show_fd_locks`): the
   description's `flock` lock, then each record lock set through it that the
   process's table or the description owns, by where they start, numbered from 1
@@ -3226,8 +3273,16 @@ kernel.
   and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
   for an event that does not sample. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
-  `remove_on_exec` disables one then for good. The
-  descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  `remove_on_exec` disables one then for good. `prctl`'s
+  `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` disable and enable every
+  event the calling thread opened, whatever task it counts (one opened
+  disabled too), and read no other argument; a thread that runs `execve`
+  keeps the events it opened. With `sample_simd_regs_enabled`, the SIMD
+  register fields of Linux master's structure are checked as x86's
+  `perf_simd_reg_validate` checks them (`EINVAL`): XMM or YMM (2 or 4
+  quadwords) all 16 registers, ZMM (8) all 32, the opmask ones (1) all 8,
+  or none; a valid use of them is `EOPNOTSUPP`, as a software event takes
+  none. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and
@@ -3262,8 +3317,8 @@ kernel.
   `BPF_MAP_GET_FD_BY_ID` a new close-on-exec descriptor of a map, open as
   `open_flags` (`BPF_F_RDONLY` or `BPF_F_WRONLY`) asks (`ENOENT` for an ID
   no map has); both need `CAP_SYS_ADMIN` (`EPERM`), after their fields are
-  checked (`EINVAL`). A map takes the memory Linux 7.0, which the x86-64
-  test machines run, gives it on x86-64: an array its 312-byte header and
+  checked (`EINVAL`). A map takes the memory the x86-64 test machines'
+  kernel, Ubuntu's Linux 7.0, gives it on x86-64: an array its 312-byte header and
   every value rounded up to 8 bytes (a mappable one each page-aligned), a
   hash its 896-byte header, 16 bytes a bucket (as many as `max_entries`
   rounded up to a power of two; more than 2^31 entries, or buckets past
@@ -3953,6 +4008,13 @@ one only with an `--allow-net`.
   exited or run another program. The thread that ends its process reports
   `PTRACE_EVENT_EXIT`, its status with 0x80 when a fatal signal dumps a
   core; the threads that end with it do not.
+- `PTRACE_SINGLESTEP` resumes a tracee with the trap flag set, which the
+  tracer does not see in its registers unless the tracee set it itself
+  (`TIF_FORCED_TF`), and any other resume takes it back: the tracee stops
+  with `SIGTRAP` after one instruction, and after a `syscall` at the call's
+  exit with `TRAP_BRKPT`. A single-stepped tracee entering a signal handler
+  stops with `SIGTRAP` before it. `PTRACE_SYSEMU_SINGLESTEP` steps as well,
+  and stops at each call's entry, which does not run, as `PTRACE_SYSEMU`.
 - `PTRACE_PEEKSIGINFO` reads the siginfo of the signals pending for a
   stopped tracee, or with `PTRACE_PEEKSIGINFO_SHARED` for its process, in
   the order they came. `PTRACE_GETSIGMASK` shows the signals it blocks

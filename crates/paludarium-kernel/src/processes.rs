@@ -230,6 +230,9 @@ pub struct Processes {
     pub(crate) traces: crate::ptrace::Traces,
     /// The machine's BPF maps by ID.
     pub(crate) bpf_maps: Arc<crate::bpf::Ids>,
+    /// The machine's perf events by the thread that opened them, and those
+    /// that wait for an `execve`.
+    pub(crate) perf_events: crate::perf::Events,
 }
 impl Processes {
     pub(crate) fn new(group: Arc<ThreadGroup>) -> Self {
@@ -255,6 +258,7 @@ impl Processes {
             aio: Arc::default(),
             traces: crate::ptrace::Traces::default(),
             bpf_maps: Arc::default(),
+            perf_events: crate::perf::Events::default(),
             entries: Mutex::new(BTreeMap::from([(
                 1,
                 Entry {
@@ -1646,6 +1650,23 @@ impl Processes {
             entry.dumped = true;
         }
     }
+    /// Task `tid`'s numbers in each PID namespace from the first down to
+    /// its own (Linux's `pid->numbers`), while it is there, a zombie's
+    /// too; none once it is reaped (`pid_has_task`).
+    fn pid_numbers(&self, tid: u32) -> Option<Vec<u32>> {
+        let space = {
+            let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            let pid = process_of(&entries, tid)?;
+            Arc::clone(&entries.get(&pid)?.space)
+        };
+        Some(
+            space
+                .levels()
+                .iter()
+                .map(|level| level.number(tid))
+                .collect(),
+        )
+    }
     /// Whether `pid` has exited: `None` once it is reaped (or never was).
     fn exited(&self, pid: u32) -> Option<bool> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2152,6 +2173,25 @@ impl PidFd {
         u64::from(self.pid)
     }
 }
+impl PidFd {
+    /// What `/proc/self/fdinfo` adds for it, as Linux's
+    /// `pidfd_show_fdinfo`: `Pid`, its task's number in the first PID
+    /// namespace, that of `/proc`, or -1 once the task is reaped; then
+    /// `NSpid`, that number and the task's in each namespace below it down
+    /// to its own.
+    pub(crate) fn fdinfo(&self) -> Vec<u8> {
+        let Some(numbers) = self.processes.pid_numbers(self.pid) else {
+            return b"Pid:\t-1\nNSpid:\t-1\n".to_vec();
+        };
+        let mut out = format!("Pid:\t{}\nNSpid:", numbers.first().copied().unwrap_or(0));
+        for number in numbers {
+            out.push('\t');
+            out.push_str(&number.to_string());
+        }
+        out.push('\n');
+        out.into_bytes()
+    }
+}
 impl paludarium_host::FileHandle for PidFd {
     /// The same process's pidfd as a new open file description, as root
     /// opens one through `/proc/self/fd` (Linux's pidfs gives it no `open`
@@ -2315,7 +2355,12 @@ impl Kernel {
                         // The events that wait for it start counting, as
                         // `begin_new_exec` runs `perf_event_exec` before the
                         // tracer's exec stop.
-                        crate::perf::exec(&self.group, tid);
+                        crate::perf::exec(
+                            &self.processes.perf_events,
+                            &self.group,
+                            tid,
+                            thread.tid,
+                        );
                         self.ptrace_exec(thread);
                         return Some(Next::Resume);
                     }
@@ -2474,6 +2519,17 @@ impl Kernel {
                 if let Some(done) = thread.state.credentials.prctl(a) {
                     return done;
                 }
+            }
+            // PR_TASK_PERF_EVENTS_DISABLE and ENABLE: the events the thread
+            // opened.
+            31 | 32 => {
+                crate::perf::prctl_task_events(
+                    &self.processes.perf_events,
+                    &self.group,
+                    thread.tid,
+                    a[0] == 32,
+                );
+                return Ok(0);
             }
             // PR_GET_SECCOMP, PR_SET_SECCOMP
             21 => return Ok(crate::seccomp::mode(&thread.state)),
@@ -2862,6 +2918,11 @@ impl Kernel {
             self.group
                 .leave_sem_undo_list(thread.tid, self.process.pid, self.wall_seconds());
         }
+        // ksys_unshare: CLONE_NEWIPC orphans the segments it made in the old
+        // namespace (`exit_shm`).
+        if flags & crate::namespaces::CLONE_NEWIPC != 0 {
+            self.group.leave_shm(thread.tid);
+        }
         Ok(0)
     }
     /// `setpriority(which, who, nice)`: sets the nice value of every thread
@@ -3080,7 +3141,8 @@ impl Kernel {
             match kind {
                 Kind::Net => mine.net = new,
                 Kind::Uts => mine.uts = new,
-                // ipcns_install leaves the semaphore undo list (`exit_sem`).
+                // ipcns_install leaves the semaphore undo list (`exit_sem`),
+                // and commit_nsset orphans the segments made (`exit_shm`).
                 Kind::Ipc => {
                     mine.ipc = new;
                     self.group.leave_sem_undo_list(
@@ -3088,6 +3150,7 @@ impl Kernel {
                         self.process.pid,
                         self.wall_seconds(),
                     );
+                    self.group.leave_shm(thread.tid);
                 }
                 Kind::Pid => mine.pid_for_children = new,
                 Kind::User => mine.user = new,
@@ -4599,6 +4662,12 @@ impl Kernel {
             && let Some(list) = self.group.take_sem_undo_list(thread.tid)
         {
             self.group.set_sem_undo_list(self.process.pid, list);
+        }
+        // So do the segments it made, which stay its own (the task's
+        // `shm_clist`).
+        if thread.tid != self.process.pid {
+            self.group
+                .renumber_shm_creator(thread.tid, self.process.pid);
         }
         thread.tid = self.process.pid;
         let closed = self.files.take_close_on_exec();

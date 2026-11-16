@@ -895,9 +895,21 @@ static int case_open_exec(const char *self) {
     show_fd_events("exec, FAN_OPEN_EXEC", exec_only, child);
     show_fd_events("exec, both", both, child);
     int fd = open(at("prog"), O_RDONLY);
-    if (fd >= 0) close(fd);
     show_fd_events("open, FAN_OPEN_EXEC", exec_only, 0);
     show_fd_events("open, both", both, 0);
+    /* execveat of that descriptor opens its file again for exec. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        char *argv[] = {"prog", "fanotify-noop", NULL}, *envp[] = {NULL};
+        syscall(SYS_execveat, fd, "", argv, envp, 0x1000 /* AT_EMPTY_PATH */);
+        _exit(127);
+    }
+    waitpid(child, &status, 0);
+    printf("execveat status=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    show_fd_events("execveat, FAN_OPEN_EXEC", exec_only, child);
+    show_fd_events("execveat, both", both, child);
+    if (fd >= 0) close(fd);
     close(exec_only);
     close(both);
     remove_base();

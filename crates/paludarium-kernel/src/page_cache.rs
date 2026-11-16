@@ -1067,7 +1067,7 @@ impl FileHandle for CoherentFile {
     fn notify_event(&self, mask: u32) -> bool {
         // The open its permission events let through has its `IN_OPEN`
         // now, and its close in time, whatever device it is on.
-        if mask == crate::inotify::OPEN && self.held.swap(false, Ordering::SeqCst) {
+        if mask & crate::inotify::OPEN != 0 && self.held.swap(false, Ordering::SeqCst) {
             self.event(mask);
             return true;
         }

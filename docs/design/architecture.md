@@ -118,9 +118,10 @@ out:
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
   registers and memory, `pxor` and `xorps` of xmm registers, and `movd` and
   `movq` between xmm registers and general ones;
-- `pshufd`, `punpcklbw`, `punpckldq`, `punpcklqdq`, `paddd`, `psubd`, `paddq`,
-  `psubq`, `pmuludq`, `pand`, `por` and `pandn` of xmm registers, `pslld` and
-  `psrld` of one by an immediate, and `pmovmskb`.
+- `pshufd`, the `punpckl` and `punpckh` unpacks, `packuswb`, `packsswb`,
+  `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`, `pmuludq`, `pand`, `por` and
+  `pandn` of xmm registers, `pslld` and `psrld` of one by an immediate, and
+  `pmovmskb`.
 
 A register in these forms may also be one of the high-byte registers `ah`, `ch`,
 `dh` and `bh`.

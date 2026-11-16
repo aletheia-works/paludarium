@@ -325,6 +325,92 @@ impl Emitter<'_, '_> {
         self.b.ins().band_imm_s(t, 0x00ff_00ff_00ff_00ff)
     }
 
+    /// The low 32 bits of `v` with word `n` moved to word `2n`, the other
+    /// words 0.
+    fn spread_words(&mut self, v: Value) -> Value {
+        let t = self.b.ins().band_imm_s(v, 0xffff_ffff);
+        let up = self.b.ins().ishl_imm_s(t, 16);
+        let t = self.b.ins().bor(t, up);
+        self.b.ins().band_imm_s(t, 0x0000_ffff_0000_ffff)
+    }
+
+    /// The interleave of the low halves of `a` and `b` (64-bit words) in
+    /// lanes of `bits`, as `punpckl` has it for one word of output: the
+    /// low 32 bits of each when `upper` is false, the high 32 otherwise.
+    fn interleave(&mut self, a: Value, b: Value, bits: u32, upper: bool) -> Value {
+        let (a, b) = if upper {
+            (
+                self.b.ins().ushr_imm_s(a, 32),
+                self.b.ins().ushr_imm_s(b, 32),
+            )
+        } else {
+            (a, b)
+        };
+        match bits {
+            8 => {
+                let a = self.spread_bytes(a);
+                let b = self.spread_bytes(b);
+                let b = self.b.ins().ishl_imm_s(b, 8);
+                self.b.ins().bor(a, b)
+            }
+            16 => {
+                let a = self.spread_words(a);
+                let b = self.spread_words(b);
+                let b = self.b.ins().ishl_imm_s(b, 16);
+                self.b.ins().bor(a, b)
+            }
+            _ => {
+                let a = self.b.ins().band_imm_s(a, 0xffff_ffff);
+                let b = self.b.ins().ishl_imm_s(b, 32);
+                self.b.ins().bor(a, b)
+            }
+        }
+    }
+
+    /// The `source`-bit signed lanes of the 128-bit value `(low, high)`
+    /// saturated to `destination` bits (unsigned when `unsigned`), packed
+    /// into one 64-bit word, as `sse::pack` has them.
+    fn pack(
+        &mut self,
+        low: Value,
+        high: Value,
+        source: u32,
+        destination: u32,
+        unsigned: bool,
+    ) -> Value {
+        let lanes = 128 / source;
+        let per_word = lanes / 2;
+        let (least, most) = if unsigned {
+            (0i64, (1i64 << destination) - 1)
+        } else {
+            (
+                -(1i64 << (destination - 1)),
+                (1i64 << (destination - 1)) - 1,
+            )
+        };
+        let least = self.constant(least);
+        let most = self.constant(most);
+        let mut out = self.constant(0);
+        for n in 0..lanes {
+            let word = if n < per_word { low } else { high };
+            let shift = i64::from((n % per_word) * source);
+            let lane = if shift == 0 {
+                word
+            } else {
+                self.b.ins().ushr_imm_s(word, shift)
+            };
+            let up = i64::from(64 - source);
+            let lane = self.b.ins().ishl_imm_s(lane, up);
+            let lane = self.b.ins().sshr_imm_s(lane, up);
+            let lane = self.b.ins().smax(lane, least);
+            let lane = self.b.ins().smin(lane, most);
+            let lane = self.b.ins().band_imm_s(lane, (1i64 << destination) - 1);
+            let lane = self.b.ins().ishl_imm_s(lane, i64::from(n * destination));
+            out = self.b.ins().bor(out, lane);
+        }
+        out
+    }
+
     /// The top bits of the 8 bytes of `w`, as an 8-bit mask: the bits,
     /// moved to the low bit of each byte, multiplied so that bit `56 + n`
     /// collects byte `n`'s without any carry.
@@ -354,6 +440,34 @@ impl Emitter<'_, '_> {
         let (b0, b1) = self.xmm_words(src);
         let (low, high) = match op {
             Mnemonic::Punpcklqdq => (a0, b0),
+            Mnemonic::Punpckhqdq => (a1, b1),
+            Mnemonic::Punpcklwd => (
+                self.interleave(a0, b0, 16, false),
+                self.interleave(a0, b0, 16, true),
+            ),
+            Mnemonic::Punpckhbw | Mnemonic::Punpckhwd | Mnemonic::Punpckhdq => {
+                let bits = match op {
+                    Mnemonic::Punpckhbw => 8,
+                    Mnemonic::Punpckhwd => 16,
+                    _ => 32,
+                };
+                (
+                    self.interleave(a1, b1, bits, false),
+                    self.interleave(a1, b1, bits, true),
+                )
+            }
+            Mnemonic::Packuswb => (
+                self.pack(a0, a1, 16, 8, true),
+                self.pack(b0, b1, 16, 8, true),
+            ),
+            Mnemonic::Packsswb => (
+                self.pack(a0, a1, 16, 8, false),
+                self.pack(b0, b1, 16, 8, false),
+            ),
+            Mnemonic::Packssdw => (
+                self.pack(a0, a1, 32, 16, false),
+                self.pack(b0, b1, 32, 16, false),
+            ),
             Mnemonic::Paddq => (self.b.ins().iadd(a0, b0), self.b.ins().iadd(a1, b1)),
             Mnemonic::Psubq => (self.b.ins().isub(a0, b0), self.b.ins().isub(a1, b1)),
             Mnemonic::Pand => (self.b.ins().band(a0, b0), self.b.ins().band(a1, b1)),

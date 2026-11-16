@@ -285,7 +285,8 @@ pub enum Fast {
         dst: u8,
         src: u8,
     },
-    /// `punpcklbw`, `punpckldq`, `punpcklqdq`, `paddd`, `psubd`, `paddq`,
+    /// `punpckl` or `punpckh` of bytes, words, dwords or quadwords,
+    /// `packuswb`, `packsswb`, `packssdw`, `paddd`, `psubd`, `paddq`,
     /// `psubq`, `pmuludq`, `pand`, `por` or `pandn` of xmm register `src`
     /// into `dst`, `pshufd` of `src` into `dst` by `imm`, or `pslld` or `psrld`
     /// of `dst` by `imm` (`src` is `dst`), as [`crate::sse::packed`] has
@@ -506,8 +507,16 @@ impl Fast {
         }
         Some(match i.mnemonic {
             Mnemonic::Punpcklbw
+            | Mnemonic::Punpcklwd
             | Mnemonic::Punpckldq
             | Mnemonic::Punpcklqdq
+            | Mnemonic::Punpckhbw
+            | Mnemonic::Punpckhwd
+            | Mnemonic::Punpckhdq
+            | Mnemonic::Punpckhqdq
+            | Mnemonic::Packuswb
+            | Mnemonic::Packsswb
+            | Mnemonic::Packssdw
             | Mnemonic::Paddd
             | Mnemonic::Psubd
             | Mnemonic::Paddq

@@ -79,6 +79,8 @@ struct Numbers {
     groups: Mutex<BTreeSet<u64>>,
     boot: Mutex<BTreeMap<u64, Arc<SuperState>>>,
     tables: Mutex<Vec<std::sync::Weak<dyn Listed>>>,
+    /// What is told of each mount ID once it is free ([`ReleaseHook`]).
+    released: Mutex<Option<ReleaseHook>>,
 }
 /// A table [`Numbers`] keeps, behind a trait object, which keeps the
 /// auto-trait checks of what holds a table shallow.
@@ -218,6 +220,13 @@ impl Token {
 impl Drop for Token {
     fn drop(&mut self) {
         lock(&self.numbers.ids).remove(&self.id);
+        // The mount below the root (numbered 1) is never handed out.
+        if self.id >= 21 {
+            let hook = lock(&self.numbers.released).clone();
+            if let Some(hook) = hook {
+                hook(self.id);
+            }
+        }
     }
 }
 
@@ -467,6 +476,14 @@ impl Entry {
 /// descriptor is in no namespace and tells nothing, nor do moves.
 pub type UnmountHook = Arc<dyn Fn(&[u64]) + Send + Sync>;
 
+/// What a machine's tables tell of a mount once it is freed, as Linux's
+/// last `mntput` does (`cleanup_mnt`, `fsnotify_vfsmount_delete`): its ID,
+/// free again, once no table and nothing open holds the mount, whichever
+/// way it went (an unmount, a detached tree, a namespace that ended). A
+/// hook point for fanotify's marks on mounts, which are kept by mount ID.
+/// It may run while a table is being changed, so it must not use one.
+pub type ReleaseHook = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// One mount namespace's mounts.
 pub struct MountTable {
     entries: RwLock<Arc<Vec<Entry>>>,
@@ -602,6 +619,11 @@ impl MountTable {
             unmount_hook: Mutex::default(),
             numbers: Arc::clone(&self.numbers),
         })
+    }
+    /// Tells `hook` of each mount freed from now on, in this table or any
+    /// made from it ([`ReleaseHook`]), in place of any hook before.
+    pub fn set_release_hook(&self, hook: Option<ReleaseHook>) {
+        *lock(&self.numbers.released) = hook;
     }
     /// Tells `hook` of each unmount from now on, in place of any hook before.
     pub fn set_unmount_hook(&self, hook: Option<UnmountHook>) {

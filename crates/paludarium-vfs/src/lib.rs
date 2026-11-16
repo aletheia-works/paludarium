@@ -628,8 +628,8 @@ pub use mount::MountedFs;
 
 mod namespace;
 pub use namespace::{
-    InUse, MountPin, MountTable, NamespacedFs, NewTmpfs, Propagation, Settings, Target,
-    UnmountHook, keeping_expiry, mount_flags,
+    InUse, MountPin, MountTable, NamespacedFs, NewTmpfs, Propagation, ReleaseHook, Settings,
+    Target, UnmountHook, keeping_expiry, mount_flags,
 };
 
 mod open_file;

@@ -953,3 +953,34 @@ fn an_unmount_hook_hears_each_mount_that_leaves() {
     fs.umount(m, true).unwrap();
     assert_eq!(*lock(&heard), [vec![m, inner]]);
 }
+
+#[test]
+fn a_release_hook_hears_each_mount_freed() {
+    let (_, fs) = machine();
+    let freed = Arc::new(Mutex::new(Vec::new()));
+    let hearing = Arc::clone(&freed);
+    fs.table()
+        .set_release_hook(Some(Arc::new(move |id| lock(&hearing).push(id))));
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/x", 66, 0o644).unwrap();
+    let id = fs.target(b"/tmp/m").unwrap().id;
+    // Held by an open file, a detached mount is freed with it.
+    let pin = fs.mount_pin(b"/tmp/m/x");
+    fs.umount(id, true).unwrap();
+    assert_eq!(*lock(&freed), Vec::<u64>::new());
+    drop(pin);
+    assert_eq!(*lock(&freed), [id]);
+    // So is a namespace's copy when the namespace ends.
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    let copy = fs.table().copy(false);
+    let copied: Vec<u64> = NamespacedFs::new(Arc::clone(&fs.lower), Arc::clone(&copy))
+        .mounts()
+        .iter()
+        .map(|m| m.id)
+        .collect();
+    lock(&freed).clear();
+    drop(copy);
+    let mut heard = lock(&freed).clone();
+    heard.sort_unstable();
+    assert_eq!(heard, copied);
+}

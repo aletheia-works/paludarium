@@ -136,6 +136,9 @@ enum Elements {
     Lru(Box<Lru>),
 }
 
+/// A key and its value.
+type Pair = (Vec<u8>, Vec<u8>);
+
 /// A map: Linux's `struct bpf_map`.
 pub(crate) struct Map {
     kind: u32,
@@ -815,6 +818,7 @@ impl Map {
         }
     }
     /// The keys and values it holds, by key: a hash's and an LRU hash's.
+    #[cfg(test)]
     fn held(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match &*self.elements() {
             Elements::Hash(values) => values.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -825,6 +829,37 @@ impl Map {
                 .collect(),
             Elements::Array(_) => Vec::new(),
         }
+    }
+    /// The elements from the `start`th, up to `max` of them, by key, taken
+    /// out with `delete`, and how many are left: all under one lock, as
+    /// Linux deletes them under the bucket's, so that no other thread takes
+    /// one between.
+    fn take(&self, start: usize, max: usize, delete: bool) -> (Vec<Pair>, usize) {
+        let mut elements = self.elements();
+        let chosen: Vec<Vec<u8>> = match &*elements {
+            Elements::Hash(values) => values.keys().skip(start).take(max).cloned().collect(),
+            Elements::Lru(lru) => lru.table.keys().skip(start).take(max).cloned().collect(),
+            Elements::Array(_) => Vec::new(),
+        };
+        let mut taken = Vec::with_capacity(chosen.len());
+        for key in chosen {
+            let value = match &mut *elements {
+                Elements::Hash(values) if delete => values.remove(&key),
+                Elements::Hash(values) => values.get(&key).cloned(),
+                Elements::Lru(lru) if delete => lru.delete(&key).ok(),
+                Elements::Lru(lru) => lru.get(&key).cloned(),
+                Elements::Array(_) => None,
+            };
+            if let Some(value) = value {
+                taken.push((key, value));
+            }
+        }
+        let left = match &*elements {
+            Elements::Hash(values) => values.len(),
+            Elements::Lru(lru) => lru.table.len(),
+            Elements::Array(_) => 0,
+        };
+        (taken, left)
     }
     /// How many keys it holds.
     fn len(&self) -> usize {
@@ -1149,17 +1184,7 @@ fn hash_lookup_batch(
     if start >= buckets {
         return Err(Errno::ENOENT);
     }
-    let taken: Vec<(Vec<u8>, Vec<u8>)> = map
-        .held()
-        .into_iter()
-        .skip(start as usize)
-        .take(max as usize)
-        .collect();
-    if delete {
-        for (key, _) in &taken {
-            map.remove(key)?;
-        }
-    }
+    let (taken, left) = map.take(start as usize, max as usize, delete);
     let (key_size, value_size) = (u64::from(map.key_size), u64::from(map.value_size));
     for (i, (key, value)) in taken.iter().enumerate() {
         write(c, element(keys, i as u64, key_size), key)?;
@@ -1171,7 +1196,7 @@ fn hash_lookup_batch(
     } else {
         start.saturating_add(done)
     };
-    let remaining = map.len() as u32 > next;
+    let remaining = left as u32 > next;
     put_count(c, at, done)?;
     write(c, out_batch, &next.to_le_bytes())?;
     if done == 0 || !remaining && done < max {

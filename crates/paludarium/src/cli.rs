@@ -425,6 +425,9 @@ pub fn describe_stop(reason: &ExitReason) -> Option<String> {
         ExitReason::FloatingPointFault { rip, .. } => {
             format!("SIMD floating-point exception at {:#x}", rip.0)
         }
+        ExitReason::MathFault { rip, .. } => {
+            format!("x87 floating-point exception at {:#x}", rip.0)
+        }
         _ => return None,
     })
 }

@@ -1,7 +1,8 @@
 //! The x87 unit: its eight 80-bit registers as a stack, and its control and
 //! status words. Values stay in their 80-bit images, in integers, so no host
-//! floating-point environment takes part. Exceptions all take their masked
-//! response: an unmasked one is noted in the status word, and does not fault.
+//! floating-point environment takes part. An unmasked exception leaves the
+//! instruction's result as the manuals say ([`X87::settle`]), and is pending
+//! until the next instruction that waits ([`X87::pending`]).
 use core::cmp::Ordering;
 
 use crate::softfloat::{self, Format};
@@ -32,6 +33,9 @@ const INTEGER_BIT: u64 = 1 << 63;
 const QUIET_BIT: u64 = 1 << 62;
 /// The exponent an 80-bit value has as a 1 in the integer bit.
 const BIAS: i32 = 16383;
+/// What an unmasked overflow takes from a result's exponent, and an unmasked
+/// underflow adds to it, so that it fits.
+const REBIAS: i32 = 24576;
 /// The QNaN that stands for an invalid result.
 const INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
 const ONE: u128 = 0x3fff_8000_0000_0000_0000;
@@ -359,6 +363,14 @@ fn round_extended(
         } else {
             (((kept + u128::from(up)) as u64) << dropped, exponent)
         };
+        if exponent >= i32::from(EXPONENT_MAX) && control & OVERFLOW == 0 {
+            let flags = OVERFLOW | if rest != 0 { INEXACT } else { 0 };
+            return (
+                join(negative, (exponent - REBIAS) as u16, mantissa),
+                flags,
+                up,
+            );
+        }
         if exponent >= i32::from(EXPONENT_MAX) {
             let flags = OVERFLOW | INEXACT;
             let to_infinity = match control >> 10 & 3 {
@@ -378,6 +390,20 @@ fn round_extended(
         return (join(negative, exponent as u16, mantissa), flags, up);
     }
     let tiny = !(exponent == 0 && carries);
+    if tiny && control & UNDERFLOW == 0 {
+        // Unmasked, it is rounded as if the range had no end, exact or not.
+        let (mantissa, exponent) = if carries {
+            (INTEGER_BIT, exponent + 1)
+        } else {
+            (((kept + u128::from(up)) as u64) << dropped, exponent)
+        };
+        let flags = UNDERFLOW | if rest != 0 { INEXACT } else { 0 };
+        return (
+            join(negative, (exponent + REBIAS) as u16, mantissa),
+            flags,
+            up,
+        );
+    }
     let (kept, rest, half) = split(softfloat::sticky(normal, (1 - exponent) as u32));
     let up = rounds_away(control, negative, kept, rest, half);
     let mantissa = ((kept + u128::from(up)) as u64) << dropped;
@@ -1078,6 +1104,80 @@ impl X87 {
     }
     pub(crate) fn set_control(&mut self, value: u16) {
         self.control = value & CONTROL_BITS | CONTROL_SET;
+        self.summarize();
+    }
+    /// The `si_code` of `SIGFPE` for what is pending, as Linux's math_error
+    /// picks it, where the next instruction that waits faults: one that is
+    /// set and not masked, of which an invalid operation comes first.
+    #[must_use]
+    pub(crate) fn pending(&self) -> Option<u8> {
+        if self.status & 1 << 7 == 0 {
+            return None;
+        }
+        let unmasked = self.status & !self.control & EXCEPTIONS;
+        [
+            (INVALID, 7),
+            (ZERO_DIVIDE, 3),
+            (OVERFLOW, 4),
+            (DENORMAL | UNDERFLOW, 5),
+            (INEXACT, 6),
+        ]
+        .into_iter()
+        .find_map(|(flags, code)| (unmasked & flags != 0).then_some(code))
+    }
+    /// The exceptions an instruction raised that are not masked, from what the
+    /// unit was before it. None was set before, or it would have faulted.
+    fn unmasked(&self, before: &X87) -> u16 {
+        self.status & !before.status & !before.control & EXCEPTIONS
+    }
+    /// Whether an instruction that stores to memory may: not where an
+    /// unmasked exception other than inexact came of it.
+    #[must_use]
+    pub(crate) fn may_store(&self, before: &X87) -> bool {
+        self.unmasked(before) & !INEXACT == 0
+    }
+    /// What an unmasked exception leaves after an instruction, as on Intel's
+    /// and AMD's CPUs. An invalid operation, a division by zero or (except
+    /// where a value is loaded) a denormal operand leaves the registers and
+    /// the stack as they were, with only those exceptions noted, and the
+    /// condition bits the instruction set. So does an overflow or underflow
+    /// of what goes to memory. One of a register's result rebiases its
+    /// exponent (in [`round_extended`]), and an inexact result is kept.
+    pub(crate) fn settle(&mut self, before: &X87, to_memory: bool, loaded: bool) {
+        let unmasked = self.unmasked(before);
+        let mut stopping = INVALID | ZERO_DIVIDE;
+        if !loaded {
+            stopping |= DENORMAL;
+        }
+        if to_memory {
+            stopping |= OVERFLOW | UNDERFLOW;
+        }
+        if unmasked & stopping == 0 {
+            return;
+        }
+        let raised = self.status & !before.status;
+        let kept = raised & (INVALID | STACK_FAULT | ZERO_DIVIDE | DENORMAL);
+        let kept = if to_memory && unmasked & (OVERFLOW | UNDERFLOW) != 0 {
+            kept | raised & (OVERFLOW | UNDERFLOW)
+        } else {
+            kept
+        };
+        // C1 says only whether the stack overflowed.
+        let c1 = if kept & STACK_FAULT != 0 {
+            self.status & C1
+        } else {
+            0
+        };
+        let conditions = if to_memory {
+            before.status & (C0 | C2 | C3)
+        } else {
+            self.status & (C0 | C2 | C3)
+        };
+        *self = X87 {
+            status: before.status & !(C0 | C1 | C2 | C3) | kept | conditions | c1,
+            control: self.control,
+            ..*before
+        };
         self.summarize();
     }
     /// The status word's summary: a set exception that is not masked.
@@ -3018,6 +3118,107 @@ mod tests {
             );
             assert_eq!((y.control_word(), y.status_word()), (0x262, 0x2800));
         }
+    }
+
+    #[test]
+    fn what_is_pending_says_the_si_code_linux_gives() {
+        let of = |status: u16, control: u16| {
+            let mut x = X87 {
+                status,
+                ..X87::default()
+            };
+            x.set_control(control);
+            x.pending()
+        };
+        assert_eq!(of(ZERO_DIVIDE, 0x37b), Some(3));
+        assert_eq!(of(ZERO_DIVIDE, 0x37f), None);
+        assert_eq!(of(INVALID | STACK_FAULT, 0x37e), Some(7));
+        assert_eq!(of(OVERFLOW | INEXACT, 0x340), Some(4));
+        assert_eq!(of(DENORMAL, 0x37d), Some(5));
+        assert_eq!(of(UNDERFLOW | INEXACT, 0x36f), Some(5));
+        assert_eq!(of(INEXACT, 0x35f), Some(6));
+        // A division by zero comes before a denormal and an inexact result.
+        assert_eq!(of(ZERO_DIVIDE | DENORMAL | INEXACT, 0x340), Some(3));
+    }
+
+    #[test]
+    fn unmasked_overflow_and_underflow_rebias_what_goes_to_a_register() {
+        let largest = parts(LARGEST);
+        let control = EXTENDED & !OVERFLOW;
+        let size = u128::from(largest.mantissa) * u128::from(largest.mantissa);
+        let power = largest.power() * 2;
+        let (value, flags, up) = round_extended(false, size, power, control, 64);
+        assert_eq!(
+            (value, flags, up),
+            (0x5ffe_ffff_ffff_ffff_fffe, OVERFLOW | INEXACT, false)
+        );
+        // Exact, and still an underflow.
+        let control = EXTENDED & !UNDERFLOW;
+        let (value, flags, _) = round_extended(false, 1, -32764, control, 64);
+        assert_eq!((value, flags), (0x2003_8000_0000_0000_0000, UNDERFLOW));
+        let (value, flags, _) = round_extended(false, 1, -32764, EXTENDED, 64);
+        assert_eq!((value, flags), (0, UNDERFLOW | INEXACT));
+    }
+
+    #[test]
+    fn an_unmasked_invalid_operation_leaves_the_registers_and_the_stack() {
+        let mut x = after(&[INFINITY, INFINITY | 1 << 79], |x| {
+            x.set_control(EXTENDED & !INVALID)
+        });
+        let before = x;
+        x.calculate_registers((Arithmetic::Add, false), 0, 1);
+        x.pop();
+        x.settle(&before, false, false);
+        assert_eq!(
+            (x.get(0), x.get(1), x.top),
+            (Some(INFINITY | 1 << 79), Some(INFINITY), before.top)
+        );
+        assert_eq!(x.status_word() & (EXCEPTIONS | SUMMARY), INVALID | SUMMARY);
+        assert_eq!(x.pending(), Some(7));
+        // A full stack does not take what is loaded, and C1 says it overflowed.
+        let mut x = after(&[ONE; 8], |x| x.set_control(EXTENDED & !INVALID));
+        let before = x;
+        x.load_zero();
+        x.settle(&before, false, false);
+        assert_eq!((x.top, x.get(0)), (before.top, Some(ONE)));
+        assert_eq!(
+            x.status_word() & (C1 | STACK_FAULT | INVALID),
+            C1 | STACK_FAULT | INVALID
+        );
+    }
+
+    #[test]
+    fn an_unmasked_denormal_stops_arithmetic_but_not_a_load() {
+        let control = EXTENDED & !DENORMAL;
+        let mut x = after(&[1, ONE], |x| x.set_control(control));
+        let before = x;
+        x.calculate_registers((Arithmetic::Add, false), 0, 1);
+        x.settle(&before, false, false);
+        assert_eq!(x.get(0), Some(ONE));
+        assert_eq!(x.status_word() & EXCEPTIONS, DENORMAL);
+        let mut x = after(&[], |x| x.set_control(control));
+        let before = x;
+        x.load_float(F32, 1);
+        x.settle(&before, false, true);
+        assert_eq!(x.get(0), Some(join(false, 0x3f6a, INTEGER_BIT)));
+        assert_eq!(x.pending(), Some(5));
+    }
+
+    #[test]
+    fn an_unmasked_overflow_to_memory_stores_nothing() {
+        let mut x = after(&[LARGEST], |x| x.set_control(EXTENDED & !OVERFLOW));
+        let before = x;
+        x.store_float(F32);
+        assert!(!x.may_store(&before));
+        x.pop();
+        x.settle(&before, true, false);
+        assert_eq!((x.top, x.get(0)), (before.top, Some(LARGEST)));
+        assert_eq!(x.status_word() & (EXCEPTIONS | C1), OVERFLOW);
+        // Inexact alone is stored, and keeps C1.
+        let mut x = after(&[number(1, -1) | 1], |x| x.set_control(EXTENDED & !INEXACT));
+        let before = x;
+        x.store_float(F32);
+        assert!(x.may_store(&before));
     }
 
     #[test]

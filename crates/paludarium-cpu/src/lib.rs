@@ -695,6 +695,7 @@ fn execute_decoded(
         Stop::GeneralProtection => ExitReason::GeneralProtection { rip },
         Stop::ArithmeticFault => ExitReason::ArithmeticFault { rip },
         Stop::FloatingPointFault(code) => ExitReason::FloatingPointFault { rip, code },
+        Stop::MathFault(code) => ExitReason::MathFault { rip, code },
         Stop::Syscall => ExitReason::Syscall { rip: state.rip },
     })
 }
@@ -1728,6 +1729,28 @@ mod tests {
         assert_eq!(s.x87.status_word() & 1 << 9, 0, "fxam: positive");
     }
     #[test]
+    fn a_pending_x87_exception_faults_where_the_next_instruction_waits() {
+        // fldcw [rax] unmasking a division by zero; fldz; fld1; fdiv st, st(1);
+        // then fnstsw ax, which does not wait, and fwait, which does.
+        let code = [
+            0xd9, 0x28, 0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1, 0xdf, 0xe0, 0x9b,
+        ];
+        let (mut s, mem) = machine(&code);
+        s.gpr[0] = STACK_TOP - 0x2000;
+        mem.write(GuestAddr(STACK_TOP - 0x2000), &0x37bu16.to_le_bytes())
+            .unwrap();
+        let reason = run(&mut s, &mem, 10);
+        assert_eq!(
+            reason,
+            ExitReason::MathFault {
+                rip: GuestAddr(CODE + 10),
+                code: 3
+            }
+        );
+        assert_eq!(s.gpr[0] & 0xffff, 0xb084);
+        assert_eq!(s.x87.status_word(), 0xb084, "the fault changes nothing");
+    }
+    #[test]
     fn x87_faults_change_nothing() {
         // fld1, then a store past the stack's first page's end of mapping.
         // fstp qword, fstp tbyte, fistp word, fst qword, fbstp, fnsave.
@@ -1781,6 +1804,19 @@ mod tests {
         assert_eq!(&area[..6], &[0x7f, 0x03, 0x00, 0x38, 0xff, 0x3f]);
         assert_eq!(&area[6..], &[0, 0, 0, 0, 0, 0, 0, 0, 0x55, 0x55]);
         assert_eq!(s.x87.status_word() >> 11 & 7, 7, "loaded");
+    }
+    #[test]
+    fn ffreep_frees_a_register_and_pops() {
+        // fld1; fldz; fldpi; ffreep st(1); fxsave [rax]: st(1), then the top,
+        // are freed, which leaves the one from fld1.
+        let code = [
+            0xd9, 0xe8, 0xd9, 0xee, 0xd9, 0xeb, 0xdf, 0xc1, 0x0f, 0xae, 0x00,
+        ];
+        let (s, mem, _) = x87_run(&code, 5);
+        let mut area = [0; 5];
+        mem.read(GuestAddr(STACK_TOP - 0x2000), &mut area).unwrap();
+        assert_eq!(area[4], 0x80, "only R7 is in use");
+        assert_eq!(s.x87.status_word() & 0x3fff, 0x3000, "top 6, no exception");
     }
     #[test]
     fn fxsave_and_fxrstor_keep_the_x87_state() {

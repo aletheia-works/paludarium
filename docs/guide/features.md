@@ -47,7 +47,15 @@ Linux.
   requires it, but its instructions stop with `SIGILL`.
 
 When a guest reaches an instruction it cannot run, it gets `SIGILL`, as on real
-Linux. Page faults raise `SIGSEGV`, and integer division by zero `SIGFPE`.
+Linux. Page faults raise `SIGSEGV`, and integer division by zero `SIGFPE`, as
+does an unmasked floating-point exception. An SSE one, which MXCSR unmasks,
+raises it at the instruction itself: the destination is left as it was, and
+MXCSR keeps the instruction's exception flags, as a signal handler sees them.
+An x87 one raises it at the next x87 instruction that waits, which is where a
+CPU raises it, and leaves its own instruction's result as on a CPU: an invalid
+operation, a division by zero or an arithmetic denormal operand changes no
+register, and an overflow or underflow rebiases a register's result by 2²⁴⁵⁷⁶
+and stores nothing to memory.
 
 ## System calls
 
@@ -1050,8 +1058,11 @@ kernel.
   `ipc/msg.c`) and its default limits (`MSGMAX` 8192, `MSGMNB` 16384,
   `MSGMNI` 32000). A queue holds as many bytes as its `msg_qbytes`, and as
   many messages; a send to a full one waits, unless `IPC_NOWAIT`
-  (`EAGAIN`), until a receive or `IPC_SET` makes room, the queue is
-  removed (`EIDRM`) or a signal comes. `msgrcv` takes the first message, the
+  (`EAGAIN`), in the queue's list of senders until a receive or `IPC_SET`
+  makes room for its message, the queue is removed (`EIDRM`) or a signal
+  comes. As Linux's `ss_wakeup`, a change wakes only the senders whose
+  messages then fit, which check the permission again, and moves the
+  others behind them in their order. `msgrcv` takes the first message, the
   first of a type, the first of another type (`MSG_EXCEPT`) or the lowest
   type up to a bound (a negative `msgtyp`); one longer than the buffer is
   `E2BIG`, unless `MSG_NOERROR` cuts it, and `MSG_COPY` with `IPC_NOWAIT`
@@ -2513,7 +2524,17 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `comm`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
-  `smaps`, `pagemap`, `fd`, `fdinfo`, `ns` and `task`. `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
+  `smaps`, `pagemap`, `fd`, `fdinfo`, `ns` and `task`. They and the directory are owned by the process's
+  effective user and group, or by root once it is not dumpable (after a
+  change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
+  gives them; `/proc/self` itself is root's. `stat` shows that owner and
+  the mode, 0400 for `environ`, `auxv` and `pagemap` and 0444 for the other files,
+  and `fstat` of an open one the owner it had when it was opened, where
+  Linux's is the owner of that moment. An open checks the mode for that owner, as Linux's
+  `generic_permission` does, so opening one for writing is `EACCES` without
+  `CAP_DAC_OVERRIDE`, and so is reading `environ`, `auxv` or `pagemap` once the
+  process is not dumpable; root's write to one it opened is `EINVAL`.
+  `root` leads to the root, `/` unless `chroot` moved it. A link of `exe`, `cwd`, `root` or
   `fd` reads, as Linux's `d_path` gives it, as a path from the reader's root
   when its file is under that root, and otherwise from the machine's root,
   unmarked; `maps` and `smaps` name a mapped file the same way. `status`
@@ -3975,7 +3996,7 @@ one only with an `--allow-net`.
 - **probe**: a Rust program that checks eight thread and filesystem features
   (a tokio timer, a UNIX socket pair, rayon parallelism, Mutex and Condvar,
   file operations, hard links, symbolic links and `flock`).
-- **aube**: a Node.js package manager written in Rust (v2.9.0). `--version`,
+- **aube**: a Node.js package manager written in Rust (v2.10.0). `--version`,
   `install`, `install --frozen-lockfile` and `list` give the same output and
   exit status as on real Linux.
 - **ripgrep**: a text search tool written in Rust (15.2.0), which runs its

@@ -146,9 +146,8 @@ mod linux {
             // the personality-layout case, which maps page 0, the
             // proc-other-maps, proc-other-fds and proc-other-limits cases,
             // which read a process's maps, descriptors and auxv as another
-            // user, and the
-            // pagemap case, which becomes an unprivileged user, as the
-            // emulator's guest starts as root.
+            // user, and the pagemap and proc-owners cases, which become an
+            // unprivileged user, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -252,6 +251,7 @@ mod linux {
                     | "scheduling-set"
                     | "personality-layout"
                     | "pagemap"
+                    | "proc-owners"
                     | "admin"
             );
             let native = if as_root && !running_as_root() {
@@ -582,11 +582,13 @@ mod linux {
         processes_x87_transcendental => ("x87-transcendental","x87"),
         processes_x87_decimal => ("x87-decimal","x87"),
         processes_x87_state => ("x87-state","x87"),
+        processes_x87_exceptions => ("x87-exceptions","x87"),
         processes_robust_list => ("robust-list","process"),
         processes_futex_shared => ("futex-shared","process"),
         processes_late_handler => ("late-handler","process"),
         processes_mincore => ("mincore","process"),
         processes_pagemap => ("pagemap","process"),
+        processes_proc_owners => ("proc-owners","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),
         processes_fifo => ("fifo","process"),

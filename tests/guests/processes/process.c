@@ -6126,6 +6126,75 @@ static int pagemap_case(void) {
     return 0;
 }
 
+/* `path`'s mode, and whether its owner and group are `uid`'s (1), root's
+   (0) or another's (-1), by stat, or lstat with `link`. */
+static void po_show(const char *label, const char *path, int link, uid_t uid) {
+    struct stat st;
+    errno = 0;
+    int r = link ? lstat(path, &st) : stat(path, &st);
+    int e = errno;
+    if (r) {
+        printf("%s: r=%d errno=%d\n", label, r, e);
+        return;
+    }
+    int owner = st.st_uid == uid ? 1 : st.st_uid == 0 ? 0 : -1;
+    int group = st.st_gid == uid ? 1 : st.st_gid == 0 ? 0 : -1;
+    printf("%s: mode=%o owner=%d group=%d\n", label, st.st_mode, owner, group);
+}
+/* An open of `path` with `flags`: 0, or the errno; and the mode and owner
+   that fstat of the descriptor gives. */
+static void po_open(const char *label, const char *path, int flags, uid_t uid) {
+    errno = 0;
+    int fd = open(path, flags);
+    int e = errno;
+    if (fd < 0) {
+        printf("%s: errno=%d\n", label, e);
+        return;
+    }
+    struct stat st;
+    int r = fstat(fd, &st);
+    printf("%s: opened fstat=%d mode=%o owner=%d\n", label, r, st.st_mode,
+           st.st_uid == uid ? 1 : st.st_uid == 0 ? 0 : -1);
+    close(fd);
+}
+
+/* The proc-owners case: a process's own files in /proc are owned by its
+   effective user and group, or root once it is not dumpable, as Linux's
+   task_dump_owner gives them, and open as their modes let that owner:
+   status 0444 and environ 0400, neither for writing without
+   CAP_DAC_OVERRIDE. Run as root, it becomes an unprivileged user. */
+static int proc_owners_case(void) {
+    const uid_t nobody = 65534;
+    po_show("root-status", "/proc/self/status", 0, 0);
+    po_open("root-status-write", "/proc/self/status", O_WRONLY, 0);
+    if (setgroups(0, NULL) || setresgid(nobody, nobody, nobody) || setresuid(nobody, nobody, nobody))
+        return 80;
+    /* A change of IDs makes it undumpable (0, or 2 with fs.suid_dumpable
+       2, as Ubuntu sets it): root owns its files. */
+    printf("dumpable=%d\n", prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 1);
+    po_show("undumpable-status", "/proc/self/status", 0, nobody);
+    po_open("undumpable-environ", "/proc/self/environ", O_RDONLY, nobody);
+    po_open("undumpable-status-read", "/proc/self/status", O_RDONLY, nobody);
+    if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)) return 81;
+    po_show("directory", "/proc/self/", 0, nobody);
+    po_show("self-link", "/proc/self", 1, nobody);
+    po_show("status", "/proc/self/status", 0, nobody);
+    po_show("environ", "/proc/self/environ", 0, nobody);
+    po_show("maps", "/proc/self/maps", 0, nobody);
+    po_show("mountinfo", "/proc/self/mountinfo", 0, nobody);
+    po_show("fd", "/proc/self/fd", 0, nobody);
+    po_show("exe-link", "/proc/self/exe", 1, nobody);
+    po_open("status-read", "/proc/self/status", O_RDONLY, nobody);
+    po_open("status-write", "/proc/self/status", O_WRONLY, nobody);
+    po_open("environ-read", "/proc/self/environ", O_RDONLY, nobody);
+    po_open("environ-write", "/proc/self/environ", O_RDWR, nobody);
+    po_open("maps-read", "/proc/self/maps", O_RDONLY, nobody);
+    po_open("maps-write", "/proc/self/maps", O_WRONLY, nobody);
+    po_open("mountinfo-write", "/proc/self/mountinfo", O_WRONLY, nobody);
+    po_open("cmdline-path", "/proc/self/cmdline", O_PATH | O_WRONLY, nobody);
+    return 0;
+}
+
 static int mincore_show(const char *label, void *at, size_t length, size_t pages) {
     unsigned char vec[16];
     memset(vec, 7, sizeof vec);
@@ -13975,6 +14044,65 @@ static int msg_case(void) {
     errno = 0;
     long removed = syscall(SYS_msgctl, id, 2, ds);
     printf("stat-removed=%ld errno=%d\n", removed, errno);
+    /* Waiting senders, as another user that may write only by the mode: a
+       change wakes only those whose messages then fit, which look at the
+       permission again, so one whose message does not fit sleeps through
+       the write permission's loss. */
+    if (geteuid() == 0) {
+        int full = (int)syscall(SYS_msgget, IPC_PRIVATE, 0622);
+        if (full < 0) return 16;
+        syscall(SYS_msgctl, full, 2, ds);
+        qbytes = 4;
+        memcpy(ds + 88, &qbytes, 8);
+        syscall(SYS_msgctl, full, 1, ds);
+        long filled = msgx_send(full, 1, "abcd", 0);
+        pid_t senders[2];
+        const char *sent[] = {"xy", "xyz"};
+        for (int i = 0; i < 2; i++) {
+            fflush(stdout);
+            senders[i] = child();
+            if (senders[i] == 0) {
+                alarm(10);
+                if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534))
+                    _exit(93);
+                if (write(ready[1], "x", 1) != 1) _exit(94);
+                /* Its result is its exit status (the errno), so that it
+                   prints nothing as it wakes. */
+                _exit((int)-msgx_send(full, 1, sent[i], 0));
+            }
+            if (read(ready[0], &byte, 1) != 1) return 17;
+            usleep(100000);
+            unsigned mode;
+            if (i == 0) {
+                /* No room: no wake, through the loss and the return of the
+                   write permission, until a receive makes room. */
+                mode = 0600;
+                memcpy(ds + 20, &mode, 4);
+                long lost = syscall(SYS_msgctl, full, 1, ds);
+                usleep(100000);
+                mode = 0622;
+                memcpy(ds + 20, &mode, 4);
+                long back = syscall(SYS_msgctl, full, 1, ds);
+                usleep(100000);
+                printf("senders lost=%ld back=%ld", lost, back);
+                msgx_show("room", full, 64, 0, 0);
+                printf("\n");
+            } else {
+                /* Room with the permission gone: the wake finds it gone. */
+                mode = 0600;
+                memcpy(ds + 20, &mode, 4);
+                qbytes = 8;
+                memcpy(ds + 88, &qbytes, 8);
+                long grown = syscall(SYS_msgctl, full, 1, ds);
+                printf("senders grown=%ld\n", grown);
+            }
+            fflush(stdout);
+            result(i ? "sender1" : "sender0", reaped(senders[i]));
+        }
+        msgx_status("senders-after", full, senders[0], getpid());
+        printf("senders filled=%ld\n", filled);
+        syscall(SYS_msgctl, full, IPC_RMID, NULL);
+    }
     /* The namespace's limits and what is in use in it. */
     int info[8] = {0};
     long max = syscall(SYS_msgctl, 0, 3 /* IPC_INFO */, info);
@@ -26982,6 +27110,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "mincore")) return mincore_cases();
     if (!strcmp(mode, "pagemap")) return pagemap_case();
+    if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {
         x87_arithmetic_cases();

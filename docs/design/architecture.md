@@ -98,11 +98,12 @@ out:
 
 - `nop` and `endbr64`;
 - moves between registers and memory, and `movzx` from memory;
-- `lea`, `push` and `pop`;
+- `lea`, `push` of a register or an immediate, and `pop`;
 - direct branches, `call` and `ret`;
 - `add`, `sub`, `and`, `or`, `xor`, `cmp` and `test` between registers,
   immediates and memory (without `lock`);
-- `shl`, `shr`, `sar`, `rol` and `ror` of a register by an immediate;
+- `shl`, `shr`, `sar`, `rol` and `ror` of a register by an immediate, and `shl`,
+  `shr` and `sar` of a register by `cl`;
 - `movzx` from a register, `movsx` and `movsxd` from a register or memory,
   `cbw`, `cwde` and `cdqe`, and `lea` into a 16- or 32-bit register;
 - `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`;

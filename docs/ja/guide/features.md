@@ -41,6 +41,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 
 ゲストが実行できない命令に当たったときは、本物の Linux と同じようにゲストに
 `SIGILL` を送ります。ページフォールトは `SIGSEGV`、整数の 0 除算は `SIGFPE` になります。
+マスクされていない浮動小数点の例外も `SIGFPE` になります。MXCSR でマスクを外した SSE の
+例外は、その命令のところで起きます。書き込み先は元のままで、MXCSR には命令の例外の
+フラグが残り、シグナルハンドラからはそれが見えます。x87 の例外は CPU と同じく、次の
+待つ x87 の命令のところで起き、元の命令の結果も CPU と同じになります。無効な演算、
+0 除算、演算の非正規化数のオペランドはレジスタを変えず、オーバーフローとアンダーフローは
+レジスタの結果の指数を 2²⁴⁵⁷⁶ ずらし、メモリには何も書きません。
 
 ## システムコール {#system-calls}
 
@@ -941,8 +947,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   IPC 名前空間のものです。確かめる内容とその順序は Linux の `ipc/msg.c` と同じで、上限は
   Linux の既定値（`MSGMAX` 8192、`MSGMNB` 16384、`MSGMNI` 32000）です。キューは
   `msg_qbytes` のバイト数まで、同じ数のメッセージまで持ちます。いっぱいのキューへの送信は、
-  `IPC_NOWAIT` があれば `EAGAIN` で、なければ受信か `IPC_SET` で空きができるか、キューが
-  消える（`EIDRM`）か、シグナルが来るまで待ちます。`msgrcv` は、最初のメッセージ、ある型の
+  `IPC_NOWAIT` があれば `EAGAIN` で、なければキューの送信者の列で、受信か `IPC_SET` で
+  そのメッセージが入る空きができるか、キューが消える（`EIDRM`）か、シグナルが来るまで
+  待ちます。Linux の `ss_wakeup` と同じく、キューが変わると、メッセージが入るように
+  なった送信者だけを起こし（起きた送信者は権限を確かめ直します）、ほかの送信者は順序を
+  保ったままその後ろに回します。`msgrcv` は、最初のメッセージ、ある型の
   最初のもの、ほかの型の最初のもの（`MSG_EXCEPT`）、ある値までのいちばん小さい型のもの
   （負の `msgtyp`）を取ります。バッファーより長いものは `E2BIG` で、`MSG_NOERROR` が
   あれば切り詰めます。`IPC_NOWAIT` を付けた `MSG_COPY` は、その位置のメッセージを写して
@@ -2183,7 +2192,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
   `limits`、`comm`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、
-  `fd`、`fdinfo`、`ns`、`task` があります。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
+  `fd`、`fdinfo`、`ns`、`task` があります。これらとディレクトリの持ち主は、Linux の `task_dump_owner` と同じく
+  プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
+  `PR_SET_DUMPABLE` まで）root です。`/proc/self` そのものは root のものです。`stat` は
+  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、ほかのファイルは 0444）を示し、
+  開いたものの `fstat` は開いたときの持ち主を示します。Linux はその時点の持ち主です。開くときは Linux の `generic_permission` と同じくその
+  持ち主に対してモードを確かめるので、`CAP_DAC_OVERRIDE` なしに書き込み用に開くと
+  `EACCES` で、ダンプできないプロセスが `environ`、`auxv`、`pagemap` を読むために開いても
+  `EACCES` です。root が開いたものへの書き込みは `EINVAL` です。`root` はルートへのリンクで、`chroot` が動かさなければ `/` です。`exe`、`cwd`、`root`、`fd` の
   リンクは、Linux の `d_path` と同じく、ファイルが読み手のルートの下にあればそのルートからの
   パスとして、そうでなければ印を付けずにマシンのルートからのパスとして読めます。`maps` と
   `smaps` も、マップしたファイルを同じように名付けます。`status` は、Linux と同じ項目を
@@ -3473,7 +3489,7 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
 - **probe**：スレッドとファイルシステムの機能を 8 項目で確かめる Rust のプログラム
   （tokio のタイマー、UNIX のソケットの組、rayon の並列処理、Mutex と Condvar、
   ファイル操作、ハードリンク、シンボリックリンク、`flock`）。
-- **aube**：Rust で書かれた Node.js のパッケージマネージャ（v2.9.0）。`--version`、
+- **aube**：Rust で書かれた Node.js のパッケージマネージャ（v2.10.0）。`--version`、
   `install`、`install --frozen-lockfile`、`list` の 4 つの操作が、本物の Linux と
   同じ出力と終了コードになります。
 - **ripgrep**：Rust で書かれたテキストの検索のツール（15.2.0）。検索を複数のスレッドで

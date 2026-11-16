@@ -1066,7 +1066,7 @@ pub(crate) fn named_at(c: &Context<'_>, name: u64) -> Result<FileStat, Errno> {
 /// The path at `addr`, with a link in `/proc/self/fd` (or `/proc/self/cwd`,
 /// `/proc/self/exe`, `/dev/fd`) before its last component taken to where it
 /// leads ([`through_magic_links`]).
-fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
+pub(crate) fn path(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     through_magic_links(c, string(c, addr)?)
 }
 /// Path `p` with each magic link it goes through, a link in a process's
@@ -1215,7 +1215,37 @@ pub(crate) fn mount_path(
     raw: Vec<u8>,
     follow: bool,
 ) -> Result<Option<Vec<u8>>, Errno> {
-    let p = lookup(c, (-100i32) as u64, raw, follow)?.0;
+    mount_path_in(c, (-100i32) as u64, raw, follow)
+}
+/// [`mount_path`] of `raw` from the directory `dir` names, or with `empty`
+/// (`AT_EMPTY_PATH`) of an empty `raw` the file `dir` names itself, its
+/// last link not followed (`ENOENT` for an empty one without it).
+pub(crate) fn mount_at(
+    c: &Context<'_>,
+    dir: u64,
+    raw: Vec<u8>,
+    follow: bool,
+    empty: bool,
+) -> Result<Option<Vec<u8>>, Errno> {
+    if !raw.is_empty() {
+        return mount_path_in(c, dir, raw, follow);
+    }
+    if !empty {
+        return Err(Errno::ENOENT);
+    }
+    if dir as i32 == -100 {
+        return mount_path_in(c, dir, b".".to_vec(), false);
+    }
+    let d = c.files.descriptor(dir)?;
+    mount_path_in(c, (-100i32) as u64, d.path, false)
+}
+fn mount_path_in(
+    c: &Context<'_>,
+    dir: u64,
+    raw: Vec<u8>,
+    follow: bool,
+) -> Result<Option<Vec<u8>>, Errno> {
+    let p = lookup(c, dir, raw, follow)?.0;
     let p = match followed(c, &p, follow)? {
         Some(Followed::Path { path, .. }) => path,
         Some(Followed::File(d)) => d.path,
@@ -5938,7 +5968,7 @@ mod files_tests {
 
 /// `open`, `creat` and `openat` of `raw` from `dir`, and `openat2` with its
 /// `RESOLVE_*` flags `resolve` ([`resolve_scoped`]).
-fn open_at(
+pub(crate) fn open_at(
     c: &mut Context<'_>,
     dir: u64,
     raw: Vec<u8>,
@@ -5965,15 +5995,24 @@ fn open_at(
     let credentials = &c.process.credentials;
     let opened = match crate::permissions::open(c.files, credentials, dir, &raw, flags) {
         Ok(created) => landlock_before_open(c, &p, flags).and_then(|landlock| {
-            let opened = open_path(c, &p, flags, mode).inspect(|_| {
+            // Its `FAN_OPEN_PERM` waits for the groups' answers, then its
+            // `IN_OPEN`; a denied file goes, never opened.
+            let (opened, answered) = crate::fanotify::asking(c, |c| open_path(c, &p, flags, mode));
+            let opened = opened.inspect(|_| {
                 if let Some(parent) = created {
                     crate::permissions::own(c.files, &c.process.credentials, &p, true, &parent);
                 }
             })?;
+            let answered = answered?;
             let landlock = match landlock {
                 Some(rights) => rights,
                 None => landlock_after_open(c, &p, flags)?,
             };
+            // `fsnotify_open` comes after the security hooks: an open
+            // Landlock refuses tells nothing.
+            if answered {
+                opened.0.notify_event(crate::inotify::OPEN);
+            }
             Ok((opened, landlock))
         }),
         Err(error) => Err(error),
@@ -7276,6 +7315,18 @@ fn reached(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, 
 /// `anon_inode:seccomp notify` without brackets), a memfd's own name, or a
 /// POSIX message queue's path in its filesystem.
 fn link_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
+    let path = named_target(h, d)?;
+    // A file of a detached tree (`open_tree`) is named from that tree's
+    // root, where Linux's `d_path` stops at its mount of no parent.
+    Ok(match path.windows(2).position(|w| w == b"/\0") {
+        Some(at) => match path[at + 2..].iter().position(|&b| b == b'/') {
+            Some(end) => path[at + 2 + end..].to_vec(),
+            None => b"/".to_vec(),
+        },
+        None => path,
+    })
+}
+fn named_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     let any = d.file.as_any();
     if let Some(memfd) = any.and_then(|v| v.downcast_ref::<crate::memfd::Memfd>()) {
         return Ok(memfd.link_target());

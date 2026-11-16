@@ -802,3 +802,130 @@ fn pivot_root_is_checked_in_linux_order() {
     assert!(fs.target(b"/").unwrap().locked);
     assert!(!fs.target(b"/old").unwrap().locked);
 }
+
+#[test]
+fn a_detached_tree_is_reached_by_its_name_only_and_attaches() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/x", 66, 0o644)
+        .unwrap()
+        .write(b"x")
+        .unwrap();
+    fs.mkdir(b"/tmp/m/in", 0o755).unwrap();
+    fs.mount(b"/tmp/m/in", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/in/y", 66, 0o644)
+        .unwrap()
+        .write(b"y")
+        .unwrap();
+    let listed = fs.mounts().len();
+    // Without recursion the mount below is not there: its directory is.
+    let (flat, pin) = fs.clone_tree(b"/tmp/m", true, false).unwrap();
+    assert!(flat.starts_with(b"/\0"));
+    assert_eq!(&*fs.read_file(&[&flat[..], b"/x"].concat()).unwrap(), b"x");
+    assert_eq!(
+        names(&fs, &[&flat[..], b"/in"].concat()),
+        Vec::<Vec<u8>>::new()
+    );
+    assert_eq!(fs.mounts().len(), listed);
+    // `..` stays at its root.
+    assert_eq!(
+        fs.metadata(&[&flat[..], b"/../x"].concat(), true).unwrap(),
+        fs.metadata(&[&flat[..], b"/x"].concat(), true).unwrap()
+    );
+    // Gone once nothing holds it.
+    drop(pin);
+    assert_eq!(fs.mounts().len(), listed);
+    assert_eq!(fs.metadata(&flat, true), Err(Errno::ENOENT));
+    // With recursion, attached by a move.
+    let (tree, pin) = fs.clone_tree(b"/tmp/m", true, true).unwrap();
+    assert_eq!(
+        &*fs.read_file(&[&tree[..], b"/in/y"].concat()).unwrap(),
+        b"y"
+    );
+    fs.mkdir(b"/tmp/n", 0o755).unwrap();
+    // Not onto its own tree, and not a mount below its root.
+    assert_eq!(
+        fs.move_mount(&tree, &[&tree[..], b"/in"].concat(), &[]),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        fs.move_mount(&[&tree[..], b"/in"].concat(), b"/tmp/n", &[]),
+        Err(Errno::EINVAL)
+    );
+    // A mount of the namespace goes onto no detached tree.
+    assert_eq!(fs.move_mount(b"/tmp/m/in", &tree, &[]), Err(Errno::EINVAL));
+    fs.move_mount(&tree, b"/tmp/n", &[]).unwrap();
+    drop(pin);
+    assert_eq!(&*fs.read_file(b"/tmp/n/in/y").unwrap(), b"y");
+    assert_eq!(fs.mounts().len(), listed + 2);
+    let mounts = fs.mounts();
+    let n = mounts.iter().find(|m| m.path == b"/tmp/n").unwrap();
+    let below = mounts.iter().find(|m| m.path == b"/tmp/n/in").unwrap();
+    assert_eq!(below.parent, n.id);
+    assert_eq!(n.parent, fs.mount_id(b"/tmp"));
+}
+
+#[test]
+fn set_group_joins_a_peer_group() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d", 0o755).unwrap();
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.bind(b"/tmp/m/d", b"/tmp/b", false).unwrap();
+    let m = fs.target(b"/tmp/m").unwrap().id;
+    // From a private mount.
+    assert_eq!(
+        fs.set_group(b"/tmp/m", true, b"/tmp/b", true),
+        Err(Errno::EINVAL)
+    );
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    // Not at a mount's root, then the wrong way round (`/` is wider).
+    assert_eq!(
+        fs.set_group(b"/tmp/m/d", true, b"/tmp/b", true),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        fs.set_group(b"/tmp/b", true, b"/tmp/m", true),
+        Err(Errno::EINVAL)
+    );
+    // Another superblock.
+    assert_eq!(
+        fs.set_group(b"/tmp/m", true, b"/", true),
+        Err(Errno::EINVAL)
+    );
+    fs.set_group(b"/tmp/m", true, b"/tmp/b", true).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/b"), " shared:1");
+    // Only onto a private one.
+    assert_eq!(
+        fs.set_group(b"/tmp/m", true, b"/tmp/b", true),
+        Err(Errno::EINVAL)
+    );
+}
+
+#[test]
+fn a_file_open_in_a_detached_tree_outlasts_the_tree() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/in", 0o755).unwrap();
+    fs.mount(b"/tmp/m/in", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/in/y", 66, 0o644)
+        .unwrap()
+        .write(b"y")
+        .unwrap();
+    let (tree, pin) = fs.clone_tree(b"/tmp/m", true, true).unwrap();
+    let y = [&tree[..], b"/in/y"].concat();
+    let file = fs.open(&y, 2, 0).unwrap();
+    let held = fs.mount_pin(&y);
+    // The tree goes with its root's last hold, as Linux's dissolves at the
+    // last close of `open_tree`'s descriptor (`umount_tree` with
+    // `UMOUNT_COVER`); the file on its mount below still reads and writes.
+    drop(pin);
+    let _ = fs.mounts();
+    assert_eq!(fs.metadata(&tree, true), Err(Errno::ENOENT));
+    file.write(b"z").unwrap();
+    let mut out = [0; 2];
+    file.seek(0, 0).unwrap();
+    assert_eq!(file.read(&mut out).unwrap(), 1);
+    assert_eq!(&out[..1], b"z");
+    drop(held);
+}

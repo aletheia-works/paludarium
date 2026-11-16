@@ -258,6 +258,8 @@ fn mark_checks_and_fdinfo() {
     assert_eq!(f.mark(content, ADD, OPEN_PERM, "/tmp/f"), 0);
     assert_eq!(f.mark(content, ADD, 0x10_0000, "/tmp/f"), einval);
     assert_eq!(f.mark(content, ADD, OPEN_PERM, "/proc/self/status"), einval);
+    // An open of the file would now wait for the group's answer.
+    assert_eq!(f.mark(content, REMOVE, OPEN_PERM, "/tmp/f"), 0);
     assert_eq!(f.mark(fan, ADD | MOUNT | EVICTABLE, OPEN, "/tmp"), einval);
     assert_eq!(f.mark(fan, ADD, CREATE, "/tmp/d"), einval);
     assert_eq!(f.mark(dfid, ADD | MOUNT, CREATE, "/tmp"), einval);

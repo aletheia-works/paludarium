@@ -5,7 +5,8 @@
 //! commands, `BPF_OBJ_GET_INFO_BY_FD`, the map IDs (`BPF_MAP_GET_NEXT_ID`,
 //! `BPF_MAP_GET_FD_BY_ID`) and the descriptor's fdinfo, with the checks
 //! every command makes first (`bpf_check_uarg_tail_zero`, `CHECK_ATTR`)
-//! and `kernel.unprivileged_bpf_disabled` at Linux's default 2.
+//! and the machine's `kernel.unprivileged_bpf_disabled`, which starts at
+//! Linux's default 2 and root may write ([`crate::sysctl::Machine`]).
 //!
 //! The checks and their order follow Linux master, where the x86-64 test
 //! machines' kernel (Ubuntu's Linux 7.0) differs too: a hash's key and
@@ -30,8 +31,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 /// `sizeof(union bpf_attr)` in Linux master.
 const ATTR_SIZE: usize = 168;
 /// `kernel.unprivileged_bpf_disabled`: Linux's default with
-/// `CONFIG_BPF_UNPRIV_DEFAULT_OFF`, which is on by default, and what
-/// `/proc/sys/kernel/unprivileged_bpf_disabled` shows ([`crate::sysctl`]).
+/// `CONFIG_BPF_UNPRIV_DEFAULT_OFF`, which is on by default, and what the
+/// machine's starts with ([`crate::sysctl::Machine`]).
 pub(crate) const UNPRIVILEGED_DISABLED: i32 = 2;
 
 const CAP_SYS_ADMIN: u64 = 1 << 21;
@@ -393,7 +394,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         // No file is a BPF token.
         return Err(not_an_object(c, token_fd));
     }
-    if UNPRIVILEGED_DISABLED != 0 && !bpf_capable(c) {
+    if c.processes.sysctls.unprivileged_bpf_disabled() != 0 && !bpf_capable(c) {
         return Err(Errno::EPERM);
     }
     // array_map_alloc: without `bpf_bypass_spec_v1` (CAP_PERFMON) the

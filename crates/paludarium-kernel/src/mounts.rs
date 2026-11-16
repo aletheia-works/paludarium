@@ -85,6 +85,167 @@ pub(crate) fn sys_umount2(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 pub(crate) fn sys_pivot_root(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome(pivot_root(c, a[0], a[1]))
 }
+pub(crate) fn sys_open_tree(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(open_tree(c, a[0], a[1], a[2] & 0xffff_ffff))
+}
+pub(crate) fn sys_move_mount(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(move_mount_call(c, a))
+}
+
+const AT_FDCWD: u64 = (-100i64) as u64;
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_NO_AUTOMOUNT: u64 = 0x800;
+const AT_EMPTY_PATH: u64 = 0x1000;
+const AT_RECURSIVE: u64 = 0x8000;
+const OPEN_TREE_CLONE: u64 = 1;
+const OPEN_TREE_NAMESPACE: u64 = 2;
+const OPEN_TREE_DROP_MNTNS_MOUNTS: u64 = 4;
+const O_CLOEXEC: u64 = 0o2000000;
+const O_NOFOLLOW: u64 = 0o400000;
+const O_PATH: u64 = 0o10000000;
+const MOVE_MOUNT_F_SYMLINKS: u64 = 0x01;
+const MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x04;
+const MOVE_MOUNT_T_SYMLINKS: u64 = 0x10;
+const MOVE_MOUNT_T_EMPTY_PATH: u64 = 0x40;
+const MOVE_MOUNT_SET_GROUP: u64 = 0x100;
+const MOVE_MOUNT_BENEATH: u64 = 0x200;
+const MOVE_MOUNT_MASK: u64 = 0x377;
+
+/// A path argument that `AT_EMPTY_PATH` lets be empty or null
+/// (`getname_maybe_null`).
+fn maybe_empty(c: &Context<'_>, ptr: u64, empty: bool) -> Result<Vec<u8>, Errno> {
+    if empty && ptr == 0 {
+        return Ok(Vec::new());
+    }
+    crate::files::path(c, ptr)
+}
+
+/// `open_tree(dfd, path, flags)`, as Linux master's `vfs_open_tree`: the
+/// flags first (`EINVAL` for an unknown one, `OPEN_TREE_DROP_MNTNS_MOUNTS`
+/// without a recursive copy, `AT_RECURSIVE` without a copy, or both kinds
+/// of copy), then `CAP_SYS_ADMIN` in the caller's user namespace for
+/// `OPEN_TREE_NAMESPACE` and over its mount namespace for
+/// `OPEN_TREE_CLONE` (`EPERM`), then the lookup, its last link followed
+/// unless `AT_SYMLINK_NOFOLLOW` (`AT_EMPTY_PATH` names `dfd` itself). It
+/// gives an `O_PATH` descriptor of the file; with `OPEN_TREE_CLONE` of a
+/// copy of its mount, with `AT_RECURSIVE` of the mounts below it too, in a
+/// tree of its own ([`paludarium_vfs::NamespacedFs::clone_tree`]) that
+/// goes with the descriptor's last close unless `move_mount` attached it.
+/// `OPEN_TREE_NAMESPACE`, new in Linux master, and a copy of `/proc` or
+/// `/dev`, which the kernel generates, are not supported (`EOPNOTSUPP`).
+fn open_tree(c: &mut Context<'_>, dfd: u64, ptr: u64, flags: u64) -> Result<u64, Errno> {
+    let known = AT_EMPTY_PATH
+        | AT_NO_AUTOMOUNT
+        | AT_RECURSIVE
+        | AT_SYMLINK_NOFOLLOW
+        | OPEN_TREE_CLONE
+        | O_CLOEXEC
+        | OPEN_TREE_NAMESPACE
+        | OPEN_TREE_DROP_MNTNS_MOUNTS;
+    if flags & !known != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let copies = flags & (OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE);
+    if flags & OPEN_TREE_DROP_MNTNS_MOUNTS != 0 && (flags & AT_RECURSIVE == 0 || copies == 0) {
+        return Err(Errno::EINVAL);
+    }
+    if flags & AT_RECURSIVE != 0 && copies == 0 || copies.count_ones() > 1 {
+        return Err(Errno::EINVAL);
+    }
+    let creds = &c.process.credentials;
+    if flags & OPEN_TREE_NAMESPACE != 0 && !creds.capable_in(CAP_SYS_ADMIN, &creds.user.0) {
+        return Err(Errno::EPERM);
+    }
+    let namespaces = c.group.namespaces(c.tid);
+    if flags & OPEN_TREE_CLONE != 0 && !may_mount(c, &namespaces.mnt) {
+        return Err(Errno::EPERM);
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let empty = flags & AT_EMPTY_PATH != 0;
+    let raw = maybe_empty(c, ptr, empty)?;
+    let found = crate::files::mount_at(c, dfd, raw.clone(), follow, empty)?;
+    if flags & OPEN_TREE_NAMESPACE != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let cloexec = flags & O_CLOEXEC;
+    if flags & OPEN_TREE_CLONE == 0 {
+        // The file itself, as an `O_PATH` open of it.
+        let (dir, raw) = match (raw.is_empty(), dfd == AT_FDCWD) {
+            (false, _) => (dfd, raw),
+            (true, true) => (AT_FDCWD, b".".to_vec()),
+            (true, false) => (AT_FDCWD, c.files.descriptor(dfd)?.path),
+        };
+        let nofollow = if follow && !raw.is_empty() && raw != b"." {
+            0
+        } else {
+            O_NOFOLLOW
+        };
+        return crate::files::open_at(c, dir, raw, O_PATH | nofollow | cloexec, 0, 0);
+    }
+    let found = found.ok_or(Errno::EOPNOTSUPP)?;
+    let (point, pin) =
+        c.files
+            .namespaced()
+            .clone_tree(&found, follow, flags & AT_RECURSIVE != 0)?;
+    let opened = crate::files::open_at(c, AT_FDCWD, point, O_PATH | O_NOFOLLOW | cloexec, 0, 0);
+    drop(pin);
+    opened
+}
+
+/// `move_mount(from_dfd, from_path, to_dfd, to_path, flags)`, as Linux
+/// master's: `CAP_SYS_ADMIN` over the caller's mount namespace (`EPERM`)
+/// first, then the flags (`EINVAL`), then the target and then the source
+/// are looked up, each following its last link only with its
+/// `MOVE_MOUNT_*_SYMLINKS` and naming its descriptor itself when empty
+/// with its `MOVE_MOUNT_*_EMPTY_PATH`; a Landlock domain is `EPERM`
+/// (`hook_move_mount`). `MOVE_MOUNT_SET_GROUP` puts the target in the
+/// source's peer group ([`paludarium_vfs::NamespacedFs::set_group`]);
+/// otherwise the source mount moves onto the target as `MS_MOVE` moves
+/// it, or a detached tree from `open_tree` is attached there.
+/// `MOVE_MOUNT_BENEATH`, and `/proc` or `/dev`, which the kernel
+/// generates, are not supported (`EOPNOTSUPP`).
+fn move_mount_call(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let flags = a[4] & 0xffff_ffff;
+    let namespaces = c.group.namespaces(c.tid);
+    if !may_mount(c, &namespaces.mnt) {
+        return Err(Errno::EPERM);
+    }
+    if flags & !MOVE_MOUNT_MASK != 0
+        || flags & (MOVE_MOUNT_BENEATH | MOVE_MOUNT_SET_GROUP)
+            == MOVE_MOUNT_BENEATH | MOVE_MOUNT_SET_GROUP
+    {
+        return Err(Errno::EINVAL);
+    }
+    let follow_to = flags & MOVE_MOUNT_T_SYMLINKS != 0;
+    let empty_to = flags & MOVE_MOUNT_T_EMPTY_PATH != 0;
+    let raw = maybe_empty(c, a[3], empty_to)?;
+    let to = crate::files::mount_at(c, a[2], raw, follow_to, empty_to)?;
+    let follow_from = flags & MOVE_MOUNT_F_SYMLINKS != 0;
+    let empty_from = flags & MOVE_MOUNT_F_EMPTY_PATH != 0;
+    let raw = maybe_empty(c, a[1], empty_from)?;
+    let from = crate::files::mount_at(c, a[0], raw, follow_from, empty_from)?;
+    if c.process.credentials.landlock.handles_fs() {
+        return Err(Errno::EPERM);
+    }
+    let (Some(from), Some(to)) = (from, to) else {
+        return Err(Errno::EOPNOTSUPP);
+    };
+    let namespaced = c.files.namespaced();
+    if flags & MOVE_MOUNT_SET_GROUP != 0 {
+        namespaced.set_group(&from, follow_from, &to, follow_to)?;
+        return Ok(0);
+    }
+    if flags & MOVE_MOUNT_BENEATH != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if !check_mnt(c, &namespaces.mnt) {
+        return Err(Errno::EINVAL);
+    }
+    c.files.relocate(c.processes, |paths| {
+        namespaced.move_mount_following(&from, follow_from, &to, follow_to, paths)
+    })?;
+    Ok(0)
+}
 
 /// `copy_mount_string`: none for a null pointer, else the string as
 /// `strndup_user(s, PATH_MAX)` takes it: `EFAULT` where it cannot be read,

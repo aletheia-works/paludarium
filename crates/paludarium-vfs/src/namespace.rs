@@ -537,6 +537,7 @@ impl MountTable {
         // the number it is shown by.
         let ids: BTreeMap<u64, u64> = old
             .iter()
+            .filter(|e| !detached(&e.point))
             .map(|e| {
                 let id = if e.hidden {
                     e.id()
@@ -547,7 +548,8 @@ impl MountTable {
             })
             .collect();
         let mut entries = Vec::with_capacity(old.len());
-        for e in old.iter() {
+        // A detached tree stays with the table it was made from.
+        for e in old.iter().filter(|e| !detached(&e.point)) {
             let id = ids[&e.id()];
             let (group, master) = match (locked, e.group) {
                 (true, 0) => (0, e.master),
@@ -652,6 +654,11 @@ fn joined(at: &[u8], rest: &[u8]) -> Vec<u8> {
     } else {
         [at, rest].concat()
     }
+}
+/// Whether `point` is in a detached tree ([`NamespacedFs::clone_tree`]),
+/// whose names start with a 0 that no path a program gives can hold.
+fn detached(point: &[u8]) -> bool {
+    point.starts_with(b"/\0")
 }
 /// `name` in the directory `dir`.
 fn child_path(dir: &[u8], name: &[u8]) -> Vec<u8> {
@@ -864,8 +871,23 @@ impl NamespacedFs {
             if part == b"." {
                 continue;
             }
+            // The root of a detached tree, by its name.
+            if part.first() == Some(&0) {
+                let point = [&b"/"[..], &part].concat();
+                let i = entries
+                    .iter()
+                    .position(|e| e.point == point && e.parent == e.id())
+                    .ok_or(Errno::ENOENT)?;
+                current = Loc {
+                    at: Some(i),
+                    path: point,
+                };
+                continue;
+            }
             if part == b".." {
-                if current.path != b"/" && current.path != self.root {
+                // A detached tree's root has no parent to go up to.
+                let tree_root = detached(&current.path) && !current.path[2..].contains(&b'/');
+                if current.path != b"/" && current.path != self.root && !tree_root {
                     // Out of each mount whose root this is, to where it
                     // is mounted, then up (`follow_dotdot`).
                     while let Some(i) = current.at
@@ -1071,6 +1093,7 @@ impl NamespacedFs {
     /// Mounts `new` on the directory at the resolved `path`, on top of what
     /// is there (`do_add_mount`): `ENOTDIR` for another file.
     pub fn mount(&self, path: &[u8], new: NewTmpfs) -> Result<(), Errno> {
+        self.swept();
         let entries = self.table.snapshot();
         let loc = self.walk(&entries, path, true, false, true)?;
         if self.lstat(&entries, &loc)?.mode & S_IFMT != S_IFDIR {
@@ -1117,22 +1140,22 @@ impl NamespacedFs {
             Ok(())
         })
     }
-    /// Binds what the resolved `source` names onto the resolved `target`
-    /// (`do_loopback`), both with their last links followed: a new mount of
-    /// the source's mount's file system, rooted there, with that mount's
-    /// flags, its source and its type, not locked, a peer of it and a slave
-    /// of its master. An unbindable source mount is `EINVAL`. With
-    /// `recurse` (`copy_tree`) the mounts below the source come along, each
-    /// still locked if it was, but for unbindable ones and what is on them
-    /// (`EPERM` for a locked one); without, a locked one below it is
-    /// `EINVAL` (`has_locked_children`). A directory goes on a directory, a
-    /// file on a file (`graft_tree`, `ENOTDIR`). On a shared mount, the new
-    /// mounts are shared too, each in a new peer group if it was in none.
-    pub fn bind(&self, source: &[u8], target: &[u8], recurse: bool) -> Result<(), Errno> {
-        let entries = self.table.snapshot();
-        let from = self.walk(&entries, source, true, false, true)?;
-        let to = self.walk(&entries, target, true, false, true)?;
-        let old = self.entry(&entries, &from);
+    /// The copies `__do_loopback` makes of the mount at `from` to go at `at`
+    /// on mount `parent`: of the mount, rooted there (`clone_mnt`), a peer
+    /// of it and a slave of its master, not locked; with `recurse`
+    /// (`copy_tree`) the mounts below it too, each still locked if it
+    /// was, but for unbindable ones and what is on them (`EPERM` for a
+    /// locked one). An unbindable mount is `EINVAL`, and without `recurse`
+    /// a locked one below it too (`has_locked_children`).
+    fn copies(
+        &self,
+        entries: &[Entry],
+        from: &Loc,
+        parent: u64,
+        at: &[u8],
+        recurse: bool,
+    ) -> Result<Vec<Entry>, Errno> {
+        let old = self.entry(entries, from);
         if old.unbindable {
             return Err(Errno::EINVAL);
         }
@@ -1142,12 +1165,11 @@ impl NamespacedFs {
             return Err(Errno::EINVAL);
         }
         let numbers = &self.table.numbers;
-        let parent = self.entry(&entries, &to);
         let top = old.cloned(
             numbers,
-            self.backing(&entries, &from).1,
-            parent.id(),
-            to.path.clone(),
+            self.backing(entries, from).1,
+            parent,
+            at.to_vec(),
             false,
         );
         let mut new = vec![Entry {
@@ -1167,7 +1189,7 @@ impl NamespacedFs {
                     }
                     continue;
                 }
-                let point = joined(&to.path, &relative(&from.path, &e.point));
+                let point = joined(at, &relative(&from.path, &e.point));
                 let copy = e.cloned(numbers, e.root.clone(), copies[&e.parent], point, false);
                 copies.insert(e.id(), copy.id());
                 new.push(copy);
@@ -1179,6 +1201,26 @@ impl NamespacedFs {
                 );
             }
         }
+        Ok(new)
+    }
+    /// Binds what the resolved `source` names onto the resolved `target`
+    /// (`do_loopback`), both with their last links followed: a new mount of
+    /// the source's mount's file system, rooted there, with that mount's
+    /// flags, its source and its type, not locked, a peer of it and a slave
+    /// of its master. An unbindable source mount is `EINVAL`. With
+    /// `recurse` (`copy_tree`) the mounts below the source come along, each
+    /// still locked if it was, but for unbindable ones and what is on them
+    /// (`EPERM` for a locked one); without, a locked one below it is
+    /// `EINVAL` (`has_locked_children`). A directory goes on a directory, a
+    /// file on a file (`graft_tree`, `ENOTDIR`). On a shared mount, the new
+    /// mounts are shared too, each in a new peer group if it was in none.
+    pub fn bind(&self, source: &[u8], target: &[u8], recurse: bool) -> Result<(), Errno> {
+        self.swept();
+        let entries = self.table.snapshot();
+        let from = self.walk(&entries, source, true, false, true)?;
+        let to = self.walk(&entries, target, true, false, true)?;
+        let parent = self.entry(&entries, &to);
+        let mut new = self.copies(&entries, &from, parent.id(), &to.path, recurse)?;
         let directory = |loc: &Loc| -> Result<bool, Errno> {
             Ok(self.lstat(&entries, loc)?.mode & S_IFMT == S_IFDIR)
         };
@@ -1195,6 +1237,116 @@ impl NamespacedFs {
         }
         self.table.update(|entries| {
             entries.extend(new);
+            Ok(())
+        })
+    }
+    /// Takes away each detached tree whose root nothing holds any more, as
+    /// the last close of `open_tree`'s descriptor does (`dissolve_on_fput`).
+    fn swept(&self) {
+        let gone: Vec<u64> = self
+            .table
+            .snapshot()
+            .iter()
+            .filter(|e| {
+                detached(&e.point) && e.parent == e.id() && e.token.pins.load(Ordering::SeqCst) == 0
+            })
+            .map(Entry::id)
+            .collect();
+        for id in gone {
+            let _ = self.umount(id, true);
+        }
+    }
+    /// `open_tree` with `OPEN_TREE_CLONE` (`open_detached_copy`): a copy of
+    /// the mount at the resolved `source` (its last link followed with
+    /// `follow`), with `recurse` (`AT_RECURSIVE`) the mounts below it too,
+    /// as `__do_loopback` makes for a bind mount, in a tree of its own that
+    /// no path of the namespace reaches and no list shows (Linux's
+    /// anonymous mount namespace). It is named by the path this gives,
+    /// which a walk takes into it, and kept while the [`MountPin`] this
+    /// gives, or any other on its root, lasts; [`Self::move_mount`]
+    /// attaches it.
+    pub fn clone_tree(
+        &self,
+        source: &[u8],
+        follow: bool,
+        recurse: bool,
+    ) -> Result<(Vec<u8>, MountPin), Errno> {
+        self.swept();
+        let entries = self.table.snapshot();
+        let from = self.walk(&entries, source, follow, false, true)?;
+        let mut new = self.copies(&entries, &from, 0, b"/", recurse)?;
+        let id = new[0].id();
+        let point = [&b"/\0"[..], id.to_string().as_bytes()].concat();
+        for e in &mut new {
+            e.point = joined(&point, &e.point);
+        }
+        new[0].parent = id;
+        let pin = MountPin::new(&new[0].token, false);
+        self.table.update(|entries| {
+            entries.extend(new);
+            Ok(())
+        })?;
+        Ok((point, pin))
+    }
+    /// `move_mount` with `MOVE_MOUNT_SET_GROUP` (`do_set_group`): the
+    /// mount at the resolved `to` joins the peer group, and takes the
+    /// master, of the mount at the resolved `from`. Both must be mounts of
+    /// the namespace (`EINVAL`, `may_change_propagation`) at their roots
+    /// (`EINVAL`), of one superblock, `to`'s root at or below `from`'s,
+    /// with no locked mount of `from` in its place; `to` must be private
+    /// and `from` shared or a slave (`EINVAL`).
+    pub fn set_group(
+        &self,
+        from: &[u8],
+        follow_from: bool,
+        to: &[u8],
+        follow_to: bool,
+    ) -> Result<(), Errno> {
+        self.swept();
+        let entries = self.table.snapshot();
+        let from_loc = self.walk(&entries, from, follow_from, false, true)?;
+        let to_loc = self.walk(&entries, to, follow_to, false, true)?;
+        let (a, b) = (
+            self.entry(&entries, &from_loc),
+            self.entry(&entries, &to_loc),
+        );
+        if detached(&a.point) || detached(&b.point) {
+            return Err(Errno::EINVAL);
+        }
+        if a.point != from_loc.path || b.point != to_loc.path {
+            return Err(Errno::EINVAL);
+        }
+        let same = match (&a.backing, &b.backing) {
+            (Backing::Memory(x), Backing::Memory(y)) => Arc::ptr_eq(x, y),
+            (Backing::Memory(_), _) | (_, Backing::Memory(_)) => false,
+            (
+                Backing::Boot { device: x, .. } | Backing::Lower { device: x, .. },
+                Backing::Boot { device: y, .. } | Backing::Lower { device: y, .. },
+            ) => x == y,
+        };
+        if !same || !within(&b.root, &a.root) {
+            return Err(Errno::EINVAL);
+        }
+        if entries.iter().any(|c| {
+            c.parent == a.id()
+                && c.id() != a.id()
+                && c.locked
+                && within(&a.inside(&c.point), &b.root)
+        }) {
+            return Err(Errno::EINVAL);
+        }
+        if b.group != 0 || b.master != 0 || b.unbindable {
+            return Err(Errno::EINVAL);
+        }
+        if a.group == 0 && a.master == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let (group, master, id) = (a.group, a.master, b.id());
+        self.table.update(|entries| {
+            if let Some(e) = entries.iter_mut().find(|e| e.id() == id) {
+                e.group = group;
+                e.master = master;
+            }
             Ok(())
         })
     }
@@ -1255,27 +1407,56 @@ impl NamespacedFs {
         target: &[u8],
         paths: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>, Errno> {
+        self.move_mount_following(source, true, target, true, paths)
+    }
+    /// [`Self::move_mount`] with the last links of `source` and `target`
+    /// followed or not (`move_mount`'s `MOVE_MOUNT_F_SYMLINKS` and
+    /// `MOVE_MOUNT_T_SYMLINKS`). The root of a detached tree
+    /// ([`Self::clone_tree`]) is attached there, onto a mount of the
+    /// namespace (`EINVAL` onto its own tree); another mount of one is
+    /// `EINVAL` (`anon_ns_root`), and a mount of the namespace goes onto
+    /// none (`EINVAL`).
+    pub fn move_mount_following(
+        &self,
+        source: &[u8],
+        follow_source: bool,
+        target: &[u8],
+        follow_target: bool,
+        paths: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, Errno> {
+        self.swept();
         let entries = self.table.snapshot();
-        let from = self.walk(&entries, source, true, false, true)?;
+        let from = self.walk(&entries, source, follow_source, false, true)?;
         let old = self.entry(&entries, &from);
         if old.point != from.path {
             return Err(Errno::EINVAL);
         }
-        let to = self.walk(&entries, target, true, false, true)?;
+        let to = self.walk(&entries, target, follow_target, false, true)?;
         let directory = |loc: &Loc| -> Result<bool, Errno> {
             Ok(self.lstat(&entries, loc)?.mode & S_IFMT == S_IFDIR)
         };
         if directory(&from)? != directory(&to)? {
             return Err(Errno::EINVAL);
         }
-        let root = &entries[Self::root_index(&entries)];
-        if old.id() == root.id() || old.locked {
-            return Err(Errno::EINVAL);
-        }
-        if Self::by_id(&entries, old.parent).is_some_and(|p| p.group != 0) {
-            return Err(Errno::EINVAL);
-        }
         let dest = self.entry(&entries, &to);
+        if detached(&old.point) {
+            let tree = old.point.split(|b| *b == b'/').nth(1).unwrap_or_default();
+            if old.parent != old.id() || dest.point.split(|b| *b == b'/').nth(1) == Some(tree) {
+                return Err(Errno::EINVAL);
+            }
+        } else {
+            let root = &entries[Self::root_index(&entries)];
+            if old.id() == root.id() || old.locked {
+                return Err(Errno::EINVAL);
+            }
+            if Self::by_id(&entries, old.parent).is_some_and(|p| p.group != 0 && p.id() != old.id())
+            {
+                return Err(Errno::EINVAL);
+            }
+            if detached(&dest.point) {
+                return Err(Errno::EINVAL);
+            }
+        }
         let moving = Self::tree(&entries, old.id(), true);
         let has = |id: &u64| Self::by_id(&entries, *id);
         if dest.group != 0 && moving.iter().filter_map(has).any(|e| e.unbindable) {
@@ -1341,6 +1522,7 @@ impl NamespacedFs {
         root: &[u8],
         paths: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>, Errno> {
+        self.swept();
         let entries = self.table.snapshot();
         let new_loc = self.walk(&entries, new, true, false, true)?;
         let old_loc = self.walk(&entries, put_old, true, false, true)?;
@@ -1507,6 +1689,7 @@ impl NamespacedFs {
     /// a slave then follows too; a private or an unbindable one has no
     /// master.
     pub fn change_type(&self, id: u64, kind: Propagation, recurse: bool) -> Result<(), Errno> {
+        self.swept();
         let numbers = &self.table.numbers;
         let ids = Self::tree(&self.table.snapshot(), id, recurse);
         for id in ids {
@@ -1652,10 +1835,11 @@ impl FileSystem for NamespacedFs {
         }))
     }
     fn mounts(&self) -> Vec<MountPoint> {
+        self.swept();
         let entries = self.table.snapshot();
         entries
             .iter()
-            .filter(|e| !e.hidden)
+            .filter(|e| !e.hidden && !detached(&e.point))
             .map(|e| {
                 let (kind, device, root, common_options, super_options) = match &e.backing {
                     Backing::Boot { kind, device } => {

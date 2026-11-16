@@ -4394,11 +4394,6 @@ mod shm {
         ] {
             assert_eq!(read(&mut k, &mut t, &m, name), value, "{name}");
         }
-        // No one writes the fixed ones.
-        assert_eq!(
-            write_kernel(&mut k, &mut t, &m, "perf_event_paranoid", b"1"),
-            e(Errno::EACCES)
-        );
         // Shared memory: a segment's size, all their pages, their number.
         assert_eq!(write_kernel(&mut k, &mut t, &m, "shmmax", b"8192\n"), 5);
         assert_eq!(
@@ -4549,6 +4544,83 @@ mod shm {
             read(&mut k, &mut t, &m, "sem"),
             "32000\t1024000000\t500\t32000\n"
         );
+    }
+
+    #[test]
+    fn root_sets_the_machine_s_perf_and_bpf_sysctls_and_they_take_effect() {
+        let (mut k, mut t, m) = setup();
+        let read = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, name: &str| {
+            read_proc(k, t, m, &format!("/proc/sys/kernel/{name}"))
+        };
+        assert_eq!(read(&mut k, &mut t, &m, "perf_event_paranoid"), "2\n");
+        assert_eq!(read(&mut k, &mut t, &m, "unprivileged_bpf_disabled"), "2\n");
+        const ATTR: u64 = DATA + 0x400;
+        // A software clock over the whole of CPU 0, its kernel counted too.
+        m.write(GuestAddr(ATTR), &[0; 64]).unwrap();
+        m.write(GuestAddr(ATTR), &1u32.to_le_bytes()).unwrap();
+        let cpu_wide = [ATTR, u64::MAX, 0, u64::MAX, 0, 0];
+        // bpf(BPF_MAP_CREATE) of a one-element array.
+        const MAP: u64 = DATA + 0x500;
+        m.write(GuestAddr(MAP), &[0; 72]).unwrap();
+        for (at, value) in [(0, 2u32), (4, 4), (8, 8), (12, 1)] {
+            m.write(GuestAddr(MAP + at), &value.to_le_bytes()).unwrap();
+        }
+        let map = [0, MAP, 72, 0, 0, 0];
+        let root = t.state.credentials.clone();
+        let user = root.setresuid(1000, 1000, 1000).unwrap();
+        t.state.credentials = user.clone();
+        assert_eq!(syscall(&mut k, &mut t, &m, 298, cpu_wide), e(Errno::EACCES));
+        assert_eq!(syscall(&mut k, &mut t, &m, 321, map), e(Errno::EPERM));
+        // Only root opens them to write.
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "perf_event_paranoid", b"-1"),
+            e(Errno::EACCES)
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "unprivileged_bpf_disabled", b"0"),
+            e(Errno::EACCES)
+        );
+        // -1 lets anyone count anything, 0 lets anyone make maps.
+        t.state.credentials = root.clone();
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "perf_event_paranoid", b"-1"),
+            2
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "perf_event_paranoid"), "-1\n");
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "unprivileged_bpf_disabled", b"0"),
+            1
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "unprivileged_bpf_disabled", b"3"),
+            e(Errno::EINVAL)
+        );
+        t.state.credentials = user.clone();
+        assert!(syscall(&mut k, &mut t, &m, 298, cpu_wide) < 1 << 31);
+        assert!(syscall(&mut k, &mut t, &m, 321, map) < 1 << 31);
+        // Once 1, unprivileged_bpf_disabled stays 1; 2 could still change.
+        t.state.credentials = root.clone();
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "unprivileged_bpf_disabled", b"2"),
+            1
+        );
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "unprivileged_bpf_disabled", b"1"),
+            1
+        );
+        for value in [&b"0"[..], b"2"] {
+            assert_eq!(
+                write_kernel(&mut k, &mut t, &m, "unprivileged_bpf_disabled", value),
+                e(Errno::EPERM)
+            );
+        }
+        assert_eq!(
+            write_kernel(&mut k, &mut t, &m, "unprivileged_bpf_disabled", b"1"),
+            1
+        );
+        assert_eq!(read(&mut k, &mut t, &m, "unprivileged_bpf_disabled"), "1\n");
+        t.state.credentials = user;
+        assert_eq!(syscall(&mut k, &mut t, &m, 321, map), e(Errno::EPERM));
     }
 
     #[test]

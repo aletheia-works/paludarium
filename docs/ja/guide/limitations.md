@@ -209,9 +209,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   176 バイトの構造体の SIMD レジスタのフィールドは、master と同じく確かめますが、Linux とは
   比べていません。テストのマシンの Linux 7.0 は 144 バイトまでしか知らず、0 でないものには
   `E2BIG` を返します。`kernel.perf_event_paranoid` は
-  いつも 2 で（Debian と Ubuntu のカーネルの既定はそれより大きい）、その
-  `/proc/sys/kernel` のファイルには書けません（モード 0444。Linux のファイルは 0644 で、
-  root が書けます）。
+  最初 Linux の 2 です（Debian と Ubuntu のカーネルの既定はそれより大きい）。
 - **BPF はマップだけ**：`bpf` が作るのは配列とハッシュだけです。プログラム
   （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
   （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
@@ -242,8 +240,6 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   マシンのものなので、1 から始まり、ホストのマップは見えません。`BPF_F_MMAPABLE` は
   受け付けますが、マップの `mmap` は `ENODEV`、マップの SHA-256
   （`bpf_map_info.hash`）は `EINVAL` です。
-  `kernel.unprivileged_bpf_disabled` はいつも 2 で、その `/proc/sys/kernel` の
-  ファイルには書けません（モード 0444。Linux のファイルは 0644 で、root が書けます）。
 - **仮想 CPU**：`rseq` を登録したスレッドは、ホストの CPU ではなく仮想 CPU で動きます。
   そのため、領域と `getcpu` が示す CPU は、ホストがそのスレッドを動かしている CPU では
   ありません。`/proc/<pid>/stat` は CPU 0 を示します。クリティカルセクションは、CPU が
@@ -406,8 +402,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     専用のワーカーではなく、次の鍵の呼び出しの始めに行います。最後のリンクを失った鍵は
     すぐになくなり、割り当ても戻ります。Linux では少しあとで解放します。スレッドのキーリングが従うのは、`setfsuid` や `setuid` などが変える
     ファイルシステムの ID だけです。
-  - `/proc/sys/fs/mqueue` のファイルと `/proc/sys/kernel` の IPC の上限は、書ける者を
-    開くときに確かめます。Linux は書き込みの
+  - `/proc/sys/fs/mqueue` と `/proc/sys/kernel` のファイルは、書ける者を（
+    `unprivileged_bpf_disabled` は書き手に `CAP_SYS_ADMIN` があるかも）開くときに
+    確かめます。Linux は書き込みの
     たびに書く者を確かめ直します。また、サイズとして値の長さを示します。Linux は 0 です。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
@@ -459,9 +456,15 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   それがないカーネルと同じく `ENODEV` です。それより前の Linux の確認を通ったあと、
   tmpfs の `MS_NOSYMFOLLOW` とマウントし直しで付ける `MS_NOSYMFOLLOW`、生成される
   `/proc` や `/dev`（とその中のファイル）へのマウント、そのバインドマウントや移動は
-  `EOPNOTSUPP` で、プログラムはできないことを知れます。`fsopen`、`fsconfig`、
-  `fsmount`、`fspick`、`move_mount`、`open_tree`、`mount_setattr`、`statmount`、
-  `listmount` はありません（`ENOSYS`）。伝播の種類は持って表示しますが、
+  `EOPNOTSUPP` で、プログラムはできないことを知れます。`open_tree` の
+  `OPEN_TREE_NAMESPACE`（Linux master で新しいもの）と `move_mount` の
+  `MOVE_MOUNT_BENEATH` も同じです。`fsopen`、`fsconfig`、`fsmount`、`fspick`、
+  `mount_setattr`、`statmount`、`listmount` はありません（`ENOSYS`）。
+  `open_tree` の切り離された木は、それを作ったマウント名前空間の表に属します。Linux は
+  それに自分だけの匿名の名前空間を与えます。そのため `unshare(CLONE_NEWNS)` のあとは
+  そのディスクリプタから届かず、つなげるのは呼び出し元の名前空間の木だけです。
+  ディスクリプタを最後に閉じたとき、ではなく、そのあと次にマウントが変わるときに
+  なくなります。伝播の種類は持って表示しますが、
   何も伝播しません。共有マウントの下でのマウントやその解除は、Linux の `propagate_mnt` と
   `propagate_umount` のようにはピアやスレーブに届かないので、ピアには写しが見えません。
   起動したときからあるマウントはプライベートです。Linux のルートは共有（`shared:1`。
@@ -594,9 +597,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
   ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
-- **fanotify の一部**：許可イベント（`FAN_OPEN_PERM`、`FAN_ACCESS_PERM`、
-  `FAN_OPEN_EXEC_PERM`）は `fanotify_mark` で受け付けますが送りません。そのため、求める
-  はずだったことはそのまま通り、応答はどのイベントも指しません。`FAN_PRE_ACCESS` は
+- **fanotify の一部**：許可イベントで送るのは、`open`、`openat`、`openat2`、`creat`、
+  `open_by_handle_at` での（`/proc/self/fd` のリンクからも）オープンの `FAN_OPEN_PERM` だけです。`FAN_ACCESS_PERM`、
+  `FAN_OPEN_EXEC_PERM`、exec の `FAN_OPEN_PERM` は `fanotify_mark` で受け付けますが
+  送らないので、求めるはずだったことはそのまま通ります。exec のオープンは
+  `FAN_OPEN_EXEC` なしの `FAN_OPEN` として伝えます。
+  `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント
   （`FAN_MNT_ATTACH`、`FAN_MNT_DETACH`）と `FAN_FS_ERROR` は来ません。追い出せるマークも
   追い出しません。グループは、まだ溜まっている似たイベントのどれにもまとめます。Linux は

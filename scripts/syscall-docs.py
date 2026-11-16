@@ -342,6 +342,8 @@ NAMES = {
     425: "io_uring_setup",
     426: "io_uring_enter",
     427: "io_uring_register",
+    428: "open_tree",
+    429: "move_mount",
     434: "pidfd_open",
     435: "clone3",
     436: "close_range",

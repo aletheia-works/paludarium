@@ -182,6 +182,7 @@ mod linux {
                     | "msg"
                     | "ipc-sysctl"
                     | "sysvipc-proc"
+                    | "kernel-sysctl"
                     | "mqueue-calls"
                     | "mqueue-limits"
                     | "mqueue-wait"
@@ -202,6 +203,7 @@ mod linux {
                     | "fanotify-pidfd"
                     | "fanotify-unprivileged"
                     | "fanotify-mounts"
+                    | "fanotify-perm"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -539,6 +541,7 @@ mod linux {
         fanotify_pidfd => ("fanotify-pidfd","fanotify"),
         fanotify_unprivileged => ("fanotify-unprivileged","fanotify"),
         fanotify_mounts => ("fanotify-mounts","fanotify"),
+        fanotify_perm => ("fanotify-perm","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
@@ -706,6 +709,7 @@ mod linux {
         processes_msg => ("msg","process"),
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
+        processes_kernel_sysctl => ("kernel-sysctl","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),
         processes_vector_flags => ("vector-flags","process"),
@@ -739,6 +743,7 @@ mod linux {
         processes_binds => ("binds","process"),
         processes_remounts => ("remounts","process"),
         processes_moves => ("moves","process"),
+        processes_trees => ("trees","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_proc_other_maps => ("proc-other-maps","process"),
         processes_proc_other_fds => ("proc-other-fds","process"),

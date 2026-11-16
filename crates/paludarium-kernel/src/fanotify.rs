@@ -20,7 +20,7 @@ use crate::page_cache::Key;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -44,9 +44,9 @@ pub(crate) const OPEN_EXEC: u32 = 0x1000;
 const UNMOUNT: u32 = 0x2000;
 const Q_OVERFLOW: u32 = 0x4000;
 const FS_ERROR: u32 = 0x8000;
-const OPEN_PERM: u32 = 0x1_0000;
-const ACCESS_PERM: u32 = 0x2_0000;
-const OPEN_EXEC_PERM: u32 = 0x4_0000;
+pub(crate) const OPEN_PERM: u32 = 0x1_0000;
+pub(crate) const ACCESS_PERM: u32 = 0x2_0000;
+pub(crate) const OPEN_EXEC_PERM: u32 = 0x4_0000;
 const PRE_ACCESS: u32 = 0x10_0000;
 const MNT_ATTACH: u32 = 0x100_0000;
 const MNT_DETACH: u32 = 0x200_0000;
@@ -506,6 +506,8 @@ struct Event {
     /// The task, by its ID in the emulator; 0 for the overflow event.
     pid: u32,
     body: Body,
+    /// A permission event's number in its group's answers ([`Answer`]).
+    perm: Option<u64>,
 }
 impl Event {
     /// `fanotify_should_merge`.
@@ -629,6 +631,147 @@ pub(crate) struct Group {
     event_flags: u32,
     status: AtomicU32,
     queue: Mutex<Queue>,
+    /// Its permission events by number, from their queueing to their
+    /// answer (`access_list` and each event's `state`).
+    answers: Mutex<Answers>,
+}
+
+/// Where a permission event is (`FAN_EVENT_INIT`, `_REPORTED`,
+/// `_ANSWERED`, `_CANCELED`).
+#[derive(Clone, Copy)]
+enum Answer {
+    /// In the queue, not read yet.
+    Queued,
+    /// Read, with the descriptor a response names it by.
+    Reported(i32),
+    /// The response.
+    Answered(u32),
+    /// Read with that descriptor, and the task stopped waiting (a fatal
+    /// signal) before an answer, which a response then only ends.
+    Canceled(i32),
+}
+#[derive(Default)]
+struct Answers {
+    next: u64,
+    states: HashMap<u64, Answer>,
+}
+
+/// `FAN_ALLOW`, `FAN_DENY` and `FAN_INFO`.
+const ALLOW: u32 = 1;
+const DENY: u32 = 2;
+const INFO_RESPONSE: u32 = 0x20;
+
+thread_local! {
+    /// The permission events the file operation this thread runs asks of
+    /// each group ([`Group::handle`]), which [`await_answers`] queues and
+    /// waits for, group by group, as `fanotify_handle_event` does; `None`
+    /// outside an operation that waits ([`asking`]), whose permission
+    /// events are let through.
+    static ASKED: RefCell<Option<Vec<Asked>>> = const { RefCell::new(None) };
+}
+
+/// A permission event asked of a group, not queued yet.
+type Asked = (Weak<Group>, Event);
+
+/// Runs `f`, a file operation whose permission events (an open's) are
+/// asked of the groups, then waits for their answers ([`await_answers`]):
+/// what `f` gives, or the error a group denies it with.
+pub(crate) fn asking<T>(
+    c: &mut Context<'_>,
+    f: impl FnOnce(&mut Context<'_>) -> T,
+) -> (T, Result<bool, Errno>) {
+    let outer = ASKED.with(|asked| asked.borrow_mut().replace(Vec::new()));
+    let result = f(c);
+    let asked = ASKED
+        .with(|asked| std::mem::replace(&mut *asked.borrow_mut(), outer))
+        .unwrap_or_default();
+    let answered = await_answers(c, asked);
+    (result, answered)
+}
+
+/// How many permission events this thread's operation has asked so far,
+/// which tells an open whether to hold back its `FAN_OPEN` until they are
+/// answered.
+pub(crate) fn asked() -> usize {
+    ASKED.with(|asked| asked.borrow().as_ref().map_or(0, Vec::len))
+}
+
+/// Queues each permission event of `asked` and waits for its answer, the
+/// groups of pre-content first, then of content, as `fsnotify` takes them
+/// by priority: whether any was asked, or the error the first denial gives.
+/// The wait ends only for an answer, the group's close (let through), or a
+/// fatal signal (`TASK_KILLABLE`), which leaves the event to its group.
+fn await_answers(c: &mut Context<'_>, mut asked: Vec<Asked>) -> Result<bool, Errno> {
+    if asked.is_empty() {
+        return Ok(false);
+    }
+    asked.sort_by_key(|(group, _)| {
+        group
+            .upgrade()
+            .map_or(2, |g| u8::from(g.flags & CLASS_PRE_CONTENT == 0))
+    });
+    for (group, event) in asked {
+        let Some(id) = group.upgrade().and_then(|g| g.ask(event)) else {
+            continue;
+        };
+        loop {
+            let ticket = c.files.readiness.token.value();
+            let Some(strong) = group.upgrade() else {
+                break;
+            };
+            if let Some(answer) = strong.answer(id) {
+                answer?;
+                break;
+            }
+            let _ = c.inbox.drain(c.process);
+            c.group.drain_process(c.process);
+            if fatal(c) {
+                strong.cancel(id);
+                return Err(Errno(4));
+            }
+            drop(strong);
+            let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+            let end = Some((
+                paludarium_host::ClockId::Monotonic,
+                now.saturating_add(10_000_000),
+            ));
+            match c
+                .host
+                .wait_on(&c.files.readiness.token, ticket, end, c.cancellation)
+            {
+                Err(e) if e == Errno::ENOSYS => {
+                    c.host.wait_until(
+                        paludarium_host::ClockId::Monotonic,
+                        now.saturating_add(1_000_000),
+                        c.cancellation,
+                    )?;
+                }
+                result => {
+                    result?;
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the task is to die (`fatal_signal_pending`): its group exits, or
+/// a signal it does not block or ignore ends it, SIGKILL or one whose
+/// default action is to end the process.
+fn fatal(c: &Context<'_>) -> bool {
+    if c.group.status().is_some() {
+        return true;
+    }
+    let Some(index) = crate::signals::next_pending(c.process, true) else {
+        return false;
+    };
+    let number = c.process.pending[index].number;
+    let handler = c
+        .process
+        .signal_actions
+        .get(&number)
+        .map_or(0, |action| action.handler);
+    number == 9 || handler == 0 && !matches!(number, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28)
 }
 
 impl Registry {
@@ -844,7 +987,8 @@ impl Registry {
         let mount = data.mount();
         let device = object.key.0;
         for group in groups {
-            group.handle(
+            Group::handle(
+                group,
                 mask,
                 data,
                 dir,
@@ -873,7 +1017,7 @@ impl Group {
     /// that the event reaches.
     #[allow(clippy::too_many_arguments)]
     fn handle(
-        &self,
+        self: &Arc<Self>,
         mask: u32,
         data: &Data<'_>,
         dir: Option<Object>,
@@ -997,6 +1141,17 @@ impl Group {
         let Some(event) = self.event(mask, data, dir, name, fsid, matched) else {
             return;
         };
+        // A permission event waits for the task to queue it and its
+        // answer ([`await_answers`]).
+        if mask & PERM_EVENTS != 0 {
+            drop(queue);
+            ASKED.with(|asked| {
+                if let Some(asked) = asked.borrow_mut().as_mut() {
+                    asked.push((Arc::downgrade(self), event));
+                }
+            });
+            return;
+        }
         let queued = Self::insert(&mut queue, event);
         drop(queue);
         if queued {
@@ -1104,7 +1259,12 @@ impl Group {
         } else {
             return None;
         };
-        Some(Event { mask, pid, body })
+        Some(Event {
+            mask,
+            pid,
+            body,
+            perm: None,
+        })
     }
 
     /// `fsnotify_insert_event` with `fanotify_merge`: past the limit only
@@ -1120,14 +1280,15 @@ impl Group {
                 mask: Q_OVERFLOW,
                 pid: 0,
                 body: Body::Overflow,
+                perm: None,
             });
         } else {
             if let Some(old) = queue
                 .events
                 .iter_mut()
                 .rev()
-                .filter(|old| !matches!(old.body, Body::Overflow))
-                .find(|old| old.merges(&event))
+                .filter(|old| !matches!(old.body, Body::Overflow) && old.perm.is_none())
+                .find(|old| event.perm.is_none() && old.merges(&event))
             {
                 old.mask |= event.mask;
                 return false;
@@ -1135,6 +1296,109 @@ impl Group {
             queue.events.push_back(event);
         }
         queue.epoch += 1;
+        true
+    }
+
+    /// Queues the permission event `event` (`fsnotify_insert_event`): its
+    /// number, or none when the queue is full, which lets it through after
+    /// the overflow event, as Linux frees an event that was not queued.
+    fn ask(&self, mut event: Event) -> Option<u64> {
+        let id = {
+            let mut answers = lock(&self.answers);
+            answers.next += 1;
+            answers.next
+        };
+        event.perm = Some(id);
+        let mut queue = self.queue();
+        let full = queue.events.len() >= queue.max;
+        let queued = Self::insert(&mut queue, event);
+        if !full {
+            lock(&self.answers).states.insert(id, Answer::Queued);
+        }
+        drop(queue);
+        if queued {
+            self.hub.changed();
+        }
+        (!full).then_some(id)
+    }
+    /// The answer to permission event `id` once there is one
+    /// (`fanotify_get_response`): let through, or the error that denies it
+    /// (`EPERM`, or the response's own errno).
+    fn answer(&self, id: u64) -> Option<Result<(), Errno>> {
+        let mut answers = lock(&self.answers);
+        let Some(&Answer::Answered(response)) = answers.states.get(&id) else {
+            return None;
+        };
+        answers.states.remove(&id);
+        // An errno in the response is only ever a pre-content group's, as
+        // [`write`] refuses one from any other.
+        Some(match response & (ALLOW | DENY) {
+            ALLOW => Ok(()),
+            _ => Err(match response >> 24 {
+                0 => Errno::EPERM,
+                errno => Errno(errno as i32),
+            }),
+        })
+    }
+    /// The task waiting for event `id` stopped (a fatal signal): one not
+    /// read yet leaves the queue, and one read waits for its answer to go.
+    fn cancel(&self, id: u64) {
+        let mut answers = lock(&self.answers);
+        match answers.states.get(&id) {
+            Some(Answer::Queued) => {
+                answers.states.remove(&id);
+                drop(answers);
+                self.queue().events.retain(|e| e.perm != Some(id));
+            }
+            Some(&Answer::Reported(fd)) => {
+                answers.states.insert(id, Answer::Canceled(fd));
+            }
+            _ => {
+                answers.states.remove(&id);
+            }
+        }
+    }
+    /// Permission event `id` was read with the descriptor `fd`: a response
+    /// names it by that; one whose read failed or gave no descriptor is
+    /// denied (`fanotify_read`).
+    fn reported(&self, id: u64, fd: Option<i32>) {
+        let mut answers = lock(&self.answers);
+        match fd {
+            Some(fd) if fd >= 0 => {
+                answers.states.insert(id, Answer::Reported(fd));
+            }
+            _ => {
+                answers.states.insert(id, Answer::Answered(DENY));
+                drop(answers);
+                self.hub.changed();
+            }
+        }
+    }
+    /// `process_access_response`'s search of the access list: the read
+    /// event `fd` names gets `response`; false when none waits by it.
+    fn respond(&self, fd: i32, response: u32) -> bool {
+        let mut answers = lock(&self.answers);
+        let Some(id) = answers
+            .states
+            .iter()
+            .filter(
+                |(_, state)| matches!(state, Answer::Reported(f) | Answer::Canceled(f) if *f == fd),
+            )
+            .map(|(&id, _)| id)
+            .min()
+        else {
+            return false;
+        };
+        // `finish_permission_event`: a canceled event just goes.
+        if matches!(answers.states.get(&id), Some(Answer::Canceled(_))) {
+            answers.states.remove(&id);
+        } else {
+            answers
+                .states
+                .insert(id, Answer::Answered(response & !INFO_RESPONSE));
+        }
+        drop(answers);
+        self.hub.changed();
         true
     }
 
@@ -1206,7 +1470,9 @@ fn sdev(device: u64) -> u64 {
 }
 
 impl Drop for Group {
+    /// `fanotify_release`: what waits for its answers is let through.
     fn drop(&mut self) {
+        self.hub.changed();
         let marks = self.queue().marks.len() as u64;
         self.fan()
             .release(self.owner, marks, self.flags & UNLIMITED_MARKS == 0, true);
@@ -1271,6 +1537,7 @@ fn init(c: &mut Context<'_>, flags: u32, event_flags: u32) -> Result<u64, Errno>
         flags: flags | internal,
         event_flags: event_flags | O_LARGEFILE,
         status: AtomicU32::new(2 | if flags & NONBLOCK != 0 { 0o4000 } else { 0 }),
+        answers: Mutex::new(Answers::default()),
         queue: Mutex::new(Queue {
             events: VecDeque::new(),
             overflowed: false,
@@ -1678,8 +1945,14 @@ fn read_events(
             let Some(event) = event else {
                 break;
             };
-            match copy_event(c, group, &event, info_mode, out, writable) {
-                Ok(()) => {}
+            let copied = copy_event(c, group, &event, info_mode, out, writable);
+            // A permission event waits for its answer by the descriptor it
+            // gave; one that could not be read is denied.
+            if let Some(id) = event.perm {
+                group.reported(id, copied.as_ref().ok().copied());
+            }
+            match copied {
+                Ok(_) => {}
                 Err(e) => {
                     error = Some(e);
                     break;
@@ -1714,7 +1987,7 @@ fn copy_event(
     info_mode: u32,
     out: &mut Vec<u8>,
     writable: usize,
-) -> Result<(), Errno> {
+) -> Result<i32, Errno> {
     let unpriv = group.flags & UNPRIV != 0;
     let fd_error = group.flags & REPORT_FD_ERROR != 0;
     let space = c.group.namespaces(c.tid).pid.clone();
@@ -1826,7 +2099,7 @@ fn copy_event(
         }
         return Err(Errno::EFAULT);
     }
-    Ok(())
+    Ok(shown_fd)
 }
 
 /// `copy_fid_info_to_user`: a `struct fanotify_event_info_fid`, its
@@ -1854,8 +2127,8 @@ fn fid_record(out: &mut Vec<u8>, info_type: u8, fsid: [u32; 2], handle: &Handle,
 }
 
 /// `fanotify_write`: a `struct fanotify_response` to a permission event,
-/// with its audit record. No permission event ever waits here, so a
-/// response that passes Linux's checks names no event (`ENOENT`).
+/// with its audit record: the read event its descriptor names gets the
+/// answer, `ENOENT` when none waits by it.
 pub(crate) fn write(
     c: &Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -1874,8 +2147,6 @@ pub(crate) fn write(
         let fd = i32::from_le_bytes(response[..4].try_into().unwrap_or_default());
         let response = u32::from_le_bytes(response[4..].try_into().unwrap_or_default());
         let errno = response >> 24;
-        const ALLOW: u32 = 1;
-        const DENY: u32 = 2;
         const AUDIT: u32 = 0x10;
         const INFO: u32 = 0x20;
         if response & !(ALLOW | DENY | AUDIT | INFO | 0xff << 24) != 0 {
@@ -1918,7 +2189,11 @@ pub(crate) fn write(
         if fd < 0 {
             return Err(Errno::EINVAL);
         }
-        Err(Errno::ENOENT)
+        if group.respond(fd, response) {
+            Ok(if response & INFO != 0 { count } else { 8 })
+        } else {
+            Err(Errno::ENOENT)
+        }
     })())
 }
 

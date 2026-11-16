@@ -9787,6 +9787,195 @@ static int moves_case(void) {
     return 0;
 }
 
+/* The trees case: open_tree and move_mount (Linux master's vfs_open_tree
+   and move_mount) in a mount namespace of a user namespace of its own: a
+   detached copy of a mount, attached elsewhere, MOVE_MOUNT_SET_GROUP, and a
+   path from a directory's descriptor on a tmpfs mount. */
+static char tr_base[] = "/tmp/paludarium-trees-XXXXXX";
+static void tr_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", tr_base, name); }
+#define TR_CLONE 1
+#define TR_RECURSIVE 0x8000
+#define TR_EMPTY 0x1000
+#define TR_F_SYMLINKS 0x01
+#define TR_F_EMPTY 0x04
+#define TR_T_SYMLINKS 0x10
+#define TR_T_EMPTY 0x40
+#define TR_SET_GROUP 0x100
+static long tr_tree(int dfd, const char *path, unsigned flags) { return syscall(428, dfd, path, flags); }
+static long tr_move(int from_dfd, const char *from, int to_dfd, const char *to, unsigned flags) {
+    return syscall(429, from_dfd, from, to_dfd, to, flags);
+}
+/* 1 for a descriptor (closed again), else the errno. */
+static int tr_opened(long fd) {
+    if (fd < 0) return errno;
+    close((int)fd);
+    return 1;
+}
+static int tr_lines(void) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    int n = 0, c;
+    while (f && (c = fgetc(f)) != EOF) n += c == '\n';
+    if (f) fclose(f);
+    return n;
+}
+/* The mount point of the parent of the top mount at `point`, from the
+   base (`.` for the base, `outside` for one outside it), `-` for none. */
+static void tr_parent(const char *label, const char *point) {
+    static long ids[512], parents[512];
+    static char paths[512][256];
+    int n = 0;
+    char line[4096], out[256];
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    while (f && n < 512 && fgets(line, sizeof line, f))
+        if (sscanf(line, "%ld %ld %*s %*s %255s", &ids[n], &parents[n], paths[n]) == 3) n++;
+    if (f) fclose(f);
+    const char *shown = "-";
+    size_t len = strlen(tr_base);
+    for (int i = n - 1; i >= 0; i--) {
+        if (strcmp(paths[i], point)) continue;
+        shown = "outside";
+        for (int j = 0; j < n; j++) {
+            if (ids[j] != parents[i] || strncmp(paths[j], tr_base, len)) continue;
+            if (paths[j][len] == 0) shown = ".";
+            else if (paths[j][len] == '/') {
+                snprintf(out, sizeof out, "%s", paths[j] + len + 1);
+                shown = out;
+            }
+        }
+        break;
+    }
+    printf("%s %s\n", label, shown);
+}
+static int tr_inner(void) {
+    char a[256], b[256], c[256], d[256], e[256], s[256], l[256], path[512];
+    tr_path(a, "a");
+    tr_path(b, "b");
+    tr_path(c, "c");
+    tr_path(d, "d");
+    tr_path(e, "e");
+    tr_path(s, "s");
+    tr_path(l, "l");
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("a", mount("none", a, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/x", a);
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    snprintf(path, sizeof path, "%s/in", a);
+    mkdir(path, 0755);
+    RM("in", mount("none", path, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/in/y", a);
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    int dir = open(a, O_RDONLY | O_DIRECTORY);
+    printf(" dirfd-x=%d dirfd-y=%d\n", tr_opened(openat(dir, "x", O_RDONLY)),
+           tr_opened(openat(dir, "in/y", O_RDONLY)));
+    int lines = tr_lines();
+    printf("open_tree");
+    RM("bad", tr_tree(AT_FDCWD, a, 8));
+    RM("recursive-alone", tr_tree(AT_FDCWD, a, TR_RECURSIVE));
+    tr_path(path, "missing");
+    RM("missing", tr_tree(AT_FDCWD, path, 0));
+    RM("empty", tr_tree(dir, "", 0));
+    long t = tr_tree(AT_FDCWD, a, 0);
+    struct stat st, at;
+    stat(a, &at);
+    fstat((int)t, &st);
+    printf(" plain-path=%d plain-dev=%d", (fcntl((int)t, F_GETFL) & O_PATH) != 0, st.st_dev == at.st_dev);
+    close((int)t);
+    printf(" plain-empty=%d", tr_opened(tr_tree(dir, "", TR_EMPTY)));
+    long flat = tr_tree(AT_FDCWD, a, TR_CLONE);
+    fstat((int)flat, &st);
+    printf(" flat-x=%d flat-y=%d flat-dev=%d lines=%d",
+           tr_opened(openat((int)flat, "x", O_RDONLY)), tr_opened(openat((int)flat, "in/y", O_RDONLY)),
+           st.st_dev == at.st_dev, tr_lines() - lines);
+    close((int)flat);
+    long tree = tr_tree(AT_FDCWD, a, TR_CLONE | TR_RECURSIVE);
+    printf(" tree-y=%d lines=%d\n", tr_opened(openat((int)tree, "in/y", O_RDONLY)), tr_lines() - lines);
+    printf("move_mount");
+    RM("bad", tr_move((int)tree, "", AT_FDCWD, b, 8));
+    RM("beneath-group", tr_move((int)tree, "", AT_FDCWD, b, 0x300));
+    tr_path(path, "missing");
+    RM("to-missing", tr_move((int)tree, "", AT_FDCWD, path, TR_F_EMPTY));
+    RM("to-empty", tr_move(AT_FDCWD, a, dir, "", 0));
+    RM("from-empty", tr_move((int)tree, "", AT_FDCWD, b, 0));
+    RM("badf", tr_move(99, "", AT_FDCWD, b, TR_F_EMPTY));
+    RM("own-tree", tr_move((int)tree, "", (int)tree, "in", TR_F_EMPTY));
+    RM("below-root", tr_move((int)tree, "in", AT_FDCWD, b, 0));
+    RM("onto-tree", tr_move(AT_FDCWD, a, (int)tree, "in", 0));
+    RM("attach", tr_move((int)tree, "", AT_FDCWD, b, TR_F_EMPTY));
+    close((int)tree);
+    snprintf(path, sizeof path, "%s/in/y", b);
+    RM("b-y", access(path, F_OK));
+    printf(" lines=%d\n", tr_lines() - lines);
+    tr_parent("b", b);
+    snprintf(path, sizeof path, "%s/in", b);
+    tr_parent("b/in", path);
+    printf("links");
+    RM("moved", tr_move(AT_FDCWD, b, AT_FDCWD, c, 0));
+    symlink(d, l);
+    RM("to-link", tr_move(AT_FDCWD, c, AT_FDCWD, l, 0));
+    RM("to-followed", tr_move(AT_FDCWD, c, AT_FDCWD, l, TR_T_SYMLINKS));
+    snprintf(path, sizeof path, "%s/x", d);
+    RM("d-x", access(path, F_OK));
+    RM("from-link", tr_move(AT_FDCWD, l, AT_FDCWD, c, 0));
+    RM("from-followed", tr_move(AT_FDCWD, l, AT_FDCWD, c, TR_F_SYMLINKS));
+    snprintf(path, sizeof path, "%s/x", c);
+    RM("c-x", access(path, F_OK));
+    printf("\nset-group");
+    RM("s", mount("none", s, "tmpfs", 0, NULL));
+    snprintf(path, sizeof path, "%s/sub", s);
+    mkdir(path, 0755);
+    RM("shared", mount(NULL, s, NULL, MS_SHARED, NULL));
+    RM("bind", mount(path, e, NULL, MS_BIND, NULL));
+    RM("private", mount(NULL, e, NULL, MS_PRIVATE, NULL));
+    RM("from-private", tr_move(AT_FDCWD, e, AT_FDCWD, s, TR_SET_GROUP));
+    RM("not-root", tr_move(AT_FDCWD, path, AT_FDCWD, e, TR_SET_GROUP));
+    RM("other-sb", tr_move(AT_FDCWD, s, AT_FDCWD, a, TR_SET_GROUP));
+    RM("joined", tr_move(AT_FDCWD, s, AT_FDCWD, e, TR_SET_GROUP));
+    RM("again", tr_move(AT_FDCWD, s, AT_FDCWD, e, TR_SET_GROUP));
+    printf("\n");
+    rm_info("s", s, NULL);
+    rm_info("e", e, NULL);
+    close(dir);
+    return 0;
+}
+static int trees_case(void) {
+    if (!mkdtemp(tr_base)) return 93;
+    chmod(tr_base, 0755);
+    const char *dirs[] = {"a", "b", "c", "d", "e", "s"};
+    char path[256];
+    for (unsigned i = 0; i < 6; i++) {
+        tr_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(tr_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    tr_path(path, "l");
+    unlink(path);
+    for (unsigned i = 0; i < 6; i++) {
+        tr_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(tr_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -14967,6 +15156,47 @@ static int ipc_sysctl_case(void) {
         _exit(r);
     }
     result("more", reaped(more));
+    return 0;
+}
+/* The kernel-sysctl case: the machine's perf_event_paranoid and
+   unprivileged_bpf_disabled, read, and refused to another user's write.
+   Root writes nothing: these are the machine's own, the test runner's on
+   native Linux. perf_event_paranoid's value is not printed: Debian's and
+   Ubuntu's kernels default to more than Linux's 2. */
+static int kernel_sysctl_case(void) {
+    const char *names[] = {"perf_event_paranoid", "unprivileged_bpf_disabled"};
+    for (int i = 0; i < 2; i++) {
+        char path[96], text[32] = {0};
+        snprintf(path, sizeof path, "/proc/sys/kernel/%s", names[i]);
+        struct stat st = {0};
+        errno = 0;
+        long stated = stat(path, &st) ? -errno : 0;
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        long n = fd < 0 ? -errno : read(fd, text, sizeof text - 1);
+        if (fd >= 0) close(fd);
+        char *end = NULL;
+        long value = strtol(text, &end, 10);
+        printf("%s: stat=%ld mode=%o uid=%d gid=%d read=%d", names[i], stated, st.st_mode, st.st_uid, st.st_gid,
+               n > 0 && *end == '\n');
+        if (i == 1) printf(" value=%ld", value);
+        printf("\n");
+    }
+    fflush(stdout);
+    pid_t other = child();
+    if (other == 0) {
+        if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        for (int i = 0; i < 2; i++) {
+            char path[96];
+            snprintf(path, sizeof path, "/proc/sys/kernel/%s", names[i]);
+            errno = 0;
+            int fd = open(path, O_WRONLY | O_CLOEXEC);
+            printf("other %s: write=%d\n", names[i], fd < 0 ? -errno : 0);
+            if (fd >= 0) close(fd);
+        }
+        fflush(stdout);
+        _exit(0);
+    }
+    result("other", reaped(other));
     return 0;
 }
 static int sem_case(void) {
@@ -27687,6 +27917,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
+    if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();
@@ -27736,6 +27967,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "binds")) return binds_case();
     if (!strcmp(mode, "remounts")) return remounts_case();
     if (!strcmp(mode, "moves")) return moves_case();
+    if (!strcmp(mode, "trees")) return trees_case();
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();

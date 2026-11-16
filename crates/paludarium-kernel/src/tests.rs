@@ -8612,6 +8612,109 @@ fn a_move_and_pivot_root_take_the_working_directory_along() {
     assert!(info.contains(" / / rw,relatime - tmpfs none "), "{info}");
 }
 
+/// A path from a directory's descriptor on a tmpfs mount starts at that
+/// directory, by the path it was opened at, not its path in the tmpfs.
+#[test]
+fn a_path_from_a_directory_descriptor_on_a_mount() {
+    let mut f = fixture();
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let m = put(&mut f, 0x40, b"/tmp/m");
+    assert_eq!(f.ret(83, &[m, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+    let d = put(&mut f, 0x60, b"/tmp/m/d");
+    assert_eq!(f.ret(83, &[d, 0o755]), 0);
+    let fd = f.ret(2, &[m, 0o200000, 0]);
+    let rel = put(&mut f, 0x80, b"d");
+    assert!((f.ret(257, &[fd, rel, 0o200000, 0]) as i64) >= 0);
+}
+
+/// `open_tree` gives a descriptor of a file or of a detached copy of its
+/// mount, which `move_mount` attaches; a copy no one attached goes with
+/// its descriptor.
+#[test]
+fn open_tree_and_move_mount_attach_a_detached_copy() {
+    let mut f = fixture();
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let (m, n) = (put(&mut f, 0x40, b"/tmp/m"), put(&mut f, 0x60, b"/tmp/n"));
+    assert_eq!(f.ret(83, &[m, 0o755]), 0);
+    assert_eq!(f.ret(83, &[n, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+    let (inner, y) = (
+        put(&mut f, 0x80, b"/tmp/m/in"),
+        put(&mut f, 0xa0, b"/tmp/m/in/y"),
+    );
+    assert_eq!(f.ret(83, &[inner, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, inner, tmpfs, 0, 0]), 0);
+    assert!((f.ret(2, &[y, 0o101, 0o644]) as i64) >= 0);
+    let listed = whole(&mut f, b"/proc/self/mountinfo");
+    let fdcwd = (-100i64) as u64;
+    let (clone, recursive) = (1, 0x8000);
+    // The flags first.
+    assert_eq!(f.ret(428, &[fdcwd, m, 8]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(428, &[fdcwd, m, recursive]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(428, &[fdcwd, m, 4 | clone]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(428, &[fdcwd, m, 2 | clone]), errno(Errno::EINVAL));
+    let fd = f.ret(428, &[fdcwd, m, clone]);
+    assert!((fd as i64) >= 0);
+    // Without recursion the mount below is not in the copy.
+    let (rel_y, nothing) = (put(&mut f, 0xc0, b"in/y"), put(&mut f, 0xd0, b""));
+    assert_eq!(f.ret(257, &[fd, rel_y, 0, 0]), errno(Errno::ENOENT));
+    assert_eq!(whole(&mut f, b"/proc/self/mountinfo"), listed);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    let fd = f.ret(428, &[fdcwd, m, clone | recursive]);
+    let opened = f.ret(257, &[fd, rel_y, 0, 0]);
+    assert!((opened as i64) >= 0, "{}", opened as i64);
+    assert_eq!(f.ret(3, &[opened]), 0);
+    // Attached, it stays after the descriptor goes.
+    let (from_empty, to_empty) = (4, 0x40);
+    assert_eq!(
+        f.ret(429, &[fd, nothing, fdcwd, n, 8]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(429, &[fd, nothing, fdcwd, n, 0]),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(
+        f.ret(429, &[99, nothing, fdcwd, n, from_empty]),
+        errno(Errno::EBADF)
+    );
+    assert_eq!(
+        f.ret(429, &[fd, rel_y, fd, nothing, from_empty | to_empty]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(429, &[fd, nothing, fdcwd, n, from_empty]), 0);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    let moved = put(&mut f, 0xe0, b"/tmp/n/in/y");
+    assert_eq!(f.ret(21, &[moved, 0]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" / /tmp/n rw,relatime - tmpfs none "),
+        "{info}"
+    );
+    assert!(
+        info.contains(" / /tmp/n/in rw,relatime - tmpfs none "),
+        "{info}"
+    );
+    // A plain one is an O_PATH descriptor of the file.
+    let fd = f.ret(428, &[fdcwd, m, 0]);
+    assert_eq!(f.ret(72, &[fd, 3, 0]) & 0o10000000, 0o10000000);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    // A mount moved as MS_MOVE moves it, and its peer group by
+    // MOVE_MOUNT_SET_GROUP.
+    let o = put(&mut f, 0x100, b"/tmp/o");
+    assert_eq!(f.ret(83, &[o, 0o755]), 0);
+    assert_eq!(f.ret(429, &[fdcwd, n, fdcwd, o, 0]), 0);
+    assert_eq!(
+        f.ret(429, &[fdcwd, o, fdcwd, m, 0x300]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.ret(429, &[fdcwd, o, fdcwd, m, 0x100]),
+        errno(Errno::EINVAL)
+    );
+}
+
 /// A new mount namespace has copies of the mounts, with new IDs, on the
 /// same file systems, and mounts of its own; the first keeps its own.
 #[test]

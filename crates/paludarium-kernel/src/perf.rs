@@ -21,8 +21,8 @@ use paludarium_types::{Errno, GuestAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-/// `kernel.perf_event_paranoid`, Linux's default, which
-/// `/proc/sys/kernel/perf_event_paranoid` shows ([`crate::sysctl`]).
+/// `kernel.perf_event_paranoid`'s default, Linux's, which the machine's
+/// starts with ([`crate::sysctl::Machine`]).
 pub(crate) const PARANOID: i32 = 2;
 /// `kernel.perf_event_max_sample_rate`, Linux's default
 /// (`DEFAULT_MAX_SAMPLE_RATE`).
@@ -177,7 +177,7 @@ fn perfmon_capable(c: &Context<'_>) -> bool {
 /// `perf_allow_kernel`: `EACCES` with `perf_event_paranoid` above 1,
 /// unless `perfmon_capable`.
 fn allow_kernel(c: &Context<'_>) -> Result<(), Errno> {
-    if PARANOID > 1 && !perfmon_capable(c) {
+    if c.processes.sysctls.perf_event_paranoid() > 1 && !perfmon_capable(c) {
         return Err(EACCES);
     }
     Ok(())
@@ -186,7 +186,7 @@ fn allow_kernel(c: &Context<'_>) -> Result<(), Errno> {
 /// `perf_allow_cpu`: `EACCES` with `perf_event_paranoid` above 0, unless
 /// `perfmon_capable`.
 fn allow_cpu(c: &Context<'_>) -> Result<(), Errno> {
-    if PARANOID > 0 && !perfmon_capable(c) {
+    if c.processes.sysctls.perf_event_paranoid() > 0 && !perfmon_capable(c) {
         return Err(EACCES);
     }
     Ok(())

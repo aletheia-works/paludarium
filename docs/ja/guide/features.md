@@ -70,7 +70,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`open_tree`、`move_mount`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
@@ -1440,6 +1440,27 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ルートに移り（`chroot_fs_refs`）、ほかのプロセスのものはそのマウントとともに動きます。
   `pivot_root(".", ".")` は古いルートを新しいルートの上に重ね、それを
   `umount2(".", MNT_DETACH)` で外せます。
+- `open_tree`（Linux master の `vfs_open_tree`）は、まずフラグを確かめ（知らない
+  もの、写しなしの `AT_RECURSIVE`、再帰的な写しなしの `OPEN_TREE_DROP_MNTNS_MOUNTS`
+  は `EINVAL`）、`OPEN_TREE_CLONE` にはマウント名前空間に対する `CAP_SYS_ADMIN` を
+  求め（`EPERM`）、そのあとパスを探します。最後のリンクは `AT_SYMLINK_NOFOLLOW`
+  がなければたどり、`AT_EMPTY_PATH` があれば空のパスは `dfd` 自身です。ファイルの
+  `O_PATH` のディスクリプタを返し、`OPEN_TREE_CLONE` ではそのマウントの写し
+  （`AT_RECURSIVE` があれば、バインドマウントと同じく下のマウントも）を、自分だけの
+  木として返します。この木にはどのパスからも mountinfo からも届かず、`move_mount`
+  でつながなければディスクリプタを最後に閉じたときになくなります。ディスクリプタからの
+  パスは写しの中に入り、`..` はその根にとどまります。
+- `move_mount`（Linux master のもの）は、マウント名前空間に対する
+  `CAP_SYS_ADMIN`（`EPERM`）と、知っているフラグ（`EINVAL`。`MOVE_MOUNT_BENEATH` と
+  `MOVE_MOUNT_SET_GROUP` の両方も）を求め、ターゲット、ソースの順に探します。それぞれ
+  `MOVE_MOUNT_*_SYMLINKS` があるときだけ最後のリンクをたどり、`MOVE_MOUNT_*_EMPTY_PATH`
+  があれば空のパスはディスクリプタ自身です。Landlock のドメインでは `EPERM` です。
+  マウントを `MS_MOVE` と同じく動かすか、`open_tree` の木をつなぎます。つなげるのは
+  その根だけで（`EINVAL`）、自分の木の上にはつなげず（`EINVAL`）、名前空間のマウントは
+  切り離された木の上には行きません（`EINVAL`）。`MOVE_MOUNT_SET_GROUP` は、ターゲットを
+  ソースのピアグループに入れます（`do_set_group`）。どちらもマウントのルートで、同じ
+  スーパーブロックのもの、ターゲットのルートはソースのルートかその下、ターゲットは
+  プライベート、ソースは共有かスレーブであることが要ります（`EINVAL`）。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどり、パスの始まりの上のマウントにも入ります
   （`LOOKUP_MOUNTPOINT`）。そのあと Linux の `can_umount` と `do_umount`
@@ -2417,9 +2438,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `semmni` の 4 つの `int` で、タブで区切って読めます。`sem` への書き込みは、Linux の
   `proc_dointvec` がベクトルを読むのと同じく、与えた数だけを設定します。不正な値は
   `EINVAL` で、その前の値は設定されたままです。`semmni` は、最後に 0 から 32768 の間に
-  なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに `perf_event_paranoid` と
-  `unprivileged_bpf_disabled` があり、Linux の既定値の 2 を読めますが、誰も書くために
-  開けません（`EACCES`）。`shm_rmid_forced`（0 か 1。持ち主と書ける者は上限と同じ）を
+  なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに、マシンの
+  `perf_event_paranoid` と `unprivileged_bpf_disabled` があります。エミュレートする
+  マシン全体に 1 つずつで、最初は Linux の既定値の 2 です。root の持つモード 0644 の
+  ファイルで、書くために開けるのは root（どのユーザー名前空間の外でもユーザー ID 0）
+  だけです（`EACCES`）。`perf_event_paranoid` は任意の `int` を取ります
+  （`proc_dointvec`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
+  と同じく、`CAP_SYS_ADMIN` のある書き手から（`EPERM`）0 から 2 まで（`EINVAL`）を
+  取り、いったん 1 になるとほかの値を取りません（`EPERM`）。`perf_event_open` と `bpf` は
+  そのときの値を確かめます。`shm_rmid_forced`（0 か 1。持ち主と書ける者は上限と同じ）を
   設定すると、Linux の `shm_close` と `exit_shm` と同じく、セグメントは最後に外れたときに
   消え、作ったスレッドが一度もつながなかったものは、そのスレッドが終わるか名前空間を
   離れたときに消えます。設定したときには、どのマッピングにもない孤児のセグメントを
@@ -2814,10 +2841,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   サンプルと読み込みの形式、分岐のない分岐サンプリング、DS・ES・FS・GS や予約ビットを含む
   レジスタのマスク、大きすぎるか 8 バイト境界でないユーザースタック、両方の weight、
   `inherit` なしの `inherit_thread`、`enable_on_exec` と一緒の `remove_on_exec`、
-  `remove_on_exec` なしの `sigtrap` がどれも `EINVAL` です）。次は `perf_event_paranoid` で、
-  Linux の既定の 2 です。カーネルのイベント（`exclude_kernel` なし、`text_poke`、カーネルの
-  コールチェーン、物理アドレス、カーネルかハイパーバイザーの分岐）と CPU のイベントには
-  `CAP_PERFMON` か `CAP_SYS_ADMIN` が要り（`EACCES`）、`namespaces` も同じです。そのあと、
+  `remove_on_exec` なしの `sigtrap` がどれも `EINVAL` です）。次はマシンの
+  `perf_event_paranoid`（root が `/proc/sys/kernel/perf_event_paranoid` に書くまでは
+  Linux の既定の 2）です。1 より大きければカーネルのイベント（`exclude_kernel` なし、
+  `text_poke`、カーネルのコールチェーン、物理アドレス、カーネルかハイパーバイザーの
+  分岐）に、0 より大きければ CPU のイベントに、`CAP_PERFMON` か `CAP_SYS_ADMIN` が要ります
+  （`EACCES`）。`namespaces` にはいつも要ります。そのあと、
   ビット 63 の立った周期や `perf_event_max_sample_rate`（100000）を超える周波数は `EINVAL`、
   CPU とタスクのない `PERF_FLAG_PID_CGROUP` は `EINVAL`、イベントでないグループの
   ディスクリプタは `EBADF`、ないタスクは `ESRCH`、タスクも CPU もないときや最後より先の
@@ -2852,8 +2881,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （4 バイトのキーで、どの要素も初めからあって 0）か `BPF_MAP_TYPE_HASH` を、Linux の検査の
   順に作ります。BTF の型 ID、`map_extra`、NUMA ノード（一つです）、型、型ごとのサイズと
   フラグ（`EINVAL`。大きすぎるハッシュの要素は `E2BIG`、`CAP_SYS_ADMIN` なしの
-  `BPF_F_ZERO_SEED` は `EPERM`）、Linux の既定の 2 の `kernel.unprivileged_bpf_disabled`
-  （マップには `CAP_BPF` か `CAP_SYS_ADMIN` が要ります、`EPERM`）、名前（英数字、`_`、`.`）、
+  `BPF_F_ZERO_SEED` は `EPERM`）、マシンの `kernel.unprivileged_bpf_disabled`
+  （root が書くまでは Linux の既定の 2。0 でなければマップには `CAP_BPF` か
+  `CAP_SYS_ADMIN` が要ります、`EPERM`）、名前（英数字、`_`、`.`）、
   BTF（どのファイルも BTF ではありません、`EINVAL`）、`BPF_F_RDONLY` と `BPF_F_WRONLY` の
   両方（`EINVAL`）の順です。ディスクリプタは close-on-exec で、`BPF_F_RDONLY` と
   `BPF_F_WRONLY` に従って読み込み、書き込み、その両方で開かれ、リンクは
@@ -3031,8 +3061,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   示します）。read はイベントを丸ごと取り（最初のイベントが入らないバッファーは
   `EINVAL`）、ノンブロッキングでなければ待ちます。`FIONREAD` は溜まったバイト数を返し、
   `/proc/self/fdinfo` は `fanotify_show_fdinfo` と同じくフラグと各マークを新しい順に
-  示します。write は許可イベントへの応答で、Linux と同じに確かめます。許可イベントは
-  送らないので（制限事項を参照）、確認を通った応答はどのイベントも指さず `ENOENT` です。
+  示します。write は許可イベントへの応答で、Linux と同じに確かめ、そのディスクリプタが指す読まれた
+  イベントに答えます（待つものがなければ `ENOENT`）。`open`、`openat`、`openat2`、`creat`、
+  `open_by_handle_at` で（`/proc/self/fd` のリンクからも）開くファイルについて、コンテンツかプレコンテンツのグループのマークが `FAN_OPEN_PERM` を
+  求めると、`fanotify_get_response` と同じく、プレコンテンツのものから順にそれぞれのグループの
+  答えを待ちます。`FAN_DENY` は `EPERM` で失敗させ、`FAN_ALLOW` とグループの最後のクローズは
+  通します。待つのを止めるのは致命的なシグナルだけです。`FAN_OPEN` は通ってから届き、拒まれた
+  ものは開かれないのでクローズも伝えません。許可イベントはまとめません。キューがいっぱいなら
+  溢れのイベントのあとに通し、ディスクリプタを渡せない読み出しはそれを拒みます。
   `statfs` の `f_fsid` はイベントが示すファイルシステムの ID と同じです。カーネル自身の
   ファイルシステム、/proc、devpts、mqueue では `simple_statfs` と同じくデバイス番号、
   ほかのファイルシステムでは、tmpfs が UUID を引くように、ファイルシステムごとに引いた

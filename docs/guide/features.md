@@ -82,7 +82,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `pivot_root`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | Security modules | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` |
 | Probes | `uprobe`, `uretprobe` |
@@ -1637,6 +1637,30 @@ kernel.
   old root is then on the new one (`chroot_fs_refs`), and the others' stay
   with their mounts. `pivot_root(".", ".")` stacks the old root on the new
   one, which `umount2(".", MNT_DETACH)` then takes off.
+- `open_tree` (Linux master's `vfs_open_tree`) checks its flags first
+  (`EINVAL` for an unknown one, `AT_RECURSIVE` without a copy, and
+  `OPEN_TREE_DROP_MNTNS_MOUNTS` without a recursive one), then
+  `CAP_SYS_ADMIN` over the mount namespace for `OPEN_TREE_CLONE` (`EPERM`),
+  then looks the path up, its last link followed unless
+  `AT_SYMLINK_NOFOLLOW`, an empty one naming `dfd` with `AT_EMPTY_PATH`.
+  It gives an `O_PATH` descriptor of the file, or with `OPEN_TREE_CLONE` of
+  a copy of its mount (with `AT_RECURSIVE` the mounts below it too, as a
+  bind mount copies them) in a tree of its own, which no path and no
+  mountinfo reaches, and which goes with the descriptor's last close
+  unless `move_mount` attached it. A path from the descriptor goes into
+  the copy, and `..` stays at its root.
+- `move_mount` (Linux master's) needs `CAP_SYS_ADMIN` over the mount
+  namespace (`EPERM`) and known flags (`EINVAL`, also for
+  `MOVE_MOUNT_BENEATH` with `MOVE_MOUNT_SET_GROUP`); it looks up the target
+  and then the source, each following its last link only with its
+  `MOVE_MOUNT_*_SYMLINKS` and naming its descriptor when empty with its
+  `MOVE_MOUNT_*_EMPTY_PATH`, and a Landlock domain is `EPERM`. It moves a
+  mount as `MS_MOVE` does, or attaches a tree from `open_tree`: only its
+  root (`EINVAL`), not onto its own tree (`EINVAL`); a mount of the
+  namespace goes onto no detached tree (`EINVAL`). `MOVE_MOUNT_SET_GROUP`
+  puts the target in the source's peer group (`do_set_group`): both mounts'
+  roots, of one superblock, the target's root at or below the source's,
+  the target private and the source shared or a slave (`EINVAL`).
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`, stepping into a mount on
   where the path starts too (`LOOKUP_MOUNTPOINT`); then, as Linux's
@@ -2790,9 +2814,15 @@ kernel.
   `sem` sets as many as it gives, as Linux's `proc_dointvec` reads a
   vector: a bad one is `EINVAL` and leaves the ones before it set, and
   `semmni` goes back to what it was unless it ends from 0 to 32768
-  (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them, `perf_event_paranoid` and
-  `unprivileged_bpf_disabled` read 2, Linux's defaults, and no one may
-  open them to write (`EACCES`). `shm_rmid_forced` (0 or 1, owned and
+  (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them are the machine's
+  `perf_event_paranoid` and `unprivileged_bpf_disabled`, one each for the
+  whole emulated machine and 2 at first, Linux's defaults: root's files of
+  mode 0644, which only root (user ID 0 outside any user namespace) may
+  open to write (`EACCES`). `perf_event_paranoid` takes any `int`
+  (`proc_dointvec`); `unprivileged_bpf_disabled` takes 0 to 2 (`EINVAL`)
+  from a writer with `CAP_SYS_ADMIN` (`EPERM`), and once 1 it takes no
+  other value (`EPERM`), as Linux's `bpf_unpriv_handler`; `perf_event_open`
+  and `bpf` check what they are now. `shm_rmid_forced` (0 or 1, owned and
   written as the limits) makes a segment go at its last detach and those
   its maker never attached go when it exits or leaves the namespace, as
   Linux's `shm_close` and `exit_shm` do; setting it removes the orphans no
@@ -3248,10 +3278,12 @@ kernel.
   reserved bits, a user stack too large or not 8-byte aligned, both
   weights, `inherit_thread` without `inherit`, `remove_on_exec` with
   `enable_on_exec`, and `sigtrap` without `remove_on_exec`, all `EINVAL`),
-  then `perf_event_paranoid`, which is Linux's default 2: an event of the
+  then the machine's `perf_event_paranoid` (2, Linux's default, until root
+  writes `/proc/sys/kernel/perf_event_paranoid`): above 1, an event of the
   kernel (one without `exclude_kernel`, `text_poke`, a kernel callchain,
-  physical addresses, kernel or hypervisor branches) and one of a CPU need
-  `CAP_PERFMON` or `CAP_SYS_ADMIN` (`EACCES`), as do `namespaces`. Then a
+  physical addresses, kernel or hypervisor branches), and above 0, one of a
+  CPU, need `CAP_PERFMON` or `CAP_SYS_ADMIN` (`EACCES`); `namespaces`
+  always does. Then a
   period with bit 63 or a frequency above `perf_event_max_sample_rate`
   (100000) is `EINVAL`, `PERF_FLAG_PID_CGROUP` without a CPU and a task
   `EINVAL`, a group descriptor that is no event `EBADF`, a task that is not
@@ -3294,8 +3326,9 @@ kernel.
   order of Linux's checks: BTF type IDs, `map_extra`, the NUMA node (there
   is one), the type, the type's own sizes and flags (`EINVAL`, too large a
   hash element `E2BIG`, `BPF_F_ZERO_SEED` without `CAP_SYS_ADMIN`
-  `EPERM`), `kernel.unprivileged_bpf_disabled`, which is Linux's default 2,
-  so that a map needs `CAP_BPF` or `CAP_SYS_ADMIN` (`EPERM`), the name
+  `EPERM`), the machine's `kernel.unprivileged_bpf_disabled` (2, Linux's
+  default, until root writes it), with which, unless it is 0, a map needs
+  `CAP_BPF` or `CAP_SYS_ADMIN` (`EPERM`), the name
   (letters, digits, `_` and `.`), BTF (no file is, `EINVAL`), and
   `BPF_F_RDONLY` with `BPF_F_WRONLY` (`EINVAL`). The descriptor is
   close-on-exec, open for reading, writing or both as `BPF_F_RDONLY` and
@@ -3498,9 +3531,18 @@ kernel.
   for a buffer too small for the first), waits unless non-blocking, and
   `FIONREAD` gives the bytes queued; `/proc/self/fdinfo` shows the flags and
   each mark, the newest first, as `fanotify_show_fdinfo`. A write is a
-  permission response, checked as Linux checks it; as no permission event
-  is ever sent (see the limitations), one that passes names no event
-  (`ENOENT`). `statfs`'s `f_fsid` is the file system ID the events give: the
+  permission response, checked as Linux checks it, to the read event its
+  descriptor names (`ENOENT` when none waits by it). An open by `open`,
+  `openat`, `openat2`, `creat` or `open_by_handle_at`, a link in
+  `/proc/self/fd` too, of a file a content or pre-content
+  group's mark wants `FAN_OPEN_PERM` of waits for each such group's
+  answer in turn, the pre-content ones first, as `fanotify_get_response`:
+  `FAN_DENY` fails it with `EPERM`, `FAN_ALLOW` lets it through, and so
+  does the group's last close; only a fatal signal ends the wait. Its
+  `FAN_OPEN` comes once it is let through, and a denied open is never
+  opened, so it tells no close. A permission event is never merged; a full
+  queue lets it through after the overflow event; a read that cannot give
+  it a descriptor denies it. `statfs`'s `f_fsid` is the file system ID the events give: the
   device of the kernel's own file systems, /proc, devpts and mqueue, as
   `simple_statfs` gives it, and a number drawn for each other file system,
   as tmpfs draws a UUID.

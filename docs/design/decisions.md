@@ -223,6 +223,17 @@ A library, a command and a WebAssembly package give each kind of user a fitting
 entry point, and the command serves the differential tests. The price is more
 interfaces to keep compatible.
 
+## Single-stepping outside the JIT
+
+The trap flag makes every instruction trap, which a JIT block or a long
+interpreted run would step over. The runtime looks at the flag once per
+run, where it chooses how to run the guest: with the flag set, the
+interpreter runs one instruction and reports the trap, so a run without it
+pays one test and nothing per instruction. `popf`, the only instruction
+that sets the flag, ends its run when it does, so the next one is stepped;
+the kernel sets it only between runs (`rt_sigreturn`, a tracer). Neither
+JIT needs to know of the flag.
+
 ## Explicit CPU differences
 
 When a `REP` instruction faults midway, Intel and AMD leave different flags.

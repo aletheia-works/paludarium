@@ -13,6 +13,13 @@ Linux.
   `MOVBE`, `ENTER`/`LEAVE` and more.
 - **Hints**: `PAUSE` and the `PREFETCHNTA`/`PREFETCHT0`/`T1`/`T2` prefetches,
   which change nothing and never fault.
+- **Traps**: the trap flag single-steps: with `TF` set, which `popf`,
+  `rt_sigreturn` and a tracer may set, each instruction is followed by a
+  `SIGTRAP` with `TRAP_TRACE` and its address past the instruction (trap
+  1), except `syscall`, as the flag is masked off in the kernel and Linux
+  returns with `iret`; a signal handler starts with the flag cleared.
+  `int3` gives `SIGTRAP` from the kernel (`SI_KERNEL`, trap 3) with `rip`
+  past it.
 - **SSE**: every SSE and SSE2 instruction, except those that use MMX registers
   (a test runs each encoding), the `MFENCE`/`LFENCE`/`SFENCE` fences among them.
   Of the later sets, the instructions real programs (probe, aube and pitchfork)
@@ -3951,6 +3958,13 @@ one only with an `--allow-net`.
   exited or run another program. The thread that ends its process reports
   `PTRACE_EVENT_EXIT`, its status with 0x80 when a fatal signal dumps a
   core; the threads that end with it do not.
+- `PTRACE_SINGLESTEP` resumes a tracee with the trap flag set, which the
+  tracer does not see in its registers unless the tracee set it itself
+  (`TIF_FORCED_TF`), and any other resume takes it back: the tracee stops
+  with `SIGTRAP` after one instruction, and after a `syscall` at the call's
+  exit with `TRAP_BRKPT`. A single-stepped tracee entering a signal handler
+  stops with `SIGTRAP` before it. `PTRACE_SYSEMU_SINGLESTEP` steps as well,
+  and stops at each call's entry, which does not run, as `PTRACE_SYSEMU`.
 - `PTRACE_PEEKSIGINFO` reads the siginfo of the signals pending for a
   stopped tracee, or with `PTRACE_PEEKSIGINFO_SHARED` for its process, in
   the order they came. `PTRACE_GETSIGMASK` shows the signals it blocks

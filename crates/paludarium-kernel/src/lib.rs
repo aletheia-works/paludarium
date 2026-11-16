@@ -900,6 +900,7 @@ impl Kernel {
                 signals::queue(&mut thread.state, rseq::forced_sigsegv());
                 continue;
             }
+            self.ptrace_handler_entered(thread, &mut restart);
             return Next::Resume;
         }
         if let Some(mask) = thread.state.wait_restore_mask.take() {
@@ -1140,6 +1141,47 @@ impl Kernel {
                     } else {
                         19
                     },
+                    error: 0,
+                    synchronous: true,
+                    timer: None,
+                    child: None,
+                    sender: None,
+                    sender_uid: None,
+                    queued: None,
+                    born: signals::generation(),
+                })
+            }
+            // The single-step trap: SIGTRAP with TRAP_TRACE and the address
+            // past the instruction, as Linux's exc_debug_user sends it
+            // (send_sigtrap, trap 1).
+            ExitReason::SingleStep { rip } => {
+                thread.cpu.rip = rip;
+                Some(signals::PendingSignal {
+                    target: signals::PendingTarget::Thread,
+                    number: signal::SIGTRAP,
+                    code: 2,
+                    addr: rip.0,
+                    trap: 1,
+                    error: 0,
+                    synchronous: true,
+                    timer: None,
+                    child: None,
+                    sender: None,
+                    sender_uid: None,
+                    queued: None,
+                    born: signals::generation(),
+                })
+            }
+            // int3: SIGTRAP from the kernel (SI_KERNEL), as do_int3_user's
+            // do_trap forces it (trap 3).
+            ExitReason::Breakpoint { rip } => {
+                thread.cpu.rip = rip;
+                Some(signals::PendingSignal {
+                    target: signals::PendingTarget::Thread,
+                    number: signal::SIGTRAP,
+                    code: signals::SI_KERNEL,
+                    addr: 0,
+                    trap: 3,
                     error: 0,
                     synchronous: true,
                     timer: None,

@@ -461,9 +461,7 @@ verified.
     value's length as its size, where Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
-  - `ptrace` has no single-stepping yet: `PTRACE_SINGLESTEP`,
-    `PTRACE_SYSEMU_SINGLESTEP` and the other requests the features do not
-    list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
+  - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `PTRACE_O_SUSPEND_SECCOMP` gives `EINVAL`, as on a Linux built without
     checkpoint and restore. `NT_X86_XSTATE` gives `ENODEV`, as on a CPU

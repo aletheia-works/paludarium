@@ -11,6 +11,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `MOVBE`、`ENTER`／`LEAVE` など。
 - **ヒントの命令**：`PAUSE` と、プリフェッチの `PREFETCHNTA`／`PREFETCHT0`／`T1`／`T2`。
   状態を何も変えず、フォールトも起こしません。
+- **トラップ**：トラップフラグでシングルステップします。`TF` が立っている間（`popf`、
+  `rt_sigreturn`、トレーサーが立てられます）、各命令の後に `TRAP_TRACE` の `SIGTRAP` が
+  来て、アドレスは命令の次です（トラップ 1）。`syscall` だけは、カーネルの中でフラグが
+  消され、Linux が `iret` で戻るので来ません。シグナルハンドラーはフラグを消して始まります。
+  `int3` は、カーネルからの（`SI_KERNEL`、トラップ 3）`SIGTRAP` で、`rip` はその次です。
 - **SSE 系**：MMX レジスタを使うものを除く SSE と SSE2 のすべての命令（エンコーディング
   ごとにテストで動かしています。フェンスの `MFENCE`／`LFENCE`／`SFENCE` を含みます）。
   それより後の命令セットは、実際のプログラム（probe、aube、pitchfork）が使う命令と、
@@ -3445,6 +3450,12 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
   `PTRACE_EVENT_EXIT` を報告し（致命的なシグナルがコアをダンプするときは、ステータスに
   0x80 が付きます）、それとともに終わるスレッドは報告しません。
+- `PTRACE_SINGLESTEP` はトラップフラグを立ててトレース対象を再開します。トレース対象が
+  自分で立てたのでなければ、トレーサーにはレジスタで見えず（`TIF_FORCED_TF`）、ほかの再開で
+  消えます。トレース対象は 1 命令の後に `SIGTRAP` で止まり、`syscall` の後はその出口で
+  `TRAP_BRKPT` で止まります。シングルステップ中のトレース対象は、シグナルハンドラーに入る前に
+  `SIGTRAP` で止まります。`PTRACE_SYSEMU_SINGLESTEP` も同じくステップし、さらに
+  `PTRACE_SYSEMU` と同じく、各システムコールの入口で止まって実行しません。
 - `PTRACE_PEEKSIGINFO` は、止まっているトレース対象に、`PTRACE_PEEKSIGINFO_SHARED` 付きでは
   そのプロセスに保留中のシグナルの siginfo を、来た順に読みます。`PTRACE_GETSIGMASK` は
   ブロックしているシグナル（`sigsuspend` や `ppoll` の待ちの間は、戻すマスク）を示し、

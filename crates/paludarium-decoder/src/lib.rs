@@ -117,6 +117,7 @@ mnemonics!(
     Endbr64,
     Syscall,
     Hlt,
+    Int3,
     Movsb,
     Movsd,
     Movsq,

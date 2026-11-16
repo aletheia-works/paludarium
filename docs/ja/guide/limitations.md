@@ -394,8 +394,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     たびに書く者を確かめ直します。また、サイズとして値の長さを示します。Linux は 0 です。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
-  - `ptrace` には、まだシングルステップがありません。`PTRACE_SINGLESTEP`、
-    `PTRACE_SYSEMU_SINGLESTEP` と、機能の一覧にないほかの要求は `EIO` を返します。
+  - `ptrace` の、機能の一覧にない要求は `EIO` を返します。
     `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
     ほかは `EINVAL` です。`PTRACE_O_SUSPEND_SECCOMP` は、checkpoint／restore なしで
     ビルドした Linux と同じく `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく

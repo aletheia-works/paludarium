@@ -339,3 +339,69 @@ fn segment_pair_failed_compare_zero_extends_registers() {
 }
 #[path = "signals_time_tests.rs"]
 mod signals_time_tests;
+
+#[test]
+fn popf_setting_the_trap_flag_ends_the_run_and_the_next_instruction_traps() {
+    // push 0x302 (TF | IF | reserved); popfq; nop; nop
+    let (mut s, mem) = fixture(&[0x68, 0x02, 0x03, 0, 0, 0x9d, 0x90, 0x90]);
+    s.gpr[reg::RSP] = 0x4000_1000;
+    let mut cache = DecodeCache::new();
+    // The popf runs, and the run ends right after it, with no trap.
+    assert_eq!(
+        run_cached(&mut s, &mem, 100, &mut cache),
+        ExitReason::BudgetExhausted {
+            rip: GuestAddr(0x10006)
+        }
+    );
+    assert_ne!(s.rflags & flag::TF, 0);
+    // Then each instruction runs alone and traps after itself.
+    assert_eq!(
+        step_traced(&mut s, &mem, &mut cache),
+        ExitReason::SingleStep {
+            rip: GuestAddr(0x10007)
+        }
+    );
+    assert_eq!(
+        step_traced(&mut s, &mem, &mut cache),
+        ExitReason::SingleStep {
+            rip: GuestAddr(0x10008)
+        }
+    );
+}
+
+#[test]
+fn a_stepped_syscall_or_int3_gives_no_single_step_trap() {
+    // syscall; int3
+    let (mut s, mem) = fixture(&[0x0f, 0x05, 0xcc]);
+    s.rflags |= flag::TF;
+    let mut cache = DecodeCache::new();
+    assert_eq!(
+        step_traced(&mut s, &mem, &mut cache),
+        ExitReason::Syscall {
+            rip: GuestAddr(0x10002)
+        }
+    );
+    assert_eq!(
+        step_traced(&mut s, &mem, &mut cache),
+        ExitReason::Breakpoint {
+            rip: GuestAddr(0x10003)
+        }
+    );
+}
+
+#[test]
+fn popf_clearing_the_trap_flag_still_traps_after_itself() {
+    // push 0x202; popfq
+    let (mut s, mem) = fixture(&[0x68, 0x02, 0x02, 0, 0, 0x9d]);
+    s.gpr[reg::RSP] = 0x4000_1000;
+    s.rflags |= flag::TF;
+    let mut cache = DecodeCache::new();
+    step_traced(&mut s, &mem, &mut cache);
+    assert_eq!(
+        step_traced(&mut s, &mem, &mut cache),
+        ExitReason::SingleStep {
+            rip: GuestAddr(0x10006)
+        }
+    );
+    assert_eq!(s.rflags & flag::TF, 0);
+}

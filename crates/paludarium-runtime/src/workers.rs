@@ -1,6 +1,8 @@
 //! Each real Host worker owns CPU/decoder/thread context and shares only process resources.
 use paludarium_cpu::compile::{Compiler, run_compiled};
-use paludarium_cpu::{DecodeCache, reg, run_cached, run_cached_with_counted_hook};
+use paludarium_cpu::{
+    DecodeCache, flag, reg, run_cached, run_cached_with_counted_hook, step_traced,
+};
 use paludarium_host::{ClockId, Host, ThreadHandle};
 use paludarium_jit::CodeCache;
 use paludarium_kernel::{Kernel, Next, Processes, SignalInbox, Thread, ThreadGroup};
@@ -131,7 +133,11 @@ impl Execution {
             }
             // JIT blocks execute at most 64 instructions. Smaller explicit
             // budgets retain exact interpreter checkpoint/kill semantics.
-            let reason = if self.accelerated && self.budget >= 64 {
+            // With the trap flag set, one instruction runs and traps; checked
+            // once per run here, so a run without it pays nothing more.
+            let reason = if thread.cpu.rflags & flag::TF != 0 {
+                step_traced(&mut thread.cpu, memory, &mut decode)
+            } else if self.accelerated && self.budget >= 64 {
                 run_cached_with_counted_hook(
                     &mut thread.cpu,
                     memory,

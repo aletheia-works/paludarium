@@ -15,7 +15,7 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use paludarium_cpu::compile::{Address, Alu, Fast, Form, Shift, Source, Unary};
 use paludarium_cpu::flag;
-use paludarium_decoder::{Condition, Register, Segment};
+use paludarium_decoder::{Condition, Mnemonic, Register, Segment};
 
 /// Words of the register block the code runs on: the general registers,
 /// then RFLAGS, RIP, the FS and GS bases (read only), and the xmm
@@ -311,6 +311,115 @@ impl Emitter<'_, '_> {
                 .ins()
                 .call_indirect(self.move128_sig, callee, &[self.context, address, slot]);
         self.b.inst_results(call)[0]
+    }
+
+    /// The low 32 bits of `v` with byte `n` moved to byte `2n`, the
+    /// other bytes 0.
+    fn spread_bytes(&mut self, v: Value) -> Value {
+        let t = self.b.ins().band_imm_s(v, 0xffff_ffff);
+        let up = self.b.ins().ishl_imm_s(t, 16);
+        let t = self.b.ins().bor(t, up);
+        let t = self.b.ins().band_imm_s(t, 0x0000_ffff_0000_ffff);
+        let up = self.b.ins().ishl_imm_s(t, 8);
+        let t = self.b.ins().bor(t, up);
+        self.b.ins().band_imm_s(t, 0x00ff_00ff_00ff_00ff)
+    }
+
+    /// The top bits of the 8 bytes of `w`, as an 8-bit mask: the bits,
+    /// moved to the low bit of each byte, multiplied so that bit `56 + n`
+    /// collects byte `n`'s without any carry.
+    fn byte_signs(&mut self, w: Value) -> Value {
+        let t = self.b.ins().ushr_imm_s(w, 7);
+        let t = self.b.ins().band_imm_s(t, 0x0101_0101_0101_0101);
+        let t = self.b.ins().imul_imm_s(t, 0x0102_0408_1020_4080);
+        self.b.ins().ushr_imm_s(t, 56)
+    }
+
+    /// The two words of xmm register `n`.
+    fn xmm_words(&mut self, n: u8) -> (Value, Value) {
+        let w = XMM + 2 * usize::from(n & 15);
+        (self.word(w), self.word(w + 1))
+    }
+
+    fn set_xmm_words(&mut self, n: u8, low: Value, high: Value) {
+        let w = XMM + 2 * usize::from(n & 15);
+        self.set_word(w, low);
+        self.set_word(w + 1, high);
+    }
+
+    /// `op` of [`Fast::XmmPacked`] on xmm registers `dst` and `src`, as
+    /// `sse::packed` has it.
+    fn packed(&mut self, op: Mnemonic, dst: u8, src: u8, imm: u8) {
+        let (a0, a1) = self.xmm_words(dst);
+        let (b0, b1) = self.xmm_words(src);
+        let (low, high) = match op {
+            Mnemonic::Punpcklqdq => (a0, b0),
+            Mnemonic::Punpckldq => {
+                let a = self.b.ins().band_imm_s(a0, 0xffff_ffff);
+                let b = self.b.ins().ishl_imm_s(b0, 32);
+                let low = self.b.ins().bor(a, b);
+                let a = self.b.ins().ushr_imm_s(a0, 32);
+                let b = self.b.ins().ushr_imm_s(b0, 32);
+                let b = self.b.ins().ishl_imm_s(b, 32);
+                (low, self.b.ins().bor(a, b))
+            }
+            Mnemonic::Punpcklbw => {
+                let a = self.spread_bytes(a0);
+                let b = self.spread_bytes(b0);
+                let b = self.b.ins().ishl_imm_s(b, 8);
+                let low = self.b.ins().bor(a, b);
+                let a_up = self.b.ins().ushr_imm_s(a0, 32);
+                let b_up = self.b.ins().ushr_imm_s(b0, 32);
+                let a = self.spread_bytes(a_up);
+                let b = self.spread_bytes(b_up);
+                let b = self.b.ins().ishl_imm_s(b, 8);
+                (low, self.b.ins().bor(a, b))
+            }
+            Mnemonic::Pshufd => {
+                let mut dwords = [a0; 4];
+                for (n, d) in dwords.iter_mut().enumerate() {
+                    let k = (imm >> (n * 2)) & 3;
+                    let w = if k < 2 { b0 } else { b1 };
+                    let shifted = if k & 1 == 1 {
+                        self.b.ins().ushr_imm_s(w, 32)
+                    } else {
+                        w
+                    };
+                    *d = self.b.ins().band_imm_s(shifted, 0xffff_ffff);
+                }
+                let up = self.b.ins().ishl_imm_s(dwords[1], 32);
+                let low = self.b.ins().bor(dwords[0], up);
+                let up = self.b.ins().ishl_imm_s(dwords[3], 32);
+                (low, self.b.ins().bor(dwords[2], up))
+            }
+            Mnemonic::Pslld | Mnemonic::Psrld => {
+                if imm >= 32 {
+                    let zero = self.constant(0);
+                    (zero, zero)
+                } else {
+                    let c = i64::from(imm);
+                    let left = op == Mnemonic::Pslld;
+                    let lane: u64 = if left {
+                        (0xffff_ffffu64 << c) & 0xffff_ffff
+                    } else {
+                        0xffff_ffffu64 >> c
+                    };
+                    let keep = (lane | (lane << 32)) as i64;
+                    let mut out = [a0, a1];
+                    for w in &mut out {
+                        let moved = if left {
+                            self.b.ins().ishl_imm_s(*w, c)
+                        } else {
+                            self.b.ins().ushr_imm_s(*w, c)
+                        };
+                        *w = self.b.ins().band_imm_s(moved, keep);
+                    }
+                    (out[0], out[1])
+                }
+            }
+            _ => unreachable!("XmmPacked holds only these operations"),
+        };
+        self.set_xmm_words(dst, low, high);
     }
 
     /// A flag bit: `bit` when `condition` (an `i8` truth value) holds.
@@ -807,6 +916,15 @@ impl Emitter<'_, '_> {
                     let v = self.b.ins().bxor(a, b);
                     self.set_word(XMM + 2 * usize::from(dst) + half, v);
                 }
+            }
+            Fast::XmmPacked { op, dst, src, imm } => self.packed(op, dst, src, imm),
+            Fast::Pmovmskb { dst, src } => {
+                let (low, high) = self.xmm_words(src);
+                let low = self.byte_signs(low);
+                let high = self.byte_signs(high);
+                let high = self.b.ins().ishl_imm_s(high, 8);
+                let mask = self.b.ins().bor(low, high);
+                self.write(dst, mask);
             }
             Fast::MoveScalar { dst, src, size } => {
                 let v = match src {

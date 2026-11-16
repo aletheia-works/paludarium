@@ -400,6 +400,7 @@
     {"name":"trap-flag-syscall","binary":"single-step"},
     {"name":"trap-flag-signal","binary":"single-step"},
     {"name":"int3","binary":"single-step"},
+    {"name":"trap-flag-rep","binary":"single-step"},
     {"name":"ptrace-singlestep","binary":"single-step"},
     {"name":"ptrace-forced-frame","binary":"single-step"},
     {"name":"ptrace-hw-breakpoint","binary":"single-step"},

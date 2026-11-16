@@ -8,10 +8,10 @@
 //! explicit memory operands touch (the whole save area of `fxsave`,
 //! `fnsave`, `fnstenv` and their restores, the bytes `maskmovdqu`'s mask
 //! selects), its stack accesses (push, pop, call, return, `enter`,
-//! `leave`), and a string instruction's element without a repeat; a write
-//! breakpoint takes only what an instruction writes. A repeated string
-//! instruction, which the CPU stops after the iteration that touched the
-//! range, is not looked at yet.
+//! `leave`), and a string instruction's element; a write breakpoint takes
+//! only what an instruction writes. A repeated string instruction runs one
+//! iteration at a time, and stops after the one that touched the range,
+//! with rcx, rsi and rdi past it and `rip` still on it while it repeats.
 use crate::{CpuState, DecodeCache, flag, reg, step_cached};
 use paludarium_decoder::{
     Instruction, MemoryOperand, Mnemonic, Operand, Register, RepPrefix, Segment,
@@ -208,9 +208,10 @@ fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
             });
         }
     }
-    // A string instruction without a repeat: its element at rsi (in its
-    // segment) and at rdi.
-    if crate::exec::is_string(insn.mnemonic) && insn.rep == RepPrefix::None {
+    // A string instruction: its element at rsi (in its segment) and at
+    // rdi, for one iteration of a repeated one, which runs one at a time
+    // here; none once rcx is 0.
+    if crate::exec::is_string(insn.mnemonic) {
         use Mnemonic as M;
         let size = insn.implicit_size.max(1);
         let mask = if insn.string_address_size_32 {
@@ -218,6 +219,9 @@ fn accesses(state: &CpuState, insn: &Instruction) -> Vec<Access> {
         } else {
             u64::MAX
         };
+        if insn.rep != RepPrefix::None && state.gpr[reg::RCX] & mask == 0 {
+            return out;
+        }
         let source = (state.gpr[reg::RSI] & mask).wrapping_add(match insn.string_segment {
             Segment::Fs => state.fs_base,
             Segment::Gs => state.gs_base,
@@ -364,7 +368,7 @@ pub fn run_watched(
         } else {
             Vec::new()
         };
-        match step_cached(state, mem, cache) {
+        match crate::exec::with_rep_iterations(1, || step_cached(state, mem, cache)) {
             Ok(()) => {}
             // popf set the trap flag: the caller steps on.
             Err(ExitReason::BudgetExhausted { .. }) if !stepping => {

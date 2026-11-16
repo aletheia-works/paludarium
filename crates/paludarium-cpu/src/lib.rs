@@ -742,7 +742,8 @@ pub fn step_traced(
     mem: &AddressSpace,
     cache: &mut DecodeCache,
 ) -> ExitReason {
-    match step_cached(state, mem, cache) {
+    // A repeated string instruction traps after each iteration.
+    match exec::with_rep_iterations(1, || step_cached(state, mem, cache)) {
         Ok(()) | Err(ExitReason::BudgetExhausted { .. }) => {
             ExitReason::SingleStep { rip: state.rip }
         }

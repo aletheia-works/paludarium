@@ -17,7 +17,9 @@ Linux.
   `rt_sigreturn` and a tracer may set, each instruction is followed by a
   `SIGTRAP` with `TRAP_TRACE` and its address past the instruction (trap
   1), except `syscall`, as the flag is masked off in the kernel and Linux
-  returns with `iret`; a signal handler starts with the flag cleared.
+  returns with `iret`, and a `rep` string instruction traps after each
+  iteration, with `rip` still on it until the last; a signal handler
+  starts with the flag cleared.
   `int3` gives `SIGTRAP` from the kernel (`SI_KERNEL`, trap 3) with `rip`
   past it.
 - **SSE**: every SSE and SSE2 instruction, except those that use MMX registers
@@ -4189,7 +4191,8 @@ one only with an `--allow-net`.
   instruction one, leaving DR7 as it was); there is no DR4 or DR5 (`EIO`).
   An instruction breakpoint stops the tracee before the instruction, with
   RF set so that it runs once resumed, and a data one after the instruction
-  that accesses the range: `SIGTRAP` with `TRAP_HWBKPT` and the address in
+  that accesses the range, after the iteration for a `rep` string
+  instruction, with `rip` still on it while it repeats: `SIGTRAP` with `TRAP_HWBKPT` and the address in
   `rip`, and DR6 with the breakpoint's bit, and with `DR_STEP` after a
   single step. A new task has none, and exec clears them. While none is
   set, the guest runs as fast as before; while one is, it runs one

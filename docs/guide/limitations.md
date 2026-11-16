@@ -495,8 +495,9 @@ verified.
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
     without XSAVE, which the emulated CPU does not offer. A data
-    breakpoint does not see a `rep` string instruction, which the CPU's
-    stops after the iteration that touched its range.
+    breakpoint on a `rep` string instruction stops after the iteration that
+    touched its range, as the architecture defines it; a CPU's fast-string
+    operation may report it some iterations later.
     A `cs` or `ss` selector a tracer writes other than the 64-bit user ones
     is kept and shown, but the tracee runs on in 64-bit mode, where Linux
     would run it in that segment or fault.

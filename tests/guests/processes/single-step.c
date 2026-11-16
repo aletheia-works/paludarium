@@ -67,6 +67,20 @@ __asm__(".text\n"
         "  popfq\n"
         "seq_signal_end:\n"
         "  ret\n"
+        /* rep stosb of 3 bytes at rdi with TF set: a trap after each
+         * iteration. */
+        ".globl seq_rep, seq_rep_end\n"
+        "seq_rep:\n"
+        "  pushfq\n"
+        "  orq $0x100, (%rsp)\n"
+        "  popfq\n"
+        "  movl $3, %ecx\n"
+        "  rep stosb\n"
+        "  pushfq\n"
+        "  andq $~0x100, (%rsp)\n"
+        "  popfq\n"
+        "seq_rep_end:\n"
+        "  ret\n"
         /* int3 alone. */
         ".globl seq_int3, seq_int3_end\n"
         "seq_int3:\n"
@@ -156,6 +170,8 @@ __asm__(".text\n"
         "leaveslot: .quad 0\n"
         ".text\n");
 
+void seq_rep(char *);
+extern char seq_rep_end[];
 void seq_flag(void), seq_syscall(void), seq_signal(int), seq_int3(void), seq_trace(int),
     seq_frame(int), seq_hw(int);
 extern char seq_hw_exec[], seq_hw_end[], seq_hw2_end[], fxarea[], table[], leaveslot[];
@@ -240,6 +256,14 @@ static int signal_case(void) {
     seq_signal(getpid());
     report("signal", (void *)seq_signal, seq_signal_end);
     printf("usr1-handler-tf=%d\n", usr1_tf);
+    return 0;
+}
+
+static int rep_case(void) {
+    static char buffer[8];
+    install();
+    seq_rep(buffer);
+    report("rep", (void *)seq_rep, seq_rep_end);
     return 0;
 }
 
@@ -499,6 +523,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "trap-flag-syscall")) code = syscall_case();
     if (!strcmp(mode, "trap-flag-signal")) code = signal_case();
     if (!strcmp(mode, "int3")) code = int3_case();
+    if (!strcmp(mode, "trap-flag-rep")) code = rep_case();
     if (!strcmp(mode, "ptrace-singlestep")) code = ptrace_case();
     if (!strcmp(mode, "ptrace-forced-frame")) code = forced_frame_case();
     if (!strcmp(mode, "ptrace-hw-breakpoint")) code = hw_breakpoint_case();

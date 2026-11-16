@@ -605,6 +605,7 @@ mod linux {
         trap_flag_syscall => ("trap-flag-syscall","single-step"),
         trap_flag_signal => ("trap-flag-signal","single-step"),
         int3 => ("int3","single-step"),
+        trap_flag_rep => ("trap-flag-rep","single-step"),
         ptrace_singlestep => ("ptrace-singlestep","single-step"),
         ptrace_forced_frame => ("ptrace-forced-frame","single-step"),
         ptrace_hw_breakpoint => ("ptrace-hw-breakpoint","single-step"),

@@ -513,12 +513,45 @@ fn a_string_instruction_without_a_repeat_hits_a_data_breakpoint() {
             step: false
         }
     );
-    // A repeated one is not looked at yet.
-    set.0[3].as_mut().unwrap().address = 0x4000_0018;
+    // A repeated one stops after the iteration that wrote the range, with
+    // rcx and rdi past it and rip still on it while it repeats.
+    s.gpr[reg::RCX] = 3;
+    set.0[3].as_mut().unwrap().address = 0x4000_0020;
+    assert_eq!(
+        run_watched(&mut s, &mem, 10, &mut cache, &set),
+        ExitReason::HardwareBreakpoint {
+            rip: GuestAddr(0x10002),
+            hits: 0b1000,
+            step: false
+        }
+    );
+    assert_eq!((s.gpr[reg::RCX], s.gpr[reg::RDI]), (1, 0x4000_0028));
     assert_eq!(
         run_watched(&mut s, &mem, 1, &mut cache, &set),
         ExitReason::BudgetExhausted {
             rip: GuestAddr(0x10005)
+        }
+    );
+}
+
+#[test]
+fn a_repeated_string_instruction_single_steps_each_iteration() {
+    // rep stosb
+    let (mut s, mem) = fixture(&[0xf3, 0xaa]);
+    s.gpr[reg::RDI] = 0x4000_0000;
+    s.gpr[reg::RCX] = 2;
+    s.rflags |= flag::TF;
+    let mut cache = DecodeCache::new();
+    assert_eq!(
+        step_traced(&mut s, &mem, &mut cache),
+        ExitReason::SingleStep {
+            rip: GuestAddr(0x10000)
+        }
+    );
+    assert_eq!(
+        step_traced(&mut s, &mem, &mut cache),
+        ExitReason::SingleStep {
+            rip: GuestAddr(0x10002)
         }
     );
 }

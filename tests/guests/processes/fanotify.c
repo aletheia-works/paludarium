@@ -879,7 +879,7 @@ static int case_access_perm(void) {
         close(fan);
         close(results[0]);
         char c[4];
-        long out[5];
+        long out[6];
         int fd = open(at("f"), O_RDONLY);
         out[0] = e(read(fd, c, 1));
         out[1] = e(read(fd, c, 1));
@@ -887,6 +887,9 @@ static int case_access_perm(void) {
         struct iovec none = {c, 0};
         out[3] = e(readv(fd, &none, 1));
         out[4] = e(read(early, c, 1));
+        /* A description open only for writing is EBADF, asking nothing. */
+        int writing = open(at("f"), O_WRONLY);
+        out[5] = e(read(writing, c, 1));
         if (write(results[1], out, sizeof out) != (ssize_t)sizeof out) _exit(1);
         _exit(0);
     }
@@ -900,11 +903,11 @@ static int case_access_perm(void) {
     fd = read_perm("pread of none", fan, child);
     printf("allow=%ld\n", respond(fan, fd, 1));
     if (fd >= 0) close(fd);
-    long out[5] = {0};
+    long out[6] = {0};
     long n = read(results[0], out, sizeof out);
     printf("child=%d results=%ld\n", child_result(child), n);
-    printf("denied read=%ld allowed read=%ld pread of none=%ld readv of none=%ld early read=%ld\n",
-           out[0], out[1], out[2], out[3], out[4]);
+    printf("denied read=%ld allowed read=%ld pread of none=%ld readv of none=%ld early read=%ld write-only read=%ld\n",
+           out[0], out[1], out[2], out[3], out[4], out[5]);
     /* Nothing else was asked. */
     struct pollfd p = {fan, POLLIN, 0};
     printf("more=%d\n", poll(&p, 1, 0));

@@ -4476,6 +4476,11 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return write_io(c, &d.ok_or(Errno::EBADF)?.file, &b, false);
             }
             let count = if let Some(d) = d {
+                // `vfs_read` refuses a description not open for reading
+                // (`EBADF`) before `rw_verify_area` asks anything.
+                if d.file.flags() & 3 == 1 {
+                    return Err(Errno::EBADF);
+                }
                 access_permission(c, &d.file)?;
                 read_blocking(c, &d.file, &mut b)?
             } else if a[0] == 0 {

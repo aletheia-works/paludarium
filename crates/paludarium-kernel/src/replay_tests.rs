@@ -2,12 +2,16 @@
 //! through the kernel's system calls in the same order, with the guest's own
 //! lines. The expected lines are what the guest printed for its mode on
 //! native Linux 7.0 (x86-64, Ubuntu 26.04 runner); `diff_processes` still
-//! compares the whole guests with Linux on every CI run. A line that needs
-//! another process (a fork) is left out, as these tests run one thread.
+//! compares the whole guests with Linux on every CI run. A process the guest
+//! forks is a fork of the fixture's, whose system calls the test makes in the
+//! order the guest's processes make theirs; a line that needs processes to run
+//! at once is left out.
 use super::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 const HEAP: u64 = 0x700000;
-const HEAP_PAGES: u64 = 16;
+const HEAP_PAGES: u64 = 128;
 
 const READ: u64 = 0;
 const WRITE: u64 = 1;
@@ -16,13 +20,14 @@ const CLOSE: u64 = 3;
 const FCNTL: u64 = 72;
 const READLINK: u64 = 89;
 
-/// One guest thread, its memory and the lines it printed.
+/// One guest process's thread and memory, and the lines its processes
+/// printed.
 struct Guest {
-    k: Kernel,
+    k: Box<Kernel>,
     t: Thread,
-    m: AddressSpace,
+    m: Arc<AddressSpace>,
     top: u64,
-    lines: Vec<String>,
+    lines: Rc<RefCell<Vec<String>>>,
 }
 
 impl Guest {
@@ -36,16 +41,34 @@ impl Guest {
         )
         .unwrap();
         Self {
-            k,
+            k: Box::new(k),
             t,
-            m,
+            m: Arc::new(m),
             top: HEAP,
-            lines: Vec::new(),
+            lines: Rc::default(),
         }
     }
     /// A system call's result as the guest's `-errno` convention gives it.
     fn call(&mut self, n: u64, a: [u64; 6]) -> i64 {
         syscall(&mut self.k, &mut self.t, &self.m, n, a) as i64
+    }
+    /// fork(2): the child, which prints to the same lines.
+    fn fork(&mut self) -> Guest {
+        let (k, t, m) = fork(&mut self.k, &mut self.t, &self.m);
+        Guest {
+            k,
+            t,
+            m,
+            top: self.top,
+            lines: Rc::clone(&self.lines),
+        }
+    }
+    fn pid(&self) -> u64 {
+        u64::from(self.t.tid)
+    }
+    /// The process exits with `code`.
+    fn exit(mut self, code: i32) {
+        finish(&mut self.k, &self.t, &self.m, ExitStatus::Exited(code));
     }
     fn alloc(&mut self, len: usize) -> u64 {
         let at = self.top;
@@ -70,7 +93,7 @@ impl Guest {
         self.m.read_u64(GuestAddr(at)).unwrap()
     }
     fn say(&mut self, line: String) {
-        self.lines.push(line);
+        self.lines.borrow_mut().push(line);
     }
     fn open(&mut self, path: &str) -> i64 {
         let path = self.put(format!("{path}\0").as_bytes());
@@ -82,7 +105,8 @@ impl Guest {
     /// Every line printed, against the native ones.
     fn check(&self, native: &str) {
         let native: Vec<_> = native.trim().lines().collect();
-        let lines: Vec<_> = self.lines.iter().map(String::as_str).collect();
+        let lines = self.lines.borrow();
+        let lines: Vec<_> = lines.iter().map(String::as_str).collect();
         assert_eq!(lines, native);
     }
 }
@@ -1064,4 +1088,503 @@ other type -2
 ",
         );
     }
+}
+
+/// `tests/guests/processes/netlink-options.c`: the netlink-nsid case, the
+/// RTM_*NSID requests of NETLINK_ROUTE. The guest's main forks the case into
+/// a child that leaves the network namespace; the fixture's thread is that
+/// child, and the guest's last line, its parent's wait, is left out.
+mod nsid {
+    use super::*;
+
+    const PIPE: u64 = 22;
+    const GETPID: u64 = 39;
+    const SOCKET: u64 = 41;
+    const SENDTO: u64 = 44;
+    const RECVMSG: u64 = 47;
+    const BIND: u64 = 49;
+    const GETSOCKNAME: u64 = 51;
+    const SETSOCKOPT: u64 = 54;
+    const WAIT4: u64 = 61;
+    const SETRESUID: u64 = 117;
+    const SETRESGID: u64 = 119;
+    const UNSHARE: u64 = 272;
+    const CLONE_NEWNET: u64 = 0x4000_0000;
+    const AF_NETLINK: u64 = 16;
+    const SOCK_RAW: u64 = 3;
+    const SOL_NETLINK: u64 = 270;
+    const ADD_MEMBERSHIP: u64 = 1;
+    const CAP_ACK: u64 = 10;
+    const EXT_ACK: u64 = 11;
+    const STRICT_CHK: u64 = 12;
+    const MSG_DONTWAIT: u64 = 0x40;
+    const EAGAIN: i64 = 11;
+    const RTM_NEWNSID: u16 = 88;
+    const RTM_DELNSID: u16 = 89;
+    const RTM_GETNSID: u16 = 90;
+    const NETNSA_NSID: u16 = 1;
+    const NETNSA_PID: u16 = 2;
+    const NETNSA_FD: u16 = 3;
+    const NETNSA_TARGET_NSID: u16 = 4;
+    const NETNSA_CURRENT_NSID: u16 = 5;
+    const RTNLGRP_NSID: u32 = 28;
+
+    /// The guest's `struct request`, built by `begin`, `put` and `put32`.
+    struct Request(Vec<u8>);
+    impl Request {
+        fn new(kind: u16, flags: u16, seq: u32) -> Self {
+            let mut r = vec![0; 20];
+            r[0..4].copy_from_slice(&20u32.to_le_bytes());
+            r[4..6].copy_from_slice(&kind.to_le_bytes());
+            r[6..8].copy_from_slice(&flags.to_le_bytes());
+            r[8..12].copy_from_slice(&seq.to_le_bytes());
+            Self(r)
+        }
+        fn put(mut self, kind: u16, value: &[u8]) -> Self {
+            let total = 4 + value.len() as u16;
+            self.0.extend_from_slice(&total.to_le_bytes());
+            self.0.extend_from_slice(&kind.to_le_bytes());
+            self.0.extend_from_slice(value);
+            self.0.resize(self.0.len().next_multiple_of(4), 0);
+            let len = self.0.len() as u32;
+            self.0[0..4].copy_from_slice(&len.to_le_bytes());
+            self
+        }
+        fn put32(self, kind: u16, value: i32) -> Self {
+            self.put(kind, &value.to_le_bytes())
+        }
+    }
+
+    fn u16_of(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
+    }
+    fn u32_of(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+    fn i32_of(b: &[u8], at: usize) -> i32 {
+        i32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+    /// C's `%#x`.
+    fn hex(value: u32) -> String {
+        if value == 0 {
+            "0".to_owned()
+        } else {
+            format!("{value:#x}")
+        }
+    }
+
+    impl Guest {
+        fn route_socket(&mut self) -> i64 {
+            self.call(SOCKET, [AF_NETLINK, SOCK_RAW, 0, 0, 0, 0])
+        }
+        fn option(&mut self, fd: i64, name: u64, value: u32) -> i64 {
+            let at = self.put(&value.to_le_bytes());
+            self.call(SETSOCKOPT, [fd as u64, SOL_NETLINK, name, at, 4, 0])
+        }
+        fn acked_socket(&mut self) -> i64 {
+            let fd = self.route_socket();
+            self.option(fd, EXT_ACK, 1);
+            self.option(fd, CAP_ACK, 1);
+            fd
+        }
+        fn bound_socket(&mut self) -> i64 {
+            let fd = self.route_socket();
+            let any = self.put(&[16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            self.call(BIND, [fd as u64, any, 12, 0, 0, 0]);
+            fd
+        }
+        fn send(&mut self, fd: i64, r: Request) {
+            let kernel = self.put(&[16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            let at = self.put(&r.0);
+            let len = r.0.len() as u64;
+            self.call(SENDTO, [fd as u64, at, len, 0, kernel, 12]);
+        }
+        /// The guest's `show`: each datagram waiting on `fd` and its messages.
+        fn show(&mut self, fd: i64, label: &str) {
+            let name = self.alloc(12);
+            let name_len = self.put(&12u32.to_le_bytes());
+            self.call(GETSOCKNAME, [fd as u64, name, name_len, 0, 0, 0]);
+            let own = self.u32_at(name + 4);
+            let data = self.alloc(8192);
+            let control = self.alloc(128);
+            let iov = self.alloc(16);
+            let msg = self.alloc(56);
+            loop {
+                self.m.write(GuestAddr(control), &[0; 128]).unwrap();
+                self.m.write_u64(GuestAddr(iov), data).unwrap();
+                self.m.write_u64(GuestAddr(iov + 8), 8192).unwrap();
+                let mut header = [0u8; 56];
+                put64(&mut header, 16, iov);
+                put64(&mut header, 24, 1);
+                put64(&mut header, 32, control);
+                put64(&mut header, 40, 128);
+                self.m.write(GuestAddr(msg), &header).unwrap();
+                let n = self.call(RECVMSG, [fd as u64, msg, MSG_DONTWAIT, 0, 0, 0]);
+                if n < 0 {
+                    if n != -EAGAIN {
+                        self.say(format!("{label}: recv={n}"));
+                    }
+                    break;
+                }
+                let flags = self.u32_at(msg + 48);
+                let mut line = format!("{label}: datagram flags={}", hex(flags));
+                let control_len = self.u64_at(msg + 40) as usize;
+                let cmsgs = self.get(control, control_len);
+                let mut at = 0;
+                while at + 16 <= cmsgs.len() {
+                    let len = u64::from_le_bytes(cmsgs[at..at + 8].try_into().unwrap()) as usize;
+                    if len < 16 {
+                        break;
+                    }
+                    let value = if len >= 20 {
+                        i32_of(&cmsgs, at + 16)
+                    } else {
+                        0
+                    };
+                    line += &format!(
+                        " cmsg({},{})={value}",
+                        i32_of(&cmsgs, at + 8),
+                        i32_of(&cmsgs, at + 12)
+                    );
+                    at += len.next_multiple_of(8);
+                }
+                self.say(line);
+                let bytes = self.get(data, n as usize);
+                let mut at = 0;
+                while at + 16 <= bytes.len() {
+                    let len = u32_of(&bytes, at) as usize;
+                    if len < 16 || at + len > bytes.len() {
+                        break;
+                    }
+                    let (kind, flags) = (u16_of(&bytes, at + 4), u16_of(&bytes, at + 6));
+                    let seq = u32_of(&bytes, at + 8);
+                    let mine = (u32_of(&bytes, at + 12) == own) as i32;
+                    let mut line = format!(
+                        "  type={kind} flags={} seq={seq} own={mine}",
+                        hex(u32::from(flags))
+                    );
+                    let body = &bytes[at + 16..at + len];
+                    let mut attrs: Option<usize> = None;
+                    if kind == 2 {
+                        line += &format!(" error={}", i32_of(body, 0));
+                        if flags & 0x200 != 0 {
+                            attrs = Some(20);
+                        }
+                    } else if kind == 3 {
+                        line += &format!(" done={}", i32_of(body, 0));
+                        if flags & 0x200 != 0 {
+                            attrs = Some(4);
+                        }
+                    } else if kind == RTM_NEWNSID || kind == RTM_DELNSID {
+                        attrs = Some(4);
+                    }
+                    while let Some(a) = attrs.filter(|a| a + 4 <= body.len()) {
+                        let (alen, atype) = (u16_of(body, a) as usize, u16_of(body, a + 2));
+                        if alen < 4 || a + alen > body.len() {
+                            break;
+                        }
+                        let value = &body[a + 4..a + alen];
+                        if kind == 2 || kind == 3 {
+                            if atype == 1 {
+                                let text = &value[..alen - 5];
+                                line += &format!(" msg=\"{}\"", String::from_utf8_lossy(text));
+                            }
+                            if atype == 2 {
+                                line += &format!(" offset={}", u32_of(value, 0));
+                            }
+                        } else {
+                            line += &format!(" nsa{atype}={}", i32_of(value, 0));
+                        }
+                        attrs = Some(a + alen.next_multiple_of(4));
+                    }
+                    self.say(line);
+                    at += len.next_multiple_of(4);
+                }
+            }
+        }
+        /// wait4(2) for `pid`: its status.
+        fn wait(&mut self, pid: u64) -> u32 {
+            let status = self.put(&[0; 4]);
+            assert_eq!(self.call(WAIT4, [pid, status, 0, 0, 0, 0]), pid as i64);
+            self.u32_at(status)
+        }
+    }
+
+    #[test]
+    fn calls() {
+        let mut g = Guest::new();
+        let r = g.call(UNSHARE, [CLONE_NEWNET, 0, 0, 0, 0, 0]);
+        g.say(format!("unshare={r}"));
+        // peer_start: a child in a network namespace of its own.
+        let mut peer = g.fork();
+        let ready = peer.call(UNSHARE, [CLONE_NEWNET, 0, 0, 0, 0, 0]) == 0;
+        peer.route_socket();
+        g.say(format!("peer ready={}", ready as i32));
+        let ctl = g.acked_socket();
+        let mon = g.bound_socket();
+        let r = g.option(mon, ADD_MEMBERSHIP, RTNLGRP_NSID);
+        g.say(format!("join={r}"));
+        let p = peer.pid() as i32;
+        let peer_fd = g.open(&format!("/proc/{p}/ns/net"));
+        let self_fd = g.open("/proc/self/ns/net");
+        let uts_fd = g.open("/proc/self/ns/uts");
+        let pipe = g.alloc(8);
+        g.call(PIPE, [pipe, 0, 0, 0, 0, 0]);
+        let pipe_fd = g.u32_at(pipe) as i32;
+        g.say(format!(
+            "opened={} {} {}",
+            (peer_fd >= 0) as i32,
+            (self_fd >= 0) as i32,
+            (uts_fd >= 0) as i32
+        ));
+        let (peer_fd, self_fd, uts_fd) = (peer_fd as i32, self_fd as i32, uts_fd as i32);
+        let mut seq = 1;
+        let mut next = || {
+            seq += 1;
+            seq - 1
+        };
+        let new = |seq| Request::new(RTM_NEWNSID, 0x5, seq);
+        let get = |seq| Request::new(RTM_GETNSID, 0x1, seq);
+        let dump = |seq| Request::new(RTM_GETNSID, 0x301, seq);
+
+        g.say("-- before".to_owned());
+        g.send(ctl, get(next()).put32(NETNSA_PID, p));
+        g.send(ctl, dump(next()));
+        g.show(ctl, "ctl");
+        g.say("-- new: errors".to_owned());
+        g.send(ctl, new(next()));
+        g.send(ctl, new(next()).put32(NETNSA_NSID, 5));
+        for (kind, value) in [
+            (NETNSA_PID, 999_999),
+            (NETNSA_PID, 0),
+            (NETNSA_FD, 9999),
+            (NETNSA_FD, -1),
+            (NETNSA_FD, pipe_fd),
+            (NETNSA_FD, uts_fd),
+        ] {
+            g.send(ctl, new(next()).put32(NETNSA_NSID, 5).put32(kind, value));
+        }
+        g.show(ctl, "ctl");
+        g.show(mon, "mon");
+        g.say("-- new".to_owned());
+        // The process wins over the descriptor.
+        let r = new(next())
+            .put32(NETNSA_NSID, 5)
+            .put32(NETNSA_FD, uts_fd)
+            .put32(NETNSA_PID, p);
+        g.send(ctl, r);
+        g.show(ctl, "ctl");
+        g.show(mon, "mon");
+        g.send(
+            ctl,
+            new(next()).put32(NETNSA_NSID, 6).put32(NETNSA_FD, peer_fd),
+        );
+        g.send(
+            ctl,
+            new(next()).put32(NETNSA_NSID, 5).put32(NETNSA_FD, self_fd),
+        );
+        g.show(ctl, "ctl");
+        // The lowest free, with NLM_F_ECHO: the requester alone has the copy.
+        let r = Request::new(RTM_NEWNSID, 0xd, next())
+            .put32(NETNSA_NSID, -1)
+            .put32(NETNSA_FD, self_fd);
+        g.send(ctl, r);
+        g.show(ctl, "ctl");
+        g.show(mon, "mon");
+        g.say("-- get".to_owned());
+        let me = g.call(GETPID, [0; 6]) as i32;
+        for (kind, value) in [
+            (NETNSA_PID, p),
+            (NETNSA_FD, peer_fd),
+            (NETNSA_NSID, 5),
+            (NETNSA_NSID, 0),
+            (NETNSA_FD, self_fd),
+            (NETNSA_PID, me),
+            (NETNSA_NSID, 7),
+            (NETNSA_NSID, -3),
+            (NETNSA_PID, 999_999),
+            (NETNSA_FD, uts_fd),
+        ] {
+            g.send(ctl, get(next()).put32(kind, value));
+        }
+        g.send(ctl, get(next()));
+        let pairs = [
+            (NETNSA_PID, p, NETNSA_CURRENT_NSID, 1),
+            (NETNSA_FD, self_fd, NETNSA_TARGET_NSID, 5),
+            (NETNSA_PID, p, NETNSA_TARGET_NSID, 0),
+            (NETNSA_PID, p, NETNSA_TARGET_NSID, 7),
+        ];
+        for (a, x, b, y) in pairs {
+            g.send(ctl, get(next()).put32(a, x).put32(b, y));
+        }
+        g.send(ctl, get(next()).put(NETNSA_PID, b"ab"));
+        g.show(ctl, "ctl");
+        // Each dump is read before the next, as one still running makes
+        // another EBUSY.
+        g.say("-- dump".to_owned());
+        g.send(ctl, dump(next()));
+        g.show(ctl, "ctl");
+        g.send(ctl, dump(next()).put32(NETNSA_NSID, 1));
+        g.show(ctl, "ctl");
+        let r = g.option(ctl, STRICT_CHK, 1);
+        g.say(format!("strict={r}"));
+        g.send(ctl, dump(next()));
+        g.show(ctl, "ctl");
+        for target in [5, 0, 9] {
+            g.send(ctl, dump(next()).put32(NETNSA_TARGET_NSID, target));
+            g.show(ctl, "ctl");
+        }
+        let r = dump(next())
+            .put32(NETNSA_TARGET_NSID, 5)
+            .put32(NETNSA_NSID, 1);
+        g.send(ctl, r);
+        g.show(ctl, "ctl");
+        g.send(ctl, dump(next()).put32(9, 1));
+        g.show(ctl, "ctl");
+        let r = get(next())
+            .put32(NETNSA_PID, p)
+            .put32(NETNSA_CURRENT_NSID, 1);
+        g.send(ctl, r);
+        g.send(ctl, get(next()).put32(NETNSA_PID, p));
+        g.show(ctl, "ctl");
+        g.say("-- others".to_owned());
+        let r = Request::new(RTM_DELNSID, 0x5, next()).put32(NETNSA_NSID, 5);
+        g.send(ctl, r);
+        g.show(ctl, "ctl");
+        // A user without CAP_NET_ADMIN.
+        let mut user = g.fork();
+        assert_eq!(user.call(SETRESGID, [65534, 65534, 65534, 0, 0, 0]), 0);
+        assert_eq!(user.call(SETRESUID, [65534, 65534, 65534, 0, 0, 0]), 0);
+        let user_ctl = user.acked_socket();
+        let r = new(next()).put32(NETNSA_NSID, 8).put32(NETNSA_PID, p);
+        user.send(user_ctl, r);
+        user.send(user_ctl, get(next()).put32(NETNSA_PID, p));
+        user.show(user_ctl, "user");
+        let user_pid = user.pid();
+        user.exit(0);
+        let status = g.wait(user_pid);
+        g.say(format!("user status={}", hex(status)));
+        g.show(mon, "mon");
+        // peer_stop.
+        let peer_pid = peer.pid();
+        peer.exit(0);
+        g.wait(peer_pid);
+        g.check(NATIVE);
+    }
+
+    /// The guest's lines on native Linux, but for its parent's wait.
+    const NATIVE: &str = "
+unshare=0
+peer ready=1
+join=0
+opened=1 1 1
+-- before
+ctl: datagram flags=0
+  type=88 flags=0 seq=1 own=1 nsa1=-1
+ctl: datagram flags=0
+  type=3 flags=0x2 seq=2 own=1 done=0
+-- new: errors
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=3 own=1 error=-22 msg=\"nsid is missing\"
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=4 own=1 error=-22 msg=\"Peer netns reference is missing\"
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=5 own=1 error=-3 msg=\"Peer netns reference is invalid\" offset=28
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=6 own=1 error=-3 msg=\"Peer netns reference is invalid\" offset=28
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=7 own=1 error=-9 msg=\"Peer netns reference is invalid\" offset=28
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=8 own=1 error=-9 msg=\"Peer netns reference is invalid\" offset=28
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=9 own=1 error=-22 msg=\"Peer netns reference is invalid\" offset=28
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=10 own=1 error=-22 msg=\"Peer netns reference is invalid\" offset=28
+-- new
+ctl: datagram flags=0
+  type=2 flags=0x100 seq=11 own=1 error=0
+mon: datagram flags=0
+  type=88 flags=0 seq=11 own=0 nsa1=5
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=12 own=1 error=-17 msg=\"Peer netns already has a nsid assigned\" offset=28
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=13 own=1 error=-17 msg=\"The specified nsid is already used\" offset=20
+ctl: datagram flags=0
+  type=88 flags=0 seq=14 own=1 nsa1=0
+ctl: datagram flags=0
+  type=2 flags=0x100 seq=14 own=1 error=0
+mon: datagram flags=0
+  type=88 flags=0 seq=14 own=0 nsa1=0
+-- get
+ctl: datagram flags=0
+  type=88 flags=0 seq=15 own=1 nsa1=5
+ctl: datagram flags=0
+  type=88 flags=0 seq=16 own=1 nsa1=5
+ctl: datagram flags=0
+  type=88 flags=0 seq=17 own=1 nsa1=5
+ctl: datagram flags=0
+  type=88 flags=0 seq=18 own=1 nsa1=0
+ctl: datagram flags=0
+  type=88 flags=0 seq=19 own=1 nsa1=0
+ctl: datagram flags=0
+  type=88 flags=0 seq=20 own=1 nsa1=0
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=21 own=1 error=-2 msg=\"Peer netns reference is invalid\" offset=20
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=22 own=1 error=-2 msg=\"Peer netns reference is invalid\" offset=20
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=23 own=1 error=-3 msg=\"Peer netns reference is invalid\" offset=20
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=24 own=1 error=-22 msg=\"Peer netns reference is invalid\" offset=20
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=25 own=1 error=-22 msg=\"Peer netns reference is missing\"
+ctl: datagram flags=0
+  type=88 flags=0 seq=26 own=1 nsa1=5
+ctl: datagram flags=0
+  type=88 flags=0 seq=27 own=1 nsa1=-1 nsa5=0
+ctl: datagram flags=0
+  type=88 flags=0 seq=28 own=1 nsa1=5 nsa5=5
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=29 own=1 error=-22 msg=\"Target netns reference is invalid\" offset=28
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=30 own=1 error=-34 msg=\"Attribute failed policy validation\" offset=20
+-- dump
+ctl: datagram flags=0
+  type=88 flags=0x2 seq=31 own=1 nsa1=0
+  type=88 flags=0x2 seq=31 own=1 nsa1=5
+  type=3 flags=0x2 seq=31 own=1 done=0
+ctl: datagram flags=0
+  type=88 flags=0x2 seq=32 own=1 nsa1=0
+  type=88 flags=0x2 seq=32 own=1 nsa1=5
+  type=3 flags=0x2 seq=32 own=1 done=0
+strict=0
+ctl: datagram flags=0
+  type=88 flags=0x2 seq=33 own=1 nsa1=0
+  type=88 flags=0x2 seq=33 own=1 nsa1=5
+  type=3 flags=0x2 seq=33 own=1 done=0
+ctl: datagram flags=0
+  type=3 flags=0x2 seq=34 own=1 done=0
+ctl: datagram flags=0
+  type=88 flags=0x2 seq=35 own=1 nsa1=0 nsa5=0
+  type=88 flags=0x2 seq=35 own=1 nsa1=5 nsa5=5
+  type=3 flags=0x2 seq=35 own=1 done=0
+ctl: datagram flags=0
+  type=3 flags=0x202 seq=36 own=1 done=-22 msg=\"Invalid target network namespace id\" offset=20
+ctl: datagram flags=0
+  type=3 flags=0x202 seq=37 own=1 done=-22 msg=\"Unsupported attribute in dump request\" offset=28
+ctl: datagram flags=0
+  type=3 flags=0x202 seq=38 own=1 done=-22 msg=\"Unknown attribute type\" offset=20
+ctl: datagram flags=0
+  type=2 flags=0x300 seq=39 own=1 error=-22 msg=\"Unsupported attribute in peer netns getid request\"
+ctl: datagram flags=0
+  type=88 flags=0 seq=40 own=1 nsa1=5
+-- others
+ctl: datagram flags=0
+  type=2 flags=0x100 seq=41 own=1 error=-95
+user: datagram flags=0
+  type=2 flags=0x100 seq=42 own=1 error=-1
+user: datagram flags=0
+  type=88 flags=0 seq=43 own=1 nsa1=5
+user status=0
+";
 }

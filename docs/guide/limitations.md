@@ -578,7 +578,9 @@ verified.
   mountinfo marks it `//deleted`. A descriptor's mount ID (`statx` with
   `AT_EMPTY_PATH`, fdinfo) is found by the path it was opened by, and so
   is the mount of a descriptor's events for fanotify's mount marks
-  (`FAN_MARK_MOUNT`). Such a mark stays after its mount is unmounted, where
+  (`FAN_MARK_MOUNT`); once that path no longer leads to the file's file
+  system (renamed or replaced since), the event is the first mount's of
+  that file system. Such a mark stays after its mount is unmounted, where
   Linux removes it, and then also hears of a new mount of the same file
   system that takes the mount's free ID.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are

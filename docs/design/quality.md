@@ -200,9 +200,10 @@ every test passing.
 - The terminal gate runs the libraries' unit tests, not the harness's
   differential tests. So that the system calls those check count there too,
   some kernel unit tests (`replay_tests.rs` and `ptrace_replay_tests.rs`
-  in `crates/paludarium-kernel/src/`) make a differential guest's calls in the same order and compare its lines
-  with what the guest printed on native Linux 7.0. The differential tests
-  still compare the whole guests with Linux on every run.
+  in `crates/paludarium-kernel/src/`) make a differential guest's calls in
+  the same order and compare its lines with what the guest printed on
+  native Linux 7.0. The differential tests still compare the whole guests
+  with Linux on every run.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)

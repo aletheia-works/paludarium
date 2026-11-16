@@ -151,6 +151,13 @@ fn halve(value: Long) -> Long {
     out
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// How often divide_long has given the divisor back, which its tests
+    /// check that they make it do.
+    static GIVEN_BACK: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
 /// The 32-bit digits of a value, lowest first.
 fn digits(value: &Long) -> [u32; 16] {
     let mut out = [0; 16];
@@ -237,6 +244,8 @@ fn divide_long(dividend: &Long, divisor: &Long) -> (Long, bool) {
         u[j + length] = difference as u32;
         if difference < 0 {
             // The guess was one too many: give v back.
+            #[cfg(test)]
+            GIVEN_BACK.with(|count| count.set(count.get() + 1));
             guess -= 1;
             let mut carry = 0u64;
             for at in 0..length {
@@ -621,15 +630,18 @@ mod tests {
     #[test]
     fn long_division_and_roots_agree_with_doing_them_by_bits() {
         // A guess one too many even after its correction, so that the
-        // divisor is given back: found by search, and checked placed higher.
+        // divisor is given back: found by search, and placed higher by whole
+        // digits, which keeps it so.
         let dividend = from_digits(&[0x7fff_ffff, 0, 0, 0xffff_ffff, 0x7fff_ffff]);
         let divisor = from_digits(&[0xffff_ffff, 0x8000_0000, 1, 0x8000_0001]);
-        for shift in [0, 32, 100, 250] {
+        for shift in [0, 32, 96, 352] {
             let dividend = shift_left(dividend, shift);
+            GIVEN_BACK.with(|count| count.set(0));
             assert_eq!(
                 divide_long(&dividend, &divisor),
                 divide_by_bits(&dividend, &divisor)
             );
+            assert_ne!(GIVEN_BACK.with(core::cell::Cell::get), 0, "given back");
         }
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {

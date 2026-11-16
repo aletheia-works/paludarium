@@ -53,10 +53,8 @@ pub(crate) const V6_ASKED: u32 = 0x02 | 0x10 | 0x100 | NO_PREFIX_ROUTE | 0x400;
 const V6_CHANGED: u32 = DEPRECATED | PERMANENT | 0x02 | 0x10 | 0x100 | NO_PREFIX_ROUTE;
 /// `INFINITY_LIFE_TIME`: a lifetime that never ends.
 pub(crate) const FOREVER: u32 = u32::MAX;
-/// A second, and how much sooner than its lifetime an address is taken to
-/// have run out (`ADDRCONF_TIMER_FUZZ_MINUS`, `HZ / 50`), in nanoseconds.
+/// A second, in nanoseconds.
 const SECOND: u64 = 1_000_000_000;
-const FUZZ: u64 = 20_000_000;
 /// The scopes of addresses and routes (`RT_SCOPE_*`).
 pub(crate) const SCOPE_UNIVERSE: u8 = 0;
 pub(crate) const SCOPE_LINK: u8 = 253;
@@ -135,11 +133,13 @@ impl Life {
         };
         (self.preferred.saturating_sub(age), valid)
     }
-    /// Whether at `now` it is as old as `lifetime` (which is not forever),
-    /// a little sooner counting (`check_lifetime`, `addrconf_verify_rtnl`).
+    /// Whether at `now` it is as old as `lifetime` (which is not forever).
+    /// Linux's work (`check_lifetime`, `addrconf_verify_rtnl`) is scheduled
+    /// for the moment a lifetime ends, and counts an address a little
+    /// older (`ADDRCONF_TIMER_FUZZ_MINUS`) only when it runs sooner for
+    /// another, which no request here makes it do.
     fn reached(&self, lifetime: u32, now: u64) -> bool {
-        lifetime != FOREVER
-            && (now + FUZZ).saturating_sub(self.changed) / SECOND >= u64::from(lifetime)
+        lifetime != FOREVER && now.saturating_sub(self.changed) / SECOND >= u64::from(lifetime)
     }
 }
 /// The valid and preferred lifetimes a request asks an address to have
@@ -2836,10 +2836,11 @@ mod tests {
         let prefix = a.dump6().into_iter().find(|r| r.len == 64).unwrap();
         // Through a loopback, it does not run out by itself.
         assert_eq!(prefix.expires, None);
-        // Nothing yet; then, a little sooner than its second, IPv4's is
+        // Nothing yet, not even just before its second; then IPv4's is
         // deprecated, once.
         assert!(a.expire(start + SECOND / 2).is_empty());
-        let soon = start + SECOND - FUZZ;
+        assert!(a.expire(start + SECOND - 1).is_empty());
+        let soon = start + SECOND;
         assert_eq!(told(&a.expire(soon)), ["+addr 10.9.0.1/24"]);
         assert!(a.v4.iter().any(|x| x.flags & DEPRECATED != 0));
         assert!(a.expire(soon).is_empty());

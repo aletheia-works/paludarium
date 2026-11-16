@@ -1945,9 +1945,12 @@ kernel.
     `IFA_CACHEINFO` are kept. An address with a valid lifetime is not
     `IFA_F_PERMANENT`, one with a preferred lifetime of 0 is
     `IFA_F_DEPRECATED`, and `IFA_CACHEINFO` tells what each has left and
-    when the address was made and its lifetimes set. As Linux's checks do,
-    an address becomes deprecated when its preferred lifetime ends, and
-    goes with its routes when its valid one does. An IPv6 prefix route does
+    when the address was made and its lifetimes set. As Linux's checks do
+    (`check_lifetime`, `addrconf_verify_rtnl`), an address becomes
+    deprecated when its preferred lifetime ends, and goes with its routes
+    when its valid one does, on time without a request: a socket that
+    binds or sends finds it gone, and a member of the address and route
+    groups waiting in `poll`, `epoll` or a read hears of it as it happens. An IPv6 prefix route does
     not run out by itself, as on Linux, whose routes through a loopback
     lose `RTF_EXPIRES` as they are made (`fib6_is_reject`); it takes a
     lifetime (`rta_expires`) when a change gives its permanent address one

@@ -738,11 +738,11 @@ verified.
   are their defaults whatever its route holds. A route may name no
   congestion control but `cubic` and `reno` (`EINVAL`), where Linux, for a
   caller with `CAP_NET_ADMIN`, loads the module of another first.
-  An address's lifetimes run out only when a netlink request in its
-  namespace next comes, which first tells of it, where Linux's work finds
-  them on time: until then a socket may still use an address past its
-  valid lifetime. An IPv6 route that has run out goes from its table then
-  too, where Linux's, which lookups pass over, stays in dumps until its
+  An address runs out as its lifetime ends, where Linux's checks are
+  deferrable work, which comes up to a second later (`round_jiffies_up`)
+  and, on an idle machine, may wait seconds more, unless an address of the
+  family is added or changed, which has them run at once. An IPv6
+  route that has run out goes from its table at once, where Linux's, which lookups pass over, stays in dumps until its
   garbage collection (`gc_interval`, 30 seconds), and from 7.3 marks its
   notification of that with `RTA_DEL_REASON`. A change that gives a
   permanent IPv6 address a lifetime gives its prefix route the same, as

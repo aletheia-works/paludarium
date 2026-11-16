@@ -22,8 +22,9 @@
 //! are given, the ones before a bad one kept, and `semmni` back as it was
 //! unless it ends from 0 to `IPCMNI` (`proc_ipc_sem_dointvec`). Their
 //! owners and who may write them are the mqueue files'. Beside them are
-//! `perf_event_paranoid` and `unprivileged_bpf_disabled`, 2 as on Linux's
-//! defaults, which no one may write.
+//! `perf_event_paranoid` and `unprivileged_bpf_disabled`, the values
+//! [`crate::perf`] and [`crate::bpf`] keep to (2, Linux's defaults), which
+//! no one may write.
 //!
 //! Each file is the opener's IPC namespace's ([`crate::mqueue::Limits`]),
 //! so a new namespace shows Linux's defaults again. A read gives the value
@@ -300,7 +301,8 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
             let [msl, mns, opm, mni] = ipc.sem.with_limits(|limits| limits.0);
             format!("{msl}\t{mns}\t{opm}\t{mni}\n").into_bytes()
         }
-        Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => line(2),
+        Kernel::PerfEventParanoid => line(crate::perf::PARANOID),
+        Kernel::UnprivilegedBpfDisabled => line(crate::bpf::UNPRIVILEGED_DISABLED),
     }
 }
 
@@ -409,7 +411,7 @@ pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
         },
         Entry::Kernel(file) if !file.ipc() => FileStat {
             mode: 0o100_444,
-            ..crate::proc::stat(line(2).len())
+            ..crate::proc::stat(kernel_line(&ipc(c), file).len())
         },
         Entry::Kernel(file) => {
             let (uid, gid) = owner(c);

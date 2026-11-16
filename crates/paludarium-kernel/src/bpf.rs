@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// `sizeof(union bpf_attr)` in Linux master.
 const ATTR_SIZE: usize = 168;
 /// `kernel.unprivileged_bpf_disabled`: Linux's default with
-/// `CONFIG_BPF_UNPRIV_DEFAULT_OFF`, which is on by default.
-const UNPRIVILEGED_DISABLED: i32 = 2;
+/// `CONFIG_BPF_UNPRIV_DEFAULT_OFF`, which is on by default, and what
+/// `/proc/sys/kernel/unprivileged_bpf_disabled` shows ([`crate::sysctl`]).
+pub(crate) const UNPRIVILEGED_DISABLED: i32 = 2;
 
 const CAP_SYS_ADMIN: u64 = 1 << 21;
 const CAP_BPF: u64 = 1 << 39;

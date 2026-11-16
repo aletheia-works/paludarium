@@ -19,8 +19,9 @@ use paludarium_types::{Errno, GuestAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-/// `kernel.perf_event_paranoid`, Linux's default.
-const PARANOID: i32 = 2;
+/// `kernel.perf_event_paranoid`, Linux's default, which
+/// `/proc/sys/kernel/perf_event_paranoid` shows ([`crate::sysctl`]).
+pub(crate) const PARANOID: i32 = 2;
 /// `kernel.perf_event_max_sample_rate`, Linux's default
 /// (`DEFAULT_MAX_SAMPLE_RATE`).
 const MAX_SAMPLE_RATE: u64 = 100_000;

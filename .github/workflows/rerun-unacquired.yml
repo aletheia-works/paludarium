@@ -45,3 +45,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          # The attempt that completed: an event can come after the next started.
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}

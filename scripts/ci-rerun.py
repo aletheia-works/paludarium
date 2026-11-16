@@ -33,16 +33,32 @@ def unacquired(job, annotations):
     )
 
 
-def decide(run, jobs, annotations, superseded):
+def replaced(run, runs):
+    """Whether a later run of `runs` replaced `run`: of the same workflow,
+    head branch and event (the query's), and from the same repository, as two
+    forks can push branches of one name."""
+    return any(
+        other["id"] > run["id"]
+        and other["head_repository"]["full_name"] == run["head_repository"]["full_name"]
+        for other in runs
+    )
+
+
+def decide(run, jobs, annotations, superseded, latest):
     """(rerun, reasons): whether to rerun `run`, and why, line by line.
 
-    `jobs` are the run attempt's jobs, `annotations` maps a job id to its
-    annotation messages, and `superseded` is whether a later run of the same
-    workflow, branch and event exists.
+    `run` is the attempt whose completion this handles, `jobs` its jobs,
+    `annotations` maps a job id to its annotation messages, `superseded` is
+    whether a later run replaced it, and `latest` is the run's latest attempt:
+    an event that comes after another attempt started reruns nothing.
     """
     reasons = []
     if run["conclusion"] not in ("failure", "cancelled"):
         return False, [f"run concluded {run['conclusion']}: nothing to rerun"]
+    if run["run_attempt"] != latest:
+        return False, [
+            f"attempt {run['run_attempt']} is not the latest, {latest}: nothing to rerun"
+        ]
     if run["run_attempt"] > MAX_EXTRA:
         return False, [f"attempt {run['run_attempt']}: already rerun {MAX_EXTRA} times"]
     if superseded:
@@ -74,10 +90,9 @@ def gh(*args):
 
 
 def main_rerun(repo, run_id, attempt=None, dry_run=False):
-    run = json.loads(gh("api", f"repos/{repo}/actions/runs/{run_id}"))
-    if attempt:
-        run = json.loads(gh("api", f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}"))
-    attempt = run["run_attempt"]
+    latest = json.loads(gh("api", f"repos/{repo}/actions/runs/{run_id}"))["run_attempt"]
+    attempt = attempt or latest
+    run = json.loads(gh("api", f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}"))
     jobs = []
     page = 1
     while True:
@@ -101,11 +116,10 @@ def main_rerun(repo, run_id, attempt=None, dry_run=False):
         gh(
             "api",
             f"repos/{repo}/actions/workflows/{run['workflow_id']}/runs"
-            f"?branch={run['head_branch']}&event={run['event']}&per_page=1",
+            f"?branch={run['head_branch']}&event={run['event']}&per_page=20",
         )
     )["workflow_runs"]
-    superseded = bool(later) and later[0]["id"] != run["id"]
-    rerun, reasons = decide(run, jobs, annotations, superseded)
+    rerun, reasons = decide(run, jobs, annotations, replaced(run, later), latest)
     print(
         f"run {run_id} attempt {attempt} ({run['event']} {run['head_branch']} {run['head_sha'][:9]}):"
     )
@@ -199,17 +213,34 @@ def self_test():
             True,
         ),
     ]
+    stale = {**run, "run_attempt": 1}
+    cases.append(
+        ("an event after attempt 2 started", stale, [mac, ok], {mac["id"]: note}, False, False)
+    )
     for name, r, jobs, notes, superseded, wanted in cases:
-        got, reasons = decide(r, jobs, notes, superseded)
+        latest = 2 if name == "an event after attempt 2 started" else r["run_attempt"]
+        got, reasons = decide(r, jobs, notes, superseded, latest)
         if got != wanted or not reasons:
             raise AssertionError(f"{name}: rerun {got}, wanted {wanted}: {reasons}")
+    own = {"id": 10, "head_repository": {"full_name": "aletheia-works/paludarium"}}
+    fork = {"id": 11, "head_repository": {"full_name": "someone/paludarium"}}
+    newer = {"id": 12, "head_repository": {"full_name": "aletheia-works/paludarium"}}
+    older = {"id": 9, "head_repository": {"full_name": "aletheia-works/paludarium"}}
+    for runs, wanted in (
+        ([own], False),
+        ([fork, own], False),
+        ([newer, own], True),
+        ([older], False),
+    ):
+        if replaced(own, runs) != wanted:
+            raise AssertionError(f"replaced by {[r['id'] for r in runs]}: wanted {wanted}")
     text = CI.read_text(encoding="utf-8")
     for gate in GATES:
         if f"\n  {gate}:\n" not in text:
             raise AssertionError(f"{gate} is no job of ci.yml")
     if "\nname: CI\n" not in text:
         raise AssertionError("rerun-unacquired.yml follows the workflow named CI")
-    print(f"ci-rerun ready: {len(cases)} cases and {len(GATES)} gate checked")
+    print(f"ci-rerun ready: {len(cases)} cases, 4 replacements and {len(GATES)} gate checked")
 
 
 def main():
@@ -224,10 +255,11 @@ def main():
         self_test()
         return
     run_id = args.run or os.environ.get("RUN_ID")
+    attempt = args.attempt or int(os.environ.get("ATTEMPT") or 0) or None
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
     if not run_id or not repo:
         sys.exit("a run ID and a repository are needed")
-    main_rerun(repo, run_id, args.attempt, args.dry_run)
+    main_rerun(repo, run_id, attempt, args.dry_run)
 
 
 if __name__ == "__main__":

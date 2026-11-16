@@ -385,12 +385,12 @@ fn shmget(c: &Context<'_>, key: i32, size: u64, flag: i32) -> Result<u64, Errno>
         return Err(Errno::ENOSYS);
     }
     let table = &mut *table;
-    let (id, index) = table
+    let id = table
         .ids
         .allocate(&table.segments, limits.mni.max(0) as usize)?;
     let name = format!("/SYSV{:08x} (deleted)", key as u32);
     table.segments.insert(
-        index,
+        ipc::index(id),
         Segment {
             id,
             perm: Perm::new(key, credentials, flag),

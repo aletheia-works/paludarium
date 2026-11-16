@@ -365,11 +365,11 @@ fn msgget(c: &Context<'_>, key: i32, flag: i32) -> Result<u64, Errno> {
     }
     let table = &mut *table;
     let limits = table.limits;
-    let (id, index) = table
+    let id = table
         .ids
         .allocate(&table.queues, limits.mni.max(0) as usize)?;
     table.queues.insert(
-        index,
+        ipc::index(id),
         Queue {
             id,
             perm: Perm::new(key, credentials, flag),

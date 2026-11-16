@@ -15022,17 +15022,20 @@ static int ipc_sysctl_more(void) {
     printf(" unset=%ld\n", ksys_write("shm_rmid_forced", "0"));
     syscall(SYS_shmctl, own, IPC_RMID, NULL);
 
-    /* A next ID whose index is taken goes to the next free one, past
-       IPCMNI too: its ID adds that index to the sequence number, and names
-       another index, so nothing finds the segment by it. It stays until
-       the namespace goes, with this child. */
+    /* A next ID whose index and all after it below IPCMNI are taken is
+       ENOSPC, as Linux master's idr_alloc stops at ipc_mni (7.0's went
+       past it), and the next ID is used up all the same. */
     ksys_write("shm_next_id", "32767");
     int last = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
     ksys_write("shm_next_id", "32767");
+    errno = 0;
     int past = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
+    int past_errno = errno;
+    printf("past-ipcmni: last=%d past=%d errno=%d", last, past, past_errno);
+    ksys_show("shm_next_id");
     unsigned long shminfo[9] = {0};
     long max = syscall(SYS_shmctl, 0, 3 /* IPC_INFO */, shminfo);
-    printf("past-ipcmni: last=%d past=%d stat=%ld max=%ld\n", last, past, ksys_exists(past), max);
+    printf(" max=%ld\n", max);
     syscall(SYS_shmctl, last, IPC_RMID, NULL);
 
     /* Another user writing through root's descriptor is refused at the

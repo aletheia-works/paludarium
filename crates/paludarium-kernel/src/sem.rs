@@ -647,11 +647,11 @@ fn semget(c: &Context<'_>, key: i32, count: i32, flag: i32) -> Result<u64, Errno
         return Err(Errno::ENOSPC);
     }
     let table = &mut *table;
-    let (id, index) = table
+    let id = table
         .ids
         .allocate(&table.sets, limits.mni().max(0) as usize)?;
     table.sets.insert(
-        index,
+        ipc::index(id),
         Set {
             id,
             perm: Perm::new(key, credentials, flag),
@@ -1455,7 +1455,7 @@ mod tests {
         {
             let mut guard = table.lock().unwrap();
             let t = &mut *guard;
-            let (id, _) = t.ids.allocate(&t.sets, SEMMNI).unwrap();
+            let id = t.ids.allocate(&t.sets, SEMMNI).unwrap();
             let mut s = set(&[5, 1]);
             s.id = id;
             list.join(&table, &mut s);

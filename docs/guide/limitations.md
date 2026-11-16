@@ -253,8 +253,13 @@ verified.
   its keys in the order of their bytes, where Linux's order follows its
   buckets and a random seed, and a batch of it takes each element as a
   bucket of its own, so `in_batch` and `out_batch` count elements. A map's
-  memory follows the sizes of Linux 7.0's structures, not Linux master's,
-  whose hash elements are smaller, and the elements are not taken from
+  memory follows the structure sizes of the test machines' kernel,
+  Ubuntu's Linux 7.0, not upstream Linux's: its `struct bpf_map` carries
+  the `u32 excl` that Ubuntu took from Linux 7.2 (0fb6c9ed6493, removed in
+  7.3), so an array's header is 312 bytes where upstream v7.0's is 304.
+  Linux master's array header is 312 bytes too, through another field,
+  but its hash header (832 bytes) and elements are smaller than the 896
+  and 48 bytes here. The elements are not taken from
   the machine until they are written: no memory cgroup is charged, and
   only a map larger than the machine's 4 GiB is `ENOMEM`, where Linux may
   also run out of the memory it really has. A preallocated hash counts a

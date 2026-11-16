@@ -8,9 +8,10 @@
 //! and `kernel.unprivileged_bpf_disabled` at Linux's default 2.
 //!
 //! The memory a map takes (fdinfo's `memlock`, and the `ENOMEM` of one
-//! larger than the machine's memory) is counted as Linux 7.0, the kernel
-//! the x86-64 test machines run, lays out its structures on x86-64; Linux
-//! master's hash elements are smaller.
+//! larger than the machine's memory) is counted with the x86-64 structure
+//! sizes of the kernel the test machines run, Ubuntu's Linux 7.0 builds,
+//! which the differential tests compare with; see [`ARRAY_HEADER`] and
+//! [`HASH_HEADER`] for where they part from upstream v7.0 and master.
 //!
 //! A command Linux has that is not here (programs, BTF, links, pins and the
 //! rest) is `ENOSYS`; one Linux does not have is `EINVAL`, as there. Map
@@ -454,13 +455,21 @@ fn new_fd(c: &mut Context<'_>, map: Arc<Map>, access: u32) -> Result<u64, Errno>
         .map(u64::from)
 }
 
-/// `sizeof(struct bpf_array)` before the values, as the test machines'
-/// Linux 7.0 (Ubuntu's) has it on x86-64: 8 bytes more than upstream
-/// v7.0's 304, whose `struct bpf_map` is 288 bytes, in the size the native
-/// runs give.
+/// `sizeof(struct bpf_array)` before the values on x86-64, 312 bytes on the
+/// test machines' kernel (`Ubuntu-azure-7.0.0-1019.20`, Ubuntu-7.0.0-44.44
+/// too): Ubuntu carries `u32 excl` after `struct bpf_map`'s `sha`, from
+/// Linux 7.2's 0fb6c9ed6493 ("libbpf: Reject non-exclusive metadata maps
+/// in the signed loader"), which Linux 7.3 removed again (a2d784869a0f).
+/// Upstream v7.0 and its stable releases have 304. Linux master has 312
+/// as well, by another field: `unsigned long user` (a04286f6d828, "bpf:
+/// Recognize pointers to functions in read-only maps", in 7.4-rc1).
 const ARRAY_HEADER: u64 = 312;
-/// Linux 7.0's `sizeof(struct bpf_htab)`, `sizeof(struct htab_elem)`
-/// before the key, and `sizeof(struct bucket)`, on x86-64.
+/// `sizeof(struct bpf_htab)`, `sizeof(struct htab_elem)` before the key,
+/// and `sizeof(struct bucket)` on x86-64, as Linux 7.0 has them (the test
+/// machines' 8 more bytes of `struct bpf_map` vanish in `bpf_htab`'s
+/// 64-byte alignment). Linux master's differ: its `bpf_htab` is 832 bytes
+/// without the per-CPU counter (1cd28b5354ab) and its elements smaller
+/// (26c9dc906692, 0d0421c96f67), so these stay the test machines'.
 const HASH_HEADER: u64 = 896;
 const HASH_ELEMENT: u64 = 48;
 const BUCKET: u64 = 16;

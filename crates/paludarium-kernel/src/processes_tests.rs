@@ -4573,10 +4573,21 @@ mod shm {
         t.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
         assert_eq!(write(&mut k, &mut t, &m, msgmax, b"100"), e(Errno::EPERM));
         assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), e(Errno::EPERM));
-        // So does a positioned write (pwrite64).
+        // So does a positioned write (pwrite64, and pwritev of one iovec).
         m.write(GuestAddr(BUF), b"100").unwrap();
         assert_eq!(
             syscall(&mut k, &mut t, &m, 18, [msgmax, BUF, 3, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        const IOV: u64 = DATA + 0xb00;
+        m.write_u64(GuestAddr(IOV), BUF).unwrap();
+        m.write_u64(GuestAddr(IOV + 8), 3).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 296, [msgmax, IOV, 1, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 296, [bpf, IOV, 1, 0, 0, 0]),
             e(Errno::EPERM)
         );
         // Root without CAP_SYS_ADMIN may write msgmax, but not

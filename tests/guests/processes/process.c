@@ -15369,8 +15369,8 @@ static int ipc_sysctl_more(void) {
     int made = reaped(maker);
     printf(" made=%d orphan-kept=%ld", made, ksys_exists(orphan));
     /* Setting it removes the orphans no mapping shows. Each call is its
-       own statement: the order of a call's arguments is unspecified, and
-       gcc took the checks before the write. */
+       own statement, as the order of a call's arguments is unspecified:
+       the checks must come after the write. */
     long set = ksys_write("shm_rmid_forced", "1");
     long orphan_now = ksys_exists(orphan);
     long own_now = ksys_exists(own);
@@ -15621,7 +15621,10 @@ static int kernel_sysctl_case(void) {
         if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
         errno = 0;
         long n = held < 0 ? 0 : write(held, "2", 1);
-        printf("held-write: write=%ld\n", n < 0 ? -errno : n);
+        long written = n < 0 ? -errno : n;
+        errno = 0;
+        n = held < 0 ? 0 : pwrite(held, "2", 1, 0);
+        printf("held-write: write=%ld pwrite=%ld\n", written, n < 0 ? -errno : n);
         fflush(stdout);
         _exit(0);
     }

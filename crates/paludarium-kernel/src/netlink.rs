@@ -264,7 +264,7 @@ const IFLA_TAILROOM: u16 = 69;
 /// What a link dump takes besides `IFLA_EXT_MASK`: a master to show the
 /// devices of, a kind (whose devices `lo` is none of, but the kinds there
 /// are depend on the modules loaded, so it is taken without effect), and
-/// another namespace's ID, of which none is given.
+/// the ID of a namespace whose link to show ([`nsid::target`]).
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_TARGET_NETNSID: u16 = 46;

@@ -15184,9 +15184,13 @@ static int ipc_sysctl_more(void) {
     if (read(ids[0], &orphan, sizeof orphan) != sizeof orphan) return 12;
     int made = reaped(maker);
     printf(" made=%d orphan-kept=%ld", made, ksys_exists(orphan));
-    /* Setting it removes the orphans no mapping shows. */
-    printf(" set=%ld orphan=%ld own=%ld", ksys_write("shm_rmid_forced", "1"), ksys_exists(orphan),
-           ksys_exists(own));
+    /* Setting it removes the orphans no mapping shows. Each call is its
+       own statement: the order of a call's arguments is unspecified, and
+       gcc took the checks before the write. */
+    long set = ksys_write("shm_rmid_forced", "1");
+    long orphan_now = ksys_exists(orphan);
+    long own_now = ksys_exists(own);
+    printf(" set=%ld orphan=%ld own=%ld", set, orphan_now, own_now);
     /* Set, a segment goes at its last detach. */
     int detached = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
     void *at = (void *)syscall(SYS_shmat, detached, 0, 0);
@@ -15233,7 +15237,11 @@ static int ipc_sysctl_more(void) {
         if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
         errno = 0;
         long n = write((int)held, "100", 3);
-        printf("held-write: open=%d write=%ld", held >= 0, n < 0 ? -errno : n);
+        long written = n < 0 ? -errno : n;
+        errno = 0;
+        n = pwrite((int)held, "100", 3, 0);
+        long positioned = n < 0 ? -errno : n;
+        printf("held-write: open=%d write=%ld pwrite=%ld", held >= 0, written, positioned);
         ksys_show("msgmax");
         printf("\n");
         fflush(stdout);

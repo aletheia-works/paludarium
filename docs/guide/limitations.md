@@ -466,11 +466,10 @@ verified.
     little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
-  - The files of `/proc/sys` check their writer again at a write through
-    `write`, `writev`, aio or `sendfile`, but a positioned write (`pwrite64`,
-    `pwritev` at an offset) only as they were opened, where Linux checks
-    every write; and each reports its value's length as its size, where
-    Linux reports 0.
+  - The files of `/proc/sys` check their writer again at each write but one
+    through `copy_file_range`, which they check only as they were opened,
+    where Linux checks every write; and each reports its value's length as
+    its size, where Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,

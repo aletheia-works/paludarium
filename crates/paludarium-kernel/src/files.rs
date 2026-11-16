@@ -2215,13 +2215,22 @@ fn read_at(file: &Arc<dyn FileHandle>, offset: u64, b: &mut [u8]) -> Result<usiz
         result => result,
     }
 }
-/// A positioned write, falling back like [`read_at`].
-fn write_at(file: &Arc<dyn FileHandle>, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+/// A positioned write by `writer`, falling back like [`read_at`]; a sysctl
+/// checks its writer again there ([`crate::sysctl::write_as`]), and with
+/// none (`copy_file_range`) only as it was opened.
+pub(crate) fn write_at(
+    file: &Arc<dyn FileHandle>,
+    offset: u64,
+    b: &[u8],
+    writer: Option<&crate::credentials::Credentials>,
+) -> Result<usize, Errno> {
     match file.write_at(offset, b) {
         Err(e) if e == Errno::ENODEV => {
             let position = file.seek(0, 1)?;
             file.seek(offset as i64, 0)?;
-            let result = file.write(b);
+            let result = writer
+                .and_then(|writer| crate::sysctl::write_as(file, b, writer))
+                .unwrap_or_else(|| file.write(b));
             file.seek(position as i64, 0)?;
             result
         }
@@ -2280,13 +2289,18 @@ fn size_limited_by(
 /// writes as [`write_at`] does if it has no position to append at (a
 /// device); a regular file of such a kind gives `EOPNOTSUPP` rather than
 /// append.
-fn write_at_unappended(file: &Arc<dyn FileHandle>, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+fn write_at_unappended(
+    file: &Arc<dyn FileHandle>,
+    offset: u64,
+    b: &[u8],
+    writer: Option<&crate::credentials::Credentials>,
+) -> Result<usize, Errno> {
     match file.write_at_unappended(offset, b) {
         Err(e) if e == Errno::ENODEV => {
             if file.stat()?.mode & S_IFMT == S_IFREG {
                 return Err(Errno::EOPNOTSUPP);
             }
-            write_at(file, offset, b)
+            write_at(file, offset, b, writer)
         }
         result => result,
     }
@@ -2345,7 +2359,7 @@ fn copy_bytes(
     while done < count {
         let want = usize::try_from(count - done).map_or(piece.len(), |n| n.min(piece.len()));
         let copied = read_at(input, from + done, &mut piece[..want])
-            .and_then(|read| Ok((read, write_at(output, to + done, &piece[..read])?)));
+            .and_then(|read| Ok((read, write_at(output, to + done, &piece[..read], None)?)));
         let (read, written) = match copied {
             Ok(counts) => counts,
             Err(_) if done > 0 => break,
@@ -3057,10 +3071,10 @@ fn aio_write(
     let start = appending(file, flags)?.unwrap_or(offset);
     let written = if unappended(file, flags) {
         let len = size_limited_from(c, file, start, bytes.len())?;
-        write_at_unappended(file, start, &bytes[..len])?
+        write_at_unappended(file, start, &bytes[..len], Some(&c.process.credentials))?
     } else {
         let len = size_limited(c, file, Some(start), bytes.len())?;
-        write_at(file, start, &bytes[..len])?
+        write_at(file, start, &bytes[..len], Some(&c.process.credentials))?
     };
     if written > 0 {
         crate::permissions::remove_set_ids(&c.process.credentials, &**file);
@@ -3227,7 +3241,8 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
         if unappended(&file, flags) && file.stat()?.mode & S_IFMT == S_IFREG {
             let position = file.seek(0, 1)?;
             let len = size_limited_from(c, &file, position, bytes.len())?;
-            let written = write_at_unappended(&file, position, &bytes[..len])?;
+            let written =
+                write_at_unappended(&file, position, &bytes[..len], Some(&c.process.credentials))?;
             file.seek((position + written as u64) as i64, 0)?;
             if written > 0 {
                 crate::permissions::remove_set_ids(&c.process.credentials, &*file);
@@ -3299,9 +3314,9 @@ fn positioned_vector(
     }
     b.truncate(len);
     let written = if unappended(&file, flags) {
-        write_at_unappended(&file, offset, &b)?
+        write_at_unappended(&file, offset, &b, Some(&c.process.credentials))?
     } else {
-        write_at(&file, offset, &b)?
+        write_at(&file, offset, &b, Some(&c.process.credentials))?
     };
     if written > 0 {
         crate::permissions::remove_set_ids(&c.process.credentials, &*file);
@@ -4355,7 +4370,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.mem
                 .read(GuestAddr(a[1]), &mut b)
                 .map_err(|_| Errno::EFAULT)?;
-            let written = write_at(&file, a[3], &b)?;
+            let written = write_at(&file, a[3], &b, Some(&c.process.credentials))?;
             if written > 0 {
                 crate::permissions::remove_set_ids(&c.process.credentials, &*file);
             }

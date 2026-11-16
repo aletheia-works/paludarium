@@ -47,9 +47,9 @@
 //! it; a write elsewhere is taken and does nothing, as
 //! `sysctl_writes_strict` has it. A file's mode is 0644, and only the root
 //! of the user namespace that owns the IPC namespace may open it to write
-//! (`mq_permissions`, `EACCES`). A write through `write`, `writev`, aio or
-//! `sendfile` asks the writer again, as Linux's `proc_sys_call_handler`
-//! does (`EPERM`) ([`write`]).
+//! (`mq_permissions`, `EACCES`). A write asks the writer again, as Linux's
+//! `proc_sys_call_handler` does (`EPERM`) ([`write`], [`write_as`]), but
+//! one through `copy_file_range`, which has no writer to ask.
 use crate::ipc::IPCMNI;
 use crate::mqueue::{HARD_MSGMAX, HARD_MSGSIZEMAX, Limits, Queues};
 use crate::namespaces::Namespace;
@@ -656,12 +656,19 @@ pub(crate) fn write(
     file: &Arc<dyn FileHandle>,
     buf: &[u8],
 ) -> Option<Result<u64, Errno>> {
+    Some(write_as(file, buf, &c.process.credentials)?.map(|n| n as u64))
+}
+
+/// A write of an open sysctl file by `writer`, checked again as [`write`]
+/// checks the calling thread; a positioned write (`pwrite64`, `pwritev`,
+/// `splice`) comes this way, at the position it moved the file to.
+pub(crate) fn write_as(
+    file: &Arc<dyn FileHandle>,
+    buf: &[u8],
+    writer: &crate::credentials::Credentials,
+) -> Option<Result<usize, Errno>> {
     let setting = file.as_any()?.downcast_ref::<SettingFile>()?;
-    Some(
-        setting
-            .write_by(buf, Some(&c.process.credentials))
-            .map(|n| n as u64),
-    )
+    Some(setting.write_by(buf, Some(writer)))
 }
 
 /// What an open sysctl file shows.

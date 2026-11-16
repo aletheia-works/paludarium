@@ -361,7 +361,6 @@ fn file_pages(
     }
 }
 
-/// Address of the program headers in guest memory (`AT_PHDR`).
 /// `start_code` and `end_code` of the program loaded at `base`: the lowest
 /// `p_vaddr` and the highest `p_vaddr + p_filesz` of its `PT_LOAD` segments
 /// with `PF_X`, moved by `base`, as Linux's `load_elf_binary` computes them
@@ -377,6 +376,7 @@ fn code_range(info: &ElfInfo, base: u64) -> (u64, u64) {
     (start.wrapping_add(base), end.wrapping_add(base))
 }
 
+/// Address of the program headers in guest memory (`AT_PHDR`).
 fn phdr_address(info: &ElfInfo, base: u64) -> u64 {
     if let Some(h) = info.headers.iter().find(|h| h.kind == elf::PT_PHDR) {
         return base.wrapping_add(h.vaddr);

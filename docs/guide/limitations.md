@@ -489,12 +489,6 @@ verified.
     little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
-  - The files of `/proc/sys` share one inode number and report their
-    value's length as their size, where Linux gives each its own inode and
-    a size of 0. So `copy_file_range` from one of them into another is
-    `EINVAL`, as for an overlapping copy within one file, where Linux copies
-    nothing and returns 0. From another filesystem it is `EXDEV`, as on
-    Linux, so it never writes one.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,

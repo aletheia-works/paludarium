@@ -2185,6 +2185,7 @@ fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file.as_any().is_some_and(|file| {
         file.is::<crate::proc::MapsFile>()
             || file.is::<crate::proc::PagemapFile>()
+            || crate::sysctl::is_file(file)
             || file
                 .downcast_ref::<crate::proc::GeneratedFile>()
                 .is_some_and(crate::proc::GeneratedFile::is_entry)

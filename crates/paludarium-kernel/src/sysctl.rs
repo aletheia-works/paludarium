@@ -48,8 +48,10 @@
 //! `sysctl_writes_strict` has it. A file's mode is 0644, and only the root
 //! of the user namespace that owns the IPC namespace may open it to write
 //! (`mq_permissions`, `EACCES`). A write asks the writer again, as Linux's
-//! `proc_sys_call_handler` does (`EPERM`) ([`write`], [`write_as`]), but
-//! one through `copy_file_range`, which has no writer to ask.
+//! `proc_sys_call_handler` does (`EPERM`) ([`write`], [`write_as`]). Each
+//! file has an inode of its own and a size of 0 ([`stat`]), so, as on
+//! Linux, `copy_file_range` never writes one: from another filesystem it is
+//! `EXDEV`, and from a sysctl it copies nothing.
 use crate::ipc::IPCMNI;
 use crate::mqueue::{HARD_MSGMAX, HARD_MSGSIZEMAX, Limits, Queues};
 use crate::namespaces::Namespace;
@@ -642,10 +644,35 @@ fn fanotify_line(limits: &crate::fanotify::Limits, file: Fanotify) -> Vec<u8> {
     }
 }
 
+/// The status of `entry`, as Linux's `proc_sys_make_inode` gives it: an
+/// inode of its own ([`inode`]), and for a file a size of 0, whatever its
+/// value's length, so that `copy_file_range` from it copies nothing.
+pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
+    let mut stat = shown(c, entry);
+    stat.inode = inode(entry);
+    if stat.mode & 0o170_000 == 0o100_000 {
+        stat.size = 0;
+    }
+    stat
+}
+
+/// An inode number for `entry`, the same at each `stat` and another for
+/// each entry: Linux numbers each sysctl's inode as it makes it
+/// (`get_next_ino`), so only that it is its own is compared. An FNV-1a
+/// hash of the entry, kept to 32 bits and above the small numbers.
+fn inode(entry: Entry) -> u64 {
+    let hash = format!("{entry:?}")
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    (hash % 0xffff_0000) + 0x1_0000
+}
+
 /// The status of `entry`: a directory anyone may read and search, a
 /// regular file of mode 0644, its owner's root's, or an aio file, root's,
 /// 0644 or for `aio-nr` 0444.
-pub(crate) fn stat(c: &Context<'_>, entry: Entry) -> FileStat {
+fn shown(c: &Context<'_>, entry: Entry) -> FileStat {
     match entry {
         Entry::Directory(directory) if directory.net() => {
             let (uid, gid) = net_owner(c);
@@ -1079,6 +1106,12 @@ impl Value {
             }
         }
     }
+}
+
+/// Whether `file` is an open file of `/proc/sys`, whose size of 0 does not
+/// bound what a read gives ([`stat`]).
+pub(crate) fn is_file(file: &dyn std::any::Any) -> bool {
+    file.is::<SettingFile>()
 }
 
 /// An open file of `/proc/sys`.

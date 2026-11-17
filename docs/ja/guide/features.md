@@ -2494,7 +2494,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   名前空間の POSIX メッセージキューの上限があります。`queues_max`、`msg_max` と
   `msg_default`（1〜65536）、`msgsize_max` と `msgsize_default`（128〜16 MiB）です。
   モード 0644 の通常ファイルで、IPC 名前空間を持つユーザー名前空間の root のもので、
-  書くために開けるのもその root だけです（`EACCES`）。読むと、先頭から値と改行を返し、
+  書くために開けるのもその root だけです（`EACCES`）。`/proc/sys` のファイルは、Linux の
+  `proc_sys_make_inode` と同じく、それぞれ自分の inode を持ち、サイズは 0 です。そのため、
+  別の sysctl からの `copy_file_range` は何も写さず、ほかのファイルシステムからは `EXDEV`
+  です。読むと、先頭から値と改行を返し、
   その先では何も返しません。先頭への書き込みは、Linux の `proc_dointvec_minmax` と同じく
   `int` を 1 つ読んで値にします。空白、あってもよい `-`、10 進の数字（`0x` の後は 16 進、
   `0` の後は 8 進）、その後に空白・タブ・改行か終わりです。読んだ分（値の後の空白も含みます）を

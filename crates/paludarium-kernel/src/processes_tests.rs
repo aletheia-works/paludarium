@@ -4612,11 +4612,12 @@ mod shm {
         );
     }
 
-    /// `copy_file_range` into a sysctl from another filesystem is `EXDEV`,
-    /// as Linux's `generic_copy_file_checks` gives it (proc has no
-    /// `copy_file_range`), so it never reaches the sysctl's handler.
+    /// `copy_file_range` into a sysctl never reaches its handler, as on
+    /// Linux: from another filesystem it is `EXDEV`
+    /// (`generic_copy_file_checks`; proc has no `copy_file_range`), and from
+    /// another sysctl, whose size is 0, it copies nothing.
     #[test]
-    fn copy_file_range_into_a_sysctl_from_elsewhere_is_exdev() {
+    fn copy_file_range_never_writes_a_sysctl() {
         let (mut k, mut t, m) = setup();
         const PATH: u64 = DATA + 0x900;
         m.write(GuestAddr(PATH), b"/proc/sys/kernel/msgmnb\0")
@@ -4631,10 +4632,30 @@ mod shm {
             syscall(&mut k, &mut t, &m, 326, [memfd, 0, target, 0, 4, 0]),
             e(Errno(18))
         );
+        // From another sysctl: its size of 0 copies nothing, as on Linux.
+        m.write(GuestAddr(PATH), b"/proc/sys/kernel/msgmax\0")
+            .unwrap();
+        let source = syscall(&mut k, &mut t, &m, 2, [PATH, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 326, [source, 0, target, 0, 16, 0]),
+            0
+        );
         assert_eq!(
             read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/msgmnb"),
             "16384\n"
         );
+        // Each has an inode of its own and a size of 0.
+        let stat = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, fd: u64| {
+            assert_eq!(syscall(k, t, m, 5, [fd, DATA + 0x800, 0, 0, 0, 0]), 0);
+            (
+                m.read_u64(GuestAddr(DATA + 0x808)).unwrap(),
+                m.read_u64(GuestAddr(DATA + 0x830)).unwrap(),
+            )
+        };
+        let (source_inode, source_size) = stat(&mut k, &mut t, &m, source);
+        let (target_inode, target_size) = stat(&mut k, &mut t, &m, target);
+        assert_ne!(source_inode, target_inode);
+        assert_eq!((source_size, target_size), (0, 0));
     }
 
     #[test]

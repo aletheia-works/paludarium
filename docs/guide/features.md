@@ -2878,7 +2878,10 @@ kernel.
   `msg_max` and `msg_default` (1 to 65536), `msgsize_max` and
   `msgsize_default` (128 to 16 MiB), regular files of mode 0644 that the
   root of the user namespace owning the IPC namespace owns, and only that
-  root may open to write (`EACCES`). A read gives the value and a newline
+  root may open to write (`EACCES`). Each file of `/proc/sys` has an inode
+  of its own and a size of 0, as Linux's `proc_sys_make_inode` makes it,
+  so `copy_file_range` into one copies nothing from another sysctl and is
+  `EXDEV` from another filesystem. A read gives the value and a newline
   from the start, and nothing past it. A write at the start sets the value
   as Linux's `proc_dointvec_minmax` reads one `int`: spaces, an optional
   `-` and digits in base 10, or 16 after `0x`, or 8 after `0`, then a

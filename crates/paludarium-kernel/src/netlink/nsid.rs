@@ -155,8 +155,10 @@ impl Drop for Resolved {
 /// `RTM_NEWNSID` and `RTM_GETNSID` request of `bytes` names by
 /// `NETNSA_PID` (`get_net_ns_by_pid`) or `NETNSA_FD` (`get_net_ns_by_fd`),
 /// and each `RTM_NEWLINK` and `RTM_SETLINK` by `IFLA_NET_NS_PID` or
-/// `IFLA_NET_NS_FD`, for the kernel to take as it reaches them; finding
-/// one changes nothing.
+/// `IFLA_NET_NS_FD`, an `RTM_NEWLINK` also inside `IFLA_LINKINFO`'s
+/// `IFLA_INFO_DATA`'s `VETH_INFO_PEER` (whatever the kind; the caller of
+/// [`peer_target`] checks it), for the kernel to take as it reaches them;
+/// finding one changes nothing.
 /// A `write` finds them as its caller sees them too ([`super::write`]),
 /// as Linux looks in `current`'s. `addressed` is whether the send names
 /// an address, as a `write` does not.

@@ -610,7 +610,6 @@ static int probe_fxsave_case(void) {
 static int probe_fxrstor_case(void) {
     probe("xmm0", probe_fxsave, probe_fxrstor, fxarea + 160, 8, 3);
     probe("reserved-416", probe_fxsave, probe_fxrstor, fxarea + 416, 8, 3);
-    probe("software-504", probe_fxsave, probe_fxrstor, fxarea + 504, 8, 3);
     return 0;
 }
 

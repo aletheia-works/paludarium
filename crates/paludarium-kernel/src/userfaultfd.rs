@@ -27,18 +27,23 @@
 //! space, into a registered range that has none, as Linux's `move_pages`
 //! does ([`paludarium_mmu::MemoryView::userfault_move`]).
 //!
-//! Not offered: the minor mode and `UFFDIO_CONTINUE`; the write
-//! protection of shared memory and of pages with no entry
-//! (`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`, `UFFD_FEATURE_WP_UNPOPULATED`,
-//! `UFFD_FEATURE_WP_ASYNC`); and the events of `fork`, `mremap`,
-//! `madvise` and `munmap`. `UFFDIO_API` does not report their features,
-//! which it refuses (`EINVAL`), and `UFFDIO_REGISTER` refuses the minor
-//! mode and the write-protect mode of shared memory (`EINVAL`).
+//! The minor mode registers shmem (shared memory, a memfd): an access to
+//! a page its page cache has but the mapping has no entry for waits, as
+//! Linux's `shmem_get_folio_gfp` gives `handle_userfault` with
+//! `VM_UFFD_MINOR`, until `UFFDIO_CONTINUE` maps the page.
+//!
+//! Not offered: the write protection of shared memory and of pages with
+//! no entry (`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
+//! `UFFD_FEATURE_WP_UNPOPULATED`, `UFFD_FEATURE_WP_ASYNC`); and the events
+//! of `fork`, `mremap`, `madvise` and `munmap`. `UFFDIO_API` does not
+//! report their features, which it refuses (`EINVAL`), and
+//! `UFFDIO_REGISTER` refuses the write-protect mode of shared memory
+//! (`EINVAL`).
 
 use crate::events::{IN, ReadinessHub};
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
-use paludarium_mmu::MemoryView;
+use paludarium_mmu::{MemoryView, UserfaultReason};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -70,6 +75,10 @@ const FEATURE_MISSING_SHMEM: u64 = 1 << 5;
 const FEATURE_SIGBUS: u64 = 1 << 7;
 /// `UFFD_FEATURE_THREAD_ID`: a fault's message names its thread.
 const FEATURE_THREAD_ID: u64 = 1 << 8;
+/// `UFFD_FEATURE_MINOR_HUGETLBFS` and `UFFD_FEATURE_MINOR_SHMEM`: the minor
+/// mode is there, which works whether a context asked for them or not.
+const FEATURE_MINOR_HUGETLBFS: u64 = 1 << 9;
+const FEATURE_MINOR_SHMEM: u64 = 1 << 10;
 /// `UFFD_FEATURE_EXACT_ADDRESS`: a fault's message has the address
 /// itself, not its page's.
 const FEATURE_EXACT_ADDRESS: u64 = 1 << 11;
@@ -87,6 +96,8 @@ const FEATURES: u64 = FEATURE_PAGEFAULT_FLAG_WP
     | FEATURE_MISSING_SHMEM
     | FEATURE_SIGBUS
     | FEATURE_THREAD_ID
+    | FEATURE_MINOR_HUGETLBFS
+    | FEATURE_MINOR_SHMEM
     | FEATURE_EXACT_ADDRESS
     | FEATURE_POISON
     | FEATURE_MOVE;
@@ -103,6 +114,9 @@ const API_IOCTLS: u64 = 1 << 0 | 1 << 1 | 1 << 0x3f;
 const RANGE_IOCTLS: u64 = 1 << 2 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 8;
 /// `UFFDIO_WRITEPROTECT`, by its number.
 const WRITEPROTECT_IOCTL: u64 = 1 << 6;
+/// `UFFDIO_CONTINUE`, by its number, for a range registered for minor
+/// faults.
+const CONTINUE_IOCTL: u64 = 1 << 7;
 
 const UFFDIO_API: u32 = 0xc018_aa3f;
 const UFFDIO_REGISTER: u32 = 0xc020_aa00;
@@ -113,9 +127,12 @@ const UFFDIO_ZEROPAGE: u32 = 0xc020_aa04;
 const UFFDIO_MOVE: u32 = 0xc028_aa05;
 const UFFDIO_WRITEPROTECT: u32 = 0xc018_aa06;
 const UFFDIO_POISON: u32 = 0xc020_aa08;
+const UFFDIO_CONTINUE: u32 = 0xc020_aa07;
 
 /// `UFFDIO_REGISTER_MODE_WP`.
 const MODE_WP: u64 = 2;
+/// `UFFDIO_REGISTER_MODE_MINOR`.
+const MODE_MINOR: u64 = 4;
 /// `UFFDIO_REGISTER_MODE_MISSING`, `_WP` and `_MINOR`.
 const MODES: u64 = 7;
 /// `UFFDIO_COPY_MODE_DONTWAKE`, which `UFFDIO_ZEROPAGE` and
@@ -136,6 +153,8 @@ const EVENT_PAGEFAULT: u8 = 0x12;
 const PAGEFAULT_FLAG_WRITE: u64 = 1;
 /// `UFFD_PAGEFAULT_FLAG_WP`: the page was write-protected.
 const PAGEFAULT_FLAG_WP: u64 = 2;
+/// `UFFD_PAGEFAULT_FLAG_MINOR`: the page cache has the page.
+const PAGEFAULT_FLAG_MINOR: u64 = 4;
 /// The size of a `uffd_msg`.
 const MESSAGE: usize = 32;
 
@@ -261,7 +280,7 @@ impl Userfaultfd {
         format!(
             "pending:\t{pending}\ntotal:\t{total}\nAPI:\t{API:x}:{:x}:{:x}\n",
             self.features.load(Ordering::SeqCst),
-            API_IOCTLS | RANGE_IOCTLS | WRITEPROTECT_IOCTL
+            API_IOCTLS | RANGE_IOCTLS | WRITEPROTECT_IOCTL | CONTINUE_IOCTL
         )
         .into_bytes()
     }
@@ -341,8 +360,8 @@ pub(crate) struct Access {
     pub(crate) address: u64,
     pub(crate) write: bool,
     pub(crate) fetch: bool,
-    /// A write to a write-protected page, not an access to a missing one.
-    pub(crate) protected: bool,
+    /// Why it waits.
+    pub(crate) reason: UserfaultReason,
 }
 
 impl Access {
@@ -351,7 +370,7 @@ impl Access {
     fn faults(&self, c: &Context<'_>, id: u64) -> bool {
         c.mem
             .userfault_for(GuestAddr(self.address), self.write, self.fetch)
-            == Some((id, self.protected))
+            == Some((id, self.reason))
     }
 }
 
@@ -390,10 +409,10 @@ pub(crate) fn fault(c: &mut Context<'_>, id: u64, access: Access) -> Option<bool
             PAGEFAULT_FLAG_WRITE
         } else {
             0
-        } | if access.protected {
-            PAGEFAULT_FLAG_WP
-        } else {
-            0
+        } | match access.reason {
+            UserfaultReason::Missing => 0,
+            UserfaultReason::Minor => PAGEFAULT_FLAG_MINOR,
+            UserfaultReason::Protected => PAGEFAULT_FLAG_WP,
         },
         thread,
         woken: AtomicBool::new(false),
@@ -543,6 +562,7 @@ pub(crate) fn ioctl(
         UFFDIO_COPY => fill(c, &context, arg, Fill::Copy),
         UFFDIO_ZEROPAGE => fill(c, &context, arg, Fill::Zeros),
         UFFDIO_POISON => fill(c, &context, arg, Fill::Poison),
+        UFFDIO_CONTINUE => fill(c, &context, arg, Fill::Continue),
         UFFDIO_MOVE => move_pages(c, &context, arg),
         UFFDIO_WRITEPROTECT => write_protect(c, &context, arg),
         _ => Err(Errno::EINVAL),
@@ -639,10 +659,10 @@ fn api(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64, Errn
 
 /// `UFFDIO_REGISTER` (`userfaultfd_register`): modes it knows, a range
 /// ([`validate`]), then the space's checks
-/// ([`paludarium_mmu::MemoryView::userfault_register`]), which refuse the
-/// minor mode; once registered, the ioctls of the range are written back
-/// (`EFAULT`), `UFFDIO_WRITEPROTECT` among them with the write-protect
-/// mode.
+/// ([`paludarium_mmu::MemoryView::userfault_register`]), which take the
+/// minor mode for shmem only; once registered, the ioctls of the range are
+/// written back (`EFAULT`), `UFFDIO_WRITEPROTECT` among them with the
+/// write-protect mode and `UFFDIO_CONTINUE` with the minor mode.
 fn register(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64, Errno> {
     let [start, len, mode] = words::<3>(c, arg)?;
     if mode == 0 || mode & !MODES != 0 {
@@ -652,11 +672,13 @@ fn register(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64,
     context
         .memory
         .userfault_register(start, start + len, context.id, mode as u8)?;
-    let ioctls = if mode & MODE_WP != 0 {
-        RANGE_IOCTLS | WRITEPROTECT_IOCTL
-    } else {
-        RANGE_IOCTLS
-    };
+    let mut ioctls = RANGE_IOCTLS;
+    if mode & MODE_WP != 0 {
+        ioctls |= WRITEPROTECT_IOCTL;
+    }
+    if mode & MODE_MINOR != 0 {
+        ioctls |= CONTINUE_IOCTL;
+    }
     put_word(c, arg + 24, ioctls)?;
     Ok(0)
 }
@@ -717,14 +739,19 @@ enum Fill {
     Zeros,
     /// `UFFDIO_POISON`: poison ([`paludarium_mmu::MemoryView::userfault_poison`]).
     Poison,
+    /// `UFFDIO_CONTINUE`: the page cache's page
+    /// ([`paludarium_mmu::MemoryView::userfault_continue`]).
+    Continue,
 }
 
-/// `UFFDIO_COPY`, `UFFDIO_ZEROPAGE` or `UFFDIO_POISON` (`kind`), as Linux's
-/// `userfaultfd_copy`, `userfaultfd_zeropage`, `userfaultfd_poison` and
-/// `mfill_atomic` have them: page by page until one fails, which is the
-/// error if it is the first; the bytes filled, or the error, are written to
-/// the struct's last field (`EFAULT`), then the waits for them end unless
-/// `DONTWAKE`, and a fill that stopped short is `EAGAIN`.
+/// `UFFDIO_COPY`, `UFFDIO_ZEROPAGE`, `UFFDIO_POISON` or `UFFDIO_CONTINUE`
+/// (`kind`), as Linux's `userfaultfd_copy`, `userfaultfd_zeropage`,
+/// `userfaultfd_poison`, `userfaultfd_continue` and `mfill_atomic` have
+/// them: page by page until one fails, which is the error if it is the
+/// first; the bytes filled, or the error, are written to the struct's last
+/// field (`EFAULT`), then the waits for them end unless `DONTWAKE`, and a
+/// fill that stopped short is `EAGAIN`. `UFFDIO_CONTINUE_MODE_WP` needs
+/// the write-protect mode, as `UFFDIO_COPY_MODE_WP` does.
 fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Result<u64, Errno> {
     let copy = kind == Fill::Copy;
     let (dst, src, len, mode, result_at) = if copy {
@@ -738,7 +765,12 @@ fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Res
     } else {
         let [dst, len, mode] = words::<3>(c, arg)?;
         validate(dst, len)?;
-        if mode & !DONTWAKE != 0 {
+        let modes = if kind == Fill::Continue {
+            DONTWAKE | COPY_MODE_WP
+        } else {
+            DONTWAKE
+        };
+        if mode & !modes != 0 {
             return Err(Errno::EINVAL);
         }
         (dst, 0, len, mode, arg + 24)
@@ -773,10 +805,12 @@ fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Res
         } else {
             None
         };
-        let done = if kind == Fill::Poison {
-            memory.userfault_poison(dst, end, dst + filled)
-        } else {
-            memory.userfault_fill(dst, end, dst + filled, bytes, mode & COPY_MODE_WP != 0)
+        let done = match kind {
+            Fill::Poison => memory.userfault_poison(dst, end, dst + filled),
+            Fill::Continue => memory.userfault_continue(dst, end, dst + filled),
+            Fill::Copy | Fill::Zeros => {
+                memory.userfault_fill(dst, end, dst + filled, bytes, mode & COPY_MODE_WP != 0)
+            }
         };
         match done {
             Ok(()) => filled += PAGE,

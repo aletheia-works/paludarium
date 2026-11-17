@@ -33,9 +33,12 @@ use crate::syscalls::{Context, Outcome};
 
 mod context;
 pub(crate) use context::{FsContext, sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick};
+mod listing;
+pub(crate) use listing::{sys_listmount, sys_statmount};
 
 const CAP_SYS_ADMIN: u64 = 1 << 21;
 const EBUSY: Errno = Errno(16);
+const E2BIG: Errno = Errno(7);
 const ENODEV: Errno = Errno(19);
 const PAGE: u64 = 4096;
 const PATH_MAX: u64 = 4096;
@@ -93,6 +96,247 @@ pub(crate) fn sys_open_tree(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 pub(crate) fn sys_move_mount(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     outcome(move_mount_call(c, a))
+}
+pub(crate) fn sys_mount_setattr(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(mount_setattr(c, a))
+}
+pub(crate) fn sys_open_tree_attr(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    outcome(open_tree_attr(c, a))
+}
+
+const MOUNT_ATTR_RDONLY: u64 = 0x01;
+const MOUNT_ATTR_NOSUID: u64 = 0x02;
+const MOUNT_ATTR_NODEV: u64 = 0x04;
+const MOUNT_ATTR_NOEXEC: u64 = 0x08;
+const MOUNT_ATTR_ATIME: u64 = 0x70;
+const MOUNT_ATTR_NOATIME: u64 = 0x10;
+const MOUNT_ATTR_STRICTATIME: u64 = 0x20;
+const MOUNT_ATTR_NODIRATIME: u64 = 0x80;
+const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
+const MOUNT_ATTR_NOSYMFOLLOW: u64 = 0x0020_0000;
+/// `MOUNT_SETATTR_VALID_FLAGS`.
+const MOUNT_SETATTR_VALID: u64 = MOUNT_ATTR_RDONLY
+    | MOUNT_ATTR_NOSUID
+    | MOUNT_ATTR_NODEV
+    | MOUNT_ATTR_NOEXEC
+    | MOUNT_ATTR_ATIME
+    | MOUNT_ATTR_NODIRATIME
+    | MOUNT_ATTR_IDMAP
+    | MOUNT_ATTR_NOSYMFOLLOW;
+/// `MOUNT_ATTR_SIZE_VER0`: `struct mount_attr`'s `attr_set`, `attr_clr`,
+/// `propagation` and `userns_fd`.
+const MOUNT_ATTR_SIZE: u64 = 32;
+
+/// What `mount_setattr` changes (`struct mount_kattr`).
+struct Change {
+    set: u32,
+    clear: u32,
+    propagation: Option<Propagation>,
+    recurse: bool,
+}
+
+/// `attr_flags_to_mnt_flags`: the mount flags of the attributes.
+fn attr_mount_flags(attrs: u64) -> u32 {
+    let mut out = 0;
+    for (attr, flag) in [
+        (MOUNT_ATTR_RDONLY, mnt::READONLY),
+        (MOUNT_ATTR_NOSUID, mnt::NOSUID),
+        (MOUNT_ATTR_NODEV, mnt::NODEV),
+        (MOUNT_ATTR_NOEXEC, mnt::NOEXEC),
+        (MOUNT_ATTR_NODIRATIME, mnt::NODIRATIME),
+        (MOUNT_ATTR_NOSYMFOLLOW, mnt::NOSYMFOLLOW),
+    ] {
+        if attrs & attr != 0 {
+            out |= flag;
+        }
+    }
+    out
+}
+
+/// `wants_mount_setattr` and `build_mount_kattr`: a `struct mount_attr` of
+/// `size` bytes at `ptr` (`E2BIG` beyond a page, `EINVAL` under 32 bytes),
+/// `CAP_SYS_ADMIN` over the caller's mount namespace (`EPERM`), its copy
+/// (`EFAULT`, `E2BIG` for bytes past it that are not 0), none for one that
+/// changes nothing; then one propagation type at most and known attributes
+/// (`EINVAL`), the access-time setting only with all of
+/// `MOUNT_ATTR__ATIME` cleared (`EINVAL`), and an idmapping's user
+/// namespace (`build_mount_idmapped`: `EINVAL` to clear one but from a new
+/// copy, `EBADF`, `EINVAL` for a descriptor of no user namespace, `EPERM`
+/// for the first one or one the caller does not administer). An idmapped
+/// mount is not supported (`EOPNOTSUPP`).
+fn wanted_change(
+    c: &Context<'_>,
+    ptr: u64,
+    size: u64,
+    recurse: bool,
+    fresh_copy: bool,
+) -> Result<Option<Change>, Errno> {
+    if size > PAGE {
+        return Err(E2BIG);
+    }
+    if size < MOUNT_ATTR_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let namespaces = c.group.namespaces(c.tid);
+    if !may_mount(c, &namespaces.mnt) {
+        return Err(Errno::EPERM);
+    }
+    let mut raw = vec![0u8; size as usize];
+    c.mem
+        .read(GuestAddr(ptr), &mut raw)
+        .map_err(|_| Errno::EFAULT)?;
+    if raw[MOUNT_ATTR_SIZE as usize..].iter().any(|&b| b != 0) {
+        return Err(E2BIG);
+    }
+    let word = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+    let (attr_set, attr_clr, propagation, userns_fd) = (word(0), word(1), word(2), word(3));
+    if attr_set == 0 && attr_clr == 0 && propagation == 0 {
+        return Ok(None);
+    }
+    let kinds = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
+    if propagation & !kinds != 0 || propagation.count_ones() > 1 {
+        return Err(Errno::EINVAL);
+    }
+    if (attr_set | attr_clr) & !MOUNT_SETATTR_VALID != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut set = attr_mount_flags(attr_set);
+    let mut clear = attr_mount_flags(attr_clr);
+    if attr_clr & MOUNT_ATTR_ATIME != 0 {
+        if attr_clr & MOUNT_ATTR_ATIME != MOUNT_ATTR_ATIME {
+            return Err(Errno::EINVAL);
+        }
+        clear |= mnt::RELATIME | mnt::NOATIME;
+        set |= match attr_set & MOUNT_ATTR_ATIME {
+            0 => mnt::RELATIME,
+            MOUNT_ATTR_NOATIME => mnt::NOATIME,
+            MOUNT_ATTR_STRICTATIME => 0,
+            _ => return Err(Errno::EINVAL),
+        };
+    } else if attr_set & MOUNT_ATTR_ATIME != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (attr_set | attr_clr) & MOUNT_ATTR_IDMAP != 0 {
+        if attr_clr & MOUNT_ATTR_IDMAP != 0 && !fresh_copy {
+            return Err(Errno::EINVAL);
+        }
+        if attr_set & MOUNT_ATTR_IDMAP != 0 {
+            if userns_fd > i32::MAX as u64 {
+                return Err(Errno::EINVAL);
+            }
+            let file = c.files.descriptor(userns_fd)?.file;
+            let Some(ns) = file
+                .as_any()
+                .and_then(|v| v.downcast_ref::<crate::namespaces::NamespaceFile>())
+            else {
+                return Err(Errno::EINVAL);
+            };
+            if ns.namespace.kind != crate::namespaces::Kind::User {
+                return Err(Errno::EINVAL);
+            }
+            if Arc::ptr_eq(&ns.namespace, crate::users::first()) {
+                return Err(Errno::EPERM);
+            }
+            if !c
+                .process
+                .credentials
+                .capable_in(CAP_SYS_ADMIN, &ns.namespace)
+            {
+                return Err(Errno::EPERM);
+            }
+            return Err(Errno::EOPNOTSUPP);
+        }
+    }
+    Ok(Some(Change {
+        set,
+        clear,
+        propagation: match propagation {
+            0 => None,
+            MS_SHARED => Some(Propagation::Shared),
+            MS_PRIVATE => Some(Propagation::Private),
+            MS_SLAVE => Some(Propagation::Slave),
+            _ => Some(Propagation::Unbindable),
+        },
+        recurse,
+    }))
+}
+
+/// `do_mount_setattr` at the resolved `path`: a mount's root (`EINVAL`),
+/// of the namespace or a detached tree's root (`EINVAL`), then the change
+/// ([`paludarium_vfs::NamespacedFs::set_attributes`]), where setting
+/// `MOUNT_ATTR_NOSYMFOLLOW` on any mount that has it not is not supported
+/// (`EOPNOTSUPP`).
+fn apply_change(c: &Context<'_>, path: &[u8], change: &Change) -> Result<(), Errno> {
+    let namespaced = c.files.namespaced();
+    let found = namespaced.target(path)?;
+    if !found.root {
+        return Err(Errno::EINVAL);
+    }
+    namespaced.set_attributes(
+        found.id,
+        change.recurse,
+        change.clear,
+        change.set,
+        change.propagation,
+    )
+}
+
+/// `mount_setattr(dfd, path, flags, attr, size)`, as Linux master's: the
+/// flags (`EINVAL`), then the attributes ([`wanted_change`]), which may
+/// change nothing (0 before any lookup), then the lookup, its last link
+/// followed unless `AT_SYMLINK_NOFOLLOW` (`AT_EMPTY_PATH` names `dfd`
+/// itself), then the change, of each mount below it too with
+/// `AT_RECURSIVE` ([`apply_change`]). `/proc` and `/dev`, which the kernel
+/// generates, are not supported (`EOPNOTSUPP`).
+fn mount_setattr(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let flags = a[2] & 0xffff_ffff;
+    if flags & !(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let recurse = flags & AT_RECURSIVE != 0;
+    let Some(change) = wanted_change(c, a[3], a[4], recurse, false)? else {
+        return Ok(0);
+    };
+    let empty = flags & AT_EMPTY_PATH != 0;
+    let raw = maybe_empty(c, a[1], empty)?;
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let path = crate::files::mount_at(c, a[0], raw, follow, empty)?.ok_or(Errno::EOPNOTSUPP)?;
+    apply_change(c, &path, &change)?;
+    Ok(0)
+}
+
+/// `open_tree_attr(dfd, path, flags, attr, size)`, as Linux master's:
+/// `EINVAL` for a size without an attribute pointer, then [`open_tree`],
+/// then its descriptor's mount takes the attributes as `mount_setattr`
+/// gives them (an idmapping may be cleared from a new copy); a failure
+/// takes the descriptor away again.
+fn open_tree_attr(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let flags = a[2] & 0xffff_ffff;
+    if a[3] == 0 && a[4] != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fd = open_tree(c, a[0], a[1], flags)?;
+    if a[3] == 0 {
+        return Ok(fd);
+    }
+    let applied = (|| {
+        let recurse = flags & AT_RECURSIVE != 0;
+        let fresh = flags & OPEN_TREE_CLONE != 0;
+        let Some(change) = wanted_change(c, a[3], a[4], recurse, fresh)? else {
+            return Ok(());
+        };
+        let path = c.files.descriptor(fd)?.path;
+        apply_change(c, &path, &change)
+    })();
+    if let Err(errno) = applied {
+        c.files
+            .fds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(fd as u32));
+        return Err(errno);
+    }
+    Ok(fd)
 }
 
 const AT_FDCWD: u64 = (-100i64) as u64;

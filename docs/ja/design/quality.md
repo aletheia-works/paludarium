@@ -101,7 +101,7 @@ paludarium の正しさは、「本物の x86-64 Linux と同じ結果になる�
   確かめます。CI では `wasm-browser-network.mjs` が、Chromium、Firefox、WebKit、Safari で
   ゲストに中継を通させます。
 - 毎晩、Debian の動的リンクのプログラムを、Debian のコンテナの中で本物の Linux と
-  エミュレーターの両方で動かし、終了コードと標準出力を比べます
+  エミュレーターの両方で動かし（エミュレーターではネイティブの JIT なしとありで 1 回ずつ）、終了コードと標準出力を比べます
   （`tests/guests/distro/compare.py`）。シェル（fish も含む）、awk、Perl、Python、Ruby、PHP、Lua、Tcl、
   Node.js、Go、Java、Erlang、LuaJIT、OCaml、R、Guile、SBCL、pandoc、Emacs、BusyBox、SQLite、PostgreSQL、Redis、memcached、nginx、圧縮のツール、Git、OpenSSL、GnuPG、rsync、
   make、CMake、Ninja、gcc、g++、binutils などです。シグナルとタイマー、子プロセスとスレッド、ループバックのソケット、
@@ -157,12 +157,14 @@ lock 付きの命令のフェンスを外しても、テストはすべて通り
 | いつ | 何を |
 |---|---|
 | プルリクエストごと | Linux・macOS・Windows の単体テスト、lint、依存の検査、WebAssembly のビルド、x86-64 Linux での差分テスト（ネイティブの JIT ありでも）、カバレッジ、probe・aube・ripgrep の差分テスト、4 つの WebAssembly の環境と x86-64 Linux の WebKit での受け入れのテスト（x87 のプロセスのケースを x86-64 Linux とバイト単位で比べるものを含みます）、プルリクエストの 7 つの対象のうち変更が届くもののファジング（上を参照） |
-| 毎晩 | 14 の対象のファジング、macOS と Windows での差分テスト、x86-64 Linux での Debian のプログラム、4 つの WebAssembly の環境と x86-64 Linux の WebKit での JIT ありとなし、速さの測定 |
+| 毎晩 | 14 の対象のファジング、macOS と Windows での差分テスト、x86-64 Linux での Debian のプログラム（ネイティブの JIT ありとなし）、4 つの WebAssembly の環境と x86-64 Linux の WebKit での JIT ありとなし、速さの測定 |
 | 毎日 | 定期実行のワークフローが時間どおりに始まったかを確かめます。始まらなかった、動かなかった、無効になっていたときは Issue を立てます |
 | 毎週 | 固定した nightly の Rust、workspace の `rust-version`（最新の stable の Rust）、aube と ripgrep のゲストを最新のリリースへ上げます。それぞれのプルリクエストは、検査が通ると自分でマージされます |
 | 公開の前 | 公開する同じコードで、上のすべて（下を参照） |
 
 プルリクエストと main への push では、重いジョブ（差分テスト、カバレッジ、ファジング、ゲストのプログラム、WebAssembly の検査）は、速い段階が通ってから始まります。速い段階は、lint、clippy（stable の Rust でも）、polyglot lint、Linux の単体テストで、2〜4 分です。これに落ちた head や、その間に後の push で置き換わった head は、重いジョブのランナーを使いません。速い段階の検査のうち変更が要らないもの（main への push での polyglot lint、Rust を変えないときの lint と clippy）は飛ばされます。飛ばされたことは、それを待つジョブへ伝わって、そのジョブも飛ばしてしまいます。そのため、重いジョブは速い段階のジョブ自身の結果を見ます。必須の検査の `ci-ok` は、すべてのジョブを自分で待ちます。そのため、速い段階が落ちて飛ばされたジョブがあっても `ci-ok` は通りません。そうなっていない `ci.yml` は `scripts/ci-changes.py --self-test` が拒みます。Dependency Review は、Cargo か npm のマニフェストかロックファイル、ワークフロー、ローカルのアクションを変えるプルリクエストでだけ走ります。
+
+GitHub は、ホストのランナーがどれも受け取らなかったジョブを、注記（「not acquired by Runner」）を付け、1 つのステップも動かさずに取り消します。macOS の arm64 のランナーが足りないときに起きます。そのテストは動いていないので、`ci-ok` は落ちます。CI の実行で落ちたのが、`ci-ok` のほかはこのようなジョブだけのときは、`rerun-unacquired.yml` が `gh run rerun --failed` で落ちたジョブを走らせ直します。1 つの実行につき 2 回までで、ブランチの後の実行が置き換えたときは走らせ直しません。ステップを動かして落ちたジョブは決して走らせ直さず、そのときは何も走らせ直しません。なぜ走らせ直した、または走らせ直さなかったかは、そのログに出ます。判断は `scripts/ci-rerun.py --self-test` が確かめます。
 
 ゲストのプログラムは、ビルドの前に、依存がルートの方針の `cargo deny` を通らなければ
 なりません。例外があるのは aube だけです。2 つのクレートのライセンスと、今のところ

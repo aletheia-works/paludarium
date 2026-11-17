@@ -64,6 +64,8 @@ jobs:
       - run: python3 scripts/ci-changes.py --self-test
         env:
           RUSTUP_TOOLCHAIN: stable
+      # rerun-unacquired.yml's decision, from main, after each CI run.
+      - run: python3 -B scripts/ci-rerun.py --self-test
       - id: groups
         env:
           RUSTUP_TOOLCHAIN: stable

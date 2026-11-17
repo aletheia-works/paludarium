@@ -2775,7 +2775,8 @@ static void monitor_show(int fd, unsigned ctl, const char *label) { monitor_wait
    lines that name `skip`: the address-lifetimes case's own change, which
    makes Linux check the lifetimes, and which Linux tells of before what
    that check finds, where the emulator, whose addresses run out on time,
-   told of that first. */
+   told of that first. What a wait prints goes through a pipe, which holds
+   64 KiB: far more than one change tells. */
 static void monitor_but(int fd, unsigned ctl, const char *label, const char *const skip[2]) {
     fflush(stdout);
     int pipes[2], saved = dup(1);
@@ -2793,6 +2794,7 @@ static void monitor_but(int fd, unsigned ctl, const char *label, const char *con
     text[n] = 0;
     for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n"))
         if (!strstr(line, skip[0]) && !strstr(line, skip[1])) printf("%s\n", line);
+    if (n == sizeof text - 1) printf("%s: more than %zu bytes heard\n", label, n);
 }
 /* monitor_show, waiting `wait` ms for each datagram: 0 takes only those
    already queued, as Linux tells of a neighbour's change as it is made. */
@@ -10162,6 +10164,454 @@ static int contexts_case(void) {
     return 0;
 }
 
+/* The setattrs case: mount_setattr and open_tree_attr (Linux master's) in a
+   mount namespace of a user namespace of its own: the checks of a struct
+   mount_attr, a mount's flags set and cleared with the mounts below it,
+   its propagation, and a new copy's attributes. */
+static char sa_base[] = "/tmp/paludarium-setattrs-XXXXXX";
+static void sa_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", sa_base, name); }
+static long sa_set(int dfd, const char *path, unsigned flags, const void *attr, size_t size) {
+    return syscall(442, dfd, path, flags, attr, size);
+}
+static long sa_tree(int dfd, const char *path, unsigned flags, const void *attr, size_t size) {
+    return syscall(467, dfd, path, flags, attr, size);
+}
+static int sa_inner(void) {
+    char a[256], inner[256], b[256], l[256], path[512];
+    sa_path(a, "a");
+    sa_path(b, "b");
+    sa_path(l, "l");
+    snprintf(inner, sizeof inner, "%s/in", a);
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("a", mount("none", a, "tmpfs", 0, NULL));
+    mkdir(inner, 0755);
+    RM("in", mount("none", inner, "tmpfs", 0, NULL));
+    symlink(a, l);
+    unsigned long long ro[5] = {1, 0, 0, 0, 0};
+    printf("\nchecks");
+    RM("flags", sa_set(AT_FDCWD, a, 1, ro, 32));
+    RM("small", sa_set(AT_FDCWD, a, 0, ro, 16));
+    RM("big", sa_set(AT_FDCWD, a, 0, ro, 8192));
+    unsigned long long tail[5] = {1, 0, 0, 0, 1};
+    RM("tail", sa_set(AT_FDCWD, a, 0, tail, 40));
+    unsigned long long nothing[5] = {0};
+    sa_path(path, "missing");
+    RM("nothing", sa_set(AT_FDCWD, path, 0, nothing, 32));
+    RM("missing", sa_set(AT_FDCWD, path, 0, ro, 32));
+    unsigned long long two[5] = {0, 0, MS_PRIVATE | MS_SHARED, 0, 0};
+    RM("two", sa_set(AT_FDCWD, a, 0, two, 32));
+    unsigned long long kind[5] = {0, 0, MS_RDONLY, 0, 0};
+    RM("kind", sa_set(AT_FDCWD, a, 0, kind, 32));
+    unsigned long long unknown[5] = {0x40000000, 0, 0, 0, 0};
+    RM("unknown", sa_set(AT_FDCWD, a, 0, unknown, 32));
+    unsigned long long alone[5] = {0x10, 0, 0, 0, 0};
+    RM("atime-alone", sa_set(AT_FDCWD, a, 0, alone, 32));
+    unsigned long long part[5] = {0x10, 0x10, 0, 0, 0};
+    RM("atime-part", sa_set(AT_FDCWD, a, 0, part, 32));
+    unsigned long long both[5] = {0x30, 0x70, 0, 0, 0};
+    RM("atime-both", sa_set(AT_FDCWD, a, 0, both, 32));
+    unsigned long long clr_idmap[5] = {0, 0x100000, 0, 0, 0};
+    RM("idmap-clear", sa_set(AT_FDCWD, a, 0, clr_idmap, 32));
+    unsigned long long big_fd[5] = {0x100000, 0, 0, 1ULL << 32, 0};
+    RM("idmap-fd", sa_set(AT_FDCWD, a, 0, big_fd, 32));
+    unsigned long long bad_fd[5] = {0x100000, 0, 0, 99, 0};
+    RM("idmap-badf", sa_set(AT_FDCWD, a, 0, bad_fd, 32));
+    int mntns = open("/proc/self/ns/mnt", O_RDONLY);
+    unsigned long long not_user[5] = {0x100000, 0, 0, (unsigned long long)mntns, 0};
+    RM("idmap-mnt", sa_set(AT_FDCWD, a, 0, not_user, 32));
+    close(mntns);
+    RM("not-root", sa_set(AT_FDCWD, sa_base, 0, ro, 32));
+    unsigned long long noatime[5] = {0x10, 0x70, 0, 0, 0};
+    RM("locked", sa_set(AT_FDCWD, "/", 0, noatime, 32));
+    printf("\nflags");
+    snprintf(path, sizeof path, "%s/f", a);
+    int fd = open(path, O_CREAT | O_WRONLY, 0644);
+    RM("busy", sa_set(AT_FDCWD, a, 0, ro, 32));
+    close(fd);
+    RM("ro", sa_set(AT_FDCWD, a, AT_RECURSIVE, ro, 32));
+    snprintf(path, sizeof path, "%s/x", inner);
+    RM("erofs", mkdir(path, 0755));
+    unsigned long long rw[5] = {0x10, 1 | 0x70, MS_SHARED, 0, 0};
+    RM("rw", sa_set(AT_FDCWD, a, 0, rw, 32));
+    RM("link-nofollow", sa_set(AT_FDCWD, l, AT_SYMLINK_NOFOLLOW, ro, 32));
+    unsigned long long nosuid[5] = {2, 0, 0, 0, 0};
+    RM("link", sa_set(AT_FDCWD, l, 0, nosuid, 32));
+    int at = open(a, O_PATH);
+    unsigned long long nodev[5] = {4, 0, 0, 0, 0};
+    RM("empty", sa_set(at, "", AT_EMPTY_PATH, nodev, 32));
+    RM("empty-no-flag", sa_set(at, "", 0, nodev, 32));
+    close(at);
+    printf("\n");
+    rm_info("a", a, NULL);
+    rm_info("a/in", inner, NULL);
+    printf("open_tree_attr");
+    RM("size-alone", sa_tree(AT_FDCWD, a, 1, NULL, 32));
+    RM("plain-not-root", sa_tree(AT_FDCWD, sa_base, 0, ro, 32));
+    unsigned long long noexec[5] = {8, 0, 0, 0, 0};
+    long plain = sa_tree(AT_FDCWD, a, 0, noexec, 32);
+    printf(" plain=%d", plain >= 0);
+    close((int)plain);
+    unsigned long long copy[5] = {1, 0, MS_PRIVATE, 0, 0};
+    long tree = sa_tree(AT_FDCWD, a, 1 | AT_RECURSIVE, copy, 32);
+    printf(" tree=%d", tree >= 0);
+    RM("attach", syscall(429, (int)tree, "", AT_FDCWD, b, 4));
+    close((int)tree);
+    printf("\n");
+    snprintf(path, sizeof path, "%s/in", b);
+    rm_info("a", a, NULL);
+    rm_info("b", b, NULL);
+    rm_info("b/in", path, NULL);
+    return 0;
+}
+static int setattrs_case(void) {
+    if (!mkdtemp(sa_base)) return 93;
+    chmod(sa_base, 0755);
+    char path[256];
+    sa_path(path, "a");
+    mkdir(path, 0755);
+    sa_path(path, "b");
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(sa_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    sa_path(path, "l");
+    unlink(path);
+    sa_path(path, "a");
+    rmdir(path);
+    sa_path(path, "b");
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(sa_base) == 0);
+    return 0;
+}
+
+/* The mount-flags case, as root: what noexec and nosuid mounts refuse, as
+   Linux enforces them: exec and access(X_OK) of a file on a noexec mount
+   (EACCES, a script's interpreter there too), its mapping for execution
+   (mmap EPERM, mprotect EACCES), and a set-user-ID and set-group-ID program
+   on a nosuid mount, which runs with the caller's IDs. */
+static char mf_base[] = "/tmp/paludarium-mount-flags-XXXXXX";
+static void mf_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", mf_base, name); }
+/* Copies `from` to `to` as a set-user-ID and set-group-ID program of user
+   and group 1000; 0 or the errno. */
+static int mf_copy(const char *from, const char *to) {
+    int in = open(from, O_RDONLY), out = open(to, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    if (in < 0 || out < 0) return errno;
+    char buf[65536];
+    long n;
+    while ((n = read(in, buf, sizeof buf)) > 0)
+        if (write(out, buf, (size_t)n) != n) return errno;
+    close(in);
+    close(out);
+    if (chown(to, 1000, 1000) || chmod(to, 06755)) return errno;
+    return 0;
+}
+/* Runs `path` as the mount-flags-id mode in a child: its line, or the
+   errno of its execve. */
+static void mf_run(const char *label, const char *path) {
+    fflush(stdout);
+    int pipefd[2];
+    if (pipe(pipefd)) return;
+    pid_t child = fork();
+    if (child == 0) {
+        dup2(pipefd[1], 1);
+        char *argv[] = {"process", "mount-flags-id", "x", NULL};
+        execve(path, argv, environ);
+        printf("execve=%d\n", errno);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    char line[128] = "";
+    long n = read(pipefd[0], line, sizeof line - 1);
+    close(pipefd[0]);
+    reaped(child);
+    if (n > 0) line[n] = 0;
+    char *end = strchr(line, '\n');
+    if (end) *end = 0;
+    printf("%s %s\n", label, line);
+}
+static int mf_inner(const char *self) {
+    char x[256], n[256], s[256], path[512];
+    mf_path(x, "x");
+    mf_path(n, "n");
+    mf_path(s, "s");
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("x", mount("none", x, "tmpfs", 0, NULL));
+    RM("n", mount("none", n, "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV, NULL));
+    RM("s", mount("none", s, "tmpfs", MS_NOSUID, NULL));
+    char xp[512], np[512], sp[512];
+    snprintf(xp, sizeof xp, "%s/prog", x);
+    snprintf(np, sizeof np, "%s/prog", n);
+    snprintf(sp, sizeof sp, "%s/prog", s);
+    printf(" copies=%d %d %d\n", mf_copy(self, xp), mf_copy(self, np), mf_copy(self, sp));
+    printf("access");
+    RM("x", access(xp, X_OK));
+    RM("n", access(np, X_OK));
+    RM("n-read", access(np, R_OK));
+    printf("\n");
+    mf_run("exec-x", xp);
+    mf_run("exec-n", np);
+    mf_run("exec-s", sp);
+    snprintf(path, sizeof path, "%s/script", x);
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    char text[600];
+    int len = snprintf(text, sizeof text, "#!%s\n", np);
+    write(fd, text, (size_t)len);
+    close(fd);
+    mf_run("script-n", path);
+    /* nosuid judges the file that runs, a script's interpreter: a script
+       on the nosuid mount runs its set-user-ID interpreter as its owner,
+       and one whose interpreter is there runs it as the caller. */
+    snprintf(path, sizeof path, "%s/script", s);
+    fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    len = snprintf(text, sizeof text, "#!%s mount-flags-id\n", xp);
+    write(fd, text, (size_t)len);
+    close(fd);
+    mf_run("script-on-s", path);
+    snprintf(path, sizeof path, "%s/script-s", x);
+    fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    len = snprintf(text, sizeof text, "#!%s mount-flags-id\n", sp);
+    write(fd, text, (size_t)len);
+    close(fd);
+    mf_run("script-of-s", path);
+    printf("mmap");
+    fd = open(np, O_RDONLY);
+    void *at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    printf(" n-exec=%d", at == MAP_FAILED ? errno : 0);
+    at = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    printf(" n-read=%d", at == MAP_FAILED ? errno : 0);
+    RM("n-mprotect", mprotect(at, 4096, PROT_READ | PROT_EXEC));
+    close(fd);
+    fd = open(xp, O_RDONLY);
+    at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    printf(" x-exec=%d\n", at == MAP_FAILED ? errno : 0);
+    close(fd);
+    printf("remount");
+    RM("n", mount(NULL, n, NULL, MS_REMOUNT | MS_BIND | MS_NOSUID, NULL));
+    printf("\n");
+    mf_run("exec-n", np);
+    return 0;
+}
+static int mount_flags_case(const char *self) {
+    if (!mkdtemp(mf_base)) return 93;
+    chmod(mf_base, 0755);
+    const char *dirs[] = {"x", "n", "s"};
+    char path[256];
+    for (unsigned i = 0; i < 3; i++) {
+        mf_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        _exit(mf_inner(self));
+    }
+    printf("status=%d\n", reaped(child));
+    for (unsigned i = 0; i < 3; i++) {
+        mf_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(mf_base) == 0);
+    return 0;
+}
+
+/* The listings case: statmount and listmount (Linux master's) in a mount
+   namespace of a user namespace of its own, by what does not depend on the
+   machine: the unique IDs' order and relations, statx's STATX_MNT_ID_UNIQUE,
+   what statmount gives of a tmpfs, and their checks. */
+static char ls_base[] = "/tmp/paludarium-listings-XXXXXX";
+struct ls_req {
+    unsigned size, fd;
+    unsigned long long mnt_id, param, ns_id;
+};
+static long ls_stat(const struct ls_req *req, void *buf, size_t size, unsigned flags) {
+    return syscall(457, req, buf, size, flags);
+}
+static long ls_list(const struct ls_req *req, unsigned long long *ids, size_t n, unsigned flags) {
+    return syscall(458, req, ids, n, flags);
+}
+/* statx's mount ID, unique with `unique`, of `path`; 0 for an error. */
+static unsigned long long ls_statx(const char *path, int unique) {
+    unsigned char buf[256];
+    if (syscall(SYS_statx, AT_FDCWD, path, 0, unique ? 0x4000 : 0x1000, buf)) return 0;
+    unsigned long long id;
+    memcpy(&id, buf + 144, 8);
+    return id;
+}
+static unsigned long long ls_u64(const unsigned char *buf, int at) {
+    unsigned long long v;
+    memcpy(&v, buf + at, 8);
+    return v;
+}
+static unsigned ls_u32(const unsigned char *buf, int at) {
+    unsigned v;
+    memcpy(&v, buf + at, 4);
+    return v;
+}
+/* The string at the offset in field `at`, the tmpfs's owner options left
+   out, which show unless the owner is the first namespace's root. */
+static void ls_string(const char *label, const unsigned char *buf, int at, int array) {
+    const char *s = (const char *)buf + 512 + ls_u32(buf, at);
+    char out[512] = "";
+    if (array) {
+        unsigned n = ls_u32(buf, 128);
+        for (unsigned i = 0; i < n; i++, s += strlen(s) + 1)
+            if (strncmp(s, "uid=", 4) && strncmp(s, "gid=", 4))
+                snprintf(out + strlen(out), sizeof out - strlen(out), "%s|", s);
+    } else {
+        char copy[512];
+        snprintf(copy, sizeof copy, "%s", s);
+        for (char *word = strtok(copy, ","); word; word = strtok(NULL, ","))
+            if (strncmp(word, "uid=", 4) && strncmp(word, "gid=", 4))
+                snprintf(out + strlen(out), sizeof out - strlen(out), "%s%s", out[0] ? "," : "", word);
+    }
+    printf(" %s=%s", label, out);
+}
+static int ls_inner(void) {
+    char a[256], in[256];
+    snprintf(a, sizeof a, "%s/a", ls_base);
+    snprintf(in, sizeof in, "%s/a/in", ls_base);
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("a", mount("none", a, "tmpfs", 0, "size=1m"));
+    mkdir(in, 0755);
+    RM("in", mount("none", in, "tmpfs", 0, NULL));
+    unsigned long long ua = ls_statx(a, 1), ui = ls_statx(in, 1), ub = ls_statx(ls_base, 1);
+    printf(" unique=%d order=%d\n", ua > (1ULL << 31) && ub > (1ULL << 31), ua < ui);
+    static unsigned long long ids[4096];
+    struct ls_req root = {32, 0, ~0ULL, 0, 0};
+    long n = ls_list(&root, ids, 4096, 0);
+    printf("listmount all=%d", n >= 3);
+    int sorted = 1;
+    for (long i = 1; i < n; i++) sorted &= ids[i - 1] < ids[i];
+    printf(" sorted=%d last=%d", sorted, n >= 2 && ids[n - 2] == ua && ids[n - 1] == ui);
+    long r = ls_list(&root, ids, 1, 1);
+    printf(" reverse=%ld first=%d", r, ids[0] == ui);
+    struct ls_req below = {32, 0, ua, 0, 0};
+    n = ls_list(&below, ids, 16, 0);
+    printf(" below=%ld %d", n, n == 1 && ids[0] == ui);
+    struct ls_req after = {32, 0, ~0ULL, ua, 0};
+    n = ls_list(&after, ids, 16, 0);
+    printf(" after=%ld %d\n", n, n == 1 && ids[0] == ui);
+    printf("listmount checks");
+    RM("flags", ls_list(&root, ids, 16, 2));
+    RM("count", ls_list(&root, ids, 2000000, 0));
+    struct ls_req small = {16, 0, ~0ULL, 0, 0};
+    RM("small", ls_list(&small, ids, 16, 0));
+    struct ls_req big = {8192, 0, ~0ULL, 0, 0};
+    RM("big", ls_list(&big, ids, 16, 0));
+    struct ls_req old = {32, 0, 21, 0, 0};
+    RM("old-id", ls_list(&old, ids, 16, 0));
+    struct ls_req last_old = {32, 0, ~0ULL, 21, 0};
+    RM("old-last", ls_list(&last_old, ids, 16, 0));
+    struct ls_req missing = {32, 0, ~0ULL - 1, 0, 0};
+    RM("missing", ls_list(&missing, ids, 16, 0));
+    int mntns = open("/proc/self/ns/mnt", O_RDONLY);
+    struct ls_req both = {32, (unsigned)mntns, ~0ULL, 0, 8};
+    RM("fd-and-id", ls_list(&both, ids, 16, 0));
+    struct ls_req by_ns_fd = {32, (unsigned)mntns, ua, 0, 0};
+    n = ls_list(&by_ns_fd, ids, 16, 0);
+    printf(" ns-fd=%ld", n);
+    int plain = open(ls_base, O_RDONLY);
+    struct ls_req not_ns = {32, (unsigned)plain, ~0ULL, 0, 0};
+    RM("not-ns", ls_list(&not_ns, ids, 16, 0));
+    printf("\n");
+    static unsigned char buf[4096];
+    struct ls_req all = {32, 0, ua, 0x7fff, 0};
+    printf("statmount");
+    RM("all", ls_stat(&all, buf, sizeof buf, 0));
+    printf(" mask=%#llx id=%d parent=%d old=%d", ls_u64(buf, 8), ls_u64(buf, 40) == ua,
+           ls_u64(buf, 48) == ub, ls_u32(buf, 56) == ls_statx(a, 0));
+    printf(" attr=%#llx propagation=%#llx peer=%llu master=%llu", ls_u64(buf, 64), ls_u64(buf, 72),
+           ls_u64(buf, 80), ls_u64(buf, 88));
+    printf(" major=%u magic=%#llx sb=%#x ns=%d supported=%#llx\n", ls_u32(buf, 16), ls_u64(buf, 24),
+           ls_u32(buf, 32), ls_u64(buf, 112) > 8, ls_u64(buf, 144));
+    printf("strings");
+    ls_string("type", buf, 36, 0);
+    ls_string("root", buf, 104, 0);
+    printf(" point=%d", !strcmp((const char *)buf + 512 + ls_u32(buf, 108), a));
+    ls_string("opts", buf, 4, 0);
+    ls_string("array", buf, 132, 1);
+    ls_string("source", buf, 124, 0);
+    printf("\n");
+    printf("statmount checks");
+    RM("flags", ls_stat(&all, buf, sizeof buf, 2));
+    RM("overflow", ls_stat(&all, buf, 512, 0));
+    struct ls_req basic = {32, 0, ua, 2, 0};
+    RM("small-buf", ls_stat(&basic, buf, 64, 0));
+    printf(" size=%u", ls_u32(buf, 0));
+    struct ls_req gone = {32, 0, ~0ULL - 1, 2, 0};
+    RM("missing", ls_stat(&gone, buf, sizeof buf, 0));
+    struct ls_req oldid = {32, 0, 21, 2, 0};
+    RM("old-id", ls_stat(&oldid, buf, sizeof buf, 0));
+    int afd = open(a, O_RDONLY);
+    struct ls_req by_fd = {32, (unsigned)afd, 0, 2, 0};
+    RM("by-fd", ls_stat(&by_fd, buf, sizeof buf, 1));
+    printf(" fd-id=%d", ls_u64(buf, 40) == ua);
+    struct ls_req by_fd_id = {32, (unsigned)afd, ua, 2, 0};
+    RM("by-fd-id", ls_stat(&by_fd_id, buf, sizeof buf, 1));
+    struct ls_req by_badf = {32, 999, 0, 2, 0};
+    RM("by-badf", ls_stat(&by_badf, buf, sizeof buf, 1));
+    struct ls_req with_ns = {32, (unsigned)mntns, ui, 2, 0};
+    RM("ns-fd", ls_stat(&with_ns, buf, sizeof buf, 0));
+    printf(" ns-fd-id=%d\n", ls_u64(buf, 40) == ui);
+    close(afd);
+    close(plain);
+    close(mntns);
+    return 0;
+}
+static int listings_case(void) {
+    if (!mkdtemp(ls_base)) return 93;
+    chmod(ls_base, 0755);
+    char path[256];
+    snprintf(path, sizeof path, "%s/a", ls_base);
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(ls_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(ls_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -15379,9 +15829,13 @@ static int ipc_sysctl_more(void) {
     if (read(ids[0], &orphan, sizeof orphan) != sizeof orphan) return 12;
     int made = reaped(maker);
     printf(" made=%d orphan-kept=%ld", made, ksys_exists(orphan));
-    /* Setting it removes the orphans no mapping shows. */
-    printf(" set=%ld orphan=%ld own=%ld", ksys_write("shm_rmid_forced", "1"), ksys_exists(orphan),
-           ksys_exists(own));
+    /* Setting it removes the orphans no mapping shows. Each call is its
+       own statement, as the order of a call's arguments is unspecified:
+       the checks must come after the write. */
+    long set = ksys_write("shm_rmid_forced", "1");
+    long orphan_now = ksys_exists(orphan);
+    long own_now = ksys_exists(own);
+    printf(" set=%ld orphan=%ld own=%ld", set, orphan_now, own_now);
     /* Set, a segment goes at its last detach. */
     int detached = (int)syscall(SYS_shmget, IPC_PRIVATE, 1, 0600);
     void *at = (void *)syscall(SYS_shmat, detached, 0, 0);
@@ -15428,7 +15882,11 @@ static int ipc_sysctl_more(void) {
         if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
         errno = 0;
         long n = write((int)held, "100", 3);
-        printf("held-write: open=%d write=%ld", held >= 0, n < 0 ? -errno : n);
+        long written = n < 0 ? -errno : n;
+        errno = 0;
+        n = pwrite((int)held, "100", 3, 0);
+        long positioned = n < 0 ? -errno : n;
+        printf("held-write: open=%d write=%ld pwrite=%ld", held >= 0, written, positioned);
         ksys_show("msgmax");
         printf("\n");
         fflush(stdout);
@@ -15436,6 +15894,41 @@ static int ipc_sysctl_more(void) {
     }
     result("held-write", reaped(writer));
     if (held >= 0) close((int)held);
+
+    /* copy_file_range into a sysctl from another filesystem, a memfd, is
+       EXDEV (generic_copy_file_checks), so it writes nothing. */
+    int memfd = (int)syscall(SYS_memfd_create, "sysctl-source", 0);
+    long fed = memfd < 0 ? -1 : write(memfd, "100\n", 4);
+    long target = ksys_open("msgmax", O_WRONLY);
+    errno = 0;
+    long copied = syscall(SYS_copy_file_range, memfd, NULL, (int)target, NULL, 4, 0);
+    printf("copy-range: fed=%ld copied=%ld errno=%d", fed, copied, copied < 0 ? errno : 0);
+    ksys_show("msgmax");
+    printf("\n");
+    /* From another sysctl: its size of 0 copies nothing. Each has an
+       inode of its own; only that they differ is compared. */
+    long source = ksys_open("msgmnb", O_RDONLY);
+    errno = 0;
+    copied = syscall(SYS_copy_file_range, (int)source, NULL, (int)target, NULL, 16, 0);
+    struct stat from = {0}, to = {0};
+    long both_stated = source >= 0 && target >= 0 && !fstat((int)source, &from) && !fstat((int)target, &to);
+    printf("copy-sysctl: copied=%ld errno=%d stated=%ld sizes=%ld,%ld inodes-differ=%d", copied,
+           copied < 0 ? errno : 0, both_stated, (long)from.st_size, (long)to.st_size, from.st_ino != to.st_ino);
+    ksys_show("msgmax");
+    /* A listing gives each entry the inode its stat gives. */
+    ino_t listed = 0;
+    DIR *kernel_dir = opendir("/proc/sys/kernel");
+    struct dirent *e;
+    while (kernel_dir && (e = readdir(kernel_dir)))
+        if (!strcmp(e->d_name, "msgmax")) listed = e->d_ino;
+    if (kernel_dir) closedir(kernel_dir);
+    struct stat named = {0};
+    long named_stat = stat("/proc/sys/kernel/msgmax", &named) ? -errno : 0;
+    printf(" listed=%d d_ino-is-st_ino=%d", listed != 0, named_stat == 0 && listed == named.st_ino);
+    printf("\n");
+    if (source >= 0) close((int)source);
+    if (target >= 0) close((int)target);
+    if (memfd >= 0) close(memfd);
     return 0;
 }
 static int ipc_sysctl_case(void) {
@@ -15624,12 +16117,204 @@ static int kernel_sysctl_case(void) {
         if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
         errno = 0;
         long n = held < 0 ? 0 : write(held, "2", 1);
-        printf("held-write: write=%ld\n", n < 0 ? -errno : n);
+        long written = n < 0 ? -errno : n;
+        errno = 0;
+        n = held < 0 ? 0 : pwrite(held, "2", 1, 0);
+        printf("held-write: write=%ld pwrite=%ld\n", written, n < 0 ? -errno : n);
         fflush(stdout);
         _exit(0);
     }
     result("held-write", reaped(other));
     if (held >= 0) close(held);
+    return 0;
+}
+/* The net-sysctl case's files, under /proc/sys/net. */
+static long ns_read(const char *name) {
+    char path[128], text[32] = {0};
+    snprintf(path, sizeof path, "/proc/sys/net/%s", name);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    long n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n <= 0 || text[n - 1] != '\n') return -1000;
+    return strtol(text, NULL, 10);
+}
+/* Writes `text` to a file at its start: what the write returns. */
+static long ns_write(const char *name, const char *text) {
+    char path[128];
+    snprintf(path, sizeof path, "/proc/sys/net/%s", name);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    long n = write(fd, text, strlen(text));
+    if (n < 0) n = -errno;
+    close(fd);
+    return n;
+}
+static void ns_show(const char *label) {
+    static const char *names[] = {
+        "ipv4/ip_forward",           "ipv4/conf/all/forwarding",  "ipv4/conf/default/forwarding",
+        "ipv4/conf/lo/forwarding",   "ipv4/conf/all/rp_filter",   "ipv4/conf/default/rp_filter",
+        "ipv4/conf/lo/rp_filter",    "ipv6/conf/all/forwarding",  "ipv6/conf/default/forwarding",
+        "ipv6/conf/lo/forwarding",   "ipv6/conf/all/disable_ipv6", "ipv6/conf/default/disable_ipv6",
+        "ipv6/conf/lo/disable_ipv6",
+    };
+    printf("%s:", label);
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) printf(" %ld", ns_read(names[i]));
+    printf("\n");
+}
+static void ns_wrote(const char *name, const char *text) {
+    char shown[64] = {0};
+    for (size_t i = 0, at = 0; text[i] && at + 3 < sizeof shown; i++) {
+        if (text[i] == '\n') {
+            shown[at++] = '\\';
+            shown[at++] = 'n';
+        } else {
+            shown[at++] = text[i];
+        }
+    }
+    printf("write %s \"%s\"=%ld\n", name, shown, ns_write(name, text));
+}
+/* Whether ::1 can be bound, which only an address of the namespace can. */
+static long ns_bind_loopback6(void) {
+    int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 at = {.sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT};
+    long r = bind(fd, (void *)&at, sizeof at) ? -errno : 0;
+    close(fd);
+    return r;
+}
+/* The net-sysctl case: /proc/sys/net's forwarding, rp_filter and
+   disable_ipv6 of all, default and lo, in a network namespace of its own,
+   as root. A new namespace copies the first one's all and default, which
+   are the test runner's own on Linux, so it writes Linux's built-in values
+   to all of them first and prints none it found. */
+static int net_sysctl_case(void) {
+    fflush(stdout);
+    pid_t maker = child();
+    if (maker == 0) {
+        printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+        static const char *stated[] = {"/proc/sys/net", "/proc/sys/net/ipv4/conf/lo", "/proc/sys/net/ipv4/ip_forward",
+                                       "/proc/sys/net/ipv6/conf/all/disable_ipv6", "/proc/sys/net/ipv6/conf/eth9"};
+        for (size_t i = 0; i < sizeof stated / sizeof stated[0]; i++) {
+            struct stat st = {0};
+            long r = stat(stated[i], &st) ? -errno : 0;
+            printf("stat %s=%ld mode=%o uid=%d gid=%d\n", stated[i], r, st.st_mode, st.st_uid, st.st_gid);
+        }
+        static const char *built[] = {"ipv4/conf/all/forwarding",   "ipv4/conf/all/rp_filter",
+                                      "ipv4/conf/default/rp_filter", "ipv4/conf/lo/rp_filter",
+                                      "ipv6/conf/all/forwarding",   "ipv6/conf/all/disable_ipv6"};
+        for (size_t i = 0; i < sizeof built / sizeof built[0]; i++) ns_write(built[i], "0");
+        ns_show("built");
+        printf("-- ipv4 forwarding\n");
+        ns_wrote("ipv4/ip_forward", "1\n");
+        ns_show("all on");
+        ns_wrote("ipv4/conf/lo/forwarding", "0");
+        ns_wrote("ipv4/conf/all/forwarding", "1");
+        ns_show("all again");
+        ns_wrote("ipv4/conf/default/forwarding", "0");
+        ns_wrote("ipv4/conf/all/forwarding", "0");
+        ns_show("all off");
+        static const char *bad[] = {"abc", "", "  7  \n", "9 9", "2147483648", "-1", "0x10", "5x"};
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            ns_wrote("ipv4/conf/lo/forwarding", bad[i]);
+            printf("  now %ld\n", ns_read("ipv4/conf/lo/forwarding"));
+        }
+        int fd = open("/proc/sys/net/ipv4/conf/lo/forwarding", O_WRONLY | O_CLOEXEC);
+        printf("past start: seek=%ld write=%ld now %ld\n", (long)lseek(fd, 1, SEEK_SET), (long)write(fd, "3", 1),
+               ns_read("ipv4/conf/lo/forwarding"));
+        close(fd);
+        printf("-- rp_filter\n");
+        ns_wrote("ipv4/conf/lo/rp_filter", "1");
+        ns_wrote("ipv4/conf/default/rp_filter", "2");
+        ns_wrote("ipv4/conf/lo/rp_filter", "x");
+        ns_wrote("ipv4/conf/all/rp_filter", "2");
+        ns_show("rp_filter");
+        printf("-- ipv6 forwarding\n");
+        ns_wrote("ipv6/conf/all/forwarding", "1\n");
+        ns_show("all on");
+        ns_wrote("ipv6/conf/lo/forwarding", "0\n");
+        ns_wrote("ipv6/conf/default/forwarding", "0\n");
+        ns_wrote("ipv6/conf/default/forwarding", "zz");
+        ns_wrote("ipv6/conf/lo/forwarding", "zz");
+        ns_wrote("ipv6/conf/lo/forwarding", "");
+        ns_show("each");
+        fd = open("/proc/sys/net/ipv6/conf/all/forwarding", O_WRONLY | O_CLOEXEC);
+        long first = write(fd, "0\n", 2), second = write(fd, "1", 1);
+        printf("same descriptor: %ld %ld\n", first, second);
+        close(fd);
+        ns_show("again");
+        ns_wrote("ipv6/conf/all/forwarding", "0");
+        printf("-- disable_ipv6\n");
+        int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+        struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+        socklen_t name_len = sizeof name;
+        bind(ctl, (void *)&any, sizeof any);
+        getsockname(ctl, (void *)&name, &name_len);
+        unsigned port = name.pid;
+        struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0xd51};
+        bind(mon, (void *)&members, sizeof members);
+        int udp = socket(AF_INET, SOCK_DGRAM, 0);
+        netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
+        monitor_show(mon, port, "up");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "1\n");
+        monitor_show(mon, port, "lo off");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        nl_addr(ctl, port, 20, 0x600, AF_INET6, "2001:db8::1", 64, 0, 1, "add while off");
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "1");
+        monitor_show(mon, port, "lo off again");
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "0");
+        monitor_show(mon, port, "lo on");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        ns_wrote("ipv6/conf/all/disable_ipv6", "3");
+        monitor_show(mon, port, "all off");
+        ns_show("all off");
+        ns_wrote("ipv6/conf/all/disable_ipv6", "0");
+        monitor_show(mon, port, "all on");
+        ns_wrote("ipv6/conf/default/disable_ipv6", "1");
+        monitor_show(mon, port, "default");
+        ns_show("default");
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "bad");
+        netns_lo(udp, SIOCSIFFLAGS, "lo", 0);
+        monitor_show(mon, port, "down");
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "1");
+        netns_lo(udp, SIOCSIFFLAGS, "lo", IFF_UP);
+        monitor_show(mon, port, "up with ipv6 off");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        ns_wrote("ipv6/conf/lo/disable_ipv6", "0");
+        monitor_show(mon, port, "on while up");
+        printf("bind ::1=%ld\n", ns_bind_loopback6());
+        printf("-- permissions\n");
+        int held = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY | O_CLOEXEC);
+        fflush(stdout);
+        pid_t other = child();
+        if (other == 0) {
+            if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+            errno = 0;
+            int w = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY | O_CLOEXEC);
+            long opened = w < 0 ? -errno : 0, value = ns_read("ipv4/ip_forward");
+            long written = netns_result(write(held, "0", 1));
+            printf("other: open write=%ld read=%ld held write=%ld\n", opened, value, written);
+            fflush(stdout);
+            _exit(0);
+        }
+        result("other", reaped(other));
+        fflush(stdout);
+        other = child();
+        if (other == 0) {
+            caps_only(CAPS_ALL & ~(1ULL << 12));
+            ns_wrote("ipv4/ip_forward", "0");
+            ns_wrote("ipv4/conf/lo/forwarding", "0");
+            ns_wrote("ipv4/conf/lo/rp_filter", "0");
+            ns_wrote("ipv6/conf/all/forwarding", "0");
+            ns_wrote("ipv6/conf/lo/disable_ipv6", "0");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("root without CAP_NET_ADMIN", reaped(other));
+        fflush(stdout);
+        _exit(0);
+    }
+    result("maker", reaped(maker));
     return 0;
 }
 static int sem_case(void) {
@@ -19183,6 +19868,226 @@ int main(int argc, char **argv) {
             nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | dump, routes, 12), port, "routes6");
             routes[0] = AF_INET;
             nl_answer(ctl, nl_send(ctl, 26, NL_F_REQUEST | dump, routes, 12), port, "routes4");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "route-input")) {
+        /* A child makes a network namespace with lo up, addresses and
+           routes, and looks routes up as packets coming in on lo would
+           take them (RTA_IIF, as `ip route get ... iif lo` sends):
+           ip_route_input_slow and ip6_route_input_lookup. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            /* A new namespace takes the first one's IPv4 settings, which a
+               host may have changed (Docker turns forwarding on, Ubuntu
+               reverse path filtering to 2); Linux's own, which the
+               emulator starts with, are set: both off. */
+            static const char *const settings[] = {
+                "/proc/sys/net/ipv4/conf/all/forwarding", "/proc/sys/net/ipv4/conf/all/rp_filter",
+                "/proc/sys/net/ipv4/conf/default/rp_filter", "/proc/sys/net/ipv4/conf/lo/rp_filter"};
+            for (size_t i = 0; i < sizeof settings / sizeof settings[0]; i++) {
+                int fd = open(settings[i], O_WRONLY);
+                if (fd < 0) {
+                    /* A read-only /proc/sys (a container's) leaves the
+                       host's. */
+                    if (errno != ENOENT) printf("%s: open=%d\n", settings[i], -errno);
+                    continue;
+                }
+                if (write(fd, "0", 1) < 0) printf("%s: write=%d\n", settings[i], -errno);
+                close(fd);
+            }
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            const unsigned short add = 0x600;
+            /* While lo is down. */
+            nl_select(ctl, port, "127.0.0.1", 0, 0, "192.0.2.1", 0, 1, 0, "down local");
+            nl_select(ctl, port, "::1", 0, 0, "2001:db8:ff::1", 0, 1, 0, "down local6");
+            struct nl_link link = {.index = 1, .flags = IFF_UP, .change = IFF_UP};
+            printf("up=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            nl_addr_life(ctl, port, add, AF_INET, "10.9.0.1", 24, 1, NULL, 0, -1, "addr4");
+            /* Linux adds an IPv6 address's local route in its duplicate
+               address detection's work, even without it (IFA_F_NODAD):
+               what a member of IPv6's address group hears of it comes
+               then. */
+            int mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x100};
+            printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
+            nl_addr_life(ctl, port, add, AF_INET6, "2001:db8:9::1", 64, 1, NULL, 0, 0x02, "addr6");
+            monitor_show(mon, port, "addr6");
+            close(mon);
+#define ROUTE4(...) ((struct nl_rt){.family = AF_INET, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+#define ROUTE6(...) ((struct nl_rt){.family = AF_INET6, .table = 254, .protocol = 3, .kind = 1, __VA_ARGS__})
+            nl_route(ctl, port, 24, add, "10.20.0.0", 16, ROUTE4(.scope = 253, .oif = 1), "unicast4");
+            nl_route(ctl, port, 24, add, "10.21.0.0", 16, ROUTE4(.kind = 6), "blackhole4");
+            nl_route(ctl, port, 24, add, "10.22.0.0", 16, ROUTE4(.kind = 7), "unreachable4");
+            nl_route(ctl, port, 24, add, "10.23.0.0", 16, ROUTE4(.kind = 8), "prohibit4");
+            nl_route(ctl, port, 24, add, "10.24.0.0", 16, ROUTE4(.tos = 0x10, .scope = 253, .oif = 1), "tos4");
+            nl_route(ctl, port, 24, add, "2001:db8:20::", 48, ROUTE6(.oif = 1), "unicast6");
+            nl_route(ctl, port, 24, add, "2001:db8:21::", 48, ROUTE6(.kind = 6), "blackhole6");
+            nl_route(ctl, port, 24, add, "2001:db8:22::", 48, ROUTE6(.kind = 7), "unreachable6");
+            nl_route(ctl, port, 24, add, "2001:db8:23::", 48, ROUTE6(.kind = 8), "prohibit6");
+            /* IPv4: a local destination from another host, with the
+               flags; from a source that is martian or local; to martian
+               destinations; broadcasts; multicast; what has no route or is
+               not local, as forwarding is off. */
+            static const struct {
+                const char *dst, *src;
+                unsigned tos, flags;
+                const char *label;
+            } asked4[] = {
+                {"10.9.0.1", "192.0.2.1", 0, 0, "local"},
+                {"10.9.0.1", "192.0.2.1", 0, 0x1000, "local lookup table"},
+                {"10.9.0.1", "192.0.2.1", 0, 0x2000, "local fibmatch"},
+                {"10.9.0.1", "192.0.2.1", 0x10, 0, "local tos"},
+                {"10.9.0.1", NULL, 0, 0, "local no source"},
+                {"10.9.0.1", "10.9.0.1", 0, 0, "local from itself"},
+                {"10.9.0.1", "10.9.0.2", 0, 0, "local from its subnet"},
+                {"10.9.0.1", "127.0.0.1", 0, 0, "local from loopback"},
+                {"10.9.0.1", "224.0.0.5", 0, 0, "local from multicast"},
+                {"10.9.0.1", "255.255.255.255", 0, 0, "local from broadcast"},
+                {"127.0.0.1", "192.0.2.1", 0, 0, "loopback"},
+                {"0.0.0.0", "192.0.2.1", 0, 0, "zero"},
+                {"0.0.0.0", NULL, 0, 0, "zero from zero"},
+                {"255.255.255.255", "192.0.2.1", 0, 0, "broadcast"},
+                {"255.255.255.255", NULL, 0, 0, "broadcast from zero"},
+                {"255.255.255.255", "10.9.0.1", 0, 0, "broadcast from local"},
+                {"255.255.255.255", "192.0.2.1", 0, 0x2000, "broadcast fibmatch"},
+                {"10.9.0.255", "192.0.2.1", 0, 0, "subnet broadcast"},
+                {"10.9.0.255", "192.0.2.1", 0, 0x1000, "subnet broadcast lookup table"},
+                {"224.0.0.1", "192.0.2.1", 0, 0, "all hosts"},
+                {"224.0.0.1", NULL, 0, 0, "all hosts from zero"},
+                {"224.0.0.1", "10.9.0.1", 0, 0, "all hosts from local"},
+                {"224.0.0.1", "192.0.2.1", 0, 0x1000, "all hosts lookup table"},
+                {"224.0.0.1", "192.0.2.1", 0, 0x2000, "all hosts fibmatch"},
+                {"239.1.1.1", "192.0.2.1", 0, 0, "group"},
+                {"10.20.1.1", "192.0.2.1", 0, 0, "unicast"},
+                {"10.21.1.1", "192.0.2.1", 0, 0, "blackhole"},
+                {"10.22.1.1", "192.0.2.1", 0, 0, "unreachable"},
+                {"10.23.1.1", "192.0.2.1", 0, 0, "prohibit"},
+                {"10.24.1.1", "192.0.2.1", 0x10, 0, "tos route"},
+                {"8.8.8.8", "192.0.2.1", 0, 0, "no route"},
+            };
+            for (size_t i = 0; i < sizeof asked4 / sizeof asked4[0]; i++)
+                nl_select(ctl, port, asked4[i].dst, asked4[i].tos, asked4[i].flags, asked4[i].src, 0, 1, 0,
+                          asked4[i].label);
+            nl_select(ctl, port, "10.9.0.1", 0, 0, "192.0.2.1", 0, 1, 6, "local tcp");
+            nl_select(ctl, port, "10.9.0.1", 0, 0, "192.0.2.1", 1, 1, 0, "local oif");
+            nl_select(ctl, port, "10.9.0.1", 0, 0, "192.0.2.1", 0, 4096, 0, "other device");
+            /* Last before a route is added, which flushes the cache: Linux
+               marks the cached route with RTCF_NOTIFY, so that later
+               lookups through it are marked too. */
+            nl_select(ctl, port, "10.9.0.1", 0, 0x100, "192.0.2.1", 0, 1, 0, "local notify");
+            /* With a local route of its own, the source is checked by a
+               lookup of it (__fib_validate_source). */
+            nl_route(ctl, port, 24, add, "10.40.0.0", 16, ROUTE4(.table = 255, .scope = 254, .kind = 2, .oif = 1),
+                     "custom local");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "192.0.2.1", 0, 1, 0, "custom local from host");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "10.20.1.1", 0, 1, 0, "custom local from unicast");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "10.21.1.1", 0, 1, 0, "custom local from blackhole");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "10.9.0.1", 0, 1, 0, "custom local from local");
+            nl_select(ctl, port, "10.40.1.1", 0, 0, "10.9.0.255", 0, 1, 0, "custom local from broadcast");
+            /* Forwarding and reverse path filtering, as /proc/sys/net sets
+               them (ip_route_input_slow, __mkroute_input,
+               fib_validate_source); a route through a gateway on lo too. */
+            nl_route(ctl, port, 24, add, "10.30.0.0", 16, ROUTE4(.oif = 1, .flags = 4, .gw = "10.9.0.5"),
+                     "gateway4");
+            static const struct {
+                const char *dst, *src;
+                unsigned tos, flags;
+                const char *label;
+            } forwarded4[] = {
+                {"10.20.1.1", "192.0.2.1", 0, 0, "unicast"},
+                {"10.20.1.1", "10.20.5.5", 0, 0, "unicast from its route"},
+                {"10.20.1.1", "10.30.5.5", 0, 0, "unicast from the gateway's"},
+                {"10.20.1.1", "192.0.2.1", 0, 0x1000, "unicast lookup table"},
+                {"10.20.1.1", "192.0.2.1", 0, 0x2000, "unicast fibmatch"},
+                {"10.20.1.1", "10.9.0.1", 0, 0, "unicast from local"},
+                {"10.20.1.1", "10.9.0.255", 0, 0, "unicast from broadcast"},
+                {"10.20.1.1", "10.21.1.1", 0, 0, "unicast from blackhole"},
+                {"10.30.1.1", "192.0.2.1", 0, 0, "gateway"},
+                {"10.21.1.1", "192.0.2.1", 0, 0, "blackhole"},
+                {"10.22.1.1", "192.0.2.1", 0, 0, "unreachable"},
+                {"10.23.1.1", "192.0.2.1", 0, 0, "prohibit"},
+                {"10.24.1.1", "192.0.2.1", 0x10, 0, "tos route"},
+                {"8.8.8.8", "192.0.2.1", 0, 0, "no route"},
+                {"10.9.0.1", "192.0.2.1", 0, 0, "local"},
+                {"10.9.0.1", "10.20.5.5", 0, 0, "local from a route"},
+                {"255.255.255.255", "192.0.2.1", 0, 0, "broadcast"},
+                {"224.0.0.1", "192.0.2.1", 0, 0, "all hosts"},
+            };
+            static const struct {
+                const char *file, *value, *label;
+            } steps[] = {
+                {"/proc/sys/net/ipv4/conf/all/forwarding", "1", "forwarding"},
+                {"/proc/sys/net/ipv4/conf/all/rp_filter", "1", "forwarding, strict"},
+                {"/proc/sys/net/ipv4/conf/all/rp_filter", "2", "forwarding, loose"},
+                {"/proc/sys/net/ipv4/conf/all/rp_filter", "0", "forwarding, all off"},
+                {"/proc/sys/net/ipv4/conf/lo/rp_filter", "2", "forwarding, lo loose"},
+                {"/proc/sys/net/ipv4/conf/lo/forwarding", "0", "lo not forwarding"},
+                {"/proc/sys/net/ipv4/conf/lo/forwarding", "1", "lo forwarding"},
+            };
+            for (size_t step = 0; step < sizeof steps / sizeof steps[0]; step++) {
+                int fd = open(steps[step].file, O_WRONLY);
+                long wrote = fd < 0 ? -errno : write(fd, steps[step].value, 1);
+                if (fd >= 0) close(fd);
+                printf("-- %s: %ld\n", steps[step].label, wrote < 0 ? -errno : wrote);
+                for (size_t i = 0; i < sizeof forwarded4 / sizeof forwarded4[0]; i++) {
+                    char label[96];
+                    snprintf(label, sizeof label, "%s: %s", steps[step].label, forwarded4[i].label);
+                    nl_select(ctl, port, forwarded4[i].dst, forwarded4[i].tos, forwarded4[i].flags,
+                              forwarded4[i].src, 0, 1, 0, label);
+                }
+            }
+            static const char *const off[] = {"/proc/sys/net/ipv4/conf/all/forwarding",
+                                              "/proc/sys/net/ipv4/conf/lo/rp_filter"};
+            for (size_t i = 0; i < sizeof off / sizeof off[0]; i++) {
+                int fd = open(off[i], O_WRONLY);
+                if (fd >= 0) {
+                    if (write(fd, "0", 1) < 0) printf("%s: write=%d\n", off[i], -errno);
+                    close(fd);
+                }
+            }
+            /* IPv6. */
+            static const struct {
+                const char *dst, *src;
+                unsigned flags;
+                const char *label;
+            } asked6[] = {
+                {"2001:db8:9::1", "2001:db8:ff::1", 0, "local6"},
+                {"2001:db8:9::1", "2001:db8:ff::1", 0x2000, "local6 fibmatch"},
+                {"2001:db8:9::1", NULL, 0, "local6 no source"},
+                {"2001:db8:9::1", "2001:db8:9::1", 0, "local6 from itself"},
+                {"::1", "2001:db8:ff::1", 0, "loopback6"},
+                {"::1", NULL, 0, "loopback6 no source"},
+                {"2001:db8:9::2", "2001:db8:ff::1", 0, "prefix6"},
+                {"fe80::1", "2001:db8:ff::1", 0, "link local6"},
+                {"ff02::1", "2001:db8:ff::1", 0, "all nodes6"},
+                {"2001:db8:20::1", "2001:db8:ff::1", 0, "unicast6"},
+                {"2001:db8:21::1", "2001:db8:ff::1", 0, "blackhole6"},
+                {"2001:db8:22::1", "2001:db8:ff::1", 0, "unreachable6"},
+                {"2001:db8:23::1", "2001:db8:ff::1", 0, "prohibit6"},
+                {"2001:4860::8888", "2001:db8:ff::1", 0, "no route6"},
+                {"::", NULL, 0, "zero6"},
+            };
+            for (size_t i = 0; i < sizeof asked6 / sizeof asked6[0]; i++)
+                nl_select(ctl, port, asked6[i].dst, 0, asked6[i].flags, asked6[i].src, 0, 1, 0, asked6[i].label);
+            nl_select(ctl, port, "2001:db8:9::1", 0, 0, "2001:db8:ff::1", 0, 4096, 0, "other device6");
+#undef ROUTE4
+#undef ROUTE6
+            link.flags = 0;
+            printf("down=%d\n", nl_quiet(ctl, 16, 0, &link, sizeof link));
+            nl_select(ctl, port, "10.9.0.1", 0, 0, "192.0.2.1", 0, 1, 0, "down local again");
+            nl_select(ctl, port, "10.20.1.1", 0, 0, "192.0.2.1", 0, 1, 0, "down unicast");
+            nl_select(ctl, port, "2001:db8:9::1", 0, 0, "2001:db8:ff::1", 0, 1, 0, "down local6 again");
             fflush(stdout);
             _exit(0);
         }
@@ -28392,6 +29297,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
     if (!strcmp(mode, "sysvipc-proc")) return sysvipc_case();
     if (!strcmp(mode, "kernel-sysctl")) return kernel_sysctl_case();
+    if (!strcmp(mode, "net-sysctl")) return net_sysctl_case();
     if (!strcmp(mode, "rseq")) return rseq_case();
     if (!strcmp(mode, "pkey")) return pkey_case();
     if (!strcmp(mode, "vector-flags")) return vector_flags_case();
@@ -28443,6 +29349,13 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "moves")) return moves_case();
     if (!strcmp(mode, "trees")) return trees_case();
     if (!strcmp(mode, "contexts")) return contexts_case();
+    if (!strcmp(mode, "setattrs")) return setattrs_case();
+    if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
+    if (!strcmp(mode, "listings")) return listings_case();
+    if (!strcmp(mode, "mount-flags-id")) {
+        printf("euid=%d egid=%d\n", (int)geteuid(), (int)getegid());
+        return 0;
+    }
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();

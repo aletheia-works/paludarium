@@ -397,6 +397,8 @@ static void show(int fd, const char *label) {
             } else if (h->type == 16) {
                 printf(" index=%d up=%u", *(int *)(body + 4), *(unsigned *)(body + 8) & 1);
                 attrs = 16;
+            } else if (h->type == 24) {
+                attrs = 12;
             }
             while (attrs >= 0 && attrs + 4 <= body_len) {
                 unsigned short alen, atype;
@@ -409,6 +411,8 @@ static void show(int fd, const char *label) {
                     if (atype == 2) printf(" offset=%u", *(unsigned *)value);
                 } else if (h->type == RTM_NEWNSID || h->type == RTM_DELNSID) {
                     printf(" nsa%u=%d", atype, *(int *)value);
+                } else if (h->type == 24) {
+                    if (atype == 25 /* RTA_UID */) printf(" uid=%u", *(unsigned *)value);
                 } else if (h->type == 16) {
                     if (atype == 3) printf(" name=%s", value);
                     if (atype == 46) printf(" netnsid=%d", *(int *)value);
@@ -1031,6 +1035,92 @@ static void link_netns_case(void) {
     peer_stop(&p);
 }
 
+/* An RTM_NEWADDR of 10.9.0.<last>/32 on lo, acknowledged. */
+static void new_address(struct request *r, unsigned seq, unsigned char last) {
+    const unsigned char address[4] = {10, 9, 0, last};
+    begin_body(r, 20, 0x605, seq, 8, AF_INET, 1);
+    r->body[1] = 32;
+    put(r, 2 /* IFA_LOCAL */, address, 4);
+}
+/* An RTM_GETROUTE for 127.0.0.1, whose answer tells the RTA_UID. */
+static void route_get(struct request *r, unsigned seq) {
+    const unsigned char loopback[4] = {127, 0, 0, 1};
+    begin_body(r, 26, 0x1, seq, 12, AF_INET, 0);
+    r->body[1] = 32;
+    put(r, 1 /* RTA_DST */, loopback, 4);
+}
+static unsigned port_of(int fd) {
+    struct nl_address name = {0};
+    socklen_t len = sizeof name;
+    getsockname(fd, (void *)&name, &len);
+    return name.pid;
+}
+#define RTNLGRP_IPV4_MROUTE_R 30
+
+static void write_credentials_case(void) {
+    lo_up();
+    int ctl = acked_socket();
+    /* Opened without capabilities, used by root. */
+    if (setresuid(0, 65534, 0)) exit(92);
+    int weak = acked_socket();
+    if (setresuid(0, 0, 0)) exit(93);
+    struct request r;
+    struct nl_address kernel = {.family = AF_NETLINK};
+    int group = RTNLGRP_IPV4_MROUTE_R;
+    printf("-- a writer without CAP_NET_ADMIN, on root's socket\n");
+    fflush(stdout);
+    pid_t user = fork();
+    if (user == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        new_address(&r, 1, 1);
+        printf("write=%d\n", write(ctl, &r, r.h.len) == r.h.len);
+        printf("bound to the writer=%d\n", port_of(ctl) == (unsigned)getpid());
+        new_address(&r, 2, 1);
+        send(ctl, &r, r.h.len, 0);
+        new_address(&r, 3, 1);
+        sendto(ctl, &r, r.h.len, 0, (void *)&kernel, sizeof kernel);
+        route_get(&r, 4);
+        write(ctl, &r, r.h.len);
+        show(ctl, "user");
+        printf("join=%ld\n", result(setsockopt(ctl, SOL_NETLINK_, ADD_MEMBERSHIP, &group, sizeof group)));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(user, &status, 0);
+    printf("user status=%#x port is the writer's=%d\n", status, port_of(ctl) == (unsigned)user);
+    printf("-- root, on root's socket\n");
+    route_get(&r, 5);
+    write(ctl, &r, r.h.len);
+    show(ctl, "ctl");
+    printf("-- root, on a socket opened without capabilities\n");
+    new_address(&r, 6, 2);
+    write(weak, &r, r.h.len);
+    new_address(&r, 7, 2);
+    send(weak, &r, r.h.len, 0);
+    new_address(&r, 8, 2);
+    sendto(weak, &r, r.h.len, 0, (void *)&kernel, sizeof kernel);
+    show(weak, "weak");
+    printf("join=%ld\n", result(setsockopt(weak, SOL_NETLINK_, ADD_MEMBERSHIP, &group, sizeof group)));
+    struct nl_address groups = {.family = AF_NETLINK, .pid = port_of(weak), .groups = 1u << (RTNLGRP_IPV4_MROUTE_R - 1)};
+    printf("bind=%ld\n", result(bind(weak, (void *)&groups, sizeof groups)));
+    struct nl_address other = {.family = AF_NETLINK, .pid = 12345};
+    printf("connect=%ld\n", result(connect(weak, (void *)&other, sizeof other)));
+    printf("-- a user's own socket\n");
+    fflush(stdout);
+    user = fork();
+    if (user == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        int own = acked_socket();
+        printf("join=%ld\n", result(setsockopt(own, SOL_NETLINK_, ADD_MEMBERSHIP, &group, sizeof group)));
+        printf("connect=%ld\n", result(connect(own, (void *)&other, sizeof other)));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(user, &status, 0);
+    printf("user status=%#x\n", status);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *mode = argv[1];
@@ -1047,6 +1137,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(mode, "netlink-nsid-write")) write_case();
         else if (!strcmp(mode, "netlink-target-netnsid")) target_case();
         else if (!strcmp(mode, "netlink-link-netns")) link_netns_case();
+        else if (!strcmp(mode, "netlink-write-credentials")) write_credentials_case();
         else return 2;
         fflush(stdout);
         _exit(0);

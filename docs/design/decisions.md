@@ -192,21 +192,65 @@ so each instruction it compiles has one meaning, the interpreter's, which
 unit tests from random states, a fuzz target and the differential tests with
 every block compiled check.
 
-It is a crate of its own because it needs `unsafe`, to map code and call
-it, and every other crate but the host's forbids it. Compiling happens on a
-thread of its own while the interpreter goes on, because compiling on the
-thread that runs the block made short programs, which run many blocks only a
-few hundred times, up to twice as slow. Cranelift's `speed` level costs
-more to compile than `none` but makes faster code, which a background
-compile can afford. The registers live in memory, not in Cranelift
-variables: each early exit then needs no copy of every register, which made
-compiling about three times faster and the code faster too.
+It is a crate of its own because it needs `unsafe`, to map code and call it, and
+every other crate but the host's forbids it. Compiling happens on a thread of
+its own while the interpreter goes on, because compiling on the thread that runs
+the block made short programs, which run many blocks only a few hundred times,
+up to twice as slow. It compiles with Cranelift's `none` level, at a block's
+300th entry. `speed` made faster code but cost more to compile. With a threshold
+of 100 that made programs of 0.1–0.25 s up to 12% slower than without the JIT,
+because they compiled dozens of blocks they then ran too few times. In one run
+of the speed check below (fork run 44116579985), `none` at 300 cut the cases the
+JIT made slower from 14 to 3. It kept most of the long programs' gain, though
+less of it for some: Perl's hash benchmark was 46% faster instead of 53%, `perl
+-c` 3% instead of 10%. The registers live in memory, not in Cranelift variables:
+each early exit then needs no copy of every register, which made compiling about
+three times faster and the code faster too.
 
-In a same-runner comparison on CI (x86-64 Linux), against the interpreter
-without it, `--jit` made Perl's hash and string benchmarks 15% and 27%
-faster, LuaJIT 15% and OCaml 8%, with every Debian program still giving
-native Linux's results; programs that run briefly changed within the
-measurement's noise. It is off by default until it has more to show.
+It now compiles more of each block than when it was added, and it is much
+faster for long programs. The numbers, and what is still slower, are in the
+criteria below. Every Debian program still gives native Linux's results with
+it. It is off by default until those criteria hold.
+
+### When the native JIT is turned on by default
+
+On Linux x86-64 hosts the native JIT is to be on by default, with `--no-jit`
+to turn it off, once all of the following hold. Other hosts and the
+WebAssembly package keep the behaviour they have. Each criterion is read off
+CI's own records, so anyone can check it:
+
+1. **Correctness on main, 14 days in a row.** Every run of the
+   `differential-jit` job on main passed (`ci.yml`, which runs on each push to
+   main that changes Rust), and so did every night's Debian comparison with
+   the JIT (the `jit` run of `distro-programs.yml`), with every case giving
+   native Linux's result. One failure starts the count again. The two
+   complement each other: the first compiles every block the first time it
+   runs, over the differential tests; the second uses the default threshold,
+   over Debian's real programs.
+2. **Fuzzing.** The nightly `jit_native` fuzz target, which compares compiled
+   code with the interpreter for arbitrary instruction bytes, found nothing in
+   each of those 14 nights. The target exists already, so no new one is needed.
+3. **No open correctness bug.** No open issue labelled `type: bug` is about
+   the native JIT (`gh issue list --state open --label "type: bug" --search
+   jit`).
+4. **Speed.** The `Native JIT speed` workflow (`jit-speed.yml`), run by hand
+   on the commit that turns the JIT on, passes. On one runner it times the
+   probe, ripgrep and aube cases, Perl's benchmarks and 12 Debian programs,
+   with and without the JIT. It fails when the JIT makes a case slower than
+   every round without it. Short programs count as much as long ones, since
+   turning the JIT on by default would add its cost to every command.
+
+The last criterion does not hold yet, by one case. It was run twice with today's
+default. On the faster runner (fork run 44126678828, Intel Xeon 6973P-C), the
+JIT made Perl's hash benchmark 32% faster, Java 47% and OCaml 38%. But one of
+the 36 cases was still slower than every round without it: aube's `list` by 3%
+(174–177 ms against 167–170 ms). On the slower runner (fork run 44116579985, AMD
+EPYC 7763), three were: probe's `fs-basic` by 4% (about 1 ms of 22 ms), probe's
+`tokio-timer` by 1% and ripgrep's `parallel` case by 2%. The criterion is met
+when no case is slower on either runner. What is left is the cost of a short
+program's first compiles. An older version of this comparison started only the
+JIT through a shell wrapper, which made programs of about 20 ms look slower than
+they are.
 
 ## One way to create a filesystem
 
@@ -232,7 +276,10 @@ interpreter runs one instruction and reports the trap, so a run without it
 pays one test and nothing per instruction. `popf`, the only instruction
 that sets the flag, ends its run when it does, so the next one is stepped;
 the kernel sets it only between runs (`rt_sigreturn`, a tracer). Neither
-JIT needs to know of the flag.
+JIT needs to know of the flag. Hardware breakpoints go the same way: while
+a tracer has one enabled, the interpreter runs the guest one instruction at
+a time and matches it against them, and a guest without any pays nothing
+for them.
 
 ## A machine with 4-level paging
 

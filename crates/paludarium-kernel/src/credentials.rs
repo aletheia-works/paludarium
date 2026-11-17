@@ -297,6 +297,21 @@ impl Credentials {
                 && target.permitted & !caps == 0)
             && crate::landlock::may_trace(&self.landlock, &target.landlock)
     }
+    /// Whether its user namespace is `ns` or one below it
+    /// (`current_in_userns`).
+    pub(crate) fn in_user_namespace_of(&self, ns: &crate::namespaces::Namespace) -> bool {
+        let mut at: &crate::namespaces::Namespace = &self.user.0;
+        loop {
+            if std::ptr::eq(at, ns) {
+                return true;
+            }
+            let up = at.owner();
+            if std::ptr::eq(up, at) {
+                return false;
+            }
+            at = up;
+        }
+    }
     /// Whether the thread has `cap` in user namespace `ns`, as Linux's
     /// `ns_capable` ([`crate::namespaces::Namespace::grants`]).
     pub(crate) fn capable_in(&self, cap: u64, ns: &crate::namespaces::Namespace) -> bool {

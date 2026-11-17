@@ -1437,10 +1437,11 @@ fn statx_fills_the_stat_fields() {
     assert_eq!(f.ret(332, &[(-100i64) as u64, DATA, 0, 0x7ff, out]), 0);
     assert_eq!(word(&f, 32), inode);
     assert_eq!(word(&f, 136), 1 << 32); // major 0, minor 1
-    // STATX_MNT_ID_UNIQUE asked for gives the unique ID in its place.
+    // STATX_MNT_ID_UNIQUE asked for gives the unique ID in its place: the
+    // root's, the first after the mount below it.
     assert_eq!(f.ret(332, &[fd, 0, 0x1000, 0x4000, out]), 0);
     assert_eq!(word(&f, 0) as u32, 0x47ff);
-    assert_eq!(word(&f, 144), 1 << 31 | 21);
+    assert_eq!(word(&f, 144), paludarium_vfs::UNIQUE_OFFSET + 2);
     assert_eq!(f.ret(332, &[fd, 0, 0, 0x7ff, out]), errno(Errno::EFAULT));
     assert_eq!(f.ret(332, &[fd, 0, 0x1000, 0x7ff, 1]), errno(Errno::EFAULT));
 }
@@ -5828,7 +5829,11 @@ mod inotify {
         let empty = put(&f, DATA + 0x80, b"");
         assert_eq!(ask(&mut f, fd, empty, 128, 0x1001), 0);
         assert_eq!(header(&mut f), tmpfs(ino));
-        assert_eq!(f.mem.read_u64(GuestAddr(mount)).unwrap(), 1 << 31 | id);
+        assert_eq!(id, 21);
+        assert_eq!(
+            f.mem.read_u64(GuestAddr(mount)).unwrap(),
+            paludarium_vfs::UNIQUE_OFFSET + 2
+        );
         assert_eq!(ask(&mut f, fd, empty, 128, 0), errno(Errno::ENOENT));
         // tmpfs cannot give a connectable handle.
         assert_eq!(ask(&mut f, cwd, file, 128, 0x2), errno(Errno::EOPNOTSUPP));
@@ -8722,6 +8727,244 @@ fn a_file_system_context_makes_and_reconfigures_a_tmpfs() {
     assert_eq!(f.ret(431, &[picked, 7, 0, 0, 0]), 0);
     let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
     assert!(info.contains(" - tmpfs x ro,size=4096k"), "{info}");
+}
+
+/// `mount_setattr` sets and clears a mount's flags and its propagation, and
+/// `open_tree_attr` a new copy's.
+#[test]
+fn mount_setattr_changes_flags_and_propagation() {
+    let mut f = fixture();
+    let attr = |f: &mut Fixture, at: u64, words: [u64; 5]| -> u64 {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        f.mem.write(GuestAddr(DATA + at), &bytes).unwrap();
+        DATA + at
+    };
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let (m, inner) = (
+        put(&mut f, 0x40, b"/tmp/m"),
+        put(&mut f, 0x60, b"/tmp/m/in"),
+    );
+    assert_eq!(f.ret(83, &[m, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, m, tmpfs, 0, 0]), 0);
+    assert_eq!(f.ret(83, &[inner, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, inner, tmpfs, 0, 0]), 0);
+    let fdcwd = (-100i64) as u64;
+    let (ro, recursive) = (1, 0x8000);
+    let set_ro = attr(&mut f, 0x200, [ro, 0, 0, 0, 0]);
+    // The flags, then the size, then the attributes.
+    assert_eq!(f.ret(442, &[fdcwd, m, 1, set_ro, 32]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, set_ro, 16]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, set_ro, 8192]), errno(Errno(7)));
+    let tail = attr(&mut f, 0x240, [ro, 0, 0, 0, 1]);
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, tail, 40]), errno(Errno(7)));
+    let nothing = attr(&mut f, 0x280, [0, 0, 0, 0, 0]);
+    let missing = put(&mut f, 0x80, b"/missing");
+    assert_eq!(f.ret(442, &[fdcwd, missing, 0, nothing, 32]), 0);
+    let two = attr(&mut f, 0x2c0, [0, 0, (1 << 18) | (1 << 20), 0, 0]);
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, two, 32]), errno(Errno::EINVAL));
+    let atime_alone = attr(&mut f, 0x300, [0x10, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(442, &[fdcwd, m, 0, atime_alone, 32]),
+        errno(Errno::EINVAL)
+    );
+    let atime_part = attr(&mut f, 0x340, [0x10, 0x10, 0, 0, 0]);
+    assert_eq!(
+        f.ret(442, &[fdcwd, m, 0, atime_part, 32]),
+        errno(Errno::EINVAL)
+    );
+    let tmp = put(&mut f, 0xa0, b"/tmp");
+    assert_eq!(
+        f.ret(442, &[fdcwd, tmp, 0, set_ro, 32]),
+        errno(Errno::EINVAL)
+    );
+    // Busy while a file is open for writing, then read-only.
+    let file = put(&mut f, 0xc0, b"/tmp/m/f");
+    let fd = f.ret(2, &[file, 0o101, 0o644]);
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, set_ro, 32]), errno(Errno(16)));
+    assert_eq!(f.ret(3, &[fd]), 0);
+    // NOSYMFOLLOW, on the mount below too, is not supported.
+    let nosymfollow = attr(&mut f, 0x3c0, [0x0020_0000, 0, 0, 0, 0]);
+    assert_eq!(
+        f.ret(442, &[fdcwd, m, recursive, nosymfollow, 32]),
+        errno(Errno::EOPNOTSUPP)
+    );
+    assert_eq!(f.ret(442, &[fdcwd, m, recursive, set_ro, 32]), 0);
+    let deep = put(&mut f, 0xe0, b"/tmp/m/in/g");
+    assert_eq!(f.ret(83, &[deep, 0o755]), errno(Errno(30)));
+    // Clear it again, take noatime, and a peer group.
+    let rw_noatime_shared = attr(&mut f, 0x380, [0x10, ro | 0x70, 1 << 20, 0, 0]);
+    assert_eq!(f.ret(442, &[fdcwd, m, 0, rw_noatime_shared, 32]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" / /tmp/m rw,noatime shared:1 - tmpfs"),
+        "{info}"
+    );
+    assert!(info.contains(" / /tmp/m/in ro,relatime - tmpfs"), "{info}");
+    // open_tree_attr: a size without attributes, then a copy made read-only.
+    assert_eq!(f.ret(467, &[fdcwd, m, 1, 0, 32]), errno(Errno::EINVAL));
+    let tree = f.ret(467, &[fdcwd, m, 1, set_ro, 32]);
+    assert!((tree as i64) >= 0);
+    let (n, empty) = (put(&mut f, 0x100, b"/tmp/n"), put(&mut f, 0x120, b""));
+    assert_eq!(f.ret(83, &[n, 0o755]), 0);
+    assert_eq!(f.ret(429, &[tree, empty, fdcwd, n, 4]), 0);
+    let info = String::from_utf8(whole(&mut f, b"/proc/self/mountinfo")).unwrap();
+    assert!(
+        info.contains(" / /tmp/n ro,noatime shared:1 - tmpfs"),
+        "{info}"
+    );
+    // A failure takes the descriptor away.
+    let before = f.ret(32, &[0]);
+    assert_eq!(f.ret(3, &[before]), 0);
+    assert_eq!(
+        f.ret(467, &[fdcwd, tmp, 0, set_ro, 32]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(f.ret(32, &[0]), before);
+}
+
+/// A file on a `noexec` mount does not run (`EACCES`), `access` does not
+/// let it, and it maps for no execution: `mmap` with `PROT_EXEC` is
+/// `EPERM` and `mprotect` to it `EACCES`.
+#[test]
+fn a_noexec_mount_runs_nothing() {
+    let mut f = fixture();
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let (n, x) = (put(&mut f, 0x40, b"/tmp/n"), put(&mut f, 0x60, b"/tmp/x"));
+    assert_eq!(f.ret(83, &[n, 0o755]), 0);
+    assert_eq!(f.ret(83, &[x, 0o755]), 0);
+    let noexec = 8;
+    assert_eq!(f.ret(165, &[none, n, tmpfs, noexec, 0]), 0);
+    assert_eq!(f.ret(165, &[none, x, tmpfs, 0, 0]), 0);
+    let (np, xp) = (
+        put(&mut f, 0x80, b"/tmp/n/prog"),
+        put(&mut f, 0xa0, b"/tmp/x/prog"),
+    );
+    for p in [np, xp] {
+        let fd = f.ret(2, &[p, 0o101, 0o755]);
+        assert_eq!(f.ret(1, &[fd, DATA, 4096]), 4096);
+        assert_eq!(f.ret(3, &[fd]), 0);
+    }
+    // Not run, before its format is looked at.
+    let argv = DATA + 0x400;
+    f.mem.write(GuestAddr(argv), &np.to_le_bytes()).unwrap();
+    f.mem
+        .write(GuestAddr(argv + 8), &0u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(f.ret(59, &[np, argv, 0]), errno(Errno::EACCES));
+    assert_eq!(f.ret(59, &[xp, argv, 0]), errno(Errno(8)));
+    assert_eq!(f.ret(21, &[np, 1]), errno(Errno::EACCES));
+    assert_eq!(f.ret(21, &[xp, 1]), 0);
+    assert_eq!(f.ret(21, &[np, 4]), 0);
+    // Mapped for reading only.
+    let (read, exec) = (1, 4);
+    let fd = f.ret(2, &[np, 0, 0]);
+    assert_eq!(
+        f.ret(9, &[0, 4096, read | exec, 2, fd, 0]),
+        errno(Errno::EPERM)
+    );
+    let at = f.ret(9, &[0, 4096, read, 2, fd, 0]);
+    assert!((at as i64) > 0);
+    assert_eq!(f.ret(10, &[at, 4096, read | exec]), errno(Errno::EACCES));
+    let xfd = f.ret(2, &[xp, 0, 0]);
+    let xat = f.ret(9, &[0, 4096, read | exec, 2, xfd, 0]);
+    assert!((xat as i64) > 0);
+}
+
+/// `listmount` gives the unique IDs of the mounts reachable from the root
+/// or from a mount, and `statmount` what one of them is.
+#[test]
+fn statmount_and_listmount_by_unique_ids() {
+    let mut f = fixture();
+    let req = |f: &mut Fixture, at: u64, words: [u64; 4]| -> u64 {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        f.mem.write(GuestAddr(DATA + at), &bytes).unwrap();
+        DATA + at
+    };
+    let (none, tmpfs) = (put(&mut f, 0, b"none"), put(&mut f, 0x10, b"tmpfs"));
+    let (m, inner) = (
+        put(&mut f, 0x40, b"/tmp/m"),
+        put(&mut f, 0x60, b"/tmp/m/in"),
+    );
+    let size = put(&mut f, 0x80, b"size=1m");
+    assert_eq!(f.ret(83, &[m, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, m, tmpfs, 0, size]), 0);
+    assert_eq!(f.ret(83, &[inner, 0o755]), 0);
+    assert_eq!(f.ret(165, &[none, inner, tmpfs, 0, 0]), 0);
+    let ids = DATA + 0x1800;
+    let read_ids = |f: &mut Fixture, n: u64| -> Vec<u64> {
+        (0..n)
+            .map(|i| f.mem.read_u64(GuestAddr(ids + 8 * i)).unwrap())
+            .collect()
+    };
+    // From the root: the root and both, in order.
+    let all = req(&mut f, 0x100, [32, u64::MAX, 0, 0]);
+    assert_eq!(f.ret(458, &[all, ids, 10, 0]), 3);
+    let listed = read_ids(&mut f, 3);
+    assert!(listed.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(listed[0], paludarium_vfs::UNIQUE_OFFSET + 2);
+    assert_eq!(f.ret(458, &[all, ids, 10, 1]), 3);
+    assert_eq!(read_ids(&mut f, 1)[0], listed[2]);
+    // After the last one given, and from a mount.
+    let after = req(&mut f, 0x120, [32, u64::MAX, listed[0], 0]);
+    assert_eq!(f.ret(458, &[after, ids, 10, 0]), 2);
+    let below = req(&mut f, 0x140, [32, listed[1], 0, 0]);
+    assert_eq!(f.ret(458, &[below, ids, 10, 0]), 1);
+    assert_eq!(read_ids(&mut f, 1)[0], listed[2]);
+    // The checks.
+    assert_eq!(f.ret(458, &[all, ids, 10, 2]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(458, &[all, ids, 2_000_000, 0]), errno(Errno(75)));
+    let small = req(&mut f, 0x160, [16, u64::MAX, 0, 0]);
+    assert_eq!(f.ret(458, &[small, ids, 10, 0]), errno(Errno::EINVAL));
+    let low = req(&mut f, 0x180, [32, 21, 0, 0]);
+    assert_eq!(f.ret(458, &[low, ids, 10, 0]), errno(Errno::EINVAL));
+    let missing = req(&mut f, 0x1a0, [32, u64::MAX - 1, 0, 0]);
+    assert_eq!(f.ret(458, &[missing, ids, 10, 0]), errno(Errno::ENOENT));
+    // statmount of /tmp/m: all it has.
+    let buf = DATA + 0x1000;
+    let stat = req(&mut f, 0x1c0, [32, listed[1], 0x7fff, 0]);
+    assert_eq!(f.ret(457, &[stat, buf, 4096, 0]), 0);
+    let word = |f: &mut Fixture, at: u64| f.mem.read_u64(GuestAddr(buf + at)).unwrap();
+    let half = |f: &mut Fixture, at: u64| word(f, at) as u32;
+    let string = |f: &mut Fixture, field: u64| -> Vec<u8> {
+        let at = u64::from(half(f, field));
+        let mut out = Vec::new();
+        let mut byte = [0];
+        loop {
+            f.mem
+                .read(GuestAddr(buf + 512 + at + out.len() as u64), &mut byte)
+                .unwrap();
+            if byte[0] == 0 {
+                return out;
+            }
+            out.push(byte[0]);
+        }
+    };
+    // All but the subtype, security options and ID mappings, which it has none of.
+    assert_eq!(word(&mut f, 8), 0x16ff);
+    assert_eq!(word(&mut f, 40), listed[1]);
+    assert_eq!(word(&mut f, 48), listed[0]);
+    assert_eq!(word(&mut f, 24), 0x0102_1994);
+    assert_eq!(word(&mut f, 72), 1 << 18);
+    assert_eq!(word(&mut f, 112), paludarium_vfs::FIRST_NAMESPACE_ID);
+    assert_eq!(word(&mut f, 144), 0x7fff);
+    assert_eq!(string(&mut f, 36), b"tmpfs");
+    assert_eq!(string(&mut f, 104), b"/");
+    assert_eq!(string(&mut f, 108), b"/tmp/m");
+    assert_eq!(string(&mut f, 124), b"none");
+    assert!(string(&mut f, 4).starts_with(b"size=1024k"));
+    assert!(half(&mut f, 128) >= 1);
+    // Too small for its strings, then a mount that is not there.
+    assert_eq!(f.ret(457, &[stat, buf, 512, 0]), errno(Errno(75)));
+    let basic = req(&mut f, 0x1e0, [32, listed[1], 2, 0]);
+    assert_eq!(f.ret(457, &[basic, buf, 64, 0]), 0);
+    assert_eq!(half(&mut f, 0), 64);
+    let gone = req(&mut f, 0x200, [32, u64::MAX - 1, 2, 0]);
+    assert_eq!(f.ret(457, &[gone, buf, 4096, 0]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(457, &[stat, buf, 4096, 2]), errno(Errno::EINVAL));
+    // statx's STATX_MNT_ID_UNIQUE is the same ID.
+    let out = DATA + 0x1c00;
+    assert_eq!(f.ret(332, &[(-100i64) as u64, inner, 0, 0x4000, out]), 0);
+    assert_eq!(f.mem.read_u64(GuestAddr(out + 144)).unwrap(), listed[2]);
 }
 
 /// `open_tree` gives a descriptor of a file or of a detached copy of its

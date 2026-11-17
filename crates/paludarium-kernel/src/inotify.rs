@@ -18,7 +18,7 @@ use paludarium_types::{Errno, GuestAddr};
 use paludarium_vfs::FileSystem;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 pub(crate) const ACCESS: u32 = 0x1;
@@ -153,6 +153,19 @@ pub(crate) struct Closing {
     device: u64,
     node: FileStat,
     writing: bool,
+    /// Exec's open waits for fanotify's answers to its permission events
+    /// ([`Self::release`]): its `IN_OPEN`, and the `IN_ACCESS` of a read
+    /// meanwhile, are held back, and a denied one tells no close.
+    held: AtomicBool,
+    /// A read while held, told on release.
+    read_held: AtomicBool,
+    /// Its reads ask `FAN_ACCESS_PERM`, as a group's mark wanted it when
+    /// exec opened the file (`FMODE_FSNOTIFY_ACCESS_PERM`).
+    access_perm: bool,
+    /// How many of exec's permission events had been asked once its open's
+    /// and its read's were ([`Self::release_through`]).
+    opened_at: usize,
+    read_at: AtomicUsize,
 }
 impl Closing {
     /// Tells the watches of the guest's open of the FIFO `node` at `path`
@@ -220,12 +233,59 @@ impl Closing {
         }
         let mut closing = Self::unopened(caches, fs, Arc::default(), device, node, 0);
         closing.file = Some(Arc::clone(file));
-        closing.tell(OPEN);
+        closing.ask_exec();
         Some(closing)
     }
     /// The device of the file's node.
     pub(crate) fn device(&self) -> u64 {
         self.device
+    }
+    /// [`open`](Self::open) of a program exec runs or its interpreter
+    /// (`do_open_execat`, `__FMODE_EXEC`): `fsnotify_open` adds
+    /// `FS_OPEN_EXEC` to its `IN_OPEN`, which fanotify hears as
+    /// `FAN_OPEN_EXEC` and inotify does not.
+    pub(crate) fn exec(
+        caches: &Arc<PageCaches>,
+        fs: &Arc<dyn FileSystem>,
+        path: &[u8],
+        device: u64,
+        node: &FileStat,
+    ) -> Self {
+        let place = caches.keep_place((device, node.inode), path);
+        let mut closing = Self::unopened(caches, fs, place, device, node, 0);
+        closing.ask_exec();
+        closing
+    }
+    /// `fsnotify_open_perm_and_set_mode` of exec's open (`__FMODE_EXEC`):
+    /// `FAN_OPEN_EXEC_PERM`, then `FAN_OPEN_PERM`, and whether its reads ask
+    /// `FAN_ACCESS_PERM`; then its `IN_OPEN` with `FS_OPEN_EXEC`, held back
+    /// while any is asked, until [`Self::release`].
+    fn ask_exec(&mut self) {
+        let asked = crate::fanotify::asked();
+        self.tell(crate::fanotify::OPEN_EXEC_PERM);
+        self.tell(crate::fanotify::OPEN_PERM);
+        self.opened_at = crate::fanotify::asked();
+        self.access_perm = crate::fanotify::probing(|| self.tell(crate::fanotify::ACCESS_PERM));
+        if crate::fanotify::asked() > asked {
+            self.held = AtomicBool::new(true);
+        } else {
+            self.tell(OPEN | crate::fanotify::OPEN_EXEC);
+        }
+    }
+    /// Tells what an open held back, once `through` of exec's permission
+    /// events were let through: its `IN_OPEN` when its open's were, even
+    /// if a later file's are denied (then it closes too), and a read's
+    /// `IN_ACCESS` when that read's was.
+    pub(crate) fn release_through(&self, through: usize) {
+        if through < self.opened_at || !self.held.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.tell(OPEN | crate::fanotify::OPEN_EXEC);
+        if self.read_held.swap(false, Ordering::SeqCst)
+            && through >= self.read_at.load(Ordering::SeqCst)
+        {
+            self.tell(ACCESS);
+        }
     }
     fn open_at(
         caches: &Arc<PageCaches>,
@@ -255,13 +315,28 @@ impl Closing {
             device,
             node: *node,
             writing: flags & 3 != 0,
+            held: AtomicBool::new(false),
+            read_held: AtomicBool::new(false),
+            access_perm: false,
+            opened_at: 0,
+            read_at: AtomicUsize::new(0),
         }
     }
     /// Tells the watches of exec's read of the file's first bytes
     /// (`kernel_read`'s `IN_ACCESS`), which an empty file has none of.
     pub(crate) fn read(&self) {
         if self.node.size > 0 {
-            self.tell(ACCESS);
+            // `kernel_read`'s `rw_verify_area` asks first.
+            if self.access_perm {
+                self.tell(crate::fanotify::ACCESS_PERM);
+                self.read_at
+                    .store(crate::fanotify::asked(), Ordering::SeqCst);
+            }
+            if self.held.load(Ordering::SeqCst) {
+                self.read_held.store(true, Ordering::SeqCst);
+            } else {
+                self.tell(ACCESS);
+            }
         }
     }
     fn tell(&self, mask: u32) {
@@ -297,11 +372,14 @@ impl Closing {
 }
 impl Drop for Closing {
     fn drop(&mut self) {
-        self.tell(if self.writing {
-            CLOSE_WRITE
-        } else {
-            CLOSE_NOWRITE
-        });
+        // A denied open was never opened: no close.
+        if !*self.held.get_mut() {
+            self.tell(if self.writing {
+                CLOSE_WRITE
+            } else {
+                CLOSE_NOWRITE
+            });
+        }
         // `__fput` then lets go of the dentry: a removed file the last of
         // its opens held ends now.
         drop(std::mem::take(&mut self.place));
@@ -1106,7 +1184,9 @@ impl Instance {
             return;
         }
         let oneshot = watch.mask & ONESHOT != 0;
-        // inotify never reported IN_ISDIR with these.
+        // `inotify_mask_to_arg`: none of fsnotify's other bits (fanotify's
+        // `FS_OPEN_EXEC`); and inotify never reported IN_ISDIR with these.
+        let mask = mask & (ALL_EVENTS | ISDIR | UNMOUNT | IGNORED | Q_OVERFLOW);
         let mask = if mask & (MOVE_SELF | DELETE_SELF) != 0 {
             mask & !ISDIR
         } else {

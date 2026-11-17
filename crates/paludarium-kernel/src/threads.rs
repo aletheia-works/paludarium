@@ -2195,6 +2195,7 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let child_namespaces = own.for_child(namespaces, true, &parent.state.credentials.user.0)?;
+        crate::netconf::inherit_new(&child_namespaces, namespaces, self.files.network.as_ref());
         let mounts = (namespaces & crate::namespaces::CLONE_NEWNS != 0).then(|| {
             crate::namespaces::copy_mounts(
                 &child_namespaces.mnt,
@@ -2299,6 +2300,16 @@ impl Kernel {
             let _ = mem.write(GuestAddr(a[3]), &tid.to_le_bytes());
         }
         child.publish(tid, &state, mem);
+        // perf_event_init_task: the thread inherits the events of its
+        // creator that have `inherit`.
+        crate::perf::clone(
+            &self.processes.perf_events,
+            &self.group,
+            parent.tid,
+            &self.group,
+            tid,
+            flags,
+        );
         self.pending_child = Some((Box::new(child), Thread { tid, cpu, state }));
         Ok(u64::from(tid))
     }

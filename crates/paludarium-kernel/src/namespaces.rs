@@ -145,6 +145,9 @@ pub(crate) fn copy_mounts(
 ) -> Arc<paludarium_vfs::MountTable> {
     let locked = !std::ptr::eq(old.owner(), owner);
     let table = mount_table(old, files).copy(locked);
+    if let Some(owner) = &new.owner {
+        table.set_owner(Arc::clone(owner) as Arc<dyn std::any::Any + Send + Sync>);
+    }
     let _ = new.mounts.set(Arc::clone(&table));
     table
 }
@@ -674,6 +677,8 @@ impl Namespaces {
         }
         if flags & CLONE_NEWNET != 0 {
             new.net = self.fresh(&self.net, owner);
+            // Its settings come from the first namespace's network, which
+            // the caller has ([`crate::netconf::inherit_new`]).
             let network = Arc::new(crate::inet::Network::isolated(owner));
             let _ = new.net.sockets.network.set(network);
         }

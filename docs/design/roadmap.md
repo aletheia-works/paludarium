@@ -24,7 +24,8 @@ Nothing here is a promise, but these are on the table:
   by yanked crates and security advisories in their dependencies).
 - More system calls and instructions (see [Limitations](../guide/limitations)).
 - The native JIT (`--jit`, experimental on Linux x86-64): turning it on by
-  default, other hosts (Arm64, macOS, Windows), and compiling more of each
+  default once the criteria in [Decisions](decisions#when-the-native-jit-is-turned-on-by-default)
+  hold, other hosts (Arm64, macOS, Windows), and compiling more of each
   block (more instructions, blocks joined to each other, flags worked out
   only when they are read).
 - Revisiting building with stable Rust.

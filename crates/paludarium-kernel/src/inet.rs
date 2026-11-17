@@ -308,6 +308,9 @@ pub(crate) struct Network {
     /// ([`Self::addresses_at`]), for netlink to tell of
     /// ([`crate::netlink::expire`]); locked after the addresses.
     expired: Mutex<Vec<crate::interface::Event>>,
+    /// Its network devices ([`crate::netdev`]), each taken out alone:
+    /// none of the other locks is taken while it is held.
+    devices: Mutex<crate::netdev::Devices>,
     /// The netlink sockets bound in it ([`crate::netlink`]).
     pub(crate) netlink: crate::netlink::Ports,
     /// Its MCTP sockets' binds and tags ([`crate::mctp`]).
@@ -337,6 +340,7 @@ impl Network {
             up: AtomicBool::new(true),
             ever_up: AtomicBool::new(true),
             addresses: Mutex::new(crate::interface::Addresses::first()),
+            devices: Mutex::new(crate::netdev::Devices::new()),
             expired: Mutex::new(Vec::new()),
             netlink: crate::netlink::Ports::default(),
             mctp: crate::mctp::Endpoints::default(),
@@ -354,6 +358,7 @@ impl Network {
             up: AtomicBool::new(false),
             ever_up: AtomicBool::new(false),
             addresses: Mutex::new(crate::interface::Addresses::isolated()),
+            devices: Mutex::new(crate::netdev::Devices::new()),
             expired: Mutex::new(Vec::new()),
             ..Self::new(NetworkPolicy::default())
         }
@@ -380,6 +385,17 @@ impl Network {
     /// monotonic `now` ([`crate::interface::Addresses::output`]).
     fn output(&self, to: IpAddr, now: Option<u64>) {
         self.addresses().output(plain(to), now.unwrap_or(0));
+    }
+    /// Its network devices.
+    pub(crate) fn devices(&self) -> MutexGuard<'_, crate::netdev::Devices> {
+        self.devices.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Whether it has a device of `index` (`__dev_get_by_index`), which an
+    /// address, route or neighbour request names.
+    pub(crate) fn has_device(&self, index: impl TryInto<i32>) -> bool {
+        index
+            .try_into()
+            .is_ok_and(|index| self.devices().by_index(index).is_some())
     }
     /// The loopback's addresses.
     pub(crate) fn addresses(&self) -> MutexGuard<'_, crate::interface::Addresses> {
@@ -442,6 +458,17 @@ impl Network {
     pub(crate) fn owner(&self) -> &crate::namespaces::Namespace {
         self.owner.as_deref().unwrap_or(crate::users::first())
     }
+    /// The loopback's settings ([`crate::netconf`]).
+    pub(crate) fn lo_conf(&self) -> (crate::netdev::Conf4, crate::netdev::Conf6) {
+        self.devices()
+            .by_index(crate::netdev::LOOPBACK_INDEX)
+            .map(|lo| (lo.conf4, lo.conf6))
+            .unwrap_or_default()
+    }
+    /// Whether the loopback's IPv6 is off (`disable_ipv6`).
+    pub(crate) fn ipv6_off(&self) -> bool {
+        self.lo_conf().1.disable_ipv6 != 0
+    }
     /// Whether the loopback is up.
     pub(crate) fn is_up(&self) -> bool {
         self.up.load(Ordering::SeqCst)
@@ -456,18 +483,36 @@ impl Network {
     /// `None` when it already is, else what happened to the addresses and
     /// routes at `now`, for netlink to tell ([`crate::netlink::set_up`]).
     pub(crate) fn set_up(&self, up: bool, now: u64) -> Option<Vec<crate::interface::Event>> {
+        // The devices, alone, before the addresses.
+        let v6 = !self.ipv6_off();
         let mut addresses = self.addresses();
         if up == self.is_up() {
             return None;
         }
         let events = if up {
             self.ever_up.store(true, Ordering::SeqCst);
-            addresses.up(now)
+            addresses.up(now, v6)
         } else {
             addresses.down()
         };
         self.up.store(up, Ordering::SeqCst);
         Some(events)
+    }
+    /// Turns the loopback's IPv6 off or on, as a change of its
+    /// `disable_ipv6` does (`dev_disable_change`): off, it loses its IPv6
+    /// addresses and routes (`addrconf_ifdown`); on, while it is up, it
+    /// takes `::1` and its permanent addresses' routes back at `now`
+    /// (`NETDEV_UP`). What happened, for netlink to tell
+    /// ([`crate::netlink::set_ipv6`]).
+    pub(crate) fn set_ipv6(&self, on: bool, now: u64) -> Vec<crate::interface::Event> {
+        let mut addresses = self.addresses();
+        if !on {
+            addresses.down6()
+        } else if self.is_up() {
+            addresses.up6(now)
+        } else {
+            Vec::new()
+        }
     }
     /// `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` on the interface
     /// `name` (the `ifr_name` of a `struct ifreq`): the loopback `lo`, index
@@ -488,10 +533,9 @@ impl Network {
         if request == SIOCSIFFLAGS && !may_administer {
             return Err(Errno::EPERM);
         }
-        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-        if &name[..end] != b"lo" {
+        let Some(index) = self.devices().by_name(name).map(|d| d.index) else {
             return Err(ENODEV);
-        }
+        };
         match request {
             SIOCGIFFLAGS => Ok(u32::from(if self.up.load(Ordering::SeqCst) {
                 IFF_UP | IFF_LOOPBACK | IFF_RUNNING
@@ -502,7 +546,7 @@ impl Network {
                 crate::netlink::set_up(self, flags & IFF_UP != 0, now);
                 Ok(0)
             }
-            _ => Ok(1),
+            _ => Ok(index.unsigned_abs()),
         }
     }
     /// How many dropped handshakes wait to be tried again.

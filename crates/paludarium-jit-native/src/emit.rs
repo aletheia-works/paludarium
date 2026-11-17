@@ -45,6 +45,9 @@ pub(crate) struct Helpers {
     pub load128: u64,
     /// `(context, address, from) -> status`: the two words at `from`.
     pub store128: u64,
+    /// `(context, address, size, kind, a, b) -> (old, status)`: a locked
+    /// exchange (`kind` 0) or compare and exchange.
+    pub atomic: u64,
 }
 
 const I64: Type = types::I64;
@@ -71,6 +74,7 @@ struct Emitter<'a, 'b> {
     load_sig: cranelift_codegen::ir::SigRef,
     store_sig: cranelift_codegen::ir::SigRef,
     move128_sig: cranelift_codegen::ir::SigRef,
+    atomic_sig: cranelift_codegen::ir::SigRef,
     /// Whether the code reaches the xmm words of the register block.
     vector: bool,
 }
@@ -278,6 +282,29 @@ impl Emitter<'_, '_> {
         self.b.inst_results(call)[0]
     }
 
+    /// The locked access of `kind` (0: exchange with `a`; 1: compare with
+    /// `a` and exchange with `b`) of `size` bytes at `address`: the old
+    /// value and the status.
+    fn atomic(
+        &mut self,
+        address: Value,
+        size: u8,
+        kind: i64,
+        a: Value,
+        b: Value,
+    ) -> (Value, Value) {
+        let size = self.constant(i64::from(size));
+        let kind = self.constant(kind);
+        let callee = self.constant(self.helpers.atomic as i64);
+        let call = self.b.ins().call_indirect(
+            self.atomic_sig,
+            callee,
+            &[self.context, address, size, kind, a, b],
+        );
+        let results = self.b.inst_results(call);
+        (results[0], results[1])
+    }
+
     /// The address of xmm register `n` in the register block.
     fn xmm_slot(&mut self, n: u8) -> Value {
         self.vector = true;
@@ -325,6 +352,92 @@ impl Emitter<'_, '_> {
         self.b.ins().band_imm_s(t, 0x00ff_00ff_00ff_00ff)
     }
 
+    /// The low 32 bits of `v` with word `n` moved to word `2n`, the other
+    /// words 0.
+    fn spread_words(&mut self, v: Value) -> Value {
+        let t = self.b.ins().band_imm_s(v, 0xffff_ffff);
+        let up = self.b.ins().ishl_imm_s(t, 16);
+        let t = self.b.ins().bor(t, up);
+        self.b.ins().band_imm_s(t, 0x0000_ffff_0000_ffff)
+    }
+
+    /// The interleave of the low halves of `a` and `b` (64-bit words) in
+    /// lanes of `bits`, as `punpckl` has it for one word of output: the
+    /// low 32 bits of each when `upper` is false, the high 32 otherwise.
+    fn interleave(&mut self, a: Value, b: Value, bits: u32, upper: bool) -> Value {
+        let (a, b) = if upper {
+            (
+                self.b.ins().ushr_imm_s(a, 32),
+                self.b.ins().ushr_imm_s(b, 32),
+            )
+        } else {
+            (a, b)
+        };
+        match bits {
+            8 => {
+                let a = self.spread_bytes(a);
+                let b = self.spread_bytes(b);
+                let b = self.b.ins().ishl_imm_s(b, 8);
+                self.b.ins().bor(a, b)
+            }
+            16 => {
+                let a = self.spread_words(a);
+                let b = self.spread_words(b);
+                let b = self.b.ins().ishl_imm_s(b, 16);
+                self.b.ins().bor(a, b)
+            }
+            _ => {
+                let a = self.b.ins().band_imm_s(a, 0xffff_ffff);
+                let b = self.b.ins().ishl_imm_s(b, 32);
+                self.b.ins().bor(a, b)
+            }
+        }
+    }
+
+    /// The `source`-bit signed lanes of the 128-bit value `(low, high)`
+    /// saturated to `destination` bits (unsigned when `unsigned`), packed
+    /// into one 64-bit word, as `sse::pack` has them.
+    fn pack(
+        &mut self,
+        low: Value,
+        high: Value,
+        source: u32,
+        destination: u32,
+        unsigned: bool,
+    ) -> Value {
+        let lanes = 128 / source;
+        let per_word = lanes / 2;
+        let (least, most) = if unsigned {
+            (0i64, (1i64 << destination) - 1)
+        } else {
+            (
+                -(1i64 << (destination - 1)),
+                (1i64 << (destination - 1)) - 1,
+            )
+        };
+        let least = self.constant(least);
+        let most = self.constant(most);
+        let mut out = self.constant(0);
+        for n in 0..lanes {
+            let word = if n < per_word { low } else { high };
+            let shift = i64::from((n % per_word) * source);
+            let lane = if shift == 0 {
+                word
+            } else {
+                self.b.ins().ushr_imm_s(word, shift)
+            };
+            let up = i64::from(64 - source);
+            let lane = self.b.ins().ishl_imm_s(lane, up);
+            let lane = self.b.ins().sshr_imm_s(lane, up);
+            let lane = self.b.ins().smax(lane, least);
+            let lane = self.b.ins().smin(lane, most);
+            let lane = self.b.ins().band_imm_s(lane, (1i64 << destination) - 1);
+            let lane = self.b.ins().ishl_imm_s(lane, i64::from(n * destination));
+            out = self.b.ins().bor(out, lane);
+        }
+        out
+    }
+
     /// The top bits of the 8 bytes of `w`, as an 8-bit mask: the bits,
     /// moved to the low bit of each byte, multiplied so that bit `56 + n`
     /// collects byte `n`'s without any carry.
@@ -354,6 +467,34 @@ impl Emitter<'_, '_> {
         let (b0, b1) = self.xmm_words(src);
         let (low, high) = match op {
             Mnemonic::Punpcklqdq => (a0, b0),
+            Mnemonic::Punpckhqdq => (a1, b1),
+            Mnemonic::Punpcklwd => (
+                self.interleave(a0, b0, 16, false),
+                self.interleave(a0, b0, 16, true),
+            ),
+            Mnemonic::Punpckhbw | Mnemonic::Punpckhwd | Mnemonic::Punpckhdq => {
+                let bits = match op {
+                    Mnemonic::Punpckhbw => 8,
+                    Mnemonic::Punpckhwd => 16,
+                    _ => 32,
+                };
+                (
+                    self.interleave(a1, b1, bits, false),
+                    self.interleave(a1, b1, bits, true),
+                )
+            }
+            Mnemonic::Packuswb => (
+                self.pack(a0, a1, 16, 8, true),
+                self.pack(b0, b1, 16, 8, true),
+            ),
+            Mnemonic::Packsswb => (
+                self.pack(a0, a1, 16, 8, false),
+                self.pack(b0, b1, 16, 8, false),
+            ),
+            Mnemonic::Packssdw => (
+                self.pack(a0, a1, 32, 16, false),
+                self.pack(b0, b1, 32, 16, false),
+            ),
             Mnemonic::Paddq => (self.b.ins().iadd(a0, b0), self.b.ins().iadd(a1, b1)),
             Mnemonic::Psubq => (self.b.ins().isub(a0, b0), self.b.ins().isub(a1, b1)),
             Mnemonic::Pand => (self.b.ins().band(a0, b0), self.b.ins().band(a1, b1)),
@@ -929,6 +1070,38 @@ impl Emitter<'_, '_> {
                 }
                 self.set_carry_overflow(overflow);
             }
+            Fast::CmpxchgStore { mem, src } => {
+                let size = mem.size;
+                let rax = self.gpr(0);
+                let expected = self.masked(rax, size);
+                let new = self.read(src);
+                let address = self.linear(&mem);
+                let (old, status) = self.atomic(address, size, 1, expected, new);
+                self.unless_failed(status, n, rip);
+                let (_, f) = self.alu(Alu::Sub, expected, old, size);
+                self.set_status(f);
+                // rax takes the old value only when the compare failed; a
+                // 32-bit write would otherwise clear its upper half.
+                let merged = if size >= 4 {
+                    old
+                } else {
+                    let kept = self.b.ins().band_imm_s(rax, !mask(size));
+                    self.b.ins().bor(kept, old)
+                };
+                let same = self.b.ins().icmp(IntCC::Equal, expected, old);
+                let value = self.b.ins().select(same, rax, merged);
+                self.set_gpr(0, value);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::XchgStore { mem, src } => {
+                let value = self.read(src);
+                let address = self.linear(&mem);
+                let zero = self.constant(0);
+                let (old, status) = self.atomic(address, mem.size, 0, value, zero);
+                self.unless_failed(status, n, rip);
+                self.write(src, old);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::XmmMove { dst, src } => {
                 let low = self.word(XMM + 2 * usize::from(src));
                 let high = self.word(XMM + 2 * usize::from(src) + 1);
@@ -1237,6 +1410,10 @@ pub(crate) fn function(
     move128_sig.params.extend([AbiParam::new(I64); 3]);
     move128_sig.returns.push(AbiParam::new(I64));
     let move128_sig = b.import_signature(move128_sig);
+    let mut atomic_sig = Signature::new(CallConv::SystemV);
+    atomic_sig.params.extend([AbiParam::new(I64); 6]);
+    atomic_sig.returns.extend([AbiParam::new(I64); 2]);
+    let atomic_sig = b.import_signature(atomic_sig);
 
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
@@ -1261,6 +1438,7 @@ pub(crate) fn function(
         load_sig,
         store_sig,
         move128_sig,
+        atomic_sig,
         vector: false,
     };
     let mut open = true;

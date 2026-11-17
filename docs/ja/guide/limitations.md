@@ -52,8 +52,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   取り込みます（`fault_around_bytes`）。`MAP_POPULATE`、`MAP_LOCKED`、ロックが
   取り込むはずのページも、触れたときに数えます。ヒュージページもプロテクションキーも
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
-  `ui`（提供しない `userfaultfd` のマイナーのモード）、`ht`、`dp`
-  （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
+  `ht`、`dp`（`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
 - **`/proc/<pid>/pagemap` の一部**：エントリーは、`smaps` の値と同じくエミュレーターのページのエントリーから出します。
   `fork` が共有したページは、相手が手放したあとも、このプロセスが書き込むまで
   ここだけのもの（ビット 56）になりません。共有メモリやファイルのページは、ほかに誰が
@@ -67,13 +66,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
 - **4 段のページングだけ**：エミュレートするマシンは、ホストの CPU にかかわらず常に 4 段の
   ページテーブルを持ちます。ユーザー空間は 2^47 バイト未満で終わり、`TASK_SIZE_MAX` を使う
   検査ではすべて 2^47 - 4096 です。`ptrace` の `PTRACE_POKEUSER`、`PTRACE_SETREGS`、
-  `PTRACE_ARCH_PRCTL` が受け取る `fs` と `gs` のベース（`EIO`、`EPERM`）がそうです。5 段のページング（LA57）の CPU の Linux は、
+  `PTRACE_ARCH_PRCTL` が受け取る `fs` と `gs` のベース（`EIO`、`EPERM`）と、デバッグレジスタの
+  ハードウェアブレークポイントの範囲（`EINVAL`）がそうです。5 段のページング（LA57）の CPU の Linux は、
   `mmap` のヒントでそこを求めたプロセスにだけ 2^47 より上をマップしますが、`TASK_SIZE_MAX` は
   2^56 - 4096 なので、これらの検査は、その間の値を受け付けます。paludarium はそれを
   拒みます（[設計判断](../design/decisions)）。
 - **ほかの `/proc` の一部**：作るのは、プロセスのディレクトリといくつかのシステムの
   ファイルだけです（[機能](./features) を参照）。ほかのシステムのファイル（`/proc/cpuinfo`、
-  `/proc/sys` のファイルのうち、`fs` と `kernel` にあるもの以外など）と、読むプロセス自身のディレクトリのほかの名前
+  `/proc/sys` のファイルのうち、`fs`、`kernel`、`net` にあるもの以外など）と、読むプロセス自身のディレクトリのほかの名前
   （`io`、`personality` など）は、ふつうのパスと同じように探すので、`--mount /:/` ではホストの
   `/proc` に届きます。ほかのプロセスのディレクトリでは、それらは `ENOENT` です。Linux は
   root に `io` や `wchan` なども見せます。ほかのプロセスの `fd` のリンクの先へ続くパス
@@ -195,8 +195,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `ENOENT` で、ハードウェアのイベントも、PMU のあるホストでも `ENOENT` です。スレッドの
   CPU 時間は、最後のシステムコールで最後に記録したものです。CPU のイベントは経った時間を
   数えます。リングバッファはないので、イベントの `mmap` は `ENODEV`、サンプリングする
-  イベントはサンプルを取らずシグナルも送らず、`poll` は読めるとは見ません。`inherit` は
-  受け付けますが子は数えず、一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
+  イベントはサンプルを取らずシグナルも送らず、`poll` は読めるとは見ません。`inherit_stat` は
+  受け付けますが、記録するものがないので、引き継いだイベントの終わりに読み取りの記録は
+  送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。`PERF_FLAG_FD_OUTPUT` と ioctl の
   `SET_OUTPUT`、`SET_FILTER`、`SET_BPF`、`PAUSE_OUTPUT`、`QUERY_BPF`、
   `MODIFY_ATTRIBUTES` は、何もしないか `ENOTTY` です。`remove_on_exec` は、
@@ -205,27 +206,37 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   Linux 7.0 はグループに残し、リーダーとしても受け付けるので、これらは単体テストだけで
   確かめています。`execve` を待つイベントと、それぞれのスレッドが開いたイベントは、
   エミュレートするマシンごとに置き、スレッドグループとスレッドで照合して、閉じたときに除きます。
-  タスクが終わったイベントは、ここでは Linux の `EXIT` の状態にならないので、新しいグループを
-  率いられます。master は `ENODEV` を返します。グループのメンバーは、どのソフトウェアの
-  クロックでも数えます。Linux は、テストを動かす x86-64 のマシンで、`task-clock` のグループの
-  `cpu-clock` のメンバーに数を与えませんでした（理由は分かっていません）。Linux master の
+  タスクが終わったイベントも、master と同じく新しいグループを率いられません（`ENODEV`）。
+  テストのマシンの 7.0 は受け付けます。グループのメンバーは、どのソフトウェアのイベントでも、
+  リーダーが数える間は数えます。Linux では、リーダーと別のソフトウェアの PMU のメンバー
+  （`task-clock` のグループの `cpu-clock` のメンバー、その逆、どちらかと `dummy`）は、自分の
+  PMU のコンテキスト（`find_get_pmu_context`）を持ち、それがリーダーのものとは別に
+  スケジュールされるので、x86-64 のテストのマシンでは、リーダーの時間のうち実行ごとに変わる
+  一部（なしからほぼすべてまで）だけ動きます。テストは一つの PMU のイベントだけを
+  グループにします。Linux master の
   176 バイトの構造体の SIMD レジスタのフィールドは、master と同じく確かめますが、Linux とは
   比べていません。テストのマシンの Linux 7.0 は 144 バイトまでしか知らず、0 でないものには
   `E2BIG` を返します。`kernel.perf_event_paranoid` は
   最初 Linux の 2 です（Debian と Ubuntu のカーネルの既定はそれより大きい）。
-- **BPF はマップだけ**：`bpf` が作るのは配列とハッシュだけです。プログラム
-  （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
+- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュ、キュー、スタック、ブルームフィルタだけです。プログラムを
+  読み込むことはありません。検証器はなく、BPF は動きません。`BPF_PROG_LOAD` は Linux と同じく
+  引数を確かめたあと、プログラムの型を組み込まずにビルドしたカーネルと同じく、どのプログラムも
+  `EINVAL` で断ります。Linux なら読み込むプログラムや、検証器がほかのエラー（多くは `EACCES`）で
+  断るプログラムも、この `EINVAL` になり、ログは書きません。ほかのプログラムのコマンド
+  （`BPF_PROG_TEST_RUN` など）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
   （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
   `BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、Linux にあってここにない
-  コマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf はプログラムを読み込めず
-  （最小のプログラムでの確認が `ENOSYS` で失敗します）、`bpftool feature` は、
-  `BPF_PROG_LOAD` を呼んで `ENOSYS` かどうかを見るので、`bpf()` システムコールがないと
-  言います。ほかのマップの型は、それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。
+  コマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf の
+  最小のプログラムでの確認は `EINVAL` で失敗し、読み込めるプログラムの型は見つかりません。
+  `bpftool feature` は、`bpf()` システムコールは見つけますが、プログラムの型は見つけません。ほかのマップの型は、それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。
   CPU ごとの型（`BPF_MAP_TYPE_PERCPU_ARRAY`、`PERCPU_HASH`、`LRU_PERCPU_HASH`）は、
   値が使いうる CPU ごとに一つあり、テストのマシンとエミュレータで CPU の数え方が違うので、
   どのみち Linux と比べられません。ハッシュはキーをバイトの順に返します。Linux の順は
   バケットとランダムなシードで決まります。そのバッチは要素一つずつをバケットとして扱うので、
-  `in_batch` と `out_batch` は要素を数えます。マップのメモリは、上流の Linux
+  `in_batch` と `out_batch` は要素を数えます。LRU ハッシュは、どのコマンドも使う一つの CPU の
+  リストを持ちます。Linux では CPU ごとにローカルなリストがあるので、一つのマップの更新が
+  いくつもの CPU から来ると、いっぱいのときに手放すキーが違うことがあります（差分テストは
+  一つの CPU に固定して動きます）。マップのメモリは、上流の Linux
   ではなく、テストのマシンのカーネル（Ubuntu の Linux 7.0）の構造体の大きさに従います。その
   `struct bpf_map` には、Ubuntu が Linux 7.2 から取り込んだ `u32 excl`（0fb6c9ed6493。7.3 で
   削除）があるので、配列のヘッダーは 312 バイトで、上流の v7.0 の 304 バイトより大きくなります。
@@ -402,18 +413,16 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     専用のワーカーではなく、次の鍵の呼び出しの始めに行います。最後のリンクを失った鍵は
     すぐになくなり、割り当ても戻ります。Linux では少しあとで解放します。スレッドのキーリングが従うのは、`setfsuid` や `setuid` などが変える
     ファイルシステムの ID だけです。
-  - `/proc/sys` のファイルは、`write`、`writev`、aio、`sendfile` での書き込みでは書き手を
-    確かめ直しますが、位置を指定した書き込み（`pwrite64`、位置を指定した `pwritev`）
-    では開いたときにしか確かめません。Linux はどの書き込みでも確かめます。また、サイズ
-    として値の長さを示します。Linux は 0 です。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
   - `ptrace` の、機能の一覧にない要求は `EIO` を返します。
     `PTRACE_ARCH_PRCTL` は、エミュレータの `arch_prctl` と同じく `fs` と `gs` のベースだけで、
     ほかは `EINVAL` です。`NT_X86_XSTATE` は、XSAVE のない CPU と同じく
-    `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。ハードウェアブレークポイントは
-    なく、デバッグレジスタは未使用として読め（DR6 は `0xffff0ff0`）、DR7 を 0 にする以外の
-    書き込みは `EIO` です。トレーサーが 64 ビットのユーザーのもの以外の `cs` や `ss` を書くと、
+    `ENODEV` です（エミュレートする CPU は XSAVE を持ちません）。データのブレークポイントは、
+    `rep` 付きの文字列命令では、アーキテクチャの定めどおり範囲に触れた回の後で止まります。CPU の
+    高速な文字列操作は、何回か後に報告することがあります。`FXRSTOR` の領域の末尾 48 バイト（アーキテクチャがソフトウェアに残す部分）への読み取りのブレークポイントには
+    当たりません。`FXRSTOR` は戻す 416 バイトだけを読むからです。AMD の CPU はそこも読み、止まります。`MASKMOVDQU` のマスクが外したバイトへの書き込みのブレークポイントにも、そこには
+    書かないので当たりません。Intel の CPU はそこで止まり、AMD の CPU は止まりません。トレーサーが 64 ビットのユーザーのもの以外の `cs` や `ss` を書くと、
     そのセレクタは残って見えますが、トレース対象は 64 ビットのまま動きます。Linux ではその
     セグメントで動くか、フォールトします。
   - `mincore` は、ファイルのページをファイルの範囲内なら常にメモリにあるとします。
@@ -459,8 +468,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `EOPNOTSUPP` で、プログラムはできないことを知れます。`open_tree` の
   `OPEN_TREE_NAMESPACE`（Linux master で新しいもの）と `move_mount` の
   `MOVE_MOUNT_BENEATH`、`fsmount` の `FSMOUNT_NAMESPACE`（Linux master で新しいもの）と
-  tmpfs への `MOUNT_ATTR_NOSYMFOLLOW`、`/proc` や `/dev` の `fspick` も同じです。
-  `mount_setattr`、`statmount`、`listmount` はありません（`ENOSYS`）。
+  tmpfs への `MOUNT_ATTR_NOSYMFOLLOW`、`/proc` や `/dev` の `fspick`、ID を
+  マップしたマウント（`mount_setattr` と `open_tree_attr` の `MOUNT_ATTR_IDMAP`。その
+  ユーザー名前空間のディスクリプタを確かめたあと）も同じです。一意なマウントの ID と
+  マウント名前空間の ID は、このマシンの中だけで数えます。Linux ではホストのものと共通
+  です（最初の名前空間の ID は Linux と同じ 8）。名前空間のファイルは `NS_GET_MNTNS_ID`
+  や `NS_GET_ID` を受け取りません。`statmount` の `propagate_from` は、mountinfo の
+  ものと同じく名前空間のルートから求めます。切り離された木のマウントへの
+  `STATMOUNT_BY_FD` は、匿名の名前空間に 1 つだけのものに対する Linux と同じく `ENOENT`
+  で、マウントは呼び出し元の名前空間で、ファイルのいまの場所から求めます。Linux は
+  ファイル自身のマウントを使います（`setns` の前に開いたものも、いまの名前空間で探し
+  ます）。
   ファイルシステムのコンテキストが作るのは、`mount` と同じく tmpfs だけで、記録する
   メッセージはパラメーターとマウントし直しのものだけです。起動したときからある
   スーパーブロックのコンテキストは、共通のフラグ（`ro`、`sync` など）しか受け取りません。
@@ -477,10 +495,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ほかのユーザー名前空間のマウント名前空間では `master:1`）のことがよくあります。ピア
   グループの番号はこのマシンのマウントの中だけで 1 から数えます。Linux ではホストのものと
   共通です。`propagate_from:` は名前空間のルートから求め、`chroot` のあとの読み手の
-  ルートからではありません。効かせるのは `MS_RDONLY`（`EROFS`）だけです。tmpfs の
-  マウントの `size`、`nr_blocks`、`nr_inodes` は返しますが効かせません（メモリ上の
-  ファイルシステムが埋まるまで埋まらず、その大きさで `ENOSPC` にはなりません）。
-  `noexec`、`nosuid`、`nodev`、atime のフラグ、`sync`、`dirsync`、`mand` も効きません。
+  ルートからではありません。`MS_RDONLY`（`EROFS`）、`noexec`、`nodev`、`nosuid` は
+  効かせますが、tmpfs のマウントの `size`、`nr_blocks`、`nr_inodes` は返すだけで効かせ
+  ません（メモリ上のファイルシステムが埋まるまで埋まらず、その大きさで `ENOSPC` には
+  なりません）。atime のフラグ、`sync`、`dirsync`、`mand` も効きません。ここのマウントが
+  持つデバイスノードはホストのディレクトリのものだけなので（その `mknod` は `EPERM`）、
+  `nodev` が断るのもそれだけです。
   `huge`、`mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて
   （マウントし直しで `noswap` やクォータを有効にしたり、クォータの上限を変えたりすると
   `EINVAL`）表示しますが、何もせず、
@@ -491,7 +511,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   スーパーブロックが読み出し専用かどうかだけです。`hostfs` のものは共通のもののほかに
   オプションを受け取らず（`EINVAL`）、ルートの tmpfs のオプションは確かめますが何も
   残しません。`fchmod`、`fchown`、`futimens`、`fsetxattr` などの `EROFS` のための
-  ディスクリプタのマウントは、それを開いたパスから求めます。`MNT_EXPIRE` の印は、
+  ディスクリプタのマウントは、それを開いたパスから求め、`mmap` の `noexec` のための
+  ものは、そのファイルのいまの場所から求めます。そのため、開いたあとにそのパスで
+  マウントし直したりマウントしたりしたものが効きます。Linux はファイル自身のマウントを
+  持ち続けます。`MNT_EXPIRE` の印は、
   マウントで終わる探索とその上のファイルを閉じることで消えますが、通り過ぎるだけの探索では
   消えません。Linux ではどの `mntput` でも消えます。
   起動したときからあるマウント（ルートと `--mount` ごとのもの）は外せません。
@@ -521,8 +544,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   fanotify のマウントへのマーク（`FAN_MARK_MOUNT`）にとってのディスクリプタのイベントの
   マウントも同じです。そのパスがもうそのファイルのファイルシステムに届かない（その後に
   名前が変わった、置き換わった）とき、イベントはそのファイルシステムの最初のマウントの
-  ものになります。このマークはマウントを外したあとも残り、Linux はそこで消します。
-  そのため、空いたその ID を得た同じファイルシステムの新しいマウントのイベントも受けます。
+  ものになります。
 - **Landlock**：ABI バージョン 8 までです。記録のフラグは受け付けますが、何も記録しません。
   `LANDLOCK_RESTRICT_SELF_TSYNC` では、ほかのスレッドが自分の確認に新しいドメインを
   使うのは、次にカーネルに入るときからです。Linux は、すべてのスレッドが受け取るまで
@@ -550,7 +572,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルのうち、`/proc` と `/dev` の下は確かめません。`fs.protected_hardlinks`、
   `fs.protected_symlinks`、`fs.protected_fifos`、`fs.protected_regular` は、
   カーネルの既定値の 0 として振る舞います。多くのディストリビューションは
-  これらを上げています。マウントの `nosuid` は効きません。set-user-ID や
+  これらを上げています。set-user-ID や
   set-group-ID のプログラムは持ち主やグループになり、ファイルケーパビリティの
   あるプログラムはそれを得ます。ほかのプロセスが呼んだ側と作業ディレクトリを
   共有していても（`CLONE_FS`）同じです。Linux なら `CAP_SETUID` がなければ実 ID を
@@ -588,28 +610,28 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
-  メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
-  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE` も
-  ありません（`EINVAL`）。`fork`、`mremap`、
+  メモリの書き込み保護と、shmem のマイナーフォールトです。Linux が受け付ける
+  shmem（共有の anonymous メモリと、プライベートも含む shmem のファイルの
+  マッピング）の書き込み保護のモードは受け付けません（`EINVAL`）。`fork`、`mremap`、
   `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
-  それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
-  ioctl にも入りません。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
-  ページの保護を外します。Linux はその印を PTE に残します。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
-  登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
+  それらを示さず、求められれば `EINVAL` です。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
+  ページの保護を外します。Linux はその印を PTE に残します。shmem のファイルで登録
+  するのは memfd だけです。tmpfs のファイルは、Linux は受け付けますが、ここでは
+  断ります（`EINVAL`）。メモリ上のファイルシステムは tmpfs を名乗りますが、ゲストが
+  ディスクに持つファイルを表すからで、ホストの tmpfs のファイルはここで持っていません。shmem のファイルの
+  プライベートなマッピングに `UFFDIO_ZEROPAGE` が入れるゼロページは、そのマッピング
+  自身のゼロのページで、`/proc/<pid>/pagemap` と `smaps` もそう数えます。Linux は
+  そのゼロページを対応付けます。登録した範囲のまだ
   ないページか、書き込み保護されたページへのシステムコール自身のコピーは、
   `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`UFFDIO_MOVE` の
   動かし元の穴は、ここでその周りの 2 MiB にどれも触れていなければ、Linux にそこの
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
   ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
-- **fanotify の一部**：許可イベントで送るのは、`open`、`openat`、`openat2`、`creat`、
-  `open_by_handle_at` での（`/proc/self/fd` のリンクからも）オープンの `FAN_OPEN_PERM` と、
-  `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range` での
-  読み出しの `FAN_ACCESS_PERM` だけです。`FAN_OPEN_EXEC_PERM`、
-  exec の `FAN_OPEN_PERM`、exec・AIO・`io_uring` の読み出しの `FAN_ACCESS_PERM` は
-  `fanotify_mark` で受け付けますが送らないので、求めるはずだったことはそのまま通ります。exec のオープンは
-  `FAN_OPEN_EXEC` なしの `FAN_OPEN` として伝えます。
+- **fanotify の一部**：exec は実行するファイルの読み出しごとに `FAN_ACCESS_PERM` を
+  1 回尋ねます。Linux は `kernel_read` ごとに尋ねます（ELF のプログラムでは 2、3 回）。
+  ここの `io_uring` には尋ねる読み出しの操作がありません。
   `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント
   （`FAN_MNT_ATTACH`、`FAN_MNT_DETACH`）と `FAN_FS_ERROR` は来ません。追い出せるマークも
@@ -651,9 +673,16 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ダンプだけです。近隣の表の設定（`RTM_SETNEIGHTBL`）、MCTP の近隣（`AF_MCTP` の
   `RTM_NEWNEIGH` と `RTM_DELNEIGH`）、ブリッジの転送データベース（`AF_BRIDGE` の
   `RTM_GETNEIGH`、`RTM_NEWNEIGH`、`RTM_DELNEIGH`）、ルール、キューイング規律などは
-  `EOPNOTSUPP` で、入力の経路の引き当て
-  （`ip route get ... iif` が送る `RTA_IIF`）、`lo` の名前の変更、ほかの属性の設定も
-  そうです。経路は
+  `EOPNOTSUPP` で、`lo` の名前の変更、ほかの属性の設定もそうです。入力の経路の
+  引き当て（`RTA_IIF`）は、Linux の組み込みの値と同じく、転送も逆経路のフィルターも
+  切ったところから始まります。Linux の新しい名前空間は IPv4 の設定を最初の名前空間から
+  受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
+  フィルターを 2 にします）。ファイルのない `accept_local`、`send_redirects`、
+  `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward` と、`all`、`default`、`lo` の
+  `forwarding`、`rp_filter`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
+  最初の名前空間の値はホストのものではなく Linux の組み込みの値なので、新しい名前空間も
+  そこから始まります。変えても `RTM_NEWNETCONF` は送らず、IPv6 の `forwarding` は
+  ルーターのマルチキャストやエニーキャストのアドレスに加わりません。経路は
   `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、
   カプセル化、ネクストホップのオブジェクト、
   realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の
@@ -668,9 +697,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `CAP_NET_ADMIN` を持つ呼び出し元なら、先にそのモジュールを読み込みます。
   アドレスは寿命が尽きたときに消えます。Linux の確認は遅延可能な処理で、1 秒まで遅れ
   （`round_jiffies_up`）、暇なマシンではさらに数秒待つことがあります。そのファミリーの
-  アドレスを足すか変えると、すぐに走ります。寿命が尽きた IPv6 の経路は、すぐに
-  表から消えます。Linux では引き当てでは飛ばしますが、ガベージコレクション（`gc_interval`、30 秒）まで
-  ダンプには残り、7.3 からはそれを伝える通知に `RTA_DEL_REASON` を付けます。
+  アドレスを足すか変えると、すぐに走ります。bind や送信をするソケットが寿命の尽きた
+  ものを見つけたときは、その名前空間の netlink のソケットが次に読む、poll する、書く
+  ときに伝えます。Linux は確認が走ったときに伝えます。寿命が尽きた IPv6 の経路は、
+  すぐに表から消えます。Linux では引き当てでは飛ばしますが、ガベージコレクション
+  （`gc_interval`、30 秒）までダンプには残り、7.3 からはそれを伝える通知に `RTA_DEL_REASON` を付けます。
   永続の IPv6 のアドレスに変更が寿命を与えると、Linux 7.3 からと同じく接頭辞の経路にも
   同じ寿命を与えます。7.3 より前ではすぐに尽きたものになります。
   `IFA_F_MANAGETEMPADDR` で一時アドレスは作らず、
@@ -752,8 +783,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `IFLA_GSO_IPV4_MAX_SIZE` の最小値は、Ubuntu のカーネルと同じく 321
   （`MAX_TCP_HEADER` + 1）です。ほかのビルドでは違うことがあります。
   受信バッファがいっぱいのソケットへの答えは、待たずに
-  `ENOBUFS` で捨てます。netlink のソケットへの `write` は、ソケットを開いたスレッドの
-  ケーパビリティだけで動きます。ほかの名前空間は、paludarium に分けるものが
+  `ENOBUFS` で捨てます。ほかの名前空間は、paludarium に分けるものが
   ありません（IPC 名前空間の System V の共有メモリ・セマフォー・メッセージキューと
   POSIX メッセージキュー、マウント名前空間のマウントを除きます）。cgroup 名前空間には
   `/proc/self/cgroup` がなく、time 名前空間には `/proc/<pid>/timens_offsets` がなく、

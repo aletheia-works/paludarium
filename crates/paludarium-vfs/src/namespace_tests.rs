@@ -39,7 +39,21 @@ fn tmpfs(blocks: u64) -> NewTmpfs {
 #[test]
 fn a_table_of_boot_mounts_is_the_lower_filesystem() {
     let (lower, fs) = machine();
-    assert_eq!(fs.mounts(), lower.mounts());
+    // But for what a table adds: unique IDs, and its flags.
+    let listed: Vec<MountPoint> = fs
+        .mounts()
+        .into_iter()
+        .map(|m| {
+            assert!(m.unique > UNIQUE_OFFSET + 1 && m.parent_unique == UNIQUE_OFFSET + 1);
+            MountPoint {
+                unique: 0,
+                parent_unique: 0,
+                flags: 0,
+                ..m
+            }
+        })
+        .collect();
+    assert_eq!(listed, lower.mounts());
     for path in [&b"/tmp/f"[..], b"/tmp/m", b"/", b"/missing"] {
         assert_eq!(fs.metadata(path, true), lower.metadata(path, true));
         assert_eq!(fs.device(path), lower.device(path));
@@ -749,11 +763,14 @@ fn pivot_root_puts_the_old_root_under_the_new() {
     let copy = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(false));
     assert_eq!(&*copy.read_file(b"/old/data/x").unwrap(), b"data");
     assert_eq!(copy.mounts().len(), 3);
-    // In the order they were made, as Linux lists them by their IDs.
+    // In the order `copy_tree` takes them, from the root, which their
+    // unique IDs follow.
     let copied = copy.mounts();
-    assert_eq!(copied[2].path, b"/");
-    assert_eq!(copied[2].parent, root.parent);
-    assert_eq!(copied[0].parent, copied[2].id);
+    assert_eq!(copied[0].path, b"/");
+    assert_eq!(copied[0].parent, root.parent);
+    assert_eq!(copied[1].parent, copied[0].id);
+    assert!(copied.windows(2).all(|w| w[0].unique < w[1].unique));
+    assert_eq!(copied[0].parent_unique + 1, copied[0].unique);
     fs.umount(old.id, true).unwrap();
     assert_eq!(names(&fs, b"/old"), Vec::<Vec<u8>>::new());
     assert_eq!(fs.mounts().len(), 1);

@@ -20,6 +20,7 @@
 //! then the default table's (253) where they have no answer. IPv6 looks in
 //! the local table, then the main one. The other tables are kept and shown,
 //! but no lookup reaches them.
+use crate::netdev::LOOPBACK_OIF;
 use crate::netlink::extack;
 use core::cmp::{Ordering, Reverse};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -876,6 +877,11 @@ pub(crate) struct Addresses {
     /// the head of the namespace's list: the local route of each of the
     /// loopback's addresses, and those added through gateways.
     pub mctp_routes: Vec<MctpRoute>,
+    /// Whether a request has added an IPv4 local route
+    /// (`fib_has_custom_local_routes`), which is never cleared: a packet's
+    /// source is then checked by a lookup of it
+    /// ([`Self::valid_source4`]).
+    custom_local4: bool,
     /// The loopback's neighbours, the oldest first.
     neighbours: Vec<Neighbour>,
     /// The proxy entries of the namespace, the oldest first.
@@ -906,7 +912,7 @@ impl Addresses {
     /// The first namespace's: `127.0.0.1/8` and `::1`, up.
     pub(crate) fn first() -> Self {
         let mut addresses = Self::isolated();
-        let _ = addresses.up(0);
+        let _ = addresses.up(0, true);
         addresses
     }
     /// A new namespace's: none.
@@ -920,6 +926,7 @@ impl Addresses {
             tables6: vec![TABLE_MAIN, TABLE_LOCAL],
             mctp: Vec::new(),
             mctp_routes: Vec::new(),
+            custom_local4: false,
             neighbours: Vec::new(),
             proxies: Vec::new(),
         }
@@ -1149,8 +1156,9 @@ impl Addresses {
     /// (`inetdev_event`); the routes every IPv4 address has then that are
     /// not there, in the addresses' order (`fib_netdev_event`); the prefix
     /// route of each permanent IPv6 address added while it was down
-    /// (`addrconf_permanent_addr`); and `::1` with its route.
-    pub(crate) fn up(&mut self, now: u64) -> Vec<Event> {
+    /// (`addrconf_permanent_addr`); and `::1` with its route. With `v6`
+    /// false (`disable_ipv6`) IPv6 does none of it ([`Self::up6`]).
+    pub(crate) fn up(&mut self, now: u64, v6: bool) -> Vec<Event> {
         let mut events = Vec::new();
         let loopback = V4::new(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, 8, SCOPE_HOST);
         // The kernel's own, which reports nothing when it is there.
@@ -1163,6 +1171,17 @@ impl Addresses {
                 self.kernel_add4(route, &mut events);
             }
         }
+        if v6 {
+            events.extend(self.up6(now));
+        }
+        events
+    }
+    /// IPv6's part of [`Self::up`], as `addrconf_notify` does it for
+    /// `NETDEV_UP`: the prefix route of each permanent address
+    /// (`addrconf_permanent_addr`), then `::1` with its route
+    /// (`init_loopback`).
+    pub(crate) fn up6(&mut self, now: u64) -> Vec<Event> {
+        let mut events = Vec::new();
         for address in self.v6.clone() {
             if address.flags & PERMANENT != 0
                 && let Some(route) = address.prefix_route()
@@ -1194,7 +1213,14 @@ impl Addresses {
         // (`rt6_disable_ip`) and its addresses.
         let mut events = Vec::new();
         self.flush(false, &mut events);
-        events.extend(self.dump6().into_iter().map(Event::DelRoute6));
+        events.extend(self.down6());
+        events
+    }
+    /// IPv6's part of [`Self::down`], as `addrconf_ifdown` does it: every
+    /// route, told of in the order of a dump (`rt6_disable_ip`), the
+    /// neighbours, then every address.
+    pub(crate) fn down6(&mut self) -> Vec<Event> {
+        let mut events: Vec<Event> = self.dump6().into_iter().map(Event::DelRoute6).collect();
         self.routes6.clear();
         self.flush(true, &mut events);
         events.extend(self.v6.drain(..).map(Event::DelAddr6));
@@ -1820,6 +1846,14 @@ impl Addresses {
     /// metrics' error comes after the scope's, as `fib_create_info` makes
     /// them.
     pub(crate) fn add_route4(&mut self, ask: &Ask4, up: bool) -> Result<Vec<Event>, Errno> {
+        let added = self.insert_route4(ask, up);
+        if added.is_ok() && ask.kind == Kind::Local.code() {
+            self.custom_local4 = true;
+        }
+        added
+    }
+    /// [`Self::add_route4`], but for what it marks.
+    fn insert_route4(&mut self, ask: &Ask4, up: bool) -> Result<Vec<Event>, Errno> {
         let table = if ask.table == 0 {
             TABLE_MAIN
         } else {
@@ -1885,7 +1919,7 @@ impl Addresses {
                     "Route with host scope can not have a gateway",
                 ));
             }
-            if ask.oif != 1 {
+            if ask.oif != LOOPBACK_OIF {
                 return Err(Errno::ENODEV);
             }
         } else if let Some(gateway) = ask.gateway {
@@ -1895,7 +1929,7 @@ impl Addresses {
                 Errno::EINVAL,
                 "Invalid flags for nexthop - PERVASIVE and ONLINK can not be set",
             ));
-        } else if ask.oif != 1 {
+        } else if ask.oif != LOOPBACK_OIF {
             return Err(Errno::ENODEV);
         } else if !up {
             return Err(extack::message(ENETDOWN, "Device for nexthop is not up"));
@@ -1922,7 +1956,7 @@ impl Addresses {
             if ask.scope >= SCOPE_LINK {
                 return Err(extack::message(Errno::EINVAL, "Nexthop has invalid scope"));
             }
-            if ask.oif != 1 {
+            if ask.oif != LOOPBACK_OIF {
                 return Err(extack::message(
                     Errno::ENODEV,
                     "Nexthop device required for onlink",
@@ -1999,7 +2033,7 @@ impl Addresses {
                     && (select.scope == SCOPE_NOWHERE || r.scope == select.scope)
                     && select.prefsrc.is_none_or(|s| r.prefsrc == Some(s))
                     && (select.proto == 0 || r.proto == select.proto)
-                    && (select.oif == 0 || (r.device && select.oif == 1))
+                    && (select.oif == 0 || (r.device && select.oif == LOOPBACK_OIF))
                     && select.gateway.is_none_or(|g| r.gateway == Some(g))
                     && select
                         .metrics
@@ -2033,7 +2067,7 @@ impl Addresses {
                 .filter(|k| *k != Kind::Broadcast)
                 .ok_or(EOPNOTSUPP)?,
         };
-        if ask.oif != 0 && ask.oif != 1 {
+        if ask.oif != 0 && ask.oif != LOOPBACK_OIF {
             return Err(Errno::ENODEV);
         }
         if kind.error().is_none() {
@@ -2089,7 +2123,7 @@ impl Addresses {
                     && r.len == ask.len
                     && (ask.metric == 0 || r.metric == ask.metric)
                     && (ask.proto == 0 || r.proto == ask.proto)
-                    && (ask.oif == 0 || ask.oif == 1)
+                    && (ask.oif == 0 || ask.oif == LOOPBACK_OIF)
             })
             .ok_or(ESRCH)?;
         Ok(vec![Event::DelRoute6(self.routes6.remove(at))])
@@ -2153,7 +2187,7 @@ impl Addresses {
                 if let Some(e) = r.kind.error() {
                     return Err(e);
                 }
-                if oif != 0 && !(r.device && oif == 1) {
+                if oif != 0 && !(r.device && oif == LOOPBACK_OIF) {
                     continue;
                 }
                 return Ok(*r);
@@ -2179,6 +2213,55 @@ impl Addresses {
     /// The route to `ip` of a flow of `tos` through `oif` (any for 0).
     pub(crate) fn lookup4_flow(&self, ip: Ipv4Addr, tos: u8, oif: u32) -> Result<Route4, Errno> {
         self.lookup4_in(ip, SCOPE_UNIVERSE, oif, tos)
+    }
+    /// Whether a packet in on `lo` from `src` may come, as
+    /// `fib_validate_source` checks it with reverse path filtering off, as
+    /// a namespace has it: from none of the namespace's addresses; or,
+    /// once a request has added a local route, from a source a lookup
+    /// finds no route to or a unicast one (`__fib_validate_source`).
+    pub(crate) fn valid_source4(&self, src: Ipv4Addr) -> bool {
+        if !self.custom_local4 {
+            return !self.v4.iter().any(|a| a.local == src);
+        }
+        self.lookup4(src)
+            .ok()
+            .is_none_or(|route| route.kind == Kind::Unicast)
+    }
+    /// `fib_validate_source` for a packet in on `lo` from `src` of `tos`,
+    /// whose route goes out through `oif` (0 for one that is not
+    /// forwarded), with reverse path filtering `rpf` (`IN_DEV_RPFILTER`):
+    /// `Err` for a source it drops; `Ok(true)` where the reverse route is
+    /// one through `lo` of host scope or narrower, as a forwarded one that
+    /// goes out where it came in asks to redirect.
+    /// - With `rpf` 0 and a route that is not out through `lo`, as
+    ///   [`Self::valid_source4`].
+    /// - Else as `__fib_validate_source`, looking `src` up: every route is
+    ///   `lo`'s, so the device always matches, and strict (1) and loose
+    ///   (2) filtering ask the same. None found is dropped with `rpf`, and
+    ///   taken without; a local one is dropped (`accept_local` is 0), as
+    ///   is one of another kind than unicast; a unicast one is taken,
+    ///   `true` but for one through a gateway, whose next hop is of link
+    ///   scope.
+    pub(crate) fn validate_source4(
+        &self,
+        src: Ipv4Addr,
+        tos: u8,
+        oif: u32,
+        rpf: i32,
+    ) -> Result<bool, ()> {
+        if rpf == 0 && oif != crate::netdev::LOOPBACK_OIF {
+            return if self.valid_source4(src) {
+                Ok(false)
+            } else {
+                Err(())
+            };
+        }
+        match self.lookup4_flow(src, tos, 0) {
+            Err(_) if rpf != 0 => Err(()),
+            Err(_) => Ok(false),
+            Ok(route) if route.kind == Kind::Unicast => Ok(route.gateway.is_none()),
+            Ok(_) => Err(()),
+        }
     }
     /// Whether `ip` is the loopback's (`__ip_dev_find`): one of its
     /// addresses, or else local to the local table's routes.
@@ -2455,7 +2538,7 @@ mod tests {
         // Up: 127.0.0.1/8 and its routes, the routes the up brings the
         // other address, IPv6's prefix route, then ::1.
         assert_eq!(
-            told(&a.up(0)),
+            told(&a.up(0, true)),
             [
                 "+addr 127.0.0.1/8",
                 "+route 255 127.0.0.1/32 Local 0x600",
@@ -2549,7 +2632,7 @@ mod tests {
         );
         assert!(!a.bindable4("10.9.9.9".parse().unwrap()));
         assert_eq!(a.dump6().len(), 1);
-        a.up(0);
+        a.up(0, true);
         // 127.0.0.1/8, of host scope, goes first; a secondary goes last.
         a.add_v4(
             v4("10.1.2.9", 24),
@@ -2644,7 +2727,7 @@ mod tests {
         a.down();
         assert!(a.v6.is_empty());
         assert_eq!(a.dump4().len(), 6);
-        a.up(0);
+        a.up(0, true);
         assert_eq!(a.v6.len(), 1);
         // A primary takes its secondary; 127.0.0.1 comes back with the next
         // up.
@@ -2662,7 +2745,7 @@ mod tests {
         );
         a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();
         assert!(!a.bindable4(Ipv4Addr::LOCALHOST));
-        a.up(0);
+        a.up(0, true);
         assert!(a.bindable4(Ipv4Addr::LOCALHOST));
     }
 
@@ -2675,7 +2758,7 @@ mod tests {
             a.add_route4(&ask4("10.9.0.0", 16, 1, 0x600), false),
             Err(ENETDOWN)
         );
-        a.up(0);
+        a.up(0, true);
         // The same prefix: prepended, replaced, appended.
         let mut ask = ask4("10.9.0.0", 16, 1, 0x600);
         assert_eq!(
@@ -2773,7 +2856,7 @@ mod tests {
             ]
         );
         // IPv6: by metric within a prefix, the walk's order across them.
-        a.up(0);
+        a.up(0, true);
         let ask6 = |dst: &str, len, metric| Ask6 {
             table: TABLE_MAIN,
             dst: dst.parse().unwrap(),
@@ -3050,7 +3133,7 @@ mod tests {
         let address = down.iter().position(|e| matches!(e, Event::DelAddr6(_)));
         assert!(route < first6 && first6 < address);
         assert!(gone(&a.down()).is_empty());
-        let _ = a.up(10);
+        let _ = a.up(10, true);
         a.output(IpAddr::V4(Ipv4Addr::LOCALHOST), 11);
         a.output(IpAddr::V6("ff02::1".parse().unwrap()), 12);
         let last = a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();

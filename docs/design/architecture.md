@@ -118,9 +118,12 @@ out:
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm
   registers and memory, `pxor` and `xorps` of xmm registers, and `movd` and
   `movq` between xmm registers and general ones;
-- `pshufd`, `punpcklbw`, `punpckldq`, `punpcklqdq`, `paddd`, `psubd`, `paddq`,
-  `psubq`, `pmuludq`, `pand`, `por` and `pandn` of xmm registers, `pslld` and
-  `psrld` of one by an immediate, and `pmovmskb`.
+- `pshufd`, the `punpckl` and `punpckh` unpacks, `packuswb`, `packsswb`,
+  `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`, `pmuludq`, `pand`, `por` and
+  `pandn` of xmm registers, `pslld` and `psrld` of one by an immediate, and
+  `pmovmskb`;
+- `cmpxchg` (with `lock` or without) and `xchg` between memory and a register,
+  each as the one atomic access of memory that the interpreter makes.
 
 A register in these forms may also be one of the high-byte registers `ah`, `ch`,
 `dh` and `bh`.
@@ -139,7 +142,7 @@ run of such forms therefore reads little host memory.
 
 With `--jit`, the blocks of the decode cache that run often are compiled to
 host code (`paludarium-jit-native`, Linux on x86-64 hosts only). Each block
-counts how many times it is entered; at the threshold (100 by default), the
+counts how many times it is entered; at the threshold (300 by default), the
 forms of its first instructions, up to the first instruction without one,
 are handed to the compiler. A thread of the JIT's own builds Cranelift IR
 for them, compiles it and maps the code into memory that is never writable

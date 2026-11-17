@@ -266,6 +266,15 @@ pub enum ExitReason {
     SingleStep { rip: GuestAddr },
     /// `int3` (#BP, a trap); `rip` points past it (SIGTRAP, `SI_KERNEL`).
     Breakpoint { rip: GuestAddr },
+    /// A hardware breakpoint hit (#DB): `hits` has the DR6 `B0`–`B3` bits
+    /// of the debug registers that matched, and `step` whether a
+    /// single-step trap came with it. `rip` is the instruction an execute
+    /// breakpoint stopped before, or the one after a data access.
+    HardwareBreakpoint {
+        rip: GuestAddr,
+        hits: u8,
+        step: bool,
+    },
 }
 
 impl ExitReason {
@@ -284,7 +293,8 @@ impl ExitReason {
             | ExitReason::MathFault { rip, .. }
             | ExitReason::BudgetExhausted { rip }
             | ExitReason::SingleStep { rip }
-            | ExitReason::Breakpoint { rip } => rip,
+            | ExitReason::Breakpoint { rip }
+            | ExitReason::HardwareBreakpoint { rip, .. } => rip,
         }
     }
 }

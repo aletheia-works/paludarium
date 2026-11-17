@@ -8,7 +8,7 @@
 
 use std::ptr::NonNull;
 
-use paludarium_mmu::AddressSpace;
+use paludarium_mmu::{AddressSpace, AtomicOp, AtomicWidth};
 use paludarium_types::GuestAddr;
 
 use crate::emit::{CODE_CHANGED, DONE, FAILED, Helpers, WORDS, XMM};
@@ -97,17 +97,58 @@ extern "sysv64" fn store128(context: *const Context<'_>, address: u64, from: *co
     }
 }
 
+/// A locked instruction's memory access: an exchange with `a` when `kind`
+/// is 0, a compare of `a` and exchange with `b` otherwise. Its result is the
+/// old value, as [`AddressSpace::atomic`] gives it to the interpreter.
+extern "sysv64" fn atomic(
+    context: *const Context<'_>,
+    address: u64,
+    size: u64,
+    kind: u64,
+    a: u64,
+    b: u64,
+) -> Loaded {
+    // SAFETY: as in `load`.
+    let context = unsafe { &*context };
+    let width = match size {
+        1 => AtomicWidth::W8,
+        2 => AtomicWidth::W16,
+        4 => AtomicWidth::W32,
+        _ => AtomicWidth::W64,
+    };
+    let operation = if kind == 0 {
+        AtomicOp::Exchange(u128::from(a))
+    } else {
+        AtomicOp::CompareExchange {
+            expected: u128::from(a),
+            replacement: u128::from(b),
+        }
+    };
+    match context.mem.atomic(GuestAddr(address), width, operation) {
+        Ok(result) => Loaded {
+            value: result.old as u64,
+            status: done(context),
+        },
+        Err(_) => Loaded {
+            value: 0,
+            status: FAILED,
+        },
+    }
+}
+
 /// The helpers' addresses, for [`crate::emit::function`].
 pub(crate) fn helpers() -> Helpers {
     type Load = extern "sysv64" fn(*const Context<'static>, u64, u64) -> Loaded;
     type Store = extern "sysv64" fn(*const Context<'static>, u64, u64, u64) -> i64;
     type Load128 = extern "sysv64" fn(*const Context<'static>, u64, *mut u64) -> i64;
+    type Atomic = extern "sysv64" fn(*const Context<'static>, u64, u64, u64, u64, u64) -> Loaded;
     type Store128 = extern "sysv64" fn(*const Context<'static>, u64, *const u64) -> i64;
     Helpers {
         load: load as Load as usize as u64,
         store: store as Store as usize as u64,
         load128: load128 as Load128 as usize as u64,
         store128: store128 as Store128 as usize as u64,
+        atomic: atomic as Atomic as usize as u64,
     }
 }
 

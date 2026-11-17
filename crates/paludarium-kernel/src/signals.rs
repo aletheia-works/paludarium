@@ -570,9 +570,10 @@ pub(crate) fn restore(
     if selectors & 0xffff != 0x33 || selectors >> 48 != 0x2b {
         return Err(());
     }
-    restored.rflags = (cpu.rflags & !flag::USER_WRITABLE)
-        | (get(&b, SC + 136) & flag::USER_WRITABLE)
-        | flag::RESERVED1;
+    // `FIX_EFLAGS`: what popf may change, and RF, which an execute
+    // breakpoint's frame keeps so that the instruction runs once.
+    let fixed = flag::USER_WRITABLE | flag::RF;
+    restored.rflags = (cpu.rflags & !fixed) | (get(&b, SC + 136) & fixed) | flag::RESERVED1;
     // FS/GS bases are thread state, not members of Linux sigcontext.
     restored.fs_base = cpu.fs_base;
     restored.gs_base = cpu.gs_base;

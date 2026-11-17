@@ -27,6 +27,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FAN_ACCESS 0x1
@@ -46,6 +47,7 @@
 #define FAN_FS_ERROR 0x8000
 #define FAN_OPEN_PERM 0x10000
 #define FAN_ACCESS_PERM 0x20000
+#define FAN_OPEN_EXEC_PERM 0x40000
 #define FAN_PRE_ACCESS 0x100000
 #define FAN_MNT_ATTACH 0x1000000
 #define FAN_EVENT_ON_CHILD 0x8000000
@@ -851,8 +853,67 @@ static int case_mounts(void) {
     printf("mark a by descriptor=%ld\n", fan_mark(fan, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_CLOSE_WRITE, dir, NULL));
     close(dir);
     show_mount_marks(fan, a, b);
+    /* An unmounted mount's marks go with it, and a new mount at b, which
+       may take its ID, is not marked. */
+    printf("umount b=%ld\n", e(umount2(at("b"), 0)));
+    show_mount_marks(fan, a, b);
+    printf("tmpfs at b=%ld\n", e(mount("none", at("b"), "tmpfs", 0, NULL)));
+    touch(at("b/g"));
+    show_fd_events("through the new b", fan, 0);
     close(fan);
     printf("umount=%ld %ld\n", e(umount2(at("b"), 0)), e(umount2(at("a"), 0)));
+    remove_base();
+    return 0;
+}
+
+/* FAN_OPEN_EXEC: exec's open of a program, a copy of this one under the
+   base, is told as FAN_OPEN with FAN_OPEN_EXEC, as do_open_execat opens it
+   with __FMODE_EXEC; a mark on FAN_OPEN_EXEC alone hears only that, and
+   an open of the program to read it is FAN_OPEN alone. */
+static int case_open_exec(const char *self) {
+    make_base("exec");
+    int from = open(self, O_RDONLY), to = open(at("prog"), O_WRONLY | O_CREAT, 0755);
+    if (from < 0 || to < 0) return 80;
+    char buf[65536];
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return 81;
+    close(from);
+    close(to);
+    int exec_only = fan_init(FAN_NONBLOCK, O_RDONLY);
+    int both = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (exec_only < 0 || both < 0) return 82;
+    printf("mark exec=%ld\n", fan_mark(exec_only, FAN_MARK_ADD, FAN_OPEN_EXEC, AT_FDCWD, at("prog")));
+    printf("mark both=%ld\n", fan_mark(both, FAN_MARK_ADD, FAN_OPEN | FAN_OPEN_EXEC, AT_FDCWD, at("prog")));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        execl(at("prog"), "prog", "fanotify-noop", (char *)NULL);
+        _exit(127);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("exec status=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    show_fd_events("exec, FAN_OPEN_EXEC", exec_only, child);
+    show_fd_events("exec, both", both, child);
+    int fd = open(at("prog"), O_RDONLY);
+    show_fd_events("open, FAN_OPEN_EXEC", exec_only, 0);
+    show_fd_events("open, both", both, 0);
+    /* execveat of that descriptor opens its file again for exec. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        char *argv[] = {"prog", "fanotify-noop", NULL}, *envp[] = {NULL};
+        syscall(SYS_execveat, fd, "", argv, envp, 0x1000 /* AT_EMPTY_PATH */);
+        _exit(127);
+    }
+    waitpid(child, &status, 0);
+    printf("execveat status=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    show_fd_events("execveat, FAN_OPEN_EXEC", exec_only, child);
+    show_fd_events("execveat, both", both, child);
+    if (fd >= 0) close(fd);
+    close(exec_only);
+    close(both);
     remove_base();
     return 0;
 }
@@ -917,6 +978,227 @@ static int case_access_perm(void) {
     return 0;
 }
 
+/* An AIO request's layout (`struct iocb`) and its completion. */
+struct aio_request {
+    uint64_t data;
+    uint32_t key, rw_flags;
+    uint16_t opcode;
+    int16_t reqprio;
+    uint32_t fildes;
+    uint64_t buf, nbytes;
+    int64_t offset;
+    uint64_t reserved2;
+    uint32_t flags, resfd;
+};
+struct aio_completion {
+    uint64_t data, obj;
+    int64_t res, res2;
+};
+
+/* FAN_ACCESS_PERM of an AIO read: io_submit asks it at submission, as
+   aio_read's rw_verify_area does, and waits for the answer before the read;
+   a denied one fails io_submit (EPERM), one let through completes. The
+   child's results come back through a pipe. */
+static int case_aio_perm(void) {
+    make_base("aio");
+    int file = open(at("f"), O_WRONLY | O_CREAT, 0644);
+    if (file < 0 || write(file, "data", 4) != 4) return 80;
+    close(file);
+    int fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    if (fan < 0) return 81;
+    printf("mark=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD, at("f")));
+    int results[2];
+    if (pipe(results)) return 82;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(fan);
+        close(results[0]);
+        long out[4] = {0};
+        unsigned long ctx = 0;
+        char c[4];
+        int fd = open(at("f"), O_RDONLY);
+        if (syscall(SYS_io_setup, 4, &ctx) != 0) _exit(1);
+        struct aio_request req = {.opcode = 0 /* IOCB_CMD_PREAD */, .fildes = (uint32_t)fd,
+                                  .buf = (uint64_t)(uintptr_t)c, .nbytes = 4};
+        struct aio_request *list[] = {&req};
+        out[0] = e(syscall(SYS_io_submit, ctx, 1, list));
+        out[1] = e(syscall(SYS_io_submit, ctx, 1, list));
+        struct aio_completion done;
+        struct timespec wait = {5, 0};
+        out[2] = e(syscall(SYS_io_getevents, ctx, 1, 1, &done, &wait));
+        out[3] = out[2] == 1 ? done.res : -1000;
+        if (write(results[1], out, sizeof out) != (ssize_t)sizeof out) _exit(1);
+        _exit(0);
+    }
+    close(results[1]);
+    int fd = read_perm("aio read", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    fd = read_perm("aio read again", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    long out[4] = {0};
+    long n = read(results[0], out, sizeof out);
+    printf("child=%d results=%ld\n", child_result(child), n);
+    printf("denied submit=%ld allowed submit=%ld events=%ld res=%ld\n", out[0], out[1], out[2], out[3]);
+    struct pollfd p = {fan, POLLIN, 0};
+    printf("more=%d\n", poll(&p, 1, 0));
+    close(fan);
+    remove_base();
+    return 0;
+}
+
+/* A copy of this program under the base, for exec. */
+static int copy_self(const char *self, const char *to_path) {
+    int from = open(self, O_RDONLY), to = open(to_path, O_WRONLY | O_CREAT, 0755);
+    if (from < 0 || to < 0) return -1;
+    char buf[65536];
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return -1;
+    close(from);
+    close(to);
+    return 0;
+}
+/* A child that execs `path`: its exit status is 0 for the program's own
+   (it returns 0), or the errno execve failed with. */
+static pid_t exec_in_child(const char *path, int fan) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(fan);
+        execl(path, "prog", "fanotify-noop", (char *)NULL);
+        _exit(errno);
+    }
+    return child;
+}
+/* Answers every permission event of `fan` with `response` until `child`
+   exits: how many of each kind came, as whether any did. */
+static void answer_until_exit(const char *label, int fan, pid_t child, uint32_t response) {
+    int open_exec = 0, open = 0, access = 0, other = 0;
+    for (;;) {
+        struct pollfd p = {fan, POLLIN, 0};
+        if (poll(&p, 1, 50) == 1) {
+            char buf[256];
+            long n = read(fan, buf, sizeof buf);
+            if (n < (long)sizeof(struct metadata)) break;
+            struct metadata m;
+            memcpy(&m, buf, sizeof m);
+            if (m.mask & FAN_OPEN_EXEC_PERM) open_exec++;
+            else if (m.mask & FAN_OPEN_PERM) open++;
+            else if (m.mask & FAN_ACCESS_PERM) access++;
+            else other++;
+            respond(fan, m.fd, response);
+            if (m.fd >= 0) close(m.fd);
+            continue;
+        }
+        int status;
+        if (waitpid(child, &status, WNOHANG) == child) {
+            printf("%s: status=%d open-exec=%d open=%d access=%d other=%d\n", label,
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -1, open_exec, open, access > 0, other);
+            return;
+        }
+    }
+    printf("%s: read failed\n", label);
+}
+
+/* Exec's permission events: its open of the program asks
+   FAN_OPEN_EXEC_PERM, then FAN_OPEN_PERM, as
+   fsnotify_open_perm_and_set_mode does for __FMODE_EXEC, and its reads
+   FAN_ACCESS_PERM; a denial of any fails execve with EPERM. Linux asks
+   FAN_ACCESS_PERM once a kernel_read, so only whether any came is shown. */
+static int case_exec_perm(const char *self) {
+    make_base("execperm");
+    if (copy_self(self, at("prog"))) return 80;
+    int fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    if (fan < 0) return 81;
+    printf("mark=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM, AT_FDCWD, at("prog")));
+    /* The program's own open, let through, tells its open and its close. */
+    int heard = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (heard < 0) return 84;
+    printf("heard=%ld\n", fan_mark(heard, FAN_MARK_ADD, FAN_OPEN | FAN_OPEN_EXEC | FAN_CLOSE, AT_FDCWD, at("prog")));
+    pid_t child = exec_in_child(at("prog"), fan);
+    int fd = read_perm("open-exec", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    fd = read_perm("open", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    printf("allowed child=%d\n", child_result(child));
+    show_fd_events("program's events", heard, child);
+    close(heard);
+    child = exec_in_child(at("prog"), fan);
+    fd = read_perm("open-exec", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    printf("denied child=%d\n", child_result(child));
+    child = exec_in_child(at("prog"), fan);
+    fd = read_perm("open-exec", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    fd = read_perm("open", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    printf("denied open child=%d\n", child_result(child));
+    /* Reads: let all through, then deny them. */
+    printf("mark access=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD, at("prog")));
+    child = exec_in_child(at("prog"), fan);
+    answer_until_exit("all allowed", fan, child, 1);
+    printf("remove opens=%ld\n", fan_mark(fan, FAN_MARK_REMOVE, FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM, AT_FDCWD, at("prog")));
+    child = exec_in_child(at("prog"), fan);
+    answer_until_exit("reads denied", fan, child, 2);
+    close(fan);
+    /* A script let through whose interpreter is denied: the script was
+       opened, so it tells its open and its close all the same. */
+    int script = open(at("script"), O_WRONLY | O_CREAT, 0755);
+    char line[160];
+    int len = snprintf(line, sizeof line, "#!%s fanotify-noop\n", at("prog"));
+    if (script < 0 || write(script, line, (size_t)len) != len) return 82;
+    close(script);
+    fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    int notif = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (fan < 0 || notif < 0) return 83;
+    printf("mark script=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, at("script")));
+    printf("mark interpreter=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_EXEC_PERM, AT_FDCWD, at("prog")));
+    printf("notif=%ld\n", fan_mark(notif, FAN_MARK_ADD, FAN_OPEN | FAN_OPEN_EXEC | FAN_CLOSE, AT_FDCWD, at("script")));
+    child = exec_in_child(at("script"), fan);
+    fd = read_perm("script open", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    fd = read_perm("interpreter open-exec", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    printf("script child=%d\n", child_result(child));
+    show_fd_events("script's events", notif, child);
+    close(notif);
+    close(fan);
+    /* An exec that fails before it loads (no interpreter) still asked the
+       script's open: let through, it fails as without the mark and tells
+       the open and close; denied, the denial's error comes first. */
+    script = open(at("lost"), O_WRONLY | O_CREAT, 0755);
+    len = snprintf(line, sizeof line, "#!%s\n", at("missing"));
+    if (script < 0 || write(script, line, (size_t)len) != len) return 85;
+    close(script);
+    fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    notif = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (fan < 0 || notif < 0) return 86;
+    printf("mark lost=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, at("lost")));
+    printf("notif lost=%ld\n", fan_mark(notif, FAN_MARK_ADD, FAN_OPEN | FAN_OPEN_EXEC | FAN_CLOSE, AT_FDCWD, at("lost")));
+    for (uint32_t response = 1; response <= 2; response++) {
+        child = exec_in_child(at("lost"), fan);
+        fd = read_perm("lost open", fan, child);
+        printf("response %u=%ld\n", response, respond(fan, fd, response));
+        if (fd >= 0) close(fd);
+        printf("lost child=%d\n", child_result(child));
+        show_fd_events("lost's events", notif, child);
+    }
+    close(notif);
+    close(fan);
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -928,6 +1210,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-pidfd")) return case_pidfd();
     if (!strcmp(mode, "fanotify-unprivileged")) return case_unprivileged();
     if (!strcmp(mode, "fanotify-mounts")) return case_mounts();
+    if (!strcmp(mode, "fanotify-open-exec")) return case_open_exec(argc > 2 ? argv[2] : "");
+    if (!strcmp(mode, "fanotify-aio-perm")) return case_aio_perm();
+    if (!strcmp(mode, "fanotify-exec-perm")) return case_exec_perm(argc > 2 ? argv[2] : "");
+    if (!strcmp(mode, "fanotify-noop")) return 0;
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
     if (!strcmp(mode, "fanotify-access-perm")) return case_access_perm();
     printf("unknown mode %s\n", mode);

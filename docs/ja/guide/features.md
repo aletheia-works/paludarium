@@ -14,7 +14,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - **トラップ**：トラップフラグでシングルステップします。`TF` が立っている間（`popf`、
   `rt_sigreturn`、トレーサーが立てられます）、各命令の後に `TRAP_TRACE` の `SIGTRAP` が
   来て、アドレスは命令の次です（トラップ 1）。`syscall` だけは、カーネルの中でフラグが
-  消され、Linux が `iret` で戻るので来ません。シグナルハンドラーはフラグを消して始まります。
+  消され、Linux が `iret` で戻るので来ません。`rep` 付きの文字列命令は 1 回ごとにトラップし、
+  最後の回までは `rip` がその命令のままです。シグナルハンドラーはフラグを消して始まります。
   `int3` は、カーネルからの（`SI_KERNEL`、トラップ 3）`SIGTRAP` で、`rip` はその次です。
 - **SSE 系**：MMX レジスタを使うものを除く SSE と SSE2 のすべての命令（エンコーディング
   ごとにテストで動かしています。フェンスの `MFENCE`／`LFENCE`／`SFENCE` を含みます）。
@@ -70,13 +71,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`open_tree`、`move_mount`、`fsopen`、`fsconfig`、`fsmount`、`fspick`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`open_tree`、`move_mount`、`fsopen`、`fsconfig`、`fsmount`、`fspick`、`mount_setattr`、`open_tree_attr`、`statmount`、`listmount`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップのみ（下を参照） |
+| BPF | `bpf`、マップと `BPF_PROG_LOAD` の引数の検査（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -221,8 +222,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `statx` は、`stat` にある項目（`STATX_BASIC_STATS`）と、デバイス番号としてマウントの
   `st_dev` を返します。flags と mask は Linux と同じように確かめます（`EINVAL`）。
   mask が何を求めても、Linux と同じくマウントの ID も返します。`/proc/self/mountinfo`
-  が示す ID（`STATX_MNT_ID`）か、`STATX_MNT_ID_UNIQUE` を求めたときはその代わりに
-  64 ビットの ID です。内部のファイルシステムのファイル（パイプ・ソケット・memfd
+  が示す ID（`STATX_MNT_ID`）か、`STATX_MNT_ID_UNIQUE` を求めたときはその代わりに、
+  マシンが終わるまで一意な 64 ビットの ID（`statmount` と `listmount` が使うもの）です。内部のファイルシステムのファイル（パイプ・ソケット・memfd
   など。後の `statfs` を参照）は、mountinfo に出ない小さな ID のマウントにあります。
   mountinfo の ID は 21 から始まり、Linux の内部のマウントも mountinfo に出ません。
   `AT_EMPTY_PATH` はディスクリプタを、`AT_FDCWD` なら作業ディレクトリを指し、Linux 6.11
@@ -856,21 +857,30 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作られたアドレス空間のものです。`UFFDIO_API` はバージョンと機能を一度だけ受け取り
   （2 度目は `EINVAL`）、提供する機能と ioctl を書き戻します。失敗したときは 0 を
   書きます。提供する機能は `UFFD_FEATURE_PAGEFAULT_FLAG_WP`、`UFFD_FEATURE_SIGBUS`、
-  `UFFD_FEATURE_THREAD_ID`、
+  `UFFD_FEATURE_THREAD_ID`、`UFFD_FEATURE_MINOR_SHMEM`、
+  `UFFD_FEATURE_MINOR_HUGETLBFS`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
-  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で、
-  `UFFD_FEATURE_EVENT_FORK` には
+  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で（`HUGETLBFS` の
+  2 つは Linux と同じく示しますが、`MFD_HUGETLB` と `SHM_HUGETLB` は `ENOSYS` なので、
+  登録する hugetlbfs のメモリはありません）、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
-  メモリと共有の anonymous メモリを、ないページについて登録し
-  （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
+  メモリ、共有の anonymous メモリ、shmem の memfd（Linux が VMA を shmem のものと
+  数えない System V の共有メモリは除きます）の共有または
+  プライベートなマッピングを、ないページについて登録し
+  （`UFFDIO_REGISTER_MODE_MISSING`）、shmem（共有の anonymous メモリと memfd の
+  マッピング）をマイナーフォールトについて登録し（`UFFDIO_REGISTER_MODE_MINOR`。示す
+  ioctl に `UFFDIO_CONTINUE` が、`smaps` に `ui` が加わります）、プライベートな anonymous メモリを書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
   が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
-  ものは `EINVAL`、ほかの `userfaultfd` のものは `EBUSY`）、モードは、VMA がすでに
+  ものは `EINVAL`、ファイルに書き込めない共有のものは `EPERM`、ほかの `userfaultfd` の
+  ものは `EBUSY`）、モードは、VMA がすでに
   持っていなければその VMA のモードに置き換わります。登録した部分は
   `/proc/<pid>/maps` に見えるとおり VMA に分かれ、`smaps` に `um` と `uw` が
   つきます。`fork` した子と、`mremap` が動かしたマッピングには引き継がれず、
   `UFFDIO_UNREGISTER` とファイルを閉じることで外れます。ないページについて登録した
-  ページでまだないもの（共有メモリでは、どのマッピングにもないもの）に命令が触れるか、
+  ページでまだないもの（shmem では、そのページキャッシュにないもの。どのマッピングも
+  持ち込んでおらず、ファイルも書き込みや割り当てで持っていないページで、ファイルの
+  終わりより先のページは先に SIGBUS です）に命令が触れるか、
   書き込み保護について登録した範囲の保護されたページに書き込むと待ち、ファイルは
   そのフォールトを古い順に `uffd_msg` として読みます。書き込みかどうか、保護された
   ページなら `UFFD_PAGEFAULT_FLAG_WP`、ページのアドレス
@@ -891,9 +901,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書き込み保護のモードを置き換える登録で保護は外れます。`UFFDIO_COPY` と
   `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
   VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
-  `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
+  `EFAULT`、shmem のファイルの終わりより先のページも `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
   です。`UFFDIO_COPY_MODE_WP` は書き込み保護したページを埋め、範囲は書き込み保護に
-  ついて登録したものでなければなりません（`EINVAL`）。`UFFDIO_POISON`
+  ついて登録したものでなければなりません（`EINVAL`）。shmem のファイルの共有の
+  マッピングを埋めるときは、ファイルのページキャッシュにページがあれば `EEXIST` で、
+  ページはファイルに入り、`read` からも見えます。プライベートなマッピングを埋めると、
+  マッピングが自分のページを持ち、ファイルは変わりません。`UFFDIO_POISON`
   （`UFFD_FEATURE_POISON`）は、登録した範囲のページを同じやり方で poison にします。
   モードは `DONTWAKE` だけで、このマッピングにページかガードがあるところは `EEXIST`
   です。poison にしたページへのアクセスは、Linux の poison マーカーが
@@ -905,7 +918,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   poison は `mprotect` と `UFFDIO_UNREGISTER` では残り、`mremap` では一緒に動き、
   `fork` した子には、プライベートなメモリでは引き継がれ、共有メモリでは引き継がれず、
   `MADV_DONTNEED`、`MADV_FREE`、`MADV_GUARD_INSTALL`（ガードに置き換わります）、
-  `munmap` で消えます。`UFFDIO_MOVE` は、Linux の `move_pages` と同じく、
+  `munmap` で消えます。マイナーフォールトは、Linux の `shmem_get_folio_gfp` が
+  フォリオを見つけて `handle_userfault` が `VM_UFFD_MINOR` を取るのと同じく、ページ
+  キャッシュにあるのにマッピングにエントリーのない shmem のページへのアクセスです。
+  メッセージには `UFFD_PAGEFAULT_FLAG_MINOR` が入り、範囲がないページについても
+  登録されていなければ、穴はそのまま取り込みます。`UFFDIO_CONTINUE` は
+  `mfill_atomic_pte_continue` と同じく、ページキャッシュのページを 1 ページずつ範囲に
+  対応付けます。shmem でないメモリ、`DONTWAKE` と `WP`（書き込み保護のモードが要ります）
+  以外のモード、ファイルの終わりより先のページは `EINVAL`、ページキャッシュにない
+  ページは `EFAULT`、マッピングにあるページは `EEXIST` です。プライベートな
+  マッピングは、`mfill_atomic_install_pte` が読み出し専用で対応付けるので、書き込む
+  までそのページを見せます。`UFFDIO_MOVE` は、Linux の `move_pages` と同じく、
   コンテキスト自身のアドレス空間（ほかの空間からは `EINVAL`）のプライベートな
   anonymous のページを、登録した範囲へ動かします。`UFFD_FEATURE_MOVE` を求めたか
   どうかは問いません。それぞれの先頭が VMA にあること（`ENOENT`）、どちらの VMA も
@@ -1387,6 +1410,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EINVAL`。`size`、`nr_blocks`、`nr_inodes`、`huge`、`inode32`、`inode64`、`mpol` は
   変わり、`mode`、`uid`、`gid` は変わりません）。そのあとマウントは呼び出しのフラグを
   持ちます。
+- `noexec` のマウントは、Linux の `path_noexec` と同じく何も実行しません。そこにある
+  プログラム、スクリプトのインタープリター、ELF のインタープリターの `execve` は、許可の
+  前に `EACCES` で、通常のファイルへの `X_OK` 付きの `access` も同じです。そこのファイルを
+  `PROT_EXEC` で `mmap` すると `EPERM`、`READ_IMPLIES_EXEC` はそれに `PROT_EXEC` を足さず、
+  `mprotect` もそのマッピングを実行できるようにはしません（`EACCES`。VMA に `VM_MAYEXEC`
+  がありません）。`nodev` のマウントは、そこのデバイスを開きません（`EACCES`。
+  `may_open_dev`。root でも同じです）。`nosuid` のマウントや、呼び出し元がいない
+  ユーザー名前空間のスーパーブロックにあるプログラムは、set-user-ID と set-group-ID の
+  ビットもファイルケーパビリティもなしに実行します（`mnt_may_suid`）。スクリプトでは、
+  実際に動くファイルであるそのインタープリターについてです。
 - 読み出し専用のマウントや、読み出し専用のスーパーブロックのマウントは、Linux の
   `mnt_want_write` と同じところで、その前に来るエラーのあとに、書き込むものを `EROFS` で
   断ります。名前を作るもの（`O_CREAT` と `O_TMPFILE` 付きの `open`、`mkdir`、`mknod`、
@@ -1481,6 +1514,33 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   オプションを `MS_REMOUNT` と同じく変えます（スーパーブロックのユーザー名前空間に
   対する `CAP_SYS_ADMIN` がなければ `EPERM` で、コンテキストは失敗した状態になり、
   それからは `EBUSY` です）。
+- `mount_setattr`（Linux master のもの）は、フラグ（`EINVAL`）、次に
+  `struct mount_attr`（1 ページを超えるか、その後ろに 0 でないバイトがあれば `E2BIG`、
+  32 バイト未満なら `EINVAL`）、マウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）、
+  伝播の種類が 1 つまでで知っている属性であること（`EINVAL`）、アクセス時刻の設定は
+  `MOUNT_ATTR__ATIME` をすべて消すときだけであること（`EINVAL`）を確かめます。何も
+  変えないものは、探す前に 0 です。マウントのルート（`EINVAL`）で、名前空間のものか
+  切り離された木の根であれば、そのマウントのフラグを付けたり消したりし、
+  `AT_RECURSIVE` があれば下のマウントのものも、すべてかどれも変えないかです。ロック
+  されたフラグが変わるなら `EPERM`、書き込みのために開いたファイルがあって読み出し専用に
+  するなら `EBUSY` です。そのあとマウントは伝播の種類を受け取ります。`open_tree_attr` は、
+  同じ変更をディスクリプタのマウントに加える `open_tree` で、変更に失敗すれば
+  ディスクリプタはまたなくなります。
+- マウントはそれぞれ、マシンが終わるまで一意な ID（`mnt_id_unique`。`1 << 31` の次
+  から、作った順で、名前空間の写しは `copy_tree` がたどる順）を持ち、マウント
+  名前空間もそれぞれ ID（最初のものは 8）を持ちます。`listmount`（Linux master の
+  もの）はフラグ・数・配列（`EINVAL`、`EOVERFLOW`、`EFAULT`）と `struct mnt_id_req`
+  （`E2BIG`、`EINVAL`）を確かめ、呼び出し元のルート（`LSMT_ROOT`）かマウント（ない
+  なら `ENOENT`）から届くマウントの ID を、最後に渡された ID のあとから順に
+  （`LISTMOUNT_REVERSE` なら逆順に）返します。名前空間は呼び出し元のものか、名前空間の
+  ファイルか ID で示すものです（`ENOENT`、`EBADF`、`EINVAL`。ほかのものは、それに
+  対する `CAP_SYS_ADMIN` があるときだけです）。`statmount` はその 1 つ、または
+  `STATMOUNT_BY_FD` ならディスクリプタのファイルのマウントについて、スーパーブロックの
+  デバイス・型・フラグ、マウントの ID・属性・伝播、そのルートと呼び出し元のルートから
+  見たマウントポイント、型の名前、オプションそのものとその配列、ソース、名前空間の ID を、
+  求められたとおりに返します（`mask`、`supported_mask`）。文字列に足りないバッファは
+  `EOVERFLOW`、呼び出し元のルートから届かないマウントは `CAP_SYS_ADMIN` がなければ
+  `EPERM` です。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどり、パスの始まりの上のマウントにも入ります
   （`LOOKUP_MOUNTPOINT`）。そのあと Linux の `can_umount` と `do_umount`
@@ -1661,6 +1721,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     開いたものの両方に要ります（なければ `EPERM`）。アドレスを指して送るとき
     （`sendto`、名前を付けた `sendmsg`）は、`netlink_sendmsg` がそれに `NETLINK_SKB_DST` の
     印を付け、`__netlink_ns_capable` が開いた側を見ないので、送るスレッドのものだけが要ります。
+    `write`（と `writev`、`sendfile`、`splice`、AIO の書き込み）は、`netlink_sendmsg` が
+    書くスレッドで動くので、アドレスのない `send` と同じく、書くスレッドとして送ります。
+    自動のバインドはそのプロセス ID をポートにし、経路の検索はそのユーザー ID を `RTA_UID`
+    にし、変更にはその `CAP_NET_ADMIN` と開いた側のものが要ります。`bind` と
+    `NETLINK_ADD_MEMBERSHIP` のマルチキャストの経路のグループ、ほかのポートやグループへの
+    `connect` は、呼び出したスレッドのものだけを見ます（`rtnetlink_bind`、`netlink_allowed`）。
   - **厳密な検査:** iproute2 と同じく `NETLINK_GET_STRICT_CHK` を設定すると、Linux と
     同じくリクエストを調べます。ダンプには、絞り込みに使うもの以外は空のヘッダーが
     そろっていて、属性は絞り込みに使うものだけで、型が知られたもので、余るバイトが
@@ -1881,7 +1947,25 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ループバック、リンクローカル、マルチキャストのアドレスなら、経路は見つかりません
     （`ENETUNREACH`）。`RTA_IP_PROTO` は
     TCP、UDP、そのファミリーの ICMP のほかは `EOPNOTSUPP`、`RTA_IIF` はないデバイスなら
-    `ENODEV` です。マーク、ユーザー ID、プロトコル、ポートはポリシーのルールとマルチパスの
+    `ENODEV` です。`RTA_IIF` が `lo` なら、そこに入ってきたパケットと同じく経路を引き
+    （`ip_route_input_slow`、`ip6_route_input_lookup`）、答えには `RTA_IIF` に `lo` を
+    入れます。IPv4 は martian を捨てます（`EINVAL`）。マルチキャスト、限定ブロード
+    キャスト、ループバック、0.0.0.0 の送り元、ループバックか 0.0.0.0 の宛先、`lo` が
+    入っていないグループ、名前空間自身のアドレスの送り元です。要求がローカルの経路を
+    足したあとは、引き当てでユニキャストでない経路が見つかる送り元も捨てます
+    （`fib_validate_source`）。ローカル、ブロードキャスト、マルチキャストの宛先には、
+    その型のローカルの経路（`RTCF_LOCAL`、`RTCF_BROADCAST`、`RTCF_MULTICAST`）を、
+    一致した経路の TOS で、優先する送り元なしで返します。ほかは転送されるはずのものです。
+    `lo` の `forwarding`（`/proc/sys/net`）が切れていれば `EHOSTUNREACH` です。入っていれば、
+    経路のない宛先は引き当てのエラー、ユニキャストでない種類の経路は `EINVAL` で、
+    ユニキャストのものは、`__mkroute_input` と同じく、転送する経路を返します。ユニキャストで、
+    `lo` から出て、経路のゲートウェイとメトリクスを持ちます。送り元自身の経路が `lo` を通る
+    ゲートウェイなしのユニキャストなら、入ってきたところから出るパケットとして
+    リダイレクトを求める `RTCF_DOREDIRECT` が付きます。逆経路のフィルター（`rp_filter`、
+    `all` と `lo` の大きいほう）は、どの送り元も、それを引き当てて確かめます
+    （`__fib_validate_source`）。入っていれば、経路のない送り元も捨てます。どの経路も `lo` を
+    通るので、厳密（1）と緩い（2）フィルターは同じことを確かめます。IPv6 は、送り元と
+    `forwarding` によらず、表が返す経路を返します。マーク、ユーザー ID、プロトコル、ポートはポリシーのルールとマルチパスの
     経路を選ぶためのもので、どちらもないので何も変えません。
   - **経路のメトリクス:** IPv4 と IPv6 の経路は、`RTA_METRICS` が持つメトリクス
     （`ip route add ... mtu 1400` が送るもの）を、`ip_metrics_convert` と同じく読んで
@@ -1959,7 +2043,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **通知:** ソケットは、`bind` が指すグループ（最初の 32 を置き換えます）と
     `NETLINK_ADD_MEMBERSHIP` が足すグループのメンバーになります。グループは `RTNLGRP_*` の
     1 から 39 で（0 とそれを超えるものは `EINVAL`、マルチキャストの経路の 30 と 31 には
-    `CAP_NET_ADMIN` が要り、なければ `EPERM`）、`NETLINK_DROP_MEMBERSHIP` で抜け、
+    呼び出し元の `CAP_NET_ADMIN` が要り、なければ `EPERM`）、`NETLINK_DROP_MEMBERSHIP` で抜け、
     `NETLINK_LIST_MEMBERSHIPS` は 2 ワードで全部を返します。`lo` の変化は、名前空間の中の
     そのグループのメンバーに、1 つずつ別のデータグラムで、Linux の順に伝えます。上げ下げには
     `ifi_change` に `IFF_UP` を持つ `RTM_NEWLINK`（`RTNLGRP_LINK`）を、それから
@@ -2348,7 +2432,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
-  `fs` と `kernel` だけを持つ `/proc/sys`（後述）、
+  `fs`、`kernel`、`net` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
   ディレクトリです。`/proc/self` はそこへの
   シンボリックリンク（0777、サイズ 0）で、`readlink` で PID になります。`lstat` と、
@@ -2455,7 +2539,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   名前空間の POSIX メッセージキューの上限があります。`queues_max`、`msg_max` と
   `msg_default`（1〜65536）、`msgsize_max` と `msgsize_default`（128〜16 MiB）です。
   モード 0644 の通常ファイルで、IPC 名前空間を持つユーザー名前空間の root のもので、
-  書くために開けるのもその root だけです（`EACCES`）。読むと、先頭から値と改行を返し、
+  書くために開けるのもその root だけです（`EACCES`）。`/proc/sys` のファイルは、Linux の
+  `proc_sys_make_inode` と同じく、それぞれ自分の inode を持ち、サイズは 0 です。そのため、
+  別の sysctl からの `copy_file_range` は何も写さず、ほかのファイルシステムからは `EXDEV`
+  です。読むと、先頭から値と改行を返し、
   その先では何も返しません。先頭への書き込みは、Linux の `proc_dointvec_minmax` と同じく
   `int` を 1 つ読んで値にします。空白、あってもよい `-`、10 進の数字（`0x` の後は 16 進、
   `0` の後は 8 進）、その後に空白・タブ・改行か終わりです。読んだ分（値の後の空白も含みます）を
@@ -2514,6 +2601,34 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
   `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
+- `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
+  `default`、デバイスごと（`lo`）に持つのと同じく、開いたプロセスのネットワーク名前空間の
+  設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
+  `ipv6/conf/<デバイス>/disable_ipv6` と `forwarding` です。ファイルとディレクトリは、
+  ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
+  書き込みで開けるのは、root と、その名前空間への `CAP_NET_ADMIN` を持つものです
+  （`net_ctl_permissions`。開けなければ `EACCES`、書き込みのときに書けなければ
+  `EPERM`）。どれも `proc_dointvec` と同じく `int` を 1 つ取ります。最初の名前空間は、
+  Linux の組み込みの値と同じく、どれも 0 で始まります。新しい名前空間は、最初の名前空間の
+  IPv4 の `all` と `default` を写し、IPv6 のものは組み込みの値で始めます
+  （`devconf_inherit_init_net` が 0 のとき）。その `lo` は `default` を写します。
+  ハンドラーと同じく:
+  - IPv4 の `forwarding`（`ip_forward` は `all` のもの）には、書き手の `CAP_NET_ADMIN` が
+    要ります（`EPERM`、`devinet_sysctl_forward`）。`all` のものが変わると、`default` と
+    すべてのデバイスのものも変わります。`default` のものはどのデバイスにも及びません。
+  - デバイスに設定した `rp_filter` はそのデバイスのものになります。`default` に設定すると、
+    まだ設定していないすべてのデバイスに及びます。失敗した書き込みでも、設定したことに
+    なります（`devinet_conf_proc`）。
+  - IPv6 の 2 つは、Linux master の `addrconf_sysctl_forward` と `addrconf_sysctl_disable`、
+    そして CI のカーネルと同じく、正しくない値を `EINVAL` で知らせます（7.0 は知らせず、
+    `all` かデバイスの `forwarding` は 1 を返しました）。`all` のものは `default` とすべてのデバイスのものを変えます。
+    デバイスの `disable_ipv6` を入れると、そのデバイスは IPv6 のアドレスと経路を失い、
+    落ちたときと同じく知らせます（`addrconf_ifdown`）。上がっている間に切ると、
+    `NETDEV_UP` と同じく `::1` が戻り、IPv6 自身の `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を
+    知らせます。入っている間は、`lo` が上がっても IPv6 は何もせず、新しい IPv6 の
+    アドレスは `EACCES` です（`addrconf_add_dev`）。
+  - リンクの `IFLA_AF_SPEC` の IPv4 と IPv6 の設定にこれらが出ます。IPv6 は
+    `disable_ipv6` が切れているときだけ準備ができています。
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
   と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
   （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、
@@ -2924,7 +3039,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
   持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで
   数えます。そうしたイベントは新しいグループを率いられません（`ENODEV`）。`execve` なしで
-  終わったスレッドは、開いたイベントの持ち主でなくなります（`perf_event_exit_task`）。
+  終わったスレッドは、開いたイベントの持ち主でなくなります（`perf_event_exit_task`）。それを
+  数えるイベントは Linux の `EXIT` の状態になり、数えなくなり、最後の数と時間は読めるまま残り、
+  グループに残り、新しいグループを率いられません（`ENODEV`）。`inherit` があると、
+  `perf_event_init_task` と同じく、新しいスレッドかプロセスは、それを作ったスレッドを数える
+  グループを引き継ぎます。その一つ一つのイベントが、新しいタスクを数える自分のものを得て、
+  元のものと同じく有効か無効になります。`inherit_thread` は新しいプロセスには、`sigtrap` は
+  `CLONE_CLEAR_SIGHAND` では引き継がせません。開いたイベントの読み込みは、引き継いだ
+  イベントと、終わったタスクのものが返したものを、数と時間に加えます。グループではメンバー
+  ごとです（タスクが引き継いだあとでメンバーが変わったグループは `ECHILD`）。その `ENABLE`、
+  `DISABLE`、`RESET`（終わったタスクが返したものは残します）と下の `prctl` は、引き継いだ
+  イベントにも及びます。
   `prctl` の `PR_TASK_PERF_EVENTS_DISABLE` と `ENABLE` は、
   呼んだスレッドが開いたすべてのイベントを、どのタスクを数えるものでも（無効で開いたものも）
   無効または有効にし、ほかの引数は読みません。`execve` を実行したスレッドは、開いたイベントを
@@ -2972,8 +3097,47 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   一つにつき 8 バイトを数えます。そのメモリがマシンのメモリ（`sysinfo` の 4 GiB）を、
   `vmalloc` と同じ確かめ方で超えるマップは `ENOMEM` です。fdinfo には `map_type`、
   `key_size`、`value_size`、`max_entries`、`map_flags`、`map_extra`、`memlock`
-  （そのメモリ）、`map_id`、`frozen` があります。ないものは [制限](./limitations) を
+  （そのメモリ）、`map_id`、`frozen` があります。`BPF_MAP_TYPE_LRU_HASH` は、いっぱいに
+  なると `E2BIG` にせず、新しいキーのために一つのキーを手放すハッシュで、手放すキーは Linux の
+  `bpf_lru_list.c` と同じ選び方です。要素は空き、active、inactive のリストと、CPU の
+  ローカルな空きと保留のリストのあいだを動くので、手放すキーは、更新が拒まれたときや
+  キーを置き換えたとき（どちらも先に要素を取ります）も Linux と同じです。どのユーザーでも
+  マップを作れる設定でも `CAP_BPF` が要り（`EPERM`）、いつも事前に確保され
+  （`BPF_F_NO_PREALLOC` は `ENOTSUPP`）、`BPF_F_NO_COMMON_LRU` では CPU ごとにリストを持ちます
+  （`max_entries` を CPU の数の倍数に切り上げ、どの CPU も同じ数です。`BPF_F_NUMA_NODE` と
+  一緒なら `EINVAL`）。メモリは予備のない要素だけを数えます。`BPF_MAP_TYPE_QUEUE` と
+  `BPF_MAP_TYPE_STACK` は、Linux の `queue_stack_maps.c` と同じく、キーのない値を持ちます
+  （`key_size` は 0 で、null でないキーのポインタは `EINVAL`）。`UPDATE_ELEM` は積み
+  （いっぱいなら `E2BIG`。`BPF_EXIST` ならいちばん古い値を手放して場所を空けます。
+  `BPF_NOEXIST` は `EINVAL`）、`LOOKUP_ELEM` は見るだけ、`LOOKUP_AND_DELETE_ELEM` は
+  取り出します。キューはいちばん古い値を、スタックはいちばん新しい値を返します（なければ
+  `ENOENT`）。`DELETE_ELEM` と `GET_NEXT_KEY` は `EINVAL`、バッチのコマンドは
+  `ENOTSUPP` です。`CAP_BPF` が要り、フラグは `BPF_F_NUMA_NODE` とアクセスのものだけで、
+  4 MiB を超える値と、`max_entries` と値の大きさの積が 32 ビットを超えるものは、Linux
+  master と同じく `E2BIG` です。312 バイトのヘッダーと `max_entries + 1` 個の値の場所を
+  取ります。`BPF_MAP_TYPE_BLOOM_FILTER` も、Linux の `bloom_filter.c` と同じく、キーのない
+  値を取ります。`UPDATE_ELEM`（`BPF_ANY` だけ）はハッシュごとにビットを立て（ハッシュの数は
+  `map_extra` の下位 4 ビットで、0 なら 5。それより上のビットは `EINVAL`）、`LOOKUP_ELEM`
+  は値を読んで、どのビットも立っているかを答えます（そうでなければ `ENOENT`。何も書き
+  戻しません）。ハッシュは、値がワードの並びなら Linux の `jhash2`、そうでなければ
+  `jhash` で、シードはランダムか、`BPF_F_ZERO_SEED` なら 0 です。そのため、0 のシードの
+  フィルタは Linux と同じ偽陽性を返します。ビットの数は `max_entries` とハッシュの数の積の
+  7 / 5 倍を、64 以上の 2 のべき乗にしたものです（2^31 を超えれば 2^32）。`DELETE_ELEM` と
+  `GET_NEXT_KEY` は `EOPNOTSUPP`、`LOOKUP_AND_DELETE_ELEM` とバッチのコマンドは
+  `ENOTSUPP` です。`CAP_BPF` が要り、312 バイトのヘッダーと、8 バイトのワードにした
+  ビットを取ります。`map_extra` は fdinfo と `bpf_map_info` に出ます。ないものは [制限](./limitations) を
   参照してください。
+- `BPF_PROG_LOAD` は、Linux の `bpf_prog_load` と同じ順に同じエラーで引数を確かめます。
+  この順とエラーは、テストのマシンのカーネル（Ubuntu の Linux 7.0）と master で同じです。
+  コマンドより先のフィールド（`EINVAL`）、プログラムのフラグ（`EINVAL`）、トークンの
+  ディスクリプタ（ないものは `EBADF`、ほかのファイルは `EINVAL`。ここにトークンはありません）、
+  `CAP_BPF` のないときの `kernel.unprivileged_bpf_disabled`（`EPERM`）、命令の数（0 か、
+  `CAP_BPF` なしで 4096、ありで 1,000,000 を超えると `E2BIG`）、ソケットフィルターと cgroup
+  skb 以外の型の `CAP_BPF`、それを求める型の `CAP_NET_ADMIN` と `CAP_PERFMON`（`EPERM`。
+  どれも `CAP_SYS_ADMIN` で代えられます）、アタッチ先のプログラムか BTF ID（ここではどの型も
+  `EINVAL`）、命令とライセンスの読み込み（`EFAULT`）です。すべて通った読み込みは、
+  そのプログラムの型を組み込まずにビルドしたカーネルと同じく `EINVAL` です。プログラムを
+  読み込むことはありません（[制限](./limitations)を見てください）。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。
@@ -3094,7 +3258,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マウント、ファイルシステムへのマーク（マウント名前空間へのものも受け付けます）を足し、外し、
   まとめて消します。マウントへのマークはマウントの ID で持ち、同じファイルシステムの
   バインドマウントではなくそのマウントの中のパスのイベントだけを受け、fdinfo はその ID を
-  示します。確認もその順です。フラグとマスク（`EINVAL`）、ディスクリプタ
+  示します。マウントが解放されるとそのマークもなくなるので（`fsnotify_vfsmount_delete`）、
+  次にその ID を得たマウントにはマークがありません。exec がプログラムとそのインタープリターを
+  開くことは、`do_open_execat` が `__FMODE_EXEC` で開くのと同じく `FAN_OPEN_EXEC` 付きの
+  `FAN_OPEN` として伝わり、inotify には `IN_OPEN` として伝わります。その前に、そうした
+  オープンはそれぞれ `FAN_OPEN_EXEC_PERM`、`FAN_OPEN_PERM` を、exec によるそのファイルの
+  読み出しは `FAN_ACCESS_PERM` を、exec が確定する前にこの順に尋ねます。拒まれると `execve`
+  は `EPERM` で失敗し、そのあとのものは尋ねません。そのあとで失敗する exec（インタプリタがない、
+  引数が読めない）も同じように尋ね終えています。拒まれたときの `EPERM` が先に返り、
+  通されたオープンはそのオープンとクローズを伝えます。確認もその順です。フラグとマスク（`EINVAL`）、ディスクリプタ
   （`EBADF`、`EINVAL`）、グループのクラスとモード、パス（`ENOENT`、`ENOTDIR`）、
   ファイルシステムが受け付けるイベント（/proc への許可イベントと、カーネル自身のファイル
   システムへのマウントとファイルシステムのマークは `EINVAL`。新しいフラグでのファイルへの
@@ -3136,7 +3308,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `readv`、`preadv`、`preadv2`、`sendfile`・`splice`・`copy_file_range` の入力）も、
   `rw_verify_area` と同じくディスクリプタ、バッファ、大きさ、位置の確認のあとに同じように
   答えを待ちます。`vfs_readv` と同じく、0 バイトの `readv` と `preadv` は何も尋ねず、
-  0 バイトの `read` と `pread64` は尋ねます。
+  0 バイトの `read` と `pread64` は尋ねます。AIO の読み出し（`IOCB_CMD_PREAD`、
+  `IOCB_CMD_PREADV`）は、`aio_read` が `rw_verify_area` を呼ぶのと同じく `io_submit` の
+  ときに、0 バイトでも尋ねます。拒まれたものは、`io_submit` がほかの失敗と同じく
+  その要求で失敗させます（最初のものなら `EPERM`）。
   `statfs` の `f_fsid` はイベントが示すファイルシステムの ID と同じです。カーネル自身の
   ファイルシステム、/proc、devpts、mqueue では `simple_statfs` と同じくデバイス番号、
   ほかのファイルシステムでは、tmpfs が UUID を引くように、ファイルシステムごとに引いた
@@ -3604,6 +3779,17 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   実行した後に `PTRACE_EVENT_VFORK_DONE` を報告します。プロセスを終わらせたスレッドは
   `PTRACE_EVENT_EXIT` を報告し（致命的なシグナルがコアをダンプするときは、ステータスに
   0x80 が付きます）、それとともに終わるスレッドは報告しません。
+- トレーサーは `PTRACE_POKEUSER` でデバッグレジスタにハードウェアブレークポイントを設定でき、
+  Linux の `ptrace_set_debugreg` と同じ値を受け付けます。DR0〜DR3 はアドレスで、ユーザー空間に
+  あってブレークポイントの長さにそろっていなければなりません（`EINVAL`）。DR7 はそれらを有効にし、
+  種類（命令（1 バイト）、書き込み、読み書き）と長さ（1、2、4、8）を与えます。I/O の
+  ブレークポイントや長い命令のブレークポイントは `EINVAL` で、DR7 は元のままです。DR4 と DR5 は
+  ありません（`EIO`）。命令のブレークポイントはその命令の前でトレース対象を止め、再開したときに
+  一度は実行されるよう RF を立てます。データのブレークポイントは範囲にアクセスした命令の後で
+  止めます。`rep` 付きの文字列命令ではその回の後で、繰り返しの途中なら `rip` はその命令のままです。どちらも `TRAP_HWBKPT` の `SIGTRAP` で、アドレスは `rip` です。DR6 には
+  ブレークポイントのビットが、シングルステップの後は `DR_STEP` が立ちます。新しいタスクは
+  ブレークポイントを持たず、exec で消えます。ひとつもなければゲストはこれまでと同じ速さで、
+  あれば 1 命令ずつ動きます。
 - `PTRACE_SINGLESTEP` はトラップフラグを立ててトレース対象を再開します。トレース対象が
   自分で立てたのでなければ、トレーサーにはレジスタで見えず（`TIF_FORCED_TF`）、ほかの再開で
   消えます。トレース対象は 1 命令の後に `SIGTRAP` で止まり、`syscall` の後はその出口で

@@ -17,7 +17,9 @@ Linux.
   `rt_sigreturn` and a tracer may set, each instruction is followed by a
   `SIGTRAP` with `TRAP_TRACE` and its address past the instruction (trap
   1), except `syscall`, as the flag is masked off in the kernel and Linux
-  returns with `iret`; a signal handler starts with the flag cleared.
+  returns with `iret`, and a `rep` string instruction traps after each
+  iteration, with `rip` still on it until the last; a signal handler
+  starts with the flag cleared.
   `int3` gives `SIGTRAP` from the kernel (`SI_KERNEL`, trap 3) with `rip`
   past it.
 - **SSE**: every SSE and SSE2 instruction, except those that use MMX registers
@@ -82,13 +84,13 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `open_tree_attr`, `statmount`, `listmount`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | Security modules | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` |
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD`'s argument checks (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -248,8 +250,9 @@ kernel.
 - `statx` reports the fields a `stat` has (`STATX_BASIC_STATS`) and the
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
   (`EINVAL`). Whatever the mask asks for, it also gives the mount's ID, as
-  Linux does: the one `/proc/self/mountinfo` shows (`STATX_MNT_ID`), or a
-  64-bit one in its place when `STATX_MNT_ID_UNIQUE` is asked for. A file
+  Linux does: the one `/proc/self/mountinfo` shows (`STATX_MNT_ID`), or
+  the 64-bit one unique until the machine ends, which `statmount` and
+  `listmount` take, in its place when `STATX_MNT_ID_UNIQUE` is asked for. A file
   of an internal file system (a pipe, a socket, a memfd and the like; see
   `statfs` below) is on a mount with one of the small IDs that mountinfo,
   whose IDs start at 21, does not show, as Linux's internal mounts are.
@@ -954,23 +957,34 @@ kernel.
   and the features once (`EINVAL` again), writing back the features it
   offers and its ioctls, or zeros when it fails; it offers
   `UFFD_FEATURE_PAGEFAULT_FLAG_WP`, `UFFD_FEATURE_SIGBUS`,
-  `UFFD_FEATURE_THREAD_ID`,
+  `UFFD_FEATURE_THREAD_ID`, `UFFD_FEATURE_MINOR_SHMEM`,
+  `UFFD_FEATURE_MINOR_HUGETLBFS`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
   `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_POISON` and
-  `UFFD_FEATURE_MOVE`, and `UFFD_FEATURE_EVENT_FORK` needs
+  `UFFD_FEATURE_MOVE` (the two `HUGETLBFS` ones as Linux reports them,
+  though there is no hugetlbfs memory to register: `MFD_HUGETLB` and
+  `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
-  memory and shared anonymous memory for missing pages
-  (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
+  memory, shared anonymous memory and the shared or private mappings of a
+  memfd, which is shmem's (not System V shared memory, whose VMAs Linux
+  does not count as shmem's), for missing pages
+  (`UFFDIO_REGISTER_MODE_MISSING`), shmem (shared anonymous memory and a
+  memfd's mappings) for minor faults (`UFFDIO_REGISTER_MODE_MINOR`, which
+  adds `UFFDIO_CONTINUE` to the ioctls it reports and `ui` to `smaps`), and
+  private anonymous memory for write
   protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
   to the ioctls it reports), with Linux's checks in its order (the
   range, then each VMA: `EINVAL` for one that cannot be registered,
-  `EBUSY` for one another `userfaultfd` has); the modes replace a VMA's
+  `EPERM` for a shared one that may not write its file, `EBUSY` for one
+  another `userfaultfd` has); the modes replace a VMA's
   own unless it has them already. The ranges make VMAs of their own, as
   `/proc/<pid>/maps` shows them, with `um` and `uw` in `smaps`; a `fork`ed
   child and a mapping `mremap` moves do not keep it, and
   `UFFDIO_UNREGISTER` and closing the file take it away. An instruction
   that touches a page registered for missing pages that has none (in
-  shared memory, one no mapping of it has), or that writes to a
+  shmem, one its page cache does not have: no mapping of it brought the
+  page in and the file does not hold it, as written or allocated, and a
+  page past the file's end is SIGBUS first), or that writes to a
   write-protected page of a range registered for write protection, waits,
   and the file reads the fault as a `uffd_msg`, the oldest first: whether
   it was a write, `UFFD_PAGEFAULT_FLAG_WP` for a protected page, the page's
@@ -995,9 +1009,13 @@ kernel.
   `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
   does: `ENOENT` for a range that does not lie in one registered VMA,
   `EEXIST` for a page that has one, `EFAULT` for a source that cannot be
-  read, and `EAGAIN` once one stops short, with what was filled in the
+  read or a page past a shmem file's end, and `EAGAIN` once one stops short, with what was filled in the
   struct's last field; `UFFDIO_COPY_MODE_WP` fills write-protected pages,
-  in a range registered for write protection (`EINVAL`). `UFFDIO_POISON`
+  in a range registered for write protection (`EINVAL`). A fill of a
+  shared mapping of a shmem file is `EEXIST` where the file's page cache
+  has the page, and puts the page in the file, which `read` then sees; one
+  of a private mapping gives the mapping a page of its own and leaves the
+  file as it was. `UFFDIO_POISON`
   (`UFFD_FEATURE_POISON`) poisons the pages of a registered range the same
   way, its only mode `DONTWAKE`, and is `EEXIST` for a page this mapping
   has, or a guard: an access to a poisoned page raises SIGBUS with
@@ -1010,7 +1028,18 @@ kernel.
   and `UFFDIO_UNREGISTER`, moves with `mremap`, goes to a `fork`ed child of
   private memory but not of shared, and goes with `MADV_DONTNEED`,
   `MADV_FREE`, `MADV_GUARD_INSTALL` (whose guard takes its place) and
-  `munmap`. `UFFDIO_MOVE` moves private anonymous pages of the
+  `munmap`. A minor fault is an access to a page of shmem that its page
+  cache has but the mapping has no entry for, as `shmem_get_folio_gfp`
+  finds the folio and `handle_userfault` takes `VM_UFFD_MINOR`; its
+  message has `UFFD_PAGEFAULT_FLAG_MINOR`, and a hole is brought in unless
+  the range is registered for missing pages too. `UFFDIO_CONTINUE` maps
+  the page cache's pages into its range page by page, as
+  `mfill_atomic_pte_continue`: `EINVAL` for memory that is not shmem, a
+  mode other than `DONTWAKE` and `WP` (which needs the write-protect
+  mode), or a page past the file's end; `EFAULT` for a page the page cache
+  does not have; `EEXIST` for one the mapping has. A private mapping shows
+  the page until it writes it, as `mfill_atomic_install_pte` maps it
+  read-only. `UFFDIO_MOVE` moves private anonymous pages of the
   context's own address space (`EINVAL` from another) into a registered
   range, whether or not `UFFD_FEATURE_MOVE` was asked for, as Linux's
   `move_pages`: each start in a VMA (`ENOENT`); neither VMA shared, each
@@ -1578,6 +1607,17 @@ kernel.
   quota on one without, a changed quota limit; `size`, `nr_blocks`,
   `nr_inodes`, `huge`, `inode32`, `inode64` and `mpol` change, `mode`,
   `uid` and `gid` do not). The mount then takes the call's flags.
+- A `noexec` mount runs nothing, as Linux's `path_noexec`: `execve` of a
+  program there, a script's interpreter there and an ELF interpreter
+  there are `EACCES` before their permission, as is `access` with `X_OK`
+  of a regular file; `mmap` of a file there with `PROT_EXEC` is `EPERM`,
+  `READ_IMPLIES_EXEC` adds no `PROT_EXEC` to it, and `mprotect` gives its
+  mapping none (`EACCES`, the VMA without `VM_MAYEXEC`). A `nodev` mount
+  opens no device there (`EACCES`, `may_open_dev`, for root too). A
+  program on a `nosuid` mount, or on a superblock of a user namespace the
+  caller is not in, runs without its set-user-ID and set-group-ID bits and
+  its file capabilities (`mnt_may_suid`); for a script that is its
+  interpreter, the file that runs.
 - A read-only mount, or one of a read-only superblock, refuses what writes
   with `EROFS` where Linux's `mnt_want_write` does, after the errors that
   come before it: creating a name (`open` with `O_CREAT`, `O_TMPFILE`,
@@ -1682,6 +1722,37 @@ kernel.
   flags named and tmpfs's options as `MS_REMOUNT` does (`EPERM` without
   `CAP_SYS_ADMIN` over the superblock's user namespace, which also leaves
   the context failed, `EBUSY` from then on).
+- `mount_setattr` (Linux master's) checks its flags (`EINVAL`), then its
+  `struct mount_attr` (`E2BIG` beyond a page or for bytes past it that
+  are not 0, `EINVAL` under 32 bytes), `CAP_SYS_ADMIN` over the mount
+  namespace (`EPERM`), one propagation type and known attributes
+  (`EINVAL`), and an access-time setting only with all of
+  `MOUNT_ATTR__ATIME` cleared (`EINVAL`); one that changes nothing is 0
+  before the lookup. At a mount's root (`EINVAL`), of the namespace or a
+  detached tree's root, it sets and clears the mount's flags, with
+  `AT_RECURSIVE` those of each mount below it too, all or none: a locked
+  flag that would change is `EPERM`, and read-only with a file open for
+  writing `EBUSY`. Then the mounts take the propagation type.
+  `open_tree_attr` is `open_tree` with the same change made to its
+  descriptor's mount, which goes again when the change fails.
+- Each mount has an ID unique until the machine ends (`mnt_id_unique`,
+  from `1 << 31` on, in the order the mounts were made, a namespace's
+  copies in the order `copy_tree` takes them), and each mount namespace
+  an ID (the first's 8). `listmount` (Linux master's) checks its flags,
+  count and array (`EINVAL`, `EOVERFLOW`, `EFAULT`) and its `struct
+  mnt_id_req` (`E2BIG`, `EINVAL`), and gives, in order or backwards with
+  `LISTMOUNT_REVERSE`, after the last ID it was given, the IDs of the
+  mounts reachable from the caller's root (`LSMT_ROOT`) or from a mount
+  (`ENOENT` for none), of the caller's namespace or of one by its
+  namespace file or ID (`ENOENT`, `EBADF`, `EINVAL`; another one's
+  only with `CAP_SYS_ADMIN` over it). `statmount` gives what one of them
+  is, or with `STATMOUNT_BY_FD` the mount of a descriptor's file: the
+  superblock's device, type and flags, the mount's IDs, attributes and
+  propagation, its root and its mount point from the caller's root, the
+  type's name, its options alone and as an array, its source and its
+  namespace's ID, each as asked (`mask`, `supported_mask`); a buffer too
+  small for its strings is `EOVERFLOW`, a mount the caller's root does
+  not reach `EPERM` without `CAP_SYS_ADMIN`.
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`, stepping into a mount on
   where the path starts too (`LOOKUP_MOUNTPOINT`); then, as Linux's
@@ -1896,7 +1967,14 @@ kernel.
     thread and the socket's opener (`EPERM`); a send that names an
     address (`sendto`, `sendmsg` with a name) needs the sending thread's
     alone, as `netlink_sendmsg` marks it `NETLINK_SKB_DST`, which
-    `__netlink_ns_capable` passes the opener over for.
+    `__netlink_ns_capable` passes the opener over for. A `write` (and
+    `writev`, `sendfile`, `splice` and AIO writes) sends as `send` without
+    an address does, as the writing thread, since `netlink_sendmsg` runs
+    in it: an autobind takes its process ID for the port, a route lookup
+    its user ID for `RTA_UID`, and a change needs its `CAP_NET_ADMIN` and
+    the opener's. `bind`'s and `NETLINK_ADD_MEMBERSHIP`'s multicast routing
+    groups and `connect` to another port or a group ask the calling
+    thread alone (`rtnetlink_bind`, `netlink_allowed`).
   - **Strict checking:** with `NETLINK_GET_STRICT_CHK`, as iproute2 sets
     it, requests are checked as Linux checks them. A dump takes a whole
     header with nothing in it but what may narrow it, and of the
@@ -2038,8 +2116,8 @@ kernel.
     deprecated when its preferred lifetime ends, and goes with its routes
     when its valid one does, on time without a request: a socket that
     binds or sends finds it gone, and a member of the address and route
-    groups waiting in `poll`, `epoll` or a read hears of it as it happens. An IPv6 prefix route does
-    not run out by itself, as on Linux, whose routes through a loopback
+    groups waiting in `poll`, `epoll` or a read hears of it as it happens.
+    An IPv6 prefix route does not run out by itself, as on Linux, whose routes through a loopback
     lose `RTF_EXPIRES` as they are made (`fib6_is_reject`); it takes a
     lifetime (`rta_expires`) when a change gives its permanent address one
     (`modify_prefix_route`), or when an address of its prefix goes while
@@ -2165,7 +2243,29 @@ kernel.
     route (`ENETUNREACH`) without a source, or to a loopback, link-local
     or multicast address. `RTA_IP_PROTO` is `EOPNOTSUPP` but for TCP, UDP
     and the family's ICMP, and `RTA_IIF` is `ENODEV` for a device there is
-    not. The mark, the user ID, the protocol and the ports choose among
+    not. With `RTA_IIF` of `lo`, a route is looked up as a packet coming in
+    on it would take it (`ip_route_input_slow`, `ip6_route_input_lookup`),
+    and the answer names `lo` as `RTA_IIF`. IPv4 drops martians
+    (`EINVAL`): a multicast, limited broadcast, loopback or 0.0.0.0
+    source, a loopback or 0.0.0.0 destination, a group `lo` has not
+    joined, and a source of the namespace's own, or with a local route a
+    request added, one a lookup finds a route to that is not unicast
+    (`fib_validate_source`). A local, broadcast or multicast destination
+    gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,
+    `RTCF_MULTICAST`), of the TOS of the route that matched and without a
+    preferred source. Anything else would be forwarded: with `lo`'s
+    `forwarding` off (`/proc/sys/net`), it is `EHOSTUNREACH`; on, a
+    destination no route takes gives the lookup's error, a route of a
+    kind other than unicast `EINVAL`, and a unicast one the route it is
+    forwarded on (`__mkroute_input`): unicast, out through `lo`, with the
+    route's gateway and metrics, and `RTCF_DOREDIRECT` where the source's
+    own route is a unicast one through `lo` without a gateway, as a packet
+    that goes out where it came in asks to redirect. Reverse path
+    filtering (`rp_filter`, `all`'s or `lo`'s, the larger) checks every
+    source by a lookup of it (`__fib_validate_source`): with it on, a
+    source no route takes is dropped too; strict and loose filtering ask
+    the same, as every route goes through `lo`. IPv6 gives the route the
+    tables do, whatever its source and its `forwarding`. The mark, the user ID, the protocol and the ports choose among
     policy rules and multipath routes, which there are none of, so they
     change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its
@@ -2258,7 +2358,8 @@ kernel.
   - **Notifications:** a socket is a member of the groups `bind` names
     (they replace its first 32) and those `NETLINK_ADD_MEMBERSHIP` adds,
     of `RTNLGRP_*` 1 to 39 (`EINVAL` for 0 or one past them; the
-    multicast routing groups 30 and 31 need `CAP_NET_ADMIN`, `EPERM`);
+    multicast routing groups 30 and 31 need the caller's `CAP_NET_ADMIN`,
+    `EPERM`);
     `NETLINK_DROP_MEMBERSHIP` leaves one, and `NETLINK_LIST_MEMBERSHIPS`
     gives them all as two words. A change to `lo` is told to the members
     of its group in the namespace, each notification its own datagram,
@@ -2704,7 +2805,7 @@ kernel.
   `execve` and a Unix socket's address do not.
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
   `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
-  `fs` and `kernel` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
+  `fs`, `kernel` and `net` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
   directory its entries can be opened relative to and that lists them, and `/proc/self`, a
   symbolic link to it (0777, size 0) that `readlink` resolves to the PID:
   `lstat`, and `fstatat` or `statx` with `AT_SYMLINK_NOFOLLOW`, give the
@@ -2833,7 +2934,10 @@ kernel.
   `msg_max` and `msg_default` (1 to 65536), `msgsize_max` and
   `msgsize_default` (128 to 16 MiB), regular files of mode 0644 that the
   root of the user namespace owning the IPC namespace owns, and only that
-  root may open to write (`EACCES`). A read gives the value and a newline
+  root may open to write (`EACCES`). Each file of `/proc/sys` has an inode
+  of its own and a size of 0, as Linux's `proc_sys_make_inode` makes it,
+  so `copy_file_range` into one copies nothing from another sysctl and is
+  `EXDEV` from another filesystem. A read gives the value and a newline
   from the start, and nothing past it. A write at the start sets the value
   as Linux's `proc_dointvec_minmax` reads one `int`: spaces, an optional
   `-` and digits in base 10, or 16 after `0x`, or 8 after `0`, then a
@@ -2900,6 +3004,39 @@ kernel.
   did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
   `/proc/sys` lists its entries by name, as Linux's tree of them keeps
   them.
+- `/proc/sys/net` has the settings of the opener's network namespace, as
+  Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
+  `all`, `default` and each device (`lo`): `ipv4/ip_forward`,
+  `ipv4/conf/<device>/forwarding` and `rp_filter`, and
+  `ipv6/conf/<device>/disable_ipv6` and `forwarding`. They and their
+  directories belong to the root of the user namespace that owns the
+  network namespace; the files are 0644, which root and whoever has
+  `CAP_NET_ADMIN` over that namespace may open to write
+  (`net_ctl_permissions`, `EACCES`, and `EPERM` at a write that may not).
+  Each takes an `int` as `proc_dointvec` does. The first namespace starts
+  with them all 0, as Linux is built; a new one copies the first one's
+  IPv4 `all` and `default` and starts IPv6's as built
+  (`devconf_inherit_init_net` at 0), and its `lo` takes its `default`. As
+  the handlers:
+  - IPv4's `forwarding` (`ip_forward` is `all`'s) needs `CAP_NET_ADMIN`
+    of the writer (`EPERM`, `devinet_sysctl_forward`); `all`'s, when it
+    changes, sets `default`'s and every device's, while `default`'s
+    reaches no device.
+  - `rp_filter` set on a device stays its own; one set on `default` goes
+    to every device that has not been set, even by a write that failed
+    (`devinet_conf_proc`).
+  - IPv6's two report a bad value (`EINVAL`), as Linux master's
+    `addrconf_sysctl_forward` and `addrconf_sysctl_disable` do and the CI
+    kernel does (7.0's left it unreported and had `forwarding` of `all` or
+    a device return 1). `all`'s sets
+    `default`'s and every device's. A device whose `disable_ipv6` turns
+    on loses its IPv6 addresses and routes, told of as when it goes down
+    (`addrconf_ifdown`); turning off while it is up gives `::1` back, and
+    IPv6's own `RTM_NEWLINK` (`RTNLGRP_IPV6_IFINFO`), as `NETDEV_UP`
+    does. While it is on, `lo` coming up takes no IPv6 and a new IPv6
+    address is `EACCES` (`addrconf_add_dev`).
+  - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
+    and IPv6 is ready only with `disable_ipv6` off.
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
   descriptor, as Linux's `seq_show` writes it: `pos`, the description's
   position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and
@@ -3375,7 +3512,19 @@ kernel.
   any more and leaves its group, whose members, if it led one, each count
   on their own; such an event leads no new group (`ENODEV`). A thread that
   ends without an `execve` owns the events it opened no more
-  (`perf_event_exit_task`). `prctl`'s
+  (`perf_event_exit_task`), and the events that count it go to Linux's
+  `EXIT` state: they count no more, keep their last count and times to be
+  read, stay in their group and lead no new group (`ENODEV`). With
+  `inherit`, a new thread or process inherits the groups that count the
+  thread that makes it, as `perf_event_init_task` does: each event of them
+  gets one of its own, counting the new task, enabled as the one it comes
+  from is. `inherit_thread` keeps them from a new process, and `sigtrap`
+  from `CLONE_CLEAR_SIGHAND`. A read of the opened event adds in the
+  inherited ones and what those of tasks that ended gave back, counts and
+  times, a group's member by member (`ECHILD` for a group whose members
+  changed since a task inherited it). Its `ENABLE`, `DISABLE` and `RESET`
+  (which keeps what ended tasks gave back), and the `prctl` below, reach
+  the inherited events too. `prctl`'s
   `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` disable and enable every
   event the calling thread opened, whatever task it counts (one opened
   disabled too), and read no other argument; a thread that runs `execve`
@@ -3432,7 +3581,54 @@ kernel.
   (`sysinfo`'s 4 GiB), checked as `vmalloc` checks it, is `ENOMEM`. Its
   fdinfo has `map_type`, `key_size`, `value_size`, `max_entries`,
   `map_flags`, `map_extra`, `memlock` (that memory), `map_id` and
-  `frozen`. See [limitations](./limitations) for what is not there.
+  `frozen`. A `BPF_MAP_TYPE_LRU_HASH` is a hash that, when full, gives up
+  a key for a new one instead of `E2BIG`, as Linux's `bpf_lru_list.c`
+  chooses it: its elements move between the free, active and inactive
+  lists and a CPU's local free and pending lists, so that the key that
+  goes is the one Linux gives up, also when an update is refused or
+  replaces a key, which takes an element first. It needs `CAP_BPF` even
+  where any user may make maps (`EPERM`), is always preallocated
+  (`BPF_F_NO_PREALLOC` is `ENOTSUPP`), and with `BPF_F_NO_COMMON_LRU` keeps
+  lists for each CPU (`max_entries` rounded up to a multiple of the CPUs,
+  as many for each; with `BPF_F_NUMA_NODE` `EINVAL`). It takes the memory
+  of its elements alone, with no spares. `BPF_MAP_TYPE_QUEUE` and
+  `BPF_MAP_TYPE_STACK` hold values without keys (`key_size` 0, and a key
+  pointer that is not null is `EINVAL`), as Linux's `queue_stack_maps.c`:
+  `UPDATE_ELEM` pushes (a full one is `E2BIG`, unless `BPF_EXIST` makes room
+  by giving up the oldest; `BPF_NOEXIST` is `EINVAL`), `LOOKUP_ELEM` peeks
+  and `LOOKUP_AND_DELETE_ELEM` pops, a queue its oldest value and a stack
+  its newest (`ENOENT` for none); `DELETE_ELEM` and `GET_NEXT_KEY` are
+  `EINVAL` and the batch commands `ENOTSUPP`. They need `CAP_BPF`, take
+  only `BPF_F_NUMA_NODE` and the access flags, and refuse a value past
+  4 MiB or `max_entries` times the value size past 32 bits (`E2BIG`, as
+  Linux master). One takes a 312-byte header and `max_entries + 1` value
+  slots. A `BPF_MAP_TYPE_BLOOM_FILTER` takes values without keys too, as
+  Linux's `bloom_filter.c`: `UPDATE_ELEM` (`BPF_ANY` alone) sets a bit for
+  each of its hashes (`map_extra`'s low four bits, 5 for 0; more bits are
+  `EINVAL`), and `LOOKUP_ELEM` reads the value and says whether every bit
+  is set (`ENOENT` if not), writing nothing back. The hashes are Linux's
+  `jhash2` of a value of whole words, `jhash` of any other, with a random
+  seed, or 0 with `BPF_F_ZERO_SEED`, so a filter with it gives the same
+  false positives as Linux. The bits are `max_entries` times the hashes,
+  times 7 / 5, a power of two of at least 64 (2^32 past 2^31). `DELETE_ELEM`
+  and `GET_NEXT_KEY` are `EOPNOTSUPP`, `LOOKUP_AND_DELETE_ELEM` and the batch
+  commands `ENOTSUPP`; it needs `CAP_BPF`, and takes a 312-byte header and
+  its bits in 8-byte words. `map_extra` is in its fdinfo and
+  `bpf_map_info`. See [limitations](./limitations) for what is not there.
+- `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
+  its order and with its errors, which are the same in the test machines'
+  kernel (Ubuntu's Linux 7.0) and in master: the fields past the command
+  (`EINVAL`), the program flags (`EINVAL`), a token descriptor (`EBADF` for
+  none, `EINVAL` for another file, as there are no tokens here),
+  `kernel.unprivileged_bpf_disabled` without `CAP_BPF` (`EPERM`), the count
+  of instructions (0, or more than 4096 without `CAP_BPF` and 1,000,000
+  with it, `E2BIG`), `CAP_BPF` for a type other than a socket filter or a
+  cgroup skb program, `CAP_NET_ADMIN` and `CAP_PERFMON` for the types that
+  need them (`EPERM`; `CAP_SYS_ADMIN` stands in for each), an attach
+  program or BTF ID (`EINVAL` for every type here), and the copies of the
+  instructions and the license (`EFAULT`). A load that passes all of them
+  is `EINVAL`, as on a kernel built without the program's type: no
+  program is ever loaded (see [Limitations](./limitations)).
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable
@@ -3568,7 +3764,17 @@ kernel.
   or flushes marks on a file, a mount or a file system (and takes a mount
   namespace's); a mount's mark, by the mount's ID, hears only of the paths
   in that mount, not of a bind mount of the same file system, and fdinfo
-  shows that ID. It makes its checks in its order: the flags and mask
+  shows that ID; it goes when its mount is freed (`fsnotify_vfsmount_delete`),
+  so a mount that takes the ID next is not marked. Exec's open of the
+  program and its interpreter is told as `FAN_OPEN` with `FAN_OPEN_EXEC`,
+  as `do_open_execat` opens them with `__FMODE_EXEC`; inotify hears it as
+  `IN_OPEN`. Before that, each such open asks `FAN_OPEN_EXEC_PERM`, then
+  `FAN_OPEN_PERM`, and exec's read of the file `FAN_ACCESS_PERM`, in their
+  order, before exec commits; a denial fails `execve` with `EPERM`, and
+  what would come after it is not asked. An exec that fails later (a
+  missing interpreter, an argument it cannot read) has asked them all the
+  same: a denial's `EPERM` comes first, and an open let through tells its
+  open and close. It makes its checks in its order: the flags and mask
   (`EINVAL`), the descriptor (`EBADF`, `EINVAL`), the group's class and
   modes, the path (`ENOENT`, `ENOTDIR`), the events the file system takes
   (`EINVAL` for permission events on /proc, and for mount and file system
@@ -3620,7 +3826,10 @@ kernel.
   `copy_file_range`) waits for the answers the same way, after the checks
   of the descriptor, the buffer, the size and the position, as
   `rw_verify_area` asks it; `readv` and `preadv` of no bytes ask nothing,
-  as `vfs_readv`, where `read` and `pread64` of none ask too. `statfs`'s `f_fsid` is the file system ID the events give: the
+  as `vfs_readv`, where `read` and `pread64` of none ask too. An AIO read
+  (`IOCB_CMD_PREAD`, `IOCB_CMD_PREADV`) asks at `io_submit`, as `aio_read`
+  calls `rw_verify_area` there, for no bytes too: a denied one fails that
+  request as `io_submit` fails any (`EPERM` when it is the first). `statfs`'s `f_fsid` is the file system ID the events give: the
   device of the kernel's own file systems, /proc, devpts and mqueue, as
   `simple_statfs` gives it, and a number drawn for each other file system,
   as tmpfs draws a UUID.
@@ -4140,6 +4349,21 @@ one only with an `--allow-net`.
   exited or run another program. The thread that ends its process reports
   `PTRACE_EVENT_EXIT`, its status with 0x80 when a fatal signal dumps a
   core; the threads that end with it do not.
+- A tracer sets hardware breakpoints in the debug registers with
+  `PTRACE_POKEUSER`, as Linux's `ptrace_set_debugreg` takes them: DR0–DR3
+  hold the addresses, which must be in user space and aligned to the
+  breakpoint's length (`EINVAL`), and DR7 enables them and gives each its
+  type, an instruction (1 byte), a write, or a read or write, and its
+  length, 1, 2, 4 or 8 (`EINVAL` for an I/O breakpoint or a longer
+  instruction one, leaving DR7 as it was); there is no DR4 or DR5 (`EIO`).
+  An instruction breakpoint stops the tracee before the instruction, with
+  RF set so that it runs once resumed, and a data one after the instruction
+  that accesses the range, after the iteration for a `rep` string
+  instruction, with `rip` still on it while it repeats: `SIGTRAP` with `TRAP_HWBKPT` and the address in
+  `rip`, and DR6 with the breakpoint's bit, and with `DR_STEP` after a
+  single step. A new task has none, and exec clears them. While none is
+  set, the guest runs as fast as before; while one is, it runs one
+  instruction at a time.
 - `PTRACE_SINGLESTEP` resumes a tracee with the trap flag set, which the
   tracer does not see in its registers unless the tracee set it itself
   (`TIF_FORCED_TF`), and any other resume takes it back: the tracee stops

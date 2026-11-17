@@ -41,6 +41,7 @@
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::inet::Network;
 use crate::interface::MctpRoute;
+use crate::netdev::{LOOPBACK_INDEX, LOOPBACK_OIF};
 use crate::sockets::Timeout;
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat};
@@ -160,6 +161,9 @@ const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 /// `RTCF_BROADCAST` or `RTCF_MULTICAST` for a broadcast or multicast one.
 const RTM_F_CLONED: u32 = 0x200;
 const RTCF_LOCAL: u32 = 0x8000_0000;
+/// An input route that sends a packet out where it came in, which asks
+/// for a redirect (`IPSKB_DOREDIRECT`, as `rt_fill_info` tells it).
+const RTCF_DOREDIRECT: u32 = 0x0100_0000;
 const RTCF_BROADCAST: u32 = 0x1000_0000;
 const RTCF_MULTICAST: u32 = 0x2000_0000;
 /// `RTN_MULTICAST`, the type of a looked-up route to a multicast address.
@@ -870,7 +874,8 @@ impl NetlinkSocket {
         {
             return Err(Errno::EINVAL);
         }
-        if self.privileged(u64::from(groups)) && !sender.admin {
+        // `rtnetlink_bind` asks the caller alone (`ns_capable`).
+        if self.privileged(u64::from(groups)) && !sender.current_admin {
             return Err(Errno::EPERM);
         }
         if s.port.is_none() {
@@ -892,7 +897,8 @@ impl NetlinkSocket {
             return Ok(0);
         }
         let (port, groups) = address(raw)?;
-        if (port != 0 || groups != 0) && !sender.admin {
+        // `netlink_allowed` asks the caller alone (`ns_capable`).
+        if (port != 0 || groups != 0) && !sender.current_admin {
             return Err(Errno::EPERM);
         }
         self.port(&mut s, sender.pid)?;
@@ -1326,26 +1332,32 @@ impl NetlinkSocket {
     /// short message, for neither to get or set (`RTM_SETLINK`), and for a
     /// negative index to make (`RTM_NEWLINK`); `ENODEV` for another
     /// interface. The attributes are checked against `ifla_policy` first
-    /// ([`parse_policy`]). To set, more than one of `IFLA_NET_NS_PID`,
-    /// `IFLA_NET_NS_FD` and `IFLA_TARGET_NETNSID` is `EINVAL`
-    /// (`rtnl_ensure_unique_netns`), `RTM_NEWLINK` checks what
-    /// `IFLA_LINKINFO` holds against `ifla_info_policy`, then the namespace
-    /// those name is found ([`nsid::link_target`]: `ESRCH`, `EBADF`,
-    /// `EINVAL`, `EPERM`); once `lo` is found, `NLM_F_EXCL` is `EEXIST` and
-    /// `NLM_F_REPLACE` `EOPNOTSUPP` for `RTM_NEWLINK`, a move to another
-    /// namespace is `EINVAL`, as `lo` may not move
-    /// (`__dev_change_net_namespace`), and of the other attributes only the
-    /// name `lo` and `IFLA_EXT_MASK` are taken (`EOPNOTSUPP` for others),
-    /// as `do_setlink` looks at them after the move. To get, `strict` is
-    /// `Some` with whether the socket checks strictly, which takes, as
-    /// `rtnl_valid_getlink_req` does, no type, flags or change mask
-    /// (`EINVAL`), and of the
-    /// attributes only the names, `IFLA_EXT_MASK` and
-    /// `IFLA_TARGET_NETNSID` (`EINVAL` for others); either way
-    /// `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are then `EOPNOTSUPP`, and
-    /// `IFLA_TARGET_NETNSID` names the namespace whose link it is, as
-    /// [`nsid::target`] finds it (`EINVAL`, `EACCES`). The flags, the
-    /// change mask, and that ID and namespace.
+    /// ([`parse_policy`]).
+    ///
+    /// To set (`strict` is `None`):
+    /// - more than one of `IFLA_NET_NS_PID`, `IFLA_NET_NS_FD` and
+    ///   `IFLA_TARGET_NETNSID` is `EINVAL` (`rtnl_ensure_unique_netns`);
+    /// - `RTM_NEWLINK` checks what `IFLA_LINKINFO` holds against
+    ///   `ifla_info_policy`;
+    /// - the namespace those attributes name is found
+    ///   ([`nsid::link_target`]: `ESRCH`, `EBADF`, `EINVAL`, `EPERM`);
+    /// - once `lo` is found, `NLM_F_EXCL` is `EEXIST` and `NLM_F_REPLACE`
+    ///   `EOPNOTSUPP` for `RTM_NEWLINK`;
+    /// - a move to another namespace is `EINVAL`, as `lo` may not move
+    ///   (`__dev_change_net_namespace`);
+    /// - of the other attributes only the name `lo` and `IFLA_EXT_MASK` are
+    ///   taken (`EOPNOTSUPP` for others), as `do_setlink` looks at them
+    ///   after the move.
+    ///
+    /// To get, `strict` is `Some` with whether the socket checks strictly,
+    /// which takes, as `rtnl_valid_getlink_req` does, no type, flags or
+    /// change mask (`EINVAL`), and of the attributes only the names,
+    /// `IFLA_EXT_MASK` and `IFLA_TARGET_NETNSID` (`EINVAL` for others).
+    /// Either way `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are then
+    /// `EOPNOTSUPP`, and `IFLA_TARGET_NETNSID` names the namespace whose
+    /// link it is, as [`nsid::target`] finds it (`EINVAL`, `EACCES`).
+    ///
+    /// The flags, the change mask, and, for a get, that ID and namespace.
     fn find_link(
         &self,
         payload: &[u8],
@@ -1447,22 +1459,25 @@ impl NetlinkSocket {
         // `rtnl_getlink` and `rtnl_setlink` need (`EINVAL`), while
         // `rtnl_newlink` takes no negative index (`EINVAL`).
         let newlink = !get && header.kind == RTM_NEWLINK;
-        let found = match (index, name) {
+        // In the namespace the request names (`IFLA_TARGET_NETNSID`), or
+        // else this one.
+        let network = target
+            .as_ref()
+            .map_or(&self.network, |(_, network)| network);
+        let device = match (index, name) {
             (i, _) if i < 0 && newlink => {
                 return Err(extack::message(Errno::EINVAL, "ifindex can't be negative"));
             }
-            (i, _) if i > 0 => i == 1,
-            (_, Some(name)) => name == b"lo",
-            (_, None) if !newlink => return Err(Errno::EINVAL),
-            (_, None) => false,
+            (_, None) if index <= 0 && !newlink => return Err(Errno::EINVAL),
+            _ => network.devices().find(index, name).cloned(),
         };
-        if !found {
+        let Some(device) = device else {
             // `rtnl_newlink` makes a link only of a kind it is given.
             if !get && header.kind == RTM_NEWLINK && header.flags & NLM_F_CREATE != 0 {
                 return Err(extack::message(EOPNOTSUPP, "Unknown device type"));
             }
             return Err(ENODEV);
-        }
+        };
         if get {
             return Ok((word(8), word(12), target));
         }
@@ -1490,7 +1505,7 @@ impl NetlinkSocket {
             return Err(EOPNOTSUPP);
         }
         // Renaming `lo` to another name is not supported.
-        if index > 0 && name.is_some_and(|name| name != b"lo") {
+        if index > 0 && name.is_some_and(|name| name != device.name) {
             return Err(EOPNOTSUPP);
         }
         Ok((word(8), word(12), None))
@@ -1516,9 +1531,10 @@ impl NetlinkSocket {
                 "specified netns attribute not supported",
             ));
         }
-        if let Some(value) = by_kind.get(&IFLA_TARGET_NETNSID) {
-            nsid::target(&self.network, &self.opener, s32_value(value))?;
-        }
+        let network = match by_kind.get(&IFLA_TARGET_NETNSID) {
+            Some(value) => nsid::target(&self.network, &self.opener, s32_value(value))?,
+            None => Arc::clone(&self.network),
+        };
         let name = by_kind
             .get(&IFLA_IFNAME)
             .or_else(|| by_kind.get(&IFLA_ALT_IFNAME))
@@ -1527,8 +1543,8 @@ impl NetlinkSocket {
                 &value[..end]
             });
         let found = match (index, name) {
-            (i, _) if i > 0 => i == 1,
-            (_, Some(name)) => name == b"lo",
+            (i, _) if i > 0 => network.devices().by_index(i).is_some(),
+            (_, Some(name)) => network.devices().by_name(name).is_some(),
             (_, None) => {
                 // `rtnl_group_dellink`.
                 return Err(match by_kind.get(&IFLA_GROUP) {
@@ -1644,12 +1660,9 @@ impl FileHandle for NetlinkSocket {
     fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         self.receive(buf, false).map(|got| got.copied)
     }
-    /// A send to the peer; it binds with the opener's process ID and acts
-    /// with the opener's capability, as no calling thread is known here.
-    /// An ID request's `NETNSA_PID` and `NETNSA_FD` are the writer's,
-    /// though, and a namespace named by its ID (`NETNSA_TARGET_NSID`,
-    /// `IFLA_TARGET_NETNSID`, `IFA_TARGET_NETNSID`) needs the writer's
-    /// `CAP_NET_ADMIN` as well as the opener's ([`resolving`]).
+    /// A send to the peer without a calling thread, as the opener: the
+    /// system calls that write go through [`crate::netlink::write`], as
+    /// the writer.
     fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
         let sender = Sender {
             pid: self.opener_pid,
@@ -2295,12 +2308,26 @@ fn link_dump(
     if master != 0 {
         return Ok(Vec::new());
     }
-    Ok(vec![match shown {
-        Some((id, peer)) => {
-            with_link_netnsid(link_message(&peer, seq, port, NLM_F_MULTI, mask), id)
-        }
-        None => link_message(network, seq, port, NLM_F_MULTI, mask),
-    }])
+    // Each device of the namespace, in the order of their indices: its
+    // loopback alone.
+    let (network, id) = match &shown {
+        Some((id, peer)) => (peer.as_ref(), Some(*id)),
+        None => (network, None),
+    };
+    let loopbacks = network
+        .devices()
+        .iter()
+        .filter(|d| d.kind == crate::netdev::DeviceKind::Loopback)
+        .count();
+    Ok((0..loopbacks)
+        .map(|_| {
+            let link = link_message(network, seq, port, NLM_F_MULTI, mask);
+            match id {
+                Some(id) => with_link_netnsid(link, id),
+                None => link,
+            }
+        })
+        .collect())
 }
 /// Strictly, a bridge link dump (`valid_bridge_getlink_req`) takes no
 /// type, flags, change mask or index (`EINVAL`), then breaks no rule of
@@ -2561,7 +2588,7 @@ fn mctp_addresses(network: &Network, payload: &[u8], seq: u32, port: u32) -> Vec
 /// ID as `IFA_LOCAL` and as `IFA_ADDRESS`.
 fn mctp_address(eid: u8, kind: u16, flags: u16, seq: u32, port: u32) -> Vec<u8> {
     let mut body = vec![AF_MCTP, 0, 0, 0];
-    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&LOOPBACK_OIF.to_le_bytes());
     attribute(&mut body, IFA_LOCAL, &[eid]);
     attribute(&mut body, IFA_ADDRESS, &[eid]);
     message(kind, flags, seq, port, &body)
@@ -2603,7 +2630,7 @@ fn mctp_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
             }
             attribute(&mut body, RTA_METRICS, &metrics);
             match route.gateway {
-                None => attribute(&mut body, RTA_OIF, &1u32.to_le_bytes()),
+                None => attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes()),
                 Some((net, eid)) => {
                     let mut address = net.to_le_bytes().to_vec();
                     address.extend_from_slice(&[eid, 0, 0, 0]);
@@ -2635,7 +2662,8 @@ fn change_mctp_address(network: &Network, header: &Header, payload: &[u8]) -> Re
         .or_else(|| table.get(&IFA_ADDRESS))
         .map(|value| value[0])
         .ok_or(Errno::EINVAL)?;
-    if u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default()) != 1 {
+    // Only the loopback has an MCTP device (`mctp_dev_get_rtnl`).
+    if u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default()) != LOOPBACK_OIF {
         return Err(ENODEV);
     }
     let mut addresses = network.addresses();
@@ -2725,7 +2753,7 @@ fn change_mctp_route(network: &Network, header: &Header, payload: &[u8]) -> Resu
         (0, None) => {
             return Err(extack::message(Errno::EINVAL, "no route output provided"));
         }
-        (1, None) => None,
+        (LOOPBACK_OIF, None) => None,
         (_, None) => return Err(extack::message(ENODEV, "bad ifindex")),
         (0, Some(value)) => {
             let eid = value[4];
@@ -2860,7 +2888,7 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
     for (&kind, &value) in &attributes {
         match kind {
             RTA_TABLE => filter.table = u32_value(value)?,
-            RTA_OIF if u32_value(value)? == 1 => filter.device = true,
+            RTA_OIF if u32_value(value)? == LOOPBACK_OIF => filter.device = true,
             RTA_OIF => return Err(ENODEV),
             _ => {
                 return Err(extack::message(
@@ -3142,7 +3170,7 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -
     let mut body = Vec::new();
     body.extend_from_slice(&[0, 0]);
     body.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
-    body.extend_from_slice(&1i32.to_le_bytes());
+    body.extend_from_slice(&LOOPBACK_INDEX.to_le_bytes());
     body.extend_from_slice(&link_flags(network).to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
     let u32_of = |v: u32| v.to_le_bytes();
@@ -3193,7 +3221,11 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -
         b"noop\0"
     };
     attribute(&mut body, IFLA_QDISC, qdisc);
-    attribute(&mut body, IFLA_AF_SPEC, &af_spec(up, stats));
+    attribute(
+        &mut body,
+        IFLA_AF_SPEC,
+        &af_spec(network.lo_conf(), up, stats),
+    );
     attribute(&mut body, IFLA_MAP, &[0; 32]);
     attribute(&mut body, IFLA_DEVLINK_PORT | NLA_F_NESTED, &[]);
     attribute(&mut body, IFLA_DPLL_PIN | NLA_F_NESTED, &[]);
@@ -3203,19 +3235,24 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -
 /// `inet6_fill_link_af` give it. Its IPv4 and IPv6 settings are those of a kernel whose sysctls
 /// are as built, a loopback's (no IPsec policy, no temporary addresses, no
 /// duplicate address detection, its MTU), not the host's a new namespace
-/// copies on Linux. IPv6 is ready while `lo` is up; its creation time is
-/// 0, its reachable time the base 30 seconds, where Linux's is random; its
-/// statistics are zero and left out without `stats`.
-fn af_spec(up: bool, stats: bool) -> Vec<u8> {
-    const INET: [i32; 33] = [
+/// copies on Linux, but for those `conf` has, as `/proc/sys/net` sets them
+/// ([`crate::netconf`]). IPv6 is ready while `lo` is up with IPv6 on; its
+/// creation time is 0, its reachable time the base 30 seconds, where
+/// Linux's is random; its statistics are zero and left out without
+/// `stats`.
+fn af_spec(conf: (crate::netdev::Conf4, crate::netdev::Conf6), up: bool, stats: bool) -> Vec<u8> {
+    let mut inet: [i32; 33] = [
         0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10000, 1000,
         0, 0, 0, 0, 1,
     ];
-    let mut inet = Vec::new();
+    // `IPV4_DEVCONF_FORWARDING` and `IPV4_DEVCONF_RP_FILTER`, less one.
+    inet[0] = conf.0.forwarding;
+    inet[7] = conf.0.rp_filter;
+    let mut settings = Vec::new();
     attribute(
-        &mut inet,
+        &mut settings,
         IFLA_INET_CONF,
-        &INET
+        &inet
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<u8>>(),
@@ -3223,22 +3260,29 @@ fn af_spec(up: bool, stats: bool) -> Vec<u8> {
     // MCTP's, first, as a kernel built with it (Ubuntu's) gives: its
     // default network, 1, and no physical binding.
     let mut mctp = Vec::new();
-    attribute(&mut mctp, IFLA_MCTP_NET, &1u32.to_le_bytes());
+    attribute(&mut mctp, IFLA_MCTP_NET, &LOOPBACK_OIF.to_le_bytes());
     attribute(&mut mctp, IFLA_MCTP_PHYS_BINDING, &[0]);
     let mut spec = Vec::new();
     attribute(&mut spec, u16::from(AF_MCTP), &mctp);
-    attribute(&mut spec, u16::from(AF_INET), &inet);
-    attribute(&mut spec, u16::from(AF_INET6), &inet6_settings(up, stats));
+    attribute(&mut spec, u16::from(AF_INET), &settings);
+    attribute(
+        &mut spec,
+        u16::from(AF_INET6),
+        &inet6_settings(conf.1, up, stats),
+    );
     spec
 }
 /// `lo`'s IPv6 settings, as `inet6_fill_ifla6_attrs` gives them, for
 /// [`af_spec`] and [`inet6_link_message`].
-fn inet6_settings(up: bool, stats: bool) -> Vec<u8> {
-    const INET6: [i32; 60] = [
+fn inet6_settings(conf: crate::netdev::Conf6, up: bool, stats: bool) -> Vec<u8> {
+    let mut values: [i32; 60] = [
         0, 64, 65536, 1, 1, 1, 1, -1, 4000, 1000, -1, 172_800, 86400, 3, 600, 16, 0, 1, 1, 1,
         60000, 0, 0, 0, 0, 0, 0, -1, 0, 0, 10000, 1000, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 3_600_000,
         0, 0, 1, 0, 0, 0, 0, 0, 1024, 0, 65535, -1, 1, 0, 0, 0,
     ];
+    // `DEVCONF_FORWARDING` and `DEVCONF_DISABLE_IPV6`.
+    values[0] = conf.forwarding;
+    values[26] = conf.disable_ipv6;
     let words =
         |values: &[i32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
     let counters = |count: u64| -> Vec<u8> {
@@ -3247,7 +3291,13 @@ fn inet6_settings(up: bool, stats: bool) -> Vec<u8> {
         raw
     };
     let mut inet6 = Vec::new();
-    let ready: u32 = if up { IF_READY } else { 0 };
+    // `addrconf_notify` makes it ready as it comes up with IPv6 on, and
+    // `addrconf_ifdown` takes that back.
+    let ready: u32 = if up && conf.disable_ipv6 == 0 {
+        IF_READY
+    } else {
+        0
+    };
     attribute(&mut inet6, IFLA_INET6_FLAGS, &ready.to_le_bytes());
     // `ifla_cacheinfo`: the largest reassembly, creation time, reachable
     // and retransmission times.
@@ -3256,7 +3306,7 @@ fn inet6_settings(up: bool, stats: bool) -> Vec<u8> {
         IFLA_INET6_CACHEINFO,
         &words(&[65535, 0, 30000, 1000]),
     );
-    attribute(&mut inet6, IFLA_INET6_CONF, &words(&INET6));
+    attribute(&mut inet6, IFLA_INET6_CONF, &words(&values));
     if stats {
         attribute(&mut inet6, IFLA_INET6_STATS, &counters(IPSTATS_MIB_MAX));
         attribute(&mut inet6, IFLA_INET6_ICMP6STATS, &counters(ICMP6_MIB_MAX));
@@ -3273,7 +3323,7 @@ fn inet6_link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec
     let up = network.is_up();
     let mut body = vec![AF_INET6, 0];
     body.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
-    body.extend_from_slice(&1i32.to_le_bytes());
+    body.extend_from_slice(&LOOPBACK_INDEX.to_le_bytes());
     body.extend_from_slice(&link_flags(network).to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
     attribute(&mut body, IFLA_IFNAME, b"lo\0");
@@ -3281,7 +3331,11 @@ fn inet6_link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec
     attribute(&mut body, IFLA_MTU, &LO_MTU.to_le_bytes());
     let operstate = if up { IF_OPER_UNKNOWN } else { IF_OPER_DOWN };
     attribute(&mut body, IFLA_OPERSTATE, &[operstate]);
-    attribute(&mut body, IFLA_PROTINFO, &inet6_settings(up, true));
+    attribute(
+        &mut body,
+        IFLA_PROTINFO,
+        &inet6_settings(network.lo_conf().1, up, true),
+    );
     message(RTM_NEWLINK, flags, seq, port, &body)
 }
 /// `RTM_NEWLINK` for the IPv4 multicast routing table in an
@@ -3357,7 +3411,7 @@ fn ipv4_address(
 ) -> Vec<u8> {
     {
         let mut body = vec![AF_INET, address.prefix, address.flags as u8, address.scope];
-        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&LOOPBACK_OIF.to_le_bytes());
         if !address.address.is_unspecified() {
             attribute(&mut body, IFA_ADDRESS, &address.address.octets());
         }
@@ -3415,7 +3469,7 @@ fn ipv6_address(
             address_flags as u8,
             address.scope(),
         ];
-        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&LOOPBACK_OIF.to_le_bytes());
         attribute(&mut body, IFA_ADDRESS, &address.address.octets());
         if address.priority != 0 {
             attribute(&mut body, IFA_RT_PRIORITY, &address.priority.to_le_bytes());
@@ -3545,7 +3599,7 @@ fn change_address(
         if add && local.is_some_and(|l| l.is_unspecified()) {
             return Ok(Vec::new());
         }
-        if index != 1 {
+        if !network.has_device(index) {
             return Err(extack::message(ENODEV, "ipv4: Device not found"));
         }
         if !add {
@@ -3579,7 +3633,7 @@ fn change_address(
         if prefix > 128 {
             return Err(long());
         }
-        if index != 1 {
+        if !network.has_device(index) {
             return Err(no_device());
         }
         return network.addresses().del_v6(ip, prefix, now);
@@ -3590,7 +3644,7 @@ fn change_address(
             "ipv6: address lifetime invalid",
         ));
     }
-    if index != 1 {
+    if !network.has_device(index) {
         return Err(no_device());
     }
     let flags = flags & crate::interface::V6_ASKED;
@@ -3616,6 +3670,13 @@ fn change_address(
         if replace {
             return Err(Errno::EINVAL);
         }
+    }
+    // `addrconf_add_dev`: a device with `disable_ipv6` takes no new one.
+    if exists.is_none() && network.ipv6_off() {
+        return Err(extack::message(
+            Errno::EACCES,
+            "ipv6: IPv6 is disabled on this device",
+        ));
     }
     // `ipv6_add_addr`, for a new address.
     if exists.is_none() {
@@ -3683,7 +3744,7 @@ fn ipv4_route_of(
         attribute(&mut body, RTA_GATEWAY, &gateway.octets());
     }
     if route.device {
-        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+        attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
     }
     message(kind, flags, seq, port, &body)
 }
@@ -3718,7 +3779,7 @@ fn ipv6_route_of(
     }
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
     let mut cache = [0; RTA_CACHEINFO_LEN];
     cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &cache);
@@ -3748,8 +3809,8 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// `ERANGE`), and a longer one counts as its first bytes; `EOPNOTSUPP` for
 /// an `RTA_IP_PROTO` but TCP, UDP and the family's ICMP
 /// (`rtm_getroute_parse_ip_proto`); then `ENODEV` for an input route
-/// (`RTA_IIF`) of another device than `lo`, and `EOPNOTSUPP` for one of
-/// `lo`, which is not supported.
+/// (`RTA_IIF`) of another device than `lo`, and one of `lo` is looked up
+/// as a packet coming in on it would be ([`input4`], [`input6`]).
 ///
 /// IPv4, as `ip_route_output_key_hash_rcu`: a source (`RTA_SRC`) is
 /// `EINVAL` when multicast or the limited broadcast address and
@@ -3844,11 +3905,42 @@ fn lookup(
     if proto.is_some_and(|p| !matches!(p, 6 | 17) && p != icmp) {
         return Err(extack::message(EOPNOTSUPP, "Unsupported ip proto"));
     }
-    if iif != 0 {
-        return Err(if iif == 1 { EOPNOTSUPP } else { ENODEV });
+    if iif != 0 && !network.has_device(iif) {
+        return Err(ENODEV);
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
+    // The devices alone, before the addresses.
+    let (forwarding, rp_filter) = {
+        let devices = network.devices();
+        devices
+            .by_index(crate::netdev::LOOPBACK_INDEX)
+            .map_or((false, 0), |lo| {
+                (
+                    lo.conf4.forwarding != 0,
+                    lo.conf4.rp_filter.max(devices.all4.rp_filter),
+                )
+            })
+    };
     let addresses = network.addresses();
+    if iif == LOOPBACK_OIF {
+        let input = Input {
+            tos,
+            flags: request_flags,
+            mark,
+            uid: asked_uid,
+            reply: (seq, port),
+            forwarding,
+            rp_filter,
+        };
+        return if v6 {
+            input6(&addresses, address6, source6, &input, now)
+        } else {
+            let four = |value: Option<&[u8]>| -> Result<[u8; 4], Errno> {
+                value.map_or(Ok([0; 4]), |v| v.first_chunk().copied().ok_or(ERANGE))
+            };
+            input4(network, &addresses, four(dst)?, four(src)?, &input)
+        };
+    }
     if v6 {
         let ip = Ipv6Addr::from(address6);
         if !network.is_up() {
@@ -3859,7 +3951,7 @@ fn lookup(
         // link-local or multicast address (`rt6_need_strict`), and every
         // one goes through `lo`.
         let strict = ip.is_loopback() || ip.is_unicast_link_local() || ip.is_multicast();
-        if oif != 0 && oif != 1 && (strict || source6 == [0; 16]) {
+        if oif != 0 && oif != LOOPBACK_OIF && (strict || source6 == [0; 16]) {
             return Err(ENETUNREACH);
         }
         let route = addresses.lookup6(ip)?;
@@ -3892,7 +3984,7 @@ fn lookup(
         // The route's metrics, which its `rt6_info` shares.
         put_metrics(&mut body, &route.metrics);
         attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+        attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
         attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
         attribute(&mut body, RTA_PREF, &[0]);
         return Ok(message(RTM_NEWROUTE, 0, seq, port, &body));
@@ -3919,7 +4011,7 @@ fn lookup(
         direct = oif == 0 && (ip.is_multicast() || ip.is_broadcast());
     }
     if oif != 0 {
-        if oif != 1 {
+        if !network.has_device(oif) {
             return Err(ENODEV);
         }
         if !network.is_up() {
@@ -4060,7 +4152,7 @@ fn lookup(
     if !named.is_unspecified() {
         attribute(&mut body, RTA_SRC, &asked_source);
     }
-    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
     if source != named {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
@@ -4078,6 +4170,241 @@ fn lookup(
         attribute(&mut body, RTA_UID, &uid.to_le_bytes());
     }
     attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
+    Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
+}
+/// What an input route lookup asks besides its addresses: the TOS, the
+/// `rtm_flags`, the mark, the user ID it names, if any, and the request's
+/// sequence number and port.
+struct Input {
+    tos: u8,
+    flags: u32,
+    mark: u32,
+    uid: Option<u32>,
+    reply: (u32, u32),
+    /// `lo`'s `forwarding` (`IN_DEV_FORWARD`), and the reverse path
+    /// filtering that counts, `all`'s or `lo`'s, the larger
+    /// (`IN_DEV_RPFILTER`), as `/proc/sys/net` sets them.
+    forwarding: bool,
+    rp_filter: i32,
+}
+/// An IPv4 route lookup for a packet in on `lo` to `address` from
+/// `source` (`RTA_IIF`), as `inet_rtm_getroute` takes it through
+/// `ip_route_input_rcu`, with `lo`'s forwarding and reverse path filtering
+/// as `/proc/sys/net` sets them, each source checked as
+/// [`Addresses::validate_source4`] checks it. `EINVAL` for what `ip_route_input_slow` drops,
+/// in its order: a multicast destination of a group `lo` has not joined
+/// (only 224.0.0.1, while it is up), or from a multicast, limited
+/// broadcast or loopback source, from none but to a group of the local
+/// net, or from a source of the namespace ([`Addresses::valid_source4`]);
+/// a multicast or limited broadcast source; then, but to the limited
+/// broadcast address or from and to 0.0.0.0, a source or destination of
+/// 0.0.0.0 or of the loopback net. A multicast or broadcast one (also a
+/// destination a broadcast route has) is checked by its source too, as is
+/// a local one. With forwarding off, any other is `EHOSTUNREACH`, and so
+/// is one no route takes; with it on, one no route takes is `fib_lookup`'s
+/// error, one of a route of another kind than unicast `EINVAL`, and a
+/// unicast one is forwarded (`__mkroute_input`), checked by its source as
+/// it goes out through `lo` again: the answer is a unicast route of no
+/// local flag, with `RTCF_DOREDIRECT` where the source's route is one of
+/// host scope, the route's gateway as `RTA_GATEWAY` where it uses one, and
+/// its metrics. The answer, as
+/// `rt_fill_info` gives an input route: of the route's type (or broadcast
+/// or multicast), with `RTCF_LOCAL` and `RTCF_BROADCAST` or
+/// `RTCF_MULTICAST`, of the TOS of the route that matched, the source as
+/// `RTA_SRC` where there is one, `lo` as `RTA_OIF` and `RTA_IIF`, no
+/// metrics, and the mark and user ID it names. With `RTM_F_LOOKUP_TABLE`
+/// it names the table the route came from, 0 for none; with
+/// `RTM_F_FIB_MATCH` it is the route that matched, of the type made, and
+/// `EHOSTUNREACH` where no table gave one.
+///
+/// [`Addresses::validate_source4`]: crate::interface::Addresses::validate_source4
+fn input4(
+    network: &Network,
+    addresses: &crate::interface::Addresses,
+    address: [u8; 4],
+    asked_source: [u8; 4],
+    input: &Input,
+) -> Result<Vec<u8>, Errno> {
+    use crate::interface::{Kind, TABLE_LOCAL, TABLE_MAIN};
+    use core::net::Ipv4Addr;
+    let (ip, src) = (Ipv4Addr::from(address), Ipv4Addr::from(asked_source));
+    let martian = |src: Ipv4Addr| src.is_multicast() || src.is_broadcast();
+    // `fib_validate_source` of a packet that is not forwarded.
+    let valid = |src: Ipv4Addr| {
+        addresses
+            .validate_source4(src, input.tos, 0, input.rp_filter)
+            .is_ok()
+    };
+    // The route's type and flags, and the table entry it came from.
+    let (code, flags, route) = if ip.is_multicast() {
+        // `ip_route_input_mc`, for a group `lo` has joined
+        // (`ip_check_mc_rcu`), after `ip_mc_validate_source`.
+        if ip != ALL_HOSTS || !network.is_up() || martian(src) || src.is_loopback() {
+            return Err(Errno::EINVAL);
+        }
+        let local_group = u32::from(ip) & 0xffff_ff00 == 0xe000_0000;
+        if src.is_unspecified() && !local_group || !src.is_unspecified() && !valid(src) {
+            return Err(Errno::EINVAL);
+        }
+        (RTN_MULTICAST, RTCF_MULTICAST | RTCF_LOCAL, None)
+    } else if martian(src) {
+        return Err(Errno::EINVAL);
+    } else if ip.is_broadcast() || src.is_unspecified() && ip.is_unspecified() {
+        // `brd_input`, before any lookup.
+        if !src.is_unspecified() && !valid(src) {
+            return Err(Errno::EINVAL);
+        }
+        (Kind::Broadcast.code(), RTCF_BROADCAST | RTCF_LOCAL, None)
+    } else if src.is_unspecified() || ip.is_unspecified() || ip.is_loopback() || src.is_loopback() {
+        return Err(Errno::EINVAL);
+    } else {
+        // Forwarding off, what no route takes is `EHOSTUNREACH`, and so is
+        // what is not local nor broadcast; on, what no route takes is the
+        // lookup's error (`no_route`).
+        let route = addresses
+            .lookup4_flow(ip, input.tos, 0)
+            .map_err(|e| if input.forwarding { e } else { EHOSTUNREACH })?;
+        match route.kind {
+            Kind::Broadcast | Kind::Local => {
+                if !valid(src) {
+                    return Err(Errno::EINVAL);
+                }
+                let flags = if route.kind == Kind::Broadcast {
+                    RTCF_BROADCAST | RTCF_LOCAL
+                } else {
+                    RTCF_LOCAL
+                };
+                (route.kind.code(), flags, Some(route))
+            }
+            _ if !input.forwarding => return Err(EHOSTUNREACH),
+            // `martian_destination`.
+            kind if kind != Kind::Unicast => return Err(Errno::EINVAL),
+            // `__mkroute_input`, out through `lo`, where it came in.
+            _ => {
+                let redirect = addresses
+                    .validate_source4(src, input.tos, LOOPBACK_OIF, input.rp_filter)
+                    .map_err(|()| Errno::EINVAL)?;
+                let flags = if redirect { RTCF_DOREDIRECT } else { 0 };
+                (route.kind.code(), flags, Some(route))
+            }
+        }
+    };
+    let (seq, port) = input.reply;
+    // The local table shares the main one's trie.
+    let from = route.map_or(0, |r| {
+        if r.table == TABLE_LOCAL {
+            TABLE_MAIN
+        } else {
+            r.table
+        }
+    });
+    let table = if input.flags & RTM_F_LOOKUP_TABLE != 0 {
+        from
+    } else {
+        TABLE_MAIN
+    };
+    if input.flags & RTM_F_FIB_MATCH != 0 {
+        let Some(route) = route else {
+            return Err(EHOSTUNREACH);
+        };
+        let mut answer = ipv4_route_of(RTM_NEWROUTE, &route, table, seq, port, 0);
+        answer[23] = code;
+        return Ok(answer);
+    }
+    let mut flags = RTM_F_CLONED | flags;
+    if input.flags & RTM_F_NOTIFY != 0 {
+        flags |= RTM_F_NOTIFY | RTCF_NOTIFY;
+    }
+    let mut body = vec![
+        AF_INET,
+        32,
+        if src.is_unspecified() { 0 } else { 32 },
+        route.map_or(0, |r| r.tos),
+        table_byte(table),
+        0,
+        RT_SCOPE_UNIVERSE,
+        code,
+    ];
+    body.extend_from_slice(&flags.to_le_bytes());
+    attribute(&mut body, RTA_TABLE, &table.to_le_bytes());
+    attribute(&mut body, RTA_DST, &address);
+    if !src.is_unspecified() {
+        attribute(&mut body, RTA_SRC, &asked_source);
+    }
+    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+    // A forwarded one has its route's next hop (`rt_set_nexthop`).
+    if let Some(route) = route.filter(|r| r.kind == Kind::Unicast) {
+        if let Some(gateway) = route.gateway.filter(|_| route.uses_gateway) {
+            attribute(&mut body, RTA_GATEWAY, &gateway.octets());
+        }
+        put_metrics(&mut body, &route.metrics);
+    }
+    if input.mark != 0 {
+        attribute(&mut body, RTA_MARK, &input.mark.to_le_bytes());
+    }
+    if let Some(uid) = input.uid.filter(|&uid| uid != u32::MAX) {
+        attribute(&mut body, RTA_UID, &uid.to_le_bytes());
+    }
+    attribute(&mut body, RTA_IIF, &LOOPBACK_OIF.to_le_bytes());
+    attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
+    Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
+}
+/// An IPv6 route lookup for a packet in on `lo` to `address` from
+/// `source` (`RTA_IIF`), as `inet6_rtm_getroute` takes it through
+/// `ip6_route_input_lookup`: the route the tables give
+/// ([`Addresses::lookup6`]: a rejecting route's error, `ENETUNREACH` for
+/// none, as for a link-local or multicast address, which no route of `lo`
+/// takes), whatever its source. The answer, as `rt6_fill_node` gives it
+/// with an input device: as an output lookup's, but `RTA_IIF` where that
+/// gives the source it leaves from, and with `RTM_F_FIB_MATCH` the route's
+/// own entry with `RTA_IIF`.
+///
+/// [`Addresses::lookup6`]: crate::interface::Addresses::lookup6
+fn input6(
+    addresses: &crate::interface::Addresses,
+    address: [u8; 16],
+    source: [u8; 16],
+    input: &Input,
+    now: u64,
+) -> Result<Vec<u8>, Errno> {
+    let route = addresses.lookup6(core::net::Ipv6Addr::from(address))?;
+    let (seq, port) = input.reply;
+    let fib_match = input.flags & RTM_F_FIB_MATCH != 0;
+    let mut body = vec![
+        AF_INET6,
+        if fib_match { route.len } else { 128 },
+        if fib_match { 0 } else { 128 },
+        0,
+        table_byte(route.table),
+        route.proto,
+        RT_SCOPE_UNIVERSE,
+        route.kind.code(),
+    ];
+    body.extend_from_slice(&0u32.to_le_bytes());
+    attribute(&mut body, RTA_TABLE, &route.table.to_le_bytes());
+    if fib_match {
+        if route.len != 0 {
+            attribute(&mut body, RTA_DST, &route.dst.octets());
+        }
+    } else {
+        attribute(&mut body, RTA_DST, &address);
+        attribute(&mut body, RTA_SRC, &source);
+    }
+    attribute(&mut body, RTA_IIF, &LOOPBACK_OIF.to_le_bytes());
+    if let Some(source) = route.prefsrc {
+        attribute(&mut body, RTA_PREFSRC, &source.octets());
+    }
+    put_metrics(&mut body, &route.metrics);
+    attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+    if fib_match {
+        let mut cache = [0; RTA_CACHEINFO_LEN];
+        cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
+        attribute(&mut body, RTA_CACHEINFO, &cache);
+    } else {
+        attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
+    }
+    attribute(&mut body, RTA_PREF, &[0]);
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }
 /// An `RTM_NEWROUTE` or `RTM_DELROUTE` request, as `inet_rtm_newroute`,
@@ -4569,7 +4896,7 @@ fn neighbour_message(
 ) -> Vec<u8> {
     let family = if n.ip.is_ipv6() { AF_INET6 } else { AF_INET };
     let mut body = vec![family, 0, 0, 0];
-    body.extend_from_slice(&1i32.to_le_bytes());
+    body.extend_from_slice(&LOOPBACK_INDEX.to_le_bytes());
     body.extend_from_slice(&u16::from(n.state).to_le_bytes());
     body.extend_from_slice(&[(n.flags & 0xff) as u8, n.kind]);
     attribute(&mut body, NDA_DST, &key_bytes(&n.ip));
@@ -4789,7 +5116,7 @@ fn neighbour_get(
             ));
         }
     };
-    if index != 0 && index != 1 {
+    if index != 0 && !network.has_device(index) {
         return Err(extack::message(ENODEV, "Unknown device ifindex"));
     }
     let addresses = network.addresses();
@@ -5008,7 +5335,7 @@ fn change_neighbour(
         };
         let flags = u32::from(payload[10]) | ext << 8;
         let index = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-        if index != 0 && index != 1 {
+        if index != 0 && !network.has_device(index) {
             return Err(ENODEV);
         }
         if add
@@ -5098,7 +5425,8 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
         bytes: link,
     }];
     notices.extend(told(events, 0, 0, false, false, now));
-    if up {
+    // `addrconf_notify` does nothing for `NETDEV_UP` with `disable_ipv6`.
+    if up && !network.ipv6_off() {
         notices.push(Notice {
             group: RTNLGRP_IPV6_IFINFO,
             origin: 0,
@@ -5106,6 +5434,23 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
         });
     }
     notices
+}
+/// Turns `network`'s loopback's IPv6 off or on at `now`, as a change of
+/// its `disable_ipv6` does ([`Network::set_ipv6`]), and tells netlink's
+/// members of what went or came; coming on while `lo` is up, last, IPv6's
+/// own `RTM_NEWLINK` for `RTNLGRP_IPV6_IFINFO`, as `addrconf_notify` sends
+/// it at the end of `NETDEV_UP` (`inet6_ifinfo_notify`).
+pub(crate) fn set_ipv6(network: &Network, on: bool, now: u64) {
+    let events = network.set_ipv6(on, now);
+    let mut notices = told(events, 0, 0, false, false, now);
+    if on && network.is_up() {
+        notices.push(Notice {
+            group: RTNLGRP_IPV6_IFINFO,
+            origin: 0,
+            bytes: inet6_link_message(network, 0, 0, 0),
+        });
+    }
+    notify(network, notices, None);
 }
 /// What has run out of `network`'s addresses and routes by `now`
 /// ([`Network::expire`]), told to netlink's members of its groups, as
@@ -5366,18 +5711,31 @@ pub(crate) fn dispatch(
         _ => Err(Errno::ENOSYS),
     }
 }
-/// For a `write` to a `NETLINK_ROUTE` socket, [`nsid::resolve`]: the
-/// peers its ID requests name as the writer sees them, and the writer's
-/// credentials for their `CAP_NET_ADMIN`, which the send takes, as
-/// Linux's `netlink_sendmsg` runs in the writer's `current`.
-pub(crate) fn resolving(
-    c: &Context<'_>,
+/// A `write` (or `writev`, `sendfile`, `splice`, an AIO write) to a
+/// netlink socket, which sends as `send` without an address does, as the
+/// writer: Linux's `netlink_sendmsg` runs in the writer's `current`, so
+/// the port an autobind takes is its process ID, a route lookup's
+/// `RTA_UID` its user ID, and `netlink_net_capable` wants its
+/// `CAP_NET_ADMIN` as well as the opener's; the namespaces an ID request
+/// names are as it sees them ([`nsid::resolve`]). `None` for another file.
+pub(crate) fn write(
+    c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
     bytes: &[u8],
-) -> Option<nsid::Resolved> {
-    of(file)
-        .filter(|socket| socket.protocol == NETLINK_ROUTE)
-        .map(|_| nsid::resolve(c, bytes, false))
+    nosignal: bool,
+    dontwait: bool,
+) -> Option<Result<u64, Errno>> {
+    let socket = of(file)?;
+    let sender = socket.sender(c);
+    let _resolved = (socket.protocol == NETLINK_ROUTE).then(|| nsid::resolve(c, bytes, false));
+    Some(crate::files::write_with(
+        c,
+        file,
+        bytes,
+        nosignal,
+        dontwait,
+        |b| socket.send(b, None, sender),
+    ))
 }
 /// What a receive returns: with `MSG_TRUNC`, the datagram's whole length.
 fn returned(n: usize, length: usize, flags: u64) -> u64 {
@@ -5501,7 +5859,8 @@ fn set_option(c: &mut Context<'_>, socket: &NetlinkSocket, a: [u64; 6]) -> Resul
             }
             let bit = 1u64 << (group - 1);
             if name == NETLINK_ADD_MEMBERSHIP {
-                if socket.privileged(bit) && !socket.sender(c).admin {
+                // `rtnetlink_bind` asks the caller alone (`ns_capable`).
+                if socket.privileged(bit) && !socket.sender(c).current_admin {
                     return Err(Errno::EPERM);
                 }
                 socket.lock().groups |= bit;
@@ -6373,7 +6732,31 @@ mod tests {
             Err(EOPNOTSUPP)
         );
         assert_eq!(get(AF_INET, 0, 0, &[(RTA_IIF, &[2, 0, 0, 0])]), Err(ENODEV));
-        assert_eq!(get(AF_INET, 0, 0, &[(RTA_IIF, &one)]), Err(EOPNOTSUPP));
+        // In on lo: martians are EINVAL, a local destination from another
+        // host is a local input route with RTA_IIF, and what would be
+        // forwarded EHOSTUNREACH.
+        let input = |to: [u8; 4], from: [u8; 4], flags: u32| {
+            get(
+                AF_INET,
+                0,
+                flags,
+                &[(RTA_DST, &to), (RTA_SRC, &from), (RTA_IIF, &one)],
+            )
+        };
+        let host = [192, 0, 2, 1];
+        assert_eq!(input([127, 0, 0, 1], host, 0), Err(Errno::EINVAL));
+        assert_eq!(input([0; 4], host, 0), Err(Errno::EINVAL));
+        assert_eq!(input([10, 9, 1, 1], [224, 0, 0, 5], 0), Err(Errno::EINVAL));
+        assert_eq!(input([10, 9, 1, 1], [0; 4], 0), Err(Errno::EINVAL));
+        assert_eq!(input([239, 1, 1, 1], host, 0), Err(Errno::EINVAL));
+        assert_eq!(input([8, 8, 8, 8], host, 0), Err(EHOSTUNREACH));
+        assert_eq!(input([127, 255, 255, 255], [0; 4], 0), Err(Errno::EINVAL));
+        let (header, found) = input([255; 4], host, 0).unwrap();
+        assert_eq!(header[7], 3);
+        assert_eq!(value(&found, RTA_IIF), Some(one.to_vec()));
+        assert_eq!(input([255; 4], host, RTM_F_FIB_MATCH), Err(EHOSTUNREACH));
+        let (header, _) = input([224, 0, 0, 1], host, RTM_F_LOOKUP_TABLE).unwrap();
+        assert_eq!((header[4], header[7]), (0, RTN_MULTICAST));
         // Down, a device is ENETUNREACH.
         network.set_up(false, 0);
         assert_eq!(through([127, 0, 0, 1], 0, 1), Err(ENETUNREACH));
@@ -6590,7 +6973,10 @@ mod tests {
             inet6.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [1, 5, 2, 3, 6, 7, 8]
         );
-        assert_eq!(found[4].1, inet6_settings(false, true));
+        assert_eq!(
+            found[4].1,
+            inet6_settings(crate::netdev::Conf6::default(), false, true)
+        );
         network.set_up(true, 0);
         let link = inet6_link_message(&network, 4, 7, NLM_F_MULTI);
         let found = attributes(&link[32..]);

@@ -274,14 +274,19 @@ fn from_pipe(
         let written = if kind == REGULAR {
             size_room(c, start + done).and_then(|room| {
                 let room = usize::try_from(room).unwrap_or(usize::MAX);
-                let written = write_at(output, start + done, &piece[..count.min(room)])?;
+                let written = write_at(
+                    output,
+                    start + done,
+                    &piece[..count.min(room)],
+                    Some(&c.process.credentials),
+                )?;
                 if written > 0 {
                     crate::permissions::remove_set_ids(&c.process.credentials, &**output);
                 }
                 Ok(written as u64)
             })
         } else if at_offset {
-            write_at(output, start + done, piece).map(|n| n as u64)
+            write_at(output, start + done, piece, Some(&c.process.credentials)).map(|n| n as u64)
         } else {
             write_io(c, output, piece, false)
         };

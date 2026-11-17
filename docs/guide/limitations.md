@@ -60,8 +60,7 @@ verified.
   those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
-  `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
+  `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
   emulator's page entries, as `smaps`'s counts do: a page that a `fork`
   shared is not exclusive (bit 56) until this process writes it, even
@@ -78,14 +77,15 @@ verified.
   tables, whatever CPU the host has: user space ends below 2^47 bytes, and
   `TASK_SIZE_MAX` is 2^47 - 4096 for every check that asks for it, as the
   `fs` and `gs` bases `ptrace`'s `PTRACE_POKEUSER`, `PTRACE_SETREGS` and
-  `PTRACE_ARCH_PRCTL` take (`EIO`, `EPERM`). Linux on a CPU with 5-level paging (LA57) maps
+  `PTRACE_ARCH_PRCTL` take (`EIO`, `EPERM`) and the range of a hardware
+  breakpoint in a debug register (`EINVAL`). Linux on a CPU with 5-level paging (LA57) maps
   above 2^47 only for a process that asks with an `mmap` hint there, but
   its `TASK_SIZE_MAX` is 2^56 - 4096, so these checks take a value between
   the two that paludarium refuses ([decisions](../design/decisions)).
 - **The rest of `/proc`, in part**: only the process directories and a few
   system files are made (see [features](./features)). The other system files
-  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs` and
-  `kernel` it has, ...) and the other names in
+  (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
+  `kernel` and `net` it has, ...) and the other names in
   the reader's own directory (`io`, `personality`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
   process's directory they are `ENOENT`, where Linux shows root `io`, `wchan`
@@ -224,8 +224,9 @@ verified.
   it last accounted, at its latest system call, and an event of a CPU
   counts the time that passes. There is no ring buffer: `mmap` of an event
   is `ENODEV`, a sampling event takes no samples and sends no signal, and
-  `poll` never finds one readable. `inherit` is taken but children are not
-  counted, an event of a task on one CPU counts on any, and the cgroup mode
+  `poll` never finds one readable. `inherit_stat` is taken, but an
+  inherited event's end sends no read record, as nothing is recorded. An
+  event of a task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
   ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
   and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
@@ -235,33 +236,47 @@ verified.
   takes it as a leader, so these are checked by the unit tests alone. The
   events that wait for an `execve`, and those each thread opened, are kept
   per emulated machine, matched by thread group and thread, and dropped as
-  they close. An event whose task has ended is not in Linux's `EXIT`
-  state here, so it may still lead a new group, where master gives
-  `ENODEV`. A group's members count whatever software
-  clock they are, where Linux gave a `cpu-clock` member of a `task-clock`
-  group no count on the x86-64 machines the tests run on (why was not found).
+  they close. An event whose task has ended also leads no new group
+  (`ENODEV`), as in master, where the test machines' 7.0 takes it. A
+  group's members count whenever their leader does, whatever software
+  event they are. In Linux, a member of another software PMU than its
+  leader's (a `cpu-clock` member of a `task-clock` group, the other way
+  round, or either with `dummy`) keeps its own PMU's context
+  (`find_get_pmu_context`), which is scheduled in and out apart from its
+  leader's, so it runs for a part of its leader's time that changes from
+  run to run, from none to nearly all, on the x86-64 test machines; the
+  tests group only events of one PMU.
   The SIMD register fields of Linux master's 176-byte structure are checked
   as master checks them and not compared with Linux: the test machines'
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays and hashes and nothing else.
-  Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
-  links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
-  programs, BTF and links (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`
-  and the rest), tokens, iterators and statistics are `ENOSYS`, as each
-  command Linux has that is not here; a number Linux has no command for is
-  `EINVAL`, as there. So libbpf finds no
-  program loads (its trivial-program probe fails with `ENOSYS`) and
-  `bpftool feature` says the `bpf()` system call is not there, as it asks
-  `BPF_PROG_LOAD` and looks for `ENOSYS`. The other map types are `EINVAL`,
+- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes, queues,
+  stacks and bloom filters and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
+  `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
+  every program with `EINVAL`, as a kernel built without the program's
+  type does; a program Linux would load, or reject in its verifier with
+  another error (most often `EACCES`), gets that `EINVAL`, and no log is
+  written. The other program commands (`BPF_PROG_TEST_RUN` and the rest),
+  BTF (`BPF_BTF_LOAD`), links, attachment, pins (`BPF_OBJ_PIN`,
+  `BPF_OBJ_GET`), the IDs of programs, BTF and links
+  (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID` and the rest), tokens,
+  iterators and statistics are `ENOSYS`, as each command Linux has that is
+  not here; a number Linux has no command for is `EINVAL`, as there. So
+  libbpf's trivial-program probe fails with `EINVAL` and it finds no
+  program type it can load, and `bpftool feature` finds the `bpf()` system
+  call but no program types. The other map types are `EINVAL`,
   as on a kernel built without them; the per-CPU ones
   (`BPF_MAP_TYPE_PERCPU_ARRAY`, `PERCPU_HASH`, `LRU_PERCPU_HASH`) could not
   be compared with Linux anyway, as their values are one per possible CPU,
   which a test machine and the emulator count differently. A hash gives
   its keys in the order of their bytes, where Linux's order follows its
   buckets and a random seed, and a batch of it takes each element as a
-  bucket of its own, so `in_batch` and `out_batch` count elements. A map's
+  bucket of its own, so `in_batch` and `out_batch` count elements. An LRU
+  hash keeps the lists of one CPU, which every command uses: on Linux each
+  CPU has its own local lists, so where updates of one map come from
+  several CPUs, the key that goes when it is full may be another (the
+  differential test pins itself to one CPU). A map's
   memory follows the structure sizes of the test machines' kernel,
   Ubuntu's Linux 7.0, not upstream Linux's: its `struct bpf_map` carries
   the `u32 excl` that Ubuntu took from Linux 7.2 (0fb6c9ed6493, removed in
@@ -470,19 +485,22 @@ verified.
     little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
-  - The files of `/proc/sys` check their writer again at a write through
-    `write`, `writev`, aio or `sendfile`, but a positioned write (`pwrite64`,
-    `pwritev` at an offset) only as they were opened, where Linux checks
-    every write; and each reports its value's length as its size, where
-    Linux reports 0.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
     as the emulator's `arch_prctl`, and gives `EINVAL` for the rest.
     `NT_X86_XSTATE` gives `ENODEV`, as on a CPU
-    without XSAVE, which the emulated CPU does not offer. There are no
-    hardware breakpoints: the debug registers read as unused (DR6 as
-    `0xffff0ff0`), and a write to them other than clearing DR7 gives `EIO`.
+    without XSAVE, which the emulated CPU does not offer. A data
+    breakpoint on a `rep` string instruction stops after the iteration that
+    touched its range, as the architecture defines it; a CPU's fast-string
+    operation may report it some iterations later.
+    A read breakpoint on the 48 bytes at the end of an `FXRSTOR` area,
+    which the architecture leaves to software, is not hit, as `FXRSTOR`
+    reads only the 416 bytes it restores; an AMD CPU reads them too, and
+    stops there.
+    A write breakpoint on a byte that `MASKMOVDQU`'s mask leaves out is not
+    hit either, as no byte there is written; an Intel CPU stops there, and
+    an AMD CPU does not.
     A `cs` or `ss` selector a tracer writes other than the 64-bit user ones
     is kept and shown, but the tracee runs on in 64-bit mode, where Linux
     would run it in that segment or fault.
@@ -534,8 +552,18 @@ verified.
   learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
   (new in Linux master), `move_mount`'s `MOVE_MOUNT_BENEATH`, `fsmount`'s
   `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
-  a tmpfs, and `fspick` of `/proc` or `/dev`; `mount_setattr`, `statmount`
-  and `listmount` are not there (`ENOSYS`). A file system context makes
+  a tmpfs, `fspick` of `/proc` or `/dev`, and an idmapped mount
+  (`mount_setattr`'s and `open_tree_attr`'s `MOUNT_ATTR_IDMAP`, after the
+  checks of its user namespace's descriptor). Unique mount IDs and mount
+  namespace IDs count among this machine's alone, where Linux's are shared
+  with the host's (the first namespace's ID is Linux's 8), and the
+  namespace files take no `NS_GET_MNTNS_ID` or `NS_GET_ID`. `statmount`'s
+  `propagate_from` is found from the namespace's root, as mountinfo's is;
+  its `STATMOUNT_BY_FD` of a detached tree's mount is `ENOENT`, as Linux's
+  is for one alone in its anonymous namespace, and finds a mount by where
+  its file now is, in the caller's namespace, where Linux takes the
+  file's own mount (one opened before a `setns` is looked for in the
+  namespace the caller is in now). A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its
   parameters and of a reconfiguration; one of a superblock from start-up
   takes only the common flags (`ro`, `sync`, ...). A context keeps its
@@ -553,11 +581,13 @@ verified.
   in a mount namespace of another user namespace). Peer group numbers
   count from 1 among this machine's mounts alone, where Linux's are
   shared with the host's. `propagate_from:` is found from the namespace's
-  root, not the reader's after `chroot`. Only `MS_RDONLY` is enforced
-  (`EROFS`): a tmpfs mount's `size`, `nr_blocks` and `nr_inodes`
-  are reported but not enforced (it fills up only as the in-memory
-  filesystem does, never `ENOSPC` at its size), nor are `noexec`,
-  `nosuid`, `nodev`, the atime flags, `sync`, `dirsync` and `mand`;
+  root, not the reader's after `chroot`. `MS_RDONLY` (`EROFS`), `noexec`,
+  `nodev` and `nosuid` are enforced, but a tmpfs mount's `size`,
+  `nr_blocks` and `nr_inodes` are reported and not enforced (it fills up
+  only as the in-memory filesystem does, never `ENOSPC` at its size), nor
+  are the atime flags, `sync`, `dirsync` and `mand`; no mount here holds a
+  device node but a host directory's (`mknod` of one is `EPERM`), so
+  `nodev` only refuses those;
   `huge`, `mpol`, `noswap` and the quota options are taken, checked as
   Linux checks them (a remount that turns on `noswap` or quotas, or
   changes a quota limit, is `EINVAL`) and shown, but do nothing, and
@@ -569,7 +599,10 @@ verified.
   is read-only: a `hostfs` one takes no option but the common ones
   (`EINVAL`), and the root's tmpfs options are checked but keep nothing.
   A descriptor's mount, for `EROFS` of `fchmod`, `fchown`, `futimens`,
-  `fsetxattr` and the like, is found by the path it was opened at.
+  `fsetxattr` and the like, is found by the path it was opened at, and for
+  `noexec` of `mmap` by where its file now is, so a remount or a mount on
+  that path since the open counts, where Linux's keeps the file's own
+  mount.
   `MNT_EXPIRE`'s mark is cleared by a lookup that ends on the mount and by
   the close of a file on it, but not by a lookup that only passes through
   it, as Linux's every `mntput` does.
@@ -605,9 +638,7 @@ verified.
   is the mount of a descriptor's events for fanotify's mount marks
   (`FAN_MARK_MOUNT`); once that path no longer leads to the file's file
   system (renamed or replaced since), the event is the first mount's of
-  that file system. Such a mark stays after its mount is unmounted, where
-  Linux removes it, and then also hears of a new mount of the same file
-  system that takes the mount's free ID.
+  that file system.
 - **Landlock**: ABI version 8 is the newest there; the logging flags are
   taken, but nothing is logged. With `LANDLOCK_RESTRICT_SELF_TSYNC` the other
   threads take the new domain for their own checks when they next enter the
@@ -635,10 +666,10 @@ verified.
   ends, with that thread's. Of the files, those under `/proc` and `/dev` are
   not checked, and `fs.protected_hardlinks`,
   `fs.protected_symlinks`, `fs.protected_fifos` and `fs.protected_regular`
-  act as 0, the kernel's defaults, which many distributions raise. A mount's
-  `nosuid` is not enforced, and a set-user-ID or set-group-ID program takes
-  its owner or group, and a program with file capabilities takes them, even
-  when another process shares the caller's working directory (`CLONE_FS`),
+  act as 0, the kernel's defaults, which many distributions raise. A
+  set-user-ID or set-group-ID program takes its owner or group, and a
+  program with file capabilities takes them, even when another process
+  shares the caller's working directory (`CLONE_FS`),
   where Linux takes the real IDs as effective unless the caller has
   `CAP_SETUID` and gives no more capabilities than the caller had.
   `execveat`'s `AT_EXECVE_CHECK` (Linux 6.14), with which user space checks
@@ -684,18 +715,22 @@ verified.
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages and the write protection of
-  private anonymous memory are registered. The minor mode is refused
-  (`EINVAL`), as is the write-protect mode for shared memory, which Linux
-  takes, and `UFFDIO_CONTINUE` is not offered (`EINVAL`), nor the events
+  private anonymous memory, and the minor faults of shmem, are
+  registered. The write-protect mode for shmem (shared anonymous
+  memory and a shmem file's mappings, private ones too), which Linux
+  takes, is refused (`EINVAL`), and not offered are the events
   of `fork`, `mremap`, `madvise` and `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
   `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
-  `UFFDIO_API` does not report and refuses (`EINVAL`); the ioctls
-  `UFFDIO_REGISTER` and `fdinfo` report leave them out too. A
+  `UFFDIO_API` does not report and refuses (`EINVAL`). A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
-  Shared memory
-  of a file (a memfd, a tmpfs file, System V shared memory) cannot be
-  registered (`EINVAL`), where Linux takes any shmem. A system call's own
+  Of shmem's files only a memfd is registered: a tmpfs file
+  is refused (`EINVAL`), where Linux takes it, as the in-memory file
+  system says it is a tmpfs but stands for the files a guest has on disk,
+  and a host's tmpfs file is not kept here. A zero page `UFFDIO_ZEROPAGE` gives a
+  private mapping of a shmem file is a page of zeros of its own, which
+  `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
+  zero page. A system call's own
   copy to or from a missing page of a registered range, or to a
   write-protected one, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
   Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
@@ -703,14 +738,10 @@ verified.
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
-- **fanotify, in part**: of the permission events, only `FAN_OPEN_PERM` of
-  an open by `open`, `openat`, `openat2`, `creat` or `open_by_handle_at`
-  (a link in `/proc/self/fd` too), and `FAN_ACCESS_PERM` of a read by
-  `read`, `pread64`, `readv`, `preadv`, `preadv2`, `sendfile`, `splice` or
-  `copy_file_range`, are sent; `FAN_OPEN_EXEC_PERM`, exec's `FAN_OPEN_PERM`
-  and the `FAN_ACCESS_PERM` of exec's and AIO's and `io_uring`'s reads are
-  taken by `fanotify_mark` but never sent, so what they would ask is let
-  through, and exec's open is told as `FAN_OPEN` without `FAN_OPEN_EXEC`.
+- **fanotify, in part**: exec asks `FAN_ACCESS_PERM` once for its read
+  of each file it runs, where Linux asks it at each `kernel_read` (two or
+  three for an ELF program), and `io_uring` has no read operation here to
+  ask for.
   `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
   and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
   never come. An evictable mark is never evicted. A group merges an event
@@ -755,9 +786,19 @@ verified.
   neighbours (an `AF_MCTP` `RTM_NEWNEIGH` or `RTM_DELNEIGH`), a bridge's
   forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`, `RTM_NEWNEIGH` or
   `RTM_DELNEIGH`), rules, queueing disciplines and the rest are
-  `EOPNOTSUPP`, as are an input route
-  lookup (`RTA_IIF`, as `ip route get ... iif` sends), renaming `lo`
-  and setting any other attribute of it. A
+  `EOPNOTSUPP`, as are renaming `lo` and setting any other attribute of
+  it. An input route lookup (`RTA_IIF`) starts with forwarding and
+  reverse path filtering off, as Linux is built, where a new namespace of
+  Linux takes the first one's for IPv4, which a host may have changed
+  (Docker turns forwarding on, Ubuntu reverse path filtering to 2); it
+  takes `accept_local`, `send_redirects`, `shared_media` and
+  `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward` and
+  the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default` and
+  `lo`, where Linux has many more; their first namespace's values are as
+  Linux is built, not a host's, so a new namespace starts from those. A
+  change of them sends no `RTM_NEWNETCONF`, and IPv6's `forwarding` joins
+  no router multicast or anycast address.
+  A
   route goes through `lo` or rejects: IPv6 gateways, multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
@@ -774,8 +815,11 @@ verified.
   An address runs out as its lifetime ends, where Linux's checks are
   deferrable work, which comes up to a second later (`round_jiffies_up`)
   and, on an idle machine, may wait seconds more, unless an address of the
-  family is added or changed, which has them run at once. An IPv6
-  route that has run out goes from its table at once, where Linux's, which lookups pass over, stays in dumps until its
+  family is added or changed, which has them run at once. What a socket
+  that binds or sends finds run out is told of when a netlink socket of
+  the namespace next reads, polls or writes, where Linux tells of it as
+  its check runs. An IPv6 route that has run out goes from its table at
+  once, where Linux's, which lookups pass over, stays in dumps until its
   garbage collection (`gc_interval`, 30 seconds), and from 7.3 marks its
   notification of that with `RTA_DEL_REASON`. A change that gives a
   permanent IPv6 address a lifetime gives its prefix route the same, as
@@ -871,8 +915,7 @@ verified.
   takes is 321, as for Ubuntu's kernel (`MAX_TCP_HEADER` + 1), where
   another build's may differ. A socket
   whose receive buffer is full drops an answer with `ENOBUFS` without
-  waiting. A `write` to a netlink socket acts with the capability of the
-  thread that opened it alone. The other namespaces keep nothing apart
+  waiting. The other namespaces keep nothing apart
   that paludarium has, but for the System V shared memory, semaphores and
   message queues and the POSIX message queues of an IPC namespace and the
   mounts of a mount namespace: there is no `/proc/self/cgroup` for a cgroup

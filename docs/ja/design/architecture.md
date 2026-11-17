@@ -95,7 +95,8 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 - `setcc` と `cmovcc`
 - レジスタによる rdx:rax への `mul` と `imul`、2 つのレジスタまたはレジスタと即値の `imul`
 - xmm レジスタとメモリの間の `movaps`、`movups`、`movdqa`、`movdqu`、`movapd`、`movupd`、xmm レジスタどうしの `pxor` と `xorps`、xmm レジスタと汎用レジスタの間の `movd` と `movq`
-- xmm レジスタどうしの `pshufd`、`punpcklbw`、`punpckldq`、`punpcklqdq`、`paddd`、`psubd`、`paddq`、`psubq`、`pmuludq`、`pand`、`por`、`pandn`、即値による `pslld` と `psrld`、`pmovmskb`
+- xmm レジスタどうしの `pshufd`、`punpckl` と `punpckh` の各アンパック、`packuswb`、`packsswb`、`packssdw`、`paddd`、`psubd`、`paddq`、`psubq`、`pmuludq`、`pand`、`por`、`pandn`、即値による `pslld` と `psrld`、`pmovmskb`
+- メモリとレジスタの間の（`lock` ありまたはなしの）`cmpxchg` と `xchg`。どちらも、インタプリタと同じ 1 回のアトミックなメモリアクセスです
 
 これらの形のレジスタは、上位バイトのレジスタ `ah`、`ch`、`dh`、`bh` でもかまいません。
 
@@ -112,7 +113,7 @@ fault の後、ブロックの終わり、コードの世代が進んだとき�
 
 `--jit` を付けると、デコードキャッシュのブロックのうち、よく実行されるものをホストの
 コードにコンパイルします（`paludarium-jit-native`、x86-64 の Linux のホストだけ）。
-ブロックは、入った回数を数えます。それがしきい値（既定は 100）に達すると、先頭の命令の形を、
+ブロックは、入った回数を数えます。それがしきい値（既定は 300）に達すると、先頭の命令の形を、
 形のない最初の命令の手前まで、コンパイラに渡します。JIT 専用のスレッドがそれを Cranelift の
 IR にしてコンパイルし、書き込みと実行が同時にはできないメモリに置きます。コードができるまでと、
 コンパイルに失敗したときは、インタプリタが今までどおりそのブロックを実行します。

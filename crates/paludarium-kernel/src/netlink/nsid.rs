@@ -11,11 +11,13 @@
 //! may name a peer by its ID (`IFLA_TARGET_NETNSID`,
 //! `IFA_TARGET_NETNSID`), as [`target`] finds it.
 //!
-//! Only a request gives an ID. Linux's `peernet2id_alloc` also gives one
-//! on its own, for what lies in another namespace than the one telling
-//! of it: a device whose link is there or that moves there, a queue lease,
-//! a devlink instance, a PSP device, an ovpn peer or an openvswitch vport.
-//! None of those is here, and `lo` may not move.
+//! A request gives an ID. [`link_netnsid`] is Linux's
+//! `peernet2id_alloc`, which gives one on its own for what lies in another
+//! namespace than the one telling of it, for a device whose link is there
+//! (a veth pair's other end); no device here calls it yet, so no ID is
+//! given that way. Its other callers (a device that moves, a queue lease,
+//! a devlink instance, a PSP device, an ovpn peer, an openvswitch vport)
+//! have no counterpart here.
 use super::{
     Errno, Header, NLM_F_MULTI, Nla, Notice, Policy, attribute, extack, message, parse_policy,
 };
@@ -153,9 +155,11 @@ impl Drop for Resolved {
 /// `RTM_NEWNSID` and `RTM_GETNSID` request of `bytes` names by
 /// `NETNSA_PID` (`get_net_ns_by_pid`) or `NETNSA_FD` (`get_net_ns_by_fd`),
 /// and each `RTM_NEWLINK` and `RTM_SETLINK` by `IFLA_NET_NS_PID` or
-/// `IFLA_NET_NS_FD`, for the kernel to take as it reaches them; finding
-/// one changes nothing.
-/// A `write` finds them as its caller sees them too ([`super::resolving`]),
+/// `IFLA_NET_NS_FD`, an `RTM_NEWLINK` also inside `IFLA_LINKINFO`'s
+/// `IFLA_INFO_DATA`'s `VETH_INFO_PEER` (whatever the kind; the caller of
+/// [`peer_target`] checks it), for the kernel to take as it reaches them;
+/// finding one changes nothing.
+/// A `write` finds them as its caller sees them too ([`super::write`]),
 /// as Linux looks in `current`'s. `addressed` is whether the send names
 /// an address, as a `write` does not.
 pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8], addressed: bool) -> Resolved {
@@ -186,26 +190,9 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8], addressed: bool) -> Res
         };
         if let Some((skip, by_pid, by_fd)) = named {
             any = true;
-            let mut attributes = bytes[16..len].get(skip..).unwrap_or_default();
-            while attributes.len() >= 4 {
-                let size = usize::from(u16::from_le_bytes([attributes[0], attributes[1]]));
-                if size < 4 || size > attributes.len() {
-                    break;
-                }
-                let kind = u16::from_le_bytes([attributes[2], attributes[3]]) & 0x3fff;
-                if size >= 8 && (kind == by_pid || kind == by_fd) {
-                    let value = u32::from_le_bytes(attributes[4..8].try_into().unwrap_or_default());
-                    let reference = if kind == by_pid {
-                        Reference::Pid(value)
-                    } else {
-                        Reference::Fd(value)
-                    };
-                    if !found.iter().any(|&(r, _)| r == reference) {
-                        found.push((reference, find(c, reference)));
-                    }
-                }
-                attributes = &attributes[super::align(size).min(attributes.len())..];
-            }
+            let attributes = bytes[16..len].get(skip..).unwrap_or_default();
+            let link = header.kind == super::RTM_NEWLINK;
+            references(c, attributes, (by_pid, by_fd), link, &mut found);
         }
         bytes = &bytes[super::align(len).min(bytes.len())..];
     }
@@ -213,6 +200,62 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8], addressed: bool) -> Res
     let credentials = any.then(|| c.process.credentials.clone());
     RESOLVED.with(|r| *r.borrow_mut() = (found, credentials, addressed));
     Resolved
+}
+/// The attributes of `bytes`, each of its type and value, until one breaks.
+fn each(mut bytes: &[u8], mut found: impl FnMut(u16, &[u8])) {
+    while bytes.len() >= 4 {
+        let size = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+        if size < 4 || size > bytes.len() {
+            break;
+        }
+        found(
+            u16::from_le_bytes([bytes[2], bytes[3]]) & 0x3fff,
+            &bytes[4..size],
+        );
+        bytes = &bytes[super::align(size).min(bytes.len())..];
+    }
+}
+/// For [`resolve`], the processes and descriptors `attributes` name by the
+/// types `by` (a process's, a descriptor's), found into `found`; with
+/// `link`, those a veth pair's peer names too (`IFLA_LINKINFO`'s
+/// `IFLA_INFO_DATA`'s `VETH_INFO_PEER`, an `ifinfomsg` and its
+/// attributes), as `rtnl_get_peer_net` reads them.
+fn references(
+    c: &Context<'_>,
+    attributes: &[u8],
+    by: (u16, u16),
+    link: bool,
+    found: &mut Vec<(Reference, Found)>,
+) {
+    const IFLA_LINKINFO: u16 = 18;
+    const IFLA_INFO_DATA: u16 = 2;
+    const VETH_INFO_PEER: u16 = 1;
+    each(attributes, |kind, value| {
+        if (kind == by.0 || kind == by.1) && value.len() >= 4 {
+            let number = u32::from_le_bytes(value[..4].try_into().unwrap_or_default());
+            let reference = if kind == by.0 {
+                Reference::Pid(number)
+            } else {
+                Reference::Fd(number)
+            };
+            if !found.iter().any(|&(r, _)| r == reference) {
+                found.push((reference, find(c, reference)));
+            }
+        }
+        if link && kind == IFLA_LINKINFO {
+            each(value, |kind, data| {
+                if kind != IFLA_INFO_DATA {
+                    return;
+                }
+                each(data, |kind, peer| {
+                    if kind == VETH_INFO_PEER {
+                        let peer = peer.get(16..).unwrap_or_default();
+                        references(c, peer, by, false, found);
+                    }
+                });
+            });
+        }
+    });
 }
 /// The namespace `reference` names, for [`resolve`].
 fn find(c: &Context<'_>, reference: Reference) -> Result<Arc<Network>, Errno> {
@@ -309,6 +352,20 @@ pub(super) fn link_target(
         return Err(Errno::EPERM);
     }
     Ok(Some(named))
+}
+/// `rtnl_get_peer_net`: the namespace a veth pair's peer (its
+/// `VETH_INFO_PEER`) names by `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD`, as
+/// [`resolve`] found it (`ESRCH`, `EBADF`, `EINVAL`), with
+/// `CAP_NET_ADMIN` over it as [`link_target`] asks (`EPERM`); `None` for a
+/// peer that names none, which is the pair's own.
+#[expect(dead_code, reason = "a veth pair's creation calls it")]
+pub(super) fn peer_target(
+    network: &Network,
+    opener: &Credentials,
+    pid: Option<u32>,
+    fd: Option<u32>,
+) -> Result<Option<Arc<Network>>, Errno> {
+    link_target(network, opener, pid, fd, None)
 }
 /// `rtnl_get_net_ns_capable`: the peer of `id`, `EINVAL` for none and
 /// `EACCES` without `CAP_NET_ADMIN` over it.
@@ -412,21 +469,7 @@ pub(super) fn new_id(
         live.insert(id, Arc::downgrade(&peer));
         id
     };
-    if !Arc::ptr_eq(&peer, network) {
-        let mut heard_by = peer
-            .netlink
-            .ids
-            .heard_by
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        heard_by.retain(|n| n.strong_count() > 0);
-        if !heard_by
-            .iter()
-            .any(|n| std::ptr::eq(n.as_ptr(), Arc::as_ptr(network)))
-        {
-            heard_by.push(Arc::downgrade(network));
-        }
-    }
+    heard(network, &peer);
     // `rtnl_net_notifyid`, which `rtnl_notify` sends to the requester
     // alone of the members with `NLM_F_ECHO`.
     Ok(Notice {
@@ -434,6 +477,64 @@ pub(super) fn new_id(
         origin: if echo { port } else { 0 },
         bytes: fill(RTM_NEWNSID, 0, header.seq, port, id, None),
     })
+}
+
+/// Notes that `network` has an ID for `peer`, so that `peer`'s
+/// notifications reach `network`'s sockets with `NETLINK_LISTEN_ALL_NSID`
+/// and `network` hears of it going (`RTM_DELNSID`).
+fn heard(network: &Arc<Network>, peer: &Arc<Network>) {
+    if Arc::ptr_eq(peer, network) {
+        return;
+    }
+    let mut heard_by = peer
+        .netlink
+        .ids
+        .heard_by
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    heard_by.retain(|n| n.strong_count() > 0);
+    if !heard_by
+        .iter()
+        .any(|n| std::ptr::eq(n.as_ptr(), Arc::as_ptr(network)))
+    {
+        heard_by.push(Arc::downgrade(network));
+    }
+}
+
+/// `peernet2id_alloc`: `this` namespace's ID for `peer`, given now, the
+/// lowest free (`alloc_netid`), if it has none, as a device whose link is
+/// in `peer` asks for its `IFLA_LINK_NETNSID` (`rtnl_fill_link_netnsid`). A
+/// new ID is told to `this` namespace's `RTNLGRP_NSID` (`rtnl_net_notifyid`)
+/// through `notices`, before what the caller tells next. `None`
+/// (`NETNSA_NSID_NOT_ASSIGNED`) when no ID is free.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a veth pair's link message calls it")
+)]
+pub(super) fn link_netnsid(
+    this: &Arc<Network>,
+    peer: &Arc<Network>,
+    notices: &mut Vec<Notice>,
+) -> Option<i32> {
+    let id = {
+        let mut live = this.netlink.ids.live();
+        if let Some((&id, _)) = live
+            .iter()
+            .find(|(_, p)| std::ptr::eq(p.as_ptr(), Arc::as_ptr(peer)))
+        {
+            return Some(id);
+        }
+        let id = (0..i32::MAX).find(|id| !live.contains_key(id))?;
+        live.insert(id, Arc::downgrade(peer));
+        id
+    };
+    heard(this, peer);
+    notices.push(Notice {
+        group: RTNLGRP_NSID,
+        origin: 0,
+        bytes: fill(RTM_NEWNSID, 0, 0, 0, id, None),
+    });
+    Some(id)
 }
 
 /// `RTM_GETNSID`, as `rtnl_net_getid`: the ID of the peer `NETNSA_PID`,
@@ -529,4 +630,35 @@ pub(super) fn dump(
             fill(RTM_NEWNSID, NLM_F_MULTI, header.seq, port, id, current)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_link_gives_its_peer_the_lowest_free_id_once() {
+        let network = || Arc::new(Network::isolated(crate::users::first()));
+        let (this, peer, other) = (network(), network(), network());
+        let mut notices = Vec::new();
+        // An ID a request gave stays taken.
+        this.netlink.ids.live().insert(0, Arc::downgrade(&other));
+        assert_eq!(link_netnsid(&this, &peer, &mut notices), Some(1));
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].group, RTNLGRP_NSID);
+        assert_eq!(notices[0].origin, 0);
+        assert_eq!(notices[0].bytes, fill(RTM_NEWNSID, 0, 0, 0, 1, None));
+        // Asked again, the same, untold.
+        assert_eq!(link_netnsid(&this, &peer, &mut notices), Some(1));
+        assert_eq!(notices.len(), 1);
+        assert_eq!(this.netlink.ids.id_of(&peer), Some(1));
+        // `peer` now tells `this` of itself, and of its going.
+        assert!(
+            peer.netlink
+                .ids
+                .heard_by()
+                .iter()
+                .any(|n| Arc::ptr_eq(n, &this))
+        );
+    }
 }

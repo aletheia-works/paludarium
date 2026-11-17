@@ -24,7 +24,7 @@ use paludarium_cpu::compile::Compiler;
 
 /// How many times a block is entered before it is compiled, unless the
 /// caller gives another number.
-pub const DEFAULT_THRESHOLD: u16 = 100;
+pub const DEFAULT_THRESHOLD: u16 = 300;
 
 /// The native compiler for this host, compiling a block once it has been
 /// entered `threshold` times on a thread of its own, while the interpreter
@@ -158,9 +158,11 @@ mod native {
 
     impl NativeCompiler {
         pub(crate) fn new(threshold: u16, background: bool) -> Option<Self> {
-            // Compiled in the background, `speed` costs little and makes
-            // the fastest code ("A native JIT" in docs/design/decisions.md).
-            Self::with_settings(threshold, background, &[("opt_level", "speed")])
+            // `none` compiles a block in a fraction of `speed`'s time; with
+            // the default threshold it keeps most of the speed-up and costs
+            // short programs far less ("A native JIT" in
+            // docs/design/decisions.md).
+            Self::with_settings(threshold, background, &[("opt_level", "none")])
         }
 
         /// With these Cranelift settings.

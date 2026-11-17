@@ -356,6 +356,10 @@ impl SyscallTable {
         handlers.insert(431, crate::mounts::sys_fsconfig);
         handlers.insert(432, crate::mounts::sys_fsmount);
         handlers.insert(433, crate::mounts::sys_fspick);
+        handlers.insert(442, crate::mounts::sys_mount_setattr);
+        handlers.insert(457, crate::mounts::sys_statmount);
+        handlers.insert(458, crate::mounts::sys_listmount);
+        handlers.insert(467, crate::mounts::sys_open_tree_attr);
         handlers.insert(167, crate::admin::sys_swapon);
         handlers.insert(168, crate::admin::sys_swapoff);
         handlers.insert(175, crate::admin::sys_init_module);
@@ -2282,7 +2286,6 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let Some(prot) = Prot::from_bits(prot) else {
         return err(Errno::EINVAL);
     };
-    let prot = read_implies_exec(c.process, prot);
     if offset & 4095 != 0 {
         return err(Errno::EINVAL);
     }
@@ -2293,6 +2296,19 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         }
     } else {
         None
+    };
+    // A file on a mount that runs nothing (`path_noexec`): READ_IMPLIES_EXEC
+    // adds no PROT_EXEC to its mapping, which may never run.
+    // Its mount is found by where the file now is, as its open description
+    // keeps that through renames, not by its mount itself.
+    let noexec = descriptor.as_ref().is_some_and(|d| {
+        let at = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
+        crate::files::mount_says(c.files, &at, crate::files::ST_NOEXEC)
+    });
+    let prot = if noexec {
+        prot
+    } else {
+        read_implies_exec(c.process, prot)
     };
     let file = descriptor.as_ref().map(|d| d.file.clone());
     if len == 0 || !matches!(flags & (MAP_SHARED | MAP_PRIVATE), MAP_SHARED | MAP_PRIVATE) {
@@ -2318,7 +2334,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
         };
     }
     if let Some(file) = &file
-        && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len)
+        && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len, noexec)
     {
         return err(e);
     }
@@ -2414,6 +2430,9 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     match result {
         Ok(a) => {
             let end = a.0.saturating_add(len.next_multiple_of(4096));
+            if noexec {
+                c.mem.set_no_exec(a, end - a.0);
+            }
             if flags & MAP_LOCKED != 0
                 && let Some(lock) = lock
             {
@@ -2489,6 +2508,7 @@ fn check_mappable(
     flags: u64,
     offset: u64,
     len: u64,
+    noexec: bool,
 ) -> Result<(), Errno> {
     let regular = file.stat()?.mode & 0o170000 == 0o100000;
     // A regular file's mapping must end within the largest file size.
@@ -2509,6 +2529,10 @@ fn check_mappable(
             .is_ok_and(|stat| crate::files::attributes::append_only(&stat))
     {
         return Err(Errno::EACCES);
+    }
+    // A file on a `noexec` mount maps for no execution (`EPERM`).
+    if noexec && prot.contains(Prot::EXEC) {
+        return Err(Errno::EPERM);
     }
     // Neither a file that is not regular nor one that /proc generates can
     // be read at an offset, which a mapping needs.
@@ -3743,11 +3767,11 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             if a[1] == crate::inet::SIOCGIFNAME {
                 let index =
                     i32::from_le_bytes([request[16], request[17], request[18], request[19]]);
-                if index != 1 {
+                let Some(name) = network.devices().by_index(index).map(|d| d.name.clone()) else {
                     return Err(Errno(19));
-                }
+                };
                 request[..16].fill(0);
-                request[..2].copy_from_slice(b"lo");
+                request[..name.len()].copy_from_slice(&name);
                 c.mem
                     .write(GuestAddr(a[2]), &request)
                     .map_err(|_| Errno::EFAULT)?;

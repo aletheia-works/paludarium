@@ -1,7 +1,8 @@
 # Debian's own dynamically linked programs (shells, interpreters, compilers and
 # tools) run natively and under paludarium in a Debian container, compared on
-# exit status and standard output (tests/guests/distro/compare.py). Called by
-# quality.yml every night. Actions are pinned by commit SHA and the default
+# exit status and standard output (tests/guests/distro/compare.py), with the
+# interpreter and with the native JIT (`--jit`). Called by quality.yml every
+# night. Actions are pinned by commit SHA and the default
 # token is read-only.
 name: Distribution programs
 
@@ -18,7 +19,15 @@ defaults:
 
 jobs:
   compare:
-    name: distribution programs (x86-64 Linux)
+    name: distribution programs (x86-64 Linux, ${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [interpreter, jit]
+    # Until the native JIT is on by default, its run is a signal for the
+    # criteria of docs/design/decisions.md and does not fail the night (nor
+    # block a release); its own result is what the criteria count.
+    continue-on-error: ${{ matrix.mode == 'jit' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
@@ -36,7 +45,21 @@ jobs:
           packages: musl-tools
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build the emulator
-        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p paludarium
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-musl -p paludarium
+          mkdir -p target/distro-bin
+          cp target/x86_64-unknown-linux-musl/release/paludarium target/distro-bin/paludarium-real
+          if [ "$MODE" = jit ]; then
+            cat > target/distro-bin/paludarium <<'SH'
+          #!/bin/sh
+          exec /usr/local/bin/paludarium-real --jit "$@"
+          SH
+          else
+            cp target/distro-bin/paludarium-real target/distro-bin/paludarium
+          fi
+          chmod +x target/distro-bin/*
       - name: Build the Debian image
         run: docker build --pull -t paludarium-distro tests/guests/distro
       - name: Compare the programs natively and under the emulator
@@ -44,7 +67,8 @@ jobs:
           mkdir -p target/distro
           docker run --rm \
             -v "$PWD/tests/guests/distro:/distro:ro" \
-            -v "$PWD/target/x86_64-unknown-linux-musl/release/paludarium:/usr/local/bin/paludarium:ro" \
+            -v "$PWD/target/distro-bin/paludarium-real:/usr/local/bin/paludarium-real:ro" \
+            -v "$PWD/target/distro-bin/paludarium:/usr/local/bin/paludarium:ro" \
             -v "$PWD/target/distro:/out" \
             paludarium-distro \
             bash -c 'dpkg-query -W > /out/packages.txt &&
@@ -53,6 +77,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: distribution-programs
+          name: distribution-programs-${{ matrix.mode }}
           path: target/distro/
           retention-days: 14

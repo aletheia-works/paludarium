@@ -638,7 +638,10 @@ fn a_userfaultfd_registration_faults_on_missing_pages_only() {
     assert_eq!(m.userfault_at(s), Some(7));
     assert_eq!(view.userfault_at(s.0 + 5), Some(7));
     // An access the protection refuses is the CPU's fault.
-    assert_eq!(m.userfault_for(s, true, false), Some((7, false)));
+    assert_eq!(
+        m.userfault_for(s, true, false),
+        Some((7, UserfaultReason::Missing))
+    );
     assert_eq!(m.userfault_for(s, false, true), None);
     // A guarded page is neither a fault nor a page to fill.
     m.guard(GuestAddr(s.0), s.0 + PAGE_SIZE, true).unwrap();
@@ -730,7 +733,10 @@ fn a_userfaultfd_write_protection_faults_on_writes_while_registered() {
     m.read(a, &mut byte).unwrap();
     let fault = m.write(a, b"c").unwrap_err();
     assert!(fault.mapped && fault.present && fault.write);
-    assert_eq!(m.userfault_for(a, true, false), Some((7, true)));
+    assert_eq!(
+        m.userfault_for(a, true, false),
+        Some((7, UserfaultReason::Protected))
+    );
     assert_eq!(m.userfault_for(a, false, false), None);
     // Read before the write: the thread's TLB entry is read-only too.
     view.userfault_write_protect(page.0, page.0 + PAGE_SIZE, true)
@@ -1055,4 +1061,205 @@ fn a_userfaultfd_move_moves_exclusive_pages_and_refuses_markers() {
     m.write(GuestAddr(dst + 3 * PAGE_SIZE + 1), b"v").unwrap();
     m.read(GuestAddr(dst + 3 * PAGE_SIZE), &mut bytes).unwrap();
     assert_eq!(&bytes, b"uv");
+}
+
+/// A shmem file of `size` bytes that holds the pages in `held`.
+struct Shmem {
+    size: u64,
+    held: Vec<u64>,
+    shmem: bool,
+}
+
+impl PageSource for Shmem {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let n = buf
+            .len()
+            .min(usize::try_from(self.size.saturating_sub(offset)).unwrap_or(0));
+        buf[..n].fill(b'f');
+        Ok(n)
+    }
+    fn size(&self) -> Option<u64> {
+        Some(self.size)
+    }
+    fn shmem(&self) -> bool {
+        self.shmem
+    }
+    fn holds(&self, offset: u64) -> bool {
+        self.held.contains(&(offset / PAGE_SIZE))
+    }
+}
+
+#[test]
+fn a_userfaultfd_registers_shmem_files_and_waits_for_their_holes() {
+    let file = |shmem| -> Arc<dyn PageSource> {
+        Arc::new(Shmem {
+            size: 2 * PAGE_SIZE,
+            held: vec![1],
+            shmem,
+        })
+    };
+    let m = AddressSpace::new();
+    let view = m.view();
+    let map = |source: &Arc<dyn PageSource>| {
+        let pages = SharedPages::new().with_source(Arc::clone(source));
+        let at = m
+            .map_shared(None, 3 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        m.share_pages(at, 3 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+            .unwrap();
+        (at.0, pages)
+    };
+    // A file that is not shmem's is not registered, nor shmem for write
+    // protection.
+    let (other, _) = map(&file(false));
+    assert_eq!(
+        view.userfault_register(other, other + PAGE_SIZE, 7, Userfault::MISSING),
+        Err(Errno::EINVAL)
+    );
+    let (at, pages) = map(&file(true));
+    assert_eq!(
+        view.userfault_register(at, at + PAGE_SIZE, 7, Userfault::WP),
+        Err(Errno::EINVAL)
+    );
+    view.userfault_register(at, at + 3 * PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    // A hole waits; a page the file holds does not, nor one past its end,
+    // which is a bus error.
+    assert_eq!(m.userfault_at(GuestAddr(at)), Some(7));
+    assert_eq!(m.userfault_at(GuestAddr(at + PAGE_SIZE)), None);
+    assert_eq!(m.userfault_at(GuestAddr(at + 2 * PAGE_SIZE)), None);
+    assert!(
+        m.read(GuestAddr(at + 2 * PAGE_SIZE), &mut [0])
+            .unwrap_err()
+            .bus
+    );
+    let bytes = [b'c'; PAGE_SIZE as usize];
+    let end = at + 3 * PAGE_SIZE;
+    assert_eq!(
+        view.userfault_fill(at, end, at + 2 * PAGE_SIZE, Some(&bytes), false),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(
+        view.userfault_poison(at, end, at + 2 * PAGE_SIZE),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(
+        view.userfault_fill(at, end, at + PAGE_SIZE, Some(&bytes), false),
+        Err(Errno::EEXIST)
+    );
+    // A fill of the hole is the file's, for write-back.
+    assert_eq!(
+        view.userfault_fill(at, end, at, Some(&bytes), false),
+        Ok(())
+    );
+    let mut written = Vec::new();
+    pages
+        .write_back(|key, page| {
+            written.push((key, page[0]));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(written, [(0, b'c')]);
+    // A private mapping's fill is its own: the cache keeps its hole.
+    let private_pages = SharedPages::new().with_source(file(true));
+    let private = m
+        .map_shared(None, 2 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.back_with_cache(private, 2 * PAGE_SIZE, &private_pages, 0)
+        .unwrap();
+    let private = private.0;
+    view.userfault_register(private, private + 2 * PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    assert_eq!(m.userfault_at(GuestAddr(private)), Some(7));
+    let end = private + 2 * PAGE_SIZE;
+    assert_eq!(
+        view.userfault_fill(private, end, private, None, false),
+        Ok(())
+    );
+    assert!(!private_pages.contains(0));
+    let mut b = [1];
+    m.read(GuestAddr(private + 3), &mut b).unwrap();
+    assert_eq!(b, [0]);
+    m.read(GuestAddr(private + PAGE_SIZE), &mut b).unwrap();
+    assert_eq!(b, *b"f");
+}
+
+#[test]
+fn a_userfaultfd_minor_fault_waits_for_uffdio_continue() {
+    let source: Arc<dyn PageSource> = Arc::new(Shmem {
+        size: 3 * PAGE_SIZE,
+        held: vec![1],
+        shmem: true,
+    });
+    let m = AddressSpace::new();
+    let view = m.view();
+    let pages = SharedPages::new().with_source(Arc::clone(&source));
+    let at = m
+        .map_shared(None, 4 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 4 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    let at = at.0;
+    let anon = m
+        .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+        .unwrap()
+        .0;
+    // Only shmem takes the minor mode, and not with write protection.
+    assert_eq!(
+        view.userfault_register(anon, anon + PAGE_SIZE, 7, Userfault::MINOR),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        view.userfault_register(at, at + PAGE_SIZE, 7, Userfault::MINOR | Userfault::WP),
+        Err(Errno::EINVAL)
+    );
+    view.userfault_register(at, at + 4 * PAGE_SIZE, 7, Userfault::MINOR)
+        .unwrap();
+    view.userfault_register(anon, anon + PAGE_SIZE, 7, Userfault::MISSING)
+        .unwrap();
+    // A page the file holds waits; a hole is brought in, as the mode is not
+    // for missing pages.
+    let page = |n: u64| at + n * PAGE_SIZE;
+    assert_eq!(
+        m.userfault_for(GuestAddr(page(1)), false, false),
+        Some((7, UserfaultReason::Minor))
+    );
+    assert!(!m.read(GuestAddr(page(1)), &mut [0]).unwrap_err().present);
+    assert_eq!(m.userfault_for(GuestAddr(page(2)), false, false), None);
+    let end = at + 4 * PAGE_SIZE;
+    // `UFFDIO_CONTINUE`: shmem only, the page within the file, in the page
+    // cache, and not mapped yet.
+    assert_eq!(
+        view.userfault_continue(anon, anon + PAGE_SIZE, anon),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        view.userfault_continue(at, end, page(3)),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        view.userfault_continue(at, end, page(2)),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(view.userfault_continue(at, end, page(1)), Ok(()));
+    assert_eq!(
+        view.userfault_continue(at, end, page(1)),
+        Err(Errno::EEXIST)
+    );
+    let mut byte = [0];
+    m.read(GuestAddr(page(1) + 3), &mut byte).unwrap();
+    assert_eq!(byte, *b"f");
+    // Once a mapping brought a hole in, the page cache has it.
+    m.read(GuestAddr(page(0)), &mut byte).unwrap();
+    assert_eq!(
+        view.userfault_continue(at, end, page(0)),
+        Err(Errno::EEXIST)
+    );
+    // With the missing mode too, a hole is a missing page.
+    view.userfault_register(at, end, 7, Userfault::MISSING | Userfault::MINOR)
+        .unwrap();
+    assert_eq!(
+        m.userfault_for(GuestAddr(page(2)), true, false),
+        Some((7, UserfaultReason::Missing))
+    );
 }

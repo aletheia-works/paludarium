@@ -133,7 +133,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -152,8 +152,9 @@ mod linux {
             // proc-other-pagemap and proc-owner-rename cases, which read a
             // process's maps, descriptors, auxv and pagemap as other users
             // or make it another user's, and the pagemap
-            // and proc-owners cases, which become an unprivileged user, as
-            // the emulator's guest starts as root.
+            // and proc-owners cases, which become an unprivileged user, and
+            // the mount-flags case, which runs a program of another user's
+            // on its own mounts, as the emulator's guest starts as root.
             let as_root = matches!(
                 mode,
                 "credentials"
@@ -186,6 +187,7 @@ mod linux {
                     | "ipc-sysctl"
                     | "sysvipc-proc"
                     | "kernel-sysctl"
+                    | "net-sysctl"
                     | "mqueue-calls"
                     | "mqueue-limits"
                     | "mqueue-wait"
@@ -208,6 +210,9 @@ mod linux {
                     | "fanotify-mounts"
                     | "fanotify-perm"
                     | "fanotify-access-perm"
+                    | "fanotify-open-exec"
+                    | "fanotify-aio-perm"
+                    | "fanotify-exec-perm"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -216,15 +221,22 @@ mod linux {
                     | "userfaultfd-wp"
                     | "userfaultfd-poison"
                     | "userfaultfd-move"
+                    | "userfaultfd-shmem"
+                    | "userfaultfd-minor"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
                     | "perf-prctl"
+                    | "perf-inherit"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
                     | "bpf-ids"
                     | "bpf-memory"
+                    | "bpf-lru"
+                    | "bpf-queue"
+                    | "bpf-bloom"
+                    | "bpf-prog-load"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -238,6 +250,7 @@ mod linux {
                     | "route-dump"
                     | "route-metrics"
                     | "route-selectors"
+                    | "route-input"
                     | "address-lifetimes"
                     | "neighbours"
                     | "neighbour-requests"
@@ -255,6 +268,7 @@ mod linux {
                     | "ext-ack-route-dump"
                     | "ext-ack-route-metrics"
                     | "ext-ack-route-selectors"
+                    | "ext-ack-route-input"
                     | "ext-ack-address-lifetimes"
                     | "ext-ack-neighbour-requests"
                     | "ext-ack-neighbour-changes"
@@ -270,12 +284,14 @@ mod linux {
                     | "netlink-nsid-write"
                     | "netlink-target-netnsid"
                     | "netlink-link-netns"
+                    | "netlink-write-credentials"
                     | "user-namespaces"
                     | "scheduling-set"
                     | "personality-layout"
                     | "pagemap"
                     | "proc-owners"
                     | "admin"
+                    | "mount-flags"
             );
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
@@ -368,6 +384,7 @@ mod linux {
                     | "perf-counts"
                     | "perf-exec"
                     | "perf-prctl"
+                    | "perf-inherit"
             ) {
                 host.measure_cpu_time();
             }
@@ -418,6 +435,7 @@ mod linux {
         processes_route_dump => ("route-dump","process"),
         processes_route_metrics => ("route-metrics","process"),
         processes_route_selectors => ("route-selectors","process"),
+        processes_route_input => ("route-input","process"),
         processes_address_lifetimes => ("address-lifetimes","process"),
         processes_neighbours => ("neighbours","process"),
         processes_neighbour_requests => ("neighbour-requests","process"),
@@ -435,6 +453,7 @@ mod linux {
         processes_ext_ack_route_dump => ("ext-ack-route-dump","process"),
         processes_ext_ack_route_metrics => ("ext-ack-route-metrics","process"),
         processes_ext_ack_route_selectors => ("ext-ack-route-selectors","process"),
+        processes_ext_ack_route_input => ("ext-ack-route-input","process"),
         processes_ext_ack_address_lifetimes => ("ext-ack-address-lifetimes","process"),
         processes_ext_ack_neighbour_requests => ("ext-ack-neighbour-requests","process"),
         processes_ext_ack_neighbour_changes => ("ext-ack-neighbour-changes","process"),
@@ -450,6 +469,7 @@ mod linux {
         netlink_nsid_write => ("netlink-nsid-write","netlink-options"),
         netlink_target_netnsid => ("netlink-target-netnsid","netlink-options"),
         netlink_link_netns => ("netlink-link-netns","netlink-options"),
+        netlink_write_credentials => ("netlink-write-credentials","netlink-options"),
         processes_user_namespaces => ("user-namespaces","process"),
         processes_scheduling_set => ("scheduling-set","process"),
         processes_personality_layout => ("personality-layout","process"),
@@ -515,11 +535,16 @@ mod linux {
         perf_counts => ("perf-counts","perf"),
         perf_exec => ("perf-exec","perf"),
         perf_prctl => ("perf-prctl","perf"),
+        perf_inherit => ("perf-inherit","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
         bpf_ids => ("bpf-ids","bpf"),
         bpf_memory => ("bpf-memory","bpf"),
+        bpf_lru => ("bpf-lru","bpf"),
+        bpf_queue => ("bpf-queue","bpf"),
+        bpf_bloom => ("bpf-bloom","bpf"),
+        bpf_prog_load => ("bpf-prog-load","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -549,6 +574,9 @@ mod linux {
         fanotify_mounts => ("fanotify-mounts","fanotify"),
         fanotify_perm => ("fanotify-perm","fanotify"),
         fanotify_access_perm => ("fanotify-access-perm","fanotify"),
+        fanotify_open_exec => ("fanotify-open-exec","fanotify"),
+        fanotify_aio_perm => ("fanotify-aio-perm","fanotify"),
+        fanotify_exec_perm => ("fanotify-exec-perm","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
@@ -557,6 +585,8 @@ mod linux {
         userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
         userfaultfd_poison => ("userfaultfd-poison","userfaultfd"),
         userfaultfd_move => ("userfaultfd-move","userfaultfd"),
+        userfaultfd_shmem => ("userfaultfd-shmem","userfaultfd"),
+        userfaultfd_minor => ("userfaultfd-minor","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),
@@ -597,8 +627,15 @@ mod linux {
         trap_flag_syscall => ("trap-flag-syscall","single-step"),
         trap_flag_signal => ("trap-flag-signal","single-step"),
         int3 => ("int3","single-step"),
+        trap_flag_rep => ("trap-flag-rep","single-step"),
         ptrace_singlestep => ("ptrace-singlestep","single-step"),
         ptrace_forced_frame => ("ptrace-forced-frame","single-step"),
+        ptrace_hw_breakpoint => ("ptrace-hw-breakpoint","single-step"),
+        ptrace_hw_implicit => ("ptrace-hw-implicit","single-step"),
+        hw_probe_fxsave => ("hw-probe-fxsave","single-step"),
+        hw_probe_fxrstor => ("hw-probe-fxrstor","single-step"),
+        hw_probe_x87 => ("hw-probe-x87","single-step"),
+        hw_probe_maskmovdqu => ("hw-probe-maskmovdqu","single-step"),
         ptrace_restart_codes => ("ptrace-restart-codes","ptrace-requests"),
         ptrace_selectors => ("ptrace-selectors","ptrace-requests"),
         ptrace_suspend_seccomp => ("ptrace-suspend-seccomp","ptrace-requests"),
@@ -721,6 +758,7 @@ mod linux {
         processes_ipc_sysctl => ("ipc-sysctl","process"),
         processes_sysvipc_proc => ("sysvipc-proc","process"),
         processes_kernel_sysctl => ("kernel-sysctl","process"),
+        processes_net_sysctl => ("net-sysctl","process"),
         processes_rseq => ("rseq","process"),
         processes_pkey => ("pkey","process"),
         processes_vector_flags => ("vector-flags","process"),
@@ -756,6 +794,9 @@ mod linux {
         processes_moves => ("moves","process"),
         processes_trees => ("trees","process"),
         processes_contexts => ("contexts","process"),
+        processes_setattrs => ("setattrs","process"),
+        processes_mount_flags => ("mount-flags","process"),
+        processes_listings => ("listings","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_proc_other_maps => ("proc-other-maps","process"),
         processes_proc_other_fds => ("proc-other-fds","process"),

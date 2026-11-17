@@ -4573,6 +4573,23 @@ mod shm {
         t.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
         assert_eq!(write(&mut k, &mut t, &m, msgmax, b"100"), e(Errno::EPERM));
         assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), e(Errno::EPERM));
+        // So does a positioned write (pwrite64, and pwritev of one iovec).
+        m.write(GuestAddr(BUF), b"100").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 18, [msgmax, BUF, 3, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        const IOV: u64 = DATA + 0xb00;
+        m.write_u64(GuestAddr(IOV), BUF).unwrap();
+        m.write_u64(GuestAddr(IOV + 8), 3).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 296, [msgmax, IOV, 1, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 296, [bpf, IOV, 1, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
         // Root without CAP_SYS_ADMIN may write msgmax, but not
         // unprivileged_bpf_disabled, which asks the writer's capability.
         let mut bare = root.clone();
@@ -4583,10 +4600,72 @@ mod shm {
         t.state.credentials = root;
         let bpf = open(&mut k, &mut t, &m, "unprivileged_bpf_disabled");
         assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), 1);
+        // Root's positioned write at the start sets the value.
+        m.write(GuestAddr(BUF), b"200").unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 18, [msgmax, BUF, 3, 0, 0, 0]),
+            3
+        );
         assert_eq!(
             read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/msgmax"),
-            "100\n"
+            "200\n"
         );
+    }
+
+    /// `copy_file_range` into a sysctl never reaches its handler, as on
+    /// Linux: from another filesystem it is `EXDEV`
+    /// (`generic_copy_file_checks`; proc has no `copy_file_range`), and from
+    /// another sysctl, whose size is 0, it copies nothing.
+    #[test]
+    fn copy_file_range_never_writes_a_sysctl() {
+        let (mut k, mut t, m) = setup();
+        const PATH: u64 = DATA + 0x900;
+        m.write(GuestAddr(PATH), b"/proc/sys/kernel/msgmnb\0")
+            .unwrap();
+        let target = syscall(&mut k, &mut t, &m, 2, [PATH, 1, 0, 0, 0, 0]);
+        // From a memfd, on a filesystem of its own.
+        m.write(GuestAddr(PATH), b"m\0").unwrap();
+        let memfd = syscall(&mut k, &mut t, &m, 319, [PATH, 0, 0, 0, 0, 0]);
+        m.write(GuestAddr(PATH), b"100\n").unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 1, [memfd, PATH, 4, 0, 0, 0]), 4);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 326, [memfd, 0, target, 0, 4, 0]),
+            e(Errno(18))
+        );
+        // From another sysctl: its size of 0 copies nothing, as on Linux.
+        m.write(GuestAddr(PATH), b"/proc/sys/kernel/msgmax\0")
+            .unwrap();
+        let source = syscall(&mut k, &mut t, &m, 2, [PATH, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 326, [source, 0, target, 0, 16, 0]),
+            0
+        );
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/msgmnb"),
+            "16384\n"
+        );
+        // Each has an inode of its own and a size of 0.
+        let stat = |k: &mut Kernel, t: &mut Thread, m: &AddressSpace, fd: u64| {
+            assert_eq!(syscall(k, t, m, 5, [fd, DATA + 0x800, 0, 0, 0, 0]), 0);
+            (
+                m.read_u64(GuestAddr(DATA + 0x808)).unwrap(),
+                m.read_u64(GuestAddr(DATA + 0x830)).unwrap(),
+            )
+        };
+        let (source_inode, source_size) = stat(&mut k, &mut t, &m, source);
+        let (target_inode, target_size) = stat(&mut k, &mut t, &m, target);
+        assert_ne!(source_inode, target_inode);
+        assert_eq!((source_size, target_size), (0, 0));
+        // The size of 0 does not bound a read: pread gives the value, and
+        // the end is 0 (`default_llseek`).
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 17, [source, DATA + 0xa00, 64, 0, 0, 0]),
+            5
+        );
+        let mut text = [0; 5];
+        m.read(GuestAddr(DATA + 0xa00), &mut text).unwrap();
+        assert_eq!(&text, b"8192\n");
+        assert_eq!(syscall(&mut k, &mut t, &m, 8, [source, 0, 2, 0, 0, 0]), 0);
     }
 
     #[test]

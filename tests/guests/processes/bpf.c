@@ -3,6 +3,14 @@
    (lookup, update, delete, next key, lookup and delete), freezing, the
    batch commands, BPF_OBJ_GET_INFO_BY_FD, fdinfo, and the rule that keeps
    a user without CAP_BPF out (kernel.unprivileged_bpf_disabled, 2).
+   bpf-lru: LRU hashes, which give up a key when they are full; the case
+   runs on one CPU, as the emulator does, since each CPU has its own free
+   and pending lists, which decide which key goes.
+   bpf-queue: queues and stacks, which push, peek and pop values without
+   keys.
+   bpf-bloom: bloom filters, with BPF_F_ZERO_SEED, so that which values
+   seem to be there, false positives included, is the same as on Linux;
+   with a random seed, only that what was pushed is there.
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -17,6 +25,7 @@
    used. The cases run as root, as the guest does. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -44,6 +53,10 @@
 
 #define TYPE_HASH 1
 #define TYPE_ARRAY 2
+#define TYPE_LRU_HASH 9
+#define TYPE_QUEUE 22
+#define TYPE_STACK 23
+#define TYPE_BLOOM_FILTER 30
 
 #define F_NO_PREALLOC (1 << 0)
 #define F_NO_COMMON_LRU (1 << 1)
@@ -664,6 +677,395 @@ static int case_memory(void) {
 }
 
 
+/* Updates key with value, and says what that gave. */
+static void put(const char *name, int fd, uint32_t key, uint64_t value, uint64_t flags) {
+    say("%s %u: %ld", name, key, elem(MAP_UPDATE_ELEM, fd, &key, &value, flags));
+}
+
+static int case_lru(void) {
+    /* One CPU, so that every command uses the same lists. */
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(sched_getcpu(), &one);
+    if (sched_setaffinity(0, sizeof one, &one) < 0) return 1;
+
+    create("lru no prealloc", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_NO_PREALLOC));
+    create("lru no common lru numa", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_NO_COMMON_LRU | F_NUMA_NODE));
+    create("lru numa", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_NUMA_NODE));
+    create("lru key 0", map_attr(TYPE_LRU_HASH, 0, 8, 4, 0));
+    create("lru entries 0", map_attr(TYPE_LRU_HASH, 4, 8, 0, 0));
+    create("lru mmapable", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_MMAPABLE));
+    create("lru zero seed", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_ZERO_SEED));
+    create("lru too big", map_attr(TYPE_LRU_HASH, 4, 1 << 22, 4, 0));
+    create("lru no common lru", map_attr(TYPE_LRU_HASH, 4, 8, 4, F_NO_COMMON_LRU));
+
+    /* Four entries: a CPU takes one free element at a time, on any machine
+       of two CPUs or more. */
+    int lru = make(TYPE_LRU_HASH, 4, 8, 4, 0);
+    say("lru memlock %llu", memlock(lru));
+    for (uint32_t key = 1; key <= 5; key++) put("add", lru, key, key, ANY);
+    keys("lru full", lru);
+    put("replace", lru, 2, 20, ANY);
+    keys("lru replaced", lru);
+    put("add", lru, 6, 6, ANY);
+    keys("lru added", lru);
+    put("refused", lru, 6, 60, NOEXIST);
+    keys("lru refused", lru);
+    put("missing", lru, 9, 9, EXIST);
+    keys("lru missing", lru);
+    uint32_t key = 6;
+    uint64_t value = 0;
+    long r = elem(MAP_LOOKUP_ELEM, lru, &key, &value, 0);
+    say("lookup 6 %ld value %llu", r, (unsigned long long)value);
+    key = 5;
+    say("delete 5 %ld", elem(MAP_DELETE_ELEM, lru, &key, NULL, 0));
+    say("delete 5 again %ld", elem(MAP_DELETE_ELEM, lru, &key, NULL, 0));
+    keys("lru deleted", lru);
+    for (key = 7; key <= 9; key++) put("add", lru, key, key, ANY);
+    keys("lru refilled", lru);
+    key = 8;
+    value = 0;
+    r = elem(MAP_LOOKUP_AND_DELETE_ELEM, lru, &key, &value, 0);
+    say("lookup and delete 8 %ld value %llu", r, (unsigned long long)value);
+    keys("lru after lookup and delete", lru);
+    /* Replaced keys are referenced, and outlast the others. */
+    for (key = 10; key <= 30; key++) {
+        put("add", lru, key, key, ANY);
+        if (key % 3 == 0) put("replace", lru, key, key + 100, ANY);
+    }
+    keys("lru after many", lru);
+    uint32_t k[8] = {40, 41, 42, 43, 44, 45, 46, 47}, count = 6, gk[8];
+    uint64_t v[8] = {0}, gv[8];
+    r = batch(MAP_UPDATE_BATCH, lru, NULL, NULL, k, v, &count, 0);
+    say("update batch %ld count %u", r, count);
+    keys("lru after batch", lru);
+    count = 8;
+    uint32_t out = 0;
+    r = batch(MAP_LOOKUP_AND_DELETE_BATCH, lru, NULL, &out, gk, gv, &count, 0);
+    qsort(gk, count, sizeof gk[0], compare);
+    printf("lookup and delete batch %ld count %u keys", r, count);
+    for (uint32_t i = 0; i < count; i++) printf(" %u", gk[i]);
+    putchar('\n');
+    keys("lru emptied", lru);
+    say("lru memlock after %llu", memlock(lru));
+    close(lru);
+
+    /* Lists for each CPU: one entry is one for each, so this CPU holds just
+       one key. */
+    lru = make(TYPE_LRU_HASH, 4, 8, 1, F_NO_COMMON_LRU);
+    for (key = 1; key <= 3; key++) put("own add", lru, key, key, ANY);
+    keys("own lists", lru);
+    close(lru);
+    return 0;
+}
+
+/* Pops (or with peek, looks at) a queue's or stack's values until there
+   are none. */
+static void drain(const char *name, int fd) {
+    printf("%s", name);
+    for (;;) {
+        uint64_t value = 0;
+        long r = elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, NULL, &value, 0);
+        if (r < 0) {
+            printf(" end %ld\n", r);
+            break;
+        }
+        printf(" %llu", (unsigned long long)value);
+    }
+    fflush(stdout);
+}
+
+static int case_queue(void) {
+    create("queue key 4", map_attr(TYPE_QUEUE, 4, 8, 4, 0));
+    create("queue value 0", map_attr(TYPE_QUEUE, 0, 0, 4, 0));
+    create("queue entries 0", map_attr(TYPE_QUEUE, 0, 8, 0, 0));
+    create("queue no prealloc", map_attr(TYPE_QUEUE, 0, 8, 4, F_NO_PREALLOC));
+    create("queue zero seed", map_attr(TYPE_QUEUE, 0, 8, 4, F_ZERO_SEED));
+    create("queue mmapable", map_attr(TYPE_QUEUE, 0, 8, 4, F_MMAPABLE));
+    create("queue numa", map_attr(TYPE_QUEUE, 0, 8, 4, F_NUMA_NODE));
+    create("queue value too big", map_attr(TYPE_QUEUE, 0, (1 << 22) + 1, 4, 0));
+    create("stack key 4", map_attr(TYPE_STACK, 4, 8, 4, 0));
+    const uint32_t types[2] = {TYPE_QUEUE, TYPE_STACK};
+    const char *names[2] = {"queue", "stack"};
+    for (int t = 0; t < 2; t++) {
+        const char *name = names[t];
+        int fd = make(types[t], 0, 8, 3, 0);
+        say("%s memlock %llu", name, memlock(fd));
+        uint64_t value = 0;
+        uint32_t key = 0;
+        say("%s peek empty %ld", name, elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0));
+        for (uint64_t v = 1; v <= 3; v++) say("%s push %llu %ld", name, (unsigned long long)v, elem(MAP_UPDATE_ELEM, fd, NULL, &v, ANY));
+        value = 4;
+        say("%s push full %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, ANY));
+        say("%s push noexist %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, NOEXIST));
+        say("%s push lock %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, ELEM_F_LOCK));
+        say("%s push with a key %ld", name, elem(MAP_UPDATE_ELEM, fd, &key, &value, ANY));
+        say("%s push exist %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, EXIST));
+        value = 0;
+        long r = elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0);
+        say("%s peek %ld value %llu", name, r, (unsigned long long)value);
+        say("%s peek with a key %ld", name, elem(MAP_LOOKUP_ELEM, fd, &key, &value, 0));
+        say("%s peek to nowhere %ld", name, elem(MAP_LOOKUP_ELEM, fd, NULL, (void *)8, 0));
+        say("%s delete %ld", name, elem(MAP_DELETE_ELEM, fd, NULL, NULL, 0));
+        say("%s delete with a key %ld", name, elem(MAP_DELETE_ELEM, fd, &key, NULL, 0));
+        uint32_t next;
+        say("%s next key %ld", name, elem(MAP_GET_NEXT_KEY, fd, NULL, &next, 0));
+        say("%s next key of a key %ld", name, elem(MAP_GET_NEXT_KEY, fd, &key, &next, 0));
+        say("%s pop lock %ld", name, elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, NULL, &value, ELEM_F_LOCK));
+        uint64_t values[4];
+        uint32_t keys[4], count = 2, out;
+        say("%s lookup batch %ld", name, batch(MAP_LOOKUP_BATCH, fd, NULL, &out, keys, values, &count, 0));
+        count = 2;
+        say("%s update batch %ld", name, batch(MAP_UPDATE_BATCH, fd, NULL, NULL, keys, values, &count, 0));
+        drain(name, fd);
+        value = 9;
+        elem(MAP_UPDATE_ELEM, fd, NULL, &value, ANY);
+        say("%s pop to nowhere %ld", name, elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, NULL, (void *)8, 0));
+        drain(name, fd);
+
+        /* Read only, and frozen. */
+        int readonly = make(types[t], 0, 8, 3, F_RDONLY);
+        say("%s read only push %ld pop %ld", name, elem(MAP_UPDATE_ELEM, readonly, NULL, &value, ANY),
+            elem(MAP_LOOKUP_AND_DELETE_ELEM, readonly, NULL, &value, 0));
+        close(readonly);
+        union attr f;
+        memset(&f, 0, sizeof f);
+        f.elem.map_fd = (uint32_t)fd;
+        say("%s freeze %ld", name, bpf(MAP_FREEZE, &f, sizeof f));
+        say("%s frozen push %ld peek %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, ANY),
+            elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0));
+        close(fd);
+    }
+    return 0;
+}
+
+/* bpf-prog-load: BPF_PROG_LOAD's checks of its arguments, each case wrong
+   in one way only, so that Linux and the emulator stop at the same check.
+   Only the errors are compared: a program Linux would verify and load is
+   never made here, as the emulator loads none. */
+#define PROG_LOAD 5
+#define PROG_SOCKET_FILTER 1
+#define PROG_TOKEN_FD (1 << 16)
+
+/* union bpf_attr for BPF_PROG_LOAD, to keyring_id, the last field. */
+struct prog_attr {
+    uint32_t prog_type, insn_cnt;
+    uint64_t insns, license;
+    uint32_t log_level, log_size;
+    uint64_t log_buf;
+    uint32_t kern_version, prog_flags;
+    char prog_name[16];
+    uint32_t prog_ifindex, expected_attach_type, prog_btf_fd, func_info_rec_size;
+    uint64_t func_info;
+    uint32_t func_info_cnt, line_info_rec_size;
+    uint64_t line_info;
+    uint32_t line_info_cnt, attach_btf_id, attach_prog_fd, core_relo_cnt;
+    uint64_t fd_array, core_relos;
+    uint32_t core_relo_rec_size, log_true_size;
+    int32_t prog_token_fd;
+    uint32_t fd_array_cnt;
+    uint64_t signature;
+    uint32_t signature_size;
+    int32_t keyring_id;
+};
+_Static_assert(sizeof(struct prog_attr) == 168, "union bpf_attr's size");
+
+/* r0 = 0; exit */
+static const uint64_t prog_insns[2] = { 0x00000000000000b7ULL, 0x0000000000000095ULL };
+static char prog_log[4096];
+
+static struct prog_attr prog(void) {
+    struct prog_attr p;
+    memset(&p, 0, sizeof p);
+    p.prog_type = PROG_SOCKET_FILTER;
+    p.insn_cnt = 2;
+    p.insns = (uintptr_t)prog_insns;
+    p.license = (uintptr_t)"GPL";
+    return p;
+}
+
+static void load(const char *name, struct prog_attr p) {
+    say("%s %ld", name, bpf(PROG_LOAD, &p, sizeof p));
+}
+
+static int case_prog_load(void) {
+    int null = open("/dev/null", O_RDONLY);
+    struct prog_attr p = prog();
+    p.prog_flags = 1 << 8;
+    load("unknown flag", p);
+    p = prog();
+    p.prog_flags = PROG_TOKEN_FD;
+    p.prog_token_fd = 1000;
+    load("token flag without a descriptor", p);
+    p.prog_token_fd = null;
+    load("token flag with another file", p);
+    p = prog();
+    p.insn_cnt = 0;
+    load("no instructions", p);
+    p.insn_cnt = 1000001;
+    load("more than the complexity limit", p);
+    p = prog();
+    p.attach_prog_fd = null;
+    load("attach to another file", p);
+    p = prog();
+    p.attach_btf_id = 1;
+    load("attach BTF ID", p);
+    p = prog();
+    p.insns = 8;
+    load("instructions at no memory", p);
+    p = prog();
+    p.license = 8;
+    load("license at no memory", p);
+    p = prog();
+    p.prog_type = 1000;
+    load("unknown type", p);
+    p = prog();
+    memcpy(p.prog_name, "bad-name", 9);
+    load("name with a dash", p);
+    p = prog();
+    p.log_buf = (uintptr_t)prog_log;
+    p.log_level = 1;
+    load("log buffer without a size", p);
+    close(null);
+
+    /* Without CAP_BPF, kernel.unprivileged_bpf_disabled (2) keeps every
+       load out, before its size is looked at. */
+    pid_t child = fork();
+    if (child == 0) {
+        if (setresuid(65534, 65534, 65534) < 0) _exit(1);
+        load("unprivileged socket filter", prog());
+        struct prog_attr q = prog();
+        q.insn_cnt = 0;
+        load("unprivileged no instructions", q);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    say("child status %d", status);
+    return 0;
+}
+
+static union attr bloom_attr(uint32_t value, uint32_t entries, uint32_t flags, uint64_t extra) {
+    union attr a = map_attr(TYPE_BLOOM_FILTER, 0, value, entries, flags);
+    a.map_extra = extra;
+    return a;
+}
+
+/* Which of the values from..to (as 4-byte, or the first `size` bytes of
+   12-byte, values) the filter says may be there, as a string of 0 and 1. */
+static void seen(const char *name, int fd, uint32_t size, uint32_t from, uint32_t to) {
+    printf("%s ", name);
+    for (uint32_t v = from; v < to; v++) {
+        unsigned char value[16] = {0};
+        memcpy(value, &v, sizeof v);
+        value[size - 1] ^= 0x5a;
+        putchar(elem(MAP_LOOKUP_ELEM, fd, NULL, value, 0) == 0 ? '1' : '0');
+    }
+    putchar('\n');
+    fflush(stdout);
+}
+
+static void fill(int fd, uint32_t size, uint32_t from, uint32_t to) {
+    for (uint32_t v = from; v < to; v++) {
+        unsigned char value[16] = {0};
+        memcpy(value, &v, sizeof v);
+        value[size - 1] ^= 0x5a;
+        elem(MAP_UPDATE_ELEM, fd, NULL, value, ANY);
+    }
+}
+
+static int case_bloom(void) {
+    create("bloom key 4", map_attr(TYPE_BLOOM_FILTER, 4, 4, 10, 0));
+    create("bloom value 0", bloom_attr(0, 10, 0, 0));
+    create("bloom entries 0", bloom_attr(4, 0, 0, 0));
+    create("bloom extra 16", bloom_attr(4, 10, 0, 16));
+    create("bloom no prealloc", bloom_attr(4, 10, F_NO_PREALLOC, 0));
+    create("bloom mmapable", bloom_attr(4, 10, F_MMAPABLE, 0));
+    create("bloom numa", bloom_attr(4, 10, F_NUMA_NODE, 0));
+    create("bloom value too big", bloom_attr((1 << 22) + 1, 10, 0, 0));
+    create("bloom both prog access", bloom_attr(4, 10, F_RDONLY_PROG | F_WRONLY_PROG, 0));
+    union attr h = map_attr(TYPE_HASH, 4, 4, 10, 0);
+    h.map_extra = 1;
+    create("hash with extra", h);
+
+    const uint32_t sizes[][3] = {{4, 1, 0}, {4, 100, 0}, {4, 1000, 3}, {3, 50, 1}, {8, 5000, 15}};
+    for (unsigned i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        union attr a = bloom_attr(sizes[i][0], sizes[i][1], F_ZERO_SEED, sizes[i][2]);
+        int fd = (int)bpf(MAP_CREATE, &a, sizeof a);
+        say("bloom value %u entries %u extra %u memlock %llu", sizes[i][0], sizes[i][1], sizes[i][2], memlock(fd));
+        close(fd);
+    }
+
+    union attr a = bloom_attr(4, 20, F_ZERO_SEED, 0);
+    int fd = (int)bpf(MAP_CREATE, &a, sizeof a);
+    struct map_info mi;
+    memset(&mi, 0, sizeof mi);
+    union attr q;
+    memset(&q, 0, sizeof q);
+    q.info.bpf_fd = (uint32_t)fd;
+    q.info.info_len = sizeof mi;
+    q.info.info = (uintptr_t)&mi;
+    long r = bpf(OBJ_GET_INFO_BY_FD, &q, sizeof q);
+    say("bloom info %ld type %u key %u value %u extra %llu", r, mi.type, mi.key_size, mi.value_size,
+        (unsigned long long)mi.map_extra);
+    char path[64], line[128];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    FILE *info = fopen(path, "r");
+    while (info && fgets(line, sizeof line, info))
+        if (!strncmp(line, "map_extra", 9)) fputs(line, stdout);
+    if (info) fclose(info);
+    fflush(stdout);
+
+    uint32_t value = 7, key = 0, next;
+    say("bloom peek empty %ld", elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0));
+    say("bloom push %ld", elem(MAP_UPDATE_ELEM, fd, NULL, &value, ANY));
+    say("bloom peek %ld", elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0));
+    say("bloom push noexist %ld", elem(MAP_UPDATE_ELEM, fd, NULL, &value, NOEXIST));
+    say("bloom push exist %ld", elem(MAP_UPDATE_ELEM, fd, NULL, &value, EXIST));
+    say("bloom push lock %ld", elem(MAP_UPDATE_ELEM, fd, NULL, &value, ELEM_F_LOCK));
+    say("bloom push with a key %ld", elem(MAP_UPDATE_ELEM, fd, &key, &value, ANY));
+    say("bloom peek with a key %ld", elem(MAP_LOOKUP_ELEM, fd, &key, &value, 0));
+    say("bloom peek from nowhere %ld", elem(MAP_LOOKUP_ELEM, fd, NULL, (void *)8, 0));
+    say("bloom delete %ld", elem(MAP_DELETE_ELEM, fd, NULL, NULL, 0));
+    say("bloom next key %ld", elem(MAP_GET_NEXT_KEY, fd, NULL, &next, 0));
+    say("bloom lookup and delete %ld", elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, NULL, &value, 0));
+    uint32_t keys[2], count = 2, out;
+    uint32_t values[2] = {1, 2};
+    say("bloom update batch %ld", batch(MAP_UPDATE_BATCH, fd, NULL, NULL, keys, values, &count, 0));
+    count = 2;
+    say("bloom lookup batch %ld", batch(MAP_LOOKUP_BATCH, fd, NULL, &out, keys, values, &count, 0));
+    close(fd);
+
+    /* What seems to be there, false positives and all, of filters that
+       hash words (jhash2) and bytes (jhash), with 5, 1 and 15 hashes. */
+    const uint32_t kinds[][4] = {{4, 20, 0, 0}, {4, 20, 1, 0}, {4, 64, 15, 0}, {3, 20, 0, 0}, {13, 30, 2, 0}};
+    for (unsigned i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
+        a = bloom_attr(kinds[i][0] <= 4 ? kinds[i][0] : 13, kinds[i][1], F_ZERO_SEED, kinds[i][2]);
+        fd = (int)bpf(MAP_CREATE, &a, sizeof a);
+        uint32_t size = kinds[i][0];
+        fill(fd, size, 0, kinds[i][1]);
+        char name[64];
+        snprintf(name, sizeof name, "bloom value %u extra %u seen", size, kinds[i][2]);
+        seen(name, fd, size, 0, 200);
+        close(fd);
+    }
+
+    /* A random seed: what was pushed is there. */
+    a = bloom_attr(4, 100, 0, 0);
+    fd = (int)bpf(MAP_CREATE, &a, sizeof a);
+    fill(fd, 4, 0, 100);
+    int all = 1;
+    for (uint32_t v = 0; v < 100; v++) {
+        unsigned char b[4];
+        memcpy(b, &v, 4);
+        b[3] ^= 0x5a;
+        all &= elem(MAP_LOOKUP_ELEM, fd, NULL, b, 0) == 0;
+    }
+    say("bloom random seed all there %d", all);
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -672,5 +1074,9 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-batch")) return case_batch();
     if (!strcmp(mode, "bpf-ids")) return case_ids();
     if (!strcmp(mode, "bpf-memory")) return case_memory();
+    if (!strcmp(mode, "bpf-lru")) return case_lru();
+    if (!strcmp(mode, "bpf-queue")) return case_queue();
+    if (!strcmp(mode, "bpf-bloom")) return case_bloom();
+    if (!strcmp(mode, "bpf-prog-load")) return case_prog_load();
     return 2;
 }

@@ -66,6 +66,23 @@ fn atomic_width(size: u8) -> Result<AtomicWidth> {
 /// on hardware where `rep` is interruptible).
 const REP_CHUNK: u64 = 4096;
 
+thread_local! {
+    /// The iterations a repeated string instruction runs in one step: one
+    /// while each is to be watched ([`with_rep_iterations`]).
+    static REP_ITERATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(REP_CHUNK) };
+}
+
+/// Runs `f` with each repeated string instruction running at most `n`
+/// iterations a step, as the CPU stops after the one that traps.
+pub(crate) fn with_rep_iterations<T>(n: u64, f: impl FnOnce() -> T) -> T {
+    REP_ITERATIONS.with(|iterations| {
+        let before = iterations.replace(n);
+        let result = f();
+        iterations.set(before);
+        result
+    })
+}
+
 pub(crate) fn is_comparison_string(m: Mnemonic) -> bool {
     matches!(
         m,
@@ -1036,7 +1053,7 @@ impl Exec<'_> {
         } else {
             u64::MAX
         };
-        let mut budget = REP_CHUNK;
+        let mut budget = REP_ITERATIONS.with(std::cell::Cell::get);
         loop {
             if repeat {
                 if self.s.gpr[reg::RCX] & address_mask == 0 {

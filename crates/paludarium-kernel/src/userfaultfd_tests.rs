@@ -21,6 +21,7 @@ const ZEROPAGE: u64 = 0xc020_aa04;
 const WRITEPROTECT: u64 = 0xc018_aa06;
 const POISON: u64 = 0xc020_aa08;
 const MOVE: u64 = 0xc028_aa05;
+const CONTINUE: u64 = 0xc020_aa07;
 
 const NONBLOCK: u64 = 0o4000;
 const SIGBUS: u64 = 1 << 7;
@@ -189,7 +190,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ret(16, &[fd, API, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, API, &[0xaa, SIGBUS | THREAD_ID, 0]);
     assert_eq!(ret, 0);
-    assert_eq!(out, vec![0xaa, 0x1_49b1, 1 << 63 | 3]);
+    assert_eq!(out, vec![0xaa, 0x1_4fb1, 1 << 63 | 3]);
     assert_eq!(
         f.ioctl(fd, API, &[0xaa, 0, 0]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
@@ -197,7 +198,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ioctl(fd, 0xc018_aa3e, &[0, 0, 0]).0, errno(Errno::EINVAL));
     assert!(
         f.fdinfo(fd)
-            .ends_with("pending:\t0\ntotal:\t0\nAPI:\taa:80000180:800000000000017f\n")
+            .ends_with("pending:\t0\ntotal:\t0\nAPI:\taa:80000180:80000000000001ff\n")
     );
     // Read, write and seek of the file.
     assert_eq!(f.ret(0, &[fd, ARG, 32]), errno(Errno::EAGAIN));
@@ -729,5 +730,47 @@ fn uffdio_move_moves_private_anonymous_pages_into_a_registered_range() {
         f.ioctl(fd, MOVE, &[AREA + 3 * PAGE, src + 2 * PAGE, PAGE, 0, 0])
             .1[4],
         einval
+    );
+}
+
+#[test]
+fn uffdio_continue_maps_a_memfd_page_registered_for_minor_faults() {
+    let mut f = fixture();
+    let fd = f.ready(0, 0);
+    // A memfd of two pages, the second written, mapped shared.
+    f.mem.write(GuestAddr(DATA), b"uffd\0").unwrap();
+    let file = f.ret(319, &[DATA, 0]);
+    assert!((file as i64) >= 0, "{file:#x}");
+    assert_eq!(f.ret(77, &[file, 2 * PAGE]), 0);
+    f.mem.write(GuestAddr(SRC), b"m").unwrap();
+    assert_eq!(f.ret(18, &[file, SRC, 1, PAGE]), 1);
+    let at = f.ret(9, &[0, 3 * PAGE, 3, 1, file, 0]);
+    assert!((at as i64) > 0, "{at:#x}");
+    // The minor mode, which adds UFFDIO_CONTINUE to the ioctls.
+    let (ret, out) = f.ioctl(fd, REGISTER, &[at, 3 * PAGE, 4, 0]);
+    assert_eq!((ret, out[3]), (0, 0x1bc));
+    let einval = errno(Errno::EINVAL);
+    assert_eq!(f.ioctl(fd, CONTINUE, &[at, PAGE, 4, 0]).0, einval);
+    // A write-protecting continue needs the range registered for it.
+    assert_eq!(f.ioctl(fd, CONTINUE, &[at + PAGE, PAGE, 2, 0]).1[3], einval);
+    // A hole is EFAULT, a page past the file's end EINVAL.
+    assert_eq!(
+        f.ioctl(fd, CONTINUE, &[at, PAGE, 0, 0]).1[3],
+        errno(Errno::EFAULT)
+    );
+    assert_eq!(
+        f.ioctl(fd, CONTINUE, &[at + 2 * PAGE, PAGE, 0, 0]).1[3],
+        einval
+    );
+    assert_eq!(
+        f.ioctl(fd, CONTINUE, &[at + PAGE, PAGE, 0, 0]),
+        (0, vec![at + PAGE, PAGE, 0, PAGE])
+    );
+    let mut byte = [0];
+    f.mem.read(GuestAddr(at + PAGE), &mut byte).unwrap();
+    assert_eq!(byte, *b"m");
+    assert_eq!(
+        f.ioctl(fd, CONTINUE, &[at + PAGE, PAGE, 0, 0]).1[3],
+        errno(Errno::EEXIST)
     );
 }

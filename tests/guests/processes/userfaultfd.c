@@ -15,7 +15,12 @@
    the poison, of private and of shared anonymous memory; and
    UFFDIO_MOVE: its errors and their order, a hole, a move that stops
    short, the wake of a fault, a page fork shares, the zero page, and
-   guards at either end.
+   guards at either end; and a memfd's mappings: shared and private, a
+   hole that waits and a page the file has, fills that reach the file or
+   do not, the end of the file, and the mappings that cannot be
+   registered (one that may not write the file, System V shared memory);
+   and the minor mode: a memfd's page the page cache has waits until
+   UFFDIO_CONTINUE maps it, its errors, and a private mapping of it.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
    whether they are the faulting thread's. Of what UFFDIO_API and
@@ -35,6 +40,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -51,6 +58,8 @@
 #define UFFD_FEATURE_EXACT_ADDRESS (1ULL << 11)
 #define UFFD_FEATURE_POISON (1ULL << 14)
 #define UFFD_FEATURE_MOVE (1ULL << 16)
+#define UFFD_FEATURE_MINOR_SHMEM (1ULL << 10)
+#define UFFD_PAGEFAULT_FLAG_MINOR 4
 #define UFFDIO_REGISTER_MODE_MISSING 1ULL
 #define UFFDIO_REGISTER_MODE_WP 2ULL
 #define UFFDIO_REGISTER_MODE_MINOR 4ULL
@@ -72,10 +81,14 @@
 #define UFFDIO_MOVE 0xc028aa05
 #define UFFDIO_WRITEPROTECT 0xc018aa06
 #define UFFDIO_POISON 0xc020aa08
+#define UFFDIO_CONTINUE 0xc020aa07
+#define UFFDIO_CONTINUE_MODE_DONTWAKE 1ULL
+#define UFFDIO_CONTINUE_MODE_WP 2ULL
 
 #define RANGE_IOCTLS ((1ULL << 2) | (1ULL << 3) | (1ULL << 4))
 #define WRITEPROTECT_IOCTL (1ULL << 6)
 #define POISON_IOCTL (1ULL << 8)
+#define CONTINUE_IOCTL (1ULL << 7)
 #define MOVE_IOCTL (1ULL << 5)
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22
@@ -113,6 +126,11 @@ struct uffdio_poison {
     struct uffdio_range range;
     uint64_t mode;
     int64_t updated;
+};
+struct uffdio_continue {
+    struct uffdio_range range;
+    uint64_t mode;
+    int64_t mapped;
 };
 struct uffdio_move {
     uint64_t dst, src, len, mode;
@@ -987,6 +1005,170 @@ static int case_move(void) {
     return 0;
 }
 
+/* A memfd of `pages` pages whose page 1 is written. */
+static int shmem_file(int pages) {
+    int file = syscall(SYS_memfd_create, "uffd", 0);
+    ftruncate(file, pages * PAGE);
+    pwrite(file, "b", 1, PAGE);
+    return file;
+}
+
+/* A shmem file's mappings, shared and private: a hole waits, a page the
+   file has does not, a shared fill goes to the file and a private one does
+   not, the end of the file, and what cannot be registered. */
+static int case_shmem(void) {
+    struct sigaction sa = {0};
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGBUS, &sa, NULL);
+    int fd = ready(O_NONBLOCK, 0);
+    char src[PAGE];
+    memset(src, 'c', sizeof src);
+    int64_t done;
+
+    /* Shared: five pages over a file of four. */
+    int file = shmem_file(4);
+    char *shared = mmap(NULL, 5 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    uint64_t ioctls = 0;
+    printf("register shared: %s", err(reg(fd, shared, 5 * PAGE, UFFDIO_REGISTER_MODE_MISSING, &ioctls)));
+    printf(" ioctls=%d\n", (ioctls & RANGE_IOCTLS) == RANGE_IOCTLS);
+    vma("shared", shared, shared);
+    access_at("the file's page", shared, shared + PAGE, 0);
+    struct toucher t = {shared + 9, 0, 0, 0};
+    pthread_t thread;
+    pthread_create(&thread, NULL, touch, &t);
+    wait_message(fd);
+    message("hole", fd, shared, 0);
+    printf("copy: %s\n", err(copy(fd, shared, src, PAGE, 0, NULL)));
+    pthread_join(thread, NULL);
+    printf("seen: %c\n", t.seen);
+    char byte = 0;
+    pread(file, &byte, 1, 9);
+    printf("the file has: %c\n", byte);
+    printf("copy over the file's: %s", err(copy(fd, shared + PAGE, src, PAGE, 0, &done)));
+    printf(" copy=%lld\n", (long long)done);
+    printf("zeropage: %s\n", err(zeropage(fd, shared + 2 * PAGE, PAGE, 0, NULL)));
+    struct stat st;
+    fstat(file, &st);
+    printf("blocks: %lld\n", (long long)st.st_blocks);
+    printf("past the end: %s", err(copy(fd, shared + 4 * PAGE, src, PAGE, 0, &done)));
+    printf(" copy=%lld\n", (long long)done);
+    printf("zeropage past the end: %s\n", err(zeropage(fd, shared + 4 * PAGE, PAGE, 0, NULL)));
+    access_at("past the end", shared, shared + 4 * PAGE, 0);
+    pwrite(file, "d", 1, 3 * PAGE + 1);
+    access_at("written later", shared, shared + 3 * PAGE + 1, 0);
+    printf("unregister: %s\n", err(unreg(fd, shared, 5 * PAGE)));
+    munmap(shared, 5 * PAGE);
+
+    /* Private: a fill is the mapping's own; the file keeps its hole. */
+    int other = shmem_file(3);
+    char *private = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, other, 0);
+    printf("register private: %s\n", err(reg(fd, private, 3 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    vma("private", private, private);
+    access_at("the file's private page", private, private + PAGE, 0);
+    printf("copy over it: %s\n", err(copy(fd, private + PAGE, src, PAGE, 0, NULL)));
+    t = (struct toucher){private + 2 * PAGE + 4, 1, 0, 0};
+    pthread_create(&thread, NULL, touch, &t);
+    wait_message(fd);
+    message("private hole", fd, private, 0);
+    printf("copy: %s\n", err(copy(fd, private + 2 * PAGE, src, PAGE, 0, NULL)));
+    pthread_join(thread, NULL);
+    printf("seen: %c\n", t.seen);
+    byte = 'x';
+    pread(other, &byte, 1, 2 * PAGE + 4);
+    printf("the file has: %d\n", byte);
+    printf("zeropage: %s\n", err(zeropage(fd, private, PAGE, 0, NULL)));
+    access_at("zero", private, private + 5, 0);
+    munmap(private, 3 * PAGE);
+
+    /* What cannot be registered: a mapping that may not write the file,
+       write protection, and System V shared memory. */
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", other);
+    int reader = open(path, O_RDONLY);
+    char *read_only = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, reader, 0);
+    printf("register read-only: %s\n", err(reg(fd, read_only, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    int id = shmget(IPC_PRIVATE, PAGE, IPC_CREAT | 0600);
+    char *segment = shmat(id, NULL, 0);
+    printf("register System V: %s\n", err(reg(fd, segment, PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    shmdt(segment);
+    shmctl(id, IPC_RMID, NULL);
+    close(fd);
+    return 0;
+}
+
+static long resume(int fd, void *at, size_t len, uint64_t mode, int64_t *done) {
+    struct uffdio_continue c = {{(uintptr_t)at, len}, mode, 0x5a5a};
+    long ret = ioctl(fd, UFFDIO_CONTINUE, &c);
+    if (done)
+        *done = c.mapped;
+    return ret;
+}
+
+/* The minor mode: a page shmem's page cache has, which the registered
+   mapping has not mapped, waits until UFFDIO_CONTINUE maps it; another
+   mapping of the memfd fills the page cache. */
+static int case_minor(void) {
+    int fd = uffd(O_NONBLOCK);
+    struct uffdio_api api = {UFFD_API, UFFD_FEATURE_MINOR_SHMEM, 0};
+    printf("api: %s", err(ioctl(fd, UFFDIO_API, &api)));
+    printf(" minor=%d\n", (api.features & UFFD_FEATURE_MINOR_SHMEM) != 0);
+    char *private_anon = anon(PAGE);
+    printf("private anonymous: %s\n",
+           err(reg(fd, private_anon, PAGE, UFFDIO_REGISTER_MODE_MINOR, NULL)));
+    int file = shmem_file(3);
+    char *writer = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    char *view = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    uint64_t ioctls = 0;
+    printf("register: %s", err(reg(fd, view, 4 * PAGE, UFFDIO_REGISTER_MODE_MINOR, &ioctls)));
+    printf(" continue=%d\n", (ioctls & CONTINUE_IOCTL) != 0);
+    vma("minor", view, view);
+
+    /* A page the file has waits. */
+    struct toucher t = {view + PAGE + 5, 0, 0, 0};
+    pthread_t thread;
+    pthread_create(&thread, NULL, touch, &t);
+    wait_message(fd);
+    message("minor fault", fd, view, 0);
+    writer[PAGE + 5] = 'n';
+    int64_t done;
+    printf("bad mode: %s\n", err(resume(fd, view + PAGE, PAGE, 4, NULL)));
+    printf("write-protecting: %s\n", err(resume(fd, view + PAGE, PAGE, UFFDIO_CONTINUE_MODE_WP, NULL)));
+    printf("continue: %s", err(resume(fd, view + PAGE, PAGE, 0, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    pthread_join(thread, NULL);
+    printf("seen: %c\n", t.seen);
+    printf("again: %s", err(resume(fd, view + PAGE, PAGE, 0, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    /* A hole is brought in; then the other mapping sees it. */
+    printf("hole: %d\n", view[7]);
+    view[8] = 'h';
+    printf("shared: %c\n", writer[8]);
+    printf("continue a hole: %s", err(resume(fd, view + 2 * PAGE, PAGE, 0, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    printf("past the end: %s", err(resume(fd, view + 3 * PAGE, PAGE, 0, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    writer[2 * PAGE] = 'q';
+    printf("continue, don't wake: %s\n",
+           err(resume(fd, view + 2 * PAGE, PAGE, UFFDIO_CONTINUE_MODE_DONTWAKE, NULL)));
+    printf("mapped: %c\n", view[2 * PAGE]);
+    printf("unregister: %s\n", err(unreg(fd, view, 4 * PAGE)));
+
+    /* A private mapping shows the page cache's page until it writes. */
+    char *private = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, file, 0);
+    printf("register private: %s\n",
+           err(reg(fd, private, 3 * PAGE, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_MINOR, NULL)));
+    t = (struct toucher){private + PAGE + 5, 1, 0, 0};
+    pthread_create(&thread, NULL, touch, &t);
+    wait_message(fd);
+    message("private minor fault", fd, private, 0);
+    printf("continue: %s\n", err(resume(fd, private + PAGE, PAGE, 0, NULL)));
+    pthread_join(thread, NULL);
+    printf("seen: %c, the file has: %c\n", t.seen, writer[PAGE + 5]);
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -998,6 +1180,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-shared")) return case_shared();
     if (!strcmp(mode, "userfaultfd-wp")) return case_wp();
     if (!strcmp(mode, "userfaultfd-poison")) return case_poison();
+    if (!strcmp(mode, "userfaultfd-shmem")) return case_shmem();
+    if (!strcmp(mode, "userfaultfd-minor")) return case_minor();
     if (!strcmp(mode, "userfaultfd-move")) return case_move();
     printf("unknown mode %s\n", mode);
     return 2;

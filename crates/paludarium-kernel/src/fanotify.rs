@@ -328,6 +328,9 @@ pub(crate) struct Registry {
     users: Mutex<HashMap<u32, (u64, u64)>>,
     /// What each file system's `f_fsid` is drawn from.
     salt: OnceLock<u64>,
+    /// The mounts freed since the marks were last looked at, whose marks
+    /// go then ([`Registry::unmounted`]).
+    released: Mutex<Vec<u64>>,
 }
 
 /// The machine's limits of `/proc/sys/fs/fanotify`.
@@ -705,6 +708,45 @@ pub(crate) fn asked_by<T>(
     (result, Pending(asked))
 }
 
+/// A gathering of the permission events of an operation that spans more
+/// than one call (exec's opens and reads), which [`gather`] starts and
+/// [`Gathering::finish`] ends; one dropped before then asks nothing.
+pub(crate) struct Gathering {
+    outer: Option<Option<Vec<Asked>>>,
+}
+/// Starts gathering the permission events asked from now on, as
+/// [`asked_by`] does for one call.
+pub(crate) fn gather() -> Gathering {
+    let outer = ASKED.with(|asked| asked.borrow_mut().replace(Vec::new()));
+    Gathering { outer: Some(outer) }
+}
+impl Gathering {
+    /// What was gathered, for [`answers`].
+    pub(crate) fn finish(mut self) -> Pending {
+        let outer = self.outer.take().unwrap_or_default();
+        let asked = ASKED.with(|asked| std::mem::replace(&mut *asked.borrow_mut(), outer));
+        Pending(asked.unwrap_or_default())
+    }
+}
+impl Drop for Gathering {
+    fn drop(&mut self) {
+        if let Some(outer) = self.outer.take() {
+            ASKED.with(|asked| *asked.borrow_mut() = outer);
+        }
+    }
+}
+
+/// Asks the groups what a [`Gathering`] gathered, in the order the
+/// operation asked them (exec's opens and reads, one fsnotify call each):
+/// how many were let through, and whether any was asked or the denial,
+/// so that what was let through before a denial still tells its events.
+pub(crate) fn answers_through(
+    c: &mut Context<'_>,
+    pending: Pending,
+) -> (usize, Result<bool, Errno>) {
+    answer_each(c, pending.0)
+}
+
 /// Asks the groups what [`asked_by`] gathered and waits for their
 /// answers: whether any was asked, or the denial.
 pub(crate) fn answers(c: &mut Context<'_>, pending: Pending) -> Result<bool, Errno> {
@@ -734,57 +776,72 @@ pub(crate) fn asked() -> usize {
 /// The wait ends only for an answer, the group's close (let through), or a
 /// fatal signal (`TASK_KILLABLE`), which leaves the event to its group.
 fn await_answers(c: &mut Context<'_>, mut asked: Vec<Asked>) -> Result<bool, Errno> {
-    if asked.is_empty() {
-        return Ok(false);
-    }
     asked.sort_by_key(|(group, _)| {
         group
             .upgrade()
             .map_or(2, |g| u8::from(g.flags & CLASS_PRE_CONTENT == 0))
     });
+    answer_each(c, asked).1
+}
+
+/// [`await_answers`] of events in the order they were asked, each event
+/// of its own call to fsnotify: how many were let through before the end,
+/// and how it ended.
+fn answer_each(c: &mut Context<'_>, asked: Vec<Asked>) -> (usize, Result<bool, Errno>) {
+    if asked.is_empty() {
+        return (0, Ok(false));
+    }
+    let mut through = 0;
     for (group, event) in asked {
-        let Some(id) = group.upgrade().and_then(|g| g.ask(event)) else {
-            continue;
+        if let Err(e) = answer_one(c, &group, event) {
+            return (through, Err(e));
+        }
+        through += 1;
+    }
+    (through, Ok(true))
+}
+
+/// Queues one permission event of `group` and waits for its answer.
+fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<(), Errno> {
+    let Some(id) = group.upgrade().and_then(|g| g.ask(event)) else {
+        return Ok(());
+    };
+    loop {
+        let ticket = c.files.readiness.token.value();
+        let Some(strong) = group.upgrade() else {
+            return Ok(());
         };
-        loop {
-            let ticket = c.files.readiness.token.value();
-            let Some(strong) = group.upgrade() else {
-                break;
-            };
-            if let Some(answer) = strong.answer(id) {
-                answer?;
-                break;
+        if let Some(answer) = strong.answer(id) {
+            return answer;
+        }
+        let _ = c.inbox.drain(c.process);
+        c.group.drain_process(c.process);
+        if fatal(c) {
+            strong.cancel(id);
+            return Err(Errno(4));
+        }
+        drop(strong);
+        let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+        let end = Some((
+            paludarium_host::ClockId::Monotonic,
+            now.saturating_add(10_000_000),
+        ));
+        match c
+            .host
+            .wait_on(&c.files.readiness.token, ticket, end, c.cancellation)
+        {
+            Err(e) if e == Errno::ENOSYS => {
+                c.host.wait_until(
+                    paludarium_host::ClockId::Monotonic,
+                    now.saturating_add(1_000_000),
+                    c.cancellation,
+                )?;
             }
-            let _ = c.inbox.drain(c.process);
-            c.group.drain_process(c.process);
-            if fatal(c) {
-                strong.cancel(id);
-                return Err(Errno(4));
-            }
-            drop(strong);
-            let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
-            let end = Some((
-                paludarium_host::ClockId::Monotonic,
-                now.saturating_add(10_000_000),
-            ));
-            match c
-                .host
-                .wait_on(&c.files.readiness.token, ticket, end, c.cancellation)
-            {
-                Err(e) if e == Errno::ENOSYS => {
-                    c.host.wait_until(
-                        paludarium_host::ClockId::Monotonic,
-                        now.saturating_add(1_000_000),
-                        c.cancellation,
-                    )?;
-                }
-                result => {
-                    result?;
-                }
+            result => {
+                result?;
             }
         }
     }
-    Ok(true)
 }
 
 /// Whether the task is to die (`fatal_signal_pending`): its group exits, or
@@ -817,11 +874,51 @@ impl Registry {
         self.marks.load(Ordering::SeqCst) != 0
     }
     fn groups(&self) -> Vec<Arc<Group>> {
+        self.purge();
+        self.live_groups()
+    }
+    fn live_groups(&self) -> Vec<Arc<Group>> {
         lock(&self.groups)
             .iter()
             .filter_map(Weak::upgrade)
             .map(Grouped::group)
             .collect()
+    }
+    /// The mount numbered `id` was freed, as Linux's
+    /// `fsnotify_vfsmount_delete` at its last `mntput`: the marks on it go,
+    /// so a mount that takes the number next is not marked. They go when
+    /// the marks are next looked at ([`Self::purge`]), as this runs where
+    /// the mount went, which may hold a group's queue.
+    pub(crate) fn unmounted(&self, id: u64) {
+        if self.active() {
+            lock(&self.released).push(id);
+        }
+    }
+    /// Takes off the marks of the mounts freed since the last look, as
+    /// `fsnotify_destroy_marks` does, giving them back to their users.
+    fn purge(&self) {
+        let released = std::mem::take(&mut *lock(&self.released));
+        if released.is_empty() {
+            return;
+        }
+        for group in self.live_groups() {
+            let removed = {
+                let mut queue = group.queue();
+                let before = queue.marks.len();
+                queue.marks.retain(
+                    |m| !matches!(m.target, Target::Mount(id, _) if released.contains(&id)),
+                );
+                (before - queue.marks.len()) as u64
+            };
+            if removed > 0 {
+                self.release(
+                    group.owner,
+                    removed,
+                    group.flags & UNLIMITED_MARKS == 0,
+                    false,
+                );
+            }
+        }
     }
     fn add_group(&self, user: u32) -> Result<(), Errno> {
         let mut users = lock(&self.users);
@@ -1018,6 +1115,15 @@ impl Registry {
         };
         let mount = data.mount();
         let device = object.key.0;
+        // The groups by priority, as `fsnotify` takes their marks: the
+        // pre-content ones, then the content ones, then the others, so a
+        // call's permission events are asked in that order.
+        let mut groups: Vec<&Arc<Group>> = groups.iter().collect();
+        groups.sort_by_key(|g| match g.flags & (CLASS_PRE_CONTENT | CLASS_CONTENT) {
+            CLASS_PRE_CONTENT => 0,
+            CLASS_CONTENT => 1,
+            _ => 2,
+        });
         for group in groups {
             Group::handle(
                 group,
@@ -1438,6 +1544,7 @@ impl Group {
     /// has, as Linux's `fanotify_show_fdinfo`: the flags, then a line for
     /// each mark, the newest first; a mount's by its ID.
     pub(crate) fn fdinfo(&self) -> Vec<u8> {
+        self.fan().purge();
         let mut out = format!(
             "fanotify flags:{:x} event-flags:{:x}\n",
             self.flags & INIT_FLAGS,
@@ -1644,6 +1751,9 @@ fn mark(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     let file = group_file(c, a[0])?;
     let group = of(&file).ok_or(Errno::EINVAL)?;
+    // A freed mount's marks go before any is added, so a mark on a mount
+    // that took its number stays.
+    group.fan().purge();
     if group.flags & REPORT_MNT != 0 {
         if mask & !MOUNT_EVENTS != 0 || mark_type != MARK_MNTNS {
             return Err(Errno::EINVAL);

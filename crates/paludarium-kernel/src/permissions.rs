@@ -403,6 +403,18 @@ pub(crate) fn open(
     let follow = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
     let found = search(files, creds, dir, raw, follow)?;
     open_writable(files, dir, raw, flags, follow)?;
+    // A device on a mount without devices (`may_open_dev`), whoever opens
+    // it, before its permission.
+    if flags & O_PATH == 0
+        && let Ok(path) = files.path(dir, raw.to_vec())
+        && files
+            .fs()
+            .metadata(&path, follow)
+            .is_ok_and(|stat| matches!(stat.mode & TYPE, 0o020000 | 0o060000))
+        && crate::files::mount_says(files, &path, crate::files::ST_NODEV)
+    {
+        return Err(Errno::EACCES);
+    }
     match (found.parent, found.file) {
         (Some(parent), None) if flags & O_CREAT != 0 => {
             may_create(creds, &parent)?;
@@ -749,9 +761,10 @@ pub(crate) fn truncate(
 
 /// exec's checks (`do_open_execat`, `would_dump`) of the program `raw`
 /// names from the working directory, at `path`: a file it finds must be a
-/// regular file the thread may execute (EACCES). Returns the file, whose
-/// set-user-ID and set-group-ID bits exec takes, and whether the thread may
-/// also read it; a program it may not read runs undumpable.
+/// regular file, not on a `noexec` mount, the thread may execute
+/// (EACCES). Returns the file, whose set-user-ID and set-group-ID bits exec
+/// takes, and whether the thread may also read it; a program it may not
+/// read runs undumpable.
 pub(crate) fn exec(
     files: &Files,
     creds: &Credentials,
@@ -770,6 +783,11 @@ pub(crate) fn exec(
         Err(_) => return Ok((None, true)),
     };
     if stat.mode & TYPE != REGULAR {
+        return Err(Errno::EACCES);
+    }
+    // Nor does one on a mount that runs nothing (`may_open`'s
+    // `path_noexec`), before its permission.
+    if crate::files::mount_says(files, path, crate::files::ST_NOEXEC) {
         return Err(Errno::EACCES);
     }
     permission(creds, &stat, MAY_EXEC)?;

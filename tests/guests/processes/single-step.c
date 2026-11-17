@@ -6,6 +6,7 @@
  * an address is printed only as its offset into its sequence. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stddef.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -66,6 +67,20 @@ __asm__(".text\n"
         "  popfq\n"
         "seq_signal_end:\n"
         "  ret\n"
+        /* rep stosb of 3 bytes at rdi with TF set: a trap after each
+         * iteration. */
+        ".globl seq_rep, seq_rep_end\n"
+        "seq_rep:\n"
+        "  pushfq\n"
+        "  orq $0x100, (%rsp)\n"
+        "  popfq\n"
+        "  movl $3, %ecx\n"
+        "  rep stosb\n"
+        "  pushfq\n"
+        "  andq $~0x100, (%rsp)\n"
+        "  popfq\n"
+        "seq_rep_end:\n"
+        "  ret\n"
         /* int3 alone. */
         ".globl seq_int3, seq_int3_end\n"
         "seq_int3:\n"
@@ -105,10 +120,103 @@ __asm__(".text\n"
         "  andq $~0x100, (%rsp)\n"
         "  popfq\n"
         "seq_frame_end:\n"
+        "  ret\n"
+        /* kill(rdi, SIGSTOP), then an instruction an execute breakpoint
+         * watches, a write and a read of `watched`. */
+        ".globl seq_hw, seq_hw_exec, seq_hw_end\n"
+        "seq_hw:\n"
+        "  movl $19, %esi\n"
+        "  movl $62, %eax\n"
+        "  syscall\n"
+        "  nop\n"
+        "seq_hw_exec:\n"
+        "  movl $1, %ecx\n"
+        "  movq %rcx, watched(%rip)\n"
+        "  movq watched(%rip), %rdx\n"
+        "seq_hw_end:\n"
+        "  ret\n"
+        /* kill(rdi, SIGSTOP), then an fxsave, an xlat and a leave whose
+         * memory breakpoints watch; the callee-saved registers are kept. */
+        ".globl seq_hw2, seq_hw2_end\n"
+        "seq_hw2:\n"
+        "  pushq %rbx\n"
+        "  pushq %rbp\n"
+        "  pushq %r12\n"
+        "  movl $19, %esi\n"
+        "  movl $62, %eax\n"
+        "  syscall\n"
+        "  leaq fxarea(%rip), %rax\n"
+        "  fxsave (%rax)\n"
+        "  leaq table(%rip), %rbx\n"
+        "  movl $8, %eax\n"
+        "  xlat\n"
+        "  movq %rsp, %r12\n"
+        "  leaq leaveslot(%rip), %rbp\n"
+        "  leave\n"
+        "  movq %r12, %rsp\n"
+        "seq_hw2_end:\n"
+        "  popq %r12\n"
+        "  popq %rbp\n"
+        "  popq %rbx\n"
+        "  ret\n"
+        ".data\n"
+        ".balign 8\n"
+        ".globl watched\n"
+        "watched: .quad 0\n"
+        ".balign 16\n"
+        ".globl fxarea, table, leaveslot\n"
+        "fxarea: .zero 512\n"
+        "table: .zero 16\n"
+        "leaveslot: .quad 0\n"
+        ".balign 16\n"
+        ".globl x87area, mmarea, mmmask\n"
+        "x87area: .zero 128\n"
+        "mmarea: .zero 16\n"
+        "mmmask: .byte 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0\n"
+        ".text\n"
+        /* One instruction each, on the areas above, for the probes. */
+        ".globl probe_fxsave, probe_fxrstor, probe_fnsave, probe_frstor\n"
+        ".globl probe_fnstenv, probe_fldenv, probe_maskmovdqu\n"
+        "probe_fxsave:\n"
+        "  leaq fxarea(%rip), %rax\n"
+        "  fxsave (%rax)\n"
+        "  ret\n"
+        "probe_fxrstor:\n"
+        "  leaq fxarea(%rip), %rax\n"
+        "  fxrstor (%rax)\n"
+        "  ret\n"
+        "probe_fnsave:\n"
+        "  leaq x87area(%rip), %rax\n"
+        "  fnsave (%rax)\n"
+        "  ret\n"
+        "probe_frstor:\n"
+        "  leaq x87area(%rip), %rax\n"
+        "  frstor (%rax)\n"
+        "  ret\n"
+        "probe_fnstenv:\n"
+        "  leaq x87area(%rip), %rax\n"
+        "  fnstenv (%rax)\n"
+        "  ret\n"
+        "probe_fldenv:\n"
+        "  leaq x87area(%rip), %rax\n"
+        "  fldenv (%rax)\n"
+        "  ret\n"
+        "probe_maskmovdqu:\n"
+        "  pushq %rdi\n"
+        "  leaq mmarea(%rip), %rdi\n"
+        "  pcmpeqb %xmm0, %xmm0\n"
+        "  movdqa mmmask(%rip), %xmm1\n"
+        "  maskmovdqu %xmm1, %xmm0\n"
+        "  popq %rdi\n"
         "  ret\n");
 
+void seq_rep(char *);
+extern char seq_rep_end[];
 void seq_flag(void), seq_syscall(void), seq_signal(int), seq_int3(void), seq_trace(int),
-    seq_frame(int);
+    seq_frame(int), seq_hw(int);
+extern char seq_hw_exec[], seq_hw_end[], seq_hw2_end[], fxarea[], table[], leaveslot[];
+void seq_hw2(int);
+extern uint64_t watched;
 extern char seq_flag_end[], seq_syscall_end[], seq_signal_end[], seq_int3_end[], seq_trace_from[],
     seq_trace_end[], seq_frame_end[];
 
@@ -188,6 +296,14 @@ static int signal_case(void) {
     seq_signal(getpid());
     report("signal", (void *)seq_signal, seq_signal_end);
     printf("usr1-handler-tf=%d\n", usr1_tf);
+    return 0;
+}
+
+static int rep_case(void) {
+    static char buffer[8];
+    install();
+    seq_rep(buffer);
+    report("rep", (void *)seq_rep, seq_rep_end);
     return 0;
 }
 
@@ -323,6 +439,197 @@ static int forced_frame_case(void) {
     return 0;
 }
 
+/* --- hardware breakpoints ------------------------------------------------ */
+
+#define DEBUGREG(n) (offsetof(struct user, u_debugreg) + (n) * 8)
+
+static long peek_debug(pid_t child, int n) {
+    unsigned long word = 0;
+    long r = pt(PTRACE_PEEKUSER, child, DEBUGREG(n), (unsigned long)&word);
+    return r ? r : (long)word;
+}
+
+/* One stop of the breakpoint case: why, where in seq_hw, and DR6. */
+static void hw_stop(pid_t child, const char *name) {
+    int status = wait_status(child);
+    if (!WIFSTOPPED(status)) {
+        printf("%s: exited=%d\n", name, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return;
+    }
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    uint64_t start = (uint64_t)(uintptr_t)seq_hw;
+    printf("%s: signal=%d code=%d at=%lld addr-is-rip=%d rf=%d dr6=%#lx\n", name, WSTOPSIG(status),
+           info.si_code, (long long)(regs.rip - start),
+           (uint64_t)(uintptr_t)info.si_addr == regs.rip, (int)(regs.eflags >> 16 & 1),
+           (unsigned long)peek_debug(child, 6));
+}
+
+static int hw_breakpoint_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        seq_hw(getpid());
+        _exit(watched == 1 ? 0 : 1);
+    }
+    wait_status(child);
+    printf("dr0=%ld dr6=%#lx dr7=%ld\n", peek_debug(child, 0), (unsigned long)peek_debug(child, 6),
+           peek_debug(child, 7));
+    /* One step first: DR6 then has the step. */
+    pt(PTRACE_SINGLESTEP, child, 0, 0);
+    hw_stop(child, "step");
+    unsigned long exec = (unsigned long)seq_hw_exec, data = (unsigned long)&watched;
+    printf("poke-dr0=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(0), exec));
+    printf("poke-dr1=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(1), data));
+    printf("poke-dr4=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(4), 0));
+    printf("poke-kernel=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(2), 1UL << 63));
+    /* DR0 executes; DR1 is an 8-byte write; an I/O one and a long
+     * execute one are refused, and leave DR7 as it was. */
+    unsigned long dr7 = 1 | 1 << 2 | 0x9UL << 20;
+    printf("poke-dr7-io=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), 1 | 0x2UL << 16));
+    printf("poke-dr7-long=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), 1 | 0x4UL << 16));
+    printf("poke-dr7=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), dr7));
+    printf("dr7=%#lx misaligned=%ld\n", (unsigned long)peek_debug(child, 7),
+           pt(PTRACE_POKEUSER, child, DEBUGREG(1), data + 4));
+    pt(PTRACE_CONT, child, 0, 0);
+    hw_stop(child, "execute");
+    pt(PTRACE_CONT, child, 0, 0);
+    hw_stop(child, "write");
+    /* DR1 now reads or writes, DR0 off: the read hits. */
+    pt(PTRACE_POKEUSER, child, DEBUGREG(7), 1 << 2 | 0xbUL << 20);
+    pt(PTRACE_CONT, child, 0, 0);
+    hw_stop(child, "read");
+    pt(PTRACE_POKEUSER, child, DEBUGREG(7), 0);
+    pt(PTRACE_CONT, child, 0, 0);
+    hw_stop(child, "end");
+    return 0;
+}
+
+/* Data breakpoints on an fxsave's area, an xlat's table entry and the
+ * word a leave pops. */
+static void hw2_stop(pid_t child, const char *name) {
+    int status = wait_status(child);
+    if (!WIFSTOPPED(status)) {
+        printf("%s: exited=%d\n", name, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return;
+    }
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+    struct user_regs_struct regs;
+    pt(PTRACE_GETREGS, child, 0, (unsigned long)&regs);
+    printf("%s: signal=%d code=%d at=%lld dr6=%#lx\n", name, WSTOPSIG(status), info.si_code,
+           (long long)(regs.rip - (uint64_t)(uintptr_t)seq_hw2), (unsigned long)peek_debug(child, 6));
+}
+
+static int hw_implicit_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        seq_hw2(getpid());
+        _exit(0);
+    }
+    wait_status(child);
+    /* DR0: XMM0 in the fxsave area, which it writes; DR3: its last bytes,
+     * which it leaves to software and never writes. */
+    pt(PTRACE_POKEUSER, child, DEBUGREG(0), (unsigned long)(fxarea + 160));
+    pt(PTRACE_POKEUSER, child, DEBUGREG(1), (unsigned long)(table + 8));
+    pt(PTRACE_POKEUSER, child, DEBUGREG(2), (unsigned long)leaveslot);
+    pt(PTRACE_POKEUSER, child, DEBUGREG(3), (unsigned long)(fxarea + 504));
+    /* DR0 and DR3: 8-byte writes; DR1: a 1-byte read or write; DR2: an
+     * 8-byte read or write. */
+    unsigned long dr7 = 1 | 1 << 2 | 1 << 4 | 1 << 6 | 0x9UL << 16 | 0x3UL << 20 | 0xbUL << 24 |
+                        0x9UL << 28;
+    printf("dr7=%ld\n", pt(PTRACE_POKEUSER, child, DEBUGREG(7), dr7));
+    pt(PTRACE_CONT, child, 0, 0);
+    hw2_stop(child, "fxsave");
+    pt(PTRACE_CONT, child, 0, 0);
+    hw2_stop(child, "xlat");
+    pt(PTRACE_CONT, child, 0, 0);
+    hw2_stop(child, "leave");
+    pt(PTRACE_POKEUSER, child, DEBUGREG(7), 0);
+    pt(PTRACE_CONT, child, 0, 0);
+    hw2_stop(child, "end");
+    return 0;
+}
+
+/* --- what an instruction's memory breakpoint sees ------------------------ */
+
+extern char x87area[], mmarea[];
+void probe_fxsave(void), probe_fxrstor(void), probe_fnsave(void), probe_frstor(void),
+    probe_fnstenv(void), probe_fldenv(void), probe_maskmovdqu(void);
+
+/* Runs `run` once in a traced child, after `before` (untraced, to give a
+ * restore a valid area), with one breakpoint on `length` bytes at
+ * `address` breaking on `rw` (1 a write, 3 a read or write), and prints
+ * whether it hit. */
+static void probe(const char *name, void (*before)(void), void (*run)(void), void *address,
+                  int length, int rw) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (before) before();
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGSTOP);
+        run();
+        _exit(0);
+    }
+    wait_status(child);
+    int len_bits = length == 1 ? 0 : length == 2 ? 1 : length == 8 ? 2 : 3;
+    pt(PTRACE_POKEUSER, child, DEBUGREG(0), (unsigned long)address);
+    long set = pt(PTRACE_POKEUSER, child, DEBUGREG(7),
+                  1 | (unsigned long)(len_bits << 2 | rw) << 16);
+    pt(PTRACE_CONT, child, 0, 0);
+    int status = wait_status(child);
+    if (WIFSTOPPED(status)) {
+        siginfo_t info;
+        memset(&info, 0, sizeof info);
+        pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+        printf("%s: set=%ld hit signal=%d code=%d\n", name, set, WSTOPSIG(status), info.si_code);
+        pt(PTRACE_POKEUSER, child, DEBUGREG(7), 0);
+        pt(PTRACE_CONT, child, 0, 0);
+        status = wait_status(child);
+    } else {
+        printf("%s: set=%ld no hit\n", name, set);
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) printf("%s: status=%#x\n", name, status);
+}
+
+static int probe_fxsave_case(void) {
+    probe("xmm0", NULL, probe_fxsave, fxarea + 160, 8, 1);
+    probe("reserved-416", NULL, probe_fxsave, fxarea + 416, 8, 1);
+    probe("reserved-456", NULL, probe_fxsave, fxarea + 456, 8, 1);
+    return 0;
+}
+
+static int probe_fxrstor_case(void) {
+    probe("xmm0", probe_fxsave, probe_fxrstor, fxarea + 160, 8, 3);
+    probe("reserved-416", probe_fxsave, probe_fxrstor, fxarea + 416, 8, 3);
+    return 0;
+}
+
+static int probe_x87_case(void) {
+    probe("fnsave-last", NULL, probe_fnsave, x87area + 104, 4, 1);
+    probe("fnsave-past", NULL, probe_fnsave, x87area + 108, 4, 1);
+    probe("frstor-last", probe_fnsave, probe_frstor, x87area + 104, 4, 3);
+    probe("frstor-past", probe_fnsave, probe_frstor, x87area + 108, 4, 3);
+    probe("fnstenv-last", NULL, probe_fnstenv, x87area + 24, 4, 1);
+    probe("fnstenv-past", NULL, probe_fnstenv, x87area + 28, 4, 1);
+    probe("fldenv-last", probe_fnstenv, probe_fldenv, x87area + 24, 4, 3);
+    probe("fldenv-past", probe_fnstenv, probe_fldenv, x87area + 28, 4, 3);
+    return 0;
+}
+
+static int probe_maskmovdqu_case(void) {
+    probe("masked", NULL, probe_maskmovdqu, mmarea + 3, 1, 1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 99;
     const char *mode = argv[1];
@@ -332,8 +639,15 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "trap-flag-syscall")) code = syscall_case();
     if (!strcmp(mode, "trap-flag-signal")) code = signal_case();
     if (!strcmp(mode, "int3")) code = int3_case();
+    if (!strcmp(mode, "trap-flag-rep")) code = rep_case();
     if (!strcmp(mode, "ptrace-singlestep")) code = ptrace_case();
     if (!strcmp(mode, "ptrace-forced-frame")) code = forced_frame_case();
+    if (!strcmp(mode, "ptrace-hw-breakpoint")) code = hw_breakpoint_case();
+    if (!strcmp(mode, "ptrace-hw-implicit")) code = hw_implicit_case();
+    if (!strcmp(mode, "hw-probe-fxsave")) code = probe_fxsave_case();
+    if (!strcmp(mode, "hw-probe-fxrstor")) code = probe_fxrstor_case();
+    if (!strcmp(mode, "hw-probe-x87")) code = probe_x87_case();
+    if (!strcmp(mode, "hw-probe-maskmovdqu")) code = probe_maskmovdqu_case();
     fflush(stdout);
     return code;
 }

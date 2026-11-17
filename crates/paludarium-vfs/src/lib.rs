@@ -143,6 +143,19 @@ pub struct MountPoint {
     pub common_options: String,
     /// The file system's own options (`show_options`): `,size=1024k`.
     pub super_options: String,
+    /// What `statmount` shows besides: the mount's ID unique until the
+    /// machine ends (`mnt_id_unique`, from `1 << 31` on) and its parent's,
+    /// its own if it has none; its flags ([`mount_flags`]); its peer group,
+    /// the peer group of its master, the nearest one with a member in the
+    /// namespace (`get_dominating_id`, 0 for none), and whether it is
+    /// unbindable. All 0 for a filesystem that keeps no table.
+    pub unique: u64,
+    pub parent_unique: u64,
+    pub flags: u32,
+    pub group: u64,
+    pub master: u64,
+    pub propagate_from: u64,
+    pub unbindable: bool,
 }
 impl MountPoint {
     /// The `index`th mount that exists from start-up, at `path`: its ID is
@@ -164,6 +177,13 @@ impl MountPoint {
             tags: String::new(),
             common_options: String::new(),
             super_options: String::new(),
+            unique: 0,
+            parent_unique: 0,
+            flags: 0,
+            group: 0,
+            master: 0,
+            propagate_from: 0,
+            unbindable: false,
         }
     }
 }
@@ -628,8 +648,8 @@ pub use mount::MountedFs;
 
 mod namespace;
 pub use namespace::{
-    InUse, MountPin, MountTable, NamespacedFs, NewTmpfs, Propagation, ReleaseHook, Settings,
-    Target, UnmountHook, keeping_expiry, mount_flags,
+    FIRST_NAMESPACE_ID, InUse, MountPin, MountTable, NamespacedFs, NewTmpfs, Propagation, Reach,
+    ReleaseHook, Settings, Target, UNIQUE_OFFSET, UnmountHook, keeping_expiry, mount_flags,
 };
 
 mod open_file;

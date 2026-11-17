@@ -166,6 +166,20 @@ impl Space {
         }
     }
 }
+/// Tells the machine's fanotify of each mount of `table`, and of every
+/// table copied from it, that is freed ([`crate::fanotify::Registry::unmounted`]),
+/// as Linux's `cleanup_mnt` calls `fsnotify_vfsmount_delete`.
+fn released_to_fanotify(
+    table: &paludarium_vfs::MountTable,
+    caches: &Arc<crate::page_cache::PageCaches>,
+) {
+    let fan = Arc::downgrade(&caches.notify.fan);
+    table.set_release_hook(Some(Arc::new(move |id| {
+        if let Some(fan) = fan.upgrade() {
+            fan.unmounted(id);
+        }
+    })));
+}
 impl Default for Files {
     fn default() -> Self {
         let fs = MemFs::new();
@@ -173,6 +187,7 @@ impl Default for Files {
         let caches = Arc::default();
         let lower: Arc<dyn FileSystem> = Arc::new(fs);
         let first_mounts = paludarium_vfs::MountTable::new(&*lower);
+        released_to_fanotify(&first_mounts, &caches);
         Self {
             readiness: Arc::default(),
             terminal_size: None,
@@ -444,6 +459,7 @@ impl Files {
     /// Its mounts are the first mount namespace's.
     pub(crate) fn set_file_system(&mut self, fs: Arc<dyn FileSystem>) {
         self.first_mounts = paludarium_vfs::MountTable::new(&*fs);
+        released_to_fanotify(&self.first_mounts, &self.caches);
         *self.space.lock().unwrap_or_else(PoisonError::into_inner) =
             Space::new(fs, Arc::clone(&self.first_mounts), &self.caches);
         *self.root.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -479,6 +495,21 @@ impl Files {
     /// The mount table the root and working directory are in.
     pub(crate) fn mount_table(&self) -> Arc<paludarium_vfs::MountTable> {
         Arc::clone(self.namespaced().table())
+    }
+    /// The machine's filesystem through another namespace's `table`, from
+    /// the machine's root, as `statmount` reads it.
+    pub(crate) fn namespaced_for(
+        &self,
+        table: Arc<paludarium_vfs::MountTable>,
+    ) -> Arc<paludarium_vfs::NamespacedFs> {
+        let lower = Arc::clone(
+            &self
+                .space
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .lower,
+        );
+        Arc::new(paludarium_vfs::NamespacedFs::new(lower, table))
     }
     /// The first mount namespace's table.
     pub(crate) fn first_mounts(&self) -> &Arc<paludarium_vfs::MountTable> {
@@ -1194,6 +1225,18 @@ pub(crate) fn mount_target(
 ) -> Result<Option<Vec<u8>>, Errno> {
     mount_path(c, path(c, ptr)?, follow)
 }
+/// `statfs`'s `ST_NOSUID`, `ST_NODEV` and `ST_NOEXEC`: the mount flags
+/// [`mount_says`] asks of.
+pub(crate) const ST_NOSUID: u64 = 0x2;
+pub(crate) const ST_NODEV: u64 = 0x4;
+pub(crate) const ST_NOEXEC: u64 = 0x8;
+/// Whether the mount of the file at `path`, its links followed, has the
+/// `statfs` flag `flag` (`MNT_NOEXEC` for `path_noexec`, `MNT_NODEV` for
+/// `may_open_dev`, `MNT_NOSUID` for `mnt_may_suid`). `/proc` and `/dev`,
+/// which the kernel generates, are Linux's own mounts, which have none.
+pub(crate) fn mount_says(files: &Files, path: &[u8], flag: u64) -> bool {
+    !path.is_empty() && !generated(path) && files.fs().statfs_flags(path) & flag != 0
+}
 /// [`mount_target`] of a directory, its links followed (`LOOKUP_FOLLOW |
 /// LOOKUP_DIRECTORY`, `ENOTDIR` for another file).
 pub(crate) fn mount_directory(c: &Context<'_>, ptr: u64) -> Result<Option<Vec<u8>>, Errno> {
@@ -1398,6 +1441,10 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
         };
         (stat, p, follow)
     };
+    // Executing a regular file on a `noexec` mount (`path_noexec`).
+    if mode & 1 != 0 && stat.mode & 0o170000 == 0o100000 && mount_says(c.files, &at, ST_NOEXEC) {
+        return Err(Errno::EACCES);
+    }
     crate::permissions::permission(&creds, &stat, mode as u32)?;
     // "SuS v2 requires we report a read only fs too": writing a file that
     // is not special.
@@ -1954,9 +2001,9 @@ fn directory_entries(
     let entries = match crate::proc::own_entry(&d.path, c.process.pid) {
         _ if tasks::is_root(&d.path) => tasks::root_entries(c),
         _ if let Some(crate::sysctl::Entry::Directory(directory)) =
-            crate::sysctl::entry(&d.path) =>
+            crate::sysctl::entry(c, &d.path) =>
         {
-            crate::sysctl::entries(directory)
+            crate::sysctl::entries(c, directory)
         }
         _ if crate::proc::is_sysvipc(&d.path) => crate::proc::sysvipc_entries(),
         _ if let Some(path) = task => tasks::entries(&tasks::find(c, &path)?, path.entry),
@@ -2153,6 +2200,7 @@ fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file.as_any().is_some_and(|file| {
         file.is::<crate::proc::MapsFile>()
             || file.is::<crate::proc::PagemapFile>()
+            || crate::sysctl::is_file(file)
             || file
                 .downcast_ref::<crate::proc::GeneratedFile>()
                 .is_some_and(crate::proc::GeneratedFile::is_entry)
@@ -2215,13 +2263,22 @@ fn read_at(file: &Arc<dyn FileHandle>, offset: u64, b: &mut [u8]) -> Result<usiz
         result => result,
     }
 }
-/// A positioned write, falling back like [`read_at`].
-fn write_at(file: &Arc<dyn FileHandle>, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+/// A positioned write by `writer`, falling back like [`read_at`]; a sysctl
+/// checks its writer again there ([`crate::sysctl::write_as`]), and with
+/// none (`copy_file_range`) only as it was opened.
+pub(crate) fn write_at(
+    file: &Arc<dyn FileHandle>,
+    offset: u64,
+    b: &[u8],
+    writer: Option<&crate::credentials::Credentials>,
+) -> Result<usize, Errno> {
     match file.write_at(offset, b) {
         Err(e) if e == Errno::ENODEV => {
             let position = file.seek(0, 1)?;
             file.seek(offset as i64, 0)?;
-            let result = file.write(b);
+            let result = writer
+                .and_then(|writer| crate::sysctl::write_as(file, b, writer))
+                .unwrap_or_else(|| file.write(b));
             file.seek(position as i64, 0)?;
             result
         }
@@ -2280,13 +2337,18 @@ fn size_limited_by(
 /// writes as [`write_at`] does if it has no position to append at (a
 /// device); a regular file of such a kind gives `EOPNOTSUPP` rather than
 /// append.
-fn write_at_unappended(file: &Arc<dyn FileHandle>, offset: u64, b: &[u8]) -> Result<usize, Errno> {
+fn write_at_unappended(
+    file: &Arc<dyn FileHandle>,
+    offset: u64,
+    b: &[u8],
+    writer: Option<&crate::credentials::Credentials>,
+) -> Result<usize, Errno> {
     match file.write_at_unappended(offset, b) {
         Err(e) if e == Errno::ENODEV => {
             if file.stat()?.mode & S_IFMT == S_IFREG {
                 return Err(Errno::EOPNOTSUPP);
             }
-            write_at(file, offset, b)
+            write_at(file, offset, b, writer)
         }
         result => result,
     }
@@ -2345,7 +2407,7 @@ fn copy_bytes(
     while done < count {
         let want = usize::try_from(count - done).map_or(piece.len(), |n| n.min(piece.len()));
         let copied = read_at(input, from + done, &mut piece[..want])
-            .and_then(|read| Ok((read, write_at(output, to + done, &piece[..read])?)));
+            .and_then(|read| Ok((read, write_at(output, to + done, &piece[..read], None)?)));
         let (read, written) = match copied {
             Ok(counts) => counts,
             Err(_) if done > 0 => break,
@@ -3057,10 +3119,10 @@ fn aio_write(
     let start = appending(file, flags)?.unwrap_or(offset);
     let written = if unappended(file, flags) {
         let len = size_limited_from(c, file, start, bytes.len())?;
-        write_at_unappended(file, start, &bytes[..len])?
+        write_at_unappended(file, start, &bytes[..len], Some(&c.process.credentials))?
     } else {
         let len = size_limited(c, file, Some(start), bytes.len())?;
-        write_at(file, start, &bytes[..len])?
+        write_at(file, start, &bytes[..len], Some(&c.process.credentials))?
     };
     if written > 0 {
         crate::permissions::remove_set_ids(&c.process.credentials, &**file);
@@ -3227,7 +3289,8 @@ fn writev(c: &mut Context<'_>, a: [u64; 6], flags: u32) -> Result<u64, Errno> {
         if unappended(&file, flags) && file.stat()?.mode & S_IFMT == S_IFREG {
             let position = file.seek(0, 1)?;
             let len = size_limited_from(c, &file, position, bytes.len())?;
-            let written = write_at_unappended(&file, position, &bytes[..len])?;
+            let written =
+                write_at_unappended(&file, position, &bytes[..len], Some(&c.process.credentials))?;
             file.seek((position + written as u64) as i64, 0)?;
             if written > 0 {
                 crate::permissions::remove_set_ids(&c.process.credentials, &*file);
@@ -3299,9 +3362,9 @@ fn positioned_vector(
     }
     b.truncate(len);
     let written = if unappended(&file, flags) {
-        write_at_unappended(&file, offset, &b)?
+        write_at_unappended(&file, offset, &b, Some(&c.process.credentials))?
     } else {
-        write_at(&file, offset, &b)?
+        write_at(&file, offset, &b, Some(&c.process.credentials))?
     };
     if written > 0 {
         crate::permissions::remove_set_ids(&c.process.credentials, &*file);
@@ -3508,7 +3571,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // mountinfo does not show, as Linux's internal mounts are not shown.
     let id = mount_id(c, device, &at);
     let (bit, id) = if mask & STATX_MNT_ID_UNIQUE != 0 {
-        (STATX_MNT_ID_UNIQUE, 1 << 31 | id)
+        (STATX_MNT_ID_UNIQUE, unique_mount_id(c, id))
     } else {
         (STATX_MNT_ID, id)
     };
@@ -3645,7 +3708,7 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let fits = given >> 2 >= bytes.len() as u32 >> 2;
     let id = mount_id(c, device, &at);
     if flags & AT_HANDLE_MNT_ID_UNIQUE != 0 {
-        output(c, mount, &(1u64 << 31 | id).to_le_bytes())?;
+        output(c, mount, &unique_mount_id(c, id).to_le_bytes())?;
     } else {
         output(c, mount, &(id as u32).to_le_bytes())?;
     }
@@ -3919,6 +3982,18 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
 /// `kern_mount`s take theirs first, at boot.
 pub(crate) fn mount_id(c: &Context<'_>, device: u64, path: &[u8]) -> u64 {
     mount_id_in(&*c.files.fs(), device, path)
+}
+/// The unique ID (`mnt_id_unique`) of the mount numbered `id`, as
+/// `statmount` and `listmount` give it; for an internal file system's,
+/// which no table lists, one past [`paludarium_vfs::UNIQUE_OFFSET`] by its
+/// number.
+pub(crate) fn unique_mount_id(c: &Context<'_>, id: u64) -> u64 {
+    c.files
+        .fs()
+        .mounts()
+        .iter()
+        .find(|m| m.id == id && m.unique != 0)
+        .map_or(paludarium_vfs::UNIQUE_OFFSET | id, |m| m.unique)
 }
 /// [`mount_id`] in the file system `fs`.
 pub(crate) fn mount_id_in(fs: &dyn FileSystem, device: u64, path: &[u8]) -> u64 {
@@ -4355,7 +4430,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             c.mem
                 .read(GuestAddr(a[1]), &mut b)
                 .map_err(|_| Errno::EFAULT)?;
-            let written = write_at(&file, a[3], &b)?;
+            let written = write_at(&file, a[3], &b, Some(&c.process.credentials))?;
             if written > 0 {
                 crate::permissions::remove_set_ids(&c.process.credentials, &*file);
             }
@@ -5284,8 +5359,10 @@ fn write_io_with(
     nosignal: bool,
     dontwait: bool,
 ) -> Result<u64, Errno> {
-    // A netlink request names peers as the writer sees them.
-    let _resolved = crate::netlink::resolving(c, file, bytes);
+    // A netlink socket sends as the writer.
+    if let Some(result) = crate::netlink::write(c, file, bytes, nosignal, dontwait) {
+        return result;
+    }
     // A pseudo-terminal writes all, unless it does not block.
     if let Some(result) = crate::pty::write(c, file, bytes) {
         return result;
@@ -6620,7 +6697,7 @@ fn open_path(
                 })),
             })
         }
-    } else if let Some(entry) = crate::sysctl::entry(p) {
+    } else if let Some(entry) = crate::sysctl::entry(c, p) {
         crate::sysctl::open(c, entry, flags)?
     } else if crate::proc::below_system_entry(p) {
         return Err(Errno::ENOTDIR);
@@ -7682,7 +7759,7 @@ fn other_generated_stat(
             SMALL_BLOCK_SIZE,
         ));
     }
-    if let Some(entry) = crate::sysctl::entry(path) {
+    if let Some(entry) = crate::sysctl::entry(c, path) {
         return Some((
             crate::sysctl::stat(c, entry),
             device(c, path),

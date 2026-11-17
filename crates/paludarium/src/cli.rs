@@ -4,7 +4,7 @@
 //! paludarium [options] <program> [args...]
 //!   --env KEY=VALUE   add a guest environment variable (repeatable)
 //!   --no-jit          accepted; the JIT is off unless --jit asks for it
-//!   --jit[=N]         compile blocks run N times (100 by default) to host
+//!   --jit[=N]         compile blocks run N times (300 by default) to host
 //!                     code (experimental; Linux x86-64 hosts only)
 //!   --mount HOST:GUEST expose one explicit host directory (repeatable)
 //!   --report-enosys   list the unimplemented system calls the guest called

@@ -961,18 +961,23 @@ kernel.
   `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_POISON` and
   `UFFD_FEATURE_MOVE`, and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
-  memory and shared anonymous memory for missing pages
+  memory, shared anonymous memory and the shared or private mappings of a
+  memfd, which is shmem's (not System V shared memory, whose VMAs Linux
+  does not count as shmem's), for missing pages
   (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
   protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
   to the ioctls it reports), with Linux's checks in its order (the
   range, then each VMA: `EINVAL` for one that cannot be registered,
-  `EBUSY` for one another `userfaultfd` has); the modes replace a VMA's
+  `EPERM` for a shared one that may not write its file, `EBUSY` for one
+  another `userfaultfd` has); the modes replace a VMA's
   own unless it has them already. The ranges make VMAs of their own, as
   `/proc/<pid>/maps` shows them, with `um` and `uw` in `smaps`; a `fork`ed
   child and a mapping `mremap` moves do not keep it, and
   `UFFDIO_UNREGISTER` and closing the file take it away. An instruction
   that touches a page registered for missing pages that has none (in
-  shared memory, one no mapping of it has), or that writes to a
+  shmem, one its page cache does not have: no mapping of it brought the
+  page in and the file does not hold it, as written or allocated, and a
+  page past the file's end is SIGBUS first), or that writes to a
   write-protected page of a range registered for write protection, waits,
   and the file reads the fault as a `uffd_msg`, the oldest first: whether
   it was a write, `UFFD_PAGEFAULT_FLAG_WP` for a protected page, the page's
@@ -997,9 +1002,13 @@ kernel.
   `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
   does: `ENOENT` for a range that does not lie in one registered VMA,
   `EEXIST` for a page that has one, `EFAULT` for a source that cannot be
-  read, and `EAGAIN` once one stops short, with what was filled in the
+  read or a page past a shmem file's end, and `EAGAIN` once one stops short, with what was filled in the
   struct's last field; `UFFDIO_COPY_MODE_WP` fills write-protected pages,
-  in a range registered for write protection (`EINVAL`). `UFFDIO_POISON`
+  in a range registered for write protection (`EINVAL`). A fill of a
+  shared mapping of a shmem file is `EEXIST` where the file's page cache
+  has the page, and puts the page in the file, which `read` then sees; one
+  of a private mapping gives the mapping a page of its own and leaves the
+  file as it was. `UFFDIO_POISON`
   (`UFFD_FEATURE_POISON`) poisons the pages of a registered range the same
   way, its only mode `DONTWAKE`, and is `EEXIST` for a page this mapping
   has, or a guard: an access to a poisoned page raises SIGBUS with
@@ -3469,8 +3478,18 @@ kernel.
   (`BPF_F_NO_PREALLOC` is `ENOTSUPP`), and with `BPF_F_NO_COMMON_LRU` keeps
   lists for each CPU (`max_entries` rounded up to a multiple of the CPUs,
   as many for each; with `BPF_F_NUMA_NODE` `EINVAL`). It takes the memory
-  of its elements alone, with no spares. See [limitations](./limitations)
-  for what is not there.
+  of its elements alone, with no spares. `BPF_MAP_TYPE_QUEUE` and
+  `BPF_MAP_TYPE_STACK` hold values without keys (`key_size` 0, and a key
+  pointer that is not null is `EINVAL`), as Linux's `queue_stack_maps.c`:
+  `UPDATE_ELEM` pushes (a full one is `E2BIG`, unless `BPF_EXIST` makes room
+  by giving up the oldest; `BPF_NOEXIST` is `EINVAL`), `LOOKUP_ELEM` peeks
+  and `LOOKUP_AND_DELETE_ELEM` pops, a queue its oldest value and a stack
+  its newest (`ENOENT` for none); `DELETE_ELEM` and `GET_NEXT_KEY` are
+  `EINVAL` and the batch commands `ENOTSUPP`. They need `CAP_BPF`, take
+  only `BPF_F_NUMA_NODE` and the access flags, and refuse a value past
+  4 MiB or `max_entries` times the value size past 32 bits (`E2BIG`, as
+  Linux master). One takes a 312-byte header and `max_entries + 1` value
+  slots. See [limitations](./limitations) for what is not there.
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable
@@ -3662,7 +3681,10 @@ kernel.
   `copy_file_range`) waits for the answers the same way, after the checks
   of the descriptor, the buffer, the size and the position, as
   `rw_verify_area` asks it; `readv` and `preadv` of no bytes ask nothing,
-  as `vfs_readv`, where `read` and `pread64` of none ask too. `statfs`'s `f_fsid` is the file system ID the events give: the
+  as `vfs_readv`, where `read` and `pread64` of none ask too. An AIO read
+  (`IOCB_CMD_PREAD`, `IOCB_CMD_PREADV`) asks at `io_submit`, as `aio_read`
+  calls `rw_verify_area` there, for no bytes too: a denied one fails that
+  request as `io_submit` fails any (`EPERM` when it is the first). `statfs`'s `f_fsid` is the file system ID the events give: the
   device of the kernel's own file systems, /proc, devpts and mqueue, as
   `simple_statfs` gives it, and a number drawn for each other file system,
   as tmpfs draws a UUID.

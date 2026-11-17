@@ -1395,6 +1395,18 @@ pub trait PageSource: Send + Sync {
     fn secret(&self) -> bool {
         false
     }
+    /// Whether the file is shmem's, a tmpfs file or a memfd (Linux's
+    /// `vma_is_shmem`), whose mappings a `userfaultfd` registers.
+    fn shmem(&self) -> bool {
+        false
+    }
+    /// Whether the file holds the page at `offset`, written or allocated,
+    /// as shmem's page cache has a folio there (`filemap_get_entry`);
+    /// `true` when it cannot tell.
+    fn holds(&self, offset: u64) -> bool {
+        let _ = offset;
+        true
+    }
     /// The `vm_flags` ([`vm`]) of a VMA of this memory, from those of a
     /// mapping of an ordinary file: a file's `mmap` may add its own, and one
     /// on a file system that runs nothing (`SB_I_NOEXEC`, as Linux's pseudo
@@ -3994,25 +4006,47 @@ impl AddressSpaceData {
 
     /// Whether a `userfaultfd` may register `m` with `modes`, as Linux's
     /// `vma_can_userfault` allows anonymous memory and shmem: private
-    /// memory of no file, and shared memory of none (`MAP_SHARED |
-    /// MAP_ANONYMOUS`), which Linux keeps in shmem. Here neither takes
-    /// [`Userfault::MINOR`], which Linux allows shmem, nor shared memory
-    /// [`Userfault::WP`], whose markers on pages it has no entry for are
-    /// not kept.
+    /// memory of no file; shared memory of none (`MAP_SHARED |
+    /// MAP_ANONYMOUS`), which Linux keeps in shmem; and a shared or private
+    /// mapping of a shmem file ([`PageSource::shmem`]: a tmpfs file, a
+    /// memfd), not System V shared memory, whose VMAs are not shmem's.
+    /// Here none takes [`Userfault::MINOR`], which Linux allows shmem, and
+    /// only private anonymous memory [`Userfault::WP`], whose markers on
+    /// pages shmem has no entry for are not kept.
     fn userfault_capable(&self, m: &Mapping, modes: u8) -> bool {
         if modes & Userfault::MINOR != 0 {
             return false;
         }
+        let shmem = |source: &Arc<dyn PageSource>| source.shmem() && modes & Userfault::WP == 0;
         match self.shared_at(m.start.0) {
-            Some(shared) => shared.pages.source.is_none() && modes & Userfault::WP == 0,
-            None => {
-                self.backing_at(m.start.0).is_none()
-                    && matches!(
-                        m.kind,
-                        MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
-                    )
-            }
+            Some(shared) => match &shared.pages.source {
+                None => modes & Userfault::WP == 0,
+                Some(source) => shmem(source),
+            },
+            None => match self.backing_at(m.start.0) {
+                None => matches!(
+                    m.kind,
+                    MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
+                ),
+                Some(backing) => m.kind == MappingKind::File && shmem(&backing.source),
+            },
         }
+    }
+
+    /// Whether shmem's page cache has the page at `page` of a mapping of
+    /// its file (`filemap_get_entry` finds a folio): a mapping of it
+    /// brought the page in, or the file holds it ([`PageSource::holds`]).
+    fn shmem_holds(&self, page: u64) -> bool {
+        let cache = match self.shared_at(page) {
+            Some(shared) => Some((&shared.pages, shared.shift)),
+            None => self
+                .backing_at(page)
+                .and_then(|backing| Some((backing.cache.as_ref()?, backing.shift))),
+        };
+        cache.is_some_and(|(pages, shift)| pages.has(page.wrapping_add(shift)))
+            || self
+                .file_at(page)
+                .is_some_and(|(source, offset)| source.holds(offset))
     }
 
     /// The `userfaultfd` an access to `page` waits for: the page is of a
@@ -4028,9 +4062,9 @@ impl AddressSpaceData {
         if lookup(directory, page).is_some() || self.poisoned(page) {
             return None;
         }
-        if let Some(shared) = self.shared_at(page)
-            && shared.pages.has(page.wrapping_add(shared.shift))
-        {
+        // A file's page past its end is SIGBUS first, as
+        // `shmem_get_folio_gfp` gives `EINVAL` before it waits.
+        if self.past_file_end(page) || self.shmem_holds(page) {
             return None;
         }
         Some(registration.context)
@@ -4273,6 +4307,13 @@ impl AddressSpaceData {
     /// none). A private page of zeros is Linux's zero page; a shared one is a
     /// page of shmem. With `protect` (`UFFDIO_COPY_MODE_WP`) the page is
     /// write-protected.
+    ///
+    /// A page of a shmem file's mapping past the file's end is `EFAULT`
+    /// (`mfill_file_over_size`), ahead of `EEXIST`. A shared one that the
+    /// file's page cache has is `EEXIST` (`shmem_add_to_page_cache`), and
+    /// the new page is the file's, written back to it; a private one gets
+    /// a page of its own, as Linux fills a hole of a `MAP_PRIVATE` shmem
+    /// mapping with anonymous memory, whatever the file has there.
     pub fn userfault_fill(
         &mut self,
         start: u64,
@@ -4283,6 +4324,10 @@ impl AddressSpaceData {
     ) -> Result<(), Errno> {
         let mapping = self.userfault_target(start, end)?;
         let prot = self.mapping_at(page).map_or(mapping.prot, |m| m.prot);
+        if self.past_file_end(page) {
+            return Err(Errno::EFAULT);
+        }
+        let file = self.file_at(page).is_some();
         let mut directory = self.write_directory();
         let shared = self.shared_at(page);
         // A guard marker is an entry too, and so is a poison marker to a
@@ -4292,18 +4337,36 @@ impl AddressSpaceData {
             || self.guarded(page)
             || (poisoned && bytes.is_none())
             || shared.is_some_and(|shared| shared.pages.has(page.wrapping_add(shared.shift)))
+            || (file && shared.is_some() && self.shmem_holds(page))
         {
             return Err(Errno::EEXIST);
         }
+        // A file's page needs its bytes, zeros too: one without would be
+        // read from the file.
         let contents = match bytes {
             Some(bytes) => Some(
                 FrameBytes::new(self.meter.as_ref(), || page_words(bytes)).ok_or(Errno::ENOMEM)?,
             ),
+            None if file => Some(
+                FrameBytes::new(self.meter.as_ref(), || page_words(&[])).ok_or(Errno::ENOMEM)?,
+            ),
             None => None,
         };
         let mut entry = self.page(page, prot);
+        if file && shared.is_none() {
+            entry = Page {
+                frame: Frame::default(),
+                cow: false,
+                cache: false,
+                ..entry
+            };
+        }
         entry.uffd_wp = protect;
         if let Some(contents) = contents {
+            // The file's page goes back to the file.
+            if file && shared.is_some() {
+                contents.data.dirty.store(true, Ordering::Release);
+            }
             let _ = entry.frame.set(contents);
         }
         let (dir, slot) = page_index(page);
@@ -4322,9 +4385,13 @@ impl AddressSpaceData {
     /// Linux's `mfill_atomic_pte_poison`: the range is checked as a fill's
     /// ([`Self::userfault_target`]), and a page with an entry or a marker,
     /// even one whose shared memory has it but this mapping has not yet
-    /// faulted it in, is `EEXIST`: only the entry is looked at.
+    /// faulted it in, is `EEXIST`: only the entry is looked at. A page of a
+    /// file's mapping past the file's end is `EFAULT` first.
     pub fn userfault_poison(&mut self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
         self.userfault_target(start, end)?;
+        if self.past_file_end(page) {
+            return Err(Errno::EFAULT);
+        }
         if lookup(&self.read_directory(), page).is_some()
             || self.guarded(page)
             || self.poisoned(page)

@@ -543,8 +543,14 @@ impl FileCache {
         let end = offset.saturating_add(len);
         let mut page = vec![0; PAGE_SIZE as usize];
         let mut key = offset;
+        // A tmpfs file's hole stays out of the cache until a mapping
+        // touches it, as shmem's page cache has no folio there: a
+        // `userfaultfd` waits for it.
+        let shmem = charge.is_none() && file.shmem_pages();
         while key < end.min(size) {
-            if !self.pages.contains(key) {
+            if !self.pages.contains(key)
+                && (!shmem || file.cached_pages(key / PAGE_SIZE, key / PAGE_SIZE) > 0)
+            {
                 let n = file.read_at(key, &mut page)?;
                 self.pages.fill(key, &page[..n], self.meter.as_ref())?;
             }
@@ -715,6 +721,16 @@ impl paludarium_mmu::PageSource for FilePages {
     }
     fn secret(&self) -> bool {
         self.secret
+    }
+    /// A memfd that is not secret (Linux's `vma_is_shmem`).
+    fn shmem(&self) -> bool {
+        !self.secret && self.file.shmem_pages()
+    }
+    /// Whether the memfd holds the page, as shmem's page cache has a folio
+    /// there; any other file holds every page.
+    fn holds(&self, offset: u64) -> bool {
+        let index = offset / PAGE_SIZE;
+        !self.file.shmem_pages() || self.file.cached_pages(index, index) > 0
     }
     /// `secretmem_mmap_prepare` adds `VM_DONTDUMP`; secretmem's pseudo file
     /// system runs nothing.
@@ -1160,6 +1176,9 @@ impl FileHandle for CoherentFile {
     fn cached_pages(&self, first: u64, last: u64) -> u64 {
         self.inner.cached_pages(first, last)
     }
+    fn shmem_pages(&self) -> bool {
+        self.inner.shmem_pages()
+    }
     fn with_attributes(&self, f: &mut dyn FnMut(&mut u32)) -> Result<(), Errno> {
         let (result, changed) = crate::inotify::changing_xattrs(|| self.inner.with_attributes(f));
         if result.is_ok() && changed {
@@ -1522,5 +1541,82 @@ impl HostFs for CoherentFs {
         let mask = Notifier::times_mask(atime.is_some(), mtime.is_some());
         self.caches.notify.changed(&*self.inner, path, follow, mask);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paludarium_mmu::PageSource;
+
+    /// A tmpfs file of two pages that holds none: a memfd (`shmem`), or
+    /// another, as a host's or one of the in-memory file system.
+    struct Tmpfs {
+        shmem: bool,
+    }
+    impl FileHandle for Tmpfs {
+        fn file_system(&self) -> Option<u64> {
+            Some(paludarium_vfs::TMPFS_MAGIC)
+        }
+        fn shmem_pages(&self) -> bool {
+            self.shmem
+        }
+        fn cached_pages(&self, _: u64, _: u64) -> u64 {
+            0
+        }
+        fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+            Ok(0)
+        }
+        fn write(&self, b: &[u8]) -> Result<usize, Errno> {
+            Ok(b.len())
+        }
+        fn read_at(&self, _: u64, b: &mut [u8]) -> Result<usize, Errno> {
+            b.fill(0);
+            Ok(b.len())
+        }
+        fn write_at(&self, _: u64, b: &[u8]) -> Result<usize, Errno> {
+            Ok(b.len())
+        }
+        fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+            Ok(0)
+        }
+        fn stat(&self) -> Result<FileStat, Errno> {
+            Ok(FileStat {
+                mode: 0o100_600,
+                size: 2 * PAGE_SIZE,
+                ..Default::default()
+            })
+        }
+        fn truncate(&self, _: u64) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn flock(&self, _: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn flags(&self) -> u32 {
+            2
+        }
+        fn set_flags(&self, _: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_a_memfd_is_shmem_and_has_holes() {
+        let caches = Arc::new(PageCaches::default());
+        for (key, shmem) in [((1, 1), true), ((1, 2), false)] {
+            let file: Arc<dyn FileHandle> = Arc::new(Tmpfs { shmem });
+            let cache = caches.cache(key, None, 2 * PAGE_SIZE);
+            let pages = cache
+                .map(&file, None, 0, 2 * PAGE_SIZE, false, None)
+                .unwrap();
+            let source = FilePages::new(&file, None, &cache, false, None);
+            // A memfd's hole is not read ahead and is not held; another
+            // file on a tmpfs is not shmem, read ahead whole, holding every
+            // page.
+            assert_eq!(source.shmem(), shmem);
+            assert_eq!(pages.contains(0), !shmem, "shmem={shmem}");
+            assert_eq!(source.holds(0), !shmem, "shmem={shmem}");
+        }
     }
 }

@@ -96,6 +96,14 @@ pub trait FileHandle: Send + Sync {
     fn cached_pages(&self, _first: u64, _last: u64) -> u64 {
         0
     }
+    /// Whether the file is shmem's (Linux's `vma_is_shmem` for a mapping
+    /// of it), with its pages kept here, as [`Self::cached_pages`] counts
+    /// them: a memfd. A file of the in-memory file system says it is on a
+    /// tmpfs but is not taken for one here, as it stands for the files a
+    /// guest has on disk; nor is a host's file, on its tmpfs too.
+    fn shmem_pages(&self) -> bool {
+        false
+    }
     /// `fchmod`: replaces the permission bits with the low 12 bits of `mode`.
     fn set_mode(&self, _mode: u32) -> Result<(), Errno> {
         Err(Errno::EPERM)

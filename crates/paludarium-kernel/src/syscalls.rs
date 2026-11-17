@@ -3745,11 +3745,11 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             if a[1] == crate::inet::SIOCGIFNAME {
                 let index =
                     i32::from_le_bytes([request[16], request[17], request[18], request[19]]);
-                if index != 1 {
+                let Some(name) = network.devices().by_index(index).map(|d| d.name.clone()) else {
                     return Err(Errno(19));
-                }
+                };
                 request[..16].fill(0);
-                request[..2].copy_from_slice(b"lo");
+                request[..name.len()].copy_from_slice(&name);
                 c.mem
                     .write(GuestAddr(a[2]), &request)
                     .map_err(|_| Errno::EFAULT)?;

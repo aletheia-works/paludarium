@@ -831,6 +831,11 @@ fn transfer(
     if iocb.offset < 0 || iocb.offset.checked_add(total as i64).is_none() {
         return Err(Errno::EINVAL);
     }
+    // `rw_verify_area`'s `FAN_ACCESS_PERM` of a read, asked at submission
+    // (`aio_read`), for no bytes too.
+    if !write {
+        crate::files::access_permission(c, file)?;
+    }
     // A transfer a signal interrupts fails with EINTR (`aio_rw_done`).
     Ok(Started::Done(crate::files::aio_transfer(
         c,

@@ -255,8 +255,8 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays, hashes and LRU hashes and nothing
-  else.
+- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes, queues and
+  stacks and nothing else.
   Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
   links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
   programs, BTF and links (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`
@@ -485,10 +485,12 @@ verified.
     little later; a thread
     keyring follows only the file-system IDs that `setfsuid`, `setuid`
     and the like change.
-  - The files of `/proc/sys` check their writer again at each write but one
-    through `copy_file_range`, which they check only as they were opened,
-    where Linux checks every write; and each reports its value's length as
-    its size, where Linux reports 0.
+  - The files of `/proc/sys` share one inode number and report their
+    value's length as their size, where Linux gives each its own inode and
+    a size of 0. So `copy_file_range` from one of them into another is
+    `EINVAL`, as for an overlapping copy within one file, where Linux copies
+    nothing and returns 0. From another filesystem it is `EXDEV`, as on
+    Linux, so it never writes one.
   - Yama's `ptrace_scope` is always 1: there is no
     `/proc/sys/kernel/yama/ptrace_scope` to read or change it.
   - `ptrace` requests the features do not list give `EIO`. `PTRACE_ARCH_PRCTL` has only the `fs` and `gs` bases,
@@ -700,7 +702,8 @@ verified.
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages and the write protection of
   private anonymous memory are registered. The minor mode is refused
-  (`EINVAL`), as is the write-protect mode for shared memory, which Linux
+  (`EINVAL`), as is the write-protect mode for shmem (shared anonymous
+  memory and a shmem file's mappings, private ones too), which Linux
   takes, and `UFFDIO_CONTINUE` is not offered (`EINVAL`), nor the events
   of `fork`, `mremap`, `madvise` and `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
   `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
@@ -708,9 +711,13 @@ verified.
   `UFFDIO_REGISTER` and `fdinfo` report leave them out too. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
-  Shared memory
-  of a file (a memfd, a tmpfs file, System V shared memory) cannot be
-  registered (`EINVAL`), where Linux takes any shmem. A system call's own
+  Of shmem's files only a memfd is registered: a tmpfs file
+  is refused (`EINVAL`), where Linux takes it, as the in-memory file
+  system says it is a tmpfs but stands for the files a guest has on disk,
+  and a host's tmpfs file is not kept here. A zero page `UFFDIO_ZEROPAGE` gives a
+  private mapping of a shmem file is a page of zeros of its own, which
+  `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
+  zero page. A system call's own
   copy to or from a missing page of a registered range, or to a
   write-protected one, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
   Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
@@ -721,11 +728,11 @@ verified.
 - **fanotify, in part**: of the permission events, only `FAN_OPEN_PERM` of
   an open by `open`, `openat`, `openat2`, `creat` or `open_by_handle_at`
   (a link in `/proc/self/fd` too), and `FAN_ACCESS_PERM` of a read by
-  `read`, `pread64`, `readv`, `preadv`, `preadv2`, `sendfile`, `splice` or
-  `copy_file_range`, are sent; `FAN_OPEN_EXEC_PERM`, exec's `FAN_OPEN_PERM`
-  and the `FAN_ACCESS_PERM` of exec's and AIO's and `io_uring`'s reads are
-  taken by `fanotify_mark` but never sent, so what they would ask is let
-  through.
+  `read`, `pread64`, `readv`, `preadv`, `preadv2`, `sendfile`, `splice`,
+  `copy_file_range` or an AIO request, are sent (`io_uring` has no read
+  operation here); `FAN_OPEN_EXEC_PERM`, exec's `FAN_OPEN_PERM` and the
+  `FAN_ACCESS_PERM` of exec's reads are taken by `fanotify_mark` but never
+  sent, so what they would ask is let through.
   `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
   and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
   never come. An evictable mark is never evicted. A group merges an event

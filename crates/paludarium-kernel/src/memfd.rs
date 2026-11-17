@@ -256,6 +256,10 @@ impl FileHandle for Memfd {
     fn cached_pages(&self, first: u64, last: u64) -> u64 {
         self.file.cached_pages(first, last)
     }
+    /// A memfd is shmem's, unless it is secret.
+    fn shmem_pages(&self) -> bool {
+        !self.secret
+    }
     /// `F_SEAL_EXEC` keeps the execute bits as they are.
     fn set_mode(&self, mode: u32) -> Result<(), Errno> {
         if self.seals() & F_SEAL_EXEC != 0 && (self.file.stat()?.mode ^ mode) & 0o111 != 0 {

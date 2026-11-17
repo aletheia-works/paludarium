@@ -1,6 +1,7 @@
 //! `bpf`, for its maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
-//! `hashtab.c` and `bpf_lru_list.c` have them: `BPF_MAP_CREATE` of
-//! `BPF_MAP_TYPE_ARRAY`, `BPF_MAP_TYPE_HASH` and `BPF_MAP_TYPE_LRU_HASH`,
+//! `hashtab.c`, `bpf_lru_list.c` and `queue_stack_maps.c` have them:
+//! `BPF_MAP_CREATE` of `BPF_MAP_TYPE_ARRAY`, `BPF_MAP_TYPE_HASH`,
+//! `BPF_MAP_TYPE_LRU_HASH`, `BPF_MAP_TYPE_QUEUE` and `BPF_MAP_TYPE_STACK`,
 //! their elements (`LOOKUP`, `UPDATE`, `DELETE`,
 //! `GET_NEXT_KEY`, `LOOKUP_AND_DELETE`), `BPF_MAP_FREEZE`, the batch
 //! commands, `BPF_OBJ_GET_INFO_BY_FD`, the map IDs (`BPF_MAP_GET_NEXT_ID`,
@@ -71,6 +72,8 @@ mod cmd {
 const TYPE_HASH: u32 = 1;
 const TYPE_ARRAY: u32 = 2;
 const TYPE_LRU_HASH: u32 = 9;
+const TYPE_QUEUE: u32 = 22;
+const TYPE_STACK: u32 = 23;
 /// `__MAX_BPF_MAP_TYPE` in Linux master.
 const TYPE_MAX: u32 = 39;
 /// `BPF_MAP_TYPE_STRUCT_OPS`, the one `btf_vmlinux_value_type_id` is for.
@@ -94,6 +97,7 @@ mod flag {
     pub const ACCESS: u32 = RDONLY | RDONLY_PROG | WRONLY | WRONLY_PROG;
     pub const ARRAY: u32 = NUMA_NODE | MMAPABLE | ACCESS | PRESERVE_ELEMS | INNER_MAP;
     pub const HASH: u32 = NO_PREALLOC | NO_COMMON_LRU | NUMA_NODE | ACCESS | ZERO_SEED;
+    pub const QUEUE_STACK: u32 = NUMA_NODE | ACCESS;
 }
 
 /// The element flags: `BPF_ANY`, `BPF_NOEXIST`, `BPF_EXIST`, `BPF_F_LOCK`,
@@ -134,6 +138,8 @@ enum Elements {
     /// An LRU hash's, with the lists that choose which goes when it is
     /// full.
     Lru(Box<Lru>),
+    /// A queue's or a stack's, oldest first.
+    Queue(std::collections::VecDeque<Vec<u8>>),
 }
 
 /// A key and its value.
@@ -400,6 +406,21 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
                 return Err(E2BIG);
             }
         }
+        // queue_stack_map_alloc_check, as Linux master has it, with its
+        // check that the elements fit in 32 bits (7.0 does not check it).
+        TYPE_QUEUE | TYPE_STACK => {
+            if max_entries == 0
+                || key_size != 0
+                || value_size == 0
+                || flags & !flag::QUEUE_STACK != 0
+                || !access_ok
+            {
+                return Err(Errno::EINVAL);
+            }
+            if value_size > 1 << 22 || max_entries >= u32::MAX / value_size {
+                return Err(E2BIG);
+            }
+        }
         // No ops for it here.
         _ => return Err(Errno::EINVAL),
     }
@@ -416,7 +437,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     }
     // The privileged map types, which need CAP_BPF even where any user
     // may make maps.
-    if kind == TYPE_LRU_HASH && !bpf_capable(c) {
+    if matches!(kind, TYPE_LRU_HASH | TYPE_QUEUE | TYPE_STACK) && !bpf_capable(c) {
         return Err(Errno::EPERM);
     }
     // array_map_alloc: without `bpf_bypass_spec_v1` (CAP_PERFMON) the
@@ -480,6 +501,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
 fn elements(kind: u32, max_entries: u32, flags: u32, cpus: u64) -> Elements {
     match kind {
         TYPE_ARRAY => Elements::Array(BTreeMap::new()),
+        TYPE_QUEUE | TYPE_STACK => Elements::Queue(std::collections::VecDeque::new()),
         TYPE_LRU_HASH => Elements::Lru(Box::new(Lru::new(
             max_entries,
             cpus,
@@ -533,6 +555,18 @@ const POINTER: u64 = 8;
 /// `totalram_pages()`: the memory `sysinfo` reports, in pages.
 const RAM_PAGES: u64 = crate::syscalls::SYSINFO_RAM / PAGE_SIZE;
 
+/// `sizeof(struct bpf_queue_stack)` on x86-64, on the test machines'
+/// kernel: their 296-byte `struct bpf_map` (as [`ARRAY_HEADER`] says), its
+/// lock, `head`, `tail` and `size`. Linux master's is the same size.
+const QUEUE_HEADER: u64 = 312;
+
+/// A queue's or stack's header and its `max_entries + 1` slots, as
+/// `queue_stack_map_alloc` makes them and `queue_stack_map_mem_usage`
+/// counts them.
+fn queue_size(max_entries: u32, value_size: u32) -> u64 {
+    QUEUE_HEADER + (u64::from(max_entries) + 1) * u64::from(value_size)
+}
+
 /// `bpf_map_area_alloc`: `vmalloc` takes no more pages than the machine
 /// has (`ENOMEM`). The memory is not taken here until it is written.
 fn area(size: u64) -> Result<(), Errno> {
@@ -583,6 +617,9 @@ fn allocate(
     bypass_spec: bool,
     cpus: u64,
 ) -> Result<(), Errno> {
+    if matches!(kind, TYPE_QUEUE | TYPE_STACK) {
+        return area(queue_size(max_entries, value_size));
+    }
     if kind == TYPE_ARRAY {
         let entries = if bypass_spec {
             u64::from(max_entries)
@@ -706,8 +743,17 @@ fn read_bytes(c: &Context<'_>, at: u64, len: u32) -> Result<Vec<u8>, Errno> {
 }
 
 /// `__bpf_copy_key`'s copy of a key (`EFAULT` for one that cannot be
-/// read); a caller that takes no key for a null pointer checks for it.
+/// read); a caller that takes no key for a null pointer checks for it. A
+/// map without keys (a queue's or stack's) takes only a null one
+/// (`EINVAL`).
 fn read_key(c: &Context<'_>, map: &Map, at: u64) -> Result<Vec<u8>, Errno> {
+    if map.key_size == 0 {
+        return if at == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(Errno::EINVAL)
+        };
+    }
     read_bytes(c, at, map.key_size)
 }
 
@@ -734,6 +780,7 @@ impl Map {
             Elements::Array(_) => index(key) < self.max_entries,
             Elements::Hash(values) => values.contains_key(key),
             Elements::Lru(lru) => lru.table.contains_key(key),
+            Elements::Queue(values) => !values.is_empty(),
         };
         if held { Ok(()) } else { Err(Errno::ENOENT) }
     }
@@ -754,7 +801,28 @@ impl Map {
             // As `htab_lru_map_lookup_elem_sys`, which leaves the
             // reference alone.
             Elements::Lru(lru) => lru.get(key).cloned().ok_or(Errno::ENOENT),
+            // `map_peek_elem`: a queue's oldest, a stack's newest.
+            Elements::Queue(values) => if self.kind == TYPE_QUEUE {
+                values.front()
+            } else {
+                values.back()
+            }
+            .cloned()
+            .ok_or(Errno::ENOENT),
         }
+    }
+    /// `map_pop_elem`: a queue's oldest or a stack's newest, taken out.
+    fn pop(&self) -> Result<Vec<u8>, Errno> {
+        let mut elements = self.elements();
+        let Elements::Queue(values) = &mut *elements else {
+            return Err(ENOTSUPP);
+        };
+        if self.kind == TYPE_QUEUE {
+            values.pop_front()
+        } else {
+            values.pop_back()
+        }
+        .ok_or(Errno::ENOENT)
     }
     /// `map_update_elem` of the map's type.
     fn set(&self, key: &[u8], value: Vec<u8>, flags: u64) -> Result<(), Errno> {
@@ -787,6 +855,20 @@ impl Map {
                 values.insert(key.to_vec(), value);
             }
             Elements::Lru(lru) => lru.update(key, value, mode)?,
+            // `queue_stack_map_push_elem`: `BPF_EXIST` makes room in a full
+            // one by giving up the oldest; `BPF_NOEXIST` is not for it.
+            Elements::Queue(values) => {
+                if mode == NOEXIST {
+                    return Err(Errno::EINVAL);
+                }
+                if values.len() >= self.max_entries as usize {
+                    if mode != EXIST {
+                        return Err(E2BIG);
+                    }
+                    values.pop_front();
+                }
+                values.push_back(value);
+            }
         }
         Ok(())
     }
@@ -796,6 +878,7 @@ impl Map {
             Elements::Array(_) => Err(Errno::EINVAL),
             Elements::Hash(values) => values.remove(key).ok_or(Errno::ENOENT),
             Elements::Lru(lru) => lru.delete(key),
+            Elements::Queue(_) => Err(Errno::EINVAL),
         }
     }
     /// `map_get_next_key`: the first key after `key`, or the first of all
@@ -815,6 +898,7 @@ impl Map {
             }
             Elements::Lru(lru) => next_in(&lru.table, key),
             Elements::Hash(values) => next_in(values, key),
+            Elements::Queue(_) => Err(Errno::EINVAL),
         }
     }
     /// The keys and values it holds, by key: a hash's and an LRU hash's.
@@ -827,7 +911,7 @@ impl Map {
                 .iter()
                 .map(|(k, &i)| (k.clone(), lru.values[i].clone()))
                 .collect(),
-            Elements::Array(_) => Vec::new(),
+            Elements::Array(_) | Elements::Queue(_) => Vec::new(),
         }
     }
     /// The elements from the `start`th, up to `max` of them, by key, taken
@@ -839,7 +923,7 @@ impl Map {
         let chosen: Vec<Vec<u8>> = match &*elements {
             Elements::Hash(values) => values.keys().skip(start).take(max).cloned().collect(),
             Elements::Lru(lru) => lru.table.keys().skip(start).take(max).cloned().collect(),
-            Elements::Array(_) => Vec::new(),
+            Elements::Array(_) | Elements::Queue(_) => Vec::new(),
         };
         let mut taken = Vec::with_capacity(chosen.len());
         for key in chosen {
@@ -848,7 +932,7 @@ impl Map {
                 Elements::Hash(values) => values.get(&key).cloned(),
                 Elements::Lru(lru) if delete => lru.delete(&key).ok(),
                 Elements::Lru(lru) => lru.get(&key).cloned(),
-                Elements::Array(_) => None,
+                Elements::Array(_) | Elements::Queue(_) => None,
             };
             if let Some(value) = value {
                 taken.push((key, value));
@@ -857,7 +941,7 @@ impl Map {
         let left = match &*elements {
             Elements::Hash(values) => values.len(),
             Elements::Lru(lru) => lru.table.len(),
-            Elements::Array(_) => 0,
+            Elements::Array(_) | Elements::Queue(_) => 0,
         };
         (taken, left)
     }
@@ -866,7 +950,7 @@ impl Map {
         match &*self.elements() {
             Elements::Hash(values) => values.len(),
             Elements::Lru(lru) => lru.table.len(),
-            Elements::Array(_) => 0,
+            Elements::Array(_) | Elements::Queue(_) => 0,
         }
     }
     /// The memory it takes, as `bpf_map_memory_usage` counts it: an array's
@@ -877,6 +961,9 @@ impl Map {
     fn memory(&self) -> u64 {
         if self.kind == TYPE_ARRAY {
             return array_size(u64::from(self.max_entries), self.value_size, self.flags);
+        }
+        if matches!(self.kind, TYPE_QUEUE | TYPE_STACK) {
+            return queue_size(self.max_entries, self.value_size);
         }
         let element = hash_element(self.key_size, self.value_size);
         let table = HASH_HEADER + BUCKET * buckets(self.max_entries);
@@ -991,10 +1078,13 @@ fn lookup_and_delete(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let key = read_key(c, &map, word(attr, 8))?;
-    if !map.hashed() {
+    let value = if matches!(map.kind, TYPE_QUEUE | TYPE_STACK) {
+        map.pop()?
+    } else if map.hashed() {
+        map.remove(&key)?
+    } else {
         return Err(ENOTSUPP);
-    }
-    let value = map.remove(&key)?;
+    };
     write(c, word(attr, 16), &value)?;
     Ok(0)
 }
@@ -1029,6 +1119,10 @@ fn batch(c: &mut Context<'_>, attr: &[u8], at: u64, command: u32) -> Result<u64,
         return Err(Errno::EPERM);
     }
     let hash = map.hashed();
+    // A queue and a stack have no batch operations.
+    if matches!(map.kind, TYPE_QUEUE | TYPE_STACK) {
+        return Err(ENOTSUPP);
+    }
     match command {
         cmd::MAP_LOOKUP_BATCH if hash => hash_lookup_batch(c, &map, attr, at, false),
         cmd::MAP_LOOKUP_AND_DELETE_BATCH if hash => hash_lookup_batch(c, &map, attr, at, true),
@@ -1940,6 +2034,47 @@ mod tests {
             allocate(TYPE_LRU_HASH, 1 << 21, 4, 1 << 20, 0, true, 2),
             Err(ENOMEM)
         );
+    }
+
+    fn queue(kind: u32, max_entries: u32) -> Map {
+        let mut m = shaped(kind, max_entries, 8, 0, &Arc::default(), 1);
+        m.key_size = 0;
+        m
+    }
+
+    #[test]
+    fn a_queue_gives_its_oldest_and_a_stack_its_newest() {
+        for (kind, first) in [(TYPE_QUEUE, 1u8), (TYPE_STACK, 2)] {
+            let m = queue(kind, 2);
+            assert_eq!(m.get(&[]), Err(Errno::ENOENT));
+            assert_eq!(m.pop(), Err(Errno::ENOENT));
+            m.set(&[], vec![1; 8], 0).unwrap();
+            m.set(&[], vec![2; 8], 0).unwrap();
+            assert_eq!(m.set(&[], vec![3; 8], 0), Err(E2BIG));
+            assert_eq!(m.set(&[], vec![3; 8], NOEXIST), Err(Errno::EINVAL));
+            assert_eq!(m.get(&[]), Ok(vec![first; 8]));
+            assert_eq!(m.pop(), Ok(vec![first; 8]));
+            assert_eq!(m.remove(&[]), Err(Errno::EINVAL));
+            assert_eq!(m.next(None), Err(Errno::EINVAL));
+        }
+        // BPF_EXIST makes room by giving up the oldest, for a stack too.
+        let m = queue(TYPE_STACK, 2);
+        for i in 1..=3 {
+            m.set(&[], vec![i; 8], EXIST).unwrap();
+        }
+        assert_eq!(m.pop(), Ok(vec![3; 8]));
+        assert_eq!(m.pop(), Ok(vec![2; 8]));
+        assert_eq!(m.pop(), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn a_queue_takes_its_header_and_one_slot_more_than_its_entries() {
+        assert_eq!(queue(TYPE_QUEUE, 3).memory(), 312 + 4 * 8);
+        assert_eq!(
+            allocate(TYPE_QUEUE, 1 << 22, 0, 1 << 11, 0, true, 2),
+            Err(ENOMEM)
+        );
+        assert_eq!(allocate(TYPE_STACK, 8, 0, 1 << 20, 0, true, 2), Ok(()));
     }
 
     #[test]

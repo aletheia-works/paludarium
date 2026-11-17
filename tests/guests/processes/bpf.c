@@ -6,6 +6,8 @@
    bpf-lru: LRU hashes, which give up a key when they are full; the case
    runs on one CPU, as the emulator does, since each CPU has its own free
    and pending lists, which decide which key goes.
+   bpf-queue: queues and stacks, which push, peek and pop values without
+   keys.
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -49,6 +51,8 @@
 #define TYPE_HASH 1
 #define TYPE_ARRAY 2
 #define TYPE_LRU_HASH 9
+#define TYPE_QUEUE 22
+#define TYPE_STACK 23
 
 #define F_NO_PREALLOC (1 << 0)
 #define F_NO_COMMON_LRU (1 << 1)
@@ -751,6 +755,86 @@ static int case_lru(void) {
     return 0;
 }
 
+/* Pops (or with peek, looks at) a queue's or stack's values until there
+   are none. */
+static void drain(const char *name, int fd) {
+    printf("%s", name);
+    for (;;) {
+        uint64_t value = 0;
+        long r = elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, NULL, &value, 0);
+        if (r < 0) {
+            printf(" end %ld\n", r);
+            break;
+        }
+        printf(" %llu", (unsigned long long)value);
+    }
+    fflush(stdout);
+}
+
+static int case_queue(void) {
+    create("queue key 4", map_attr(TYPE_QUEUE, 4, 8, 4, 0));
+    create("queue value 0", map_attr(TYPE_QUEUE, 0, 0, 4, 0));
+    create("queue entries 0", map_attr(TYPE_QUEUE, 0, 8, 0, 0));
+    create("queue no prealloc", map_attr(TYPE_QUEUE, 0, 8, 4, F_NO_PREALLOC));
+    create("queue zero seed", map_attr(TYPE_QUEUE, 0, 8, 4, F_ZERO_SEED));
+    create("queue mmapable", map_attr(TYPE_QUEUE, 0, 8, 4, F_MMAPABLE));
+    create("queue numa", map_attr(TYPE_QUEUE, 0, 8, 4, F_NUMA_NODE));
+    create("queue value too big", map_attr(TYPE_QUEUE, 0, (1 << 22) + 1, 4, 0));
+    create("stack key 4", map_attr(TYPE_STACK, 4, 8, 4, 0));
+    const uint32_t types[2] = {TYPE_QUEUE, TYPE_STACK};
+    const char *names[2] = {"queue", "stack"};
+    for (int t = 0; t < 2; t++) {
+        const char *name = names[t];
+        int fd = make(types[t], 0, 8, 3, 0);
+        say("%s memlock %llu", name, memlock(fd));
+        uint64_t value = 0;
+        uint32_t key = 0;
+        say("%s peek empty %ld", name, elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0));
+        for (uint64_t v = 1; v <= 3; v++) say("%s push %llu %ld", name, (unsigned long long)v, elem(MAP_UPDATE_ELEM, fd, NULL, &v, ANY));
+        value = 4;
+        say("%s push full %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, ANY));
+        say("%s push noexist %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, NOEXIST));
+        say("%s push lock %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, ELEM_F_LOCK));
+        say("%s push with a key %ld", name, elem(MAP_UPDATE_ELEM, fd, &key, &value, ANY));
+        say("%s push exist %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, EXIST));
+        value = 0;
+        long r = elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0);
+        say("%s peek %ld value %llu", name, r, (unsigned long long)value);
+        say("%s peek with a key %ld", name, elem(MAP_LOOKUP_ELEM, fd, &key, &value, 0));
+        say("%s peek to nowhere %ld", name, elem(MAP_LOOKUP_ELEM, fd, NULL, (void *)8, 0));
+        say("%s delete %ld", name, elem(MAP_DELETE_ELEM, fd, NULL, NULL, 0));
+        say("%s delete with a key %ld", name, elem(MAP_DELETE_ELEM, fd, &key, NULL, 0));
+        uint32_t next;
+        say("%s next key %ld", name, elem(MAP_GET_NEXT_KEY, fd, NULL, &next, 0));
+        say("%s next key of a key %ld", name, elem(MAP_GET_NEXT_KEY, fd, &key, &next, 0));
+        say("%s pop lock %ld", name, elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, NULL, &value, ELEM_F_LOCK));
+        uint64_t values[4];
+        uint32_t keys[4], count = 2, out;
+        say("%s lookup batch %ld", name, batch(MAP_LOOKUP_BATCH, fd, NULL, &out, keys, values, &count, 0));
+        count = 2;
+        say("%s update batch %ld", name, batch(MAP_UPDATE_BATCH, fd, NULL, NULL, keys, values, &count, 0));
+        drain(name, fd);
+        value = 9;
+        elem(MAP_UPDATE_ELEM, fd, NULL, &value, ANY);
+        say("%s pop to nowhere %ld", name, elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, NULL, (void *)8, 0));
+        drain(name, fd);
+
+        /* Read only, and frozen. */
+        int readonly = make(types[t], 0, 8, 3, F_RDONLY);
+        say("%s read only push %ld pop %ld", name, elem(MAP_UPDATE_ELEM, readonly, NULL, &value, ANY),
+            elem(MAP_LOOKUP_AND_DELETE_ELEM, readonly, NULL, &value, 0));
+        close(readonly);
+        union attr f;
+        memset(&f, 0, sizeof f);
+        f.elem.map_fd = (uint32_t)fd;
+        say("%s freeze %ld", name, bpf(MAP_FREEZE, &f, sizeof f));
+        say("%s frozen push %ld peek %ld", name, elem(MAP_UPDATE_ELEM, fd, NULL, &value, ANY),
+            elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0));
+        close(fd);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -760,5 +844,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-ids")) return case_ids();
     if (!strcmp(mode, "bpf-memory")) return case_memory();
     if (!strcmp(mode, "bpf-lru")) return case_lru();
+    if (!strcmp(mode, "bpf-queue")) return case_queue();
     return 2;
 }

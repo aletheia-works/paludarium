@@ -862,16 +862,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で、
   `UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
-  メモリと共有の anonymous メモリを、ないページについて登録し
+  メモリ、共有の anonymous メモリ、shmem の memfd（Linux が VMA を shmem のものと
+  数えない System V の共有メモリは除きます）の共有または
+  プライベートなマッピングを、ないページについて登録し
   （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
   が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
-  ものは `EINVAL`、ほかの `userfaultfd` のものは `EBUSY`）、モードは、VMA がすでに
+  ものは `EINVAL`、ファイルに書き込めない共有のものは `EPERM`、ほかの `userfaultfd` の
+  ものは `EBUSY`）、モードは、VMA がすでに
   持っていなければその VMA のモードに置き換わります。登録した部分は
   `/proc/<pid>/maps` に見えるとおり VMA に分かれ、`smaps` に `um` と `uw` が
   つきます。`fork` した子と、`mremap` が動かしたマッピングには引き継がれず、
   `UFFDIO_UNREGISTER` とファイルを閉じることで外れます。ないページについて登録した
-  ページでまだないもの（共有メモリでは、どのマッピングにもないもの）に命令が触れるか、
+  ページでまだないもの（shmem では、そのページキャッシュにないもの。どのマッピングも
+  持ち込んでおらず、ファイルも書き込みや割り当てで持っていないページで、ファイルの
+  終わりより先のページは先に SIGBUS です）に命令が触れるか、
   書き込み保護について登録した範囲の保護されたページに書き込むと待ち、ファイルは
   そのフォールトを古い順に `uffd_msg` として読みます。書き込みかどうか、保護された
   ページなら `UFFD_PAGEFAULT_FLAG_WP`、ページのアドレス
@@ -892,9 +897,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   書き込み保護のモードを置き換える登録で保護は外れます。`UFFDIO_COPY` と
   `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
   VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
-  `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
+  `EFAULT`、shmem のファイルの終わりより先のページも `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
   です。`UFFDIO_COPY_MODE_WP` は書き込み保護したページを埋め、範囲は書き込み保護に
-  ついて登録したものでなければなりません（`EINVAL`）。`UFFDIO_POISON`
+  ついて登録したものでなければなりません（`EINVAL`）。shmem のファイルの共有の
+  マッピングを埋めるときは、ファイルのページキャッシュにページがあれば `EEXIST` で、
+  ページはファイルに入り、`read` からも見えます。プライベートなマッピングを埋めると、
+  マッピングが自分のページを持ち、ファイルは変わりません。`UFFDIO_POISON`
   （`UFFD_FEATURE_POISON`）は、登録した範囲のページを同じやり方で poison にします。
   モードは `DONTWAKE` だけで、このマッピングにページかガードがあるところは `EEXIST`
   です。poison にしたページへのアクセスは、Linux の poison マーカーが
@@ -3003,7 +3011,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マップを作れる設定でも `CAP_BPF` が要り（`EPERM`）、いつも事前に確保され
   （`BPF_F_NO_PREALLOC` は `ENOTSUPP`）、`BPF_F_NO_COMMON_LRU` では CPU ごとにリストを持ちます
   （`max_entries` を CPU の数の倍数に切り上げ、どの CPU も同じ数です。`BPF_F_NUMA_NODE` と
-  一緒なら `EINVAL`）。メモリは予備のない要素だけを数えます。ないものは [制限](./limitations) を
+  一緒なら `EINVAL`）。メモリは予備のない要素だけを数えます。`BPF_MAP_TYPE_QUEUE` と
+  `BPF_MAP_TYPE_STACK` は、Linux の `queue_stack_maps.c` と同じく、キーのない値を持ちます
+  （`key_size` は 0 で、null でないキーのポインタは `EINVAL`）。`UPDATE_ELEM` は積み
+  （いっぱいなら `E2BIG`。`BPF_EXIST` ならいちばん古い値を手放して場所を空けます。
+  `BPF_NOEXIST` は `EINVAL`）、`LOOKUP_ELEM` は見るだけ、`LOOKUP_AND_DELETE_ELEM` は
+  取り出します。キューはいちばん古い値を、スタックはいちばん新しい値を返します（なければ
+  `ENOENT`）。`DELETE_ELEM` と `GET_NEXT_KEY` は `EINVAL`、バッチのコマンドは
+  `ENOTSUPP` です。`CAP_BPF` が要り、フラグは `BPF_F_NUMA_NODE` とアクセスのものだけで、
+  4 MiB を超える値と、`max_entries` と値の大きさの積が 32 ビットを超えるものは、Linux
+  master と同じく `E2BIG` です。312 バイトのヘッダーと `max_entries + 1` 個の値の場所を
+  取ります。ないものは [制限](./limitations) を
   参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
@@ -3170,7 +3188,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `readv`、`preadv`、`preadv2`、`sendfile`・`splice`・`copy_file_range` の入力）も、
   `rw_verify_area` と同じくディスクリプタ、バッファ、大きさ、位置の確認のあとに同じように
   答えを待ちます。`vfs_readv` と同じく、0 バイトの `readv` と `preadv` は何も尋ねず、
-  0 バイトの `read` と `pread64` は尋ねます。
+  0 バイトの `read` と `pread64` は尋ねます。AIO の読み出し（`IOCB_CMD_PREAD`、
+  `IOCB_CMD_PREADV`）は、`aio_read` が `rw_verify_area` を呼ぶのと同じく `io_submit` の
+  ときに、0 バイトでも尋ねます。拒まれたものは、`io_submit` がほかの失敗と同じく
+  その要求で失敗させます（最初のものなら `EPERM`）。
   `statfs` の `f_fsid` はイベントが示すファイルシステムの ID と同じです。カーネル自身の
   ファイルシステム、/proc、devpts、mqueue では `simple_statfs` と同じくデバイス番号、
   ほかのファイルシステムでは、tmpfs が UUID を引くように、ファイルシステムごとに引いた

@@ -4573,10 +4573,21 @@ mod shm {
         t.state.credentials = root.setresuid(1000, 1000, 1000).unwrap();
         assert_eq!(write(&mut k, &mut t, &m, msgmax, b"100"), e(Errno::EPERM));
         assert_eq!(write(&mut k, &mut t, &m, bpf, b"2"), e(Errno::EPERM));
-        // So does a positioned write (pwrite64).
+        // So does a positioned write (pwrite64, and pwritev of one iovec).
         m.write(GuestAddr(BUF), b"100").unwrap();
         assert_eq!(
             syscall(&mut k, &mut t, &m, 18, [msgmax, BUF, 3, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        const IOV: u64 = DATA + 0xb00;
+        m.write_u64(GuestAddr(IOV), BUF).unwrap();
+        m.write_u64(GuestAddr(IOV + 8), 3).unwrap();
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 296, [msgmax, IOV, 1, 0, 0, 0]),
+            e(Errno::EPERM)
+        );
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 296, [bpf, IOV, 1, 0, 0, 0]),
             e(Errno::EPERM)
         );
         // Root without CAP_SYS_ADMIN may write msgmax, but not
@@ -4598,6 +4609,31 @@ mod shm {
         assert_eq!(
             read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/msgmax"),
             "200\n"
+        );
+    }
+
+    /// `copy_file_range` into a sysctl from another filesystem is `EXDEV`,
+    /// as Linux's `generic_copy_file_checks` gives it (proc has no
+    /// `copy_file_range`), so it never reaches the sysctl's handler.
+    #[test]
+    fn copy_file_range_into_a_sysctl_from_elsewhere_is_exdev() {
+        let (mut k, mut t, m) = setup();
+        const PATH: u64 = DATA + 0x900;
+        m.write(GuestAddr(PATH), b"/proc/sys/kernel/msgmnb\0")
+            .unwrap();
+        let target = syscall(&mut k, &mut t, &m, 2, [PATH, 1, 0, 0, 0, 0]);
+        // From a memfd, on a filesystem of its own.
+        m.write(GuestAddr(PATH), b"m\0").unwrap();
+        let memfd = syscall(&mut k, &mut t, &m, 319, [PATH, 0, 0, 0, 0, 0]);
+        m.write(GuestAddr(PATH), b"100\n").unwrap();
+        assert_eq!(syscall(&mut k, &mut t, &m, 1, [memfd, PATH, 4, 0, 0, 0]), 4);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 326, [memfd, 0, target, 0, 4, 0]),
+            e(Errno(18))
+        );
+        assert_eq!(
+            read_proc(&mut k, &mut t, &m, "/proc/sys/kernel/msgmnb"),
+            "16384\n"
         );
     }
 

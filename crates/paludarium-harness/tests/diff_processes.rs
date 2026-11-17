@@ -207,6 +207,7 @@ mod linux {
                     | "fanotify-perm"
                     | "fanotify-access-perm"
                     | "fanotify-open-exec"
+                    | "fanotify-aio-perm"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -215,6 +216,7 @@ mod linux {
                     | "userfaultfd-wp"
                     | "userfaultfd-poison"
                     | "userfaultfd-move"
+                    | "userfaultfd-shmem"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -225,6 +227,7 @@ mod linux {
                     | "bpf-ids"
                     | "bpf-memory"
                     | "bpf-lru"
+                    | "bpf-queue"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -527,6 +530,7 @@ mod linux {
         bpf_ids => ("bpf-ids","bpf"),
         bpf_memory => ("bpf-memory","bpf"),
         bpf_lru => ("bpf-lru","bpf"),
+        bpf_queue => ("bpf-queue","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -557,6 +561,7 @@ mod linux {
         fanotify_perm => ("fanotify-perm","fanotify"),
         fanotify_access_perm => ("fanotify-access-perm","fanotify"),
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),
+        fanotify_aio_perm => ("fanotify-aio-perm","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),
@@ -565,6 +570,7 @@ mod linux {
         userfaultfd_wp => ("userfaultfd-wp","userfaultfd"),
         userfaultfd_poison => ("userfaultfd-poison","userfaultfd"),
         userfaultfd_move => ("userfaultfd-move","userfaultfd"),
+        userfaultfd_shmem => ("userfaultfd-shmem","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

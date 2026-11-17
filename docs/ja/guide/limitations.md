@@ -222,7 +222,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   比べていません。テストのマシンの Linux 7.0 は 144 バイトまでしか知らず、0 でないものには
   `E2BIG` を返します。`kernel.perf_event_paranoid` は
   最初 Linux の 2 です（Debian と Ubuntu のカーネルの既定はそれより大きい）。
-- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュだけです。プログラム
+- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュ、キュー、スタックだけです。プログラム
   （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
   （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
   `BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、Linux にあってここにない
@@ -414,9 +414,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     専用のワーカーではなく、次の鍵の呼び出しの始めに行います。最後のリンクを失った鍵は
     すぐになくなり、割り当ても戻ります。Linux では少しあとで解放します。スレッドのキーリングが従うのは、`setfsuid` や `setuid` などが変える
     ファイルシステムの ID だけです。
-  - `/proc/sys` のファイルは、書き込みのたびに書き手を確かめ直しますが、
-    `copy_file_range` での書き込みだけは開いたときにしか確かめません。Linux はどの
-    書き込みでも確かめます。また、サイズとして値の長さを示します。Linux は 0 です。
+  - `/proc/sys` のファイルは 1 つの inode 番号を共有し、サイズとして値の長さを
+    示します。Linux はそれぞれに別の inode を与え、サイズは 0 です。そのため、ある
+    ファイルから別のファイルへの `copy_file_range` は、1 つのファイルの中で重なる
+    コピーと同じく `EINVAL` になります。Linux は何も写さず 0 を返します。ほかの
+    ファイルシステムからは Linux と同じく `EXDEV` なので、どちらでも書かれることは
+    ありません。
   - Yama の `ptrace_scope` は常に 1 です。それを読んだり変えたりする
     `/proc/sys/kernel/yama/ptrace_scope` はありません。
   - `ptrace` の、機能の一覧にない要求は `EIO` を返します。
@@ -601,14 +604,20 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
   メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
-  受け付ける共有メモリの書き込み保護のモードも同じです。`UFFDIO_CONTINUE` も
+  受け付ける shmem（共有の anonymous メモリと、プライベートも含む shmem のファイルの
+  マッピング）の書き込み保護のモードも同じです。`UFFDIO_CONTINUE` も
   ありません（`EINVAL`）。`fork`、`mremap`、
   `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
   それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
   ioctl にも入りません。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
-  ページの保護を外します。Linux はその印を PTE に残します。ファイルの共有メモリ（memfd、tmpfs のファイル、System V の共有メモリ）は
-  登録できません（`EINVAL`）。Linux はどの shmem も受け付けます。登録した範囲のまだ
+  ページの保護を外します。Linux はその印を PTE に残します。shmem のファイルで登録
+  するのは memfd だけです。tmpfs のファイルは、Linux は受け付けますが、ここでは
+  断ります（`EINVAL`）。メモリ上のファイルシステムは tmpfs を名乗りますが、ゲストが
+  ディスクに持つファイルを表すからで、ホストの tmpfs のファイルはここで持っていません。shmem のファイルの
+  プライベートなマッピングに `UFFDIO_ZEROPAGE` が入れるゼロページは、そのマッピング
+  自身のゼロのページで、`/proc/<pid>/pagemap` と `smaps` もそう数えます。Linux は
+  そのゼロページを対応付けます。登録した範囲のまだ
   ないページか、書き込み保護されたページへのシステムコール自身のコピーは、
   `UFFD_USER_MODE_ONLY` のときと同じく `EFAULT` です。Linux は命令のときと同じくページを待ちます。`UFFDIO_MOVE` の
   動かし元の穴は、ここでその周りの 2 MiB にどれも触れていなければ、Linux にそこの
@@ -617,9 +626,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベントで送るのは、`open`、`openat`、`openat2`、`creat`、
   `open_by_handle_at` での（`/proc/self/fd` のリンクからも）オープンの `FAN_OPEN_PERM` と、
-  `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range` での
-  読み出しの `FAN_ACCESS_PERM` だけです。`FAN_OPEN_EXEC_PERM`、
-  exec の `FAN_OPEN_PERM`、exec・AIO・`io_uring` の読み出しの `FAN_ACCESS_PERM` は
+  `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range`、
+  AIO の要求での読み出しの `FAN_ACCESS_PERM` だけです（ここの `io_uring` には読み出しの
+  操作がありません）。`FAN_OPEN_EXEC_PERM`、exec の `FAN_OPEN_PERM`、exec の読み出しの
+  `FAN_ACCESS_PERM` は
   `fanotify_mark` で受け付けますが送らないので、求めるはずだったことはそのまま通ります。
   `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント

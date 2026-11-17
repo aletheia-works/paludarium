@@ -168,7 +168,47 @@ __asm__(".text\n"
         "fxarea: .zero 512\n"
         "table: .zero 16\n"
         "leaveslot: .quad 0\n"
-        ".text\n");
+        ".balign 16\n"
+        ".globl x87area, mmarea, mmmask\n"
+        "x87area: .zero 128\n"
+        "mmarea: .zero 16\n"
+        "mmmask: .byte 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0\n"
+        ".text\n"
+        /* One instruction each, on the areas above, for the probes. */
+        ".globl probe_fxsave, probe_fxrstor, probe_fnsave, probe_frstor\n"
+        ".globl probe_fnstenv, probe_fldenv, probe_maskmovdqu\n"
+        "probe_fxsave:\n"
+        "  leaq fxarea(%rip), %rax\n"
+        "  fxsave (%rax)\n"
+        "  ret\n"
+        "probe_fxrstor:\n"
+        "  leaq fxarea(%rip), %rax\n"
+        "  fxrstor (%rax)\n"
+        "  ret\n"
+        "probe_fnsave:\n"
+        "  leaq x87area(%rip), %rax\n"
+        "  fnsave (%rax)\n"
+        "  ret\n"
+        "probe_frstor:\n"
+        "  leaq x87area(%rip), %rax\n"
+        "  frstor (%rax)\n"
+        "  ret\n"
+        "probe_fnstenv:\n"
+        "  leaq x87area(%rip), %rax\n"
+        "  fnstenv (%rax)\n"
+        "  ret\n"
+        "probe_fldenv:\n"
+        "  leaq x87area(%rip), %rax\n"
+        "  fldenv (%rax)\n"
+        "  ret\n"
+        "probe_maskmovdqu:\n"
+        "  pushq %rdi\n"
+        "  leaq mmarea(%rip), %rdi\n"
+        "  pcmpeqb %xmm0, %xmm0\n"
+        "  movdqa mmmask(%rip), %xmm1\n"
+        "  maskmovdqu %xmm1, %xmm0\n"
+        "  popq %rdi\n"
+        "  ret\n");
 
 void seq_rep(char *);
 extern char seq_rep_end[];
@@ -518,6 +558,80 @@ static int hw_implicit_case(void) {
     return 0;
 }
 
+/* --- what an instruction's memory breakpoint sees ------------------------ */
+
+extern char x87area[], mmarea[];
+void probe_fxsave(void), probe_fxrstor(void), probe_fnsave(void), probe_frstor(void),
+    probe_fnstenv(void), probe_fldenv(void), probe_maskmovdqu(void);
+
+/* Runs `run` once in a traced child, after `before` (untraced, to give a
+ * restore a valid area), with one breakpoint on `length` bytes at
+ * `address` breaking on `rw` (1 a write, 3 a read or write), and prints
+ * whether it hit. */
+static void probe(const char *name, void (*before)(void), void (*run)(void), void *address,
+                  int length, int rw) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (before) before();
+        if (pt(PTRACE_TRACEME, 0, 0, 0)) _exit(90);
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGSTOP);
+        run();
+        _exit(0);
+    }
+    wait_status(child);
+    int len_bits = length == 1 ? 0 : length == 2 ? 1 : length == 8 ? 2 : 3;
+    pt(PTRACE_POKEUSER, child, DEBUGREG(0), (unsigned long)address);
+    long set = pt(PTRACE_POKEUSER, child, DEBUGREG(7),
+                  1 | (unsigned long)(len_bits << 2 | rw) << 16);
+    pt(PTRACE_CONT, child, 0, 0);
+    int status = wait_status(child);
+    if (WIFSTOPPED(status)) {
+        siginfo_t info;
+        memset(&info, 0, sizeof info);
+        pt(PTRACE_GETSIGINFO, child, 0, (unsigned long)&info);
+        printf("%s: set=%ld hit signal=%d code=%d\n", name, set, WSTOPSIG(status), info.si_code);
+        pt(PTRACE_POKEUSER, child, DEBUGREG(7), 0);
+        pt(PTRACE_CONT, child, 0, 0);
+        status = wait_status(child);
+    } else {
+        printf("%s: set=%ld no hit\n", name, set);
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) printf("%s: status=%#x\n", name, status);
+}
+
+static int probe_fxsave_case(void) {
+    probe("xmm0", NULL, probe_fxsave, fxarea + 160, 8, 1);
+    probe("reserved-416", NULL, probe_fxsave, fxarea + 416, 8, 1);
+    probe("reserved-456", NULL, probe_fxsave, fxarea + 456, 8, 1);
+    return 0;
+}
+
+static int probe_fxrstor_case(void) {
+    probe("xmm0", probe_fxsave, probe_fxrstor, fxarea + 160, 8, 3);
+    probe("reserved-416", probe_fxsave, probe_fxrstor, fxarea + 416, 8, 3);
+    probe("software-504", probe_fxsave, probe_fxrstor, fxarea + 504, 8, 3);
+    return 0;
+}
+
+static int probe_x87_case(void) {
+    probe("fnsave-last", NULL, probe_fnsave, x87area + 104, 4, 1);
+    probe("fnsave-past", NULL, probe_fnsave, x87area + 108, 4, 1);
+    probe("frstor-last", probe_fnsave, probe_frstor, x87area + 104, 4, 3);
+    probe("frstor-past", probe_fnsave, probe_frstor, x87area + 108, 4, 3);
+    probe("fnstenv-last", NULL, probe_fnstenv, x87area + 24, 4, 1);
+    probe("fnstenv-past", NULL, probe_fnstenv, x87area + 28, 4, 1);
+    probe("fldenv-last", probe_fnstenv, probe_fldenv, x87area + 24, 4, 3);
+    probe("fldenv-past", probe_fnstenv, probe_fldenv, x87area + 28, 4, 3);
+    return 0;
+}
+
+static int probe_maskmovdqu_case(void) {
+    probe("masked", NULL, probe_maskmovdqu, mmarea + 3, 1, 1);
+    probe("unmasked", NULL, probe_maskmovdqu, mmarea + 4, 1, 1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 99;
     const char *mode = argv[1];
@@ -532,6 +646,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-forced-frame")) code = forced_frame_case();
     if (!strcmp(mode, "ptrace-hw-breakpoint")) code = hw_breakpoint_case();
     if (!strcmp(mode, "ptrace-hw-implicit")) code = hw_implicit_case();
+    if (!strcmp(mode, "hw-probe-fxsave")) code = probe_fxsave_case();
+    if (!strcmp(mode, "hw-probe-fxrstor")) code = probe_fxrstor_case();
+    if (!strcmp(mode, "hw-probe-x87")) code = probe_x87_case();
+    if (!strcmp(mode, "hw-probe-maskmovdqu")) code = probe_maskmovdqu_case();
     fflush(stdout);
     return code;
 }

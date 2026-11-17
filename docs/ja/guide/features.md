@@ -3016,9 +3016,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   CPU とタスクのない `PERF_FLAG_PID_CGROUP` は `EINVAL`、イベントでないグループの
   ディスクリプタは `EBADF`、ないタスクは `ESRCH`、タスクも CPU もないときや最後より先の
   CPU は `EINVAL`、知らない `clockid` は `EINVAL` です。数えるイベントは、ソフトウェアの
-  `cpu-clock` と `task-clock`（スレッドの CPU 時間をナノ秒で。CPU のイベントは経った時間）と、
-  x86-64 と同じく何も数えない `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output`
-  です。それらの分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
+  `cpu-clock` と `task-clock`（スレッドの CPU 時間をナノ秒で。CPU のイベントは経った時間）、
+  スレッドの `page-faults` と `minor-faults`（ページへの最初の読み書きと、`fork` で共有した
+  ページやファイルのプライベートなマッピングへの書き込み。スレッドのコードのフォルトは
+  `exclude_user` で、システムコールのコピーのフォルトは `exclude_kernel` で除きます）、
+  `context-switches`（眠るたび）と `cpu-migrations`（`getcpu` の返す CPU が変わるたび）。
+  後の二つはカーネルが起こすので、Linux と同じく `exclude_kernel` で除きます。すべての
+  ページがメモリにあるので何も数えない `major-faults` と、x86-64 と同じく何も数えない
+  `alignment-faults`、`emulation-faults`、`dummy`、`bpf-output` もあります。それらの
+  分岐サンプリングや XMM レジスタは `EOPNOTSUPP` です。ハードウェア、
   キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
   イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
   要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った

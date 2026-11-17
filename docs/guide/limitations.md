@@ -220,13 +220,17 @@ verified.
   writes there: the call gives `EFAULT`, where Linux's copy of user memory
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
-- **perf events, in part**: only the software clocks count
-  (`cpu-clock`, `task-clock`) and the software events that never happen on
-  x86-64; page faults, context switches, CPU migrations and cgroup switches,
-  tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as are
-  hardware events even on a host with a PMU. A thread's CPU time is the one
-  it last accounted, at its latest system call, and an event of a CPU
-  counts the time that passes. There is no ring buffer: `mmap` of an event
+- **perf events, in part**: only the software events count; cgroup
+  switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
+  are hardware events even on a host with a PMU. A thread's CPU time, page
+  faults, context switches and CPU migrations are those it last accounted,
+  at its latest system call. An event of a CPU counts the time that passes,
+  and no faults, switches or migrations. A fault that ends in `SIGSEGV` or
+  `SIGBUS` is not counted, where Linux counts it in `page-faults`; one of a
+  signal frame's write counts as the thread's own; a context switch is a
+  sleep of the thread, not a preemption (but for a thread with `rseq` that
+  gives its virtual CPU to another); and a thread without `rseq` moves to
+  another CPU only when a new CPU mask changes the lowest CPU it allows. There is no ring buffer: `mmap` of an event
   is `ENODEV`, a sampling event takes no samples and sends no signal, and
   `poll` never finds one readable. `inherit_stat` is taken, but an
   inherited event's end sends no read record, as nothing is recorded. An

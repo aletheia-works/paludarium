@@ -227,6 +227,9 @@ impl Host for RecordingHost {
             }
             deadline.saturating_sub(s.now(clock))
         };
+        if remaining > 0 {
+            crate::switches::sleep(&mut false);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if cancelled_within(cancel, remaining.min(GRACE)) {
             return Ok(WaitOutcome::Interrupted);
@@ -249,6 +252,7 @@ impl Host for RecordingHost {
             return crate::threads::wait(self, token, expected, None, cancel);
         };
         if token.value() == expected && !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::switches::sleep(&mut false);
             crate::threads::wait_briefly(token, expected, GRACE);
         }
         if token.value() != expected {

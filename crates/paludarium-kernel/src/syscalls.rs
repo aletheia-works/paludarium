@@ -4257,16 +4257,7 @@ fn sys_sched_setaffinity(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// shows; another on none, so it reports the lowest its mask allows.
 fn sys_getcpu(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let cpu = c.process.on_cpu.map(|on| on.cpu);
-    let cpu = cpu.unwrap_or_else(|| {
-        c.group.affinity(c.tid).map_or(0, |set| {
-            set.iter()
-                .enumerate()
-                .find(|(_, word)| **word != 0)
-                .map_or(0, |(index, word)| {
-                    index * 64 + word.trailing_zeros() as usize
-                })
-        }) as u32
-    });
+    let cpu = cpu.unwrap_or_else(|| c.group.lowest_cpu(c.tid));
     let mut failed = false;
     for (address, value) in [(a[0], cpu), (a[1], 0)] {
         if address != 0 {

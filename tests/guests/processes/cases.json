@@ -127,6 +127,7 @@
     {"name":"perf-exec","binary":"perf"},
     {"name":"perf-prctl","binary":"perf"},
     {"name":"perf-inherit","binary":"perf"},
+    {"name":"perf-software","binary":"perf"},
     {"name":"bpf-calls","binary":"bpf"},
     {"name":"bpf-elements","binary":"bpf"},
     {"name":"bpf-batch","binary":"bpf"},

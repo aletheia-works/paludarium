@@ -48,6 +48,33 @@ pub mod testing;
 pub mod wasm_net;
 pub use clock::{ClockId, WaitOutcome};
 
+/// The times the calling host thread went to sleep in a wait of the host
+/// ([`Host::wait_on`], [`Host::wait_until`]), each wait once however often
+/// it wakes to look at its cancellation: what the kernel adds to its guest
+/// thread's context switches (`perf`'s `context-switches`), as Linux counts
+/// one each time the thread is scheduled out to sleep.
+pub mod switches {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static TAKEN: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// The thread goes to sleep; `slept` says whether this wait has already
+    /// counted.
+    pub fn sleep(slept: &mut bool) {
+        if !core::mem::replace(slept, true) {
+            TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
+        }
+    }
+
+    /// The sleeps since the last call, on this host thread.
+    #[must_use]
+    pub fn take() -> u64 {
+        TAKEN.with(|taken| taken.replace(0))
+    }
+}
+
 /// What reading the host's standard input would find now
 /// ([`Host::stdin_state`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -83,7 +83,7 @@ pub struct ThreadGroup {
     pub(crate) timers: Mutex<crate::timers::Timers>,
     /// Every thread's CPU time, live or exited, for the process's total,
     /// with the thread's ID, for its own clock.
-    cpu: Mutex<Vec<(u32, Arc<AtomicU64>)>>,
+    cpu: Mutex<Vec<(u32, Arc<crate::Usage>)>>,
     /// The interval timers of the process's CPU time and its `RLIMIT_CPU`,
     /// and whether either asks for the CPU time to be checked. Locked
     /// before `cpu` and `process_inbox`.
@@ -627,7 +627,7 @@ impl ThreadGroup {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
-    pub(crate) fn register_cpu(&self, tid: u32, used: Arc<AtomicU64>) {
+    pub(crate) fn register_cpu(&self, tid: u32, used: Arc<crate::Usage>) {
         self.cpu
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -639,7 +639,7 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|(_, used)| used.load(Ordering::SeqCst))
+            .map(|(_, used)| used.cpu.load(Ordering::SeqCst))
             .fold(0u64, u64::saturating_add)
     }
     /// The CPU time of thread `tid` while it is live, as of its latest
@@ -655,7 +655,7 @@ impl ThreadGroup {
                 .iter()
                 .rev()
                 .find(|(owner, _)| *owner == tid)
-                .map_or(0, |(_, used)| used.load(Ordering::SeqCst)),
+                .map_or(0, |(_, used)| used.cpu.load(Ordering::SeqCst)),
         )
     }
     /// The CPU time thread `tid` last accounted, live or not: what a perf
@@ -667,7 +667,17 @@ impl ThreadGroup {
             .iter()
             .rev()
             .find(|(owner, _)| *owner == tid)
-            .map(|(_, used)| used.load(Ordering::SeqCst))
+            .map(|(_, used)| used.cpu.load(Ordering::SeqCst))
+    }
+    /// What thread `tid` last accounted ([`crate::Usage`]), live or not.
+    pub(crate) fn last_thread_usage(&self, tid: u32) -> Option<Arc<crate::Usage>> {
+        self.cpu
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|(owner, _)| *owner == tid)
+            .map(|(_, used)| Arc::clone(used))
     }
     /// The time of a POSIX timer's CPU-time clock; ESRCH once the thread
     /// whose clock it is has exited (Linux's `timer_lock_sighand` finds no
@@ -1123,6 +1133,22 @@ impl ThreadGroup {
     /// The aio contexts of the address space ([`crate::aio`]).
     pub(crate) fn aio(&self) -> &crate::aio::Contexts {
         &self.aio
+    }
+    /// The lowest CPU thread `tid`'s mask allows, which a thread without
+    /// `rseq` reports it runs on (`getcpu`).
+    pub(crate) fn lowest_cpu(&self, tid: u32) -> u32 {
+        self.affinity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .map_or(0, |set| {
+                set.iter()
+                    .enumerate()
+                    .find(|(_, word)| **word != 0)
+                    .map_or(0, |(index, word)| {
+                        index * 64 + word.trailing_zeros() as usize
+                    })
+            }) as u32
     }
     /// The CPU mask of thread `tid`, if `sched_setaffinity` gave it one.
     pub(crate) fn affinity(&self, tid: u32) -> Option<Vec<u64>> {

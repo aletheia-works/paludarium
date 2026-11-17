@@ -161,12 +161,16 @@ impl Default for AltStack {
 
 /// A guest thread's CPU time: the host thread's CPU time (or, where the host
 /// cannot measure it, wall time) since the guest thread's first system call,
-/// published for the thread group's total. A clone starts again from zero,
-/// as a new Linux thread or process does.
+/// published for the thread group's total, with what else it has used
+/// ([`Usage`]). A clone starts again from zero, as a new Linux thread or
+/// process does.
 #[derive(Debug, Default)]
 pub(crate) struct CpuAccount {
     base: Option<u64>,
-    used: Arc<std::sync::atomic::AtomicU64>,
+    used: Arc<Usage>,
+    /// The CPU the thread was last seen on, and the thread group's
+    /// [`ThreadGroup::affinity_generation`] then, for its migrations.
+    on: Option<(u32, u64)>,
 }
 impl Clone for CpuAccount {
     fn clone(&self) -> Self {
@@ -180,28 +184,80 @@ impl PartialEq for CpuAccount {
 }
 impl Eq for CpuAccount {}
 
-/// Brings the thread's CPU time up to date and returns it in nanoseconds;
-/// called at every system call, which publishes it for the process clock,
-/// and by the system calls that read the CPU clocks.
+/// What a guest thread has used, as of its latest system call: its CPU
+/// time in nanoseconds, the page faults its accesses took
+/// ([`paludarium_mmu::faults`]) in its own code and in system calls, the
+/// times it went to sleep ([`paludarium_host::switches`]) and the times it
+/// moved to another CPU. The software events of `perf` count these.
+#[derive(Debug, Default)]
+pub(crate) struct Usage {
+    pub(crate) cpu: std::sync::atomic::AtomicU64,
+    pub(crate) faults: std::sync::atomic::AtomicU64,
+    pub(crate) kernel_faults: std::sync::atomic::AtomicU64,
+    pub(crate) switches: std::sync::atomic::AtomicU64,
+    pub(crate) migrations: std::sync::atomic::AtomicU64,
+}
+
+/// Adds the page faults taken since the last call to the thread's
+/// [`Usage`]: those of its own code as it enters a system call, and those of
+/// the call (`kernel`) as it leaves it, as Linux tells a fault of user mode
+/// from one of the kernel's accesses to user memory.
+pub(crate) fn account_faults(state: &ThreadState, kernel: bool) {
+    let faults = paludarium_mmu::faults::take();
+    if faults != 0 {
+        let usage = &state.cpu.used;
+        let field = if kernel {
+            &usage.kernel_faults
+        } else {
+            &usage.faults
+        };
+        field.fetch_add(faults, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Brings the thread's CPU time and [`Usage`] up to date and returns its
+/// CPU time in nanoseconds; called at every system call, which publishes
+/// them for the process clock and `perf`, and by the system calls that read
+/// the CPU clocks.
 pub(crate) fn account_cpu(
     host: &dyn Host,
     group: &ThreadGroup,
     state: &mut ThreadState,
     tid: u32,
 ) -> u64 {
+    use std::sync::atomic::Ordering;
     let now = host
         .thread_cpu_time()
         .or_else(|_| host.clock(paludarium_host::ClockId::Monotonic))
         .unwrap_or(0);
+    let on_cpu = state.on_cpu.map(|on| on.cpu);
     let account = &mut state.cpu;
     let base = *account.base.get_or_insert_with(|| {
         group.register_cpu(tid, Arc::clone(&account.used));
         now
     });
     let used = now.saturating_sub(base);
-    account
-        .used
-        .store(used, std::sync::atomic::Ordering::SeqCst);
+    let usage = &account.used;
+    usage.cpu.store(used, Ordering::SeqCst);
+    let switches = paludarium_host::switches::take();
+    if switches != 0 {
+        usage.switches.fetch_add(switches, Ordering::SeqCst);
+    }
+    // The CPU it runs on: its virtual one with `rseq`, else the lowest its
+    // mask allows (`getcpu`), looked up again only when a mask changed.
+    let generation = group.affinity_generation();
+    let cpu = match (on_cpu, account.on) {
+        (Some(cpu), _) => cpu,
+        (None, Some((cpu, seen))) if seen == generation => cpu,
+        (None, _) => group.lowest_cpu(tid),
+    };
+    if account
+        .on
+        .replace((cpu, generation))
+        .is_some_and(|(was, _)| was != cpu)
+    {
+        usage.migrations.fetch_add(1, Ordering::SeqCst);
+    }
     used
 }
 
@@ -1258,9 +1314,11 @@ impl Kernel {
         }
         match reason {
             ExitReason::Syscall { .. } => {
+                account_faults(&thread.state, false);
                 self.inbox.set_in_call(true);
                 let next = self.syscall(thread, mem);
                 self.inbox.set_in_call(false);
+                account_faults(&thread.state, true);
                 next
             }
             ExitReason::PageFault { .. }

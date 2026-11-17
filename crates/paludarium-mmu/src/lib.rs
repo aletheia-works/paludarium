@@ -195,6 +195,32 @@ pub enum ReadHint {
     Random,
 }
 
+/// The page faults that the calling host thread's accesses took, which the
+/// kernel adds to its guest thread's (`perf`'s `page-faults`). They are
+/// those of Linux's `mm_account_fault` with the registers of an access: a
+/// read or fetch of a page that had no entry yet (Linux maps the zero page
+/// or the file's), and a write to a page with no frame of its own yet (its
+/// first write, the copy of a page-cache page of a private mapping or of a
+/// frame `fork` shared). A core dump's or `ptrace`'s access through
+/// `FOLL_FORCE` counts none, as Linux's `get_user_pages` passes no registers.
+pub mod faults {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static TAKEN: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn count() {
+        TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
+    }
+
+    /// The faults taken since the last call, on this host thread.
+    #[must_use]
+    pub fn take() -> u64 {
+        TAKEN.with(|taken| taken.replace(0))
+    }
+}
+
 /// The bits of Linux's `vm_flags` that `/proc/<pid>/smaps` shows
 /// ([`Vma::flags`]), as `include/linux/mm.h` numbers them.
 pub mod vm {
@@ -2976,6 +3002,9 @@ impl AddressSpaceData {
                 let (dir, slot) = page_index(page);
                 let table = directory.entry(dir).or_insert_with(PageTable::new);
                 if let Some(entry) = table.pages.get_mut(slot) {
+                    if entry.is_none() && matches!(access, Access::Read | Access::Fetch) {
+                        faults::count();
+                    }
                     self.refresh(entry, page, prot, false);
                 }
             }
@@ -3132,6 +3161,15 @@ impl AddressSpaceData {
             };
             let (dir, slot) = page_index(page);
             let table = directory.entry(dir).or_insert_with(PageTable::new);
+            if access == Access::Write
+                && table.pages.get(slot).is_some_and(|entry| {
+                    entry
+                        .as_ref()
+                        .is_none_or(|p| p.cow || p.frame.get().is_none())
+                })
+            {
+                faults::count();
+            }
             if let Some(entry) = table.pages.get_mut(slot)
                 && !self.refresh(entry, page, prot, true)
             {
@@ -7366,6 +7404,46 @@ mod tests {
         assert!(space.write_u64(anon, 1).is_err());
         space.unmap(GuestAddr(0x10000), 0xff_ffff_0000).unwrap();
         assert!(space.read_u64(GuestAddr(0xff_ffff_fff8)).is_err());
+    }
+
+    #[test]
+    fn faults_are_counted_where_linux_accounts_them() {
+        let mut space = AddressSpace::new();
+        let anon = space
+            .map(
+                None,
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let _ = faults::take();
+        // A first write faults, and nothing after it on the page does.
+        space.write_u64(anon, 1).unwrap();
+        space.write_u64(anon, 2).unwrap();
+        assert_eq!(space.read_u64(anon).unwrap(), 2);
+        assert_eq!(faults::take(), 1);
+        // A first read maps the zero page, and a write after it faults again.
+        let next = GuestAddr(anon.0 + PAGE_SIZE);
+        assert_eq!(space.read_u64(next).unwrap(), 0);
+        assert_eq!(space.read_u64(next).unwrap(), 0);
+        assert_eq!(faults::take(), 1);
+        space.write_u64(next, 3).unwrap();
+        assert_eq!(faults::take(), 1);
+        // After a fork, the first write of each space to a page it shares
+        // faults, the last one's too, which keeps the frame.
+        let child = space.fork();
+        child.write_u64(anon, 4).unwrap();
+        space.write_u64(anon, 5).unwrap();
+        space.write_u64(anon, 6).unwrap();
+        assert_eq!(faults::take(), 2);
+        // A core dump's reads count none.
+        let fresh = space
+            .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        let mut word = [0; 8];
+        space.read_for_dump(fresh, &mut word).unwrap();
+        assert_eq!(faults::take(), 0);
     }
 
     #[test]

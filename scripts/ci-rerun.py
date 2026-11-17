@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlencode
 
 CI = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 
@@ -39,6 +40,8 @@ def replaced(run, runs):
     forks can push branches of one name."""
     return any(
         other["id"] > run["id"]
+        and other["head_branch"] == run["head_branch"]
+        and other["event"] == run["event"]
         and other["head_repository"]["full_name"] == run["head_repository"]["full_name"]
         for other in runs
     )
@@ -116,7 +119,7 @@ def main_rerun(repo, run_id, attempt=None, dry_run=False):
         gh(
             "api",
             f"repos/{repo}/actions/workflows/{run['workflow_id']}/runs"
-            f"?branch={run['head_branch']}&event={run['event']}&per_page=20",
+            "?" + urlencode({"branch": run["head_branch"], "event": run["event"], "per_page": 20}),
         )
     )["workflow_runs"]
     rerun, reasons = decide(run, jobs, annotations, replaced(run, later), latest)
@@ -222,16 +225,28 @@ def self_test():
         got, reasons = decide(r, jobs, notes, superseded, latest)
         if got != wanted or not reasons:
             raise AssertionError(f"{name}: rerun {got}, wanted {wanted}: {reasons}")
-    own = {"id": 10, "head_repository": {"full_name": "aletheia-works/paludarium"}}
-    fork = {"id": 11, "head_repository": {"full_name": "someone/paludarium"}}
-    newer = {"id": 12, "head_repository": {"full_name": "aletheia-works/paludarium"}}
-    older = {"id": 9, "head_repository": {"full_name": "aletheia-works/paludarium"}}
-    for runs, wanted in (
+
+    def other(rid, repo="aletheia-works/paludarium", branch="fix/a&b", event="pull_request"):
+        return {
+            "id": rid,
+            "head_branch": branch,
+            "event": event,
+            "head_repository": {"full_name": repo},
+        }
+
+    own = other(10)
+    replacements = (
         ([own], False),
-        ([fork, own], False),
-        ([newer, own], True),
-        ([older], False),
-    ):
+        ([other(11, repo="someone/paludarium"), own], False),
+        ([other(12), own], True),
+        ([other(9)], False),
+        ([other(13, branch="fix/a")], False),
+        ([other(14, event="push")], False),
+    )
+    query = urlencode({"branch": "fix/a&b+c#d", "event": "pull_request", "per_page": 20})
+    if query != "branch=fix%2Fa%26b%2Bc%23d&event=pull_request&per_page=20":
+        raise AssertionError(f"branch not encoded: {query}")
+    for runs, wanted in replacements:
         if replaced(own, runs) != wanted:
             raise AssertionError(f"replaced by {[r['id'] for r in runs]}: wanted {wanted}")
     text = CI.read_text(encoding="utf-8")
@@ -240,7 +255,10 @@ def self_test():
             raise AssertionError(f"{gate} is no job of ci.yml")
     if "\nname: CI\n" not in text:
         raise AssertionError("rerun-unacquired.yml follows the workflow named CI")
-    print(f"ci-rerun ready: {len(cases)} cases, 4 replacements and {len(GATES)} gate checked")
+    print(
+        f"ci-rerun ready: {len(cases)} cases, {len(replacements)} replacements"
+        f" and {len(GATES)} gate checked"
+    )
 
 
 def main():

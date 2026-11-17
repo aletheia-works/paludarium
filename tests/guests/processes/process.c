@@ -8066,12 +8066,28 @@ static int cpu_itimer_case(const char *self) {
     syscall(SYS_setitimer, 1L, NULL, &old);
     left = cit_us(old.it_value);
     printf("virtual old-in-range=%d\n", left > 1500000 && left <= 2001000);
-    /* A value clamped to KTIME_MAX, a tick later, shows negative seconds. */
+    /* A value clamped to KTIME_MAX, a tick later, shows negative seconds
+       while less than that tick of CPU time has been counted since. Linux
+       counts the CPU time in steps of up to a tick, so a step between the
+       two calls leaves it just under KTIME_MAX: the pair is tried again
+       until it reads negative, and every reading must be one or the
+       other. */
     v = (struct itimerval){{0, 0}, {LONG_MAX, 0}};
     printf("virtual huge=%ld\n", itimer_errno(syscall(SYS_setitimer, 1L, &v, NULL)));
-    syscall(SYS_getitimer, 1L, &v);
-    printf("virtual huge negative=%d usec-in-range=%d\n", v.it_value.tv_sec < 0,
-           v.it_value.tv_usec >= 0 && v.it_value.tv_usec < 1000000);
+    int negative = 0, readings_ok = 1;
+    for (int tries = 0; tries < 100 && !negative; tries++) {
+        if (tries) {
+            v = (struct itimerval){{0, 0}, {LONG_MAX, 0}};
+            syscall(SYS_setitimer, 1L, &v, NULL);
+        }
+        syscall(SYS_getitimer, 1L, &v);
+        negative = v.it_value.tv_sec < 0;
+        /* KTIME_MAX is 9223372036.854775807 s; under a second of CPU time
+           has gone since it was set. */
+        readings_ok &= v.it_value.tv_usec >= 0 && v.it_value.tv_usec < 1000000 &&
+                       (negative || v.it_value.tv_sec >= 9223372035L);
+    }
+    printf("virtual huge negative=%d usec-in-range=%d\n", negative, readings_ok);
     syscall(SYS_setitimer, 1L, NULL, NULL);
     /* SIGPROF, from the kernel, every interval while the CPU runs. */
     struct sigaction sa;

@@ -787,12 +787,12 @@ verified.
   forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`, `RTM_NEWNEIGH` or
   `RTM_DELNEIGH`), rules, queueing disciplines and the rest are
   `EOPNOTSUPP`, as are renaming `lo` and setting any other attribute of
-  it. An input route lookup (`RTA_IIF`) takes forwarding and reverse path
-  filtering to be off, as Linux's own settings have them, where a new
-  namespace of Linux takes the first one's for IPv4, which a host may
-  have changed (Docker turns forwarding on, Ubuntu reverse path filtering
-  to 2); it does not look yet at the `forwarding` and `rp_filter` of
-  `/proc/sys/net/ipv4/conf`. `/proc/sys/net` has only `ip_forward` and
+  it. An input route lookup (`RTA_IIF`) starts with forwarding and
+  reverse path filtering off, as Linux is built, where a new namespace of
+  Linux takes the first one's for IPv4, which a host may have changed
+  (Docker turns forwarding on, Ubuntu reverse path filtering to 2); it
+  takes `accept_local`, `send_redirects`, `shared_media` and
+  `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward` and
   the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default` and
   `lo`, where Linux has many more; their first namespace's values are as
   Linux is built, not a host's, so a new namespace starts from those. A

@@ -19539,7 +19539,7 @@ int main(int argc, char **argv) {
             /* A new namespace takes the first one's IPv4 settings, which a
                host may have changed (Docker turns forwarding on, Ubuntu
                reverse path filtering to 2); Linux's own, which the
-               emulator has and has no files for, are set: both off. */
+               emulator starts with, are set: both off. */
             static const char *const settings[] = {
                 "/proc/sys/net/ipv4/conf/all/forwarding", "/proc/sys/net/ipv4/conf/all/rp_filter",
                 "/proc/sys/net/ipv4/conf/default/rp_filter", "/proc/sys/net/ipv4/conf/lo/rp_filter"};
@@ -19648,6 +19648,67 @@ int main(int argc, char **argv) {
             nl_select(ctl, port, "10.40.1.1", 0, 0, "10.21.1.1", 0, 1, 0, "custom local from blackhole");
             nl_select(ctl, port, "10.40.1.1", 0, 0, "10.9.0.1", 0, 1, 0, "custom local from local");
             nl_select(ctl, port, "10.40.1.1", 0, 0, "10.9.0.255", 0, 1, 0, "custom local from broadcast");
+            /* Forwarding and reverse path filtering, as /proc/sys/net sets
+               them (ip_route_input_slow, __mkroute_input,
+               fib_validate_source); a route through a gateway on lo too. */
+            nl_route(ctl, port, 24, add, "10.30.0.0", 16, ROUTE4(.oif = 1, .flags = 4, .gw = "10.9.0.5"),
+                     "gateway4");
+            static const struct {
+                const char *dst, *src;
+                unsigned tos, flags;
+                const char *label;
+            } forwarded4[] = {
+                {"10.20.1.1", "192.0.2.1", 0, 0, "unicast"},
+                {"10.20.1.1", "10.20.5.5", 0, 0, "unicast from its route"},
+                {"10.20.1.1", "10.30.5.5", 0, 0, "unicast from the gateway's"},
+                {"10.20.1.1", "192.0.2.1", 0, 0x1000, "unicast lookup table"},
+                {"10.20.1.1", "192.0.2.1", 0, 0x2000, "unicast fibmatch"},
+                {"10.20.1.1", "10.9.0.1", 0, 0, "unicast from local"},
+                {"10.20.1.1", "10.9.0.255", 0, 0, "unicast from broadcast"},
+                {"10.20.1.1", "10.21.1.1", 0, 0, "unicast from blackhole"},
+                {"10.30.1.1", "192.0.2.1", 0, 0, "gateway"},
+                {"10.21.1.1", "192.0.2.1", 0, 0, "blackhole"},
+                {"10.22.1.1", "192.0.2.1", 0, 0, "unreachable"},
+                {"10.23.1.1", "192.0.2.1", 0, 0, "prohibit"},
+                {"10.24.1.1", "192.0.2.1", 0x10, 0, "tos route"},
+                {"8.8.8.8", "192.0.2.1", 0, 0, "no route"},
+                {"10.9.0.1", "192.0.2.1", 0, 0, "local"},
+                {"10.9.0.1", "10.20.5.5", 0, 0, "local from a route"},
+                {"255.255.255.255", "192.0.2.1", 0, 0, "broadcast"},
+                {"224.0.0.1", "192.0.2.1", 0, 0, "all hosts"},
+            };
+            static const struct {
+                const char *file, *value, *label;
+            } steps[] = {
+                {"/proc/sys/net/ipv4/conf/all/forwarding", "1", "forwarding"},
+                {"/proc/sys/net/ipv4/conf/all/rp_filter", "1", "forwarding, strict"},
+                {"/proc/sys/net/ipv4/conf/all/rp_filter", "2", "forwarding, loose"},
+                {"/proc/sys/net/ipv4/conf/all/rp_filter", "0", "forwarding, all off"},
+                {"/proc/sys/net/ipv4/conf/lo/rp_filter", "2", "forwarding, lo loose"},
+                {"/proc/sys/net/ipv4/conf/lo/forwarding", "0", "lo not forwarding"},
+                {"/proc/sys/net/ipv4/conf/lo/forwarding", "1", "lo forwarding"},
+            };
+            for (size_t step = 0; step < sizeof steps / sizeof steps[0]; step++) {
+                int fd = open(steps[step].file, O_WRONLY);
+                long wrote = fd < 0 ? -errno : write(fd, steps[step].value, 1);
+                if (fd >= 0) close(fd);
+                printf("-- %s: %ld\n", steps[step].label, wrote < 0 ? -errno : wrote);
+                for (size_t i = 0; i < sizeof forwarded4 / sizeof forwarded4[0]; i++) {
+                    char label[96];
+                    snprintf(label, sizeof label, "%s: %s", steps[step].label, forwarded4[i].label);
+                    nl_select(ctl, port, forwarded4[i].dst, forwarded4[i].tos, forwarded4[i].flags,
+                              forwarded4[i].src, 0, 1, 0, label);
+                }
+            }
+            static const char *const off[] = {"/proc/sys/net/ipv4/conf/all/forwarding",
+                                              "/proc/sys/net/ipv4/conf/lo/rp_filter"};
+            for (size_t i = 0; i < sizeof off / sizeof off[0]; i++) {
+                int fd = open(off[i], O_WRONLY);
+                if (fd >= 0) {
+                    if (write(fd, "0", 1) < 0) printf("%s: write=%d\n", off[i], -errno);
+                    close(fd);
+                }
+            }
             /* IPv6. */
             static const struct {
                 const char *dst, *src;

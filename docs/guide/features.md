@@ -2217,9 +2217,19 @@ kernel.
     (`fib_validate_source`). A local, broadcast or multicast destination
     gives a local route of that type (`RTCF_LOCAL`, `RTCF_BROADCAST`,
     `RTCF_MULTICAST`), of the TOS of the route that matched and without a
-    preferred source; anything else would be forwarded, and is
-    `EHOSTUNREACH`. IPv6 gives the route the tables do, whatever its
-    source. The mark, the user ID, the protocol and the ports choose among
+    preferred source. Anything else would be forwarded: with `lo`'s
+    `forwarding` off (`/proc/sys/net`), it is `EHOSTUNREACH`; on, a
+    destination no route takes gives the lookup's error, a route of a
+    kind other than unicast `EINVAL`, and a unicast one the route it is
+    forwarded on (`__mkroute_input`): unicast, out through `lo`, with the
+    route's gateway and metrics, and `RTCF_DOREDIRECT` where the source's
+    own route is a unicast one through `lo` without a gateway, as a packet
+    that goes out where it came in asks to redirect. Reverse path
+    filtering (`rp_filter`, `all`'s or `lo`'s, the larger) checks every
+    source by a lookup of it (`__fib_validate_source`): with it on, a
+    source no route takes is dropped too; strict and loose filtering ask
+    the same, as every route goes through `lo`. IPv6 gives the route the
+    tables do, whatever its source and its `forwarding`. The mark, the user ID, the protocol and the ports choose among
     policy rules and multipath routes, which there are none of, so they
     change nothing.
   - **Route metrics:** an IPv4 or IPv6 route keeps the metrics its

@@ -161,6 +161,9 @@ const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 /// `RTCF_BROADCAST` or `RTCF_MULTICAST` for a broadcast or multicast one.
 const RTM_F_CLONED: u32 = 0x200;
 const RTCF_LOCAL: u32 = 0x8000_0000;
+/// An input route that sends a packet out where it came in, which asks
+/// for a redirect (`IPSKB_DOREDIRECT`, as `rt_fill_info` tells it).
+const RTCF_DOREDIRECT: u32 = 0x0100_0000;
 const RTCF_BROADCAST: u32 = 0x1000_0000;
 const RTCF_MULTICAST: u32 = 0x2000_0000;
 /// `RTN_MULTICAST`, the type of a looked-up route to a multicast address.
@@ -3906,6 +3909,18 @@ fn lookup(
         return Err(ENODEV);
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
+    // The devices alone, before the addresses.
+    let (forwarding, rp_filter) = {
+        let devices = network.devices();
+        devices
+            .by_index(crate::netdev::LOOPBACK_INDEX)
+            .map_or((false, 0), |lo| {
+                (
+                    lo.conf4.forwarding != 0,
+                    lo.conf4.rp_filter.max(devices.all4.rp_filter),
+                )
+            })
+    };
     let addresses = network.addresses();
     if iif == LOOPBACK_OIF {
         let input = Input {
@@ -3914,6 +3929,8 @@ fn lookup(
             mark,
             uid: asked_uid,
             reply: (seq, port),
+            forwarding,
+            rp_filter,
         };
         return if v6 {
             input6(&addresses, address6, source6, &input, now)
@@ -4164,12 +4181,17 @@ struct Input {
     mark: u32,
     uid: Option<u32>,
     reply: (u32, u32),
+    /// `lo`'s `forwarding` (`IN_DEV_FORWARD`), and the reverse path
+    /// filtering that counts, `all`'s or `lo`'s, the larger
+    /// (`IN_DEV_RPFILTER`), as `/proc/sys/net` sets them.
+    forwarding: bool,
+    rp_filter: i32,
 }
 /// An IPv4 route lookup for a packet in on `lo` to `address` from
 /// `source` (`RTA_IIF`), as `inet_rtm_getroute` takes it through
-/// `ip_route_input_rcu`, with forwarding off and reverse path filtering
-/// off, Linux's own settings, which a new namespace of Linux takes from
-/// the first one's instead. `EINVAL` for what `ip_route_input_slow` drops,
+/// `ip_route_input_rcu`, with `lo`'s forwarding and reverse path filtering
+/// as `/proc/sys/net` sets them, each source checked as
+/// [`Addresses::validate_source4`] checks it. `EINVAL` for what `ip_route_input_slow` drops,
 /// in its order: a multicast destination of a group `lo` has not joined
 /// (only 224.0.0.1, while it is up), or from a multicast, limited
 /// broadcast or loopback source, from none but to a group of the local
@@ -4178,8 +4200,14 @@ struct Input {
 /// broadcast address or from and to 0.0.0.0, a source or destination of
 /// 0.0.0.0 or of the loopback net. A multicast or broadcast one (also a
 /// destination a broadcast route has) is checked by its source too, as is
-/// a local one. Any other is `EHOSTUNREACH`, as it would be forwarded, and
-/// so is one no route takes (`fib_lookup`'s error). The answer, as
+/// a local one. With forwarding off, any other is `EHOSTUNREACH`, and so
+/// is one no route takes; with it on, one no route takes is `fib_lookup`'s
+/// error, one of a route of another kind than unicast `EINVAL`, and a
+/// unicast one is forwarded (`__mkroute_input`), checked by its source as
+/// it goes out through `lo` again: the answer is a unicast route of no
+/// local flag, with `RTCF_DOREDIRECT` where the source's route is one of
+/// host scope, the route's gateway as `RTA_GATEWAY` where it uses one, and
+/// its metrics. The answer, as
 /// `rt_fill_info` gives an input route: of the route's type (or broadcast
 /// or multicast), with `RTCF_LOCAL` and `RTCF_BROADCAST` or
 /// `RTCF_MULTICAST`, of the TOS of the route that matched, the source as
@@ -4189,7 +4217,7 @@ struct Input {
 /// `RTM_F_FIB_MATCH` it is the route that matched, of the type made, and
 /// `EHOSTUNREACH` where no table gave one.
 ///
-/// [`Addresses::valid_source4`]: crate::interface::Addresses::valid_source4
+/// [`Addresses::validate_source4`]: crate::interface::Addresses::validate_source4
 fn input4(
     network: &Network,
     addresses: &crate::interface::Addresses,
@@ -4201,6 +4229,12 @@ fn input4(
     use core::net::Ipv4Addr;
     let (ip, src) = (Ipv4Addr::from(address), Ipv4Addr::from(asked_source));
     let martian = |src: Ipv4Addr| src.is_multicast() || src.is_broadcast();
+    // `fib_validate_source` of a packet that is not forwarded.
+    let valid = |src: Ipv4Addr| {
+        addresses
+            .validate_source4(src, input.tos, 0, input.rp_filter)
+            .is_ok()
+    };
     // The route's type and flags, and the table entry it came from.
     let (code, flags, route) = if ip.is_multicast() {
         // `ip_route_input_mc`, for a group `lo` has joined
@@ -4209,9 +4243,7 @@ fn input4(
             return Err(Errno::EINVAL);
         }
         let local_group = u32::from(ip) & 0xffff_ff00 == 0xe000_0000;
-        if src.is_unspecified() && !local_group
-            || !src.is_unspecified() && !addresses.valid_source4(src)
-        {
+        if src.is_unspecified() && !local_group || !src.is_unspecified() && !valid(src) {
             return Err(Errno::EINVAL);
         }
         (RTN_MULTICAST, RTCF_MULTICAST | RTCF_LOCAL, None)
@@ -4219,7 +4251,7 @@ fn input4(
         return Err(Errno::EINVAL);
     } else if ip.is_broadcast() || src.is_unspecified() && ip.is_unspecified() {
         // `brd_input`, before any lookup.
-        if !src.is_unspecified() && !addresses.valid_source4(src) {
+        if !src.is_unspecified() && !valid(src) {
             return Err(Errno::EINVAL);
         }
         (Kind::Broadcast.code(), RTCF_BROADCAST | RTCF_LOCAL, None)
@@ -4227,13 +4259,14 @@ fn input4(
         return Err(Errno::EINVAL);
     } else {
         // Forwarding off, what no route takes is `EHOSTUNREACH`, and so is
-        // what is not local nor broadcast.
+        // what is not local nor broadcast; on, what no route takes is the
+        // lookup's error (`no_route`).
         let route = addresses
             .lookup4_flow(ip, input.tos, 0)
-            .map_err(|_| EHOSTUNREACH)?;
+            .map_err(|e| if input.forwarding { e } else { EHOSTUNREACH })?;
         match route.kind {
             Kind::Broadcast | Kind::Local => {
-                if !addresses.valid_source4(src) {
+                if !valid(src) {
                     return Err(Errno::EINVAL);
                 }
                 let flags = if route.kind == Kind::Broadcast {
@@ -4243,7 +4276,17 @@ fn input4(
                 };
                 (route.kind.code(), flags, Some(route))
             }
-            _ => return Err(EHOSTUNREACH),
+            _ if !input.forwarding => return Err(EHOSTUNREACH),
+            // `martian_destination`.
+            kind if kind != Kind::Unicast => return Err(Errno::EINVAL),
+            // `__mkroute_input`, out through `lo`, where it came in.
+            _ => {
+                let redirect = addresses
+                    .validate_source4(src, input.tos, LOOPBACK_OIF, input.rp_filter)
+                    .map_err(|()| Errno::EINVAL)?;
+                let flags = if redirect { RTCF_DOREDIRECT } else { 0 };
+                (route.kind.code(), flags, Some(route))
+            }
         }
     };
     let (seq, port) = input.reply;
@@ -4289,6 +4332,13 @@ fn input4(
         attribute(&mut body, RTA_SRC, &asked_source);
     }
     attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+    // A forwarded one has its route's next hop (`rt_set_nexthop`).
+    if let Some(route) = route.filter(|r| r.kind == Kind::Unicast) {
+        if let Some(gateway) = route.gateway.filter(|_| route.uses_gateway) {
+            attribute(&mut body, RTA_GATEWAY, &gateway.octets());
+        }
+        put_metrics(&mut body, &route.metrics);
+    }
     if input.mark != 0 {
         attribute(&mut body, RTA_MARK, &input.mark.to_le_bytes());
     }

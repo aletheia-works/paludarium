@@ -681,11 +681,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `RTM_NEWNEIGH` と `RTM_DELNEIGH`）、ブリッジの転送データベース（`AF_BRIDGE` の
   `RTM_GETNEIGH`、`RTM_NEWNEIGH`、`RTM_DELNEIGH`）、ルール、キューイング規律などは
   `EOPNOTSUPP` で、`lo` の名前の変更、ほかの属性の設定もそうです。入力の経路の
-  引き当て（`RTA_IIF`）は、Linux 自身の設定と同じく、転送も逆経路のフィルターも
-  切ったものとします。Linux の新しい名前空間は IPv4 の設定を最初の名前空間から
+  引き当て（`RTA_IIF`）は、Linux の組み込みの値と同じく、転送も逆経路のフィルターも
+  切ったところから始まります。Linux の新しい名前空間は IPv4 の設定を最初の名前空間から
   受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
-  フィルターを 2 にします）。`/proc/sys/net/ipv4/conf` の `forwarding` と `rp_filter` は、
-  まだ見ません。`/proc/sys/net` にあるのは、`ip_forward` と、`all`、`default`、`lo` の
+  フィルターを 2 にします）。ファイルのない `accept_local`、`send_redirects`、
+  `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward` と、`all`、`default`、`lo` の
   `forwarding`、`rp_filter`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
   最初の名前空間の値はホストのものではなく Linux の組み込みの値なので、新しい名前空間も
   そこから始まります。変えても `RTM_NEWNETCONF` は送らず、IPv6 の `forwarding` は

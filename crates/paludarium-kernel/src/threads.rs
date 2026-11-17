@@ -541,6 +541,13 @@ impl ThreadGroup {
         }
         public.retain(|&tid, _| tid == pid);
         drop(public);
+        // A rename of a thread execve ended, which must not name the new
+        // program when the thread that ran it takes the leader's TID; that
+        // thread took its own at the system call's entry.
+        self.renames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         // So does its CPU mask.
         let mut affinity = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
         let kept = affinity.remove(&old_tid);
@@ -1427,6 +1434,11 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
+        // A rename it did not live to take.
+        self.renames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tid);
     }
     /// Publishes what thread `tid` shows in `/proc`.
     pub(crate) fn publish(&self, tid: u32, thread: PublicThread) {
@@ -1437,15 +1449,13 @@ impl ThreadGroup {
     }
     /// Renames thread `tid` to `name`, as `/proc` shows it at once and the
     /// thread takes at its next system call or checkpoint ([`Self::take_rename`]).
+    /// A thread that is gone is not renamed.
     pub(crate) fn rename(&self, tid: u32, name: [u8; 16]) {
-        if let Some(public) = self
-            .public
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(&tid)
-        {
-            public.name = name;
-        }
+        let mut public = self.public.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(record) = public.get_mut(&tid) else {
+            return;
+        };
+        record.name = name;
         self.renames
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

@@ -408,9 +408,13 @@ pub(crate) fn own_live_owner(
     tid: u32,
     open: bool,
 ) -> crate::proc::LiveOwner {
-    let processes = std::sync::Arc::clone(processes);
+    // Weak, as the file that holds it sits in a descriptor table of theirs.
+    let processes = std::sync::Arc::downgrade(processes);
     std::sync::Arc::new(move || {
-        let Some(view) = processes.view(pid) else {
+        let Some(view) = processes
+            .upgrade()
+            .and_then(|processes| processes.view(pid))
+        else {
             return (0, 0);
         };
         let public = view.group.public(tid);

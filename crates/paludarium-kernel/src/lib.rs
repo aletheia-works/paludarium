@@ -39,6 +39,7 @@ mod keys;
 mod loopback;
 mod lsm;
 mod mctp;
+mod netdev;
 mod netlink;
 pub use inet::{InvalidRule, NetworkPolicy};
 mod futex;

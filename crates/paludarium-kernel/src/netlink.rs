@@ -41,6 +41,7 @@
 use crate::events::{CLOEXEC, IN, NONBLOCK, OUT, ReadinessHub};
 use crate::inet::Network;
 use crate::interface::MctpRoute;
+use crate::netdev::{LOOPBACK_INDEX, LOOPBACK_OIF};
 use crate::sockets::Timeout;
 use crate::syscalls::Context;
 use paludarium_host::{FileHandle, FileStat};
@@ -1455,22 +1456,25 @@ impl NetlinkSocket {
         // `rtnl_getlink` and `rtnl_setlink` need (`EINVAL`), while
         // `rtnl_newlink` takes no negative index (`EINVAL`).
         let newlink = !get && header.kind == RTM_NEWLINK;
-        let found = match (index, name) {
+        // In the namespace the request names (`IFLA_TARGET_NETNSID`), or
+        // else this one.
+        let network = target
+            .as_ref()
+            .map_or(&self.network, |(_, network)| network);
+        let device = match (index, name) {
             (i, _) if i < 0 && newlink => {
                 return Err(extack::message(Errno::EINVAL, "ifindex can't be negative"));
             }
-            (i, _) if i > 0 => i == 1,
-            (_, Some(name)) => name == b"lo",
-            (_, None) if !newlink => return Err(Errno::EINVAL),
-            (_, None) => false,
+            (_, None) if index <= 0 && !newlink => return Err(Errno::EINVAL),
+            _ => network.devices().find(index, name).cloned(),
         };
-        if !found {
+        let Some(device) = device else {
             // `rtnl_newlink` makes a link only of a kind it is given.
             if !get && header.kind == RTM_NEWLINK && header.flags & NLM_F_CREATE != 0 {
                 return Err(extack::message(EOPNOTSUPP, "Unknown device type"));
             }
             return Err(ENODEV);
-        }
+        };
         if get {
             return Ok((word(8), word(12), target));
         }
@@ -1498,7 +1502,7 @@ impl NetlinkSocket {
             return Err(EOPNOTSUPP);
         }
         // Renaming `lo` to another name is not supported.
-        if index > 0 && name.is_some_and(|name| name != b"lo") {
+        if index > 0 && name.is_some_and(|name| name != device.name) {
             return Err(EOPNOTSUPP);
         }
         Ok((word(8), word(12), None))
@@ -1524,9 +1528,10 @@ impl NetlinkSocket {
                 "specified netns attribute not supported",
             ));
         }
-        if let Some(value) = by_kind.get(&IFLA_TARGET_NETNSID) {
-            nsid::target(&self.network, &self.opener, s32_value(value))?;
-        }
+        let network = match by_kind.get(&IFLA_TARGET_NETNSID) {
+            Some(value) => nsid::target(&self.network, &self.opener, s32_value(value))?,
+            None => Arc::clone(&self.network),
+        };
         let name = by_kind
             .get(&IFLA_IFNAME)
             .or_else(|| by_kind.get(&IFLA_ALT_IFNAME))
@@ -1535,8 +1540,8 @@ impl NetlinkSocket {
                 &value[..end]
             });
         let found = match (index, name) {
-            (i, _) if i > 0 => i == 1,
-            (_, Some(name)) => name == b"lo",
+            (i, _) if i > 0 => network.devices().by_index(i).is_some(),
+            (_, Some(name)) => network.devices().by_name(name).is_some(),
             (_, None) => {
                 // `rtnl_group_dellink`.
                 return Err(match by_kind.get(&IFLA_GROUP) {
@@ -2300,12 +2305,26 @@ fn link_dump(
     if master != 0 {
         return Ok(Vec::new());
     }
-    Ok(vec![match shown {
-        Some((id, peer)) => {
-            with_link_netnsid(link_message(&peer, seq, port, NLM_F_MULTI, mask), id)
-        }
-        None => link_message(network, seq, port, NLM_F_MULTI, mask),
-    }])
+    // Each device of the namespace, in the order of their indices: its
+    // loopback alone.
+    let (network, id) = match &shown {
+        Some((id, peer)) => (peer.as_ref(), Some(*id)),
+        None => (network, None),
+    };
+    let loopbacks = network
+        .devices()
+        .iter()
+        .filter(|d| d.kind == crate::netdev::DeviceKind::Loopback)
+        .count();
+    Ok((0..loopbacks)
+        .map(|_| {
+            let link = link_message(network, seq, port, NLM_F_MULTI, mask);
+            match id {
+                Some(id) => with_link_netnsid(link, id),
+                None => link,
+            }
+        })
+        .collect())
 }
 /// Strictly, a bridge link dump (`valid_bridge_getlink_req`) takes no
 /// type, flags, change mask or index (`EINVAL`), then breaks no rule of
@@ -2566,7 +2585,7 @@ fn mctp_addresses(network: &Network, payload: &[u8], seq: u32, port: u32) -> Vec
 /// ID as `IFA_LOCAL` and as `IFA_ADDRESS`.
 fn mctp_address(eid: u8, kind: u16, flags: u16, seq: u32, port: u32) -> Vec<u8> {
     let mut body = vec![AF_MCTP, 0, 0, 0];
-    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&LOOPBACK_OIF.to_le_bytes());
     attribute(&mut body, IFA_LOCAL, &[eid]);
     attribute(&mut body, IFA_ADDRESS, &[eid]);
     message(kind, flags, seq, port, &body)
@@ -2608,7 +2627,7 @@ fn mctp_routes(network: &Network, seq: u32, port: u32) -> Vec<Vec<u8>> {
             }
             attribute(&mut body, RTA_METRICS, &metrics);
             match route.gateway {
-                None => attribute(&mut body, RTA_OIF, &1u32.to_le_bytes()),
+                None => attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes()),
                 Some((net, eid)) => {
                     let mut address = net.to_le_bytes().to_vec();
                     address.extend_from_slice(&[eid, 0, 0, 0]);
@@ -2640,7 +2659,8 @@ fn change_mctp_address(network: &Network, header: &Header, payload: &[u8]) -> Re
         .or_else(|| table.get(&IFA_ADDRESS))
         .map(|value| value[0])
         .ok_or(Errno::EINVAL)?;
-    if u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default()) != 1 {
+    // Only the loopback has an MCTP device (`mctp_dev_get_rtnl`).
+    if u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default()) != LOOPBACK_OIF {
         return Err(ENODEV);
     }
     let mut addresses = network.addresses();
@@ -2730,7 +2750,7 @@ fn change_mctp_route(network: &Network, header: &Header, payload: &[u8]) -> Resu
         (0, None) => {
             return Err(extack::message(Errno::EINVAL, "no route output provided"));
         }
-        (1, None) => None,
+        (LOOPBACK_OIF, None) => None,
         (_, None) => return Err(extack::message(ENODEV, "bad ifindex")),
         (0, Some(value)) => {
             let eid = value[4];
@@ -2865,7 +2885,7 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
     for (&kind, &value) in &attributes {
         match kind {
             RTA_TABLE => filter.table = u32_value(value)?,
-            RTA_OIF if u32_value(value)? == 1 => filter.device = true,
+            RTA_OIF if u32_value(value)? == LOOPBACK_OIF => filter.device = true,
             RTA_OIF => return Err(ENODEV),
             _ => {
                 return Err(extack::message(
@@ -3147,7 +3167,7 @@ fn link_message(network: &Network, seq: u32, port: u32, flags: u16, mask: u32) -
     let mut body = Vec::new();
     body.extend_from_slice(&[0, 0]);
     body.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
-    body.extend_from_slice(&1i32.to_le_bytes());
+    body.extend_from_slice(&LOOPBACK_INDEX.to_le_bytes());
     body.extend_from_slice(&link_flags(network).to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
     let u32_of = |v: u32| v.to_le_bytes();
@@ -3228,7 +3248,7 @@ fn af_spec(up: bool, stats: bool) -> Vec<u8> {
     // MCTP's, first, as a kernel built with it (Ubuntu's) gives: its
     // default network, 1, and no physical binding.
     let mut mctp = Vec::new();
-    attribute(&mut mctp, IFLA_MCTP_NET, &1u32.to_le_bytes());
+    attribute(&mut mctp, IFLA_MCTP_NET, &LOOPBACK_OIF.to_le_bytes());
     attribute(&mut mctp, IFLA_MCTP_PHYS_BINDING, &[0]);
     let mut spec = Vec::new();
     attribute(&mut spec, u16::from(AF_MCTP), &mctp);
@@ -3278,7 +3298,7 @@ fn inet6_link_message(network: &Network, seq: u32, port: u32, flags: u16) -> Vec
     let up = network.is_up();
     let mut body = vec![AF_INET6, 0];
     body.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
-    body.extend_from_slice(&1i32.to_le_bytes());
+    body.extend_from_slice(&LOOPBACK_INDEX.to_le_bytes());
     body.extend_from_slice(&link_flags(network).to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
     attribute(&mut body, IFLA_IFNAME, b"lo\0");
@@ -3362,7 +3382,7 @@ fn ipv4_address(
 ) -> Vec<u8> {
     {
         let mut body = vec![AF_INET, address.prefix, address.flags as u8, address.scope];
-        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&LOOPBACK_OIF.to_le_bytes());
         if !address.address.is_unspecified() {
             attribute(&mut body, IFA_ADDRESS, &address.address.octets());
         }
@@ -3420,7 +3440,7 @@ fn ipv6_address(
             address_flags as u8,
             address.scope(),
         ];
-        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&LOOPBACK_OIF.to_le_bytes());
         attribute(&mut body, IFA_ADDRESS, &address.address.octets());
         if address.priority != 0 {
             attribute(&mut body, IFA_RT_PRIORITY, &address.priority.to_le_bytes());
@@ -3550,7 +3570,7 @@ fn change_address(
         if add && local.is_some_and(|l| l.is_unspecified()) {
             return Ok(Vec::new());
         }
-        if index != 1 {
+        if !network.has_device(index) {
             return Err(extack::message(ENODEV, "ipv4: Device not found"));
         }
         if !add {
@@ -3584,7 +3604,7 @@ fn change_address(
         if prefix > 128 {
             return Err(long());
         }
-        if index != 1 {
+        if !network.has_device(index) {
             return Err(no_device());
         }
         return network.addresses().del_v6(ip, prefix, now);
@@ -3595,7 +3615,7 @@ fn change_address(
             "ipv6: address lifetime invalid",
         ));
     }
-    if index != 1 {
+    if !network.has_device(index) {
         return Err(no_device());
     }
     let flags = flags & crate::interface::V6_ASKED;
@@ -3688,7 +3708,7 @@ fn ipv4_route_of(
         attribute(&mut body, RTA_GATEWAY, &gateway.octets());
     }
     if route.device {
-        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+        attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
     }
     message(kind, flags, seq, port, &body)
 }
@@ -3723,7 +3743,7 @@ fn ipv6_route_of(
     }
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
     let mut cache = [0; RTA_CACHEINFO_LEN];
     cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &cache);
@@ -3849,12 +3869,12 @@ fn lookup(
     if proto.is_some_and(|p| !matches!(p, 6 | 17) && p != icmp) {
         return Err(extack::message(EOPNOTSUPP, "Unsupported ip proto"));
     }
-    if iif != 0 && iif != 1 {
+    if iif != 0 && !network.has_device(iif) {
         return Err(ENODEV);
     }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
     let addresses = network.addresses();
-    if iif == 1 {
+    if iif == LOOPBACK_OIF {
         let input = Input {
             tos,
             flags: request_flags,
@@ -3881,7 +3901,7 @@ fn lookup(
         // link-local or multicast address (`rt6_need_strict`), and every
         // one goes through `lo`.
         let strict = ip.is_loopback() || ip.is_unicast_link_local() || ip.is_multicast();
-        if oif != 0 && oif != 1 && (strict || source6 == [0; 16]) {
+        if oif != 0 && oif != LOOPBACK_OIF && (strict || source6 == [0; 16]) {
             return Err(ENETUNREACH);
         }
         let route = addresses.lookup6(ip)?;
@@ -3914,7 +3934,7 @@ fn lookup(
         // The route's metrics, which its `rt6_info` shares.
         put_metrics(&mut body, &route.metrics);
         attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-        attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+        attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
         attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
         attribute(&mut body, RTA_PREF, &[0]);
         return Ok(message(RTM_NEWROUTE, 0, seq, port, &body));
@@ -3941,7 +3961,7 @@ fn lookup(
         direct = oif == 0 && (ip.is_multicast() || ip.is_broadcast());
     }
     if oif != 0 {
-        if oif != 1 {
+        if !network.has_device(oif) {
             return Err(ENODEV);
         }
         if !network.is_up() {
@@ -4082,7 +4102,7 @@ fn lookup(
     if !named.is_unspecified() {
         attribute(&mut body, RTA_SRC, &asked_source);
     }
-    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
     if source != named {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
@@ -4235,14 +4255,14 @@ fn input4(
     if !src.is_unspecified() {
         attribute(&mut body, RTA_SRC, &asked_source);
     }
-    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
     if input.mark != 0 {
         attribute(&mut body, RTA_MARK, &input.mark.to_le_bytes());
     }
     if let Some(uid) = input.uid.filter(|&uid| uid != u32::MAX) {
         attribute(&mut body, RTA_UID, &uid.to_le_bytes());
     }
-    attribute(&mut body, RTA_IIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_IIF, &LOOPBACK_OIF.to_le_bytes());
     attribute(&mut body, RTA_CACHEINFO, &lookup_cacheinfo());
     Ok(message(RTM_NEWROUTE, 0, seq, port, &body))
 }
@@ -4287,13 +4307,13 @@ fn input6(
         attribute(&mut body, RTA_DST, &address);
         attribute(&mut body, RTA_SRC, &source);
     }
-    attribute(&mut body, RTA_IIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_IIF, &LOOPBACK_OIF.to_le_bytes());
     if let Some(source) = route.prefsrc {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
     put_metrics(&mut body, &route.metrics);
     attribute(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
-    attribute(&mut body, RTA_OIF, &1u32.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
     if fib_match {
         let mut cache = [0; RTA_CACHEINFO_LEN];
         cache[8..12].copy_from_slice(&route_expires(route.expires, now).to_le_bytes());
@@ -4793,7 +4813,7 @@ fn neighbour_message(
 ) -> Vec<u8> {
     let family = if n.ip.is_ipv6() { AF_INET6 } else { AF_INET };
     let mut body = vec![family, 0, 0, 0];
-    body.extend_from_slice(&1i32.to_le_bytes());
+    body.extend_from_slice(&LOOPBACK_INDEX.to_le_bytes());
     body.extend_from_slice(&u16::from(n.state).to_le_bytes());
     body.extend_from_slice(&[(n.flags & 0xff) as u8, n.kind]);
     attribute(&mut body, NDA_DST, &key_bytes(&n.ip));
@@ -5013,7 +5033,7 @@ fn neighbour_get(
             ));
         }
     };
-    if index != 0 && index != 1 {
+    if index != 0 && !network.has_device(index) {
         return Err(extack::message(ENODEV, "Unknown device ifindex"));
     }
     let addresses = network.addresses();
@@ -5232,7 +5252,7 @@ fn change_neighbour(
         };
         let flags = u32::from(payload[10]) | ext << 8;
         let index = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-        if index != 0 && index != 1 {
+        if index != 0 && !network.has_device(index) {
             return Err(ENODEV);
         }
         if add

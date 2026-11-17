@@ -3002,7 +3002,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マップを作れる設定でも `CAP_BPF` が要り（`EPERM`）、いつも事前に確保され
   （`BPF_F_NO_PREALLOC` は `ENOTSUPP`）、`BPF_F_NO_COMMON_LRU` では CPU ごとにリストを持ちます
   （`max_entries` を CPU の数の倍数に切り上げ、どの CPU も同じ数です。`BPF_F_NUMA_NODE` と
-  一緒なら `EINVAL`）。メモリは予備のない要素だけを数えます。ないものは [制限](./limitations) を
+  一緒なら `EINVAL`）。メモリは予備のない要素だけを数えます。`BPF_MAP_TYPE_QUEUE` と
+  `BPF_MAP_TYPE_STACK` は、Linux の `queue_stack_maps.c` と同じく、キーのない値を持ちます
+  （`key_size` は 0 で、null でないキーのポインタは `EINVAL`）。`UPDATE_ELEM` は積み
+  （いっぱいなら `E2BIG`。`BPF_EXIST` ならいちばん古い値を手放して場所を空けます。
+  `BPF_NOEXIST` は `EINVAL`）、`LOOKUP_ELEM` は見るだけ、`LOOKUP_AND_DELETE_ELEM` は
+  取り出します。キューはいちばん古い値を、スタックはいちばん新しい値を返します（なければ
+  `ENOENT`）。`DELETE_ELEM` と `GET_NEXT_KEY` は `EINVAL`、バッチのコマンドは
+  `ENOTSUPP` です。`CAP_BPF` が要り、フラグは `BPF_F_NUMA_NODE` とアクセスのものだけで、
+  4 MiB を超える値と、`max_entries` と値の大きさの積が 32 ビットを超えるものは、Linux
+  master と同じく `E2BIG` です。312 バイトのヘッダーと `max_entries + 1` 個の値の場所を
+  取ります。ないものは [制限](./limitations) を
   参照してください。
 - `BPF_PROG_LOAD` は、Linux の `bpf_prog_load` と同じ順に同じエラーで引数を確かめます。
   この順とエラーは、テストのマシンのカーネル（Ubuntu の Linux 7.0）と master で同じです。
@@ -3180,7 +3190,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `readv`、`preadv`、`preadv2`、`sendfile`・`splice`・`copy_file_range` の入力）も、
   `rw_verify_area` と同じくディスクリプタ、バッファ、大きさ、位置の確認のあとに同じように
   答えを待ちます。`vfs_readv` と同じく、0 バイトの `readv` と `preadv` は何も尋ねず、
-  0 バイトの `read` と `pread64` は尋ねます。
+  0 バイトの `read` と `pread64` は尋ねます。AIO の読み出し（`IOCB_CMD_PREAD`、
+  `IOCB_CMD_PREADV`）は、`aio_read` が `rw_verify_area` を呼ぶのと同じく `io_submit` の
+  ときに、0 バイトでも尋ねます。拒まれたものは、`io_submit` がほかの失敗と同じく
+  その要求で失敗させます（最初のものなら `EPERM`）。
   `statfs` の `f_fsid` はイベントが示すファイルシステムの ID と同じです。カーネル自身の
   ファイルシステム、/proc、devpts、mqueue では `simple_statfs` と同じくデバイス番号、
   ほかのファイルシステムでは、tmpfs が UUID を引くように、ファイルシステムごとに引いた

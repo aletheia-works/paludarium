@@ -3467,8 +3467,18 @@ kernel.
   (`BPF_F_NO_PREALLOC` is `ENOTSUPP`), and with `BPF_F_NO_COMMON_LRU` keeps
   lists for each CPU (`max_entries` rounded up to a multiple of the CPUs,
   as many for each; with `BPF_F_NUMA_NODE` `EINVAL`). It takes the memory
-  of its elements alone, with no spares. See [limitations](./limitations)
-  for what is not there.
+  of its elements alone, with no spares. `BPF_MAP_TYPE_QUEUE` and
+  `BPF_MAP_TYPE_STACK` hold values without keys (`key_size` 0, and a key
+  pointer that is not null is `EINVAL`), as Linux's `queue_stack_maps.c`:
+  `UPDATE_ELEM` pushes (a full one is `E2BIG`, unless `BPF_EXIST` makes room
+  by giving up the oldest; `BPF_NOEXIST` is `EINVAL`), `LOOKUP_ELEM` peeks
+  and `LOOKUP_AND_DELETE_ELEM` pops, a queue its oldest value and a stack
+  its newest (`ENOENT` for none); `DELETE_ELEM` and `GET_NEXT_KEY` are
+  `EINVAL` and the batch commands `ENOTSUPP`. They need `CAP_BPF`, take
+  only `BPF_F_NUMA_NODE` and the access flags, and refuse a value past
+  4 MiB or `max_entries` times the value size past 32 bits (`E2BIG`, as
+  Linux master). One takes a 312-byte header and `max_entries + 1` value
+  slots. See [limitations](./limitations) for what is not there.
 - `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
   its order and with its errors, which are the same in the test machines'
   kernel (Ubuntu's Linux 7.0) and in master: the fields past the command
@@ -3674,7 +3684,10 @@ kernel.
   `copy_file_range`) waits for the answers the same way, after the checks
   of the descriptor, the buffer, the size and the position, as
   `rw_verify_area` asks it; `readv` and `preadv` of no bytes ask nothing,
-  as `vfs_readv`, where `read` and `pread64` of none ask too. `statfs`'s `f_fsid` is the file system ID the events give: the
+  as `vfs_readv`, where `read` and `pread64` of none ask too. An AIO read
+  (`IOCB_CMD_PREAD`, `IOCB_CMD_PREADV`) asks at `io_submit`, as `aio_read`
+  calls `rw_verify_area` there, for no bytes too: a denied one fails that
+  request as `io_submit` fails any (`EPERM` when it is the first). `statfs`'s `f_fsid` is the file system ID the events give: the
   device of the kernel's own file systems, /proc, devpts and mqueue, as
   `simple_statfs` gives it, and a number drawn for each other file system,
   as tmpfs draws a UUID.

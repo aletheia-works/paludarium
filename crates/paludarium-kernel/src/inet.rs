@@ -308,6 +308,9 @@ pub(crate) struct Network {
     /// ([`Self::addresses_at`]), for netlink to tell of
     /// ([`crate::netlink::expire`]); locked after the addresses.
     expired: Mutex<Vec<crate::interface::Event>>,
+    /// Its network devices ([`crate::netdev`]), each taken out alone:
+    /// none of the other locks is taken while it is held.
+    devices: Mutex<crate::netdev::Devices>,
     /// The netlink sockets bound in it ([`crate::netlink`]).
     pub(crate) netlink: crate::netlink::Ports,
     /// Its MCTP sockets' binds and tags ([`crate::mctp`]).
@@ -337,6 +340,7 @@ impl Network {
             up: AtomicBool::new(true),
             ever_up: AtomicBool::new(true),
             addresses: Mutex::new(crate::interface::Addresses::first()),
+            devices: Mutex::new(crate::netdev::Devices::new()),
             expired: Mutex::new(Vec::new()),
             netlink: crate::netlink::Ports::default(),
             mctp: crate::mctp::Endpoints::default(),
@@ -354,6 +358,7 @@ impl Network {
             up: AtomicBool::new(false),
             ever_up: AtomicBool::new(false),
             addresses: Mutex::new(crate::interface::Addresses::isolated()),
+            devices: Mutex::new(crate::netdev::Devices::new()),
             expired: Mutex::new(Vec::new()),
             ..Self::new(NetworkPolicy::default())
         }
@@ -380,6 +385,17 @@ impl Network {
     /// monotonic `now` ([`crate::interface::Addresses::output`]).
     fn output(&self, to: IpAddr, now: Option<u64>) {
         self.addresses().output(plain(to), now.unwrap_or(0));
+    }
+    /// Its network devices.
+    pub(crate) fn devices(&self) -> MutexGuard<'_, crate::netdev::Devices> {
+        self.devices.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Whether it has a device of `index` (`__dev_get_by_index`), which an
+    /// address, route or neighbour request names.
+    pub(crate) fn has_device(&self, index: impl TryInto<i32>) -> bool {
+        index
+            .try_into()
+            .is_ok_and(|index| self.devices().by_index(index).is_some())
     }
     /// The loopback's addresses.
     pub(crate) fn addresses(&self) -> MutexGuard<'_, crate::interface::Addresses> {
@@ -488,10 +504,9 @@ impl Network {
         if request == SIOCSIFFLAGS && !may_administer {
             return Err(Errno::EPERM);
         }
-        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-        if &name[..end] != b"lo" {
+        let Some(index) = self.devices().by_name(name).map(|d| d.index) else {
             return Err(ENODEV);
-        }
+        };
         match request {
             SIOCGIFFLAGS => Ok(u32::from(if self.up.load(Ordering::SeqCst) {
                 IFF_UP | IFF_LOOPBACK | IFF_RUNNING
@@ -502,7 +517,7 @@ impl Network {
                 crate::netlink::set_up(self, flags & IFF_UP != 0, now);
                 Ok(0)
             }
-            _ => Ok(1),
+            _ => Ok(index.unsigned_abs()),
         }
     }
     /// How many dropped handshakes wait to be tried again.

@@ -221,7 +221,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   比べていません。テストのマシンの Linux 7.0 は 144 バイトまでしか知らず、0 でないものには
   `E2BIG` を返します。`kernel.perf_event_paranoid` は
   最初 Linux の 2 です（Debian と Ubuntu のカーネルの既定はそれより大きい）。
-- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュだけです。プログラムを
+- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュ、キュー、スタックだけです。プログラムを
   読み込むことはありません。検証器はなく、BPF は動きません。`BPF_PROG_LOAD` は Linux と同じく
   引数を確かめたあと、プログラムの型を組み込まずにビルドしたカーネルと同じく、どのプログラムも
   `EINVAL` で断ります。Linux なら読み込むプログラムや、検証器がほかのエラー（多くは `EACCES`）で
@@ -625,9 +625,10 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：許可イベントで送るのは、`open`、`openat`、`openat2`、`creat`、
   `open_by_handle_at` での（`/proc/self/fd` のリンクからも）オープンの `FAN_OPEN_PERM` と、
-  `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range` での
-  読み出しの `FAN_ACCESS_PERM` だけです。`FAN_OPEN_EXEC_PERM`、
-  exec の `FAN_OPEN_PERM`、exec・AIO・`io_uring` の読み出しの `FAN_ACCESS_PERM` は
+  `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range`、
+  AIO の要求での読み出しの `FAN_ACCESS_PERM` だけです（ここの `io_uring` には読み出しの
+  操作がありません）。`FAN_OPEN_EXEC_PERM`、exec の `FAN_OPEN_PERM`、exec の読み出しの
+  `FAN_ACCESS_PERM` は
   `fanotify_mark` で受け付けますが送らないので、求めるはずだったことはそのまま通ります。
   `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント

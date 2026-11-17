@@ -239,7 +239,7 @@ CI's own records, so anyone can check it:
 The last criterion does not hold yet. In a run of the check on CI (fork run
 43982096280), the JIT made long programs much faster: Perl's hash benchmark
 49%, Java 50% and OCaml 45%. But 9 of the 36 cases were slower than every
-round without it, all of them programs that take 0.1–0.25 s. Seven ripgrep
+round without it, all of them programs that take 0.1–0.25 s. Six ripgrep
 cases were 2–8% slower, two of aube's 7–8% and one probe case 2%. A program
 that short compiles dozens of blocks (about 0.7 ms each) that it then runs
 too few times to earn back, so that has to change before the switch. The

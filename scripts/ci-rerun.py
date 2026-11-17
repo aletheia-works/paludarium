@@ -34,6 +34,11 @@ def unacquired(job, annotations):
     )
 
 
+def repository(run):
+    """The run's head repository, or None: a deleted fork's is null."""
+    return (run.get("head_repository") or {}).get("full_name")
+
+
 def replaced(run, runs):
     """Whether a later run of `runs` replaced `run`: of the same workflow,
     head branch and event (the query's), and from the same repository, as two
@@ -42,7 +47,8 @@ def replaced(run, runs):
         other["id"] > run["id"]
         and other["head_branch"] == run["head_branch"]
         and other["event"] == run["event"]
-        and other["head_repository"]["full_name"] == run["head_repository"]["full_name"]
+        and repository(other) is not None
+        and repository(other) == repository(run)
         for other in runs
     )
 
@@ -242,7 +248,10 @@ def self_test():
         ([other(9)], False),
         ([other(13, branch="fix/a")], False),
         ([other(14, event="push")], False),
+        ([{**other(15), "head_repository": None}], False),
     )
+    if replaced({**own, "head_repository": None}, [other(16)]):
+        raise AssertionError("a deleted fork's run was replaced by a live one")
     query = urlencode({"branch": "fix/a&b+c#d", "event": "pull_request", "per_page": 20})
     if query != "branch=fix%2Fa%26b%2Bc%23d&event=pull_request&per_page=20":
         raise AssertionError(f"branch not encoded: {query}")

@@ -13,7 +13,9 @@ use paludarium_decoder::{
 use paludarium_mmu::AddressSpace;
 use paludarium_types::GuestAddr;
 
-use super::{Exec, Result, Stop};
+use paludarium_mmu::AtomicOp;
+
+use super::{Exec, Result, Stop, atomic_width};
 use crate::alu::{self, sign_extend, size_mask};
 use crate::state::{CpuState, flag};
 
@@ -310,6 +312,18 @@ pub enum Fast {
         src: Register,
         size: u8,
     },
+    /// `cmpxchg [m], r`, with `lock` or without: one atomic compare and
+    /// exchange of memory with rax, as [`Exec::cmpxchg`] does.
+    CmpxchgStore {
+        mem: Address,
+        src: Register,
+    },
+    /// `xchg [m], r` or `xchg r, [m]`, always locked: one atomic exchange,
+    /// as [`Exec::xchg`] does.
+    XchgStore {
+        mem: Address,
+        src: Register,
+    },
     /// `imul r, r` (`a` is `dst`) or `imul r, r, imm`.
     Imul {
         dst: Register,
@@ -470,7 +484,10 @@ impl Fast {
     /// The form of `i`, or [`Fast::None`].
     #[must_use]
     pub fn of(i: &Instruction) -> Self {
-        if i.lock || i.rep != RepPrefix::None {
+        // Of the locked instructions, only these have a form: their memory
+        // access is one atomic operation either way.
+        let lockable = matches!(i.mnemonic, Mnemonic::Cmpxchg | Mnemonic::Xchg);
+        if (i.lock && !lockable) || i.rep != RepPrefix::None {
             return Self::None;
         }
         Self::form(i).unwrap_or(Self::None)
@@ -591,6 +608,24 @@ impl Fast {
                     return None;
                 }
                 Self::MoveScalar { dst, src, size }
+            }
+            Mnemonic::Cmpxchg => {
+                let mem = address(a)?;
+                let src = gpr(b)?;
+                if src.size() != mem.size || !matches!(mem.size, 1 | 2 | 4 | 8) {
+                    return None;
+                }
+                Self::CmpxchgStore { mem, src }
+            }
+            Mnemonic::Xchg => {
+                let (mem, src) = match (address(a), gpr(b)) {
+                    (Some(mem), Some(src)) => (mem, src),
+                    _ => (address(b)?, gpr(a)?),
+                };
+                if src.size() != mem.size || !matches!(mem.size, 1 | 2 | 4 | 8) {
+                    return None;
+                }
+                Self::XchgStore { mem, src }
             }
             Mnemonic::Mul | Mnemonic::Imul if b.is_none() => Self::MulWide {
                 src: gpr(a)?,
@@ -875,6 +910,43 @@ pub(crate) fn execute(
             x.write_wide(size, full)?;
             let f = if overflow { flag::CF | flag::OF } else { 0 };
             x.set_status(flag::CF | flag::OF, f);
+            next
+        }
+        Fast::CmpxchgStore { mem, src } => {
+            let size = mem.size;
+            let acc = Register::Gpr { index: 0, size };
+            let expected = x.read_reg(acc) & size_mask(size);
+            let new = x.read_reg(src) & size_mask(size);
+            let current = x
+                .mem
+                .atomic(
+                    x.fast_linear(&mem),
+                    atomic_width(size)?,
+                    AtomicOp::CompareExchange {
+                        expected: u128::from(expected),
+                        replacement: u128::from(new),
+                    },
+                )?
+                .old as u64;
+            let (_, f) = alu::sub(expected, current, false, size);
+            if expected != current {
+                x.write_reg(acc, current);
+            }
+            x.set_status(flag::STATUS, f);
+            next
+        }
+        Fast::XchgStore { mem, src } => {
+            let size = mem.size;
+            let value = x.read_reg(src) & size_mask(size);
+            let old = x
+                .mem
+                .atomic(
+                    x.fast_linear(&mem),
+                    atomic_width(size)?,
+                    AtomicOp::Exchange(u128::from(value)),
+                )?
+                .old as u64;
+            x.write_reg(src, old & size_mask(size));
             next
         }
         Fast::XmmMove { dst, src } => {

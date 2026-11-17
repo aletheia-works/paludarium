@@ -45,6 +45,9 @@ pub(crate) struct Helpers {
     pub load128: u64,
     /// `(context, address, from) -> status`: the two words at `from`.
     pub store128: u64,
+    /// `(context, address, size, kind, a, b) -> (old, status)`: a locked
+    /// exchange (`kind` 0) or compare and exchange.
+    pub atomic: u64,
 }
 
 const I64: Type = types::I64;
@@ -71,6 +74,7 @@ struct Emitter<'a, 'b> {
     load_sig: cranelift_codegen::ir::SigRef,
     store_sig: cranelift_codegen::ir::SigRef,
     move128_sig: cranelift_codegen::ir::SigRef,
+    atomic_sig: cranelift_codegen::ir::SigRef,
     /// Whether the code reaches the xmm words of the register block.
     vector: bool,
 }
@@ -276,6 +280,29 @@ impl Emitter<'_, '_> {
             &[self.context, address, size, value],
         );
         self.b.inst_results(call)[0]
+    }
+
+    /// The locked access of `kind` (0: exchange with `a`; 1: compare with
+    /// `a` and exchange with `b`) of `size` bytes at `address`: the old
+    /// value and the status.
+    fn atomic(
+        &mut self,
+        address: Value,
+        size: u8,
+        kind: i64,
+        a: Value,
+        b: Value,
+    ) -> (Value, Value) {
+        let size = self.constant(i64::from(size));
+        let kind = self.constant(kind);
+        let callee = self.constant(self.helpers.atomic as i64);
+        let call = self.b.ins().call_indirect(
+            self.atomic_sig,
+            callee,
+            &[self.context, address, size, kind, a, b],
+        );
+        let results = self.b.inst_results(call);
+        (results[0], results[1])
     }
 
     /// The address of xmm register `n` in the register block.
@@ -1043,6 +1070,38 @@ impl Emitter<'_, '_> {
                 }
                 self.set_carry_overflow(overflow);
             }
+            Fast::CmpxchgStore { mem, src } => {
+                let size = mem.size;
+                let rax = self.gpr(0);
+                let expected = self.masked(rax, size);
+                let new = self.read(src);
+                let address = self.linear(&mem);
+                let (old, status) = self.atomic(address, size, 1, expected, new);
+                self.unless_failed(status, n, rip);
+                let (_, f) = self.alu(Alu::Sub, expected, old, size);
+                self.set_status(f);
+                // rax takes the old value only when the compare failed; a
+                // 32-bit write would otherwise clear its upper half.
+                let merged = if size >= 4 {
+                    old
+                } else {
+                    let kept = self.b.ins().band_imm_s(rax, !mask(size));
+                    self.b.ins().bor(kept, old)
+                };
+                let same = self.b.ins().icmp(IntCC::Equal, expected, old);
+                let value = self.b.ins().select(same, rax, merged);
+                self.set_gpr(0, value);
+                self.unless_changed(status, n + 1, next);
+            }
+            Fast::XchgStore { mem, src } => {
+                let value = self.read(src);
+                let address = self.linear(&mem);
+                let zero = self.constant(0);
+                let (old, status) = self.atomic(address, mem.size, 0, value, zero);
+                self.unless_failed(status, n, rip);
+                self.write(src, old);
+                self.unless_changed(status, n + 1, next);
+            }
             Fast::XmmMove { dst, src } => {
                 let low = self.word(XMM + 2 * usize::from(src));
                 let high = self.word(XMM + 2 * usize::from(src) + 1);
@@ -1351,6 +1410,10 @@ pub(crate) fn function(
     move128_sig.params.extend([AbiParam::new(I64); 3]);
     move128_sig.returns.push(AbiParam::new(I64));
     let move128_sig = b.import_signature(move128_sig);
+    let mut atomic_sig = Signature::new(CallConv::SystemV);
+    atomic_sig.params.extend([AbiParam::new(I64); 6]);
+    atomic_sig.returns.extend([AbiParam::new(I64); 2]);
+    let atomic_sig = b.import_signature(atomic_sig);
 
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
@@ -1375,6 +1438,7 @@ pub(crate) fn function(
         load_sig,
         store_sig,
         move128_sig,
+        atomic_sig,
         vector: false,
     };
     let mut open = true;

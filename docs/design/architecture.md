@@ -121,7 +121,9 @@ out:
 - `pshufd`, the `punpckl` and `punpckh` unpacks, `packuswb`, `packsswb`,
   `packssdw`, `paddd`, `psubd`, `paddq`, `psubq`, `pmuludq`, `pand`, `por` and
   `pandn` of xmm registers, `pslld` and `psrld` of one by an immediate, and
-  `pmovmskb`.
+  `pmovmskb`;
+- `cmpxchg` (with `lock` or without) and `xchg` between memory and a register,
+  each as the one atomic access of memory that the interpreter makes.
 
 A register in these forms may also be one of the high-byte registers `ah`, `ch`,
 `dh` and `bh`.

@@ -340,6 +340,17 @@ const FORMS: &[&[u8]] = &[
     &[0x66, 0x0f, 0x6a, 0xc1],
     &[0x66, 0x0f, 0x6d, 0xc1],
     &[0x66, 0x0f, 0x68, 0xc0],
+    // cmpxchg and xchg with memory, with lock or without
+    &[0xf0, 0x0f, 0xb1, 0x0b],
+    &[0x48, 0x0f, 0xb1, 0x0b],
+    &[0xf0, 0x48, 0x0f, 0xb1, 0x13],
+    &[0xf0, 0x0f, 0xb0, 0x0b],
+    &[0x66, 0xf0, 0x0f, 0xb1, 0x0b],
+    &[0x87, 0x0b],
+    &[0x48, 0x87, 0x03],
+    &[0x86, 0x23],
+    &[0xf0, 0x87, 0x0b],
+    &[0x66, 0x87, 0x13],
 ];
 
 struct Random(u64);
@@ -662,5 +673,48 @@ fn an_sse_move_that_fails_runs_nothing() {
         assert_eq!(state, before);
         let (_, data) = contents(&memory);
         assert!(data.iter().all(|&b| b == 0));
+    }
+}
+
+/// A compare and exchange whose compare matches writes memory, as the
+/// interpreter's does: rax is set to the bytes at the address first.
+#[test]
+fn a_compare_exchange_that_matches_does_what_the_interpreter_does() {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    for code in [
+        &[0xf0, 0x0f, 0xb1, 0x0b][..],
+        &[0x48, 0x0f, 0xb1, 0x0b][..],
+        &[0xf0, 0x0f, 0xb0, 0x0b][..],
+        &[0x66, 0xf0, 0x0f, 0xb1, 0x0b][..],
+    ] {
+        let compiled = compiler.compile(&forms(code)).unwrap();
+        for _ in 0..50 {
+            let data: Vec<u8> = (0..DATA_LEN).map(|_| random.next() as u8).collect();
+            let mut before = state(&mut random);
+            let offset = (random.next() % (DATA_LEN as u64 - 8)) as usize;
+            before.gpr[reg::RBX] = DATA + offset as u64;
+            before.gpr[reg::RAX] = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            let (fast_memory, slow_memory) = (space(code, &data), space(code, &data));
+            let mut fast = before.clone();
+            assert_eq!(
+                compiled.run(
+                    &mut fast,
+                    &fast_memory,
+                    fast_memory.code_generation_cached()
+                ),
+                1,
+                "{code:02x?}"
+            );
+            let mut slow = before.clone();
+            step(&mut slow, &slow_memory).unwrap();
+            assert_eq!(fast, slow, "{code:02x?} from {before:x?}");
+            assert_eq!(
+                contents(&fast_memory),
+                contents(&slow_memory),
+                "{code:02x?}"
+            );
+            assert_ne!(contents(&fast_memory).0, data, "{code:02x?} wrote nothing");
+        }
     }
 }

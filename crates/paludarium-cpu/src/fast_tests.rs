@@ -327,6 +327,17 @@ const FORMS: &[&[u8]] = &[
     &[0x66, 0x0f, 0x6a, 0xc1],
     &[0x66, 0x0f, 0x6d, 0xc1],
     &[0x66, 0x0f, 0x68, 0xc0],
+    // cmpxchg and xchg with memory, with lock or without
+    &[0xf0, 0x0f, 0xb1, 0x0b],
+    &[0x48, 0x0f, 0xb1, 0x0b],
+    &[0xf0, 0x48, 0x0f, 0xb1, 0x13],
+    &[0xf0, 0x0f, 0xb0, 0x0b],
+    &[0x66, 0xf0, 0x0f, 0xb1, 0x0b],
+    &[0x87, 0x0b],
+    &[0x48, 0x87, 0x03],
+    &[0x86, 0x23],
+    &[0xf0, 0x87, 0x0b],
+    &[0x66, 0x87, 0x13],
 ];
 
 /// Instructions that must keep running in [`exec::execute`].
@@ -366,6 +377,10 @@ const OTHERS: &[&[u8]] = &[
     &[0x66, 0x0f, 0xfd, 0xc1],
     &[0x66, 0x0f, 0x67, 0x03],
     &[0x66, 0x0f, 0x6c, 0x03],
+    &[0x0f, 0xb1, 0xcb],
+    &[0x87, 0xcb],
+    &[0x0f, 0xc7, 0x0b],
+    &[0xf0, 0x0f, 0xc1, 0x0b],
     &[0x0f, 0x05],
 ];
 
@@ -507,6 +522,8 @@ fn a_form_that_faults_stops_as_the_interpreter_does() {
         (&[0x48, 0x89, 0x03][..], (reg::RBX, CODE)),
         (&[0xff, 0x03][..], (reg::RBX, CODE)),
         (&[0x48, 0x01, 0x03][..], (reg::RBX, CODE)),
+        (&[0xf0, 0x0f, 0xb1, 0x0b][..], (reg::RBX, CODE)),
+        (&[0x87, 0x0b][..], (reg::RBX, 0x1000)),
         (&[0x0f, 0x29, 0x03][..], (reg::RBX, CODE)),
         (&[0x0f, 0x10, 0x03][..], (reg::RBX, 0x1000)),
     ] {
@@ -521,5 +538,48 @@ fn a_form_that_faults_stops_as_the_interpreter_does() {
             "{fast:?}"
         );
         assert_eq!(fast, slow);
+    }
+}
+
+/// A compare and exchange whose compare matches writes memory, as the
+/// interpreter's does: rax is set to the bytes at the address first.
+#[test]
+fn a_compare_exchange_that_matches_does_what_the_interpreter_does() {
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    for code in [
+        &[0xf0, 0x0f, 0xb1, 0x0b][..],
+        &[0x48, 0x0f, 0xb1, 0x0b][..],
+        &[0xf0, 0x0f, 0xb0, 0x0b][..],
+        &[0x66, 0xf0, 0x0f, 0xb1, 0x0b][..],
+    ] {
+        let instruction = decode(code, GuestAddr(CODE)).unwrap();
+        let fast = exec::Fast::of(&instruction);
+        assert_ne!(fast, exec::Fast::None, "{code:02x?} has no form");
+        for _ in 0..50 {
+            let data: Vec<u8> = (0..DATA_LEN).map(|_| random.next() as u8).collect();
+            let mut before = state(&mut random);
+            let offset = (random.next() % (DATA_BYTES - 8)) as usize;
+            before.gpr[reg::RBX] = DATA + offset as u64;
+            before.gpr[reg::RAX] = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            let (fast_memory, slow_memory) = (space(code, &data), space(code, &data));
+            let (mut fast_state, mut slow_state) = (before.clone(), before.clone());
+            exec::execute(&mut slow_state, &slow_memory, &instruction).unwrap();
+            exec::execute_fast(
+                &mut fast_state,
+                &fast_memory,
+                &instruction,
+                &fast,
+                instruction.next_rip().0,
+            )
+            .unwrap();
+            assert_eq!(fast_state, slow_state, "{code:02x?} from {before:x?}");
+            assert_eq!(
+                contents(&fast_memory),
+                contents(&slow_memory),
+                "{code:02x?}"
+            );
+            assert_ne!(contents(&fast_memory).0, data, "{code:02x?} wrote nothing");
+            assert_ne!(fast_state.rflags & flag::ZF, 0, "{code:02x?}: ZF");
+        }
     }
 }

@@ -15590,6 +15590,16 @@ static int ipc_sysctl_more(void) {
     printf("copy-sysctl: copied=%ld errno=%d stated=%ld sizes=%ld,%ld inodes-differ=%d", copied,
            copied < 0 ? errno : 0, stated, (long)from.st_size, (long)to.st_size, from.st_ino != to.st_ino);
     ksys_show("msgmax");
+    /* A listing gives each entry the inode its stat gives. */
+    ino_t listed = 0;
+    DIR *kernel_dir = opendir("/proc/sys/kernel");
+    struct dirent *e;
+    while (kernel_dir && (e = readdir(kernel_dir)))
+        if (!strcmp(e->d_name, "msgmax")) listed = e->d_ino;
+    if (kernel_dir) closedir(kernel_dir);
+    struct stat named = {0};
+    long named_stat = stat("/proc/sys/kernel/msgmax", &named) ? -errno : 0;
+    printf(" listed=%d d_ino-is-st_ino=%d", listed != 0, named_stat == 0 && listed == named.st_ino);
     printf("\n");
     if (source >= 0) close((int)source);
     if (target >= 0) close((int)target);

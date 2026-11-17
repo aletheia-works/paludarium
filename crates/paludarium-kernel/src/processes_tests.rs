@@ -4656,6 +4656,16 @@ mod shm {
         let (target_inode, target_size) = stat(&mut k, &mut t, &m, target);
         assert_ne!(source_inode, target_inode);
         assert_eq!((source_size, target_size), (0, 0));
+        // The size of 0 does not bound a read: pread gives the value, and
+        // the end is 0 (`default_llseek`).
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 17, [source, DATA + 0xa00, 64, 0, 0, 0]),
+            5
+        );
+        let mut text = [0; 5];
+        m.read(GuestAddr(DATA + 0xa00), &mut text).unwrap();
+        assert_eq!(&text, b"8192\n");
+        assert_eq!(syscall(&mut k, &mut t, &m, 8, [source, 0, 2, 0, 0, 0]), 0);
     }
 
     #[test]

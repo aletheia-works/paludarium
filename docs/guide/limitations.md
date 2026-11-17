@@ -718,16 +718,16 @@ verified.
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
-- **userfaultfd, in part**: missing pages and the write protection of
-  private anonymous memory, and the minor faults of shmem, are
-  registered. The write-protect mode for shmem (shared anonymous
-  memory and a shmem file's mappings, private ones too), which Linux
-  takes, is refused (`EINVAL`), and not offered are the events
-  of `fork`, `mremap`, `madvise` and `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
-  `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
-  `UFFDIO_API` does not report and refuses (`EINVAL`). A
+- **userfaultfd, in part**: missing pages, write protection and the minor
+  faults of shmem are registered. Not offered are the events of `fork`,
+  `mremap`, `madvise` and `munmap` and `UFFD_FEATURE_WP_ASYNC`, which
+  `UFFDIO_API` does not report and refuses (`EINVAL`); without it only
+  anonymous memory and shmem take the write-protect mode. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
+  `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in
+  the marker's place, where Linux, whose zap keeps the marker, restarts
+  the call until a signal comes.
   Of shmem's files only a memfd is registered: a tmpfs file
   is refused (`EINVAL`), where Linux takes it, as the in-memory file
   system says it is a tmpfs but stands for the files a guest has on disk,

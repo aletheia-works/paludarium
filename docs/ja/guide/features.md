@@ -860,8 +860,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_THREAD_ID`、`UFFD_FEATURE_MINOR_SHMEM`、
   `UFFD_FEATURE_MINOR_HUGETLBFS`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
-  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で（`HUGETLBFS` の
-  2 つは Linux と同じく示しますが、`MFD_HUGETLB` と `SHM_HUGETLB` は `ENOSYS` なので、
+  `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
+  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で（`HUGETLBFS` の
+  ものは Linux と同じく示しますが、`MFD_HUGETLB` と `SHM_HUGETLB` は `ENOSYS` なので、
   登録する hugetlbfs のメモリはありません）、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
   メモリ、共有の anonymous メモリ、shmem の memfd（Linux が VMA を shmem のものと
@@ -869,7 +870,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プライベートなマッピングを、ないページについて登録し
   （`UFFDIO_REGISTER_MODE_MISSING`）、shmem（共有の anonymous メモリと memfd の
   マッピング）をマイナーフォールトについて登録し（`UFFDIO_REGISTER_MODE_MINOR`。示す
-  ioctl に `UFFDIO_CONTINUE` が、`smaps` に `ui` が加わります）、プライベートな anonymous メモリを書き込み保護に
+  ioctl に `UFFDIO_CONTINUE` が、`smaps` に `ui` が加わります）、プライベートな anonymous メモリと shmem を書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
   が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
   ものは `EINVAL`、ファイルに書き込めない共有のものは `EPERM`、ほかの `userfaultfd` の
@@ -894,9 +895,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFDIO_WRITEPROTECT` は、`mwriteprotect_range` と同じく VMA ごとに、範囲のページを
   保護するか保護を解きます。どの VMA も書き込み保護について登録したものでなければ
   ならず（`ENOENT`。それより前の VMA は変わったあとです）、保護するときは
-  `DONTWAKE` を受け付けません（`EINVAL`）。エントリーのないページは、Linux に
-  present の PTE がないので保護しません。読んだだけのページは Linux のゼロページで、
-  保護します。`mprotect` は保護を残し、許さない書き込みはこれまでどおり SIGSEGV です。
+  `DONTWAKE` を受け付けません（`EINVAL`）。プライベートな anonymous メモリの
+  エントリーのないページは、Linux に present の PTE がないので、
+  `UFFD_FEATURE_WP_UNPOPULATED` のときだけ保護します。読んだだけのページは Linux の
+  ゼロページで、保護します。shmem のエントリーのないページはいつも保護します。
+  そうしたページには Linux の uffd-wp マーカーがつき、`/proc/<pid>/pagemap` は
+  ビット 57 のついたスワップエントリーとして示します。アクセスがそのページに作る
+  エントリーは書き込み保護されるので、書き込みはページが入ってからフォールトします。
+  `MADV_DONTNEED` は、ページキャッシュにページを残したまま shmem のエントリーを外し、
+  `zap_install_uffd_wp_if_needed` と同じく、保護されていたものにはマーカーを残します。
+  プライベートな anonymous メモリの `MADV_DONTNEED` はマーカーを消します。埋める操作と
+  `UFFDIO_CONTINUE` はマーカーに置き換わり、保護は自分のモードによるものだけです。
+  プライベートな anonymous メモリの `UFFDIO_ZEROPAGE` と `UFFDIO_POISON` はそこでは
+  `EEXIST` です。`mprotect` は保護を残し、許さない書き込みはこれまでどおり SIGSEGV です。
   `fork` した子、`mremap` による移動、`UFFDIO_UNREGISTER`、ファイルを閉じること、
   書き込み保護のモードを置き換える登録で保護は外れます。`UFFDIO_COPY` と
   `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
@@ -912,9 +923,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   です。poison にしたページへのアクセスは、Linux の poison マーカーが
   `VM_FAULT_HWPOISON` を返すのと同じく、保護の確認の後、範囲がまだ登録されているか
   どうかにかかわらず、`BUS_MCEERR_AR` と `si_addr_lsb` 12 の SIGBUS を起こします。
-  そこへのシステムコールのコピーは `EFAULT`、`MADV_POPULATE_READ` は `EHWPOISON` です。
+  そこへのシステムコールのコピーは `EFAULT`、`MADV_POPULATE_READ` は `EHWPOISON` で、
+  `/proc/<pid>/pagemap` はスワップエントリーとして示します。
   `UFFDIO_COPY` は、Linux の `mfill_atomic_install_pte` がマーカーを受け付けるのと同じく、
-  poison にしたページを代わりに埋め、`UFFDIO_ZEROPAGE` はそこでは `EEXIST` です。
+  poison にしたページを代わりに埋め、shmem の `UFFDIO_ZEROPAGE` も同じです。
+  プライベートな anonymous メモリの `UFFDIO_ZEROPAGE` はそこでは `EEXIST` です。
   poison は `mprotect` と `UFFDIO_UNREGISTER` では残り、`mremap` では一緒に動き、
   `fork` した子には、プライベートなメモリでは引き継がれ、共有メモリでは引き継がれず、
   `MADV_DONTNEED`、`MADV_FREE`、`MADV_GUARD_INSTALL`（ガードに置き換わります）、
@@ -928,7 +941,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   以外のモード、ファイルの終わりより先のページは `EINVAL`、ページキャッシュにない
   ページは `EFAULT`、マッピングにあるページは `EEXIST` です。プライベートな
   マッピングは、`mfill_atomic_install_pte` が読み出し専用で対応付けるので、書き込む
-  までそのページを見せます。`UFFDIO_MOVE` は、Linux の `move_pages` と同じく、
+  までそのページを見せ、`UFFDIO_CONTINUE_MODE_WP` は書き込み保護して対応付けます。
+  `MADV_DONTNEED` は shmem のマッピングのエントリーを外すので、そのページはまた
+  マイナーフォールトになります。`UFFDIO_MOVE` は、Linux の `move_pages` と同じく、
   コンテキスト自身のアドレス空間（ほかの空間からは `EINVAL`）のプライベートな
   anonymous のページを、登録した範囲へ動かします。`UFFD_FEATURE_MOVE` を求めたか
   どうかは問いません。それぞれの先頭が VMA にあること（`ENOENT`）、どちらの VMA も
@@ -937,7 +952,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   もので、どちらも anonymous のメモリであること（`EINVAL`）を確かめます。そのあと
   1 ページずつ、動かし先にページかマーカーがあれば `EEXIST`、動かし元にページが
   なければ `ENOENT`（`UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES` では動かしたものとして
-  数えます）、動かし元の poison やガードは `EFAULT`、`fork` が共有していて、書き込みで
+  数えます）、動かし元の poison、ガード、uffd-wp マーカーは `EFAULT`、`fork` が共有していて、書き込みで
   自分のものになっていないページは `EBUSY`（`PageAnonExclusive`）です。ゼロページは
   ゼロページのまま動き、ほかのページは動かし先の保護で書き込めるようになり、書き込み
   保護は外れ、動かし元にはページがなくなります。動かした分かエラーは構造体の最後の

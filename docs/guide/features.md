@@ -960,8 +960,9 @@ kernel.
   `UFFD_FEATURE_THREAD_ID`, `UFFD_FEATURE_MINOR_SHMEM`,
   `UFFD_FEATURE_MINOR_HUGETLBFS`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
-  `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_POISON` and
-  `UFFD_FEATURE_MOVE` (the two `HUGETLBFS` ones as Linux reports them,
+  `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
+  `UFFD_FEATURE_WP_UNPOPULATED`, `UFFD_FEATURE_POISON` and
+  `UFFD_FEATURE_MOVE` (the `HUGETLBFS` ones as Linux reports them,
   though there is no hugetlbfs memory to register: `MFD_HUGETLB` and
   `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
@@ -971,7 +972,7 @@ kernel.
   (`UFFDIO_REGISTER_MODE_MISSING`), shmem (shared anonymous memory and a
   memfd's mappings) for minor faults (`UFFDIO_REGISTER_MODE_MINOR`, which
   adds `UFFDIO_CONTINUE` to the ioctls it reports and `ui` to `smaps`), and
-  private anonymous memory for write
+  private anonymous memory and shmem for write
   protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
   to the ioctls it reports), with Linux's checks in its order (the
   range, then each VMA: `EINVAL` for one that cannot be registered,
@@ -1000,8 +1001,18 @@ kernel.
   their protection, VMA by VMA as `mwriteprotect_range` does: each must be
   registered for write protection (`ENOENT`, once the ones before it
   changed), and protecting does not take `DONTWAKE` (`EINVAL`). A page
-  with no entry, which Linux has no present PTE for, is not protected; one
-  only read is Linux's zero page, and is. `mprotect` keeps the protection,
+  of private anonymous memory with no entry, which Linux has no present
+  PTE for, is protected only with `UFFD_FEATURE_WP_UNPOPULATED`; one only
+  read is Linux's zero page, and is. Shmem's pages with no entry are
+  always protected. Such a page gets Linux's uffd-wp marker, which
+  `/proc/<pid>/pagemap` shows as a swap entry with bit 57, and the entry
+  an access makes for it is write-protected, so that a write faults once
+  the page is in. `MADV_DONTNEED` takes shmem's entries away, the page
+  cache keeping the pages, and leaves a marker for each protected one, as
+  `zap_install_uffd_wp_if_needed` does; that of private anonymous memory
+  drops the markers. A fill or `UFFDIO_CONTINUE` takes a marker's place,
+  protected only by its own mode, and a `UFFDIO_ZEROPAGE` of private
+  anonymous memory or a `UFFDIO_POISON` is `EEXIST` there. `mprotect` keeps the protection,
   and refuses a write it does not permit with SIGSEGV as before; a
   `fork`ed child, a move by `mremap`, `UFFDIO_UNREGISTER`, closing the
   file and a registration that replaces the write-protect mode take it
@@ -1022,9 +1033,11 @@ kernel.
   `BUS_MCEERR_AR` and `si_addr_lsb` 12, after the protection check and
   whether the range is still registered or not, as Linux's poison marker
   gives `VM_FAULT_HWPOISON`; a system call's copy there is `EFAULT` and
-  `MADV_POPULATE_READ` `EHWPOISON`. A `UFFDIO_COPY` fills a poisoned page
-  in its place, as Linux's `mfill_atomic_install_pte` takes the marker, and
-  a `UFFDIO_ZEROPAGE` is `EEXIST` there. The poison stays through `mprotect`
+  `MADV_POPULATE_READ` `EHWPOISON`; `/proc/<pid>/pagemap` shows it as a
+  swap entry. A `UFFDIO_COPY` fills a poisoned page
+  in its place, as Linux's `mfill_atomic_install_pte` takes the marker, as
+  does a `UFFDIO_ZEROPAGE` of shmem, and one of private anonymous memory
+  is `EEXIST` there. The poison stays through `mprotect`
   and `UFFDIO_UNREGISTER`, moves with `mremap`, goes to a `fork`ed child of
   private memory but not of shared, and goes with `MADV_DONTNEED`,
   `MADV_FREE`, `MADV_GUARD_INSTALL` (whose guard takes its place) and
@@ -1039,7 +1052,9 @@ kernel.
   mode), or a page past the file's end; `EFAULT` for a page the page cache
   does not have; `EEXIST` for one the mapping has. A private mapping shows
   the page until it writes it, as `mfill_atomic_install_pte` maps it
-  read-only. `UFFDIO_MOVE` moves private anonymous pages of the
+  read-only, and `UFFDIO_CONTINUE_MODE_WP` maps it write-protected.
+  `MADV_DONTNEED` takes a shmem mapping's entries away, so that its pages
+  fault as minor faults again. `UFFDIO_MOVE` moves private anonymous pages of the
   context's own address space (`EINVAL` from another) into a registered
   range, whether or not `UFFD_FEATURE_MOVE` was asked for, as Linux's
   `move_pages`: each start in a VMA (`ENOENT`); neither VMA shared, each
@@ -1048,7 +1063,7 @@ kernel.
   and both anonymous memory (`EINVAL`). Then page by page: `EEXIST` for a
   destination page that has one, or a marker; `ENOENT` for a source page
   with none, which `UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES` counts as moved
-  instead; `EFAULT` for a source poison or guard; and `EBUSY` for a page a
+  instead; `EFAULT` for a source poison, guard or uffd-wp marker; and `EBUSY` for a page a
   `fork` shares until a write gives it its own (`PageAnonExclusive`). The
   zero page moves as the zero page; any other page takes the
   destination's protection, writable and no longer write-protected, and

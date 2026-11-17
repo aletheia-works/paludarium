@@ -221,6 +221,7 @@ mod linux {
                     | "userfaultfd-move"
                     | "userfaultfd-shmem"
                     | "userfaultfd-minor"
+                    | "userfaultfd-wp-shmem"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -585,6 +586,7 @@ mod linux {
         userfaultfd_move => ("userfaultfd-move","userfaultfd"),
         userfaultfd_shmem => ("userfaultfd-shmem","userfaultfd"),
         userfaultfd_minor => ("userfaultfd-minor","userfaultfd"),
+        userfaultfd_wp_shmem => ("userfaultfd-wp-shmem","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

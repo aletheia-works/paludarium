@@ -613,14 +613,14 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   シグナルのエッジは、そのスレッドがシグナルを取り込んだとき（次のシステムコールか、
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
-- **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
-  メモリの書き込み保護と、shmem のマイナーフォールトです。Linux が受け付ける
-  shmem（共有の anonymous メモリと、プライベートも含む shmem のファイルの
-  マッピング）の書き込み保護のモードは受け付けません（`EINVAL`）。`fork`、`mremap`、
-  `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
-  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
-  それらを示さず、求められれば `EINVAL` です。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
-  ページの保護を外します。Linux はその印を PTE に残します。shmem のファイルで登録
+- **userfaultfd の一部**：登録するのは、ないページと、書き込み保護と、shmem の
+  マイナーフォールトです。`fork`、`mremap`、`madvise`、`munmap` のイベントと
+  `UFFD_FEATURE_WP_ASYNC` はなく、`UFFDIO_API` はそれらを示さず、求められれば
+  `EINVAL` です。そのため書き込み保護のモードを受け付けるのは anonymous メモリと
+  shmem だけです。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
+  ページの保護を外します。Linux はその印を PTE に残します。shmem の uffd-wp
+  マーカーの上の `MADV_GUARD_INSTALL` は、マーカーをガードに置き換えます。Linux は
+  エントリーを外すとき（zap）にマーカーを残すので、シグナルが来るまで呼び出しをやり直します。shmem のファイルで登録
   するのは memfd だけです。tmpfs のファイルは、Linux は受け付けますが、ここでは
   断ります（`EINVAL`）。メモリ上のファイルシステムは tmpfs を名乗りますが、ゲストが
   ディスクに持つファイルを表すからで、ホストの tmpfs のファイルはここで持っていません。shmem のファイルの

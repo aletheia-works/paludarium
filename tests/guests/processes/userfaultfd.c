@@ -20,7 +20,12 @@
    do not, the end of the file, and the mappings that cannot be
    registered (one that may not write the file, System V shared memory);
    and the minor mode: a memfd's page the page cache has waits until
-   UFFDIO_CONTINUE maps it, its errors, and a private mapping of it.
+   UFFDIO_CONTINUE maps it, its errors, and a private mapping of it; and
+   the write protection of a memfd's mapping and, with WP_UNPOPULATED, of
+   private anonymous memory: the pages UFFDIO_WRITEPROTECT protects that
+   have no entry (their bits in /proc/self/pagemap), a read and a write of
+   one, what MADV_DONTNEED, fills, the minor mode, fork and mremap do to
+   the protection.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
    whether they are the faulting thread's. Of what UFFDIO_API and
@@ -59,6 +64,8 @@
 #define UFFD_FEATURE_POISON (1ULL << 14)
 #define UFFD_FEATURE_MOVE (1ULL << 16)
 #define UFFD_FEATURE_MINOR_SHMEM (1ULL << 10)
+#define UFFD_FEATURE_WP_HUGETLBFS_SHMEM (1ULL << 12)
+#define UFFD_FEATURE_WP_UNPOPULATED (1ULL << 13)
 #define UFFD_PAGEFAULT_FLAG_MINOR 4
 #define UFFDIO_REGISTER_MODE_MISSING 1ULL
 #define UFFDIO_REGISTER_MODE_WP 2ULL
@@ -1082,7 +1089,7 @@ static int case_shmem(void) {
     munmap(private, 3 * PAGE);
 
     /* What cannot be registered: a mapping that may not write the file,
-       write protection, and System V shared memory. */
+       and System V shared memory. */
     char path[64];
     snprintf(path, sizeof path, "/proc/self/fd/%d", other);
     int reader = open(path, O_RDONLY);
@@ -1169,6 +1176,138 @@ static int case_minor(void) {
     return 0;
 }
 
+/* Whether the page at `at` is present, a swap entry and write-protected,
+   as /proc/self/pagemap has it (bits 63, 62 and 57). */
+static void pagemap_show(const char *what, void *at) {
+    int f = open("/proc/self/pagemap", O_RDONLY);
+    uint64_t e = 0;
+    pread(f, &e, sizeof e, (off_t)((uintptr_t)at / PAGE * sizeof e));
+    close(f);
+    printf("%s: present=%d swap=%d wp=%d\n", what, (int)(e >> 63 & 1), (int)(e >> 62 & 1),
+           (int)(e >> 57 & 1));
+}
+
+/* A write to `at` by a thread of its own, which faults to `fd`: the
+   message, then the end of the protection of its page, and what the
+   thread wrote. */
+static void write_fault(const char *what, int fd, char *base, char *at) {
+    struct toucher t = {at, 1, 0, 0};
+    pthread_t thread;
+    pthread_create(&thread, NULL, touch, &t);
+    protected_fault(what, fd, base, &t);
+    pagemap_show(what, (void *)((uintptr_t)at & ~(uintptr_t)(PAGE - 1)));
+    printf("unprotect: %s\n",
+           err(protect(fd, (void *)((uintptr_t)at & ~(uintptr_t)(PAGE - 1)), PAGE, 0)));
+    pthread_join(thread, NULL);
+    printf("seen: %c\n", t.seen);
+}
+
+/* Write protection of shmem, whose pages that have no entry get markers,
+   and of private anonymous memory's with WP_UNPOPULATED. */
+static int case_wp_shmem(void) {
+    int fd = uffd(O_NONBLOCK);
+    struct uffdio_api api = {UFFD_API, UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_THREAD_ID, 0};
+    printf("api: %s", err(ioctl(fd, UFFDIO_API, &api)));
+    printf(" shmem=%d unpopulated=%d\n", (api.features & UFFD_FEATURE_WP_HUGETLBFS_SHMEM) != 0,
+           (api.features & UFFD_FEATURE_WP_UNPOPULATED) != 0);
+    int file = shmem_file(4);
+    char *view = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    char *other = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    uint64_t ioctls = 0;
+    printf("register: %s", err(reg(fd, view, 4 * PAGE, UFFDIO_REGISTER_MODE_WP, &ioctls)));
+    printf(" writeprotect=%d\n", (ioctls & WRITEPROTECT_IOCTL) != 0);
+    vma("shmem", view, view);
+    view[0] = 'a';
+    printf("protect: %s\n", err(protect(fd, view, 4 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    pagemap_show("an entry", view);
+    pagemap_show("the file's page", view + PAGE);
+    pagemap_show("a hole", view + 2 * PAGE);
+    /* A read of a page with a marker is no fault; its entry is protected. */
+    printf("read: %c\n", view[PAGE]);
+    pagemap_show("read", view + PAGE);
+    write_fault("the file's page", fd, view, view + PAGE + 1);
+    /* A hole's page is brought in, protected, before the write faults. */
+    write_fault("a hole", fd, view, view + 2 * PAGE + 2);
+    /* Another mapping of the file is not protected. */
+    other[3 * PAGE] = 'o';
+    pagemap_show("the other mapping's page", view + 3 * PAGE);
+    /* MADV_DONTNEED keeps the protection of shmem's pages. */
+    printf("dontneed: %s\n", err(madvise(view, 4 * PAGE, MADV_DONTNEED)));
+    pagemap_show("after dontneed", view);
+    pagemap_show("unprotected after dontneed", view + PAGE);
+    printf("read after dontneed: %c\n", view[0]);
+    write_fault("after dontneed", fd, view, view);
+    /* A fill over a marker: a hole's copy replaces it; a page the page
+       cache has is EEXIST, as is a poison. */
+    printf("protect again: %s\n", err(protect(fd, view, 4 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    printf("dontneed: %s\n", err(madvise(view, 4 * PAGE, MADV_DONTNEED)));
+    char src[PAGE];
+    memset(src, 'c', sizeof src);
+    int64_t done;
+    printf("copy over the page cache's: %s", err(copy(fd, view + PAGE, src, PAGE, 0, &done)));
+    printf(" copy=%lld\n", (long long)done);
+    printf("poison: %s\n", err(poison(fd, view + PAGE, PAGE, 0, NULL)));
+    printf("unprotect: %s\n", err(protect(fd, view, 4 * PAGE, 0)));
+    pagemap_show("unprotected", view + PAGE);
+    printf("written: %c\n", (view[PAGE] = 'u'));
+    /* The minor mode with write protection: UFFDIO_CONTINUE_MODE_WP maps
+       the page protected. */
+    printf("register minor: %s\n",
+           err(reg(fd, view, 4 * PAGE, UFFDIO_REGISTER_MODE_MINOR | UFFDIO_REGISTER_MODE_WP, NULL)));
+    printf("dontneed: %s\n", err(madvise(view, 4 * PAGE, MADV_DONTNEED)));
+    struct toucher t = {view + PAGE + 5, 0, 0, 0};
+    pthread_t thread;
+    pthread_create(&thread, NULL, touch, &t);
+    protected_fault("minor fault", fd, view, &t);
+    printf("continue WP: %s", err(resume(fd, view + PAGE, PAGE, UFFDIO_CONTINUE_MODE_WP, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    pthread_join(thread, NULL);
+    printf("seen: %d\n", t.seen);
+    pagemap_show("continued", view + PAGE);
+    write_fault("continued", fd, view, view + PAGE + 6);
+    close(fd);
+    pagemap_show("closed", view + 2 * PAGE);
+
+    /* Private anonymous memory: with WP_UNPOPULATED its pages that have
+       none are protected too. */
+    fd = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_THREAD_ID |
+                               UFFD_FEATURE_WP_UNPOPULATED);
+    char *a = anon(3 * PAGE);
+    printf("register anonymous: %s\n", err(reg(fd, a, 3 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    printf("protect: %s\n", err(protect(fd, a, 3 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    pagemap_show("unpopulated", a);
+    printf("read: %d\n", a[0]);
+    pagemap_show("read", a);
+    write_fault("unpopulated", fd, a, a + PAGE + 3);
+    printf("zeropage: %s\n", err(zeropage(fd, a + 2 * PAGE, PAGE, 0, NULL)));
+    printf("copy: %s\n", err(copy(fd, a + 2 * PAGE, src, PAGE, 0, NULL)));
+    pagemap_show("copied", a + 2 * PAGE);
+    printf("written: %c\n", (a[2 * PAGE + 1] = 'v'));
+    /* MADV_DONTNEED of anonymous memory drops the protection. */
+    printf("protect again: %s\n", err(protect(fd, a, 3 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    printf("dontneed: %s\n", err(madvise(a + PAGE, 2 * PAGE, MADV_DONTNEED)));
+    pagemap_show("after dontneed", a + PAGE);
+    printf("written: %c\n", (a[PAGE] = 'd'));
+    /* A child has no markers; an mremap takes them away. */
+    printf("protect again: %s\n", err(protect(fd, a, 3 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        pagemap_show("child", a + 2 * PAGE);
+        printf("child wrote: %c\n", (a[2 * PAGE] = 'k'));
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    pagemap_show("parent", a + 2 * PAGE);
+    char *to = anon(3 * PAGE);
+    char *moved = mremap(a, 3 * PAGE, 3 * PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, to);
+    printf("moved: %d\n", moved == to);
+    pagemap_show("moved", to + 2 * PAGE);
+    printf("written: %c\n", (to[2 * PAGE] = 'm'));
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1182,6 +1321,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-poison")) return case_poison();
     if (!strcmp(mode, "userfaultfd-shmem")) return case_shmem();
     if (!strcmp(mode, "userfaultfd-minor")) return case_minor();
+    if (!strcmp(mode, "userfaultfd-wp-shmem")) return case_wp_shmem();
     if (!strcmp(mode, "userfaultfd-move")) return case_move();
     printf("unknown mode %s\n", mode);
     return 2;

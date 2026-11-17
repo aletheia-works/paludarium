@@ -3256,8 +3256,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   開くことは、`do_open_execat` が `__FMODE_EXEC` で開くのと同じく `FAN_OPEN_EXEC` 付きの
   `FAN_OPEN` として伝わり、inotify には `IN_OPEN` として伝わります。その前に、そうした
   オープンはそれぞれ `FAN_OPEN_EXEC_PERM`、`FAN_OPEN_PERM` を、exec によるそのファイルの
-  読み出しは `FAN_ACCESS_PERM` を、exec が確定する前にこの順に尋ねます。拒まれると `execve`
-  は `EPERM` で失敗し、そのあとのものは尋ねません。そのあとで失敗する exec（インタプリタがない、
+  読み出し（`kernel_read`）は 1 回ごとに `FAN_ACCESS_PERM` を、exec が確定する前に
+  この順に尋ねます（バイトを読んだ読み出しは続いて `IN_ACCESS` です）。スクリプトは
+  先頭のバイトを 1 回、ELF のプログラムはそれに加えてプログラムヘッダーと `PT_INTERP`
+  の名前を、続いてインタプリタの ELF ヘッダーとプログラムヘッダーを読みます（x86-64 は
+  `PT_GNU_PROPERTY` を読みません）。拒まれると `execve` は `EPERM` で失敗し、そのあとの
+  ものは尋ねません。そのあとで失敗する exec（インタプリタがない、
   引数が読めない）も同じように尋ね終えています。拒まれたときの `EPERM` が先に返り、
   通されたオープンはそのオープンとクローズを伝えます。確認もその順です。フラグとマスク（`EINVAL`）、ディスクリプタ
   （`EBADF`、`EINVAL`）、グループのクラスとモード、パス（`ENOENT`、`ENOTDIR`）、

@@ -4469,7 +4469,13 @@ impl Kernel {
                             return Err(Errno::ENOMEM);
                         }
                         let capabilities = program_capabilities(|f| file.with_xattrs(f))?;
-                        Some((read_whole(&*file, limit)?, name, capabilities, denied))
+                        let bytes = read_whole(&*file, limit)?;
+                        if let Some(Some(opened)) = opens.0.last() {
+                            for any in elf_reads(&head, &|at, out| bytes_at(&bytes, at, out)) {
+                                opened.read_some(any);
+                            }
+                        }
+                        Some((bytes, name, capabilities, denied))
                     }
                     // A script reads itself by its name, which a descriptor
                     // closed on exec leaves to nothing
@@ -4706,7 +4712,14 @@ impl Kernel {
             // Denied only while it loads, as `load_elf_binary` gives it back.
             drop(deny_writes(&self.files, &path)?);
             if let Some(closing) = &*closing.lock().unwrap_or_else(PoisonError::into_inner) {
+                // `load_elf_binary` reads its ELF header, then, if that is
+                // one of this machine's, its program headers.
                 closing.read();
+                if let Some(head) = read_head(&self.files, &path) {
+                    for any in interpreter_reads(&head, &path_reader(&self.files, &path)) {
+                        closing.read_some(any);
+                    }
+                }
             }
             readable &= may_read;
             let keep: paludarium_loader::Keep =
@@ -5028,6 +5041,12 @@ pub(crate) fn follow_scripts(
             break;
         };
         let Some((interpreter, argument)) = script_interpreter(&head)? else {
+            // The program `load_elf_binary` takes reads more of itself.
+            if let Some(Some(opened)) = opens.0.last() {
+                for any in elf_reads(&head, &path_reader(files, &loaded)) {
+                    opened.read_some(any);
+                }
+            }
             break;
         };
         splice_script(argv, budget, &interpreter, argument, named)?;
@@ -5166,6 +5185,106 @@ fn read_from(file: &dyn paludarium_host::FileHandle, head: &mut [u8]) -> Result<
         }
     }
     Ok(())
+}
+/// Reads at an offset into a buffer: how many bytes it read.
+pub(crate) type ReadAt<'a> = dyn Fn(u64, &mut [u8]) -> usize + 'a;
+/// What the file at `path` reads at an offset, as exec's own reads of it
+/// see it (none of the guest's opens, nothing told).
+fn path_reader(files: &crate::files::Files, path: &[u8]) -> impl Fn(u64, &mut [u8]) -> usize {
+    let file = crate::inotify::unnoticed(|| files.fs().open(path, 0, 0)).ok();
+    move |at, out| {
+        let mut got = 0;
+        while let Some(file) = &file
+            && got < out.len()
+        {
+            match file.read_at(at + got as u64, &mut out[got..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        got
+    }
+}
+/// What `bytes` holds at an offset, as [`path_reader`] reads a file.
+pub(crate) fn bytes_at(bytes: &[u8], at: u64, out: &mut [u8]) -> usize {
+    let rest = usize::try_from(at)
+        .ok()
+        .and_then(|at| bytes.get(at..))
+        .unwrap_or_default();
+    let n = rest.len().min(out.len());
+    out[..n].copy_from_slice(&rest[..n]);
+    n
+}
+fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default())
+}
+/// `EM_X86_64`, the machine `elf_check_arch` takes.
+const EM_X86_64: u16 = 62;
+/// `load_elf_phdrs` of the ELF header `head` with `read`: the program
+/// headers, when their size is the one it takes, and whether that read
+/// read any byte; `None` without the read.
+fn read_phdrs(head: &[u8], read: &ReadAt<'_>) -> Option<(Vec<u8>, bool)> {
+    // `e_phentsize` is `sizeof(struct elf_phdr)`, and `e_phnum` gives
+    // some, but no more than 64 KiB.
+    let size = usize::from(u16_at(head, 56)) * 56;
+    if u16_at(head, 54) != 56 || size == 0 || size > 65536 {
+        return None;
+    }
+    let mut phdrs = vec![0; size];
+    let got = read(u64_at(head, 32), &mut phdrs);
+    phdrs.truncate(got);
+    Some((phdrs, got > 0))
+}
+/// The `kernel_read`s `load_elf_binary` makes of the program whose first
+/// bytes are `head`, after `prepare_binprm`'s, with `read`, and whether each
+/// read any byte: its program headers, then the name its `PT_INTERP` gives
+/// (x86-64 has no `PT_GNU_PROPERTY` to read).
+pub(crate) fn elf_reads(head: &[u8; SCRIPT_HEAD], read: &ReadAt<'_>) -> Vec<bool> {
+    let mut reads = Vec::new();
+    // ET_EXEC or ET_DYN, of this machine.
+    if head[..4] != *b"\x7fELF"
+        || !matches!(u16_at(head, 16), 2 | 3)
+        || u16_at(head, 18) != EM_X86_64
+    {
+        return reads;
+    }
+    let Some((phdrs, any)) = read_phdrs(head, read) else {
+        return reads;
+    };
+    reads.push(any);
+    // A short read (`EIO`) ends the load.
+    if phdrs.len() != usize::from(u16_at(head, 56)) * 56 {
+        return reads;
+    }
+    // The first `PT_INTERP`, whose name is from 2 bytes to `PATH_MAX`.
+    if let Some(interp) = phdrs
+        .as_chunks::<56>()
+        .0
+        .iter()
+        .find(|p| p[..4] == 3u32.to_le_bytes())
+    {
+        let size = u64_at(interp, 32);
+        if (2..=4096).contains(&size) {
+            let mut name = vec![0; size as usize];
+            reads.push(read(u64_at(interp, 8), &mut name) > 0);
+        }
+    }
+    reads
+}
+/// The `kernel_read`s `load_elf_binary` makes of the ELF interpreter whose
+/// first bytes are `head`, with `read`, after that of its ELF header: its
+/// program headers, if it is an ELF file of this machine.
+pub(crate) fn interpreter_reads(head: &[u8; SCRIPT_HEAD], read: &ReadAt<'_>) -> Vec<bool> {
+    if head[..4] != *b"\x7fELF" || u16_at(head, 18) != EM_X86_64 {
+        return Vec::new();
+    }
+    read_phdrs(head, read)
+        .map(|(_, any)| any)
+        .into_iter()
+        .collect()
 }
 /// A script's interpreter, and its argument if any.
 pub(crate) type Script = (Vec<u8>, Option<Vec<u8>>);

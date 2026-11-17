@@ -1074,7 +1074,7 @@ static pid_t exec_in_child(const char *path, int fan) {
     return child;
 }
 /* Answers every permission event of `fan` with `response` until `child`
-   exits: how many of each kind came, as whether any did. */
+   exits: how many of each kind came. */
 static void answer_until_exit(const char *label, int fan, pid_t child, uint32_t response) {
     int open_exec = 0, open = 0, access = 0, other = 0;
     for (;;) {
@@ -1096,7 +1096,7 @@ static void answer_until_exit(const char *label, int fan, pid_t child, uint32_t 
         int status;
         if (waitpid(child, &status, WNOHANG) == child) {
             printf("%s: status=%d open-exec=%d open=%d access=%d other=%d\n", label,
-                   WIFEXITED(status) ? WEXITSTATUS(status) : -1, open_exec, open, access > 0, other);
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -1, open_exec, open, access, other);
             return;
         }
     }
@@ -1106,8 +1106,9 @@ static void answer_until_exit(const char *label, int fan, pid_t child, uint32_t 
 /* Exec's permission events: its open of the program asks
    FAN_OPEN_EXEC_PERM, then FAN_OPEN_PERM, as
    fsnotify_open_perm_and_set_mode does for __FMODE_EXEC, and its reads
-   FAN_ACCESS_PERM; a denial of any fails execve with EPERM. Linux asks
-   FAN_ACCESS_PERM once a kernel_read, so only whether any came is shown. */
+   FAN_ACCESS_PERM once a kernel_read: the ELF header, then the program
+   headers of this static program; a denial of any fails execve with
+   EPERM. */
 static int case_exec_perm(const char *self) {
     make_base("execperm");
     if (copy_self(self, at("prog"))) return 80;

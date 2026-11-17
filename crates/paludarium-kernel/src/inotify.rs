@@ -154,18 +154,18 @@ pub(crate) struct Closing {
     node: FileStat,
     writing: bool,
     /// Exec's open waits for fanotify's answers to its permission events
-    /// ([`Self::release`]): its `IN_OPEN`, and the `IN_ACCESS` of a read
-    /// meanwhile, are held back, and a denied one tells no close.
+    /// ([`Self::release_through`]): its `IN_OPEN` is held back, and a
+    /// denied one tells no close.
     held: AtomicBool,
-    /// A read while held, told on release.
-    read_held: AtomicBool,
     /// Its reads ask `FAN_ACCESS_PERM`, as a group's mark wanted it when
     /// exec opened the file (`FMODE_FSNOTIFY_ACCESS_PERM`).
     access_perm: bool,
     /// How many of exec's permission events had been asked once its open's
-    /// and its read's were ([`Self::release_through`]).
+    /// were ([`Self::release_through`]).
     opened_at: usize,
-    read_at: AtomicUsize,
+    /// The reads that wait for those answers, each as how many had been
+    /// asked once its own was, and whether it read any byte (`IN_ACCESS`).
+    reads: Mutex<Vec<(usize, bool)>>,
 }
 impl Closing {
     /// Tells the watches of the guest's open of the FIFO `node` at `path`
@@ -277,14 +277,22 @@ impl Closing {
     /// if a later file's are denied (then it closes too), and a read's
     /// `IN_ACCESS` when that read's was.
     pub(crate) fn release_through(&self, through: usize) {
-        if through < self.opened_at || !self.held.swap(false, Ordering::SeqCst) {
-            return;
+        if self.held.load(Ordering::SeqCst) {
+            if through < self.opened_at {
+                return;
+            }
+            self.held.store(false, Ordering::SeqCst);
+            self.tell(OPEN | crate::fanotify::OPEN_EXEC);
         }
-        self.tell(OPEN | crate::fanotify::OPEN_EXEC);
-        if self.read_held.swap(false, Ordering::SeqCst)
-            && through >= self.read_at.load(Ordering::SeqCst)
-        {
-            self.tell(ACCESS);
+        let reads = std::mem::take(&mut *self.reads.lock().unwrap_or_else(PoisonError::into_inner));
+        for (at, any) in reads {
+            // A denied read ends exec: none after it was made.
+            if through < at {
+                break;
+            }
+            if any {
+                self.tell(ACCESS);
+            }
         }
     }
     fn open_at(
@@ -316,27 +324,33 @@ impl Closing {
             node: *node,
             writing: flags & 3 != 0,
             held: AtomicBool::new(false),
-            read_held: AtomicBool::new(false),
             access_perm: false,
             opened_at: 0,
-            read_at: AtomicUsize::new(0),
+            reads: Mutex::new(Vec::new()),
         }
     }
     /// Tells the watches of exec's read of the file's first bytes
-    /// (`kernel_read`'s `IN_ACCESS`), which an empty file has none of.
+    /// (`prepare_binprm`'s `kernel_read`), which an empty file has none of.
     pub(crate) fn read(&self) {
-        if self.node.size > 0 {
-            // `kernel_read`'s `rw_verify_area` asks first.
-            if self.access_perm {
-                self.tell(crate::fanotify::ACCESS_PERM);
-                self.read_at
-                    .store(crate::fanotify::asked(), Ordering::SeqCst);
-            }
-            if self.held.load(Ordering::SeqCst) {
-                self.read_held.store(true, Ordering::SeqCst);
-            } else {
-                self.tell(ACCESS);
-            }
+        self.read_some(self.node.size > 0);
+    }
+    /// Tells the watches of one of exec's reads of the file (a
+    /// `kernel_read`), which asks `FAN_ACCESS_PERM` first (`rw_verify_area`)
+    /// and is `IN_ACCESS` if it read `any` byte, held back while its open is
+    /// or while its own answer is awaited.
+    pub(crate) fn read_some(&self, any: bool) {
+        let mut at = 0;
+        if self.access_perm {
+            self.tell(crate::fanotify::ACCESS_PERM);
+            at = crate::fanotify::asked();
+        }
+        if self.access_perm || self.held.load(Ordering::SeqCst) {
+            self.reads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((at, any));
+        } else if any {
+            self.tell(ACCESS);
         }
     }
     fn tell(&self, mask: u32) {

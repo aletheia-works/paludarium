@@ -1509,6 +1509,51 @@ mod exec {
         assert_eq!(syscall(&mut c, &mut ct, &cm, 252, [1, 0, 0, 0, 0, 0]), 0);
         assert_eq!(syscall(&mut k, &mut t, &m, 252, [1, 0, 0, 0, 0, 0]), 0);
     }
+    /// An x86-64 ELF file of type `e_type` whose `phnum` program headers of
+    /// `phentsize` bytes start at 64, the first of type `first` naming
+    /// `/i` at 1024 when it is `PT_INTERP`.
+    fn elf(e_type: u16, phentsize: u16, phnum: u16, first: u32) -> Vec<u8> {
+        let mut file = vec![0; 2048];
+        file[..4].copy_from_slice(b"\x7fELF");
+        file[16..18].copy_from_slice(&e_type.to_le_bytes());
+        file[18..20].copy_from_slice(&62u16.to_le_bytes());
+        file[32..40].copy_from_slice(&64u64.to_le_bytes());
+        file[54..56].copy_from_slice(&phentsize.to_le_bytes());
+        file[56..58].copy_from_slice(&phnum.to_le_bytes());
+        file[64..68].copy_from_slice(&first.to_le_bytes());
+        file[72..80].copy_from_slice(&1024u64.to_le_bytes());
+        file[96..104].copy_from_slice(&3u64.to_le_bytes());
+        file[1024..1027].copy_from_slice(b"/i\0");
+        file
+    }
+    fn reads(file: &[u8], interpreter: bool) -> Vec<bool> {
+        let mut head = [0; 256];
+        head.copy_from_slice(&file[..256]);
+        let read = |at, out: &mut [u8]| crate::processes::bytes_at(file, at, out);
+        if interpreter {
+            crate::processes::interpreter_reads(&head, &read)
+        } else {
+            crate::processes::elf_reads(&head, &read)
+        }
+    }
+    #[test]
+    fn exec_reads_an_elf_file_as_load_elf_binary_does() {
+        // The program headers, then the interpreter's name.
+        assert_eq!(reads(&elf(3, 56, 2, 3), false), [true, true]);
+        assert_eq!(reads(&elf(2, 56, 2, 1), false), [true]);
+        // No read of headers it does not take.
+        assert_eq!(reads(&elf(1, 56, 2, 3), false), [false; 0]);
+        assert_eq!(reads(&elf(3, 32, 2, 3), false), [false; 0]);
+        assert_eq!(reads(&elf(3, 56, 0, 3), false), [false; 0]);
+        // A short read of the program headers ends the load.
+        assert_eq!(reads(&elf(3, 56, 100, 3)[..256], false), [true]);
+        // The interpreter's program headers, whatever its type.
+        assert_eq!(reads(&elf(1, 56, 2, 3), true), [true]);
+        assert_eq!(reads(&elf(1, 32, 2, 3), true), [false; 0]);
+        let mut script = elf(3, 56, 2, 3);
+        script[..4].copy_from_slice(b"#!/b");
+        assert_eq!(reads(&script, true), [false; 0]);
+    }
     /// `load_script`'s view of a first line.
     fn parsed(line: &[u8]) -> Result<Option<crate::processes::Script>, Errno> {
         let mut head = [0; 256];

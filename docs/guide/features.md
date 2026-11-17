@@ -3759,9 +3759,13 @@ kernel.
   program and its interpreter is told as `FAN_OPEN` with `FAN_OPEN_EXEC`,
   as `do_open_execat` opens them with `__FMODE_EXEC`; inotify hears it as
   `IN_OPEN`. Before that, each such open asks `FAN_OPEN_EXEC_PERM`, then
-  `FAN_OPEN_PERM`, and exec's read of the file `FAN_ACCESS_PERM`, in their
-  order, before exec commits; a denial fails `execve` with `EPERM`, and
-  what would come after it is not asked. An exec that fails later (a
+  `FAN_OPEN_PERM`, and each of exec's reads of the file (`kernel_read`)
+  asks `FAN_ACCESS_PERM`, then tells `IN_ACCESS` if it read a byte, in
+  their order: one of a script's first bytes, and of an ELF program those,
+  its program headers and its `PT_INTERP` name, then its interpreter's ELF
+  header and program headers (x86-64 reads no `PT_GNU_PROPERTY`), before
+  exec commits; a denial fails `execve` with `EPERM`, and what would come
+  after it is not asked. An exec that fails later (a
   missing interpreter, an argument it cannot read) has asked them all the
   same: a denial's `EPERM` comes first, and an open let through tells its
   open and close. It makes its checks in its order: the flags and mask

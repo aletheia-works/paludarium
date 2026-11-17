@@ -633,9 +633,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
   ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
-- **fanotify の一部**：exec は実行するファイルの読み出しごとに `FAN_ACCESS_PERM` を
-  1 回尋ねます。Linux は `kernel_read` ごとに尋ねます（ELF のプログラムでは 2、3 回）。
-  ここの `io_uring` には尋ねる読み出しの操作がありません。
+- **fanotify の一部**：ここの `io_uring` には `FAN_ACCESS_PERM` を尋ねる読み出しの操作が
+  ありません。
   `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント
   （`FAN_MNT_ATTACH`、`FAN_MNT_DETACH`）と `FAN_FS_ERROR` は来ません。追い出せるマークも

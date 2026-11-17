@@ -742,10 +742,8 @@ verified.
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
-- **fanotify, in part**: exec asks `FAN_ACCESS_PERM` once for its read
-  of each file it runs, where Linux asks it at each `kernel_read` (two or
-  three for an ELF program), and `io_uring` has no read operation here to
-  ask for.
+- **fanotify, in part**: `io_uring` has no read operation here to ask
+  `FAN_ACCESS_PERM` for.
   `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
   and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
   never come. An evictable mark is never evicted. A group merges an event

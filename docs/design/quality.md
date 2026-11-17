@@ -246,6 +246,13 @@ and not when a later run of the branch replaced it. A job that ran a step
 and failed is never rerun, and then nothing is. Its log says why each run
 was or was not rerun; `scripts/ci-rerun.py --self-test` checks the decision.
 
+So do not rerun such jobs of a `CI` run by hand: the workflow starts as soon
+as the run completes. It watches only `CI`, not `Publish` or
+`release-acceptance`. A hand rerun started first makes it see an attempt that is not
+the latest, and it then reruns nothing. Rerun by hand only when its log says
+the run was already rerun twice, or when a job that ran a step failed and
+you have reason to think the failure was a flake.
+
 Before a guest program is built, its dependencies must pass `cargo deny`
 under the root policy. Only aube has exceptions: the licenses of two crates
 and, for now, three RustSec advisories against `zstd` 0.13.3 and `zstd-safe`

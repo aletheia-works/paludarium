@@ -362,11 +362,12 @@ pub fn run_watched(
             }
         }
         let stepping = state.rflags & flag::TF != 0;
+        let insn = match crate::fetch_cached(state, mem, cache) {
+            Ok(insn) => insn,
+            Err(reason) => return reason,
+        };
         let planned = if watches_data {
-            match crate::fetch_cached(state, mem, cache) {
-                Ok(insn) => accesses(state, &insn),
-                Err(reason) => return reason,
-            }
+            accesses(state, &insn)
         } else {
             Vec::new()
         };
@@ -378,6 +379,15 @@ pub fn run_watched(
             }
             Err(ExitReason::BudgetExhausted { .. }) => {}
             Err(reason) => return reason,
+        }
+        // A repeated string instruction that goes on at the same rip keeps
+        // RF, as the CPU sets it when it stops between iterations: its
+        // execute breakpoint hits once, before the first.
+        if state.rip.0 == rip
+            && insn.rep != RepPrefix::None
+            && crate::exec::is_string(insn.mnemonic)
+        {
+            state.rflags |= flag::RF;
         }
         let hits = breakpoints.data_hits(&planned);
         if hits != 0 || stepping {

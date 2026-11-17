@@ -3533,7 +3533,19 @@ kernel.
   only `BPF_F_NUMA_NODE` and the access flags, and refuse a value past
   4 MiB or `max_entries` times the value size past 32 bits (`E2BIG`, as
   Linux master). One takes a 312-byte header and `max_entries + 1` value
-  slots. See [limitations](./limitations) for what is not there.
+  slots. A `BPF_MAP_TYPE_BLOOM_FILTER` takes values without keys too, as
+  Linux's `bloom_filter.c`: `UPDATE_ELEM` (`BPF_ANY` alone) sets a bit for
+  each of its hashes (`map_extra`'s low four bits, 5 for 0; more bits are
+  `EINVAL`), and `LOOKUP_ELEM` reads the value and says whether every bit
+  is set (`ENOENT` if not), writing nothing back. The hashes are Linux's
+  `jhash2` of a value of whole words, `jhash` of any other, with a random
+  seed, or 0 with `BPF_F_ZERO_SEED`, so a filter with it gives the same
+  false positives as Linux. The bits are `max_entries` times the hashes,
+  times 7 / 5, a power of two of at least 64 (2^32 past 2^31). `DELETE_ELEM`
+  and `GET_NEXT_KEY` are `EOPNOTSUPP`, `LOOKUP_AND_DELETE_ELEM` and the batch
+  commands `ENOTSUPP`; it needs `CAP_BPF`, and takes a 312-byte header and
+  its bits in 8-byte words. `map_extra` is in its fdinfo and
+  `bpf_map_info`. See [limitations](./limitations) for what is not there.
 - `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
   its order and with its errors, which are the same in the test machines'
   kernel (Ubuntu's Linux 7.0) and in master: the fields past the command

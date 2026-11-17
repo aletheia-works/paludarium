@@ -255,8 +255,8 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes, queues and
-  stacks and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
+- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes, queues,
+  stacks and bloom filters and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
   `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
   every program with `EINVAL`, as a kernel built without the program's
   type does; a program Linux would load, or reject in its verifier with

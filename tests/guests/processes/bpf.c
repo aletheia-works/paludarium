@@ -8,6 +8,9 @@
    and pending lists, which decide which key goes.
    bpf-queue: queues and stacks, which push, peek and pop values without
    keys.
+   bpf-bloom: bloom filters, with BPF_F_ZERO_SEED, so that which values
+   seem to be there, false positives included, is the same as on Linux;
+   with a random seed, only that what was pushed is there.
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -53,6 +56,7 @@
 #define TYPE_LRU_HASH 9
 #define TYPE_QUEUE 22
 #define TYPE_STACK 23
+#define TYPE_BLOOM_FILTER 30
 
 #define F_NO_PREALLOC (1 << 0)
 #define F_NO_COMMON_LRU (1 << 1)
@@ -941,6 +945,127 @@ static int case_prog_load(void) {
     return 0;
 }
 
+static union attr bloom_attr(uint32_t value, uint32_t entries, uint32_t flags, uint64_t extra) {
+    union attr a = map_attr(TYPE_BLOOM_FILTER, 0, value, entries, flags);
+    a.map_extra = extra;
+    return a;
+}
+
+/* Which of the values from..to (as 4-byte, or the first `size` bytes of
+   12-byte, values) the filter says may be there, as a string of 0 and 1. */
+static void seen(const char *name, int fd, uint32_t size, uint32_t from, uint32_t to) {
+    printf("%s ", name);
+    for (uint32_t v = from; v < to; v++) {
+        unsigned char value[16] = {0};
+        memcpy(value, &v, sizeof v);
+        value[size - 1] ^= 0x5a;
+        putchar(elem(MAP_LOOKUP_ELEM, fd, NULL, value, 0) == 0 ? '1' : '0');
+    }
+    putchar('\n');
+    fflush(stdout);
+}
+
+static void fill(int fd, uint32_t size, uint32_t from, uint32_t to) {
+    for (uint32_t v = from; v < to; v++) {
+        unsigned char value[16] = {0};
+        memcpy(value, &v, sizeof v);
+        value[size - 1] ^= 0x5a;
+        elem(MAP_UPDATE_ELEM, fd, NULL, value, ANY);
+    }
+}
+
+static int case_bloom(void) {
+    create("bloom key 4", map_attr(TYPE_BLOOM_FILTER, 4, 4, 10, 0));
+    create("bloom value 0", bloom_attr(0, 10, 0, 0));
+    create("bloom entries 0", bloom_attr(4, 0, 0, 0));
+    create("bloom extra 16", bloom_attr(4, 10, 0, 16));
+    create("bloom no prealloc", bloom_attr(4, 10, F_NO_PREALLOC, 0));
+    create("bloom mmapable", bloom_attr(4, 10, F_MMAPABLE, 0));
+    create("bloom numa", bloom_attr(4, 10, F_NUMA_NODE, 0));
+    create("bloom value too big", bloom_attr((1 << 22) + 1, 10, 0, 0));
+    create("bloom both prog access", bloom_attr(4, 10, F_RDONLY_PROG | F_WRONLY_PROG, 0));
+    union attr h = map_attr(TYPE_HASH, 4, 4, 10, 0);
+    h.map_extra = 1;
+    create("hash with extra", h);
+
+    const uint32_t sizes[][3] = {{4, 1, 0}, {4, 100, 0}, {4, 1000, 3}, {3, 50, 1}, {8, 5000, 15}};
+    for (unsigned i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        union attr a = bloom_attr(sizes[i][0], sizes[i][1], F_ZERO_SEED, sizes[i][2]);
+        int fd = (int)bpf(MAP_CREATE, &a, sizeof a);
+        say("bloom value %u entries %u extra %u memlock %llu", sizes[i][0], sizes[i][1], sizes[i][2], memlock(fd));
+        close(fd);
+    }
+
+    union attr a = bloom_attr(4, 20, F_ZERO_SEED, 0);
+    int fd = (int)bpf(MAP_CREATE, &a, sizeof a);
+    struct map_info mi;
+    memset(&mi, 0, sizeof mi);
+    union attr q;
+    memset(&q, 0, sizeof q);
+    q.info.bpf_fd = (uint32_t)fd;
+    q.info.info_len = sizeof mi;
+    q.info.info = (uintptr_t)&mi;
+    long r = bpf(OBJ_GET_INFO_BY_FD, &q, sizeof q);
+    say("bloom info %ld type %u key %u value %u extra %llu", r, mi.type, mi.key_size, mi.value_size,
+        (unsigned long long)mi.map_extra);
+    char path[64], line[128];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    FILE *info = fopen(path, "r");
+    while (info && fgets(line, sizeof line, info))
+        if (!strncmp(line, "map_extra", 9)) fputs(line, stdout);
+    if (info) fclose(info);
+    fflush(stdout);
+
+    uint32_t value = 7, key = 0, next;
+    say("bloom peek empty %ld", elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0));
+    say("bloom push %ld", elem(MAP_UPDATE_ELEM, fd, NULL, &value, ANY));
+    say("bloom peek %ld", elem(MAP_LOOKUP_ELEM, fd, NULL, &value, 0));
+    say("bloom push noexist %ld", elem(MAP_UPDATE_ELEM, fd, NULL, &value, NOEXIST));
+    say("bloom push exist %ld", elem(MAP_UPDATE_ELEM, fd, NULL, &value, EXIST));
+    say("bloom push lock %ld", elem(MAP_UPDATE_ELEM, fd, NULL, &value, ELEM_F_LOCK));
+    say("bloom push with a key %ld", elem(MAP_UPDATE_ELEM, fd, &key, &value, ANY));
+    say("bloom peek with a key %ld", elem(MAP_LOOKUP_ELEM, fd, &key, &value, 0));
+    say("bloom peek from nowhere %ld", elem(MAP_LOOKUP_ELEM, fd, NULL, (void *)8, 0));
+    say("bloom delete %ld", elem(MAP_DELETE_ELEM, fd, NULL, NULL, 0));
+    say("bloom next key %ld", elem(MAP_GET_NEXT_KEY, fd, NULL, &next, 0));
+    say("bloom lookup and delete %ld", elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, NULL, &value, 0));
+    uint32_t keys[2], count = 2, out;
+    uint32_t values[2] = {1, 2};
+    say("bloom update batch %ld", batch(MAP_UPDATE_BATCH, fd, NULL, NULL, keys, values, &count, 0));
+    count = 2;
+    say("bloom lookup batch %ld", batch(MAP_LOOKUP_BATCH, fd, NULL, &out, keys, values, &count, 0));
+    close(fd);
+
+    /* What seems to be there, false positives and all, of filters that
+       hash words (jhash2) and bytes (jhash), with 5, 1 and 15 hashes. */
+    const uint32_t kinds[][4] = {{4, 20, 0, 0}, {4, 20, 1, 0}, {4, 64, 15, 0}, {3, 20, 0, 0}, {13, 30, 2, 0}};
+    for (unsigned i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
+        a = bloom_attr(kinds[i][0] <= 4 ? kinds[i][0] : 13, kinds[i][1], F_ZERO_SEED, kinds[i][2]);
+        fd = (int)bpf(MAP_CREATE, &a, sizeof a);
+        uint32_t size = kinds[i][0];
+        fill(fd, size, 0, kinds[i][1]);
+        char name[64];
+        snprintf(name, sizeof name, "bloom value %u extra %u seen", size, kinds[i][2]);
+        seen(name, fd, size, 0, 200);
+        close(fd);
+    }
+
+    /* A random seed: what was pushed is there. */
+    a = bloom_attr(4, 100, 0, 0);
+    fd = (int)bpf(MAP_CREATE, &a, sizeof a);
+    fill(fd, 4, 0, 100);
+    int all = 1;
+    for (uint32_t v = 0; v < 100; v++) {
+        unsigned char b[4];
+        memcpy(b, &v, 4);
+        b[3] ^= 0x5a;
+        all &= elem(MAP_LOOKUP_ELEM, fd, NULL, b, 0) == 0;
+    }
+    say("bloom random seed all there %d", all);
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -951,6 +1076,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-memory")) return case_memory();
     if (!strcmp(mode, "bpf-lru")) return case_lru();
     if (!strcmp(mode, "bpf-queue")) return case_queue();
+    if (!strcmp(mode, "bpf-bloom")) return case_bloom();
     if (!strcmp(mode, "bpf-prog-load")) return case_prog_load();
     return 2;
 }

@@ -3059,7 +3059,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `ENOTSUPP` です。`CAP_BPF` が要り、フラグは `BPF_F_NUMA_NODE` とアクセスのものだけで、
   4 MiB を超える値と、`max_entries` と値の大きさの積が 32 ビットを超えるものは、Linux
   master と同じく `E2BIG` です。312 バイトのヘッダーと `max_entries + 1` 個の値の場所を
-  取ります。ないものは [制限](./limitations) を
+  取ります。`BPF_MAP_TYPE_BLOOM_FILTER` も、Linux の `bloom_filter.c` と同じく、キーのない
+  値を取ります。`UPDATE_ELEM`（`BPF_ANY` だけ）はハッシュごとにビットを立て（ハッシュの数は
+  `map_extra` の下位 4 ビットで、0 なら 5。それより上のビットは `EINVAL`）、`LOOKUP_ELEM`
+  は値を読んで、どのビットも立っているかを答えます（そうでなければ `ENOENT`。何も書き
+  戻しません）。ハッシュは、値がワードの並びなら Linux の `jhash2`、そうでなければ
+  `jhash` で、シードはランダムか、`BPF_F_ZERO_SEED` なら 0 です。そのため、0 のシードの
+  フィルタは Linux と同じ偽陽性を返します。ビットの数は `max_entries` とハッシュの数の積の
+  7 / 5 倍を、64 以上の 2 のべき乗にしたものです（2^31 を超えれば 2^32）。`DELETE_ELEM` と
+  `GET_NEXT_KEY` は `EOPNOTSUPP`、`LOOKUP_AND_DELETE_ELEM` とバッチのコマンドは
+  `ENOTSUPP` です。`CAP_BPF` が要り、312 バイトのヘッダーと、8 バイトのワードにした
+  ビットを取ります。`map_extra` は fdinfo と `bpf_map_info` に出ます。ないものは [制限](./limitations) を
   参照してください。
 - `BPF_PROG_LOAD` は、Linux の `bpf_prog_load` と同じ順に同じエラーで引数を確かめます。
   この順とエラーは、テストのマシンのカーネル（Ubuntu の Linux 7.0）と master で同じです。

@@ -1,7 +1,8 @@
 //! `bpf`, for its maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
-//! `hashtab.c`, `bpf_lru_list.c` and `queue_stack_maps.c` have them:
-//! `BPF_MAP_CREATE` of `BPF_MAP_TYPE_ARRAY`, `BPF_MAP_TYPE_HASH`,
-//! `BPF_MAP_TYPE_LRU_HASH`, `BPF_MAP_TYPE_QUEUE` and `BPF_MAP_TYPE_STACK`,
+//! `hashtab.c`, `bpf_lru_list.c`, `queue_stack_maps.c` and `bloom_filter.c`
+//! have them: `BPF_MAP_CREATE` of `BPF_MAP_TYPE_ARRAY`, `BPF_MAP_TYPE_HASH`,
+//! `BPF_MAP_TYPE_LRU_HASH`, `BPF_MAP_TYPE_QUEUE`, `BPF_MAP_TYPE_STACK` and
+//! `BPF_MAP_TYPE_BLOOM_FILTER`,
 //! their elements (`LOOKUP`, `UPDATE`, `DELETE`,
 //! `GET_NEXT_KEY`, `LOOKUP_AND_DELETE`), `BPF_MAP_FREEZE`, the batch
 //! commands, `BPF_OBJ_GET_INFO_BY_FD`, the map IDs (`BPF_MAP_GET_NEXT_ID`,
@@ -45,6 +46,7 @@ const E2BIG: Errno = Errno(7);
 const ENOMEM: Errno = Errno(12);
 const EBUSY: Errno = Errno(16);
 const ENOSPC: Errno = Errno(28);
+const EOPNOTSUPP: Errno = Errno(95);
 const EBADFD: Errno = Errno(77);
 /// The kernel's own `ENOTSUPP`, which reaches user space as it is.
 const ENOTSUPP: Errno = Errno(524);
@@ -77,6 +79,7 @@ const TYPE_ARRAY: u32 = 2;
 const TYPE_LRU_HASH: u32 = 9;
 const TYPE_QUEUE: u32 = 22;
 const TYPE_STACK: u32 = 23;
+const TYPE_BLOOM_FILTER: u32 = 30;
 /// `__MAX_BPF_MAP_TYPE` in Linux master.
 const TYPE_MAX: u32 = 39;
 /// `BPF_MAP_TYPE_STRUCT_OPS`, the one `btf_vmlinux_value_type_id` is for.
@@ -101,6 +104,7 @@ mod flag {
     pub const ARRAY: u32 = NUMA_NODE | MMAPABLE | ACCESS | PRESERVE_ELEMS | INNER_MAP;
     pub const HASH: u32 = NO_PREALLOC | NO_COMMON_LRU | NUMA_NODE | ACCESS | ZERO_SEED;
     pub const QUEUE_STACK: u32 = NUMA_NODE | ACCESS;
+    pub const BLOOM: u32 = NUMA_NODE | ZERO_SEED | ACCESS;
 }
 
 /// The element flags: `BPF_ANY`, `BPF_NOEXIST`, `BPF_EXIST`, `BPF_F_LOCK`,
@@ -143,6 +147,168 @@ enum Elements {
     Lru(Box<Lru>),
     /// A queue's or a stack's, oldest first.
     Queue(std::collections::VecDeque<Vec<u8>>),
+    /// A bloom filter's bits.
+    Bloom(Bloom),
+}
+
+/// A bloom filter's bit array, as Linux's `bloom_filter.c` has it: up to
+/// 2^32 bits, of which only those set are kept.
+pub(crate) struct Bloom {
+    /// `bitset_mask`: the bits, less one, a power of two.
+    mask: u32,
+    /// `hash_seed`: random, or 0 with `BPF_F_ZERO_SEED`.
+    seed: u32,
+    /// `nr_hash_funcs`: `map_extra`'s low four bits, or 5 for 0.
+    hashes: u32,
+    set: std::collections::BTreeSet<u32>,
+}
+
+impl Bloom {
+    /// The bits `bloom_map_alloc` gives a filter: `max_entries` times the
+    /// hashes, times 7 / 5 (about 1 / ln 2), at least 64 and rounded up to
+    /// a power of two; 2^32 where that passes 2^31 or overflows 32 bits.
+    fn mask(max_entries: u32, hashes: u32) -> u32 {
+        match max_entries
+            .checked_mul(hashes)
+            .and_then(|bits| (bits / 5).checked_mul(7))
+        {
+            Some(bits) if bits <= 1 << 31 => bits.max(64).next_power_of_two() - 1,
+            _ => u32::MAX,
+        }
+    }
+    /// `hash`: `jhash2` of a value of whole 32-bit words, else `jhash`, with
+    /// the seed and the hash's index, masked.
+    fn bit(&self, value: &[u8], index: u32) -> u32 {
+        let initval = self.seed.wrapping_add(index);
+        let h = if value.len() % 4 == 0 {
+            let words: Vec<u32> = value
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| u32::from_le_bytes(*w))
+                .collect();
+            jhash2(&words, initval)
+        } else {
+            jhash(value, initval)
+        };
+        h & self.mask
+    }
+    /// `bloom_map_push_elem`: sets each hash's bit.
+    fn push(&mut self, value: &[u8]) {
+        for i in 0..self.hashes {
+            let bit = self.bit(value, i);
+            self.set.insert(bit);
+        }
+    }
+    /// `bloom_map_peek_elem`: whether every hash's bit is set (`ENOENT`).
+    fn peek(&self, value: &[u8]) -> Result<(), Errno> {
+        if (0..self.hashes).all(|i| self.set.contains(&self.bit(value, i))) {
+            Ok(())
+        } else {
+            Err(Errno::ENOENT)
+        }
+    }
+}
+
+/// `JHASH_INITVAL`.
+const JHASH_INITVAL: u32 = 0xdead_beef;
+
+/// `__jhash_mix`, Bob Jenkins' lookup3 mix.
+fn jhash_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
+    for (x, y, z, r) in [
+        (0, 2, 1, 4),
+        (1, 0, 2, 6),
+        (2, 1, 0, 8),
+        (0, 2, 1, 16),
+        (1, 0, 2, 19),
+        (2, 1, 0, 4),
+    ] {
+        let mut v = [*a, *b, *c];
+        v[x] = v[x].wrapping_sub(v[y]);
+        v[x] ^= v[y].rotate_left(r);
+        v[y] = v[y].wrapping_add(v[z]);
+        [*a, *b, *c] = v;
+    }
+}
+
+/// `__jhash_final`.
+fn jhash_final(a: &mut u32, b: &mut u32, c: &mut u32) {
+    for (x, y, r) in [
+        (2, 1, 14),
+        (0, 2, 11),
+        (1, 0, 25),
+        (2, 1, 16),
+        (0, 2, 4),
+        (1, 0, 14),
+        (2, 1, 24),
+    ] {
+        let mut v = [*a, *b, *c];
+        v[x] ^= v[y];
+        v[x] = v[x].wrapping_sub(v[y].rotate_left(r));
+        [*a, *b, *c] = v;
+    }
+}
+
+/// `jhash`: lookup3's hash of bytes, little-endian words.
+fn jhash(key: &[u8], initval: u32) -> u32 {
+    let start = JHASH_INITVAL
+        .wrapping_add(key.len() as u32)
+        .wrapping_add(initval);
+    let (mut a, mut b, mut c) = (start, start, start);
+    let word = |bytes: &[u8]| {
+        let mut w = [0; 4];
+        w[..bytes.len()].copy_from_slice(bytes);
+        u32::from_le_bytes(w)
+    };
+    let mut rest = key;
+    while rest.len() > 12 {
+        a = a.wrapping_add(word(&rest[0..4]));
+        b = b.wrapping_add(word(&rest[4..8]));
+        c = c.wrapping_add(word(&rest[8..12]));
+        jhash_mix(&mut a, &mut b, &mut c);
+        rest = &rest[12..];
+    }
+    if rest.is_empty() {
+        return c;
+    }
+    // The last block, its missing bytes as zeros.
+    a = a.wrapping_add(word(&rest[..rest.len().min(4)]));
+    if rest.len() > 4 {
+        b = b.wrapping_add(word(&rest[4..rest.len().min(8)]));
+    }
+    if rest.len() > 8 {
+        c = c.wrapping_add(word(&rest[8..]));
+    }
+    jhash_final(&mut a, &mut b, &mut c);
+    c
+}
+
+/// `jhash2`: lookup3's hash of 32-bit words.
+fn jhash2(key: &[u32], initval: u32) -> u32 {
+    let start = JHASH_INITVAL
+        .wrapping_add((key.len() as u32) << 2)
+        .wrapping_add(initval);
+    let (mut a, mut b, mut c) = (start, start, start);
+    let mut rest = key;
+    while rest.len() > 3 {
+        a = a.wrapping_add(rest[0]);
+        b = b.wrapping_add(rest[1]);
+        c = c.wrapping_add(rest[2]);
+        jhash_mix(&mut a, &mut b, &mut c);
+        rest = &rest[3..];
+    }
+    if rest.is_empty() {
+        return c;
+    }
+    a = a.wrapping_add(rest[0]);
+    if let Some(&w) = rest.get(1) {
+        b = b.wrapping_add(w);
+    }
+    if let Some(&w) = rest.get(2) {
+        c = c.wrapping_add(w);
+    }
+    jhash_final(&mut a, &mut b, &mut c);
+    c
 }
 
 /// A key and its value.
@@ -155,6 +321,8 @@ pub(crate) struct Map {
     value_size: u32,
     max_entries: u32,
     flags: u32,
+    /// `map_extra`, which only a bloom filter takes here.
+    extra: u64,
     name: [u8; 16],
     id: u32,
     /// The table that holds the ID, which gives it back when the map goes.
@@ -425,6 +593,12 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
                 return Err(E2BIG);
             }
         }
+        // bloom_map_alloc_check; the rest it checks once allowed.
+        TYPE_BLOOM_FILTER => {
+            if value_size > 1 << 22 {
+                return Err(E2BIG);
+            }
+        }
         // No ops for it here.
         _ => return Err(Errno::EINVAL),
     }
@@ -441,7 +615,11 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     }
     // The privileged map types, which need CAP_BPF even where any user
     // may make maps.
-    if matches!(kind, TYPE_LRU_HASH | TYPE_QUEUE | TYPE_STACK) && !bpf_capable(c) {
+    if matches!(
+        kind,
+        TYPE_LRU_HASH | TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER
+    ) && !bpf_capable(c)
+    {
         return Err(Errno::EPERM);
     }
     // array_map_alloc: without `bpf_bypass_spec_v1` (CAP_PERFMON) the
@@ -452,6 +630,18 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     };
     if kind == TYPE_ARRAY && !bypass_spec && max_entries.checked_next_power_of_two().is_none() {
         return Err(E2BIG);
+    }
+    // bloom_map_alloc: no key, a value, entries, its flags, and the
+    // number of hashes in map_extra's low four bits.
+    if kind == TYPE_BLOOM_FILTER
+        && (key_size != 0
+            || value_size == 0
+            || max_entries == 0
+            || flags & !flag::BLOOM != 0
+            || !access_ok
+            || map_extra & !0xf != 0)
+    {
+        return Err(Errno::EINVAL);
     }
     let cpus = c.host.cpu_count().clamp(1, 8192) as u64;
     let max_entries = entries(kind, max_entries, flags, cpus);
@@ -464,6 +654,13 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         bypass_spec,
         cpus,
     )?;
+    if kind == TYPE_BLOOM_FILTER {
+        area(bloom_size(max_entries, map_extra))?;
+    }
+    let mut seed = [0; 4];
+    if kind == TYPE_BLOOM_FILTER && flags & flag::ZERO_SEED == 0 {
+        c.host.random_bytes(&mut seed).map_err(|_| ENOMEM)?;
+    }
     let name = name(&attr[28..44])?;
     if btf_key != 0 || btf_value != 0 || btf_vmlinux_value != 0 {
         // No file is BTF.
@@ -491,14 +688,45 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         value_size,
         max_entries,
         flags,
+        extra: map_extra,
         name,
         id,
         ids: Arc::clone(ids),
         cpus,
         frozen: AtomicBool::new(false),
-        elements: Mutex::new(elements(kind, max_entries, flags, cpus)),
+        elements: Mutex::new(if kind == TYPE_BLOOM_FILTER {
+            Elements::Bloom(bloom(max_entries, map_extra, u32::from_le_bytes(seed)))
+        } else {
+            elements(kind, max_entries, flags, cpus)
+        }),
     })?;
     new_fd(c, map, access)
+}
+
+/// A new bloom filter's bits, none set.
+fn bloom(max_entries: u32, extra: u64, seed: u32) -> Bloom {
+    let hashes = match extra as u32 & 0xf {
+        0 => 5,
+        n => n,
+    };
+    Bloom {
+        mask: Bloom::mask(max_entries, hashes),
+        seed,
+        hashes,
+        set: std::collections::BTreeSet::new(),
+    }
+}
+
+/// `sizeof(struct bpf_bloom_filter)` on x86-64, on the test machines'
+/// kernel: their 296-byte `struct bpf_map`, `bitset_mask`, `hash_seed` and
+/// `nr_hash_funcs`, rounded up to the bit array's 8-byte words.
+const BLOOM_HEADER: u64 = 312;
+
+/// A bloom filter's header and bit array in whole 8-byte words, as
+/// `bloom_map_alloc` makes it and `bloom_map_mem_usage` counts it.
+fn bloom_size(max_entries: u32, extra: u64) -> u64 {
+    let filter = bloom(max_entries, extra, 0);
+    BLOOM_HEADER + (u64::from(filter.mask) + 1).div_ceil(64) * 8
 }
 
 /// A new map's elements: none.
@@ -785,6 +1013,7 @@ impl Map {
             Elements::Hash(values) => values.contains_key(key),
             Elements::Lru(lru) => lru.table.contains_key(key),
             Elements::Queue(values) => !values.is_empty(),
+            Elements::Bloom(_) => true,
         };
         if held { Ok(()) } else { Err(Errno::ENOENT) }
     }
@@ -813,6 +1042,8 @@ impl Map {
             }
             .cloned()
             .ok_or(Errno::ENOENT),
+            // A bloom filter is looked up by its value, not a key.
+            Elements::Bloom(_) => Err(Errno::EINVAL),
         }
     }
     /// `map_pop_elem`: a queue's oldest or a stack's newest, taken out.
@@ -873,6 +1104,13 @@ impl Map {
                 }
                 values.push_back(value);
             }
+            // `bloom_map_push_elem`: `BPF_ANY` alone.
+            Elements::Bloom(bloom) => {
+                if flags != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                bloom.push(&value);
+            }
         }
         Ok(())
     }
@@ -883,6 +1121,7 @@ impl Map {
             Elements::Hash(values) => values.remove(key).ok_or(Errno::ENOENT),
             Elements::Lru(lru) => lru.delete(key),
             Elements::Queue(_) => Err(Errno::EINVAL),
+            Elements::Bloom(_) => Err(EOPNOTSUPP),
         }
     }
     /// `map_get_next_key`: the first key after `key`, or the first of all
@@ -903,6 +1142,7 @@ impl Map {
             Elements::Lru(lru) => next_in(&lru.table, key),
             Elements::Hash(values) => next_in(values, key),
             Elements::Queue(_) => Err(Errno::EINVAL),
+            Elements::Bloom(_) => Err(EOPNOTSUPP),
         }
     }
     /// The keys and values it holds, by key: a hash's and an LRU hash's.
@@ -915,7 +1155,7 @@ impl Map {
                 .iter()
                 .map(|(k, &i)| (k.clone(), lru.values[i].clone()))
                 .collect(),
-            Elements::Array(_) | Elements::Queue(_) => Vec::new(),
+            Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => Vec::new(),
         }
     }
     /// The elements from the `start`th, up to `max` of them, by key, taken
@@ -927,7 +1167,7 @@ impl Map {
         let chosen: Vec<Vec<u8>> = match &*elements {
             Elements::Hash(values) => values.keys().skip(start).take(max).cloned().collect(),
             Elements::Lru(lru) => lru.table.keys().skip(start).take(max).cloned().collect(),
-            Elements::Array(_) | Elements::Queue(_) => Vec::new(),
+            Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => Vec::new(),
         };
         let mut taken = Vec::with_capacity(chosen.len());
         for key in chosen {
@@ -936,7 +1176,7 @@ impl Map {
                 Elements::Hash(values) => values.get(&key).cloned(),
                 Elements::Lru(lru) if delete => lru.delete(&key).ok(),
                 Elements::Lru(lru) => lru.get(&key).cloned(),
-                Elements::Array(_) | Elements::Queue(_) => None,
+                Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => None,
             };
             if let Some(value) = value {
                 taken.push((key, value));
@@ -945,7 +1185,7 @@ impl Map {
         let left = match &*elements {
             Elements::Hash(values) => values.len(),
             Elements::Lru(lru) => lru.table.len(),
-            Elements::Array(_) | Elements::Queue(_) => 0,
+            Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => 0,
         };
         (taken, left)
     }
@@ -954,7 +1194,7 @@ impl Map {
         match &*self.elements() {
             Elements::Hash(values) => values.len(),
             Elements::Lru(lru) => lru.table.len(),
-            Elements::Array(_) | Elements::Queue(_) => 0,
+            Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => 0,
         }
     }
     /// The memory it takes, as `bpf_map_memory_usage` counts it: an array's
@@ -968,6 +1208,9 @@ impl Map {
         }
         if matches!(self.kind, TYPE_QUEUE | TYPE_STACK) {
             return queue_size(self.max_entries, self.value_size);
+        }
+        if self.kind == TYPE_BLOOM_FILTER {
+            return bloom_size(self.max_entries, self.extra);
         }
         let element = hash_element(self.key_size, self.value_size);
         let table = HASH_HEADER + BUCKET * buckets(self.max_entries);
@@ -1007,6 +1250,14 @@ fn lookup(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     }
     check_op_flags(word(attr, 24), F_LOCK | F_CPU)?;
     let key = read_key(c, &map, word(attr, 8))?;
+    if map.kind == TYPE_BLOOM_FILTER {
+        // The value is read, not written: whether it may be in the filter.
+        let value = read_value(c, &map, word(attr, 16))?;
+        let Elements::Bloom(bloom) = &*map.elements() else {
+            return Err(Errno::EINVAL);
+        };
+        return bloom.peek(&value).map(|()| 0);
+    }
     copy_value(c, &map, &key, word(attr, 16))?;
     Ok(0)
 }
@@ -1123,8 +1374,8 @@ fn batch(c: &mut Context<'_>, attr: &[u8], at: u64, command: u32) -> Result<u64,
         return Err(Errno::EPERM);
     }
     let hash = map.hashed();
-    // A queue and a stack have no batch operations.
-    if matches!(map.kind, TYPE_QUEUE | TYPE_STACK) {
+    // A queue, a stack and a bloom filter have no batch operations.
+    if matches!(map.kind, TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER) {
         return Err(ENOTSUPP);
     }
     match command {
@@ -1357,6 +1608,7 @@ fn info(c: &mut Context<'_>, attr: &[u8], at: u64) -> Result<u64, Errno> {
         info[i * 4..i * 4 + 4].copy_from_slice(&field.to_le_bytes());
     }
     info[24..40].copy_from_slice(&map.name);
+    info[80..88].copy_from_slice(&map.extra.to_le_bytes());
     // A map's SHA-256 (`map_get_hash`) is not made here.
     if hash != 0 || hash_size != 0 {
         return Err(Errno::EINVAL);
@@ -1372,12 +1624,13 @@ pub(crate) fn fdinfo(file: &Arc<dyn FileHandle>) -> Option<Vec<u8>> {
     let map = &of(file)?.map;
     Some(
         format!(
-            "map_type:\t{}\nkey_size:\t{}\nvalue_size:\t{}\nmax_entries:\t{}\nmap_flags:\t{:#x}\nmap_extra:\t0x0\nmemlock:\t{}\nmap_id:\t{}\nfrozen:\t{}\n",
+            "map_type:\t{}\nkey_size:\t{}\nvalue_size:\t{}\nmax_entries:\t{}\nmap_flags:\t{:#x}\nmap_extra:\t{:#x}\nmemlock:\t{}\nmap_id:\t{}\nfrozen:\t{}\n",
             map.kind,
             map.key_size,
             map.value_size,
             map.max_entries,
             map.flags,
+            map.extra,
             map.memory(),
             map.id,
             u8::from(map.frozen.load(Ordering::SeqCst))
@@ -1831,6 +2084,7 @@ mod tests {
             value_size,
             max_entries,
             flags,
+            extra: 0,
             name: [0; 16],
             id,
             ids: Arc::clone(ids),
@@ -2079,6 +2333,54 @@ mod tests {
             Err(ENOMEM)
         );
         assert_eq!(allocate(TYPE_STACK, 8, 0, 1 << 20, 0, true, 2), Ok(()));
+    }
+
+    #[test]
+    fn jhash_is_lookup3() {
+        // Bob Jenkins' own check values for lookup3's hashlittle.
+        let text = b"Four score and seven years ago";
+        assert_eq!(jhash(text, 0), 0x1777_0551);
+        assert_eq!(jhash(text, 1), 0xcd62_8161);
+        assert_eq!(jhash(b"", 0), 0xdead_beef);
+        // jhash2 of whole words is jhash of their bytes, at every length
+        // around the 12-byte blocks.
+        for len in [4, 8, 12, 16, 24, 28] {
+            let bytes: Vec<u8> = (0..len as u8).map(|b| b.wrapping_mul(37)).collect();
+            let words: Vec<u32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| u32::from_le_bytes(*w))
+                .collect();
+            assert_eq!(jhash2(&words, 7), jhash(&bytes, 7), "{len}");
+        }
+    }
+
+    #[test]
+    fn a_bloom_filter_knows_what_was_pushed() {
+        assert_eq!(Bloom::mask(1, 5), 63);
+        assert_eq!(Bloom::mask(100, 5), 1023);
+        assert_eq!(Bloom::mask(u32::MAX, 5), u32::MAX);
+        assert_eq!(Bloom::mask(1 << 28, 15), u32::MAX);
+        assert_eq!(bloom_size(1, 0), 312 + 8);
+        assert_eq!(bloom_size(u32::MAX, 0), 312 + (1 << 29));
+        let mut b = bloom(100, 0, 0);
+        assert_eq!(b.hashes, 5);
+        assert_eq!(bloom(100, 3, 0).hashes, 3);
+        for v in 0u32..20 {
+            b.push(&v.to_le_bytes());
+        }
+        for v in 0u32..20 {
+            assert_eq!(b.peek(&v.to_le_bytes()), Ok(()));
+        }
+        // Most of what was never pushed is not there.
+        let absent = (1000u32..1100)
+            .filter(|v| b.peek(&v.to_le_bytes()).is_err())
+            .count();
+        assert!(absent > 90, "{absent}");
+        // A value of bytes that are not whole words takes jhash.
+        b.push(b"abc");
+        assert_eq!(b.peek(b"abc"), Ok(()));
     }
 
     #[test]

@@ -18,8 +18,10 @@
 //! memory), counted with its x86-64 structure sizes; see [`ARRAY_HEADER`]
 //! and [`HASH_HEADER`] for where they part from upstream v7.0 and master.
 //!
-//! A command Linux has that is not here (programs, BTF, links, pins and the
-//! rest) is `ENOSYS`; one Linux does not have is `EINVAL`, as there. Map
+//! `BPF_PROG_LOAD` checks its arguments as Linux does and then refuses every
+//! program ([`crate::bpf_prog`]). A command Linux has that is not here
+//! (the other program commands, BTF, links, pins and the rest) is
+//! `ENOSYS`; one Linux does not have is `EINVAL`, as there. Map
 //! types Linux has that are not here are `EINVAL`, as on a kernel built
 //! without them (`bpf_map_types` holds no ops for them).
 use crate::syscalls::{Context, Outcome};
@@ -55,6 +57,7 @@ mod cmd {
     pub const MAP_UPDATE_ELEM: u32 = 2;
     pub const MAP_DELETE_ELEM: u32 = 3;
     pub const MAP_GET_NEXT_KEY: u32 = 4;
+    pub const PROG_LOAD: u32 = 5;
     pub const MAP_GET_NEXT_ID: u32 = 12;
     pub const MAP_GET_FD_BY_ID: u32 = 14;
     pub const OBJ_GET_INFO_BY_FD: u32 = 15;
@@ -262,6 +265,7 @@ fn dispatch(c: &mut Context<'_>, command: u32, at: u64, size: u32) -> Result<u64
         cmd::MAP_UPDATE_ELEM => update(c, &attr),
         cmd::MAP_DELETE_ELEM => delete(c, &attr),
         cmd::MAP_GET_NEXT_KEY => next_key(c, &attr),
+        cmd::PROG_LOAD => crate::bpf_prog::load(c, &attr),
         cmd::MAP_LOOKUP_AND_DELETE_ELEM => lookup_and_delete(c, &attr),
         cmd::MAP_FREEZE => freeze(c, &attr),
         cmd::MAP_LOOKUP_BATCH
@@ -277,7 +281,7 @@ fn dispatch(c: &mut Context<'_>, command: u32, at: u64, size: u32) -> Result<u64
 }
 
 /// `CHECK_ATTR`: the bytes past the command's last field are 0.
-fn check_attr(attr: &[u8], end: usize) -> Result<(), Errno> {
+pub(crate) fn check_attr(attr: &[u8], end: usize) -> Result<(), Errno> {
     if attr[end..].iter().any(|&b| b != 0) {
         Err(Errno::EINVAL)
     } else {

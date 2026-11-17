@@ -823,6 +823,91 @@ hash emptied end -2 keys
 ",
         );
     }
+
+    /// `bpf-prog-load`: BPF_PROG_LOAD's checks of its arguments. The guest
+    /// checks the unprivileged loads in a child; here the same task drops
+    /// to nobody at the end, as that child does.
+    #[test]
+    fn prog_load() {
+        const PROG_LOAD: u64 = 5;
+        const SETRESUID: u64 = 117;
+        let mut g = Guest::new();
+        // r0 = 0; exit
+        let insns = g.put(&[0xb7, 0, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0]);
+        let license = g.put(b"GPL\0");
+        let log = g.alloc(64);
+        let prog = || {
+            let mut a = [0u8; 168];
+            put32(&mut a, 0, 1);
+            put32(&mut a, 4, 2);
+            put64(&mut a, 8, insns);
+            put64(&mut a, 16, license);
+            a
+        };
+        let null = g.open("/dev/null");
+        let load = |g: &mut Guest, label: &str, a: [u8; 168]| {
+            let r = g.bpf(PROG_LOAD, &a);
+            g.say(format!("{label} {r}"));
+        };
+        let mut a = prog();
+        put32(&mut a, 44, 1 << 8);
+        load(&mut g, "unknown flag", a);
+        let mut a = prog();
+        put32(&mut a, 44, 1 << 16);
+        put32(&mut a, 144, 1000);
+        load(&mut g, "token flag without a descriptor", a);
+        put32(&mut a, 144, null as u32);
+        load(&mut g, "token flag with another file", a);
+        let mut a = prog();
+        put32(&mut a, 4, 0);
+        load(&mut g, "no instructions", a);
+        put32(&mut a, 4, 1_000_001);
+        load(&mut g, "more than the complexity limit", a);
+        let mut a = prog();
+        put32(&mut a, 112, null as u32);
+        load(&mut g, "attach to another file", a);
+        let mut a = prog();
+        put32(&mut a, 108, 1);
+        load(&mut g, "attach BTF ID", a);
+        let mut a = prog();
+        put64(&mut a, 8, 8);
+        load(&mut g, "instructions at no memory", a);
+        let mut a = prog();
+        put64(&mut a, 16, 8);
+        load(&mut g, "license at no memory", a);
+        let mut a = prog();
+        put32(&mut a, 0, 1000);
+        load(&mut g, "unknown type", a);
+        let mut a = prog();
+        a[48..57].copy_from_slice(b"bad-name\0");
+        load(&mut g, "name with a dash", a);
+        let mut a = prog();
+        put64(&mut a, 32, log);
+        put32(&mut a, 24, 1);
+        load(&mut g, "log buffer without a size", a);
+        g.close(null);
+        assert_eq!(g.call(SETRESUID, [65534, 65534, 65534, 0, 0, 0]), 0);
+        load(&mut g, "unprivileged socket filter", prog());
+        let mut a = prog();
+        put32(&mut a, 4, 0);
+        load(&mut g, "unprivileged no instructions", a);
+        g.check(
+            "unknown flag -22
+token flag without a descriptor -9
+token flag with another file -22
+no instructions -7
+more than the complexity limit -7
+attach to another file -22
+attach BTF ID -22
+instructions at no memory -14
+license at no memory -14
+unknown type -22
+name with a dash -22
+log buffer without a size -22
+unprivileged socket filter -1
+unprivileged no instructions -1",
+        );
+    }
 }
 
 /// `tests/guests/processes/perf.c`: perf_event_open's checks and events.

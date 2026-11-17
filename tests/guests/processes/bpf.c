@@ -751,6 +751,112 @@ static int case_lru(void) {
     return 0;
 }
 
+/* bpf-prog-load: BPF_PROG_LOAD's checks of its arguments, each case wrong
+   in one way only, so that Linux and the emulator stop at the same check.
+   Only the errors are compared: a program Linux would verify and load is
+   never made here, as the emulator loads none. */
+#define PROG_LOAD 5
+#define PROG_SOCKET_FILTER 1
+#define PROG_TOKEN_FD (1 << 16)
+
+/* union bpf_attr for BPF_PROG_LOAD, to keyring_id, the last field. */
+struct prog_attr {
+    uint32_t prog_type, insn_cnt;
+    uint64_t insns, license;
+    uint32_t log_level, log_size;
+    uint64_t log_buf;
+    uint32_t kern_version, prog_flags;
+    char prog_name[16];
+    uint32_t prog_ifindex, expected_attach_type, prog_btf_fd, func_info_rec_size;
+    uint64_t func_info;
+    uint32_t func_info_cnt, line_info_rec_size;
+    uint64_t line_info;
+    uint32_t line_info_cnt, attach_btf_id, attach_prog_fd, core_relo_cnt;
+    uint64_t fd_array, core_relos;
+    uint32_t core_relo_rec_size, log_true_size;
+    int32_t prog_token_fd;
+    uint32_t fd_array_cnt;
+    uint64_t signature;
+    uint32_t signature_size;
+    int32_t keyring_id;
+};
+_Static_assert(sizeof(struct prog_attr) == 168, "union bpf_attr's size");
+
+/* r0 = 0; exit */
+static const uint64_t prog_insns[2] = { 0x00000000000000b7ULL, 0x0000000000000095ULL };
+static char prog_log[4096];
+
+static struct prog_attr prog(void) {
+    struct prog_attr p;
+    memset(&p, 0, sizeof p);
+    p.prog_type = PROG_SOCKET_FILTER;
+    p.insn_cnt = 2;
+    p.insns = (uintptr_t)prog_insns;
+    p.license = (uintptr_t)"GPL";
+    return p;
+}
+
+static void load(const char *name, struct prog_attr p) {
+    say("%s %ld", name, bpf(PROG_LOAD, &p, sizeof p));
+}
+
+static int case_prog_load(void) {
+    int null = open("/dev/null", O_RDONLY);
+    struct prog_attr p = prog();
+    p.prog_flags = 1 << 8;
+    load("unknown flag", p);
+    p = prog();
+    p.prog_flags = PROG_TOKEN_FD;
+    p.prog_token_fd = 1000;
+    load("token flag without a descriptor", p);
+    p.prog_token_fd = null;
+    load("token flag with another file", p);
+    p = prog();
+    p.insn_cnt = 0;
+    load("no instructions", p);
+    p.insn_cnt = 1000001;
+    load("more than the complexity limit", p);
+    p = prog();
+    p.attach_prog_fd = null;
+    load("attach to another file", p);
+    p = prog();
+    p.attach_btf_id = 1;
+    load("attach BTF ID", p);
+    p = prog();
+    p.insns = 8;
+    load("instructions at no memory", p);
+    p = prog();
+    p.license = 8;
+    load("license at no memory", p);
+    p = prog();
+    p.prog_type = 1000;
+    load("unknown type", p);
+    p = prog();
+    memcpy(p.prog_name, "bad-name", 9);
+    load("name with a dash", p);
+    p = prog();
+    p.log_buf = (uintptr_t)prog_log;
+    p.log_level = 1;
+    load("log buffer without a size", p);
+    close(null);
+
+    /* Without CAP_BPF, kernel.unprivileged_bpf_disabled (2) keeps every
+       load out, before its size is looked at. */
+    pid_t child = fork();
+    if (child == 0) {
+        if (setresuid(65534, 65534, 65534) < 0) _exit(1);
+        load("unprivileged socket filter", prog());
+        struct prog_attr q = prog();
+        q.insn_cnt = 0;
+        load("unprivileged no instructions", q);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    say("child status %d", status);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -760,5 +866,6 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-ids")) return case_ids();
     if (!strcmp(mode, "bpf-memory")) return case_memory();
     if (!strcmp(mode, "bpf-lru")) return case_lru();
+    if (!strcmp(mode, "bpf-prog-load")) return case_prog_load();
     return 2;
 }

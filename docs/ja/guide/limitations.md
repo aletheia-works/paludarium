@@ -221,14 +221,17 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   比べていません。テストのマシンの Linux 7.0 は 144 バイトまでしか知らず、0 でないものには
   `E2BIG` を返します。`kernel.perf_event_paranoid` は
   最初 Linux の 2 です（Debian と Ubuntu のカーネルの既定はそれより大きい）。
-- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュだけです。プログラム
-  （`BPF_PROG_LOAD`、`BPF_PROG_TEST_RUN`）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
+- **BPF はマップだけ**：`bpf` が作るのは配列、ハッシュ、LRU ハッシュだけです。プログラムを
+  読み込むことはありません。検証器はなく、BPF は動きません。`BPF_PROG_LOAD` は Linux と同じく
+  引数を確かめたあと、プログラムの型を組み込まずにビルドしたカーネルと同じく、どのプログラムも
+  `EINVAL` で断ります。Linux なら読み込むプログラムや、検証器がほかのエラー（多くは `EACCES`）で
+  断るプログラムも、この `EINVAL` になり、ログは書きません。ほかのプログラムのコマンド
+  （`BPF_PROG_TEST_RUN` など）、BTF（`BPF_BTF_LOAD`）、link、アタッチ、ピン
   （`BPF_OBJ_PIN`、`BPF_OBJ_GET`）、プログラム、BTF、link の ID（`BPF_PROG_GET_NEXT_ID`、
   `BPF_PROG_GET_FD_BY_ID` など）、トークン、イテレータ、統計は、Linux にあってここにない
-  コマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf はプログラムを読み込めず
-  （最小のプログラムでの確認が `ENOSYS` で失敗します）、`bpftool feature` は、
-  `BPF_PROG_LOAD` を呼んで `ENOSYS` かどうかを見るので、`bpf()` システムコールがないと
-  言います。ほかのマップの型は、それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。
+  コマンドとして `ENOSYS` です。Linux にコマンドのない番号は、Linux と同じく `EINVAL` です。そのため libbpf の
+  最小のプログラムでの確認は `EINVAL` で失敗し、読み込めるプログラムの型は見つかりません。
+  `bpftool feature` は、`bpf()` システムコールは見つけますが、プログラムの型は見つけません。ほかのマップの型は、それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。
   CPU ごとの型（`BPF_MAP_TYPE_PERCPU_ARRAY`、`PERCPU_HASH`、`LRU_PERCPU_HASH`）は、
   値が使いうる CPU ごとに一つあり、テストのマシンとエミュレータで CPU の数え方が違うので、
   どのみち Linux と比べられません。ハッシュはキーをバイトの順に返します。Linux の順は

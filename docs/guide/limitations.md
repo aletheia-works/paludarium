@@ -255,16 +255,20 @@ verified.
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
 - **BPF, maps only**: `bpf` makes arrays, hashes and LRU hashes and nothing
-  else.
-  Programs (`BPF_PROG_LOAD`, `BPF_PROG_TEST_RUN`), BTF (`BPF_BTF_LOAD`),
-  links, attachment, pins (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of
-  programs, BTF and links (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`
-  and the rest), tokens, iterators and statistics are `ENOSYS`, as each
-  command Linux has that is not here; a number Linux has no command for is
-  `EINVAL`, as there. So libbpf finds no
-  program loads (its trivial-program probe fails with `ENOSYS`) and
-  `bpftool feature` says the `bpf()` system call is not there, as it asks
-  `BPF_PROG_LOAD` and looks for `ENOSYS`. The other map types are `EINVAL`,
+  else. Programs are never loaded: there is no verifier and no BPF runs.
+  `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
+  every program with `EINVAL`, as a kernel built without the program's
+  type does; a program Linux would load, or reject in its verifier with
+  another error (most often `EACCES`), gets that `EINVAL`, and no log is
+  written. The other program commands (`BPF_PROG_TEST_RUN` and the rest),
+  BTF (`BPF_BTF_LOAD`), links, attachment, pins (`BPF_OBJ_PIN`,
+  `BPF_OBJ_GET`), the IDs of programs, BTF and links
+  (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID` and the rest), tokens,
+  iterators and statistics are `ENOSYS`, as each command Linux has that is
+  not here; a number Linux has no command for is `EINVAL`, as there. So
+  libbpf's trivial-program probe fails with `EINVAL` and it finds no
+  program type it can load, and `bpftool feature` finds the `bpf()` system
+  call but no program types. The other map types are `EINVAL`,
   as on a kernel built without them; the per-CPU ones
   (`BPF_MAP_TYPE_PERCPU_ARRAY`, `PERCPU_HASH`, `LRU_PERCPU_HASH`) could not
   be compared with Linux anyway, as their values are one per possible CPU,

@@ -76,7 +76,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップのみ（下を参照） |
+| BPF | `bpf`、マップと `BPF_PROG_LOAD` の引数の検査（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -3004,6 +3004,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`max_entries` を CPU の数の倍数に切り上げ、どの CPU も同じ数です。`BPF_F_NUMA_NODE` と
   一緒なら `EINVAL`）。メモリは予備のない要素だけを数えます。ないものは [制限](./limitations) を
   参照してください。
+- `BPF_PROG_LOAD` は、Linux の `bpf_prog_load` と同じ順に同じエラーで引数を確かめます。
+  この順とエラーは、テストのマシンのカーネル（Ubuntu の Linux 7.0）と master で同じです。
+  コマンドより先のフィールド（`EINVAL`）、プログラムのフラグ（`EINVAL`）、トークンの
+  ディスクリプタ（ないものは `EBADF`、ほかのファイルは `EINVAL`。ここにトークンはありません）、
+  `CAP_BPF` のないときの `kernel.unprivileged_bpf_disabled`（`EPERM`）、命令の数（0 か、
+  `CAP_BPF` なしで 4096、ありで 1,000,000 を超えると `E2BIG`）、ソケットフィルターと cgroup
+  skb 以外の型の `CAP_BPF`、それを求める型の `CAP_NET_ADMIN` と `CAP_PERFMON`（`EPERM`。
+  どれも `CAP_SYS_ADMIN` で代えられます）、アタッチ先のプログラムか BTF ID（ここではどの型も
+  `EINVAL`）、命令とライセンスの読み込み（`EFAULT`）です。すべて通った読み込みは、
+  そのプログラムの型を組み込まずにビルドしたカーネルと同じく `EINVAL` です。プログラムを
+  読み込むことはありません（[制限](./limitations)を見てください）。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。

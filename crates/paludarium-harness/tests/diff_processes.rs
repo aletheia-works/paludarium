@@ -225,6 +225,7 @@ mod linux {
                     | "bpf-ids"
                     | "bpf-memory"
                     | "bpf-lru"
+                    | "bpf-prog-load"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -527,6 +528,7 @@ mod linux {
         bpf_ids => ("bpf-ids","bpf"),
         bpf_memory => ("bpf-memory","bpf"),
         bpf_lru => ("bpf-lru","bpf"),
+        bpf_prog_load => ("bpf-prog-load","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),

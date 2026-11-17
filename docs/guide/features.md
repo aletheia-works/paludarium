@@ -88,7 +88,7 @@ kernel.
 | Probes | `uprobe`, `uretprobe` |
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
-| BPF | `bpf`, for maps (see below) |
+| BPF | `bpf`, for maps, and `BPF_PROG_LOAD`'s argument checks (see below) |
 | I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
@@ -3469,6 +3469,20 @@ kernel.
   as many for each; with `BPF_F_NUMA_NODE` `EINVAL`). It takes the memory
   of its elements alone, with no spares. See [limitations](./limitations)
   for what is not there.
+- `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
+  its order and with its errors, which are the same in the test machines'
+  kernel (Ubuntu's Linux 7.0) and in master: the fields past the command
+  (`EINVAL`), the program flags (`EINVAL`), a token descriptor (`EBADF` for
+  none, `EINVAL` for another file, as there are no tokens here),
+  `kernel.unprivileged_bpf_disabled` without `CAP_BPF` (`EPERM`), the count
+  of instructions (0, or more than 4096 without `CAP_BPF` and 1,000,000
+  with it, `E2BIG`), `CAP_BPF` for a type other than a socket filter or a
+  cgroup skb program, `CAP_NET_ADMIN` and `CAP_PERFMON` for the types that
+  need them (`EPERM`; `CAP_SYS_ADMIN` stands in for each), an attach
+  program or BTF ID (`EINVAL` for every type here), and the copies of the
+  instructions and the license (`EFAULT`). A load that passes all of them
+  is `EINVAL`, as on a kernel built without the program's type: no
+  program is ever loaded (see [Limitations](./limitations)).
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable

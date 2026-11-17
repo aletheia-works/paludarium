@@ -564,7 +564,9 @@ verified.
   `propagate_from` is found from the namespace's root, as mountinfo's is;
   its `STATMOUNT_BY_FD` of a detached tree's mount is `ENOENT`, as Linux's
   is for one alone in its anonymous namespace, and finds a mount by where
-  its file now is. A file system context makes
+  its file now is, in the caller's namespace, where Linux takes the
+  file's own mount (one opened before a `setns` is looked for in the
+  namespace the caller is in now). A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its
   parameters and of a reconfiguration; one of a superblock from start-up
   takes only the common flags (`ro`, `sync`, ...). A context keeps its

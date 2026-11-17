@@ -71,7 +71,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 資格情報 | `getuid`、`geteuid`、`getgid`、`getegid`、`getresuid`／`getresgid`、`setuid`／`setgid`、`setreuid`／`setregid`、`setresuid`／`setresgid`、`setfsuid`／`setfsgid`、`getgroups`／`setgroups`、`capget`／`capset` |
 | シグナル | `rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`、`sigaltstack`、`kill`、`tkill`、`tgkill`、`getitimer`／`setitimer`、`alarm`、`rt_sigtimedwait`、`rt_sigqueueinfo`、`rt_tgsigqueueinfo`、`rt_sigpending`、`rt_sigsuspend`、`pause`、`restart_syscall` |
 | 時刻 | `clock_gettime`、`clock_getres`、`gettimeofday`、`time`、`nanosleep`、`clock_nanosleep`、`timer_create`／`timer_settime`／`timer_gettime`／`timer_getoverrun`／`timer_delete`、`adjtimex`、`clock_adjtime`、`settimeofday`、`clock_settime` |
-| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`open_tree`、`move_mount`、`fsopen`、`fsconfig`、`fsmount`、`fspick`、`mount_setattr`、`open_tree_attr`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
+| ファイル | `open`／`openat`／`openat2`／`creat`、`read`、`write`、`readv`／`writev`、`pread64`／`pwrite64`、`preadv`／`pwritev`、`preadv2`／`pwritev2`、`copy_file_range`、`sendfile`、`splice`、`tee`、`vmsplice`、`setxattr`／`lsetxattr`／`fsetxattr`、`getxattr`／`lgetxattr`／`fgetxattr`、`listxattr`／`llistxattr`／`flistxattr`、`removexattr`／`lremovexattr`／`fremovexattr`、`setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`、`file_getattr`、`file_setattr`、`close`、`close_range`、`lseek`、`stat`／`fstat`／`lstat`／`newfstatat`、`statx`、`name_to_handle_at`、`open_by_handle_at`、`getdents`／`getdents64`、`mkdir`／`mkdirat`、`mknod`／`mknodat`、`rmdir`、`unlink`／`unlinkat`、`rename`／`renameat`／`renameat2`、`link`／`linkat`、`symlink`／`symlinkat`、`readlink`／`readlinkat`、`truncate`／`ftruncate`、`fallocate`、`memfd_create`、`memfd_secret`、`flock`、`fcntl`、`dup`／`dup2`／`dup3`、`pipe`／`pipe2`、`chdir`／`fchdir`、`getcwd`、`chroot`、`mount`、`umount2`、`pivot_root`、`open_tree`、`move_mount`、`fsopen`、`fsconfig`、`fsmount`、`fspick`、`mount_setattr`、`open_tree_attr`、`statmount`、`listmount`、`umask`、`chmod`／`fchmod`／`fchmodat`／`fchmodat2`、`chown`／`fchown`／`lchown`／`fchownat`、`utimensat`、`utime`／`utimes`／`futimesat`、`fsync`／`fdatasync`、`sync_file_range`、`sync`、`syncfs`、`fadvise64`、`readahead`、`access`／`faccessat`／`faccessat2`、`statfs`／`fstatfs`、`ustat` |
 | Landlock | `landlock_create_ruleset`、`landlock_add_rule`、`landlock_restrict_self` |
 | セキュリティモジュール | `lsm_list_modules`、`lsm_get_self_attr`、`lsm_set_self_attr` |
 | プローブ | `uprobe`、`uretprobe` |
@@ -222,8 +222,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `statx` は、`stat` にある項目（`STATX_BASIC_STATS`）と、デバイス番号としてマウントの
   `st_dev` を返します。flags と mask は Linux と同じように確かめます（`EINVAL`）。
   mask が何を求めても、Linux と同じくマウントの ID も返します。`/proc/self/mountinfo`
-  が示す ID（`STATX_MNT_ID`）か、`STATX_MNT_ID_UNIQUE` を求めたときはその代わりに
-  64 ビットの ID です。内部のファイルシステムのファイル（パイプ・ソケット・memfd
+  が示す ID（`STATX_MNT_ID`）か、`STATX_MNT_ID_UNIQUE` を求めたときはその代わりに、
+  マシンが終わるまで一意な 64 ビットの ID（`statmount` と `listmount` が使うもの）です。内部のファイルシステムのファイル（パイプ・ソケット・memfd
   など。後の `statfs` を参照）は、mountinfo に出ない小さな ID のマウントにあります。
   mountinfo の ID は 21 から始まり、Linux の内部のマウントも mountinfo に出ません。
   `AT_EMPTY_PATH` はディスクリプタを、`AT_FDCWD` なら作業ディレクトリを指し、Linux 6.11
@@ -1512,6 +1512,21 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   するなら `EBUSY` です。そのあとマウントは伝播の種類を受け取ります。`open_tree_attr` は、
   同じ変更をディスクリプタのマウントに加える `open_tree` で、変更に失敗すれば
   ディスクリプタはまたなくなります。
+- マウントはそれぞれ、マシンが終わるまで一意な ID（`mnt_id_unique`。`1 << 31` の次
+  から、作った順で、名前空間の写しは `copy_tree` がたどる順）を持ち、マウント
+  名前空間もそれぞれ ID（最初のものは 8）を持ちます。`listmount`（Linux master の
+  もの）はフラグ・数・配列（`EINVAL`、`EOVERFLOW`、`EFAULT`）と `struct mnt_id_req`
+  （`E2BIG`、`EINVAL`）を確かめ、呼び出し元のルート（`LSMT_ROOT`）かマウント（ない
+  なら `ENOENT`）から届くマウントの ID を、最後に渡された ID のあとから順に
+  （`LISTMOUNT_REVERSE` なら逆順に）返します。名前空間は呼び出し元のものか、名前空間の
+  ファイルか ID で示すものです（`ENOENT`、`EBADF`、`EINVAL`。ほかのものは、それに
+  対する `CAP_SYS_ADMIN` があるときだけです）。`statmount` はその 1 つ、または
+  `STATMOUNT_BY_FD` ならディスクリプタのファイルのマウントについて、スーパーブロックの
+  デバイス・型・フラグ、マウントの ID・属性・伝播、そのルートと呼び出し元のルートから
+  見たマウントポイント、型の名前、オプションそのものとその配列、ソース、名前空間の ID を、
+  求められたとおりに返します（`mask`、`supported_mask`）。文字列に足りないバッファは
+  `EOVERFLOW`、呼び出し元のルートから届かないマウントは `CAP_SYS_ADMIN` がなければ
+  `EPERM` です。
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどり、パスの始まりの上のマウントにも入ります
   （`LOOKUP_MOUNTPOINT`）。そのあと Linux の `can_umount` と `do_umount`

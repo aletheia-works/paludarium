@@ -10437,6 +10437,181 @@ static int mount_flags_case(const char *self) {
     return 0;
 }
 
+/* The listings case: statmount and listmount (Linux master's) in a mount
+   namespace of a user namespace of its own, by what does not depend on the
+   machine: the unique IDs' order and relations, statx's STATX_MNT_ID_UNIQUE,
+   what statmount gives of a tmpfs, and their checks. */
+static char ls_base[] = "/tmp/paludarium-listings-XXXXXX";
+struct ls_req {
+    unsigned size, fd;
+    unsigned long long mnt_id, param, ns_id;
+};
+static long ls_stat(const struct ls_req *req, void *buf, size_t size, unsigned flags) {
+    return syscall(457, req, buf, size, flags);
+}
+static long ls_list(const struct ls_req *req, unsigned long long *ids, size_t n, unsigned flags) {
+    return syscall(458, req, ids, n, flags);
+}
+/* statx's mount ID, unique with `unique`, of `path`; 0 for an error. */
+static unsigned long long ls_statx(const char *path, int unique) {
+    unsigned char buf[256];
+    if (syscall(SYS_statx, AT_FDCWD, path, 0, unique ? 0x4000 : 0x1000, buf)) return 0;
+    unsigned long long id;
+    memcpy(&id, buf + 144, 8);
+    return id;
+}
+static unsigned long long ls_u64(const unsigned char *buf, int at) {
+    unsigned long long v;
+    memcpy(&v, buf + at, 8);
+    return v;
+}
+static unsigned ls_u32(const unsigned char *buf, int at) {
+    unsigned v;
+    memcpy(&v, buf + at, 4);
+    return v;
+}
+/* The string at the offset in field `at`, the tmpfs's owner options left
+   out, which show unless the owner is the first namespace's root. */
+static void ls_string(const char *label, const unsigned char *buf, int at, int array) {
+    const char *s = (const char *)buf + 512 + ls_u32(buf, at);
+    char out[512] = "";
+    if (array) {
+        unsigned n = ls_u32(buf, 128);
+        for (unsigned i = 0; i < n; i++, s += strlen(s) + 1)
+            if (strncmp(s, "uid=", 4) && strncmp(s, "gid=", 4))
+                snprintf(out + strlen(out), sizeof out - strlen(out), "%s|", s);
+    } else {
+        char copy[512];
+        snprintf(copy, sizeof copy, "%s", s);
+        for (char *word = strtok(copy, ","); word; word = strtok(NULL, ","))
+            if (strncmp(word, "uid=", 4) && strncmp(word, "gid=", 4))
+                snprintf(out + strlen(out), sizeof out - strlen(out), "%s%s", out[0] ? "," : "", word);
+    }
+    printf(" %s=%s", label, out);
+}
+static int ls_inner(void) {
+    char a[256], in[256];
+    snprintf(a, sizeof a, "%s/a", ls_base);
+    snprintf(in, sizeof in, "%s/a/in", ls_base);
+    printf("private=%d\n", mt_result(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)));
+    printf("setup");
+    RM("a", mount("none", a, "tmpfs", 0, "size=1m"));
+    mkdir(in, 0755);
+    RM("in", mount("none", in, "tmpfs", 0, NULL));
+    unsigned long long ua = ls_statx(a, 1), ui = ls_statx(in, 1), ub = ls_statx(ls_base, 1);
+    printf(" unique=%d order=%d\n", ua > (1ULL << 31) && ub > (1ULL << 31), ua < ui);
+    static unsigned long long ids[4096];
+    struct ls_req root = {32, 0, ~0ULL, 0, 0};
+    long n = ls_list(&root, ids, 4096, 0);
+    printf("listmount all=%d", n >= 3);
+    int sorted = 1;
+    for (long i = 1; i < n; i++) sorted &= ids[i - 1] < ids[i];
+    printf(" sorted=%d last=%d", sorted, n >= 2 && ids[n - 2] == ua && ids[n - 1] == ui);
+    long r = ls_list(&root, ids, 1, 1);
+    printf(" reverse=%ld first=%d", r, ids[0] == ui);
+    struct ls_req below = {32, 0, ua, 0, 0};
+    n = ls_list(&below, ids, 16, 0);
+    printf(" below=%ld %d", n, n == 1 && ids[0] == ui);
+    struct ls_req after = {32, 0, ~0ULL, ua, 0};
+    n = ls_list(&after, ids, 16, 0);
+    printf(" after=%ld %d\n", n, n == 1 && ids[0] == ui);
+    printf("listmount checks");
+    RM("flags", ls_list(&root, ids, 16, 2));
+    RM("count", ls_list(&root, ids, 2000000, 0));
+    struct ls_req small = {16, 0, ~0ULL, 0, 0};
+    RM("small", ls_list(&small, ids, 16, 0));
+    struct ls_req big = {8192, 0, ~0ULL, 0, 0};
+    RM("big", ls_list(&big, ids, 16, 0));
+    struct ls_req old = {32, 0, 21, 0, 0};
+    RM("old-id", ls_list(&old, ids, 16, 0));
+    struct ls_req last_old = {32, 0, ~0ULL, 21, 0};
+    RM("old-last", ls_list(&last_old, ids, 16, 0));
+    struct ls_req missing = {32, 0, ~0ULL - 1, 0, 0};
+    RM("missing", ls_list(&missing, ids, 16, 0));
+    int mntns = open("/proc/self/ns/mnt", O_RDONLY);
+    struct ls_req both = {32, (unsigned)mntns, ~0ULL, 0, 8};
+    RM("fd-and-id", ls_list(&both, ids, 16, 0));
+    struct ls_req by_ns_fd = {32, (unsigned)mntns, ua, 0, 0};
+    n = ls_list(&by_ns_fd, ids, 16, 0);
+    printf(" ns-fd=%ld", n);
+    int plain = open(ls_base, O_RDONLY);
+    struct ls_req not_ns = {32, (unsigned)plain, ~0ULL, 0, 0};
+    RM("not-ns", ls_list(&not_ns, ids, 16, 0));
+    printf("\n");
+    static unsigned char buf[4096];
+    struct ls_req all = {32, 0, ua, 0x7fff, 0};
+    printf("statmount");
+    RM("all", ls_stat(&all, buf, sizeof buf, 0));
+    printf(" mask=%#llx id=%d parent=%d old=%d", ls_u64(buf, 8), ls_u64(buf, 40) == ua,
+           ls_u64(buf, 48) == ub, ls_u32(buf, 56) == ls_statx(a, 0));
+    printf(" attr=%#llx propagation=%#llx peer=%llu master=%llu", ls_u64(buf, 64), ls_u64(buf, 72),
+           ls_u64(buf, 80), ls_u64(buf, 88));
+    printf(" major=%u magic=%#llx sb=%#x ns=%d supported=%#llx\n", ls_u32(buf, 16), ls_u64(buf, 24),
+           ls_u32(buf, 32), ls_u64(buf, 112) > 8, ls_u64(buf, 144));
+    printf("strings");
+    ls_string("type", buf, 36, 0);
+    ls_string("root", buf, 104, 0);
+    printf(" point=%d", !strcmp((const char *)buf + 512 + ls_u32(buf, 108), a));
+    ls_string("opts", buf, 4, 0);
+    ls_string("array", buf, 132, 1);
+    ls_string("source", buf, 124, 0);
+    printf("\n");
+    printf("statmount checks");
+    RM("flags", ls_stat(&all, buf, sizeof buf, 2));
+    RM("overflow", ls_stat(&all, buf, 512, 0));
+    struct ls_req basic = {32, 0, ua, 2, 0};
+    RM("small-buf", ls_stat(&basic, buf, 64, 0));
+    printf(" size=%u", ls_u32(buf, 0));
+    struct ls_req gone = {32, 0, ~0ULL - 1, 2, 0};
+    RM("missing", ls_stat(&gone, buf, sizeof buf, 0));
+    struct ls_req oldid = {32, 0, 21, 2, 0};
+    RM("old-id", ls_stat(&oldid, buf, sizeof buf, 0));
+    int afd = open(a, O_RDONLY);
+    struct ls_req by_fd = {32, (unsigned)afd, 0, 2, 0};
+    RM("by-fd", ls_stat(&by_fd, buf, sizeof buf, 1));
+    printf(" fd-id=%d", ls_u64(buf, 40) == ua);
+    struct ls_req by_fd_id = {32, (unsigned)afd, ua, 2, 0};
+    RM("by-fd-id", ls_stat(&by_fd_id, buf, sizeof buf, 1));
+    struct ls_req by_badf = {32, 999, 0, 2, 0};
+    RM("by-badf", ls_stat(&by_badf, buf, sizeof buf, 1));
+    struct ls_req with_ns = {32, (unsigned)mntns, ui, 2, 0};
+    RM("ns-fd", ls_stat(&with_ns, buf, sizeof buf, 0));
+    printf(" ns-fd-id=%d\n", ls_u64(buf, 40) == ui);
+    close(afd);
+    close(plain);
+    close(mntns);
+    return 0;
+}
+static int listings_case(void) {
+    if (!mkdtemp(ls_base)) return 93;
+    chmod(ls_base, 0755);
+    char path[256];
+    snprintf(path, sizeof path, "%s/a", ls_base);
+    mkdir(path, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(ls_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(ls_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -28943,6 +29118,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "contexts")) return contexts_case();
     if (!strcmp(mode, "setattrs")) return setattrs_case();
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
+    if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "mount-flags-id")) {
         printf("euid=%d egid=%d\n", (int)geteuid(), (int)getegid());
         return 0;

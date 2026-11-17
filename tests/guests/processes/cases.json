@@ -360,6 +360,7 @@
     {"name":"contexts","binary":"process"},
     {"name":"setattrs","binary":"process"},
     {"name":"mount-flags","binary":"process"},
+    {"name":"listings","binary":"process"},
     {"name":"proc-other-mounts","binary":"process"},
     {"name":"proc-other-maps","binary":"process"},
     {"name":"proc-other-fds","binary":"process"},

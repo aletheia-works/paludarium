@@ -145,6 +145,9 @@ pub(crate) fn copy_mounts(
 ) -> Arc<paludarium_vfs::MountTable> {
     let locked = !std::ptr::eq(old.owner(), owner);
     let table = mount_table(old, files).copy(locked);
+    if let Some(owner) = &new.owner {
+        table.set_owner(Arc::clone(owner) as Arc<dyn std::any::Any + Send + Sync>);
+    }
     let _ = new.mounts.set(Arc::clone(&table));
     table
 }

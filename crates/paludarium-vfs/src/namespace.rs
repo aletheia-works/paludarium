@@ -81,18 +81,39 @@ struct Numbers {
     tables: Mutex<Vec<std::sync::Weak<dyn Listed>>>,
     /// What is told of each mount ID once it is free ([`ReleaseHook`]).
     released: Mutex<Option<ReleaseHook>>,
+    /// The last unique mount ID handed out (`mnt_id_ctr`), from
+    /// [`UNIQUE_OFFSET`], and the last mount namespace ID (`ns_id`), from
+    /// the first namespace's.
+    uniques: std::sync::atomic::AtomicU64,
+    namespace_ids: std::sync::atomic::AtomicU64,
 }
+/// `MNT_UNIQUE_ID_OFFSET`: the first unique mount ID is the one after it.
+pub const UNIQUE_OFFSET: u64 = 1 << 31;
+/// `MNT_NS_INIT_ID`: the first mount namespace's ID.
+pub const FIRST_NAMESPACE_ID: u64 = 8;
 /// A table [`Numbers`] keeps, behind a trait object, which keeps the
 /// auto-trait checks of what holds a table shallow.
 trait Listed: Send + Sync {
     fn table(&self) -> &MountTable;
+    fn shared(self: Arc<Self>) -> Arc<MountTable>;
 }
 impl Listed for MountTable {
     fn table(&self) -> &MountTable {
         self
     }
+    fn shared(self: Arc<Self>) -> Arc<MountTable> {
+        self
+    }
 }
 impl Numbers {
+    /// The next unique mount ID.
+    fn unique(&self) -> u64 {
+        UNIQUE_OFFSET + 1 + self.uniques.fetch_add(1, Ordering::SeqCst)
+    }
+    /// The next mount namespace ID, the first's for the first table.
+    fn namespace_id(&self) -> u64 {
+        FIRST_NAMESPACE_ID + self.namespace_ids.fetch_add(1, Ordering::SeqCst)
+    }
     /// Every table that is still there.
     fn tables(&self) -> Vec<Arc<dyn Listed>> {
         let mut tables = lock(&self.tables);
@@ -167,6 +188,8 @@ struct SuperState {
 /// the table both let go of it, as Linux frees a mount's ID with it.
 struct Token {
     id: u64,
+    /// Its ID unique until the machine ends (`mnt_id_unique`).
+    unique: u64,
     numbers: Arc<Numbers>,
     /// The superblock of a tmpfs mount, which its open files keep (only
     /// held).
@@ -206,8 +229,19 @@ impl Token {
         superblock: Option<Arc<Superblock>>,
         state: Arc<SuperState>,
     ) -> Arc<Self> {
+        Self::numbered(id, numbers.unique(), numbers, superblock, state)
+    }
+    /// [`Self::new`] with the unique ID `unique`.
+    fn numbered(
+        id: u64,
+        unique: u64,
+        numbers: &Arc<Numbers>,
+        superblock: Option<Arc<Superblock>>,
+        state: Arc<SuperState>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
+            unique,
             numbers: Arc::clone(numbers),
             _superblock: superblock,
             pins: AtomicUsize::new(0),
@@ -469,6 +503,15 @@ impl Entry {
     }
 }
 
+/// Where `statmount` and `listmount` look from ([`NamespacedFs::reaches`]):
+/// a path, as a process's root, or the root of the mount with that unique
+/// ID.
+#[derive(Clone, Copy, Debug)]
+pub enum Reach<'a> {
+    Path(&'a [u8]),
+    Mount(u64),
+}
+
 /// What a table tells of the mounts an unmount takes out of its namespace
 /// (`umount_tree`): their IDs, each mount before those on it, after they
 /// went. A hook point for fanotify's mount events (`FAN_MNT_DETACH`, which
@@ -493,6 +536,13 @@ pub struct MountTable {
     lower_points: Arc<Vec<Vec<u8>>>,
     /// What is told of mounts that leave the namespace ([`UnmountHook`]).
     unmount_hook: Mutex<Option<UnmountHook>>,
+    /// The unique ID of the mount below its root (Linux's rootfs), and the
+    /// namespace's ID (`ns_id`).
+    below: u64,
+    namespace: u64,
+    /// The user namespace that owns the mount namespace, set by the kernel
+    /// (`mnt_ns->user_ns`); none for the first.
+    owner: Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     numbers: Arc<Numbers>,
 }
 impl std::fmt::Debug for MountTable {
@@ -506,6 +556,8 @@ impl MountTable {
     /// parents and devices it gives them.
     pub fn new(lower: &dyn FileSystem) -> Arc<Self> {
         let numbers = Arc::new(Numbers::default());
+        let below = numbers.unique();
+        let namespace = numbers.namespace_id();
         let mounts = lower.mounts();
         let entries = mounts
             .iter()
@@ -537,6 +589,9 @@ impl MountTable {
             boot_only: AtomicBool::new(true),
             lower_points: Arc::new(mounts.iter().map(|m| m.path.clone()).collect()),
             unmount_hook: Mutex::default(),
+            below,
+            namespace,
+            owner: Mutex::default(),
             numbers,
         })
     }
@@ -558,13 +613,30 @@ impl MountTable {
     #[must_use]
     pub fn copy(&self, locked: bool) -> Arc<Self> {
         use mount_flags::*;
-        let old = self.snapshot();
+        let snapshot = self.snapshot();
+        // In the order `copy_tree` takes them from the namespace's root
+        // (rootfs, then each mount before those on it), which their unique
+        // IDs and their order in the list follow; a detached tree stays
+        // with the table it was made from.
+        let below = self.numbers.unique();
+        let namespace = self.numbers.namespace_id();
+        let root = snapshot[NamespacedFs::root_index(&snapshot)].id();
+        let mut order: Vec<u64> = snapshot
+            .iter()
+            .filter(|e| e.hidden)
+            .map(Entry::id)
+            .collect();
+        order.extend(NamespacedFs::tree(&snapshot, root, true));
+        let old: Vec<&Entry> = order
+            .iter()
+            .filter_map(|id| snapshot.iter().find(|e| e.id() == *id))
+            .filter(|e| !detached(&e.point))
+            .collect();
         // Each copy's ID first, as a parent may come after a mount on it
         // once a `pivot_root` moved them; the mount below the root keeps
         // the number it is shown by.
         let ids: BTreeMap<u64, u64> = old
             .iter()
-            .filter(|e| !detached(&e.point))
             .map(|e| {
                 let id = if e.hidden {
                     e.id()
@@ -575,8 +647,7 @@ impl MountTable {
             })
             .collect();
         let mut entries = Vec::with_capacity(old.len());
-        // A detached tree stays with the table it was made from.
-        for e in old.iter().filter(|e| !detached(&e.point)) {
+        for e in &old {
             let id = ids[&e.id()];
             let (group, master) = match (locked, e.group) {
                 (true, 0) => (0, e.master),
@@ -598,8 +669,13 @@ impl MountTable {
                 }
             }
             entries.push(Entry {
-                token: Token::new(
+                token: Token::numbered(
                     id,
+                    if e.hidden {
+                        below
+                    } else {
+                        self.numbers.unique()
+                    },
                     &self.numbers,
                     e.memory().cloned(),
                     Arc::clone(&e.token.state),
@@ -609,7 +685,7 @@ impl MountTable {
                 locks,
                 group,
                 master,
-                ..e.clone()
+                ..(*e).clone()
             });
         }
         Self::registered(Self {
@@ -617,8 +693,36 @@ impl MountTable {
             boot_only: AtomicBool::new(self.boot_only.load(Ordering::SeqCst)),
             lower_points: Arc::clone(&self.lower_points),
             unmount_hook: Mutex::default(),
+            below,
+            namespace,
+            owner: Mutex::default(),
             numbers: Arc::clone(&self.numbers),
         })
+    }
+    /// The mount namespace's ID (`ns_id`): [`FIRST_NAMESPACE_ID`] for the
+    /// first, then each copy's in turn.
+    #[must_use]
+    pub fn namespace_id(&self) -> u64 {
+        self.namespace
+    }
+    /// The table of the namespace numbered `id`, of those made from the
+    /// same first table that are still there (`lookup_mnt_ns`).
+    #[must_use]
+    pub fn by_namespace_id(&self, id: u64) -> Option<Arc<MountTable>> {
+        self.numbers
+            .tables()
+            .into_iter()
+            .find(|t| t.table().namespace == id)
+            .map(Listed::shared)
+    }
+    /// Keeps `owner`, the user namespace that owns the mount namespace.
+    pub fn set_owner(&self, owner: Arc<dyn std::any::Any + Send + Sync>) {
+        *lock(&self.owner) = Some(owner);
+    }
+    /// The user namespace that owns it, if one was set.
+    #[must_use]
+    pub fn owner(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        lock(&self.owner).clone()
     }
     /// Tells `hook` of each mount freed from now on, in this table or any
     /// made from it ([`ReleaseHook`]), in place of any hook before.
@@ -1045,7 +1149,7 @@ impl NamespacedFs {
     /// mount of them is, and the lower filesystem from its root goes below
     /// the namespace's root, hidden, numbered as the root's parent is shown
     /// (Linux's rootfs).
-    fn materialize(entries: &mut Vec<Entry>, numbers: &Arc<Numbers>) {
+    fn materialize(entries: &mut Vec<Entry>, numbers: &Arc<Numbers>, below: u64) {
         if entries.iter().any(|e| e.hidden) {
             return;
         }
@@ -1070,7 +1174,7 @@ impl NamespacedFs {
         entries.insert(
             0,
             Entry {
-                token: Token::new(parent, numbers, None, Arc::default()),
+                token: Token::numbered(parent, below, numbers, None, Arc::default()),
                 parent,
                 point: b"/".to_vec(),
                 backing: Backing::Boot { kind, device },
@@ -1420,6 +1524,31 @@ impl NamespacedFs {
             Ok(())
         })
     }
+    /// Whether the mount whose unique ID is `unique` can be reached from
+    /// `from` (`is_path_reachable` of its root): up through its parents to
+    /// the mount there, at or below its place. `None` when no mount of the
+    /// namespace has that ID, or `from` names none.
+    #[must_use]
+    pub fn reaches(&self, unique: u64, from: Reach<'_>) -> Option<bool> {
+        let entries = self.table.snapshot();
+        let listed = |u: u64| {
+            entries
+                .iter()
+                .find(|e| e.token.unique == u && !e.hidden && !detached(&e.point))
+        };
+        let m = listed(unique)?;
+        let (at, path) = match from {
+            Reach::Path(path) => {
+                let loc = self.walk_keeping(&entries, path, true, false, true).ok()?;
+                (self.entry(&entries, &loc), loc.path)
+            }
+            Reach::Mount(u) => {
+                let e = listed(u)?;
+                (e, e.point.clone())
+            }
+        };
+        Some(Self::reachable(&entries, m, m.point.clone(), at, &path))
+    }
     /// The ID of the mount `path` resolves to (its nearest directory that
     /// is there, for one that is not), leaving the expiry marks.
     fn mount_of(&self, entries: &[Entry], path: &[u8]) -> u64 {
@@ -1657,8 +1786,9 @@ impl NamespacedFs {
         let (new_id, root_id, old_id) = (new_mnt.id(), root_mnt.id(), old_mnt.id());
         let (root_parent, root_locked) = (root_mnt.parent, root_mnt.locked);
         let numbers = Arc::clone(&self.table.numbers);
+        let below = self.table.below;
         self.table.update(|entries| {
-            Self::materialize(entries, &numbers);
+            Self::materialize(entries, &numbers, below);
             for e in entries.iter_mut() {
                 let id = e.id();
                 e.point = place(&e.point, id);
@@ -2032,6 +2162,13 @@ impl FileSystem for NamespacedFs {
                 if e.unbindable {
                     tags.push_str(" unbindable");
                 }
+                // The root's parent, below it, is no entry until a
+                // `pivot_root`; a detached tree's root has none but itself.
+                let parent_unique = if e.parent == e.id() {
+                    e.token.unique
+                } else {
+                    Self::by_id(&entries, e.parent).map_or(self.table.below, |p| p.token.unique)
+                };
                 MountPoint {
                     path: e.point.clone(),
                     root,
@@ -2046,6 +2183,17 @@ impl FileSystem for NamespacedFs {
                     tags,
                     common_options,
                     super_options,
+                    unique: e.token.unique,
+                    parent_unique,
+                    flags: e.flags,
+                    group: e.group,
+                    master: e.master,
+                    propagate_from: if e.master == 0 {
+                        0
+                    } else {
+                        self.dominating(&entries, e)
+                    },
+                    unbindable: e.unbindable,
                 }
             })
             .collect()

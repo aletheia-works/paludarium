@@ -478,8 +478,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `MOVE_MOUNT_BENEATH`、`fsmount` の `FSMOUNT_NAMESPACE`（Linux master で新しいもの）と
   tmpfs への `MOUNT_ATTR_NOSYMFOLLOW`、`/proc` や `/dev` の `fspick`、ID を
   マップしたマウント（`mount_setattr` と `open_tree_attr` の `MOUNT_ATTR_IDMAP`。その
-  ユーザー名前空間のディスクリプタを確かめたあと）も同じです。`statmount`、`listmount`
-  はありません（`ENOSYS`）。
+  ユーザー名前空間のディスクリプタを確かめたあと）も同じです。一意なマウントの ID と
+  マウント名前空間の ID は、このマシンの中だけで数えます。Linux ではホストのものと共通
+  です（最初の名前空間の ID は Linux と同じ 8）。名前空間のファイルは `NS_GET_MNTNS_ID`
+  や `NS_GET_ID` を受け取りません。`statmount` の `propagate_from` は、mountinfo の
+  ものと同じく名前空間のルートから求めます。切り離された木のマウントへの
+  `STATMOUNT_BY_FD` は、匿名の名前空間に 1 つだけのものに対する Linux と同じく `ENOENT`
+  で、マウントはファイルのいまの場所から求めます。
   ファイルシステムのコンテキストが作るのは、`mount` と同じく tmpfs だけで、記録する
   メッセージはパラメーターとマウントし直しのものだけです。起動したときからある
   スーパーブロックのコンテキストは、共通のフラグ（`ro`、`sync` など）しか受け取りません。

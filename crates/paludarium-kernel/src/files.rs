@@ -496,6 +496,21 @@ impl Files {
     pub(crate) fn mount_table(&self) -> Arc<paludarium_vfs::MountTable> {
         Arc::clone(self.namespaced().table())
     }
+    /// The machine's filesystem through another namespace's `table`, from
+    /// the machine's root, as `statmount` reads it.
+    pub(crate) fn namespaced_for(
+        &self,
+        table: Arc<paludarium_vfs::MountTable>,
+    ) -> Arc<paludarium_vfs::NamespacedFs> {
+        let lower = Arc::clone(
+            &self
+                .space
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .lower,
+        );
+        Arc::new(paludarium_vfs::NamespacedFs::new(lower, table))
+    }
     /// The first mount namespace's table.
     pub(crate) fn first_mounts(&self) -> &Arc<paludarium_vfs::MountTable> {
         &self.first_mounts
@@ -3555,7 +3570,7 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     // mountinfo does not show, as Linux's internal mounts are not shown.
     let id = mount_id(c, device, &at);
     let (bit, id) = if mask & STATX_MNT_ID_UNIQUE != 0 {
-        (STATX_MNT_ID_UNIQUE, 1 << 31 | id)
+        (STATX_MNT_ID_UNIQUE, unique_mount_id(c, id))
     } else {
         (STATX_MNT_ID, id)
     };
@@ -3692,7 +3707,7 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let fits = given >> 2 >= bytes.len() as u32 >> 2;
     let id = mount_id(c, device, &at);
     if flags & AT_HANDLE_MNT_ID_UNIQUE != 0 {
-        output(c, mount, &(1u64 << 31 | id).to_le_bytes())?;
+        output(c, mount, &unique_mount_id(c, id).to_le_bytes())?;
     } else {
         output(c, mount, &(id as u32).to_le_bytes())?;
     }
@@ -3966,6 +3981,18 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
 /// `kern_mount`s take theirs first, at boot.
 pub(crate) fn mount_id(c: &Context<'_>, device: u64, path: &[u8]) -> u64 {
     mount_id_in(&*c.files.fs(), device, path)
+}
+/// The unique ID (`mnt_id_unique`) of the mount numbered `id`, as
+/// `statmount` and `listmount` give it; for an internal file system's,
+/// which no table lists, one past [`paludarium_vfs::UNIQUE_OFFSET`] by its
+/// number.
+pub(crate) fn unique_mount_id(c: &Context<'_>, id: u64) -> u64 {
+    c.files
+        .fs()
+        .mounts()
+        .iter()
+        .find(|m| m.id == id && m.unique != 0)
+        .map_or(paludarium_vfs::UNIQUE_OFFSET | id, |m| m.unique)
 }
 /// [`mount_id`] in the file system `fs`.
 pub(crate) fn mount_id_in(fs: &dyn FileSystem, device: u64, path: &[u8]) -> u64 {

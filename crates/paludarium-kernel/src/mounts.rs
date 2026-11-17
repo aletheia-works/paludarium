@@ -33,6 +33,8 @@ use crate::syscalls::{Context, Outcome};
 
 mod context;
 pub(crate) use context::{FsContext, sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick};
+mod listing;
+pub(crate) use listing::{sys_listmount, sys_statmount};
 
 const CAP_SYS_ADMIN: u64 = 1 << 21;
 const EBUSY: Errno = Errno(16);

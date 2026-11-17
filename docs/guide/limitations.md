@@ -557,8 +557,14 @@ verified.
   `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
   a tmpfs, `fspick` of `/proc` or `/dev`, and an idmapped mount
   (`mount_setattr`'s and `open_tree_attr`'s `MOUNT_ATTR_IDMAP`, after the
-  checks of its user namespace's descriptor); `statmount` and `listmount`
-  are not there (`ENOSYS`). A file system context makes
+  checks of its user namespace's descriptor). Unique mount IDs and mount
+  namespace IDs count among this machine's alone, where Linux's are shared
+  with the host's (the first namespace's ID is Linux's 8), and the
+  namespace files take no `NS_GET_MNTNS_ID` or `NS_GET_ID`. `statmount`'s
+  `propagate_from` is found from the namespace's root, as mountinfo's is;
+  its `STATMOUNT_BY_FD` of a detached tree's mount is `ENOENT`, as Linux's
+  is for one alone in its anonymous namespace, and finds a mount by where
+  its file now is. A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its
   parameters and of a reconfiguration; one of a superblock from start-up
   takes only the common flags (`ro`, `sync`, ...). A context keeps its

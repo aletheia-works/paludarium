@@ -84,7 +84,7 @@ kernel.
 | Credentials | `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`/`getresgid`, `setuid`/`setgid`, `setreuid`/`setregid`, `setresuid`/`setresgid`, `setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `capget`/`capset` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`, `tkill`, `tgkill`, `getitimer`/`setitimer`, `alarm`, `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigpending`, `rt_sigsuspend`, `pause`, `restart_syscall` |
 | Time | `clock_gettime`, `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`, `timer_create`/`timer_settime`/`timer_gettime`/`timer_getoverrun`/`timer_delete`, `adjtimex`, `clock_adjtime`, `settimeofday`, `clock_settime` |
-| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `open_tree_attr`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
+| Files | `open`/`openat`/`openat2`/`creat`, `read`, `write`, `readv`/`writev`, `pread64`/`pwrite64`, `preadv`/`pwritev`, `preadv2`/`pwritev2`, `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice`, `setxattr`/`lsetxattr`/`fsetxattr`, `getxattr`/`lgetxattr`/`fgetxattr`, `listxattr`/`llistxattr`/`flistxattr`, `removexattr`/`lremovexattr`/`fremovexattr`, `setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`, `file_getattr`, `file_setattr`, `close`, `close_range`, `lseek`, `stat`/`fstat`/`lstat`/`newfstatat`, `statx`, `name_to_handle_at`, `open_by_handle_at`, `getdents`/`getdents64`, `mkdir`/`mkdirat`, `mknod`/`mknodat`, `rmdir`, `unlink`/`unlinkat`, `rename`/`renameat`/`renameat2`, `link`/`linkat`, `symlink`/`symlinkat`, `readlink`/`readlinkat`, `truncate`/`ftruncate`, `fallocate`, `memfd_create`, `memfd_secret`, `flock`, `fcntl`, `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `chdir`/`fchdir`, `getcwd`, `chroot`, `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `open_tree_attr`, `statmount`, `listmount`, `umask`, `chmod`/`fchmod`/`fchmodat`/`fchmodat2`, `chown`/`fchown`/`lchown`/`fchownat`, `utimensat`, `utime`/`utimes`/`futimesat`, `fsync`/`fdatasync`, `sync_file_range`, `sync`, `syncfs`, `fadvise64`, `readahead`, `access`/`faccessat`/`faccessat2`, `statfs`/`fstatfs`, `ustat` |
 | Landlock | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` |
 | Security modules | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` |
 | Probes | `uprobe`, `uretprobe` |
@@ -250,8 +250,9 @@ kernel.
 - `statx` reports the fields a `stat` has (`STATX_BASIC_STATS`) and the
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
   (`EINVAL`). Whatever the mask asks for, it also gives the mount's ID, as
-  Linux does: the one `/proc/self/mountinfo` shows (`STATX_MNT_ID`), or a
-  64-bit one in its place when `STATX_MNT_ID_UNIQUE` is asked for. A file
+  Linux does: the one `/proc/self/mountinfo` shows (`STATX_MNT_ID`), or
+  the 64-bit one unique until the machine ends, which `statmount` and
+  `listmount` take, in its place when `STATX_MNT_ID_UNIQUE` is asked for. A file
   of an internal file system (a pipe, a socket, a memfd and the like; see
   `statfs` below) is on a mount with one of the small IDs that mountinfo,
   whose IDs start at 21, does not show, as Linux's internal mounts are.
@@ -1717,6 +1718,24 @@ kernel.
   writing `EBUSY`. Then the mounts take the propagation type.
   `open_tree_attr` is `open_tree` with the same change made to its
   descriptor's mount, which goes again when the change fails.
+- Each mount has an ID unique until the machine ends (`mnt_id_unique`,
+  from `1 << 31` on, in the order the mounts were made, a namespace's
+  copies in the order `copy_tree` takes them), and each mount namespace
+  an ID (the first's 8). `listmount` (Linux master's) checks its flags,
+  count and array (`EINVAL`, `EOVERFLOW`, `EFAULT`) and its `struct
+  mnt_id_req` (`E2BIG`, `EINVAL`), and gives, in order or backwards with
+  `LISTMOUNT_REVERSE`, after the last ID it was given, the IDs of the
+  mounts reachable from the caller's root (`LSMT_ROOT`) or from a mount
+  (`ENOENT` for none), of the caller's namespace or of one by its
+  namespace file or ID (`ENOENT`, `EBADF`, `EINVAL`; another one's
+  only with `CAP_SYS_ADMIN` over it). `statmount` gives what one of them
+  is, or with `STATMOUNT_BY_FD` the mount of a descriptor's file: the
+  superblock's device, type and flags, the mount's IDs, attributes and
+  propagation, its root and its mount point from the caller's root, the
+  type's name, its options alone and as an array, its source and its
+  namespace's ID, each as asked (`mask`, `supported_mask`); a buffer too
+  small for its strings is `EOVERFLOW`, a mount the caller's root does
+  not reach `EPERM` without `CAP_SYS_ADMIN`.
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`, stepping into a mount on
   where the path starts too (`LOOKUP_MOUNTPOINT`); then, as Linux's

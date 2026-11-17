@@ -82,8 +82,14 @@ jobs:
             done
           ' 2>&1 | tee -a times.txt
           if grep -E '^DIFFERENT|^case .* False$' times.txt; then exit 1; fi
+      # The runner's CPU goes first, since the criterion asks for a pass on
+      # both an Intel and an AMD one and the workflow cannot choose.
       - name: Compare
-        run: python3 "$BENCH/check.py" times.txt | tee summary.txt
+        run: |
+          {
+            lscpu | grep -m1 'Model name' || true
+            python3 "$BENCH/check.py" times.txt
+          } | tee summary.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:

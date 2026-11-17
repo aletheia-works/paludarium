@@ -1115,6 +1115,15 @@ impl Registry {
         };
         let mount = data.mount();
         let device = object.key.0;
+        // The groups by priority, as `fsnotify` takes their marks: the
+        // pre-content ones, then the content ones, then the others, so a
+        // call's permission events are asked in that order.
+        let mut groups: Vec<&Arc<Group>> = groups.iter().collect();
+        groups.sort_by_key(|g| match g.flags & (CLASS_PRE_CONTENT | CLASS_CONTENT) {
+            CLASS_PRE_CONTENT => 0,
+            CLASS_CONTENT => 1,
+            _ => 2,
+        });
         for group in groups {
             Group::handle(
                 group,

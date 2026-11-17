@@ -15586,9 +15586,9 @@ static int ipc_sysctl_more(void) {
     errno = 0;
     copied = syscall(SYS_copy_file_range, (int)source, NULL, (int)target, NULL, 16, 0);
     struct stat from = {0}, to = {0};
-    long stated = source >= 0 && target >= 0 && !fstat((int)source, &from) && !fstat((int)target, &to);
+    long both_stated = source >= 0 && target >= 0 && !fstat((int)source, &from) && !fstat((int)target, &to);
     printf("copy-sysctl: copied=%ld errno=%d stated=%ld sizes=%ld,%ld inodes-differ=%d", copied,
-           copied < 0 ? errno : 0, stated, (long)from.st_size, (long)to.st_size, from.st_ino != to.st_ino);
+           copied < 0 ? errno : 0, both_stated, (long)from.st_size, (long)to.st_size, from.st_ino != to.st_ino);
     ksys_show("msgmax");
     /* A listing gives each entry the inode its stat gives. */
     ino_t listed = 0;

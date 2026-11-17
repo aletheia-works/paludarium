@@ -177,32 +177,33 @@ impl Bloom {
         }
     }
     /// `hash`: `jhash2` of a value of whole 32-bit words, else `jhash`, with
-    /// the seed and the hash's index, masked.
-    fn bit(&self, value: &[u8], index: u32) -> u32 {
-        let initval = self.seed.wrapping_add(index);
-        let h = if value.len().is_multiple_of(4) {
-            let words: Vec<u32> = value
+    /// the seed and the hash's index, masked: the value's bit for each hash.
+    fn bits<'a>(&'a self, value: &'a [u8]) -> impl Iterator<Item = u32> + 'a {
+        let words: Option<Vec<u32>> = value.len().is_multiple_of(4).then(|| {
+            value
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .map(|w| u32::from_le_bytes(*w))
-                .collect();
-            jhash2(&words, initval)
-        } else {
-            jhash(value, initval)
-        };
-        h & self.mask
+                .collect()
+        });
+        (0..self.hashes).map(move |index| {
+            let initval = self.seed.wrapping_add(index);
+            let h = match &words {
+                Some(words) => jhash2(words, initval),
+                None => jhash(value, initval),
+            };
+            h & self.mask
+        })
     }
     /// `bloom_map_push_elem`: sets each hash's bit.
     fn push(&mut self, value: &[u8]) {
-        for i in 0..self.hashes {
-            let bit = self.bit(value, i);
-            self.set.insert(bit);
-        }
+        let bits: Vec<u32> = self.bits(value).collect();
+        self.set.extend(bits);
     }
     /// `bloom_map_peek_elem`: whether every hash's bit is set (`ENOENT`).
     fn peek(&self, value: &[u8]) -> Result<(), Errno> {
-        if (0..self.hashes).all(|i| self.set.contains(&self.bit(value, i))) {
+        if self.bits(value).all(|bit| self.set.contains(&bit)) {
             Ok(())
         } else {
             Err(Errno::ENOENT)
@@ -321,7 +322,7 @@ pub(crate) struct Map {
     value_size: u32,
     max_entries: u32,
     flags: u32,
-    /// `map_extra`, which only a bloom filter takes here.
+    /// `map_extra`, which only the types `TYPES_WITH_EXTRA` names may have.
     extra: u64,
     name: [u8; 16],
     id: u32,
@@ -851,6 +852,11 @@ fn allocate(
 ) -> Result<(), Errno> {
     if matches!(kind, TYPE_QUEUE | TYPE_STACK) {
         return area(queue_size(max_entries, value_size));
+    }
+    // A bloom filter is its bit array alone, which `create` sizes from
+    // `map_extra`: no buckets or elements, and no limit of 2^31 entries.
+    if kind == TYPE_BLOOM_FILTER {
+        return Ok(());
     }
     if kind == TYPE_ARRAY {
         let entries = if bypass_spec {
@@ -2364,6 +2370,13 @@ mod tests {
         assert_eq!(Bloom::mask(1 << 28, 15), u32::MAX);
         assert_eq!(bloom_size(1, 0), 312 + 8);
         assert_eq!(bloom_size(u32::MAX, 0), 312 + (1 << 29));
+        // No buckets or elements, so no limit of 2^31 entries: the largest
+        // is the 2^32-bit filter, 512 MiB, which the machine has.
+        assert_eq!(
+            allocate(TYPE_BLOOM_FILTER, 1 << 22, 0, u32::MAX, 0, true, 2),
+            Ok(())
+        );
+        assert_eq!(area(bloom_size(u32::MAX, 15)), Ok(()));
         let mut b = bloom(100, 0, 0);
         assert_eq!(b.hashes, 5);
         assert_eq!(bloom(100, 3, 0).hashes, 3);

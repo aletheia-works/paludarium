@@ -133,6 +133,7 @@
     {"name":"bpf-memory","binary":"bpf"},
     {"name":"bpf-lru","binary":"bpf"},
     {"name":"bpf-queue","binary":"bpf"},
+    {"name":"bpf-prog-load","binary":"bpf"},
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"inotify-directory","binary":"inotify"},
     {"name":"inotify-files","binary":"inotify"},

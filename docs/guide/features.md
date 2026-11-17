@@ -3077,11 +3077,17 @@ kernel.
 - `/proc/sysvipc` holds `msg`, `sem` and `shm`, listed in that order, each in
   the format of Linux's `sysvipc_*_proc_show` on a 64-bit kernel.
   - Each is a header, then a line for each queue, set or segment of the
-    reader's IPC namespace, by index.
+    opener's IPC namespace, by index.
+  - As Linux's `seq_file`, each `read` makes the lines it reaches from the
+    objects as they are then, from the index the reader had got to. An
+    object made or removed between reads shows or not by where the reader
+    is, and a file opened before an `unshare` of the IPC namespace still
+    reads the one it was opened in. `lseek` goes from the start or the
+    current position, and `SEEK_END` is `EINVAL`.
   - A line shows the key, ID and mode, with `SHM_DEST` and `SHM_LOCKED`
     for a segment.
-  - It also shows the counts, the PIDs in the reader's PID namespace (0
-    for one it cannot see), the owner and creator in the reader's user
+  - It also shows the counts, the PIDs in the opener's PID namespace (0
+    for one it cannot see), the owner and creator in the opener's user
     namespace, and the times.
   - A segment's line adds the bytes of its pages in memory, and 0 swapped.
   - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show

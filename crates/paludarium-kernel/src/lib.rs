@@ -62,6 +62,7 @@ mod rseq;
 mod scheduling;
 mod seccomp;
 mod sem;
+mod seq;
 mod shm;
 mod sockets;
 mod syscalls;

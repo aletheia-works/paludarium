@@ -206,9 +206,43 @@ pub(crate) fn now(c: &Context<'_>) -> i64 {
         .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
 }
 
+/// The record of a `/proc/sysvipc` file at `index`, as Linux's
+/// `sysvipc_proc_start`, `sysvipc_proc_next` and `sysvipc_find_ipc` walk
+/// them: 0 is its header, and `n` the object at index `n - 1` or, with
+/// none there, the first after it, followed by the one at its own index
+/// plus 2. An object made or removed between reads is shown or not by
+/// where the reader has got to, as on Linux.
+pub(crate) fn proc_record<T>(
+    objects: &BTreeMap<u32, T>,
+    header: &str,
+    index: u64,
+    show: impl FnOnce(&T) -> String,
+) -> Option<(Vec<u8>, u64)> {
+    if index == 0 {
+        return Some((header.as_bytes().to_vec(), 1));
+    }
+    let first = u32::try_from(index - 1).ok()?;
+    let (at, object) = objects.range(first..).next()?;
+    Some((show(object).into_bytes(), u64::from(*at) + 2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_proc_record_is_the_header_then_each_object_from_its_index_on() {
+        let objects = BTreeMap::from([(0, "a"), (5, "b")]);
+        let show = |object: &&str| format!("{object}\n");
+        let record = |index| proc_record(&objects, "h\n", index, show);
+        assert_eq!(record(0), Some((b"h\n".to_vec(), 1)));
+        assert_eq!(record(1), Some((b"a\n".to_vec(), 2)));
+        // Past the object at 0, the next is at 5, after which comes 7.
+        assert_eq!(record(2), Some((b"b\n".to_vec(), 7)));
+        assert_eq!(record(6), Some((b"b\n".to_vec(), 7)));
+        assert_eq!(record(7), None);
+        assert_eq!(record(u64::MAX), None);
+    }
 
     #[test]
     fn a_next_id_set_is_taken_once_and_leaves_the_turn_as_it_was() {

@@ -746,40 +746,56 @@ fn shmid_ds(
 }
 
 /// `/proc/sysvipc/shm`, as Linux's `sysvipc_shm_proc_show` prints it on a
-/// 64-bit kernel: its header, then each segment of the caller's IPC
-/// namespace by index, its processes as the caller's PID namespace numbers
-/// them and its owners as the caller's user namespace shows them, with the
+/// 64-bit kernel: its header, then each segment of the opener's IPC
+/// namespace by index, as it is when the read reaches it
+/// ([`crate::seq`]), its processes as the opener's PID namespace numbers
+/// them and its owners as the opener's user namespace shows them, with the
 /// bytes of its pages in memory and none swapped.
-pub(crate) fn proc_file(c: &Context<'_>) -> Vec<u8> {
-    let mut out = String::from(
-        "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
-    );
-    let (space, user) = (c.pid_space(), &c.process.credentials.user);
-    let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
-    let shm = segments(c);
-    for s in shm.lock().segments.values() {
-        let perm = &s.perm;
-        out.push_str(&format!(
-            "{:10} {:10}  {:4o} {:21} {:5} {:5}  {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}\n",
-            perm.key,
-            s.id,
-            perm.mode,
-            s.size,
-            space.number_of(&s.cpid),
-            space.number_of(&s.lpid),
-            s.attached(),
-            user.shown(kind, perm.uid),
-            user.shown(group, perm.gid),
-            user.shown(kind, perm.cuid),
-            user.shown(group, perm.cgid),
-            s.atime,
-            s.dtime,
-            s.ctime,
-            s.memory.resident() * PAGE,
-            0,
-        ));
+pub(crate) fn proc_file(c: &Context<'_>, flags: u32) -> crate::seq::SeqFile {
+    let records = ProcRecords {
+        shm: segments(c),
+        space: c.pid_space(),
+        user: c.process.credentials.user.clone(),
+    };
+    crate::seq::SeqFile::open(Box::new(records), flags)
+}
+/// What `/proc/sysvipc/shm` shows, as Linux's `ipc_proc_iter` holds it
+/// from the open: the segments of an IPC namespace, and the PID and user
+/// namespaces they are shown in.
+struct ProcRecords {
+    shm: Segments,
+    space: std::sync::Arc<crate::namespaces::Namespace>,
+    user: crate::users::UserNs,
+}
+impl crate::seq::Records for ProcRecords {
+    fn record(&self, index: u64) -> Option<(Vec<u8>, u64)> {
+        const HEADER: &str = "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
+        let (space, user) = (&self.space, &self.user);
+        let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
+        let table = self.shm.lock();
+        ipc::proc_record(&table.segments, HEADER, index, |s| {
+            let perm = &s.perm;
+            format!(
+                "{:10} {:10}  {:4o} {:21} {:5} {:5}  {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}\n",
+                perm.key,
+                s.id,
+                perm.mode,
+                s.size,
+                space.number_of(&s.cpid),
+                space.number_of(&s.lpid),
+                s.attached(),
+                user.shown(kind, perm.uid),
+                user.shown(group, perm.gid),
+                user.shown(kind, perm.cuid),
+                user.shown(group, perm.cgid),
+                s.atime,
+                s.dtime,
+                s.ctime,
+                s.memory.resident() * PAGE,
+                0,
+            )
+        })
     }
-    out.into_bytes()
 }
 
 /// `SHM_LOCK` and `SHM_UNLOCK`, as Linux's `shmctl_do_lock`: without

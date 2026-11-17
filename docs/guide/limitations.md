@@ -459,9 +459,7 @@ verified.
     opened from a handle with `O_EXCL` does not keep `PIDFD_THREAD`, as on
     the CI runners' Linux 7.0, where Linux 7.2 and later keep it.
   - System V IPC's `IPCMNI` is always 32768, as without the
-    `ipcmni_extend` boot option. `/proc/sysvipc` shows
-    its objects as they were when it was opened, where Linux reads each one
-    as the read reaches it.
+    `ipcmni_extend` boot option.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
     `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,

@@ -15204,6 +15204,27 @@ static void sysvipc_sempids(const char *label, int sem) {
         printf(" %ld=%ld", semx_ctl(sem, n, SEMX_GETPID, 0), semx_ctl(sem, n, SEMX_GETVAL, 0));
     printf("\n");
 }
+/* Reads the rest of `fd` and counts its lines, and whether a line, past
+   the header, has ID `want` and `gone`. */
+static int sysvipc_rest(int fd, int want, int gone, int *shown, int *kept) {
+    static char text[65536];
+    long total = 0, n;
+    while (total < (long)sizeof text - 1 && (n = read(fd, text + total, sizeof text - 1 - total)) > 0) total += n;
+    text[total] = 0;
+    int lines = 0;
+    *shown = *kept = 0;
+    for (char *line = text; *line; lines++) {
+        char *end = strchr(line, '\n');
+        int key, id;
+        if (lines > 0 && sscanf(line, "%d %d", &key, &id) == 2) {
+            *shown |= id == want;
+            *kept |= id == gone;
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+    return lines;
+}
 /* The work of the case, as PID 1 of its PID namespace. */
 static int sysvipc_work(void) {
     long page = sysconf(_SC_PAGESIZE);
@@ -15298,6 +15319,27 @@ static int sysvipc_work(void) {
     printf("lock=%ld\n", syscall(SYS_shmctl, shm, 11 /* SHM_LOCK */, NULL));
     printf("remove=%ld\n", syscall(SYS_shmctl, shm, 0 /* IPC_RMID */, NULL));
     sysvipc_show("removed", "shm", sysvipc_shm_times);
+    /* Read as the read reaches each segment, not as at the open: one made
+       after the header was read shows, and one removed before its line was
+       reached does not. Nothing seeks from the end (seq_lseek). */
+    int early = (int)syscall(SYS_shmget, 0, 10, SHMX_CREAT | 0600);
+    int live = open("/proc/sysvipc/shm", O_RDONLY);
+    char first;
+    long head = read(live, &first, 1);
+    int late = (int)syscall(SYS_shmget, 0, 10, SHMX_CREAT | 0600);
+    long dropped = syscall(SYS_shmctl, early, 0 /* IPC_RMID */, NULL);
+    int shown, kept;
+    int lines = sysvipc_rest(live, late, early, &shown, &kept);
+    printf("live: early=%d late=%d head=%ld drop=%ld lines=%d late-shown=%d early-shown=%d\n", early >= 0,
+           late >= 0, head, dropped, lines, shown, kept);
+    errno = 0;
+    long end = lseek(live, 0, SEEK_END);
+    printf("live: seek-end=%ld errno=%d\n", end, errno);
+    long back = lseek(live, 0, SEEK_SET);
+    syscall(SYS_shmctl, late, 0 /* IPC_RMID */, NULL);
+    lines = sysvipc_rest(live, late, early, &shown, &kept);
+    printf("live: again=%ld lines=%d late-shown=%d early-shown=%d\n", back, lines, shown, kept);
+    close(live);
     /* A nested PID namespace sees no PID of these. */
     if (syscall(SYS_unshare, CLONE_NEWPID)) return 23;
     fflush(stdout);
@@ -15309,9 +15351,14 @@ static int sysvipc_work(void) {
         _exit(0);
     }
     result("nested", reaped(nested));
-    /* A new IPC namespace has none of them. */
+    /* A new IPC namespace has none of them, but a file opened before
+       still reads the namespace it was opened in. */
+    int before = open("/proc/sysvipc/shm", O_RDONLY);
     if (syscall(SYS_unshare, CLONE_NEWIPC)) return 24;
     sysvipc_all("new ipc");
+    lines = sysvipc_rest(before, shm, -1, &shown, &kept);
+    printf("opened before: lines=%d segment-shown=%d\n", lines, shown);
+    close(before);
     return 0;
 }
 static int sysvipc_case(void) {

@@ -394,8 +394,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
     `O_EXCL` を付けてハンドルから開いた pidfd には、CI の Linux 7.0 と同じく `PIDFD_THREAD`
     が残りません。Linux 7.2 以降は残します。
   - System V IPC の `IPCMNI` は、起動オプション `ipcmni_extend` がないときと同じく、
-    いつも 32768 です。`/proc/sysvipc` は開いたときのオブジェクトを見せます。Linux は読み進めたところで、
-    そのオブジェクトをその都度読みます。
+    いつも 32768 です。
   - POSIX メッセージキューのファイルシステムは、ほかの場所にはマウントできません。
     `/dev/mqueue` はいつも最初の IPC 名前空間のもので、`/proc/self/mountinfo` には
     並びません。そこでは `open`、`stat`、`access`、`getdents`、`unlink`、`rmdir`、`statfs`、

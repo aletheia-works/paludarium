@@ -90,6 +90,18 @@ impl Emitter<'_, '_> {
         self.b.ins().jump(self.exit, &[count.into(), rip.into()]);
     }
 
+    /// Pushes `next` and leaves for `target`, the last of `n + 1`
+    /// instructions; a failed push leaves at `rip` after `n`.
+    fn call(&mut self, n: usize, rip: u64, next: u64, target: Value) {
+        let rsp = self.gpr(4);
+        let rsp = self.b.ins().iadd_imm_s(rsp, -8);
+        let v = self.constant(next as i64);
+        let status = self.store(rsp, 8, v);
+        self.unless_failed(status, n, rip);
+        self.set_gpr(4, rsp);
+        self.leave(n + 1, target);
+    }
+
     fn leave_at(&mut self, count: usize, rip: u64) {
         let rip = self.constant(rip as i64);
         self.leave(count, rip);
@@ -1183,13 +1195,32 @@ impl Emitter<'_, '_> {
                 return false;
             }
             Fast::Call(target) => {
-                let rsp = self.gpr(4);
-                let rsp = self.b.ins().iadd_imm_s(rsp, -8);
-                let v = self.constant(next as i64);
-                let status = self.store(rsp, 8, v);
+                let target = self.constant(target as i64);
+                self.call(n, rip, next, target);
+                return false;
+            }
+            Fast::JmpRegister(r) => {
+                let target = self.gpr(r);
+                self.leave(n + 1, target);
+                return false;
+            }
+            Fast::JmpLoad(mem) => {
+                let address = self.linear(&mem);
+                let (target, status) = self.load(address, 8);
                 self.unless_failed(status, n, rip);
-                self.set_gpr(4, rsp);
-                self.leave_at(n + 1, target);
+                self.leave(n + 1, target);
+                return false;
+            }
+            Fast::CallRegister(r) => {
+                let target = self.gpr(r);
+                self.call(n, rip, next, target);
+                return false;
+            }
+            Fast::CallLoad(mem) => {
+                let address = self.linear(&mem);
+                let (target, status) = self.load(address, 8);
+                self.unless_failed(status, n, rip);
+                self.call(n, rip, next, target);
                 return false;
             }
             Fast::Ret => {

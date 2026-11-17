@@ -337,7 +337,15 @@ pub enum Fast {
         target: u64,
     },
     Jmp(u64),
+    /// `jmp r64`.
+    JmpRegister(u8),
+    /// `jmp [m]` of 8 bytes.
+    JmpLoad(Address),
     Call(u64),
+    /// `call r64`.
+    CallRegister(u8),
+    /// `call [m]` of 8 bytes.
+    CallLoad(Address),
     /// `ret` without an immediate.
     Ret,
     /// `op r, r/imm`.
@@ -471,6 +479,11 @@ fn xmm(o: Option<Operand>) -> Option<u8> {
 
 fn address(o: Option<Operand>) -> Option<Address> {
     Address::of(memory(o)?)
+}
+
+/// The 8 bytes in memory that an indirect `jmp` or `call` goes to.
+fn target(o: Option<Operand>) -> Option<Address> {
+    address(o).filter(|mem| mem.size == 8)
 }
 
 fn branch(o: Option<Operand>) -> Option<u64> {
@@ -712,7 +725,11 @@ impl Fast {
                 condition,
                 target: branch(a)?,
             },
-            Mnemonic::Jmp => Self::Jmp(branch(a)?),
+            Mnemonic::Jmp if b.is_none() => match (branch(a), gpr64(a)) {
+                (Some(target), _) => Self::Jmp(target),
+                (None, Some(r)) => Self::JmpRegister(r),
+                (None, None) => Self::JmpLoad(target(a)?),
+            },
             Mnemonic::Setcc(condition) => {
                 if b.is_some() {
                     return None;
@@ -751,7 +768,11 @@ impl Fast {
                     }
                 }
             }
-            Mnemonic::Call => Self::Call(branch(a)?),
+            Mnemonic::Call if b.is_none() => match (branch(a), gpr64(a)) {
+                (Some(target), _) => Self::Call(target),
+                (None, Some(r)) => Self::CallRegister(r),
+                (None, None) => Self::CallLoad(target(a)?),
+            },
             Mnemonic::Ret if a.is_none() => Self::Ret,
             m if Unary::of(m).is_some() => {
                 if b.is_some() {
@@ -1026,7 +1047,19 @@ pub(crate) fn execute(
             }
         }
         Fast::Jmp(target) => target,
+        Fast::JmpRegister(r) => x.s.gpr[usize::from(r)],
+        Fast::JmpLoad(mem) => x.load(x.fast_linear(&mem), 8)?,
         Fast::Call(target) => {
+            x.push(next, 8)?;
+            target
+        }
+        Fast::CallRegister(r) => {
+            let target = x.s.gpr[usize::from(r)];
+            x.push(next, 8)?;
+            target
+        }
+        Fast::CallLoad(mem) => {
+            let target = x.load(x.fast_linear(&mem), 8)?;
             x.push(next, 8)?;
             target
         }

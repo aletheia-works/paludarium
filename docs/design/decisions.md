@@ -192,15 +192,20 @@ so each instruction it compiles has one meaning, the interpreter's, which
 unit tests from random states, a fuzz target and the differential tests with
 every block compiled check.
 
-It is a crate of its own because it needs `unsafe`, to map code and call
-it, and every other crate but the host's forbids it. Compiling happens on a
-thread of its own while the interpreter goes on, because compiling on the
-thread that runs the block made short programs, which run many blocks only a
-few hundred times, up to twice as slow. Cranelift's `speed` level costs
-more to compile than `none` but makes faster code, which a background
-compile can afford. The registers live in memory, not in Cranelift
-variables: each early exit then needs no copy of every register, which made
-compiling about three times faster and the code faster too.
+It is a crate of its own because it needs `unsafe`, to map code and call it, and
+every other crate but the host's forbids it. Compiling happens on a thread of
+its own while the interpreter goes on, because compiling on the thread that runs
+the block made short programs, which run many blocks only a few hundred times,
+up to twice as slow. It compiles with Cranelift's `none` level, at a block's
+300th entry. `speed` made faster code but cost more to compile. With a threshold
+of 100 that made programs of 0.1–0.25 s up to 12% slower than without the JIT,
+because they compiled dozens of blocks they then ran too few times. In one run
+of the speed check below (fork run 44116579985), `none` at 300 cut the cases the
+JIT made slower from 14 to 3. It kept most of the long programs' gain, though
+less of it for some: Perl's hash benchmark was 46% faster instead of 53%, `perl
+-c` 3% instead of 10%. The registers live in memory, not in Cranelift variables:
+each early exit then needs no copy of every register, which made compiling about
+three times faster and the code faster too.
 
 In a same-runner comparison on CI (x86-64 Linux), against the interpreter
 without it, `--jit` made Perl's hash and string benchmarks 15% and 27%
@@ -236,16 +241,15 @@ CI's own records, so anyone can check it:
    every round without it. Short programs count as much as long ones, since
    turning the JIT on by default would add its cost to every command.
 
-The last criterion does not hold yet. In a run of the check on CI (fork run
-43982096280), the JIT made long programs much faster: Perl's hash benchmark
-49%, Java 50% and OCaml 45%. But 9 of the 36 cases were slower than every
-round without it, all of them programs that take 0.1–0.25 s. Six ripgrep
-cases were 2–8% slower, two of aube's 7–8% and one probe case 2%. A program
-that short compiles dozens of blocks (about 0.7 ms each) that it then runs
-too few times to earn back, so that has to change before the switch. The
-programs of 20 ms or less are no longer among them. They were in an earlier
-version of this comparison, which started only the JIT through a shell
-wrapper.
+The last criterion does not hold yet. In the run of the check with today's
+default (fork run 44116579985, AMD EPYC 7763), the JIT made long programs much
+faster: Perl's hash benchmark 46%, Java 50% and OCaml 44%. But 3 of the 36 cases
+were still slower than every round without it: probe's `fs-basic` by 4% (about 1
+ms of 22 ms), probe's `tokio-timer` by 1% and ripgrep's `parallel` case by 2%.
+On a faster runner (fork run 43982096280, with the earlier default) probe's
+other cases of about 20 ms were within the rounds' spread. An older version of
+this comparison started only the JIT through a shell wrapper, which made them
+look slower.
 
 ## One way to create a filesystem
 

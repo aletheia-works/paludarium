@@ -58,7 +58,7 @@ jobs:
           SH
           cat > bin/jit <<'SH'
           #!/bin/sh
-          exec "$(dirname "$0")/paludarium" --jit=100 "$@"
+          exec "$(dirname "$0")/paludarium" --jit "$@"
           SH
           chmod +x bin/*
       - name: Build the guests

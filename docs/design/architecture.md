@@ -140,7 +140,7 @@ run of such forms therefore reads little host memory.
 
 With `--jit`, the blocks of the decode cache that run often are compiled to
 host code (`paludarium-jit-native`, Linux on x86-64 hosts only). Each block
-counts how many times it is entered; at the threshold (100 by default), the
+counts how many times it is entered; at the threshold (300 by default), the
 forms of its first instructions, up to the first instruction without one,
 are handed to the compiler. A thread of the JIT's own builds Cranelift IR
 for them, compiles it and maps the code into memory that is never writable

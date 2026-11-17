@@ -34,7 +34,7 @@ paludarium [--env KEY=VALUE]... [--mount HOST:GUEST]... [--no-jit] [--jit[=N]] [
   the guest at the absolute guest path `GUEST`. Repeat it for more. The guest
   cannot leave the directory through `..` or symbolic links.
 - `--jit` (or `--jit=N`) turns on the native JIT, which is experimental.
-  A block of instructions that has run `N` times (100 without `=N`, at most
+  A block of instructions that has run `N` times (300 without `=N`, at most
   65535) is compiled to host code with Cranelift on a thread of its own, and
   runs as host code once it is ready; the interpreter runs everything else
   ([Architecture](../design/architecture#the-native-jit)). Only Linux on

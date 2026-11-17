@@ -3687,7 +3687,10 @@ kernel.
   so a mount that takes the ID next is not marked. Exec's open of the
   program and its interpreter is told as `FAN_OPEN` with `FAN_OPEN_EXEC`,
   as `do_open_execat` opens them with `__FMODE_EXEC`; inotify hears it as
-  `IN_OPEN`. It makes its checks in its order: the flags and mask
+  `IN_OPEN`. Before that, each such open asks `FAN_OPEN_EXEC_PERM`, then
+  `FAN_OPEN_PERM`, and exec's read of the file `FAN_ACCESS_PERM`, in their
+  order, before exec commits; a denial fails `execve` with `EPERM`, and
+  what would come after it is not asked. It makes its checks in its order: the flags and mask
   (`EINVAL`), the descriptor (`EBADF`, `EINVAL`), the group's class and
   modes, the path (`ENOENT`, `ENOTDIR`), the events the file system takes
   (`EINVAL` for permission events on /proc, and for mount and file system

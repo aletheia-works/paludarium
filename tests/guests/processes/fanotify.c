@@ -47,6 +47,7 @@
 #define FAN_FS_ERROR 0x8000
 #define FAN_OPEN_PERM 0x10000
 #define FAN_ACCESS_PERM 0x20000
+#define FAN_OPEN_EXEC_PERM 0x40000
 #define FAN_PRE_ACCESS 0x100000
 #define FAN_MNT_ATTACH 0x1000000
 #define FAN_EVENT_ON_CHILD 0x8000000
@@ -1048,6 +1049,104 @@ static int case_aio_perm(void) {
     return 0;
 }
 
+/* A copy of this program under the base, for exec. */
+static int copy_self(const char *self, const char *to_path) {
+    int from = open(self, O_RDONLY), to = open(to_path, O_WRONLY | O_CREAT, 0755);
+    if (from < 0 || to < 0) return -1;
+    char buf[65536];
+    long n;
+    while ((n = read(from, buf, sizeof buf)) > 0)
+        if (write(to, buf, (size_t)n) != n) return -1;
+    close(from);
+    close(to);
+    return 0;
+}
+/* A child that execs `path`: its exit status is 0 for the program's own
+   (it returns 0), or the errno execve failed with. */
+static pid_t exec_in_child(const char *path, int fan) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(fan);
+        execl(path, "prog", "fanotify-noop", (char *)NULL);
+        _exit(errno);
+    }
+    return child;
+}
+/* Answers every permission event of `fan` with `response` until `child`
+   exits: how many of each kind came, as whether any did. */
+static void answer_until_exit(const char *label, int fan, pid_t child, uint32_t response) {
+    int open_exec = 0, open = 0, access = 0, other = 0;
+    for (;;) {
+        struct pollfd p = {fan, POLLIN, 0};
+        if (poll(&p, 1, 50) == 1) {
+            char buf[256];
+            long n = read(fan, buf, sizeof buf);
+            if (n < (long)sizeof(struct metadata)) break;
+            struct metadata m;
+            memcpy(&m, buf, sizeof m);
+            if (m.mask & FAN_OPEN_EXEC_PERM) open_exec++;
+            else if (m.mask & FAN_OPEN_PERM) open++;
+            else if (m.mask & FAN_ACCESS_PERM) access++;
+            else other++;
+            respond(fan, m.fd, response);
+            if (m.fd >= 0) close(m.fd);
+            continue;
+        }
+        int status;
+        if (waitpid(child, &status, WNOHANG) == child) {
+            printf("%s: status=%d open-exec=%d open=%d access=%d other=%d\n", label,
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -1, open_exec, open, access > 0, other);
+            return;
+        }
+    }
+    printf("%s: read failed\n", label);
+}
+
+/* Exec's permission events: its open of the program asks
+   FAN_OPEN_EXEC_PERM, then FAN_OPEN_PERM, as
+   fsnotify_open_perm_and_set_mode does for __FMODE_EXEC, and its reads
+   FAN_ACCESS_PERM; a denial of any fails execve with EPERM. Linux asks
+   FAN_ACCESS_PERM once a kernel_read, so only whether any came is shown. */
+static int case_exec_perm(const char *self) {
+    make_base("execperm");
+    if (copy_self(self, at("prog"))) return 80;
+    int fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    if (fan < 0) return 81;
+    printf("mark=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM, AT_FDCWD, at("prog")));
+    pid_t child = exec_in_child(at("prog"), fan);
+    int fd = read_perm("open-exec", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    fd = read_perm("open", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    printf("allowed child=%d\n", child_result(child));
+    child = exec_in_child(at("prog"), fan);
+    fd = read_perm("open-exec", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    printf("denied child=%d\n", child_result(child));
+    child = exec_in_child(at("prog"), fan);
+    fd = read_perm("open-exec", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    fd = read_perm("open", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    printf("denied open child=%d\n", child_result(child));
+    /* Reads: let all through, then deny them. */
+    printf("mark access=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD, at("prog")));
+    child = exec_in_child(at("prog"), fan);
+    answer_until_exit("all allowed", fan, child, 1);
+    printf("remove opens=%ld\n", fan_mark(fan, FAN_MARK_REMOVE, FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM, AT_FDCWD, at("prog")));
+    child = exec_in_child(at("prog"), fan);
+    answer_until_exit("reads denied", fan, child, 2);
+    close(fan);
+    remove_base();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1061,6 +1160,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fanotify-mounts")) return case_mounts();
     if (!strcmp(mode, "fanotify-open-exec")) return case_open_exec(argc > 2 ? argv[2] : "");
     if (!strcmp(mode, "fanotify-aio-perm")) return case_aio_perm();
+    if (!strcmp(mode, "fanotify-exec-perm")) return case_exec_perm(argc > 2 ? argv[2] : "");
     if (!strcmp(mode, "fanotify-noop")) return 0;
     if (!strcmp(mode, "fanotify-perm")) return case_perm();
     if (!strcmp(mode, "fanotify-access-perm")) return case_access_perm();

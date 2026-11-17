@@ -210,6 +210,7 @@ mod linux {
                     | "fanotify-access-perm"
                     | "fanotify-open-exec"
                     | "fanotify-aio-perm"
+                    | "fanotify-exec-perm"
                     | "userfaultfd-calls"
                     | "userfaultfd-faults"
                     | "userfaultfd-signals"
@@ -567,6 +568,7 @@ mod linux {
         fanotify_access_perm => ("fanotify-access-perm","fanotify"),
         fanotify_open_exec => ("fanotify-open-exec","fanotify"),
         fanotify_aio_perm => ("fanotify-aio-perm","fanotify"),
+        fanotify_exec_perm => ("fanotify-exec-perm","fanotify"),
         userfaultfd_calls => ("userfaultfd-calls","userfaultfd"),
         userfaultfd_faults => ("userfaultfd-faults","userfaultfd"),
         userfaultfd_signals => ("userfaultfd-signals","userfaultfd"),

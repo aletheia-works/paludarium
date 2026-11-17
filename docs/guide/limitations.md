@@ -734,14 +734,12 @@ verified.
   touched the 2 MiB around it here, as when Linux has no page table there,
   which Linux may also have freed or kept otherwise. There is no `/dev/userfaultfd` and no
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
-- **fanotify, in part**: of the permission events, only `FAN_OPEN_PERM` of
-  an open by `open`, `openat`, `openat2`, `creat` or `open_by_handle_at`
-  (a link in `/proc/self/fd` too), and `FAN_ACCESS_PERM` of a read by
-  `read`, `pread64`, `readv`, `preadv`, `preadv2`, `sendfile`, `splice`,
-  `copy_file_range` or an AIO request, are sent (`io_uring` has no read
-  operation here); `FAN_OPEN_EXEC_PERM`, exec's `FAN_OPEN_PERM` and the
-  `FAN_ACCESS_PERM` of exec's reads are taken by `fanotify_mark` but never
-  sent, so what they would ask is let through.
+- **fanotify, in part**: exec asks `FAN_ACCESS_PERM` once for its read
+  of each file it runs, where Linux asks it at each `kernel_read` (two or
+  three for an ELF program); an exec that fails before its program is
+  loaded (an argument it cannot read, too long a list) asks none of its
+  permission events, where Linux has asked those of the opens before; and
+  `io_uring` has no read operation here to ask for.
   `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
   and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
   never come. An evictable mark is never evicted. A group merges an event

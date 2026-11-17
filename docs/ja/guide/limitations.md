@@ -632,13 +632,11 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   ページテーブルがないときと同じく、動かし先を見る前に `ENOENT` です。Linux は
   ページテーブルをほかのときに解放したり残したりもします。`/dev/userfaultfd` と
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
-- **fanotify の一部**：許可イベントで送るのは、`open`、`openat`、`openat2`、`creat`、
-  `open_by_handle_at` での（`/proc/self/fd` のリンクからも）オープンの `FAN_OPEN_PERM` と、
-  `read`、`pread64`、`readv`、`preadv`、`preadv2`、`sendfile`、`splice`、`copy_file_range`、
-  AIO の要求での読み出しの `FAN_ACCESS_PERM` だけです（ここの `io_uring` には読み出しの
-  操作がありません）。`FAN_OPEN_EXEC_PERM`、exec の `FAN_OPEN_PERM`、exec の読み出しの
-  `FAN_ACCESS_PERM` は
-  `fanotify_mark` で受け付けますが送らないので、求めるはずだったことはそのまま通ります。
+- **fanotify の一部**：exec は実行するファイルの読み出しごとに `FAN_ACCESS_PERM` を
+  1 回尋ねます。Linux は `kernel_read` ごとに尋ねます（ELF のプログラムでは 2、3 回）。
+  プログラムを読み込む前に失敗する exec（読めない引数、長すぎる並び）は許可イベントを
+  何も尋ねません。Linux はそれまでのオープンの分を尋ね終えています。ここの `io_uring` には
+  尋ねる読み出しの操作がありません。
   `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント
   （`FAN_MNT_ATTACH`、`FAN_MNT_DETACH`）と `FAN_FS_ERROR` は来ません。追い出せるマークも

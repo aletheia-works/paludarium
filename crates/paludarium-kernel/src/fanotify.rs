@@ -708,6 +708,34 @@ pub(crate) fn asked_by<T>(
     (result, Pending(asked))
 }
 
+/// A gathering of the permission events of an operation that spans more
+/// than one call (exec's opens and reads), which [`gather`] starts and
+/// [`Gathering::finish`] ends; one dropped before then asks nothing.
+pub(crate) struct Gathering {
+    outer: Option<Option<Vec<Asked>>>,
+}
+/// Starts gathering the permission events asked from now on, as
+/// [`asked_by`] does for one call.
+pub(crate) fn gather() -> Gathering {
+    let outer = ASKED.with(|asked| asked.borrow_mut().replace(Vec::new()));
+    Gathering { outer: Some(outer) }
+}
+impl Gathering {
+    /// What was gathered, for [`answers`].
+    pub(crate) fn finish(mut self) -> Pending {
+        let outer = self.outer.take().unwrap_or_default();
+        let asked = ASKED.with(|asked| std::mem::replace(&mut *asked.borrow_mut(), outer));
+        Pending(asked.unwrap_or_default())
+    }
+}
+impl Drop for Gathering {
+    fn drop(&mut self) {
+        if let Some(outer) = self.outer.take() {
+            ASKED.with(|asked| *asked.borrow_mut() = outer);
+        }
+    }
+}
+
 /// Asks the groups what [`asked_by`] gathered and waits for their
 /// answers: whether any was asked, or the denial.
 pub(crate) fn answers(c: &mut Context<'_>, pending: Pending) -> Result<bool, Errno> {

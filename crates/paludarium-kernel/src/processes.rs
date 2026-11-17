@@ -4212,6 +4212,31 @@ impl Kernel {
             .signal(self.process.pid, sender.uid, pid, number)
             .map(|()| 0)
     }
+    /// Waits for fanotify's answers to the permission events of `pending`,
+    /// as an open's do ([`crate::fanotify::answers`]), with this thread's
+    /// signals: the denial's error.
+    fn permission_answers(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        pending: crate::fanotify::Pending,
+    ) -> Result<(), Errno> {
+        let mut c = crate::syscalls::Context {
+            number: 59,
+            tid: thread.tid,
+            host: &*self.host,
+            shared_host: &self.host,
+            files: &mut self.files,
+            process: &mut thread.state,
+            cpu: &mut thread.cpu,
+            mem,
+            cancellation: &self.cancellation,
+            inbox: &self.inbox,
+            group: &self.group,
+            processes: &self.processes,
+        };
+        crate::fanotify::answers(&mut c, pending).map(drop)
+    }
     /// Closes what exec closed, as Linux's `__fput` does on the way back to
     /// the new program: a socket's last descriptor waits for its linger
     /// time ([`crate::inet::linger`]).
@@ -4290,6 +4315,10 @@ impl Kernel {
         let mut opened = None;
         // Exec's opens of the files it runs, for inotify, in their order.
         let mut opens = ExecOpens::default();
+        // Their permission events (`FAN_OPEN_EXEC_PERM`, `FAN_OPEN_PERM`,
+        // `FAN_ACCESS_PERM` of their reads), gathered until the program is
+        // loaded and then asked in their order, before exec commits.
+        let gathering = crate::fanotify::gather();
         let (start, program, mut readable, image) = match program {
             crate::files::Program::Path(path) => {
                 let (program, readable) =
@@ -4439,6 +4468,7 @@ impl Kernel {
                             (argv, envp),
                             None,
                             exe,
+                            (gathering, &opens),
                         );
                         if done.is_ok() {
                             self.exec_closes = Some(opens);
@@ -4482,6 +4512,7 @@ impl Kernel {
             (argv, envp),
             image,
             exe,
+            (gathering, &opens),
         );
         drop(opened);
         // The scripts' opens close at the end of exec, as the `fput`s
@@ -4507,6 +4538,7 @@ impl Kernel {
         (argv, envp): (Vec<Vec<u8>>, Vec<Vec<u8>>),
         held: Option<HeldProgram>,
         program_file: Option<crate::page_cache::WriteAccess>,
+        (gathering, opens): (crate::fanotify::Gathering, &ExecOpens),
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let mut random = [0; 16];
         self.host
@@ -4616,7 +4648,7 @@ impl Kernel {
             Ok((path, Some(keep)))
         };
         let fs = &*self.files.fs();
-        let image = crate::inotify::unopened(|| match &held {
+        let loaded_image = crate::inotify::unopened(|| match &held {
             Some((bytes, name, _)) => paludarium_loader::load_file_with(
                 fs,
                 bytes,
@@ -4628,8 +4660,20 @@ impl Kernel {
             None => {
                 paludarium_loader::load_with(fs, &loaded, &start, &mut memory, &mut interpreter)
             }
-        })
-        .map_err(|error| match error {
+        });
+        // Linux asks each as it opens or reads the file, so a denial comes
+        // before the loader's errors, and what follows a denied one is
+        // never asked; those let through tell their held `IN_OPEN` then.
+        self.permission_answers(thread, mem, gathering.finish())?;
+        for opened in opens.0.iter().flatten() {
+            opened.release();
+        }
+        for interpreter in &failing.interpreters {
+            if let Some(opened) = &*interpreter.lock().unwrap_or_else(PoisonError::into_inner) {
+                opened.release();
+            }
+        }
+        let image = loaded_image.map_err(|error| match error {
             // The new image did not fit under the memory limit.
             _ if memory.take_out_of_memory() => Errno::ENOMEM,
             LoadError::NotFound => Errno::ENOENT,

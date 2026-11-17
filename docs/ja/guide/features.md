@@ -3195,7 +3195,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   示します。マウントが解放されるとそのマークもなくなるので（`fsnotify_vfsmount_delete`）、
   次にその ID を得たマウントにはマークがありません。exec がプログラムとそのインタープリターを
   開くことは、`do_open_execat` が `__FMODE_EXEC` で開くのと同じく `FAN_OPEN_EXEC` 付きの
-  `FAN_OPEN` として伝わり、inotify には `IN_OPEN` として伝わります。確認もその順です。フラグとマスク（`EINVAL`）、ディスクリプタ
+  `FAN_OPEN` として伝わり、inotify には `IN_OPEN` として伝わります。その前に、そうした
+  オープンはそれぞれ `FAN_OPEN_EXEC_PERM`、`FAN_OPEN_PERM` を、exec によるそのファイルの
+  読み出しは `FAN_ACCESS_PERM` を、exec が確定する前にこの順に尋ねます。拒まれると `execve`
+  は `EPERM` で失敗し、そのあとのものは尋ねません。確認もその順です。フラグとマスク（`EINVAL`）、ディスクリプタ
   （`EBADF`、`EINVAL`）、グループのクラスとモード、パス（`ENOENT`、`ENOTDIR`）、
   ファイルシステムが受け付けるイベント（/proc への許可イベントと、カーネル自身のファイル
   システムへのマウントとファイルシステムのマークは `EINVAL`。新しいフラグでのファイルへの

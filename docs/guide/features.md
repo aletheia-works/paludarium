@@ -2140,13 +2140,36 @@ kernel.
     as it has no `rtnl_link_ops`); another link is `ENODEV`, and without
     either, `IFLA_GROUP` is `EPERM` for group 0 and `ENODEV` for another,
     and nothing `EINVAL`.
+  - **veth pairs:** `RTM_NEWLINK` of kind `veth` (`IFLA_LINKINFO`) makes a
+    pair, as `rtnl_newlink` and `veth_newlink` do: its peer, of
+    `VETH_INFO_PEER`'s name, address, MTU and namespace (`IFLA_NET_NS_PID`
+    or `IFLA_NET_NS_FD`), then the first end, of the request's, each
+    `veth%d` without a name, of a random address without one and of the
+    index the request asks (the peer's only with the first end's). It
+    checks in Linux's order: an address of other than six bytes or an MTU
+    past 68 to 65535 (`EINVAL`), a multicast address (`EADDRNOTAVAIL`), a
+    name or index taken (`EEXIST`, `EBUSY`), a link the request names that
+    is there (`EEXIST` with `NLM_F_EXCL`). Each end is an Ethernet device,
+    told of with `RTM_NEWLINK` in its namespace; it has its carrier
+    (`IFF_LOWER_UP`, then `IFF_RUNNING` and an operational state of up)
+    while both ends are up, each telling of it, and its link messages give
+    its kind, its peer (`IFLA_LINK`) and, where that is in another
+    namespace, that namespace's ID (`IFLA_LINK_NETNSID`, which the
+    namespace telling of it gives first, with `RTM_NEWNSID`). `RTM_SETLINK`
+    or `RTM_NEWLINK` brings an end up or down and moves it to another
+    namespace (told of with `RTM_DELLINK` there and `RTM_NEWLINK` here),
+    as do `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and
+    `SIOCGIFNAME`; `RTM_DELLINK` of either end takes both, and so does the
+    namespace of either going.
   - **Namespace IDs:** as Linux's `net_namespace.c`, `RTM_NEWNSID` gives
     the network namespace of a process (`NETNSA_PID`, `ESRCH` for none) or
     of a `/proc/<pid>/ns/net` descriptor (`NETNSA_FD`, `EBADF`, or `EINVAL`
     for another file) the ID `NETNSA_NSID`, or with a negative one the
     lowest free; one without either is `EINVAL`, and a namespace that has
     an ID, or an ID taken, `EEXIST`, each with Linux's extended-ack
-    message. The members of `RTNLGRP_NSID` hear of each new ID
+    message. Telling of a veth end whose peer is in another namespace
+    gives that namespace an ID too, the lowest free, as
+    `peernet2id_alloc` does (veth pairs, above). The members of `RTNLGRP_NSID` hear of each new ID
     (`NLM_F_ECHO` sends it to the requester alone of them), and with
     `RTM_DELNSID` of each that goes with its namespace, once no process,
     descriptor or socket holds that, as `unhash_nsid` tells it; the ID is

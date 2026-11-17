@@ -55,6 +55,8 @@ pub(crate) mod extack;
 mod generic;
 mod inet_diag;
 mod nsid;
+mod veth;
+pub(crate) use veth::{ioctl_flags as veth_ioctl_flags, peer_gone, set_up as veth_set_up};
 
 const AF_NETLINK: u16 = 16;
 const NETLINK_ROUTE: u32 = 0;
@@ -677,7 +679,7 @@ impl NetlinkSocket {
         self.lock().error = Some(error);
     }
     /// The network it was made in.
-    pub(crate) fn network(&self) -> &Network {
+    pub(crate) fn network(&self) -> &Arc<Network> {
         &self.network
     }
     /// The sockets of its protocol in its network namespace.
@@ -974,7 +976,7 @@ impl NetlinkSocket {
             let mut t = socket.lock();
             socket.deliver(&mut t, 0, 0, bytes);
         }
-        notify(&self.network, notices, Some(self));
+        broadcast(&self.network, notices, Some(self));
         Ok(bytes.len())
     }
     /// The kernel takes each message of a datagram from `port`, as Linux's
@@ -1024,7 +1026,10 @@ impl NetlinkSocket {
                 // This socket hears of what it changed as it happens, before
                 // its acknowledgement; the others once it is unlocked.
                 for notice in &told {
-                    if s.groups & (1u64 << (notice.group - 1)) != 0 && port != notice.origin {
+                    if notice.to.is_none()
+                        && s.groups & (1u64 << (notice.group - 1)) != 0
+                        && port != notice.origin
+                    {
                         self.deliver(s, 0, notice.group, notice.bytes.clone());
                     }
                 }
@@ -1106,7 +1111,14 @@ impl NetlinkSocket {
                     ],
                 )
                 .map(|()| vec![ipmr_link_message(seq, port)]),
-                (RTM_GETLINK, _) => link_dump(network, payload, (seq, port), strict, &target),
+                (RTM_GETLINK, _) => link_dump(
+                    &self.network,
+                    payload,
+                    (seq, port),
+                    strict,
+                    &target,
+                    notices,
+                ),
                 // `mctp_dump_addrinfo`: `lo`'s MCTP addresses.
                 (RTM_GETADDR, AF_MCTP) => mctp_address_dump_check(payload, strict)
                     .map(|()| mctp_addresses(network, payload, seq, port)),
@@ -1240,6 +1252,7 @@ impl NetlinkSocket {
                 // `mctp_addr_notify`, which `rtnl_notify` sends as an IPv4
                 // address's.
                 let notice = Notice {
+                    to: None,
                     group: RTNLGRP_MCTP_IFADDR,
                     origin: if echo { port } else { 0 },
                     bytes: mctp_address(eid, header.kind, 0, header.seq, port),
@@ -1297,20 +1310,69 @@ impl NetlinkSocket {
                 Ok(false)
             }
             RTM_GETLINK => {
-                let (.., target) = self.find_link(payload, header, Some(s.strict))?;
+                let (.., target, device, _) = self.find_link(payload, header, Some(s.strict))?;
                 let mask = ext_mask(payload);
-                let reply = match target {
-                    Some((id, peer)) => {
-                        with_link_netnsid(link_message(&peer, header.seq, port, 0, mask), id)
-                    }
-                    None => link_message(&self.network, header.seq, port, 0, mask),
+                let network = target.as_ref().map_or(&self.network, |(_, peer)| peer);
+                let reply = if device.kind == crate::netdev::DeviceKind::Veth {
+                    let (link, told) = veth::link_message(
+                        network,
+                        &self.network,
+                        &device,
+                        RTM_NEWLINK,
+                        0,
+                        (header.seq, port, 0),
+                        mask,
+                        false,
+                    );
+                    notices.extend(told);
+                    link
+                } else {
+                    link_message(network, header.seq, port, 0, mask)
+                };
+                let reply = match &target {
+                    Some((id, _)) => with_link_netnsid(reply, *id),
+                    None => reply,
                 };
                 self.deliver(s, 0, 0, reply);
                 Ok(false)
             }
-            RTM_DELLINK => self.delete_link(payload),
+            RTM_DELLINK => self.delete_link(payload, notices),
             RTM_NEWLINK | RTM_SETLINK => {
-                let (flags, change, _) = self.find_link(payload, header, None)?;
+                // A veth pair to make (`rtnl_newlink` of a kind), else a
+                // link there is to change.
+                if header.kind == RTM_NEWLINK
+                    && payload.len() >= 16
+                    && link_kind(payload).as_deref() == Some(&b"veth"[..])
+                    && veth::newlink(&self.network, &self.opener, header, payload, notices)?
+                        .is_some()
+                {
+                    return Ok(false);
+                }
+                let (flags, change, _, device, moving) = self.find_link(payload, header, None)?;
+                if device.kind == crate::netdev::DeviceKind::Veth {
+                    // `do_setlink`: the namespace first, then the flags.
+                    let mut network = Arc::clone(&self.network);
+                    let mut index = device.index;
+                    if let Some(to) = moving.filter(|to| !Arc::ptr_eq(to, &self.network)) {
+                        veth::move_to(&self.network, &self.network, index, &to, notices)?;
+                        index = to
+                            .devices()
+                            .by_name(&device.name)
+                            .map_or(index, |d| d.index);
+                        network = to;
+                    }
+                    if flags != 0 || change != 0 {
+                        let now_up = device.veth.as_ref().is_some_and(|v| v.up);
+                        // `rtnl_dev_combine_flags`.
+                        let up = if change == 0 || change & IFF_UP != 0 {
+                            flags & IFF_UP != 0
+                        } else {
+                            now_up
+                        };
+                        veth::set_up(&self.network, &network, index, up, notices);
+                    }
+                    return Ok(false);
+                }
                 // `rtnl_dev_combine_flags`: only the flags `ifi_change`
                 // names, or all with none named; of them only `IFF_UP`.
                 if flags != 0 || change != 0 {
@@ -1363,7 +1425,7 @@ impl NetlinkSocket {
         payload: &[u8],
         header: &Header,
         strict: Option<bool>,
-    ) -> Result<(u32, u32, Option<Named>), Errno> {
+    ) -> Result<FoundLink, Errno> {
         let get = strict.is_some();
         if payload.len() < 16 {
             return Err(extack::message(
@@ -1479,7 +1541,7 @@ impl NetlinkSocket {
             return Err(ENODEV);
         };
         if get {
-            return Ok((word(8), word(12), target));
+            return Ok((word(8), word(12), target, device, None));
         }
         // `rtnl_changelink`, then `do_setlink`.
         if header.kind == RTM_NEWLINK {
@@ -1491,7 +1553,12 @@ impl NetlinkSocket {
             }
         }
         // `lo` is `netns_immutable`; its own namespace is no move.
-        if moving.is_some_and(|to| !Arc::ptr_eq(&to, &self.network)) {
+        let veth = device.kind == crate::netdev::DeviceKind::Veth;
+        if !veth
+            && moving
+                .as_ref()
+                .is_some_and(|to| !Arc::ptr_eq(to, &self.network))
+        {
             return Err(extack::message(
                 Errno::EINVAL,
                 "The interface netns is immutable",
@@ -1504,11 +1571,11 @@ impl NetlinkSocket {
         }) {
             return Err(EOPNOTSUPP);
         }
-        // Renaming `lo` to another name is not supported.
+        // Renaming a link to another name is not supported.
         if index > 0 && name.is_some_and(|name| name != device.name) {
             return Err(EOPNOTSUPP);
         }
-        Ok((word(8), word(12), None))
+        Ok((word(8), word(12), None, device, moving))
     }
     /// `RTM_DELLINK`, as `rtnl_dellink`: the attributes are checked
     /// against `ifla_policy`, `IFLA_NET_NS_PID` and `IFLA_NET_NS_FD` are
@@ -1518,7 +1585,7 @@ impl NetlinkSocket {
     /// (`EOPNOTSUPP`, as it has no `rtnl_link_ops`), or nothing
     /// (`ENODEV`); without either, `IFLA_GROUP` is `EPERM` for group 0 and
     /// `ENODEV` for another, which `lo` is not in, and nothing `EINVAL`.
-    fn delete_link(&self, payload: &[u8]) -> Result<bool, Errno> {
+    fn delete_link(&self, payload: &[u8], notices: &mut Vec<Notice>) -> Result<bool, Errno> {
         if payload.len() < 16 {
             return Err(extack::message(Errno::EINVAL, "Invalid header length"));
         }
@@ -1543,8 +1610,8 @@ impl NetlinkSocket {
                 &value[..end]
             });
         let found = match (index, name) {
-            (i, _) if i > 0 => network.devices().by_index(i).is_some(),
-            (_, Some(name)) => network.devices().by_name(name).is_some(),
+            (i, _) if i > 0 => network.devices().by_index(i).map(|d| (d.index, d.kind)),
+            (_, Some(name)) => network.devices().by_name(name).map(|d| (d.index, d.kind)),
             (_, None) => {
                 // `rtnl_group_dellink`.
                 return Err(match by_kind.get(&IFLA_GROUP) {
@@ -1554,7 +1621,15 @@ impl NetlinkSocket {
                 });
             }
         };
-        Err(if found { EOPNOTSUPP } else { ENODEV })
+        match found {
+            // `veth_dellink`.
+            Some((index, crate::netdev::DeviceKind::Veth)) => {
+                veth::delete(&self.network, &network, index, notices);
+                Ok(false)
+            }
+            Some(_) => Err(EOPNOTSUPP),
+            None => Err(ENODEV),
+        }
     }
     /// Receives one datagram into `buf`, as `netlink_recvmsg`: a pending
     /// error first, `EAGAIN` while there is none; `peek` leaves it. A
@@ -1785,6 +1860,16 @@ fn attribute(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
 }
 /// An ID a request names another namespace by, and that namespace.
 type Named = (i32, Arc<Network>);
+/// What [`NetlinkSocket::find_link`] finds: the request's flags and change
+/// mask, for a get the namespace an ID names, the link, and the namespace
+/// a change moves it to.
+type FoundLink = (
+    u32,
+    u32,
+    Option<Named>,
+    crate::netdev::Device,
+    Option<Arc<Network>>,
+);
 /// A namespace an ID names, as [`nsid::target`] finds it for a request.
 type Target<'a> = &'a dyn Fn(i32) -> Result<Arc<Network>, Errno>;
 /// `message` with attribute `kind` of `id` put in at `at`.
@@ -2243,13 +2328,31 @@ fn strict_link_header(
 /// is `EINVAL` with a type, flags, a change mask or an index
 /// ([`strict_link_header`]), then the policy's error, and `EINVAL` for
 /// attributes but those and `IFLA_LINKINFO`.
+/// The kind `IFLA_LINKINFO`'s `IFLA_INFO_KIND` names in a link request's
+/// `payload`, to its NUL, if any.
+fn link_kind(payload: &[u8]) -> Option<Vec<u8>> {
+    let info = attributes(&payload[16..])
+        .into_iter()
+        .rev()
+        .find(|&(kind, _)| kind == IFLA_LINKINFO)?
+        .1;
+    let kind = attributes(info)
+        .into_iter()
+        .rev()
+        .find(|&(kind, _)| kind == IFLA_INFO_KIND)?
+        .1;
+    let end = kind.iter().position(|&b| b == 0).unwrap_or(kind.len());
+    Some(kind[..end].to_vec())
+}
 fn link_dump(
-    network: &Network,
+    network: &Arc<Network>,
     payload: &[u8],
     (seq, port): (u32, u32),
     strict: bool,
     target: Target<'_>,
+    notices: &mut Vec<Notice>,
 ) -> Result<Vec<Vec<u8>>, Errno> {
+    let src = network;
     let parsed = if strict {
         strict_link_header(
             payload,
@@ -2309,25 +2412,37 @@ fn link_dump(
         return Ok(Vec::new());
     }
     // Each device of the namespace, in the order of their indices: its
-    // loopback alone.
+    // loopback and its veth ends, whose peers' namespaces this one may give
+    // an ID as it tells of them.
     let (network, id) = match &shown {
-        Some((id, peer)) => (peer.as_ref(), Some(*id)),
+        Some((id, peer)) => (peer, Some(*id)),
         None => (network, None),
     };
-    let loopbacks = network
-        .devices()
-        .iter()
-        .filter(|d| d.kind == crate::netdev::DeviceKind::Loopback)
-        .count();
-    Ok((0..loopbacks)
-        .map(|_| {
-            let link = link_message(network, seq, port, NLM_F_MULTI, mask);
-            match id {
-                Some(id) => with_link_netnsid(link, id),
-                None => link,
-            }
-        })
-        .collect())
+    let devices: Vec<crate::netdev::Device> = network.devices().iter().cloned().collect();
+    let mut links = Vec::new();
+    for device in &devices {
+        let link = if device.kind == crate::netdev::DeviceKind::Loopback {
+            link_message(network, seq, port, NLM_F_MULTI, mask)
+        } else {
+            let (link, told) = veth::link_message(
+                network,
+                src,
+                device,
+                RTM_NEWLINK,
+                0,
+                (seq, port, NLM_F_MULTI),
+                mask,
+                false,
+            );
+            notices.extend(told);
+            link
+        };
+        links.push(match id {
+            Some(id) => with_link_netnsid(link, id),
+            None => link,
+        });
+    }
+    Ok(links)
 }
 /// Strictly, a bridge link dump (`valid_bridge_getlink_req`) takes no
 /// type, flags, change mask or index (`EINVAL`), then breaks no rule of
@@ -3602,6 +3717,10 @@ fn change_address(
         if !network.has_device(index) {
             return Err(extack::message(ENODEV, "ipv4: Device not found"));
         }
+        // Only `lo` has addresses, routes and neighbours here, not a veth end.
+        if index != LOOPBACK_OIF {
+            return Err(EOPNOTSUPP);
+        }
         if !add {
             return network
                 .addresses()
@@ -3636,6 +3755,10 @@ fn change_address(
         if !network.has_device(index) {
             return Err(no_device());
         }
+        // Only `lo` has addresses, routes and neighbours here, not a veth end.
+        if index != LOOPBACK_OIF {
+            return Err(EOPNOTSUPP);
+        }
         return network.addresses().del_v6(ip, prefix, now);
     }
     if bad_lifetimes {
@@ -3646,6 +3769,10 @@ fn change_address(
     }
     if !network.has_device(index) {
         return Err(no_device());
+    }
+    // Only `lo` has addresses, routes and neighbours here, not a veth end.
+    if index != LOOPBACK_OIF {
+        return Err(EOPNOTSUPP);
     }
     let flags = flags & crate::interface::V6_ASKED;
     let mut addresses = network.addresses();
@@ -3908,6 +4035,10 @@ fn lookup(
     if iif != 0 && !network.has_device(iif) {
         return Err(ENODEV);
     }
+    // Only `lo` has addresses, routes and neighbours here, not a veth end.
+    if iif != 0 && iif != LOOPBACK_OIF {
+        return Err(EOPNOTSUPP);
+    }
     let fib_match = request_flags & RTM_F_FIB_MATCH != 0;
     // The devices alone, before the addresses.
     let (forwarding, rp_filter) = {
@@ -4013,6 +4144,10 @@ fn lookup(
     if oif != 0 {
         if !network.has_device(oif) {
             return Err(ENODEV);
+        }
+        // Only `lo` has addresses, routes and neighbours here, not a veth end.
+        if oif != LOOPBACK_OIF {
+            return Err(EOPNOTSUPP);
         }
         if !network.is_up() {
             return Err(ENETUNREACH);
@@ -4742,6 +4877,10 @@ fn put_metrics(body: &mut Vec<u8>, metrics: &crate::interface::Metrics) {
 /// no unbound socket, or the port of a request with `NLM_F_ECHO`, which
 /// has its own copy instead (`nlmsg_notify`).
 pub(crate) struct Notice {
+    /// Another namespace than the requester's, whose members it goes to
+    /// once the requester's socket is unlocked ([`broadcast`]): a veth
+    /// peer's end's. None for the requester's own.
+    to: Option<Arc<Network>>,
     group: u32,
     origin: u32,
     bytes: Vec<u8>,
@@ -4825,6 +4964,7 @@ fn told(
                 ),
             };
             Notice {
+                to: None,
                 group,
                 origin,
                 bytes,
@@ -5119,6 +5259,10 @@ fn neighbour_get(
     if index != 0 && !network.has_device(index) {
         return Err(extack::message(ENODEV, "Unknown device ifindex"));
     }
+    // Only `lo` has addresses, routes and neighbours here, not a veth end.
+    if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) {
+        return Err(EOPNOTSUPP);
+    }
     let addresses = network.addresses();
     if proxy {
         let Some(p) = addresses.proxy(ip, index == 1) else {
@@ -5338,6 +5482,10 @@ fn change_neighbour(
         if index != 0 && !network.has_device(index) {
             return Err(ENODEV);
         }
+        // Only `lo` has addresses, routes and neighbours here, not a veth end.
+        if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) {
+            return Err(EOPNOTSUPP);
+        }
         if add
             && index == 1
             && let Some(lladdr) = lladdr
@@ -5420,6 +5568,7 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
     let mut link = link_message(network, 0, 0, 0, 0);
     link[28..32].copy_from_slice(&IFF_UP.to_le_bytes());
     let mut notices = vec![Notice {
+        to: None,
         group: RTNLGRP_LINK,
         origin: 0,
         bytes: link,
@@ -5428,6 +5577,7 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
     // `addrconf_notify` does nothing for `NETDEV_UP` with `disable_ipv6`.
     if up && !network.ipv6_off() {
         notices.push(Notice {
+            to: None,
             group: RTNLGRP_IPV6_IFINFO,
             origin: 0,
             bytes: inet6_link_message(network, 0, 0, 0),
@@ -5445,12 +5595,44 @@ pub(crate) fn set_ipv6(network: &Network, on: bool, now: u64) {
     let mut notices = told(events, 0, 0, false, false, now);
     if on && network.is_up() {
         notices.push(Notice {
+            to: None,
             group: RTNLGRP_IPV6_IFINFO,
             origin: 0,
             bytes: inet6_link_message(network, 0, 0, 0),
         });
     }
     notify(network, notices, None);
+}
+/// Sends `notices` to `network`'s members of their groups, from no socket
+/// (an interface ioctl's change).
+pub(crate) fn notify_link(network: &Network, notices: Vec<Notice>) {
+    broadcast(network, notices, None);
+}
+/// Sends `notices` in their order, each run to its namespace: `network`'s
+/// (but `except`, which has had them already) for those without a `to`,
+/// and `to`'s for the others, which `except` hears as any socket there
+/// does, as it is unlocked by now.
+fn broadcast(network: &Network, notices: Vec<Notice>, except: Option<&NetlinkSocket>) {
+    let mut run: Vec<Notice> = Vec::new();
+    let mut to: Option<Arc<Network>> = None;
+    let same = |a: &Option<Arc<Network>>, b: &Option<Arc<Network>>| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    };
+    let send = |to: Option<Arc<Network>>, run: Vec<Notice>| match to {
+        None => notify(network, run, except),
+        Some(other) => notify(&other, run, None),
+    };
+    for mut notice in notices {
+        let target = notice.to.take();
+        if !run.is_empty() && !same(&to, &target) {
+            send(to.take(), core::mem::take(&mut run));
+        }
+        to = target;
+        run.push(notice);
+    }
+    send(to, run);
 }
 /// What has run out of `network`'s addresses and routes by `now`
 /// ([`Network::expire`]), told to netlink's members of its groups, as
@@ -7403,7 +7585,7 @@ mod tests {
     fn another_namespaces_link_and_addresses_carry_its_id() {
         let peer = Arc::new(Network::isolated(crate::users::first()));
         peer.set_up(true, 0);
-        let network = Network::isolated(crate::users::first());
+        let network = Arc::new(Network::isolated(crate::users::first()));
         let target = |id: i32| match id {
             4 => Ok(Arc::clone(&peer)),
             5 => Err(Errno(13)),
@@ -7411,7 +7593,7 @@ mod tests {
         };
         let id = |n: i32| ifinfo(0, 0, &[(IFLA_TARGET_NETNSID, &n.to_le_bytes())]);
         // The peer's lo, up, with the ID first, before its name.
-        let dumped = link_dump(&network, &id(4), (1, 7), true, &target).unwrap();
+        let dumped = link_dump(&network, &id(4), (1, 7), true, &target, &mut Vec::new()).unwrap();
         let link = &dumped[0];
         assert_eq!(
             attribute_kinds(&link[32..])[..3],
@@ -7424,15 +7606,15 @@ mod tests {
         );
         // Unchecked, the ID counts too; its errors pass through.
         assert_eq!(
-            link_dump(&network, &id(4), (1, 7), false, &target),
+            link_dump(&network, &id(4), (1, 7), false, &target, &mut Vec::new()),
             Ok(dumped)
         );
         assert_eq!(
-            link_dump(&network, &id(5), (1, 7), true, &target),
+            link_dump(&network, &id(5), (1, 7), true, &target, &mut Vec::new()),
             Err(Errno(13))
         );
         assert_eq!(
-            link_dump(&network, &id(6), (1, 7), false, &target),
+            link_dump(&network, &id(6), (1, 7), false, &target, &mut Vec::new()),
             Err(Errno::EINVAL)
         );
         // Each address has the ID first; unchecked, no attribute counts.
@@ -7457,9 +7639,11 @@ mod tests {
     }
     #[test]
     fn strict_link_dumps_take_only_their_filters() {
-        let network = Network::isolated(crate::users::first());
+        let network = Arc::new(Network::isolated(crate::users::first()));
         network.set_up(true, 0);
-        let dump = |payload: &[u8], strict| link_dump(&network, payload, (1, 7), strict, &no_ids);
+        let dump = |payload: &[u8], strict| {
+            link_dump(&network, payload, (1, 7), strict, &no_ids, &mut Vec::new())
+        };
         let skip = RTEXT_FILTER_SKIP_STATS.to_le_bytes();
         let plain = dump(&ifinfo(0, 0, &[]), true).unwrap();
         assert_eq!(plain, vec![link_message(&network, 1, 7, NLM_F_MULTI, 0)]);

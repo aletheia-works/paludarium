@@ -61,6 +61,7 @@
     {"name":"netlink-target-netnsid","binary":"netlink-options"},
     {"name":"netlink-link-netns","binary":"netlink-options"},
     {"name":"netlink-write-credentials","binary":"netlink-options"},
+    {"name":"veth-links","binary":"veth"},
     {"name":"user-namespaces","binary":"process"},
     {"name":"scheduling-set","binary":"process"},
     {"name":"personality-layout","binary":"process"},

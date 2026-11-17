@@ -811,9 +811,17 @@ verified.
   `CAP_SETUID` and `CAP_SETGID` it needs in the parent; and the `/proc` files
   of a process that is not dumpable belong to root of the first namespace,
   where Linux gives them to root of the process's own when it maps one. A network
-  namespace has no interface but its loopback (no `veth` pairs to reach
-  another), and the interface requests and netlink change no other flag
-  than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
+  namespace has no interface but its loopback and the veth ends requests
+  make, and nothing goes through a pair yet: a veth end takes no address,
+  route or neighbour (`EOPNOTSUPP`), and no traffic. Making one takes
+  only a name, an address and an MTU for each end (`EOPNOTSUPP` for the
+  other attributes) and none of the `ifinfomsg`s' flags; changing one,
+  only `IFF_UP` and its namespace. A veth end's address without one asked
+  comes from a sequence of the emulator's own, not the kernel's random
+  numbers; its link watch comes at once, where Linux's may come a second
+  later; it has one queue each way, where Linux's has one for each
+  possible CPU, no `IFLA_AF_SPEC`, and statistics of zero. The interface
+  requests and netlink change no other flag than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`,
   `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC` (`EPROTONOSUPPORT` for the
   rest). Socket diagnostics tell only of AF_UNIX, TCP and UDP sockets:
@@ -930,11 +938,10 @@ verified.
   where Linux's count every namespace's; its own parameters' references
   are 1.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
-  ID is given only by `RTM_NEWNSID`: Linux's `peernet2id_alloc` gives one
-  on its own only for what lies in another namespace than the one
-  telling of it (a device's link or a device that moves there, a queue
-  lease, a devlink instance, a PSP device, an ovpn peer, an openvswitch
-  vport), none of which is here, and `lo` may not move; the `RTM_DELNSID` of a
+  ID is given by `RTM_NEWNSID` and by telling of a veth end whose peer is
+  in another namespace: Linux's `peernet2id_alloc` gives one on its own
+  for a queue lease, a devlink instance, a PSP device, an ovpn peer and
+  an openvswitch vport too, none of which is here; the `RTM_DELNSID` of a
   namespace that goes is sent as its last holder lets it go, where
   Linux sends it a little later, from a work queue. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries

@@ -3900,7 +3900,7 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             .and_then(|v| v.downcast_ref::<crate::sockets::SocketPairEnd>())
         {
             unix_network = end.unix().and_then(|socket| socket.network().cloned());
-            unix_network.as_deref()
+            unix_network.as_ref()
         } else {
             None
         };

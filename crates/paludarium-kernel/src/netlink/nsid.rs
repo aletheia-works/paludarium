@@ -11,12 +11,13 @@
 //! may name a peer by its ID (`IFLA_TARGET_NETNSID`,
 //! `IFA_TARGET_NETNSID`), as [`target`] finds it.
 //!
-//! A request gives an ID, and so does [`link_netnsid`], as Linux's
-//! `peernet2id_alloc` gives one on its own for what lies in another
-//! namespace than the one telling of it: a device whose link is there (a
-//! veth pair's other end). Its other callers (a device that moves, a queue
-//! lease, a devlink instance, a PSP device, an ovpn peer, an openvswitch
-//! vport) have no counterpart here.
+//! A request gives an ID. [`link_netnsid`] is Linux's
+//! `peernet2id_alloc`, which gives one on its own for what lies in another
+//! namespace than the one telling of it, for a device whose link is there
+//! (a veth pair's other end); no device here calls it yet, so no ID is
+//! given that way. Its other callers (a device that moves, a queue lease,
+//! a devlink instance, a PSP device, an ovpn peer, an openvswitch vport)
+//! have no counterpart here.
 use super::{
     Errno, Header, NLM_F_MULTI, Nla, Notice, Policy, attribute, extack, message, parse_policy,
 };
@@ -187,26 +188,9 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8], addressed: bool) -> Res
         };
         if let Some((skip, by_pid, by_fd)) = named {
             any = true;
-            let mut attributes = bytes[16..len].get(skip..).unwrap_or_default();
-            while attributes.len() >= 4 {
-                let size = usize::from(u16::from_le_bytes([attributes[0], attributes[1]]));
-                if size < 4 || size > attributes.len() {
-                    break;
-                }
-                let kind = u16::from_le_bytes([attributes[2], attributes[3]]) & 0x3fff;
-                if size >= 8 && (kind == by_pid || kind == by_fd) {
-                    let value = u32::from_le_bytes(attributes[4..8].try_into().unwrap_or_default());
-                    let reference = if kind == by_pid {
-                        Reference::Pid(value)
-                    } else {
-                        Reference::Fd(value)
-                    };
-                    if !found.iter().any(|&(r, _)| r == reference) {
-                        found.push((reference, find(c, reference)));
-                    }
-                }
-                attributes = &attributes[super::align(size).min(attributes.len())..];
-            }
+            let attributes = bytes[16..len].get(skip..).unwrap_or_default();
+            let link = header.kind == super::RTM_NEWLINK;
+            references(c, attributes, (by_pid, by_fd), link, &mut found);
         }
         bytes = &bytes[super::align(len).min(bytes.len())..];
     }
@@ -214,6 +198,62 @@ pub(super) fn resolve(c: &Context<'_>, mut bytes: &[u8], addressed: bool) -> Res
     let credentials = any.then(|| c.process.credentials.clone());
     RESOLVED.with(|r| *r.borrow_mut() = (found, credentials, addressed));
     Resolved
+}
+/// The attributes of `bytes`, each of its type and value, until one breaks.
+fn each(mut bytes: &[u8], mut found: impl FnMut(u16, &[u8])) {
+    while bytes.len() >= 4 {
+        let size = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+        if size < 4 || size > bytes.len() {
+            break;
+        }
+        found(
+            u16::from_le_bytes([bytes[2], bytes[3]]) & 0x3fff,
+            &bytes[4..size],
+        );
+        bytes = &bytes[super::align(size).min(bytes.len())..];
+    }
+}
+/// For [`resolve`], the processes and descriptors `attributes` name by the
+/// types `by` (a process's, a descriptor's), found into `found`; with
+/// `link`, those a veth pair's peer names too (`IFLA_LINKINFO`'s
+/// `IFLA_INFO_DATA`'s `VETH_INFO_PEER`, an `ifinfomsg` and its
+/// attributes), as `rtnl_get_peer_net` reads them.
+fn references(
+    c: &Context<'_>,
+    attributes: &[u8],
+    by: (u16, u16),
+    link: bool,
+    found: &mut Vec<(Reference, Found)>,
+) {
+    const IFLA_LINKINFO: u16 = 18;
+    const IFLA_INFO_DATA: u16 = 2;
+    const VETH_INFO_PEER: u16 = 1;
+    each(attributes, |kind, value| {
+        if (kind == by.0 || kind == by.1) && value.len() >= 4 {
+            let number = u32::from_le_bytes(value[..4].try_into().unwrap_or_default());
+            let reference = if kind == by.0 {
+                Reference::Pid(number)
+            } else {
+                Reference::Fd(number)
+            };
+            if !found.iter().any(|&(r, _)| r == reference) {
+                found.push((reference, find(c, reference)));
+            }
+        }
+        if link && kind == IFLA_LINKINFO {
+            each(value, |kind, data| {
+                if kind != IFLA_INFO_DATA {
+                    return;
+                }
+                each(data, |kind, peer| {
+                    if kind == VETH_INFO_PEER {
+                        let peer = peer.get(16..).unwrap_or_default();
+                        references(c, peer, by, false, found);
+                    }
+                });
+            });
+        }
+    });
 }
 /// The namespace `reference` names, for [`resolve`].
 fn find(c: &Context<'_>, reference: Reference) -> Result<Arc<Network>, Errno> {
@@ -310,6 +350,20 @@ pub(super) fn link_target(
         return Err(Errno::EPERM);
     }
     Ok(Some(named))
+}
+/// `rtnl_get_peer_net`: the namespace a veth pair's peer (its
+/// `VETH_INFO_PEER`) names by `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD`, as
+/// [`resolve`] found it (`ESRCH`, `EBADF`, `EINVAL`), with
+/// `CAP_NET_ADMIN` over it as [`link_target`] asks (`EPERM`); `None` for a
+/// peer that names none, which is the pair's own.
+#[expect(dead_code, reason = "a veth pair's creation calls it")]
+pub(super) fn peer_target(
+    network: &Network,
+    opener: &Credentials,
+    pid: Option<u32>,
+    fd: Option<u32>,
+) -> Result<Option<Arc<Network>>, Errno> {
+    link_target(network, opener, pid, fd, None)
 }
 /// `rtnl_get_net_ns_capable`: the peer of `id`, `EINVAL` for none and
 /// `EACCES` without `CAP_NET_ADMIN` over it.

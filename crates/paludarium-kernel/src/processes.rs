@@ -4687,17 +4687,18 @@ impl Kernel {
                 name,
                 &path,
             )?;
-            let closing = exec_opened(&self.files, &path, report);
+            // Its mappings keep the open, which closes with the last of them
+            // (`vm_file`), before they let go of the file. Opened before its
+            // denial of writes is taken, it tells its open and close even
+            // when that fails (`ETXTBSY`).
+            let closing = Arc::new(Mutex::new(exec_opened(&self.files, &path, report)));
+            failing.interpreters.push(Arc::clone(&closing));
             // Denied only while it loads, as `load_elf_binary` gives it back.
             drop(deny_writes(&self.files, &path)?);
-            if let Some(closing) = &closing {
+            if let Some(closing) = &*closing.lock().unwrap_or_else(PoisonError::into_inner) {
                 closing.read();
             }
             readable &= may_read;
-            // Its mappings keep the open, which closes with the last of them
-            // (`vm_file`), before they let go of the file.
-            let closing = Arc::new(Mutex::new(closing));
-            failing.interpreters.push(Arc::clone(&closing));
             let keep: paludarium_loader::Keep =
                 Arc::new((closing, self.files.interpreter_keep(&path)));
             Ok((path, Some(keep)))

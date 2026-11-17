@@ -31,6 +31,7 @@ const MAX_SAMPLE_RATE: u64 = 100_000;
 const CAP_PERFMON: u64 = 1 << 38;
 const EACCES: Errno = Errno::EACCES;
 const ESRCH: Errno = Errno(3);
+const ECHILD: Errno = Errno(10);
 const E2BIG: Errno = Errno(7);
 const ENOSPC: Errno = Errno::ENOSPC;
 const EBADF: Errno = Errno::EBADF;
@@ -391,6 +392,11 @@ struct State {
     running_time: u64,
     /// The clock when these were last brought up to date.
     since: u64,
+    /// What inherited events of tasks that have ended gave back
+    /// (`child_count`, `child_total_time_enabled`, `_running`).
+    child_count: u64,
+    child_enabled: u64,
+    child_running: u64,
     /// The task is gone: its last time stays.
     last: u64,
     /// In Linux's `PERF_EVENT_STATE_EXIT`: `remove_on_exec` took it out of
@@ -414,6 +420,12 @@ pub(crate) struct Event {
     leader: Mutex<Option<Arc<Event>>>,
     siblings: Mutex<Vec<Weak<Event>>>,
     state: Mutex<State>,
+    /// For one a new task inherited (`inherit`), the event it comes from,
+    /// the one opened, as Linux keeps `parent` at the top of the tree.
+    parent: Option<Weak<Event>>,
+    /// The opened event's inherited ones, of the tasks that still run
+    /// (`child_list`).
+    children: Mutex<Vec<Arc<Event>>>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -584,15 +596,111 @@ impl Event {
             }
         }
     }
+    /// Whether it counts thread `tid` of `group`.
+    fn counts(&self, group: &ThreadGroup, tid: u32) -> bool {
+        matches!(&self.target, Target::Thread { group: target, tid: target_tid }
+            if *target_tid == tid && std::ptr::eq(Arc::as_ptr(target), group))
+    }
+    /// `inherit_event`: the event a new task gets from this one, counting
+    /// `target`, a member of `leader`'s group or a leader. It comes from the
+    /// opened event, at the top, and is enabled as this one is; none comes
+    /// once the opened event's file is closed.
+    fn inherit(
+        self: &Arc<Self>,
+        target: Target,
+        leader: Option<&Arc<Event>>,
+    ) -> Option<Arc<Event>> {
+        let top = match &self.parent {
+            Some(parent) => parent.upgrade()?,
+            None => Arc::clone(self),
+        };
+        let enabled = {
+            let state = lock(&self.state);
+            state.enabled && !state.removed
+        };
+        let child = Arc::new(Event {
+            id: top.id,
+            attr: top.attr,
+            counter: top.counter,
+            target,
+            cpu: top.cpu,
+            clockid: top.clockid,
+            host: Arc::clone(&top.host),
+            leader: Mutex::new(leader.cloned()),
+            siblings: Mutex::default(),
+            state: Mutex::new(State {
+                enabled,
+                paused: leader.is_some_and(|leader| !leader.enabled()),
+                ..State::default()
+            }),
+            parent: Some(Arc::downgrade(&top)),
+            children: Mutex::default(),
+        });
+        if let Some(leader) = leader {
+            lock(&leader.siblings).push(Arc::downgrade(&child));
+        }
+        lock(&top.children).push(Arc::clone(&child));
+        Some(child)
+    }
+    /// The inherited events, of the tasks that still run.
+    fn children(&self) -> Vec<Arc<Event>> {
+        lock(&self.children).clone()
+    }
+    /// `_perf_event_enable` and `_disable` through
+    /// `perf_event_for_each_child`: the event and those inherited from it.
     fn enable(&self) {
         self.set_enabled(true);
+        for child in self.children() {
+            child.set_enabled(true);
+        }
     }
     fn disable(&self) {
         self.set_enabled(false);
+        for child in self.children() {
+            child.set_enabled(false);
+        }
     }
-    /// Linux's reset clears the count and leaves the times.
+    /// Linux's reset clears the count, the inherited events' too, and
+    /// leaves the times and what ended children gave back.
     fn reset(&self) {
         self.settle().count = 0;
+        for child in self.children() {
+            child.settle().count = 0;
+        }
+    }
+    /// `__perf_event_read_value`: the count and times of the event, of what
+    /// ended children gave back, and of the inherited events still running.
+    fn totals(&self) -> (u64, u64, u64) {
+        let (mut count, mut enabled, mut running) = {
+            let state = self.settle();
+            (
+                state.count + state.child_count,
+                state.enabled_time + state.child_enabled,
+                state.running_time + state.child_running,
+            )
+        };
+        for child in self.children() {
+            let (c, e, r) = child.values();
+            count += c;
+            enabled += e;
+            running += r;
+        }
+        (count, enabled, running)
+    }
+    /// `sync_child_event`: an inherited event's task ends, and the event
+    /// it comes from takes its count and times.
+    fn give_back(self: &Arc<Self>) {
+        let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        let (count, enabled, running) = self.values();
+        {
+            let mut state = lock(&parent.state);
+            state.child_count += count;
+            state.child_enabled += enabled;
+            state.child_running += running;
+        }
+        lock(&parent.children).retain(|child| !Arc::ptr_eq(child, self));
     }
     /// The group's leader: the event itself or the one it joined.
     fn leader(self: &Arc<Self>) -> Arc<Event> {
@@ -649,8 +757,10 @@ impl Event {
         }
         size + entry
     }
-    /// What a read gives (`perf_read_one`, `perf_read_group`).
-    fn read_values(self: &Arc<Self>) -> Vec<u64> {
+    /// What a read gives (`perf_read_one`, `perf_read_group`), with the
+    /// inherited events added in; `ECHILD` for a group whose members are no
+    /// longer those it had when a task inherited it.
+    fn read_values(self: &Arc<Self>) -> Result<Vec<u64>, Errno> {
         let format = self.attr.read_format;
         let mut values = Vec::new();
         let times = |values: &mut Vec<u64>, enabled: u64, running: u64| {
@@ -672,15 +782,23 @@ impl Event {
         };
         if format & FORMAT_GROUP != 0 {
             let group = self.group();
+            let members = group.len() - 1;
+            if group[0]
+                .children()
+                .iter()
+                .any(|child| child.members().len() != members)
+            {
+                return Err(ECHILD);
+            }
             values.push(group.len() as u64);
             // The members' times are the leader's, as they run together.
-            let (_, enabled, running) = group[0].values();
+            let (_, enabled, running) = group[0].totals();
             times(&mut values, enabled, running);
             for event in &group {
-                entry(&mut values, event, event.values().0);
+                entry(&mut values, event, event.totals().0);
             }
         } else {
-            let (count, enabled, running) = self.values();
+            let (count, enabled, running) = self.totals();
             values.push(count);
             times(&mut values, enabled, running);
             if format & FORMAT_ID != 0 {
@@ -690,7 +808,7 @@ impl Event {
                 values.push(0);
             }
         }
-        values
+        Ok(values)
     }
 }
 
@@ -879,6 +997,8 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         leader: Mutex::new(leader.clone()),
         siblings: Mutex::default(),
         state: Mutex::default(),
+        parent: None,
+        children: Mutex::default(),
     });
     if let Some(leader) = &leader {
         event.set_paused(!leader.enabled());
@@ -961,8 +1081,76 @@ pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, tid: u32) {
         gone
     };
     for event in counting {
-        event.disable();
-        event.settle().removed = true;
+        if event.parent.is_some() {
+            // An inherited event goes, giving back what it counted
+            // (`perf_event_exit_event` with a parent).
+            event.set_enabled(false);
+            event.give_back();
+        } else {
+            event.disable();
+            event.settle().removed = true;
+        }
+    }
+}
+
+const CLONE_THREAD: u64 = 0x10000;
+const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+
+/// `perf_event_init_task`: thread `child_tid` of `child_group`, which
+/// thread `tid` of `group` made with clone flags `flags`, inherits the
+/// groups that count that thread and have `inherit` (and, with
+/// `inherit_thread`, only by `CLONE_THREAD`; and not with `sigtrap` and
+/// `CLONE_CLEAR_SIGHAND`): each event of them gets one of its own, of the
+/// opened event's attributes, enabled as the one it is made from is
+/// (`inherit_event`). An event `remove_on_exec` or the end of its task took
+/// out is not inherited.
+pub(crate) fn clone(
+    events: &Events,
+    group: &ThreadGroup,
+    tid: u32,
+    child_group: &Arc<ThreadGroup>,
+    child_tid: u32,
+    flags: u64,
+) {
+    let leaders: Vec<Arc<Event>> = lock(&events.lists)
+        .counting
+        .iter()
+        .filter_map(event)
+        .filter(|event| event.counts(group, tid) && lock(&event.leader).is_none())
+        .collect();
+    let mut made = Vec::new();
+    for leader in leaders {
+        let attr = &leader.attr;
+        if !attr.flag(bit::INHERIT)
+            || attr.flag(bit::INHERIT_THREAD) && flags & CLONE_THREAD == 0
+            || attr.flag(bit::SIGTRAP) && flags & CLONE_CLEAR_SIGHAND != 0
+            || lock(&leader.state).removed
+        {
+            continue;
+        }
+        let target = || Target::Thread {
+            group: Arc::clone(child_group),
+            tid: child_tid,
+        };
+        let Some(child_leader) = leader.inherit(target(), None) else {
+            continue;
+        };
+        made.push(Arc::clone(&child_leader));
+        for member in leader.members() {
+            if let Some(child) = member.inherit(target(), Some(&child_leader)) {
+                made.push(child);
+            }
+        }
+    }
+    let mut lists = lock(&events.lists);
+    for child in &made {
+        lists.counting.push(erase(child));
+        let attr = &child.attr;
+        if attr.flag(bit::DISABLED) && attr.flag(bit::ENABLE_ON_EXEC)
+            || attr.flag(bit::REMOVE_ON_EXEC)
+        {
+            lists.on_exec.push(erase(child));
+        }
     }
 }
 
@@ -993,7 +1181,11 @@ pub(crate) fn exec(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32)
                 group: target,
                 tid: target_tid,
             } if *target_tid == tid && std::ptr::eq(Arc::as_ptr(target), group) => {
-                if event.attr.flag(bit::REMOVE_ON_EXEC) {
+                if event.attr.flag(bit::REMOVE_ON_EXEC) && event.parent.is_some() {
+                    // An inherited one goes, giving back what it counted.
+                    event.set_enabled(false);
+                    event.give_back();
+                } else if event.attr.flag(bit::REMOVE_ON_EXEC) {
                     // `perf_event_exit_event` with `DETACH_GROUP`, after
                     // `perf_remove_from_owner`, as Linux master since 7.2's
                     // 037a3c43edfb; the test machines' 7.0 leaves the event
@@ -1092,7 +1284,7 @@ impl FileHandle for EventFile {
         if buf.len() < size {
             return Err(ENOSPC);
         }
-        let values = event.read_values();
+        let values = event.read_values()?;
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
@@ -1162,9 +1354,24 @@ mod tests {
     }
 
     fn counting(leader: Option<&Arc<Event>>, target: Target) -> Arc<Event> {
+        with_flags(leader, target, 0)
+    }
+
+    fn with_flags(leader: Option<&Arc<Event>>, target: Target, flags: u64) -> Arc<Event> {
+        with_attr(
+            leader,
+            target,
+            Attr {
+                flags,
+                ..Attr::default()
+            },
+        )
+    }
+
+    fn with_attr(leader: Option<&Arc<Event>>, target: Target, attr: Attr) -> Arc<Event> {
         let event = Arc::new(Event {
             id: 0,
-            attr: Attr::default(),
+            attr,
             counter: Counter::Zero,
             target,
             cpu: 0,
@@ -1173,6 +1380,8 @@ mod tests {
             leader: Mutex::new(leader.cloned()),
             siblings: Mutex::default(),
             state: Mutex::default(),
+            parent: None,
+            children: Mutex::default(),
         });
         if let Some(leader) = leader {
             lock(&leader.siblings).push(Arc::downgrade(&event));
@@ -1182,6 +1391,92 @@ mod tests {
 
     fn ids(events: &[Arc<Event>]) -> Vec<*const Event> {
         events.iter().map(Arc::as_ptr).collect()
+    }
+
+    #[test]
+    fn a_new_task_inherits_groups_with_inherit_and_gives_them_back_at_its_end() {
+        let events = Events::default();
+        let (group, child_group) = (
+            Arc::new(ThreadGroup::default()),
+            Arc::new(ThreadGroup::default()),
+        );
+        let on = |tid| Target::Thread {
+            group: Arc::clone(&group),
+            tid,
+        };
+        let inherit = 1 << bit::INHERIT;
+        let leader = with_flags(None, on(5), inherit);
+        let member = with_flags(Some(&leader), on(5), inherit);
+        let alone = counting(None, on(5));
+        for event in [&leader, &member, &alone] {
+            events.add(event, &group, 5);
+        }
+        leader.enable();
+        clone(&events, &group, 5, &child_group, 9, 0);
+        assert_eq!(leader.children().len(), 1);
+        assert_eq!(member.children().len(), 1);
+        assert!(alone.children().is_empty());
+        let (child_leader, child_member) =
+            (leader.children()[0].clone(), member.children()[0].clone());
+        assert!(child_leader.counts(&child_group, 9) && child_leader.enabled());
+        assert_eq!(
+            ids(&child_leader.group()),
+            ids(&[Arc::clone(&child_leader), Arc::clone(&child_member)])
+        );
+        // The opened event's ioctls reach the inherited ones.
+        leader.disable();
+        assert!(!child_leader.enabled());
+        leader.enable();
+        lock(&child_leader.state).count = 7;
+        lock(&child_member.state).count = 3;
+        assert_eq!(leader.totals().0, 7);
+        exit_thread(&events, &child_group, 9);
+        assert!(leader.children().is_empty() && member.children().is_empty());
+        assert_eq!((leader.totals().0, member.totals().0), (7, 3));
+        // A reset leaves what ended children gave back.
+        leader.reset();
+        assert_eq!(leader.totals().0, 7);
+    }
+
+    #[test]
+    fn inherit_thread_is_inherited_by_threads_alone() {
+        let events = Events::default();
+        let group = Arc::new(ThreadGroup::default());
+        let event = with_flags(
+            None,
+            Target::Thread {
+                group: Arc::clone(&group),
+                tid: 5,
+            },
+            1 << bit::INHERIT | 1 << bit::INHERIT_THREAD,
+        );
+        events.add(&event, &group, 5);
+        clone(&events, &group, 5, &Arc::new(ThreadGroup::default()), 9, 0);
+        assert!(event.children().is_empty());
+        clone(&events, &group, 5, &group, 6, CLONE_THREAD);
+        assert_eq!(event.children().len(), 1);
+    }
+
+    #[test]
+    fn a_group_that_changed_since_it_was_inherited_is_echild_to_read() {
+        let events = Events::default();
+        let group = Arc::new(ThreadGroup::default());
+        let on = || Target::Thread {
+            group: Arc::clone(&group),
+            tid: 5,
+        };
+        let attr = Attr {
+            flags: 1 << bit::INHERIT,
+            read_format: FORMAT_GROUP,
+            ..Attr::default()
+        };
+        let leader = with_attr(None, on(), attr);
+        events.add(&leader, &group, 5);
+        assert!(leader.read_values().is_ok());
+        clone(&events, &group, 5, &group, 6, CLONE_THREAD);
+        assert!(leader.read_values().is_ok());
+        let _late = with_attr(Some(&leader), on(), attr);
+        assert_eq!(leader.read_values(), Err(ECHILD));
     }
 
     #[test]

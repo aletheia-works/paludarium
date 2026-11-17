@@ -200,8 +200,9 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `ENOENT` で、ハードウェアのイベントも、PMU のあるホストでも `ENOENT` です。スレッドの
   CPU 時間は、最後のシステムコールで最後に記録したものです。CPU のイベントは経った時間を
   数えます。リングバッファはないので、イベントの `mmap` は `ENODEV`、サンプリングする
-  イベントはサンプルを取らずシグナルも送らず、`poll` は読めるとは見ません。`inherit` は
-  受け付けますが子は数えず、一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
+  イベントはサンプルを取らずシグナルも送らず、`poll` は読めるとは見ません。`inherit_stat` は
+  受け付けますが、記録するものがないので、引き継いだイベントの終わりに読み取りの記録は
+  送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
   モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。`PERF_FLAG_FD_OUTPUT` と ioctl の
   `SET_OUTPUT`、`SET_FILTER`、`SET_BPF`、`PAUSE_OUTPUT`、`QUERY_BPF`、
   `MODIFY_ATTRIBUTES` は、何もしないか `ENOTTY` です。`remove_on_exec` は、

@@ -2273,6 +2273,16 @@ impl Kernel {
             let _ = mem.write(GuestAddr(a[3]), &tid.to_le_bytes());
         }
         child.publish(tid, &state, mem);
+        // perf_event_init_task: the thread inherits the events of its
+        // creator that have `inherit`.
+        crate::perf::clone(
+            &self.processes.perf_events,
+            &self.group,
+            parent.tid,
+            &self.group,
+            tid,
+            flags,
+        );
         self.pending_child = Some((Box::new(child), Thread { tid, cpu, state }));
         Ok(u64::from(tid))
     }

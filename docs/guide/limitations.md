@@ -229,8 +229,9 @@ verified.
   it last accounted, at its latest system call, and an event of a CPU
   counts the time that passes. There is no ring buffer: `mmap` of an event
   is `ENODEV`, a sampling event takes no samples and sends no signal, and
-  `poll` never finds one readable. `inherit` is taken but children are not
-  counted, an event of a task on one CPU counts on any, and the cgroup mode
+  `poll` never finds one readable. `inherit_stat` is taken, but an
+  inherited event's end sends no read record, as nothing is recorded. An
+  event of a task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
   ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
   and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`

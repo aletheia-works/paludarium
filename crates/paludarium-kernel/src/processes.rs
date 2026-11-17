@@ -3393,6 +3393,16 @@ impl Kernel {
         // Shown in /proc from the start, before its first system call.
         let memory = child.spawn_memory.clone();
         child.publish(pid, &state, memory.as_deref().unwrap_or(mem));
+        // perf_event_init_task: the process inherits the events of the
+        // thread that made it that have `inherit`.
+        crate::perf::clone(
+            &self.processes.perf_events,
+            &self.group,
+            parent.tid,
+            &child.group,
+            pid,
+            flags,
+        );
         self.vfork_wait = release;
         self.pending_child = Some((
             Box::new(child),

@@ -3455,7 +3455,17 @@ kernel.
   ends without an `execve` owns the events it opened no more
   (`perf_event_exit_task`), and the events that count it go to Linux's
   `EXIT` state: they count no more, keep their last count and times to be
-  read, stay in their group and lead no new group (`ENODEV`). `prctl`'s
+  read, stay in their group and lead no new group (`ENODEV`). With
+  `inherit`, a new thread or process inherits the groups that count the
+  thread that makes it, as `perf_event_init_task` does: each event of them
+  gets one of its own, counting the new task, enabled as the one it comes
+  from is. `inherit_thread` keeps them from a new process, and `sigtrap`
+  from `CLONE_CLEAR_SIGHAND`. A read of the opened event adds in the
+  inherited ones and what those of tasks that ended gave back, counts and
+  times, a group's member by member (`ECHILD` for a group whose members
+  changed since a task inherited it). Its `ENABLE`, `DISABLE` and `RESET`
+  (which keeps what ended tasks gave back), and the `prctl` below, reach
+  the inherited events too. `prctl`'s
   `PR_TASK_PERF_EVENTS_DISABLE` and `ENABLE` disable and enable every
   event the calling thread opened, whatever task it counts (one opened
   disabled too), and read no other argument; a thread that runs `execve`

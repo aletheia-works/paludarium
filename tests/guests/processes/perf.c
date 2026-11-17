@@ -1,8 +1,9 @@
 /* perf_event_open, compared with Linux: the order of its checks and their
    errors, and the software events the emulator counts (task-clock,
    cpu-clock and the dummy event) with read, the read formats, groups, the
-   ENABLE, DISABLE, RESET and ID ioctls, enable_on_exec, and prctl's
-   PR_TASK_PERF_EVENTS_DISABLE and ENABLE of the events a thread opened.
+   ENABLE, DISABLE, RESET and ID ioctls, enable_on_exec, prctl's
+   PR_TASK_PERF_EVENTS_DISABLE and ENABLE of the events a thread opened,
+   and inherit, which counts the children a task makes.
 
    Counts and times are given as whether they are 0, grew or stayed,
    never as values, and IDs as whether they match. Hardware events are not
@@ -425,12 +426,69 @@ static int case_prctl(void) {
     return 0;
 }
 
+/* inherit: a child's time is added to an event its parent opened with
+   inherit, by itself and in a group, and not to one without it or with
+   inherit_thread, which a fork does not inherit. The child reports what an
+   event of its own counted, which the inherited one, there from the fork,
+   counts at least. */
+static int case_inherit(void) {
+    struct attr a = software(1);
+    a.flags |= INHERIT;
+    int inherited = (int)open_event(&a, 0, -1, -1, 0);
+    a.flags |= INHERIT_THREAD;
+    int threads_only = (int)open_event(&a, 0, -1, -1, 0);
+    struct attr b = software(1);
+    int plain = (int)open_event(&b, 0, -1, -1, 0);
+    a = software(1);
+    a.flags |= INHERIT;
+    a.read_format = FORMAT_GROUP;
+    int leader = (int)open_event(&a, 0, -1, -1, 0);
+    a.read_format = 0;
+    int member = (int)open_event(&a, 0, -1, leader, 0);
+    say("open %d %d %d %d %d", inherited >= 0, threads_only >= 0, plain >= 0, leader >= 0, member >= 0);
+    uint64_t before[3] = {count(inherited), count(threads_only), count(plain)};
+    uint64_t group_before[3], group_after[3];
+    long n = TRY(read(leader, group_before, sizeof group_before));
+    int pipes[2];
+    pipe(pipes);
+    pid_t child = fork();
+    if (child == 0) {
+        struct attr own = software(1);
+        int mine = (int)open_event(&own, 0, -1, -1, 0);
+        spin();
+        spin();
+        spin();
+        uint64_t counted = count(mine);
+        write(pipes[1], &counted, sizeof counted);
+        _exit(0);
+    }
+    uint64_t counted = 0;
+    read(pipes[0], &counted, sizeof counted);
+    int status;
+    waitpid(child, &status, 0);
+    long m = TRY(read(leader, group_after, sizeof group_after));
+    say("child status %d counted %d", status, counted > 0);
+    say("inherited has the child %d", count(inherited) - before[0] >= counted);
+    say("inherit_thread has it %d plain has it %d", count(threads_only) - before[1] >= counted,
+        count(plain) - before[2] >= counted);
+    say("group read %ld %ld nr %llu leader has the child %d member has the child %d", n, m,
+        (unsigned long long)group_after[0], group_after[1] - group_before[1] >= counted,
+        group_after[2] - group_before[2] >= counted);
+    close(member);
+    close(leader);
+    close(plain);
+    close(threads_only);
+    close(inherited);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
     if (!strcmp(mode, "perf-calls")) return case_calls();
     if (!strcmp(mode, "perf-counts")) return case_counts();
     if (!strcmp(mode, "perf-prctl")) return case_prctl();
+    if (!strcmp(mode, "perf-inherit")) return case_inherit();
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {
         spin();

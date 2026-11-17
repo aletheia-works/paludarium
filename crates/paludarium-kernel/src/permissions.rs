@@ -761,9 +761,10 @@ pub(crate) fn truncate(
 
 /// exec's checks (`do_open_execat`, `would_dump`) of the program `raw`
 /// names from the working directory, at `path`: a file it finds must be a
-/// regular file, not on a `noexec` mount, the thread may execute (EACCES). Returns the file, whose
-/// set-user-ID and set-group-ID bits exec takes, and whether the thread may
-/// also read it; a program it may not read runs undumpable.
+/// regular file, not on a `noexec` mount, the thread may execute
+/// (EACCES). Returns the file, whose set-user-ID and set-group-ID bits exec
+/// takes, and whether the thread may also read it; a program it may not
+/// read runs undumpable.
 pub(crate) fn exec(
     files: &Files,
     creds: &Credentials,

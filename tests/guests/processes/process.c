@@ -10376,6 +10376,21 @@ static int mf_inner(const char *self) {
     write(fd, text, (size_t)len);
     close(fd);
     mf_run("script-n", path);
+    /* nosuid judges the file that runs, a script's interpreter: a script
+       on the nosuid mount runs its set-user-ID interpreter as its owner,
+       and one whose interpreter is there runs it as the caller. */
+    snprintf(path, sizeof path, "%s/script", s);
+    fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    len = snprintf(text, sizeof text, "#!%s mount-flags-id\n", xp);
+    write(fd, text, (size_t)len);
+    close(fd);
+    mf_run("script-on-s", path);
+    snprintf(path, sizeof path, "%s/script-s", x);
+    fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    len = snprintf(text, sizeof text, "#!%s mount-flags-id\n", sp);
+    write(fd, text, (size_t)len);
+    close(fd);
+    mf_run("script-of-s", path);
     printf("mmap");
     fd = open(np, O_RDONLY);
     void *at = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);

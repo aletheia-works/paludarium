@@ -400,6 +400,9 @@ enum Backing {
         device: u64,
         base: Vec<u8>,
     },
+    /// A bind mount of a file the kernel generates
+    /// ([`GeneratedSource`]).
+    Generated(Arc<generated::GeneratedFs>),
 }
 
 #[derive(Clone)]
@@ -435,7 +438,7 @@ impl Entry {
     fn memory(&self) -> Option<&Arc<Superblock>> {
         match &self.backing {
             Backing::Memory(sb) => Some(sb),
-            Backing::Boot { .. } | Backing::Lower { .. } => None,
+            Backing::Boot { .. } | Backing::Lower { .. } | Backing::Generated(_) => None,
         }
     }
     /// Made after start-up, by `mount`: a walk steps into it itself.
@@ -497,7 +500,11 @@ impl Entry {
     fn same_files(&self, other: &Self) -> bool {
         match (&self.backing, &other.backing) {
             (Backing::Memory(a), Backing::Memory(b)) => Arc::ptr_eq(a, b),
-            (Backing::Memory(_), _) | (_, Backing::Memory(_)) => false,
+            (Backing::Generated(a), Backing::Generated(b)) => {
+                a.0.kind == b.0.kind && a.0.device == b.0.device
+            }
+            (Backing::Memory(_) | Backing::Generated(_), _)
+            | (_, Backing::Memory(_) | Backing::Generated(_)) => false,
             _ => true,
         }
     }
@@ -532,6 +539,9 @@ pub struct MountTable {
     entries: RwLock<Arc<Vec<Entry>>>,
     /// Whether every mount is a boot one, so calls go straight through.
     boot_only: AtomicBool,
+    /// Whether a mount is a bind mount of a file the kernel generates, so
+    /// the kernel asks where its paths lead ([`NamespacedFs::generated`]).
+    generated: AtomicBool,
     /// Where the lower filesystem has its mounts, which it shows itself.
     lower_points: Arc<Vec<Vec<u8>>>,
     /// What is told of mounts that leave the namespace ([`UnmountHook`]).
@@ -587,6 +597,7 @@ impl MountTable {
         Self::registered(Self {
             entries: RwLock::new(Arc::new(entries)),
             boot_only: AtomicBool::new(true),
+            generated: AtomicBool::new(false),
             lower_points: Arc::new(mounts.iter().map(|m| m.path.clone()).collect()),
             unmount_hook: Mutex::default(),
             below,
@@ -691,6 +702,7 @@ impl MountTable {
         Self::registered(Self {
             entries: RwLock::new(Arc::new(entries)),
             boot_only: AtomicBool::new(self.boot_only.load(Ordering::SeqCst)),
+            generated: AtomicBool::new(self.generated.load(Ordering::SeqCst)),
             lower_points: Arc::clone(&self.lower_points),
             unmount_hook: Mutex::default(),
             below,
@@ -742,6 +754,12 @@ impl MountTable {
         let out = f(&mut entries)?;
         self.boot_only
             .store(entries.iter().all(|e| !e.runtime()), Ordering::SeqCst);
+        self.generated.store(
+            entries
+                .iter()
+                .any(|e| matches!(e.backing, Backing::Generated(_))),
+            Ordering::SeqCst,
+        );
         *guard = Arc::new(entries);
         Ok(out)
     }
@@ -923,7 +941,10 @@ impl NamespacedFs {
         // filesystem.
         match loc.at.map(|i| &entries[i]) {
             Some(e) => (
-                e.memory().map_or(&*self.lower, |sb| &*sb.fs),
+                match &e.backing {
+                    Backing::Generated(fs) => &**fs,
+                    _ => e.memory().map_or(&*self.lower, |sb| &*sb.fs),
+                },
                 e.inside(&loc.path),
             ),
             None => (&*self.lower, loc.path.clone()),
@@ -1237,6 +1258,7 @@ impl NamespacedFs {
             kind: match &e.backing {
                 Backing::Boot { kind, .. } | Backing::Lower { kind, .. } => kind,
                 Backing::Memory(_) => "tmpfs",
+                Backing::Generated(fs) => fs.0.kind,
             },
             settings: e.memory().map(|sb| lock(&sb.settings).clone()),
             read_only: e.read_only(),
@@ -1492,7 +1514,11 @@ impl NamespacedFs {
         }
         let same = match (&a.backing, &b.backing) {
             (Backing::Memory(x), Backing::Memory(y)) => Arc::ptr_eq(x, y),
-            (Backing::Memory(_), _) | (_, Backing::Memory(_)) => false,
+            (Backing::Generated(x), Backing::Generated(y)) => {
+                x.0.kind == y.0.kind && x.0.device == y.0.device
+            }
+            (Backing::Memory(_) | Backing::Generated(_), _)
+            | (_, Backing::Memory(_) | Backing::Generated(_)) => false,
             (
                 Backing::Boot { device: x, .. } | Backing::Lower { device: x, .. },
                 Backing::Boot { device: y, .. } | Backing::Lower { device: y, .. },
@@ -2136,6 +2162,13 @@ impl FileSystem for NamespacedFs {
                         String::new(),
                         String::new(),
                     ),
+                    Backing::Generated(fs) => (
+                        fs.0.kind,
+                        fs.0.device,
+                        e.root.clone(),
+                        String::new(),
+                        String::new(),
+                    ),
                     Backing::Memory(sb) => {
                         let settings = lock(&sb.settings);
                         (
@@ -2583,6 +2616,10 @@ impl HostFs for NamespacedFs {
         fs.set_times(&at, false, atime, mtime)
     }
 }
+
+#[path = "namespace_generated.rs"]
+mod generated;
+pub use generated::GeneratedSource;
 
 #[cfg(test)]
 #[path = "namespace_tests.rs"]

@@ -14,9 +14,10 @@
 //! of the processes along. Read-only mounts and superblocks refuse writes
 //! (`EROFS`, in the calls that write). What it does not do yet gives
 //! `EOPNOTSUPP` once Linux's checks before it have passed: `MS_NOSYMFOLLOW`
-//! on a tmpfs or set by a remount, a mount on, a bind mount of or a move of
-//! `/proc` or `/dev`, which the kernel generates, and a move of a mount
-//! from start-up that the lower filesystem shows. Any other file system
+//! on a tmpfs or set by a remount, a mount on or a move of `/proc` or
+//! `/dev`, which the kernel generates, a bind mount of a directory there
+//! (one of a file there shows that file), and a move of a mount from
+//! start-up that the lower filesystem shows. Any other file system
 //! type is `ENODEV`, as from a kernel without it.
 //!
 //! `umount2` unmounts the mounts `mount` made, and the old root after a
@@ -673,7 +674,9 @@ fn mount(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// namespace (`check_mnt`, `EINVAL`) before the bind mount is made
 /// ([`paludarium_vfs::NamespacedFs::bind`]). The flags other than `MS_REC`
 /// change nothing: the new mount has the source mount's. A source in
-/// `/proc` or `/dev`, which the kernel generates, is not supported yet.
+/// `/proc` or `/dev`, which the kernel generates, is a mount of that file
+/// ([`paludarium_vfs::NamespacedFs::bind_generated`]); of a directory
+/// there, not supported yet (`EOPNOTSUPP`).
 fn bind(
     c: &Context<'_>,
     source: Option<Vec<u8>>,
@@ -682,11 +685,18 @@ fn bind(
     ns: &Namespace,
 ) -> Result<u64, Errno> {
     let source = source.filter(|s| !s.is_empty()).ok_or(Errno::EINVAL)?;
-    let source = crate::files::mount_path(c, source, true)?.ok_or(Errno::EOPNOTSUPP)?;
+    let Some(found) = crate::files::mount_path(c, source.clone(), true)? else {
+        let generated = crate::files::generated_source(c, source)?;
+        if !check_mnt(c, ns) {
+            return Err(Errno::EINVAL);
+        }
+        c.files.namespaced().bind_generated(generated, target)?;
+        return Ok(0);
+    };
     if !check_mnt(c, ns) {
         return Err(Errno::EINVAL);
     }
-    c.files.namespaced().bind(&source, target, recurse)?;
+    c.files.namespaced().bind(&found, target, recurse)?;
     Ok(0)
 }
 

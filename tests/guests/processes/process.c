@@ -10612,6 +10612,138 @@ static int listings_case(void) {
     return 0;
 }
 
+/* The generated-binds case: bind mounts of files the kernel generates,
+   /dev/null and a file of this process's /proc directory, onto files of a
+   temporary directory, in a mount namespace of a user namespace of its own,
+   where the caller is root. Only errno values, comparisons and the mounts'
+   root fields and types are printed, nothing of the machine's own mount
+   table. */
+static char gb_base[] = "/tmp/paludarium-generated-binds-XXXXXX";
+static void gb_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", gb_base, name); }
+/* Whether the link of descriptor `fd` in /proc/self/fd names `path`. */
+static int gb_fd_names(int fd, const char *path) {
+    char at[64], name[256];
+    snprintf(at, sizeof at, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(at, name, sizeof name - 1);
+    if (n < 0) return -errno;
+    name[n] = 0;
+    return !strcmp(name, path);
+}
+static int gb_inner(void) {
+    char f[256], g[256], d[256], link_path[256], other[256], buf[256], want[64];
+    gb_path(f, "f");
+    gb_path(g, "g");
+    gb_path(d, "d");
+    gb_path(link_path, "link");
+    gb_path(other, "other");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    struct stat null, seen;
+    stat("/dev/null", &null);
+    printf("null=%d", mt_result(mount("/dev/null", f, "nosuchfs", MS_BIND | MS_RDONLY, "bogus")));
+    int r = stat(f, &seen) ? errno : 0;
+    printf(" stat=%d", r);
+    printf(" chr=%d rdev=%d ino=%d dev=%d\n", S_ISCHR(seen.st_mode), seen.st_rdev == null.st_rdev,
+           seen.st_ino == null.st_ino, seen.st_dev == null.st_dev);
+    int fd = open(f, O_RDWR);
+    printf("open=%d", fd < 0 ? errno : 0);
+    if (fd >= 0) {
+        long wrote = (long)write(fd, "abc", 3);
+        long got = (long)read(fd, buf, sizeof buf);
+        printf(" write=%ld read=%ld fdlink=%d", wrote, got, gb_fd_names(fd, f));
+        close(fd);
+    }
+    long id = 0, parent = 0;
+    char root[1024] = "", kind[64] = "";
+    int lines = bd_line(f, &id, &parent, root, kind);
+    printf("\nmountinfo lines=%d root=%s kind=%s\n", lines, root, kind);
+    /* A link to it, followed and not. */
+    symlink(f, link_path);
+    struct stat l;
+    memset(&l, 0, sizeof l);
+    r = stat(link_path, &l) ? errno : 0;
+    printf("link stat=%d chr=%d", r, S_ISCHR(l.st_mode));
+    r = lstat(link_path, &l) ? errno : 0;
+    printf(" lstat=%d lnk=%d", r, S_ISLNK(l.st_mode));
+    fd = open(link_path, O_WRONLY);
+    printf(" open=%d", fd < 0 ? errno : 0);
+    if (fd >= 0) {
+        long wrote = (long)write(fd, "abc", 3);
+        printf(" write=%ld fdlink=%d", wrote, gb_fd_names(fd, f));
+        close(fd);
+    }
+    unlink(link_path);
+    /* The name is the mount's place: it stays, and is in use. */
+    printf("\nunlink=%d", mt_result(unlink(f)));
+    printf(" rename=%d", mt_result(rename(f, other)));
+    printf(" link=%d", mt_result(link(f, other)));
+    printf(" mkdir=%d\n", mt_result(mkdir(f, 0755)));
+    /* do_loopback's checks: a file on a directory, one that is not there. */
+    printf("on-dir=%d", mt_result(mount("/dev/null", d, NULL, MS_BIND, NULL)));
+    printf(" missing=%d", mt_result(mount("/dev/nosuch", g, NULL, MS_BIND, NULL)));
+    printf(" missing-proc=%d\n", mt_result(mount("/proc/self/nosuch", g, NULL, MS_BIND, NULL)));
+    /* A bind mount of the bind mount: another mount of /dev/null. */
+    printf("again=%d", mt_result(mount(f, g, NULL, MS_BIND, NULL)));
+    stat(g, &seen);
+    long again = 0;
+    bd_line(g, &again, &parent, root, kind);
+    printf(" rdev=%d root=%s kind=%s new=%d", seen.st_rdev == null.st_rdev, root, kind, again != id);
+    printf(" umount=%d", mt_result(umount2(g, 0)));
+    printf(" back=%d %s\n", bd_read(g, buf, sizeof buf), buf);
+    printf("umount=%d", mt_result(umount2(f, 0)));
+    printf(" back=%d %s\n", bd_read(f, buf, sizeof buf), buf);
+    /* A file of this process's /proc directory, by /proc/self. */
+    char comm[64];
+    bd_read("/proc/self/comm", comm, sizeof comm);
+    printf("comm=%d", mt_result(mount("/proc/self/comm", f, NULL, MS_BIND, NULL)));
+    bd_line(f, &id, &parent, root, kind);
+    snprintf(want, sizeof want, "/%d/comm", (int)getpid());
+    printf(" root=%d kind=%s", !strcmp(root, want), kind);
+    r = bd_read(f, buf, sizeof buf);
+    printf(" read=%d same=%d", r, !strcmp(buf, comm));
+    printf(" umount=%d", mt_result(umount2(f, 0)));
+    printf(" back=%d %s\n", bd_read(f, buf, sizeof buf), buf);
+    return 0;
+}
+static int generated_binds_case(void) {
+    if (!mkdtemp(gb_base)) return 93;
+    chmod(gb_base, 0755);
+    char path[256];
+    gb_path(path, "d");
+    mkdir(path, 0755);
+    gb_path(path, "f");
+    mt_write_new(path, "eff");
+    gb_path(path, "g");
+    mt_write_new(path, "gee");
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(gb_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    const char *files[] = {"f", "g", "other", "link"};
+    for (unsigned i = 0; i < 4; i++) {
+        gb_path(path, files[i]);
+        unlink(path);
+    }
+    gb_path(path, "d");
+    rmdir(path);
+    printf("cleaned=%d\n", rmdir(gb_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -29202,6 +29334,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "setattrs")) return setattrs_case();
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
     if (!strcmp(mode, "listings")) return listings_case();
+    if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "mount-flags-id")) {
         printf("euid=%d egid=%d\n", (int)geteuid(), (int)getegid());
         return 0;

@@ -1588,6 +1588,18 @@ kernel.
   one). The new mount is a peer of the source's mount and a slave of its
   master; on a shared mount it is shared, in a new peer group if the
   source's mount was in none.
+- A bind mount's source may be a file the kernel generates in `/dev` or
+  `/proc` (`mount --bind /dev/null file`, or a file of a process's
+  directory, `/proc/self` taken as the caller's own): the new mount shows
+  that file, with its device, as a mount of devtmpfs, procfs, devpts or
+  mqueue with the flags Linux mounts each with (locked in a namespace of a
+  less privileged owner) and the file's path there as its root in
+  mountinfo. A path to the mount's place, or a link followed to it, reaches
+  that file, as `stat`, `open`, reading and writing find it; its link in
+  `/proc/self/fd` names the mount's place, as Linux's `d_path` does. The
+  name itself is the mount's: `unlink` and `rename` find it in use
+  (`EBUSY`), `mkdir` there `EEXIST`, `link` of it `EXDEV`; a bind mount of
+  the mount is another of the same file, and `umount2` takes it away.
 - `mount` with `MS_REMOUNT` and `MS_BIND` changes a mount's flags alone, as
   Linux's `do_reconfigure_mnt`: the target is the root of a mount of the
   caller's namespace (`EINVAL`), the flags a copy into a less privileged

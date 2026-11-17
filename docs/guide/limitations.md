@@ -551,8 +551,10 @@ verified.
 - **mount and umount2, in part**: `mount` makes only tmpfs and bind mounts;
   any other type is `ENODEV`, as from a kernel without it. Once Linux's
   checks before them pass, `MS_NOSYMFOLLOW` on a tmpfs or set by a
-  remount, and a mount on, a bind mount of or a move of the generated
-  `/proc` or `/dev` (or a file in them) give `EOPNOTSUPP`, so a program
+  remount, a mount on or a move of the generated `/proc` or `/dev` (or a
+  file in them), and a bind mount of a directory there or of a
+  descriptor's link to a file no path names, give `EOPNOTSUPP`, so a
+  program
   learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
   (new in Linux master), `move_mount`'s `MOVE_MOUNT_BENEATH`, `fsmount`'s
   `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
@@ -567,7 +569,9 @@ verified.
   is for one alone in its anonymous namespace, and finds a mount by where
   its file now is, in the caller's namespace, where Linux takes the
   file's own mount (one opened before a `setns` is looked for in the
-  namespace the caller is in now). A file system context makes
+  namespace the caller is in now). A file a bind mount of a generated
+  file shows has, in `statx` and `/proc/self/fdinfo`, the mount ID of
+  `/dev` or `/proc`, not the bind mount's. A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its
   parameters and of a reconfiguration; one of a superblock from start-up
   takes only the common flags (`ro`, `sync`, ...). A context keeps its

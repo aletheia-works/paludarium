@@ -353,6 +353,98 @@ fn a_file_binds_onto_a_file_only() {
     assert_eq!(&*fs.read_file(b"/tmp/g").unwrap(), b"gee");
 }
 
+/// `/dev/null`, as the kernel tells of it to a bind mount of it.
+fn null() -> GeneratedSource {
+    GeneratedSource {
+        kind: "devtmpfs",
+        device: 5,
+        base: b"/dev".to_vec(),
+        path: b"/null".to_vec(),
+        stat: FileStat {
+            inode: 4,
+            mode: 0o020_666,
+            rdev: 0x103,
+            links: 1,
+            ..FileStat::default()
+        },
+        flags: mount_flags::NOSUID | mount_flags::RELATIME,
+    }
+}
+
+#[test]
+fn a_bind_mount_of_a_generated_file_leads_the_kernel_to_it() {
+    let (lower, fs) = machine();
+    assert_eq!(fs.generated(b"/tmp/f", true), None);
+    // A file on a file only, and none of a directory yet.
+    assert_eq!(fs.bind_generated(null(), b"/tmp/m"), Err(Errno::ENOTDIR));
+    let directory = GeneratedSource {
+        path: b"/".to_vec(),
+        stat: FileStat {
+            mode: 0o040_755,
+            ..FileStat::default()
+        },
+        ..null()
+    };
+    assert_eq!(
+        fs.bind_generated(directory, b"/tmp/m"),
+        Err(Errno::EOPNOTSUPP)
+    );
+    fs.bind_generated(null(), b"/tmp/f").unwrap();
+    assert_eq!(
+        fs.generated(b"/tmp/f", false),
+        Some((b"/dev/null".to_vec(), b"/tmp/f".to_vec()))
+    );
+    assert_eq!(
+        fs.generated(b"/tmp/m/../f", false),
+        Some((b"/dev/null".to_vec(), b"/tmp/f".to_vec()))
+    );
+    assert_eq!(fs.generated(b"/tmp/f/x", false), None);
+    // A link to it leads there only when it is followed.
+    fs.symlink(b"/tmp/f", b"/tmp/l").unwrap();
+    assert_eq!(fs.generated(b"/tmp/l", false), None);
+    assert_eq!(
+        fs.generated(b"/tmp/l", true),
+        Some((b"/dev/null".to_vec(), b"/tmp/f".to_vec()))
+    );
+    assert_eq!(fs.metadata(b"/tmp/f", true).unwrap().rdev, 0x103);
+    // The name is the mount's place.
+    assert_eq!(fs.unlink(b"/tmp/f", false), Err(EBUSY));
+    let mount = fs
+        .mounts()
+        .into_iter()
+        .find(|m| m.path == b"/tmp/f")
+        .unwrap();
+    assert_eq!((mount.kind, mount.device), ("devtmpfs", 5));
+    assert_eq!(mount.root, b"/null");
+    // A bind mount of it is another of the file; a copy of the table has it.
+    fs.open(b"/tmp/g", 66, 0o644).unwrap();
+    fs.bind(b"/tmp/f", b"/tmp/g", false).unwrap();
+    assert_eq!(
+        fs.generated(b"/tmp/g", false),
+        Some((b"/dev/null".to_vec(), b"/tmp/g".to_vec()))
+    );
+    let copy = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(true));
+    assert!(copy.generated(b"/tmp/f", false).is_some());
+    let id = fs.target(b"/tmp/f").unwrap().id;
+    fs.umount(id, false).unwrap();
+    assert_eq!(fs.generated(b"/tmp/f", false), None);
+    assert_eq!(&*fs.read_file(b"/tmp/f").unwrap(), b"out");
+}
+
+#[test]
+fn a_bind_mount_of_a_generated_file_keeps_its_locks_in_a_locked_copy() {
+    let (lower, fs) = machine();
+    let locked = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(true));
+    locked.bind_generated(null(), b"/tmp/f").unwrap();
+    use mount_flags::*;
+    assert_eq!(
+        locked.target(b"/tmp/f").unwrap().locks,
+        LOCK_ATIME | LOCK_NOSUID
+    );
+    fs.bind_generated(null(), b"/tmp/f").unwrap();
+    assert_eq!(fs.target(b"/tmp/f").unwrap().locks, 0);
+}
+
 #[test]
 fn a_recursive_bind_copies_the_mounts_below() {
     let (_, fs) = machine();

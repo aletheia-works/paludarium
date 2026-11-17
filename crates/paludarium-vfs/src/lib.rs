@@ -648,8 +648,9 @@ pub use mount::MountedFs;
 
 mod namespace;
 pub use namespace::{
-    FIRST_NAMESPACE_ID, InUse, MountPin, MountTable, NamespacedFs, NewTmpfs, Propagation, Reach,
-    ReleaseHook, Settings, Target, UNIQUE_OFFSET, UnmountHook, keeping_expiry, mount_flags,
+    FIRST_NAMESPACE_ID, GeneratedSource, InUse, MountPin, MountTable, NamespacedFs, NewTmpfs,
+    Propagation, Reach, ReleaseHook, Settings, Target, UNIQUE_OFFSET, UnmountHook, keeping_expiry,
+    mount_flags,
 };
 
 mod open_file;

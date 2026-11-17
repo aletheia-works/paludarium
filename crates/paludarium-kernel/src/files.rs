@@ -35,6 +35,10 @@ pub(crate) struct Descriptor {
     /// (`LANDLOCK_ACCESS_FS_TRUNCATE`), all of them unless a Landlock domain
     /// opened it ([`crate::landlock::open`]).
     pub(crate) landlock: u64,
+    /// Where a file the kernel generates was opened through a bind mount
+    /// of it, which its link in `/proc/self/fd` reads, as Linux's `d_path`
+    /// names the mount's place; `path` is still the file's own.
+    pub(crate) shown: Option<Vec<u8>>,
 }
 /// The names a directory's position has passed, in the order they came. The
 /// position counts these and not places in the listing, which a later call
@@ -90,6 +94,7 @@ impl Descriptor {
             opened: false,
             listed: Arc::default(),
             landlock: crate::landlock::FS,
+            shown: None,
         }
     }
     /// The descriptor a process gets for this one's open file over
@@ -676,6 +681,7 @@ impl Files {
     ) -> Result<u32, Errno> {
         self.allocate(
             Descriptor {
+                shown: None,
                 file,
                 path: Vec::new(),
                 cloexec,
@@ -698,6 +704,7 @@ impl Files {
     ) -> Result<u32, Errno> {
         self.allocate(
             Descriptor {
+                shown: None,
                 file,
                 path,
                 cloexec,
@@ -737,6 +744,7 @@ impl Files {
             fds.insert(
                 n,
                 Descriptor {
+                    shown: None,
                     file,
                     path,
                     cloexec,
@@ -774,6 +782,7 @@ impl Files {
         self.fill(
             n,
             Descriptor {
+                shown: None,
                 file,
                 path,
                 cloexec,
@@ -810,6 +819,7 @@ impl Files {
                 .insert(
                     channel,
                     Descriptor {
+                        shown: None,
                         file: Arc::new(StandardFile::new(&host, channel)),
                         path: Vec::new(),
                         cloexec: false,
@@ -865,7 +875,27 @@ impl Files {
     /// root ([`Self::root`]). Under a root other than the machine's, a path
     /// whose `..` would leave the root as written stops there, as Linux's
     /// walk does at `fs->root`, so no check of the text sees a name above it.
+    /// A path into a bind mount of a file the kernel generates is that
+    /// file's own path ([`Self::through_generated`]), its last link not
+    /// followed.
     pub(crate) fn path(&self, dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
+        let p = self.named(dir, p)?;
+        Ok(self
+            .through_generated(&p, false)
+            .map_or(p, |(file, _)| file))
+    }
+    /// Where the kernel finds the file at `p`, a path from the machine's
+    /// root (its last link followed with `follow`), when a bind mount
+    /// shows a file it generates there: that file's own path (`/dev/null`
+    /// for a file it was bound onto) and the place that names it, none
+    /// for any other path.
+    pub(crate) fn through_generated(&self, p: &[u8], follow: bool) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.namespaced().generated(p, follow)
+    }
+    /// [`Self::path`] as written, a bind mount's place itself and not the
+    /// file it shows: the name an unlink or a rename takes away, which a
+    /// mount on it keeps (`EBUSY`).
+    pub(crate) fn named(&self, dir: u64, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
         let root = self.root();
         let joined = self.joined(&root, dir, p)?;
         if root == b"/" {
@@ -1210,8 +1240,23 @@ fn lookup(
     follow: bool,
 ) -> Result<(Vec<u8>, crate::permissions::Found), Errno> {
     let p = c.files.path(dir, raw.clone())?;
+    let p = match follow {
+        true => c
+            .files
+            .through_generated(&p, true)
+            .map_or(p, |(file, _)| file),
+        false => p,
+    };
     let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
     Ok((p, found))
+}
+/// [`lookup`] of the place `raw` names, a bind mount's own and not the
+/// file it shows, as `mount` and `umount2` find a mount
+/// ([`Files::named`]).
+fn lookup_named(c: &Context<'_>, dir: u64, raw: Vec<u8>, follow: bool) -> Result<Vec<u8>, Errno> {
+    let p = c.files.named(dir, raw.clone())?;
+    crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
+    Ok(p)
 }
 /// The target of `mount` or `umount2` at `ptr`, as `user_path_at` finds it
 /// (search permission on the way, then the file; its last link followed
@@ -1251,6 +1296,69 @@ pub(crate) fn mount_directory(c: &Context<'_>, ptr: u64) -> Result<Option<Vec<u8
     }
     Ok(found)
 }
+/// What a bind mount of the file the kernel generates at `raw` shows, as
+/// `kern_path` finds a bind mount's source in `/dev` or `/proc`, its links
+/// followed (`/proc/self` to the caller's own directory): its file system
+/// (procfs, devpts, mqueue or devtmpfs, with the flags Linux mounts each
+/// with), its path there and its `stat`; `ENOENT` for one that is not
+/// there. A descriptor's link to a file no path names is not supported
+/// (`EOPNOTSUPP`).
+pub(crate) fn generated_source(
+    c: &Context<'_>,
+    raw: Vec<u8>,
+) -> Result<paludarium_vfs::GeneratedSource, Errno> {
+    use paludarium_vfs::mount_flags as mnt;
+    let p = lookup(c, (-100i32) as u64, raw, true)?.0;
+    let p = match followed(c, &p, true)? {
+        Some(Followed::Path { path, .. }) => path,
+        Some(Followed::File(_)) => return Err(Errno::EOPNOTSUPP),
+        None => p,
+    };
+    let p = paludarium_vfs::normalize_path(&p)?;
+    let own = |name: &[u8], to: String| {
+        p.strip_prefix(name)
+            .filter(|rest| rest.is_empty() || rest[0] == b'/')
+            .map(|rest| [to.as_bytes(), rest].concat())
+    };
+    let p = own(b"/proc/self", format!("/proc/{}", c.process.pid))
+        .or_else(|| {
+            own(
+                b"/proc/thread-self",
+                format!("/proc/{}/task/{}", c.process.pid, c.tid),
+            )
+        })
+        .unwrap_or(p);
+    let (stat, device, _) = generated_stat(c, &p, true)?.ok_or(Errno::ENOENT)?;
+    let under = |base: &[u8]| {
+        p.strip_prefix(base)
+            .filter(|rest| rest.is_empty() || rest[0] == b'/')
+            .map(|rest| {
+                if rest.is_empty() {
+                    b"/".to_vec()
+                } else {
+                    rest.to_vec()
+                }
+            })
+    };
+    let quiet = mnt::NOSUID | mnt::NOEXEC | mnt::RELATIME;
+    let (kind, base, flags) = [
+        ("proc", &b"/proc"[..], quiet | mnt::NODEV),
+        ("devpts", b"/dev/pts", quiet),
+        ("mqueue", b"/dev/mqueue", quiet | mnt::NODEV),
+        ("devtmpfs", b"/dev", mnt::NOSUID | mnt::RELATIME),
+    ]
+    .into_iter()
+    .find(|(_, base, _)| under(base).is_some())
+    .ok_or(Errno::ENOENT)?;
+    Ok(paludarium_vfs::GeneratedSource {
+        kind,
+        device,
+        base: base.to_vec(),
+        path: under(base).unwrap_or_default(),
+        stat,
+        flags,
+    })
+}
 /// [`mount_target`] of the path `raw`, as `kern_path` finds a bind mount's
 /// source.
 pub(crate) fn mount_path(
@@ -1288,7 +1396,7 @@ fn mount_path_in(
     raw: Vec<u8>,
     follow: bool,
 ) -> Result<Option<Vec<u8>>, Errno> {
-    let p = lookup(c, dir, raw, follow)?.0;
+    let p = lookup_named(c, dir, raw, follow)?;
     let p = match followed(c, &p, follow)? {
         Some(Followed::Path { path, .. }) => path,
         Some(Followed::File(d)) => d.path,
@@ -1877,7 +1985,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
     if !(old_raw.is_empty() && flags & AT_EMPTY_PATH != 0) {
         let new_raw = path(c, new_ptr)?;
         let old_name = queue_name(&c.files.path(old_dir, old_raw.clone())?);
-        let new_name = queue_name(&c.files.path(new_dir, new_raw.clone())?);
+        let new_name = queue_name(&c.files.named(new_dir, new_raw.clone())?);
         if old_name.is_some() || new_name.is_some() {
             return link_queue(
                 c,
@@ -1893,7 +2001,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
         let d = c.files.descriptor(old_dir)?;
         if crate::mqueue::is_queue(&*d.file) {
             let new_raw = path(c, new_ptr)?;
-            let new = c.files.path(new_dir, new_raw.clone())?;
+            let new = c.files.named(new_dir, new_raw.clone())?;
             let name = queue_name(&new);
             match &name {
                 Some(name) if crate::mqueue::mounted_there(c, name)? => {
@@ -1934,7 +2042,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
         }
     };
     let new_raw = path(c, new_ptr)?;
-    let new = c.files.path(new_dir, new_raw.clone())?;
+    let new = c.files.named(new_dir, new_raw.clone())?;
     let old = match target {
         Followed::Path { path, follow: true } => resolved(c.files, &path).unwrap_or(path),
         Followed::Path { path, .. } => path,
@@ -4641,6 +4749,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             .seek(a[1] as i64, a[2] as u32),
         32 => {
             let d = Descriptor {
+                shown: None,
                 cloexec: false,
                 ..c.files.descriptor(a[0])?
             };
@@ -4660,6 +4769,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return Err(Errno::EBADF);
             }
             let d = Descriptor {
+                shown: None,
                 cloexec: n == 292 && a[2] & 0x80000 != 0,
                 ..c.files.descriptor(u64::from(old))?
             };
@@ -4951,8 +5061,8 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 ((a[0], path(c, a[1])?), (a[2], path(c, a[3])?))
             };
-            let old = c.files.path(old_dir, old_raw.clone())?;
-            let new = c.files.path(new_dir, new_raw.clone())?;
+            let old = c.files.named(old_dir, old_raw.clone())?;
+            let new = c.files.named(new_dir, new_raw.clone())?;
             let names = (queue_name(&old), queue_name(&new));
             if names.0.is_some() || names.1.is_some() {
                 let walks = ((old_dir, &old_raw[..]), (new_dir, &new_raw[..]));
@@ -5029,7 +5139,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 (a[0], path(c, a[1])?, a[2])
             };
-            let p = c.files.path(dir, raw.clone())?;
+            let p = c.files.named(dir, raw.clone())?;
             if queue_root(&p) {
                 return Err(Errno::EEXIST);
             }
@@ -5067,7 +5177,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 ((-100i32) as u64, path(c, a[0])?, n == 84)
             };
-            let p = c.files.path(at_dir, raw.clone())?;
+            let p = c.files.named(at_dir, raw.clone())?;
             if let Some(name) = paludarium_vfs::normalize_path(&p)
                 .ok()
                 .as_deref()
@@ -5103,7 +5213,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             } else {
                 (a[1], path(c, a[2])?)
             };
-            let p = c.files.path(dir, raw.clone())?;
+            let p = c.files.named(dir, raw.clone())?;
             if queue_root(&p) {
                 return Err(Errno::EEXIST);
             }
@@ -5925,6 +6035,7 @@ mod files_tests {
     }
     fn d(fs: &MemFs, p: &[u8]) -> Descriptor {
         Descriptor {
+            shown: None,
             file: fs.open(p, 66, 0o600).unwrap(),
             path: p.to_vec(),
             cloexec: false,
@@ -5987,6 +6098,7 @@ mod files_tests {
         f.fill(
             1,
             Descriptor {
+                shown: None,
                 cloexec: true,
                 ..d(&fs, b"/closed")
             },
@@ -6089,17 +6201,25 @@ pub(crate) fn open_at(
     mode: u32,
     resolve: u64,
 ) -> Result<u64, Errno> {
-    let p = c.files.path(dir, raw.clone())?;
+    let p = c.files.named(dir, raw.clone())?;
     let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
     if flags & 3 == 3 {
         return Err(Errno::EINVAL);
     }
+    // A file the kernel generates, through a bind mount of it: its own
+    // path, and the place its link in `/proc/self/fd` names.
+    const O_NOFOLLOW: u32 = 0o400000;
+    let (p, mut shown) = match c.files.through_generated(&p, flags & O_NOFOLLOW == 0) {
+        Some((file, shown)) => (file, Some(shown)),
+        None => (p, None),
+    };
     // The walk of `openat2` with `RESOLVE_*` flags, which ends at a path
     // the rest of the open takes as it is.
     let (dir, raw, p) = if resolve == 0 {
         (dir, raw, p)
     } else {
         let p = resolve_scoped(c, dir, &raw, flags, resolve)?;
+        shown = None;
         ((-100i32) as u64, p.clone(), p)
     };
     // Linux takes the descriptor before it opens, so with none free
@@ -6135,6 +6255,7 @@ pub(crate) fn open_at(
             c.files.fill(
                 fd,
                 Descriptor {
+                    shown,
                     file,
                     path,
                     cloexec,
@@ -7400,6 +7521,7 @@ fn reached(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, 
     }
     if queue_root(p) {
         return Ok(Some(Followed::File(Descriptor {
+            shown: None,
             file: Arc::new(crate::mqueue::MountedRoot::new(c)),
             path: b"/dev/mqueue".to_vec(),
             cloexec: false,
@@ -7413,6 +7535,7 @@ fn reached(c: &Context<'_>, p: &[u8], follow: bool) -> Result<Option<Followed>, 
     };
     let file = crate::mqueue::mounted_file(c, &name)?;
     Ok(Some(Followed::File(Descriptor {
+        shown: None,
         file,
         path: p.to_vec(),
         cloexec: false,
@@ -7493,6 +7616,7 @@ fn named_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
         _ if d.path == b"/proc/self" && any.is_some_and(|v| v.is::<LinkPath>()) => {
             b"/proc/self".to_vec()
         }
+        _ if let Some(shown) = &d.shown => shown.clone(),
         _ if generated(&d.path) => h.generated(&d.path),
         // The descriptor of a symbolic link itself names the link.
         _ if any.is_some_and(|v| v.is::<LinkPath>()) => {
@@ -8018,7 +8142,7 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
         kind,
         0 | 0o100000 | 0o010000 | 0o140000 | 0o020000 | 0o060000
     ) {
-        let p = c.files.path(dir, raw.to_vec())?;
+        let p = c.files.named(dir, raw.to_vec())?;
         if queue_root(&p) {
             return Err(Errno::EEXIST);
         }
@@ -8038,7 +8162,7 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
             // `filename_create`'s EROFS comes before `vfs_mknod`'s EPERM.
             crate::permissions::want_write_new(c.files, dir, raw, false)?;
             if c.process.credentials.landlock != Default::default() {
-                let p = c.files.path(dir, raw.to_vec())?;
+                let p = c.files.named(dir, raw.to_vec())?;
                 if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
                     landlock_name(c, &p, crate::landlock::make_access(kind, u64::from(dev)))?;
                 }
@@ -8048,7 +8172,7 @@ fn mknod(c: &mut Context<'_>, dir: u64, raw: &[u8], mode: u32, dev: u32) -> Resu
         0o040000 => return Err(Errno::EPERM),
         _ => return Err(Errno::EINVAL),
     }
-    let p = c.files.path(dir, raw.to_vec())?;
+    let p = c.files.named(dir, raw.to_vec())?;
     let created = crate::permissions::create(c.files, &c.process.credentials, dir, raw, false)?;
     if landlock_named(c, &p).is_some_and(|(_, there)| there.is_none()) {
         landlock_name(c, &p, crate::landlock::make_access(kind, 0))?;

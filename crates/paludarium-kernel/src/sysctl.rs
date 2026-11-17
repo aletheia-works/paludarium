@@ -906,11 +906,9 @@ impl NetFile {
     ///   `CAP_NET_ADMIN`, then takes an `int` as `proc_dointvec` does.
     /// - `rp_filter` (`devinet_conf_proc`) takes one so, and marks the
     ///   device as set whatever comes of it.
-    /// - IPv6's (`addrconf_sysctl_disable`, `addrconf_sysctl_forward`)
-    ///   read one so but never fail: a bad one leaves the value, and the
-    ///   write takes it all without moving the position; and `forwarding`
-    ///   of `all` or a device returns 1 and leaves the position, as
-    ///   `addrconf_fixup_forwarding` returns 1.
+    /// - IPv6's (`addrconf_sysctl_disable`, `addrconf_sysctl_forward`) take
+    ///   one so too, as Linux master's handlers do (7.0's left a bad value
+    ///   unreported, and had `forwarding` of `all` or a device return 1).
     fn take(&self, buf: &[u8], position: &mut u64, net_admin: bool) -> Result<usize, Errno> {
         // `proc_first_pos_non_zero_ignore`: past the start, a write is
         // taken whole and sets nothing.
@@ -954,17 +952,16 @@ impl NetFile {
                 }
             }
             Net::DisableIpv6(target) | Net::Forwarding6(target) => {
-                let old = net_value(&self.network, self.file);
+                // `proc_dointvec`'s error first, as Linux master's handlers
+                // (and the CI kernel's) return it; past the start, the value
+                // as it was.
                 let (value, taken) = match parsed {
                     Ok((value, consumed)) => (value, consumed),
-                    Err(true) => (old, buf.len()),
-                    Err(false) => (old, 0),
+                    Err(true) => (net_value(&self.network, self.file), buf.len()),
+                    Err(false) => return Err(Errno::EINVAL),
                 };
                 if let Net::Forwarding6(_) = self.file {
                     crate::netconf::set_forwarding6(&mut self.network.devices(), target, value);
-                    if target != Target::Default {
-                        return Ok(1);
-                    }
                 } else {
                     let changed = crate::netconf::set_disable_ipv6(
                         &mut self.network.devices(),
@@ -985,8 +982,7 @@ impl NetFile {
                         }
                     }
                 }
-                *position += taken as u64;
-                Ok(if taken == 0 { buf.len() } else { taken })
+                advance(position, taken)
             }
         }
     }

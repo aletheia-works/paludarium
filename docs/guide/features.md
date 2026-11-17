@@ -2944,9 +2944,10 @@ kernel.
   - `rp_filter` set on a device stays its own; one set on `default` goes
     to every device that has not been set, even by a write that failed
     (`devinet_conf_proc`).
-  - IPv6's two never fail: a bad value is left as it was and the write
-    takes everything; `forwarding` of `all` or of a device returns 1 and
-    leaves the position, as `addrconf_sysctl_forward` does. `all`'s sets
+  - IPv6's two report a bad value (`EINVAL`), as Linux master's
+    `addrconf_sysctl_forward` and `addrconf_sysctl_disable` do and the CI
+    kernel does (7.0's left it unreported and had `forwarding` of `all` or
+    a device return 1). `all`'s sets
     `default`'s and every device's. A device whose `disable_ipv6` turns
     on loses its IPv6 addresses and routes, told of as when it goes down
     (`addrconf_ifdown`); turning off while it is up gives `::1` back, and

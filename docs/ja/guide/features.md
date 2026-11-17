@@ -2552,9 +2552,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - デバイスに設定した `rp_filter` はそのデバイスのものになります。`default` に設定すると、
     まだ設定していないすべてのデバイスに及びます。失敗した書き込みでも、設定したことに
     なります（`devinet_conf_proc`）。
-  - IPv6 の 2 つは失敗しません。正しくない値では値は変わらず、書き込みは全部を取ります。
-    `all` かデバイスの `forwarding` は、`addrconf_sysctl_forward` と同じく 1 を返し、
-    位置を動かしません。`all` のものは `default` とすべてのデバイスのものを変えます。
+  - IPv6 の 2 つは、Linux master の `addrconf_sysctl_forward` と `addrconf_sysctl_disable`、
+    そして CI のカーネルと同じく、正しくない値を `EINVAL` で知らせます（7.0 は知らせず、
+    `all` かデバイスの `forwarding` は 1 を返しました）。`all` のものは `default` とすべてのデバイスのものを変えます。
     デバイスの `disable_ipv6` を入れると、そのデバイスは IPv6 のアドレスと経路を失い、
     落ちたときと同じく知らせます（`addrconf_ifdown`）。上がっている間に切ると、
     `NETDEV_UP` と同じく `::1` が戻り、IPv6 自身の `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を

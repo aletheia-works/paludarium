@@ -857,7 +857,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   作られたアドレス空間のものです。`UFFDIO_API` はバージョンと機能を一度だけ受け取り
   （2 度目は `EINVAL`）、提供する機能と ioctl を書き戻します。失敗したときは 0 を
   書きます。提供する機能は `UFFD_FEATURE_PAGEFAULT_FLAG_WP`、`UFFD_FEATURE_SIGBUS`、
-  `UFFD_FEATURE_THREAD_ID`、
+  `UFFD_FEATURE_THREAD_ID`、`UFFD_FEATURE_MINOR_SHMEM`、
+  `UFFD_FEATURE_MINOR_HUGETLBFS`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
   `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で、
   `UFFD_FEATURE_EVENT_FORK` には
@@ -865,7 +866,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   メモリ、共有の anonymous メモリ、shmem の memfd（Linux が VMA を shmem のものと
   数えない System V の共有メモリは除きます）の共有または
   プライベートなマッピングを、ないページについて登録し
-  （`UFFDIO_REGISTER_MODE_MISSING`）、プライベートな anonymous メモリを書き込み保護に
+  （`UFFDIO_REGISTER_MODE_MISSING`）、shmem（共有の anonymous メモリと memfd の
+  マッピング）をマイナーフォールトについて登録し（`UFFDIO_REGISTER_MODE_MINOR`。示す
+  ioctl に `UFFDIO_CONTINUE` が、`smaps` に `ui` が加わります）、プライベートな anonymous メモリを書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
   が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
   ものは `EINVAL`、ファイルに書き込めない共有のものは `EPERM`、ほかの `userfaultfd` の
@@ -914,7 +917,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   poison は `mprotect` と `UFFDIO_UNREGISTER` では残り、`mremap` では一緒に動き、
   `fork` した子には、プライベートなメモリでは引き継がれ、共有メモリでは引き継がれず、
   `MADV_DONTNEED`、`MADV_FREE`、`MADV_GUARD_INSTALL`（ガードに置き換わります）、
-  `munmap` で消えます。`UFFDIO_MOVE` は、Linux の `move_pages` と同じく、
+  `munmap` で消えます。マイナーフォールトは、Linux の `shmem_get_folio_gfp` が
+  フォリオを見つけて `handle_userfault` が `VM_UFFD_MINOR` を取るのと同じく、ページ
+  キャッシュにあるのにマッピングにエントリーのない shmem のページへのアクセスです。
+  メッセージには `UFFD_PAGEFAULT_FLAG_MINOR` が入り、範囲がないページについても
+  登録されていなければ、穴はそのまま取り込みます。`UFFDIO_CONTINUE` は
+  `mfill_atomic_pte_continue` と同じく、ページキャッシュのページを 1 ページずつ範囲に
+  対応付けます。shmem でないメモリ、`DONTWAKE` と `WP`（書き込み保護のモードが要ります）
+  以外のモード、ファイルの終わりより先のページは `EINVAL`、ページキャッシュにない
+  ページは `EFAULT`、マッピングにあるページは `EEXIST` です。プライベートな
+  マッピングは、`mfill_atomic_install_pte` が読み出し専用で対応付けるので、書き込む
+  までそのページを見せます。`UFFDIO_MOVE` は、Linux の `move_pages` と同じく、
   コンテキスト自身のアドレス空間（ほかの空間からは `EINVAL`）のプライベートな
   anonymous のページを、登録した範囲へ動かします。`UFFD_FEATURE_MOVE` を求めたか
   どうかは問いません。それぞれの先頭が VMA にあること（`ENOENT`）、どちらの VMA も

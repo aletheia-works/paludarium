@@ -60,8 +60,7 @@ verified.
   those that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
-  `ui` (`userfaultfd`'s minor mode, which is not offered), and no `ht` or
-  `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
+  `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
 - **Writing `comm`**: a write to `/proc/<pid>/comm` or
   `/proc/<pid>/task/<tid>/comm` is `EINVAL`, where Linux renames the thread
   when the writer is of its process (musl's `pthread_setname_np` of another
@@ -710,14 +709,13 @@ verified.
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages and the write protection of
-  private anonymous memory are registered. The minor mode is refused
-  (`EINVAL`), as is the write-protect mode for shmem (shared anonymous
+  private anonymous memory, and the minor faults of shmem, are
+  registered. The write-protect mode for shmem (shared anonymous
   memory and a shmem file's mappings, private ones too), which Linux
-  takes, and `UFFDIO_CONTINUE` is not offered (`EINVAL`), nor the events
+  takes, is refused (`EINVAL`), and not offered are the events
   of `fork`, `mremap`, `madvise` and `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
   `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
-  `UFFDIO_API` does not report and refuses (`EINVAL`); the ioctls
-  `UFFDIO_REGISTER` and `fdinfo` report leave them out too. A
+  `UFFDIO_API` does not report and refuses (`EINVAL`). A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
   Of shmem's files only a memfd is registered: a tmpfs file

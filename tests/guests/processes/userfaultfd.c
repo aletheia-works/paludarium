@@ -18,7 +18,9 @@
    guards at either end; and a memfd's mappings: shared and private, a
    hole that waits and a page the file has, fills that reach the file or
    do not, the end of the file, and the mappings that cannot be
-   registered (one that may not write the file, System V shared memory).
+   registered (one that may not write the file, System V shared memory);
+   and the minor mode: a memfd's page the page cache has waits until
+   UFFDIO_CONTINUE maps it, its errors, and a private mapping of it.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
    whether they are the faulting thread's. Of what UFFDIO_API and
@@ -56,6 +58,8 @@
 #define UFFD_FEATURE_EXACT_ADDRESS (1ULL << 11)
 #define UFFD_FEATURE_POISON (1ULL << 14)
 #define UFFD_FEATURE_MOVE (1ULL << 16)
+#define UFFD_FEATURE_MINOR_SHMEM (1ULL << 10)
+#define UFFD_PAGEFAULT_FLAG_MINOR 4
 #define UFFDIO_REGISTER_MODE_MISSING 1ULL
 #define UFFDIO_REGISTER_MODE_WP 2ULL
 #define UFFDIO_REGISTER_MODE_MINOR 4ULL
@@ -77,10 +81,14 @@
 #define UFFDIO_MOVE 0xc028aa05
 #define UFFDIO_WRITEPROTECT 0xc018aa06
 #define UFFDIO_POISON 0xc020aa08
+#define UFFDIO_CONTINUE 0xc020aa07
+#define UFFDIO_CONTINUE_MODE_DONTWAKE 1ULL
+#define UFFDIO_CONTINUE_MODE_WP 2ULL
 
 #define RANGE_IOCTLS ((1ULL << 2) | (1ULL << 3) | (1ULL << 4))
 #define WRITEPROTECT_IOCTL (1ULL << 6)
 #define POISON_IOCTL (1ULL << 8)
+#define CONTINUE_IOCTL (1ULL << 7)
 #define MOVE_IOCTL (1ULL << 5)
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22
@@ -118,6 +126,11 @@ struct uffdio_poison {
     struct uffdio_range range;
     uint64_t mode;
     int64_t updated;
+};
+struct uffdio_continue {
+    struct uffdio_range range;
+    uint64_t mode;
+    int64_t mapped;
 };
 struct uffdio_move {
     uint64_t dst, src, len, mode;
@@ -1084,6 +1097,78 @@ static int case_shmem(void) {
     return 0;
 }
 
+static long resume(int fd, void *at, size_t len, uint64_t mode, int64_t *done) {
+    struct uffdio_continue c = {{(uintptr_t)at, len}, mode, 0x5a5a};
+    long ret = ioctl(fd, UFFDIO_CONTINUE, &c);
+    if (done)
+        *done = c.mapped;
+    return ret;
+}
+
+/* The minor mode: a page shmem's page cache has, which the registered
+   mapping has not mapped, waits until UFFDIO_CONTINUE maps it; another
+   mapping of the memfd fills the page cache. */
+static int case_minor(void) {
+    int fd = uffd(O_NONBLOCK);
+    struct uffdio_api api = {UFFD_API, UFFD_FEATURE_MINOR_SHMEM, 0};
+    printf("api: %s", err(ioctl(fd, UFFDIO_API, &api)));
+    printf(" minor=%d\n", (api.features & UFFD_FEATURE_MINOR_SHMEM) != 0);
+    char *private_anon = anon(PAGE);
+    printf("private anonymous: %s\n",
+           err(reg(fd, private_anon, PAGE, UFFDIO_REGISTER_MODE_MINOR, NULL)));
+    int file = shmem_file(3);
+    char *writer = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    char *view = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    uint64_t ioctls = 0;
+    printf("register: %s", err(reg(fd, view, 4 * PAGE, UFFDIO_REGISTER_MODE_MINOR, &ioctls)));
+    printf(" continue=%d\n", (ioctls & CONTINUE_IOCTL) != 0);
+    vma("minor", view, view);
+
+    /* A page the file has waits. */
+    struct toucher t = {view + PAGE + 5, 0, 0, 0};
+    pthread_t thread;
+    pthread_create(&thread, NULL, touch, &t);
+    wait_message(fd);
+    message("minor fault", fd, view, 0);
+    writer[PAGE + 5] = 'n';
+    int64_t done;
+    printf("bad mode: %s\n", err(resume(fd, view + PAGE, PAGE, 4, NULL)));
+    printf("write-protecting: %s\n", err(resume(fd, view + PAGE, PAGE, UFFDIO_CONTINUE_MODE_WP, NULL)));
+    printf("continue: %s", err(resume(fd, view + PAGE, PAGE, 0, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    pthread_join(thread, NULL);
+    printf("seen: %c\n", t.seen);
+    printf("again: %s", err(resume(fd, view + PAGE, PAGE, 0, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    /* A hole is brought in; then the other mapping sees it. */
+    printf("hole: %d\n", view[7]);
+    view[8] = 'h';
+    printf("shared: %c\n", writer[8]);
+    printf("continue a hole: %s", err(resume(fd, view + 2 * PAGE, PAGE, 0, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    printf("past the end: %s", err(resume(fd, view + 3 * PAGE, PAGE, 0, &done)));
+    printf(" mapped=%lld\n", (long long)done);
+    writer[2 * PAGE] = 'q';
+    printf("continue, don't wake: %s\n",
+           err(resume(fd, view + 2 * PAGE, PAGE, UFFDIO_CONTINUE_MODE_DONTWAKE, NULL)));
+    printf("mapped: %c\n", view[2 * PAGE]);
+    printf("unregister: %s\n", err(unreg(fd, view, 4 * PAGE)));
+
+    /* A private mapping shows the page cache's page until it writes. */
+    char *private = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, file, 0);
+    printf("register private: %s\n",
+           err(reg(fd, private, 3 * PAGE, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_MINOR, NULL)));
+    t = (struct toucher){private + PAGE + 5, 1, 0, 0};
+    pthread_create(&thread, NULL, touch, &t);
+    wait_message(fd);
+    message("private minor fault", fd, private, 0);
+    printf("continue: %s\n", err(resume(fd, private + PAGE, PAGE, 0, NULL)));
+    pthread_join(thread, NULL);
+    printf("seen: %c, the file has: %c\n", t.seen, writer[PAGE + 5]);
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1096,6 +1181,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-wp")) return case_wp();
     if (!strcmp(mode, "userfaultfd-poison")) return case_poison();
     if (!strcmp(mode, "userfaultfd-shmem")) return case_shmem();
+    if (!strcmp(mode, "userfaultfd-minor")) return case_minor();
     if (!strcmp(mode, "userfaultfd-move")) return case_move();
     printf("unknown mode %s\n", mode);
     return 2;

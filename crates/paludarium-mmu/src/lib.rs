@@ -170,9 +170,22 @@ impl Userfault {
     /// `UFFDIO_REGISTER_MODE_WP` (`VM_UFFD_WP`): a write to a page
     /// `UFFDIO_WRITEPROTECT` protected faults to the `userfaultfd`.
     pub const WP: u8 = 2;
-    /// `UFFDIO_REGISTER_MODE_MINOR` (`VM_UFFD_MINOR`), which no mapping
-    /// takes here.
+    /// `UFFDIO_REGISTER_MODE_MINOR` (`VM_UFFD_MINOR`): an access to a page
+    /// of shmem that its page cache has but the mapping has no entry for
+    /// faults to the `userfaultfd`, which `UFFDIO_CONTINUE` maps it for.
     pub const MINOR: u8 = 4;
+}
+
+/// Why an access waits for a `userfaultfd` ([`AddressSpace::userfault_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserfaultReason {
+    /// The page has none ([`Userfault::MISSING`]).
+    Missing,
+    /// Shmem's page cache has the page, and the mapping no entry for it
+    /// ([`Userfault::MINOR`]).
+    Minor,
+    /// A write to a page `UFFDIO_WRITEPROTECT` protected ([`Userfault::WP`]).
+    Protected,
 }
 
 /// How a mapping is read ([`Mapping::read_hint`]).
@@ -207,6 +220,8 @@ pub mod vm {
     pub const DONTDUMP: u64 = 1 << 26;
     pub const UFFD_MISSING: u64 = 1 << 9;
     pub const UFFD_WP: u64 = 1 << 12;
+    /// `VM_UFFD_MINOR`, which `smaps` names `ui`.
+    pub const UFFD_MINOR: u64 = 1 << 41;
     pub const SOFTDIRTY: u64 = 1 << 27;
     pub const MIXEDMAP: u64 = 1 << 28;
     pub const HUGEPAGE: u64 = 1 << 29;
@@ -2823,7 +2838,7 @@ impl AddressSpaceData {
             // kernel takes the fault of an instruction, and a system call's
             // copy is `EFAULT`, as with `UFFD_USER_MODE_ONLY`.
             if matches!(access, Access::Read | Access::Write | Access::Fetch)
-                && self.userfault_missing(directory, page).is_some()
+                && self.userfault_waits(directory, page).is_some()
             {
                 return Err(Fault {
                     mapped: true,
@@ -3310,6 +3325,10 @@ impl AddressSpaceData {
             | bit(
                 m.userfault.is_some_and(|u| u.modes & Userfault::WP != 0),
                 vm::UFFD_WP,
+            )
+            | bit(
+                m.userfault.is_some_and(|u| u.modes & Userfault::MINOR != 0),
+                vm::UFFD_MINOR,
             );
         for piece in pieces {
             flags |= bit(piece.maybe_guard, vm::MAYBE_GUARD)
@@ -4022,28 +4041,36 @@ impl AddressSpaceData {
     /// `vma_can_userfault` allows anonymous memory and shmem: private
     /// memory of no file; shared memory of none (`MAP_SHARED |
     /// MAP_ANONYMOUS`), which Linux keeps in shmem; and a shared or private
-    /// mapping of a shmem file ([`PageSource::shmem`]: a tmpfs file, a
-    /// memfd), not System V shared memory, whose VMAs are not shmem's.
-    /// Here none takes [`Userfault::MINOR`], which Linux allows shmem, and
-    /// only private anonymous memory [`Userfault::WP`], whose markers on
-    /// pages shmem has no entry for are not kept.
+    /// mapping of a shmem file ([`PageSource::shmem`]: a memfd), not
+    /// System V shared memory, whose VMAs are not shmem's. Only shmem takes
+    /// [`Userfault::MINOR`], as Linux's does, and only private anonymous
+    /// memory [`Userfault::WP`], whose markers on pages shmem has no entry
+    /// for are not kept here.
     fn userfault_capable(&self, m: &Mapping, modes: u8) -> bool {
-        if modes & Userfault::MINOR != 0 {
-            return false;
+        if self.shmem_at(m.start.0) {
+            return modes & Userfault::WP == 0;
         }
-        let shmem = |source: &Arc<dyn PageSource>| source.shmem() && modes & Userfault::WP == 0;
-        match self.shared_at(m.start.0) {
-            Some(shared) => match &shared.pages.source {
-                None => modes & Userfault::WP == 0,
-                Some(source) => shmem(source),
-            },
-            None => match self.backing_at(m.start.0) {
-                None => matches!(
-                    m.kind,
-                    MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
-                ),
-                Some(backing) => m.kind == MappingKind::File && shmem(&backing.source),
-            },
+        modes & Userfault::MINOR == 0
+            && self.shared_at(m.start.0).is_none()
+            && self.backing_at(m.start.0).is_none()
+            && matches!(
+                m.kind,
+                MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
+            )
+    }
+
+    /// Whether the mapping at `page` is shmem's (Linux's `vma_is_shmem`):
+    /// shared memory of no file, or a shared or private mapping of a shmem
+    /// file ([`PageSource::shmem`]).
+    fn shmem_at(&self, page: u64) -> bool {
+        match self.shared_at(page) {
+            Some(shared) => shared.pages.source.as_ref().is_none_or(|s| s.shmem()),
+            None => self.backing_at(page).is_some_and(|backing| {
+                backing.source.shmem()
+                    && self
+                        .mapping_at(page)
+                        .is_some_and(|m| m.kind == MappingKind::File)
+            }),
         }
     }
 
@@ -4061,6 +4088,29 @@ impl AddressSpaceData {
             || self
                 .file_at(page)
                 .is_some_and(|(source, offset)| source.holds(offset))
+    }
+
+    /// The `userfaultfd` an access to `page` waits for, and why: a missing
+    /// page ([`Self::userfault_missing`]), or one of shmem that the
+    /// mapping registered for minor faults has no entry for, though the
+    /// page cache has it, as `shmem_get_folio_gfp` finds the folio and
+    /// `userfaultfd_minor`, past the end of the file first.
+    fn userfault_waits(&self, directory: &Directory, page: u64) -> Option<(u64, UserfaultReason)> {
+        if let Some(context) = self.userfault_missing(directory, page) {
+            return Some((context, UserfaultReason::Missing));
+        }
+        let registration = self
+            .mapping_at(page)?
+            .userfault
+            .filter(|u| u.modes & Userfault::MINOR != 0)?;
+        if lookup(directory, page).is_some()
+            || self.poisoned(page)
+            || self.past_file_end(page)
+            || !self.shmem_holds(page)
+        {
+            return None;
+        }
+        Some((registration.context, UserfaultReason::Minor))
     }
 
     /// The `userfaultfd` an access to `page` waits for: the page is of a
@@ -4085,10 +4135,11 @@ impl AddressSpaceData {
     }
 
     /// The `userfaultfd` an access to the page at `addr` waits for
-    /// ([`Self::userfault_missing`]).
+    /// ([`Self::userfault_waits`]).
     pub fn userfault_at(&self, addr: GuestAddr) -> Option<u64> {
         let page = addr.page_align_down().0;
-        self.userfault_missing(&self.read_directory(), page)
+        self.userfault_waits(&self.read_directory(), page)
+            .map(|(context, _)| context)
     }
 
     /// The `userfaultfd` a failed access to `addr` (a write with `write`,
@@ -4099,7 +4150,12 @@ impl AddressSpaceData {
     /// of a page with no guard, that [`Self::userfault_at`] waits for. Any
     /// other is the CPU's fault, as Linux's `do_user_addr_fault` sends
     /// SIGSEGV for an `access_error` before it handles the fault.
-    pub fn userfault_for(&self, addr: GuestAddr, write: bool, fetch: bool) -> Option<(u64, bool)> {
+    pub fn userfault_for(
+        &self,
+        addr: GuestAddr,
+        write: bool,
+        fetch: bool,
+    ) -> Option<(u64, UserfaultReason)> {
         let page = addr.page_align_down().0;
         let access = if fetch {
             Access::Fetch
@@ -4119,7 +4175,7 @@ impl AddressSpaceData {
             && mapping.prot.contains(Prot::WRITE)
             && lookup(&directory, page).is_some_and(|p| p.uffd_wp)
         {
-            return Some((registration.context, true));
+            return Some((registration.context, UserfaultReason::Protected));
         }
         if !self
             .prot_at(&directory, page)
@@ -4127,8 +4183,7 @@ impl AddressSpaceData {
         {
             return None;
         }
-        self.userfault_missing(&directory, page)
-            .map(|context| (context, false))
+        self.userfault_waits(&directory, page)
     }
 
     /// Sets or clears the write protection of the pages of `[start, end)`
@@ -4413,6 +4468,39 @@ impl AddressSpaceData {
             return Err(Errno::EEXIST);
         }
         self.poisons.add(page, page + PAGE_SIZE);
+        Ok(())
+    }
+
+    /// One page of a `UFFDIO_CONTINUE` of `[start, end)`, at `page`, as
+    /// Linux's `mfill_atomic_pte_continue`: the range is checked as a
+    /// fill's ([`Self::userfault_target`]) and must be shmem's (`EINVAL`);
+    /// a page past the file's end is `EINVAL` (`shmem_get_folio` with
+    /// `SGP_NOALLOC`), one the page cache does not have `EFAULT`, and one
+    /// the mapping has an entry or a guard for `EEXIST`. The mapping then
+    /// shows the page cache's page, a private one until it writes it, and
+    /// a poison marker goes, as `mfill_atomic_install_pte` takes it.
+    pub fn userfault_continue(&mut self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
+        let mapping = self.userfault_target(start, end)?;
+        if !self.shmem_at(page) {
+            return Err(Errno::EINVAL);
+        }
+        if self.past_file_end(page) {
+            return Err(Errno::EINVAL);
+        }
+        if !self.shmem_holds(page) {
+            return Err(Errno::EFAULT);
+        }
+        let prot = self.mapping_at(page).map_or(mapping.prot, |m| m.prot);
+        let mut directory = self.write_directory();
+        if lookup(&directory, page).is_some() || self.guarded(page) {
+            return Err(Errno::EEXIST);
+        }
+        let entry = self.page(page, prot);
+        self.fill_from_file(page, &entry);
+        let (dir, slot) = page_index(page);
+        directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
+        drop(directory);
+        self.poisons.clear(page, page + PAGE_SIZE);
         Ok(())
     }
 
@@ -5467,6 +5555,12 @@ impl MemoryView {
         self.with_data_mut(|data| data.userfault_poison(start, end, page))
             .unwrap_or(Err(Errno(3))) // ESRCH
     }
+    /// See [`AddressSpaceData::userfault_continue`]; `ESRCH` once the space
+    /// is gone.
+    pub fn userfault_continue(&self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
+        self.with_data_mut(|data| data.userfault_continue(start, end, page))
+            .unwrap_or(Err(Errno(3))) // ESRCH
+    }
     /// See [`AddressSpaceData::userfault_move`]; `ESRCH` once the space is
     /// gone.
     pub fn userfault_move(
@@ -6193,7 +6287,12 @@ impl AddressSpace {
     }
     /// See [`AddressSpaceData::userfault_for`].
     #[must_use]
-    pub fn userfault_for(&self, addr: GuestAddr, write: bool, fetch: bool) -> Option<(u64, bool)> {
+    pub fn userfault_for(
+        &self,
+        addr: GuestAddr,
+        write: bool,
+        fetch: bool,
+    ) -> Option<(u64, UserfaultReason)> {
         self.locked().userfault_for(addr, write, fetch)
     }
     /// See [`AddressSpaceData::advise_flags`].

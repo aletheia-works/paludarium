@@ -675,7 +675,7 @@ impl Kernel {
                     trap: 14,
                     // A write-protected page is present.
                     error: 4
-                        | u64::from(access.protected)
+                        | u64::from(access.reason == paludarium_mmu::UserfaultReason::Protected)
                         | (u64::from(access.write) * 2)
                         | (u64::from(access.fetch) * 16),
                     synchronous: true,
@@ -1035,14 +1035,14 @@ impl Kernel {
             mapped: true,
             ..
         } = reason
-            && let Some((context, protected)) = mem.userfault_for(addr, write, fetch)
+            && let Some((context, reason)) = mem.userfault_for(addr, write, fetch)
         {
             thread.cpu.rip = rip;
             let access = userfaultfd::Access {
                 address: addr.0,
                 write,
                 fetch,
-                protected,
+                reason,
             };
             return self.userfault(thread, mem, context, access);
         }

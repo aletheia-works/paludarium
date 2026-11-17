@@ -174,6 +174,7 @@
     {"name":"userfaultfd-poison","binary":"userfaultfd"},
     {"name":"userfaultfd-move","binary":"userfaultfd"},
     {"name":"userfaultfd-shmem","binary":"userfaultfd"},
+    {"name":"userfaultfd-minor","binary":"userfaultfd"},
     {"name":"mqueue-calls","binary":"mqueue"},
     {"name":"mqueue-limits","binary":"mqueue"},
     {"name":"mqueue-wait","binary":"mqueue"},

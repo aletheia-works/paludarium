@@ -956,7 +956,8 @@ kernel.
   and the features once (`EINVAL` again), writing back the features it
   offers and its ioctls, or zeros when it fails; it offers
   `UFFD_FEATURE_PAGEFAULT_FLAG_WP`, `UFFD_FEATURE_SIGBUS`,
-  `UFFD_FEATURE_THREAD_ID`,
+  `UFFD_FEATURE_THREAD_ID`, `UFFD_FEATURE_MINOR_SHMEM`,
+  `UFFD_FEATURE_MINOR_HUGETLBFS`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
   `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_POISON` and
   `UFFD_FEATURE_MOVE`, and `UFFD_FEATURE_EVENT_FORK` needs
@@ -964,7 +965,10 @@ kernel.
   memory, shared anonymous memory and the shared or private mappings of a
   memfd, which is shmem's (not System V shared memory, whose VMAs Linux
   does not count as shmem's), for missing pages
-  (`UFFDIO_REGISTER_MODE_MISSING`), and private anonymous memory for write
+  (`UFFDIO_REGISTER_MODE_MISSING`), shmem (shared anonymous memory and a
+  memfd's mappings) for minor faults (`UFFDIO_REGISTER_MODE_MINOR`, which
+  adds `UFFDIO_CONTINUE` to the ioctls it reports and `ui` to `smaps`), and
+  private anonymous memory for write
   protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
   to the ioctls it reports), with Linux's checks in its order (the
   range, then each VMA: `EINVAL` for one that cannot be registered,
@@ -1021,7 +1025,18 @@ kernel.
   and `UFFDIO_UNREGISTER`, moves with `mremap`, goes to a `fork`ed child of
   private memory but not of shared, and goes with `MADV_DONTNEED`,
   `MADV_FREE`, `MADV_GUARD_INSTALL` (whose guard takes its place) and
-  `munmap`. `UFFDIO_MOVE` moves private anonymous pages of the
+  `munmap`. A minor fault is an access to a page of shmem that its page
+  cache has but the mapping has no entry for, as `shmem_get_folio_gfp`
+  finds the folio and `handle_userfault` takes `VM_UFFD_MINOR`; its
+  message has `UFFD_PAGEFAULT_FLAG_MINOR`, and a hole is brought in unless
+  the range is registered for missing pages too. `UFFDIO_CONTINUE` maps
+  the page cache's pages into its range page by page, as
+  `mfill_atomic_pte_continue`: `EINVAL` for memory that is not shmem, a
+  mode other than `DONTWAKE` and `WP` (which needs the write-protect
+  mode), or a page past the file's end; `EFAULT` for a page the page cache
+  does not have; `EEXIST` for one the mapping has. A private mapping shows
+  the page until it writes it, as `mfill_atomic_install_pte` maps it
+  read-only. `UFFDIO_MOVE` moves private anonymous pages of the
   context's own address space (`EINVAL` from another) into a registered
   range, whether or not `UFFD_FEATURE_MOVE` was asked for, as Linux's
   `move_pages`: each start in a VMA (`ENOENT`); neither VMA shared, each

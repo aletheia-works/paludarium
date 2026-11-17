@@ -52,8 +52,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   取り込みます（`fault_around_bytes`）。`MAP_POPULATE`、`MAP_LOCKED`、ロックが
   取り込むはずのページも、触れたときに数えます。ヒュージページもプロテクションキーも
   ないので、`THPeligible` はいつも 0 で、`ProtectionKey` はありません。`VmFlags` には
-  `ui`（提供しない `userfaultfd` のマイナーのモード）、`ht`、`dp`
-  （`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
+  `ht`、`dp`（`MAP_HUGETLB`、`MAP_DROPPABLE`）がありません。
 - **`comm` への書き込み**：`/proc/<pid>/comm` や `/proc/<pid>/task/<tid>/comm` への
   書き込みは `EINVAL` です。Linux は、書き手がそのプロセスのものならスレッドの名前を
   変えます（musl の `pthread_setname_np` はほかのスレッドの名前をここに書きます。
@@ -611,14 +610,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **userfaultfd の一部**：登録するのは、ないページと、プライベートな anonymous
-  メモリの書き込み保護です。マイナーのモードは受け付けず（`EINVAL`）、Linux が
-  受け付ける shmem（共有の anonymous メモリと、プライベートも含む shmem のファイルの
-  マッピング）の書き込み保護のモードも同じです。`UFFDIO_CONTINUE` も
-  ありません（`EINVAL`）。`fork`、`mremap`、
+  メモリの書き込み保護と、shmem のマイナーフォールトです。Linux が受け付ける
+  shmem（共有の anonymous メモリと、プライベートも含む shmem のファイルの
+  マッピング）の書き込み保護のモードは受け付けません（`EINVAL`）。`fork`、`mremap`、
   `madvise`、`munmap` のイベントと `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_WP_ASYNC` もなく、`UFFDIO_API` は
-  それらを示さず、求められれば `EINVAL` です。`UFFDIO_REGISTER` と `fdinfo` が示す
-  ioctl にも入りません。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
+  それらを示さず、求められれば `EINVAL` です。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
   ページの保護を外します。Linux はその印を PTE に残します。shmem のファイルで登録
   するのは memfd だけです。tmpfs のファイルは、Linux は受け付けますが、ここでは
   断ります（`EINVAL`）。メモリ上のファイルシステムは tmpfs を名乗りますが、ゲストが

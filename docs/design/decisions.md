@@ -240,15 +240,17 @@ CI's own records, so anyone can check it:
    every round without it. Short programs count as much as long ones, since
    turning the JIT on by default would add its cost to every command.
 
-The last criterion does not hold yet. In the run of the check with today's
-default (fork run 44116579985, AMD EPYC 7763), the JIT made long programs much
-faster: Perl's hash benchmark 46%, Java 50% and OCaml 44%. But 3 of the 36 cases
-were still slower than every round without it: probe's `fs-basic` by 4% (about 1
-ms of 22 ms), probe's `tokio-timer` by 1% and ripgrep's `parallel` case by 2%.
-On a faster runner (fork run 43982096280, with the earlier default) probe's
-other cases of about 20 ms were within the rounds' spread. An older version of
-this comparison started only the JIT through a shell wrapper, which made them
-look slower.
+The last criterion does not hold yet, by one case. It was run twice with today's
+default. On the faster runner (fork run 44126678828, Intel Xeon 6973P-C), the
+JIT made Perl's hash benchmark 32% faster, Java 47% and OCaml 38%. But one of
+the 36 cases was still slower than every round without it: aube's `list` by 3%
+(174–177 ms against 167–170 ms). On the slower runner (fork run 44116579985, AMD
+EPYC 7763), three were: probe's `fs-basic` by 4% (about 1 ms of 22 ms), probe's
+`tokio-timer` by 1% and ripgrep's `parallel` case by 2%. The criterion is met
+when no case is slower on either runner. What is left is the cost of a short
+program's first compiles. An older version of this comparison started only the
+JIT through a shell wrapper, which made programs of about 20 ms look slower than
+they are.
 
 ## One way to create a filesystem
 

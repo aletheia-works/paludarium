@@ -207,11 +207,10 @@ less of it for some: Perl's hash benchmark was 46% faster instead of 53%, `perl
 each early exit then needs no copy of every register, which made compiling about
 three times faster and the code faster too.
 
-In a same-runner comparison on CI (x86-64 Linux), against the interpreter
-without it, `--jit` made Perl's hash and string benchmarks 15% and 27%
-faster, LuaJIT 15% and OCaml 8%, with every Debian program still giving
-native Linux's results; programs that run briefly changed within that
-measurement's noise. It is off by default until it has more to show.
+It now compiles more of each block than when it was added, and it is much
+faster for long programs. The numbers, and what is still slower, are in the
+criteria below. Every Debian program still gives native Linux's results with
+it. It is off by default until those criteria hold.
 
 ### When the native JIT is turned on by default
 

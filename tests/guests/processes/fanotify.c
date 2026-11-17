@@ -1143,6 +1143,30 @@ static int case_exec_perm(const char *self) {
     child = exec_in_child(at("prog"), fan);
     answer_until_exit("reads denied", fan, child, 2);
     close(fan);
+    /* A script let through whose interpreter is denied: the script was
+       opened, so it tells its open and its close all the same. */
+    int script = open(at("script"), O_WRONLY | O_CREAT, 0755);
+    char line[160];
+    int len = snprintf(line, sizeof line, "#!%s fanotify-noop\n", at("prog"));
+    if (script < 0 || write(script, line, (size_t)len) != len) return 82;
+    close(script);
+    fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    int notif = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (fan < 0 || notif < 0) return 83;
+    printf("mark script=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, at("script")));
+    printf("mark interpreter=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_EXEC_PERM, AT_FDCWD, at("prog")));
+    printf("notif=%ld\n", fan_mark(notif, FAN_MARK_ADD, FAN_OPEN | FAN_OPEN_EXEC | FAN_CLOSE, AT_FDCWD, at("script")));
+    child = exec_in_child(at("script"), fan);
+    fd = read_perm("script open", fan, child);
+    printf("allow=%ld\n", respond(fan, fd, 1));
+    if (fd >= 0) close(fd);
+    fd = read_perm("interpreter open-exec", fan, child);
+    printf("deny=%ld\n", respond(fan, fd, 2));
+    if (fd >= 0) close(fd);
+    printf("script child=%d\n", child_result(child));
+    show_fd_events("script's events", notif, child);
+    close(notif);
+    close(fan);
     remove_base();
     return 0;
 }

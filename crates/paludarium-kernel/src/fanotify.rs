@@ -736,6 +736,17 @@ impl Drop for Gathering {
     }
 }
 
+/// Asks the groups what a [`Gathering`] gathered, in the order the
+/// operation asked them (exec's opens and reads, one fsnotify call each):
+/// how many were let through, and whether any was asked or the denial,
+/// so that what was let through before a denial still tells its events.
+pub(crate) fn answers_through(
+    c: &mut Context<'_>,
+    pending: Pending,
+) -> (usize, Result<bool, Errno>) {
+    answer_each(c, pending.0)
+}
+
 /// Asks the groups what [`asked_by`] gathered and waits for their
 /// answers: whether any was asked, or the denial.
 pub(crate) fn answers(c: &mut Context<'_>, pending: Pending) -> Result<bool, Errno> {
@@ -765,57 +776,72 @@ pub(crate) fn asked() -> usize {
 /// The wait ends only for an answer, the group's close (let through), or a
 /// fatal signal (`TASK_KILLABLE`), which leaves the event to its group.
 fn await_answers(c: &mut Context<'_>, mut asked: Vec<Asked>) -> Result<bool, Errno> {
-    if asked.is_empty() {
-        return Ok(false);
-    }
     asked.sort_by_key(|(group, _)| {
         group
             .upgrade()
             .map_or(2, |g| u8::from(g.flags & CLASS_PRE_CONTENT == 0))
     });
+    answer_each(c, asked).1
+}
+
+/// [`await_answers`] of events in the order they were asked, each event
+/// of its own call to fsnotify: how many were let through before the end,
+/// and how it ended.
+fn answer_each(c: &mut Context<'_>, asked: Vec<Asked>) -> (usize, Result<bool, Errno>) {
+    if asked.is_empty() {
+        return (0, Ok(false));
+    }
+    let mut through = 0;
     for (group, event) in asked {
-        let Some(id) = group.upgrade().and_then(|g| g.ask(event)) else {
-            continue;
+        if let Err(e) = answer_one(c, &group, event) {
+            return (through, Err(e));
+        }
+        through += 1;
+    }
+    (through, Ok(true))
+}
+
+/// Queues one permission event of `group` and waits for its answer.
+fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<(), Errno> {
+    let Some(id) = group.upgrade().and_then(|g| g.ask(event)) else {
+        return Ok(());
+    };
+    loop {
+        let ticket = c.files.readiness.token.value();
+        let Some(strong) = group.upgrade() else {
+            return Ok(());
         };
-        loop {
-            let ticket = c.files.readiness.token.value();
-            let Some(strong) = group.upgrade() else {
-                break;
-            };
-            if let Some(answer) = strong.answer(id) {
-                answer?;
-                break;
+        if let Some(answer) = strong.answer(id) {
+            return answer;
+        }
+        let _ = c.inbox.drain(c.process);
+        c.group.drain_process(c.process);
+        if fatal(c) {
+            strong.cancel(id);
+            return Err(Errno(4));
+        }
+        drop(strong);
+        let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
+        let end = Some((
+            paludarium_host::ClockId::Monotonic,
+            now.saturating_add(10_000_000),
+        ));
+        match c
+            .host
+            .wait_on(&c.files.readiness.token, ticket, end, c.cancellation)
+        {
+            Err(e) if e == Errno::ENOSYS => {
+                c.host.wait_until(
+                    paludarium_host::ClockId::Monotonic,
+                    now.saturating_add(1_000_000),
+                    c.cancellation,
+                )?;
             }
-            let _ = c.inbox.drain(c.process);
-            c.group.drain_process(c.process);
-            if fatal(c) {
-                strong.cancel(id);
-                return Err(Errno(4));
-            }
-            drop(strong);
-            let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
-            let end = Some((
-                paludarium_host::ClockId::Monotonic,
-                now.saturating_add(10_000_000),
-            ));
-            match c
-                .host
-                .wait_on(&c.files.readiness.token, ticket, end, c.cancellation)
-            {
-                Err(e) if e == Errno::ENOSYS => {
-                    c.host.wait_until(
-                        paludarium_host::ClockId::Monotonic,
-                        now.saturating_add(1_000_000),
-                        c.cancellation,
-                    )?;
-                }
-                result => {
-                    result?;
-                }
+            result => {
+                result?;
             }
         }
     }
-    Ok(true)
 }
 
 /// Whether the task is to die (`fatal_signal_pending`): its group exits, or

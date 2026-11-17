@@ -4212,15 +4212,16 @@ impl Kernel {
             .signal(self.process.pid, sender.uid, pid, number)
             .map(|()| 0)
     }
-    /// Waits for fanotify's answers to the permission events of `pending`,
-    /// as an open's do ([`crate::fanotify::answers`]), with this thread's
-    /// signals: the denial's error.
+    /// Waits for fanotify's answers to exec's permission events of
+    /// `pending`, in their order ([`crate::fanotify::answers_through`]),
+    /// with this thread's signals: how many were let through, and the
+    /// denial's error.
     fn permission_answers(
         &mut self,
         thread: &mut Thread,
         mem: &AddressSpace,
         pending: crate::fanotify::Pending,
-    ) -> Result<(), Errno> {
+    ) -> (usize, Result<bool, Errno>) {
         let mut c = crate::syscalls::Context {
             number: 59,
             tid: thread.tid,
@@ -4235,7 +4236,7 @@ impl Kernel {
             group: &self.group,
             processes: &self.processes,
         };
-        crate::fanotify::answers(&mut c, pending).map(drop)
+        crate::fanotify::answers_through(&mut c, pending)
     }
     /// Closes what exec closed, as Linux's `__fput` does on the way back to
     /// the new program: a socket's last descriptor waits for its linger
@@ -4663,16 +4664,18 @@ impl Kernel {
         });
         // Linux asks each as it opens or reads the file, so a denial comes
         // before the loader's errors, and what follows a denied one is
-        // never asked; those let through tell their held `IN_OPEN` then.
-        self.permission_answers(thread, mem, gathering.finish())?;
+        // never asked; the opens let through before it tell their held
+        // `IN_OPEN` then, and close as the exec fails.
+        let (through, answered) = self.permission_answers(thread, mem, gathering.finish());
         for opened in opens.0.iter().flatten() {
-            opened.release();
+            opened.release_through(through);
         }
         for interpreter in &failing.interpreters {
             if let Some(opened) = &*interpreter.lock().unwrap_or_else(PoisonError::into_inner) {
-                opened.release();
+                opened.release_through(through);
             }
         }
+        answered?;
         let image = loaded_image.map_err(|error| match error {
             // The new image did not fit under the memory limit.
             _ if memory.take_out_of_memory() => Errno::ENOMEM,

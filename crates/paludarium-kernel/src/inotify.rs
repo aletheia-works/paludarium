@@ -162,6 +162,10 @@ pub(crate) struct Closing {
     /// Its reads ask `FAN_ACCESS_PERM`, as a group's mark wanted it when
     /// exec opened the file (`FMODE_FSNOTIFY_ACCESS_PERM`).
     access_perm: bool,
+    /// How many of exec's permission events had been asked once its open's
+    /// and its read's were ([`Self::release_through`]).
+    opened_at: usize,
+    read_at: AtomicUsize,
 }
 impl Closing {
     /// Tells the watches of the guest's open of the FIFO `node` at `path`
@@ -260,6 +264,7 @@ impl Closing {
         let asked = crate::fanotify::asked();
         self.tell(crate::fanotify::OPEN_EXEC_PERM);
         self.tell(crate::fanotify::OPEN_PERM);
+        self.opened_at = crate::fanotify::asked();
         self.access_perm = crate::fanotify::probing(|| self.tell(crate::fanotify::ACCESS_PERM));
         if crate::fanotify::asked() > asked {
             self.held = AtomicBool::new(true);
@@ -267,14 +272,19 @@ impl Closing {
             self.tell(OPEN | crate::fanotify::OPEN_EXEC);
         }
     }
-    /// Tells what an open held back once its permission events let it
-    /// through: its `IN_OPEN`, then a read's `IN_ACCESS`.
-    pub(crate) fn release(&self) {
-        if self.held.swap(false, Ordering::SeqCst) {
-            self.tell(OPEN | crate::fanotify::OPEN_EXEC);
-            if self.read_held.swap(false, Ordering::SeqCst) {
-                self.tell(ACCESS);
-            }
+    /// Tells what an open held back, once `through` of exec's permission
+    /// events were let through: its `IN_OPEN` when its open's were, even
+    /// if a later file's are denied (then it closes too), and a read's
+    /// `IN_ACCESS` when that read's was.
+    pub(crate) fn release_through(&self, through: usize) {
+        if through < self.opened_at || !self.held.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.tell(OPEN | crate::fanotify::OPEN_EXEC);
+        if self.read_held.swap(false, Ordering::SeqCst)
+            && through >= self.read_at.load(Ordering::SeqCst)
+        {
+            self.tell(ACCESS);
         }
     }
     fn open_at(
@@ -308,6 +318,8 @@ impl Closing {
             held: AtomicBool::new(false),
             read_held: AtomicBool::new(false),
             access_perm: false,
+            opened_at: 0,
+            read_at: AtomicUsize::new(0),
         }
     }
     /// Tells the watches of exec's read of the file's first bytes
@@ -317,6 +329,8 @@ impl Closing {
             // `kernel_read`'s `rw_verify_area` asks first.
             if self.access_perm {
                 self.tell(crate::fanotify::ACCESS_PERM);
+                self.read_at
+                    .store(crate::fanotify::asked(), Ordering::SeqCst);
             }
             if self.held.load(Ordering::SeqCst) {
                 self.read_held.store(true, Ordering::SeqCst);

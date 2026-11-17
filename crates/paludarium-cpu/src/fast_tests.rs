@@ -434,7 +434,7 @@ fn state(random: &mut Random) -> CpuState {
         *x = u128::from(random.next()) | (u128::from(random.next()) << 64);
         // Half the registers get small or negative lanes, so that packs
         // also keep values rather than only saturate them.
-        if random.next() % 2 == 0 {
+        if random.next().is_multiple_of(2) {
             *x &= 0x81ff_81ff_81ff_81ff_81ff_81ff_81ff_81ff;
         }
     }

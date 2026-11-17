@@ -1114,6 +1114,10 @@ static int case_exec_perm(const char *self) {
     int fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
     if (fan < 0) return 81;
     printf("mark=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM, AT_FDCWD, at("prog")));
+    /* The program's own open, let through, tells its open and its close. */
+    int heard = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (heard < 0) return 84;
+    printf("heard=%ld\n", fan_mark(heard, FAN_MARK_ADD, FAN_OPEN | FAN_OPEN_EXEC | FAN_CLOSE, AT_FDCWD, at("prog")));
     pid_t child = exec_in_child(at("prog"), fan);
     int fd = read_perm("open-exec", fan, child);
     printf("allow=%ld\n", respond(fan, fd, 1));
@@ -1122,6 +1126,8 @@ static int case_exec_perm(const char *self) {
     printf("allow=%ld\n", respond(fan, fd, 1));
     if (fd >= 0) close(fd);
     printf("allowed child=%d\n", child_result(child));
+    show_fd_events("program's events", heard, child);
+    close(heard);
     child = exec_in_child(at("prog"), fan);
     fd = read_perm("open-exec", fan, child);
     printf("deny=%ld\n", respond(fan, fd, 2));
@@ -1165,6 +1171,28 @@ static int case_exec_perm(const char *self) {
     if (fd >= 0) close(fd);
     printf("script child=%d\n", child_result(child));
     show_fd_events("script's events", notif, child);
+    close(notif);
+    close(fan);
+    /* An exec that fails before it loads (no interpreter) still asked the
+       script's open: let through, it fails as without the mark and tells
+       the open and close; denied, the denial's error comes first. */
+    script = open(at("lost"), O_WRONLY | O_CREAT, 0755);
+    len = snprintf(line, sizeof line, "#!%s\n", at("missing"));
+    if (script < 0 || write(script, line, (size_t)len) != len) return 85;
+    close(script);
+    fan = fan_init(FAN_CLASS_CONTENT, O_RDONLY);
+    notif = fan_init(FAN_NONBLOCK, O_RDONLY);
+    if (fan < 0 || notif < 0) return 86;
+    printf("mark lost=%ld\n", fan_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, at("lost")));
+    printf("notif lost=%ld\n", fan_mark(notif, FAN_MARK_ADD, FAN_OPEN | FAN_OPEN_EXEC | FAN_CLOSE, AT_FDCWD, at("lost")));
+    for (uint32_t response = 1; response <= 2; response++) {
+        child = exec_in_child(at("lost"), fan);
+        fd = read_perm("lost open", fan, child);
+        printf("response %u=%ld\n", response, respond(fan, fd, response));
+        if (fd >= 0) close(fd);
+        printf("lost child=%d\n", child_result(child));
+        show_fd_events("lost's events", notif, child);
+    }
     close(notif);
     close(fan);
     remove_base();

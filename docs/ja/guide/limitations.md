@@ -634,9 +634,7 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc/sys/vm/unprivileged_userfaultfd` はなく、後者は 0 として扱います。
 - **fanotify の一部**：exec は実行するファイルの読み出しごとに `FAN_ACCESS_PERM` を
   1 回尋ねます。Linux は `kernel_read` ごとに尋ねます（ELF のプログラムでは 2、3 回）。
-  プログラムを読み込む前に失敗する exec（読めない引数、長すぎる並び）は許可イベントを
-  何も尋ねません。Linux はそれまでのオープンの分を尋ね終えています。ここの `io_uring` には
-  尋ねる読み出しの操作がありません。
+  ここの `io_uring` には尋ねる読み出しの操作がありません。
   `FAN_PRE_ACCESS` は
   `EOPNOTSUPP` です（ここのファイルシステムはどれも認めません）。マウントのイベント
   （`FAN_MNT_ATTACH`、`FAN_MNT_DETACH`）と `FAN_FS_ERROR` は来ません。追い出せるマークも

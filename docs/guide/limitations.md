@@ -736,10 +736,8 @@ verified.
   `/proc/sys/vm/unprivileged_userfaultfd`, which is taken as 0.
 - **fanotify, in part**: exec asks `FAN_ACCESS_PERM` once for its read
   of each file it runs, where Linux asks it at each `kernel_read` (two or
-  three for an ELF program); an exec that fails before its program is
-  loaded (an argument it cannot read, too long a list) asks none of its
-  permission events, where Linux has asked those of the opens before; and
-  `io_uring` has no read operation here to ask for.
+  three for an ELF program), and `io_uring` has no read operation here to
+  ask for.
   `FAN_PRE_ACCESS` is `EOPNOTSUPP` (no file system here allows it),
   and mount events (`FAN_MNT_ATTACH`, `FAN_MNT_DETACH`) and `FAN_FS_ERROR`
   never come. An evictable mark is never evicted. A group merges an event

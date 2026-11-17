@@ -178,6 +178,10 @@ impl WriteAccess {
         self.closing = closing;
         self
     }
+    /// Exec's open of the program this denial closes, if any.
+    pub(crate) fn opened(&self) -> Option<&crate::inotify::Closing> {
+        self.closing.as_ref()
+    }
 }
 
 impl Drop for WriteAccess {

@@ -4220,8 +4220,11 @@ impl Kernel {
         &mut self,
         thread: &mut Thread,
         mem: &AddressSpace,
-        pending: crate::fanotify::Pending,
+        pending: Option<crate::fanotify::Pending>,
     ) -> (usize, Result<bool, Errno>) {
+        let Some(pending) = pending else {
+            return (usize::MAX, Ok(false));
+        };
         let mut c = crate::syscalls::Context {
             number: 59,
             tid: thread.tid,
@@ -4237,6 +4240,28 @@ impl Kernel {
             processes: &self.processes,
         };
         crate::fanotify::answers_through(&mut c, pending)
+    }
+    /// Asks what `gathering` still holds of exec's permission events, once
+    /// exec fails before they were asked ([`Self::permission_answers`]),
+    /// and tells what `opens` and the program's open `exe` held back of
+    /// those let through: the error of a denial among them.
+    fn settle(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        gathering: &mut Option<crate::fanotify::Gathering>,
+        opens: &ExecOpens,
+        exe: Option<&crate::inotify::Closing>,
+    ) -> Result<(), Errno> {
+        // Asked already, and told what was let through.
+        let Some(gathering) = gathering.take() else {
+            return Ok(());
+        };
+        let (through, answered) = self.permission_answers(thread, mem, Some(gathering.finish()));
+        for opened in opens.0.iter().flatten().chain(exe) {
+            opened.release_through(through);
+        }
+        answered.map(drop)
     }
     /// Closes what exec closed, as Linux's `__fput` does on the way back to
     /// the new program: a socket's last descriptor waits for its linger
@@ -4278,6 +4303,32 @@ impl Kernel {
         n: u64,
         a: [u64; 6],
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
+        // Exec's opens of the files it runs, for inotify, in their order.
+        let mut opens = ExecOpens::default();
+        // Their permission events (`FAN_OPEN_EXEC_PERM`, `FAN_OPEN_PERM`,
+        // `FAN_ACCESS_PERM` of their reads), gathered until the program is
+        // loaded and then asked in their order, before exec commits.
+        let mut gathering = Some(crate::fanotify::gather());
+        let done = self.exec_opening(thread, mem, n, a, &mut gathering, &mut opens);
+        // An exec that fails before the program loads still asked what its
+        // opens and reads asked, as Linux does at each: a denial among them
+        // came first, and the opens let through tell their events and close.
+        if done.is_err() {
+            self.settle(thread, mem, &mut gathering, &opens, None)?;
+        }
+        done
+    }
+    /// [`Self::exec`], gathering its permission events in `gathering` and
+    /// its opens in `opens`.
+    fn exec_opening(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        n: u64,
+        a: [u64; 6],
+        gathering: &mut Option<crate::fanotify::Gathering>,
+        opens: &mut ExecOpens,
+    ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         const AT_FDCWD: u64 = -100i64 as u64;
         const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
         const AT_EMPTY_PATH: u64 = 0x1000;
@@ -4314,12 +4365,6 @@ impl Kernel {
         // open on, as `do_open_execat` takes it, until exec ends; the program
         // it loads takes its own.
         let mut opened = None;
-        // Exec's opens of the files it runs, for inotify, in their order.
-        let mut opens = ExecOpens::default();
-        // Their permission events (`FAN_OPEN_EXEC_PERM`, `FAN_OPEN_PERM`,
-        // `FAN_ACCESS_PERM` of their reads), gathered until the program is
-        // loaded and then asked in their order, before exec commits.
-        let gathering = crate::fanotify::gather();
         let (start, program, mut readable, image) = match program {
             crate::files::Program::Path(path) => {
                 let (program, readable) =
@@ -4452,7 +4497,7 @@ impl Kernel {
                             program,
                             &mut readable,
                             (&mut argv, &mut budget),
-                            &mut opens,
+                            opens,
                         )?;
                         path = loaded.clone();
                         // The script's own denial ends once its interpreter
@@ -4469,10 +4514,10 @@ impl Kernel {
                             (argv, envp),
                             None,
                             exe,
-                            (gathering, &opens),
+                            (gathering, &*opens),
                         );
                         if done.is_ok() {
-                            self.exec_closes = Some(opens);
+                            self.exec_closes = Some(std::mem::take(opens));
                         }
                         return done;
                     }
@@ -4495,7 +4540,7 @@ impl Kernel {
                     program,
                     &mut readable,
                     (&mut argv, &mut budget),
-                    &mut opens,
+                    opens,
                 )?;
                 // The program's own open closes with the process's last use
                 // of it (`exe_file`).
@@ -4513,13 +4558,13 @@ impl Kernel {
             (argv, envp),
             image,
             exe,
-            (gathering, &opens),
+            (gathering, &*opens),
         );
         drop(opened);
         // The scripts' opens close at the end of exec, as the `fput`s
         // `exec_binprm` defers, once the old image has gone.
         if done.is_ok() {
-            self.exec_closes = Some(opens);
+            self.exec_closes = Some(std::mem::take(opens));
         }
         done
     }
@@ -4539,19 +4584,28 @@ impl Kernel {
         (argv, envp): (Vec<Vec<u8>>, Vec<Vec<u8>>),
         held: Option<HeldProgram>,
         program_file: Option<crate::page_cache::WriteAccess>,
-        (gathering, opens): (crate::fanotify::Gathering, &ExecOpens),
+        (gathering, opens): (&mut Option<crate::fanotify::Gathering>, &ExecOpens),
     ) -> Result<Vec<crate::files::Descriptor>, Errno> {
         let mut random = [0; 16];
-        self.host
+        let early = self
+            .host
             .random_bytes(&mut random)
-            .map_err(|_| Errno::EIO)?;
-        let (_, _, no_new_privs) = self.processes.status_of(self.process.pid);
-        // The program's file capabilities: a held file's, read before its
-        // bytes, or those of the file the path names.
-        let capabilities = match &held {
-            Some((_, _, capabilities)) => capabilities.clone(),
-            None => program_capabilities(|f| self.files.fs().with_xattrs(&loaded, true, f))?,
+            .map_err(|_| Errno::EIO)
+            .and_then(|()| match &held {
+                // The program's file capabilities: a held file's, read
+                // before its bytes, or those of the file the path names.
+                Some((_, _, capabilities)) => Ok(capabilities.clone()),
+                None => program_capabilities(|f| self.files.fs().with_xattrs(&loaded, true, f)),
+            });
+        let capabilities = match early {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                let exe = program_file.as_ref().and_then(|exe| exe.opened());
+                self.settle(thread, mem, gathering, opens, exe)?;
+                return Err(error);
+            }
         };
+        let (_, _, no_new_privs) = self.processes.status_of(self.process.pid);
         // `mnt_may_suid`: the file that runs (a script's interpreter, as
         // Linux's `bprm_creds_from_file` takes `bprm->file`) on a `nosuid`
         // mount, or on a superblock of a user namespace the caller is not
@@ -4666,8 +4720,11 @@ impl Kernel {
         // before the loader's errors, and what follows a denied one is
         // never asked; the opens let through before it tell their held
         // `IN_OPEN` then, and close as the exec fails.
-        let (through, answered) = self.permission_answers(thread, mem, gathering.finish());
-        for opened in opens.0.iter().flatten() {
+        let pending = gathering.take().map(crate::fanotify::Gathering::finish);
+        let (through, answered) = self.permission_answers(thread, mem, pending);
+        // The program's own open, which its denial of writes holds.
+        let exe = failing.exe.as_ref().and_then(|exe| exe.opened());
+        for opened in opens.0.iter().flatten().chain(exe) {
             opened.release_through(through);
         }
         for interpreter in &failing.interpreters {

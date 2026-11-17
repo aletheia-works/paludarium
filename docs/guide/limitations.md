@@ -508,6 +508,9 @@ verified.
     which the architecture leaves to software, is not hit, as `FXRSTOR`
     reads only the 416 bytes it restores; an AMD CPU reads them too, and
     stops there.
+    A write breakpoint on a byte that `MASKMOVDQU`'s mask leaves out is not
+    hit either, as no byte there is written; an Intel CPU stops there, and
+    an AMD CPU does not.
     A `cs` or `ss` selector a tracer writes other than the 64-bit user ones
     is kept and shown, but the tracee runs on in 64-bit mode, where Linux
     would run it in that segment or fault.

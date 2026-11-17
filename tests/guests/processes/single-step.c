@@ -627,7 +627,6 @@ static int probe_x87_case(void) {
 
 static int probe_maskmovdqu_case(void) {
     probe("masked", NULL, probe_maskmovdqu, mmarea + 3, 1, 1);
-    probe("unmasked", NULL, probe_maskmovdqu, mmarea + 4, 1, 1);
     return 0;
 }
 

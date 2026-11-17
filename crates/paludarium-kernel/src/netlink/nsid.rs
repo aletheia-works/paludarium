@@ -11,11 +11,12 @@
 //! may name a peer by its ID (`IFLA_TARGET_NETNSID`,
 //! `IFA_TARGET_NETNSID`), as [`target`] finds it.
 //!
-//! Only a request gives an ID. Linux's `peernet2id_alloc` also gives one
-//! on its own, for what lies in another namespace than the one telling
-//! of it: a device whose link is there or that moves there, a queue lease,
-//! a devlink instance, a PSP device, an ovpn peer or an openvswitch vport.
-//! None of those is here, and `lo` may not move.
+//! A request gives an ID, and so does [`link_netnsid`], as Linux's
+//! `peernet2id_alloc` gives one on its own for what lies in another
+//! namespace than the one telling of it: a device whose link is there (a
+//! veth pair's other end). Its other callers (a device that moves, a queue
+//! lease, a devlink instance, a PSP device, an ovpn peer, an openvswitch
+//! vport) have no counterpart here.
 use super::{
     Errno, Header, NLM_F_MULTI, Nla, Notice, Policy, attribute, extack, message, parse_policy,
 };
@@ -412,21 +413,7 @@ pub(super) fn new_id(
         live.insert(id, Arc::downgrade(&peer));
         id
     };
-    if !Arc::ptr_eq(&peer, network) {
-        let mut heard_by = peer
-            .netlink
-            .ids
-            .heard_by
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        heard_by.retain(|n| n.strong_count() > 0);
-        if !heard_by
-            .iter()
-            .any(|n| std::ptr::eq(n.as_ptr(), Arc::as_ptr(network)))
-        {
-            heard_by.push(Arc::downgrade(network));
-        }
-    }
+    heard(network, &peer);
     // `rtnl_net_notifyid`, which `rtnl_notify` sends to the requester
     // alone of the members with `NLM_F_ECHO`.
     Ok(Notice {
@@ -434,6 +421,64 @@ pub(super) fn new_id(
         origin: if echo { port } else { 0 },
         bytes: fill(RTM_NEWNSID, 0, header.seq, port, id, None),
     })
+}
+
+/// Notes that `network` has an ID for `peer`, so that `peer`'s
+/// notifications reach `network`'s sockets with `NETLINK_LISTEN_ALL_NSID`
+/// and `network` hears of it going (`RTM_DELNSID`).
+fn heard(network: &Arc<Network>, peer: &Arc<Network>) {
+    if Arc::ptr_eq(peer, network) {
+        return;
+    }
+    let mut heard_by = peer
+        .netlink
+        .ids
+        .heard_by
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    heard_by.retain(|n| n.strong_count() > 0);
+    if !heard_by
+        .iter()
+        .any(|n| std::ptr::eq(n.as_ptr(), Arc::as_ptr(network)))
+    {
+        heard_by.push(Arc::downgrade(network));
+    }
+}
+
+/// `peernet2id_alloc`: `this` namespace's ID for `peer`, given now, the
+/// lowest free (`alloc_netid`), if it has none, as a device whose link is
+/// in `peer` asks for its `IFLA_LINK_NETNSID` (`rtnl_fill_link_netnsid`). A
+/// new ID is told to `this` namespace's `RTNLGRP_NSID` (`rtnl_net_notifyid`)
+/// through `notices`, before what the caller tells next. `None`
+/// (`NETNSA_NSID_NOT_ASSIGNED`) when no ID is free.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a veth pair's link message calls it")
+)]
+pub(super) fn link_netnsid(
+    this: &Arc<Network>,
+    peer: &Arc<Network>,
+    notices: &mut Vec<Notice>,
+) -> Option<i32> {
+    let id = {
+        let mut live = this.netlink.ids.live();
+        if let Some((&id, _)) = live
+            .iter()
+            .find(|(_, p)| std::ptr::eq(p.as_ptr(), Arc::as_ptr(peer)))
+        {
+            return Some(id);
+        }
+        let id = (0..i32::MAX).find(|id| !live.contains_key(id))?;
+        live.insert(id, Arc::downgrade(peer));
+        id
+    };
+    heard(this, peer);
+    notices.push(Notice {
+        group: RTNLGRP_NSID,
+        origin: 0,
+        bytes: fill(RTM_NEWNSID, 0, 0, 0, id, None),
+    });
+    Some(id)
 }
 
 /// `RTM_GETNSID`, as `rtnl_net_getid`: the ID of the peer `NETNSA_PID`,
@@ -529,4 +574,35 @@ pub(super) fn dump(
             fill(RTM_NEWNSID, NLM_F_MULTI, header.seq, port, id, current)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_link_gives_its_peer_the_lowest_free_id_once() {
+        let network = || Arc::new(Network::isolated(crate::users::first()));
+        let (this, peer, other) = (network(), network(), network());
+        let mut notices = Vec::new();
+        // An ID a request gave stays taken.
+        this.netlink.ids.live().insert(0, Arc::downgrade(&other));
+        assert_eq!(link_netnsid(&this, &peer, &mut notices), Some(1));
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].group, RTNLGRP_NSID);
+        assert_eq!(notices[0].origin, 0);
+        assert_eq!(notices[0].bytes, fill(RTM_NEWNSID, 0, 0, 0, 1, None));
+        // Asked again, the same, untold.
+        assert_eq!(link_netnsid(&this, &peer, &mut notices), Some(1));
+        assert_eq!(notices.len(), 1);
+        assert_eq!(this.netlink.ids.id_of(&peer), Some(1));
+        // `peer` now tells `this` of itself, and of its going.
+        assert!(
+            peer.netlink
+                .ids
+                .heard_by()
+                .iter()
+                .any(|n| Arc::ptr_eq(n, &this))
+        );
+    }
 }

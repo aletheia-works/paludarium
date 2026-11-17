@@ -180,7 +180,7 @@ impl Bloom {
     /// the seed and the hash's index, masked.
     fn bit(&self, value: &[u8], index: u32) -> u32 {
         let initval = self.seed.wrapping_add(index);
-        let h = if value.len() % 4 == 0 {
+        let h = if value.len().is_multiple_of(4) {
             let words: Vec<u32> = value
                 .as_chunks::<4>()
                 .0

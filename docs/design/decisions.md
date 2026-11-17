@@ -236,12 +236,16 @@ CI's own records, so anyone can check it:
    every round without it. Short programs count as much as long ones, since
    turning the JIT on by default would add its cost to every command.
 
-The last criterion does not hold yet. In the last same-runner runs (fork run
-43897560585), the JIT made long programs much faster: Perl's hash benchmark
-42%, Java 44% and OCaml 41%. But 15 of the 36 cases were slower than every
-round without it, all of them programs that take 15–200 ms: the probe cases
-by 4–30%, ripgrep's by 5–12% and two of aube's by 7–10%. That is a cost the
-JIT pays at start, so it has to go before the switch.
+The last criterion does not hold yet. In a run of the check on CI (fork run
+43982096280), the JIT made long programs much faster: Perl's hash benchmark
+49%, Java 50% and OCaml 45%. But 9 of the 36 cases were slower than every
+round without it, all of them programs that take 0.1–0.25 s. Seven ripgrep
+cases were 2–8% slower, two of aube's 7–8% and one probe case 2%. A program
+that short compiles dozens of blocks (about 0.7 ms each) that it then runs
+too few times to earn back, so that has to change before the switch. The
+programs of 20 ms or less are no longer among them. They were in an earlier
+version of this comparison, which started only the JIT through a shell
+wrapper.
 
 ## One way to create a filesystem
 

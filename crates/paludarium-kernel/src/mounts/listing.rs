@@ -297,7 +297,8 @@ fn magic(fs: &NamespacedFs, m: &MountPoint) -> u64 {
 /// outside it), the type's name, its options alone and as an array, its
 /// source and its namespace's ID; it has no subtype, security options or
 /// ID mappings to give. A detached tree's mount by its descriptor is
-/// `ENOENT`, as Linux's is for one alone in its anonymous namespace.
+/// `ENOENT`, as Linux's is for one alone in its anonymous namespace, and
+/// one is found in the caller's namespace, not its file's.
 fn statmount(
     c: &mut Context<'_>,
     req: u64,
@@ -310,8 +311,10 @@ fn statmount(
     }
     let by_fd = flags & STATMOUNT_BY_FD != 0;
     let req = request(c, req, by_fd)?;
-    // By descriptor: the file's (`fget_raw`), whose mount gives the
-    // namespace; else the namespace named.
+    // By descriptor: the file's (`fget_raw`), whose mount is looked for in
+    // the caller's own namespace, where Linux takes the file's mount and
+    // its namespace (one opened before a `setns` differs); else the
+    // namespace named.
     let (space, file) = if by_fd {
         let d = c.files.descriptor(u64::from(req.fd))?;
         let own = Request {

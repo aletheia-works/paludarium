@@ -960,7 +960,9 @@ kernel.
   `UFFD_FEATURE_MINOR_HUGETLBFS`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
   `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_POISON` and
-  `UFFD_FEATURE_MOVE`, and `UFFD_FEATURE_EVENT_FORK` needs
+  `UFFD_FEATURE_MOVE` (the two `HUGETLBFS` ones as Linux reports them,
+  though there is no hugetlbfs memory to register: `MFD_HUGETLB` and
+  `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
   memory, shared anonymous memory and the shared or private mappings of a
   memfd, which is shmem's (not System V shared memory, whose VMAs Linux

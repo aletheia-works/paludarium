@@ -747,10 +747,11 @@ enum Fill {
 /// `UFFDIO_COPY`, `UFFDIO_ZEROPAGE`, `UFFDIO_POISON` or `UFFDIO_CONTINUE`
 /// (`kind`), as Linux's `userfaultfd_copy`, `userfaultfd_zeropage`,
 /// `userfaultfd_poison`, `userfaultfd_continue` and `mfill_atomic` have
-/// them, `UFFDIO_CONTINUE_MODE_WP` like `UFFDIO_COPY_MODE_WP`: page by page until one fails, which is the
-/// error if it is the first; the bytes filled, or the error, are written to
-/// the struct's last field (`EFAULT`), then the waits for them end unless
-/// `DONTWAKE`, and a fill that stopped short is `EAGAIN`.
+/// them: page by page until one fails, which is the error if it is the
+/// first; the bytes filled, or the error, are written to the struct's last
+/// field (`EFAULT`), then the waits for them end unless `DONTWAKE`, and a
+/// fill that stopped short is `EAGAIN`. `UFFDIO_CONTINUE_MODE_WP` needs
+/// the write-protect mode, as `UFFDIO_COPY_MODE_WP` does.
 fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Result<u64, Errno> {
     let copy = kind == Fill::Copy;
     let (dst, src, len, mode, result_at) = if copy {

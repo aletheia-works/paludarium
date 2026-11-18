@@ -207,6 +207,11 @@ every test passing.
   for a case whose differential test finds it equal to Linux's. The
   differential tests still compare the whole guests with Linux on every
   run.
+- The coverage job's summary prints the terminal gate's margin: its hit
+  and measured lines, the rate, and how many hit lines it has above the
+  80% floor (rounded up to a whole line). The lines are the gated lcov's,
+  which the report's TOTAL line also counts, so a pull request sees the
+  margin shrink before the gate fails.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)

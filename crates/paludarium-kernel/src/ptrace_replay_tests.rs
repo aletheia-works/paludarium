@@ -12,7 +12,8 @@
 //! run. What only the CPU does (a signal handler's body, the check a tracee
 //! makes after it resumes, the trap after each instruction a stepped
 //! tracee runs) is done here in Rust from the state the kernel left, or its
-//! line is left out; so is a line that needs an exec.
+//! line is left out. An exec runs a program that does nothing; the tracee
+//! then ends as the one the guest execs does.
 
 use super::*;
 
@@ -32,6 +33,7 @@ const GETPID: u64 = 39;
 const CLONE: u64 = 56;
 const FORK: u64 = 57;
 const VFORK: u64 = 58;
+const EXECVE: u64 = 59;
 const EXIT: u64 = 60;
 const WAIT4: u64 = 61;
 const KILL: u64 = 62;
@@ -205,6 +207,11 @@ impl Tracee {
             {
                 return Err(status);
             }
+            // As the runtime after an `execve`: the new image from now on.
+            if let Some(memory) = self.k.take_exec_memory() {
+                self.m = memory;
+                self.k.exec_finished();
+            }
             self.spawn();
             self.settle()?;
             match self.t.cpu.rip.0 {
@@ -334,6 +341,13 @@ impl Tracee {
         self.forked = Some(Box::new(body));
         self.sys(VFORK, [0; 6]).unwrap()
     }
+    /// `execve("/child")`, from which the tracee goes on as the program
+    /// it runs: `Err` is the process's end.
+    fn exec(&mut self) -> Result<u64, ExitStatus> {
+        let path = HEAP + 0xb00;
+        self.m.write(GuestAddr(path), b"/child\0").unwrap();
+        self.sys(EXECVE, [path, 0, 0, 0, 0, 0])
+    }
     /// `sigaction(signal)` with the handler at `HANDLER`.
     fn catch(&mut self, signal: u64, flags: u64) {
         let action = HEAP + 0xa00;
@@ -360,6 +374,14 @@ impl Tracee {
 impl Tracer {
     fn new() -> Self {
         let (k, t, m) = setup();
+        // The program a tracee execs, which ends as `exec-child` does.
+        let mut fs = paludarium_vfs::MemFs::new();
+        fs.add_file(paludarium_vfs::GuestFile::new(
+            "/child",
+            paludarium_loader::testing::tiny_exec(&[0x90], b""),
+        ))
+        .unwrap();
+        let k = k.with_file_system(Arc::new(fs));
         m.map_shared(
             Some(GuestAddr(HEAP)),
             HEAP_PAGES * PAGE_SIZE,
@@ -527,10 +549,10 @@ impl Tracer {
     }
 }
 
-/// `ptrace-traceme`, up to the exec: the stop for a signal the child sends
-/// itself, its siginfo, a peek and a poke, the registers, and a cancelled
-/// signal. The exec's stop is left out; the child ends with the code the
-/// program it would exec gives.
+/// `ptrace-traceme`: the stop for a signal the child sends itself, its
+/// siginfo, a peek and a poke, the registers, a cancelled signal, and the
+/// SIGTRAP its exec sends it. The program it execs ends with the code
+/// `exec-child` gives.
 #[test]
 fn traceme() {
     let mut g = Tracer::new();
@@ -554,6 +576,7 @@ fn traceme() {
             c.m.read_u64(GuestAddr(WORD)).unwrap(),
             0x0102_0304_0506_0708
         );
+        assert_eq!(c.exec(), Ok(0));
         c.exit(7)
     });
     let status = g.wait(child, 0);
@@ -596,6 +619,13 @@ fn traceme() {
     g.say("cont", cont);
     let running = g.pt(PEEKDATA, child, WORD, word);
     g.say("running-peek", running);
+    let status = g.wait(child, 0);
+    g.stop("exec", status);
+    let (_, _, code, pid) = g.siginfo(child);
+    g.say("exec-si-code", code);
+    g.say("exec-si-pid", i64::from(u64::from(pid) == child));
+    let cont = g.pt(CONT, child, 0, 0);
+    g.say("cont-exec", cont);
     thread.join().unwrap();
     let status = g.wait(child, 0);
     g.say("exited", i64::from(status & 0x7f == 0));
@@ -629,6 +659,12 @@ bad-signal=-5
 bad-request=-5
 cont=0
 running-peek=-3
+exec-stopped=1
+exec-signal=5
+exec-event=0
+exec-si-code=0
+exec-si-pid=1
+cont-exec=0
 exited=1
 exit-code=7
 no-tracee=-3",
@@ -1992,10 +2028,10 @@ process-exit=5",
     );
 }
 
-/// `ptrace-events`, up to the exec: PTRACE_EVENT_FORK and VFORK with their
-/// children attached as they start, VFORK_DONE, and EXIT as each ends. The
-/// exec's stop is left out; the tracee ends with the code the program it
-/// would exec gives.
+/// `ptrace-events`: PTRACE_EVENT_FORK and VFORK with their children
+/// attached as they start, VFORK_DONE, EXEC with the tracee's PID, and
+/// EXIT as each ends. The program it execs ends with the code
+/// `exec-child` gives.
 #[test]
 fn events() {
     let mut g = Tracer::new();
@@ -2008,6 +2044,7 @@ fn events() {
         let forked = c.fork(|c| c.exit(3));
         c.sys(WAIT4, [forked, HEAP + 0x990, 0, 0, 0, 0]).unwrap();
         c.vfork(|c| c.exit(4));
+        assert_eq!(c.exec(), Ok(0));
         c.exit(7)
     });
     let mut s = Strace {
@@ -2051,6 +2088,8 @@ fn events() {
     g.pt(CONT, child, 0, 0);
     s.expect(&mut g, child, "vfork-done");
     g.pt(CONT, child, 0, 0);
+    s.expect(&mut g, child, "exec");
+    g.pt(CONT, child, 0, 0);
     s.expect(&mut g, child, "exit");
     g.pt(CONT, child, 0, 0);
     s.expect(&mut g, child, "gone");
@@ -2069,6 +2108,7 @@ vforked: second signal=19 event=0 nr=58 rax=0 message=0
 vforked-exit: second signal=5 event=6 nr=231 rax=-38 message=1024
 vforked-gone: second exited=1 code=4
 vfork-done: parent signal=5 event=5 nr=58 rax=-38 message=second
+exec: parent signal=5 event=4 nr=59 rax=-38 message=parent
 exit: parent signal=5 event=6 nr=231 rax=-38 message=1792
 gone: parent exited=1 code=7",
     );

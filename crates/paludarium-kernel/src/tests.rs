@@ -9348,6 +9348,11 @@ fn a_bind_mount_of_a_generated_directory_shows_its_files() {
         assert_eq!(name, format!("/tmp/p/{pid}").as_bytes());
         assert_eq!(f.ret(3, &[fd]), 0);
     }
+    // Not followed at the end, `self` is the link, as `/proc/self` is.
+    let unbound = put(&mut f, 0x3c0, b"/proc/self");
+    for path in [own, unbound] {
+        assert_eq!(f.ret(2, &[path, 0o400000, 0]), errno(Errno(40)));
+    }
     // In use while it is the working directory.
     assert_eq!(f.ret(166, &[p, 0]), errno(Errno(16)));
     assert_eq!(f.ret(80, &[root]), 0);

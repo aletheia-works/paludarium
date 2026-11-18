@@ -1374,6 +1374,10 @@ pub(crate) fn generated_place(
     follow: bool,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let (file, shown) = c.files.through_generated(p, follow)?;
+    // A last `self` or `thread-self` not followed stays the link it is.
+    if !follow && (file == b"/proc/self" || file == b"/proc/thread-self") {
+        return Some((file, shown));
+    }
     let real = own_proc(c, &file);
     if real == file {
         return Some((file, shown));

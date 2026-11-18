@@ -28,6 +28,30 @@ pub struct SignalInbox {
     /// Whether the thread is in a system call, where it waits if it waits,
     /// which `/proc` shows other processes as sleeping.
     in_call: AtomicBool,
+    /// The registers of its last entry into the kernel
+    /// ([`Self::enter_kernel`]).
+    entry: Entry,
+}
+/// The registers Linux's `collect_syscall` reads of a task that has entered
+/// the kernel: `orig_ax` (the call's number, or -1 for another reason),
+/// the six arguments, the user stack pointer and the instruction pointer.
+/// Only its own thread writes them, around a count that is odd while it
+/// does, so another reads them whole ([`SignalInbox::entry`]).
+#[derive(Default)]
+struct Entry {
+    writes: AtomicU64,
+    words: [AtomicU64; 9],
+}
+/// What [`SignalInbox::entry`] reads: Linux's `struct syscall_info`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KernelEntry {
+    /// `orig_ax`: the call's number, or `u64::MAX` (-1) for an entry that
+    /// was no call.
+    pub number: u64,
+    /// Its arguments, 0 for an entry that was no call.
+    pub arguments: [u64; 6],
+    pub stack_pointer: u64,
+    pub instruction_pointer: u64,
 }
 #[derive(Default)]
 pub(crate) struct WakeReceipt {
@@ -41,6 +65,53 @@ impl SignalInbox {
     }
     pub(crate) fn in_call(&self) -> bool {
         self.in_call.load(Ordering::Relaxed)
+    }
+    /// Records, as its thread enters the kernel, the registers of the entry
+    /// (`/proc/<pid>/syscall`). Only that thread calls it.
+    pub(crate) fn enter_kernel(&self, entry: KernelEntry) {
+        let Entry { writes, words } = &self.entry;
+        let count = writes.load(Ordering::Relaxed);
+        writes.store(count.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        let values = [
+            entry.number,
+            entry.arguments[0],
+            entry.arguments[1],
+            entry.arguments[2],
+            entry.arguments[3],
+            entry.arguments[4],
+            entry.arguments[5],
+            entry.stack_pointer,
+            entry.instruction_pointer,
+        ];
+        for (word, value) in words.iter().zip(values) {
+            word.store(value, Ordering::Relaxed);
+        }
+        writes.store(count.wrapping_add(2), Ordering::Release);
+    }
+    /// The registers of the thread's last entry into the kernel, read whole
+    /// whatever the thread does meanwhile.
+    pub(crate) fn entry(&self) -> KernelEntry {
+        let Entry { writes, words } = &self.entry;
+        loop {
+            let before = writes.load(Ordering::Acquire);
+            if before % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let values: [u64; 9] = std::array::from_fn(|i| words[i].load(Ordering::Relaxed));
+            std::sync::atomic::fence(Ordering::Acquire);
+            if writes.load(Ordering::Relaxed) == before {
+                return KernelEntry {
+                    number: values[0],
+                    arguments: [
+                        values[1], values[2], values[3], values[4], values[5], values[6],
+                    ],
+                    stack_pointer: values[7],
+                    instruction_pointer: values[8],
+                };
+            }
+        }
     }
     /// Queues a signal for the single guest process from outside the
     /// emulator. The guest cannot see the sender, so `si_pid` is 0, as a PID

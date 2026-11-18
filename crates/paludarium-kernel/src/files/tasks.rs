@@ -617,6 +617,72 @@ pub(super) fn personality(
         owner,
     ))
 }
+/// `syscall` of the task, as Linux's `proc_pid_syscall` writes it when it
+/// is read, for a reader that may attach to it (`lock_trace`, else
+/// `EPERM`), as `task_current_syscall` finds the thread then: the call the
+/// reading thread itself is in; `running` for another that is running (in
+/// no system call and not stopped); and for one that is asleep in a call or
+/// stopped, the registers of its last entry into the kernel: the call's
+/// number, its six arguments, the stack pointer and the instruction pointer
+/// in hex, or -1 and the last two for an entry that was no call. A thread
+/// that has ended has no kernel stack left: -1 and zeros. 0400.
+pub(super) fn syscall(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    flags: u32,
+    owner: crate::proc::Owner,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let (processes, which) = at_read(processes, task);
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        let now = AtRead::find(&processes, which)?;
+        if !now.may_attach() {
+            return Err(Errno::EPERM);
+        }
+        let (_, tid, _) = which;
+        let threads = now.view.group.threads();
+        let entry = match threads.iter().find(|&&(t, _)| t == tid) {
+            None => None,
+            Some(&(_, in_call)) => {
+                let (_, reader) = crate::proc::caller();
+                let waits = reader == tid
+                    || in_call
+                    || now.view.group.is_stopped()
+                    || now.processes.traces.in_stop(tid);
+                if !waits {
+                    return Ok(b"running\n".to_vec());
+                }
+                now.view.group.kernel_entry(tid)
+            }
+        };
+        let entry = entry.unwrap_or(crate::inbox::KernelEntry {
+            number: u64::MAX,
+            ..Default::default()
+        });
+        Ok(render_syscall(&entry))
+    });
+    std::sync::Arc::new(crate::proc::single_file(
+        text,
+        flags,
+        crate::proc::private_stat(0),
+        owner,
+    ))
+}
+/// A line of `syscall`, as `proc_pid_syscall` prints `struct syscall_info`:
+/// the number as an `int`, then the arguments, for a call, and the stack and
+/// instruction pointers, in hex.
+fn render_syscall(entry: &crate::inbox::KernelEntry) -> Vec<u8> {
+    let number = entry.number as i32;
+    let (sp, ip) = (entry.stack_pointer, entry.instruction_pointer);
+    if number < 0 {
+        return format!("{number} {sp:#x} {ip:#x}\n").into_bytes();
+    }
+    let a = entry.arguments;
+    format!(
+        "{number} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {sp:#x} {ip:#x}\n",
+        a[0], a[1], a[2], a[3], a[4], a[5]
+    )
+    .into_bytes()
+}
 /// `wchan` of the task, as Linux's `proc_pid_wchan` writes it when it is
 /// read: `0`, with no newline, for a reader that may not read the task and
 /// for a task that is not waiting. There are no kernel functions here to
@@ -755,7 +821,9 @@ pub(super) fn stat(
         // As Linux's, of size 0, as they are made as they are read.
         TaskEntry::Maps(_) => crate::proc::stat(0),
         // 0400, as Linux's.
-        TaskEntry::Pagemap | TaskEntry::Io | TaskEntry::Personality => crate::proc::private_stat(0),
+        TaskEntry::Pagemap | TaskEntry::Io | TaskEntry::Personality | TaskEntry::Syscall => {
+            crate::proc::private_stat(0)
+        }
         // 0444, as Linux's.
         TaskEntry::Wchan => crate::proc::stat(0),
         // 0200, as Linux's.
@@ -888,4 +956,64 @@ pub(super) fn root_entries(c: &Context<'_>) -> Vec<DirectoryEntry> {
 pub(super) fn is_root(path: &[u8]) -> bool {
     path.starts_with(b"/proc")
         && paludarium_vfs::normalize_path(path).is_ok_and(|path| path == b"/proc")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inbox::KernelEntry;
+
+    #[test]
+    fn a_syscall_line_is_proc_pid_syscall_s() {
+        let call = KernelEntry {
+            number: 0,
+            arguments: [3, 0x7ffd_1000, 64, 0, u64::MAX, 1],
+            stack_pointer: 0x7ffd_0ff8,
+            instruction_pointer: 0x40_1234,
+        };
+        assert_eq!(
+            render_syscall(&call),
+            b"0 0x3 0x7ffd1000 0x40 0x0 0xffffffffffffffff 0x1 0x7ffd0ff8 0x401234\n"
+        );
+        // An entry that was no call: -1, and only the two pointers.
+        let interrupt = KernelEntry {
+            number: u64::MAX,
+            stack_pointer: 0x10,
+            instruction_pointer: 0x20,
+            ..KernelEntry::default()
+        };
+        assert_eq!(render_syscall(&interrupt), b"-1 0x10 0x20\n");
+        // The number is an int, as Linux's `syscall_info` keeps it.
+        let x32 = KernelEntry {
+            number: 0x4000_0000 | 1,
+            ..KernelEntry::default()
+        };
+        assert!(render_syscall(&x32).starts_with(b"1073741825 0x0 "));
+    }
+    #[test]
+    fn an_entry_reads_back_whole_while_its_thread_writes() {
+        let inbox = std::sync::Arc::new(crate::inbox::SignalInbox::default());
+        let writer = std::sync::Arc::clone(&inbox);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&done);
+        let thread = std::thread::spawn(move || {
+            for n in 0..20_000u64 {
+                writer.enter_kernel(KernelEntry {
+                    number: n,
+                    arguments: [n; 6],
+                    stack_pointer: n,
+                    instruction_pointer: n,
+                });
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            let entry = inbox.entry();
+            let n = entry.number;
+            assert_eq!(entry.arguments, [n; 6]);
+            assert_eq!((entry.stack_pointer, entry.instruction_pointer), (n, n));
+        }
+        thread.join().unwrap();
+        assert_eq!(inbox.entry().number, 19_999);
+    }
 }

@@ -3037,8 +3037,7 @@ kernel.
   A reader that may not see the task's memory, as Linux's
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
-  every field from `start_data` on, as Linux's `do_task_stat` hides them;
-  a zombie's dumpable flag no longer matters there.
+  every field from `start_data` on, as Linux's `do_task_stat` hides them.
   `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.

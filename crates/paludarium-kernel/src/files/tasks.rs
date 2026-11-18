@@ -101,15 +101,11 @@ impl Task {
     }
     /// Whether `stat` shows the reader where the task's memory is, as
     /// Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` decides for
-    /// `do_task_stat`: as [`Self::may_access`], but with no dumpable rule
-    /// once the memory is gone, as Linux's skips it with no `mm`.
+    /// `do_task_stat`: [`Self::may_access`] with the filesystem IDs, which
+    /// keeps a zombie's dumpable flag, as Linux 7.1 and later keep it in its
+    /// `exec_state` (`task_still_dumpable`).
     fn may_see_addresses(&self, c: &Context<'_>) -> bool {
-        self.pid == c.process.pid
-            || c.process.credentials.may_read_task(
-                &self.public.credentials,
-                self.view.dumpable || self.memory().is_none(),
-                false,
-            )
+        self.may_access(c, false)
     }
     fn start_stack(&self) -> u64 {
         if self.live() {

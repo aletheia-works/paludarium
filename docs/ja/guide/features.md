@@ -2466,12 +2466,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
-  `limits`、`comm`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、
-  `io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
+  `limits`、`comm`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、
+  `pagemap`、`io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
   プロセスのもので、`/proc/self` そのものは root のものです。`stat` は
-  その持ち主とモード（`environ`、`auxv`、`pagemap`、`io` は 0400、`comm` は 0644、ほかのファイルは 0444）を示します。
+  その持ち主とモード（`environ`、`auxv`、`pagemap`、`io` は 0400、`comm` は 0644、`clear_refs`
+  は 0200、ほかのファイルは 0444）を示します。
   開いたファイルの `fstat` は、そのパスを最後に探したとき（どのプロセスの open や `stat` でも）の
   持ち主を示します。Linux の inode と同じで、開いたファイルが押さえるパスを探すたびに新しく
   なります（`pid_revalidate`）。開いたディレクトリとその `ns` の `fstat` は、Linux の
@@ -2502,7 +2503,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`comm`、
-  `maps`、`smaps`、`pagemap`（0400）、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `maps`、`clear_refs`（0200）、`smaps`、`pagemap`（0400）、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
   `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
@@ -2762,12 +2763,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   メモリの `de`、`mm`、`dd`、課金（`ac`。書き込めたプライベートメモリが持ち、
   `MAP_NORESERVE` なら代わりに `nr` を持ちます。一度も書いていない匿名メモリは書き込め
   なくなるときに返します）、`MAP_STACK` のマッピングの `nh`、封印（`sl`）、最初の
-  スタック以外のすべての VMA の `sd` です。
+  スタック以外の、作られてから `clear_refs` に消されていない VMA の `sd`（`VM_SOFTDIRTY`）
+  です。新しい VMA とつながった VMA は、Linux の引き継がれるフラグと同じく、また `sd` を持ちます。
 - `/proc/self/pagemap`（モード 0400、大きさ 0）は、Linux の `pagemap_read` と同じく、
   ユーザー空間のページごとに 8 バイトのエントリーを持ちます。あるアドレスのページの
   エントリーは、そのアドレスをページの大きさで割って 8 を掛けた位置にあります。どの
-  マッピングにもないページのエントリーは 0 です。マッピングの中のページは、Linux が
-  新しい VMA にすべて付けるとおり soft-dirty（ビット 55）です。ガード領域のページ
+  マッピングにもないページのエントリーは 0 です。マッピングの中のページは、VMA が `sd`
+  を持つあいだ soft-dirty（ビット 55）で、エントリーのあるページは `clear_refs`（後述）の
+  あとに書き込まれたときもそうです。Linux の書き込みのフォールトが `_PAGE_SOFT_DIRTY` を
+  付けるのと同じです。ガード領域のページ
   （`MADV_GUARD_INSTALL`）はさらにスワップのエントリー（ビット 62）でガードのビット（58）を
   持ち、何かのアクセスでエントリーを得たページは存在します（ビット 63）。プライベートな
   匿名メモリを読んだだけで見えるゼロページは、それだけです。ほかの存在するページは、
@@ -2780,6 +2784,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   返しません。`lseek` は Linux の `mem_lseek` と同じく、始めか今の位置からどの位置にも
   動かせ、負の位置にもなります。そこからの `read` は `EINVAL` です。終わりからは
   `EINVAL` です。書き込めません（`EINVAL`。読むためだけに開いたディスクリプタでは `EBADF`）。
+- `/proc/<pid>/clear_refs`（モード 0200、大きさ 0。スレッドのものも）は、Linux の
+  `clear_refs_write` と同じく、書き込みの先頭の多くて 12 バイト（書き込みはこれを返します）を、
+  `kstrtoint` が 10 進で読むとおりに数として読みます（前後の空白を除き、符号と改行 1 つまで。
+  ほかは `EINVAL`、`int` を超えれば `ERANGE`）。数は 1 から 5 で（`EINVAL`）、そのあと
+  プロセスがまだある必要があります（`ESRCH`）。4 は、プロセスがそのとき持つアドレス空間の
+  すべての VMA とページの soft-dirty のビットを消します。ページは次の書き込みで、また
+  `mremap` が動かしたページ、`UFFDIO_COPY`、`UFFDIO_CONTINUE`、`UFFDIO_MOVE` がマップした
+  ページもビットを得ます。`fork` の子は各ページのビットを引き継ぎます。1 から 3 と 5 は
+  受け付けますが、見えるものは変わりません（制限事項を参照）。読み出しの操作はなく
+  （`EINVAL`。書くためだけに開いたディスクリプタでは `EBADF`）、`lseek` は 0 のままです。
 - `/proc/self/fd`（モード 0500。大きさは Linux の `proc_fd_getattr` と同じく開いている
   ディスクリプタの数）は、`.`、`..` と、開いているディスクリプタごとのリンクを並べます。名前は番号で、Linux と同じく先頭に 0 のない形で読みます。各リンクの
   `lstat` は、ユーザーのビットでディスクリプタのアクセスを示し、大きさは 64 です。`stat`

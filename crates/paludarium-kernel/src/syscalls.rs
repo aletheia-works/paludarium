@@ -2456,6 +2456,9 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             if flags & MAP_GROWSDOWN != 0 {
                 c.mem.grow_new_down(a, end);
             }
+            // A new VMA is soft-dirty, and so is the one it merged with
+            // (`__mmap_complete`).
+            c.mem.mapped(a, end);
             // Linux populates a writable private mapping by writing it, which
             // gives it an anon_vma (a core then writes it whole), with
             // MAP_POPULATE or a lock that is not on fault.

@@ -150,6 +150,11 @@ pub struct Mapping {
     /// never be executable: Linux's `do_mmap` clears its `VM_MAYEXEC`, and
     /// `mprotect` then refuses `PROT_EXEC` (`EACCES`).
     pub no_exec: bool,
+    /// Linux's `VM_SOFTDIRTY`: every new VMA but the initial stack has it
+    /// until `clear_refs` clears it, a merge gives it to the whole merged
+    /// VMA (`VMA_STICKY_FLAGS`), and `pagemap` shows each of its pages
+    /// soft-dirty ([`AddressSpaceData::spread_soft_dirty`]).
+    pub soft_dirty: bool,
 }
 
 /// The `userfaultfd` a mapping reports its faults to, and why
@@ -916,6 +921,11 @@ struct Page {
     /// write faults to the `userfaultfd` its mapping is registered with for
     /// [`Userfault::WP`], which it is set only while that lasts.
     uffd_wp: bool,
+    /// Linux's `_PAGE_SOFT_DIRTY`: written since `clear_refs` cleared it,
+    /// which write-protects the entry so that the next write sets it
+    /// (`clear_soft_dirty`). An entry made in a mapping with `VM_SOFTDIRTY`
+    /// has it from the start, as `pagemap` cannot tell the two apart.
+    soft_dirty: bool,
 }
 
 impl Page {
@@ -929,6 +939,7 @@ impl Page {
             cache: self.cache,
             shrinks: self.shrinks,
             uffd_wp: self.uffd_wp,
+            soft_dirty: self.soft_dirty,
         }
     }
 
@@ -940,6 +951,18 @@ impl Page {
             Prot(self.prot.0 & !Prot::WRITE.0)
         } else {
             self.prot
+        }
+    }
+
+    /// What a [`ThreadTlb`] may do with it without the locks: what an
+    /// access may, but a write while it is not soft-dirty, as
+    /// `clear_soft_dirty` write-protects it, which takes the locks to set
+    /// the bit ([`AddressSpaceData::prepare_write`]) and so is no fault.
+    fn cached_access(&self) -> Prot {
+        if self.soft_dirty {
+            self.access()
+        } else {
+            Prot(self.prot.0 & !Prot::WRITE.0)
         }
     }
 
@@ -2390,6 +2413,7 @@ impl AddressSpaceData {
             // Made now, so no shrink so far can leave it past the end.
             shrinks: self.file_at(page).map_or(0, |(source, _)| source.shrinks()),
             uffd_wp: false,
+            soft_dirty: self.mapping_at(page).is_some_and(|m| m.soft_dirty),
         }
     }
     /// A new entry for `page`, with its file read into it if need be.
@@ -2570,9 +2594,9 @@ impl AddressSpaceData {
     /// `pte_to_pagemap_entry` make them, without the frame number (bits 0 to
     /// 54), which only a reader with `CAP_SYS_ADMIN` sees.
     ///
-    /// A page outside every mapping is 0. One in a mapping is soft-dirty, as
-    /// Linux marks every new VMA `VM_SOFTDIRTY` and nothing here clears it
-    /// (`clear_refs`); a guard region's page is also a swap entry with the
+    /// A page outside every mapping is 0. One in a mapping is soft-dirty
+    /// when its mapping has `VM_SOFTDIRTY` or its entry `_PAGE_SOFT_DIRTY`
+    /// ([`Mapping::soft_dirty`]); a guard region's page is also a swap entry with the
     /// guard bit, as is a poisoned page without it and one with a uffd-wp
     /// marker with the `userfaultfd` bit, and one any access gave an entry
     /// is present. The zero page
@@ -2589,7 +2613,11 @@ impl AddressSpaceData {
                 let Some(mapping) = self.mapping_at(page) else {
                     return 0;
                 };
-                let mut entry = pagemap::SOFT_DIRTY;
+                let mut entry = if mapping.soft_dirty {
+                    pagemap::SOFT_DIRTY
+                } else {
+                    0
+                };
                 if self.guarded(page) {
                     return entry | pagemap::SWAP | pagemap::GUARD_REGION;
                 }
@@ -2604,6 +2632,9 @@ impl AddressSpaceData {
                     return entry;
                 };
                 entry |= pagemap::PRESENT;
+                if pte.soft_dirty {
+                    entry |= pagemap::SOFT_DIRTY;
+                }
                 if pte.uffd_wp {
                     entry |= pagemap::UFFD_WP;
                 }
@@ -3005,7 +3036,7 @@ impl AddressSpaceData {
             }
             thread.tlb.insert(TlbEntry {
                 page,
-                prot: p.access(),
+                prot: p.cached_access(),
                 frame: TlbFrame::of(&p.frame),
                 fetched: Arc::clone(&p.frame.fetched),
                 cow: p.cow,
@@ -3197,7 +3228,10 @@ impl AddressSpaceData {
             self.check(&directory, addr, len, access)?;
             let ready = |page: u64| {
                 lookup(&directory, page).is_some_and(|p| {
-                    !p.cow && p.frame.get().is_some() && !self.may_be_truncated(page, p)
+                    !p.cow
+                        && p.soft_dirty
+                        && p.frame.get().is_some()
+                        && !self.may_be_truncated(page, p)
                 })
             };
             if chunks(addr, len).all(|(page, _, _)| ready(page)) {
@@ -3227,7 +3261,7 @@ impl AddressSpaceData {
                 && table.pages.get(slot).is_some_and(|entry| {
                     entry
                         .as_ref()
-                        .is_none_or(|p| p.cow || p.frame.get().is_none())
+                        .is_none_or(|p| p.cow || !p.soft_dirty || p.frame.get().is_none())
                 })
             {
                 faults::count();
@@ -3244,6 +3278,15 @@ impl AddressSpaceData {
                     bus: false,
                     poison: false,
                 });
+            }
+            // A write's entry is dirty (`pte_mkdirty`, which sets
+            // `_PAGE_SOFT_DIRTY` on x86). The loader's and a refill's are
+            // not writes: a page `MADV_DONTNEED` refilled has no entry on
+            // Linux, and is only as soft-dirty as its VMA.
+            if access != Access::Setup
+                && let Some(Some(p)) = table.pages.get_mut(slot)
+            {
+                p.soft_dirty = true;
             }
             if let Some(p) = lookup(&directory, page)
                 && p.frame_for_write(self.meter.as_ref()).is_none()
@@ -3387,8 +3430,7 @@ impl AddressSpaceData {
     /// Linux's `vm_flags` of the VMA `[start, end)` ([`vm`]), but for what
     /// its file adds ([`PageSource::vma_flags`]). Its mappings agree on all
     /// but the sticky flags, which any of them gives it (`VMA_STICKY_FLAGS`):
-    /// `VM_MAYBE_GUARD`, and `VM_SOFTDIRTY`, which every new VMA but the
-    /// initial stack has (`setup_arg_pages` gives it flags without it).
+    /// `VM_MAYBE_GUARD`, and `VM_SOFTDIRTY` ([`Mapping::soft_dirty`]).
     fn vma_flags(&self, start: u64, end: u64) -> u64 {
         let pieces: Vec<&Mapping> = self.mappings.range(start..end).map(|(_, m)| m).collect();
         let Some(&&m) = pieces.first() else {
@@ -3431,8 +3473,7 @@ impl AddressSpaceData {
                 vm::UFFD_MINOR,
             );
         for piece in pieces {
-            flags |= bit(piece.maybe_guard, vm::MAYBE_GUARD)
-                | bit(piece.kind != MappingKind::Stack, vm::SOFTDIRTY);
+            flags |= bit(piece.maybe_guard, vm::MAYBE_GUARD) | bit(piece.soft_dirty, vm::SOFTDIRTY);
         }
         flags
     }
@@ -3592,6 +3633,7 @@ impl AddressSpaceData {
                 grows_down: kind == MappingKind::Stack,
                 userfault: None,
                 no_exec: false,
+                soft_dirty: kind != MappingKind::Stack,
             },
         );
         Ok(GuestAddr(start))
@@ -3745,6 +3787,56 @@ impl AddressSpaceData {
             }
     }
 
+    /// Gives `VM_SOFTDIRTY` to every mapping of a Linux VMA that holds or
+    /// borders `[start, end)` when one of them has it, as a merge gives the
+    /// merged VMA the sticky flags of each (`VMA_STICKY_FLAGS`), which it
+    /// keeps when it is split again; called once a change of mappings that
+    /// Linux merges after is done.
+    fn spread_soft_dirty(&mut self, start: u64, end: u64) {
+        let before = start.saturating_sub(1);
+        let mut starts: Vec<u64> = self
+            .mapping_at(before)
+            .map(|m| m.start.0)
+            .into_iter()
+            .collect();
+        starts.extend(self.mappings.range(before..=end).map(|(&s, _)| s));
+        let mut done = 0;
+        for at in starts {
+            if at < done {
+                continue;
+            }
+            let Some((first, last)) = self.region_at(at) else {
+                continue;
+            };
+            done = last;
+            if self.mappings.range(first..last).any(|(_, m)| m.soft_dirty) {
+                for (_, m) in self.mappings.range_mut(first..last) {
+                    m.soft_dirty = true;
+                }
+            }
+        }
+    }
+
+    /// `clear_refs` 4 (`CLEAR_REFS_SOFT_DIRTY`), as Linux's
+    /// `clear_refs_write` and `clear_soft_dirty` make it: every mapping
+    /// loses `VM_SOFTDIRTY`, and every page entry its soft-dirty bit, which
+    /// write-protects it until its next write sets the bit again
+    /// ([`Page::cached_access`]).
+    fn clear_soft_dirty(&mut self) {
+        for mapping in self.mappings.values_mut() {
+            mapping.soft_dirty = false;
+        }
+        let directory = self
+            .directory
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        for table in directory.values_mut() {
+            for page in table.pages.iter_mut().flatten() {
+                page.soft_dirty = false;
+            }
+        }
+    }
+
     /// The `[start, end)` of the Linux VMA holding `addr`: the mapping there
     /// and the adjacent ones Linux would have merged with it.
     fn region_at(&self, addr: u64) -> Option<(u64, u64)> {
@@ -3871,8 +3963,10 @@ impl AddressSpaceData {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner);
         for (page, mut entry) in pages {
-            // Nor its pages write-protected (`move_ptes`).
+            // Nor its pages write-protected (`move_ptes`), which are
+            // soft-dirty (`move_soft_dirty_pte`).
             entry.uffd_wp = false;
+            entry.soft_dirty = true;
             let (dir, slot) = page_index(page - old + to);
             directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
         }
@@ -4648,6 +4742,9 @@ impl AddressSpaceData {
             };
         }
         entry.uffd_wp = protect;
+        // `mfill_atomic_install_pte` makes a dirty entry; the zero page
+        // of private memory (`mfill_atomic_pte_zeropage`) is not.
+        entry.soft_dirty |= bytes.is_some() || shared.is_some();
         if let Some(contents) = contents {
             // The file's page goes back to the file.
             if file && shared.is_some() {
@@ -4728,6 +4825,8 @@ impl AddressSpaceData {
         let mut entry = self.page(page, prot);
         self.fill_from_file(page, &entry);
         entry.uffd_wp = protect;
+        // A dirty entry (`mfill_atomic_install_pte`).
+        entry.soft_dirty = true;
         let (dir, slot) = page_index(page);
         directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
         drop(directory);
@@ -4854,9 +4953,11 @@ impl AddressSpaceData {
                 .get_mut(&dir)
                 .and_then(|table| table.pages[slot].take());
             let entry = match taken {
+                // Soft-dirty, so that the move shows (`move_present_ptes`).
                 Some(entry) if !zero => Page {
                     prot: dst_mapping.prot,
                     uffd_wp: false,
+                    soft_dirty: true,
                     ..entry
                 },
                 _ => self.page(to, dst_mapping.prot),
@@ -5720,6 +5821,12 @@ impl MemoryView {
         self.with_data(|data| data.page_state(GuestAddr(addr).page_align_down().0))
             .flatten()
     }
+    /// See [`AddressSpaceData::clear_soft_dirty`]; `false` once the space
+    /// is gone.
+    pub fn clear_soft_dirty(&self) -> bool {
+        self.with_data_mut(AddressSpaceData::clear_soft_dirty)
+            .is_some()
+    }
     /// The `/proc/<pid>/pagemap` entries of the `count` pages from the page
     /// at `start` ([`pagemap`]), or `None` once the space is gone.
     #[must_use]
@@ -5761,8 +5868,12 @@ impl MemoryView {
         context: u64,
         modes: u8,
     ) -> Result<(), Errno> {
-        self.with_data_mut(|data| data.userfault_register(start, end, context, modes))
-            .unwrap_or(Err(Errno::ENOMEM))
+        self.with_data_mut(|data| {
+            let result = data.userfault_register(start, end, context, modes);
+            data.spread_soft_dirty(start, end);
+            result
+        })
+        .unwrap_or(Err(Errno::ENOMEM))
     }
     /// See [`AddressSpaceData::userfault_unregister`]; `ENOMEM` once the
     /// space is gone.
@@ -5772,12 +5883,19 @@ impl MemoryView {
         end: u64,
         context: u64,
     ) -> Result<Vec<(u64, u64)>, Errno> {
-        self.with_data_mut(|data| data.userfault_unregister(start, end, context))
-            .unwrap_or(Err(Errno::ENOMEM))
+        self.with_data_mut(|data| {
+            let result = data.userfault_unregister(start, end, context);
+            data.spread_soft_dirty(start, end);
+            result
+        })
+        .unwrap_or(Err(Errno::ENOMEM))
     }
     /// See [`AddressSpaceData::userfault_release`].
     pub fn userfault_release(&self, context: u64) {
-        self.with_data_mut(|data| data.userfault_release(context));
+        self.with_data_mut(|data| {
+            data.userfault_release(context);
+            data.spread_soft_dirty(0, USER_ADDRESS_LIMIT);
+        });
     }
     /// Whether the space still lives, as Linux's `mmget_not_zero` asks.
     #[must_use]
@@ -6527,6 +6645,12 @@ impl AddressSpace {
     ) -> Result<GuestAddr, Errno> {
         self.locked().map(addr, len, prot, kind)
     }
+    /// Ends a new mapping `[addr, end)` that `mmap` made and flagged: it
+    /// is soft-dirty, and so is the Linux VMA it merged with
+    /// ([`AddressSpaceData::spread_soft_dirty`]).
+    pub fn mapped(&self, addr: GuestAddr, end: u64) {
+        self.locked().spread_soft_dirty(addr.0, end);
+    }
     pub fn unmap(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         self.unmap_shared(addr, len)
     }
@@ -6535,7 +6659,10 @@ impl AddressSpace {
     }
     /// See [`AddressSpaceData::seal`].
     pub fn seal_shared(&self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
-        self.locked().seal(addr, len)
+        let mut data = self.locked();
+        let result = data.seal(addr, len);
+        data.spread_soft_dirty(addr.0, addr.0.saturating_add(len));
+        result
     }
     /// See [`AddressSpaceData::removals`]: the memory to free, which the
     /// kernel frees with the lock released, as its file may take time.
@@ -6565,11 +6692,17 @@ impl AddressSpace {
     }
     /// See [`AddressSpaceData::advise_flags`].
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
-        self.locked().advise_flags(addr.0, end, advice)
+        let mut data = self.locked();
+        let result = data.advise_flags(addr.0, end, advice);
+        data.spread_soft_dirty(addr.0, end);
+        result
     }
     /// See [`AddressSpaceData::lock`].
     pub fn lock(&self, addr: GuestAddr, end: u64, lock: Option<Lock>) -> Result<(), Errno> {
-        self.locked().lock(addr.0, end, lock)
+        let mut data = self.locked();
+        let result = data.lock(addr.0, end, lock);
+        data.spread_soft_dirty(addr.0, end);
+        result
     }
     /// See [`AddressSpaceData::lock_new`].
     pub fn lock_new(&self, addr: GuestAddr, end: u64, lock: Lock) {
@@ -6592,7 +6725,9 @@ impl AddressSpace {
     }
     /// See [`AddressSpaceData::lock_all`].
     pub fn lock_all(&self, current: Option<Option<Lock>>, future: Option<Lock>) {
-        self.locked().lock_all(current, future);
+        let mut data = self.locked();
+        data.lock_all(current, future);
+        data.spread_soft_dirty(0, USER_ADDRESS_LIMIT);
     }
     /// See [`AddressSpaceData::first_locked`].
     pub fn first_locked(&self, addr: GuestAddr, end: u64) -> Option<Mapping> {
@@ -6616,7 +6751,10 @@ impl AddressSpace {
     }
     /// See [`AddressSpaceData::guard`].
     pub fn guard(&self, addr: GuestAddr, end: u64, install: bool) -> Result<(), Errno> {
-        self.locked().guard(addr.0, end, install)
+        let mut data = self.locked();
+        let result = data.guard(addr.0, end, install);
+        data.spread_soft_dirty(addr.0, end);
+        result
     }
     /// Whether `[addr, end)` has a guard page (`MADV_GUARD_INSTALL`), where
     /// Linux's `mlock` fails to fault a page in.
@@ -6671,14 +6809,22 @@ impl AddressSpace {
         new_len: u64,
         how: Remap,
     ) -> Result<GuestAddr, Errno> {
-        self.locked().remap(addr, old_len, new_len, how)
+        let mut data = self.locked();
+        let result = data.remap(addr, old_len, new_len, how);
+        if let Ok(at) = result {
+            data.spread_soft_dirty(at.0, at.0.saturating_add(new_len));
+        }
+        result
     }
     /// See [`AddressSpaceData::covers`].
     pub fn covers(&self, addr: GuestAddr, len: u64) -> Result<bool, Errno> {
         self.locked().covers(addr, len)
     }
     pub fn protect_shared(&self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), Errno> {
-        self.locked().protect(addr, len, prot)
+        let mut data = self.locked();
+        let result = data.protect(addr, len, prot);
+        data.spread_soft_dirty(addr.0, addr.0.saturating_add(len));
+        result
     }
     pub fn set_initial_break(&mut self, addr: GuestAddr) {
         self.locked().set_initial_break(addr);
@@ -6692,11 +6838,18 @@ impl AddressSpace {
         self.locked().current_break()
     }
     pub fn set_break(&mut self, addr: GuestAddr) -> GuestAddr {
-        self.locked().set_break(addr)
+        self.set_break_shared(addr)
     }
-    /// Adjusts the shared process break under the memory/mapping lock.
+    /// Adjusts the shared process break under the memory/mapping lock;
+    /// a heap it grows is soft-dirty, as `do_brk_flags` makes it.
     pub fn set_break_shared(&self, addr: GuestAddr) -> GuestAddr {
-        self.locked().set_break(addr)
+        let mut data = self.locked();
+        let before = data.current_break().0;
+        let after = data.set_break(addr);
+        if after.0 > before {
+            data.spread_soft_dirty(before, after.0);
+        }
+        after
     }
     /// A locked instruction: one update of the bytes, atomic against every
     /// other access to them, that needs write access to them even when its
@@ -7667,6 +7820,14 @@ mod tests {
         space.write_u64(anon, 5).unwrap();
         space.write_u64(anon, 6).unwrap();
         assert_eq!(faults::take(), 2);
+        // After `clear_refs` 4, the first write to each page faults, as its
+        // entry is write-protected, and a second one does not.
+        assert!(space.view().clear_soft_dirty());
+        space.write_u64(anon, 7).unwrap();
+        space.write_u64(next, 8).unwrap();
+        space.write_u64(anon, 9).unwrap();
+        space.write_u64(next, 10).unwrap();
+        assert_eq!(faults::take(), 2);
         // A core dump's reads count none.
         let fresh = space
             .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
@@ -7792,6 +7953,29 @@ mod tests {
             })
             .unwrap();
         assert!(written.is_empty(), "the cache stays clean");
+    }
+
+    #[test]
+    fn a_refill_after_a_discard_is_no_write_for_soft_dirty() {
+        let size = Arc::new(AtomicU64::new(2 * PAGE_SIZE));
+        let file: Arc<dyn PageSource> = Arc::new(Resizable(size));
+        let space = AddressSpace::new();
+        let at = space
+            .map_shared(None, 2 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+            .unwrap();
+        space
+            .back_with_file(at, 2 * PAGE_SIZE, Arc::clone(&file), 0)
+            .unwrap();
+        space.write(at, b"x").unwrap();
+        assert!(space.view().clear_soft_dirty());
+        space.discard_shared(at, PAGE_SIZE).unwrap();
+        let dirty = |space: &AddressSpace| {
+            space.view().pagemap(at.0, 1).unwrap()[0] & pagemap::SOFT_DIRTY != 0
+        };
+        assert!(!dirty(&space));
+        assert_eq!(byte(&space, at.0), 0);
+        space.write(at, b"y").unwrap();
+        assert!(dirty(&space));
     }
 
     #[test]

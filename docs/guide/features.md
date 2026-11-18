@@ -2841,12 +2841,13 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `comm`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
-  `smaps`, `pagemap`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
+  `clear_refs`, `smaps`, `pagemap`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them; the directory, `task` and `fdinfo` (0555) are the process's
   either way, and `/proc/self` itself is root's. `stat` shows that owner and
-  the mode, 0400 for `environ`, `auxv`, `pagemap` and `io`, 0644 for `comm` and 0444 for the other files.
+  the mode, 0400 for `environ`, `auxv`, `pagemap` and `io`, 0644 for `comm`, 0200 for
+  `clear_refs` and 0444 for the other files.
   `fstat` of an open file shows its owner as of the last lookup of its path
   (an open, a `stat`, by any process), as Linux's inode, which each lookup
   of the path an open file pins brings up to date (`pid_revalidate`); of
@@ -2885,8 +2886,8 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`,
-  `comm`, `maps`, `smaps`, `pagemap` (0400), `io` (0400), `exe`, `cwd`, `root`, `mounts`,
-  `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
+  `comm`, `maps`, `clear_refs` (0200), `smaps`, `pagemap` (0400), `io` (0400), `exe`, `cwd`,
+  `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
   reaped, whatever a mounted host `/proc` holds. `task` lists the threads of
@@ -3188,12 +3189,16 @@ kernel.
   secret memory, the charge (`ac`, which private memory that was writable
   has unless `MAP_NORESERVE` gave it `nr`, and which anonymous memory never
   written gives back as it stops being writable), `nh` of a `MAP_STACK`
-  mapping, the seal (`sl`), and `sd` on every VMA but the initial stack.
+  mapping, the seal (`sl`), and `sd` (`VM_SOFTDIRTY`) on every VMA
+  `clear_refs` has not cleared since it was made, but the initial stack:
+  one that merges with a new VMA has it again, as Linux's sticky flags.
 - `/proc/self/pagemap` (mode 0400, size 0) has an entry of 8 bytes for
   each page of user space, as Linux's `pagemap_read` gives them: the
   entry of the page at an address is at that address divided by the page
   size, times 8. An entry outside every mapping is 0. In a mapping it is
-  soft-dirty (bit 55), as Linux marks every new VMA so; a guard region's
+  soft-dirty (bit 55) while its VMA has `sd`, and a page with an entry also
+  once it is written after `clear_refs` (below), as Linux's write fault
+  sets `_PAGE_SOFT_DIRTY`; a guard region's
   page (`MADV_GUARD_INSTALL`) is also a swap entry (bit 62) with the guard
   bit (58); and a page any access gave an entry is present (bit 63). The
   zero page that a read of private anonymous memory shows is only that.
@@ -3208,6 +3213,18 @@ kernel.
   as Linux's `mem_lseek`, a negative one too, from which a read is `EINVAL`;
   from the end it is `EINVAL`. It cannot be written (`EINVAL`, `EBADF` on a
   descriptor open only for reading).
+- `/proc/<pid>/clear_refs` (mode 0200, size 0, a thread's too), as Linux's
+  `clear_refs_write`: a write's first 12 bytes at most, which is what it
+  returns, are a number as `kstrtoint` reads one in base 10 (spaces
+  stripped, a sign, one newline; `EINVAL`, `ERANGE` past an `int`) from 1
+  to 5 (`EINVAL`), and then the process must still be there (`ESRCH`). 4
+  clears the soft-dirty bit of every VMA and every page of the address
+  space the process has at that moment: a page's next write sets it again,
+  as does `mremap` for a page it moves and `UFFDIO_COPY`, `UFFDIO_CONTINUE`
+  and `UFFDIO_MOVE` for the page they map, and a `fork`ed child keeps each
+  page's bit. 1 to 3 and 5 are taken and change nothing shown (see
+  Limitations). It has no read operation (`EINVAL`, `EBADF` on a descriptor
+  open only for writing), and `lseek` leaves it at 0.
 - `/proc/self/fd` (mode 0500, its size the number of open descriptors, as
   Linux's `proc_fd_getattr` gives it) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each

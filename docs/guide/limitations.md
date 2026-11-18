@@ -70,9 +70,13 @@ verified.
   written, not until the page was. A read of a file's page gives only
   that page an entry, where Linux's fault maps the pages around it too
   (`fault_around_bytes`). The frame number is 0 for every reader, also one
-  with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; nothing
-  clears the soft-dirty bit (`/proc/<pid>/clear_refs` is not there); and
+  with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
+- **`/proc/<pid>/clear_refs`, in part**: only 4 (soft-dirty) changes
+  anything. 1, 2 and 3 are taken, but no referenced bits are kept, so
+  `smaps`' `Referenced` stays the resident size, where Linux's drops until
+  the pages are touched again; 5 is taken, and no peak resident size is
+  kept to reset.
 - **4-level paging only**: the emulated machine always has 4-level page
   tables, whatever CPU the host has: user space ends below 2^47 bytes, and
   `TASK_SIZE_MAX` is 2^47 - 4096 for every check that asks for it, as the

@@ -6251,6 +6251,188 @@ static int pagemap_case(void) {
     return 0;
 }
 
+/* pm_show without the exclusive bit (bit 56), which Linux sets again for
+   a page fork shared once only one process maps it: the emulator keeps no
+   map counts. */
+static void cr_show(int fd, const char *label, void *at, int pages) {
+    uint64_t entries[16] = {0};
+    errno = 0;
+    ssize_t n = pread(fd, entries, (size_t)pages * 8, (off_t)((uintptr_t)at / 4096 * 8));
+    printf("%s: n=%zd errno=%d", label, n, errno);
+    for (int i = 0; n > 0 && i < n / 8; i++)
+        printf(" %llx", (unsigned long long)(entries[i] & ~(1ULL << 56)));
+    printf("\n");
+}
+
+/* Writes `text` to clear_refs at `fd`: what write returned, and errno. */
+static void cr_write(int fd, const char *label, const char *text, size_t len) {
+    errno = 0;
+    ssize_t n = write(fd, text, len);
+    printf("%s: n=%zd errno=%d\n", label, n, errno);
+}
+
+/* Whether the VMA at `at` has VM_SOFTDIRTY, as smaps' VmFlags shows it
+   ("sd"): 1, 0, or -1 when smaps has no such VMA. */
+static int cr_vma_soft_dirty(void *at) {
+    static char text[1 << 17];
+    int fd = open("/proc/self/smaps", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t length = 0;
+    ssize_t n;
+    while (length < sizeof text - 1 && (n = read(fd, text + length, sizeof text - 1 - length)) > 0)
+        length += (size_t)n;
+    close(fd);
+    text[length] = 0;
+    char head[32];
+    snprintf(head, sizeof head, "%lx-", (unsigned long)(uintptr_t)at);
+    for (char *line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+        if (strncmp(line, head, strlen(head))) continue;
+        char *flags = strstr(line, "VmFlags:");
+        if (!flags) return -1;
+        char *end = strchr(flags, '\n');
+        for (char *p = flags + 8; p && (!end || p < end); p = strchr(p + 1, ' ')) {
+            if (!strncmp(p, " sd", 3) && (p[3] == ' ' || p[3] == '\n' || p[3] == 0)) return 1;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+/* /proc/<pid>/clear_refs: writing 4 clears the soft-dirty bit of every
+   page and VMA, which the next write to a page sets again; a new VMA or
+   one that merges with a new one is soft-dirty again, and so is a page
+   mremap moves. The other numbers change nothing pagemap shows. How the
+   number is read, and the file's mode. */
+static int clear_refs_case(void) {
+    long page = 4096;
+    /* As the pagemap case: an unprivileged user that owns its files, so
+       that no frame numbers show and the 0200 file is not read. */
+    if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534))
+        return 79;
+    if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)) return 78;
+    struct stat st;
+    int got = stat("/proc/self/clear_refs", &st);
+    printf("stat=%d mode=%o size=%lld\n", got, st.st_mode, (long long)st.st_size);
+    errno = 0;
+    int r = open("/proc/self/clear_refs", O_RDONLY);
+    printf("open-read=%d errno=%d\n", r < 0 ? -1 : 0, errno);
+    if (r >= 0) close(r);
+    errno = 0;
+    r = open("/proc/self/clear_refs", O_RDWR);
+    printf("open-rdwr=%d errno=%d\n", r < 0 ? -1 : 0, errno);
+    if (r >= 0) close(r);
+    int clear = open("/proc/self/clear_refs", O_WRONLY);
+    if (clear < 0) return 80;
+    int map = open("/proc/self/pagemap", O_RDONLY);
+    if (map < 0) return 81;
+    char *base = mmap(NULL, 64 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 82;
+    munmap(base, (size_t)(64 * page));
+    int flags = MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS;
+    char *a = mmap(base + 2 * page, 4 * page, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (a == MAP_FAILED) return 83;
+    volatile char seen = a[page];
+    a[2 * page] = 1;
+    a[3 * page] = 1;
+    /* Untouched, read (the zero page), written twice. */
+    pm_show(map, "before", a, 4);
+    printf("vma before=%d\n", cr_vma_soft_dirty(a));
+    cr_write(clear, "clear", "4", 1);
+    pm_show(map, "cleared", a, 4);
+    printf("vma cleared=%d\n", cr_vma_soft_dirty(a));
+    /* Only a write sets it again: a read, of the zero page too, does not. */
+    seen = a[0];
+    seen = a[page];
+    seen = a[2 * page];
+    a[3 * page] = 2;
+    pm_show(map, "written", a, 4);
+    /* The other numbers leave it as it is. */
+    for (const char *const *n = (const char *const[]){"1", "2", "3", "5", NULL}; *n; n++)
+        cr_write(clear, *n, *n, 1);
+    pm_show(map, "others", a, 4);
+    /* An mprotect that splits the VMA and one that merges it again keep it
+       clean. */
+    mprotect(a + page, (size_t)page, PROT_READ);
+    mprotect(a + page, (size_t)page, PROT_READ | PROT_WRITE);
+    pm_show(map, "reprotected", a, 4);
+    printf("vma reprotected=%d\n", cr_vma_soft_dirty(a));
+    /* A new mapping that merges with it makes the VMA soft-dirty, which
+       stays when the new part goes. */
+    if (mmap(a + 4 * page, (size_t)page, PROT_READ | PROT_WRITE, flags, -1, 0) == MAP_FAILED) return 84;
+    printf("vma merged=%d\n", cr_vma_soft_dirty(a));
+    munmap(a + 4 * page, (size_t)page);
+    pm_show(map, "merged", a, 4);
+    printf("vma unmerged=%d\n", cr_vma_soft_dirty(a));
+
+    /* mremap: the pages it moves are soft-dirty, the VMA as it was. */
+    char *m = mmap(base + 10 * page, 2 * page, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (m == MAP_FAILED) return 85;
+    m[0] = 1;
+    cr_write(clear, "clear-again", "4", 1);
+    pm_show(map, "unmoved", m, 2);
+    char *moved = mremap(m, (size_t)(2 * page), (size_t)(2 * page), MREMAP_MAYMOVE | MREMAP_FIXED,
+                         base + 20 * page);
+    if (moved == MAP_FAILED) return 86;
+    pm_show(map, "moved", moved, 2);
+    printf("vma moved=%d\n", cr_vma_soft_dirty(moved));
+
+    /* fork: the child's pages keep their bits; its write to a page they
+       share sets the bit in the child only. */
+    cr_write(clear, "clear-fork", "4", 1);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 87;
+    if (!child) {
+        int own = open("/proc/self/pagemap", O_RDONLY);
+        cr_show(own, "child", a, 4);
+        a[2 * page] = 3;
+        cr_show(own, "child-written", a, 4);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    cr_show(map, "parent", a, 4);
+
+    /* Another process's file, and a thread's. */
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/clear_refs", (int)getpid());
+    a[3 * page] = 4;
+    int thread = open(path, O_WRONLY);
+    cr_write(thread, "thread", "4", 1);
+    if (thread >= 0) close(thread);
+    cr_show(map, "thread-cleared", a, 4);
+
+    /* How the number is read: kstrtoint in base 10, spaces stripped, at
+       most 12 bytes taken. */
+    cr_write(clear, "spaces", " +4 \n", 5);
+    cr_write(clear, "nul", "4\0junk", 6);
+    cr_write(clear, "long", "1                   ", 20);
+    cr_write(clear, "empty", "", 0);
+    cr_write(clear, "zero", "0", 1);
+    cr_write(clear, "six", "6", 1);
+    cr_write(clear, "negative", "-1", 2);
+    cr_write(clear, "hex", "0x4", 3);
+    cr_write(clear, "trailing", "4x", 2);
+    cr_write(clear, "newlines", "4\n\n", 3);
+    cr_write(clear, "overflow", "99999999999", 11);
+    cr_write(clear, "bad-buffer", (const char *)16, 1);
+    char buf[4];
+    errno = 0;
+    ssize_t n = read(clear, buf, sizeof buf);
+    printf("read=%zd errno=%d\n", n, errno);
+    errno = 0;
+    off_t at = lseek(clear, 100, SEEK_SET);
+    printf("seek=%lld errno=%d\n", (long long)at, errno);
+    errno = 0;
+    n = pwrite(clear, "4", 1, 7);
+    printf("pwrite=%zd errno=%d\n", n, errno);
+    (void)seen;
+    close(clear);
+    close(map);
+    return 0;
+}
+
 /* `path`'s mode, and whether its owner and group are `uid`'s (1), root's
    (0) or another's (-1), by stat, or lstat with `link`. */
 static void po_show(const char *label, const char *path, int link, uid_t uid) {
@@ -30262,6 +30444,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "mincore")) return mincore_cases();
     if (!strcmp(mode, "pagemap")) return pagemap_case();
+    if (!strcmp(mode, "clear-refs")) return clear_refs_case();
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {

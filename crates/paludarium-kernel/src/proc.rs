@@ -36,6 +36,13 @@ pub(crate) fn private_stat(length: usize) -> FileStat {
         ..stat(length)
     }
 }
+/// `clear_refs`'s `stat`: a regular 0200 file of size 0, as Linux's.
+pub(crate) fn write_only_stat() -> FileStat {
+    FileStat {
+        mode: 0o100_200,
+        ..stat(0)
+    }
+}
 /// The paths served, and whether each one is the mountinfo format.
 pub(crate) fn mount_table(path: &[u8]) -> Option<bool> {
     match path {
@@ -107,7 +114,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 24] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 25] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -126,6 +133,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 24] = [
     (b"exe", 10),
     (b"mounts", 8),
     (b"mountinfo", 8),
+    (b"clear_refs", 8),
     (b"smaps", 8),
     (b"pagemap", 8),
     (b"io", 8),
@@ -134,7 +142,7 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 24] = [
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 24] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 25] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -153,6 +161,7 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 24] = [
     (b"exe", 10),
     (b"mounts", 8),
     (b"mountinfo", 8),
+    (b"clear_refs", 8),
     (b"smaps", 8),
     (b"pagemap", 8),
     (b"io", 8),
@@ -186,6 +195,9 @@ pub(crate) enum TaskEntry {
     Maps(bool),
     /// `pagemap`, the entry of each page of its address space.
     Pagemap,
+    /// `clear_refs`, which a write clears its pages' soft-dirty bits with
+    /// ([`ClearRefsFile`]).
+    ClearRefs,
     /// `io`, the counts of its reads and writes.
     Io,
     /// `fd`, and one of its links by descriptor number.
@@ -255,6 +267,7 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"maps" => TaskEntry::Maps(false),
         b"smaps" => TaskEntry::Maps(true),
         b"pagemap" => TaskEntry::Pagemap,
+        b"clear_refs" => TaskEntry::ClearRefs,
         b"io" => TaskEntry::Io,
         b"mounts" => TaskEntry::Mounts(false),
         b"mountinfo" => TaskEntry::Mounts(true),
@@ -294,7 +307,7 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         [b"ns", ..]
         | [
             b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo" | b"auxv" | b"limits"
-            | b"statm" | b"io",
+            | b"statm" | b"io" | b"clear_refs",
         ] => (None, entry(&parts)),
         _ if pid == own => return None,
         [] => (None, TaskEntry::Directory),
@@ -1623,6 +1636,132 @@ impl FileHandle for PagemapFile {
     }
 }
 
+/// The address space `clear_refs` acts on at a write: the task's then,
+/// `None` once it has none (a zombie), or `ESRCH` once it is gone.
+pub(crate) type CurrentMemory = Arc<dyn Fn() -> Result<Option<MemoryView>, Errno> + Send + Sync>;
+/// `/proc/<pid>/clear_refs`, as Linux's `clear_refs_write` takes a write:
+/// at most 12 bytes of it (`PROC_NUMBUF` less one), which is what it
+/// returns, are a number as `kstrtoint` reads one, from 1 to 5 (`EINVAL`
+/// otherwise); then the task, which must still be there (`ESRCH`), has
+/// its address space changed if it has one. Only 4
+/// (`CLEAR_REFS_SOFT_DIRTY`) changes what can be seen here
+/// ([`MemoryView::clear_soft_dirty`]); 1 to 3 clear referenced bits, which
+/// are not kept, and 5 the peak resident size, which is not shown. It has
+/// no read operation.
+pub(crate) struct ClearRefsFile {
+    memory: CurrentMemory,
+    /// The access mode it was opened with (`O_ACCMODE`).
+    access: u32,
+    readable: bool,
+    writable: bool,
+    /// Its inode's owner, as `fstat` shows it.
+    owner: Owner,
+}
+impl ClearRefsFile {
+    pub(crate) fn open(memory: CurrentMemory, flags: u32, owner: Owner) -> Self {
+        Self {
+            memory,
+            access: flags & 3,
+            readable: flags & 3 != 1,
+            writable: flags & 3 != 0,
+            owner,
+        }
+    }
+}
+/// The kernel's `isspace`, which takes the Latin-1 no-break space too.
+fn kernel_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t'..=b'\r' | 0xa0)
+}
+/// `kstrtoint` in base 10 of `text` with its spaces stripped (`strstrip`):
+/// a sign and digits; `EINVAL` for anything else, and
+/// `ERANGE` for a number past an `int`.
+fn clear_refs_number(text: &[u8]) -> Result<i64, Errno> {
+    let end = text
+        .iter()
+        .rposition(|&b| !kernel_space(b))
+        .map_or(0, |at| at + 1);
+    let start = text[..end]
+        .iter()
+        .position(|&b| !kernel_space(b))
+        .unwrap_or(end);
+    let text = &text[start..end];
+    let (negative, digits) = match text {
+        [b'-', rest @ ..] => (true, rest),
+        [b'+', rest @ ..] => (false, rest),
+        _ => (false, text),
+    };
+    let count = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+    // `kstrtoint`'s one newline is gone with the spaces.
+    if count == 0 || count != digits.len() {
+        return Err(Errno::EINVAL);
+    }
+    // At most 12 digits, which an `i64` holds.
+    let value = digits[..count]
+        .iter()
+        .fold(0i64, |value, &b| value * 10 + i64::from(b - b'0'));
+    let value = if negative { -value } else { value };
+    i32::try_from(value).map_err(|_| Errno(34))?; // ERANGE
+    Ok(value)
+}
+impl FileHandle for ClearRefsFile {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn read(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Err(if self.readable {
+            Errno::EINVAL
+        } else {
+            Errno::EBADF
+        })
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let _ = offset;
+        self.read(buf)
+    }
+    fn write(&self, buf: &[u8]) -> Result<usize, Errno> {
+        if !self.writable {
+            return Err(Errno::EBADF);
+        }
+        let count = buf.len().min(12);
+        let text = &buf[..count];
+        // The bytes are a C string in a zeroed buffer.
+        let text = &text[..text.iter().position(|&b| b == 0).unwrap_or(count)];
+        let kind = clear_refs_number(text)?;
+        if !(1..=5).contains(&kind) {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(memory) = (self.memory)()?
+            && kind == 4
+        {
+            memory.clear_soft_dirty();
+        }
+        Ok(count)
+    }
+    fn write_at(&self, _: u64, buf: &[u8]) -> Result<usize, Errno> {
+        self.write(buf)
+    }
+    /// Linux's `noop_llseek`: the position stays 0.
+    fn seek(&self, _: i64, _: u32) -> Result<u64, Errno> {
+        Ok(0)
+    }
+    /// Size 0, and only its owner may write it, as Linux's (0200).
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(owned(write_only_stat(), &self.owner))
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn flags(&self) -> u32 {
+        self.access
+    }
+    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+}
+
 /// What makes a file's text when it is read ([`ReadTimeFile`]).
 pub(crate) type Text = Arc<dyn Fn() -> Result<Vec<u8>, Errno> + Send + Sync>;
 /// A file whose text is made when it is first read, and again after a seek
@@ -1804,6 +1943,97 @@ mod tests {
             pagemap_entries(&theirs, 0x12000, 1),
             [SOFT_DIRTY | PRESENT | EXCLUSIVE]
         );
+    }
+
+    #[test]
+    fn clear_refs_cleans_every_page_until_its_next_write() {
+        use paludarium_mmu::pagemap::{EXCLUSIVE, PRESENT, SOFT_DIRTY};
+        let mut mem = AddressSpace::new();
+        mem.map(
+            Some(GuestAddr(0x10000)),
+            0x4000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        let mut byte = [0];
+        mem.read(GuestAddr(0x10000), &mut byte).unwrap();
+        mem.write(GuestAddr(0x11000), b"x").unwrap();
+        mem.write(GuestAddr(0x12000), b"x").unwrap();
+        let view = mem.view();
+        let current: CurrentMemory = Arc::new(move || Ok(Some(view.clone())));
+        let clear = ClearRefsFile::open(current, 1, Arc::default());
+        let file = PagemapFile::open(mem.view(), 0, Arc::default());
+        assert_eq!(clear.write(b"4\n"), Ok(2));
+        let written = PRESENT | EXCLUSIVE;
+        assert_eq!(
+            pagemap_entries(&file, 0x10000, 4),
+            [PRESENT, written, written, 0]
+        );
+        // The next write sets it again, the one this thread's TLB held the
+        // page for too.
+        mem.write(GuestAddr(0x12000), b"y").unwrap();
+        mem.write(GuestAddr(0x10000), b"y").unwrap();
+        let dirty = SOFT_DIRTY | written;
+        assert_eq!(
+            pagemap_entries(&file, 0x10000, 4),
+            [dirty, written, dirty, 0]
+        );
+        // A new mapping merges with it: the VMA is soft-dirty, and stays so
+        // when the new part goes again.
+        mem.map(
+            Some(GuestAddr(0x14000)),
+            0x1000,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+        mem.mapped(GuestAddr(0x14000), 0x15000);
+        mem.unmap(GuestAddr(0x14000), 0x1000).unwrap();
+        assert_eq!(
+            pagemap_entries(&file, 0x11000, 3),
+            [dirty, dirty, SOFT_DIRTY]
+        );
+        // Each page `fork` copies keeps its bit.
+        assert_eq!(clear.write(b"4"), Ok(1));
+        mem.write(GuestAddr(0x11000), b"z").unwrap();
+        let child = mem.fork();
+        let theirs = PagemapFile::open(child.view(), 0, Arc::default());
+        assert_eq!(
+            pagemap_entries(&theirs, 0x10000, 3)
+                .iter()
+                .map(|e| e & SOFT_DIRTY)
+                .collect::<Vec<_>>(),
+            [0, SOFT_DIRTY, 0]
+        );
+    }
+
+    #[test]
+    fn clear_refs_takes_a_number_as_kstrtoint_reads_one() {
+        let mem = AddressSpace::new();
+        let view = mem.view();
+        let current: CurrentMemory = Arc::new(move || Ok(Some(view.clone())));
+        let clear = ClearRefsFile::open(current, 1, Arc::default());
+        assert_eq!(clear.write(b" +4 \n"), Ok(5));
+        assert_eq!(clear.write(b"\xa05\0junk"), Ok(7));
+        assert_eq!(clear.write(b"1           and more"), Ok(12));
+        for bad in [&b""[..], b"0", b"6", b"-1", b"4x", b"0x4", b"--4", b" "] {
+            assert_eq!(clear.write(bad), Err(Errno::EINVAL), "{bad:?}");
+        }
+        assert_eq!(clear.write(b"99999999999"), Err(Errno(34)));
+        assert_eq!(clear.write(b"-2147483649"), Err(Errno(34)));
+        assert_eq!(clear.write(b"-2147483648"), Err(Errno::EINVAL));
+        let mut buf = [0; 4];
+        assert_eq!(clear.read(&mut buf), Err(Errno::EBADF));
+        // The number is read before the task is looked for.
+        let gone: CurrentMemory = Arc::new(|| Err(Errno(3)));
+        let gone = ClearRefsFile::open(gone, 2, Arc::default());
+        assert_eq!(gone.write(b"7"), Err(Errno::EINVAL));
+        assert_eq!(gone.write(b"4"), Err(Errno(3)));
+        assert_eq!(gone.read(&mut buf), Err(Errno::EINVAL));
+        assert_eq!(gone.stat().map(|s| s.mode), Ok(0o100_200));
+        let read_only = ClearRefsFile::open(Arc::new(|| Ok(None)), 0, Arc::default());
+        assert_eq!(read_only.write(b"4"), Err(Errno::EBADF));
     }
 
     #[test]

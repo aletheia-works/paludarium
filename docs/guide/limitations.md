@@ -50,10 +50,7 @@ verified.
   symbolic links. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
   do not exist.
 - **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
-  page entries. `Referenced` is every page counted, a page that `fork`
-  shares counts as shared (and half of it in `Pss`) even after the other
-  process has let it go, while one of shared memory counts as private
-  whoever else maps it. A page of a loaded program's segment counts as
+  page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A
   file's pages are counted as they are touched, where Linux's fault
   brings in up to 16 pages around one (`fault_around_bytes`), and so are
@@ -62,10 +59,7 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
-  emulator's page entries, as `smaps`'s counts do: a page that a `fork`
-  shared is not exclusive (bit 56) until this process writes it, even
-  after the other has let it go, and a page of shared memory or of a file
-  is exclusive whoever else maps it. A page of a loaded program's segment, or of a
+  emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
   written, not until the page was. A read of a file's page gives only
   that page an entry, where Linux's fault maps the pages around it too

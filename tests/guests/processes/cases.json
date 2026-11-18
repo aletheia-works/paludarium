@@ -240,6 +240,7 @@
     {"name":"mincore","binary":"process"},
     {"name":"pagemap","binary":"process"},
     {"name":"clear-refs","binary":"process"},
+    {"name":"map-count","binary":"process"},
     {"name":"proc-owners","binary":"process"},
     {"name":"memory-locks","binary":"process"},
     {"name":"proc-maps","binary":"process"},

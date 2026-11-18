@@ -295,6 +295,7 @@ mod linux {
                     | "personality-layout"
                     | "pagemap"
                     | "clear-refs"
+                    | "map-count"
                     | "proc-owners"
                     | "admin"
                     | "mount-flags"
@@ -684,6 +685,7 @@ mod linux {
         processes_mincore => ("mincore","process"),
         processes_pagemap => ("pagemap","process"),
         processes_clear_refs => ("clear-refs","process"),
+        processes_map_count => ("map-count","process"),
         processes_proc_owners => ("proc-owners","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),

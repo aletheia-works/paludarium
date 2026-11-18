@@ -3195,8 +3195,11 @@ kernel.
   `Locked`, with 0 for huge pages, swap and KSM), `THPeligible` and
   `VmFlags`. A page counts once it has an entry: private memory only read
   shows the zero page, which is not counted, written private memory is
-  anonymous and dirty, and a page that a `fork` shares until it is written
-  is shared, half of it in `Pss`. `VmFlags` names Linux's flags of the VMA
+  anonymous and dirty, and a page that more than one page table entry
+  maps, in this process or any other (one a `fork` shares until it is
+  written, a file's page two mappings show), is shared, with its size
+  divided by that count in `Pss`, as Linux's `smaps_account` takes the
+  precise map count. `VmFlags` names Linux's flags of the VMA
   in Linux's order: the protection and what it may become (`mr`, `mw`, `me`,
   `ms`, without `mw` for a file open only for reading or sealed against
   writes, and without `me` for the rings of AIO and `io_uring` and secret
@@ -3220,8 +3223,11 @@ kernel.
   bit (58); and a page any access gave an entry is present (bit 63). The
   zero page that a read of private anonymous memory shows is only that.
   Any other present page is a file's or shared memory's (bit 61) unless it
-  is anonymous, as `smaps` counts it, and mapped only here (bit 56) unless
-  a `fork` shares it until it is written; one `userfaultfd` write-protects
+  is anonymous, as `smaps` counts it, and mapped exclusively (bit 56) while
+  exactly one page table entry maps it, in this process or any other, as
+  Linux takes a precise map count of 1: a page `fork` shares is mapped
+  twice until either process writes its own copy or lets it go, and a
+  file's page that two mappings show is mapped twice; one `userfaultfd` write-protects
   has bit 57. The frame number (bits 0 to 54) is 0, as Linux gives it to a
   reader without `CAP_SYS_ADMIN`. A read or `pread` must start at a whole
   entry and ask for whole entries (`EINVAL`), and gives nothing from the end

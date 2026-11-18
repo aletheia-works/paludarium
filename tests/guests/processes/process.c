@@ -6234,8 +6234,7 @@ static int pagemap_case(void) {
     PM_RESULT("bad-buffer", pread(fd, (void *)16, 8, 8));
     /* The position: lseek from the start and the current one only, to any
        position; read moves it by what it read. The page is the file's
-       written one: the one fork shared is exclusive again on Linux once the
-       child is gone, which the emulator does not tell. */
+       written one. */
     off_t at = (off_t)((uintptr_t)(f + 2 * page) / 4096 * 8);
     printf("seek=%d\n", lseek(fd, at, SEEK_SET) == at);
     errno = 0;
@@ -6251,17 +6250,140 @@ static int pagemap_case(void) {
     return 0;
 }
 
-/* pm_show without the exclusive bit (bit 56), which Linux sets again for
-   a page fork shared once only one process maps it: the emulator keeps no
-   map counts. */
-static void cr_show(int fd, const char *label, void *at, int pages) {
-    uint64_t entries[16] = {0};
-    errno = 0;
-    ssize_t n = pread(fd, entries, (size_t)pages * 8, (off_t)((uintptr_t)at / 4096 * 8));
-    printf("%s: n=%zd errno=%d", label, n, errno);
-    for (int i = 0; n > 0 && i < n / 8; i++)
-        printf(" %llx", (unsigned long long)(entries[i] & ~(1ULL << 56)));
-    printf("\n");
+/* The sharing lines of the smaps block of the VMA at `at`: Rss, Pss and
+   the shared and private pages, on one line. Clean and dirty are summed:
+   a file's page that write() filled is dirty on Linux until writeback,
+   which depends on time and on the filesystem, not on the map count. */
+static void mc_smaps(const char *label, void *at) {
+    static char text[1 << 17];
+    int fd = open("/proc/self/smaps", O_RDONLY);
+    size_t length = 0;
+    ssize_t n;
+    while (fd >= 0 && length < sizeof text - 1 && (n = read(fd, text + length, sizeof text - 1 - length)) > 0)
+        length += (size_t)n;
+    if (fd >= 0) close(fd);
+    text[length] = 0;
+    char head[32];
+    snprintf(head, sizeof head, "%lx-", (unsigned long)(uintptr_t)at);
+    char *block = NULL;
+    for (char *line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL)
+        if (!strncmp(line, head, strlen(head))) { block = line; break; }
+    static const char *const names[] = {"Rss:", "Pss:", "Shared_Clean:", "Shared_Dirty:",
+                                        "Private_Clean:", "Private_Dirty:"};
+    long kb[6] = {-1, -1, -1, -1, -1, -1};
+    for (size_t i = 0; block && i < 6; i++) {
+        char *field = strstr(block, names[i]);
+        if (field) sscanf(field + strlen(names[i]), "%ld", &kb[i]);
+    }
+    printf("%s smaps: rss=%ld pss=%ld shared=%ld private=%ld\n", label, kb[0], kb[1], kb[2] + kb[3],
+           kb[4] + kb[5]);
+}
+
+/* The map-count case: pagemap's exclusive bit (bit 56), which Linux sets
+   for a present page that exactly one page table entry maps, in any
+   process (a precise map count of 1): fork, a second mapping of the same
+   file page, munmap and a child's exit change it. */
+static int map_count_case(void) {
+    long page = 4096;
+    /* As the pagemap case: unprivileged, to read no frame numbers. */
+    if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534))
+        return 79;
+    if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)) return 78;
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) return 80;
+    char *base = mmap(NULL, 64 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 81;
+    munmap(base, (size_t)(64 * page));
+    /* Private anonymous: one written page, one only read (the zero page). */
+    char *a = mmap(base + 2 * page, 2 * page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) return 82;
+    a[0] = 1;
+    volatile char seen = a[page];
+    (void)seen;
+    /* Shared anonymous memory, written. */
+    char *s = mmap(base + 6 * page, page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (s == MAP_FAILED) return 83;
+    s[0] = 1;
+    /* A file, mapped shared twice and privately twice: each mapping maps
+       the same page-cache page. */
+    char path[] = "/tmp/map-count-XXXXXX";
+    int file = mkstemp(path);
+    if (file < 0) return 84;
+    unlink(path);
+    char block[4096];
+    memset(block, 'f', sizeof block);
+    if (write(file, block, sizeof block) != (ssize_t)sizeof block) return 85;
+    char *f1 = mmap(base + 10 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, file, 0);
+    if (f1 == MAP_FAILED) return 86;
+    seen = f1[0];
+    pm_show(fd, "anonymous", a, 2);
+    pm_show(fd, "shared", s, 1);
+    pm_show(fd, "file-once", f1, 1);
+    char *f2 = mmap(base + 14 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, file, 0);
+    if (f2 == MAP_FAILED) return 87;
+    seen = f2[0];
+    pm_show(fd, "file-twice-1", f1, 1);
+    pm_show(fd, "file-twice-2", f2, 1);
+    mc_smaps("file-twice", f1);
+    munmap(f2, (size_t)page);
+    pm_show(fd, "file-unmapped", f1, 1);
+    char *p1 = mmap(base + 18 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, file, 0);
+    if (p1 == MAP_FAILED) return 88;
+    seen = p1[0];
+    pm_show(fd, "private-read", p1, 1);
+    pm_show(fd, "private-read-shared", f1, 1);
+    mc_smaps("private-read", p1);
+    p1[0] = 'g';
+    pm_show(fd, "private-written", p1, 1);
+    pm_show(fd, "private-written-shared", f1, 1);
+
+    /* fork: each page the child maps too is mapped twice, until the child
+       writes its own copy or exits. */
+    fflush(stdout);
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 89;
+    pid_t child = fork();
+    if (child < 0) return 90;
+    if (!child) {
+        int own = open("/proc/self/pagemap", O_RDONLY);
+        pm_show(own, "child-anonymous", a, 2);
+        pm_show(own, "child-shared", s, 1);
+        pm_show(own, "child-file", f1, 1);
+        pm_show(own, "child-private", p1, 1);
+        a[0] = 2;
+        pm_show(own, "child-written", a, 1);
+        fflush(stdout);
+        char c = 0;
+        if (write(ready[1], &c, 1) != 1 || read(go[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    char c = 0;
+    if (read(ready[0], &c, 1) != 1) return 91;
+    /* The child still runs: what it shares is mapped twice. */
+    pm_show(fd, "parent-anonymous", a, 1);
+    pm_show(fd, "parent-shared", s, 1);
+    pm_show(fd, "parent-file", f1, 1);
+    pm_show(fd, "parent-private", p1, 1);
+    mc_smaps("parent-anonymous", a);
+    mc_smaps("parent-shared", s);
+    mc_smaps("parent-file", f1);
+    fflush(stdout);
+    if (write(go[1], &c, 1) != 1) return 92;
+    int status;
+    waitpid(child, &status, 0);
+    printf("child status=%x\n", status);
+    /* The child is gone: mapped once again. */
+    pm_show(fd, "after-anonymous", a, 1);
+    pm_show(fd, "after-shared", s, 1);
+    pm_show(fd, "after-file", f1, 1);
+    pm_show(fd, "after-private", p1, 1);
+    mc_smaps("after-anonymous", a);
+    mc_smaps("after-file", f1);
+    close(file);
+    close(fd);
+    return 0;
 }
 
 /* Writes `text` to clear_refs at `fd`: what write returned, and errno. */
@@ -6384,15 +6506,15 @@ static int clear_refs_case(void) {
     if (child < 0) return 87;
     if (!child) {
         int own = open("/proc/self/pagemap", O_RDONLY);
-        cr_show(own, "child", a, 4);
+        pm_show(own, "child", a, 4);
         a[2 * page] = 3;
-        cr_show(own, "child-written", a, 4);
+        pm_show(own, "child-written", a, 4);
         fflush(stdout);
         _exit(0);
     }
     int status;
     waitpid(child, &status, 0);
-    cr_show(map, "parent", a, 4);
+    pm_show(map, "parent", a, 4);
 
     /* Another process's file, and a thread's. */
     char path[64];
@@ -6401,7 +6523,7 @@ static int clear_refs_case(void) {
     int thread = open(path, O_WRONLY);
     cr_write(thread, "thread", "4", 1);
     if (thread >= 0) close(thread);
-    cr_show(map, "thread-cleared", a, 4);
+    pm_show(map, "thread-cleared", a, 4);
 
     /* How the number is read: kstrtoint in base 10, spaces stripped, at
        most 12 bytes taken. */
@@ -30448,6 +30570,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mincore")) return mincore_cases();
     if (!strcmp(mode, "pagemap")) return pagemap_case();
     if (!strcmp(mode, "clear-refs")) return clear_refs_case();
+    if (!strcmp(mode, "map-count")) return map_count_case();
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {

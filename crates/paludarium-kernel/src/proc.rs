@@ -1259,16 +1259,13 @@ fn map_line(vma: &Vma, start_stack: u64, root: &[u8]) -> Vec<u8> {
 }
 /// The lines `smaps` writes after a VMA's line of `maps`, as Linux's
 /// `show_smap` does: its size, what its pages hold ([`Usage`]), and its
-/// flags. Pss counts a page `fork` shares as half, as if one other process
-/// had it. No page here is huge, swapped or merged by KSM, and the CPU
+/// flags. Pss counts each page for its share of the entries that map it.
+/// No page here is huge, swapped or merged by KSM, and the CPU
 /// has no protection keys, which leaves out `ProtectionKey`.
 fn smap_lines(vma: &Vma, usage: Usage) -> Vec<u8> {
     let kb = |pages: u64| pages * 4;
-    let pss = |private: u64, shared: u64| private * 4 + shared * 2;
-    let pss_all = pss(
-        usage.private_clean + usage.private_dirty,
-        usage.shared_clean + usage.shared_dirty,
-    );
+    let pss = |sum: u64| sum >> Usage::PSS_SHIFT >> 10;
+    let pss_all = pss(usage.pss);
     let locked = if vma.flags & vm::LOCKED != 0 {
         pss_all
     } else {
@@ -1281,10 +1278,7 @@ fn smap_lines(vma: &Vma, usage: Usage) -> Vec<u8> {
         ("MMUPageSize:    ", 4),
         ("Rss:            ", kb(usage.resident)),
         ("Pss:            ", pss_all),
-        (
-            "Pss_Dirty:      ",
-            pss(usage.private_dirty, usage.shared_dirty),
-        ),
+        ("Pss_Dirty:      ", pss(usage.pss_dirty)),
         ("Shared_Clean:   ", kb(usage.shared_clean)),
         ("Shared_Dirty:   ", kb(usage.shared_dirty)),
         ("Private_Clean:  ", kb(usage.private_clean)),

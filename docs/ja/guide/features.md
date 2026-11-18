@@ -3956,6 +3956,11 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   います。メモリ上でも、Linux か macOS でマウントしたホストのディレクトリでも使えます。
   `RENAME_WHITEOUT` には `CAP_MKNOD` が要り（なければ `EPERM`）、あっても
   ホワイトアウトのない Linux のファイルシステムと同じく `EINVAL` を返します。
+- `/dev` と `/proc` の外にあって、その中を指すシンボリックリンク
+  （`ln -s /dev/null f` が作るものや、途中にある `/dev` へのリンク）は、カーネルが
+  そこに作るファイルにつながります。`stat`、`statx`、`access`、`open` はそれを
+  たどり、それを通して開いたディスクリプタは、`/proc/self/fd` でそのファイルを
+  指します。
 - `linkat` は `AT_SYMLINK_FOLLOW` と `AT_EMPTY_PATH` に対応しています。
   `AT_SYMLINK_FOLLOW` は古いパスの最後のシンボリックリンク（リンク先がなければ
   `ENOENT`）と、`/proc/self/fd` のリンクをディスクリプタのファイルまでたどります。

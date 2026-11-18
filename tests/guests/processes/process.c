@@ -10945,8 +10945,33 @@ static int generated_binds_case(void) {
         _exit(gb_inner());
     }
     printf("status=%d\n", reaped(child));
-    const char *files[] = {"f", "g", "other", "link"};
-    for (unsigned i = 0; i < 4; i++) {
+    /* A plain symbolic link to a generated file, and one to /dev, outside
+       any bind mount. */
+    char plain[256], pdev[256], through[300];
+    gb_path(plain, "plain");
+    gb_path(pdev, "pdev");
+    symlink("/dev/null", plain);
+    symlink("/dev", pdev);
+    snprintf(through, sizeof through, "%s/null", pdev);
+    struct stat ps;
+    memset(&ps, 0, sizeof ps);
+    int pr = stat(plain, &ps) ? errno : 0;
+    printf("plain stat=%d chr=%d", pr, S_ISCHR(ps.st_mode));
+    memset(&ps, 0, sizeof ps);
+    pr = stat(through, &ps) ? errno : 0;
+    printf(" through stat=%d chr=%d", pr, S_ISCHR(ps.st_mode));
+    pr = access(plain, W_OK) ? errno : 0;
+    printf(" access=%d", pr);
+    int pfd = open(through, O_WRONLY);
+    printf(" open=%d", pfd < 0 ? errno : 0);
+    if (pfd >= 0) {
+        long wrote = (long)write(pfd, "abc", 3);
+        printf(" write=%ld fdlink=%d", wrote, gb_fd_names(pfd, "/dev/null"));
+        close(pfd);
+    }
+    printf("\n");
+    const char *files[] = {"f", "g", "other", "link", "plain", "pdev"};
+    for (unsigned i = 0; i < 6; i++) {
         gb_path(path, files[i]);
         unlink(path);
     }

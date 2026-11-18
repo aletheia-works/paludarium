@@ -9313,3 +9313,40 @@ fn a_bind_mount_of_a_generated_directory_shows_its_files() {
     assert_eq!(f.ret(166, &[d, 0]), 0);
     assert_eq!(f.ret(2, &[null, 2, 0]), errno(Errno::ENOENT));
 }
+
+#[test]
+fn a_symbolic_link_leads_into_the_files_the_kernel_generates() {
+    let mut f = fixture();
+    let null = put(&mut f, 0, b"/dev/null");
+    let link = put(&mut f, 0x20, b"/tmp/l");
+    let dev = put(&mut f, 0x40, b"/dev");
+    let to_dev = put(&mut f, 0x60, b"/tmp/ld");
+    let through = put(&mut f, 0x80, b"/tmp/ld/null");
+    let nowhere = put(&mut f, 0xa0, b"/nosuch");
+    let dangling = put(&mut f, 0xc0, b"/tmp/x");
+    let relative = put(&mut f, 0xe0, b"../dev/null");
+    let up = put(&mut f, 0x400, b"/tmp/r");
+    assert_eq!(f.ret(88, &[null, link]), 0);
+    assert_eq!(f.ret(88, &[dev, to_dev]), 0);
+    assert_eq!(f.ret(88, &[nowhere, dangling]), 0);
+    assert_eq!(f.ret(88, &[relative, up]), 0);
+    // `stat` follows each to the device, `lstat` stays on the link.
+    for path in [link, through, up] {
+        assert_eq!(
+            stat_mode_and_mtime(&mut f, path, false).0 & 0o170000,
+            0o020000
+        );
+    }
+    assert_eq!(
+        stat_mode_and_mtime(&mut f, link, true).0 & 0o170000,
+        0o120000
+    );
+    // `open` writes to the device, and a link to nothing is still ENOENT.
+    let fd = f.ret(2, &[through, 1, 0]);
+    assert!(fd < 1024);
+    assert_eq!(f.ret(1, &[fd, DATA + 0x200, 3]), 3);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(2, &[link, 0o400001, 0]), errno(Errno(40)));
+    assert_eq!(f.ret(4, &[dangling, DATA + 0x300]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(2, &[dangling, 0, 0]), errno(Errno::ENOENT));
+}

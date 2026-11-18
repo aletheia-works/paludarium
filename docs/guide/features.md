@@ -4559,6 +4559,11 @@ one only with an `--allow-net`.
   missing), in memory and in a host directory mounted on Linux or macOS.
   `RENAME_WHITEOUT` needs `CAP_MKNOD` (`EPERM`), and then gives `EINVAL`, as
   on a Linux filesystem without whiteouts.
+- A symbolic link outside `/dev` and `/proc` that leads into them, as
+  `ln -s /dev/null f` makes, or a link to `/dev` on the way, leads to the
+  file the kernel generates there: `stat`, `statx`, `access` and `open`
+  follow it, and a descriptor opened through it names that file in
+  `/proc/self/fd`.
 - `linkat` takes `AT_SYMLINK_FOLLOW`, which follows a symbolic link the old
   path ends in (a dangling one is `ENOENT`) and a link in `/proc/self/fd` to
   the descriptor's file, and `AT_EMPTY_PATH`, which with an empty old path

@@ -125,6 +125,11 @@ verified.
   files from the root their opener had when it opened them, where Linux
   takes the root of whoever reads them, at each read.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
+- **Links into `/dev` and `/proc`, in part**: a symbolic link elsewhere
+  that leads into them is followed to the generated file by `stat`,
+  `statx`, `access` and `open` only. Other calls by path through it
+  (`chdir`, `execve`, `truncate`, `chmod` and the like) give `ENOENT`, and
+  under a root of its own no such link is followed.
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
   no device for it to stand for. A FIFO in a mounted host directory can be

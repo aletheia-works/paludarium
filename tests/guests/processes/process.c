@@ -10962,6 +10962,10 @@ static int generated_binds_case(void) {
     printf(" through stat=%d chr=%d", pr, S_ISCHR(ps.st_mode));
     pr = access(plain, W_OK) ? errno : 0;
     printf(" access=%d", pr);
+    char slashed[300];
+    snprintf(slashed, sizeof slashed, "%s/", plain);
+    pr = stat(slashed, &ps) ? errno : 0;
+    printf(" slash=%d", pr);
     int pfd = open(through, O_WRONLY);
     printf(" open=%d", pfd < 0 ? errno : 0);
     if (pfd >= 0) {

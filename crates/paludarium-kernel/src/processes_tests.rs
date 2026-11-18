@@ -6501,9 +6501,27 @@ mod proc_other {
         let after = line.rfind(')').unwrap() + 2;
         line[after..].split_whitespace().map(String::from).collect()
     }
+    /// A program's code, data and stack, as an exec records them.
+    fn program() -> paludarium_loader::LoadedImage {
+        paludarium_loader::LoadedImage {
+            entry_point: GuestAddr(0x40_1000),
+            program_entry: GuestAddr(0x40_1000),
+            interpreter_base: 0,
+            program_header_address: GuestAddr(0x40_0040),
+            program_header_count: 2,
+            initial_stack_pointer: GuestAddr(0x7fff_f000),
+            initial_break: GuestAddr(0x40_4000),
+            load_base: GuestAddr(0),
+            auxv: [(0, 0); paludarium_loader::AUXV_ENTRIES],
+            code: (0x40_1000, 0x40_2345),
+            data: (0x40_3000, 0x40_3100),
+        }
+    }
     #[test]
     fn a_parent_sees_its_child_s_stat_and_another_user_sees_no_addresses() {
         let (mut k, mut t, m) = setup();
+        // The program the child keeps from its parent at the fork.
+        k.group.set_program(&program());
         let (_child, ct, _cm) = fork(&mut k, &mut t, &m);
         let path = format!("/proc/{}/stat", ct.tid);
         let line = read(&mut k, &mut t, &m, &path).unwrap();
@@ -6511,10 +6529,12 @@ mod proc_other {
         assert!(line.ends_with(b"\n"));
         let seen = fields(&line);
         // 52 fields, the parent the fourth; the reader may see the memory,
-        // so start_code and end_code are the program's (none here: 0).
+        // so start_code, end_code, start_stack, start_data and end_data are
+        // the program's.
         assert_eq!(seen.len() + 2, 52);
         assert_eq!(seen[1], t.tid.to_string());
-        assert_eq!(&seen[23..25], ["0", "0"]);
+        assert_eq!(&seen[23..26], ["4198400", "4203333", "2147479552"]);
+        assert_eq!(&seen[42..44], ["4206592", "4206848"]);
         // A reader of another user that ptrace_may_access refuses: 1 for
         // start_code and end_code, 0 for start_stack, wchan and every field
         // from start_data on.

@@ -861,7 +861,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_MINOR_HUGETLBFS`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
   `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
-  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で（`HUGETLBFS` の
+  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_WP_ASYNC`、
+  `UFFD_FEATURE_MOVE` で（`HUGETLBFS` の
   ものは Linux と同じく示しますが、`MFD_HUGETLB` と `SHM_HUGETLB` は `ENOSYS` なので、
   登録する hugetlbfs のメモリはありません）、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
@@ -872,7 +873,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピング）をマイナーフォールトについて登録し（`UFFDIO_REGISTER_MODE_MINOR`。示す
   ioctl に `UFFDIO_CONTINUE` が、`smaps` に `ui` が加わります）、プライベートな anonymous メモリと shmem を書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
-  が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
+  が加わります）。`UFFD_FEATURE_WP_ASYNC` では、書き込み保護だけなら、
+  `vma_can_userfault` と同じくどのメモリも登録します（ファイルのプライベートまたは
+  共有のマッピングや System V の共有メモリも）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
   ものは `EINVAL`、ファイルに書き込めない共有のものは `EPERM`、ほかの `userfaultfd` の
   ものは `EBUSY`）、モードは、VMA がすでに
   持っていなければその VMA のモードに置き換わります。登録した部分は
@@ -909,7 +912,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プライベートな anonymous メモリの `UFFDIO_ZEROPAGE` と `UFFDIO_POISON` はそこでは
   `EEXIST` です。`mprotect` は保護を残し、許さない書き込みはこれまでどおり SIGSEGV です。
   `fork` した子、`mremap` による移動、`UFFDIO_UNREGISTER`、ファイルを閉じること、
-  書き込み保護のモードを置き換える登録で保護は外れます。`UFFDIO_COPY` と
+  書き込み保護のモードを置き換える登録で保護は外れます。
+  `UFFD_FEATURE_WP_ASYNC`（`/proc/<pid>/fdinfo` が示すとおり
+  `UFFD_FEATURE_WP_UNPOPULATED` を伴います）では、書き込み保護されたページへの
+  書き込みは、命令のものもシステムコールのものもフォールトせず、`do_wp_page` と
+  同じくページの保護を外して進みます。そのため `/proc/<pid>/pagemap` のビット 57 で、
+  `UFFDIO_WRITEPROTECT` から書き込まれたページがわかります。ファイルのプライベートな
+  マッピングの `MADV_DONTNEED` は、shmem と同じく、まだ保護されているページに
+  マーカーを残します。そこを埋める操作は、anonymous メモリでも shmem でもないので
+  `EINVAL` です。`UFFDIO_COPY` と
   `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
   VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
   `EFAULT`、shmem のファイルの終わりより先のページも `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`
@@ -1421,7 +1432,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクは、Linux の `d_path` と同じくマウントの場所を指します。名前そのものはマウントの
   もので、`unlink` と `rename` は使用中（`EBUSY`）、そこへの `mkdir` は `EEXIST`、その
   `link` は `EXDEV` です。そのマウントのバインドマウントは同じファイルのもう 1 つの
-  マウントで、`umount2` で外せます。
+  マウントで、`umount2` で外せます。そこのディレクトリ（`/proc`、`/dev` やその下のもの）は
+  ディレクトリの上にバインドできます。マウントの場所より下のパスはそのディレクトリより下の
+  カーネルのパスなので、カーネルがそこに生成するものを見せます。マウントのルートでの `..`
+  はマウントを出ます。そこを作業ディレクトリにすると、作業ディレクトリはマウントの場所で、
+  `getcwd` はそれを返します（ない名前は `chdir` でも `ENOENT`）。生成されるディレクトリより
+  下のマウントは表にないので、ロックされたもの（`has_locked_children`）はなく、`MS_REC`
+  で付いてくるものもありません。
 - `MS_REMOUNT` と `MS_BIND` 付きの `mount` は、Linux の `do_reconfigure_mnt` と同じく
   マウントのフラグだけを変えます。ターゲットは呼び出し元の名前空間のマウントのルートで
   （`EINVAL`）、より権限の少ない名前空間への写しでロックされたフラグはそのままで
@@ -2625,11 +2642,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `proc_dointvec` がベクトルを読むのと同じく、与えた数だけを設定します。不正な値は
   `EINVAL` で、その前の値は設定されたままです。`semmni` は、最後に 0 から 32768 の間に
   なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに、マシンの
-  `perf_event_paranoid` と `unprivileged_bpf_disabled` があります。エミュレートする
-  マシン全体に 1 つずつで、最初は Linux の既定値の 2 です。root の持つモード 0644 の
-  ファイルで、書くために開けるのは root（どのユーザー名前空間の外でもユーザー ID 0）
-  だけです（`EACCES`）。`perf_event_paranoid` は任意の `int` を取ります
-  （`proc_dointvec`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
+  `perf_event_mlock_kb`、`perf_event_paranoid`、`unprivileged_bpf_disabled` があります。
+  エミュレートするマシン全体に 1 つずつで、最初は Linux の既定値（516、2、2）です。
+  root の持つモード 0644 のファイルで、書くために開けるのは root（どのユーザー名前空間の
+  外でもユーザー ID 0）だけです（`EACCES`）。`perf_event_mlock_kb` と
+  `perf_event_paranoid` は任意の `int` を取ります（`proc_dointvec`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
   と同じく、`CAP_SYS_ADMIN` のある書き手から（`EPERM`）0 から 2 まで（`EINVAL`）を
   取り、いったん 1 になるとほかの値を取りません（`EPERM`）。`perf_event_open` と `bpf` は
   そのときの値を確かめます。`shm_rmid_forced`（0 か 1。持ち主と書ける者は上限と同じ）を
@@ -3131,7 +3148,25 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   レジスタのフィールドを、x86 の `perf_simd_reg_validate` と同じく確かめます（`EINVAL`）。
   XMM か YMM（2 か 4 クワッドワード）は 16 個すべて、ZMM（8）は 32 個すべて、opmask（1）は
   8 個すべてか、どれもないかです。正しく使っても、ソフトウェアのイベントは取らないので
-  `EOPNOTSUPP` です。ディスクリプタのリンクは
+  `EOPNOTSUPP` です。イベントの `mmap` は、Linux の `perf_mmap` と同じく
+  リングバッファをマップします。共有のマッピング（`EINVAL`）で、ユーザーページと 2 の
+  べき乗の数のデータページ、またはデータページなし（`EINVAL`）です。新しいタスクが
+  引き継ぐ、すべての CPU のイベントはマップできません（`EINVAL`）。最初のマッピングが
+  バッファを作り、後のマッピングは同じ大きさでなければならず（`EINVAL`）、それを
+  共有します。バッファより先のオフセットは AUX 領域を求めます。AUX 領域はユーザー
+  ページの `aux_offset` と `aux_size` の示す、データページより先の場所にあり、2 の
+  べき乗のページ数でなければなりません（`EINVAL`）。ソフトウェアのイベントには
+  ありません（`EOPNOTSUPP`）。ページは、CPU ごとに `perf_event_mlock_kb` まで
+  マッピングのユーザーに課され、残りはアドレス空間の固定したページに課されます。
+  後者は、`perf_event_paranoid` が -1 か、呼び出し元が `CAP_IPC_LOCK` を持つので
+  なければ、`RLIMIT_MEMLOCK` を超えられません（`EPERM`）。後のマッピングも、Linux
+  master と同じくユーザーに課され、返されません。マッピングは `fork` した子に写されず、
+  コアダンプにも含まれず（`VM_DONTCOPY`、`VM_DONTDUMP`）、ディスクリプタが閉じられても
+  イベントを数え続けさせます。最後にアンマップされると、バッファと課したものは
+  なくなります。ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
+  `size` 96、データのオフセットと大きさ、`cap_bit0_is_deprecated` があり
+  `cap_user_rdpmc` はなく、インデックス 0、そしてシーケンスロックの 2 回の増加の間に
+  数と有効な時間と動いた時間があります。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを

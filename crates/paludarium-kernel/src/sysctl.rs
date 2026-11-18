@@ -29,10 +29,11 @@
 //! takes, -1 for none, which a write from 0 sets: mode 0444, which
 //! `ipc_permissions` makes 0666 for whoever has `CAP_CHECKPOINT_RESTORE` or
 //! `CAP_SYS_ADMIN` over the namespace's user namespace. Beside them are the
-//! machine's `perf_event_paranoid` and `unprivileged_bpf_disabled`
-//! ([`Machine`]), which [`crate::perf`] and [`crate::bpf`] check: root's
-//! files of mode 0644, which only root opens to write.
-//! `perf_event_paranoid` takes any `int` (`proc_dointvec`);
+//! machine's `perf_event_mlock_kb`, `perf_event_paranoid` and
+//! `unprivileged_bpf_disabled` ([`Machine`]), which [`crate::perf`] and
+//! [`crate::bpf`] check: root's files of mode 0644, which only root opens to
+//! write. `perf_event_mlock_kb` and `perf_event_paranoid` take any `int`
+//! (`proc_dointvec`);
 //! `unprivileged_bpf_disabled` takes 0 to 2 from a writer with
 //! `CAP_SYS_ADMIN` (`EPERM`), and once 1 it stays (`EPERM`), as Linux's
 //! `bpf_unpriv_handler`.
@@ -220,6 +221,7 @@ pub(crate) enum Kernel {
     Msgmax,
     Msgmnb,
     Msgmni,
+    PerfEventMlockKb,
     PerfEventParanoid,
     Sem,
     SemNextId,
@@ -233,12 +235,13 @@ pub(crate) enum Kernel {
 
 /// The `/proc/sys/kernel` files by name, in the order Linux lists them (by
 /// name).
-const KERNEL: [(&[u8], Kernel); 14] = [
+const KERNEL: [(&[u8], Kernel); 15] = [
     (b"auto_msgmni", Kernel::AutoMsgmni),
     (b"msg_next_id", Kernel::MsgNextId),
     (b"msgmax", Kernel::Msgmax),
     (b"msgmnb", Kernel::Msgmnb),
     (b"msgmni", Kernel::Msgmni),
+    (b"perf_event_mlock_kb", Kernel::PerfEventMlockKb),
     (b"perf_event_paranoid", Kernel::PerfEventParanoid),
     (b"sem", Kernel::Sem),
     (b"sem_next_id", Kernel::SemNextId),
@@ -259,7 +262,7 @@ impl Kernel {
     fn ipc(self) -> bool {
         !matches!(
             self,
-            Self::PerfEventParanoid | Self::UnprivilegedBpfDisabled
+            Self::PerfEventMlockKb | Self::PerfEventParanoid | Self::UnprivilegedBpfDisabled
         )
     }
     /// Whether it is one of the IPC namespace's next IDs.
@@ -268,11 +271,12 @@ impl Kernel {
     }
 }
 
-/// The machine's `kernel.perf_event_paranoid` and
-/// `kernel.unprivileged_bpf_disabled`, one each for the whole emulated
+/// The machine's `kernel.perf_event_mlock_kb`, `kernel.perf_event_paranoid`
+/// and `kernel.unprivileged_bpf_disabled`, one each for the whole emulated
 /// machine as Linux's are for the whole kernel, at Linux's defaults at
 /// first.
 pub(crate) struct Machine {
+    perf_event_mlock_kb: AtomicI32,
     perf_event_paranoid: AtomicI32,
     unprivileged_bpf_disabled: AtomicI32,
 }
@@ -280,6 +284,7 @@ pub(crate) struct Machine {
 impl Default for Machine {
     fn default() -> Self {
         Self {
+            perf_event_mlock_kb: AtomicI32::new(crate::perf::MLOCK_KB),
             perf_event_paranoid: AtomicI32::new(crate::perf::PARANOID),
             unprivileged_bpf_disabled: AtomicI32::new(crate::bpf::UNPRIVILEGED_DISABLED),
         }
@@ -291,23 +296,33 @@ impl Machine {
     pub(crate) fn perf_event_paranoid(&self) -> i32 {
         self.perf_event_paranoid.load(Ordering::SeqCst)
     }
+    /// What a ring buffer's `mmap` may lock of a user's, per CPU
+    /// (`sysctl_perf_event_mlock`), in KiB.
+    pub(crate) fn perf_event_mlock_kb(&self) -> i32 {
+        self.perf_event_mlock_kb.load(Ordering::SeqCst)
+    }
     /// What `bpf` checks (`sysctl_unprivileged_bpf_disabled`).
     pub(crate) fn unprivileged_bpf_disabled(&self) -> i32 {
         self.unprivileged_bpf_disabled.load(Ordering::SeqCst)
     }
     fn line(&self, file: Kernel) -> Vec<u8> {
-        line(if file == Kernel::PerfEventParanoid {
-            self.perf_event_paranoid()
-        } else {
-            self.unprivileged_bpf_disabled()
+        line(match file {
+            Kernel::PerfEventMlockKb => self.perf_event_mlock_kb(),
+            Kernel::PerfEventParanoid => self.perf_event_paranoid(),
+            _ => self.unprivileged_bpf_disabled(),
         })
     }
     /// Takes a value written at the start of the file, by a writer with
     /// `CAP_SYS_ADMIN` (`admin`) or without.
     fn write(&self, file: Kernel, buf: &[u8], admin: bool) -> Result<usize, Errno> {
-        if file == Kernel::PerfEventParanoid {
+        // Both take any `int` (`proc_dointvec`).
+        if let Some(sysctl) = match file {
+            Kernel::PerfEventMlockKb => Some(&self.perf_event_mlock_kb),
+            Kernel::PerfEventParanoid => Some(&self.perf_event_paranoid),
+            _ => None,
+        } {
             let (value, consumed) = parse(buf, None)?;
-            self.perf_event_paranoid.store(value, Ordering::SeqCst);
+            sysctl.store(value, Ordering::SeqCst);
             return Ok(consumed);
         }
         // `bpf_unpriv_handler`.
@@ -629,7 +644,9 @@ fn kernel_line(ipc: &Namespace, file: Kernel) -> Vec<u8> {
         Kernel::SemNextId => line(ipc.sem.with_ids(|ids| ids.next_id())),
         Kernel::MsgNextId => line(ipc.msg.with_ids(|ids| ids.next_id())),
         // The machine's ([`Machine`]), which are not the namespace's.
-        Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => Vec::new(),
+        Kernel::PerfEventMlockKb | Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => {
+            Vec::new()
+        }
     }
 }
 
@@ -703,7 +720,9 @@ fn kernel_write(ipc: &Namespace, file: Kernel, buf: &[u8]) -> Result<usize, Errn
             }
             written
         }),
-        Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => Err(Errno::EINVAL),
+        Kernel::PerfEventMlockKb | Kernel::PerfEventParanoid | Kernel::UnprivilegedBpfDisabled => {
+            Err(Errno::EINVAL)
+        }
     }
 }
 
@@ -856,8 +875,9 @@ fn net_value(network: &crate::inet::Network, file: Net) -> i32 {
 /// setting to write only by the root of the namespace's owner (`EACCES`),
 /// as `mq_permissions` lets the owner's root have the owner's bits and
 /// everyone else the others', and so a `/proc/sys/kernel` IPC limit
-/// (`ipc_permissions`); the machine's `perf_event_paranoid` and
-/// `unprivileged_bpf_disabled` to write only by root (`EACCES`), as
+/// (`ipc_permissions`); the machine's `perf_event_mlock_kb`,
+/// `perf_event_paranoid` and `unprivileged_bpf_disabled` to write only by
+/// root (`EACCES`), as
 /// `test_perm` gives the root user ID the owner's bits.
 pub(crate) fn open(
     c: &Context<'_>,
@@ -1534,7 +1554,7 @@ mod tests {
         );
         assert_eq!(lookup(b"/proc/sys/kernel/other", None), None);
         assert_eq!(entries_of(Directory::Sys, None).len(), 5);
-        assert_eq!(entries_of(Directory::Kernel, None).len(), 16);
+        assert_eq!(entries_of(Directory::Kernel, None).len(), 17);
         assert_eq!(lookup(b"/proc/system", None), None);
         assert_eq!(entries_of(Directory::Mqueue, None).len(), 7);
     }

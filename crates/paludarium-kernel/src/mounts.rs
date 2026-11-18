@@ -15,9 +15,9 @@
 //! (`EROFS`, in the calls that write). What it does not do yet gives
 //! `EOPNOTSUPP` once Linux's checks before it have passed: `MS_NOSYMFOLLOW`
 //! on a tmpfs or set by a remount, a mount on or a move of `/proc` or
-//! `/dev`, which the kernel generates, a bind mount of a directory there
-//! (one of a file there shows that file), and a move of a mount from
-//! start-up that the lower filesystem shows. Any other file system
+//! `/dev`, which the kernel generates (a bind mount of a file or a
+//! directory there shows it), and a move of a mount from start-up that the
+//! lower filesystem shows. Any other file system
 //! type is `ENODEV`, as from a kernel without it.
 //!
 //! `umount2` unmounts the mounts `mount` made, and the old root after a
@@ -675,8 +675,9 @@ fn mount(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
 /// ([`paludarium_vfs::NamespacedFs::bind`]). The flags other than `MS_REC`
 /// change nothing: the new mount has the source mount's. A source in
 /// `/proc` or `/dev`, which the kernel generates, is a mount of that file
-/// ([`paludarium_vfs::NamespacedFs::bind_generated`]); of a directory
-/// there, not supported yet (`EOPNOTSUPP`).
+/// ([`paludarium_vfs::NamespacedFs::bind_generated`]), a file or a
+/// directory, below which no mount is locked or comes along with
+/// `MS_REC`.
 fn bind(
     c: &Context<'_>,
     source: Option<Vec<u8>>,

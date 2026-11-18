@@ -14,14 +14,21 @@
 //! with `PERF_IOC_FLAG_GROUP`), and grouped; `enable_on_exec` enables it
 //! when its task runs `execve`, and `prctl`'s `PR_TASK_PERF_EVENTS_DISABLE`
 //! and `ENABLE` disable and enable those the calling thread opened. The
-//! machine keeps both lists ([`Events`]). There is no ring buffer: `mmap`
-//! of an event is `ENODEV`, and a sampling event takes no samples.
+//! machine keeps both lists ([`Events`]). An event of a task maps its
+//! ring buffer ([`buffer`]), whose user page shows the count and times as
+//! of the event's `mmap`, its enabling and its reset; a sampling event
+//! takes no samples yet, and the buffer stays empty.
+mod buffer;
+
 use crate::ThreadGroup;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{ClockId, FileHandle, FileStat, Host};
 use paludarium_types::{Errno, GuestAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+
+/// `kernel.perf_event_mlock_kb`'s default, Linux's: 512 KiB and a page.
+pub(crate) const MLOCK_KB: i32 = 512 + 4;
 
 /// `kernel.perf_event_paranoid`'s default, Linux's, which the machine's
 /// starts with ([`crate::sysctl::Machine`]).
@@ -444,6 +451,12 @@ pub(crate) struct Event {
     /// The opened event's inherited ones, of the tasks that still run
     /// (`child_list`).
     children: Mutex<Vec<Arc<Event>>>,
+    /// The ring buffer it writes to (`rb`), while one is mapped.
+    rb: Mutex<Option<Arc<buffer::Buffer>>>,
+    /// What the mappings of the buffer it made hold (`mmap_count`).
+    mapped: Mutex<Weak<buffer::Mapped>>,
+    /// Held while the event's buffer is mapped (`mmap_mutex`).
+    mmap_mutex: Mutex<()>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -456,6 +469,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Default)]
 pub(crate) struct Events {
     lists: Mutex<Lists>,
+    /// What users and address spaces have locked of ring buffers.
+    accounts: Arc<buffer::Accounts>,
 }
 
 #[derive(Default)]
@@ -696,6 +711,9 @@ impl Event {
             }),
             parent: Some(Arc::downgrade(&top)),
             children: Mutex::default(),
+            rb: Mutex::default(),
+            mapped: Mutex::default(),
+            mmap_mutex: Mutex::default(),
         });
         if let Some(leader) = leader {
             lock(&leader.siblings).push(Arc::downgrade(&child));
@@ -711,6 +729,7 @@ impl Event {
     /// `perf_event_for_each_child`: the event and those inherited from it.
     fn enable(&self) {
         self.set_enabled(true);
+        self.update_user_page();
         for child in self.children() {
             child.set_enabled(true);
         }
@@ -725,6 +744,7 @@ impl Event {
     /// leaves the times and what ended children gave back.
     fn reset(&self) {
         self.settle().count = 0;
+        self.update_user_page();
         for child in self.children() {
             child.settle().count = 0;
         }
@@ -1060,6 +1080,9 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         state: Mutex::default(),
         parent: None,
         children: Mutex::default(),
+        rb: Mutex::default(),
+        mapped: Mutex::default(),
+        mmap_mutex: Mutex::default(),
     });
     if let Some(leader) = &leader {
         event.set_paused(!leader.enabled());
@@ -1281,6 +1304,21 @@ const IOC_PERIOD: u64 = 0x4008_2404;
 const IOC_ID: u64 = 0x8008_2407;
 const IOC_FLAG_GROUP: u64 = 1;
 
+/// `mmap` of an event's file: its ring buffer ([`buffer`]), at
+/// `placement`, once `mmap`'s own checks have passed.
+pub(crate) fn mmap(
+    c: &mut Context<'_>,
+    file: &Arc<dyn FileHandle>,
+    placement: paludarium_mmu::Placement,
+    len: u64,
+    prot: paludarium_mmu::Prot,
+    shared: bool,
+    offset: u64,
+) -> Option<Result<u64, Errno>> {
+    of(file)?;
+    Some(buffer::mmap(c, file, placement, len, prot, shared, offset))
+}
+
 /// An event's ioctls, as Linux's `_perf_ioctl`: `ENABLE`, `DISABLE` and
 /// `RESET` of the event or, with `PERF_IOC_FLAG_GROUP`, its whole group;
 /// `ID`; `PERIOD` and `REFRESH`, which only a sampling event takes
@@ -1417,7 +1455,7 @@ mod tests {
         assert_eq!(init(&branch), Err(Errno::EOPNOTSUPP));
     }
 
-    fn event(leader: Option<&Arc<Event>>) -> Arc<Event> {
+    pub(super) fn event(leader: Option<&Arc<Event>>) -> Arc<Event> {
         counting(leader, Target::Cpu)
     }
 
@@ -1459,6 +1497,9 @@ mod tests {
             state: Mutex::default(),
             parent: None,
             children: Mutex::default(),
+            rb: Mutex::default(),
+            mapped: Mutex::default(),
+            mmap_mutex: Mutex::default(),
         });
         if let Some(leader) = leader {
             lock(&leader.siblings).push(Arc::downgrade(&event));

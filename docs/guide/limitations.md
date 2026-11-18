@@ -69,7 +69,10 @@ verified.
   private file mapping, is a file's (bit 61) until the mapping was
   written, not until the page was. A read of a file's page gives only
   that page an entry, where Linux's fault maps the pages around it too
-  (`fault_around_bytes`). The frame number is 0 for every reader, also one
+  (`fault_around_bytes`). A page of a file's private mapping that
+  `MADV_DONTNEED` dropped is read from the file again at once, so it has
+  an entry (bit 63, and bit 57 if it was write-protected) where Linux has
+  none, or a uffd-wp marker, until an access. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
 - **`/proc/<pid>/clear_refs`, in part**: only 4 (soft-dirty) changes
@@ -235,9 +238,20 @@ verified.
   signal frame's write counts as the thread's own; a context switch is a
   sleep of the thread, not a preemption (but for a thread with `rseq` that
   gives its virtual CPU to another); and a thread without `rseq` moves to
-  another CPU only when a new CPU mask changes the lowest CPU it allows. There is no ring buffer: `mmap` of an event
-  is `ENODEV`, a sampling event takes no samples and sends no signal, and
-  `poll` never finds one readable. `inherit_stat` is taken, but an
+  another CPU only when a new CPU mask changes the lowest CPU it allows.
+  An event's ring buffer maps, but nothing writes records to it yet: a
+  sampling event takes no samples and sends no signal, and `poll` never
+  finds one readable. Its user page shows the count and times as of the
+  `mmap`, the event's enabling and its reset, where Linux updates them
+  each time the event is scheduled in, and `cap_user_time` is never set.
+  Where Linux's checks of a mapping and of where it goes both fail, the
+  mapping's are the error here. Until the memory manager knows Linux's
+  rules for the mapping (`VM_PFNMAP`), a write to a data page lands, where
+  Linux raises `SIGBUS`; a part of the mapping may be unmapped, moved or
+  given another protection, where Linux refuses to split it (`EINVAL`); and
+  `MADV_DOFORK` takes it into a child, where Linux refuses it on `VM_IO`
+  (`EINVAL`); and `mlock` locks it, where Linux leaves a `VM_SPECIAL`
+  mapping unlocked. `inherit_stat` is taken, but an
   inherited event's end sends no read record, as nothing is recorded. An
   event of a task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
@@ -561,9 +575,8 @@ verified.
   any other type is `ENODEV`, as from a kernel without it. Once Linux's
   checks before them pass, `MS_NOSYMFOLLOW` on a tmpfs or set by a
   remount, a mount on or a move of the generated `/proc` or `/dev` (or a
-  file in them), and a bind mount of a directory there or of a
-  descriptor's link to a file no path names, give `EOPNOTSUPP`, so a
-  program
+  file in them), and a bind mount of a descriptor's link to a file no path
+  names, give `EOPNOTSUPP`, so a program
   learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
   (new in Linux master), `move_mount`'s `MOVE_MOUNT_BENEATH`, `fsmount`'s
   `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
@@ -580,7 +593,13 @@ verified.
   file's own mount (one opened before a `setns` is looked for in the
   namespace the caller is in now). A file a bind mount of a generated
   file shows has, in `statx` and `/proc/self/fdinfo`, the mount ID of
-  `/dev` or `/proc`, not the bind mount's. A file system context makes
+  `/dev` or `/proc`, not the bind mount's. Under `/proc` and `/dev` the
+  table has none of the mounts Linux has there (`/dev/pts`, `/dev/shm`,
+  `/dev/mqueue`, `/proc/sys/fs/binfmt_misc`): a bind mount of either
+  without `MS_REC` still shows what is generated in those directories,
+  where Linux shows their empty mount points, and in a namespace of a less
+  privileged owner it is made, where Linux refuses it for its locked
+  mounts below (`EINVAL`). A file system context makes
   only a tmpfs, as `mount` does, and logs no message but those of its
   parameters and of a reconfiguration; one of a superblock from start-up
   takes only the common flags (`ro`, `sync`, ...). A context keeps its
@@ -733,15 +752,17 @@ verified.
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages, write protection and the minor
   faults of shmem are registered. Not offered are the events of `fork`,
-  `mremap`, `madvise` and `munmap` and `UFFD_FEATURE_WP_ASYNC`, which
-  `UFFDIO_API` does not report and refuses (`EINVAL`); without it only
-  anonymous memory and shmem take the write-protect mode. A
+  `mremap`, `madvise` and `munmap`, which `UFFDIO_API` does not report and
+  refuses (`EINVAL`), and `PAGEMAP_SCAN`, the `/proc/<pid>/pagemap` ioctl
+  that finds and protects again the pages `UFFD_FEATURE_WP_ASYNC` saw
+  written; their bit 57 in `/proc/<pid>/pagemap` tells them. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
   `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in
   the marker's place, where Linux, whose zap keeps the marker, restarts
   the call until a signal comes.
-  Of shmem's files only a memfd is registered: a tmpfs file
+  Of shmem's files only a memfd is registered, but for write protection
+  alone with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a tmpfs file
   is refused (`EINVAL`), where Linux takes it, as the in-memory file
   system says it is a tmpfs but stands for the files a guest has on disk,
   and a host's tmpfs file is not kept here. A zero page `UFFDIO_ZEROPAGE` gives a
@@ -749,7 +770,7 @@ verified.
   `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
   zero page. A system call's own
   copy to or from a missing page of a registered range, or to a
-  write-protected one, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
+  write-protected one without `UFFD_FEATURE_WP_ASYNC`, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
   Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,

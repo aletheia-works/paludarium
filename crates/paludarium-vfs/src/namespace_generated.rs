@@ -29,8 +29,9 @@ impl GeneratedSource {
 }
 
 /// The stand-in a walk sees for a bind mount of a generated file: its root
-/// with the file's `stat`, and nothing else, as every other call on it is
-/// the kernel's.
+/// with the file's `stat` and, below a directory's, a directory at each
+/// name, so a walk goes through by the names alone and the kernel finds
+/// what is there; every other call on it is the kernel's.
 #[derive(Debug)]
 pub(super) struct GeneratedFs(pub(super) GeneratedSource);
 impl HostFs for GeneratedFs {
@@ -40,6 +41,12 @@ impl HostFs for GeneratedFs {
     fn metadata(&self, path: &[u8], _follow: bool) -> Result<FileStat, Errno> {
         if path == self.0.path.as_slice() {
             Ok(self.0.stat)
+        } else if self.0.stat.mode & S_IFMT == S_IFDIR && within(path, &self.0.path) {
+            Ok(FileStat {
+                mode: S_IFDIR | 0o555,
+                links: 2,
+                ..FileStat::default()
+            })
         } else {
             Err(Errno::ENOENT)
         }
@@ -72,8 +79,9 @@ impl NamespacedFs {
     /// `do_loopback` of a file the kernel generates onto the resolved
     /// `target`: the new mount shows `source`, a file on a file and a
     /// directory on a directory (`graft_tree`, `ENOTDIR`), and on a shared
-    /// mount it is shared too, in a new peer group. Only a file is taken
-    /// for now (`EOPNOTSUPP` for a directory).
+    /// mount it is shared too, in a new peer group. No table here holds a
+    /// mount below a generated directory, so none is locked
+    /// (`has_locked_children`) or comes along with `MS_REC`.
     pub fn bind_generated(&self, source: GeneratedSource, target: &[u8]) -> Result<(), Errno> {
         self.swept();
         let entries = self.table.snapshot();
@@ -82,9 +90,6 @@ impl NamespacedFs {
         let directory = source.stat.mode & S_IFMT == S_IFDIR;
         if directory != (self.lstat(&entries, &to)?.mode & S_IFMT == S_IFDIR) {
             return Err(Errno::ENOTDIR);
-        }
-        if directory {
-            return Err(Errno::EOPNOTSUPP);
         }
         // `clone_mnt` keeps the flags' locks of the mount it copies, the
         // one of `/dev` or `/proc` from start-up, which a namespace of a

@@ -186,6 +186,13 @@ impl Userfault {
     /// markers, as Linux's `userfaultfd_wp_use_markers` has it. Shmem's
     /// get markers either way.
     pub const WP_UNPOPULATED: u8 = 1 << 6;
+    /// Not a mode of `UFFDIO_REGISTER`: the `userfaultfd` took
+    /// `UFFD_FEATURE_WP_ASYNC`, so a write to a page `UFFDIO_WRITEPROTECT`
+    /// protected does not fault to it: the write clears the protection
+    /// and goes on, as Linux's `do_wp_page` clears `_PAGE_UFFD_WP` when
+    /// `userfaultfd_wp_async`. With [`Userfault::WP`] alone, any memory
+    /// may be registered (`vma_can_userfault`).
+    pub const WP_ASYNC: u8 = 1 << 7;
 }
 
 /// Why an access waits for a `userfaultfd` ([`AddressSpace::userfault_for`]).
@@ -2500,7 +2507,11 @@ impl AddressSpaceData {
                     .is_some_and(|size| offset >= size.div_ceil(PAGE_SIZE) * PAGE_SIZE);
                 if past {
                     let fetched = p.frame.fetched();
-                    *entry = Some(self.fresh(page, p.prot));
+                    // The zap leaves a uffd-wp marker for a protected entry
+                    // (`zap_install_uffd_wp_if_needed`).
+                    let mut new = self.fresh(page, p.prot);
+                    new.uffd_wp = p.uffd_wp;
+                    *entry = Some(new);
                     if fetched {
                         // The page shows other bytes than the instructions
                         // decoded from it.
@@ -2967,7 +2978,14 @@ impl AddressSpaceData {
                     ..fault(at)
                 });
             }
-            match self.prot_at(directory, page) {
+            // With `WP_ASYNC`, a write to a write-protected page clears the
+            // protection ([`Self::refresh`]), as `do_wp_page` does: the
+            // entry's own protection decides.
+            let prot = match lookup(directory, page) {
+                Some(p) if access.is_write() && p.uffd_wp && self.wp_async(page) => Some(p.prot),
+                _ => self.prot_at(directory, page),
+            };
+            match prot {
                 Some(prot) if access.permitted(prot) => {
                     if access == Access::ForceWrite
                         && !prot.contains(Prot::WRITE)
@@ -3029,10 +3047,12 @@ impl AddressSpaceData {
                 });
             }
             // A write to a page with a uffd-wp marker, which the kernel
-            // takes to its `userfaultfd` ([`Self::userfault_for`]).
+            // takes to its `userfaultfd` ([`Self::userfault_for`]); with
+            // `WP_ASYNC` the page faults in without the protection.
             if access == Access::Write
                 && lookup(directory, page).is_none()
                 && self.uffd_marked(page)
+                && !self.wp_async(page)
             {
                 return Err(Fault {
                     mapped: true,
@@ -3278,6 +3298,7 @@ impl AddressSpaceData {
             let ready = |page: u64| {
                 lookup(&directory, page).is_some_and(|p| {
                     !p.cow
+                        && !p.uffd_wp
                         && p.soft_dirty
                         && p.frame.get().is_some()
                         && !self.may_be_truncated(page, p)
@@ -3315,6 +3336,15 @@ impl AddressSpaceData {
             {
                 faults::count();
             }
+            // A write with `WP_ASYNC` clears the protection; the loader's and
+            // a refill's are not writes. An entry loses it first, as Linux's
+            // `do_wp_page` clears `_PAGE_UFFD_WP` before it copies the page,
+            // which may fail; a marker's page only once its entry has room,
+            // as a failed `do_anonymous_page` leaves the marker.
+            let unprotect = access != Access::Setup && self.wp_async(page);
+            if unprotect && let Some(Some(p)) = table.pages.get_mut(slot) {
+                p.uffd_wp = false;
+            }
             if let Some(entry) = table.pages.get_mut(slot)
                 && !self.refresh(entry, page, prot, true)
             {
@@ -3341,6 +3371,13 @@ impl AddressSpaceData {
                 && p.frame_for_write(self.meter.as_ref()).is_none()
             {
                 return Err(self.out_of_room(page));
+            }
+            if unprotect
+                && let Some(Some(p)) = directory
+                    .get_mut(&dir)
+                    .and_then(|table| table.pages.get_mut(slot))
+            {
+                p.uffd_wp = false;
             }
         }
         // Again, as a truncation may have come between the check and the
@@ -4328,9 +4365,14 @@ impl AddressSpaceData {
     /// MAP_ANONYMOUS`), which Linux keeps in shmem; and a shared or private
     /// mapping of a shmem file ([`PageSource::shmem`]: a memfd), not
     /// System V shared memory, whose VMAs are not shmem's. Only shmem takes
-    /// [`Userfault::MINOR`], as Linux's does; any of them takes
-    /// [`Userfault::WP`].
+    /// [`Userfault::WP`]. With [`Userfault::WP_ASYNC`], [`Userfault::WP`]
+    /// alone takes any memory, as `vma_can_userfault` allows any memory
+    /// type when `wp_async` and `VM_UFFD_WP` is the only mode.
     fn userfault_capable(&self, m: &Mapping, modes: u8) -> bool {
+        let kinds = Userfault::MISSING | Userfault::WP | Userfault::MINOR;
+        if modes & Userfault::WP_ASYNC != 0 && modes & kinds == Userfault::WP {
+            return true;
+        }
         if self.shmem_at(m.start.0) {
             return true;
         }
@@ -4386,6 +4428,19 @@ impl AddressSpaceData {
                 .is_some_and(|u| u.modes & Userfault::WP != 0)
     }
 
+    /// Whether a write to the page at `page`, if `UFFDIO_WRITEPROTECT`
+    /// protected it, clears the protection rather than faulting: its
+    /// mapping is registered for [`Userfault::WP`] by a `userfaultfd` with
+    /// [`Userfault::WP_ASYNC`] (Linux's `userfaultfd_wp_async`).
+    fn wp_async(&self, page: u64) -> bool {
+        self.mapping_at(page)
+            .and_then(|m| m.userfault)
+            .is_some_and(|u| {
+                u.modes & (Userfault::WP | Userfault::WP_ASYNC)
+                    == Userfault::WP | Userfault::WP_ASYNC
+            })
+    }
+
     /// Whether the mapping at `page` is anonymous memory as Linux's
     /// `vma_is_anonymous` has it: private memory of no file, whose discard
     /// drops its uffd-wp markers.
@@ -4403,13 +4458,16 @@ impl AddressSpaceData {
     /// Leaves a uffd-wp marker on each page of `[start, end)` whose entry
     /// is write-protected, before the entries go, as Linux's
     /// `zap_install_uffd_wp_if_needed` does for memory that is not
-    /// anonymous; anonymous memory loses its markers.
+    /// anonymous, and none on one whose entry is not (a write with
+    /// [`Userfault::WP_ASYNC`] cleared it); anonymous memory loses its
+    /// markers.
     fn keep_uffd_markers(&mut self, start: u64, end: u64) {
         if self.anonymous_at(start) {
             self.uffd_markers.clear(start, end);
             return;
         }
         let mut protected = Vec::new();
+        let mut unprotected = Vec::new();
         {
             let directory = self.read_directory();
             for (&dir, table) in directory.range(
@@ -4418,14 +4476,22 @@ impl AddressSpaceData {
             ) {
                 for (slot, entry) in table.pages.iter().enumerate() {
                     let page = (dir * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
-                    if page >= start && page < end && entry.as_ref().is_some_and(|p| p.uffd_wp) {
-                        protected.push(page);
+                    if page < start || page >= end {
+                        continue;
+                    }
+                    match entry {
+                        Some(p) if p.uffd_wp => protected.push(page),
+                        Some(_) => unprotected.push(page),
+                        None => {}
                     }
                 }
             }
         }
         for page in protected {
             self.uffd_markers.add(page, page + PAGE_SIZE);
+        }
+        for page in unprotected {
+            self.uffd_markers.clear(page, page + PAGE_SIZE);
         }
     }
 
@@ -4511,6 +4577,7 @@ impl AddressSpaceData {
             && let Some(mapping) = self.mapping_at(page)
             && let Some(registration) = mapping.userfault
             && registration.modes & Userfault::WP != 0
+            && registration.modes & Userfault::WP_ASYNC == 0
             && mapping.prot.contains(Prot::WRITE)
             && lookup(&directory, page).is_some_and(|p| p.uffd_wp)
         {
@@ -4529,6 +4596,7 @@ impl AddressSpaceData {
         self.userfault_waits(&directory, page).or_else(|| {
             let registration = self.mapping_at(page)?.userfault?;
             (access == Access::Write
+                && registration.modes & Userfault::WP_ASYNC == 0
                 && lookup(&directory, page).is_none()
                 && self.uffd_marked(page)
                 && !self.past_file_end(page))

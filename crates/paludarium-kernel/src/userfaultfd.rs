@@ -38,9 +38,16 @@
 //! such a page is write-protected, and a discard of shmem keeps the
 //! protection of its pages.
 //!
-//! Not offered: `UFFD_FEATURE_WP_ASYNC`, and the events of `fork`,
-//! `mremap`, `madvise` and `munmap`. `UFFDIO_API` does not report their
-//! features, which it refuses (`EINVAL`).
+//! With `UFFD_FEATURE_WP_ASYNC` (which brings `UFFD_FEATURE_WP_UNPOPULATED`)
+//! a write to a write-protected page does not fault: it clears the
+//! protection and goes on, as Linux's `do_wp_page` does, so that
+//! `/proc/<pid>/pagemap`'s `PM_UFFD_WP` tells which pages were written.
+//! Registered for write protection alone, any memory takes it, a file's
+//! mapping too, whose discarded pages keep their protection.
+//!
+//! Not offered: the events of `fork`, `mremap`, `madvise` and `munmap`.
+//! `UFFDIO_API` does not report their features, which it refuses
+//! (`EINVAL`).
 
 use crate::events::{IN, ReadinessHub};
 use crate::syscalls::{Context, Outcome};
@@ -93,7 +100,9 @@ const FEATURE_WP_HUGETLBFS_SHMEM: u64 = 1 << 12;
 const FEATURE_WP_UNPOPULATED: u64 = 1 << 13;
 /// `UFFD_FEATURE_POISON`: `UFFDIO_POISON` is there.
 const FEATURE_POISON: u64 = 1 << 14;
-/// `UFFD_FEATURE_WP_ASYNC`, which takes `UFFD_FEATURE_WP_UNPOPULATED`.
+/// `UFFD_FEATURE_WP_ASYNC`, which takes `UFFD_FEATURE_WP_UNPOPULATED`: a
+/// write to a write-protected page clears the protection rather than
+/// faulting ([`paludarium_mmu::Userfault::WP_ASYNC`]).
 const FEATURE_WP_ASYNC: u64 = 1 << 15;
 /// `UFFD_FEATURE_MOVE`: `UFFDIO_MOVE` is there, which works whether a
 /// context asked for it or not, as Linux's does.
@@ -110,6 +119,7 @@ const FEATURES: u64 = FEATURE_PAGEFAULT_FLAG_WP
     | FEATURE_WP_HUGETLBFS_SHMEM
     | FEATURE_WP_UNPOPULATED
     | FEATURE_POISON
+    | FEATURE_WP_ASYNC
     | FEATURE_MOVE;
 /// The context's features once `UFFDIO_API` took them
 /// (`UFFD_FEATURE_INITIALIZED`).
@@ -682,6 +692,9 @@ fn register(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64,
     let mut modes = mode as u8;
     if context.features() & FEATURE_WP_UNPOPULATED != 0 {
         modes |= paludarium_mmu::Userfault::WP_UNPOPULATED;
+    }
+    if context.features() & FEATURE_WP_ASYNC != 0 {
+        modes |= paludarium_mmu::Userfault::WP_ASYNC;
     }
     context
         .memory

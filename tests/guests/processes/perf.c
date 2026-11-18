@@ -5,7 +5,9 @@
    PR_TASK_PERF_EVENTS_DISABLE and ENABLE of the events a thread opened,
    inherit, which counts the children a task makes, and the page faults,
    context switches and CPU migrations a thread makes, with and without
-   exclude_user and exclude_kernel.
+   exclude_user and exclude_kernel; and mmap of an event's ring buffer:
+   its user page, the sizes and mappings it takes, its AUX area, a fork's
+   child, which has none of it, and the pages a user may lock.
 
    Counts and times are given as whether they are 0, grew or stayed,
    never as values, and IDs as whether they match. Hardware events are not
@@ -24,6 +26,8 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -554,6 +558,154 @@ static int case_software(void) {
     return 0;
 }
 
+/* The user page's fields (struct perf_event_mmap_page). */
+#define PAGE_U32(page, at) (*(volatile uint32_t *)((char *)(page) + (at)))
+#define PAGE_U64(page, at) (*(volatile uint64_t *)((char *)(page) + (at)))
+
+static long map_event(int fd, size_t pages, int prot, int flags, off_t offset, void **at) {
+    void *p = mmap(NULL, pages * 4096, prot, flags, fd, offset);
+    if (p == MAP_FAILED) return -errno;
+    if (at) *at = p;
+    else munmap(p, pages * 4096);
+    return 0;
+}
+
+/* Run in a child as another user, whose caps go with root's IDs: what it
+   locks of buffers is its own, and gone when it ends. */
+static void as_user(uid_t uid, void (*run)(int), int fd) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (setresgid(uid, uid, uid) || setresuid(uid, uid, uid)) _exit(90);
+        run(fd);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) say("child %d", status);
+}
+
+/* Each mapping of a buffer of 1 + 8 pages through its event shares it. */
+static void map_twice(int fd) {
+    void *a = NULL, *b = NULL;
+    long first = map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &a);
+    long second = map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &b);
+    long other = map_event(fd, 5, PROT_READ | PROT_WRITE, MAP_SHARED, 0, NULL);
+    if (first || second) {
+        say("map twice %ld %ld", first, second);
+        return;
+    }
+    PAGE_U64(a, 1032) = 64;
+    say("map twice: other size %ld shared %d", other, PAGE_U64(b, 1032) == 64);
+}
+
+/* Without RLIMIT_MEMLOCK or CAP_IPC_LOCK, what passes the user's share
+   (perf_event_mlock_kb a CPU, 516 KiB unless the host tunes it, read as
+   it is) is refused. */
+static void map_past_limit(int fd) {
+    struct rlimit none = {0, 0};
+    setrlimit(RLIMIT_MEMLOCK, &none);
+    char text[32] = {0};
+    int sysctl = open("/proc/sys/kernel/perf_event_mlock_kb", O_RDONLY);
+    if (sysctl < 0 || read(sysctl, text, sizeof text - 1) <= 0) {
+        say("past limit: no perf_event_mlock_kb");
+        return;
+    }
+    close(sysctl);
+    long kb = strtol(text, NULL, 10);
+    if (kb < 8) {
+        say("past limit: share below two pages");
+        return;
+    }
+    size_t share = (size_t)(kb >> 2) * (size_t)get_nprocs();
+    /* The largest buffer within the share, and the smallest past it. */
+    size_t within = 1, over = 1;
+    while (2 * within + 1 <= share) within <<= 1;
+    while (over + 1 <= share) over <<= 1;
+    say("past limit: within %ld over %ld", map_event(fd, within + 1, PROT_READ, MAP_SHARED, 0, NULL),
+        map_event(fd, over + 1, PROT_READ, MAP_SHARED, 0, NULL));
+}
+
+static int case_mmap(void) {
+    int fd = open_software(2, EXCLUDE_KERNEL | EXCLUDE_HV);
+    say("open %d", fd >= 0);
+
+    /* Mappings refused before the buffer is made. */
+    say("private %ld", map_event(fd, 9, PROT_READ, MAP_PRIVATE, 0, NULL));
+    say("three data pages %ld", map_event(fd, 4, PROT_READ, MAP_SHARED, 0, NULL));
+    say("aux without buffer %ld", map_event(fd, 1, PROT_READ, MAP_SHARED, 4096 * 16, NULL));
+    struct attr inherited = software(2);
+    inherited.flags |= INHERIT;
+    int inherit = (int)open_event(&inherited, 0, -1, -1, 0);
+    say("inherit %ld", map_event(inherit, 9, PROT_READ, MAP_SHARED, 0, NULL));
+    close(inherit);
+
+    /* The user page of a buffer of eight data pages. */
+    void *page = NULL;
+    touch(4);
+    long mapped = map_event(fd, 9, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    say("mapped %ld", mapped);
+    if (mapped) return 0;
+    uint64_t caps = PAGE_U64(page, 40);
+    say("version %u compat %u lock even %d index %u", PAGE_U32(page, 0), PAGE_U32(page, 4),
+        PAGE_U32(page, 8) % 2 == 0, PAGE_U32(page, 12));
+    say("caps bit0 %d deprecated %d rdpmc %d", (int)(caps & 1), (int)(caps >> 1 & 1), (int)(caps >> 2 & 1));
+    say("size %u data offset %llu size %llu head %llu tail %llu", PAGE_U32(page, 72),
+        (unsigned long long)PAGE_U64(page, 1040), (unsigned long long)PAGE_U64(page, 1048),
+        (unsigned long long)PAGE_U64(page, 1024), (unsigned long long)PAGE_U64(page, 1032));
+    say("count %d times %d", PAGE_U64(page, 16) <= count(fd),
+        PAGE_U64(page, 24) >= PAGE_U64(page, 32));
+    /* The data pages read as zeros. */
+    int zeros = 1;
+    for (size_t i = 4096; i < 9 * 4096; i += 512) zeros &= ((volatile char *)page)[i] == 0;
+    say("data zeros %d", zeros);
+
+    /* Another size while mapped, and the AUX area, which a software event
+       has none of once Linux's checks pass. */
+    say("other size %ld", map_event(fd, 17, PROT_READ, MAP_SHARED, 0, NULL));
+    say("aux unset %ld", map_event(fd, 4, PROT_READ, MAP_SHARED, 4096 * 16, NULL));
+    PAGE_U64(page, 1072) = 4096 * 16;
+    PAGE_U64(page, 1080) = 4096 * 4;
+    say("aux elsewhere %ld", map_event(fd, 4, PROT_READ, MAP_SHARED, 4096 * 32, NULL));
+    say("aux other size %ld", map_event(fd, 2, PROT_READ, MAP_SHARED, 4096 * 16, NULL));
+    say("aux %ld", map_event(fd, 4, PROT_READ, MAP_SHARED, 4096 * 16, NULL));
+    PAGE_U64(page, 1080) = 4096 * 3;
+    say("aux three pages %ld", map_event(fd, 3, PROT_READ, MAP_SHARED, 4096 * 16, NULL));
+    PAGE_U64(page, 1072) = 4096 * 4;
+    PAGE_U64(page, 1080) = 4096 * 4;
+    say("aux within %ld", map_event(fd, 4, PROT_READ, MAP_SHARED, 4096 * 4, NULL));
+
+    /* A fork's child has none of it. */
+    pid_t pid = fork();
+    if (pid == 0) _exit(msync(page, 4096, MS_ASYNC) == 0 ? 0 : errno == ENOMEM ? 1 : 2);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    say("child mapping %d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    /* Unmapped, the buffer goes, and another size maps. Closed, the
+       event lives on in its mapping. */
+    munmap(page, 9 * 4096);
+    say("unmapped: other size %ld", map_event(fd, 17, PROT_READ, MAP_SHARED, 0, NULL));
+    mapped = map_event(fd, 5, PROT_READ, MAP_SHARED, 0, &page);
+    close(fd);
+    say("closed %ld: mapped %d data size %llu", mapped, msync(page, 5 * 4096, MS_ASYNC) == 0,
+        (unsigned long long)PAGE_U64(page, 1048));
+    munmap(page, 5 * 4096);
+    int again = open_software(2, EXCLUDE_KERNEL | EXCLUDE_HV);
+    say("one page %ld", map_event(again, 1, PROT_READ, MAP_SHARED, 0, NULL));
+    say("fixed %ld", ({
+            void *hint = mmap(NULL, 9 * 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            void *got = mmap(hint, 9 * 4096, PROT_READ, MAP_SHARED | MAP_FIXED, again, 0);
+            long fixed = got == MAP_FAILED ? -errno : got == hint;
+            if (got != MAP_FAILED) munmap(got, 9 * 4096);
+            fixed;
+        }));
+
+    as_user(4242, map_twice, again);
+    as_user(4243, map_past_limit, again);
+    close(again);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -562,6 +714,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-prctl")) return case_prctl();
     if (!strcmp(mode, "perf-inherit")) return case_inherit();
     if (!strcmp(mode, "perf-software")) return case_software();
+    if (!strcmp(mode, "perf-mmap")) return case_mmap();
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {
         spin();

@@ -25,7 +25,12 @@
    private anonymous memory: the pages UFFDIO_WRITEPROTECT protects that
    have no entry (their bits in /proc/self/pagemap), a read and a write of
    one, what MADV_DONTNEED, fills, the minor mode, fork and mremap do to
-   the protection.
+   the protection; and WP_ASYNC: the features it brings, a write to a
+   protected page that clears the protection rather than faulting (an
+   instruction's and a system call's), of private anonymous memory and of
+   the memory only WP_ASYNC registers (a file's private and shared
+   mappings, System V shared memory), the modes and mappings it still
+   refuses, and what MADV_DONTNEED does to a file's protected pages.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
    whether they are the faulting thread's. Of what UFFDIO_API and
@@ -66,6 +71,7 @@
 #define UFFD_FEATURE_MINOR_SHMEM (1ULL << 10)
 #define UFFD_FEATURE_WP_HUGETLBFS_SHMEM (1ULL << 12)
 #define UFFD_FEATURE_WP_UNPOPULATED (1ULL << 13)
+#define UFFD_FEATURE_WP_ASYNC (1ULL << 15)
 #define UFFD_PAGEFAULT_FLAG_MINOR 4
 #define UFFDIO_REGISTER_MODE_MISSING 1ULL
 #define UFFDIO_REGISTER_MODE_WP 2ULL
@@ -1308,6 +1314,129 @@ static int case_wp_shmem(void) {
     return 0;
 }
 
+/* Only the uffd-wp bit of the page at `at` in /proc/self/pagemap: a
+   private file page MADV_DONTNEED dropped is read again at once here,
+   where Linux has no entry until an access. */
+static void wp_show(const char *what, void *at) {
+    int f = open("/proc/self/pagemap", O_RDONLY);
+    uint64_t e = 0;
+    pread(f, &e, sizeof e, (off_t)((uintptr_t)at / PAGE * sizeof e));
+    close(f);
+    printf("%s: wp=%d\n", what, (int)(e >> 57 & 1));
+}
+
+/* WP_ASYNC: a write to a protected page clears its protection and goes
+   on, of any memory registered for write protection alone. */
+static int case_wp_async(void) {
+    int sync = ready(O_NONBLOCK, UFFD_FEATURE_PAGEFAULT_FLAG_WP);
+    int fd = uffd(O_NONBLOCK);
+    struct uffdio_api api = {UFFD_API, UFFD_FEATURE_WP_ASYNC, 0};
+    printf("api: %s", err(ioctl(fd, UFFDIO_API, &api)));
+    printf(" async=%d\n", (api.features & UFFD_FEATURE_WP_ASYNC) != 0);
+    fdinfo("async", fd);
+    /* Private anonymous memory, whose pages with no entry get markers. */
+    char *a = anon(3 * PAGE);
+    a[0] = 'a';
+    printf("register: %s\n", err(reg(fd, a, 3 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    printf("protect: %s\n", err(protect(fd, a, 3 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    pagemap_show("an entry", a);
+    pagemap_show("unpopulated", a + PAGE);
+    a[0] = 'b';
+    a[PAGE] = 'c';
+    pagemap_show("written", a);
+    pagemap_show("written unpopulated", a + PAGE);
+    pagemap_show("untouched", a + 2 * PAGE);
+    printf("read: %c%c\n", a[0], a[PAGE]);
+    struct pollfd waiting = {fd, POLLIN, 0};
+    printf("poll: %d\n", poll(&waiting, 1, 0));
+    /* A system call's write goes on too. */
+    printf("protect again: %s\n", err(protect(fd, a, 3 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    int p[2];
+    pipe(p);
+    write(p[1], "s", 1);
+    printf("read(2): %s\n", err(read(p[0], a + 2 * PAGE, 1)));
+    pagemap_show("read(2)", a + 2 * PAGE);
+    pagemap_show("still protected", a);
+    printf("dontneed: %s\n", err(madvise(a, 3 * PAGE, MADV_DONTNEED)));
+    pagemap_show("after dontneed", a);
+    /* The missing mode with it takes private anonymous memory only. */
+    char *b = anon(PAGE);
+    printf("register missing: %s\n",
+           err(reg(fd, b, PAGE, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, NULL)));
+    printf("unregister: %s\n", err(unreg(fd, b, PAGE)));
+
+    /* A file's private mapping, which only WP_ASYNC registers. */
+    char path[] = "/tmp/uffd-async-XXXXXX";
+    int file = mkstemp(path);
+    int readonly = open(path, O_RDONLY);
+    unlink(path);
+    char bytes[PAGE];
+    memset(bytes, 'f', sizeof bytes);
+    for (int i = 0; i < 3; i++)
+        write(file, bytes, sizeof bytes);
+    char *f = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, file, 0);
+    printf("register file without async: %s\n",
+           err(reg(sync, f, 3 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    printf("register file with missing: %s\n",
+           err(reg(fd, f, 3 * PAGE, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, NULL)));
+    uint64_t ioctls = 0;
+    printf("register file: %s", err(reg(fd, f, 3 * PAGE, UFFDIO_REGISTER_MODE_WP, &ioctls)));
+    printf(" writeprotect=%d\n", (ioctls & WRITEPROTECT_IOCTL) != 0);
+    vma("private file", f, f);
+    printf("read: %c\n", f[0]);
+    printf("protect: %s\n", err(protect(fd, f, 3 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    pagemap_show("private read", f);
+    pagemap_show("private unread", f + PAGE);
+    f[0] = 'g';
+    f[PAGE] = 'h';
+    pagemap_show("private written", f);
+    pagemap_show("private written unread", f + PAGE);
+    pagemap_show("private untouched", f + 2 * PAGE);
+    char c = 0;
+    pread(file, &c, 1, 0);
+    printf("file: %c\n", c);
+    int64_t done = 0;
+    printf("copy: %s\n", err(copy(fd, f + 2 * PAGE, bytes, PAGE, 0, &done)));
+    /* MADV_DONTNEED drops the copies, and keeps the protection of the
+       pages that still had it. */
+    printf("dontneed: %s\n", err(madvise(f, 3 * PAGE, MADV_DONTNEED)));
+    wp_show("after dontneed", f);
+    wp_show("written after dontneed", f + PAGE);
+    wp_show("protected after dontneed", f + 2 * PAGE);
+    printf("read after dontneed: %c%c%c\n", f[0], f[PAGE], f[2 * PAGE]);
+    wp_show("read after dontneed", f + 2 * PAGE);
+    f[2 * PAGE] = 'i';
+    wp_show("written after dontneed", f + 2 * PAGE);
+    printf("unregister: %s\n", err(unreg(fd, f, 3 * PAGE)));
+
+    /* A file's shared mapping: the write reaches the file. */
+    char *s = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    printf("register shared file: %s\n", err(reg(fd, s, 2 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    printf("protect: %s\n", err(protect(fd, s, 2 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    pagemap_show("shared unread", s + PAGE);
+    s[PAGE] = 'k';
+    pagemap_show("shared written", s + PAGE);
+    pread(file, &c, 1, PAGE);
+    printf("file: %c\n", c);
+    /* One that may not write the file still cannot be registered. */
+    char *r = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, readonly, 0);
+    printf("register read-only: %s\n", err(reg(fd, r, PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+
+    /* System V shared memory. */
+    int id = shmget(IPC_PRIVATE, PAGE, IPC_CREAT | 0600);
+    char *segment = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    printf("register sysv: %s\n", err(reg(fd, segment, PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    printf("protect: %s\n", err(protect(fd, segment, PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    pagemap_show("sysv", segment);
+    segment[0] = 'v';
+    pagemap_show("sysv written", segment);
+    printf("poll: %d\n", poll(&waiting, 1, 0));
+    close(fd);
+    close(sync);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1322,6 +1451,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-shmem")) return case_shmem();
     if (!strcmp(mode, "userfaultfd-minor")) return case_minor();
     if (!strcmp(mode, "userfaultfd-wp-shmem")) return case_wp_shmem();
+    if (!strcmp(mode, "userfaultfd-wp-async")) return case_wp_async();
     if (!strcmp(mode, "userfaultfd-move")) return case_move();
     printf("unknown mode %s\n", mode);
     return 2;

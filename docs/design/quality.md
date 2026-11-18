@@ -207,11 +207,21 @@ every test passing.
   for a case whose differential test finds it equal to Linux's. The
   differential tests still compare the whole guests with Linux on every
   run.
-- The coverage job's summary prints the terminal gate's margin: its hit
-  and measured lines, the rate, and how many hit lines it has above the
-  80% floor (rounded up to a whole line). The lines are the gated lcov's,
-  which the report's TOTAL line also counts, so a pull request sees the
-  margin shrink before the gate fails.
+- The coverage job's summary prints, for each gate that writes an lcov
+  (WebAssembly, terminal and encodings), the lcov's hit and measured lines,
+  their rate, and how many hit lines it has above the 80% floor (rounded up
+  to a whole line), so a pull request sees a margin shrink before its gate
+  fails. `--fail-under-lines` does not read the lcov file: cargo-llvm-cov
+  compares the line totals of llvm-cov's JSON export of the same test
+  binaries, profile and ignored files, which count the same lines, so the
+  printed rate is the one the gate compared. The core and workspace gates
+  write no lcov; they compare the totals their printed table's TOTAL line
+  shows. Where a gate also prints a table (terminal and encodings), the
+  summary says whether its TOTAL line counts the same hit and measured
+  lines. On main (run 44284364893) both did. A TOTAL differs only when the
+  `report` reads other binaries or files than the gated run, as the
+  terminal and encodings tables did when they added `paludarium-jit-native`
+  (above).
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)

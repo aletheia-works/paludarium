@@ -2574,7 +2574,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PR_SET_PTRACER` で名指しされたもの、または `CAP_SYS_PTRACE`）のとおりに、ほかのプロセスの
   読み手が読めるかを確かめます（`EPERM`）。回収されたタスクは `ESRCH` です。`wchan`
   （0444）は、Linux の `proc_pid_wchan` が動いているタスクと、タスクを読めない読み手に
-  返すのと同じく、改行のない `0` を読みます。
+  返すのと同じく、改行のない `0` を読みます。`stat` の `wchan` の項目は別のもので、
+  下のとおり、待っているタスクは 1 です。
 - プロセスやスレッドの `io`（`/proc/<pid>/task/<tid>/io`）は 0400 で大きさは 0 で、
   Linux の `task_io_accounting` が数えるものを示します。`rchar` と `wchar` は読み書きの
   呼び出し（`read`、`pread64`、`readv`、`preadv`、`preadv2`、それらの書き込み版、

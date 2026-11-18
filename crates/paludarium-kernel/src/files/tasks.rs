@@ -463,13 +463,25 @@ pub(crate) fn own_live_owner(
 /// What a file of the task's that is made when it is read
 /// ([`crate::proc::single_file`]) finds then, as Linux's `proc_single_show`
 /// does: the task's process, the thread it shows (or its process's, for a
-/// zombie), and the reading thread when it is of another process. A thread
-/// or process that has been reaped is `ESRCH`.
+/// zombie), and who reads it. A thread or process that has been reaped is
+/// `ESRCH`.
 struct AtRead {
     processes: std::sync::Arc<crate::processes::Processes>,
     view: crate::processes::ProcessView,
+    pid: u32,
     target: PublicThread,
-    reader: Option<PublicThread>,
+    reader_pid: u32,
+    reader: Reader,
+}
+/// Who reads a file of a task's.
+enum Reader {
+    /// A thread of the task's own process, which may read it all.
+    Own,
+    /// A thread of another process, as it last published itself.
+    Other(Box<PublicThread>),
+    /// A thread that has not published itself, or whose process is gone:
+    /// no reader that may see the task.
+    Unknown,
 }
 impl AtRead {
     fn find(
@@ -489,49 +501,51 @@ impl AtRead {
             .unwrap_or_default();
         let (reader_pid, reader_tid) = crate::proc::caller();
         let reader = if reader_pid == pid {
-            None
+            Reader::Own
         } else {
-            // No thread published is no reader that may see it.
-            Some(
-                processes
-                    .view(reader_pid)
-                    .and_then(|reader| reader.group.public(reader_tid))
-                    .unwrap_or_default(),
-            )
+            processes
+                .view(reader_pid)
+                .and_then(|reader| reader.group.public(reader_tid))
+                .map_or(Reader::Unknown, |reader| Reader::Other(Box::new(reader)))
         };
         Ok(Self {
             processes,
             view,
+            pid,
             target,
+            reader_pid,
             reader,
         })
     }
     /// Whether the reader may read the task, as Linux's
     /// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` decides: its own
-    /// process always, and with no dumpable rule once the memory is gone.
+    /// process always, and another as its dumpability lets, which a zombie
+    /// keeps (`task_still_dumpable`).
     fn may_read(&self) -> bool {
-        self.reader.as_ref().is_none_or(|reader| {
-            reader.credentials.may_read_task(
+        match &self.reader {
+            Reader::Own => true,
+            Reader::Other(reader) => reader.credentials.may_read_task(
                 &self.target.credentials,
-                self.view.dumpable || self.view.zombie,
+                self.view.dumpable,
                 false,
-            )
-        })
+            ),
+            Reader::Unknown => false,
+        }
     }
     /// Whether the reader may attach to the task, as Linux's `lock_trace`
-    /// asks with `PTRACE_MODE_ATTACH_FSCREDS`: it may read it, and Yama
-    /// (`ptrace_scope` 1) lets it in, or it has `CAP_SYS_PTRACE` in the
-    /// task's user namespace.
-    fn may_attach(&self, pid: u32) -> bool {
-        let (reader_pid, _) = crate::proc::caller();
-        self.may_read()
-            && self.reader.as_ref().is_none_or(|reader| {
-                self.processes.yama_allows(reader_pid, pid)
-                    || reader.credentials.capable_in(
-                        crate::credentials::CAP_SYS_PTRACE,
-                        &self.target.credentials.user,
-                    )
-            })
+    /// asks with `PTRACE_MODE_ATTACH_FSCREDS`
+    /// ([`crate::processes::may_attach_task`] with the filesystem IDs).
+    fn may_attach(&self) -> bool {
+        match &self.reader {
+            Reader::Own => true,
+            Reader::Other(reader) => crate::processes::may_attach_task(
+                &self.processes,
+                (self.reader_pid, &reader.credentials),
+                (self.pid, &self.view, &self.target),
+                false,
+            ),
+            Reader::Unknown => false,
+        }
     }
 }
 /// The task's process, thread and whether it is a thread's file, for
@@ -553,7 +567,7 @@ fn at_read(
 /// made when it is read, as Linux's `do_io_accounting`. The reader then must
 /// be of its process or one `ptrace_may_access` lets read it with its file
 /// system IDs (`EACCES`), and a task that has been reaped is `ESRCH`. A
-/// zombie's memory is gone, so its dumpable flag no longer matters.
+/// zombie keeps its dumpable flag for it, as Linux 7.1 and later do.
 pub(super) fn io(
     processes: &std::sync::Arc<crate::processes::Processes>,
     task: &Task,
@@ -591,7 +605,7 @@ pub(super) fn personality(
     let (processes, which) = at_read(processes, task);
     let text: crate::proc::Text = std::sync::Arc::new(move || {
         let now = AtRead::find(&processes, which)?;
-        if !now.may_attach(which.0) {
+        if !now.may_attach() {
             return Err(Errno::EPERM);
         }
         Ok(format!("{:08x}\n", now.target.personality).into_bytes())

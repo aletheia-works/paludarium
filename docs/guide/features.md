@@ -2964,7 +2964,9 @@ kernel.
   ancestor, one named by `PR_SET_PTRACER`, or `CAP_SYS_PTRACE`), may a
   reader of another process read it (`EPERM`). A reaped task is `ESRCH`.
   `wchan` (0444) reads `0` with no newline, as Linux's `proc_pid_wchan`
-  does for a running task and for a reader that may not read the task.
+  does for a running task and for a reader that may not read the task. The
+  `wchan` field of `stat` is something else: 1 for a task that waits, as
+  below.
 - `io` of a process or of a thread (`/proc/<pid>/task/<tid>/io`), 0400 and
   of size 0, has the counts Linux's `task_io_accounting` keeps: `rchar` and
   `wchar`, the bytes the read and write calls moved (`read`, `pread64`,

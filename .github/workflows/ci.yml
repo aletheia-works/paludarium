@@ -293,7 +293,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         # Retried: static.rust-lang.org downloads sometimes fail on CI.
         uses: ./.github/actions/rust-toolchain
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           install_args: cargo-deny
           cache: false
@@ -482,7 +482,7 @@ jobs:
               (out/'native-input-receipt.json').write_text(json.dumps(rows,indent=2)+'\n')
               assert code==0 and len(data.splitlines())==expected_rows and not (out/(name+'.stderr')).read_bytes()
           PY_NATIVE
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           install_args: aqua:taiki-e/cargo-llvm-cov
           cache: false

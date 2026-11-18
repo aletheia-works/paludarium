@@ -218,7 +218,7 @@ every test passing.
 
 | When | What |
 |---|---|
-| Every pull request | unit tests on Linux, macOS and Windows; lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments and in WebKit on x86-64 Linux, which include the x87 process cases compared byte for byte with x86-64 Linux; fuzzing of the seven pull-request targets the change can affect (above) |
+| Every pull request | unit tests on Linux, macOS and Windows (when the change can reach them, below); lint; dependency checks; the WebAssembly build; differential tests on x86-64 Linux, also with the native JIT; coverage; probe, aube and ripgrep differential tests; acceptance tests in the four WebAssembly environments (Safari when the change can reach the Wasm module, below) and in WebKit on x86-64 Linux, which include the x87 process cases compared byte for byte with x86-64 Linux; fuzzing of the seven pull-request targets the change can affect (above) |
 | Every night | fuzzing of the 14 targets; differential tests on macOS and Windows; Debian's own programs on x86-64 Linux, with and without the native JIT; the four WebAssembly environments and WebKit on x86-64 Linux with and without the JIT; the performance measurement |
 | Every day | every scheduled workflow is checked to have started on time; one that failed to start, did not run or was disabled opens an Issue |
 | Every week | the pinned nightly Rust, the workspace's `rust-version` (the latest stable Rust) and the aube and ripgrep guests move to their latest releases, each in a pull request that merges itself once its checks pass |
@@ -238,6 +238,22 @@ skipped because the quick stage failed cannot make it pass;
 `scripts/ci-changes.py --self-test` refuses a `ci.yml` where it does not.
 Dependency Review runs only on pull requests that change a Cargo or npm
 manifest or lockfile, a workflow or a local action.
+
+Two kinds of job run only when the change can reach what they test, as
+macOS runners can be scarce. The unit test jobs (Linux, macOS and Windows)
+run when the change touches a crate they test (the harness only for its
+library), a manifest, the lockfile or the toolchain, or a file outside the
+crates that their sources name by a relative path (`#[path]`,
+`include_str!`, a path joined to the crate's directory) or that the
+harness's instruction list reads under `tests/guests`. So a new
+differential guest or a script alone does not run them, and a change to
+`packages/paludarium-wasm/jit-support.mjs`, which a JIT unit test reads,
+does. The Safari row of the WebAssembly checks is left out when the only
+crates a change reaches are ones the Wasm module (`paludarium-wasm`) does
+not link, such as the harness, the command or the native JIT; the Linux
+rows still run. `scripts/ci-changes.py` reads both from `cargo metadata`
+and the sources, and its self-test fails on a unit test source that builds
+a path at run time without saying what it reads.
 
 GitHub cancels a job that no hosted runner acquires, as macOS arm64 runners
 run short of capacity, with an annotation ("not acquired by Runner") and no

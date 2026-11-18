@@ -47,9 +47,11 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.groups.outputs.rust }}
+      unit: ${{ steps.groups.outputs.unit }}
       dependencies: ${{ steps.groups.outputs.dependencies }}
       fuzz: ${{ steps.groups.outputs.fuzz }}
       wasm: ${{ steps.groups.outputs.wasm }}
+      safari: ${{ steps.groups.outputs.safari }}
       programs: ${{ steps.groups.outputs.programs }}
       production_wasm: ${{ steps.groups.outputs.production_wasm }}
       docs: ${{ steps.groups.outputs.docs }}
@@ -85,6 +87,10 @@ jobs:
     needs: [changes, quick]
     if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.wasm == 'true' }}
     uses: ./.github/workflows/wasm-programs.yml
+    # Safari's row runs on a macOS runner, which may be scarce; it is left out
+    # when the changes reach only crates the Wasm module does not link.
+    with:
+      safari: ${{ needs.changes.outputs.safari == 'true' }}
   # Only the targets the changes can affect. None chosen skips the job; a
   # failed choice fails changes, and so ci-ok.
   fuzz:
@@ -168,7 +174,9 @@ jobs:
   test-linux:
     name: unit tests (ubuntu-latest)
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # The crates these tests build and the files outside them their sources
+    # name (scripts/ci-changes.py's unit group).
+    if: needs.changes.outputs.unit == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps: &unit-test-steps
@@ -194,7 +202,7 @@ jobs:
   test:
     name: unit tests (${{ matrix.os }})
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.unit == 'true'
     strategy:
       fail-fast: false
       matrix:

@@ -5,11 +5,18 @@ It also picks the pull-request fuzz targets the changes can affect: a target
 runs when a changed crate is one its source names or one of their Cargo
 dependencies (from cargo metadata). Any other change the fuzz group needs
 runs every target.
+
+Two groups narrow the jobs that run on scarce runners. "unit" is the unit
+test jobs: a crate they test, or a file outside the crates their sources name
+by a relative path. "safari" is the Safari row of the wasm programs: the
+"wasm" group without the changes that only reach crates the Wasm module does
+not link.
 """
 
 import argparse
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -17,9 +24,11 @@ from pathlib import Path
 
 GROUPS = (
     "rust",
+    "unit",
     "dependencies",
     "fuzz",
     "wasm",
+    "safari",
     "programs",
     "production_wasm",
     "docs",
@@ -33,6 +42,30 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
 FUZZ_WORKFLOW = ROOT / ".github/workflows/fuzz-pr.yml"
 FUZZ_TARGETS = ROOT / "fuzz/fuzz_targets"
+# The package the Wasm module is built from (mise-tasks/wasm/build.sh).
+WASM_PACKAGE = "paludarium-wasm"
+# The unit test jobs run its library's tests only (cargo test --lib).
+LIB_ONLY = "paludarium-harness"
+# What the unit test jobs run; self_test checks that ci.yml still does.
+UNIT_COMMANDS = (
+    'cargo test --locked "${packages[@]}" -- --nocapture',
+    "cargo test --locked -p paludarium-harness --lib",
+)
+# A relative path in a Rust source: #[path], include_str!, a joined path.
+RELATIVE = re.compile(r'"((?:\.\./)+[^"\s\\]+)"')
+# Unit test sources that build a path at run time; each read is listed in
+# dynamic_reads, so a new one must be added there.
+DYNAMIC = re.compile(r"CARGO_MANIFEST_DIR|workspace_root\(\)|current_dir\(")
+DYNAMIC_SOURCES = frozenset(
+    {
+        # The literal joined to it is a relative path RELATIVE finds.
+        "crates/paludarium-host/src/terminal_tests.rs",
+        # workspace_root() and the guest build only the differential tests use.
+        "crates/paludarium-harness/src/lib.rs",
+        # The guest sources CORE_INSTRUCTIONS names, under tests/guests.
+        "crates/paludarium-harness/src/coverage.rs",
+    }
+)
 # The jobs the quick stage waits for.
 QUICK = frozenset({"changes", "polyglot-lint", "test-linux", "lint", "stable-clippy"})
 # The jobs that start only after the quick stage passed.
@@ -132,11 +165,38 @@ def matches(path, pattern):
     return path == pattern
 
 
-def groups_for(path):
+def groups_for(path, reach=None):
     for groups, patterns in RULES:
         if any(matches(path, p) for p in patterns):
-            return frozenset(groups)
+            return narrow(path, frozenset(groups), reach)
     return ALL
+
+
+def narrow(path, groups, reach=None):
+    """Adds "unit" and "safari" to a path's groups when those jobs can be affected."""
+    crate = re.match(r"(crates/[^/]+)/(.+)$", path)
+    if groups == ALL and not crate:
+        return ALL
+    reach = reach or crate_reach()
+    if groups == ALL:
+        owner = reach["owners"].get(crate.group(1))
+        # A manifest changes what links what; an unknown crate is not in the graph.
+        if owner is None or crate.group(2) == "Cargo.toml":
+            return ALL
+        groups = ALL - {"unit", "safari"}
+        tested = owner in reach["unit"] and (owner != LIB_ONLY or crate.group(2).startswith("src/"))
+        if tested or path in reach["unit_reads"]:
+            groups |= {"unit"}
+        if owner in reach["wasm"] or path in reach["wasm_reads"]:
+            groups |= {"safari"}
+        return groups
+    if path in reach["unit_reads"]:
+        groups |= {"unit"}
+    # Outside the crates, the wasm group's rules already name what the Wasm
+    # programs read, Safari's row included.
+    if "wasm" in groups:
+        groups |= {"safari"}
+    return groups
 
 
 def needed(paths):
@@ -155,24 +215,128 @@ def pr_fuzz_targets(text=None):
     return list(lists.pop())
 
 
-def crate_graph(metadata):
-    """Each workspace package: its directory and the path packages it links."""
+def crate_graph(metadata, dev=False):
+    """Each workspace package: its directory and the path packages it links.
+
+    With dev, also the packages its tests link.
+    """
     root = Path(metadata["workspace_root"])
     graph = {}
     for package in metadata["packages"]:
-        links = {d["name"] for d in package["dependencies"] if d.get("path") and d["kind"] != "dev"}
+        links = {
+            d["name"]
+            for d in package["dependencies"]
+            if d.get("path") and (dev or d["kind"] != "dev")
+        }
         directory = Path(package["manifest_path"]).parent.relative_to(root).as_posix()
         graph[package["name"]] = (directory, frozenset(links))
     return graph
 
 
-def load_crate_graph():
+_METADATA = []
+
+
+def load_metadata():
     # cargo honours RUSTUP_TOOLCHAIN; CI sets it to the runner's stable so the
     # pinned nightly is not installed for this.
-    command = [os.environ.get("CARGO", "cargo"), "metadata", "--no-deps", "--locked"]
-    command += ["--format-version", "1", "--manifest-path", str(ROOT / "Cargo.toml")]
-    out = subprocess.run(command, check=True, capture_output=True, text=True).stdout
-    return crate_graph(json.loads(out[out.index("{") :]))
+    if not _METADATA:
+        command = [os.environ.get("CARGO", "cargo"), "metadata", "--no-deps", "--locked"]
+        command += ["--format-version", "1", "--manifest-path", str(ROOT / "Cargo.toml")]
+        out = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+        _METADATA.append(json.loads(out[out.index("{") :]))
+    return _METADATA[0]
+
+
+def load_crate_graph():
+    return crate_graph(load_metadata())
+
+
+def closure(names, graph):
+    seen, todo = set(), list(names)
+    while todo:
+        name = todo.pop()
+        if name not in seen:
+            seen.add(name)
+            todo.extend(graph[name][1])
+    return frozenset(seen)
+
+
+def core_packages(text=None):
+    """The packages of ci.yml's CORE_PACKAGES, which the unit test jobs test."""
+    text = WORKFLOW.read_text(encoding="utf-8") if text is None else text
+    block = re.search(r"^  CORE_PACKAGES: >-\n((?:    .*\n)+)", text, re.M)
+    if not block:
+        raise AssertionError("ci.yml must set CORE_PACKAGES")
+    return re.findall(r"-p (\S+)", block.group(1))
+
+
+def rust_sources(directory, only=""):
+    base = ROOT / directory / only
+    return sorted(p.relative_to(ROOT).as_posix() for p in base.rglob("*.rs"))
+
+
+def relative_reads(sources):
+    """Files that Rust sources name by a relative path, followed through the Rust ones.
+
+    A path resolves against the source's directory (#[path], include_str!) or
+    its crate's (a path joined to CARGO_MANIFEST_DIR, the tests' directory).
+    """
+    found, seen, todo = set(), set(), list(sources)
+    while todo:
+        source, crate_dir = todo.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        text = (ROOT / source).read_text(encoding="utf-8")
+        for literal in RELATIVE.findall(text):
+            for base in {posixpath.dirname(source), crate_dir}:
+                path = posixpath.normpath(posixpath.join(base, literal))
+                if not path.startswith("../") and (ROOT / path).is_file():
+                    found.add(path)
+                    if path.endswith(".rs"):
+                        todo.append((path, crate_dir))
+    return found
+
+
+def dynamic_reads():
+    """The files DYNAMIC_SOURCES read by a path built at run time."""
+    text = (ROOT / "crates/paludarium-harness/src/coverage.rs").read_text(encoding="utf-8")
+    if 'workspace_root().join("tests").join("guests")' not in text:
+        raise AssertionError("coverage.rs no longer reads tests/guests: update dynamic_reads")
+    return {f"tests/guests/{f}" for f in re.findall(r'^    \("[^"]+", "([^"]+)", ', text, re.M)}
+
+
+_REACH = []
+
+
+def crate_reach():
+    """Which packages, and files outside them, the unit tests and the Wasm module reach."""
+    if _REACH:
+        return _REACH[0]
+    metadata = load_metadata()
+    graph, tests = crate_graph(metadata), crate_graph(metadata, dev=True)
+    unit = closure([*core_packages(), LIB_ONLY], tests)
+    wasm = closure([WASM_PACKAGE], graph)
+
+    def sources(names):
+        out = []
+        for name in sorted(names):
+            directory = graph[name][0]
+            only = "src" if name == LIB_ONLY else ""
+            out += [(s, directory) for s in rust_sources(directory, only)]
+        return out
+
+    unit_sources = sources(unit)
+    reach = {
+        "owners": {d: name for name, (d, _) in graph.items()},
+        "unit": unit,
+        "wasm": wasm,
+        "unit_reads": frozenset(relative_reads(unit_sources) | dynamic_reads()),
+        "wasm_reads": frozenset(relative_reads(sources(wasm))),
+        "unit_sources": [s for s, _ in unit_sources],
+    }
+    _REACH.append(reach)
+    return reach
 
 
 def linked_crates(target, graph, read=None):
@@ -294,10 +458,15 @@ def self_test():
         "scripts/bump-pins.py": {"rust"},
         ".github/workflows/bump-pins.yml": NONE,
         "fuzz/fuzz_targets/load_elf.rs": {"rust", "dependencies", "fuzz"},
-        "packages/paludarium-wasm/index.mjs": {"wasm", "production_wasm", "release_check"},
-        "tests/guests/programs/cases.json": {"programs", "wasm"},
-        "tests/guests/processes/x87.c": {"rust", "wasm"},
-        "tests/guests/processes/build.sh": {"rust", "wasm"},
+        "packages/paludarium-wasm/index.mjs": {
+            "wasm",
+            "safari",
+            "production_wasm",
+            "release_check",
+        },
+        "tests/guests/programs/cases.json": {"programs", "wasm", "safari"},
+        "tests/guests/processes/x87.c": {"rust", "wasm", "safari"},
+        "tests/guests/processes/build.sh": {"rust", "wasm", "safari"},
         "tests/guests/processes/process.c": {"rust"},
         "tests/guests/encodings/observe.c": {"rust"},
         "tests/guests/distro/compare.py": {"rust"},
@@ -309,6 +478,29 @@ def self_test():
         "clippy.toml": {"rust"},
         "mise-tasks/linux-dev.sh": NONE,
         "unknown-top-level-file": ALL,
+        # What the unit test jobs read outside the crates they test.
+        "tests/guests/insn/alu.c": {"rust", "unit"},
+        "tests/guests/processes/x87_transcendental.h": {"rust", "unit"},
+        "tests/guests/encodings/native-contract.rs": {"rust", "unit"},
+        "tests/guests/terminal/host-pty.py": {"rust", "unit"},
+        "fuzz/fuzz_targets/support/syscall_host.rs": {"rust", "unit", "dependencies", "fuzz"},
+        "packages/paludarium-wasm/jit-support.mjs": {
+            "unit",
+            "wasm",
+            "safari",
+            "production_wasm",
+            "release_check",
+        },
+        "crates/paludarium-wasm/src/abi.rs": ALL,
+        # Crates the Wasm module does not link, and files the unit tests do not build.
+        "crates/paludarium-wasm/src/lib.rs": ALL - {"unit"},
+        "crates/paludarium-harness/src/lib.rs": ALL - {"safari"},
+        "crates/paludarium-harness/tests/diff_core.rs": ALL - {"unit", "safari"},
+        "crates/paludarium-jit-native/src/lib.rs": ALL - {"safari"},
+        "crates/paludarium/src/main.rs": ALL - {"safari"},
+        "crates/paludarium-kernel/tests/fuzz_wait.rs": ALL,
+        "crates/paludarium-harness/Cargo.toml": ALL,
+        "crates/paludarium-new/src/lib.rs": ALL,
     }
     for path, expected in cases.items():
         got = groups_for(path)
@@ -320,7 +512,9 @@ def self_test():
         raise AssertionError("infrastructure and bot settings need no group")
     if needed(["docs/a.md", "deny.toml"]) != {"docs", "dependencies"}:
         raise AssertionError("groups of several files must be joined")
-    jobs = check_gates(WORKFLOW.read_text(encoding="utf-8"))
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    jobs = check_gates(workflow)
+    check_narrowing(workflow)
     good = (
         "on: push\njobs:\n  a:\n    runs-on: x\n  b:\n    needs: [a, quick]\n"
         "    if: ${{ !cancelled() && needs.quick.result == 'success' && true }}\n"
@@ -353,6 +547,37 @@ def self_test():
     print(
         f"ci-changes ready: {len(cases)} paths, {len(jobs)} jobs and {fuzz_cases} fuzz selections checked"
     )
+
+
+def check_narrowing(workflow):
+    """ci.yml and wasm-programs.yml still run what "unit" and "safari" assume."""
+    for group in GROUPS:
+        if f"      {group}: ${{{{ steps.groups.outputs.{group} }}}}\n" not in workflow:
+            raise AssertionError(f"changes must output {group}")
+    jobs = workflow_jobs(workflow)
+    for job in ("test-linux", "test"):
+        if jobs[job][1] != "needs.changes.outputs.unit == 'true'":
+            raise AssertionError(f"{job} must run if and only if the unit group is needed")
+    for command in UNIT_COMMANDS:
+        if command not in workflow:
+            raise AssertionError(f"the unit test steps no longer run {command}: update UNIT_*")
+    if "      safari: ${{ needs.changes.outputs.safari == 'true' }}\n" not in workflow:
+        raise AssertionError("wasm-programs must get the safari group as its safari input")
+    wasm = (ROOT / ".github/workflows/wasm-programs.yml").read_text(encoding="utf-8")
+    if wasm.count("      safari:\n        type: boolean\n        default: true\n") != 2:
+        raise AssertionError("wasm-programs.yml must declare safari for a call and a dispatch")
+    rows = re.findall(r"fromJSON\(inputs\.safari == false && '(\[.*?\])' \|\| '(\[.*?\])'\)", wasm)
+    if len(rows) != 1 or [*json.loads(rows[0][0]), "safari"] != sorted(
+        json.loads(rows[0][1]), key=[*json.loads(rows[0][0]), "safari"].index
+    ):
+        raise AssertionError("wasm-programs.yml must drop only the Safari row on safari: false")
+    reach = crate_reach()
+    if not reach["wasm"] < reach["unit"] | {WASM_PACKAGE} or WASM_PACKAGE in reach["unit"]:
+        raise AssertionError(f"the unit and wasm packages changed: {sorted(reach['wasm'])}")
+    for source in reach["unit_sources"]:
+        text = (ROOT / source).read_text(encoding="utf-8")
+        if DYNAMIC.search(text) and source not in DYNAMIC_SOURCES:
+            raise AssertionError(f"{source} builds a path at run time: add what it reads")
 
 
 def fuzz_self_test():

@@ -239,6 +239,7 @@ mod linux {
                     | "bpf-lru"
                     | "bpf-queue"
                     | "bpf-bloom"
+                    | "bpf-lpm"
                     | "bpf-prog-load"
                     | "keys-calls"
                     | "keys-keyrings"
@@ -549,6 +550,7 @@ mod linux {
         bpf_lru => ("bpf-lru","bpf"),
         bpf_queue => ("bpf-queue","bpf"),
         bpf_bloom => ("bpf-bloom","bpf"),
+        bpf_lpm => ("bpf-lpm","bpf"),
         bpf_prog_load => ("bpf-prog-load","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),

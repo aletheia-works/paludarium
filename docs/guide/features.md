@@ -3617,8 +3617,9 @@ kernel.
   none. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
-- `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and
-  `hashtab.c` have them. Every command first takes the size of its union
+- `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
+  `hashtab.c`, `bpf_lru_list.c`, `lpm_trie.c`, `queue_stack_maps.c` and
+  `bloom_filter.c` have them. Every command first takes the size of its union
   (more than a page, or bytes past Linux master's 168 that are not 0, is
   `E2BIG`) and its fields past the command's own (`CHECK_ATTR`, `EINVAL`).
   `BPF_MAP_CREATE` makes a `BPF_MAP_TYPE_ARRAY` (4-byte keys, every
@@ -3695,7 +3696,25 @@ kernel.
   and `GET_NEXT_KEY` are `EOPNOTSUPP`, `LOOKUP_AND_DELETE_ELEM` and the batch
   commands `ENOTSUPP`; it needs `CAP_BPF`, and takes a 312-byte header and
   its bits in 8-byte words. `map_extra` is in its fdinfo and
-  `bpf_map_info`. See [limitations](./limitations) for what is not there.
+  `bpf_map_info`. A `BPF_MAP_TYPE_LPM_TRIE` holds prefixes, as Linux's
+  `lpm_trie.c`: a key is a prefix length (a `u32`) and 1 to 256 bytes of
+  data, the most significant first, and `LOOKUP_ELEM` gives the value of
+  the longest prefix that holds the key's (`ENOENT` for none, and for a
+  prefix length past the data's bits). Its nodes are Linux's, with
+  intermediate ones where two prefixes part, so `GET_NEXT_KEY` gives the
+  keys in Linux's postorder, more specific prefixes first (from the first
+  for no key, a prefix length past the data's bits, or a key that is no
+  element's), each with the bytes past its prefix that its last update
+  gave. `UPDATE_ELEM` takes `BPF_ANY`, `BPF_NOEXIST` and `BPF_EXIST`
+  (`EINVAL` for any other flag and for a prefix length past the data's
+  bits; a full one is `ENOSPC`), `DELETE_ELEM` takes the exact prefix
+  (`ENOENT` for none), `LOOKUP_AND_DELETE_ELEM` and its batch are
+  `ENOTSUPP`, and the other batch commands follow the next keys. It needs
+  `CAP_BPF` and `BPF_F_NO_PREALLOC`, takes only that, `BPF_F_NUMA_NODE`
+  and the access flags, and a value of 1 byte up to 4 MiB less 280
+  (`EINVAL`). Its memory is 24 bytes, the data and the value for each
+  element, with nothing for its header or intermediate nodes. See
+  [limitations](./limitations) for what is not there.
 - `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
   its order and with its errors, which are the same in the test machines'
   kernel (Ubuntu's Linux 7.0) and in master: the fields past the command

@@ -3130,8 +3130,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EOPNOTSUPP` です。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
-- `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを
-  持ちます。どのコマンドも、まず union のサイズ（1 ページより大きいか、Linux master の 168
+- `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c`、`bpf_lru_list.c`、
+  `lpm_trie.c`、`queue_stack_maps.c`、`bloom_filter.c` と同じくマップを持ちます。どのコマンドも、まず union のサイズ（1 ページより大きいか、Linux master の 168
   バイトより先に 0 でないバイトがあれば `E2BIG`）と、コマンド自身のフィールドより先
   （`CHECK_ATTR`、`EINVAL`）を確かめます。`BPF_MAP_CREATE` は `BPF_MAP_TYPE_ARRAY`
   （4 バイトのキーで、どの要素も初めからあって 0）か `BPF_MAP_TYPE_HASH` を、Linux の検査の
@@ -3195,8 +3195,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   7 / 5 倍を、64 以上の 2 のべき乗にしたものです（2^31 を超えれば 2^32）。`DELETE_ELEM` と
   `GET_NEXT_KEY` は `EOPNOTSUPP`、`LOOKUP_AND_DELETE_ELEM` とバッチのコマンドは
   `ENOTSUPP` です。`CAP_BPF` が要り、312 バイトのヘッダーと、8 バイトのワードにした
-  ビットを取ります。`map_extra` は fdinfo と `bpf_map_info` に出ます。ないものは [制限](./limitations) を
-  参照してください。
+  ビットを取ります。`map_extra` は fdinfo と `bpf_map_info` に出ます。
+  `BPF_MAP_TYPE_LPM_TRIE` は、Linux の `lpm_trie.c` と同じくプレフィックスを持ちます。キーは
+  プレフィックスの長さ（`u32`）と、上位のバイトから並べた 1 から 256 バイトのデータで、
+  `LOOKUP_ELEM` はキーを含むいちばん長いプレフィックスの値を返します（なければ `ENOENT`。
+  データのビット数を超えるプレフィックスの長さも `ENOENT`）。ノードは Linux と同じで、二つの
+  プレフィックスが分かれるところに中間のノードがあります。そのため `GET_NEXT_KEY` は、
+  Linux と同じ後行順で、より細かいプレフィックスを先にキーを返します（キーがないとき、
+  データのビット数を超えるプレフィックスの長さのとき、どの要素のキーでもないときは最初から
+  返します）。どのキーも、プレフィックスより後ろのバイトは最後の更新で与えられたものです。
+  `UPDATE_ELEM` は `BPF_ANY`、`BPF_NOEXIST`、`BPF_EXIST` を取り（ほかのフラグとデータの
+  ビット数を超えるプレフィックスの長さは `EINVAL`、いっぱいなら `ENOSPC`）、`DELETE_ELEM` は
+  同じプレフィックスを消し（なければ `ENOENT`）、`LOOKUP_AND_DELETE_ELEM` とそのバッチは
+  `ENOTSUPP` で、ほかのバッチのコマンドは次のキーをたどります。`CAP_BPF` と
+  `BPF_F_NO_PREALLOC` が要り、フラグはそれと `BPF_F_NUMA_NODE` とアクセスのものだけで、
+  値は 1 バイトから 4 MiB より 280 バイト小さい大きさまでです（`EINVAL`）。メモリは要素ごとに
+  24 バイトとデータと値で、ヘッダーと中間のノードは数えません。ないものは
+  [制限](./limitations) を参照してください。
 - `BPF_PROG_LOAD` は、Linux の `bpf_prog_load` と同じ順に同じエラーで引数を確かめます。
   この順とエラーは、テストのマシンのカーネル（Ubuntu の Linux 7.0）と master で同じです。
   コマンドより先のフィールド（`EINVAL`）、プログラムのフラグ（`EINVAL`）、トークンの

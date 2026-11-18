@@ -264,8 +264,9 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes, queues,
-  stacks and bloom filters and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
+- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes,
+  longest-prefix-match tries, queues, stacks and bloom filters and nothing
+  else. Programs are never loaded: there is no verifier and no BPF runs.
   `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
   every program with `EINVAL`, as a kernel built without the program's
   type does; a program Linux would load, or reject in its verifier with
@@ -289,7 +290,10 @@ verified.
   hash keeps the lists of one CPU, which every command uses: on Linux each
   CPU has its own local lists, so where updates of one map come from
   several CPUs, the key that goes when it is full may be another (the
-  differential test pins itself to one CPU). A map's
+  differential test pins itself to one CPU). A trie takes memory only as
+  elements come, as Linux counts it, but Linux also fills a cache of
+  nodes for each CPU when it makes one, so a trie with a value of
+  megabytes may be `ENOMEM` there and is not here. A map's
   memory follows the structure sizes of the test machines' kernel,
   Ubuntu's Linux 7.0, not upstream Linux's: its `struct bpf_map` carries
   the `u32 excl` that Ubuntu took from Linux 7.2 (0fb6c9ed6493, removed in

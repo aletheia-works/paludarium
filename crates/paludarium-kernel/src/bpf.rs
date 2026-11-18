@@ -1,7 +1,8 @@
 //! `bpf`, for its maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
-//! `hashtab.c`, `bpf_lru_list.c`, `queue_stack_maps.c` and `bloom_filter.c`
-//! have them: `BPF_MAP_CREATE` of `BPF_MAP_TYPE_ARRAY`, `BPF_MAP_TYPE_HASH`,
-//! `BPF_MAP_TYPE_LRU_HASH`, `BPF_MAP_TYPE_QUEUE`, `BPF_MAP_TYPE_STACK` and
+//! `hashtab.c`, `bpf_lru_list.c`, `lpm_trie.c`, `queue_stack_maps.c` and
+//! `bloom_filter.c` have them: `BPF_MAP_CREATE` of `BPF_MAP_TYPE_ARRAY`,
+//! `BPF_MAP_TYPE_HASH`, `BPF_MAP_TYPE_LRU_HASH`, `BPF_MAP_TYPE_LPM_TRIE`
+//! ([`crate::bpf_trie`]), `BPF_MAP_TYPE_QUEUE`, `BPF_MAP_TYPE_STACK` and
 //! `BPF_MAP_TYPE_BLOOM_FILTER`,
 //! their elements (`LOOKUP`, `UPDATE`, `DELETE`,
 //! `GET_NEXT_KEY`, `LOOKUP_AND_DELETE`), `BPF_MAP_FREEZE`, the batch
@@ -26,6 +27,7 @@
 //! `ENOSYS`; one Linux does not have is `EINVAL`, as there. Map
 //! types Linux has that are not here are `EINVAL`, as on a kernel built
 //! without them (`bpf_map_types` holds no ops for them).
+use crate::bpf_trie::{self, Trie};
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::{Errno, GuestAddr, PAGE_SIZE};
@@ -77,6 +79,7 @@ mod cmd {
 pub(crate) const TYPE_HASH: u32 = 1;
 pub(crate) const TYPE_ARRAY: u32 = 2;
 pub(crate) const TYPE_LRU_HASH: u32 = 9;
+pub(crate) const TYPE_LPM_TRIE: u32 = 11;
 pub(crate) const TYPE_QUEUE: u32 = 22;
 pub(crate) const TYPE_STACK: u32 = 23;
 pub(crate) const TYPE_BLOOM_FILTER: u32 = 30;
@@ -105,6 +108,7 @@ pub(crate) mod flag {
     pub const HASH: u32 = NO_PREALLOC | NO_COMMON_LRU | NUMA_NODE | ACCESS | ZERO_SEED;
     pub const QUEUE_STACK: u32 = NUMA_NODE | ACCESS;
     pub const BLOOM: u32 = NUMA_NODE | ZERO_SEED | ACCESS;
+    pub const LPM: u32 = NO_PREALLOC | NUMA_NODE | ACCESS;
 }
 
 /// The element flags: `BPF_ANY`, `BPF_NOEXIST`, `BPF_EXIST`, `BPF_F_LOCK`,
@@ -159,6 +163,8 @@ enum Elements {
     /// An LRU hash's, with the lists that choose which goes when it is
     /// full.
     Lru(Box<Lru>),
+    /// A longest-prefix-match trie's, by prefix.
+    Trie(Box<Trie<Cell>>),
     /// A queue's or a stack's, oldest first.
     Queue(std::collections::VecDeque<Vec<u8>>),
     /// A bloom filter's bits.
@@ -614,6 +620,8 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
                 return Err(E2BIG);
             }
         }
+        // A trie has no `map_alloc_check`: `trie_alloc` checks it below.
+        TYPE_LPM_TRIE => {}
         // No ops for it here.
         _ => return Err(Errno::EINVAL),
     }
@@ -632,7 +640,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     // may make maps.
     if matches!(
         kind,
-        TYPE_LRU_HASH | TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER
+        TYPE_LRU_HASH | TYPE_LPM_TRIE | TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER
     ) && !bpf_capable(c)
     {
         return Err(Errno::EPERM);
@@ -655,6 +663,20 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
             || flags & !flag::BLOOM != 0
             || !access_ok
             || map_extra & !0xf != 0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    // trie_alloc: entries, `BPF_F_NO_PREALLOC` (which it must have), its
+    // flags, a key of a prefix length and 1 to 256 bytes, and a value of 1
+    // byte up to what one `kmalloc` holds with the node and its data.
+    if kind == TYPE_LPM_TRIE
+        && (max_entries == 0
+            || flags & flag::NO_PREALLOC == 0
+            || flags & !flag::LPM != 0
+            || !access_ok
+            || !(LPM_KEY_MIN..=LPM_KEY_MAX).contains(&key_size)
+            || value_size == 0
+            || value_size > LPM_VALUE_MAX)
     {
         return Err(Errno::EINVAL);
     }
@@ -712,7 +734,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         elements: Mutex::new(if kind == TYPE_BLOOM_FILTER {
             Elements::Bloom(bloom(max_entries, map_extra, u32::from_le_bytes(seed)))
         } else {
-            elements(kind, max_entries, flags, cpus)
+            elements(kind, key_size, max_entries, flags, cpus)
         }),
     })?;
     new_fd(c, map, access)
@@ -745,9 +767,10 @@ fn bloom_size(max_entries: u32, extra: u64) -> u64 {
 }
 
 /// A new map's elements: none.
-fn elements(kind: u32, max_entries: u32, flags: u32, cpus: u64) -> Elements {
+fn elements(kind: u32, key_size: u32, max_entries: u32, flags: u32, cpus: u64) -> Elements {
     match kind {
         TYPE_ARRAY => Elements::Array(BTreeMap::new()),
+        TYPE_LPM_TRIE => Elements::Trie(Box::new(Trie::new(key_size, max_entries))),
         TYPE_QUEUE | TYPE_STACK => Elements::Queue(std::collections::VecDeque::new()),
         TYPE_LRU_HASH => Elements::Lru(Box::new(Lru::new(
             max_entries,
@@ -801,6 +824,18 @@ const BUCKET: u64 = 16;
 const POINTER: u64 = 8;
 /// `totalram_pages()`: the memory `sysinfo` reports, in pages.
 const RAM_PAGES: u64 = crate::syscalls::SYSINFO_RAM / PAGE_SIZE;
+
+/// A trie's key: the prefix length and 1 to `LPM_DATA_SIZE_MAX` (256)
+/// bytes.
+const LPM_KEY_MIN: u32 = bpf_trie::PREFIX as u32 + 1;
+const LPM_KEY_MAX: u32 = bpf_trie::PREFIX as u32 + 256;
+/// `sizeof(struct lpm_trie_node)` on x86-64, before its data: two child
+/// pointers, the prefix length and the flags; the same in Linux 7.0 and
+/// master.
+const LPM_NODE: u64 = 24;
+/// `LPM_VAL_SIZE_MAX`: `KMALLOC_MAX_SIZE` (4 MiB with SLUB on x86-64) less
+/// the most data and the node.
+const LPM_VALUE_MAX: u32 = (1 << 22) - 256 - LPM_NODE as u32;
 
 /// `sizeof(struct bpf_queue_stack)` on x86-64, on the test machines'
 /// kernel: their 296-byte `struct bpf_map` (as [`ARRAY_HEADER`] says), its
@@ -866,6 +901,10 @@ fn allocate(
 ) -> Result<(), Errno> {
     if matches!(kind, TYPE_QUEUE | TYPE_STACK) {
         return area(queue_size(max_entries, value_size));
+    }
+    // A trie takes its nodes as elements come, and only its header first.
+    if kind == TYPE_LPM_TRIE {
+        return Ok(());
     }
     // A bloom filter is its bit array alone, which `create` sizes from
     // `map_extra`: no buckets or elements, and no limit of 2^31 entries.
@@ -1032,6 +1071,7 @@ impl Map {
             Elements::Array(_) => index(key) < self.max_entries,
             Elements::Hash(values) => values.contains_key(key),
             Elements::Lru(lru) => lru.table.contains_key(key),
+            Elements::Trie(trie) => trie.lookup(key).is_some(),
             Elements::Queue(values) => !values.is_empty(),
             Elements::Bloom(_) => true,
         };
@@ -1053,6 +1093,8 @@ impl Map {
             // As `htab_lru_map_lookup_elem_sys`, which leaves the
             // reference alone.
             Elements::Lru(lru) => lru.get(key).map(copy).ok_or(Errno::ENOENT),
+            // `trie_lookup_elem`: the longest prefix that holds the key.
+            Elements::Trie(trie) => trie.lookup(key).map(copy).ok_or(Errno::ENOENT),
             // `map_peek_elem`: a queue's oldest, a stack's newest.
             Elements::Queue(values) => if self.kind == TYPE_QUEUE {
                 values.front()
@@ -1130,6 +1172,9 @@ impl Map {
                 }
                 lru.update(key, cell(value), mode)?;
             }
+            // `trie_update_elem` takes no flag past `BPF_EXIST`, so
+            // `BPF_F_LOCK` is `EINVAL` there first.
+            Elements::Trie(trie) => trie.update(key, cell(value), flags)?,
             // `queue_stack_map_push_elem`: `BPF_EXIST` makes room in a full
             // one by giving up the oldest; `BPF_NOEXIST` is not for it.
             Elements::Queue(values) => {
@@ -1163,13 +1208,14 @@ impl Map {
                 .map(|value| copy(&value))
                 .ok_or(Errno::ENOENT),
             Elements::Lru(lru) => lru.delete(key),
+            Elements::Trie(trie) => trie.delete(key).map(|value| copy(&value)),
             Elements::Queue(_) => Err(Errno::EINVAL),
             Elements::Bloom(_) => Err(EOPNOTSUPP),
         }
     }
     /// `map_get_next_key`: the first key after `key`, or the first of all
-    /// for none, or (in a hash) for a key it does not hold; `ENOENT` past
-    /// the last.
+    /// for none, or (in a hash and a trie) for a key it does not hold;
+    /// `ENOENT` past the last.
     fn next(&self, key: Option<&[u8]>) -> Result<Vec<u8>, Errno> {
         match &*self.elements() {
             Elements::Array(_) => {
@@ -1184,11 +1230,13 @@ impl Map {
             }
             Elements::Lru(lru) => next_in(&lru.table, key),
             Elements::Hash(values) => next_in(values, key),
+            Elements::Trie(trie) => trie.next(key),
             Elements::Queue(_) => Err(Errno::EINVAL),
             Elements::Bloom(_) => Err(EOPNOTSUPP),
         }
     }
-    /// The keys and values it holds, by key: a hash's and an LRU hash's.
+    /// The keys and values it holds: a hash's and an LRU hash's by key, a
+    /// trie's in the order of its next keys.
     #[cfg(test)]
     fn held(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match &*self.elements() {
@@ -1198,6 +1246,7 @@ impl Map {
                 .keys()
                 .filter_map(|k| Some((k.clone(), copy(lru.get(k)?))))
                 .collect(),
+            Elements::Trie(trie) => trie.held().into_iter().map(|(k, v)| (k, copy(v))).collect(),
             Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => Vec::new(),
         }
     }
@@ -1210,7 +1259,9 @@ impl Map {
         let chosen: Vec<Vec<u8>> = match &*elements {
             Elements::Hash(values) => values.keys().skip(start).take(max).cloned().collect(),
             Elements::Lru(lru) => lru.table.keys().skip(start).take(max).cloned().collect(),
-            Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => Vec::new(),
+            Elements::Array(_) | Elements::Trie(_) | Elements::Queue(_) | Elements::Bloom(_) => {
+                Vec::new()
+            }
         };
         let mut taken = Vec::with_capacity(chosen.len());
         for key in chosen {
@@ -1219,7 +1270,10 @@ impl Map {
                 Elements::Hash(values) => values.get(&key).map(copy),
                 Elements::Lru(lru) if delete => lru.delete(&key).ok(),
                 Elements::Lru(lru) => lru.get(&key).map(copy),
-                Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => None,
+                Elements::Array(_)
+                | Elements::Trie(_)
+                | Elements::Queue(_)
+                | Elements::Bloom(_) => None,
             };
             if let Some(value) = value {
                 taken.push((key, value));
@@ -1228,7 +1282,7 @@ impl Map {
         let left = match &*elements {
             Elements::Hash(values) => values.len(),
             Elements::Lru(lru) => lru.table.len(),
-            Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => 0,
+            Elements::Array(_) | Elements::Trie(_) | Elements::Queue(_) | Elements::Bloom(_) => 0,
         };
         (taken, left)
     }
@@ -1237,6 +1291,7 @@ impl Map {
         match &*self.elements() {
             Elements::Hash(values) => values.len(),
             Elements::Lru(lru) => lru.table.len(),
+            Elements::Trie(trie) => trie.len() as usize,
             Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => 0,
         }
     }
@@ -1254,6 +1309,12 @@ impl Map {
         }
         if self.kind == TYPE_BLOOM_FILTER {
             return bloom_size(self.max_entries, self.extra);
+        }
+        // `trie_mem_usage`: its elements' nodes, with their data and value,
+        // and nothing for its header or intermediate nodes.
+        if self.kind == TYPE_LPM_TRIE {
+            let node = LPM_NODE + u64::from(self.key_size) - bpf_trie::PREFIX as u64;
+            return (node + u64::from(self.value_size)) * self.len() as u64;
         }
         let element = hash_element(self.key_size, self.value_size);
         let table = HASH_HEADER + BUCKET * buckets(self.max_entries);
@@ -1366,6 +1427,7 @@ impl Map {
             }
             Elements::Hash(values) => Arc::clone(values.get(key)?),
             Elements::Lru(lru) => Arc::clone(lru.reference(key)?),
+            Elements::Trie(trie) => Arc::clone(trie.lookup(key)?),
             // `queue_stack_map_lookup_elem` is null; a bloom filter's is
             // `ERR_PTR(-EINVAL)`, which the verifier never lets a program
             // reach.
@@ -1622,7 +1684,10 @@ fn batch(c: &mut Context<'_>, attr: &[u8], at: u64, command: u32) -> Result<u64,
         cmd::MAP_LOOKUP_AND_DELETE_BATCH if hash => hash_lookup_batch(c, &map, attr, at, true),
         cmd::MAP_LOOKUP_BATCH => array_lookup_batch(c, &map, attr, at),
         cmd::MAP_UPDATE_BATCH => update_batch(c, &map, attr, at),
-        cmd::MAP_DELETE_BATCH if hash => delete_batch(c, &map, attr, at),
+        // A trie's deletes are `generic_map_delete_batch`, as a hash's.
+        cmd::MAP_DELETE_BATCH if hash || map.kind == TYPE_LPM_TRIE => {
+            delete_batch(c, &map, attr, at)
+        }
         _ => Err(ENOTSUPP),
     }
 }
@@ -1693,7 +1758,7 @@ fn delete_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Result<u64,
     result
 }
 
-/// `generic_map_lookup_batch`, an array's: the elements after the key at
+/// `generic_map_lookup_batch`, an array's and a trie's: the elements after the key at
 /// `in_batch` (from the first for none), and the last key given back at
 /// `out_batch`; `ENOENT` once they run out.
 fn array_lookup_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Result<u64, Errno> {
@@ -2342,7 +2407,7 @@ mod tests {
             ids: Arc::clone(ids),
             cpus: 2,
             frozen: AtomicBool::new(false),
-            elements: Mutex::new(elements(kind, max_entries, flags, 2)),
+            elements: Mutex::new(elements(kind, 4, max_entries, flags, 2)),
         }
     }
 
@@ -2631,6 +2696,71 @@ mod tests {
         assert_eq!(by_syscall.get(&k(2)), Ok(vec![2; 8]));
         by_syscall.set(&k(6), vec![6; 8], 0).unwrap();
         assert_eq!(held_keys(&by_syscall), [3, 4, 5, 6]);
+    }
+
+    /// A trie of IPv4 prefixes with 4-byte values.
+    fn trie(max_entries: u32) -> Map {
+        let mut trie = shaped(
+            TYPE_LPM_TRIE,
+            max_entries,
+            4,
+            flag::NO_PREALLOC,
+            &Arc::default(),
+            1,
+        );
+        trie.key_size = 8;
+        *trie.elements() = elements(TYPE_LPM_TRIE, 8, max_entries, trie.flags, 2);
+        trie
+    }
+
+    fn prefix(address: [u8; 4], length: u32) -> Vec<u8> {
+        let mut key = length.to_le_bytes().to_vec();
+        key.extend_from_slice(&address);
+        key
+    }
+
+    #[test]
+    fn a_tries_memory_is_its_elements_nodes_alone() {
+        let trie = trie(4);
+        assert_eq!(trie.memory(), 0);
+        trie.set(&prefix([10, 0, 0, 0], 24), vec![1; 4], 0).unwrap();
+        trie.set(&prefix([10, 0, 1, 0], 24), vec![2; 4], 0).unwrap();
+        // Two nodes of 24 bytes, 4 of data and 4 of value; the
+        // intermediate node between them is not counted.
+        assert_eq!(trie.memory(), 64);
+        assert_eq!(
+            trie.set(&prefix([10, 0, 0, 0], 24), vec![3; 4], F_LOCK),
+            Err(Errno::EINVAL)
+        );
+        trie.remove(&prefix([10, 0, 0, 0], 24)).unwrap();
+        assert_eq!(trie.memory(), 32);
+    }
+
+    #[test]
+    fn a_programs_lookup_in_a_trie_points_at_the_longest_prefixs_value() {
+        let trie = trie(4);
+        trie.prog_update(&prefix([10, 0, 0, 0], 8), &[1; 4], 0)
+            .unwrap();
+        let held = trie.prog_lookup(&prefix([10, 1, 2, 3], 32)).unwrap();
+        held.write(0, &[7; 4]).unwrap();
+        assert_eq!(trie.get(&prefix([10, 0, 0, 0], 8)), Ok(vec![7; 4]));
+        assert!(trie.prog_lookup(&prefix([11, 0, 0, 0], 32)).is_none());
+        // A replaced element is a new one: what the program points at
+        // stays the old value.
+        trie.prog_update(&prefix([10, 0, 0, 0], 8), &[2; 4], EXIST)
+            .unwrap();
+        let mut old = [0; 4];
+        held.read(0, &mut old).unwrap();
+        assert_eq!(old, [7; 4]);
+        assert_eq!(trie.prog_delete(&prefix([10, 0, 0, 0], 8)), Ok(()));
+        assert_eq!(
+            trie.prog_delete(&prefix([10, 0, 0, 0], 8)),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(
+            trie.prog_update(&prefix([10, 0, 0, 0], 8), &[1; 3], 0),
+            Err(Errno::EFAULT)
+        );
     }
 
     #[test]

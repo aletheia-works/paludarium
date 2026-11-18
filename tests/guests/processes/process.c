@@ -12136,6 +12136,145 @@ static int proc_personality_wchan_case(void) {
     ppw_read("reaped", held);
     return 0;
 }
+/* The proc-syscall case: /proc/<pid>/syscall, which Linux's
+   proc_pid_syscall writes when it is read for a reader that may attach to
+   the task (lock_trace, else EPERM), as task_current_syscall finds it: the
+   reader's own call, "running" for a running task, the call a sleeping or
+   stopped task last entered the kernel with (-1 for an entry that was no
+   call), and -1 with no registers once its stack is gone. The arguments a
+   call does not take hold whatever the registers held, so only the call's
+   own are shown. */
+static char psc_buffer[64];
+/* The line of `syscall` read from descriptor `fd`, shown by its number,
+   its first and third arguments, whether the second is psc_buffer, and
+   whether the stack and instruction pointers are set. */
+static void psc_show(const char *label, int fd) {
+    char b[256];
+    if (fd < 0) {
+        printf("%s: open errno=%d\n", label, errno);
+        return;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        printf("%s: lseek errno=%d\n", label, errno);
+        return;
+    }
+    ssize_t n = read(fd, b, sizeof b - 1);
+    if (n < 0) {
+        printf("%s: read errno=%d\n", label, errno);
+        return;
+    }
+    b[n] = 0;
+    if (!strcmp(b, "running\n")) {
+        printf("%s: running\n", label);
+        return;
+    }
+    unsigned long long v[8] = {0};
+    int number = 0;
+    int got = sscanf(b, "%d %llx %llx %llx %llx %llx %llx %llx %llx", &number, &v[0], &v[1], &v[2], &v[3], &v[4],
+                     &v[5], &v[6], &v[7]);
+    if (number < 0) {
+        printf("%s: %d fields=%d pointers=%s\n", label, number, got,
+               got == 3 && v[0] && v[1] ? "set" : got == 3 && !v[0] && !v[1] ? "zero" : "?");
+        return;
+    }
+    printf("%s: %d fd=%llu buffer=%s count=%llu fields=%d pointers=%s newline=%d\n", label, number, v[0],
+           v[1] == (unsigned long long)(uintptr_t)psc_buffer ? "ours" : "other", v[2], got,
+           v[6] && v[7] ? "set" : "zero", b[n - 1] == '\n');
+}
+static void psc_path(const char *label, const char *path) {
+    int fd = open(path, O_RDONLY);
+    psc_show(label, fd);
+    if (fd >= 0) close(fd);
+}
+/* Waits until the task at `stat` is in state `want`, for up to 5 s. */
+static int psc_state(const char *stat, char want) {
+    static char buffer[4096];
+    char *fields[64];
+    for (int i = 0; i < 5000; i++) {
+        if (proc_fields(stat, buffer, sizeof buffer, fields, 64) > 0 && fields[0][0] == want) return 0;
+        usleep(1000);
+    }
+    return 1;
+}
+static volatile int psc_spin;
+static int psc_pipe[2];
+static void *psc_thread(void *unused) {
+    (void)unused;
+    read(psc_pipe[0], psc_buffer, sizeof psc_buffer);
+    return NULL;
+}
+static int proc_syscall_case(void) {
+    char path[64], state[64];
+    int own = open("/proc/self/syscall", O_RDONLY);
+    /* Its own read of it: read(own, b, 255). */
+    psc_show("own", own);
+    struct stat st;
+    printf("mode=%o\n", stat("/proc/self/syscall", &st) ? 0 : (unsigned)(st.st_mode & 07777));
+    /* Another thread of its own, asleep in read. */
+    if (pipe(psc_pipe)) return 80;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, psc_thread, NULL)) return 81;
+    int tid = 0;
+    for (int i = 0; i < 5000 && !tid; i++) {
+        DIR *d = opendir("/proc/self/task");
+        for (struct dirent *e; d && (e = readdir(d));)
+            if (atoi(e->d_name) > 0 && atoi(e->d_name) != getpid()) tid = atoi(e->d_name);
+        if (d) closedir(d);
+    }
+    snprintf(state, sizeof state, "/proc/self/task/%d/stat", tid);
+    if (psc_state(state, 'S')) return 82;
+    snprintf(path, sizeof path, "/proc/self/task/%d/syscall", tid);
+    psc_path("own thread asleep", path);
+    write(psc_pipe[1], "x", 1);
+    pthread_join(thread, NULL);
+    /* A child asleep in read, then running, then stopped. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 83;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 84;
+    if (!kid) {
+        read(go[0], psc_buffer, 1);
+        write(ready[1], "r", 1);
+        for (;;) psc_spin++;
+    }
+    snprintf(state, sizeof state, "/proc/%d/stat", (int)kid);
+    snprintf(path, sizeof path, "/proc/%d/syscall", (int)kid);
+    if (psc_state(state, 'S')) return 85;
+    psc_path("child asleep", path);
+    /* Stopped while in read: the call it entered with. */
+    kill(kid, SIGSTOP);
+    if (psc_state(state, 'T')) return 86;
+    psc_path("child stopped in read", path);
+    int held = open(path, O_RDONLY);
+    fflush(stdout);
+    pid_t other = fork();
+    if (other < 0) return 87;
+    if (!other) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        psc_show("other user", held);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(other));
+    kill(kid, SIGCONT);
+    write(go[1], "g", 1);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 88;
+    if (psc_state(state, 'R')) return 89;
+    psc_path("child running", path);
+    /* Stopped from its loop: an entry that was no call. */
+    kill(kid, SIGSTOP);
+    if (psc_state(state, 'T')) return 90;
+    psc_path("child stopped running", path);
+    kill(kid, SIGKILL);
+    siginfo_t info;
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    psc_path("zombie", path);
+    printf("status=%d\n", reaped(kid));
+    psc_show("reaped", held);
+    return 0;
+}
 /* The proc-owner-rename case: the owner fstat shows of an open file in a
    process's /proc directory, which is its inode's as the last lookup of its
    path set it (pid_revalidate), and of the process's directory and its ns,
@@ -30448,6 +30587,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "proc-owner-rename")) return proc_owner_rename_case();
     if (!strcmp(mode, "proc-io")) return proc_io_case();
+    if (!strcmp(mode, "proc-syscall")) return proc_syscall_case();
     if (!strcmp(mode, "proc-personality-wchan")) return proc_personality_wchan_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);

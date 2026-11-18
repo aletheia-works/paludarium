@@ -6827,6 +6827,9 @@ fn open_path(
                 p.to_vec(),
             ));
         }
+        if path.entry == crate::proc::TaskEntry::Syscall {
+            return Ok((tasks::syscall(c.processes, &task, flags, owner), p.to_vec()));
+        }
         if path.entry == crate::proc::TaskEntry::Wchan {
             return Ok((tasks::wchan(c.processes, &task, flags, owner), p.to_vec()));
         }

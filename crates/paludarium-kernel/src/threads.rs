@@ -1572,6 +1572,14 @@ impl ThreadGroup {
                 .remove(&tid);
         }
     }
+    /// The registers of live thread `tid`'s last entry into the kernel.
+    pub(crate) fn kernel_entry(&self, tid: u32) -> Option<crate::inbox::KernelEntry> {
+        self.members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tid)
+            .map(|inbox| inbox.entry())
+    }
     /// The live threads, in order, and whether each is in a system call.
     pub(crate) fn threads(&self) -> Vec<(u32, bool)> {
         self.members

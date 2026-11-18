@@ -646,9 +646,13 @@ verified.
   Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise, and
   `MS_MOVE` of one gives `EOPNOTSUPP`: the lower filesystem shows each
   `--mount` itself, so taking one away would show it again, not the
-  directory under it. After `pivot_root` the old root can go, but a
-  `--mount` under it still stays, and a new root that is a `--mount`
-  shows its files at its old place under `put_old` too, where Linux shows
+  directory under it. For the same reason `move_mount` with
+  `MOVE_MOUNT_BENEATH` beneath one gives `EOPNOTSUPP`. Beneath the
+  namespace's root after `pivot_root` it gives `EINVAL`, as the mount left
+  below the root here takes no mounts, where Linux master mounts the
+  source on that mount. After `pivot_root` the old root can go, but a
+  `--mount` under it still stays, and a new root that is a `--mount` shows
+  its files at its old place under `put_old` too, where Linux shows
   the directory it covered. The generated `/proc` and `/dev` stay at the
   root's `/proc` and `/dev` after `pivot_root`, where Linux's go to
   `put_old` with the old root. A move or a `pivot_root` takes the roots

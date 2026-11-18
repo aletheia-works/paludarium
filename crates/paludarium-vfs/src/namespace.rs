@@ -2207,8 +2207,6 @@ impl NamespacedFs {
             Ok(())
         })
     }
-    /// The peer group nearest along `e`'s masters with a member in this
-    /// namespace (`get_dominating_id`), 0 for none.
     /// Whether the peer group `group` propagates to `to`: `to` is in it,
     /// or a master up `to`'s chain of masters is (`propagation_would_overmount`).
     fn receives(&self, to: &Entry, group: u64) -> bool {
@@ -2225,6 +2223,8 @@ impl NamespacedFs {
             master = self.table.numbers.master_of(master);
         }
     }
+    /// The peer group nearest along `e`'s masters with a member in this
+    /// namespace (`get_dominating_id`), 0 for none.
     fn dominating(&self, entries: &[Entry], e: &Entry) -> u64 {
         let mut group = e.master;
         for _ in 0..64 {

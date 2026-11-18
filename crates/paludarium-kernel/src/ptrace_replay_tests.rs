@@ -1,18 +1,21 @@
-//! Cases of `tests/guests/processes/ptrace.c` and `ptrace-syscalls.c`,
-//! replayed through the kernel's system calls: the tracer on the test's
-//! thread, the tracee on a thread of its own, as a guest's tasks run, each
-//! system call followed by the checkpoint the runtime takes before guest
-//! code runs again. The expected lines are what the guest prints for its
-//! mode on native Linux: for the `ptrace.c` cases as printed on Linux 7.0
-//! (x86-64, Ubuntu 26.04 runner), for `ptrace-strace` and `ptrace-sysemu` as
-//! the guest prints them under the emulator, which `diff_processes` finds
-//! equal to Linux's. It still compares the whole guests with Linux on every
-//! CI run. What only the CPU does (a signal handler's body, the check a
-//! tracee makes after it resumes) is done here in Rust from the state the
-//! kernel left; a line that needs an exec is left out.
+//! Cases of `tests/guests/processes/ptrace.c`, `ptrace-syscalls.c` and
+//! `ptrace-requests.c`, replayed through the kernel's system calls: the
+//! tracer on the test's thread, the tracee on a thread of its own, as a
+//! guest's tasks run, each system call followed by the checkpoint the
+//! runtime takes before guest code runs again. The expected lines are what
+//! the guest prints for its mode on native Linux: for the `ptrace.c` cases
+//! but `ptrace-thread` as printed on Linux 7.0 (x86-64, Ubuntu 26.04
+//! runner); for `ptrace-thread`, `ptrace-strace`, `ptrace-sysemu` and the
+//! `ptrace-requests.c` cases as the guest prints them under the emulator,
+//! which `diff_processes` finds equal to Linux's. It still compares the
+//! whole guests with Linux on every CI run. What only the CPU does (a
+//! signal handler's body, the check a tracee makes after it resumes) is
+//! done here in Rust from the state the kernel left; a line that needs an
+//! exec is left out.
 use super::*;
 
 const READ: u64 = 0;
+const WRITE: u64 = 1;
 const OPEN: u64 = 2;
 const CLOSE: u64 = 3;
 const MMAP: u64 = 9;
@@ -20,10 +23,13 @@ const MPROTECT: u64 = 10;
 const RT_SIGACTION: u64 = 13;
 const RT_SIGPROCMASK: u64 = 14;
 const RT_SIGRETURN: u64 = 15;
+const PIPE: u64 = 22;
 const PAUSE: u64 = 34;
 const SCHED_YIELD: u64 = 24;
 const GETPID: u64 = 39;
+const CLONE: u64 = 56;
 const FORK: u64 = 57;
+const EXIT: u64 = 60;
 const WAIT4: u64 = 61;
 const KILL: u64 = 62;
 const PTRACE: u64 = 101;
@@ -32,8 +38,13 @@ const GETPPID: u64 = 110;
 const ARCH_PRCTL: u64 = 158;
 const GETTID: u64 = 186;
 const TKILL: u64 = 200;
+const FUTEX: u64 = 202;
 const EXIT_GROUP: u64 = 231;
 const TGKILL: u64 = 234;
+const RT_SIGQUEUEINFO: u64 = 129;
+const PRCTL: u64 = 157;
+const SECCOMP: u64 = 317;
+const RSEQ: u64 = 334;
 
 const TRACEME: u64 = 0;
 const PEEKDATA: u64 = 2;
@@ -58,10 +69,17 @@ const GETREGSET: u64 = 0x4204;
 const SETREGSET: u64 = 0x4205;
 const SEIZE: u64 = 0x4206;
 const INTERRUPT: u64 = 0x4207;
+const LISTEN: u64 = 0x4208;
+const PEEKSIGINFO: u64 = 0x4209;
+const GETSIGMASK: u64 = 0x420a;
+const SETSIGMASK: u64 = 0x420b;
 const GET_SYSCALL_INFO: u64 = 0x420e;
+const GET_RSEQ_CONFIGURATION: u64 = 0x420f;
+const ARCH_PRCTL_REQUEST: u64 = 30;
 const SET_SYSCALL_INFO: u64 = 0x4212;
 const O_TRACESYSGOOD: u64 = 1;
 const O_TRACEFORK: u64 = 2;
+const O_TRACESECCOMP: u64 = 0x80;
 const O_EXITKILL: u64 = 1 << 20;
 const NT_PRSTATUS: u64 = 1;
 const NT_PRFPREG: u64 = 2;
@@ -72,10 +90,15 @@ const SIGUSR2: u64 = 12;
 const SIGTERM: u64 = 15;
 const SIGCHLD: u64 = 17;
 const SIGSTOP: u64 = 19;
+const SIGCONT: u64 = 18;
+const SIGKILL: u64 = 9;
+/// musl's `SIGRTMIN`, above the three it keeps for itself.
+const SIGRTMIN: u64 = 35;
 const WNOHANG: u64 = 1;
 const WALL: u64 = 0x4000_0000;
 const SA_SIGINFO: u64 = 4;
 const SA_RESTORER: u64 = 0x0400_0000;
+const SA_RESTART: u64 = 0x1000_0000;
 
 /// `struct user_regs_struct`'s fields, by their offsets.
 const R14: u64 = 8;
@@ -91,6 +114,7 @@ const EFLAGS: u64 = 144;
 const RSP: u64 = 152;
 const SS: u64 = 160;
 const FS_BASE: u64 = 168;
+const GS_BASE: u64 = 176;
 const DS: u64 = 184;
 const REGS: u64 = 216;
 /// `struct user`'s `u_tsize` and `u_debugreg`, and glibc's size of it.
@@ -217,7 +241,8 @@ impl Tracee {
         let Some((mut k, t)) = self.k.take_child() else {
             return;
         };
-        let m = k.take_spawn_memory().unwrap();
+        // A thread runs on its maker's memory.
+        let m = k.take_spawn_memory().unwrap_or_else(|| self.m.clone());
         let body = self.forked.take().expect("a task no case runs");
         self.children.push(std::thread::spawn(move || {
             let mut child = Tracee {
@@ -249,6 +274,29 @@ impl Tracee {
     fn fork(&mut self, body: impl FnOnce(&mut Tracee) -> ExitStatus + Send + 'static) -> u64 {
         self.forked = Some(Box::new(body));
         self.sys(FORK, [0; 6]).unwrap()
+    }
+    /// A thread, as musl's `pthread_create` makes it, running `body`; the
+    /// word at `ctid` holds its TID until it ends: its TID.
+    fn thread(
+        &mut self,
+        ctid: u64,
+        body: impl FnOnce(&mut Tracee) -> ExitStatus + Send + 'static,
+    ) -> u64 {
+        // CLONE_VM | FS | FILES | SIGHAND | THREAD | PARENT_SETTID |
+        // CHILD_CLEARTID.
+        let flags = 0x10f00 | 0x10_0000 | 0x20_0000;
+        self.forked = Some(Box::new(body));
+        self.sys(CLONE, [flags, 0, ctid, ctid, 0, 0]).unwrap()
+    }
+    /// musl's `pthread_join`: a futex wait until the word at `ctid` clears.
+    fn join(&mut self, ctid: u64) {
+        loop {
+            let tid = read32(&self.m, ctid);
+            if tid == 0 {
+                return;
+            }
+            self.sys(FUTEX, [ctid, 0, u64::from(tid), 0, 0, 0]).ok();
+        }
     }
     /// A call with no handler to run.
     fn sys(&mut self, n: u64, a: [u64; 6]) -> Result<u64, ExitStatus> {
@@ -418,12 +466,45 @@ impl Tracer {
             field("State:").as_bytes()[0],
         )
     }
+    /// A pipe: its read and write ends.
+    fn pipe(&mut self) -> (u64, u64) {
+        let fds = HEAP + 0x780;
+        assert_eq!(self.call(PIPE, [fds, 0, 0, 0, 0, 0]), 0);
+        (
+            u64::from(read32(&self.m, fds)),
+            u64::from(read32(&self.m, fds + 4)),
+        )
+    }
+    /// The guest's wait for its child's byte on the ready pipe, and then for
+    /// it to sleep in the call after.
+    fn ready(&mut self, pid: u64, fd: u64) {
+        assert_eq!(self.call(READ, [fd, HEAP + 0x790, 1, 0, 0, 0]), 1);
+        self.until_sleeping(pid);
+    }
     /// Waits until `pid` sleeps, as the guest does before it attaches.
     fn until_sleeping(&mut self, pid: u64) {
         let deadline = std::time::Instant::now() + PATIENCE;
         while self.status_of(pid).1 != b'S' {
             assert!(std::time::Instant::now() < deadline, "{pid} did not sleep");
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    /// A stop as `ptrace-requests.c` prints it.
+    fn show(&mut self, name: &str, status: i64) {
+        let stopped = status & 0xff == 0x7f;
+        let signal = if stopped { (status >> 8) & 0xff } else { -1 };
+        self.lines.push(format!(
+            "{name}: stopped={} signal={signal} event={}",
+            i64::from(stopped),
+            status >> 16
+        ));
+    }
+    /// The exit code of an exited status, or -1.
+    fn code(status: i64) -> i64 {
+        if status & 0x7f == 0 {
+            (status >> 8) & 0xff
+        } else {
+            -1
         }
     }
     fn check(&self, native: &str) {
@@ -546,15 +627,17 @@ no-tracee=-3",
 #[test]
 fn attach() {
     let mut g = Tracer::new();
-    let (child, thread) = g.fork(|c| {
+    let (ready, told) = g.pipe();
+    let (child, thread) = g.fork(move |c| {
         c.catch(SIGUSR1, 0);
+        c.sys(WRITE, [told, HEAP + 0x790, 1, 0, 0, 0]).unwrap();
         loop {
             if let Err(status) = c.call(PAUSE, [0; 6], &mut |_, _, _| None) {
                 return status;
             }
         }
     });
-    g.until_sleeping(child);
+    g.ready(child, ready);
     let r = g.pt(CONT, child, 0, 0);
     g.say("untraced", r);
     let r = g.pt(ATTACH, 1, 0, 0);
@@ -1398,5 +1481,476 @@ sysemu=0
 entry signal=133 nr=110 rax=-38
 exit signal=133 nr=110 rax=-38
 exit=3",
+    );
+}
+
+/// `ptrace-sigmask`: PTRACE_GETSIGMASK and SETSIGMASK, and the thread's and
+/// the process's pending signals through PTRACE_PEEKSIGINFO, then their
+/// delivery once the mask the tracer set lets them in.
+#[test]
+fn sigmask() {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        c.catch(SIGUSR1, SA_RESTART);
+        c.catch(SIGRTMIN, SA_RESTART);
+        let set = HEAP + 0x900;
+        let blocked = 1u64 << (SIGUSR1 - 1) | 1 << (SIGRTMIN - 1);
+        c.m.write_u64(GuestAddr(set), blocked).unwrap();
+        c.sys(RT_SIGPROCMASK, [0, set, 0, 8, 0, 0]).unwrap();
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        let pid = c.sys(GETPID, [0; 6]).unwrap();
+        let tid = c.sys(GETTID, [0; 6]).unwrap();
+        c.sys(TGKILL, [pid, tid, SIGUSR1, 0, 0, 0]).unwrap();
+        // musl's sigqueue: SI_QUEUE, the sender and the value.
+        let info = HEAP + 0xb00;
+        for value in 1..=2u32 {
+            c.m.write(GuestAddr(info), &[0; 128]).unwrap();
+            write32(&c.m, info, SIGRTMIN as u32);
+            write32(&c.m, info + 8, -1i32 as u32);
+            write32(&c.m, info + 16, pid as u32);
+            write32(&c.m, info + 24, value);
+            c.sys(RT_SIGQUEUEINFO, [pid, SIGRTMIN, info, 0, 0, 0])
+                .unwrap();
+        }
+        let mut handled = 0i32;
+        let mut count = |_: &mut Tracee, signal: u64, _| {
+            handled = handled * 100 + signal as i32;
+            None
+        };
+        c.call(TKILL, [tid, SIGSTOP, 0, 0, 0, 0], &mut count)
+            .unwrap();
+        c.exit(handled % 1_000_000)
+    });
+    let status = g.wait(child, 0);
+    g.show("stop", status);
+    let (mask, infos, args) = (HEAP + 0x500, HEAP + 0x2000, HEAP + 0x600);
+    let r = g.pt(GETSIGMASK, child, 4, mask);
+    g.say("getmask-size", r);
+    let r = g.pt(GETSIGMASK, child, 8, mask);
+    g.say("getmask", r);
+    let bits = g.m.read_u64(GuestAddr(mask)).unwrap();
+    g.lines.push(format!(
+        "mask-usr1={} mask-rtmin={}",
+        bits >> (SIGUSR1 - 1) & 1,
+        bits >> (SIGRTMIN - 1) & 1
+    ));
+    let peek = |g: &mut Tracer, offset: u64, flags: u32, count: i32, to: u64| {
+        g.m.write_u64(GuestAddr(args), offset).unwrap();
+        write32(&g.m, args + 8, flags);
+        write32(&g.m, args + 12, count as u32);
+        g.pt(PEEKSIGINFO, child, args, to)
+    };
+    let n = peek(&mut g, 0, 0, 4, infos);
+    let mut line = format!("thread-queue={n}");
+    for i in 0..n.max(0) as u64 {
+        let at = infos + i * 128;
+        line += &format!(" {}/{}", read32(&g.m, at), read32(&g.m, at + 8) as i32);
+    }
+    g.lines.push(line);
+    let n = peek(&mut g, 0, 1, 4, infos);
+    let mut line = format!("process-queue={n}");
+    for i in 0..n.max(0) as u64 {
+        let at = infos + i * 128;
+        line += &format!(
+            " {}/{}/{}",
+            i32::from(u64::from(read32(&g.m, at)) == SIGRTMIN),
+            read32(&g.m, at + 8) as i32,
+            read32(&g.m, at + 24) as i32
+        );
+    }
+    g.lines.push(line);
+    let r = peek(&mut g, 1, 1, 4, infos);
+    g.say("offset", r);
+    let r = peek(&mut g, 9, 1, 4, infos);
+    g.say("beyond", r);
+    let r = peek(&mut g, 0, 2, 4, infos);
+    g.say("bad-flags", r);
+    let r = peek(&mut g, 0, 1, -1, infos);
+    g.say("bad-nr", r);
+    let r = peek(&mut g, 0, 1, 1, 8);
+    g.say("bad-buffer", r);
+    let none = !(1u64 << (SIGUSR1 - 1) | 1 << (SIGRTMIN - 1));
+    g.m.write_u64(GuestAddr(mask), none).unwrap();
+    let r = g.pt(SETSIGMASK, child, 8, mask);
+    g.say("setmask", r);
+    g.pt(GETSIGMASK, child, 8, mask);
+    let bits = g.m.read_u64(GuestAddr(mask)).unwrap();
+    g.lines.push(format!(
+        "kill-blocked={} stop-blocked={} usr2-blocked={}",
+        bits >> (SIGKILL - 1) & 1,
+        bits >> (SIGSTOP - 1) & 1,
+        bits >> (SIGUSR2 - 1) & 1
+    ));
+    g.m.write_u64(GuestAddr(mask), 0).unwrap();
+    let r = g.pt(SETSIGMASK, child, 16, mask);
+    g.say("setmask-size", r);
+    g.pt(SETSIGMASK, child, 8, mask);
+    g.pt(CONT, child, 0, 0);
+    let status = loop {
+        let status = g.wait(child, 0);
+        if status & 0xff != 0x7f {
+            break status;
+        }
+        let signal = (status >> 8) & 0xff;
+        g.say("delivery", signal);
+        g.pt(CONT, child, 0, signal as u64);
+    };
+    thread.join().unwrap();
+    g.say("exit", Tracer::code(status));
+    g.check(
+        "stop: stopped=1 signal=19 event=0
+getmask-size=-22
+getmask=0
+mask-usr1=1 mask-rtmin=1
+thread-queue=1 10/-6
+process-queue=2 1/-1/1 1/-1/2
+offset=1
+beyond=0
+bad-flags=-22
+bad-nr=-22
+bad-buffer=-14
+setmask=0
+kill-blocked=0 stop-blocked=0 usr2-blocked=1
+setmask-size=-22
+delivery=10
+delivery=35
+delivery=35
+exit=230",
+    );
+}
+
+/// `ptrace-arch-rseq`: PTRACE_ARCH_PRCTL on the stopped tracee's fs and gs
+/// bases, PTRACE_GET_RSEQ_CONFIGURATION, and a gs base the tracee keeps
+/// after the detach.
+#[test]
+fn arch_rseq() {
+    const AREA: u64 = HEAP + 0xc00;
+    const RSEQ_SIG: u64 = 0x5305_3053;
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        // musl's thread pointer, which it sets as it starts.
+        c.sys(ARCH_PRCTL, [0x1002, HEAP + 0xf00, 0, 0, 0, 0])
+            .unwrap();
+        let registered = c.sys(RSEQ, [AREA, 32, 0, RSEQ_SIG, 0, 0]).unwrap();
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        c.raise(SIGSTOP, &mut |_, _, _| None).unwrap();
+        let gs = HEAP + 0xd00;
+        c.sys(ARCH_PRCTL, [0x1004, gs, 0, 0, 0, 0]).unwrap();
+        let gs = c.m.read_u64(GuestAddr(gs)).unwrap();
+        c.exit(i32::from(registered == 0) | i32::from(gs == 0x1234) << 1)
+    });
+    let status = g.wait(child, 0);
+    g.show("stop", status);
+    let (_, regs) = g.regs(child);
+    let fs_base = g.reg(regs, FS_BASE);
+    let value = HEAP + 0x500;
+    // The guest's printf reads `fs` and `gs` before the call that fills
+    // them in: gcc evaluates its arguments right to left.
+    g.m.write_u64(GuestAddr(value), 0).unwrap();
+    let same = g.m.read_u64(GuestAddr(value)).unwrap() == fs_base;
+    let r = g.pt(ARCH_PRCTL_REQUEST, child, value, 0x1003);
+    g.lines.push(format!("get-fs={r} same={}", i32::from(same)));
+    let r = g.pt(ARCH_PRCTL_REQUEST, child, 0x1234, 0x1001);
+    g.say("set-gs", r);
+    let (_, regs) = g.regs(child);
+    let gs_base = g.reg(regs, GS_BASE);
+    g.say("gs-base", format!("{gs_base:#x}"));
+    g.m.write_u64(GuestAddr(value), 0).unwrap();
+    let gs = g.m.read_u64(GuestAddr(value)).unwrap();
+    let r = g.pt(ARCH_PRCTL_REQUEST, child, value, 0x1004);
+    g.lines.push(format!("get-gs={r} gs={}", hex(gs)));
+    let r = g.pt(ARCH_PRCTL_REQUEST, child, 1 << 63, 0x1002);
+    g.say("set-fs-high", r);
+    let r = g.pt(ARCH_PRCTL_REQUEST, child, 8, 0x1003);
+    g.say("get-fs-fault", r);
+    let r = g.pt(ARCH_PRCTL_REQUEST, child, 0, 0x1fff);
+    g.say("other", r);
+    let conf = HEAP + 0x600;
+    let read_conf = |g: &mut Tracer, length: u64| {
+        g.m.write(GuestAddr(conf), &[0; 24]).unwrap();
+        let size = g.pt(GET_RSEQ_CONFIGURATION, child, length, conf);
+        let pointer = g.m.read_u64(GuestAddr(conf)).unwrap() == AREA;
+        let int = |at| read32(&g.m, conf + at);
+        (size, i32::from(pointer), int(8), int(12), int(16))
+    };
+    let (size, pointer, length, signature, flags) = read_conf(&mut g, 24);
+    g.lines.push(format!(
+        "rseq size={size} pointer={pointer} length={length} signature={signature:#x} flags={flags}"
+    ));
+    let (size, pointer, length, _, _) = read_conf(&mut g, 8);
+    g.lines.push(format!(
+        "rseq-short size={size} pointer={pointer} length={length}"
+    ));
+    let r = g.pt(DETACH, child, 0, 0);
+    g.say("detach", r);
+    let status = g.wait(child, 0);
+    thread.join().unwrap();
+    g.say("exit", Tracer::code(status));
+    g.check(
+        "stop: stopped=1 signal=19 event=0
+get-fs=0 same=0
+set-gs=0
+gs-base=0x1234
+get-gs=0 gs=0
+set-fs-high=-1
+get-fs-fault=-14
+other=-22
+rseq size=24 pointer=1 length=32 signature=0x53053053 flags=0
+rseq-short size=24 pointer=1 length=0
+detach=0
+exit=3",
+    );
+}
+
+/// C's `%#x`: no prefix on zero.
+fn hex(value: u64) -> String {
+    if value == 0 {
+        "0".into()
+    } else {
+        format!("{value:#x}")
+    }
+}
+
+/// `ptrace-listen`: PTRACE_LISTEN in a group stop of a seized tracee, which
+/// neither a wait nor a request then sees stopped, the trap as the group
+/// stop ends, and PTRACE_INTERRUPT of a listening tracee.
+#[test]
+fn listen() {
+    let mut g = Tracer::new();
+    let (ready, told) = g.pipe();
+    let (child, thread) = g.fork(move |c| {
+        c.sys(WRITE, [told, HEAP + 0x790, 1, 0, 0, 0]).unwrap();
+        loop {
+            if let Err(status) = c.sys(PAUSE, [0; 6]) {
+                return status;
+            }
+        }
+    });
+    g.ready(child, ready);
+    let r = g.pt(SEIZE, child, 0, 0);
+    g.say("seize", r);
+    let kill = |g: &mut Tracer, signal: u64| g.call(KILL, [child, signal, 0, 0, 0, 0]);
+    kill(&mut g, SIGSTOP);
+    let status = g.wait(child, 0);
+    g.show("sigstop", status);
+    let r = g.pt(LISTEN, child, 0, 0);
+    g.say("listen-signal", r);
+    g.pt(CONT, child, 0, SIGSTOP);
+    let status = g.wait(child, 0);
+    g.show("group", status);
+    let r = g.pt(LISTEN, child, 0, 0);
+    g.say("listen", r);
+    let r = g.wait(child, WNOHANG);
+    g.say("wait", r);
+    let r = g.regs(child).0;
+    g.say("getregs", r);
+    let r = g.pt(LISTEN, child, 0, 0);
+    g.say("listen-again", r);
+    let state = g.status_of(child).1;
+    g.say("state", char::from(state));
+    kill(&mut g, SIGCONT);
+    let status = g.wait(child, 0);
+    g.show("continued", status);
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, 0);
+    g.show("sigcont", status);
+    g.pt(CONT, child, 0, 0);
+    kill(&mut g, SIGSTOP);
+    let status = g.wait(child, 0);
+    g.show("sigstop-2", status);
+    g.pt(CONT, child, 0, SIGSTOP);
+    let status = g.wait(child, 0);
+    g.show("group-2", status);
+    let r = g.pt(LISTEN, child, 0, 0);
+    g.say("listen-2", r);
+    let r = g.pt(INTERRUPT, child, 0, 0);
+    g.say("interrupt", r);
+    let status = g.wait(child, 0);
+    g.show("interrupted", status);
+    kill(&mut g, SIGKILL);
+    let status = g.wait(child, 0);
+    thread.join().unwrap();
+    let signaled = status & 0x7f != 0 && status & 0x7f != 0x7f;
+    g.say("killed", if signaled { status & 0x7f } else { -1 });
+    g.check(
+        "seize=0
+sigstop: stopped=1 signal=19 event=0
+listen-signal=-5
+group: stopped=1 signal=19 event=128
+listen=0
+wait=0
+getregs=-3
+listen-again=-3
+state=t
+continued: stopped=1 signal=5 event=128
+sigcont: stopped=1 signal=18 event=0
+sigstop-2: stopped=1 signal=19 event=0
+group-2: stopped=1 signal=19 event=128
+listen-2=0
+interrupt=0
+interrupted: stopped=1 signal=19 event=128
+killed=9",
+    );
+}
+
+/// `ptrace-seccomp`: the stops SECCOMP_RET_TRACE makes once the tracer sets
+/// PTRACE_O_TRACESECCOMP (ENOSYS before), their message and syscall info,
+/// and a call the tracer skips or changes there.
+#[test]
+fn seccomp() {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        // seccomp_data's number; getppid traced with 0x42, getuid with 7.
+        let (fprog, code) = (HEAP + 0xe00, HEAP + 0xe40);
+        let filter: [(u16, u8, u8, u32); 6] = [
+            (0x20, 0, 0, 0),
+            (0x15, 0, 1, GETPPID as u32),
+            (0x06, 0, 0, 0x7ff0_0042),
+            (0x15, 0, 1, GETUID as u32),
+            (0x06, 0, 0, 0x7ff0_0007),
+            (0x06, 0, 0, 0x7fff_0000),
+        ];
+        for (i, (op, jt, jf, k)) in filter.into_iter().enumerate() {
+            let at = code + i as u64 * 8;
+            let mut insn = [0u8; 8];
+            insn[..2].copy_from_slice(&op.to_le_bytes());
+            insn[2] = jt;
+            insn[3] = jf;
+            insn[4..].copy_from_slice(&k.to_le_bytes());
+            c.m.write(GuestAddr(at), &insn).unwrap();
+        }
+        c.m.write_u64(GuestAddr(fprog), filter.len() as u64)
+            .unwrap();
+        c.m.write_u64(GuestAddr(fprog + 8), code).unwrap();
+        assert_eq!(c.sys(PRCTL, [38, 1, 0, 0, 0, 0]), Ok(0));
+        assert_eq!(c.sys(SECCOMP, [1, 0, fprog, 0, 0, 0]), Ok(0));
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        let untraced = neg(c.sys(GETPPID, [0; 6]).unwrap());
+        c.raise(SIGSTOP, &mut |_, _, _| None).unwrap();
+        let skipped = c.sys(GETPPID, [0; 6]).unwrap();
+        let changed = c.sys(GETUID, [0; 6]).unwrap();
+        let rechecked = neg(c.sys(GETPPID, [0; 6]).unwrap());
+        let pid = c.sys(GETPID, [0; 6]).unwrap();
+        c.exit(
+            i32::from(untraced == -38)
+                | i32::from(skipped == 99) << 1
+                | i32::from(changed == pid) << 2
+                | i32::from(rechecked > 0) << 3,
+        )
+    });
+    let status = g.wait(child, 0);
+    g.show("stop", status);
+    let r = g.pt(SETOPTIONS, child, 0, O_TRACESECCOMP);
+    g.say("options", r);
+    let (message, info) = (HEAP + 0x500, HEAP + 0x600);
+    for round in 0..3 {
+        g.pt(CONT, child, 0, 0);
+        let status = g.wait(child, 0);
+        g.show("seccomp", status);
+        g.m.write_u64(GuestAddr(message), 0).unwrap();
+        g.pt(GETEVENTMSG, child, 0, message);
+        let (_, regs) = g.regs(child);
+        g.m.write(GuestAddr(info), &[0; INFO as usize]).unwrap();
+        let size = g.pt(GET_SYSCALL_INFO, child, INFO, info);
+        let message = g.m.read_u64(GuestAddr(message)).unwrap();
+        let (nr, rax) = (g.reg(regs, ORIG_RAX) as i64, g.reg(regs, RAX) as i64);
+        let op = g.m.read_u64(GuestAddr(info)).unwrap() & 0xff;
+        let info_nr = g.m.read_u64(GuestAddr(info + 24)).unwrap() as i64;
+        let ret_data = read32(&g.m, info + 80);
+        g.lines.push(format!(
+            "message={} nr={nr} rax={rax} info-size={size} op={op} info-nr={info_nr} ret-data={}",
+            hex(message),
+            hex(u64::from(ret_data))
+        ));
+        let set = match round {
+            0 => {
+                g.m.write_u64(GuestAddr(regs + RAX), 99).unwrap();
+                Some(u64::MAX)
+            }
+            1 => Some(GETPID),
+            _ => None,
+        };
+        if let Some(number) = set {
+            g.m.write_u64(GuestAddr(regs + ORIG_RAX), number).unwrap();
+            g.pt(SETREGS, child, 0, regs);
+        }
+    }
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, 0);
+    thread.join().unwrap();
+    g.say("exit", Tracer::code(status));
+    g.check(
+        "stop: stopped=1 signal=19 event=0
+options=0
+seccomp: stopped=1 signal=5 event=7
+message=0x42 nr=110 rax=-38 info-size=84 op=3 info-nr=110 ret-data=0x42
+seccomp: stopped=1 signal=5 event=7
+message=0x7 nr=102 rax=-38 info-size=84 op=3 info-nr=102 ret-data=0x7
+seccomp: stopped=1 signal=5 event=7
+message=0x42 nr=110 rax=-38 info-size=84 op=3 info-nr=110 ret-data=0x42
+exit=15",
+    );
+}
+
+/// `ptrace-thread`: a tracer attaches to one thread of a process, whose
+/// other thread stays untraced, and waits for that thread's exit.
+#[test]
+fn thread() {
+    let mut g = Tracer::new();
+    let fds = HEAP + 0x700;
+    g.call(PIPE, [fds, 0, 0, 0, 0, 0]);
+    g.call(PIPE, [fds + 8, 0, 0, 0, 0, 0]);
+    let fd = |g: &Tracer, at: u64| u64::from(read32(&g.m, fds + at * 4));
+    let (tid_read, tid_write, wake_read, wake_write) = (fd(&g, 0), fd(&g, 1), fd(&g, 2), fd(&g, 3));
+    let (child, process) = g.fork(move |c| {
+        c.sys(CLOSE, [tid_read, 0, 0, 0, 0, 0]).unwrap();
+        let ctid = HEAP + 0xf00;
+        c.thread(ctid, move |t| {
+            let tid = t.sys(GETTID, [0; 6]).unwrap();
+            let at = HEAP + 0xf10;
+            write32(&t.m, at, tid as u32);
+            t.sys(WRITE, [tid_write, at, 4, 0, 0, 0]).unwrap();
+            let byte = HEAP + 0xf20;
+            if let Err(status) = t.sys(READ, [wake_read, byte, 1, 0, 0, 0]) {
+                return status;
+            }
+            match t.sys(EXIT, [0; 6]) {
+                Err(status) => status,
+                Ok(r) => panic!("exit returned {r}"),
+            }
+        });
+        c.join(ctid);
+        c.sys(READ, [wake_read, HEAP + 0xf30, 1, 0, 0, 0]).unwrap();
+        c.exit(5)
+    });
+    let at = HEAP + 0x710;
+    assert_eq!(g.call(READ, [tid_read, at, 4, 0, 0, 0]), 4);
+    let tid = u64::from(read32(&g.m, at));
+    let r = g.pt(ATTACH, tid, 0, 0);
+    g.say("attach", r);
+    let status = g.wait(tid, 0);
+    g.stop("thread", status);
+    let r = g.pt(CONT, child, 0, 0);
+    g.say("process-untraced", r);
+    let r = g.pt(CONT, tid, 0, 0);
+    g.say("cont", r);
+    g.call(WRITE, [wake_write, at, 1, 0, 0, 0]);
+    let status = g.wait(tid, WALL);
+    g.say("thread-exited", i64::from(status & 0x7f == 0));
+    g.say("thread-code", (status >> 8) & 0xff);
+    g.call(WRITE, [wake_write, at, 1, 0, 0, 0]);
+    let status = g.wait(child, 0);
+    process.join().unwrap();
+    g.say("process-exit", Tracer::code(status));
+    g.check(
+        "attach=0
+thread-stopped=1
+thread-signal=19
+thread-event=0
+process-untraced=-3
+cont=0
+thread-exited=1
+thread-code=0
+process-exit=5",
     );
 }

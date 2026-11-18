@@ -63,9 +63,8 @@ mod native {
     use paludarium_cpu::CpuState;
     use paludarium_cpu::compile::{CompiledBlock, Compiler, Form};
     use paludarium_mmu::AddressSpace;
-    use paludarium_types::GuestAddr;
 
-    use crate::emit::{self, FS_BASE, GS_BASE, RFLAGS, RIP, WORDS, XMM};
+    use crate::emit;
     use crate::exec::{self, Code, Context};
 
     /// Counts of what the compiler did, for measuring.
@@ -96,9 +95,8 @@ mod native {
     impl Machine {
         /// The machine code of `forms`, `None` when Cranelift fails or the
         /// code would need relocating.
-        fn machine_code(&self, forms: &[Form]) -> Option<(Vec<u8>, bool)> {
-            let (function, vector) =
-                emit::function(forms, exec::helpers(), self.isa.frontend_config());
+        fn machine_code(&self, forms: &[Form]) -> Option<Vec<u8>> {
+            let function = emit::function(forms, exec::helpers(), self.isa.frontend_config());
             let mut context = cranelift_codegen::Context::for_function(function);
             let compiled = context
                 .compile(&*self.isa, &mut ControlPlane::default())
@@ -106,15 +104,13 @@ mod native {
             if !compiled.buffer.relocs().is_empty() {
                 return None;
             }
-            Some((compiled.code_buffer().to_vec(), vector))
+            Some(compiled.code_buffer().to_vec())
         }
 
         /// Compiles `forms` into `block`.
         fn fill(&self, forms: &[Form], block: &PendingBlock) {
             let started = std::time::Instant::now();
-            let code = self
-                .machine_code(forms)
-                .and_then(|(bytes, vector)| Code::new(&bytes, vector));
+            let code = self.machine_code(forms).and_then(|bytes| Code::new(&bytes));
             let s = &self.statistics;
             s.nanoseconds.fetch_add(
                 u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -203,7 +199,7 @@ mod native {
 
         #[cfg(test)]
         pub(crate) fn machine_code(&self, forms: &[Form]) -> Option<Vec<u8>> {
-            self.machine.machine_code(forms).map(|(bytes, _)| bytes)
+            self.machine.machine_code(forms)
         }
 
         /// Hands `job` to the background thread, starting it first if
@@ -282,55 +278,13 @@ mod native {
         len: usize,
     }
 
-    /// Runs `code` on a register block of `N` words, [`XMM`] or [`WORDS`]:
-    /// the xmm registers are copied in and back only in the larger one, so
-    /// a block that does not use them pays nothing for them.
-    fn run_on<const N: usize>(
-        code: &Code,
-        len: usize,
-        state: &mut CpuState,
-        context: &Context<'_>,
-    ) -> usize {
-        let mut registers = [0; N];
-        registers[..16].copy_from_slice(&state.gpr);
-        registers[RFLAGS] = state.rflags;
-        registers[RIP] = state.rip.0;
-        registers[FS_BASE] = state.fs_base;
-        registers[GS_BASE] = state.gs_base;
-        let vector = N >= WORDS;
-        if vector {
-            for (n, x) in state.xmm.iter().enumerate() {
-                registers[XMM + 2 * n] = *x as u64;
-                registers[XMM + 2 * n + 1] = (*x >> 64) as u64;
-            }
-        }
-        let ran = code.run(&mut registers, context);
-        let ran = usize::try_from(ran).unwrap_or(0).min(len);
-        if ran > 0 {
-            state.gpr.copy_from_slice(&registers[..16]);
-            state.rflags = registers[RFLAGS];
-            state.rip = GuestAddr(registers[RIP]);
-            if vector {
-                for (n, x) in state.xmm.iter_mut().enumerate() {
-                    *x = u128::from(registers[XMM + 2 * n])
-                        | (u128::from(registers[XMM + 2 * n + 1]) << 64);
-                }
-            }
-        }
-        ran
-    }
-
     impl CompiledBlock for PendingBlock {
         fn run(&self, state: &mut CpuState, mem: &AddressSpace, generation: u64) -> usize {
             let Some(Some(code)) = self.code.get() else {
                 return 0;
             };
-            let context = Context { mem, generation };
-            if code.vector() {
-                run_on::<WORDS>(code, self.len, state, &context)
-            } else {
-                run_on::<XMM>(code, self.len, state, &context)
-            }
+            let ran = code.run(state, &Context { mem, generation });
+            usize::try_from(ran).unwrap_or(0).min(self.len)
         }
 
         fn len(&self) -> usize {

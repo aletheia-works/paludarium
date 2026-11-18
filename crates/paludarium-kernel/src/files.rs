@@ -6761,6 +6761,12 @@ fn open_path(
         if path.entry == crate::proc::TaskEntry::Io {
             return Ok((tasks::io(c.processes, &task, flags, owner), p.to_vec()));
         }
+        if path.entry == crate::proc::TaskEntry::ClearRefs {
+            return Ok((
+                tasks::clear_refs(c.processes, &task, flags, owner),
+                p.to_vec(),
+            ));
+        }
         // A link of `fd` opens its descriptor's file again, as this
         // process's own does.
         if let crate::proc::TaskEntry::Descriptor(n) = path.entry {

@@ -83,7 +83,7 @@ jobs:
           ' 2>&1 | tee -a times.txt
           if grep -E '^DIFFERENT|^case .* False$' times.txt; then exit 1; fi
       # The runner's CPU goes first, since the criterion asks for a pass on
-      # both an Intel and an AMD one and the workflow cannot choose.
+      # one kind of Intel runner and one of AMD, and the workflow cannot choose.
       - name: Compare
         run: |
           {

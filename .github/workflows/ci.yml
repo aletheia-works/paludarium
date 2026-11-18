@@ -47,9 +47,11 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.groups.outputs.rust }}
+      unit: ${{ steps.groups.outputs.unit }}
       dependencies: ${{ steps.groups.outputs.dependencies }}
       fuzz: ${{ steps.groups.outputs.fuzz }}
       wasm: ${{ steps.groups.outputs.wasm }}
+      safari: ${{ steps.groups.outputs.safari }}
       programs: ${{ steps.groups.outputs.programs }}
       production_wasm: ${{ steps.groups.outputs.production_wasm }}
       docs: ${{ steps.groups.outputs.docs }}
@@ -85,6 +87,10 @@ jobs:
     needs: [changes, quick]
     if: ${{ !cancelled() && needs.quick.result == 'success' && needs.changes.outputs.wasm == 'true' }}
     uses: ./.github/workflows/wasm-programs.yml
+    # Safari's row runs on a macOS runner, which may be scarce; it is left out
+    # when the changes reach only crates the Wasm module does not link.
+    with:
+      safari: ${{ needs.changes.outputs.safari == 'true' }}
   # Only the targets the changes can affect. None chosen skips the job; a
   # failed choice fails changes, and so ci-ok.
   fuzz:
@@ -168,7 +174,9 @@ jobs:
   test-linux:
     name: unit tests (ubuntu-latest)
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # The crates these tests build and the files outside them their sources
+    # name (scripts/ci-changes.py's unit group).
+    if: needs.changes.outputs.unit == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps: &unit-test-steps
@@ -194,7 +202,7 @@ jobs:
   test:
     name: unit tests (${{ matrix.os }})
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.unit == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -548,6 +556,17 @@ jobs:
           cargo llvm-cov report -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|jit-native|harness)/'
         env:
           RUST_TEST_THREADS: "1"
+      # How far the gate is above its floor, so a pull request sees the margin
+      # shrink before the gate fails. The gate and this read the same lines.
+      - name: Terminal line coverage margin
+        if: ${{ !cancelled() && hashFiles('target/terminal-coverage.lcov') != '' }}
+        run: |
+          awk -F: '/^LF:/ { lines += $2 } /^LH:/ { hit += $2 }
+            END {
+              if (lines == 0) { print "Terminal line coverage: no measured lines"; exit }
+              floor = int((lines * 80 + 99) / 100)
+              printf "Terminal line coverage: %d of %d lines (%.2f%%), %d lines above the 80%% floor of %d\n", hit, lines, 100 * hit / lines, hit - floor, floor
+            }' target/terminal-coverage.lcov | tee -a "$GITHUB_STEP_SUMMARY"
       # The CPU and decoder only: the command crate (crates/paludarium), which
       # the harness builds and this run does not exercise, is left out of the
       # report as it is out of the measured lines.

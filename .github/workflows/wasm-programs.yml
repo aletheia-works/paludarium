@@ -1,7 +1,18 @@
 name: Wasm guest programs
 on:
   workflow_call:
+    inputs:
+      # false leaves out the Safari row (ci.yml, scripts/ci-changes.py).
+      safari:
+        type: boolean
+        default: true
+  # Declared here too: an undeclared input is null, and null == false is
+  # true in an expression, which would leave Safari out of a dispatch.
   workflow_dispatch:
+    inputs:
+      safari:
+        type: boolean
+        default: true
 permissions:
   contents: read
 jobs:
@@ -62,20 +73,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            environment: node
-          - os: ubuntu-latest
-            environment: chromium
-          - os: ubuntu-latest
-            environment: firefox
-          - os: macos-latest
-            environment: safari
-          # JavaScriptCore on x86-64, which Safari on macOS (arm64) does not
-          # cover: it once miscompiled a CPU flag helper (#113).
-          - os: ubuntu-latest
-            environment: webkit
-    runs-on: ${{ matrix.os }}
+        # Safari runs on macOS, the others on Linux. webkit is JavaScriptCore
+        # on x86-64, which Safari on macOS (arm64) does not cover: it once
+        # miscompiled a CPU flag helper (#113).
+        environment: ${{ fromJSON(inputs.safari == false && '["node","chromium","firefox","webkit"]' || '["node","chromium","firefox","safari","webkit"]') }}
+    name: differential (${{ matrix.environment == 'safari' && 'macos-latest' || 'ubuntu-latest' }}, ${{ matrix.environment }})
+    runs-on: ${{ matrix.environment == 'safari' && 'macos-latest' || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

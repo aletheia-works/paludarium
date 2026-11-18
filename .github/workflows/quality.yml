@@ -560,6 +560,17 @@ jobs:
           cargo llvm-cov report -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|jit-native|harness)/'
         env:
           RUST_TEST_THREADS: "1"
+      # How far the gate is above its floor, so a pull request sees the margin
+      # shrink before the gate fails. The gate and this read the same lines.
+      - name: Terminal line coverage margin
+        if: ${{ !cancelled() && hashFiles('target/terminal-coverage.lcov') != '' }}
+        run: |
+          awk -F: '/^LF:/ { lines += $2 } /^LH:/ { hit += $2 }
+            END {
+              if (lines == 0) { print "Terminal line coverage: no measured lines"; exit }
+              floor = int((lines * 80 + 99) / 100)
+              printf "Terminal line coverage: %d of %d lines (%.2f%%), %d lines above the 80%% floor of %d\n", hit, lines, 100 * hit / lines, hit - floor, floor
+            }' target/terminal-coverage.lcov | tee -a "$GITHUB_STEP_SUMMARY"
       # The CPU and decoder only: the command crate (crates/paludarium), which
       # the harness builds and this run does not exercise, is left out of the
       # report as it is out of the measured lines.

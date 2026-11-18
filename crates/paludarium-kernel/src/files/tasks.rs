@@ -391,6 +391,36 @@ pub(super) fn pagemap(
         owner,
     )))
 }
+/// `clear_refs` of the task, opened with `flags`: a write acts on the
+/// address space the task has then (`get_task_mm`), as Linux's
+/// `clear_refs_write`, and is `ESRCH` once it is gone.
+pub(super) fn clear_refs(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    flags: u32,
+    owner: crate::proc::Owner,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    // Weak, as the file that holds it sits in a descriptor table of theirs.
+    let processes = std::sync::Arc::downgrade(processes);
+    let (pid, tid, thread) = (task.pid, task.tid, task.thread);
+    let memory: crate::proc::CurrentMemory = std::sync::Arc::new(move || {
+        let processes = processes.upgrade().ok_or(Errno(3))?; // ESRCH
+        let view = processes.view(pid).ok_or(Errno(3))?;
+        let member = view.group.threads().iter().any(|&(t, _)| t == tid);
+        if thread && !member && !(view.zombie && tid == pid) {
+            return Err(Errno(3));
+        }
+        if view.zombie {
+            return Ok(None);
+        }
+        Ok(view
+            .group
+            .public(tid)
+            .or_else(|| view.group.public(pid))
+            .and_then(|public| public.memory))
+    });
+    std::sync::Arc::new(crate::proc::ClearRefsFile::open(memory, flags, owner))
+}
 /// Who owns, at each `fstat`, the task's directory, or its `ns` (`open`
 /// false), as Linux's `pid_getattr` asks `task_dump_owner` then: root once
 /// the task is gone.
@@ -588,6 +618,8 @@ pub(super) fn stat(
         TaskEntry::Maps(_) => crate::proc::stat(0),
         // 0400, as Linux's.
         TaskEntry::Pagemap | TaskEntry::Io => crate::proc::private_stat(0),
+        // 0200, as Linux's.
+        TaskEntry::ClearRefs => crate::proc::write_only_stat(),
         // 0644, which their owner may write.
         TaskEntry::IdMap(_) | TaskEntry::Setgroups | TaskEntry::Comm => {
             let length = content(task, entry, &c.process.credentials.user).map_or(0, |c| c.len());

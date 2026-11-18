@@ -971,7 +971,7 @@ pub(crate) fn render(mounts: &[MountPoint], mountinfo: bool, root: &[u8]) -> Vec
 /// `i_uid` and `i_gid`, which `fstat` of an open one shows.
 pub(crate) type Owner = Arc<Mutex<(u32, u32)>>;
 /// `stat` with `owner`'s user and group.
-fn owned(stat: FileStat, owner: &Owner) -> FileStat {
+pub(crate) fn owned(stat: FileStat, owner: &Owner) -> FileStat {
     let (uid, gid) = *owner.lock().unwrap_or_else(PoisonError::into_inner);
     FileStat { uid, gid, ..stat }
 }
@@ -1334,204 +1334,58 @@ const VM_FLAG_NAMES: [&str; 44] = [
 /// Where `maps` pads a line to before its name (Linux's width of
 /// `25 + sizeof(void *) * 6 - 1`).
 const MAPS_NAME_COLUMN: usize = 72;
-/// How much a `read` of `maps` gathers: Linux's `seq_file` buffer, one page
-/// until a single line needs more.
-const MAPS_BUFFER: usize = 4096;
 /// Past the last VMA, as Linux's `m_start` is told by its sentinel.
 const MAPS_END: u64 = u64::MAX;
 
-/// Where a reader of `maps` has got to, as Linux's `seq_file` keeps it.
-struct MapsPosition {
-    /// The bytes gathered but not yet read.
-    pending: Vec<u8>,
-    /// How far into `pending` the reader is.
-    from: usize,
-    /// The start of the next VMA to gather.
-    next: u64,
-    /// The file position.
-    position: u64,
-    /// The size of the buffer, which a long line doubles.
-    buffer: usize,
-}
-
-/// `/proc/<pid>/maps`, generated as it is read from the VMAs of the address
-/// space it was opened on: a read sees the mappings of that moment, from the
-/// address it had reached, whatever they were when it was opened.
-pub(crate) struct MapsFile {
+/// The lines of `/proc/<pid>/maps` ([`maps_file`]), one for each VMA of the
+/// address space it was opened on, by the address it starts at: a read sees
+/// the mappings of that moment, from the address it had reached, whatever
+/// they were when it was opened.
+struct Maps {
     memory: MemoryView,
     start_stack: u64,
     /// It is `smaps`, which follows each line with [`smap_lines`].
     smaps: bool,
     /// The opener's root, from which file names are shown.
     root: Vec<u8>,
-    writable: bool,
-    position: Mutex<MapsPosition>,
-    /// Its inode's owner ([`Self::owned`]).
-    owner: Owner,
 }
-impl MapsFile {
-    pub(crate) fn open(memory: MemoryView, start_stack: u64, flags: u32, root: Vec<u8>) -> Self {
-        Self::open_as(memory, start_stack, flags, root, false)
-    }
-    /// `smaps` rather than `maps` with `smaps`.
-    pub(crate) fn open_as(
-        memory: MemoryView,
-        start_stack: u64,
-        flags: u32,
-        root: Vec<u8>,
-        smaps: bool,
-    ) -> Self {
-        Self {
-            memory,
-            start_stack,
-            smaps,
-            root,
-            writable: flags & 3 != 0,
-            position: Mutex::new(MapsPosition {
-                pending: Vec::new(),
-                from: 0,
-                next: 0,
-                position: 0,
-                buffer: MAPS_BUFFER,
-            }),
-            owner: Arc::default(),
-        }
-    }
-    /// The same, owned by whom its inode's `owner` says when `fstat` asks.
-    pub(crate) fn owned(self, owner: Owner) -> Self {
-        Self { owner, ..self }
-    }
+impl crate::seq::Records for Maps {
     /// The line of the VMA at `next` or after it, and where the next starts.
-    fn take_line(&self, next: u64) -> Option<(Vec<u8>, u64)> {
+    fn record(&self, next: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
         if next == MAPS_END {
-            return None;
+            return Ok(None);
         }
-        let vma = self.memory.vma_from(next)?;
+        let Some(vma) = self.memory.vma_from(next) else {
+            return Ok(None);
+        };
         let after = self.memory.vma_from(vma.end).map_or(MAPS_END, |v| v.start);
         let mut line = map_line(&vma, self.start_stack, &self.root);
         if self.smaps {
             let usage = self.memory.usage(vma.start, vma.end).unwrap_or_default();
             line.extend_from_slice(&smap_lines(&vma, usage));
         }
-        Some((line, after))
-    }
-    /// Gathers whole lines until `wanted` bytes are there or one more would
-    /// fill the buffer, as `seq_read` does; the first always goes in.
-    fn gather(&self, state: &mut MapsPosition, wanted: usize) {
-        state.pending.clear();
-        state.from = 0;
-        while let Some((line, after)) = self.take_line(state.next) {
-            if state.pending.is_empty() {
-                while line.len() >= state.buffer {
-                    state.buffer *= 2;
-                }
-            } else if state.pending.len() + line.len() >= state.buffer {
-                break;
-            }
-            state.pending.extend_from_slice(&line);
-            state.next = after;
-            if state.pending.len() >= wanted {
-                break;
-            }
-        }
-    }
-    /// Starts over and walks to `offset`, as Linux's `traverse`: one past
-    /// the end only reads nothing.
-    fn walk_to(&self, state: &mut MapsPosition, offset: u64) {
-        state.pending.clear();
-        state.from = 0;
-        state.next = 0;
-        if offset == 0 {
-            return;
-        }
-        let mut reached = 0;
-        while let Some((line, after)) = self.take_line(state.next) {
-            state.next = after;
-            let length = line.len() as u64;
-            if reached + length > offset {
-                state.from = (offset - reached) as usize;
-                state.pending = line;
-                return;
-            }
-            reached += length;
-            if reached == offset {
-                return;
-            }
-        }
+        Ok(Some((line, after)))
     }
 }
-impl FileHandle for MapsFile {
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-    fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let mut state = self.position.lock().unwrap_or_else(PoisonError::into_inner);
-        let state = &mut *state;
-        let mut copied = 0;
-        let waiting = &state.pending[state.from..];
-        if !waiting.is_empty() {
-            copied = buf.len().min(waiting.len());
-            buf[..copied].copy_from_slice(&waiting[..copied]);
-            state.from += copied;
-            if state.from < state.pending.len() {
-                state.position += copied as u64;
-                return Ok(copied);
-            }
-        }
-        if copied < buf.len() {
-            self.gather(state, buf.len() - copied);
-            let count = (buf.len() - copied).min(state.pending.len());
-            buf[copied..copied + count].copy_from_slice(&state.pending[..count]);
-            state.from = count;
-            copied += count;
-        }
-        state.position += copied as u64;
-        Ok(copied)
-    }
-    /// It has no write operation: EINVAL, or EBADF on a descriptor opened
-    /// read-only.
-    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
-        Err(if self.writable {
-            Errno::EINVAL
-        } else {
-            Errno::EBADF
-        })
-    }
-    /// As Linux's `seq_lseek`: from the start or the current position, never
-    /// the end, which it does not know.
-    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
-        let mut state = self.position.lock().unwrap_or_else(PoisonError::into_inner);
-        let base = match whence {
-            0 => 0,
-            1 => state.position,
-            _ => return Err(Errno::EINVAL),
-        };
-        let target = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
-        if i64::try_from(target).is_err() {
-            return Err(Errno::EINVAL);
-        }
-        if target != state.position {
-            self.walk_to(&mut state, target);
-            state.position = target;
-        }
-        Ok(target)
-    }
-    /// Size 0, as Linux's /proc: a reader goes by what `read` gives.
-    fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(owned(stat(0), &self.owner))
-    }
-    fn truncate(&self, _: u64) -> Result<(), Errno> {
-        Err(Errno::EINVAL)
-    }
-    fn flock(&self, _: u32) -> Result<(), Errno> {
-        Ok(())
-    }
-    fn flags(&self) -> u32 {
-        0
-    }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
-        Ok(())
-    }
+/// `/proc/<pid>/maps`, or `smaps` with `smaps`, of `memory`, opened with
+/// `flags` and its files named from the opener's `root`: a `seq_file` of
+/// [`Maps`], of size 0 and owned by whom its inode's `owner` says when
+/// `fstat` asks.
+pub(crate) fn maps_file(
+    memory: MemoryView,
+    start_stack: u64,
+    flags: u32,
+    root: Vec<u8>,
+    smaps: bool,
+    owner: Owner,
+) -> crate::seq::SeqFile {
+    let maps = Maps {
+        memory,
+        start_stack,
+        smaps,
+        root,
+    };
+    crate::seq::SeqFile::of_task(Box::new(maps), flags, stat(0), owner)
 }
 
 /// Linux's `TASK_SIZE` with 4-level page tables: where `pagemap` ends.
@@ -1762,94 +1616,24 @@ impl FileHandle for ClearRefsFile {
     }
 }
 
-/// What makes a file's text when it is read ([`ReadTimeFile`]).
+/// What makes a file's text when it is read ([`single_file`]).
 pub(crate) type Text = Arc<dyn Fn() -> Result<Vec<u8>, Errno> + Send + Sync>;
-/// A file whose text is made when it is first read, and again after a seek
-/// to another place, as Linux's `seq_file` of one record (`single_open`)
-/// makes it then, with what its checks say at that moment: `io`.
-pub(crate) struct ReadTimeFile {
-    text: Text,
-    /// The read position, and the text made for it, until a seek.
-    state: Mutex<(u64, Option<Vec<u8>>)>,
-    writable: bool,
-    /// Its inode's owner ([`Owners`]).
-    owner: Owner,
-}
-impl ReadTimeFile {
-    pub(crate) fn open(text: Text, flags: u32, owner: Owner) -> Self {
-        Self {
-            text,
-            state: Mutex::new((0, None)),
-            writable: flags & 3 != 0,
-            owner,
+/// The one record of a [`single_file`].
+struct Single(Text);
+impl crate::seq::Records for Single {
+    fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
+        if index > 0 {
+            return Ok(None);
         }
+        (self.0)().map(|text| Some((text, 1)))
     }
 }
-impl FileHandle for ReadTimeFile {
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-    fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let (position, made) = &mut *state;
-        if made.is_none() {
-            *made = Some((self.text)()?);
-        }
-        let text = made.as_deref().unwrap_or_default();
-        let rest = usize::try_from(*position)
-            .ok()
-            .and_then(|at| text.get(at..))
-            .unwrap_or_default();
-        let count = buf.len().min(rest.len());
-        buf[..count].copy_from_slice(&rest[..count]);
-        *position += count as u64;
-        Ok(count)
-    }
-    /// It has no write operation: EINVAL, or EBADF on a descriptor opened
-    /// read-only.
-    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
-        Err(if self.writable {
-            Errno::EINVAL
-        } else {
-            Errno::EBADF
-        })
-    }
-    /// From the start or from where it is, as `seq_lseek`; a new place
-    /// makes the text again at the next read.
-    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let (position, made) = &mut *state;
-        let base = match whence {
-            0 => 0,
-            1 => *position as i64,
-            _ => return Err(Errno::EINVAL),
-        };
-        let target = base
-            .checked_add(offset)
-            .filter(|target| *target >= 0)
-            .ok_or(Errno::EINVAL)? as u64;
-        if target != *position {
-            *position = target;
-            *made = None;
-        }
-        Ok(target)
-    }
-    /// Size 0 and only its owner may read it, as Linux's (0400).
-    fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(owned(private_stat(0), &self.owner))
-    }
-    fn truncate(&self, _: u64) -> Result<(), Errno> {
-        Err(Errno::EINVAL)
-    }
-    fn flock(&self, _: u32) -> Result<(), Errno> {
-        Ok(())
-    }
-    fn flags(&self) -> u32 {
-        0
-    }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
-        Ok(())
-    }
+/// A file whose text `text` makes when it is first read, and again after a
+/// seek to another place, as Linux's `seq_file` of one record
+/// (`single_open`) makes it then, with what its checks say at that moment:
+/// `io`. Size 0 and only its owner may read it, as Linux's (0400).
+pub(crate) fn single_file(text: Text, flags: u32, owner: Owner) -> crate::seq::SeqFile {
+    crate::seq::SeqFile::of_task(Box::new(Single(text)), flags, private_stat(0), owner)
 }
 
 #[cfg(test)]
@@ -1858,7 +1642,7 @@ mod tests {
     use paludarium_mmu::{AddressSpace, MappingKind};
     use paludarium_types::GuestAddr;
 
-    fn read_all(file: &MapsFile, piece: usize) -> Vec<u8> {
+    fn read_all(file: &crate::seq::SeqFile, piece: usize) -> Vec<u8> {
         let mut all = Vec::new();
         let mut buf = vec![0; piece];
         loop {
@@ -1880,7 +1664,14 @@ mod tests {
             .unwrap();
         mem.map(at(0x7fff0000), 0x1000, Prot::READ_WRITE, MappingKind::Stack)
             .unwrap();
-        let file = MapsFile::open(mem.view(), 0x7fff0800, 0, b"/".to_vec());
+        let file = maps_file(
+            mem.view(),
+            0x7fff0800,
+            0,
+            b"/".to_vec(),
+            false,
+            Owner::default(),
+        );
         assert_eq!(
             String::from_utf8(read_all(&file, 4096)).unwrap(),
             format!(
@@ -2092,7 +1883,14 @@ mod tests {
             Some(paludarium_mmu::Lock::OnFault),
         )
         .unwrap();
-        let file = MapsFile::open_as(mem.view(), 0x7fff0800, 0, b"/".to_vec(), true);
+        let file = maps_file(
+            mem.view(),
+            0x7fff0800,
+            0,
+            b"/".to_vec(),
+            true,
+            Owner::default(),
+        );
         let text = String::from_utf8(read_all(&file, 4096)).unwrap();
         let blocks: Vec<&str> = text.split_inclusive("VmFlags:").collect();
         assert!(
@@ -2210,7 +2008,7 @@ mod tests {
         };
         map(0x10000);
         map(0x30000);
-        let file = MapsFile::open(mem.view(), 0, 0, b"/".to_vec());
+        let file = maps_file(mem.view(), 0, 0, b"/".to_vec(), false, Owner::default());
         let mut buf = [0; 10];
         assert_eq!(file.read(&mut buf).unwrap(), 10);
         // The reader goes on from the VMA it found next, as Linux's does:
@@ -2239,13 +2037,13 @@ mod tests {
             )
             .unwrap();
         }
-        let file = MapsFile::open(mem.view(), 0, 0, b"/".to_vec());
+        let file = maps_file(mem.view(), 0, 0, b"/".to_vec(), false, Owner::default());
         let whole = read_all(&file, 1 << 16);
         assert_eq!(whole.len(), 200 * 41);
         file.seek(0, 0).unwrap();
         let mut big = vec![0; 1 << 16];
         let first = file.read(&mut big).unwrap();
-        assert!((MAPS_BUFFER - 41..MAPS_BUFFER).contains(&first), "{first}");
+        assert!((4096 - 41..4096).contains(&first), "{first}");
         assert_eq!(big[first - 1], b'\n');
         // Going forward lands within a line, and past the end reads nothing.
         assert_eq!(file.seek(45, 0).unwrap(), 45);
@@ -2259,7 +2057,7 @@ mod tests {
         assert_eq!(file.stat().unwrap().size, 0);
         assert_eq!(file.write(b"x"), Err(Errno::EBADF));
         assert_eq!(
-            MapsFile::open(mem.view(), 0, 2, b"/".to_vec()).write(b"x"),
+            maps_file(mem.view(), 0, 2, b"/".to_vec(), false, Owner::default()).write(b"x"),
             Err(Errno::EINVAL)
         );
     }
@@ -2269,7 +2067,7 @@ mod tests {
         let mem = AddressSpace::new();
         mem.map_shared(None, 0x1000, Prot::READ, MappingKind::Anonymous)
             .unwrap();
-        let file = MapsFile::open(mem.view(), 0, 0, b"/".to_vec());
+        let file = maps_file(mem.view(), 0, 0, b"/".to_vec(), false, Owner::default());
         drop(mem);
         assert_eq!(file.read(&mut [0; 16]).unwrap(), 0);
     }

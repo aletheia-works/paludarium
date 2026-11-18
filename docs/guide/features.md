@@ -2950,13 +2950,14 @@ kernel.
   process's adds those of its threads, of its threads that have ended, and
   of the children it reaped with `wait` (with theirs), as Linux's
   `do_io_accounting` and `wait_task_zombie` add them; a forked child starts
-  from 0, and a zombie keeps its counts. The text is made when it is read
-  (and again after a seek elsewhere), as Linux's `seq_file` makes it, and
-  only then, as Linux's `ptrace_may_access` decides with the reader's
+  from 0, and a zombie keeps its counts. The text is made when it is read,
+  and when an `lseek` goes to another place, as Linux's `seq_file` makes
+  it. Only then, as Linux's `ptrace_may_access` decides with the reader's
   filesystem IDs, may a reader that is not of the process read it
   (`EACCES`), so a descriptor opened while the process was dumpable cannot
   read it once it is not; a thread or process that has been reaped since
-  is `ESRCH`.
+  is `ESRCH`. An `lseek` that fails so leaves the file at the start, as
+  Linux's `seq_lseek` does.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0

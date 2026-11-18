@@ -366,10 +366,14 @@ pub(super) fn maps(
     owner: crate::proc::Owner,
 ) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
     match task.memory() {
-        Some(memory) => std::sync::Arc::new(
-            crate::proc::MapsFile::open_as(memory.clone(), task.start_stack(), flags, root, smaps)
-                .owned(owner),
-        ),
+        Some(memory) => std::sync::Arc::new(crate::proc::maps_file(
+            memory.clone(),
+            task.start_stack(),
+            flags,
+            root,
+            smaps,
+            owner,
+        )),
         None => std::sync::Arc::new(
             crate::proc::GeneratedFile::open(Vec::new(), flags)
                 .with_stat(crate::proc::stat(0))
@@ -500,7 +504,7 @@ pub(super) fn io(
             view.group.io(thread.then_some(tid)),
         ))
     });
-    std::sync::Arc::new(crate::proc::ReadTimeFile::open(text, flags, owner))
+    std::sync::Arc::new(crate::proc::single_file(text, flags, owner))
 }
 /// The group of the task and the thread a write to its `comm` renames.
 pub(super) fn comm(task: &Task) -> (std::sync::Arc<crate::threads::ThreadGroup>, u32, u32) {

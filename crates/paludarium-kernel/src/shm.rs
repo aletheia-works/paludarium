@@ -772,12 +772,12 @@ struct ProcRecords {
     user: crate::users::UserNs,
 }
 impl crate::seq::Records for ProcRecords {
-    fn record(&self, index: u64) -> Option<(Vec<u8>, u64)> {
+    fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
         const HEADER: &str = "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
         let (space, user) = (&self.space, &self.user);
         let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
         let table = self.shm.lock();
-        ipc::proc_record(&table.segments, HEADER, index, |s| {
+        Ok(ipc::proc_record(&table.segments, HEADER, index, |s| {
             let perm = &s.perm;
             format!(
                 "{:10} {:10}  {:4o} {:21} {:5} {:5}  {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}\n",
@@ -798,7 +798,7 @@ impl crate::seq::Records for ProcRecords {
                 s.memory.resident() * PAGE,
                 0,
             )
-        })
+        }))
     }
 }
 

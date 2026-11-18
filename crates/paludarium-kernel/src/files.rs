@@ -2306,9 +2306,7 @@ fn positioned(
 /// Linux's /proc does and end where their `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file.as_any().is_some_and(|file| {
-        file.is::<crate::proc::MapsFile>()
-            || file.is::<crate::proc::PagemapFile>()
-            || file.is::<crate::proc::ReadTimeFile>()
+        file.is::<crate::proc::PagemapFile>()
             || crate::sysctl::is_file(file)
             || crate::seq::is_file(file)
             || file
@@ -6925,25 +6923,16 @@ fn open_path(
             | crate::proc::OwnEntry::Exe
             | crate::proc::OwnEntry::Cwd
             | crate::proc::OwnEntry::Root => return Err(Errno::ENOENT),
-            crate::proc::OwnEntry::Maps => Arc::new(
-                crate::proc::MapsFile::open(
+            crate::proc::OwnEntry::Maps | crate::proc::OwnEntry::Smaps => {
+                Arc::new(crate::proc::maps_file(
                     c.mem.view(),
                     c.group.start_stack(),
                     flags,
                     c.files.root(),
-                )
-                .owned(owner),
-            ),
-            crate::proc::OwnEntry::Smaps => Arc::new(
-                crate::proc::MapsFile::open_as(
-                    c.mem.view(),
-                    c.group.start_stack(),
-                    flags,
-                    c.files.root(),
-                    true,
-                )
-                .owned(owner),
-            ),
+                    entry == crate::proc::OwnEntry::Smaps,
+                    owner,
+                ))
+            }
             crate::proc::OwnEntry::Pagemap => {
                 Arc::new(crate::proc::PagemapFile::open(c.mem.view(), flags, owner))
             }

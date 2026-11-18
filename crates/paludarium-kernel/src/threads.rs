@@ -2361,6 +2361,9 @@ impl Kernel {
         state.on_cpu = None;
         state.rseq_notify = false;
         let inbox = Arc::new(SignalInbox::default());
+        // Its registers are a copy of this thread's in this call, as Linux's
+        // `copy_thread` copies `pt_regs` (`/proc/<pid>/syscall`).
+        inbox.enter_kernel(self.inbox.entry());
         let mut child = Kernel {
             host: self.host.clone(),
             process: self.process.clone(),

@@ -2978,7 +2978,9 @@ kernel.
   instruction), in hex, or `-1` and the two pointers for an entry that was
   no call (a stop from user code). A thread that has ended has no kernel
   stack left: `-1 0x0 0x0`. Each thread records the registers as it enters
-  the kernel, with a few plain stores that another reads whole.
+  the kernel, with a few plain stores that another reads whole; a new
+  thread or child starts with its parent's in the call that made it, as
+  Linux's `copy_thread` copies them.
 - `io` of a process or of a thread (`/proc/<pid>/task/<tid>/io`), 0400 and
   of size 0, has the counts Linux's `task_io_accounting` keeps: `rchar` and
   `wchar`, the bytes the read and write calls moved (`read`, `pread64`,

@@ -6525,3 +6525,14 @@ mod robust_lists {
         assert_eq!(get(&mut k, &mut t, &m, other).0, esrch);
     }
 }
+/// A new task's kernel entry is its parent's in the call that made it, as
+/// Linux's `copy_thread` copies `pt_regs`: what `/proc/<pid>/syscall` of a
+/// child shows before it enters the kernel itself.
+#[test]
+fn a_child_starts_with_the_entry_of_the_call_that_made_it() {
+    let (mut k, mut t, m) = setup();
+    let (child, _, _) = fork(&mut k, &mut t, &m);
+    let entry = child.inbox.entry();
+    assert_eq!(entry.number, 57);
+    assert_eq!(entry, k.inbox.entry());
+}

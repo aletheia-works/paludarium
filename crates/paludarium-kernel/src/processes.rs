@@ -3295,6 +3295,9 @@ impl Kernel {
             group.exec_actions();
         }
         let inbox = Arc::new(SignalInbox::default());
+        // The child's registers are a copy of the parent's in this call,
+        // as Linux's `copy_thread` copies `pt_regs` (`/proc/<pid>/syscall`).
+        inbox.enter_kernel(self.inbox.entry());
         group.set_process_inbox(inbox.clone());
         if let Some(value) = self.group.nice(parent.tid) {
             group.set_nice(pid, if reset_nice { 0 } else { value });

@@ -1840,6 +1840,15 @@ fn sys_write(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if !c.files.uses_original_stdio(a[0]) {
         return crate::files::dispatch(c, a);
     }
+    let outcome = write_stdio(c, a);
+    // Counted as any write is ([`crate::files::dispatch`]).
+    if let Outcome::Return(ret) = outcome {
+        crate::io_accounting::account(c, 1, a, ret);
+    }
+    outcome
+}
+/// `write` to the host's stdout or stderr.
+fn write_stdio(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let (fd, buf, count) = (a[0], a[1], a[2].min(MAX_RW_COUNT));
     // Only stdout and stderr are connected in the core emulator.
     let write: fn(&dyn Host, &[u8]) -> Result<usize, Errno> = match fd {

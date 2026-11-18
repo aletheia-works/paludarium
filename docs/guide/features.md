@@ -2814,12 +2814,12 @@ kernel.
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
   `limits`, `comm`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
-  `smaps`, `pagemap`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
+  `smaps`, `pagemap`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them; the directory, `task` and `fdinfo` (0555) are the process's
   either way, and `/proc/self` itself is root's. `stat` shows that owner and
-  the mode, 0400 for `environ`, `auxv` and `pagemap`, 0644 for `comm` and 0444 for the other files.
+  the mode, 0400 for `environ`, `auxv`, `pagemap` and `io`, 0644 for `comm` and 0444 for the other files.
   `fstat` of an open file shows its owner as of the last lookup of its path
   (an open, a `stat`, by any process), as Linux's inode, which each lookup
   of the path an open file pins brings up to date (`pid_revalidate`); of
@@ -2858,7 +2858,7 @@ kernel.
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
   `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`,
-  `comm`, `maps`, `smaps`, `pagemap` (0400), `exe`, `cwd`, `root`, `mounts`,
+  `comm`, `maps`, `smaps`, `pagemap` (0400), `io` (0400), `exe`, `cwd`, `root`, `mounts`,
   `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
@@ -2906,6 +2906,29 @@ kernel.
   `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
   their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
   process with no memory before they check the reader.
+- `io` of a process or of a thread (`/proc/<pid>/task/<tid>/io`), 0400 and
+  of size 0, has the counts Linux's `task_io_accounting` keeps: `rchar` and
+  `wchar`, the bytes the read and write calls moved (`read`, `pread64`,
+  `readv`, `preadv`, `preadv2`, the writes, and both for `sendfile` and
+  `copy_file_range`, writes to the host's stdout and stderr too), and
+  `syscr` and `syscw`, how many of them ran: a call that failed in the
+  file's own read or write counts, one refused before it does not, as
+  Linux's `vfs_read`, `do_readv` and `do_preadv` each decide (`readv`
+  counts even a bad descriptor, `pread64` not a file without a position).
+  `splice`, `tee`, `vmsplice`, the `recv` and `send` families and `io_uring`
+  count nothing, as on Linux. `read_bytes`, `write_bytes` and
+  `cancelled_write_bytes` are 0, as on a Linux whose files are all in
+  memory: there is no block device. A thread's file has its own counts; the
+  process's adds those of its threads, of its threads that have ended, and
+  of the children it reaped with `wait` (with theirs), as Linux's
+  `do_io_accounting` and `wait_task_zombie` add them; a forked child starts
+  from 0, and a zombie keeps its counts. The text is made when it is read
+  (and again after a seek elsewhere), as Linux's `seq_file` makes it, and
+  only then, as Linux's `ptrace_may_access` decides with the reader's
+  filesystem IDs, may a reader that is not of the process read it
+  (`EACCES`), so a descriptor opened while the process was dumpable cannot
+  read it once it is not; a thread or process that has been reaped since
+  is `ESRCH`.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0

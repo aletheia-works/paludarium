@@ -149,9 +149,9 @@ mod linux {
             // to one an unprivileged user makes) before it becomes one,
             // the personality-layout case, which maps page 0, the
             // proc-other-maps, proc-other-fds, proc-other-limits,
-            // proc-other-pagemap and proc-owner-rename cases, which read a
-            // process's maps, descriptors, auxv and pagemap as other users
-            // or make it another user's, and the pagemap
+            // proc-other-pagemap, proc-owner-rename and proc-io cases, which
+            // read a process's maps, descriptors, auxv, pagemap and io as
+            // other users or make it another user's, and the pagemap
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, as the emulator's guest starts as root.
@@ -175,6 +175,7 @@ mod linux {
                     | "proc-other-limits"
                     | "proc-other-pagemap"
                     | "proc-owner-rename"
+                    | "proc-io"
                     | "dynamic-exec"
                     | "pty-vhangup"
                     | "pid-namespace"
@@ -803,6 +804,7 @@ mod linux {
         processes_proc_other_limits => ("proc-other-limits","process"),
         processes_proc_other_pagemap => ("proc-other-pagemap","process"),
         processes_proc_owner_rename => ("proc-owner-rename","process"),
+        processes_proc_io => ("proc-io","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),
         processes_timer_limits => ("timer-limits","process"),

@@ -2441,11 +2441,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
   `limits`、`comm`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`smaps`、`pagemap`、
-  `fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
+  `io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
   プロセスのもので、`/proc/self` そのものは root のものです。`stat` は
-  その持ち主とモード（`environ`、`auxv`、`pagemap` は 0400、`comm` は 0644、ほかのファイルは 0444）を示します。
+  その持ち主とモード（`environ`、`auxv`、`pagemap`、`io` は 0400、`comm` は 0644、ほかのファイルは 0444）を示します。
   開いたファイルの `fstat` は、そのパスを最後に探したとき（どのプロセスの open や `stat` でも）の
   持ち主を示します。Linux の inode と同じで、開いたファイルが押さえるパスを探すたびに新しく
   なります（`pid_revalidate`）。開いたディレクトリとその `ns` の `fstat` は、Linux の
@@ -2476,7 +2476,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
   `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`comm`、
-  `maps`、`smaps`、`pagemap`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `maps`、`smaps`、`pagemap`（0400）、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
   `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
@@ -2517,6 +2517,25 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ゾンビの `maps` と `smaps` は、モードが許すどの読み手も開けます。Linux の `__mem_open` と
   `pagemap_open` は、読み手を確かめる前にメモリのないプロセスを断るので、ゾンビの
   `environ`、`auxv`、`pagemap` は、モードが許すどの読み手にも開けません（`ESRCH`）。
+- プロセスやスレッドの `io`（`/proc/<pid>/task/<tid>/io`）は 0400 で大きさは 0 で、
+  Linux の `task_io_accounting` が数えるものを示します。`rchar` と `wchar` は読み書きの
+  呼び出し（`read`、`pread64`、`readv`、`preadv`、`preadv2`、それらの書き込み版、
+  `sendfile` と `copy_file_range` は両方、ホストの stdout と stderr への書き込みも）が
+  動かしたバイト数、`syscr` と `syscw` はその呼び出しの数です。Linux の `vfs_read`、
+  `do_readv`、`do_preadv` がそれぞれ決めるとおり、ファイル自身の読み書きで失敗した
+  呼び出しは数え、その前に断られたものは数えません（`readv` は不正なディスクリプタも
+  数え、`pread64` は位置のないファイルを数えません）。`splice`、`tee`、`vmsplice`、
+  `recv` と `send` の仲間、`io_uring` は、Linux と同じく何も数えません。`read_bytes`、
+  `write_bytes`、`cancelled_write_bytes` は、ファイルがすべてメモリにある Linux と同じく
+  0 です。ブロックデバイスがないからです。スレッドのファイルはそのスレッドの数を示し、
+  プロセスのファイルは、Linux の `do_io_accounting` と `wait_task_zombie` と同じく、
+  スレッド、終わったスレッド、`wait` で回収した子（とその子たちのもの）の数を足します。
+  `fork` した子は 0 から始まり、ゾンビは数を残します。中身は、Linux の `seq_file` と
+  同じく読んだとき（とほかの位置へ seek した後）に作り、そのとき Linux の
+  `ptrace_may_access` が読み手のファイルシステムの ID で決めるとおり、そのプロセスの
+  ものでない読み手が読めるかを確かめます（`EACCES`）。そのため、ダンプできる間に開いた
+  ディスクリプタでも、ダンプできなくなった後は読めません。その後に回収された
+  スレッドやプロセスは `ESRCH` です。
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、

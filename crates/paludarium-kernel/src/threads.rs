@@ -135,6 +135,12 @@ pub struct ThreadGroup {
     /// The names a write to `comm` gave threads, which each takes at its
     /// next system call or checkpoint (Linux's `set_task_comm` of it).
     renames: Mutex<BTreeMap<u32, [u8; 16]>>,
+    /// The read and write counts of each thread, and of the threads and
+    /// reaped children that are gone (Linux's `signal->ioac`).
+    io: Mutex<(
+        BTreeMap<u32, crate::io_accounting::Io>,
+        crate::io_accounting::Io,
+    )>,
     /// The process is the init of a nested PID namespace, which takes only
     /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
     /// SIGNAL_UNKILLABLE), until a fault ends it.
@@ -254,6 +260,7 @@ impl Default for ThreadGroup {
             exe_file: Mutex::default(),
             public: Mutex::default(),
             renames: Mutex::default(),
+            io: Mutex::default(),
             unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
@@ -541,6 +548,18 @@ impl ThreadGroup {
         }
         public.retain(|&tid, _| tid == pid);
         drop(public);
+        // The thread that ran it keeps its counts as the leader; the others
+        // added theirs to the process's when they ended.
+        let mut io = self.io.lock().unwrap_or_else(PoisonError::into_inner);
+        let (threads, gone) = &mut *io;
+        let kept = threads.remove(&old_tid);
+        for (_, counts) in std::mem::take(threads) {
+            gone.add(counts);
+        }
+        if let Some(counts) = kept {
+            threads.insert(pid, counts);
+        }
+        drop(io);
         // A rename of a thread execve ended, which must not name the new
         // program when the thread that ran it takes the leader's TID; that
         // thread took its own at the system call's entry.
@@ -1439,6 +1458,45 @@ impl ThreadGroup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tid);
+        // Its counts join the process's, as `__exit_signal` adds them.
+        let mut io = self.io.lock().unwrap_or_else(PoisonError::into_inner);
+        let (threads, gone) = &mut *io;
+        if let Some(counts) = threads.remove(&tid) {
+            gone.add(counts);
+        }
+    }
+    /// Counts `io` for thread `tid`.
+    pub(crate) fn account_io(&self, tid: u32, io: crate::io_accounting::Io) {
+        self.io
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+            .entry(tid)
+            .or_default()
+            .add(io);
+    }
+    /// The counts of thread `tid`, or with `None` of the whole process: its
+    /// threads' and those of the threads and reaped children that are gone,
+    /// as Linux's `do_io_accounting` sums them.
+    pub(crate) fn io(&self, tid: Option<u32>) -> crate::io_accounting::Io {
+        let io = self.io.lock().unwrap_or_else(PoisonError::into_inner);
+        let (threads, gone) = &*io;
+        match tid {
+            Some(tid) => threads.get(&tid).copied().unwrap_or_default(),
+            None => threads.values().fold(*gone, |mut sum, &counts| {
+                sum.add(counts);
+                sum
+            }),
+        }
+    }
+    /// Adds the counts of a reaped child, as `wait_task_zombie` adds them
+    /// to its parent's.
+    pub(crate) fn reaped_io(&self, child: crate::io_accounting::Io) {
+        self.io
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .1
+            .add(child);
     }
     /// Publishes what thread `tid` shows in `/proc`.
     pub(crate) fn publish(&self, tid: u32, thread: PublicThread) {

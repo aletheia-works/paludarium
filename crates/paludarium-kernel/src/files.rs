@@ -2193,13 +2193,14 @@ fn positioned(
     }
     Ok(file)
 }
-/// Where reads of a regular file stop: at its size, but for `maps` and
-/// `smaps`, and /proc's system-wide files, which say 0 as Linux's /proc
-/// does and end where their `read` does.
+/// Where reads of a regular file stop: at its size, but for `maps`,
+/// `smaps`, `pagemap`, `io` and /proc's system-wide files, which say 0 as
+/// Linux's /proc does and end where their `read` does.
 fn read_limit(file: &Arc<dyn FileHandle>, metadata: &FileStat) -> u64 {
     if file.as_any().is_some_and(|file| {
         file.is::<crate::proc::MapsFile>()
             || file.is::<crate::proc::PagemapFile>()
+            || file.is::<crate::proc::ReadTimeFile>()
             || crate::sysctl::is_file(file)
             || file
                 .downcast_ref::<crate::proc::GeneratedFile>()
@@ -4322,10 +4323,12 @@ pub(crate) fn dispatch(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if c.files.caches.notify.watching() {
         accessed(c, n, a, &result);
     }
-    match result {
-        Ok(v) => Outcome::Return(v),
-        Err(e) => Outcome::Return(e.to_syscall_return()),
-    }
+    let ret = match result {
+        Ok(v) => v,
+        Err(e) => e.to_syscall_return(),
+    };
+    crate::io_accounting::account(c, n, a, ret);
+    Outcome::Return(ret)
 }
 /// The inotify events of a call that read or wrote files, as Linux's
 /// `fsnotify_access` and `fsnotify_modify` follow them: a read or write that
@@ -6622,6 +6625,9 @@ fn open_path(
         }
         if path.entry == crate::proc::TaskEntry::Pagemap {
             return Ok((tasks::pagemap(&task, flags, owner)?, p.to_vec()));
+        }
+        if path.entry == crate::proc::TaskEntry::Io {
+            return Ok((tasks::io(c.processes, &task, flags, owner), p.to_vec()));
         }
         // A link of `fd` opens its descriptor's file again, as this
         // process's own does.

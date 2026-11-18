@@ -32,6 +32,7 @@ mod files;
 mod filesystems;
 mod inet;
 mod interface;
+mod io_accounting;
 mod io_uring;
 mod ipc;
 mod kcmp;
@@ -603,7 +604,7 @@ impl Kernel {
     ) -> Option<Next> {
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
-        proc::enter(thread.state.pid);
+        proc::enter(thread.state.pid, thread.tid);
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number,
@@ -648,7 +649,7 @@ impl Kernel {
     ) -> Next {
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
-        proc::enter(thread.state.pid);
+        proc::enter(thread.state.pid, thread.tid);
         signalfd::observe(&thread.state, &self.inbox, &self.group);
         let mut ctx = syscalls::Context {
             number: 0,
@@ -1393,7 +1394,7 @@ impl Kernel {
         };
         memfd::enter(self.group.memlock());
         fanotify::enter(thread.state.pid, thread.tid);
-        proc::enter(thread.state.pid);
+        proc::enter(thread.state.pid, thread.tid);
         // A rename through `comm` comes before what the call does, as
         // Linux's takes effect when it is written.
         if let Some(name) = self.group.take_rename(thread.tid) {

@@ -86,10 +86,15 @@ verified.
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has, ...) and the other names in
-  the reader's own directory (`io`, `personality`, ...) are looked up like any
+  the reader's own directory (`personality`, `wchan`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `io`, `wchan`
-  and the rest. A path that goes on through a link of another process's `fd`
+  process's directory they are `ENOENT`, where Linux shows root `wchan`
+  and the rest. `io` does not count what Linux's `kernel_read` and
+  `kernel_write` count for the process (`execve` reading its program and
+  interpreter, a core dump's writes), and a read or write that fails with
+  an errno Linux gives both before and in the file's operation (`EINVAL`,
+  `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
+  so not counted. A path that goes on through a link of another process's `fd`
   (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
   directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
   time are 0, so `ps` shows no `RSS`, and its `STIME` and

@@ -426,6 +426,52 @@ pub(crate) fn own_live_owner(
         }
     })
 }
+/// `io` of the task: its counts, of the thread or of the whole process,
+/// made when it is read, as Linux's `do_io_accounting`. The reader then must
+/// be of its process or one `ptrace_may_access` lets read it with its file
+/// system IDs (`EACCES`), and a task that has been reaped is `ESRCH`. A
+/// zombie's memory is gone, so its dumpable flag no longer matters.
+pub(super) fn io(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    flags: u32,
+    owner: crate::proc::Owner,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    // Weak, as the file that holds it sits in a descriptor table of theirs.
+    let processes = std::sync::Arc::downgrade(processes);
+    let (pid, tid, thread) = (task.pid, task.tid, task.thread);
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        let processes = processes.upgrade().ok_or(Errno(3))?; // ESRCH
+        let view = processes.view(pid).ok_or(Errno(3))?;
+        let member = view.group.threads().iter().any(|&(t, _)| t == tid);
+        if thread && !member && !(view.zombie && tid == pid) {
+            return Err(Errno(3));
+        }
+        let (reader_pid, reader_tid) = crate::proc::caller();
+        if reader_pid != pid {
+            let target = view
+                .group
+                .public(tid)
+                .or_else(|| view.group.public(pid))
+                .unwrap_or_default();
+            let reader = processes
+                .view(reader_pid)
+                .and_then(|reader| reader.group.public(reader_tid))
+                .ok_or(Errno::EACCES)?;
+            if !reader.credentials.may_read_task(
+                &target.credentials,
+                view.dumpable || view.zombie,
+                false,
+            ) {
+                return Err(Errno::EACCES);
+            }
+        }
+        Ok(crate::io_accounting::render(
+            view.group.io(thread.then_some(tid)),
+        ))
+    });
+    std::sync::Arc::new(crate::proc::ReadTimeFile::open(text, flags, owner))
+}
 /// The group of the task and the thread a write to its `comm` renames.
 pub(super) fn comm(task: &Task) -> (std::sync::Arc<crate::threads::ThreadGroup>, u32, u32) {
     (std::sync::Arc::clone(&task.view.group), task.pid, task.tid)
@@ -541,7 +587,7 @@ pub(super) fn stat(
         // As Linux's, of size 0, as they are made as they are read.
         TaskEntry::Maps(_) => crate::proc::stat(0),
         // 0400, as Linux's.
-        TaskEntry::Pagemap => crate::proc::private_stat(0),
+        TaskEntry::Pagemap | TaskEntry::Io => crate::proc::private_stat(0),
         // 0644, which their owner may write.
         TaskEntry::IdMap(_) | TaskEntry::Setgroups | TaskEntry::Comm => {
             let length = content(task, entry, &c.process.credentials.user).map_or(0, |c| c.len());

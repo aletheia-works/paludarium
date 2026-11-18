@@ -109,7 +109,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 23] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 24] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -130,12 +130,13 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 23] = [
     (b"mountinfo", 8),
     (b"smaps", 8),
     (b"pagemap", 8),
+    (b"io", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 23] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 24] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -156,6 +157,7 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 23] = [
     (b"mountinfo", 8),
     (b"smaps", 8),
     (b"pagemap", 8),
+    (b"io", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
@@ -186,6 +188,8 @@ pub(crate) enum TaskEntry {
     Maps(bool),
     /// `pagemap`, the entry of each page of its address space.
     Pagemap,
+    /// `io`, the counts of its reads and writes.
+    Io,
     /// `fd`, and one of its links by descriptor number.
     Descriptors,
     Descriptor(u32),
@@ -253,6 +257,7 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"maps" => TaskEntry::Maps(false),
         b"smaps" => TaskEntry::Maps(true),
         b"pagemap" => TaskEntry::Pagemap,
+        b"io" => TaskEntry::Io,
         b"mounts" => TaskEntry::Mounts(false),
         b"mountinfo" => TaskEntry::Mounts(true),
         b"ns" => TaskEntry::Namespaces,
@@ -285,13 +290,13 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
         [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
         // The process's own `ns`, user namespace files, mount tables,
-        // `auxv`, `limits` and `statm` are here (`/proc/self/mountinfo` and
-        // `mounts` are [`mount_table`]'s); the rest of its own directory is
-        // `own_entry`'s.
+        // `auxv`, `limits`, `statm` and `io` are here (`/proc/self/mountinfo`
+        // and `mounts` are [`mount_table`]'s); the rest of its own directory
+        // is `own_entry`'s.
         [b"ns", ..]
         | [
             b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo" | b"auxv" | b"limits"
-            | b"statm",
+            | b"statm" | b"io",
         ] => (None, entry(&parts)),
         _ if pid == own => return None,
         [] => (None, TaskEntry::Directory),
@@ -1006,13 +1011,19 @@ pub(crate) fn dentry(path: &[u8], own: u32, own_tid: u32) -> Option<Dentry> {
 }
 
 thread_local! {
-    /// The process whose system call runs on this host thread, which a write
-    /// to `comm` asks of its writer (Linux's `current`).
-    static WRITER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The process and thread whose system call runs on this host thread,
+    /// which a write to `comm` and a read of `io` ask of their caller
+    /// (Linux's `current`).
+    static CALLER: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
-/// Records, as a system call starts, the process `pid` it is of.
-pub(crate) fn enter(pid: u32) {
-    WRITER.with(|writer| writer.set(pid));
+/// Records, as a system call starts, the process `pid` and thread `tid` it
+/// is of.
+pub(crate) fn enter(pid: u32, tid: u32) {
+    CALLER.with(|caller| caller.set((pid, tid)));
+}
+/// The process and thread of the system call running ([`enter`]).
+pub(crate) fn caller() -> (u32, u32) {
+    CALLER.with(std::cell::Cell::get)
 }
 
 /// A file whose contents were fixed when it was opened.
@@ -1123,7 +1134,7 @@ impl FileHandle for GeneratedFile {
         if !comm.group.threads().iter().any(|&(tid, _)| tid == comm.tid) {
             return Err(Errno(3)); // ESRCH
         }
-        if WRITER.with(std::cell::Cell::get) != comm.pid {
+        if caller().0 != comm.pid {
             return Err(Errno::EINVAL);
         }
         let mut name = [0; 16];
@@ -1595,6 +1606,96 @@ impl FileHandle for PagemapFile {
             _ => return Err(Errno::EINVAL),
         };
         Ok(*position)
+    }
+    /// Size 0 and only its owner may read it, as Linux's (0400).
+    fn stat(&self) -> Result<FileStat, Errno> {
+        Ok(owned(private_stat(0), &self.owner))
+    }
+    fn truncate(&self, _: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
+    fn flock(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn flags(&self) -> u32 {
+        0
+    }
+    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+}
+
+/// What makes a file's text when it is read ([`ReadTimeFile`]).
+pub(crate) type Text = Arc<dyn Fn() -> Result<Vec<u8>, Errno> + Send + Sync>;
+/// A file whose text is made when it is first read, and again after a seek
+/// to another place, as Linux's `seq_file` of one record (`single_open`)
+/// makes it then, with what its checks say at that moment: `io`.
+pub(crate) struct ReadTimeFile {
+    text: Text,
+    /// The read position, and the text made for it, until a seek.
+    state: Mutex<(u64, Option<Vec<u8>>)>,
+    writable: bool,
+    /// Its inode's owner ([`Owners`]).
+    owner: Owner,
+}
+impl ReadTimeFile {
+    pub(crate) fn open(text: Text, flags: u32, owner: Owner) -> Self {
+        Self {
+            text,
+            state: Mutex::new((0, None)),
+            writable: flags & 3 != 0,
+            owner,
+        }
+    }
+}
+impl FileHandle for ReadTimeFile {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (position, made) = &mut *state;
+        if made.is_none() {
+            *made = Some((self.text)()?);
+        }
+        let text = made.as_deref().unwrap_or_default();
+        let rest = usize::try_from(*position)
+            .ok()
+            .and_then(|at| text.get(at..))
+            .unwrap_or_default();
+        let count = buf.len().min(rest.len());
+        buf[..count].copy_from_slice(&rest[..count]);
+        *position += count as u64;
+        Ok(count)
+    }
+    /// It has no write operation: EINVAL, or EBADF on a descriptor opened
+    /// read-only.
+    fn write(&self, _: &[u8]) -> Result<usize, Errno> {
+        Err(if self.writable {
+            Errno::EINVAL
+        } else {
+            Errno::EBADF
+        })
+    }
+    /// From the start or from where it is, as `seq_lseek`; a new place
+    /// makes the text again at the next read.
+    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (position, made) = &mut *state;
+        let base = match whence {
+            0 => 0,
+            1 => *position as i64,
+            _ => return Err(Errno::EINVAL),
+        };
+        let target = base
+            .checked_add(offset)
+            .filter(|target| *target >= 0)
+            .ok_or(Errno::EINVAL)? as u64;
+        if target != *position {
+            *position = target;
+            *made = None;
+        }
+        Ok(target)
     }
     /// Size 0 and only its owner may read it, as Linux's (0400).
     fn stat(&self) -> Result<FileStat, Errno> {

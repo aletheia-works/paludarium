@@ -11182,6 +11182,261 @@ static int proc_other_pagemap_case(void) {
     munmap(seen, 4096);
     return 0;
 }
+/* The proc-io case: /proc/<pid>/io, the counts Linux keeps of a task's
+   reads and writes (task_io_accounting): what the read and write calls
+   moved and how many ran, for a thread or its whole process, with the
+   threads and reaped children that are gone, and who may read it. The
+   storage counts stay 0 for memory files, as here. */
+struct pio {
+    long long v[7];
+    long bytes;
+};
+/* Reads `path` once into `out`: 0, or -errno of its open or read. */
+static int pio_read_fd(int fd, struct pio *out) {
+    char text[512];
+    ssize_t n = read(fd, text, sizeof text - 1);
+    if (n < 0) return -errno;
+    text[n] = 0;
+    out->bytes = n;
+    memset(out->v, -1, sizeof out->v);
+    sscanf(text,
+           "rchar: %lld\nwchar: %lld\nsyscr: %lld\nsyscw: %lld\nread_bytes: %lld\nwrite_bytes: %lld\n"
+           "cancelled_write_bytes: %lld\n",
+           &out->v[0], &out->v[1], &out->v[2], &out->v[3], &out->v[4], &out->v[5], &out->v[6]);
+    return 0;
+}
+static int pio_read(const char *path, struct pio *out) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -errno;
+    int r = pio_read_fd(fd, out);
+    close(fd);
+    return r;
+}
+/* Prints the counts of `path`, or its errno. */
+static void pio_show(const char *label, const char *path) {
+    struct pio io;
+    int r = pio_read(path, &io);
+    if (r) printf(" %s=%d", label, r);
+    else
+        printf(" %s=%lld/%lld/%lld/%lld/%lld/%lld/%lld", label, io.v[0], io.v[1], io.v[2], io.v[3], io.v[4], io.v[5],
+               io.v[6]);
+}
+/* Waits until thread `tid` of `pid` sleeps, in its next call. */
+static void pio_sleeping(int pid, int tid) {
+    char path[64], text[256];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, tid);
+    for (int i = 0; i < 5000; i++) {
+        int fd = open(path, O_RDONLY);
+        ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+        if (fd >= 0) close(fd);
+        if (n > 0) {
+            text[n] = 0;
+            char *end = strrchr(text, ')');
+            if (end && end[1] == ' ' && end[2] == 'S') return;
+        }
+        usleep(1000);
+    }
+}
+/* Waits until thread `tid` of `pid` is gone, as a join does not wait for. */
+static void pio_gone(int pid, int tid) {
+    char path[64];
+    struct stat st;
+    snprintf(path, sizeof path, "/proc/%d/task/%d", pid, tid);
+    for (int i = 0; i < 5000 && !stat(path, &st); i++) usleep(1000);
+}
+static int pio_null, pio_ready[2], pio_go[2];
+static void *pio_thread(void *unused) {
+    (void)unused;
+    char byte;
+    (void)!write(pio_null, "abc", 3);
+    (void)!write(pio_null, "abc", 3);
+    int tid = (int)syscall(SYS_gettid);
+    (void)!write(pio_ready[1], &tid, 4);
+    (void)!read(pio_go[0], &byte, 1);
+    return NULL;
+}
+static int proc_io_case(void) {
+    /* Its own counts across calls that count and calls that do not: the
+       read of the first snapshot counts too, once, with its bytes. */
+    int z = open("/dev/zero", O_RDONLY), nul = open("/dev/null", O_WRONLY), p[2];
+    if (z < 0 || nul < 0 || pipe2(p, O_NONBLOCK)) return 80;
+    int m = memfd_create("pio", 0), m2 = memfd_create("pio2", 0);
+    if (m < 0 || m2 < 0) return 81;
+    char buf[64] = "";
+    struct iovec two[2] = {{buf, 2}, {buf + 2, 2}}, one[1] = {{buf, 5}};
+    struct pio a, b;
+    if (pio_read("/proc/self/io", &a)) return 82;
+    for (int i = 0; i < 3; i++) (void)!read(z, buf, 10);
+    for (int i = 0; i < 2; i++) (void)!write(nul, buf, 7);
+    long eagain = read(p[0], buf, 1);
+    long ebadf = read(999, buf, 1);
+    (void)!write(p[1], "hello", 5);
+    long espipe = pread(p[0], buf, 1, 0);
+    long vespipe = preadv(p[0], one, 1, 0);
+    long vebadf = readv(999, one, 1);
+    long vector = readv(p[0], two, 2);
+    long wvector = writev(nul, two, 2);
+    long negative = pread(z, buf, 5, -1);
+    long current = syscall(SYS_preadv2, z, one, 1, -1L, 0L, 0);
+    int current_errno = current < 0 ? errno : 0;
+    (void)!write(m, "0123456789abcdefghij", 20);
+    off_t offset = 0;
+    long sent = sendfile(p[1], m, &offset, 6);
+    loff_t from = 0;
+    long copied = syscall(SYS_copy_file_range, m, &from, m2, NULL, 8, 0);
+    long nothing = syscall(SYS_copy_file_range, m, &from, m2, NULL, 0, 0);
+    if (pio_read("/proc/self/io", &b)) return 83;
+    printf("calls: %ld %ld %ld %ld %ld %ld %ld %ld %ld/%d %ld %ld %ld\n", eagain, ebadf, espipe, vespipe, vebadf,
+           vector, wvector, negative, current, current_errno, sent, copied, nothing);
+    printf("own: rchar=%lld wchar=%lld syscr=%lld syscw=%lld storage=%lld/%lld/%lld\n", b.v[0] - a.v[0] - a.bytes,
+           b.v[1] - a.v[1], b.v[2] - a.v[2] - 1, b.v[3] - a.v[3], b.v[4] - a.v[4], b.v[5] - a.v[5], b.v[6] - a.v[6]);
+    close(p[0]);
+    close(p[1]);
+    close(m);
+    close(m2);
+    close(z);
+
+    /* Another process: a fork starts from nothing. Its thread's counts,
+       its own and the process's; a thread that has ended still counts for
+       the process; a zombie's; and the reaped child's join its parent's. */
+    pio_null = nul;
+    if (pipe(pio_ready) || pipe(pio_go)) return 84;
+    int tready[2];
+    if (pipe(tready)) return 85;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 86;
+    if (!kid) {
+        close(pio_ready[0]);
+        close(pio_go[1]);
+        /* The thread tells this thread its TID, which tells the parent. */
+        int parent_ready = pio_ready[1];
+        pio_ready[1] = tready[1];
+        int thread_go[2];
+        if (pipe(thread_go)) _exit(90);
+        int parent_go = pio_go[0];
+        pio_go[0] = thread_go[0];
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, pio_thread, NULL)) _exit(91);
+        int tid = 0;
+        char byte;
+        (void)!read(tready[0], &tid, 4);
+        (void)!write(parent_ready, &tid, 4);
+        (void)!read(parent_go, &byte, 1);
+        (void)!write(thread_go[1], "g", 1);
+        pthread_join(thread, NULL);
+        (void)!write(parent_ready, "j", 1);
+        (void)!read(parent_go, &byte, 1);
+        _exit(0);
+    }
+    close(pio_ready[1]);
+    close(pio_go[0]);
+    close(tready[0]);
+    close(tready[1]);
+    int tid = 0;
+    char byte, path[64], thread_path[64];
+    if (read(pio_ready[0], &tid, 4) != 4) return 87;
+    pio_sleeping(kid, kid);
+    pio_sleeping(kid, tid);
+    snprintf(thread_path, sizeof thread_path, "/proc/%d/task/%d/io", (int)kid, tid);
+    int thread_fd = open(thread_path, O_RDONLY);
+    printf("running:");
+    snprintf(path, sizeof path, "/proc/%d/io", (int)kid);
+    pio_show("process", path);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/io", (int)kid, (int)kid);
+    pio_show("main", path);
+    pio_show("thread", thread_path);
+    printf("\n");
+    if (write(pio_go[1], "1", 1) != 1 || read(pio_ready[0], &byte, 1) != 1) return 88;
+    pio_sleeping(kid, kid);
+    pio_gone(kid, tid);
+    printf("joined:");
+    snprintf(path, sizeof path, "/proc/%d/io", (int)kid);
+    pio_show("process", path);
+    pio_show("thread", thread_path);
+    struct pio ended;
+    printf(" open-thread=%d\n", thread_fd >= 0 ? pio_read_fd(thread_fd, &ended) : -1000);
+    if (thread_fd >= 0) close(thread_fd);
+    if (write(pio_go[1], "2", 1) != 1) return 89;
+    siginfo_t info;
+    if (waitid(P_PID, kid, &info, WEXITED | WNOWAIT)) return 90;
+    printf("zombie:");
+    snprintf(path, sizeof path, "/proc/%d/io", (int)kid);
+    pio_show("process", path);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/io", (int)kid, (int)kid);
+    pio_show("main", path);
+    printf("\n");
+    if (pio_read("/proc/self/io", &a)) return 91;
+    int status = reaped(kid);
+    if (pio_read("/proc/self/io", &b)) return 92;
+    printf("reaped: status=%d rchar=%lld wchar=%lld syscr=%lld syscw=%lld\n", status, b.v[0] - a.v[0] - a.bytes,
+           b.v[1] - a.v[1], b.v[2] - a.v[2] - 1, b.v[3] - a.v[3]);
+    snprintf(path, sizeof path, "/proc/%d/io", (int)kid);
+    printf("gone: %d\n", pio_read(path, &a));
+    close(pio_ready[0]);
+    close(pio_go[1]);
+
+    /* Who may read it: a reader of the same user while the process is
+       dumpable, not once it is not, which an open descriptor's next read
+       finds then (the check is at read time), nor of root's; root always. */
+    if (pipe(pio_ready) || pipe(pio_go)) return 93;
+    fflush(stdout);
+    pid_t target = fork();
+    if (target < 0) return 94;
+    if (!target) {
+        close(pio_ready[0]);
+        close(pio_go[1]);
+        char step = 'r', next;
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000) || prctl(PR_SET_DUMPABLE, 1)) step = 'u';
+        for (int i = 0; i < 2; i++) {
+            if (write(pio_ready[1], &step, 1) != 1 || read(pio_go[0], &next, 1) != 1) _exit(88);
+            if (step == 'r' && i == 0 && prctl(PR_SET_DUMPABLE, 0)) step = 'd';
+        }
+        _exit(0);
+    }
+    close(pio_ready[1]);
+    close(pio_go[0]);
+    if (read(pio_ready[0], &byte, 1) != 1) return 95;
+    int reader_ready[2], reader_go[2];
+    if (pipe(reader_ready) || pipe(reader_go)) return 96;
+    fflush(stdout);
+    pid_t reader = fork();
+    if (reader < 0) return 97;
+    if (!reader) {
+        close(reader_ready[0]);
+        close(reader_go[1]);
+        char next;
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(70);
+        snprintf(path, sizeof path, "/proc/%d/io", (int)target);
+        int fd = open(path, O_RDONLY);
+        struct pio io;
+        int first = fd >= 0 ? pio_read_fd(fd, &io) : -errno;
+        snprintf(thread_path, sizeof thread_path, "/proc/%d/io", (int)getppid());
+        int root = pio_read(thread_path, &io);
+        if (write(reader_ready[1], "a", 1) != 1 || read(reader_go[0], &next, 1) != 1) _exit(71);
+        int again = fd >= 0 ? (lseek(fd, 0, SEEK_SET) ? -1000 : pio_read_fd(fd, &io)) : -1001;
+        int reopened = pio_read(path, &io);
+        printf("reader: open=%d first=%d root=%d undumpable: again=%d reopened=%d\n", fd >= 0, first, root, again,
+               reopened);
+        fflush(stdout);
+        _exit(0);
+    }
+    close(reader_ready[1]);
+    close(reader_go[0]);
+    if (read(reader_ready[0], &byte, 1) != 1) return 98;
+    if (write(pio_go[1], "1", 1) != 1 || read(pio_ready[0], &byte, 1) != 1) return 99;
+    if (write(reader_go[1], "1", 1) != 1) return 100;
+    int reader_status = reaped(reader);
+    snprintf(path, sizeof path, "/proc/%d/io", (int)target);
+    struct pio io;
+    int by_root = pio_read(path, &io);
+    printf("target=%c reader=%d root=%d\n", byte, reader_status, by_root);
+    if (write(pio_go[1], "2", 1) != 1) return 101;
+    printf("target status=%d\n", reaped(target));
+    close(nul);
+    return 0;
+}
+
 /* The proc-owner-rename case: the owner fstat shows of an open file in a
    process's /proc directory, which is its inode's as the last lookup of its
    path set it (pid_revalidate), and of the process's directory and its ns,
@@ -29362,6 +29617,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-limits")) return proc_other_limits_case();
     if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "proc-owner-rename")) return proc_owner_rename_case();
+    if (!strcmp(mode, "proc-io")) return proc_io_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

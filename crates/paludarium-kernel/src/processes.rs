@@ -1520,10 +1520,15 @@ impl Processes {
         {
             match event {
                 // A reaped child's CPU time joins its parent's children's.
+                // So do its read and write counts, to its parent's process.
                 ChildEvent::Exited(_) | ChildEvent::Dumped(_) => {
+                    let io = entries.get(&pid).map(|child| child.group.io(None));
                     self.release(&mut entries, pid);
                     if let Some(parent) = entries.get_mut(&parent) {
                         parent.children_cpu = parent.children_cpu.saturating_add(cpu);
+                        if let Some(io) = io {
+                            parent.group.reaped_io(io);
+                        }
                     }
                 }
                 ChildEvent::Stopped(_) => {

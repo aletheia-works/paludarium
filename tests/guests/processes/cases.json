@@ -371,6 +371,7 @@
     {"name":"proc-other-limits","binary":"process"},
     {"name":"proc-other-pagemap","binary":"process"},
     {"name":"proc-owner-rename","binary":"process"},
+    {"name":"proc-io","binary":"process"},
     {"name":"modify-ldt","binary":"process"},
     {"name":"port-access","binary":"process"},
     {"name":"timer-limits","binary":"process"},

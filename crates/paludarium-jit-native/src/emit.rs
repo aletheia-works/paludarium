@@ -14,18 +14,33 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use paludarium_cpu::compile::{Address, Alu, Fast, Form, Shift, Source, Unary};
-use paludarium_cpu::flag;
+use paludarium_cpu::{CpuState, flag};
 use paludarium_decoder::{Condition, Mnemonic, Register, Segment};
+use std::mem::offset_of;
 
-/// Words of the register block the code runs on: the general registers,
-/// then RFLAGS, RIP, the FS and GS bases (read only), and the xmm
-/// registers, each as its low word and its high word.
-pub(crate) const RFLAGS: usize = 16;
-pub(crate) const RIP: usize = 17;
-pub(crate) const FS_BASE: usize = 18;
-pub(crate) const GS_BASE: usize = 19;
-pub(crate) const XMM: usize = 20;
-pub(crate) const WORDS: usize = XMM + 32;
+/// Words of the [`CpuState`] the code runs on, in place: the general
+/// registers, then RFLAGS, RIP, the FS and GS bases (read only), and the
+/// xmm registers, each as its low word and its high word ([`offset`] says
+/// where each is).
+const RFLAGS: usize = 16;
+const RIP: usize = 17;
+const FS_BASE: usize = 18;
+const GS_BASE: usize = 19;
+const XMM: usize = 20;
+
+/// Where `word` is in a [`CpuState`], in bytes. An xmm register is a
+/// `u128`, its low word first on this little-endian host.
+const fn offset(word: usize) -> i32 {
+    let bytes = match word {
+        0..RFLAGS => offset_of!(CpuState, gpr) + word * 8,
+        RFLAGS => offset_of!(CpuState, rflags),
+        RIP => offset_of!(CpuState, rip.0),
+        FS_BASE => offset_of!(CpuState, fs_base),
+        GS_BASE => offset_of!(CpuState, gs_base),
+        _ => offset_of!(CpuState, xmm) + (word - XMM) * 8,
+    };
+    bytes as i32
+}
 
 /// What a helper reports: the access was made, it failed (nothing was
 /// done), or it was made and the code generation changed.
@@ -62,7 +77,7 @@ fn sign(size: u8) -> i64 {
 
 struct Emitter<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
-    /// The register block: registers are read and written there, so that
+    /// The [`CpuState`]: registers are read and written there, so that
     /// leaving needs nothing but the count and RIP.
     registers: Value,
     /// Takes the count and RIP to leave with.
@@ -75,8 +90,6 @@ struct Emitter<'a, 'b> {
     store_sig: cranelift_codegen::ir::SigRef,
     move128_sig: cranelift_codegen::ir::SigRef,
     atomic_sig: cranelift_codegen::ir::SigRef,
-    /// Whether the code reaches the xmm words of the register block.
-    vector: bool,
 }
 
 impl Emitter<'_, '_> {
@@ -132,23 +145,15 @@ impl Emitter<'_, '_> {
     }
 
     fn word(&mut self, word: usize) -> Value {
-        self.vector |= word >= XMM;
-        self.b.ins().load(
-            I64,
-            MemFlagsData::trusted(),
-            self.registers,
-            (word * 8) as i32,
-        )
+        self.b
+            .ins()
+            .load(I64, MemFlagsData::trusted(), self.registers, offset(word))
     }
 
     fn set_word(&mut self, word: usize, v: Value) {
-        self.vector |= word >= XMM;
-        self.b.ins().store(
-            MemFlagsData::trusted(),
-            v,
-            self.registers,
-            (word * 8) as i32,
-        );
+        self.b
+            .ins()
+            .store(MemFlagsData::trusted(), v, self.registers, offset(word));
     }
 
     fn gpr(&mut self, index: u8) -> Value {
@@ -317,11 +322,10 @@ impl Emitter<'_, '_> {
         (results[0], results[1])
     }
 
-    /// The address of xmm register `n` in the register block.
+    /// The address of xmm register `n` in the [`CpuState`].
     fn xmm_slot(&mut self, n: u8) -> Value {
-        self.vector = true;
-        let offset = ((XMM + 2 * usize::from(n & 15)) * 8) as i64;
-        self.b.ins().iadd_imm_s(self.registers, offset)
+        let offset = offset(XMM + 2 * usize::from(n & 15));
+        self.b.ins().iadd_imm_s(self.registers, i64::from(offset))
     }
 
     /// Moves 16 bytes between `address` and xmm register `n` with
@@ -1408,7 +1412,7 @@ impl Emitter<'_, '_> {
     }
 }
 
-/// The signature of a block's code: `(registers, context) -> count`.
+/// The signature of a block's code: `(state, context) -> count`.
 pub(crate) fn block_signature() -> Signature {
     let mut sig = Signature::new(CallConv::SystemV);
     sig.params.push(AbiParam::new(I64));
@@ -1417,14 +1421,12 @@ pub(crate) fn block_signature() -> Signature {
     sig
 }
 
-/// The function that runs `forms`, and whether it reaches the xmm words
-/// of the register block: the block it is given has [`WORDS`] words then,
-/// and [`XMM`] otherwise.
+/// The function that runs `forms` on the [`CpuState`] it is given.
 pub(crate) fn function(
     forms: &[Form],
     helpers: Helpers,
     config: cranelift_codegen::isa::TargetFrontendConfig,
-) -> (Function, bool) {
+) -> Function {
     let mut func = Function::with_name_signature(UserFuncName::user(0, 0), block_signature());
     let mut context = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(&mut func, &mut context);
@@ -1452,8 +1454,8 @@ pub(crate) fn function(
     let registers = b.block_params(entry)[0];
     let context_value = b.block_params(entry)[1];
     let flags = MemFlagsData::trusted();
-    let fs_base = b.ins().load(I64, flags, registers, (FS_BASE * 8) as i32);
-    let gs_base = b.ins().load(I64, flags, registers, (GS_BASE * 8) as i32);
+    let fs_base = b.ins().load(I64, flags, registers, offset(FS_BASE));
+    let gs_base = b.ins().load(I64, flags, registers, offset(GS_BASE));
     let exit = b.create_block();
     let count = b.append_block_param(exit, I64);
     let rip = b.append_block_param(exit, I64);
@@ -1470,7 +1472,6 @@ pub(crate) fn function(
         store_sig,
         move128_sig,
         atomic_sig,
-        vector: false,
     };
     let mut open = true;
     for (n, form) in forms.iter().enumerate() {
@@ -1483,11 +1484,10 @@ pub(crate) fn function(
         e.leave_at(forms.len(), last.next);
     }
 
-    let vector = e.vector;
     b.switch_to_block(exit);
-    b.ins().store(flags, rip, registers, (RIP * 8) as i32);
+    b.ins().store(flags, rip, registers, offset(RIP));
     b.ins().return_(&[count]);
     b.seal_all_blocks();
     b.finalize(config);
-    (func, vector)
+    func
 }

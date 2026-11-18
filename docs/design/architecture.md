@@ -150,9 +150,9 @@ for them, compiles it and maps the code into memory that is never writable
 and executable at once. Until the code is ready, and when compiling fails,
 the interpreter runs the block as before.
 
-Compiled code means exactly what the interpreter's forms mean. It works on a
-copy of the registers, reads and writes them in memory (the xmm registers too,
-copied only for a block that uses them), and reaches guest memory only through
+Compiled code means exactly what the interpreter's forms mean. It reads and
+writes the thread's registers where the interpreter keeps them, in memory,
+with nothing copied in or out, and reaches guest memory only through
 the MMU's own loads and stores, with their checks. It stops before an
 instruction whose load or store fails, having changed nothing for it, so that
 the interpreter runs it again and reports the fault, and after a load or store

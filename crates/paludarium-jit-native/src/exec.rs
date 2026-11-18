@@ -8,10 +8,11 @@
 
 use std::ptr::NonNull;
 
+use paludarium_cpu::CpuState;
 use paludarium_mmu::{AddressSpace, AtomicOp, AtomicWidth};
 use paludarium_types::GuestAddr;
 
-use crate::emit::{CODE_CHANGED, DONE, FAILED, Helpers, WORDS, XMM};
+use crate::emit::{CODE_CHANGED, DONE, FAILED, Helpers};
 
 /// What compiled code reaches guest memory through: the address space and
 /// the code generation the block was entered under.
@@ -77,8 +78,8 @@ extern "sysv64" fn load128(context: *const Context<'_>, address: u64, to: *mut u
         return FAILED;
     }
     let value = u128::from_le_bytes(bytes);
-    // SAFETY: compiled code passes the address of an xmm register's two
-    // words in the register block it was given (`emit::XMM`).
+    // SAFETY: compiled code passes the address of an xmm register (a
+    // `u128`, two words) in the `CpuState` it was given.
     unsafe {
         to.write(value as u64);
         to.add(1).write((value >> 64) as u64);
@@ -156,8 +157,6 @@ pub(crate) fn helpers() -> Helpers {
 pub(crate) struct Code {
     start: NonNull<u8>,
     len: usize,
-    /// Whether it reaches the xmm words of the register block.
-    vector: bool,
 }
 
 // SAFETY: the memory is never written after `Code::new`, and the code only
@@ -170,7 +169,7 @@ impl Code {
     /// `bytes`, which must be code built by [`crate::emit::function`]
     /// with no relocations, in executable memory. `None` when the memory
     /// cannot be had.
-    pub(crate) fn new(bytes: &[u8], vector: bool) -> Option<Self> {
+    pub(crate) fn new(bytes: &[u8]) -> Option<Self> {
         let len = bytes.len().max(1);
         // SAFETY: an anonymous private mapping at no fixed address
         // touches no existing memory.
@@ -190,7 +189,6 @@ impl Code {
         let code = Code {
             start: NonNull::new(start.cast())?,
             len,
-            vector,
         };
         // SAFETY: the mapping is `len` bytes, writable, and no one else
         // has it.
@@ -203,25 +201,18 @@ impl Code {
         protected.then_some(code)
     }
 
-    /// Whether it reaches the xmm words of the register block, and so
-    /// needs all [`WORDS`] of them rather than the first [`XMM`].
-    pub(crate) fn vector(&self) -> bool {
-        self.vector
-    }
-
-    /// Runs the code on `registers` (laid out as in [`crate::emit`]) and
-    /// returns how many instructions it ran.
-    pub(crate) fn run(&self, registers: &mut [u64], context: &Context<'_>) -> u64 {
-        type Entry = extern "sysv64" fn(*mut u64, *const Context<'_>) -> u64;
-        assert!(registers.len() >= if self.vector { WORDS } else { XMM });
+    /// Runs the code on `state`, in place, and returns how many
+    /// instructions it ran.
+    pub(crate) fn run(&self, state: &mut CpuState, context: &Context<'_>) -> u64 {
+        type Entry = extern "sysv64" fn(*mut CpuState, *const Context<'_>) -> u64;
         // SAFETY: the memory holds a function of this signature
         // ([`crate::emit::block_signature`]), compiled for this host, that
-        // reads and writes only the first `XMM` words of `registers`, or
-        // `WORDS` when `vector` (which `emit::function` says, and the
-        // assertion above checks), and calls only the helpers above with
-        // `context`.
+        // reads and writes only the `u64` and `u128` fields of `state` that
+        // `emit::offset` places (the general and xmm registers, RFLAGS, RIP,
+        // and the FS and GS bases, read only), and calls only the helpers
+        // above with `context`.
         let entry: Entry = unsafe { std::mem::transmute(self.start.as_ptr()) };
-        entry(registers.as_mut_ptr(), context)
+        entry(state, context)
     }
 }
 

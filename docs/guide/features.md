@@ -1740,7 +1740,16 @@ kernel.
   `MOVE_MOUNT_*_EMPTY_PATH`, and a Landlock domain is `EPERM`. It moves a
   mount as `MS_MOVE` does, or attaches a tree from `open_tree`: only its
   root (`EINVAL`), not onto its own tree (`EINVAL`); a mount of the
-  namespace goes onto no detached tree (`EINVAL`). `MOVE_MOUNT_SET_GROUP`
+  namespace goes onto no detached tree (`EINVAL`). With `MOVE_MOUNT_BENEATH`
+  the source goes beneath the topmost mount at the target, on that mount's
+  parent, and the topmost mount stays on top, on the source's root
+  (`do_move_mount` with `MNT_TREE_BENEATH`): the target must be a mount's
+  root and not the namespace's root (`EINVAL`), then the checks of a move
+  are made on that parent. A source in the topmost mount's tree is `EINVAL`,
+  and so is a move where a shared parent would propagate a copy of the
+  source onto the topmost mount or onto the source at its root
+  (`propagation_would_overmount`). A locked topmost mount's lock passes to the source, so the
+  topmost one may then be unmounted. `MOVE_MOUNT_SET_GROUP`
   puts the target in the source's peer group (`do_set_group`): both mounts'
   roots, of one superblock, the target's root at or below the source's,
   the target private and the source shared or a slave (`EINVAL`).

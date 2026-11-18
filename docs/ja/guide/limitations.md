@@ -489,8 +489,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `/proc` や `/dev`（とその中のファイル）へのマウントやその移動、パスのないファイルへの
   ディスクリプタのリンクのバインドマウントは
   `EOPNOTSUPP` で、プログラムはできないことを知れます。`open_tree` の
-  `OPEN_TREE_NAMESPACE`（Linux master で新しいもの）と `move_mount` の
-  `MOVE_MOUNT_BENEATH`、`fsmount` の `FSMOUNT_NAMESPACE`（Linux master で新しいもの）と
+  `OPEN_TREE_NAMESPACE`（Linux master で新しいもの）、`fsmount` の
+  `FSMOUNT_NAMESPACE`（Linux master で新しいもの）と
   tmpfs への `MOUNT_ATTR_NOSYMFOLLOW`、`/proc` や `/dev` の `fspick`、ID を
   マップしたマウント（`mount_setattr` と `open_tree_attr` の `MOUNT_ATTR_IDMAP`。その
   ユーザー名前空間のディスクリプタを確かめたあと）も同じです。一意なマウントの ID と

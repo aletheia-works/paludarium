@@ -10956,6 +10956,117 @@ static int generated_binds_case(void) {
     return 0;
 }
 
+/* The beneath case: move_mount with MOVE_MOUNT_BENEATH (Linux master's
+   do_move_mount and can_move_mount_beneath) of tmpfs mounts in a temporary
+   directory, in a mount namespace of a user namespace of its own: the moved
+   mount goes under the topmost one, which an unmount takes away to show
+   it, and the refusals (EINVAL) for a target that is no mount's root, the
+   namespace's root, a source in the topmost mount's tree, and a shared
+   parent that would propagate a copy onto the topmost mount. Only errno
+   values are printed. */
+static char bn_base[] = "/tmp/paludarium-beneath-XXXXXX";
+static void bn_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", bn_base, name); }
+/* 0 for a path that is there, else the errno. */
+static int bn_there(const char *dir, const char *name) {
+    char p[300];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return access(p, F_OK) ? errno : 0;
+}
+static long bn_beneath(const char *from, const char *to) {
+    long r = tr_move(AT_FDCWD, from, AT_FDCWD, to, 0x200 /* MOVE_MOUNT_BENEATH */);
+    return r ? errno : 0;
+}
+static int bn_inner(void) {
+    char a[256], b[256], c[256], s[256], file[300], sub[300], d[300];
+    bn_path(a, "a");
+    bn_path(b, "b");
+    bn_path(c, "c");
+    bn_path(s, "s");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    int r = mt_result(mount("none", a, "tmpfs", 0, NULL));
+    printf("a=%d", r);
+    snprintf(file, sizeof file, "%s/x-a", a);
+    mt_write_new(file, "a");
+    snprintf(sub, sizeof sub, "%s/sub", a);
+    mkdir(sub, 0755);
+    r = mt_result(mount("none", b, "tmpfs", 0, NULL));
+    printf(" b=%d", r);
+    snprintf(file, sizeof file, "%s/x-b", b);
+    mt_write_new(file, "b");
+    printf("\nnot-root=%ld", bn_beneath(b, sub));
+    printf(" root=%ld", bn_beneath(b, "/"));
+    r = mt_result(mount("none", sub, "tmpfs", 0, NULL));
+    printf(" sub=%d", r);
+    printf(" in-tree=%ld", bn_beneath(sub, a));
+    r = mt_result(umount2(sub, 0));
+    printf(" sub-gone=%d\n", r);
+    printf("beneath=%ld", bn_beneath(b, a));
+    printf(" top=%d", bn_there(a, "x-a"));
+    printf(" under=%d", bn_there(a, "x-b"));
+    printf(" old=%d\n", bn_there(b, "x-b"));
+    r = mt_result(umount2(a, 0));
+    printf("umount=%d", r);
+    printf(" shown=%d", bn_there(a, "x-b"));
+    r = mt_result(umount2(a, 0));
+    printf(" umount=%d", r);
+    r = mt_result(umount2(a, 0));
+    printf(" umount=%d", r);
+    r = mt_result(umount2(b, 0));
+    printf(" b-umount=%d\n", r);
+    /* A shared parent with a bind of its directory onto itself. */
+    r = mt_result(mount("none", s, "tmpfs", 0, NULL));
+    printf("s=%d", r);
+    r = mt_result(mount(NULL, s, NULL, MS_SHARED, NULL));
+    printf(" shared=%d", r);
+    snprintf(d, sizeof d, "%s/d", s);
+    mkdir(d, 0755);
+    r = mt_result(mount(d, d, NULL, MS_BIND, NULL));
+    printf(" self-bind=%d", r);
+    r = mt_result(mount("none", c, "tmpfs", 0, NULL));
+    printf(" c=%d", r);
+    printf(" propagates=%ld", bn_beneath(c, d));
+    r = mt_result(umount2(c, 0));
+    printf(" c-umount=%d", r);
+    r = mt_result(umount2(s, MNT_DETACH));
+    printf(" s-umount=%d\n", r);
+    return 0;
+}
+static int beneath_case(void) {
+    if (!mkdtemp(bn_base)) return 93;
+    chmod(bn_base, 0755);
+    char path[256];
+    const char *dirs[] = {"a", "b", "c", "s"};
+    for (unsigned i = 0; i < 4; i++) {
+        bn_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(bn_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    for (unsigned i = 0; i < 4; i++) {
+        bn_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(bn_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -30002,6 +30113,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
+    if (!strcmp(mode, "beneath")) return beneath_case();
     if (!strcmp(mode, "mount-flags-id")) {
         printf("euid=%d egid=%d\n", (int)geteuid(), (int)getegid());
         return 0;

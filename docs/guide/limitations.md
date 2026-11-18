@@ -576,7 +576,7 @@ verified.
   file in them), and a bind mount of a descriptor's link to a file no path
   names, give `EOPNOTSUPP`, so a program
   learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
-  (new in Linux master), `move_mount`'s `MOVE_MOUNT_BENEATH`, `fsmount`'s
+  (new in Linux master), `fsmount`'s
   `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
   a tmpfs, `fspick` of `/proc` or `/dev`, and an idmapped mount
   (`mount_setattr`'s and `open_tree_attr`'s `MOUNT_ATTR_IDMAP`, after the

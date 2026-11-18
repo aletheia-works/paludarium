@@ -29,6 +29,7 @@ const SCHED_YIELD: u64 = 24;
 const GETPID: u64 = 39;
 const CLONE: u64 = 56;
 const FORK: u64 = 57;
+const VFORK: u64 = 58;
 const EXIT: u64 = 60;
 const WAIT4: u64 = 61;
 const KILL: u64 = 62;
@@ -309,17 +310,22 @@ impl Tracee {
             Ok(r) => panic!("exit_group returned {r}"),
         }
     }
-    /// musl's `raise`: every signal blocked around a `tgkill` to itself, so
-    /// that it arrives as the mask comes back, at the end of
-    /// `rt_sigprocmask`.
+    /// musl's `raise`: every signal blocked around a `tkill` to its own
+    /// thread (whose TID musl keeps), so that it arrives as the mask comes
+    /// back, at the end of `rt_sigprocmask`.
     fn raise(&mut self, signal: u64, handler: &mut Handler<'_>) -> Result<u64, ExitStatus> {
         let (all, old) = (HEAP + 0x900, HEAP + 0x908);
         self.m.write_u64(GuestAddr(all), u64::MAX).unwrap();
         self.call(RT_SIGPROCMASK, [0, all, old, 8, 0, 0], handler)?;
-        let pid = self.sys(GETPID, [0; 6])?;
-        let tid = self.sys(GETTID, [0; 6])?;
-        self.call(TGKILL, [pid, tid, signal, 0, 0, 0], handler)?;
+        let tid = u64::from(self.t.tid);
+        self.call(TKILL, [tid, signal, 0, 0, 0, 0], handler)?;
         self.call(RT_SIGPROCMASK, [2, old, 0, 8, 0, 0], handler)
+    }
+    /// `vfork`, its child running `body`: the child's PID, once the child
+    /// has exited.
+    fn vfork(&mut self, body: impl FnOnce(&mut Tracee) -> ExitStatus + Send + 'static) -> u64 {
+        self.forked = Some(Box::new(body));
+        self.sys(VFORK, [0; 6]).unwrap()
     }
     /// `sigaction(signal)` with the handler at `HANDLER`.
     fn catch(&mut self, signal: u64, flags: u64) {
@@ -1171,24 +1177,48 @@ const INFO: u64 = 88;
 /// What `ptrace-strace`'s tracer keeps: the tasks it names, and whether it
 /// has seen a syscall-entry stop yet.
 struct Strace {
-    named: [u64; 2],
+    named: [u64; 4],
     first_entry: bool,
 }
 
 impl Strace {
+    const NAMES: [&'static str; 4] = ["parent", "child", "second", "other"];
     fn who(&self, pid: u64) -> &'static str {
-        match pid {
-            p if p == self.named[0] => "parent",
-            p if p == self.named[1] => "child",
-            _ => "?",
-        }
+        self.named
+            .iter()
+            .position(|&n| n == pid)
+            .map_or("?", |i| Self::NAMES[i])
     }
     fn value(&self, v: i64) -> String {
         match self.named.iter().position(|&n| n != 0 && n as i64 == v) {
-            Some(0) => "parent".to_owned(),
-            Some(_) => "child".to_owned(),
+            Some(i) => Self::NAMES[i].to_owned(),
             None => v.to_string(),
         }
+    }
+    /// The guest's `expect`: the next stop of `pid`, or its end.
+    fn expect(&self, g: &mut Tracer, pid: u64, name: &str) {
+        let status = g.wait(pid, WALL);
+        let who = self.who(pid);
+        if status < 0 || status & 0xff != 0x7f {
+            let exited = i64::from(status >= 0 && status & 0x7f == 0);
+            let code = (status >> 8) & 0xff;
+            g.lines
+                .push(format!("{name}: {who} exited={exited} code={code}"));
+            return;
+        }
+        let at = HEAP + 0x500;
+        g.m.write_u64(GuestAddr(at), 0).unwrap();
+        g.pt(GETEVENTMSG, pid, 0, at);
+        let message = g.m.read_u64(GuestAddr(at)).unwrap() as i64;
+        let (_, regs) = g.regs(pid);
+        let (nr, rax) = (g.reg(regs, ORIG_RAX) as i64, g.reg(regs, RAX) as i64);
+        g.lines.push(format!(
+            "{name}: {who} signal={} event={} nr={nr} rax={} message={}",
+            (status >> 8) & 0xff,
+            status >> 16,
+            self.value(rax),
+            self.value(message)
+        ));
     }
     /// PTRACE_GET_SYSCALL_INFO into the tracer's buffer: the size, and the
     /// buffer.
@@ -1368,7 +1398,7 @@ fn strace() {
         c.exit(code)
     });
     let mut strace = Strace {
-        named: [child, 0],
+        named: [child, 0, 0, 0],
         first_entry: true,
     };
     strace.follow(&mut g, child);
@@ -1952,5 +1982,143 @@ cont=0
 thread-exited=1
 thread-code=0
 process-exit=5",
+    );
+}
+
+/// `ptrace-events`, up to the exec: PTRACE_EVENT_FORK and VFORK with their
+/// children attached as they start, VFORK_DONE, and EXIT as each ends. The
+/// exec's stop is left out; the tracee ends with the code the program it
+/// would exec gives.
+#[test]
+fn events() {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        let chld = HEAP + 0x980;
+        c.m.write_u64(GuestAddr(chld), 1 << (SIGCHLD - 1)).unwrap();
+        c.sys(RT_SIGPROCMASK, [0, chld, 0, 8, 0, 0]).unwrap();
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        c.raise(SIGSTOP, &mut |_, _, _| None).unwrap();
+        let forked = c.fork(|c| c.exit(3));
+        c.sys(WAIT4, [forked, HEAP + 0x990, 0, 0, 0, 0]).unwrap();
+        c.vfork(|c| c.exit(4));
+        c.exit(7)
+    });
+    let mut s = Strace {
+        named: [child, 0, 0, 0],
+        first_entry: false,
+    };
+    s.expect(&mut g, child, "start");
+    // FORK, VFORK, EXEC, VFORK_DONE and EXIT.
+    let r = g.pt(SETOPTIONS, child, 0, 0x76);
+    g.say("options", r);
+    let message = |g: &mut Tracer, pid: u64| {
+        let at = HEAP + 0x500;
+        g.pt(GETEVENTMSG, pid, 0, at);
+        g.m.read_u64(GuestAddr(at)).unwrap()
+    };
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, WALL);
+    s.named[1] = message(&mut g, child);
+    g.lines.push(format!("fork event={}", status >> 16));
+    let (_, signo, code, _) = g.siginfo(child);
+    g.lines.push(format!(
+        "fork si-signo={signo} si-code={}",
+        hex(code as u64)
+    ));
+    s.expect(&mut g, s.named[1], "forked");
+    let (_, _, code, pid) = g.siginfo(s.named[1]);
+    g.lines.push(format!("forked si-code={code} si-pid={pid}"));
+    g.pt(CONT, s.named[1], 0, 0);
+    s.expect(&mut g, s.named[1], "forked-exit");
+    g.pt(CONT, s.named[1], 0, 0);
+    s.expect(&mut g, s.named[1], "forked-gone");
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, WALL);
+    s.named[2] = message(&mut g, child);
+    g.lines.push(format!("vfork event={}", status >> 16));
+    s.expect(&mut g, s.named[2], "vforked");
+    g.pt(CONT, s.named[2], 0, 0);
+    s.expect(&mut g, s.named[2], "vforked-exit");
+    g.pt(CONT, s.named[2], 0, 0);
+    s.expect(&mut g, s.named[2], "vforked-gone");
+    g.pt(CONT, child, 0, 0);
+    s.expect(&mut g, child, "vfork-done");
+    g.pt(CONT, child, 0, 0);
+    s.expect(&mut g, child, "exit");
+    g.pt(CONT, child, 0, 0);
+    s.expect(&mut g, child, "gone");
+    thread.join().unwrap();
+    g.check(
+        "start: parent signal=19 event=0 nr=200 rax=0 message=0
+options=0
+fork event=1
+fork si-signo=5 si-code=0x105
+forked: child signal=19 event=0 nr=57 rax=0 message=0
+forked si-code=0 si-pid=0
+forked-exit: child signal=5 event=6 nr=231 rax=-38 message=768
+forked-gone: child exited=1 code=3
+vfork event=2
+vforked: second signal=19 event=0 nr=58 rax=0 message=0
+vforked-exit: second signal=5 event=6 nr=231 rax=-38 message=1024
+vforked-gone: second exited=1 code=4
+vfork-done: parent signal=5 event=5 nr=58 rax=-38 message=second
+exit: parent signal=5 event=6 nr=231 rax=-38 message=1792
+gone: parent exited=1 code=7",
+    );
+}
+
+/// `ptrace-clone`: PTRACE_EVENT_CLONE for a thread of a seized tracee,
+/// the thread seized as its maker and starting in PTRACE_EVENT_STOP, and
+/// its exit as the tracer waits for it.
+#[test]
+fn clone() {
+    let mut g = Tracer::new();
+    let (go_read, go_write) = g.pipe();
+    let (done_read, done_write) = g.pipe();
+    let (child, thread) = g.fork(move |c| {
+        c.sys(READ, [go_read, HEAP + 0x990, 1, 0, 0, 0]).unwrap();
+        let ctid = HEAP + 0xf00;
+        c.thread(ctid, |t| match t.sys(EXIT, [0; 6]) {
+            Err(status) => status,
+            Ok(r) => panic!("exit returned {r}"),
+        });
+        c.join(ctid);
+        c.sys(READ, [done_read, HEAP + 0x990, 1, 0, 0, 0]).unwrap();
+        c.exit(0)
+    });
+    let mut s = Strace {
+        named: [child, 0, 0, 0],
+        first_entry: false,
+    };
+    // PTRACE_O_TRACECLONE.
+    let r = g.pt(SEIZE, child, 0, 8 | O_EXITKILL);
+    g.say("seize", r);
+    g.call(WRITE, [go_write, HEAP + 0x790, 1, 0, 0, 0]);
+    let status = g.wait(child, WALL);
+    let at = HEAP + 0x500;
+    g.pt(GETEVENTMSG, child, 0, at);
+    s.named[2] = g.m.read_u64(GuestAddr(at)).unwrap();
+    let (_, regs) = g.regs(child);
+    let (nr, rax) = (g.reg(regs, ORIG_RAX) as i64, g.reg(regs, RAX) as i64);
+    let (size, info) = Strace::info(&mut g, child);
+    let op = g.m.read_u64(GuestAddr(info)).unwrap() & 0xff;
+    g.lines.push(format!(
+        "clone signal={} event={} nr={nr} rax={rax} info-op={op} size={size}",
+        (status >> 8) & 0xff,
+        status >> 16
+    ));
+    s.expect(&mut g, s.named[2], "thread");
+    g.pt(CONT, s.named[2], 0, 0);
+    g.pt(CONT, child, 0, 0);
+    s.expect(&mut g, s.named[2], "thread-gone");
+    g.call(WRITE, [done_write, HEAP + 0x790, 1, 0, 0, 0]);
+    s.expect(&mut g, child, "gone");
+    thread.join().unwrap();
+    g.check(
+        "seize=0
+clone signal=5 event=3 nr=56 rax=-38 info-op=0 size=24
+thread: second signal=5 event=128 nr=56 rax=0 message=0
+thread-gone: second exited=1 code=0
+gone: parent exited=1 code=0",
     );
 }

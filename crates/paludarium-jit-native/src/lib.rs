@@ -283,7 +283,7 @@ mod native {
             let Some(Some(code)) = self.code.get() else {
                 return 0;
             };
-            let ran = code.run(state, &Context { mem, generation });
+            let ran = code.run(state, &Context::new(mem, generation));
             usize::try_from(ran).unwrap_or(0).min(self.len)
         }
 

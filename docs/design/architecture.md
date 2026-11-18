@@ -152,8 +152,16 @@ the interpreter runs the block as before.
 
 Compiled code means exactly what the interpreter's forms mean. It reads and
 writes the thread's registers where the interpreter keeps them, in memory,
-with nothing copied in or out, and reaches guest memory only through
-the MMU's own loads and stores, with their checks. It stops before an
+with nothing copied in or out. A load or store of up to 8 bytes within one
+aligned word goes straight to the page's bytes when the thread's TLB holds
+the page and the slot the MMU keeps for compiled code says the access may
+go through it: the slot holds only at the epoch it was filled at, and
+allows a store only where the MMU's own stores through the TLB would
+write, never to an executable page. Every other access, and every one the
+slot does not allow, such as a write to a page that `mprotect`,
+`UFFDIO_WRITEPROTECT` or a clear soft-dirty bit protects, calls the MMU's
+own loads and stores, with their checks, which fill the slot again. It
+stops before an
 instruction whose load or store fails, having changed nothing for it, so that
 the interpreter runs it again and reports the fault, and after a load or store
 that moved the code generation on. A taken branch, `jmp`, `call` and `ret` end

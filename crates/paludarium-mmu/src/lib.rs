@@ -1664,6 +1664,9 @@ struct Tlb {
     /// Which entries are set, one bit each, so that emptying touches only
     /// those.
     used: [u64; TLB_ENTRIES / 64],
+    /// What compiled code reads of the entries ([`JitSlot`]), one slot for
+    /// each.
+    jit: Box<[JitSlot]>,
 }
 
 impl Default for Tlb {
@@ -1671,7 +1674,121 @@ impl Default for Tlb {
         Tlb {
             entries: std::iter::repeat_with(|| None).take(TLB_ENTRIES).collect(),
             used: [0; TLB_ENTRIES / 64],
+            jit: std::iter::repeat_with(JitSlot::default)
+                .take(TLB_ENTRIES)
+                .collect(),
         }
+    }
+}
+
+/// What compiled code reads of one [`TlbEntry`] to load or store a value
+/// that lies in one word of its page without calling into the MMU, as
+/// [`AddressSpace::read_value`] and [`AddressSpace::write_value`] would
+/// through the TLB. A slot holds only while `epoch` is the space's epoch,
+/// which compiled code compares on each access: it holds the entry of the
+/// same index of [`Tlb::entries`], which is emptied, and its slot with it,
+/// before that entry changes or goes.
+///
+/// `read` and `write` are the page an access may read or write this way,
+/// or [`NO_PAGE`]. Only an entry whose frame has its bytes, and that has
+/// no file to check ([`FileEnd`]), may be read: `words` is where the words
+/// of those bytes are, kept by the entry. One may be written only when
+/// [`AddressSpace::write_value`] would write it through the TLB: its
+/// protection, which is what [`Page::cached_access`] gives, so with no
+/// write while `UFFDIO_WRITEPROTECT` protects the page or its soft-dirty
+/// bit is clear, allows writing, it is no copy on write, and it shows no
+/// shared mapping. It must also not be executable, so that a store never
+/// changes code that was or may be fetched.
+///
+/// A store says it is under way in [`ThreadTlb::storing`], and reads the
+/// epoch again, as [`AddressSpace::write_value`] does.
+#[repr(C)]
+#[derive(Default)]
+pub struct JitSlot {
+    /// The epoch the slot was filled at, or 0, which no space has.
+    epoch: AtomicU64,
+    read: AtomicU64,
+    write: AtomicU64,
+    words: AtomicU64,
+}
+
+/// The page of an empty [`JitSlot`]: no page starts there.
+pub const NO_PAGE: u64 = 1;
+
+/// The slots of a thread whose TLB cannot be had: none holds.
+static NO_JIT_SLOTS: [JitSlot; TLB_ENTRIES] = [const {
+    JitSlot {
+        epoch: AtomicU64::new(0),
+        read: AtomicU64::new(NO_PAGE),
+        write: AtomicU64::new(NO_PAGE),
+        words: AtomicU64::new(0),
+    }
+}; TLB_ENTRIES];
+
+/// The [`JitAccess::storing`] of [`NO_JIT_SLOTS`], which no store reaches.
+static NO_STORING: AtomicU64 = AtomicU64::new(NOT_STORING);
+
+/// Where compiled code finds what it reads to load and store through a
+/// thread's [`JitSlot`]s ([`AddressSpace::jit_access`]), as addresses in
+/// this process. Each is valid while the space lives and the thread that
+/// asked for them runs, and only on that thread.
+#[derive(Clone, Copy, Debug)]
+pub struct JitAccess {
+    /// The first of [`JIT_SLOTS`] [`JitSlot`]s: the slot of a page is its
+    /// page number modulo [`JIT_SLOTS`].
+    pub slots: u64,
+    /// The thread's [`ThreadTlb::storing`], an `AtomicU64`.
+    pub storing: u64,
+    /// The space's epoch, layout, last watched layout and code
+    /// generation ([`CodeCounters`]), each an `AtomicU64`: an access is
+    /// under the code generation [`AddressSpace::code_generation_cached`]
+    /// gives when `watched` is one more than `layout`.
+    pub epoch: u64,
+    pub layout: u64,
+    pub watched: u64,
+    pub generation: u64,
+}
+
+/// How many [`JitSlot`]s a thread has.
+pub const JIT_SLOTS: u64 = TLB_ENTRIES as u64;
+
+/// Where the fields of a [`JitSlot`] are, in bytes, and its size.
+pub const JIT_SLOT_EPOCH: i32 = std::mem::offset_of!(JitSlot, epoch) as i32;
+pub const JIT_SLOT_READ: i32 = std::mem::offset_of!(JitSlot, read) as i32;
+pub const JIT_SLOT_WRITE: i32 = std::mem::offset_of!(JitSlot, write) as i32;
+pub const JIT_SLOT_WORDS: i32 = std::mem::offset_of!(JitSlot, words) as i32;
+pub const JIT_SLOT_BYTES: u64 = std::mem::size_of::<JitSlot>() as u64;
+
+fn address_of(atomic: &AtomicU64) -> u64 {
+    std::ptr::from_ref(atomic).addr() as u64
+}
+
+impl JitSlot {
+    fn clear(&self) {
+        self.epoch.store(0, Ordering::Relaxed);
+        self.read.store(NO_PAGE, Ordering::Relaxed);
+        self.write.store(NO_PAGE, Ordering::Relaxed);
+    }
+
+    /// Fills the slot from `entry` at `epoch`.
+    fn fill(&self, entry: &TlbEntry, epoch: u64) {
+        let (read, write, words) = match (&entry.frame, &entry.file) {
+            (TlbFrame::Bytes(data), None) => {
+                let read = entry.prot.allows_read().then_some(entry.page);
+                let write = (entry.prot.contains(Prot::WRITE)
+                    && !entry.prot.contains(Prot::EXEC)
+                    && !entry.cow
+                    && entry.shared.is_none())
+                .then_some(entry.page);
+                (read, write, data.words.as_ptr().addr() as u64)
+            }
+            _ => (None, None, 0),
+        };
+        self.words.store(words, Ordering::Relaxed);
+        self.read.store(read.unwrap_or(NO_PAGE), Ordering::Relaxed);
+        self.write
+            .store(write.unwrap_or(NO_PAGE), Ordering::Relaxed);
+        self.epoch.store(epoch, Ordering::Relaxed);
     }
 }
 
@@ -1691,6 +1808,7 @@ impl Tlb {
 
     fn insert(&mut self, entry: TlbEntry) {
         let slot = Self::slot(entry.page);
+        self.jit[slot].clear();
         self.entries[slot] = Some(entry);
         self.used[slot / 64] |= 1 << (slot % 64);
     }
@@ -1699,9 +1817,19 @@ impl Tlb {
         for (word, used) in self.used.iter_mut().enumerate() {
             while *used != 0 {
                 let slot = word * 64 + used.trailing_zeros() as usize;
+                self.jit[slot].clear();
                 self.entries[slot] = None;
                 *used &= *used - 1;
             }
+        }
+    }
+
+    /// Fills the [`JitSlot`] of `page` at `epoch`, which the entries are
+    /// valid at, when the TLB holds the page.
+    fn fill_jit(&self, page: u64, epoch: u64) {
+        let slot = Self::slot(page);
+        if let Some(entry) = self.entries[slot].as_ref().filter(|e| e.page == page) {
+            self.jit[slot].fill(entry, epoch);
         }
     }
 }
@@ -6059,6 +6187,8 @@ mod processes_tests;
 #[cfg(test)]
 mod jit_tests;
 #[cfg(test)]
+mod jit_tlb_tests;
+#[cfg(test)]
 mod threads_tests;
 #[cfg(test)]
 mod tlb_tests;
@@ -6570,6 +6700,72 @@ impl AddressSpace {
     }
     pub fn write_u64(&self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
         self.write_value(addr, 8, value)
+    }
+    /// Where compiled code running on this thread finds what it reads to
+    /// load and store through this thread's TLB ([`JitSlot`]).
+    #[must_use]
+    pub fn jit_access(&self) -> JitAccess {
+        let slots = THREAD_TLB.with(|cell| {
+            cell.try_borrow().ok().map(|thread| {
+                (
+                    thread.tlb.jit.as_ptr().addr() as u64,
+                    address_of(&thread.storing),
+                )
+            })
+        });
+        // A TLB that is in use cannot be had; nothing holds in these slots,
+        // so every access takes the calls below.
+        let (slots, storing) =
+            slots.unwrap_or_else(|| (NO_JIT_SLOTS.as_ptr().addr() as u64, address_of(&NO_STORING)));
+        JitAccess {
+            slots,
+            storing,
+            epoch: address_of(&self.code.epoch),
+            layout: address_of(&self.code.layout),
+            watched: address_of(&self.code.watched),
+            generation: address_of(&self.code.generation),
+        }
+    }
+    /// [`Self::read_value`] for compiled code, which then fills the page's
+    /// [`JitSlot`], so that the next access reads it there.
+    pub fn jit_read_value(&self, addr: GuestAddr, size: usize) -> Result<u64, Fault> {
+        let value = self.read_value(addr, size)?;
+        self.fill_jit(addr);
+        Ok(value)
+    }
+    /// [`Self::write_value`] for compiled code, which then fills the page's
+    /// [`JitSlot`] as [`Self::jit_read_value`] does.
+    pub fn jit_write_value(&self, addr: GuestAddr, size: usize, value: u64) -> Result<(), Fault> {
+        self.write_value(addr, size, value)?;
+        self.fill_jit(addr);
+        Ok(())
+    }
+    /// Fills the [`JitSlot`] of the page of `addr` when this thread's TLB
+    /// holds this space's entry of it.
+    fn fill_jit(&self, addr: GuestAddr) {
+        let epoch = self.code.epoch.load(Ordering::Acquire);
+        let page = addr.0 & !(PAGE_SIZE - 1);
+        THREAD_TLB.with(|cell| {
+            if let Ok(thread) = cell.try_borrow()
+                && thread.epoch == epoch
+            {
+                thread.tlb.fill_jit(page, epoch);
+            }
+        });
+    }
+    /// The epoch and the pages that the [`JitSlot`] of `page` holds for
+    /// reads and writes, for tests.
+    #[cfg(test)]
+    fn jit_slot(&self, page: u64) -> (bool, u64, u64) {
+        THREAD_TLB.with(|cell| {
+            let thread = cell.borrow();
+            let slot = &thread.tlb.jit[Tlb::slot(page)];
+            (
+                slot.epoch.load(Ordering::Relaxed) == self.code.epoch.load(Ordering::Relaxed),
+                slot.read.load(Ordering::Relaxed),
+                slot.write.load(Ordering::Relaxed),
+            )
+        })
     }
     /// The little-endian value of `size` bytes, of which 8 are the most it
     /// takes, as [`Self::read`] gives them, with one atomic access where they

@@ -3,8 +3,8 @@
 use paludarium_cpu::compile::{Compiler, Fast, Form};
 use paludarium_cpu::{CpuState, flag, reg, step};
 use paludarium_decoder::decode;
-use paludarium_mmu::{AddressSpace, MappingKind, Prot};
-use paludarium_types::GuestAddr;
+use paludarium_mmu::{AddressSpace, MappingKind, Prot, Userfault};
+use paludarium_types::{GuestAddr, PAGE_SIZE};
 
 use crate::native::NativeCompiler;
 
@@ -457,17 +457,32 @@ fn forms(code: &[u8]) -> Vec<Form> {
     forms
 }
 
-/// Runs `code` compiled and in the interpreter from random states.
+/// Fills the thread's slots of the data and the stack pages, as accesses
+/// of compiled code do, so that the next accesses go through them; the
+/// bytes stay as they were.
+fn warm(mem: &AddressSpace) {
+    let pages = (DATA..DATA + DATA_LEN as u64).chain(STACK - STACK_LEN as u64..STACK);
+    for page in pages.step_by(PAGE_SIZE as usize) {
+        let value = mem.jit_read_value(GuestAddr(page), 8).unwrap();
+        mem.jit_write_value(GuestAddr(page), 8, value).unwrap();
+    }
+}
+
+/// Runs `code` compiled and in the interpreter from random states, every
+/// other one with the slots of the pages filled ([`warm`]).
 fn compare(compiler: &NativeCompiler, code: &[u8], random: &mut Random, rounds: usize) -> usize {
     let forms = forms(code);
     let compiled = compiler
         .compile(&forms)
         .unwrap_or_else(|| panic!("{code:02x?} did not compile"));
     let mut stopped = 0;
-    for _ in 0..rounds {
+    for round in 0..rounds {
         let data: Vec<u8> = (0..DATA_LEN).map(|_| random.next() as u8).collect();
         let before = state(random);
         let (fast_memory, slow_memory) = (space(code, &data), space(code, &data));
+        if round % 2 == 0 {
+            warm(&fast_memory);
+        }
         let generation = fast_memory.code_generation_cached();
         let mut fast = before.clone();
         let ran = compiled.run(&mut fast, &fast_memory, generation);
@@ -728,4 +743,61 @@ fn a_compare_exchange_that_matches_does_what_the_interpreter_does() {
             assert_ne!(contents(&fast_memory).0, data, "{code:02x?} wrote nothing");
         }
     }
+}
+
+/// `mov rcx, [rbx]; mov [rbx], rax` run with the slot of the data page
+/// filled, after `protect` changed what the page allows: what ran, the
+/// word there, and the memory. The load fills the slot again, at the new
+/// epoch, so the store finds it holding the page for reads.
+fn store_after(protect: impl FnOnce(&mut AddressSpace)) -> (usize, u64, AddressSpace) {
+    let compiler = NativeCompiler::new(1, false).unwrap();
+    let code = [0x48, 0x8b, 0x0b, 0x48, 0x89, 0x03];
+    let compiled = compiler.compile(&forms(&code)).unwrap();
+    let mut memory = space(&code, &[1; 8]);
+    warm(&memory);
+    protect(&mut memory);
+    let mut state = CpuState::new(GuestAddr(CODE), GuestAddr(STACK - 0x100));
+    state.gpr[reg::RBX] = DATA;
+    state.gpr[reg::RAX] = 0x5555;
+    let ran = compiled.run(&mut state, &memory, memory.code_generation_cached());
+    let word = memory.read_u64(GuestAddr(DATA)).unwrap();
+    (ran, word, memory)
+}
+
+#[test]
+fn a_store_through_a_filled_slot_writes() {
+    let (ran, word, _) = store_after(|_| {});
+    assert_eq!((ran, word), (2, 0x5555));
+}
+
+#[test]
+fn a_store_to_a_page_made_read_only_after_its_slot_was_filled_faults() {
+    let (ran, word, _) = store_after(|m| {
+        m.protect(GuestAddr(DATA), PAGE_SIZE, Prot::READ).unwrap();
+    });
+    assert_eq!((ran, word), (1, 0x0101_0101_0101_0101));
+}
+
+#[test]
+fn a_store_to_a_page_userfaultfd_write_protects_faults() {
+    let (ran, word, _) = store_after(|m| {
+        let view = m.view();
+        view.userfault_register(DATA, DATA + PAGE_SIZE, 7, Userfault::WP)
+            .unwrap();
+        view.userfault_write_protect(DATA, DATA + PAGE_SIZE, true)
+            .unwrap();
+    });
+    assert_eq!((ran, word), (1, 0x0101_0101_0101_0101));
+}
+
+#[test]
+fn a_store_after_clear_refs_makes_the_page_soft_dirty_again() {
+    let soft_dirty = |m: &AddressSpace| m.view().pagemap(DATA, 1).unwrap()[0] >> 55 & 1;
+    let mut cleared = None;
+    let (ran, word, memory) = store_after(|m| {
+        assert!(m.view().clear_soft_dirty());
+        cleared = Some(soft_dirty(m));
+    });
+    assert_eq!((ran, word, cleared), (2, 0x5555, Some(0)));
+    assert_eq!(soft_dirty(&memory), 1);
 }

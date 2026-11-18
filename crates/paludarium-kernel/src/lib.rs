@@ -395,6 +395,7 @@ struct Published {
     memory: usize,
     files: [usize; 3],
     credentials: credentials::Credentials,
+    personality: u32,
 }
 
 impl Kernel {
@@ -788,6 +789,7 @@ impl Kernel {
                 && p.memory == memory
                 && p.files == files
                 && p.credentials == state.credentials
+                && p.personality == state.personality
         }) {
             return;
         }
@@ -802,6 +804,7 @@ impl Kernel {
                 memory: Some(mem.view()),
                 files: self.files.view(),
                 seccomp: (state.seccomp.mode, state.seccomp.filters()),
+                personality: state.personality,
             },
         );
         self.published = Some(Published {
@@ -811,6 +814,7 @@ impl Kernel {
             memory,
             files,
             credentials: state.credentials.clone(),
+            personality: state.personality,
         });
     }
 

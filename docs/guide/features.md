@@ -2862,13 +2862,13 @@ kernel.
   (`ELOOP`), and `O_PATH | O_NOFOLLOW` opens the link itself, which reads
   as the PID of the process reading it and names itself `/proc/self`; then
   `/proc/self/status`, `stat`, `statm`, `cmdline`, `environ`, `auxv`,
-  `limits`, `comm`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
-  `clear_refs`, `smaps`, `pagemap`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
+  `limits`, `personality`, `comm`, `exe`, `cwd`, `root`, `maps`, `mounts`, `mountinfo`,
+  `clear_refs`, `smaps`, `pagemap`, `wchan`, `io`, `fd`, `fdinfo`, `ns` and `task`. They are owned by the process's
   effective user and group, or by root once it is not dumpable (after a
   change of its IDs, until `PR_SET_DUMPABLE`), as Linux's `task_dump_owner`
   gives them; the directory, `task` and `fdinfo` (0555) are the process's
   either way, and `/proc/self` itself is root's. `stat` shows that owner and
-  the mode, 0400 for `environ`, `auxv`, `pagemap` and `io`, 0644 for `comm`, 0200 for
+  the mode, 0400 for `environ`, `auxv`, `pagemap`, `io` and `personality`, 0644 for `comm`, 0200 for
   `clear_refs` and 0444 for the other files.
   `fstat` of an open file shows its owner as of the last lookup of its path
   (an open, a `stat`, by any process), as Linux's inode, which each lookup
@@ -2907,8 +2907,8 @@ kernel.
   and then a directory for every process of the guest, zombies included, as
   Linux lists them, which is what `ps`, `pgrep` and `pidof` read. Another
   process's `/proc/<pid>` (0555, owned by its effective IDs) has `status`,
-  `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`,
-  `comm`, `maps`, `clear_refs` (0200), `smaps`, `pagemap` (0400), `io` (0400), `exe`, `cwd`,
+  `stat`, `statm`, `cmdline`, `environ` (0400), `auxv` (0400), `limits`, `personality` (0400),
+  `comm`, `maps`, `clear_refs` (0200), `smaps`, `pagemap` (0400), `wchan`, `io` (0400), `exe`, `cwd`,
   `root`, `mounts`, `mountinfo`, `fd`, `fdinfo`, `ns` (0511) and `task`, made as
   `fs/proc/base.c` and `array.c` make them for root; any other name there is
   `ENOENT`, as is the directory of a process that was never there or was
@@ -2956,6 +2956,15 @@ kernel.
   `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
   their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
   process with no memory before they check the reader.
+- `personality` of a process or of a thread, 0400 and of size 0, is the
+  thread's execution domain and flags in 8 hex digits and a newline, as
+  Linux's `proc_pid_personality` writes it when it is read. Only then, as
+  Linux's `lock_trace` decides with `ptrace_may_access` in attach mode and
+  the reader's filesystem IDs, and with Yama's `ptrace_scope` 1 (an
+  ancestor, one named by `PR_SET_PTRACER`, or `CAP_SYS_PTRACE`), may a
+  reader of another process read it (`EPERM`). A reaped task is `ESRCH`.
+  `wchan` (0444) reads `0` with no newline, as Linux's `proc_pid_wchan`
+  does for a running task and for a reader that may not read the task.
 - `io` of a process or of a thread (`/proc/<pid>/task/<tid>/io`), 0400 and
   of size 0, has the counts Linux's `task_io_accounting` keeps: `rchar` and
   `wchar`, the bytes the read and write calls moved (`read`, `pread64`,

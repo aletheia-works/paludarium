@@ -11781,6 +11781,135 @@ static int proc_io_case(void) {
     return 0;
 }
 
+/* The proc-personality-wchan case: /proc/<pid>/personality, which Linux's
+   proc_pid_personality writes when it is read for a reader that may attach
+   to the task (lock_trace: ptrace_may_access with
+   PTRACE_MODE_ATTACH_FSCREDS, and Yama), else EPERM; and wchan, 0 for a
+   task that is running or that the reader may not read. */
+/* What a read of `fd` from its start gives, with -errno for a failure. */
+static void ppw_read(const char *label, int fd) {
+    char b[64];
+    if (fd < 0) {
+        printf("%s: open errno=%d\n", label, errno);
+        return;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        printf("%s: lseek errno=%d\n", label, errno);
+        return;
+    }
+    ssize_t n = read(fd, b, sizeof b - 1);
+    if (n < 0) {
+        printf("%s: read errno=%d\n", label, errno);
+        return;
+    }
+    b[n] = 0;
+    printf("%s: [", label);
+    for (ssize_t i = 0; i < n; i++)
+        if (b[i] == '\n') printf("\\n");
+        else putchar(b[i]);
+    printf("]\n");
+}
+static void ppw_path(const char *label, const char *path) {
+    int fd = open(path, O_RDONLY);
+    ppw_read(label, fd);
+    if (fd >= 0) close(fd);
+}
+static int ppw_wait_byte(int fd) {
+    char byte;
+    return read(fd, &byte, 1) == 1 ? 0 : 1;
+}
+static int proc_personality_wchan_case(void) {
+    char path[64];
+    int own = open("/proc/self/personality", O_RDONLY);
+    ppw_read("own", own);
+    int old = (int)syscall(SYS_personality, 0xffffffffUL);
+    syscall(SYS_personality, 0x0040000UL); /* ADDR_NO_RANDOMIZE */
+    /* The same descriptor reads the new one: it is made when read. */
+    ppw_read("own after personality", own);
+    snprintf(path, sizeof path, "/proc/self/task/%d/personality", (int)getpid());
+    ppw_path("own thread", path);
+    syscall(SYS_personality, (unsigned long)old);
+    ppw_path("own wchan", "/proc/self/wchan");
+    struct stat st;
+    printf("modes personality=%o wchan=%o\n",
+           stat("/proc/self/personality", &st) ? 0 : (unsigned)(st.st_mode & 07777),
+           stat("/proc/self/wchan", &st) ? 0 : (unsigned)(st.st_mode & 07777));
+    /* A child of root's, waiting. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 81;
+    if (!kid) {
+        syscall(SYS_personality, 0x0020000UL); /* ADDR_LIMIT_32BIT, of the child only */
+        char byte = 'r';
+        write(ready[1], &byte, 1);
+        read(go[0], &byte, 1);
+        _exit(0);
+    }
+    if (ppw_wait_byte(ready[0])) return 82;
+    snprintf(path, sizeof path, "/proc/%d/personality", (int)kid);
+    ppw_path("root reads child", path);
+    int held = open(path, O_RDONLY);
+    fflush(stdout);
+    pid_t other = fork();
+    if (other < 0) return 83;
+    if (!other) {
+        /* Opened as root, read as another user: lock_trace refuses. */
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        ppw_read("other user held", held);
+        ppw_path("other user opens", path);
+        snprintf(path, sizeof path, "/proc/%d/wchan", (int)kid);
+        ppw_path("other user wchan", path);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(other));
+    /* Yama: a sibling of the same user may not attach; a parent may. */
+    int a_ready[2], a_go[2], b_done[2];
+    if (pipe(a_ready) || pipe(a_go) || pipe(b_done)) return 84;
+    fflush(stdout);
+    pid_t mid = fork();
+    if (mid < 0) return 85;
+    if (!mid) {
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(90);
+        /* The ID change made it undumpable, which would make its child's
+           files root's. */
+        prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+        fflush(stdout);
+        pid_t a = fork();
+        if (a < 0) _exit(91);
+        if (!a) {
+            char byte = 'r';
+            write(a_ready[1], &byte, 1);
+            read(a_go[0], &byte, 1);
+            _exit(0);
+        }
+        if (ppw_wait_byte(a_ready[0])) _exit(92);
+        char a_path[64];
+        snprintf(a_path, sizeof a_path, "/proc/%d/personality", (int)a);
+        ppw_path("same user parent", a_path);
+        fflush(stdout);
+        pid_t b = fork();
+        if (b < 0) _exit(93);
+        if (!b) {
+            ppw_path("same user sibling", a_path);
+            fflush(stdout);
+            _exit(0);
+        }
+        printf("sibling=%d\n", reaped(b));
+        write(a_go[1], "g", 1);
+        printf("a=%d\n", reaped(a));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("mid=%d\n", reaped(mid));
+    /* Once reaped, the descriptor reads ESRCH. */
+    write(go[1], "g", 1);
+    printf("kid=%d\n", reaped(kid));
+    ppw_read("reaped", held);
+    return 0;
+}
 /* The proc-owner-rename case: the owner fstat shows of an open file in a
    process's /proc directory, which is its inode's as the last lookup of its
    path set it (pid_revalidate), and of the process's directory and its ns,
@@ -30093,6 +30222,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "proc-owner-rename")) return proc_owner_rename_case();
     if (!strcmp(mode, "proc-io")) return proc_io_case();
+    if (!strcmp(mode, "proc-personality-wchan")) return proc_personality_wchan_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

@@ -207,6 +207,8 @@ pub(crate) struct PublicThread {
     pub files: crate::files::FilesView,
     /// Its seccomp mode and number of filters.
     pub seccomp: (u8, u32),
+    /// Its execution domain and flags (`personality`).
+    pub personality: u32,
 }
 impl Default for ThreadGroup {
     fn default() -> Self {

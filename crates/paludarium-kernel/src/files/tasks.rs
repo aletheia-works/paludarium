@@ -460,6 +460,95 @@ pub(crate) fn own_live_owner(
         }
     })
 }
+/// What a file of the task's that is made when it is read
+/// ([`crate::proc::single_file`]) finds then, as Linux's `proc_single_show`
+/// does: the task's process, the thread it shows (or its process's, for a
+/// zombie), and the reading thread when it is of another process. A thread
+/// or process that has been reaped is `ESRCH`.
+struct AtRead {
+    processes: std::sync::Arc<crate::processes::Processes>,
+    view: crate::processes::ProcessView,
+    target: PublicThread,
+    reader: Option<PublicThread>,
+}
+impl AtRead {
+    fn find(
+        processes: &std::sync::Weak<crate::processes::Processes>,
+        (pid, tid, thread): (u32, u32, bool),
+    ) -> Result<Self, Errno> {
+        let processes = processes.upgrade().ok_or(Errno(3))?; // ESRCH
+        let view = processes.view(pid).ok_or(Errno(3))?;
+        let member = view.group.threads().iter().any(|&(t, _)| t == tid);
+        if thread && !member && !(view.zombie && tid == pid) {
+            return Err(Errno(3));
+        }
+        let target = view
+            .group
+            .public(tid)
+            .or_else(|| view.group.public(pid))
+            .unwrap_or_default();
+        let (reader_pid, reader_tid) = crate::proc::caller();
+        let reader = if reader_pid == pid {
+            None
+        } else {
+            // No thread published is no reader that may see it.
+            Some(
+                processes
+                    .view(reader_pid)
+                    .and_then(|reader| reader.group.public(reader_tid))
+                    .unwrap_or_default(),
+            )
+        };
+        Ok(Self {
+            processes,
+            view,
+            target,
+            reader,
+        })
+    }
+    /// Whether the reader may read the task, as Linux's
+    /// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` decides: its own
+    /// process always, and with no dumpable rule once the memory is gone.
+    fn may_read(&self) -> bool {
+        self.reader.as_ref().is_none_or(|reader| {
+            reader.credentials.may_read_task(
+                &self.target.credentials,
+                self.view.dumpable || self.view.zombie,
+                false,
+            )
+        })
+    }
+    /// Whether the reader may attach to the task, as Linux's `lock_trace`
+    /// asks with `PTRACE_MODE_ATTACH_FSCREDS`: it may read it, and Yama
+    /// (`ptrace_scope` 1) lets it in, or it has `CAP_SYS_PTRACE` in the
+    /// task's user namespace.
+    fn may_attach(&self, pid: u32) -> bool {
+        let (reader_pid, _) = crate::proc::caller();
+        self.may_read()
+            && self.reader.as_ref().is_none_or(|reader| {
+                self.processes.yama_allows(reader_pid, pid)
+                    || reader.credentials.capable_in(
+                        crate::credentials::CAP_SYS_PTRACE,
+                        &self.target.credentials.user,
+                    )
+            })
+    }
+}
+/// The task's process, thread and whether it is a thread's file, for
+/// [`AtRead::find`], with the table held weakly, as the file that holds it
+/// sits in a descriptor table of theirs.
+fn at_read(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+) -> (
+    std::sync::Weak<crate::processes::Processes>,
+    (u32, u32, bool),
+) {
+    (
+        std::sync::Arc::downgrade(processes),
+        (task.pid, task.tid, task.thread),
+    )
+}
 /// `io` of the task: its counts, of the thread or of the whole process,
 /// made when it is read, as Linux's `do_io_accounting`. The reader then must
 /// be of its process or one `ptrace_may_access` lets read it with its file
@@ -471,40 +560,71 @@ pub(super) fn io(
     flags: u32,
     owner: crate::proc::Owner,
 ) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
-    // Weak, as the file that holds it sits in a descriptor table of theirs.
-    let processes = std::sync::Arc::downgrade(processes);
-    let (pid, tid, thread) = (task.pid, task.tid, task.thread);
+    let (processes, which) = at_read(processes, task);
     let text: crate::proc::Text = std::sync::Arc::new(move || {
-        let processes = processes.upgrade().ok_or(Errno(3))?; // ESRCH
-        let view = processes.view(pid).ok_or(Errno(3))?;
-        let member = view.group.threads().iter().any(|&(t, _)| t == tid);
-        if thread && !member && !(view.zombie && tid == pid) {
-            return Err(Errno(3));
+        let now = AtRead::find(&processes, which)?;
+        if !now.may_read() {
+            return Err(Errno::EACCES);
         }
-        let (reader_pid, reader_tid) = crate::proc::caller();
-        if reader_pid != pid {
-            let target = view
-                .group
-                .public(tid)
-                .or_else(|| view.group.public(pid))
-                .unwrap_or_default();
-            let reader = processes
-                .view(reader_pid)
-                .and_then(|reader| reader.group.public(reader_tid))
-                .ok_or(Errno::EACCES)?;
-            if !reader.credentials.may_read_task(
-                &target.credentials,
-                view.dumpable || view.zombie,
-                false,
-            ) {
-                return Err(Errno::EACCES);
-            }
-        }
+        let (_, tid, thread) = which;
         Ok(crate::io_accounting::render(
-            view.group.io(thread.then_some(tid)),
+            now.view.group.io(thread.then_some(tid)),
         ))
     });
-    std::sync::Arc::new(crate::proc::single_file(text, flags, owner))
+    std::sync::Arc::new(crate::proc::single_file(
+        text,
+        flags,
+        crate::proc::private_stat(0),
+        owner,
+    ))
+}
+/// `personality` of the task, as Linux's `proc_pid_personality` writes it
+/// when it is read: the thread's execution domain and flags, in 8 hex
+/// digits, for a reader that may attach to it (`lock_trace`, else `EPERM`).
+/// 0400.
+pub(super) fn personality(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    flags: u32,
+    owner: crate::proc::Owner,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let (processes, which) = at_read(processes, task);
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        let now = AtRead::find(&processes, which)?;
+        if !now.may_attach(which.0) {
+            return Err(Errno::EPERM);
+        }
+        Ok(format!("{:08x}\n", now.target.personality).into_bytes())
+    });
+    std::sync::Arc::new(crate::proc::single_file(
+        text,
+        flags,
+        crate::proc::private_stat(0),
+        owner,
+    ))
+}
+/// `wchan` of the task, as Linux's `proc_pid_wchan` writes it when it is
+/// read: `0`, with no newline, for a reader that may not read the task and
+/// for a task that is not waiting. There are no kernel functions here to
+/// name where a waiting task waits, so it is `0` for that too. Any reader
+/// may open it (0444).
+pub(super) fn wchan(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    flags: u32,
+    owner: crate::proc::Owner,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let (processes, which) = at_read(processes, task);
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        AtRead::find(&processes, which)?;
+        Ok(b"0".to_vec())
+    });
+    std::sync::Arc::new(crate::proc::single_file(
+        text,
+        flags,
+        crate::proc::stat(0),
+        owner,
+    ))
 }
 /// The group of the task and the thread a write to its `comm` renames.
 pub(super) fn comm(task: &Task) -> (std::sync::Arc<crate::threads::ThreadGroup>, u32, u32) {
@@ -621,7 +741,9 @@ pub(super) fn stat(
         // As Linux's, of size 0, as they are made as they are read.
         TaskEntry::Maps(_) => crate::proc::stat(0),
         // 0400, as Linux's.
-        TaskEntry::Pagemap | TaskEntry::Io => crate::proc::private_stat(0),
+        TaskEntry::Pagemap | TaskEntry::Io | TaskEntry::Personality => crate::proc::private_stat(0),
+        // 0444, as Linux's.
+        TaskEntry::Wchan => crate::proc::stat(0),
         // 0200, as Linux's.
         TaskEntry::ClearRefs => crate::proc::write_only_stat(),
         // 0644, which their owner may write.

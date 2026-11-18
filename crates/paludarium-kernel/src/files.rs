@@ -6774,6 +6774,15 @@ fn open_path(
         if path.entry == crate::proc::TaskEntry::Io {
             return Ok((tasks::io(c.processes, &task, flags, owner), p.to_vec()));
         }
+        if path.entry == crate::proc::TaskEntry::Personality {
+            return Ok((
+                tasks::personality(c.processes, &task, flags, owner),
+                p.to_vec(),
+            ));
+        }
+        if path.entry == crate::proc::TaskEntry::Wchan {
+            return Ok((tasks::wchan(c.processes, &task, flags, owner), p.to_vec()));
+        }
         if path.entry == crate::proc::TaskEntry::ClearRefs {
             return Ok((
                 tasks::clear_refs(c.processes, &task, flags, owner),

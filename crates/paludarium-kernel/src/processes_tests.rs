@@ -4481,6 +4481,7 @@ mod shm {
             ("msgmnb", "16384\n"),
             ("msgmni", "32000\n"),
             ("sem", "32000\t1024000000\t500\t32000\n"),
+            ("perf_event_mlock_kb", "516\n"),
             ("perf_event_paranoid", "2\n"),
             ("unprivileged_bpf_disabled", "2\n"),
         ] {

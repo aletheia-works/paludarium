@@ -2620,11 +2620,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `proc_dointvec` がベクトルを読むのと同じく、与えた数だけを設定します。不正な値は
   `EINVAL` で、その前の値は設定されたままです。`semmni` は、最後に 0 から 32768 の間に
   なければ元に戻ります（`ERANGE`、`proc_ipc_sem_dointvec`）。ほかに、マシンの
-  `perf_event_paranoid` と `unprivileged_bpf_disabled` があります。エミュレートする
-  マシン全体に 1 つずつで、最初は Linux の既定値の 2 です。root の持つモード 0644 の
-  ファイルで、書くために開けるのは root（どのユーザー名前空間の外でもユーザー ID 0）
-  だけです（`EACCES`）。`perf_event_paranoid` は任意の `int` を取ります
-  （`proc_dointvec`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
+  `perf_event_mlock_kb`、`perf_event_paranoid`、`unprivileged_bpf_disabled` があります。
+  エミュレートするマシン全体に 1 つずつで、最初は Linux の既定値（516、2、2）です。
+  root の持つモード 0644 のファイルで、書くために開けるのは root（どのユーザー名前空間の
+  外でもユーザー ID 0）だけです（`EACCES`）。`perf_event_mlock_kb` と
+  `perf_event_paranoid` は任意の `int` を取ります（`proc_dointvec`）。`unprivileged_bpf_disabled` は、Linux の `bpf_unpriv_handler`
   と同じく、`CAP_SYS_ADMIN` のある書き手から（`EPERM`）0 から 2 まで（`EINVAL`）を
   取り、いったん 1 になるとほかの値を取りません（`EPERM`）。`perf_event_open` と `bpf` は
   そのときの値を確かめます。`shm_rmid_forced`（0 か 1。持ち主と書ける者は上限と同じ）を
@@ -3113,7 +3113,25 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   レジスタのフィールドを、x86 の `perf_simd_reg_validate` と同じく確かめます（`EINVAL`）。
   XMM か YMM（2 か 4 クワッドワード）は 16 個すべて、ZMM（8）は 32 個すべて、opmask（1）は
   8 個すべてか、どれもないかです。正しく使っても、ソフトウェアのイベントは取らないので
-  `EOPNOTSUPP` です。ディスクリプタのリンクは
+  `EOPNOTSUPP` です。イベントの `mmap` は、Linux の `perf_mmap` と同じく
+  リングバッファをマップします。共有のマッピング（`EINVAL`）で、ユーザーページと 2 の
+  べき乗の数のデータページ、またはデータページなし（`EINVAL`）です。新しいタスクが
+  引き継ぐ、すべての CPU のイベントはマップできません（`EINVAL`）。最初のマッピングが
+  バッファを作り、後のマッピングは同じ大きさでなければならず（`EINVAL`）、それを
+  共有します。バッファより先のオフセットは AUX 領域を求めます。AUX 領域はユーザー
+  ページの `aux_offset` と `aux_size` の示す、データページより先の場所にあり、2 の
+  べき乗のページ数でなければなりません（`EINVAL`）。ソフトウェアのイベントには
+  ありません（`EOPNOTSUPP`）。ページは、CPU ごとに `perf_event_mlock_kb` まで
+  マッピングのユーザーに課され、残りはアドレス空間の固定したページに課されます。
+  後者は、`perf_event_paranoid` が -1 か、呼び出し元が `CAP_IPC_LOCK` を持つので
+  なければ、`RLIMIT_MEMLOCK` を超えられません（`EPERM`）。後のマッピングも、Linux
+  master と同じくユーザーに課され、返されません。マッピングは `fork` した子に写されず、
+  コアダンプにも含まれず（`VM_DONTCOPY`、`VM_DONTDUMP`）、ディスクリプタが閉じられても
+  イベントを数え続けさせます。最後にアンマップされると、バッファと課したものは
+  なくなります。ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
+  `size` 96、データのオフセットと大きさ、`cap_bit0_is_deprecated` があり
+  `cap_user_rdpmc` はなく、インデックス 0、そしてシーケンスロックの 2 回の増加の間に
+  数と有効な時間と動いた時間があります。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c` と同じくマップを

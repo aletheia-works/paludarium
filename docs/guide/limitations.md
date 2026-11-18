@@ -231,9 +231,20 @@ verified.
   signal frame's write counts as the thread's own; a context switch is a
   sleep of the thread, not a preemption (but for a thread with `rseq` that
   gives its virtual CPU to another); and a thread without `rseq` moves to
-  another CPU only when a new CPU mask changes the lowest CPU it allows. There is no ring buffer: `mmap` of an event
-  is `ENODEV`, a sampling event takes no samples and sends no signal, and
-  `poll` never finds one readable. `inherit_stat` is taken, but an
+  another CPU only when a new CPU mask changes the lowest CPU it allows.
+  An event's ring buffer maps, but nothing writes records to it yet: a
+  sampling event takes no samples and sends no signal, and `poll` never
+  finds one readable. Its user page shows the count and times as of the
+  `mmap`, the event's enabling and its reset, where Linux updates them
+  each time the event is scheduled in, and `cap_user_time` is never set.
+  Where Linux's checks of a mapping and of where it goes both fail, the
+  mapping's are the error here. Until the memory manager knows Linux's
+  rules for the mapping (`VM_PFNMAP`), a write to a data page lands, where
+  Linux raises `SIGBUS`; a part of the mapping may be unmapped, moved or
+  given another protection, where Linux refuses to split it (`EINVAL`); and
+  `MADV_DOFORK` takes it into a child, where Linux refuses it on `VM_IO`
+  (`EINVAL`); and `mlock` locks it, where Linux leaves a `VM_SPECIAL`
+  mapping unlocked. `inherit_stat` is taken, but an
   inherited event's end sends no read record, as nothing is recorded. An
   event of a task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the

@@ -3027,11 +3027,12 @@ kernel.
   vector: a bad one is `EINVAL` and leaves the ones before it set, and
   `semmni` goes back to what it was unless it ends from 0 to 32768
   (`ERANGE`, `proc_ipc_sem_dointvec`). Beside them are the machine's
-  `perf_event_paranoid` and `unprivileged_bpf_disabled`, one each for the
-  whole emulated machine and 2 at first, Linux's defaults: root's files of
-  mode 0644, which only root (user ID 0 outside any user namespace) may
-  open to write (`EACCES`). `perf_event_paranoid` takes any `int`
-  (`proc_dointvec`); `unprivileged_bpf_disabled` takes 0 to 2 (`EINVAL`)
+  `perf_event_mlock_kb`, `perf_event_paranoid` and
+  `unprivileged_bpf_disabled`, one each for the whole emulated machine and
+  at Linux's defaults at first (516, 2 and 2): root's files of mode 0644,
+  which only root (user ID 0 outside any user namespace) may open to write
+  (`EACCES`). `perf_event_mlock_kb` and `perf_event_paranoid` take any
+  `int` (`proc_dointvec`); `unprivileged_bpf_disabled` takes 0 to 2 (`EINVAL`)
   from a writer with `CAP_SYS_ADMIN` (`EPERM`), and once 1 it takes no
   other value (`EPERM`), as Linux's `bpf_unpriv_handler`; `perf_event_open`
   and `bpf` check what they are now. `shm_rmid_forced` (0 or 1, owned and
@@ -3597,7 +3598,26 @@ kernel.
   `perf_simd_reg_validate` checks them (`EINVAL`): XMM or YMM (2 or 4
   quadwords) all 16 registers, ZMM (8) all 32, the opmask ones (1) all 8,
   or none; a valid use of them is `EOPNOTSUPP`, as a software event takes
-  none. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  none. `mmap` of an event maps its ring buffer, as Linux's
+  `perf_mmap`: a shared mapping (`EINVAL`) of a user page and a power of
+  two of data pages, or none (`EINVAL`), and none of an event of every CPU
+  that new tasks inherit (`EINVAL`). The first mapping makes the buffer; a
+  later one must be as large (`EINVAL`) and shares it. An offset past the
+  buffer asks for its AUX area, which must lie where the user page's
+  `aux_offset` and `aux_size` put it, past the data pages, a power of two
+  of pages (`EINVAL`); a software event has none (`EOPNOTSUPP`). The
+  pages are charged to the mapping's user up to `perf_event_mlock_kb` for
+  each CPU, and the rest to the address space's pinned pages, which may
+  not pass `RLIMIT_MEMLOCK` (`EPERM`) unless `perf_event_paranoid` is -1
+  or the caller has `CAP_IPC_LOCK`; a later mapping is charged to the user
+  too and never given back, as in Linux master. The mapping is not copied
+  to a `fork`ed child nor held in a core dump (`VM_DONTCOPY`,
+  `VM_DONTDUMP`), and keeps the event counting though its descriptors are
+  closed; its last unmapping frees the buffer and its charges. The user
+  page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
+  offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
+  index 0, and the count and times enabled and running between two bumps
+  of the sequence lock. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and

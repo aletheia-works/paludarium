@@ -2342,7 +2342,11 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             Err(e) => err(e),
         };
     }
+    let event = file
+        .as_ref()
+        .is_some_and(|f| f.as_any().is_some_and(|v| v.is::<crate::perf::EventFile>()));
     if let Some(file) = &file
+        && !event
         && let Err(e) = check_mappable(file.as_ref(), prot, flags, offset, len, noexec)
     {
         return err(e);
@@ -2394,6 +2398,24 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     // `check_mappable`).
     if flags & (MAP_GROWSDOWN | MAP_SHARED) == MAP_GROWSDOWN | MAP_SHARED {
         return err(Errno::EINVAL);
+    }
+    // An event's ring buffer maps its own pages (`perf_mmap`).
+    if let Some(file) = &file
+        && event
+        && let Some(result) = crate::perf::mmap(
+            c,
+            file,
+            placement,
+            len,
+            prot,
+            flags & MAP_SHARED != 0,
+            offset,
+        )
+    {
+        return match result {
+            Ok(at) => ok(at),
+            Err(e) => err(e),
+        };
     }
     // What the mapping shows is made first, outside the address space's
     // lock, as it may read the file. The mapping and what it shows then go

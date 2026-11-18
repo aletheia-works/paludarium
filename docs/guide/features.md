@@ -2986,9 +2986,17 @@ kernel.
   the file of its executable `PT_LOAD` segments; 0 for a zombie), the start
   of the stack and of the heap, the signal sets as decimal numbers, `wchan` (1 for a task that
   waits, as Linux shows root, though not for a process of more than one thread
-  as a whole), `exit_signal` (17 for the reader's own), and where
+  as a whole), `exit_signal` (17 for the reader's own), the start and end
+  of the program's data (Linux's `start_data` and `end_data`, as
+  `load_elf_binary` finds them: the highest address and the highest end in
+  the file of all its `PT_LOAD` segments), and where
   the argument and environment strings lie. What nothing measures is 0: page
   faults, resident memory, the start time and the scheduler's figures.
+  A reader that may not see the task's memory, as Linux's
+  `ptrace_may_access` decides with its filesystem IDs, gets 1 for
+  `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
+  every field from `start_data` on, as Linux's `do_task_stat` hides them;
+  a zombie's dumpable flag no longer matters there.
   `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.

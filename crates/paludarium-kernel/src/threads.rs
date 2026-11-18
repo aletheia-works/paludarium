@@ -113,6 +113,9 @@ pub struct ThreadGroup {
     /// Where the running program's code starts and ends (Linux's
     /// `start_code` and `end_code`), which `stat` and `statm` show.
     code: Mutex<(u64, u64)>,
+    /// Where its data starts and ends (`start_data` and `end_data`), which
+    /// `stat` shows.
+    data: Mutex<(u64, u64)>,
     /// The head `set_robust_list` gave each thread that called it.
     robust_lists: Mutex<BTreeMap<u32, u64>>,
     /// Each thread's System V semaphore undo list, once it has one, which
@@ -253,6 +256,7 @@ impl Default for ThreadGroup {
             start_stack: AtomicU64::new(0),
             auxv: Mutex::default(),
             code: Mutex::default(),
+            data: Mutex::default(),
             robust_lists: Mutex::default(),
             sem_undo: Mutex::default(),
             shm_creators: Mutex::default(),
@@ -620,6 +624,7 @@ impl ThreadGroup {
             start_stack: AtomicU64::new(self.start_stack()),
             auxv: Mutex::new(self.auxv()),
             code: Mutex::new(self.code()),
+            data: Mutex::new(self.data()),
             executable: Mutex::new(self.executable()),
             first_namespaces: self.first_namespaces.clone(),
             exe_file: Mutex::new(
@@ -1641,9 +1646,13 @@ impl ThreadGroup {
             .flatten()
             .collect();
         *self.code.lock().unwrap_or_else(PoisonError::into_inner) = image.code;
+        *self.data.lock().unwrap_or_else(PoisonError::into_inner) = image.data;
     }
     pub(crate) fn code(&self) -> (u64, u64) {
         *self.code.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    pub(crate) fn data(&self) -> (u64, u64) {
+        *self.data.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub(crate) fn auxv(&self) -> Vec<u8> {
         self.auxv

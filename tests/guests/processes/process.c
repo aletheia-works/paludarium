@@ -5473,6 +5473,8 @@ static int proc_own_files_cases(int argc, char **argv) {
         unsigned long env_start = strtoul(fields[47], NULL, 10), env_end = strtoul(fields[48], NULL, 10);
         printf("stat arguments-at-argv=%d environment-after-arguments=%d\n", arg_start == (unsigned long)argv[0],
                env_start >= arg_end && env_end >= env_start);
+        /* start_data and end_data, of a program at a fixed address. */
+        printf("stat data=%s-%s\n", fields[42], fields[43]);
     }
 
     n = proc_read("/proc/self/cmdline", buffer, sizeof buffer);
@@ -10991,6 +10993,22 @@ static void pomaps_stable(char *text) {
     }
     *out = 0;
 }
+/* The fields of the stat at `path` that Linux hides from a reader that
+   may not see the task's memory (do_task_stat): start_code, end_code,
+   start_stack, wchan, and start_data to exit_code. */
+static void pom_stat(const char *label, const char *path) {
+    static char buffer[4096];
+    char *fields[64];
+    int count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf("%s stat", label);
+    if (count < 50) {
+        printf(" count=%d\n", count);
+        return;
+    }
+    const int shown[] = {23, 24, 25, 32, 42, 43, 44, 45, 46, 47, 48, 49};
+    for (unsigned i = 0; i < sizeof shown / sizeof *shown; i++) printf(" %s", fields[shown[i]]);
+    printf("\n");
+}
 static int proc_other_maps_case(void) {
     /* What the child reads of itself, shared with this process, its
        pages touched before either reads. */
@@ -11068,15 +11086,35 @@ static int proc_other_maps_case(void) {
         o = open(path, O_PATH) >= 0 ? 0 : errno;
         l = readlink(path, link, sizeof link) >= 0 ? 0 : errno;
         printf(" environ path=%d readlink=%d\n", o, l);
+        snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+        pom_stat("other user", path);
+        snprintf(path, sizeof path, "/proc/%d/task/%d/stat", (int)kid, (int)kid);
+        pom_stat("other user task", path);
         fflush(stdout);
         _exit(0);
     }
     printf("other=%d\n", reaped(other));
+    {
+        /* Its own reader sees them: the same program, so the same code
+           and data as this process's. */
+        static char own[4096], kids[4096];
+        char *mine[64], *its[64];
+        snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+        int a = proc_fields("/proc/self/stat", own, sizeof own, mine, 64);
+        int b = proc_fields(path, kids, sizeof kids, its, 64);
+        int same = a >= 50 && b >= 50;
+        for (int i = 23; same && i < 25; i++) same = !strcmp(mine[i], its[i]);
+        for (int i = 42; same && i < 44; i++) same = !strcmp(mine[i], its[i]);
+        printf("root stat code-and-data-same=%d data-set=%d\n", same, b >= 50 && strcmp(its[42], "0"));
+    }
     /* Ended and not reaped: empty; reaped: not there. */
     if (write(done[1], "d", 1) != 1) return 84;
     siginfo_t info;
     memset(&info, 0, sizeof info);
     waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+    pom_stat("zombie", path);
     snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
     printf("zombie maps=%ld", pomaps_read(path, theirs));
     snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);

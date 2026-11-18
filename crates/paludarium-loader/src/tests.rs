@@ -571,3 +571,36 @@ fn a_misplaced_writable_segment_loads_or_fails_without_overflow() {
     let mut mem = AddressSpace::new();
     let _ = load_bytes(&file, &start(&[b"prog".to_vec()], &[]), &mut mem);
 }
+
+#[test]
+fn the_code_and_data_ranges_are_load_elf_binarys() {
+    let header = |flags, vaddr, filesz| elf::ProgramHeader {
+        kind: elf::PT_LOAD,
+        flags,
+        offset: 0,
+        vaddr,
+        filesz,
+        memsz: filesz + 0x100,
+        align: 0x1000,
+    };
+    let info = elf::ElfInfo {
+        kind: 2,
+        entry: 0,
+        phoff: 0,
+        phnum: 3,
+        headers: vec![
+            header(elf::PF_R, 0x40_0000, 0x200),
+            header(elf::PF_R | elf::PF_X, 0x40_1000, 0x300),
+            header(elf::PF_R | elf::PF_W, 0x40_3000, 0x40),
+        ],
+    };
+    // Code: the executable segments; data: the highest start and end of
+    // any, in the file (`p_filesz`), moved by the base.
+    assert_eq!(code_range(&info, 0x1000), (0x40_2000, 0x40_2300));
+    assert_eq!(data_range(&info, 0x1000), (0x40_4000, 0x40_4040));
+    let none = elf::ElfInfo {
+        headers: Vec::new(),
+        ..info
+    };
+    assert_eq!(data_range(&none, 7), (7, 7));
+}

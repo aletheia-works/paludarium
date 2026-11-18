@@ -6733,8 +6733,7 @@ fn open_path(
         // by whom their mode lets, and `setgroups` only with CAP_SYS_ADMIN
         // in the namespace (`proc_setgroups_open`'s `EACCES`).
         if let crate::proc::TaskEntry::IdMap(_) | crate::proc::TaskEntry::Setgroups = path.entry {
-            let content =
-                tasks::content(&task, path.entry, &c.process.credentials.user).unwrap_or_default();
+            let content = tasks::content(c, &task, path.entry).unwrap_or_default();
             let creds = &c.process.credentials;
             let user = task.user();
             if flags & 3 != 0 {
@@ -6812,7 +6811,7 @@ fn open_path(
                 p.to_vec(),
             ));
         }
-        if let Some(content) = tasks::content(&task, path.entry, &c.process.credentials.user) {
+        if let Some(content) = tasks::content(c, &task, path.entry) {
             let mut file = crate::proc::GeneratedFile::open(content, flags);
             if path.entry == crate::proc::TaskEntry::Comm {
                 let (group, pid, tid) = tasks::comm(&task);
@@ -8096,7 +8095,11 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
                 threads: c.group.active_threads(),
                 virtual_size: c.mem.mappings().map(|m| m.length).sum(),
                 rss_limit,
+                // Its own: `ptrace_may_access` lets a thread group see itself.
+                memory: true,
+                permitted: true,
                 code: c.group.code(),
+                data: c.group.data(),
                 start_stack,
                 start_brk: c.mem.initial_break().0,
                 arguments,

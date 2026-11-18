@@ -99,6 +99,18 @@ impl Task {
             (0, 0)
         }
     }
+    /// Whether `stat` shows the reader where the task's memory is, as
+    /// Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` decides for
+    /// `do_task_stat`: as [`Self::may_access`], but with no dumpable rule
+    /// once the memory is gone, as Linux's skips it with no `mm`.
+    fn may_see_addresses(&self, c: &Context<'_>) -> bool {
+        self.pid == c.process.pid
+            || c.process.credentials.may_read_task(
+                &self.public.credentials,
+                self.view.dumpable || self.memory().is_none(),
+                false,
+            )
+    }
     fn start_stack(&self) -> u64 {
         if self.live() {
             self.view.group.start_stack()
@@ -242,11 +254,8 @@ pub(super) fn descriptors(task: &Task) -> Vec<(u32, super::Descriptor)> {
 
 /// The contents of `status`, `stat`, `statm`, `limits`, `auxv`, `cmdline`
 /// or `comm`, and the others made when opened; `None` for any other entry.
-pub(super) fn content(
-    task: &Task,
-    entry: TaskEntry,
-    reader: &crate::namespaces::Namespace,
-) -> Option<Vec<u8>> {
+pub(super) fn content(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Option<Vec<u8>> {
+    let reader = &c.process.credentials.user;
     let public = &task.public;
     let (ignored, caught) = task.handled();
     Some(match entry {
@@ -304,7 +313,14 @@ pub(super) fn content(
                 threads,
                 virtual_size,
                 rss_limit: task.view.rss_limit,
+                memory: task.memory().is_some(),
+                permitted: task.may_see_addresses(c),
                 code: task.code(),
+                data: if task.live() {
+                    task.view.group.data()
+                } else {
+                    (0, 0)
+                },
                 start_stack: task.start_stack(),
                 start_brk,
                 arguments,
@@ -622,18 +638,16 @@ pub(super) fn stat(
         TaskEntry::ClearRefs => crate::proc::write_only_stat(),
         // 0644, which their owner may write.
         TaskEntry::IdMap(_) | TaskEntry::Setgroups | TaskEntry::Comm => {
-            let length = content(task, entry, &c.process.credentials.user).map_or(0, |c| c.len());
+            let length = content(c, task, entry).map_or(0, |c| c.len());
             FileStat {
                 mode: 0o100_644,
                 ..crate::proc::stat(length)
             }
         }
-        TaskEntry::Environ | TaskEntry::Auxv => crate::proc::private_stat(
-            content(task, entry, &c.process.credentials.user).map_or(0, |content| content.len()),
-        ),
-        _ => crate::proc::stat(
-            content(task, entry, &c.process.credentials.user).map_or(0, |content| content.len()),
-        ),
+        TaskEntry::Environ | TaskEntry::Auxv => {
+            crate::proc::private_stat(content(c, task, entry).map_or(0, |content| content.len()))
+        }
+        _ => crate::proc::stat(content(c, task, entry).map_or(0, |content| content.len())),
     };
     Ok((task.owned(stat), device(c, path), SMALL_BLOCK_SIZE))
 }

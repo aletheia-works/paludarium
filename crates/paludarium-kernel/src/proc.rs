@@ -496,8 +496,15 @@ pub(crate) struct ProcessStat<'a> {
     /// The total size of the mappings, in bytes.
     pub virtual_size: u64,
     pub rss_limit: u64,
-    /// `start_code` and `end_code`, the program's code; 0 without memory.
+    /// Whether it has memory, which a zombie no longer has.
+    pub memory: bool,
+    /// Whether the reader may see where its memory is, as Linux's
+    /// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` decides.
+    pub permitted: bool,
+    /// `start_code` and `end_code`, the program's code.
     pub code: (u64, u64),
+    /// `start_data` and `end_data`, the program's data.
+    pub data: (u64, u64),
     pub start_stack: u64,
     pub start_brk: u64,
     /// `[arg_start, arg_end)` and `[env_start, env_end)`.
@@ -510,11 +517,21 @@ pub(crate) struct ProcessStat<'a> {
 }
 /// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it: 52 fields, and
 /// 0 for what nothing measures (page faults, resident memory, start time
-/// and the scheduler's figures).
+/// and the scheduler's figures). A reader that may not see the task's
+/// memory gets 1 for `start_code` and `end_code` and 0 for `start_stack`,
+/// `wchan` and the addresses from `start_data` on, as Linux hides them;
+/// without memory they are all 0.
 pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
     /// USER_HZ, the unit of the times, as on x86-64 Linux.
     const TICKS: u64 = 100;
     let ticks = |ns: u64| ns / (1_000_000_000 / TICKS);
+    let seen = s.memory && s.permitted;
+    let code = |at: u64| match (s.memory, s.permitted) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => at,
+    };
+    let address = |at: u64| if seen { at } else { 0 };
     let fields: [String; 50] = [
         s.state.to_string(),
         s.parent.to_string(),
@@ -541,18 +558,18 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         s.virtual_size.to_string(),
         "0".into(), // rss
         s.rss_limit.to_string(),
-        s.code.0.to_string(),
-        s.code.1.to_string(),
-        s.start_stack.to_string(),
+        code(s.code.0).to_string(),
+        code(s.code.1).to_string(),
+        address(s.start_stack).to_string(),
         "0".into(), // kstkesp
         "0".into(), // kstkeip
         s.pending.to_string(),
         s.blocked.to_string(),
         s.ignored.to_string(),
         s.caught.to_string(),
-        u8::from(s.waiting).to_string(), // wchan
-        "0".into(),                      // nswap
-        "0".into(),                      // cnswap
+        u8::from(s.waiting && s.permitted).to_string(), // wchan
+        "0".into(),                                     // nswap
+        "0".into(),                                     // cnswap
         s.exit_signal.to_string(),
         "0".into(), // processor
         "0".into(), // rt_priority
@@ -560,13 +577,13 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         "0".into(), // delayacct_blkio_ticks
         "0".into(), // guest_time
         "0".into(), // cguest_time
-        "0".into(), // start_data
-        "0".into(), // end_data
-        s.start_brk.to_string(),
-        s.arguments.0.to_string(),
-        s.arguments.1.to_string(),
-        s.environment.0.to_string(),
-        s.environment.1.to_string(),
+        address(s.data.0).to_string(),
+        address(s.data.1).to_string(),
+        address(s.start_brk).to_string(),
+        address(s.arguments.0).to_string(),
+        address(s.arguments.1).to_string(),
+        address(s.environment.0).to_string(),
+        address(s.environment.1).to_string(),
         "0".into(), // exit_code
     ];
     // The name's bytes as they are, as `comm` gives them.
@@ -2644,7 +2661,10 @@ mod generated_tests {
             threads: 2,
             virtual_size: 8192,
             rss_limit: u64::MAX,
+            memory: true,
+            permitted: true,
             code: (0x40_1000, 0x40_5abc),
+            data: (0x40_6000, 0x40_7010),
             start_stack: 0x7fff_0000,
             start_brk: 0x60_0000,
             arguments: (10, 20),
@@ -2670,7 +2690,52 @@ mod generated_tests {
         assert_eq!(&fields[23..25], ["4198400", "4217532"]);
         assert_eq!(&fields[28..32], ["0", "512", "2048", "1"]);
         assert_eq!(fields[35], "17");
+        assert_eq!(&fields[42..44], ["4218880", "4222992"]);
         assert_eq!(&fields[45..49], ["10", "20", "20", "30"]);
+    }
+    #[test]
+    fn stat_hides_where_the_memory_is_from_a_reader_that_may_not_see_it() {
+        let stat = |memory, permitted| {
+            let line = render_stat(&ProcessStat {
+                pid: 5,
+                name: b"a",
+                state: 'S',
+                waiting: true,
+                exit_signal: 17,
+                parent: 1,
+                group: 5,
+                session: 1,
+                terminal: (0, -1),
+                cpu: 0,
+                children_cpu: 0,
+                nice: 0,
+                threads: 1,
+                virtual_size: 8192,
+                rss_limit: 0,
+                memory,
+                permitted,
+                code: (2, 3),
+                data: (4, 5),
+                start_stack: 6,
+                start_brk: 7,
+                arguments: (8, 9),
+                environment: (10, 11),
+                pending: 0,
+                blocked: 0,
+                ignored: 0,
+                caught: 0,
+            });
+            let line = String::from_utf8(line).unwrap();
+            let fields: Vec<String> = line.split_whitespace().map(String::from).collect();
+            // start_code, end_code, start_stack; wchan; 45 to 51.
+            let mut shown = fields[25..28].to_vec();
+            shown.push(fields[34].clone());
+            shown.extend_from_slice(&fields[44..51]);
+            shown.join(" ")
+        };
+        assert_eq!(stat(true, true), "2 3 6 1 4 5 7 8 9 10 11");
+        assert_eq!(stat(true, false), "1 1 0 0 0 0 0 0 0 0 0");
+        assert_eq!(stat(false, true), "0 0 0 1 0 0 0 0 0 0 0");
     }
     #[test]
     fn system_files_have_linux_s_formats() {

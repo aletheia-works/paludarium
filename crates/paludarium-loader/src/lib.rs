@@ -112,6 +112,10 @@ pub struct LoadedImage {
     /// `end_code`), as `load_elf_binary` finds them: the lowest address and
     /// the highest end in the file of its executable `PT_LOAD` segments.
     pub code: (u64, u64),
+    /// Linux's `start_data` and `end_data`, as `load_elf_binary` finds
+    /// them: the highest address and the highest end in the file of all its
+    /// `PT_LOAD` segments.
+    pub data: (u64, u64),
 }
 
 /// The entries of [`LoadedImage::auxv`], `AT_NULL`'s with them.
@@ -373,6 +377,20 @@ fn code_range(info: &ElfInfo, base: u64) -> (u64, u64) {
         .fold((u64::MAX, 0), |(start, end), h| {
             (start.min(h.vaddr), end.max(h.vaddr.wrapping_add(h.filesz)))
         });
+    (start.wrapping_add(base), end.wrapping_add(base))
+}
+
+/// `start_data` and `end_data` of the program loaded at `base`: the highest
+/// `p_vaddr` and the highest `p_vaddr + p_filesz` of all its `PT_LOAD`
+/// segments, moved by `base`, as Linux's `load_elf_binary` computes them
+/// (`base` when there is none).
+fn data_range(info: &ElfInfo, base: u64) -> (u64, u64) {
+    let (start, end) = info.loads().fold((0, 0), |(start, end), h| {
+        (
+            u64::max(start, h.vaddr),
+            u64::max(end, h.vaddr.wrapping_add(h.filesz)),
+        )
+    });
     (start.wrapping_add(base), end.wrapping_add(base))
 }
 
@@ -671,6 +689,7 @@ fn load_image(
         load_base: GuestAddr(base),
         auxv: [(0, 0); AUXV_ENTRIES],
         code: code_range(&info, base),
+        data: data_range(&info, base),
     };
     let (stack, auxv) = build_stack(mem, start, &image)?;
     image.initial_stack_pointer = GuestAddr(stack);

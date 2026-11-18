@@ -103,7 +103,9 @@ verified.
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
   so not counted. A path that goes on through a link of another process's `fd`
   (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
-  directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
+  directory it leads to, as it does for this process's own. Whether
+  another process's `stat` hides its addresses is decided when the file is
+  opened, where Linux decides at each read, and its `exit_code` is 0. In `stat`, page faults, resident memory, the start
   time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and

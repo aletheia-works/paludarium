@@ -1746,7 +1746,16 @@ kernel.
   `MOVE_MOUNT_*_EMPTY_PATH`, and a Landlock domain is `EPERM`. It moves a
   mount as `MS_MOVE` does, or attaches a tree from `open_tree`: only its
   root (`EINVAL`), not onto its own tree (`EINVAL`); a mount of the
-  namespace goes onto no detached tree (`EINVAL`). `MOVE_MOUNT_SET_GROUP`
+  namespace goes onto no detached tree (`EINVAL`). With `MOVE_MOUNT_BENEATH`
+  the source goes beneath the topmost mount at the target, on that mount's
+  parent, and the topmost mount stays on top, on the source's root
+  (`do_move_mount` with `MNT_TREE_BENEATH`): the target must be a mount's
+  root and not the namespace's root (`EINVAL`), then the checks of a move
+  are made on that parent. A source in the topmost mount's tree is `EINVAL`,
+  and so is a move where a shared parent would propagate a copy of the
+  source onto the topmost mount or onto the source at its root
+  (`propagation_would_overmount`). A locked topmost mount's lock passes to the source, so the
+  topmost one may then be unmounted. `MOVE_MOUNT_SET_GROUP`
   puts the target in the source's peer group (`do_set_group`): both mounts'
   roots, of one superblock, the target's root at or below the source's,
   the target private and the source shared or a slave (`EINVAL`).
@@ -2847,7 +2856,10 @@ kernel.
   `/proc/self/fd/3/name` is `name` in the directory descriptor 3 holds, by
   the path that names it now, even after a rename, and `..` goes on from
   there. A removed directory is `ENOENT`, a descriptor that is not open
-  `ENOENT`, and a file that is not a directory `ENOTDIR`. The file calls
+  `ENOENT`, and a file that is not a directory `ENOTDIR`. So is a link in
+  another process's `fd` (`/proc/<pid>/fd/3/name`), for a reader that may
+  look at its descriptors (`EACCES`), as Linux's `proc_fd_link` jumps;
+  once the process has ended, it is `ENOENT`. The file calls
   that take an absolute path do this (`openat2` with `RESOLVE_*` flags in its
   own walk); a path relative to a descriptor of `/proc` or to a working
   directory there, one whose `..` or symbolic link leads into `/proc`,
@@ -3227,8 +3239,11 @@ kernel.
   `Locked`, with 0 for huge pages, swap and KSM), `THPeligible` and
   `VmFlags`. A page counts once it has an entry: private memory only read
   shows the zero page, which is not counted, written private memory is
-  anonymous and dirty, and a page that a `fork` shares until it is written
-  is shared, half of it in `Pss`. `VmFlags` names Linux's flags of the VMA
+  anonymous and dirty, and a page that more than one page table entry
+  maps, in this process or any other (one a `fork` shares until it is
+  written, a file's page two mappings show), is shared, with its size
+  divided by that count in `Pss`, as Linux's `smaps_account` takes the
+  precise map count. `VmFlags` names Linux's flags of the VMA
   in Linux's order: the protection and what it may become (`mr`, `mw`, `me`,
   `ms`, without `mw` for a file open only for reading or sealed against
   writes, and without `me` for the rings of AIO and `io_uring` and secret
@@ -3252,8 +3267,11 @@ kernel.
   bit (58); and a page any access gave an entry is present (bit 63). The
   zero page that a read of private anonymous memory shows is only that.
   Any other present page is a file's or shared memory's (bit 61) unless it
-  is anonymous, as `smaps` counts it, and mapped only here (bit 56) unless
-  a `fork` shares it until it is written; one `userfaultfd` write-protects
+  is anonymous, as `smaps` counts it, and mapped exclusively (bit 56) while
+  exactly one page table entry maps it, in this process or any other, as
+  Linux takes a precise map count of 1: a page `fork` shares is mapped
+  twice until either process writes its own copy or lets it go, and a
+  file's page that two mappings show is mapped twice; one `userfaultfd` write-protects
   has bit 57. The frame number (bits 0 to 54) is 0, as Linux gives it to a
   reader without `CAP_SYS_ADMIN`. A read or `pread` must start at a whole
   entry and ask for whole entries (`EINVAL`), and gives nothing from the end

@@ -9306,6 +9306,53 @@ fn a_bind_mount_of_a_generated_directory_shows_its_files() {
     let fd = f.ret(257, &[(-100i64) as u64, relative, 0, 0]);
     assert!(fd < 1024);
     assert_eq!(f.ret(3, &[fd]), 0);
+    // `self` there is the link it is: the working directory is the
+    // process's own directory, through the bind mount.
+    let own = put(&mut f, 0xe0, b"/tmp/p/self");
+    assert_eq!(f.ret(80, &[own]), 0);
+    let expected = format!("/tmp/p/{}\0", f.ret(39, &[]));
+    let got = f.ret(79, &[cwd, 64]);
+    assert_eq!(got, expected.len() as u64);
+    let mut name = vec![0; expected.len()];
+    f.mem.read(GuestAddr(cwd), &mut name).unwrap();
+    assert_eq!(name, expected.as_bytes());
+    // `thread-self` is the thread's own directory there.
+    let own_thread = put(&mut f, 0x300, b"/tmp/p/thread-self");
+    assert_eq!(f.ret(80, &[own_thread]), 0);
+    let pid = f.ret(39, &[]);
+    let expected = format!("/tmp/p/{pid}/task/{}\0", f.ret(186, &[]));
+    assert_eq!(f.ret(79, &[cwd, 64]), expected.len() as u64);
+    let mut name = vec![0; expected.len()];
+    f.mem.read(GuestAddr(cwd), &mut name).unwrap();
+    assert_eq!(name, expected.as_bytes());
+    assert_eq!(f.ret(80, &[p]), 0);
+    // A descriptor opened there names the same place in /proc/self/fd,
+    // with `open` and with `openat2` and `RESOLVE_NO_SYMLINKS`.
+    let how = DATA + 0x340;
+    f.mem.write(GuestAddr(how), &[0u8; 24]).unwrap();
+    f.mem
+        .write(GuestAddr(how), &0o200000u64.to_le_bytes())
+        .unwrap();
+    f.mem
+        .write(GuestAddr(how + 16), &4u64.to_le_bytes())
+        .unwrap();
+    for fd in [
+        f.ret(2, &[own, 0o200000, 0]),
+        f.ret(437, &[(-100i64) as u64, own, how, 24]),
+    ] {
+        assert!(fd < 1024);
+        let link = put(&mut f, 0x380, format!("/proc/self/fd/{fd}").as_bytes());
+        let got = f.ret(89, &[link, cwd, 64]);
+        let mut name = vec![0; got as usize];
+        f.mem.read(GuestAddr(cwd), &mut name).unwrap();
+        assert_eq!(name, format!("/tmp/p/{pid}").as_bytes());
+        assert_eq!(f.ret(3, &[fd]), 0);
+    }
+    // Not followed at the end, `self` is the link, as `/proc/self` is.
+    let unbound = put(&mut f, 0x3c0, b"/proc/self");
+    for path in [own, unbound] {
+        assert_eq!(f.ret(2, &[path, 0o400000, 0]), errno(Errno(40)));
+    }
     // In use while it is the working directory.
     assert_eq!(f.ret(166, &[p, 0]), errno(Errno(16)));
     assert_eq!(f.ret(80, &[root]), 0);

@@ -1660,6 +1660,38 @@ impl NamespacedFs {
         follow_target: bool,
         paths: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>, Errno> {
+        self.attach_moved(source, follow_source, target, follow_target, paths, false)
+    }
+    /// [`Self::move_mount_following`] with `MOVE_MOUNT_BENEATH`
+    /// (`do_move_mount` with `MNT_TREE_BENEATH`, Linux master's order):
+    /// the source goes where the topmost mount at the resolved `target` is,
+    /// on that mount's parent, and the topmost mount goes on the source's
+    /// root, as it was. `target` must be a mount's root (`EINVAL`,
+    /// `do_lock_mount`), not the namespace's root (`EINVAL`); then the
+    /// checks of a move are made on the parent, then those of
+    /// `can_move_mount_beneath`: a source with a mount on its root, or in
+    /// the topmost mount's tree, is `EINVAL`, and so is one a shared parent
+    /// would propagate a copy onto (`propagation_would_overmount`). A
+    /// locked topmost mount's lock passes to the source.
+    pub fn move_mount_beneath(
+        &self,
+        source: &[u8],
+        follow_source: bool,
+        target: &[u8],
+        follow_target: bool,
+        paths: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, Errno> {
+        self.attach_moved(source, follow_source, target, follow_target, paths, true)
+    }
+    fn attach_moved(
+        &self,
+        source: &[u8],
+        follow_source: bool,
+        target: &[u8],
+        follow_target: bool,
+        paths: &[Vec<u8>],
+        beneath: bool,
+    ) -> Result<Vec<Vec<u8>>, Errno> {
         self.swept();
         let entries = self.table.snapshot();
         let from = self.walk(&entries, source, follow_source, false, true)?;
@@ -1674,7 +1706,24 @@ impl NamespacedFs {
         if directory(&from)? != directory(&to)? {
             return Err(Errno::EINVAL);
         }
-        let dest = self.entry(&entries, &to);
+        let top = self.entry(&entries, &to);
+        // Beneath the topmost mount: on its parent, where it is.
+        let dest = if beneath {
+            let root = &entries[Self::root_index(&entries)];
+            if top.point != to.path {
+                return Err(Errno::EINVAL);
+            }
+            match Self::by_id(&entries, top.parent) {
+                Some(parent)
+                    if parent.id() != top.id() && top.id() != root.id() && !parent.hidden =>
+                {
+                    parent
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        } else {
+            top
+        };
         if detached(&old.point) {
             let tree = old.point.split(|b| *b == b'/').nth(1).unwrap_or_default();
             if old.parent != old.id() || dest.point.split(|b| *b == b'/').nth(1) == Some(tree) {
@@ -1695,6 +1744,25 @@ impl NamespacedFs {
         }
         let moving = Self::tree(&entries, old.id(), true);
         let has = |id: &u64| Self::by_id(&entries, *id);
+        if beneath {
+            // `can_move_mount_beneath`.
+            let overmounted = entries
+                .iter()
+                .any(|e| e.parent == old.id() && e.id() != old.id() && e.point == old.point);
+            if overmounted || Self::tree(&entries, top.id(), true).contains(&old.id()) {
+                return Err(Errno::EINVAL);
+            }
+            // A copy the parent would propagate onto `to` at its root.
+            let overmounts = |to: &Entry| {
+                dest.group != 0
+                    && to.same_files(dest)
+                    && to.root == dest.inside(&top.point)
+                    && self.receives(to, dest.group)
+            };
+            if overmounts(top) || !detached(&old.point) && overmounts(old) {
+                return Err(Errno::EINVAL);
+            }
+        }
         if dest.group != 0 && moving.iter().filter_map(has).any(|e| e.unbindable) {
             return Err(Errno::EINVAL);
         }
@@ -1705,10 +1773,11 @@ impl NamespacedFs {
             }
             up = Self::by_id(&entries, at.parent).filter(|p| p.id() != at.id());
         }
-        if self.stays(&entries, old) {
+        if self.stays(&entries, old) || beneath && !top.runtime() {
             return Err(Errno::EOPNOTSUPP);
         }
         let (id, point, parent) = (old.id(), old.point.clone(), dest.id());
+        let (over, over_locked) = (beneath.then(|| top.id()), top.locked);
         let shared = dest.group != 0;
         let mut fresh = Vec::new();
         if shared {
@@ -1734,6 +1803,17 @@ impl NamespacedFs {
                 }
                 if e.id() == id {
                     e.parent = parent;
+                    // It takes over the topmost mount's job of hiding
+                    // what is below (`attach_recursive_mnt`).
+                    if over.is_some() && over_locked {
+                        e.locked = true;
+                    }
+                }
+            }
+            if let Some(over) = over {
+                for e in entries.iter_mut().filter(|e| e.id() == over) {
+                    e.parent = id;
+                    e.locked = false;
                 }
             }
             Ok(())
@@ -2126,6 +2206,22 @@ impl NamespacedFs {
             e.flags = flags & mount_flags::SETTABLE;
             Ok(())
         })
+    }
+    /// Whether the peer group `group` propagates to `to`: `to` is in it,
+    /// or a master up `to`'s chain of masters is (`propagation_would_overmount`).
+    fn receives(&self, to: &Entry, group: u64) -> bool {
+        let mut at = to.group;
+        let mut master = to.master;
+        loop {
+            if at == group {
+                return true;
+            }
+            if master == 0 {
+                return false;
+            }
+            at = master;
+            master = self.table.numbers.master_of(master);
+        }
     }
     /// The peer group nearest along `e`'s masters with a member in this
     /// namespace (`get_dominating_id`), 0 for none.

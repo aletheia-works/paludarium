@@ -1120,6 +1120,86 @@ fn a_release_hook_hears_each_mount_freed() {
 }
 
 #[test]
+fn a_move_beneath_puts_the_mount_under_the_topmost_one() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/a", 66, 0o644).unwrap();
+    fs.mkdir(b"/tmp/n", 0o755).unwrap();
+    fs.mount(b"/tmp/n", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/n/b", 66, 0o644).unwrap();
+    let (top, below) = (
+        fs.target(b"/tmp/m").unwrap().id,
+        fs.target(b"/tmp/n").unwrap().id,
+    );
+    let parent = fs.mount_id(b"/tmp");
+    let paths = [b"/tmp/n".to_vec(), b"/tmp/m".to_vec()];
+    let placed = fs
+        .move_mount_beneath(b"/tmp/n", true, b"/tmp/m", true, &paths)
+        .unwrap();
+    assert_eq!(placed, [b"/tmp/m".to_vec(), b"/tmp/m".to_vec()]);
+    // The topmost mount still shows; the moved one is on its parent, and
+    // the topmost on it.
+    assert!(fs.metadata(b"/tmp/m/a", true).is_ok());
+    assert_eq!(fs.metadata(b"/tmp/n/b", true), Err(Errno::ENOENT));
+    let mounts = fs.mounts();
+    let at = |id: u64| mounts.iter().find(|e| e.id == id).unwrap().clone();
+    assert_eq!(
+        (at(below).path, at(below).parent),
+        (b"/tmp/m".to_vec(), parent)
+    );
+    assert_eq!((at(top).path, at(top).parent), (b"/tmp/m".to_vec(), below));
+    // Its unmount uncovers the moved mount.
+    fs.umount(top, false).unwrap();
+    assert!(fs.metadata(b"/tmp/m/b", true).is_ok());
+}
+
+#[test]
+fn a_move_beneath_is_checked_in_linux_order() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/in", 0o755).unwrap();
+    fs.mkdir(b"/tmp/n", 0o755).unwrap();
+    fs.mount(b"/tmp/n", tmpfs(0)).unwrap();
+    let beneath = |from: &[u8], to: &[u8]| fs.move_mount_beneath(from, true, to, true, &[]);
+    // Not a mount's root, then the namespace's root.
+    assert_eq!(beneath(b"/tmp/n", b"/tmp/m/in"), Err(Errno::EINVAL));
+    assert_eq!(beneath(b"/tmp/n", b"/"), Err(Errno::EINVAL));
+    // A source in the topmost mount's tree.
+    fs.mount(b"/tmp/m/in", tmpfs(0)).unwrap();
+    assert_eq!(beneath(b"/tmp/m/in", b"/tmp/m"), Err(Errno::EINVAL));
+    // A shared parent that would propagate a copy onto the topmost mount
+    // at its root: a bind of the parent's directory onto itself.
+    fs.mkdir(b"/tmp/s", 0o755).unwrap();
+    fs.mount(b"/tmp/s", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/s/d", 0o755).unwrap();
+    let s = fs.target(b"/tmp/s").unwrap().id;
+    fs.change_type(s, Propagation::Shared, false).unwrap();
+    fs.bind(b"/tmp/s/d", b"/tmp/s/d", false).unwrap();
+    assert_eq!(beneath(b"/tmp/n", b"/tmp/s/d"), Err(Errno::EINVAL));
+}
+
+#[test]
+fn a_move_beneath_a_locked_mount_takes_its_lock() {
+    let (lower, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    let locked = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(true));
+    locked.mkdir(b"/tmp/n", 0o755).unwrap();
+    locked.mount(b"/tmp/n", tmpfs(0)).unwrap();
+    let below = locked.target(b"/tmp/n").unwrap().id;
+    let top = locked.target(b"/tmp/m").unwrap();
+    assert!(top.locked);
+    locked
+        .move_mount_beneath(b"/tmp/n", true, b"/tmp/m", true, &[])
+        .unwrap();
+    // The moved mount hides what is below now, and the topmost one may go.
+    let mounts = locked.mounts();
+    assert!(mounts.iter().any(|e| e.id == below && e.parent != top.id));
+    locked.umount(top.id, false).unwrap();
+    let moved = locked.target(b"/tmp/m").unwrap();
+    assert_eq!((moved.id, moved.locked), (below, true));
+}
+
+#[test]
 fn a_bind_without_recursion_shows_the_directory_a_boot_mount_covers() {
     let (fs, _host) = machine_with_data("uncover");
     fs.mkdir(b"/tmp/b", 0o755).unwrap();

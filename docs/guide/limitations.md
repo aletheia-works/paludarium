@@ -50,10 +50,7 @@ verified.
   symbolic links. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
   do not exist.
 - **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
-  page entries. `Referenced` is every page counted, a page that `fork`
-  shares counts as shared (and half of it in `Pss`) even after the other
-  process has let it go, while one of shared memory counts as private
-  whoever else maps it. A page of a loaded program's segment counts as
+  page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A
   file's pages are counted as they are touched, where Linux's fault
   brings in up to 16 pages around one (`fault_around_bytes`), and so are
@@ -62,10 +59,7 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
-  emulator's page entries, as `smaps`'s counts do: a page that a `fork`
-  shared is not exclusive (bit 56) until this process writes it, even
-  after the other has let it go, and a page of shared memory or of a file
-  is exclusive whoever else maps it. A page of a loaded program's segment, or of a
+  emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
   written, not until the page was. A read of a file's page gives only
   that page an entry, where Linux's fault maps the pages around it too
@@ -103,9 +97,7 @@ verified.
   interpreter, a core dump's writes), and a read or write that fails with
   an errno Linux gives both before and in the file's operation (`EINVAL`,
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
-  so not counted. A path that goes on through a link of another process's `fd`
-  (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
-  directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
+  so not counted. In `stat`, page faults, resident memory, the start
   time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
@@ -584,7 +576,7 @@ verified.
   file in them), and a bind mount of a descriptor's link to a file no path
   names, give `EOPNOTSUPP`, so a program
   learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
-  (new in Linux master), `move_mount`'s `MOVE_MOUNT_BENEATH`, `fsmount`'s
+  (new in Linux master), `fsmount`'s
   `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
   a tmpfs, `fspick` of `/proc` or `/dev`, and an idmapped mount
   (`mount_setattr`'s and `open_tree_attr`'s `MOUNT_ATTR_IDMAP`, after the
@@ -654,9 +646,13 @@ verified.
   Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise, and
   `MS_MOVE` of one gives `EOPNOTSUPP`: the lower filesystem shows each
   `--mount` itself, so taking one away would show it again, not the
-  directory under it. After `pivot_root` the old root can go, but a
-  `--mount` under it still stays, and a new root that is a `--mount`
-  shows its files at its old place under `put_old` too, where Linux shows
+  directory under it. For the same reason `move_mount` with
+  `MOVE_MOUNT_BENEATH` beneath one gives `EOPNOTSUPP`. Beneath the
+  namespace's root after `pivot_root` it gives `EINVAL`, as the mount left
+  below the root here takes no mounts, where Linux master mounts the
+  source on that mount. After `pivot_root` the old root can go, but a
+  `--mount` under it still stays, and a new root that is a `--mount` shows
+  its files at its old place under `put_old` too, where Linux shows
   the directory it covered. The generated `/proc` and `/dev` stay at the
   root's `/proc` and `/dev` after `pivot_root`, where Linux's go to
   `put_old` with the old root. A move or a `pivot_root` takes the roots

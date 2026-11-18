@@ -449,9 +449,10 @@ fn open_tree(c: &mut Context<'_>, dfd: u64, ptr: u64, flags: u64) -> Result<u64,
 /// (`hook_move_mount`). `MOVE_MOUNT_SET_GROUP` puts the target in the
 /// source's peer group ([`paludarium_vfs::NamespacedFs::set_group`]);
 /// otherwise the source mount moves onto the target as `MS_MOVE` moves
-/// it, or a detached tree from `open_tree` is attached there.
-/// `MOVE_MOUNT_BENEATH`, and `/proc` or `/dev`, which the kernel
-/// generates, are not supported (`EOPNOTSUPP`).
+/// it, or a detached tree from `open_tree` is attached there; with
+/// `MOVE_MOUNT_BENEATH` it goes beneath the topmost mount there
+/// ([`paludarium_vfs::NamespacedFs::move_mount_beneath`]). `/proc` or
+/// `/dev`, which the kernel generates, are not supported (`EOPNOTSUPP`).
 fn move_mount_call(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     let flags = a[4] & 0xffff_ffff;
     let namespaces = c.group.namespaces(c.tid);
@@ -483,14 +484,16 @@ fn move_mount_call(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         namespaced.set_group(&from, follow_from, &to, follow_to)?;
         return Ok(0);
     }
-    if flags & MOVE_MOUNT_BENEATH != 0 {
-        return Err(Errno::EOPNOTSUPP);
-    }
     if !check_mnt(c, &namespaces.mnt) {
         return Err(Errno::EINVAL);
     }
+    let beneath = flags & MOVE_MOUNT_BENEATH != 0;
     c.files.relocate(c.processes, |paths| {
-        namespaced.move_mount_following(&from, follow_from, &to, follow_to, paths)
+        if beneath {
+            namespaced.move_mount_beneath(&from, follow_from, &to, follow_to, paths)
+        } else {
+            namespaced.move_mount_following(&from, follow_from, &to, follow_to, paths)
+        }
     })?;
     Ok(0)
 }

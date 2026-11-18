@@ -11781,6 +11781,232 @@ static int proc_io_case(void) {
     return 0;
 }
 
+/* The proc-fd-links case: what a link of a process's /proc directory reads
+   (proc_pid_readlink, d_path): /proc itself, files removed, renamed or
+   renamed over, a link read through an O_PATH | O_NOFOLLOW descriptor of
+   it (readlinkat(fd, "")) when it is read and of the process that opened
+   it, another process's descriptor, and each from a reader whose root is
+   a chroot: from that root when the file is under it, else from the
+   machine's root. */
+static char pfl_base[] = "/tmp/paludarium-fdlinks-XXXXXX";
+static void pfl_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", pfl_base, name); }
+/* `link` with the case's directory as B and unprintable bytes as \xNN. */
+static void pfl_print(const char *label, long n, const char *link) {
+    if (n < 0) {
+        printf("%s: errno=%ld\n", label, -n);
+        return;
+    }
+    printf("%s: ", label);
+    size_t base = strlen(pfl_base);
+    const char *p = link;
+    if (!strncmp(p, pfl_base, base)) {
+        putchar('B');
+        p += base;
+    }
+    for (; *p; p++)
+        if (*p >= 0x20 && *p < 0x7f) putchar(*p);
+        else printf("\\x%02x", (unsigned char)*p);
+    /* A pipe's inode is a number of the machine's. */
+    printf("\n");
+}
+static void pfl_read(const char *label, const char *path) {
+    char b[512];
+    ssize_t n = readlink(path, b, sizeof b - 1);
+    if (n >= 0) b[n] = 0;
+    if (n >= 0 && !strncmp(b, "pipe:[", 6)) strcpy(b, "pipe:[N]");
+    pfl_print(label, n < 0 ? -errno : n, b);
+}
+/* The link of this process's descriptor `fd`. */
+static void pfl_fd(const char *label, int fd) {
+    char p[64];
+    if (fd < 0) {
+        printf("%s: open errno=%d\n", label, errno);
+        return;
+    }
+    snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    pfl_read(label, p);
+}
+/* What readlinkat(fd, "") reads of the link `fd` holds. */
+static void pfl_at(const char *label, int fd) {
+    char b[512];
+    if (fd < 0) {
+        printf("%s: open errno=%d\n", label, errno);
+        return;
+    }
+    ssize_t n = readlinkat(fd, "", b, sizeof b - 1);
+    if (n >= 0) b[n] = 0;
+    pfl_print(label, n < 0 ? -errno : n, b);
+}
+static int pfl_open(const char *name, int flags) {
+    char p[256];
+    pfl_path(p, name);
+    return open(p, flags, 0644);
+}
+static int pfl_inner(void) {
+    char a[256], b[256];
+    /* Mounts made here stay in this namespace. */
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) return 82;
+    pfl_fd("proc", open("/proc", O_RDONLY | O_DIRECTORY));
+    pfl_fd("proc-slash", open("/proc/", O_RDONLY | O_DIRECTORY));
+    pfl_fd("dir", open(pfl_base, O_RDONLY | O_DIRECTORY));
+    int file = pfl_open("a", O_CREAT | O_RDWR);
+    pfl_fd("file", file);
+    pfl_path(a, "a");
+    pfl_path(b, "hard");
+    link(a, b);
+    unlink(a);
+    /* Its dentry is gone, though another name reaches the file. */
+    pfl_fd("unlinked-with-another-name", file);
+    int moved = pfl_open("m", O_CREAT | O_RDWR);
+    pfl_path(a, "d");
+    mkdir(a, 0755);
+    pfl_path(a, "m");
+    pfl_path(b, "d/m2");
+    rename(a, b);
+    pfl_fd("renamed", moved);
+    pfl_path(a, "d");
+    pfl_path(b, "e");
+    rename(a, b);
+    pfl_fd("directory-renamed", moved);
+    int over = pfl_open("y", O_CREAT | O_RDWR);
+    int over_with = pfl_open("z", O_CREAT | O_RDWR);
+    pfl_path(a, "z");
+    pfl_path(b, "y");
+    rename(a, b);
+    pfl_fd("renamed-over", over);
+    pfl_fd("renamed-over-with", over_with);
+    pfl_path(a, "gone");
+    mkdir(a, 0755);
+    int gone = open(a, O_RDONLY | O_DIRECTORY);
+    rmdir(a);
+    pfl_fd("removed-directory", gone);
+    pfl_fd("newline", pfl_open("new\nline", O_CREAT | O_RDWR));
+    pfl_fd("deleted-in-name", pfl_open("x (deleted)", O_CREAT | O_RDWR));
+    int pipes[2];
+    if (pipe(pipes)) return 83;
+    pfl_fd("pipe", pipes[0]);
+    /* Links read through O_PATH | O_NOFOLLOW descriptors of them, which
+       read where they lead at the time. */
+    int hard = pfl_open("hard", O_RDONLY);
+    int cwd = open("/proc/self/cwd", O_PATH | O_NOFOLLOW);
+    int root = open("/proc/self/root", O_PATH | O_NOFOLLOW);
+    char p[64];
+    snprintf(p, sizeof p, "/proc/self/fd/%d", hard);
+    int of_fd = open(p, O_PATH | O_NOFOLLOW);
+    if (chdir(pfl_base)) return 84;
+    pfl_at("path-cwd", cwd);
+    pfl_path(a, "e");
+    if (chdir(a)) return 85;
+    pfl_at("path-cwd-moved", cwd);
+    pfl_at("path-root", root);
+    pfl_at("path-fd", of_fd);
+    {
+        /* `/proc/self` reads as the reader's PID. */
+        char self[32];
+        ssize_t n = readlinkat(open("/proc/self", O_PATH | O_NOFOLLOW), "", self, sizeof self - 1);
+        if (n >= 0) self[n] = 0;
+        printf("path-self: %s\n", n < 0 ? "error" : atoi(self) == getpid() ? "own pid" : self);
+    }
+    /* A child reads its parent's links through them, but its own self. */
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 86;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 87;
+    if (!kid) {
+        dup2(over_with, hard);
+        if (chdir("/")) _exit(1);
+        pfl_at("child path-fd", of_fd);
+        pfl_at("child path-cwd", cwd);
+        pfl_fd("child own fd", hard);
+        fflush(stdout);
+        char byte = 'r';
+        write(ready[1], &byte, 1);
+        read(done[0], &byte, 1);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 88;
+    snprintf(p, sizeof p, "/proc/%d/fd/%d", (int)kid, hard);
+    pfl_read("other fd", p);
+    snprintf(p, sizeof p, "/proc/%d/cwd", (int)kid);
+    pfl_read("other cwd", p);
+    int other = open(p, O_PATH | O_NOFOLLOW);
+    pfl_at("other path-cwd", other);
+    write(done[1], &byte, 1);
+    reaped(kid);
+    /* Gone with its process. */
+    pfl_at("other path-cwd reaped", other);
+    /* From a chroot: inside it from its root, outside it from the
+       machine's. */
+    pfl_path(a, "root");
+    mkdir(a, 0755);
+    pfl_path(a, "root/proc");
+    mkdir(a, 0755);
+    if (mount("/proc", a, NULL, MS_BIND | MS_REC, NULL)) {
+        printf("bind errno=%d\n", errno);
+        return 89;
+    }
+    int inside = pfl_open("root/in", O_CREAT | O_RDWR);
+    int outside = pfl_open("hard", O_RDONLY);
+    snprintf(p, sizeof p, "/proc/self/fd/%d", outside);
+    int of_outside = open(p, O_PATH | O_NOFOLLOW);
+    snprintf(p, sizeof p, "/proc/self/fd/%d", inside);
+    int of_inside = open(p, O_PATH | O_NOFOLLOW);
+    fflush(stdout);
+    kid = fork();
+    if (kid < 0) return 90;
+    if (!kid) {
+        pfl_path(a, "root");
+        if (chroot(a)) _exit(1);
+        pfl_fd("chroot inside", inside);
+        pfl_fd("chroot outside", outside);
+        pfl_fd("chroot pipe", pipes[1]);
+        pfl_read("chroot cwd outside", "/proc/self/cwd");
+        pfl_at("chroot path-fd outside", of_outside);
+        pfl_at("chroot path-fd inside", of_inside);
+        pfl_at("chroot path-cwd", cwd);
+        snprintf(p, sizeof p, "/proc/%d/fd/%d", (int)getppid(), inside);
+        pfl_read("chroot parent fd inside", p);
+        if (chdir("/")) _exit(2);
+        pfl_read("chroot cwd", "/proc/self/cwd");
+        pfl_read("chroot root", "/proc/self/root");
+        pfl_fd("chroot new", open("/in", O_RDONLY));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("chrooted=%d\n", reaped(kid));
+    pfl_path(a, "root/proc");
+    umount2(a, MNT_DETACH);
+    return 0;
+}
+static int proc_fd_links_case(void) {
+    if (!mkdtemp(pfl_base)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 81;
+    if (!kid) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (unshare(CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        _exit(pfl_inner());
+    }
+    printf("status=%d\n", reaped(kid));
+    const char *names[] = {"hard", "e/m2", "y", "new\nline", "x (deleted)", "root/in", "root/proc", "root", "e"};
+    char path[256];
+    for (unsigned i = 0; i < 7; i++) {
+        pfl_path(path, names[i]);
+        unlink(path);
+    }
+    for (unsigned i = 6; i < 9; i++) {
+        pfl_path(path, names[i]);
+        rmdir(path);
+    }
+    rmdir(pfl_base);
+    return 0;
+}
 /* The proc-other-fd-paths case: a path that goes on through a link of
    another process's fd, which Linux's walk jumps to the descriptor's file
    (proc_fd_link, nd_jump_link) once the reader may look at it, and goes on
@@ -30179,6 +30405,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "proc-owner-rename")) return proc_owner_rename_case();
     if (!strcmp(mode, "proc-io")) return proc_io_case();
+    if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);

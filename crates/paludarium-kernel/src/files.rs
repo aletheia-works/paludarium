@@ -5281,7 +5281,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                     .as_any()
                     .and_then(|v| v.downcast_ref::<LinkPath>())
                     .ok_or(Errno::ENOENT)?;
-                let b = link.target(c)?;
+                let b = link.read(c)?;
                 let count = b
                     .len()
                     .min(usize::try_from(a[3]).map_err(|_| Errno::EINVAL)?);
@@ -5632,9 +5632,11 @@ pub(crate) struct LinkPath {
 enum LinkTarget {
     /// A symbolic link of the filesystem or `/dev`, whose target stays.
     Fixed(Vec<u8>),
-    /// A link in `/proc/self/fd`, which names the descriptor's file as it
-    /// is when read.
-    Descriptor(u32),
+    /// A link of a process's `/proc` directory at this path (`fd/<n>`,
+    /// `exe`, `cwd`, `root`, of the process that opened it or another),
+    /// which leads where it does when read, as Linux's `proc_pid_readlink`
+    /// asks the task then.
+    Task(Vec<u8>),
     /// `/proc/self`, which names the directory of the process that reads it.
     OwnProcess,
 }
@@ -5647,16 +5649,36 @@ impl LinkPath {
                 target: LinkTarget::Fixed(target.to_vec()),
             }));
         }
-        if let Some(crate::proc::OwnEntry::Descriptor(n)) = crate::proc::own_entry(p, c.process.pid)
-        {
-            let d = c
-                .files
-                .descriptor(u64::from(n))
-                .map_err(|_| Errno::ENOENT)?;
-            return Ok(Some(Self {
-                stat: crate::proc::link_stat(d.file.flags() & 3),
-                target: LinkTarget::Descriptor(n),
-            }));
+        // Its inode is of the process that opened it: a forked child reads
+        // the parent's link.
+        let pinned = || match p.strip_prefix(b"/proc/self") {
+            Some(rest) if rest.is_empty() || rest[0] == b'/' => {
+                [format!("/proc/{}", c.process.pid).as_bytes(), rest].concat()
+            }
+            _ => p.to_vec(),
+        };
+        match crate::proc::own_entry(p, c.process.pid) {
+            Some(crate::proc::OwnEntry::Descriptor(n)) => {
+                let d = c
+                    .files
+                    .descriptor(u64::from(n))
+                    .map_err(|_| Errno::ENOENT)?;
+                return Ok(Some(Self {
+                    stat: crate::proc::link_stat(d.file.flags() & 3),
+                    target: LinkTarget::Task(pinned()),
+                }));
+            }
+            Some(
+                entry @ (crate::proc::OwnEntry::Exe
+                | crate::proc::OwnEntry::Cwd
+                | crate::proc::OwnEntry::Root),
+            ) if own_link(c, entry).is_some() => {
+                return Ok(Some(Self {
+                    stat: own_stat(c, crate::proc::self_link_stat()),
+                    target: LinkTarget::Task(pinned()),
+                }));
+            }
+            _ => {}
         }
         if p == b"/proc/self" {
             return Ok(Some(Self {
@@ -5671,9 +5693,10 @@ impl LinkPath {
             return match tasks::link(&task, path.entry) {
                 Some(target) => {
                     tasks::check(c, &task, path.entry)?;
+                    target?;
                     Ok(Some(Self {
                         stat: crate::proc::self_link_stat(),
-                        target: LinkTarget::Fixed(target?),
+                        target: LinkTarget::Task(p.to_vec()),
                     }))
                 }
                 None => Ok(None),
@@ -5690,18 +5713,20 @@ impl LinkPath {
             _ => Ok(None),
         }
     }
-    /// What `readlink` of the link gives.
+    /// Where the link leads, from the machine's root.
     fn target(&self, c: &Context<'_>) -> Result<Vec<u8>, Errno> {
         match &self.target {
             LinkTarget::Fixed(target) => Ok(target.clone()),
             LinkTarget::OwnProcess => Ok(c.process.pid.to_string().into_bytes()),
-            LinkTarget::Descriptor(n) => {
-                let d = c
-                    .files
-                    .descriptor(u64::from(*n))
-                    .map_err(|_| Errno::ENOENT)?;
-                link_target(&Holder::of(c), &d)
-            }
+            LinkTarget::Task(path) => task_link(c, path),
+        }
+    }
+    /// What `readlinkat(fd, "")` of the link gives: a symbolic link's text,
+    /// or where a `/proc` link leads as the reader sees it ([`from_reader`]).
+    fn read(&self, c: &Context<'_>) -> Result<Vec<u8>, Errno> {
+        match &self.target {
+            LinkTarget::Fixed(target) => Ok(target.clone()),
+            _ => Ok(from_reader(c, self.target(c)?)),
         }
     }
 }
@@ -6625,6 +6650,28 @@ fn own_link_target(c: &Context<'_>, path: &[u8]) -> Option<Vec<u8>> {
     let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
     let task = tasks::find(c, &task_path).ok()?;
     tasks::link(&task, task_path.entry)?.ok()
+}
+/// Where the link of a process's `/proc` directory at `path` leads now, as
+/// `readlink` reads it: a descriptor's file, the program, the current
+/// directory or the root, of this process or of another one that the
+/// reader may look at ([`tasks::check`]). `ENOENT` once it is gone.
+fn task_link(c: &Context<'_>, path: &[u8]) -> Result<Vec<u8>, Errno> {
+    match crate::proc::own_entry(path, c.process.pid) {
+        Some(crate::proc::OwnEntry::Descriptor(n)) => {
+            let d = c
+                .files
+                .descriptor(u64::from(n))
+                .map_err(|_| Errno::ENOENT)?;
+            return link_target(&Holder::of(c), &d);
+        }
+        Some(entry) => return own_link(c, entry).ok_or(Errno::ENOENT),
+        None => {}
+    }
+    let task_path = crate::proc::task_path(path, c.process.pid, c.tid).ok_or(Errno::ENOENT)?;
+    let task = tasks::find(c, &task_path)?;
+    let target = tasks::link(&task, task_path.entry).ok_or(Errno::ENOENT)?;
+    tasks::check(c, &task, task_path.entry)?;
+    target
 }
 /// The file that opening guest path `p` gives, and the path its descriptor
 /// records: the generated files, a link in `/proc/self/fd` opened again,
@@ -7704,7 +7751,8 @@ fn named_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
             b"/proc/self".to_vec()
         }
         _ if let Some(shown) = &d.shown => shown.clone(),
-        _ if generated(&d.path) => h.generated(&d.path),
+        // `/proc` itself is procfs's root, which no other filesystem holds.
+        _ if generated(&d.path) || d.path == b"/proc" => h.generated(&opened_path(d)),
         // The descriptor of a symbolic link itself names the link.
         _ if any.is_some_and(|v| v.is::<LinkPath>()) => {
             paludarium_vfs::normalize_path(&d.path).unwrap_or_else(|_| d.path.clone())

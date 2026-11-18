@@ -2499,12 +2499,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクをたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。`O_PATH | O_NOFOLLOW` は
   リンクそのものを開き、読んだプロセスの PID を読み、自分を `/proc/self` と
   名乗ります。ほかに `/proc/self/status`、`stat`、`statm`、`cmdline`、`environ`、`auxv`、
-  `limits`、`comm`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、
-  `pagemap`、`io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
+  `limits`、`personality`、`comm`、`syscall`、`exe`、`cwd`、`root`、`maps`、`mounts`、`mountinfo`、`clear_refs`、`smaps`、
+  `pagemap`、`wchan`、`io`、`fd`、`fdinfo`、`ns`、`task` があります。これらの持ち主は、Linux の `task_dump_owner` と同じく
   プロセスの実効ユーザーとグループで、ダンプできなくなると（ID を変えてから
   `PR_SET_DUMPABLE` まで）root です。ディレクトリ、`task`、`fdinfo`（0555）はどちらでも
   プロセスのもので、`/proc/self` そのものは root のものです。`stat` は
-  その持ち主とモード（`environ`、`auxv`、`pagemap`、`io` は 0400、`comm` は 0644、`clear_refs`
+  その持ち主とモード（`environ`、`auxv`、`pagemap`、`io`、`personality`、`syscall` は 0400、`comm` は 0644、`clear_refs`
   は 0200、ほかのファイルは 0444）を示します。
   開いたファイルの `fstat` は、そのパスを最後に探したとき（どのプロセスの open や `stat` でも）の
   持ち主を示します。Linux の inode と同じで、開いたファイルが押さえるパスを探すたびに新しく
@@ -2535,8 +2535,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
   が読むのはこれです。ほかのプロセスの `/proc/<pid>`（0555 で、持ち主はその実効 ID）には、
-  `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`comm`、
-  `maps`、`clear_refs`（0200）、`smaps`、`pagemap`（0400）、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
+  `status`、`stat`、`statm`、`cmdline`、`environ`（0400）、`auxv`（0400）、`limits`、`personality`（0400）、`comm`、
+  `syscall`（0400）、`maps`、`clear_refs`（0200）、`smaps`、`pagemap`（0400）、`wchan`、`io`（0400）、`exe`、`cwd`、`root`、`mounts`、`mountinfo`、`fd`、`fdinfo`、
   `ns`（0511）、`task` があり、
   Linux の `fs/proc/base.c` と `array.c` が root に見せるとおりに作ります。そこのほかの名前は
   `ENOENT` です。いなかったプロセスや回収されたプロセスのディレクトリも、マウントした
@@ -2577,6 +2577,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ゾンビの `maps` と `smaps` は、モードが許すどの読み手も開けます。Linux の `__mem_open` と
   `pagemap_open` は、読み手を確かめる前にメモリのないプロセスを断るので、ゾンビの
   `environ`、`auxv`、`pagemap` は、モードが許すどの読み手にも開けません（`ESRCH`）。
+- プロセスやスレッドの `personality` は 0400 で大きさは 0 で、Linux の
+  `proc_pid_personality` と同じく、読んだときにスレッドの実行ドメインとフラグを 16 進数 8 桁と
+  改行で書きます。そのとき、Linux の `lock_trace` がアタッチのモードの `ptrace_may_access` と
+  読み手のファイルシステムの ID で決めるとおり、そして Yama の `ptrace_scope` 1（祖先、
+  `PR_SET_PTRACER` で名指しされたもの、または `CAP_SYS_PTRACE`）のとおりに、ほかのプロセスの
+  読み手が読めるかを確かめます（`EPERM`）。回収されたタスクは `ESRCH` です。`wchan`
+  （0444）は、Linux の `proc_pid_wchan` が動いているタスクと、タスクを読めない読み手に
+  返すのと同じく、改行のない `0` を読みます。`stat` の `wchan` の項目は別のもので、
+  下のとおり、待っているタスクは 1 です。
+- プロセスやスレッドの `syscall` は 0400 で大きさは 0 で、Linux の `proc_pid_syscall` と同じく
+  読んだときに書きます。読み手が読めるかは `personality` と同じくアタッチできるかで決め
+  （`EPERM`）、読むスレッド自身のものは、読んでいるその呼び出しです。ほかのスレッドは、
+  動いている（システムコールの中にも止まってもいない）なら `running`、呼び出しの中で
+  眠っているか止まっているなら、Linux の `pt_regs` と同じく、最後にカーネルに入ったときの
+  レジスタです。呼び出しの番号と 6 つの引数、スタックポインターと命令ポインター（`syscall`
+  命令の次）を 16 進数で並べ、呼び出しでない入り方（ユーザーのコードからの停止）なら `-1` と
+  2 つのポインターです。終わったスレッドにはカーネルのスタックが残っていないので
+  `-1 0x0 0x0` です。スレッドは、カーネルに入るたびにいくつかのストアでレジスタを記録し、
+  ほかのスレッドはそれを欠けずに読みます。新しいスレッドや子は、Linux の `copy_thread` と
+  同じく、それを作った呼び出しでの親のレジスタから始まります。
 - プロセスやスレッドの `io`（`/proc/<pid>/task/<tid>/io`）は 0400 で大きさは 0 で、
   Linux の `task_io_accounting` が数えるものを示します。`rchar` と `wchar` は読み書きの
   呼び出し（`read`、`pread64`、`readv`、`preadv`、`preadv2`、それらの書き込み版、

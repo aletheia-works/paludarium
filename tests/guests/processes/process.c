@@ -12392,6 +12392,274 @@ static int proc_other_fd_paths_case(void) {
     rmdir(pofp_base);
     return 0;
 }
+/* The proc-personality-wchan case: /proc/<pid>/personality, which Linux's
+   proc_pid_personality writes when it is read for a reader that may attach
+   to the task (lock_trace: ptrace_may_access with
+   PTRACE_MODE_ATTACH_FSCREDS, and Yama), else EPERM; and wchan, 0 for a
+   task that is running or that the reader may not read. */
+/* What a read of `fd` from its start gives, with -errno for a failure. */
+static void ppw_read(const char *label, int fd) {
+    char b[64];
+    if (fd < 0) {
+        printf("%s: open errno=%d\n", label, errno);
+        return;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        printf("%s: lseek errno=%d\n", label, errno);
+        return;
+    }
+    ssize_t n = read(fd, b, sizeof b - 1);
+    if (n < 0) {
+        printf("%s: read errno=%d\n", label, errno);
+        return;
+    }
+    b[n] = 0;
+    printf("%s: [", label);
+    for (ssize_t i = 0; i < n; i++)
+        if (b[i] == '\n') printf("\\n");
+        else putchar(b[i]);
+    printf("]\n");
+}
+static void ppw_path(const char *label, const char *path) {
+    int fd = open(path, O_RDONLY);
+    ppw_read(label, fd);
+    if (fd >= 0) close(fd);
+}
+static int ppw_wait_byte(int fd) {
+    char byte;
+    return read(fd, &byte, 1) == 1 ? 0 : 1;
+}
+static int proc_personality_wchan_case(void) {
+    char path[64];
+    int own = open("/proc/self/personality", O_RDONLY);
+    ppw_read("own", own);
+    int old = (int)syscall(SYS_personality, 0xffffffffUL);
+    syscall(SYS_personality, 0x0040000UL); /* ADDR_NO_RANDOMIZE */
+    /* The same descriptor reads the new one: it is made when read. */
+    ppw_read("own after personality", own);
+    snprintf(path, sizeof path, "/proc/self/task/%d/personality", (int)getpid());
+    ppw_path("own thread", path);
+    syscall(SYS_personality, (unsigned long)old);
+    ppw_path("own wchan", "/proc/self/wchan");
+    struct stat st;
+    printf("modes personality=%o wchan=%o\n",
+           stat("/proc/self/personality", &st) ? 0 : (unsigned)(st.st_mode & 07777),
+           stat("/proc/self/wchan", &st) ? 0 : (unsigned)(st.st_mode & 07777));
+    /* A child of root's, waiting. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 81;
+    if (!kid) {
+        syscall(SYS_personality, 0x0020000UL); /* ADDR_LIMIT_32BIT, of the child only */
+        char byte = 'r';
+        write(ready[1], &byte, 1);
+        read(go[0], &byte, 1);
+        _exit(0);
+    }
+    if (ppw_wait_byte(ready[0])) return 82;
+    snprintf(path, sizeof path, "/proc/%d/personality", (int)kid);
+    ppw_path("root reads child", path);
+    int held = open(path, O_RDONLY);
+    fflush(stdout);
+    pid_t other = fork();
+    if (other < 0) return 83;
+    if (!other) {
+        /* Opened as root, read as another user: lock_trace refuses. */
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        ppw_read("other user held", held);
+        ppw_path("other user opens", path);
+        snprintf(path, sizeof path, "/proc/%d/wchan", (int)kid);
+        ppw_path("other user wchan", path);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(other));
+    /* Yama: a sibling of the same user may not attach; a parent may. */
+    int a_ready[2], a_go[2], b_done[2];
+    if (pipe(a_ready) || pipe(a_go) || pipe(b_done)) return 84;
+    fflush(stdout);
+    pid_t mid = fork();
+    if (mid < 0) return 85;
+    if (!mid) {
+        if (setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(90);
+        /* The ID change made it undumpable, which would make its child's
+           files root's. */
+        prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+        fflush(stdout);
+        pid_t a = fork();
+        if (a < 0) _exit(91);
+        if (!a) {
+            char byte = 'r';
+            write(a_ready[1], &byte, 1);
+            read(a_go[0], &byte, 1);
+            _exit(0);
+        }
+        if (ppw_wait_byte(a_ready[0])) _exit(92);
+        char a_path[64];
+        snprintf(a_path, sizeof a_path, "/proc/%d/personality", (int)a);
+        ppw_path("same user parent", a_path);
+        fflush(stdout);
+        pid_t b = fork();
+        if (b < 0) _exit(93);
+        if (!b) {
+            ppw_path("same user sibling", a_path);
+            fflush(stdout);
+            _exit(0);
+        }
+        printf("sibling=%d\n", reaped(b));
+        write(a_go[1], "g", 1);
+        printf("a=%d\n", reaped(a));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("mid=%d\n", reaped(mid));
+    /* Once reaped, the descriptor reads ESRCH. */
+    write(go[1], "g", 1);
+    printf("kid=%d\n", reaped(kid));
+    ppw_read("reaped", held);
+    return 0;
+}
+/* The proc-syscall case: /proc/<pid>/syscall, which Linux's
+   proc_pid_syscall writes when it is read for a reader that may attach to
+   the task (lock_trace, else EPERM), as task_current_syscall finds it: the
+   reader's own call, "running" for a running task, the call a sleeping or
+   stopped task last entered the kernel with (-1 for an entry that was no
+   call), and -1 with no registers once its stack is gone. The arguments a
+   call does not take hold whatever the registers held, so only the call's
+   own are shown. */
+static char psc_buffer[64];
+/* The line of `syscall` read from descriptor `fd`, shown by its number,
+   its first and third arguments, whether the second is psc_buffer, and
+   whether the stack and instruction pointers are set. */
+static void psc_show(const char *label, int fd) {
+    char b[256];
+    if (fd < 0) {
+        printf("%s: open errno=%d\n", label, errno);
+        return;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        printf("%s: lseek errno=%d\n", label, errno);
+        return;
+    }
+    ssize_t n = read(fd, b, sizeof b - 1);
+    if (n < 0) {
+        printf("%s: read errno=%d\n", label, errno);
+        return;
+    }
+    b[n] = 0;
+    if (!strcmp(b, "running\n")) {
+        printf("%s: running\n", label);
+        return;
+    }
+    unsigned long long v[8] = {0};
+    int number = 0;
+    int got = sscanf(b, "%d %llx %llx %llx %llx %llx %llx %llx %llx", &number, &v[0], &v[1], &v[2], &v[3], &v[4],
+                     &v[5], &v[6], &v[7]);
+    if (number < 0) {
+        printf("%s: %d fields=%d pointers=%s\n", label, number, got,
+               got == 3 && v[0] && v[1] ? "set" : got == 3 && !v[0] && !v[1] ? "zero" : "?");
+        return;
+    }
+    printf("%s: %d fd=%llu buffer=%s count=%llu fields=%d pointers=%s newline=%d\n", label, number, v[0],
+           v[1] == (unsigned long long)(uintptr_t)psc_buffer ? "ours" : "other", v[2], got,
+           v[6] && v[7] ? "set" : "zero", b[n - 1] == '\n');
+}
+static void psc_path(const char *label, const char *path) {
+    int fd = open(path, O_RDONLY);
+    psc_show(label, fd);
+    if (fd >= 0) close(fd);
+}
+/* Waits until the task at `stat` is in state `want`, for up to 5 s. */
+static int psc_state(const char *stat, char want) {
+    static char buffer[4096];
+    char *fields[64];
+    for (int i = 0; i < 5000; i++) {
+        if (proc_fields(stat, buffer, sizeof buffer, fields, 64) > 0 && fields[0][0] == want) return 0;
+        usleep(1000);
+    }
+    return 1;
+}
+static volatile int psc_spin;
+static int psc_pipe[2];
+static void *psc_thread(void *unused) {
+    (void)unused;
+    read(psc_pipe[0], psc_buffer, sizeof psc_buffer);
+    return NULL;
+}
+static int proc_syscall_case(void) {
+    char path[64], state[64];
+    int own = open("/proc/self/syscall", O_RDONLY);
+    /* Its own read of it: read(own, b, 255). */
+    psc_show("own", own);
+    struct stat st;
+    printf("mode=%o\n", stat("/proc/self/syscall", &st) ? 0 : (unsigned)(st.st_mode & 07777));
+    /* Another thread of its own, asleep in read. */
+    if (pipe(psc_pipe)) return 80;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, psc_thread, NULL)) return 81;
+    int tid = 0;
+    for (int i = 0; i < 5000 && !tid; i++) {
+        DIR *d = opendir("/proc/self/task");
+        for (struct dirent *e; d && (e = readdir(d));)
+            if (atoi(e->d_name) > 0 && atoi(e->d_name) != getpid()) tid = atoi(e->d_name);
+        if (d) closedir(d);
+    }
+    snprintf(state, sizeof state, "/proc/self/task/%d/stat", tid);
+    if (psc_state(state, 'S')) return 82;
+    snprintf(path, sizeof path, "/proc/self/task/%d/syscall", tid);
+    psc_path("own thread asleep", path);
+    write(psc_pipe[1], "x", 1);
+    pthread_join(thread, NULL);
+    /* A child asleep in read, then running, then stopped. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 83;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 84;
+    if (!kid) {
+        read(go[0], psc_buffer, 1);
+        write(ready[1], "r", 1);
+        for (;;) psc_spin++;
+    }
+    snprintf(state, sizeof state, "/proc/%d/stat", (int)kid);
+    snprintf(path, sizeof path, "/proc/%d/syscall", (int)kid);
+    if (psc_state(state, 'S')) return 85;
+    psc_path("child asleep", path);
+    /* Stopped while in read: the call it entered with. */
+    kill(kid, SIGSTOP);
+    if (psc_state(state, 'T')) return 86;
+    psc_path("child stopped in read", path);
+    int held = open(path, O_RDONLY);
+    fflush(stdout);
+    pid_t other = fork();
+    if (other < 0) return 87;
+    if (!other) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        psc_show("other user", held);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(other));
+    kill(kid, SIGCONT);
+    write(go[1], "g", 1);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 88;
+    if (psc_state(state, 'R')) return 89;
+    psc_path("child running", path);
+    /* Stopped from its loop: an entry that was no call. */
+    kill(kid, SIGSTOP);
+    if (psc_state(state, 'T')) return 90;
+    psc_path("child stopped running", path);
+    kill(kid, SIGKILL);
+    siginfo_t info;
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    psc_path("zombie", path);
+    printf("status=%d\n", reaped(kid));
+    psc_show("reaped", held);
+    return 0;
+}
 /* The proc-owner-rename case: the owner fstat shows of an open file in a
    process's /proc directory, which is its inode's as the last lookup of its
    path set it (pid_revalidate), and of the process's directory and its ns,
@@ -30706,6 +30974,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "proc-owner-rename")) return proc_owner_rename_case();
     if (!strcmp(mode, "proc-io")) return proc_io_case();
+    if (!strcmp(mode, "proc-personality-wchan")) return proc_personality_wchan_case();
+    if (!strcmp(mode, "proc-syscall")) return proc_syscall_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {

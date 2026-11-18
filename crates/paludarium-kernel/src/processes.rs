@@ -3295,6 +3295,9 @@ impl Kernel {
             group.exec_actions();
         }
         let inbox = Arc::new(SignalInbox::default());
+        // The child's registers are a copy of the parent's in this call,
+        // as Linux's `copy_thread` copies `pt_regs` (`/proc/<pid>/syscall`).
+        inbox.enter_kernel(self.inbox.entry());
         group.set_process_inbox(inbox.clone());
         if let Some(value) = self.group.nice(parent.tid) {
             group.set_nice(pid, if reset_nice { 0 } else { value });
@@ -3834,13 +3837,12 @@ impl Kernel {
         view: &ProcessView,
         public: &crate::threads::PublicThread,
     ) -> bool {
-        use crate::credentials::CAP_SYS_PTRACE;
-        Self::may_read(thread, view, public)
-            && (self.processes.yama_allows(self.process.pid, pid)
-                || thread
-                    .state
-                    .credentials
-                    .capable_in(CAP_SYS_PTRACE, &public.credentials.user))
+        may_attach_task(
+            &self.processes,
+            (self.process.pid, &thread.state.credentials),
+            (pid, view, public),
+            true,
+        )
     }
     /// `pidfd_getfd(pidfd, targetfd, flags)`, as Linux's: `flags` must be 0
     /// (`EINVAL`) and `pidfd` a pidfd (`EBADF`); its process must not be
@@ -5484,4 +5486,23 @@ pub(crate) fn known_layout(number: i32, code: i32) -> bool {
     } else {
         code >= -7 || code == -60
     }
+}
+
+/// Whether `reader`, of process `reader_pid`, may attach to a thread of
+/// process `pid` (`view`, `public`) of another process, as Linux's
+/// `__ptrace_may_access` decides in attach mode: it may read it
+/// ([`crate::credentials::Credentials::may_read_task`], with the real IDs
+/// for `real`, else the filesystem ones), and Yama, whose `ptrace_scope`
+/// here is 1, as Debian's and Ubuntu's, lets it in
+/// ([`Processes::yama_allows`], or `CAP_SYS_PTRACE` in the target's user
+/// namespace).
+pub(crate) fn may_attach_task(
+    processes: &Processes,
+    (reader_pid, reader): (u32, &crate::credentials::Credentials),
+    (pid, view, public): (u32, &ProcessView, &crate::threads::PublicThread),
+    real: bool,
+) -> bool {
+    reader.may_read_task(&public.credentials, view.dumpable, real)
+        && (processes.yama_allows(reader_pid, pid)
+            || reader.capable_in(crate::credentials::CAP_SYS_PTRACE, &public.credentials.user))
 }

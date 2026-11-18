@@ -382,6 +382,8 @@
     {"name":"proc-owner-rename","binary":"process"},
     {"name":"proc-io","binary":"process"},
     {"name":"proc-other-fd-paths","binary":"process"},
+    {"name":"proc-personality-wchan","binary":"process"},
+    {"name":"proc-syscall","binary":"process"},
     {"name":"proc-fd-links","binary":"process"},
     {"name":"modify-ldt","binary":"process"},
     {"name":"port-access","binary":"process"},

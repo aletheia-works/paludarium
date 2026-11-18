@@ -395,6 +395,7 @@ struct Published {
     memory: usize,
     files: [usize; 3],
     credentials: credentials::Credentials,
+    personality: u32,
 }
 
 impl Kernel {
@@ -788,6 +789,7 @@ impl Kernel {
                 && p.memory == memory
                 && p.files == files
                 && p.credentials == state.credentials
+                && p.personality == state.personality
         }) {
             return;
         }
@@ -802,6 +804,7 @@ impl Kernel {
                 memory: Some(mem.view()),
                 files: self.files.view(),
                 seccomp: (state.seccomp.mode, state.seccomp.filters()),
+                personality: state.personality,
             },
         );
         self.published = Some(Published {
@@ -811,6 +814,7 @@ impl Kernel {
             memory,
             files,
             credentials: state.credentials.clone(),
+            personality: state.personality,
         });
     }
 
@@ -1062,6 +1066,26 @@ impl Kernel {
             u64::MAX
         };
         thread.state.ptrace.enter(thread.tid, orig_rax);
+        // As Linux's `pt_regs` keeps them for `/proc/<pid>/syscall`.
+        let gpr = &thread.cpu.gpr;
+        let call = orig_rax != u64::MAX;
+        self.inbox.enter_kernel(inbox::KernelEntry {
+            number: orig_rax,
+            arguments: if call {
+                [
+                    gpr[reg::RDI],
+                    gpr[reg::RSI],
+                    gpr[reg::RDX],
+                    gpr[reg::R10],
+                    gpr[reg::R8],
+                    gpr[reg::R9],
+                ]
+            } else {
+                [0; 6]
+            },
+            stack_pointer: gpr[reg::RSP],
+            instruction_pointer: reason.rip().0,
+        });
         // The thread runs no guest code until it takes a CPU again.
         self.leave_cpu();
         // A caller that did not finish the last exec finishes it now.

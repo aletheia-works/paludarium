@@ -114,7 +114,7 @@ pub(crate) fn own_entry(path: &[u8], pid: u32) -> Option<OwnEntry> {
 }
 /// The names in this process's directory, with their `d_type`, in the order
 /// Linux's `tgid_base_stuff` lists them, of the entries paludarium has.
-pub(crate) const OWN_NAMES: [(&[u8], u8); 25] = [
+pub(crate) const OWN_NAMES: [(&[u8], u8); 28] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -122,8 +122,10 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 25] = [
     (b"environ", 8),
     (b"auxv", 8),
     (b"status", 8),
+    (b"personality", 8),
     (b"limits", 8),
     (b"comm", 8),
+    (b"syscall", 8),
     (b"cmdline", 8),
     (b"stat", 8),
     (b"statm", 8),
@@ -136,13 +138,14 @@ pub(crate) const OWN_NAMES: [(&[u8], u8); 25] = [
     (b"clear_refs", 8),
     (b"smaps", 8),
     (b"pagemap", 8),
+    (b"wchan", 8),
     (b"io", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
     (b"setgroups", 8),
 ];
 /// The names in another process's directory, in the same order.
-pub(crate) const TASK_NAMES: [(&[u8], u8); 25] = [
+pub(crate) const TASK_NAMES: [(&[u8], u8); 28] = [
     (b"task", 4),
     (b"fd", 4),
     (b"fdinfo", 4),
@@ -150,8 +153,10 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 25] = [
     (b"environ", 8),
     (b"auxv", 8),
     (b"status", 8),
+    (b"personality", 8),
     (b"limits", 8),
     (b"comm", 8),
+    (b"syscall", 8),
     (b"cmdline", 8),
     (b"stat", 8),
     (b"statm", 8),
@@ -164,6 +169,7 @@ pub(crate) const TASK_NAMES: [(&[u8], u8); 25] = [
     (b"clear_refs", 8),
     (b"smaps", 8),
     (b"pagemap", 8),
+    (b"wchan", 8),
     (b"io", 8),
     (b"uid_map", 8),
     (b"gid_map", 8),
@@ -200,6 +206,12 @@ pub(crate) enum TaskEntry {
     ClearRefs,
     /// `io`, the counts of its reads and writes.
     Io,
+    /// `personality`, its execution domain and flags.
+    Personality,
+    /// `wchan`, where it waits in the kernel.
+    Wchan,
+    /// `syscall`, the call it is in.
+    Syscall,
     /// `fd`, and one of its links by descriptor number.
     Descriptors,
     Descriptor(u32),
@@ -269,6 +281,9 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         b"pagemap" => TaskEntry::Pagemap,
         b"clear_refs" => TaskEntry::ClearRefs,
         b"io" => TaskEntry::Io,
+        b"personality" => TaskEntry::Personality,
+        b"wchan" => TaskEntry::Wchan,
+        b"syscall" => TaskEntry::Syscall,
         b"mounts" => TaskEntry::Mounts(false),
         b"mountinfo" => TaskEntry::Mounts(true),
         b"ns" => TaskEntry::Namespaces,
@@ -301,13 +316,14 @@ pub(crate) fn task_path(path: &[u8], own: u32, own_tid: u32) -> Option<TaskPath>
         [b"task", tid] => (Some(thread(tid)?), TaskEntry::Directory),
         [b"task", tid, ref rest @ ..] => (Some(thread(tid)?), entry(rest)),
         // The process's own `ns`, user namespace files, mount tables,
-        // `auxv`, `limits`, `statm` and `io` are here (`/proc/self/mountinfo`
+        // `auxv`, `limits`, `statm`, `io`, `personality`, `wchan` and
+        // `syscall` are here (`/proc/self/mountinfo`
         // and `mounts` are [`mount_table`]'s); the rest of its own directory
         // is `own_entry`'s.
         [b"ns", ..]
         | [
             b"uid_map" | b"gid_map" | b"setgroups" | b"mounts" | b"mountinfo" | b"auxv" | b"limits"
-            | b"statm" | b"io" | b"clear_refs",
+            | b"statm" | b"io" | b"clear_refs" | b"personality" | b"wchan" | b"syscall",
         ] => (None, entry(&parts)),
         _ if pid == own => return None,
         [] => (None, TaskEntry::Directory),
@@ -1642,9 +1658,15 @@ impl crate::seq::Records for Single {
 /// A file whose text `text` makes when it is first read, and again after a
 /// seek to another place, as Linux's `seq_file` of one record
 /// (`single_open`) makes it then, with what its checks say at that moment:
-/// `io`. Size 0 and only its owner may read it, as Linux's (0400).
-pub(crate) fn single_file(text: Text, flags: u32, owner: Owner) -> crate::seq::SeqFile {
-    crate::seq::SeqFile::of_task(Box::new(Single(text)), flags, private_stat(0), owner)
+/// `io`, `personality`, `wchan` and `syscall`, of size 0 and with the mode
+/// of `stat`.
+pub(crate) fn single_file(
+    text: Text,
+    flags: u32,
+    stat: FileStat,
+    owner: Owner,
+) -> crate::seq::SeqFile {
+    crate::seq::SeqFile::of_task(Box::new(Single(text)), flags, stat, owner)
 }
 
 #[cfg(test)]
@@ -2236,9 +2258,15 @@ mod tests {
             path(b"/proc/8/task/8/auxv"),
             at(8, Some(8), TaskEntry::Auxv)
         );
+        assert_eq!(path(b"/proc/8/stack"), at(8, None, TaskEntry::Missing));
         assert_eq!(
             path(b"/proc/8/personality"),
-            at(8, None, TaskEntry::Missing)
+            at(8, None, TaskEntry::Personality)
+        );
+        assert_eq!(path(b"/proc/self/wchan"), at(7, None, TaskEntry::Wchan));
+        assert_eq!(
+            path(b"/proc/8/task/9/syscall"),
+            at(8, Some(9), TaskEntry::Syscall)
         );
         assert_eq!(path(b"/proc/8/fd/1"), at(8, None, TaskEntry::Descriptor(1)));
         assert_eq!(path(b"/proc/8/fd/"), at(8, None, TaskEntry::Descriptors));
@@ -2271,7 +2299,7 @@ mod tests {
         for none in [
             &b"/proc/7"[..],
             b"/proc/self/stat",
-            b"/proc/7/personality",
+            b"/proc/7/stack",
             b"/proc/08",
             b"/proc/0",
             b"/proc/loadavg",

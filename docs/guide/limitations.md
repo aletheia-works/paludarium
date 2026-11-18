@@ -87,10 +87,12 @@ verified.
   system files are made (see [features](./features)). The other system files
   (`/proc/cpuinfo`, the files of `/proc/sys` but for the ones of `fs`,
   `kernel` and `net` it has, ...) and the other names in
-  the reader's own directory (`personality`, `wchan`, ...) are looked up like any
+  the reader's own directory (`stack`, `sched`, ...) are looked up like any
   path, which with `--mount /:/` finds the host's `/proc`; in another
-  process's directory they are `ENOENT`, where Linux shows root `wchan`
-  and the rest. `io` does not count what Linux's `kernel_read` and
+  process's directory they are `ENOENT`, where Linux shows root `stack`
+  and the rest. `wchan` is `0` for a waiting task too, where Linux names
+  the kernel function it waits in for a reader that may read the task:
+  there are no kernel functions here to name. `io` does not count what Linux's `kernel_read` and
   `kernel_write` count for the process (`execve` reading its program and
   interpreter, a core dump's writes), and a read or write that fails with
   an errno Linux gives both before and in the file's operation (`EINVAL`,

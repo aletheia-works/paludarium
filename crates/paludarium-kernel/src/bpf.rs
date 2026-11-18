@@ -136,7 +136,6 @@ fn bpf_capable(c: &Context<'_>) -> bool {
     credentials.capable(CAP_BPF) || credentials.capable(CAP_SYS_ADMIN)
 }
 
-/// The elements of a map.
 /// A value that a program's lookup points at: the map and the program
 /// share it, so that what either writes the other reads, until the element
 /// it is in goes (an array's never do; a hash's and an LRU hash's are new
@@ -151,6 +150,7 @@ fn copy(cell: &Cell) -> Vec<u8> {
     lock(cell).to_vec()
 }
 
+/// The elements of a map.
 enum Elements {
     /// An array's, by index: those never written or pointed at are zeros.
     Array(BTreeMap<u32, Cell>),
@@ -1327,7 +1327,9 @@ pub(crate) struct Meta {
 /// The map operations a program's helpers call, as each type's
 /// `bpf_map_ops` does them; the verifier lets a program call only those its
 /// map's type has (`check_map_func_compatibility`), and those it has not
-/// are `EINVAL` here.
+/// are `EINVAL` here. The verifier also makes every key and value the
+/// map's size; one that is not is `EFAULT` (none for a lookup), so that a
+/// mistake there fails the call rather than the emulator.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "BPF programs call them once they run")
@@ -1348,6 +1350,7 @@ impl Map {
     /// so an index in range always has one; an LRU hash's lookup sets the
     /// element's reference, which the syscall's does not.
     pub(crate) fn prog_lookup(&self, key: &[u8]) -> Option<ValueRef> {
+        sized(key, self.key_size).ok()?;
         let mut elements = self.elements();
         let value = match &mut *elements {
             Elements::Array(values) => {
@@ -1377,11 +1380,14 @@ impl Map {
         if matches!(self.kind, TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER) {
             return Err(Errno::EINVAL);
         }
+        sized(key, self.key_size)?;
+        sized(value, self.value_size)?;
         self.set(key, value.to_vec(), flags)
     }
     /// `bpf_map_delete_elem`: an array's, a queue's and a stack's are
     /// `EINVAL`, a bloom filter's `EOPNOTSUPP`.
     pub(crate) fn prog_delete(&self, key: &[u8]) -> Result<(), Errno> {
+        sized(key, self.key_size)?;
         self.remove(key).map(drop)
     }
     /// `bpf_map_push_elem`: a queue's, a stack's or a bloom filter's.
@@ -1389,12 +1395,14 @@ impl Map {
         if !matches!(self.kind, TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER) {
             return Err(Errno::EINVAL);
         }
+        sized(value, self.value_size)?;
         self.set(&[], value.to_vec(), flags)
     }
     /// `bpf_map_pop_elem`: a queue's oldest or a stack's newest, taken out
     /// into `out`, which is zeros with `ENOENT` for none; a bloom filter's
     /// is `EOPNOTSUPP`.
     pub(crate) fn pop_into(&self, out: &mut [u8]) -> Result<(), Errno> {
+        sized(out, self.value_size)?;
         match self.kind {
             TYPE_QUEUE | TYPE_STACK => Self::give(self.pop(), out),
             TYPE_BLOOM_FILTER => Err(EOPNOTSUPP),
@@ -1405,6 +1413,7 @@ impl Map {
     /// into `value` (zeros with `ENOENT` for none); for a bloom filter,
     /// whether `value` may be in it (`ENOENT` for one that is not).
     pub(crate) fn peek(&self, value: &mut [u8]) -> Result<(), Errno> {
+        sized(value, self.value_size)?;
         match &*self.elements() {
             Elements::Bloom(bloom) => bloom.peek(value),
             Elements::Queue(values) => {
@@ -1434,6 +1443,15 @@ impl Map {
                 Err(e)
             }
         }
+    }
+}
+
+/// `EFAULT` for a key or value that is not `size` bytes.
+fn sized(bytes: &[u8], size: u32) -> Result<(), Errno> {
+    if bytes.len() == size as usize {
+        Ok(())
+    } else {
+        Err(Errno::EFAULT)
     }
 }
 
@@ -2513,6 +2531,18 @@ mod tests {
         assert_eq!(queue.push(&[0; 8], F_LOCK), Err(Errno::EINVAL));
         assert_eq!(queue.push(&[0; 8], F_LOCK | EXIST), Err(Errno::EINVAL));
         assert_eq!(map(TYPE_HASH, 1).push(&[0; 8], 0), Err(Errno::EINVAL));
+        // A key or value of another size fails the call, and nothing more.
+        let array = map(TYPE_ARRAY, 1);
+        assert_eq!(array.prog_update(&k, &[0; 9], 0), Err(Errno::EFAULT));
+        assert_eq!(array.prog_update(&[0; 3], &[0; 8], 0), Err(Errno::EFAULT));
+        assert!(array.prog_lookup(&[0; 3]).is_none());
+        let hash = map(TYPE_HASH, 1);
+        assert_eq!(hash.prog_update(&k, &[0; 7], 0), Err(Errno::EFAULT));
+        assert_eq!(hash.prog_delete(&[0; 5]), Err(Errno::EFAULT));
+        assert_eq!(hash.len(), 0);
+        assert_eq!(queue.push(&[0; 4], 0), Err(Errno::EFAULT));
+        assert_eq!(queue.peek(&mut [0; 4]), Err(Errno::EFAULT));
+        assert_eq!(queue.pop_into(&mut [0; 4]), Err(Errno::EFAULT));
     }
 
     #[test]
@@ -2541,7 +2571,8 @@ mod tests {
         assert_eq!(out, [0; 8]);
         // A bloom filter's peek reads the value it asks about.
         // (`create` makes its bits from `map_extra` and the seed.)
-        let filter = map(TYPE_BLOOM_FILTER, 100);
+        let mut filter = map(TYPE_BLOOM_FILTER, 100);
+        filter.key_size = 0;
         *filter.elements() = Elements::Bloom(bloom(100, 0, 0));
         filter.push(&[4; 8], 0).unwrap();
         assert_eq!(filter.push(&[4; 8], EXIST), Err(Errno::EINVAL));

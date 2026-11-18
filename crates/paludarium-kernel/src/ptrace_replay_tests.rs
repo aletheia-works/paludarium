@@ -1,13 +1,15 @@
-//! Cases of `tests/guests/processes/ptrace.c`, replayed through the kernel's
-//! system calls: the tracer on the test's thread, the tracee on a thread of
-//! its own, as a guest's tasks run, each system call followed by the
-//! checkpoint the runtime takes before guest code runs again. The expected
-//! lines are what the guest printed for its mode on native Linux 7.0
-//! (x86-64, Ubuntu 26.04 runner); `diff_processes` still compares the whole
-//! guests with Linux on every CI run. What only the CPU does (a signal
-//! handler's body, the check a tracee makes after it resumes) is done here
-//! in Rust from the state the kernel left; a line that needs an exec is left
-//! out.
+//! Cases of `tests/guests/processes/ptrace.c` and `ptrace-syscalls.c`,
+//! replayed through the kernel's system calls: the tracer on the test's
+//! thread, the tracee on a thread of its own, as a guest's tasks run, each
+//! system call followed by the checkpoint the runtime takes before guest
+//! code runs again. The expected lines are what the guest prints for its
+//! mode on native Linux: for the `ptrace.c` cases as printed on Linux 7.0
+//! (x86-64, Ubuntu 26.04 runner), for `ptrace-strace` and `ptrace-sysemu` as
+//! the guest prints them under the emulator, which `diff_processes` finds
+//! equal to Linux's. It still compares the whole guests with Linux on every
+//! CI run. What only the CPU does (a signal handler's body, the check a
+//! tracee makes after it resumes) is done here in Rust from the state the
+//! kernel left; a line that needs an exec is left out.
 use super::*;
 
 const READ: u64 = 0;
@@ -19,10 +21,13 @@ const RT_SIGACTION: u64 = 13;
 const RT_SIGPROCMASK: u64 = 14;
 const RT_SIGRETURN: u64 = 15;
 const PAUSE: u64 = 34;
+const SCHED_YIELD: u64 = 24;
 const GETPID: u64 = 39;
+const FORK: u64 = 57;
 const WAIT4: u64 = 61;
 const KILL: u64 = 62;
 const PTRACE: u64 = 101;
+const GETUID: u64 = 102;
 const GETPPID: u64 = 110;
 const ARCH_PRCTL: u64 = 158;
 const GETTID: u64 = 186;
@@ -38,24 +43,34 @@ const POKEUSER: u64 = 6;
 const CONT: u64 = 7;
 const KILL_REQUEST: u64 = 8;
 const GETREGS: u64 = 12;
+const SETREGS: u64 = 13;
 const GETFPREGS: u64 = 14;
 const SETFPREGS: u64 = 15;
 const ATTACH: u64 = 16;
+const SYSCALL: u64 = 24;
+const SYSEMU: u64 = 31;
 const DETACH: u64 = 17;
 const SETOPTIONS: u64 = 0x4200;
+const GETEVENTMSG: u64 = 0x4201;
 const GETSIGINFO: u64 = 0x4202;
 const SETSIGINFO: u64 = 0x4203;
 const GETREGSET: u64 = 0x4204;
 const SETREGSET: u64 = 0x4205;
 const SEIZE: u64 = 0x4206;
 const INTERRUPT: u64 = 0x4207;
+const GET_SYSCALL_INFO: u64 = 0x420e;
+const SET_SYSCALL_INFO: u64 = 0x4212;
+const O_TRACESYSGOOD: u64 = 1;
+const O_TRACEFORK: u64 = 2;
 const O_EXITKILL: u64 = 1 << 20;
 const NT_PRSTATUS: u64 = 1;
 const NT_PRFPREG: u64 = 2;
 
+const SIGTRAP: i64 = 5;
 const SIGUSR1: u64 = 10;
 const SIGUSR2: u64 = 12;
 const SIGTERM: u64 = 15;
+const SIGCHLD: u64 = 17;
 const SIGSTOP: u64 = 19;
 const WNOHANG: u64 = 1;
 const WALL: u64 = 0x4000_0000;
@@ -66,10 +81,14 @@ const SA_RESTORER: u64 = 0x0400_0000;
 const R14: u64 = 8;
 const R13: u64 = 16;
 const R12: u64 = 24;
+const R10: u64 = 56;
 const RAX: u64 = 80;
+const RDI: u64 = 112;
 const ORIG_RAX: u64 = 120;
+const RIP: u64 = 128;
 const CS: u64 = 136;
 const EFLAGS: u64 = 144;
+const RSP: u64 = 152;
 const SS: u64 = 160;
 const FS_BASE: u64 = 168;
 const DS: u64 = 184;
@@ -120,7 +139,14 @@ struct Tracee {
     k: Box<Kernel>,
     t: Thread,
     m: Arc<AddressSpace>,
+    /// The threads of the tasks it forked, joined as it ends.
+    children: Vec<std::thread::JoinHandle<()>>,
+    /// What the child of its next `fork` runs.
+    forked: Option<Box<Body>>,
 }
+
+/// What a forked task runs, to the end it gives.
+type Body = dyn FnOnce(&mut Tracee) -> ExitStatus + Send;
 
 /// What the tracee's signal handler does with a signal and its siginfo:
 /// return, or end the process with a code.
@@ -147,20 +173,8 @@ impl Tracee {
             {
                 return Err(status);
             }
-            let deadline = std::time::Instant::now() + PATIENCE;
-            loop {
-                match self.k.checkpoint(&mut self.t, &self.m) {
-                    Next::Exit(status) => return Err(status),
-                    Next::Stopped => {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "tracee stayed stopped"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    Next::Resume => break,
-                }
-            }
+            self.spawn();
+            self.settle()?;
             match self.t.cpu.rip.0 {
                 HANDLER => {
                     let (signal, info) = (self.t.cpu.gpr[reg::RDI], self.t.cpu.gpr[reg::RSI]);
@@ -177,6 +191,64 @@ impl Tracee {
                 _ => return Ok(self.t.cpu.gpr[reg::RAX]),
             }
         }
+    }
+    /// The checkpoints until guest code runs again, as the runtime takes
+    /// them, waiting while the task is stopped.
+    fn settle(&mut self) -> Result<(), ExitStatus> {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        loop {
+            match self.k.checkpoint(&mut self.t, &self.m) {
+                Next::Exit(status) => return Err(status),
+                Next::Stopped => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "tracee stayed stopped"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Next::Resume => return Ok(()),
+            }
+        }
+    }
+    /// As the runtime after a call that made a task: the task on a thread
+    /// of its own, which runs `forked` once its first checkpoints let it,
+    /// then the event its maker's tracer asked for.
+    fn spawn(&mut self) {
+        let Some((mut k, t)) = self.k.take_child() else {
+            return;
+        };
+        let m = k.take_spawn_memory().unwrap();
+        let body = self.forked.take().expect("a task no case runs");
+        self.children.push(std::thread::spawn(move || {
+            let mut child = Tracee {
+                k,
+                t,
+                m,
+                children: Vec::new(),
+                forked: None,
+            };
+            // As a tracee of the tracer's: a failure ends the process, then
+            // fails the test from join.
+            let run =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match child.settle() {
+                    Ok(()) => body(&mut child),
+                    Err(status) => status,
+                }));
+            match run {
+                Ok(status) => child.end(status),
+                Err(panic) => {
+                    child.end(ExitStatus::Signaled(9));
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }));
+        let kill = std::sync::atomic::AtomicBool::new(false);
+        self.k.child_started(&mut self.t, true, &kill).unwrap();
+    }
+    /// `fork`, its child running `body`: the child's PID.
+    fn fork(&mut self, body: impl FnOnce(&mut Tracee) -> ExitStatus + Send + 'static) -> u64 {
+        self.forked = Some(Box::new(body));
+        self.sys(FORK, [0; 6]).unwrap()
     }
     /// A call with no handler to run.
     fn sys(&mut self, n: u64, a: [u64; 6]) -> Result<u64, ExitStatus> {
@@ -218,6 +290,9 @@ impl Tracee {
     fn end(mut self, status: ExitStatus) {
         self.k.finish_thread(&self.t, &self.m);
         self.k.complete_process(status);
+        for child in std::mem::take(&mut self.children) {
+            child.join().unwrap();
+        }
     }
 }
 
@@ -255,7 +330,13 @@ impl Tracer {
         let (k, t, m) = fork(&mut self.k, &mut self.t, &self.m);
         let pid = u64::from(t.tid);
         let thread = std::thread::spawn(move || {
-            let mut tracee = Tracee { k, t, m };
+            let mut tracee = Tracee {
+                k,
+                t,
+                m,
+                children: Vec::new(),
+                forked: None,
+            };
             // A tracee that fails ends its process, so that the tracer's
             // wait returns and the test reports the failure from join.
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut tracee)));
@@ -998,5 +1079,324 @@ peek-shared=0
 poke-shared=-5
 parent-ro=1
 exit=0",
+    );
+}
+
+/// `struct ptrace_syscall_info`'s size, as Linux 6.16 and later have it.
+const INFO: u64 = 88;
+
+/// What `ptrace-strace`'s tracer keeps: the tasks it names, and whether it
+/// has seen a syscall-entry stop yet.
+struct Strace {
+    named: [u64; 2],
+    first_entry: bool,
+}
+
+impl Strace {
+    fn who(&self, pid: u64) -> &'static str {
+        match pid {
+            p if p == self.named[0] => "parent",
+            p if p == self.named[1] => "child",
+            _ => "?",
+        }
+    }
+    fn value(&self, v: i64) -> String {
+        match self.named.iter().position(|&n| n != 0 && n as i64 == v) {
+            Some(0) => "parent".to_owned(),
+            Some(_) => "child".to_owned(),
+            None => v.to_string(),
+        }
+    }
+    /// PTRACE_GET_SYSCALL_INFO into the tracer's buffer: the size, and the
+    /// buffer.
+    fn info(g: &mut Tracer, pid: u64) -> (i64, u64) {
+        let info = HEAP + 0x600;
+        g.m.write(GuestAddr(info), &[0; INFO as usize]).unwrap();
+        (g.pt(GET_SYSCALL_INFO, pid, INFO, info), info)
+    }
+    /// The stop syscall info describes: 1 for an entry, 2 for an exit.
+    fn op(g: &mut Tracer, pid: u64) -> u8 {
+        let (_, info) = Self::info(g, pid);
+        let mut op = [0];
+        g.m.read(GuestAddr(info), &mut op).unwrap();
+        op[0]
+    }
+    fn entry(&mut self, g: &mut Tracer, pid: u64, regs: u64) {
+        let nr = g.reg(regs, ORIG_RAX) as i64;
+        let rax = g.reg(regs, RAX) as i64;
+        g.lines
+            .push(format!("{} enter {nr} rax={rax}", self.who(pid)));
+        let (size, info) = Self::info(g, pid);
+        let word = |g: &Tracer, at: u64| g.m.read_u64(GuestAddr(info + at)).unwrap();
+        if self.first_entry {
+            self.first_entry = false;
+            let mut op = [0];
+            g.m.read(GuestAddr(info), &mut op).unwrap();
+            let arch = read32(&g.m, info + 4);
+            let same = |g: &Tracer, at, field| i32::from(word(g, at) == g.reg(regs, field));
+            let (ip, sp, nr) = (same(g, 8, RIP), same(g, 16, RSP), same(g, 24, ORIG_RAX));
+            g.lines.push(format!(
+                "info size={size} op={} arch={arch:#x} ip={ip} sp={sp} nr={nr}",
+                op[0]
+            ));
+            let short = g.pt(GET_SYSCALL_INFO, pid, 8, info);
+            g.say("info short", short);
+            let args = word(g, 32) == g.reg(regs, RDI) && word(g, 56) == g.reg(regs, R10);
+            g.say("info args", i32::from(args));
+        }
+        if nr == GETPPID as i64 {
+            // Skipped, with the value the tracer leaves in rax.
+            g.m.write_u64(GuestAddr(regs + ORIG_RAX), u64::MAX).unwrap();
+            g.m.write_u64(GuestAddr(regs + RAX), 42).unwrap();
+            let r = g.pt(SETREGS, pid, 0, regs);
+            g.say("setregs", r);
+        } else if nr == GETUID as i64 {
+            let set = HEAP + 0x680;
+            let mut bytes = [0; INFO as usize];
+            g.m.read(GuestAddr(info), &mut bytes).unwrap();
+            g.m.write(GuestAddr(set), &bytes).unwrap();
+            let r = g.pt(SET_SYSCALL_INFO, pid, INFO - 1, set);
+            g.say("set-small", r);
+            g.m.write(GuestAddr(set + 2), &1u16.to_le_bytes()).unwrap();
+            let r = g.pt(SET_SYSCALL_INFO, pid, INFO, set);
+            g.say("set-flags", r);
+            g.m.write(GuestAddr(set + 2), &0u16.to_le_bytes()).unwrap();
+            g.m.write(GuestAddr(set), &[2]).unwrap();
+            let r = g.pt(SET_SYSCALL_INFO, pid, INFO, set);
+            g.say("set-op", r);
+            g.m.write(GuestAddr(set), &[1]).unwrap();
+            g.m.write_u64(GuestAddr(set + 24), 1 << 40).unwrap();
+            let r = g.pt(SET_SYSCALL_INFO, pid, INFO, set);
+            g.say("set-range", r);
+            g.m.write_u64(GuestAddr(set + 24), GETPID).unwrap();
+            let r = g.pt(SET_SYSCALL_INFO, pid, INFO, set);
+            g.say("set-entry", r);
+        }
+    }
+    fn exit(&mut self, g: &mut Tracer, pid: u64, regs: u64) {
+        let (size, info) = Self::info(g, pid);
+        let mut head = [0; 33];
+        g.m.read(GuestAddr(info), &mut head).unwrap();
+        let rval = i64::from_le_bytes(head[24..32].try_into().unwrap());
+        let nr = g.reg(regs, ORIG_RAX) as i64;
+        g.lines.push(format!(
+            "{} exit {nr} = {} error={} size={size} op={}",
+            self.who(pid),
+            self.value(rval),
+            head[32],
+            head[0]
+        ));
+        if nr == SCHED_YIELD as i64 {
+            g.m.write(GuestAddr(info + 32), &[1]).unwrap();
+            g.m.write_u64(GuestAddr(info + 24), -1i64 as u64).unwrap();
+            let r = g.pt(SET_SYSCALL_INFO, pid, INFO, info);
+            g.say("set-exit", r);
+        }
+    }
+    /// Follows `pid` until it exits, as `strace -f` does, a child it forks
+    /// first, while `pid` waits at the event.
+    fn follow(&mut self, g: &mut Tracer, pid: u64) {
+        loop {
+            let status = g.wait(pid, WALL);
+            let who = self.who(pid);
+            if status < 0 || status & 0xff != 0x7f {
+                let exited = i32::from(status & 0x7f == 0);
+                g.lines.push(format!(
+                    "{who} exited={exited} code={}",
+                    (status >> 8) & 0xff
+                ));
+                return;
+            }
+            let (signal, event) = ((status >> 8) & 0xff, status >> 16);
+            let mut give = 0;
+            if event != 0 {
+                let at = HEAP + 0x6e0;
+                g.pt(GETEVENTMSG, pid, 0, at);
+                let message = g.m.read_u64(GuestAddr(at)).unwrap();
+                if event == 1 {
+                    self.named[1] = message;
+                }
+                let shown = self.value(message as i64);
+                g.lines.push(format!("{who} event={event} message={shown}"));
+                if event == 1 {
+                    self.follow(g, message);
+                }
+            } else if signal == SIGTRAP | 0x80 || signal == SIGTRAP {
+                let (_, regs) = g.regs(pid);
+                if signal == SIGTRAP {
+                    // Without PTRACE_O_TRACESYSGOOD: a plain SIGTRAP, which
+                    // syscall info cannot tell from another.
+                    let (size, _) = Self::info(g, pid);
+                    let op = Self::op(g, pid);
+                    let (_, _, code, _) = g.siginfo(pid);
+                    let nr = g.reg(regs, ORIG_RAX) as i64;
+                    g.lines.push(format!(
+                        "{who} plain nr={nr} op={op} size={size} si-code={code}"
+                    ));
+                    let r = g.pt(SETOPTIONS, pid, 0, O_TRACESYSGOOD | O_TRACEFORK);
+                    g.say("options", r);
+                } else if Self::op(g, pid) == 1 {
+                    self.entry(g, pid, regs);
+                } else {
+                    self.exit(g, pid, regs);
+                }
+            } else {
+                g.lines.push(format!("{who} signal={signal}"));
+                if signal != SIGSTOP as i64 {
+                    give = signal as u64;
+                }
+            }
+            g.pt(SYSCALL, pid, 0, give);
+        }
+    }
+}
+
+/// `ptrace-strace`: syscall-entry and -exit stops, a plain SIGTRAP before
+/// PTRACE_O_TRACESYSGOOD, PTRACE_GET_SYSCALL_INFO and
+/// PTRACE_SET_SYSCALL_INFO, a call the tracer skips and ones it changes,
+/// and the fork event with the child it follows. The lines are what the
+/// guest prints, which `diff_processes` checks against native Linux.
+#[test]
+fn strace() {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        let chld = HEAP + 0x910;
+        c.m.write_u64(GuestAddr(chld), 1 << (SIGCHLD - 1)).unwrap();
+        c.sys(RT_SIGPROCMASK, [0, chld, 0, 8, 0, 0]).unwrap();
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        c.raise(SIGSTOP, &mut |_, _, _| None).unwrap();
+        let own = c.sys(GETPID, [0; 6]).unwrap();
+        c.sys(CLOSE, [u64::MAX, 0, 0, 0, 0, 0]).unwrap();
+        let skipped = c.sys(GETPPID, [0; 6]).unwrap();
+        let changed = c.sys(GETUID, [0; 6]).unwrap();
+        let failed = c.sys(SCHED_YIELD, [0; 6]).unwrap();
+        let none = c.sys(1000, [0; 6]).unwrap();
+        let forked = c.fork(|grandchild| {
+            grandchild.sys(GETPID, [0; 6]).unwrap();
+            grandchild.exit(2)
+        });
+        let status = HEAP + 0x920;
+        c.sys(WAIT4, [forked, status, 0, 0, 0, 0]).unwrap();
+        let code = i32::from(skipped == 42)
+            | i32::from(changed == own) << 1
+            | i32::from(neg(failed) == -1) << 2
+            | i32::from(neg(none) == -38) << 3
+            | i32::from(read32(&c.m, status) >> 8 & 0xff == 2) << 4;
+        c.exit(code)
+    });
+    let mut strace = Strace {
+        named: [child, 0],
+        first_entry: true,
+    };
+    strace.follow(&mut g, child);
+    thread.join().unwrap();
+    g.check(
+        "parent signal=19
+parent plain nr=14 op=0 size=24 si-code=5
+options=0
+parent exit 14 = 0 error=0 size=33 op=2
+parent enter 39 rax=-38
+info size=80 op=1 arch=0xc000003e ip=1 sp=1 nr=1
+info short=80
+info args=1
+parent exit 39 = parent error=0 size=33 op=2
+parent enter 3 rax=-38
+parent exit 3 = -9 error=1 size=33 op=2
+parent enter 110 rax=-38
+setregs=0
+parent exit -1 = 42 error=0 size=33 op=2
+parent enter 102 rax=-38
+set-small=-22
+set-flags=-22
+set-op=-22
+set-range=-34
+set-entry=0
+parent exit 39 = parent error=0 size=33 op=2
+parent enter 24 rax=-38
+parent exit 24 = 0 error=0 size=33 op=2
+set-exit=0
+parent enter 1000 rax=-38
+parent exit 1000 = -38 error=1 size=33 op=2
+parent enter 57 rax=-38
+parent event=1 message=child
+child signal=19
+child enter 39 rax=-38
+child exit 39 = child error=0 size=33 op=2
+child enter 231 rax=-38
+child exited=1 code=2
+parent exit 57 = child error=0 size=33 op=2
+parent enter 61 rax=-38
+parent exit 61 = child error=0 size=33 op=2
+parent enter 231 rax=-38
+parent exited=1 code=31",
+    );
+}
+
+/// `ptrace-sysemu`: under PTRACE_SYSEMU each call stops at its entry only
+/// and does not run, with the value the tracer leaves in rax; resumed with
+/// PTRACE_SYSCALL, the call it entered under PTRACE_SYSEMU still does not
+/// run, though it stops at its exit. The lines are what the guest prints,
+/// which `diff_processes` checks against native Linux.
+#[test]
+fn sysemu() {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        c.raise(SIGSTOP, &mut |_, _, _| None).unwrap();
+        let emulated = c.sys(GETPID, [0; 6]).unwrap();
+        let skipped = c.sys(GETPPID, [0; 6]).unwrap();
+        c.exit(i32::from(emulated == 77) | i32::from(neg(skipped) == -38) << 1)
+    });
+    let status = g.wait(child, 0);
+    let stop = if status & 0xff == 0x7f {
+        (status >> 8) & 0xff
+    } else {
+        -1
+    };
+    g.say("stop", stop);
+    g.pt(SETOPTIONS, child, 0, O_TRACESYSGOOD);
+    let line = |g: &mut Tracer, name: &str, status: i64| {
+        let (_, regs) = g.regs(child);
+        let (nr, rax) = (g.reg(regs, ORIG_RAX) as i64, g.reg(regs, RAX) as i64);
+        let signal = (status >> 8) & 0xff;
+        g.lines
+            .push(format!("{name} signal={signal} nr={nr} rax={rax}"));
+        (regs, nr)
+    };
+    for round in 0.. {
+        let r = g.pt(SYSEMU, child, 0, 0);
+        g.say("sysemu", r);
+        let status = g.wait(child, 0);
+        let (regs, nr) = line(&mut g, "entry", status);
+        if nr == GETPID as i64 {
+            g.m.write_u64(GuestAddr(regs + RAX), 77).unwrap();
+            g.pt(SETREGS, child, 0, regs);
+        }
+        if nr == GETPPID as i64 || round > 8 {
+            break;
+        }
+    }
+    g.pt(SYSCALL, child, 0, 0);
+    let status = g.wait(child, 0);
+    line(&mut g, "exit", status);
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, 0);
+    thread.join().unwrap();
+    let code = if status & 0x7f == 0 {
+        (status >> 8) & 0xff
+    } else {
+        -1
+    };
+    g.say("exit", code);
+    g.check(
+        "stop=19
+sysemu=0
+entry signal=133 nr=14 rax=-38
+sysemu=0
+entry signal=133 nr=39 rax=-38
+sysemu=0
+entry signal=133 nr=110 rax=-38
+exit signal=133 nr=110 rax=-38
+exit=3",
     );
 }

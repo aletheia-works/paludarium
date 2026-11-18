@@ -202,9 +202,11 @@ every test passing.
   differential tests. So that the system calls those check count there too,
   some kernel unit tests (`replay_tests.rs` and `ptrace_replay_tests.rs`
   in `crates/paludarium-kernel/src/`) make a differential guest's calls in
-  the same order and compare its lines with what the guest printed on
-  native Linux 7.0. The differential tests still compare the whole guests
-  with Linux on every run.
+  the same order and compare its lines with what the guest prints on
+  native Linux: as printed on Linux 7.0, or as printed under the emulator
+  for a case whose differential test finds it equal to Linux's. The
+  differential tests still compare the whole guests with Linux on every
+  run.
 - `cargo fmt --check`, clippy (warnings are errors) and `cargo deny` (licences,
   sources, known vulnerabilities) run on every pull request. Clippy also runs
   with the stable Rust that `rust-version` names (the latest, moved weekly)

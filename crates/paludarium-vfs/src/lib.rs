@@ -220,6 +220,12 @@ pub trait FileSystem: HostFs {
     fn rooted(&self, _root: &[u8]) -> Option<Arc<dyn FileSystem>> {
         None
     }
+    /// This filesystem without its mounts below the mount point `point`,
+    /// so each shows the directory it covers, as a bind mount of that
+    /// mount without `MS_REC` shows it: `None` when it has no mounts.
+    fn uncovered(&self, _point: &[u8]) -> Option<Arc<dyn FileSystem>> {
+        None
+    }
     /// The mounts, root first, for `/proc/self/mountinfo`.
     fn mounts(&self) -> Vec<MountPoint> {
         vec![MountPoint::boot(0, b"/".to_vec(), "tmpfs")]

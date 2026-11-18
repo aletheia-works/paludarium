@@ -1602,8 +1602,10 @@ kernel.
   `MS_RDONLY` with it does not make it read-only), an ID of its own, and the
   source as its root in mountinfo's fourth field. It is not locked; without
   `MS_REC` a locked mount below the source is `EINVAL`
-  (`has_locked_children`), and with it the mounts below come along as
-  copies, each locked if its original was. A tmpfs stays while a bind mount
+  (`has_locked_children`), and a mount below that is not locked stays
+  behind, so the new mount shows the directory it covers (a `--mount`
+  directory's too). With `MS_REC` the mounts below come along as copies,
+  each locked if its original was. A tmpfs stays while a bind mount
   of it does, after its first mount goes, and a bind mount keeps showing its
   source after a rename of it. `statx` and `/proc/self/fdinfo` give a
   file's mount ID by its path, so a bind mount's files have the bind

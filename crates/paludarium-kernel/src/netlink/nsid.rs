@@ -661,4 +661,288 @@ mod tests {
                 .any(|n| Arc::ptr_eq(n, &this))
         );
     }
+
+    fn network() -> Arc<Network> {
+        Arc::new(Network::isolated(crate::users::first()))
+    }
+    /// A user with no capabilities.
+    fn user() -> Credentials {
+        Credentials {
+            uid: 1000,
+            euid: 1000,
+            suid: 1000,
+            fsuid: 1000,
+            permitted: 0,
+            effective: 0,
+            ..Credentials::default()
+        }
+    }
+    /// What [`resolve`] would have found: `found`, with the sender's
+    /// `credentials` and whether the send named an address.
+    fn found(
+        found: Vec<(Reference, Found)>,
+        credentials: Option<Credentials>,
+        addressed: bool,
+    ) -> Resolved {
+        RESOLVED.with(|r| *r.borrow_mut() = (found, credentials, addressed));
+        Resolved
+    }
+    /// A request of `kind` and sequence 7: an `rtgenmsg`, then
+    /// `attributes`.
+    fn request(kind: u16, attributes: &[(u16, i32)]) -> (Header, Vec<u8>) {
+        let mut payload = vec![0; 4];
+        for &(kind, value) in attributes {
+            attribute(&mut payload, kind, &value.to_le_bytes());
+        }
+        let header = Header {
+            len: 16 + payload.len() as u32,
+            kind,
+            flags: 0,
+            seq: 7,
+        };
+        (header, payload)
+    }
+    /// The `NETNSA_NSID` and `NETNSA_CURRENT_NSID` of an answer.
+    fn ids_of(answer: &[u8]) -> (i32, Option<i32>) {
+        let (mut nsid, mut current) = (i32::MIN, None);
+        each(&answer[20..], |kind, value| match kind {
+            NETNSA_NSID => nsid = s32(value),
+            NETNSA_CURRENT_NSID => current = Some(s32(value)),
+            _ => {}
+        });
+        (nsid, current)
+    }
+
+    #[test]
+    fn a_new_id_needs_an_id_and_a_peer_that_has_none() {
+        let (this, peer, other) = (network(), network(), network());
+        let _found = found(
+            vec![
+                (Reference::Pid(10), Ok(Arc::clone(&peer))),
+                (Reference::Fd(3), Ok(Arc::clone(&other))),
+                (Reference::Fd(4), Err(Errno::EINVAL)),
+            ],
+            None,
+            false,
+        );
+        let new = |attributes: &[(u16, i32)], echo| {
+            let (header, payload) = request(RTM_NEWNSID, attributes);
+            new_id(&this, &header, &payload, 55, echo)
+        };
+        // `rtnl_net_newid`: no ID, then no peer, are `EINVAL`; a process
+        // or descriptor none is gives its own error.
+        assert_eq!(new(&[(NETNSA_PID, 10)], false).err(), Some(Errno::EINVAL));
+        assert_eq!(new(&[(NETNSA_NSID, 5)], false).err(), Some(Errno::EINVAL));
+        assert_eq!(
+            new(&[(NETNSA_NSID, 5), (NETNSA_PID, 11)], false).err(),
+            Some(ESRCH)
+        );
+        assert_eq!(
+            new(&[(NETNSA_NSID, 5), (NETNSA_FD, 9)], false).err(),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
+            new(&[(NETNSA_NSID, 5), (NETNSA_FD, 4)], false).err(),
+            Some(Errno::EINVAL)
+        );
+        // The ID asked for, told to the group with the request's sequence
+        // and port.
+        let notice = new(&[(NETNSA_NSID, 5), (NETNSA_PID, 10)], false).unwrap();
+        assert_eq!(notice.group, RTNLGRP_NSID);
+        assert_eq!(notice.origin, 0);
+        assert_eq!(notice.bytes, fill(RTM_NEWNSID, 0, 7, 55, 5, None));
+        assert_eq!(this.netlink.ids.id_of(&peer), Some(5));
+        assert!(
+            peer.netlink
+                .ids
+                .heard_by()
+                .iter()
+                .any(|n| Arc::ptr_eq(n, &this))
+        );
+        // A peer that has one, or an ID taken: `EEXIST`, and nothing
+        // changes.
+        assert_eq!(
+            new(&[(NETNSA_NSID, 6), (NETNSA_PID, 10)], false).err(),
+            Some(EEXIST)
+        );
+        assert_eq!(
+            new(&[(NETNSA_NSID, 5), (NETNSA_FD, 3)], false).err(),
+            Some(EEXIST)
+        );
+        assert_eq!(this.netlink.ids.id_of(&other), None);
+        // A negative one takes the lowest free; with `NLM_F_ECHO` the
+        // requester alone of the members hears of it.
+        let notice = new(&[(NETNSA_NSID, -1), (NETNSA_FD, 3)], true).unwrap();
+        assert_eq!(notice.origin, 55);
+        assert_eq!(ids_of(&notice.bytes), (0, None));
+        assert_eq!(this.netlink.ids.id_of(&other), Some(0));
+        // The namespace's own ID for itself tells no one.
+        let _found = found(
+            vec![(Reference::Pid(1), Ok(Arc::clone(&this)))],
+            None,
+            false,
+        );
+        assert!(new(&[(NETNSA_NSID, 9), (NETNSA_PID, 1)], false).is_ok());
+        assert!(this.netlink.ids.heard_by().is_empty());
+    }
+
+    #[test]
+    fn get_id_tells_an_id_by_process_descriptor_or_id() {
+        let (this, peer, other, target) = (network(), network(), network(), network());
+        this.netlink.ids.live().insert(2, Arc::downgrade(&peer));
+        this.netlink.ids.live().insert(3, Arc::downgrade(&target));
+        target.netlink.ids.live().insert(8, Arc::downgrade(&peer));
+        let _found = found(
+            vec![
+                (Reference::Pid(10), Ok(Arc::clone(&peer))),
+                (Reference::Fd(3), Ok(Arc::clone(&other))),
+            ],
+            None,
+            false,
+        );
+        let opener = Credentials::default();
+        let get = |attributes: &[(u16, i32)], strict| {
+            let (header, payload) = request(RTM_GETNSID, attributes);
+            get_id(&this, &opener, &header, &payload, 55, strict)
+        };
+        let answer = get(&[(NETNSA_PID, 10)], false).unwrap();
+        assert_eq!(answer, fill(RTM_NEWNSID, 0, 7, 55, 2, None));
+        assert_eq!(ids_of(&get(&[(NETNSA_NSID, 2)], false).unwrap()), (2, None));
+        // A peer with no ID: `NETNSA_NSID_NOT_ASSIGNED`.
+        assert_eq!(ids_of(&get(&[(NETNSA_FD, 3)], false).unwrap()), (-1, None));
+        // An ID none has, no reference, or a process none is.
+        assert_eq!(get(&[(NETNSA_NSID, 4)], false).err(), Some(ENOENT));
+        assert_eq!(get(&[], false).err(), Some(Errno::EINVAL));
+        assert_eq!(get(&[(NETNSA_PID, 11)], false).err(), Some(ESRCH));
+        // Strictly, `NETNSA_CURRENT_NSID` is not the request's to give.
+        assert!(get(&[(NETNSA_PID, 10), (NETNSA_CURRENT_NSID, 0)], false).is_ok());
+        assert_eq!(
+            get(&[(NETNSA_PID, 10), (NETNSA_CURRENT_NSID, 0)], true).err(),
+            Some(Errno::EINVAL)
+        );
+        // As another namespace numbers the peer, with this one's ID too;
+        // the other's ID none has is `EINVAL`.
+        let answer = get(&[(NETNSA_PID, 10), (NETNSA_TARGET_NSID, 3)], false).unwrap();
+        assert_eq!(answer, fill(RTM_NEWNSID, 0, 7, 55, 8, Some(2)));
+        assert_eq!(
+            ids_of(&get(&[(NETNSA_FD, 3), (NETNSA_TARGET_NSID, 3)], false).unwrap()),
+            (-1, Some(-1))
+        );
+        assert_eq!(
+            get(&[(NETNSA_PID, 10), (NETNSA_TARGET_NSID, 9)], false).err(),
+            Some(Errno::EINVAL)
+        );
+        // Without `CAP_NET_ADMIN` over the other one: `EACCES`.
+        let user = user();
+        let (header, payload) = request(RTM_GETNSID, &[(NETNSA_PID, 10), (NETNSA_TARGET_NSID, 3)]);
+        assert_eq!(
+            get_id(&this, &user, &header, &payload, 55, false).err(),
+            Some(EACCES)
+        );
+    }
+
+    #[test]
+    fn a_dump_lists_the_ids_in_order_or_another_namespaces() {
+        let (this, first, second, target) = (network(), network(), network(), network());
+        this.netlink.ids.live().insert(4, Arc::downgrade(&second));
+        this.netlink.ids.live().insert(1, Arc::downgrade(&first));
+        this.netlink.ids.live().insert(6, Arc::downgrade(&target));
+        target.netlink.ids.live().insert(0, Arc::downgrade(&second));
+        target.netlink.ids.live().insert(3, Arc::downgrade(&this));
+        let _found = found(Vec::new(), None, false);
+        let opener = Credentials::default();
+        let dump_of = |attributes: &[(u16, i32)], strict| {
+            let (header, payload) = request(RTM_GETNSID, attributes);
+            dump(&this, &opener, &header, &payload, 55, strict)
+        };
+        let all = dump_of(&[], true).unwrap();
+        assert_eq!(
+            all,
+            [1, 4, 6].map(|id| fill(RTM_NEWNSID, NLM_F_MULTI, 7, 55, id, None))
+        );
+        // Unchecked, any attribute is passed over.
+        assert_eq!(dump_of(&[(NETNSA_TARGET_NSID, 6)], false), Ok(all));
+        // Strictly, another namespace's, with this one's ID of each peer.
+        let other = dump_of(&[(NETNSA_TARGET_NSID, 6)], true).unwrap();
+        assert_eq!(
+            other.iter().map(|m| ids_of(m)).collect::<Vec<_>>(),
+            [(0, Some(4)), (3, Some(-1))]
+        );
+        assert_eq!(
+            dump_of(&[(NETNSA_TARGET_NSID, 2)], true).err(),
+            Some(Errno::EINVAL)
+        );
+        assert_eq!(
+            dump_of(&[(NETNSA_NSID, 1)], true).err(),
+            Some(Errno::EINVAL)
+        );
+        let user = user();
+        let (header, payload) = request(RTM_GETNSID, &[(NETNSA_TARGET_NSID, 6)]);
+        assert_eq!(
+            dump(&this, &user, &header, &payload, 55, true).err(),
+            Some(EACCES)
+        );
+    }
+
+    #[test]
+    fn a_link_change_names_a_namespace_it_may_administer() {
+        let (this, peer) = (network(), network());
+        this.netlink.ids.live().insert(2, Arc::downgrade(&peer));
+        let root = Credentials::default();
+        let user = user();
+        let _found = found(
+            vec![(Reference::Pid(10), Ok(Arc::clone(&peer)))],
+            None,
+            false,
+        );
+        let named = |opener: &Credentials, pid, fd, id| {
+            link_target(&this, opener, pid, fd, id).map(|n| n.map(|n| Arc::ptr_eq(&n, &peer)))
+        };
+        assert_eq!(named(&root, None, None, None), Ok(None));
+        assert_eq!(named(&root, Some(10), None, Some(9)), Ok(Some(true)));
+        assert_eq!(named(&root, None, None, Some(2)), Ok(Some(true)));
+        assert_eq!(named(&root, None, None, Some(9)), Err(Errno::EINVAL));
+        assert_eq!(named(&root, Some(11), None, None), Err(ESRCH));
+        assert_eq!(named(&root, None, Some(3), None), Err(Errno::EBADF));
+        // Both the opener and the sender need `CAP_NET_ADMIN` over it.
+        assert_eq!(named(&user, Some(10), None, None), Err(Errno::EPERM));
+        let _found = found(
+            vec![(Reference::Pid(10), Ok(Arc::clone(&peer)))],
+            Some(user.clone()),
+            false,
+        );
+        assert_eq!(named(&root, Some(10), None, None), Err(Errno::EPERM));
+        // A send that names an address asks the sender alone.
+        let _found = found(
+            vec![(Reference::Pid(10), Ok(Arc::clone(&peer)))],
+            Some(root.clone()),
+            true,
+        );
+        assert_eq!(named(&user, Some(10), None, None), Ok(Some(true)));
+        let _found = found(
+            vec![(Reference::Pid(10), Ok(Arc::clone(&peer)))],
+            Some(user.clone()),
+            true,
+        );
+        assert_eq!(named(&root, Some(10), None, None), Err(Errno::EPERM));
+    }
+
+    #[test]
+    fn an_id_goes_with_its_peer() {
+        let (this, other) = (network(), network());
+        let peer = network();
+        let mut notices = Vec::new();
+        assert_eq!(link_netnsid(&this, &peer, &mut notices), Some(0));
+        assert_eq!(link_netnsid(&other, &peer, &mut notices), Some(0));
+        assert_eq!(link_netnsid(&this, &other, &mut notices), Some(1));
+        drop(peer);
+        // `unhash_nsid`: each namespace that had an ID for it forgets it,
+        // which is free again; the others stay.
+        assert_eq!(
+            this.netlink.ids.live().keys().copied().collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(other.netlink.ids.live().is_empty());
+        assert_eq!(link_netnsid(&this, &network(), &mut notices), Some(0));
+    }
 }

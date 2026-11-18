@@ -1510,6 +1510,34 @@ pub trait PageSource: Send + Sync {
     fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
         None
     }
+    /// A VMA of a shared mapping of the file came to be, by a split, a
+    /// `fork` or a move by `mremap`, as Linux's `vm_ops->open` is told;
+    /// `by` is the actor of the space it is in ([`AddressSpace::set_actor`]).
+    fn opened(&self, by: &Actor) {
+        let _ = by;
+    }
+    /// A VMA of a shared mapping of the file went, by an unmap or the end
+    /// of its space, as Linux's `vm_ops->close` is told.
+    fn closed(&self, by: &Actor) {
+        let _ = by;
+    }
+}
+
+/// Who acts on an address space for the kernel, as Linux's `current` in a
+/// VMA's `open` and `close`: the files of its shared mappings are told it
+/// ([`PageSource::opened`], [`PageSource::closed`]).
+pub type Actor = dyn std::any::Any + Send + Sync;
+
+/// Tells the file of `shared`, if it has one, that one of its VMAs opened
+/// or closed, in a space with an `actor`.
+fn tell(actor: Option<&Arc<Actor>>, shared: &SharedMapping, opened: bool) {
+    if let (Some(actor), Some(source)) = (actor, shared.pages.source.as_ref()) {
+        if opened {
+            source.opened(actor.as_ref());
+        } else {
+            source.closed(actor.as_ref());
+        }
+    }
 }
 /// The shared memory `MADV_REMOVE` frees in one VMA of its range
 /// ([`AddressSpace::removals`]): `len` bytes of `pages` from `offset`, the
@@ -1990,6 +2018,19 @@ struct AddressSpaceData {
     /// [`AddressSpace::take_out_of_memory`], which reads it without the
     /// locks.
     out_of_memory: Arc<AtomicBool>,
+    /// Who acts on the space ([`AddressSpace::set_actor`]), which the files
+    /// of its shared mappings are told as their VMAs open and close.
+    actor: Option<Arc<Actor>>,
+}
+
+impl Drop for AddressSpaceData {
+    /// The space ends, and each VMA of a shared mapping with it, as Linux's
+    /// `exit_mmap` closes them.
+    fn drop(&mut self) {
+        for shared in self.shared.values() {
+            tell(self.actor.as_ref(), shared, false);
+        }
+    }
 }
 
 impl Default for AddressSpaceData {
@@ -2077,6 +2118,7 @@ impl AddressSpaceData {
             bottom_up: None,
             meter: None,
             out_of_memory: Arc::default(),
+            actor: None,
         }
     }
 
@@ -2782,6 +2824,13 @@ impl AddressSpaceData {
                     child.written = false;
                 }
             }
+        }
+        // Each VMA the child gets is opened by the parent (`dup_mmap`), and
+        // the child's space acts for it until the kernel says who the child
+        // is: a fork that fails after this closes them as the parent.
+        copy.actor = self.actor.clone();
+        for shared in copy.shared.values() {
+            tell(copy.actor.as_ref(), shared, true);
         }
         copy
     }
@@ -3652,10 +3701,37 @@ impl AddressSpaceData {
         {
             return;
         }
-        let tail = shared.clone();
-        if let Some(head) = self.shared.get_mut(&start) {
-            head.end = at;
+        self.split_shared(start, at);
+    }
+    /// Splits the shared mapping across `at` when its memory's VMAs never
+    /// merge ([`PageSource::merges`]) and the mappings on either side of
+    /// `at` now differ, as Linux splits a VMA when `madvise`, `mlock`,
+    /// `mseal` or a `userfaultfd` changes the flags of part of it
+    /// (`vma_modify`).
+    fn split_unmergeable_shared_where_changed(&mut self, at: u64) {
+        let Some((&start, shared)) = self.shared.range(..at).next_back() else {
+            return;
+        };
+        if shared.end <= at || shared.pages.source.as_ref().is_none_or(|s| s.merges()) {
+            return;
         }
+        let before = at.checked_sub(1).and_then(|last| self.mapping_at(last));
+        let (Some(&before), Some(&after)) = (before, self.mapping_at(at)) else {
+            return;
+        };
+        if !self.mergeable(&before, &after) {
+            self.split_shared(start, at);
+        }
+    }
+    /// Splits the shared mapping from `start` in two at `at`, the new VMA
+    /// opened as Linux's `__split_vma` opens it.
+    fn split_shared(&mut self, start: u64, at: u64) {
+        let Some(shared) = self.shared.get_mut(&start) else {
+            return;
+        };
+        let tail = shared.clone();
+        shared.end = at;
+        tell(self.actor.as_ref(), &tail, true);
         self.shared.insert(at, tail);
     }
     /// The shared mappings, by address.
@@ -3719,6 +3795,13 @@ impl AddressSpaceData {
             .collect();
         for (start, mapping) in affected {
             self.shared.remove(&start);
+            // What is left of a VMA unmapped in part is split from it
+            // (`__split_vma` opens the new one), and the part unmapped is
+            // closed.
+            if start < addr.0 || mapping.end > end {
+                tell(self.actor.as_ref(), &mapping, true);
+            }
+            tell(self.actor.as_ref(), &mapping, false);
             if start < addr.0 {
                 self.shared.insert(
                     start,
@@ -3938,14 +4021,14 @@ impl AddressSpaceData {
             }
         }
         if let Some(shared) = shared {
-            self.shared.insert(
-                to,
-                SharedMapping {
-                    end: to + new_len,
-                    shift: shared.shift.wrapping_add(old).wrapping_sub(to),
-                    ..shared
-                },
-            );
+            let moved = SharedMapping {
+                end: to + new_len,
+                shift: shared.shift.wrapping_add(old).wrapping_sub(to),
+                ..shared
+            };
+            // The VMA at its new place is a copy, opened (`copy_vma`).
+            tell(self.actor.as_ref(), &moved, true);
+            self.shared.insert(to, moved);
         }
         // The moved VMA leaves its `userfaultfd` (`mremap_userfaultfd_prep`
         // without `UFFD_FEATURE_EVENT_REMAP`).
@@ -4130,6 +4213,8 @@ impl AddressSpaceData {
         for (_, m) in self.mappings.range_mut(addr.0..end) {
             m.sealed = true;
         }
+        self.split_unmergeable_shared_where_changed(addr.0);
+        self.split_unmergeable_shared_where_changed(end);
         Ok(())
     }
 
@@ -4218,6 +4303,8 @@ impl AddressSpaceData {
                     FlagAdvice::Mergeable(on) => m.mergeable = on && (m.mergeable || ksm),
                 }
             }
+            self.split_unmergeable_shared_where_changed(from);
+            self.split_unmergeable_shared_where_changed(to);
         }
         if hole || covered < end {
             Err(Errno::ENOMEM)
@@ -4547,6 +4634,8 @@ impl AddressSpaceData {
             for (_, piece) in self.mappings.range_mut(from..to) {
                 piece.userfault = Some(registration);
             }
+            self.split_unmergeable_shared_where_changed(from);
+            self.split_unmergeable_shared_where_changed(to);
         }
         Ok(())
     }
@@ -4589,6 +4678,8 @@ impl AddressSpaceData {
             for (_, piece) in self.mappings.range_mut(from..to) {
                 piece.userfault = None;
             }
+            self.split_unmergeable_shared_where_changed(from);
+            self.split_unmergeable_shared_where_changed(to);
         }
         Ok(ended)
     }
@@ -5000,6 +5091,8 @@ impl AddressSpaceData {
                 for (_, mapping) in self.mappings.range_mut(at..to) {
                     mapping.locked = lock;
                 }
+                self.split_unmergeable_shared_where_changed(at);
+                self.split_unmergeable_shared_where_changed(to);
             }
             at = to;
         }
@@ -5023,6 +5116,8 @@ impl AddressSpaceData {
         for (_, mapping) in self.mappings.range_mut(addr..end) {
             mapping.locked = Some(lock);
         }
+        self.split_unmergeable_shared_where_changed(addr);
+        self.split_unmergeable_shared_where_changed(end);
     }
 
     /// Linux's `expand_downwards` for an access at `addr` that no mapping
@@ -6103,6 +6198,13 @@ impl AddressSpace {
     #[must_use]
     pub fn memory_meter(&self) -> Option<Arc<MemoryMeter>> {
         self.locked().meter.clone()
+    }
+    /// Says who acts on this space from now on, which the files of its
+    /// shared mappings are told as their VMAs open and close
+    /// ([`PageSource::opened`], [`PageSource::closed`]); a space without
+    /// one tells them nothing.
+    pub fn set_actor(&self, actor: Arc<Actor>) {
+        self.locked().actor = Some(actor);
     }
     /// Whether a write found no room under the meter since the last call.
     pub fn take_out_of_memory(&self) -> bool {

@@ -15630,7 +15630,23 @@ static int rseq_case(void) {
     return 0;
 }
 
-static int shm_case(void) {
+/* Makes a child's the last process to use segment `id`: the child exits at
+   once, which closes its copies of the attachments. Its PID. */
+static pid_t shm_last_used_by_child(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    if (child > 0) waitpid(child, NULL, 0);
+    return child;
+}
+/* Whether `shm_lpid` is this process's or `other`'s, and `shm_nattch`. */
+static void shm_show_user(const char *label, int id, pid_t other) {
+    struct shm_status s;
+    shm_status_of(id, SHMX_STAT, &s);
+    printf("%s lpid-own=%d lpid-other=%d nattch=%lu\n", label, s.lpid == getpid(), s.lpid == other, s.nattch);
+}
+
+static int shm_case(const char *self) {
     long page = sysconf(_SC_PAGESIZE);
     struct shm_status s;
     int id = (int)syscall(SYS_shmget, 0, 3 * page - 10, SHMX_CREAT | 0600);
@@ -15807,6 +15823,69 @@ static int shm_case(void) {
     if (waitpid(child, &status, 0) != child) return 23;
     printf("removed=%ld", syscall(SYS_shmctl, id, SHMX_RMID, 0));
     printf(" %ld\n", syscall(SYS_shmctl, keyed2, SHMX_RMID, 0));
+
+    /* Each VMA of an attachment that opens stamps the segment's atime and
+       lpid, and each one that closes its dtime and lpid (shm_open,
+       shm_close). A child's exit makes it the last user before each step. */
+    int st = (int)syscall(SYS_shmget, 0, 4 * page, SHMX_CREAT | 0600);
+    if (st < 0) return 24;
+    char *c = (char *)syscall(SYS_shmat, st, 0, 0);
+    if (c == (char *)-1) return 25;
+    shm_status_of(st, SHMX_STAT, &s);
+    printf("stamps new dtime-set=%d", s.dtime > 0);
+    pid_t other = shm_last_used_by_child();
+    shm_status_of(st, SHMX_STAT, &s);
+    printf(" after-exit dtime-set=%d lpid-other=%d nattch=%lu\n", s.dtime > 0, s.lpid == other, s.nattch);
+    /* An unmap of part splits the rest off and closes the part. */
+    other = shm_last_used_by_child();
+    if (munmap(c + 3 * page, page)) return 26;
+    shm_show_user("stamps unmap-tail", st, other);
+    /* mlock and madvise split where they change the flags, as mprotect
+       does; advice that the piece already has splits nothing. */
+    other = shm_last_used_by_child();
+    printf("stamps mlock=%d", mlock(c, page));
+    shm_show_user("", st, other);
+    other = shm_last_used_by_child();
+    printf("stamps dontfork=%d", madvise(c + page, page, MADV_DONTFORK));
+    shm_show_user("", st, other);
+    other = shm_last_used_by_child();
+    printf("stamps dontfork-again=%d", madvise(c + page, page, MADV_DONTFORK));
+    shm_show_user("", st, other);
+    /* A fork opens the child's copies as the parent, all but the piece it
+       does not get, and the child's exec closes them as the child. */
+    other = shm_last_used_by_child();
+    int go[2];
+    if (pipe(go)) return 27;
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 28;
+    if (child == 0) {
+        char byte;
+        close(go[1]);
+        if (read(go[0], &byte, 1) != 1) _exit(1);
+        char id_text[16];
+        snprintf(id_text, sizeof id_text, "%d", st);
+        char *arguments[] = {(char *)self, "shm-after-exec", (char *)self, id_text, NULL};
+        execv(self, arguments);
+        _exit(2);
+    }
+    close(go[0]);
+    shm_show_user("stamps forked", st, other);
+    fflush(stdout);
+    if (write(go[1], "x", 1) != 1) return 29;
+    close(go[1]);
+    if (waitpid(child, &status, 0) != child) return 30;
+    shm_show_user("stamps child-done", st, child);
+    printf("stamps detach=%ld", syscall(SYS_shmdt, c));
+    shm_show_user("", st, child);
+    printf("stamps removed=%ld\n", syscall(SYS_shmctl, st, SHMX_RMID, 0));
+    return 0;
+}
+
+/* After the shm case's exec: the attachments the old image had are closed,
+   as this process. */
+static int shm_after_exec(int id) {
+    shm_show_user("stamps after-exec", id, 0);
     return 0;
 }
 
@@ -29937,7 +30016,8 @@ int main(int argc, char **argv) {
         if (chdir("/") || rmdir(dir)) return 89;
         return 0;
     }
-    if (!strcmp(mode, "shm")) return shm_case();
+    if (!strcmp(mode, "shm")) return shm_case(self);
+    if (!strcmp(mode, "shm-after-exec") && argc > 3) return shm_after_exec(atoi(argv[3]));
     if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();

@@ -7,7 +7,7 @@ use crate::credentials::Credentials;
 use crate::namespaces::Namespace;
 use crate::syscalls::Context;
 use crate::users::Ids as Kind;
-use paludarium_host::ClockId;
+use paludarium_host::{ClockId, Host};
 use paludarium_types::Errno;
 use std::collections::BTreeMap;
 
@@ -201,8 +201,12 @@ pub(crate) fn capable(c: &Context<'_>, cap: u64) -> bool {
 
 /// The time of day in seconds, which the objects' times are in.
 pub(crate) fn now(c: &Context<'_>) -> i64 {
-    c.host
-        .clock(ClockId::Realtime)
+    seconds(c.host)
+}
+
+/// The seconds since the epoch on `host`'s clock, for an object's times.
+pub(crate) fn seconds(host: &dyn Host) -> i64 {
+    host.clock(ClockId::Realtime)
         .map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
 }
 

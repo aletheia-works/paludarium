@@ -532,16 +532,18 @@ verified.
   - A memory policy that `mbind` gives a shared mapping belongs to that
     mapping, where Linux keeps it with the shared memory itself, for every
     process that maps it. `/proc/<pid>/numa_maps` does not exist.
-  - A System V shared memory segment's `shm_atime`, `shm_dtime` and
-    `shm_lpid` change at `shmat` and `shmdt` only, where Linux also changes
-    them when a `fork` copies an attachment, `munmap` or `mprotect` splits
-    one, or a process exits or execs with one. `shmdt` finds the
-    attachments of the segments of the thread's IPC namespace only, where
-    Linux detaches one made before `setns` or `unshare` moved the thread to
-    another. An `mprotect` that gives part
-    of an attachment back the protection of the piece next to it makes a
-    piece of its own, which counts as an attachment, where recent Linux
-    moves the boundary between the two.
+  - `shmdt` finds the attachments of the segments of the thread's IPC
+    namespace only, where Linux detaches one made before `setns` or
+    `unshare` moved the thread to another. An `mprotect`, `mlock`,
+    `madvise`, `mseal` or `userfaultfd` registration that gives part of an
+    attachment back the flags of the piece next to it makes a piece of its
+    own, which counts as an attachment, where recent Linux moves the
+    boundary between the two.
+  - A segment's `shm_lpid` is that of the process that last attached a
+    segment in the address space, or the one a `fork` made it for: a child
+    that shares its parent's memory without being a thread of it
+    (`CLONE_VM`, `vfork`) stamps the segment as that process, where Linux
+    stamps it as the process that acts.
 - **Extended attributes**: a mounted host directory behaves as a file system
   without them, so reading finds none (`ENODATA`) and writing gives `EOPNOTSUPP`.
   In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), so it

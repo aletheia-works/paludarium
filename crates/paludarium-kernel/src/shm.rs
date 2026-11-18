@@ -13,9 +13,12 @@ use crate::ipc::{
     self, CAP_IPC_OWNER, CAP_SYS_ADMIN, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
     IPC_SET, IPC_STAT, Perm,
 };
-use crate::namespaces::KeptPid;
+use crate::namespaces::{KeptPid, Namespace};
 use crate::syscalls::{Context, Outcome};
-use paludarium_mmu::{Backing, FileSize, MappingKind, PageSource, Placement, Prot, SharedPages};
+use paludarium_host::Host;
+use paludarium_mmu::{
+    AddressSpace, Backing, FileSize, MappingKind, PageSource, Placement, Prot, SharedPages,
+};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -214,6 +217,56 @@ impl PageSource for Attachment {
     }
     fn merges(&self) -> bool {
         false
+    }
+    /// A VMA of it opened (`shm_open`): a split, a `fork` or a move.
+    fn opened(&self, by: &paludarium_mmu::Actor) {
+        self.touched(by, true);
+    }
+    /// A VMA of it closed (`shm_close`): an unmap, an `exec` or an exit.
+    fn closed(&self, by: &paludarium_mmu::Actor) {
+        self.touched(by, false);
+    }
+}
+
+/// Who acts on an address space that may show System V shared memory: the
+/// process, for `shm_lpid`, and the clock, for `shm_atime` and `shm_dtime`,
+/// as Linux's `shm_open` and `shm_close` take them from `current`.
+pub(crate) struct Actor {
+    pid: KeptPid,
+    host: Arc<dyn Host>,
+}
+
+/// Says that process `pid`, numbered in `space`, acts on `mem` from now on.
+pub(crate) fn act(mem: &AddressSpace, space: &Namespace, pid: u32, host: &Arc<dyn Host>) {
+    mem.set_actor(Arc::new(Actor {
+        pid: space.keep(pid),
+        host: Arc::clone(host),
+    }));
+}
+
+impl Attachment {
+    /// A VMA of this attachment opened or closed, by `by`, as Linux's
+    /// `__shm_open` and `__shm_close` stamp the segment: the time and the
+    /// process, if the segment is still there.
+    fn touched(&self, by: &paludarium_mmu::Actor, opened: bool) {
+        let (Some(actor), Some(table)) = (by.downcast_ref::<Actor>(), self.table.upgrade()) else {
+            return;
+        };
+        let mut table = table.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(segment) = table
+            .segments
+            .get_mut(&ipc::index(self.id))
+            .filter(|segment| segment.id == self.id)
+        else {
+            return;
+        };
+        let now = ipc::seconds(actor.host.as_ref());
+        if opened {
+            segment.atime = now;
+        } else {
+            segment.dtime = now;
+        }
+        segment.lpid = actor.pid.clone();
     }
 }
 
@@ -483,6 +536,9 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         }
     }
     let prot = crate::syscalls::read_implies_exec(c.process, prot);
+    // The space's VMAs of segments are opened and closed by this process
+    // from now on, even those `SHM_REMAP` replaces.
+    act(c.mem, &c.pid_space(), c.process.pid, c.shared_host);
     let placement = if fixed {
         if addr
             .checked_add(len)
@@ -542,8 +598,8 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
     if !addr.is_multiple_of(PAGE) {
         return Err(Errno::EINVAL);
     }
-    // The segments' attachments, by open file, with the segment's ID and size.
-    let attachments: BTreeMap<usize, (i32, u64)> = segments(c)
+    // The segments' attachments, by open file, with the segment's size.
+    let attachments: BTreeMap<usize, u64> = segments(c)
         .lock()
         .segments
         .values()
@@ -552,50 +608,41 @@ fn shmdt(c: &Context<'_>, addr: u64) -> Result<u64, Errno> {
                 .attachments
                 .iter()
                 .filter(|attachment| attachment.strong_count() > 0)
-                .map(|attachment| (attachment.as_ptr().addr(), (segment.id, segment.size)))
+                .map(|attachment| (attachment.as_ptr().addr(), segment.size))
         })
         .collect();
     let fragments = c.mem.shared_fragments();
     let lies = |start: u64, offset: u64| start.wrapping_sub(addr) / PAGE == offset / PAGE;
     let mut rest = fragments.iter().skip_while(|f| f.end <= addr);
     let mut found = None;
-    let mut detached = false;
+    // A sealed piece stays (Linux ignores `do_vmi_align_munmap`'s EPERM);
+    // the others close, which stamps the segment ([`Attachment::touched`]).
     let unmap = |f: &paludarium_mmu::SharedFragment| {
-        let unmapped = c
-            .mem
+        if c.mem
             .unmap_shared(GuestAddr(f.start), f.end - f.start)
-            .is_ok();
-        if unmapped {
+            .is_ok()
+        {
             c.group.numa().forget(f.start, f.end - f.start);
         }
-        unmapped
     };
     for f in rest.by_ref() {
-        if let Some(&(id, size)) = attachments.get(&f.open_file)
+        if let Some(&size) = attachments.get(&f.open_file)
             && lies(f.start, f.offset)
         {
             // Linux bounds the pieces by the size rounded up to a page
             // (`size = PAGE_ALIGN(size)` before its second loop).
-            found = Some((f.open_file, id, size.div_ceil(PAGE) * PAGE));
-            detached |= unmap(f);
+            found = Some((f.open_file, size.div_ceil(PAGE) * PAGE));
+            unmap(f);
             break;
         }
     }
-    let Some((file, id, size)) = found else {
+    let Some((file, size)) = found else {
         return Err(Errno::EINVAL);
     };
     for f in rest.take_while(|f| f.end - addr <= size) {
         if f.open_file == file && lies(f.start, f.offset) {
-            detached |= unmap(f);
+            unmap(f);
         }
-    }
-    let shm = segments(c);
-    let mut table = shm.lock();
-    // A sealed piece stays (Linux ignores `do_vmi_align_munmap`'s EPERM),
-    // and only a closed one counts as a detach.
-    if detached && let Ok(segment) = table.checked(id) {
-        segment.dtime = ipc::now(c);
-        segment.lpid = c.pid_space().keep(c.process.pid);
     }
     Ok(0)
 }

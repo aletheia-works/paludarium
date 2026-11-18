@@ -1091,10 +1091,14 @@ kernel.
   out in turn as Linux gives them, and `/proc/<pid>/maps` names an attachment
   `/SYSV<key> (deleted)` on device 00:01, with the ID as its inode. The count
   of attachments (`shm_nattch`) counts each VMA that shows the segment, in
-  every process, as Linux does: a `fork` copies them, and `munmap` and an
-  `mprotect` that changes part of one split them, and they never merge.
-  `shmdt` takes every piece of the attachment that `munmap` and `mprotect`
-  left. A segment removed with `IPC_RMID` while attached keeps its ID, is
+  every process, as Linux does: a `fork` copies them, and `munmap`, and an
+  `mprotect`, `mlock`, `madvise`, `mseal` or `userfaultfd` registration
+  that changes part of one, split them, and they never merge. Each VMA that
+  opens (a split, a `fork`'s copy, a move by `mremap`) sets the segment's
+  `shm_atime` and `shm_lpid`, and each one that closes (an unmap, `shmdt`,
+  an exit, an `exec`) its `shm_dtime` and `shm_lpid`, as Linux's
+  `shm_open` and `shm_close` do. `shmdt` takes every piece of the
+  attachment that `munmap` and the others left. A segment removed with `IPC_RMID` while attached keeps its ID, is
   found by no key, and goes at its last detach. `SHM_LOCK` checks the owner
   and `RLIMIT_MEMLOCK` as Linux does, and `SHM_HUGETLB` gives `ENOSYS`, as
   from a kernel built without hugetlbfs.

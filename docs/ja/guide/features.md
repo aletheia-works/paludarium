@@ -977,9 +977,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   セグメントの ID は添字とシーケンス番号からなり、Linux と同じ順に割り当てます。
   `/proc/<pid>/maps` は、つないだ領域をデバイス 00:01 の `/SYSV<key> (deleted)` と示し、
   inode は ID です。つないでいる数（`shm_nattch`）は、Linux と同じく、どのプロセスでも
-  セグメントを映す VMA ごとに数えます。`fork` はそれを写し、`munmap` と、一部の保護を
-  変える `mprotect` はそれを分け、分かれたものは 1 つに戻りません。`shmdt` は、`munmap`
-  と `mprotect` が残したその領域のかけらをすべて外します。つながったまま `IPC_RMID`
+  セグメントを映す VMA ごとに数えます。`fork` はそれを写します。`munmap` と、一部を
+  変える `mprotect`、`mlock`、`madvise`、`mseal`、`userfaultfd` の登録はそれを分け、
+  分かれたものは 1 つに戻りません。VMA ができるたびに（分割、`fork` の写し、`mremap` での
+  移動）セグメントの `shm_atime` と `shm_lpid` が、VMA が閉じるたびに（アンマップ、`shmdt`、
+  終了、`exec`）`shm_dtime` と `shm_lpid` が変わります。Linux の `shm_open` と
+  `shm_close` と同じです。`shmdt` は、`munmap` などが残したその領域のかけらをすべて
+  外します。つながったまま `IPC_RMID`
   したセグメントは、ID はそのままで、どのキーでも見つからなくなり、最後に外れたとき
   消えます。`SHM_LOCK` は Linux と同じく所有者と `RLIMIT_MEMLOCK` を確かめます。
   `SHM_HUGETLB` は、hugetlbfs なしでビルドしたカーネルと同じく `ENOSYS` です。

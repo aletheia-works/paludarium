@@ -6679,16 +6679,7 @@ fn open_path(
         }
         Arc::new(crate::proc::OwnDirectory::new(crate::proc::directory_stat()))
     } else if let Some(entry) = crate::proc::system_entry(p) {
-        match entry {
-            // Generated as they are read, from the opener's namespaces.
-            crate::proc::SystemEntry::SysvipcMsg => Arc::new(crate::msg::proc_file(c, flags)),
-            crate::proc::SystemEntry::SysvipcSem => Arc::new(crate::sem::proc_file(c, flags)),
-            crate::proc::SystemEntry::SysvipcShm => Arc::new(crate::shm::proc_file(c, flags)),
-            _ => Arc::new(crate::proc::GeneratedFile::open_entry(
-                system_file(c, entry),
-                flags,
-            )),
-        }
+        system_file(c, entry, flags)
     } else if let Some(entry) = crate::proc::own_entry(p, c.process.pid) {
         own_open_check(c, p, flags)?;
         if let Some(content) = own_file(c, entry) {
@@ -7977,10 +7968,15 @@ fn epoll_fdinfo(
     }
     out
 }
-/// The contents of a system-wide /proc file, from what `sysinfo` reports;
-/// `/proc/sysvipc`'s are generated as they are read instead.
-fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
-    match entry {
+/// A system-wide /proc file, opened with `flags`: its contents from what
+/// `sysinfo` reports, or, for `/proc/sysvipc`'s, generated as they are read
+/// from the opener's namespaces ([`crate::seq`]).
+fn system_file(
+    c: &Context<'_>,
+    entry: crate::proc::SystemEntry,
+    flags: u32,
+) -> Arc<dyn FileHandle> {
+    let content = match entry {
         crate::proc::SystemEntry::Loadavg => {
             let (tasks, last_pid) = c.processes.task_counts();
             crate::proc::render_loadavg(1, tasks, last_pid)
@@ -8005,11 +8001,11 @@ fn system_file(c: &Context<'_>, entry: crate::proc::SystemEntry) -> Vec<u8> {
                 .clock(paludarium_host::ClockId::Monotonic)
                 .unwrap_or(0),
         ),
-        // Opened as they are read ([`crate::seq`]).
-        crate::proc::SystemEntry::SysvipcMsg
-        | crate::proc::SystemEntry::SysvipcSem
-        | crate::proc::SystemEntry::SysvipcShm => Vec::new(),
-    }
+        crate::proc::SystemEntry::SysvipcMsg => return Arc::new(crate::msg::proc_file(c, flags)),
+        crate::proc::SystemEntry::SysvipcSem => return Arc::new(crate::sem::proc_file(c, flags)),
+        crate::proc::SystemEntry::SysvipcShm => return Arc::new(crate::shm::proc_file(c, flags)),
+    };
+    Arc::new(crate::proc::GeneratedFile::open_entry(content, flags))
 }
 /// `mknod` and `mknodat`, as Linux's `do_mknodat`: a regular file (type 0
 /// too), a FIFO or a socket node, with the permission bits of `mode` less

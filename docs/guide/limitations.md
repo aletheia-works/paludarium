@@ -661,10 +661,7 @@ verified.
   namespace leaves that mount there, where Linux detaches it. A detached
   mount's open files keep working, but a working directory or a descriptor
   in it is used by its path, which no longer leads there. A mount ID is the
-  lowest free one from 21, and the root's parent is shown as 1. A bind
-  mount without `MS_REC` of a directory with a mount from start-up below it
-  (a `--mount` directory) shows that mount's files there, where Linux shows
-  the directory under it. A bind mount keeps its source by path: a rename
+  lowest free one from 21, and the root's parent is shown as 1. A bind mount keeps its source by path: a rename
   in another namespace leaves it at the old path, and when its source is
   removed it shows nothing, where Linux keeps the deleted directory and
   mountinfo marks it `//deleted`. A descriptor's mount ID (`statx` with

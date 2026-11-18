@@ -6,6 +6,9 @@ pub struct MountedFs {
     /// Where absolute paths and links start and `..` stops for the process
     /// that sees the filesystem through this view ([`HostFs::root`]).
     root: Vec<u8>,
+    /// The mount point below which this view has no mounts, so the
+    /// directories they cover show ([`FileSystem::uncovered`]).
+    above: Option<Vec<u8>>,
 }
 /// What every view of one [`MountedFs`] shares.
 pub struct Shared {
@@ -77,6 +80,7 @@ impl MountedFs {
                 targets: Mutex::new(BTreeMap::new()),
             }),
             root: b"/".to_vec(),
+            above: None,
         }
     }
     /// Mounts `fs` at `path`, before any view of this filesystem is made
@@ -111,6 +115,13 @@ impl MountedFs {
         validate(p)?;
         if !self.private_files.contains(p) {
             for (i, (root, fs)) in self.mounts.iter().enumerate() {
+                if self
+                    .above
+                    .as_ref()
+                    .is_some_and(|above| covered(root, above))
+                {
+                    continue;
+                }
                 if p == root
                     || root == b"/"
                     || p.starts_with(root) && p.get(root.len()) == Some(&b'/')
@@ -219,11 +230,24 @@ impl MountedFs {
         Ok(current)
     }
 }
+/// Whether the mount point `root` is below `above`, not `above` itself.
+fn covered(root: &[u8], above: &[u8]) -> bool {
+    root != above
+        && (above == b"/" || root.starts_with(above) && root.get(above.len()) == Some(&b'/'))
+}
 impl FileSystem for MountedFs {
     fn rooted(&self, root: &[u8]) -> Option<Arc<dyn FileSystem>> {
         Some(Arc::new(MountedFs {
             shared: Arc::clone(&self.shared),
             root: root.to_vec(),
+            above: self.above.clone(),
+        }))
+    }
+    fn uncovered(&self, point: &[u8]) -> Option<Arc<dyn FileSystem>> {
+        Some(Arc::new(MountedFs {
+            shared: Arc::clone(&self.shared),
+            root: self.root.clone(),
+            above: Some(point.to_vec()),
         }))
     }
     /// The in-memory root's file, where `anchor` is on that root: a path

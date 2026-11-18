@@ -12,8 +12,8 @@
 //! (`follow_dotdot`).
 use crate::*;
 use std::collections::BTreeSet;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 /// Linux's per-mount flags (`MNT_*`), as a mount keeps them.
 pub mod mount_flags {
@@ -394,11 +394,15 @@ enum Backing {
     },
     Memory(Arc<Superblock>),
     /// A bind mount of the lower filesystem's files, in the boot mount at
-    /// `base`, whose type and device it shows.
+    /// `base`, whose type and device it shows. It shows what that boot
+    /// mount holds, with the directories its boot mounts below cover
+    /// (`view`, [`FileSystem::uncovered`]), as `clone_mnt` copies one
+    /// mount: those that a bind with `MS_REC` takes are its own entries.
     Lower {
         kind: &'static str,
         device: u64,
         base: Vec<u8>,
+        view: Arc<OnceLock<Arc<dyn FileSystem>>>,
     },
     /// A bind mount of a file the kernel generates
     /// ([`GeneratedSource`]).
@@ -487,6 +491,7 @@ impl Entry {
                     kind,
                     device: *device,
                     base: self.point.clone(),
+                    view: Arc::default(),
                 },
                 other => other.clone(),
             },
@@ -943,6 +948,11 @@ impl NamespacedFs {
             Some(e) => (
                 match &e.backing {
                     Backing::Generated(fs) => &**fs,
+                    Backing::Lower { base, view, .. } => &**view.get_or_init(|| {
+                        self.lower
+                            .uncovered(base)
+                            .unwrap_or_else(|| Arc::clone(&self.lower))
+                    }),
                     _ => e.memory().map_or(&*self.lower, |sb| &*sb.fs),
                 },
                 e.inside(&loc.path),
@@ -1188,6 +1198,7 @@ impl NamespacedFs {
                     kind,
                     device,
                     base: e.point.clone(),
+                    view: Arc::default(),
                 };
                 e.root.clone_from(&e.point);
             }
@@ -2155,7 +2166,9 @@ impl FileSystem for NamespacedFs {
                     Backing::Boot { kind, device } => {
                         (*kind, *device, b"/".to_vec(), String::new(), String::new())
                     }
-                    Backing::Lower { kind, device, base } => (
+                    Backing::Lower {
+                        kind, device, base, ..
+                    } => (
                         *kind,
                         *device,
                         relative(base, &e.root),
@@ -2237,9 +2250,11 @@ impl FileSystem for NamespacedFs {
         }
         let entries = self.table.snapshot();
         let loc = self.locate(&entries, path);
-        match loc.at.and_then(|i| entries[i].memory()) {
-            Some(sb) => sb.device(),
-            None => self.lower.device(&self.backing(&entries, &loc).1),
+        match loc.at.map(|i| &entries[i].backing) {
+            Some(Backing::Memory(sb)) => sb.device(),
+            // Its own boot mount's, whose files it shows (not those below).
+            Some(Backing::Lower { device, .. }) => *device,
+            _ => self.lower.device(&self.backing(&entries, &loc).1),
         }
     }
     fn mount_id(&self, path: &[u8]) -> u64 {

@@ -1118,3 +1118,23 @@ fn a_release_hook_hears_each_mount_freed() {
     heard.sort_unstable();
     assert_eq!(heard, copied);
 }
+
+#[test]
+fn a_bind_without_recursion_shows_the_directory_a_boot_mount_covers() {
+    let (fs, _host) = machine_with_data("uncover");
+    fs.mkdir(b"/tmp/b", 0o755).unwrap();
+    fs.mkdir(b"/tmp/c", 0o755).unwrap();
+    // `clone_mnt` copies the root mount alone: `/data` there is the
+    // directory under the boot mount, empty, on the root's device.
+    fs.bind(b"/", b"/tmp/b", false).unwrap();
+    assert!(names(&fs, b"/tmp/b/data").is_empty());
+    assert_eq!(fs.metadata(b"/tmp/b/data/x", true), Err(Errno::ENOENT));
+    assert_eq!(fs.device(b"/tmp/b/data"), fs.device(b"/"));
+    assert_ne!(fs.device(b"/data"), fs.device(b"/"));
+    // With `MS_REC` the boot mount comes along, and shows its files.
+    fs.bind(b"/", b"/tmp/c", true).unwrap();
+    assert_eq!(names(&fs, b"/tmp/c/data"), [b"x".to_vec()]);
+    assert_eq!(fs.device(b"/tmp/c/data/x"), fs.device(b"/data"));
+    // The source itself is unchanged.
+    assert_eq!(names(&fs, b"/data"), [b"x".to_vec()]);
+}

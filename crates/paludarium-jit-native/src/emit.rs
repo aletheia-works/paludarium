@@ -85,6 +85,11 @@ macro_rules! context {
 
 const I64: Type = types::I64;
 
+/// The flags of a load or store of a guest page's bytes through a slot: it
+/// cannot trap, as the slot allows it, but it is aligned only to its word,
+/// not to its own size.
+const GUEST_BYTES: MemFlagsData = MemFlagsData::new().with_notrap();
+
 fn mask(size: u8) -> i64 {
     paludarium_cpu::size_mask(size) as i64
 }
@@ -390,7 +395,7 @@ impl Emitter<'_, '_> {
 
         self.b.switch_to_block(fast);
         let at = self.host_address(slot, address);
-        let flags = MemFlagsData::trusted();
+        let flags = GUEST_BYTES;
         let loaded = match size {
             1 => self.b.ins().uload8(I64, flags, at, 0),
             2 => self.b.ins().uload16(I64, flags, at, 0),
@@ -445,10 +450,10 @@ impl Emitter<'_, '_> {
         self.b.switch_to_block(fast);
         let at = self.host_address(slot, address);
         match size {
-            1 => self.b.ins().istore8(flags, value, at, 0),
-            2 => self.b.ins().istore16(flags, value, at, 0),
-            4 => self.b.ins().istore32(flags, value, at, 0),
-            _ => self.b.ins().store(flags, value, at, 0),
+            1 => self.b.ins().istore8(GUEST_BYTES, value, at, 0),
+            2 => self.b.ins().istore16(GUEST_BYTES, value, at, 0),
+            4 => self.b.ins().istore32(GUEST_BYTES, value, at, 0),
+            _ => self.b.ins().store(GUEST_BYTES, value, at, 0),
         };
         // A plain store on x86-64 releases: a change that sees the store
         // ended sees its bytes.

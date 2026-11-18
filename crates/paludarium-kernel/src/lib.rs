@@ -22,6 +22,7 @@ pub use inbox::SignalInbox;
 mod aio;
 mod bpf;
 mod bpf_prog;
+mod bpf_trie;
 mod devices;
 mod epoll;
 mod events;

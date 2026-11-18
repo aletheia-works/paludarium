@@ -416,8 +416,8 @@ pub struct Usage {
     /// Pages with an entry of their own (`Rss`); a page of private memory
     /// only read shows Linux's zero page, which is not counted.
     pub resident: u64,
-    /// Those that a `fork` shares with another process until either
-    /// writes them (`Shared_*`), and of them the ones written.
+    /// Those that more than one page table entry maps, in any process
+    /// (`Shared_*`), and of them the dirty ones.
     pub shared_clean: u64,
     pub shared_dirty: u64,
     /// The rest (`Private_*`).
@@ -425,6 +425,16 @@ pub struct Usage {
     pub private_dirty: u64,
     /// The pages of private memory, not a file's (`Anonymous`).
     pub anonymous: u64,
+    /// Each page's size divided by how many entries map it, in bytes
+    /// shifted left by [`Usage::PSS_SHIFT`], as Linux's `mss->pss` sums it
+    /// (`Pss`), and that of the dirty pages (`Pss_Dirty`).
+    pub pss: u64,
+    pub pss_dirty: u64,
+}
+
+impl Usage {
+    /// The fixed point of [`Usage::pss`], Linux's `PSS_SHIFT`.
+    pub const PSS_SHIFT: u32 = 12;
 }
 
 impl Mapping {
@@ -912,7 +922,7 @@ impl PageRanges {
 /// allocated on the first write; until then the page reads as zeros.
 struct Page {
     prot: Prot,
-    frame: Frame,
+    frame: Mapped,
     /// The page belongs to a file mapping, which may end before it.
     file: bool,
     /// The first write to the page copies its frame first: the frame is
@@ -1050,6 +1060,46 @@ struct FrameCell {
     /// correctness. The [`TlbEntry`]s of the page share it, as they hold
     /// the bytes and not the cell ([`TlbFrame`]).
     fetched: Arc<AtomicBool>,
+    /// How many page entries show the page, in every space: Linux's
+    /// precise map count of the page, which a [`Mapped`] keeps. The page
+    /// cache, a [`SharedPages`] and a [`TlbEntry`] hold the frame without
+    /// mapping it, as Linux's page-cache reference does not count.
+    maps: AtomicU32,
+}
+
+/// The frame a page entry shows, counted in its [`FrameCell::maps`] for as
+/// long as the entry shows it: making, copying and dropping the entry, or
+/// giving it another frame, keep the count.
+struct Mapped(Frame);
+
+impl Mapped {
+    fn new(frame: Frame) -> Self {
+        frame.maps.fetch_add(1, Ordering::Relaxed);
+        Mapped(frame)
+    }
+    /// How many page entries show the frame.
+    fn maps(&self) -> u32 {
+        self.0.maps.load(Ordering::Relaxed)
+    }
+}
+
+impl Clone for Mapped {
+    fn clone(&self) -> Self {
+        Mapped::new(Arc::clone(&self.0))
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        self.0.maps.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for Mapped {
+    type Target = Frame;
+    fn deref(&self) -> &Frame {
+        &self.0
+    }
 }
 
 impl FrameCell {
@@ -1074,6 +1124,7 @@ impl FrameCell {
         FrameCell {
             bytes: OnceLock::new(),
             fetched: Arc::new(AtomicBool::new(self.fetched())),
+            maps: AtomicU32::new(0),
         }
     }
 }
@@ -1516,6 +1567,34 @@ pub trait PageSource: Send + Sync {
     /// The source itself, for the kernel to tell its kinds apart.
     fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
         None
+    }
+    /// A VMA of a shared mapping of the file came to be, by a split, a
+    /// `fork` or a move by `mremap`, as Linux's `vm_ops->open` is told;
+    /// `by` is the actor of the space it is in ([`AddressSpace::set_actor`]).
+    fn opened(&self, by: &Actor) {
+        let _ = by;
+    }
+    /// A VMA of a shared mapping of the file went, by an unmap or the end
+    /// of its space, as Linux's `vm_ops->close` is told.
+    fn closed(&self, by: &Actor) {
+        let _ = by;
+    }
+}
+
+/// Who acts on an address space for the kernel, as Linux's `current` in a
+/// VMA's `open` and `close`: the files of its shared mappings are told it
+/// ([`PageSource::opened`], [`PageSource::closed`]).
+pub type Actor = dyn std::any::Any + Send + Sync;
+
+/// Tells the file of `shared`, if it has one, that one of its VMAs opened
+/// or closed, in a space with an `actor`.
+fn tell(actor: Option<&Arc<Actor>>, shared: &SharedMapping, opened: bool) {
+    if let (Some(actor), Some(source)) = (actor, shared.pages.source.as_ref()) {
+        if opened {
+            source.opened(actor.as_ref());
+        } else {
+            source.closed(actor.as_ref());
+        }
     }
 }
 /// The shared memory `MADV_REMOVE` frees in one VMA of its range
@@ -1997,6 +2076,19 @@ struct AddressSpaceData {
     /// [`AddressSpace::take_out_of_memory`], which reads it without the
     /// locks.
     out_of_memory: Arc<AtomicBool>,
+    /// Who acts on the space ([`AddressSpace::set_actor`]), which the files
+    /// of its shared mappings are told as their VMAs open and close.
+    actor: Option<Arc<Actor>>,
+}
+
+impl Drop for AddressSpaceData {
+    /// The space ends, and each VMA of a shared mapping with it, as Linux's
+    /// `exit_mmap` closes them.
+    fn drop(&mut self) {
+        for shared in self.shared.values() {
+            tell(self.actor.as_ref(), shared, false);
+        }
+    }
 }
 
 impl Default for AddressSpaceData {
@@ -2084,6 +2176,7 @@ impl AddressSpaceData {
             bottom_up: None,
             meter: None,
             out_of_memory: Arc::default(),
+            actor: None,
         }
     }
 
@@ -2199,7 +2292,7 @@ impl AddressSpaceData {
                         page.as_ref().map(|page| {
                             (
                                 (index * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE,
-                                page.frame.clone(),
+                                Arc::clone(&page.frame),
                             )
                         })
                     })
@@ -2411,7 +2504,7 @@ impl AddressSpaceData {
         });
         Page {
             prot,
-            frame: frame.unwrap_or_default(),
+            frame: Mapped::new(frame.unwrap_or_default()),
             file: self
                 .mapping_at(page)
                 .is_some_and(|m| m.kind == MappingKind::File),
@@ -2492,12 +2585,16 @@ impl AddressSpaceData {
             .then(|| self.file_at(page).map_or(0, |(source, _)| source.shrinks()));
         // A forked frame that no other space holds any more is this one's
         // own: the space holds its lock, so no other can take it meanwhile.
+        // This counts every holder of the cell, not only the entries that map
+        // it ([`FrameCell::maps`]): a `TlbFrame::Empty` of the other space
+        // holds the cell too, and a write into it would show there, so the
+        // copy is made unless this entry is the cell's only holder.
         if write && p.cow && (p.cache || Arc::strong_count(&p.frame) > 1) {
             let Some(frame) = copied(&p.frame, self.meter.as_ref()) else {
                 self.out_of_memory.store(true, Ordering::SeqCst);
                 return false;
             };
-            p.frame = frame;
+            p.frame = Mapped::new(frame);
         }
         if write && p.cow {
             p.cow = false;
@@ -2545,9 +2642,9 @@ impl AddressSpaceData {
     /// a loaded program's segment, whose frames hold what was read from its
     /// file, counts its pages so once the segment was written
     /// ([`Mapping::written`]). The page cache's pages are dirty when a store
-    /// changed them since they were written back. A page that `fork` shares
-    /// until it is written counts as shared, whether or not the other
-    /// process still has it.
+    /// changed them since they were written back. A page that more than one
+    /// entry maps ([`FrameCell::maps`]) is shared, and counts in `pss` for
+    /// its share, as `smaps_account` takes the precise map count.
     fn usage(&self, start: u64, end: u64) -> Usage {
         let mut usage = Usage::default();
         if end <= start {
@@ -2576,7 +2673,13 @@ impl AddressSpaceData {
                     anonymous || (shared && bytes.is_some_and(|b| b.dirty.load(Ordering::Acquire)));
                 usage.resident += 1;
                 usage.anonymous += u64::from(anonymous);
-                match (entry.cow && !entry.cache, dirty) {
+                let maps = u64::from(entry.frame.maps().max(1));
+                let pss = (PAGE_SIZE << Usage::PSS_SHIFT) / maps;
+                usage.pss += pss;
+                if dirty {
+                    usage.pss_dirty += pss;
+                }
+                match (maps >= 2, dirty) {
                     (true, false) => usage.shared_clean += 1,
                     (true, true) => usage.shared_dirty += 1,
                     (false, false) => usage.private_clean += 1,
@@ -2613,9 +2716,9 @@ impl AddressSpaceData {
     /// is present. The zero page
     /// that a read of private anonymous memory shows is only that. Any other
     /// is a file's or shared memory's, unless it is anonymous as `usage`
-    /// counts it, and mapped only here unless `fork` shares it until a
-    /// write: Linux counts a page's mappings, which are not kept here, so a
-    /// file's or shared memory's page that another process maps is too.
+    /// counts it, and mapped exclusively when no other entry, here or in
+    /// another space, shows its frame ([`FrameCell::maps`]), as Linux's
+    /// `__folio_page_mapped_exclusively` takes a precise map count of 1.
     fn pagemap(&self, start: u64, count: u64) -> Vec<u64> {
         let directory = self.read_directory();
         (0..count)
@@ -2656,7 +2759,7 @@ impl AddressSpaceData {
                 if shared || pte.cache || (pte.file && !mapping.written) {
                     entry |= pagemap::FILE;
                 }
-                if !pte.cow || pte.cache {
+                if pte.frame.maps() == 1 {
                     entry |= pagemap::EXCLUSIVE;
                 }
                 entry
@@ -2752,7 +2855,7 @@ impl AddressSpaceData {
                         } else {
                             // Keeping the mark, as a copy does
                             // ([`FrameCell::successor`]).
-                            child.frame = Arc::new(page.frame.successor());
+                            child.frame = Mapped::new(Arc::new(page.frame.successor()));
                         }
                     }
                     cloned.pages[slot] = Some(child);
@@ -2793,6 +2896,13 @@ impl AddressSpaceData {
                     child.written = false;
                 }
             }
+        }
+        // Each VMA the child gets is opened by the parent (`dup_mmap`), and
+        // the child's space acts for it until the kernel says who the child
+        // is: a fork that fails after this closes them as the parent.
+        copy.actor = self.actor.clone();
+        for shared in copy.shared.values() {
+            tell(copy.actor.as_ref(), shared, true);
         }
         copy
     }
@@ -3689,10 +3799,37 @@ impl AddressSpaceData {
         {
             return;
         }
-        let tail = shared.clone();
-        if let Some(head) = self.shared.get_mut(&start) {
-            head.end = at;
+        self.split_shared(start, at);
+    }
+    /// Splits the shared mapping across `at` when its memory's VMAs never
+    /// merge ([`PageSource::merges`]) and the mappings on either side of
+    /// `at` now differ, as Linux splits a VMA when `madvise`, `mlock`,
+    /// `mseal` or a `userfaultfd` changes the flags of part of it
+    /// (`vma_modify`).
+    fn split_unmergeable_shared_where_changed(&mut self, at: u64) {
+        let Some((&start, shared)) = self.shared.range(..at).next_back() else {
+            return;
+        };
+        if shared.end <= at || shared.pages.source.as_ref().is_none_or(|s| s.merges()) {
+            return;
         }
+        let before = at.checked_sub(1).and_then(|last| self.mapping_at(last));
+        let (Some(&before), Some(&after)) = (before, self.mapping_at(at)) else {
+            return;
+        };
+        if !self.mergeable(&before, &after) {
+            self.split_shared(start, at);
+        }
+    }
+    /// Splits the shared mapping from `start` in two at `at`, the new VMA
+    /// opened as Linux's `__split_vma` opens it.
+    fn split_shared(&mut self, start: u64, at: u64) {
+        let Some(shared) = self.shared.get_mut(&start) else {
+            return;
+        };
+        let tail = shared.clone();
+        shared.end = at;
+        tell(self.actor.as_ref(), &tail, true);
         self.shared.insert(at, tail);
     }
     /// The shared mappings, by address.
@@ -3756,6 +3893,13 @@ impl AddressSpaceData {
             .collect();
         for (start, mapping) in affected {
             self.shared.remove(&start);
+            // What is left of a VMA unmapped in part is split from it
+            // (`__split_vma` opens the new one), and the part unmapped is
+            // closed.
+            if start < addr.0 || mapping.end > end {
+                tell(self.actor.as_ref(), &mapping, true);
+            }
+            tell(self.actor.as_ref(), &mapping, false);
             if start < addr.0 {
                 self.shared.insert(
                     start,
@@ -3975,14 +4119,14 @@ impl AddressSpaceData {
             }
         }
         if let Some(shared) = shared {
-            self.shared.insert(
-                to,
-                SharedMapping {
-                    end: to + new_len,
-                    shift: shared.shift.wrapping_add(old).wrapping_sub(to),
-                    ..shared
-                },
-            );
+            let moved = SharedMapping {
+                end: to + new_len,
+                shift: shared.shift.wrapping_add(old).wrapping_sub(to),
+                ..shared
+            };
+            // The VMA at its new place is a copy, opened (`copy_vma`).
+            tell(self.actor.as_ref(), &moved, true);
+            self.shared.insert(to, moved);
         }
         // The moved VMA leaves its `userfaultfd` (`mremap_userfaultfd_prep`
         // without `UFFD_FEATURE_EVENT_REMAP`).
@@ -4167,6 +4311,8 @@ impl AddressSpaceData {
         for (_, m) in self.mappings.range_mut(addr.0..end) {
             m.sealed = true;
         }
+        self.split_unmergeable_shared_where_changed(addr.0);
+        self.split_unmergeable_shared_where_changed(end);
         Ok(())
     }
 
@@ -4255,6 +4401,8 @@ impl AddressSpaceData {
                     FlagAdvice::Mergeable(on) => m.mergeable = on && (m.mergeable || ksm),
                 }
             }
+            self.split_unmergeable_shared_where_changed(from);
+            self.split_unmergeable_shared_where_changed(to);
         }
         if hole || covered < end {
             Err(Errno::ENOMEM)
@@ -4615,6 +4763,8 @@ impl AddressSpaceData {
             for (_, piece) in self.mappings.range_mut(from..to) {
                 piece.userfault = Some(registration);
             }
+            self.split_unmergeable_shared_where_changed(from);
+            self.split_unmergeable_shared_where_changed(to);
         }
         Ok(())
     }
@@ -4657,6 +4807,8 @@ impl AddressSpaceData {
             for (_, piece) in self.mappings.range_mut(from..to) {
                 piece.userfault = None;
             }
+            self.split_unmergeable_shared_where_changed(from);
+            self.split_unmergeable_shared_where_changed(to);
         }
         Ok(ended)
     }
@@ -4803,7 +4955,7 @@ impl AddressSpaceData {
         let mut entry = self.page(page, prot);
         if file && shared.is_none() {
             entry = Page {
-                frame: Frame::default(),
+                frame: Mapped::new(Frame::default()),
                 cow: false,
                 cache: false,
                 ..entry
@@ -5068,6 +5220,8 @@ impl AddressSpaceData {
                 for (_, mapping) in self.mappings.range_mut(at..to) {
                     mapping.locked = lock;
                 }
+                self.split_unmergeable_shared_where_changed(at);
+                self.split_unmergeable_shared_where_changed(to);
             }
             at = to;
         }
@@ -5091,6 +5245,8 @@ impl AddressSpaceData {
         for (_, mapping) in self.mappings.range_mut(addr..end) {
             mapping.locked = Some(lock);
         }
+        self.split_unmergeable_shared_where_changed(addr);
+        self.split_unmergeable_shared_where_changed(end);
     }
 
     /// Linux's `expand_downwards` for an access at `addr` that no mapping
@@ -6171,6 +6327,13 @@ impl AddressSpace {
     #[must_use]
     pub fn memory_meter(&self) -> Option<Arc<MemoryMeter>> {
         self.locked().meter.clone()
+    }
+    /// Says who acts on this space from now on, which the files of its
+    /// shared mappings are told as their VMAs open and close
+    /// ([`PageSource::opened`], [`PageSource::closed`]); a space without
+    /// one tells them nothing.
+    pub fn set_actor(&self, actor: Arc<Actor>) {
+        self.locked().actor = Some(actor);
     }
     /// Whether a write found no room under the meter since the last call.
     pub fn take_out_of_memory(&self) -> bool {
@@ -8021,6 +8184,40 @@ mod tests {
             })
             .unwrap();
         assert!(written.is_empty(), "the cache stays clean");
+    }
+
+    #[test]
+    fn a_page_is_exclusive_while_one_entry_maps_it() {
+        let exclusive = |space: &AddressSpace, at: u64| {
+            space.view().pagemap(at, 1).unwrap()[0] & pagemap::EXCLUSIVE != 0
+        };
+        let space = AddressSpace::new();
+        let at = space
+            .map_shared(
+                None,
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write(at, b"x").unwrap();
+        assert!(exclusive(&space, at.0));
+        // fork maps it twice until either space writes its own copy.
+        let child = space.fork();
+        assert!(!exclusive(&space, at.0));
+        assert!(!exclusive(&child, at.0));
+        child.write(at, b"y").unwrap();
+        assert!(exclusive(&space, at.0));
+        assert!(exclusive(&child, at.0));
+        // A space that goes unmaps its pages.
+        let other = space.fork();
+        assert!(!exclusive(&space, at.0));
+        drop(other);
+        assert!(exclusive(&space, at.0));
+        // So does munmap.
+        let mut other = space.fork();
+        other.unmap(at, PAGE_SIZE).unwrap();
+        assert!(exclusive(&space, at.0));
     }
 
     #[test]

@@ -3280,6 +3280,11 @@ impl Kernel {
         let pid = self
             .processes
             .allocate_in(&space, &set_tid, &parent.state.credentials)?;
+        // The child acts on its own space from now on: its attachments of
+        // System V shared memory close as it, at its exit or exec.
+        if let Some(child_mem) = &child_mem {
+            crate::shm::act(child_mem, &space, pid, &self.host);
+        }
         let group = Arc::new(self.group.fork(flags & 0x800 != 0));
         if !space.is_first() && space.init() == Some(pid) {
             group.set_unkillable();

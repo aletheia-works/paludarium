@@ -4927,6 +4927,64 @@ mod shm {
     }
 
     #[test]
+    fn each_vma_opened_or_closed_stamps_the_segment_with_its_time_and_process() {
+        let host = Arc::new(paludarium_host::testing::RecordingHost::new());
+        let (_, mut t, m) = setup();
+        let mut k = Kernel::new(host.clone());
+        let at = |seconds: u64| {
+            host.set_clock(paludarium_host::ClockId::Realtime, seconds * 1_000_000_000)
+        };
+        // `shm_atime`, `shm_dtime`, `shm_lpid` and `shm_nattch`.
+        let stamps = |k: &mut Kernel, t: &mut Thread, id: u64| {
+            assert_eq!(syscall(k, t, &m, 31, [id, IPC_STAT, DS, 0, 0, 0]), 0);
+            let mut ds = [0u8; 112];
+            m.read(GuestAddr(DS), &mut ds).unwrap();
+            let long = |at: usize| u64::from_le_bytes(ds[at..at + 8].try_into().unwrap());
+            let lpid = u32::from_le_bytes(ds[84..88].try_into().unwrap());
+            (long(56), long(64), lpid, long(88))
+        };
+        let id = shmget(&mut k, &mut t, &m, 0, 4 * PAGE_SIZE, 0o600);
+        at(100);
+        let a = shmat(&mut k, &mut t, &m, id, 0, 0);
+        assert_eq!(stamps(&mut k, &mut t, id), (100, 0, 1, 1));
+        // An unmap of part splits the rest off (open) and closes the part.
+        at(200);
+        let unmap = [a + 3 * PAGE_SIZE, PAGE_SIZE, 0, 0, 0, 0];
+        assert_eq!(syscall(&mut k, &mut t, &m, 11, unmap), 0);
+        assert_eq!(stamps(&mut k, &mut t, id), (200, 200, 1, 1));
+        // mlock and madvise split where they change the flags, as mprotect
+        // does; advice the piece already has splits nothing.
+        at(300);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 149, [a, PAGE_SIZE, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(stamps(&mut k, &mut t, id), (300, 200, 1, 2));
+        at(400);
+        let dontfork = [a + PAGE_SIZE, PAGE_SIZE, 10, 0, 0, 0];
+        assert_eq!(syscall(&mut k, &mut t, &m, 28, dontfork), 0);
+        assert_eq!(stamps(&mut k, &mut t, id), (400, 200, 1, 3));
+        at(450);
+        assert_eq!(syscall(&mut k, &mut t, &m, 28, dontfork), 0);
+        assert_eq!(stamps(&mut k, &mut t, id), (400, 200, 1, 3));
+        // A fork opens the child's copies as the parent, all but the piece
+        // it does not get.
+        at(500);
+        let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
+        assert_eq!(stamps(&mut k, &mut t, id), (500, 200, 1, 5));
+        // The child's exit closes them as the child.
+        at(600);
+        finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
+        let child = ct.tid;
+        drop((c, ct, cm));
+        assert_eq!(stamps(&mut k, &mut t, id), (500, 600, child, 3));
+        // shmdt closes every piece.
+        at(700);
+        assert_eq!(shmdt(&mut k, &mut t, &m, a), 0);
+        assert_eq!(stamps(&mut k, &mut t, id), (500, 700, 1, 0));
+    }
+
+    #[test]
     fn addresses_follow_shm_rnd_and_shm_remap() {
         let (mut k, mut t, m) = setup();
         let id = shmget(&mut k, &mut t, &m, 0, PAGE_SIZE, 0o600);

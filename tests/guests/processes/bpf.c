@@ -11,6 +11,10 @@
    bpf-bloom: bloom filters, with BPF_F_ZERO_SEED, so that which values
    seem to be there, false positives included, is the same as on Linux;
    with a random seed, only that what was pushed is there.
+   bpf-lpm: longest-prefix-match tries, of IPv4 prefixes and of longer
+   keys: which prefix holds an address, the order of the next keys (more
+   specific prefixes first), the bytes past a prefix that an element
+   keeps, the room they take, and the batch commands.
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -54,6 +58,7 @@
 #define TYPE_HASH 1
 #define TYPE_ARRAY 2
 #define TYPE_LRU_HASH 9
+#define TYPE_LPM_TRIE 11
 #define TYPE_QUEUE 22
 #define TYPE_STACK 23
 #define TYPE_BLOOM_FILTER 30
@@ -1066,6 +1071,208 @@ static int case_bloom(void) {
     return 0;
 }
 
+/* An IPv4 trie's key: a prefix length and an address. */
+struct v4 {
+    uint32_t length;
+    unsigned char address[4];
+};
+
+static struct v4 v4(unsigned a, unsigned b, unsigned c, unsigned d, uint32_t length) {
+    struct v4 key = {length, {(unsigned char)a, (unsigned char)b, (unsigned char)c, (unsigned char)d}};
+    return key;
+}
+
+/* Which value the trie gives an address, or the error. */
+static void holds(int fd, unsigned a, unsigned b, unsigned c, unsigned d, uint32_t length) {
+    struct v4 key = v4(a, b, c, d, length);
+    uint32_t value = 0;
+    long r = elem(MAP_LOOKUP_ELEM, fd, &key, &value, 0);
+    if (r == 0)
+        say("lpm %u.%u.%u.%u/%u holds %u", a, b, c, d, length, value);
+    else
+        say("lpm %u.%u.%u.%u/%u %ld", a, b, c, d, length, r);
+}
+
+static long lpm_put(int fd, unsigned a, unsigned b, unsigned c, unsigned d, uint32_t length, uint32_t value,
+                uint64_t flags) {
+    struct v4 key = v4(a, b, c, d, length);
+    return elem(MAP_UPDATE_ELEM, fd, &key, &value, flags);
+}
+
+static long lpm_take(int fd, unsigned a, unsigned b, unsigned c, unsigned d, uint32_t length) {
+    struct v4 key = v4(a, b, c, d, length);
+    return elem(MAP_DELETE_ELEM, fd, &key, NULL, 0);
+}
+
+/* The trie's keys in the order MAP_GET_NEXT_KEY gives them. */
+static void order(const char *name, int fd) {
+    struct v4 key, next;
+    long r = elem(MAP_GET_NEXT_KEY, fd, NULL, &next, 0);
+    printf("%s", name);
+    for (int n = 0; r == 0 && n < 32; n++) {
+        printf(" %u.%u.%u.%u/%u", next.address[0], next.address[1], next.address[2], next.address[3],
+               next.length);
+        key = next;
+        r = elem(MAP_GET_NEXT_KEY, fd, &key, &next, 0);
+    }
+    printf(" end %ld\n", r);
+    fflush(stdout);
+}
+
+static union attr lpm_attr(uint32_t key, uint32_t value, uint32_t entries, uint32_t flags) {
+    return map_attr(TYPE_LPM_TRIE, key, value, entries, flags);
+}
+
+static int case_lpm(void) {
+    create("lpm key 4", lpm_attr(4, 4, 10, F_NO_PREALLOC));
+    create("lpm key 5", lpm_attr(5, 4, 10, F_NO_PREALLOC));
+    create("lpm key 260", lpm_attr(260, 4, 10, F_NO_PREALLOC));
+    create("lpm key 261", lpm_attr(261, 4, 10, F_NO_PREALLOC));
+    create("lpm value 0", lpm_attr(8, 0, 10, F_NO_PREALLOC));
+    /* Not the largest value Linux takes: trie_alloc fills each CPU's cache
+       with a node of it, 4 MiB that the machine may not have in one piece. */
+    create("lpm value 4096", lpm_attr(8, 4096, 10, F_NO_PREALLOC));
+    create("lpm value too big", lpm_attr(8, (1 << 22) - 279, 10, F_NO_PREALLOC));
+    create("lpm entries 0", lpm_attr(8, 4, 0, F_NO_PREALLOC));
+    create("lpm preallocated", lpm_attr(8, 4, 10, 0));
+    create("lpm zero seed", lpm_attr(8, 4, 10, F_NO_PREALLOC | F_ZERO_SEED));
+    create("lpm mmapable", lpm_attr(8, 4, 10, F_NO_PREALLOC | F_MMAPABLE));
+    create("lpm numa", lpm_attr(8, 4, 10, F_NO_PREALLOC | F_NUMA_NODE));
+    create("lpm read only", lpm_attr(8, 4, 10, F_NO_PREALLOC | F_RDONLY_PROG));
+    create("lpm both prog access", lpm_attr(8, 4, 10, F_NO_PREALLOC | F_RDONLY_PROG | F_WRONLY_PROG));
+
+    int fd = make(TYPE_LPM_TRIE, 8, 4, 6, F_NO_PREALLOC);
+    say("lpm empty memlock %llu", memlock(fd));
+    order("lpm empty", fd);
+    holds(fd, 192, 168, 0, 1, 32);
+    say("lpm put /16 %ld", lpm_put(fd, 192, 168, 0, 0, 16, 1, NOEXIST));
+    say("lpm put /24 %ld", lpm_put(fd, 192, 168, 0, 0, 24, 2, ANY));
+    say("lpm put 128/24 %ld", lpm_put(fd, 192, 168, 128, 0, 24, 3, ANY));
+    say("lpm put 1/24 %ld", lpm_put(fd, 192, 168, 1, 0, 24, 5, ANY));
+    say("lpm four memlock %llu", memlock(fd));
+    holds(fd, 192, 168, 0, 7, 32);
+    holds(fd, 192, 168, 1, 7, 32);
+    holds(fd, 192, 168, 128, 1, 32);
+    holds(fd, 192, 168, 200, 1, 32);
+    holds(fd, 192, 168, 0, 0, 23);
+    holds(fd, 192, 168, 0, 0, 15);
+    holds(fd, 10, 0, 0, 1, 32);
+    holds(fd, 192, 168, 0, 0, 33);
+    order("lpm order", fd);
+    struct v4 key = v4(192, 168, 0, 0, 23), next;
+    long r = elem(MAP_GET_NEXT_KEY, fd, &key, &next, 0);
+    say("lpm next of no element %ld %u.%u.%u.%u/%u", r, next.address[0], next.address[1], next.address[2],
+        next.address[3], next.length);
+    key = v4(0, 0, 0, 0, 40);
+    r = elem(MAP_GET_NEXT_KEY, fd, &key, &next, 0);
+    say("lpm next of a long prefix %ld %u.%u.%u.%u/%u", r, next.address[0], next.address[1],
+        next.address[2], next.address[3], next.length);
+
+    say("lpm put again noexist %ld", lpm_put(fd, 192, 168, 0, 0, 16, 9, NOEXIST));
+    say("lpm put /23 exist %ld", lpm_put(fd, 192, 168, 0, 0, 23, 4, EXIST));
+    say("lpm put /23 %ld", lpm_put(fd, 192, 168, 0, 0, 23, 4, NOEXIST));
+    holds(fd, 192, 168, 0, 0, 23);
+    say("lpm put /33 %ld", lpm_put(fd, 192, 168, 0, 0, 33, 4, ANY));
+    say("lpm put flag 3 %ld", lpm_put(fd, 10, 0, 0, 0, 8, 4, 3));
+    say("lpm put lock %ld", lpm_put(fd, 10, 0, 0, 0, 8, 4, ELEM_F_LOCK));
+    say("lpm put 10/8 %ld", lpm_put(fd, 10, 1, 2, 3, 8, 6, ANY));
+    say("lpm full %ld", lpm_put(fd, 11, 0, 0, 0, 8, 7, ANY));
+    say("lpm full exist %ld", lpm_put(fd, 11, 0, 0, 0, 8, 7, EXIST));
+    say("lpm full replace %ld", lpm_put(fd, 10, 9, 9, 9, 8, 8, EXIST));
+    order("lpm full", fd);
+    say("lpm six memlock %llu", memlock(fd));
+
+    say("lpm delete /23 %ld", lpm_take(fd, 192, 168, 0, 0, 23));
+    say("lpm delete /23 again %ld", lpm_take(fd, 192, 168, 0, 0, 23));
+    say("lpm delete /33 %ld", lpm_take(fd, 192, 168, 0, 0, 33));
+    say("lpm delete 2/24 %ld", lpm_take(fd, 192, 168, 2, 0, 24));
+    say("lpm delete /24 %ld", lpm_take(fd, 192, 168, 0, 0, 24));
+    say("lpm delete /16 %ld", lpm_take(fd, 192, 168, 0, 0, 16));
+    holds(fd, 192, 168, 0, 9, 32);
+    holds(fd, 192, 168, 1, 9, 32);
+    order("lpm after deletes", fd);
+    say("lpm three memlock %llu", memlock(fd));
+    uint32_t value;
+    key = v4(10, 0, 0, 0, 8);
+    say("lpm lookup and delete %ld", elem(MAP_LOOKUP_AND_DELETE_ELEM, fd, &key, &value, 0));
+    say("lpm lookup lock %ld", elem(MAP_LOOKUP_ELEM, fd, &key, &value, ELEM_F_LOCK));
+    say("lpm delete null %ld", elem(MAP_DELETE_ELEM, fd, NULL, NULL, 0));
+
+    /* Batches: the generic ones, which follow the next keys. */
+    struct v4 keys[8], out, in;
+    uint32_t values[8], count = 2;
+    memset(keys, 0, sizeof keys);
+    r = batch(MAP_LOOKUP_BATCH, fd, NULL, &out, keys, values, &count, 0);
+    say("lpm lookup batch %ld count %u %u.%u.%u.%u/%u=%u %u.%u.%u.%u/%u=%u last /%u", r, count,
+        keys[0].address[0], keys[0].address[1], keys[0].address[2], keys[0].address[3], keys[0].length,
+        values[0], keys[1].address[0], keys[1].address[1], keys[1].address[2], keys[1].address[3],
+        keys[1].length, values[1], out.length);
+    in = out;
+    count = 8;
+    r = batch(MAP_LOOKUP_BATCH, fd, &in, &out, keys, values, &count, 0);
+    say("lpm lookup batch rest %ld count %u %u.%u.%u.%u/%u=%u", r, count, keys[0].address[0],
+        keys[0].address[1], keys[0].address[2], keys[0].address[3], keys[0].length, values[0]);
+    count = 2;
+    r = batch(MAP_LOOKUP_AND_DELETE_BATCH, fd, NULL, &out, keys, values, &count, 0);
+    say("lpm lookup and delete batch %ld count %u", r, count);
+    keys[0] = v4(172, 16, 0, 0, 12);
+    keys[1] = v4(172, 16, 0, 0, 40);
+    keys[2] = v4(172, 17, 0, 0, 16);
+    values[0] = 20;
+    values[1] = 21;
+    values[2] = 22;
+    count = 3;
+    r = batch(MAP_UPDATE_BATCH, fd, NULL, NULL, keys, values, &count, 0);
+    say("lpm update batch %ld count %u", r, count);
+    holds(fd, 172, 16, 5, 5, 32);
+    keys[1] = v4(192, 168, 1, 0, 24);
+    count = 3;
+    r = batch(MAP_DELETE_BATCH, fd, NULL, NULL, keys, NULL, &count, 0);
+    say("lpm delete batch %ld count %u", r, count);
+    order("lpm after batches", fd);
+    close(fd);
+
+    /* Longer keys: 17 bytes of data, past the first 8 and 16. */
+    fd = make(TYPE_LPM_TRIE, 4 + 17, 1, 4, F_NO_PREALLOC);
+    struct {
+        uint32_t length;
+        unsigned char data[17];
+    } __attribute__((packed)) long_key;
+    const struct {
+        uint32_t length;
+        unsigned char last;
+    } puts_[] = {{129, 0x80}, {136, 0x00}, {64, 0x11}};
+    for (unsigned i = 0; i < sizeof puts_ / sizeof puts_[0]; i++) {
+        long_key.length = puts_[i].length;
+        memset(long_key.data, 0xab, 16);
+        long_key.data[16] = puts_[i].last;
+        unsigned char v = (unsigned char)(i + 1);
+        say("lpm long put /%u %ld", puts_[i].length, elem(MAP_UPDATE_ELEM, fd, &long_key, &v, ANY));
+    }
+    const unsigned char lasts[] = {0xff, 0x00, 0x7f, 0x80};
+    for (unsigned i = 0; i < sizeof lasts; i++) {
+        long_key.length = 136;
+        memset(long_key.data, 0xab, 16);
+        long_key.data[16] = lasts[i];
+        unsigned char v = 0;
+        r = elem(MAP_LOOKUP_ELEM, fd, &long_key, &v, 0);
+        say("lpm long lookup %#x %ld %u", lasts[i], r, v);
+    }
+    long_key.data[3] = 0;
+    unsigned char v = 0;
+    say("lpm long lookup off at byte 3 %ld", elem(MAP_LOOKUP_ELEM, fd, &long_key, &v, 0));
+    printf("lpm long order");
+    r = elem(MAP_GET_NEXT_KEY, fd, NULL, &long_key, 0);
+    while (r == 0) {
+        printf(" /%u:%02x", long_key.length, long_key.data[16]);
+        r = elem(MAP_GET_NEXT_KEY, fd, &long_key, &long_key, 0);
+    }
+    printf(" end %ld\n", r);
+    say("lpm long memlock %llu", memlock(fd));
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1077,6 +1284,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-lru")) return case_lru();
     if (!strcmp(mode, "bpf-queue")) return case_queue();
     if (!strcmp(mode, "bpf-bloom")) return case_bloom();
+    if (!strcmp(mode, "bpf-lpm")) return case_lpm();
     if (!strcmp(mode, "bpf-prog-load")) return case_prog_load();
     return 2;
 }

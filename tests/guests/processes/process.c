@@ -6236,8 +6236,7 @@ static int pagemap_case(void) {
     PM_RESULT("bad-buffer", pread(fd, (void *)16, 8, 8));
     /* The position: lseek from the start and the current one only, to any
        position; read moves it by what it read. The page is the file's
-       written one: the one fork shared is exclusive again on Linux once the
-       child is gone, which the emulator does not tell. */
+       written one. */
     off_t at = (off_t)((uintptr_t)(f + 2 * page) / 4096 * 8);
     printf("seek=%d\n", lseek(fd, at, SEEK_SET) == at);
     errno = 0;
@@ -6253,17 +6252,140 @@ static int pagemap_case(void) {
     return 0;
 }
 
-/* pm_show without the exclusive bit (bit 56), which Linux sets again for
-   a page fork shared once only one process maps it: the emulator keeps no
-   map counts. */
-static void cr_show(int fd, const char *label, void *at, int pages) {
-    uint64_t entries[16] = {0};
-    errno = 0;
-    ssize_t n = pread(fd, entries, (size_t)pages * 8, (off_t)((uintptr_t)at / 4096 * 8));
-    printf("%s: n=%zd errno=%d", label, n, errno);
-    for (int i = 0; n > 0 && i < n / 8; i++)
-        printf(" %llx", (unsigned long long)(entries[i] & ~(1ULL << 56)));
-    printf("\n");
+/* The sharing lines of the smaps block of the VMA at `at`: Rss, Pss and
+   the shared and private pages, on one line. Clean and dirty are summed:
+   a file's page that write() filled is dirty on Linux until writeback,
+   which depends on time and on the filesystem, not on the map count. */
+static void mc_smaps(const char *label, void *at) {
+    static char text[1 << 17];
+    int fd = open("/proc/self/smaps", O_RDONLY);
+    size_t length = 0;
+    ssize_t n;
+    while (fd >= 0 && length < sizeof text - 1 && (n = read(fd, text + length, sizeof text - 1 - length)) > 0)
+        length += (size_t)n;
+    if (fd >= 0) close(fd);
+    text[length] = 0;
+    char head[32];
+    snprintf(head, sizeof head, "%lx-", (unsigned long)(uintptr_t)at);
+    char *block = NULL;
+    for (char *line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL)
+        if (!strncmp(line, head, strlen(head))) { block = line; break; }
+    static const char *const names[] = {"Rss:", "Pss:", "Shared_Clean:", "Shared_Dirty:",
+                                        "Private_Clean:", "Private_Dirty:"};
+    long kb[6] = {-1, -1, -1, -1, -1, -1};
+    for (size_t i = 0; block && i < 6; i++) {
+        char *field = strstr(block, names[i]);
+        if (field) sscanf(field + strlen(names[i]), "%ld", &kb[i]);
+    }
+    printf("%s smaps: rss=%ld pss=%ld shared=%ld private=%ld\n", label, kb[0], kb[1], kb[2] + kb[3],
+           kb[4] + kb[5]);
+}
+
+/* The map-count case: pagemap's exclusive bit (bit 56), which Linux sets
+   for a present page that exactly one page table entry maps, in any
+   process (a precise map count of 1): fork, a second mapping of the same
+   file page, munmap and a child's exit change it. */
+static int map_count_case(void) {
+    long page = 4096;
+    /* As the pagemap case: unprivileged, to read no frame numbers. */
+    if (setgroups(0, NULL) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534))
+        return 79;
+    if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)) return 78;
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) return 80;
+    char *base = mmap(NULL, 64 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 81;
+    munmap(base, (size_t)(64 * page));
+    /* Private anonymous: one written page, one only read (the zero page). */
+    char *a = mmap(base + 2 * page, 2 * page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) return 82;
+    a[0] = 1;
+    volatile char seen = a[page];
+    (void)seen;
+    /* Shared anonymous memory, written. */
+    char *s = mmap(base + 6 * page, page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (s == MAP_FAILED) return 83;
+    s[0] = 1;
+    /* A file, mapped shared twice and privately twice: each mapping maps
+       the same page-cache page. */
+    char path[] = "/tmp/map-count-XXXXXX";
+    int file = mkstemp(path);
+    if (file < 0) return 84;
+    unlink(path);
+    char block[4096];
+    memset(block, 'f', sizeof block);
+    if (write(file, block, sizeof block) != (ssize_t)sizeof block) return 85;
+    char *f1 = mmap(base + 10 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, file, 0);
+    if (f1 == MAP_FAILED) return 86;
+    seen = f1[0];
+    pm_show(fd, "anonymous", a, 2);
+    pm_show(fd, "shared", s, 1);
+    pm_show(fd, "file-once", f1, 1);
+    char *f2 = mmap(base + 14 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, file, 0);
+    if (f2 == MAP_FAILED) return 87;
+    seen = f2[0];
+    pm_show(fd, "file-twice-1", f1, 1);
+    pm_show(fd, "file-twice-2", f2, 1);
+    mc_smaps("file-twice", f1);
+    munmap(f2, (size_t)page);
+    pm_show(fd, "file-unmapped", f1, 1);
+    char *p1 = mmap(base + 18 * page, page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, file, 0);
+    if (p1 == MAP_FAILED) return 88;
+    seen = p1[0];
+    pm_show(fd, "private-read", p1, 1);
+    pm_show(fd, "private-read-shared", f1, 1);
+    mc_smaps("private-read", p1);
+    p1[0] = 'g';
+    pm_show(fd, "private-written", p1, 1);
+    pm_show(fd, "private-written-shared", f1, 1);
+
+    /* fork: each page the child maps too is mapped twice, until the child
+       writes its own copy or exits. */
+    fflush(stdout);
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 89;
+    pid_t child = fork();
+    if (child < 0) return 90;
+    if (!child) {
+        int own = open("/proc/self/pagemap", O_RDONLY);
+        pm_show(own, "child-anonymous", a, 2);
+        pm_show(own, "child-shared", s, 1);
+        pm_show(own, "child-file", f1, 1);
+        pm_show(own, "child-private", p1, 1);
+        a[0] = 2;
+        pm_show(own, "child-written", a, 1);
+        fflush(stdout);
+        char c = 0;
+        if (write(ready[1], &c, 1) != 1 || read(go[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    char c = 0;
+    if (read(ready[0], &c, 1) != 1) return 91;
+    /* The child still runs: what it shares is mapped twice. */
+    pm_show(fd, "parent-anonymous", a, 1);
+    pm_show(fd, "parent-shared", s, 1);
+    pm_show(fd, "parent-file", f1, 1);
+    pm_show(fd, "parent-private", p1, 1);
+    mc_smaps("parent-anonymous", a);
+    mc_smaps("parent-shared", s);
+    mc_smaps("parent-file", f1);
+    fflush(stdout);
+    if (write(go[1], &c, 1) != 1) return 92;
+    int status;
+    waitpid(child, &status, 0);
+    printf("child status=%x\n", status);
+    /* The child is gone: mapped once again. */
+    pm_show(fd, "after-anonymous", a, 1);
+    pm_show(fd, "after-shared", s, 1);
+    pm_show(fd, "after-file", f1, 1);
+    pm_show(fd, "after-private", p1, 1);
+    mc_smaps("after-anonymous", a);
+    mc_smaps("after-file", f1);
+    close(file);
+    close(fd);
+    return 0;
 }
 
 /* Writes `text` to clear_refs at `fd`: what write returned, and errno. */
@@ -6386,15 +6508,15 @@ static int clear_refs_case(void) {
     if (child < 0) return 87;
     if (!child) {
         int own = open("/proc/self/pagemap", O_RDONLY);
-        cr_show(own, "child", a, 4);
+        pm_show(own, "child", a, 4);
         a[2 * page] = 3;
-        cr_show(own, "child-written", a, 4);
+        pm_show(own, "child-written", a, 4);
         fflush(stdout);
         _exit(0);
     }
     int status;
     waitpid(child, &status, 0);
-    cr_show(map, "parent", a, 4);
+    pm_show(map, "parent", a, 4);
 
     /* Another process's file, and a thread's. */
     char path[64];
@@ -6403,7 +6525,7 @@ static int clear_refs_case(void) {
     int thread = open(path, O_WRONLY);
     cr_write(thread, "thread", "4", 1);
     if (thread >= 0) close(thread);
-    cr_show(map, "thread-cleared", a, 4);
+    pm_show(map, "thread-cleared", a, 4);
 
     /* How the number is read: kstrtoint in base 10, spaces stripped, at
        most 12 bytes taken. */
@@ -10947,14 +11069,154 @@ static int generated_binds_case(void) {
         _exit(gb_inner());
     }
     printf("status=%d\n", reaped(child));
-    const char *files[] = {"f", "g", "other", "link"};
-    for (unsigned i = 0; i < 4; i++) {
+    /* A plain symbolic link to a generated file, and one to /dev, outside
+       any bind mount. */
+    char plain[256], pdev[256], through[300];
+    gb_path(plain, "plain");
+    gb_path(pdev, "pdev");
+    symlink("/dev/null", plain);
+    symlink("/dev", pdev);
+    snprintf(through, sizeof through, "%s/null", pdev);
+    struct stat ps;
+    memset(&ps, 0, sizeof ps);
+    int pr = stat(plain, &ps) ? errno : 0;
+    printf("plain stat=%d chr=%d", pr, S_ISCHR(ps.st_mode));
+    memset(&ps, 0, sizeof ps);
+    pr = stat(through, &ps) ? errno : 0;
+    printf(" through stat=%d chr=%d", pr, S_ISCHR(ps.st_mode));
+    pr = access(plain, W_OK) ? errno : 0;
+    printf(" access=%d", pr);
+    char slashed[300];
+    snprintf(slashed, sizeof slashed, "%s/", plain);
+    pr = stat(slashed, &ps) ? errno : 0;
+    printf(" slash=%d", pr);
+    int pfd = open(through, O_WRONLY);
+    printf(" open=%d", pfd < 0 ? errno : 0);
+    if (pfd >= 0) {
+        long wrote = (long)write(pfd, "abc", 3);
+        printf(" write=%ld fdlink=%d", wrote, gb_fd_names(pfd, "/dev/null"));
+        close(pfd);
+    }
+    printf("\n");
+    const char *files[] = {"f", "g", "other", "link", "plain", "pdev"};
+    for (unsigned i = 0; i < 6; i++) {
         gb_path(path, files[i]);
         unlink(path);
     }
     gb_path(path, "d");
     rmdir(path);
     printf("cleaned=%d\n", rmdir(gb_base) == 0);
+    return 0;
+}
+
+/* The beneath case: move_mount with MOVE_MOUNT_BENEATH (Linux master's
+   do_move_mount and can_move_mount_beneath) of tmpfs mounts in a temporary
+   directory, in a mount namespace of a user namespace of its own: the moved
+   mount goes under the topmost one, which an unmount takes away to show
+   it, and the refusals (EINVAL) for a target that is no mount's root, the
+   namespace's root, a source in the topmost mount's tree, and a shared
+   parent that would propagate a copy onto the topmost mount. Only errno
+   values are printed. */
+static char bn_base[] = "/tmp/paludarium-beneath-XXXXXX";
+static void bn_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", bn_base, name); }
+/* 0 for a path that is there, else the errno. */
+static int bn_there(const char *dir, const char *name) {
+    char p[300];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return access(p, F_OK) ? errno : 0;
+}
+static long bn_beneath(const char *from, const char *to) {
+    long r = tr_move(AT_FDCWD, from, AT_FDCWD, to, 0x200 /* MOVE_MOUNT_BENEATH */);
+    return r ? errno : 0;
+}
+static int bn_inner(void) {
+    char a[256], b[256], c[256], s[256], file[300], sub[300], d[300];
+    bn_path(a, "a");
+    bn_path(b, "b");
+    bn_path(c, "c");
+    bn_path(s, "s");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    int r = mt_result(mount("none", a, "tmpfs", 0, NULL));
+    printf("a=%d", r);
+    snprintf(file, sizeof file, "%s/x-a", a);
+    mt_write_new(file, "a");
+    snprintf(sub, sizeof sub, "%s/sub", a);
+    mkdir(sub, 0755);
+    r = mt_result(mount("none", b, "tmpfs", 0, NULL));
+    printf(" b=%d", r);
+    snprintf(file, sizeof file, "%s/x-b", b);
+    mt_write_new(file, "b");
+    printf("\nnot-root=%ld", bn_beneath(b, sub));
+    printf(" root=%ld", bn_beneath(b, "/"));
+    r = mt_result(mount("none", sub, "tmpfs", 0, NULL));
+    printf(" sub=%d", r);
+    printf(" in-tree=%ld", bn_beneath(sub, a));
+    r = mt_result(umount2(sub, 0));
+    printf(" sub-gone=%d\n", r);
+    printf("beneath=%ld", bn_beneath(b, a));
+    printf(" top=%d", bn_there(a, "x-a"));
+    printf(" under=%d", bn_there(a, "x-b"));
+    printf(" old=%d\n", bn_there(b, "x-b"));
+    r = mt_result(umount2(a, 0));
+    printf("umount=%d", r);
+    printf(" shown=%d", bn_there(a, "x-b"));
+    r = mt_result(umount2(a, 0));
+    printf(" umount=%d", r);
+    r = mt_result(umount2(a, 0));
+    printf(" umount=%d", r);
+    r = mt_result(umount2(b, 0));
+    printf(" b-umount=%d\n", r);
+    /* A shared parent with a bind of its directory onto itself. */
+    r = mt_result(mount("none", s, "tmpfs", 0, NULL));
+    printf("s=%d", r);
+    r = mt_result(mount(NULL, s, NULL, MS_SHARED, NULL));
+    printf(" shared=%d", r);
+    snprintf(d, sizeof d, "%s/d", s);
+    mkdir(d, 0755);
+    r = mt_result(mount(d, d, NULL, MS_BIND, NULL));
+    printf(" self-bind=%d", r);
+    r = mt_result(mount("none", c, "tmpfs", 0, NULL));
+    printf(" c=%d", r);
+    printf(" propagates=%ld", bn_beneath(c, d));
+    r = mt_result(umount2(c, 0));
+    printf(" c-umount=%d", r);
+    r = mt_result(umount2(s, MNT_DETACH));
+    printf(" s-umount=%d\n", r);
+    return 0;
+}
+static int beneath_case(void) {
+    if (!mkdtemp(bn_base)) return 93;
+    chmod(bn_base, 0755);
+    char path[256];
+    const char *dirs[] = {"a", "b", "c", "s"};
+    for (unsigned i = 0; i < 4; i++) {
+        bn_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(bn_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    for (unsigned i = 0; i < 4; i++) {
+        bn_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(bn_base) == 0);
     return 0;
 }
 
@@ -11819,6 +12081,317 @@ static int proc_io_case(void) {
     return 0;
 }
 
+/* The proc-fd-links case: what a link of a process's /proc directory reads
+   (proc_pid_readlink, d_path): /proc itself, files removed, renamed or
+   renamed over, a link read through an O_PATH | O_NOFOLLOW descriptor of
+   it (readlinkat(fd, "")) when it is read and of the process that opened
+   it, another process's descriptor, and each from a reader whose root is
+   a chroot: from that root when the file is under it, else from the
+   machine's root. */
+static char pfl_base[] = "/tmp/paludarium-fdlinks-XXXXXX";
+static void pfl_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", pfl_base, name); }
+/* `link` with the case's directory as B and unprintable bytes as \xNN. */
+static void pfl_print(const char *label, long n, const char *link) {
+    if (n < 0) {
+        printf("%s: errno=%ld\n", label, -n);
+        return;
+    }
+    printf("%s: ", label);
+    size_t base = strlen(pfl_base);
+    const char *p = link;
+    if (!strncmp(p, pfl_base, base)) {
+        putchar('B');
+        p += base;
+    }
+    for (; *p; p++)
+        if (*p >= 0x20 && *p < 0x7f) putchar(*p);
+        else printf("\\x%02x", (unsigned char)*p);
+    /* A pipe's inode is a number of the machine's. */
+    printf("\n");
+}
+static void pfl_read(const char *label, const char *path) {
+    char b[512];
+    ssize_t n = readlink(path, b, sizeof b - 1);
+    if (n >= 0) b[n] = 0;
+    if (n >= 0 && !strncmp(b, "pipe:[", 6)) strcpy(b, "pipe:[N]");
+    pfl_print(label, n < 0 ? -errno : n, b);
+}
+/* The link of this process's descriptor `fd`. */
+static void pfl_fd(const char *label, int fd) {
+    char p[64];
+    if (fd < 0) {
+        printf("%s: open errno=%d\n", label, errno);
+        return;
+    }
+    snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    pfl_read(label, p);
+}
+/* What readlinkat(fd, "") reads of the link `fd` holds. */
+static void pfl_at(const char *label, int fd) {
+    char b[512];
+    if (fd < 0) {
+        printf("%s: open errno=%d\n", label, errno);
+        return;
+    }
+    ssize_t n = readlinkat(fd, "", b, sizeof b - 1);
+    if (n >= 0) b[n] = 0;
+    pfl_print(label, n < 0 ? -errno : n, b);
+}
+static int pfl_open(const char *name, int flags) {
+    char p[256];
+    pfl_path(p, name);
+    return open(p, flags, 0644);
+}
+static int pfl_inner(void) {
+    char a[256], b[256];
+    /* Mounts made here stay in this namespace. */
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) return 82;
+    pfl_fd("proc", open("/proc", O_RDONLY | O_DIRECTORY));
+    pfl_fd("proc-slash", open("/proc/", O_RDONLY | O_DIRECTORY));
+    pfl_fd("dir", open(pfl_base, O_RDONLY | O_DIRECTORY));
+    int file = pfl_open("a", O_CREAT | O_RDWR);
+    pfl_fd("file", file);
+    pfl_path(a, "a");
+    pfl_path(b, "hard");
+    link(a, b);
+    unlink(a);
+    /* Its dentry is gone, though another name reaches the file. */
+    pfl_fd("unlinked-with-another-name", file);
+    int moved = pfl_open("m", O_CREAT | O_RDWR);
+    pfl_path(a, "d");
+    mkdir(a, 0755);
+    pfl_path(a, "m");
+    pfl_path(b, "d/m2");
+    rename(a, b);
+    pfl_fd("renamed", moved);
+    pfl_path(a, "d");
+    pfl_path(b, "e");
+    rename(a, b);
+    pfl_fd("directory-renamed", moved);
+    int over = pfl_open("y", O_CREAT | O_RDWR);
+    int over_with = pfl_open("z", O_CREAT | O_RDWR);
+    pfl_path(a, "z");
+    pfl_path(b, "y");
+    rename(a, b);
+    pfl_fd("renamed-over", over);
+    pfl_fd("renamed-over-with", over_with);
+    pfl_path(a, "gone");
+    mkdir(a, 0755);
+    int gone = open(a, O_RDONLY | O_DIRECTORY);
+    rmdir(a);
+    pfl_fd("removed-directory", gone);
+    pfl_fd("newline", pfl_open("new\nline", O_CREAT | O_RDWR));
+    pfl_fd("deleted-in-name", pfl_open("x (deleted)", O_CREAT | O_RDWR));
+    int pipes[2];
+    if (pipe(pipes)) return 83;
+    pfl_fd("pipe", pipes[0]);
+    /* Links read through O_PATH | O_NOFOLLOW descriptors of them, which
+       read where they lead at the time. */
+    int hard = pfl_open("hard", O_RDONLY);
+    int cwd = open("/proc/self/cwd", O_PATH | O_NOFOLLOW);
+    int root = open("/proc/self/root", O_PATH | O_NOFOLLOW);
+    char p[64];
+    snprintf(p, sizeof p, "/proc/self/fd/%d", hard);
+    int of_fd = open(p, O_PATH | O_NOFOLLOW);
+    if (chdir(pfl_base)) return 84;
+    pfl_at("path-cwd", cwd);
+    pfl_path(a, "e");
+    if (chdir(a)) return 85;
+    pfl_at("path-cwd-moved", cwd);
+    pfl_at("path-root", root);
+    pfl_at("path-fd", of_fd);
+    {
+        /* `/proc/self` reads as the reader's PID. */
+        char self[32];
+        ssize_t n = readlinkat(open("/proc/self", O_PATH | O_NOFOLLOW), "", self, sizeof self - 1);
+        if (n >= 0) self[n] = 0;
+        printf("path-self: %s\n", n < 0 ? "error" : atoi(self) == getpid() ? "own pid" : self);
+    }
+    /* A child reads its parent's links through them, but its own self. */
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 86;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 87;
+    if (!kid) {
+        dup2(over_with, hard);
+        if (chdir("/")) _exit(1);
+        pfl_at("child path-fd", of_fd);
+        pfl_at("child path-cwd", cwd);
+        pfl_fd("child own fd", hard);
+        fflush(stdout);
+        char byte = 'r';
+        write(ready[1], &byte, 1);
+        read(done[0], &byte, 1);
+        _exit(0);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 88;
+    snprintf(p, sizeof p, "/proc/%d/fd/%d", (int)kid, hard);
+    pfl_read("other fd", p);
+    snprintf(p, sizeof p, "/proc/%d/cwd", (int)kid);
+    pfl_read("other cwd", p);
+    int other = open(p, O_PATH | O_NOFOLLOW);
+    pfl_at("other path-cwd", other);
+    write(done[1], &byte, 1);
+    reaped(kid);
+    /* Gone with its process. */
+    pfl_at("other path-cwd reaped", other);
+    /* From a chroot: inside it from its root, outside it from the
+       machine's. */
+    pfl_path(a, "root");
+    mkdir(a, 0755);
+    pfl_path(a, "root/proc");
+    mkdir(a, 0755);
+    if (mount("/proc", a, NULL, MS_BIND | MS_REC, NULL)) {
+        printf("bind errno=%d\n", errno);
+        return 89;
+    }
+    int inside = pfl_open("root/in", O_CREAT | O_RDWR);
+    int outside = pfl_open("hard", O_RDONLY);
+    snprintf(p, sizeof p, "/proc/self/fd/%d", outside);
+    int of_outside = open(p, O_PATH | O_NOFOLLOW);
+    snprintf(p, sizeof p, "/proc/self/fd/%d", inside);
+    int of_inside = open(p, O_PATH | O_NOFOLLOW);
+    fflush(stdout);
+    kid = fork();
+    if (kid < 0) return 90;
+    if (!kid) {
+        pfl_path(a, "root");
+        if (chroot(a)) _exit(1);
+        pfl_fd("chroot inside", inside);
+        pfl_fd("chroot outside", outside);
+        pfl_fd("chroot pipe", pipes[1]);
+        pfl_read("chroot cwd outside", "/proc/self/cwd");
+        pfl_at("chroot path-fd outside", of_outside);
+        pfl_at("chroot path-fd inside", of_inside);
+        pfl_at("chroot path-cwd", cwd);
+        snprintf(p, sizeof p, "/proc/%d/fd/%d", (int)getppid(), inside);
+        pfl_read("chroot parent fd inside", p);
+        if (chdir("/")) _exit(2);
+        pfl_read("chroot cwd", "/proc/self/cwd");
+        pfl_read("chroot root", "/proc/self/root");
+        pfl_fd("chroot new", open("/in", O_RDONLY));
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("chrooted=%d\n", reaped(kid));
+    pfl_path(a, "root/proc");
+    umount2(a, MNT_DETACH);
+    return 0;
+}
+static int proc_fd_links_case(void) {
+    if (!mkdtemp(pfl_base)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 81;
+    if (!kid) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (unshare(CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        _exit(pfl_inner());
+    }
+    printf("status=%d\n", reaped(kid));
+    const char *names[] = {"hard", "e/m2", "y", "new\nline", "x (deleted)", "root/in", "root/proc", "root", "e"};
+    char path[256];
+    for (unsigned i = 0; i < 7; i++) {
+        pfl_path(path, names[i]);
+        unlink(path);
+    }
+    for (unsigned i = 6; i < 9; i++) {
+        pfl_path(path, names[i]);
+        rmdir(path);
+    }
+    rmdir(pfl_base);
+    return 0;
+}
+/* The proc-other-fd-paths case: a path that goes on through a link of
+   another process's fd, which Linux's walk jumps to the descriptor's file
+   (proc_fd_link, nd_jump_link) once the reader may look at it, and goes on
+   in when it is a directory. */
+static char pofp_base[] = "/tmp/paludarium-pofp-XXXXXX";
+static void pofp_stat(const char *label, const char *path, ino_t expected) {
+    struct stat st;
+    if (stat(path, &st)) printf("%s: errno=%d\n", label, errno);
+    else printf("%s: same=%d\n", label, st.st_ino == expected);
+}
+static int proc_other_fd_paths_case(void) {
+    if (!mkdtemp(pofp_base)) return 80;
+    chmod(pofp_base, 0755);
+    char dir[256], inner[256], file[256], moved[256];
+    snprintf(dir, sizeof dir, "%s/d", pofp_base);
+    snprintf(inner, sizeof inner, "%s/d/name", pofp_base);
+    snprintf(file, sizeof file, "%s/f", pofp_base);
+    snprintf(moved, sizeof moved, "%s/moved", pofp_base);
+    mkdir(dir, 0755);
+    int w = open(inner, O_CREAT | O_WRONLY, 0644);
+    if (w < 0 || write(w, "inside", 6) != 6) return 81;
+    close(w);
+    close(open(file, O_CREAT | O_WRONLY, 0644));
+    struct stat inner_st;
+    stat(inner, &inner_st);
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 82;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 83;
+    if (!kid) {
+        unsigned char fds[2];
+        fds[0] = (unsigned char)open(dir, O_RDONLY | O_DIRECTORY);
+        fds[1] = (unsigned char)open(file, O_RDONLY);
+        char byte;
+        if (write(ready[1], fds, 2) != 2 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    unsigned char fds[2];
+    if (read(ready[0], fds, 2) != 2) return 84;
+    char path[256];
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
+    pofp_stat("through directory", path, inner_st.st_ino);
+    int fd = open(path, O_RDONLY);
+    char text[8] = "";
+    printf("open=%d read=%zd %.6s\n", fd >= 0 ? 0 : errno, fd >= 0 ? read(fd, text, 6) : (ssize_t)-1, text);
+    if (fd >= 0) close(fd);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/.", (int)kid, fds[0]);
+    struct stat dir_st;
+    stat(dir, &dir_st);
+    pofp_stat("dot", path, dir_st.st_ino);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[1]);
+    pofp_stat("through file", path, 0);
+    snprintf(path, sizeof path, "/proc/%d/fd/60/name", (int)kid);
+    pofp_stat("not open", path, 0);
+    /* Another user may not look at its descriptors. */
+    fflush(stdout);
+    pid_t other = fork();
+    if (other == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
+        pofp_stat("other user", path, inner_st.st_ino);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(other));
+    /* Renamed, the walk goes on where the directory is now; removed, it is
+       not there. */
+    rename(dir, moved);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
+    pofp_stat("renamed", path, inner_st.st_ino);
+    snprintf(inner, sizeof inner, "%s/moved/name", pofp_base);
+    unlink(inner);
+    rmdir(moved);
+    pofp_stat("removed", path, inner_st.st_ino);
+    /* Its descriptors are gone with it. */
+    if (write(done[1], "d", 1) != 1) return 85;
+    siginfo_t info;
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    pofp_stat("zombie", path, inner_st.st_ino);
+    printf("status=%d\n", reaped(kid));
+    unlink(file);
+    rmdir(pofp_base);
+    return 0;
+}
 /* The proc-owner-rename case: the owner fstat shows of an open file in a
    process's /proc directory, which is its inode's as the last lookup of its
    path set it (pid_revalidate), and of the process's directory and its ns,
@@ -15668,7 +16241,23 @@ static int rseq_case(void) {
     return 0;
 }
 
-static int shm_case(void) {
+/* Makes a child's the last process to use segment `id`: the child exits at
+   once, which closes its copies of the attachments. Its PID. */
+static pid_t shm_last_used_by_child(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    if (child > 0) waitpid(child, NULL, 0);
+    return child;
+}
+/* Whether `shm_lpid` is this process's or `other`'s, and `shm_nattch`. */
+static void shm_show_user(const char *label, int id, pid_t other) {
+    struct shm_status s;
+    shm_status_of(id, SHMX_STAT, &s);
+    printf("%s lpid-own=%d lpid-other=%d nattch=%lu\n", label, s.lpid == getpid(), s.lpid == other, s.nattch);
+}
+
+static int shm_case(const char *self) {
     long page = sysconf(_SC_PAGESIZE);
     struct shm_status s;
     int id = (int)syscall(SYS_shmget, 0, 3 * page - 10, SHMX_CREAT | 0600);
@@ -15845,6 +16434,69 @@ static int shm_case(void) {
     if (waitpid(child, &status, 0) != child) return 23;
     printf("removed=%ld", syscall(SYS_shmctl, id, SHMX_RMID, 0));
     printf(" %ld\n", syscall(SYS_shmctl, keyed2, SHMX_RMID, 0));
+
+    /* Each VMA of an attachment that opens stamps the segment's atime and
+       lpid, and each one that closes its dtime and lpid (shm_open,
+       shm_close). A child's exit makes it the last user before each step. */
+    int st = (int)syscall(SYS_shmget, 0, 4 * page, SHMX_CREAT | 0600);
+    if (st < 0) return 24;
+    char *c = (char *)syscall(SYS_shmat, st, 0, 0);
+    if (c == (char *)-1) return 25;
+    shm_status_of(st, SHMX_STAT, &s);
+    printf("stamps new dtime-set=%d", s.dtime > 0);
+    pid_t other = shm_last_used_by_child();
+    shm_status_of(st, SHMX_STAT, &s);
+    printf(" after-exit dtime-set=%d lpid-other=%d nattch=%lu\n", s.dtime > 0, s.lpid == other, s.nattch);
+    /* An unmap of part splits the rest off and closes the part. */
+    other = shm_last_used_by_child();
+    if (munmap(c + 3 * page, page)) return 26;
+    shm_show_user("stamps unmap-tail", st, other);
+    /* mlock and madvise split where they change the flags, as mprotect
+       does; advice that the piece already has splits nothing. */
+    other = shm_last_used_by_child();
+    printf("stamps mlock=%d", mlock(c, page));
+    shm_show_user("", st, other);
+    other = shm_last_used_by_child();
+    printf("stamps dontfork=%d", madvise(c + page, page, MADV_DONTFORK));
+    shm_show_user("", st, other);
+    other = shm_last_used_by_child();
+    printf("stamps dontfork-again=%d", madvise(c + page, page, MADV_DONTFORK));
+    shm_show_user("", st, other);
+    /* A fork opens the child's copies as the parent, all but the piece it
+       does not get, and the child's exec closes them as the child. */
+    other = shm_last_used_by_child();
+    int go[2];
+    if (pipe(go)) return 27;
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 28;
+    if (child == 0) {
+        char byte;
+        close(go[1]);
+        if (read(go[0], &byte, 1) != 1) _exit(1);
+        char id_text[16];
+        snprintf(id_text, sizeof id_text, "%d", st);
+        char *arguments[] = {(char *)self, "shm-after-exec", (char *)self, id_text, NULL};
+        execv(self, arguments);
+        _exit(2);
+    }
+    close(go[0]);
+    shm_show_user("stamps forked", st, other);
+    fflush(stdout);
+    if (write(go[1], "x", 1) != 1) return 29;
+    close(go[1]);
+    if (waitpid(child, &status, 0) != child) return 30;
+    shm_show_user("stamps child-done", st, child);
+    printf("stamps detach=%ld", syscall(SYS_shmdt, c));
+    shm_show_user("", st, child);
+    printf("stamps removed=%ld\n", syscall(SYS_shmctl, st, SHMX_RMID, 0));
+    return 0;
+}
+
+/* After the shm case's exec: the attachments the old image had are closed,
+   as this process. */
+static int shm_after_exec(int id) {
+    shm_show_user("stamps after-exec", id, 0);
     return 0;
 }
 
@@ -29978,7 +30630,8 @@ int main(int argc, char **argv) {
         if (chdir("/") || rmdir(dir)) return 89;
         return 0;
     }
-    if (!strcmp(mode, "shm")) return shm_case();
+    if (!strcmp(mode, "shm")) return shm_case(self);
+    if (!strcmp(mode, "shm-after-exec") && argc > 3) return shm_after_exec(atoi(argv[3]));
     if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();
@@ -30040,6 +30693,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
+    if (!strcmp(mode, "beneath")) return beneath_case();
     if (!strcmp(mode, "mount-flags-id")) {
         printf("euid=%d egid=%d\n", (int)geteuid(), (int)getegid());
         return 0;
@@ -30047,10 +30701,12 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();
+    if (!strcmp(mode, "proc-other-fd-paths")) return proc_other_fd_paths_case();
     if (!strcmp(mode, "proc-other-limits")) return proc_other_limits_case();
     if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "proc-owner-rename")) return proc_owner_rename_case();
     if (!strcmp(mode, "proc-io")) return proc_io_case();
+    if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
         ldt_show("after exec", 64);
@@ -30486,6 +31142,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mincore")) return mincore_cases();
     if (!strcmp(mode, "pagemap")) return pagemap_case();
     if (!strcmp(mode, "clear-refs")) return clear_refs_case();
+    if (!strcmp(mode, "map-count")) return map_count_case();
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {

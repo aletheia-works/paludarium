@@ -9425,3 +9425,24 @@ fn a_symbolic_link_leads_into_the_files_the_kernel_generates() {
     assert_eq!(f.ret(21, &[link, 2]), 0);
     assert_eq!(f.ret(21, &[comm, 4]), 0);
 }
+
+/// A bind of `/proc` onto a directory of a new root shows the files the
+/// kernel generates at the new root's `/proc` after `chroot`, as on Linux.
+#[test]
+fn a_bind_of_proc_shows_its_files_in_a_new_root() {
+    let mut f = fixture();
+    let root = put(&mut f, 0, b"/tmp/r");
+    let place = put(&mut f, 0x10, b"/tmp/r/proc");
+    let proc_dir = put(&mut f, 0x20, b"/proc");
+    let comm = put(&mut f, 0x30, b"/proc/self/comm");
+    let missing = put(&mut f, 0x50, b"/proc/nosuch");
+    assert_eq!(f.ret(83, &[root, 0o755]), 0);
+    assert_eq!(f.ret(83, &[place, 0o755]), 0);
+    assert_eq!(f.ret(165, &[proc_dir, place, 0, 4096, 0]), 0);
+    assert_eq!(f.ret(161, &[root]), 0);
+    let fd = f.ret(2, &[comm, 0, 0]);
+    assert!(fd < 1024);
+    assert!(f.ret(0, &[fd, DATA + 0x100, 64]) > 0);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(2, &[missing, 0, 0]), errno(Errno::ENOENT));
+}

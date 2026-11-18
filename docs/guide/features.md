@@ -1564,8 +1564,9 @@ kernel.
   from the root, or, when it is not under the root, its path from the
   machine's root after `(unreachable)`. A child of `fork` keeps the root, a
   rename moves it with its directory, and `setns` into a mount namespace
-  goes back to the machine's root. The generated `/proc` and `/dev` are not
-  under another root, as no `proc` filesystem is mounted there.
+  goes back to the machine's root. The generated `/proc` and `/dev` are under
+  another root only where a bind mount of them puts them, as no `proc`
+  filesystem is mounted there.
 - `mount` mounts a new tmpfs on a directory of the caller's mount namespace,
   after Linux's checks in Linux's order: the type, the source and the
   options are copied (`EFAULT`; a string with no end in 4096 bytes is

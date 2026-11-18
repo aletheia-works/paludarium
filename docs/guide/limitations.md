@@ -113,9 +113,10 @@ verified.
   seq files are of size 0; `maps`, `smaps` and `fdinfo` are 0 as on Linux.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
-  root. As `mount` mounts nothing on `/proc` or `/dev` and cannot bind
-  them, nothing can be mounted on the new root's `/proc` or `/dev`, so a
-  program there finds only the files the directory holds. In a path that climbs above the root as written, `..` is
+  root. `mount` mounts no `proc` filesystem and nothing on `/proc` or
+  `/dev`, so the new root's `/proc` or `/dev` shows the generated files
+  only through a bind mount of `/proc` or `/dev` (or a directory in them)
+  made onto it before. In a path that climbs above the root as written, `..` is
   taken from the names as written, where Linux takes a `..` after a
   symbolic link from the link's target. `maps` and `smaps` in `/proc` name
   files from the root their opener had when it opened them, where Linux

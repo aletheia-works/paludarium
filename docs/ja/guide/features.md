@@ -3889,7 +3889,8 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
 - `ptrace` は Linux の `kernel/ptrace.c` と同じく、ほかのタスクをトレースします。
   `PTRACE_TRACEME` では、呼び出したタスクを fork したスレッドがトレーサーになります。
   `PTRACE_ATTACH` はカーネルからそのタスクに `SIGSTOP` を送り、`PTRACE_SEIZE` は
-  `PTRACE_INTERRUPT` のときだけ止めます。どちらも、呼び出したプロセス自身のタスク、すでに
+  `PTRACE_INTERRUPT` のときだけ止めます。すでにグループ停止にあるタスクには、それを新しい
+  トレーサーへ報告させ、報告し終えてから呼び出しが返ります。どちらも、呼び出したプロセス自身のタスク、すでに
   トレースされているか終了したタスク、アタッチしてはいけないタスク（実 ID での
   `ptrace_may_access` と、Yama の `ptrace_scope` 1）を `EPERM` で断ります。要求を出せるのは
   トレーサーのスレッドだけで、相手が ptrace 停止にあるときだけです（`PTRACE_KILL` と

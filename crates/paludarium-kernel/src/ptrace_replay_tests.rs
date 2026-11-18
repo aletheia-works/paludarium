@@ -1,17 +1,19 @@
-//! Cases of `tests/guests/processes/ptrace.c`, `ptrace-syscalls.c` and
-//! `ptrace-requests.c`, replayed through the kernel's system calls: the
-//! tracer on the test's thread, the tracee on a thread of its own, as a
-//! guest's tasks run, each system call followed by the checkpoint the
-//! runtime takes before guest code runs again. The expected lines are what
-//! the guest prints for its mode on native Linux: for the `ptrace.c` cases
-//! but `ptrace-thread` as printed on Linux 7.0 (x86-64, Ubuntu 26.04
-//! runner); for `ptrace-thread`, `ptrace-strace`, `ptrace-sysemu` and the
-//! `ptrace-requests.c` cases as the guest prints them under the emulator,
-//! which `diff_processes` finds equal to Linux's. It still compares the
-//! whole guests with Linux on every CI run. What only the CPU does (a
-//! signal handler's body, the check a tracee makes after it resumes) is
-//! done here in Rust from the state the kernel left; a line that needs an
-//! exec is left out.
+//! Cases of `tests/guests/processes/ptrace.c`, `ptrace-syscalls.c`,
+//! `ptrace-requests.c` and `single-step.c`, replayed through the kernel's
+//! system calls: the tracer on the test's thread, the tracee on a thread of
+//! its own, as a guest's tasks run, each system call followed by the
+//! checkpoint the runtime takes before guest code runs again. The expected
+//! lines are what the guest prints for its mode on native Linux: for the
+//! `ptrace.c` cases but `ptrace-thread` and `ptrace-attach-stopped` as
+//! printed on Linux 7.0 (x86-64, Ubuntu 26.04 runner); for those two, the
+//! `ptrace-syscalls.c`, `ptrace-requests.c` and `single-step.c` cases as the
+//! guest prints them under the emulator, which `diff_processes` finds equal
+//! to Linux's. It still compares the whole guests with Linux on every CI
+//! run. What only the CPU does (a signal handler's body, the check a tracee
+//! makes after it resumes, the trap after each instruction a stepped
+//! tracee runs) is done here in Rust from the state the kernel left, or its
+//! line is left out; so is a line that needs an exec.
+
 use super::*;
 
 const READ: u64 = 0;
@@ -59,7 +61,9 @@ const SETREGS: u64 = 13;
 const GETFPREGS: u64 = 14;
 const SETFPREGS: u64 = 15;
 const ATTACH: u64 = 16;
+const SINGLESTEP: u64 = 9;
 const SYSCALL: u64 = 24;
+const SYSEMU_SINGLESTEP: u64 = 32;
 const SYSEMU: u64 = 31;
 const DETACH: u64 = 17;
 const SETOPTIONS: u64 = 0x4200;
@@ -96,10 +100,13 @@ const SIGKILL: u64 = 9;
 /// musl's `SIGRTMIN`, above the three it keeps for itself.
 const SIGRTMIN: u64 = 35;
 const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
 const WALL: u64 = 0x4000_0000;
 const SA_SIGINFO: u64 = 4;
 const SA_RESTORER: u64 = 0x0400_0000;
 const SA_RESTART: u64 = 0x1000_0000;
+/// The trap flag.
+const TF: u64 = 0x100;
 
 /// `struct user_regs_struct`'s fields, by their offsets.
 const R14: u64 = 8;
@@ -2120,5 +2127,224 @@ clone signal=5 event=3 nr=56 rax=-38 info-op=0 size=24
 thread: second signal=5 event=128 nr=56 rax=0 message=0
 thread-gone: second exited=1 code=0
 gone: parent exited=1 code=0",
+    );
+}
+
+/// Where a stopped tracee is, as `single-step.c` prints it: `end`, the
+/// offset into the case's sequence of the end of the system call the
+/// tracee made last, when it is there, or `outside`.
+fn at(rip: u64, end: u64) -> String {
+    if rip == CODE {
+        end.to_string()
+    } else {
+        "outside".into()
+    }
+}
+
+/// `ptrace-singlestep`: each round from the stop for the child's SIGSTOP,
+/// whose call ends at offset 12 of `seq_trace`, to the `getpid` that ends
+/// at 25. PTRACE_SINGLESTEP over the call gives SIGTRAP with TRAP_BRKPT
+/// after it; PTRACE_SYSEMU_SINGLESTEP stops at its entry and skips it. The
+/// trap flag the tracer set is not shown, and is gone once it continues.
+/// The traps of the other instructions, which only the CPU gives, are left
+/// out, and the tracer continues where the guest steps them.
+#[test]
+fn singlestep() {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        for _ in 0..2 {
+            let pid = c.sys(GETPID, [0; 6]).unwrap();
+            c.sys(KILL, [pid, SIGSTOP, 0, 0, 0, 0]).unwrap();
+            c.sys(GETPID, [0; 6]).unwrap();
+        }
+        // The guest's exit on the flag it has.
+        let tf = c.t.cpu.rflags & TF != 0;
+        c.exit(i32::from(tf))
+    });
+    g.wait(child, 0);
+    let mut status = 0;
+    for (request, name) in [
+        (SINGLESTEP, "singlestep"),
+        (SYSEMU_SINGLESTEP, "sysemu-singlestep"),
+    ] {
+        if request == SYSEMU_SINGLESTEP {
+            g.pt(SETOPTIONS, child, 0, O_TRACESYSGOOD);
+        }
+        let (_, regs) = g.regs(child);
+        let rip = g.reg(regs, RIP);
+        g.lines.push(format!("{name}: stopped at={}", at(rip, 12)));
+        let r = g.pt(request, child, 0, 0);
+        let stop = g.wait(child, 0);
+        assert_eq!((r, stop & 0xff), (0, 0x7f));
+        let (_, _, code, _) = g.siginfo(child);
+        let (_, regs) = g.regs(child);
+        let signal = (stop >> 8) & 0xff;
+        let mut line = format!(
+            "{name}: signal={} code={} at={} nr={} tf-shown={}",
+            hex(signal as u64),
+            hex(code as u64),
+            at(g.reg(regs, RIP), 25),
+            g.reg(regs, ORIG_RAX) as i64,
+            i64::from(g.reg(regs, EFLAGS) & TF != 0),
+        );
+        if signal == SIGTRAP | 0x80 {
+            line += &format!(" rax={}", g.reg(regs, RAX) as i64);
+        }
+        g.lines.push(line);
+        g.pt(CONT, child, 0, 0);
+        status = g.wait(child, 0);
+    }
+    g.say("exit", Tracer::code(status));
+    thread.join().unwrap();
+    g.check(
+        "singlestep: stopped at=12
+singlestep: signal=0x5 code=0x1 at=25 nr=39 tf-shown=0
+sysemu-singlestep: stopped at=12
+sysemu-singlestep: signal=0x85 code=0x85 at=25 nr=39 tf-shown=0 rax=-38
+exit=0",
+    );
+}
+
+/// `ptrace-forced-frame`: stepped from the stop for its SIGSTOP over the
+/// `kill` that sends it SIGUSR1, whose call ends at offset 24 of
+/// `seq_frame`, then stepped into the handler: stepping ends there, so the
+/// handler's frame keeps no trap flag the tracer set, and nothing traps
+/// once the tracer lets it run. The traps of the two moves before the
+/// call, which only the CPU gives, are left out.
+#[test]
+fn forced_frame() {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        // musl's `signal`.
+        c.catch(SIGUSR1, SA_RESTART);
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        let pid = c.sys(GETPID, [0; 6]).unwrap();
+        c.sys(KILL, [pid, SIGSTOP, 0, 0, 0, 0]).unwrap();
+        let mut handled = false;
+        c.call(KILL, [pid, SIGUSR1, 0, 0, 0, 0], &mut |_, signal, _| {
+            handled = signal == SIGUSR1;
+            None
+        })
+        .unwrap();
+        assert!(handled);
+        // rt_sigreturn gave back no trap flag, so nothing traps after.
+        let tf = c.t.cpu.rflags & TF != 0;
+        c.exit(i32::from(tf))
+    });
+    g.wait(child, 0);
+    let mut status = 0;
+    for _ in 0..20 {
+        g.pt(SINGLESTEP, child, 0, 0);
+        status = g.wait(child, 0);
+        if status & 0xff != 0x7f || (status >> 8) & 0xff == SIGUSR1 as i64 {
+            break;
+        }
+        let (_, _, code, _) = g.siginfo(child);
+        let (_, regs) = g.regs(child);
+        let line = format!(
+            "step: signal={} code={} at={}",
+            (status >> 8) & 0xff,
+            hex(code as u64),
+            at(g.reg(regs, RIP), 24)
+        );
+        g.lines.push(line);
+    }
+    let stopped = status & 0xff == 0x7f;
+    g.lines.push(format!(
+        "delivery: signal={}",
+        if stopped { (status >> 8) & 0xff } else { -1 }
+    ));
+    g.pt(SINGLESTEP, child, 0, SIGUSR1);
+    let status = g.wait(child, 0);
+    let (_, _, code, _) = g.siginfo(child);
+    let (_, regs) = g.regs(child);
+    let line = format!(
+        "handler: signal={} code={} in-handler={} tf-shown={}",
+        (status >> 8) & 0xff,
+        hex(code as u64),
+        i64::from(g.reg(regs, RIP) == HANDLER),
+        i64::from(g.reg(regs, EFLAGS) & TF != 0)
+    );
+    g.lines.push(line);
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, 0);
+    g.say("exit", Tracer::code(status));
+    thread.join().unwrap();
+    g.check(
+        "step: signal=5 code=0x1 at=24
+delivery: signal=10
+handler: signal=5 code=0x5 in-handler=1 tf-shown=0
+exit=0",
+    );
+}
+
+/// `ptrace-attach-stopped`: PTRACE_ATTACH and PTRACE_SEIZE of a child
+/// already in a group stop return once it has stopped for its new tracer,
+/// which sees the group stop at once (PTRACE_EVENT_STOP for the seize,
+/// with no siginfo for the attach); the attach's own SIGSTOP then has its
+/// delivery stop.
+#[test]
+fn attach_stopped() {
+    let mut g = Tracer::new();
+    for (seize, name) in [(false, "attach"), (true, "seize")] {
+        let (child, thread) = g.fork(|c| {
+            loop {
+                if let Err(status) = c.sys(PAUSE, [0; 6]) {
+                    return status;
+                }
+            }
+        });
+        g.call(KILL, [child, SIGSTOP, 0, 0, 0, 0]);
+        let status = g.wait(child, WUNTRACED);
+        g.stop(&format!("{name}-group"), status);
+        let r = g.pt(if seize { SEIZE } else { ATTACH }, child, 0, 0);
+        g.say(name, r);
+        let status = g.wait(child, WNOHANG | WALL);
+        g.stop(&format!("{name}-trap"), status);
+        let (error, signo, _, _) = g.siginfo(child);
+        g.say(&format!("{name}-siginfo"), error);
+        g.say(&format!("{name}-si-signo"), signo);
+        if !seize {
+            let r = g.pt(CONT, child, 0, 0);
+            g.say("cont", r);
+            let status = g.wait(child, WALL);
+            g.stop("sigstop", status);
+        }
+        g.call(KILL, [child, SIGKILL, 0, 0, 0, 0]);
+        let status = g.wait(child, WALL);
+        let killed = if status & 0x7f != 0 && status & 0xff != 0x7f {
+            status & 0x7f
+        } else {
+            -1
+        };
+        g.say(&format!("{name}-killed"), killed);
+        thread.join().unwrap();
+    }
+    g.check(
+        "attach-group-stopped=1
+attach-group-signal=19
+attach-group-event=0
+attach=0
+attach-trap-stopped=1
+attach-trap-signal=19
+attach-trap-event=0
+attach-siginfo=-22
+attach-si-signo=0
+cont=0
+sigstop-stopped=1
+sigstop-signal=19
+sigstop-event=0
+attach-killed=9
+seize-group-stopped=1
+seize-group-signal=19
+seize-group-event=0
+seize=0
+seize-trap-stopped=1
+seize-trap-signal=19
+seize-trap-event=128
+seize-siginfo=0
+seize-si-signo=19
+seize-killed=9",
     );
 }

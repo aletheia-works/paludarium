@@ -531,6 +531,46 @@ static int sibling_case(void) {
     return 0;
 }
 
+/* PTRACE_ATTACH and PTRACE_SEIZE of a child already in a group stop:
+ * the call returns once the child has stopped for its new tracer, which
+ * sees the group stop at once (PTRACE_EVENT_STOP for the seize, with no
+ * siginfo for the attach); the attach's own SIGSTOP then has its delivery
+ * stop. */
+static int attach_stopped(void) {
+    for (int seize = 0; seize < 2; seize++) {
+        const char *name = seize ? "seize" : "attach";
+        char line[64];
+        fflush(stdout);
+        pid_t child = fork();
+        if (child == 0) {
+            for (;;) pause();
+        }
+        kill(child, SIGSTOP);
+        int status = wait_status(child, WUNTRACED);
+        snprintf(line, sizeof line, "%s-group", name);
+        stop(line, status);
+        result(name, pt(seize ? PTRACE_SEIZE : PTRACE_ATTACH, child, 0, 0));
+        status = wait_status(child, WNOHANG | __WALL);
+        snprintf(line, sizeof line, "%s-trap", name);
+        stop(line, status);
+        long error;
+        siginfo_t info = siginfo_of(child, &error);
+        snprintf(line, sizeof line, "%s-siginfo", name);
+        result(line, error);
+        snprintf(line, sizeof line, "%s-si-signo", name);
+        result(line, info.si_signo);
+        if (!seize) {
+            result("cont", pt(PTRACE_CONT, child, 0, 0));
+            stop("sigstop", wait_status(child, __WALL));
+        }
+        kill(child, SIGKILL);
+        status = wait_status(child, __WALL);
+        snprintf(line, sizeof line, "%s-killed", name);
+        result(line, WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 99;
     const char *mode = argv[1], *self = argv[2];
@@ -545,6 +585,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-memory")) code = memory_case();
     if (!strcmp(mode, "ptrace-thread")) code = thread_case();
     if (!strcmp(mode, "ptrace-sibling")) code = sibling_case();
+    if (!strcmp(mode, "ptrace-attach-stopped")) code = attach_stopped();
     fflush(stdout);
     return code;
 }

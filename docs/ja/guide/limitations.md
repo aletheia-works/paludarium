@@ -223,9 +223,8 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   （`EINVAL`）。`mlock` でロックでき、Linux は `VM_SPECIAL` のマッピングをロックしません。`inherit_stat` は
   受け付けますが、記録するものがないので、引き継いだイベントの終わりに読み取りの記録は
   送りません。一つの CPU のタスクのイベントはどの CPU でも数え、cgroup の
-  モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。`PERF_FLAG_FD_OUTPUT` と ioctl の
-  `SET_OUTPUT`、`SET_FILTER`、`SET_BPF`、`PAUSE_OUTPUT`、`QUERY_BPF`、
-  `MODIFY_ATTRIBUTES` は、何もしないか `ENOTTY` です。`remove_on_exec` は、
+  モード（`PERF_FLAG_PID_CGROUP`）は `EBADF` です。ioctl の `SET_FILTER`、`SET_BPF`、
+  `PAUSE_OUTPUT`、`QUERY_BPF`、`MODIFY_ATTRIBUTES` は `ENOTTY` です。`remove_on_exec` は、
   Linux master が 7.2 から（037a3c43edfb）するように、イベントをグループから外し、そうした
   イベントは新しいグループを率いられません（`ENODEV`、fa091f46c383）。テストのマシンの
   Linux 7.0 はグループに残し、リーダーとしても受け付けるので、これらは単体テストだけで

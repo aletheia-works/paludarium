@@ -255,9 +255,9 @@ verified.
   mapping unlocked. `inherit_stat` is taken, but an
   inherited event's end sends no read record, as nothing is recorded. An
   event of a task on one CPU counts on any, and the cgroup mode
-  (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
-  ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
-  and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
+  (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
+  `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are
+  `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
   (037a3c43edfb), and such an event leads no new group (`ENODEV`,
   fa091f46c383); the test machines' Linux 7.0 leaves it in its group and

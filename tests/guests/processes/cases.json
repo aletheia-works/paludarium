@@ -129,6 +129,7 @@
     {"name":"perf-inherit","binary":"perf"},
     {"name":"perf-software","binary":"perf"},
     {"name":"perf-mmap","binary":"perf"},
+    {"name":"perf-output","binary":"perf"},
     {"name":"bpf-calls","binary":"bpf"},
     {"name":"bpf-elements","binary":"bpf"},
     {"name":"bpf-batch","binary":"bpf"},

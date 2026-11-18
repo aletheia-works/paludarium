@@ -3211,7 +3211,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   なくなります。ユーザーページは `struct perf_event_mmap_page` で、バージョン 0、
   `size` 96、データのオフセットと大きさ、`cap_bit0_is_deprecated` があり
   `cap_user_rdpmc` はなく、インデックス 0、そしてシーケンスロックの 2 回の増加の間に
-  数と有効な時間と動いた時間があります。ディスクリプタのリンクは
+  数と有効な時間と動いた時間があります。`PERF_EVENT_IOC_SET_OUTPUT` と、開くときに
+  グループのディスクリプタで指す `PERF_FLAG_FD_OUTPUT` は、Linux の
+  `perf_event_set_output` と同じく、イベントの出力をほかのイベントのバッファへ向けます。
+  相手はイベントで（`EBADF`）、同じイベントではなく、同じ CPU の、すべての CPU の
+  イベントなら同じタスクのもので、時計と `write_backward` が同じで、自分のものか
+  書き込み先のバッファを持たなければなりません。イベント自身のバッファをマップして
+  いるときも断ります（`EINVAL`）。-1（`SET_OUTPUT` だけ）は出力先をなくします。こうした
+  イベントはユーザーページを共有しますが、マップすると `EBUSY`（大きさが違えば
+  `EINVAL`）で、バッファの最後のマッピングがなくなると、書き込んでいたイベントは
+  どれも自由になります。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c`、`bpf_lru_list.c`、

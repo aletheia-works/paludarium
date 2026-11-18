@@ -3710,7 +3710,17 @@ kernel.
   page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
   offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
   index 0, and the count and times enabled and running between two bumps
-  of the sequence lock. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  of the sequence lock. `PERF_EVENT_IOC_SET_OUTPUT`, and
+  `PERF_FLAG_FD_OUTPUT` at open through the group's descriptor, make an
+  event write to another event's buffer, as Linux's
+  `perf_event_set_output`: the other must be an event (`EBADF`), not the
+  same one, of the same CPU, of the same task for an event of every CPU,
+  with the same clock and `write_backward`, and have a buffer, its own or
+  one it writes to; the event may not map a buffer of its own
+  (`EINVAL`), and -1 (`SET_OUTPUT` alone) makes it write to none. Such an
+  event shares the user page, but a mapping of it is `EBUSY` (`EINVAL`
+  for another size), and when the buffer's last mapping goes, every event
+  that wrote to it is free again. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,

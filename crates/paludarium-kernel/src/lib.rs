@@ -168,9 +168,11 @@ impl Default for AltStack {
 pub(crate) struct CpuAccount {
     base: Option<u64>,
     used: Arc<Usage>,
-    /// The CPU the thread was last seen on, and the thread group's
-    /// [`ThreadGroup::affinity_generation`] then, for its migrations.
-    on: Option<(u32, u64)>,
+    /// The CPU the thread was last seen on, for its migrations, with the
+    /// thread group's [`ThreadGroup::affinity_generation`] when it was the
+    /// lowest its mask allows; `None` for a virtual CPU of `rseq`, which is
+    /// not looked up again.
+    on: Option<(u32, Option<u64>)>,
 }
 impl Clone for CpuAccount {
     fn clone(&self) -> Self {
@@ -246,15 +248,15 @@ pub(crate) fn account_cpu(
     // The CPU it runs on: its virtual one with `rseq`, else the lowest its
     // mask allows (`getcpu`), looked up again only when a mask changed.
     let generation = group.affinity_generation();
-    let cpu = match (on_cpu, account.on) {
-        (Some(cpu), _) => cpu,
-        (None, Some((cpu, seen))) if seen == generation => cpu,
-        (None, _) => group.lowest_cpu(tid),
+    let seen = match (on_cpu, account.on) {
+        (Some(cpu), _) => (cpu, None),
+        (None, Some((cpu, Some(seen)))) if seen == generation => (cpu, Some(seen)),
+        (None, _) => (group.lowest_cpu(tid), Some(generation)),
     };
     if account
         .on
-        .replace((cpu, generation))
-        .is_some_and(|(was, _)| was != cpu)
+        .replace(seen)
+        .is_some_and(|(was, _)| was != seen.0)
     {
         usage.migrations.fetch_add(1, Ordering::SeqCst);
     }

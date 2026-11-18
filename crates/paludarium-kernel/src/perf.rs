@@ -1569,6 +1569,11 @@ mod tests {
         });
         account(&mut state);
         assert_eq!(migrations.values().0, 2);
+        // Without `rseq` again, it is on the lowest CPU its mask allows,
+        // though the mask has not changed since.
+        state.on_cpu = None;
+        account(&mut state);
+        assert_eq!(migrations.values().0, 3);
         // An event of a CPU counts none of these.
         let cpu = of_counter(None, Target::Cpu, Attr::default(), Counter::Faults);
         cpu.enable();

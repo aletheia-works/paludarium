@@ -10650,6 +10650,10 @@ static int gb_inner(void) {
         long wrote = (long)write(fd, "abc", 3);
         long got = (long)read(fd, buf, sizeof buf);
         printf(" write=%ld read=%ld fdlink=%d", wrote, got, gb_fd_names(fd, f));
+        /* A copy shares the open file, which names the same place. */
+        int copy = dup(fd);
+        printf(" dup=%d", copy < 0 ? -errno : gb_fd_names(copy, f));
+        if (copy >= 0) close(copy);
         close(fd);
     }
     long id = 0, parent = 0;

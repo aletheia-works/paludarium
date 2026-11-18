@@ -86,11 +86,12 @@ impl NamespacedFs {
         if directory {
             return Err(Errno::EOPNOTSUPP);
         }
-        // `clone_mnt` keeps the flags' locks of the mount it copies, which
-        // a namespace of a less privileged owner has on all it copied.
-        let root = &entries[Self::root_index(&entries)];
+        // `clone_mnt` keeps the flags' locks of the mount it copies, the
+        // one of `/dev` or `/proc` from start-up, which a namespace of a
+        // less privileged owner has, as all it copied, which stay locked
+        // where they are (`EINVAL` to unmount).
         let mut locks = 0;
-        if root.locked {
+        if entries.iter().any(|e| e.locked) {
             locks |= mount_flags::LOCK_ATIME;
             for (flag, lock) in [
                 (mount_flags::READONLY, mount_flags::LOCK_READONLY),

@@ -4749,7 +4749,6 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             .seek(a[1] as i64, a[2] as u32),
         32 => {
             let d = Descriptor {
-                shown: None,
                 cloexec: false,
                 ..c.files.descriptor(a[0])?
             };
@@ -4769,7 +4768,6 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 return Err(Errno::EBADF);
             }
             let d = Descriptor {
-                shown: None,
                 cloexec: n == 292 && a[2] & 0x80000 != 0,
                 ..c.files.descriptor(u64::from(old))?
             };
@@ -6098,7 +6096,6 @@ mod files_tests {
         f.fill(
             1,
             Descriptor {
-                shown: None,
                 cloexec: true,
                 ..d(&fs, b"/closed")
             },

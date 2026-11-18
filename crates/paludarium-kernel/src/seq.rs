@@ -3,7 +3,8 @@
 //! its [`Records`] for the records of that moment from where the reader
 //! had got to, so a reader sees what is there when it reads, not what was
 //! there when it opened the file. `/proc/sysvipc`'s files are these
-//! ([`crate::ipc::proc_record`]).
+//! ([`crate::ipc::proc_record`]), and so are a process's `maps`, `smaps`
+//! and `io` ([`crate::proc::maps_file`], [`crate::proc::single_file`]).
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_types::Errno;
 use std::sync::{Mutex, PoisonError};
@@ -16,8 +17,8 @@ const BUFFER: usize = 4096;
 pub(crate) trait Records: Send + Sync {
     /// The record at `index` or, with none there, the first after it, and
     /// the index of the one after that (`start` or `next`, then `show`);
-    /// `None` past the last.
-    fn record(&self, index: u64) -> Option<(Vec<u8>, u64)>;
+    /// `None` past the last; an error is what `show` failed with.
+    fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno>;
 }
 
 /// Where a reader has got to, as Linux's `struct seq_file` keeps it.
@@ -34,12 +35,20 @@ struct State {
     buffer: usize,
 }
 
-/// A file served from its [`Records`] as it is read; system-wide, as a
-/// `proc_create` file is: of size 0, and a write is `EIO`, as
-/// `proc_reg_write` gives without a `proc_write`.
+/// A file served from its [`Records`] as it is read, of size 0. A
+/// system-wide one, as a `proc_create` file is, gives `EIO` for a write, as
+/// `proc_reg_write` does without a `proc_write`; one of a process's `/proc`
+/// directory ([`Self::of_task`]) has no write operation at all (`EINVAL`).
 pub(crate) struct SeqFile {
     records: Box<dyn Records>,
     writable: bool,
+    /// What a write on a descriptor open for writing gives.
+    unwritable: Errno,
+    /// What `fstat` shows but the owner.
+    stat: FileStat,
+    /// Its inode's owner, for a file of a process's `/proc` directory
+    /// ([`crate::proc::Owners`]).
+    owner: Option<crate::proc::Owner>,
     state: Mutex<State>,
 }
 impl SeqFile {
@@ -47,6 +56,9 @@ impl SeqFile {
         Self {
             records,
             writable: flags & 3 != 0,
+            unwritable: Errno::EIO,
+            stat: crate::proc::entry_stat(),
+            owner: None,
             state: Mutex::new(State {
                 pending: Vec::new(),
                 from: 0,
@@ -56,50 +68,73 @@ impl SeqFile {
             }),
         }
     }
+    /// A file of a process's `/proc` directory, whose `fstat` shows `stat`
+    /// with `owner`'s user and group, and which has no write operation.
+    pub(crate) fn of_task(
+        records: Box<dyn Records>,
+        flags: u32,
+        stat: FileStat,
+        owner: crate::proc::Owner,
+    ) -> Self {
+        Self {
+            unwritable: Errno::EINVAL,
+            stat,
+            owner: Some(owner),
+            ..Self::open(records, flags)
+        }
+    }
     /// Gathers whole records until `wanted` bytes are there or one more
     /// would fill the buffer, as `seq_read_iter` does; the first always
-    /// goes in, the buffer doubling until it fits.
-    fn gather(&self, state: &mut State, wanted: usize) {
+    /// goes in, the buffer doubling until it fits. A record that fails
+    /// ends the gathering, and fails the read when it is the first.
+    fn gather(&self, state: &mut State, wanted: usize) -> Result<(), Errno> {
         state.pending.clear();
         state.from = 0;
-        while let Some((record, after)) = self.records.record(state.next) {
+        loop {
+            let (record, after) = match self.records.record(state.next) {
+                Ok(Some(record)) => record,
+                Ok(None) => return Ok(()),
+                Err(e) if state.pending.is_empty() => return Err(e),
+                Err(_) => return Ok(()),
+            };
             if state.pending.is_empty() {
                 while record.len() >= state.buffer {
                     state.buffer *= 2;
                 }
             } else if state.pending.len() + record.len() >= state.buffer {
-                break;
+                return Ok(());
             }
             state.pending.extend_from_slice(&record);
             state.next = after;
             if state.pending.len() >= wanted {
-                break;
+                return Ok(());
             }
         }
     }
     /// Starts over and walks to `offset`, as Linux's `traverse`: past the
-    /// end it only reads nothing.
-    fn walk_to(&self, state: &mut State, offset: u64) {
+    /// end it only reads nothing, and a record that fails fails it.
+    fn walk_to(&self, state: &mut State, offset: u64) -> Result<(), Errno> {
         state.pending.clear();
         state.from = 0;
         state.next = 0;
         if offset == 0 {
-            return;
+            return Ok(());
         }
         let mut reached = 0;
-        while let Some((record, after)) = self.records.record(state.next) {
+        while let Some((record, after)) = self.records.record(state.next)? {
             state.next = after;
             let length = record.len() as u64;
             if reached + length > offset {
                 state.from = (offset - reached) as usize;
                 state.pending = record;
-                return;
+                return Ok(());
             }
             reached += length;
             if reached == offset {
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 }
 /// Whether `file` is one of these, whose reads its size of 0 does not
@@ -136,7 +171,11 @@ impl FileHandle for SeqFile {
         }
         // With what was left all read, the next record is gathered now,
         // even when the reader has no room left for it.
-        self.gather(state, buf.len() - copied);
+        if let Err(e) = self.gather(state, buf.len() - copied)
+            && copied == 0
+        {
+            return Err(e);
+        }
         let count = (buf.len() - copied).min(state.pending.len());
         buf[copied..copied + count].copy_from_slice(&state.pending[..count]);
         state.from = count;
@@ -144,17 +183,18 @@ impl FileHandle for SeqFile {
         state.position += copied as u64;
         Ok(copied)
     }
-    /// It has no write operation: `EIO`, or `EBADF` on a descriptor opened
-    /// read-only.
+    /// It has no `proc_write` (`EIO`) or no write operation (`EINVAL`), or
+    /// `EBADF` on a descriptor opened read-only.
     fn write(&self, _: &[u8]) -> Result<usize, Errno> {
         Err(if self.writable {
-            Errno::EIO
+            self.unwritable
         } else {
             Errno::EBADF
         })
     }
     /// As Linux's `seq_lseek`: from the start or the current position,
-    /// never the end, which it does not know.
+    /// never the end, which it does not know. A walk that a record fails
+    /// leaves it at the start.
     fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let base = match whence {
@@ -167,14 +207,21 @@ impl FileHandle for SeqFile {
             return Err(Errno::EINVAL);
         }
         if target != state.position {
-            self.walk_to(&mut state, target);
+            if let Err(e) = self.walk_to(&mut state, target) {
+                self.walk_to(&mut state, 0)?;
+                state.position = 0;
+                return Err(e);
+            }
             state.position = target;
         }
         Ok(target)
     }
     /// Size 0, as Linux's `/proc`: a reader goes by what `read` gives.
     fn stat(&self) -> Result<FileStat, Errno> {
-        Ok(crate::proc::entry_stat())
+        Ok(match &self.owner {
+            Some(owner) => crate::proc::owned(self.stat, owner),
+            None => self.stat,
+        })
     }
     fn truncate(&self, _: u64) -> Result<(), Errno> {
         Err(Errno::EINVAL)
@@ -198,11 +245,16 @@ mod tests {
     /// Records `"<n>\n"` for each number in the shared list, by their
     /// place in it.
     struct Numbers(Arc<Mutex<Vec<u32>>>);
+    /// A list that starts with this fails every record.
+    const FAILS: u32 = u32::MAX;
     impl Records for Numbers {
-        fn record(&self, index: u64) -> Option<(Vec<u8>, u64)> {
+        fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
             let numbers = self.0.lock().unwrap();
-            let number = numbers.get(usize::try_from(index).ok()?)?;
-            Some((format!("{number}\n").into_bytes(), index + 1))
+            if numbers.first() == Some(&FAILS) {
+                return Err(Errno::EACCES);
+            }
+            let number = usize::try_from(index).ok().and_then(|i| numbers.get(i));
+            Ok(number.map(|number| (format!("{number}\n").into_bytes(), index + 1)))
         }
     }
     fn file(numbers: &[u32]) -> (SeqFile, Arc<Mutex<Vec<u32>>>) {
@@ -274,5 +326,34 @@ mod tests {
         let numbers = Arc::new(Mutex::new(Vec::new()));
         let writable = SeqFile::open(Box::new(Numbers(numbers)), 1);
         assert_eq!(writable.write(b"x"), Err(Errno::EIO));
+    }
+
+    #[test]
+    fn a_failing_record_fails_the_read_or_seek_that_reaches_it_first() {
+        let (file, numbers) = file(&[FAILS, 1]);
+        assert_eq!(read(&file, 0), b"");
+        assert_eq!(file.read(&mut [0; 10]), Err(Errno::EACCES));
+        // A walk that fails leaves the file at the start.
+        assert_eq!(file.seek(1, 0), Err(Errno::EACCES));
+        assert_eq!(file.seek(0, 1), Ok(0));
+        numbers.lock().unwrap()[0] = 5;
+        assert_eq!(read(&file, 2), b"5\n");
+        // From the start again, the first record fails again.
+        numbers.lock().unwrap()[0] = FAILS;
+        assert_eq!(file.seek(0, 0), Ok(0));
+        assert_eq!(file.read(&mut [0; 10]), Err(Errno::EACCES));
+    }
+
+    #[test]
+    fn a_file_of_a_process_has_its_owner_and_no_write_operation() {
+        let owner = crate::proc::Owner::default();
+        *owner.lock().unwrap() = (7, 8);
+        let numbers = Arc::new(Mutex::new(vec![1]));
+        let stat = crate::proc::private_stat(0);
+        let file = SeqFile::of_task(Box::new(Numbers(numbers)), 2, stat, owner);
+        let shown = file.stat().unwrap();
+        assert_eq!((shown.uid, shown.gid, shown.mode), (7, 8, stat.mode));
+        assert_eq!(file.write(b"x"), Err(Errno::EINVAL));
+        assert_eq!(read(&file, 10), b"1\n");
     }
 }

@@ -1544,3 +1544,98 @@ fn a_wp_async_write_with_no_room_keeps_a_markers_protection_only() {
     m.write(page(0), b"d").unwrap();
     assert!(!wp(0));
 }
+
+/// A file whose VMAs never merge, as System V shared memory's, which counts
+/// the VMAs opened and closed and who did it.
+#[derive(Default)]
+struct Counted {
+    told: Mutex<Vec<(bool, u32)>>,
+}
+
+impl PageSource for Counted {
+    fn read_at(&self, _: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        buf.fill(0);
+        Ok(buf.len())
+    }
+    fn merges(&self) -> bool {
+        false
+    }
+    fn opened(&self, by: &Actor) {
+        self.told
+            .lock()
+            .unwrap()
+            .push((true, *by.downcast_ref::<u32>().unwrap()));
+    }
+    fn closed(&self, by: &Actor) {
+        self.told
+            .lock()
+            .unwrap()
+            .push((false, *by.downcast_ref::<u32>().unwrap()));
+    }
+}
+
+#[test]
+fn the_vmas_of_a_file_that_never_merges_open_and_close_as_linux_s_do() {
+    let file = Arc::new(Counted::default());
+    let told = || std::mem::take(&mut *file.told.lock().unwrap());
+    let m = AddressSpace::new();
+    let pages = SharedPages::new().with_source(file.clone());
+    let at = m
+        .map_shared(None, 6 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap()
+        .0;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    m.share_pages(page(0), 6 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    drop(pages);
+    // A space with no actor tells nothing.
+    m.protect_shared(page(5), PAGE_SIZE, Prot::READ).unwrap();
+    assert_eq!(told(), []);
+    m.set_actor(Arc::new(1u32));
+    // A split opens the new VMA; an unmap of a whole VMA closes it, and
+    // one of part splits it and closes the part.
+    m.protect_shared(page(4), PAGE_SIZE, Prot::READ).unwrap();
+    assert_eq!(told(), [(true, 1)]);
+    m.unmap_shared(page(5), PAGE_SIZE).unwrap();
+    assert_eq!(told(), [(false, 1)]);
+    m.unmap_shared(page(3), PAGE_SIZE).unwrap();
+    assert_eq!(told(), [(true, 1), (false, 1)]);
+    // mlock and madvise split where they change the flags, and not where
+    // they leave them, nor at the end of a VMA.
+    m.lock(page(0), page(1).0, Some(Lock::OnFault)).unwrap();
+    assert_eq!(told(), [(true, 1)]);
+    m.lock(page(0), page(1).0, Some(Lock::OnFault)).unwrap();
+    m.advise_flags(page(1), page(3).0, FlagAdvice::DontDump)
+        .unwrap();
+    assert_eq!(told(), []);
+    m.advise_flags(page(2), page(3).0, FlagAdvice::DoDump)
+        .unwrap();
+    assert_eq!(told(), [(true, 1)]);
+    let pieces = |m: &AddressSpace| m.shared_fragments().len();
+    assert_eq!(pieces(&m), 4);
+    // A move by mremap closes the old VMA and opens its copy.
+    let moved = m
+        .remap_shared(
+            page(4),
+            PAGE_SIZE,
+            PAGE_SIZE,
+            Remap {
+                may_move: true,
+                fixed: true,
+                new_addr: page(16),
+                ..Remap::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(moved, page(16));
+    assert_eq!(told(), [(false, 1), (true, 1)]);
+    // A fork opens the child's VMAs as the parent; the child's space then
+    // closes them as the child, and the parent's as the parent.
+    let child = m.fork();
+    assert_eq!(told(), [(true, 1); 4]);
+    child.set_actor(Arc::new(2u32));
+    drop(child);
+    assert_eq!(told(), [(false, 2); 4]);
+    drop(m);
+    assert_eq!(told(), [(false, 1); 4]);
+}

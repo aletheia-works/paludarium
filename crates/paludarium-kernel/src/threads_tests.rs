@@ -162,6 +162,96 @@ fn a_signal_sent_before_a_sleep_ends_it_without_waiting() {
         }
     }
 }
+/// Sends the process an ignored SIGURG from its first clock reads: some
+/// after the system call's own drains, before the sleep's.
+struct SendOnClockHost {
+    inner: paludarium_host::testing::RecordingHost,
+    group: std::sync::OnceLock<Arc<ThreadGroup>>,
+    sends: std::sync::atomic::AtomicU32,
+}
+impl paludarium_host::Host for SendOnClockHost {
+    fn clock(&self, clock: paludarium_host::ClockId) -> Result<u64, Errno> {
+        if let Some(group) = self.group.get()
+            && self
+                .sends
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            group
+                .send_process_signal(signals::PendingSignal::user(23, 0))
+                .unwrap();
+        }
+        self.inner.clock(clock)
+    }
+    fn wait_until(
+        &self,
+        clock: paludarium_host::ClockId,
+        deadline: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<paludarium_host::WaitOutcome, Errno> {
+        self.inner.wait_until(clock, deadline, cancel)
+    }
+    fn read_stdin(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        self.inner.read_stdin(buf)
+    }
+    fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno> {
+        self.inner.write_stdout(buf)
+    }
+    fn write_stderr(&self, buf: &[u8]) -> Result<usize, Errno> {
+        self.inner.write_stderr(buf)
+    }
+    fn random_bytes(&self, buf: &mut [u8]) -> Result<(), paludarium_types::Error> {
+        self.inner.random_bytes(buf)
+    }
+}
+/// A signal the process ignores, sent once a thread's system call has
+/// taken its signals in, sets the thread's wake, and the sleep takes the
+/// signal in before it waits: the wake must still be told from an
+/// interruption, and the sleep sleeps on. Linux drops such a signal as it
+/// is sent, and the sleep runs its course.
+#[test]
+fn an_ignored_signal_sent_as_a_sleep_starts_does_not_end_it() {
+    use paludarium_host::{ClockId, Host};
+    for sends in 1..=6 {
+        let host = Arc::new(SendOnClockHost {
+            inner: paludarium_host::testing::RecordingHost::new(),
+            group: std::sync::OnceLock::new(),
+            sends: std::sync::atomic::AtomicU32::new(sends),
+        });
+        // The process's signals come to its first thread's inbox; the
+        // sleeper is another thread, whose wake they set.
+        let first = Arc::new(SignalInbox::default());
+        let mut k = Kernel::new(host.clone()).with_signal_inbox(first.clone());
+        k.group.register(1, first);
+        let inbox = Arc::new(SignalInbox::default());
+        k.cancellation = inbox.wake_token();
+        k.inbox = inbox.clone();
+        k.group.register(2, inbox);
+        assert!(host.group.set(k.group.clone()).is_ok());
+        let mut t = thread();
+        t.tid = 2;
+        let m = memory();
+        m.write(GuestAddr(DATA + 8), &200_000_000u64.to_le_bytes())
+            .unwrap();
+        t.cpu.gpr[reg::RAX] = syscalls::nr::NANOSLEEP;
+        t.cpu.gpr[reg::RDI] = DATA;
+        let next = k.handle(
+            &mut t,
+            &m,
+            ExitReason::Syscall {
+                rip: GuestAddr(0x400000),
+            },
+        );
+        assert!(matches!(next, Next::Resume), "{sends} sends");
+        assert_eq!(t.cpu.gpr[reg::RAX], 0, "{sends} sends");
+        assert_eq!(
+            host.inner.clock(ClockId::Monotonic).unwrap(),
+            200_000_000,
+            "{sends} sends"
+        );
+        assert_eq!(host.sends.load(Ordering::SeqCst), 0, "{sends} sends");
+    }
+}
 fn memory() -> AddressSpace {
     let mem = AddressSpace::new();
     mem.map_shared(

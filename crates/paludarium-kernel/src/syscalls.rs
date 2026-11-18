@@ -952,6 +952,12 @@ fn sleep_until(
         _ => None,
     };
     let _target_sleeping = target.as_deref().map(crate::ThreadGroup::cpu_sleep);
+    // A process signal sent after this count can set the wake the drain
+    // below clears, even one the drain before the wait takes in: a later
+    // count tells that wake from an interruption once the wait ends. The
+    // drain's interruption ends the sleep before it waits.
+    let mut notices = group.process_notices();
+    let mut entry_interrupted = c.inbox.drain(c.process).interrupted;
     // `start` is the clock's time as the sleep began (none for a restart),
     // for the time left once its task has gone.
     loop {
@@ -978,7 +984,7 @@ fn sleep_until(
         // the sleep before it starts, as Linux's do_nanosleep finds it
         // pending when it schedules.
         c.group.expire_timer(c.process, mono_now);
-        let result = if ends_sleep(c.process) || c.group.status().is_some() {
+        let result = if entry_interrupted || ends_sleep(c.process) || c.group.status().is_some() {
             Ok(WaitOutcome::Interrupted)
         } else {
             match clock {
@@ -997,9 +1003,15 @@ fn sleep_until(
                 }
             }
         };
+        // A signal sent to the process wakes every thread; one that ends no
+        // sleep (an ignored one) is no interruption, even when a drain
+        // before the wait took it in.
+        let counted = c.group.process_notices();
         let received = c.inbox.drain(c.process);
-        let sent = c.group.drain_process(c.process);
+        let sent = c.group.drain_process(c.process) | (counted != notices);
+        notices = counted;
         let interrupted = received.interrupted
+            || std::mem::take(&mut entry_interrupted)
             || (!c.inbox.owns_wake(c.cancellation)
                 && c.cancellation.load(std::sync::atomic::Ordering::SeqCst));
         if let Ok(now) = c.host.clock(ClockId::Monotonic) {

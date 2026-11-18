@@ -50,10 +50,7 @@ verified.
   symbolic links. `smaps_rollup` and `[anon:<name>]` names (`PR_SET_VMA`)
   do not exist.
 - **`/proc/self/smaps`, in part**: what it counts comes from the emulator's
-  page entries. `Referenced` is every page counted, a page that `fork`
-  shares counts as shared (and half of it in `Pss`) even after the other
-  process has let it go, while one of shared memory counts as private
-  whoever else maps it. A page of a loaded program's segment counts as
+  page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. A
   file's pages are counted as they are touched, where Linux's fault
   brings in up to 16 pages around one (`fault_around_bytes`), and so are
@@ -62,10 +59,7 @@ verified.
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`).
 - **`/proc/<pid>/pagemap`, in part**: its entries come from the
-  emulator's page entries, as `smaps`'s counts do: a page that a `fork`
-  shared is not exclusive (bit 56) until this process writes it, even
-  after the other has let it go, and a page of shared memory or of a file
-  is exclusive whoever else maps it. A page of a loaded program's segment, or of a
+  emulator's page entries, as `smaps`'s counts do. A page of a loaded program's segment, or of a
   private file mapping, is a file's (bit 61) until the mapping was
   written, not until the page was. A read of a file's page gives only
   that page an entry, where Linux's fault maps the pages around it too
@@ -101,9 +95,7 @@ verified.
   interpreter, a core dump's writes), and a read or write that fails with
   an errno Linux gives both before and in the file's operation (`EINVAL`,
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
-  so not counted. A path that goes on through a link of another process's `fd`
-  (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
-  directory it leads to, as it does for this process's own. Whether
+  so not counted. Whether
   another process's `stat` hides its addresses is decided when the file is
   opened, where Linux decides at each read, and its `exit_code` is 0. In `stat`, page faults, resident memory, the start
   time are 0, so `ps` shows no `RSS`, and its `STIME` and
@@ -127,6 +119,11 @@ verified.
   files from the root their opener had when it opened them, where Linux
   takes the root of whoever reads them, at each read.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
+- **Links into `/dev` and `/proc`, in part**: a symbolic link elsewhere
+  that leads into them is followed to the generated file by `stat`,
+  `statx`, `access` and `open` only. Other calls by path through it
+  (`chdir`, `execve`, `truncate`, `chmod` and the like) give `ENOENT`, and
+  under a root of its own no such link is followed.
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
   no device for it to stand for. A FIFO in a mounted host directory can be
@@ -280,8 +277,9 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes, queues,
-  stacks and bloom filters and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
+- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes,
+  longest-prefix-match tries, queues, stacks and bloom filters and nothing
+  else. Programs are never loaded: there is no verifier and no BPF runs.
   `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
   every program with `EINVAL`, as a kernel built without the program's
   type does; a program Linux would load, or reject in its verifier with
@@ -305,7 +303,10 @@ verified.
   hash keeps the lists of one CPU, which every command uses: on Linux each
   CPU has its own local lists, so where updates of one map come from
   several CPUs, the key that goes when it is full may be another (the
-  differential test pins itself to one CPU). A map's
+  differential test pins itself to one CPU). A trie takes memory only as
+  elements come, as Linux counts it, but Linux also fills a cache of
+  nodes for each CPU when it makes one, so a trie with a value of
+  megabytes may be `ENOMEM` there and is not here. A map's
   memory follows the structure sizes of the test machines' kernel,
   Ubuntu's Linux 7.0, not upstream Linux's: its `struct bpf_map` carries
   the `u32 excl` that Ubuntu took from Linux 7.2 (0fb6c9ed6493, removed in
@@ -548,16 +549,18 @@ verified.
   - A memory policy that `mbind` gives a shared mapping belongs to that
     mapping, where Linux keeps it with the shared memory itself, for every
     process that maps it. `/proc/<pid>/numa_maps` does not exist.
-  - A System V shared memory segment's `shm_atime`, `shm_dtime` and
-    `shm_lpid` change at `shmat` and `shmdt` only, where Linux also changes
-    them when a `fork` copies an attachment, `munmap` or `mprotect` splits
-    one, or a process exits or execs with one. `shmdt` finds the
-    attachments of the segments of the thread's IPC namespace only, where
-    Linux detaches one made before `setns` or `unshare` moved the thread to
-    another. An `mprotect` that gives part
-    of an attachment back the protection of the piece next to it makes a
-    piece of its own, which counts as an attachment, where recent Linux
-    moves the boundary between the two.
+  - `shmdt` finds the attachments of the segments of the thread's IPC
+    namespace only, where Linux detaches one made before `setns` or
+    `unshare` moved the thread to another. An `mprotect`, `mlock`,
+    `madvise`, `mseal` or `userfaultfd` registration that gives part of an
+    attachment back the flags of the piece next to it makes a piece of its
+    own, which counts as an attachment, where recent Linux moves the
+    boundary between the two.
+  - A segment's `shm_lpid` is that of the process that last attached a
+    segment in the address space, or the one a `fork` made it for: a child
+    that shares its parent's memory without being a thread of it
+    (`CLONE_VM`, `vfork`) stamps the segment as that process, where Linux
+    stamps it as the process that acts.
 - **Extended attributes**: a mounted host directory behaves as a file system
   without them, so reading finds none (`ENODATA`) and writing gives `EOPNOTSUPP`.
   In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), so it
@@ -578,7 +581,7 @@ verified.
   file in them), and a bind mount of a descriptor's link to a file no path
   names, give `EOPNOTSUPP`, so a program
   learns they are not supported, as do `open_tree`'s `OPEN_TREE_NAMESPACE`
-  (new in Linux master), `move_mount`'s `MOVE_MOUNT_BENEATH`, `fsmount`'s
+  (new in Linux master), `fsmount`'s
   `FSMOUNT_NAMESPACE` (new in Linux master) and `MOUNT_ATTR_NOSYMFOLLOW` on
   a tmpfs, `fspick` of `/proc` or `/dev`, and an idmapped mount
   (`mount_setattr`'s and `open_tree_attr`'s `MOUNT_ATTR_IDMAP`, after the
@@ -648,9 +651,13 @@ verified.
   Linux's `/` is a locked mount on its rootfs) and `EBUSY` otherwise, and
   `MS_MOVE` of one gives `EOPNOTSUPP`: the lower filesystem shows each
   `--mount` itself, so taking one away would show it again, not the
-  directory under it. After `pivot_root` the old root can go, but a
-  `--mount` under it still stays, and a new root that is a `--mount`
-  shows its files at its old place under `put_old` too, where Linux shows
+  directory under it. For the same reason `move_mount` with
+  `MOVE_MOUNT_BENEATH` beneath one gives `EOPNOTSUPP`. Beneath the
+  namespace's root after `pivot_root` it gives `EINVAL`, as the mount left
+  below the root here takes no mounts, where Linux master mounts the
+  source on that mount. After `pivot_root` the old root can go, but a
+  `--mount` under it still stays, and a new root that is a `--mount` shows
+  its files at its old place under `put_old` too, where Linux shows
   the directory it covered. The generated `/proc` and `/dev` stay at the
   root's `/proc` and `/dev` after `pivot_root`, where Linux's go to
   `put_old` with the old root. A move or a `pivot_root` takes the roots

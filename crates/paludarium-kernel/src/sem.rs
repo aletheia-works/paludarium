@@ -1012,12 +1012,12 @@ struct ProcRecords {
     user: crate::users::UserNs,
 }
 impl crate::seq::Records for ProcRecords {
-    fn record(&self, index: u64) -> Option<(Vec<u8>, u64)> {
+    fn record(&self, index: u64) -> Result<Option<(Vec<u8>, u64)>, Errno> {
         const HEADER: &str = "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n";
         let user = &self.user;
         let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
         let table = self.sets.lock();
-        ipc::proc_record(&table.sets, HEADER, index, |set| {
+        Ok(ipc::proc_record(&table.sets, HEADER, index, |set| {
             let perm = &set.perm;
             format!(
                 "{:10} {:10}  {:4o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",
@@ -1032,7 +1032,7 @@ impl crate::seq::Records for ProcRecords {
                 set.otime,
                 set.ctime,
             )
-        })
+        }))
     }
 }
 

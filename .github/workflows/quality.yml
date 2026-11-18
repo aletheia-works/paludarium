@@ -557,29 +557,47 @@ jobs:
       - name: Terminal target crates line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --lib --test diff_terminal --test command --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|jit-native|harness)/' --fail-under-lines 80 --lcov --output-path target/terminal-coverage.lcov
-          cargo llvm-cov report -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|jit-native|harness)/'
+          cargo llvm-cov report -p paludarium-host -p paludarium-kernel -p paludarium-runtime -p paludarium -p paludarium-harness --ignore-filename-regex 'paludarium-(cpu|decoder|mmu|loader|types|vfs|jit|jit-native|harness)/' | tee target/terminal-coverage-report.txt
         env:
           RUST_TEST_THREADS: "1"
-      # How far the gate is above its floor, so a pull request sees the margin
-      # shrink before the gate fails. The gate and this read the same lines.
-      - name: Terminal line coverage margin
-        if: ${{ !cancelled() && hashFiles('target/terminal-coverage.lcov') != '' }}
-        run: |
-          awk -F: '/^LF:/ { lines += $2 } /^LH:/ { hit += $2 }
-            END {
-              if (lines == 0) { print "Terminal line coverage: no measured lines"; exit }
-              floor = int((lines * 80 + 99) / 100)
-              printf "Terminal line coverage: %d of %d lines (%.2f%%), %d lines above the 80%% floor of %d\n", hit, lines, 100 * hit / lines, hit - floor, floor
-            }' target/terminal-coverage.lcov | tee -a "$GITHUB_STEP_SUMMARY"
       # The CPU and decoder only: the command crate (crates/paludarium), which
       # the harness builds and this run does not exercise, is left out of the
       # report as it is out of the measured lines.
       - name: Encodings CPU and Decoder line coverage >= 80%
         run: |
           cargo llvm-cov --locked -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --lib --test diff_encodings --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|jit-native|runtime|harness)/|crates/paludarium/' --fail-under-lines 80 --lcov --output-path target/encodings-coverage.lcov
-          cargo llvm-cov report -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|jit-native|runtime|harness)/|crates/paludarium/'
+          cargo llvm-cov report -p paludarium-cpu -p paludarium-decoder -p paludarium-harness --ignore-filename-regex 'paludarium-(types|mmu|host|kernel|loader|vfs|jit|jit-native|runtime|harness)/|crates/paludarium/' | tee target/encodings-coverage-report.txt
         env:
           RUST_TEST_THREADS: "1"
+      # The rate each lcov gate compared with its floor, and how far it is
+      # above it, so a pull request sees the margin shrink before a gate
+      # fails. The gate compares llvm-cov's export of the same objects, profile
+      # and ignored files as the lcov, so the two count the same lines; where
+      # a gate prints a table, its TOTAL line is checked against them too.
+      - name: Line coverage of the lcov gates
+        if: ${{ !cancelled() }}
+        run: |
+          for gate in wasm terminal encodings; do
+            lcov="target/$gate-coverage.lcov"
+            [ -f "$lcov" ] || continue
+            read -r hit lines < <(awk -F: '/^LF:/ { lines += $2 } /^LH:/ { hit += $2 } END { print hit + 0, lines + 0 }' "$lcov")
+            if [ "$lines" -eq 0 ]; then
+              echo "- $gate: no measured lines"
+              continue
+            fi
+            floor=$(( (lines * 80 + 99) / 100 ))
+            line=$(awk -v gate="$gate" -v hit="$hit" -v lines="$lines" -v floor="$floor" 'BEGIN { printf "- %s: %d of %d lines (%.2f%%), %d lines above the 80%% floor of %d", gate, hit, lines, 100 * hit / lines, hit - floor, floor }')
+            report="target/$gate-coverage-report.txt"
+            if [ -f "$report" ]; then
+              total=$(sed 's/\x1b\[[0-9;]*m//g' "$report" | awk '$1 == "TOTAL" { print $8 - $9, $8 }')
+              if [ "$total" = "$hit $lines" ]; then
+                line+="; the report's TOTAL counts the same lines"
+              else
+                line+="; the report's TOTAL differs (hit and lines: ${total:-none}), see docs/design/quality.md"
+              fi
+            fi
+            echo "$line"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Retain encodings coverage observations
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

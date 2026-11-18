@@ -1100,10 +1100,14 @@ kernel.
   out in turn as Linux gives them, and `/proc/<pid>/maps` names an attachment
   `/SYSV<key> (deleted)` on device 00:01, with the ID as its inode. The count
   of attachments (`shm_nattch`) counts each VMA that shows the segment, in
-  every process, as Linux does: a `fork` copies them, and `munmap` and an
-  `mprotect` that changes part of one split them, and they never merge.
-  `shmdt` takes every piece of the attachment that `munmap` and `mprotect`
-  left. A segment removed with `IPC_RMID` while attached keeps its ID, is
+  every process, as Linux does: a `fork` copies them, and `munmap`, and an
+  `mprotect`, `mlock`, `madvise`, `mseal` or `userfaultfd` registration
+  that changes part of one, split them, and they never merge. Each VMA that
+  opens (a split, a `fork`'s copy, a move by `mremap`) sets the segment's
+  `shm_atime` and `shm_lpid`, and each one that closes (an unmap, `shmdt`,
+  an exit, an `exec`) its `shm_dtime` and `shm_lpid`, as Linux's
+  `shm_open` and `shm_close` do. `shmdt` takes every piece of the
+  attachment that `munmap` and the others left. A segment removed with `IPC_RMID` while attached keeps its ID, is
   found by no key, and goes at its last detach. `SHM_LOCK` checks the owner
   and `RLIMIT_MEMLOCK` as Linux does, and `SHM_HUGETLB` gives `ENOSYS`, as
   from a kernel built without hugetlbfs.
@@ -1742,7 +1746,16 @@ kernel.
   `MOVE_MOUNT_*_EMPTY_PATH`, and a Landlock domain is `EPERM`. It moves a
   mount as `MS_MOVE` does, or attaches a tree from `open_tree`: only its
   root (`EINVAL`), not onto its own tree (`EINVAL`); a mount of the
-  namespace goes onto no detached tree (`EINVAL`). `MOVE_MOUNT_SET_GROUP`
+  namespace goes onto no detached tree (`EINVAL`). With `MOVE_MOUNT_BENEATH`
+  the source goes beneath the topmost mount at the target, on that mount's
+  parent, and the topmost mount stays on top, on the source's root
+  (`do_move_mount` with `MNT_TREE_BENEATH`): the target must be a mount's
+  root and not the namespace's root (`EINVAL`), then the checks of a move
+  are made on that parent. A source in the topmost mount's tree is `EINVAL`,
+  and so is a move where a shared parent would propagate a copy of the
+  source onto the topmost mount or onto the source at its root
+  (`propagation_would_overmount`). A locked topmost mount's lock passes to the source, so the
+  topmost one may then be unmounted. `MOVE_MOUNT_SET_GROUP`
   puts the target in the source's peer group (`do_set_group`): both mounts'
   roots, of one superblock, the target's root at or below the source's,
   the target private and the source shared or a slave (`EINVAL`).
@@ -2843,7 +2856,10 @@ kernel.
   `/proc/self/fd/3/name` is `name` in the directory descriptor 3 holds, by
   the path that names it now, even after a rename, and `..` goes on from
   there. A removed directory is `ENOENT`, a descriptor that is not open
-  `ENOENT`, and a file that is not a directory `ENOTDIR`. The file calls
+  `ENOENT`, and a file that is not a directory `ENOTDIR`. So is a link in
+  another process's `fd` (`/proc/<pid>/fd/3/name`), for a reader that may
+  look at its descriptors (`EACCES`), as Linux's `proc_fd_link` jumps;
+  once the process has ended, it is `ENOENT`. The file calls
   that take an absolute path do this (`openat2` with `RESOLVE_*` flags in its
   own walk); a path relative to a descriptor of `/proc` or to a working
   directory there, one whose `..` or symbolic link leads into `/proc`,
@@ -2968,13 +2984,14 @@ kernel.
   process's adds those of its threads, of its threads that have ended, and
   of the children it reaped with `wait` (with theirs), as Linux's
   `do_io_accounting` and `wait_task_zombie` add them; a forked child starts
-  from 0, and a zombie keeps its counts. The text is made when it is read
-  (and again after a seek elsewhere), as Linux's `seq_file` makes it, and
-  only then, as Linux's `ptrace_may_access` decides with the reader's
+  from 0, and a zombie keeps its counts. The text is made when it is read,
+  and when an `lseek` goes to another place, as Linux's `seq_file` makes
+  it. Only then, as Linux's `ptrace_may_access` decides with the reader's
   filesystem IDs, may a reader that is not of the process read it
   (`EACCES`), so a descriptor opened while the process was dumpable cannot
   read it once it is not; a thread or process that has been reaped since
-  is `ESRCH`.
+  is `ESRCH`. An `lseek` that fails so leaves the file at the start, as
+  Linux's `seq_lseek` does.
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0
@@ -3205,8 +3222,11 @@ kernel.
   `Locked`, with 0 for huge pages, swap and KSM), `THPeligible` and
   `VmFlags`. A page counts once it has an entry: private memory only read
   shows the zero page, which is not counted, written private memory is
-  anonymous and dirty, and a page that a `fork` shares until it is written
-  is shared, half of it in `Pss`. `VmFlags` names Linux's flags of the VMA
+  anonymous and dirty, and a page that more than one page table entry
+  maps, in this process or any other (one a `fork` shares until it is
+  written, a file's page two mappings show), is shared, with its size
+  divided by that count in `Pss`, as Linux's `smaps_account` takes the
+  precise map count. `VmFlags` names Linux's flags of the VMA
   in Linux's order: the protection and what it may become (`mr`, `mw`, `me`,
   `ms`, without `mw` for a file open only for reading or sealed against
   writes, and without `me` for the rings of AIO and `io_uring` and secret
@@ -3230,8 +3250,11 @@ kernel.
   bit (58); and a page any access gave an entry is present (bit 63). The
   zero page that a read of private anonymous memory shows is only that.
   Any other present page is a file's or shared memory's (bit 61) unless it
-  is anonymous, as `smaps` counts it, and mapped only here (bit 56) unless
-  a `fork` shares it until it is written; one `userfaultfd` write-protects
+  is anonymous, as `smaps` counts it, and mapped exclusively (bit 56) while
+  exactly one page table entry maps it, in this process or any other, as
+  Linux takes a precise map count of 1: a page `fork` shares is mapped
+  twice until either process writes its own copy or lets it go, and a
+  file's page that two mappings show is mapped twice; one `userfaultfd` write-protects
   has bit 57. The frame number (bits 0 to 54) is 0, as Linux gives it to a
   reader without `CAP_SYS_ADMIN`. A read or `pread` must start at a whole
   entry and ask for whole entries (`EINVAL`), and gives nothing from the end
@@ -3258,7 +3281,7 @@ kernel.
   link's `lstat` shows the descriptor's access in its user bits and size 64,
   and `stat` follows it to the file. `readlink` gives Linux's names: the
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
-  for this process's entries), followed by a space and `(deleted)` once
+  for this process's entries, `/proc` for procfs's root), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
   `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]`, `[perf_event]` or `[pidfd]` (an
   anonymous inode's name, which pidfs, from Linux 6.9, still gives),
@@ -3286,7 +3309,10 @@ kernel.
   any symbolic link (`/dev`'s, or a filesystem's): a descriptor whose
   `fstat` (and `fstatat` with `AT_EMPTY_PATH`) and `fstatfs` are the
   link's, whose `readlinkat(fd, "")` reads where it points (`ENOENT` for an
-  `O_PATH` descriptor of anything else), whose own link names the link, and
+  `O_PATH` descriptor of anything else; for a link of a process's `/proc`
+  directory, `fd/<n>`, `exe`, `cwd` or `root`, where it leads at that
+  moment, of the process that opened it and as the reader's root shows it,
+  as Linux's `proc_pid_readlink` reads it), whose own link names the link, and
   that nothing reads through (`EBADF`); an open that follows its own link
   reaches the link (`ELOOP`). A socket gives `ENXIO`, as on Linux, and so
   do an eventfd, an epoll, a timerfd, a signalfd and an inotify instance, whose anonymous inode Linux opens
@@ -3663,8 +3689,9 @@ kernel.
   of the sequence lock. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
-- `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c` and
-  `hashtab.c` have them. Every command first takes the size of its union
+- `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
+  `hashtab.c`, `bpf_lru_list.c`, `lpm_trie.c`, `queue_stack_maps.c` and
+  `bloom_filter.c` have them. Every command first takes the size of its union
   (more than a page, or bytes past Linux master's 168 that are not 0, is
   `E2BIG`) and its fields past the command's own (`CHECK_ATTR`, `EINVAL`).
   `BPF_MAP_CREATE` makes a `BPF_MAP_TYPE_ARRAY` (4-byte keys, every
@@ -3741,7 +3768,25 @@ kernel.
   and `GET_NEXT_KEY` are `EOPNOTSUPP`, `LOOKUP_AND_DELETE_ELEM` and the batch
   commands `ENOTSUPP`; it needs `CAP_BPF`, and takes a 312-byte header and
   its bits in 8-byte words. `map_extra` is in its fdinfo and
-  `bpf_map_info`. See [limitations](./limitations) for what is not there.
+  `bpf_map_info`. A `BPF_MAP_TYPE_LPM_TRIE` holds prefixes, as Linux's
+  `lpm_trie.c`: a key is a prefix length (a `u32`) and 1 to 256 bytes of
+  data, the most significant first, and `LOOKUP_ELEM` gives the value of
+  the longest prefix that holds the key's (`ENOENT` for none, and for a
+  prefix length past the data's bits). Its nodes are Linux's, with
+  intermediate ones where two prefixes part, so `GET_NEXT_KEY` gives the
+  keys in Linux's postorder, more specific prefixes first (from the first
+  for no key, a prefix length past the data's bits, or a key that is no
+  element's), each with the bytes past its prefix that its last update
+  gave. `UPDATE_ELEM` takes `BPF_ANY`, `BPF_NOEXIST` and `BPF_EXIST`
+  (`EINVAL` for any other flag and for a prefix length past the data's
+  bits; a full one is `ENOSPC`), `DELETE_ELEM` takes the exact prefix
+  (`ENOENT` for none), `LOOKUP_AND_DELETE_ELEM` and its batch are
+  `ENOTSUPP`, and the other batch commands follow the next keys. It needs
+  `CAP_BPF` and `BPF_F_NO_PREALLOC`, takes only that, `BPF_F_NUMA_NODE`
+  and the access flags, and a value of 1 byte up to 4 MiB less 280
+  (`EINVAL`). Its memory is 24 bytes, the data and the value for each
+  element, with nothing for its header or intermediate nodes. See
+  [limitations](./limitations) for what is not there.
 - `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
   its order and with its errors, which are the same in the test machines'
   kernel (Ubuntu's Linux 7.0) and in master: the fields past the command
@@ -4555,8 +4600,9 @@ one only with an `--allow-net`.
   default) discards its pending instances in the process and in every thread,
   as Linux's `do_sigaction` does. A blocked signal sent after that stays
   pending. An unblocked ignored signal, such as the `SIGCHLD` of a child that
-  ends, ends no wait in any thread: a blocked `read` stays blocked, as Linux
-  drops the signal as it is sent (`sig_ignored`).
+  ends, ends no wait in any thread: a blocked `read` stays blocked and a
+  `nanosleep` sleeps on, as Linux drops the signal as it is sent
+  (`sig_ignored`).
 
 ## Filesystem
 
@@ -4569,6 +4615,11 @@ one only with an `--allow-net`.
   missing), in memory and in a host directory mounted on Linux or macOS.
   `RENAME_WHITEOUT` needs `CAP_MKNOD` (`EPERM`), and then gives `EINVAL`, as
   on a Linux filesystem without whiteouts.
+- A symbolic link outside `/dev` and `/proc` that leads into them, as
+  `ln -s /dev/null f` makes, or a link to `/dev` on the way, leads to the
+  file the kernel generates there: `stat`, `statx`, `access` and `open`
+  follow it, and a descriptor opened through it names that file in
+  `/proc/self/fd`.
 - `linkat` takes `AT_SYMLINK_FOLLOW`, which follows a symbolic link the old
   path ends in (a dangling one is `ENOENT`) and a link in `/proc/self/fd` to
   the descriptor's file, and `AT_EMPTY_PATH`, which with an empty old path

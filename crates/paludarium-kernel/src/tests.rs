@@ -9425,3 +9425,69 @@ fn a_symbolic_link_leads_into_the_files_the_kernel_generates() {
     assert_eq!(f.ret(21, &[link, 2]), 0);
     assert_eq!(f.ret(21, &[comm, 4]), 0);
 }
+
+/// The calls that take a path go on through a symbolic link into `/dev`
+/// or `/proc` as they do for the path it leads to: `readlink` reads the
+/// generated link, and each other call gives what it gives there.
+#[test]
+fn the_path_calls_go_through_a_link_into_the_generated_files() {
+    let mut f = fixture();
+    let dev = put(&mut f, 0, b"/dev");
+    let ld = put(&mut f, 0x10, b"/tmp/ld");
+    let proc_dir = put(&mut f, 0x20, b"/proc");
+    let lp = put(&mut f, 0x30, b"/tmp/lp");
+    assert_eq!(f.ret(88, &[dev, ld]), 0);
+    assert_eq!(f.ret(88, &[proc_dir, lp]), 0);
+    let name = put(&mut f, 0x40, b"user.x");
+    let other = put(&mut f, 0x60, b"/tmp/other");
+    let root = put(&mut f, 0x80, b"/");
+    let buf = DATA + 0x1000;
+    // `readlink` of a link the kernel generates, through a link to it.
+    let fd_link = put(&mut f, 0x100, b"/tmp/ld/fd");
+    assert_eq!(f.ret(89, &[fd_link, buf, 64]), 13);
+    let mut got = [0; 13];
+    f.mem.read(GuestAddr(buf), &mut got).unwrap();
+    assert_eq!(&got, b"/proc/self/fd");
+    let own = put(&mut f, 0x100, b"/tmp/lp/self");
+    let pid = f.ret(39, &[]).to_string();
+    assert_eq!(f.ret(89, &[own, buf, 64]), pid.len() as u64);
+    let pairs: [(&[u8], &[u8]); 5] = [
+        (b"/dev/null", b"/tmp/ld/null"),
+        (b"/dev/fd", b"/tmp/ld/fd"),
+        (b"/proc/self", b"/tmp/lp/self"),
+        (b"/proc/self/comm", b"/tmp/lp/self/comm"),
+        (b"/dev/nosuch", b"/tmp/ld/nosuch"),
+    ];
+    for (direct, through) in pairs {
+        let mut results = Vec::new();
+        for path in [direct, through] {
+            let p = put(&mut f, 0x100, path);
+            let call = |f: &mut Fixture, n: u64, args: &[u64]| f.ret(n, args) as i64;
+            results.push([
+                call(&mut f, 89, &[p, buf, 64]),
+                call(&mut f, 267, &[(-100i64) as u64, p, buf, 64]),
+                call(&mut f, 80, &[p]),
+                call(&mut f, 80, &[root]),
+                call(&mut f, 90, &[p, 0o666]),
+                call(&mut f, 92, &[p, 0, 0]),
+                call(&mut f, 94, &[p, 0, 0]),
+                call(&mut f, 76, &[p, 0]),
+                call(&mut f, 280, &[(-100i64) as u64, p, 0, 0]),
+                call(&mut f, 235, &[p, 0]),
+                call(&mut f, 191, &[p, name, buf, 0]),
+                call(&mut f, 192, &[p, name, buf, 0]),
+                call(&mut f, 194, &[p, buf, 0]),
+                call(&mut f, 188, &[p, name, name, 1, 0]),
+                call(&mut f, 137, &[p, buf]),
+                call(&mut f, 86, &[p, other]),
+            ]);
+            let _ = f.ret(87, &[other]);
+        }
+        assert_eq!(
+            results[0],
+            results[1],
+            "{}",
+            String::from_utf8_lossy(direct)
+        );
+    }
+}

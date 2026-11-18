@@ -122,10 +122,18 @@ verified.
   takes the root of whoever reads them, at each read.
   `fchroot`, new in Linux master, is not there (`ENOSYS`).
 - **Links into `/dev` and `/proc`, in part**: a symbolic link elsewhere
-  that leads into them is followed to the generated file by `stat`,
-  `statx`, `access` and `open` only. Other calls by path through it
-  (`chdir`, `execve`, `truncate`, `chmod` and the like) give `ENOENT`, and
-  under a root of its own no such link is followed.
+  that leads into them is followed to the generated file by the calls
+  that look a path up, but not by `execve` or by the calls that make or
+  remove a name through it (`mkdir`, `mknod`, `unlink`, `rename` and the
+  like), which give `ENOENT`, and under a root of its own no such link is
+  followed.
+- **Changing the generated files**: `chmod`, `chown`, `truncate`,
+  `utimensat` and `chdir` of `/dev`, `/proc` or a file in them give
+  `ENOENT`, by their own path or through a link, where Linux changes
+  their mode, owner and times (or gives `EPERM` or `EINVAL`) and makes a
+  directory there the working directory; so does `statfs` of `/dev` and
+  its files. A bind mount of a generated directory is a working directory
+  of its own.
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
   no device for it to stand for. A FIFO in a mounted host directory can be

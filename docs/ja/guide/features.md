@@ -4023,9 +4023,11 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   ホワイトアウトのない Linux のファイルシステムと同じく `EINVAL` を返します。
 - `/dev` と `/proc` の外にあって、その中を指すシンボリックリンク
   （`ln -s /dev/null f` が作るものや、途中にある `/dev` へのリンク）は、カーネルが
-  そこに作るファイルにつながります。`stat`、`statx`、`access`、`open` はそれを
-  たどり、それを通して開いたディスクリプタは、`/proc/self/fd` でそのファイルを
-  指します。
+  そこに作るファイルにつながります。`stat`、`statx`、`access`、`open` と、パスを
+  たどるほかの呼び出しは、リンク先のパスと同じようにそこで続きます（`readlink` は
+  `/dev/fd` のようなそこのリンクを読み、`xattr` の呼び出し、`statfs`、`link`、
+  `name_to_handle_at` は、その `*at` の形も、生成されるファイルを扱います）。それを
+  通して開いたディスクリプタは、`/proc/self/fd` でそのファイルを指します。
 - `linkat` は `AT_SYMLINK_FOLLOW` と `AT_EMPTY_PATH` に対応しています。
   `AT_SYMLINK_FOLLOW` は古いパスの最後のシンボリックリンク（リンク先がなければ
   `ENOENT`）と、`/proc/self/fd` のリンクをディスクリプタのファイルまでたどります。

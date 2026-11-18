@@ -1260,7 +1260,24 @@ fn lookup(
         false => p,
     };
     let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
-    Ok((p, found))
+    Ok((linked_generated_path(c, p, follow)?, found))
+}
+/// `p`, or, when the file system has no file there because a symbolic link
+/// on the way leads into `/dev` or `/proc` ([`generated_target`]), the
+/// generated path it leads to, so that a call goes on there as it does
+/// for that path.
+fn linked_generated_path(c: &Context<'_>, p: Vec<u8>, follow: bool) -> Result<Vec<u8>, Errno> {
+    if generated(&p) || p == b"/proc" {
+        return Ok(p);
+    }
+    let Err(error) = c.files.fs().metadata(&p, follow) else {
+        return Ok(p);
+    };
+    match generated_target(c, &p, follow, error) {
+        Ok(target) => Ok(target),
+        Err(e) if e == error => Ok(p),
+        Err(e) => Err(e),
+    }
 }
 /// [`lookup`] of the place `raw` names, a bind mount's own and not the
 /// file it shows, as `mount` and `umount2` find a mount

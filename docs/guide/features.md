@@ -4641,9 +4641,12 @@ one only with an `--allow-net`.
   on a Linux filesystem without whiteouts.
 - A symbolic link outside `/dev` and `/proc` that leads into them, as
   `ln -s /dev/null f` makes, or a link to `/dev` on the way, leads to the
-  file the kernel generates there: `stat`, `statx`, `access` and `open`
-  follow it, and a descriptor opened through it names that file in
-  `/proc/self/fd`.
+  file the kernel generates there: `stat`, `statx`, `access`, `open` and
+  the other calls that look a path up go on there as for the path it
+  leads to (`readlink` reads a link there, as `/dev/fd`, and the `xattr`
+  calls, `statfs`, `link` and `name_to_handle_at`, with their `*at`
+  forms, take the generated file), and a descriptor opened through it
+  names that file in `/proc/self/fd`.
 - `linkat` takes `AT_SYMLINK_FOLLOW`, which follows a symbolic link the old
   path ends in (a dangling one is `ENOENT`) and a link in `/proc/self/fd` to
   the descriptor's file, and `AT_EMPTY_PATH`, which with an empty old path

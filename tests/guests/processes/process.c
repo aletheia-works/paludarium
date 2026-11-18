@@ -25,6 +25,7 @@
 #include <sys/sendfile.h>
 #include <sys/resource.h>
 #include <sys/vfs.h>
+#include <sys/xattr.h>
 #include <sys/prctl.h>
 #include <sys/time.h>
 #include <sys/timex.h>
@@ -11098,8 +11099,31 @@ static int generated_binds_case(void) {
         close(pfd);
     }
     printf("\n");
-    const char *files[] = {"f", "g", "other", "link", "plain", "pdev"};
-    for (unsigned i = 0; i < 6; i++) {
+    /* The path calls through the link to /dev go on as for the path it
+       leads to: readlink reads /dev/fd there, also from a descriptor of
+       the link's directory, the xattr calls and link give /dev/null's
+       errno, and statfs finds /proc through a link to it. */
+    char fdl[300], got[64], other[256], pproc[256], comm[300];
+    snprintf(fdl, sizeof fdl, "%s/fd", pdev);
+    gb_path(other, "other");
+    gb_path(pproc, "pproc");
+    symlink("/proc", pproc);
+    snprintf(comm, sizeof comm, "%s/self/comm", pproc);
+    memset(got, 0, sizeof got);
+    long n = (long)readlink(fdl, got, sizeof got - 1);
+    printf("calls readlink=%d", n < 0 ? -errno : !strcmp(got, "/proc/self/fd"));
+    int dfd = open(pdev, O_PATH | O_DIRECTORY);
+    memset(got, 0, sizeof got);
+    n = dfd < 0 ? -1 : (long)readlinkat(dfd, "fd", got, sizeof got - 1);
+    printf(" readlinkat=%d", n < 0 ? -errno : !strcmp(got, "/proc/self/fd"));
+    if (dfd >= 0) close(dfd);
+    struct statfs fs;
+    printf(" getxattr=%d", getxattr(through, "user.x", got, sizeof got) < 0 ? errno : 0);
+    printf(" setxattr=%d", setxattr(through, "user.x", "1", 1, 0) ? errno : 0);
+    printf(" link=%d", link(through, other) ? errno : 0);
+    printf(" statfs=%d\n", statfs(comm, &fs) ? errno : 0);
+    const char *files[] = {"f", "g", "other", "link", "plain", "pdev", "pproc"};
+    for (unsigned i = 0; i < 7; i++) {
         gb_path(path, files[i]);
         unlink(path);
     }

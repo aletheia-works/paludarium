@@ -1168,26 +1168,13 @@ fn through_magic_links(c: &Context<'_>, mut p: Vec<u8>) -> Result<Vec<u8>, Errno
 /// or `None` when `path` is not one.
 fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, Errno>> {
     const ENOTDIR: Errno = Errno::ENOTDIR;
-    let is_dir = |stat: FileStat| stat.mode & 0o170000 == 0o040000;
     match crate::proc::own_entry(path, c.process.pid) {
-        Some(crate::proc::OwnEntry::Descriptor(n)) => Some((|| {
-            let d = c
-                .files
+        Some(crate::proc::OwnEntry::Descriptor(n)) => Some(
+            c.files
                 .descriptor(u64::from(n))
-                .map_err(|_| Errno::ENOENT)?;
-            let stat = d.file.stat()?;
-            if !is_dir(stat) || d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
-                return Err(ENOTDIR);
-            }
-            let path = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
-            // The path still names the directory, or it was removed.
-            let named = generated(&path)
-                || c.files
-                    .fs()
-                    .metadata(&path, true)
-                    .is_ok_and(|now| now.inode == stat.inode);
-            if named { Ok(path) } else { Err(Errno::ENOENT) }
-        })()),
+                .map_err(|_| Errno::ENOENT)
+                .and_then(|d| descriptor_directory(c, &d)),
+        ),
         Some(
             entry @ (crate::proc::OwnEntry::Cwd
             | crate::proc::OwnEntry::Root
@@ -1203,6 +1190,14 @@ fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, 
         _ => {
             let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
             match task_path.entry {
+                // Another task's descriptor, for a reader that may look at
+                // it, as Linux's `proc_fd_link` jumps to its file.
+                crate::proc::TaskEntry::Descriptor(n) => Some((|| {
+                    let task = tasks::find(c, &task_path)?;
+                    tasks::check(c, &task, task_path.entry)?;
+                    let d = tasks::descriptor(&task, n).ok_or(Errno::ENOENT)?;
+                    descriptor_directory(c, &d)
+                })()),
                 crate::proc::TaskEntry::Exe => Some(Err(ENOTDIR)),
                 crate::proc::TaskEntry::Cwd | crate::proc::TaskEntry::Root => {
                     Some(own_link_target(c, path).ok_or(Errno::ENOENT))
@@ -1211,6 +1206,23 @@ fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, 
             }
         }
     }
+}
+/// The directory descriptor `d` holds, which a path going on through its
+/// link goes on in: by the path that names it now, `ENOENT` once it is
+/// removed, and `ENOTDIR` for a file that is not a directory.
+fn descriptor_directory(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
+    let stat = d.file.stat()?;
+    if stat.mode & 0o170000 != 0o040000 || d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
+        return Err(Errno::ENOTDIR);
+    }
+    let path = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
+    // The path still names the directory, or it was removed.
+    let named = generated(&path)
+        || c.files
+            .fs()
+            .metadata(&path, true)
+            .is_ok_and(|now| now.inode == stat.inode);
+    if named { Ok(path) } else { Err(Errno::ENOENT) }
 }
 /// The NUL-terminated string at `addr`, of at most 4096 bytes.
 pub(crate) fn string(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
@@ -1314,20 +1326,7 @@ pub(crate) fn generated_source(
         Some(Followed::File(_)) => return Err(Errno::EOPNOTSUPP),
         None => p,
     };
-    let p = paludarium_vfs::normalize_path(&p)?;
-    let own = |name: &[u8], to: String| {
-        p.strip_prefix(name)
-            .filter(|rest| rest.is_empty() || rest[0] == b'/')
-            .map(|rest| [to.as_bytes(), rest].concat())
-    };
-    let p = own(b"/proc/self", format!("/proc/{}", c.process.pid))
-        .or_else(|| {
-            own(
-                b"/proc/thread-self",
-                format!("/proc/{}/task/{}", c.process.pid, c.tid),
-            )
-        })
-        .unwrap_or(p);
+    let p = own_proc(c, &paludarium_vfs::normalize_path(&p)?);
     let (stat, device, _) = generated_stat(c, &p, true)?.ok_or(Errno::ENOENT)?;
     let under = |base: &[u8]| {
         p.strip_prefix(base)
@@ -1358,6 +1357,82 @@ pub(crate) fn generated_source(
         stat,
         flags,
     })
+}
+/// The normalized path `p` with `/proc/self` and `/proc/thread-self`
+/// taken as the links they are, to the caller's own directories.
+fn own_proc(c: &Context<'_>, p: &[u8]) -> Vec<u8> {
+    let own = |name: &[u8], to: String| {
+        p.strip_prefix(name)
+            .filter(|rest| rest.is_empty() || rest[0] == b'/')
+            .map(|rest| [to.as_bytes(), rest].concat())
+    };
+    own(b"/proc/self", format!("/proc/{}", c.process.pid))
+        .or_else(|| {
+            own(
+                b"/proc/thread-self",
+                format!("/proc/{}/task/{}", c.process.pid, c.tid),
+            )
+        })
+        .unwrap_or_else(|| p.to_vec())
+}
+/// [`Files::through_generated`], with `/proc/self` and `/proc/thread-self`
+/// on the way followed ([`own_proc`]), as Linux's walk follows them: the
+/// generated file's path, and its place, through the bind mount while it
+/// is still below the mount's source (`/tmp/p/<pid>` for `/tmp/p/self`
+/// with `/proc` bound on `/tmp/p`), else where the link leads.
+pub(crate) fn generated_place(
+    c: &Context<'_>,
+    p: &[u8],
+    follow: bool,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (file, shown) = c.files.through_generated(p, follow)?;
+    // A last `self` or `thread-self` not followed stays the link it is.
+    if !follow && (file == b"/proc/self" || file == b"/proc/thread-self") {
+        return Some((file, shown));
+    }
+    let real = own_proc(c, &file);
+    if real == file {
+        return Some((file, shown));
+    }
+    // The names the two share at their ends are the path below the
+    // mount's root, so what is before them is the source and the place.
+    let parts = |p: &[u8]| -> Vec<Vec<u8>> {
+        p.split(|b| *b == b'/')
+            .filter(|n| !n.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let (a, b) = (parts(&file), parts(&shown));
+    let common = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let join = |names: &[Vec<u8>]| -> Vec<u8> {
+        let mut out = Vec::new();
+        for n in names {
+            out.push(b'/');
+            out.extend_from_slice(n);
+        }
+        if out.is_empty() {
+            out.push(b'/');
+        }
+        out
+    };
+    let (source, place) = (join(&a[..a.len() - common]), join(&b[..b.len() - common]));
+    let below = if source == b"/" {
+        Some(&real[..])
+    } else {
+        real.strip_prefix(&source[..])
+            .filter(|rest| rest.is_empty() || rest[0] == b'/')
+    };
+    let shown = match below {
+        Some(rest) if place == b"/" && !rest.is_empty() => rest.to_vec(),
+        Some(rest) => [&place[..], rest].concat(),
+        None => real.clone(),
+    };
+    Some((real, shown))
 }
 /// [`mount_target`] of the path `raw`, as `kern_path` finds a bind mount's
 /// source.
@@ -1543,9 +1618,17 @@ fn access(c: &Context<'_>, dir: u64, ptr: u64, mode: u64, flags: u64) -> Result<
     } else {
         let p = c.files.path(dir, raw.clone())?;
         crate::permissions::search(c.files, &creds, dir, &raw, follow)?;
-        let stat = match generated_stat(c, &p, follow)? {
-            Some((stat, ..)) => stat,
-            None => c.files.fs().metadata(&p, follow)?,
+        // A link on the way to a generated file is checked there, on its
+        // own mount.
+        let (stat, p) = match generated_stat(c, &p, follow)? {
+            Some((stat, ..)) => (stat, p),
+            None => match c.files.fs().metadata(&p, follow) {
+                Err(e) => {
+                    let (stat, _, _, target) = linked_generated(c, &p, follow, e)?;
+                    (stat, target)
+                }
+                Ok(stat) => (stat, p),
+            },
         };
         (stat, p, follow)
     };
@@ -3656,13 +3739,19 @@ fn statx(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         let (p, _) = lookup(c, dir, raw, follow)?;
         match generated_stat(c, &p, follow)? {
             Some((stat, device, block_size)) => (stat, device, block_size, false, Vec::new()),
-            None => (
-                c.files.fs().metadata(&p, follow)?,
-                device(c, &p),
-                path_block_size(&p),
-                c.files.fs().with_attributes(&p, follow, noop).is_ok(),
-                p,
-            ),
+            None => match c.files.fs().metadata(&p, follow) {
+                Err(e) => {
+                    let (stat, device, block_size, _) = linked_generated(c, &p, follow, e)?;
+                    (stat, device, block_size, false, Vec::new())
+                }
+                Ok(s) => (
+                    s,
+                    device(c, &p),
+                    path_block_size(&p),
+                    c.files.fs().with_attributes(&p, follow, noop).is_ok(),
+                    p,
+                ),
+            },
         }
     };
     let attributes = u64::from(s.attributes & STATX_ATTR_FLAGS);
@@ -4010,11 +4099,11 @@ pub(crate) fn named(
         ),
         None => match generated_stat(c, p, follow)? {
             Some((stat, device, _)) => (stat, device, path_kind(c, p, follow)),
-            None => (
-                c.files.fs().metadata(p, follow)?,
-                watched_device(c, p, follow),
-                path_kind(c, p, follow),
-            ),
+            None => match c.files.fs().metadata(p, follow) {
+                // A link on the way to a file the kernel generates.
+                Err(e) => return named(c, &generated_target(c, p, follow, e)?, follow),
+                Ok(stat) => (stat, watched_device(c, p, follow), path_kind(c, p, follow)),
+            },
         },
     })
 }
@@ -4729,13 +4818,13 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if let Some((generated, device, block_size)) = generated_stat(c, &p, follow)? {
                 return stat(c, out, generated, device, block_size);
             }
-            stat(
-                c,
-                out,
-                c.files.fs().metadata(&p, follow)?,
-                device(c, &p),
-                path_block_size(&p),
-            )
+            match c.files.fs().metadata(&p, follow) {
+                Err(e) => {
+                    let (generated, device, block_size, _) = linked_generated(c, &p, follow, e)?;
+                    stat(c, out, generated, device, block_size)
+                }
+                Ok(s) => stat(c, out, s, device(c, &p), path_block_size(&p)),
+            }
         }
         5 => {
             let d = c.files.descriptor(a[0])?;
@@ -4973,8 +5062,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let p = if n == 80 {
                 let raw = path(c, a[0])?;
                 let named = c.files.named((-100i32) as u64, raw.clone())?;
-                let p = lookup(c, (-100i32) as u64, raw, true)?.0;
-                match c.files.through_generated(&named, true) {
+                match generated_place(c, &named, true) {
                     Some((file, shown)) => {
                         let (stat, ..) = generated_stat(c, &file, true)?.ok_or(Errno::ENOENT)?;
                         if stat.mode & 0o170000 != 0o040000 {
@@ -4982,21 +5070,27 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         }
                         shown
                     }
-                    None => match followed(c, &p, true)? {
-                        // A symbolic link an `O_PATH | O_NOFOLLOW` descriptor
-                        // holds is not followed again: it is no directory.
-                        Some(Followed::Path { path, follow }) => {
-                            if c.files.fs().metadata(&path, follow)?.mode & 0o170000 != 0o040000 {
+                    None => {
+                        let p = lookup(c, (-100i32) as u64, raw, true)?.0;
+                        match followed(c, &p, true)? {
+                            // A symbolic link an `O_PATH | O_NOFOLLOW` descriptor
+                            // holds is not followed again: it is no directory.
+                            Some(Followed::Path { path, follow }) => {
+                                if c.files.fs().metadata(&path, follow)?.mode & 0o170000 != 0o040000
+                                {
+                                    return Err(Errno::ENOTDIR);
+                                }
+                                path
+                            }
+                            Some(Followed::File(d))
+                                if d.file.stat()?.mode & 0o170000 != 0o040000 =>
+                            {
                                 return Err(Errno::ENOTDIR);
                             }
-                            path
+                            Some(Followed::File(d)) => d.path,
+                            None => p,
                         }
-                        Some(Followed::File(d)) if d.file.stat()?.mode & 0o170000 != 0o040000 => {
-                            return Err(Errno::ENOTDIR);
-                        }
-                        Some(Followed::File(d)) => d.path,
-                        None => p,
-                    },
+                    }
                 }
             } else {
                 let d = c.files.descriptor(a[0])?;
@@ -6251,7 +6345,7 @@ pub(crate) fn open_at(
     // A file the kernel generates, through a bind mount of it: its own
     // path, and the place its link in `/proc/self/fd` names.
     const O_NOFOLLOW: u32 = 0o400000;
-    let (p, mut shown) = match c.files.through_generated(&p, flags & O_NOFOLLOW == 0) {
+    let (p, mut shown) = match generated_place(c, &p, flags & O_NOFOLLOW == 0) {
         Some((file, shown)) => (file, Some(shown)),
         None => (p, None),
     };
@@ -6262,7 +6356,7 @@ pub(crate) fn open_at(
     } else {
         // Its end, a place too, leads to the generated file as above.
         let p = resolve_scoped(c, dir, &raw, flags, resolve)?;
-        let p = match c.files.through_generated(&p, flags & O_NOFOLLOW == 0) {
+        let p = match generated_place(c, &p, flags & O_NOFOLLOW == 0) {
             Some((file, place)) => {
                 shown = Some(place);
                 file
@@ -7042,7 +7136,14 @@ fn open_path(
             let key = (device(c, p), node.inode);
             return Ok((crate::fifo::open(c, p, key, &node, flags)?, p.to_vec()));
         }
-        let file = c.files.fs().open(p, flags, mode & !c.files.umask())?;
+        let file = match c.files.fs().open(p, flags, mode & !c.files.umask()) {
+            // A link on the way to a file the kernel generates.
+            Err(e) => {
+                let target = generated_target(c, p, flags & O_NOFOLLOW == 0, e)?;
+                return open_path(c, &target, flags, mode);
+            }
+            Ok(file) => file,
+        };
         const O_TRUNC: u32 = 0o1000;
         if flags & O_TRUNC != 0 && flags & O_PATH == 0 {
             crate::permissions::remove_set_ids(&c.process.credentials, &*file);
@@ -7338,6 +7439,107 @@ pub(crate) fn resolved_in(fs: &dyn HostFs, path: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(join(&parts))
+}
+/// The `stat` of the generated file a symbolic link on the way of `p` leads
+/// to ([`into_generated`]) when the file system's own lookup of `p` failed
+/// with `error`; else that error.
+fn linked_generated(
+    c: &Context<'_>,
+    p: &[u8],
+    follow: bool,
+    error: Errno,
+) -> Result<(FileStat, u64, u32, Vec<u8>), Errno> {
+    let target = generated_target(c, p, follow, error)?;
+    let (stat, device, block_size) = generated_stat(c, &target, follow)?.ok_or(error)?;
+    Ok((stat, device, block_size, target))
+}
+/// The generated path a symbolic link on the way of `p` leads to
+/// ([`into_generated`]) when the file system's own lookup of `p` failed
+/// with `error` (else that error), which, for a path ending in `/`, must be
+/// a directory (`ENOTDIR`), as a trailing slash asks of its last component.
+fn generated_target(
+    c: &Context<'_>,
+    p: &[u8],
+    follow: bool,
+    error: Errno,
+) -> Result<Vec<u8>, Errno> {
+    if error != Errno::ENOENT && error != Errno::ENOTDIR {
+        return Err(error);
+    }
+    let target = into_generated(&*c.files.fs(), p, follow).ok_or(error)?;
+    if p.ends_with(b"/") {
+        let (stat, ..) = generated_stat(c, &target, true)?.ok_or(error)?;
+        if stat.mode & 0o170000 != 0o040000 {
+            return Err(Errno::ENOTDIR);
+        }
+    }
+    Ok(target)
+}
+/// Where `path` leads when a symbolic link on the way (its last one only
+/// with `follow`) goes into `/dev` or `/proc`, which no file system here
+/// holds: the generated path, with the rest of `path` after it, for the
+/// kernel's own walk to take on (its links, as `/proc/self`). `None` when
+/// the walk stays out of them, or a name on the way is missing.
+fn into_generated(fs: &dyn HostFs, path: &[u8], follow: bool) -> Option<Vec<u8>> {
+    const SYMLINK: u32 = 0o120000;
+    if fs.root() != b"/" {
+        return None;
+    }
+    let inside = |p: &[u8]| generated(p) || p == b"/proc" || p.starts_with(b"/dev/");
+    let trailing = path.ends_with(b"/");
+    let mut pending: Vec<Vec<u8>> = path
+        .split(|&b| b == b'/')
+        .rev()
+        .map(<[u8]>::to_vec)
+        .collect();
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut links = 0;
+    let mut jumped = false;
+    let join = |parts: &[Vec<u8>]| -> Vec<u8> {
+        let joined: Vec<u8> = parts.iter().flat_map(|p| [&b"/"[..], p].concat()).collect();
+        if joined.is_empty() {
+            b"/".to_vec()
+        } else {
+            joined
+        }
+    };
+    while let Some(part) = pending.pop() {
+        match &part[..] {
+            b"" | b"." => continue,
+            b".." => {
+                parts.pop();
+                continue;
+            }
+            _ => {}
+        }
+        parts.push(part);
+        let candidate = join(&parts);
+        if jumped && inside(&candidate) {
+            let rest: Vec<u8> = pending
+                .iter()
+                .rev()
+                .filter(|p| !p.is_empty())
+                .flat_map(|p| [&b"/"[..], p].concat())
+                .collect();
+            return Some([candidate, rest].concat());
+        }
+        // A trailing slash follows the last link too.
+        let last = pending.iter().all(|p| p == b".") && !trailing;
+        if fs.metadata(&candidate, false).ok()?.mode & 0o170000 == SYMLINK && (follow || !last) {
+            links += 1;
+            if links > 40 {
+                return None;
+            }
+            let target = fs.readlink(&candidate).ok()?;
+            parts.pop();
+            if target.first() == Some(&b'/') {
+                parts.clear();
+            }
+            jumped = true;
+            pending.extend(target.split(|&b| b == b'/').rev().map(<[u8]>::to_vec));
+        }
+    }
+    None
 }
 /// The path that still names the file of `d` (its recorded path resolved),
 /// or `None` once nothing does.

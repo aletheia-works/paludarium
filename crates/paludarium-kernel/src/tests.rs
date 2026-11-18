@@ -9306,10 +9306,122 @@ fn a_bind_mount_of_a_generated_directory_shows_its_files() {
     let fd = f.ret(257, &[(-100i64) as u64, relative, 0, 0]);
     assert!(fd < 1024);
     assert_eq!(f.ret(3, &[fd]), 0);
+    // `self` there is the link it is: the working directory is the
+    // process's own directory, through the bind mount.
+    let own = put(&mut f, 0xe0, b"/tmp/p/self");
+    assert_eq!(f.ret(80, &[own]), 0);
+    let expected = format!("/tmp/p/{}\0", f.ret(39, &[]));
+    let got = f.ret(79, &[cwd, 64]);
+    assert_eq!(got, expected.len() as u64);
+    let mut name = vec![0; expected.len()];
+    f.mem.read(GuestAddr(cwd), &mut name).unwrap();
+    assert_eq!(name, expected.as_bytes());
+    // `thread-self` is the thread's own directory there.
+    let own_thread = put(&mut f, 0x300, b"/tmp/p/thread-self");
+    assert_eq!(f.ret(80, &[own_thread]), 0);
+    let pid = f.ret(39, &[]);
+    let expected = format!("/tmp/p/{pid}/task/{}\0", f.ret(186, &[]));
+    assert_eq!(f.ret(79, &[cwd, 64]), expected.len() as u64);
+    let mut name = vec![0; expected.len()];
+    f.mem.read(GuestAddr(cwd), &mut name).unwrap();
+    assert_eq!(name, expected.as_bytes());
+    assert_eq!(f.ret(80, &[p]), 0);
+    // A descriptor opened there names the same place in /proc/self/fd,
+    // with `open` and with `openat2` and `RESOLVE_NO_SYMLINKS`.
+    let how = DATA + 0x340;
+    f.mem.write(GuestAddr(how), &[0u8; 24]).unwrap();
+    f.mem
+        .write(GuestAddr(how), &0o200000u64.to_le_bytes())
+        .unwrap();
+    f.mem
+        .write(GuestAddr(how + 16), &4u64.to_le_bytes())
+        .unwrap();
+    for fd in [
+        f.ret(2, &[own, 0o200000, 0]),
+        f.ret(437, &[(-100i64) as u64, own, how, 24]),
+    ] {
+        assert!(fd < 1024);
+        let link = put(&mut f, 0x380, format!("/proc/self/fd/{fd}").as_bytes());
+        let got = f.ret(89, &[link, cwd, 64]);
+        let mut name = vec![0; got as usize];
+        f.mem.read(GuestAddr(cwd), &mut name).unwrap();
+        assert_eq!(name, format!("/tmp/p/{pid}").as_bytes());
+        assert_eq!(f.ret(3, &[fd]), 0);
+    }
+    // Not followed at the end, `self` is the link, as `/proc/self` is.
+    let unbound = put(&mut f, 0x3c0, b"/proc/self");
+    for path in [own, unbound] {
+        assert_eq!(f.ret(2, &[path, 0o400000, 0]), errno(Errno(40)));
+    }
     // In use while it is the working directory.
     assert_eq!(f.ret(166, &[p, 0]), errno(Errno(16)));
     assert_eq!(f.ret(80, &[root]), 0);
     assert_eq!(f.ret(166, &[p, 0]), 0);
     assert_eq!(f.ret(166, &[d, 0]), 0);
     assert_eq!(f.ret(2, &[null, 2, 0]), errno(Errno::ENOENT));
+}
+
+#[test]
+fn a_symbolic_link_leads_into_the_files_the_kernel_generates() {
+    let mut f = fixture();
+    let null = put(&mut f, 0, b"/dev/null");
+    let link = put(&mut f, 0x20, b"/tmp/l");
+    let dev = put(&mut f, 0x40, b"/dev");
+    let to_dev = put(&mut f, 0x60, b"/tmp/ld");
+    let through = put(&mut f, 0x80, b"/tmp/ld/null");
+    let nowhere = put(&mut f, 0xa0, b"/nosuch");
+    let dangling = put(&mut f, 0xc0, b"/tmp/x");
+    let relative = put(&mut f, 0xe0, b"../dev/null");
+    let up = put(&mut f, 0x400, b"/tmp/r");
+    assert_eq!(f.ret(88, &[null, link]), 0);
+    assert_eq!(f.ret(88, &[dev, to_dev]), 0);
+    assert_eq!(f.ret(88, &[nowhere, dangling]), 0);
+    assert_eq!(f.ret(88, &[relative, up]), 0);
+    // `stat` follows each to the device, `lstat` stays on the link.
+    for path in [link, through, up] {
+        assert_eq!(
+            stat_mode_and_mtime(&mut f, path, false).0 & 0o170000,
+            0o020000
+        );
+    }
+    assert_eq!(
+        stat_mode_and_mtime(&mut f, link, true).0 & 0o170000,
+        0o120000
+    );
+    // `open` writes to the device, and a link to nothing is still ENOENT.
+    let fd = f.ret(2, &[through, 1, 0]);
+    assert!(fd < 1024);
+    assert_eq!(f.ret(1, &[fd, DATA + 0x200, 3]), 3);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    assert_eq!(f.ret(2, &[link, 0o400001, 0]), errno(Errno(40)));
+    assert_eq!(f.ret(4, &[dangling, DATA + 0x300]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(2, &[dangling, 0, 0]), errno(Errno::ENOENT));
+    // A trailing slash asks for a directory: ENOTDIR for the device, and
+    // `/dev` itself through its link.
+    let slashed = put(&mut f, 0x420, b"/tmp/l/");
+    let dev_slashed = put(&mut f, 0x440, b"/tmp/ld/");
+    assert_eq!(f.ret(4, &[slashed, DATA + 0x300]), errno(Errno::ENOTDIR));
+    assert_eq!(f.ret(2, &[slashed, 0, 0]), errno(Errno::ENOTDIR));
+    for path in [to_dev, dev_slashed] {
+        assert_eq!(
+            stat_mode_and_mtime(&mut f, path, false).0 & 0o170000,
+            0o040000
+        );
+    }
+    // `/proc/self` through a link to `/proc`, and `statx` and `access`.
+    let proc_dir = put(&mut f, 0x460, b"/proc");
+    let to_proc = put(&mut f, 0x480, b"/tmp/lp");
+    let comm = put(&mut f, 0x4a0, b"/tmp/lp/self/comm");
+    assert_eq!(f.ret(88, &[proc_dir, to_proc]), 0);
+    assert_eq!(
+        stat_mode_and_mtime(&mut f, comm, false).0 & 0o170000,
+        0o100000
+    );
+    let statx = DATA + 0x500;
+    assert_eq!(f.ret(332, &[(-100i64) as u64, link, 0, 0x7ff, statx]), 0);
+    let mut mode = [0u8; 2];
+    f.mem.read(GuestAddr(statx + 28), &mut mode).unwrap();
+    assert_eq!(u32::from(u16::from_le_bytes(mode)) & 0o170000, 0o020000);
+    assert_eq!(f.ret(21, &[link, 2]), 0);
+    assert_eq!(f.ret(21, &[comm, 4]), 0);
 }

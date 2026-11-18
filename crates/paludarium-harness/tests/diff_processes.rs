@@ -153,8 +153,9 @@ mod linux {
             // read a process's maps, descriptors, auxv, pagemap and io as
             // other users or make it another user's, the proc-fd-links case,
             // which reads links from a chroot of its own mount namespace,
-            // the proc-personality-wchan case, which reads them as other
-            // users, and the pagemap
+            // the proc-other-fd-paths case, which goes through a process's
+            // descriptors as another user, the proc-personality-wchan case,
+            // which reads them as other users, and the pagemap
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, as the emulator's guest starts as root.
@@ -179,6 +180,7 @@ mod linux {
                     | "proc-other-pagemap"
                     | "proc-owner-rename"
                     | "proc-io"
+                    | "proc-other-fd-paths"
                     | "proc-personality-wchan"
                     | "proc-fd-links"
                     | "dynamic-exec"
@@ -301,6 +303,7 @@ mod linux {
                     | "personality-layout"
                     | "pagemap"
                     | "clear-refs"
+                    | "map-count"
                     | "proc-owners"
                     | "admin"
                     | "mount-flags"
@@ -691,6 +694,7 @@ mod linux {
         processes_mincore => ("mincore","process"),
         processes_pagemap => ("pagemap","process"),
         processes_clear_refs => ("clear-refs","process"),
+        processes_map_count => ("map-count","process"),
         processes_proc_owners => ("proc-owners","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),
@@ -816,6 +820,7 @@ mod linux {
         processes_mount_flags => ("mount-flags","process"),
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),
+        processes_beneath => ("beneath","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_proc_other_maps => ("proc-other-maps","process"),
         processes_proc_other_fds => ("proc-other-fds","process"),
@@ -823,6 +828,7 @@ mod linux {
         processes_proc_other_pagemap => ("proc-other-pagemap","process"),
         processes_proc_owner_rename => ("proc-owner-rename","process"),
         processes_proc_io => ("proc-io","process"),
+        processes_proc_other_fd_paths => ("proc-other-fd-paths","process"),
         processes_proc_personality_wchan => ("proc-personality-wchan","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),

@@ -10656,6 +10656,16 @@ static int gb_inner(void) {
         if (copy >= 0) close(copy);
         close(fd);
     }
+    /* openat2 with RESOLVE_* flags walks to the place, which leads to the
+       device too. */
+    struct { unsigned long long flags, mode, resolve; } how = {O_RDWR, 0, 0x04 /* RESOLVE_NO_SYMLINKS */};
+    fd = (int)syscall(437 /* openat2 */, AT_FDCWD, f, &how, sizeof how);
+    printf(" openat2=%d", fd < 0 ? errno : 0);
+    if (fd >= 0) {
+        long wrote = (long)write(fd, "abc", 3);
+        printf(" write=%ld fdlink=%d", wrote, gb_fd_names(fd, f));
+        close(fd);
+    }
     long id = 0, parent = 0;
     char root[1024] = "", kind[64] = "";
     int lines = bd_line(f, &id, &parent, root, kind);

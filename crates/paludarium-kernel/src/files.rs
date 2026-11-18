@@ -6215,8 +6215,18 @@ pub(crate) fn open_at(
     let (dir, raw, p) = if resolve == 0 {
         (dir, raw, p)
     } else {
+        // Its end, a place too, leads to the generated file as above.
         let p = resolve_scoped(c, dir, &raw, flags, resolve)?;
-        shown = None;
+        let p = match c.files.through_generated(&p, flags & O_NOFOLLOW == 0) {
+            Some((file, place)) => {
+                shown = Some(place);
+                file
+            }
+            None => {
+                shown = None;
+                p
+            }
+        };
         ((-100i32) as u64, p.clone(), p)
     };
     // Linux takes the descriptor before it opens, so with none free

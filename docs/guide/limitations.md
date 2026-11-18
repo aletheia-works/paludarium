@@ -116,8 +116,8 @@ verified.
   root. `mount` mounts no `proc` filesystem and nothing on `/proc` or
   `/dev`, so the new root's `/proc` or `/dev` shows the generated files
   only through a bind mount of `/proc` or `/dev` (or a directory in them)
-  made onto it before. In a path that climbs above the root as written, `..` is
-  taken from the names as written, where Linux takes a `..` after a
+  made onto it before. In a path that climbs above the root as written,
+  `..` is taken from the names as written, where Linux takes a `..` after a
   symbolic link from the link's target. `maps` and `smaps` in `/proc` name
   files from the root their opener had when it opened them, where Linux
   takes the root of whoever reads them, at each read.

@@ -443,6 +443,15 @@ fn a_bind_mount_of_a_generated_file_keeps_its_locks_in_a_locked_copy() {
     );
     fs.bind_generated(null(), b"/tmp/f").unwrap();
     assert_eq!(fs.target(b"/tmp/f").unwrap().locks, 0);
+    // The locks are those of the start-up `/dev`, locked in the copy
+    // whatever mount the target is on: a new, unlocked one too.
+    locked.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    locked.open(b"/tmp/m/f", 66, 0o600).unwrap();
+    locked.bind_generated(null(), b"/tmp/m/f").unwrap();
+    assert_eq!(
+        locked.target(b"/tmp/m/f").unwrap().locks,
+        LOCK_ATIME | LOCK_NOSUID
+    );
 }
 
 #[test]

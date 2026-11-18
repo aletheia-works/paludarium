@@ -6580,7 +6580,10 @@ mod proc_other {
         let (mut k, mut t, m) = setup();
         // The program the child keeps from its parent at the fork.
         k.group.set_program(&program());
-        let (_child, ct, _cm) = fork(&mut k, &mut t, &m);
+        let (child, ct, _cm) = fork(&mut k, &mut t, &m);
+        // In a system call, where it waits: `wchan` is 1 for a reader that
+        // may see it.
+        child.inbox.set_in_call(true);
         let path = format!("/proc/{}/stat", ct.tid);
         let line = read(&mut k, &mut t, &m, &path).unwrap();
         assert!(line.starts_with(format!("{} (", ct.tid).as_bytes()));
@@ -6593,6 +6596,7 @@ mod proc_other {
         assert_eq!(seen[1], t.tid.to_string());
         assert_eq!(&seen[23..26], ["4198400", "4203333", "2147479552"]);
         assert_eq!(&seen[42..44], ["4206592", "4206848"]);
+        assert_eq!(seen[32], "1");
         // A reader of another user that ptrace_may_access refuses: 1 for
         // start_code and end_code, 0 for start_stack, wchan and every field
         // from start_data on.
@@ -6635,8 +6639,10 @@ mod proc_other {
         let (mut child, ct, cm) = fork(&mut k, &mut t, &m);
         finish(&mut child, &ct, &cm, ExitStatus::Exited(0));
         let seen = fields(&read(&mut k, &mut t, &m, &format!("/proc/{}/stat", ct.tid)).unwrap());
-        // State Z, no mappings (vsize), and no code without memory.
+        // State Z, no mappings (vsize), and no code without memory; it is
+        // not running, so `wchan` is 1 for a reader that may see it.
         assert_eq!(seen[0], "Z");
+        assert_eq!(seen[32], "1");
         assert_eq!(seen[20], "0");
         assert_eq!(&seen[23..26], ["0", "0", "0"]);
         assert!(seen[42..49].iter().all(|field| field == "0"), "{seen:?}");

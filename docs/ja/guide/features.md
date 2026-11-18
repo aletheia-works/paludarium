@@ -2816,7 +2816,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `lstat` は、ユーザーのビットでディスクリプタのアクセスを示し、大きさは 64 です。`stat`
   はリンクをたどってファイルを示します。`readlink` は Linux と同じ名前を返します。
   `.`、`..` とシンボリックリンクを解決したファイルのパス（このプロセスのものは
-  `/proc/<pid>/…`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに
+  `/proc/<pid>/…`、procfs のルートは `/proc`）で、どこからも指されなくなれば空白と `(deleted)` が付きます。ほかに
   `pipe:[<inode>]`、`socket:[<inode>]`、`anon_inode:[eventfd]`・`[eventpoll]`・
   `[timerfd]`・`[signalfd]`・`[perf_event]`・`[pidfd]`（無名 inode の名前で、Linux 6.9 からの pidfs も同じ
   名前を返します）、`anon_inode:inotify`（Linux と同じく角括弧なし）、`anon_inode:bpf-map`、`/memfd:<名前> (deleted)` です。
@@ -2841,7 +2841,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルシステムのもの）と同じく、リンクそのものを開きます。その `fstat`
   （`AT_EMPTY_PATH` の `fstatat` も）と `fstatfs` はリンクのもので、
   `readlinkat(fd, "")` はリンク先を読み（ほかのものの `O_PATH` のディスクリプタでは
-  `ENOENT`）、自分のリンクはそのリンクを指し、そこから読むことはできません（`EBADF`）。
+  `ENOENT`。プロセスの `/proc` ディレクトリのリンク、つまり `fd/<n>`、`exe`、`cwd`、
+  `root` では、Linux の `proc_pid_readlink` と同じく、開いたプロセスのリンクが
+  そのとき指す先を、読み手のルートから見たパスで読みます）、自分のリンクはそのリンクを指し、そこから読むことはできません（`EBADF`）。
   自分のリンクをたどって開くと、そのリンクに着くので `ELOOP` です。ソケットは Linux と
   同じく `ENXIO` です。eventfd、epoll、timerfd、signalfd、inotify のインスタンスも、Linux がその無名 inode を
   `no_open` で開くので `ENXIO` です。pidfd は、root が開いたときと同じく、そのプロセスの

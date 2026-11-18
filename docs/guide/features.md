@@ -3248,7 +3248,7 @@ kernel.
   link's `lstat` shows the descriptor's access in its user bits and size 64,
   and `stat` follows it to the file. `readlink` gives Linux's names: the
   file's path with `.`, `..` and symbolic links resolved (`/proc/<pid>/…`
-  for this process's entries), followed by a space and `(deleted)` once
+  for this process's entries, `/proc` for procfs's root), followed by a space and `(deleted)` once
   nothing names it, `pipe:[<inode>]`, `socket:[<inode>]`,
   `anon_inode:[eventfd]`, `[eventpoll]`, `[timerfd]`, `[signalfd]`, `[perf_event]` or `[pidfd]` (an
   anonymous inode's name, which pidfs, from Linux 6.9, still gives),
@@ -3276,7 +3276,10 @@ kernel.
   any symbolic link (`/dev`'s, or a filesystem's): a descriptor whose
   `fstat` (and `fstatat` with `AT_EMPTY_PATH`) and `fstatfs` are the
   link's, whose `readlinkat(fd, "")` reads where it points (`ENOENT` for an
-  `O_PATH` descriptor of anything else), whose own link names the link, and
+  `O_PATH` descriptor of anything else; for a link of a process's `/proc`
+  directory, `fd/<n>`, `exe`, `cwd` or `root`, where it leads at that
+  moment, of the process that opened it and as the reader's root shows it,
+  as Linux's `proc_pid_readlink` reads it), whose own link names the link, and
   that nothing reads through (`EBADF`); an open that follows its own link
   reaches the link (`ELOOP`). A socket gives `ENXIO`, as on Linux, and so
   do an eventfd, an epoll, a timerfd, a signalfd and an inotify instance, whose anonymous inode Linux opens

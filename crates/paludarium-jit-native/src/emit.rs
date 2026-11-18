@@ -725,6 +725,57 @@ impl Emitter<'_, '_> {
         self.set_word(RFLAGS, new);
     }
 
+    /// `tzcnt`, `lzcnt`, `popcnt`, `bsf` or `bsr` (`op`) of `src` into
+    /// `dst`, as `fast::bits` has them: a scan of 0 leaves `dst` alone.
+    fn bits(&mut self, op: Mnemonic, dst: Register, src: Register) {
+        let size = dst.size();
+        let width = i64::from(size) * 8;
+        let value = self.read(src);
+        let zero = self.b.ins().icmp_imm_s(IntCC::Equal, value, 0);
+        let zf = self.bit(zero, flag::ZF);
+        match op {
+            Mnemonic::Bsf | Mnemonic::Bsr => {
+                let index = if op == Mnemonic::Bsr {
+                    let leading = self.b.ins().clz(value);
+                    let top = self.constant(63);
+                    self.b.ins().isub(top, leading)
+                } else {
+                    self.b.ins().ctz(value)
+                };
+                let Register::Gpr { index: n, .. } = dst else {
+                    unreachable!("bit forms hold general registers only")
+                };
+                let old = self.gpr(n);
+                self.write(dst, index);
+                let new = self.gpr(n);
+                let kept = self.b.ins().select(zero, old, new);
+                self.set_gpr(n, kept);
+                self.set_flags(flag::ZF, zf);
+            }
+            Mnemonic::Popcnt => {
+                let count = self.b.ins().popcnt(value);
+                self.write(dst, count);
+                self.set_flags(flag::STATUS, zf);
+            }
+            _ => {
+                let count = if op == Mnemonic::Tzcnt {
+                    let trailing = self.b.ins().ctz(value);
+                    let all = self.constant(width);
+                    self.b.ins().select(zero, all, trailing)
+                } else {
+                    let leading = self.b.ins().clz(value);
+                    self.b.ins().iadd_imm_s(leading, width - 64)
+                };
+                self.write(dst, count);
+                let none = self.b.ins().icmp_imm_s(IntCC::Equal, count, 0);
+                let cf = self.bit(zero, flag::CF);
+                let zf = self.bit(none, flag::ZF);
+                let f = self.b.ins().bor(cf, zf);
+                self.set_flags(flag::CF | flag::ZF, f);
+            }
+        }
+    }
+
     /// The result of `op` on `a` (masked to `size`), the flags it changes
     /// and their values, as `Unary::apply` has them.
     fn unary(&mut self, op: Unary, a: Value, size: u8) -> (Value, u64, Value) {
@@ -1311,6 +1362,7 @@ impl Emitter<'_, '_> {
                 self.write(dst, v);
                 self.unless_changed(status, n + 1, next);
             }
+            Fast::Bits { op, dst, src } => self.bits(op, dst, src),
             Fast::Unary { op, dst } => {
                 let a = self.read(dst);
                 let (r, update, f) = self.unary(op, a, dst.size());

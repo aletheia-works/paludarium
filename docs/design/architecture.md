@@ -114,6 +114,8 @@ out:
   `cbw`, `cwde` and `cdqe`, and `lea` into a 16- or 32-bit register;
 - `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`;
 - `setcc` and `cmovcc`;
+- `tzcnt`, `lzcnt`, `popcnt`, `bsf` and `bsr` of a register into one of its
+  size;
 - `mul` and `imul` of a register into rdx:rax, and `imul` of two registers or of
   a register and an immediate;
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm

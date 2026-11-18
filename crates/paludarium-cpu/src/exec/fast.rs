@@ -398,6 +398,13 @@ pub enum Fast {
         dst: Register,
         mem: Address,
     },
+    /// `tzcnt`, `lzcnt`, `popcnt`, `bsf` or `bsr` (`op`) of a register into
+    /// one of the same size.
+    Bits {
+        op: Mnemonic,
+        dst: Register,
+        src: Register,
+    },
     /// `inc`, `dec`, `neg` or `not` of a register.
     Unary {
         op: Unary,
@@ -479,6 +486,35 @@ fn xmm(o: Option<Operand>) -> Option<u8> {
 
 fn address(o: Option<Operand>) -> Option<Address> {
     Address::of(memory(o)?)
+}
+
+/// What [`Fast::Bits`] writes (nothing for a scan of 0), the flags it
+/// changes and their values, as `Exec::count_bits` and `Exec::scan` have
+/// them, for `value` masked to `size`.
+fn bits(op: Mnemonic, value: u64, size: u8) -> (Option<u64>, u64, u64) {
+    let width = u32::from(size) * 8;
+    let zero = value == 0;
+    let count = match op {
+        Mnemonic::Bsf | Mnemonic::Bsr => {
+            let index = if zero {
+                None
+            } else if op == Mnemonic::Bsr {
+                Some(u64::from(63 - value.leading_zeros()))
+            } else {
+                Some(u64::from(value.trailing_zeros()))
+            };
+            return (index, flag::ZF, if zero { flag::ZF } else { 0 });
+        }
+        Mnemonic::Popcnt => {
+            let f = if zero { flag::ZF } else { 0 };
+            return (Some(u64::from(value.count_ones())), flag::STATUS, f);
+        }
+        Mnemonic::Tzcnt if zero => width,
+        Mnemonic::Tzcnt => value.trailing_zeros(),
+        _ => value.leading_zeros() - (64 - width),
+    };
+    let f = if zero { flag::CF } else { 0 } | if count == 0 { flag::ZF } else { 0 };
+    (Some(u64::from(count)), flag::CF | flag::ZF, f)
 }
 
 /// The 8 bytes in memory that an indirect `jmp` or `call` goes to.
@@ -774,6 +810,21 @@ impl Fast {
                 (None, None) => Self::CallLoad(target(a)?),
             },
             Mnemonic::Ret if a.is_none() => Self::Ret,
+            Mnemonic::Tzcnt
+            | Mnemonic::Lzcnt
+            | Mnemonic::Popcnt
+            | Mnemonic::Bsf
+            | Mnemonic::Bsr => {
+                let (dst, src) = (gpr(a)?, gpr(b)?);
+                if dst.size() != src.size() || dst.size() == 1 {
+                    return None;
+                }
+                Self::Bits {
+                    op: i.mnemonic,
+                    dst,
+                    src,
+                }
+            }
             m if Unary::of(m).is_some() => {
                 if b.is_some() {
                     return None;
@@ -1139,6 +1190,16 @@ pub(crate) fn execute(
                 x.read_reg(dst)
             };
             x.write_reg(dst, v & size_mask(size));
+            next
+        }
+        Fast::Bits { op, dst, src } => {
+            let size = dst.size();
+            let value = x.read_reg(src) & size_mask(size);
+            let (result, update, flags) = bits(op, value, size);
+            if let Some(r) = result {
+                x.write_reg(dst, r);
+            }
+            x.set_status(update, flags);
             next
         }
         Fast::Unary { op, dst } => {

@@ -2065,6 +2065,9 @@ impl Lru {
     fn take_out(&mut self, i: usize) -> bool {
         if self.table.get(&self.keys[i]) == Some(&i) {
             self.table.remove(&self.keys[i]);
+            // Its value is no longer the map's: a program that still
+            // points at it is its only holder.
+            self.values[i] = None;
             true
         } else {
             false
@@ -2259,6 +2262,9 @@ impl Lru {
     /// `bpf_lru_push_free`: a pending element back to the local free list,
     /// any other to the free list.
     fn push_free(&mut self, i: usize) {
+        // A free element holds no value: not one a refused update put
+        // there, nor a replaced key's old one.
+        self.values[i] = None;
         if !self.per_cpu && self.place[i] == Place::LocalPending {
             self.place[i] = Place::LocalFree;
             self.referenced[i] = false;
@@ -2603,6 +2609,24 @@ mod tests {
         assert!(by_program.prog_lookup(&k(2)).is_some());
         by_program.set(&k(6), vec![6; 8], 0).unwrap();
         assert_eq!(held_keys(&by_program), [2, 4, 5, 6]);
+        // No element without a key keeps a value, however it lost its key.
+        assert_eq!(
+            by_program.set(&k(6), vec![0; 8], NOEXIST),
+            Err(Errno::EEXIST)
+        );
+        by_program.set(&k(2), vec![9; 8], 0).unwrap();
+        let first = held_keys(&by_program)[0];
+        by_program.remove(&k(first)).unwrap();
+        {
+            let elements = by_program.elements();
+            let Elements::Lru(lru) = &*elements else {
+                unreachable!()
+            };
+            let keyed: std::collections::BTreeSet<usize> = lru.table.values().copied().collect();
+            for (i, value) in lru.values.iter().enumerate() {
+                assert_eq!(value.is_some(), keyed.contains(&i), "element {i}");
+            }
+        }
         let by_syscall = fill();
         assert_eq!(by_syscall.get(&k(2)), Ok(vec![2; 8]));
         by_syscall.set(&k(6), vec![6; 8], 0).unwrap();

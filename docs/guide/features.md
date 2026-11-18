@@ -1614,7 +1614,14 @@ kernel.
   `/proc/self/fd` names the mount's place, as Linux's `d_path` does. The
   name itself is the mount's: `unlink` and `rename` find it in use
   (`EBUSY`), `mkdir` there `EEXIST`, `link` of it `EXDEV`; a bind mount of
-  the mount is another of the same file, and `umount2` takes it away.
+  the mount is another of the same file, and `umount2` takes it away. A
+  directory there binds onto a directory (`/proc`, `/dev` or one below
+  them): each path below the mount's place is the kernel's path below the
+  directory, so it shows what the kernel generates there, `..` at the
+  mount's root leaves it, and a working directory there is the mount's
+  place, which `getcwd` names (a missing name is `ENOENT` to `chdir` too).
+  No mount below a generated directory is in the table, so none is locked
+  (`has_locked_children`) and `MS_REC` brings none along.
 - `mount` with `MS_REMOUNT` and `MS_BIND` changes a mount's flags alone, as
   Linux's `do_reconfigure_mnt`: the target is the root of a mount of the
   caller's namespace (`EINVAL`), the flags a copy into a less privileged

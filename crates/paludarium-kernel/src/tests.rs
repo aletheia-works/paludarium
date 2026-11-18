@@ -9267,3 +9267,49 @@ fn prctl_task_perf_events_take_any_arguments() {
     assert_eq!(f.ret(157, &[31, 0, 0, 0, 0]), 0); // PR_TASK_PERF_EVENTS_DISABLE
     assert_eq!(f.ret(157, &[32, 1, 2, 3, 4]), 0); // PR_TASK_PERF_EVENTS_ENABLE
 }
+
+/// A bind mount of `/proc` or `/dev`, which the kernel generates, shows
+/// what it generates below them; a working directory there is the mount's
+/// place, which `getcwd` names and paths from it go through.
+#[test]
+fn a_bind_mount_of_a_generated_directory_shows_its_files() {
+    let mut f = fixture();
+    let (p, d) = (put(&mut f, 0, b"/tmp/p"), put(&mut f, 0x10, b"/tmp/d"));
+    let (proc_dir, dev) = (put(&mut f, 0x20, b"/proc"), put(&mut f, 0x30, b"/dev"));
+    let null = put(&mut f, 0x40, b"/tmp/d/null");
+    let comm = put(&mut f, 0x60, b"/tmp/p/self/comm");
+    let relative = put(&mut f, 0x80, b"self/comm");
+    let missing = put(&mut f, 0xa0, b"/tmp/p/nosuch");
+    let root = put(&mut f, 0xc0, b"/");
+    assert_eq!(f.ret(83, &[p, 0o755]), 0);
+    assert_eq!(f.ret(83, &[d, 0o755]), 0);
+    // MS_BIND, and MS_BIND | MS_REC: no mount below either is locked.
+    assert_eq!(f.ret(165, &[proc_dir, p, 0, 4096, 0]), 0);
+    assert_eq!(f.ret(165, &[dev, d, 0, 4096 | 16384, 0]), 0);
+    let fd = f.ret(2, &[null, 2, 0]);
+    assert!(fd < 1024);
+    assert_eq!(f.ret(1, &[fd, DATA + 0x100, 3]), 3);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    let fd = f.ret(2, &[comm, 0, 0]);
+    assert!(fd < 1024);
+    assert!(f.ret(0, &[fd, DATA + 0x100, 64]) > 0);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    // A missing name there is the kernel's ENOENT, also to chdir.
+    assert_eq!(f.ret(2, &[missing, 0, 0]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(80, &[missing]), errno(Errno::ENOENT));
+    assert_eq!(f.ret(80, &[p]), 0);
+    let cwd = DATA + 0x200;
+    assert_eq!(f.ret(79, &[cwd, 64]), 7);
+    let mut name = [0; 7];
+    f.mem.read(GuestAddr(cwd), &mut name).unwrap();
+    assert_eq!(&name, b"/tmp/p\0");
+    let fd = f.ret(257, &[(-100i64) as u64, relative, 0, 0]);
+    assert!(fd < 1024);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    // In use while it is the working directory.
+    assert_eq!(f.ret(166, &[p, 0]), errno(Errno(16)));
+    assert_eq!(f.ret(80, &[root]), 0);
+    assert_eq!(f.ret(166, &[p, 0]), 0);
+    assert_eq!(f.ret(166, &[d, 0]), 0);
+    assert_eq!(f.ret(2, &[null, 2, 0]), errno(Errno::ENOENT));
+}

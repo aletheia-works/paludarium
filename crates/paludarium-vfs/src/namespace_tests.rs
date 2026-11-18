@@ -375,20 +375,8 @@ fn null() -> GeneratedSource {
 fn a_bind_mount_of_a_generated_file_leads_the_kernel_to_it() {
     let (lower, fs) = machine();
     assert_eq!(fs.generated(b"/tmp/f", true), None);
-    // A file on a file only, and none of a directory yet.
+    // A file on a file only.
     assert_eq!(fs.bind_generated(null(), b"/tmp/m"), Err(Errno::ENOTDIR));
-    let directory = GeneratedSource {
-        path: b"/".to_vec(),
-        stat: FileStat {
-            mode: 0o040_755,
-            ..FileStat::default()
-        },
-        ..null()
-    };
-    assert_eq!(
-        fs.bind_generated(directory, b"/tmp/m"),
-        Err(Errno::EOPNOTSUPP)
-    );
     fs.bind_generated(null(), b"/tmp/f").unwrap();
     assert_eq!(
         fs.generated(b"/tmp/f", false),
@@ -429,6 +417,34 @@ fn a_bind_mount_of_a_generated_file_leads_the_kernel_to_it() {
     fs.umount(id, false).unwrap();
     assert_eq!(fs.generated(b"/tmp/f", false), None);
     assert_eq!(&*fs.read_file(b"/tmp/f").unwrap(), b"out");
+}
+
+#[test]
+fn a_bind_mount_of_a_generated_directory_leads_each_name_to_the_kernel() {
+    let (_, fs) = machine();
+    let dev = GeneratedSource {
+        path: b"/".to_vec(),
+        stat: FileStat {
+            mode: 0o040_755,
+            links: 2,
+            ..FileStat::default()
+        },
+        ..null()
+    };
+    assert_eq!(
+        fs.bind_generated(dev.clone(), b"/tmp/f"),
+        Err(Errno::ENOTDIR)
+    );
+    fs.bind_generated(dev, b"/tmp/m").unwrap();
+    let to = |path: &[u8]| fs.generated(path, true).map(|(file, _)| file);
+    assert_eq!(to(b"/tmp/m"), Some(b"/dev".to_vec()));
+    assert_eq!(to(b"/tmp/m/pts/0"), Some(b"/dev/pts/0".to_vec()));
+    assert_eq!(to(b"/tmp/m/pts/.."), Some(b"/dev".to_vec()));
+    // `..` at its root leaves it, for where it is mounted.
+    assert_eq!(to(b"/tmp/m/.."), None);
+    assert_eq!(to(b"/tmp/m/../f"), None);
+    assert_eq!(fs.metadata(b"/tmp/m", true).unwrap().mode, 0o040_755);
+    assert_eq!(fs.metadata(b"/tmp/m/x", true).unwrap().mode, 0o040_555);
 }
 
 #[test]

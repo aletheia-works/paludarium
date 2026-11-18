@@ -4969,25 +4969,40 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             Ok(p.len() as u64)
         }
         80 | 81 => {
+            // A directory the kernel generates, through a bind mount of
+            // it: the working directory is the mount's place, as `getcwd`
+            // names it, and paths from it lead there again.
             let p = if n == 80 {
-                let p = looked_up(c, (-100i32) as u64, a[0], true)?.0;
-                match followed(c, &p, true)? {
-                    // A symbolic link an `O_PATH | O_NOFOLLOW` descriptor
-                    // holds is not followed again: it is no directory.
-                    Some(Followed::Path { path, follow }) => {
-                        if c.files.fs().metadata(&path, follow)?.mode & 0o170000 != 0o040000 {
+                let raw = path(c, a[0])?;
+                let named = c.files.named((-100i32) as u64, raw.clone())?;
+                let p = lookup(c, (-100i32) as u64, raw, true)?.0;
+                match c.files.through_generated(&named, true) {
+                    Some((file, shown)) => {
+                        let (stat, ..) = generated_stat(c, &file, true)?.ok_or(Errno::ENOENT)?;
+                        if stat.mode & 0o170000 != 0o040000 {
                             return Err(Errno::ENOTDIR);
                         }
-                        path
+                        shown
                     }
-                    Some(Followed::File(d)) if d.file.stat()?.mode & 0o170000 != 0o040000 => {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    Some(Followed::File(d)) => d.path,
-                    None => p,
+                    None => match followed(c, &p, true)? {
+                        // A symbolic link an `O_PATH | O_NOFOLLOW` descriptor
+                        // holds is not followed again: it is no directory.
+                        Some(Followed::Path { path, follow }) => {
+                            if c.files.fs().metadata(&path, follow)?.mode & 0o170000 != 0o040000 {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            path
+                        }
+                        Some(Followed::File(d)) if d.file.stat()?.mode & 0o170000 != 0o040000 => {
+                            return Err(Errno::ENOTDIR);
+                        }
+                        Some(Followed::File(d)) => d.path,
+                        None => p,
+                    },
                 }
             } else {
-                c.files.descriptor(a[0])?.path
+                let d = c.files.descriptor(a[0])?;
+                d.shown.unwrap_or(d.path)
             };
             let stat = c.files.fs().metadata(&p, true)?;
             if stat.mode & 0o170000 != 0o040000 {

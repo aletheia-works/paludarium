@@ -961,8 +961,8 @@ kernel.
   `UFFD_FEATURE_MINOR_HUGETLBFS`,
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
   `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
-  `UFFD_FEATURE_WP_UNPOPULATED`, `UFFD_FEATURE_POISON` and
-  `UFFD_FEATURE_MOVE` (the `HUGETLBFS` ones as Linux reports them,
+  `UFFD_FEATURE_WP_UNPOPULATED`, `UFFD_FEATURE_POISON`,
+  `UFFD_FEATURE_WP_ASYNC` and `UFFD_FEATURE_MOVE` (the `HUGETLBFS` ones as Linux reports them,
   though there is no hugetlbfs memory to register: `MFD_HUGETLB` and
   `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
@@ -974,7 +974,9 @@ kernel.
   adds `UFFDIO_CONTINUE` to the ioctls it reports and `ui` to `smaps`), and
   private anonymous memory and shmem for write
   protection (`UFFDIO_REGISTER_MODE_WP`, which adds `UFFDIO_WRITEPROTECT`
-  to the ioctls it reports), with Linux's checks in its order (the
+  to the ioctls it reports), and with `UFFD_FEATURE_WP_ASYNC` any memory
+  for write protection alone (a file's private or shared mapping and
+  System V shared memory too, as `vma_can_userfault` allows), with Linux's checks in its order (the
   range, then each VMA: `EINVAL` for one that cannot be registered,
   `EPERM` for a shared one that may not write its file, `EBUSY` for one
   another `userfaultfd` has); the modes replace a VMA's
@@ -1016,7 +1018,14 @@ kernel.
   and refuses a write it does not permit with SIGSEGV as before; a
   `fork`ed child, a move by `mremap`, `UFFDIO_UNREGISTER`, closing the
   file and a registration that replaces the write-protect mode take it
-  away.
+  away. With `UFFD_FEATURE_WP_ASYNC`, which brings
+  `UFFD_FEATURE_WP_UNPOPULATED` (as `/proc/<pid>/fdinfo` shows), a write
+  to a write-protected page, an instruction's or a system call's, does not
+  fault: it clears the page's protection and goes on, as `do_wp_page`
+  does, so that bit 57 of `/proc/<pid>/pagemap` tells which pages were
+  written since `UFFDIO_WRITEPROTECT`. `MADV_DONTNEED` of a file's private
+  mapping leaves a marker for each page still protected, as for shmem; a
+  fill there is `EINVAL`, as the memory is neither anonymous nor shmem's.
   `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
   does: `ENOENT` for a range that does not lie in one registered VMA,
   `EEXIST` for a page that has one, `EFAULT` for a source that cannot be

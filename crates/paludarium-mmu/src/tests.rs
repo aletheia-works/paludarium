@@ -1407,3 +1407,140 @@ fn uffdio_writeprotect_marks_unpopulated_anonymous_pages_with_wp_unpopulated() {
     child.write(page(1), b"f").unwrap();
     assert!(m.write(page(1), b"g").is_err());
 }
+
+#[test]
+fn wp_async_writes_clear_the_protection_of_any_memory() {
+    let source: Arc<dyn PageSource> = Arc::new(Shmem {
+        size: 4 * PAGE_SIZE,
+        held: vec![],
+        shmem: false,
+    });
+    let mut m = AddressSpace::new();
+    let view = m.view();
+    let at = m
+        .map(None, 4 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.back_with_file(at, 4 * PAGE_SIZE, source, 0).unwrap();
+    let at = at.0;
+    let end = at + 4 * PAGE_SIZE;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    let state = |n: u64| {
+        view.pagemap(page(n).0, 1).unwrap()[0]
+            & (pagemap::PRESENT | pagemap::SWAP | pagemap::UFFD_WP)
+    };
+    let modes = Userfault::WP | Userfault::WP_UNPOPULATED;
+    // A private mapping of a file takes write protection only with
+    // `WP_ASYNC`, and then no other mode.
+    assert_eq!(
+        view.userfault_register(at, end, 7, modes),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        view.userfault_register(at, end, 7, modes | Userfault::MISSING | Userfault::WP_ASYNC),
+        Err(Errno::EINVAL)
+    );
+    view.userfault_register(at, end, 7, modes | Userfault::WP_ASYNC)
+        .unwrap();
+    let mut b = [0];
+    m.read(page(0), &mut b).unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    assert_eq!(state(0), pagemap::PRESENT | pagemap::UFFD_WP);
+    assert_eq!(state(1), pagemap::SWAP | pagemap::UFFD_WP);
+    // A write goes on, to an entry or to a marker's page, and clears the
+    // protection; nothing waits.
+    m.write(page(0), b"a").unwrap();
+    m.write(page(1), b"b").unwrap();
+    assert_eq!(m.userfault_for(page(0), true, false), None);
+    assert_eq!(state(0), pagemap::PRESENT);
+    assert_eq!(state(1), pagemap::PRESENT);
+    m.read(page(0), &mut b).unwrap();
+    assert_eq!(b, *b"a");
+    // A read keeps it.
+    m.read(page(2), &mut b).unwrap();
+    assert_eq!(b, *b"f");
+    assert_eq!(state(2), pagemap::PRESENT | pagemap::UFFD_WP);
+    // A discard keeps the protection of the protected pages only, whose
+    // file it reads again (`Self::refill`), as Linux's markers fault in.
+    m.discard_shared(GuestAddr(at), 4 * PAGE_SIZE).unwrap();
+    assert_eq!(state(0), pagemap::PRESENT);
+    assert_eq!(state(1), pagemap::PRESENT);
+    assert_eq!(state(2), pagemap::PRESENT | pagemap::UFFD_WP);
+    assert_eq!(state(3), pagemap::PRESENT | pagemap::UFFD_WP);
+    m.read(page(0), &mut b).unwrap();
+    assert_eq!(b, *b"f");
+    m.write(page(2), b"c").unwrap();
+    assert_eq!(state(2), pagemap::PRESENT);
+    // A fill is not for a file's memory.
+    assert_eq!(view.userfault_target(at, end).err(), Some(Errno::EINVAL));
+    view.userfault_unregister(at, end, 7).unwrap();
+    assert_eq!(state(3), pagemap::PRESENT);
+}
+
+#[test]
+fn wp_async_writes_clear_the_protection_of_anonymous_memory() {
+    let mut m = AddressSpace::new();
+    let view = m.view();
+    let at = m
+        .map(
+            None,
+            2 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap()
+        .0;
+    let end = at + 2 * PAGE_SIZE;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    let state = |n: u64| {
+        view.pagemap(page(n).0, 1).unwrap()[0]
+            & (pagemap::PRESENT | pagemap::SWAP | pagemap::UFFD_WP)
+    };
+    let modes = Userfault::WP | Userfault::WP_UNPOPULATED | Userfault::WP_ASYNC;
+    view.userfault_register(at, end, 7, modes).unwrap();
+    m.write(page(0), b"a").unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    assert_eq!(state(0), pagemap::PRESENT | pagemap::UFFD_WP);
+    assert_eq!(state(1), pagemap::SWAP | pagemap::UFFD_WP);
+    m.write(page(0), b"b").unwrap();
+    m.write(page(1), b"c").unwrap();
+    assert_eq!(state(0), pagemap::PRESENT);
+    assert_eq!(state(1), pagemap::PRESENT);
+    // A discard of anonymous memory drops the markers.
+    view.userfault_write_protect(at, end, true).unwrap();
+    m.discard_shared(GuestAddr(at), 2 * PAGE_SIZE).unwrap();
+    assert_eq!(state(0), 0);
+}
+
+#[test]
+fn a_wp_async_write_with_no_room_keeps_a_markers_protection_only() {
+    let meter = Arc::new(MemoryMeter::new(PAGE_SIZE));
+    let mut m = AddressSpace::new().with_memory_meter(Arc::clone(&meter));
+    let view = m.view();
+    let at = m
+        .map(
+            None,
+            3 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap()
+        .0;
+    let end = at + 3 * PAGE_SIZE;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    let wp = |n: u64| view.pagemap(page(n).0, 1).unwrap()[0] & pagemap::UFFD_WP != 0;
+    let modes = Userfault::WP | Userfault::WP_UNPOPULATED | Userfault::WP_ASYNC;
+    view.userfault_register(at, end, 7, modes).unwrap();
+    m.write(page(0), b"a").unwrap();
+    let mut b = [0];
+    m.read(page(2), &mut b).unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    // The meter is full: a marker's page stays protected, as Linux makes
+    // no entry; the zero page loses it, as `do_wp_page` clears it before
+    // the copy fails.
+    assert!(m.write(page(1), b"b").is_err());
+    assert!(wp(1));
+    assert!(m.write(page(2), b"c").is_err());
+    assert!(!wp(2));
+    m.write(page(0), b"d").unwrap();
+    assert!(!wp(0));
+}

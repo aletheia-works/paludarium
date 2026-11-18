@@ -69,7 +69,10 @@ verified.
   private file mapping, is a file's (bit 61) until the mapping was
   written, not until the page was. A read of a file's page gives only
   that page an entry, where Linux's fault maps the pages around it too
-  (`fault_around_bytes`). The frame number is 0 for every reader, also one
+  (`fault_around_bytes`). A page of a file's private mapping that
+  `MADV_DONTNEED` dropped is read from the file again at once, so it has
+  an entry (bit 63, and bit 57 if it was write-protected) where Linux has
+  none, or a uffd-wp marker, until an access. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; nothing
   clears the soft-dirty bit (`/proc/<pid>/clear_refs` is not there); and
   user space ends at 2^47 bytes, as with 4-level page tables.
@@ -727,15 +730,17 @@ verified.
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages, write protection and the minor
   faults of shmem are registered. Not offered are the events of `fork`,
-  `mremap`, `madvise` and `munmap` and `UFFD_FEATURE_WP_ASYNC`, which
-  `UFFDIO_API` does not report and refuses (`EINVAL`); without it only
-  anonymous memory and shmem take the write-protect mode. A
+  `mremap`, `madvise` and `munmap`, which `UFFDIO_API` does not report and
+  refuses (`EINVAL`), and `PAGEMAP_SCAN`, the `/proc/<pid>/pagemap` ioctl
+  that finds and protects again the pages `UFFD_FEATURE_WP_ASYNC` saw
+  written; their bit 57 in `/proc/<pid>/pagemap` tells them. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
   `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in
   the marker's place, where Linux, whose zap keeps the marker, restarts
   the call until a signal comes.
-  Of shmem's files only a memfd is registered: a tmpfs file
+  Of shmem's files only a memfd is registered, but for write protection
+  alone with `UFFD_FEATURE_WP_ASYNC`, which takes any file: a tmpfs file
   is refused (`EINVAL`), where Linux takes it, as the in-memory file
   system says it is a tmpfs but stands for the files a guest has on disk,
   and a host's tmpfs file is not kept here. A zero page `UFFDIO_ZEROPAGE` gives a
@@ -743,7 +748,7 @@ verified.
   `/proc/<pid>/pagemap` and `smaps` count as such, where Linux maps its
   zero page. A system call's own
   copy to or from a missing page of a registered range, or to a
-  write-protected one, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
+  write-protected one without `UFFD_FEATURE_WP_ASYNC`, is `EFAULT`, as with `UFFD_USER_MODE_ONLY`, where
   Linux waits for the page as for an instruction. A `UFFDIO_MOVE` source
   hole is `ENOENT` before the destination is looked at when nothing
   touched the 2 MiB around it here, as when Linux has no page table there,

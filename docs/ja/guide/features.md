@@ -861,7 +861,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_MINOR_HUGETLBFS`、
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
   `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
-  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_MOVE` で（`HUGETLBFS` の
+  `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_WP_ASYNC`、
+  `UFFD_FEATURE_MOVE` で（`HUGETLBFS` の
   ものは Linux と同じく示しますが、`MFD_HUGETLB` と `SHM_HUGETLB` は `ENOSYS` なので、
   登録する hugetlbfs のメモリはありません）、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
@@ -872,7 +873,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピング）をマイナーフォールトについて登録し（`UFFDIO_REGISTER_MODE_MINOR`。示す
   ioctl に `UFFDIO_CONTINUE` が、`smaps` に `ui` が加わります）、プライベートな anonymous メモリと shmem を書き込み保護に
   ついて登録します（`UFFDIO_REGISTER_MODE_WP`。示す ioctl に `UFFDIO_WRITEPROTECT`
-  が加わります）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
+  が加わります）。`UFFD_FEATURE_WP_ASYNC` では、書き込み保護だけなら、
+  `vma_can_userfault` と同じくどのメモリも登録します（ファイルのプライベートまたは
+  共有のマッピングや System V の共有メモリも）。確かめることと順は Linux と同じで（範囲、次に各 VMA。登録できない
   ものは `EINVAL`、ファイルに書き込めない共有のものは `EPERM`、ほかの `userfaultfd` の
   ものは `EBUSY`）、モードは、VMA がすでに
   持っていなければその VMA のモードに置き換わります。登録した部分は
@@ -909,7 +912,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プライベートな anonymous メモリの `UFFDIO_ZEROPAGE` と `UFFDIO_POISON` はそこでは
   `EEXIST` です。`mprotect` は保護を残し、許さない書き込みはこれまでどおり SIGSEGV です。
   `fork` した子、`mremap` による移動、`UFFDIO_UNREGISTER`、ファイルを閉じること、
-  書き込み保護のモードを置き換える登録で保護は外れます。`UFFDIO_COPY` と
+  書き込み保護のモードを置き換える登録で保護は外れます。
+  `UFFD_FEATURE_WP_ASYNC`（`/proc/<pid>/fdinfo` が示すとおり
+  `UFFD_FEATURE_WP_UNPOPULATED` を伴います）では、書き込み保護されたページへの
+  書き込みは、命令のものもシステムコールのものもフォールトせず、`do_wp_page` と
+  同じくページの保護を外して進みます。そのため `/proc/<pid>/pagemap` のビット 57 で、
+  `UFFDIO_WRITEPROTECT` から書き込まれたページがわかります。ファイルのプライベートな
+  マッピングの `MADV_DONTNEED` は、shmem と同じく、まだ保護されているページに
+  マーカーを残します。そこを埋める操作は、anonymous メモリでも shmem でもないので
+  `EINVAL` です。`UFFDIO_COPY` と
   `UFFDIO_ZEROPAGE` は `mfill_atomic` と同じく 1 ページずつ埋めます。1 つの登録した
   VMA に収まらない範囲は `ENOENT`、ページのあるところは `EEXIST`、読めないコピー元は
   `EFAULT`、shmem のファイルの終わりより先のページも `EFAULT` で、途中で止まると、埋めた分を構造体の最後のフィールドに入れて `EAGAIN`

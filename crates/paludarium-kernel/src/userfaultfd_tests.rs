@@ -29,6 +29,7 @@ const THREAD_ID: u64 = 1 << 8;
 const EXACT_ADDRESS: u64 = 1 << 11;
 const FEATURE_POISON: u64 = 1 << 14;
 const WP_UNPOPULATED: u64 = 1 << 13;
+const WP_ASYNC: u64 = 1 << 15;
 
 struct Fixture {
     kernel: Kernel,
@@ -182,16 +183,10 @@ fn uffdio_api_takes_the_features_once() {
         f.ioctl(fd, API, &[0xaa, 1 << 30, 7]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
     );
-    // UFFD_FEATURE_WP_ASYNC, which brings UFFD_FEATURE_WP_UNPOPULATED, is
-    // not offered.
-    assert_eq!(
-        f.ioctl(fd, API, &[0xaa, 1 << 15, 0]).0,
-        errno(Errno::EINVAL)
-    );
     assert_eq!(f.ret(16, &[fd, API, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, API, &[0xaa, SIGBUS | THREAD_ID, 0]);
     assert_eq!(ret, 0);
-    assert_eq!(out, vec![0xaa, 0x1_7fb1, 1 << 63 | 3]);
+    assert_eq!(out, vec![0xaa, 0x1_ffb1, 1 << 63 | 3]);
     assert_eq!(
         f.ioctl(fd, API, &[0xaa, 0, 0]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
@@ -803,4 +798,34 @@ fn wp_unpopulated_protects_the_pages_that_have_none() {
     assert!(f.mem.write(GuestAddr(AREA + PAGE), b"a").is_err());
     assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, 2 * PAGE, 0]).0, 0);
     f.mem.write(GuestAddr(AREA), b"a").unwrap();
+}
+
+#[test]
+fn wp_async_clears_the_protection_a_write_meets() {
+    let mut f = fixture();
+    // It brings WP_UNPOPULATED, which the context then has.
+    let fd = f.ready(NONBLOCK, WP_ASYNC);
+    assert!(
+        f.fdinfo(fd)
+            .ends_with("API:\taa:8000a000:80000000000001ff\n")
+    );
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 2, 0]).0, 0);
+    assert_eq!(
+        f.userfault(AREA).map(|u| u.modes),
+        Some(Userfault::WP | Userfault::WP_UNPOPULATED | Userfault::WP_ASYNC)
+    );
+    f.mem.write(GuestAddr(AREA), b"a").unwrap();
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, 2 * PAGE, 1]).0, 0);
+    assert!(f.mem.check_write(GuestAddr(AREA), 1).is_ok());
+    // A write to the page with an entry, and to the one with a marker,
+    // goes on, and nothing waits.
+    f.mem.write(GuestAddr(AREA), b"b").unwrap();
+    f.mem.write(GuestAddr(AREA + PAGE), b"c").unwrap();
+    assert_eq!(f.mem.userfault_for(GuestAddr(AREA), true, false), None);
+    assert_eq!(f.ret(0, &[fd, ARG, 32]), errno(Errno::EAGAIN));
+    let mut bytes = [0; 1];
+    f.mem.read(GuestAddr(AREA + PAGE), &mut bytes).unwrap();
+    assert_eq!(bytes, *b"c");
+    // The missing mode with it takes private anonymous memory as before.
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 3, 0]).0, 0);
 }

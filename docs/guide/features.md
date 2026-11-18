@@ -2847,7 +2847,10 @@ kernel.
   `/proc/self/fd/3/name` is `name` in the directory descriptor 3 holds, by
   the path that names it now, even after a rename, and `..` goes on from
   there. A removed directory is `ENOENT`, a descriptor that is not open
-  `ENOENT`, and a file that is not a directory `ENOTDIR`. The file calls
+  `ENOENT`, and a file that is not a directory `ENOTDIR`. So is a link in
+  another process's `fd` (`/proc/<pid>/fd/3/name`), for a reader that may
+  look at its descriptors (`EACCES`), as Linux's `proc_fd_link` jumps;
+  once the process has ended, it is `ENOENT`. The file calls
   that take an absolute path do this (`openat2` with `RESOLVE_*` flags in its
   own walk); a path relative to a descriptor of `/proc` or to a working
   directory there, one whose `..` or symbolic link leads into `/proc`,

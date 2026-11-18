@@ -11781,6 +11781,91 @@ static int proc_io_case(void) {
     return 0;
 }
 
+/* The proc-other-fd-paths case: a path that goes on through a link of
+   another process's fd, which Linux's walk jumps to the descriptor's file
+   (proc_fd_link, nd_jump_link) once the reader may look at it, and goes on
+   in when it is a directory. */
+static char pofp_base[] = "/tmp/paludarium-pofp-XXXXXX";
+static void pofp_stat(const char *label, const char *path, ino_t expected) {
+    struct stat st;
+    if (stat(path, &st)) printf("%s: errno=%d\n", label, errno);
+    else printf("%s: same=%d\n", label, st.st_ino == expected);
+}
+static int proc_other_fd_paths_case(void) {
+    if (!mkdtemp(pofp_base)) return 80;
+    chmod(pofp_base, 0755);
+    char dir[256], inner[256], file[256], moved[256];
+    snprintf(dir, sizeof dir, "%s/d", pofp_base);
+    snprintf(inner, sizeof inner, "%s/d/name", pofp_base);
+    snprintf(file, sizeof file, "%s/f", pofp_base);
+    snprintf(moved, sizeof moved, "%s/moved", pofp_base);
+    mkdir(dir, 0755);
+    int w = open(inner, O_CREAT | O_WRONLY, 0644);
+    if (w < 0 || write(w, "inside", 6) != 6) return 81;
+    close(w);
+    close(open(file, O_CREAT | O_WRONLY, 0644));
+    struct stat inner_st;
+    stat(inner, &inner_st);
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 82;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 83;
+    if (!kid) {
+        unsigned char fds[2];
+        fds[0] = (unsigned char)open(dir, O_RDONLY | O_DIRECTORY);
+        fds[1] = (unsigned char)open(file, O_RDONLY);
+        char byte;
+        if (write(ready[1], fds, 2) != 2 || read(done[0], &byte, 1) != 1) _exit(88);
+        _exit(0);
+    }
+    unsigned char fds[2];
+    if (read(ready[0], fds, 2) != 2) return 84;
+    char path[256];
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
+    pofp_stat("through directory", path, inner_st.st_ino);
+    int fd = open(path, O_RDONLY);
+    char text[8] = "";
+    printf("open=%d read=%zd %.6s\n", fd >= 0 ? 0 : errno, fd >= 0 ? read(fd, text, 6) : (ssize_t)-1, text);
+    if (fd >= 0) close(fd);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/.", (int)kid, fds[0]);
+    struct stat dir_st;
+    stat(dir, &dir_st);
+    pofp_stat("dot", path, dir_st.st_ino);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[1]);
+    pofp_stat("through file", path, 0);
+    snprintf(path, sizeof path, "/proc/%d/fd/60/name", (int)kid);
+    pofp_stat("not open", path, 0);
+    /* Another user may not look at its descriptors. */
+    fflush(stdout);
+    pid_t other = fork();
+    if (other == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
+        pofp_stat("other user", path, inner_st.st_ino);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("other=%d\n", reaped(other));
+    /* Renamed, the walk goes on where the directory is now; removed, it is
+       not there. */
+    rename(dir, moved);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
+    pofp_stat("renamed", path, inner_st.st_ino);
+    snprintf(inner, sizeof inner, "%s/moved/name", pofp_base);
+    unlink(inner);
+    rmdir(moved);
+    pofp_stat("removed", path, inner_st.st_ino);
+    /* Its descriptors are gone with it. */
+    if (write(done[1], "d", 1) != 1) return 85;
+    siginfo_t info;
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    pofp_stat("zombie", path, inner_st.st_ino);
+    printf("status=%d\n", reaped(kid));
+    unlink(file);
+    rmdir(pofp_base);
+    return 0;
+}
 /* The proc-owner-rename case: the owner fstat shows of an open file in a
    process's /proc directory, which is its inode's as the last lookup of its
    path set it (pid_revalidate), and of the process's directory and its ns,
@@ -30089,6 +30174,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-other-mounts")) return proc_other_mounts_case();
     if (!strcmp(mode, "proc-other-maps")) return proc_other_maps_case();
     if (!strcmp(mode, "proc-other-fds")) return proc_other_fds_case();
+    if (!strcmp(mode, "proc-other-fd-paths")) return proc_other_fd_paths_case();
     if (!strcmp(mode, "proc-other-limits")) return proc_other_limits_case();
     if (!strcmp(mode, "proc-other-pagemap")) return proc_other_pagemap_case();
     if (!strcmp(mode, "proc-owner-rename")) return proc_owner_rename_case();

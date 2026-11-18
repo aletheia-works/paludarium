@@ -101,9 +101,7 @@ verified.
   interpreter, a core dump's writes), and a read or write that fails with
   an errno Linux gives both before and in the file's operation (`EINVAL`,
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
-  so not counted. A path that goes on through a link of another process's `fd`
-  (`/proc/<pid>/fd/3/name`) is `ENOENT`, where Linux goes on in the
-  directory it leads to, as it does for this process's own. In `stat`, page faults, resident memory, the start
+  so not counted. In `stat`, page faults, resident memory, the start
   time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and

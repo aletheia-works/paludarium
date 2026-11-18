@@ -1168,26 +1168,13 @@ fn through_magic_links(c: &Context<'_>, mut p: Vec<u8>) -> Result<Vec<u8>, Errno
 /// or `None` when `path` is not one.
 fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, Errno>> {
     const ENOTDIR: Errno = Errno::ENOTDIR;
-    let is_dir = |stat: FileStat| stat.mode & 0o170000 == 0o040000;
     match crate::proc::own_entry(path, c.process.pid) {
-        Some(crate::proc::OwnEntry::Descriptor(n)) => Some((|| {
-            let d = c
-                .files
+        Some(crate::proc::OwnEntry::Descriptor(n)) => Some(
+            c.files
                 .descriptor(u64::from(n))
-                .map_err(|_| Errno::ENOENT)?;
-            let stat = d.file.stat()?;
-            if !is_dir(stat) || d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
-                return Err(ENOTDIR);
-            }
-            let path = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
-            // The path still names the directory, or it was removed.
-            let named = generated(&path)
-                || c.files
-                    .fs()
-                    .metadata(&path, true)
-                    .is_ok_and(|now| now.inode == stat.inode);
-            if named { Ok(path) } else { Err(Errno::ENOENT) }
-        })()),
+                .map_err(|_| Errno::ENOENT)
+                .and_then(|d| descriptor_directory(c, &d)),
+        ),
         Some(
             entry @ (crate::proc::OwnEntry::Cwd
             | crate::proc::OwnEntry::Root
@@ -1203,6 +1190,14 @@ fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, 
         _ => {
             let task_path = crate::proc::task_path(path, c.process.pid, c.tid)?;
             match task_path.entry {
+                // Another task's descriptor, for a reader that may look at
+                // it, as Linux's `proc_fd_link` jumps to its file.
+                crate::proc::TaskEntry::Descriptor(n) => Some((|| {
+                    let task = tasks::find(c, &task_path)?;
+                    tasks::check(c, &task, task_path.entry)?;
+                    let d = tasks::descriptor(&task, n).ok_or(Errno::ENOENT)?;
+                    descriptor_directory(c, &d)
+                })()),
                 crate::proc::TaskEntry::Exe => Some(Err(ENOTDIR)),
                 crate::proc::TaskEntry::Cwd | crate::proc::TaskEntry::Root => {
                     Some(own_link_target(c, path).ok_or(Errno::ENOENT))
@@ -1211,6 +1206,23 @@ fn magic_link_directory(c: &Context<'_>, path: &[u8]) -> Option<Result<Vec<u8>, 
             }
         }
     }
+}
+/// The directory descriptor `d` holds, which a path going on through its
+/// link goes on in: by the path that names it now, `ENOENT` once it is
+/// removed, and `ENOTDIR` for a file that is not a directory.
+fn descriptor_directory(c: &Context<'_>, d: &Descriptor) -> Result<Vec<u8>, Errno> {
+    let stat = d.file.stat()?;
+    if stat.mode & 0o170000 != 0o040000 || d.file.as_any().is_some_and(|v| v.is::<LinkPath>()) {
+        return Err(Errno::ENOTDIR);
+    }
+    let path = d.file.guest_path_hint().unwrap_or_else(|| d.path.clone());
+    // The path still names the directory, or it was removed.
+    let named = generated(&path)
+        || c.files
+            .fs()
+            .metadata(&path, true)
+            .is_ok_and(|now| now.inode == stat.inode);
+    if named { Ok(path) } else { Err(Errno::ENOENT) }
 }
 /// The NUL-terminated string at `addr`, of at most 4096 bytes.
 pub(crate) fn string(c: &Context<'_>, addr: u64) -> Result<Vec<u8>, Errno> {

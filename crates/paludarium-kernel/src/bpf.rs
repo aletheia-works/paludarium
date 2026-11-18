@@ -1,9 +1,10 @@
 //! `bpf`, for its maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
-//! `hashtab.c`, `bpf_lru_list.c`, `lpm_trie.c`, `queue_stack_maps.c` and
-//! `bloom_filter.c` have them: `BPF_MAP_CREATE` of `BPF_MAP_TYPE_ARRAY`,
-//! `BPF_MAP_TYPE_HASH`, `BPF_MAP_TYPE_LRU_HASH`, `BPF_MAP_TYPE_LPM_TRIE`
-//! ([`crate::bpf_trie`]), `BPF_MAP_TYPE_QUEUE`, `BPF_MAP_TYPE_STACK` and
-//! `BPF_MAP_TYPE_BLOOM_FILTER`,
+//! `hashtab.c`, `bpf_lru_list.c`, `lpm_trie.c`, `queue_stack_maps.c`,
+//! `bloom_filter.c` and `map_in_map.c` have them: `BPF_MAP_CREATE` of
+//! `BPF_MAP_TYPE_ARRAY`, `BPF_MAP_TYPE_HASH`, `BPF_MAP_TYPE_LRU_HASH`,
+//! `BPF_MAP_TYPE_LPM_TRIE` ([`crate::bpf_trie`]), `BPF_MAP_TYPE_QUEUE`,
+//! `BPF_MAP_TYPE_STACK`, `BPF_MAP_TYPE_BLOOM_FILTER`,
+//! `BPF_MAP_TYPE_ARRAY_OF_MAPS` and `BPF_MAP_TYPE_HASH_OF_MAPS`,
 //! their elements (`LOOKUP`, `UPDATE`, `DELETE`,
 //! `GET_NEXT_KEY`, `LOOKUP_AND_DELETE`), `BPF_MAP_FREEZE`, the batch
 //! commands, `BPF_OBJ_GET_INFO_BY_FD`, the map IDs (`BPF_MAP_GET_NEXT_ID`,
@@ -80,6 +81,8 @@ pub(crate) const TYPE_HASH: u32 = 1;
 pub(crate) const TYPE_ARRAY: u32 = 2;
 pub(crate) const TYPE_LRU_HASH: u32 = 9;
 pub(crate) const TYPE_LPM_TRIE: u32 = 11;
+pub(crate) const TYPE_ARRAY_OF_MAPS: u32 = 12;
+pub(crate) const TYPE_HASH_OF_MAPS: u32 = 13;
 pub(crate) const TYPE_QUEUE: u32 = 22;
 pub(crate) const TYPE_STACK: u32 = 23;
 pub(crate) const TYPE_BLOOM_FILTER: u32 = 30;
@@ -169,6 +172,10 @@ enum Elements {
     Queue(std::collections::VecDeque<Vec<u8>>),
     /// A bloom filter's bits.
     Bloom(Bloom),
+    /// The maps an array of maps (by its 4-byte key, each below
+    /// `max_entries`) or a hash of maps holds, each kept as long as it is
+    /// there.
+    Maps(BTreeMap<Vec<u8>, Arc<Map>>),
 }
 
 /// A bloom filter's bit array, as Linux's `bloom_filter.c` has it: up to
@@ -351,7 +358,49 @@ pub(crate) struct Map {
     /// `num_possible_cpus()`, which a hash's spare elements count.
     cpus: u64,
     frozen: AtomicBool,
+    /// Made with `excl_prog_hash`: only the program of that hash may use
+    /// it, so it is no map's inner map (`excl_prog_sha`).
+    exclusive: bool,
+    /// A map of maps' `inner_map_meta`: what the maps it holds are like.
+    inner: Option<Template>,
     elements: Mutex<Elements>,
+}
+
+/// `inner_map_meta`, as `bpf_map_meta_alloc` copies it from the map whose
+/// descriptor `inner_map_fd` is.
+#[derive(Clone, Copy, Debug)]
+struct Template {
+    kind: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    flags: u32,
+}
+
+impl Template {
+    fn of(map: &Map) -> Self {
+        Self {
+            kind: map.kind,
+            key_size: map.key_size,
+            value_size: map.value_size,
+            max_entries: map.max_entries,
+            flags: map.flags,
+        }
+    }
+    /// The template type's `map_meta_equal`: `bpf_map_meta_equal`'s type,
+    /// sizes and flags (there is no BTF to compare), and for an array
+    /// (`array_map_meta_equal`) its entries too, unless the template has
+    /// `BPF_F_INNER_MAP`.
+    fn fits(&self, map: &Map) -> bool {
+        let same = Self::of(map);
+        self.kind == same.kind
+            && self.key_size == same.key_size
+            && self.value_size == same.value_size
+            && self.flags == same.flags
+            && (self.kind != TYPE_ARRAY
+                || self.flags & flag::INNER_MAP != 0
+                || self.max_entries == same.max_entries)
+    }
 }
 
 /// The machine's maps by ID: Linux's `map_idr`.
@@ -517,6 +566,7 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     let value_size = half(attr, 8);
     let max_entries = half(attr, 12);
     let mut flags = half(attr, 16);
+    let inner_map_fd = half(attr, 20);
     let numa_node = half(attr, 24);
     let map_ifindex = half(attr, 44);
     let btf_fd = half(attr, 48);
@@ -552,13 +602,24 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     let access_ok =
         flags & (flag::RDONLY_PROG | flag::WRONLY_PROG) != flag::RDONLY_PROG | flag::WRONLY_PROG;
     match kind {
-        TYPE_ARRAY => {
+        TYPE_ARRAY | TYPE_ARRAY_OF_MAPS => {
+            // fd_array_map_alloc_check: a value is a descriptor, and a
+            // program reads or writes it either way.
+            if kind == TYPE_ARRAY_OF_MAPS
+                && (value_size != 4 || flags & (flag::RDONLY_PROG | flag::WRONLY_PROG) != 0)
+            {
+                return Err(Errno::EINVAL);
+            }
             if max_entries == 0
                 || key_size != 4
                 || value_size == 0
                 || flags & !flag::ARRAY != 0
                 || !access_ok
             {
+                return Err(Errno::EINVAL);
+            }
+            // Only an array is mapped or made an inner map's template.
+            if kind != TYPE_ARRAY && flags & (flag::MMAPABLE | flag::INNER_MAP) != 0 {
                 return Err(Errno::EINVAL);
             }
             if flags & flag::PRESERVE_ELEMS != 0 {
@@ -568,7 +629,11 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
                 return Err(E2BIG);
             }
         }
-        TYPE_HASH | TYPE_LRU_HASH => {
+        TYPE_HASH | TYPE_LRU_HASH | TYPE_HASH_OF_MAPS => {
+            // fd_htab_map_alloc_check: a value is a descriptor.
+            if kind == TYPE_HASH_OF_MAPS && value_size != 4 {
+                return Err(Errno::EINVAL);
+            }
             let lru = kind == TYPE_LRU_HASH;
             if flags & flag::ZERO_SEED != 0 && !c.process.credentials.capable(CAP_SYS_ADMIN) {
                 return Err(Errno::EPERM);
@@ -645,13 +710,23 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     {
         return Err(Errno::EPERM);
     }
+    // array_of_map_alloc and htab_of_map_alloc: the template of the maps
+    // it holds, before the array or hash itself.
+    let inner = if matches!(kind, TYPE_ARRAY_OF_MAPS | TYPE_HASH_OF_MAPS) {
+        Some(template(c, inner_map_fd)?)
+    } else {
+        None
+    };
     // array_map_alloc: without `bpf_bypass_spec_v1` (CAP_PERFMON) the
     // array is rounded up to a power of two, which may overflow.
     let bypass_spec = {
         let credentials = &c.process.credentials;
         credentials.capable(1 << 38) || credentials.capable(CAP_SYS_ADMIN)
     };
-    if kind == TYPE_ARRAY && !bypass_spec && max_entries.checked_next_power_of_two().is_none() {
+    if matches!(kind, TYPE_ARRAY | TYPE_ARRAY_OF_MAPS)
+        && !bypass_spec
+        && max_entries.checked_next_power_of_two().is_none()
+    {
         return Err(E2BIG);
     }
     // bloom_map_alloc: no key, a value, entries, its flags, and the
@@ -718,6 +793,9 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     // machines' Linux 7.0 refuses both flags before the NUMA node and the
     // type.
     let access = file_access(flags)?;
+    // bpf_map_flags_retain_permanent: the access flags are the
+    // descriptor's, not the map's.
+    let flags = flags & !(flag::RDONLY | flag::WRONLY);
     let ids = &c.processes.bpf_maps;
     let map = ids.publish(|id| Map {
         kind,
@@ -731,6 +809,8 @@ fn create(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
         ids: Arc::clone(ids),
         cpus,
         frozen: AtomicBool::new(false),
+        exclusive: excl_hash != 0,
+        inner,
         elements: Mutex::new(if kind == TYPE_BLOOM_FILTER {
             Elements::Bloom(bloom(max_entries, map_extra, u32::from_le_bytes(seed)))
         } else {
@@ -770,6 +850,7 @@ fn bloom_size(max_entries: u32, extra: u64) -> u64 {
 fn elements(kind: u32, key_size: u32, max_entries: u32, flags: u32, cpus: u64) -> Elements {
     match kind {
         TYPE_ARRAY => Elements::Array(BTreeMap::new()),
+        TYPE_ARRAY_OF_MAPS | TYPE_HASH_OF_MAPS => Elements::Maps(BTreeMap::new()),
         TYPE_LPM_TRIE => Elements::Trie(Box::new(Trie::new(key_size, max_entries))),
         TYPE_QUEUE | TYPE_STACK => Elements::Queue(std::collections::VecDeque::new()),
         TYPE_LRU_HASH => Elements::Lru(Box::new(Lru::new(
@@ -800,6 +881,69 @@ fn new_fd(c: &mut Context<'_>, map: Arc<Map>, access: u32) -> Result<u64, Errno>
     c.files
         .install(Arc::new(MapFile { map, access }), true, c.group.nofile())
         .map(u64::from)
+}
+
+/// `bpf_map_meta_alloc`: the template of the map of `fd` (`EBADF` for no
+/// descriptor, `EINVAL` for one of no map), which is no map of maps
+/// (`EINVAL`: one level alone) and not exclusive to a program
+/// (`ENOTSUPP`); every other type here has a `map_meta_equal`.
+///
+/// The exclusive map's `ENOTSUPP`, here and in [`inner_of`], is Linux
+/// master's; the test machines' Linux 7.0 takes one.
+fn template(c: &Context<'_>, fd: u32) -> Result<Template, Errno> {
+    let (map, _, _) = map_of(c, fd)?;
+    if map.inner.is_some() {
+        return Err(Errno::EINVAL);
+    }
+    if map.exclusive {
+        return Err(ENOTSUPP);
+    }
+    Ok(Template::of(&map))
+}
+
+/// `bpf_map_fd_get_ptr`: the map of the descriptor in `value`, which must
+/// fit the template (`EINVAL`).
+fn inner_of(c: &Context<'_>, template: &Template, value: &[u8]) -> Result<Arc<Map>, Errno> {
+    let (map, _, _) = map_of(c, index(value))?;
+    if map.exclusive {
+        return Err(ENOTSUPP);
+    }
+    if !template.fits(&map) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(map)
+}
+
+/// `BPF_MAP_UPDATE_ELEM` of a value, from the syscall or a batch: a map of
+/// maps takes the map of a descriptor, the others the bytes.
+fn update_value(
+    c: &Context<'_>,
+    map: &Map,
+    key: &[u8],
+    value: Vec<u8>,
+    flags: u64,
+) -> Result<(), Errno> {
+    let Some(template) = &map.inner else {
+        return map.set(key, value, flags);
+    };
+    if map.kind == TYPE_ARRAY_OF_MAPS {
+        // bpf_fd_array_map_update_elem: `BPF_ANY` alone, and an index in
+        // range, before the descriptor.
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if index(key) >= map.max_entries {
+            return Err(E2BIG);
+        }
+        let inner = inner_of(c, template, &value)?;
+        return map.hold(key, inner, flags);
+    }
+    // bpf_fd_htab_map_update_elem: the descriptor, then the flags.
+    let inner = inner_of(c, template, &value)?;
+    if flags > EXIST {
+        return Err(Errno::EINVAL);
+    }
+    map.hold(key, inner, flags)
 }
 
 /// `sizeof(struct bpf_array)` before the values on x86-64, 312 bytes on the
@@ -911,7 +1055,7 @@ fn allocate(
     if kind == TYPE_BLOOM_FILTER {
         return Ok(());
     }
-    if kind == TYPE_ARRAY {
+    if matches!(kind, TYPE_ARRAY | TYPE_ARRAY_OF_MAPS) {
         let entries = if bypass_spec {
             u64::from(max_entries)
         } else {
@@ -928,8 +1072,13 @@ fn allocate(
     }
     area(buckets * BUCKET)?;
     if flags & flag::NO_PREALLOC == 0 {
-        // An LRU hash has no spare elements.
-        let spares = if kind == TYPE_LRU_HASH { 0 } else { cpus };
+        // An LRU hash and a hash of maps have no spare elements
+        // (`htab_has_extra_elems`).
+        let spares = if matches!(kind, TYPE_LRU_HASH | TYPE_HASH_OF_MAPS) {
+            0
+        } else {
+            cpus
+        };
         area(hash_element(key_size, value_size) * (u64::from(max_entries) + spares))?;
     }
     Ok(())
@@ -1074,6 +1223,7 @@ impl Map {
             Elements::Trie(trie) => trie.lookup(key).is_some(),
             Elements::Queue(values) => !values.is_empty(),
             Elements::Bloom(_) => true,
+            Elements::Maps(maps) => maps.contains_key(key),
         };
         if held { Ok(()) } else { Err(Errno::ENOENT) }
     }
@@ -1105,6 +1255,11 @@ impl Map {
             .ok_or(Errno::ENOENT),
             // A bloom filter is looked up by its value, not a key.
             Elements::Bloom(_) => Err(Errno::EINVAL),
+            // `bpf_map_fd_sys_lookup_elem`: the ID of the map it holds.
+            Elements::Maps(maps) => maps
+                .get(key)
+                .map(|map| map.id.to_le_bytes().to_vec())
+                .ok_or(Errno::ENOENT),
         }
     }
     /// `map_pop_elem`: a queue's oldest or a stack's newest, taken out.
@@ -1196,7 +1351,36 @@ impl Map {
                 }
                 bloom.push(&value);
             }
+            // A map of maps takes maps, which [`update_value`] finds from
+            // their descriptors; a program cannot update one.
+            Elements::Maps(_) => return Err(Errno::EINVAL),
         }
+        Ok(())
+    }
+    /// Puts `inner` at `key` of a map of maps, in place of the map there:
+    /// a hash's flags are checked as `htab_map_update_elem_in_place`
+    /// checks them, and it holds no more than `max_entries` (`E2BIG`).
+    fn hold(&self, key: &[u8], inner: Arc<Map>, mode: u64) -> Result<(), Errno> {
+        let mut elements = self.elements();
+        let Elements::Maps(maps) = &mut *elements else {
+            return Err(Errno::EINVAL);
+        };
+        if self.kind == TYPE_HASH_OF_MAPS {
+            let present = maps.contains_key(key);
+            if present && mode == NOEXIST {
+                return Err(Errno::EEXIST);
+            }
+            if !present && mode == EXIST {
+                return Err(Errno::ENOENT);
+            }
+            if !present && maps.len() >= self.max_entries as usize {
+                return Err(E2BIG);
+            }
+        }
+        let old = maps.insert(key.to_vec(), inner);
+        // The map given up goes once the lock is let go.
+        drop(elements);
+        drop(old);
         Ok(())
     }
     /// `map_delete_elem`: an array's elements cannot be (`EINVAL`).
@@ -1211,6 +1395,16 @@ impl Map {
             Elements::Trie(trie) => trie.delete(key).map(|value| copy(&value)),
             Elements::Queue(_) => Err(Errno::EINVAL),
             Elements::Bloom(_) => Err(EOPNOTSUPP),
+            // `fd_array_map_delete_elem` (an index past the end is `E2BIG`)
+            // and `htab_map_delete_elem`.
+            Elements::Maps(maps) => {
+                if self.kind == TYPE_ARRAY_OF_MAPS && index(key) >= self.max_entries {
+                    return Err(E2BIG);
+                }
+                maps.remove(key)
+                    .map(|map| map.id.to_le_bytes().to_vec())
+                    .ok_or(Errno::ENOENT)
+            }
         }
     }
     /// `map_get_next_key`: the first key after `key`, or the first of all
@@ -1218,7 +1412,9 @@ impl Map {
     /// `ENOENT` past the last.
     fn next(&self, key: Option<&[u8]>) -> Result<Vec<u8>, Errno> {
         match &*self.elements() {
-            Elements::Array(_) => {
+            Elements::Maps(maps) if self.kind == TYPE_HASH_OF_MAPS => next_in(maps, key),
+            // `bpf_array_get_next_key`, whatever the indexes hold.
+            Elements::Array(_) | Elements::Maps(_) => {
                 let i = key.map_or(u32::MAX, index);
                 if i >= self.max_entries {
                     return Ok(0u32.to_le_bytes().to_vec());
@@ -1247,6 +1443,10 @@ impl Map {
                 .filter_map(|k| Some((k.clone(), copy(lru.get(k)?))))
                 .collect(),
             Elements::Trie(trie) => trie.held().into_iter().map(|(k, v)| (k, copy(v))).collect(),
+            Elements::Maps(maps) => maps
+                .iter()
+                .map(|(k, map)| (k.clone(), map.id.to_le_bytes().to_vec()))
+                .collect(),
             Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => Vec::new(),
         }
     }
@@ -1259,10 +1459,12 @@ impl Map {
         let chosen: Vec<Vec<u8>> = match &*elements {
             Elements::Hash(values) => values.keys().skip(start).take(max).cloned().collect(),
             Elements::Lru(lru) => lru.table.keys().skip(start).take(max).cloned().collect(),
+            Elements::Maps(maps) => maps.keys().skip(start).take(max).cloned().collect(),
             Elements::Array(_) | Elements::Trie(_) | Elements::Queue(_) | Elements::Bloom(_) => {
                 Vec::new()
             }
         };
+        let mut given_up = Vec::new();
         let mut taken = Vec::with_capacity(chosen.len());
         for key in chosen {
             let value = match &mut *elements {
@@ -1270,6 +1472,12 @@ impl Map {
                 Elements::Hash(values) => values.get(&key).map(copy),
                 Elements::Lru(lru) if delete => lru.delete(&key).ok(),
                 Elements::Lru(lru) => lru.get(&key).map(copy),
+                Elements::Maps(maps) if delete => maps.remove(&key).map(|map| {
+                    let id = map.id.to_le_bytes().to_vec();
+                    given_up.push(map);
+                    id
+                }),
+                Elements::Maps(maps) => maps.get(&key).map(|map| map.id.to_le_bytes().to_vec()),
                 Elements::Array(_)
                 | Elements::Trie(_)
                 | Elements::Queue(_)
@@ -1282,8 +1490,11 @@ impl Map {
         let left = match &*elements {
             Elements::Hash(values) => values.len(),
             Elements::Lru(lru) => lru.table.len(),
+            Elements::Maps(maps) => maps.len(),
             Elements::Array(_) | Elements::Trie(_) | Elements::Queue(_) | Elements::Bloom(_) => 0,
         };
+        drop(elements);
+        drop(given_up);
         (taken, left)
     }
     /// How many keys it holds.
@@ -1292,7 +1503,8 @@ impl Map {
             Elements::Hash(values) => values.len(),
             Elements::Lru(lru) => lru.table.len(),
             Elements::Trie(trie) => trie.len() as usize,
-            Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => 0,
+            Elements::Maps(maps) if self.kind == TYPE_HASH_OF_MAPS => maps.len(),
+            Elements::Array(_) | Elements::Maps(_) | Elements::Queue(_) | Elements::Bloom(_) => 0,
         }
     }
     /// The memory it takes, as `bpf_map_memory_usage` counts it: an array's
@@ -1301,7 +1513,7 @@ impl Map {
     /// LRU hash's all of them alone), or those it holds with a list node
     /// each when not.
     fn memory(&self) -> u64 {
-        if self.kind == TYPE_ARRAY {
+        if matches!(self.kind, TYPE_ARRAY | TYPE_ARRAY_OF_MAPS) {
             return array_size(u64::from(self.max_entries), self.value_size, self.flags);
         }
         if matches!(self.kind, TYPE_QUEUE | TYPE_STACK) {
@@ -1321,7 +1533,14 @@ impl Map {
         if self.kind == TYPE_LRU_HASH {
             table + element * u64::from(self.max_entries)
         } else if self.flags & flag::NO_PREALLOC == 0 {
-            table + element * (u64::from(self.max_entries) + self.cpus) + POINTER * self.cpus
+            // A hash of maps has no spare elements, but the pointers to
+            // them are counted all the same.
+            let spares = if self.kind == TYPE_HASH_OF_MAPS {
+                0
+            } else {
+                self.cpus
+            };
+            table + element * (u64::from(self.max_entries) + spares) + POINTER * self.cpus
         } else {
             table + (element + POINTER) * self.len() as u64
         }
@@ -1432,8 +1651,20 @@ impl Map {
             // `ERR_PTR(-EINVAL)`, which the verifier never lets a program
             // reach.
             Elements::Queue(_) | Elements::Bloom(_) => return None,
+            // A map of maps' lookup gives a map, not a value:
+            // [`Map::prog_inner`].
+            Elements::Maps(_) => return None,
         };
         Some(ValueRef(value))
+    }
+    /// `array_of_map_lookup_elem` and `htab_of_map_lookup_elem`: the map at
+    /// `key` of a map of maps, or none (a null pointer).
+    pub(crate) fn prog_inner(&self, key: &[u8]) -> Option<Arc<Map>> {
+        sized(key, self.key_size).ok()?;
+        match &*self.elements() {
+            Elements::Maps(maps) => maps.get(key).cloned(),
+            _ => None,
+        }
     }
     /// `bpf_map_update_elem`: as the syscall's, but a queue's, a stack's
     /// and a bloom filter's are `EINVAL`, for their push is a helper of its
@@ -1447,8 +1678,12 @@ impl Map {
         self.set(key, value.to_vec(), flags)
     }
     /// `bpf_map_delete_elem`: an array's, a queue's and a stack's are
-    /// `EINVAL`, a bloom filter's `EOPNOTSUPP`.
+    /// `EINVAL`, a bloom filter's `EOPNOTSUPP`; a map of maps' only its
+    /// lookup is for programs.
     pub(crate) fn prog_delete(&self, key: &[u8]) -> Result<(), Errno> {
+        if self.inner.is_some() {
+            return Err(Errno::EINVAL);
+        }
         sized(key, self.key_size)?;
         self.remove(key).map(drop)
     }
@@ -1586,7 +1821,7 @@ fn update(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
     check_op_flags(flags, !0)?;
     let key = read_key(c, &map, word(attr, 8))?;
     let value = read_value(c, &map, word(attr, 16))?;
-    map.set(&key, value, flags)?;
+    update_value(c, &map, &key, value, flags)?;
     Ok(0)
 }
 
@@ -1662,7 +1897,7 @@ fn freeze(c: &mut Context<'_>, attr: &[u8]) -> Result<u64, Errno> {
 
 /// The batch commands, as Linux's `bpf_map_do_batch`: the access they
 /// need, then the map type's operation (`ENOTSUPP` for one it lacks: an
-/// array deletes nothing).
+/// array and an array of maps delete nothing).
 fn batch(c: &mut Context<'_>, attr: &[u8], at: u64, command: u32) -> Result<u64, Errno> {
     check_attr(attr, 56)?;
     let reads = matches!(
@@ -1674,7 +1909,8 @@ fn batch(c: &mut Context<'_>, attr: &[u8], at: u64, command: u32) -> Result<u64,
     if reads && !readable || writes && !writable {
         return Err(Errno::EPERM);
     }
-    let hash = map.hashed();
+    // A hash of maps' batches are a hash's (`BATCH_OPS(htab)`).
+    let hash = map.hashed() || map.kind == TYPE_HASH_OF_MAPS;
     // A queue, a stack and a bloom filter have no batch operations.
     if matches!(map.kind, TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER) {
         return Err(ENOTSUPP);
@@ -1716,7 +1952,7 @@ fn update_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Result<u64,
         let i = u64::from(done);
         let step = read_key(c, map, element(keys, i, key_size))
             .and_then(|key| Ok((key, read_value(c, map, element(values, i, value_size))?)))
-            .and_then(|(key, value)| map.set(&key, value, flags));
+            .and_then(|(key, value)| update_value(c, map, &key, value, flags));
         if let Err(e) = step {
             result = Err(e);
             break;
@@ -1758,9 +1994,11 @@ fn delete_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Result<u64,
     result
 }
 
-/// `generic_map_lookup_batch`, an array's and a trie's: the elements after the key at
-/// `in_batch` (from the first for none), and the last key given back at
-/// `out_batch`; `ENOENT` once they run out.
+/// `generic_map_lookup_batch`, an array's, an array of maps' and a trie's:
+/// the elements after the key at `in_batch` (from the first for none),
+/// passing over the keys that hold none (an array of maps' empty indexes),
+/// and the last key it came to given back at `out_batch`; `ENOENT` once
+/// they run out.
 fn array_lookup_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Result<u64, Errno> {
     check_op_flags(word(attr, 40), F_LOCK | F_CPU)?;
     let max = half(attr, 32);
@@ -1785,6 +2023,14 @@ fn array_lookup_batch(c: &Context<'_>, map: &Map, attr: &[u8], at: u64) -> Resul
                 break;
             }
         };
+        match map.holds(&key) {
+            Ok(()) => {}
+            Err(Errno::ENOENT) => {
+                previous = Some(key);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
         write(c, element(keys, u64::from(done), key_size), &key)?;
         copy_value(c, map, &key, element(values, u64::from(done), value_size))?;
         done += 1;
@@ -2407,6 +2653,8 @@ mod tests {
             ids: Arc::clone(ids),
             cpus: 2,
             frozen: AtomicBool::new(false),
+            exclusive: false,
+            inner: None,
             elements: Mutex::new(elements(kind, 4, max_entries, flags, 2)),
         }
     }
@@ -2958,5 +3206,98 @@ mod tests {
         assert!(name(b"map_1.x\0\0\0\0\0\0\0\0\0").is_ok());
         assert_eq!(name(b"map-1\0\0\0\0\0\0\0\0\0\0\0"), Err(Errno::EINVAL));
         assert_eq!(name(b"0123456789abcdef"), Err(Errno::EINVAL));
+    }
+
+    /// A map of maps of `kind` whose template is `template`'s.
+    fn maps(kind: u32, max_entries: u32, flags: u32, template: &Map) -> Map {
+        let mut map = shaped(kind, max_entries, 4, flags, &Arc::default(), 9);
+        map.inner = Some(Template::of(template));
+        map
+    }
+
+    #[test]
+    fn an_array_template_takes_arrays_of_its_entries_unless_it_is_an_inner_map() {
+        let ids = Arc::default();
+        let template = Template::of(&shaped(TYPE_ARRAY, 4, 8, 0, &ids, 1));
+        assert!(template.fits(&shaped(TYPE_ARRAY, 4, 8, 0, &ids, 2)));
+        assert!(!template.fits(&shaped(TYPE_ARRAY, 5, 8, 0, &ids, 3)));
+        assert!(!template.fits(&shaped(TYPE_ARRAY, 4, 16, 0, &ids, 4)));
+        assert!(!template.fits(&shaped(TYPE_ARRAY, 4, 8, flag::MMAPABLE, &ids, 5)));
+        assert!(!template.fits(&shaped(TYPE_HASH, 4, 8, 0, &ids, 6)));
+        let any = Template::of(&shaped(TYPE_ARRAY, 4, 8, flag::INNER_MAP, &ids, 7));
+        assert!(any.fits(&shaped(TYPE_ARRAY, 9, 8, flag::INNER_MAP, &ids, 8)));
+        assert!(!any.fits(&shaped(TYPE_ARRAY, 9, 8, 0, &ids, 10)));
+        // Any other type's template compares no entries.
+        let hash = Template::of(&shaped(TYPE_HASH, 4, 8, 0, &ids, 11));
+        assert!(hash.fits(&shaped(TYPE_HASH, 9, 8, 0, &ids, 12)));
+    }
+
+    #[test]
+    fn a_hash_of_maps_holds_maps_by_key_and_gives_their_ids() {
+        let ids: Arc<Ids> = Arc::default();
+        let inner = Arc::new(shaped(TYPE_HASH, 4, 8, 0, &ids, 21));
+        let other = Arc::new(shaped(TYPE_HASH, 4, 8, 0, &ids, 22));
+        let hash = maps(TYPE_HASH_OF_MAPS, 1, 0, &inner);
+        let key = 5u32.to_le_bytes();
+        hash.hold(&key, Arc::clone(&inner), NOEXIST).unwrap();
+        assert_eq!(hash.get(&key), Ok(21u32.to_le_bytes().to_vec()));
+        assert_eq!(
+            hash.hold(&key, Arc::clone(&other), NOEXIST),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            hash.hold(&6u32.to_le_bytes(), Arc::clone(&other), 0),
+            Err(E2BIG)
+        );
+        assert_eq!(
+            hash.hold(&6u32.to_le_bytes(), Arc::clone(&other), EXIST),
+            Err(Errno::ENOENT)
+        );
+        // Full, it still replaces the map a key holds, and lets the old go.
+        hash.hold(&key, Arc::clone(&other), EXIST).unwrap();
+        assert_eq!(Arc::strong_count(&inner), 1);
+        assert_eq!(hash.next(None), Ok(key.to_vec()));
+        assert_eq!(hash.remove(&key), Ok(22u32.to_le_bytes().to_vec()));
+        assert_eq!(Arc::strong_count(&other), 1);
+        assert_eq!(hash.remove(&key), Err(Errno::ENOENT));
+        // A program looks maps up, and updates none.
+        assert_eq!(hash.prog_update(&key, &[0; 4], 0), Err(Errno::EINVAL));
+        assert_eq!(hash.prog_delete(&key), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn an_array_of_maps_deletes_by_index_and_its_next_keys_are_an_arrays() {
+        let ids: Arc<Ids> = Arc::default();
+        let inner = Arc::new(shaped(TYPE_ARRAY, 4, 8, 0, &ids, 31));
+        let array = maps(TYPE_ARRAY_OF_MAPS, 3, 0, &inner);
+        let one = 1u32.to_le_bytes();
+        assert_eq!(array.holds(&one), Err(Errno::ENOENT));
+        array.hold(&one, Arc::clone(&inner), 0).unwrap();
+        assert_eq!(array.get(&one), Ok(31u32.to_le_bytes().to_vec()));
+        assert_eq!(array.prog_inner(&one).map(|map| map.id), Some(31));
+        assert!(array.prog_lookup(&one).is_none());
+        assert_eq!(array.next(None), Ok(0u32.to_le_bytes().to_vec()));
+        assert_eq!(array.next(Some(&one)), Ok(2u32.to_le_bytes().to_vec()));
+        assert_eq!(array.next(Some(&2u32.to_le_bytes())), Err(Errno::ENOENT));
+        assert_eq!(array.remove(&3u32.to_le_bytes()), Err(E2BIG));
+        assert_eq!(array.remove(&one), Ok(31u32.to_le_bytes().to_vec()));
+        assert_eq!(array.remove(&one), Err(Errno::ENOENT));
+        assert_eq!(array.memory(), ARRAY_HEADER + 3 * 8);
+    }
+
+    #[test]
+    fn a_preallocated_hash_of_maps_counts_no_spare_elements() {
+        let ids: Arc<Ids> = Arc::default();
+        let inner = shaped(TYPE_HASH, 4, 8, 0, &ids, 41);
+        let hash = maps(TYPE_HASH_OF_MAPS, 4, 0, &inner);
+        let element = HASH_ELEMENT + 8 + 8;
+        assert_eq!(
+            hash.memory(),
+            HASH_HEADER + BUCKET * 4 + element * 4 + POINTER * 2
+        );
+        let lazy = maps(TYPE_HASH_OF_MAPS, 4, flag::NO_PREALLOC, &inner);
+        lazy.hold(&[1; 4], Arc::new(shaped(TYPE_HASH, 4, 8, 0, &ids, 42)), 0)
+            .unwrap();
+        assert_eq!(lazy.memory(), HASH_HEADER + BUCKET * 4 + element + POINTER);
     }
 }

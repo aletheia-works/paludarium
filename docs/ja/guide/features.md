@@ -3294,7 +3294,27 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `ENOTSUPP` で、ほかのバッチのコマンドは次のキーをたどります。`CAP_BPF` と
   `BPF_F_NO_PREALLOC` が要り、フラグはそれと `BPF_F_NUMA_NODE` とアクセスのものだけで、
   値は 1 バイトから 4 MiB より 280 バイト小さい大きさまでです（`EINVAL`）。メモリは要素ごとに
-  24 バイトとデータと値で、ヘッダーと中間のノードは数えません。ないものは
+  24 バイトとデータと値で、ヘッダーと中間のノードは数えません。
+  `BPF_MAP_TYPE_ARRAY_OF_MAPS` と `BPF_MAP_TYPE_HASH_OF_MAPS` は、Linux の `map_in_map.c` と
+  同じくほかのマップを持ちます。値は 4 バイトのディスクリプタで（ほかの大きさは `EINVAL`）、
+  `inner_map_fd` のマップが、持つマップの手本になります（ディスクリプタがなければ `EBADF`、
+  マップでなければ `EINVAL`、マップのマップは一段だけなので `EINVAL`）。型、キーと値の大きさ、
+  フラグが手本と同じマップが合い、配列は、手本に `BPF_F_INNER_MAP` がなければ要素の数も
+  同じでなければなりません（合わなければ `EINVAL`）。`UPDATE_ELEM` はそのようなマップの
+  ディスクリプタを取り、`LOOKUP_ELEM` は要素が持つマップの ID を返します。外側のマップは、
+  ディスクリプタが閉じたあとも、消されるか置き換えられるまでマップを持ち続けます。
+  マップの配列は `BPF_ANY` だけを取り（ディスクリプタを見る前に `EINVAL`）、インデックスは
+  `max_entries` より小さくなければなりません（`E2BIG`）。マップを持たないインデックスは
+  `ENOENT` で、次のキーは配列と同じです。バッチの検索はマップを持たないインデックスを飛ばし、
+  バッチの削除はありません（`ENOTSUPP`）。`BPF_F_RDONLY_PROG`、`BPF_F_WRONLY_PROG`、
+  `BPF_F_MMAPABLE`、`BPF_F_INNER_MAP` は取りません（`EINVAL`）。マップのハッシュは、
+  フラグより先にディスクリプタを見ます。フラグはハッシュと同じです。ハッシュのバッチの
+  コマンドを持ちますが `LOOKUP_AND_DELETE_ELEM` はなく（`ENOTSUPP`）、事前に確保するときも
+  予備の要素は数えません。どちらも `CAP_BPF` は要りません。`excl_prog_hash` を付けて作った
+  マップは、Linux master と同じく、どのマップの内側のマップにもなりません（`ENOTSUPP`）。
+  テストのマシンの Linux 7.0 は受け入れます。`BPF_F_RDONLY` と `BPF_F_WRONLY` はマップではなく
+  ディスクリプタのものなので、Linux の `bpf_map_flags_retain_permanent` と同じく、
+  `map_flags`（fdinfo、`bpf_map_info`、手本）には入りません。ないものは
   [制限](./limitations) を参照してください。
 - `BPF_PROG_LOAD` は、Linux の `bpf_prog_load` と同じ順に同じエラーで引数を確かめます。
   この順とエラーは、テストのマシンのカーネル（Ubuntu の Linux 7.0）と master で同じです。

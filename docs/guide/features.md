@@ -3809,8 +3809,31 @@ kernel.
   `CAP_BPF` and `BPF_F_NO_PREALLOC`, takes only that, `BPF_F_NUMA_NODE`
   and the access flags, and a value of 1 byte up to 4 MiB less 280
   (`EINVAL`). Its memory is 24 bytes, the data and the value for each
-  element, with nothing for its header or intermediate nodes. See
-  [limitations](./limitations) for what is not there.
+  element, with nothing for its header or intermediate nodes. A
+  `BPF_MAP_TYPE_ARRAY_OF_MAPS` or `BPF_MAP_TYPE_HASH_OF_MAPS` holds other
+  maps, as Linux's `map_in_map.c`: its value is a 4-byte descriptor (any
+  other size is `EINVAL`), and the map of `inner_map_fd` is the template its
+  maps must be like (no descriptor is `EBADF`, one of no map `EINVAL`, and
+  a map of maps `EINVAL`, for there is one level alone). A map fits when its
+  type, key and value sizes and flags are the template's, and an array its
+  entries too unless the template has `BPF_F_INNER_MAP` (`EINVAL` if not).
+  `UPDATE_ELEM` takes the descriptor of such a map, `LOOKUP_ELEM` gives the
+  ID of the map an element holds, and the outer map keeps its maps after
+  their descriptors close, until they are deleted or replaced. An array of
+  maps takes `BPF_ANY` alone (`EINVAL`, before the descriptor is looked at)
+  and an index below `max_entries` (`E2BIG`); an index that holds no map is
+  `ENOENT`, its next keys are an array's, a batch lookup passes over the
+  indexes that hold none, and it has no batch delete (`ENOTSUPP`). It takes
+  neither `BPF_F_RDONLY_PROG`, `BPF_F_WRONLY_PROG`, `BPF_F_MMAPABLE` nor
+  `BPF_F_INNER_MAP` (`EINVAL`). A hash of maps looks at the descriptor
+  before its flags, which are a hash's; it has a hash's batch commands but
+  no `LOOKUP_AND_DELETE_ELEM` (`ENOTSUPP`), and preallocated it counts no
+  spare elements. Neither needs `CAP_BPF`. A map made with `excl_prog_hash`
+  is no map's inner map (`ENOTSUPP`), as Linux master has it; the test
+  machines' Linux 7.0 takes one. `BPF_F_RDONLY` and `BPF_F_WRONLY` are the
+  descriptor's, not the map's: `map_flags` (in fdinfo, `bpf_map_info` and a
+  template) leaves them out, as Linux's `bpf_map_flags_retain_permanent`
+  does. See [limitations](./limitations) for what is not there.
 - `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
   its order and with its errors, which are the same in the test machines'
   kernel (Ubuntu's Linux 7.0) and in master: the fields past the command

@@ -138,6 +138,7 @@
     {"name":"bpf-queue","binary":"bpf"},
     {"name":"bpf-bloom","binary":"bpf"},
     {"name":"bpf-lpm","binary":"bpf"},
+    {"name":"bpf-maps","binary":"bpf"},
     {"name":"bpf-prog-load","binary":"bpf"},
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"inotify-directory","binary":"inotify"},

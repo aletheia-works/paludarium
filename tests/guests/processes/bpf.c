@@ -15,6 +15,11 @@
    keys: which prefix holds an address, the order of the next keys (more
    specific prefixes first), the bytes past a prefix that an element
    keeps, the room they take, and the batch commands.
+   bpf-maps: arrays and hashes of maps, which hold other maps by their
+   descriptors: the template the inner map's descriptor gives at creation,
+   which maps fit it, the IDs a lookup gives, an inner map kept after its
+   descriptor closes and given up on delete, the flags, the batch
+   commands and the room they take.
 
    The map IDs (BPF_MAP_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID) are compared by
    what they find, and the memory fdinfo gives a map (memlock), with the
@@ -58,6 +63,8 @@
 #define TYPE_HASH 1
 #define TYPE_ARRAY 2
 #define TYPE_LRU_HASH 9
+#define TYPE_ARRAY_OF_MAPS 12
+#define TYPE_HASH_OF_MAPS 13
 #define TYPE_LPM_TRIE 11
 #define TYPE_QUEUE 22
 #define TYPE_STACK 23
@@ -73,6 +80,7 @@
 #define F_WRONLY_PROG (1 << 8)
 #define F_MMAPABLE (1 << 10)
 #define F_PRESERVE_ELEMS (1 << 11)
+#define F_INNER_MAP (1 << 12)
 
 #define ANY 0
 #define NOEXIST 1
@@ -1273,6 +1281,265 @@ static int case_lpm(void) {
     return 0;
 }
 
+static union attr outer_attr(uint32_t type, uint32_t key, uint32_t value, uint32_t entries, uint32_t flags, int inner) {
+    union attr a = map_attr(type, key, value, entries, flags);
+    a.inner_map_fd = (uint32_t)inner;
+    return a;
+}
+
+static int outer(uint32_t type, uint32_t key, uint32_t entries, uint32_t flags, int inner) {
+    union attr a = outer_attr(type, key, 4, entries, flags, inner);
+    long fd = bpf(MAP_CREATE, &a, sizeof a);
+    if (fd < 0) {
+        say("outer %ld", fd);
+        exit(1);
+    }
+    return (int)fd;
+}
+
+/* An update of key to the map of descriptor fd. */
+static long hold(int map, uint32_t key, int fd, uint64_t flags) {
+    uint32_t value = (uint32_t)fd;
+    return elem(MAP_UPDATE_ELEM, map, &key, &value, flags);
+}
+
+/* A lookup of key: the error, or whether it gives the ID of fd's map. */
+static void holding(const char *name, int map, uint32_t key, int fd) {
+    uint32_t id = 0;
+    long r = elem(MAP_LOOKUP_ELEM, map, &key, &id, 0);
+    say("%s %ld same %d", name, r, r == 0 && id == id_of(fd));
+}
+
+static int case_maps(void) {
+    int inner = make(TYPE_ARRAY, 4, 8, 4, 0);
+    int hash = make(TYPE_HASH, 4, 8, 4, 0);
+    int closed = dup(inner);
+    close(closed);
+
+    /* The value is a descriptor, and the template another map's. */
+    create("array of maps value 8", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 8, 4, 0, inner));
+    create("hash of maps value 8", outer_attr(TYPE_HASH_OF_MAPS, 4, 8, 4, 0, inner));
+    create("array of maps rdonly prog", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 4, 4, F_RDONLY_PROG, inner));
+    create("array of maps wronly prog", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 4, 4, F_WRONLY_PROG, inner));
+    create("hash of maps rdonly prog", outer_attr(TYPE_HASH_OF_MAPS, 4, 4, 4, F_RDONLY_PROG, inner));
+    create("array of maps inner map flag", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 4, 4, F_INNER_MAP, inner));
+    create("array of maps mmapable", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 4, 4, F_MMAPABLE, inner));
+    create("array of maps key 8", outer_attr(TYPE_ARRAY_OF_MAPS, 8, 4, 4, 0, inner));
+    create("array of maps no entries", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 4, 0, 0, inner));
+    create("hash of maps no entries", outer_attr(TYPE_HASH_OF_MAPS, 4, 4, 0, 0, inner));
+    create("array of maps closed inner", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 4, 4, 0, closed));
+    create("hash of maps closed inner", outer_attr(TYPE_HASH_OF_MAPS, 4, 4, 4, 0, closed));
+    create("array of maps file inner", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 4, 4, 0, 1));
+    create("hash of maps value 8 closed inner", outer_attr(TYPE_HASH_OF_MAPS, 4, 8, 4, 0, closed));
+    int nested = outer(TYPE_ARRAY_OF_MAPS, 4, 2, 0, inner);
+    create("array of maps of maps", outer_attr(TYPE_ARRAY_OF_MAPS, 4, 4, 4, 0, nested));
+    create("hash of maps of maps", outer_attr(TYPE_HASH_OF_MAPS, 4, 4, 4, 0, nested));
+    close(nested);
+
+    /* An array of maps: maps like the template, by index. */
+    int array = outer(TYPE_ARRAY_OF_MAPS, 4, 3, 0, inner);
+    int same = make(TYPE_ARRAY, 4, 8, 4, 0);
+    int longer = make(TYPE_ARRAY, 4, 8, 5, 0);
+    int wider = make(TYPE_ARRAY, 4, 16, 4, 0);
+    int readonly = make(TYPE_ARRAY, 4, 8, 4, F_RDONLY);
+    int mappable = make(TYPE_ARRAY, 4, 8, 4, F_MMAPABLE);
+    say("array of maps the template %ld", hold(array, 0, inner, ANY));
+    say("array of maps another like it %ld", hold(array, 1, same, ANY));
+    say("array of maps more entries %ld", hold(array, 2, longer, ANY));
+    say("array of maps wider values %ld", hold(array, 2, wider, ANY));
+    say("array of maps read only %ld", hold(array, 2, readonly, ANY));
+    say("array of maps mappable %ld", hold(array, 2, mappable, ANY));
+    say("array of maps a hash %ld", hold(array, 2, hash, ANY));
+    say("array of maps itself %ld", hold(array, 2, array, ANY));
+    say("array of maps closed %ld", hold(array, 2, closed, ANY));
+    say("array of maps a file %ld", hold(array, 2, 1, ANY));
+    say("array of maps noexist %ld", hold(array, 2, same, NOEXIST));
+    say("array of maps exist %ld", hold(array, 0, same, EXIST));
+    say("array of maps past the end %ld", hold(array, 3, same, ANY));
+    say("array of maps past the end closed %ld", hold(array, 3, closed, ANY));
+    say("array of maps noexist closed %ld", hold(array, 2, closed, NOEXIST));
+    say("array of maps lock %ld", hold(array, 2, same, ELEM_F_LOCK));
+    holding("array of maps lookup 0", array, 0, inner);
+    holding("array of maps lookup 1", array, 1, same);
+    holding("array of maps lookup 2", array, 2, same);
+    holding("array of maps lookup 3", array, 3, same);
+    keys("array of maps", array);
+    uint32_t k = 2, next = 0;
+    say("array of maps next of the last %ld", elem(MAP_GET_NEXT_KEY, array, &k, &next, 0));
+    k = 7;
+    long r = elem(MAP_GET_NEXT_KEY, array, &k, &next, 0);
+    say("array of maps next past the end %ld %u", r, next);
+    uint32_t got = 0;
+    say("array of maps lookup and delete %ld", elem(MAP_LOOKUP_AND_DELETE_ELEM, array, &k, &got, 0));
+
+    /* The map stays while the outer map holds it, and goes on delete. */
+    int kept = make(TYPE_ARRAY, 4, 8, 4, 0);
+    uint32_t kept_id = id_of(kept);
+    say("array of maps kept %ld", hold(array, 2, kept, ANY));
+    close(kept);
+    long again = fd_by_id(kept_id, 0);
+    say("kept after its descriptor closes %s", again >= 0 ? "fd" : "error");
+    if (again >= 0) close((int)again);
+    holding("array of maps lookup kept", array, 2, -1);
+    k = 2;
+    say("array of maps delete %ld", elem(MAP_DELETE_ELEM, array, &k, NULL, 0));
+    say("kept after delete %ld", fd_by_id(kept_id, 0));
+    say("array of maps delete again %ld", elem(MAP_DELETE_ELEM, array, &k, NULL, 0));
+    k = 3;
+    say("array of maps delete past the end %ld", elem(MAP_DELETE_ELEM, array, &k, NULL, 0));
+    holding("array of maps lookup deleted", array, 2, same);
+
+    /* Batches: lookups pass over empty indexes; there is no delete. */
+    uint32_t bk[4] = {0, 1, 2, 3}, bv[4], gk[4], gv[4], count = 2, in = 0, out = 99;
+    bv[0] = (uint32_t)same;
+    bv[1] = (uint32_t)inner;
+    k = 0;
+    elem(MAP_DELETE_ELEM, array, &k, NULL, 0);
+    bk[0] = 2;
+    bk[1] = 0;
+    r = batch(MAP_UPDATE_BATCH, array, NULL, NULL, bk, bv, &count, 0);
+    say("array of maps update batch %ld count %u", r, count);
+    k = 1;
+    elem(MAP_DELETE_ELEM, array, &k, NULL, 0);
+    count = 4;
+    memset(gk, 0xff, sizeof gk);
+    r = batch(MAP_LOOKUP_BATCH, array, NULL, &out, gk, gv, &count, 0);
+    say("array of maps lookup batch %ld count %u out %u keys %u %u same %d %d", r, count, out, gk[0], gk[1],
+        gv[0] == id_of(inner), gv[1] == id_of(same));
+    count = 1;
+    out = 99;
+    r = batch(MAP_LOOKUP_BATCH, array, NULL, &out, gk, gv, &count, 0);
+    say("array of maps lookup batch of one %ld count %u out %u key %u", r, count, out, gk[0]);
+    in = 0;
+    count = 1;
+    out = 99;
+    r = batch(MAP_LOOKUP_BATCH, array, &in, &out, gk, gv, &count, 0);
+    say("array of maps lookup batch from 0 %ld count %u out %u key %u", r, count, out, gk[0]);
+    in = 2;
+    count = 4;
+    out = 99;
+    r = batch(MAP_LOOKUP_BATCH, array, &in, &out, gk, gv, &count, 0);
+    say("array of maps lookup batch from the last %ld count %u out %u", r, count, out);
+    count = 2;
+    bk[0] = 0;
+    bk[1] = 1;
+    bv[0] = (uint32_t)same;
+    bv[1] = (uint32_t)wider;
+    r = batch(MAP_UPDATE_BATCH, array, NULL, NULL, bk, bv, &count, 0);
+    say("array of maps update batch with a misfit %ld count %u", r, count);
+    count = 2;
+    say("array of maps delete batch %ld", batch(MAP_DELETE_BATCH, array, NULL, NULL, bk, NULL, &count, 0));
+    count = 2;
+    say("array of maps lookup and delete batch %ld",
+        batch(MAP_LOOKUP_AND_DELETE_BATCH, array, NULL, &out, gk, gv, &count, 0));
+    say("array of maps memlock %llu", memlock(array));
+    say("array of maps freeze %ld", ({
+            union attr f;
+            memset(&f, 0, sizeof f);
+            f.elem.map_fd = (uint32_t)array;
+            bpf(MAP_FREEZE, &f, sizeof f);
+        }));
+    say("array of maps frozen update %ld", hold(array, 1, same, ANY));
+    close(array);
+
+    /* An array template with BPF_F_INNER_MAP takes arrays of any size. */
+    int any = make(TYPE_ARRAY, 4, 8, 4, F_INNER_MAP);
+    int any_longer = make(TYPE_ARRAY, 4, 8, 9, F_INNER_MAP);
+    array = outer(TYPE_ARRAY_OF_MAPS, 4, 2, 0, any);
+    say("inner map flag longer %ld", hold(array, 0, any_longer, ANY));
+    say("inner map flag without it %ld", hold(array, 0, longer, ANY));
+    close(array);
+    close(any);
+    close(any_longer);
+
+    /* The access flags are the descriptor's, not the map's. */
+    struct map_info mi;
+    memset(&mi, 0, sizeof mi);
+    union attr q;
+    memset(&q, 0, sizeof q);
+    q.info.bpf_fd = (uint32_t)readonly;
+    q.info.info_len = sizeof mi;
+    q.info.info = (uintptr_t)&mi;
+    r = bpf(OBJ_GET_INFO_BY_FD, &q, sizeof q);
+    say("read only map %ld flags %u", r, mi.map_flags);
+    array = outer(TYPE_ARRAY_OF_MAPS, 4, 2, 0, readonly);
+    say("read only template takes another %ld", hold(array, 0, same, ANY));
+    close(array);
+
+    /* A hash of maps: a hash's flags, after the descriptor. */
+    int map = outer(TYPE_HASH_OF_MAPS, 4, 2, 0, hash);
+    int hash2 = make(TYPE_HASH, 4, 8, 4, 0);
+    int hash_longer = make(TYPE_HASH, 4, 8, 9, 0);
+    int hash_lazy = make(TYPE_HASH, 4, 8, 4, F_NO_PREALLOC);
+    say("hash of maps the template %ld", hold(map, 10, hash, ANY));
+    say("hash of maps more entries %ld", hold(map, 11, hash_longer, ANY));
+    say("hash of maps no prealloc %ld", hold(map, 11, hash_lazy, ANY));
+    say("hash of maps an array %ld", hold(map, 11, inner, ANY));
+    say("hash of maps closed %ld", hold(map, 11, closed, ANY));
+    say("hash of maps closed with bad flags %ld", hold(map, 11, closed, 3));
+    say("hash of maps misfit with bad flags %ld", hold(map, 11, inner, 7));
+    say("hash of maps bad flags %ld", hold(map, 11, hash2, 3));
+    say("hash of maps lock %ld", hold(map, 11, hash2, ELEM_F_LOCK));
+    say("hash of maps noexist %ld", hold(map, 10, hash2, NOEXIST));
+    say("hash of maps exist %ld", hold(map, 11, hash2, EXIST));
+    say("hash of maps another %ld", hold(map, 11, hash2, NOEXIST));
+    say("hash of maps full %ld", hold(map, 12, hash2, ANY));
+    say("hash of maps replace when full %ld", hold(map, 10, hash2, EXIST));
+    holding("hash of maps lookup 10", map, 10, hash2);
+    holding("hash of maps lookup 11", map, 11, hash2);
+    holding("hash of maps lookup 12", map, 12, hash2);
+    keys("hash of maps", map);
+    k = 10;
+    say("hash of maps lookup and delete %ld", elem(MAP_LOOKUP_AND_DELETE_ELEM, map, &k, &got, 0));
+    say("hash of maps delete %ld", elem(MAP_DELETE_ELEM, map, &k, NULL, 0));
+    say("hash of maps delete again %ld", elem(MAP_DELETE_ELEM, map, &k, NULL, 0));
+    keys("hash of maps after delete", map);
+    close(map);
+
+    /* Its batches are a hash's. */
+    map = outer(TYPE_HASH_OF_MAPS, 4, 8, F_NO_PREALLOC, hash);
+    say("hash of maps no prealloc memlock empty %llu", memlock(map));
+    uint32_t hk[3] = {5, 6, 7}, hv[3] = {(uint32_t)hash, (uint32_t)hash2, (uint32_t)hash};
+    count = 3;
+    r = batch(MAP_UPDATE_BATCH, map, NULL, NULL, hk, hv, &count, 0);
+    say("hash of maps update batch %ld count %u", r, count);
+    say("hash of maps no prealloc memlock %llu", memlock(map));
+    uint32_t pairs[8][2];
+    uint32_t lk[8], lv[8];
+    count = 8;
+    r = batch(MAP_LOOKUP_BATCH, map, NULL, &out, lk, lv, &count, 0);
+    for (uint32_t i = 0; i < count && i < 8; i++) {
+        pairs[i][0] = lk[i];
+        pairs[i][1] = lv[i] == id_of(hash) ? 1 : lv[i] == id_of(hash2) ? 2 : 0;
+    }
+    qsort(pairs, count < 8 ? count : 8, sizeof pairs[0], compare);
+    printf("hash of maps lookup batch %ld count %u", r, count);
+    for (uint32_t i = 0; i < count && i < 8; i++) printf(" %u:%u", pairs[i][0], pairs[i][1]);
+    putchar('\n');
+    fflush(stdout);
+    uint32_t gone[1] = {6};
+    count = 1;
+    r = batch(MAP_DELETE_BATCH, map, NULL, NULL, gone, NULL, &count, 0);
+    say("hash of maps delete batch %ld count %u", r, count);
+    count = 8;
+    r = batch(MAP_LOOKUP_AND_DELETE_BATCH, map, NULL, &out, lk, lv, &count, 0);
+    say("hash of maps lookup and delete batch %ld count %u", r, count);
+    keys("hash of maps emptied", map);
+    close(map);
+
+    close(inner);
+    close(hash);
+    close(same);
+    close(longer);
+    close(wider);
+    close(readonly);
+    close(mappable);
+    close(hash2);
+    close(hash_longer);
+    close(hash_lazy);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -1285,6 +1552,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "bpf-queue")) return case_queue();
     if (!strcmp(mode, "bpf-bloom")) return case_bloom();
     if (!strcmp(mode, "bpf-lpm")) return case_lpm();
+    if (!strcmp(mode, "bpf-maps")) return case_maps();
     if (!strcmp(mode, "bpf-prog-load")) return case_prog_load();
     return 2;
 }

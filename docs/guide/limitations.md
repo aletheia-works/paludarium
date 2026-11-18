@@ -280,8 +280,8 @@ verified.
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
 - **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes,
-  longest-prefix-match tries, queues, stacks and bloom filters and nothing
-  else. Programs are never loaded: there is no verifier and no BPF runs.
+  longest-prefix-match tries, queues, stacks, bloom filters, and arrays
+  and hashes of maps, and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
   `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
   every program with `EINVAL`, as a kernel built without the program's
   type does; a program Linux would load, or reject in its verifier with

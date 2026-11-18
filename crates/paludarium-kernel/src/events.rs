@@ -37,6 +37,10 @@ pub(crate) fn signalled(c: &Context<'_>) -> bool {
 
 /// Sample the ticket before readiness inspection to prevent lost writes.
 pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> Result<(), Errno> {
+    // A process signal sent after this count can set the wake the drain
+    // below clears, even one the drain after it takes in before the wait:
+    // a later count tells it from an interruption once the wait ends.
+    let notices = c.group.process_notices();
     let receipt = c.inbox.drain(c.process);
     c.group.drain_process(c.process);
     let now = c.host.clock(paludarium_host::ClockId::Monotonic)?;
@@ -66,7 +70,7 @@ pub(crate) fn wait(c: &mut Context<'_>, ticket: u32, deadline: Option<u64>) -> R
     let receipt = c.inbox.drain(c.process);
     // A signal sent to the process wakes every thread; one that ends no
     // wait (an ignored one, or one another thread takes) is no interruption.
-    let sent = c.group.drain_process(c.process);
+    let sent = c.group.drain_process(c.process) | (c.group.process_notices() != notices);
     c.group.expire_timer(
         c.process,
         c.host.clock(paludarium_host::ClockId::Monotonic)?,

@@ -890,6 +890,28 @@ fn every_thread_learns_of_a_process_signal_another_took() {
     assert!(!group.drain_process(&mut other));
 }
 #[test]
+fn a_signal_taken_in_before_a_wait_still_explains_its_wake() {
+    let group = ThreadGroup::default();
+    let inbox = Arc::new(SignalInbox::default());
+    group.register(2, Arc::clone(&inbox));
+    let mut waiter = ThreadState::default();
+    let wake = inbox.wake_token();
+    // The wait counts the process's signals and clears its wake; an ignored
+    // SIGURG sent then sets the wake again, and the drain just before the
+    // wait takes it in.
+    let notices = group.process_notices();
+    inbox.drain(&mut waiter);
+    group.send_process_from(23, 2, 0).unwrap();
+    group.drain_process(&mut waiter);
+    assert!(wake.load(Ordering::SeqCst));
+    assert!(signals::next_pending(&waiter, true).is_none());
+    // Once the wait wakes, the drain after it finds nothing new, but the
+    // count tells that a signal woke it, so it waits on.
+    assert!(!inbox.drain(&mut waiter).interrupted);
+    assert!(!group.drain_process(&mut waiter));
+    assert_ne!(group.process_notices(), notices);
+}
+#[test]
 fn futex_wake_counts_before_it_compares() {
     let m = memory();
     let f = futex::Futexes::default();

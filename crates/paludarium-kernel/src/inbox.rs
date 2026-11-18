@@ -135,8 +135,11 @@ impl SignalInbox {
         }
     }
     /// How many signals have been sent here ([`Self::send_pending`],
-    /// [`Self::send_timer`]); an interruption does not count.
+    /// [`Self::send_timer`]); an interruption does not count. Read under
+    /// the lock a send holds, it comes before or after the whole of a send:
+    /// its count and the wakes it sets.
     pub(crate) fn notices(&self) -> u64 {
+        let _queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         self.notices.load(Ordering::SeqCst)
     }
     fn notify_listeners(&self) {

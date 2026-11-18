@@ -4058,6 +4058,9 @@ fn stat(
 /// a cancellation comes first.
 pub(crate) fn pause_for_lock(c: &mut Context<'_>) -> Result<(), Errno> {
     let timer_generation = c.group.timer_generation();
+    // As in [`crate::events::wait`]: counted before the drain clears the
+    // wake, a process signal that sets it again shows in a later count.
+    let notices = c.group.process_notices();
     let receipt = c.inbox.drain(c.process);
     c.group.drain_process(c.process);
     let now = c.host.clock(ClockId::Monotonic)?;
@@ -4079,7 +4082,7 @@ pub(crate) fn pause_for_lock(c: &mut Context<'_>) -> Result<(), Errno> {
         c.cancellation,
     )?;
     let receipt = c.inbox.drain(c.process);
-    let sent = c.group.drain_process(c.process);
+    let sent = c.group.drain_process(c.process) | (c.group.process_notices() != notices);
     if c.group.status().is_some()
         || crate::signals::next_pending(c.process, true).is_some()
         || receipt.interrupted

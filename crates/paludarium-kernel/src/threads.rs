@@ -1679,6 +1679,17 @@ impl ThreadGroup {
     pub(crate) fn apply_discards(&self, local: &mut ThreadState) {
         self.discards.apply(local);
     }
+    /// How many signals have been sent to the process inbox so far
+    /// ([`SignalInbox::notices`]). A wait reads it before its own inbox
+    /// clears its wake: a send wholly before the read set a wake the drain
+    /// clears, and one after it, which can wake the wait even when the drain
+    /// before the wait takes the signal in, shows in a later count.
+    pub(crate) fn process_notices(&self) -> u64 {
+        self.process_inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .notices()
+    }
     /// Takes in the process's signals; whether a signal has been sent to the
     /// process inbox since this thread last did, which is what woke a
     /// thread its own inbox has nothing for.

@@ -256,7 +256,11 @@ The evidence is two fork runs of main at `c615ddf8` (the default of a
 threshold of 300 and compiling in the background) with the five-round
 workflow: an Intel Xeon Platinum 8573C (run 44193580662) and an AMD EPYC 9V74
 (run 44193575557). In both no case was slower; Java was 43–50% faster, Perl's
-hash benchmark 34–41% and OCaml 36–42%.
+hash benchmark 34–41% and OCaml 36–42%. These runs count for the switch while
+the JIT compiles and runs code as it did at `c615ddf8`, with the same defaults.
+A change to the compiled code, to how blocks are compiled or entered, or to the
+threshold or compiling in the background, is measured again, on the commit
+that brings it, before the switch.
 
 **A known limitation of the default.** Short programs pay for their first
 compiles. A third run of the same commit, on an AMD EPYC 7763 (run
@@ -264,10 +268,10 @@ compiles. A third run of the same commit, on an AMD EPYC 7763 (run
 3 ms (225–230 ms against 219–223 ms). On all three runners the ripgrep cases'
 medians are up to 2% slower with the JIT. Compiling more instructions of each
 block does not help: it lengthens those compiles, and made ripgrep's
-`no-match` slower still on the 7763. The Intel Xeon 6973P-C has not been run
-with five rounds. An older version of this comparison started only the JIT
-through a shell wrapper, which made programs of about 20 ms look slower than
-they are.
+`no-match` 2.4% slower again than main's JIT on the 7763 (#758, closed; run
+44219431384). The Intel Xeon 6973P-C has not been run with five rounds. An
+older version of this comparison started only the JIT through a shell wrapper,
+which made programs of about 20 ms look slower than they are.
 
 ## One way to create a filesystem
 

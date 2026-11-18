@@ -16535,7 +16535,8 @@ static int ipc_sysctl_case(void) {
    another user's write.
    Root writes nothing: these are the machine's own, the test runner's on
    native Linux. perf_event_paranoid's value is not printed: Debian's and
-   Ubuntu's kernels default to more than Linux's 2. */
+   Ubuntu's kernels default to more than Linux's 2; nor is
+   perf_event_mlock_kb's, which a host may tune, only that it is above 0. */
 static int kernel_sysctl_case(void) {
     const char *names[] = {"perf_event_paranoid", "perf_event_mlock_kb", "unprivileged_bpf_disabled"};
     for (int i = 0; i < 3; i++) {
@@ -16551,7 +16552,8 @@ static int kernel_sysctl_case(void) {
         long value = strtol(text, &end, 10);
         printf("%s: stat=%ld mode=%o uid=%d gid=%d read=%d", names[i], stated, st.st_mode, st.st_uid, st.st_gid,
                n > 0 && *end == '\n');
-        if (i > 0) printf(" value=%ld", value);
+        if (i == 1) printf(" positive=%d", value > 0);
+        if (i == 2) printf(" value=%ld", value);
         printf("\n");
     }
     fflush(stdout);

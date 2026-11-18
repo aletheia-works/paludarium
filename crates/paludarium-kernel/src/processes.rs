@@ -223,8 +223,8 @@ pub struct Processes {
     kcmp_cookies: std::sync::OnceLock<[[u64; 2]; crate::kcmp::TYPES]>,
     /// The events the machine's aio contexts take, and their limit.
     pub(crate) aio: Arc<crate::aio::Limits>,
-    /// The machine's `kernel.perf_event_paranoid` and
-    /// `kernel.unprivileged_bpf_disabled`.
+    /// The machine's `kernel.perf_event_mlock_kb`, `kernel.perf_event_paranoid`
+    /// and `kernel.unprivileged_bpf_disabled`.
     pub(crate) sysctls: Arc<crate::sysctl::Machine>,
     /// The `memfd_secret` pages each user has (Linux's `locked_vm` of its
     /// `user_struct`).

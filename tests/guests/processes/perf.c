@@ -599,15 +599,30 @@ static void map_twice(int fd) {
 }
 
 /* Without RLIMIT_MEMLOCK or CAP_IPC_LOCK, what passes the user's share
-   (perf_event_mlock_kb, 516 KiB a CPU) is refused. */
+   (perf_event_mlock_kb a CPU, 516 KiB unless the host tunes it, read as
+   it is) is refused. */
 static void map_past_limit(int fd) {
     struct rlimit none = {0, 0};
     setrlimit(RLIMIT_MEMLOCK, &none);
-    size_t share = (size_t)129 * (size_t)get_nprocs();
-    size_t data = 1;
-    while (data + 1 <= share) data <<= 1;
-    say("past limit: within %ld over %ld", map_event(fd, 129, PROT_READ, MAP_SHARED, 0, NULL),
-        map_event(fd, data + 1, PROT_READ, MAP_SHARED, 0, NULL));
+    char text[32] = {0};
+    int sysctl = open("/proc/sys/kernel/perf_event_mlock_kb", O_RDONLY);
+    if (sysctl < 0 || read(sysctl, text, sizeof text - 1) <= 0) {
+        say("past limit: no perf_event_mlock_kb");
+        return;
+    }
+    close(sysctl);
+    long kb = strtol(text, NULL, 10);
+    if (kb < 8) {
+        say("past limit: share below two pages");
+        return;
+    }
+    size_t share = (size_t)(kb >> 2) * (size_t)get_nprocs();
+    /* The largest buffer within the share, and the smallest past it. */
+    size_t within = 1, over = 1;
+    while (2 * within + 1 <= share) within <<= 1;
+    while (over + 1 <= share) over <<= 1;
+    say("past limit: within %ld over %ld", map_event(fd, within + 1, PROT_READ, MAP_SHARED, 0, NULL),
+        map_event(fd, over + 1, PROT_READ, MAP_SHARED, 0, NULL));
 }
 
 static int case_mmap(void) {

@@ -224,11 +224,13 @@ mod linux {
                     | "userfaultfd-move"
                     | "userfaultfd-shmem"
                     | "userfaultfd-minor"
+                    | "userfaultfd-wp-shmem"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
                     | "perf-prctl"
                     | "perf-inherit"
+                    | "perf-software"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -537,6 +539,7 @@ mod linux {
         perf_exec => ("perf-exec","perf"),
         perf_prctl => ("perf-prctl","perf"),
         perf_inherit => ("perf-inherit","perf"),
+        perf_software => ("perf-software","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -588,6 +591,7 @@ mod linux {
         userfaultfd_move => ("userfaultfd-move","userfaultfd"),
         userfaultfd_shmem => ("userfaultfd-shmem","userfaultfd"),
         userfaultfd_minor => ("userfaultfd-minor","userfaultfd"),
+        userfaultfd_wp_shmem => ("userfaultfd-wp-shmem","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

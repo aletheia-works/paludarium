@@ -1,6 +1,6 @@
 # The native JIT's speed against the interpreter, on one runner: the probe,
-# ripgrep and aube cases, Perl's benchmarks and 12 Debian programs, three
-# rounds each (two for the Debian programs), with and without the JIT.
+# ripgrep and aube cases, Perl's benchmarks and 12 Debian programs, five
+# rounds each, with and without the JIT.
 # .github/jit-bench/check.py fails the run when the JIT makes a case slower
 # than every round without it, one of the criteria for turning the JIT on by
 # default (docs/design/decisions.md). Run by hand; actions are pinned by
@@ -66,14 +66,14 @@ jobs:
       - run: docker build --pull -t paludarium-distro tests/guests/distro
       - name: Time with and without the JIT
         run: |
-          for _ in 1 2 3; do
+          for _ in 1 2 3 4 5; do
             for v in interpreter jit; do
               bash "$BENCH/programs.sh" "$PWD/bin/$v" "$v"
               docker run --rm -v "$PWD/bin:/bin2:ro" -v "$PWD/$BENCH:/bench:ro" paludarium-distro bash /bench/perl.sh "/bin2/$v" "$v"
             done
           done 2>&1 | tee times.txt
           docker run --rm -v "$PWD/tests/guests/distro:/distro:ro" -v "$PWD/bin:/bin2:ro" paludarium-distro bash -c '
-            for r in 1 2; do
+            for r in 1 2 3 4 5; do
               for v in interpreter jit; do
                 python3 -B /distro/compare.py --emulator /bin2/$v --work /tmp/w-$v-$r --output /tmp/o-$v-$r --jobs 1 \
                   parallel perl java compressors sbcl postgresql gcc python3 luajit mkfifo ocaml emacs >/dev/null 2>&1 || true
@@ -82,8 +82,14 @@ jobs:
             done
           ' 2>&1 | tee -a times.txt
           if grep -E '^DIFFERENT|^case .* False$' times.txt; then exit 1; fi
+      # The runner's CPU goes first, since the criterion asks for a pass on
+      # both an Intel and an AMD one and the workflow cannot choose.
       - name: Compare
-        run: python3 "$BENCH/check.py" times.txt | tee summary.txt
+        run: |
+          {
+            lscpu | grep -m1 'Model name' || true
+            python3 "$BENCH/check.py" times.txt
+          } | tee summary.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:

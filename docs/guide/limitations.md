@@ -221,13 +221,17 @@ verified.
   writes there: the call gives `EFAULT`, where Linux's copy of user memory
   grows it as a fault in the guest would. `RLIMIT_AS` does not stop the
   growth, as it does not stop `mmap`.
-- **perf events, in part**: only the software clocks count
-  (`cpu-clock`, `task-clock`) and the software events that never happen on
-  x86-64; page faults, context switches, CPU migrations and cgroup switches,
-  tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as are
-  hardware events even on a host with a PMU. A thread's CPU time is the one
-  it last accounted, at its latest system call, and an event of a CPU
-  counts the time that passes. There is no ring buffer: `mmap` of an event
+- **perf events, in part**: only the software events count; cgroup
+  switches, tracepoints, breakpoints, kprobes and uprobes are `ENOENT`, as
+  are hardware events even on a host with a PMU. A thread's CPU time, page
+  faults, context switches and CPU migrations are those it last accounted,
+  at its latest system call. An event of a CPU counts the time that passes,
+  and no faults, switches or migrations. A fault that ends in `SIGSEGV` or
+  `SIGBUS` is not counted, where Linux counts it in `page-faults`; one of a
+  signal frame's write counts as the thread's own; a context switch is a
+  sleep of the thread, not a preemption (but for a thread with `rseq` that
+  gives its virtual CPU to another); and a thread without `rseq` moves to
+  another CPU only when a new CPU mask changes the lowest CPU it allows. There is no ring buffer: `mmap` of an event
   is `ENODEV`, a sampling event takes no samples and sends no signal, and
   `poll` never finds one readable. `inherit_stat` is taken, but an
   inherited event's end sends no read record, as nothing is recorded. An
@@ -460,9 +464,7 @@ verified.
     opened from a handle with `O_EXCL` does not keep `PIDFD_THREAD`, as on
     the CI runners' Linux 7.0, where Linux 7.2 and later keep it.
   - System V IPC's `IPCMNI` is always 32768, as without the
-    `ipcmni_extend` boot option. `/proc/sysvipc` shows
-    its objects as they were when it was opened, where Linux reads each one
-    as the read reaches it.
+    `ipcmni_extend` boot option.
   - The POSIX message queues' filesystem cannot be mounted anywhere else:
     `/dev/mqueue` always shows the first IPC namespace's, and
     `/proc/self/mountinfo` does not list it. Through it, `open`, `stat`,
@@ -719,16 +721,16 @@ verified.
   eventfds within the emulator, where Linux's `eventfd-id` counts the whole
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
-- **userfaultfd, in part**: missing pages and the write protection of
-  private anonymous memory, and the minor faults of shmem, are
-  registered. The write-protect mode for shmem (shared anonymous
-  memory and a shmem file's mappings, private ones too), which Linux
-  takes, is refused (`EINVAL`), and not offered are the events
-  of `fork`, `mremap`, `madvise` and `munmap` or `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
-  `UFFD_FEATURE_WP_UNPOPULATED` and `UFFD_FEATURE_WP_ASYNC`, which
-  `UFFDIO_API` does not report and refuses (`EINVAL`). A
+- **userfaultfd, in part**: missing pages, write protection and the minor
+  faults of shmem are registered. Not offered are the events of `fork`,
+  `mremap`, `madvise` and `munmap` and `UFFD_FEATURE_WP_ASYNC`, which
+  `UFFDIO_API` does not report and refuses (`EINVAL`); without it only
+  anonymous memory and shmem take the write-protect mode. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
+  `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in
+  the marker's place, where Linux, whose zap keeps the marker, restarts
+  the call until a signal comes.
   Of shmem's files only a memfd is registered: a tmpfs file
   is refused (`EINVAL`), where Linux takes it, as the in-memory file
   system says it is a tmpfs but stands for the files a guest has on disk,

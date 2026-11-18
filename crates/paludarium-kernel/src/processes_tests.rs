@@ -4351,6 +4351,51 @@ mod shm {
         assert_eq!(msg[1].len(), msg[0].len());
     }
 
+    #[test]
+    fn proc_sysvipc_shows_each_object_as_the_read_reaches_it() {
+        let (mut k, mut t, m) = setup();
+        const PATH: u64 = DATA + 0x900;
+        const BUF: u64 = DATA + 0xa00;
+        let early = shmget(&mut k, &mut t, &m, 0, 100, IPC_CREAT | 0o600);
+        m.write(GuestAddr(PATH), b"/proc/sysvipc/shm\0").unwrap();
+        let fd = syscall(&mut k, &mut t, &m, 2, [PATH, 0, 0, 0, 0, 0]);
+        assert!(fd < 1 << 63);
+        // A read of 1 byte gathers the header alone.
+        assert_eq!(syscall(&mut k, &mut t, &m, 0, [fd, BUF, 1, 0, 0, 0]), 1);
+        // One made after that shows, and one removed before its line was
+        // reached does not.
+        let late = shmget(&mut k, &mut t, &m, 0, 200, IPC_CREAT | 0o600);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [early, IPC_RMID, 0, 0, 0, 0]),
+            0
+        );
+        let n = syscall(&mut k, &mut t, &m, 0, [fd, BUF, 0x600, 0, 0, 0]);
+        let mut text = vec![0; n as usize];
+        m.read(GuestAddr(BUF), &mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        let fields: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(fields[1], late.to_string());
+        assert_eq!(fields[3], "200");
+        // Nothing seeks from the end (`seq_lseek`); from the start, the
+        // file is read again as it is now.
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 8, [fd, 0, 2, 0, 0, 0]),
+            Errno::EINVAL.to_syscall_return()
+        );
+        assert_eq!(syscall(&mut k, &mut t, &m, 8, [fd, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(&mut k, &mut t, &m, 31, [late, IPC_RMID, 0, 0, 0, 0]),
+            0
+        );
+        let n = syscall(&mut k, &mut t, &m, 0, [fd, BUF, 0x600, 0, 0, 0]);
+        let mut text = vec![0; n as usize];
+        m.read(GuestAddr(BUF), &mut text).unwrap();
+        assert_eq!(String::from_utf8(text).unwrap().lines().count(), 1);
+        assert_eq!(syscall(&mut k, &mut t, &m, 3, [fd, 0, 0, 0, 0, 0]), 0);
+    }
+
     /// A write of `text` to `/proc/sys/kernel/<name>`: its result, or the
     /// open's.
     fn write_kernel(

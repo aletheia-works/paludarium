@@ -102,6 +102,10 @@ Link the relevant issue, explain the change, and highlight review risks.
 Do not rewrite shared history. Sign off commits created through GitHub's web UI.
 Pin every GitHub Action to a full commit SHA. Do not apply workflow labels by
 judgment; labels are applied mechanically.
+Do not rerun by hand the jobs of a `CI` run that no runner acquired;
+`rerun-unacquired.yml` reruns them (see
+[Testing and verification](docs/design/quality.md)). It does not watch
+other workflows, such as `Publish` or `release-acceptance`.
 
 Contributions use [Apache-2.0](LICENSE). Follow the
 [Code of Conduct](https://github.com/aletheia-works/.github/blob/main/CODE_OF_CONDUCT.md)

@@ -234,23 +234,35 @@ CI's own records, so anyone can check it:
    the native JIT (`gh issue list --state open --label "type: bug" --search
    jit`).
 4. **Speed.** The `Native JIT speed` workflow (`jit-speed.yml`), run by hand
-   on the commit that turns the JIT on, passes. On one runner it times the
-   probe, ripgrep and aube cases, Perl's benchmarks and 12 Debian programs,
-   with and without the JIT. It fails when the JIT makes a case slower than
-   every round without it. Short programs count as much as long ones, since
-   turning the JIT on by default would add its cost to every command.
+   on the commit that turns the JIT on, passes on both an Intel and an AMD
+   runner. On one runner it times the probe, ripgrep and aube cases, Perl's
+   benchmarks and 12 Debian programs, five rounds each, with and without the
+   JIT. It fails when the JIT makes a case slower than every round without it.
+   Short programs count as much as long ones, since turning the JIT on by
+   default would add its cost to every command.
 
-The last criterion does not hold yet, by one case. It was run twice with today's
-default. On the faster runner (fork run 44126678828, Intel Xeon 6973P-C), the
-JIT made Perl's hash benchmark 32% faster, Java 47% and OCaml 38%. But one of
-the 36 cases was still slower than every round without it: aube's `list` by 3%
-(174–177 ms against 167–170 ms). On the slower runner (fork run 44116579985, AMD
-EPYC 7763), three were: probe's `fs-basic` by 4% (about 1 ms of 22 ms), probe's
-`tokio-timer` by 1% and ripgrep's `parallel` case by 2%. The criterion is met
-when no case is slower on either runner. What is left is the cost of a short
-program's first compiles. An older version of this comparison started only the
-JIT through a shell wrapper, which made programs of about 20 ms look slower than
-they are.
+The last criterion does not hold yet: one case failed on one of the three
+kinds of runner seen with five rounds. With three rounds, the case that tripped
+changed from runner to runner (aube's `list` by 3% on an Intel Xeon 6973P-C;
+probe's `fs-basic`, probe's `tokio-timer` and ripgrep's `parallel` case by 1–4%
+on an AMD EPYC 7763), which looked like noise around the line rather than one
+cost. So each case now runs five rounds, and the criterion asks for a pass on
+both an Intel and an AMD runner. The workflow cannot choose the runner, so its
+summary starts with the runner's CPU. Five rounds widen both ranges, which makes
+the check easier to pass: a slowdown smaller than the rounds' spread can pass
+on one run and fail on the next. The check finds what is slower beyond that
+spread, not every slowdown.
+
+With today's default, three fork runs landed on three kinds of runner. On an
+Intel Xeon Platinum 8573C (run 44193580662) and an AMD EPYC 9V74 (run
+44193575557) no case was slower; Java was 43–50% faster, Perl's hash benchmark
+34–41% and OCaml 36–42%. On an AMD EPYC 7763 (run 44193570604) one case was:
+ripgrep's `no-match` by 2% (225–230 ms against 219–223 ms). The Intel Xeon
+6973P-C has not been run with five rounds. On all three runners the ripgrep
+cases' medians are up to 2% slower with the JIT, about 3 ms: what is left is the
+cost of a short program's first compiles. An older version of this comparison
+started only the JIT through a shell wrapper, which made programs of about 20 ms
+look slower than they are.
 
 ## One way to create a filesystem
 

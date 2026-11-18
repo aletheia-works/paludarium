@@ -757,37 +757,53 @@ fn msgctl(c: &Context<'_>, id: i32, cmd: i32, buf: u64) -> Result<u64, Errno> {
 }
 
 /// `/proc/sysvipc/msg`, as Linux's `sysvipc_msg_proc_show` prints it: its
-/// header, then each queue of the caller's IPC namespace by index, its
-/// processes as the caller's PID namespace numbers them and its owners as
-/// the caller's user namespace shows them.
-pub(crate) fn proc_file(c: &Context<'_>) -> Vec<u8> {
-    let mut out = String::from(
-        "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
-    );
-    let (space, user) = (c.pid_space(), &c.process.credentials.user);
-    let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
-    let queues = queues(c);
-    for queue in queues.lock().queues.values() {
-        let perm = &queue.perm;
-        out.push_str(&format!(
-            "{:10} {:10}  {:4o}  {:10} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}\n",
-            perm.key,
-            queue.id,
-            perm.mode,
-            queue.bytes,
-            queue.messages.len(),
-            space.number_of(&queue.lspid),
-            space.number_of(&queue.lrpid),
-            user.shown(kind, perm.uid),
-            user.shown(group, perm.gid),
-            user.shown(kind, perm.cuid),
-            user.shown(group, perm.cgid),
-            queue.stime,
-            queue.rtime,
-            queue.ctime,
-        ));
+/// header, then each queue of the opener's IPC namespace by index, as it
+/// is when the read reaches it ([`crate::seq`]), its processes as the
+/// opener's PID namespace numbers them and its owners as the opener's user
+/// namespace shows them.
+pub(crate) fn proc_file(c: &Context<'_>, flags: u32) -> crate::seq::SeqFile {
+    let records = ProcRecords {
+        queues: queues(c),
+        space: c.pid_space(),
+        user: c.process.credentials.user.clone(),
+    };
+    crate::seq::SeqFile::open(Box::new(records), flags)
+}
+/// What `/proc/sysvipc/msg` shows, as Linux's `ipc_proc_iter` holds it
+/// from the open: the queues of an IPC namespace, and the PID and user
+/// namespaces they are shown in.
+struct ProcRecords {
+    queues: Queues,
+    space: std::sync::Arc<crate::namespaces::Namespace>,
+    user: crate::users::UserNs,
+}
+impl crate::seq::Records for ProcRecords {
+    fn record(&self, index: u64) -> Option<(Vec<u8>, u64)> {
+        const HEADER: &str = "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n";
+        let (space, user) = (&self.space, &self.user);
+        let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
+        let table = self.queues.lock();
+        ipc::proc_record(&table.queues, HEADER, index, |queue| {
+            let perm = &queue.perm;
+            format!(
+                "{:10} {:10}  {:4o}  {:10} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}\n",
+                perm.key,
+                queue.id,
+                perm.mode,
+                queue.bytes,
+                queue.messages.len(),
+                space.number_of(&queue.lspid),
+                space.number_of(&queue.lrpid),
+                user.shown(kind, perm.uid),
+                user.shown(group, perm.gid),
+                user.shown(kind, perm.cuid),
+                user.shown(group, perm.cgid),
+                queue.stime,
+                queue.rtime,
+                queue.ctime,
+            )
+        })
     }
-    out.into_bytes()
 }
 
 /// `struct msqid64_ds` of `queue`, as x86-64 lays it out: its owners as the

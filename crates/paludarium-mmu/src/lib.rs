@@ -159,7 +159,8 @@ pub struct Userfault {
     /// The kernel's number for the `userfaultfd`.
     pub context: u64,
     /// The modes, as `UFFDIO_REGISTER` numbers them:
-    /// [`Userfault::MISSING`] and [`Userfault::WP`].
+    /// [`Userfault::MISSING`], [`Userfault::WP`] and [`Userfault::MINOR`];
+    /// and [`Userfault::WP_UNPOPULATED`], which the `userfaultfd` gives.
     pub modes: u8,
 }
 
@@ -174,6 +175,12 @@ impl Userfault {
     /// of shmem that its page cache has but the mapping has no entry for
     /// faults to the `userfaultfd`, which `UFFDIO_CONTINUE` maps it for.
     pub const MINOR: u8 = 4;
+    /// Not a mode of `UFFDIO_REGISTER`: the `userfaultfd` took
+    /// `UFFD_FEATURE_WP_UNPOPULATED`, so `UFFDIO_WRITEPROTECT` protects the
+    /// pages of private anonymous memory that have no entry too, with
+    /// markers, as Linux's `userfaultfd_wp_use_markers` has it. Shmem's
+    /// get markers either way.
+    pub const WP_UNPOPULATED: u8 = 1 << 6;
 }
 
 /// Why an access waits for a `userfaultfd` ([`AddressSpace::userfault_for`]).
@@ -193,6 +200,32 @@ pub enum UserfaultReason {
 pub enum ReadHint {
     Sequential,
     Random,
+}
+
+/// The page faults that the calling host thread's accesses took, which the
+/// kernel adds to its guest thread's (`perf`'s `page-faults`). They are
+/// those of Linux's `mm_account_fault` with the registers of an access: a
+/// read or fetch of a page that had no entry yet (Linux maps the zero page
+/// or the file's), and a write to a page with no frame of its own yet (its
+/// first write, the copy of a page-cache page of a private mapping or of a
+/// frame `fork` shared). A core dump's or `ptrace`'s access through
+/// `FOLL_FORCE` counts none, as Linux's `get_user_pages` passes no registers.
+pub mod faults {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static TAKEN: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn count() {
+        TAKEN.with(|taken| taken.set(taken.get().wrapping_add(1)));
+    }
+
+    /// The faults taken since the last call, on this host thread.
+    #[must_use]
+    pub fn take() -> u64 {
+        TAKEN.with(|taken| taken.replace(0))
+    }
 }
 
 /// The bits of Linux's `vm_flags` that `/proc/<pid>/smaps` shows
@@ -781,7 +814,7 @@ impl Drop for FrameBytes {
 }
 
 /// Page-aligned ranges of an address space, from start to end, kept merged:
-/// the guard and poison markers of its page tables.
+/// the guard, poison and uffd-wp markers of its page tables.
 #[derive(Clone, Debug, Default)]
 struct PageRanges(BTreeMap<u64, u64>);
 
@@ -816,6 +849,23 @@ impl PageRanges {
             end = end.max(e);
         }
         self.0.insert(start, end);
+    }
+
+    /// The parts of `[start, end)` that are in.
+    fn within(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        if end <= start {
+            return Vec::new();
+        }
+        let first = self
+            .0
+            .range(..start)
+            .next_back()
+            .filter(|&(_, &e)| e > start)
+            .map_or(start, |(&s, _)| s);
+        self.0
+            .range(first..end)
+            .map(|(&s, &e)| (s.max(start), e.min(end)))
+            .collect()
     }
 
     /// Takes `[start, end)` out, and gives the parts of it that were in.
@@ -1891,6 +1941,16 @@ struct AddressSpaceData {
     /// the VMAs, so they neither split nor stop a merge. An access to one
     /// faults as one to no mapping would.
     guards: PageRanges,
+    /// The pages `UFFDIO_WRITEPROTECT` protected that have no entry:
+    /// Linux's uffd-wp PTE markers ([`Self::userfault_mark`]). Only a page
+    /// without an entry has a marker that counts, and the entry an access
+    /// or a fault makes for it is write-protected. Whatever drops an entry
+    /// of a mapping that is not anonymous memory leaves a marker for a
+    /// protected one (`zap_install_uffd_wp_if_needed`); a discard of
+    /// anonymous memory, an unmap, an `mremap` and the end of a
+    /// registration drop them, and a `fork` child has none
+    /// (`copy_pte_marker` without `UFFD_FEATURE_EVENT_FORK`).
+    uffd_markers: PageRanges,
     /// The pages `UFFDIO_POISON` poisoned: Linux's poison PTE markers,
     /// which, like the guards, belong to the page tables. A discard drops
     /// them (`zap_nonpresent_ptes`, `madvise_free_pte_range`), as an unmap
@@ -1984,6 +2044,7 @@ impl AddressSpaceData {
             backing: BTreeMap::new(),
             guards: PageRanges::default(),
             poisons: PageRanges::default(),
+            uffd_markers: PageRanges::default(),
             future_lock: None,
             code: Arc::default(),
             mappings: BTreeMap::new(),
@@ -2356,7 +2417,13 @@ impl AddressSpaceData {
     /// when the meter has no room for it.
     fn refresh(&self, entry: &mut Option<Page>, page: u64, prot: Prot, write: bool) -> bool {
         match entry {
-            None => *entry = Some(self.fresh(page, prot)),
+            None => {
+                // A uffd-wp marker's page gets a write-protected entry
+                // (`vmf_orig_pte_uffd_wp`).
+                let mut new = self.fresh(page, prot);
+                new.uffd_wp = self.uffd_marked(page);
+                *entry = Some(new);
+            }
             Some(p) if self.may_be_truncated(page, p) => {
                 let Some((source, offset)) = self.file_at(page) else {
                     return true;
@@ -2506,7 +2573,9 @@ impl AddressSpaceData {
     /// A page outside every mapping is 0. One in a mapping is soft-dirty, as
     /// Linux marks every new VMA `VM_SOFTDIRTY` and nothing here clears it
     /// (`clear_refs`); a guard region's page is also a swap entry with the
-    /// guard bit, and one any access gave an entry is present. The zero page
+    /// guard bit, as is a poisoned page without it and one with a uffd-wp
+    /// marker with the `userfaultfd` bit, and one any access gave an entry
+    /// is present. The zero page
     /// that a read of private anonymous memory shows is only that. Any other
     /// is a file's or shared memory's, unless it is anonymous as `usage`
     /// counts it, and mapped only here unless `fork` shares it until a
@@ -2525,6 +2594,13 @@ impl AddressSpaceData {
                     return entry | pagemap::SWAP | pagemap::GUARD_REGION;
                 }
                 let Some(pte) = lookup(&directory, page) else {
+                    // A poison or a uffd-wp marker is a swap entry too.
+                    if self.uffd_markers.contains(page) {
+                        return entry | pagemap::SWAP | pagemap::UFFD_WP;
+                    }
+                    if self.poisoned(page) {
+                        return entry | pagemap::SWAP;
+                    }
                     return entry;
                 };
                 entry |= pagemap::PRESENT;
@@ -2872,6 +2948,18 @@ impl AddressSpaceData {
                     ..fault(at)
                 });
             }
+            // A write to a page with a uffd-wp marker, which the kernel
+            // takes to its `userfaultfd` ([`Self::userfault_for`]).
+            if access == Access::Write
+                && lookup(directory, page).is_none()
+                && self.uffd_marked(page)
+            {
+                return Err(Fault {
+                    mapped: true,
+                    present: false,
+                    ..fault(at)
+                });
+            }
         }
         Ok(())
     }
@@ -2976,6 +3064,9 @@ impl AddressSpaceData {
                 let (dir, slot) = page_index(page);
                 let table = directory.entry(dir).or_insert_with(PageTable::new);
                 if let Some(entry) = table.pages.get_mut(slot) {
+                    if entry.is_none() && matches!(access, Access::Read | Access::Fetch) {
+                        faults::count();
+                    }
                     self.refresh(entry, page, prot, false);
                 }
             }
@@ -3132,6 +3223,15 @@ impl AddressSpaceData {
             };
             let (dir, slot) = page_index(page);
             let table = directory.entry(dir).or_insert_with(PageTable::new);
+            if access == Access::Write
+                && table.pages.get(slot).is_some_and(|entry| {
+                    entry
+                        .as_ref()
+                        .is_none_or(|p| p.cow || p.frame.get().is_none())
+                })
+            {
+                faults::count();
+            }
             if let Some(entry) = table.pages.get_mut(slot)
                 && !self.refresh(entry, page, prot, true)
             {
@@ -3567,6 +3667,7 @@ impl AddressSpaceData {
     fn remove(&mut self, addr: u64, end: u64) {
         self.clear_guards(addr, end);
         self.poisons.clear(addr, end);
+        self.uffd_markers.clear(addr, end);
         let addr = GuestAddr(addr);
         let affected: Vec<_> = self
             .shared
@@ -3712,6 +3813,9 @@ impl AddressSpaceData {
         // range even when `MREMAP_DONTUNMAP` keeps it.
         let guards = self.clear_guards(old, old + old_len);
         let poisons = self.poisons.clear(old, old + old_len);
+        // The uffd-wp markers go, as the moved VMA leaves its `userfaultfd`
+        // (`move_ptes` clears them).
+        self.uffd_markers.clear(old, old + old_len);
         // MREMAP_DONTUNMAP leaves the old range unlocked (`VMA_LOCKED_MASK`).
         if keep_old {
             self.split_at(old);
@@ -4043,12 +4147,11 @@ impl AddressSpaceData {
     /// MAP_ANONYMOUS`), which Linux keeps in shmem; and a shared or private
     /// mapping of a shmem file ([`PageSource::shmem`]: a memfd), not
     /// System V shared memory, whose VMAs are not shmem's. Only shmem takes
-    /// [`Userfault::MINOR`], as Linux's does, and only private anonymous
-    /// memory [`Userfault::WP`], whose markers on pages shmem has no entry
-    /// for are not kept here.
+    /// [`Userfault::MINOR`], as Linux's does; any of them takes
+    /// [`Userfault::WP`].
     fn userfault_capable(&self, m: &Mapping, modes: u8) -> bool {
         if self.shmem_at(m.start.0) {
-            return modes & Userfault::WP == 0;
+            return true;
         }
         modes & Userfault::MINOR == 0
             && self.shared_at(m.start.0).is_none()
@@ -4088,6 +4191,61 @@ impl AddressSpaceData {
             || self
                 .file_at(page)
                 .is_some_and(|(source, offset)| source.holds(offset))
+    }
+
+    /// Whether `page`, if it has no entry, is write-protected: it has a
+    /// uffd-wp marker ([`Self::uffd_markers`]), of a mapping registered for
+    /// [`Userfault::WP`], as Linux's `pte_marker_handle_uffd_wp` clears a
+    /// marker left over from a registration that ended.
+    fn uffd_marked(&self, page: u64) -> bool {
+        self.uffd_markers.contains(page)
+            && self
+                .mapping_at(page)
+                .and_then(|m| m.userfault)
+                .is_some_and(|u| u.modes & Userfault::WP != 0)
+    }
+
+    /// Whether the mapping at `page` is anonymous memory as Linux's
+    /// `vma_is_anonymous` has it: private memory of no file, whose discard
+    /// drops its uffd-wp markers.
+    fn anonymous_at(&self, page: u64) -> bool {
+        self.shared_at(page).is_none()
+            && self.backing_at(page).is_none()
+            && self.mapping_at(page).is_some_and(|m| {
+                matches!(
+                    m.kind,
+                    MappingKind::Anonymous | MappingKind::Stack | MappingKind::Heap
+                )
+            })
+    }
+
+    /// Leaves a uffd-wp marker on each page of `[start, end)` whose entry
+    /// is write-protected, before the entries go, as Linux's
+    /// `zap_install_uffd_wp_if_needed` does for memory that is not
+    /// anonymous; anonymous memory loses its markers.
+    fn keep_uffd_markers(&mut self, start: u64, end: u64) {
+        if self.anonymous_at(start) {
+            self.uffd_markers.clear(start, end);
+            return;
+        }
+        let mut protected = Vec::new();
+        {
+            let directory = self.read_directory();
+            for (&dir, table) in directory.range(
+                start / PAGE_SIZE / ENTRIES_PER_TABLE
+                    ..=end.saturating_sub(1) / PAGE_SIZE / ENTRIES_PER_TABLE,
+            ) {
+                for (slot, entry) in table.pages.iter().enumerate() {
+                    let page = (dir * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
+                    if page >= start && page < end && entry.as_ref().is_some_and(|p| p.uffd_wp) {
+                        protected.push(page);
+                    }
+                }
+            }
+        }
+        for page in protected {
+            self.uffd_markers.add(page, page + PAGE_SIZE);
+        }
     }
 
     /// The `userfaultfd` an access to `page` waits for, and why: a missing
@@ -4183,19 +4341,68 @@ impl AddressSpaceData {
         {
             return None;
         }
-        self.userfault_waits(&directory, page)
+        // A page with a uffd-wp marker faults in as a missing one does
+        // (`handle_pte_marker`, `do_pte_missing`), and its new entry is
+        // write-protected: the write faults again, to the `userfaultfd`
+        // ([`AddressSpace::userfault_for`] makes the entry).
+        self.userfault_waits(&directory, page).or_else(|| {
+            let registration = self.mapping_at(page)?.userfault?;
+            (access == Access::Write
+                && lookup(&directory, page).is_none()
+                && self.uffd_marked(page)
+                && !self.past_file_end(page))
+            .then_some((registration.context, UserfaultReason::Protected))
+        })
     }
 
-    /// Sets or clears the write protection of the pages of `[start, end)`
-    /// that have entries, as Linux's `uffd_wp_range` changes the present
-    /// entries of anonymous memory. The space's epoch has moved on, so no
-    /// [`ThreadTlb`] keeps an entry from before.
-    fn userfault_mark(&mut self, start: u64, end: u64, protect: bool) {
+    /// Makes the write-protected entry of a page with a uffd-wp marker,
+    /// which a write to it faults in first ([`Self::userfault_for`]), as
+    /// Linux's `do_anonymous_page` and `set_pte_range` make it with
+    /// `pte_mkuffd_wp`.
+    fn userfault_fault_in(&mut self, addr: GuestAddr) {
+        let page = addr.page_align_down().0;
+        let Some(prot) = self.mapping_at(page).map(|m| m.prot) else {
+            return;
+        };
+        if lookup(&self.read_directory(), page).is_some() || !self.uffd_marked(page) {
+            return;
+        }
+        let mut entry = self.fresh(page, prot);
+        entry.uffd_wp = true;
+        let (dir, slot) = page_index(page);
+        self.write_directory()
+            .entry(dir)
+            .or_insert_with(PageTable::new)
+            .pages[slot] = Some(entry);
+    }
+
+    /// Sets or clears the write protection of the pages of `[start, end)`,
+    /// as Linux's `uffd_wp_range` changes the entries: those that have one
+    /// and, with `markers`, those that have none, which get a uffd-wp
+    /// marker unless they have a guard or a poison marker
+    /// (`change_pte_range`). The end of the protection drops the markers.
+    /// The space's epoch has moved on, so no [`ThreadTlb`] keeps an entry
+    /// from before.
+    fn userfault_mark(&mut self, start: u64, end: u64, protect: bool, markers: bool) {
         self.for_populated(start, end, |entry| {
             if let Some(page) = entry {
                 page.uffd_wp = protect;
             }
         });
+        if !protect {
+            self.uffd_markers.clear(start, end);
+        } else if markers {
+            self.uffd_markers.add(start, end);
+            let taken: Vec<(u64, u64)> = self
+                .guards
+                .within(start, end)
+                .into_iter()
+                .chain(self.poisons.within(start, end))
+                .collect();
+            for (from, to) in taken {
+                self.uffd_markers.clear(from, to);
+            }
+        }
     }
 
     /// `UFFDIO_REGISTER` of `[start, end)` for the `userfaultfd` `context`
@@ -4239,7 +4446,7 @@ impl AddressSpaceData {
             }
             let (from, to) = (m.start.0.max(start), m.end().min(end));
             if modes & Userfault::WP == 0 {
-                self.userfault_mark(from, to, false);
+                self.userfault_mark(from, to, false, false);
             }
             self.split_at(from);
             self.split_at(to);
@@ -4282,7 +4489,7 @@ impl AddressSpaceData {
             if registration.modes & Userfault::MISSING != 0 {
                 ended.push((from, to));
             }
-            self.userfault_mark(from, to, false);
+            self.userfault_mark(from, to, false, false);
             self.split_at(from);
             self.split_at(to);
             for (_, piece) in self.mappings.range_mut(from..to) {
@@ -4303,7 +4510,7 @@ impl AddressSpaceData {
             .map(|m| (m.start.0, m.end()))
             .collect();
         for (start, end) in ranges {
-            self.userfault_mark(start, end, false);
+            self.userfault_mark(start, end, false, false);
             if let Some(m) = self.mappings.get_mut(&start) {
                 m.userfault = None;
             }
@@ -4328,7 +4535,12 @@ impl AddressSpaceData {
             if !m.userfault.is_some_and(|u| u.modes & Userfault::WP != 0) {
                 return Err(Errno::ENOENT);
             }
-            self.userfault_mark(m.start.0.max(start), m.end().min(end), protect);
+            // Linux's `userfaultfd_wp_use_markers`: memory that is not
+            // anonymous always, anonymous memory with `WP_UNPOPULATED`.
+            let markers = !self.anonymous_at(m.start.0)
+                || m.userfault
+                    .is_some_and(|u| u.modes & Userfault::WP_UNPOPULATED != 0);
+            self.userfault_mark(m.start.0.max(start), m.end().min(end), protect, markers);
         }
         Ok(())
     }
@@ -4399,12 +4611,17 @@ impl AddressSpaceData {
         let file = self.file_at(page).is_some();
         let mut directory = self.write_directory();
         let shared = self.shared_at(page);
-        // A guard marker is an entry too, and so is a poison marker to a
-        // zero page.
+        // A guard marker is an entry too, and so is a poison or a uffd-wp
+        // marker to a zero page of private anonymous memory
+        // (`mfill_atomic_pte_zeropage` takes only none); shmem's takes
+        // them (`mfill_atomic_install_pte`).
         let poisoned = self.poisoned(page);
+        let marked = self.uffd_markers.contains(page);
+        let zero_page = bytes.is_none() && !file && shared.is_none();
         if lookup(&directory, page).is_some()
             || self.guarded(page)
-            || (poisoned && bytes.is_none())
+            || (poisoned && zero_page)
+            || (marked && zero_page)
             || shared.is_some_and(|shared| shared.pages.has(page.wrapping_add(shared.shift)))
             || (file && shared.is_some() && self.shmem_holds(page))
         {
@@ -4447,6 +4664,9 @@ impl AddressSpaceData {
         if poisoned {
             self.poisons.clear(page, page + PAGE_SIZE);
         }
+        // The new entry takes the marker's place, protected only by the
+        // fill's mode.
+        self.uffd_markers.clear(page, page + PAGE_SIZE);
         Ok(())
     }
 
@@ -4454,8 +4674,9 @@ impl AddressSpaceData {
     /// Linux's `mfill_atomic_pte_poison`: the range is checked as a fill's
     /// ([`Self::userfault_target`]), and a page with an entry or a marker,
     /// even one whose shared memory has it but this mapping has not yet
-    /// faulted it in, is `EEXIST`: only the entry is looked at. A page of a
-    /// file's mapping past the file's end is `EFAULT` first.
+    /// faulted it in, is `EEXIST`: only the entry is looked at, and a
+    /// uffd-wp marker is one. A page of a file's mapping past the file's end
+    /// is `EFAULT` first.
     pub fn userfault_poison(&mut self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
         self.userfault_target(start, end)?;
         if self.past_file_end(page) {
@@ -4464,6 +4685,7 @@ impl AddressSpaceData {
         if lookup(&self.read_directory(), page).is_some()
             || self.guarded(page)
             || self.poisoned(page)
+            || self.uffd_markers.contains(page)
         {
             return Err(Errno::EEXIST);
         }
@@ -4477,9 +4699,17 @@ impl AddressSpaceData {
     /// a page past the file's end is `EINVAL` (`shmem_get_folio` with
     /// `SGP_NOALLOC`), one the page cache does not have `EFAULT`, and one
     /// the mapping has an entry or a guard for `EEXIST`. The mapping then
-    /// shows the page cache's page, a private one until it writes it, and
-    /// a poison marker goes, as `mfill_atomic_install_pte` takes it.
-    pub fn userfault_continue(&mut self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
+    /// shows the page cache's page, a private one until it writes it,
+    /// write-protected with `protect` (`UFFDIO_CONTINUE_MODE_WP`), and a
+    /// poison or a uffd-wp marker goes, as `mfill_atomic_install_pte` takes
+    /// them.
+    pub fn userfault_continue(
+        &mut self,
+        start: u64,
+        end: u64,
+        page: u64,
+        protect: bool,
+    ) -> Result<(), Errno> {
         let mapping = self.userfault_target(start, end)?;
         if !self.shmem_at(page) {
             return Err(Errno::EINVAL);
@@ -4495,12 +4725,14 @@ impl AddressSpaceData {
         if lookup(&directory, page).is_some() || self.guarded(page) {
             return Err(Errno::EEXIST);
         }
-        let entry = self.page(page, prot);
+        let mut entry = self.page(page, prot);
         self.fill_from_file(page, &entry);
+        entry.uffd_wp = protect;
         let (dir, slot) = page_index(page);
         directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
         drop(directory);
         self.poisons.clear(page, page + PAGE_SIZE);
+        self.uffd_markers.clear(page, page + PAGE_SIZE);
         Ok(())
     }
 
@@ -4584,18 +4816,23 @@ impl AddressSpaceData {
         let mut changed = false;
         while moved < len {
             let (from, to) = (src + moved, dst + moved);
-            let markers = |page| self.guarded(page) || self.poisoned(page);
             let mut directory = self.write_directory();
-            let table = directory.contains_key(&page_index(from).0) || markers(from);
+            // A uffd-wp marker counts on a page with no entry only.
+            let markers = |directory: &Directory, page| {
+                self.guarded(page)
+                    || self.poisoned(page)
+                    || (self.uffd_markers.contains(page) && lookup(directory, page).is_none())
+            };
+            let table = directory.contains_key(&page_index(from).0) || markers(&directory, from);
             if !table && !holes {
                 error = Some(Errno::ENOENT);
                 break;
             }
-            if lookup(&directory, to).is_some() || markers(to) {
+            if lookup(&directory, to).is_some() || markers(&directory, to) {
                 error = Some(Errno::EEXIST);
                 break;
             }
-            if markers(from) {
+            if markers(&directory, from) {
                 error = Some(Errno::EFAULT);
                 break;
             }
@@ -4627,6 +4864,8 @@ impl AddressSpaceData {
             let (dir, slot) = page_index(to);
             directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
             drop(directory);
+            // The source's entry goes with its protection (`move_ptes`).
+            self.uffd_markers.clear(from, from + PAGE_SIZE);
             changed = true;
             moved += PAGE_SIZE;
         }
@@ -4888,8 +5127,11 @@ impl AddressSpaceData {
             }
         }
         // The zap before the markers go in (`madvise_guard_install`) takes
-        // any poison marker away too.
+        // any poison marker away too. A uffd-wp marker the zap leaves on
+        // memory that is not anonymous makes Linux restart the call until
+        // a signal; here the guard takes its place.
         self.poisons.clear(from, to);
+        self.uffd_markers.clear(from, to);
         self.add_guards(from, to);
         self.bump_code_generation();
     }
@@ -5060,14 +5302,18 @@ impl AddressSpaceData {
     /// ([`Self::back_with_file`]), as Linux faults them in from the file.
     /// Shared pages keep theirs, as their memory outlives the mapping, and so
     /// do the ones without a recorded file, which have nothing to read
-    /// again. Applies the mapped parts and returns `ENOMEM` when the range
-    /// has a hole, as Linux does.
+    /// again; shmem's lose their entries, which an access makes again from
+    /// the page cache. A write-protected entry of memory that is not
+    /// anonymous leaves a uffd-wp marker ([`Self::keep_uffd_markers`]).
+    /// Applies the mapped parts and returns `ENOMEM` when the range has a
+    /// hole, as Linux does.
     pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
         let end = checked_range(addr, len)?;
         let mut covered = addr.0;
         let mut hole = false;
         let mut private = Vec::new();
         let mut poisoned = Vec::new();
+        let mut shmem = Vec::new();
         let mut sealed = false;
         for (_, m) in self.mappings.range(..end) {
             if m.end() <= addr.0 {
@@ -5084,6 +5330,12 @@ impl AddressSpaceData {
             // Every page table entry goes, poison markers too
             // (`zap_nonpresent_ptes` with no `zap_details`), shared or not.
             poisoned.push((start, m.end().min(end)));
+            // Shmem's entries go too, the page cache keeping its pages:
+            // an access faults them in again, as a minor fault where the
+            // mapping is registered for one.
+            if self.shared_at(start).is_some() && self.shmem_at(start) {
+                shmem.push((start, m.end().min(end)));
+            }
             // An ELF segment or a file mapping without its file keeps its
             // contents: there is nothing to read it from again.
             let backed = matches!(m.kind, MappingKind::ElfSegment | MappingKind::File)
@@ -5098,10 +5350,15 @@ impl AddressSpaceData {
         for (start, end) in poisoned {
             self.poisons.clear(start, end);
         }
-        if !private.is_empty() {
+        if !private.is_empty() || !shmem.is_empty() {
             self.bump_code_generation();
         }
+        for (start, end) in shmem {
+            self.keep_uffd_markers(start, end);
+            self.for_populated(start, end, |entry| *entry = None);
+        }
         for (start, end) in private {
+            self.keep_uffd_markers(start, end);
             self.for_populated(start, end, |entry| *entry = None);
             self.refill(start, end);
         }
@@ -5557,8 +5814,14 @@ impl MemoryView {
     }
     /// See [`AddressSpaceData::userfault_continue`]; `ESRCH` once the space
     /// is gone.
-    pub fn userfault_continue(&self, start: u64, end: u64, page: u64) -> Result<(), Errno> {
-        self.with_data_mut(|data| data.userfault_continue(start, end, page))
+    pub fn userfault_continue(
+        &self,
+        start: u64,
+        end: u64,
+        page: u64,
+        protect: bool,
+    ) -> Result<(), Errno> {
+        self.with_data_mut(|data| data.userfault_continue(start, end, page, protect))
             .unwrap_or(Err(Errno(3))) // ESRCH
     }
     /// See [`AddressSpaceData::userfault_move`]; `ESRCH` once the space is
@@ -6293,7 +6556,12 @@ impl AddressSpace {
         write: bool,
         fetch: bool,
     ) -> Option<(u64, UserfaultReason)> {
-        self.locked().userfault_for(addr, write, fetch)
+        let mut data = self.locked();
+        let found = data.userfault_for(addr, write, fetch);
+        if matches!(found, Some((_, UserfaultReason::Protected))) {
+            data.userfault_fault_in(addr);
+        }
+        found
     }
     /// See [`AddressSpaceData::advise_flags`].
     pub fn advise_flags(&self, addr: GuestAddr, end: u64, advice: FlagAdvice) -> Result<(), Errno> {
@@ -7366,6 +7634,46 @@ mod tests {
         assert!(space.write_u64(anon, 1).is_err());
         space.unmap(GuestAddr(0x10000), 0xff_ffff_0000).unwrap();
         assert!(space.read_u64(GuestAddr(0xff_ffff_fff8)).is_err());
+    }
+
+    #[test]
+    fn faults_are_counted_where_linux_accounts_them() {
+        let mut space = AddressSpace::new();
+        let anon = space
+            .map(
+                None,
+                2 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        let _ = faults::take();
+        // A first write faults, and nothing after it on the page does.
+        space.write_u64(anon, 1).unwrap();
+        space.write_u64(anon, 2).unwrap();
+        assert_eq!(space.read_u64(anon).unwrap(), 2);
+        assert_eq!(faults::take(), 1);
+        // A first read maps the zero page, and a write after it faults again.
+        let next = GuestAddr(anon.0 + PAGE_SIZE);
+        assert_eq!(space.read_u64(next).unwrap(), 0);
+        assert_eq!(space.read_u64(next).unwrap(), 0);
+        assert_eq!(faults::take(), 1);
+        space.write_u64(next, 3).unwrap();
+        assert_eq!(faults::take(), 1);
+        // After a fork, the first write of each space to a page it shares
+        // faults, the last one's too, which keeps the frame.
+        let child = space.fork();
+        child.write_u64(anon, 4).unwrap();
+        space.write_u64(anon, 5).unwrap();
+        space.write_u64(anon, 6).unwrap();
+        assert_eq!(faults::take(), 2);
+        // A core dump's reads count none.
+        let fresh = space
+            .map(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
+            .unwrap();
+        let mut word = [0; 8];
+        space.read_for_dump(fresh, &mut word).unwrap();
+        assert_eq!(faults::take(), 0);
     }
 
     #[test]

@@ -994,32 +994,46 @@ fn semid_ds(set: &Set, user: &crate::namespaces::Namespace) -> [u8; DS_SIZE] {
 }
 
 /// `/proc/sysvipc/sem`, as Linux's `sysvipc_sem_proc_show` prints it: its
-/// header, then each set of the caller's IPC namespace by index, its owners
-/// as the caller's user namespace shows them.
-pub(crate) fn proc_file(c: &Context<'_>) -> Vec<u8> {
-    let mut out = String::from(
-        "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
-    );
-    let user = &c.process.credentials.user;
-    let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
-    let sets = sets(c);
-    for set in sets.lock().sets.values() {
-        let perm = &set.perm;
-        out.push_str(&format!(
-            "{:10} {:10}  {:4o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",
-            perm.key,
-            set.id,
-            perm.mode,
-            set.semaphores.len(),
-            user.shown(kind, perm.uid),
-            user.shown(group, perm.gid),
-            user.shown(kind, perm.cuid),
-            user.shown(group, perm.cgid),
-            set.otime,
-            set.ctime,
-        ));
+/// header, then each set of the opener's IPC namespace by index, as it is
+/// when the read reaches it ([`crate::seq`]), its owners as the opener's
+/// user namespace shows them.
+pub(crate) fn proc_file(c: &Context<'_>, flags: u32) -> crate::seq::SeqFile {
+    let records = ProcRecords {
+        sets: sets(c),
+        user: c.process.credentials.user.clone(),
+    };
+    crate::seq::SeqFile::open(Box::new(records), flags)
+}
+/// What `/proc/sysvipc/sem` shows, as Linux's `ipc_proc_iter` holds it
+/// from the open: the sets of an IPC namespace, and the user namespace
+/// they are shown in.
+struct ProcRecords {
+    sets: Sets,
+    user: crate::users::UserNs,
+}
+impl crate::seq::Records for ProcRecords {
+    fn record(&self, index: u64) -> Option<(Vec<u8>, u64)> {
+        const HEADER: &str = "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n";
+        let user = &self.user;
+        let (kind, group) = (crate::users::Ids::User, crate::users::Ids::Group);
+        let table = self.sets.lock();
+        ipc::proc_record(&table.sets, HEADER, index, |set| {
+            let perm = &set.perm;
+            format!(
+                "{:10} {:10}  {:4o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",
+                perm.key,
+                set.id,
+                perm.mode,
+                set.semaphores.len(),
+                user.shown(kind, perm.uid),
+                user.shown(group, perm.gid),
+                user.shown(kind, perm.cuid),
+                user.shown(group, perm.cgid),
+                set.otime,
+                set.ctime,
+            )
+        })
     }
-    out.into_bytes()
 }
 
 /// The commands of Linux's `semctl_main`, in its order: the set

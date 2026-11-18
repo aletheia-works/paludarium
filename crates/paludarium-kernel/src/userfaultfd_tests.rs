@@ -2,7 +2,7 @@
 //! dispatch.
 use super::*;
 use paludarium_host::testing::RecordingHost;
-use paludarium_mmu::{MappingKind, Prot, Userfault};
+use paludarium_mmu::{MappingKind, Prot, Userfault, UserfaultReason};
 use paludarium_types::{Errno, GuestAddr};
 
 const DATA: u64 = 0x10_0000;
@@ -28,6 +28,7 @@ const SIGBUS: u64 = 1 << 7;
 const THREAD_ID: u64 = 1 << 8;
 const EXACT_ADDRESS: u64 = 1 << 11;
 const FEATURE_POISON: u64 = 1 << 14;
+const WP_UNPOPULATED: u64 = 1 << 13;
 
 struct Fixture {
     kernel: Kernel,
@@ -181,8 +182,8 @@ fn uffdio_api_takes_the_features_once() {
         f.ioctl(fd, API, &[0xaa, 1 << 30, 7]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
     );
-    // UFFD_FEATURE_WP_ASYNC brings UFFD_FEATURE_WP_UNPOPULATED, neither
-    // offered.
+    // UFFD_FEATURE_WP_ASYNC, which brings UFFD_FEATURE_WP_UNPOPULATED, is
+    // not offered.
     assert_eq!(
         f.ioctl(fd, API, &[0xaa, 1 << 15, 0]).0,
         errno(Errno::EINVAL)
@@ -190,7 +191,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ret(16, &[fd, API, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, API, &[0xaa, SIGBUS | THREAD_ID, 0]);
     assert_eq!(ret, 0);
-    assert_eq!(out, vec![0xaa, 0x1_4fb1, 1 << 63 | 3]);
+    assert_eq!(out, vec![0xaa, 0x1_7fb1, 1 << 63 | 3]);
     assert_eq!(
         f.ioctl(fd, API, &[0xaa, 0, 0]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
@@ -773,4 +774,33 @@ fn uffdio_continue_maps_a_memfd_page_registered_for_minor_faults() {
         f.ioctl(fd, CONTINUE, &[at + PAGE, PAGE, 0, 0]).1[3],
         errno(Errno::EEXIST)
     );
+}
+
+#[test]
+fn wp_unpopulated_protects_the_pages_that_have_none() {
+    let mut f = fixture();
+    let protected = |f: &Fixture, addr: u64| {
+        f.mem
+            .userfault_for(GuestAddr(addr), true, false)
+            .map(|(_, reason)| reason)
+    };
+    // Without the feature, a page with no entry is not protected.
+    let fd = f.ready(NONBLOCK, 0);
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 2, 0]).0, 0);
+    assert_eq!(f.userfault(AREA).map(|u| u.modes), Some(Userfault::WP));
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, 2 * PAGE, 1]).0, 0);
+    assert_eq!(protected(&f, AREA), None);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    // With it, the registration has it, and the protection marks them.
+    let fd = f.ready(NONBLOCK, WP_UNPOPULATED);
+    assert_eq!(f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 2, 0]).0, 0);
+    assert_eq!(
+        f.userfault(AREA).map(|u| u.modes),
+        Some(Userfault::WP | Userfault::WP_UNPOPULATED)
+    );
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, 2 * PAGE, 1]).0, 0);
+    assert_eq!(protected(&f, AREA + PAGE), Some(UserfaultReason::Protected));
+    assert!(f.mem.write(GuestAddr(AREA + PAGE), b"a").is_err());
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, 2 * PAGE, 0]).0, 0);
+    f.mem.write(GuestAddr(AREA), b"a").unwrap();
 }

@@ -797,7 +797,7 @@ fn a_userfaultfd_write_protection_faults_on_writes_while_registered() {
         .unwrap();
     view.userfault_release(7);
     m.write(a, b"k").unwrap();
-    // Shared memory takes no write protection.
+    // Shared memory takes write protection too.
     let s = m
         .map_shared(
             Some(GuestAddr(0x100000)),
@@ -809,7 +809,7 @@ fn a_userfaultfd_write_protection_faults_on_writes_while_registered() {
     m.mark_shared(s, PAGE_SIZE).unwrap();
     assert_eq!(
         view.userfault_register(s.0, s.0 + PAGE_SIZE, 7, Userfault::WP),
-        Err(Errno::EINVAL)
+        Ok(())
     );
     let gone = AddressSpace::new().view();
     assert_eq!(
@@ -1109,8 +1109,8 @@ fn a_userfaultfd_registers_shmem_files_and_waits_for_their_holes() {
             .unwrap();
         (at.0, pages)
     };
-    // A file that is not shmem's is not registered, nor shmem for write
-    // protection.
+    // A file that is not shmem's is not registered; shmem is, for write
+    // protection too.
     let (other, _) = map(&file(false));
     assert_eq!(
         view.userfault_register(other, other + PAGE_SIZE, 7, Userfault::MISSING),
@@ -1119,7 +1119,7 @@ fn a_userfaultfd_registers_shmem_files_and_waits_for_their_holes() {
     let (at, pages) = map(&file(true));
     assert_eq!(
         view.userfault_register(at, at + PAGE_SIZE, 7, Userfault::WP),
-        Err(Errno::EINVAL)
+        Ok(())
     );
     view.userfault_register(at, at + 3 * PAGE_SIZE, 7, Userfault::MISSING)
         .unwrap();
@@ -1204,14 +1204,14 @@ fn a_userfaultfd_minor_fault_waits_for_uffdio_continue() {
         .map_shared(None, PAGE_SIZE, Prot::READ_WRITE, MappingKind::Anonymous)
         .unwrap()
         .0;
-    // Only shmem takes the minor mode, and not with write protection.
+    // Only shmem takes the minor mode, with write protection too.
     assert_eq!(
         view.userfault_register(anon, anon + PAGE_SIZE, 7, Userfault::MINOR),
         Err(Errno::EINVAL)
     );
     assert_eq!(
-        view.userfault_register(at, at + PAGE_SIZE, 7, Userfault::MINOR | Userfault::WP),
-        Err(Errno::EINVAL)
+        view.userfault_register(at, at + 4 * PAGE_SIZE, 7, Userfault::MINOR | Userfault::WP),
+        Ok(())
     );
     view.userfault_register(at, at + 4 * PAGE_SIZE, 7, Userfault::MINOR)
         .unwrap();
@@ -1230,20 +1230,20 @@ fn a_userfaultfd_minor_fault_waits_for_uffdio_continue() {
     // `UFFDIO_CONTINUE`: shmem only, the page within the file, in the page
     // cache, and not mapped yet.
     assert_eq!(
-        view.userfault_continue(anon, anon + PAGE_SIZE, anon),
+        view.userfault_continue(anon, anon + PAGE_SIZE, anon, false),
         Err(Errno::EINVAL)
     );
     assert_eq!(
-        view.userfault_continue(at, end, page(3)),
+        view.userfault_continue(at, end, page(3), false),
         Err(Errno::EINVAL)
     );
     assert_eq!(
-        view.userfault_continue(at, end, page(2)),
+        view.userfault_continue(at, end, page(2), false),
         Err(Errno::EFAULT)
     );
-    assert_eq!(view.userfault_continue(at, end, page(1)), Ok(()));
+    assert_eq!(view.userfault_continue(at, end, page(1), false), Ok(()));
     assert_eq!(
-        view.userfault_continue(at, end, page(1)),
+        view.userfault_continue(at, end, page(1), false),
         Err(Errno::EEXIST)
     );
     let mut byte = [0];
@@ -1252,8 +1252,23 @@ fn a_userfaultfd_minor_fault_waits_for_uffdio_continue() {
     // Once a mapping brought a hole in, the page cache has it.
     m.read(GuestAddr(page(0)), &mut byte).unwrap();
     assert_eq!(
-        view.userfault_continue(at, end, page(0)),
+        view.userfault_continue(at, end, page(0), false),
         Err(Errno::EEXIST)
+    );
+    // A discard drops the entries, and the pages wait again; a
+    // `UFFDIO_CONTINUE` with the write-protect mode protects its page.
+    m.discard_shared(GuestAddr(at), 4 * PAGE_SIZE).unwrap();
+    assert_eq!(
+        m.userfault_for(GuestAddr(page(1)), false, false),
+        Some((7, UserfaultReason::Minor))
+    );
+    view.userfault_register(at, end, 7, Userfault::MINOR | Userfault::WP)
+        .unwrap();
+    assert_eq!(view.userfault_continue(at, end, page(1), true), Ok(()));
+    assert!(m.write(GuestAddr(page(1)), b"g").is_err());
+    assert_eq!(
+        m.userfault_for(GuestAddr(page(1)), true, false),
+        Some((7, UserfaultReason::Protected))
     );
     // With the missing mode too, a hole is a missing page.
     view.userfault_register(at, end, 7, Userfault::MISSING | Userfault::MINOR)
@@ -1262,4 +1277,133 @@ fn a_userfaultfd_minor_fault_waits_for_uffdio_continue() {
         m.userfault_for(GuestAddr(page(2)), true, false),
         Some((7, UserfaultReason::Missing))
     );
+}
+
+#[test]
+fn uffdio_writeprotect_marks_the_pages_of_shmem_that_have_no_entry() {
+    let source: Arc<dyn PageSource> = Arc::new(Shmem {
+        size: 4 * PAGE_SIZE,
+        held: vec![],
+        shmem: true,
+    });
+    let m = AddressSpace::new();
+    let view = m.view();
+    let pages = SharedPages::new().with_source(Arc::clone(&source));
+    let at = m
+        .map_shared(None, 4 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 4 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    let at = at.0;
+    let end = at + 4 * PAGE_SIZE;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    let state = |n: u64| {
+        view.pagemap(page(n).0, 1).unwrap()[0]
+            & (pagemap::PRESENT | pagemap::SWAP | pagemap::UFFD_WP)
+    };
+    view.userfault_register(at, end, 7, Userfault::WP).unwrap();
+    m.write(page(1), b"a").unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    // A page with no entry has a marker: a write to it faults to the
+    // `userfaultfd`, which makes its entry, write-protected, first.
+    assert_eq!(state(0), pagemap::SWAP | pagemap::UFFD_WP);
+    let fault = m.write(page(0), b"b").unwrap_err();
+    assert!(fault.mapped && !fault.present && fault.write);
+    assert_eq!(
+        m.userfault_for(page(0), true, false),
+        Some((7, UserfaultReason::Protected))
+    );
+    assert_eq!(state(0), pagemap::PRESENT | pagemap::UFFD_WP);
+    assert!(m.write(page(0), b"b").unwrap_err().present);
+    // A read makes a write-protected entry too.
+    let mut b = [0];
+    m.read(page(2), &mut b).unwrap();
+    assert_eq!(state(2), pagemap::PRESENT | pagemap::UFFD_WP);
+    assert!(m.write(page(2), b"c").is_err());
+    assert_eq!(m.userfault_for(page(2), false, false), None);
+    // A discard drops shmem's entries and leaves markers for the
+    // protected ones; the page cache keeps the contents.
+    m.discard_shared(GuestAddr(at), 4 * PAGE_SIZE).unwrap();
+    assert_eq!(state(1), pagemap::SWAP | pagemap::UFFD_WP);
+    m.read(page(1), &mut b).unwrap();
+    assert_eq!(b, *b"a");
+    assert!(m.write(page(1), b"d").is_err());
+    // The end of the protection drops the markers.
+    view.userfault_write_protect(at, end, false).unwrap();
+    assert_eq!(state(3), 0);
+    m.write(page(3), b"e").unwrap();
+    m.write(page(1), b"f").unwrap();
+    m.discard_shared(GuestAddr(at), 4 * PAGE_SIZE).unwrap();
+    m.write(page(1), b"g").unwrap();
+    // A fill takes a marker's place, protected only by its mode.
+    view.userfault_write_protect(at, end, true).unwrap();
+    m.discard_shared(GuestAddr(at), 4 * PAGE_SIZE).unwrap();
+    assert_eq!(state(1), pagemap::SWAP | pagemap::UFFD_WP);
+    assert_eq!(
+        view.userfault_poison(at, end, page(1).0),
+        Err(Errno::EEXIST)
+    );
+    // A page the page cache has is a shmem fill's `EEXIST`; a hole's
+    // marker gives way.
+    assert_eq!(
+        view.userfault_fill(at, end, page(1).0, None, false),
+        Err(Errno::EEXIST)
+    );
+    view.userfault_unregister(at, end, 7).unwrap();
+    assert_eq!(state(1), 0);
+}
+
+#[test]
+fn uffdio_writeprotect_marks_unpopulated_anonymous_pages_with_wp_unpopulated() {
+    let mut m = AddressSpace::new();
+    let view = m.view();
+    let at = m
+        .map(
+            None,
+            3 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap()
+        .0;
+    let end = at + 3 * PAGE_SIZE;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    // Without `WP_UNPOPULATED` a page with no entry is not protected.
+    view.userfault_register(at, end, 7, Userfault::WP).unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    m.write(page(0), b"a").unwrap();
+    view.userfault_register(at, end, 7, Userfault::WP | Userfault::WP_UNPOPULATED)
+        .unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    assert!(m.write(page(0), b"b").is_err());
+    assert!(m.write(page(1), b"b").is_err());
+    assert_eq!(
+        m.userfault_for(page(1), true, false),
+        Some((7, UserfaultReason::Protected))
+    );
+    // A zero page or a poison does not replace a marker; a copy does.
+    view.userfault_prepare_fill(at);
+    assert_eq!(
+        view.userfault_fill(at, end, page(2).0, None, false),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        view.userfault_poison(at, end, page(2).0),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        view.userfault_fill(at, end, page(2).0, Some(b"c"), false),
+        Ok(())
+    );
+    m.write(page(2), b"d").unwrap();
+    // A discard of anonymous memory drops the protection, markers too.
+    m.discard_shared(page(1), 2 * PAGE_SIZE).unwrap();
+    m.write(page(1), b"e").unwrap();
+    m.write(page(2), b"e").unwrap();
+    // A child has no markers.
+    m.discard_shared(page(1), 2 * PAGE_SIZE).unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    let child = m.fork();
+    child.write(page(1), b"f").unwrap();
+    assert!(m.write(page(1), b"g").is_err());
 }

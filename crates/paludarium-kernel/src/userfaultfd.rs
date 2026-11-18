@@ -4,9 +4,9 @@
 //!
 //! A context belongs to the address space it was made in (Linux's
 //! `ctx->mm`), whoever holds its file. `UFFDIO_API` takes the features,
-//! once; `UFFDIO_REGISTER` registers private anonymous memory and shared
-//! memory of no file for missing pages, and private anonymous memory for
-//! write protection ([`paludarium_mmu::Userfault`]). An instruction that
+//! once; `UFFDIO_REGISTER` registers private anonymous memory and shmem
+//! (shared memory of no file, a memfd) for missing pages and for write
+//! protection ([`paludarium_mmu::Userfault`]). An instruction that
 //! touches such a page, which has none, or that writes to a page
 //! `UFFDIO_WRITEPROTECT` or `UFFDIO_COPY_MODE_WP` protected, stops: its
 //! thread waits in the context, whose file reads the fault as a
@@ -32,13 +32,15 @@
 //! Linux's `shmem_get_folio_gfp` gives `handle_userfault` with
 //! `VM_UFFD_MINOR`, until `UFFDIO_CONTINUE` maps the page.
 //!
-//! Not offered: the write protection of shared memory and of pages with
-//! no entry (`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
-//! `UFFD_FEATURE_WP_UNPOPULATED`, `UFFD_FEATURE_WP_ASYNC`); and the events
-//! of `fork`, `mremap`, `madvise` and `munmap`. `UFFDIO_API` does not
-//! report their features, which it refuses (`EINVAL`), and
-//! `UFFDIO_REGISTER` refuses the write-protect mode of shared memory
-//! (`EINVAL`).
+//! `UFFDIO_WRITEPROTECT` protects the pages of shmem that have no entry
+//! too, and with `UFFD_FEATURE_WP_UNPOPULATED` those of private anonymous
+//! memory, with Linux's uffd-wp markers: the entry an access makes for
+//! such a page is write-protected, and a discard of shmem keeps the
+//! protection of its pages.
+//!
+//! Not offered: `UFFD_FEATURE_WP_ASYNC`, and the events of `fork`,
+//! `mremap`, `madvise` and `munmap`. `UFFDIO_API` does not report their
+//! features, which it refuses (`EINVAL`).
 
 use crate::events::{IN, ReadinessHub};
 use crate::syscalls::{Context, Outcome};
@@ -82,6 +84,12 @@ const FEATURE_MINOR_SHMEM: u64 = 1 << 10;
 /// `UFFD_FEATURE_EXACT_ADDRESS`: a fault's message has the address
 /// itself, not its page's.
 const FEATURE_EXACT_ADDRESS: u64 = 1 << 11;
+/// `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`: shmem takes the write-protect mode,
+/// whether a context asked for it or not, as Linux's does.
+const FEATURE_WP_HUGETLBFS_SHMEM: u64 = 1 << 12;
+/// `UFFD_FEATURE_WP_UNPOPULATED`: `UFFDIO_WRITEPROTECT` protects the pages
+/// of private anonymous memory that have none too
+/// ([`paludarium_mmu::Userfault::WP_UNPOPULATED`]).
 const FEATURE_WP_UNPOPULATED: u64 = 1 << 13;
 /// `UFFD_FEATURE_POISON`: `UFFDIO_POISON` is there.
 const FEATURE_POISON: u64 = 1 << 14;
@@ -99,6 +107,8 @@ const FEATURES: u64 = FEATURE_PAGEFAULT_FLAG_WP
     | FEATURE_MINOR_HUGETLBFS
     | FEATURE_MINOR_SHMEM
     | FEATURE_EXACT_ADDRESS
+    | FEATURE_WP_HUGETLBFS_SHMEM
+    | FEATURE_WP_UNPOPULATED
     | FEATURE_POISON
     | FEATURE_MOVE;
 /// The context's features once `UFFDIO_API` took them
@@ -669,9 +679,13 @@ fn register(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64,
         return Err(Errno::EINVAL);
     }
     validate(start, len)?;
+    let mut modes = mode as u8;
+    if context.features() & FEATURE_WP_UNPOPULATED != 0 {
+        modes |= paludarium_mmu::Userfault::WP_UNPOPULATED;
+    }
     context
         .memory
-        .userfault_register(start, start + len, context.id, mode as u8)?;
+        .userfault_register(start, start + len, context.id, modes)?;
     let mut ioctls = RANGE_IOCTLS;
     if mode & MODE_WP != 0 {
         ioctls |= WRITEPROTECT_IOCTL;
@@ -807,7 +821,9 @@ fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Res
         };
         let done = match kind {
             Fill::Poison => memory.userfault_poison(dst, end, dst + filled),
-            Fill::Continue => memory.userfault_continue(dst, end, dst + filled),
+            Fill::Continue => {
+                memory.userfault_continue(dst, end, dst + filled, mode & COPY_MODE_WP != 0)
+            }
             Fill::Copy | Fill::Zeros => {
                 memory.userfault_fill(dst, end, dst + filled, bytes, mode & COPY_MODE_WP != 0)
             }

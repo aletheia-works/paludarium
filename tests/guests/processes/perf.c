@@ -3,7 +3,9 @@
    cpu-clock and the dummy event) with read, the read formats, groups, the
    ENABLE, DISABLE, RESET and ID ioctls, enable_on_exec, prctl's
    PR_TASK_PERF_EVENTS_DISABLE and ENABLE of the events a thread opened,
-   and inherit, which counts the children a task makes.
+   inherit, which counts the children a task makes, and the page faults,
+   context switches and CPU migrations a thread makes, with and without
+   exclude_user and exclude_kernel.
 
    Counts and times are given as whether they are 0, grew or stayed,
    never as values, and IDs as whether they match. Hardware events are not
@@ -18,7 +20,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -42,6 +46,7 @@ struct attr {
 
 #define DISABLED (1ULL << 0)
 #define INHERIT (1ULL << 1)
+#define EXCLUDE_USER (1ULL << 4)
 #define EXCLUDE_KERNEL (1ULL << 5)
 #define EXCLUDE_HV (1ULL << 6)
 #define FREQ (1ULL << 10)
@@ -482,6 +487,73 @@ static int case_inherit(void) {
     return 0;
 }
 
+/* A software event of this thread with the exclusions given. */
+static int open_software(uint64_t config, uint64_t exclude) {
+    struct attr a = software(config);
+    a.flags = exclude;
+    return (int)open_event(&a, 0, -1, -1, 0);
+}
+
+/* Writes a byte to each of the pages of an anonymous mapping, its first
+   write: one minor fault each. */
+static void touch(int pages) {
+    char *p = mmap(NULL, (size_t)pages * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (int i = 0; i < pages; i++) p[(size_t)i * 4096] = 1;
+}
+
+static int case_software(void) {
+    int faults = open_software(2, 0), minor = open_software(5, 0), major = open_software(6, 0);
+    int user_faults = open_software(2, EXCLUDE_KERNEL), kernel_faults = open_software(2, EXCLUDE_USER);
+    int switches = open_software(3, 0), user_switches = open_software(3, EXCLUDE_KERNEL);
+    int migrations = open_software(4, 0), user_migrations = open_software(4, EXCLUDE_KERNEL);
+    say("open %d %d %d %d %d %d %d %d %d", faults >= 0, minor >= 0, major >= 0, user_faults >= 0,
+        kernel_faults >= 0, switches >= 0, user_switches >= 0, migrations >= 0, user_migrations >= 0);
+
+    /* Sixteen first writes of the program's own, once its code has run. */
+    touch(16);
+    uint64_t f = count(faults), m = count(minor), j = count(major), u = count(user_faults);
+    touch(16);
+    uint64_t df = count(faults) - f, dm = count(minor) - m, dj = count(major) - j, du = count(user_faults) - u;
+    say("own writes: faults %d minor %d major %d user %d", df >= 16 && df <= 20, dm >= 16 && dm <= 20,
+        dj == 0, du >= 16 && du <= 20);
+
+    /* A system call writes a page first: a fault of the kernel's. */
+    int pipes[2];
+    pipe(pipes);
+    char *fresh = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    write(pipes[1], "x", 1);
+    uint64_t k = count(kernel_faults);
+    read(pipes[0], fresh, 1);
+    say("a read's copy: kernel faults %d", count(kernel_faults) - k >= 1);
+
+    /* Three sleeps each switch at least once, all in the kernel. */
+    uint64_t s = count(switches), us = count(user_switches);
+    for (int i = 0; i < 3; i++) usleep(1000);
+    say("sleeps: switches %d user %d", count(switches) - s >= 3, count(user_switches) - us == 0);
+
+    /* Moved to another CPU, then kept on it. */
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) >= 2 && CPU_ISSET(0, &set) &&
+        CPU_ISSET(1, &set)) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(0, &one);
+        sched_setaffinity(0, sizeof one, &one);
+        uint64_t g = count(migrations), ug = count(user_migrations);
+        CPU_ZERO(&one);
+        CPU_SET(1, &one);
+        long moved = TRY(sched_setaffinity(0, sizeof one, &one));
+        uint64_t h = count(migrations);
+        say("moved %ld: migrations %d user %d", moved, h - g >= 1, count(user_migrations) - ug == 0);
+        for (int i = 0; i < 3; i++) usleep(1000);
+        say("kept: migrations %d", count(migrations) - h == 0);
+    } else {
+        say("fewer than two cpus");
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -489,6 +561,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-counts")) return case_counts();
     if (!strcmp(mode, "perf-prctl")) return case_prctl();
     if (!strcmp(mode, "perf-inherit")) return case_inherit();
+    if (!strcmp(mode, "perf-software")) return case_software();
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {
         spin();

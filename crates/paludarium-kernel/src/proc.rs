@@ -1,13 +1,11 @@
 //! The /proc files paludarium has, generated when opened: the mount table
 //! (`/proc/self/mountinfo`, `/proc/mounts`) from the filesystem's mounts,
 //! `loadavg`, `meminfo`, `stat` and `uptime`, `/proc/sys` ([`crate::sysctl`]),
-//! `/proc/sysvipc`'s `msg`, `sem` and `shm` ([`crate::msg`], [`crate::sem`],
-//! [`crate::shm`]),
 //! and this process's directory with its
 //! `status`, `stat`, `cmdline`, `comm`, the `exe` and `cwd` links, its `fd`
 //! directory of links to the open descriptors, its `ns` directory of links
-//! to its namespaces, and its `maps`, which alone is generated as it is
-//! read.
+//! to its namespaces, and its `maps`, which is generated as it is read, as
+//! `/proc/sysvipc`'s `msg`, `sem` and `shm` are ([`crate::seq`]).
 use paludarium_host::{FileHandle, FileStat};
 use paludarium_mmu::{MemoryView, Prot, Usage, Vma, vm};
 use paludarium_types::Errno;

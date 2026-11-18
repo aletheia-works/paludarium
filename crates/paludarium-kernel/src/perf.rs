@@ -1,12 +1,14 @@
 //! `perf_event_open`, as Linux's `kernel/events/core.c` checks its
 //! arguments, for the software events the emulator can count: `cpu-clock`
 //! and `task-clock` (the thread's CPU time, or for an event of a CPU the
-//! time that passes), and `alignment-faults`, `emulation-faults`, `dummy`
-//! and `bpf-output`, which never count on x86-64 here or there. Hardware,
-//! cache and raw events find no PMU (`ENOENT`), as on a machine without
-//! one; the other software events (page faults, context switches, CPU
-//! migrations, cgroup switches), tracepoints and breakpoints are not there
-//! (`ENOENT`) either.
+//! time that passes); `page-faults`, `minor-faults`, `context-switches`
+//! and `cpu-migrations` of a thread, from what it used as of its latest
+//! system call ([`crate::Usage`]); and `major-faults`, `alignment-faults`,
+//! `emulation-faults`, `dummy` and `bpf-output`, which never count here
+//! (the last four on x86-64 Linux neither). An event of a CPU counts no
+//! faults, switches or migrations. Hardware, cache and raw events find no
+//! PMU (`ENOENT`), as on a machine without one; `cgroup-switches`,
+//! tracepoints and breakpoints are not there (`ENOENT`) either.
 //!
 //! An event is read (`read`), enabled, disabled and reset (the `ioctl`s,
 //! with `PERF_IOC_FLAG_GROUP`), and grouped; `enable_on_exec` enables it
@@ -56,6 +58,11 @@ const TYPE_HW_CACHE: u32 = 3;
 
 const SW_CPU_CLOCK: u64 = 0;
 const SW_TASK_CLOCK: u64 = 1;
+const SW_PAGE_FAULTS: u64 = 2;
+const SW_CONTEXT_SWITCHES: u64 = 3;
+const SW_CPU_MIGRATIONS: u64 = 4;
+const SW_PAGE_FAULTS_MIN: u64 = 5;
+const SW_PAGE_FAULTS_MAJ: u64 = 6;
 const SW_ALIGNMENT_FAULTS: u64 = 7;
 const SW_EMULATION_FAULTS: u64 = 8;
 const SW_DUMMY: u64 = 9;
@@ -107,6 +114,7 @@ mod bit {
     pub const INHERIT: u32 = 1;
     pub const PINNED: u32 = 2;
     pub const EXCLUSIVE: u32 = 3;
+    pub const EXCLUDE_USER: u32 = 4;
     pub const EXCLUDE_KERNEL: u32 = 5;
     pub const FREQ: u32 = 10;
     pub const ENABLE_ON_EXEC: u32 = 12;
@@ -367,6 +375,14 @@ fn simd_regs(vec_qwords: u16, vector: u64, pred_qwords: u16, predicate: u32) -> 
 enum Counter {
     /// `cpu-clock` and `task-clock`: nanoseconds.
     Clock,
+    /// `page-faults` and `minor-faults`: the faults the thread's accesses
+    /// took ([`crate::Usage::faults`]), every one minor, as the emulator's
+    /// pages are all in memory.
+    Faults,
+    /// `context-switches`: the times the thread went to sleep.
+    Switches,
+    /// `cpu-migrations`: the times it moved to another CPU.
+    Migrations,
     /// An event that never happens here.
     Zero,
 }
@@ -392,6 +408,8 @@ struct State {
     running_time: u64,
     /// The clock when these were last brought up to date.
     since: u64,
+    /// For a counter of the thread's [`crate::Usage`], its value then.
+    tally: u64,
     /// What inherited events of tasks that have ended gave back
     /// (`child_count`, `child_total_time_enabled`, `_running`).
     child_count: u64,
@@ -551,16 +569,59 @@ impl Event {
         let now = self.now(&mut state);
         let passed = now.saturating_sub(state.since);
         state.since = now;
+        let tallied = self.used().map_or(0, |value| {
+            let more = value.saturating_sub(state.tally);
+            state.tally = value;
+            more
+        });
         if state.enabled {
             state.enabled_time += passed;
             if !state.paused {
                 state.running_time += passed;
-                if self.counter == Counter::Clock {
-                    state.count += passed;
-                }
+                state.count += if self.counter == Counter::Clock {
+                    passed
+                } else {
+                    tallied
+                };
             }
         }
         state
+    }
+    /// What the thread's [`crate::Usage`] counts for a counter of it, as of
+    /// its latest system call, and kept once it is gone; `None` for the
+    /// other counters, an event of a CPU, and a thread that has made no
+    /// system call yet. As Linux's `perf_exclude_event` has it, the faults
+    /// of the thread's code are left out with `exclude_user` and those of
+    /// system calls with `exclude_kernel`, which leaves out the switches and
+    /// migrations too, as the kernel makes them.
+    fn used(&self) -> Option<u64> {
+        let Target::Thread { group, tid } = &self.target else {
+            return None;
+        };
+        if !matches!(
+            self.counter,
+            Counter::Faults | Counter::Switches | Counter::Migrations
+        ) {
+            return None;
+        }
+        let usage = group.last_thread_usage(*tid)?;
+        let load = |value: &AtomicU64| value.load(Ordering::SeqCst);
+        let (user, kernel) = match self.counter {
+            Counter::Faults => (load(&usage.faults), load(&usage.kernel_faults)),
+            Counter::Switches => (0, load(&usage.switches)),
+            _ => (0, load(&usage.migrations)),
+        };
+        let user = if self.attr.flag(bit::EXCLUDE_USER) {
+            0
+        } else {
+            user
+        };
+        let kernel = if self.attr.flag(bit::EXCLUDE_KERNEL) {
+            0
+        } else {
+            kernel
+        };
+        Some(user + kernel)
     }
     /// The count, the time enabled and the time running now.
     fn values(&self) -> (u64, u64, u64) {
@@ -1027,9 +1088,11 @@ fn init(attr: &Attr) -> Result<Counter, Errno> {
             }
             let counter = match config {
                 SW_CPU_CLOCK | SW_TASK_CLOCK => Counter::Clock,
-                SW_ALIGNMENT_FAULTS | SW_EMULATION_FAULTS | SW_DUMMY | SW_BPF_OUTPUT => {
-                    Counter::Zero
-                }
+                SW_PAGE_FAULTS | SW_PAGE_FAULTS_MIN => Counter::Faults,
+                SW_CONTEXT_SWITCHES => Counter::Switches,
+                SW_CPU_MIGRATIONS => Counter::Migrations,
+                SW_PAGE_FAULTS_MAJ | SW_ALIGNMENT_FAULTS | SW_EMULATION_FAULTS | SW_DUMMY
+                | SW_BPF_OUTPUT => Counter::Zero,
                 _ => return Err(Errno::ENOENT),
             };
             // `perf_try_init_event`: a software PMU takes neither SIMD nor
@@ -1339,7 +1402,12 @@ mod tests {
         assert_eq!(init(&attr(1, 0)), Ok(Counter::Clock));
         assert_eq!(init(&attr(1, 1)), Ok(Counter::Clock));
         assert_eq!(init(&attr(1, 9)), Ok(Counter::Zero));
-        assert_eq!(init(&attr(1, 2)), Err(Errno::ENOENT));
+        assert_eq!(init(&attr(1, 2)), Ok(Counter::Faults));
+        assert_eq!(init(&attr(1, 3)), Ok(Counter::Switches));
+        assert_eq!(init(&attr(1, 4)), Ok(Counter::Migrations));
+        assert_eq!(init(&attr(1, 5)), Ok(Counter::Faults));
+        assert_eq!(init(&attr(1, 6)), Ok(Counter::Zero));
+        assert_eq!(init(&attr(1, 11)), Err(Errno::ENOENT));
         assert_eq!(init(&attr(1, 12)), Err(Errno::ENOENT));
         assert_eq!(init(&attr(0, 0)), Err(Errno::ENOENT));
         let branch = Attr {
@@ -1369,10 +1437,19 @@ mod tests {
     }
 
     fn with_attr(leader: Option<&Arc<Event>>, target: Target, attr: Attr) -> Arc<Event> {
+        of_counter(leader, target, attr, Counter::Zero)
+    }
+
+    fn of_counter(
+        leader: Option<&Arc<Event>>,
+        target: Target,
+        attr: Attr,
+        counter: Counter,
+    ) -> Arc<Event> {
         let event = Arc::new(Event {
             id: 0,
             attr,
-            counter: Counter::Zero,
+            counter,
             target,
             cpu: 0,
             clockid: None,
@@ -1391,6 +1468,126 @@ mod tests {
 
     fn ids(events: &[Arc<Event>]) -> Vec<*const Event> {
         events.iter().map(Arc::as_ptr).collect()
+    }
+
+    #[test]
+    fn the_software_events_count_what_the_thread_used_while_they_are_enabled() {
+        let host = paludarium_host::testing::RecordingHost::default();
+        let group = Arc::new(ThreadGroup::default());
+        let mut state = crate::ThreadState::default();
+        // A system call: what the thread's code faulted on, then the call.
+        let account = |state: &mut crate::ThreadState| {
+            crate::account_faults(state, false);
+            crate::account_cpu(&host, &group, state, 5);
+        };
+        let excluding = |counter, bit: u32| {
+            let target = Target::Thread {
+                group: Arc::clone(&group),
+                tid: 5,
+            };
+            let attr = Attr {
+                flags: 1 << bit,
+                ..Attr::default()
+            };
+            of_counter(None, target, attr, counter)
+        };
+        // Bit 63 is no exclusion.
+        let of = |counter| excluding(counter, 63);
+        // Before the thread's first system call there is nothing to count.
+        let switches = of(Counter::Switches);
+        switches.enable();
+        assert_eq!(switches.values().0, 0);
+        let _ = paludarium_host::switches::take();
+        account(&mut state);
+        let (faults, migrations) = (of(Counter::Faults), of(Counter::Migrations));
+        let user_switches = excluding(Counter::Switches, bit::EXCLUDE_KERNEL);
+        let user_faults = excluding(Counter::Faults, bit::EXCLUDE_KERNEL);
+        let kernel_faults = excluding(Counter::Faults, bit::EXCLUDE_USER);
+        for event in [
+            &faults,
+            &migrations,
+            &user_switches,
+            &user_faults,
+            &kernel_faults,
+        ] {
+            event.enable();
+        }
+        // Two sleeps and a page's first write, accounted at the next call.
+        paludarium_host::switches::sleep(&mut false);
+        paludarium_host::switches::sleep(&mut false);
+        let mut space = paludarium_mmu::AddressSpace::new();
+        let page = space
+            .map(
+                None,
+                4096,
+                paludarium_mmu::Prot::READ_WRITE,
+                paludarium_mmu::MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write_u64(page, 1).unwrap();
+        assert_eq!(switches.values().0, 0);
+        account(&mut state);
+        assert_eq!((switches.values().0, faults.values().0), (2, 1));
+        // The kernel makes the switches; the fault was the thread's own.
+        assert_eq!(user_switches.values().0, 0);
+        assert_eq!((user_faults.values().0, kernel_faults.values().0), (1, 0));
+        // A fault of a system call's access, as it leaves the call.
+        let copy = space
+            .map(
+                None,
+                4096,
+                paludarium_mmu::Prot::READ_WRITE,
+                paludarium_mmu::MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write_u64(copy, 1).unwrap();
+        crate::account_faults(&state, true);
+        account(&mut state);
+        assert_eq!((user_faults.values().0, kernel_faults.values().0), (1, 1));
+        // A disabled event leaves out what comes meanwhile.
+        switches.disable();
+        paludarium_host::switches::sleep(&mut false);
+        account(&mut state);
+        switches.enable();
+        paludarium_host::switches::sleep(&mut false);
+        account(&mut state);
+        assert_eq!(switches.values().0, 3);
+        // A new mask that leaves out its CPU moves the thread; one that keeps
+        // the lowest CPU, or another call on the same, does not.
+        assert_eq!(migrations.values().0, 0);
+        group.set_affinity(5, vec![0b110]);
+        account(&mut state);
+        account(&mut state);
+        group.set_affinity(5, vec![0b1110]);
+        account(&mut state);
+        assert_eq!(migrations.values().0, 1);
+        // The thread's virtual CPU with `rseq` is the one it runs on.
+        state.on_cpu = Some(crate::rseq::OnCpu {
+            cpu: 3,
+            cid: 0,
+            runner: 0,
+        });
+        account(&mut state);
+        assert_eq!(migrations.values().0, 2);
+        // Without `rseq` again, it is on the lowest CPU its mask allows,
+        // though the mask has not changed since.
+        state.on_cpu = None;
+        account(&mut state);
+        assert_eq!(migrations.values().0, 3);
+        // An event of a CPU counts none of these.
+        let cpu = of_counter(None, Target::Cpu, Attr::default(), Counter::Faults);
+        cpu.enable();
+        let more = space
+            .map(
+                None,
+                4096,
+                paludarium_mmu::Prot::READ_WRITE,
+                paludarium_mmu::MappingKind::Anonymous,
+            )
+            .unwrap();
+        space.write_u64(more, 1).unwrap();
+        account(&mut state);
+        assert_eq!((cpu.values().0, faults.values().0), (0, 3));
     }
 
     #[test]

@@ -74,12 +74,12 @@ mod cmd {
     pub const MAX: u32 = 39;
 }
 
-const TYPE_HASH: u32 = 1;
-const TYPE_ARRAY: u32 = 2;
-const TYPE_LRU_HASH: u32 = 9;
-const TYPE_QUEUE: u32 = 22;
-const TYPE_STACK: u32 = 23;
-const TYPE_BLOOM_FILTER: u32 = 30;
+pub(crate) const TYPE_HASH: u32 = 1;
+pub(crate) const TYPE_ARRAY: u32 = 2;
+pub(crate) const TYPE_LRU_HASH: u32 = 9;
+pub(crate) const TYPE_QUEUE: u32 = 22;
+pub(crate) const TYPE_STACK: u32 = 23;
+pub(crate) const TYPE_BLOOM_FILTER: u32 = 30;
 /// `__MAX_BPF_MAP_TYPE` in Linux master.
 const TYPE_MAX: u32 = 39;
 /// `BPF_MAP_TYPE_STRUCT_OPS`, the one `btf_vmlinux_value_type_id` is for.
@@ -87,7 +87,7 @@ const TYPE_STRUCT_OPS: u32 = 26;
 /// The types `map_extra` is for: bloom filters, arenas and resizable hashes.
 const TYPES_WITH_EXTRA: [u32; 3] = [30, 33, 37];
 
-mod flag {
+pub(crate) mod flag {
     pub const NO_PREALLOC: u32 = 1 << 0;
     pub const NO_COMMON_LRU: u32 = 1 << 1;
     pub const NUMA_NODE: u32 = 1 << 2;
@@ -109,9 +109,9 @@ mod flag {
 
 /// The element flags: `BPF_ANY`, `BPF_NOEXIST`, `BPF_EXIST`, `BPF_F_LOCK`,
 /// `BPF_F_CPU` and `BPF_F_ALL_CPUS`.
-const NOEXIST: u64 = 1;
-const EXIST: u64 = 2;
-const F_LOCK: u64 = 4;
+pub(crate) const NOEXIST: u64 = 1;
+pub(crate) const EXIST: u64 = 2;
+pub(crate) const F_LOCK: u64 = 4;
 const F_CPU: u64 = 8;
 const F_ALL_CPUS: u64 = 16;
 
@@ -136,12 +136,26 @@ fn bpf_capable(c: &Context<'_>) -> bool {
     credentials.capable(CAP_BPF) || credentials.capable(CAP_SYS_ADMIN)
 }
 
+/// A value that a program's lookup points at: the map and the program
+/// share it, so that what either writes the other reads, until the element
+/// it is in goes (an array's never do; a hash's and an LRU hash's are new
+/// with each update, as Linux takes a new element for one).
+type Cell = Arc<Mutex<Box<[u8]>>>;
+
+fn cell(value: Vec<u8>) -> Cell {
+    Arc::new(Mutex::new(value.into_boxed_slice()))
+}
+
+fn copy(cell: &Cell) -> Vec<u8> {
+    lock(cell).to_vec()
+}
+
 /// The elements of a map.
 enum Elements {
-    /// An array's, by index: those never written are zeros.
-    Array(BTreeMap<u32, Vec<u8>>),
+    /// An array's, by index: those never written or pointed at are zeros.
+    Array(BTreeMap<u32, Cell>),
     /// A hash's, by key.
-    Hash(BTreeMap<Vec<u8>, Vec<u8>>),
+    Hash(BTreeMap<Vec<u8>, Cell>),
     /// An LRU hash's, with the lists that choose which goes when it is
     /// full.
     Lru(Box<Lru>),
@@ -466,7 +480,7 @@ pub(crate) fn check_attr(attr: &[u8], end: usize) -> Result<(), Errno> {
 
 /// `bpf_obj_name_cpy`: letters, digits, `_` and `.`, ending in a NUL
 /// within the field (`EINVAL`).
-fn name(field: &[u8]) -> Result<[u8; 16], Errno> {
+pub(crate) fn name(field: &[u8]) -> Result<[u8; 16], Errno> {
     let mut name = [0; 16];
     let end = field.iter().position(|&b| b == 0).ok_or(Errno::EINVAL)?;
     if !field[..end]
@@ -1033,13 +1047,12 @@ impl Map {
                 }
                 Ok(values
                     .get(&i)
-                    .cloned()
-                    .unwrap_or_else(|| vec![0; self.value_size as usize]))
+                    .map_or_else(|| vec![0; self.value_size as usize], copy))
             }
-            Elements::Hash(values) => values.get(key).cloned().ok_or(Errno::ENOENT),
+            Elements::Hash(values) => values.get(key).map(copy).ok_or(Errno::ENOENT),
             // As `htab_lru_map_lookup_elem_sys`, which leaves the
             // reference alone.
-            Elements::Lru(lru) => lru.get(key).cloned().ok_or(Errno::ENOENT),
+            Elements::Lru(lru) => lru.get(key).map(copy).ok_or(Errno::ENOENT),
             // `map_peek_elem`: a queue's oldest, a stack's newest.
             Elements::Queue(values) => if self.kind == TYPE_QUEUE {
                 values.front()
@@ -1065,13 +1078,17 @@ impl Map {
         }
         .ok_or(Errno::ENOENT)
     }
-    /// `map_update_elem` of the map's type.
+    /// `map_update_elem` of the map's type, from the syscall or a program:
+    /// `BPF_F_LOCK`, which the syscall refuses first, is `EINVAL` where
+    /// each type finds that the map has no spin lock (none here has).
     fn set(&self, key: &[u8], value: Vec<u8>, flags: u64) -> Result<(), Errno> {
         let mode = flags & !F_LOCK;
         if mode > EXIST {
             return Err(Errno::EINVAL);
         }
+        let locked = flags & F_LOCK != 0;
         match &mut *self.elements() {
+            // `array_map_update_elem` writes the element in place.
             Elements::Array(values) => {
                 let i = index(key);
                 if i >= self.max_entries {
@@ -1080,9 +1097,20 @@ impl Map {
                 if mode == NOEXIST {
                     return Err(Errno::EEXIST);
                 }
-                values.insert(i, value);
+                if locked {
+                    return Err(Errno::EINVAL);
+                }
+                match values.get(&i) {
+                    Some(held) => lock(held).copy_from_slice(&value),
+                    None => {
+                        values.insert(i, cell(value));
+                    }
+                }
             }
             Elements::Hash(values) => {
+                if locked {
+                    return Err(Errno::EINVAL);
+                }
                 let present = values.contains_key(key);
                 if present && mode == NOEXIST {
                     return Err(Errno::EEXIST);
@@ -1093,13 +1121,19 @@ impl Map {
                 if !present && values.len() >= self.max_entries as usize {
                     return Err(E2BIG);
                 }
-                values.insert(key.to_vec(), value);
+                values.insert(key.to_vec(), cell(value));
             }
-            Elements::Lru(lru) => lru.update(key, value, mode)?,
+            // `htab_lru_map_update_elem` takes no flag past `BPF_EXIST`.
+            Elements::Lru(lru) => {
+                if locked {
+                    return Err(Errno::EINVAL);
+                }
+                lru.update(key, cell(value), mode)?;
+            }
             // `queue_stack_map_push_elem`: `BPF_EXIST` makes room in a full
             // one by giving up the oldest; `BPF_NOEXIST` is not for it.
             Elements::Queue(values) => {
-                if mode == NOEXIST {
+                if mode == NOEXIST || locked {
                     return Err(Errno::EINVAL);
                 }
                 if values.len() >= self.max_entries as usize {
@@ -1124,7 +1158,10 @@ impl Map {
     fn remove(&self, key: &[u8]) -> Result<Vec<u8>, Errno> {
         match &mut *self.elements() {
             Elements::Array(_) => Err(Errno::EINVAL),
-            Elements::Hash(values) => values.remove(key).ok_or(Errno::ENOENT),
+            Elements::Hash(values) => values
+                .remove(key)
+                .map(|value| copy(&value))
+                .ok_or(Errno::ENOENT),
             Elements::Lru(lru) => lru.delete(key),
             Elements::Queue(_) => Err(Errno::EINVAL),
             Elements::Bloom(_) => Err(EOPNOTSUPP),
@@ -1155,11 +1192,11 @@ impl Map {
     #[cfg(test)]
     fn held(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match &*self.elements() {
-            Elements::Hash(values) => values.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Elements::Hash(values) => values.iter().map(|(k, v)| (k.clone(), copy(v))).collect(),
             Elements::Lru(lru) => lru
                 .table
-                .iter()
-                .map(|(k, &i)| (k.clone(), lru.values[i].clone()))
+                .keys()
+                .filter_map(|k| Some((k.clone(), copy(lru.get(k)?))))
                 .collect(),
             Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => Vec::new(),
         }
@@ -1178,10 +1215,10 @@ impl Map {
         let mut taken = Vec::with_capacity(chosen.len());
         for key in chosen {
             let value = match &mut *elements {
-                Elements::Hash(values) if delete => values.remove(&key),
-                Elements::Hash(values) => values.get(&key).cloned(),
+                Elements::Hash(values) if delete => values.remove(&key).map(|value| copy(&value)),
+                Elements::Hash(values) => values.get(&key).map(copy),
                 Elements::Lru(lru) if delete => lru.delete(&key).ok(),
-                Elements::Lru(lru) => lru.get(&key).cloned(),
+                Elements::Lru(lru) => lru.get(&key).map(copy),
                 Elements::Array(_) | Elements::Queue(_) | Elements::Bloom(_) => None,
             };
             if let Some(value) = value {
@@ -1228,6 +1265,202 @@ impl Map {
             table + (element + POINTER) * self.len() as u64
         }
     }
+}
+
+/// A value a program's `bpf_map_lookup_elem` points at, which it reads and
+/// writes in place; the verifier keeps its accesses within the value, and
+/// one outside it is `EFAULT`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "BPF programs use it once they run")
+)]
+pub(crate) struct ValueRef(Cell);
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "BPF programs use it once they run")
+)]
+impl ValueRef {
+    /// The `out.len()` bytes from `off`.
+    pub(crate) fn read(&self, off: usize, out: &mut [u8]) -> Result<(), Errno> {
+        let value = lock(&self.0);
+        let bytes = off
+            .checked_add(out.len())
+            .and_then(|end| value.get(off..end))
+            .ok_or(Errno::EFAULT)?;
+        out.copy_from_slice(bytes);
+        Ok(())
+    }
+    /// `bytes` written from `off`.
+    pub(crate) fn write(&self, off: usize, bytes: &[u8]) -> Result<(), Errno> {
+        let mut value = lock(&self.0);
+        let place = off
+            .checked_add(bytes.len())
+            .and_then(|end| value.get_mut(off..end))
+            .ok_or(Errno::EFAULT)?;
+        place.copy_from_slice(bytes);
+        Ok(())
+    }
+    /// The value's size, the map's `value_size`.
+    pub(crate) fn len(&self) -> usize {
+        lock(&self.0).len()
+    }
+}
+
+/// What the verifier needs to know of a map.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "BPF programs use it once they run")
+)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Meta {
+    pub(crate) kind: u32,
+    pub(crate) key_size: u32,
+    pub(crate) value_size: u32,
+    pub(crate) max_entries: u32,
+    pub(crate) flags: u32,
+    /// `BPF_MAP_FREEZE`: a frozen map with `BPF_F_RDONLY_PROG` is one whose
+    /// values the verifier may take as constants.
+    pub(crate) frozen: bool,
+}
+
+/// The map operations a program's helpers call, as each type's
+/// `bpf_map_ops` does them; the verifier lets a program call only those its
+/// map's type has (`check_map_func_compatibility`), and those it has not
+/// are `EINVAL` here. The verifier also makes every key and value the
+/// map's size; one that is not is `EFAULT` (none for a lookup), so that a
+/// mistake there fails the call rather than the emulator.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "BPF programs call them once they run")
+)]
+impl Map {
+    pub(crate) fn meta(&self) -> Meta {
+        Meta {
+            kind: self.kind,
+            key_size: self.key_size,
+            value_size: self.value_size,
+            max_entries: self.max_entries,
+            flags: self.flags,
+            frozen: self.frozen.load(Ordering::SeqCst),
+        }
+    }
+    /// `bpf_map_lookup_elem`: the value itself, which the program writes in
+    /// place, or none (a null pointer). An array's elements are all there,
+    /// so an index in range always has one; an LRU hash's lookup sets the
+    /// element's reference, which the syscall's does not.
+    pub(crate) fn prog_lookup(&self, key: &[u8]) -> Option<ValueRef> {
+        sized(key, self.key_size).ok()?;
+        let mut elements = self.elements();
+        let value = match &mut *elements {
+            Elements::Array(values) => {
+                let i = index(key);
+                if i >= self.max_entries {
+                    return None;
+                }
+                Arc::clone(
+                    values
+                        .entry(i)
+                        .or_insert_with(|| cell(vec![0; self.value_size as usize])),
+                )
+            }
+            Elements::Hash(values) => Arc::clone(values.get(key)?),
+            Elements::Lru(lru) => Arc::clone(lru.reference(key)?),
+            // `queue_stack_map_lookup_elem` is null; a bloom filter's is
+            // `ERR_PTR(-EINVAL)`, which the verifier never lets a program
+            // reach.
+            Elements::Queue(_) | Elements::Bloom(_) => return None,
+        };
+        Some(ValueRef(value))
+    }
+    /// `bpf_map_update_elem`: as the syscall's, but a queue's, a stack's
+    /// and a bloom filter's are `EINVAL`, for their push is a helper of its
+    /// own.
+    pub(crate) fn prog_update(&self, key: &[u8], value: &[u8], flags: u64) -> Result<(), Errno> {
+        if matches!(self.kind, TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER) {
+            return Err(Errno::EINVAL);
+        }
+        sized(key, self.key_size)?;
+        sized(value, self.value_size)?;
+        self.set(key, value.to_vec(), flags)
+    }
+    /// `bpf_map_delete_elem`: an array's, a queue's and a stack's are
+    /// `EINVAL`, a bloom filter's `EOPNOTSUPP`.
+    pub(crate) fn prog_delete(&self, key: &[u8]) -> Result<(), Errno> {
+        sized(key, self.key_size)?;
+        self.remove(key).map(drop)
+    }
+    /// `bpf_map_push_elem`: a queue's, a stack's or a bloom filter's.
+    pub(crate) fn push(&self, value: &[u8], flags: u64) -> Result<(), Errno> {
+        if !matches!(self.kind, TYPE_QUEUE | TYPE_STACK | TYPE_BLOOM_FILTER) {
+            return Err(Errno::EINVAL);
+        }
+        sized(value, self.value_size)?;
+        self.set(&[], value.to_vec(), flags)
+    }
+    /// `bpf_map_pop_elem`: a queue's oldest or a stack's newest, taken out
+    /// into `out`, which is zeros with `ENOENT` for none; a bloom filter's
+    /// is `EOPNOTSUPP`.
+    pub(crate) fn pop_into(&self, out: &mut [u8]) -> Result<(), Errno> {
+        sized(out, self.value_size)?;
+        match self.kind {
+            TYPE_QUEUE | TYPE_STACK => Self::give(self.pop(), out),
+            TYPE_BLOOM_FILTER => Err(EOPNOTSUPP),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+    /// `bpf_map_peek_elem`: a queue's oldest or a stack's newest, left in,
+    /// into `value` (zeros with `ENOENT` for none); for a bloom filter,
+    /// whether `value` may be in it (`ENOENT` for one that is not).
+    pub(crate) fn peek(&self, value: &mut [u8]) -> Result<(), Errno> {
+        sized(value, self.value_size)?;
+        match &*self.elements() {
+            Elements::Bloom(bloom) => bloom.peek(value),
+            Elements::Queue(values) => {
+                let held = if self.kind == TYPE_QUEUE {
+                    values.front()
+                } else {
+                    values.back()
+                }
+                .cloned()
+                .ok_or(Errno::ENOENT);
+                Self::give(held, value)
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+    /// The value `__queue_map_get` and `__stack_map_get` copy out, or the
+    /// zeros they leave for none.
+    fn give(value: Result<Vec<u8>, Errno>, out: &mut [u8]) -> Result<(), Errno> {
+        match value {
+            Ok(value) if value.len() == out.len() => {
+                out.copy_from_slice(&value);
+                Ok(())
+            }
+            Ok(_) => Err(Errno::EFAULT),
+            Err(e) => {
+                out.fill(0);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// `EFAULT` for a key or value that is not `size` bytes.
+fn sized(bytes: &[u8], size: u32) -> Result<(), Errno> {
+    if bytes.len() == size as usize {
+        Ok(())
+    } else {
+        Err(Errno::EFAULT)
+    }
+}
+
+/// `bpf_map_get` for a program's `BPF_PSEUDO_MAP_FD`: the map of `fd`,
+/// whichever way the descriptor was opened; `EBADF` for no descriptor,
+/// `EINVAL` for one that is no map.
+#[expect(dead_code, reason = "the verifier calls it once programs load")]
+pub(crate) fn map_from_fd(c: &Context<'_>, fd: u32) -> Result<Arc<Map>, Errno> {
+    map_of(c, fd).map(|(map, _, _)| map)
 }
 
 /// `htab_map_get_next_key`, in the order of the keys: the first after
@@ -1705,7 +1938,8 @@ struct Lru {
     /// `bpf_lru_node.ref`, which only replacing a key sets from user space.
     referenced: Vec<bool>,
     keys: Vec<Vec<u8>>,
-    values: Vec<Vec<u8>>,
+    /// Each element's value, while it holds a key.
+    values: Vec<Option<Cell>>,
     /// The hash table: which element holds each key.
     table: BTreeMap<Vec<u8>, usize>,
     /// How many are active and inactive (`counts`).
@@ -1739,7 +1973,7 @@ impl Lru {
             place: vec![Place::Free; elements],
             referenced: vec![false; elements],
             keys: vec![Vec::new(); elements],
-            values: vec![Vec::new(); elements],
+            values: vec![None; elements],
             table: BTreeMap::new(),
             active: 0,
             inactive: 0,
@@ -1831,6 +2065,9 @@ impl Lru {
     fn take_out(&mut self, i: usize) -> bool {
         if self.table.get(&self.keys[i]) == Some(&i) {
             self.table.remove(&self.keys[i]);
+            // Its value is no longer the map's: a program that still
+            // points at it is its only holder.
+            self.values[i] = None;
             true
         } else {
             false
@@ -2025,6 +2262,9 @@ impl Lru {
     /// `bpf_lru_push_free`: a pending element back to the local free list,
     /// any other to the free list.
     fn push_free(&mut self, i: usize) {
+        // A free element holds no value: not one a refused update put
+        // there, nor a replaced key's old one.
+        self.values[i] = None;
         if !self.per_cpu && self.place[i] == Place::LocalPending {
             self.place[i] = Place::LocalFree;
             self.referenced[i] = false;
@@ -2035,10 +2275,10 @@ impl Lru {
     }
     /// `htab_lru_map_update_elem`: an element is taken first, then the flags
     /// are checked; a key replaced is referenced in its new element.
-    fn update(&mut self, key: &[u8], value: Vec<u8>, mode: u64) -> Result<(), Errno> {
+    fn update(&mut self, key: &[u8], value: Cell, mode: u64) -> Result<(), Errno> {
         let i = self.pop_free().ok_or(ENOMEM)?;
         self.keys[i] = key.to_vec();
-        self.values[i] = value;
+        self.values[i] = Some(value);
         let old = self.table.get(key).copied();
         let refused = match (old, mode) {
             (Some(_), NOEXIST) => Some(Errno::EEXIST),
@@ -2059,12 +2299,18 @@ impl Lru {
     /// `htab_lru_map_delete_elem`.
     fn delete(&mut self, key: &[u8]) -> Result<Vec<u8>, Errno> {
         let i = self.table.remove(key).ok_or(Errno::ENOENT)?;
-        let value = std::mem::take(&mut self.values[i]);
+        let value = self.values[i].take().map(|value| copy(&value));
         self.push_free(i);
-        Ok(value)
+        Ok(value.unwrap_or_default())
     }
-    fn get(&self, key: &[u8]) -> Option<&Vec<u8>> {
-        self.table.get(key).map(|&i| &self.values[i])
+    fn get(&self, key: &[u8]) -> Option<&Cell> {
+        self.table.get(key).and_then(|&i| self.values[i].as_ref())
+    }
+    /// `bpf_lru_node_set_ref`, as a program's lookup sets it.
+    fn reference(&mut self, key: &[u8]) -> Option<&Cell> {
+        let &i = self.table.get(key)?;
+        self.referenced[i] = true;
+        self.values[i].as_ref()
     }
 }
 
@@ -2222,6 +2468,187 @@ mod tests {
 
     fn held_keys(m: &Map) -> Vec<u32> {
         m.held().iter().map(|(k, _)| index(k)).collect()
+    }
+
+    #[test]
+    fn a_programs_lookup_points_at_the_value_itself() {
+        let k = |i: u32| i.to_le_bytes();
+        // An array's element is written in place, by either side, and is
+        // there before anything was written to it.
+        let array = map(TYPE_ARRAY, 2);
+        let value = array.prog_lookup(&k(1)).unwrap();
+        assert_eq!(value.len(), 8);
+        value.write(2, &[7, 7]).unwrap();
+        assert_eq!(array.get(&k(1)), Ok(vec![0, 0, 7, 7, 0, 0, 0, 0]));
+        array.set(&k(1), vec![1; 8], 0).unwrap();
+        let mut out = [0; 4];
+        value.read(4, &mut out).unwrap();
+        assert_eq!(out, [1; 4]);
+        assert_eq!(value.read(6, &mut out), Err(Errno::EFAULT));
+        assert_eq!(value.write(usize::MAX, &[0]), Err(Errno::EFAULT));
+        assert!(array.prog_lookup(&k(2)).is_none());
+        assert_eq!(array.prog_delete(&k(1)), Err(Errno::EINVAL));
+        // A hash's update is a new element: what pointed at the old one no
+        // longer reaches the map.
+        let hash = map(TYPE_HASH, 2);
+        assert!(hash.prog_lookup(&k(1)).is_none());
+        hash.prog_update(&k(1), &[1; 8], NOEXIST).unwrap();
+        let old = hash.prog_lookup(&k(1)).unwrap();
+        old.write(0, &[5]).unwrap();
+        assert_eq!(hash.get(&k(1)), Ok(vec![5, 1, 1, 1, 1, 1, 1, 1]));
+        hash.prog_update(&k(1), &[2; 8], EXIST).unwrap();
+        old.write(0, &[6]).unwrap();
+        assert_eq!(hash.get(&k(1)), Ok(vec![2; 8]));
+        assert_eq!(hash.prog_delete(&k(1)), Ok(()));
+        assert_eq!(hash.prog_delete(&k(1)), Err(Errno::ENOENT));
+        assert!(hash.prog_lookup(&k(1)).is_none());
+    }
+
+    #[test]
+    fn a_programs_update_takes_the_flags_each_type_takes() {
+        let k = 0u32.to_le_bytes();
+        // `BPF_F_LOCK` with no spin lock, where each type checks it.
+        let array = map(TYPE_ARRAY, 1);
+        assert_eq!(array.prog_update(&k, &[0; 8], F_LOCK), Err(Errno::EINVAL));
+        assert_eq!(
+            array.prog_update(&1u32.to_le_bytes(), &[0; 8], F_LOCK),
+            Err(E2BIG)
+        );
+        assert_eq!(
+            array.prog_update(&k, &[0; 8], F_LOCK | NOEXIST),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(array.prog_update(&k, &[0; 8], 1 << 32), Err(Errno::EINVAL));
+        for kind in [TYPE_HASH, TYPE_LRU_HASH] {
+            let hash = map(kind, 2);
+            assert_eq!(
+                hash.prog_update(&k, &[0; 8], F_LOCK | NOEXIST),
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(hash.len(), 0);
+        }
+        // A queue, a stack and a bloom filter are pushed, not updated.
+        for kind in [TYPE_QUEUE, TYPE_STACK, TYPE_BLOOM_FILTER] {
+            let m = map(kind, 2);
+            assert_eq!(m.prog_update(&[], &[0; 8], 0), Err(Errno::EINVAL));
+            assert!(m.prog_lookup(&[]).is_none());
+        }
+        let queue = map(TYPE_QUEUE, 1);
+        assert_eq!(queue.push(&[0; 8], F_LOCK), Err(Errno::EINVAL));
+        assert_eq!(queue.push(&[0; 8], F_LOCK | EXIST), Err(Errno::EINVAL));
+        assert_eq!(map(TYPE_HASH, 1).push(&[0; 8], 0), Err(Errno::EINVAL));
+        // A key or value of another size fails the call, and nothing more.
+        let array = map(TYPE_ARRAY, 1);
+        assert_eq!(array.prog_update(&k, &[0; 9], 0), Err(Errno::EFAULT));
+        assert_eq!(array.prog_update(&[0; 3], &[0; 8], 0), Err(Errno::EFAULT));
+        assert!(array.prog_lookup(&[0; 3]).is_none());
+        let hash = map(TYPE_HASH, 1);
+        assert_eq!(hash.prog_update(&k, &[0; 7], 0), Err(Errno::EFAULT));
+        assert_eq!(hash.prog_delete(&[0; 5]), Err(Errno::EFAULT));
+        assert_eq!(hash.len(), 0);
+        assert_eq!(queue.push(&[0; 4], 0), Err(Errno::EFAULT));
+        assert_eq!(queue.peek(&mut [0; 4]), Err(Errno::EFAULT));
+        assert_eq!(queue.pop_into(&mut [0; 4]), Err(Errno::EFAULT));
+    }
+
+    #[test]
+    fn a_programs_pop_and_peek_leave_zeros_for_none() {
+        let queue = map(TYPE_QUEUE, 2);
+        let stack = map(TYPE_STACK, 2);
+        for m in [&queue, &stack] {
+            m.push(&[1; 8], 0).unwrap();
+            m.push(&[2; 8], 0).unwrap();
+            assert_eq!(m.push(&[3; 8], 0), Err(E2BIG));
+        }
+        let mut out = [9; 8];
+        queue.peek(&mut out).unwrap();
+        assert_eq!(out, [1; 8]);
+        stack.peek(&mut out).unwrap();
+        assert_eq!(out, [2; 8]);
+        queue.pop_into(&mut out).unwrap();
+        assert_eq!(out, [1; 8]);
+        queue.pop_into(&mut out).unwrap();
+        assert_eq!(out, [2; 8]);
+        out = [9; 8];
+        assert_eq!(queue.pop_into(&mut out), Err(Errno::ENOENT));
+        assert_eq!(out, [0; 8]);
+        out = [9; 8];
+        assert_eq!(queue.peek(&mut out), Err(Errno::ENOENT));
+        assert_eq!(out, [0; 8]);
+        // A bloom filter's peek reads the value it asks about.
+        // (`create` makes its bits from `map_extra` and the seed.)
+        let mut filter = map(TYPE_BLOOM_FILTER, 100);
+        filter.key_size = 0;
+        *filter.elements() = Elements::Bloom(bloom(100, 0, 0));
+        filter.push(&[4; 8], 0).unwrap();
+        assert_eq!(filter.push(&[4; 8], EXIST), Err(Errno::EINVAL));
+        let mut asked = [4; 8];
+        assert_eq!(filter.peek(&mut asked), Ok(()));
+        assert_eq!(asked, [4; 8]);
+        assert_eq!(filter.pop_into(&mut asked), Err(EOPNOTSUPP));
+        assert_eq!(filter.prog_delete(&[]), Err(EOPNOTSUPP));
+        assert!(filter.prog_lookup(&[]).is_none());
+        // Types without them, which the verifier never lets through.
+        let array = map(TYPE_ARRAY, 1);
+        assert_eq!(array.pop_into(&mut out), Err(Errno::EINVAL));
+        assert_eq!(array.peek(&mut out), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn a_programs_lookup_references_an_lru_element_and_the_syscalls_does_not() {
+        let k = |i: u32| i.to_le_bytes();
+        let fill = || {
+            let m = map(TYPE_LRU_HASH, 4);
+            for i in 1..=5 {
+                m.set(&k(i), vec![i as u8; 8], 0).unwrap();
+            }
+            assert_eq!(held_keys(&m), [2, 3, 4, 5]);
+            m
+        };
+        let by_program = fill();
+        assert!(by_program.prog_lookup(&k(2)).is_some());
+        by_program.set(&k(6), vec![6; 8], 0).unwrap();
+        assert_eq!(held_keys(&by_program), [2, 4, 5, 6]);
+        // No element without a key keeps a value, however it lost its key.
+        assert_eq!(
+            by_program.set(&k(6), vec![0; 8], NOEXIST),
+            Err(Errno::EEXIST)
+        );
+        by_program.set(&k(2), vec![9; 8], 0).unwrap();
+        let first = held_keys(&by_program)[0];
+        by_program.remove(&k(first)).unwrap();
+        {
+            let elements = by_program.elements();
+            let Elements::Lru(lru) = &*elements else {
+                unreachable!()
+            };
+            let keyed: std::collections::BTreeSet<usize> = lru.table.values().copied().collect();
+            for (i, value) in lru.values.iter().enumerate() {
+                assert_eq!(value.is_some(), keyed.contains(&i), "element {i}");
+            }
+        }
+        let by_syscall = fill();
+        assert_eq!(by_syscall.get(&k(2)), Ok(vec![2; 8]));
+        by_syscall.set(&k(6), vec![6; 8], 0).unwrap();
+        assert_eq!(held_keys(&by_syscall), [3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn meta_is_what_the_map_was_made_with() {
+        let m = shaped(TYPE_HASH, 3, 16, flag::RDONLY_PROG, &Arc::default(), 1);
+        m.frozen.store(true, Ordering::SeqCst);
+        let Meta {
+            kind,
+            key_size,
+            value_size,
+            max_entries,
+            flags,
+            frozen,
+        } = m.meta();
+        assert_eq!(
+            (kind, key_size, value_size, max_entries, flags, frozen),
+            (TYPE_HASH, 4, 16, 3, flag::RDONLY_PROG, true)
+        );
     }
 
     #[test]

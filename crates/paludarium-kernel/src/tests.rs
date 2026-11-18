@@ -9306,6 +9306,17 @@ fn a_bind_mount_of_a_generated_directory_shows_its_files() {
     let fd = f.ret(257, &[(-100i64) as u64, relative, 0, 0]);
     assert!(fd < 1024);
     assert_eq!(f.ret(3, &[fd]), 0);
+    // `self` there is the link it is: the working directory is the
+    // process's own directory, through the bind mount.
+    let own = put(&mut f, 0xe0, b"/tmp/p/self");
+    assert_eq!(f.ret(80, &[own]), 0);
+    let expected = format!("/tmp/p/{}\0", f.ret(39, &[]));
+    let got = f.ret(79, &[cwd, 64]);
+    assert_eq!(got, expected.len() as u64);
+    let mut name = vec![0; expected.len()];
+    f.mem.read(GuestAddr(cwd), &mut name).unwrap();
+    assert_eq!(name, expected.as_bytes());
+    assert_eq!(f.ret(80, &[p]), 0);
     // In use while it is the working directory.
     assert_eq!(f.ret(166, &[p, 0]), errno(Errno(16)));
     assert_eq!(f.ret(80, &[root]), 0);

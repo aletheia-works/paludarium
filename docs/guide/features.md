@@ -4471,14 +4471,15 @@ one only with an `--allow-net`.
 - `ptrace` traces another task as Linux's `kernel/ptrace.c` does.
   `PTRACE_TRACEME` makes the thread that forked the caller its tracer;
   `PTRACE_ATTACH` sends the task `SIGSTOP` from the kernel, and
-  `PTRACE_SEIZE` stops it only at `PTRACE_INTERRUPT`. A task already in a
-  group stop is made to report it to its new tracer, and the call returns
-  once it has. Both refuse a task of
+  `PTRACE_SEIZE` stops it only at `PTRACE_INTERRUPT`. `PTRACE_ATTACH` and
+  `PTRACE_SEIZE` both refuse a task of
   the caller's own process, one already traced or exited, and one the caller
   may not attach to (`ptrace_may_access` with the real IDs, and Yama's
   `ptrace_scope` 1), with `EPERM`. Only the tracer thread may make requests,
   and only of a tracee in a ptrace stop, but for `PTRACE_KILL` and
-  `PTRACE_INTERRUPT` (`ESRCH`).
+  `PTRACE_INTERRUPT` (`ESRCH`). A task already in a group stop when it is
+  attached or seized is made to report that stop to its new tracer, and the
+  call returns once it has.
 - A traced thread stops for its tracer at every signal it takes but
   `SIGKILL`, ignored ones too, and at a group stop, which a seized task
   reports as `PTRACE_EVENT_STOP` with its siginfo and one attached otherwise

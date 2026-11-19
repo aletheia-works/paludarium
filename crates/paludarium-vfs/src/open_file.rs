@@ -180,6 +180,9 @@ impl FileHandle for MemFile {
         let Kind::File(contents) = &mut n.kind else {
             return Err(Errno::EISDIR);
         };
+        // A file system without a size (`size=0`, or none mounted) still
+        // ends at the memory; `Contents::allocate` takes the pages against
+        // a mount's size, which this check has already let through.
         if used.saturating_add(contents.missing(offset, len)) > size {
             return Err(Errno(28));
         }

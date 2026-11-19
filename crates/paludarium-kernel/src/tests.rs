@@ -8523,6 +8523,9 @@ fn a_tmpfs_mount_holds_its_files_to_its_size_and_inodes() {
     assert_eq!(f.ret(87, &[s]), 0);
     assert_eq!(f.ret(86, &[a, b]), 0);
     assert_eq!(statfs(&mut f).4, 0);
+    // A rename between two names of one file does nothing.
+    assert_eq!(f.ret(82, &[a, b]), 0);
+    assert_eq!(statfs(&mut f).4, 0);
     assert_eq!(f.ret(87, &[b]), 0);
     assert_eq!(statfs(&mut f).4, 1);
     // A long symbolic link needs a page, which there is not.

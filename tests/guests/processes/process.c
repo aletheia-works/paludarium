@@ -11291,6 +11291,8 @@ static int tl_inner(const char *m) {
     int gone = tl_err(unlink(s));
     printf("unlink=%d link=%d\n", gone, tl_err(link(a, b)));
     tl_statfs("linked", m);
+    printf("rename same=%d\n", tl_err(rename(a, b)));
+    tl_statfs("renamed", m);
     printf("unlink second=%d\n", tl_err(unlink(b)));
     tl_statfs("unlinked", m);
     char longer[201];

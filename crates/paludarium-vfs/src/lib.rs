@@ -342,6 +342,9 @@ struct Node {
     /// its `Drop` reads it.
     _charge: Charge,
 }
+/// `SHORT_SYMLINK_LEN`: a symbolic link whose target and NUL are no longer
+/// is kept in its inode, a longer one in a page.
+const SHORT_SYMLINK_LEN: usize = 128;
 /// An inode's part of its file system's [`Usage`], given back when it goes.
 struct Charge {
     usage: Arc<Usage>,
@@ -373,7 +376,7 @@ impl Charge {
     /// The pages `kind` takes of its own, besides a file's contents.
     fn pages_of(kind: &Kind) -> u64 {
         match kind {
-            Kind::Symlink(target) if target.len() + 1 > 128 => 1,
+            Kind::Symlink(target) if target.len() + 1 > SHORT_SYMLINK_LEN => 1,
             _ => 0,
         }
     }

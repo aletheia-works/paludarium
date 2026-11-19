@@ -338,6 +338,7 @@
     {"name":"execveat","binary":"process"},
     {"name":"etxtbsy","binary":"process"},
     {"name":"shm","binary":"process"},
+    {"name":"traced-rusage","binary":"process"},
     {"name":"sem","binary":"process"},
     {"name":"msg","binary":"process"},
     {"name":"ipc-sysctl","binary":"process"},

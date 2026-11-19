@@ -1365,6 +1365,8 @@ fn change_generated_file(
     follow: bool,
     change: Change,
 ) -> Result<u64, Errno> {
+    // A name too long is `ENAMETOOLONG` before any lookup.
+    paludarium_vfs::normalize_path(p)?;
     let (stat, ..) = generated_stat(c, p, follow)?.ok_or(Errno::ENOENT)?;
     let creds = &c.process.credentials;
     let target = dev_followed(p, follow);

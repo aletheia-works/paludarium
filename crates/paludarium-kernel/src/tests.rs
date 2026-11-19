@@ -9537,6 +9537,12 @@ fn the_path_calls_change_the_generated_files() {
     assert_eq!(u64::from_le_bytes(kind), 0x0102_1994);
     let missing = put(&mut f, 0x60, b"/dev/nosuch");
     assert_eq!(f.ret(137, &[missing, buf]), errno(Errno::ENOENT));
+    let long = put(
+        &mut f,
+        0x100,
+        &[b"/dev/mqueue/".as_slice(), &[b'a'; 256]].concat(),
+    );
+    assert_eq!(f.ret(90, &[long, 0o600]), errno(Errno::ENAMETOOLONG));
     // Another user: the owner's checks of root's files.
     assert_eq!(f.ret(117, &[1000, 1000, 1000]), 0);
     assert_eq!(f.ret(90, &[null, 0o666]), errno(Errno::EPERM));

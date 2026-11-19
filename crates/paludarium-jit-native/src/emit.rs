@@ -792,79 +792,10 @@ impl Emitter<'_, '_> {
 
     /// The result (masked to `size`) and status flags of `op` on `a` and
     /// `b`, both masked to `size`, as `alu::add`, `alu::sub` and
-    /// `alu::logic` have them; `adc` and `sbb` take CF from the flags.
+    /// `alu::logic` have them.
     fn alu(&mut self, op: Alu, a: Value, b: Value, size: u8) -> (Value, Value) {
         match op {
-            Alu::Add | Alu::Adc | Alu::Sub | Alu::Sbb | Alu::Cmp => {
-                let add = matches!(op, Alu::Add | Alu::Adc);
-                let carry_in = if matches!(op, Alu::Adc | Alu::Sbb) {
-                    let flags = self.word(RFLAGS);
-                    Some(self.b.ins().band_imm_s(flags, flag::CF as i64))
-                } else {
-                    None
-                };
-                let first = if add {
-                    self.b.ins().iadd(a, b)
-                } else {
-                    self.b.ins().isub(a, b)
-                };
-                let wide = match carry_in {
-                    Some(c) if add => self.b.ins().iadd(first, c),
-                    Some(c) => self.b.ins().isub(first, c),
-                    None => first,
-                };
-                let r = if size == 8 {
-                    wide
-                } else {
-                    self.b.ins().band_imm_s(wide, mask(size))
-                };
-                let mut f = self.zf_sf_pf(r, size);
-                let carry = match (add, size == 8, carry_in) {
-                    // Below 8 bytes the whole sum or difference fits.
-                    (true, false, _) => {
-                        self.b
-                            .ins()
-                            .icmp_imm_s(IntCC::UnsignedGreaterThan, wide, mask(size))
-                    }
-                    (true, true, None) => self.b.ins().icmp(IntCC::UnsignedLessThan, r, a),
-                    (true, true, Some(_)) => {
-                        let low = self.b.ins().icmp(IntCC::UnsignedLessThan, first, a);
-                        let high = self.b.ins().icmp(IntCC::UnsignedLessThan, r, first);
-                        self.b.ins().bor(low, high)
-                    }
-                    (false, _, None) => self.b.ins().icmp(IntCC::UnsignedLessThan, a, b),
-                    (false, false, Some(c)) => {
-                        let bc = self.b.ins().iadd(b, c);
-                        self.b.ins().icmp(IntCC::UnsignedLessThan, a, bc)
-                    }
-                    (false, true, Some(c)) => {
-                        let low = self.b.ins().icmp(IntCC::UnsignedLessThan, a, b);
-                        let high = self.b.ins().icmp(IntCC::UnsignedLessThan, first, c);
-                        self.b.ins().bor(low, high)
-                    }
-                };
-                let cf = self.bit(carry, flag::CF);
-                f = self.b.ins().bor(f, cf);
-                // OF: add when both operands differ in sign from the result,
-                // sub when the operands differ in sign and the result
-                // differs from the first.
-                let ar = self.b.ins().bxor(a, r);
-                let other = if add {
-                    self.b.ins().bxor(b, r)
-                } else {
-                    self.b.ins().bxor(a, b)
-                };
-                let both = self.b.ins().band(ar, other);
-                let signed = self.b.ins().band_imm_s(both, sign(size));
-                let overflow = self.b.ins().icmp_imm_s(IntCC::NotEqual, signed, 0);
-                let of = self.bit(overflow, flag::OF);
-                f = self.b.ins().bor(f, of);
-                let ab = self.b.ins().bxor(a, b);
-                let abr = self.b.ins().bxor(ab, r);
-                let af = self.b.ins().band_imm_s(abr, flag::AF as i64);
-                f = self.b.ins().bor(f, af);
-                (r, f)
-            }
+            Alu::Add | Alu::Sub | Alu::Cmp => self.add_sub(op == Alu::Add, false, a, b, size),
             Alu::And | Alu::Test | Alu::Or | Alu::Xor => {
                 let r = match op {
                     Alu::Or => self.b.ins().bor(a, b),
@@ -875,6 +806,80 @@ impl Emitter<'_, '_> {
                 (r, f)
             }
         }
+    }
+
+    /// The result (masked to `size`) and status flags of `a` plus `b`
+    /// (`add`) or `a` minus `b`, both masked to `size`, with CF from the
+    /// flags as the carry in when `carry` is set (`adc`, `sbb`), as
+    /// `alu::add` and `alu::sub` have them.
+    fn add_sub(&mut self, add: bool, carry: bool, a: Value, b: Value, size: u8) -> (Value, Value) {
+        let carry_in = if carry {
+            let flags = self.word(RFLAGS);
+            Some(self.b.ins().band_imm_s(flags, flag::CF as i64))
+        } else {
+            None
+        };
+        let first = if add {
+            self.b.ins().iadd(a, b)
+        } else {
+            self.b.ins().isub(a, b)
+        };
+        let wide = match carry_in {
+            Some(c) if add => self.b.ins().iadd(first, c),
+            Some(c) => self.b.ins().isub(first, c),
+            None => first,
+        };
+        let r = if size == 8 {
+            wide
+        } else {
+            self.b.ins().band_imm_s(wide, mask(size))
+        };
+        let mut f = self.zf_sf_pf(r, size);
+        let carry = match (add, size == 8, carry_in) {
+            // Below 8 bytes the whole sum or difference fits.
+            (true, false, _) => {
+                self.b
+                    .ins()
+                    .icmp_imm_s(IntCC::UnsignedGreaterThan, wide, mask(size))
+            }
+            (true, true, None) => self.b.ins().icmp(IntCC::UnsignedLessThan, r, a),
+            (true, true, Some(_)) => {
+                let low = self.b.ins().icmp(IntCC::UnsignedLessThan, first, a);
+                let high = self.b.ins().icmp(IntCC::UnsignedLessThan, r, first);
+                self.b.ins().bor(low, high)
+            }
+            (false, _, None) => self.b.ins().icmp(IntCC::UnsignedLessThan, a, b),
+            (false, false, Some(c)) => {
+                let bc = self.b.ins().iadd(b, c);
+                self.b.ins().icmp(IntCC::UnsignedLessThan, a, bc)
+            }
+            (false, true, Some(c)) => {
+                let low = self.b.ins().icmp(IntCC::UnsignedLessThan, a, b);
+                let high = self.b.ins().icmp(IntCC::UnsignedLessThan, first, c);
+                self.b.ins().bor(low, high)
+            }
+        };
+        let cf = self.bit(carry, flag::CF);
+        f = self.b.ins().bor(f, cf);
+        // OF: add when both operands differ in sign from the result,
+        // sub when the operands differ in sign and the result
+        // differs from the first.
+        let ar = self.b.ins().bxor(a, r);
+        let other = if add {
+            self.b.ins().bxor(b, r)
+        } else {
+            self.b.ins().bxor(a, b)
+        };
+        let both = self.b.ins().band(ar, other);
+        let signed = self.b.ins().band_imm_s(both, sign(size));
+        let overflow = self.b.ins().icmp_imm_s(IntCC::NotEqual, signed, 0);
+        let of = self.bit(overflow, flag::OF);
+        f = self.b.ins().bor(f, of);
+        let ab = self.b.ins().bxor(a, b);
+        let abr = self.b.ins().bxor(ab, r);
+        let af = self.b.ins().band_imm_s(abr, flag::AF as i64);
+        f = self.b.ins().bor(f, af);
+        (r, f)
     }
 
     fn set_status(&mut self, f: Value) {
@@ -1539,6 +1544,14 @@ impl Emitter<'_, '_> {
                 let v = self.b.ins().select(holds, v, old);
                 self.write(dst, v);
                 self.unless_changed(status, n + 1, next);
+            }
+            Fast::Carry { sub, dst, src } => {
+                let size = dst.size();
+                let b = self.source(src, size);
+                let a = self.read(dst);
+                let (r, f) = self.add_sub(!sub, true, a, b, size);
+                self.write(dst, r);
+                self.set_status(f);
             }
             Fast::Count { op, dst, src } => self.count(op, dst, src),
             Fast::BitTest { dst, bit } => {

@@ -115,8 +115,9 @@ out:
 - `lea`, `push` of a register or an immediate, and `pop`;
 - direct branches, `call` and `ret`, and `jmp` and `call` through a 64-bit
   register or 8 bytes of memory;
-- `add`, `adc`, `sub`, `sbb`, `and`, `or`, `xor`, `cmp` and `test` between
-  registers, immediates and memory (without `lock`);
+- `add`, `sub`, `and`, `or`, `xor`, `cmp` and `test` between registers,
+  immediates and memory (without `lock`), and `adc` and `sbb` of a register and
+  a register or an immediate;
 - `shl`, `shr`, `sar`, `rol` and `ror` of a register by an immediate, and `shl`,
   `shr` and `sar` of a register by `cl`;
 - `movzx` from a register, `movsx` and `movsxd` from a register or memory,

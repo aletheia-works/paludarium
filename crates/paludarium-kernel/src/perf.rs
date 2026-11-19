@@ -1390,8 +1390,9 @@ pub(crate) fn mmap(
 
 /// An event's ioctls, as Linux's `_perf_ioctl`: `ENABLE`, `DISABLE` and
 /// `RESET` of the event or, with `PERF_IOC_FLAG_GROUP`, its whole group;
-/// `ID`; `PERIOD` and `REFRESH`, which only a sampling event takes
-/// (`EINVAL`), the first a new period or frequency; `SET_OUTPUT` to
+/// `ID`; `PERIOD`, which only a sampling event takes (`EINVAL`), a new
+/// period or frequency; `REFRESH`, `EINVAL` for every event here (Linux
+/// takes it for a sampling event that does not inherit); `SET_OUTPUT` to
 /// another event's buffer ([`buffer::set_output`]), whose descriptor must
 /// be an event's (`EBADF`), or to none for -1; `PAUSE_OUTPUT` of the
 /// event's buffer (`EINVAL` without one); every other request is `ENOTTY`

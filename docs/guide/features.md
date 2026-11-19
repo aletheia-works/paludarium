@@ -3713,9 +3713,10 @@ kernel.
   clock, and neither pinned nor exclusive (`EINVAL`); it counts only while
   its leader is enabled. The ioctls `PERF_EVENT_IOC_ENABLE`, `DISABLE` and
   `RESET`, each of the event or with `PERF_IOC_FLAG_GROUP` of its group,
-  and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
-  for an event that does not sample, and `PERIOD` gives a sampling event a
-  new period (or with `freq` a new frequency) that starts over. `enable_on_exec` enables a disabled
+  and `PERF_EVENT_IOC_ID` are there; `PERIOD` is `EINVAL` for an event
+  that does not sample, and gives a sampling event a new period (or with
+  `freq` a new frequency) that starts over; `REFRESH` is `EINVAL` for
+  every event (see [limitations](./limitations)). `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
   `remove_on_exec` takes one out then for good, as Linux master does: it
   counts no more, keeps its last count and times to be read, has no owner

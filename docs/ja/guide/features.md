@@ -3214,8 +3214,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   pinned でも exclusive でもないこと（`EINVAL`）が要り、リーダーが有効な間だけ数えます。
   ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
-  と `REFRESH` は `EINVAL` で、`PERIOD` はサンプリングするイベントに新しい周期（`freq`
-  なら新しい頻度）を与え、周期は初めからになります。`enable_on_exec` は、`perf stat` が使うように、無効な
+  は `EINVAL` で、サンプリングするイベントには新しい周期（`freq` なら新しい頻度）を
+  与え、周期は初めからになります。`REFRESH` はどのイベントでも `EINVAL` です
+  （[制限](./limitations) を参照）。`enable_on_exec` は、`perf stat` が使うように、無効な
   イベントをそのタスクの `execve` で有効にし、`remove_on_exec` は、Linux master と同じく、そのとき
   イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
   持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで

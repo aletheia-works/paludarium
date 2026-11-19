@@ -261,7 +261,8 @@ verified.
   or `UNTHROTTLE`), an event of a CPU takes none, and no other record
   (`MMAP`, `COMM`, `TASK` and the rest) is written yet. Nothing wakes a
   reader: an overflow sends no signal, and `poll` never finds an event
-  readable. Its user page shows the count and times as of the
+  readable, and `PERF_EVENT_IOC_REFRESH` is `EINVAL` for every event,
+  where Linux takes it for a sampling event that does not inherit. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the

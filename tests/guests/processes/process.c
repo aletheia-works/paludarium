@@ -6667,14 +6667,20 @@ static int fault_around_case(void) {
     char *reserve = mmap(NULL, 8 * block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (reserve == MAP_FAILED) return 81;
     char *base = (char *)(((uintptr_t)reserve + block - 1) & ~(uintptr_t)(block - 1));
-    /* A file of 40 pages and 100 bytes, all in the page cache. */
+    /* A file of 40 pages and 100 bytes, all in the page cache. It is
+       written a page at a time, so that Linux's page cache holds it in
+       folios of one page: a larger folio within the file, the VMA and the
+       page table is mapped whole (filemap_map_folio_range), past the 16
+       pages, and how large a file system makes them is its own. */
     char path[] = "/tmp/paludarium-fault-around-XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0) return 82;
     unlink(path);
-    static char bytes[40 * 4096 + 100];
+    static char bytes[4096];
     memset(bytes, 7, sizeof bytes);
-    if (write(fd, bytes, sizeof bytes) != (ssize_t)sizeof bytes) return 83;
+    for (int i = 0; i < 40; i++)
+        if (write(fd, bytes, sizeof bytes) != (ssize_t)sizeof bytes) return 83;
+    if (write(fd, bytes, 100) != 100) return 83;
 
     int fixed = MAP_FIXED | MAP_PRIVATE;
     char *a = mmap(base, (size_t)(48 * page), PROT_READ, fixed, fd, 0);

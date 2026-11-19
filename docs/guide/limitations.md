@@ -53,7 +53,13 @@ verified.
   page entries. `Referenced` is every page counted. A page of a loaded program's segment counts as
   anonymous once the segment was written, not once the page was. The
   pages that `MAP_POPULATE`, `MAP_LOCKED` or a lock would bring in of a
-  file are counted only once touched.
+  file are counted only once touched. A read fault in a file's mapping
+  maps no more than the 16 pages around it
+  ([features](./features#system-calls)), where Linux maps a large folio
+  of its page cache whole when the folio lies within the file, the VMA
+  and the page table (`filemap_map_folio_range`): the emulator's page
+  cache has no large folios, whose size each file system picks. `pagemap`
+  shows the same pages.
   `THPeligible` is always 0 and there is no `ProtectionKey`, as there are
   no huge pages and the CPU has no protection keys. `VmFlags` shows no
   `ht` or `dp` (`MAP_HUGETLB`, `MAP_DROPPABLE`). A page of a host file

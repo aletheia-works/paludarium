@@ -76,6 +76,8 @@ impl Execution {
         thread: &mut Thread,
         mut memory: Arc<AddressSpace>,
     ) {
+        // This host thread runs the task from now on, as Linux's `current`.
+        kernel.enter_thread(thread.tid);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run(kernel, thread, &mut memory)
         }))
@@ -89,6 +91,9 @@ impl Execution {
         // `exit_notify`): what its mappings hold, such as an ELF
         // interpreter's file, is let go of before a parent's wait ends.
         drop(memory);
+        // And no longer: what this host thread lets go of after this is no
+        // task's doing.
+        paludarium_mmu::set_current_actor(None);
         kernel.complete_process(
             result
                 .as_ref()

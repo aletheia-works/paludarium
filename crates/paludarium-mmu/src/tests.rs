@@ -1588,10 +1588,10 @@ fn the_vmas_of_a_file_that_never_merges_open_and_close_as_linux_s_do() {
     m.share_pages(page(0), 6 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
         .unwrap();
     drop(pages);
-    // A space with no actor tells nothing.
+    // A thread with no actor tells nothing.
     m.protect_shared(page(5), PAGE_SIZE, Prot::READ).unwrap();
     assert_eq!(told(), []);
-    m.set_actor(Arc::new(1u32));
+    set_current_actor(Some(Arc::new(1u32)));
     // A split opens the new VMA; an unmap of a whole VMA closes it, and
     // one of part splits it and closes the part.
     m.protect_shared(page(4), PAGE_SIZE, Prot::READ).unwrap();
@@ -1630,14 +1630,26 @@ fn the_vmas_of_a_file_that_never_merges_open_and_close_as_linux_s_do() {
     assert_eq!(moved, page(16));
     assert_eq!(told(), [(false, 1), (true, 1)]);
     // A fork opens the child's VMAs as the parent; the child's space then
-    // closes them as the child, and the parent's as the parent.
+    // closes them as whoever lets go of it last.
     let child = m.fork();
     assert_eq!(told(), [(true, 1); 4]);
-    child.set_actor(Arc::new(2u32));
+    set_current_actor(Some(Arc::new(2u32)));
     drop(child);
     assert_eq!(told(), [(false, 2); 4]);
+    // Tasks that share one space (`CLONE_VM`) each tell as themselves, and
+    // only the last of them to let go of it closes what is left
+    // (`exit_mmap`).
+    let m = Arc::new(m);
+    let other = Arc::clone(&m);
+    m.unmap_shared(page(0), PAGE_SIZE).unwrap();
+    assert_eq!(told(), [(false, 2)]);
+    set_current_actor(Some(Arc::new(1u32)));
     drop(m);
-    assert_eq!(told(), [(false, 1); 4]);
+    assert_eq!(told(), []);
+    set_current_actor(Some(Arc::new(3u32)));
+    drop(other);
+    assert_eq!(told(), [(false, 3); 3]);
+    set_current_actor(None);
 }
 
 #[test]

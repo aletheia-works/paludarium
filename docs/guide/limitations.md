@@ -569,11 +569,6 @@ verified.
     attachment back the flags of the piece next to it makes a piece of its
     own, which counts as an attachment, where recent Linux moves the
     boundary between the two.
-  - A segment's `shm_lpid` is that of the process that last attached a
-    segment in the address space, or the one a `fork` made it for: a child
-    that shares its parent's memory without being a thread of it
-    (`CLONE_VM`, `vfork`) stamps the segment as that process, where Linux
-    stamps it as the process that acts.
 - **Extended attributes**: a mounted host directory behaves as a file system
   without them, so reading finds none (`ENODATA`) and writing gives `EOPNOTSUPP`.
   In memory, a file's `system.*` attributes do not exist (`EOPNOTSUPP`), so it

@@ -13,12 +13,10 @@ use crate::ipc::{
     self, CAP_IPC_OWNER, CAP_SYS_ADMIN, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
     IPC_SET, IPC_STAT, Perm,
 };
-use crate::namespaces::{KeptPid, Namespace};
+use crate::namespaces::KeptPid;
 use crate::syscalls::{Context, Outcome};
 use paludarium_host::Host;
-use paludarium_mmu::{
-    AddressSpace, Backing, FileSize, MappingKind, PageSource, Placement, Prot, SharedPages,
-};
+use paludarium_mmu::{Backing, FileSize, MappingKind, PageSource, Placement, Prot, SharedPages};
 use paludarium_types::{Errno, GuestAddr, USER_ADDRESS_LIMIT};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -236,12 +234,18 @@ pub(crate) struct Actor {
     host: Arc<dyn Host>,
 }
 
-/// Says that process `pid`, numbered in `space`, acts on `mem` from now on.
-pub(crate) fn act(mem: &AddressSpace, space: &Namespace, pid: u32, host: &Arc<dyn Host>) {
-    mem.set_actor(Arc::new(Actor {
-        pid: space.keep(pid),
-        host: Arc::clone(host),
-    }));
+impl crate::Kernel {
+    /// Says that this thread runs thread `tid` of this kernel's process from
+    /// now on, as Linux's `current`: the VMAs of segments it opens and
+    /// closes, in any space, it stamps with that process's PID (its
+    /// `tgid`) and the time. A process's PID stays as it is, so once, as the
+    /// thread starts, is enough.
+    pub fn enter_thread(&self, tid: u32) {
+        paludarium_mmu::set_current_actor(Some(Arc::new(Actor {
+            pid: self.pid_space(tid).keep(self.process().pid),
+            host: Arc::clone(&self.host),
+        })));
+    }
 }
 
 impl Attachment {
@@ -536,9 +540,6 @@ fn shmat(c: &Context<'_>, id: i32, addr: u64, flag: i32) -> Result<u64, Errno> {
         }
     }
     let prot = crate::syscalls::read_implies_exec(c.process, prot);
-    // The space's VMAs of segments are opened and closed by this process
-    // from now on, even those `SHM_REMAP` replaces.
-    act(c.mem, &c.pid_space(), c.process.pid, c.shared_host);
     let placement = if fixed {
         if addr
             .checked_add(len)

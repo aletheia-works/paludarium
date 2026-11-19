@@ -16952,6 +16952,42 @@ static void shm_show_user(const char *label, int id, pid_t other) {
     printf("%s lpid-own=%d lpid-other=%d nattch=%lu\n", label, s.lpid == getpid(), s.lpid == other, s.nattch);
 }
 
+/* What a child in its parent's space (CLONE_VM, not a thread) does to an
+   attachment: 0 unmaps the tail page, 1 locks the middle one, 2 nothing, 3
+   detaches it, 4 waits for its parent's exit (EOF on `shm_vm_hold`). */
+static char *shm_vm_at;
+static long shm_vm_page;
+static int shm_vm_hold[2];
+static int shm_vm_child(void *what) {
+    switch ((int)(intptr_t)what) {
+    case 0: munmap(shm_vm_at + 3 * shm_vm_page, shm_vm_page); break;
+    case 1: mlock(shm_vm_at + shm_vm_page, shm_vm_page); break;
+    case 3: syscall(SYS_shmdt, shm_vm_at); break;
+    case 4: {
+        char byte;
+        close(shm_vm_hold[1]);
+        while (read(shm_vm_hold[0], &byte, 1) > 0) {}
+        break;
+    }
+    }
+    _exit(0);
+}
+static char shm_vm_stack[65536] __attribute__((aligned(16)));
+/* Runs `shm_vm_child(what)` in this space and reaps it. Its PID. */
+static pid_t shm_vm_run(int what) {
+    fflush(stdout);
+    pid_t pid = clone(shm_vm_child, shm_vm_stack + sizeof shm_vm_stack, CLONE_VM | SIGCHLD, (void *)(intptr_t)what);
+    if (pid > 0) waitpid(pid, NULL, 0);
+    return pid;
+}
+static const char *shm_vm_self;
+static int shm_vm_exec(void *unused) {
+    (void)unused;
+    char *arguments[] = {(char *)shm_vm_self, "shm-vm-exec", (char *)shm_vm_self, NULL};
+    execv(shm_vm_self, arguments);
+    _exit(2);
+}
+
 static int shm_case(const char *self) {
     long page = sysconf(_SC_PAGESIZE);
     struct shm_status s;
@@ -17185,6 +17221,60 @@ static int shm_case(const char *self) {
     printf("stamps detach=%ld", syscall(SYS_shmdt, c));
     shm_show_user("", st, child);
     printf("stamps removed=%ld\n", syscall(SYS_shmctl, st, SHMX_RMID, 0));
+
+    /* A child in this space (CLONE_VM, not a thread) stamps what it does
+       as itself, as Linux's `current`; its exit or exec, while this
+       process still uses the space, closes nothing (`mmput` is not the
+       last). */
+    int vm = (int)syscall(SYS_shmget, 0, 4 * page, SHMX_CREAT | 0600);
+    if (vm < 0) return 31;
+    shm_vm_page = page;
+    shm_vm_at = (char *)syscall(SYS_shmat, vm, 0, 0);
+    if (shm_vm_at == (char *)-1) return 32;
+    shm_last_used_by_child();
+    shm_show_user("stamps vm-unmap-tail", vm, shm_vm_run(0));
+    shm_last_used_by_child();
+    shm_show_user("stamps vm-mlock", vm, shm_vm_run(1));
+    other = shm_last_used_by_child();
+    shm_vm_run(2);
+    shm_show_user("stamps vm-exit", vm, other);
+    other = shm_last_used_by_child();
+    shm_vm_self = self;
+    fflush(stdout);
+    child = clone(shm_vm_exec, shm_vm_stack + sizeof shm_vm_stack, CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
+    if (child < 0 || waitpid(child, &status, 0) != child) return 33;
+    printf("stamps vm-exec=%d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    shm_show_user("", vm, other);
+    shm_show_user("stamps vm-detach", vm, shm_vm_run(3));
+    errno = 0;
+    printf("stamps vm-detached-here=%ld errno=%d\n", syscall(SYS_shmdt, shm_vm_at), errno);
+    /* The last of the processes in a space to let it go closes what it
+       still has as itself (`exit_mmap`): a child attaches, starts one in
+       its space and exits first; this process adopts that one and reaps
+       it. */
+    int fd[2];
+    if (pipe(fd) || prctl(PR_SET_CHILD_SUBREAPER, 1)) return 34;
+    fflush(stdout);
+    child = fork();
+    if (child < 0) return 35;
+    if (child == 0) {
+        close(fd[0]);
+        if (pipe(shm_vm_hold)) _exit(1);
+        if (syscall(SYS_shmat, vm, 0, 0) == -1) _exit(2);
+        pid_t last = clone(shm_vm_child, shm_vm_stack + sizeof shm_vm_stack, CLONE_VM | SIGCHLD, (void *)(intptr_t)4);
+        if (last < 0 || write(fd[1], &last, sizeof last) != sizeof last) _exit(3);
+        _exit(0);
+    }
+    close(fd[1]);
+    pid_t last = 0;
+    if (read(fd[0], &last, sizeof last) != sizeof last) return 36;
+    close(fd[0]);
+    if (waitpid(child, &status, 0) != child) return 37;
+    if (waitpid(last, NULL, 0) != last) return 38;
+    prctl(PR_SET_CHILD_SUBREAPER, 0);
+    shm_status_of(vm, SHMX_STAT, &s);
+    printf("stamps vm-last lpid-last=%d lpid-first=%d nattch=%lu\n", s.lpid == last, s.lpid == child, s.nattch);
+    printf("stamps vm-removed=%ld\n", syscall(SYS_shmctl, vm, SHMX_RMID, 0));
     return 0;
 }
 
@@ -31327,6 +31417,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "shm")) return shm_case(self);
     if (!strcmp(mode, "shm-after-exec") && argc > 3) return shm_after_exec(atoi(argv[3]));
+    if (!strcmp(mode, "shm-vm-exec")) return 0;
     if (!strcmp(mode, "sem")) return sem_case();
     if (!strcmp(mode, "msg")) return msg_case();
     if (!strcmp(mode, "ipc-sysctl")) return ipc_sysctl_case();

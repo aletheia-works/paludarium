@@ -1592,7 +1592,7 @@ pub trait PageSource: Send + Sync {
     }
     /// A VMA of a shared mapping of the file came to be, by a split, a
     /// `fork` or a move by `mremap`, as Linux's `vm_ops->open` is told;
-    /// `by` is the actor of the space it is in ([`AddressSpace::set_actor`]).
+    /// `by` is the actor of the thread that did it ([`set_current_actor`]).
     fn opened(&self, by: &Actor) {
         let _ = by;
     }
@@ -1603,20 +1603,49 @@ pub trait PageSource: Send + Sync {
     }
 }
 
-/// Who acts on an address space for the kernel, as Linux's `current` in a
-/// VMA's `open` and `close`: the files of its shared mappings are told it
+/// Who acts for the kernel, as Linux's `current` in a VMA's `open` and
+/// `close`: the files of shared mappings are told it
 /// ([`PageSource::opened`], [`PageSource::closed`]).
 pub type Actor = dyn std::any::Any + Send + Sync;
 
+thread_local! {
+    /// The actor of the task this thread runs ([`set_current_actor`]).
+    static CURRENT_ACTOR: RefCell<Option<Arc<Actor>>> = const { RefCell::new(None) };
+}
+
+/// Says who acts on any space from this thread from now on, as Linux's
+/// `current` is the task a CPU runs: what it maps, unmaps, splits or
+/// forks, and a space whose last holder it lets go of (`exit_mmap`), tells
+/// the files of the shared mappings it is. With none, they are told
+/// nothing.
+pub fn set_current_actor(actor: Option<Arc<Actor>>) {
+    CURRENT_ACTOR.with(|current| *current.borrow_mut() = actor);
+}
+
+/// Runs `f` with no actor on this thread, so that what it opens and closes
+/// is told no one.
+fn untold<R>(f: impl FnOnce() -> R) -> R {
+    let actor = CURRENT_ACTOR.with(|current| current.borrow_mut().take());
+    let result = f();
+    CURRENT_ACTOR.with(|current| *current.borrow_mut() = actor);
+    result
+}
+
 /// Tells the file of `shared`, if it has one, that one of its VMAs opened
-/// or closed, in a space with an `actor`.
-fn tell(actor: Option<&Arc<Actor>>, shared: &SharedMapping, opened: bool) {
-    if let (Some(actor), Some(source)) = (actor, shared.pages.source.as_ref()) {
-        if opened {
-            source.opened(actor.as_ref());
-        } else {
-            source.closed(actor.as_ref());
-        }
+/// or closed, when this thread has an actor.
+fn tell(shared: &SharedMapping, opened: bool) {
+    let Some(source) = shared.pages.source.as_ref() else {
+        return;
+    };
+    // The actor is taken out before the file is told, so that what the
+    // file does cannot find this borrowed.
+    let Some(actor) = CURRENT_ACTOR.with(|current| current.borrow().clone()) else {
+        return;
+    };
+    if opened {
+        source.opened(actor.as_ref());
+    } else {
+        source.closed(actor.as_ref());
     }
 }
 /// The shared memory `MADV_REMOVE` frees in one VMA of its range
@@ -2220,9 +2249,6 @@ struct AddressSpaceData {
     /// [`AddressSpace::take_out_of_memory`], which reads it without the
     /// locks.
     out_of_memory: Arc<AtomicBool>,
-    /// Who acts on the space ([`AddressSpace::set_actor`]), which the files
-    /// of its shared mappings are told as their VMAs open and close.
-    actor: Option<Arc<Actor>>,
     /// How many pages it holds, Linux's `get_mm_rss`: the entries
     /// [`Self::counts`] takes, kept as they change, which a store without
     /// the write lock may raise ([`Self::store_with`]).
@@ -2239,7 +2265,7 @@ impl Drop for AddressSpaceData {
     /// `exit_mmap` closes them.
     fn drop(&mut self) {
         for shared in self.shared.values() {
-            tell(self.actor.as_ref(), shared, false);
+            tell(shared, false);
         }
         // A debug build checks the count of the pages held once more.
         if cfg!(debug_assertions) && !std::thread::panicking() {
@@ -2333,7 +2359,6 @@ impl AddressSpaceData {
             bottom_up: None,
             meter: None,
             out_of_memory: Arc::default(),
-            actor: None,
             resident: AtomicU64::new(0),
             peak_resident: 0,
         }
@@ -3080,7 +3105,9 @@ impl AddressSpaceData {
             .collect();
         for m in advised {
             if m.dont_fork {
-                copy.remove(m.start.0, m.end());
+                // `dup_mmap` skips it: the child's VMA never opened, so it
+                // does not close either.
+                untold(|| copy.remove(m.start.0, m.end()));
             } else {
                 copy.clear_populated(m.start.0, m.end());
                 copy.clear_guards(m.start.0, m.end());
@@ -3091,12 +3118,10 @@ impl AddressSpaceData {
                 }
             }
         }
-        // Each VMA the child gets is opened by the parent (`dup_mmap`), and
-        // the child's space acts for it until the kernel says who the child
-        // is: a fork that fails after this closes them as the parent.
-        copy.actor = self.actor.clone();
+        // Each VMA the child gets is opened by the parent (`dup_mmap`), as
+        // the thread that forks.
         for shared in copy.shared.values() {
-            tell(copy.actor.as_ref(), shared, true);
+            tell(shared, true);
         }
         // The child's peak is what it holds (`dup_mm`).
         copy.peak_resident = copy.resident_pages();
@@ -4133,7 +4158,7 @@ impl AddressSpaceData {
         };
         let tail = shared.clone();
         shared.end = at;
-        tell(self.actor.as_ref(), &tail, true);
+        tell(&tail, true);
         self.shared.insert(at, tail);
     }
     /// The shared mappings, by address.
@@ -4203,9 +4228,9 @@ impl AddressSpaceData {
             // (`__split_vma` opens the new one), and the part unmapped is
             // closed.
             if start < addr.0 || mapping.end > end {
-                tell(self.actor.as_ref(), &mapping, true);
+                tell(&mapping, true);
             }
-            tell(self.actor.as_ref(), &mapping, false);
+            tell(&mapping, false);
             if start < addr.0 {
                 self.shared.insert(
                     start,
@@ -4439,7 +4464,7 @@ impl AddressSpaceData {
                 ..shared
             };
             // The VMA at its new place is a copy, opened (`copy_vma`).
-            tell(self.actor.as_ref(), &moved, true);
+            tell(&moved, true);
             self.shared.insert(to, moved);
         }
         self.mappings.insert(
@@ -6703,13 +6728,6 @@ impl AddressSpace {
     #[must_use]
     pub fn memory_meter(&self) -> Option<Arc<MemoryMeter>> {
         self.locked().meter.clone()
-    }
-    /// Says who acts on this space from now on, which the files of its
-    /// shared mappings are told as their VMAs open and close
-    /// ([`PageSource::opened`], [`PageSource::closed`]); a space without
-    /// one tells them nothing.
-    pub fn set_actor(&self, actor: Arc<Actor>) {
-        self.locked().actor = Some(actor);
     }
     /// Whether a write found no room under the meter since the last call.
     pub fn take_out_of_memory(&self) -> bool {

@@ -118,6 +118,8 @@ mod fd {
 }
 fn setup() -> (Kernel, Thread, AddressSpace) {
     let kernel = Kernel::new(Arc::new(paludarium_host::testing::RecordingHost::new()));
+    // The test's thread runs the first process, as a worker's would.
+    kernel.enter_thread(1);
     let thread = Thread::new(
         1,
         CpuState::new(GuestAddr(0x400000), GuestAddr(DATA + PAGE_SIZE)),
@@ -4931,6 +4933,7 @@ mod shm {
         let host = Arc::new(paludarium_host::testing::RecordingHost::new());
         let (_, mut t, m) = setup();
         let mut k = Kernel::new(host.clone());
+        k.enter_thread(t.tid);
         let at = |seconds: u64| {
             host.set_clock(paludarium_host::ClockId::Realtime, seconds * 1_000_000_000)
         };
@@ -4972,12 +4975,37 @@ mod shm {
         at(500);
         let (mut c, ct, cm) = fork(&mut k, &mut t, &m);
         assert_eq!(stamps(&mut k, &mut t, id), (500, 200, 1, 5));
-        // The child's exit closes them as the child.
+        // The child's exit closes them as the child, whose thread lets go
+        // of its space.
         at(600);
+        c.enter_thread(ct.tid);
         finish(&mut c, &ct, &cm, ExitStatus::Exited(0));
         let child = ct.tid;
         drop((c, ct, cm));
+        k.enter_thread(t.tid);
         assert_eq!(stamps(&mut k, &mut t, id), (500, 600, child, 3));
+        // A child in the same space (`CLONE_VM`, not a thread) stamps what
+        // it unmaps as itself, and its exit, not the last in the space,
+        // closes nothing.
+        at(650);
+        assert_ne!(
+            syscall(&mut k, &mut t, &m, 56, [0x100 | 17, 0, 0, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        let (mut v, mut vt) = k.take_child().unwrap();
+        assert!(v.take_spawn_memory().is_none());
+        v.enter_thread(vt.tid);
+        assert_eq!(
+            syscall(&mut v, &mut vt, &m, 11, [a, PAGE_SIZE, 0, 0, 0, 0]),
+            0
+        );
+        let shared = vt.tid;
+        assert_ne!(shared, child);
+        at(660);
+        finish(&mut v, &vt, &m, ExitStatus::Exited(0));
+        drop((v, vt));
+        k.enter_thread(t.tid);
+        assert_eq!(stamps(&mut k, &mut t, id), (500, 650, shared, 2));
         // shmdt closes every piece.
         at(700);
         assert_eq!(shmdt(&mut k, &mut t, &m, a), 0);

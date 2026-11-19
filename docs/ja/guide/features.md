@@ -1016,7 +1016,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   分かれたものは 1 つに戻りません。VMA ができるたびに（分割、`fork` の写し、`mremap` での
   移動）セグメントの `shm_atime` と `shm_lpid` が、VMA が閉じるたびに（アンマップ、`shmdt`、
   終了、`exec`）`shm_dtime` と `shm_lpid` が変わります。Linux の `shm_open` と
-  `shm_close` と同じです。`shmdt` は、`munmap` などが残したその領域のかけらをすべて
+  `shm_close` と同じです。`shm_lpid` は、Linux の `current` と同じく、実際にしたプロセスの
+  ものです。スレッドではないのに親のメモリを共有する子（`CLONE_VM`、`vfork`）がマップや
+  アンマップをすると、その子のものとして記録します。終了や `exec` で VMA が閉じるのは、
+  ほかにそのアドレス空間を使うプロセスがないときだけで、最後のプロセスのものとして記録します。
+  `shmdt` は、`munmap` などが残したその領域のかけらをすべて
   外します。つながったまま `IPC_RMID`
   したセグメントは、ID はそのままで、どのキーでも見つからなくなり、最後に外れたとき
   消えます。`SHM_LOCK` は Linux と同じく所有者と `RLIMIT_MEMLOCK` を確かめます。

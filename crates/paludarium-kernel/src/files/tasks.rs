@@ -44,11 +44,22 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
             (c.processes.view(pid).ok_or(Errno::ENOENT)?, pid)
         }
     };
-    let threads = view.group.threads();
     let tid = path.tid.unwrap_or(path.pid);
+    shown(c.processes, view, (pid, tid, path.tid.is_some()), c.tid).ok_or(Errno::ENOENT)
+}
+/// Thread `tid` of process `pid` (a path under `task` when `thread` is
+/// set) with what /proc shows of it to thread `reader`; `None` for a
+/// thread that is not in it.
+fn shown(
+    processes: &crate::processes::Processes,
+    view: ProcessView,
+    (pid, tid, thread): (u32, u32, bool),
+    reader: u32,
+) -> Option<Task> {
+    let threads = view.group.threads();
     let member = threads.iter().find(|&&(t, _)| t == tid).copied();
-    if path.tid.is_some() && member.is_none() && !(view.zombie && tid == pid) {
-        return Err(Errno::ENOENT);
+    if thread && member.is_none() && !(view.zombie && tid == pid) {
+        return None;
     }
     let public = view
         .group
@@ -61,22 +72,22 @@ pub(super) fn find(c: &Context<'_>, path: &TaskPath) -> Result<Task, Errno> {
         _ if view.zombie => ('Z', "Z (zombie)"),
         // A leader that ended before its other threads.
         None => ('Z', "Z (zombie)"),
-        Some(_) if c.processes.traces.in_stop(tid) => ('t', "t (tracing stop)"),
+        Some(_) if processes.traces.in_stop(tid) => ('t', "t (tracing stop)"),
         Some(_) if view.group.is_stopped() => ('T', "T (stopped)"),
-        Some((_, in_call)) if in_call && tid != c.tid => ('S', "S (sleeping)"),
+        Some((_, in_call)) if in_call && tid != reader => ('S', "S (sleeping)"),
         Some(_) => ('R', "R (running)"),
     };
-    Ok(Task {
+    Some(Task {
         pid,
         tid,
         // Only under `task`: a thread's own ID names a directory of
         // Linux's `tgid_base_stuff`, whose `stat` is the whole process's
         // (`proc_tgid_stat`), as `/proc/<pid>/stat` is.
-        thread: path.tid.is_some(),
+        thread,
         view,
         public,
         state,
-        tracer: c.processes.traces.tracer_of(tid).unwrap_or(0),
+        tracer: processes.traces.tracer_of(tid).unwrap_or(0),
     })
 }
 
@@ -98,14 +109,6 @@ impl Task {
         } else {
             (0, 0)
         }
-    }
-    /// Whether `stat` shows the reader where the task's memory is, as
-    /// Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` decides for
-    /// `do_task_stat`: [`Self::may_access`] with the filesystem IDs, which
-    /// keeps a zombie's dumpable flag, as Linux 7.1 and later keep it in its
-    /// `exec_state` (`task_still_dumpable`).
-    fn may_see_addresses(&self, c: &Context<'_>) -> bool {
-        self.may_access(c, false)
     }
     fn start_stack(&self) -> u64 {
         if self.live() {
@@ -248,7 +251,7 @@ pub(super) fn descriptors(task: &Task) -> Vec<(u32, super::Descriptor)> {
     }
 }
 
-/// The contents of `status`, `stat`, `statm`, `limits`, `auxv`, `cmdline`
+/// The contents of `status`, `statm`, `limits`, `auxv`, `cmdline`
 /// or `comm`, and the others made when opened; `None` for any other entry.
 pub(super) fn content(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Option<Vec<u8>> {
     let reader = &c.process.credentials.user;
@@ -284,49 +287,6 @@ pub(super) fn content(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Option<
             }
             bytes
         }
-        TaskEntry::Stat => {
-            let (arguments, environment) = task.string_ranges();
-            let (virtual_size, start_brk) = task
-                .memory()
-                .and_then(paludarium_mmu::MemoryView::size_and_break)
-                .unwrap_or((0, 0));
-            let threads = task.threads();
-            crate::proc::render_stat(&crate::proc::ProcessStat {
-                pid: task.tid,
-                name: &public.name,
-                state: task.state.0,
-                // As root sees it: whether the task sleeps, though not for a
-                // process of more than one thread as a whole.
-                waiting: task.state.0 != 'R' && (task.thread || threads < 2),
-                exit_signal: task.view.exit_signal,
-                parent: task.view.parent,
-                group: task.view.group_id,
-                session: task.view.session,
-                terminal: crate::pty::stat_fields(task.view.terminal.as_deref()),
-                cpu: task.view.group.process_cpu(),
-                children_cpu: task.view.children_cpu,
-                nice: task.view.group.nice(task.tid).unwrap_or(0),
-                threads,
-                virtual_size,
-                rss_limit: task.view.rss_limit,
-                memory: task.memory().is_some(),
-                permitted: task.may_see_addresses(c),
-                code: task.code(),
-                data: if task.live() {
-                    task.view.group.data()
-                } else {
-                    (0, 0)
-                },
-                start_stack: task.start_stack(),
-                start_brk,
-                arguments,
-                environment,
-                pending: public.pending,
-                blocked: public.blocked,
-                ignored,
-                caught,
-            })
-        }
         TaskEntry::Status => crate::proc::render_status(&crate::proc::Status {
             name: &public.name,
             umask: task.live().then(|| public.files.umask()),
@@ -353,6 +313,54 @@ pub(super) fn content(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Option<
             reader,
         }),
         _ => return None,
+    })
+}
+
+/// `stat` of the task, which shows a reader where its memory is only if
+/// Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` lets it read the
+/// task (`permitted`), as `do_task_stat` decides at each read.
+fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
+    let (ignored, caught) = task.handled();
+    let (arguments, environment) = task.string_ranges();
+    let (virtual_size, start_brk) = task
+        .memory()
+        .and_then(paludarium_mmu::MemoryView::size_and_break)
+        .unwrap_or((0, 0));
+    let threads = task.threads();
+    crate::proc::render_stat(&crate::proc::ProcessStat {
+        pid: task.tid,
+        name: &task.public.name,
+        state: task.state.0,
+        // As root sees it: whether the task sleeps, though not for a
+        // process of more than one thread as a whole.
+        waiting: task.state.0 != 'R' && (task.thread || threads < 2),
+        exit_signal: task.view.exit_signal,
+        parent: task.view.parent,
+        group: task.view.group_id,
+        session: task.view.session,
+        terminal: crate::pty::stat_fields(task.view.terminal.as_deref()),
+        cpu: task.view.group.process_cpu(),
+        children_cpu: task.view.children_cpu,
+        nice: task.view.group.nice(task.tid).unwrap_or(0),
+        threads,
+        virtual_size,
+        rss_limit: task.view.rss_limit,
+        memory: task.memory().is_some(),
+        permitted,
+        code: task.code(),
+        data: if task.live() {
+            task.view.group.data()
+        } else {
+            (0, 0)
+        },
+        start_stack: task.start_stack(),
+        start_brk,
+        arguments,
+        environment,
+        pending: task.public.pending,
+        blocked: task.public.blocked,
+        ignored,
+        caught,
     })
 }
 
@@ -717,6 +725,31 @@ pub(super) fn wchan(
         crate::proc::stat(0),
         owner,
     ))
+}
+/// `stat` of the task, made when it is read, as Linux's `proc_tgid_stat`
+/// and `proc_tid_stat` write it then: the task as it is at that moment,
+/// with its addresses for a reader that may then read it
+/// ([`AtRead::may_read`]); `ESRCH` once it has been reaped. Any reader may
+/// open it (0444).
+pub(super) fn stat_file(
+    processes: &std::sync::Arc<crate::processes::Processes>,
+    task: &Task,
+    flags: u32,
+    stat: FileStat,
+    owner: crate::proc::Owner,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let (processes, which) = at_read(processes, task);
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        let now = AtRead::find(&processes, which)?;
+        let (_, reader) = crate::proc::caller();
+        let permitted = now.may_read();
+        let AtRead {
+            processes, view, ..
+        } = now;
+        let task = shown(&processes, view, which, reader).ok_or(Errno(3))?;
+        Ok(render_stat(&task, permitted))
+    });
+    std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner))
 }
 /// The group of the task and the thread a write to its `comm` renames.
 pub(super) fn comm(task: &Task) -> (std::sync::Arc<crate::threads::ThreadGroup>, u32, u32) {

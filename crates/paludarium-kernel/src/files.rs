@@ -6926,6 +6926,13 @@ fn open_path(
         if path.entry == crate::proc::TaskEntry::Wchan {
             return Ok((tasks::wchan(c.processes, &task, flags, owner), p.to_vec()));
         }
+        if path.entry == crate::proc::TaskEntry::Stat {
+            let stat = file_stat.unwrap_or_else(|| crate::proc::stat(0));
+            return Ok((
+                tasks::stat_file(c.processes, &task, flags, stat, owner),
+                p.to_vec(),
+            ));
+        }
         if path.entry == crate::proc::TaskEntry::ClearRefs {
             return Ok((
                 tasks::clear_refs(c.processes, &task, flags, owner),

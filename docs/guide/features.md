@@ -3038,6 +3038,9 @@ kernel.
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
   every field from `start_data` on, as Linux's `do_task_stat` hides them.
+  `stat` is made at each read from its start, as Linux's is, so a descriptor
+  shows what the task and the reader are then: one that drops its rights
+  sees the addresses hidden, and a task that has been reaped is `ESRCH`.
   `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.

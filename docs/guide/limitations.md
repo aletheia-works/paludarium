@@ -97,9 +97,8 @@ verified.
   interpreter, a core dump's writes), and a read or write that fails with
   an errno Linux gives both before and in the file's operation (`EINVAL`,
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
-  so not counted. Whether
-  another process's `stat` hides its addresses is decided when the file is
-  opened, where Linux decides at each read, and its `exit_code` is 0. In `stat`, page faults, resident memory, the start
+  so not counted.
+  Another process's `stat` has an `exit_code` of 0. In `stat`, page faults, resident memory, the start
   time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and

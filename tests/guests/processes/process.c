@@ -11271,6 +11271,29 @@ static void pom_stat(const char *label, const char *path) {
     for (unsigned i = 0; i < sizeof shown / sizeof *shown; i++) printf(" %s", fields[shown[i]]);
     printf("\n");
 }
+/* Whether a read of the stat open at `fd`, from its start, shows the
+   task's code and stack addresses (Linux decides at each read), or the
+   read's errno. */
+static void pom_fd_stat(const char *label, int fd) {
+    static char buffer[4096];
+    ssize_t n = lseek(fd, 0, SEEK_SET) < 0 ? -1 : read(fd, buffer, sizeof buffer - 1);
+    if (n < 0) {
+        printf("%s stat errno=%d\n", label, errno);
+        return;
+    }
+    buffer[n] = 0;
+    char *close_paren = strrchr(buffer, ')');
+    char *fields[64];
+    int count = 0;
+    if (close_paren)
+        for (char *field = strtok(close_paren + 2, " \n"); field && count < 64; field = strtok(NULL, " \n"))
+            fields[count++] = field;
+    if (count < 50) {
+        printf("%s stat count=%d\n", label, count);
+        return;
+    }
+    printf("%s stat addresses=%d\n", label, strcmp(fields[23], "1") && strcmp(fields[25], "0"));
+}
 static int proc_other_maps_case(void) {
     /* What the child reads of itself, shared with this process, its
        pages touched before either reads. */
@@ -11356,6 +11379,21 @@ static int proc_other_maps_case(void) {
         _exit(0);
     }
     printf("other=%d\n", reaped(other));
+    /* The same descriptor shows them while its reader may read the task,
+       and hides them once it is another user. */
+    fflush(stdout);
+    pid_t later = fork();
+    if (later == 0) {
+        snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) _exit(91);
+        pom_fd_stat("held root", fd);
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(92);
+        pom_fd_stat("held other user", fd);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("later=%d\n", reaped(later));
     {
         /* Its own reader sees them: the same program, so the same code
            and data as this process's. */
@@ -11377,12 +11415,16 @@ static int proc_other_maps_case(void) {
     snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
     snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
     pom_stat("zombie", path);
+    int held = open(path, O_RDONLY);
     snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
     printf("zombie maps=%ld", pomaps_read(path, theirs));
     snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
     printf(" smaps=%ld", pomaps_read(path, theirs));
     printf(" status=%d", reaped(kid));
     printf(" reaped=%ld\n", pomaps_read(path, theirs));
+    /* Made at each read, so not there once it is reaped (ESRCH). */
+    pom_fd_stat("reaped held", held);
+    if (held >= 0) close(held);
     munmap(seen, 2 * POM_SIZE);
     return 0;
 }

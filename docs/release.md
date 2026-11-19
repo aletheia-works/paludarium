@@ -224,6 +224,7 @@ itself.
    the merge commit, the new main head SHA;
    `gh api repos/aletheia-works/paludarium/commits/<sha> --jq .commit.verification.verified`
    prints `true`, and the `CI` (`ci.yml`) push run for that SHA starts.
+
 2. **Create the `release` environment.** When: before the first release
    (release preflight rejects a missing environment). `infra/github`
    manages environment `release` with administrator bypass off and
@@ -232,6 +233,7 @@ itself.
    (step 5) decides it. Confirm:
    `gh api repos/aletheia-works/paludarium/environments/release` shows
    `can_admins_bypass: false` (preflight refuses bypass `true` or unknown).
+
 3. **New packages.** Trusted Publishing needs the package to exist, so a
    crate or npm package that is not on its registry yet is published once
    by hand (by its owner, from the release head, with a short-lived token
@@ -255,6 +257,7 @@ itself.
    variables and the GitHub context that Deno's provenance statement reads
    (`JSR_ENVIRONMENT`). Receipts and `publication-progress.json` record
    no token value.
+
 4. **Register the Trusted Publishers.** For each of the twelve crates on
    crates.io and for `@aletheia-works/paludarium-wasm` on npm, register
    repository `aletheia-works/paludarium`, workflow `publish.yml` and
@@ -269,6 +272,7 @@ itself.
    repository link of step 3 takes its place. Confirm:
    `https://api.jsr.io/scopes/aletheia-works/packages/paludarium-wasm`
    shows `githubRepository` `aletheia-works/paludarium`.
+
 5. **Same-head evidence: automatic.**
    `.github/workflows/publish.yml` runs on every push to main. Its
    `evidence` job runs `scripts/release/evidence.py`: while tag
@@ -306,6 +310,7 @@ itself.
    the release-acceptance run succeeded and its artifact `release-acceptance` holds only
    `release-evidence.json`, with that head, eight `quality` rows and the
    four `acceptance` IDs all `passed: true`.
+
 6. **Publication, then tag: automatic.** When the evidence of step 5
    succeeded, the same `Publish` run continues with `preflight` (main,
    untagged version, signed head, environment), `packages` (the package

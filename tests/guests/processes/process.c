@@ -12750,19 +12750,18 @@ static void pio_show(const char *label, const char *path) {
         printf(" %s=%lld/%lld/%lld/%lld/%lld/%lld/%lld", label, io.v[0], io.v[1], io.v[2], io.v[3], io.v[4], io.v[5],
                io.v[6]);
 }
-/* Waits until thread `tid` of `pid` sleeps, in its next call. */
-static void pio_sleeping(int pid, int tid) {
+/* Waits until thread `tid` of `pid` is in its next read. Its stat shows
+   it asleep too early here: paludarium shows a thread asleep for the whole
+   of a system call, so also in the write it has just made, which counts
+   only as it returns. */
+static void pio_reading(int pid, int tid) {
     char path[64], text[256];
-    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, tid);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/syscall", pid, tid);
     for (int i = 0; i < 5000; i++) {
         int fd = open(path, O_RDONLY);
         ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
         if (fd >= 0) close(fd);
-        if (n > 0) {
-            text[n] = 0;
-            char *end = strrchr(text, ')');
-            if (end && end[1] == ' ' && end[2] == 'S') return;
-        }
+        if (n > 1 && text[0] == '0' && text[1] == ' ') return;
         usleep(1000);
     }
 }
@@ -12865,8 +12864,8 @@ static int proc_io_case(void) {
     int tid = 0;
     char byte, path[64], thread_path[64];
     if (read(pio_ready[0], &tid, 4) != 4) return 87;
-    pio_sleeping(kid, kid);
-    pio_sleeping(kid, tid);
+    pio_reading(kid, kid);
+    pio_reading(kid, tid);
     snprintf(thread_path, sizeof thread_path, "/proc/%d/task/%d/io", (int)kid, tid);
     int thread_fd = open(thread_path, O_RDONLY);
     printf("running:");
@@ -12877,7 +12876,7 @@ static int proc_io_case(void) {
     pio_show("thread", thread_path);
     printf("\n");
     if (write(pio_go[1], "1", 1) != 1 || read(pio_ready[0], &byte, 1) != 1) return 88;
-    pio_sleeping(kid, kid);
+    pio_reading(kid, kid);
     pio_gone(kid, tid);
     printf("joined:");
     snprintf(path, sizeof path, "/proc/%d/io", (int)kid);

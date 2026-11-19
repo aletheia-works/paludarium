@@ -1757,9 +1757,13 @@ static int case_events(void) {
     printf(" event=%#x at=%ld\n", msg.event, (long)(msg.address - (uintptr_t)base));
     char page[PAGE];
     memset(page, 'c', PAGE);
-    printf("child copy: %s\n", err(copy(ufd, base + 7 * PAGE, page, PAGE, 0, NULL)));
+    /* The copy wakes the child, which prints as this does: told only after
+       it has ended, so that its line always comes first. */
+    char copied[64];
+    snprintf(copied, sizeof copied, "%s", err(copy(ufd, base + 7 * PAGE, page, PAGE, 0, NULL)));
     int status;
     waitpid(child, &status, 0);
+    printf("child copy: %s\n", copied);
     printf("child: %d\n", WEXITSTATUS(status));
     char path[64], link[64] = {0};
     snprintf(path, sizeof path, "/proc/self/fd/%d", ufd);

@@ -57,6 +57,8 @@ const COMPLEXITY_LIMIT_JMP_SEQ: usize = 8192;
 const MAX_STACK: i64 = 512;
 /// `BPF_MAX_VAR_OFF`.
 const MAX_VAR_OFF: i64 = 1 << 29;
+/// The largest number `tnum_strn` writes in decimal (`U16_MAX`).
+const UNUM_MAX_DECIMAL: u64 = 0xffff;
 /// `MAX_BPF_REG`: R0 to R10.
 const REGS: usize = 11;
 /// The frame pointer, R10.
@@ -852,7 +854,7 @@ impl Walk {
                 if bytes > 1 && total % bytes != 0 {
                     return refuse(
                         EACCES,
-                        format!("misaligned stack access off (0x0; 0x0)+{base}+{off} size {bytes}"),
+                        format!("misaligned stack access off 0+{base}+{off} size {bytes}"),
                     );
                 }
                 let what = if value.is_some() {
@@ -891,7 +893,10 @@ impl Walk {
                         Some(v) => {
                             return refuse(
                                 EACCES,
-                                format!("misaligned access off ({v:#x}; 0x0)+0+{off} size {bytes}"),
+                                format!(
+                                    "misaligned access off {}+0+{off} size {bytes}",
+                                    known_value(v)
+                                ),
                             );
                         }
                         None => {
@@ -908,6 +913,17 @@ impl Walk {
             }
             Reg::NotInit => refuse(EACCES, format!("R{ptr} !read_ok")),
         }
+    }
+}
+
+/// 7.0's `tnum_strn` of a known value: in decimal up to
+/// `UNUM_MAX_DECIMAL`, else in hexadecimal (master writes negative ones in
+/// decimal too). The kernel's `%#llx` writes 0 as `0x0`, unlike C's.
+fn known_value(v: u64) -> String {
+    if v <= UNUM_MAX_DECIMAL {
+        v.to_string()
+    } else {
+        format!("{v:#x}")
     }
 }
 
@@ -1433,10 +1449,7 @@ mod tests {
         );
         assert_eq!(
             refused(&[mov(0, 0), stx_dw(10, 0, -4), exit()]),
-            (
-                EACCES,
-                "misaligned stack access off (0x0; 0x0)+0+-4 size 8".into()
-            )
+            (EACCES, "misaligned stack access off 0+0+-4 size 8".into())
         );
         assert_eq!(
             refused(&[
@@ -1445,10 +1458,7 @@ mod tests {
                 ldx(0x00, 0, 1, 0),
                 exit()
             ]),
-            (
-                EACCES,
-                "misaligned stack access off (0x0; 0x0)+-6+0 size 4".into()
-            )
+            (EACCES, "misaligned stack access off 0+-6+0 size 4".into())
         );
         // A pointer the program moves keeps its offset.
         ok(&[

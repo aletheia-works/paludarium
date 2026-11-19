@@ -1,5 +1,6 @@
 //! `AF_NETLINK` sockets of `NETLINK_ROUTE`, in the network namespace each
-//! was made in, whose loopback `lo` is its only interface, of
+//! was made in, whose interfaces are its loopback `lo` and its veth ends
+//! ([`veth`]), of
 //! `NETLINK_GENERIC` ([`generic`]) and of `NETLINK_SOCK_DIAG` ([`diag`]),
 //! each protocol with its own ports.
 //!

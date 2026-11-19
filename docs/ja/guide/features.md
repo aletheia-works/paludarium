@@ -78,7 +78,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
 | BPF | `bpf`、マップと `BPF_PROG_LOAD` の引数の検査（下を参照） |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックと veth の端の `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、`AF_MCTP` のデータグラム、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
@@ -1762,15 +1762,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どの名前空間からも届きます。どのファミリーのソケットへの `SIOCGIFFLAGS` と
   `SIOCGIFINDEX` も（glibc と musl の `if_nametoindex` が使う AF_UNIX のものも）、
   Linux の `dev_ioctl` が `sock_net` を取るのと同じく、ソケットが作られた名前空間の
-  ループバックを読みます（上がっている間は最初の名前空間でも
-  `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）。accept した AF_UNIX のソケットは、
+  デバイスを読みます。ループバック（上がっている間は最初の名前空間でも
+  `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）と veth の端（下の veth の組）です。accept した AF_UNIX のソケットは、
   クライアントの名前空間のものです。`SIOCSIFFLAGS` には、呼び出し元がどこにいても、
   その名前空間を持つユーザーの名前空間での CAP_NET_ADMIN が要ります。ネットワークの
   ない最初の名前空間の AF_UNIX のソケットには、ネットワークがありません（`ENOTTY`）。
   ほかのインターフェースの名前は `ENODEV` です。`SIOCGIFNAME`
-  （`if_indextoname`）は、インデックス 1 を `lo` と答えます（ほかは `ENODEV`）。
+  （`if_indextoname`）は、そのインデックスのデバイスの名前を答えます（なければ
+  `ENODEV`）。
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
-  `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
+  `NETLINK_ROUTE`）は、作られたネットワーク名前空間のデバイス（ループバックと、下の veth の組の
+  端）を見せ、変えます。
   そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`（`ip addr add` と `del` も）、
   `ip route`（`ip route add`、`del`、`replace`、`append` も）、`ip route get`、
   `ip link set lo up`、`ip monitor` が動きます。

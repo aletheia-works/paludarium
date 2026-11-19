@@ -3885,7 +3885,7 @@ fn sys_ioctl(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             return result;
         }
         // SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCGIFINDEX and SIOCGIFNAME of a
-        // socket's network, whose interface is its loopback: a `struct ifreq`
+        // socket's network's devices, its loopback and veth ends: a `struct ifreq`
         // of 40 bytes, read whole and written back, as Linux's `dev_ioctl`
         // does for a socket of any family. The network is that of the
         // namespace the socket was made in (`sock_net`), and setting flags

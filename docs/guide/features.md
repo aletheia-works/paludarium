@@ -91,7 +91,7 @@ kernel.
 | Administration | `reboot`, `swapon`/`swapoff`, `init_module`/`finit_module`/`delete_module`, `kexec_load`/`kexec_file_load`, `quotactl`/`quotactl_fd` |
 | seccomp | `seccomp` (see below) |
 | BPF | `bpf`, for maps, and `BPF_PROG_LOAD`'s argument checks (see below) |
-| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
+| I/O | `poll`, `ppoll`, `select`, `pselect6`, `vhangup`, `ioctl` (`TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`, `FIONBIO`, `FIOASYNC`, `FIOQSIZE`, `FIGETBSZ`, `SIOCATMARK`, `FIONREAD`/`SIOCINQ`, `SIOCOUTQ`, `SIOCGIFFLAGS`, `SIOCSIFFLAGS`, `SIOCGIFINDEX` and `SIOCGIFNAME` of the loopback and veth ends, `INOTIFY_IOC_SETNEXTWD`, the seccomp listener's `SECCOMP_IOCTL_NOTIF_*` (see seccomp below), `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`, and the pseudo-terminals' requests below) |
 | Events | `eventfd`/`eventfd2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `signalfd`/`signalfd4`, `inotify_init`/`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, `fanotify_mark`, `epoll_create`/`epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` (see below) |
 | Asynchronous I/O | `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents` (see below) |
 | Sockets | `socket` (`AF_UNIX` streams, packet and datagram sockets; `AF_INET`, `AF_INET6`, `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC`) and `AF_MCTP` datagrams with a [network](#network) or in a new network namespace, else `EAFNOSUPPORT`), `connect`, `getsockname`, `getpeername`, `bind`, `listen`, `accept` and `accept4` (AF_UNIX streams and packet sockets, and on the guest's own [loopback](#loopback-servers) TCP), `socketpair` (AF_UNIX, `SOCK_STREAM`, `SOCK_SEQPACKET` and `SOCK_DGRAM`), `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (passing descriptors with `SCM_RIGHTS`, credentials with `SCM_CREDENTIALS` and the sender's pidfd with `SCM_PIDFD`), `sendmmsg` and `recvmmsg`, `setsockopt` and `getsockopt` (`SOL_SOCKET`), `shutdown` |
@@ -2005,17 +2005,18 @@ kernel.
   `unix_find_abstract`, while a socket file on a path is reached from any
   namespace. `SIOCGIFFLAGS` and `SIOCGIFINDEX` on a socket of any family,
   an AF_UNIX one too (as glibc's and musl's `if_nametoindex` use), read the
-  loopback of the namespace the socket was made in, as Linux's `dev_ioctl`
-  takes `sock_net` (`IFF_UP | IFF_LOOPBACK | IFF_RUNNING` while it is up,
-  in the first namespace too); an accepted AF_UNIX socket is in its
-  client's. `SIOCSIFFLAGS` needs CAP_NET_ADMIN in the user namespace that
-  owns that namespace, whichever the caller is in. An AF_UNIX socket of a
-  first namespace without a network has none (`ENOTTY`). Another interface
-  name is `ENODEV`. `SIOCGIFNAME` (`if_indextoname`) names index 1
-  `lo` (`ENODEV` for another).
+  devices of the namespace the socket was made in, as Linux's `dev_ioctl`
+  takes `sock_net`: its loopback (`IFF_UP | IFF_LOOPBACK | IFF_RUNNING`
+  while it is up, in the first namespace too) and its veth ends (veth
+  pairs, below); an accepted AF_UNIX socket is in its client's.
+  `SIOCSIFFLAGS` needs CAP_NET_ADMIN in the user namespace that owns that
+  namespace, whichever the caller is in. An AF_UNIX socket of a first
+  namespace without a network has none (`ENOTTY`). Another interface name
+  is `ENODEV`. `SIOCGIFNAME` (`if_indextoname`) names the device of the
+  index (`ENODEV` for none).
 - A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
-  `NETLINK_ROUTE`) shows and changes the loopback of the network namespace
-  it was made in, so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`
+  `NETLINK_ROUTE`) shows and changes the devices of the network namespace
+  it was made in, its loopback and its veth ends (veth pairs, below), so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`
   (with `ip addr add` and `del`), `ip route` (with `ip route add`, `del`,
   `replace` and `append`), `ip route get`, `ip link set lo up` and
   `ip monitor` work.

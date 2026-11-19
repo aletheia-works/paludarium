@@ -31,6 +31,7 @@
     {"name":"neighbours","binary":"process"},
     {"name":"neighbour-requests","binary":"process"},
     {"name":"neighbour-changes","binary":"process"},
+    {"name":"neighbour-ageing","binary":"process"},
     {"name":"mctp-sockets","binary":"process"},
     {"name":"netlink-strict","binary":"process"},
     {"name":"link-attributes","binary":"process"},

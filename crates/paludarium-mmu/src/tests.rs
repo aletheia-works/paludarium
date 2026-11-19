@@ -1962,3 +1962,57 @@ fn pagemap_scan_write_protects_the_written_pages_for_wp_async() {
     m.write(GuestAddr(page(3)), b"g").unwrap();
     assert!(!wp(3));
 }
+
+#[test]
+fn a_discard_drops_the_entries_of_any_shared_mapping_and_keeps_its_pages() {
+    // A shared mapping of a file that is not shmem's, as a disk file or
+    // System V shared memory is.
+    let source: Arc<dyn PageSource> = Arc::new(Shmem {
+        size: 3 * PAGE_SIZE,
+        held: vec![],
+        shmem: false,
+    });
+    let m = AddressSpace::new();
+    let view = m.view();
+    let pages = SharedPages::new().with_source(Arc::clone(&source));
+    let at = m
+        .map_shared(None, 3 * PAGE_SIZE, Prot::READ_WRITE, MappingKind::File)
+        .unwrap();
+    m.share_pages(at, 3 * PAGE_SIZE, &pages, 0, SharedWrites::Allowed)
+        .unwrap();
+    let at = at.0;
+    let end = at + 3 * PAGE_SIZE;
+    let page = |n: u64| GuestAddr(at + n * PAGE_SIZE);
+    let state = |n: u64| {
+        view.pagemap(page(n).0, 1).unwrap()[0]
+            & (pagemap::PRESENT | pagemap::SWAP | pagemap::UFFD_WP)
+    };
+    m.write(page(0), b"a").unwrap();
+    m.write(page(1), b"b").unwrap();
+    let mut b = [0];
+    m.read(page(2), &mut b).unwrap();
+    assert_eq!(state(0), pagemap::PRESENT);
+    let resident = view.usage(at, end).unwrap();
+    m.discard_shared(GuestAddr(at), 3 * PAGE_SIZE).unwrap();
+    // The entries go, as Linux's zap clears them; the pages stay.
+    assert!((0..3).all(|n| state(n) == 0));
+    assert_ne!(view.usage(at, end).unwrap(), resident);
+    m.read(page(0), &mut b).unwrap();
+    assert_eq!(b, *b"a");
+    assert_eq!(state(0), pagemap::PRESENT);
+    m.read(page(1), &mut b).unwrap();
+    assert_eq!(b, *b"b");
+    // With write protection, a protected entry leaves a marker, which a
+    // write with `WP_ASYNC` clears.
+    view.userfault_register(at, end, 7, Userfault::WP | Userfault::WP_ASYNC)
+        .unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    m.write(page(1), b"c").unwrap();
+    m.discard_shared(GuestAddr(at), 3 * PAGE_SIZE).unwrap();
+    assert_eq!(state(0), pagemap::SWAP | pagemap::UFFD_WP);
+    assert_eq!(state(1), 0);
+    m.write(page(0), b"d").unwrap();
+    assert_eq!(state(0), pagemap::PRESENT);
+    m.read(page(1), &mut b).unwrap();
+    assert_eq!(b, *b"c");
+}

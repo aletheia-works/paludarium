@@ -6147,8 +6147,9 @@ static void pm_show(int fd, const char *label, void *at, int pages) {
 
 /* /proc/self/pagemap: what each page table entry holds, as one 64-bit
    entry a page (present, swapped or a guard, file or anonymous, mapped
-   only here, soft-dirty), and how it is read. The frame numbers are 0, as
-   for any reader without CAP_SYS_ADMIN. */
+   only here, soft-dirty), and how it is read, and what MADV_DONTNEED does
+   to the entries of a shared file mapping and System V shared memory. The
+   frame numbers are 0, as for any reader without CAP_SYS_ADMIN. */
 static int pagemap_case(void) {
     long page = 4096;
     /* Run as root, it becomes an unprivileged user first, so that Linux and
@@ -6227,6 +6228,35 @@ static int pagemap_case(void) {
     pm_show(fd, "file-read", f + page, 1);
     f[2 * page] = 'g';
     pm_show(fd, "file-written", f + 2 * page, 1);
+
+    /* MADV_DONTNEED of a shared mapping of the file, and of System V shared
+       memory, takes the entries away and keeps the pages. Writes fault
+       them in, as Linux's write fault maps no pages around one. */
+    char *sf = mmap(base + 30 * page, 2 * page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, file, 0);
+    if (sf == MAP_FAILED) return 88;
+    sf[0] = 'h';
+    sf[page] = 'i';
+    pm_show(fd, "shared-file", sf, 2);
+    printf("shared-file-dontneed=%d\n", madvise(sf, (size_t)(2 * page), MADV_DONTNEED));
+    pm_show(fd, "shared-file-dropped", sf, 2);
+    sf[0] = 'j';
+    pm_show(fd, "shared-file-again", sf, 2);
+    char kept = 0;
+    printf("shared-file-kept=%c", pread(file, &kept, 1, page) == 1 ? kept : '?');
+    printf("%c\n", pread(file, &kept, 1, 0) == 1 ? kept : '?');
+    int id = shmget(IPC_PRIVATE, (size_t)(2 * page), IPC_CREAT | 0600);
+    char *segment = id < 0 ? (char *)-1 : shmat(id, base + 40 * page, 0);
+    if (id >= 0) shmctl(id, IPC_RMID, NULL);
+    if (segment == (char *)-1) return 89;
+    segment[0] = 's';
+    segment[page] = 't';
+    pm_show(fd, "sysv", segment, 2);
+    printf("sysv-dontneed=%d\n", madvise(segment, (size_t)(2 * page), MADV_DONTNEED));
+    pm_show(fd, "sysv-dropped", segment, 2);
+    segment[page] = 'u';
+    pm_show(fd, "sysv-again", segment, 2);
+    printf("sysv-kept=%c\n", segment[0]);
+    shmdt(segment);
     close(file);
 
     /* Whole entries only, from any position; a read past its end is 0. */

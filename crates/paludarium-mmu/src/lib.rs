@@ -6337,11 +6337,14 @@ impl AddressSpaceData {
     /// (`MADV_DONTNEED`): anonymous ones read as zeros again, and those of a
     /// file mapping or an ELF segment read their file again
     /// ([`Self::back_with_file`]), as Linux faults them in from the file.
-    /// Shared pages keep theirs, as their memory outlives the mapping, and so
-    /// do the ones without a recorded file, which have nothing to read
-    /// again; shmem's lose their entries, which an access makes again from
-    /// the page cache. A write-protected entry of memory that is not
-    /// anonymous leaves a uffd-wp marker ([`Self::keep_uffd_markers`]).
+    /// The ones without a recorded file keep theirs, as there is nothing to
+    /// read again. Shared pages keep their contents, as their memory
+    /// outlives the mapping, and lose their entries, which an access makes
+    /// again from the shared memory: shmem's, System V shared memory's and
+    /// a file's alike, as Linux's `zap_pte_range` clears every entry and
+    /// the page cache keeps the pages. A write-protected entry of memory
+    /// that is not anonymous leaves a uffd-wp marker
+    /// ([`Self::keep_uffd_markers`]).
     /// Applies the mapped parts and returns `ENOMEM` when the range has a
     /// hole, as Linux does.
     pub fn discard(&mut self, addr: GuestAddr, len: u64) -> Result<(), Errno> {
@@ -6350,7 +6353,7 @@ impl AddressSpaceData {
         let mut hole = false;
         let mut private = Vec::new();
         let mut poisoned = Vec::new();
-        let mut shmem = Vec::new();
+        let mut shared = Vec::new();
         let mut sealed = false;
         for (_, m) in self.mappings.range(..end) {
             if m.end() <= addr.0 {
@@ -6367,11 +6370,11 @@ impl AddressSpaceData {
             // Every page table entry goes, poison markers too
             // (`zap_nonpresent_ptes` with no `zap_details`), shared or not.
             poisoned.push((start, m.end().min(end)));
-            // Shmem's entries go too, the page cache keeping its pages:
-            // an access faults them in again, as a minor fault where the
-            // mapping is registered for one.
-            if self.shared_at(start).is_some() && self.shmem_at(start) {
-                shmem.push((start, m.end().min(end)));
+            // A shared mapping's entries go too, the shared memory keeping
+            // its pages: an access faults them in again, as a minor fault
+            // where shmem's mapping is registered for one.
+            if self.shared_at(start).is_some() {
+                shared.push((start, m.end().min(end)));
             }
             // An ELF segment or a file mapping without its file keeps its
             // contents: there is nothing to read it from again.
@@ -6387,10 +6390,10 @@ impl AddressSpaceData {
         for (start, end) in poisoned {
             self.poisons.clear(start, end);
         }
-        if !private.is_empty() || !shmem.is_empty() {
+        if !private.is_empty() || !shared.is_empty() {
             self.bump_code_generation();
         }
-        for (start, end) in shmem {
+        for (start, end) in shared {
             self.keep_uffd_markers(start, end);
             self.clear_populated(start, end);
         }

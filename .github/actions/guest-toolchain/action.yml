@@ -131,8 +131,9 @@ runs:
         # The Azure mirror sometimes serves one job at 40 kB/s while another job of the same run
         # gets 45 MB/s from it, and apt stays on it until the job times out; AWS's has done the
         # same. So bound the download (not the install: stopping dpkg would leave packages half
-        # installed) and fall back to the other mirrors. Each attempt goes on from the files the previous one left, and all
-        # downloads share one deadline, which leaves line coverage the time it needs.
+        # installed) and fall back to the other mirrors. Each attempt goes on from the files the
+        # previous one left, and all downloads share one deadline, which leaves line coverage the
+        # time it needs.
         deadline=$((SECONDS + 720))
         download() {
           local limit

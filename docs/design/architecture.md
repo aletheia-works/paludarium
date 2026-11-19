@@ -60,10 +60,10 @@ instructions that follow each other in memory from its address, up to a `jmp`,
 branch does not end a block. The interpreter looks up a block only when the
 next instruction is not the next one of the current block: after a branch, a
 system call or a fault, at the end of the block, or when the code generation
-has moved on. Falling through from one instruction to the next needs no lookup. With
-the WebAssembly JIT the loop walks the blocks in the same way, and offers each
-instruction to the JIT before running it, unless the JIT has turned that
-instruction down while its block has been cached.
+has moved on. Falling through from one instruction to the next needs no
+lookup. With the WebAssembly JIT the loop walks the blocks in the same way,
+and offers each instruction to the JIT before running it, unless the JIT has
+turned that instruction down while its block has been cached.
 
 The code generation is a counter of the address space. It moves on when the
 mappings change (`mmap`, `munmap`, `mprotect`, `mremap`, `brk`, `shmat`,
@@ -163,23 +163,25 @@ Compiled code means exactly what the interpreter's forms mean. It reads and
 writes the thread's registers where the interpreter keeps them, in memory,
 with nothing copied in or out. A load or store of up to 8 bytes within one
 aligned word goes straight to the page's bytes when the thread's TLB holds
-the page and the slot the MMU keeps for compiled code says the access may
-go through it: the slot holds only at the epoch it was filled at, and
-allows a store only where the MMU's own stores through the TLB would
-write, never to an executable page. Every other access, and every one the
-slot does not allow, such as a write to a page that `mprotect`,
+the page and the slot the MMU keeps for compiled code says the access may go
+through it: the slot holds only at the epoch it was filled at, and allows a
+store only where the MMU's own stores through the TLB would write, never to
+a page an instruction was fetched from. A page that is also executable but
+holds only data, as SBCL's heap does, is written through the slot until an
+instruction is fetched from it. Every other access, and every one the slot
+does not allow, such as a write to a page that `mprotect`,
 `UFFDIO_WRITEPROTECT` or a clear soft-dirty bit protects, calls the MMU's
 own loads and stores, with their checks, which fill the slot again. It stops
 before an instruction whose load or store fails, having changed nothing for
 it, so that the interpreter runs it again and reports the fault, and after a
 call into the MMU that finds the code generation moved on. An access to a
-page's bytes never moves it: a slot never allows a write to an executable
-page, nor to a shared or file page, whose stores the MMU counts as code
-changes for the mappings and page caches it watches. A change another thread
-makes meanwhile shows at the next call, or after the block, when the
-interpreter reads the generation again. A taken branch, `jmp`, `call` and
-`ret` end it. It returns how many instructions ran, and the interpreter goes
-on from the next one.
+page's bytes never moves it: a slot never allows a write to a page an
+instruction was fetched from, nor to a shared or file page, whose stores the
+MMU counts as code changes for the mappings and page caches it watches. A
+change another thread makes meanwhile shows at the next call, or after the
+block, when the interpreter reads the generation again. A taken branch,
+`jmp`, `call` and `ret` end it. It returns how many instructions ran, and
+the interpreter goes on from the next one.
 
 When the code generation moves on, the interpreter decodes every block again,
 mostly to the same forms. The JIT keeps the code it compiled by its forms (up

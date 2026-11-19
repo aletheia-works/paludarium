@@ -144,6 +144,11 @@ pub struct ThreadGroup {
         BTreeMap<u32, crate::io_accounting::Io>,
         crate::io_accounting::Io,
     )>,
+    /// The peak resident pages of the address spaces it left by `execve`
+    /// and of the one it exited in (Linux's `signal->maxrss`), and the
+    /// largest of its reaped children's (`signal->cmaxrss`).
+    peak: AtomicU64,
+    children_peak: AtomicU64,
     /// The process is the init of a nested PID namespace, which takes only
     /// the signals it handles, and SIGKILL and SIGSTOP from outside (Linux's
     /// SIGNAL_UNKILLABLE), until a fault ends it.
@@ -267,6 +272,8 @@ impl Default for ThreadGroup {
             public: Mutex::default(),
             renames: Mutex::default(),
             io: Mutex::default(),
+            peak: AtomicU64::new(0),
+            children_peak: AtomicU64::new(0),
             unkillable: std::sync::atomic::AtomicBool::new(false),
             killed: std::sync::atomic::AtomicBool::new(false),
             traced: AtomicU32::new(0),
@@ -1531,6 +1538,41 @@ impl ThreadGroup {
             .1
             .add(child);
     }
+    /// Keeps `pages`, the peak resident size of an address space it is
+    /// done with, as Linux's `setmax_mm_hiwater_rss` into `signal->maxrss`
+    /// at `execve` and at the group's exit.
+    pub(crate) fn keep_peak(&self, pages: u64) {
+        self.peak.fetch_max(pages, Ordering::Relaxed);
+    }
+    /// The peak resident pages `getrusage(RUSAGE_SELF)` gives: the kept
+    /// one, or `live`'s, the address space it runs in, if larger.
+    pub(crate) fn peak(&self, live: u64) -> u64 {
+        self.peak.load(Ordering::Relaxed).max(live)
+    }
+    /// The largest peak of its reaped children (`RUSAGE_CHILDREN`).
+    pub(crate) fn children_peak(&self) -> u64 {
+        self.children_peak.load(Ordering::Relaxed)
+    }
+    /// What a wait reports of it (Linux's `getrusage(RUSAGE_BOTH)`): its
+    /// kept peak, its children's and, while a thread still runs, its address
+    /// space's.
+    pub(crate) fn waited_peak(&self) -> u64 {
+        let live = self
+            .public
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter_map(|thread| thread.memory.as_ref()?.resident_pages())
+            .map(|(peak, _)| peak)
+            .max()
+            .unwrap_or(0);
+        self.peak(live).max(self.children_peak())
+    }
+    /// Takes a reaped child's peak, its own or its children's
+    /// (`wait_task_zombie`'s `cmaxrss`).
+    pub(crate) fn reaped_peak(&self, pages: u64) {
+        self.children_peak.fetch_max(pages, Ordering::Relaxed);
+    }
     /// Publishes what thread `tid` shows in `/proc`.
     pub(crate) fn publish(&self, tid: u32, thread: PublicThread) {
         self.public
@@ -2046,6 +2088,10 @@ impl Kernel {
         self.group.leave_shm(thread.tid);
         // perf_event_exit_task: the events it opened have no owner.
         crate::perf::exit_thread(&self.processes.perf_events, &self.group, thread.tid);
+        // The group's exit keeps the peak its address space reached
+        // (`do_exit`'s `setmax_mm_hiwater_rss` once the group is dead), under
+        // the members' lock, so that no wait sees the exit before it.
+        let (peak, _) = mem.resident_pages();
         let alone = {
             let mut members = self
                 .group
@@ -2053,6 +2099,9 @@ impl Kernel {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             members.remove(&thread.tid);
+            if members.is_empty() {
+                self.group.keep_peak(peak);
+            }
             members.is_empty()
         };
         drop(core);

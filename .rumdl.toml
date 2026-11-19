@@ -16,3 +16,6 @@ disable = ["MD013", "MD033", "MD036", "MD041", "MD057"]
 respect-gitignore = true
 
 flavor = "gfm"
+
+[MD076]
+allow-loose-continuation = true

@@ -9,21 +9,28 @@ results are compared. Expected results are not stored in the repository: every
 CI run produces them afresh on an x86-64 Linux runner.
 
 - **Per instruction**: registers, flags and memory.
+
 - **Per program**: standard output, standard error and the exit status, byte
   for byte.
+
 - Flags and values that x86 leaves undefined (AF after logic instructions,
   the flags after `div`, …) are skipped, following a per-instruction table.
+
 - Where x86 only bounds a result and Intel's and AMD's CPUs differ in it
   (`RCPPS` and the like, and the last bit of x87's transcendental
   instructions), a case prints whether the result is within that bound of a
   reference, which each CPU's is, rather than its bits; it still prints every
   bit where the CPUs agree. Limitations names each such place.
+
 - Values that change from run to run, such as pids, times, random numbers and
   addresses, are normalised or excluded before the comparison.
+
 - New instructions and system calls get their test cases, and the result on
   real Linux, before they are implemented.
+
 - Each case has a 30-second timeout, or a longer one for a case that waits
   out a timer of Linux's own, such as `TIME_WAIT`.
+
 - The emulated side of the program cases runs on a virtual clock
   (`RecordingHost`): a sleep or a timed wait jumps it to its deadline after
   up to 10 ms of real time (no more than the wait itself) for a wake-up from
@@ -34,19 +41,23 @@ CI run produces them afresh on an x86-64 Linux runner.
   how long a wait took only when no other process or thread sleeps
   meanwhile. To wait for another process, it uses a pipe or a descriptor
   to wait on without a timeout, not a sleep.
+
 - The core-dump case needs Linux to keep the kernel's default `core_pattern`
   (`core`, with `core_uses_pid` 0). CI sets it with `sysctl`; elsewhere the
   case stops and says so, rather than compare with a core sent to a crash
   handler.
+
 - The AF_UNIX datagram case needs the kernel's default
   `net.unix.max_dgram_qlen` of 10, which systemd raises on many hosts. CI
   sets it with `sysctl` (a container's own network namespace has it);
   elsewhere the case stops and says so.
+
 - The `chroot` case takes `CAP_SYS_CHROOT` in a user namespace of its own,
   which Linux grants. Ubuntu's AppArmor refuses every capability there
   (the `unprivileged_userns` profile) while
   `kernel.apparmor_restrict_unprivileged_userns` is 1, so CI sets it to 0
   with `sysctl`; elsewhere the case differs from such a host's native run.
+
 - The native side must be a real x86-64 Linux. Docker on an Arm Mac runs
   x86-64 programs under QEMU's user-mode emulation, which handles signals
   itself, so there even native results can differ from Linux: a stopped and
@@ -76,6 +87,7 @@ CI run produces them afresh on an x86-64 Linux runner.
   flaky, as some cases' timing is under QEMU; else it fails the task, as
   does a case that main ran and the checkout did not (a suite that
   stopped).
+
 - The native results are those of the CI runner's kernel (Linux 7.0 on
   `ubuntu-26.04`, which the `differential` and `coverage` jobs of `ci.yml` and
   `quality.yml` name instead of `ubuntu-latest`; the jobs that compare fixed
@@ -86,9 +98,11 @@ CI run produces them afresh on an x86-64 Linux runner.
   can fail those cases. `listen` on a connected AF_UNIX socket is one: it is
   `EINVAL` as Linux's fix of 2026 makes it, where `ubuntu-24.04`'s
   7.0.0-1017-azure still succeeded when this was written.
+
 - A test checks that `diff_processes` runs exactly the process cases that
   `tests/guests/processes/cases.json` lists, so that a case cannot be listed
   and never run.
+
 - The network cases (`diff_network`) serve the guest from the test itself, on
   127.0.0.1, so that native Linux and the emulator talk to the same server;
   the emulator may reach only that server's port and one that nothing
@@ -97,6 +111,7 @@ CI run produces them afresh on an x86-64 Linux runner.
   kernel. Name resolution on Linux depends on the runner's own files and
   servers, so it is checked under the emulator only, against `localhost`,
   over UDP through musl's resolver and over TCP with a query of its own.
+
 - The WebAssembly package's network is checked on Node.js
   (`wasm-network.test.mjs`) and through the [relay](../guide/relay)
   (`wasm-relay.test.mjs`): freestanding guests reach a server the test runs
@@ -105,6 +120,7 @@ CI run produces them afresh on an x86-64 Linux runner.
   writes everything before it reads anything) and its parity with the
   kernel's rules. `wasm-browser-network.mjs` runs the guests through the
   relay in Chromium, Firefox, WebKit and Safari in CI.
+
 - Every night, Debian's own dynamically linked programs run natively and
   under the emulator, once without and once with the native JIT, in a Debian
   container, and their exit status and

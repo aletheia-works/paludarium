@@ -21810,6 +21810,94 @@ int main(int argc, char **argv) {
         result("maker", reaped(maker));
         return 0;
     }
+    if (!strcmp(mode, "neighbour-ageing")) {
+        /* A child makes a network namespace and adds reachable neighbours of
+           lo (IPv4's, keyed 0.0.0.0, and IPv6's) and a permanent one; then
+           waits for what RTNLGRP_NEIGH hears as their timers run
+           (neigh_timer_handler): each reachable one goes stale once its
+           reachable time has passed, which Linux picks from half to one and
+           a half times the base 30 seconds for each table, so the two are
+           heard in either order, and are printed sorted. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x4};
+            printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
+            const unsigned short create = 0x400;
+            const unsigned char mac[6] = {2, 0, 0, 0, 0, 1};
+            const struct {
+                unsigned char family;
+                const char *dst;
+                unsigned short state;
+            } adds[] = {{AF_INET, "10.0.0.1", 0x02}, {AF_INET6, "2001:db8::1", 0x02}, {AF_INET6, "2001:db8::2", 0x80}};
+            for (size_t i = 0; i < sizeof adds / sizeof *adds; i++) {
+                struct nl_body b = nl_body(adds[i].family, 12);
+                memcpy(b.bytes + 4, &(int){1}, 4);
+                memcpy(b.bytes + 8, &adds[i].state, 2);
+                unsigned char key[16];
+                inet_pton(adds[i].family, adds[i].dst, key);
+                nl_put(&b, 1, key, adds[i].family == AF_INET ? 4 : 16);
+                nl_put(&b, 2, mac, 6);
+                printf("add %s: error=%d\n", adds[i].dst, nl_quiet(ctl, 28, create, b.bytes, b.len));
+                monitor_wait(mon, port, adds[i].dst, 0);
+            }
+            struct nl_body all = nl_body(0, 12);
+            nl_sorted(ctl, port, 30, 1, &all, "dump before");
+            /* Up to 60 seconds, looking each second, for the two. */
+            char heard[8][256];
+            int count = 0;
+            for (int waited = 0; waited < 60 && count < 2; waited++) {
+                struct pollfd ready = {.fd = mon, .events = POLLIN};
+                if (poll(&ready, 1, 1000) <= 0) continue;
+                static char buf[16384];
+                long n = recv(mon, buf, sizeof buf, MSG_DONTWAIT);
+                for (char *at = buf; n > 0 && at + sizeof(struct nl_header) <= buf + n;) {
+                    struct nl_header *h = (void *)at;
+                    if (h->len < sizeof *h || at + h->len > buf + n) break;
+                    unsigned char *body = (void *)(h + 1);
+                    int body_len = h->len - sizeof *h;
+                    if (count < 8 && body_len >= 12) {
+                        unsigned short state;
+                        memcpy(&state, body + 8, 2);
+                        char dst[INET6_ADDRSTRLEN] = "?";
+                        unsigned refcnt = 0, probes = 0, lladdr = 0;
+                        for (unsigned char *a = body + 12; a + 4 <= body + body_len;) {
+                            unsigned short alen, atype;
+                            memcpy(&alen, a, 2);
+                            memcpy(&atype, a + 2, 2);
+                            if (alen < 4 || a + alen > body + body_len) break;
+                            if (atype == 1) inet_ntop(alen == 8 ? AF_INET : AF_INET6, a + 4, dst, sizeof dst);
+                            if (atype == 2) lladdr = alen - 4;
+                            if (atype == 3 && alen == 20) memcpy(&refcnt, a + 16, 4);
+                            if (atype == 4 && alen == 8) memcpy(&probes, a + 4, 4);
+                            a += (alen + 3) & ~3;
+                        }
+                        snprintf(heard[count++], sizeof heard[0],
+                                 "heard: type=%u flags=%#x seq=%u pid=%u family=%u state=%#x flags=%#x type=%u dst=%s "
+                                 "lladdr:%u probes=%u refcnt=%u",
+                                 h->type, h->flags, h->seq, h->pid, body[0], state, body[10], body[11], dst, lladdr,
+                                 probes, refcnt);
+                    }
+                    at += (h->len + 3) & ~3;
+                }
+            }
+            qsort(heard, count, sizeof heard[0], (int (*)(const void *, const void *))strcmp);
+            printf("heard=%d\n", count);
+            for (int i = 0; i < count; i++) printf("%s\n", heard[i]);
+            nl_sorted(ctl, port, 30, 1, &all, "dump after");
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
     if (!strcmp(mode, "neighbours")) {
         /* A child makes a network namespace with lo up, and sends through
            it: each packet's next hop has a neighbour, IPv4's one keyed by

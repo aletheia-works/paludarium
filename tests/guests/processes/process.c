@@ -6546,8 +6546,9 @@ static pid_t mr_child(long mib, int nested, long *start) {
 }
 /* The traced-rusage case: a tracer's wait reports the tracee's resource
    usage as its parent's wait does, `getrusage(RUSAGE_BOTH)`, with the CPU
-   time of the children it reaped (kernel/exit.c wait_task_stopped). The
-   tracee reaps a child that spent 300 ms of CPU time, then stops. */
+   time of the children it reaped (kernel/exit.c wait_task_stopped,
+   wait_task_zombie). The tracee reaps a child that spent 300 ms of CPU
+   time, then stops or exits. */
 static long tr_cpu_ms(const struct rusage *usage) {
     return (usage->ru_utime.tv_sec + usage->ru_stime.tv_sec) * 1000 +
            (usage->ru_utime.tv_usec + usage->ru_stime.tv_usec) / 1000;
@@ -6585,6 +6586,49 @@ static int traced_rusage_case(void) {
     if (wait4(tracee, &status, 0, &usage) != tracee) return 13;
     result("exited", WIFEXITED(status) && WEXITSTATUS(status) == 0);
     result("exit-with-children", tr_cpu_ms(&usage) >= 250);
+
+    /* A tracer that is not the parent waits for the exit first: this
+       process seizes a grandchild, which reaps a child that spent 300 ms
+       and exits; its parent waits for it after this process has. */
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 14;
+    fflush(stdout);
+    pid_t middle = fork();
+    if (middle < 0) return 15;
+    if (middle == 0) {
+        close(ready[0]);
+        close(go[1]);
+        pid_t traced = fork();
+        if (traced == 0) {
+            pid_t burner = fork();
+            if (burner == 0) {
+                tr_burn(300);
+                _exit(0);
+            }
+            if (burner < 0 || waitpid(burner, NULL, 0) != burner) _exit(2);
+            pid_t self_pid = getpid();
+            char byte;
+            if (write(ready[1], &self_pid, sizeof self_pid) != sizeof self_pid) _exit(3);
+            if (read(go[0], &byte, 1) != 1) _exit(4);
+            _exit(0);
+        }
+        int traced_status;
+        _exit(traced > 0 && waitpid(traced, &traced_status, 0) == traced && WIFEXITED(traced_status) ? 0 : 5);
+    }
+    close(ready[1]);
+    close(go[0]);
+    pid_t grandchild = 0;
+    if (read(ready[0], &grandchild, sizeof grandchild) != sizeof grandchild) return 16;
+    close(ready[0]);
+    result("seized", syscall(SYS_ptrace, 0x4206 /* PTRACE_SEIZE */, grandchild, 0, 0) == 0);
+    if (write(go[1], "x", 1) != 1) return 17;
+    close(go[1]);
+    memset(&usage, 0, sizeof usage);
+    if (wait4(grandchild, &status, 0, &usage) != grandchild) return 18;
+    result("tracer-exited", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    result("tracer-exit-with-children", tr_cpu_ms(&usage) >= 250);
+    if (waitpid(middle, &status, 0) != middle) return 19;
+    result("parent-reaped", WIFEXITED(status) && WEXITSTATUS(status) == 0);
     return 0;
 }
 static int maxrss_exec(const char *start, const char *children) {

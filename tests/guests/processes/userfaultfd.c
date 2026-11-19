@@ -30,7 +30,13 @@
    instruction's and a system call's), of private anonymous memory and of
    the memory only WP_ASYNC registers (a file's private and shared
    mappings, System V shared memory), the modes and mappings it still
-   refuses, and what MADV_DONTNEED does to a file's protected pages.
+   refuses, and what MADV_DONTNEED does to a file's protected pages; and
+   the events: fork's, whose message hands the child's new userfaultfd
+   over, which the child's faults reach; mremap's move, which keeps the
+   registration, and the unmaps it gives; MADV_DONTNEED's remove; the
+   unmaps of munmap and a MAP_FIXED mmap; a context without the features,
+   which is told nothing; and the fills that are EAGAIN while an unmap
+   waits for its event to be read.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
    whether they are the faulting thread's. Of what UFFDIO_API and
@@ -62,6 +68,13 @@
 #define UFFD_PAGEFAULT_FLAG_WRITE 1
 #define UFFD_FEATURE_PAGEFAULT_FLAG_WP (1ULL << 0)
 #define UFFD_FEATURE_EVENT_FORK (1ULL << 1)
+#define UFFD_FEATURE_EVENT_REMAP (1ULL << 2)
+#define UFFD_FEATURE_EVENT_REMOVE (1ULL << 3)
+#define UFFD_FEATURE_EVENT_UNMAP (1ULL << 6)
+#define UFFD_EVENT_FORK 0x13
+#define UFFD_EVENT_REMAP 0x14
+#define UFFD_EVENT_REMOVE 0x15
+#define UFFD_EVENT_UNMAP 0x16
 #define UFFD_FEATURE_MISSING_SHMEM (1ULL << 5)
 #define UFFD_FEATURE_SIGBUS (1ULL << 7)
 #define UFFD_FEATURE_THREAD_ID (1ULL << 8)
@@ -1437,6 +1450,148 @@ static int case_wp_async(void) {
     return 0;
 }
 
+/* A thread that reads `want` messages of `fd`, which blocks. */
+struct events {
+    int fd, want;
+    struct uffd_msg msg[4];
+    pthread_t thread;
+};
+
+static void *read_events(void *arg) {
+    struct events *e = arg;
+    for (int i = 0; i < e->want; i++) {
+        if (read(e->fd, &e->msg[i], sizeof e->msg[i]) != sizeof e->msg[i]) {
+            printf("read: %s\n", strerror(errno));
+            e->want = i;
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void expect(struct events *e, int fd, int want) {
+    e->fd = fd;
+    e->want = want;
+    memset(e->msg, 0, sizeof e->msg);
+    pthread_create(&e->thread, NULL, read_events, e);
+}
+
+/* The messages the thread read: their events, and their ranges as
+   offsets from `base`. */
+static void seen(const char *what, struct events *e, char *base) {
+    pthread_join(e->thread, NULL);
+    for (int i = 0; i < e->want; i++) {
+        struct uffd_msg *m = &e->msg[i];
+        long from = (long)(m->flags - (uintptr_t)base);
+        long to = (long)(m->address - (uintptr_t)base);
+        switch (m->event) {
+        case UFFD_EVENT_REMAP:
+            printf("%s: remap %ld -> %ld len %llu\n", what, from, to,
+                   (unsigned long long)m->ptid | (unsigned long long)m->pad << 32);
+            break;
+        case UFFD_EVENT_REMOVE:
+        case UFFD_EVENT_UNMAP:
+            printf("%s: %s [%ld, %ld) rest=%u\n", what,
+                   m->event == UFFD_EVENT_REMOVE ? "remove" : "unmap", from, to, m->ptid);
+            break;
+        case UFFD_EVENT_FORK:
+            printf("%s: fork ufd>2=%d rest=%llu\n", what, (int)(uint32_t)m->flags > 2,
+                   (unsigned long long)(m->flags >> 32) | (unsigned long long)m->address);
+            break;
+        default:
+            printf("%s: event %#x\n", what, m->event);
+        }
+    }
+}
+
+static void *unmap_page(void *at) {
+    munmap(at, PAGE);
+    return NULL;
+}
+
+static int case_events(void) {
+    uint64_t all = UFFD_FEATURE_EVENT_FORK | UFFD_FEATURE_EVENT_REMAP | UFFD_FEATURE_EVENT_REMOVE |
+                   UFFD_FEATURE_EVENT_UNMAP;
+    struct uffdio_api api = {UFFD_API, all, 0};
+    int fd = uffd(0);
+    printf("api: %s", err(ioctl(fd, UFFDIO_API, &api)));
+    printf(" events=%d\n", (api.features & all) == all);
+    char *base = anon(8 * PAGE);
+    printf("register: %s\n", err(reg(fd, base, 4 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    struct events e;
+    /* A discard tells of each range it drops, before it does. */
+    expect(&e, fd, 1);
+    printf("dontneed: %s\n", err(madvise(base + PAGE, 2 * PAGE, MADV_DONTNEED)));
+    seen("dontneed", &e, base);
+    /* A move keeps the registration: the move, then the range it left. */
+    expect(&e, fd, 2);
+    void *moved = mremap(base, 2 * PAGE, 2 * PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, base + 6 * PAGE);
+    printf("mremap: %ld\n", moved == MAP_FAILED ? -1L : (long)((char *)moved - base));
+    seen("mremap", &e, base);
+    vma("moved", base, base + 6 * PAGE);
+    /* munmap and a fixed mapping over registered memory unmap it. */
+    expect(&e, fd, 1);
+    printf("munmap: %s\n", err(munmap(base + 2 * PAGE, 4 * PAGE)));
+    seen("munmap", &e, base);
+    expect(&e, fd, 1);
+    void *over = mmap(base + 6 * PAGE, PAGE, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    printf("mmap fixed: %ld\n", over == MAP_FAILED ? -1L : (long)((char *)over - base));
+    seen("mmap", &e, base);
+    /* fork waits for its event, whose file is the child's context: the
+       child's fault on its registered page reaches it. */
+    expect(&e, fd, 1);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        printf("child read: %c\n", base[7 * PAGE]);
+        _exit(0);
+    }
+    seen("fork", &e, base);
+    int ufd = (int)(uint32_t)e.msg[0].flags;
+    struct uffd_msg msg;
+    printf("child fault: %s", err(read(ufd, &msg, sizeof msg)));
+    printf(" event=%#x at=%ld\n", msg.event, (long)(msg.address - (uintptr_t)base));
+    char page[PAGE];
+    memset(page, 'c', PAGE);
+    printf("child copy: %s\n", err(copy(ufd, base + 7 * PAGE, page, PAGE, 0, NULL)));
+    int status;
+    waitpid(child, &status, 0);
+    printf("child: %d\n", WEXITSTATUS(status));
+    char path[64], link[64] = {0};
+    snprintf(path, sizeof path, "/proc/self/fd/%d", ufd);
+    readlink(path, link, sizeof link - 1);
+    printf("handed over: %s cloexec=%d\n", link, (fcntl(ufd, F_GETFD) & FD_CLOEXEC) != 0);
+    close(ufd);
+    /* A context without the features is told nothing. */
+    int quiet = ready(O_NONBLOCK, 0);
+    char *other = anon(2 * PAGE);
+    printf("register quiet: %s\n", err(reg(quiet, other, 2 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    printf("munmap quiet: %s\n", err(munmap(other, PAGE)));
+    printf("read quiet: %s\n", err(read(quiet, &msg, sizeof msg)));
+    /* While an unmap waits for its event, the fills are EAGAIN. */
+    int waiting = ready(O_NONBLOCK, UFFD_FEATURE_EVENT_UNMAP);
+    char *area = anon(2 * PAGE);
+    printf("register waiting: %s\n", err(reg(waiting, area, 2 * PAGE, UFFDIO_REGISTER_MODE_MISSING, NULL)));
+    pthread_t unmapper;
+    pthread_create(&unmapper, NULL, unmap_page, area);
+    struct pollfd p = {waiting, POLLIN, 0};
+    int polled = poll(&p, 1, 5000);
+    printf("poll: %d %#x\n", polled, p.revents);
+    int64_t done = 0;
+    printf("zeropage: %s", err(zeropage(waiting, area + PAGE, PAGE, 0, &done)));
+    printf(" %lld\n", (long long)done);
+    printf("copy: %s", err(copy(waiting, area + PAGE, page, PAGE, 0, &done)));
+    printf(" %lld\n", (long long)done);
+    printf("writeprotect: %s\n", err(protect(waiting, area + PAGE, PAGE, 0)));
+    printf("read: %s", err(read(waiting, &msg, sizeof msg)));
+    printf(" event=%#x [%ld, %ld)\n", msg.event, (long)(msg.flags - (uintptr_t)area),
+           (long)(msg.address - (uintptr_t)area));
+    pthread_join(unmapper, NULL);
+    printf("zeropage after: %s\n", err(zeropage(waiting, area + PAGE, PAGE, 0, NULL)));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1453,6 +1608,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-wp-shmem")) return case_wp_shmem();
     if (!strcmp(mode, "userfaultfd-wp-async")) return case_wp_async();
     if (!strcmp(mode, "userfaultfd-move")) return case_move();
+    if (!strcmp(mode, "userfaultfd-events")) return case_events();
     printf("unknown mode %s\n", mode);
     return 2;
 }

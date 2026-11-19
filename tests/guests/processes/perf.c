@@ -7,7 +7,9 @@
    context switches and CPU migrations a thread makes, with and without
    exclude_user and exclude_kernel; and mmap of an event's ring buffer:
    its user page, the sizes and mappings it takes, its AUX area, a fork's
-   child, which has none of it, and the pages a user may lock.
+   child, which has none of it, and the pages a user may lock; and
+   output to another event's buffer, with PERF_EVENT_IOC_SET_OUTPUT and
+   PERF_FLAG_FD_OUTPUT.
 
    Counts and times are given as whether they are 0, grew or stayed,
    never as values, and IDs as whether they match. Hardware events are not
@@ -30,6 +32,8 @@
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 /* struct perf_event_attr as of PERF_ATTR_SIZE_VER8 (136 bytes), which
@@ -56,6 +60,7 @@ struct attr {
 #define FREQ (1ULL << 10)
 #define ENABLE_ON_EXEC (1ULL << 12)
 #define USE_CLOCKID (1ULL << 25)
+#define WRITE_BACKWARD (1ULL << 27)
 #define AUX_OUTPUT (1ULL << 31)
 #define INHERIT_THREAD (1ULL << 35)
 #define REMOVE_ON_EXEC (1ULL << 36)
@@ -79,10 +84,12 @@ struct attr {
 #define IOC_REFRESH _IO('$', 2)
 #define IOC_RESET _IO('$', 3)
 #define IOC_PERIOD _IOW('$', 4, uint64_t)
+#define IOC_SET_OUTPUT _IO('$', 5)
 #define IOC_ID _IOR('$', 7, uint64_t *)
 #define IOC_FLAG_GROUP 1
 
 #define FLAG_FD_NO_GROUP 1
+#define FLAG_FD_OUTPUT 2
 #define FLAG_PID_CGROUP 4
 #define FLAG_FD_CLOEXEC 8
 
@@ -706,6 +713,88 @@ static int case_mmap(void) {
     return 0;
 }
 
+static long set_output(int fd, long output) {
+    return TRY(ioctl(fd, IOC_SET_OUTPUT, output));
+}
+
+/* An event of this thread like open_software's, with more flags. */
+static int open_like(uint64_t flags, int pid, int cpu, int group, unsigned long open_flags) {
+    struct attr a = software(2);
+    a.flags |= flags;
+    return (int)open_event(&a, pid, cpu, group, open_flags);
+}
+
+/* Each call in its own statement: the arguments of one call run in no
+   set order. */
+static int case_output(void) {
+    int owner = open_like(0, 0, -1, -1, 0), other = open_like(0, 0, -1, -1, 0);
+    void *page = NULL;
+    long a = map_event(owner, 3, PROT_READ, MAP_SHARED, 0, &page), b, c;
+    say("open %d mapped %ld", owner >= 0 && other >= 0, a);
+
+    /* What may not write to the buffer. */
+    say("self %ld", set_output(owner, owner));
+    say("no buffer %ld", set_output(other, open_like(0, 0, -1, -1, 0)));
+    a = set_output(other, 0);
+    b = set_output(other, 1000);
+    c = set_output(other, 0xffffffffL);
+    say("not an event %ld closed %ld high %ld", a, b, c);
+    say("other cpu %ld", set_output(open_like(0, 0, 0, -1, 0), owner));
+    struct attr clocked = software(2);
+    clocked.flags |= USE_CLOCKID;
+    clocked.clockid = CLOCK_MONOTONIC;
+    say("other clock %ld", set_output((int)open_event(&clocked, 0, -1, -1, 0), owner));
+    say("backward %ld", set_output(open_like(WRITE_BACKWARD, 0, -1, -1, 0), owner));
+    pid_t child = fork();
+    if (child == 0) {
+        pause();
+        _exit(0);
+    }
+    int theirs = open_like(0, child, -1, -1, 0);
+    say("other task %d %ld", theirs >= 0, set_output(theirs, owner));
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+
+    /* Another event writes to it, and maps none of it. */
+    a = set_output(other, owner);
+    b = set_output(other, owner);
+    say("set %ld again %ld", a, b);
+    a = map_event(other, 3, PROT_READ, MAP_SHARED, 0, NULL);
+    b = map_event(other, 5, PROT_READ, MAP_SHARED, 0, NULL);
+    say("other mapped %ld other size %ld", a, b);
+    a = set_output(owner, other);
+    b = set_output(owner, -1);
+    say("owner elsewhere %ld owner none %ld", a, b);
+    int third = open_like(0, 0, -1, -1, 0);
+    a = set_output(third, other);
+    b = map_event(third, 3, PROT_READ, MAP_SHARED, 0, NULL);
+    say("through %ld mapped %ld", a, b);
+    a = set_output(third, -1);
+    void *own = NULL;
+    b = map_event(third, 3, PROT_READ, MAP_SHARED, 0, &own);
+    say("none %ld mapped %ld", a, b);
+    if (!b) {
+        say("own mapping elsewhere %ld", set_output(third, owner));
+        munmap(own, 3 * 4096);
+    }
+
+    /* At open, through the group's event, in its group or not. */
+    long grouped = open_like(0, 0, -1, owner, FLAG_FD_OUTPUT);
+    long alone = open_like(0, 0, -1, owner, FLAG_FD_OUTPUT | FLAG_FD_NO_GROUP);
+    say("open grouped %d alone %d", grouped >= 0, alone >= 0);
+    if (alone >= 0) say("alone mapped %ld", map_event((int)alone, 3, PROT_READ, MAP_SHARED, 0, NULL));
+    say("open without buffer %ld", (long)open_like(0, 0, -1, third, FLAG_FD_OUTPUT | FLAG_FD_NO_GROUP));
+    say("open backward %ld", (long)open_like(WRITE_BACKWARD, 0, -1, owner, FLAG_FD_OUTPUT | FLAG_FD_NO_GROUP));
+    say("open other cpu %ld", (long)open_like(0, 0, 0, owner, FLAG_FD_OUTPUT | FLAG_FD_NO_GROUP));
+
+    /* Unmapped, the buffer goes, and those that wrote to it are free. */
+    munmap(page, 3 * 4096);
+    a = set_output(third, other);
+    b = map_event(other, 5, PROT_READ, MAP_SHARED, 0, NULL);
+    say("unmapped: set %ld other maps %ld", a, b);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -715,6 +804,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-inherit")) return case_inherit();
     if (!strcmp(mode, "perf-software")) return case_software();
     if (!strcmp(mode, "perf-mmap")) return case_mmap();
+    if (!strcmp(mode, "perf-output")) return case_output();
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {
         spin();

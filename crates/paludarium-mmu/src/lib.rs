@@ -142,8 +142,9 @@ pub struct Mapping {
     /// mapping is placed within [`STACK_GUARD_GAP`] below it.
     pub grows_down: bool,
     /// A `userfaultfd` registered it (Linux's `vm_userfaultfd_ctx` and
-    /// `VM_UFFD_*`), which a `fork`ed child and a move by `mremap` do not
-    /// keep, as Linux's do not without `UFFD_FEATURE_EVENT_FORK` and
+    /// `VM_UFFD_*`), which a `fork`ed child and a move by `mremap` keep
+    /// only with [`Userfault::EVENT_FORK`] and [`Userfault::EVENT_REMAP`],
+    /// as Linux's with `UFFD_FEATURE_EVENT_FORK` and
     /// `UFFD_FEATURE_EVENT_REMAP`.
     pub userfault: Option<Userfault>,
     /// A file on a mount that runs nothing (`noexec`) backs it, so it may
@@ -165,7 +166,9 @@ pub struct Userfault {
     pub context: u64,
     /// The modes, as `UFFDIO_REGISTER` numbers them:
     /// [`Userfault::MISSING`], [`Userfault::WP`] and [`Userfault::MINOR`];
-    /// and [`Userfault::WP_UNPOPULATED`], which the `userfaultfd` gives.
+    /// and those the `userfaultfd`'s features give:
+    /// [`Userfault::WP_UNPOPULATED`], [`Userfault::WP_ASYNC`],
+    /// [`Userfault::EVENT_FORK`] and [`Userfault::EVENT_REMAP`].
     pub modes: u8,
 }
 
@@ -193,6 +196,18 @@ impl Userfault {
     /// `userfaultfd_wp_async`. With [`Userfault::WP`] alone, any memory
     /// may be registered (`vma_can_userfault`).
     pub const WP_ASYNC: u8 = 1 << 7;
+    /// Not a mode of `UFFDIO_REGISTER`: the `userfaultfd` took
+    /// `UFFD_FEATURE_EVENT_FORK`, so a `fork`ed child keeps the
+    /// registration, which the kernel moves to the child's own
+    /// `userfaultfd` ([`AddressSpaceData::userfault_renumber`]), and the
+    /// write protection of its pages (`dup_userfaultfd`, and
+    /// `copy_present_pte` with `userfaultfd_wp(dst_vma)`).
+    pub const EVENT_FORK: u8 = 1 << 3;
+    /// Not a mode of `UFFDIO_REGISTER`: the `userfaultfd` took
+    /// `UFFD_FEATURE_EVENT_REMAP`, so a mapping `mremap` moves keeps the
+    /// registration and the write protection of its pages
+    /// (`mremap_userfaultfd_prep`, and `move_ptes`).
+    pub const EVENT_REMAP: u8 = 1 << 4;
 }
 
 /// Why an access waits for a `userfaultfd` ([`AddressSpace::userfault_for`]).
@@ -438,6 +453,15 @@ impl Usage {
 }
 
 impl Mapping {
+    /// A `fork`ed child keeps its registration for write protection
+    /// ([`Userfault::EVENT_FORK`]) and gets its page tables, unless
+    /// `MADV_DONTFORK` or `MADV_WIPEONFORK` leaves the child none.
+    fn keeps_protection_on_fork(&self) -> bool {
+        let wanted = Userfault::WP | Userfault::EVENT_FORK;
+        self.userfault.is_some_and(|u| u.modes & wanted == wanted)
+            && !self.dont_fork
+            && !self.wipe_on_fork
+    }
     /// Exclusive end address.
     #[must_use]
     pub const fn end(&self) -> u64 {
@@ -1750,6 +1774,9 @@ struct Tlb {
     /// Which entries are set, one bit each, so that emptying touches only
     /// those.
     used: [u64; TLB_ENTRIES / 64],
+    /// What compiled code reads of the entries ([`JitSlot`]), one slot for
+    /// each.
+    jit: Box<[JitSlot]>,
 }
 
 impl Default for Tlb {
@@ -1757,7 +1784,121 @@ impl Default for Tlb {
         Tlb {
             entries: std::iter::repeat_with(|| None).take(TLB_ENTRIES).collect(),
             used: [0; TLB_ENTRIES / 64],
+            jit: std::iter::repeat_with(JitSlot::default)
+                .take(TLB_ENTRIES)
+                .collect(),
         }
+    }
+}
+
+/// What compiled code reads of one [`TlbEntry`] to load or store a value
+/// that lies in one word of its page without calling into the MMU, as
+/// [`AddressSpace::read_value`] and [`AddressSpace::write_value`] would
+/// through the TLB. A slot holds only while `epoch` is the space's epoch,
+/// which compiled code compares on each access: it holds the entry of the
+/// same index of [`Tlb::entries`], which is emptied, and its slot with it,
+/// before that entry changes or goes.
+///
+/// `read` and `write` are the page an access may read or write this way,
+/// or [`NO_PAGE`]. Only an entry whose frame has its bytes, and that has
+/// no file to check ([`FileEnd`]), may be read: `words` is where the words
+/// of those bytes are, kept by the entry. One may be written only when
+/// [`AddressSpace::write_value`] would write it through the TLB: its
+/// protection, which is what [`Page::cached_access`] gives, so with no
+/// write while `UFFDIO_WRITEPROTECT` protects the page or its soft-dirty
+/// bit is clear, allows writing, it is no copy on write, and it shows no
+/// shared mapping. It must also not be executable, so that a store never
+/// changes code that was or may be fetched.
+///
+/// A store says it is under way in [`ThreadTlb::storing`], and reads the
+/// epoch again, as [`AddressSpace::write_value`] does.
+#[repr(C)]
+#[derive(Default)]
+pub struct JitSlot {
+    /// The epoch the slot was filled at, or 0, which no space has.
+    epoch: AtomicU64,
+    read: AtomicU64,
+    write: AtomicU64,
+    words: AtomicU64,
+}
+
+/// The page of an empty [`JitSlot`]: no page starts there.
+pub const NO_PAGE: u64 = 1;
+
+/// The slots of a thread whose TLB cannot be had: none holds.
+static NO_JIT_SLOTS: [JitSlot; TLB_ENTRIES] = [const {
+    JitSlot {
+        epoch: AtomicU64::new(0),
+        read: AtomicU64::new(NO_PAGE),
+        write: AtomicU64::new(NO_PAGE),
+        words: AtomicU64::new(0),
+    }
+}; TLB_ENTRIES];
+
+/// The [`JitAccess::storing`] of [`NO_JIT_SLOTS`], which no store reaches.
+static NO_STORING: AtomicU64 = AtomicU64::new(NOT_STORING);
+
+/// Where compiled code finds what it reads to load and store through a
+/// thread's [`JitSlot`]s ([`AddressSpace::jit_access`]), as addresses in
+/// this process. Each is valid while the space lives and the thread that
+/// asked for them runs, and only on that thread.
+#[derive(Clone, Copy, Debug)]
+pub struct JitAccess {
+    /// The first of [`JIT_SLOTS`] [`JitSlot`]s: the slot of a page is its
+    /// page number modulo [`JIT_SLOTS`].
+    pub slots: u64,
+    /// The thread's [`ThreadTlb::storing`], an `AtomicU64`.
+    pub storing: u64,
+    /// The space's epoch, layout, last watched layout and code
+    /// generation ([`CodeCounters`]), each an `AtomicU64`: an access is
+    /// under the code generation [`AddressSpace::code_generation_cached`]
+    /// gives when `watched` is one more than `layout`.
+    pub epoch: u64,
+    pub layout: u64,
+    pub watched: u64,
+    pub generation: u64,
+}
+
+/// How many [`JitSlot`]s a thread has.
+pub const JIT_SLOTS: u64 = TLB_ENTRIES as u64;
+
+/// Where the fields of a [`JitSlot`] are, in bytes, and its size.
+pub const JIT_SLOT_EPOCH: i32 = std::mem::offset_of!(JitSlot, epoch) as i32;
+pub const JIT_SLOT_READ: i32 = std::mem::offset_of!(JitSlot, read) as i32;
+pub const JIT_SLOT_WRITE: i32 = std::mem::offset_of!(JitSlot, write) as i32;
+pub const JIT_SLOT_WORDS: i32 = std::mem::offset_of!(JitSlot, words) as i32;
+pub const JIT_SLOT_BYTES: u64 = std::mem::size_of::<JitSlot>() as u64;
+
+fn address_of(atomic: &AtomicU64) -> u64 {
+    std::ptr::from_ref(atomic).addr() as u64
+}
+
+impl JitSlot {
+    fn clear(&self) {
+        self.epoch.store(0, Ordering::Relaxed);
+        self.read.store(NO_PAGE, Ordering::Relaxed);
+        self.write.store(NO_PAGE, Ordering::Relaxed);
+    }
+
+    /// Fills the slot from `entry` at `epoch`.
+    fn fill(&self, entry: &TlbEntry, epoch: u64) {
+        let (read, write, words) = match (&entry.frame, &entry.file) {
+            (TlbFrame::Bytes(data), None) => {
+                let read = entry.prot.allows_read().then_some(entry.page);
+                let write = (entry.prot.contains(Prot::WRITE)
+                    && !entry.prot.contains(Prot::EXEC)
+                    && !entry.cow
+                    && entry.shared.is_none())
+                .then_some(entry.page);
+                (read, write, data.words.as_ptr().addr() as u64)
+            }
+            _ => (None, None, 0),
+        };
+        self.words.store(words, Ordering::Relaxed);
+        self.read.store(read.unwrap_or(NO_PAGE), Ordering::Relaxed);
+        self.write
+            .store(write.unwrap_or(NO_PAGE), Ordering::Relaxed);
+        self.epoch.store(epoch, Ordering::Relaxed);
     }
 }
 
@@ -1777,6 +1918,7 @@ impl Tlb {
 
     fn insert(&mut self, entry: TlbEntry) {
         let slot = Self::slot(entry.page);
+        self.jit[slot].clear();
         self.entries[slot] = Some(entry);
         self.used[slot / 64] |= 1 << (slot % 64);
     }
@@ -1785,9 +1927,19 @@ impl Tlb {
         for (word, used) in self.used.iter_mut().enumerate() {
             while *used != 0 {
                 let slot = word * 64 + used.trailing_zeros() as usize;
+                self.jit[slot].clear();
                 self.entries[slot] = None;
                 *used &= *used - 1;
             }
+        }
+    }
+
+    /// Fills the [`JitSlot`] of `page` at `epoch`, which the entries are
+    /// valid at, when the TLB holds the page.
+    fn fill_jit(&self, page: u64, epoch: u64) {
+        let slot = Self::slot(page);
+        if let Some(entry) = self.entries[slot].as_ref().filter(|e| e.page == page) {
+            self.jit[slot].fill(entry, epoch);
         }
     }
 }
@@ -2815,8 +2967,26 @@ impl AddressSpaceData {
         // `anon_vma`, are copied with its page tables (`vma_needs_copy`);
         // shared memory's are copied only with `VM_MAYBE_GUARD`.
         copy.poisons = self.poisons.clone();
+        // A mapping whose `userfaultfd` the child keeps for write protection
+        // has its page tables copied (`VM_UFFD_WP` in `VM_COPY_ON_FORK`),
+        // with their uffd-wp bits and markers (`copy_pte_marker`); not one
+        // that `MADV_DONTFORK` or `MADV_WIPEONFORK` leaves the child empty.
+        let kept_protection: BTreeMap<u64, u64> = self
+            .mappings
+            .values()
+            .filter(|m| m.keeps_protection_on_fork())
+            .map(|m| (m.start.0, m.end()))
+            .collect();
+        for (&start, &end) in &kept_protection {
+            for (from, to) in self.uffd_markers.within(start, end) {
+                copy.uffd_markers.add(from, to);
+            }
+        }
         for m in self.mappings.values() {
-            if self.shared_at(m.start.0).is_some() && !m.maybe_guard {
+            if self.shared_at(m.start.0).is_some()
+                && !m.maybe_guard
+                && !m.keeps_protection_on_fork()
+            {
                 copy.poisons.clear(m.start.0, m.end());
             }
         }
@@ -2844,10 +3014,13 @@ impl AddressSpaceData {
                     // in either space; one without contents gets a frame of
                     // its own in the child, so that neither space's first
                     // write fills the other's.
-                    // The child's mapping is not registered: its entry is not
-                    // write-protected (`__copy_present_ptes`).
+                    // Its entry is write-protected only if the child's mapping
+                    // stays registered for it (`__copy_present_ptes`).
                     let mut child = page.share();
-                    child.uffd_wp = false;
+                    child.uffd_wp &= kept_protection
+                        .range(..=address)
+                        .next_back()
+                        .is_some_and(|(_, &end)| address < end);
                     if !is_shared && !page.cache {
                         if page.frame.get().is_some() {
                             page.cow = true;
@@ -2869,11 +3042,16 @@ impl AddressSpaceData {
             .unwrap_or_else(PoisonError::into_inner) = directory;
         copy.drop_refaultable_pages();
         // A child's VMAs are not locked (`dup_mmap` clears `VMA_LOCKED_MASK`).
-        // Nor registered with a `userfaultfd` (`dup_userfaultfd`, without
-        // `UFFD_FEATURE_EVENT_FORK`).
+        // Nor registered with a `userfaultfd` (`dup_userfaultfd`), unless it
+        // took `UFFD_FEATURE_EVENT_FORK`.
         for mapping in copy.mappings.values_mut() {
             mapping.locked = None;
-            mapping.userfault = None;
+            if !mapping
+                .userfault
+                .is_some_and(|u| u.modes & Userfault::EVENT_FORK != 0)
+            {
+                mapping.userfault = None;
+            }
         }
         // MADV_DONTFORK leaves the child a hole; MADV_WIPEONFORK leaves it
         // the mapping with no page and no `anon_vma`, as Linux's `dup_mmap`
@@ -2913,8 +3091,9 @@ impl AddressSpaceData {
 
     /// Drops the page entries of a forked child that Linux's `fork` does not
     /// copy (`vma_needs_copy`): those of a VMA with no `anon_vma`
-    /// ([`Mapping::written`]) and no guards (`VM_MAYBE_GUARD`), which a
-    /// fault fills again. Such an entry is one of shared memory, a page of
+    /// ([`Mapping::written`]), no guards (`VM_MAYBE_GUARD`) and no
+    /// registration for write protection the child keeps (`VM_UFFD_WP`),
+    /// which a fault fills again. Such an entry is one of shared memory, a page of
     /// the file's page cache, or one with no contents of private
     /// anonymous memory. An entry with contents of its own (an ELF
     /// segment's, which the loader wrote) stays, as nothing would give them
@@ -2929,7 +3108,7 @@ impl AddressSpaceData {
             let copies = self
                 .mappings
                 .range(first..last)
-                .any(|(_, m)| m.written || m.maybe_guard);
+                .any(|(_, m)| m.written || m.maybe_guard || m.keeps_protection_on_fork());
             if !copies {
                 regions.push((first, last, self.shared_at(first).is_some()));
             }
@@ -4086,9 +4265,13 @@ impl AddressSpaceData {
         // range even when `MREMAP_DONTUNMAP` keeps it.
         let guards = self.clear_guards(old, old + old_len);
         let poisons = self.poisons.clear(old, old + old_len);
-        // The uffd-wp markers go, as the moved VMA leaves its `userfaultfd`
-        // (`move_ptes` clears them).
-        self.uffd_markers.clear(old, old + old_len);
+        // The moved VMA keeps its `userfaultfd` only if it took
+        // `UFFD_FEATURE_EVENT_REMAP`; else its uffd-wp markers go, and its
+        // pages' protection (`move_ptes`).
+        let userfault = mapping
+            .userfault
+            .filter(|u| u.modes & Userfault::EVENT_REMAP != 0);
+        let markers = self.uffd_markers.clear(old, old + old_len);
         // MREMAP_DONTUNMAP leaves the old range unlocked (`VMA_LOCKED_MASK`).
         if keep_old {
             self.split_at(old);
@@ -4128,25 +4311,28 @@ impl AddressSpaceData {
             tell(self.actor.as_ref(), &moved, true);
             self.shared.insert(to, moved);
         }
-        // The moved VMA leaves its `userfaultfd` (`mremap_userfaultfd_prep`
-        // without `UFFD_FEATURE_EVENT_REMAP`).
         self.mappings.insert(
             to,
             Mapping {
                 start: GuestAddr(to),
                 length: new_len,
-                userfault: None,
+                userfault,
                 ..mapping
             },
         );
+        if userfault.is_some() {
+            for (start, end) in markers {
+                self.uffd_markers.add(start - old + to, end - old + to);
+            }
+        }
         let directory = self
             .directory
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner);
         for (page, mut entry) in pages {
-            // Nor its pages write-protected (`move_ptes`), which are
-            // soft-dirty (`move_soft_dirty_pte`).
-            entry.uffd_wp = false;
+            // Its pages are soft-dirty (`move_soft_dirty_pte`), and stay
+            // write-protected only with its `userfaultfd`.
+            entry.uffd_wp &= userfault.is_some();
             entry.soft_dirty = true;
             let (dir, slot) = page_index(page - old + to);
             directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
@@ -4827,6 +5013,33 @@ impl AddressSpaceData {
             self.userfault_mark(start, end, false, false);
             if let Some(m) = self.mappings.get_mut(&start) {
                 m.userfault = None;
+            }
+        }
+    }
+
+    /// The registered parts of `[start, end)`, in order, each with its
+    /// registration, as the events of a `userfaultfd` look for the VMAs of
+    /// a range that have a context (`vma->vm_userfaultfd_ctx`).
+    #[must_use]
+    pub fn userfault_registrations(&self, start: u64, end: u64) -> Vec<(u64, u64, Userfault)> {
+        self.mappings
+            .values()
+            .filter(|m| m.start.0 < end && m.end() > start)
+            .filter_map(|m| {
+                let userfault = m.userfault?;
+                Some((m.start.0.max(start), m.end().min(end), userfault))
+            })
+            .collect()
+    }
+
+    /// Moves the mappings the `userfaultfd` `from` registered to `to`, as
+    /// a `fork`ed child's VMAs take the context `dup_userfaultfd` made.
+    pub fn userfault_renumber(&mut self, from: u64, to: u64) {
+        for m in self.mappings.values_mut() {
+            if let Some(userfault) = &mut m.userfault
+                && userfault.context == from
+            {
+                userfault.context = to;
             }
         }
     }
@@ -6121,6 +6334,17 @@ impl MemoryView {
             data.spread_soft_dirty(0, USER_ADDRESS_LIMIT);
         });
     }
+    /// See [`AddressSpaceData::userfault_registrations`]; none once the
+    /// space is gone.
+    #[must_use]
+    pub fn userfault_registrations(&self, start: u64, end: u64) -> Vec<(u64, u64, Userfault)> {
+        self.with_data(|data| data.userfault_registrations(start, end))
+            .unwrap_or_default()
+    }
+    /// See [`AddressSpaceData::userfault_renumber`].
+    pub fn userfault_renumber(&self, from: u64, to: u64) {
+        self.with_data_mut(|data| data.userfault_renumber(from, to));
+    }
     /// Whether the space still lives, as Linux's `mmget_not_zero` asks.
     #[must_use]
     pub fn lives(&self) -> bool {
@@ -6282,6 +6506,8 @@ mod processes_tests;
 
 #[cfg(test)]
 mod jit_tests;
+#[cfg(test)]
+mod jit_tlb_tests;
 #[cfg(test)]
 mod threads_tests;
 #[cfg(test)]
@@ -6801,6 +7027,72 @@ impl AddressSpace {
     }
     pub fn write_u64(&self, addr: GuestAddr, value: u64) -> Result<(), Fault> {
         self.write_value(addr, 8, value)
+    }
+    /// Where compiled code running on this thread finds what it reads to
+    /// load and store through this thread's TLB ([`JitSlot`]).
+    #[must_use]
+    pub fn jit_access(&self) -> JitAccess {
+        let slots = THREAD_TLB.with(|cell| {
+            cell.try_borrow().ok().map(|thread| {
+                (
+                    thread.tlb.jit.as_ptr().addr() as u64,
+                    address_of(&thread.storing),
+                )
+            })
+        });
+        // A TLB that is in use cannot be had; nothing holds in these slots,
+        // so every access takes the calls below.
+        let (slots, storing) =
+            slots.unwrap_or_else(|| (NO_JIT_SLOTS.as_ptr().addr() as u64, address_of(&NO_STORING)));
+        JitAccess {
+            slots,
+            storing,
+            epoch: address_of(&self.code.epoch),
+            layout: address_of(&self.code.layout),
+            watched: address_of(&self.code.watched),
+            generation: address_of(&self.code.generation),
+        }
+    }
+    /// [`Self::read_value`] for compiled code, which then fills the page's
+    /// [`JitSlot`], so that the next access reads it there.
+    pub fn jit_read_value(&self, addr: GuestAddr, size: usize) -> Result<u64, Fault> {
+        let value = self.read_value(addr, size)?;
+        self.fill_jit(addr);
+        Ok(value)
+    }
+    /// [`Self::write_value`] for compiled code, which then fills the page's
+    /// [`JitSlot`] as [`Self::jit_read_value`] does.
+    pub fn jit_write_value(&self, addr: GuestAddr, size: usize, value: u64) -> Result<(), Fault> {
+        self.write_value(addr, size, value)?;
+        self.fill_jit(addr);
+        Ok(())
+    }
+    /// Fills the [`JitSlot`] of the page of `addr` when this thread's TLB
+    /// holds this space's entry of it.
+    fn fill_jit(&self, addr: GuestAddr) {
+        let epoch = self.code.epoch.load(Ordering::Acquire);
+        let page = addr.0 & !(PAGE_SIZE - 1);
+        THREAD_TLB.with(|cell| {
+            if let Ok(thread) = cell.try_borrow()
+                && thread.epoch == epoch
+            {
+                thread.tlb.fill_jit(page, epoch);
+            }
+        });
+    }
+    /// The epoch and the pages that the [`JitSlot`] of `page` holds for
+    /// reads and writes, for tests.
+    #[cfg(test)]
+    fn jit_slot(&self, page: u64) -> (bool, u64, u64) {
+        THREAD_TLB.with(|cell| {
+            let thread = cell.borrow();
+            let slot = &thread.tlb.jit[Tlb::slot(page)];
+            (
+                slot.epoch.load(Ordering::Relaxed) == self.code.epoch.load(Ordering::Relaxed),
+                slot.read.load(Ordering::Relaxed),
+                slot.write.load(Ordering::Relaxed),
+            )
+        })
     }
     /// The little-endian value of `size` bytes, of which 8 are the most it
     /// takes, as [`Self::read`] gives them, with one atomic access where they

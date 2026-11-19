@@ -847,7 +847,7 @@ fn answer_one(c: &mut Context<'_>, group: &Weak<Group>, event: Event) -> Result<
 /// Whether the task is to die (`fatal_signal_pending`): its group exits, or
 /// a signal it does not block or ignore ends it, SIGKILL or one whose
 /// default action is to end the process.
-fn fatal(c: &Context<'_>) -> bool {
+pub(crate) fn fatal(c: &Context<'_>) -> bool {
     if c.group.status().is_some() {
         return true;
     }

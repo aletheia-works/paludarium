@@ -1639,3 +1639,122 @@ fn the_vmas_of_a_file_that_never_merges_open_and_close_as_linux_s_do() {
     drop(m);
     assert_eq!(told(), [(false, 1); 4]);
 }
+
+#[test]
+fn a_child_and_a_moved_mapping_keep_the_registrations_whose_events_they_give() {
+    const WP: u64 = 1 << 57;
+    let mut m = AddressSpace::new();
+    let a = m
+        .map(
+            Some(GuestAddr(0x80000)),
+            4 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap();
+    let view = m.view();
+    let modes = Userfault::WP | Userfault::WP_UNPOPULATED;
+    // The first two pages for a context with fork's event, the next for one
+    // without; the first page has an entry, the second a marker.
+    view.userfault_register(a.0, a.0 + 2 * PAGE_SIZE, 7, modes | Userfault::EVENT_FORK)
+        .unwrap();
+    view.userfault_register(a.0 + 2 * PAGE_SIZE, a.0 + 3 * PAGE_SIZE, 8, modes)
+        .unwrap();
+    m.write(a, b"a").unwrap();
+    m.write(GuestAddr(a.0 + 2 * PAGE_SIZE), b"b").unwrap();
+    view.userfault_write_protect(a.0, a.0 + 3 * PAGE_SIZE, true)
+        .unwrap();
+    assert_eq!(
+        view.userfault_registrations(a.0 + PAGE_SIZE, a.0 + 4 * PAGE_SIZE)
+            .iter()
+            .map(|&(s, e, u)| (s - a.0, e - a.0, u.context))
+            .collect::<Vec<_>>(),
+        [
+            (PAGE_SIZE, 2 * PAGE_SIZE, 7),
+            (2 * PAGE_SIZE, 3 * PAGE_SIZE, 8)
+        ]
+    );
+    let child = m.fork();
+    let in_child = child.view();
+    let registered = |space: &AddressSpace, addr: GuestAddr| {
+        space
+            .mappings()
+            .find(|m| m.start.0 <= addr.0 && addr.0 < m.end())
+            .and_then(|m| m.userfault)
+            .map(|u| u.context)
+    };
+    // The child keeps the one registration, its entry's protection and the
+    // marker; the other's go.
+    let flags = |space: &MemoryView| -> Vec<bool> {
+        space
+            .pagemap(a.0, 3)
+            .unwrap()
+            .iter()
+            .map(|e| e & WP != 0)
+            .collect()
+    };
+    assert_eq!(flags(&in_child), [true, true, false]);
+    assert_eq!(flags(&view), [true, true, true]);
+    assert_eq!(registered(&child, a), Some(7));
+    assert_eq!(registered(&child, GuestAddr(a.0 + 2 * PAGE_SIZE)), None);
+    assert_eq!(
+        child.userfault_for(a, true, false),
+        Some((7, UserfaultReason::Protected))
+    );
+    child.write(GuestAddr(a.0 + 2 * PAGE_SIZE), b"c").unwrap();
+    // The kernel moves it to the child's own context.
+    in_child.userfault_renumber(7, 9);
+    assert_eq!(
+        child.userfault_for(a, true, false),
+        Some((9, UserfaultReason::Protected))
+    );
+    assert_eq!(registered(&m, a), Some(7));
+    // A move keeps a registration with the remap event, with its pages'
+    // protection and markers; one without leaves its context.
+    let moved = m
+        .remap_shared(
+            a,
+            2 * PAGE_SIZE,
+            2 * PAGE_SIZE,
+            Remap {
+                may_move: true,
+                fixed: true,
+                keep_old: false,
+                new_addr: GuestAddr(0xa0000),
+            },
+        )
+        .unwrap();
+    assert_eq!(registered(&m, moved), None);
+    let pagemap = view.pagemap(moved.0, 2).unwrap();
+    assert!(pagemap.iter().all(|e| e & WP == 0));
+    view.userfault_register(
+        moved.0,
+        moved.0 + 2 * PAGE_SIZE,
+        7,
+        modes | Userfault::EVENT_REMAP,
+    )
+    .unwrap();
+    m.write(moved, b"d").unwrap();
+    view.userfault_write_protect(moved.0, moved.0 + 2 * PAGE_SIZE, true)
+        .unwrap();
+    let back = m
+        .remap_shared(
+            moved,
+            2 * PAGE_SIZE,
+            2 * PAGE_SIZE,
+            Remap {
+                may_move: true,
+                fixed: true,
+                keep_old: false,
+                new_addr: a,
+            },
+        )
+        .unwrap();
+    assert_eq!(back, a);
+    assert_eq!(registered(&m, a), Some(7));
+    assert_eq!(flags(&view)[..2], [true, true]);
+    assert_eq!(
+        m.userfault_for(a, true, false),
+        Some((7, UserfaultReason::Protected))
+    );
+}

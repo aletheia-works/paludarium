@@ -329,7 +329,13 @@ a stop before an instruction must be one the interpreter faults on. On every
 pull request the differential tests also run with every block compiled the
 first time it runs (`PALUDARIUM_TEST_JIT=1`, the `differential-jit` job), and
 the `jit_native` fuzz target compares compiled code with the interpreter for
-arbitrary instruction bytes.
+arbitrary instruction bytes. Half of the unit tests' runs start with the slots
+of the thread's TLB filled, so that compiled code loads and stores through
+them, and the MMU's tests check which pages a slot lets it read and write
+after `mprotect`, `fork`, `clear_refs` and `UFFDIO_WRITEPROTECT`. Stores
+through a slot that a load just filled again after `mprotect` and
+`UFFDIO_WRITEPROTECT` must fault, and one after `clear_refs` must set the
+soft-dirty bit again.
 
 ### How speed is measured
 

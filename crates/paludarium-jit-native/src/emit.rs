@@ -1,6 +1,8 @@
 //! Cranelift IR of a block's forms. Safe code only: the function it builds
 //! reads and writes the registers through the pointer it is given, and
-//! reaches guest memory only through the helpers of [`crate::exec`].
+//! reaches guest memory through the helpers of [`crate::exec`], or, for a
+//! value in one word of a page that the thread's TLB holds, through the
+//! slot of the page ([`paludarium_mmu::JitSlot`]).
 //!
 //! Each form means what `paludarium_cpu`'s interpreter does with it
 //! (`exec/fast.rs`). A form that can fail changes no register before the
@@ -9,14 +11,21 @@
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlagsData, Signature, Type, UserFuncName, Value, types,
+    AbiParam, AtomicRmwOp, Function, InstBuilder, MemFlagsData, Signature, Type, UserFuncName,
+    Value, types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use paludarium_cpu::compile::{Address, Alu, Fast, Form, Shift, Source, Unary};
 use paludarium_cpu::{CpuState, flag};
 use paludarium_decoder::{Condition, Mnemonic, Register, Segment};
+use paludarium_mmu::{
+    JIT_SLOT_BYTES, JIT_SLOT_EPOCH, JIT_SLOT_READ, JIT_SLOT_WORDS, JIT_SLOT_WRITE, JIT_SLOTS,
+};
+use paludarium_types::PAGE_SIZE;
 use std::mem::offset_of;
+
+use crate::exec::Context;
 
 /// Words of the [`CpuState`] the code runs on, in place: the general
 /// registers, then RFLAGS, RIP, the FS and GS bases (read only), and the
@@ -63,9 +72,23 @@ pub(crate) struct Helpers {
     /// `(context, address, size, kind, a, b) -> (old, status)`: a locked
     /// exchange (`kind` 0) or compare and exchange.
     pub atomic: u64,
+    /// `(context) -> status`: of an access the code made itself.
+    pub status: u64,
+}
+
+/// Where a field of the [`Context`] is, in bytes.
+macro_rules! context {
+    ($field:ident) => {
+        offset_of!(Context<'static>, $field) as i32
+    };
 }
 
 const I64: Type = types::I64;
+
+/// The flags of a load or store of a guest page's bytes through a slot: it
+/// cannot trap, as the slot allows it, but it is aligned only to its word,
+/// not to its own size.
+const GUEST_BYTES: MemFlagsData = MemFlagsData::new().with_notrap();
 
 fn mask(size: u8) -> i64 {
     paludarium_cpu::size_mask(size) as i64
@@ -90,6 +113,15 @@ struct Emitter<'a, 'b> {
     store_sig: cranelift_codegen::ir::SigRef,
     move128_sig: cranelift_codegen::ir::SigRef,
     atomic_sig: cranelift_codegen::ir::SigRef,
+    status_sig: cranelift_codegen::ir::SigRef,
+    /// The addresses [`Context`] gives, loaded once.
+    slots: Value,
+    storing: Value,
+    epoch: Value,
+    layout: Value,
+    watched: Value,
+    generation_at: Value,
+    generation: Value,
 }
 
 impl Emitter<'_, '_> {
@@ -276,27 +308,177 @@ impl Emitter<'_, '_> {
         }
     }
 
+    /// The slot of the page of `address` ([`paludarium_mmu::JitSlot`]) and
+    /// whether an access of `size` bytes there may go through it: the slot
+    /// holds, at the space's epoch, the page in its `tag` field, and the
+    /// bytes lie in one aligned word.
+    fn through_slot(&mut self, address: Value, size: u8, tag: i32) -> (Value, Value, Value) {
+        let flags = MemFlagsData::trusted();
+        let number = self
+            .b
+            .ins()
+            .ushr_imm_u(address, i64::from(PAGE_SIZE.trailing_zeros()));
+        let index = self.b.ins().band_imm_u(number, (JIT_SLOTS - 1) as i64);
+        let offset = self.b.ins().imul_imm_u(index, JIT_SLOT_BYTES as i64);
+        let slot = self.b.ins().iadd(self.slots, offset);
+        let page = self.b.ins().band_imm_s(address, !(PAGE_SIZE as i64 - 1));
+        let held = self.b.ins().load(I64, flags, slot, tag);
+        let same_page = self.b.ins().icmp(IntCC::Equal, held, page);
+        let within = self.b.ins().band_imm_u(address, 7);
+        let one_word =
+            self.b
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, within, 8 - i64::from(size));
+        let filled = self.b.ins().load(I64, flags, slot, JIT_SLOT_EPOCH);
+        let epoch = self.b.ins().load(I64, flags, self.epoch, 0);
+        let current = self.b.ins().icmp(IntCC::Equal, filled, epoch);
+        let ok = self.b.ins().band(same_page, one_word);
+        let ok = self.b.ins().band(ok, current);
+        (slot, epoch, ok)
+    }
+
+    /// Where the bytes at `address` are in the frame the slot shows.
+    fn host_address(&mut self, slot: Value, address: Value) -> Value {
+        let words = self
+            .b
+            .ins()
+            .load(I64, MemFlagsData::trusted(), slot, JIT_SLOT_WORDS);
+        let offset = self.b.ins().band_imm_u(address, PAGE_SIZE as i64 - 1);
+        self.b.ins().iadd(words, offset)
+    }
+
+    /// The status of an access the code made itself, as the helpers give
+    /// it: whether the code generation is still the one the block was
+    /// entered under, read as [`paludarium_mmu::AddressSpace::code_generation_cached`]
+    /// does, which needs the locks, and so the call, unless the space's
+    /// watched layout is one more than its layout.
+    fn own_status(&mut self) -> Value {
+        let flags = MemFlagsData::trusted();
+        let layout = self.b.ins().atomic_load(I64, flags, self.layout);
+        let watched = self.b.ins().atomic_load(I64, flags, self.watched);
+        let expected = self.b.ins().iadd_imm_u(layout, 1);
+        let readable = self.b.ins().icmp(IntCC::Equal, watched, expected);
+        let quick = self.b.create_block();
+        let call = self.b.create_block();
+        let done = self.b.create_block();
+        let status = self.b.append_block_param(done, I64);
+        self.b.ins().brif(readable, quick, &[], call, &[]);
+        self.b.switch_to_block(quick);
+        let generation = self.b.ins().atomic_load(I64, flags, self.generation_at);
+        let same = self.b.ins().icmp(IntCC::Equal, generation, self.generation);
+        let ok = self.constant(DONE);
+        let changed = self.constant(CODE_CHANGED);
+        let quick_status = self.b.ins().select(same, ok, changed);
+        self.b.ins().jump(done, &[quick_status.into()]);
+        self.b.switch_to_block(call);
+        let callee = self.constant(self.helpers.status as i64);
+        let called = self
+            .b
+            .ins()
+            .call_indirect(self.status_sig, callee, &[self.context]);
+        let called = self.b.inst_results(called)[0];
+        self.b.ins().jump(done, &[called.into()]);
+        self.b.switch_to_block(done);
+        status
+    }
+
     /// Loads `size` bytes at `address`: the value and the status.
     fn load(&mut self, address: Value, size: u8) -> (Value, Value) {
-        let size = self.constant(i64::from(size.min(8)));
+        let size = size.min(8);
+        let (slot, _, ok) = self.through_slot(address, size, JIT_SLOT_READ);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        let value = self.b.append_block_param(done, I64);
+        let status = self.b.append_block_param(done, I64);
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
+
+        self.b.switch_to_block(fast);
+        let at = self.host_address(slot, address);
+        let flags = GUEST_BYTES;
+        let loaded = match size {
+            1 => self.b.ins().uload8(I64, flags, at, 0),
+            2 => self.b.ins().uload16(I64, flags, at, 0),
+            4 => self.b.ins().uload32(flags, at, 0),
+            _ => self.b.ins().load(I64, flags, at, 0),
+        };
+        let fast_status = self.own_status();
+        self.b
+            .ins()
+            .jump(done, &[loaded.into(), fast_status.into()]);
+
+        self.b.switch_to_block(slow);
+        let size = self.constant(i64::from(size));
         let callee = self.constant(self.helpers.load as i64);
         let call =
             self.b
                 .ins()
                 .call_indirect(self.load_sig, callee, &[self.context, address, size]);
-        let results = self.b.inst_results(call);
-        (results[0], results[1])
+        let results = self.b.inst_results(call).to_vec();
+        self.b
+            .ins()
+            .jump(done, &[results[0].into(), results[1].into()]);
+        self.b.switch_to_block(done);
+        (value, status)
     }
 
+    /// Stores the low `size` bytes of `value` at `address`: the status.
     fn store(&mut self, address: Value, size: u8, value: Value) -> Value {
-        let size = self.constant(i64::from(size.min(8)));
+        let size = size.min(8);
+        let (slot, epoch, ok) = self.through_slot(address, size, JIT_SLOT_WRITE);
+        let under_way = self.b.create_block();
+        let fast = self.b.create_block();
+        let undo = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        let status = self.b.append_block_param(done, I64);
+        self.b.ins().brif(ok, under_way, &[], slow, &[]);
+
+        // As the MMU's stores through the TLB: say the store is under way
+        // at the epoch, sequentially consistent, then read the epoch again,
+        // so that a change that moved it on either shows here or waits for
+        // the store to end.
+        self.b.switch_to_block(under_way);
+        let flags = MemFlagsData::trusted();
+        self.b
+            .ins()
+            .atomic_rmw(I64, flags, AtomicRmwOp::Xchg, self.storing, epoch);
+        let again = self.b.ins().atomic_load(I64, flags, self.epoch);
+        let same = self.b.ins().icmp(IntCC::Equal, again, epoch);
+        self.b.ins().brif(same, fast, &[], undo, &[]);
+
+        self.b.switch_to_block(fast);
+        let at = self.host_address(slot, address);
+        match size {
+            1 => self.b.ins().istore8(GUEST_BYTES, value, at, 0),
+            2 => self.b.ins().istore16(GUEST_BYTES, value, at, 0),
+            4 => self.b.ins().istore32(GUEST_BYTES, value, at, 0),
+            _ => self.b.ins().store(GUEST_BYTES, value, at, 0),
+        };
+        // A plain store on x86-64 releases: a change that sees the store
+        // ended sees its bytes.
+        let none = self.constant(0);
+        self.b.ins().store(flags, none, self.storing, 0);
+        let fast_status = self.own_status();
+        self.b.ins().jump(done, &[fast_status.into()]);
+
+        self.b.switch_to_block(undo);
+        let none = self.constant(0);
+        self.b.ins().store(flags, none, self.storing, 0);
+        self.b.ins().jump(slow, &[]);
+
+        self.b.switch_to_block(slow);
+        let size = self.constant(i64::from(size));
         let callee = self.constant(self.helpers.store as i64);
         let call = self.b.ins().call_indirect(
             self.store_sig,
             callee,
             &[self.context, address, size, value],
         );
-        self.b.inst_results(call)[0]
+        let called = self.b.inst_results(call)[0];
+        self.b.ins().jump(done, &[called.into()]);
+        self.b.switch_to_block(done);
+        status
     }
 
     /// The locked access of `kind` (0: exchange with `a`; 1: compare with
@@ -1447,6 +1629,10 @@ pub(crate) fn function(
     atomic_sig.params.extend([AbiParam::new(I64); 6]);
     atomic_sig.returns.extend([AbiParam::new(I64); 2]);
     let atomic_sig = b.import_signature(atomic_sig);
+    let mut status_sig = Signature::new(CallConv::SystemV);
+    status_sig.params.push(AbiParam::new(I64));
+    status_sig.returns.push(AbiParam::new(I64));
+    let status_sig = b.import_signature(status_sig);
 
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
@@ -1456,6 +1642,14 @@ pub(crate) fn function(
     let flags = MemFlagsData::trusted();
     let fs_base = b.ins().load(I64, flags, registers, offset(FS_BASE));
     let gs_base = b.ins().load(I64, flags, registers, offset(GS_BASE));
+    let mut field = |at: i32| b.ins().load(I64, flags, context_value, at);
+    let slots = field(context!(slots));
+    let storing = field(context!(storing));
+    let epoch = field(context!(epoch));
+    let layout = field(context!(layout));
+    let watched = field(context!(watched));
+    let generation_at = field(context!(generation_at));
+    let generation = field(context!(generation));
     let exit = b.create_block();
     let count = b.append_block_param(exit, I64);
     let rip = b.append_block_param(exit, I64);
@@ -1472,6 +1666,14 @@ pub(crate) fn function(
         store_sig,
         move128_sig,
         atomic_sig,
+        status_sig,
+        slots,
+        storing,
+        epoch,
+        layout,
+        watched,
+        generation_at,
+        generation,
     };
     let mut open = true;
     for (n, form) in forms.iter().enumerate() {

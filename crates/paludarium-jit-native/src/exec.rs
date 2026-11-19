@@ -9,17 +9,48 @@
 use std::ptr::NonNull;
 
 use paludarium_cpu::CpuState;
-use paludarium_mmu::{AddressSpace, AtomicOp, AtomicWidth};
+use paludarium_mmu::{AddressSpace, AtomicOp, AtomicWidth, JitAccess};
 use paludarium_types::GuestAddr;
 
 use crate::emit::{CODE_CHANGED, DONE, FAILED, Helpers};
 
-/// What compiled code reaches guest memory through: the address space and
-/// the code generation the block was entered under.
+/// What compiled code reaches guest memory through: the address space,
+/// the code generation the block was entered under, and where it finds the
+/// thread's [`paludarium_mmu::JitSlot`]s and the space's counters, which it
+/// loads and stores through without a call ([`JitAccess`]).
 #[repr(C)]
 pub(crate) struct Context<'a> {
     pub mem: &'a AddressSpace,
     pub generation: u64,
+    pub slots: u64,
+    pub storing: u64,
+    pub epoch: u64,
+    pub layout: u64,
+    pub watched: u64,
+    pub generation_at: u64,
+}
+
+impl<'a> Context<'a> {
+    pub(crate) fn new(mem: &'a AddressSpace, generation: u64) -> Self {
+        let JitAccess {
+            slots,
+            storing,
+            epoch,
+            layout,
+            watched,
+            generation: generation_at,
+        } = mem.jit_access();
+        Context {
+            mem,
+            generation,
+            slots,
+            storing,
+            epoch,
+            layout,
+            watched,
+            generation_at,
+        }
+    }
 }
 
 /// The value and status a load returns, in RAX and RDX.
@@ -44,7 +75,7 @@ extern "sysv64" fn load(context: *const Context<'_>, address: u64, size: u64) ->
     let context = unsafe { &*context };
     match context
         .mem
-        .read_value(GuestAddr(address), usize::try_from(size).unwrap_or(8))
+        .jit_read_value(GuestAddr(address), usize::try_from(size).unwrap_or(8))
     {
         Ok(value) => Loaded {
             value,
@@ -60,7 +91,7 @@ extern "sysv64" fn load(context: *const Context<'_>, address: u64, size: u64) ->
 extern "sysv64" fn store(context: *const Context<'_>, address: u64, size: u64, value: u64) -> i64 {
     // SAFETY: as in `load`.
     let context = unsafe { &*context };
-    match context.mem.write_value(
+    match context.mem.jit_write_value(
         GuestAddr(address),
         usize::try_from(size).unwrap_or(8),
         value,
@@ -96,6 +127,13 @@ extern "sysv64" fn store128(context: *const Context<'_>, address: u64, from: *co
         Ok(()) => done(context),
         Err(_) => FAILED,
     }
+}
+
+/// The status of an access that compiled code made itself, when the
+/// space's code generation is not one it can read ([`JitAccess`]).
+extern "sysv64" fn status(context: *const Context<'_>) -> i64 {
+    // SAFETY: as in `load`.
+    done(unsafe { &*context })
 }
 
 /// A locked instruction's memory access: an exchange with `a` when `kind`
@@ -144,12 +182,14 @@ pub(crate) fn helpers() -> Helpers {
     type Load128 = extern "sysv64" fn(*const Context<'static>, u64, *mut u64) -> i64;
     type Atomic = extern "sysv64" fn(*const Context<'static>, u64, u64, u64, u64, u64) -> Loaded;
     type Store128 = extern "sysv64" fn(*const Context<'static>, u64, *const u64) -> i64;
+    type Status = extern "sysv64" fn(*const Context<'static>) -> i64;
     Helpers {
         load: load as Load as usize as u64,
         store: store as Store as usize as u64,
         load128: load128 as Load128 as usize as u64,
         store128: store128 as Store128 as usize as u64,
         atomic: atomic as Atomic as usize as u64,
+        status: status as Status as usize as u64,
     }
 }
 
@@ -210,7 +250,16 @@ impl Code {
         // reads and writes only the `u64` and `u128` fields of `state` that
         // `emit::offset` places (the general and xmm registers, RFLAGS, RIP,
         // and the FS and GS bases, read only), and calls only the helpers
-        // above with `context`.
+        // above with `context`. It also reads the counters of `context.mem`
+        // and the thread's slots that `context` has the addresses of
+        // ([`JitAccess`], valid on this thread while `mem` lives), and
+        // loads and stores the bytes of a guest page where a slot shows
+        // them, only while the slot holds and only as
+        // [`AddressSpace::read_value`] and [`AddressSpace::write_value`]
+        // would, each access within one aligned word, which the slot's
+        // entry keeps alive until the slot is emptied, on this thread
+        // only, by a helper. A store says it is under way at
+        // `context.storing` first, as the MMU's own stores do.
         let entry: Entry = unsafe { std::mem::transmute(self.start.as_ptr()) };
         entry(state, context)
     }

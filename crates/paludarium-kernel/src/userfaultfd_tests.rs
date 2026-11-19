@@ -30,6 +30,10 @@ const EXACT_ADDRESS: u64 = 1 << 11;
 const FEATURE_POISON: u64 = 1 << 14;
 const WP_UNPOPULATED: u64 = 1 << 13;
 const WP_ASYNC: u64 = 1 << 15;
+const EVENT_FORK: u64 = 1 << 1;
+const EVENT_REMAP: u64 = 1 << 2;
+const EVENT_REMOVE: u64 = 1 << 3;
+const EVENT_UNMAP: u64 = 1 << 6;
 
 struct Fixture {
     kernel: Kernel,
@@ -186,7 +190,7 @@ fn uffdio_api_takes_the_features_once() {
     assert_eq!(f.ret(16, &[fd, API, 0]), errno(Errno::EFAULT));
     let (ret, out) = f.ioctl(fd, API, &[0xaa, SIGBUS | THREAD_ID, 0]);
     assert_eq!(ret, 0);
-    assert_eq!(out, vec![0xaa, 0x1_ffb1, 1 << 63 | 3]);
+    assert_eq!(out, vec![0xaa, 0x1_ffff, 1 << 63 | 3]);
     assert_eq!(
         f.ioctl(fd, API, &[0xaa, 0, 0]),
         (errno(Errno::EINVAL), vec![0, 0, 0])
@@ -828,4 +832,169 @@ fn wp_async_clears_the_protection_a_write_meets() {
     assert_eq!(bytes, *b"c");
     // The missing mode with it takes private anonymous memory as before.
     assert_eq!(f.ioctl(fd, REGISTER, &[AREA, 2 * PAGE, 3, 0]).0, 0);
+}
+
+/// The event, first word and second word of a message.
+fn event_of(message: &[u8; 32]) -> (u8, u64, u64, u64) {
+    let word = |at: usize| u64::from_le_bytes(message[at..at + 8].try_into().unwrap());
+    (message[0], word(8), word(16), word(24))
+}
+
+#[test]
+fn an_event_is_read_after_the_faults_and_holds_the_changes_back() {
+    use crate::userfaultfd::tests::{changing, queue, queue_events, unmap_events};
+    let mut f = fixture();
+    let fd = f.ready(NONBLOCK, EVENT_UNMAP | EVENT_REMOVE | EVENT_REMAP);
+    assert!(f.fdinfo(fd).contains("API:\taa:8000004c:"));
+    // Two ranges of one context make one event of the whole unmap.
+    assert_eq!(f.register(fd, AREA, PAGE), 0);
+    assert_eq!(f.register(fd, AREA + 2 * PAGE, PAGE), 0);
+    let context = crate::userfaultfd::find(f.userfault(AREA).unwrap().context).unwrap();
+    let (events, messages) = unmap_events(&f.mem.view(), AREA, AREA + 4 * PAGE);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(event_of(&messages[0]), (0x16, AREA, AREA + 4 * PAGE, 0));
+    assert!(changing(&context));
+    // Dropped undelivered, as when the unmap fails, it counts no more.
+    drop(events);
+    assert!(!changing(&context));
+    let (events, _) = unmap_events(&f.mem.view(), AREA, AREA + PAGE);
+    let queued = queue_events(events);
+    queue(&context, AREA + PAGE, 0, 0);
+    assert_ne!(readiness(&f, fd) & 1, 0);
+    // Until it is read, the fills, moves and changes of protection are
+    // EAGAIN, which the fills and moves write to their last field.
+    let again = errno(Errno::EAGAIN);
+    let (ret, out) = f.ioctl(fd, COPY, &[AREA, SRC, PAGE, 0, 0]);
+    assert_eq!((ret, out[4]), (again, again));
+    for cmd in [ZEROPAGE, POISON, CONTINUE] {
+        let (ret, out) = f.ioctl(fd, cmd, &[AREA, PAGE, 0, 0]);
+        assert_eq!((ret, out[3]), (again, again), "{cmd:#x}");
+    }
+    let (ret, out) = f.ioctl(fd, MOVE, &[AREA, SRC, PAGE, 0, 0]);
+    assert_eq!((ret, out[4]), (again, again));
+    assert_eq!(f.ioctl(fd, WRITEPROTECT, &[AREA, PAGE, 0]).0, again);
+    // A read takes the fault first, then the event, whose thread goes on.
+    assert_eq!(f.ret(0, &[fd, ARG, 64]), 64);
+    let mut bytes = [0u8; 64];
+    f.mem.read(GuestAddr(ARG), &mut bytes).unwrap();
+    let (first, second) = bytes.split_at(32);
+    assert_eq!(event_of(first.try_into().unwrap()).0, 0x12);
+    assert_eq!(
+        event_of(second.try_into().unwrap()),
+        (0x16, AREA, AREA + PAGE, 0)
+    );
+    assert!(queued[0].read());
+    assert_eq!(readiness(&f, fd) & 1, 0);
+    for queued in queued {
+        queued.finish();
+    }
+    let (ret, out) = f.ioctl(fd, COPY, &[AREA, SRC, PAGE, 0, 0]);
+    assert_eq!((ret, out[4]), (0, PAGE));
+    // A context without the feature is told nothing.
+    let other = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(other, AREA + 4 * PAGE, PAGE), 0);
+    let (_, messages) = unmap_events(&f.mem.view(), AREA + 4 * PAGE, AREA + 5 * PAGE);
+    assert!(messages.is_empty());
+}
+
+#[test]
+fn the_changes_wait_until_their_events_are_read() {
+    use crate::userfaultfd::tests::{changing, reader};
+    let mut f = fixture();
+    let fd = f.ready(NONBLOCK, EVENT_UNMAP | EVENT_REMOVE | EVENT_REMAP);
+    assert_eq!(f.register(fd, AREA, 4 * PAGE), 0);
+    let id = f.userfault(AREA).unwrap().context;
+    let context = crate::userfaultfd::find(id).unwrap();
+    // A move keeps the registration, and tells of the move, then of the
+    // range it left.
+    const TO: u64 = 0x60_0000;
+    let handler = reader(Arc::clone(&context), 2);
+    assert_eq!(f.ret(25, &[AREA, 2 * PAGE, 2 * PAGE, 3, TO]), TO);
+    let messages = handler.join().unwrap();
+    assert_eq!(event_of(&messages[0]), (0x14, AREA, TO, 2 * PAGE));
+    assert_eq!(event_of(&messages[1]), (0x16, AREA, AREA + 2 * PAGE, 0));
+    assert_eq!(f.userfault(TO).map(|u| u.context), Some(id));
+    assert!(!changing(&context));
+    // A discard tells of the range before it drops the pages.
+    let handler = reader(Arc::clone(&context), 1);
+    assert_eq!(f.ret(28, &[TO, 2 * PAGE, 4]), 0);
+    assert_eq!(
+        event_of(&handler.join().unwrap()[0]),
+        (0x15, TO, TO + 2 * PAGE, 0)
+    );
+    // A fixed mapping over it unmaps it.
+    let handler = reader(Arc::clone(&context), 1);
+    assert_eq!(f.ret(9, &[TO, PAGE, 3, 0x32, u64::MAX, 0]), TO);
+    assert_eq!(
+        event_of(&handler.join().unwrap()[0]),
+        (0x16, TO, TO + PAGE, 0)
+    );
+    // So does munmap, of the whole range it was given.
+    let handler = reader(Arc::clone(&context), 1);
+    assert_eq!(f.ret(11, &[AREA + PAGE, 4 * PAGE]), 0);
+    assert_eq!(
+        event_of(&handler.join().unwrap()[0]),
+        (0x16, AREA + PAGE, AREA + 5 * PAGE, 0)
+    );
+    assert!(!changing(&context));
+}
+
+#[test]
+fn a_fork_hands_the_child_a_context_of_its_own() {
+    use crate::userfaultfd::tests::{children, queue_events, reader};
+    let mut f = fixture();
+    let fd = f.ready(NONBLOCK, EVENT_FORK);
+    let other = f.ready(NONBLOCK, 0);
+    assert_eq!(f.register(fd, AREA, 2 * PAGE), 0);
+    assert_eq!(f.register(other, AREA + 4 * PAGE, PAGE), 0);
+    let id = f.userfault(AREA).unwrap().context;
+    let context = crate::userfaultfd::find(id).unwrap();
+    // fork waits for the event, whose new context the child's
+    // registrations moved to; the other context's go.
+    let handler = reader(Arc::clone(&context), 1);
+    let pid = f.ret(57, &[]);
+    assert!((pid as i64) > 0, "{pid:#x}");
+    let message = handler.join().unwrap()[0];
+    let (event, new, _, _) = event_of(&message);
+    assert_eq!(event, 0x13);
+    assert_ne!(new, id);
+    let child = f.kernel.pending_child.take().unwrap().0;
+    let memory = child.spawn_memory.clone().unwrap();
+    let registered = |addr: u64| {
+        memory
+            .mappings()
+            .find(|m| m.start.0 <= addr && addr < m.end())
+            .and_then(|m| m.userfault)
+            .map(|u| u.context)
+    };
+    assert_eq!(registered(AREA), Some(new));
+    assert_eq!(registered(AREA + 4 * PAGE), None);
+    assert_eq!(f.userfault(AREA).map(|u| u.context), Some(id));
+    // A read hands the child's context over as a file of its own, with the
+    // features of the old, whose close takes the child's mappings out.
+    let copy = f.mem.fork();
+    let mut events = crate::userfaultfd::Events::default();
+    crate::userfaultfd::fork(&copy.view(), &mut events);
+    let made = children(&events);
+    assert_eq!(made.len(), 1);
+    let queued = queue_events(events);
+    assert_eq!(f.ret(0, &[fd, ARG, 32]), 32);
+    let mut bytes = [0u8; 32];
+    f.mem.read(GuestAddr(ARG), &mut bytes).unwrap();
+    assert_eq!(bytes[0], 0x13);
+    let handed = u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
+    assert!(queued[0].read());
+    assert!(f.fdinfo(handed).contains("API:\taa:80000002:"));
+    let in_copy = |addr: u64| {
+        copy.mappings()
+            .find(|m| m.start.0 <= addr && addr < m.end())
+            .and_then(|m| m.userfault)
+            .map(|u| u.context)
+    };
+    assert_eq!(in_copy(AREA), Some(made[0]));
+    assert_eq!(f.ret(3, &[handed]), 0);
+    assert_eq!(in_copy(AREA), None);
+    for queued in queued {
+        queued.finish();
+    }
 }

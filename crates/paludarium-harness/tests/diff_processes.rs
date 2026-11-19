@@ -235,6 +235,7 @@ mod linux {
                     | "userfaultfd-minor"
                     | "userfaultfd-wp-shmem"
                     | "userfaultfd-wp-async"
+                    | "userfaultfd-events"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -242,6 +243,7 @@ mod linux {
                     | "perf-inherit"
                     | "perf-software"
                     | "perf-mmap"
+                    | "perf-output"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -251,6 +253,7 @@ mod linux {
                     | "bpf-queue"
                     | "bpf-bloom"
                     | "bpf-lpm"
+                    | "bpf-maps"
                     | "bpf-prog-load"
                     | "keys-calls"
                     | "keys-keyrings"
@@ -555,6 +558,7 @@ mod linux {
         perf_inherit => ("perf-inherit","perf"),
         perf_software => ("perf-software","perf"),
         perf_mmap => ("perf-mmap","perf"),
+        perf_output => ("perf-output","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -564,6 +568,7 @@ mod linux {
         bpf_queue => ("bpf-queue","bpf"),
         bpf_bloom => ("bpf-bloom","bpf"),
         bpf_lpm => ("bpf-lpm","bpf"),
+        bpf_maps => ("bpf-maps","bpf"),
         bpf_prog_load => ("bpf-prog-load","bpf"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
@@ -609,6 +614,7 @@ mod linux {
         userfaultfd_minor => ("userfaultfd-minor","userfaultfd"),
         userfaultfd_wp_shmem => ("userfaultfd-wp-shmem","userfaultfd"),
         userfaultfd_wp_async => ("userfaultfd-wp-async","userfaultfd"),
+        userfaultfd_events => ("userfaultfd-events","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

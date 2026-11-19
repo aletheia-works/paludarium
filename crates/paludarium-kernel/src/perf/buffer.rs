@@ -108,8 +108,11 @@ pub(crate) struct Buffer {
     space: u64,
     pinned: u64,
     /// The events that write to it (`event_list`), held by no type for
-    /// the reason [`Erased`] gives.
-    events: Mutex<Vec<Erased>>,
+    /// the reason [`Erased`] gives: the one that made it and those whose
+    /// output goes to it ([`set_output`]). `None` once its last mapping
+    /// has gone, when no event may join it (Linux's `rb->mmap_count` of
+    /// 0).
+    events: Mutex<Option<Vec<Erased>>>,
 }
 
 impl Buffer {
@@ -134,7 +137,7 @@ impl Buffer {
             uid,
             space,
             pinned,
-            events: Mutex::new(vec![erase(event)]),
+            events: Mutex::new(Some(vec![erase(event)])),
         });
         accounts.charge(uid, user, space, pinned);
         buffer.init_user_page();
@@ -196,7 +199,7 @@ impl Drop for Mapped {
     /// longer charged.
     fn drop(&mut self) {
         let buffer = &self.buffer;
-        let events = std::mem::take(&mut *lock(&buffer.events));
+        let events = lock(&buffer.events).take().unwrap_or_default();
         for event in events.iter().filter_map(super::event) {
             let mut rb = lock(&event.rb);
             if rb.as_ref().is_some_and(|rb| Arc::ptr_eq(rb, buffer)) {
@@ -391,6 +394,81 @@ fn aux(
     Err(Errno::EOPNOTSUPP)
 }
 
+/// `perf_event_set_output`: `event` writes to `output`'s buffer from now
+/// on, or to none for `None`. `output` must be another event (`EINVAL`) of
+/// the same CPU, of the same task for an event of every CPU, with the same
+/// clock and the same direction of writing (`write_backward`), and have a
+/// buffer, its own or one it writes to; and `event` may not have a
+/// mapping of its own (`EINVAL`). No event here has an AUX area, which
+/// Linux would also compare the PMUs of.
+pub(super) fn set_output(event: &Arc<Event>, output: Option<&Arc<Event>>) -> Result<(), Errno> {
+    let Some(output) = output else {
+        let _guard = lock(&event.mmap_mutex);
+        if lock(&event.mapped).upgrade().is_some() {
+            return Err(Errno::EINVAL);
+        }
+        let old = lock(&event.rb).take();
+        leave(event, old);
+        return Ok(());
+    };
+    let same_task = || match (&event.target, &output.target) {
+        (super::Target::Thread { tid: a, .. }, super::Target::Thread { tid: b, .. }) => a == b,
+        (super::Target::Cpu, super::Target::Cpu) => true,
+        _ => false,
+    };
+    let backward = |e: &Event| e.attr.flag(super::bit::WRITE_BACKWARD);
+    if Arc::ptr_eq(event, output)
+        || output.cpu != event.cpu
+        || output.cpu == -1 && !same_task()
+        || output.clockid != event.clockid
+        || backward(output) != backward(event)
+    {
+        return Err(Errno::EINVAL);
+    }
+    // Both `mmap_mutex`es, the lower address's first (`mutex_lock_double`).
+    let (first, second) = if Arc::as_ptr(event) < Arc::as_ptr(output) {
+        (event, output)
+    } else {
+        (output, event)
+    };
+    let _first = lock(&first.mmap_mutex);
+    let _second = lock(&second.mmap_mutex);
+    if lock(&event.mapped).upgrade().is_some() {
+        return Err(Errno::EINVAL);
+    }
+    let rb = lock(&output.rb).clone().ok_or(Errno::EINVAL)?;
+    // `ring_buffer_attach`: the event joins the buffer's list and writes
+    // to it under the list's lock, so that a last unmapping either finds
+    // it there writing to the buffer, or has already left the buffer
+    // taking no more events (`EINVAL`).
+    let old = {
+        let mut events = lock(&rb.events);
+        let Some(list) = events.as_mut() else {
+            return Err(Errno::EINVAL);
+        };
+        let mut current = lock(&event.rb);
+        if current.as_ref().is_some_and(|old| Arc::ptr_eq(old, &rb)) {
+            return Ok(());
+        }
+        list.push(erase(event));
+        current.replace(Arc::clone(&rb))
+    };
+    leave(event, old);
+    Ok(())
+}
+
+/// Takes `event` off the list of `old`, the buffer it wrote to, with no
+/// other lock held: two events that change places between two buffers
+/// would otherwise take the two lists' locks in opposite orders.
+fn leave(event: &Arc<Event>, old: Option<Arc<Buffer>>) {
+    if let Some(old) = old
+        && let Some(list) = lock(&old.events).as_mut()
+    {
+        let me = Arc::as_ptr(event).cast::<()>();
+        list.retain(|e| e.as_ptr().cast::<()>() != me);
+    }
+}
+
 impl Event {
     /// `perf_event_update_userpage`, if the event has a buffer.
     pub(super) fn update_user_page(&self) {
@@ -480,6 +558,57 @@ mod tests {
         assert_eq!((accounts.user(1000), accounts.pinned(7)), (0, 0));
         // Without a buffer, the user page is not written.
         event.update_user_page();
+    }
+
+    fn listed(rb: &Buffer) -> usize {
+        lock(&rb.events).as_ref().map_or(0, |list| {
+            list.iter().filter(|e| e.upgrade().is_some()).count()
+        })
+    }
+
+    #[test]
+    fn output_goes_to_a_mapped_buffer_of_another_event_alike() {
+        let accounts = Arc::default();
+        let (owner, mapped) = mapped(4, &accounts);
+        let rb = Arc::clone(&mapped.buffer);
+        let other = super::super::tests::event(None);
+        let on = |event: &Arc<Event>| {
+            lock(&event.rb)
+                .as_ref()
+                .is_some_and(|b| Arc::ptr_eq(b, &rb))
+        };
+        assert_eq!(set_output(&owner, Some(&owner)), Err(Errno::EINVAL));
+        // One with a mapping of its own may not write elsewhere.
+        assert_eq!(set_output(&owner, Some(&other)), Err(Errno::EINVAL));
+        // Nor to an event without a buffer, nor one that writes backward.
+        let third = super::super::tests::event(None);
+        assert_eq!(set_output(&third, Some(&other)), Err(Errno::EINVAL));
+        let backward = super::super::tests::with_flags(
+            None,
+            super::super::Target::Cpu,
+            1 << super::super::bit::WRITE_BACKWARD,
+        );
+        assert_eq!(set_output(&backward, Some(&owner)), Err(Errno::EINVAL));
+
+        assert_eq!(set_output(&other, Some(&owner)), Ok(()));
+        assert!(on(&other));
+        assert_eq!(set_output(&other, Some(&owner)), Ok(()));
+        // Through an event that writes to it, to the same buffer.
+        assert_eq!(set_output(&third, Some(&other)), Ok(()));
+        assert!(on(&third));
+        assert_eq!(listed(&rb), 3);
+        assert_eq!(set_output(&third, None), Ok(()));
+        assert!(lock(&third.rb).is_none());
+        assert_eq!(listed(&rb), 2);
+        // Its owner may not leave its own buffer while it maps it.
+        assert_eq!(set_output(&owner, None), Err(Errno::EINVAL));
+
+        // When the last mapping goes, every event leaves the buffer, which
+        // takes no more.
+        drop(mapped);
+        assert!(lock(&owner.rb).is_none() && lock(&other.rb).is_none());
+        assert_eq!(set_output(&third, Some(&owner)), Err(Errno::EINVAL));
+        assert_eq!(set_output(&owner, None), Ok(()));
     }
 
     #[test]

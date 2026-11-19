@@ -11295,6 +11295,29 @@ static void pom_stat(const char *label, const char *path) {
     for (unsigned i = 0; i < sizeof shown / sizeof *shown; i++) printf(" %s", fields[shown[i]]);
     printf("\n");
 }
+/* Whether a read of the stat open at `fd`, from its start, shows the
+   task's code and stack addresses (Linux decides at each read), or the
+   read's errno. */
+static void pom_fd_stat(const char *label, int fd) {
+    static char buffer[4096];
+    ssize_t n = lseek(fd, 0, SEEK_SET) < 0 ? -1 : read(fd, buffer, sizeof buffer - 1);
+    if (n < 0) {
+        printf("%s stat errno=%d\n", label, errno);
+        return;
+    }
+    buffer[n] = 0;
+    char *close_paren = strrchr(buffer, ')');
+    char *fields[64];
+    int count = 0;
+    if (close_paren)
+        for (char *field = strtok(close_paren + 2, " \n"); field && count < 64; field = strtok(NULL, " \n"))
+            fields[count++] = field;
+    if (count < 50) {
+        printf("%s stat count=%d\n", label, count);
+        return;
+    }
+    printf("%s stat addresses=%d\n", label, strcmp(fields[23], "1") && strcmp(fields[25], "0"));
+}
 static int proc_other_maps_case(void) {
     /* What the child reads of itself, shared with this process, its
        pages touched before either reads. */
@@ -11380,6 +11403,21 @@ static int proc_other_maps_case(void) {
         _exit(0);
     }
     printf("other=%d\n", reaped(other));
+    /* The same descriptor shows them while its reader may read the task,
+       and hides them once it is another user. */
+    fflush(stdout);
+    pid_t later = fork();
+    if (later == 0) {
+        snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) _exit(91);
+        pom_fd_stat("held root", fd);
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(92);
+        pom_fd_stat("held other user", fd);
+        fflush(stdout);
+        _exit(0);
+    }
+    printf("later=%d\n", reaped(later));
     {
         /* Its own reader sees them: the same program, so the same code
            and data as this process's. */
@@ -11401,12 +11439,16 @@ static int proc_other_maps_case(void) {
     snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
     snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
     pom_stat("zombie", path);
+    int held = open(path, O_RDONLY);
     snprintf(path, sizeof path, "/proc/%d/maps", (int)kid);
     printf("zombie maps=%ld", pomaps_read(path, theirs));
     snprintf(path, sizeof path, "/proc/%d/smaps", (int)kid);
     printf(" smaps=%ld", pomaps_read(path, theirs));
     printf(" status=%d", reaped(kid));
     printf(" reaped=%ld\n", pomaps_read(path, theirs));
+    /* Made at each read, so not there once it is reaped (ESRCH). */
+    pom_fd_stat("reaped held", held);
+    if (held >= 0) close(held);
     munmap(seen, 2 * POM_SIZE);
     return 0;
 }
@@ -12334,12 +12376,23 @@ static int proc_fd_links_case(void) {
 /* The proc-other-fd-paths case: a path that goes on through a link of
    another process's fd, which Linux's walk jumps to the descriptor's file
    (proc_fd_link, nd_jump_link) once the reader may look at it, and goes on
-   in when it is a directory. */
+   in when it is a directory; and the same through task/<tid>/fd of each
+   of its threads, which share its descriptors. */
 static char pofp_base[] = "/tmp/paludarium-pofp-XXXXXX";
 static void pofp_stat(const char *label, const char *path, ino_t expected) {
     struct stat st;
     if (stat(path, &st)) printf("%s: errno=%d\n", label, errno);
     else printf("%s: same=%d\n", label, st.st_ino == expected);
+}
+/* A thread of the child that sends its id and waits for the end of the
+   process. Its descriptors are the process's. */
+static int pofp_tid_pipe = -1;
+static void *pofp_thread(void *arg) {
+    (void)arg;
+    int tid = (int)syscall(SYS_gettid);
+    if (write(pofp_tid_pipe, &tid, sizeof tid) != sizeof tid) _exit(89);
+    for (;;) pause();
+    return NULL;
 }
 static int proc_other_fd_paths_case(void) {
     if (!mkdtemp(pofp_base)) return 80;
@@ -12366,11 +12419,16 @@ static int proc_other_fd_paths_case(void) {
         fds[0] = (unsigned char)open(dir, O_RDONLY | O_DIRECTORY);
         fds[1] = (unsigned char)open(file, O_RDONLY);
         char byte;
-        if (write(ready[1], fds, 2) != 2 || read(done[0], &byte, 1) != 1) _exit(88);
+        pofp_tid_pipe = ready[1];
+        pthread_t thread;
+        if (write(ready[1], fds, 2) != 2 || pthread_create(&thread, NULL, pofp_thread, NULL) ||
+            read(done[0], &byte, 1) != 1)
+            _exit(88);
         _exit(0);
     }
     unsigned char fds[2];
-    if (read(ready[0], fds, 2) != 2) return 84;
+    int tid;
+    if (read(ready[0], fds, 2) != 2 || read(ready[0], &tid, sizeof tid) != sizeof tid) return 84;
     char path[256];
     snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
     pofp_stat("through directory", path, inner_st.st_ino);
@@ -12386,6 +12444,16 @@ static int proc_other_fd_paths_case(void) {
     pofp_stat("through file", path, 0);
     snprintf(path, sizeof path, "/proc/%d/fd/60/name", (int)kid);
     pofp_stat("not open", path, 0);
+    /* The same through task/<tid>/fd of the leader and of another thread. */
+    snprintf(path, sizeof path, "/proc/%d/task/%d/fd/%d/name", (int)kid, (int)kid, fds[0]);
+    pofp_stat("leader task", path, inner_st.st_ino);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/fd/%d/name", (int)kid, tid, fds[0]);
+    pofp_stat("thread task", path, inner_st.st_ino);
+    printf("thread is another task=%d\n", tid != (int)kid);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/fd/%d/.", (int)kid, tid, fds[0]);
+    pofp_stat("thread dot", path, dir_st.st_ino);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/fd/%d/name", (int)kid, tid, fds[1]);
+    pofp_stat("thread through file", path, 0);
     /* Another user may not look at its descriptors. */
     fflush(stdout);
     pid_t other = fork();
@@ -12393,6 +12461,8 @@ static int proc_other_fd_paths_case(void) {
         if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
         snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
         pofp_stat("other user", path, inner_st.st_ino);
+        snprintf(path, sizeof path, "/proc/%d/task/%d/fd/%d/name", (int)kid, tid, fds[0]);
+        pofp_stat("other user thread", path, inner_st.st_ino);
         fflush(stdout);
         _exit(0);
     }
@@ -12402,15 +12472,23 @@ static int proc_other_fd_paths_case(void) {
     rename(dir, moved);
     snprintf(path, sizeof path, "/proc/%d/fd/%d/name", (int)kid, fds[0]);
     pofp_stat("renamed", path, inner_st.st_ino);
+    char thread_path[256];
+    snprintf(thread_path, sizeof thread_path, "/proc/%d/task/%d/fd/%d/name", (int)kid, tid, fds[0]);
+    pofp_stat("thread renamed", thread_path, inner_st.st_ino);
     snprintf(inner, sizeof inner, "%s/moved/name", pofp_base);
     unlink(inner);
     rmdir(moved);
     pofp_stat("removed", path, inner_st.st_ino);
+    pofp_stat("thread removed", thread_path, inner_st.st_ino);
     /* Its descriptors are gone with it. */
     if (write(done[1], "d", 1) != 1) return 85;
     siginfo_t info;
     waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
     pofp_stat("zombie", path, inner_st.st_ino);
+    /* The other thread is gone before the process is a zombie. */
+    pofp_stat("zombie thread", thread_path, inner_st.st_ino);
+    snprintf(thread_path, sizeof thread_path, "/proc/%d/task/%d/fd/%d/name", (int)kid, (int)kid, fds[0]);
+    pofp_stat("zombie leader task", thread_path, inner_st.st_ino);
     printf("status=%d\n", reaped(kid));
     unlink(file);
     rmdir(pofp_base);

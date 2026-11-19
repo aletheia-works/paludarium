@@ -2359,9 +2359,9 @@ impl Kernel {
         a: [u64; 6],
     ) -> Option<Next> {
         let result = match n {
-            56 if a[0] & 0x10000 == 0 => self.clone_process(thread, mem, a),
-            57 => self.clone_process(thread, mem, [17, 0, 0, 0, 0, 0]),
-            58 => self.clone_process(thread, mem, [0x4111, 0, 0, 0, 0, 0]),
+            56 if a[0] & 0x10000 == 0 => self.fork_process(thread, mem, a),
+            57 => self.fork_process(thread, mem, [17, 0, 0, 0, 0, 0]),
+            58 => self.fork_process(thread, mem, [0x4111, 0, 0, 0, 0, 0]),
             59 | 322 => {
                 // The exec'ing thread, by the number it had: it takes the
                 // leader's, but its perf events are its own.
@@ -3192,12 +3192,40 @@ impl Kernel {
         }
         Ok(0)
     }
+    /// `clone` of a new process, `fork` and `vfork` ([`Self::clone_process`]);
+    /// before the child runs, the `userfaultfd`s whose registrations it
+    /// kept have their `UFFD_EVENT_FORK` read, as Linux's `dup_mmap` waits
+    /// for them (`dup_userfaultfd_complete`).
+    fn fork_process(
+        &mut self,
+        parent: &mut Thread,
+        mem: &AddressSpace,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        let (number, events) = self.clone_process(parent, mem, a)?;
+        let mut c = crate::syscalls::Context {
+            number: 56,
+            tid: parent.tid,
+            host: &*self.host,
+            shared_host: &self.host,
+            files: &mut self.files,
+            process: &mut parent.state,
+            cpu: &mut parent.cpu,
+            mem,
+            cancellation: &self.cancellation,
+            inbox: &self.inbox,
+            group: &self.group,
+            processes: &self.processes,
+        };
+        events.deliver(&mut c);
+        Ok(number)
+    }
     fn clone_process(
         &mut self,
         parent: &Thread,
         mem: &AddressSpace,
         a: [u64; 6],
-    ) -> Result<u64, Errno> {
+    ) -> Result<(u64, crate::userfaultfd::Events), Errno> {
         let flags = a[0];
         let known = 0xff
             | 0x100
@@ -3274,6 +3302,10 @@ impl Kernel {
         } else {
             None
         };
+        let mut userfaults = crate::userfaultfd::Events::default();
+        if let Some(child_mem) = &child_mem {
+            crate::userfaultfd::fork(&child_mem.view(), &mut userfaults);
+        }
         // Numbered in the PID namespace children take, and those it is in.
         let space = child_namespaces.pid.clone();
         let set_tid = std::mem::take(&mut self.set_tid);
@@ -3431,7 +3463,7 @@ impl Kernel {
                 state,
             },
         ));
-        Ok(u64::from(number))
+        Ok((u64::from(number), userfaults))
     }
     /// The PID namespace thread `tid` is in, which numbers the tasks it
     /// names and sees.
@@ -3896,8 +3928,8 @@ impl Kernel {
     /// The bytes of the ranges before the first that fails are the result,
     /// or its error when there are none.
     fn process_madvise(
-        &self,
-        thread: &Thread,
+        &mut self,
+        thread: &mut Thread,
         mem: &AddressSpace,
         a: [u64; 6],
     ) -> Result<u64, Errno> {
@@ -3969,13 +4001,7 @@ impl Kernel {
                     Ok(())
                 } else {
                     match &target {
-                        None => crate::syscalls::advise(
-                            mem,
-                            &thread.state.credentials,
-                            start,
-                            len,
-                            advice as u64,
-                        ),
+                        None => self.advise_own(thread, mem, start, len, advice as u64),
                         Some(memory) => Self::mapped_whole(memory, start, len),
                     }
                 };
@@ -3986,6 +4012,34 @@ impl Kernel {
             }
         }
         Ok(done)
+    }
+    /// `madvise` of the caller's own memory, for `process_madvise`, whose
+    /// discards the `userfaultfd`s are told of as `madvise`'s are.
+    fn advise_own(
+        &mut self,
+        thread: &mut Thread,
+        mem: &AddressSpace,
+        start: u64,
+        len: u64,
+        advice: u64,
+    ) -> Result<(), Errno> {
+        let credentials = thread.state.credentials.clone();
+        let mut c = crate::syscalls::Context {
+            number: 440,
+            tid: thread.tid,
+            host: &*self.host,
+            shared_host: &self.host,
+            files: &mut self.files,
+            process: &mut thread.state,
+            cpu: &mut thread.cpu,
+            mem,
+            cancellation: &self.cancellation,
+            inbox: &self.inbox,
+            group: &self.group,
+            processes: &self.processes,
+        };
+        let mut removing = |from, to| crate::userfaultfd::remove(&mut c, from, to);
+        crate::syscalls::advise(mem, &credentials, start, len, advice, &mut removing)
     }
     /// `process_mrelease(pidfd, flags)`, as Linux master's: `flags` must be
     /// 0 (`EINVAL`); then the task, `PIDFD_SELF_THREAD` or

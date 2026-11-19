@@ -962,7 +962,9 @@ kernel.
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
   `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
   `UFFD_FEATURE_WP_UNPOPULATED`, `UFFD_FEATURE_POISON`,
-  `UFFD_FEATURE_WP_ASYNC` and `UFFD_FEATURE_MOVE` (the `HUGETLBFS` ones as Linux reports them,
+  `UFFD_FEATURE_WP_ASYNC`, `UFFD_FEATURE_MOVE`, and the events'
+  `UFFD_FEATURE_EVENT_FORK`, `UFFD_FEATURE_EVENT_REMAP`,
+  `UFFD_FEATURE_EVENT_REMOVE` and `UFFD_FEATURE_EVENT_UNMAP` (the `HUGETLBFS` ones as Linux reports them,
   though there is no hugetlbfs memory to register: `MFD_HUGETLB` and
   `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
@@ -1016,9 +1018,9 @@ kernel.
   protected only by its own mode, and a `UFFDIO_ZEROPAGE` of private
   anonymous memory or a `UFFDIO_POISON` is `EEXIST` there. `mprotect` keeps the protection,
   and refuses a write it does not permit with SIGSEGV as before; a
-  `fork`ed child, a move by `mremap`, `UFFDIO_UNREGISTER`, closing the
-  file and a registration that replaces the write-protect mode take it
-  away. With `UFFD_FEATURE_WP_ASYNC`, which brings
+  `fork`ed child and a move by `mremap` (without their events' features),
+  `UFFDIO_UNREGISTER`, closing the file and a registration that replaces
+  the write-protect mode take it away. With `UFFD_FEATURE_WP_ASYNC`, which brings
   `UFFD_FEATURE_WP_UNPOPULATED` (as `/proc/<pid>/fdinfo` shows), a write
   to a write-protected page, an instruction's or a system call's, does not
   fault: it clears the page's protection and goes on, as `do_wp_page`
@@ -1082,9 +1084,32 @@ kernel.
   A read takes whole messages (`EINVAL` for a buffer
   too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
   `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
-  Linux's does, else `POLLIN` while a fault is not read yet.
+  Linux's does, else `POLLIN` while a fault or an event is not read yet.
   `/proc/self/fdinfo` shows the faults not read and all those waiting, and
-  the API, as `userfaultfd_show_fdinfo`.
+  the API, as `userfaultfd_show_fdinfo`. The events tell the
+  `userfaultfd` of changes to its space, as Linux's non-cooperative mode:
+  with `UFFD_FEATURE_EVENT_FORK` a `fork`ed child keeps the registrations,
+  and the write protection of their pages and markers, in a new
+  `userfaultfd` of its own, which `UFFD_EVENT_FORK` hands over as a file
+  the read installs (with the old one's `O_CLOEXEC` and `O_NONBLOCK`), its
+  number in the message; with `UFFD_FEATURE_EVENT_REMAP` a mapping
+  `mremap` moves keeps them too, and `UFFD_EVENT_REMAP` gives where it was,
+  where it went and its length; `UFFD_FEATURE_EVENT_REMOVE` tells the
+  ranges `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`, `MADV_FREE` and
+  `MADV_REMOVE` (and `process_madvise` of the caller's own memory) are
+  about to drop, mapping by mapping (`UFFD_EVENT_REMOVE`), and
+  `UFFD_FEATURE_EVENT_UNMAP` the whole range `munmap`, `brk`, a `MAP_FIXED`
+  `mmap` and `mremap` unmapped (`UFFD_EVENT_UNMAP`), once to each
+  `userfaultfd` that registered some of it; `mremap` tells of the range
+  `MREMAP_FIXED` replaced, then of the move, then of the range it left
+  and what it shrank, as Linux's `notify_uffd`. The thread that made the
+  change waits until its event is read, the file is closed or a fatal
+  signal comes (`TASK_KILLABLE`); `fork` waits before the child runs, and
+  a child's `userfaultfd` whose event was not read leaves the child's
+  mappings. A read takes the faults before the events, and while an event
+  is not read `UFFDIO_COPY`, `UFFDIO_ZEROPAGE`, `UFFDIO_POISON`,
+  `UFFDIO_CONTINUE` and `UFFDIO_MOVE` are `EAGAIN` (written to their last
+  field first), as is `UFFDIO_WRITEPROTECT` (`mmap_changing`).
 - `remap_file_pages` maps a range of a shared mapping again at another page
   of its file or shared memory, as Linux's `mmap` of the mapping's own file
   does, keeping its protection. As on Linux, `prot` must be 0 and the range
@@ -1564,8 +1589,9 @@ kernel.
   from the root, or, when it is not under the root, its path from the
   machine's root after `(unreachable)`. A child of `fork` keeps the root, a
   rename moves it with its directory, and `setns` into a mount namespace
-  goes back to the machine's root. The generated `/proc` and `/dev` are not
-  under another root, as no `proc` filesystem is mounted there.
+  goes back to the machine's root. The generated `/proc` and `/dev` are under
+  another root only where a bind mount of them puts them, as no `proc`
+  filesystem is mounted there.
 - `mount` mounts a new tmpfs on a directory of the caller's mount namespace,
   after Linux's checks in Linux's order: the type, the source and the
   options are copied (`EFAULT`; a string with no end in 4096 bytes is
@@ -3038,6 +3064,9 @@ kernel.
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
   every field from `start_data` on, as Linux's `do_task_stat` hides them.
+  `stat` is made at each read from its start, as Linux's is, so a descriptor
+  shows what the task and the reader are then: one that drops its rights
+  sees the addresses hidden, and a task that has been reaped is `ESRCH`.
   `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.
@@ -3710,7 +3739,17 @@ kernel.
   page is `struct perf_event_mmap_page`: version 0, `size` 96, the data's
   offset and size, `cap_bit0_is_deprecated` and no `cap_user_rdpmc`,
   index 0, and the count and times enabled and running between two bumps
-  of the sequence lock. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  of the sequence lock. `PERF_EVENT_IOC_SET_OUTPUT`, and
+  `PERF_FLAG_FD_OUTPUT` at open through the group's descriptor, make an
+  event write to another event's buffer, as Linux's
+  `perf_event_set_output`: the other must be an event (`EBADF`), not the
+  same one, of the same CPU, of the same task for an event of every CPU,
+  with the same clock and `write_backward`, and have a buffer, its own or
+  one it writes to; the event may not map a buffer of its own
+  (`EINVAL`), and -1 (`SET_OUTPUT` alone) makes it write to none. Such an
+  event shares the user page, but a mapping of it is `EBUSY` (`EINVAL`
+  for another size), and when the buffer's last mapping goes, every event
+  that wrote to it is free again. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
@@ -3809,8 +3848,31 @@ kernel.
   `CAP_BPF` and `BPF_F_NO_PREALLOC`, takes only that, `BPF_F_NUMA_NODE`
   and the access flags, and a value of 1 byte up to 4 MiB less 280
   (`EINVAL`). Its memory is 24 bytes, the data and the value for each
-  element, with nothing for its header or intermediate nodes. See
-  [limitations](./limitations) for what is not there.
+  element, with nothing for its header or intermediate nodes. A
+  `BPF_MAP_TYPE_ARRAY_OF_MAPS` or `BPF_MAP_TYPE_HASH_OF_MAPS` holds other
+  maps, as Linux's `map_in_map.c`: its value is a 4-byte descriptor (any
+  other size is `EINVAL`), and the map of `inner_map_fd` is the template its
+  maps must be like (no descriptor is `EBADF`, one of no map `EINVAL`, and
+  a map of maps `EINVAL`, for there is one level alone). A map fits when its
+  type, key and value sizes and flags are the template's, and an array its
+  entries too unless the template has `BPF_F_INNER_MAP` (`EINVAL` if not).
+  `UPDATE_ELEM` takes the descriptor of such a map, `LOOKUP_ELEM` gives the
+  ID of the map an element holds, and the outer map keeps its maps after
+  their descriptors close, until they are deleted or replaced. An array of
+  maps takes `BPF_ANY` alone (`EINVAL`, before the descriptor is looked at)
+  and an index below `max_entries` (`E2BIG`); an index that holds no map is
+  `ENOENT`, its next keys are an array's, a batch lookup passes over the
+  indexes that hold none, and it has no batch delete (`ENOTSUPP`). It takes
+  neither `BPF_F_RDONLY_PROG`, `BPF_F_WRONLY_PROG`, `BPF_F_MMAPABLE` nor
+  `BPF_F_INNER_MAP` (`EINVAL`). A hash of maps looks at the descriptor
+  before its flags, which are a hash's; it has a hash's batch commands but
+  no `LOOKUP_AND_DELETE_ELEM` (`ENOTSUPP`), and preallocated it counts no
+  spare elements. Neither needs `CAP_BPF`. A map made with `excl_prog_hash`
+  is no map's inner map (`ENOTSUPP`), as Linux master has it; the test
+  machines' Linux 7.0 takes one. `BPF_F_RDONLY` and `BPF_F_WRONLY` are the
+  descriptor's, not the map's: `map_flags` (in fdinfo, `bpf_map_info` and a
+  template) leaves them out, as Linux's `bpf_map_flags_retain_permanent`
+  does. See [limitations](./limitations) for what is not there.
 - `BPF_PROG_LOAD` checks its arguments as Linux's `bpf_prog_load` does, in
   its order and with its errors, which are the same in the test machines'
   kernel (Ubuntu's Linux 7.0) and in master: the fields past the command

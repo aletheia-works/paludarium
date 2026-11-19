@@ -9496,3 +9496,40 @@ fn the_path_calls_go_through_a_link_into_the_generated_files() {
         );
     }
 }
+
+/// A bind of `/proc`, `/dev` or a directory in them onto a directory of a
+/// new root shows the files the kernel generates there after `chroot`, as
+/// on Linux.
+#[test]
+fn a_bind_of_proc_shows_its_files_in_a_new_root() {
+    let mut f = fixture();
+    let root = put(&mut f, 0, b"/tmp/r");
+    let proc_place = put(&mut f, 0x10, b"/tmp/r/proc");
+    let dev_place = put(&mut f, 0x20, b"/tmp/r/dev");
+    let own_place = put(&mut f, 0x30, b"/tmp/r/own");
+    let proc_dir = put(&mut f, 0x40, b"/proc");
+    let dev = put(&mut f, 0x50, b"/dev");
+    let own = put(&mut f, 0x60, b"/proc/self");
+    for place in [root, proc_place, dev_place, own_place] {
+        assert_eq!(f.ret(83, &[place, 0o755]), 0);
+    }
+    assert_eq!(f.ret(165, &[proc_dir, proc_place, 0, 4096, 0]), 0);
+    assert_eq!(f.ret(165, &[dev, dev_place, 0, 4096, 0]), 0);
+    assert_eq!(f.ret(165, &[own, own_place, 0, 4096, 0]), 0);
+    assert_eq!(f.ret(161, &[root]), 0);
+    let comm = put(&mut f, 0x80, b"/proc/self/comm");
+    let own_comm = put(&mut f, 0xa0, b"/own/comm");
+    for path in [comm, own_comm] {
+        let fd = f.ret(2, &[path, 0, 0]);
+        assert!(fd < 1024);
+        assert!(f.ret(0, &[fd, DATA + 0x100, 64]) > 0);
+        assert_eq!(f.ret(3, &[fd]), 0);
+    }
+    let null = put(&mut f, 0xc0, b"/dev/null");
+    let fd = f.ret(2, &[null, 2, 0]);
+    assert!(fd < 1024);
+    assert_eq!(f.ret(1, &[fd, DATA + 0x100, 3]), 3);
+    assert_eq!(f.ret(3, &[fd]), 0);
+    let missing = put(&mut f, 0xe0, b"/proc/nosuch");
+    assert_eq!(f.ret(2, &[missing, 0, 0]), errno(Errno::ENOENT));
+}

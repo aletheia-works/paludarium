@@ -97,9 +97,8 @@ verified.
   interpreter, a core dump's writes), and a read or write that fails with
   an errno Linux gives both before and in the file's operation (`EINVAL`,
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
-  so not counted. Whether
-  another process's `stat` hides its addresses is decided when the file is
-  opened, where Linux decides at each read, and its `exit_code` is 0. In `stat`, page faults, resident memory, the start
+  so not counted.
+  Another process's `stat` has an `exit_code` of 0. In `stat`, page faults, resident memory, the start
   time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
@@ -113,10 +112,11 @@ verified.
   seq files are of size 0; `maps`, `smaps` and `fdinfo` are 0 as on Linux.
 - **Roots of their own, in part**: `chroot` into the generated `/proc` or
   `/dev` (or a directory in them) gives `EINVAL`, where Linux makes it the
-  root. As `mount` mounts nothing on `/proc` or `/dev` and cannot bind
-  them, nothing can be mounted on the new root's `/proc` or `/dev`, so a
-  program there finds only the files the directory holds. In a path that climbs above the root as written, `..` is
-  taken from the names as written, where Linux takes a `..` after a
+  root. `mount` mounts no `proc` filesystem and nothing on `/proc` or
+  `/dev`, so the new root's `/proc` or `/dev` shows the generated files
+  only through a bind mount of `/proc` or `/dev` (or a directory in them)
+  made onto it before. In a path that climbs above the root as written,
+  `..` is taken from the names as written, where Linux takes a `..` after a
   symbolic link from the link's target. `maps` and `smaps` in `/proc` name
   files from the root their opener had when it opened them, where Linux
   takes the root of whoever reads them, at each read.
@@ -263,9 +263,9 @@ verified.
   mapping unlocked. `inherit_stat` is taken, but an
   inherited event's end sends no read record, as nothing is recorded. An
   event of a task on one CPU counts on any, and the cgroup mode
-  (`PERF_FLAG_PID_CGROUP`) is `EBADF`. `PERF_FLAG_FD_OUTPUT` and the
-  ioctls `SET_OUTPUT`, `SET_FILTER`, `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF`
-  and `MODIFY_ATTRIBUTES` do nothing or are `ENOTTY`. `remove_on_exec`
+  (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
+  `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are
+  `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
   (037a3c43edfb), and such an event leads no new group (`ENODEV`,
   fa091f46c383); the test machines' Linux 7.0 leaves it in its group and
@@ -288,8 +288,8 @@ verified.
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
 - **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes,
-  longest-prefix-match tries, queues, stacks and bloom filters and nothing
-  else. Programs are never loaded: there is no verifier and no BPF runs.
+  longest-prefix-match tries, queues, stacks, bloom filters, and arrays
+  and hashes of maps, and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
   `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
   every program with `EINVAL`, as a kernel built without the program's
   type does; a program Linux would load, or reject in its verifier with
@@ -765,11 +765,14 @@ verified.
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages, write protection and the minor
-  faults of shmem are registered. Not offered are the events of `fork`,
-  `mremap`, `madvise` and `munmap`, which `UFFDIO_API` does not report and
-  refuses (`EINVAL`), and `PAGEMAP_SCAN`, the `/proc/<pid>/pagemap` ioctl
-  that finds and protects again the pages `UFFD_FEATURE_WP_ASYNC` saw
-  written; their bit 57 in `/proc/<pid>/pagemap` tells them. A
+  faults of shmem are registered. Not offered is `PAGEMAP_SCAN`, the
+  `/proc/<pid>/pagemap` ioctl that finds and protects again the pages
+  `UFFD_FEATURE_WP_ASYNC` saw written; their bit 57 in
+  `/proc/<pid>/pagemap` tells them. A discard tells of all its ranges
+  before it drops the pages of any, where Linux tells and drops VMA by VMA,
+  and registered mappings of one `userfaultfd` that meet are one range of
+  `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of
+  its whole range once its first mapping passes the checks. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
   `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in

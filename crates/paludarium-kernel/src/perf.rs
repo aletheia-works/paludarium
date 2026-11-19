@@ -17,7 +17,9 @@
 //! machine keeps both lists ([`Events`]). An event of a task maps its
 //! ring buffer ([`buffer`]), whose user page shows the count and times as
 //! of the event's `mmap`, its enabling and its reset; a sampling event
-//! takes no samples yet, and the buffer stays empty.
+//! takes no samples yet, and the buffer stays empty. `SET_OUTPUT` and
+//! `PERF_FLAG_FD_OUTPUT` make an event write to another's buffer
+//! ([`buffer::set_output`]).
 mod buffer;
 
 use crate::ThreadGroup;
@@ -127,6 +129,7 @@ mod bit {
     pub const ENABLE_ON_EXEC: u32 = 12;
     pub const EXCLUDE_CALLCHAIN_KERNEL: u32 = 21;
     pub const USE_CLOCKID: u32 = 25;
+    pub const WRITE_BACKWARD: u32 = 27;
     pub const NAMESPACES: u32 = 28;
     pub const AUX_OUTPUT: u32 = 31;
     pub const TEXT_POKE: u32 = 33;
@@ -975,6 +978,7 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     }
     // The descriptor is taken here; an error after this frees it.
     let mut leader = None;
+    let mut output = None;
     if group_fd != -1 {
         let file = c
             .files
@@ -987,6 +991,9 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         // master since 7.2's fa091f46c383; the test machines' 7.0 takes it).
         if lock(&event.state).removed {
             return Err(Errno::ENODEV);
+        }
+        if flags & PERF_FLAG_FD_OUTPUT != 0 {
+            output = Some(Arc::clone(&event));
         }
         if flags & PERF_FLAG_FD_NO_GROUP == 0 {
             leader = Some(event);
@@ -1084,6 +1091,10 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         mapped: Mutex::default(),
         mmap_mutex: Mutex::default(),
     });
+    // `PERF_FLAG_FD_OUTPUT`: it writes to the group's event's buffer.
+    if let Some(output) = &output {
+        buffer::set_output(&event, Some(output))?;
+    }
     if let Some(leader) = &leader {
         event.set_paused(!leader.enabled());
         lock(&leader.siblings).push(Arc::downgrade(&event));
@@ -1301,6 +1312,7 @@ const IOC_DISABLE: u64 = 0x2401;
 const IOC_REFRESH: u64 = 0x2402;
 const IOC_RESET: u64 = 0x2403;
 const IOC_PERIOD: u64 = 0x4008_2404;
+const IOC_SET_OUTPUT: u64 = 0x2405;
 const IOC_ID: u64 = 0x8008_2407;
 const IOC_FLAG_GROUP: u64 = 1;
 
@@ -1322,7 +1334,9 @@ pub(crate) fn mmap(
 /// An event's ioctls, as Linux's `_perf_ioctl`: `ENABLE`, `DISABLE` and
 /// `RESET` of the event or, with `PERF_IOC_FLAG_GROUP`, its whole group;
 /// `ID`; `PERIOD` and `REFRESH`, which only a sampling event takes
-/// (`EINVAL`); every other request is `ENOTTY` here.
+/// (`EINVAL`); `SET_OUTPUT` to another event's buffer
+/// ([`buffer::set_output`]), whose descriptor must be an event's
+/// (`EBADF`), or to none for -1; every other request is `ENOTTY` here.
 pub(crate) fn ioctl(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -1359,6 +1373,19 @@ pub(crate) fn ioctl(
                 return Err(Errno::EINVAL);
             }
             Ok(0)
+        })(),
+        IOC_SET_OUTPUT => (|| {
+            if argument == u64::MAX {
+                return buffer::set_output(&event, None).map(|()| 0);
+            }
+            // Linux's `fdget` takes an `unsigned int`.
+            let file = c
+                .files
+                .descriptor(u64::from(argument as u32))
+                .map_err(|_| EBADF)?
+                .file;
+            let output = Arc::clone(of(&file).ok_or(EBADF)?);
+            buffer::set_output(&event, Some(&output)).map(|()| 0)
         })(),
         IOC_ID => c
             .mem
@@ -1463,7 +1490,11 @@ mod tests {
         with_flags(leader, target, 0)
     }
 
-    fn with_flags(leader: Option<&Arc<Event>>, target: Target, flags: u64) -> Arc<Event> {
+    pub(super) fn with_flags(
+        leader: Option<&Arc<Event>>,
+        target: Target,
+        flags: u64,
+    ) -> Arc<Event> {
         with_attr(
             leader,
             target,

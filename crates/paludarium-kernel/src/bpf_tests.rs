@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use paludarium_mmu::{MappingKind, Prot};
-use paludarium_types::{Errno, GuestAddr, PAGE_SIZE};
+use paludarium_types::{Errno, Error, GuestAddr, PAGE_SIZE};
 
 const DATA: u64 = 0x600000;
 /// Where the tests put a `union bpf_attr`.
@@ -40,33 +40,67 @@ const OBJ_GET_INFO_BY_FD: u64 = 15;
 const MAP_LOOKUP_AND_DELETE_ELEM: u64 = 21;
 const MAP_FREEZE: u64 = 22;
 const MAP_LOOKUP_BATCH: u64 = 24;
+const MAP_LOOKUP_AND_DELETE_BATCH: u64 = 25;
 const MAP_UPDATE_BATCH: u64 = 26;
+const MAP_DELETE_BATCH: u64 = 27;
 
 const HASH: u32 = 1;
 const ARRAY: u32 = 2;
 const ARRAY_OF_MAPS: u32 = 12;
 const HASH_OF_MAPS: u32 = 13;
+const LRU_HASH: u32 = 9;
+const LPM_TRIE: u32 = 11;
 const QUEUE: u32 = 22;
 const STACK: u32 = 23;
 const BLOOM_FILTER: u32 = 30;
 
+const F_NO_PREALLOC: u32 = 1;
+const F_NO_COMMON_LRU: u32 = 1 << 1;
 const F_NUMA_NODE: u32 = 1 << 2;
 const F_RDONLY: u32 = 1 << 3;
 const F_WRONLY: u32 = 1 << 4;
+const F_ZERO_SEED: u32 = 1 << 6;
 const F_RDONLY_PROG: u32 = 1 << 7;
+const F_WRONLY_PROG: u32 = 1 << 8;
 const F_MMAPABLE: u32 = 1 << 10;
 const F_PRESERVE_ELEMS: u32 = 1 << 11;
 const F_TOKEN_FD: u32 = 1 << 16;
 const NOEXIST: u64 = 1;
+const EXIST: u64 = 2;
 
 const E2BIG: Errno = Errno(7);
+const EEXIST: Errno = Errno(17);
 /// `EBADFD`, which `BPF_OBJ_GET_INFO_BY_FD` gives for no descriptor.
 const EBADFD: Errno = Errno(77);
 /// The kernel's own `ENOTSUPP`, which `bpf(2)` lets out.
 const ENOTSUPP: Errno = Errno(524);
 
 fn setup() -> (Kernel, Thread, AddressSpace) {
-    let kernel = Kernel::new(Arc::new(paludarium_host::testing::RecordingHost::new()));
+    on(Arc::new(paludarium_host::testing::RecordingHost::new()))
+}
+
+/// A host of a fixed number of CPUs, which an LRU hash's lists depend on.
+struct Cpus(usize);
+impl Host for Cpus {
+    fn read_stdin(&self, _: &mut [u8]) -> Result<usize, Errno> {
+        Ok(0)
+    }
+    fn write_stdout(&self, buf: &[u8]) -> Result<usize, Errno> {
+        Ok(buf.len())
+    }
+    fn write_stderr(&self, buf: &[u8]) -> Result<usize, Errno> {
+        Ok(buf.len())
+    }
+    fn random_bytes(&self, _: &mut [u8]) -> Result<(), Error> {
+        Ok(())
+    }
+    fn cpu_count(&self) -> usize {
+        self.0
+    }
+}
+
+fn on(host: Arc<dyn Host>) -> (Kernel, Thread, AddressSpace) {
+    let kernel = Kernel::new(host);
     let thread = Thread::new(
         1,
         CpuState::new(GuestAddr(0x400000), GuestAddr(DATA + PAGE_SIZE)),
@@ -735,5 +769,458 @@ fn map_information_is_for_a_map_descriptor_and_a_length_linux_knows() {
     assert_eq!(
         bpf(&mut k, &mut t, &m, OBJ_GET_INFO_BY_FD, &attr),
         errno(Errno::EFAULT)
+    );
+}
+
+/// Where a batch's keys, values and `out_batch` go.
+const KEYS: u64 = DATA + 0x600;
+const VALUES: u64 = DATA + 0x700;
+const BATCH_OUT: u64 = DATA + 0x500;
+const BATCH_IN: u64 = DATA + 0x580;
+
+/// The keys `BPF_MAP_GET_NEXT_KEY` walks to from none, of `size` bytes
+/// each, and how the walk ends.
+fn keys(
+    k: &mut Kernel,
+    t: &mut Thread,
+    m: &AddressSpace,
+    fd: u64,
+    size: usize,
+) -> (Vec<Vec<u8>>, u64) {
+    let mut found = Vec::new();
+    let first = Attr::default().half(0, fd as u32).word(16, VALUE);
+    let mut r = bpf(k, t, m, MAP_GET_NEXT_KEY, &first);
+    while r == 0 && found.len() < 32 {
+        let mut key = vec![0; size];
+        m.read(GuestAddr(VALUE), &mut key).unwrap();
+        m.write(GuestAddr(KEY), &key).unwrap();
+        found.push(key);
+        let next = Attr::default()
+            .half(0, fd as u32)
+            .word(8, KEY)
+            .word(16, VALUE);
+        r = bpf(k, t, m, MAP_GET_NEXT_KEY, &next);
+    }
+    (found, r)
+}
+
+/// An LRU hash's keys, sorted, as `bpf.c`'s `keys` prints them.
+fn lru_keys(k: &mut Kernel, t: &mut Thread, m: &AddressSpace, fd: u64) -> Vec<u32> {
+    let (found, end) = keys(k, t, m, fd, 4);
+    assert_eq!(end, errno(Errno::ENOENT));
+    let mut keys: Vec<u32> = found
+        .iter()
+        .map(|key| u32::from_le_bytes(key[..4].try_into().unwrap()))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// `BPF_MAP_UPDATE_ELEM` of a `u32` key and a `u64` value.
+fn put(
+    k: &mut Kernel,
+    t: &mut Thread,
+    m: &AddressSpace,
+    fd: u64,
+    key: u32,
+    value: u64,
+    flags: u64,
+) -> u64 {
+    let kv = (Some(&key.to_le_bytes()[..]), Some(&value.to_le_bytes()[..]));
+    elem_with(k, t, m, MAP_UPDATE_ELEM, fd, kv, flags)
+}
+
+/// A batch's count, as the command gave it back.
+fn count(m: &AddressSpace) -> u32 {
+    let mut b = [0; 4];
+    m.read(GuestAddr(ATTR + 32), &mut b).unwrap();
+    u32::from_le_bytes(b)
+}
+
+/// `bpf.c`'s `case_lru`, on one CPU's lists as Linux's `bpf_lru_list.c`
+/// keeps them: which keys a full map gives up as new ones come.
+#[test]
+fn a_full_lru_hash_gives_up_the_keys_linux_s_lists_give_up() {
+    // Four entries take one free element at a time on any machine of two
+    // CPUs or more, as the differential case says; one CPU would take two.
+    for cpus in [2, 4, 8, 64] {
+        lru_case(cpus);
+    }
+}
+
+fn lru_case(cpus: usize) {
+    let (mut k, mut t, m) = on(Arc::new(Cpus(cpus)));
+    let einval = errno(Errno::EINVAL);
+    let lru = |flags: u32| map(LRU_HASH, 4, 8, 4, flags);
+    // An LRU hash is always preallocated (ENOTSUPP), and lists of each
+    // CPU's own are on no one NUMA node.
+    assert_eq!(
+        create(&mut k, &mut t, &m, lru(F_NO_PREALLOC)),
+        errno(ENOTSUPP)
+    );
+    assert_eq!(
+        create(&mut k, &mut t, &m, lru(F_NO_COMMON_LRU | F_NUMA_NODE)),
+        einval
+    );
+    assert_eq!(create(&mut k, &mut t, &m, lru(F_MMAPABLE)), einval);
+    assert_eq!(
+        create(&mut k, &mut t, &m, map(LRU_HASH, 0, 8, 4, 0)),
+        einval
+    );
+    assert_eq!(
+        create(&mut k, &mut t, &m, map(LRU_HASH, 4, 1 << 22, 4, 0)),
+        errno(E2BIG)
+    );
+    let fd = make(&mut k, &mut t, &m, lru(0));
+    for key in 1..=5 {
+        assert_eq!(put(&mut k, &mut t, &m, fd, key, key.into(), 0), 0);
+    }
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [2, 3, 4, 5]);
+    assert_eq!(put(&mut k, &mut t, &m, fd, 2, 20, 0), 0);
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [2, 3, 4, 5]);
+    // The replaced key is referenced, so the oldest other goes.
+    assert_eq!(put(&mut k, &mut t, &m, fd, 6, 6, 0), 0);
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [2, 4, 5, 6]);
+    // htab_lru_map_update_elem takes an element before it checks the
+    // flags: a refused update still costs a key.
+    assert_eq!(put(&mut k, &mut t, &m, fd, 6, 60, NOEXIST), errno(EEXIST));
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [2, 5, 6]);
+    assert_eq!(
+        put(&mut k, &mut t, &m, fd, 9, 9, EXIST),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [2, 5, 6]);
+    let six = Some(&6u32.to_le_bytes()[..]);
+    assert_eq!(
+        elem(&mut k, &mut t, &m, MAP_LOOKUP_ELEM, fd, six, Some(&[0; 8])),
+        0
+    );
+    assert_eq!(value(&m), 6);
+    let five = Some(&5u32.to_le_bytes()[..]);
+    assert_eq!(elem(&mut k, &mut t, &m, MAP_DELETE_ELEM, fd, five, None), 0);
+    assert_eq!(
+        elem(&mut k, &mut t, &m, MAP_DELETE_ELEM, fd, five, None),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [2, 6]);
+    for key in 7..=9 {
+        assert_eq!(put(&mut k, &mut t, &m, fd, key, key.into(), 0), 0);
+    }
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [6, 7, 8, 9]);
+    let eight = Some(&8u32.to_le_bytes()[..]);
+    assert_eq!(
+        elem(
+            &mut k,
+            &mut t,
+            &m,
+            MAP_LOOKUP_AND_DELETE_ELEM,
+            fd,
+            eight,
+            Some(&[0; 8])
+        ),
+        0
+    );
+    assert_eq!(value(&m), 8);
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [6, 7, 9]);
+    // Many more, every third replaced and so referenced: the lists rotate
+    // and shrink.
+    for key in 10..=30u32 {
+        assert_eq!(put(&mut k, &mut t, &m, fd, key, key.into(), 0), 0);
+        if key % 3 == 0 {
+            assert_eq!(put(&mut k, &mut t, &m, fd, key, u64::from(key) + 100, 0), 0);
+        }
+    }
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [28, 29, 30]);
+    // Batches: six updated, then everything looked up and deleted.
+    let batch_keys: Vec<u8> = (40u32..48).flat_map(u32::to_le_bytes).collect();
+    m.write(GuestAddr(KEYS), &batch_keys).unwrap();
+    m.write(GuestAddr(VALUES), &[0; 64]).unwrap();
+    let update = Attr::default()
+        .word(16, KEYS)
+        .word(24, VALUES)
+        .half(32, 6)
+        .half(36, fd as u32);
+    assert_eq!(bpf(&mut k, &mut t, &m, MAP_UPDATE_BATCH, &update), 0);
+    assert_eq!(count(&m), 6);
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [30, 43, 44, 45]);
+    let take = Attr::default()
+        .word(8, BATCH_OUT)
+        .word(16, KEYS)
+        .word(24, VALUES)
+        .half(32, 8)
+        .half(36, fd as u32);
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, MAP_LOOKUP_AND_DELETE_BATCH, &take),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(count(&m), 4);
+    let mut taken = [0; 16];
+    m.read(GuestAddr(KEYS), &mut taken).unwrap();
+    let mut taken: Vec<u32> = taken
+        .chunks(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    taken.sort_unstable();
+    assert_eq!(taken, [30, 43, 44, 45]);
+    assert_eq!(lru_keys(&mut k, &mut t, &m, fd), [] as [u32; 0]);
+    // Lists for each CPU: one entry is one for each, so this CPU holds
+    // one key.
+    let own = make(&mut k, &mut t, &m, map(LRU_HASH, 4, 8, 1, F_NO_COMMON_LRU));
+    for key in 1..=3 {
+        assert_eq!(put(&mut k, &mut t, &m, own, key, key.into(), 0), 0);
+    }
+    assert_eq!(lru_keys(&mut k, &mut t, &m, own), [3]);
+}
+
+/// An LPM trie's key: a prefix length, then an IPv4 address.
+fn v4(address: [u8; 4], length: u32) -> [u8; 8] {
+    let mut key = [0; 8];
+    key[..4].copy_from_slice(&length.to_le_bytes());
+    key[4..].copy_from_slice(&address);
+    key
+}
+
+/// `bpf.c`'s `case_lpm`, of IPv4 keys: what a trie takes, the longest
+/// prefix a lookup finds, the order of its next keys, and its batches.
+#[test]
+fn an_lpm_trie_finds_the_longest_prefix_and_walks_its_keys_in_linux_s_order() {
+    let (mut k, mut t, m) = setup();
+    let einval = errno(Errno::EINVAL);
+    let trie =
+        |key: u32, value: u32, entries: u32, flags: u32| map(LPM_TRIE, key, value, entries, flags);
+    // A prefix length and 1 to 256 bytes, a value up to what one kmalloc
+    // holds with the node, entries, and BPF_F_NO_PREALLOC, which it must
+    // have, with its own flags alone.
+    for attr in [
+        trie(4, 4, 10, F_NO_PREALLOC),
+        trie(261, 4, 10, F_NO_PREALLOC),
+        trie(8, 0, 10, F_NO_PREALLOC),
+        trie(8, (1 << 22) - 279, 10, F_NO_PREALLOC),
+        trie(8, 4, 0, F_NO_PREALLOC),
+        trie(8, 4, 10, 0),
+        trie(8, 4, 10, F_NO_PREALLOC | F_ZERO_SEED),
+        trie(8, 4, 10, F_NO_PREALLOC | F_MMAPABLE),
+        trie(8, 4, 10, F_NO_PREALLOC | F_RDONLY_PROG | F_WRONLY_PROG),
+    ] {
+        assert_eq!(create(&mut k, &mut t, &m, attr), einval);
+    }
+    for key in [5, 260] {
+        make(&mut k, &mut t, &m, trie(key, 4, 10, F_NO_PREALLOC));
+    }
+    let fd = make(&mut k, &mut t, &m, trie(8, 4, 6, F_NO_PREALLOC));
+    let put = |k: &mut Kernel, t: &mut Thread, a: [u8; 4], length: u32, v: u32, flags: u64| {
+        let kv = (Some(&v4(a, length)[..]), Some(&v.to_le_bytes()[..]));
+        elem_with(k, t, &m, MAP_UPDATE_ELEM, fd, kv, flags)
+    };
+    // What a lookup finds, or its error.
+    let find = |k: &mut Kernel, t: &mut Thread, a: [u8; 4], length: u32| {
+        let r = elem(
+            k,
+            t,
+            &m,
+            MAP_LOOKUP_ELEM,
+            fd,
+            Some(&v4(a, length)),
+            Some(&[0; 4]),
+        );
+        if r == 0 { Ok(value(&m) as u32) } else { Err(r) }
+    };
+    let order = |k: &mut Kernel, t: &mut Thread| {
+        let (found, end) = keys(k, t, &m, fd, 8);
+        assert_eq!(end, errno(Errno::ENOENT));
+        found
+            .iter()
+            .map(|key| {
+                (
+                    key[4..].to_vec(),
+                    u32::from_le_bytes(key[..4].try_into().unwrap()),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let key = |a: [u8; 4], length: u32| (a.to_vec(), length);
+    let enoent = Err(errno(Errno::ENOENT));
+    assert_eq!(order(&mut k, &mut t), []);
+    assert_eq!(put(&mut k, &mut t, [192, 168, 0, 0], 16, 1, NOEXIST), 0);
+    assert_eq!(put(&mut k, &mut t, [192, 168, 0, 0], 24, 2, 0), 0);
+    assert_eq!(put(&mut k, &mut t, [192, 168, 128, 0], 24, 3, 0), 0);
+    assert_eq!(put(&mut k, &mut t, [192, 168, 1, 0], 24, 5, 0), 0);
+    assert_eq!(find(&mut k, &mut t, [192, 168, 0, 7], 32), Ok(2));
+    assert_eq!(find(&mut k, &mut t, [192, 168, 1, 7], 32), Ok(5));
+    assert_eq!(find(&mut k, &mut t, [192, 168, 128, 1], 32), Ok(3));
+    assert_eq!(find(&mut k, &mut t, [192, 168, 200, 1], 32), Ok(1));
+    // The key's own length bounds the prefix it finds.
+    assert_eq!(find(&mut k, &mut t, [192, 168, 0, 0], 23), Ok(1));
+    assert_eq!(find(&mut k, &mut t, [192, 168, 0, 0], 15), enoent);
+    assert_eq!(find(&mut k, &mut t, [10, 0, 0, 1], 32), enoent);
+    assert_eq!(find(&mut k, &mut t, [192, 168, 0, 0], 33), enoent);
+    // trie_get_next_key: the longer prefixes first, in post-order.
+    let four = [
+        key([192, 168, 0, 0], 24),
+        key([192, 168, 1, 0], 24),
+        key([192, 168, 128, 0], 24),
+        key([192, 168, 0, 0], 16),
+    ];
+    assert_eq!(order(&mut k, &mut t), four);
+    // The next key of one it does not hold, or of no prefix it could, is
+    // the first.
+    for (a, length) in [([192, 168, 0, 0], 23), ([0, 0, 0, 0], 40)] {
+        m.write(GuestAddr(KEY), &v4(a, length)).unwrap();
+        let next = Attr::default()
+            .half(0, fd as u32)
+            .word(8, KEY)
+            .word(16, VALUE);
+        assert_eq!(bpf(&mut k, &mut t, &m, MAP_GET_NEXT_KEY, &next), 0);
+        let mut got = [0; 8];
+        m.read(GuestAddr(VALUE), &mut got).unwrap();
+        assert_eq!(got, v4([192, 168, 0, 0], 24));
+    }
+    assert_eq!(
+        put(&mut k, &mut t, [192, 168, 0, 0], 16, 9, NOEXIST),
+        errno(EEXIST)
+    );
+    assert_eq!(
+        put(&mut k, &mut t, [192, 168, 0, 0], 23, 4, EXIST),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(put(&mut k, &mut t, [192, 168, 0, 0], 23, 4, NOEXIST), 0);
+    assert_eq!(put(&mut k, &mut t, [192, 168, 0, 0], 33, 4, 0), einval);
+    // The key's bits past its prefix are kept as given.
+    assert_eq!(put(&mut k, &mut t, [10, 1, 2, 3], 8, 6, 0), 0);
+    // Full: a new key is ENOSPC, a key it holds is replaced.
+    assert_eq!(
+        put(&mut k, &mut t, [11, 0, 0, 0], 8, 7, 0),
+        errno(Errno::ENOSPC)
+    );
+    assert_eq!(
+        put(&mut k, &mut t, [11, 0, 0, 0], 8, 7, EXIST),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(put(&mut k, &mut t, [10, 9, 9, 9], 8, 8, EXIST), 0);
+    assert_eq!(
+        order(&mut k, &mut t),
+        [
+            key([10, 9, 9, 9], 8),
+            key([192, 168, 0, 0], 24),
+            key([192, 168, 1, 0], 24),
+            key([192, 168, 0, 0], 23),
+            key([192, 168, 128, 0], 24),
+            key([192, 168, 0, 0], 16),
+        ]
+    );
+    let take = |k: &mut Kernel, t: &mut Thread, a: [u8; 4], length: u32| {
+        elem(k, t, &m, MAP_DELETE_ELEM, fd, Some(&v4(a, length)), None)
+    };
+    assert_eq!(take(&mut k, &mut t, [192, 168, 0, 0], 23), 0);
+    assert_eq!(
+        take(&mut k, &mut t, [192, 168, 0, 0], 23),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(take(&mut k, &mut t, [192, 168, 0, 0], 33), einval);
+    assert_eq!(
+        take(&mut k, &mut t, [192, 168, 2, 0], 24),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(take(&mut k, &mut t, [192, 168, 0, 0], 24), 0);
+    assert_eq!(take(&mut k, &mut t, [192, 168, 0, 0], 16), 0);
+    assert_eq!(find(&mut k, &mut t, [192, 168, 0, 9], 32), enoent);
+    assert_eq!(find(&mut k, &mut t, [192, 168, 1, 9], 32), Ok(5));
+    assert_eq!(
+        order(&mut k, &mut t),
+        [
+            key([10, 9, 9, 9], 8),
+            key([192, 168, 1, 0], 24),
+            key([192, 168, 128, 0], 24),
+        ]
+    );
+    // A trie has no lookup and delete of its own.
+    assert_eq!(
+        elem(
+            &mut k,
+            &mut t,
+            &m,
+            MAP_LOOKUP_AND_DELETE_ELEM,
+            fd,
+            Some(&v4([10, 0, 0, 0], 8)),
+            Some(&[0; 4])
+        ),
+        errno(ENOTSUPP)
+    );
+    // Its batches are the generic ones, which follow the next keys.
+    let batch = |at: u64, count: u32| {
+        Attr::default()
+            .word(0, at)
+            .word(8, BATCH_OUT)
+            .word(16, KEYS)
+            .word(24, VALUES)
+            .half(32, count)
+            .half(36, fd as u32)
+    };
+    let read = |at: u64, len: usize| {
+        let mut b = vec![0; len];
+        m.read(GuestAddr(at), &mut b).unwrap();
+        b
+    };
+    assert_eq!(bpf(&mut k, &mut t, &m, MAP_LOOKUP_BATCH, &batch(0, 2)), 0);
+    assert_eq!(count(&m), 2);
+    assert_eq!(
+        read(KEYS, 16),
+        [v4([10, 9, 9, 9], 8), v4([192, 168, 1, 0], 24)].concat()
+    );
+    assert_eq!(
+        read(VALUES, 8),
+        [8u32.to_le_bytes(), 5u32.to_le_bytes()].concat()
+    );
+    let last = read(BATCH_OUT, 8);
+    assert_eq!(last, v4([192, 168, 1, 0], 24));
+    m.write(GuestAddr(BATCH_IN), &last).unwrap();
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, MAP_LOOKUP_BATCH, &batch(BATCH_IN, 8)),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(count(&m), 1);
+    assert_eq!(read(KEYS, 8), v4([192, 168, 128, 0], 24));
+    assert_eq!(read(VALUES, 4), 3u32.to_le_bytes());
+    // No lookup and delete batch: the count is left as it was.
+    assert_eq!(
+        bpf(
+            &mut k,
+            &mut t,
+            &m,
+            MAP_LOOKUP_AND_DELETE_BATCH,
+            &batch(0, 2)
+        ),
+        errno(ENOTSUPP)
+    );
+    assert_eq!(count(&m), 2);
+    // An update batch stops at the key it refuses, a delete batch at the
+    // one it does not hold, each with the count of those done.
+    let three = [
+        v4([172, 16, 0, 0], 12),
+        v4([172, 16, 0, 0], 40),
+        v4([172, 17, 0, 0], 16),
+    ];
+    m.write(GuestAddr(KEYS), &three.concat()).unwrap();
+    let values: Vec<u8> = [20u32, 21, 22]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    m.write(GuestAddr(VALUES), &values).unwrap();
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, MAP_UPDATE_BATCH, &batch(0, 3)),
+        einval
+    );
+    assert_eq!(count(&m), 1);
+    assert_eq!(find(&mut k, &mut t, [172, 16, 5, 5], 32), Ok(20));
+    m.write(GuestAddr(KEYS + 8), &v4([192, 168, 1, 0], 24))
+        .unwrap();
+    assert_eq!(
+        bpf(&mut k, &mut t, &m, MAP_DELETE_BATCH, &batch(0, 3)),
+        errno(Errno::ENOENT)
+    );
+    assert_eq!(count(&m), 2);
+    assert_eq!(
+        order(&mut k, &mut t),
+        [key([10, 9, 9, 9], 8), key([192, 168, 128, 0], 24)]
     );
 }

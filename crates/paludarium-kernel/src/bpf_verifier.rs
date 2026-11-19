@@ -14,7 +14,6 @@
 //! - with `allow_ptr_leaks`, master makes a number of a pointer that a
 //!   multiplication, a shift or a bitwise operation is applied to, where
 //!   7.0 refuses it;
-//! - master refuses a `BPF_LD_IMM64` whose `off` is not 0, which 7.0 takes;
 //! - master takes an exit whose `src_reg` is `BPF_UNWIND_EXIT`.
 //!
 //! The log lines are 7.0's where the two kernels word them differently
@@ -32,21 +31,32 @@
 //! - No state is pruned: every path is walked, against the same limit of
 //!   1,000,000 instructions and 8,192 pending branches, which Linux's
 //!   pruning only keeps it further from.
+//! - A lookup's result is null until the program compares it with 0 in a
+//!   64-bit `BPF_JEQ` or `BPF_JNE` of an immediate, where Linux also knows
+//!   an array's element by a constant key is there, and compares two
+//!   pointers.
 //! - Rejected outright, with a line of the emulator's own ("paludarium:
 //!   ..."; a helper call's starts "unknown func", which tells libbpf and
-//!   bpftool the helper is not there): helper calls, bpf-to-bpf calls and
-//!   kfuncs, the context's
-//!   fields (`struct __sk_buff`), `BPF_LD_IMM64` of maps, BTF IDs and
-//!   functions, `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`,
-//!   indirect jumps, a back-edge (Linux takes a bounded loop from a
-//!   privileged loader), a pointer with a variable offset, and
-//!   `BPF_F_TEST_REG_INVARIANTS` with a conditional jump.
+//!   bpftool the helper is not there): helpers other than
+//!   `bpf_map_lookup_elem`, `bpf_map_update_elem` and `bpf_map_delete_elem`,
+//!   those of maps of maps, queues, stacks and bloom filters, a helper's
+//!   argument other than the stack or a map's value, bpf-to-bpf calls and
+//!   kfuncs, the context's fields (`struct __sk_buff`) and a map's own
+//!   (`struct bpf_map`), maps from `fd_array` and maps made with
+//!   `excl_prog_hash`, BTF IDs and functions in `BPF_LD_IMM64`,
+//!   `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`, indirect jumps, a
+//!   back-edge (Linux takes a bounded loop from a privileged loader), a
+//!   pointer with a variable offset, and `BPF_F_TEST_REG_INVARIANTS` with a
+//!   conditional jump.
 //! - The loader has `CAP_BPF` and `CAP_PERFMON` ([`crate::bpf_prog`]
 //!   refuses others), so the verifier allows what Linux allows them:
 //!   pointer leaks, uninitialized stack reads and no Spectre sanitizing.
 use paludarium_types::Errno;
 
 const EACCES: Errno = Errno(13);
+const EPROTO: Errno = Errno(71);
+/// The kernel's own `ENOTSUPP`, which reaches user space as it is.
+const ENOTSUPP: Errno = Errno(524);
 const E2BIG: Errno = Errno(7);
 
 /// `BPF_COMPLEXITY_LIMIT_INSNS`.
@@ -209,6 +219,52 @@ pub(crate) struct Options {
     pub(crate) strict_alignment: bool,
     /// `BPF_F_TEST_REG_INVARIANTS`.
     pub(crate) test_reg_invariants: bool,
+    /// Whether `fd_array` is given.
+    pub(crate) fd_array: bool,
+}
+
+/// What the verifier needs of a map a program names by its descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MapShape {
+    /// The map's ID, which tells two descriptors of one map apart from two
+    /// maps (`used_maps` holds each map once).
+    pub(crate) id: u32,
+    pub(crate) kind: u32,
+    pub(crate) key_size: u32,
+    pub(crate) value_size: u32,
+    pub(crate) max_entries: u32,
+    pub(crate) flags: u32,
+    /// Made with `excl_prog_hash`.
+    pub(crate) exclusive: bool,
+}
+
+/// `__bpf_map_get` of a descriptor: the map's shape, or `EBADF` for no
+/// descriptor and `EINVAL` for one of no map.
+pub(crate) type Maps<'a> = dyn FnMut(i32) -> Result<MapShape, Errno> + 'a;
+
+/// `MAX_USED_MAPS`.
+const MAX_USED_MAPS: usize = 64;
+
+mod map_type {
+    pub const HASH: u32 = 1;
+    pub const ARRAY: u32 = 2;
+    pub const LRU_HASH: u32 = 9;
+    pub const LPM_TRIE: u32 = 11;
+    pub const ARRAY_OF_MAPS: u32 = 12;
+    pub const HASH_OF_MAPS: u32 = 13;
+    pub const QUEUE: u32 = 22;
+    pub const STACK: u32 = 23;
+}
+
+/// The map flags a program's access depends on (`bpf_map_flags_to_cap`).
+const F_RDONLY_PROG: u32 = 1 << 7;
+const F_WRONLY_PROG: u32 = 1 << 8;
+
+/// The helpers in range, `enum bpf_func_id`.
+mod func {
+    pub const MAP_LOOKUP_ELEM: i32 = 1;
+    pub const MAP_UPDATE_ELEM: i32 = 2;
+    pub const MAP_DELETE_ELEM: i32 = 3;
 }
 
 /// A program that passed.
@@ -218,6 +274,8 @@ pub(crate) struct Verified {
     pub(crate) processed: u32,
     /// The stack the program uses, in bytes, rounded up to 8.
     pub(crate) stack_depth: u32,
+    /// The maps the program uses (`used_maps`), by ID.
+    pub(crate) maps: Vec<u32>,
 }
 
 /// Why a program is refused: the error and the line the log gets.
@@ -254,15 +312,20 @@ pub(crate) fn ends_in_half(insns: &[Insn]) -> bool {
 /// `bpf_check` for a socket filter, from the checks of the instructions on,
 /// for a program [`ends_in_half`] took. `BPF_PROG_LOAD` refuses no
 /// instructions at all (`E2BIG`) before it gets here.
-pub(crate) fn check(insns: &[Insn], options: Options) -> Result<Verified, Rejection> {
+pub(crate) fn check(
+    insns: &[Insn],
+    options: Options,
+    maps: &mut Maps<'_>,
+) -> Result<Verified, Rejection> {
     debug_assert!(!insns.is_empty() && !ends_in_half(insns));
     let mut walk = Walk::default();
-    let result = structure(insns, options).and_then(|()| walk.run(insns, options));
+    let result = structure(insns, options, maps, &mut walk).and_then(|()| walk.run(insns, options));
     let stack_depth = walk.depth.div_ceil(8) * 8;
     match result {
         Ok(()) => Ok(Verified {
             processed: walk.processed,
             stack_depth,
+            maps: walk.maps.iter().map(|m| m.id).collect(),
         }),
         Err((errno, line)) => Err(Rejection {
             errno,
@@ -274,7 +337,12 @@ pub(crate) fn check(insns: &[Insn], options: Options) -> Result<Verified, Reject
 }
 
 /// The checks before any path is walked, in master's order.
-fn structure(insns: &[Insn], options: Options) -> Checked<()> {
+fn structure(
+    insns: &[Insn],
+    options: Options,
+    maps: &mut Maps<'_>,
+    walk: &mut Walk,
+) -> Checked<()> {
     // add_subprogs, add_kfuncs: one function, calling no other.
     for insn in insns {
         if insn.code == class::JMP | jmp::CALL
@@ -290,7 +358,7 @@ fn structure(insns: &[Insn], options: Options) -> Checked<()> {
     let mut i = 0;
     while i < insns.len() {
         // A BPF_LD_IMM64's second half is checked with its first.
-        i += fields(insns, i)?;
+        i += fields(insns, i, options, maps, walk)?;
     }
     cfg(insns)?;
     // check_attach_btf_id: a socket filter cannot sleep. 7.0's words.
@@ -372,7 +440,13 @@ fn known(code: u8) -> bool {
 /// `check_and_resolve_insns` for the instruction at `i`: its registers,
 /// a BPF_LD_IMM64's second half, the opcode, and `check_insn_fields`.
 /// Gives how many instructions it took.
-fn fields(insns: &[Insn], i: usize) -> Checked<usize> {
+fn fields(
+    insns: &[Insn],
+    i: usize,
+    options: Options,
+    maps: &mut Maps<'_>,
+    walk: &mut Walk,
+) -> Checked<usize> {
     let insn = insns[i];
     if usize::from(insn.dst) >= REGS {
         return refuse(Errno::EINVAL, format!("R{} is invalid", insn.dst));
@@ -385,18 +459,58 @@ fn fields(insns: &[Insn], i: usize) -> Checked<usize> {
         if next.is_none_or(|n| n.code != 0 || n.dst != 0 || n.src != 0 || n.off != 0) {
             return refuse(Errno::EINVAL, "invalid bpf_ld_imm64 insn");
         }
-        // Master's; 7.0 takes one.
+        // Master's place; 7.0 refuses it as it walks the instruction.
         if insn.off != 0 {
             return refuse(Errno::EINVAL, "BPF_LD_IMM64 uses reserved fields");
         }
-        return match insn.src {
-            0 => Ok(2),
-            pseudo::BTF_ID => gap("BTF IDs in BPF_LD_IMM64"),
-            pseudo::FUNC => gap("references to functions"),
-            pseudo::MAP_VALUE | pseudo::MAP_IDX_VALUE => gap("maps"),
-            pseudo::MAP_FD | pseudo::MAP_IDX if next.is_some_and(|n| n.imm == 0) => gap("maps"),
-            _ => refuse(Errno::EINVAL, "unrecognized bpf_ld_imm64 insn"),
+        let second = next.map_or(0, |n| n.imm);
+        match insn.src {
+            0 => return Ok(2),
+            pseudo::BTF_ID => return gap("BTF IDs in BPF_LD_IMM64"),
+            pseudo::FUNC => return gap("references to functions"),
+            pseudo::MAP_VALUE | pseudo::MAP_IDX_VALUE => {}
+            pseudo::MAP_FD | pseudo::MAP_IDX if second == 0 => {}
+            _ => return refuse(Errno::EINVAL, "unrecognized bpf_ld_imm64 insn"),
+        }
+        if matches!(insn.src, pseudo::MAP_IDX | pseudo::MAP_IDX_VALUE) {
+            if !options.fd_array {
+                return refuse(EPROTO, "fd_idx without fd_array is invalid");
+            }
+            return gap("maps from fd_array");
+        }
+        let map = walk.use_map(insn.imm, options, maps)?;
+        let value = if insn.src == pseudo::MAP_VALUE {
+            // map_direct_value_addr: an array of one element alone.
+            let shape = walk.maps[usize::from(map)];
+            let off = second as u32;
+            if shape.kind != map_type::ARRAY {
+                return refuse(
+                    Errno::EINVAL,
+                    "no direct value access support for this map type",
+                );
+            }
+            let errno = if shape.max_entries != 1 {
+                Some(ENOTSUPP)
+            } else if off >= shape.value_size {
+                Some(Errno::EINVAL)
+            } else {
+                None
+            };
+            if let Some(errno) = errno {
+                return refuse(
+                    errno,
+                    format!(
+                        "invalid access to map value pointer, value_size={} off={off}",
+                        shape.value_size
+                    ),
+                );
+            }
+            Some(off)
+        } else {
+            None
         };
+        walk.loads.insert(i, (map, value));
+        return Ok(2);
     }
     if !known(insn.code) {
         return refuse(Errno::EINVAL, format!("unknown opcode {:02x}", insn.code));
@@ -666,6 +780,13 @@ enum Ptr {
     Ctx,
     /// `PTR_TO_STACK`, from the frame pointer.
     Stack,
+    /// `CONST_PTR_TO_MAP`, the map of an index into `used_maps`.
+    Map(u8),
+    /// `PTR_TO_MAP_VALUE`, into a value of the map.
+    Value(u8),
+    /// `PTR_TO_MAP_VALUE | PTR_MAYBE_NULL`, a lookup's result before the
+    /// program compares it with 0, with the ID every copy of it shares.
+    MaybeNull(u8, u32),
 }
 
 impl Ptr {
@@ -674,7 +795,19 @@ impl Ptr {
         match self {
             Ptr::Ctx => "ctx",
             Ptr::Stack => "fp",
+            Ptr::Map(_) => "map_ptr",
+            Ptr::Value(_) => "map_value",
+            Ptr::MaybeNull(..) => "map_value_or_null",
         }
+    }
+}
+
+/// `reg_type_str` of a register.
+fn reg_name(reg: Reg) -> &'static str {
+    match reg {
+        Reg::NotInit => "?",
+        Reg::Scalar(_) => "scalar",
+        Reg::Ptr(p, _) => p.name(),
     }
 }
 
@@ -692,6 +825,30 @@ struct State {
     insn: usize,
     regs: [Reg; REGS],
     stack: [Slot; (MAX_STACK / 8) as usize],
+}
+
+impl State {
+    /// `mark_ptr_or_null_regs`: every copy of the lookup's result `id`, in
+    /// a register or spilled, is 0 (a scalar) or a pointer to a value.
+    fn null_check(&mut self, id: u32, null: bool) {
+        let mark = |reg: &mut Reg| {
+            if let Reg::Ptr(Ptr::MaybeNull(map, i), _) = *reg
+                && i == id
+            {
+                *reg = if null {
+                    Reg::Scalar(Some(0))
+                } else {
+                    Reg::Ptr(Ptr::Value(map), 0)
+                };
+            }
+        };
+        self.regs.iter_mut().for_each(mark);
+        for slot in &mut self.stack {
+            if let Slot::Spill(reg) = slot {
+                mark(reg);
+            }
+        }
+    }
 }
 
 /// `bpf_alu_string`.
@@ -724,7 +881,9 @@ enum Store {
 /// How an instruction leaves the walk.
 enum Step {
     Next(usize),
-    Branch(usize, usize),
+    /// The fall-through, the target, and the ID of a lookup's result that
+    /// the jump tells is 0 on the target's side (`true`) or the other.
+    Branch(usize, usize, Option<(u32, bool)>),
     Exit,
 }
 
@@ -734,9 +893,64 @@ struct Walk {
     processed: u32,
     /// The deepest stack byte accessed.
     depth: u32,
+    /// `used_maps`.
+    maps: Vec<MapShape>,
+    /// Each BPF_LD_IMM64 of a map: its index in `maps`, and the offset in
+    /// the value of a `BPF_PSEUDO_MAP_VALUE`.
+    loads: std::collections::BTreeMap<usize, (u8, Option<u32>)>,
+    /// `id_gen`.
+    ids: u32,
 }
 
 impl Walk {
+    /// `add_used_map`: the map of `fd`, once however many times the
+    /// program names it, and `check_map_prog_compatibility`.
+    fn use_map(&mut self, fd: i32, options: Options, maps: &mut Maps<'_>) -> Checked<u8> {
+        let shape = match maps(fd) {
+            Ok(shape) => shape,
+            Err(errno) => {
+                return refuse(errno, format!("fd {fd} is not pointing to valid bpf_map"));
+            }
+        };
+        if let Some(i) = self.maps.iter().position(|m| m.id == shape.id) {
+            return Ok(i as u8);
+        }
+        if self.maps.len() >= MAX_USED_MAPS {
+            return refuse(
+                E2BIG,
+                format!(
+                    "The total number of maps per program has reached the limit of {MAX_USED_MAPS}"
+                ),
+            );
+        }
+        // 7.0 refuses one whose hash is another program's here, and master
+        // after all the instructions.
+        if shape.exclusive {
+            return gap("maps made with excl_prog_hash");
+        }
+        // A sleepable program, which is refused later anyway, uses only
+        // the types 7.0 lists.
+        if options.sleepable
+            && !matches!(
+                shape.kind,
+                map_type::HASH
+                    | map_type::LRU_HASH
+                    | map_type::ARRAY
+                    | map_type::ARRAY_OF_MAPS
+                    | map_type::HASH_OF_MAPS
+                    | map_type::QUEUE
+                    | map_type::STACK
+            )
+        {
+            return refuse(
+                Errno::EINVAL,
+                "Sleepable programs can only use array, hash, ringbuf and local storage maps",
+            );
+        }
+        self.maps.push(shape);
+        Ok((self.maps.len() - 1) as u8)
+    }
+
     /// `do_check`: every path from the first instruction, the fall-through
     /// first and the jumps' targets after, last pushed first.
     fn run(&mut self, insns: &[Insn], options: Options) -> Checked<()> {
@@ -762,9 +976,14 @@ impl Walk {
             }
             match self.step(insns, &mut state, options)? {
                 Step::Next(next) => state.insn = next,
-                Step::Branch(fall, target) => {
+                Step::Branch(fall, target, null) => {
                     let mut other = state.clone();
                     other.insn = target;
+                    if let Some((id, on_target)) = null {
+                        // mark_ptr_or_null_regs on both sides.
+                        other.null_check(id, on_target);
+                        state.null_check(id, !on_target);
+                    }
                     pending.push(other);
                     if pending.len() > COMPLEXITY_LIMIT_JMP_SEQ {
                         return refuse(
@@ -814,16 +1033,20 @@ impl Walk {
                 self.access(s, insn.dst, insn.off, insn.size(), Some(value), options)?;
                 Ok(next)
             }
-            class::JMP | class::JMP32 => jmp_op(s, insn, i),
+            class::JMP | class::JMP32 => self.jmp_op(s, insn, i),
             _ => {
                 if insn.mode() != mode::IMM {
                     return gap("BPF_LD_ABS and BPF_LD_IND");
                 }
-                // check_ld_imm: a plain 64-bit constant.
+                // check_ld_imm: a 64-bit constant, a map or a map's value.
                 write_ok(insn.dst)?;
                 let low = u64::from(insn.imm as u32);
                 let high = u64::from(insns[i + 1].imm as u32);
-                s.regs[usize::from(insn.dst)] = Reg::Scalar(Some(high << 32 | low));
+                s.regs[usize::from(insn.dst)] = match self.loads.get(&i) {
+                    None => Reg::Scalar(Some(high << 32 | low)),
+                    Some(&(map, None)) => Reg::Ptr(Ptr::Map(map), 0),
+                    Some(&(map, Some(off))) => Reg::Ptr(Ptr::Value(map), off as i32),
+                };
                 Ok(Step::Next(i + 2))
             }
         }
@@ -886,6 +1109,22 @@ impl Walk {
                 }
             }
             Reg::Ptr(Ptr::Ctx, _) => gap("the context's fields"),
+            Reg::Ptr(Ptr::Map(_), _) => gap("the fields of struct bpf_map"),
+            Reg::Ptr(p @ Ptr::MaybeNull(..), _) => {
+                refuse(EACCES, format!("R{ptr} invalid mem access '{}'", p.name()))
+            }
+            Reg::Ptr(Ptr::Value(map), base) => {
+                let total = i64::from(base) + i64::from(off);
+                if options.strict_alignment && bytes > 1 && total % bytes != 0 {
+                    return refuse(
+                        EACCES,
+                        format!("misaligned value access off 0+{base}+{off} size {bytes}"),
+                    );
+                }
+                let write = value.is_some();
+                self.value_access(ptr, map, total, bytes, write)?;
+                Ok(Reg::Scalar(None))
+            }
             Reg::Scalar(known) => {
                 if options.strict_alignment && bytes > 1 {
                     match known {
@@ -913,6 +1152,133 @@ impl Walk {
             }
             Reg::NotInit => refuse(EACCES, format!("R{ptr} !read_ok")),
         }
+    }
+}
+
+impl Walk {
+    /// `check_map_access_type` and `check_map_access` of `bytes` at `off`
+    /// in a value of the map through the register `r`: what
+    /// `BPF_F_RDONLY_PROG` and `BPF_F_WRONLY_PROG` forbid, and the value's
+    /// bounds, for which `check_mem_region_access` writes a second line.
+    fn value_access(&self, r: u8, map: u8, off: i64, bytes: i64, write: bool) -> Checked<()> {
+        let shape = self.maps[usize::from(map)];
+        let size = i64::from(shape.value_size);
+        if write && shape.flags & F_RDONLY_PROG != 0 {
+            return refuse(
+                EACCES,
+                format!("write into map forbidden, value_size={size} off={off} size={bytes}"),
+            );
+        }
+        if !write && shape.flags & F_WRONLY_PROG != 0 {
+            return refuse(
+                EACCES,
+                format!("read from map forbidden, value_size={size} off={off} size={bytes}"),
+            );
+        }
+        if off < 0 || off + bytes > size {
+            return refuse(
+                EACCES,
+                format!(
+                    "invalid access to map value, value_size={size} off={off} size={bytes}\nR{r} min value is outside of the allowed memory range"
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// `check_helper_mem_access` of a helper's argument in `r`, which
+    /// reads `bytes`: a fixed place on the stack, or in a map's value.
+    fn helper_read(&mut self, s: &State, r: u8, bytes: u32) -> Checked<()> {
+        read_ok(s, r)?;
+        let bytes = i64::from(bytes);
+        match s.regs[usize::from(r)] {
+            Reg::Ptr(Ptr::Stack, base) => {
+                let base = i64::from(base);
+                // check_stack_range_initialized: a privileged loader may
+                // pass bytes it never wrote.
+                if !(-MAX_STACK..=-1).contains(&base) {
+                    return refuse(
+                        EACCES,
+                        format!("invalid read from stack R{r} off={base} size={bytes}"),
+                    );
+                }
+                if base + bytes > 0 {
+                    return refuse(
+                        Errno::EINVAL,
+                        format!("invalid read from stack R{r} off={base} size={bytes}"),
+                    );
+                }
+                self.depth = self.depth.max((-base) as u32);
+                Ok(())
+            }
+            Reg::Ptr(Ptr::Value(map), base) => {
+                self.value_access(r, map, i64::from(base), bytes, false)
+            }
+            _ => gap("helper arguments of other types"),
+        }
+    }
+
+    /// `check_helper_call` of the map helpers in range.
+    fn helper(&mut self, s: &mut State, id: i32) -> Checked<()> {
+        if !matches!(
+            id,
+            func::MAP_LOOKUP_ELEM | func::MAP_UPDATE_ELEM | func::MAP_DELETE_ELEM
+        ) {
+            // libbpf and bpftool take a helper as there unless the log
+            // says "unknown func" (or Linux's other words for one a type
+            // cannot use), so the line starts with Linux's for an unknown
+            // helper.
+            return refuse(
+                Errno::EINVAL,
+                format!("unknown func #{id} (paludarium: helper calls are not verified yet)"),
+            );
+        }
+        // check_func_arg of ARG_CONST_MAP_PTR.
+        read_ok(s, 1)?;
+        let map = match s.regs[1] {
+            Reg::Ptr(Ptr::Map(map), _) => map,
+            reg => {
+                return refuse(
+                    EACCES,
+                    format!("R1 type={} expected=map_ptr", reg_name(reg)),
+                );
+            }
+        };
+        let shape = self.maps[usize::from(map)];
+        if !matches!(
+            shape.kind,
+            map_type::ARRAY | map_type::HASH | map_type::LRU_HASH | map_type::LPM_TRIE
+        ) {
+            return gap("map helpers of maps of maps, queues, stacks and bloom filters");
+        }
+        // ARG_PTR_TO_MAP_KEY, and ARG_PTR_TO_MAP_VALUE and ARG_ANYTHING.
+        self.helper_read(s, 2, shape.key_size)?;
+        if id == func::MAP_UPDATE_ELEM {
+            self.helper_read(s, 3, shape.value_size)?;
+            read_ok(s, 4)?;
+        }
+        // record_func_map.
+        if id != func::MAP_LOOKUP_ELEM && shape.flags & F_RDONLY_PROG != 0 {
+            return refuse(EACCES, "write into map forbidden");
+        }
+        // The caller-saved registers.
+        s.regs[1..=5].fill(Reg::NotInit);
+        s.regs[0] = if id == func::MAP_LOOKUP_ELEM {
+            self.ids += 1;
+            Reg::Ptr(Ptr::MaybeNull(map, self.ids), 0)
+        } else {
+            Reg::Scalar(None)
+        };
+        Ok(())
+    }
+
+    /// The jumps: `BPF_JA`, `BPF_EXIT`, a call, and `check_cond_jmp_op`.
+    fn jmp_op(&mut self, s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
+        if insn.op() == jmp::CALL {
+            self.helper(s, insn.imm)?;
+            return Ok(Step::Next(i + 1));
+        }
+        jmp_op(s, insn, i)
     }
 }
 
@@ -1099,6 +1465,23 @@ fn pointer_math(
             format!("R{dst} 32-bit pointer arithmetic prohibited"),
         );
     }
+    if let Ptr::MaybeNull(..) = ptr {
+        return refuse(
+            EACCES,
+            format!(
+                "R{dst} pointer arithmetic on {} prohibited, null-check it first",
+                ptr.name()
+            ),
+        );
+    }
+    if let Ptr::Map(_) = ptr
+        && !(scalar == Some(0) && op == alu::ADD)
+    {
+        return refuse(
+            EACCES,
+            format!("R{dst} pointer arithmetic on {} prohibited", ptr.name()),
+        );
+    }
     // check_reg_sane_offset of the scalar, then of the pointer.
     let Some(value) = scalar else {
         return gap("pointers with a variable offset");
@@ -1210,16 +1593,7 @@ fn scalar_math(insn: Insn, a: Option<u64>, b: Option<u64>) -> Option<u64> {
 /// The jumps: `BPF_JA`, `BPF_EXIT`, a call, and `check_cond_jmp_op`.
 fn jmp_op(s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
     match insn.op() {
-        // libbpf and bpftool take a helper as there unless the log says
-        // "unknown func" (or Linux's other words for one a type cannot
-        // use), so the line starts with Linux's for an unknown helper.
-        jmp::CALL => refuse(
-            Errno::EINVAL,
-            format!(
-                "unknown func #{} (paludarium: helper calls are not verified yet)",
-                insn.imm
-            ),
-        ),
+        jmp::CALL => unreachable!("Walk::jmp_op calls the helpers"),
         jmp::JA if insn.x() => gap("indirect jumps"),
         jmp::JA => Ok(Step::Next((i as i64 + insn.jump() + 1) as usize)),
         jmp::EXIT => {
@@ -1247,7 +1621,17 @@ fn jmp_op(s: &mut State, insn: Insn, i: usize) -> Checked<Step> {
                         Ok(Step::Next(i + 1))
                     }
                 }
-                _ => Ok(Step::Branch(i + 1, target)),
+                // A 64-bit comparison of a lookup's result with 0 tells
+                // whether it is null.
+                (Reg::Ptr(Ptr::MaybeNull(_, id), _), _)
+                    if insn.class() == class::JMP
+                        && !insn.x()
+                        && insn.imm == 0
+                        && matches!(op, jmp::JEQ | jmp::JNE) =>
+                {
+                    Ok(Step::Branch(i + 1, target, Some((id, op == jmp::JEQ))))
+                }
+                _ => Ok(Step::Branch(i + 1, target, None)),
             }
         }
     }
@@ -1310,14 +1694,39 @@ mod tests {
     fn ldx(size: u8, dst: u8, src: u8, off: i16) -> Insn {
         i(0x61 | size, dst, src, off, 0)
     }
+    /// The maps of the tests, by descriptor: 3 an array of one 8-byte
+    /// value with 4-byte keys, 4 a hash with 8-byte keys and values, 5 a
+    /// read-only array, 6 a queue; any other is no map.
+    fn maps(fd: i32) -> Result<MapShape, Errno> {
+        let shape = |id, kind, key_size, value_size, max_entries, flags| MapShape {
+            id,
+            kind,
+            key_size,
+            value_size,
+            max_entries,
+            flags,
+            exclusive: false,
+        };
+        match fd {
+            3 => Ok(shape(30, map_type::ARRAY, 4, 8, 1, 0)),
+            4 => Ok(shape(40, map_type::HASH, 8, 8, 16, 0)),
+            5 => Ok(shape(50, map_type::ARRAY, 4, 8, 1, F_RDONLY_PROG)),
+            6 => Ok(shape(60, map_type::QUEUE, 0, 8, 4, 0)),
+            7 => Err(Errno::EINVAL),
+            _ => Err(Errno::EBADF),
+        }
+    }
+    fn verify(insns: &[Insn], options: Options) -> Result<Verified, Rejection> {
+        check(insns, options, &mut maps)
+    }
     fn ok(insns: &[Insn]) -> u32 {
-        match check(insns, Options::default()) {
+        match verify(insns, Options::default()) {
             Ok(v) => v.processed,
             Err(r) => panic!("refused: {} ({:?})", r.line, r.errno),
         }
     }
     fn refused(insns: &[Insn]) -> (Errno, String) {
-        let r = check(insns, Options::default()).expect_err("accepted");
+        let r = verify(insns, Options::default()).expect_err("accepted");
         (r.errno, r.line)
     }
 
@@ -1567,7 +1976,7 @@ mod tests {
         ]);
         // A division is not followed here, so both ways are walked.
         assert!(
-            check(
+            verify(
                 &[
                     mov(1, 8),
                     i(0x37, 1, 0, 0, 2),
@@ -1592,7 +2001,15 @@ mod tests {
         gap(&[i(0x85, 0, 0, 0, 7), exit()]);
         gap(&[i(0x85, 0, 1, 0, 1), exit(), mov(0, 0), exit()]);
         gap(&[ldx(0x10, 0, 1, 0), exit()]);
-        gap(&[i(0x18, 1, 1, 0, 3), i(0, 0, 0, 0, 0), mov(0, 0), exit()]);
+        // A queue's helpers are push, pop and peek.
+        gap(&[
+            i(0x18, 1, 1, 0, 6),
+            i(0, 0, 0, 0, 0),
+            mov_reg(2, 10),
+            i(0x07, 2, 0, 0, -8),
+            i(0x85, 0, 0, 0, 1),
+            exit(),
+        ]);
         gap(&[i(0x30, 0, 0, 0, 0), exit()]);
         gap(&[mov(0, 0), i(0xdb, 10, 0, -8, 0), exit()]);
         gap(&[
@@ -1609,7 +2026,7 @@ mod tests {
             sleepable: true,
             ..Options::default()
         };
-        let r = check(&[mov(0, 0), exit()], options).expect_err("accepted");
+        let r = verify(&[mov(0, 0), exit()], options).expect_err("accepted");
         assert_eq!(r.errno, Errno::EINVAL);
         assert!(r.line.ends_with("can be sleepable"));
     }
@@ -1622,8 +2039,185 @@ mod tests {
             insns.push(i(0x15, 0, 0, 0, 0));
         }
         insns.push(exit());
-        let r = check(&insns, Options::default()).expect_err("accepted");
+        let r = verify(&insns, Options::default()).expect_err("accepted");
         assert_eq!(r.errno, E2BIG);
         assert_eq!(r.line, "The sequence of 8193 jumps is too complex.");
+    }
+
+    /// `r = map fd`, two instructions.
+    fn ld_map(dst: u8, fd: i32) -> [Insn; 2] {
+        [i(0x18, dst, 1, 0, fd), i(0, 0, 0, 0, 0)]
+    }
+    fn call(id: i32) -> Insn {
+        i(0x85, 0, 0, 0, id)
+    }
+    /// A lookup of the key 0 at fp-4 in the map of `fd`, leaving R0.
+    fn lookup(fd: i32) -> Vec<Insn> {
+        let mut v = vec![i(0x62, 10, 0, -4, 0)];
+        v.extend(ld_map(1, fd));
+        v.extend([mov_reg(2, 10), i(0x07, 2, 0, 0, -4), call(1)]);
+        v
+    }
+
+    #[test]
+    fn a_lookup_must_be_null_checked() {
+        let mut p = lookup(3);
+        p.extend([ldx(0x18, 0, 0, 0), exit()]);
+        assert_eq!(
+            refused(&p),
+            (EACCES, "R0 invalid mem access 'map_value_or_null'".into())
+        );
+        // if r0 == 0 goto exit; r0 = *(u64 *)(r0 + 0)
+        let mut p = lookup(3);
+        p.extend([i(0x15, 0, 0, 1, 0), ldx(0x18, 0, 0, 0), exit()]);
+        ok(&p);
+        // A copy spilled before the check is checked with it.
+        let mut p = lookup(3);
+        p.extend([
+            stx_dw(10, 0, -16),
+            i(0x55, 0, 0, 2, 0),
+            mov(0, 0),
+            exit(),
+            ldx(0x18, 1, 10, -16),
+            ldx(0x18, 0, 1, 0),
+            exit(),
+        ]);
+        ok(&p);
+        // A 32-bit comparison does not tell.
+        let mut p = lookup(3);
+        p.extend([i(0x16, 0, 0, 1, 0), ldx(0x18, 0, 0, 0), exit()]);
+        assert_eq!(refused(&p).1, "R0 invalid mem access 'map_value_or_null'");
+        let mut p = lookup(3);
+        p.extend([i(0x07, 0, 0, 0, 1), exit()]);
+        assert_eq!(
+            refused(&p),
+            (
+                EACCES,
+                "R0 pointer arithmetic on map_value_or_null prohibited, null-check it first".into()
+            )
+        );
+    }
+
+    #[test]
+    fn a_maps_value_has_its_bounds_and_access() {
+        let mut p = lookup(3);
+        p.extend([i(0x15, 0, 0, 1, 0), ldx(0x18, 0, 0, 4), exit()]);
+        assert_eq!(
+            refused(&p),
+            (
+                EACCES,
+                "invalid access to map value, value_size=8 off=4 size=8\nR0 min value is outside of the allowed memory range".into()
+            )
+        );
+        let mut p = lookup(5);
+        p.extend([i(0x15, 0, 0, 1, 0), i(0x7a, 0, 0, 0, 1), exit()]);
+        assert_eq!(
+            refused(&p),
+            (
+                EACCES,
+                "write into map forbidden, value_size=8 off=0 size=8".into()
+            )
+        );
+        // The direct value of an array of one element.
+        let mut p = vec![i(0x18, 1, 2, 0, 3), i(0, 0, 0, 0, 4)];
+        p.extend([ldx(0x00, 0, 1, 0), exit()]);
+        ok(&p);
+        let mut p = vec![i(0x18, 1, 2, 0, 3), i(0, 0, 0, 0, 8)];
+        p.extend([mov(0, 0), exit()]);
+        assert_eq!(
+            refused(&p),
+            (
+                Errno::EINVAL,
+                "invalid access to map value pointer, value_size=8 off=8".into()
+            )
+        );
+        let mut p = vec![i(0x18, 1, 2, 0, 4), i(0, 0, 0, 0, 0)];
+        p.extend([mov(0, 0), exit()]);
+        assert_eq!(
+            refused(&p),
+            (
+                Errno::EINVAL,
+                "no direct value access support for this map type".into()
+            )
+        );
+    }
+
+    #[test]
+    fn a_map_is_named_by_its_descriptor() {
+        let mut p = ld_map(1, 9).to_vec();
+        p.extend([mov(0, 0), exit()]);
+        assert_eq!(
+            refused(&p),
+            (Errno::EBADF, "fd 9 is not pointing to valid bpf_map".into())
+        );
+        let mut p = ld_map(1, 7).to_vec();
+        p.extend([mov(0, 0), exit()]);
+        assert_eq!(refused(&p).0, Errno::EINVAL);
+        let mut p = vec![i(0x18, 1, 5, 0, 0), i(0, 0, 0, 0, 0)];
+        p.extend([mov(0, 0), exit()]);
+        assert_eq!(
+            refused(&p),
+            (EPROTO, "fd_idx without fd_array is invalid".into())
+        );
+        // The map pointer itself takes only += 0.
+        let mut p = ld_map(1, 3).to_vec();
+        p.extend([i(0x07, 1, 0, 0, 0), i(0x07, 1, 0, 0, 8), mov(0, 0), exit()]);
+        assert_eq!(
+            refused(&p),
+            (EACCES, "R1 pointer arithmetic on map_ptr prohibited".into())
+        );
+        // One map named twice is one map.
+        let mut p = ld_map(1, 3).to_vec();
+        p.extend(ld_map(2, 3));
+        p.extend([mov(0, 0), exit()]);
+        assert_eq!(
+            verify(&p, Options::default()).map(|v| v.maps).ok(),
+            Some(vec![30])
+        );
+    }
+
+    #[test]
+    fn the_map_helpers_check_their_arguments() {
+        // update(map, key, value, flags), then the arguments are gone.
+        let mut p = vec![stx_dw(10, 10, -8), i(0x62, 10, 0, -12, 0)];
+        p.extend(ld_map(1, 3));
+        p.extend([
+            mov_reg(2, 10),
+            i(0x07, 2, 0, 0, -12),
+            mov_reg(3, 10),
+            i(0x07, 3, 0, 0, -8),
+            mov(4, 0),
+            call(2),
+            mov_reg(0, 1),
+            exit(),
+        ]);
+        assert_eq!(refused(&p), (EACCES, "R1 !read_ok".into()));
+        let n = p.len();
+        p[n - 2] = mov(0, 0);
+        ok(&p);
+        // The key must be within the stack.
+        let mut p = ld_map(1, 4).to_vec();
+        p.extend([
+            mov_reg(2, 10),
+            i(0x07, 2, 0, 0, -4),
+            call(1),
+            mov(0, 0),
+            exit(),
+        ]);
+        assert_eq!(
+            refused(&p),
+            (
+                Errno::EINVAL,
+                "invalid read from stack R2 off=-4 size=8".into()
+            )
+        );
+        assert_eq!(
+            refused(&[mov(1, 0), mov(2, 0), call(1), exit()]),
+            (EACCES, "R1 type=scalar expected=map_ptr".into())
+        );
+        let mut p = vec![i(0x62, 10, 0, -4, 0)];
+        p.extend(ld_map(1, 5));
+        p.extend([mov_reg(2, 10), i(0x07, 2, 0, 0, -4), call(3), exit()]);
+        assert_eq!(refused(&p), (EACCES, "write into map forbidden".into()));
     }
 }

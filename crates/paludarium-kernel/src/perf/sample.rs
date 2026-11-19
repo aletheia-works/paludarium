@@ -23,13 +23,16 @@
 //! and frames are not known here (0, and no frames after
 //! `PERF_CONTEXT_KERNEL`).
 use super::{Counter, Event, Events, bit, lock};
+use crate::fasync::{Reason, Registration};
 use crate::namespaces::Namespace;
+use crate::signals::PendingSignal;
 use paludarium_cpu::{CpuState, reg};
 use paludarium_host::ClockId;
+use paludarium_host::FileHandle;
 use paludarium_mmu::AddressSpace;
 use paludarium_types::{GuestAddr, USER_ADDRESS_LIMIT};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 
 pub(super) const IP: u64 = 1;
 pub(super) const TID: u64 = 1 << 1;
@@ -251,6 +254,22 @@ fn run(out: &mut Runs, period: u64, n: u64) {
     }
 }
 
+/// Where an event's `O_ASYNC` signals go: the registration `F_SETFL`
+/// made, and the file, whose owner (`F_SETOWN`, `F_SETSIG`) the machine
+/// keeps.
+#[derive(Clone)]
+pub(crate) struct Fasync {
+    pub(super) to: Registration,
+    pub(super) file: Weak<dyn FileHandle>,
+}
+
+const SIGTRAP: i32 = 5;
+/// `TRAP_PERF`, and `TRAP_PERF_FLAG_ASYNC` for a SIGTRAP the thread blocks.
+const TRAP_PERF: i32 = 6;
+const TRAP_PERF_FLAG_ASYNC: u32 = 1;
+/// `EPOLLHUP`.
+const POLL_HUP: u32 = 0x10;
+
 /// The thread a sample is of, at its system call.
 pub(crate) struct Task<'a> {
     /// Its process and thread, by their IDs in the emulator.
@@ -260,13 +279,20 @@ pub(crate) struct Task<'a> {
     pub(crate) cpu: u32,
     pub(crate) regs: &'a CpuState,
     pub(crate) mem: &'a AddressSpace,
+    /// Whether it blocks SIGTRAP.
+    pub(crate) blocks_sigtrap: bool,
 }
 
 /// The samples the events that count thread `task` of `group` have to
-/// take as of now, which its system call brought its counts up to.
-pub(crate) fn overflow(events: &Events, group: &crate::ThreadGroup, task: &Task<'_>) {
+/// take as of now, which its system call brought its counts up to, and the
+/// signals of `sigtrap` the thread is to get.
+pub(crate) fn overflow(
+    events: &Events,
+    group: &crate::ThreadGroup,
+    task: &Task<'_>,
+) -> Vec<PendingSignal> {
     if !events.sampling.load(Ordering::Relaxed) {
-        return;
+        return Vec::new();
     }
     let sampling: Vec<Arc<Event>> = lock(&events.lists)
         .counting
@@ -274,9 +300,10 @@ pub(crate) fn overflow(events: &Events, group: &crate::ThreadGroup, task: &Task<
         .filter_map(super::event)
         .filter(|event| event.attr.sampling() && event.counts(group, task.tid))
         .collect();
-    for event in sampling {
-        event.take_samples(task);
-    }
+    sampling
+        .into_iter()
+        .filter_map(|event| event.take_samples(task))
+        .collect()
 }
 
 /// Whether any event of the machine samples, for the checkpoints that
@@ -294,12 +321,13 @@ impl Event {
             None => Some(Arc::clone(self)),
         }
     }
-    /// Its overflows since they were last taken, and their samples.
-    fn take_samples(self: &Arc<Self>, task: &Task<'_>) {
+    /// Its overflows since they were last taken, their samples and the
+    /// signals they send, and its `sigtrap`.
+    fn take_samples(self: &Arc<Self>, task: &Task<'_>) -> Option<PendingSignal> {
         let occurred = {
             let state = self.settle();
             if state.removed {
-                return;
+                return None;
             }
             state.occurred
         };
@@ -315,7 +343,7 @@ impl Event {
             ];
             sampler.seen = occurred;
             if new == [0, 0] {
-                return;
+                return None;
             }
             if self.counter == Counter::Clock {
                 // The hrtimer interrupts the thread's own code: a sample of
@@ -341,20 +369,129 @@ impl Event {
                 sampler.occurrences(new[1], period_field, freq, &mut kernel);
             }
         }
-        let Some(top) = self.top() else {
-            return;
+        let top = self.top()?;
+        let rb = lock(&top.rb).clone();
+        let wakeup_events = if self.attr.flag(bit::WATERMARK) {
+            0
+        } else {
+            self.attr.wakeup
         };
-        let Some(rb) = lock(&top.rb).clone() else {
-            return;
-        };
+        let mut overflows = 0;
+        let mut hung_up = false;
+        let mut woken = false;
         // The samples of one period are alike: written together.
-        for (runs, user_mode) in [(user, true), (kernel, false)] {
-            for (period, copies) in runs {
-                let (record, spill) = self.sample(task, user_mode, period);
-                let trailer = top.id_sample(task);
-                rb.output(&top, &record, &spill, copies, &trailer);
+        'runs: for (runs, user_mode) in [(user, true), (kernel, false)] {
+            for (period, mut copies) in runs {
+                // `event_limit`: the overflow that brings it to 0 is the
+                // last, and disables the event (`POLL_HUP`).
+                let limit = self.event_limit.load(Ordering::Relaxed);
+                if limit > 0 && copies >= limit as u64 {
+                    copies = limit as u64;
+                    self.event_limit.store(0, Ordering::Relaxed);
+                    hung_up = true;
+                } else if limit != 0 {
+                    self.event_limit
+                        .store(limit.wrapping_sub(copies as i32), Ordering::Relaxed);
+                }
+                overflows += copies;
+                if let Some(rb) = &rb {
+                    let (record, spill) = self.sample(task, user_mode, period);
+                    let trailer = top.id_sample(task);
+                    woken |= rb.output(&top, &record, &spill, copies, &trailer, wakeup_events);
+                }
+                if hung_up {
+                    break 'runs;
+                }
             }
         }
+        if overflows == 0 {
+            return None;
+        }
+        if hung_up {
+            self.set_enabled(false);
+        }
+        // An inherited event's wakeup of the buffer signals for the event
+        // it writes through too.
+        let extra = woken && self.parent.is_some();
+        top.signal_owner(overflows, hung_up, extra);
+        self.attr.flag(bit::SIGTRAP).then(|| self.sigtrap(task))
+    }
+    /// `kill_fasync` for `overflows`, each `POLL_IN` but the last that
+    /// hung the event up (`POLL_HUP`), and one more `POLL_IN` for `extra`:
+    /// to the owner of the event's file once `O_ASYNC` registered it. Plain
+    /// SIGIO, not queued, is sent once.
+    fn signal_owner(&self, overflows: u64, hung_up: bool, extra: bool) {
+        let Some(fasync) = lock(&self.fasync).clone() else {
+            return;
+        };
+        let (Some(processes), Some(file)) = (fasync.to.processes.upgrade(), fasync.file.upgrade())
+        else {
+            return;
+        };
+        let owner = processes.file_owner(&file);
+        let mut ins = overflows - u64::from(hung_up) + u64::from(extra);
+        if owner.signal == 0 {
+            ins = ins.min(1);
+        }
+        for _ in 0..ins {
+            processes.send_io(owner, fasync.to.fd, Reason::In);
+        }
+        if hung_up && (owner.signal != 0 || ins == 0) {
+            processes.send_io(owner, fasync.to.fd, Reason::HangUp);
+        }
+    }
+    /// `send_sig_perf`: SIGTRAP of `TRAP_PERF` for the thread, with
+    /// `sig_data` and the event's type, and the flag that it came late if
+    /// the thread blocks it. A fault's address is not known here (0).
+    fn sigtrap(&self, task: &Task<'_>) -> PendingSignal {
+        let mut info = [0; 48];
+        info[0..4].copy_from_slice(&SIGTRAP.to_le_bytes());
+        info[8..12].copy_from_slice(&TRAP_PERF.to_le_bytes());
+        info[24..32].copy_from_slice(&self.attr.sig_data.to_le_bytes());
+        info[32..36].copy_from_slice(&self.attr.kind.to_le_bytes());
+        let flags = if task.blocks_sigtrap {
+            TRAP_PERF_FLAG_ASYNC
+        } else {
+            0
+        };
+        info[36..40].copy_from_slice(&flags.to_le_bytes());
+        PendingSignal {
+            queued: Some(info),
+            ..PendingSignal::thread(SIGTRAP, TRAP_PERF)
+        }
+    }
+    /// `perf_poll` ([`super::EventFile`]'s readiness).
+    pub(super) fn poll(&self) -> (u32, u64, u64) {
+        let removed = lock(&self.state).removed;
+        if removed && self.children().is_empty() {
+            return (POLL_HUP, 0, 0);
+        }
+        let _guard = lock(&self.mmap_mutex);
+        match lock(&self.rb).clone() {
+            Some(rb) => {
+                let (mask, wakeups) = rb.take_poll();
+                (mask, wakeups, 0)
+            }
+            None => (POLL_HUP, 0, 0),
+        }
+    }
+    /// `perf_event_wakeup` of the buffer it writes to, if any.
+    pub(super) fn wake_readers(&self) {
+        if let Some(rb) = lock(&self.rb).clone() {
+            rb.wake();
+        }
+    }
+    /// `_perf_event_refresh`: `refresh` more overflows, and the event
+    /// enabled; `EINVAL` for one that does not sample or that new tasks
+    /// inherit.
+    pub(super) fn refresh(&self, refresh: i32) -> Result<(), paludarium_types::Errno> {
+        if self.attr.flag(bit::INHERIT) || !self.attr.sampling() {
+            return Err(paludarium_types::Errno::EINVAL);
+        }
+        self.event_limit.fetch_add(refresh, Ordering::Relaxed);
+        self.set_enabled(true);
+        self.update_user_page();
+        Ok(())
     }
     /// `perf_event_clock`: the event's clock, `local_clock` for none.
     pub(super) fn clock_now(&self) -> u64 {

@@ -118,8 +118,11 @@ verified.
   an errno Linux gives both before and in the file's operation (`EINVAL`,
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
   so not counted.
-  Another process's `stat` has an `exit_code` of 0. In `stat`, page faults, resident memory, the start
-  time are 0, so `ps` shows no `RSS`, and its `STIME` and
+  `exit_code` in `stat` is 0 while a thread is in a ptrace stop, where
+  Linux has the stop's signal until the tracer's wait, and a process whose
+  leader ended with `exit` before the last of its threads shows the last
+  thread's status, where Linux shows the leader's. In `stat`, page faults,
+  resident memory, the start time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
   another process's state is taken from where its thread is (in a system
@@ -279,10 +282,12 @@ verified.
   address 0 and no kernel frames. `freq` follows the rate at those points,
   not at each tick. A sample is never throttled (no `PERF_RECORD_THROTTLE`
   or `UNTHROTTLE`), an event of a CPU takes none, and no other record
-  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. Nothing wakes a
-  reader: an overflow sends no signal, and `poll` never finds an event
-  readable, and `PERF_EVENT_IOC_REFRESH` is `EINVAL` for every event,
-  where Linux takes it for a sampling event that does not inherit. Its user page shows the count and times as of the
+  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. The overflows
+  of one such point send one SIGTRAP for `sigtrap`, where Linux sends one
+  each time the thread returns to its code, and its `si_addr` is 0, where
+  Linux gives a fault's address. When `REFRESH`'s last overflow disables
+  the event, the occurrences after it up to that point are still counted,
+  where Linux stops the count at it. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
@@ -326,20 +331,28 @@ verified.
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are
   not verified yet", `EINVAL`; a helper call's starts "unknown func #%d",
-  so that libbpf and bpftool take the helper as missing): helper calls, bpf-to-bpf calls and
-  kfuncs, the context's fields (`struct __sk_buff`), `BPF_LD_IMM64` of
-  maps, of BTF IDs and of functions, `BPF_LD_ABS` and `BPF_LD_IND`,
-  atomics, `may_goto`, indirect jumps, a pointer with a variable offset,
-  and `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
+  so that libbpf and bpftool take the helper as missing): helpers other
+  than `bpf_map_lookup_elem`, `bpf_map_update_elem` and
+  `bpf_map_delete_elem`, and those for maps of maps, queues, stacks and
+  bloom filters, a helper's argument that is neither on the stack nor in
+  a map's value, bpf-to-bpf calls and kfuncs, the context's fields
+  (`struct __sk_buff`) and a map's own (`struct bpf_map`), maps from
+  `fd_array` and maps made with `excl_prog_hash`, `BPF_LD_IMM64` of BTF IDs
+  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`,
+  indirect jumps, a pointer with a variable offset, and
+  `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
   takes a bounded loop from a privileged loader). A scalar is a value the
   verifier knows or nothing at all, where Linux keeps its bounds, so it
   walks both ways of a jump Linux knows goes one way, and it prunes no
-  states, so a program with many branches may reach the limits sooner.
+  states, so a program with many branches may reach the limits sooner. A
+  lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
+  the immediate 0 tells, where Linux also knows that an array's element
+  of a constant key is there and learns from comparing two pointers.
   Where master and the test machines' Linux 7.0 decide differently, it
   refuses: master takes a larger stack where its JIT can, makes a number
   of a pointer that any operator is applied to, and takes an exit for
-  unwinding, and 7.0 takes a `BPF_LD_IMM64` with a non-zero `off`. It has
+  unwinding. It has
   only a privileged loader's rules (pointers may leak, the stack may be
   read before it is written, no Spectre sanitizing), so a loader without
   `CAP_PERFMON` gets `EPERM` once the type is known. With no BTF objects
@@ -961,11 +974,15 @@ verified.
   x86-64 runner's Linux gave two of them the other way. One without a
   device goes with its namespace, where Linux 7.0, whose proxy table is
   every namespace's, keeps it, for a namespace made later where that one
-  was to see (Linux's master gives each namespace its own). A neighbour's
-  timer never runs: one
-  reachable never goes stale, one delaying or probing never probes nor
-  becomes reachable or failed, and one `NTF_USE` or `NTF_MANAGED` makes
-  incomplete counts its first probe but never sends another nor fails;
+  was to see (Linux's master gives each namespace its own). Of a neighbour's
+  timers only a reachable one's runs: once its reachable time since it
+  was confirmed has passed, it goes stale, or delays if it was used
+  within the delay before a probe (5 seconds), and its going stale is
+  told of when a netlink socket of the namespace next reads, polls or
+  writes, as an address that runs out is. One delaying or probing never
+  probes nor becomes reachable or failed, and one `NTF_USE` or
+  `NTF_MANAGED` makes incomplete counts its first probe but never sends
+  another nor fails;
   `NTF_EXT_MANAGED` ones are not probed from time to time. A neighbour's
   state and link-layer address change nothing traffic does, where Linux's
   `lo` holds a packet for one that is not valid until it resolves. Its

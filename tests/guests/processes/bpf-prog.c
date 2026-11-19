@@ -10,6 +10,11 @@
    the log's arguments: a buffer too small (ENOSPC), one that cannot be
    written (EFAULT), and the checks before the verifier, which log
    nothing.
+   bpf-prog-maps: programs that use maps: the map and its value by
+   descriptor in BPF_LD_IMM64, bpf_map_lookup_elem, bpf_map_update_elem
+   and bpf_map_delete_elem with keys and values on the stack or in a
+   value, the null check of a lookup's result, and the bounds and access
+   (BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG) of a value.
 
    Each program refused is wrong in one way only, which both kernels the
    tests know (Linux 7.0, the CI machines', and master) find first, with
@@ -76,6 +81,16 @@ struct insn {
 #define ST_B(dst, off, imm) I(0x72, dst, 0, off, imm)   /* *(u8 *)(dst + off) = imm */
 #define ADD(dst, imm) I(0x07, dst, 0, 0, imm)
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
+/* r = the map of fd, or its value at off, in two instructions. */
+#define LD_MAP(dst, fd) I(0x18, dst, 1, 0, fd), I(0, 0, 0, 0, 0)
+#define LD_VALUE(dst, fd, off) I(0x18, dst, 2, 0, fd), I(0, 0, 0, 0, off)
+#define CALL(id) I(0x85, 0, 0, 0, id)
+#define ST_W(dst, off, imm) I(0x62, dst, 0, off, imm)
+#define ST_DW(dst, off, imm) I(0x7a, dst, 0, off, imm)
+#define JEQ(dst, imm, off) I(0x15, dst, 0, off, imm)
+#define LOOKUP 1
+#define UPDATE 2
+#define DELETE 3
 
 static char log_text[65536];
 
@@ -249,9 +264,83 @@ static int case_verify(void) {
     return 0;
 }
 
+#define LOAD_MAPS(name, ...)                                    \
+    do {                                                        \
+        struct insn insns[] = {__VA_ARGS__};                    \
+        run(name, attr(insns, COUNT(insns)));                   \
+    } while (0)
+
+/* A key of 0 at fp-4, the map in R1 and R2 pointing at the key. */
+#define KEY4(fd) ST_W(10, -4, 0), LD_MAP(1, fd), MOV_REG(2, 10), ADD(2, -4)
+/* The same for a hash's 8-byte key at fp-8. Linux knows that an array's
+   element of a constant key is there, so its lookup needs no null check;
+   a hash's does. */
+#define KEY8(fd) ST_DW(10, -8, 0), LD_MAP(1, fd), MOV_REG(2, 10), ADD(2, -8)
+
+static int map(uint32_t type, uint32_t key, uint32_t value, uint32_t entries, uint32_t flags) {
+    uint32_t a[32] = {type, key, value, entries, flags};
+    return (int)bpf(0, a, sizeof a);
+}
+
+static int case_maps(void) {
+    int array = map(2, 4, 8, 1, 0);
+    int pair = map(2, 4, 8, 2, 0);
+    int hash = map(1, 8, 8, 4, 0);
+    int lru = map(9, 4, 8, 4, 0);
+    int trie = map(11, 8, 8, 4, 1);
+    int rdonly = map(2, 4, 8, 1, 1 << 7);
+    int wronly = map(2, 4, 8, 1, 1 << 8);
+    int null = open("/dev/null", O_RDONLY);
+    say("maps %d", array > 0 && pair > 0 && hash > 0 && lru > 0 && trie > 0 && rdonly > 0 &&
+                       wronly > 0);
+
+    /* Programs it takes. */
+    LOAD_MAPS("lookup, check and read", KEY4(array), CALL(LOOKUP), JEQ(0, 0, 1), LDX_DW(0, 0, 0),
+              EXIT());
+    LOAD_MAPS("lookup and write", KEY4(array), CALL(LOOKUP), JEQ(0, 0, 2), ST_DW(0, 0, 7), MOV(0, 0),
+              EXIT());
+    LOAD_MAPS("update", STX_DW(10, 10, -16), KEY4(array), MOV_REG(3, 10), ADD(3, -16), MOV(4, 0),
+              CALL(UPDATE), EXIT());
+    LOAD_MAPS("delete from a hash", ST_DW(10, -8, 1), LD_MAP(1, hash), MOV_REG(2, 10), ADD(2, -8),
+              CALL(DELETE), EXIT());
+    LOAD_MAPS("lru update", ST_DW(10, -16, 2), KEY4(lru), MOV_REG(3, 10), ADD(3, -16), MOV(4, 1),
+              CALL(UPDATE), EXIT());
+    LOAD_MAPS("trie lookup", ST_DW(10, -8, 32), LD_MAP(1, trie), MOV_REG(2, 10), ADD(2, -8),
+              CALL(LOOKUP), MOV(0, 0), EXIT());
+    LOAD_MAPS("key in a value", KEY4(array), CALL(LOOKUP), JEQ(0, 0, 4), MOV_REG(2, 0), LD_MAP(1, array),
+              CALL(LOOKUP), MOV(0, 0), EXIT());
+    LOAD_MAPS("pointer into a value", KEY4(array), CALL(LOOKUP), JEQ(0, 0, 1), STX_DW(0, 10, 0),
+              EXIT());
+    LOAD_MAPS("direct value", LD_VALUE(1, array, 4), LDX_W(0, 1, 0), EXIT());
+    LOAD_MAPS("map named twice", LD_MAP(1, array), LD_MAP(2, array), MOV(0, 0), EXIT());
+
+    /* Programs it refuses. */
+    LOAD_MAPS("no null check", KEY8(hash), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("arithmetic before the check", KEY8(hash), CALL(LOOKUP), ADD(0, 1), EXIT());
+    LOAD_MAPS("past the value", KEY4(array), CALL(LOOKUP), JEQ(0, 0, 1), LDX_DW(0, 0, 4), EXIT());
+    LOAD_MAPS("write a read-only value", KEY4(rdonly), CALL(LOOKUP), JEQ(0, 0, 1), ST_DW(0, 0, 1),
+              EXIT());
+    LOAD_MAPS("read a write-only value", KEY4(wronly), CALL(LOOKUP), JEQ(0, 0, 1), LDX_DW(0, 0, 0),
+              EXIT());
+    LOAD_MAPS("update a read-only map", STX_DW(10, 10, -16), KEY4(rdonly), MOV_REG(3, 10), ADD(3, -16),
+              MOV(4, 0), CALL(UPDATE), EXIT());
+    LOAD_MAPS("key past the frame", LD_MAP(1, hash), MOV_REG(2, 10), ADD(2, -4), CALL(LOOKUP), MOV(0, 0),
+              EXIT());
+    LOAD_MAPS("no map in R1", MOV(1, 5), MOV_REG(2, 10), ADD(2, -8), CALL(LOOKUP), EXIT());
+    LOAD_MAPS("argument after the call", KEY4(array), CALL(LOOKUP), MOV_REG(0, 1), EXIT());
+    LOAD_MAPS("arithmetic on the map", LD_MAP(1, array), ADD(1, 8), MOV(0, 0), EXIT());
+    LOAD_MAPS("descriptor of no file", LD_MAP(1, 1000), MOV(0, 0), EXIT());
+    LOAD_MAPS("descriptor of no map", LD_MAP(1, null), MOV(0, 0), EXIT());
+    LOAD_MAPS("value past its end", LD_VALUE(1, array, 8), MOV(0, 0), EXIT());
+    LOAD_MAPS("value of two elements", LD_VALUE(1, pair, 0), MOV(0, 0), EXIT());
+    LOAD_MAPS("value of a hash", LD_VALUE(1, hash, 0), MOV(0, 0), EXIT());
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
     if (!strcmp(mode, "bpf-prog-verify")) return case_verify();
+    if (!strcmp(mode, "bpf-prog-maps")) return case_maps();
     return 2;
 }

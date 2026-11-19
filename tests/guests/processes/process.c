@@ -11397,6 +11397,55 @@ static int generated_binds_case(void) {
     return 0;
 }
 
+/* The generated-noexec case: /proc and /dev are noexec mounts, so an
+   executable mapping of a file there is EPERM before anything else is
+   checked, and mprotect to one EACCES; a file reached through a link
+   there is on its own mount. /proc is noexec wherever this runs; /dev is
+   where the machine's init mounts it so, which only statfs tells, so its
+   lines print whether they agree with statfs. */
+static int gn_map(const char *path, int flags, int prot) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1000 - errno;
+    void *m = mmap(NULL, 4096, prot, flags, fd, 0);
+    int r = m == MAP_FAILED ? -errno : 0;
+    if (m != MAP_FAILED) munmap(m, 4096);
+    close(fd);
+    return r;
+}
+static int generated_noexec_case(void) {
+    printf("proc exec=%d shared=%d read=%d\n", gn_map("/proc/self/status", MAP_PRIVATE, PROT_READ | PROT_EXEC),
+           gn_map("/proc/self/status", MAP_SHARED, PROT_READ | PROT_EXEC),
+           gn_map("/proc/self/status", MAP_PRIVATE, PROT_READ));
+    struct statfs fs;
+    int dev_noexec = !statfs("/dev/zero", &fs) && (fs.f_flags & ST_NOEXEC);
+    int exec = gn_map("/dev/zero", MAP_PRIVATE, PROT_READ | PROT_EXEC);
+    int shared = gn_map("/dev/zero", MAP_SHARED, PROT_READ | PROT_EXEC);
+    printf("dev exec agrees=%d shared agrees=%d read=%d\n", exec == (dev_noexec ? -EPERM : 0),
+           shared == (dev_noexec ? -EPERM : 0), gn_map("/dev/zero", MAP_PRIVATE, PROT_READ));
+    int zero = open("/dev/zero", O_RDONLY);
+    char *m = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, zero, 0);
+    int r = m == MAP_FAILED ? -1 : mprotect(m, 4096, PROT_READ | PROT_EXEC) ? -errno : 0;
+    printf("dev mprotect agrees=%d\n", r == (dev_noexec ? -EACCES : 0));
+    if (m != MAP_FAILED) munmap(m, 4096);
+    close(zero);
+    char file[] = "/tmp/paludarium-noexec-XXXXXX";
+    int fd = mkstemp(file);
+    if (fd < 0) return 91;
+    static char page[4096];
+    if (write(fd, page, sizeof page) != (ssize_t)sizeof page) return 92;
+    struct statfs tmp;
+    int tmp_noexec = !statfs(file, &tmp) && (tmp.f_flags & ST_NOEXEC);
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    int through = gn_map(link, MAP_PRIVATE, PROT_READ | PROT_EXEC);
+    snprintf(link, sizeof link, "/dev/fd/%d", fd);
+    printf("links proc agrees=%d dev agrees=%d\n", through == (tmp_noexec ? -EPERM : 0),
+           gn_map(link, MAP_PRIVATE, PROT_READ | PROT_EXEC) == (tmp_noexec ? -EPERM : 0));
+    close(fd);
+    unlink(file);
+    return 0;
+}
+
 /* The tmpfs-limits case: a tmpfs mount's size and inodes hold its files,
    in a mount namespace of a user namespace of its own, and the statfs
    flags of /proc and /dev. Only errno values, counts and flags are
@@ -12087,6 +12136,87 @@ static int proc_other_maps_case(void) {
     pom_fd_stat("reaped held", held);
     if (held >= 0) close(held);
     munmap(seen, 2 * POM_SIZE);
+    return 0;
+}
+
+/* The proc-stat-exit-code case: exit_code, the last field of another
+   process's stat, as Linux's do_task_stat gives it to a reader that
+   ptrace_may_access lets see it: the process's group_exit_code in its own
+   stat (an exit's wait status, a stop's signal until a wait reports it)
+   and the thread's exit_code in task/<tid>/stat; 0 for any other reader. */
+static void psec_show(const char *label, pid_t pid) {
+    static char buffer[4096];
+    char *fields[64];
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    int count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf("%s exit_code=%s", label, count >= 50 ? fields[49] : "?");
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", (int)pid, (int)pid);
+    count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf(" task=%s\n", count >= 50 ? fields[49] : "?");
+}
+/* Shows the stat of `pid` as another user sees it. */
+static void psec_other_user(const char *label, pid_t pid) {
+    fflush(stdout);
+    pid_t other = fork();
+    if (other == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        psec_show(label, pid);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (reaped(other)) printf("%s failed\n", label);
+}
+/* A child that ends as `how` says, shown while a zombie: by its root
+   reader and by another user. */
+static void psec_ended(const char *label, int how) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        if (how > 0) _exit(how);
+        pause();
+        _exit(99);
+    }
+    if (how < 0) kill(kid, -how);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    psec_show(label, kid);
+    char other[64];
+    snprintf(other, sizeof other, "%s other user", label);
+    psec_other_user(other, kid);
+    waitpid(kid, NULL, 0);
+}
+static int proc_stat_exit_code_case(void) {
+    psec_ended("exited 3", 3);
+    psec_ended("exited 255", 255);
+    psec_ended("killed", -SIGKILL);
+    psec_ended("terminated", -SIGTERM);
+    /* Stopped: the stop's signal in the process's stat until a wait
+       reports the stop, none in its thread's. */
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 80;
+    if (kid == 0) {
+        for (;;) pause();
+    }
+    psec_show("running", kid);
+    kill(kid, SIGSTOP);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WSTOPPED | WNOWAIT);
+    psec_show("stopped", kid);
+    psec_other_user("stopped other user", kid);
+    int status = 0;
+    waitpid(kid, &status, WUNTRACED);
+    printf("wait stopped=%d\n", WIFSTOPPED(status));
+    psec_show("stop reported", kid);
+    kill(kid, SIGCONT);
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WCONTINUED);
+    psec_show("continued", kid);
+    kill(kid, SIGKILL);
+    waitpid(kid, NULL, 0);
     return 0;
 }
 
@@ -21839,6 +21969,94 @@ int main(int argc, char **argv) {
 #undef NEIGH6
 #undef NEIGH_DUMP
 #undef NEIGH_SORTED
+            fflush(stdout);
+            _exit(0);
+        }
+        result("maker", reaped(maker));
+        return 0;
+    }
+    if (!strcmp(mode, "neighbour-ageing")) {
+        /* A child makes a network namespace and adds reachable neighbours of
+           lo (IPv4's, keyed 0.0.0.0, and IPv6's) and a permanent one; then
+           waits for what RTNLGRP_NEIGH hears as their timers run
+           (neigh_timer_handler): each reachable one goes stale once its
+           reachable time has passed, which Linux picks from half to one and
+           a half times the base 30 seconds for each table, so the two are
+           heard in either order, and are printed sorted. */
+        fflush(stdout);
+        pid_t maker = child();
+        if (maker == 0) {
+            printf("unshare=%ld\n", netns_result(syscall(SYS_unshare, CLONE_NEWNET)));
+            int ctl = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE), mon = socket(NL_AF_NETLINK, SOCK_RAW, NL_ROUTE);
+            struct nl_address any = {.family = NL_AF_NETLINK}, name = {0};
+            socklen_t name_len = sizeof name;
+            bind(ctl, (void *)&any, sizeof any);
+            getsockname(ctl, (void *)&name, &name_len);
+            unsigned port = name.pid;
+            struct nl_address members = {.family = NL_AF_NETLINK, .groups = 0x4};
+            printf("bind=%ld\n", netns_result(bind(mon, (void *)&members, sizeof members)));
+            const unsigned short create = 0x400;
+            const unsigned char mac[6] = {2, 0, 0, 0, 0, 1};
+            const struct {
+                unsigned char family;
+                const char *dst;
+                unsigned short state;
+            } adds[] = {{AF_INET, "10.0.0.1", 0x02}, {AF_INET6, "2001:db8::1", 0x02}, {AF_INET6, "2001:db8::2", 0x80}};
+            for (size_t i = 0; i < sizeof adds / sizeof *adds; i++) {
+                struct nl_body b = nl_body(adds[i].family, 12);
+                memcpy(b.bytes + 4, &(int){1}, 4);
+                memcpy(b.bytes + 8, &adds[i].state, 2);
+                unsigned char key[16];
+                inet_pton(adds[i].family, adds[i].dst, key);
+                nl_put(&b, 1, key, adds[i].family == AF_INET ? 4 : 16);
+                nl_put(&b, 2, mac, 6);
+                printf("add %s: error=%d\n", adds[i].dst, nl_quiet(ctl, 28, create, b.bytes, b.len));
+                monitor_wait(mon, port, adds[i].dst, 0);
+            }
+            struct nl_body all = nl_body(0, 12);
+            nl_sorted(ctl, port, 30, 1, &all, "dump before");
+            /* Up to 60 seconds, looking each second, for the two. */
+            char heard[8][256];
+            int count = 0;
+            for (int waited = 0; waited < 60 && count < 2; waited++) {
+                struct pollfd ready = {.fd = mon, .events = POLLIN};
+                if (poll(&ready, 1, 1000) <= 0) continue;
+                static char buf[16384];
+                long n = recv(mon, buf, sizeof buf, MSG_DONTWAIT);
+                for (char *at = buf; n > 0 && at + sizeof(struct nl_header) <= buf + n;) {
+                    struct nl_header *h = (void *)at;
+                    if (h->len < sizeof *h || at + h->len > buf + n) break;
+                    unsigned char *body = (void *)(h + 1);
+                    int body_len = h->len - sizeof *h;
+                    if (count < 8 && body_len >= 12) {
+                        unsigned short state;
+                        memcpy(&state, body + 8, 2);
+                        char dst[INET6_ADDRSTRLEN] = "?";
+                        unsigned refcnt = 0, probes = 0, lladdr = 0;
+                        for (unsigned char *a = body + 12; a + 4 <= body + body_len;) {
+                            unsigned short alen, atype;
+                            memcpy(&alen, a, 2);
+                            memcpy(&atype, a + 2, 2);
+                            if (alen < 4 || a + alen > body + body_len) break;
+                            if (atype == 1) inet_ntop(alen == 8 ? AF_INET : AF_INET6, a + 4, dst, sizeof dst);
+                            if (atype == 2) lladdr = alen - 4;
+                            if (atype == 3 && alen == 20) memcpy(&refcnt, a + 16, 4);
+                            if (atype == 4 && alen == 8) memcpy(&probes, a + 4, 4);
+                            a += (alen + 3) & ~3;
+                        }
+                        snprintf(heard[count++], sizeof heard[0],
+                                 "heard: type=%u flags=%#x seq=%u pid=%u family=%u state=%#x flags=%#x type=%u dst=%s "
+                                 "lladdr:%u probes=%u refcnt=%u",
+                                 h->type, h->flags, h->seq, h->pid, body[0], state, body[10], body[11], dst, lladdr,
+                                 probes, refcnt);
+                    }
+                    at += (h->len + 3) & ~3;
+                }
+            }
+            qsort(heard, count, sizeof heard[0], (int (*)(const void *, const void *))strcmp);
+            printf("heard=%d\n", count);
+            for (int i = 0; i < count; i++) printf("%s\n", heard[i]);
+            nl_sorted(ctl, port, 30, 1, &all, "dump after");
             fflush(stdout);
             _exit(0);
         }
@@ -31793,6 +32011,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
+    if (!strcmp(mode, "generated-noexec")) return generated_noexec_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
     if (!strcmp(mode, "propagation")) return propagation_case();
     if (!strcmp(mode, "mount-flags-id")) {
@@ -31809,6 +32028,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-io")) return proc_io_case();
     if (!strcmp(mode, "proc-personality-wchan")) return proc_personality_wchan_case();
     if (!strcmp(mode, "proc-syscall")) return proc_syscall_case();
+    if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {

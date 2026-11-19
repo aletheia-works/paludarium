@@ -3386,8 +3386,10 @@ impl AddressSpaceData {
             let Some(entry) = table.pages.get_mut(slot).filter(|entry| entry.is_none()) else {
                 continue;
             };
+            // A page of the file whose bytes could not be read is not up
+            // to date in the cache, which `filemap_map_pages` leaves out.
             let new = self.page(around, prot);
-            if !self.try_fill_from_file(around, &new) {
+            if !self.try_fill_from_file(around, &new) || new.file && new.frame.get().is_none() {
                 continue;
             }
             self.recount(around, None, Some(&new));

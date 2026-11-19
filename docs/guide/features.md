@@ -3497,7 +3497,7 @@ kernel.
   block, read as `maps` is: the size, what the pages hold (`Rss`, `Pss`,
   `Pss_Dirty`, the shared and private clean and dirty pages, `Anonymous`,
   `Locked`, with 0 for huge pages, swap and KSM), `THPeligible` and
-  `VmFlags`. A page counts once it has an entry: private memory only read
+  `VmFlags`. A page counts once it has an entry: anonymous private memory only read
   shows the zero page, which is not counted, written private memory is
   anonymous and dirty, and a page that more than one page table entry
   maps, in this process or any other (one a `fork` shares until it is

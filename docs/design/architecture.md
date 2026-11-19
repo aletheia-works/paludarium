@@ -166,10 +166,11 @@ it, so that the interpreter runs it again and reports the fault, and after a
 call into the MMU that finds the code generation moved on. An access to a
 page's bytes never moves it: a slot never allows a write to an executable
 page, nor to a shared or file page, whose stores the MMU counts as code
-changes for the mappings and page caches it watches. A change another thread makes meanwhile shows at
-the next call, or after the block, when the interpreter reads the
-generation again. A taken branch, `jmp`, `call` and `ret` end it. It returns
-how many instructions ran, and the interpreter goes on from the next one.
+changes for the mappings and page caches it watches. A change another thread
+makes meanwhile shows at the next call, or after the block, when the
+interpreter reads the generation again. A taken branch, `jmp`, `call` and
+`ret` end it. It returns how many instructions ran, and the interpreter goes
+on from the next one.
 
 When the code generation moves on, the interpreter decodes every block again,
 mostly to the same forms. The JIT keeps the code it compiled by its forms (up

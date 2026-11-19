@@ -8546,6 +8546,18 @@ fn a_tmpfs_mount_holds_its_files_to_its_size_and_inodes() {
     let fd = f.ret(2, &[a, 0o102, 0o600]);
     assert_eq!(f.ret(1, &[fd, DATA, 8192]), 8192);
     assert_eq!(statfs(&mut f), (4, 1, 1, 4, 0));
+    // A remount below what the files use is EINVAL (`shmem_reconfigure`).
+    let small = put(&mut f, 0x80, b"size=8k");
+    assert_eq!(
+        f.ret(165, &[none, target, 0, 32, small]),
+        errno(Errno::EINVAL)
+    );
+    let few = put(&mut f, 0x80, b"nr_inodes=3");
+    assert_eq!(
+        f.ret(165, &[none, target, 0, 32, few]),
+        errno(Errno::EINVAL)
+    );
+    assert_eq!(statfs(&mut f), (4, 1, 1, 4, 0));
 }
 
 /// `statfs`'s `f_flags` for the kernel's own mounts are those Linux mounts

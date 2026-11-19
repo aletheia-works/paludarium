@@ -11312,6 +11312,10 @@ static int tl_inner(const char *m) {
     first = tl_err(write(fd, page, 8192));
     printf("write=%d more=%d\n", first, tl_err(write(fd, page, 8192)));
     tl_statfs("again", m);
+    int smaller = tl_err(mount(NULL, m, NULL, MS_REMOUNT, "size=8k"));
+    printf("remount under use: size=%d inodes=%d\n", smaller,
+           tl_err(mount(NULL, m, NULL, MS_REMOUNT, "nr_inodes=1")));
+    tl_statfs("kept", m);
     close(fd);
     unlink(a);
     unlink(s);

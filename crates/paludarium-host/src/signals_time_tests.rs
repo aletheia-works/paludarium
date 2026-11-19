@@ -74,13 +74,27 @@ fn native_wait_checks_cancellation() {
 }
 /// On Linux the host's NTP state is read without privilege: a tick within
 /// the range Linux takes (90% to 110% of USER_TICK_USEC) and Linux's
-/// tolerance; elsewhere the native host tells none.
+/// tolerance. A sandbox may refuse even the read (Docker's default seccomp
+/// profile, without `CAP_SYS_TIME`), and then the host tells none.
+/// Elsewhere the native host tells none.
 #[test]
 fn native_ntp_state_is_the_hosts() {
     let state = NativeHost::new().ntp_state();
     #[cfg(target_os = "linux")]
     {
-        let state = state.expect("adjtimex reads without privilege");
+        let Some(state) = state else {
+            let mut timex = [0i64; 26];
+            // SAFETY: `timex` is a live, aligned 208-byte buffer, as the
+            // call needs; no mode is set, so it only reads.
+            let r = unsafe { libc::syscall(libc::SYS_adjtimex, timex.as_mut_ptr()) };
+            let e = std::io::Error::last_os_error().raw_os_error();
+            assert_eq!(
+                (r, e),
+                (-1, Some(libc::EPERM)),
+                "only a refused read tells none"
+            );
+            return;
+        };
         assert!((0..=5).contains(&state.result), "{state:?}");
         assert!((9_000..=11_000).contains(&state.tick), "{state:?}");
         assert_eq!(state.tolerance, 32_768_000);

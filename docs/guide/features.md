@@ -3881,7 +3881,8 @@ kernel.
   state. On native Linux the real-time clock is the host's, and so is its
   state: the host's result, status, errors, corrections, tick and TAI
   offset, as the host's own `adjtimex` reads them. Elsewhere (WebAssembly,
-  macOS, Windows) it is the state Linux starts with: unsynchronised
+  macOS, Windows, or a host whose sandbox refuses even that read) it is the
+  state Linux starts with: unsynchronised
   (`STA_UNSYNC`, so the result is `TIME_ERROR`), the errors at 16 s, no
   offset or frequency correction, a time constant of 2, a 10,000 µs tick and
   no PPS or TAI offset. The time is the real-time clock's, in nanoseconds

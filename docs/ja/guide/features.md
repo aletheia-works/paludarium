@@ -3383,7 +3383,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - `CLOCK_REALTIME` での `adjtimex` と `clock_adjtime` は、時計の NTP の状態を読みます。
   ネイティブの Linux では実時間の時計はホストのものなので、状態もホストのものです。結果、
   ステータス、誤差、補正、ティック、TAI のオフセットを、ホスト自身の `adjtimex` が読むとおりに
-  返します。それ以外（WebAssembly、macOS、Windows）では、Linux が起動したときの状態です。
+  返します。それ以外（WebAssembly、macOS、Windows、またはその読み取りもサンドボックスが拒む
+  ホスト）では、Linux が起動したときの状態です。
   同期しておらず（`STA_UNSYNC` なので結果は `TIME_ERROR`）、誤差は 16 秒、オフセットと
   周波数の補正はなく、時定数は 2、ティックは 10,000 µs、PPS と TAI のオフセットはありません。
   時刻は実時間の時計のもので、ステータスに `STA_NANO` があればナノ秒です。Linux と同じく

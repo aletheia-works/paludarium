@@ -513,7 +513,10 @@ verified.
     is read at each call, so two reads can differ when the host's time
     daemon changes it in between (chrony, for one, moves the tick by a few
     microseconds); a comparison with a native run therefore matches only
-    while the host leaves it as it is. `clock_settime` on a CPU clock named by a negative clock ID gives
+    while the host leaves it as it is. Where the host's sandbox refuses
+    even that read (Docker's default seccomp profile without
+    `CAP_SYS_TIME`), a native `adjtimex` gives `EPERM`, while here it reads
+    the state Linux starts with. `clock_settime` on a CPU clock named by a negative clock ID gives
     `EINVAL` without reading the time, where Linux reads it, finds the task
     and gives `EPERM`, and the auxiliary clocks (`CLOCK_AUX`) are not there.
   - The host's I/O ports cannot be used: `iopl` above level 0 and `ioperm`

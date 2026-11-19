@@ -290,22 +290,44 @@ verified.
   Linux 7.0 knows 144 bytes and gives `E2BIG` for any of them that is not
   0. `kernel.perf_event_paranoid` starts at Linux's 2 (Debian's and
   Ubuntu's kernels default to more).
-- **BPF, maps only**: `bpf` makes arrays, hashes, LRU hashes,
-  longest-prefix-match tries, queues, stacks, bloom filters, and arrays
-  and hashes of maps, and nothing else. Programs are never loaded: there is no verifier and no BPF runs.
-  `BPF_PROG_LOAD` checks its arguments as Linux does, and then refuses
-  every program with `EINVAL`, as a kernel built without the program's
-  type does; a program Linux would load, or reject in its verifier with
-  another error (most often `EACCES`), gets that `EINVAL`, and no log is
-  written. The other program commands (`BPF_PROG_TEST_RUN` and the rest),
-  BTF (`BPF_BTF_LOAD`), links, attachment, pins (`BPF_OBJ_PIN`,
-  `BPF_OBJ_GET`), the IDs of programs, BTF and links
+- **BPF, maps and socket filters that do not run**: `bpf` makes arrays,
+  hashes, LRU hashes, longest-prefix-match tries, queues, stacks, bloom
+  filters, and arrays and hashes of maps, and loads socket filters, and
+  nothing else. No program runs: nothing attaches one (`SO_ATTACH_BPF` and
+  the rest) and there is no interpreter yet. Every other program type is
+  `EINVAL`, as on a kernel built without it. The verifier refuses, where
+  Linux may take them, with a log line of its own ("paludarium: ... are
+  not verified yet", `EINVAL`; a helper call's starts "unknown func #%d",
+  so that libbpf and bpftool take the helper as missing): helper calls, bpf-to-bpf calls and
+  kfuncs, the context's fields (`struct __sk_buff`), `BPF_LD_IMM64` of
+  maps, of BTF IDs and of functions, `BPF_LD_ABS` and `BPF_LD_IND`,
+  atomics, `may_goto`, indirect jumps, a pointer with a variable offset,
+  and `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
+  Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
+  takes a bounded loop from a privileged loader). A scalar is a value the
+  verifier knows or nothing at all, where Linux keeps its bounds, so it
+  walks both ways of a jump Linux knows goes one way, and it prunes no
+  states, so a program with many branches may reach the limits sooner.
+  Where master and the test machines' Linux 7.0 decide differently, it
+  refuses: master takes a larger stack where its JIT can, makes a number
+  of a pointer that any operator is applied to, and takes an exit for
+  unwinding, and 7.0 takes a `BPF_LD_IMM64` with a non-zero `off`. It has
+  only a privileged loader's rules (pointers may leak, the stack may be
+  read before it is written, no Spectre sanitizing), so a loader without
+  `CAP_PERFMON` gets `EPERM` once the type is known. With no BTF objects
+  or keys here, func and line info, CO-RE relocations, `fd_array_cnt` and
+  a signature are refused. The log has no trace of each instruction or
+  state, which Linux writes at levels 1 and 2, and master's diagnostics
+  after an error are not written, so its size (`log_true_size`) is
+  smaller than Linux's. The other program commands (`BPF_PROG_TEST_RUN`
+  and the rest), BTF (`BPF_BTF_LOAD`), links, attachment, pins
+  (`BPF_OBJ_PIN`, `BPF_OBJ_GET`), the IDs of programs, BTF and links
   (`BPF_PROG_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID` and the rest), tokens,
   iterators and statistics are `ENOSYS`, as each command Linux has that is
   not here; a number Linux has no command for is `EINVAL`, as there. So
-  libbpf's trivial-program probe fails with `EINVAL` and it finds no
-  program type it can load, and `bpftool feature` finds the `bpf()` system
-  call but no program types. The other map types are `EINVAL`,
+  libbpf's trivial-program probe loads a socket filter and finds no other
+  program type, and `bpftool feature` finds socket filters but no
+  helpers. The other map types are `EINVAL`,
   as on a kernel built without them; the per-CPU ones
   (`BPF_MAP_TYPE_PERCPU_ARRAY`, `PERCPU_HASH`, `LRU_PERCPU_HASH`) could not
   be compared with Linux anyway, as their values are one per possible CPU,

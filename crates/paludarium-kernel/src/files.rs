@@ -8129,6 +8129,10 @@ fn named_target(h: &Holder, d: &Descriptor) -> Result<Vec<u8>, Errno> {
     if any.is_some_and(|v| v.is::<crate::bpf::MapFile>()) {
         return Ok(b"anon_inode:bpf-map".to_vec());
     }
+    // A BPF program's, `anon_inode_getfd("bpf-prog", ...)`.
+    if any.is_some_and(|v| v.is::<crate::bpf_prog::ProgFile>()) {
+        return Ok(b"anon_inode:bpf-prog".to_vec());
+    }
     // So is a seccomp listener: "seccomp notify".
     if crate::seccomp::is_listener(&d.file) {
         return Ok(b"anon_inode:seccomp notify".to_vec());
@@ -8625,6 +8629,8 @@ fn fdinfo(c: &Context<'_>, h: &Holder, d: &Descriptor, descriptors: &[Descriptor
     } else if let Some(epoll) = any.and_then(|a| a.downcast_ref::<crate::epoll::EpollInstance>()) {
         out.extend(epoll_fdinfo(&*h.fs, epoll, descriptors));
     } else if let Some(lines) = crate::bpf::fdinfo(&d.file) {
+        out.extend(lines);
+    } else if let Some(lines) = crate::bpf_prog::fdinfo(&d.file) {
         out.extend(lines);
     }
     out

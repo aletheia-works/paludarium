@@ -77,7 +77,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | プローブ | `uprobe`、`uretprobe` |
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
-| BPF | `bpf`、マップと `BPF_PROG_LOAD` の引数の検査（下を参照） |
+| BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`（下を参照） |
 | 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
@@ -3369,17 +3369,49 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディスクリプタのものなので、Linux の `bpf_map_flags_retain_permanent` と同じく、
   `map_flags`（fdinfo、`bpf_map_info`、手本）には入りません。ないものは
   [制限](./limitations) を参照してください。
-- `BPF_PROG_LOAD` は、Linux の `bpf_prog_load` と同じ順に同じエラーで引数を確かめます。
-  この順とエラーは、テストのマシンのカーネル（Ubuntu の Linux 7.0）と master で同じです。
-  コマンドより先のフィールド（`EINVAL`）、プログラムのフラグ（`EINVAL`）、トークンの
+- `BPF_PROG_LOAD` はソケットフィルター（`BPF_PROG_TYPE_SOCKET_FILTER`）を読み込み、
+  Linux と同じく検証器で確かめます。まだ動かすものはありません。引数は Linux の
+  `bpf_prog_load` と同じく、master の順に同じエラーで確かめます。最初はログの引数です
+  （サイズのないバッファとバッファのないサイズ、レベルのないバッファ、知らないレベルは
+  `EINVAL`。テストのマシンのカーネル、Ubuntu の Linux 7.0 は検証器を始めるときに確かめます）。
+  続いて、コマンドより先のフィールド（`EINVAL`）、プログラムのフラグ（`EINVAL`）、トークンの
   ディスクリプタ（ないものは `EBADF`、ほかのファイルは `EINVAL`。ここにトークンはありません）、
   `CAP_BPF` のないときの `kernel.unprivileged_bpf_disabled`（`EPERM`）、命令の数（0 か、
   `CAP_BPF` なしで 4096、ありで 1,000,000 を超えると `E2BIG`）、ソケットフィルターと cgroup
   skb 以外の型の `CAP_BPF`、それを求める型の `CAP_NET_ADMIN` と `CAP_PERFMON`（`EPERM`。
-  どれも `CAP_SYS_ADMIN` で代えられます）、アタッチ先のプログラムか BTF ID（ここではどの型も
-  `EINVAL`）、命令とライセンスの読み込み（`EFAULT`）です。すべて通った読み込みは、
-  そのプログラムの型を組み込まずにビルドしたカーネルと同じく `EINVAL` です。プログラムを
-  読み込むことはありません（[制限](./limitations)を見てください）。
+  どれも `CAP_SYS_ADMIN` で代えられます）、アタッチ先のプログラムか BTF ID、または master の
+  複数の関数にアタッチする型（ここではどの型も `EINVAL`）、命令とライセンスの読み込み
+  （`EFAULT`）、結び付けるデバイス（`EINVAL`）、そして型です。ソケットフィルター以外の型は、
+  それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。名前は、マップと同じく最後に
+  確かめます（`EINVAL`）。
+- 検証器（`kernel/bpf/verifier.c`）は、テストが知る二つのカーネル、master と 7.0 の
+  どちらも受け入れるプログラムだけを受け入れ、どちらかが断るものは断ります。最初に構造を
+  master の順に確かめます。どれも `EINVAL` です。最後の命令が `BPF_LD_IMM64` の半分でないこと、
+  ジャンプがプログラムの中に収まり（"jump out of range from insn %d to %d"）、最後の命令が
+  exit かジャンプであること、命令ごとのレジスタ、オペコード（"unknown opcode %02x"）、
+  予約フィールド（クラスごとの "... uses reserved fields"）、`BPF_LD_IMM64` の後半、そして
+  命令のあいだの辺です。どの命令にも届き（"unreachable insn %d"）、`BPF_LD_IMM64` の
+  途中へのジャンプがないことを確かめます。そのあと、最初の命令からのすべての道を、各レジスタの
+  中身（R1 はコンテキスト、R10 はフレームポインタ、ほかはまだ何もない）と 512 バイトの
+  スタックとともにたどります。書く前に読んだレジスタ（"R%d !read_ok"、`EACCES`）、
+  フレームポインタへの書き込み、即値 0 での割り算と幅を超えるシフト（`EINVAL`）、
+  Linux が許すポインタの演算（スタックかコンテキストのポインタへのオフセットの足し算、
+  ポインタからポインタの引き算、32 ビットの引き算。スタックのポインタからの引き算、ほかの
+  演算子、32 ビットの足し算は `EACCES`。2^29 を超えるオフセットは `EINVAL`）、スタックへの
+  読み書き（大きさに揃っていて 512 バイトに収まること、`EACCES`）、スタックにまるごと書いて
+  まるごと読むポインタ、スカラーを通した読み込み（"R%d invalid mem access 'scalar'"、
+  `EACCES`）、exit のときの R0（値は何でもかまいません）です。オペランドを知っている
+  条件ジャンプは一方へだけ進み、ほかは両方をたどります。Linux と同じく、1,000,000 命令か、
+  たどるのを待つジャンプが 8,192 個を超えるとあきらめます（`E2BIG`）。
+- ログ（`log_level`、`log_buf`、`log_size`）には、プログラムを断った理由の行（二つの
+  カーネルで言い方が違うときは 7.0 の言い方）と "processed %d insns" の行を、固定
+  （`BPF_LOG_FIXED`）か回転するバッファに書きます。小さすぎるログは `ENOSPC`、書けないログは
+  `EFAULT` で、読み込みの結果に代わります。`log_true_size` はログの長さです。読み込んだ
+  プログラムは `anon_inode:bpf-prog` の close-on-exec のディスクリプタです。その fdinfo は、
+  型、タグ（Linux の `bpf_prog_calc_tag` と同じく、マップのディスクリプタを除いた命令の
+  SHA-256 の先頭 8 バイト）、メモリ（96 バイトのヘッダーと命令をページで）、ID（マップとは
+  別のプログラムの ID）、検証器が通った命令の数を示します。`prog_jited` と実行の統計は 0 です。
+  Linux が受け入れるのに検証器が断るものは [制限](./limitations) を参照してください。
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。

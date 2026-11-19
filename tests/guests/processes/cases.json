@@ -141,6 +141,7 @@
     {"name":"bpf-lpm","binary":"bpf"},
     {"name":"bpf-maps","binary":"bpf"},
     {"name":"bpf-prog-load","binary":"bpf"},
+    {"name":"bpf-prog-verify","binary":"bpf-prog"},
     {"name":"inotify-calls","binary":"inotify"},
     {"name":"inotify-directory","binary":"inotify"},
     {"name":"inotify-files","binary":"inotify"},

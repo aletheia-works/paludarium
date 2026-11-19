@@ -22,8 +22,8 @@
 //! memory), counted with its x86-64 structure sizes; see [`ARRAY_HEADER`]
 //! and [`HASH_HEADER`] for where they part from upstream v7.0 and master.
 //!
-//! `BPF_PROG_LOAD` checks its arguments as Linux does and then refuses every
-//! program ([`crate::bpf_prog`]). A command Linux has that is not here
+//! `BPF_PROG_LOAD` loads socket filters, which its verifier checks
+//! ([`crate::bpf_prog`], [`crate::bpf_verifier`]). A command Linux has that is not here
 //! (the other program commands, BTF, links, pins and the rest) is
 //! `ENOSYS`; one Linux does not have is `EINVAL`, as there. Map
 //! types Linux has that are not here are `EINVAL`, as on a kernel built
@@ -509,7 +509,7 @@ fn dispatch(c: &mut Context<'_>, command: u32, at: u64, size: u32) -> Result<u64
         cmd::MAP_UPDATE_ELEM => update(c, &attr),
         cmd::MAP_DELETE_ELEM => delete(c, &attr),
         cmd::MAP_GET_NEXT_KEY => next_key(c, &attr),
-        cmd::PROG_LOAD => crate::bpf_prog::load(c, &attr),
+        cmd::PROG_LOAD => crate::bpf_prog::load(c, &attr, at, size as u32),
         cmd::MAP_LOOKUP_AND_DELETE_ELEM => lookup_and_delete(c, &attr),
         cmd::MAP_FREEZE => freeze(c, &attr),
         cmd::MAP_LOOKUP_BATCH

@@ -23,6 +23,7 @@ mod aio;
 mod bpf;
 mod bpf_prog;
 mod bpf_trie;
+mod bpf_verifier;
 mod devices;
 mod epoll;
 mod events;

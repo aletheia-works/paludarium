@@ -105,9 +105,11 @@ kernel.
   buffer must lie in the user half (`EFAULT`), with its whole length when
   there are several and at most `MAX_RW_COUNT` when there is one. The lengths
   are cut so that the total is at most `MAX_RW_COUNT`.
+
 - `pread64`, `pwrite64`, `preadv` and `pwritev` leave the file position
   where it was, and a pipe or socket gives `ESPIPE`; in an `O_APPEND` file a
   positioned write still appends, as on Linux.
+
 - `preadv2` and `pwritev2` read and write at an offset, or at the file
   position for an offset of -1, as `readv` and `writev` do. Their flags
   are checked as Linux's `kiocb_set_rw_flags` checks them, once the vector
@@ -134,12 +136,14 @@ kernel.
   (`FS_APPEND_FL`) gives `EPERM`, for a read too. `RWF_APPEND` writes a
   regular file at its end, `RWF_DSYNC` and `RWF_SYNC` write it through as
   `fdatasync`, and `RWF_HIPRI` changes nothing.
+
 - `copy_file_range` copies between two regular files on one mount (`EXDEV`
   across mounts), stopping at the input's end, with Linux's checks in order
   (`EISDIR`, `EINVAL`, `EBADF`, `EOVERFLOW`, and `EINVAL` for an overlap in
   one file). `sendfile` reads a regular file into any writable file, a pipe
   taking at most its capacity per call. Both update the given offsets or the
   file positions; `sendfile` writes its offset back even after an error.
+
 - `splice` moves bytes between a pipe (or FIFO) and a regular file, a
   device, a socket or another pipe, `tee` copies what one pipe holds into
   another without taking it, and `vmsplice` puts the guest's buffers into a
@@ -170,12 +174,14 @@ kernel.
   The host's standard streams, which stand for pipes, can be either end of
   a `splice` (an offset for one is `ESPIPE`), but not of `tee` or
   `vmsplice`, which take only the guest's own pipes.
+
 - `getdents64` goes on from what it has returned, so unlinking those entries
   skips nothing. `lseek` to a `d_off` leads to the same entry while the
   directory is unchanged, and `dup` and `fork` share the place. `getdents`
   is the same with the old `linux_dirent`, whose last byte is the type. Both
   keep the count in an `int` as Linux does, so one of 2 GiB or more fits no
   entry (`EINVAL`).
+
 - Extended attributes stay with a file in memory, through hard links and
   renames and after its last name is gone. As on Linux, `user.*` is for regular
   files and directories (on others, reading gives `ENODATA` and writing `EPERM`),
@@ -185,6 +191,7 @@ kernel.
   `security.*` needs `CAP_SYS_ADMIN` to change. A name is from 1 to 255 bytes
   (`ERANGE`), a value at most 64 KiB (`E2BIG`), and any other namespace gives
   `EOPNOTSUPP`. The name is read before the file is found, as since Linux 6.13.
+
 - File capabilities (`security.capability`) are checked and converted as
   Linux's capability module does. A value written must be a `vfs_cap_data` of
   revision 2 (20 bytes) or 3 (24 bytes) (`EINVAL`), and the caller needs
@@ -198,6 +205,7 @@ kernel.
   A write or truncation of the file, and a `chown` of anything but a
   directory, takes them away, whoever does it. `execve` gives them to the
   program it runs (see the credentials below).
+
 - `setxattrat`, `getxattrat`, `listxattrat` and `removexattrat` (Linux 6.13)
   find the file from a directory descriptor, and take `AT_SYMLINK_NOFOLLOW`
   and `AT_EMPTY_PATH` only (`EINVAL`). With `AT_EMPTY_PATH`, a null or empty
@@ -207,6 +215,7 @@ kernel.
   flags come in a `struct xattr_args`, checked as `copy_struct_from_user`
   checks one: below 16 bytes is `EINVAL`, above a page or with a nonzero
   byte past the 16 is `E2BIG`, and `getxattrat` takes no flags (`EINVAL`).
+
 - A regular file or directory in memory keeps tmpfs's inode flags:
   `FS_IMMUTABLE_FL`, `FS_APPEND_FL`, `FS_NODUMP_FL` and `FS_NOATIME_FL`.
   `file_getattr` and `file_setattr` (Linux 6.17) and the `FS_IOC_GETFLAGS`,
@@ -229,6 +238,7 @@ kernel.
     special file keeps none: `EOPNOTSUPP` from the calls and `ENOTTY` from
     the ioctls.
   - Setting one generates `IN_ATTRIB`.
+
 - The flags are enforced where Linux checks `IS_IMMUTABLE` and `IS_APPEND`,
   root included:
   - Writing an immutable file is `EPERM` before any other permission check
@@ -247,6 +257,7 @@ kernel.
   - A description opened before the flag was set still writes, as on tmpfs.
     `FS_NOATIME_FL` and `FS_NODUMP_FL` change nothing else, as no access
     time is kept.
+
 - `statx` reports the fields a `stat` has (`STATX_BASIC_STATS`) and the
   mount's `st_dev` as its device numbers, with Linux's flag and mask checks
   (`EINVAL`). Whatever the mask asks for, it also gives the mount's ID, as
@@ -258,6 +269,7 @@ kernel.
   whose IDs start at 21, does not show, as Linux's internal mounts are.
   `AT_EMPTY_PATH` names the descriptor, or the working directory for
   `AT_FDCWD`, and as since Linux 6.11 a null path with it does too.
+
 - `name_to_handle_at` gives a file's handle, checked in the order of
   Linux's (6.13 and later): the flags (`EINVAL`, also for
   `AT_HANDLE_CONNECTABLE` with `AT_HANDLE_FID` or `AT_EMPTY_PATH`), the path
@@ -274,6 +286,7 @@ kernel.
   gives `AT_HANDLE_FID` its identifier of type `FILEID_INO64_GEN`: the inode,
   then the generation. A connectable handle is `EOPNOTSUPP`, as neither tmpfs
   nor pidfs can give one.
+
 - `open_by_handle_at` opens the file a handle names, checked in the order of
   Linux's: the handle's header (`EFAULT`), its size (`EINVAL` for 0 or over
   128 bytes) and the flags of its type (`EINVAL`, but for a connectable
@@ -293,6 +306,7 @@ kernel.
   opens its file, as an open of that file itself would: `O_CREAT` finds it
   (`EEXIST` with `O_EXCL`, `EISDIR` for a directory), and a symbolic link is
   not followed.
+
 - `fallocate` checks its arguments as Linux's `vfs_fallocate` does, in
   order (`EINVAL`, `EOPNOTSUPP`, `EBADF`, then `ESPIPE`, `EISDIR` or
   `ENODEV` for a file that is not regular, and `EFBIG`). Files then behave
@@ -304,6 +318,7 @@ kernel.
   `fallocate` past the 4 GiB the in-memory filesystem has fails with
   `ENOSPC` and allocates nothing (writes are not bounded this way; see
   [Limitations](./limitations)).
+
 - Files of the in-memory filesystem keep their contents in 4 KiB pages, as
   tmpfs does: a write allocates the pages it touches, and the rest of a file
   is a hole that reads as zeros and takes no memory, so a file grown by
@@ -313,11 +328,13 @@ kernel.
   holes; a page `fallocate` allocated is a hole until it is written, and
   the end of the file is one. An offset at or past the end, or a negative
   one, gives `ENXIO`.
+
 - Files of a mounted host directory take `SEEK_DATA`, `SEEK_HOLE` and
   `st_blocks` from the host on Linux and macOS (`st_blocks` on every Unix
   host). Where the host's filesystem cannot tell where its holes are, and on
   other hosts, the whole file is data, as Linux's `generic_file_llseek` has
   it for a filesystem without holes.
+
 - `memfd_create` makes an unlinked in-memory file (mode 0777, or 0666 with
   `MFD_NOEXEC_SEAL`, and no links), with Linux's flag and name checks
   (`EINVAL`, `EFAULT`); `MFD_HUGETLB` gives `ENOSYS`, as from a kernel
@@ -336,6 +353,7 @@ kernel.
   of a memfd sealed against writes cannot become writable (`EACCES`).
   `F_SEAL_EXEC` on an executable memfd, which seals writes too, gives `EBUSY`
   then as well, as since Linux 7.1; earlier kernels add the seals.
+
 - `memfd_secret` makes a file as Linux's secretmem does: regular, empty,
   mode 0600 and one link, open for reading and writing, `/secretmem
   (deleted)` in `/proc/self/fd` and `/proc/self/maps`, and on a filesystem
@@ -356,6 +374,7 @@ kernel.
   until the file goes, mapped or not, as Linux master's secretmem charges
   the creator's `locked_vm`. Its pages are the emulator's, so they are as
   secret as any other memory of the guest.
+
 - `openat2` opens as `openat` does (a FIFO too), with Linux's stricter
   checks of its `struct open_how`: a size below 24 bytes is `EINVAL`, above
   a page or with unknown nonzero bytes past the first version `E2BIG`; an
@@ -371,11 +390,13 @@ kernel.
   a magic link (`EXDEV`). With both scoping flags the call is `EINVAL`.
   `RESOLVE_CACHED` gives `EAGAIN` with `O_CREAT`, `O_TRUNC` or `O_TMPFILE`,
   and otherwise always finds the file, as if every name were cached.
+
 - `close_range` closes the open descriptors from `first` to `last`, or with
   `CLOSE_RANGE_CLOEXEC` marks them close-on-exec. `CLOSE_RANGE_UNSHARE` first
   gives the thread its own copy of a table it shares with `CLONE_FILES`
   threads, which keep their descriptors. Unknown flags and `first` above
   `last` give `EINVAL`.
+
 - Every system call reads its arguments at the width of the C type Linux
   declares them with, as Linux's syscall wrappers cast the registers before
   the call runs: an `int`, `pid_t` or `clockid_t` from the low 32 bits,
@@ -393,6 +414,7 @@ kernel.
   does. The number
   itself is read from the low 32 bits of `rax` too, as Linux's
   `do_syscall_64` takes an `int`, and a negative one gives `ENOSYS`.
+
 - `futex` handles `WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`,
   `CMP_REQUEUE` and `WAKE_OP`. A word is
   told apart as Linux's `get_futex_key` does: in a shared mapping (shared
@@ -418,6 +440,7 @@ kernel.
   and gives how many it woke. An unknown operation gives `ENOSYS` before the
   word is touched, an unknown comparison gives `ENOSYS` after it changed, and
   a word it cannot write gives `EFAULT`, as x86's Linux does.
+
 - The futex2 calls take 32-bit words with `FUTEX2_PRIVATE`, `FUTEX2_NUMA`
   and `FUTEX2_MPOL`, checked in Linux's order. Other sizes and flags give
   `EINVAL`. `futex_wake` and `futex_wait` are `FUTEX_WAKE_BITSET` and
@@ -431,6 +454,7 @@ kernel.
   which must be node 0, the only one, or `-1`, which becomes 0, as Linux
   writes the thread's node there. A signal interrupts the waits with
   `ERESTARTSYS`, so they run again after a stop or an `SA_RESTART` handler.
+
 - `set_robust_list` and `get_robust_list` keep each thread's list of robust
   futexes, which glibc's and musl's robust mutexes need. When a thread ends or
   calls `execve`, the list is walked as Linux's `exit_robust_list` walks it:
@@ -443,11 +467,14 @@ kernel.
   zombie keeps the dumpability it had for that check, and for `kcmp`,
   `pidfd_getfd`, `migrate_pages` and `move_pages`, as Linux 7.1 and later keep
   it (before, a process with no memory left skipped it).
+
 - `futex`, `epoll` and `eventfd` are implemented inside paludarium, not with the
   host's equivalents, so they behave the same on macOS, Windows and in
   WebAssembly.
+
 - Without a [network](#network), outside a new network namespace, `socket()` returns `EAFNOSUPPORT` for
   `AF_INET`, `AF_INET6`, `AF_NETLINK` and `AF_MCTP`.
+
 - `epoll_wait`, `epoll_pwait` and `epoll_pwait2` check their arguments in
   the order of the kernels after Linux 6.12 (6.12 itself checked
   `maxevents` before the descriptor): `epoll_pwait2` reads its timeout (a `struct timespec`, none
@@ -455,6 +482,7 @@ kernel.
   huge one saturates), the signal mask is set (`EINVAL` for a size other
   than 8), then the descriptor is checked (`EBADF`), then `maxevents`
   (`EINVAL`), and last that it is an epoll (`EINVAL`).
+
 - `poll` waits like `epoll_wait`: until a descriptor is ready, the timeout
   in milliseconds passes (a negative one never does) or a signal arrives
   (`EINTR`). The host's standard input is readable only with bytes to read
@@ -467,18 +495,21 @@ kernel.
   host that cannot tell (Windows) keeps it always readable. The output
   streams are always writable. A pipe's read end is readable only with unread data, and only hung up once
   its writers are gone, as Linux's `pipe_poll` reports.
+
 - `ppoll`, `select` and `pselect6` wait the same way. They write the time
   left back to their timeout (not a zero one), as Linux does, and `ppoll` and
   `pselect6` take a temporary signal mask, which a handler runs with.
   `select` fails with `EBADF` for a closed descriptor in its sets, and looks
   at no more than 1024 descriptors (`FD_SETSIZE`), where Linux cuts `nfds` to
   the size of its descriptor table.
+
 - `fcntl`'s `F_GETFL` gives the status flags as Linux keeps them: the open
   flags less `O_CLOEXEC`, `O_CREAT`, `O_EXCL`, `O_NOCTTY` and `O_TRUNC`,
   with `O_LARGEFILE` for a file opened by a path or a memfd; an `O_PATH`
   file keeps only `O_DIRECTORY`, `O_NOFOLLOW` and `O_PATH`. Pipes, sockets
   and the kernel's own files have no `O_LARGEFILE`, unless opened by a path
   (a link in `/proc/self/fd`, `/dev/stdout`).
+
 - An `O_PATH` descriptor holds only a path, as Linux's `fdget` refuses it:
   reading and writing it, `lseek`, `flock`, `getdents`, `getdents64`, `sendfile`,
   `copy_file_range`, `splice`, `tee`, `vmsplice`, `fsync`, `fdatasync`, `syncfs`, `sync_file_range`,
@@ -489,6 +520,7 @@ kernel.
   `F_SETFD` and `F_GETFL`) are `EBADF`, and `poll` gives `POLLNVAL`, while
   `select` finds it ready. `fstat`, `fstatfs`, `fchdir`, `dup` and `close`
   take it, and it is a directory for the `*at` calls.
+
 - `fcntl`'s byte-range locks, as Linux's `fs/locks.c` keeps them: record
   locks (`F_SETLK`, `F_SETLKW`, `F_GETLK`), which a descriptor table owns (a
   process's, which its threads and a child cloned with `CLONE_FILES` share,
@@ -513,14 +545,17 @@ kernel.
   `locks_wake_up_blocks` does, even before the waiter runs again. The
   locks are the guest's own: a program on the host does not see them, nor
   they its.
+
 - A pipe holds 64 KiB, as on Linux, and `fcntl`'s `F_SETPIPE_SZ` and
   `F_GETPIPE_SZ` resize and report it like `pipe_set_size`: a power of two of
   at least a page, `EBUSY` below the unread data and `EINVAL` past 2³¹.
+
 - A `SOCK_DGRAM` pair keeps message boundaries like `SOCK_SEQPACKET`, but has
   no end of file: when the peer closes, reads wait and the next send gets
   `ECONNREFUSED`, then `ENOTCONN`; that send drops what the end has not
   read, as below. Only `SOCK_STREAM` raises `SIGPIPE` with
   `EPIPE`, as on Linux.
+
 - `socket(AF_UNIX)` makes a `SOCK_STREAM` or `SOCK_SEQPACKET` socket that
   binds to a name in the abstract namespace (a `sun_path` starting with 0),
   or with only the family to a free one of five hex digits, listens and
@@ -537,6 +572,7 @@ kernel.
   is `ECONNRESET`. Connected, it is a socket pair end in all else. Names
   are kept per socket type, as Linux hashes them with the type, so a stream
   and a datagram socket may bind the same one.
+
 - An AF_UNIX socket also binds to a path, as Linux's `unix_bind_bsd`: `bind`
   makes a socket file there (`S_IFSOCK`, mode 0777 less the umask), also
   in a directory mounted from a Linux host ([Limitations](./limitations)), so a
@@ -547,6 +583,7 @@ kernel.
   `ECONNREFUSED` for a file that is no socket or whose socket has closed
   (the file stays), `EPROTOTYPE` for a socket of another type. A socket
   file opens nothing (`ENXIO`), and `readdir` gives it `DT_SOCK`.
+
 - `socket(AF_UNIX, SOCK_DGRAM)` (and `SOCK_RAW`, which Linux makes one)
   makes a datagram socket that binds as above, and sends with `sendto` to
   the socket of a name, or to the one it connected to, as Linux's
@@ -583,6 +620,7 @@ kernel.
   `SO_PEERPIDFD` is `ENODATA`; a datagram socket pair's ends name their
   maker, as every pair's do. A socket pair's datagram end sends to names
   too.
+
 - `socketpair(AF_UNIX)` makes two sockets as Linux's `unix_socketpair` does:
   unnamed and connected to each other, so each is a socket of its type in
   all else. Either may `bind`, as above, and its peer's `getpeername` and
@@ -590,6 +628,7 @@ kernel.
   connects no more (`EISCONN` once a listener has the name), and a
   datagram one connects elsewhere or to `AF_UNSPEC` as any datagram socket
   does, disconnecting from the other end as above.
+
 - `recvmsg` and `recvfrom` take their flags as Linux's AF_UNIX sockets do:
   `MSG_PEEK` leaves the data, and gives copies of the descriptors it passes;
   `MSG_WAITALL` fills a stream's buffer, unless the stream ends, descriptors
@@ -601,6 +640,7 @@ kernel.
   the sending socket has as it is read, even once that socket has gone, as
   Linux's `unix_copy_addr`, cut to the room given but with its whole
   length; an unnamed socket's has length 0.
+
 - `sendmmsg` and `recvmmsg` send and receive each message of their vector
   as `sendmsg` and `recvmsg` do, on any socket, writing its byte count to
   its `msg_len`, as Linux's `__sys_sendmmsg` and `do_recvmmsg`.
@@ -618,6 +658,7 @@ kernel.
   `ERESTARTSYS`'s 512 there, as on Linux). A datagram or packet socket's
   receive gives it before its queue too, and an AF_UNIX stream's only once
   nothing is queued, as Linux's `unix_stream_read_generic` does.
+
 - Sockets that only unread messages hold are closed, as Linux's garbage
   collector (`unix_gc`) closes them when a socket goes: a socket whose
   descriptor waits in its own queue, or sockets that hold each other so,
@@ -626,6 +667,7 @@ kernel.
   connections not yet accepted hold counts as the listener's, as Linux's
   `unix_edge_successor` counts it: a listener only they hold is garbage,
   and goes with what they hold, which resets their clients.
+
 - A stream write goes in parts, as Linux's `unix_stream_sendmsg` sends it:
   each at most 36544 bytes (a page's head and 32 KiB of pages), or half the
   send buffer less 64 bytes: the doubled value `SO_SNDBUF` sets and reads
@@ -639,6 +681,7 @@ kernel.
   them, and a full sender waits, is writable to `poll` and gives
   `SIOCOUTQ` as a datagram socket does. The peer's unread bytes bound
   nothing.
+
 - A stream has out-of-band data as Linux 7.0's AF_UNIX keeps it. A `MSG_OOB`
   send makes its last byte the out-of-band byte (an empty one is
   `EOPNOTSUPP`), after the rest of its data, and an earlier byte not yet
@@ -650,6 +693,7 @@ kernel.
   (`recv` with `MSG_OOB` is then `EINVAL`). The descriptors a one-byte
   out-of-band send passes are closed, not delivered. The byte sends `SIGURG`
   to the receiving end's owner (see signal-driven I/O below).
+
 - Signal-driven I/O, as on Linux. `fcntl`'s `F_SETOWN` gives any open file
   an owner:
   - a process or, negative, a process group;
@@ -712,6 +756,7 @@ kernel.
     reader before it looks, so for a send, the peer's shutdown or its
     close Linux sometimes signals; the emulator never does. A datagram or
     packet socket's reader gets it.
+
 - `setsockopt` and `getsockopt` take the `SOL_SOCKET` options as Linux's
   `sk_setsockopt` and `sk_getsockopt` do, with their defaults and checks: an
   `int` value of fewer than 4 bytes is `EINVAL`, a value read back is cut to
@@ -720,6 +765,7 @@ kernel.
   `SO_ACCEPTCONN`, `SO_PEERCRED` and `SO_PEERPIDFD` (the peer process,
   below) can only be read. `SO_SNDBUF` and `SO_RCVBUF` are doubled and kept at Linux's
   floors and ceiling, and `SO_LINGER` takes a `struct linger`.
+
 - `SO_PASSCRED` makes messages carry credentials, as Linux's AF_UNIX does.
   A message sent while either end has it carries the sender's process ID and
   real user and group, or those `SCM_CREDENTIALS` gives. A receiver with it gets
@@ -732,6 +778,7 @@ kernel.
   its real, effective and saved user IDs unless it has `CAP_SETUID`, and one of
   its group IDs unless it has `CAP_SETGID` (`EPERM`), and only then is the
   process looked up (`ESRCH` when there is none).
+
 - `SO_PASSPIDFD` makes messages carry credentials as `SO_PASSCRED` does,
   and a receiver with it gets a close-on-exec pidfd of the sending process
   in an `SCM_PIDFD` message, after any descriptors, as Linux 7.0 orders
@@ -748,19 +795,23 @@ kernel.
   (`copy_peercred`). `SO_PEERPIDFD` reads a new pidfd of that process,
   installed even when the length given holds only part of its number; it
   can only be read (`setsockopt` is `ENOPROTOOPT`).
+
 - `SO_PASSSEC` is set and read back as on Linux, and with it a receiver
   with no control buffer finds `MSG_CTRUNC`; it gets no `SCM_SECURITY`
   message, as on a Linux whose security module gives AF_UNIX no sender's
   context (none, or AppArmor).
+
 - `SO_PASSRIGHTS` is on for a new AF_UNIX socket, as on Linux 6.16 and
   later. Set to 0, the socket takes no descriptors: a send that passes some
   to it is `EPERM`, after a shutdown's `EPIPE` and before a full queue's
   `EAGAIN`, while a stream send of no bytes passes nothing and gives 0.
   Descriptors already waiting are still read.
+
 - A socket a listener accepts takes the listener's `SO_PASSCRED`,
   `SO_PASSPIDFD`, `SO_PASSSEC` and `SO_PASSRIGHTS` as they were when the
   client connected. An inet socket refuses these four options both ways
   with `EOPNOTSUPP`, as Linux takes them only on AF_UNIX.
+
 - `SO_RCVTIMEO` and `SO_SNDTIMEO` (and their `_NEW` forms) limit how long a
   blocking `recv`, `read`, `send` or `write` on the socket waits, as on
   Linux: past the limit it gives `EAGAIN`, or what it moved, and
@@ -769,17 +820,20 @@ kernel.
   value is kept in ticks of a 1000 Hz clock, so it reads back rounded up to
   a millisecond. A signal that ends such a wait gives `EINTR`, which no
   `SA_RESTART` restarts, as Linux's `sock_intr_errno`.
+
 - `SO_RCVLOWAT` makes a blocking stream `recv` or `read` wait until it has
   that many bytes or its buffer is full, as Linux's `sock_rcvlowat` does. It
   returns less when the stream ends, its time is up, or descriptors come.
   Peeks, nonblocking reads, `poll`, and datagram and packet sockets are not
   held back. 0 counts as 1 and a negative value as `INT_MAX`.
+
 - `SO_PEEK_OFF` sets where a `MSG_PEEK` starts, as Linux's `sk_peek_off`:
   each peek moves it on by what it read, and each read moves it back by what
   it took, not below 0. On a datagram or packet socket it passes over whole
   messages, and over an empty one already peeked at, and `MSG_TRUNC` gives
   what is left of the message from there. It takes any value; a negative one
   (by default -1) is none.
+
 - `SO_TIMESTAMP` and `SO_TIMESTAMPNS`, and their `_NEW` forms, timestamp
   messages as Linux's AF_UNIX does. A datagram or packet socket with one
   gets each message's real time in a control message, before any
@@ -789,6 +843,7 @@ kernel.
   timestamps then, or else when it is first read or peeked at. A stream gets
   none. `getsockopt` reads each one as set only by the form that set it, and
   turning any off keeps the `_NEW` choice until one is turned on again.
+
 - `SO_TIMESTAMPING` and its `_NEW` form take the flags Linux knows, refusing
   as Linux's `sock_set_timestamping` does (`EINVAL` for an unknown flag,
   `SOF_TIMESTAMPING_OPT_ID_TCP` without `OPT_ID` or `OPT_STATS` without
@@ -800,6 +855,7 @@ kernel.
   `SCM_TIMESTAMPING` after that control message, whose first `timespec` is
   the same time when the flags report software stamps and do not filter
   received ones out; no hardware stamps a message between local sockets.
+
 - `mmap` and `shmat` make a mapping and attach the file, the shared memory or
   the segment to it under one hold of the address space's lock, as Linux does
   under its `mmap_lock`. With `MAP_FIXED`, or `SHM_REMAP`, the unmap of what
@@ -809,6 +865,7 @@ kernel.
   `EEXIST` when anything is mapped there, before the file is asked. When the
   backing cannot be attached, the new mapping goes and what it replaced stays
   gone.
+
 - A `MAP_SHARED` mapping of a file shows the file's page cache, as on Linux:
   every shared mapping of the file, in every process, has the same pages. A
   store to them is what `read` and the file's private mappings see, and
@@ -816,22 +873,26 @@ kernel.
   store past the end of the file stays out of it. Such a mapping may write,
   and become writable with `mprotect`, only when the file is open for
   reading and writing (`EACCES` otherwise), as Linux has it.
+
 - A `MAP_PRIVATE` mapping of a file shows the same page cache in the pages
   it has not written, so it sees later changes to the file there, and its
   first write to a page copies the page for its process alone, as on Linux;
   a `fork`ed child shares the pages neither process has written. A
   truncation drops the copies it leaves wholly past the end of the file, so
   that they read the file again when it grows, as Linux drops them.
+
 - A page of a file mapping, private or shared, wholly past the end of the
   file raises `SIGBUS` (`BUS_ADRERR`, with the address) when it is touched,
   as on Linux; a system call given such memory fails with `EFAULT`. The end
   follows the file: a page past it becomes readable when the file grows, and
   a page read before raises `SIGBUS` once the file shrinks past it. A page
   the file only partly covers reads zeros after its end.
+
 - `mincore` says which pages are in memory: a private page once it was read or
   written, shared anonymous memory once it was, and a file's page when it lies
   within the file. It writes the bytes up to the first page that is not mapped,
   which is `ENOMEM`, as Linux does.
+
 - `cachestat` (Linux 6.5) counts the pages of a byte range (to the end of the
   file for a length of 0) that the file's page cache holds. A file in memory
   holds its allocated pages, as tmpfs does, none of them dirty or under
@@ -841,6 +902,7 @@ kernel.
   both structs must be readable and writable (`EFAULT`), and a description
   open to read only needs a caller that owns or may write the file
   (`EPERM`) before an unknown flag is `EINVAL`.
+
 - `mlock`, `mlock2` and `munlock` check their range as Linux does: the length
   rounds up to pages, a range past the end of addresses is `EINVAL`, and one
   with a page that is not mapped is `ENOMEM`, once the VMAs before it took
@@ -862,6 +924,7 @@ kernel.
   the rings of AIO and `io_uring` are never locked. Unknown flags of
   `mlock2` and `mlockall` give `EINVAL`. Nothing is ever swapped out, so
   memory stays in place without more being done.
+
 - `madvise`: `MADV_DONTNEED` empties private pages. Anonymous ones then read
   as zeros, and those of a file mapping read the file again, as it is then,
   as Linux faults them in from the file; this holds
@@ -911,6 +974,7 @@ kernel.
   discarded takes none (`EPERM`), and the rings of AIO and `io_uring`,
   which Linux maps `VM_DONTEXPAND`, take neither advice (`EINVAL`). Other
   advice gives `EINVAL`.
+
 - `process_madvise` advises each range of its iovecs in turn, of the caller's
   memory (`PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP`, or a pidfd of its
   own process or of one sharing its memory) as `madvise` does, and gives the
@@ -920,6 +984,7 @@ kernel.
   (`EPERM`), and its ranges need only be mapped (`ENOMEM`). The checks come
   in Linux's order: `flags`, the iovecs, the pidfd (`EBADF`, `ESRCH`), the
   caller's right to read the process (`EACCES`), then the advice.
+
 - `process_mrelease` finds its process as `process_madvise` does (`flags`
   must be 0, then `EBADF`, `ESRCH`); a process that has exited has no
   memory left (`ESRCH`, as a zombie). It succeeds when that memory is on
@@ -934,6 +999,7 @@ kernel.
   to (or one of the process's) does not block it, and the process is not
   stopped. The memory goes as the process's last thread ends, so there is
   nothing more to release early.
+
 - `mremap` grows a mapping in place when the pages after it are free, and
   otherwise moves it with its contents under `MREMAP_MAYMOVE`; `MREMAP_FIXED`
   and `MREMAP_DONTUNMAP` work too. Shared memory stays shared with a `fork`ed
@@ -945,8 +1011,10 @@ kernel.
   (`MREMAP_DONTUNMAP`, `EINVAL`), and an AIO ring moves only whole, as
   Linux master's `aio_ring_mremap` has it (`EINVAL` once the target is
   free and what a shrink drops is gone), with its context.
+
 - `msync` checks its arguments and the range, and with `MS_SYNC` or
   `MS_ASYNC` writes the stores of shared file mappings back to their files.
+
 - `userfaultfd` makes a file through which a thread handles the faults of
   others on memory it registered, as Linux's `fs/userfaultfd.c`. One that
   the kernel's own faults reach as well (without `UFFD_USER_MODE_ONLY`)
@@ -1111,12 +1179,14 @@ kernel.
   is not read `UFFDIO_COPY`, `UFFDIO_ZEROPAGE`, `UFFDIO_POISON`,
   `UFFDIO_CONTINUE` and `UFFDIO_MOVE` are `EAGAIN` (written to their last
   field first), as is `UFFDIO_WRITEPROTECT` (`mmap_changing`).
+
 - `remap_file_pages` maps a range of a shared mapping again at another page
   of its file or shared memory, as Linux's `mmap` of the mapping's own file
   does, keeping its protection. As on Linux, `prot` must be 0 and the range
   must lie in shared mappings of the same memory whose file is open for
   writing (`VM_SHARED`, which a memfd's seals leave), with no hole
   (`EINVAL`), and a page past what a file can reach is `EOVERFLOW`.
+
 - System V shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) belongs to
   the thread's IPC namespace, with Linux's checks in Linux's order and the
   namespace's limits, its `/proc/sys/kernel` files (below): a size from 1
@@ -1141,6 +1211,7 @@ kernel.
   found by no key, and goes at its last detach. `SHM_LOCK` checks the owner
   and `RLIMIT_MEMLOCK` as Linux does, and `SHM_HUGETLB` gives `ENOSYS`, as
   from a kernel built without hugetlbfs.
+
 - System V semaphores (`semget`, `semop`, `semtimedop`, `semctl`) belong to
   the thread's IPC namespace too, with Linux's checks in Linux's order (as
   `ipc/sem.c`) and the namespace's limits of `/proc/sys/kernel/sem` (Linux's
@@ -1170,6 +1241,7 @@ kernel.
   shares the list applies it as it ends, or as it leaves it with `unshare`
   (`CLONE_SYSVSEM` or `CLONE_NEWIPC`) or `setns` to another IPC namespace,
   cut to 0 and `SEMVMX` as Linux cuts them.
+
 - System V message queues (`msgget`, `msgsnd`, `msgrcv`, `msgctl`) belong to
   the thread's IPC namespace too, with Linux's checks in Linux's order (as
   `ipc/msg.c`) and the namespace's limits of `/proc/sys/kernel` (Linux's
@@ -1194,6 +1266,7 @@ kernel.
   `MSG_STAT_ANY` (the processes in the caller's PID namespace), `IPC_SET`
   (past `MSGMNB` with `CAP_SYS_RESOURCE`), `IPC_RMID`, `IPC_INFO` and
   `MSG_INFO`.
+
 - POSIX message queues (`mq_open`, `mq_unlink`, `mq_timedsend`,
   `mq_timedreceive`, `mq_notify`, `mq_getsetattr`) are the files of the
   thread's IPC namespace's own `mqueue` filesystem, with Linux's checks in
@@ -1265,6 +1338,7 @@ kernel.
   `SA_RESTART` restarts it), and gives the room back if it then fails.
   Closing any descriptor of the queue, or ending,
   drops its process's registration, as Linux's `mqueue_flush_file`.
+
 - `/dev/mqueue` is the first IPC namespace's `mqueue` filesystem, as
   systemd mounts it when Linux boots, whatever IPC namespace the caller is
   in: a sticky directory anyone may write (01777, its maker's), which
@@ -1307,6 +1381,7 @@ kernel.
   on the way, `EACCES`; `rename` before it looks the names up), and
   `EPERM` within it, but for a `rename` of a name onto itself, which does
   nothing.
+
 - The key retention service (`add_key`, `request_key`, `keyctl`), as
   Linux's `security/keys`: `keyring`, `user` and `logon` keys, each with
   its serial number, owner, group, permissions (possessor, user, group and
@@ -1332,6 +1407,7 @@ kernel.
   and gives `ENOENT`, so `INSTANTIATE`, `NEGATE`, `REJECT` and
   `INSTANTIATE_IOV` find no authority (`EPERM`) and `ASSUME_AUTHORITY` of
   a key `ENOKEY`.
+
 - `sched_getaffinity` lets every guest thread run on each of the host's CPUs,
   so the guest sees as many CPUs as the host has (one in WebAssembly).
   `sched_setaffinity` keeps a mask for a thread of the process, as Linux
@@ -1343,6 +1419,7 @@ kernel.
   has the ID. `getcpu` gives NUMA node 0, and the virtual CPU of a thread
   that has registered `rseq`; for another thread, the lowest CPU its mask
   allows.
+
 - Each thread has scheduling attributes, as on Linux: a policy
   (`SCHED_OTHER`, `SCHED_BATCH`, `SCHED_IDLE`, `SCHED_EXT`, `SCHED_FIFO`,
   `SCHED_RR`, `SCHED_DEADLINE`), a real-time priority, `SCHED_RESET_ON_FORK`,
@@ -1373,6 +1450,7 @@ kernel.
   the host's scheduler gives its threads on a Linux host, whose threads run
   the guest's; elsewhere Linux 6.12's default at 1000 Hz, 0.75 ms times 1 +
   log2 of the CPUs (at most 8).
+
 - `ioprio_set` and `ioprio_get` find threads as `getpriority` does
   (`IOPRIO_WHO_PROCESS`, `IOPRIO_WHO_PGRP`, `IOPRIO_WHO_USER`). `ioprio_set`
   checks the priority first, as Linux's `ioprio_check_cap` (a known class, a
@@ -1383,6 +1461,7 @@ kernel.
   the class none, whatever its nice value; for several threads, the best as Linux's
   `ioprio_best` compares them (one without a class counts as best-effort
   level 4). A priority with a class passes to new threads and processes.
+
 - `kcmp` finds each thread as the caller's PID namespace numbers it
   (`ESRCH`) and needs to be allowed to read both, as `ptrace_may_access` in
   read mode with the real IDs decides (`EPERM`). It then compares, as Linux's
@@ -1395,6 +1474,7 @@ kernel.
   for others in an order that random cookies make, as Linux hides the
   objects' addresses. A thread without one (an ended process, a thread with
   no I/O context or undo list) compares equal to another without.
+
 - `process_vm_readv` and `process_vm_writev` check as Linux's
   `mm/process_vm_access.c` does: `flags` must be 0 (`EINVAL`), then the local
   iovec array as `readv` reads it, then the remote one (more than 1024
@@ -1410,12 +1490,14 @@ kernel.
   without `PROT_WRITE` (to write), or a local byte that cannot be written or
   read, ends the copy, which gives the bytes copied before it, or `EFAULT`
   with none.
+
 - `pidfd_getfd` takes no flags (`EINVAL`) and a pidfd (`EBADF`), and needs
   the caller to be allowed to attach to its process as above (`EPERM`); a
   process that has exited, reaped or not, is `ESRCH`, and a descriptor it
   does not have `EBADF`. The copy shares the open file description and
   gets the lowest free number, close-on-exec (`EMFILE` at
   `RLIMIT_NOFILE`).
+
 - Whether a caller may read or attach to a thread of another process is
   decided as Linux's `__ptrace_may_access` with the capability module and
   Yama decides it. To read (`kcmp`, `get_robust_list`, `/proc/<pid>/environ`
@@ -1430,6 +1512,7 @@ kernel.
   target must also be a descendant of the caller, or have let it in with
   `PR_SET_PTRACER`, or the caller must have `CAP_SYS_PTRACE` in the target's
   user namespace.
+
 - `personality` keeps any value for the thread, as Linux stores it, and
   returns the old one (`0xffffffff` only asks). New threads and processes
   inherit it, and `execve` keeps it but for `READ_IMPLIES_EXEC`, and
@@ -1446,6 +1529,7 @@ kernel.
   and so are the flags that do nothing on x86-64 Linux either
   (`ADDR_LIMIT_32BIT`, `SHORT_INODE`, `WHOLE_SECONDS`, `STICKY_TIMEOUTS`,
   ...).
+
 - `mprotect` checks its arguments in Linux's order: both `PROT_GROWSDOWN`
   and `PROT_GROWSUP`, a misaligned start, an empty range (which succeeds
   whatever the bits), an end that overflows (`ENOMEM`), then unknown bits.
@@ -1454,6 +1538,7 @@ kernel.
   else `EINVAL`; `PROT_GROWSUP` is
   `EINVAL` on a mapped start, as no VMA grows up on x86-64. Where no VMA is
   in the range, both give `ENOMEM`.
+
 - A mapping that grows down, the main stack or private anonymous memory that
   `mmap` made with `MAP_GROWSDOWN` (`VmFlags` shows `gd`), grows as Linux's
   `expand_downwards` makes it: an access to an unmapped page below it, or a
@@ -1466,6 +1551,7 @@ kernel.
   or where `mmap` looks for room. A file's mapping, `/dev/zero`'s included,
   and shared memory cannot grow down (`EINVAL`). The main stack's VMA starts
   at 8 MiB, so with a larger `RLIMIT_STACK` it grows past that.
+
 - Protection keys answer as Linux does on a CPU without them, which the
   virtual CPU is (`CPUID` reports no PKU): no key is ever allocated, not even
   the default key 0. `pkey_alloc` gives `ENOSPC`, or `EINVAL` for a flag or
@@ -1473,6 +1559,7 @@ kernel.
   `pkey_free` gives `EINVAL`; and `pkey_mprotect` with key `-1` is `mprotect`,
   while any other key gives `EINVAL` after the checks Linux makes first (an
   empty range succeeds, an overflowing one gives `ENOMEM`).
+
 - `mseal` seals mappings as Linux's `mm/mseal.c` does. It takes no flags and a
   page-aligned start, and a length that wraps or runs past the top is
   `EINVAL`; a range with an unmapped page is `ENOMEM`, and seals nothing.
@@ -1489,6 +1576,7 @@ kernel.
   - `shmdt` of a sealed attachment succeeds and leaves it mapped, as Linux
     ignores its failed unmap.
   - A child of `fork` keeps the seals; `exec` starts without any.
+
 - io_uring is Linux 6.12's with two operations, `IORING_OP_NOP` and
   `IORING_OP_EPOLL_CTL` (which libuv batches its `epoll_ctl` calls with); the
   other operations complete with `EOPNOTSUPP`, as on a Linux built without
@@ -1498,6 +1586,7 @@ kernel.
   completion is in the queue when the call returns; links, completions that
   skip success, and completions kept while the queue is full
   (`IORING_FEAT_NODROP`) behave as on Linux.
+
 - Linux's native asynchronous I/O (the calls libaio wraps) is `fs/aio.c`'s.
   `io_setup` makes the number of events at least four for each CPU and
   doubles it (`EINVAL` past `0x8000000 / 32`, `EAGAIN` past
@@ -1535,6 +1624,7 @@ kernel.
   `CLONE_VM` children share them, a fork's child has none and not their
   rings either (as `VM_DONTCOPY` since 2026), and `execve` or the last exit
   ends them, cancelling their polls.
+
 - `modify_ldt` keeps the address space's local descriptor table as Linux's
   `arch/x86/kernel/ldt.c` does. Writing (1, the old mode, or 0x11) takes one
   16-byte `struct user_desc`. An entry number of 8,192 or more gives
@@ -1547,6 +1637,7 @@ kernel.
   zero bytes, and other functions give `ENOSYS`. A fork keeps a copy and an
   exec starts with none. The result is Linux's `int` as an `unsigned int`,
   so an error comes back as, say, `0xffffffea`, not `-EINVAL`.
+
 - `membarrier` has Linux's commands on x86-64 with `CONFIG_RSEQ` and no
   `nohz_full` CPU (`MEMBARRIER_CMD_QUERY` gives `0x3ff`). The private
   commands give `EPERM` until the address space registers for them, a fork
@@ -1560,6 +1651,7 @@ kernel.
   sections of the space's other threads (with `MEMBARRIER_CMD_FLAG_CPU`,
   of the one on that CPU, and of none for a CPU the machine does not have),
   and returns once each of them that was running guest code has stopped.
+
 - `rseq` registers a thread's area as Linux does, with its checks and
   errors (`EINVAL`, `EPERM`, `EBUSY`, `EFAULT`), and clears the area's
   `rseq_cs` when it registers, as current Linux does. The auxiliary vector
@@ -1583,6 +1675,7 @@ kernel.
   a CPU, one that has kept its own for 4 ms lets them have it first. A
   fork keeps the registration; a new thread, a `CLONE_VM` child and an
   exec start without one.
+
 - `chroot` gives the tasks that share the caller's working directory
   (`CLONE_FS`) a root of their own, as Linux's `set_fs_root`, after its
   checks: the path's lookup (`ENOENT`, `ENOTDIR`, `ELOOP`, `EACCES`), search
@@ -1597,6 +1690,7 @@ kernel.
   goes back to the machine's root. The generated `/proc` and `/dev` are under
   another root only where a bind mount of them puts them, as no `proc`
   filesystem is mounted there.
+
 - `mount` mounts a new tmpfs on a directory of the caller's mount namespace,
   after Linux's checks in Linux's order: the type, the source and the
   options are copied (`EFAULT`; a string with no end in 4096 bytes is
@@ -1634,6 +1728,7 @@ kernel.
   moves. `MS_RDONLY` makes the new mount and its superblock read-only, and
   the `ro` option the superblock alone, as mountinfo's two `ro` fields show.
   A mount on a shared mount is shared too, in a peer group of its own.
+
 - `mount` with `MS_BIND` makes a bind mount, after the same checks up to
   `CAP_SYS_ADMIN`, as Linux's `do_loopback`: a source (`EINVAL` for none or
   an empty one), looked up with its links followed (`ENOENT`, `ENOTDIR`,
@@ -1657,6 +1752,7 @@ kernel.
   one). The new mount is a peer of the source's mount and a slave of its
   master; on a shared mount it is shared, in a new peer group if the
   source's mount was in none.
+
 - A bind mount's source may be a file the kernel generates in `/dev` or
   `/proc` (`mount --bind /dev/null file`, or a file of a process's
   directory, `/proc/self` taken as the caller's own): the new mount shows
@@ -1676,6 +1772,7 @@ kernel.
   place, which `getcwd` names (a missing name is `ENOENT` to `chdir` too).
   No mount below a generated directory is in the table, so none is locked
   (`has_locked_children`) and `MS_REC` brings none along.
+
 - `mount` with `MS_REMOUNT` and `MS_BIND` changes a mount's flags alone, as
   Linux's `do_reconfigure_mnt`: the target is the root of a mount of the
   caller's namespace (`EINVAL`), the flags a copy into a less privileged
@@ -1695,6 +1792,7 @@ kernel.
   quota on one without, a changed quota limit; `size`, `nr_blocks`,
   `nr_inodes`, `huge`, `inode32`, `inode64` and `mpol` change, `mode`,
   `uid` and `gid` do not). The mount then takes the call's flags.
+
 - A `noexec` mount runs nothing, as Linux's `path_noexec`: `execve` of a
   program there, a script's interpreter there and an ELF interpreter
   there are `EACCES` before their permission, as is `access` with `X_OK`
@@ -1706,6 +1804,7 @@ kernel.
   caller is not in, runs without its set-user-ID and set-group-ID bits and
   its file capabilities (`mnt_may_suid`); for a script that is its
   interpreter, the file that runs.
+
 - A read-only mount, or one of a read-only superblock, refuses what writes
   with `EROFS` where Linux's `mnt_want_write` does, after the errors that
   come before it: creating a name (`open` with `O_CREAT`, `O_TMPFILE`,
@@ -1731,6 +1830,7 @@ kernel.
   `nosuid`, `noexec` and `relatime`, as systemd mounts it. A link in `/proc/self/fd` gives its file's, and
   the kernel's internal mounts (pipes, sockets, anonymous inodes, pidfs,
   memfd, secretmem, a queue `mq_open` opened) `ST_VALID` alone.
+
 - `mount` with `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` or `MS_UNBINDABLE` (and
   `MS_REC` for the mounts on the target too) changes a mount's propagation
   type, after `do_change_type`'s checks: the root of a mount (`EINVAL`),
@@ -1746,6 +1846,7 @@ kernel.
   is a peer of the mount it copies, or with another user namespace a slave
   of it. A mount that is unmounted, or whose namespace ends, leaves its
   peer group the same way.
+
 - A mount, a bind mount or a move onto a shared mount propagates as
   Linux's `propagate_mnt` makes it: each other mount its peer group
   reaches (its peers, its slaves and theirs, in every mount namespace)
@@ -1761,6 +1862,7 @@ kernel.
   with its parent (`handle_locked`). Without `MNT_DETACH`, a file open on one of
   them makes the unmount `EBUSY` (`propagate_mount_busy`). A slave's own
   mounts reach its own slaves, not its master.
+
 - `mount` with `MS_MOVE` moves a mount, as Linux master's `do_move_mount`
   checks it: a source (`EINVAL` for none or an empty one), looked up with
   its last link followed, at a mount's root (`EINVAL`), a directory onto a
@@ -1771,6 +1873,7 @@ kernel.
   target, with the mounts on it, its old place showing the directory under
   it again; on a shared mount each becomes shared, in a new peer group if
   it was in none. The roots and working directories in them go along.
+
 - `pivot_root` (Linux master's `path_pivot_root`) looks both paths up as
   directories with their links followed, the new root first; then it needs
   `CAP_SYS_ADMIN` over the mount namespace and no Landlock domain that
@@ -1786,6 +1889,7 @@ kernel.
   old root is then on the new one (`chroot_fs_refs`), and the others' stay
   with their mounts. `pivot_root(".", ".")` stacks the old root on the new
   one, which `umount2(".", MNT_DETACH)` then takes off.
+
 - `open_tree` (Linux master's `vfs_open_tree`) checks its flags first
   (`EINVAL` for an unknown one, `AT_RECURSIVE` without a copy, and
   `OPEN_TREE_DROP_MNTNS_MOUNTS` without a recursive one), then
@@ -1798,6 +1902,7 @@ kernel.
   mountinfo reaches, and which goes with the descriptor's last close
   unless `move_mount` attached it. A path from the descriptor goes into
   the copy, and `..` stays at its root.
+
 - `move_mount` (Linux master's) needs `CAP_SYS_ADMIN` over the mount
   namespace (`EPERM`) and known flags (`EINVAL`, also for
   `MOVE_MOUNT_BENEATH` with `MOVE_MOUNT_SET_GROUP`); it looks up the target
@@ -1819,6 +1924,7 @@ kernel.
   puts the target in the source's peer group (`do_set_group`): both mounts'
   roots, of one superblock, the target's root at or below the source's,
   the target private and the source shared or a slave (`EINVAL`).
+
 - `fsopen`, `fsconfig`, `fsmount` and `fspick` (Linux master's
   `fs/fsopen.c`) make a tmpfs through a file system context, a descriptor
   (`anon_inode:[fscontext]`) that `fsconfig` fills and acts on. `fsopen`
@@ -1840,6 +1946,7 @@ kernel.
   flags named and tmpfs's options as `MS_REMOUNT` does (`EPERM` without
   `CAP_SYS_ADMIN` over the superblock's user namespace, which also leaves
   the context failed, `EBUSY` from then on).
+
 - `mount_setattr` (Linux master's) checks its flags (`EINVAL`), then its
   `struct mount_attr` (`E2BIG` beyond a page or for bytes past it that
   are not 0, `EINVAL` under 32 bytes), `CAP_SYS_ADMIN` over the mount
@@ -1853,6 +1960,7 @@ kernel.
   writing `EBUSY`. Then the mounts take the propagation type.
   `open_tree_attr` is `open_tree` with the same change made to its
   descriptor's mount, which goes again when the change fails.
+
 - Each mount has an ID unique until the machine ends (`mnt_id_unique`,
   from `1 << 31` on, in the order the mounts were made, a namespace's
   copies in the order `copy_tree` takes them), and each mount namespace
@@ -1871,6 +1979,7 @@ kernel.
   namespace's ID, each as asked (`mask`, `supported_mask`); a buffer too
   small for its strings is `EOVERFLOW`, a mount the caller's root does
   not reach `EPERM` without `CAP_SYS_ADMIN`.
+
 - `umount2` checks its flags (`EINVAL`) before it looks the target up, its
   last link followed unless `UMOUNT_NOFOLLOW`, stepping into a mount on
   where the path starts too (`LOOKUP_MOUNTPOINT`); then, as Linux's
@@ -1889,6 +1998,7 @@ kernel.
   its superblock's user namespace (`EPERM`), and then stays mounted: its
   superblock is remounted read-only (`do_umount_root`, `EBUSY` with a file
   open for writing on it).
+
 - `unshare` with `CLONE_FILES` gives the thread its own descriptor table, and
   with `CLONE_FS` its own working directory and umask, as Linux. With
   `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM` it succeeds where there is
@@ -1897,6 +2007,7 @@ kernel.
   memory shared with one (`CLONE_VM` without `CLONE_THREAD`). `CLONE_SYSVSEM`
   (and `CLONE_NEWIPC`) leaves the semaphore undo list, as an exit does. Its
   namespace flags give the thread new namespaces, as below.
+
 - Each thread has its own namespaces, as Linux's `nsproxy`: UTS, IPC,
   mount, cgroup, time, PID, network and user ones of its own (the user
   namespace in its credentials). `unshare` with `CLONE_NEWUTS`,
@@ -1936,6 +2047,7 @@ kernel.
   thread's children are numbered in; entering a network namespace makes it
   the one the thread's new sockets are in. See [Limitations](./limitations.md)
   for the namespaces paludarium has no new ones of.
+
 - A new user namespace, as Linux's `create_user_ns` makes it, is nested
   in the thread's and owned by its effective user (`EPERM` when that user
   or group has no ID in it, `ENOSPC` past 32 levels); the thread has every
@@ -1969,6 +2081,7 @@ kernel.
   `CAP_SETFCAP`. `/proc/<pid>/setgroups` reads `allow` or `deny`, which
   may be written before the gid map; `setgroups` needs it allowed and the
   gid map written.
+
 - A new PID namespace, as Linux's, is the one the thread's children are
   numbered in; the thread stays in its own, and its `pid_for_children` link
   is `ENOENT` until the first child, the namespace's init, numbered 1. A
@@ -2008,6 +2121,7 @@ kernel.
   other process of the namespace gets SIGKILL and none may join it any more
   (`ENOMEM`); its parent learns of the exit only once the rest is gone, its
   children reaped by the init, as Linux's `zap_pid_ns_processes`.
+
 - A new network namespace, as Linux's `loopback_net_init` makes it, has a
   loopback alone, `lo` (index 1), which is down: a TCP or UDP socket there
   binds any IPv4 address until IPv4 has a route, but not `::1`
@@ -2033,6 +2147,7 @@ kernel.
   namespace without a network has none (`ENOTTY`). Another interface name
   is `ENODEV`. `SIOCGIFNAME` (`if_indextoname`) names the device of the
   index (`ENODEV` for none).
+
 - A netlink socket (`AF_NETLINK`, `SOCK_RAW` or `SOCK_DGRAM`, protocol
   `NETLINK_ROUTE`) shows and changes the devices of the network namespace
   it was made in, its loopback and its veth ends (veth pairs, below), so glibc's and musl's `getifaddrs`, `ip link`, `ip addr`
@@ -2545,6 +2660,7 @@ kernel.
     (`RTNLGRP_IPV4_NETCONF`, `RTNLGRP_IPV6_NETCONF`) comes, as on Linux,
     which sends one only as a device comes or goes or a forwarding sysctl
     is written.
+
 - A generic netlink socket (protocol `NETLINK_GENERIC`) has its own ports,
   so it binds to the process's ID as a `NETLINK_ROUTE` socket does too,
   and its one family is the controller, `nlctrl` (family ID 16), as in a
@@ -2574,6 +2690,7 @@ kernel.
   - **Groups:** a socket has 64 groups (`EINVAL` for 0 or one past them),
     any of which anyone may join; `nlctrl`'s `notify` is group 16, which
     hears nothing, as no family comes or goes.
+
 - A socket-diagnostics netlink socket (protocol `NETLINK_SOCK_DIAG`)
   tells of the AF_UNIX, TCP and UDP sockets of the network namespace it was
   made in, as Linux's `sock_diag`, `unix_diag`, `inet_diag`, `tcp_diag` and
@@ -2643,6 +2760,7 @@ kernel.
     its addresses, state and timer alone.
   - **Groups:** a socket has 32 groups, as Linux makes the four of
     `sock_diag` 32, which anyone may join, and which hear nothing.
+
 - An MCTP socket (`AF_MCTP`, `SOCK_DGRAM` and protocol 0: `EPROTONOSUPPORT`
   for another protocol, then `ESOCKTNOSUPPORT` for another type) sends and
   receives messages between the MCTP endpoint IDs of its network
@@ -2698,6 +2816,7 @@ kernel.
   - **Others:** `getsockname`, `getpeername`, `listen`, `accept`,
     `shutdown` and `socketpair` are `EOPNOTSUPP`; `setsockopt` and
     `getsockopt` of a level but `SOL_SOCKET` and `SOL_MCTP` are `EINVAL`.
+
 - The machine has one NUMA node, node 0. `set_mempolicy` and `mbind` take
   every mode Linux 6.9 has, with its flags, and check the node mask as Linux
   does: nodes past node 0 are dropped, a mask with none of them is `EINVAL`,
@@ -2723,6 +2842,7 @@ kernel.
   one with an `anon_vma` (private memory something wrote) or that had guard
   regions. The pages of any other VMA it faults in again, so they are
   `-ENOENT` until it touches them.
+
 - `uname` reports Linux on x86_64 with the host name `paludarium` and the
   domain name `(none)` of the thread's UTS namespace, until `sethostname` or
   `setdomainname` changes them (`CAP_SYS_ADMIN`, else `EPERM`; at most 64
@@ -2787,6 +2907,7 @@ kernel.
   gives it another owner or group, which the in-memory filesystem keeps.
   A mounted host directory starts with every file root's and keeps the
   owners and groups for the run.
+
 - Files are checked as Linux checks them (`generic_permission`): the
   owner's permission bits apply to the owner, the group's to a member of the
   file's group (by the filesystem group ID or a supplementary group) and
@@ -2836,6 +2957,7 @@ kernel.
   two ends share them, and for each socket, which start as the filesystem IDs
   of the thread that made them, or that accepted a connection. Standard input,
   output and error, which the host provides, give `EPERM`.
+
 - `execveat(dir, path, argv, envp, flags)` runs a program as `execve` does,
   from `dir` for a relative path, and takes `AT_EMPTY_PATH`, which with an
   empty path runs the file the descriptor holds (an `O_PATH` one's too), and
@@ -2854,6 +2976,7 @@ kernel.
   was, as from its dentry on Linux; a memfd is in no hierarchy.
   `AT_EXECVE_CHECK` (Linux 6.14) is
   `EINVAL`.
+
 - A program's file and writes to it exclude each other, as Linux's
   `i_writecount` does (`ETXTBSY`). Exec refuses a file that a description
   has open for writing: the program, each script and its interpreter, and an
@@ -2865,6 +2988,7 @@ kernel.
   and is written through as Linux allows, while opening it again for writing
   through `/proc/self/fd` counts. Only the emulator's own processes are
   counted: a host program writing a file in a mounted directory is not.
+
 - `chmod` and `utimensat` work in the in-memory filesystem and in mounted
   host directories; on a Windows host, `chmod` only sets or clears the
   read-only attribute. `fchmodat2` (Linux 6.6) takes `AT_SYMLINK_NOFOLLOW`,
@@ -2885,6 +3009,7 @@ kernel.
   `sync_file_range` checks its flags and range (`EINVAL`) and then the file
   (`ESPIPE` unless it is a regular file, a directory or a block device), as
   Linux does, and writes the stores of shared mappings back to the file.
+
 - `mknod` and `mknodat` make a FIFO, a socket node or an empty regular file
   (type 0 too), with the mode's permission bits less the umask, as Linux's
   `do_mknodat`: a directory's type is `EPERM` and an unknown one `EINVAL`.
@@ -2902,6 +3027,7 @@ kernel.
   FIFO is made on Linux hosts only (`EPERM` elsewhere), and it is the
   emulator's own pipe: a host program opening the same node does not reach
   it.
+
 - `statfs` reports the in-memory filesystem as a 4 GiB tmpfs whose used
   space and inodes are what it holds, and a mounted host directory with the
   host filesystem's own numbers. `/proc/self/mountinfo`, `/proc/self/mounts`
@@ -2929,6 +3055,7 @@ kernel.
   of one of those devices none (0, as Linux's `simple_statfs` and the
   internal tmpfs, which has no limits, give), and of any other device
   `EINVAL`.
+
 - A file's block size (`st_blksize`, `stx_blksize`, `FIGETBSZ`) is its
   filesystem's, as on Linux: 1024 for `/proc` (procfs), a pseudo-terminal's
   slave and a terminal on standard input, output or error (devpts), and 4096
@@ -2947,6 +3074,7 @@ kernel.
   `O_PATH | O_NOFOLLOW` descriptor holds is not followed again: its mode
   cannot change (`EOPNOTSUPP`), `chdir` finds no directory (`ENOTDIR`),
   `truncate` no regular file (`EINVAL`) and `execve` gives `ELOOP`.
+
 - Inside a path, a link in `/proc/self/fd` (or `/dev/fd`), `/proc/self/cwd`
   and `/proc/self/exe` is jumped through as Linux's `nd_jump_link` does:
   `/proc/self/fd/3/name` is `name` in the directory descriptor 3 holds, by
@@ -2960,6 +3088,7 @@ kernel.
   own walk); a path relative to a descriptor of `/proc` or to a working
   directory there, one whose `..` or symbolic link leads into `/proc`,
   `execve` and a Unix socket's address do not.
+
 - The other `/proc` entries are `/proc/loadavg`, `/proc/meminfo`,
   `/proc/stat`, `/proc/uptime` and `/proc/sysvipc` (below), `/proc/sys` with only
   `fs`, `kernel` and `net` in it (below), a directory per process, and this process's own: `/proc/<pid>`, a
@@ -3015,6 +3144,7 @@ kernel.
   and across `fork`. Any other path in this process's directory or
   elsewhere under `/proc` is looked up in the filesystem like any path, so with
   `--mount /:/` it reaches the host's own `/proc`.
+
 - `/proc` lists what the filesystem has there that is not a process (with
   `--mount /:/`, the host's own entries except its processes), the files above,
   and then a directory for every process of the guest, zombies included, as
@@ -3069,6 +3199,7 @@ kernel.
   `environ`, `auxv` and `pagemap` do not open (`ESRCH`, for any reader
   their mode lets), as Linux's `__mem_open` and `pagemap_open` refuse a
   process with no memory before they check the reader.
+
 - `personality` of a process or of a thread, 0400 and of size 0, is the
   thread's execution domain and flags in 8 hex digits and a newline, as
   Linux's `proc_pid_personality` writes it when it is read. Only then, as
@@ -3080,6 +3211,7 @@ kernel.
   does for a running task and for a reader that may not read the task. The
   `wchan` field of `stat` is something else: 1 for a task that waits, as
   below.
+
 - `syscall` of a process or of a thread, 0400 and of size 0, is what
   Linux's `proc_pid_syscall` writes when it is read, for a reader that may
   attach to the task, as for `personality` (`EPERM`). The reading thread's
@@ -3094,6 +3226,7 @@ kernel.
   the kernel, with a few plain stores that another reads whole; a new
   thread or child starts with its parent's in the call that made it, as
   Linux's `copy_thread` copies them.
+
 - `io` of a process or of a thread (`/proc/<pid>/task/<tid>/io`), 0400 and
   of size 0, has the counts Linux's `task_io_accounting` keeps: `rchar` and
   `wchar`, the bytes the read and write calls moved (`read`, `pread64`,
@@ -3118,6 +3251,7 @@ kernel.
   read it once it is not; a thread or process that has been reaped since
   is `ESRCH`. An `lseek` that fails so leaves the file at the start, as
   Linux's `seq_lseek` does.
+
 - `/proc/self/stat` has Linux's 52 fields after the name in parentheses:
   state `R` (the process is running, reading it; another process's as above), the parent, process group
   and session, the controlling terminal's device and foreground group (0
@@ -3145,12 +3279,14 @@ kernel.
   `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.
+
 - `/proc/self/exe` and `/proc/self/cwd` are symbolic links (0777, size 0) to
   the program the process runs (the one `execve` loaded, with symbolic links
   resolved; for the first program, the path the CLI gives it: its path in a
   `--mount`, else `/<file name>`)
   and to the current directory. `stat` and `open` follow them, and
   `O_NOFOLLOW` does not (`ELOOP`).
+
 - `/proc/sys/fs/mqueue` has the POSIX message queue limits of the
   reader's IPC namespace, as Linux's `ipc/mq_sysctl.c`: `queues_max`,
   `msg_max` and `msg_default` (1 to 65536), `msgsize_max` and
@@ -3168,6 +3304,7 @@ kernel.
   or one out of range (`queues_max` takes any `int`, compared as
   unsigned). A write past the start is taken and changes nothing, as
   `sysctl_writes_strict` has it.
+
 - `/proc/sys/fs/aio-nr` (mode 0444) is how many events the machine's aio
   contexts were set up for, and `/proc/sys/fs/aio-max-nr` (0644, 65536 at
   first) their limit, which only root (user ID 0 outside any user namespace)
@@ -3175,6 +3312,7 @@ kernel.
   `proc_doulongvec_minmax` reads and writes them: a write takes no `-`
   (`EINVAL`) and otherwise reads as the files of `/proc/sys/fs/mqueue` do.
   `/proc/sys/fs` lists only these, `fanotify`, `inotify` and `mqueue`.
+
 - `/proc/sys/fs/inotify` has the machine's inotify limits, root's regular
   files of mode 0644 that only root (user ID 0 outside any user namespace)
   may open to write, read and written as the files above:
@@ -3183,11 +3321,13 @@ kernel.
   each user may have from then on, and `max_queued_events` (16384 at first),
   an `int` from 0, is how many events an instance made from then on queues
   before `IN_Q_OVERFLOW`.
+
 - `/proc/sys/fs/fanotify` has the machine's fanotify limits in the same way:
   `max_user_groups` (128 at first) and `max_user_marks` (33979 at first, 1%
   of the memory `sysinfo` reports over twice an inode's size), unsigned
   longs from 0 to `INT_MAX`, and `max_queued_events` (16384 at first) and
   `watchdog_timeout` (0), `int`s from 0.
+
 - `/proc/sys/kernel` has the System V IPC limits of the opener's IPC
   namespace, as Linux's `ipc/ipc_sysctl.c`, each a new namespace has at
   Linux's defaults, owned and opened to write as the files of
@@ -3227,6 +3367,7 @@ kernel.
   did so at a read of it set too. `/proc/sys/kernel` lists only these, and each directory of
   `/proc/sys` lists its entries by name, as Linux's tree of them keeps
   them.
+
 - `/proc/sys/net` has the settings of the opener's network namespace, as
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
   `all`, `default` and each device (`lo`): `ipv4/ip_forward`,
@@ -3260,6 +3401,7 @@ kernel.
     address is `EACCES` (`addrconf_add_dev`).
   - A link's `IFLA_AF_SPEC` shows them in its IPv4 and IPv6 settings,
     and IPv6 is ready only with `disable_ipv6` off.
+
 - `/proc/self/fdinfo` (0555) has a file (0444, of size 0) for each open
   descriptor, as Linux's `seq_show` writes it: `pos`, the description's
   position (0 for a pipe or socket), `flags` in octal (`F_GETFL`'s, and
@@ -3296,17 +3438,20 @@ kernel.
   adds, and only the flags once a one-shot fired), the data, and the file's
   position, inode and device (that of a descriptor the process has of it,
   else 0).
+
 - `/proc/loadavg`, `/proc/meminfo` and `/proc/uptime` agree with `sysinfo`,
   in Linux's formats: load averages of 0 with the running and live tasks and
   the last ID handed out; 4 GiB of total, free and available memory and
   nothing else used, no swap and no huge pages; and the monotonic clock's
   uptime with no idle time.
+
 - `/proc/stat` is in the format of Linux's `show_stat`: a `cpu` line and one
   for each CPU `sched_getaffinity` reports, every time 0 as `/proc/uptime`
   counts no idle time; `intr 0`, `ctxt 0`; `btime`, the real-time clock less
   the monotonic one in seconds, so `ps` finds the boot time; `processes`, the
   IDs handed out; `procs_running 1`, `procs_blocked 0`; and a `softirq` line
   of zeros.
+
 - `/proc/sysvipc` holds `msg`, `sem` and `shm`, listed in that order, each in
   the format of Linux's `sysvipc_*_proc_show` on a 64-bit kernel.
   - Each is a header, then a line for each queue, set or segment of the
@@ -3325,12 +3470,15 @@ kernel.
   - A segment's line adds the bytes of its pages in memory, and 0 swapped.
   - A segment's or queue's PIDs, which `IPC_STAT` gives too, still show
     once their process is gone, as the object keeps its `struct pid`.
+
 - These system files (`loadavg`, `meminfo`, `stat`, `uptime` and
   `sysvipc`'s) are of size 0, as Linux's `proc_create` makes them, and a
   read goes on to the end of what they hold.
+
 - Root may open these system files for writing, but a write gives `EIO`,
   as Linux's `pde_write` gives for a file without a write operation. A
   process's own files give `EINVAL`.
+
 - `/proc/self/maps` lists the VMAs in Linux's format, with adjacent mappings
   merged and split as Linux does: the range, the protection, `s` or `p`, the
   offset in the file, the file's device and inode as `stat` gives them, and
@@ -3344,6 +3492,7 @@ kernel.
   shows the address space it was opened on, which a forked child reading it
   sees too, and nothing once no thread uses that space, as after an `execve`.
   It cannot be mapped (`ENODEV`).
+
 - `/proc/self/smaps` follows each line of `maps` with Linux's `show_smap`
   block, read as `maps` is: the size, what the pages hold (`Rss`, `Pss`,
   `Pss_Dirty`, the shared and private clean and dirty pages, `Anonymous`,
@@ -3367,6 +3516,7 @@ kernel.
   mapping, the seal (`sl`), and `sd` (`VM_SOFTDIRTY`) on every VMA
   `clear_refs` has not cleared since it was made, but the initial stack:
   one that merges with a new VMA has it again, as Linux's sticky flags.
+
 - `/proc/self/pagemap` (mode 0400, size 0) has an entry of 8 bytes for
   each page of user space, as Linux's `pagemap_read` gives them: the
   entry of the page at an address is at that address divided by the page
@@ -3418,6 +3568,7 @@ kernel.
     length (`EINVAL`).
   - Any other ioctl is `ENOTTY`, and a scan once the address space is gone
     is `ESRCH`.
+
 - `/proc/<pid>/clear_refs` (mode 0200, size 0, a thread's too), as Linux's
   `clear_refs_write`: a write's first 12 bytes at most, which is what it
   returns, are a number as `kstrtoint` reads one in base 10 (spaces
@@ -3432,6 +3583,7 @@ kernel.
   `reset_mm_hiwater_rss` does. 1 to 3 are taken and change nothing shown
   (see Limitations). It has no read operation (`EINVAL`, `EBADF` on a descriptor
   open only for writing), and `lseek` leaves it at 0.
+
 - `/proc/self/fd` (mode 0500, its size the number of open descriptors, as
   Linux's `proc_fd_getattr` gives it) lists `.`, `..` and a link per open
   descriptor, named by its number as Linux reads one (no leading zero). Each
@@ -3481,6 +3633,7 @@ kernel.
   A removed file
   of a directory mounted from a host other than Linux, which Linux can
   open, gives `ENXIO` here.
+
 - `/dev` (mode 0755) holds the memory devices, the links Linux systems
   keep there and the pseudo-terminals' `ptmx` and `pts` (below), and lists
   only these: a file a guest makes under `/dev` can be
@@ -3497,6 +3650,7 @@ kernel.
   (`/dev/fd/3`); `O_NOFOLLOW` on one gives `ELOOP`, and with `O_PATH` opens
   the link itself, as in `/proc/self/fd`. Files on host mounts report no
   device number.
+
 - **Pseudo-terminals**, as Linux's devpts, `pty.c` and N_TTY line discipline
   make them. Each open of `/dev/ptmx` (5:2, mode 0666; also devpts's own
   `/dev/pts/ptmx`) makes a pair whose slave is `/dev/pts/<n>`, the lowest
@@ -3571,6 +3725,7 @@ kernel.
     a slave not open for writing) makes the slave take the console's output,
     holding it open, until that slave hangs up; another while one has it is
     `EBUSY`.
+
 - CPU time is the host thread's CPU time (user and system together) from a
   guest thread's first system call, where the host can measure it (Linux,
   macOS, Windows); elsewhere, as in WebAssembly, it is wall time instead.
@@ -3587,6 +3742,7 @@ kernel.
   the child's and its children's together, as Linux's `RUSAGE_BOTH`. A
   forked child starts from zero, and an `execve` keeps both. The other
   counts (faults, context switches, blocks) are 0.
+
 - A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`
   takes it apart: the task's number in the caller's PID namespace
   (`~id >> 3`, 0 for the caller), a thread's clock (bit 2) or a process's,
@@ -3600,6 +3756,7 @@ kernel.
   kind give `EINVAL`, as does a dynamic clock (`3` in the low three bits),
   which needs a PTP device's file. Every clock ID is an `int`, as Linux's
   system calls take it, so the high 32 bits are not looked at.
+
 - `clock_gettime` also reads `CLOCK_MONOTONIC_RAW`, the coarse clocks,
   `CLOCK_BOOTTIME` (the host never suspends), the alarm clocks and
   `CLOCK_TAI` (with a TAI offset of 0). The coarse clocks give the time of
@@ -3612,6 +3769,7 @@ kernel.
   moving at the same instant, as Linux's timekeeping updates both at each
   tick. `clock_getres` gives 1 ns,
   and the tick for the coarse clocks.
+
 - `clock_nanosleep` and `timer_create` run on `CLOCK_REALTIME`,
   `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, `CLOCK_TAI` and the process's CPU
   clock, and `timer_create` on the thread's CPU clock too. As Linux's,
@@ -3643,6 +3801,7 @@ kernel.
   with the whole request as the time left, as Linux's `do_cpu_nanosleep`
   copies out what it was asked once `posix_cpu_timer_set` finds no task;
   a restart after a stop then finds no task (`EINVAL`).
+
 - A sleep on the process's CPU clock ends once the process's threads
   together have used the time, as Linux's `do_cpu_nanosleep`: a time that
   has passed, or none to sleep, returns at once, and the sleeping thread
@@ -3651,6 +3810,7 @@ kernel.
   sleeper's wall time counts too). A signal with a handler ends it with `EINTR`, writing the
   time left for a relative sleep, unless the time has been used by then,
   when it returns 0; a stop resumes it as it does the other sleeps.
+
 - The process's real-time interval timer (`ITIMER_REAL`) sends `SIGALRM`
   when it expires and goes on by its interval, as Linux's: `setitimer`
   reads and checks the new value before the timer, and writes the old one
@@ -3662,6 +3822,7 @@ kernel.
   `alarm` sets it to whole seconds with no interval and returns the seconds
   that were left, rounded to the nearest and at least 1 while it was armed,
   as Linux's `alarm_setitimer`.
+
 - The interval timers of the process's CPU time, `ITIMER_VIRTUAL` and
   `ITIMER_PROF`, send `SIGVTALRM` and `SIGPROF` from the kernel
   (`SI_KERNEL`) when the process's threads together have used their time,
@@ -3672,6 +3833,7 @@ kernel.
   them. A child of `fork` starts with neither, and `execve` keeps them.
   They count CPU time as the CPU clocks do, so in WebAssembly, which cannot
   measure it, they count wall time.
+
 - `adjtimex` and `clock_adjtime` on `CLOCK_REALTIME` read the clock's NTP
   state as Linux starts with it, without revealing the host's:
   unsynchronised (`STA_UNSYNC`, so the result is `TIME_ERROR`), the errors at
@@ -3684,15 +3846,18 @@ kernel.
   `clock_settime` (only on `CLOCK_REALTIME`, or `EINVAL`) check the time as
   Linux does, `EINVAL` past 30 years short of `KTIME_MAX`, and then give
   `EPERM`.
+
 - `sysinfo` reports a fixed 4 GiB of free memory and no swap, without
   revealing the host's; the uptime is the monotonic clock's, rounded up to
   a whole second as Linux rounds it.
+
 - `iopl` and `ioperm` check their arguments as Linux does (a level past 3,
   or a range that is empty or goes past port 65,535, gives `EINVAL`), keep
   the thread's level of 0 and give up ports it never had, and give `EPERM`
   for anything more, as a kernel locked down against port access does.
   `acct` needs `CAP_SYS_PACCT` (`EPERM`), and then turns accounting off,
   which is never on, or gives `EPERM` for a file.
+
 - `syslog` reads a kernel log that is empty, as nothing writes to it. As
   with Ubuntu's `kernel.dmesg_restrict` of 1, every action needs
   `CAP_SYSLOG` (`EPERM`). Then, as Linux's `do_syslog`, an unknown action
@@ -3702,12 +3867,14 @@ kernel.
   until a signal (`ERESTARTSYS`); the other reads copy nothing and give 0.
   The buffer size is 256 KiB (`CONFIG_LOG_BUF_SHIFT` 18), and nothing is
   unread.
+
 - `sysfs` numbers the file system types: `tmpfs`, `proc`, `sockfs`,
   `pipefs`, `devpts`, `ext4` and `mqueue`, the types of the files paludarium
   gives (a host file's as `ext4`), in the order Linux registers them. Option
   1 gives a name's index, 2 copies an index's name and 3 gives the count; an
   unknown option, name or index is `EINVAL`, and a name that does not end
   within `PATH_MAX` bytes too.
+
 - The security modules are the ones paludarium has, in the order Linux
   starts them with Ubuntu's configuration: Lockdown (an early module there,
   whose port access paludarium refuses), the capability module, Landlock
@@ -3716,9 +3883,11 @@ kernel.
   buffer). None of them keeps an attribute of a task, so
   `lsm_get_self_attr` and `lsm_set_self_attr` give `EOPNOTSUPP` (and a size
   of 0) once their arguments pass Linux's checks, in its order.
+
 - No uprobe is ever set, so there is no probe trampoline: `uretprobe` forces
   `SIGILL` (`SI_KERNEL`) and returns -1, and `uprobe` gives `EPROTO`, as
   Linux does when they are called from anywhere else.
+
 - The administration calls take Linux master's checks in its order, on a
   kernel locked down for integrity, as Ubuntu's is under Secure Boot (and as
   `iopl` and `ioperm` refuse port access): nothing can load code into it, and
@@ -3760,6 +3929,7 @@ kernel.
     `quotactl_fd` takes any descriptor (`EBADF`), checks the type
     (`EINVAL`) and gives `ENOSYS`, as Linux's `do_quotactl` does for a file
     system without quotas.
+
 - `perf_event_open` checks its arguments in the order of Linux's
   `kernel/events/core.c`: unknown flags, then the structure
   (`perf_copy_attr`: a size of 0 is the first one's 64 bytes, less than that
@@ -3903,6 +4073,7 @@ kernel.
   and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
+
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,
   `hashtab.c`, `bpf_lru_list.c`, `lpm_trie.c`, `queue_stack_maps.c` and
   `bloom_filter.c` have them. Every command first takes the size of its union
@@ -4024,6 +4195,7 @@ kernel.
   descriptor's, not the map's: `map_flags` (in fdinfo, `bpf_map_info` and a
   template) leaves them out, as Linux's `bpf_map_flags_retain_permanent`
   does. See [limitations](./limitations) for what is not there.
+
 - `BPF_PROG_LOAD` loads socket filters (`BPF_PROG_TYPE_SOCKET_FILTER`),
   which a verifier checks as Linux's does; nothing runs them yet. It checks
   its arguments as Linux's `bpf_prog_load` does, in master's order and with
@@ -4043,6 +4215,7 @@ kernel.
   license (`EFAULT`), a device to bind to (`EINVAL`), and the type: any but
   a socket filter is `EINVAL`, as on a kernel built without it. The name
   comes last, as a map's (`EINVAL`).
+
 - The verifier (`kernel/bpf/verifier.c`) takes a program only if both of
   the kernels the tests know take it, master and 7.0, and rejects what
   either rejects. It checks the structure first, in master's order, all
@@ -4068,6 +4241,7 @@ kernel.
   A conditional jump whose operands it knows goes one way; any other is
   walked both ways. It gives up as Linux does after 1,000,000 instructions
   or 8,192 jumps waiting to be walked (`E2BIG`).
+
 - The log (`log_level`, `log_buf`, `log_size`) gets the line that says
   why a program was refused, in 7.0's words where the two kernels word it
   differently, and the "processed %d insns" line, in a fixed
@@ -4082,6 +4256,7 @@ kernel.
   through; `prog_jited` and the run statistics are 0. See
   [Limitations](./limitations) for what the verifier refuses that Linux
   takes.
+
 - A timerfd runs on `CLOCK_REALTIME` or `CLOCK_MONOTONIC` (`CLOCK_BOOTTIME`
   as `CLOCK_MONOTONIC`), with absolute and periodic settings. A read returns
   the expirations since the last one, and `poll` and `epoll` see it readable
@@ -4089,6 +4264,7 @@ kernel.
   cannot set the clock, so it never cancels. The alarm clocks run as
   `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and need `CAP_WAKE_ALARM`
   (`EPERM`, after unknown flags give `EINVAL`).
+
 - A signalfd (`signalfd`, `signalfd4`) reads the signals of its mask that are
   pending for the thread reading it, blocked or not, as Linux's
   `dequeue_signal` takes them: the thread's own first, then the process's,
@@ -4111,6 +4287,7 @@ kernel.
   signalfd's descriptor gives it a new mask (`EINVAL` for another file);
   `SIGKILL` and `SIGSTOP` never enter one. A write gives `EINVAL`, `pread`
   and `pwrite` `ESPIPE`, and `lseek` 0, as Linux's `noop_llseek`.
+
 - An inotify instance (`inotify_init`, `inotify_init1`, with `IN_NONBLOCK`
   and `IN_CLOEXEC`) watches files by their device and inode, which
   `inotify_add_watch` finds as Linux's `inotify_find_inode` does: the last
@@ -4208,6 +4385,7 @@ kernel.
   queued, and each queued event is an edge for edge-triggered `epoll`.
   Closing the last descriptor of an instance removes its watches. A write
   gives `EBADF`, `pread` `ESPIPE`, and `lseek` 0.
+
 - A fanotify group (`fanotify_init`) is as Linux's `fs/notify/fanotify`:
   the flags are checked in its order (`EPERM` without CAP_SYS_ADMIN but for
   a group that reports file handles or mounts, which reports no
@@ -4290,6 +4468,7 @@ kernel.
   device of the kernel's own file systems, /proc, devpts and mqueue, as
   `simple_statfs` gives it, and a number drawn for each other file system,
   as tmpfs draws a UUID.
+
 - POSIX timers run on the clocks above and notify with
   a signal to the process (`SIGEV_SIGNAL`, with `SI_TIMER` siginfo and
   overruns), a signal to one of its threads (`SIGEV_THREAD_ID`), or not at all
@@ -4310,6 +4489,7 @@ kernel.
   counts on the monotonic clock. Timers are
   not inherited by `fork` and are deleted by `execve`. `rt_sigtimedwait` also
   takes blocked signals pending for the whole process.
+
 - `clone3` checks its `struct clone_args` as Linux does (`E2BIG` for a
   longer struct whose extra part is not zero) and then runs as the `clone` it
   describes; `CLONE_CLEAR_SIGHAND` resets handled signals to their default.
@@ -4317,6 +4497,7 @@ kernel.
   gives `EINVAL`. `clone` itself reads only
   the low 32 bits of its flags, as in Linux, so `CLONE_CLEAR_SIGHAND` is
   `clone3`'s alone.
+
 - `prctl` supports `PR_SET_NAME`/`PR_GET_NAME` (a name of up to 15 bytes per
   thread, taken from the program's file name at `execve` and inherited by new
   threads and processes), `PR_SET_PDEATHSIG` (the signal is sent when the
@@ -4337,6 +4518,7 @@ kernel.
   descendants, may attach while that task is there. It is the process's,
   whichever thread sets it, and a child does not inherit it. Other options
   give `EINVAL`.
+
 - When a process exits, its children go to the nearest ancestor that set
   `PR_SET_CHILD_SUBREAPER` and has not exited, or else to the first process,
   which acts as the init of a PID namespace, as Linux's
@@ -4344,9 +4526,11 @@ kernel.
   can wait for them, and their exit signal becomes `SIGCHLD`. A child that has
   already exited is reported to the new parent at once (and reaped at once if
   that parent ignores `SIGCHLD`).
+
 - When the first process exits, every other process gets `SIGKILL` from the
   kernel, as when the init of a PID namespace exits (Linux's
   `zap_pid_ns_processes`), so the run ends with it.
+
 - When an exit orphans a process group, so that no member keeps a parent in
   another group of the same session, and a member of the group is stopped,
   every member gets `SIGHUP` and then `SIGCONT` from the kernel (`SI_KERNEL`),
@@ -4355,6 +4539,7 @@ kernel.
   runs. The first process itself links a group of its children as any parent
   does: Linux leaves out only the children of the global init, and the first
   process acts as the init of a PID namespace, as in a container.
+
 - `kill` reaches a process by its PID or by the ID of one of its threads, the
   caller's process group with 0, another group with `-pgid`, and every
   process but the first one and the caller with -1, as Linux's
@@ -4372,6 +4557,7 @@ kernel.
   `si_uid`, as `tkill` and `tgkill` do, and the `PR_SET_PDEATHSIG` signal the
   PID and real user ID of the parent that exited, which needs the same
   permission.
+
 - `rt_sigqueueinfo` (behind `sigqueue`) sends a process the caller's siginfo
   as it is, and `rt_tgsigqueueinfo` sends it to one thread, so the signal
   carries its value; each realtime signal sent is kept. As in Linux, only a
@@ -4379,6 +4565,7 @@ kernel.
   `tkill` would give (`EPERM`, checked before the target), and a `si_code`
   whose layout Linux does not know must leave the rest of the siginfo zero
   (`E2BIG`).
+
 - Resource limits start at Linux's defaults (`RLIMIT_NOFILE` 1024/4096,
   `RLIMIT_STACK` 8 MiB/unlimited, ...), are inherited on `fork` and can be
   read and changed; the hard `RLIMIT_NOFILE` goes up to 1048576 (Linux's
@@ -4444,6 +4631,7 @@ kernel.
   another session give `EPERM`, and a child that has run `execve` gives
   `EACCES`. A group exists while any member is left, an exited child not yet
   reaped included.
+
 - Nice values are kept per thread, as on Linux: a new thread or process
   starts with its creator's, and `execve` keeps the caller's. `getpriority`
   reports the highest priority among the threads it finds, as `20 - nice`,
@@ -4453,12 +4641,14 @@ kernel.
   process not yet reaped is still found. No thread gives `ESRCH`, and an
   unknown `which` `EINVAL`. The values are reported but do not change
   scheduling.
+
 - `setpriority` checks each thread as Linux's `set_one_prio` does. The
   caller's effective user ID must be the thread's real or effective one, or
   the caller must have `CAP_SYS_NICE`; otherwise it is `EPERM`. Lowering a
   nice value needs `CAP_SYS_NICE` or `20 - nice` within the thread's
   `RLIMIT_NICE` soft limit; otherwise it is `EACCES`. The threads it may
   change do change, and the call then reports the last refusal.
+
 - `waitid` follows Linux's checks and copy-out: its siginfo fields are zero
   when no child is reported, even on an error, and an exited child cannot be
   waited for without `WEXITED` or `WCONTINUED` (`ECHILD`). A stop and a
@@ -4487,6 +4677,7 @@ kernel.
   `PIDFD_SELF_THREAD` (-10000) sends to the calling thread, as `tkill`
   does (`SI_TKILL`), and `PIDFD_SELF_THREAD_GROUP` (-10001) to its process,
   as `kill` does.
+
 - Invalid pointers return `EFAULT`.
 
 ## Network

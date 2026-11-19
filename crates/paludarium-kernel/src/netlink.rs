@@ -3823,7 +3823,7 @@ fn change_address(
         if !network.has_device(index) {
             return Err(no_device());
         }
-        // Only `lo` has addresses, routes and neighbours here, not a veth end.
+        // Only `lo` has IPv6 addresses here, not a veth end.
         if index != LOOPBACK_OIF {
             return Err(EOPNOTSUPP);
         }
@@ -3838,7 +3838,7 @@ fn change_address(
     if !network.has_device(index) {
         return Err(no_device());
     }
-    // Only `lo` has addresses, routes and neighbours here, not a veth end.
+    // Only `lo` has IPv6 addresses here, not a veth end.
     if index != LOOPBACK_OIF {
         return Err(EOPNOTSUPP);
     }
@@ -4109,7 +4109,7 @@ fn lookup(
     if iif != 0 && !network.has_device(iif) {
         return Err(ENODEV);
     }
-    // Only `lo` has addresses, routes and neighbours here, not a veth end.
+    // Input lookups come in only through `lo` here: nothing comes in through a veth end yet.
     if iif != 0 && iif != LOOPBACK_OIF {
         return Err(EOPNOTSUPP);
     }
@@ -5370,7 +5370,7 @@ fn neighbour_get(
     if index != 0 && !network.has_device(index) {
         return Err(extack::message(ENODEV, "Unknown device ifindex"));
     }
-    // Only `lo` has addresses, routes and neighbours here, not a veth end.
+    // Only `lo` has neighbours here, not a veth end.
     if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) {
         return Err(EOPNOTSUPP);
     }
@@ -5593,7 +5593,7 @@ fn change_neighbour(
         if index != 0 && !network.has_device(index) {
             return Err(ENODEV);
         }
-        // Only `lo` has addresses, routes and neighbours here, not a veth end.
+        // Only `lo` has neighbours here, not a veth end.
         if index != 0 && u32::try_from(index).ok() != Some(LOOPBACK_OIF) {
             return Err(EOPNOTSUPP);
         }

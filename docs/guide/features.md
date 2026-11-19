@@ -962,7 +962,9 @@ kernel.
   `UFFD_FEATURE_EXACT_ADDRESS`, `UFFD_FEATURE_MISSING_SHMEM`,
   `UFFD_FEATURE_MISSING_HUGETLBFS`, `UFFD_FEATURE_WP_HUGETLBFS_SHMEM`,
   `UFFD_FEATURE_WP_UNPOPULATED`, `UFFD_FEATURE_POISON`,
-  `UFFD_FEATURE_WP_ASYNC` and `UFFD_FEATURE_MOVE` (the `HUGETLBFS` ones as Linux reports them,
+  `UFFD_FEATURE_WP_ASYNC`, `UFFD_FEATURE_MOVE`, and the events'
+  `UFFD_FEATURE_EVENT_FORK`, `UFFD_FEATURE_EVENT_REMAP`,
+  `UFFD_FEATURE_EVENT_REMOVE` and `UFFD_FEATURE_EVENT_UNMAP` (the `HUGETLBFS` ones as Linux reports them,
   though there is no hugetlbfs memory to register: `MFD_HUGETLB` and
   `SHM_HUGETLB` give `ENOSYS`), and `UFFD_FEATURE_EVENT_FORK` needs
   `CAP_SYS_PTRACE` (`EPERM`). `UFFDIO_REGISTER` registers private anonymous
@@ -1016,9 +1018,9 @@ kernel.
   protected only by its own mode, and a `UFFDIO_ZEROPAGE` of private
   anonymous memory or a `UFFDIO_POISON` is `EEXIST` there. `mprotect` keeps the protection,
   and refuses a write it does not permit with SIGSEGV as before; a
-  `fork`ed child, a move by `mremap`, `UFFDIO_UNREGISTER`, closing the
-  file and a registration that replaces the write-protect mode take it
-  away. With `UFFD_FEATURE_WP_ASYNC`, which brings
+  `fork`ed child and a move by `mremap` (without their events' features),
+  `UFFDIO_UNREGISTER`, closing the file and a registration that replaces
+  the write-protect mode take it away. With `UFFD_FEATURE_WP_ASYNC`, which brings
   `UFFD_FEATURE_WP_UNPOPULATED` (as `/proc/<pid>/fdinfo` shows), a write
   to a write-protected page, an instruction's or a system call's, does not
   fault: it clears the page's protection and goes on, as `do_wp_page`
@@ -1082,9 +1084,32 @@ kernel.
   A read takes whole messages (`EINVAL` for a buffer
   too small for one, or before `UFFDIO_API`), waiting unless non-blocking;
   `poll` gives `POLLERR` before `UFFDIO_API` and for a file that blocks, as
-  Linux's does, else `POLLIN` while a fault is not read yet.
+  Linux's does, else `POLLIN` while a fault or an event is not read yet.
   `/proc/self/fdinfo` shows the faults not read and all those waiting, and
-  the API, as `userfaultfd_show_fdinfo`.
+  the API, as `userfaultfd_show_fdinfo`. The events tell the
+  `userfaultfd` of changes to its space, as Linux's non-cooperative mode:
+  with `UFFD_FEATURE_EVENT_FORK` a `fork`ed child keeps the registrations,
+  and the write protection of their pages and markers, in a new
+  `userfaultfd` of its own, which `UFFD_EVENT_FORK` hands over as a file
+  the read installs (with the old one's `O_CLOEXEC` and `O_NONBLOCK`), its
+  number in the message; with `UFFD_FEATURE_EVENT_REMAP` a mapping
+  `mremap` moves keeps them too, and `UFFD_EVENT_REMAP` gives where it was,
+  where it went and its length; `UFFD_FEATURE_EVENT_REMOVE` tells the
+  ranges `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`, `MADV_FREE` and
+  `MADV_REMOVE` (and `process_madvise` of the caller's own memory) are
+  about to drop, mapping by mapping (`UFFD_EVENT_REMOVE`), and
+  `UFFD_FEATURE_EVENT_UNMAP` the whole range `munmap`, `brk`, a `MAP_FIXED`
+  `mmap` and `mremap` unmapped (`UFFD_EVENT_UNMAP`), once to each
+  `userfaultfd` that registered some of it; `mremap` tells of the range
+  `MREMAP_FIXED` replaced, then of the move, then of the range it left
+  and what it shrank, as Linux's `notify_uffd`. The thread that made the
+  change waits until its event is read, the file is closed or a fatal
+  signal comes (`TASK_KILLABLE`); `fork` waits before the child runs, and
+  a child's `userfaultfd` whose event was not read leaves the child's
+  mappings. A read takes the faults before the events, and while an event
+  is not read `UFFDIO_COPY`, `UFFDIO_ZEROPAGE`, `UFFDIO_POISON`,
+  `UFFDIO_CONTINUE` and `UFFDIO_MOVE` are `EAGAIN` (written to their last
+  field first), as is `UFFDIO_WRITEPROTECT` (`mmap_changing`).
 - `remap_file_pages` maps a range of a shared mapping again at another page
   of its file or shared memory, as Linux's `mmap` of the mapping's own file
   does, keeping its protection. As on Linux, `prot` must be 0 and the range

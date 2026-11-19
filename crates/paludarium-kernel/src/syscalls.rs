@@ -2429,6 +2429,16 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             Err(e) => err(e),
         };
     }
+    // A fixed mapping unmaps what it replaces, which tells the
+    // `userfaultfd`s that registered some of it (`UFFD_EVENT_UNMAP`).
+    let mut events = crate::userfaultfd::Events::default();
+    if let Placement::Replacing(at) = placement
+        && let Some(end) = len
+            .checked_next_multiple_of(4096)
+            .and_then(|len| at.0.checked_add(len))
+    {
+        crate::userfaultfd::unmap(&c.mem.view(), at.0, end, &mut events);
+    }
     // What the mapping shows is made first, outside the address space's
     // lock, as it may read the file. The mapping and what it shows then go
     // in under one hold of the lock, so that no other thread sees the
@@ -2504,6 +2514,7 @@ fn sys_mmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
             }
             // A new VMA has no memory policy.
             c.group.numa().forget(a.0, len);
+            events.deliver(c);
             ok(a.0)
         }
         Err(e) => err(e),
@@ -2912,7 +2923,9 @@ fn sys_set_robust_list(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 }
 
 fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
-    match advise(c.mem, &c.process.credentials, a[0], a[1], a[2]) {
+    let (mem, credentials) = (c.mem, c.process.credentials.clone());
+    let mut removing = |from, to| crate::userfaultfd::remove(c, from, to);
+    match advise(mem, &credentials, a[0], a[1], a[2], &mut removing) {
         Ok(()) => ok(0),
         Err(e) => err(e),
     }
@@ -2932,13 +2945,15 @@ fn sys_madvise(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
 /// ([`AddressSpace::advise_flags`]); and `MADV_REMOVE`, which frees shared
 /// memory as a hole punched in its file ([`remove`]). The others are
 /// rejected rather than ignored, so that a guest relying on one of them
-/// notices.
+/// notices. Before a discard drops pages, `removing` is told its range,
+/// for the `userfaultfd` events (`userfaultfd_remove`).
 pub(crate) fn advise(
     mem: &AddressSpace,
     credentials: &credentials::Credentials,
     addr: u64,
     len: u64,
     advice: u64,
+    removing: &mut dyn FnMut(u64, u64),
 ) -> Result<(), Errno> {
     if !matches!(advice, 0..=4 | 8..=24 | MADV_GUARD_INSTALL | MADV_GUARD_REMOVE) {
         return Err(Errno::EINVAL);
@@ -2959,16 +2974,22 @@ pub(crate) fn advise(
         return Err(Errno::ENOMEM);
     }
     if advice == MADV_DONTNEED_LOCKED {
+        removing(addr, end);
         return mem.discard_shared(GuestAddr(addr), length);
     }
     if advice == MADV_DONTNEED {
         return short_of_locked(mem, addr, end, true, |to| {
+            removing(addr, to);
             mem.discard_shared(GuestAddr(addr), to - addr)
         });
     }
     if advice == MADV_REMOVE {
         return short_of_locked(mem, addr, end, true, |to| {
             let (removals, hole) = mem.removals(GuestAddr(addr), to);
+            // The checks of the VMA come before the event.
+            if removals.first().is_some_and(Result::is_ok) {
+                removing(addr, to);
+            }
             for removal in removals {
                 remove(credentials, &removal?)?;
             }
@@ -3014,6 +3035,9 @@ pub(crate) fn advise(
         // emulator never has, so their contents stay as they are; their
         // poison markers go at once (`madvise_free_pte_range`).
         return short_of_locked(mem, addr, end, true, |to| {
+            // The event comes before the check of the VMA's kind
+            // (`madvise_free_single_vma`).
+            removing(addr, to);
             mem.check_private_anonymous(GuestAddr(addr), to - addr)?;
             mem.clear_poisons(GuestAddr(addr), to - addr);
             Ok(())
@@ -3414,12 +3438,80 @@ fn sys_mremap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     {
         return err(Errno::EAGAIN);
     }
+    let events = RemapEvents::new(c, addr, align(old_len), align(new_len), &how);
     match c.mem.remap_shared(GuestAddr(addr), old_len, new_len, how) {
         Ok(at) => {
             c.group.numa().moved(addr, old_len, at.0, new_len, keep_old);
+            events.deliver(c, addr, at.0, keep_old);
             ok(at.0)
         }
         Err(e) => err(e),
+    }
+}
+
+/// The `userfaultfd` events of an `mremap`, made before it and told once it
+/// is done, in the order of Linux's `notify_uffd`: the unmaps of the range
+/// `MREMAP_FIXED` replaces and of what a move shrinks off first; the move
+/// of the mapping, to the contexts with `UFFD_FEATURE_EVENT_REMAP`
+/// (`UFFD_EVENT_REMAP`); then the unmaps of the range it left and of what
+/// shrinking in place gave back.
+struct RemapEvents {
+    early: crate::userfaultfd::Events,
+    contexts: Vec<std::sync::Arc<crate::userfaultfd::Userfaultfd>>,
+    /// The length that moves, and the unmap of where it was.
+    moving: u64,
+    left: crate::userfaultfd::Events,
+    late: crate::userfaultfd::Events,
+}
+
+impl RemapEvents {
+    fn new(c: &Context<'_>, addr: u64, old_len: u64, new_len: u64, how: &Remap) -> Self {
+        use crate::userfaultfd::{Events, unmap};
+        let view = c.mem.view();
+        let (mut early, mut left, mut late) =
+            (Events::default(), Events::default(), Events::default());
+        let fixed = how.fixed && how.may_move;
+        if fixed {
+            if let Some(end) = how.new_addr.0.checked_add(new_len) {
+                unmap(&view, how.new_addr.0, end, &mut early);
+            }
+            if new_len < old_len {
+                unmap(
+                    &view,
+                    addr.saturating_add(new_len),
+                    addr.saturating_add(old_len),
+                    &mut early,
+                );
+            }
+        } else if new_len < old_len {
+            unmap(
+                &view,
+                addr.saturating_add(new_len),
+                addr.saturating_add(old_len),
+                &mut late,
+            );
+        }
+        let moving = if fixed { old_len.min(new_len) } else { old_len };
+        unmap(&view, addr, addr.saturating_add(moving), &mut left);
+        Self {
+            early,
+            contexts: crate::userfaultfd::remap_contexts(&view, addr),
+            moving,
+            left,
+            late,
+        }
+    }
+    fn deliver(self, c: &mut Context<'_>, addr: u64, at: u64, keep_old: bool) {
+        self.early.deliver(c);
+        if at != addr {
+            let mut moved = crate::userfaultfd::Events::default();
+            crate::userfaultfd::remap(self.contexts, addr, at, self.moving, &mut moved);
+            moved.deliver(c);
+            if !keep_old {
+                self.left.deliver(c);
+            }
+        }
+        self.late.deliver(c);
     }
 }
 
@@ -3500,10 +3592,17 @@ fn sys_mseal(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     }
 }
 
+/// `munmap(addr, len)`; the `userfaultfd`s that registered some of the
+/// range are told once it is unmapped (`UFFD_EVENT_UNMAP`).
 fn sys_munmap(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
+    let mut events = crate::userfaultfd::Events::default();
+    if let Some(end) = a[0].checked_add(a[1].wrapping_add(4095) & !4095) {
+        crate::userfaultfd::unmap(&c.mem.view(), a[0], end, &mut events);
+    }
     match c.mem.unmap_shared(GuestAddr(a[0]), a[1]) {
         Ok(()) => {
             c.group.numa().forget(a[0], a[1]);
+            events.deliver(c);
             ok(0)
         }
         Err(e) => err(e),
@@ -3520,12 +3619,22 @@ fn sys_brk(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     if grows > 0 && c.mem.future_lock().is_some() && !lock_fits(c, grows >> 12) {
         return ok(old);
     }
+    // A break that shrinks unmaps the pages above it (`UFFD_EVENT_UNMAP`).
+    let up = |n: u64| n.saturating_add(4095) & !4095;
+    let mut events = crate::userfaultfd::Events::default();
+    if up(a[0]) < up(old) {
+        crate::userfaultfd::unmap(&c.mem.view(), up(a[0]), up(old), &mut events);
+    }
     let new = c.mem.set_break_shared(GuestAddr(a[0])).0;
+    if up(new) < up(old) {
+        events.deliver(c);
+    } else {
+        drop(events);
+    }
     // The pages it gives back, or a new VMA it grows into, have no memory
     // policy (Linux expands the heap's VMA only when it has none).
     // set_break maps and unmaps whole pages between the two breaks rounded
     // up, so the page that holds an unaligned break keeps its policy.
-    let up = |n: u64| n.saturating_add(4095) & !4095;
     let (low, high) = (up(old.min(new)), up(old.max(new)));
     if high > low {
         c.group.numa().forget(low, high - low);

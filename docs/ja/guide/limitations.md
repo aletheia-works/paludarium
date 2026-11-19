@@ -646,11 +646,13 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   待っている間なら 10 ms 以内）に来ます。Linux の `signalfd_notify` は送られたときに
   ファイルを起こすので、待たない `epoll_wait` はそれより先に呼ばれることがあります。
 - **userfaultfd の一部**：登録するのは、ないページと、書き込み保護と、shmem の
-  マイナーフォールトです。`fork`、`mremap`、`madvise`、`munmap` のイベントはなく、
-  `UFFDIO_API` はそれらを示さず、求められれば `EINVAL` です。
-  `UFFD_FEATURE_WP_ASYNC` が書き込まれたと見たページを探して保護し直す
-  `/proc/<pid>/pagemap` の ioctl、`PAGEMAP_SCAN` もありません。それらのページは
-  `/proc/<pid>/pagemap` のビット 57 でわかります。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
+  マイナーフォールトです。`UFFD_FEATURE_WP_ASYNC` が書き込まれたと見たページを探して
+  保護し直す `/proc/<pid>/pagemap` の ioctl、`PAGEMAP_SCAN` はありません。それらの
+  ページは `/proc/<pid>/pagemap` のビット 57 でわかります。捨てる操作は、どのページを
+  落とすより先にすべての範囲を知らせます。Linux は VMA ごとに知らせて落とします。
+  1 つの `userfaultfd` の登録したマッピングが接していれば、Linux の VMA が
+  つながったときと同じく、`UFFD_EVENT_REMOVE` の 1 つの範囲になります。
+  `MADV_REMOVE` は、最初のマッピングが確かめを通れば範囲全体を一度知らせます。書き込み保護のモードをほかのモードに置き換える登録は、範囲の
   ページの保護を外します。Linux はその印を PTE に残します。shmem の uffd-wp
   マーカーの上の `MADV_GUARD_INSTALL` は、マーカーをガードに置き換えます。Linux は
   エントリーを外すとき（zap）にマーカーを残すので、シグナルが来るまで呼び出しをやり直します。shmem のファイルで登録

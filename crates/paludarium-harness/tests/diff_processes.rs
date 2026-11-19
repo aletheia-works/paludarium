@@ -235,6 +235,7 @@ mod linux {
                     | "userfaultfd-minor"
                     | "userfaultfd-wp-shmem"
                     | "userfaultfd-wp-async"
+                    | "userfaultfd-events"
                     | "perf-calls"
                     | "perf-counts"
                     | "perf-exec"
@@ -609,6 +610,7 @@ mod linux {
         userfaultfd_minor => ("userfaultfd-minor","userfaultfd"),
         userfaultfd_wp_shmem => ("userfaultfd-wp-shmem","userfaultfd"),
         userfaultfd_wp_async => ("userfaultfd-wp-async","userfaultfd"),
+        userfaultfd_events => ("userfaultfd-events","userfaultfd"),
         mqueue_calls => ("mqueue-calls","mqueue"),
         mqueue_limits => ("mqueue-limits","mqueue"),
         mqueue_wait => ("mqueue-wait","mqueue"),

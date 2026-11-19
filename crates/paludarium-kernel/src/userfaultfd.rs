@@ -45,9 +45,20 @@
 //! Registered for write protection alone, any memory takes it, a file's
 //! mapping too, whose discarded pages keep their protection.
 //!
-//! Not offered: the events of `fork`, `mremap`, `madvise` and `munmap`.
-//! `UFFDIO_API` does not report their features, which it refuses
-//! (`EINVAL`).
+//! The events tell the context of changes to its space, as Linux's
+//! non-cooperative mode does: with `UFFD_FEATURE_EVENT_FORK` a `fork`ed
+//! child keeps the registrations, in a new context of its own that a read
+//! of the old one hands over as a new file (`UFFD_EVENT_FORK`); with
+//! `UFFD_FEATURE_EVENT_REMAP` a mapping `mremap` moves keeps them
+//! (`UFFD_EVENT_REMAP`); `UFFD_FEATURE_EVENT_REMOVE` reports the ranges
+//! `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`, `MADV_FREE` and `MADV_REMOVE`
+//! are about to drop (`UFFD_EVENT_REMOVE`), and `UFFD_FEATURE_EVENT_UNMAP`
+//! those `munmap`, `mremap`, `brk` and a `MAP_FIXED` `mmap` unmapped
+//! (`UFFD_EVENT_UNMAP`). The thread that made the change waits until the
+//! event is read, the file closed or a fatal signal comes, as Linux's
+//! `userfaultfd_event_wait_completion` (`TASK_KILLABLE`); a read takes the
+//! faults before the events, and until it does, the fills, moves and
+//! changes of protection are `EAGAIN` (`mmap_changing`).
 
 use crate::events::{IN, ReadinessHub};
 use crate::syscalls::{Context, Outcome};
@@ -76,10 +87,18 @@ const MIN_ADDRESS: u64 = paludarium_mmu::MMAP_MIN_ADDR;
 /// `UFFD_FEATURE_PAGEFAULT_FLAG_WP`: faults of write-protected pages are
 /// reported, with [`PAGEFAULT_FLAG_WP`].
 const FEATURE_PAGEFAULT_FLAG_WP: u64 = 1 << 0;
-/// `UFFD_FEATURE_EVENT_FORK`, which needs `CAP_SYS_PTRACE`.
+/// `UFFD_FEATURE_EVENT_FORK`, which needs `CAP_SYS_PTRACE`: a child keeps
+/// the registrations, in a context of its own ([`fork`]).
 const FEATURE_EVENT_FORK: u64 = 1 << 1;
+/// `UFFD_FEATURE_EVENT_REMAP`: a mapping `mremap` moves keeps its
+/// registration ([`remap`]).
+const FEATURE_EVENT_REMAP: u64 = 1 << 2;
+/// `UFFD_FEATURE_EVENT_REMOVE`: the discards are reported ([`remove`]).
+const FEATURE_EVENT_REMOVE: u64 = 1 << 3;
 const FEATURE_MISSING_HUGETLBFS: u64 = 1 << 4;
 const FEATURE_MISSING_SHMEM: u64 = 1 << 5;
+/// `UFFD_FEATURE_EVENT_UNMAP`: the unmaps are reported ([`unmap`]).
+const FEATURE_EVENT_UNMAP: u64 = 1 << 6;
 /// `UFFD_FEATURE_SIGBUS`: a fault raises SIGBUS rather than waiting.
 const FEATURE_SIGBUS: u64 = 1 << 7;
 /// `UFFD_FEATURE_THREAD_ID`: a fault's message names its thread.
@@ -109,8 +128,12 @@ const FEATURE_WP_ASYNC: u64 = 1 << 15;
 const FEATURE_MOVE: u64 = 1 << 16;
 /// The features `UFFDIO_API` offers.
 const FEATURES: u64 = FEATURE_PAGEFAULT_FLAG_WP
+    | FEATURE_EVENT_FORK
+    | FEATURE_EVENT_REMAP
+    | FEATURE_EVENT_REMOVE
     | FEATURE_MISSING_HUGETLBFS
     | FEATURE_MISSING_SHMEM
+    | FEATURE_EVENT_UNMAP
     | FEATURE_SIGBUS
     | FEATURE_THREAD_ID
     | FEATURE_MINOR_HUGETLBFS
@@ -169,6 +192,12 @@ const MOVE_MODE_ALLOW_SRC_HOLES: u64 = 2;
 
 /// `UFFD_EVENT_PAGEFAULT`.
 const EVENT_PAGEFAULT: u8 = 0x12;
+/// `UFFD_EVENT_FORK`, `UFFD_EVENT_REMAP`, `UFFD_EVENT_REMOVE` and
+/// `UFFD_EVENT_UNMAP`.
+const EVENT_FORK: u8 = 0x13;
+const EVENT_REMAP: u8 = 0x14;
+const EVENT_REMOVE: u8 = 0x15;
+const EVENT_UNMAP: u8 = 0x16;
 /// `UFFD_PAGEFAULT_FLAG_WRITE`.
 const PAGEFAULT_FLAG_WRITE: u64 = 1;
 /// `UFFD_PAGEFAULT_FLAG_WP`: the page was write-protected.
@@ -204,6 +233,11 @@ pub(crate) struct Userfaultfd {
     state: Mutex<State>,
     /// Its file was closed (`ctx->released`).
     released: AtomicBool,
+    /// The flags `userfaultfd` took (`ctx->flags`), which the file a fork's
+    /// event hands over takes too.
+    flags: u32,
+    /// The events made and not yet read (`mmap_changing`).
+    changing: AtomicU32,
 }
 
 #[derive(Default)]
@@ -212,8 +246,31 @@ struct State {
     pending: VecDeque<Arc<Waiting>>,
     /// The faults read whose threads still wait (`fault_wqh`).
     read: Vec<Arc<Waiting>>,
+    /// The events not read yet, oldest first (`event_wqh`).
+    events: VecDeque<Arc<Event>>,
     /// Moves on with each fault that comes, for `epoll`.
     epoch: u64,
+}
+
+/// A thread waiting for its event to be read (`userfaultfd_wait_queue` on
+/// `event_wqh`).
+struct Event {
+    /// Its `uffd_msg`; a fork's file is not in it yet.
+    message: [u8; MESSAGE],
+    /// The child's context, which a fork's event hands over.
+    child: Option<Arc<Userfaultfd>>,
+    /// It was read, or its thread gave up on it, under [`State`]'s lock.
+    done: AtomicBool,
+    abandoned: AtomicBool,
+    /// What the thread waits on.
+    hub: Arc<ReadinessHub>,
+}
+
+/// What a read takes ([`Userfaultfd::take`]).
+enum Taken {
+    Message([u8; MESSAGE]),
+    /// A fork's event, out of the queue while its file is made.
+    Fork(Arc<Event>),
 }
 
 /// A thread waiting for a page (`userfaultfd_wait_queue`).
@@ -251,6 +308,10 @@ impl Userfaultfd {
     fn initialized(&self) -> bool {
         self.features.load(Ordering::SeqCst) & INITIALIZED != 0
     }
+    /// An event of the context is not read yet (`mmap_changing`).
+    fn changing(&self) -> bool {
+        self.changing.load(Ordering::SeqCst) != 0
+    }
     /// Ends the waits for the pages of `[start, start + len)`, or all of
     /// them for a `len` of 0, as Linux's `userfaultfd_wake_function` takes
     /// a fault whose message's address lies there.
@@ -275,13 +336,23 @@ impl Userfaultfd {
         }
     }
     /// Takes the oldest fault not read yet, which stays waiting, as
-    /// Linux's `userfaultfd_ctx_read` moves it to `fault_wqh`.
-    fn take(&self) -> Option<[u8; MESSAGE]> {
+    /// Linux's `userfaultfd_ctx_read` moves it to `fault_wqh`; with none,
+    /// the oldest event, whose thread goes on unless it is a fork's.
+    fn take(&self) -> Option<Taken> {
         let mut state = self.state();
-        let waiting = state.pending.pop_front()?;
-        let message = waiting.message();
-        state.read.push(waiting);
-        Some(message)
+        if let Some(waiting) = state.pending.pop_front() {
+            let message = waiting.message();
+            state.read.push(waiting);
+            return Some(Taken::Message(message));
+        }
+        let event = state.events.pop_front()?;
+        if event.child.is_some() {
+            return Some(Taken::Fork(event));
+        }
+        drop(state);
+        event.done.store(true, Ordering::SeqCst);
+        event.hub.changed();
+        Some(Taken::Message(event.message))
     }
     /// Its file was closed: its mappings leave it and its waits end
     /// (`userfaultfd_release`).
@@ -289,6 +360,15 @@ impl Userfaultfd {
         self.released.store(true, Ordering::SeqCst);
         self.memory.userfault_release(self.id);
         self.wake(0, 0);
+        let hubs: Vec<_> = self
+            .state()
+            .events
+            .iter()
+            .map(|event| Arc::clone(&event.hub))
+            .collect();
+        for hub in hubs {
+            hub.changed();
+        }
         self.hub.changed();
     }
     /// What `/proc/<pid>/fdinfo` shows of it (`userfaultfd_show_fdinfo`).
@@ -322,11 +402,16 @@ pub(crate) struct UserfaultFile {
     context: Arc<Userfaultfd>,
     /// `O_NONBLOCK` and `O_ASYNC`, which `fcntl` sets.
     status: AtomicU32,
+    /// Its close releases the context: not so for a fork's file that found
+    /// no room ([`hand_over`]).
+    owns: AtomicBool,
 }
 
 impl Drop for UserfaultFile {
     fn drop(&mut self) {
-        self.context.release();
+        if self.owns.load(Ordering::SeqCst) {
+            self.context.release();
+        }
     }
 }
 
@@ -362,11 +447,14 @@ fn create(c: &mut Context<'_>, flags: u32) -> Result<u64, Errno> {
         hub: Arc::clone(&c.files.readiness),
         state: Mutex::default(),
         released: AtomicBool::new(false),
+        flags,
+        changing: AtomicU32::new(0),
     });
     lock(&CONTEXTS).insert(id, Arc::downgrade(&context));
     let file = Arc::new(UserfaultFile {
         context,
         status: AtomicU32::new(flags & O_NONBLOCK),
+        owns: AtomicBool::new(true),
     });
     c.files
         .install(file, flags & O_CLOEXEC != 0, c.group.nofile())
@@ -536,8 +624,13 @@ fn read_messages(
         }
         let message = loop {
             let ticket = c.files.readiness.token.value();
-            if let Some(message) = context.take() {
-                break message;
+            match context.take() {
+                Some(Taken::Message(message)) => break message,
+                Some(Taken::Fork(event)) => match hand_over(c, context, &event) {
+                    Ok(message) => break message,
+                    Err(e) => return if done > 0 { Ok(done) } else { Err(e) },
+                },
+                None => {}
             }
             if crate::events::signalled(c) {
                 return if done > 0 { Ok(done) } else { Err(Errno(4)) };
@@ -558,6 +651,57 @@ fn read_messages(
         }
         done += MESSAGE;
         nowait = true;
+    }
+}
+
+/// A fork's event, which a read took: the child's context gets a file of
+/// the reader's, opened for reading with the `O_CLOEXEC` and `O_NONBLOCK`
+/// the old one was made with, whose number the message has, and the
+/// forking thread goes on, as Linux's `resolve_userfault_fork`. With no
+/// room for the file, the event goes back to the queue, unless its thread
+/// gave up on it, and the read fails.
+fn hand_over(
+    c: &mut Context<'_>,
+    context: &Userfaultfd,
+    event: &Arc<Event>,
+) -> Result<[u8; MESSAGE], Errno> {
+    let child = event.child.as_ref().map(Arc::clone).ok_or(Errno::EINVAL)?;
+    let file = Arc::new(UserfaultFile {
+        status: AtomicU32::new(child.flags & O_NONBLOCK),
+        context: Arc::clone(&child),
+        owns: AtomicBool::new(true),
+    });
+    let installed = c.files.install(
+        Arc::clone(&file) as Arc<dyn FileHandle>,
+        child.flags & O_CLOEXEC != 0,
+        c.group.nofile(),
+    );
+    if installed.is_err() {
+        file.owns.store(false, Ordering::SeqCst);
+    }
+    drop(file);
+    let mut state = context.state();
+    let abandoned = event.abandoned.load(Ordering::SeqCst);
+    match installed {
+        Ok(fd) => {
+            if !abandoned {
+                event.done.store(true, Ordering::SeqCst);
+            }
+            drop(state);
+            event.hub.changed();
+            let mut message = event.message;
+            message[8..12].copy_from_slice(&fd.to_le_bytes());
+            Ok(message)
+        }
+        Err(e) => {
+            if abandoned {
+                drop(state);
+                child.release();
+            } else {
+                state.events.push_front(Arc::clone(event));
+            }
+            Err(e)
+        }
     }
 }
 
@@ -696,6 +840,12 @@ fn register(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64,
     if context.features() & FEATURE_WP_ASYNC != 0 {
         modes |= paludarium_mmu::Userfault::WP_ASYNC;
     }
+    if context.features() & FEATURE_EVENT_FORK != 0 {
+        modes |= paludarium_mmu::Userfault::EVENT_FORK;
+    }
+    if context.features() & FEATURE_EVENT_REMAP != 0 {
+        modes |= paludarium_mmu::Userfault::EVENT_REMAP;
+    }
     context
         .memory
         .userfault_register(start, start + len, context.id, modes)?;
@@ -724,12 +874,15 @@ fn unregister(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u6
     Ok(0)
 }
 
-/// `UFFDIO_WRITEPROTECT` (`userfaultfd_writeprotect`): a range
-/// ([`validate`]) and modes it knows, not both protecting and
+/// `UFFDIO_WRITEPROTECT` (`userfaultfd_writeprotect`): `EAGAIN` while an
+/// event is not read; a range ([`validate`]) and modes it knows, not both protecting and
 /// `DONTWAKE` (`EINVAL`), of a space that lives (`ESRCH`); then the
 /// space's change ([`paludarium_mmu::MemoryView::userfault_write_protect`]),
 /// and an end of the protection wakes the range unless `DONTWAKE`.
 fn write_protect(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64, Errno> {
+    if context.changing() {
+        return Err(Errno::EAGAIN);
+    }
     let [start, len, mode] = words::<3>(c, arg)?;
     validate(start, len)?;
     if mode & !(WRITEPROTECT_MODE_WP | WRITEPROTECT_MODE_DONTWAKE) != 0 {
@@ -778,9 +931,18 @@ enum Fill {
 /// first; the bytes filled, or the error, are written to the struct's last
 /// field (`EFAULT`), then the waits for them end unless `DONTWAKE`, and a
 /// fill that stopped short is `EAGAIN`. `UFFDIO_CONTINUE_MODE_WP` needs
-/// the write-protect mode, as `UFFDIO_COPY_MODE_WP` does.
+/// the write-protect mode, as `UFFDIO_COPY_MODE_WP` does. While an event
+/// is not read, the fill is `EAGAIN`, written to that field first.
 fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Result<u64, Errno> {
     let copy = kind == Fill::Copy;
+    if context.changing() {
+        put_word(
+            c,
+            arg + if copy { 32 } else { 24 },
+            Errno::EAGAIN.to_syscall_return(),
+        )?;
+        return Err(Errno::EAGAIN);
+    }
     let (dst, src, len, mode, result_at) = if copy {
         let [dst, src, len, mode] = words::<4>(c, arg)?;
         validate_unaligned(src, len)?;
@@ -864,7 +1026,8 @@ fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Res
     }
 }
 
-/// `UFFDIO_MOVE` (`userfaultfd_move`): the `struct uffdio_move` but its
+/// `UFFDIO_MOVE` (`userfaultfd_move`): `EAGAIN` while an event is not
+/// read, written to the last field first; the `struct uffdio_move` but its
 /// last field (`EFAULT`), from a thread of the context's own space
 /// (`EINVAL`), with page-aligned ranges ([`validate`]) and modes it knows
 /// (`EINVAL`); then the space's move
@@ -873,6 +1036,10 @@ fn fill(c: &mut Context<'_>, context: &Userfaultfd, arg: u64, kind: Fill) -> Res
 /// waits for the moved pages end unless `DONTWAKE`, and a move that
 /// stopped short is `EAGAIN`.
 fn move_pages(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u64, Errno> {
+    if context.changing() {
+        put_word(c, arg + 32, Errno::EAGAIN.to_syscall_return())?;
+        return Err(Errno::EAGAIN);
+    }
     let [dst, src, len, mode] = words::<4>(c, arg)?;
     if c.mem.view().identity() != context.memory.identity() {
         return Err(Errno::EINVAL);
@@ -907,6 +1074,242 @@ fn move_pages(c: &mut Context<'_>, context: &Userfaultfd, arg: u64) -> Result<u6
     }
 }
 
+/// The events an operation on a space makes, made before it and queued
+/// once it is done ([`Events::deliver`]); each counts in its context's
+/// `mmap_changing` until it is read. Dropped undelivered, as when the
+/// operation fails, they count no more, and a fork's child context is
+/// released.
+#[derive(Default)]
+#[must_use]
+pub(crate) struct Events(Vec<Made>);
+
+/// An event made: its context, its message, and a fork's child context.
+type Made = (Arc<Userfaultfd>, [u8; MESSAGE], Option<Arc<Userfaultfd>>);
+
+/// The parts of a range a context registered ([`registered`]).
+type Parts = (Arc<Userfaultfd>, Vec<(u64, u64)>);
+
+impl Events {
+    fn push(
+        &mut self,
+        context: Arc<Userfaultfd>,
+        message: [u8; MESSAGE],
+        child: Option<Arc<Userfaultfd>>,
+    ) {
+        context.changing.fetch_add(1, Ordering::SeqCst);
+        self.0.push((context, message, child));
+    }
+    /// Queues each event and waits until it is read, in their order.
+    pub(crate) fn deliver(mut self, c: &mut Context<'_>) {
+        for (context, message, child) in std::mem::take(&mut self.0) {
+            wait_read(c, &context, message, child);
+            context.changing.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        for (context, _, child) in self.0.drain(..) {
+            context.changing.fetch_sub(1, Ordering::SeqCst);
+            if let Some(child) = child {
+                child.release();
+            }
+        }
+    }
+}
+
+/// Queues an event of `context` and waits until it is read, the context's
+/// file is closed or a fatal signal comes, as Linux's
+/// `userfaultfd_event_wait_completion` waits `TASK_KILLABLE`. A fork's
+/// event left unread takes the child out of its context
+/// (`userfaultfd_release_new`).
+fn wait_read(
+    c: &mut Context<'_>,
+    context: &Arc<Userfaultfd>,
+    message: [u8; MESSAGE],
+    child: Option<Arc<Userfaultfd>>,
+) {
+    let event = Arc::new(Event {
+        message,
+        child,
+        done: AtomicBool::new(false),
+        abandoned: AtomicBool::new(false),
+        hub: Arc::clone(&c.files.readiness),
+    });
+    {
+        let mut state = context.state();
+        state.events.push_back(Arc::clone(&event));
+        state.epoch += 1;
+    }
+    context.hub.changed();
+    loop {
+        let ticket = c.files.readiness.token.value();
+        if event.done.load(Ordering::SeqCst)
+            || context.released.load(Ordering::SeqCst)
+            || crate::fanotify::fatal(c)
+        {
+            break;
+        }
+        let _ = c.inbox.drain(c.process);
+        c.group.drain_process(c.process);
+        let Ok(now) = c.host.clock(paludarium_host::ClockId::Monotonic) else {
+            break;
+        };
+        let end = Some((
+            paludarium_host::ClockId::Monotonic,
+            now.saturating_add(10_000_000),
+        ));
+        if let Err(e) = c
+            .host
+            .wait_on(&c.files.readiness.token, ticket, end, c.cancellation)
+            && e == Errno::ENOSYS
+        {
+            let _ = c.host.wait_until(
+                paludarium_host::ClockId::Monotonic,
+                now.saturating_add(1_000_000),
+                c.cancellation,
+            );
+        }
+    }
+    let queued = {
+        let mut state = context.state();
+        event.abandoned.store(true, Ordering::SeqCst);
+        let before = state.events.len();
+        state.events.retain(|e| !Arc::ptr_eq(e, &event));
+        before != state.events.len()
+    };
+    if queued && let Some(child) = &event.child {
+        child.release();
+    }
+}
+
+/// The live contexts with `feature` that registered parts of
+/// `[start, end)` of `mem`, each with the parts, joined where they meet.
+fn registered(mem: &MemoryView, start: u64, end: u64, feature: u64) -> Vec<Parts> {
+    let mut found: Vec<Parts> = Vec::new();
+    for (from, to, userfault) in mem.userfault_registrations(start, end) {
+        let Some(context) = find(userfault.context) else {
+            continue;
+        };
+        if context.released.load(Ordering::SeqCst) || context.features() & feature == 0 {
+            continue;
+        }
+        let at = match found.iter().position(|(c, _)| c.id == context.id) {
+            Some(i) => i,
+            None => {
+                found.push((context, Vec::new()));
+                found.len() - 1
+            }
+        };
+        let parts = &mut found[at].1;
+        match parts.last_mut() {
+            Some(last) if last.1 == from => last.1 = to,
+            _ => parts.push((from, to)),
+        }
+    }
+    found
+}
+
+/// A message of `event` with the words `args` after its header.
+fn event_message(event: u8, args: &[u64]) -> [u8; MESSAGE] {
+    let mut message = [0; MESSAGE];
+    message[0] = event;
+    for (i, word) in args.iter().enumerate() {
+        message[8 + i * 8..16 + i * 8].copy_from_slice(&word.to_le_bytes());
+    }
+    message
+}
+
+/// The `UFFD_EVENT_UNMAP` that an unmap of `[start, end)` of `mem` makes
+/// for each context with `UFFD_FEATURE_EVENT_UNMAP` that registered some
+/// of it, of the whole range, once (`userfaultfd_unmap_prep`).
+pub(crate) fn unmap(mem: &MemoryView, start: u64, end: u64, events: &mut Events) {
+    for (context, _) in registered(mem, start, end, FEATURE_EVENT_UNMAP) {
+        let message = event_message(EVENT_UNMAP, &[start, end]);
+        let known = events
+            .0
+            .iter()
+            .any(|(c, m, _)| c.id == context.id && *m == message);
+        if !known {
+            events.push(context, message, None);
+        }
+    }
+}
+
+/// The `UFFD_EVENT_REMOVE` that a discard of `[start, end)` of `mem`
+/// gives, mapping by mapping, before it drops the pages
+/// (`userfaultfd_remove`): each context with `UFFD_FEATURE_EVENT_REMOVE`
+/// that registered some of the range is told of its parts and read before
+/// the discard goes on.
+pub(crate) fn remove(c: &mut Context<'_>, start: u64, end: u64) {
+    let mut events = Events::default();
+    for (context, parts) in registered(&c.mem.view(), start, end, FEATURE_EVENT_REMOVE) {
+        for (from, to) in parts {
+            events.push(
+                Arc::clone(&context),
+                event_message(EVENT_REMOVE, &[from, to]),
+                None,
+            );
+        }
+    }
+    // In the order of the ranges, whose start is the message's first word.
+    events.0.sort_by_key(|(_, m, _)| {
+        let mut word = [0; 8];
+        word.copy_from_slice(&m[8..16]);
+        u64::from_le_bytes(word)
+    });
+    events.deliver(c);
+}
+
+/// The contexts with `UFFD_FEATURE_EVENT_REMAP` of the mapping at `addr`
+/// of `mem`, which a move by `mremap` keeps registered
+/// (`mremap_userfaultfd_prep`).
+pub(crate) fn remap_contexts(mem: &MemoryView, addr: u64) -> Vec<Arc<Userfaultfd>> {
+    registered(mem, addr, addr.saturating_add(PAGE), FEATURE_EVENT_REMAP)
+        .into_iter()
+        .map(|(context, _)| context)
+        .collect()
+}
+
+/// The `UFFD_EVENT_REMAP` of a move of `len` bytes from `from` to `to`,
+/// for each of `contexts` (`mremap_userfaultfd_complete`).
+pub(crate) fn remap(
+    contexts: Vec<Arc<Userfaultfd>>,
+    from: u64,
+    to: u64,
+    len: u64,
+    events: &mut Events,
+) {
+    for context in contexts {
+        events.push(context, event_message(EVENT_REMAP, &[from, to, len]), None);
+    }
+}
+
+/// A `fork`ed child's registrations (`dup_userfaultfd`): those of a
+/// context with `UFFD_FEATURE_EVENT_FORK`, which the child's space kept
+/// ([`paludarium_mmu::Userfault::EVENT_FORK`]), move to a new context of
+/// the child's, with the old one's flags and features; its
+/// `UFFD_EVENT_FORK`, which `events` gets, hands it over to the reader.
+pub(crate) fn fork(child: &MemoryView, events: &mut Events) {
+    for (context, _) in registered(child, 0, USER_ADDRESS_LIMIT, FEATURE_EVENT_FORK) {
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        let new = Arc::new(Userfaultfd {
+            id,
+            features: AtomicU32::new(context.features.load(Ordering::SeqCst)),
+            memory: child.clone(),
+            hub: Arc::clone(&context.hub),
+            state: Mutex::default(),
+            released: AtomicBool::new(false),
+            flags: context.flags,
+            changing: AtomicU32::new(0),
+        });
+        lock(&CONTEXTS).insert(id, Arc::downgrade(&new));
+        child.userfault_renumber(context.id, id);
+        events.push(context, event_message(EVENT_FORK, &[]), Some(new));
+    }
+}
+
 /// The lines `/proc/<pid>/fdinfo` adds for a context's file.
 pub(crate) fn fdinfo(file: &UserfaultFile) -> Vec<u8> {
     file.context.fdinfo()
@@ -915,14 +1318,15 @@ pub(crate) fn fdinfo(file: &UserfaultFile) -> Vec<u8> {
 impl FileHandle for UserfaultFile {
     /// `userfaultfd_poll`: `POLLERR` before `UFFDIO_API` and for a file that
     /// blocks, whose `read` may wait though a fault was there; `POLLIN`
-    /// while a fault is not read yet.
+    /// while a fault or an event is not read yet.
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
         let context = &self.context;
         if !context.initialized() || self.status.load(Ordering::SeqCst) & O_NONBLOCK == 0 {
             return Ok((ERR, 0, 0));
         }
         let state = context.state();
-        Ok((u32::from(!state.pending.is_empty()) * IN, state.epoch, 0))
+        let ready = !state.pending.is_empty() || !state.events.is_empty();
+        Ok((u32::from(ready) * IN, state.epoch, 0))
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
@@ -982,5 +1386,90 @@ pub(crate) mod tests {
     pub(crate) fn counts(context: &Userfaultfd) -> (usize, usize) {
         let state = context.state();
         (state.pending.len(), state.pending.len() + state.read.len())
+    }
+
+    /// An event [`queue_events`] queued.
+    pub(crate) struct Queued(Arc<Userfaultfd>, Arc<Event>);
+
+    impl Queued {
+        /// It was read.
+        pub(crate) fn read(&self) -> bool {
+            self.1.done.load(Ordering::SeqCst)
+        }
+        /// Its thread goes on, as [`Events::deliver`] once it was read.
+        pub(crate) fn finish(self) {
+            self.0.changing.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Queues `events` as their threads would, without waiting; they count
+    /// in `mmap_changing` until [`Queued::finish`].
+    pub(crate) fn queue_events(mut events: Events) -> Vec<Queued> {
+        let mut queued = Vec::new();
+        for (context, message, child) in std::mem::take(&mut events.0) {
+            let event = Arc::new(Event {
+                message,
+                child,
+                done: AtomicBool::new(false),
+                abandoned: AtomicBool::new(false),
+                hub: Arc::clone(&context.hub),
+            });
+            context.state().events.push_back(Arc::clone(&event));
+            queued.push(Queued(context, event));
+        }
+        queued
+    }
+
+    /// An unmap's events ([`unmap`]), counted and still to be delivered.
+    pub(crate) fn unmap_events(
+        mem: &MemoryView,
+        start: u64,
+        end: u64,
+    ) -> (Events, Vec<[u8; MESSAGE]>) {
+        let mut events = Events::default();
+        unmap(mem, start, end, &mut events);
+        let messages = events.0.iter().map(|(_, m, _)| *m).collect();
+        (events, messages)
+    }
+
+    /// The child contexts a fork's events hand over.
+    pub(crate) fn children(events: &Events) -> Vec<u64> {
+        events
+            .0
+            .iter()
+            .filter_map(|(_, _, c)| c.as_ref().map(|c| c.id))
+            .collect()
+    }
+
+    /// Whether an event of `context` is not read yet (`mmap_changing`).
+    pub(crate) fn changing(context: &Userfaultfd) -> bool {
+        context.changing()
+    }
+
+    /// Reads `n` messages of `context` from another thread, as its handler
+    /// would, while the caller's thread waits for them; faults and events
+    /// but a fork's.
+    pub(crate) fn reader(
+        context: Arc<Userfaultfd>,
+        n: usize,
+    ) -> std::thread::JoinHandle<Vec<[u8; MESSAGE]>> {
+        std::thread::spawn(move || {
+            let mut messages = Vec::new();
+            while messages.len() < n {
+                match context.take() {
+                    Some(Taken::Message(message)) => messages.push(message),
+                    Some(Taken::Fork(event)) => {
+                        event.done.store(true, Ordering::SeqCst);
+                        event.hub.changed();
+                        let mut message = event.message;
+                        let id = event.child.as_ref().map_or(0, |c| c.id);
+                        message[8..16].copy_from_slice(&id.to_le_bytes());
+                        messages.push(message);
+                    }
+                    None => std::thread::yield_now(),
+                }
+            }
+            messages
+        })
     }
 }

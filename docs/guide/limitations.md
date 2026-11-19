@@ -757,11 +757,14 @@ verified.
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages, write protection and the minor
-  faults of shmem are registered. Not offered are the events of `fork`,
-  `mremap`, `madvise` and `munmap`, which `UFFDIO_API` does not report and
-  refuses (`EINVAL`), and `PAGEMAP_SCAN`, the `/proc/<pid>/pagemap` ioctl
-  that finds and protects again the pages `UFFD_FEATURE_WP_ASYNC` saw
-  written; their bit 57 in `/proc/<pid>/pagemap` tells them. A
+  faults of shmem are registered. Not offered is `PAGEMAP_SCAN`, the
+  `/proc/<pid>/pagemap` ioctl that finds and protects again the pages
+  `UFFD_FEATURE_WP_ASYNC` saw written; their bit 57 in
+  `/proc/<pid>/pagemap` tells them. A discard tells of all its ranges
+  before it drops the pages of any, where Linux tells and drops VMA by VMA,
+  and registered mappings of one `userfaultfd` that meet are one range of
+  `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of
+  its whole range once its first mapping passes the checks. A
   registration that replaces the write-protect mode with others ends the
   protection of the range's pages, whose marks Linux leaves in their PTEs.
   `MADV_GUARD_INSTALL` over a uffd-wp marker of shmem puts the guard in

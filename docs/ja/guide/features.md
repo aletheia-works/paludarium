@@ -862,7 +862,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_EXACT_ADDRESS`、`UFFD_FEATURE_MISSING_SHMEM`、
   `UFFD_FEATURE_MISSING_HUGETLBFS`、`UFFD_FEATURE_WP_HUGETLBFS_SHMEM`、
   `UFFD_FEATURE_WP_UNPOPULATED`、`UFFD_FEATURE_POISON`、`UFFD_FEATURE_WP_ASYNC`、
-  `UFFD_FEATURE_MOVE` で（`HUGETLBFS` の
+  `UFFD_FEATURE_MOVE`、それにイベントの `UFFD_FEATURE_EVENT_FORK`、
+  `UFFD_FEATURE_EVENT_REMAP`、`UFFD_FEATURE_EVENT_REMOVE`、
+  `UFFD_FEATURE_EVENT_UNMAP` で（`HUGETLBFS` の
   ものは Linux と同じく示しますが、`MFD_HUGETLB` と `SHM_HUGETLB` は `ENOSYS` なので、
   登録する hugetlbfs のメモリはありません）、`UFFD_FEATURE_EVENT_FORK` には
   `CAP_SYS_PTRACE` が要ります（`EPERM`）。`UFFDIO_REGISTER` はプライベートな anonymous
@@ -911,8 +913,9 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFDIO_CONTINUE` はマーカーに置き換わり、保護は自分のモードによるものだけです。
   プライベートな anonymous メモリの `UFFDIO_ZEROPAGE` と `UFFDIO_POISON` はそこでは
   `EEXIST` です。`mprotect` は保護を残し、許さない書き込みはこれまでどおり SIGSEGV です。
-  `fork` した子、`mremap` による移動、`UFFDIO_UNREGISTER`、ファイルを閉じること、
-  書き込み保護のモードを置き換える登録で保護は外れます。
+  （そのイベントの機能がないときの）`fork` した子と `mremap` による移動、
+  `UFFDIO_UNREGISTER`、ファイルを閉じること、書き込み保護のモードを置き換える登録で
+  保護は外れます。
   `UFFD_FEATURE_WP_ASYNC`（`/proc/<pid>/fdinfo` が示すとおり
   `UFFD_FEATURE_WP_UNPOPULATED` を伴います）では、書き込み保護されたページへの
   書き込みは、命令のものもシステムコールのものもフォールトせず、`do_wp_page` と
@@ -971,8 +974,28 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EAGAIN` です。read はメッセージを丸ごと取り（1 つも入らないバッファーと `UFFDIO_API` の前は
   `EINVAL`）、ノンブロッキングでなければ待ちます。`poll` は、Linux と同じく
   `UFFDIO_API` の前とブロックするファイルでは `POLLERR`、それ以外ではまだ読まれていない
-  フォールトがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と
+  フォールトかイベントがあれば `POLLIN` です。`/proc/self/fdinfo` は `userfaultfd_show_fdinfo` と
   同じく、読まれていないフォールトの数、待っているもの全部の数、API を示します。
+  イベントは、Linux の non-cooperative モードと同じく、アドレス空間の変化を
+  `userfaultfd` に知らせます。`UFFD_FEATURE_EVENT_FORK` では、`fork` した子が登録と、
+  そのページとマーカーの書き込み保護を、子自身の新しい `userfaultfd` で引き継ぎます。
+  `UFFD_EVENT_FORK` はそれを、read が入れるファイル（古いものの `O_CLOEXEC` と
+  `O_NONBLOCK` つき）として渡し、メッセージにはその番号が入ります。
+  `UFFD_FEATURE_EVENT_REMAP` では `mremap` が動かしたマッピングも登録を引き継ぎ、
+  `UFFD_EVENT_REMAP` が元の場所、移った先、長さを示します。
+  `UFFD_FEATURE_EVENT_REMOVE` は、`MADV_DONTNEED`、`MADV_DONTNEED_LOCKED`、
+  `MADV_FREE`、`MADV_REMOVE`（と呼んだ側自身のメモリへの `process_madvise`）が
+  落とそうとする範囲を、マッピングごとに知らせます（`UFFD_EVENT_REMOVE`）。
+  `UFFD_FEATURE_EVENT_UNMAP` は、`munmap`、`brk`、`MAP_FIXED` の `mmap`、`mremap` が
+  外した範囲全体を、その一部を登録した `userfaultfd` ごとに一度知らせます
+  （`UFFD_EVENT_UNMAP`）。`mremap` は Linux の `notify_uffd` と同じく、`MREMAP_FIXED` が
+  置き換えた範囲、移動、残した範囲と縮めた分の順に知らせます。変化を起こしたスレッドは、
+  イベントが読まれるか、ファイルが閉じられるか、致命的なシグナルが来るまで待ちます
+  （`TASK_KILLABLE`）。`fork` は子が動く前に待ち、イベントが読まれなかった子の
+  `userfaultfd` は子のマッピングから外れます。read はイベントより先にフォールトを取り、
+  イベントが読まれるまで `UFFDIO_COPY`、`UFFDIO_ZEROPAGE`、`UFFDIO_POISON`、
+  `UFFDIO_CONTINUE`、`UFFDIO_MOVE` は（先に最後のフィールドへ書いてから）
+  `EAGAIN`、`UFFDIO_WRITEPROTECT` も `EAGAIN` です（`mmap_changing`）。
 - `remap_file_pages` は、共有のマッピングの範囲を、そのファイルや共有メモリの別の
   ページに張り直します。Linux がマッピング自身のファイルを `mmap` し直すのと同じで、
   保護はそのままです。Linux と同じく、`prot` は 0 でなければならず、範囲は、ファイルを

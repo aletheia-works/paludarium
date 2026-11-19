@@ -72,8 +72,6 @@ pub(crate) struct Helpers {
     /// `(context, address, size, kind, a, b) -> (old, status)`: a locked
     /// exchange (`kind` 0) or compare and exchange.
     pub atomic: u64,
-    /// `(context) -> status`: of an access the code made itself.
-    pub status: u64,
 }
 
 /// Where a field of the [`Context`] is, in bytes.
@@ -113,15 +111,10 @@ struct Emitter<'a, 'b> {
     store_sig: cranelift_codegen::ir::SigRef,
     move128_sig: cranelift_codegen::ir::SigRef,
     atomic_sig: cranelift_codegen::ir::SigRef,
-    status_sig: cranelift_codegen::ir::SigRef,
     /// The addresses [`Context`] gives, loaded once.
     slots: Value,
     storing: Value,
     epoch: Value,
-    layout: Value,
-    watched: Value,
-    generation_at: Value,
-    generation: Value,
 }
 
 impl Emitter<'_, '_> {
@@ -347,41 +340,6 @@ impl Emitter<'_, '_> {
         self.b.ins().iadd(words, offset)
     }
 
-    /// The status of an access the code made itself, as the helpers give
-    /// it: whether the code generation is still the one the block was
-    /// entered under, read as [`paludarium_mmu::AddressSpace::code_generation_cached`]
-    /// does, which needs the locks, and so the call, unless the space's
-    /// watched layout is one more than its layout.
-    fn own_status(&mut self) -> Value {
-        let flags = MemFlagsData::trusted();
-        let layout = self.b.ins().atomic_load(I64, flags, self.layout);
-        let watched = self.b.ins().atomic_load(I64, flags, self.watched);
-        let expected = self.b.ins().iadd_imm_u(layout, 1);
-        let readable = self.b.ins().icmp(IntCC::Equal, watched, expected);
-        let quick = self.b.create_block();
-        let call = self.b.create_block();
-        let done = self.b.create_block();
-        let status = self.b.append_block_param(done, I64);
-        self.b.ins().brif(readable, quick, &[], call, &[]);
-        self.b.switch_to_block(quick);
-        let generation = self.b.ins().atomic_load(I64, flags, self.generation_at);
-        let same = self.b.ins().icmp(IntCC::Equal, generation, self.generation);
-        let ok = self.constant(DONE);
-        let changed = self.constant(CODE_CHANGED);
-        let quick_status = self.b.ins().select(same, ok, changed);
-        self.b.ins().jump(done, &[quick_status.into()]);
-        self.b.switch_to_block(call);
-        let callee = self.constant(self.helpers.status as i64);
-        let called = self
-            .b
-            .ins()
-            .call_indirect(self.status_sig, callee, &[self.context]);
-        let called = self.b.inst_results(called)[0];
-        self.b.ins().jump(done, &[called.into()]);
-        self.b.switch_to_block(done);
-        status
-    }
-
     /// Loads `size` bytes at `address`: the value and the status.
     fn load(&mut self, address: Value, size: u8) -> (Value, Value) {
         let size = size.min(8);
@@ -402,7 +360,11 @@ impl Emitter<'_, '_> {
             4 => self.b.ins().uload32(flags, at, 0),
             _ => self.b.ins().load(I64, flags, at, 0),
         };
-        let fast_status = self.own_status();
+        // An access the code makes itself changes no code: a slot never
+        // lets it write an executable page. A change another thread makes
+        // shows at the next call or after the block, as the interpreter
+        // sees it after the instruction.
+        let fast_status = self.constant(DONE);
         self.b
             .ins()
             .jump(done, &[loaded.into(), fast_status.into()]);
@@ -459,7 +421,7 @@ impl Emitter<'_, '_> {
         // ended sees its bytes.
         let none = self.constant(0);
         self.b.ins().store(flags, none, self.storing, 0);
-        let fast_status = self.own_status();
+        let fast_status = self.constant(DONE);
         self.b.ins().jump(done, &[fast_status.into()]);
 
         self.b.switch_to_block(undo);
@@ -1629,10 +1591,6 @@ pub(crate) fn function(
     atomic_sig.params.extend([AbiParam::new(I64); 6]);
     atomic_sig.returns.extend([AbiParam::new(I64); 2]);
     let atomic_sig = b.import_signature(atomic_sig);
-    let mut status_sig = Signature::new(CallConv::SystemV);
-    status_sig.params.push(AbiParam::new(I64));
-    status_sig.returns.push(AbiParam::new(I64));
-    let status_sig = b.import_signature(status_sig);
 
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
@@ -1646,10 +1604,6 @@ pub(crate) fn function(
     let slots = field(context!(slots));
     let storing = field(context!(storing));
     let epoch = field(context!(epoch));
-    let layout = field(context!(layout));
-    let watched = field(context!(watched));
-    let generation_at = field(context!(generation_at));
-    let generation = field(context!(generation));
     let exit = b.create_block();
     let count = b.append_block_param(exit, I64);
     let rip = b.append_block_param(exit, I64);
@@ -1666,14 +1620,9 @@ pub(crate) fn function(
         store_sig,
         move128_sig,
         atomic_sig,
-        status_sig,
         slots,
         storing,
         epoch,
-        layout,
-        watched,
-        generation_at,
-        generation,
     };
     let mut open = true;
     for (n, form) in forms.iter().enumerate() {

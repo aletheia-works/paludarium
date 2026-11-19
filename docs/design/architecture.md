@@ -163,9 +163,11 @@ slot does not allow, such as a write to a page that `mprotect`,
 own loads and stores, with their checks, which fill the slot again. It stops
 before an instruction whose load or store fails, having changed nothing for
 it, so that the interpreter runs it again and reports the fault, and after a
-load or store
-that moved the code generation on. A taken branch, `jmp`, `call` and `ret` end
-it. It returns how many instructions ran, and the interpreter goes on from the
+call into the MMU that finds the code generation moved on. An access to a
+page's bytes never moves it, as a slot never allows a write to an executable
+page; a change another thread makes meanwhile shows at the next call, or
+after the block, when the interpreter reads the generation again. A taken
+branch, `jmp`, `call` and `ret` end it. It returns how many instructions ran, and the interpreter goes on from the
 next one.
 
 When the code generation moves on, the interpreter decodes every block again,

@@ -16,8 +16,8 @@ use crate::emit::{CODE_CHANGED, DONE, FAILED, Helpers};
 
 /// What compiled code reaches guest memory through: the address space,
 /// the code generation the block was entered under, and where it finds the
-/// thread's [`paludarium_mmu::JitSlot`]s and the space's counters, which it
-/// loads and stores through without a call ([`JitAccess`]).
+/// thread's [`paludarium_mmu::JitSlot`]s, its `storing` and the space's
+/// epoch, which it loads and stores through without a call ([`JitAccess`]).
 #[repr(C)]
 pub(crate) struct Context<'a> {
     pub mem: &'a AddressSpace,
@@ -25,9 +25,6 @@ pub(crate) struct Context<'a> {
     pub slots: u64,
     pub storing: u64,
     pub epoch: u64,
-    pub layout: u64,
-    pub watched: u64,
-    pub generation_at: u64,
 }
 
 impl<'a> Context<'a> {
@@ -36,9 +33,6 @@ impl<'a> Context<'a> {
             slots,
             storing,
             epoch,
-            layout,
-            watched,
-            generation: generation_at,
         } = mem.jit_access();
         Context {
             mem,
@@ -46,9 +40,6 @@ impl<'a> Context<'a> {
             slots,
             storing,
             epoch,
-            layout,
-            watched,
-            generation_at,
         }
     }
 }
@@ -129,13 +120,6 @@ extern "sysv64" fn store128(context: *const Context<'_>, address: u64, from: *co
     }
 }
 
-/// The status of an access that compiled code made itself, when the
-/// space's code generation is not one it can read ([`JitAccess`]).
-extern "sysv64" fn status(context: *const Context<'_>) -> i64 {
-    // SAFETY: as in `load`.
-    done(unsafe { &*context })
-}
-
 /// A locked instruction's memory access: an exchange with `a` when `kind`
 /// is 0, a compare of `a` and exchange with `b` otherwise. Its result is the
 /// old value, as [`AddressSpace::atomic`] gives it to the interpreter.
@@ -182,14 +166,12 @@ pub(crate) fn helpers() -> Helpers {
     type Load128 = extern "sysv64" fn(*const Context<'static>, u64, *mut u64) -> i64;
     type Atomic = extern "sysv64" fn(*const Context<'static>, u64, u64, u64, u64, u64) -> Loaded;
     type Store128 = extern "sysv64" fn(*const Context<'static>, u64, *const u64) -> i64;
-    type Status = extern "sysv64" fn(*const Context<'static>) -> i64;
     Helpers {
         load: load as Load as usize as u64,
         store: store as Store as usize as u64,
         load128: load128 as Load128 as usize as u64,
         store128: store128 as Store128 as usize as u64,
         atomic: atomic as Atomic as usize as u64,
-        status: status as Status as usize as u64,
     }
 }
 

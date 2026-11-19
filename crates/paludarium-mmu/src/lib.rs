@@ -1825,14 +1825,8 @@ pub struct JitAccess {
     pub slots: u64,
     /// The thread's [`ThreadTlb::storing`], an `AtomicU64`.
     pub storing: u64,
-    /// The space's epoch, layout, last watched layout and code
-    /// generation ([`CodeCounters`]), each an `AtomicU64`: an access is
-    /// under the code generation [`AddressSpace::code_generation_cached`]
-    /// gives when `watched` is one more than `layout`.
+    /// The space's epoch ([`CodeCounters::epoch`]), an `AtomicU64`.
     pub epoch: u64,
-    pub layout: u64,
-    pub watched: u64,
-    pub generation: u64,
 }
 
 /// How many [`JitSlot`]s a thread has.
@@ -6952,9 +6946,6 @@ impl AddressSpace {
             slots,
             storing,
             epoch: address_of(&self.code.epoch),
-            layout: address_of(&self.code.layout),
-            watched: address_of(&self.code.watched),
-            generation: address_of(&self.code.generation),
         }
     }
     /// [`Self::read_value`] for compiled code, which then fills the page's

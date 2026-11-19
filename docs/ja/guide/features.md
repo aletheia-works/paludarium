@@ -2862,7 +2862,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `start_code` と `end_code` を 1、スタックの始まり、`wchan`、`start_data` から後の
   項目をすべて 0 として隠します。`stat` は Linux と同じく先頭から読むたびに作るので、
   同じディスクリプターでもそのときのタスクと読み手で決まります。権限を手放した読み手には
-  アドレスが隠れ、回収されたタスクは `ESRCH` です。`cmdline` と `environ` は、今メモリにある引数と環境変数の文字列で、
+  アドレスが隠れ、回収されたタスクは `ESRCH` です。ほかのプロセスの `status`、`statm`、
+  `limits`、`cmdline` も、Linux の `proc_single_show` と `proc_pid_cmdline_read` と同じく
+  読むたびに作ります。`status` の ID は開いたプロセスのユーザー名前空間から見たものです。
+  `environ` は、Linux の `environ_read` が開いたときの `mm` を読むのと同じく、開いたときの
+  アドレス空間を読むので、そのプロセスが `execve` するか終わったあとは何も読めません。`cmdline` と `environ` は、今メモリにある引数と環境変数の文字列で、
   それぞれ NUL で終わります。`comm` は名前と改行です。
 
 - `/proc/self/exe` と `/proc/self/cwd` はシンボリックリンク（0777、サイズ 0）で、それぞれ

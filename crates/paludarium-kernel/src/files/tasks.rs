@@ -252,9 +252,13 @@ pub(super) fn descriptors(task: &Task) -> Vec<(u32, super::Descriptor)> {
 }
 
 /// The contents of `status`, `statm`, `limits`, `auxv`, `cmdline`
-/// or `comm`, and the others made when opened; `None` for any other entry.
+/// or `comm`, and the others made of the task; `None` for any other entry.
 pub(super) fn content(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Option<Vec<u8>> {
-    let reader = &c.process.credentials.user;
+    text(task, entry, &c.process.credentials.user)
+}
+/// [`content`] of `entry`, the IDs in it as user namespace `reader` sees
+/// them.
+fn text(task: &Task, entry: TaskEntry, reader: &crate::users::UserNs) -> Option<Vec<u8>> {
     let public = &task.public;
     let (ignored, caught) = task.handled();
     Some(match entry {
@@ -749,6 +753,66 @@ pub(super) fn stat_file(
         } = now;
         let task = shown(&processes, view, which, reader).ok_or(Errno(3))?;
         Ok(render_stat(&task, permitted))
+    });
+    std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner))
+}
+/// Whether `entry` is one [`text_file`] makes at each read: `status`,
+/// `statm`, `limits` and `cmdline`, which Linux's `proc_single_show` and
+/// `proc_pid_cmdline_read` make from the task as it is then.
+pub(super) fn made_at_read(entry: TaskEntry) -> bool {
+    matches!(
+        entry,
+        TaskEntry::Status | TaskEntry::Statm | TaskEntry::Limits | TaskEntry::Cmdline
+    )
+}
+/// `entry` of the task (one [`made_at_read`]), opened with `flags`: made
+/// at each read from its start of the task as it is then, the IDs in it as
+/// the opener's user namespace sees them (Linux's `seq_user_ns`, the
+/// file's credentials); `ESRCH` once the task has been reaped, as Linux's
+/// `get_pid_task` finds none.
+pub(super) fn text_file(
+    c: &Context<'_>,
+    task: &Task,
+    entry: TaskEntry,
+    flags: u32,
+    stat: FileStat,
+    owner: crate::proc::Owner,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let (processes, which) = at_read(c.processes, task);
+    let opener = c.process.credentials.user.clone();
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        let AtRead {
+            processes, view, ..
+        } = AtRead::find(&processes, which)?;
+        let (_, reader) = crate::proc::caller();
+        let task = shown(&processes, view, which, reader).ok_or(Errno(3))?;
+        Ok(text(&task, entry, &opener).unwrap_or_default())
+    });
+    std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner))
+}
+/// `environ` of the task, opened with `flags`: the environment strings,
+/// read at each read from the address space it had when opened, as Linux's
+/// `environ_read` reads the `mm` its open took; nothing once that space is
+/// gone, after the task's `execve` or exit.
+pub(super) fn environ_file(
+    task: &Task,
+    flags: u32,
+    stat: FileStat,
+    owner: crate::proc::Owner,
+) -> std::sync::Arc<dyn paludarium_host::FileHandle> {
+    let memory = task.memory().cloned();
+    let start_stack = task.start_stack();
+    let text: crate::proc::Text = std::sync::Arc::new(move || {
+        let Some(memory) = &memory else {
+            return Ok(Vec::new());
+        };
+        let read = |at: u64, buf: &mut [u8]| memory.read(at, buf);
+        let (_, (start, end)) = crate::coredump::string_ranges_in(&read, start_stack);
+        let mut bytes = vec![0; usize::try_from(end - start).unwrap_or(0)];
+        if !read(start, &mut bytes) {
+            bytes.clear();
+        }
+        Ok(bytes)
     });
     std::sync::Arc::new(crate::proc::single_file(text, flags, stat, owner))
 }

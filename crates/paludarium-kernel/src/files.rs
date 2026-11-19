@@ -7179,6 +7179,17 @@ fn open_path(
                 p.to_vec(),
             ));
         }
+        if tasks::made_at_read(path.entry) {
+            let stat = file_stat.unwrap_or_else(|| crate::proc::stat(0));
+            return Ok((
+                tasks::text_file(c, &task, path.entry, flags, stat, owner),
+                p.to_vec(),
+            ));
+        }
+        if path.entry == crate::proc::TaskEntry::Environ {
+            let stat = file_stat.unwrap_or_else(|| crate::proc::stat(0));
+            return Ok((tasks::environ_file(&task, flags, stat, owner), p.to_vec()));
+        }
         if path.entry == crate::proc::TaskEntry::ClearRefs {
             return Ok((
                 tasks::clear_refs(c.processes, &task, flags, owner),

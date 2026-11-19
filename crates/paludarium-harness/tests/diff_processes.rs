@@ -865,6 +865,7 @@ mod linux {
         processes_proc_other_fd_paths => ("proc-other-fd-paths","process"),
         processes_proc_personality_wchan => ("proc-personality-wchan","process"),
         processes_proc_syscall => ("proc-syscall","process"),
+        processes_proc_at_read => ("proc-at-read","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),

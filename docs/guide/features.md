@@ -3280,6 +3280,12 @@ kernel.
   `stat` is made at each read from its start, as Linux's is, so a descriptor
   shows what the task and the reader are then: one that drops its rights
   sees the addresses hidden, and a task that has been reaped is `ESRCH`.
+  Another process's `status`, `statm`, `limits` and `cmdline` are made at
+  each read the same way, as Linux's `proc_single_show` and
+  `proc_pid_cmdline_read` make them, with the IDs in `status` as the
+  opener's user namespace sees them; `environ` reads the address space it
+  was opened on, as Linux's `environ_read` reads the `mm` its open took, so
+  nothing after the process's `execve` or exit.
   `cmdline` and `environ` are the argument and environment strings
   as they are in memory now, each ending in its NUL, and `comm` the name and a
   newline.

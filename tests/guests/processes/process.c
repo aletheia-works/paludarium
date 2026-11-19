@@ -12055,6 +12055,162 @@ static int proc_other_maps_case(void) {
     return 0;
 }
 
+/* The proc-at-read case: another process's status, statm, limits, cmdline
+   and environ, each read again from its start through the descriptor
+   opened first, as Linux makes them at each read (proc_single_show,
+   proc_pid_cmdline_read, environ_read): what the process is then, until it
+   is reaped (ESRCH); environ from the address space opened, so nothing
+   after the process's exec or exit. */
+static int par_reads(int fd, char *buffer, size_t size) {
+    if (lseek(fd, 0, SEEK_SET) < 0) return -errno;
+    long total = 0, n;
+    while (total < (long)size - 1 && (n = read(fd, buffer + total, size - 1 - (size_t)total)) > 0) total += n;
+    if (n < 0) return -errno;
+    buffer[total] = 0;
+    return (int)total;
+}
+/* The value of `name`'s line in `text`, up to `stop`, into `value`. */
+static void par_line(const char *text, const char *name, char *value, size_t size) {
+    const char *line = strstr(text, name);
+    value[0] = 0;
+    if (!line) return;
+    line += strlen(name);
+    while (*line == ' ' || *line == '\t' || *line == ':') line++;
+    size_t n = strcspn(line, " \t\n");
+    if (n >= size) n = size - 1;
+    memcpy(value, line, n);
+    value[n] = 0;
+}
+/* A text of NUL-ended strings with each NUL shown as '|'. */
+static void par_strings(char *text, int length) {
+    for (int i = 0; i < length; i++)
+        if (!text[i]) text[i] = '|';
+}
+static long par_size = -1;
+static void par_show(const char *label, const int *fds) {
+    static char buffer[65536];
+    char a[64], b[64];
+    printf("%s", label);
+    int n = par_reads(fds[0], buffer, sizeof buffer);
+    if (n < 0) {
+        printf(" status errno=%d", -n);
+    } else {
+        /* Its state once it has ended; until then it may be on its way
+           to its read or there. */
+        par_line(buffer, "Name:", a, sizeof a);
+        par_line(buffer, "State:", b, sizeof b);
+        printf(" name=%s", a);
+        if (!strcmp(label, "zombie")) printf(" state=%s", b);
+    }
+    n = par_reads(fds[1], buffer, sizeof buffer);
+    if (n < 0) {
+        printf(" statm errno=%d", -n);
+    } else {
+        long size = atol(buffer);
+        /* Grown by the mapping it adds; any size of another program. */
+        const char *grown = size > par_size ? ">" : size == par_size ? "==" : "<";
+        printf(" statm size%s", size == 0 ? "=0" : strcmp(label, "changed") ? " set" : grown);
+        if (size) par_size = size;
+    }
+    n = par_reads(fds[2], buffer, sizeof buffer);
+    if (n < 0) {
+        printf(" limits errno=%d", -n);
+    } else {
+        /* The limit it sets; the one it starts with is the runner's. */
+        par_line(buffer, "Max open files", a, sizeof a);
+        printf(" nofile%s", strcmp(label, "opened") ? "=" : "");
+        if (strcmp(label, "opened")) printf("%s", a);
+    }
+    n = par_reads(fds[3], buffer, sizeof buffer);
+    if (n < 0) {
+        printf(" cmdline errno=%d", -n);
+    } else {
+        /* Its first two strings; the third is this program's path. */
+        par_strings(buffer, n);
+        char *third = strchr(buffer, '|');
+        if (third) third = strchr(third + 1, '|');
+        if (third) third[1] = 0;
+        printf(" cmdline=%s", buffer);
+    }
+    n = par_reads(fds[4], buffer, sizeof buffer);
+    if (n < 0) {
+        printf(" environ errno=%d\n", -n);
+    } else {
+        par_strings(buffer, n);
+        printf(" environ=%s\n", buffer);
+    }
+}
+/* The child of the proc-at-read case, run as `process proc-at-read-child
+   <self> <ready> <go>`: says it is ready, changes, then runs exec-wait. */
+static int proc_at_read_child(char **argv) {
+    int ready = atoi(argv[3]), go = atoi(argv[4]);
+    char byte = 'r';
+    if (write(ready, &byte, 1) != 1 || read(go, &byte, 1) != 1) return 1;
+    prctl(PR_SET_NAME, "renamed", 0, 0, 0);
+    struct rlimit limit;
+    getrlimit(RLIMIT_NOFILE, &limit);
+    limit.rlim_cur = 100;
+    setrlimit(RLIMIT_NOFILE, &limit);
+    char *more = mmap(NULL, 64 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (more == MAP_FAILED) return 2;
+    more[0] = 1;
+    argv[1][0] = 'P';
+    environ[0][0] = 'Z';
+    byte = 'r';
+    if (write(ready, &byte, 1) != 1 || read(go, &byte, 1) != 1) return 3;
+    char *arguments[] = {"process", "exec-wait", argv[2], argv[3], argv[4], NULL};
+    char *environment[] = {"E=2", NULL};
+    execve(argv[2], arguments, environment);
+    return 4;
+}
+static int proc_at_read_case(const char *self) {
+    int ready[2], go[2];
+    if (pipe(ready) || pipe(go)) return 80;
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 81;
+    if (!kid) {
+        char ready_fd[16], go_fd[16];
+        snprintf(ready_fd, sizeof ready_fd, "%d", ready[1]);
+        snprintf(go_fd, sizeof go_fd, "%d", go[0]);
+        char *arguments[] = {"process", "proc-at-read-child", (char *)self, ready_fd, go_fd, NULL};
+        char *environment[] = {"A=1", NULL};
+        execve(self, arguments, environment);
+        _exit(90);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 82;
+    static const char *const names[] = {"status", "statm", "limits", "cmdline", "environ"};
+    int fds[5];
+    char path[64];
+    for (int i = 0; i < 5; i++) {
+        snprintf(path, sizeof path, "/proc/%d/%s", (int)kid, names[i]);
+        fds[i] = open(path, O_RDONLY);
+        if (fds[i] < 0) return 83;
+    }
+    par_show("opened", fds);
+    if (write(go[1], "g", 1) != 1 || read(ready[0], &byte, 1) != 1) return 84;
+    par_show("changed", fds);
+    if (write(go[1], "g", 1) != 1 || read(ready[0], &byte, 1) != 1) return 85;
+    par_show("execed", fds);
+    snprintf(path, sizeof path, "/proc/%d/environ", (int)kid);
+    int fresh = open(path, O_RDONLY);
+    char buffer[256];
+    int n = fresh < 0 ? -errno : par_reads(fresh, buffer, sizeof buffer);
+    if (n > 0) par_strings(buffer, n);
+    printf("execed environ opened again=%s\n", n < 0 ? "?" : buffer);
+    if (fresh >= 0) close(fresh);
+    if (write(go[1], "g", 1) != 1) return 86;
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    par_show("zombie", fds);
+    printf("status=%d\n", reaped(kid));
+    par_show("reaped", fds);
+    for (int i = 0; i < 5; i++) close(fds[i]);
+    return 0;
+}
+
 /* The proc-other-limits case: another process's statm, auxv and limits,
    and this process's own, as Linux's proc_pid_statm, auxv_read and
    proc_pid_limits make them: statm and limits for anyone, auxv for a reader
@@ -31862,6 +32018,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-io")) return proc_io_case();
     if (!strcmp(mode, "proc-personality-wchan")) return proc_personality_wchan_case();
     if (!strcmp(mode, "proc-syscall")) return proc_syscall_case();
+    if (!strcmp(mode, "proc-at-read")) return proc_at_read_case(self);
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {
@@ -32286,6 +32443,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-own-files")) return proc_own_files_cases(argc, argv);
     if (!strcmp(mode, "proc-other-files")) return proc_other_files_cases(self);
     if (!strcmp(mode, "proc-other-child") && argc >= 5) return proc_other_child(argv);
+    if (!strcmp(mode, "proc-at-read-child") && argc >= 5) return proc_at_read_child(argv);
     if (!strcmp(mode, "late-handler")) return late_handler_cases();
     if (!strcmp(mode, "futex-shared")) return futex_shared_cases();
     if (!strcmp(mode, "robust-list-after-exec")) {

@@ -8589,7 +8589,7 @@ fn a_tmpfs_mount_holds_its_files_to_its_size_and_inodes() {
 /// The files the kernel generates are on `noexec` mounts, as Linux's
 /// `/proc` and `/dev` are: an executable mapping of `/dev/zero` is `EPERM`
 /// and `mprotect` to one `EACCES`, while a file reached through a link in
-/// `/dev/fd` is on its own mount.
+/// `/dev/fd` is on its own mount; the exec checks find them `noexec` too.
 #[test]
 fn the_kernels_own_files_are_on_noexec_mounts() {
     let mut f = fixture();
@@ -8610,10 +8610,20 @@ fn the_kernels_own_files_are_on_noexec_mounts() {
     let again = f.ret(2, &[link, 0, 0]);
     let mapped = f.ret(9, &[0, 4096, 5, 2, again, 0]);
     assert!(mapped < u64::MAX - 4095, "{mapped:#x}");
-    // access(X_OK) of a generated file: EACCES, even for root.
-    let null = put(&mut f, 0xc0, b"/dev/null");
-    assert_eq!(f.ret(21, &[null, 1]), errno(Errno::EACCES));
-    assert_eq!(f.ret(21, &[null, 6]), 0);
+    // What the exec checks ask (`path_noexec`): no generated file is a
+    // regular file with an execute bit, so only the mount can say it here.
+    use crate::files::{ST_NODEV, ST_NOEXEC, ST_NOSUID, mount_says};
+    for path in [
+        &b"/proc/self/status"[..],
+        b"/proc/1/stat",
+        b"/dev/null",
+        b"/dev/pts/ptmx",
+    ] {
+        assert!(mount_says(&f.kernel.files, path, ST_NOEXEC), "{path:?}");
+        assert!(!mount_says(&f.kernel.files, path, ST_NOSUID), "{path:?}");
+        assert!(!mount_says(&f.kernel.files, path, ST_NODEV), "{path:?}");
+    }
+    assert!(!mount_says(&f.kernel.files, b"/tmp/x", ST_NOEXEC));
 }
 
 /// `statfs`'s `f_flags` for the kernel's own mounts are those Linux mounts

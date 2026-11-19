@@ -250,6 +250,7 @@
     {"name":"clear-refs","binary":"process"},
     {"name":"map-count","binary":"process"},
     {"name":"hiwater","binary":"process"},
+    {"name":"fault-around","binary":"process"},
     {"name":"maxrss","binary":"process"},
     {"name":"proc-owners","binary":"process"},
     {"name":"memory-locks","binary":"process"},

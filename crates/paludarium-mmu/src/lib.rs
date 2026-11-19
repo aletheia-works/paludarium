@@ -23,6 +23,9 @@ use paludarium_types::{Errno, GuestAddr, PAGE_SIZE, USER_ADDRESS_LIMIT};
 
 /// Number of page entries in one lower-level page table.
 pub const ENTRIES_PER_TABLE: u64 = 512;
+/// The pages a read fault maps around itself from a file's page cache
+/// (Linux's default `fault_around_bytes`, 64 KiB).
+const FAULT_AROUND_PAGES: u64 = 16;
 
 /// Lowest address handed out for mappings without a fixed address.
 pub const MMAP_MIN_ADDR: u64 = 0x10000;
@@ -3307,15 +3310,22 @@ impl AddressSpaceData {
     /// has no contents yet: one past the end of the file when the mapping
     /// was made, or one `mremap` added. What lies past the end stays zero.
     fn fill_from_file(&self, page: u64, entry: &Page) {
+        if !self.try_fill_from_file(page, entry) {
+            self.out_of_memory.store(true, Ordering::SeqCst);
+        }
+    }
+    /// [`Self::fill_from_file`], but `false` when the meter has no room for
+    /// the bytes, which are then not read.
+    fn try_fill_from_file(&self, page: u64, entry: &Page) -> bool {
         if !entry.file || entry.frame.get().is_some() {
-            return;
+            return true;
         }
         let Some((source, offset)) = self.file_at(page) else {
-            return;
+            return true;
         };
         let mut buf = vec![0; PAGE_BYTES];
         let Ok(n @ 1..) = source.read_at(offset, &mut buf) else {
-            return;
+            return true;
         };
         let bytes = FrameBytes::new(self.meter.as_ref(), || {
             page_words(&buf[..n.min(PAGE_BYTES)])
@@ -3324,8 +3334,91 @@ impl AddressSpaceData {
             // A racing fill of a shared frame may set it first.
             Some(bytes) => {
                 let _ = entry.frame.set(bytes);
+                true
             }
-            None => self.out_of_memory.store(true, Ordering::SeqCst),
+            None => false,
+        }
+    }
+    /// After a read fault on `page`, which had no entry, gives entries to
+    /// the pages around it that its file's page cache holds, as Linux's
+    /// `do_fault_around` maps them with `filemap_map_pages`: up to
+    /// [`FAULT_AROUND_PAGES`] pages from `page`'s aligned block, or from the
+    /// VMA's start if that is later, within the VMA and the page table. A
+    /// page is left out that has an entry or a marker (a uffd-wp marker, a
+    /// guard region, poison: `filemap_map_pages` maps only a `pte_none`
+    /// entry), lies past the end of the file, or is one that the file does
+    /// not hold, as a hole of a memfd; and so is a page the meter has no
+    /// room for, as nothing faults for it. Nothing is mapped around in a
+    /// VMA that `userfaultfd` watches for writes or minor faults
+    /// (`uffd_disable_fault_around`), nor in one whose memory has no
+    /// `map_pages`: private memory, a loaded program's segments (made
+    /// whole at load), System V shared memory ([`PageSource::merges`], as
+    /// `shm_vm_ops` has neither `map_pages` nor merging) and secret memory.
+    /// Like `mincore` here, every page of a file within its size is taken
+    /// to be in the page cache.
+    fn fault_around(&self, directory: &mut Directory, page: u64) {
+        let watched = Userfault::WP | Userfault::MINOR;
+        if self
+            .mapping_at(page)
+            .is_none_or(|m| m.userfault.is_some_and(|u| u.modes & watched != 0))
+        {
+            return;
+        }
+        let Some((start, end)) = self.region_at(page) else {
+            return;
+        };
+        let index = page / PAGE_SIZE % ENTRIES_PER_TABLE;
+        let table = page - index * PAGE_SIZE;
+        let into_vma = (page - start) / PAGE_SIZE;
+        let from = (index & !(FAULT_AROUND_PAGES - 1)).max(index - index.min(into_vma));
+        let to = (from + FAULT_AROUND_PAGES)
+            .min(ENTRIES_PER_TABLE)
+            .min(index + (end - page) / PAGE_SIZE);
+        for around in (from..to).map(|i| table + i * PAGE_SIZE) {
+            if around == page || !self.in_page_cache(around) {
+                continue;
+            }
+            let Some(prot) = self.mapping_at(around).map(|m| m.prot) else {
+                continue;
+            };
+            let (dir, slot) = page_index(around);
+            let table = directory.entry(dir).or_insert_with(PageTable::new);
+            let Some(entry) = table.pages.get_mut(slot).filter(|entry| entry.is_none()) else {
+                continue;
+            };
+            let new = self.page(around, prot);
+            if !self.try_fill_from_file(around, &new) {
+                continue;
+            }
+            self.recount(around, None, Some(&new));
+            *entry = Some(new);
+        }
+    }
+    /// Whether the page cache of the memory mapped at `page` holds that
+    /// page, for [`Self::fault_around`]; `false` for memory that has no
+    /// `map_pages`, and for a page with a marker.
+    fn in_page_cache(&self, page: u64) -> bool {
+        if self.uffd_marked(page) || self.guarded(page) || self.poisoned(page) {
+            return false;
+        }
+        let shared = self.shared_at(page);
+        match self.file_at(page) {
+            Some((source, offset)) => {
+                (shared.is_some()
+                    || self
+                        .mapping_at(page)
+                        .is_some_and(|m| m.kind == MappingKind::File))
+                    && !source.secret()
+                    && source.merges()
+                    && source.size().is_none_or(|size| offset < size)
+                    && source.holds(offset)
+            }
+            // Shared memory of no file is shmem's, whose page cache holds
+            // the pages any of its mappings touched.
+            None => shared.is_some_and(|shared| {
+                shared.pages.source.is_none()
+                    && shared.pages.contains(page.wrapping_add(shared.shift))
+            }),
         }
     }
     /// The space for a child `fork` makes: it shares every frame, a private
@@ -3783,10 +3876,14 @@ impl AddressSpaceData {
                 let (dir, slot) = page_index(page);
                 let table = directory.entry(dir).or_insert_with(PageTable::new);
                 if let Some(entry) = table.pages.get_mut(slot) {
-                    if entry.is_none() && matches!(access, Access::Read | Access::Fetch) {
+                    let fault = entry.is_none() && matches!(access, Access::Read | Access::Fetch);
+                    if fault {
                         faults::count();
                     }
                     self.refresh(entry, page, prot, false);
+                    if fault {
+                        self.fault_around(&mut directory, page);
+                    }
                 }
             }
         }
@@ -8961,6 +9058,62 @@ mod tests {
     }
     fn pattern(offset: u64) -> u8 {
         (offset % 251) as u8
+    }
+
+    #[test]
+    fn a_read_fault_maps_the_pages_around_it_that_the_file_holds() {
+        let size = Arc::new(AtomicU64::new(20 * PAGE_SIZE + 100));
+        let source: Arc<dyn PageSource> = Arc::new(Resizable(Arc::clone(&size)));
+        let mut space = AddressSpace::new();
+        // A page table's first page, 40 pages, of a file of 21 pages.
+        let base = GuestAddr(0x4000_0000);
+        let file = space
+            .map(Some(base), 40 * PAGE_SIZE, Prot::READ, MappingKind::File)
+            .unwrap();
+        space
+            .back_with_file(file, 40 * PAGE_SIZE, Arc::clone(&source), 0)
+            .unwrap();
+        let resident = |space: &AddressSpace| space.resident_pages().1;
+        let read = |space: &AddressSpace, page: u64| byte(space, base.0 + page * PAGE_SIZE + 1);
+        // The aligned block of 16 pages around the fault.
+        assert_eq!(read(&space, 5), pattern(5 * PAGE_SIZE + 1));
+        assert_eq!(resident(&space), 16);
+        assert_eq!(read(&space, 15), pattern(15 * PAGE_SIZE + 1));
+        assert_eq!(resident(&space), 16);
+        // The next block up to the end of the file: pages 16 to 20.
+        assert_eq!(read(&space, 17), pattern(17 * PAGE_SIZE + 1));
+        assert_eq!(resident(&space), 21);
+        // A VMA that starts inside a block takes 16 pages from its start;
+        // private memory takes none.
+        let later = space
+            .map(
+                Some(GuestAddr(0x4020_0000 + 3 * PAGE_SIZE)),
+                20 * PAGE_SIZE,
+                Prot::READ,
+                MappingKind::File,
+            )
+            .unwrap();
+        space
+            .back_with_file(later, 20 * PAGE_SIZE, Arc::clone(&source), 0)
+            .unwrap();
+        let anonymous = space
+            .map(
+                Some(GuestAddr(0x4040_0000)),
+                16 * PAGE_SIZE,
+                Prot::READ,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        byte(&space, later.0 + PAGE_SIZE);
+        assert_eq!(resident(&space), 21 + 16);
+        byte(&space, anonymous.0);
+        assert_eq!(resident(&space), 21 + 16);
+        // Each page around holds its own part of the file.
+        assert_eq!(
+            byte(&space, later.0 + 15 * PAGE_SIZE + 9),
+            pattern(15 * PAGE_SIZE + 9)
+        );
+        assert_eq!(resident(&space), 21 + 16);
     }
 
     #[test]

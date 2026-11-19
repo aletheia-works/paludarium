@@ -6618,6 +6618,131 @@ static int maxrss_case(const char *self) {
     _exit(0);
 }
 
+/* The fault-around case: a read fault in a file's mapping maps up to 16
+   pages around it that the page cache holds (mm/memory.c do_fault_around,
+   mm/filemap.c filemap_map_pages): within an aligned block of 16, the VMA,
+   the page table and the file, and only pages the cache holds (a memfd's
+   written pages, shared memory another process touched). System V shared
+   memory maps none (shm_vm_ops has no map_pages). Each mapping is put at a
+   2 MiB boundary, so that the blocks are the same on both sides. */
+static void fa_show(int pagemap, const char *label, const char *at, int pages) {
+    char line[80];
+    for (int i = 0; i < pages; i++) {
+        uint64_t entry = 0;
+        off_t where = (off_t)((uintptr_t)at / 4096 + (uintptr_t)i) * 8;
+        if (pread(pagemap, &entry, sizeof entry, where) != (ssize_t)sizeof entry) entry = 0;
+        line[i] = entry >> 63 ? '1' : '0';
+    }
+    line[pages] = 0;
+    printf("%s: %s\n", label, line);
+}
+static void fa_touch(const char *at) {
+    volatile char seen = *at;
+    (void)seen;
+}
+/* The Rss of the VMA at `at`, in kB, from smaps. */
+static long fa_rss(const char *at) {
+    FILE *smaps = fopen("/proc/self/smaps", "r");
+    if (!smaps) return -1;
+    char line[256];
+    char want[32];
+    snprintf(want, sizeof want, "%lx-", (unsigned long)(uintptr_t)at);
+    int in = 0;
+    long rss = -1;
+    while (fgets(line, sizeof line, smaps)) {
+        if (!strncmp(line, want, strlen(want))) in = 1;
+        else if (in && !strncmp(line, "Rss:", 4)) {
+            rss = atol(line + 4);
+            break;
+        }
+    }
+    fclose(smaps);
+    return rss;
+}
+static int fault_around_case(void) {
+    const long page = 4096;
+    const size_t block = (size_t)2 << 20;
+    int pagemap = open("/proc/self/pagemap", O_RDONLY);
+    if (pagemap < 0) return 80;
+    char *reserve = mmap(NULL, 8 * block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (reserve == MAP_FAILED) return 81;
+    char *base = (char *)(((uintptr_t)reserve + block - 1) & ~(uintptr_t)(block - 1));
+    /* A file of 40 pages and 100 bytes, all in the page cache. */
+    char path[] = "/tmp/paludarium-fault-around-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return 82;
+    unlink(path);
+    static char bytes[40 * 4096 + 100];
+    memset(bytes, 7, sizeof bytes);
+    if (write(fd, bytes, sizeof bytes) != (ssize_t)sizeof bytes) return 83;
+
+    int fixed = MAP_FIXED | MAP_PRIVATE;
+    char *a = mmap(base, (size_t)(48 * page), PROT_READ, fixed, fd, 0);
+    if (a == MAP_FAILED) return 84;
+    fa_touch(a + 5 * page);
+    fa_show(pagemap, "private 5", a, 48);
+    fa_touch(a + 17 * page);
+    fa_show(pagemap, "private 17", a, 48);
+    fa_touch(a + 40 * page);
+    fa_show(pagemap, "private 40", a, 48);
+    printf("private rss: %ld kB\n", fa_rss(a));
+
+    /* A VMA that starts 3 pages into a block takes 16 from its start. */
+    char *b = mmap(base + block + 3 * page, (size_t)(20 * page), PROT_READ, fixed, fd, 0);
+    if (b == MAP_FAILED) return 85;
+    fa_touch(b + page);
+    fa_show(pagemap, "inside a block", b, 20);
+
+    /* A shared mapping maps around too. */
+    char *c = mmap(base + 2 * block, (size_t)(32 * page), PROT_READ, MAP_FIXED | MAP_SHARED, fd, 0);
+    if (c == MAP_FAILED) return 86;
+    fa_touch(c + 20 * page);
+    fa_show(pagemap, "shared 20", c, 32);
+
+    /* A memfd maps the pages it holds: those written. */
+    int memfd = memfd_create("fault-around", 0);
+    if (memfd < 0) return 87;
+    if (ftruncate(memfd, 32 * page)) return 88;
+    for (int i = 0; i < 4; i++) pwrite(memfd, bytes, (size_t)page, i * page);
+    pwrite(memfd, bytes, (size_t)page, 10 * page);
+    char *d = mmap(base + 3 * block, (size_t)(32 * page), PROT_READ, MAP_FIXED | MAP_SHARED, memfd, 0);
+    if (d == MAP_FAILED) return 89;
+    fa_touch(d + page);
+    fa_show(pagemap, "memfd", d, 32);
+
+    /* Shared memory of no file maps the pages another process touched. */
+    char *e = mmap(base + 4 * block, (size_t)(16 * page), PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (e == MAP_FAILED) return 90;
+    madvise(e, (size_t)(16 * page), MADV_NOHUGEPAGE);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return 91;
+    if (child == 0) {
+        e[3 * page] = 1;
+        e[9 * page] = 1;
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
+    fa_touch(e);
+    fa_show(pagemap, "shared anonymous", e, 16);
+
+    /* System V shared memory maps none around. */
+    int id = shmget(IPC_PRIVATE, (size_t)(16 * page), IPC_CREAT | 0600);
+    if (id < 0) return 92;
+    char *f = shmat(id, base + 5 * block, SHM_REMAP);
+    char *g = shmat(id, base + 6 * block, SHM_REMAP);
+    shmctl(id, IPC_RMID, NULL);
+    if (f == (void *)-1 || g == (void *)-1) return 93;
+    f[2 * page] = 1;
+    f[5 * page] = 1;
+    fa_touch(g);
+    fa_show(pagemap, "System V", g, 16);
+    shmdt(f);
+    shmdt(g);
+    return 0;
+}
+
 /* Writes `text` to clear_refs at `fd`: what write returned, and errno. */
 static void cr_write(int fd, const char *label, const char *text, size_t len) {
     errno = 0;
@@ -32212,6 +32337,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "clear-refs")) return clear_refs_case();
     if (!strcmp(mode, "map-count")) return map_count_case();
     if (!strcmp(mode, "hiwater")) return hiwater_case();
+    if (!strcmp(mode, "fault-around")) return fault_around_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();

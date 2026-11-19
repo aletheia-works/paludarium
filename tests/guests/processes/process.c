@@ -11220,6 +11220,141 @@ static int beneath_case(void) {
     return 0;
 }
 
+/* The propagation case: mounts and unmounts under a shared tmpfs mount in
+   a temporary directory, in a mount namespace of a user namespace of its
+   own, reach its peer and its slave (Linux's propagate_mnt and
+   propagate_umount): a slave's own mount stays its own, a copy goes under
+   a mount already at its place, a file open on a copy makes the unmount
+   EBUSY, and a mount reaches the peers in another mount namespace and
+   comes back from them. Only errno values are printed. */
+static char pg_base[] = "/tmp/paludarium-propagation-XXXXXX";
+static void pg_path(char *out, const char *name) { snprintf(out, 256, "%s/%s", pg_base, name); }
+/* 0 for a path under the base that is there, else the errno. */
+static int pg_there(const char *name) {
+    char p[300];
+    snprintf(p, sizeof p, "%s/%s", pg_base, name);
+    return access(p, F_OK) ? errno : 0;
+}
+static int pg_mount(const char *name) {
+    char p[256];
+    pg_path(p, name);
+    return mt_result(mount("none", p, "tmpfs", 0, NULL));
+}
+static int pg_umount(const char *name) {
+    char p[256];
+    pg_path(p, name);
+    return mt_result(umount2(p, 0));
+}
+static void pg_touch(const char *name) {
+    char p[256];
+    pg_path(p, name);
+    mt_write_new(p, "x");
+}
+static int pg_inner(void) {
+    char m[256], p[256], s[256];
+    pg_path(m, "m");
+    pg_path(p, "p");
+    pg_path(s, "s");
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    printf("m=%d", mt_result(mount("none", m, "tmpfs", 0, NULL)));
+    char dir[300];
+    const char *dirs[] = {"d", "e", "f"};
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(dir, sizeof dir, "%s/%s", m, dirs[i]);
+        mkdir(dir, 0755);
+    }
+    printf(" shared=%d", mt_result(mount(NULL, m, NULL, MS_SHARED, NULL)));
+    printf(" peer=%d", mt_result(mount(m, p, NULL, MS_BIND, NULL)));
+    printf(" slave=%d", mt_result(mount(m, s, NULL, MS_BIND, NULL)));
+    printf(" slaved=%d\n", mt_result(mount(NULL, s, NULL, MS_SLAVE, NULL)));
+    printf("d=%d", pg_mount("m/d"));
+    pg_touch("m/d/x");
+    printf(" peer-sees=%d slave-sees=%d\n", pg_there("p/d/x"), pg_there("s/d/x"));
+    printf("own=%d", pg_mount("s/e"));
+    pg_touch("s/e/y");
+    printf(" master-sees=%d peer-sees=%d", pg_there("m/e/y"), pg_there("p/e/y"));
+    printf(" from-peer=%d", pg_mount("p/e"));
+    pg_touch("p/e/z");
+    printf(" master-sees=%d under=%d slave-top=%d\n", pg_there("m/e/z"), pg_there("s/e/z"), pg_there("s/e/y"));
+    printf("umount=%d", pg_umount("m/d"));
+    printf(" peer-sees=%d slave-sees=%d\n", pg_there("p/d/x"), pg_there("s/d/x"));
+    printf("again=%d", pg_mount("m/d"));
+    char held[300];
+    snprintf(held, sizeof held, "%s/d/f", s);
+    int fd = open(held, O_WRONLY | O_CREAT, 0644);
+    printf(" open=%d", fd < 0 ? errno : 0);
+    printf(" busy=%d", pg_umount("m/d"));
+    if (fd >= 0) close(fd);
+    printf(" umount=%d\n", pg_umount("m/d"));
+    /* Another mount namespace of the same user namespace: its copy of
+       the shared mount is a peer. */
+    int to_child[2], to_parent[2];
+    if (pipe(to_child) || pipe(to_parent)) return 91;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char c;
+        int r = mt_result(syscall(SYS_unshare, CLONE_NEWNS));
+        if (write(to_parent[1], "u", 1) != 1 || read(to_child[0], &c, 1) != 1) _exit(92);
+        printf("unshared=%d", r);
+        printf(" sees=%d", pg_there("m/d/w"));
+        printf(" mount=%d\n", pg_mount("m/f"));
+        pg_touch("m/f/v");
+        fflush(stdout);
+        if (write(to_parent[1], "m", 1) != 1 || read(to_child[0], &c, 1) != 1) _exit(92);
+        printf("gone=%d\n", pg_there("m/d/w"));
+        _exit(0);
+    }
+    char c;
+    if (read(to_parent[0], &c, 1) != 1) return 92;
+    printf("other-ns=%d", pg_mount("m/d"));
+    pg_touch("m/d/w");
+    printf("\n");
+    fflush(stdout);
+    if (write(to_child[1], "g", 1) != 1 || read(to_parent[0], &c, 1) != 1) return 92;
+    printf("back=%d", pg_there("m/f/v"));
+    printf(" umount=%d\n", pg_umount("m/d"));
+    fflush(stdout);
+    if (write(to_child[1], "g", 1) != 1) return 92;
+    printf("child=%d\n", reaped(child));
+    return 0;
+}
+static int propagation_case(void) {
+    if (!mkdtemp(pg_base)) return 93;
+    chmod(pg_base, 0755);
+    char path[256];
+    const char *dirs[] = {"m", "p", "s"};
+    for (unsigned i = 0; i < 3; i++) {
+        pg_path(path, dirs[i]);
+        mkdir(path, 0755);
+    }
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(pg_inner());
+    }
+    printf("status=%d\n", reaped(child));
+    for (unsigned i = 0; i < 3; i++) {
+        pg_path(path, dirs[i]);
+        rmdir(path);
+    }
+    printf("cleaned=%d\n", rmdir(pg_base) == 0);
+    return 0;
+}
+
 /* The proc-other-maps case: another process's maps and smaps, which Linux's
    proc_maps_open makes from its address space for a reader that
    ptrace_may_access lets read it (PTRACE_MODE_READ_FSCREDS). */
@@ -30962,6 +31097,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
+    if (!strcmp(mode, "propagation")) return propagation_case();
     if (!strcmp(mode, "mount-flags-id")) {
         printf("euid=%d egid=%d\n", (int)geteuid(), (int)getegid());
         return 0;

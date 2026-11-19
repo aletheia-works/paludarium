@@ -825,6 +825,7 @@ mod linux {
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),
         processes_beneath => ("beneath","process"),
+        processes_propagation => ("propagation","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
         processes_proc_other_maps => ("proc-other-maps","process"),
         processes_proc_other_fds => ("proc-other-fds","process"),

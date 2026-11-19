@@ -409,6 +409,51 @@ enum Backing {
     Generated(Arc<generated::GeneratedFs>),
 }
 
+/// What `propagate_mnt` adds to one table ([`NamespacedFs::propagated`]):
+/// the copies, and each mount already where a copy goes, with the copy it
+/// now goes on (`mnt_change_mountpoint`).
+struct Spread {
+    table: Arc<MountTable>,
+    added: Vec<Entry>,
+    tucked: Vec<(u64, u64)>,
+}
+impl Spread {
+    fn apply(self, entries: &mut Vec<Entry>) {
+        for (child, root) in self.tucked {
+            for e in entries.iter_mut().filter(|e| e.id() == child) {
+                e.parent = root;
+            }
+        }
+        entries.extend(self.added);
+    }
+}
+/// What `propagate_umount` takes from one table ([`NamespacedFs::umount_spread`]):
+/// the table's mounts before, the ones that go, and each mount that moves
+/// down onto the parent of one that goes, with that parent.
+struct Unmounted {
+    table: Arc<MountTable>,
+    entries: Arc<Vec<Entry>>,
+    gone: BTreeSet<u64>,
+    moved: Vec<(u64, u64)>,
+}
+/// The flags a copy into a less privileged mount namespace may not change
+/// (`lock_mnt_tree`): the access-time ones, and each of the others it has.
+fn lock_flags(flags: u32, locks: u32) -> u32 {
+    use mount_flags::*;
+    let mut locks = locks | LOCK_ATIME;
+    for (flag, lock) in [
+        (READONLY, LOCK_READONLY),
+        (NODEV, LOCK_NODEV),
+        (NOSUID, LOCK_NOSUID),
+        (NOEXEC, LOCK_NOEXEC),
+    ] {
+        if flags & flag != 0 {
+            locks |= lock;
+        }
+    }
+    locks
+}
+
 #[derive(Clone)]
 struct Entry {
     token: Arc<Token>,
@@ -628,7 +673,6 @@ impl MountTable {
     /// copies instead of a peer (`CL_SLAVE`).
     #[must_use]
     pub fn copy(&self, locked: bool) -> Arc<Self> {
-        use mount_flags::*;
         let snapshot = self.snapshot();
         // In the order `copy_tree` takes them from the namespace's root
         // (rootfs, then each mount before those on it), which their unique
@@ -670,20 +714,11 @@ impl MountTable {
                 (true, group) => (0, group),
                 (false, group) => (group, e.master),
             };
-            let mut locks = e.locks;
-            if locked {
-                locks |= LOCK_ATIME;
-                for (flag, lock) in [
-                    (READONLY, LOCK_READONLY),
-                    (NODEV, LOCK_NODEV),
-                    (NOSUID, LOCK_NOSUID),
-                    (NOEXEC, LOCK_NOEXEC),
-                ] {
-                    if e.flags & flag != 0 {
-                        locks |= lock;
-                    }
-                }
-            }
+            let locks = if locked {
+                lock_flags(e.flags, e.locks)
+            } else {
+                e.locks
+            };
             entries.push(Entry {
                 token: Token::numbered(
                     id,
@@ -1285,15 +1320,36 @@ impl NamespacedFs {
             return Err(Errno::ENOTDIR);
         }
         let parent = self.entry(&entries, &loc);
-        let mut entry = self.new_entry(new, parent.id(), loc.path);
+        let mut entry = self.new_entry(new, parent.id(), loc.path.clone());
         // `attach_recursive_mnt`: a mount on a shared one is shared too.
         if parent.group != 0 {
             entry.group = self.table.new_group();
         }
+        let tree = vec![entry];
+        let spreads = self.propagated(&entries, parent, &loc.path, &tree, &BTreeSet::new());
+        self.attached(tree, spreads)
+    }
+    /// Adds `tree` to the table, and what [`Self::propagated`] gives to
+    /// each table, this one first.
+    fn attached(&self, tree: Vec<Entry>, spreads: Vec<Spread>) -> Result<(), Errno> {
+        let (own, others): (Vec<Spread>, Vec<Spread>) = spreads
+            .into_iter()
+            .partition(|s| Arc::ptr_eq(&s.table, &self.table));
         self.table.update(|entries| {
-            entries.push(entry);
+            entries.extend(tree);
+            for spread in own {
+                spread.apply(entries);
+            }
             Ok(())
-        })
+        })?;
+        for spread in others {
+            let table = Arc::clone(&spread.table);
+            table.update(|entries| {
+                spread.apply(entries);
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
     /// `fsmount`: a mount of the new tmpfs `new` in a detached tree of its
     /// own, as [`Self::clone_tree`] makes one, named by the path this gives
@@ -1442,10 +1498,8 @@ impl NamespacedFs {
                 e.unbindable = false;
             }
         }
-        self.table.update(|entries| {
-            entries.extend(new);
-            Ok(())
-        })
+        let spreads = self.propagated(&entries, parent, &to.path, &new, &BTreeSet::new());
+        self.attached(new, spreads)
     }
     /// Takes away each detached tree whose root nothing holds any more, as
     /// the last close of `open_tree`'s descriptor does (`dissolve_on_fput`).
@@ -1818,6 +1872,17 @@ impl NamespacedFs {
             }
             Ok(())
         })?;
+        // The moved tree propagates from its new parent as a new mount does.
+        let moved = self.table.snapshot();
+        let tree: Vec<Entry> = moving
+            .iter()
+            .filter_map(|id| Self::by_id(&moved, *id).cloned())
+            .collect();
+        if let Some(dest) = Self::by_id(&moved, parent) {
+            let skip: BTreeSet<u64> = moving.iter().copied().collect();
+            let spreads = self.propagated(&moved, dest, &to.path, &tree, &skip);
+            self.attached(Vec::new(), spreads)?;
+        }
         Ok(placed)
     }
     /// `pivot_root` (`path_pivot_root`, Linux master's order), with the
@@ -1926,6 +1991,28 @@ impl NamespacedFs {
     /// without, a mount in use or with others on it is `EBUSY`
     /// (`propagate_mount_busy`). Each is made private as it goes.
     pub fn umount(&self, id: u64, detach: bool) -> Result<(), Errno> {
+        // What goes from the peers and slaves (`propagate_umount`), each
+        // with nothing on it in use unless `detach` (`propagate_mount_busy`).
+        let before = self.table.snapshot();
+        let spread = match Self::runtime_index(&before, id) {
+            Some(i)
+                if detach
+                    || !before.iter().any(|e| e.parent == id)
+                        && before[i].token.pins.load(Ordering::SeqCst) == 0 =>
+            {
+                self.umount_spread(&before, &Self::subtree(&before, id))
+            }
+            _ => Vec::new(),
+        };
+        if !detach
+            && spread.iter().any(|u| {
+                u.entries
+                    .iter()
+                    .any(|e| u.gone.contains(&e.id()) && e.token.pins.load(Ordering::SeqCst) != 0)
+            })
+        {
+            return Err(EBUSY);
+        }
         let gone = self.table.update(|entries| {
             let i = Self::runtime_index(entries, id).ok_or(Errno::EINVAL)?;
             if !detach
@@ -1958,17 +2045,162 @@ impl NamespacedFs {
             entries.retain(|e| !gone.contains(&e.id()));
             Ok((left, told))
         })?;
-        let (left, told) = gone;
+        let (mut left, told) = gone;
+        let mut tells = vec![(Arc::clone(&self.table), told)];
+        for Unmounted {
+            table, gone, moved, ..
+        } in spread
+        {
+            let removed = table.update(|entries| {
+                let removed: Vec<(u64, u64, u64)> = entries
+                    .iter()
+                    .filter(|e| gone.contains(&e.id()))
+                    .map(|e| (e.id(), e.group, e.master))
+                    .collect();
+                for e in entries.iter_mut() {
+                    if let Some((_, to)) = moved.iter().find(|(child, _)| *child == e.id()) {
+                        e.parent = *to;
+                    }
+                }
+                entries.retain(|e| !gone.contains(&e.id()));
+                Ok(removed)
+            })?;
+            left.extend(removed.iter().map(|(_, group, master)| (*group, *master)));
+            let ids: Vec<u64> = removed.iter().map(|(id, ..)| *id).collect();
+            match tells.iter_mut().find(|(t, _)| Arc::ptr_eq(t, &table)) {
+                Some((_, told)) => told.extend(ids),
+                None => tells.push((table, ids)),
+            }
+        }
         for (group, master) in left {
             self.table.numbers.left(group, master);
         }
-        let hook = lock(&self.table.unmount_hook).clone();
-        if let Some(hook) = hook
-            && !told.is_empty()
-        {
-            hook(&told);
+        for (table, told) in tells {
+            let hook = lock(&table.unmount_hook).clone();
+            if let Some(hook) = hook
+                && !told.is_empty()
+            {
+                hook(&told);
+            }
         }
         Ok(())
+    }
+    /// The mount `id` and every mount on it, and on those.
+    fn subtree(entries: &[Entry], id: u64) -> BTreeSet<u64> {
+        let mut gone = BTreeSet::from([id]);
+        loop {
+            let more: Vec<u64> = entries
+                .iter()
+                .filter(|e| gone.contains(&e.parent) && !gone.contains(&e.id()))
+                .map(Entry::id)
+                .collect();
+            if more.is_empty() {
+                return gone;
+            }
+            gone.extend(more);
+        }
+    }
+    /// What `propagate_umount` takes away with the mounts `gone` of this
+    /// table (`entries`), table by table: each with the table's mounts, the
+    /// ones that go, and the mounts that move down onto the parent of one
+    /// that goes. For each mount in `gone` on a shared parent, the mount at
+    /// the same place on each other mount the parent's peer group
+    /// propagates to goes too, once nothing is on it but what goes as
+    /// well, or a mount on its root, which takes its place
+    /// (`__propagate_umount`, `mnt_change_mountpoint`).
+    fn umount_spread(&self, entries: &Arc<Vec<Entry>>, gone: &BTreeSet<u64>) -> Vec<Unmounted> {
+        let shared: Vec<(&Entry, &Entry)> = entries
+            .iter()
+            .filter(|e| gone.contains(&e.id()))
+            .filter_map(|e| {
+                Self::by_id(entries, e.parent)
+                    .filter(|p| p.id() != e.id() && p.group != 0)
+                    .map(|p| (e, p))
+            })
+            .collect();
+        if shared.is_empty() {
+            return Vec::new();
+        }
+        let tables: Vec<(Arc<MountTable>, Arc<Vec<Entry>>)> = self
+            .table
+            .numbers
+            .tables()
+            .into_iter()
+            .map(|t| {
+                let table = t.shared();
+                let snapshot = if Arc::ptr_eq(&table, &self.table) {
+                    Arc::clone(entries)
+                } else {
+                    table.snapshot()
+                };
+                (table, snapshot)
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (table, es) in tables {
+            let mut taken = BTreeSet::new();
+            for (e, parent) in &shared {
+                let place = parent.inside(&e.point);
+                for m in es.iter().filter(|m| {
+                    m.id() != parent.id()
+                        && !gone.contains(&m.id())
+                        && !detached(&m.point)
+                        && within(&place, &m.root)
+                        && m.same_files(parent)
+                        && self.receives(m, parent.group)
+                }) {
+                    let at = joined(&m.point, &relative(&m.root, &place));
+                    taken.extend(
+                        es.iter()
+                            .filter(|c| c.parent == m.id() && c.id() != m.id() && c.point == at)
+                            .map(Entry::id),
+                    );
+                }
+            }
+            // Only those with nothing else on them.
+            let mut moved: Vec<(u64, u64)>;
+            loop {
+                moved = Vec::new();
+                let kept: Vec<u64> = taken
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        let Some(c) = Self::by_id(&es, *id) else {
+                            return false;
+                        };
+                        let on: Vec<&Entry> = es
+                            .iter()
+                            .filter(|o| {
+                                o.parent == *id && o.id() != *id && !taken.contains(&o.id())
+                            })
+                            .collect();
+                        match on.as_slice() {
+                            [] => false,
+                            [o] if o.point == c.point => {
+                                moved.push((o.id(), c.parent));
+                                false
+                            }
+                            _ => true,
+                        }
+                    })
+                    .collect();
+                if kept.is_empty() {
+                    break;
+                }
+                for id in kept {
+                    taken.remove(&id);
+                }
+            }
+            if !taken.is_empty() {
+                out.push(Unmounted {
+                    table,
+                    entries: es,
+                    gone: taken,
+                    moved,
+                });
+            }
+        }
+        out
     }
     /// `MNT_EXPIRE` of mount `id`, not in use and with no mounts on it
     /// (else `EBUSY`): the first call marks it and is `EAGAIN`, the next
@@ -2206,6 +2438,156 @@ impl NamespacedFs {
             e.flags = flags & mount_flags::SETTABLE;
             Ok(())
         })
+    }
+    /// The copies `propagate_mnt` makes of `tree`, mounts going at `point`
+    /// on `dest`, its root first and each mount before those on it: when
+    /// `dest` is shared, one for each other mount its peer group
+    /// propagates to, in this table (`entries`) and the others, whose root
+    /// holds the place (`is_subdir`), but for those in `skip` and detached
+    /// trees. A peer's copies are peers of `tree`'s mounts; a slave's are
+    /// slaves of the copies its master's peer group got (or of what that
+    /// group's own masters got, for none), and when the slave is shared,
+    /// peers of the copies its own peers get, in new peer groups
+    /// (`propagate_one`, `CL_MAKE_SHARED`, `CL_SLAVE`). A copy into a
+    /// namespace of another owner is locked (`CL_UNPRIVILEGED`). A mount
+    /// already at the place goes on the copy's root.
+    fn propagated(
+        &self,
+        entries: &Arc<Vec<Entry>>,
+        dest: &Entry,
+        point: &[u8],
+        tree: &[Entry],
+        skip: &BTreeSet<u64>,
+    ) -> Vec<Spread> {
+        let Some(top) = tree.first() else {
+            return Vec::new();
+        };
+        if dest.group == 0 {
+            return Vec::new();
+        }
+        let owner = |table: &MountTable| table.owner().map(|o| Arc::as_ptr(&o).cast::<()>());
+        let own_owner = owner(&self.table);
+        let numbers = &self.table.numbers;
+        let tables: Vec<(Arc<MountTable>, Arc<Vec<Entry>>)> = numbers
+            .tables()
+            .into_iter()
+            .map(|t| {
+                let table = t.shared();
+                let snapshot = if Arc::ptr_eq(&table, &self.table) {
+                    Arc::clone(entries)
+                } else {
+                    table.snapshot()
+                };
+                (table, snapshot)
+            })
+            .collect();
+        let place = dest.inside(point);
+        let mut spreads: Vec<Spread> = Vec::new();
+        // A level: a peer group, the masters its copies take, and their
+        // own groups once one is made.
+        struct Level {
+            group: u64,
+            masters: Vec<u64>,
+            groups: Option<Vec<u64>>,
+        }
+        let mut levels = vec![Level {
+            group: dest.group,
+            masters: tree.iter().map(|e| e.master).collect(),
+            groups: Some(tree.iter().map(|e| e.group).collect()),
+        }];
+        let mut seen = BTreeSet::from([dest.group]);
+        let mut next = 0;
+        while next < levels.len() {
+            let group = levels[next].group;
+            let receivers: Vec<(usize, Entry)> = tables
+                .iter()
+                .enumerate()
+                .flat_map(|(i, (_, es))| {
+                    es.iter()
+                        .filter(|m| {
+                            (m.group == group || m.group == 0 && m.master == group)
+                                && m.id() != dest.id()
+                                && !skip.contains(&m.id())
+                                && !detached(&m.point)
+                                && within(&place, &m.root)
+                                && m.same_files(dest)
+                        })
+                        .map(move |m| (i, m.clone()))
+                })
+                .collect();
+            for (i, m) in receivers {
+                let (table, es) = &tables[i];
+                let level = &mut levels[next];
+                let (groups, masters): (Vec<u64>, Vec<u64>) = if m.group == group {
+                    let groups = level
+                        .groups
+                        .get_or_insert_with(|| {
+                            tree.iter().map(|_| self.table.new_group()).collect()
+                        })
+                        .clone();
+                    (groups, level.masters.clone())
+                } else {
+                    // A slave of no peer group of its own.
+                    let masters = level
+                        .groups
+                        .clone()
+                        .unwrap_or_else(|| level.masters.clone());
+                    (vec![0; tree.len()], masters)
+                };
+                let at = joined(&m.point, &relative(&m.root, &place));
+                let locked = owner(table) != own_owner;
+                let mut ids = BTreeMap::new();
+                let mut added = Vec::with_capacity(tree.len());
+                for (k, e) in tree.iter().enumerate() {
+                    let parent = if k == 0 { m.id() } else { ids[&e.parent] };
+                    let point = joined(&at, &relative(&top.point, &e.point));
+                    let mut copy = e.cloned(numbers, e.root.clone(), parent, point, false);
+                    copy.group = groups[k];
+                    copy.master = masters[k];
+                    copy.unbindable = false;
+                    if locked {
+                        copy.locked = true;
+                        copy.locks = lock_flags(copy.flags, copy.locks);
+                    }
+                    ids.insert(e.id(), copy.id());
+                    added.push(copy);
+                }
+                let root = added[0].id();
+                let tucked = es
+                    .iter()
+                    .filter(|c| c.parent == m.id() && c.id() != m.id() && c.point == at)
+                    .map(|c| (c.id(), root))
+                    .collect();
+                spreads.push(Spread {
+                    table: Arc::clone(table),
+                    added,
+                    tucked,
+                });
+            }
+            // The shared slaves of the group: each group a level of its own.
+            let below: Vec<u64> = tables
+                .iter()
+                .flat_map(|(_, es)| es.iter())
+                .filter(|m| m.master == group && m.group != 0)
+                .map(|m| m.group)
+                .collect();
+            for slave in below {
+                if seen.insert(slave) {
+                    let level = &levels[next];
+                    let masters = level
+                        .groups
+                        .clone()
+                        .unwrap_or_else(|| level.masters.clone());
+                    levels.push(Level {
+                        group: slave,
+                        masters,
+                        groups: None,
+                    });
+                }
+            }
+            next += 1;
+        }
+        spreads
     }
     /// Whether the peer group `group` propagates to `to`: `to` is in it,
     /// or a master up `to`'s chain of masters is (`propagation_would_overmount`).

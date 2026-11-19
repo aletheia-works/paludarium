@@ -1701,6 +1701,19 @@ kernel.
   is a peer of the mount it copies, or with another user namespace a slave
   of it. A mount that is unmounted, or whose namespace ends, leaves its
   peer group the same way.
+- A mount, a bind mount or a move onto a shared mount propagates as
+  Linux's `propagate_mnt` makes it: each other mount its peer group
+  reaches (its peers, its slaves and theirs, in every mount namespace)
+  whose root holds the place gets a copy of the new mounts there. A
+  peer's copies are peers of the new mounts; a slave's are slaves of
+  them, and shared in new peer groups when the slave is. A copy into a
+  namespace of another user namespace is locked, and a mount already at
+  the place goes on the copy's root. An unmount under a shared mount
+  takes away the mount at the same place on each of those, as
+  `propagate_umount` does, but one that has other mounts on it (a mount on
+  its root takes its place); without `MNT_DETACH`, a file open on one of
+  them makes the unmount `EBUSY` (`propagate_mount_busy`). A slave's own
+  mounts reach its own slaves, not its master.
 - `mount` with `MS_MOVE` moves a mount, as Linux master's `do_move_mount`
   checks it: a source (`EINVAL` for none or an empty one), looked up with
   its last link followed, at a mount's root (`EINVAL`), a directory onto a

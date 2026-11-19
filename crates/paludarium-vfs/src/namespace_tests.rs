@@ -1218,3 +1218,110 @@ fn a_bind_without_recursion_shows_the_directory_a_boot_mount_covers() {
     // The source itself is unchanged.
     assert_eq!(names(&fs, b"/data"), [b"x".to_vec()]);
 }
+
+/// Whether a file of the content `text` is at `path`.
+fn holds(fs: &NamespacedFs, path: &[u8], text: &[u8]) -> bool {
+    let Ok(file) = fs.open(path, 0, 0) else {
+        return false;
+    };
+    let mut buf = vec![0; text.len() + 1];
+    let n = file.read(&mut buf).unwrap();
+    &buf[..n] == text
+}
+
+#[test]
+fn a_mount_on_a_shared_mount_propagates_to_its_peers_and_slaves() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d", 0o755).unwrap();
+    let m = fs.target(b"/tmp/m").unwrap().id;
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    for dir in [&b"/tmp/p"[..], b"/tmp/s"] {
+        fs.mkdir(dir, 0o755).unwrap();
+        fs.bind(b"/tmp/m", dir, false).unwrap();
+    }
+    let s = fs.target(b"/tmp/s").unwrap().id;
+    fs.change_type(s, Propagation::Slave, false).unwrap();
+    // A mount on the master shows on its peer and on its slave.
+    fs.mount(b"/tmp/m/d", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/d/x", 66, 0o644)
+        .unwrap()
+        .write(b"ex")
+        .unwrap();
+    assert!(holds(&fs, b"/tmp/p/d/x", b"ex"));
+    assert!(holds(&fs, b"/tmp/s/d/x", b"ex"));
+    let at_m = tags(&fs, b"/tmp/m/d");
+    assert_eq!(tags(&fs, b"/tmp/p/d"), at_m);
+    assert_eq!(tags(&fs, b"/tmp/s/d"), at_m.replace("shared", "master"));
+    // An unmount there takes the copies away.
+    let d = fs.target(b"/tmp/m/d").unwrap().id;
+    fs.umount(d, false).unwrap();
+    assert!(fs.mounts().iter().all(|l| !l.path.ends_with(b"/d")));
+    // A slave's own mount does not go back to its master.
+    fs.mount(b"/tmp/s/d", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/s/d/y", 66, 0o644).unwrap();
+    assert!(fs.metadata(b"/tmp/m/d/y", false).is_err());
+    assert!(fs.metadata(b"/tmp/p/d/y", false).is_err());
+}
+
+#[test]
+fn a_mount_propagates_into_a_copy_of_the_namespace() {
+    let (lower, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d", 0o755).unwrap();
+    let m = fs.target(b"/tmp/m").unwrap().id;
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    let peer = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(false));
+    let slave = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(true));
+    fs.mount(b"/tmp/m/d", tmpfs(0)).unwrap();
+    fs.open(b"/tmp/m/d/x", 66, 0o644)
+        .unwrap()
+        .write(b"ex")
+        .unwrap();
+    assert!(holds(&peer, b"/tmp/m/d/x", b"ex"));
+    assert!(holds(&slave, b"/tmp/m/d/x", b"ex"));
+    assert_eq!(
+        tags(&slave, b"/tmp/m/d"),
+        tags(&fs, b"/tmp/m/d").replace("shared", "master")
+    );
+    // A mount in the peer comes back; the slave's stays its own.
+    peer.mkdir(b"/tmp/m/e", 0o755).unwrap();
+    peer.mount(b"/tmp/m/e", tmpfs(0)).unwrap();
+    assert_eq!(tags(&fs, b"/tmp/m/e"), tags(&peer, b"/tmp/m/e"));
+    slave.mkdir(b"/tmp/m/f", 0o755).unwrap();
+    slave.mount(b"/tmp/m/f", tmpfs(0)).unwrap();
+    assert!(fs.mounts().iter().all(|l| l.path != b"/tmp/m/f"));
+    // An unmount goes to each copy.
+    let d = fs.target(b"/tmp/m/d").unwrap().id;
+    fs.umount(d, true).unwrap();
+    for other in [&peer, &slave] {
+        assert!(other.mounts().iter().all(|l| l.path != b"/tmp/m/d"));
+    }
+}
+
+#[test]
+fn a_propagated_unmount_leaves_a_busy_or_covered_copy() {
+    let (_, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d", 0o755).unwrap();
+    let m = fs.target(b"/tmp/m").unwrap().id;
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    fs.mkdir(b"/tmp/p", 0o755).unwrap();
+    fs.bind(b"/tmp/m", b"/tmp/p", false).unwrap();
+    let p = fs.target(b"/tmp/p").unwrap().id;
+    fs.change_type(p, Propagation::Slave, false).unwrap();
+    fs.mount(b"/tmp/m/d", tmpfs(0)).unwrap();
+    // A file open on the copy keeps the unmount from happening.
+    fs.open(b"/tmp/p/d/f", 66, 0o644).unwrap();
+    let held = fs.mount_writer(b"/tmp/p/d/f", true);
+    let d = fs.target(b"/tmp/m/d").unwrap().id;
+    assert!(held.is_some());
+    assert_eq!(fs.umount(d, false), Err(EBUSY));
+    drop(held);
+    // A mount on the copy keeps the copy there.
+    fs.mkdir(b"/tmp/p/d/e", 0o755).unwrap();
+    fs.mount(b"/tmp/p/d/e", tmpfs(0)).unwrap();
+    fs.umount(d, false).unwrap();
+    assert!(fs.mounts().iter().any(|l| l.path == b"/tmp/p/d"));
+    assert!(fs.mounts().iter().all(|l| l.path != b"/tmp/m/d"));
+}

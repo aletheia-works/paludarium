@@ -614,10 +614,8 @@ verified.
   gives it an anonymous namespace of its own: after an
   `unshare(CLONE_NEWNS)` its descriptor no longer reaches it, and only a
   tree from the caller's namespace attaches. It goes at the next change of
-  the mounts after its descriptor's last close, not at the close. Propagation types are kept and shown, but nothing
-  propagates: a mount or an unmount under a shared mount does not reach
-  its peers and slaves, as Linux's `propagate_mnt` and `propagate_umount`
-  make it, so a peer of it shows no copy. The mounts from start-up are
+  the mounts after its descriptor's last close, not at the close. A detached tree gets no copy of
+  a mount propagated to its peers. The mounts from start-up are
   private, where Linux's root is often shared (`shared:1`, and `master:1`
   in a mount namespace of another user namespace). Peer group numbers
   count from 1 among this machine's mounts alone, where Linux's are

@@ -8,7 +8,8 @@
 //! superblock (`MS_REMOUNT`) or a mount's flags alone (`MS_REMOUNT |
 //! MS_BIND`), and changes a mount's propagation type (`MS_SHARED`,
 //! `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE`, with `MS_REC` the mounts on
-//! it too), which mountinfo shows; nothing propagates between peers. It
+//! it too), which mountinfo shows; a mount or an unmount under a shared
+//! mount reaches its peers and slaves, in every namespace. It
 //! moves a mount and those on it (`MS_MOVE`), and `pivot_root` puts the
 //! old root under a new one; both take the roots and working directories
 //! of the processes along. Read-only mounts and superblocks refuse writes

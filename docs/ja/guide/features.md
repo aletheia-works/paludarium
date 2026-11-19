@@ -1921,6 +1921,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     どちらかの端の `RTM_DELLINK` は両端を消し、どちらかの名前空間がなくなるときも
     （その `RTM_DELNSID` の後で）両端が消えます。`unregister_netdevice_many_notify` と
     同じく、上がっている端をすべて閉じてから、それぞれが消えたことを伝えます。
+  - **veth の端の netconf:** それぞれの端の設定は、その名前空間に伝えます（`RTNLGRP_IPV4_NETCONF`、
+    `RTNLGRP_IPV6_NETCONF`。`inetdev_init`、`ipv6_add_dev` とその後始末が伝えるのと
+    同じです）。増えるときは IPv4 の、それから IPv6 の設定のすべての `RTM_NEWNETCONF` を
+    その `RTM_NEWLINK` の前に、消えるときはそれぞれの `RTM_DELNETCONF` をその
+    `RTM_DELLINK` の前に伝えます。MTU が 1280 より小さい端には IPv6 がないので、
+    IPv4 のものだけです。移すときは、離れる名前空間の `RTM_NEWNSID` と `RTM_DELLINK` の
+    前に設定が消えたことを伝え、端は移った先の名前空間の `default` の設定を取り、それを
+    そこでの `RTM_NEWLINK` の前に伝えます。
   - **名前空間の ID:** Linux の `net_namespace.c` と同じく、`RTM_NEWNSID` は、
     プロセス（`NETNSA_PID`、なければ `ESRCH`）か `/proc/<pid>/ns/net` の記述子
     （`NETNSA_FD`、`EBADF`、ほかのファイルなら `EINVAL`）のネットワーク名前空間に
@@ -2208,9 +2216,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `NUD_NOARP` です。`lo` を落とすと、新しいものから順に `RTM_DELNEIGH` で伝えます
     （`fib_disable_ip` と `rt6_disable_ip` が消すのと同じく、IPv4 のものは `RTM_NEWLINK`
     のあと、IPv6 のものはその経路のあとでアドレスの前）。IPv4 のものは、最後の IPv4 の
-    アドレスがなくなったときにも伝えます。netconf の通知（`RTNLGRP_IPV4_NETCONF`、
-    `RTNLGRP_IPV6_NETCONF`）は来ません。Linux も、デバイスが増えるか消えるとき、または
-    転送の sysctl に書いたときにしか送りません。
+    アドレスがなくなったときにも伝えます。`lo` の変化では netconf の通知
+    （`RTNLGRP_IPV4_NETCONF`、`RTNLGRP_IPV6_NETCONF`）は来ません。Linux も、デバイスが
+    増えるか消えるとき（上の veth ペア）か、`/proc/sys/net` の設定が変わったとき（下）に
+    しか送りません。どれも、ファミリーと `NETCONFA_IFINDEX`（`all` は -1、`default` は
+    -2）と伝える設定を持つ `netconfmsg` で、ポートとシーケンス番号は 0 です。増える
+    デバイスでは、`inet_netconf_fill_devconf` と（`CONFIG_IPV6_MROUTE` のある
+    カーネルの）`inet6_netconf_fill_devconf` と同じく、IPv4 の転送、逆経路のフィルター、
+    マルチキャストとブロードキャストの転送、プロキシ ARP、リンクの落ちた経路を無視する
+    設定と、IPv6 の転送、マルチキャストの転送、プロキシ NDP、最後のものを伝えます。
 - 汎用 netlink のソケット（プロトコル `NETLINK_GENERIC`）は自分のポートを持つので、
   `NETLINK_ROUTE` のソケットもプロセスの ID に bind していても、同じくプロセスの ID に
   bind します。ファミリーは、ほかを入れずに作ったカーネルと同じく、コントローラの `nlctrl`
@@ -2799,7 +2813,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
 - `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
-  `default`、デバイスごと（`lo`）に持つのと同じく、開いたプロセスのネットワーク名前空間の
+  `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
   設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
   `ipv6/conf/<デバイス>/disable_ipv6` と `forwarding` です。ファイルとディレクトリは、
   ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
@@ -2813,12 +2827,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - IPv4 の `forwarding`（`ip_forward` は `all` のもの）には、書き手の `CAP_NET_ADMIN` が
     要ります（`EPERM`、`devinet_sysctl_forward`）。`all` のものが変わると、`default` と
     すべてのデバイスのものも変わります。`default` のものはどのデバイスにも及びません。
+    変えた書き込みは、`RTNLGRP_IPV4_NETCONF` のメンバーにその転送の `RTM_NEWNETCONF` で
+    伝えます。`all` のものなら `all`、`default`、すべてのデバイスの順に、`default` か
+    デバイスのものならそれだけです。
   - デバイスに設定した `rp_filter` はそのデバイスのものになります。`default` に設定すると、
     まだ設定していないすべてのデバイスに及びます。失敗した書き込みでも、設定したことに
-    なります（`devinet_conf_proc`）。
+    なります（`devinet_conf_proc`）。値を変えた書き込みは、書いた先のものだけを伝え、
+    `default` のものを取ったデバイスのものは伝えません。
   - IPv6 の 2 つは、Linux master の `addrconf_sysctl_forward` と `addrconf_sysctl_disable`、
     そして CI のカーネルと同じく、正しくない値を `EINVAL` で知らせます（7.0 は知らせず、
     `all` かデバイスの `forwarding` は 1 を返しました）。`all` のものは `default` とすべてのデバイスのものを変えます。
+    `forwarding` は、`addrconf_fixup_forwarding` と同じく、入るか切れるときだけ
+    `RTNLGRP_IPV6_NETCONF` のメンバーに伝えます（1 から 2 では伝えません）。`all` の
+    ものでは、`default`、切り替わったデバイスのもの、`all` 自身の順です。
+    `disable_ipv6` はこうして伝えることはありません。
     デバイスの `disable_ipv6` を入れると、そのデバイスは IPv6 のアドレスと経路を失い、
     落ちたときと同じく知らせます（`addrconf_ifdown`）。上がっている間に切ると、
     `NETDEV_UP` と同じく `::1` が戻り、IPv6 自身の `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を

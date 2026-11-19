@@ -1072,7 +1072,12 @@ impl NetFile {
                 };
                 match parsed {
                     Ok((value, consumed)) => {
-                        crate::netconf::set_forwarding(&mut self.network.devices(), target, value);
+                        let told = crate::netconf::set_forwarding(
+                            &mut self.network.devices(),
+                            target,
+                            value,
+                        );
+                        crate::netlink::devconf::tell(&self.network, told);
                         advance(position, consumed)
                     }
                     Err(true) => advance(position, buf.len()),
@@ -1080,11 +1085,12 @@ impl NetFile {
                 }
             }
             Net::RpFilter(target) => {
-                crate::netconf::set_rp_filter(
+                let told = crate::netconf::set_rp_filter(
                     &mut self.network.devices(),
                     target,
                     parsed.ok().map(|(value, _)| value),
                 );
+                crate::netlink::devconf::tell(&self.network, told);
                 match parsed {
                     Ok((_, consumed)) => advance(position, consumed),
                     Err(true) => advance(position, buf.len()),
@@ -1101,7 +1107,9 @@ impl NetFile {
                     Err(false) => return Err(Errno::EINVAL),
                 };
                 if let Net::Forwarding6(_) = self.file {
-                    crate::netconf::set_forwarding6(&mut self.network.devices(), target, value);
+                    let told =
+                        crate::netconf::set_forwarding6(&mut self.network.devices(), target, value);
+                    crate::netlink::devconf::tell(&self.network, told);
                 } else {
                     let changed = crate::netconf::set_disable_ipv6(
                         &mut self.network.devices(),

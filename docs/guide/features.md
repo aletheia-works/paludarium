@@ -2192,6 +2192,16 @@ kernel.
     takes both, and so does the namespace of either going (after its
     `RTM_DELNSID`); as `unregister_netdevice_many_notify` does, every end
     that is up is closed before either is told gone.
+  - **Netconf of veth ends:** each end's settings
+    are told of in its namespace (`RTNLGRP_IPV4_NETCONF`,
+    `RTNLGRP_IPV6_NETCONF`, as `inetdev_init`, `ipv6_add_dev` and their
+    undoing tell them): as it comes, `RTM_NEWNETCONF` of all of IPv4's and
+    then IPv6's, before its `RTM_NEWLINK`; as it goes, `RTM_DELNETCONF` of
+    each, before its `RTM_DELLINK`. An end whose MTU is below 1280 has no
+    IPv6, and so only IPv4's. A move tells them gone before the leaving
+    namespace's `RTM_NEWNSID` and `RTM_DELLINK`, and the end takes the
+    entered namespace's `default` settings, told of there before its
+    `RTM_NEWLINK`.
   - **Namespace IDs:** as Linux's `net_namespace.c`, `RTM_NEWNSID` gives
     the network namespace of a process (`NETNSA_PID`, `ESRCH` for none) or
     of a `/proc/<pid>/ns/net` descriptor (`NETNSA_FD`, `EBADF`, or `EINVAL`
@@ -2542,9 +2552,17 @@ kernel.
     down (IPv4's after `RTM_NEWLINK`, IPv6's after its routes and before
     its addresses, as `fib_disable_ip` and `rt6_disable_ip` flush them) and
     IPv4's when it loses its last IPv4 address. No netconf notification
-    (`RTNLGRP_IPV4_NETCONF`, `RTNLGRP_IPV6_NETCONF`) comes, as on Linux,
-    which sends one only as a device comes or goes or a forwarding sysctl
-    is written.
+    (`RTNLGRP_IPV4_NETCONF`, `RTNLGRP_IPV6_NETCONF`) comes of `lo`'s
+    changes, as on Linux, which sends one only as a device comes or goes
+    (veth pairs, above) or a setting in `/proc/sys/net` changes (below).
+    Each is a `netconfmsg` with its family, `NETCONFA_IFINDEX` (-1 for
+    `all`, -2 for `default`) and the settings told of, of port and
+    sequence number 0: for a device that comes, IPv4's forwarding,
+    reverse path filter, multicast and broadcast forwarding, proxy ARP and
+    ignoring routes with their link down, and IPv6's forwarding,
+    multicast forwarding, proxy NDP and the last, as
+    `inet_netconf_fill_devconf` and `inet6_netconf_fill_devconf` (of a
+    kernel with `CONFIG_IPV6_MROUTE`) give them.
 - A generic netlink socket (protocol `NETLINK_GENERIC`) has its own ports,
   so it binds to the process's ID as a `NETLINK_ROUTE` socket does too,
   and its one family is the controller, `nlctrl` (family ID 16), as in a
@@ -3229,7 +3247,7 @@ kernel.
   them.
 - `/proc/sys/net` has the settings of the opener's network namespace, as
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
-  `all`, `default` and each device (`lo`): `ipv4/ip_forward`,
+  `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
   `ipv6/conf/<device>/disable_ipv6` and `forwarding`. They and their
   directories belong to the root of the user namespace that owns the
@@ -3244,15 +3262,23 @@ kernel.
   - IPv4's `forwarding` (`ip_forward` is `all`'s) needs `CAP_NET_ADMIN`
     of the writer (`EPERM`, `devinet_sysctl_forward`); `all`'s, when it
     changes, sets `default`'s and every device's, while `default`'s
-    reaches no device.
+    reaches no device. A write that changes one is told to the members of
+    `RTNLGRP_IPV4_NETCONF` with `RTM_NEWNETCONF` of its forwarding: of
+    `all`'s, then `default`'s and every device's, of `default`'s or of a
+    device's alone.
   - `rp_filter` set on a device stays its own; one set on `default` goes
     to every device that has not been set, even by a write that failed
-    (`devinet_conf_proc`).
+    (`devinet_conf_proc`). A write that changes it tells of the one written
+    to alone, not of the devices that take `default`'s.
   - IPv6's two report a bad value (`EINVAL`), as Linux master's
     `addrconf_sysctl_forward` and `addrconf_sysctl_disable` do and the CI
     kernel does (7.0's left it unreported and had `forwarding` of `all` or
     a device return 1). `all`'s sets
-    `default`'s and every device's. A device whose `disable_ipv6` turns
+    `default`'s and every device's. `forwarding` is told of to the members
+    of `RTNLGRP_IPV6_NETCONF` only as it turns on or off (from 1 to 2 tells
+    nothing), as `addrconf_fixup_forwarding` does: of `all`'s, `default`'s
+    first, then each device's that turns, then `all`'s own;
+    `disable_ipv6` is told of so by nothing. A device whose `disable_ipv6` turns
     on loses its IPv6 addresses and routes, told of as when it goes down
     (`addrconf_ifdown`); turning off while it is up gives `::1` back, and
     IPv6's own `RTM_NEWLINK` (`RTNLGRP_IPV6_IFINFO`), as `NETDEV_UP`

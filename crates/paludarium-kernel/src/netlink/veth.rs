@@ -295,6 +295,17 @@ fn tell(own: &Arc<Network>, to: &Arc<Network>, notices: &mut Vec<Notice>, list: 
     }
 }
 
+/// Sends `network`'s netconf notifications of `told` through `notices`
+/// ([`super::devconf`]), as [`tell`] does.
+fn tell_netconf(
+    own: &Arc<Network>,
+    network: &Arc<Network>,
+    notices: &mut Vec<Notice>,
+    told: Vec<crate::netconf::Told>,
+) {
+    tell(own, network, notices, super::devconf::notices(told));
+}
+
 /// A random Ethernet address, unicast and locally administered
 /// (`eth_random_addr`), from a sequence of the emulator's own.
 fn random_mac() -> [u8; 6] {
@@ -480,7 +491,11 @@ pub(super) fn newlink(
         peer_asked,
     )?;
     let peer_index = peer.index;
+    // `register_netdevice` tells of its settings (`NETDEV_REGISTER`), and
+    // `rtnl_configure_link` then of the end.
+    let settings = crate::netconf::registered(&peer);
     peer_net.devices().add(peer, peer_asked > 0);
+    tell_netconf(own, &peer_net, notices, settings);
     let list = told(&peer_net, peer_index, RTM_NEWLINK, u32::MAX, false);
     tell(own, &peer_net, notices, list);
     // Then the first end.
@@ -490,6 +505,7 @@ pub(super) fn newlink(
         Err(e) => {
             let gone = peer_net.devices().remove(peer_index);
             if let Some(gone) = gone {
+                tell_netconf(own, &peer_net, notices, crate::netconf::unregistered(&gone));
                 let list = told_of(&peer_net, &gone, RTM_DELLINK, u32::MAX, true);
                 tell(own, &peer_net, notices, list);
             }
@@ -497,7 +513,9 @@ pub(super) fn newlink(
         }
     };
     let first_index = first.index;
+    let settings = crate::netconf::registered(&first);
     target.devices().add(first, index > 0);
+    tell_netconf(own, &target, notices, settings);
     let tie = |network: &Network, index: i32, peer: Peer| {
         if let Some(v) = network
             .devices()
@@ -648,7 +666,8 @@ fn switch(
 /// Takes the devices of `gone`, each out of its namespace, away as
 /// `unregister_netdevice_many_notify` does: each up is closed first, told
 /// of with `IFF_UP` and `IFF_RUNNING` changed (`netif_close_many`), and
-/// only then is each told of with `RTM_DELLINK`, in their order.
+/// only then is each told of, in their order, with `RTM_DELNETCONF` of
+/// its settings (`NETDEV_UNREGISTER`) and then `RTM_DELLINK`.
 fn unregister(
     own: &Arc<Network>,
     mut gone: Vec<(Arc<Network>, Device)>,
@@ -670,6 +689,7 @@ fn unregister(
         }
     }
     for (network, device) in &gone {
+        tell_netconf(own, network, notices, crate::netconf::unregistered(device));
         let list = told_of(network, device, RTM_DELLINK, u32::MAX, true);
         tell(own, network, notices, list);
     }
@@ -782,11 +802,14 @@ fn with_new_netns(mut message: Vec<u8>, nsid: i32, new_index: i32) -> Vec<u8> {
 /// Moves `network`'s veth end `index` to `to` (`__dev_change_net_namespace`):
 /// `EEXIST` where `to` has a device of its name. It keeps its index in
 /// `to`, or takes the next free (`dev_index_reserve`); closed first if up
-/// (`netif_close`, told of with `IFF_UP` and `IFF_RUNNING` changed), it
+/// (`netif_close`, told of with `IFF_UP` and `IFF_RUNNING` changed), its
+/// settings go (`RTM_DELNETCONF`, as `NETDEV_UNREGISTER` takes them), it
 /// gives `to` an ID where it is (`peernet2id_alloc`), is told of there
 /// with `RTM_DELLINK`, carrying that ID and its new index, loses its
-/// queueing discipline and is told of with `RTM_NEWLINK` in `to`; its
-/// peer names it there.
+/// queueing discipline, takes `to`'s `default` settings, told of with
+/// `RTM_NEWNETCONF` there (`NETDEV_REGISTER`, `inetdev_init` and
+/// `ipv6_add_dev` copying them), and is told of with `RTM_NEWLINK` in
+/// `to`; its peer names it there.
 pub(super) fn move_to(
     own: &Arc<Network>,
     network: &Arc<Network>,
@@ -814,7 +837,7 @@ pub(super) fn move_to(
     let Some(mut device) = network.devices().by_index(index).cloned() else {
         return Err(super::ENODEV);
     };
-    let mut list = Vec::new();
+    let mut list = super::devconf::notices(crate::netconf::unregistered(&device));
     let nsid = nsid::link_netnsid(network, to, &mut list).unwrap_or(-1);
     let (message, more) = link_message(
         network,
@@ -841,7 +864,15 @@ pub(super) fn move_to(
         v.opened = false;
     }
     let peer = device.veth.as_ref().and_then(|v| v.peer.clone());
-    to.devices().add(device, new_index == index);
+    let settings = {
+        let mut devices = to.devices();
+        device.conf4 = devices.default4;
+        device.conf6 = devices.default6;
+        let settings = crate::netconf::registered(&device);
+        devices.add(device, new_index == index);
+        settings
+    };
+    tell_netconf(own, to, notices, settings);
     if let Some(peer) = peer
         && let Some(n) = peer.network.upgrade()
     {
@@ -927,6 +958,95 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Each link and netconf notice's group, type and index.
+    fn told_in_order(notices: &[Notice]) -> Vec<(u32, u16, i32)> {
+        notices
+            .iter()
+            .filter(|n| n.group != nsid::RTNLGRP_NSID)
+            .map(|n| {
+                let b = &n.bytes;
+                // The index after an `ifinfomsg`'s family and type, or a
+                // `netconfmsg` and `NETCONFA_IFINDEX`'s header.
+                let at = if n.group == RTNLGRP_LINK { 20 } else { 24 };
+                (
+                    n.group,
+                    u16::from_le_bytes([b[4], b[5]]),
+                    i32::from_le_bytes(b[at..at + 4].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_end_tells_of_its_settings_as_it_comes_and_goes() {
+        const V4: u32 = 24;
+        const V6: u32 = 25;
+        const NEW: u16 = 80;
+        const DEL: u16 = 81;
+        let a = Arc::new(Network::isolated(crate::users::first()));
+        let b = Arc::new(Network::isolated(crate::users::first()));
+        // The first end's MTU is too small for IPv6 (`ipv6_add_dev`).
+        let mtu = 1279u32.to_le_bytes();
+        let (made, notices) = create(&a, &pair(b"va", 1000, b"vb", 1001, &[(IFLA_MTU, &mtu)]));
+        assert_eq!(made, Ok(Some(())));
+        let link = RTNLGRP_LINK;
+        assert_eq!(
+            told_in_order(&notices),
+            [
+                (V4, NEW, 1001),
+                (V6, NEW, 1001),
+                (link, RTM_NEWLINK, 1001),
+                (V4, NEW, 1000),
+                (link, RTM_NEWLINK, 1000),
+            ]
+        );
+        // A move: its settings go before the ID and the `RTM_DELLINK`,
+        // and it takes B's `default` ones, told of before it is.
+        b.devices().default4.forwarding = 1;
+        let mut notices = Vec::new();
+        move_to(&a, &a, 1001, &b, &mut notices).unwrap();
+        assert_eq!(
+            told_in_order(&notices),
+            [
+                (V4, DEL, 1001),
+                (V6, DEL, 1001),
+                (link, RTM_DELLINK, 1001),
+                (V4, NEW, 1001),
+                (V6, NEW, 1001),
+                (link, RTM_NEWLINK, 1001),
+            ]
+        );
+        let gone = notices.iter().position(|n| n.group == V6).unwrap();
+        let id = notices
+            .iter()
+            .position(|n| n.group == nsid::RTNLGRP_NSID)
+            .unwrap();
+        assert!(gone < id);
+        let came = notices
+            .iter()
+            .rfind(|n| n.group == V4)
+            .map(|n| n.bytes[32..36].to_vec())
+            .unwrap();
+        assert_eq!(came, 1i32.to_le_bytes());
+        assert_eq!(
+            b.devices().by_index(1001).map(|d| d.conf4.forwarding),
+            Some(1)
+        );
+        // Deleting: each end's settings go just before it does.
+        let mut notices = Vec::new();
+        delete(&a, &a, 1000, &mut notices);
+        assert_eq!(
+            told_in_order(&notices),
+            [
+                (V4, DEL, 1000),
+                (link, RTM_DELLINK, 1000),
+                (V4, DEL, 1001),
+                (V6, DEL, 1001),
+                (link, RTM_DELLINK, 1001),
+            ]
+        );
     }
 
     #[test]
@@ -1161,7 +1281,7 @@ mod tests {
         );
         let first_nsid = notices
             .iter()
-            .position(|n| n.group != RTNLGRP_LINK)
+            .position(|n| n.group == nsid::RTNLGRP_NSID)
             .unwrap();
         let gone = notices
             .iter()

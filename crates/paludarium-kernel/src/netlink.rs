@@ -51,6 +51,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
+pub(crate) mod devconf;
 mod diag;
 pub(crate) mod extack;
 mod generic;

@@ -893,7 +893,7 @@ verified.
   neighbour table dump: setting a neighbour table (`RTM_SETNEIGHTBL`), MCTP's
   neighbours (an `AF_MCTP` `RTM_NEWNEIGH` or `RTM_DELNEIGH`), a bridge's
   forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`, `RTM_NEWNEIGH` or
-  `RTM_DELNEIGH`), rules, queueing disciplines and the rest are
+  `RTM_DELNEIGH`), rules, the settings' (`RTM_GETNETCONF`), queueing disciplines and the rest are
   `EOPNOTSUPP`, as are renaming `lo` and setting any other attribute of
   it. An input route lookup (`RTA_IIF`) starts with forwarding and
   reverse path filtering off, as Linux is built, where a new namespace of
@@ -901,11 +901,16 @@ verified.
   (Docker turns forwarding on, Ubuntu reverse path filtering to 2); it
   takes `accept_local`, `send_redirects`, `shared_media` and
   `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward` and
-  the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default` and
-  `lo`, where Linux has many more; their first namespace's values are as
-  Linux is built, not a host's, so a new namespace starts from those. A
-  change of them sends no `RTM_NEWNETCONF`, and IPv6's `forwarding` joins
-  no router multicast or anycast address.
+  the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default`,
+  `lo` and the veth ends, where Linux has many more; their first namespace's values are as
+  Linux is built, not a host's, so a new namespace starts from those.
+  IPv6's `forwarding` joins no router multicast or anycast address, and a
+  write of `all`'s tells of the devices in the order of their indices,
+  where Linux's goes in the order they came. A netconf notification gives
+  the settings that have no file (proxy ARP and NDP, multicast and
+  broadcast forwarding, ignoring routes with their link down) as 0, as
+  Linux is built. A veth end whose MTU is below 1280 still has the files
+  of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6.
   A
   route goes through `lo` or rejects: IPv6 gateways, multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences

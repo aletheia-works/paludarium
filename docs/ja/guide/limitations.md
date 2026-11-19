@@ -770,17 +770,22 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   `NETLINK_ROUTE` にあるのはリンク、アドレス、経路、近隣のリクエストと、近隣の表の
   ダンプだけです。近隣の表の設定（`RTM_SETNEIGHTBL`）、MCTP の近隣（`AF_MCTP` の
   `RTM_NEWNEIGH` と `RTM_DELNEIGH`）、ブリッジの転送データベース（`AF_BRIDGE` の
-  `RTM_GETNEIGH`、`RTM_NEWNEIGH`、`RTM_DELNEIGH`）、ルール、キューイング規律などは
+  `RTM_GETNEIGH`、`RTM_NEWNEIGH`、`RTM_DELNEIGH`）、ルール、設定のもの（`RTM_GETNETCONF`）、キューイング規律などは
   `EOPNOTSUPP` で、`lo` の名前の変更、ほかの属性の設定もそうです。入力の経路の
   引き当て（`RTA_IIF`）は、Linux の組み込みの値と同じく、転送も逆経路のフィルターも
   切ったところから始まります。Linux の新しい名前空間は IPv4 の設定を最初の名前空間から
   受け継ぎ、ホストが変えていることがあります（Docker は転送を入れ、Ubuntu は逆経路の
   フィルターを 2 にします）。ファイルのない `accept_local`、`send_redirects`、
-  `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward` と、`all`、`default`、`lo` の
+  `shared_media`、`route_localnet` は組み込みの値とします。`/proc/sys/net` にあるのは、`ip_forward` と、`all`、`default`、`lo`、veth の端の
   `forwarding`、`rp_filter`、`disable_ipv6` だけで、Linux にはもっとたくさんあります。
   最初の名前空間の値はホストのものではなく Linux の組み込みの値なので、新しい名前空間も
-  そこから始まります。変えても `RTM_NEWNETCONF` は送らず、IPv6 の `forwarding` は
-  ルーターのマルチキャストやエニーキャストのアドレスに加わりません。経路は
+  そこから始まります。IPv6 の `forwarding` はルーターのマルチキャストや
+  エニーキャストのアドレスに加わりません。`all` のものに書くと、デバイスのものを
+  インデックスの順に伝えますが、Linux は増えた順です。netconf の通知は、ファイルのない
+  設定（プロキシ ARP と NDP、マルチキャストとブロードキャストの転送、リンクの落ちた
+  経路を無視する設定）を、Linux の組み込みの値と同じく 0 として伝えます。MTU が 1280
+  より小さい veth の端にも `ipv6/conf/<デバイス>` のファイルがありますが、Linux では
+  IPv6 がないのでありません。経路は
   `lo` を通るか拒むかのどちらかです。IPv6 のゲートウェイ、マルチパスの経路、
   カプセル化、ネクストホップのオブジェクト、
   realm、有効期限、送り元の接頭辞、ルーターの優先度、エニーキャスト・マルチキャスト・NAT の

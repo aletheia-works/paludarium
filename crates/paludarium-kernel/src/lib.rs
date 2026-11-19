@@ -22,6 +22,8 @@ pub use inbox::SignalInbox;
 mod aio;
 mod bpf;
 mod bpf_prog;
+#[cfg(test)]
+mod bpf_tests;
 mod bpf_trie;
 mod devices;
 mod epoll;

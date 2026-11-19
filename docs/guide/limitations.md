@@ -121,8 +121,8 @@ verified.
   `exit_code` in `stat` is 0 while a thread is in a ptrace stop, where
   Linux has the stop's signal until the tracer's wait, and a process whose
   leader ended with `exit` before the last of its threads shows the last
-  thread's status, where Linux shows the leader's. In `stat`, page faults, resident memory, the start
-  time are 0, so `ps` shows no `RSS`, and its `STIME` and
+  thread's status, where Linux shows the leader's. In `stat`, page faults,
+  resident memory, the start time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
   another process's state is taken from where its thread is (in a system

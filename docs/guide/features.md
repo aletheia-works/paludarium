@@ -2457,8 +2457,9 @@ kernel.
     it (`neigh_event_send`). A reachable neighbour's timer runs as
     `neigh_timer_handler`: past the reachable time (30 seconds) since it
     was confirmed, it delays if it was used within the 5 seconds before,
-    else goes stale and is told of to `RTNLGRP_NEIGH` without a port. A permanent neighbour `NTF_EXT_MANAGED`, and
-    one `NTF_EXT_VALIDATED` in an invalid state, are `EINVAL`. A removal
+    else goes stale and is told of to `RTNLGRP_NEIGH` without a port. A
+    permanent neighbour `NTF_EXT_MANAGED`, and one `NTF_EXT_VALIDATED` in
+    an invalid state, are `EINVAL`. A removal
     fails the neighbour (`NUD_FAILED`, told of if it was valid), then
     tells it gone with `RTM_DELNEIGH`. With `NTF_PROXY` a request adds,
     changes or removes a proxy entry instead, of `lo` or of no device

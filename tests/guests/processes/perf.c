@@ -857,7 +857,8 @@ static int case_sample(void) {
         uint16_t misc = (uint16_t)(r[0] >> 32), size = (uint16_t)(r[0] >> 48);
         alike &= type == RECORD_SAMPLE && misc == 2 && size == 48 && r[1] == id;
         alike &= (uint32_t)r[2] == (uint32_t)getpid() && (uint32_t)(r[2] >> 32) == (uint32_t)gettid();
-        alike &= r[3] == 1 && r[4] == id && r[5] == id;
+        /* PERF_SAMPLE_PERIOD comes after the IDs. */
+        alike &= r[3] == id && r[4] == id && r[5] == 1;
         samples++;
     }
     say("samples>=5 %d alike %d whole %d", samples >= 5, alike, head % 48 == 0);

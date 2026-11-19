@@ -67,7 +67,8 @@ turned that instruction down while its block has been cached.
 
 The code generation is a counter of the address space. It moves on when the
 mappings change (`mmap`, `munmap`, `mprotect`, `mremap`, `brk`, `shmat`,
-`shmdt`), when `madvise` with `MADV_DONTNEED` discards private pages, when any
+`shmdt`), when `madvise` with `MADV_DONTNEED` discards private pages or the
+entries of shared ones, when any
 process or the kernel stores to a shared mapping or page cache the space may run
 code from, when the space stores to an executable page that an instruction has
 been fetched from, and when pages change under it otherwise: a stack grows down,

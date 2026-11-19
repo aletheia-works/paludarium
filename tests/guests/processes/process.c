@@ -12055,6 +12055,87 @@ static int proc_other_maps_case(void) {
     return 0;
 }
 
+/* The proc-stat-exit-code case: exit_code, the last field of another
+   process's stat, as Linux's do_task_stat gives it to a reader that
+   ptrace_may_access lets see it: the process's group_exit_code in its own
+   stat (an exit's wait status, a stop's signal until a wait reports it)
+   and the thread's exit_code in task/<tid>/stat; 0 for any other reader. */
+static void psec_show(const char *label, pid_t pid) {
+    static char buffer[4096];
+    char *fields[64];
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    int count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf("%s exit_code=%s", label, count >= 50 ? fields[49] : "?");
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", (int)pid, (int)pid);
+    count = proc_fields(path, buffer, sizeof buffer, fields, 64);
+    printf(" task=%s\n", count >= 50 ? fields[49] : "?");
+}
+/* Shows the stat of `pid` as another user sees it. */
+static void psec_other_user(const char *label, pid_t pid) {
+    fflush(stdout);
+    pid_t other = fork();
+    if (other == 0) {
+        if (setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534)) _exit(90);
+        psec_show(label, pid);
+        fflush(stdout);
+        _exit(0);
+    }
+    if (reaped(other)) printf("%s failed\n", label);
+}
+/* A child that ends as `how` says, shown while a zombie: by its root
+   reader and by another user. */
+static void psec_ended(const char *label, int how) {
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        if (how > 0) _exit(how);
+        pause();
+        _exit(99);
+    }
+    if (how < 0) kill(kid, -how);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WEXITED | WNOWAIT);
+    psec_show(label, kid);
+    char other[64];
+    snprintf(other, sizeof other, "%s other user", label);
+    psec_other_user(other, kid);
+    waitpid(kid, NULL, 0);
+}
+static int proc_stat_exit_code_case(void) {
+    psec_ended("exited 3", 3);
+    psec_ended("exited 255", 255);
+    psec_ended("killed", -SIGKILL);
+    psec_ended("terminated", -SIGTERM);
+    /* Stopped: the stop's signal in the process's stat until a wait
+       reports the stop, none in its thread's. */
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid < 0) return 80;
+    if (kid == 0) {
+        for (;;) pause();
+    }
+    psec_show("running", kid);
+    kill(kid, SIGSTOP);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WSTOPPED | WNOWAIT);
+    psec_show("stopped", kid);
+    psec_other_user("stopped other user", kid);
+    int status = 0;
+    waitpid(kid, &status, WUNTRACED);
+    printf("wait stopped=%d\n", WIFSTOPPED(status));
+    psec_show("stop reported", kid);
+    kill(kid, SIGCONT);
+    memset(&info, 0, sizeof info);
+    waitid(P_PID, kid, &info, WCONTINUED);
+    psec_show("continued", kid);
+    kill(kid, SIGKILL);
+    waitpid(kid, NULL, 0);
+    return 0;
+}
+
 /* The proc-other-limits case: another process's statm, auxv and limits,
    and this process's own, as Linux's proc_pid_statm, auxv_read and
    proc_pid_limits make them: statm and limits for anyone, auxv for a reader
@@ -31774,6 +31855,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "proc-io")) return proc_io_case();
     if (!strcmp(mode, "proc-personality-wchan")) return proc_personality_wchan_case();
     if (!strcmp(mode, "proc-syscall")) return proc_syscall_case();
+    if (!strcmp(mode, "proc-stat-exit-code")) return proc_stat_exit_code_case();
     if (!strcmp(mode, "proc-fd-links")) return proc_fd_links_case();
     if (!strcmp(mode, "modify-ldt")) return ldt_case(self);
     if (!strcmp(mode, "ldt-exec")) {

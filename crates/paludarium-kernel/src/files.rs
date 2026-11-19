@@ -8621,6 +8621,8 @@ fn own_file(c: &Context<'_>, entry: crate::proc::OwnEntry) -> Option<Vec<u8>> {
                 blocked: c.process.signal_mask,
                 ignored: mask(&|handler| handler == 1),
                 caught: mask(&|handler| handler > 1),
+                // Running, it has neither ended nor stopped.
+                exit_code: 0,
             })
         }
         crate::proc::OwnEntry::DescriptorInfo(n) => descriptor_info(c, n)?,

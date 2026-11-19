@@ -156,7 +156,8 @@ mod linux {
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
-            // reads a child's as another user, and the pagemap
+            // reads a child's as another user, the proc-stat-exit-code case,
+            // which reads a child's stat as another user, and the pagemap
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, as the emulator's guest starts as root.
@@ -184,6 +185,7 @@ mod linux {
                     | "proc-other-fd-paths"
                     | "proc-personality-wchan"
                     | "proc-syscall"
+                    | "proc-stat-exit-code"
                     | "proc-fd-links"
                     | "dynamic-exec"
                     | "pty-vhangup"
@@ -854,6 +856,7 @@ mod linux {
         processes_proc_other_fd_paths => ("proc-other-fd-paths","process"),
         processes_proc_personality_wchan => ("proc-personality-wchan","process"),
         processes_proc_syscall => ("proc-syscall","process"),
+        processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),

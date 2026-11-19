@@ -99,6 +99,10 @@ static void on_signal(int number) { handled = handled * 100 + number; }
  * itself, its siginfo, a peek and a poke of its memory, a cancelled
  * signal, and the SIGTRAP an exec sends a tracee attached this way. */
 static int traceme(const char *self) {
+    /* The child waits on `go` before it execs, so that it still runs, not
+     * stopped at the exec, when the tracer peeks it after PTRACE_CONT. */
+    int go[2];
+    if (pipe(go)) return 80;
     pid_t child = fork();
     if (child == 0) {
         if (pt(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(90);
@@ -109,6 +113,8 @@ static int traceme(const char *self) {
         /* The tracer cancelled it and changed the word. */
         if (handled != 0) _exit(91);
         if (shared_word != 0x0102030405060708L) _exit(92);
+        char byte;
+        if (read(go[0], &byte, 1) != 1) _exit(94);
         execl(self, self, "exec-child", self, (char *)0);
         _exit(93);
     }
@@ -141,6 +147,7 @@ static int traceme(const char *self) {
     result("bad-request", pt(0x4299, child, 0, 0));
     result("cont", pt(PTRACE_CONT, child, 0, 0));
     result("running-peek", pt(PTRACE_PEEKDATA, child, (unsigned long)&shared_word, (unsigned long)&word));
+    write(go[1], "x", 1);
     status = wait_status(child, 0);
     stop("exec", status);
     info = siginfo_of(child, &error);

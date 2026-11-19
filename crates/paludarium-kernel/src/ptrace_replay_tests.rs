@@ -594,6 +594,9 @@ impl Tracer {
 #[test]
 fn traceme() {
     let mut g = Tracer::new();
+    // The child waits on `go` before it execs, so that it still runs, not
+    // stopped at the exec, when the tracer peeks it after PTRACE_CONT.
+    let (go_read, go_write) = g.pipe();
     let (lines, tx) = std::sync::mpsc::channel();
     let (child, thread) = g.fork(move |c| {
         assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
@@ -614,6 +617,7 @@ fn traceme() {
             c.m.read_u64(GuestAddr(WORD)).unwrap(),
             0x0102_0304_0506_0708
         );
+        assert_eq!(c.sys(READ, [go_read, HEAP + 0x990, 1, 0, 0, 0]), Ok(1));
         assert_eq!(c.exec(), Ok(0));
         c.exit(7)
     });
@@ -657,6 +661,7 @@ fn traceme() {
     g.say("cont", cont);
     let running = g.pt(PEEKDATA, child, WORD, word);
     g.say("running-peek", running);
+    g.call(WRITE, [go_write, HEAP + 0x790, 1, 0, 0, 0]);
     let status = g.wait(child, 0);
     g.stop("exec", status);
     let (_, _, code, pid) = g.siginfo(child);

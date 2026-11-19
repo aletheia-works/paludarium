@@ -1122,7 +1122,7 @@ impl Walk {
                     );
                 }
                 let write = value.is_some();
-                self.value_access(map, total, bytes, write)?;
+                self.value_access(ptr, map, total, bytes, write)?;
                 Ok(Reg::Scalar(None))
             }
             Reg::Scalar(known) => {
@@ -1157,9 +1157,10 @@ impl Walk {
 
 impl Walk {
     /// `check_map_access_type` and `check_map_access` of `bytes` at `off`
-    /// in a value of the map: what `BPF_F_RDONLY_PROG` and
-    /// `BPF_F_WRONLY_PROG` forbid, and the value's bounds.
-    fn value_access(&self, map: u8, off: i64, bytes: i64, write: bool) -> Checked<()> {
+    /// in a value of the map through the register `r`: what
+    /// `BPF_F_RDONLY_PROG` and `BPF_F_WRONLY_PROG` forbid, and the value's
+    /// bounds, for which `check_mem_region_access` writes a second line.
+    fn value_access(&self, r: u8, map: u8, off: i64, bytes: i64, write: bool) -> Checked<()> {
         let shape = self.maps[usize::from(map)];
         let size = i64::from(shape.value_size);
         if write && shape.flags & F_RDONLY_PROG != 0 {
@@ -1177,7 +1178,9 @@ impl Walk {
         if off < 0 || off + bytes > size {
             return refuse(
                 EACCES,
-                format!("invalid access to map value, value_size={size} off={off} size={bytes}"),
+                format!(
+                    "invalid access to map value, value_size={size} off={off} size={bytes}\nR{r} min value is outside of the allowed memory range"
+                ),
             );
         }
         Ok(())
@@ -1209,7 +1212,7 @@ impl Walk {
                 Ok(())
             }
             Reg::Ptr(Ptr::Value(map), base) => {
-                self.value_access(map, i64::from(base), bytes, false)
+                self.value_access(r, map, i64::from(base), bytes, false)
             }
             _ => gap("helper arguments of other types"),
         }
@@ -2103,7 +2106,7 @@ mod tests {
             refused(&p),
             (
                 EACCES,
-                "invalid access to map value, value_size=8 off=4 size=8".into()
+                "invalid access to map value, value_size=8 off=4 size=8\nR0 min value is outside of the allowed memory range".into()
             )
         );
         let mut p = lookup(5);

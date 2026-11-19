@@ -272,6 +272,10 @@ static int case_verify(void) {
 
 /* A key of 0 at fp-4, the map in R1 and R2 pointing at the key. */
 #define KEY4(fd) ST_W(10, -4, 0), LD_MAP(1, fd), MOV_REG(2, 10), ADD(2, -4)
+/* The same for a hash's 8-byte key at fp-8. Linux knows that an array's
+   element of a constant key is there, so its lookup needs no null check;
+   a hash's does. */
+#define KEY8(fd) ST_DW(10, -8, 0), LD_MAP(1, fd), MOV_REG(2, 10), ADD(2, -8)
 
 static int map(uint32_t type, uint32_t key, uint32_t value, uint32_t entries, uint32_t flags) {
     uint32_t a[32] = {type, key, value, entries, flags};
@@ -311,8 +315,8 @@ static int case_maps(void) {
     LOAD_MAPS("map named twice", LD_MAP(1, array), LD_MAP(2, array), MOV(0, 0), EXIT());
 
     /* Programs it refuses. */
-    LOAD_MAPS("no null check", KEY4(array), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
-    LOAD_MAPS("arithmetic before the check", KEY4(array), CALL(LOOKUP), ADD(0, 1), EXIT());
+    LOAD_MAPS("no null check", KEY8(hash), CALL(LOOKUP), LDX_DW(0, 0, 0), EXIT());
+    LOAD_MAPS("arithmetic before the check", KEY8(hash), CALL(LOOKUP), ADD(0, 1), EXIT());
     LOAD_MAPS("past the value", KEY4(array), CALL(LOOKUP), JEQ(0, 0, 1), LDX_DW(0, 0, 4), EXIT());
     LOAD_MAPS("write a read-only value", KEY4(rdonly), CALL(LOOKUP), JEQ(0, 0, 1), ST_DW(0, 0, 1),
               EXIT());

@@ -8586,6 +8586,46 @@ fn a_tmpfs_mount_holds_its_files_to_its_size_and_inodes() {
     assert_eq!(statfs(&mut f), (4, 1, 1, 4, 0));
 }
 
+/// The files the kernel generates are on `noexec` mounts, as Linux's
+/// `/proc` and `/dev` are: an executable mapping of `/dev/zero` is `EPERM`
+/// and `mprotect` to one `EACCES`, while a file reached through a link in
+/// `/dev/fd` is on its own mount; the exec checks find them `noexec` too.
+#[test]
+fn the_kernels_own_files_are_on_noexec_mounts() {
+    let mut f = fixture();
+    let zero = put(&mut f, 0, b"/dev/zero");
+    let fd = f.ret(2, &[zero, 2, 0]);
+    // PROT_READ | PROT_EXEC, MAP_PRIVATE; then MAP_SHARED.
+    assert_eq!(f.ret(9, &[0, 4096, 5, 2, fd, 0]), errno(Errno::EPERM));
+    assert_eq!(f.ret(9, &[0, 4096, 5, 1, fd, 0]), errno(Errno::EPERM));
+    let at = f.ret(9, &[0, 4096, 1, 2, fd, 0]);
+    assert!(at < u64::MAX - 4095, "{at:#x}");
+    assert_eq!(f.ret(10, &[at, 4096, 5]), errno(Errno::EACCES));
+    assert_eq!(f.ret(10, &[at, 4096, 3]), 0);
+    // A file in /tmp, through /dev/fd, maps executable.
+    let file = put(&mut f, 0x40, b"/tmp/x");
+    let made = f.ret(2, &[file, 0o102, 0o700]);
+    assert_eq!(f.ret(1, &[made, DATA, 4096]), 4096);
+    let link = put(&mut f, 0x80, format!("/dev/fd/{made}").as_bytes());
+    let again = f.ret(2, &[link, 0, 0]);
+    let mapped = f.ret(9, &[0, 4096, 5, 2, again, 0]);
+    assert!(mapped < u64::MAX - 4095, "{mapped:#x}");
+    // What the exec checks ask (`path_noexec`): no generated file is a
+    // regular file with an execute bit, so only the mount can say it here.
+    use crate::files::{ST_NODEV, ST_NOEXEC, ST_NOSUID, mount_says};
+    for path in [
+        &b"/proc/self/status"[..],
+        b"/proc/1/stat",
+        b"/dev/null",
+        b"/dev/pts/ptmx",
+    ] {
+        assert!(mount_says(&f.kernel.files, path, ST_NOEXEC), "{path:?}");
+        assert!(!mount_says(&f.kernel.files, path, ST_NOSUID), "{path:?}");
+        assert!(!mount_says(&f.kernel.files, path, ST_NODEV), "{path:?}");
+    }
+    assert!(!mount_says(&f.kernel.files, b"/tmp/x", ST_NOEXEC));
+}
+
 /// `statfs`'s `f_flags` for the kernel's own mounts are those Linux mounts
 /// them with; a link in `/proc/self/fd` gives its file's, and a pipe's
 /// internal mount `ST_VALID` alone.

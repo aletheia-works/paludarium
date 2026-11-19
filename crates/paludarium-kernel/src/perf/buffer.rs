@@ -104,6 +104,9 @@ pub(crate) struct Buffer {
     /// Where the next record goes, the records lost since the last that
     /// went in, and whether output is paused.
     out: Mutex<Out>,
+    /// `watermark`: the bytes between wakeups, `wakeup_watermark` for an
+    /// event with `watermark` (no more than the data), else half the data.
+    watermark: u64,
     accounts: Arc<Accounts>,
     /// Who mapped it first (`mmap_user`), the address space it was in,
     /// and how much of it the address space's pinned pages took
@@ -141,6 +144,15 @@ impl Buffer {
             uid,
             space,
             pinned,
+            watermark: {
+                let size = data_pages * PAGE;
+                let asked = if event.attr.flag(super::bit::WATERMARK) {
+                    u64::from(event.attr.wakeup).min(size)
+                } else {
+                    0
+                };
+                if asked == 0 { size / 2 } else { asked }
+            },
             // A buffer of no data pages takes nothing (`rb->paused`).
             out: Mutex::new(Out {
                 paused: data_pages == 0,
@@ -195,12 +207,51 @@ impl Buffer {
 }
 
 /// What `struct perf_buffer` keeps of its output: `head`, `lost` and
-/// `paused`.
+/// `paused`; `wakeup`, where the next wakeup is due, and `events`, the
+/// samples since the last of `wakeup_events`; and `poll`, what the last
+/// wakeup left for `poll` to find, with how many wakeups there have been.
 #[derive(Default)]
 struct Out {
     head: u64,
     lost: u64,
     paused: bool,
+    wakeup: u64,
+    events: u32,
+    poll: u32,
+    wakeups: u64,
+}
+
+/// `EPOLLIN | EPOLLRDNORM`.
+const POLL_IN: u32 = 0x41;
+
+impl Out {
+    /// How far the head has gone: back from 0 for `write_backward`.
+    fn written(&self, backward: bool) -> u64 {
+        if backward {
+            self.head.wrapping_neg()
+        } else {
+            self.head
+        }
+    }
+    /// `__perf_output_begin`'s watermark: a wakeup is due once the head
+    /// is more than a watermark past the last.
+    fn watermark(&mut self, backward: bool, watermark: u64, records: u64) {
+        let lag = self.written(backward).wrapping_sub(self.wakeup);
+        if watermark != 0 && lag > watermark {
+            let due = (lag - watermark).div_ceil(watermark).min(records);
+            self.wakeup = self.wakeup.wrapping_add(due * watermark);
+        }
+    }
+    /// `perf_output_sample`'s `wakeup_events`, for `records` more samples.
+    fn sampled(&mut self, wakeup_events: u32, records: u64) {
+        if wakeup_events == 0 {
+            return;
+        }
+        let total = u64::from(self.events) + records;
+        let w = u64::from(wakeup_events);
+        self.wakeup = self.wakeup.wrapping_add(total / w);
+        self.events = (total % w) as u32;
+    }
 }
 
 impl Buffer {
@@ -212,7 +263,12 @@ impl Buffer {
     /// the first after lost ones follows a `PERF_RECORD_LOST` of them
     /// with `trailer`, its `sample_id`. A paused buffer counts what it does
     /// not take as lost. `spill` is written past the record, in the room it
-    /// was not given.
+    /// was not given. Each sample counts towards the sampling event's
+    /// `wakeup_events` (0 for none, or with `watermark`), and the head
+    /// towards the watermark; when either makes a wakeup due, the buffer
+    /// is readable for `poll` and its readers are woken
+    /// (`perf_output_wakeup`), which this returns.
+    #[allow(clippy::too_many_arguments, reason = "a record and how it counts")]
     pub(super) fn output(
         &self,
         event: &Event,
@@ -220,21 +276,26 @@ impl Buffer {
         spill: &[u8],
         copies: u64,
         trailer: &[u8],
-    ) {
+        wakeup_events: u32,
+    ) -> bool {
         let backward = event.attr.flag(super::bit::WRITE_BACKWARD);
         let size = self.data_size();
         let mut out = lock(&self.out);
+        let due = out.wakeup;
         let mut copies = copies;
         // Of a buffer that overwrites, only the last that fit stay.
         if !self.writable && !out.paused && size != 0 && out.lost == 0 {
             let fit = size / record.len() as u64 + 1;
             if copies > fit {
-                let skipped = (copies - fit) * record.len() as u64;
+                let records = copies - fit;
+                let skipped = records * record.len() as u64;
                 out.head = if backward {
                     out.head.wrapping_sub(skipped)
                 } else {
                     out.head.wrapping_add(skipped)
                 };
+                out.watermark(backward, self.watermark, records);
+                out.sampled(wakeup_events, records);
                 copies = fit;
             }
         }
@@ -272,6 +333,7 @@ impl Buffer {
                 (head, head.wrapping_add(need))
             };
             out.head = new_head;
+            out.watermark(backward, self.watermark, 1);
             if out.lost != 0 {
                 let lost = std::mem::take(&mut out.lost);
                 let lost = event.lost_record(lost, trailer);
@@ -280,8 +342,37 @@ impl Buffer {
             }
             self.copy_in(at, record);
             self.copy_in(at.wrapping_add(record.len() as u64), spill);
+            out.sampled(wakeup_events, 1);
             self.store(field::DATA_HEAD, &new_head.to_le_bytes());
         }
+        let woken = out.wakeup != due;
+        if woken {
+            out.poll = POLL_IN;
+            out.wakeups += 1;
+        }
+        drop(out);
+        if woken {
+            self.wake();
+        }
+        woken
+    }
+    /// `ring_buffer_wakeup`: wakes those who wait for any event that writes
+    /// to the buffer.
+    pub(super) fn wake(&self) {
+        let events: Vec<Arc<Event>> = lock(&self.events)
+            .as_ref()
+            .map(|list| list.iter().filter_map(super::event).collect())
+            .unwrap_or_default();
+        for event in events {
+            event.hub.changed();
+        }
+    }
+    /// What `perf_poll` takes of the buffer: what its last wakeup left,
+    /// then nothing until the next (`atomic_xchg(&rb->poll, 0)`), with the
+    /// count of wakeups for `epoll`'s edges.
+    pub(super) fn take_poll(&self) -> (u32, u64) {
+        let mut out = lock(&self.out);
+        (std::mem::take(&mut out.poll), out.wakeups)
     }
     /// `PERF_EVENT_IOC_PAUSE_OUTPUT` (`rb_toggle_paused`): `EINVAL` for a
     /// buffer of no data pages.
@@ -622,9 +713,7 @@ mod tests {
     /// A buffer of `data_pages` for a new event, charged to user 1000.
     fn mapped(data_pages: u64, accounts: &Arc<Accounts>) -> (Arc<Event>, Arc<Mapped>) {
         let event = super::super::tests::event(None);
-        let file: Arc<dyn FileHandle> = Arc::new(super::super::EventFile {
-            event: Arc::clone(&event),
-        });
+        let file: Arc<dyn FileHandle> = Arc::new(super::super::EventFile::new(Arc::clone(&event)));
         let pages = SharedPages::new();
         for key in (0..=data_pages).map(|page| page * PAGE) {
             pages.fill(key, &[], None).unwrap();
@@ -686,12 +775,12 @@ mod tests {
         let (event, mapped) = mapped(1, &accounts);
         let rb = &mapped.buffer;
         let record: Vec<u8> = (0..24).collect();
-        rb.output(&event, &record, &[], 200, &[]);
+        rb.output(&event, &record, &[], 200, &[], 0);
         // 170 fit: the head may not reach the tail.
         assert_eq!(rb.load(field::DATA_HEAD), 4080);
         assert_eq!(lock(&event.sampler).lost, 30);
         rb.store(field::DATA_TAIL, &4080u64.to_le_bytes());
-        rb.output(&event, &record, &[], 1, &[]);
+        rb.output(&event, &record, &[], 1, &[], 0);
         assert_eq!(rb.load(field::DATA_HEAD), 4080 + 48);
         // PERF_RECORD_LOST, 24 bytes, round the end of the data page.
         assert_eq!(rb.load(PAGE + 4080), 2 | 24 << 48);
@@ -708,13 +797,31 @@ mod tests {
         let (event, one) = mapped(1, &accounts);
         let rb = &one.buffer;
         rb.pause(true).unwrap();
-        rb.output(&event, &[0; 8], &[], 3, &[]);
+        rb.output(&event, &[0; 8], &[], 3, &[], 0);
         assert_eq!(rb.load(field::DATA_HEAD), 0);
         assert_eq!(lock(&event.sampler).lost, 3);
         let (other, none) = mapped(0, &accounts);
         assert_eq!(none.buffer.pause(false), Err(Errno::EINVAL));
-        none.buffer.output(&other, &[0; 8], &[], 1, &[]);
+        none.buffer.output(&other, &[0; 8], &[], 1, &[], 0);
         assert_eq!(lock(&other.sampler).lost, 0);
+    }
+
+    #[test]
+    fn wakeup_events_and_the_watermark_make_the_buffer_readable_once() {
+        let accounts = Arc::default();
+        let (event, one) = mapped(1, &accounts);
+        let rb = &one.buffer;
+        assert_eq!(rb.watermark, 2048);
+        // Every second sample wakes.
+        assert!(!rb.output(&event, &[0; 24], &[], 1, &[], 2));
+        assert_eq!(rb.take_poll(), (0, 0));
+        assert!(rb.output(&event, &[0; 24], &[], 1, &[], 2));
+        assert_eq!(rb.take_poll(), (POLL_IN, 1));
+        assert_eq!(rb.take_poll(), (0, 1));
+        // Without wakeup_events, half the data: 86 of 24 bytes pass it.
+        assert!(!rb.output(&event, &[0; 24], &[], 83, &[], 0));
+        assert!(rb.output(&event, &[0; 24], &[], 1, &[], 0));
+        assert_eq!(rb.take_poll().0, POLL_IN);
     }
 
     fn listed(rb: &Buffer) -> usize {

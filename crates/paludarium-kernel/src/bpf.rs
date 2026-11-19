@@ -1146,6 +1146,26 @@ fn map_of(c: &Context<'_>, fd: u32) -> Result<(Arc<Map>, bool, bool), Errno> {
     Ok((map, readable, writable))
 }
 
+/// `__bpf_map_get` for a program's BPF_LD_IMM64: the map of `fd` (`EBADF`
+/// for no descriptor, `EINVAL` for one of no map), whatever the
+/// descriptor's mode, with what the verifier needs of it.
+pub(crate) fn program_map(
+    c: &Context<'_>,
+    fd: u32,
+) -> Result<(Arc<Map>, crate::bpf_verifier::MapShape), Errno> {
+    let (map, _, _) = map_of(c, fd)?;
+    let shape = crate::bpf_verifier::MapShape {
+        id: map.id,
+        kind: map.kind,
+        key_size: map.key_size,
+        value_size: map.value_size,
+        max_entries: map.max_entries,
+        flags: map.flags,
+        exclusive: map.exclusive,
+    };
+    Ok((map, shape))
+}
+
 /// `bpf_map_check_op_flags`: flags in the low half past `allowed`, a lock
 /// no map here has, a high half without `BPF_F_CPU`, and the CPU flags of
 /// a map that is not per CPU are `EINVAL`.

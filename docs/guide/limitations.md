@@ -118,8 +118,11 @@ verified.
   an errno Linux gives both before and in the file's operation (`EINVAL`,
   `EFAULT`: an eventfd's too small a buffer) is taken as refused before it,
   so not counted.
-  Another process's `stat` has an `exit_code` of 0. In `stat`, page faults, resident memory, the start
-  time are 0, so `ps` shows no `RSS`, and its `STIME` and
+  `exit_code` in `stat` is 0 while a thread is in a ptrace stop, where
+  Linux has the stop's signal until the tracer's wait, and a process whose
+  leader ended with `exit` before the last of its threads shows the last
+  thread's status, where Linux shows the leader's. In `stat`, page faults,
+  resident memory, the start time are 0, so `ps` shows no `RSS`, and its `STIME` and
   `START` are the boot time in `/proc/stat`. `/proc/stat` counts no CPU time,
   interrupts or context switches, and lists no interrupt numbers. A thread's `stat` gives its process's CPU time, and
   another process's state is taken from where its thread is (in a system
@@ -279,10 +282,12 @@ verified.
   address 0 and no kernel frames. `freq` follows the rate at those points,
   not at each tick. A sample is never throttled (no `PERF_RECORD_THROTTLE`
   or `UNTHROTTLE`), an event of a CPU takes none, and no other record
-  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. Nothing wakes a
-  reader: an overflow sends no signal, and `poll` never finds an event
-  readable, and `PERF_EVENT_IOC_REFRESH` is `EINVAL` for every event,
-  where Linux takes it for a sampling event that does not inherit. Its user page shows the count and times as of the
+  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. The overflows
+  of one such point send one SIGTRAP for `sigtrap`, where Linux sends one
+  each time the thread returns to its code, and its `si_addr` is 0, where
+  Linux gives a fault's address. When `REFRESH`'s last overflow disables
+  the event, the occurrences after it up to that point are still counted,
+  where Linux stops the count at it. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
@@ -326,20 +331,28 @@ verified.
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are
   not verified yet", `EINVAL`; a helper call's starts "unknown func #%d",
-  so that libbpf and bpftool take the helper as missing): helper calls, bpf-to-bpf calls and
-  kfuncs, the context's fields (`struct __sk_buff`), `BPF_LD_IMM64` of
-  maps, of BTF IDs and of functions, `BPF_LD_ABS` and `BPF_LD_IND`,
-  atomics, `may_goto`, indirect jumps, a pointer with a variable offset,
-  and `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
+  so that libbpf and bpftool take the helper as missing): helpers other
+  than `bpf_map_lookup_elem`, `bpf_map_update_elem` and
+  `bpf_map_delete_elem`, and those for maps of maps, queues, stacks and
+  bloom filters, a helper's argument that is neither on the stack nor in
+  a map's value, bpf-to-bpf calls and kfuncs, the context's fields
+  (`struct __sk_buff`) and a map's own (`struct bpf_map`), maps from
+  `fd_array` and maps made with `excl_prog_hash`, `BPF_LD_IMM64` of BTF IDs
+  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`,
+  indirect jumps, a pointer with a variable offset, and
+  `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
   takes a bounded loop from a privileged loader). A scalar is a value the
   verifier knows or nothing at all, where Linux keeps its bounds, so it
   walks both ways of a jump Linux knows goes one way, and it prunes no
-  states, so a program with many branches may reach the limits sooner.
+  states, so a program with many branches may reach the limits sooner. A
+  lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
+  the immediate 0 tells, where Linux also knows that an array's element
+  of a constant key is there and learns from comparing two pointers.
   Where master and the test machines' Linux 7.0 decide differently, it
   refuses: master takes a larger stack where its JIT can, makes a number
   of a pointer that any operator is applied to, and takes an exit for
-  unwinding, and 7.0 takes a `BPF_LD_IMM64` with a non-zero `off`. It has
+  unwinding. It has
   only a privileged loader's rules (pointers may leak, the stack may be
   read before it is written, no Spectre sanitizing), so a loader without
   `CAP_PERFMON` gets `EPERM` once the type is known. With no BTF objects
@@ -898,7 +911,7 @@ verified.
   neighbour table dump: setting a neighbour table (`RTM_SETNEIGHTBL`), MCTP's
   neighbours (an `AF_MCTP` `RTM_NEWNEIGH` or `RTM_DELNEIGH`), a bridge's
   forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`, `RTM_NEWNEIGH` or
-  `RTM_DELNEIGH`), rules, queueing disciplines and the rest are
+  `RTM_DELNEIGH`), rules, netconf requests (`RTM_GETNETCONF`), queueing disciplines and the rest are
   `EOPNOTSUPP`, as are renaming `lo` and setting any other attribute of
   it. An input route lookup (`RTA_IIF`) starts with forwarding and
   reverse path filtering off, as Linux is built, where a new namespace of
@@ -906,11 +919,16 @@ verified.
   (Docker turns forwarding on, Ubuntu reverse path filtering to 2); it
   takes `accept_local`, `send_redirects`, `shared_media` and
   `route_localnet` to be as built, which have no files. `/proc/sys/net` has only `ip_forward` and
-  the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default` and
-  `lo`, where Linux has many more; their first namespace's values are as
-  Linux is built, not a host's, so a new namespace starts from those. A
-  change of them sends no `RTM_NEWNETCONF`, and IPv6's `forwarding` joins
-  no router multicast or anycast address.
+  the `forwarding`, `rp_filter` and `disable_ipv6` of `all`, `default`,
+  `lo` and the veth ends, where Linux has many more; their first namespace's values are as
+  Linux is built, not a host's, so a new namespace starts from those.
+  IPv6's `forwarding` joins no router multicast or anycast address, and a
+  write of `all`'s tells of the devices in the order of their indices,
+  where Linux's goes in the order they came. A netconf notification gives
+  the settings that have no file (proxy ARP and NDP, multicast and
+  broadcast forwarding, ignoring routes with their link down) as 0, as
+  Linux is built. A veth end whose MTU is below 1280 still has the files
+  of `ipv6/conf/<device>`, where Linux's has none, as it has no IPv6.
   A
   route goes through `lo`, a veth end (IPv4, without a gateway) or rejects: IPv6 gateways, multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences

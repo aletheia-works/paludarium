@@ -157,7 +157,8 @@ mod linux {
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
-            // reads a child's as another user, and the pagemap
+            // reads a child's as another user, the proc-stat-exit-code case,
+            // which reads a child's stat as another user, and the pagemap
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, as the emulator's guest starts as root.
@@ -185,6 +186,7 @@ mod linux {
                     | "proc-other-fd-paths"
                     | "proc-personality-wchan"
                     | "proc-syscall"
+                    | "proc-stat-exit-code"
                     | "proc-fd-links"
                     | "dynamic-exec"
                     | "pty-vhangup"
@@ -247,6 +249,7 @@ mod linux {
                     | "perf-mmap"
                     | "perf-output"
                     | "perf-sample"
+                    | "perf-wakeup"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -259,6 +262,7 @@ mod linux {
                     | "bpf-maps"
                     | "bpf-prog-load"
                     | "bpf-prog-verify"
+                    | "bpf-prog-maps"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -578,6 +582,7 @@ mod linux {
         perf_mmap => ("perf-mmap","perf"),
         perf_output => ("perf-output","perf"),
         perf_sample => ("perf-sample","perf"),
+        perf_wakeup => ("perf-wakeup","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -590,6 +595,7 @@ mod linux {
         bpf_maps => ("bpf-maps","bpf"),
         bpf_prog_load => ("bpf-prog-load","bpf"),
         bpf_prog_verify => ("bpf-prog-verify","bpf-prog"),
+        bpf_prog_maps => ("bpf-prog-maps","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -855,6 +861,7 @@ mod linux {
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
+        processes_generated_noexec => ("generated-noexec","process"),
         processes_beneath => ("beneath","process"),
         processes_propagation => ("propagation","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
@@ -867,6 +874,7 @@ mod linux {
         processes_proc_other_fd_paths => ("proc-other-fd-paths","process"),
         processes_proc_personality_wchan => ("proc-personality-wchan","process"),
         processes_proc_syscall => ("proc-syscall","process"),
+        processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),

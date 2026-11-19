@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -946,6 +947,159 @@ static int case_sample(void) {
     return 0;
 }
 
+#define WATERMARK (1ULL << 14)
+
+static short polled(int fd) {
+    struct pollfd p = {.fd = fd, .events = POLLIN};
+    return poll(&p, 1, 0) < 0 ? -1 : p.revents;
+}
+
+static volatile int io_count, io_in, io_hup, io_alike, trap_count, trap_alike;
+static int io_fd;
+static void on_io(int number, siginfo_t *info, void *context) {
+    (void)number;
+    (void)context;
+    io_count++;
+    if (info->si_code == POLL_IN) io_in++;
+    if (info->si_code == POLL_HUP) io_hup++;
+    io_alike &= info->si_fd == io_fd && (info->si_code == POLL_HUP || info->si_band == (POLLIN | POLLRDNORM));
+}
+static void on_trap(int number, siginfo_t *info, void *context) {
+    (void)number;
+    (void)context;
+    trap_count++;
+    const unsigned char *raw = (const unsigned char *)info;
+    trap_alike &= info->si_code == 6 && *(const uint64_t *)(raw + 24) == 0x1234 && *(const uint32_t *)(raw + 32) == 1 &&
+                  *(const uint32_t *)(raw + 36) == 0;
+}
+
+/* Signal-driven I/O to this process with SIGRTMIN, which is queued. */
+static void own_signals(int fd) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_io;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGRTMIN, &sa, NULL);
+    fcntl(fd, F_SETOWN, getpid());
+    fcntl(fd, F_SETSIG, SIGRTMIN);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_ASYNC);
+    io_fd = fd;
+    io_count = io_in = io_hup = 0;
+    io_alike = 1;
+}
+
+static int case_wakeup(void) {
+    /* Without a buffer, poll finds the event hung up. */
+    int fd = open_sampling(SAMPLE_TID | SAMPLE_PERIOD, 0);
+    say("no buffer %d", polled(fd));
+    void *page = NULL;
+    map_event(fd, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    say("empty %d", polled(fd));
+    munmap(page, 2 * 4096);
+    close(fd);
+
+    /* Each wakeup_events-th sample makes it readable once. */
+    struct attr a = software(2);
+    a.sample_period = 1;
+    a.sample_type = SAMPLE_TID | SAMPLE_PERIOD;
+    a.flags |= DISABLED;
+    a.wakeup_events = 1;
+    fd = (int)open_event(&a, 0, -1, -1, 0);
+    map_event(fd, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    faults_while_enabled(fd, 1);
+    short first = polled(fd), second = polled(fd);
+    say("wakeup events: readable %d then %d", first, second);
+    munmap(page, 2 * 4096);
+    close(fd);
+
+    /* With watermark, once wakeup_watermark bytes are written. */
+    a.flags |= WATERMARK;
+    a.wakeup_events = 4 * 24;
+    fd = (int)open_event(&a, 0, -1, -1, 0);
+    map_event(fd, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    faults_while_enabled(fd, 6);
+    first = polled(fd);
+    say("watermark: readable %d head>96 %d", first, PAGE_U64(page, 1024) > 96);
+    munmap(page, 2 * 4096);
+    close(fd);
+
+    /* O_ASYNC signals each overflow, with or without a buffer. */
+    fd = open_sampling(SAMPLE_TID | SAMPLE_PERIOD, 0);
+    own_signals(fd);
+    faults_while_enabled(fd, 3);
+    say("signals>=3 %d in %d alike %d hup %d", io_count >= 3, io_in == io_count, io_alike, io_hup);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_ASYNC);
+    io_count = 0;
+    faults_while_enabled(fd, 2);
+    say("off %d", io_count);
+    close(fd);
+
+    /* REFRESH allows that many overflows, the last hanging up. */
+    fd = open_sampling(SAMPLE_TID | SAMPLE_PERIOD, 0);
+    map_event(fd, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    own_signals(fd);
+    long refreshed = TRY(ioctl(fd, IOC_REFRESH, 2));
+    touch(5);
+    ioctl(fd, IOC_ID, &(uint64_t){0});
+    say("refresh %ld: signals %d in %d hup %d records %d", refreshed, io_count, io_in, io_hup,
+        (int)(PAGE_U64(page, 1024) / 24));
+    touch(2);
+    ioctl(fd, IOC_ID, &(uint64_t){0});
+    say("after: signals %d", io_count);
+    struct attr counting = software(2);
+    say("refresh counting %ld", TRY(ioctl((int)open_event(&counting, 0, -1, -1, 0), IOC_REFRESH, 1)));
+    struct attr inherited = software(2);
+    inherited.sample_period = 1;
+    inherited.flags |= INHERIT;
+    say("refresh inherit %ld", TRY(ioctl((int)open_event(&inherited, 0, -1, -1, 0), IOC_REFRESH, 1)));
+    munmap(page, 2 * 4096);
+    close(fd);
+
+    /* sigtrap: SIGTRAP of TRAP_PERF with sig_data and the type. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_trap;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGTRAP, &sa, NULL);
+    a = software(2);
+    a.sample_period = 1;
+    a.flags |= DISABLED | ATTR_SIGTRAP | REMOVE_ON_EXEC;
+    a.sig_data = 0x1234;
+    fd = (int)open_event(&a, 0, -1, -1, 0);
+    trap_alike = 1;
+    faults_while_enabled(fd, 2);
+    say("sigtrap>=1 %d alike %d", trap_count >= 1, trap_alike);
+    /* Blocked, it waits, flagged as late. */
+    sigset_t trap, old;
+    sigemptyset(&trap);
+    sigaddset(&trap, SIGTRAP);
+    sigprocmask(SIG_BLOCK, &trap, &old);
+    faults_while_enabled(fd, 1);
+    siginfo_t info;
+    struct timespec none = {0, 0};
+    int got = sigtimedwait(&trap, &info, &none);
+    const unsigned char *raw = (const unsigned char *)&info;
+    say("blocked %d code %d async %u", got, info.si_code, *(const uint32_t *)(raw + 36));
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    close(fd);
+
+    /* A child's event hangs up when the child ends. */
+    pid_t child = fork();
+    if (child == 0) {
+        pause();
+        _exit(0);
+    }
+    struct attr theirs = software(2);
+    theirs.sample_period = 1;
+    fd = (int)open_event(&theirs, child, -1, -1, 0);
+    map_event(fd, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    say("child running %d", polled(fd));
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    say("child gone %d", polled(fd));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -957,6 +1111,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-mmap")) return case_mmap();
     if (!strcmp(mode, "perf-output")) return case_output();
     if (!strcmp(mode, "perf-sample")) return case_sample();
+    if (!strcmp(mode, "perf-wakeup")) return case_wakeup();
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {
         spin();

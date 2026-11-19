@@ -5,13 +5,16 @@
    member of RTNLGRP_LINK hears (A's also RTNLGRP_NSID, as B's ID goes
    before B's end), its link dump and the interface ioctls, as the pair
    is made, brought up, deleted, made again and taken away with B's
-   namespace. Names, indices and addresses are given, as Linux
+   namespace, and what RTNLGRP_IPV4_NETCONF and RTNLGRP_IPV6_NETCONF hear
+   of each end's settings as it comes and goes, and as A writes
+   forwarding and rp_filter in /proc/sys/net. Names, indices and addresses are given, as Linux
    picks a random address and the next free index otherwise; some kernels
    put fallback tunnels in every namespace, which take the low indices, so
    the pairs' are 1000 to 1003, and only lo and those are shown. The two
    processes take turns through pipes, so their lines come in one order. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <poll.h>
 #include <sched.h>
@@ -33,6 +36,10 @@
 #define SOL_NETLINK_ 270
 #define NETLINK_ADD_MEMBERSHIP_ 1
 #define RTNLGRP_NSID_ 28
+#define RTNLGRP_IPV4_NETCONF_ 24
+#define RTNLGRP_IPV6_NETCONF_ 25
+#define RTM_NEWNETCONF 80
+#define RTM_DELNETCONF 81
 #define NLM_F_REQUEST 1
 #define NLM_F_ACK 4
 #define NLM_F_DUMP 0x300
@@ -99,6 +106,34 @@ static void info(struct body *b, int index, unsigned flags, unsigned change) {
     b->len += sizeof i;
 }
 
+/* Has mon join the netconf groups, saying how it went. */
+static void join_netconf(int mon) {
+    int groups[2] = {RTNLGRP_IPV4_NETCONF_, RTNLGRP_IPV6_NETCONF_};
+    for (int i = 0; i < 2; i++)
+        printf("%s: join netconf %d=%ld\n", side, groups[i],
+               result(setsockopt(mon, SOL_NETLINK_, NETLINK_ADD_MEMBERSHIP_, &groups[i], sizeof groups[i])));
+}
+/* Writes value to /proc/sys/net/<path>, saying whether it was taken (a
+   count, which Linux 7.0's IPv6 forwarding gives as 1, shows as 0). */
+static void sysctl_write(const char *path, const char *value) {
+    char name[128];
+    snprintf(name, sizeof name, "/proc/sys/net/%s", path);
+    int fd = open(name, O_WRONLY);
+    long got = fd < 0 ? -errno : result(write(fd, value, strlen(value)));
+    if (fd >= 0) close(fd);
+    printf("%s: write %s=%s: %ld\n", side, path, value, got < 0 ? got : 0);
+}
+/* A new namespace takes the first one's IPv4 all and default settings,
+   which the host may have changed (Docker turns forwarding on, Ubuntu
+   rp_filter to 2): sets them, and lo's, to 0 as Linux is built, before
+   anything hears of them. */
+static void settings_as_built(void) {
+    static const char *const paths[] = {
+        "ipv4/conf/all/forwarding", "ipv4/conf/default/forwarding", "ipv4/conf/lo/forwarding",
+        "ipv4/conf/all/rp_filter",  "ipv4/conf/default/rp_filter",  "ipv4/conf/lo/rp_filter",
+    };
+    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++) sysctl_write(paths[i], "0");
+}
 static int route_socket(unsigned groups) {
     int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE_);
     struct nl_address at = {.family = AF_NETLINK, .groups = groups};
@@ -182,6 +217,24 @@ static int show(const unsigned char *buf, long n, const char *label) {
                 a += (alen + 3) & ~3;
             }
             printf("\n");
+        } else if ((h->type == RTM_NEWNETCONF || h->type == RTM_DELNETCONF) && body_len >= 4) {
+            /* Of all, default, lo and the pairs; others are tunnels. */
+            int index = 0;
+            if (body_len >= 12) memcpy(&index, body + 8, 4);
+            if (index == -1 || index == -2 || index == 1 || (index >= A_INDEX && index <= A_INDEX + 3)) {
+                printf("%s: %s: type=%u family=%u", side, label, h->type, body[0]);
+                for (int a = 4; a + 4 <= body_len;) {
+                    unsigned short alen, kind;
+                    memcpy(&alen, body + a, 2);
+                    memcpy(&kind, body + a + 2, 2);
+                    if (alen < 4 || a + alen > body_len) break;
+                    int value = 0;
+                    if (alen >= 8) memcpy(&value, body + a + 4, 4);
+                    printf(" %u=%d", kind & 0x3fff, value);
+                    a += (alen + 3) & ~3;
+                }
+                printf("\n");
+            }
         } else if ((h->type == RTM_NEWLINK || h->type == RTM_DELLINK) && body_len >= 16) {
             struct ifinfo i;
             memcpy(&i, body, sizeof i);
@@ -288,7 +341,9 @@ static void veth(struct body *b, const char *name, int index, const char *peer_n
 static void child(int in, int out) {
     side = "B";
     if (unshare(CLONE_NEWNET) < 0) printf("B: unshare=%d\n", -errno);
+    settings_as_built();
     int ctl = route_socket(0), mon = route_socket(1);
+    join_netconf(mon);
     fflush(stdout);
     if (write(out, "r", 1) != 1) _exit(2);
     for (char command; read(in, &command, 1) == 1;) {
@@ -334,11 +389,13 @@ int main(int argc, char **argv) {
             printf("A: B gone\n");                                            \
     } while (0)
     printf("A: unshare=%ld\n", result(unshare(CLONE_NEWNET)));
+    settings_as_built();
     int ctl = route_socket(0), mon = route_socket(1);
     /* RTNLGRP_NSID too, to hear B's ID go before its end of the pair. */
     int nsid_group = RTNLGRP_NSID_;
     printf("A: join nsid=%ld\n",
            result(setsockopt(mon, SOL_NETLINK_, NETLINK_ADD_MEMBERSHIP_, &nsid_group, sizeof nsid_group)));
+    join_netconf(mon);
     struct body m = {0};
     veth(&m, "va", A_INDEX, "vb", B_INDEX, b, NULL, 0);
     request(ctl, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &m, "make");
@@ -346,6 +403,29 @@ int main(int argc, char **argv) {
     dump(ctl, "dump");
     ioctls(ctl, "va", A_INDEX);
     B_DOES("p");
+    /* The settings' writes: all's IPv4 forwarding tells all's, default's
+       and each device's; a device's or default's its own; rp_filter of
+       default its own alone; IPv6's only as it turns on or off. A value
+       the setting has tells nothing. */
+    sysctl_write("ipv4/conf/all/forwarding", "1");
+    heard(mon, "heard", 300, 300);
+    sysctl_write("ipv4/conf/va/forwarding", "0");
+    sysctl_write("ipv4/conf/va/forwarding", "0");
+    sysctl_write("ipv4/conf/default/forwarding", "0");
+    sysctl_write("ipv4/conf/default/rp_filter", "2");
+    sysctl_write("ipv4/conf/va/rp_filter", "2");
+    heard(mon, "heard", 300, 300);
+    sysctl_write("ipv6/conf/all/forwarding", "1");
+    heard(mon, "heard", 300, 300);
+    sysctl_write("ipv6/conf/all/forwarding", "2");
+    sysctl_write("ipv6/conf/va/forwarding", "0");
+    sysctl_write("ipv6/conf/default/forwarding", "1");
+    sysctl_write("ipv6/conf/all/disable_ipv6", "0");
+    heard(mon, "heard", 300, 300);
+    sysctl_write("ipv4/conf/all/forwarding", "0");
+    sysctl_write("ipv6/conf/all/forwarding", "0");
+    sysctl_write("ipv4/conf/default/rp_filter", "0");
+    heard(mon, "heard", 300, 300);
     /* What is refused: the name again, an address of 5 bytes, a multicast
        address, an MTU below 68, a kind there is not, deleting lo. */
     m = (struct body){0};
@@ -397,9 +477,14 @@ int main(int argc, char **argv) {
     /* A pair within A (its peer of no namespace is the requester's), then
        its end vd, up, moved to B (IFLA_NET_NS_PID of a link there is):
        closed first, and gone from A with its new ID and index. vc stays
-       down, so neither has a carrier to lose. Then deleted from A. */
+       down, so neither has a carrier to lose. Then deleted from A. vc's
+       MTU is too small for IPv6, so it has only IPv4's settings; each end
+       takes default's (forwarding on), and vd takes B's as it moves. */
+    sysctl_write("ipv4/conf/default/forwarding", "1");
+    heard(mon, "heard", 300, 300);
     m = (struct body){0};
     veth(&m, "vc", A_INDEX + 2, "vd", A_INDEX + 3, 0, NULL, 0);
+    put32(&m, IFLA_MTU, 1279);
     request(ctl, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &m, "make within");
     heard(mon, "heard", 300, 300);
     dump(ctl, "dump within");

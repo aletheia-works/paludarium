@@ -1598,7 +1598,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   前に `EACCES` で、通常のファイルへの `X_OK` 付きの `access` も同じです。そこのファイルを
   `PROT_EXEC` で `mmap` すると `EPERM`、`READ_IMPLIES_EXEC` はそれに `PROT_EXEC` を足さず、
   `mprotect` もそのマッピングを実行できるようにはしません（`EACCES`。VMA に `VM_MAYEXEC`
-  がありません）。`nodev` のマウントは、そこのデバイスを開きません（`EACCES`。
+  がありません）。カーネルが作るファイルは、Linux の `/proc` と `/dev`（`/dev` は
+  systemd のもとで）と同じく `noexec` のマウントにあります。`/dev/zero` を `PROT_EXEC`
+  で `mmap` すると `EPERM` ですが、そこのリンク（`/dev/fd`、`/proc/self/fd`）から
+  たどったファイルはそれ自身のマウントにあります。`nodev` のマウントは、そこのデバイスを開きません（`EACCES`。
   `may_open_dev`。root でも同じです）。`nosuid` のマウントや、呼び出し元がいない
   ユーザー名前空間のスーパーブロックにあるプログラムは、set-user-ID と set-group-ID の
   ビットもファイルケーパビリティもなしに実行します（`mnt_may_suid`）。スクリプトでは、
@@ -2053,6 +2056,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     同じく、`RTM_DELLINK` の前に、アドレスとそのローカル経路が消えたことを一つずつ
     伝えます。アドレスと経路のダンプは端のインデックス（`ifaddrmsg` のもの、`RTA_OIF`）を
     取ります。
+  - **veth の端の netconf:** それぞれの端の設定は、その名前空間に伝えます（`RTNLGRP_IPV4_NETCONF`、
+    `RTNLGRP_IPV6_NETCONF`。`inetdev_init`、`ipv6_add_dev` とその後始末が伝えるのと
+    同じです）。増えるときは IPv4 の、それから IPv6 の設定のすべての `RTM_NEWNETCONF` を
+    その `RTM_NEWLINK` の前に、消えるときはそれぞれの `RTM_DELNETCONF` をその
+    `RTM_DELLINK` の前に伝えます。MTU が 1280 より小さい端には IPv6 がないので、
+    IPv4 のものだけです。移すときは、離れる名前空間の `RTM_NEWNSID` と `RTM_DELLINK` の
+    前に設定が消えたことを伝え、端は移った先の名前空間の `default` の設定を取り、それを
+    そこでの `RTM_NEWLINK` の前に伝えます。
   - **名前空間の ID:** Linux の `net_namespace.c` と同じく、`RTM_NEWNSID` は、
     プロセス（`NETNSA_PID`、なければ `ESRCH`）か `/proc/<pid>/ns/net` の記述子
     （`NETNSA_FD`、`EBADF`、ほかのファイルなら `EINVAL`）のネットワーク名前空間に
@@ -2344,9 +2355,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     `NUD_NOARP` です。`lo` を落とすと、新しいものから順に `RTM_DELNEIGH` で伝えます
     （`fib_disable_ip` と `rt6_disable_ip` が消すのと同じく、IPv4 のものは `RTM_NEWLINK`
     のあと、IPv6 のものはその経路のあとでアドレスの前）。IPv4 のものは、最後の IPv4 の
-    アドレスがなくなったときにも伝えます。netconf の通知（`RTNLGRP_IPV4_NETCONF`、
-    `RTNLGRP_IPV6_NETCONF`）は来ません。Linux も、デバイスが増えるか消えるとき、または
-    転送の sysctl に書いたときにしか送りません。
+    アドレスがなくなったときにも伝えます。`lo` の変化では netconf の通知
+    （`RTNLGRP_IPV4_NETCONF`、`RTNLGRP_IPV6_NETCONF`）は来ません。Linux も、デバイスが
+    増えるか消えるとき（上の veth ペア）か、`/proc/sys/net` の設定が変わったとき（下）に
+    しか送りません。どれも、ファミリーと `NETCONFA_IFINDEX`（`all` は -1、`default` は
+    -2）と伝える設定を持つ `netconfmsg` で、ポートとシーケンス番号は 0 です。増える
+    デバイスでは、`inet_netconf_fill_devconf` と（`CONFIG_IPV6_MROUTE` のある
+    カーネルの）`inet6_netconf_fill_devconf` と同じく、IPv4 の転送、逆経路のフィルター、
+    マルチキャストとブロードキャストの転送、プロキシ ARP、リンクの落ちた経路を無視する
+    設定と、IPv6 の転送、マルチキャストの転送、プロキシ NDP、最後のものを伝えます。
 
 - 汎用 netlink のソケット（プロトコル `NETLINK_GENERIC`）は自分のポートを持つので、
   `NETLINK_ROUTE` のソケットもプロセスの ID に bind していても、同じくプロセスの ID に
@@ -2878,7 +2895,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   数値）は 0 です。Linux の `ptrace_may_access` がファイルシステムの ID で決めるとおり、
   タスクのメモリを見てはいけない読み手には、Linux の `do_task_stat` と同じく、
   `start_code` と `end_code` を 1、スタックの始まり、`wchan`、`start_data` から後の
-  項目をすべて 0 として隠します。`stat` は Linux と同じく先頭から読むたびに作るので、
+  項目をすべて 0 として隠します。その最後の `exit_code` は、終わったプロセスでは wait の
+  ステータス（終了コードの 256 倍か、シグナル。コアダンプしたものは 0x80 を足します）で、
+  止まったプロセスでは、wait がその停止を報告するまで、プロセス自身の `stat` に止めた
+  シグナルが出ます（Linux の `group_exit_code`）。`task` の下のスレッドの `stat` には
+  停止のものは出ません。`stat` は Linux と同じく先頭から読むたびに作るので、
   同じディスクリプターでもそのときのタスクと読み手で決まります。権限を手放した読み手には
   アドレスが隠れ、回収されたタスクは `ESRCH` です。`cmdline` と `environ` は、今メモリにある引数と環境変数の文字列で、
   それぞれ NUL で終わります。`comm` は名前と改行です。
@@ -2961,7 +2982,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
 
 - `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
-  `default`、デバイスごと（`lo`）に持つのと同じく、開いたプロセスのネットワーク名前空間の
+  `default`、デバイスごと（`lo` と veth の端）に持つのと同じく、開いたプロセスのネットワーク名前空間の
   設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
   `ipv6/conf/<デバイス>/disable_ipv6` と `forwarding` です。ファイルとディレクトリは、
   ネットワーク名前空間を持つユーザー名前空間の root のもので、ファイルは 0644 です。
@@ -2975,12 +2996,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - IPv4 の `forwarding`（`ip_forward` は `all` のもの）には、書き手の `CAP_NET_ADMIN` が
     要ります（`EPERM`、`devinet_sysctl_forward`）。`all` のものが変わると、`default` と
     すべてのデバイスのものも変わります。`default` のものはどのデバイスにも及びません。
+    変えた書き込みは、`RTNLGRP_IPV4_NETCONF` のメンバーにその転送の `RTM_NEWNETCONF` で
+    伝えます。`all` のものなら `all`、`default`、すべてのデバイスの順に、`default` か
+    デバイスのものならそれだけです。
   - デバイスに設定した `rp_filter` はそのデバイスのものになります。`default` に設定すると、
     まだ設定していないすべてのデバイスに及びます。失敗した書き込みでも、設定したことに
-    なります（`devinet_conf_proc`）。
+    なります（`devinet_conf_proc`）。値を変えた書き込みは、書いた先のものだけを伝え、
+    `default` のものを取ったデバイスのものは伝えません。
   - IPv6 の 2 つは、Linux master の `addrconf_sysctl_forward` と `addrconf_sysctl_disable`、
     そして CI のカーネルと同じく、正しくない値を `EINVAL` で知らせます（7.0 は知らせず、
     `all` かデバイスの `forwarding` は 1 を返しました）。`all` のものは `default` とすべてのデバイスのものを変えます。
+    `forwarding` は、`addrconf_fixup_forwarding` と同じく、入るか切れるときだけ
+    `RTNLGRP_IPV6_NETCONF` のメンバーに伝えます（1 から 2 では伝えません）。`all` の
+    ものでは、`default`、切り替わったデバイスのもの、`all` 自身の順です。
+    `disable_ipv6` はこうして伝えることはありません。
     デバイスの `disable_ipv6` を入れると、そのデバイスは IPv6 のアドレスと経路を失い、
     落ちたときと同じく知らせます（`addrconf_ifdown`）。上がっている間に切ると、
     `NETDEV_UP` と同じく `::1` が戻り、IPv6 自身の `RTM_NEWLINK`（`RTNLGRP_IPV6_IFINFO`）を
@@ -3485,8 +3514,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
   は `EINVAL` で、サンプリングするイベントには新しい周期（`freq` なら新しい頻度）を
-  与え、周期は初めからになります。`REFRESH` はどのイベントでも `EINVAL` です
-  （[制限](./limitations) を参照）。`enable_on_exec` は、`perf stat` が使うように、無効な
+  与え、周期は初めからになります。`REFRESH` は、サンプリングしないか、新しい
+  タスクが引き継ぐイベントでは `EINVAL` で、そうでなければその数だけオーバーフローを
+  許してイベントを有効にします（`event_limit`）。その最後でイベントは無効になり、
+  `POLL_HUP` を知らせます。`enable_on_exec` は、`perf stat` が使うように、無効な
   イベントをそのタスクの `execve` で有効にし、`remove_on_exec` は、Linux master と同じく、そのとき
   イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
   持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで
@@ -3556,7 +3587,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   バッファは中身を上書きし、何も失いません。`PERF_EVENT_IOC_PAUSE_OUTPUT` はバッファを
   止め、また動かし（バッファがないか、データページがなければ `EINVAL`）、止まっている
   バッファは受け取らない記録を失ったものと数えます。引き継いだイベントは、元のイベントの
-  バッファへ書きます。ディスクリプタのリンクは
+  バッファへ書きます。`wakeup_events` 回のサンプルごと、`watermark` なら
+  `wakeup_watermark` バイトごと（ないときはデータの半分）に、バッファは `poll` や
+  `epoll` で待つものを起こします。そのとき一度だけ読める（`POLLIN`）ようになり、
+  `perf_poll` が起こされた状態を取るので、次まではまた読めません。バッファのない
+  イベントと、タスクが終わり引き継いだイベントも残っていないイベントは、切れています
+  （`POLLHUP`）。`O_ASYNC` では、オーバーフローのたびに、バッファがあってもなくても、
+  ファイルの持ち主（`F_SETOWN`）へ `POLL_IN` を知らせ、`F_SETSIG` のシグナルは
+  `si_code`、`si_band`、`si_fd` を持ちます。`sigtrap` では、オーバーフローはスレッドに
+  `TRAP_PERF` の SIGTRAP を送り、`si_perf_data` と `si_perf_type` に `sig_data` と
+  イベントの型を、スレッドがそれをブロックしていれば `TRAP_PERF_FLAG_ASYNC` を
+  持たせます。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 
@@ -3698,6 +3739,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EACCES`）、exit のときの R0（値は何でもかまいません）です。オペランドを知っている
   条件ジャンプは一方へだけ進み、ほかは両方をたどります。Linux と同じく、1,000,000 命令か、
   たどるのを待つジャンプが 8,192 個を超えるとあきらめます（`E2BIG`）。
+
+- プログラムは、Linux の検証器が許すとおりにマップを使えます。マップのディスクリプタの
+  `BPF_LD_IMM64`（`BPF_PSEUDO_MAP_FD`）はマップを、その値の `BPF_LD_IMM64`
+  （`BPF_PSEUDO_MAP_VALUE`）は要素が一つの配列の値へのポインタを与えます。マップでない
+  ディスクリプタは `EBADF` か `EINVAL`（"fd %d is not pointing to valid bpf_map"）、ほかの型の
+  値は `EINVAL`、要素が二つ以上の配列の値は `ENOTSUPP`、値の先は `EINVAL` です。同じマップを
+  二度名指しても一つで、一つのプログラムが使えるのは 64 個までです（`E2BIG`）。呼べるのは
+  `bpf_map_lookup_elem`、`bpf_map_update_elem`、`bpf_map_delete_elem` で、R1 にマップ
+  （"R1 type=%s expected=map_ptr"、`EACCES`）、キーと値はスタックかマップの値に、その大きさに
+  収まるように置きます。呼び出しのあと R1 から R5 はなくなり、R0 が結果です。
+  `BPF_F_RDONLY_PROG` を付けて作ったマップの更新と削除は "write into map forbidden"
+  （`EACCES`）です。検索の結果は null かもしれません。64 ビットの `BPF_JEQ` か `BPF_JNE` で
+  0 と比べるまで、それを通した読み書きもオフセットの足し算もできません。比べると、その結果と、レジスタや
+  スタックにあるそのすべての写しが、一方では値へのポインタ、もう一方では 0 になります
+  （"R%d invalid mem access 'map_value_or_null'"、`EACCES`）。値の読み書きはその大きさに
+  収まり（"invalid access to map value"、`EACCES`）、マップが `BPF_F_RDONLY_PROG` なら書けず、
+  `BPF_F_WRONLY_PROG` なら読めません（`EACCES`）。プログラムは使うマップを持ち続けます。
 
 - ログ（`log_level`、`log_buf`、`log_size`）には、プログラムを断った理由の行（二つの
   カーネルで言い方が違うときは 7.0 の言い方）と "processed %d insns" の行を、固定

@@ -97,6 +97,7 @@ pub(crate) fn has_fasync(file: &Arc<dyn FileHandle>) -> bool {
     crate::sockets::endpoint(file).is_some()
         || crate::inet::of(file).is_some()
         || crate::inotify::of(file).is_some()
+        || crate::perf::is_event(file)
         || crate::pty::is_terminal(file)
         || crate::files::standard(file).is_some_and(crate::files::StandardFile::signals)
 }
@@ -196,6 +197,8 @@ pub(crate) fn set_flags(
             socket.set_async(registration);
         } else if let Some(instance) = crate::inotify::of(file) {
             instance.set_async(registration);
+        } else if crate::perf::is_event(file) {
+            crate::perf::set_async(file, registration);
         } else if crate::pty::is_terminal(file) {
             crate::pty::set_async(c, file, registration);
         } else if let Some(stdin) = crate::files::standard(file) {

@@ -158,26 +158,43 @@ static int exec_child(void) {
     return 7;
 }
 
+/* The calls a child has gone into that its parent waits for it to block
+ * in, which the child counts just before it makes each: a page that the
+ * fork leaves shared. /proc's 'S' alone does not tell which call a task
+ * sleeps in, and under an emulator that shows a task asleep in every call
+ * it is in it can be the call before, such as the write of a ready byte or
+ * the rt_sigreturn of a handler. */
+static int *entered;
+
+static int share_entered(void) {
+    entered = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (entered == MAP_FAILED) return -1;
+    *entered = 0;
+    return 0;
+}
+
+static void enter(void) { __atomic_add_fetch(entered, 1, __ATOMIC_SEQ_CST); }
+
 /* PTRACE_ATTACH of a child waiting in pause: the stop for the attach's
  * SIGSTOP, with the restart code of the interrupted call in rax, and the
  * refusals of a second attach, of an attach to oneself, and of requests
  * to a task that is not stopped or not traced. */
 static int attach(void) {
     int ready[2];
-    if (pipe(ready)) return 80;
+    if (pipe(ready) || share_entered()) return 80;
     pid_t child = fork();
     if (child == 0) {
         signal(SIGUSR1, on_signal);
         write(ready[1], "x", 1);
+        enter();
         for (;;) pause();
     }
-    /* Attaches once the child sleeps in pause, its only blocking call
-     * after the write, so that the stop is the same each run; the pause
-     * before each look lets the child leave the write. */
+    /* Attaches once the child sleeps in pause, so that the stop is the
+     * same each run. */
     char byte, state = 0;
     read(ready[0], &byte, 1);
-    do usleep(10000);
-    while (tracer_pid_of(child, &state) >= 0 && state != 'S');
+    while (__atomic_load_n(entered, __ATOMIC_SEQ_CST) < 1) usleep(1000);
+    while (tracer_pid_of(child, &state) >= 0 && state != 'S') usleep(1000);
     result("untraced", pt(PTRACE_CONT, child, 0, 0));
     result("self", pt(PTRACE_ATTACH, getpid(), 0, 0));
     result("attach", pt(PTRACE_ATTACH, child, 0, 0));

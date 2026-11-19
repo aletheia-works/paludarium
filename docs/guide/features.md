@@ -1798,7 +1798,11 @@ kernel.
   there are `EACCES` before their permission, as is `access` with `X_OK`
   of a regular file; `mmap` of a file there with `PROT_EXEC` is `EPERM`,
   `READ_IMPLIES_EXEC` adds no `PROT_EXEC` to it, and `mprotect` gives its
-  mapping none (`EACCES`, the VMA without `VM_MAYEXEC`). A `nodev` mount
+  mapping none (`EACCES`, the VMA without `VM_MAYEXEC`). The files the
+  kernel generates are on `noexec` mounts, as `/proc` and `/dev` are on
+  Linux (with systemd for `/dev`): `mmap` of `/dev/zero` with `PROT_EXEC`
+  is `EPERM`, while a file reached through a link there (`/dev/fd`,
+  `/proc/self/fd`) is on its own mount. A `nodev` mount
   opens no device there (`EACCES`, `may_open_dev`, for root too). A
   program on a `nosuid` mount, or on a superblock of a user namespace the
   caller is not in, runs without its set-user-ID and set-group-ID bits and
@@ -2328,6 +2332,16 @@ kernel.
     of its addresses and their local routes going, as `inetdev_destroy`
     does, before its `RTM_DELLINK`. Address and route dumps take an end's
     index (the `ifaddrmsg`'s, `RTA_OIF`).
+  - **Netconf of veth ends:** each end's settings
+    are told of in its namespace (`RTNLGRP_IPV4_NETCONF`,
+    `RTNLGRP_IPV6_NETCONF`, as `inetdev_init`, `ipv6_add_dev` and their
+    undoing tell them): as it comes, `RTM_NEWNETCONF` of all of IPv4's and
+    then IPv6's, before its `RTM_NEWLINK`; as it goes, `RTM_DELNETCONF` of
+    each, before its `RTM_DELLINK`. An end whose MTU is below 1280 has no
+    IPv6, and so only IPv4's. A move tells them gone before the leaving
+    namespace's `RTM_NEWNSID` and `RTM_DELLINK`, and the end takes the
+    entered namespace's `default` settings, told of there before its
+    `RTM_NEWLINK`.
   - **Namespace IDs:** as Linux's `net_namespace.c`, `RTM_NEWNSID` gives
     the network namespace of a process (`NETNSA_PID`, `ESRCH` for none) or
     of a `/proc/<pid>/ns/net` descriptor (`NETNSA_FD`, `EBADF`, or `EINVAL`
@@ -2684,9 +2698,17 @@ kernel.
     down (IPv4's after `RTM_NEWLINK`, IPv6's after its routes and before
     its addresses, as `fib_disable_ip` and `rt6_disable_ip` flush them) and
     IPv4's when it loses its last IPv4 address. No netconf notification
-    (`RTNLGRP_IPV4_NETCONF`, `RTNLGRP_IPV6_NETCONF`) comes, as on Linux,
-    which sends one only as a device comes or goes or a forwarding sysctl
-    is written.
+    (`RTNLGRP_IPV4_NETCONF`, `RTNLGRP_IPV6_NETCONF`) comes of `lo`'s
+    changes, as on Linux, which sends one only as a device comes or goes
+    (veth pairs, above) or a setting in `/proc/sys/net` changes (below).
+    Each is a `netconfmsg` with its family, `NETCONFA_IFINDEX` (-1 for
+    `all`, -2 for `default`) and the settings told of, of port and
+    sequence number 0: for a device that comes, IPv4's forwarding,
+    reverse path filter, multicast and broadcast forwarding, proxy ARP and
+    ignoring routes with their link down, and IPv6's forwarding,
+    multicast forwarding, proxy NDP and the last, as
+    `inet_netconf_fill_devconf` and `inet6_netconf_fill_devconf` (of a
+    kernel with `CONFIG_IPV6_MROUTE`) give them.
 
 - A generic netlink socket (protocol `NETLINK_GENERIC`) has its own ports,
   so it binds to the process's ID as a `NETLINK_ROUTE` socket does too,
@@ -3300,6 +3322,10 @@ kernel.
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
   every field from `start_data` on, as Linux's `do_task_stat` hides them.
+  The last of those, `exit_code`, is the wait status of a process that has
+  ended (its code times 256, or its signal, with 0x80 for a core dumped), and
+  a stopped process's signal in its own `stat` until a wait reports the stop
+  (Linux's `group_exit_code`); a thread's `stat` under `task` has no stop's.
   `stat` is made at each read from its start, as Linux's is, so a descriptor
   shows what the task and the reader are then: one that drops its rights
   sees the addresses hidden, and a task that has been reaped is `ESRCH`.
@@ -3397,7 +3423,7 @@ kernel.
 
 - `/proc/sys/net` has the settings of the opener's network namespace, as
   Linux's `net/ipv4/devinet.c` and `net/ipv6/addrconf.c` keep them for
-  `all`, `default` and each device (`lo`): `ipv4/ip_forward`,
+  `all`, `default` and each device (`lo` and the veth ends): `ipv4/ip_forward`,
   `ipv4/conf/<device>/forwarding` and `rp_filter`, and
   `ipv6/conf/<device>/disable_ipv6` and `forwarding`. They and their
   directories belong to the root of the user namespace that owns the
@@ -3412,15 +3438,23 @@ kernel.
   - IPv4's `forwarding` (`ip_forward` is `all`'s) needs `CAP_NET_ADMIN`
     of the writer (`EPERM`, `devinet_sysctl_forward`); `all`'s, when it
     changes, sets `default`'s and every device's, while `default`'s
-    reaches no device.
+    reaches no device. A write that changes one is told to the members of
+    `RTNLGRP_IPV4_NETCONF` with `RTM_NEWNETCONF` of its forwarding: of
+    `all`'s, then `default`'s and every device's, of `default`'s or of a
+    device's alone.
   - `rp_filter` set on a device stays its own; one set on `default` goes
     to every device that has not been set, even by a write that failed
-    (`devinet_conf_proc`).
+    (`devinet_conf_proc`). A write that changes it tells of the one written
+    to alone, not of the devices that take `default`'s.
   - IPv6's two report a bad value (`EINVAL`), as Linux master's
     `addrconf_sysctl_forward` and `addrconf_sysctl_disable` do and the CI
     kernel does (7.0's left it unreported and had `forwarding` of `all` or
     a device return 1). `all`'s sets
-    `default`'s and every device's. A device whose `disable_ipv6` turns
+    `default`'s and every device's. `forwarding` is told of to the members
+    of `RTNLGRP_IPV6_NETCONF` only as it turns on or off (from 1 to 2 tells
+    nothing), as `addrconf_fixup_forwarding` does: of `all`'s, `default`'s
+    first, then each device's that turns, then `all`'s own;
+    `disable_ipv6` is told of so by nothing. A device whose `disable_ipv6` turns
     on loses its IPv6 addresses and routes, told of as when it goes down
     (`addrconf_ifdown`); turning off while it is up gives `::1` back, and
     IPv6's own `RTM_NEWLINK` (`RTNLGRP_IPV6_IFINFO`), as `NETDEV_UP`
@@ -4001,8 +4035,10 @@ kernel.
   `RESET`, each of the event or with `PERF_IOC_FLAG_GROUP` of its group,
   and `PERF_EVENT_IOC_ID` are there; `PERIOD` is `EINVAL` for an event
   that does not sample, and gives a sampling event a new period (or with
-  `freq` a new frequency) that starts over; `REFRESH` is `EINVAL` for
-  every event (see [limitations](./limitations)). `enable_on_exec` enables a disabled
+  `freq` a new frequency) that starts over; `REFRESH` is `EINVAL` for an
+  event that does not sample or that new tasks inherit, and else allows
+  that many more overflows and enables the event (`event_limit`): the
+  last of them disables it and signals `POLL_HUP`. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
   `remove_on_exec` takes one out then for good, as Linux master does: it
   counts no more, keeps its last count and times to be read, has no owner
@@ -4084,7 +4120,18 @@ kernel.
   overwrites what it holds and loses nothing. `PERF_EVENT_IOC_PAUSE_OUTPUT`
   pauses and resumes the buffer (`EINVAL` without one, or for one of no
   data pages), which counts what it does not take as lost. An inherited
-  event writes to the buffer of the one it comes from. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  event writes to the buffer of the one it comes from. Every
+  `wakeup_events` samples, or with `watermark` every `wakeup_watermark`
+  bytes (half the data without one), the buffer wakes those who wait for
+  it in `poll` or `epoll`: it is readable (`POLLIN`) once, as
+  `perf_poll` takes what the wakeup left, until the next. An event
+  without a buffer, and one whose task has ended with no inherited events
+  left, is hung up (`POLLHUP`). With `O_ASYNC`, each overflow signals the
+  file's owner (`F_SETOWN`) with `POLL_IN`, `F_SETSIG`'s signal carrying
+  `si_code`, `si_band` and `si_fd`, with or without a buffer; and with
+  `sigtrap`, an overflow sends the thread SIGTRAP of `TRAP_PERF` with
+  `sig_data` and the event's type in `si_perf_data` and `si_perf_type`,
+  and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 
@@ -4255,6 +4302,27 @@ kernel.
   A conditional jump whose operands it knows goes one way; any other is
   walked both ways. It gives up as Linux does after 1,000,000 instructions
   or 8,192 jumps waiting to be walked (`E2BIG`).
+
+- Programs use maps as Linux's verifier lets them. A `BPF_LD_IMM64` of a
+  map's descriptor (`BPF_PSEUDO_MAP_FD`) gives the map, and one of its
+  value (`BPF_PSEUDO_MAP_VALUE`) a pointer into the value of an array of
+  one element: a descriptor of no map is `EBADF` or `EINVAL` ("fd %d is
+  not pointing to valid bpf_map"), a value of another type `EINVAL`, of an
+  array of more elements `ENOTSUPP`, and past the value `EINVAL`; a map
+  named twice is one, and a program uses 64 at most (`E2BIG`). It may call
+  `bpf_map_lookup_elem`, `bpf_map_update_elem` and `bpf_map_delete_elem`
+  with the map in R1 ("R1 type=%s expected=map_ptr", `EACCES`) and the key
+  and value on the stack or in a map's value, their sizes within it; R1 to
+  R5 are gone after a call, and R0 is its result. An update or delete of
+  a map made with `BPF_F_RDONLY_PROG` is "write into map forbidden"
+  (`EACCES`). A lookup's result may be null: nothing may be read or
+  written through it, nor added to it, until a 64-bit `BPF_JEQ` or `BPF_JNE` compares it with 0, which
+  makes it, and every copy of it in a register or on the stack, a pointer
+  to the value on one side and 0 on the other ("R%d invalid mem access
+  'map_value_or_null'", `EACCES`). A value is read and written within its
+  size ("invalid access to map value", `EACCES`), not written when the
+  map has `BPF_F_RDONLY_PROG` and not read when it has
+  `BPF_F_WRONLY_PROG` (`EACCES`). The program keeps the maps it uses.
 
 - The log (`log_level`, `log_buf`, `log_size`) gets the line that says
   why a program was refused, in 7.0's words where the two kernels word it

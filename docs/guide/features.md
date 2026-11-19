@@ -1700,7 +1700,11 @@ kernel.
   there are `EACCES` before their permission, as is `access` with `X_OK`
   of a regular file; `mmap` of a file there with `PROT_EXEC` is `EPERM`,
   `READ_IMPLIES_EXEC` adds no `PROT_EXEC` to it, and `mprotect` gives its
-  mapping none (`EACCES`, the VMA without `VM_MAYEXEC`). A `nodev` mount
+  mapping none (`EACCES`, the VMA without `VM_MAYEXEC`). The files the
+  kernel generates are on `noexec` mounts, as `/proc` and `/dev` are on
+  Linux (with systemd for `/dev`): `mmap` of `/dev/zero` with `PROT_EXEC`
+  is `EPERM`, while a file reached through a link there (`/dev/fd`,
+  `/proc/self/fd`) is on its own mount. A `nodev` mount
   opens no device there (`EACCES`, `may_open_dev`, for root too). A
   program on a `nosuid` mount, or on a superblock of a user namespace the
   caller is not in, runs without its set-user-ID and set-group-ID bits and

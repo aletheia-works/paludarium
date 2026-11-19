@@ -1441,10 +1441,23 @@ pub(crate) const ST_NOEXEC: u64 = 0x8;
 const ST_RELATIME: u64 = 0x1000;
 /// Whether the mount of the file at `path`, its links followed, has the
 /// `statfs` flag `flag` (`MNT_NOEXEC` for `path_noexec`, `MNT_NODEV` for
-/// `may_open_dev`, `MNT_NOSUID` for `mnt_may_suid`). `/proc` and `/dev`,
-/// which the kernel generates, are Linux's own mounts, which have none.
+/// `may_open_dev`, `MNT_NOSUID` for `mnt_may_suid`). A file the kernel
+/// generates is on the mount Linux has there ([`generated_mount`]), all of
+/// them `noexec` (so `mmap` with `PROT_EXEC` of `/dev/zero` is `EPERM`, and
+/// `access` with `X_OK` `EACCES`); their `nosuid` and `nodev` refuse
+/// nothing, as no file there has a set-ID bit or is a device on a `nodev`
+/// mount, and are left out. The callers give a link's target, so a file
+/// reached through `/proc/self/fd` or `/proc/self/exe` is on its own mount.
 pub(crate) fn mount_says(files: &Files, path: &[u8], flag: u64) -> bool {
-    !path.is_empty() && !generated(path) && files.fs().statfs_flags(path) & flag != 0
+    if path.is_empty() {
+        return false;
+    }
+    if generated(path) {
+        return flag == ST_NOEXEC
+            && generated_mount(path)
+                .is_some_and(|(_, _, flags)| flags & paludarium_vfs::mount_flags::NOEXEC != 0);
+    }
+    files.fs().statfs_flags(path) & flag != 0
 }
 /// [`mount_target`] of a directory, its links followed (`LOOKUP_FOLLOW |
 /// LOOKUP_DIRECTORY`, `ENOTDIR` for another file).

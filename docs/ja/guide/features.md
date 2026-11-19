@@ -1500,7 +1500,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   前に `EACCES` で、通常のファイルへの `X_OK` 付きの `access` も同じです。そこのファイルを
   `PROT_EXEC` で `mmap` すると `EPERM`、`READ_IMPLIES_EXEC` はそれに `PROT_EXEC` を足さず、
   `mprotect` もそのマッピングを実行できるようにはしません（`EACCES`。VMA に `VM_MAYEXEC`
-  がありません）。`nodev` のマウントは、そこのデバイスを開きません（`EACCES`。
+  がありません）。カーネルが作るファイルは、Linux の `/proc` と `/dev`（`/dev` は
+  systemd のもとで）と同じく `noexec` のマウントにあります。`/dev/zero` を `PROT_EXEC`
+  で `mmap` すると `EPERM` ですが、そこのリンク（`/dev/fd`、`/proc/self/fd`）から
+  たどったファイルはそれ自身のマウントにあります。`nodev` のマウントは、そこのデバイスを開きません（`EACCES`。
   `may_open_dev`。root でも同じです）。`nosuid` のマウントや、呼び出し元がいない
   ユーザー名前空間のスーパーブロックにあるプログラムは、set-user-ID と set-group-ID の
   ビットもファイルケーパビリティもなしに実行します（`mnt_may_suid`）。スクリプトでは、

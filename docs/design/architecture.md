@@ -85,6 +85,15 @@ moving the TLB epoch on, which waits for the stores under way without the lock.
 Either a store sees the mark and moves the generation on after its bytes, or the
 fetch sees the bytes.
 
+The address space also counts the pages it holds (`VmRSS`), as Linux's RSS
+counters do: the count changes with the page entry that changes, when a fault
+gives a page an entry, a first write gives a private page bytes of its own, or
+an unmap, `madvise` or `mremap` takes entries out or moves them. So the peak
+(`VmHWM`), which is noted before each drop, costs the page tables of the range
+dropped, not those of the whole space, and loads and stores cost nothing more.
+A debug build checks the count against every entry whenever it is read and
+when the space goes.
+
 A block starts with its first instruction and grows as it runs. An instruction
 that runs right after the last one of a block is decoded on its own, as it would
 be without blocks, and added to that block unless another block was stored

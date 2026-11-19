@@ -6388,6 +6388,111 @@ static int map_count_case(void) {
     return 0;
 }
 
+/* VmHWM and VmRSS of /proc/<pid>/status at `path`, in kB, and whether
+   it shows them (a zombie's does not). Into a static buffer and without
+   stdio, so that reading them takes no pages of its own. */
+static int hw_read(const char *path, long *hwm, long *rss) {
+    static char text[1 << 13];
+    *hwm = *rss = -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n < 0) return 0;
+    text[n] = 0;
+    char *h = strstr(text, "\nVmHWM:"), *r = strstr(text, "\nVmRSS:");
+    if (h) *hwm = strtol(h + 7, NULL, 10);
+    if (r) *rss = strtol(r + 7, NULL, 10);
+    return h && r;
+}
+
+/* The hiwater case: VmHWM is the peak of VmRSS, which munmap and
+   MADV_DONTNEED leave where it was and writing 5 to clear_refs makes what
+   VmRSS is now (CLEAR_REFS_MM_HIWATER_RSS); a fork child's starts at what
+   it holds, and a zombie shows neither. Differences only: what the
+   process held before the case is the emulator's own. Linux notes the
+   peak from its per-CPU counters as they read without summing them
+   (`get_mm_rss`), which may be off by a batch (`percpu_counter_batch`
+   pages, at most 128 KiB up to 16 CPUs and 512 KiB up to 64) on each CPU
+   the process ran on: so the case runs on one CPU, on a region of MiBs,
+   and shows the differences in whole MiB. */
+static long hw_mib(long kb) { return (kb >= 0 ? kb + 512 : kb - 512) / 1024; }
+static int hiwater_case(void) {
+    enum { PAGES = 2048 };
+    const long page = sysconf(_SC_PAGESIZE);
+    int clear = open("/proc/self/clear_refs", O_WRONLY);
+    if (clear < 0) {
+        printf("clear_refs: errno=%d\n", errno);
+        return 1;
+    }
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(sched_getcpu() < 0 ? 0 : sched_getcpu(), &one);
+    sched_setaffinity(0, sizeof one, &one);
+    char *map = mmap(NULL, PAGES * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return 1;
+    /* Page by page, not a huge page at a time. */
+    madvise(map, PAGES * page, MADV_NOHUGEPAGE);
+    long h[8], r[8];
+    /* Once before, so that what reading takes (its stack, its code) is
+       there from the start. */
+    hw_read("/proc/self/status", &h[0], &r[0]);
+    int shown = hw_read("/proc/self/status", &h[0], &r[0]);
+    ssize_t reset = write(clear, "5", 1);
+    hw_read("/proc/self/status", &h[0], &r[0]);
+    for (int i = 0; i < PAGES; i++) map[i * page] = 1;
+    hw_read("/proc/self/status", &h[1], &r[1]);
+    munmap(map + PAGES / 2 * page, PAGES / 2 * page);
+    hw_read("/proc/self/status", &h[2], &r[2]);
+    write(clear, "5", 1);
+    hw_read("/proc/self/status", &h[3], &r[3]);
+    madvise(map, PAGES / 4 * page, MADV_DONTNEED);
+    hw_read("/proc/self/status", &h[4], &r[4]);
+    for (int i = 0; i < PAGES / 4; i++) map[i * page] = 2;
+    hw_read("/proc/self/status", &h[5], &r[5]);
+    /* The other numbers leave the peak as it is. */
+    madvise(map, PAGES / 4 * page, MADV_DONTNEED);
+    write(clear, "1", 1);
+    write(clear, "4", 1);
+    hw_read("/proc/self/status", &h[6], &r[6]);
+    printf("shown=%d reset=%zd\n", shown, reset);
+    printf("reset: hwm-rss=%ld\n", hw_mib(h[0] - r[0]));
+    printf("touched: hwm+%ld rss+%ld\n", hw_mib(h[1] - h[0]), hw_mib(r[1] - r[0]));
+    printf("unmapped: hwm+%ld rss-%ld\n", hw_mib(h[2] - h[1]), hw_mib(r[1] - r[2]));
+    printf("reset again: hwm-rss=%ld rss-%ld\n", hw_mib(h[3] - r[3]), hw_mib(r[2] - r[3]));
+    printf("discarded: hwm+%ld rss-%ld\n", hw_mib(h[4] - h[3]), hw_mib(r[3] - r[4]));
+    printf("refilled: hwm+%ld rss+%ld\n", hw_mib(h[5] - h[4]), hw_mib(r[5] - r[4]));
+    printf("others: hwm+%ld rss-%ld\n", hw_mib(h[6] - h[5]), hw_mib(r[5] - r[6]));
+
+    int pipes[2];
+    if (pipe(pipes)) return 1;
+    pid_t child = fork();
+    if (child == 0) {
+        long ch, cr;
+        hw_read("/proc/self/status", &ch, &cr);
+        char line[64];
+        int n = snprintf(line, sizeof line, "child: hwm-rss=%ld\n", hw_mib(ch - cr));
+        write(pipes[1], line, (size_t)n);
+        _exit(0);
+    }
+    close(pipes[1]);
+    char line[64] = {0};
+    read(pipes[0], line, sizeof line - 1);
+    close(pipes[0]);
+    printf("%s", line);
+    /* A zombie has no memory to show. */
+    siginfo_t info;
+    waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", (int)child);
+    long zh, zr;
+    printf("zombie: shown=%d\n", hw_read(path, &zh, &zr));
+    waitpid(child, NULL, 0);
+    munmap(map, PAGES / 2 * page);
+    close(clear);
+    return 0;
+}
+
 /* Writes `text` to clear_refs at `fd`: what write returned, and errno. */
 static void cr_write(int fd, const char *label, const char *text, size_t len) {
     errno = 0;
@@ -31413,6 +31518,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "pagemap")) return pagemap_case();
     if (!strcmp(mode, "clear-refs")) return clear_refs_case();
     if (!strcmp(mode, "map-count")) return map_count_case();
+    if (!strcmp(mode, "hiwater")) return hiwater_case();
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {

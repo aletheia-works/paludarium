@@ -69,11 +69,10 @@ verified.
   none, or a uffd-wp marker, until an access. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
-- **`/proc/<pid>/clear_refs`, in part**: only 4 (soft-dirty) changes
-  anything. 1, 2 and 3 are taken, but no referenced bits are kept, so
-  `smaps`' `Referenced` stays the resident size, where Linux's drops until
-  the pages are touched again; 5 is taken, and no peak resident size is
-  kept to reset.
+- **`/proc/<pid>/clear_refs`, in part**: only 4 (soft-dirty) and 5 (the
+  peak resident size) change anything. 1, 2 and 3 are taken, but no
+  referenced bits are kept, so `smaps`' `Referenced` stays the resident
+  size, where Linux's drops until the pages are touched again.
 - **4-level paging only**: the emulated machine always has 4-level page
   tables, whatever CPU the host has: user space ends below 2^47 bytes, and
   `TASK_SIZE_MAX` is 2^47 - 4096 for every check that asks for it, as the

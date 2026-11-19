@@ -774,6 +774,10 @@ pub(crate) struct Status<'a> {
     /// The pages locked in memory (Linux's `locked_vm`), which a process
     /// that no longer has its memory does not show.
     pub locked: Option<u64>,
+    /// The peak of the resident pages (Linux's `get_mm_hiwater_rss`) and
+    /// those resident now (`get_mm_rss`), which a process that no longer
+    /// has its memory does not show either.
+    pub resident: Option<(u64, u64)>,
     pub threads: usize,
     pub queued: usize,
     pub queue_limit: u64,
@@ -789,8 +793,8 @@ pub(crate) struct Status<'a> {
     pub reader: &'a crate::namespaces::Namespace,
 }
 /// `/proc/<pid>/status` in Linux's field order. Of the memory fields only
-/// `VmLck` is there, and none of the CPU ones, as nothing measures them;
-/// parsers treat them as optional.
+/// `VmLck`, `VmHWM` and `VmRSS` are there, and none of the CPU ones, as
+/// nothing measures them; parsers treat them as optional.
 pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
     let mut name = String::new();
     for &b in s.name.iter().take_while(|&&b| b != 0) {
@@ -834,9 +838,16 @@ pub(crate) fn render_status(s: &Status<'_>) -> Vec<u8> {
         }
         numbers.push('\n');
     }
-    let memory = s
+    let mut memory = s
         .locked
         .map_or_else(String::new, |pages| format!("VmLck:\t{:8} kB\n", pages * 4));
+    if let Some((peak, now)) = s.resident {
+        memory.push_str(&format!(
+            "VmHWM:\t{:8} kB\nVmRSS:\t{:8} kB\n",
+            peak * 4,
+            now * 4
+        ));
+    }
     format!(
         "Name:\t{name}\n{umask}State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\n\
          Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
@@ -1524,11 +1535,11 @@ pub(crate) type CurrentMemory = Arc<dyn Fn() -> Result<Option<MemoryView>, Errno
 /// at most 12 bytes of it (`PROC_NUMBUF` less one), which is what it
 /// returns, are a number as `kstrtoint` reads one, from 1 to 5 (`EINVAL`
 /// otherwise); then the task, which must still be there (`ESRCH`), has
-/// its address space changed if it has one. Only 4
-/// (`CLEAR_REFS_SOFT_DIRTY`) changes what can be seen here
-/// ([`MemoryView::clear_soft_dirty`]); 1 to 3 clear referenced bits, which
-/// are not kept, and 5 the peak resident size, which is not shown. It has
-/// no read operation.
+/// its address space changed if it has one. 4 (`CLEAR_REFS_SOFT_DIRTY`)
+/// clears the soft-dirty bits ([`MemoryView::clear_soft_dirty`]) and 5
+/// (`CLEAR_REFS_MM_HIWATER_RSS`) makes the peak of the resident pages
+/// those resident now ([`MemoryView::reset_peak_resident`]); 1 to 3 clear
+/// referenced bits, which are not kept. It has no read operation.
 pub(crate) struct ClearRefsFile {
     memory: CurrentMemory,
     /// The access mode it was opened with (`O_ACCMODE`).
@@ -1611,10 +1622,16 @@ impl FileHandle for ClearRefsFile {
         if !(1..=5).contains(&kind) {
             return Err(Errno::EINVAL);
         }
-        if let Some(memory) = (self.memory)()?
-            && kind == 4
-        {
-            memory.clear_soft_dirty();
+        if let Some(memory) = (self.memory)()? {
+            match kind {
+                4 => {
+                    memory.clear_soft_dirty();
+                }
+                5 => {
+                    memory.reset_peak_resident();
+                }
+                _ => {}
+            }
         }
         Ok(count)
     }
@@ -2334,6 +2351,7 @@ mod tests {
             space: &namespaces.pid,
             descriptors: Some(70),
             locked: Some(3),
+            resident: Some((9, 5)),
             threads: 2,
             queued: 1,
             queue_limit: 4096,
@@ -2373,7 +2391,7 @@ mod tests {
             "Uid:\t1\t2\t3\t4\n",
             "Gid:\t0\t0\t0\t0\n",
             // In Linux's place, the session's leader outside the namespace.
-            "Groups:\t5 6 \nNStgid:\t3\t1\nNSpid:\t4\t2\nNSpgid:\t3\t1\nNSsid:\t2\t0\nVmLck:\t      12 kB\nThreads:",
+            "Groups:\t5 6 \nNStgid:\t3\t1\nNSpid:\t4\t2\nNSpgid:\t3\t1\nNSsid:\t2\t0\nVmLck:\t      12 kB\nVmHWM:\t      36 kB\nVmRSS:\t      20 kB\nThreads:",
             "CapInh:\t0000000000000042\n",
             "CapPrm:\t000001ffffffffff\n",
             "CapEff:\t0000000000000000\n",

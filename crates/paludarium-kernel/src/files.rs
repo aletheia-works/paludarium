@@ -8603,6 +8603,7 @@ fn status(c: &Context<'_>) -> Vec<u8> {
         space: &space,
         descriptors: Some(descriptors),
         locked: Some(c.mem.locked_pages()),
+        resident: Some(c.mem.resident_pages()),
         threads: c.group.active_threads(),
         queued: c.process.pending.len(),
         queue_limit,

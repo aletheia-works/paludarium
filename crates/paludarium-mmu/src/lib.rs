@@ -982,12 +982,6 @@ impl Page {
             Prot(self.prot.0 & !Prot::WRITE.0)
         }
     }
-
-    /// The contents to write, allocated now if need be; `None` when the
-    /// meter has no room for them.
-    fn frame_for_write(&self, meter: Option<&Arc<MemoryMeter>>) -> Option<&FrameBytes> {
-        allocated(&self.frame, meter)
-    }
 }
 
 /// A frame with a copy of the contents of `frame`, which has none if `frame`
@@ -1007,16 +1001,20 @@ fn copied(frame: &Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<Frame> {
     Some(copy)
 }
 
-/// The contents of `frame`, allocated as zeros now if need be; `None` when
-/// the meter has no room for them.
-fn allocated<'a>(frame: &'a Frame, meter: Option<&Arc<MemoryMeter>>) -> Option<&'a FrameBytes> {
+/// The contents of `frame`, allocated as zeros now if need be, and whether
+/// this call gave them; `None` when the meter has no room for them.
+fn allocated<'a>(
+    frame: &'a Frame,
+    meter: Option<&Arc<MemoryMeter>>,
+) -> Option<(&'a FrameBytes, bool)> {
+    let mut gave = false;
     if frame.get().is_none() {
         let bytes = FrameBytes::new(meter, || page_words(&[]))?;
         // A racing write to a shared frame may set it first: then this one
         // is dropped, and its charge with it.
-        let _ = frame.set(bytes);
+        gave = frame.set(bytes).is_ok();
     }
-    frame.get()
+    frame.get().map(|bytes| (bytes, gave))
 }
 
 /// Lower level of the page table: 512 consecutive pages. Entries are populated lazily, on the first write to a page
@@ -2207,6 +2205,15 @@ struct AddressSpaceData {
     /// Who acts on the space ([`AddressSpace::set_actor`]), which the files
     /// of its shared mappings are told as their VMAs open and close.
     actor: Option<Arc<Actor>>,
+    /// How many pages it holds, Linux's `get_mm_rss`: the entries
+    /// [`Self::counts`] takes, kept as they change, which a store without
+    /// the write lock may raise ([`Self::store_with`]).
+    resident: AtomicU64,
+    /// The most pages it was found to hold, Linux's `hiwater_rss`: noted
+    /// before each drop of page entries ([`Self::forget_resident`]), as
+    /// `update_hiwater_rss` is before a zap, so that with the pages held
+    /// now it is the peak.
+    peak_resident: u64,
 }
 
 impl Drop for AddressSpaceData {
@@ -2215,6 +2222,10 @@ impl Drop for AddressSpaceData {
     fn drop(&mut self) {
         for shared in self.shared.values() {
             tell(self.actor.as_ref(), shared, false);
+        }
+        // A debug build checks the count of the pages held once more.
+        if cfg!(debug_assertions) && !std::thread::panicking() {
+            let _ = self.resident_pages();
         }
     }
 }
@@ -2305,6 +2316,8 @@ impl AddressSpaceData {
             meter: None,
             out_of_memory: Arc::default(),
             actor: None,
+            resident: AtomicU64::new(0),
+            peak_resident: 0,
         }
     }
 
@@ -2461,7 +2474,7 @@ impl AddressSpaceData {
         {
             return Err(Errno::EINVAL);
         }
-        self.for_populated(addr.0, end, |entry| *entry = None);
+        self.clear_populated(addr.0, end);
         self.bump_code_generation();
         // Linux's `mmap_region` does not lock a VMA `vma_supports_mlock`
         // refuses, as the rings of AIO and `io_uring` are.
@@ -2668,6 +2681,14 @@ impl AddressSpaceData {
     /// mapping, or a frame `fork` shared, becomes a copy of its own; `false`
     /// when the meter has no room for it.
     fn refresh(&self, entry: &mut Option<Page>, page: u64, prot: Prot, write: bool) -> bool {
+        let was = entry.as_ref().is_some_and(|p| self.counts(page, p));
+        let done = self.refresh_entry(entry, page, prot, write);
+        let is = entry.as_ref().is_some_and(|p| self.counts(page, p));
+        self.recount_flag(was, is);
+        done
+    }
+    /// [`Self::refresh`], but for the pages held.
+    fn refresh_entry(&self, entry: &mut Option<Page>, page: u64, prot: Prot, write: bool) -> bool {
         match entry {
             None => {
                 // A uffd-wp marker's page gets a write-protected entry
@@ -2996,6 +3017,7 @@ impl AddressSpaceData {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner) = directory;
         copy.drop_refaultable_pages();
+        copy.resident = AtomicU64::new(copy.resident_walk());
         // A child's VMAs are not locked (`dup_mmap` clears `VMA_LOCKED_MASK`).
         // Nor registered with a `userfaultfd` (`dup_userfaultfd`, without
         // `UFFD_FEATURE_EVENT_FORK`).
@@ -3016,7 +3038,7 @@ impl AddressSpaceData {
             if m.dont_fork {
                 copy.remove(m.start.0, m.end());
             } else {
-                copy.for_populated(m.start.0, m.end(), |entry| *entry = None);
+                copy.clear_populated(m.start.0, m.end());
                 copy.clear_guards(m.start.0, m.end());
                 copy.poisons.clear(m.start.0, m.end());
                 copy.bump_code_generation();
@@ -3032,6 +3054,8 @@ impl AddressSpaceData {
         for shared in copy.shared.values() {
             tell(copy.actor.as_ref(), shared, true);
         }
+        // The child's peak is what it holds (`dup_mm`).
+        copy.peak_resident = copy.resident_pages();
         copy
     }
 
@@ -3444,7 +3468,7 @@ impl AddressSpaceData {
                 if let Some(mapping) = self.shared_at(page) {
                     mapping.pages.changed();
                 }
-                let Some(frame) = p.frame_for_write(self.meter.as_ref()) else {
+                let Some(frame) = self.frame_for_write(page, p) else {
                     return Err(self.out_of_room(page));
                 };
                 write(frame, offset, range);
@@ -3557,7 +3581,7 @@ impl AddressSpaceData {
                 p.soft_dirty = true;
             }
             if let Some(p) = lookup(&directory, page)
-                && p.frame_for_write(self.meter.as_ref()).is_none()
+                && self.frame_for_write(page, p).is_none()
             {
                 return Err(self.out_of_room(page));
             }
@@ -3860,6 +3884,113 @@ impl AddressSpaceData {
         }
     }
 
+    /// Drops every page entry in `[start, end)` ([`Self::forget_resident`]).
+    fn clear_populated(&mut self, start: u64, end: u64) {
+        self.forget_resident(start, end);
+        self.for_populated(start, end, |entry| *entry = None);
+    }
+
+    /// Before the page entries of `[start, end)` go: notes the pages held
+    /// as the peak if they are more ([`Self::peak_resident`]), as Linux's
+    /// `update_hiwater_rss` does before `unmap_vmas` and
+    /// `zap_page_range_single` take pages out, and takes those of the range
+    /// from them. It costs the range's page tables, not the space's.
+    fn forget_resident(&mut self, start: u64, end: u64) {
+        let held = self.resident_pages();
+        self.peak_resident = self.peak_resident.max(held);
+        let gone = self.resident_in(start, end);
+        self.resident.fetch_sub(gone, Ordering::Relaxed);
+    }
+
+    /// The contents of the entry `p` of the page at `page` to write,
+    /// allocated now if need be; `None` when the meter has no room for
+    /// them. A private page that showed the zero page holds one now.
+    fn frame_for_write<'a>(&self, page: u64, p: &'a Page) -> Option<&'a FrameBytes> {
+        let (bytes, gave) = allocated(&p.frame, self.meter.as_ref())?;
+        if gave && !p.file && self.shared_at(page).is_none() {
+            self.resident.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(bytes)
+    }
+
+    /// Whether the entry of the page at `page` holds the page, as Linux's
+    /// `get_mm_rss` counts it and [`Self::usage`] shows it: one with
+    /// contents, a file's, or shared memory's. Only read, private memory
+    /// shows the zero page.
+    fn counts(&self, page: u64, entry: &Page) -> bool {
+        entry.frame.get().is_some() || entry.file || self.shared_at(page).is_some()
+    }
+
+    /// Adds the change of an entry at `page` from `before` to `after` to
+    /// the pages held.
+    fn recount(&self, page: u64, before: Option<&Page>, after: Option<&Page>) {
+        self.recount_flag(
+            before.is_some_and(|entry| self.counts(page, entry)),
+            after.is_some_and(|entry| self.counts(page, entry)),
+        );
+    }
+
+    /// Adds an entry that held its page (`was`) and holds it now (`is`) to
+    /// the pages held.
+    fn recount_flag(&self, was: bool, is: bool) {
+        match (was, is) {
+            (false, true) => {
+                self.resident.fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                self.resident.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    /// How many entries of `[start, end)` hold their page ([`Self::counts`]).
+    fn resident_in(&self, start: u64, end: u64) -> u64 {
+        if end <= start {
+            return 0;
+        }
+        let directory = self.read_directory();
+        let mut count = 0;
+        let range =
+            start / PAGE_SIZE / ENTRIES_PER_TABLE..=(end - 1) / PAGE_SIZE / ENTRIES_PER_TABLE;
+        for (&dir, table) in directory.range(range) {
+            for (slot, entry) in table.pages.iter().enumerate() {
+                let page = (dir * ENTRIES_PER_TABLE + slot as u64) * PAGE_SIZE;
+                if let Some(entry) = entry.as_ref().filter(|_| page >= start && page < end) {
+                    count += u64::from(self.counts(page, entry));
+                }
+            }
+        }
+        count
+    }
+
+    /// [`Self::resident_in`] of the whole space.
+    fn resident_walk(&self) -> u64 {
+        self.resident_in(0, u64::MAX)
+    }
+
+    /// How many pages it holds ([`Self::resident`]). A debug build checks
+    /// the count against every entry.
+    fn resident_pages(&self) -> u64 {
+        let held = self.resident.load(Ordering::Relaxed);
+        debug_assert_eq!(held, self.resident_walk(), "resident pages");
+        held
+    }
+
+    /// The peak of the pages it held, as `/proc/<pid>/status`'s `VmHWM`
+    /// shows it: Linux's `get_mm_hiwater_rss`, the larger of the peak
+    /// noted and the pages held now, which are both.
+    fn peak_resident(&self) -> (u64, u64) {
+        let now = self.resident_pages();
+        (self.peak_resident.max(now), now)
+    }
+
+    /// `clear_refs` 5 (`CLEAR_REFS_MM_HIWATER_RSS`): the peak becomes the
+    /// pages held now (`reset_mm_hiwater_rss`).
+    fn reset_peak_resident(&mut self) {
+        self.peak_resident = self.resident_pages();
+    }
+
     /// Maps zero-filled pages. With `Some(addr)` the region must be free
     /// (`EEXIST` otherwise); with `None` a free region is chosen below the
     /// mmap top. `len` is rounded up to whole pages. Pages are populated
@@ -4009,6 +4140,8 @@ impl AddressSpaceData {
     /// Takes `[addr, end)` out of the space, its mappings, memory and pages,
     /// sealed or not.
     fn remove(&mut self, addr: u64, end: u64) {
+        // While its shared memory is there, which its entries count by.
+        self.forget_resident(addr, end);
         self.clear_guards(addr, end);
         self.poisons.clear(addr, end);
         self.uffd_markers.clear(addr, end);
@@ -4173,6 +4306,10 @@ impl AddressSpaceData {
         if end <= start {
             return pages;
         }
+        if !keep {
+            let gone = self.resident_in(start, end);
+            self.resident.fetch_sub(gone, Ordering::Relaxed);
+        }
         let directory = self
             .directory
             .get_mut()
@@ -4279,6 +4416,8 @@ impl AddressSpaceData {
             let (dir, slot) = page_index(page - old + to);
             directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
         }
+        let moved = self.resident_in(to, to + new_len);
+        self.resident.fetch_add(moved, Ordering::Relaxed);
         for (start, end) in guards {
             self.add_guards(start - old + to, end - old + to);
         }
@@ -4807,6 +4946,7 @@ impl AddressSpaceData {
         }
         let mut entry = self.fresh(page, prot);
         entry.uffd_wp = true;
+        self.recount(page, None, Some(&entry));
         let (dir, slot) = page_index(page);
         self.write_directory()
             .entry(dir)
@@ -5100,6 +5240,7 @@ impl AddressSpaceData {
             }
             let _ = entry.frame.set(contents);
         }
+        self.recount(page, None, Some(&entry));
         let (dir, slot) = page_index(page);
         directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
         if let Some(shared) = shared {
@@ -5175,6 +5316,7 @@ impl AddressSpaceData {
         entry.uffd_wp = protect;
         // A dirty entry (`mfill_atomic_install_pte`).
         entry.soft_dirty = true;
+        self.recount(page, None, Some(&entry));
         let (dir, slot) = page_index(page);
         directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
         drop(directory);
@@ -5300,6 +5442,7 @@ impl AddressSpaceData {
             let taken = directory
                 .get_mut(&dir)
                 .and_then(|table| table.pages[slot].take());
+            self.recount(from, taken.as_ref(), None);
             let entry = match taken {
                 // Soft-dirty, so that the move shows (`move_present_ptes`).
                 Some(entry) if !zero => Page {
@@ -5310,6 +5453,7 @@ impl AddressSpaceData {
                 },
                 _ => self.page(to, dst_mapping.prot),
             };
+            self.recount(to, None, Some(&entry));
             let (dir, slot) = page_index(to);
             directory.entry(dir).or_insert_with(PageTable::new).pages[slot] = Some(entry);
             drop(directory);
@@ -5568,7 +5712,7 @@ impl AddressSpaceData {
         // As in `discard`: a file mapping without its file has nothing to
         // read its pages from again, and keeps them.
         if shared || !file || self.backing_at(from).is_some() {
-            self.for_populated(from, to, |entry| *entry = None);
+            self.clear_populated(from, to);
             self.refill(from, to);
         }
         if !shared && !file {
@@ -5808,11 +5952,11 @@ impl AddressSpaceData {
         }
         for (start, end) in shmem {
             self.keep_uffd_markers(start, end);
-            self.for_populated(start, end, |entry| *entry = None);
+            self.clear_populated(start, end);
         }
         for (start, end) in private {
             self.keep_uffd_markers(start, end);
-            self.for_populated(start, end, |entry| *entry = None);
+            self.clear_populated(start, end);
             self.refill(start, end);
         }
         if sealed {
@@ -6177,6 +6321,18 @@ impl MemoryView {
     /// is gone.
     pub fn clear_soft_dirty(&self) -> bool {
         self.with_data_mut(AddressSpaceData::clear_soft_dirty)
+            .is_some()
+    }
+    /// The peak of the pages the space held and the pages it holds now
+    /// ([`AddressSpaceData::peak_resident`]), or `None` once it is gone.
+    #[must_use]
+    pub fn resident_pages(&self) -> Option<(u64, u64)> {
+        self.with_data(AddressSpaceData::peak_resident)
+    }
+    /// See [`AddressSpaceData::reset_peak_resident`]; `false` once the
+    /// space is gone.
+    pub fn reset_peak_resident(&self) -> bool {
+        self.with_data_mut(AddressSpaceData::reset_peak_resident)
             .is_some()
     }
     /// The `/proc/<pid>/pagemap` entries of the `count` pages from the page
@@ -7167,6 +7323,11 @@ impl AddressSpace {
     /// See [`AddressSpaceData::locked_pages`].
     pub fn locked_pages(&self) -> u64 {
         self.locked().locked_pages()
+    }
+    /// See [`AddressSpaceData::peak_resident`].
+    #[must_use]
+    pub fn resident_pages(&self) -> (u64, u64) {
+        self.locked().peak_resident()
     }
     /// See [`AddressSpaceData::locked_pages_in`].
     pub fn locked_pages_in(&self, addr: GuestAddr, end: u64) -> u64 {
@@ -8414,6 +8575,47 @@ mod tests {
         let mut other = space.fork();
         other.unmap(at, PAGE_SIZE).unwrap();
         assert!(exclusive(&space, at.0));
+    }
+
+    #[test]
+    fn the_peak_of_resident_pages_stays_until_clear_refs_resets_it() {
+        let mut space = AddressSpace::new();
+        let at = space
+            .map(
+                None,
+                8 * PAGE_SIZE,
+                Prot::READ_WRITE,
+                MappingKind::Anonymous,
+            )
+            .unwrap();
+        // A page only read is the zero page, which is not resident.
+        let mut byte = [0];
+        space.read(at, &mut byte).unwrap();
+        assert_eq!(space.resident_pages(), (0, 0));
+        for page in 0..8 {
+            space
+                .write(GuestAddr(at.0 + page * PAGE_SIZE), b"x")
+                .unwrap();
+        }
+        assert_eq!(space.resident_pages(), (8, 8));
+        space
+            .unmap(GuestAddr(at.0 + 4 * PAGE_SIZE), 4 * PAGE_SIZE)
+            .unwrap();
+        assert_eq!(space.resident_pages(), (8, 4));
+        // clear_refs 5 makes the peak what is resident now.
+        assert!(space.view().reset_peak_resident());
+        assert_eq!(space.resident_pages(), (4, 4));
+        space.discard_shared(at, 2 * PAGE_SIZE).unwrap();
+        assert_eq!(space.resident_pages(), (4, 2));
+        // A child's peak is what it holds at the fork (`dup_mm`).
+        let child = space.fork();
+        assert_eq!(child.resident_pages(), (2, 2));
+        // The view agrees, and has nothing once the space is gone.
+        let view = space.view();
+        assert_eq!(view.resident_pages(), Some((4, 2)));
+        drop(space);
+        assert_eq!(view.resident_pages(), None);
+        assert!(!view.reset_peak_resident());
     }
 
     #[test]

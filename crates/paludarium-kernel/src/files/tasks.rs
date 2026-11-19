@@ -340,6 +340,7 @@ pub(super) fn content(c: &Context<'_>, task: &Task, entry: TaskEntry) -> Option<
             space: &task.view.space,
             descriptors: task.live().then(|| public.files.descriptors()),
             locked: task.memory().and_then(|memory| memory.locked_pages()),
+            resident: task.memory().and_then(|memory| memory.resident_pages()),
             threads: task.threads(),
             queued: public.queued,
             queue_limit: task.view.queue_limit,

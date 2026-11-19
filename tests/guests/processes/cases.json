@@ -242,6 +242,7 @@
     {"name":"pagemap","binary":"process"},
     {"name":"clear-refs","binary":"process"},
     {"name":"map-count","binary":"process"},
+    {"name":"hiwater","binary":"process"},
     {"name":"proc-owners","binary":"process"},
     {"name":"memory-locks","binary":"process"},
     {"name":"proc-maps","binary":"process"},

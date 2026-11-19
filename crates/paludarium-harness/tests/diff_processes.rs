@@ -697,6 +697,7 @@ mod linux {
         processes_pagemap => ("pagemap","process"),
         processes_clear_refs => ("clear-refs","process"),
         processes_map_count => ("map-count","process"),
+        processes_hiwater => ("hiwater","process"),
         processes_proc_owners => ("proc-owners","process"),
         processes_memory_locks => ("memory-locks","process"),
         processes_proc_maps => ("proc-maps","process"),

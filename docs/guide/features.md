@@ -2902,8 +2902,13 @@ kernel.
   unmarked; `maps` and `smaps` name a mapped file the same way. `status`
   has Linux's fields in Linux's order (umask, IDs, threads, signal masks,
   capabilities and so on) and, of the memory ones, the locked memory
-  (`VmLck`); the other memory fields and the CPU ones are not there, as
-  nothing measures them. `statm` has, in pages, what Linux's `task_statm`
+  (`VmLck`), the peak of the resident memory (`VmHWM`) and the resident
+  memory (`VmRSS`), which a zombie does not show; the other memory fields
+  and the CPU ones are not there, as nothing measures them. The peak is
+  Linux's `hiwater_rss`: noted before `munmap`, `MADV_DONTNEED` and the
+  other calls that drop pages, as `update_hiwater_rss` does, so that
+  `VmHWM` is never below `VmRSS`; a `fork`ed child's starts at what it
+  holds, as `dup_mm` sets it, and writing 5 to `clear_refs` resets it. `statm` has, in pages, what Linux's `task_statm`
   counts: the size of the mappings, the resident pages, those of them a
   file's or shared memory's, the pages of the code range `stat` gives, 0,
   the private
@@ -3296,8 +3301,10 @@ kernel.
   space the process has at that moment: a page's next write sets it again,
   as does `mremap` for a page it moves and `UFFDIO_COPY`, `UFFDIO_CONTINUE`
   and `UFFDIO_MOVE` for the page they map, and a `fork`ed child keeps each
-  page's bit. 1 to 3 and 5 are taken and change nothing shown (see
-  Limitations). It has no read operation (`EINVAL`, `EBADF` on a descriptor
+  page's bit. 5 (`CLEAR_REFS_MM_HIWATER_RSS`) makes the peak of the
+  resident memory (`status`' `VmHWM`) the resident memory now, as
+  `reset_mm_hiwater_rss` does. 1 to 3 are taken and change nothing shown
+  (see Limitations). It has no read operation (`EINVAL`, `EBADF` on a descriptor
   open only for writing), and `lseek` leaves it at 0.
 - `/proc/self/fd` (mode 0500, its size the number of open descriptors, as
   Linux's `proc_fd_getattr` gives it) lists `.`, `..` and a link per open

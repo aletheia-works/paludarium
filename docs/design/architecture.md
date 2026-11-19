@@ -115,14 +115,17 @@ out:
 - `lea`, `push` of a register or an immediate, and `pop`;
 - direct branches, `call` and `ret`, and `jmp` and `call` through a 64-bit
   register or 8 bytes of memory;
-- `add`, `sub`, `and`, `or`, `xor`, `cmp` and `test` between registers,
-  immediates and memory (without `lock`);
+- `add`, `adc`, `sub`, `sbb`, `and`, `or`, `xor`, `cmp` and `test` between
+  registers, immediates and memory (without `lock`);
 - `shl`, `shr`, `sar`, `rol` and `ror` of a register by an immediate, and `shl`,
   `shr` and `sar` of a register by `cl`;
 - `movzx` from a register, `movsx` and `movsxd` from a register or memory,
   `cbw`, `cwde` and `cdqe`, and `lea` into a 16- or 32-bit register;
 - `inc`, `dec`, `neg` and `not` of a register, or of memory without `lock`;
 - `setcc` and `cmovcc`;
+- `tzcnt`, `lzcnt`, `popcnt`, `bsf` and `bsr` of a register into one of its
+  size, `bt` of a register by a register or an immediate, and `bswap` of a
+  32- or 64-bit register;
 - `mul` and `imul` of a register into rdx:rax, and `imul` of two registers or of
   a register and an immediate;
 - `movaps`, `movups`, `movdqa`, `movdqu`, `movapd` and `movupd` between xmm

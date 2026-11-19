@@ -16,7 +16,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use paludarium_cpu::compile::{Address, Alu, Fast, Form, Shift, Source, Unary};
+use paludarium_cpu::compile::{Address, Alu, Count, Fast, Form, Shift, Source, Unary};
 use paludarium_cpu::{CpuState, flag};
 use paludarium_decoder::{Condition, Mnemonic, Register, Segment};
 use paludarium_mmu::{
@@ -792,15 +792,26 @@ impl Emitter<'_, '_> {
 
     /// The result (masked to `size`) and status flags of `op` on `a` and
     /// `b`, both masked to `size`, as `alu::add`, `alu::sub` and
-    /// `alu::logic` have them.
+    /// `alu::logic` have them; `adc` and `sbb` take CF from the flags.
     fn alu(&mut self, op: Alu, a: Value, b: Value, size: u8) -> (Value, Value) {
         match op {
-            Alu::Add | Alu::Sub | Alu::Cmp => {
-                let add = op == Alu::Add;
-                let wide = if add {
+            Alu::Add | Alu::Adc | Alu::Sub | Alu::Sbb | Alu::Cmp => {
+                let add = matches!(op, Alu::Add | Alu::Adc);
+                let carry_in = if matches!(op, Alu::Adc | Alu::Sbb) {
+                    let flags = self.word(RFLAGS);
+                    Some(self.b.ins().band_imm_s(flags, flag::CF as i64))
+                } else {
+                    None
+                };
+                let first = if add {
                     self.b.ins().iadd(a, b)
                 } else {
                     self.b.ins().isub(a, b)
+                };
+                let wide = match carry_in {
+                    Some(c) if add => self.b.ins().iadd(first, c),
+                    Some(c) => self.b.ins().isub(first, c),
+                    None => first,
                 };
                 let r = if size == 8 {
                     wide
@@ -808,16 +819,29 @@ impl Emitter<'_, '_> {
                     self.b.ins().band_imm_s(wide, mask(size))
                 };
                 let mut f = self.zf_sf_pf(r, size);
-                let carry = if add {
-                    if size == 8 {
-                        self.b.ins().icmp(IntCC::UnsignedLessThan, r, a)
-                    } else {
+                let carry = match (add, size == 8, carry_in) {
+                    // Below 8 bytes the whole sum or difference fits.
+                    (true, false, _) => {
                         self.b
                             .ins()
                             .icmp_imm_s(IntCC::UnsignedGreaterThan, wide, mask(size))
                     }
-                } else {
-                    self.b.ins().icmp(IntCC::UnsignedLessThan, a, b)
+                    (true, true, None) => self.b.ins().icmp(IntCC::UnsignedLessThan, r, a),
+                    (true, true, Some(_)) => {
+                        let low = self.b.ins().icmp(IntCC::UnsignedLessThan, first, a);
+                        let high = self.b.ins().icmp(IntCC::UnsignedLessThan, r, first);
+                        self.b.ins().bor(low, high)
+                    }
+                    (false, _, None) => self.b.ins().icmp(IntCC::UnsignedLessThan, a, b),
+                    (false, false, Some(c)) => {
+                        let bc = self.b.ins().iadd(b, c);
+                        self.b.ins().icmp(IntCC::UnsignedLessThan, a, bc)
+                    }
+                    (false, true, Some(c)) => {
+                        let low = self.b.ins().icmp(IntCC::UnsignedLessThan, a, b);
+                        let high = self.b.ins().icmp(IntCC::UnsignedLessThan, first, c);
+                        self.b.ins().bor(low, high)
+                    }
                 };
                 let cf = self.bit(carry, flag::CF);
                 f = self.b.ins().bor(f, cf);
@@ -892,6 +916,63 @@ impl Emitter<'_, '_> {
                 let r = self.b.ins().bxor_imm_s(a, mask(size));
                 let zero = self.constant(0);
                 (r, 0, zero)
+            }
+        }
+    }
+
+    /// `op` of [`Fast::Count`] of `src` into `dst`, as `Count::apply` has
+    /// it: `bsf` and `bsr` of 0 leave all of `dst` as it was.
+    fn count(&mut self, op: Count, dst: Register, src: Register) {
+        let size = dst.size();
+        let width = i64::from(size) * 8;
+        let v = self.read(src);
+        let zero = self.b.ins().icmp_imm_s(IntCC::Equal, v, 0);
+        match op {
+            Count::Popcnt => {
+                let r = self.b.ins().popcnt(v);
+                self.write(dst, r);
+                let f = self.bit(zero, flag::ZF);
+                self.set_status(f);
+            }
+            Count::Tzcnt | Count::Lzcnt => {
+                let r = if op == Count::Lzcnt {
+                    let leading = self.b.ins().clz(v);
+                    self.b.ins().iadd_imm_s(leading, width - 64)
+                } else {
+                    // `ctz` of 0 is 64, which is the width only for 8 bytes.
+                    let trailing = self.b.ins().ctz(v);
+                    let all = self.constant(width);
+                    self.b.ins().select(zero, all, trailing)
+                };
+                self.write(dst, r);
+                let cf = self.bit(zero, flag::CF);
+                let none = self.b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+                let zf = self.bit(none, flag::ZF);
+                let f = self.b.ins().bor(cf, zf);
+                self.set_flags(flag::CF | flag::ZF, f);
+            }
+            Count::Bsf | Count::Bsr => {
+                let index = if op == Count::Bsr {
+                    let leading = self.b.ins().clz(v);
+                    let top = self.constant(63);
+                    self.b.ins().isub(top, leading)
+                } else {
+                    self.b.ins().ctz(v)
+                };
+                let Register::Gpr { index: n, .. } = dst else {
+                    unreachable!("a count has a register of 2 to 8 bytes");
+                };
+                let old = self.gpr(n);
+                let written = if size == 2 {
+                    let kept = self.b.ins().band_imm_s(old, !mask(2));
+                    self.b.ins().bor(kept, index)
+                } else {
+                    index
+                };
+                let new = self.b.ins().select(zero, old, written);
+                self.set_gpr(n, new);
+                let f = self.bit(zero, flag::ZF);
+                self.set_flags(flag::ZF, f);
             }
         }
     }
@@ -1458,6 +1539,31 @@ impl Emitter<'_, '_> {
                 let v = self.b.ins().select(holds, v, old);
                 self.write(dst, v);
                 self.unless_changed(status, n + 1, next);
+            }
+            Fast::Count { op, dst, src } => self.count(op, dst, src),
+            Fast::BitTest { dst, bit } => {
+                let size = dst.size();
+                let n = self.source(bit, size);
+                let n = self
+                    .b
+                    .ins()
+                    .band_imm_s(n, i64::from(u32::from(size) * 8 - 1));
+                let v = self.read(dst);
+                let down = self.b.ins().ushr(v, n);
+                // CF is bit 0.
+                let cf = self.b.ins().band_imm_s(down, 1);
+                self.set_flags(flag::CF, cf);
+            }
+            Fast::Bswap(dst) => {
+                let v = self.read(dst);
+                let r = if dst.size() == 8 {
+                    self.b.ins().bswap(v)
+                } else {
+                    let low = self.b.ins().ireduce(types::I32, v);
+                    let swapped = self.b.ins().bswap(low);
+                    self.b.ins().uextend(I64, swapped)
+                };
+                self.write(dst, r);
             }
             Fast::Unary { op, dst } => {
                 let a = self.read(dst);

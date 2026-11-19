@@ -627,11 +627,13 @@ impl crate::Processes {
         }
         self.changed().notify();
     }
-    /// What a tracer's wait reports of a tracee's process: its CPU time,
-    /// and the peak resident size as Linux's `getrusage(RUSAGE_BOTH)` gives.
-    fn usage(group: &crate::ThreadGroup) -> crate::syscalls::ResourceUsage {
+    /// What a tracer's wait reports of a tracee's process, as Linux's
+    /// `getrusage(RUSAGE_BOTH)` gives, the same as its parent's wait: its
+    /// CPU time and that of the children it reaped (`children_cpu`), and
+    /// the largest peak resident size among them.
+    fn usage(group: &crate::ThreadGroup, children_cpu: u64) -> crate::syscalls::ResourceUsage {
         crate::syscalls::ResourceUsage {
-            cpu: group.process_cpu(),
+            cpu: group.process_cpu().saturating_add(children_cpu),
             peak: group.waited_peak(),
         }
     }
@@ -663,7 +665,7 @@ impl crate::Processes {
                 {
                     continue;
                 }
-                let Some((group, pgid, parent)) = groups.get(&tracee.pid) else {
+                let Some((group, pgid, parent, children_cpu)) = groups.get(&tracee.pid) else {
                     continue;
                 };
                 let matching = match wanted {
@@ -690,7 +692,13 @@ impl crate::Processes {
                         ExitStatus::Signaled(signal) if dumped => ChildEvent::Dumped(signal),
                         status => ChildEvent::Exited(status),
                     };
-                    found = Some((tid, event, Self::usage(group), uid, !wait.keep));
+                    found = Some((
+                        tid,
+                        event,
+                        Self::usage(group, *children_cpu),
+                        uid,
+                        !wait.keep,
+                    ));
                     break;
                 }
                 any = true;
@@ -706,7 +714,7 @@ impl crate::Processes {
                     found = Some((
                         tid,
                         ChildEvent::Trapped(code),
-                        Self::usage(group),
+                        Self::usage(group, *children_cpu),
                         uid,
                         false,
                     ));

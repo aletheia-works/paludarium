@@ -3584,7 +3584,8 @@ kernel.
   `RUSAGE_THREAD` too), the largest of its address space's and of those it
   left by `execve` or exited in; for `RUSAGE_CHILDREN`, the largest of the
   children waited for and of their own children; and a wait's rusage gives
-  the child's and its children's together, as Linux's `RUSAGE_BOTH`. A
+  the child's and its children's together, as Linux's `RUSAGE_BOTH`, the
+  CPU time as well as `ru_maxrss`, a tracer's wait for a tracee too. A
   forked child starts from zero, and an `execve` keeps both. The other
   counts (faults, context switches, blocks) are 0.
 - A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`

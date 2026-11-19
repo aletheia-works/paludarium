@@ -6544,6 +6544,49 @@ static pid_t mr_child(long mib, int nested, long *start) {
     close(pipes[0]);
     return pid;
 }
+/* The traced-rusage case: a tracer's wait reports the tracee's resource
+   usage as its parent's wait does, `getrusage(RUSAGE_BOTH)`, with the CPU
+   time of the children it reaped (kernel/exit.c wait_task_stopped). The
+   tracee reaps a child that spent 300 ms of CPU time, then stops. */
+static long tr_cpu_ms(const struct rusage *usage) {
+    return (usage->ru_utime.tv_sec + usage->ru_stime.tv_sec) * 1000 +
+           (usage->ru_utime.tv_usec + usage->ru_stime.tv_usec) / 1000;
+}
+static void tr_burn(long ms) {
+    struct timespec now;
+    do {
+        for (volatile int spin = 0; spin < 100000; spin++) {}
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now);
+    } while (now.tv_sec * 1000 + now.tv_nsec / 1000000 < ms);
+}
+static int traced_rusage_case(void) {
+    fflush(stdout);
+    pid_t tracee = fork();
+    if (tracee < 0) return 10;
+    if (tracee == 0) {
+        if (syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0)) _exit(1);
+        pid_t burner = fork();
+        if (burner == 0) {
+            tr_burn(300);
+            _exit(0);
+        }
+        if (burner < 0 || waitpid(burner, NULL, 0) != burner) _exit(2);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    int status;
+    struct rusage usage;
+    memset(&usage, 0, sizeof usage);
+    if (wait4(tracee, &status, 0, &usage) != tracee) return 11;
+    result("stopped", WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    result("stop-with-children", tr_cpu_ms(&usage) >= 250);
+    memset(&usage, 0, sizeof usage);
+    if (syscall(SYS_ptrace, 7 /* PTRACE_CONT */, tracee, 0, 0)) return 12;
+    if (wait4(tracee, &status, 0, &usage) != tracee) return 13;
+    result("exited", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    result("exit-with-children", tr_cpu_ms(&usage) >= 250);
+    return 0;
+}
 static int maxrss_exec(const char *start, const char *children) {
     long kept = mr_get(RUSAGE_SELF);
     printf("after exec: self+%ld children-same=%d\n", hw_mib(kept - atol(start)),
@@ -32213,6 +32256,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "map-count")) return map_count_case();
     if (!strcmp(mode, "hiwater")) return hiwater_case();
     if (!strcmp(mode, "maxrss")) return maxrss_case(self);
+    if (!strcmp(mode, "traced-rusage")) return traced_rusage_case();
     if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();

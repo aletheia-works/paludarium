@@ -1230,13 +1230,22 @@ impl Processes {
         self.changed.notify();
     }
     /// The processes, by PID, with their thread groups, process groups
-    /// and parents, for a tracer's wait.
-    pub(crate) fn traced_groups(&self) -> BTreeMap<u32, (Arc<ThreadGroup>, u32, u32)> {
+    /// and parents, and the CPU time of the children they reaped, for a
+    /// tracer's wait.
+    pub(crate) fn traced_groups(&self) -> BTreeMap<u32, (Arc<ThreadGroup>, u32, u32, u64)> {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|(&pid, entry)| (pid, (entry.group.clone(), entry.pgid, entry.parent)))
+            .map(|(&pid, entry)| {
+                let traced = (
+                    entry.group.clone(),
+                    entry.pgid,
+                    entry.parent,
+                    entry.children_cpu,
+                );
+                (pid, traced)
+            })
             .collect()
     }
     /// The process `pid`, traced by process `tracer` that is not its

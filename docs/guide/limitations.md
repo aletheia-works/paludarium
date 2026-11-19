@@ -961,11 +961,15 @@ verified.
   x86-64 runner's Linux gave two of them the other way. One without a
   device goes with its namespace, where Linux 7.0, whose proxy table is
   every namespace's, keeps it, for a namespace made later where that one
-  was to see (Linux's master gives each namespace its own). A neighbour's
-  timer never runs: one
-  reachable never goes stale, one delaying or probing never probes nor
-  becomes reachable or failed, and one `NTF_USE` or `NTF_MANAGED` makes
-  incomplete counts its first probe but never sends another nor fails;
+  was to see (Linux's master gives each namespace its own). Of a neighbour's
+  timers only a reachable one's runs: once its reachable time since it
+  was confirmed has passed, it goes stale, or delays if it was used
+  within the delay before a probe (5 seconds), and its going stale is
+  told of when a netlink socket of the namespace next reads, polls or
+  writes, as an address that runs out is. One delaying or probing never
+  probes nor becomes reachable or failed, and one `NTF_USE` or
+  `NTF_MANAGED` makes incomplete counts its first probe but never sends
+  another nor fails;
   `NTF_EXT_MANAGED` ones are not probed from time to time. A neighbour's
   state and link-layer address change nothing traffic does, where Linux's
   `lo` holds a packet for one that is not valid until it resolves. Its

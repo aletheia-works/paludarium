@@ -90,9 +90,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   全要素を読み、負の長さは `EINVAL` です。その後で各バッファーがユーザー空間に収まるかを確かめ
   （`EFAULT`）、要素が複数なら長さ全体で、1 つなら `MAX_RW_COUNT` までで確かめます。長さは、
   合計が `MAX_RW_COUNT` を超えないように切り詰めます。
+
 - `pread64`・`pwrite64`・`preadv`・`pwritev` はファイルの位置を動かさず、パイプとソケットでは
   `ESPIPE` を返します。`O_APPEND` のファイルでは、Linux と同じく位置を指定した書き込みも
   末尾に足します。
+
 - `preadv2` と `pwritev2` は、指定した位置で読み書きし、位置が -1 なら `readv` と `writev` と
   同じくファイルの位置で読み書きします。フラグは、ベクターと範囲を確かめた後、動かすバイトが
   あるときだけ、Linux の `kiocb_set_rw_flags` と同じく確かめます。知らないフラグは
@@ -115,12 +117,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   追記専用のファイル（`FS_APPEND_FL`）は、読み込みでも `EPERM` です。
   `RWF_APPEND` は通常のファイルの末尾に書き、`RWF_DSYNC` と
   `RWF_SYNC` は `fdatasync` と同じく書き出し、`RWF_HIPRI` は何も変えません。
+
 - `copy_file_range` は、同じマウントにある 2 つの通常のファイルの間でコピーし（マウントを
   またぐと `EXDEV`）、入力の末尾で止まります。確かめる順番は Linux と同じです（`EISDIR`、
   `EINVAL`、`EBADF`、`EOVERFLOW`、同じファイルの中で範囲が重なると `EINVAL`）。
   `sendfile` は、通常のファイルを書き込める任意のファイルに送り、パイプには 1 回でその容量
   までを送ります。どちらも、渡されたオフセットかファイルの位置を進めます。`sendfile` は、
   失敗したときもオフセットを書き戻します。
+
 - `splice` は、パイプ（または FIFO）と、通常のファイル、デバイス、ソケット、別のパイプの
   間でバイトを動かします。`tee` は、あるパイプにあるものを取り出さずに別のパイプへ
   コピーし、`vmsplice` は、ゲストのバッファーを書き込み用に開いたパイプへ入れるか、
@@ -148,12 +152,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   パイプの代わりであるホストの標準のストリームは、`splice` のどちらの端にもなれます
   （オフセットを渡すと `ESPIPE`）。`tee` と `vmsplice` はゲスト自身のパイプだけを受け付け、
   標準のストリームは受け付けません。
+
 - `getdents64` は返したエントリーの続きから読むので、それらを `unlink` しても
   読み飛ばしません。ディレクトリが変わらない間は、`d_off` への `lseek` で同じ
   エントリーに戻ります。`dup` と `fork` は読んでいる位置を共有します。`getdents`
   も同じで、古い `linux_dirent` を書きます（型は各エントリーの最後のバイトです）。
   どちらも Linux と同じく大きさを `int` で持つので、2 GiB 以上ではどのエントリーも
   入りません（`EINVAL`）。
+
 - 拡張属性はメモリ上のファイルとともに保持し、ハードリンクや名前の変更のあとも、
   最後の名前がなくなったあとも残ります。Linux と同じく、`user.*` は通常のファイルと
   ディレクトリ用で（ほかでは読むと `ENODATA`、書くと `EPERM`）、スティッキー
@@ -163,6 +169,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `CAP_SYS_ADMIN` が必要です。名前は 1〜255 バイト（`ERANGE`）、値は 64 KiB まで
   （`E2BIG`）で、ほかの名前空間は `EOPNOTSUPP` です。Linux 6.13 以降と同じく、名前は
   ファイルを探す前に読みます。
+
 - ファイルケーパビリティ（`security.capability`）は、Linux のケーパビリティモジュールと
   同じように確かめて変換します。書く値はリビジョン 2（20 バイト）か 3（24 バイト）の
   `vfs_cap_data` でなければならず（`EINVAL`）、呼び出し元には、ファイルの持ち主とグループを
@@ -175,6 +182,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   なければ `EOVERFLOW` です。ファイルへの書き込みと切り詰め、ディレクトリ以外の
   `chown` は、誰がしてもファイルケーパビリティを取り除きます。`execve` は、実行する
   プログラムにそれを与えます（下の資格情報を見てください）。
+
 - `setxattrat`、`getxattrat`、`listxattrat`、`removexattrat`（Linux 6.13）は、
   ディレクトリのディスクリプタからファイルを探し、受け付けるフラグは
   `AT_SYMLINK_NOFOLLOW` と `AT_EMPTY_PATH` だけです（`EINVAL`）。`AT_EMPTY_PATH` では、
@@ -184,6 +192,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `struct xattr_args` で渡し、`copy_struct_from_user` と同じように確かめます。16 バイト
   未満は `EINVAL`、1 ページを超えるか 16 バイトより後ろに 0 でないバイトがあれば
   `E2BIG` で、`getxattrat` はフラグを受け付けません（`EINVAL`）。
+
 - メモリ上の通常のファイルとディレクトリは、tmpfs と同じ inode フラグを保持します。
   `FS_IMMUTABLE_FL`、`FS_APPEND_FL`、`FS_NODUMP_FL`、`FS_NOATIME_FL` の 4 つです。
   `file_getattr` と `file_setattr`（Linux 6.17）、`FS_IOC_GETFLAGS`・
@@ -203,6 +212,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - マウントしたホストのディレクトリのファイル、`/proc` の下、シンボリックリンク、
     特殊ファイルは保持しません。システムコールは `EOPNOTSUPP`、ioctl は `ENOTTY` です。
   - 設定すると `IN_ATTRIB` が生じます。
+
 - フラグは、Linux が `IS_IMMUTABLE` と `IS_APPEND` を確かめるところで、root にも
   適用します。
   - 変更不可のファイルへの書き込みは、ほかのどの権限確認よりも先に `EPERM` です
@@ -219,6 +229,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - `copy_file_range` は変更不可のファイルに書き込みません（`EPERM`）。
   - tmpfs と同じく、フラグを設定する前に開いたものからは書き込めます。
     アクセス時刻は保持しないので、`FS_NOATIME_FL` と `FS_NODUMP_FL` はほかに何も変えません。
+
 - `statx` は、`stat` にある項目（`STATX_BASIC_STATS`）と、デバイス番号としてマウントの
   `st_dev` を返します。flags と mask は Linux と同じように確かめます（`EINVAL`）。
   mask が何を求めても、Linux と同じくマウントの ID も返します。`/proc/self/mountinfo`
@@ -228,6 +239,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   mountinfo の ID は 21 から始まり、Linux の内部のマウントも mountinfo に出ません。
   `AT_EMPTY_PATH` はディスクリプタを、`AT_FDCWD` なら作業ディレクトリを指し、Linux 6.11
   からと同じく、それとともに渡した空ポインタのパスも同じ扱いです。
+
 - `name_to_handle_at` はファイルのハンドルを返し、Linux（6.13 以降）と同じ順に確かめます。
   まずフラグ（`EINVAL`。`AT_HANDLE_CONNECTABLE` と `AT_HANDLE_FID` か `AT_EMPTY_PATH` を
   合わせたときも）、次にパス（`AT_SYMLINK_FOLLOW` がなければ最後のリンクそのもの。空の
@@ -241,6 +253,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `/proc` など）は NFS のエクスポートがないものとしてハンドルを断り（`EOPNOTSUPP`）、
   `AT_HANDLE_FID` には型 `FILEID_INO64_GEN` の識別子を返します。inode、世代の順です。
   接続できるハンドルは、tmpfs も pidfs も作れないので `EOPNOTSUPP` です。
+
 - `open_by_handle_at` はハンドルが指すファイルを開き、Linux と同じ順に確かめます。
   まずハンドルの見出し（`EFAULT`）、その大きさ（0 か 128 バイトを超えると `EINVAL`）と
   型のフラグ（接続できるハンドルとディレクトリのハンドルのもの以外は `EINVAL`）、
@@ -257,6 +270,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EPERM`）。メモリー上のルートの tmpfs のハンドルは、そのファイルそのものを開くのと
   同じようにファイルを開きます。`O_CREAT` はそのファイルを見つけ（`O_EXCL` では
   `EEXIST`、ディレクトリでは `EISDIR`）、シンボリックリンクはたどりません。
+
 - `fallocate` は、Linux の `vfs_fallocate` と同じ順に引数を確かめます（`EINVAL`、
   `EOPNOTSUPP`、`EBADF`、通常のファイルでなければ `ESPIPE`・`EISDIR`・`ENODEV`、
   そして `EFBIG`）。そのあとは tmpfs と同じふるまいです。通常の確保は範囲の
@@ -267,6 +281,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   メモリ上のファイルシステムの 4 GiB を超える `fallocate` は、何も確保せずに
   `ENOSPC` で失敗します（書き込みにはこの上限はありません。
   [制限](./limitations) を見てください）。
+
 - メモリ上のファイルシステムのファイルは、tmpfs と同じく中身を 4 KiB のページで
   持ちます。書き込みは触れたページを確保し、それ以外は 0 として読める穴で、
   メモリを使いません。そのため `ftruncate` で大きくしたファイルは、書くまで何も
@@ -274,11 +289,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   後ろのページを解放します。`SEEK_DATA` と `SEEK_HOLE` の `lseek` は、書いたページと
   穴を見つけます。`fallocate` で確保したページは書くまで穴で、ファイルの末尾も
   穴です。末尾以降や負のオフセットは `ENXIO` です。
+
 - マウントしたホストのディレクトリのファイルでは、Linux と macOS のホストなら
   `SEEK_DATA`、`SEEK_HOLE`、`st_blocks` をホストから得ます（`st_blocks` は Unix の
   ホストすべてで）。ホストのファイルシステムが穴の場所を答えられないときと、ほかの
   ホストでは、Linux の `generic_file_llseek` が穴のないファイルシステムで扱うのと
   同じく、ファイル全体をデータとします。
+
 - `memfd_create` は、リンクのないメモリ上のファイル（モード 0777、
   `MFD_NOEXEC_SEAL` なら 0666）を作り、flags と名前を Linux と同じく確かめます
   （`EINVAL`、`EFAULT`）。`MFD_HUGETLB` は、hugetlbfs のないカーネルと同じく
@@ -296,6 +313,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EBUSY` になり、書き込みを封じた memfd の共有マッピングは書き込めるようにできません
   （`EACCES`）。実行できる memfd への `F_SEAL_EXEC` も書き込みを封じるので、そのときは
   Linux 7.1 以降と同じく `EBUSY` になります（それより前のカーネルはシールを加えます）。
+
 - `memfd_secret` は、Linux の secretmem と同じファイルを作ります。中身のない通常の
   ファイルで、モードは 0600、リンクは 1 つ、読み書き用に開いていて、`/proc/self/fd` と
   `/proc/self/maps` では `/secretmem (deleted)` と見え、専用のファイルシステム
@@ -314,6 +332,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux master の secretmem が作ったユーザーの `locked_vm` に数えるのと同じく、ページは
   マップしているかによらず、ファイルがなくなるまで数えます。ページはエミュレータのものなので、
   ゲストのほかのメモリと同じだけしか秘密になりません。
+
 - `openat2` は `openat` と同じように開き（FIFO も）、`struct open_how` を Linux と同じく
   より厳しく調べます。24 バイトに満たない大きさは `EINVAL`、1 ページを超えるものや、
   最初の版より後ろに 0 でない未知のバイトがあるものは `E2BIG` です。未知のフラグや
@@ -328,11 +347,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EXDEV`）。両方のスコープのフラグを付けると `EINVAL` です。`RESOLVE_CACHED` は
   `O_CREAT`、`O_TRUNC`、`O_TMPFILE` と一緒なら `EAGAIN` で、それ以外はすべての名前が
   キャッシュにあるものとして常にファイルを見つけます。
+
 - `close_range` は `first` から `last` までの開いているディスクリプタを閉じ、
   `CLOSE_RANGE_CLOEXEC` なら閉じずに close-on-exec を付けます。`CLOSE_RANGE_UNSHARE`
   は先に、`CLONE_FILES` のスレッドと共有している表をそのスレッド専用の写しにします。
   共有していたスレッドのディスクリプタはそのまま残ります。未知のフラグや `last` より
   大きい `first` は `EINVAL` です。
+
 - どのシステムコールも、引数を Linux が宣言している C の型の幅で読みます。Linux の
   システムコールの入口が、呼び出しの前にレジスタをその型にキャストするのと同じです。
   `int`・`pid_t`・`clockid_t` は下位 32 ビットを符号拡張して、`unsigned int`・`uid_t`・
@@ -348,6 +369,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   合わせます。システムコールの番号も、
   Linux の `do_syscall_64` が `int` で受け取るのと同じく `rax` の下位 32 ビットから読み、
   負の番号は `ENOSYS` です。
+
 - `futex` は `WAIT`・`WAKE`・`WAIT_BITSET`・`WAKE_BITSET`・`REQUEUE`・`CMP_REQUEUE`・
   `WAKE_OP` を扱います。ワードは Linux の
   `get_futex_key` と同じように見分けます。共有マッピング（共有の無名メモリかファイルのもの）では、
@@ -368,6 +390,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   値を符号付きの `int` として比べた結果が真なら、`uaddr2` の待ち手を最大 `val2` 個起こし、
   起こした数を返します。x86 の Linux と同じく、知らない演算はワードに触れる前に `ENOSYS`、
   知らない比較はワードを変えた後で `ENOSYS`、書けないワードは `EFAULT` です。
+
 - futex2 の呼び出しは、32 ビットのワードと `FUTEX2_PRIVATE`・`FUTEX2_NUMA`・`FUTEX2_MPOL` を
   Linux と同じ順に確かめて受け付けます。ほかの大きさやフラグは `EINVAL` です。`futex_wake` と
   `futex_wait` は、`FUTEX_WAKE_BITSET` と `FUTEX_WAIT_BITSET` に、`CLOCK_REALTIME` か
@@ -379,6 +402,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   値です。`FUTEX2_NUMA` のワードの後ろにはノードが続き、ただ 1 つのノード 0 か、`-1` で
   なければなりません。`-1` は、Linux がスレッドのノードを書くのと同じく 0 になります。待ちを
   シグナルで中断すると `ERESTARTSYS` になるので、停止の後と `SA_RESTART` のハンドラの後にやり直します。
+
 - `set_robust_list` と `get_robust_list` は、スレッドごとの robust futex のリストを
   持ちます。glibc と musl の robust mutex に必要です。スレッドが終わるときと `execve`
   のときに、Linux の `exit_robust_list` と同じようにリストをたどります。スレッドが
@@ -391,16 +415,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `migrate_pages`、`move_pages` の検査では、Linux 7.1 以降と同じく、ゾンビもダンプ
   できるかどうかをそのまま持ちます（それより前は、メモリのなくなったプロセスでは
   この判定を飛ばしていました）。
+
 - `futex`・`epoll`・`eventfd` は paludarium の中で実装していて、ホストの同じ機能には
   頼りません。そのため、macOS・Windows・WebAssembly でも同じように動きます。
+
 - [ネットワーク](#network)がなければ、新しいネットワーク名前空間の外では、`socket()` は `AF_INET`、`AF_INET6`、`AF_NETLINK`、`AF_MCTP` に
   `EAFNOSUPPORT` を返します。
+
 - `epoll_wait`・`epoll_pwait`・`epoll_pwait2` は、Linux 6.12 より後のカーネルと同じ順番で引数を
   確かめます（6.12 は記述子より先に `maxevents` を確かめていました）。
   `epoll_pwait2` はまずタイムアウト（`struct timespec`。なければいつまでも待ちます）を読み
   （`EFAULT`）、Linux が受け付けない値なら `EINVAL` を返し、大きすぎる値は上限で止めます。次に
   シグナルマスクを設定し（大きさが 8 でなければ `EINVAL`）、記述子（`EBADF`）、`maxevents`
   （`EINVAL`）、epoll であること（`EINVAL`）の順に確かめます。
+
 - `poll` は `epoll_wait` と同じように、どれかの記述子が準備できるか、ミリ秒の
   タイムアウトが過ぎるか（負の値なら過ぎません）、シグナルが届くまで（`EINTR`）待ちます。
   ホストの標準入力は、Linux の端末やパイプと同じく、読むバイトがあるときか、入力が
@@ -412,17 +440,20 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   は、どれもそう見ます。それを見分けられないホスト（Windows）では、いつも読めると
   します。出力はいつも書けます。パイプの読み出し側は、読まれていないデータがあるときだけ読めるとし、書き手が
   いなくなると切断だけを示します。Linux の `pipe_poll` と同じです。
+
 - `ppoll`・`select`・`pselect6` も同じように待ちます。Linux と同じく、残りの時間を
   タイムアウトの引数に書き戻し（0 のタイムアウトには書き戻しません）、`ppoll` と
   `pselect6` は一時的なシグナルのマスクを受け取り、ハンドラはそのマスクで動きます。
   `select` は、集合の中の閉じた記述子に `EBADF` を返し、見る記述子は 1024 個
   （`FD_SETSIZE`）までです。Linux は `nfds` を記述子の表の大きさで切ります。
+
 - `fcntl` の `F_GETFL` は、Linux が持つのと同じ状態フラグを返します。開いたときの
   フラグから `O_CLOEXEC`、`O_CREAT`、`O_EXCL`、`O_NOCTTY`、`O_TRUNC` を除き、パスで
   開いたファイルと memfd には `O_LARGEFILE` を加えます。`O_PATH` のファイルは
   `O_DIRECTORY`、`O_NOFOLLOW`、`O_PATH` だけを持ちます。パイプ、ソケット、カーネル
   自身のファイルには、パスで開いたとき（`/proc/self/fd` のリンク、`/dev/stdout`）を
   除いて `O_LARGEFILE` がありません。
+
 - `O_PATH` のディスクリプタはパスだけを持ち、Linux の `fdget` と同じく受け付けません。
   読み書き、`lseek`、`flock`、`getdents`、`getdents64`、`sendfile`、`copy_file_range`、`splice`、`tee`、`vmsplice`、`fsync`、
   `fdatasync`、`syncfs`、`sync_file_range`、`fadvise64`、`readahead`、`ftruncate`、`fallocate`、`mmap`、`ioctl`、`f*xattr` の
@@ -430,6 +461,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `F_GETFD`、`F_SETFD`、`F_GETFL` を除く）は `EBADF`、`poll` は `POLLNVAL` で、
   `select` は準備ができたものとみなします。`fstat`、`fstatfs`、`fchdir`、`dup`、
   `close` は受け付け、`*at` の呼び出しではディレクトリになります。
+
 - `fcntl` のバイト範囲のロックを、Linux の `fs/locks.c` と同じく扱います。記述子の表
   （Linux の `files_struct` と同じく、プロセスのもので、そのスレッドと `CLONE_FILES` で
   clone した子が共有します）が持つレコードロック（`F_SETLK`、`F_SETLKW`、`F_GETLK`）と、開いたファイルの記述が持つ OFD ロック
@@ -447,15 +479,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ロックがそのままの間だけです。そのロックを外す、変える、閉じると、`locks_wake_up_blocks` と
   同じく、待つ側がまだ動き出す前でもその待ちはすぐ数えられなくなります。ロックはゲストだけのもので、ホストの
   プログラムからは見えず、ゲストからもホストのロックは見えません。
+
 - パイプは Linux と同じく 64 KiB を持ちます。`fcntl` の `F_SETPIPE_SZ` と
   `F_GETPIPE_SZ` は、`pipe_set_size` と同じように大きさを変えて返します。大きさは
   1 ページ以上の 2 のべき乗で、読まれていないデータより小さくすると `EBUSY`、
   2³¹ を超えると `EINVAL` です。
+
 - `SOCK_DGRAM` の組は、`SOCK_SEQPACKET` と同じくメッセージの区切りを保ちますが、
   ファイルの終わりがありません。相手が閉じると、読み込みは待ち続け、次の送信は
   `ECONNREFUSED`、その後は `ENOTCONN` になります。その送信は、下と同じく、その端が
   読んでいないものを捨てます。`EPIPE` で `SIGPIPE` を送るのは、
   Linux と同じく `SOCK_STREAM` だけです。
+
 - `socket(AF_UNIX)` は、Linux の `af_unix.c` と同じく、`SOCK_STREAM` か
   `SOCK_SEQPACKET` のソケットを作ります。抽象名前空間の名前（0 で始まる `sun_path`）に
   `bind` し、ファミリーだけなら空いている 5 桁の 16 進の名前に `bind` し、待ち受けて
@@ -471,6 +506,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ソケットのペアの端と同じです。Linux が種類と一緒にハッシュするのと同じく、名前は
   ソケットの種類ごとに持つので、ストリームとデータグラムのソケットは同じ名前に
   `bind` できます。
+
 - AF_UNIX のソケットは、Linux の `unix_bind_bsd` と同じく、パスにも `bind` します。
   `bind` はそこにソケットファイル（`S_IFSOCK`、モードは 0777 から umask を引いたもの）を
   作ります。Linux のホストからマウントしたディレクトリにも作ります（[制限](./limitations)）。
@@ -481,6 +517,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ソケットのファイルでないもの、ソケットが閉じたファイル（ファイルは残ります）は
   `ECONNREFUSED`、種類の違うソケットは `EPROTOTYPE` です。ソケットファイルを開くと
   `ENXIO` で、`readdir` はそれを `DT_SOCK` と示します。
+
 - `socket(AF_UNIX, SOCK_DGRAM)`（と、Linux が同じものを作る `SOCK_RAW`）は、
   Linux の `unix_dgram_*` と同じく、上と同じように `bind` し、名前のソケットへ
   `sendto` で、または接続したソケットへ送るデータグラムのソケットを作ります。その名前の
@@ -512,6 +549,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   いなくても `SO_PEERCRED` はどのプロセスも示さず（プロセス 0、ID は -1）、`SO_PEERPIDFD`
   は `ENODATA` です。データグラムのソケットのペアの端は、ほかのペアと同じく組を作った
   プロセスを示します。ソケットのペアのデータグラムの端も名前へ送れます。
+
 - `socketpair(AF_UNIX)` は、Linux の `unix_socketpair` と同じく、名前がなく互いに
   接続した 2 つのソケットを作ります。そのほかは、それぞれその種類のソケットと同じです。
   どちらも上と同じく `bind` でき、そのあとは相手の `getpeername` と、そのソケットが
@@ -519,6 +557,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   しません（その名前で待ち受けがあれば `EISCONN`）。データグラムのソケットは、ほかの
   データグラムのソケットと同じく、別のソケットや `AF_UNSPEC` へ接続し直し、上と同じく
   もう一方の端との接続を切ります。
+
 - `recvmsg` と `recvfrom` は、Linux の AF_UNIX のソケットと同じくフラグを扱います。
   `MSG_PEEK` はデータを残し、受け渡すディスクリプタの写しを渡します。`MSG_WAITALL` は、
   ストリームの終わりやディスクリプタが来るまで、またはデータを受け取ったあとにシグナルが
@@ -530,6 +569,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、読んだときに送ったソケットが持っている名前で、そのソケットがなくなったあとも
   同じです。渡された場所に収まる分だけ書き、長さは全体の長さです。名前のないソケットの
   アドレスの長さは 0 です。
+
 - `sendmmsg` と `recvmmsg` は、Linux の `__sys_sendmmsg` と `do_recvmmsg` と同じく、ベクターの
   メッセージを 1 つずつ `sendmsg` と `recvmsg` と同じように送受信し（どのソケットでも）、
   それぞれのバイト数を `msg_len` に書きます。`MSG_CMSG_COMPAT` は `EINVAL` です。`sendmmsg` は
@@ -544,6 +584,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   返します（シグナルでやり直す待ちなら、Linux と同じく `ERESTARTSYS` の 512 が残ります）。
   データグラムやパケットのソケットの受信もキューより先にそれを返し、AF_UNIX のストリームは、
   Linux の `unix_stream_read_generic` と同じく、キューが空になってから返します。
+
 - 読まれていないメッセージだけが持っているソケットは、Linux のガベージコレクタ
   （`unix_gc`）がソケットのなくなるときに閉じるのと同じく閉じられます。自分のキューで
   ディスクリプタが待っているソケットや、そうして互いを持ち合うソケットは、ディスクリプタが
@@ -552,6 +593,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   待ち受けのまだ受け付けていない接続が持っているものは、待ち受けが持っているものとして
   数えます。そうした接続だけが持っている待ち受けはゴミとして、接続が持っているものと
   一緒に閉じられ、その接続のクライアントはリセットされます。
+
 - ストリームへの書き込みは、Linux の `unix_stream_sendmsg` と同じく、いくつかの部分に
   分けて送ります。1 つの部分は最大 36544 バイト（1 ページの先頭部分と 32 KiB のページ）、
   または送信バッファの半分から 64 バイトを引いた大きさです。送信バッファは `SO_SNDBUF` が
@@ -564,6 +606,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   送るので、ノンブロッキングの送信は一部だけを送ることがあります。満杯の送り手の待ち方、
   `poll` での書ける条件、`SIOCOUTQ` もデータグラムのソケットと同じです。相手が読んで
   いないバイト数では抑えません。
+
 - ストリームは、Linux 7.0 の AF_UNIX と同じく帯域外のデータを持ちます。`MSG_OOB` を
   付けた送信では、ほかのデータのあとに、最後の 1 バイトが帯域外のバイトになります
   （空の送信は `EOPNOTSUPP`）。まだ読まれていない前のバイトは、ふつうのデータになります。
@@ -574,6 +617,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   読みます（そのとき `MSG_OOB` を付けた `recv` は `EINVAL`）。1 バイトの帯域外の送信が
   受け渡すディスクリプタは、渡されずに閉じられます。帯域外のバイトは、受け取る側の
   持ち主に `SIGURG` を送ります（下のシグナル駆動の入出力を見てください）。
+
 - Linux と同じくシグナル駆動の入出力を扱います。`fcntl` の `F_SETOWN` で、どのファイルにも
   持ち主を決められます。
   - プロセス、または負の値でプロセスグループ
@@ -631,6 +675,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     確かめるため）。そのため送信でも、相手が `shutdown` したときや閉じたときでも、Linux では
     送ることがありますが、エミュレータは送りません。データグラムとパケットの
     ソケットの読み手には送ります。
+
 - `setsockopt` と `getsockopt` は、Linux の `sk_setsockopt` と `sk_getsockopt` と同じく、
   既定の値やチェックも含めて `SOL_SOCKET` のオプションを扱います。4 バイトに満たない
   `int` の値は `EINVAL`、読み出す値は渡された長さで切り、ほかのレベルは `EOPNOTSUPP`、
@@ -639,6 +684,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   読むだけです。
   `SO_SNDBUF` と `SO_RCVBUF` は 2 倍にして、Linux の下限と上限に収め、`SO_LINGER` は
   `struct linger` を受け取ります。
+
 - `SO_PASSCRED` を設定すると、Linux の AF_UNIX と同じく、メッセージが資格情報を運びます。
   どちらかの端に設定があるときに送ったメッセージは、送り手のプロセス ID、実ユーザー、
   実グループを運びます。`SCM_CREDENTIALS` を渡したときは、その値を運びます。設定のある
@@ -650,6 +696,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   呼び出し側のプロセス以外を示すには `CAP_SYS_ADMIN`、自分の実、実効、保存ユーザー ID
   以外を示すには `CAP_SETUID`、自分のグループ ID 以外を示すには `CAP_SETGID` が要ります
   （なければ `EPERM`）。そのあとでプロセスを探し、なければ `ESRCH` です。
+
 - `SO_PASSPIDFD` を設定すると、`SO_PASSCRED` と同じようにメッセージが資格情報を運び、
   設定のある受け手は、送り手のプロセスの pidfd（close-on-exec）を `SCM_PIDFD` の
   メッセージで受け取ります。Linux 7.0 と同じく、ディスクリプタのあとに来ます。pidfd を
@@ -664,19 +711,23 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   クライアントでは待ち受けのプロセス（`copy_peercred`）です。`SO_PEERPIDFD` は、その
   プロセスの新しい pidfd を読み出します。渡した長さに番号の一部しか入らなくても、
   pidfd は作ります。読み出すだけのオプションで、`setsockopt` は `ENOPROTOOPT` です。
+
 - `SO_PASSSEC` は Linux と同じく設定でき、読み出せます。設定のある受け手が制御の
   バッファなしで受け取ると `MSG_CTRUNC` になります。`SCM_SECURITY` のメッセージは
   来ません。AF_UNIX に送り手のコンテキストを渡すセキュリティモジュールのない Linux
   （モジュールなし、または AppArmor）と同じです。
+
 - `SO_PASSRIGHTS` は、Linux 6.16 以降と同じく、新しい AF_UNIX のソケットでは
   有効です。0 にするとソケットはディスクリプタを受け取らず、それを渡す送信は
   `EPERM` になります。シャットダウンの `EPIPE` よりあと、キューが満杯の `EAGAIN`
   より先です。ストリームで 0 バイトを送るときは何も渡さないので、0 を返します。
   すでに待っているディスクリプタは読めます。
+
 - 待ち受けが受け付けたソケットは、クライアントが接続したときの待ち受けの
   `SO_PASSCRED`、`SO_PASSPIDFD`、`SO_PASSSEC`、`SO_PASSRIGHTS` を引き継ぎます。
   inet のソケットでは、Linux が AF_UNIX でしか受け付けないので、この 4 つは
   設定も読み出しも `EOPNOTSUPP` です。
+
 - `SO_RCVTIMEO` と `SO_SNDTIMEO`（と `_NEW` の形）は、Linux と同じく、そのソケットでの
   `recv`、`read`、`send`、`write` が待つ時間を限ります。限りを過ぎると `EAGAIN`、または
   そこまでに動かした分を返し、`MSG_WAITALL` もそこで止まります。0 の `timeval` は
@@ -684,16 +735,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   1000 Hz の時計の刻みで持つので、読み出すとミリ秒に切り上がっています。そのような待ちを
   シグナルが終わらせると `EINTR` になり、Linux の `sock_intr_errno` と同じく
   `SA_RESTART` でもやり直しません。
+
 - `SO_RCVLOWAT` を設定すると、Linux の `sock_rcvlowat` と同じく、ブロックするストリームの
   `recv` や `read` は、その量のバイトが揃うか、バッファが一杯になるまで待ちます。ストリームの
   終わり、時間切れ、ディスクリプタの到着では、それより少なくても返します。`MSG_PEEK`、
   ブロックしない読み込み、`poll`、データグラムとパケットのソケットは待たせません。0 は 1、
   負の値は `INT_MAX` として扱います。
+
 - `SO_PEEK_OFF` は、Linux の `sk_peek_off` と同じく、`MSG_PEEK` が読み始める位置を決めます。
   覗くたびに読んだ分だけ進み、読み込むたびに取った分だけ戻ります（0 より下には戻りません）。
   データグラムとパケットのソケットでは、メッセージ単位で先へ進み、一度覗いた空のメッセージも
   飛ばします。`MSG_TRUNC` は、そこから先のメッセージの長さを返します。どんな値も受け付け、
   負の値（既定は -1）では位置を使いません。
+
 - `SO_TIMESTAMP` と `SO_TIMESTAMPNS`、それに `_NEW` の形は、Linux の AF_UNIX と同じく、
   メッセージにタイムスタンプを付けます。設定したデータグラムやパケットのソケットは、
   メッセージごとに実時間を制御メッセージで受け取ります。資格情報やディスクリプタより先に並び、
@@ -702,6 +756,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   取っていれば送った時刻、そうでなければ最初に読むか覗いた時刻です。ストリームには付きません。
   `getsockopt` は、それぞれ自分の形で設定したときだけ 1 を返します。どれかを切っても、次に
   どれかを設定するまで `_NEW` の選択は残ります。
+
 - `SO_TIMESTAMPING` とその `_NEW` の形は、Linux の知るフラグを受け付け、Linux の
   `sock_set_timestamping` と同じものを断ります。知らないフラグ、`OPT_ID` のない
   `SOF_TIMESTAMPING_OPT_ID_TCP`、`OPT_TSONLY` のない `OPT_STATS` は `EINVAL` です。
@@ -712,6 +767,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   その制御メッセージのあとに `SCM_TIMESTAMPING` が並び、フラグがソフトウェアの
   タイムスタンプを報告し、受信したものを除いていなければ、最初の `timespec` が同じ時刻です。
   ローカルのソケットどうしのメッセージには、ハードウェアのタイムスタンプは付きません。
+
 - `mmap` と `shmat` は、マッピングを作り、ファイル、共有メモリ、セグメントを付ける
   までを、アドレス空間のロックを一度取る間に行います。Linux が `mmap_lock` の下で
   するのと同じです。`MAP_FIXED` や `SHM_REMAP` では、範囲にあったマッピングを外すのも
@@ -720,6 +776,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   読みます。`MAP_FIXED_NOREPLACE` は、何かがマップされていれば、ファイルに尋ねる前に
   `EEXIST` になります。中身を付けられなかったときは、新しいマッピングを外し、置き換えた
   マッピングは戻りません。
+
 - ファイルの `MAP_SHARED` のマッピングは、Linux と同じくファイルのページキャッシュを
   見せます。どのプロセスのものでも、そのファイルの共有マッピングはみな同じページを
   持ちます。そこへの書き込みは `read` にも、そのファイルのプライベートなマッピングにも
@@ -727,22 +784,26 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   終わりより先への書き込みは、ファイルに入りません。このマッピングが書き込めるのも、
   `mprotect` で書き込めるようにできるのも、Linux と同じく、ファイルを読み書きの両方で
   開いたときだけです（ほかは `EACCES`）。
+
 - ファイルの `MAP_PRIVATE` のマッピングは、まだ書いていないページでは同じページ
   キャッシュを見せます。そのため、そこではファイルの後の変更も見えます。ページに初めて
   書き込むと、Linux と同じく、そのページをそのプロセスだけのために写し取ります。`fork`
   した子とは、どちらもまだ書いていないページを共有します。ファイルを縮めて、写しが
   ファイルの終わりより完全に先になると、その写しは捨てられます。そのため、ファイルが
   また伸びればファイルを読み直します。Linux も同じく写しを捨てます。
+
 - ファイルのマッピングで、ファイルの終わりより完全に先にあるページに触れると、
   プライベートでも共有でも、Linux と同じく `SIGBUS`（`BUS_ADRERR` とそのアドレス）に
   なります。そのようなメモリを渡したシステムコールは `EFAULT` で失敗します。終わりは
   ファイルに合わせて動きます。ファイルが伸びれば先のページも読めるようになり、縮めば
   前に読んだページでも `SIGBUS` になります。ファイルが一部だけを覆うページは、
   ファイルの終わりより先が 0 として読めます。
+
 - `mincore` は、どのページがメモリにあるかを返します。プライベートなページと共有の
   無名メモリは読むか書いたあとから、ファイルのページはファイルの範囲内ならメモリに
   あるとします。Linux と同じく、マップされていない最初のページの手前まで書いて
   `ENOMEM` を返します。
+
 - `cachestat`（Linux 6.5）は、バイト範囲（長さ 0 ならファイルの終わりまで）のうち、
   ファイルのページキャッシュにあるページを数えます。メモリ上のファイルは、tmpfs と同じく
   割り当て済みのページを持ち、tmpfs は印を付けないので dirty や書き戻し中のページはなく、
@@ -751,6 +812,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディスクリプタは `O_PATH` でなく（`EBADF`）、2 つの構造体は読み書きでき（`EFAULT`）、
   読み込み専用で開いたものは、呼び出し元がファイルの所有者か書き込めることが必要で
   （`EPERM`）、そのあとで未知のフラグが `EINVAL` です。
+
 - `mlock`、`mlock2`、`munlock` は、Linux と同じように範囲を確かめます。長さはページ単位に
   切り上げ、アドレスの終わりを越える範囲は `EINVAL`、マップされていないページを含む範囲は、
   その前の VMA に新しい状態を付けてから `ENOMEM` です。ロック（`VM_LOCKED`、
@@ -770,6 +832,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   範囲はロックされず、AIO と `io_uring` のリングもロックされません。`mlock2` と
   `mlockall` の未知のフラグは `EINVAL` です。スワップアウトは起きないので、ほかに
   何もしなくてもメモリはそのまま残ります。
+
 - `madvise`：`MADV_DONTNEED` を受けたプライベートなページは空になります。無名の
   ページはそのあと 0 として読め、ファイルのマッピングのページは、Linux がファイルから
   読み込み直すのと同じく、そのときのファイルの中身を読みます。`mremap` で動かしたあとも、`fork` した子でも同じです。プログラム自身の
@@ -816,6 +879,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ガードを置けません（`EPERM`）。Linux が `VM_DONTEXPAND` でマップする AIO と
   `io_uring` のリングは、どちらの指定も受け付けません（`EINVAL`）。ほかの指定には
   `EINVAL` を返します。
+
 - `process_madvise` は、iovec の範囲を順に指定どおりにします。呼んだプロセス自身の
   メモリ（`PIDFD_SELF_THREAD`、`PIDFD_SELF_THREAD_GROUP`、自身かメモリを共有する
   プロセスの pidfd）には `madvise` と同じようにします。結果は、最初に失敗した範囲より
@@ -824,6 +888,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EINVAL`）、`CAP_SYS_NICE` が要ります（`EPERM`）。その範囲は、マップされていれば
   足ります（`ENOMEM`）。確かめる順は Linux と同じで、`flags`、iovec、pidfd（`EBADF`、
   `ESRCH`）、プロセスを読む権利（`EACCES`）、指定の順です。
+
 - `process_mrelease` は、`process_madvise` と同じようにプロセスを探します（`flags` は
   0 で、そのあと `EBADF`、`ESRCH`）。終わったプロセス（ゾンビ）には、もうメモリが
   ありません（`ESRCH`）。そのメモリが解放されるところなら成功します。つまり、プロセスが
@@ -837,6 +902,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どれかのスレッド）がブロックしておらず、プロセスが止まっていないときです。メモリは
   プロセスの最後のスレッドが終わるときに解放されるので、それより早く解放するものは
   ありません。
+
 - `mremap` は、後ろが空いていればその場で広げ、空いていなければ `MREMAP_MAYMOVE` で
   中身ごと動かします。`MREMAP_FIXED` と `MREMAP_DONTUNMAP` も使えます。共有のメモリは、
   動かしても `fork` した相手と共有したままです。ファイルのマッピングは、ファイルの
@@ -847,8 +913,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EFAULT`）、動かして元を残すこともできません（`MREMAP_DONTUNMAP`、`EINVAL`）。
   AIO のリングは、Linux master の `aio_ring_mremap` と同じく丸ごとでなければ動かせず
   （行き先を空け、縮めて落とす分を外したあとで `EINVAL`）、コンテキストも一緒に移ります。
+
 - `msync` は、引数と範囲を確かめ、`MS_SYNC` か `MS_ASYNC` なら共有のファイルの
   マッピングへの書き込みをファイルに書き戻します。
+
 - `userfaultfd` は、登録したメモリでほかのスレッドが起こすフォールトをスレッドが
   さばくためのファイルを、Linux の `fs/userfaultfd.c` と同じに作ります。カーネル自身の
   フォールトも届くもの（`UFFD_USER_MODE_ONLY` なし）には `CAP_SYS_PTRACE` が要り
@@ -997,12 +1065,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベントが読まれるまで `UFFDIO_COPY`、`UFFDIO_ZEROPAGE`、`UFFDIO_POISON`、
   `UFFDIO_CONTINUE`、`UFFDIO_MOVE` は（先に最後のフィールドへ書いてから）
   `EAGAIN`、`UFFDIO_WRITEPROTECT` も `EAGAIN` です（`mmap_changing`）。
+
 - `remap_file_pages` は、共有のマッピングの範囲を、そのファイルや共有メモリの別の
   ページに張り直します。Linux がマッピング自身のファイルを `mmap` し直すのと同じで、
   保護はそのままです。Linux と同じく、`prot` は 0 でなければならず、範囲は、ファイルを
   書き込み用に開いた（`VM_SHARED`。memfd の封印は外しません）同じメモリの共有の
   マッピングの中に隙間なく収まっていなければなりません（`EINVAL`）。
   ファイルが届かないページは `EOVERFLOW` です。
+
 - System V の共有メモリ（`shmget`、`shmat`、`shmdt`、`shmctl`）は、スレッドの IPC
   名前空間のものです。確かめる内容とその順序は Linux と同じで、上限はその名前空間の
   `/proc/sys/kernel` のファイル（後述）です。大きさは 1 から `shmmax` まで（`EINVAL`）、
@@ -1026,6 +1096,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   したセグメントは、ID はそのままで、どのキーでも見つからなくなり、最後に外れたとき
   消えます。`SHM_LOCK` は Linux と同じく所有者と `RLIMIT_MEMLOCK` を確かめます。
   `SHM_HUGETLB` は、hugetlbfs なしでビルドしたカーネルと同じく `ENOSYS` です。
+
 - System V のセマフォー（`semget`、`semop`、`semtimedop`、`semctl`）も、スレッドの IPC
   名前空間のものです。確かめる内容とその順序は Linux の `ipc/sem.c` と同じで、上限は
   その名前空間の `/proc/sys/kernel/sem`（Linux の既定値は `SEMMSL` 32000、`SEMMNS`
@@ -1049,6 +1120,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `SETALL` は調整値を消します。リストを共有する最後のスレッドが、終わるとき、または
   `unshare`（`CLONE_SYSVSEM` か `CLONE_NEWIPC`）やほかの IPC 名前空間への `setns` で
   リストを離れるときに、Linux と同じく 0 と `SEMVMX` の間に収めて値に足します。
+
 - System V のメッセージキュー（`msgget`、`msgsnd`、`msgrcv`、`msgctl`）も、スレッドの
   IPC 名前空間のものです。確かめる内容とその順序は Linux の `ipc/msg.c` と同じで、上限は
   その名前空間の `/proc/sys/kernel` のファイル（Linux の既定値は `MSGMAX` 8192、`MSGMNB`
@@ -1071,6 +1143,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`ERESTARTNOHAND`）。`msgctl` には、`IPC_STAT`、`MSG_STAT`、`MSG_STAT_ANY`（プロセスは
   呼び出し元の PID 名前空間の番号）、`IPC_SET`（`MSGMNB` を超えるには
   `CAP_SYS_RESOURCE`）、`IPC_RMID`、`IPC_INFO`、`MSG_INFO` があります。
+
 - POSIX メッセージキュー（`mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、
   `mq_notify`、`mq_getsetattr`）は、スレッドの IPC 名前空間が持つ `mqueue` ファイル
   システムのファイルです。確かめる内容とその順序は Linux の `ipc/mqueue.c` と同じです。
@@ -1126,6 +1199,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `mq_notify` はキューを引く前に、受信で空きができるか空になるまで待ちます（シグナルで待ちは終わり `EINTR`。`SA_RESTART` なら再開します）。そのあと失敗すれば
   空きを返します。キューのどの記述子を閉じても、またはプロセスが
   終わっても、Linux の `mqueue_flush_file` と同じくそのプロセスの登録は外れます。
+
 - `/dev/mqueue` は、Linux の起動時に systemd がマウントするのと同じく、呼び出し元がどの IPC
   名前空間にいても、最初の IPC 名前空間の `mqueue` ファイルシステムです。誰でも書ける
   スティッキーなディレクトリ（01777。作った者のもの）で、`/dev` に並び、中にはキューが通常
@@ -1158,6 +1232,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   パスをたどったあと（途中の各ディレクトリを検索でき、なければ `EACCES`）で `EXDEV`
   （`rename` は名前を引く前）、その中では `EPERM` です。ただし、名前をそれ自身へ `rename`
   すると何もせずに成功します。
+
 - 鍵の保管サービス（`add_key`、`request_key`、`keyctl`）は Linux の `security/keys`
   と同じです。`keyring`、`user`、`logon` の鍵があり、それぞれに通し番号、所有者、グループ、
   許可（所持者、ユーザー、グループ、その他）、期限があります。スレッドはスレッド、
@@ -1178,6 +1253,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `request_key` は、`/sbin/request-key` が失敗したときと同じく鍵を 60 秒の否定の鍵にして
   `ENOENT` を返します。そのため `INSTANTIATE`、`NEGATE`、`REJECT`、`INSTANTIATE_IOV` は
   権限を見つけられず（`EPERM`）、鍵の `ASSUME_AUTHORITY` は `ENOKEY` です。
+
 - `sched_getaffinity` では、ゲストのどのスレッドもホストのすべての CPU で動けるとします。
   そのため、ゲストにはホストと同じ数の CPU が見えます（WebAssembly では 1 つ）。
   `sched_setaffinity` は、プロセスのスレッドのマスクを Linux と同じように読んで持ちます。
@@ -1187,6 +1263,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どちらも、root と同じくほかのプロセスのスレッドも見つけ、その ID の生きているスレッドが
   なければ `ESRCH` です。`getcpu` は NUMA ノード 0 と、`rseq` を登録したスレッドなら
   その仮想 CPU を返します。ほかのスレッドには、マスクが許すいちばん小さい番号の CPU を返します。
+
 - Linux と同じく、スレッドごとにスケジューリングの属性があります。ポリシー
   （`SCHED_OTHER`、`SCHED_BATCH`、`SCHED_IDLE`、`SCHED_EXT`、`SCHED_FIFO`、`SCHED_RR`、
   `SCHED_DEADLINE`）、リアルタイムの優先度、`SCHED_RESET_ON_FORK`、デッドライン
@@ -1216,6 +1293,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スケジューラーがそのスレッドに与えるものです。ゲストのスレッドはホストのスレッドで
   動くからです。ほかのホストでは Linux 6.12 の 1000 Hz での既定値、つまり 0.75 ms に
   1 + log2(CPU の数、最大 8) を掛けた値です。
+
 - `ioprio_set` と `ioprio_get` は、`getpriority` と同じようにスレッドを見つけます
   （`IOPRIO_WHO_PROCESS`、`IOPRIO_WHO_PGRP`、`IOPRIO_WHO_USER`）。`ioprio_set` は、まず
   Linux の `ioprio_check_cap` と同じく優先度を確かめ（知られたクラスであること、
@@ -1226,6 +1304,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スレッドなら、Linux の `ioprio_best` と同じように比べていちばんよいものです（クラスの
   ないものはベストエフォートのレベル 4 とみなします）。クラスのある優先度は、新しい
   スレッドとプロセスに渡ります。
+
 - `kcmp` は、呼んだ側の PID 名前空間の番号でそれぞれのスレッドを見つけ（`ESRCH`）、実 ID で
   判断する読み取りモードの `ptrace_may_access` と同じく、両方を読めることを求めます（`EPERM`）。
   そのうえで Linux の `kernel/kcmp.c` と同じく、ディスクリプタで指したそれぞれの開いたファイル
@@ -1236,6 +1315,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux がアドレスを隠すのと同じく、ランダムなクッキーで決まる順の 1 か 2 を返します。それを
   持たないスレッド（終わったプロセス、I/O コンテキストや undo リストのないスレッド）どうしは
   等しいとみなします。
+
 - `process_vm_readv` と `process_vm_writev` は Linux の `mm/process_vm_access.c` と同じ順に
   確かめます。`flags` は 0 でなければならず（`EINVAL`）、次に手元の iovec 配列を `readv` と
   同じく読み、次に相手側の配列を読みます（1024 を超える要素や負の長さは `EINVAL`、読めない
@@ -1248,11 +1328,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `PROT_EXEC` だけでは足りません）、`PROT_WRITE` なしのページ（書く場合）、または書けない・
   読めない手元のバイトで写すのをやめ、それまでに写したバイト数を返します。1 バイトも
   写せなければ `EFAULT` です。
+
 - `pidfd_getfd` はフラグを取らず（`EINVAL`）、pidfd を取り（`EBADF`）、そのプロセスに上と
   同じくアタッチできることを求めます（`EPERM`）。終わったプロセスは回収の前でも後でも
   `ESRCH`、そのプロセスにないディスクリプタは `EBADF` です。写しは開いたファイル記述を
   共有し、空いている最小の番号を close-on-exec で得ます（`RLIMIT_NOFILE` に達すれば
   `EMFILE`）。
+
 - ほかのプロセスのスレッドを読めるか、アタッチできるかは、Linux の `__ptrace_may_access` が
   ケーパビリティモジュールと Yama を合わせて決めるのと同じく決めます。読む場合（`kcmp`、`get_robust_list`、
   `/proc/<pid>/environ` など、`move_pages`、`migrate_pages`、pidfd を渡した `setns`）は、
@@ -1265,6 +1347,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `pidfd_getfd`）は、Debian や Ubuntu、CI のランナーと同じく Yama の `ptrace_scope` を 1 と
   します。相手が呼び出し元の子孫であるか、`PR_SET_PTRACER` で呼び出し元を入れているか、
   呼び出し元が相手のユーザー名前空間で `CAP_SYS_PTRACE` を持つことも求めます。
+
 - `personality` は、Linux と同じくどんな値でもスレッドに持ち、前の値を返します
   （`0xffffffff` は問い合わせだけです）。新しいスレッドとプロセスはそれを継ぎ、
   `execve` は `READ_IMPLIES_EXEC` を、set-ID のプログラムなら `PER_CLEAR_ON_SETID` も
@@ -1278,6 +1361,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   実行のできるようにマップします。`ADDR_NO_RANDOMIZE` は持つだけです。もともと何も
   ランダムにしないからです。x86-64 の Linux でも何もしないフラグ（`ADDR_LIMIT_32BIT`、
   `SHORT_INODE`、`WHOLE_SECONDS`、`STICKY_TIMEOUTS` など）も持つだけです。
+
 - `mprotect` は引数を Linux と同じ順で確かめます。`PROT_GROWSDOWN` と `PROT_GROWSUP` の
   両方、そろっていない先頭、空の範囲（ビットが何でも成功します）、あふれる終わり（`ENOMEM`）、
   そのあと未知のビットの順です。`PROT_GROWSDOWN` は範囲を、その中の最初の VMA の先頭まで
@@ -1285,6 +1369,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マッピング）でなければならず、そうでなければ
   `EINVAL` です。`PROT_GROWSUP` は、x86-64 には上に伸びる VMA がないので、先頭がマップ済みなら
   `EINVAL` です。範囲に VMA がなければ、どちらも `ENOMEM` です。
+
 - 下に伸びるマッピング（メインのスタックか、`mmap` が `MAP_GROWSDOWN` で作った
   プライベートな匿名メモリで、`VmFlags` は `gd` を示します）は、Linux の
   `expand_downwards` と同じように伸びます。その下のマップされていないページへの
@@ -1297,12 +1382,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`/dev/zero` も含みます）と共有メモリは下に伸ばせません（`EINVAL`）。メインの
   スタックの VMA は 8 MiB から始まるので、それより大きい `RLIMIT_STACK` ではそれを
   超えて伸びます。
+
 - 保護キーは、保護キーのない CPU での Linux と同じ答えを返します。仮想 CPU はそういう CPU
   です（`CPUID` は PKU を報告しません）。キーは、既定のキー 0 も含めて一つも割り当てられて
   いません。`pkey_alloc` は `ENOSPC` で、フラグや `PKEY_DISABLE_ACCESS` と
   `PKEY_DISABLE_WRITE` 以外の権利には `EINVAL` です。`pkey_free` は `EINVAL` です。
   `pkey_mprotect` はキーが `-1` なら `mprotect` と同じで、それ以外のキーは、Linux が先に
   行う確認のあとで `EINVAL` です（空の範囲は成功し、あふれる範囲は `ENOMEM` です）。
+
 - `mseal` は、Linux の `mm/mseal.c` と同じようにマッピングを封印します。フラグは受け付けず、
   先頭はページ境界でなければならず、一周する長さや上端を超える長さは `EINVAL` です。
   マップされていないページを含む範囲は `ENOMEM` で、何も封印しません。封印された
@@ -1317,6 +1404,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - 封印された共有メモリの `shmdt` は、Linux が失敗した解除を無視するのと同じく、
     成功してマップされたまま残します。
   - `fork` の子は封印を受け継ぎ、`exec` のあとは何も封印されていません。
+
 - io_uring は、操作が `IORING_OP_NOP` と `IORING_OP_EPOLL_CTL`（libuv が `epoll_ctl` を
   まとめるのに使います）の 2 つだけの Linux 6.12 のものです。ほかの操作は、それらなしで
   ビルドした Linux と同じく `EOPNOTSUPP` で完了し、`IORING_REGISTER_PROBE` もその 2 つだけを
@@ -1324,6 +1412,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   見えます。要求は `io_uring_enter` が取り出すときに実行されるので、呼び出しが戻るときには
   完了がキューにあります。リンク、成功時に完了を省くもの、キューがいっぱいのあいだ保たれる
   完了（`IORING_FEAT_NODROP`）は Linux と同じです。
+
 - Linux のネイティブな非同期 I/O（libaio が包む呼び出し）は `fs/aio.c` のものです。
   `io_setup` はイベント数を CPU ごとに少なくとも 4 にして 2 倍にし（`0x8000000 / 32` を
   超えると `EINVAL`、単独でもマシンのほかのコンテキストと合わせても
@@ -1354,6 +1443,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   数えます。コンテキストはアドレス空間のものです。スレッドと `CLONE_VM` の子は共有し、fork の
   子はコンテキストもリングも持たず（2026 年からの `VM_DONTCOPY` と同じ）、`execve` か最後の
   終了でコンテキストは終わり、待っている poll は取り消されます。
+
 - `modify_ldt` は、Linux の `arch/x86/kernel/ldt.c` と同じく、アドレス空間のローカル
   ディスクリプタテーブルを持ちます。書き込み（1 は古いモード、0x11 は新しいモード）は
   16 バイトの `struct user_desc` を 1 つ受けます。エントリ番号が 8,192 以上なら `EINVAL` を
@@ -1365,6 +1455,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   最大 128 バイトの 0 を読み、ほかの関数は `ENOSYS` です。fork はコピーを保ち、exec のあとは
   テーブルがありません。結果は Linux の `int` を `unsigned int` にしたものなので、エラーは
   `-EINVAL` ではなく、たとえば `0xffffffea` として返ります。
+
 - `membarrier` は、`CONFIG_RSEQ` があって `nohz_full` の CPU がない x86-64 の Linux の
   コマンドを持ちます（`MEMBARRIER_CMD_QUERY` は `0x3ff`）。プライベートのコマンドは、
   アドレス空間がそれに登録するまで `EPERM` です。fork は登録を保ち、exec のあとは登録がなく、
@@ -1377,6 +1468,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   クリティカルセクションを中止させます（`MEMBARRIER_CMD_FLAG_CPU` ならその CPU のスレッドだけ、
   マシンにない CPU ならどれも）。ゲストのコードを実行していたスレッドがそれぞれ止まってから
   戻ります。
+
 - `rseq` は、Linux と同じ検査とエラー（`EINVAL`、`EPERM`、`EBUSY`、`EFAULT`）でスレッドの
   領域を登録し、今の Linux と同じく登録のときに領域の `rseq_cs` を消します。補助ベクターは
   今の Linux と同じく `AT_RSEQ_FEATURE_SIZE` に 28、`AT_RSEQ_ALIGN` に 64 を与えるので、
@@ -1395,6 +1487,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   では、スレッドは `SIGSEGV` で終わります。CPU を待つスレッドがあると、自分の CPU を 4 ms 使った
   スレッドは先に譲ります。fork は登録を保ち、新しいスレッド、`CLONE_VM` の子、exec は登録なしで
   始まります。
+
 - `chroot` は、Linux の `set_fs_root` と同じく、呼び出し元と作業ディレクトリを共有する
   タスク（`CLONE_FS`）に自分のルートを与えます。その前に Linux と同じ順に確かめます。
   パスのたどり（`ENOENT`、`ENOTDIR`、`ELOOP`、`EACCES`）、ディレクトリの検索の許可
@@ -1407,6 +1500,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   一緒にルートも動かし、マウント名前空間への `setns` はマシンのルートに戻します。生成される
   `/proc` と `/dev` がほかのルートの下にあるのは、それをバインドマウントした場所だけです。
   そこには `proc` ファイルシステムがマウントされていないからです。
+
 - `mount` は、呼び出し元のマウント名前空間のディレクトリに新しい tmpfs をマウントします。
   その前に Linux と同じ順に確かめます。型・ソース・オプションを写し（`EFAULT`。4096 バイト
   の中で終わらない文字列は `EINVAL`）、リンクをたどってターゲットを探し（`ENOENT`、
@@ -1439,6 +1533,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スーパーブロックを読み出し専用にし、`ro` オプションはスーパーブロックだけをそうします。
   mountinfo の 2 つの `ro` の欄がそれを示します。共有マウントの上のマウントも、自分の
   ピアグループで共有になります。
+
 - `MS_BIND` 付きの `mount` は、`CAP_SYS_ADMIN` までの同じ確認のあと、Linux の
   `do_loopback` と同じくバインドマウントを作ります。ソースが要り（ないものや空のものは
   `EINVAL`）、リンクをたどって探し（`ENOENT`、`ENOTDIR`、`ELOOP`、`EACCES`）、ターゲットの
@@ -1460,6 +1555,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   その上のものを除きます（ロックされたものは `EPERM`）。新しいマウントはソースの
   マウントのピアで、そのマスターのスレーブです。共有マウントの上では共有になり、ソースの
   マウントがどのピアグループにもなければ新しいグループに入ります。
+
 - バインドマウントのソースには、カーネルが `/dev` や `/proc` に生成するファイルも使えます
   （`mount --bind /dev/null file` や、プロセスのディレクトリのファイル。`/proc/self` は
   呼び出し元のものとして扱います）。新しいマウントはそのファイルをデバイスごと見せ、
@@ -1477,6 +1573,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `getcwd` はそれを返します（ない名前は `chdir` でも `ENOENT`）。生成されるディレクトリより
   下のマウントは表にないので、ロックされたもの（`has_locked_children`）はなく、`MS_REC`
   で付いてくるものもありません。
+
 - `MS_REMOUNT` と `MS_BIND` 付きの `mount` は、Linux の `do_reconfigure_mnt` と同じく
   マウントのフラグだけを変えます。ターゲットは呼び出し元の名前空間のマウントのルートで
   （`EINVAL`）、より権限の少ない名前空間への写しでロックされたフラグはそのままで
@@ -1495,6 +1592,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EINVAL`。`size`、`nr_blocks`、`nr_inodes`、`huge`、`inode32`、`inode64`、`mpol` は
   変わり、`mode`、`uid`、`gid` は変わりません）。そのあとマウントは呼び出しのフラグを
   持ちます。
+
 - `noexec` のマウントは、Linux の `path_noexec` と同じく何も実行しません。そこにある
   プログラム、スクリプトのインタープリター、ELF のインタープリターの `execve` は、許可の
   前に `EACCES` で、通常のファイルへの `X_OK` 付きの `access` も同じです。そこのファイルを
@@ -1505,6 +1603,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ユーザー名前空間のスーパーブロックにあるプログラムは、set-user-ID と set-group-ID の
   ビットもファイルケーパビリティもなしに実行します（`mnt_may_suid`）。スクリプトでは、
   実際に動くファイルであるそのインタープリターについてです。
+
 - 読み出し専用のマウントや、読み出し専用のスーパーブロックのマウントは、Linux の
   `mnt_want_write` と同じところで、その前に来るエラーのあとに、書き込むものを `EROFS` で
   断ります。名前を作るもの（`O_CREAT` と `O_TMPFILE` 付きの `open`、`mkdir`、`mknod`、
@@ -1526,6 +1625,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （devtmpfs）は systemd がマウントするのと同じく `nosuid`・`noexec`・`relatime` です。`/proc/self/fd` のリンクはそのファイルの
   ものを返し、カーネルの内部のマウント（パイプ、ソケット、匿名 inode、pidfs、memfd、
   secretmem、`mq_open` で開いたキュー）は `ST_VALID` だけです。
+
 - `MS_SHARED`、`MS_PRIVATE`、`MS_SLAVE`、`MS_UNBINDABLE` 付きの `mount`（`MS_REC` が
   あればターゲットの上のマウントも）は、`do_change_type` の確認のあと、マウントの伝播の
   種類を変えます。マウントのルートであること（`EINVAL`）、種類が 1 つでほかのフラグが
@@ -1539,6 +1639,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `unbindable` で示します。新しいマウント名前空間への写しは写したマウントのピアで、
   ユーザー名前空間がほかのものならそのスレーブです。外したマウントや、名前空間が
   終わったマウントも、同じようにピアグループから出ます。
+
 - 共有マウントの上へのマウント、バインドマウント、移動は、Linux の `propagate_mnt` と
   同じく伝播します。そのピアグループが届くほかのマウント（ピア、スレーブ、そのスレーブ。
   どのマウント名前空間のものも）のうち、ルートがその場所を含むものそれぞれに、新しい
@@ -1552,6 +1653,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`handle_locked`）。`MNT_DETACH` がなければ、そのどれかで
   開いているファイルがあると、解除は `EBUSY` です（`propagate_mount_busy`）。スレーブ自身の
   マウントは、そのスレーブには届き、マスターには届きません。
+
 - `MS_MOVE` 付きの `mount` は、Linux master の `do_move_mount` と同じ確認のあと、
   マウントを動かします。ソースがあること（ないか空なら `EINVAL`）、最後のリンクを
   たどって探したソースがマウントのルートであること（`EINVAL`）、ディレクトリーは
@@ -1562,6 +1664,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マウントとともにターゲットにあるものの上に行き、元の場所には下のディレクトリーが
   また見えます。共有マウントの上では、それぞれが共有になります（どのピアグループにも
   なければ新しいものに入ります）。その中のルートと作業ディレクトリーも一緒に動きます。
+
 - `pivot_root`（Linux master の `path_pivot_root`）は、2 つのパスを、リンクをたどって
   ディレクトリーとして新しいルートから探します。そのあと、マウント名前空間に対する
   `CAP_SYS_ADMIN` と、ファイルへのアクセスを扱う Landlock のドメインがないこと
@@ -1576,6 +1679,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ルートに移り（`chroot_fs_refs`）、ほかのプロセスのものはそのマウントとともに動きます。
   `pivot_root(".", ".")` は古いルートを新しいルートの上に重ね、それを
   `umount2(".", MNT_DETACH)` で外せます。
+
 - `open_tree`（Linux master の `vfs_open_tree`）は、まずフラグを確かめ（知らない
   もの、写しなしの `AT_RECURSIVE`、再帰的な写しなしの `OPEN_TREE_DROP_MNTNS_MOUNTS`
   は `EINVAL`）、`OPEN_TREE_CLONE` にはマウント名前空間に対する `CAP_SYS_ADMIN` を
@@ -1586,6 +1690,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   木として返します。この木にはどのパスからも mountinfo からも届かず、`move_mount`
   でつながなければディスクリプタを最後に閉じたときになくなります。ディスクリプタからの
   パスは写しの中に入り、`..` はその根にとどまります。
+
 - `move_mount`（Linux master のもの）は、マウント名前空間に対する
   `CAP_SYS_ADMIN`（`EPERM`）と、知っているフラグ（`EINVAL`。`MOVE_MOUNT_BENEATH` と
   `MOVE_MOUNT_SET_GROUP` の両方も）を求め、ターゲット、ソースの順に探します。それぞれ
@@ -1605,6 +1710,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ソースのピアグループに入れます（`do_set_group`）。どちらもマウントのルートで、同じ
   スーパーブロックのもの、ターゲットのルートはソースのルートかその下、ターゲットは
   プライベート、ソースは共有かスレーブであることが要ります（`EINVAL`）。
+
 - `fsopen`、`fsconfig`、`fsmount`、`fspick`（Linux master の `fs/fsopen.c`）は、
   ファイルシステムのコンテキストを通して tmpfs を作ります。コンテキストは
   ディスクリプタ（`anon_inode:[fscontext]`）で、`fsconfig` が中身を入れて操作します。
@@ -1625,6 +1731,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   オプションを `MS_REMOUNT` と同じく変えます（スーパーブロックのユーザー名前空間に
   対する `CAP_SYS_ADMIN` がなければ `EPERM` で、コンテキストは失敗した状態になり、
   それからは `EBUSY` です）。
+
 - `mount_setattr`（Linux master のもの）は、フラグ（`EINVAL`）、次に
   `struct mount_attr`（1 ページを超えるか、その後ろに 0 でないバイトがあれば `E2BIG`、
   32 バイト未満なら `EINVAL`）、マウント名前空間に対する `CAP_SYS_ADMIN`（`EPERM`）、
@@ -1637,6 +1744,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   するなら `EBUSY` です。そのあとマウントは伝播の種類を受け取ります。`open_tree_attr` は、
   同じ変更をディスクリプタのマウントに加える `open_tree` で、変更に失敗すれば
   ディスクリプタはまたなくなります。
+
 - マウントはそれぞれ、マシンが終わるまで一意な ID（`mnt_id_unique`。`1 << 31` の次
   から、作った順で、名前空間の写しは `copy_tree` がたどる順）を持ち、マウント
   名前空間もそれぞれ ID（最初のものは 8）を持ちます。`listmount`（Linux master の
@@ -1652,6 +1760,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   求められたとおりに返します（`mask`、`supported_mask`）。文字列に足りないバッファは
   `EOVERFLOW`、呼び出し元のルートから届かないマウントは `CAP_SYS_ADMIN` がなければ
   `EPERM` です。
+
 - `umount2` は、ターゲットを探す前にフラグを確かめます（`EINVAL`）。最後のリンクは
   `UMOUNT_NOFOLLOW` がなければたどり、パスの始まりの上のマウントにも入ります
   （`LOOKUP_MOUNTPOINT`）。そのあと Linux の `can_umount` と `do_umount`
@@ -1668,6 +1777,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   名前空間に対する `CAP_SYS_ADMIN` が要り（`EPERM`）、マウントされたまま、
   スーパーブロックを読み出し専用にマウントし直します（`do_umount_root`。その上で書き込みの
   ために開いたファイルがあれば `EBUSY`）。
+
 - `unshare` は、Linux と同じく `CLONE_FILES` ならスレッドに自分のディスクリプター表を、
   `CLONE_FS` なら自分の作業ディレクトリーと umask を与えます。`CLONE_THREAD`、
   `CLONE_SIGHAND`、`CLONE_VM` は、分けるものがなければ成功し、Linux と同じ場合に
@@ -1676,6 +1786,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`CLONE_THREAD` なしの `CLONE_VM`）です。`CLONE_SYSVSEM`（と `CLONE_NEWIPC`）は、
   終了と同じくセマフォーの undo リストを離れます。名前空間のフラグは、次のとおりスレッドに
   新しい名前空間を与えます。
+
 - スレッドは、Linux の `nsproxy` と同じく自分の名前空間を持ちます。UTS・IPC・マウント・
   cgroup・time・PID・ネットワーク・ユーザーの名前空間は自分のものです（ユーザーの名前空間は
   資格情報が持ちます）。`CLONE_NEWUTS`、`CLONE_NEWIPC`、`CLONE_NEWNS`、`CLONE_NEWCGROUP`、
@@ -1710,6 +1821,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   スレッドの子に番号を付ける名前空間になり、ネットワーク名前空間に入ると、それが
   スレッドが新しく作るソケットの名前空間になります。新しく作れない名前空間は
   [制限](./limitations.md)を見てください。
+
 - 新しいユーザーの名前空間は、Linux の `create_user_ns` と同じく、スレッドのものの中に
   入れ子になり、その実効ユーザーが持ち主です（そのユーザーかグループに中での ID がなければ
   `EPERM`、32 段を超えると `ENOSPC`）。スレッドはその中と、いっしょに作った名前空間で
@@ -1735,6 +1847,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかの対応には親での `CAP_SETUID` か `CAP_SETGID` が、親のルートの対応には
   `CAP_SETFCAP` が要ります。`/proc/<pid>/setgroups` は `allow` か `deny` を読み、gid の
   対応表より前に書けます。`setgroups` には、それが `allow` で gid の対応表があることが要ります。
+
 - 新しい PID 名前空間は、Linux と同じく、スレッドの子に番号を付ける名前空間です。
   スレッド自身は元の名前空間に残り、`pid_for_children` のリンクは、最初の子
   （名前空間の init で、番号は 1）ができるまで `ENOENT` です。子が新しい名前空間に
@@ -1766,6 +1879,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   終わると、名前空間のほかのプロセスはすべて SIGKILL を受け、名前空間にはもう入れません
   （`ENOMEM`）。init の親は、Linux の `zap_pid_ns_processes` と同じく、残りがいなくなって
   から（init の子は init が刈り取ります）init の終了を知ります。
+
 - 新しいネットワーク名前空間には、Linux の `loopback_net_init` と同じく、ループバックの
   `lo`（インデックス 1）だけがあり、それは落ちています。そこでの TCP や UDP のソケットは、
   IPv4 に経路ができるまではどの IPv4 のアドレスにも bind できますが、`::1` には
@@ -1788,6 +1902,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかのインターフェースの名前は `ENODEV` です。`SIOCGIFNAME`
   （`if_indextoname`）は、そのインデックスのデバイスの名前を答えます（なければ
   `ENODEV`）。
+
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
   `NETLINK_ROUTE`）は、作られたネットワーク名前空間のデバイス（ループバックと、下の veth の組の
   端）を見せ、変えます。
@@ -2167,7 +2282,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     渡したアドレスを取るか、持っているものが要ります（`EINVAL`）。変わるたびに、
     求めたソケットのポートを付けて `RTNLGRP_NEIGH` に伝えます。`NTF_USE` と
     `NTF_MANAGED` は `NUD_PERMANENT` だけを外し、それから近隣を使います
-    （`neigh_event_send`）。`NTF_EXT_MANAGED` の永続の近隣と、有効でない状態の
+    （`neigh_event_send`）。到達可能な近隣のタイマーは `neigh_timer_handler` と同じく
+    動きます。確認から到達可能時間（30 秒）が過ぎると、その前の 5 秒のうちに使われて
+    いれば遅延中になり、そうでなければ古くなって、ポートを付けずに `RTNLGRP_NEIGH` に
+    伝えます。`NTF_EXT_MANAGED` の永続の近隣と、有効でない状態の
     `NTF_EXT_VALIDATED` は `EINVAL` です。削除は近隣をまず失敗させ（`NUD_FAILED`。
     有効だったなら伝えます）、それから `RTM_DELNEIGH` で消えたと伝えます。`NTF_PROXY`
     のリクエストは、代わりに `lo` かデバイスのない代理のエントリを足し、変え、消します
@@ -2211,6 +2329,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     アドレスがなくなったときにも伝えます。netconf の通知（`RTNLGRP_IPV4_NETCONF`、
     `RTNLGRP_IPV6_NETCONF`）は来ません。Linux も、デバイスが増えるか消えるとき、または
     転送の sysctl に書いたときにしか送りません。
+
 - 汎用 netlink のソケット（プロトコル `NETLINK_GENERIC`）は自分のポートを持つので、
   `NETLINK_ROUTE` のソケットもプロセスの ID に bind していても、同じくプロセスの ID に
   bind します。ファミリーは、ほかを入れずに作ったカーネルと同じく、コントローラの `nlctrl`
@@ -2235,6 +2354,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **グループ:** ソケットのグループは 64 で（0 とそれを超えるものは `EINVAL`）、誰でも
     入れます。`nlctrl` の `notify` はグループ 16 で、ファミリーが増えも減りもしないので
     何も届きません。
+
 - ソケット診断の netlink ソケット（プロトコル `NETLINK_SOCK_DIAG`）は、Linux の
   `sock_diag`、`unix_diag`、`inet_diag`、`tcp_diag`、`udp_diag` と同じく、作られた
   ネットワーク名前空間の AF_UNIX、TCP、UDP のソケットを伝えます。そのため `ss -x`、
@@ -2291,6 +2411,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     については、アドレス、状態、タイマーだけを伝えます。
   - **グループ:** Linux は `sock_diag` の 4 つのグループを 32 にするので、ソケットの
     グループは 32 です。誰でも入れますが、何も届きません。
+
 - MCTP のソケット（`AF_MCTP`、`SOCK_DGRAM`、プロトコル 0。ほかのプロトコルは
   `EPROTONOSUPPORT`、その次にほかの型は `ESOCKTNOSUPPORT`）は、`CONFIG_MCTP` を組み込んだ
   カーネルの Linux 7.0 の `af_mctp` と同じく、ネットワーク名前空間のループバックの MCTP
@@ -2340,6 +2461,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - **そのほか:** `getsockname`、`getpeername`、`listen`、`accept`、`shutdown`、`socketpair` は
     `EOPNOTSUPP` です。`SOL_SOCKET` と `SOL_MCTP` 以外のレベルの `setsockopt` と
     `getsockopt` は `EINVAL` です。
+
 - マシンの NUMA ノードは、ノード 0 の 1 つだけです。`set_mempolicy` と `mbind` は、
   Linux 6.9 のすべてのモードとそのフラグを受け付け、ノードのマスクを Linux と同じように
   確かめます。ノード 0 より後ろのノードは落とし、それが 1 つもないマスクは `EINVAL`、
@@ -2363,6 +2485,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   VMA のページテーブルだけを受け継ぎます。`anon_vma` を持つ VMA（何かが書き込んだ
   プライベートのメモリ）と、ガード領域を置いたことのある VMA です。ほかの VMA の
   ページは子が改めて割り当てるので、子が触れるまでは `-ENOENT` です。
+
 - `uname` は x86_64 の Linux で、スレッドの UTS 名前空間のホスト名 `paludarium` と
   ドメイン名 `(none)` を答えます。これは `sethostname` と `setdomainname` で変えられます
   （`CAP_SYS_ADMIN` がなければ `EPERM`、64 バイトを超えると `EINVAL`）。`CPUID` と同じく、
@@ -2422,6 +2545,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   グループ ID のものです。`chown` で別の持ち主やグループにでき、メモリ上の
   ファイルシステムはその持ち主を覚えています。マウントしたホストのディレクトリでは、
   初めはどのファイルも root のもので、持ち主とグループはその回の間だけ覚えます。
+
 - ファイルは Linux と同じように確かめます（`generic_permission`）。持ち主には
   持ち主のビット、ファイルのグループに属する者（ファイルシステム用のグループ ID か
   補助グループで）にはグループのビット、それ以外にはその他のビットが当てはまります。
@@ -2468,6 +2592,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   変えます。パイプでは両端がそれらを共有し、ソケットペアでは端ごとに持ちます。最初の
   持ち主は、それを作ったスレッド、または接続を受け付けたスレッドのファイルシステム ID です。
   ホストが用意する標準入力、標準出力、標準エラー出力では `EPERM` を返します。
+
 - `execveat(dir, path, argv, envp, flags)` は `execve` と同じくプログラムを動かし、
   相対パスは `dir` から探します。`AT_EMPTY_PATH` は、パスが空のときディスクリプタ
   （`O_PATH` のものも）が持つファイルを動かし、`AT_SYMLINK_NOFOLLOW` はシンボリック
@@ -2483,6 +2608,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   先頭のバイトで `ENOEXEC` になります。Landlock は、削除したファイルの `EXECUTE` を、
   Linux がその dentry から確かめるのと同じく、もとの場所から確かめます。memfd はどの
   階層にも属しません。`AT_EXECVE_CHECK`（Linux 6.14）は `EINVAL` です。
+
 - プログラムのファイルとそのファイルへの書き込みは、Linux の `i_writecount` と
   同じく互いを断ります（`ETXTBSY`）。exec は、書き込みのために開いた記述があるファイルを
   断ります。プログラム、スクリプトとそのインタープリタ、ELF のプログラムの
@@ -2494,6 +2620,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じく、動かすこともそれで書き込むこともできます。`/proc/self/fd` から書き込みのために
   開き直したものは数えます。数えるのはエミュレータのプロセスだけで、マウントした
   ディレクトリのファイルにホストのプログラムが書き込んでいても分かりません。
+
 - `chmod` と `utimensat` は、メモリ上のファイルシステムでも、マウントしたホストの
   ディレクトリでも使えます。Windows のホストでは、`chmod` が変えるのは読み取り専用の
   属性だけです。`fchmodat2`（Linux 6.6）は `AT_SYMLINK_NOFOLLOW` と `AT_EMPTY_PATH` を
@@ -2513,6 +2640,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `sync_file_range` は、Linux と同じくフラグと範囲（`EINVAL`）、次にファイル（通常の
   ファイル、ディレクトリー、ブロックデバイス以外は `ESPIPE`）を確かめ、共有のマッピングへの
   書き込みをファイルに書き戻します。
+
 - `mknod` と `mknodat` は、FIFO、ソケットのノード、空の通常のファイル（種類が 0 のときも）を、
   モードの許可のビットから umask を除いて作ります。Linux の `do_mknodat` と同じく、ディレクトリの
   種類は `EPERM`、知らない種類は `EINVAL` です。キャラクターデバイスとブロックデバイスは、
@@ -2526,6 +2654,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   モード、持ち主を返し、`/proc/self/fd` はそのパスを示します。マウントしたホストのディレクトリ
   では、FIFO を作れるのは Linux のホストだけです（ほかでは `EPERM`）。そのパイプはエミュレーター
   のもので、同じノードを開いたホストのプログラムにはつながりません。
+
 - `statfs` は、メモリ上のファイルシステムを 4 GiB の tmpfs として返します。使用量と
   inode の数は、実際に持っているものです。マウントしたホストのディレクトリでは、
   ホストのファイルシステムの値を返します。`/proc/self/mountinfo`、`/proc/self/mounts`、
@@ -2549,6 +2678,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ではありません。`ustat` は、マウントの `st_dev` なら空きブロックと空き inode の数を
   返し、それらのデバイスなら何も空いていない（0）と返します。Linux の `simple_statfs`
   と、制限のない内部の tmpfs も 0 を返すからです。ほかのデバイスなら `EINVAL` です。
+
 - ファイルのブロックの大きさ（`st_blksize`、`stx_blksize`、`FIGETBSZ`）は、Linux と
   同じくそのファイルシステムのものです。`/proc`（procfs）と、疑似端末のスレーブ、
   標準入力・出力・エラーの端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096
@@ -2565,6 +2695,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `O_PATH | O_NOFOLLOW` のディスクリプタが持つシンボリックリンクはもうたどりません。
   そのモードは変えられず（`EOPNOTSUPP`）、`chdir` はディレクトリでないもの（`ENOTDIR`）、
   `truncate` は通常のファイルでないもの（`EINVAL`）とし、`execve` は `ELOOP` になります。
+
 - パスの途中にある `/proc/self/fd`（や `/dev/fd`）のリンク、`/proc/self/cwd`、
   `/proc/self/exe` は、Linux の `nd_jump_link` と同じく飛び越えます。
   `/proc/self/fd/3/name` は、ディスクリプタ 3 が持つディレクトリの中の `name` で、
@@ -2576,6 +2707,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `openat2` は自身の解決の中で扱います）。`/proc` のディスクリプタや `/proc` の中の
   作業ディレクトリからの相対パス、`..` やシンボリックリンクで `/proc` に入るパス、
   `execve`、Unix ソケットのアドレスは扱いません。
+
 - `/proc` にあるのは、ほかには `/proc/loadavg`、`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/sysvipc`（後述）、
   `fs`、`kernel`、`net` だけを持つ `/proc/sys`（後述）、
   プロセスごとのディレクトリと、自分のプロセスのものです。`/proc/<pid>` は、その中のものを相対的に開けて、それらを並べる
@@ -2621,6 +2753,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   プログラムがそのあとスタックに何をしても、`fork` しても残ります。自分のディレクトリと `/proc` の下の
   それ以外のパスは、ふつうのパスと同じようにファイルシステムで探します。
   そのため `--mount /:/` では、ホストの `/proc` に届きます。
+
 - `/proc` は、ファイルシステムがそこに持つプロセス以外のもの（`--mount /:/` では、
   ホストのプロセスを除いたホストの項目）、上のファイル、そしてゲストのプロセスごとの
   ディレクトリ（ゾンビも含む）を、Linux と同じくこの順に並べます。`ps`、`pgrep`、`pidof`
@@ -2667,6 +2800,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ゾンビの `maps` と `smaps` は、モードが許すどの読み手も開けます。Linux の `__mem_open` と
   `pagemap_open` は、読み手を確かめる前にメモリのないプロセスを断るので、ゾンビの
   `environ`、`auxv`、`pagemap` は、モードが許すどの読み手にも開けません（`ESRCH`）。
+
 - プロセスやスレッドの `personality` は 0400 で大きさは 0 で、Linux の
   `proc_pid_personality` と同じく、読んだときにスレッドの実行ドメインとフラグを 16 進数 8 桁と
   改行で書きます。そのとき、Linux の `lock_trace` がアタッチのモードの `ptrace_may_access` と
@@ -2676,6 +2810,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （0444）は、Linux の `proc_pid_wchan` が動いているタスクと、タスクを読めない読み手に
   返すのと同じく、改行のない `0` を読みます。`stat` の `wchan` の項目は別のもので、
   下のとおり、待っているタスクは 1 です。
+
 - プロセスやスレッドの `syscall` は 0400 で大きさは 0 で、Linux の `proc_pid_syscall` と同じく
   読んだときに書きます。読み手が読めるかは `personality` と同じくアタッチできるかで決め
   （`EPERM`）、読むスレッド自身のものは、読んでいるその呼び出しです。ほかのスレッドは、
@@ -2687,6 +2822,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `-1 0x0 0x0` です。スレッドは、カーネルに入るたびにいくつかのストアでレジスタを記録し、
   ほかのスレッドはそれを欠けずに読みます。新しいスレッドや子は、Linux の `copy_thread` と
   同じく、それを作った呼び出しでの親のレジスタから始まります。
+
 - プロセスやスレッドの `io`（`/proc/<pid>/task/<tid>/io`）は 0400 で大きさは 0 で、
   Linux の `task_io_accounting` が数えるものを示します。`rchar` と `wchar` は読み書きの
   呼び出し（`read`、`pread64`、`readv`、`preadv`、`preadv2`、それらの書き込み版、
@@ -2707,6 +2843,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディスクリプタでも、ダンプできなくなった後は読めません。その後に回収された
   スレッドやプロセスは `ESRCH` です。こうして失敗した `lseek` は、Linux の
   `seq_lseek` と同じく、ファイルを先頭に戻します。
+
 - `/proc/self/stat` は、括弧に入った名前の後に Linux と同じ 52 の項目を持ちます。状態は
   `R`（読んでいるプロセスは動いているので。ほかのプロセスは上のとおり）、親、プロセスグループ、セッション、制御端末のデバイスとフォアグラウンドのグループ（なければ 0 と -1）、
   プロセスと wait した子の CPU 時間（`USER_HZ` の 100 分の 1 秒単位）、優先度と nice 値、
@@ -2727,11 +2864,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じディスクリプターでもそのときのタスクと読み手で決まります。権限を手放した読み手には
   アドレスが隠れ、回収されたタスクは `ESRCH` です。`cmdline` と `environ` は、今メモリにある引数と環境変数の文字列で、
   それぞれ NUL で終わります。`comm` は名前と改行です。
+
 - `/proc/self/exe` と `/proc/self/cwd` はシンボリックリンク（0777、サイズ 0）で、それぞれ
   プロセスが動かしているプログラム（`execve` が読み込んだもので、シンボリックリンクは
   たどった後のパス。最初のプログラムは CLI が与えるパスで、`--mount` の中ならそのパス、ほかは
   `/<ファイル名>`）と、カレント
   ディレクトリを指します。`stat` と `open` はたどり、`O_NOFOLLOW` はたどらず `ELOOP` です。
+
 - `/proc/sys/fs/mqueue` には、Linux の `ipc/mq_sysctl.c` と同じく、読むプロセスの IPC
   名前空間の POSIX メッセージキューの上限があります。`queues_max`、`msg_max` と
   `msg_default`（1〜65536）、`msgsize_max` と `msgsize_default`（128〜16 MiB）です。
@@ -2746,12 +2885,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   返し、値がない、余計な文字がある、長すぎる、範囲外なら `EINVAL` です（`queues_max` は
   どの `int` も取り、符号なしで比べます）。先頭より後への書き込みは、`sysctl_writes_strict`
   と同じく受け取るだけで何も変えません。
+
 - `/proc/sys/fs/aio-nr`（モード 0444）はマシンの aio コンテキストが用意したイベントの数で、
   `/proc/sys/fs/aio-max-nr`（0644、最初は 65536）はその上限です。書くために開けるのは
   root（どのユーザー名前空間の外でもユーザー ID 0）だけです。どちらも Linux の
   `proc_doulongvec_minmax` と同じく unsigned long として読み書きし、書き込みは `-` を取らず
   （`EINVAL`）、それ以外は `/proc/sys/fs/mqueue` のファイルと同じに読みます。
   `/proc/sys/fs` にあるのはこれらと `fanotify`、`inotify`、`mqueue` だけです。
+
 - `/proc/sys/fs/inotify` はマシンの inotify の上限で、root の持つモード 0644 の
   通常のファイルです。書くために開けるのは root（どのユーザー名前空間の外でも
   ユーザー ID 0）だけで、上のファイルと同じに読み書きします。`max_user_instances`
@@ -2759,10 +2900,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   0 から `INT_MAX` までの unsigned long で、それ以後に各ユーザーが持てる数です。
   `max_queued_events`（最初は 16384）は 0 以上の `int` で、それ以後に作るインスタンスが
   `IN_Q_OVERFLOW` までに溜めるイベントの数です。
+
 - `/proc/sys/fs/fanotify` も同じく、マシンの fanotify の上限です。`max_user_groups`
   （最初は 128）と `max_user_marks`（最初は 33979。`sysinfo` が示すメモリーの 1% を inode
   2 つ分の大きさで割った数）は 0 から `INT_MAX` までの unsigned long、`max_queued_events`
   （最初は 16384）と `watchdog_timeout`（0）は 0 以上の `int` です。
+
 - `/proc/sys/kernel` には、Linux の `ipc/ipc_sysctl.c` と同じく、開くプロセスの IPC
   名前空間の System V IPC の上限があります。新しい名前空間では Linux の既定値で、持ち主と
   書くために開ける者は `/proc/sys/fs/mqueue` のファイルと同じです。`shmmax` と `shmall`
@@ -2798,6 +2941,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ハンドラーと同じです（7.0 は設定したものを読んでも消しました）。
   `/proc/sys/kernel` にあるのはこれらだけで、`/proc/sys` のどの
   ディレクトリも、Linux の木と同じく、名前の順に並べます。
+
 - `/proc/sys/net` には、Linux の `net/ipv4/devinet.c` と `net/ipv6/addrconf.c` が `all`、
   `default`、デバイスごと（`lo`）に持つのと同じく、開いたプロセスのネットワーク名前空間の
   設定があります。`ipv4/ip_forward`、`ipv4/conf/<デバイス>/forwarding` と `rp_filter`、
@@ -2826,6 +2970,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     アドレスは `EACCES` です（`addrconf_add_dev`）。
   - リンクの `IFLA_AF_SPEC` の IPv4 と IPv6 の設定にこれらが出ます。IPv6 は
     `disable_ipv6` が切れているときだけ準備ができています。
+
 - `/proc/self/fdinfo`（0555）は、開いているディスクリプタごとに、Linux の `seq_show`
   と同じ内容のファイル（0444、大きさ 0）を持ちます。`pos` はファイル記述の位置
   （パイプやソケットでは 0）、`flags` は 8 進のフラグ（`F_GETFL` のものに、
@@ -2857,16 +3002,19 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   追加したときのディスクリプタ、イベント（`epoll_ctl` が加える `EPOLLERR` と `EPOLLHUP` を
   含み、発火した one-shot ではフラグだけ）、データ、ファイルの位置、inode、デバイス
   （プロセスが持つそのファイルのディスクリプタのもの。なければ 0）です。
+
 - `/proc/loadavg`、`/proc/meminfo`、`/proc/uptime` は、Linux と同じ形式で `sysinfo` と
   合った値を返します。ロードアベレージは 0 で、動いているタスクと生きているタスクの数、
   最後に割り当てた ID が続きます。メモリは合計、空き、使えるものがどれも 4 GiB で、ほかの
   使用はなく、スワップも huge page もありません。起動からの時間は単調時計の値で、アイドルの
   時間は数えません。
+
 - `/proc/stat` は Linux の `show_stat` と同じ形式です。`cpu` の行と、`sched_getaffinity` が
   返す CPU ごとの行があり、`/proc/uptime` がアイドルの時間を数えないのと同じく、時間はどれも
   0 です。続いて `intr 0`、`ctxt 0`、`btime`（実時間の時計から単調時計を引いた秒数で、`ps` は
   これで起動時刻を得ます）、`processes`（割り当てた ID の数）、`procs_running 1`、
   `procs_blocked 0`、0 が並ぶ `softirq` の行です。
+
 - `/proc/sysvipc` には `msg`、`sem`、`shm` がこの順に並びます。どれも 64 ビットのカーネルでの
   Linux の `sysvipc_*_proc_show` と同じ形式です。
   - 見出しの行に続けて、開いたプロセスの IPC 名前空間のキュー、セット、セグメントを、
@@ -2883,11 +3031,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   - セグメントの行には、メモリにあるページのバイト数と、スワップした 0 も入ります。
   - セグメントやキューの PID は、`IPC_STAT` が返すものも、そのプロセスがなくなっても見えます。
     オブジェクトがその `struct pid` を持ち続けるためです。
+
 - これらのシステムのファイル（`loadavg`、`meminfo`、`stat`、`uptime`、`sysvipc` の中のもの）の
   サイズは、Linux の `proc_create` が作るものと同じく 0 です。読み込みは中身の終わりまで進みます。
+
 - root はこれらのシステムのファイルを書き込み用に開けますが、書き込みは `EIO` です。書き込みの
   操作がないファイルに Linux の `pde_write` が返すのと同じです。プロセス自身のファイルへの書き込みは
   `EINVAL` です。
+
 - `/proc/self/maps` は VMA を Linux の形式で並べます。隣り合うマッピングの併合と
   分割も Linux と同じです。項目は、範囲、保護、`s` か `p`、ファイル内のオフセット、
   `stat` と同じファイルのデバイスと inode、Linux と同じ桁に置く名前です。名前は
@@ -2899,6 +3050,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   大きさは 0 です。ディスクリプタが示すのは開いたときのアドレス空間で、fork した
   子が読んでもそのアドレス空間を示します。`execve` の後のように、そのアドレス空間を
   使うスレッドがなくなると何も示しません。マップはできません（`ENODEV`）。
+
 - `/proc/self/smaps` は、`maps` の各行のあとに Linux の `show_smap` と同じ項目を
   続け、`maps` と同じように読めます。大きさ、ページの中身（`Rss`、`Pss`、`Pss_Dirty`、
   共有とプライベートそれぞれの clean と dirty のページ、`Anonymous`、`Locked`。
@@ -2918,6 +3070,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   なくなるときに返します）、`MAP_STACK` のマッピングの `nh`、封印（`sl`）、最初の
   スタック以外の、作られてから `clear_refs` に消されていない VMA の `sd`（`VM_SOFTDIRTY`）
   です。新しい VMA とつながった VMA は、Linux の引き継がれるフラグと同じく、また `sd` を持ちます。
+
 - `/proc/self/pagemap`（モード 0400、大きさ 0）は、Linux の `pagemap_read` と同じく、
   ユーザー空間のページごとに 8 バイトのエントリーを持ちます。あるアドレスのページの
   エントリーは、そのアドレスをページの大きさで割って 8 を掛けた位置にあります。どの
@@ -2963,6 +3116,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     （`EINVAL`）、ページの区切りから始まること（`EINVAL`）、範囲とバッファーが
     ユーザー空間にあること（`EFAULT`）、長さがあればバッファーがあること（`EINVAL`）です。
   - ほかの ioctl は `ENOTTY` で、アドレス空間がなくなったあとのスキャンは `ESRCH` です。
+
 - `/proc/<pid>/clear_refs`（モード 0200、大きさ 0。スレッドのものも）は、Linux の
   `clear_refs_write` と同じく、書き込みの先頭の多くて 12 バイト（書き込みはこれを返します）を、
   `kstrtoint` が 10 進で読むとおりに数として読みます（前後の空白を除き、符号と改行 1 つまで。
@@ -2975,6 +3129,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   最大値（`status` の `VmHWM`）をいま常駐するメモリにします。1 から 3 は受け付けますが、
   見えるものは変わりません（制限事項を参照）。読み出しの操作はなく
   （`EINVAL`。書くためだけに開いたディスクリプタでは `EBADF`）、`lseek` は 0 のままです。
+
 - `/proc/self/fd`（モード 0500。大きさは Linux の `proc_fd_getattr` と同じく開いている
   ディスクリプタの数）は、`.`、`..` と、開いているディスクリプタごとのリンクを並べます。名前は番号で、Linux と同じく先頭に 0 のない形で読みます。各リンクの
   `lstat` は、ユーザーのビットでディスクリプタのアクセスを示し、大きさは 64 です。`stat`
@@ -3016,6 +3171,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   inode のモード（root の 0600、pidfd は 0700）を確かめるので、ほかのユーザーは
   `EACCES` になりますが、paludarium は root と同じように開きます。Linux 以外のホストからマウントした
   ディレクトリの消されたファイルは、Linux なら開けますが、ここでは `ENXIO` です。
+
 - `/dev`（モード 0755）は、メモリのデバイスと、Linux のシステムがそこに置くリンクと、
   疑似端末の `ptmx` と `pts`（後述）を持ち、それだけを並べます。ゲストが `/dev` の下に作ったファイルは、開いたり `stat`
   したりできますが、一覧には出ません。各エントリは 1 つの inode 番号を持ち、`stat` と
@@ -3030,6 +3186,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   リンクに `O_NOFOLLOW` を付けると `ELOOP` で、`O_PATH` も付けると `/proc/self/fd` と
   同じくリンクそのものを開きます。ホストのマウントのファイルはデバイス番号を
   持ちません。
+
 - **疑似端末**は、Linux の devpts、`pty.c`、N_TTY の行規則と同じに動きます。
   `/dev/ptmx`（5:2、モード 0666。devpts 自身の `/dev/pts/ptmx` も）を開くたびに
   組が 1 つでき、そのスレーブは空いている最も小さい番号の `/dev/pts/<n>` です。
@@ -3099,6 +3256,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     書き込み用に開いていないスレーブなら `EBADF`）は、コンソールの出力をスレーブが
     受け取るようにし、そのスレーブが切断されるまで開いたまま持ちます。ほかの端末が
     持っている間は `EBUSY` です。
+
 - CPU 時間は、ホストが測れるところ（Linux・macOS・Windows）では、ゲストのスレッドの
   最初のシステムコールからの、ホストのスレッドの CPU 時間（ユーザーとシステムの合計）
   です。WebAssembly などそれ以外では、代わりに経過時間を数えます。
@@ -3114,6 +3272,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   その子たちのものを合わせて返します。トレーサーがトレース先を待つときも同じです。fork した
   子は 0 から始まり、`execve` はどちらも保ちます。ほかの値（フォールト、コンテキスト
   スイッチ、ブロック）は 0 です。
+
 - 負の時計 ID は、Linux の `pid_for_clock` が分けるのと同じく、タスクの CPU 時計を指します。
   呼び出し元の PID 名前空間でのタスクの番号（`~id >> 3`。0 は呼び出し元）、スレッドの時計か
   （ビット 2）プロセスの時計か、下位 2 ビットの時間の種類（`CPUCLOCK_PROF`、
@@ -3125,6 +3284,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ないタスク、4 つめの種類は `EINVAL` です。PTP デバイスのファイルが要る動的な時計
   （下位 3 ビットが `3`）も `EINVAL` です。時計 ID は、Linux のシステムコールと同じく
   `int` として受け取るので、上位 32 ビットは見ません。
+
 - `clock_gettime` は、`CLOCK_MONOTONIC_RAW`、粗い時計、`CLOCK_BOOTTIME`（ホストは
   サスペンドしないものとします）、アラームの時計、`CLOCK_TAI`（TAI のずれは 0）も
   読めます。粗い時計は、Linux と同じく直近のティックの時刻を返し、`time` は
@@ -3135,6 +3295,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   単調時計でその倍数ちょうどに来て、Linux の時刻管理がティックごとに両方を更新するのと
   同じく、2 つの粗い時計は同じ瞬間に進みます。`clock_getres` は 1 ns、粗い時計では
   ティックの長さを返します。
+
 - `clock_nanosleep` と `timer_create` は、`CLOCK_REALTIME`、`CLOCK_MONOTONIC`、
   `CLOCK_BOOTTIME`、`CLOCK_TAI`、プロセスの CPU 時計で動きます。`timer_create` は、
   スレッドの CPU 時計でも動きます。Linux と同じく、`CLOCK_MONOTONIC_RAW` と
@@ -3161,6 +3322,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   残りの時間には頼んだ時間をそのまま書き出します。Linux の `posix_cpu_timer_set` がタスクを
   見つけられないとき、`do_cpu_nanosleep` が頼まれた時間を書き出すのと同じです。停止の
   あとの再開では、タスクが見つからず `EINVAL` になります。
+
 - プロセスの CPU 時計での眠りは、Linux の `do_cpu_nanosleep` と同じく、プロセスの
   スレッドが合わせてその時間を使うと終わります。過ぎた時刻や 0 の時間ならすぐに戻ります。
   眠っているスレッド自身は CPU 時間を使わないので、ほかに動くスレッドのないプロセスは
@@ -3168,6 +3330,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   経過時間も数えます）。ハンドラのあるシグナルは `EINTR` で眠りを終わらせ、相対時間
   なら残りの時間を書き出します。ただし、そのときもう時間を使い終えていれば 0 を返します。
   停止からは、ほかの眠りと同じように再開します。
+
 - プロセスの実時間のインターバルタイマー（`ITIMER_REAL`）は、Linux と同じく、満了すると
   `SIGALRM` を送り、間隔の分だけ次に進みます。`setitimer` はタイマーより先に新しい値を読んで
   確かめ、古い値はタイマーを設定してから書き出すので、古い値を書けないときはタイマーを設定した
@@ -3176,6 +3339,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マイクロ秒に切り捨てて返します。設定中で時間が来たタイマーは 1 µs、残りが 1 µs に満たない
   タイマーは 0 と見せます。`alarm` は Linux の `alarm_setitimer` と同じく、間隔なしの秒単位で
   設定し、残っていた秒数を四捨五入して返します（設定中だったなら少なくとも 1）。
+
 - プロセスの CPU 時間のインターバルタイマー（`ITIMER_VIRTUAL` と `ITIMER_PROF`）は、Linux の
   `check_cpu_itimer` と同じく、プロセスのスレッドが合わせてその時間を使うと、カーネルから
   （`SI_KERNEL`）`SIGVTALRM` と `SIGPROF` を送ります。満了するたびに間隔ひとつ分だけ進み、
@@ -3183,6 +3347,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   なら止めますが間隔は残し、`KTIME_MAX` を超えて設定した値は、Linux の `ns_to_timespec64`
   と同じく負の秒数に見えます。`fork` の子はどちらも持たずに始まり、`execve` は引き継ぎます。
   CPU 時間は CPU の時計と同じく数えるので、それを測れない WebAssembly では経過時間を数えます。
+
 - `CLOCK_REALTIME` での `adjtimex` と `clock_adjtime` は、時計の NTP の状態を、ホストのものは
   見せずに、Linux が起動したときのまま読みます。同期しておらず（`STA_UNSYNC` なので結果は
   `TIME_ERROR`）、誤差は 16 秒、オフセットと周波数の補正はなく、時定数は 2、ティックは
@@ -3193,13 +3358,16 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `settimeofday` と `clock_settime`（`CLOCK_REALTIME` だけで、ほかは `EINVAL`）は、Linux と
   同じく時刻を確かめ（`KTIME_MAX` の 30 年前より先は `EINVAL`）、そのうえで `EPERM` を
   返します。
+
 - `sysinfo` は、空きが 4 GiB でスワップのない固定のメモリを返し、ホストのメモリは
   見せません。起動からの時間は単調時計の値で、Linux と同じく秒単位に切り上げます。
+
 - `iopl` と `ioperm` は Linux と同じく引数を確かめ（3 を超えるレベルや、空の範囲、
   ポート 65,535 を越える範囲は `EINVAL`）、スレッドのレベル 0 を保つことと、持っていない
   ポートを手放すことは受け、それ以上はポートへのアクセスをロックダウンしたカーネルと同じく
   `EPERM` を返します。`acct` は `CAP_SYS_PACCT` を求め（`EPERM`）、そのうえで、いつも
   切れているアカウンティングを切ることは受け、ファイルには `EPERM` を返します。
+
 - `syslog` が読むカーネルのログは空です。ログに書くものがないためです。Ubuntu の
   `kernel.dmesg_restrict` が 1 であるのと同じく、どの操作にも `CAP_SYSLOG` が要ります
   （`EPERM`）。そのあとは Linux の `do_syslog` と同じく、知らない操作と 1 から 8 の外の
@@ -3208,20 +3376,24 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ないメッセージを、シグナルが来るまで待ちます（`ERESTARTSYS`）。ほかの読む操作は何も
   写さず 0 を返します。バッファの大きさは 256 KiB（`CONFIG_LOG_BUF_SHIFT` が 18）で、
   未読のものはありません。
+
 - `sysfs` はファイルシステムの種類に番号を付けます。種類は `tmpfs`、`proc`、`sockfs`、
   `pipefs`、`devpts`、`ext4`、`mqueue` で、paludarium が渡すファイルの種類（ホストの
   ファイルは `ext4`）を、Linux が登録する順に並べています。オプション 1 は名前の番号を、
   2 は番号の名前を、3 は種類の数を返します。知らないオプション、名前、番号は `EINVAL`
   で、`PATH_MAX` バイトのうちに終わらない名前も `EINVAL` です。
+
 - セキュリティモジュールは paludarium にあるもので、Ubuntu の設定で Linux が始める順に、
   Lockdown（Ubuntu では early のモジュールで、paludarium はこれによってポートへの
   アクセスを断ります）、capability モジュール、Landlock、Yama です。`lsm_list_modules` はこれを並べます
   （バッファが小さければ、要る大きさを書いて `E2BIG`）。どれもタスクの属性を持たない
   ので、`lsm_get_self_attr` と `lsm_set_self_attr` は、引数が Linux の確認をその順に
   通ったあと `EOPNOTSUPP` を返します（大きさは 0 にします）。
+
 - uprobe が置かれることはないので、プローブのトランポリンもありません。そのため、
   Linux でトランポリンの外から呼んだときと同じく、`uretprobe` は `SIGILL`（`SI_KERNEL`）
   を送って -1 を返し、`uprobe` は `EPROTO` を返します。
+
 - 管理の syscall は、Linux master の確認をその順に行います。カーネルは、Ubuntu が
   Secure Boot のときと同じく integrity でロックダウンしています（`iopl` と `ioperm` が
   ポートへのアクセスを断るのもこのためです）。なので、カーネルにコードを読み込むことは
@@ -3260,6 +3432,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     ブロックデバイスはないので `ENOTBLK` を返します。`quotactl_fd` はどのディスクリプタも
     受け付け（`EBADF`）、種類を確かめ（`EINVAL`）、クォータのないファイルシステムに
     対する Linux の `do_quotactl` と同じく `ENOSYS` を返します。
+
 - `perf_event_open` は、Linux の `kernel/events/core.c` の順に引数を確かめます。知らない
   フラグ、次に構造体です（`perf_copy_attr`。サイズ 0 は最初の版の 64 バイトで、それより
   小さいか 1 ページより大きいと `E2BIG` になり、Linux master の知るサイズ 176 を書き戻します。
@@ -3369,6 +3542,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   バッファへ書きます。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
+
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c`、`bpf_lru_list.c`、
   `lpm_trie.c`、`queue_stack_maps.c`、`bloom_filter.c` と同じくマップを持ちます。どのコマンドも、まず union のサイズ（1 ページより大きいか、Linux master の 168
   バイトより先に 0 でないバイトがあれば `E2BIG`）と、コマンド自身のフィールドより先
@@ -3471,6 +3645,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディスクリプタのものなので、Linux の `bpf_map_flags_retain_permanent` と同じく、
   `map_flags`（fdinfo、`bpf_map_info`、手本）には入りません。ないものは
   [制限](./limitations) を参照してください。
+
 - `BPF_PROG_LOAD` はソケットフィルター（`BPF_PROG_TYPE_SOCKET_FILTER`）を読み込み、
   Linux と同じく検証器で確かめます。まだ動かすものはありません。引数は Linux の
   `bpf_prog_load` と同じく、master の順に同じエラーで確かめます。最初はログの引数です
@@ -3486,6 +3661,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   （`EFAULT`）、結び付けるデバイス（`EINVAL`）、そして型です。ソケットフィルター以外の型は、
   それを組み込まずにビルドしたカーネルと同じく `EINVAL` です。名前は、マップと同じく最後に
   確かめます（`EINVAL`）。
+
 - 検証器（`kernel/bpf/verifier.c`）は、テストが知る二つのカーネル、master と 7.0 の
   どちらも受け入れるプログラムだけを受け入れ、どちらかが断るものは断ります。最初に構造を
   master の順に確かめます。どれも `EINVAL` です。最後の命令が `BPF_LD_IMM64` の半分でないこと、
@@ -3505,6 +3681,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EACCES`）、exit のときの R0（値は何でもかまいません）です。オペランドを知っている
   条件ジャンプは一方へだけ進み、ほかは両方をたどります。Linux と同じく、1,000,000 命令か、
   たどるのを待つジャンプが 8,192 個を超えるとあきらめます（`E2BIG`）。
+
 - ログ（`log_level`、`log_buf`、`log_size`）には、プログラムを断った理由の行（二つの
   カーネルで言い方が違うときは 7.0 の言い方）と "processed %d insns" の行を、固定
   （`BPF_LOG_FIXED`）か回転するバッファに書きます。小さすぎるログは `ENOSPC`、書けないログは
@@ -3514,12 +3691,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   SHA-256 の先頭 8 バイト）、メモリ（96 バイトのヘッダーと命令をページで）、ID（マップとは
   別のプログラムの ID）、検証器が通った命令の数を示します。`prog_jited` と実行の統計は 0 です。
   Linux が受け入れるのに検証器が断るものは [制限](./limitations) を参照してください。
+
 - timerfd は `CLOCK_REALTIME` か `CLOCK_MONOTONIC` で動き（`CLOCK_BOOTTIME` は
   `CLOCK_MONOTONIC` として扱います）、絶対時刻と周期の指定ができます。読むと前回からの
   満了の回数を返し、満了すると `poll` と `epoll` から読めるように見えます。
   `TFD_TIMER_CANCEL_ON_SET` は受け付けますが、ゲストは時計を設定できないので取り消しは
   起きません。アラームの時計は `CLOCK_REALTIME` と `CLOCK_MONOTONIC` として動き、
   `CAP_WAKE_ALARM` が要ります（`EPERM`。知らないフラグの `EINVAL` が先です）。
+
 - signalfd（`signalfd`、`signalfd4`）は、読むスレッドに保留されているシグナルのうち
   マスクにあるものを、ブロックされていてもいなくても、Linux の `dequeue_signal` と
   同じ順で読みます。スレッド自身のものが先で、次にプロセスのもの、それぞれ番号の
@@ -3542,6 +3721,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   マスクが変わります（ほかのファイルなら `EINVAL`）。`SIGKILL` と `SIGSTOP` は
   マスクに入りません。書き込みは `EINVAL`、`pread` と `pwrite` は `ESPIPE`、`lseek` は
   Linux の `noop_llseek` と同じく 0 を返します。
+
 - inotify のインスタンス（`inotify_init`、`inotify_init1`。`IN_NONBLOCK` と
   `IN_CLOEXEC` が使えます）は、ファイルをデバイスと inode で見張ります。
   `inotify_add_watch` は Linux の `inotify_find_inode` と同じくファイルを探します。
@@ -3626,6 +3806,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   イベントが溜まっている間読めると見ます。エッジトリガーの `epoll` は、イベントが
   1 つ溜まるたびにエッジを受けます。インスタンスの最後のディスクリプタを閉じると
   ウォッチも消えます。書き込みは `EBADF`、`pread` は `ESPIPE`、`lseek` は 0 です。
+
 - fanotify のグループ（`fanotify_init`）は Linux の `fs/notify/fanotify` と同じです。
   フラグはその順に確かめ（CAP_SYS_ADMIN がなければ `EPERM`。ただしファイルハンドルか
   マウントを報告するグループは作れ、ディスクリプタもほかのプロセスの ID も報告しません）、
@@ -3696,6 +3877,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ファイルシステム、/proc、devpts、mqueue では `simple_statfs` と同じくデバイス番号、
   ほかのファイルシステムでは、tmpfs が UUID を引くように、ファイルシステムごとに引いた
   数です。
+
 - POSIX タイマーは上の時計で動き、プロセスへの
   シグナル（`SIGEV_SIGNAL`。`SI_TIMER` の siginfo とオーバーランつき）か、プロセスの
   中の 1 つのスレッドへのシグナル（`SIGEV_THREAD_ID`）で知らせるか、何も知らせません
@@ -3714,11 +3896,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   単調時計で数えます。タイマーは
   `fork` では受け継がれず、`execve` で消えます。`rt_sigtimedwait` は、プロセス全体に
   届いてブロックされているシグナルも受け取ります。
+
 - `clone3` は、`struct clone_args` を Linux と同じように確かめ（後ろに足された部分が
   0 でない長い構造体には `E2BIG`）、それが表す `clone` として動きます。
   `CLONE_CLEAR_SIGHAND` は、ハンドラを設定したシグナルを既定に戻します。`set_tid` は上の PID
   名前空間で書いたとおりで、`CLONE_INTO_CGROUP` は `EINVAL` を返します。`clone` そのものは、Linux と同じく flags の
   下位 32 ビットだけを読むので、`CLONE_CLEAR_SIGHAND` は `clone3` でしか使えません。
+
 - `prctl` は `PR_SET_NAME`／`PR_GET_NAME`（スレッドごとの 15 バイトまでの名前。
   `execve` でプログラムのファイル名になり、新しいスレッドとプロセスに受け継がれます）、
   `PR_SET_PDEATHSIG`（親が終わったときにシグナルを送ります）、`PR_SET_DUMPABLE`
@@ -3737,15 +3921,18 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   タスクを指します（なければ `EINVAL`）。そのタスクがある間、そのプロセスとその子孫が
   アタッチできます。どのスレッドが設定してもプロセスのもので、子には受け継がれません。
   ほかの指定には `EINVAL` を返します。
+
 - プロセスが終わると、その子は、`PR_SET_CHILD_SUBREAPER` を設定していてまだ終わって
   いない一番近い祖先に、いなければ PID 名前空間の init にあたる最初のプロセスに
   引き取られます。Linux の `forget_original_parent` と同じです。その後 `getppid` は
   新しい親を返し、新しい親はその子を待てて、子の終了シグナルは `SIGCHLD` になります。
   すでに終わっていた子は、すぐに新しい親に知らせます（その親が `SIGCHLD` を
   無視していれば、すぐに回収します）。
+
 - 最初のプロセスが終わると、PID 名前空間の init が終わったとき（Linux の
   `zap_pid_ns_processes`）と同じように、ほかのすべてのプロセスがカーネルから
   `SIGKILL` を受け取り、実行もそこで終わります。
+
 - 終わったプロセスのせいでプロセスグループが孤児になり（同じセッションの別のグループに
   親を持つメンバーがいなくなり）、そのグループに止まっているメンバーがいれば、Linux の
   `kill_orphaned_pgrp` と同じように、すべてのメンバーにカーネルから（`SI_KERNEL` で）
@@ -3754,6 +3941,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ほかの親と同じように、自分の子のグループをつなぐ親として数えます。Linux が数えない
   のはシステム全体の init の子だけで、最初のプロセスは、コンテナと同じく PID
   名前空間の init として振る舞うからです。
+
 - `kill` は、Linux の `kill_something_info` と同じように、PID かそのスレッドの ID
   でそのプロセスに、0 で呼び出し元のプロセスグループに、`-pgid` でほかのグループに、
   -1 で最初のプロセスと呼び出し元以外のすべてのプロセスに届きます。終わったプロセスも、
@@ -3768,12 +3956,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   シグナルの `si_pid` と `si_uid` は送り主の PID と実ユーザー ID に（`tkill` と `tgkill`
   も同じです）、`PR_SET_PDEATHSIG` のシグナルでは終わった親の PID と実ユーザー ID に
   なります。このシグナルにも同じ許可が要ります。
+
 - `rt_sigqueueinfo`（`sigqueue` の中身）は、呼び出し元の siginfo をそのままプロセスに
   送り、`rt_tgsigqueueinfo` は 1 つのスレッドに送ります。そのためシグナルは値を運び、
   リアルタイムシグナルは送った数だけ届きます。Linux と同じく、カーネルや `kill`、
   `tkill` が付ける `si_code` を付けられるのは、自分自身に送るスレッドだけです（相手を
   探す前に `EPERM`）。Linux が形を知らない `si_code` では、siginfo の残りを 0 にして
   おく必要があります（`E2BIG`）。
+
 - 資源の上限は Linux の既定値（`RLIMIT_NOFILE` は 1024／4096、`RLIMIT_STACK` は
   8 MiB／無制限など）から始まり、`fork` で受け継がれ、読み書きできます。ハードの
   `RLIMIT_NOFILE` は 1048576（Linux の `fs.nr_open`）まで、埋め込む側がそれより低い
@@ -3835,6 +4025,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   同じくセッションを確かめ、セッションの先頭、別のセッションの子、別のセッションの
   グループには `EPERM` を、`execve` を済ませた子には `EACCES` を返します。グループは、
   まだ回収されていない終わった子も含め、メンバーが残っている間は存在します。
+
 - nice 値は Linux と同じくスレッドごとに持ちます。新しいスレッドやプロセスは作った
   スレッドの値を受け継ぎ、`execve` は呼んだスレッドの値を保ちます。`getpriority` は
   見つけたスレッドのうち最も高い優先度を `20 - nice` で返し、`setpriority` はそれらを
@@ -3843,11 +4034,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ID が同じすべてのスレッド（0 は呼んだスレッドの ID）です。まだ回収されていない
   終わったプロセスも見つかります。スレッドがなければ `ESRCH`、知らない `which` は
   `EINVAL` です。値は報告するだけで、スケジューリングは変えません。
+
 - `setpriority` は、Linux の `set_one_prio` と同じくスレッドごとに確かめます。呼んだ側の
   実効ユーザー ID が相手の実または実効ユーザー ID と同じか、`CAP_SYS_NICE` があることが
   必要で、なければ `EPERM` です。nice 値を下げるには、`CAP_SYS_NICE` があるか、
   `20 - nice` が相手の `RLIMIT_NICE` のソフトリミット以内であることが必要で、なければ
   `EACCES` です。変えられるスレッドは変わり、そのうえで最後に断られた理由を返します。
+
 - `waitid` は、Linux と同じ確かめ方と書き出し方をします。報告する子がないときは、
   エラーのときも含めて siginfo の項目を 0 にします。終わった子は、`WEXITED` か
   `WCONTINUED` がないと待てません（`ECHILD`）。停止と再開は、`WUNTRACED`
@@ -3873,6 +4066,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   代わりに Linux の特別な値も受け付けます。`PIDFD_SELF_THREAD`（-10000）は呼んだ
   スレッドに `tkill` と同じく（`SI_TKILL`）、`PIDFD_SELF_THREAD_GROUP`（-10001）は
   そのプロセスに `kill` と同じく送ります。
+
 - 不正なポインタを渡されたときは `EFAULT` を返します。
 
 ## ネットワーク {#network}

@@ -3321,8 +3321,6 @@ fn acknowledgement(
     }
     message(NLMSG_ERROR, flags, header.seq, port, &payload)
 }
-/// The flags of `lo`, as `dev_get_flags`: `IFF_LOOPBACK`, with `IFF_UP`,
-/// `IFF_RUNNING` and `IFF_LOWER_UP` while it is up.
 /// The name of `network`'s device of `index`, and whether it is up
 /// (`IFF_UP`); `None` for none.
 fn device_state(network: &Network, index: u32) -> Option<(Vec<u8>, bool)> {
@@ -3334,6 +3332,8 @@ fn device_state(network: &Network, index: u32) -> Option<(Vec<u8>, bool)> {
     };
     Some((name, up.unwrap_or_else(|| network.is_up())))
 }
+/// The flags of `lo`, as `dev_get_flags`: `IFF_LOOPBACK`, with `IFF_UP`,
+/// `IFF_RUNNING` and `IFF_LOWER_UP` while it is up.
 fn link_flags(network: &Network) -> u32 {
     if network.is_up() {
         IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP
@@ -5697,11 +5697,6 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
     }
     notices
 }
-/// Turns `network`'s loopback's IPv6 off or on at `now`, as a change of
-/// its `disable_ipv6` does ([`Network::set_ipv6`]), and tells netlink's
-/// members of what went or came; coming on while `lo` is up, last, IPv6's
-/// own `RTM_NEWLINK` for `RTNLGRP_IPV6_IFINFO`, as `addrconf_notify` sends
-/// it at the end of `NETDEV_UP` (`inet6_ifinfo_notify`).
 /// What `network` tells of IPv4 as its device of `index` goes, closed
 /// (`inetdev_event`'s `NETDEV_UNREGISTER`): each of its addresses removed,
 /// with its routes ([`crate::interface::Addresses::device_gone4`]), before
@@ -5734,6 +5729,11 @@ pub(crate) fn device_changed4(network: &Network, index: i32, up: bool, carrier: 
         addresses.device_down4(index);
     }
 }
+/// Turns `network`'s loopback's IPv6 off or on at `now`, as a change of
+/// its `disable_ipv6` does ([`Network::set_ipv6`]), and tells netlink's
+/// members of what went or came; coming on while `lo` is up, last, IPv6's
+/// own `RTM_NEWLINK` for `RTNLGRP_IPV6_IFINFO`, as `addrconf_notify` sends
+/// it at the end of `NETDEV_UP` (`inet6_ifinfo_notify`).
 pub(crate) fn set_ipv6(network: &Network, on: bool, now: u64) {
     let events = network.set_ipv6(on, now);
     let mut notices = told(events, 0, 0, false, false, now);

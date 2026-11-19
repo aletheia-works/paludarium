@@ -242,8 +242,18 @@ fn gap<T>(what: &str) -> Checked<T> {
     )
 }
 
-/// `bpf_check` for a socket filter, from the checks of the instructions on.
+/// `bpf_check`'s first check of the instructions, which comes before
+/// `process_fd_array` and the rest ([`crate::bpf_prog`] makes it): the
+/// last one may not be the first half of a BPF_LD_IMM64.
+pub(crate) fn ends_in_half(insns: &[Insn]) -> bool {
+    insns.last().is_some_and(|i| i.ldimm64())
+}
+
+/// `bpf_check` for a socket filter, from the checks of the instructions on,
+/// for a program [`ends_in_half`] took. `BPF_PROG_LOAD` refuses no
+/// instructions at all (`E2BIG`) before it gets here.
 pub(crate) fn check(insns: &[Insn], options: Options) -> Result<Verified, Rejection> {
+    debug_assert!(!insns.is_empty() && !ends_in_half(insns));
     let mut walk = Walk::default();
     let result = structure(insns, options).and_then(|()| walk.run(insns, options));
     let stack_depth = walk.depth.div_ceil(8) * 8;
@@ -263,10 +273,6 @@ pub(crate) fn check(insns: &[Insn], options: Options) -> Result<Verified, Reject
 
 /// The checks before any path is walked, in master's order.
 fn structure(insns: &[Insn], options: Options) -> Checked<()> {
-    // bpf_check: a program may not end in half of a BPF_LD_IMM64.
-    if insns.last().is_some_and(|i| i.ldimm64()) {
-        return refuse(Errno::EINVAL, "invalid bpf_ld_imm64 insn");
-    }
     // add_subprogs, add_kfuncs: one function, calling no other.
     for insn in insns {
         if insn.code == class::JMP | jmp::CALL
@@ -1336,10 +1342,8 @@ mod tests {
             refused(&[mov(0, 0), i(0x05, 0, 0, -2, 0)]),
             einval("back-edge from insn 1 to 0")
         );
-        assert_eq!(
-            refused(&[mov(0, 0), i(0x18, 0, 0, 0, 0)]),
-            einval("invalid bpf_ld_imm64 insn")
-        );
+        assert!(ends_in_half(&[mov(0, 0), i(0x18, 0, 0, 0, 0)]));
+        assert!(!ends_in_half(&[i(0x18, 0, 0, 0, 0), i(0, 0, 0, 0, 0)]));
         assert_eq!(
             refused(&[i(0x18, 0, 0, 0, 0), i(0, 1, 0, 0, 0), exit()]),
             einval("invalid bpf_ld_imm64 insn")

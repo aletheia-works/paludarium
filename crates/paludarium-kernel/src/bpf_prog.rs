@@ -471,7 +471,7 @@ fn early(c: &Context<'_>, attr: &[u8], insns: &[Insn]) -> Result<(), bpf_verifie
     let func_info_cnt = half(attr, 88);
     let line_info_cnt = half(attr, 104);
     let core_relo_cnt = half(attr, 116);
-    if insns.last().is_some_and(|i| i.code == 0x18) {
+    if bpf_verifier::ends_in_half(insns) {
         return Err(refuse(Errno::EINVAL, "invalid bpf_ld_imm64 insn"));
     }
     if fd_array_cnt != 0 {

@@ -779,7 +779,7 @@ impl NetlinkSocket {
                 if s.groups & (1u64 << (notice.group - 1)) != 0 {
                     self.deliver(s, 0, notice.group, notice.bytes.clone());
                 }
-                notice.origin = port;
+                notice.heard = true;
             }
         }
         told
@@ -988,12 +988,14 @@ impl NetlinkSocket {
         let deferred = deferring(|| self.take(&mut s, bytes, port, sender, &mut notices));
         let unicasts = core::mem::take(&mut s.unicasts);
         drop(s);
-        notices.extend(deferred);
         for (socket, bytes) in unicasts {
             let mut t = socket.lock();
             socket.deliver(&mut t, 0, 0, bytes);
         }
         broadcast(&self.network, notices, Some(self));
+        // What a namespace that went meanwhile told, which the requester
+        // hears as any member does (from `cleanup_net`, later in Linux).
+        broadcast(&self.network, deferred, None);
         Ok(bytes.len())
     }
     /// The kernel takes each message of a datagram from `port`, as Linux's
@@ -1043,7 +1045,10 @@ impl NetlinkSocket {
                 // This socket hears of what it changed as it happens, before
                 // its acknowledgement; the others once it is unlocked.
                 for notice in &told {
-                    if s.groups & (1u64 << (notice.group - 1)) == 0 || port == notice.origin {
+                    if notice.heard
+                        || s.groups & (1u64 << (notice.group - 1)) == 0
+                        || port == notice.origin
+                    {
                         continue;
                     }
                     match &notice.to {
@@ -1283,6 +1288,7 @@ impl NetlinkSocket {
                 // address's.
                 let notice = Notice {
                     to: None,
+                    heard: false,
                     group: RTNLGRP_MCTP_IFADDR,
                     origin: if echo { port } else { 0 },
                     bytes: mctp_address(eid, header.kind, 0, header.seq, port),
@@ -4911,6 +4917,9 @@ pub(crate) struct Notice {
     /// once the requester's socket is unlocked ([`broadcast`]): a veth
     /// peer's end's. None for the requester's own.
     to: Option<Arc<Network>>,
+    /// Whether the requester has had it already, as it filled an answer
+    /// ([`NetlinkSocket::heard_now`]).
+    heard: bool,
     group: u32,
     origin: u32,
     bytes: Vec<u8>,
@@ -4995,6 +5004,7 @@ fn told(
             };
             Notice {
                 to: None,
+                heard: false,
                 group,
                 origin,
                 bytes,
@@ -5599,6 +5609,7 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
     link[28..32].copy_from_slice(&IFF_UP.to_le_bytes());
     let mut notices = vec![Notice {
         to: None,
+        heard: false,
         group: RTNLGRP_LINK,
         origin: 0,
         bytes: link,
@@ -5608,6 +5619,7 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
     if up && !network.ipv6_off() {
         notices.push(Notice {
             to: None,
+            heard: false,
             group: RTNLGRP_IPV6_IFINFO,
             origin: 0,
             bytes: inet6_link_message(network, 0, 0, 0),
@@ -5626,6 +5638,7 @@ pub(crate) fn set_ipv6(network: &Network, on: bool, now: u64) {
     if on && network.is_up() {
         notices.push(Notice {
             to: None,
+            heard: false,
             group: RTNLGRP_IPV6_IFINFO,
             origin: 0,
             bytes: inet6_link_message(network, 0, 0, 0),

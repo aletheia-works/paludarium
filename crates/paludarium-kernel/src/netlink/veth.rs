@@ -273,6 +273,7 @@ fn told_of(
         link_message(network, network, device, kind, change, (0, 0, 0), 0, going);
     notices.push(Notice {
         to: None,
+        heard: false,
         group: RTNLGRP_LINK,
         origin: 0,
         bytes,
@@ -799,6 +800,8 @@ pub(super) fn move_to(
     if to.devices().by_name(&device.name).is_some() {
         return Err(Errno::EEXIST);
     }
+    // `dev_index_reserve` comes first in Linux, and holds the index; here
+    // it is only chosen, so a device made in `to` meanwhile may take it.
     let new_index = {
         let devices = to.devices();
         if devices.by_index(index).is_none() {
@@ -826,6 +829,7 @@ pub(super) fn move_to(
     list.extend(more);
     list.push(Notice {
         to: None,
+        heard: false,
         group: RTNLGRP_LINK,
         origin: 0,
         bytes: with_new_netns(message, nsid, new_index),

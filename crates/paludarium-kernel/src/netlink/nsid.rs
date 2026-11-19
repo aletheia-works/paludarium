@@ -117,6 +117,7 @@ impl Drop for Ids {
                 .into_iter()
                 .map(|id| Notice {
                     to: None,
+                    heard: false,
                     group: RTNLGRP_NSID,
                     origin: 0,
                     bytes: fill(RTM_DELNSID, 0, 0, 0, id, None),
@@ -474,6 +475,7 @@ pub(super) fn new_id(
     // alone of the members with `NLM_F_ECHO`.
     Ok(Notice {
         to: None,
+        heard: false,
         group: RTNLGRP_NSID,
         origin: if echo { port } else { 0 },
         bytes: fill(RTM_NEWNSID, 0, header.seq, port, id, None),
@@ -528,6 +530,7 @@ pub(super) fn link_netnsid(
     heard(this, peer);
     notices.push(Notice {
         to: None,
+        heard: false,
         group: RTNLGRP_NSID,
         origin: 0,
         bytes: fill(RTM_NEWNSID, 0, 0, 0, id, None),

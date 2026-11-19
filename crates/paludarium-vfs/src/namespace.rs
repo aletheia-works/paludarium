@@ -2000,7 +2000,7 @@ impl NamespacedFs {
                     || !before.iter().any(|e| e.parent == id)
                         && before[i].token.pins.load(Ordering::SeqCst) == 0 =>
             {
-                self.umount_spread(&before, &Self::subtree(&before, id))
+                self.umount_spread(&before, &Self::subtree(&before, id), id)
             }
             _ => Vec::new(),
         };
@@ -2106,9 +2106,16 @@ impl NamespacedFs {
     /// that goes. For each mount in `gone` on a shared parent, the mount at
     /// the same place on each other mount the parent's peer group
     /// propagates to goes too, once nothing is on it but what goes as
-    /// well, or a mount on its root, which takes its place
-    /// (`__propagate_umount`, `mnt_change_mountpoint`).
-    fn umount_spread(&self, entries: &Arc<Vec<Entry>>, gone: &BTreeSet<u64>) -> Vec<Unmounted> {
+    /// well, or a mount on its root, which takes its place (`trim_one`,
+    /// `reparent`). Those at the place of `root`, the mount unmounted, are
+    /// no longer locked (`propagate_mount_unlock`); any other locked one
+    /// goes only with its parent (`handle_locked`).
+    fn umount_spread(
+        &self,
+        entries: &Arc<Vec<Entry>>,
+        gone: &BTreeSet<u64>,
+        root: u64,
+    ) -> Vec<Unmounted> {
         let shared: Vec<(&Entry, &Entry)> = entries
             .iter()
             .filter(|e| gone.contains(&e.id()))
@@ -2139,6 +2146,7 @@ impl NamespacedFs {
         let mut out = Vec::new();
         for (table, es) in tables {
             let mut taken = BTreeSet::new();
+            let mut unlocked = BTreeSet::new();
             for (e, parent) in &shared {
                 let place = parent.inside(&e.point);
                 for m in es.iter().filter(|m| {
@@ -2150,11 +2158,15 @@ impl NamespacedFs {
                         && self.receives(m, parent.group)
                 }) {
                     let at = joined(&m.point, &relative(&m.root, &place));
-                    taken.extend(
-                        es.iter()
-                            .filter(|c| c.parent == m.id() && c.id() != m.id() && c.point == at)
-                            .map(Entry::id),
-                    );
+                    for c in es
+                        .iter()
+                        .filter(|c| c.parent == m.id() && c.id() != m.id() && c.point == at)
+                    {
+                        taken.insert(c.id());
+                        if e.id() == root {
+                            unlocked.insert(c.id());
+                        }
+                    }
                 }
             }
             // Only those with nothing else on them.
@@ -2168,6 +2180,9 @@ impl NamespacedFs {
                         let Some(c) = Self::by_id(&es, *id) else {
                             return false;
                         };
+                        if c.locked && !unlocked.contains(id) && !taken.contains(&c.parent) {
+                            return true;
+                        }
                         let on: Vec<&Entry> = es
                             .iter()
                             .filter(|o| {

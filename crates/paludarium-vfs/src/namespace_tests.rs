@@ -1325,3 +1325,39 @@ fn a_propagated_unmount_leaves_a_busy_or_covered_copy() {
     assert!(fs.mounts().iter().any(|l| l.path == b"/tmp/p/d"));
     assert!(fs.mounts().iter().all(|l| l.path != b"/tmp/m/d"));
 }
+
+#[test]
+fn a_propagated_unmount_takes_a_locked_copy_only_with_its_parent() {
+    let (lower, fs) = machine();
+    fs.mount(b"/tmp/m", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d", 0o755).unwrap();
+    let m = fs.target(b"/tmp/m").unwrap().id;
+    fs.change_type(m, Propagation::Shared, false).unwrap();
+    let slave = NamespacedFs::new(Arc::clone(&lower), fs.table().copy(true));
+    // Of another user namespace.
+    slave.table().set_owner(Arc::new(()));
+    fs.mount(b"/tmp/m/d", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d/x", 0o755).unwrap();
+    fs.mkdir(b"/tmp/m/d/y", 0o755).unwrap();
+    fs.mount(b"/tmp/m/d/x", tmpfs(0)).unwrap();
+    // The slave's copies are locked; one of its own keeps its copy of
+    // /tmp/m/d there.
+    slave.mount(b"/tmp/m/d/y", tmpfs(0)).unwrap();
+    let d = fs.target(b"/tmp/m/d").unwrap().id;
+    fs.umount(d, true).unwrap();
+    // The copy at the unmounted place is unlocked but stays for the
+    // slave's own mount on it, so the locked copy on it stays too.
+    let kept: Vec<Vec<u8>> = slave.mounts().into_iter().map(|l| l.path).collect();
+    assert!(kept.iter().any(|p| p == b"/tmp/m/d"));
+    assert!(kept.iter().any(|p| p == b"/tmp/m/d/x"));
+    // Without the slave's own mount, both go.
+    let y = slave.target(b"/tmp/m/d/y").unwrap().id;
+    slave.umount(y, false).unwrap();
+    fs.mount(b"/tmp/m/d", tmpfs(0)).unwrap();
+    fs.mkdir(b"/tmp/m/d/x", 0o755).unwrap();
+    fs.mount(b"/tmp/m/d/x", tmpfs(0)).unwrap();
+    let d = fs.target(b"/tmp/m/d").unwrap().id;
+    let before = slave.mounts().len();
+    fs.umount(d, true).unwrap();
+    assert_eq!(slave.mounts().len(), before - 2);
+}

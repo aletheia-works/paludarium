@@ -1711,7 +1711,9 @@ kernel.
   the place goes on the copy's root. An unmount under a shared mount
   takes away the mount at the same place on each of those, as
   `propagate_umount` does, but one that has other mounts on it (a mount on
-  its root takes its place); without `MNT_DETACH`, a file open on one of
+  its root takes its place). Those at the place unmounted are no longer
+  locked (`propagate_mount_unlock`); a locked one below them goes only
+  with its parent (`handle_locked`). Without `MNT_DETACH`, a file open on one of
   them makes the unmount `EBUSY` (`propagate_mount_busy`). A slave's own
   mounts reach its own slaves, not its master.
 - `mount` with `MS_MOVE` moves a mount, as Linux master's `do_move_mount`

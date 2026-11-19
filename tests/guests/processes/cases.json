@@ -413,6 +413,7 @@
     {"name":"ptrace-thread","binary":"ptrace"},
     {"name":"ptrace-sibling","binary":"ptrace"},
     {"name":"ptrace-attach-stopped","binary":"ptrace"},
+    {"name":"ptrace-tracer-exit","binary":"ptrace"},
     {"name":"ptrace-strace","binary":"ptrace-syscalls"},
     {"name":"ptrace-sysemu","binary":"ptrace-syscalls"},
     {"name":"ptrace-events","binary":"ptrace-syscalls"},

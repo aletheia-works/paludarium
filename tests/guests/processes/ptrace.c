@@ -571,6 +571,42 @@ static int attach_stopped(void) {
     return 0;
 }
 
+/* A tracer that exits while it still traces: the tracee it seized with
+ * PTRACE_O_EXITKILL gets SIGKILL, and the other is let go and runs on. */
+static int tracer_exit_case(void) {
+    int ready[2];
+    if (pipe(ready)) return 80;
+    pid_t kids[2];
+    fflush(stdout);
+    for (int i = 0; i < 2; i++) {
+        kids[i] = fork();
+        if (kids[i] == 0) {
+            prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+            write(ready[1], "x", 1);
+            for (;;) pause();
+        }
+    }
+    char byte;
+    read(ready[0], &byte, 1);
+    read(ready[0], &byte, 1);
+    pid_t tracer = fork();
+    if (tracer == 0) {
+        result("seize-kill", pt(PTRACE_SEIZE, kids[0], 0, PTRACE_O_EXITKILL));
+        result("seize-keep", pt(PTRACE_SEIZE, kids[1], 0, 0));
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = wait_status(tracer, 0);
+    result("tracer-exit", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    status = wait_status(kids[0], 0);
+    result("killed", WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    result("kept-running", wait_status(kids[1], WNOHANG));
+    kill(kids[1], SIGTERM);
+    status = wait_status(kids[1], 0);
+    result("kept-term", WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 99;
     const char *mode = argv[1], *self = argv[2];
@@ -586,6 +622,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "ptrace-thread")) code = thread_case();
     if (!strcmp(mode, "ptrace-sibling")) code = sibling_case();
     if (!strcmp(mode, "ptrace-attach-stopped")) code = attach_stopped();
+    if (!strcmp(mode, "ptrace-tracer-exit")) code = tracer_exit_case();
     fflush(stdout);
     return code;
 }

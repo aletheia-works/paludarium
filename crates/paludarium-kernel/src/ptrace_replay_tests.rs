@@ -4,9 +4,9 @@
 //! its own, as a guest's tasks run, each system call followed by the
 //! checkpoint the runtime takes before guest code runs again. The expected
 //! lines are what the guest prints for its mode on native Linux: for the
-//! `ptrace.c` cases but `ptrace-thread` and `ptrace-attach-stopped` as
-//! printed on Linux 7.0 (x86-64, Ubuntu 26.04 runner); for those two, the
-//! `ptrace-syscalls.c`, `ptrace-requests.c` and `single-step.c` cases as the
+//! `ptrace.c` cases but `ptrace-thread`, `ptrace-attach-stopped` and
+//! `ptrace-tracer-exit` as printed on Linux 7.0 (x86-64, Ubuntu 26.04
+//! runner); for those three, the `ptrace-syscalls.c`, `ptrace-requests.c` and `single-step.c` cases as the
 //! guest prints them under the emulator, which `diff_processes` finds equal
 //! to Linux's. It still compares the whole guests with Linux on every CI
 //! run. What only the CPU does (a signal handler's body, the check a tracee
@@ -50,6 +50,7 @@ const RT_SIGQUEUEINFO: u64 = 129;
 const PRCTL: u64 = 157;
 const SECCOMP: u64 = 317;
 const RSEQ: u64 = 334;
+const PRLIMIT64: u64 = 302;
 
 const TRACEME: u64 = 0;
 const PEEKDATA: u64 = 2;
@@ -86,11 +87,13 @@ const ARCH_PRCTL_REQUEST: u64 = 30;
 const SET_SYSCALL_INFO: u64 = 0x4212;
 const O_TRACESYSGOOD: u64 = 1;
 const O_TRACEFORK: u64 = 2;
+const O_TRACEEXIT: u64 = 0x40;
 const O_TRACESECCOMP: u64 = 0x80;
 const O_EXITKILL: u64 = 1 << 20;
 const NT_PRSTATUS: u64 = 1;
 const NT_PRFPREG: u64 = 2;
 
+const SIGQUIT: u64 = 3;
 const SIGTRAP: i64 = 5;
 const SIGUSR1: u64 = 10;
 const SIGUSR2: u64 = 12;
@@ -2386,5 +2389,355 @@ seize-trap-event=128
 seize-siginfo=0
 seize-si-signo=19
 seize-killed=9",
+    );
+}
+
+/// `ptrace-tracer-exit`: a sibling seizes two children, which let any
+/// task trace them (Yama's PR_SET_PTRACER), and exits while it traces
+/// them: the one seized with PTRACE_O_EXITKILL gets SIGKILL, and the
+/// other is let go and runs on.
+#[test]
+fn tracer_exit() {
+    let mut g = Tracer::new();
+    let (ready_read, ready_write) = g.pipe();
+    let mut kids = Vec::new();
+    for _ in 0..2 {
+        kids.push(g.fork(move |c| {
+            // PR_SET_PTRACER, PR_SET_PTRACER_ANY.
+            c.sys(PRCTL, [0x5961_6d61, u64::MAX, 0, 0, 0, 0]).unwrap();
+            c.sys(WRITE, [ready_write, HEAP + 0x790, 1, 0, 0, 0])
+                .unwrap();
+            loop {
+                if let Err(status) = c.sys(PAUSE, [0; 6]) {
+                    return status;
+                }
+            }
+        }));
+    }
+    for _ in 0..2 {
+        assert_eq!(g.call(READ, [ready_read, HEAP + 0x798, 1, 0, 0, 0]), 1);
+    }
+    let (kill_pid, keep_pid) = (kids[0].0, kids[1].0);
+    let (lines, rx) = std::sync::mpsc::channel();
+    let (tracer, tracer_thread) = g.fork(move |c| {
+        for (name, pid, options) in [
+            ("seize-kill", kill_pid, O_EXITKILL),
+            ("seize-keep", keep_pid, 0),
+        ] {
+            let r = c.sys(PTRACE, [SEIZE, pid, 0, options, 0, 0]).unwrap();
+            lines.send(format!("{name}={}", neg(r))).unwrap();
+        }
+        c.exit(0)
+    });
+    let status = g.wait(tracer, 0);
+    g.lines.extend(rx.try_iter());
+    g.say("tracer-exit", Tracer::code(status));
+    tracer_thread.join().unwrap();
+    let signaled = |status: i64| {
+        if status & 0x7f != 0 && status & 0xff != 0x7f {
+            status & 0x7f
+        } else {
+            -1
+        }
+    };
+    let status = g.wait(kill_pid, 0);
+    g.say("killed", signaled(status));
+    let running = g.wait(keep_pid, WNOHANG);
+    g.say("kept-running", running);
+    g.call(KILL, [keep_pid, SIGTERM, 0, 0, 0, 0]);
+    let status = g.wait(keep_pid, 0);
+    g.say("kept-term", signaled(status));
+    for (_, thread) in kids {
+        thread.join().unwrap();
+    }
+    g.check(
+        "seize-kill=0
+seize-keep=0
+tracer-exit=0
+killed=9
+kept-running=0
+kept-term=15",
+    );
+}
+
+/// `ptrace-restart-codes`: the restart code a tracer sees in `rax` at the
+/// stop for a signal that interrupts a blocked `read`, and what each code
+/// it leaves there does: -ERESTARTNOINTR restarts the call after the
+/// handler, -ERESTARTNOHAND gives EINTR after even an SA_RESTART handler,
+/// an `orig_rax` of -1 leaves no call to restart, and
+/// -ERESTART_RESTARTBLOCK, with the signal taken back, gives EINTR from
+/// `restart_syscall`.
+#[test]
+fn restart_codes() {
+    let mut g = Tracer::new();
+    let (pipe_read, pipe_write) = g.pipe();
+    let (lines, rx) = std::sync::mpsc::channel();
+    let (child, thread) = g.fork(move |c| {
+        c.catch(SIGUSR1, 0);
+        c.catch(SIGUSR2, SA_RESTART);
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        let tid = u64::from(c.t.tid);
+        c.sys(TKILL, [tid, SIGSTOP, 0, 0, 0, 0]).unwrap();
+        let mut read = || {
+            neg(c
+                .call(
+                    READ,
+                    [pipe_read, HEAP + 0x990, 1, 0, 0, 0],
+                    &mut |_, _, _| None,
+                )
+                .unwrap())
+        };
+        let (nointr, nohand, literal, block) = (read(), read(), read(), read());
+        lines
+            .send(format!(
+                "nointr={nointr} nohand={nohand} literal={literal} block={block}"
+            ))
+            .unwrap();
+        c.exit(0)
+    });
+    g.wait(child, 0);
+    g.pt(CONT, child, 0, 0);
+    let interrupt = |g: &mut Tracer, signal: u64, rax: i64, orig: i64, resume: u64| {
+        g.until_sleeping(child);
+        g.call(KILL, [child, signal, 0, 0, 0, 0]);
+        let status = g.wait(child, 0);
+        let (_, regs) = g.regs(child);
+        let stopped = status & 0xff == 0x7f;
+        g.lines.push(format!(
+            "stop={} rax={}",
+            if stopped { (status >> 8) & 0xff } else { -1 },
+            g.reg(regs, RAX) as i64
+        ));
+        g.m.write_u64(GuestAddr(regs + RAX), rax as u64).unwrap();
+        if orig != 0 {
+            g.m.write_u64(GuestAddr(regs + ORIG_RAX), orig as u64)
+                .unwrap();
+        }
+        g.pt(SETREGS, child, 0, regs);
+        g.pt(CONT, child, 0, resume);
+    };
+    interrupt(&mut g, SIGUSR1, -513, 0, SIGUSR1);
+    g.call(WRITE, [pipe_write, HEAP + 0x790, 1, 0, 0, 0]);
+    interrupt(&mut g, SIGUSR2, -514, 0, SIGUSR2);
+    interrupt(&mut g, SIGUSR1, -512, -1, SIGUSR1);
+    interrupt(&mut g, SIGUSR1, -516, 0, 0);
+    let status = g.wait(child, 0);
+    g.lines.extend(rx.try_iter());
+    g.say("exit", Tracer::code(status));
+    thread.join().unwrap();
+    g.check(
+        "stop=10 rax=-512
+stop=12 rax=-512
+stop=10 rax=-512
+stop=10 rax=-512
+nointr=1 nohand=-4 literal=-512 block=-4
+exit=0",
+    );
+}
+
+/// `ptrace-exit-core`: PTRACE_EVENT_EXIT of a process a fatal signal ends,
+/// with a core and without: the event's status has 0x80 only when it
+/// dumps one.
+#[test]
+fn exit_core() {
+    let mut g = Tracer::new();
+    for (name, limit) in [("core", u64::MAX), ("no-core", 0)] {
+        let (child, thread) = g.fork(move |c| {
+            // setrlimit(RLIMIT_CORE), the soft limit up to the hard one.
+            let at = HEAP + 0x9a0;
+            c.sys(PRLIMIT64, [0, 4, 0, at, 0, 0]).unwrap();
+            let hard = c.m.read_u64(GuestAddr(at + 8)).unwrap();
+            c.m.write_u64(GuestAddr(at), limit.min(hard)).unwrap();
+            c.sys(PRLIMIT64, [0, 4, at, 0, 0, 0]).unwrap();
+            assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+            let tid = u64::from(c.t.tid);
+            for signal in [SIGSTOP, SIGQUIT] {
+                if let Err(status) = c.sys(TKILL, [tid, signal, 0, 0, 0, 0]) {
+                    return status;
+                }
+            }
+            c.exit(91)
+        });
+        g.wait(child, 0);
+        g.pt(SETOPTIONS, child, 0, O_TRACEEXIT);
+        g.pt(CONT, child, 0, 0);
+        let status = g.wait(child, 0);
+        g.lines
+            .push(format!("{name}: delivery={}", (status >> 8) & 0xff));
+        g.pt(CONT, child, 0, SIGQUIT);
+        let status = g.wait(child, 0);
+        let at = HEAP + 0x500;
+        g.pt(GETEVENTMSG, child, 0, at);
+        let message = g.m.read_u64(GuestAddr(at)).unwrap();
+        g.lines.push(format!(
+            "{name}: event={} message={}",
+            status >> 16,
+            hex(message)
+        ));
+        g.pt(CONT, child, 0, 0);
+        let status = g.wait(child, 0);
+        let signaled = status & 0x7f != 0 && status & 0xff != 0x7f;
+        g.lines.push(format!(
+            "{name}: signal={} core={}",
+            if signaled { status & 0x7f } else { -1 },
+            i64::from(status & 0x80 != 0)
+        ));
+        thread.join().unwrap();
+    }
+    g.check(
+        "core: delivery=3
+core: event=6 message=0x83
+core: signal=3 core=1
+no-core: delivery=3
+no-core: event=6 message=0x3
+no-core: signal=3 core=0",
+    );
+}
+
+/// `ptrace-selectors`: the segment selectors a tracer reads and writes. A
+/// data selector may be set to a user one, not to a kernel one, and `cs`
+/// not to the null one (`EIO`); SETREGS keeps only a selector's 16 bits.
+#[test]
+fn selectors() {
+    const ES: u64 = 192;
+    const FS: u64 = 200;
+    const GS: u64 = 208;
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        let tid = u64::from(c.t.tid);
+        if let Err(status) = c.sys(TKILL, [tid, SIGSTOP, 0, 0, 0, 0]) {
+            return status;
+        }
+        c.exit(0)
+    });
+    g.wait(child, 0);
+    let (_, regs) = g.regs(child);
+    let line = [
+        ("ds", DS),
+        ("es", ES),
+        ("fs", FS),
+        ("gs", GS),
+        ("cs", CS),
+        ("ss", SS),
+    ]
+    .map(|(name, field)| format!("{name}={}", hex(g.reg(regs, field))))
+    .join(" ");
+    g.lines.push(line);
+    let r = g.pt(POKEUSER, child, DS, 0x2b);
+    g.say("poke-ds", r);
+    let word = HEAP + 0x500;
+    let peeked = g.pt(PEEKUSER, child, DS, word);
+    let value = g.m.read_u64(GuestAddr(word)).unwrap();
+    g.lines
+        .push(format!("peek-ds={peeked} word={}", hex(value)));
+    let r = g.pt(POKEUSER, child, DS, 0x10);
+    g.say("poke-ds-kernel", r);
+    let r = g.pt(POKEUSER, child, CS, 0);
+    g.say("poke-cs-null", r);
+    let (_, regs) = g.regs(child);
+    g.m.write_u64(GuestAddr(regs + ES), 0x1002b).unwrap();
+    let r = g.pt(SETREGS, child, 0, regs);
+    g.say("setregs", r);
+    let (_, regs) = g.regs(child);
+    let line = format!("ds={} es={}", hex(g.reg(regs, DS)), hex(g.reg(regs, ES)));
+    g.lines.push(line);
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, 0);
+    g.say("exit", Tracer::code(status));
+    thread.join().unwrap();
+    g.check(
+        "ds=0 es=0 fs=0 gs=0 cs=0x33 ss=0x2b
+poke-ds=0
+peek-ds=0 word=0x2b
+poke-ds-kernel=-5
+poke-cs-null=-5
+setregs=0
+ds=0x2b es=0x2b
+exit=0",
+    );
+}
+
+/// `ptrace-syscall-signal`: a signal given at a syscall-entry stop comes
+/// as the call returns. At the exit stop it waits in the thread's queue,
+/// from the kernel (SI_KERNEL), not the process's; its delivery stop
+/// follows, and the handler gets it with that code.
+#[test]
+fn syscall_signal() {
+    let mut g = Tracer::new();
+    let (child, thread) = g.fork(|c| {
+        c.catch(SIGUSR1, SA_SIGINFO);
+        assert_eq!(c.sys(PTRACE, [TRACEME, 0, 0, 0, 0, 0]), Ok(0));
+        let tid = u64::from(c.t.tid);
+        if let Err(status) = c.sys(TKILL, [tid, SIGSTOP, 0, 0, 0, 0]) {
+            return status;
+        }
+        let mut code = 0;
+        let r = c.call(GETPPID, [0; 6], &mut |c, _, info| {
+            code = read32(&c.m, info + 8);
+            None
+        });
+        if let Err(status) = r {
+            return status;
+        }
+        c.exit(if code == 0x80 { 0 } else { 1 })
+    });
+    let status = g.wait(child, 0);
+    g.show("stop", status);
+    g.pt(SYSCALL, child, 0, 0);
+    let status = g.wait(child, 0);
+    let (_, regs) = g.regs(child);
+    let line = format!(
+        "entry signal={} nr={}",
+        (status >> 8) & 0xff,
+        g.reg(regs, ORIG_RAX) as i64
+    );
+    g.lines.push(line);
+    g.pt(SYSCALL, child, 0, SIGUSR1);
+    let status = g.wait(child, 0);
+    let (_, regs) = g.regs(child);
+    let line = format!(
+        "exit signal={} nr={}",
+        (status >> 8) & 0xff,
+        g.reg(regs, ORIG_RAX) as i64
+    );
+    g.lines.push(line);
+    let (args, infos) = (HEAP + 0x600, HEAP + 0x1000);
+    g.m.write(GuestAddr(args), &[0; 16]).unwrap();
+    write32(&g.m, args + 12, 2);
+    let n = g.pt(PEEKSIGINFO, child, args, infos);
+    g.say("thread-queue", n);
+    write32(&g.m, args + 8, 1);
+    let n = g.pt(PEEKSIGINFO, child, args, infos);
+    let mut line = format!("process-queue={n}");
+    for i in 0..n.max(0) as u64 {
+        let at = infos + i * 128;
+        line += &format!(
+            " {}/{}",
+            read32(&g.m, at),
+            hex(u64::from(read32(&g.m, at + 8)))
+        );
+    }
+    g.lines.push(line);
+    g.pt(CONT, child, 0, 0);
+    let status = g.wait(child, 0);
+    let (_, _, code, pid) = g.siginfo(child);
+    let signal = (status >> 8) & 0xff;
+    g.lines.push(format!(
+        "delivery signal={signal} si-code={} si-pid={pid}",
+        hex(code as u64)
+    ));
+    g.pt(CONT, child, 0, signal as u64);
+    let status = g.wait(child, 0);
+    g.say("exit", Tracer::code(status));
+    thread.join().unwrap();
+    g.check(
+        "stop: stopped=1 signal=19 event=0
+entry signal=5 nr=110
+exit signal=5 nr=110
+thread-queue=1
+process-queue=0
+delivery signal=10 si-code=0x80 si-pid=0
+exit=0",
     );
 }

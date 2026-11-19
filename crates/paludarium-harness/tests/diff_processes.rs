@@ -244,6 +244,7 @@ mod linux {
                     | "perf-software"
                     | "perf-mmap"
                     | "perf-output"
+                    | "perf-sample"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -559,6 +560,7 @@ mod linux {
         perf_software => ("perf-software","perf"),
         perf_mmap => ("perf-mmap","perf"),
         perf_output => ("perf-output","perf"),
+        perf_sample => ("perf-sample","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),

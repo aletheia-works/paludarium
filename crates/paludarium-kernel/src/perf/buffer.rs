@@ -27,6 +27,8 @@ const EBUSY: Errno = Errno(16);
 /// Where `struct perf_event_mmap_page` keeps its fields.
 mod field {
     pub const LOCK: u64 = 8;
+    pub const DATA_HEAD: u64 = 1024;
+    pub const DATA_TAIL: u64 = 1032;
     pub const INDEX: u64 = 12;
     pub const OFFSET: u64 = 16;
     pub const TIME_ENABLED: u64 = 24;
@@ -97,9 +99,11 @@ pub(crate) struct Buffer {
     data_pages: u64,
     /// The first mapping could write (`RING_BUFFER_WRITABLE`): the reader
     /// says how far it has read (`data_tail`). Without, the buffer
-    /// overwrites what it holds.
-    #[allow(dead_code, reason = "read once the buffer takes records")]
+    /// overwrites what it holds (`overwrite`).
     writable: bool,
+    /// Where the next record goes, the records lost since the last that
+    /// went in, and whether output is paused.
+    out: Mutex<Out>,
     accounts: Arc<Accounts>,
     /// Who mapped it first (`mmap_user`), the address space it was in,
     /// and how much of it the address space's pinned pages took
@@ -137,6 +141,11 @@ impl Buffer {
             uid,
             space,
             pinned,
+            // A buffer of no data pages takes nothing (`rb->paused`).
+            out: Mutex::new(Out {
+                paused: data_pages == 0,
+                ..Out::default()
+            }),
             events: Mutex::new(Some(vec![erase(event)])),
         });
         accounts.charge(uid, user, space, pinned);
@@ -182,6 +191,117 @@ impl Buffer {
         self.store(field::TIME_ENABLED, &enabled.to_le_bytes());
         self.store(field::TIME_RUNNING, &running.to_le_bytes());
         self.store(field::LOCK, &seq.wrapping_add(2).to_le_bytes());
+    }
+}
+
+/// What `struct perf_buffer` keeps of its output: `head`, `lost` and
+/// `paused`.
+#[derive(Default)]
+struct Out {
+    head: u64,
+    lost: u64,
+    paused: bool,
+}
+
+impl Buffer {
+    /// `__perf_output_begin`, the copy and `perf_output_end`, for `copies`
+    /// of `record` that `event` (the one the buffer is reached through,
+    /// which counts what is lost) writes: each goes in where the reader
+    /// has left room (`data_tail`) or, in a buffer that overwrites, where
+    /// it is due, forward or for `write_backward` back from the head, and
+    /// the first after lost ones follows a `PERF_RECORD_LOST` of them
+    /// with `trailer`, its `sample_id`. A paused buffer counts what it does
+    /// not take as lost. `spill` is written past the record, in the room it
+    /// was not given.
+    pub(super) fn output(
+        &self,
+        event: &Event,
+        record: &[u8],
+        spill: &[u8],
+        copies: u64,
+        trailer: &[u8],
+    ) {
+        let backward = event.attr.flag(super::bit::WRITE_BACKWARD);
+        let size = self.data_size();
+        let mut out = lock(&self.out);
+        let mut copies = copies;
+        // Of a buffer that overwrites, only the last that fit stay.
+        if !self.writable && !out.paused && size != 0 && out.lost == 0 {
+            let fit = size / record.len() as u64 + 1;
+            if copies > fit {
+                let skipped = (copies - fit) * record.len() as u64;
+                out.head = if backward {
+                    out.head.wrapping_sub(skipped)
+                } else {
+                    out.head.wrapping_add(skipped)
+                };
+                copies = fit;
+            }
+        }
+        for _ in 0..copies {
+            if out.paused {
+                if size != 0 {
+                    out.lost += 1;
+                    lock(&event.sampler).lost += 1;
+                }
+                continue;
+            }
+            let mut need = record.len() as u64;
+            if out.lost != 0 {
+                need += event.lost_size() as u64;
+            }
+            let head = out.head;
+            if self.writable {
+                let tail = self.load(field::DATA_TAIL);
+                // CIRC_SPACE.
+                let space = if backward {
+                    head.wrapping_sub(tail.wrapping_add(1)) & (size - 1)
+                } else {
+                    tail.wrapping_sub(head.wrapping_add(1)) & (size - 1)
+                };
+                if space < need {
+                    out.lost += 1;
+                    lock(&event.sampler).lost += 1;
+                    continue;
+                }
+            }
+            let (mut at, new_head) = if backward {
+                let new = head.wrapping_sub(need);
+                (new, new)
+            } else {
+                (head, head.wrapping_add(need))
+            };
+            out.head = new_head;
+            if out.lost != 0 {
+                let lost = std::mem::take(&mut out.lost);
+                let lost = event.lost_record(lost, trailer);
+                self.copy_in(at, &lost);
+                at = at.wrapping_add(lost.len() as u64);
+            }
+            self.copy_in(at, record);
+            self.copy_in(at.wrapping_add(record.len() as u64), spill);
+            self.store(field::DATA_HEAD, &new_head.to_le_bytes());
+        }
+    }
+    /// `PERF_EVENT_IOC_PAUSE_OUTPUT` (`rb_toggle_paused`): `EINVAL` for a
+    /// buffer of no data pages.
+    pub(super) fn pause(&self, paused: bool) -> Result<(), Errno> {
+        if self.data_pages == 0 {
+            return Err(Errno::EINVAL);
+        }
+        lock(&self.out).paused = paused;
+        Ok(())
+    }
+    /// `bytes` into the data pages from `at`, round the end of them.
+    fn copy_in(&self, at: u64, bytes: &[u8]) {
+        let size = self.data_size();
+        let mut done = 0;
+        while done < bytes.len() {
+            let offset = at.wrapping_add(done as u64) & (size - 1);
+            let n = ((size - offset) as usize).min(bytes.len() - done);
+            self.store(PAGE + offset, &bytes[done..done + n]);
+            done += n;
+        }
     }
 }
 
@@ -517,7 +637,7 @@ mod tests {
             true,
             accounts,
             (1000, 7),
-            (data_pages + 1 - 2, 2),
+            ((data_pages + 1).saturating_sub(2), 2.min(data_pages + 1)),
         );
         (event, mapped)
     }
@@ -558,6 +678,43 @@ mod tests {
         assert_eq!((accounts.user(1000), accounts.pinned(7)), (0, 0));
         // Without a buffer, the user page is not written.
         event.update_user_page();
+    }
+
+    #[test]
+    fn a_full_buffer_loses_records_and_then_says_how_many() {
+        let accounts = Arc::default();
+        let (event, mapped) = mapped(1, &accounts);
+        let rb = &mapped.buffer;
+        let record: Vec<u8> = (0..24).collect();
+        rb.output(&event, &record, &[], 200, &[]);
+        // 170 fit: the head may not reach the tail.
+        assert_eq!(rb.load(field::DATA_HEAD), 4080);
+        assert_eq!(lock(&event.sampler).lost, 30);
+        rb.store(field::DATA_TAIL, &4080u64.to_le_bytes());
+        rb.output(&event, &record, &[], 1, &[]);
+        assert_eq!(rb.load(field::DATA_HEAD), 4080 + 48);
+        // PERF_RECORD_LOST, 24 bytes, round the end of the data page.
+        assert_eq!(rb.load(PAGE + 4080), 2 | 24 << 48);
+        assert_eq!(rb.load(PAGE + 4088), event.id);
+        assert_eq!(rb.load(PAGE), 30);
+        let mut copied = [0; 24];
+        rb.pages.load(PAGE + 8, &mut copied);
+        assert_eq!(copied.as_slice(), record.as_slice());
+    }
+
+    #[test]
+    fn a_paused_buffer_takes_nothing_and_one_of_no_pages_cannot_pause() {
+        let accounts = Arc::default();
+        let (event, one) = mapped(1, &accounts);
+        let rb = &one.buffer;
+        rb.pause(true).unwrap();
+        rb.output(&event, &[0; 8], &[], 3, &[]);
+        assert_eq!(rb.load(field::DATA_HEAD), 0);
+        assert_eq!(lock(&event.sampler).lost, 3);
+        let (other, none) = mapped(0, &accounts);
+        assert_eq!(none.buffer.pause(false), Err(Errno::EINVAL));
+        none.buffer.output(&other, &[0; 8], &[], 1, &[]);
+        assert_eq!(lock(&other.sampler).lost, 0);
     }
 
     fn listed(rb: &Buffer) -> usize {

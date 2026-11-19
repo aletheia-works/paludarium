@@ -3209,12 +3209,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
   イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
   要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った
-  サンプル（0）を付けて返し、`PERF_FORMAT_GROUP` ではグループ全体を返します。バッファが
+  サンプルを付けて返し、`PERF_FORMAT_GROUP` ではグループ全体を返します。バッファが
   小さすぎると `ENOSPC` です。グループのメンバーはリーダーと同じタスク、CPU、クロックで、
   pinned でも exclusive でもないこと（`EINVAL`）が要り、リーダーが有効な間だけ数えます。
   ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
-  と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
+  と `REFRESH` は `EINVAL` で、`PERIOD` はサンプリングするイベントに新しい周期（`freq`
+  なら新しい頻度）を与え、周期は初めからになります。`enable_on_exec` は、`perf stat` が使うように、無効な
   イベントをそのタスクの `execve` で有効にし、`remove_on_exec` は、Linux master と同じく、そのとき
   イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
   持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで
@@ -3264,7 +3265,27 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   いるときも断ります（`EINVAL`）。-1（`SET_OUTPUT` だけ）は出力先をなくします。こうした
   イベントはユーザーページを共有しますが、マップすると `EBUSY`（大きさが違えば
   `EINVAL`）で、バッファの最後のマッピングがなくなると、書き込んでいたイベントは
-  どれも自由になります。ディスクリプタのリンクは
+  どれも自由になります。サンプリングするイベントは、Linux の `perf_swevent_event` と
+  `perf_swevent_hrtimer` と同じく、オーバーフローのたびに `PERF_RECORD_SAMPLE` を
+  バッファへ書きます。`sample_period` 回ごと、`PERF_SAMPLE_PERIOD` ならそれぞれ（周期 1）、
+  `cpu-clock` と `task-clock` は数えたナノ秒の周期ごとで、少なくとも 10 µs ごとです。
+  `freq` では、クロックの周期は 1 秒を頻度で割ったもので、ほかのイベントの周期は 1 から
+  始まり、数える速さへ 8 分の 1 ずつ近づきます（`perf_adjust_period`）。サンプルは
+  `sample_type` の求めるフィールドを `perf_output_sample` の順に持ちます。識別子、
+  アドレス、開いたタスクの PID 名前空間でのプロセスとスレッド、イベントの時計での時刻、
+  ID とストリーム ID、CPU、周期、`PERF_SAMPLE_READ` の読む値（`PERF_FORMAT_GROUP`
+  ならグループのもの）、コールチェーン（`PERF_CONTEXT_USER`、アドレス、`rbp` の
+  連なりがたどる戻りアドレスで、`sample_max_stack` まで。0 なら `perf_event_max_stack`
+  （127）で、それより多いと `EOVERFLOW`）、空の raw データ、マスクのユーザーレジスタ、
+  ページがメモリにある限りのユーザースタックの写し、そして残りはソフトウェアイベントの
+  とおりです（重みなし、データソースは `PERF_MEM_NA`、ルートの cgroup）。記録は読み手が
+  空けたところ（`data_tail`）まで、前へ、`write_backward` なら 0 から後ろへ書かれます。
+  入らない記録は失われて数えられ、次に入る記録の前に、それらの数の `PERF_RECORD_LOST`
+  が、`sample_id_all` の足す `sample_id` を付けて書かれます。読み取り専用でマップした
+  バッファは中身を上書きし、何も失いません。`PERF_EVENT_IOC_PAUSE_OUTPUT` はバッファを
+  止め、また動かし（バッファがないか、データページがなければ `EINVAL`）、止まっている
+  バッファは受け取らない記録を失ったものと数えます。引き継いだイベントは、元のイベントの
+  バッファへ書きます。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c`、`bpf_lru_list.c`、

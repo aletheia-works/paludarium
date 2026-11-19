@@ -3707,14 +3707,15 @@ kernel.
   Hardware, cache and raw events are `ENOENT`, as on a machine without a
   PMU. An event of another process needs `CAP_PERFMON` or to be able to
   read it (`ptrace_may_access`, `EACCES`). `read` gives the count with the
-  times enabled and running, the ID and the lost samples (0) as the read
+  times enabled and running, the ID and the lost samples as the read
   format asks, and with `PERF_FORMAT_GROUP` the whole group's, `ENOSPC` for
   a buffer too small. A group member must be of its leader's task, CPU and
   clock, and neither pinned nor exclusive (`EINVAL`); it counts only while
   its leader is enabled. The ioctls `PERF_EVENT_IOC_ENABLE`, `DISABLE` and
   `RESET`, each of the event or with `PERF_IOC_FLAG_GROUP` of its group,
   and `PERF_EVENT_IOC_ID` are there; `PERIOD` and `REFRESH` are `EINVAL`
-  for an event that does not sample. `enable_on_exec` enables a disabled
+  for an event that does not sample, and `PERIOD` gives a sampling event a
+  new period (or with `freq` a new frequency) that starts over. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
   `remove_on_exec` takes one out then for good, as Linux master does: it
   counts no more, keeps its last count and times to be read, has no owner
@@ -3771,7 +3772,32 @@ kernel.
   (`EINVAL`), and -1 (`SET_OUTPUT` alone) makes it write to none. Such an
   event shares the user page, but a mapping of it is `EBUSY` (`EINVAL`
   for another size), and when the buffer's last mapping goes, every event
-  that wrote to it is free again. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  that wrote to it is free again. A sampling event writes a
+  `PERF_RECORD_SAMPLE` to its buffer at each overflow, as Linux's
+  `perf_swevent_event` and `perf_swevent_hrtimer`: every `sample_period`
+  occurrences, each one with `PERF_SAMPLE_PERIOD` (of a period of 1), or
+  for `cpu-clock` and `task-clock` every period of nanoseconds of its count
+  and at least every 10 µs; with `freq`, a clock's period is a second over
+  the frequency, and another event's starts at 1 and moves an eighth of the
+  way to the rate it counts at (`perf_adjust_period`). The sample has the
+  fields `sample_type` asks for in `perf_output_sample`'s order: the
+  identifier, address, process and thread in the opener's PID namespace,
+  time on the event's clock, ID and stream ID, CPU, period, the values
+  `PERF_SAMPLE_READ` reads (with `PERF_FORMAT_GROUP` the group's), the
+  callchain (`PERF_CONTEXT_USER`, the address and the return addresses the
+  `rbp` chain leads to, up to `sample_max_stack`, which is
+  `perf_event_max_stack` (127) when 0, and more is `EOVERFLOW`), empty raw
+  data, the user registers of the mask and a dump of the user stack as far
+  as its pages are in memory, and the rest as a software event has them
+  (no weight, data source `PERF_MEM_NA`, the root cgroup). A record goes in
+  where the reader has left room (`data_tail`), forward or with
+  `write_backward` back from 0; one that finds none is lost and counted,
+  and the next that fits follows a `PERF_RECORD_LOST` of them, with the
+  `sample_id` that `sample_id_all` adds. A buffer mapped read-only
+  overwrites what it holds and loses nothing. `PERF_EVENT_IOC_PAUSE_OUTPUT`
+  pauses and resumes the buffer (`EINVAL` without one, or for one of no
+  data pages), which counts what it does not take as lost. An inherited
+  event writes to the buffer of the one it comes from. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,

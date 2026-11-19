@@ -251,9 +251,17 @@ verified.
   sleep of the thread, not a preemption (but for a thread with `rseq` that
   gives its virtual CPU to another); and a thread without `rseq` moves to
   another CPU only when a new CPU mask changes the lowest CPU it allows.
-  An event's ring buffer maps, but nothing writes records to it yet: a
-  sampling event takes no samples and sends no signal, and `poll` never
-  finds one readable. Its user page shows the count and times as of the
+  A sampling event's samples are taken as its thread enters a system call,
+  or reaches the emulator's checkpoint, of what it did since then, where
+  Linux takes each at its occurrence: they show the thread's address,
+  registers, stack and frames as of then, a fault's address is 0, and one
+  of the kernel (a fault in a system call, a switch or a migration) has the
+  address 0 and no kernel frames. `freq` follows the rate at those points,
+  not at each tick. A sample is never throttled (no `PERF_RECORD_THROTTLE`
+  or `UNTHROTTLE`), an event of a CPU takes none, and no other record
+  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. Nothing wakes a
+  reader: an overflow sends no signal, and `poll` never finds an event
+  readable. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
@@ -267,8 +275,7 @@ verified.
   inherited event's end sends no read record, as nothing is recorded. An
   event of a task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
-  `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are
-  `ENOTTY`. `remove_on_exec`
+  `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
   (037a3c43edfb), and such an event leads no new group (`ENODEV`,
   fa091f46c383); the test machines' Linux 7.0 leaves it in its group and

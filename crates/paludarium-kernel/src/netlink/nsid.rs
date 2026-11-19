@@ -122,7 +122,7 @@ impl Drop for Ids {
                     bytes: fill(RTM_DELNSID, 0, 0, 0, id, None),
                 })
                 .collect();
-            super::notify(&peer, notices, None);
+            super::notify_going(&peer, notices);
         }
     }
 }

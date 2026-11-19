@@ -28,13 +28,17 @@ const ARPHRD_ETHER: u16 = 1;
 const IFF_BROADCAST: u32 = 0x2;
 const IFF_MULTICAST: u32 = 0x1000;
 const IF_OPER_DOWN: u8 = 2;
+const IF_OPER_LOWERLAYERDOWN: u8 = 3;
 const IF_OPER_UP: u8 = 6;
 /// `ETH_DATA_LEN`, `ETH_MIN_MTU` and `ETH_MAX_MTU`.
 const ETH_DATA_LEN: u32 = 1500;
 const ETH_MIN_MTU: u32 = 68;
 const ETH_MAX_MTU: u32 = 65535;
-/// What `dev_close_many` tells of a device it closes to remove it.
+/// What `dev_close_many` tells of a device it closes to remove or move it.
 const CLOSED: u32 = IFF_UP | IFF_RUNNING;
+/// `IFLA_NEW_NETNSID`, which a move's `RTM_DELLINK` carries with
+/// `IFLA_NEW_IFINDEX`.
+const IFLA_NEW_NETNSID: u16 = 45;
 /// `veth_policy`.
 const VETH_POLICY: Policy = Policy {
     max: VETH_INFO_PEER,
@@ -45,6 +49,30 @@ const VETH_POLICY: Policy = Policy {
     },
 };
 
+/// The operational state `rtnl_fill_ifinfo` gives a veth end of
+/// `network`: down while it is not running; up with its carrier; else
+/// as `default_operstate` finds it, by the device of its `iflink`, its
+/// peer's index, looked up in its own namespace: down for none there or
+/// one operationally up, else lower layer down. (Linux finds it as its
+/// link watch runs; it is found here as it is told of.)
+fn operstate(network: &Network, v: &crate::netdev::Veth) -> u8 {
+    if !v.up {
+        return IF_OPER_DOWN;
+    }
+    if v.oper_up {
+        return IF_OPER_UP;
+    }
+    let iflink = v.peer.as_ref().map_or(0, |p| p.index);
+    let devices = network.devices();
+    match devices.by_index(iflink) {
+        None => IF_OPER_DOWN,
+        // Only a veth end is not up here: `lo`'s stays unknown.
+        Some(found) => match &found.veth {
+            Some(f) if !(f.up && f.oper_up) => IF_OPER_LOWERLAYERDOWN,
+            _ => IF_OPER_DOWN,
+        },
+    }
+}
 /// A veth end's flags (`netif_get_flags`): `IFF_BROADCAST` and
 /// `IFF_MULTICAST`, and while up `IFF_UP`, with `IFF_RUNNING` once its
 /// operational state is up and `IFF_LOWER_UP` while it has its carrier.
@@ -105,11 +133,7 @@ pub(super) fn link_message(
     name.push(0);
     attribute(&mut body, IFLA_IFNAME, &name);
     attribute(&mut body, super::IFLA_TXQLEN, &u32_of(1000));
-    let operstate = if v.up && v.oper_up {
-        IF_OPER_UP
-    } else {
-        IF_OPER_DOWN
-    };
+    let operstate = operstate(network, v);
     attribute(&mut body, super::IFLA_OPERSTATE, &[operstate]);
     attribute(&mut body, super::IFLA_LINKMODE, &[0]);
     attribute(&mut body, super::IFLA_NETNS_IMMUTABLE, &[0]);
@@ -333,8 +357,9 @@ fn supported(tb: &BTreeMap<u16, &[u8]>) -> bool {
 /// without `NLM_F_CREATE`; `EOPNOTSUPP` for `IFLA_MAP`, `IFLA_PROTINFO`,
 /// and here for an attribute but a name, an address and an MTU.
 ///
-/// The peer is made first, in its namespace, of the peer's name (or
-/// `veth%d`), address (or a random one), MTU (1500) and, when the request
+/// The peer is made first, in its namespace (the requester's without
+/// one), of the peer's name (or `veth%d`), address (or a random one, as
+/// without `VETH_INFO_PEER`), MTU (1500) and, when the request
 /// asks the first end an index, the peer's index; then the first end, of
 /// the request's, in the target; each told of with `RTM_NEWLINK` in its
 /// namespace, the peer's before it has its peer, so with `IFLA_LINK` 0.
@@ -409,7 +434,9 @@ pub(super) fn newlink(
     if !supported(&tb) || !supported(&peer_tb) {
         return Err(super::EOPNOTSUPP);
     }
-    let peer_net = peer_net.unwrap_or_else(|| Arc::clone(&target));
+    // `rtnl_newlink_peer_net`: the peer's own namespace, else the
+    // requester's (`link_net`, `IFLA_LINK_NETNSID`, is not taken).
+    let peer_net = peer_net.unwrap_or_else(|| Arc::clone(own));
     // The peer first (`veth_newlink`).
     let peer_name = match (peer_info, peer_tb.get(&IFLA_IFNAME)) {
         (Some(_), Some(name)) => name.to_vec(),
@@ -419,13 +446,19 @@ pub(super) fn newlink(
         Some(peer) if index != 0 => i32::from_le_bytes(peer[4..8].try_into().unwrap_or_default()),
         _ => 0,
     };
-    let device_of = |tb: &BTreeMap<u16, &[u8]>, network: &Network, name: &[u8], asked: i32| {
+    // Each end's address is its own attributes', else random: the peer
+    // takes none of the request's (`if (!ifmp || !tbp[IFLA_ADDRESS])`).
+    let device_of = |tb: &BTreeMap<u16, &[u8]>,
+                     own_address: bool,
+                     network: &Network,
+                     name: &[u8],
+                     asked: i32| {
         let devices = network.devices();
         let name = devices.name_for(name)?;
         let index = devices.index_for(asked)?;
-        let mac = match (peer_info, tb.get(&IFLA_ADDRESS)) {
-            (_, Some(mac)) => <[u8; 6]>::try_from(*mac).unwrap_or_else(|_| random_mac()),
-            _ => random_mac(),
+        let mac = match tb.get(&IFLA_ADDRESS).filter(|_| own_address) {
+            Some(mac) => <[u8; 6]>::try_from(*mac).unwrap_or_else(|_| random_mac()),
+            None => random_mac(),
         };
         let mtu = tb
             .get(&IFLA_MTU)
@@ -438,14 +471,20 @@ pub(super) fn newlink(
             (devices.default4, devices.default6),
         ))
     };
-    let peer = device_of(&peer_tb, &peer_net, &peer_name, peer_asked)?;
+    let peer = device_of(
+        &peer_tb,
+        peer_info.is_some(),
+        &peer_net,
+        &peer_name,
+        peer_asked,
+    )?;
     let peer_index = peer.index;
     peer_net.devices().add(peer, peer_asked > 0);
     let list = told(&peer_net, peer_index, RTM_NEWLINK, u32::MAX, false);
     tell(own, &peer_net, notices, list);
     // Then the first end.
     let first_name = name.map_or_else(|| b"veth%d".to_vec(), <[u8]>::to_vec);
-    let first = match device_of(&tb, &target, &first_name, index) {
+    let first = match device_of(&tb, true, &target, &first_name, index) {
         Ok(first) => first,
         Err(e) => {
             let gone = peer_net.devices().remove(peer_index);
@@ -519,6 +558,18 @@ pub(crate) fn set_up(
     up: bool,
     notices: &mut Vec<Notice>,
 ) {
+    switch(own, network, index, up, IFF_UP, notices);
+}
+/// [`set_up`], telling of the end itself with `told_change`: `IFF_UP`
+/// for `dev_change_flags`, [`CLOSED`] for the `netif_close` of a move.
+fn switch(
+    own: &Arc<Network>,
+    network: &Arc<Network>,
+    index: i32,
+    up: bool,
+    told_change: u32,
+    notices: &mut Vec<Notice>,
+) {
     let was = network
         .devices()
         .by_index(index)
@@ -585,7 +636,7 @@ pub(crate) fn set_up(
         if let Some((n, i)) = &peer {
             change(n, *i, |v| carrier(v, false));
         }
-        let list = told(network, index, RTM_NEWLINK, IFF_UP, false);
+        let list = told(network, index, RTM_NEWLINK, told_change, false);
         tell(own, network, notices, list);
         if peer_was_running && let Some((n, i)) = &peer {
             let list = told(n, *i, RTM_NEWLINK, 0, false);
@@ -593,30 +644,34 @@ pub(crate) fn set_up(
         }
     }
 }
-/// Takes `network`'s device `device` away (`unregister_netdevice_many`):
-/// closed first if up, told of with `IFF_UP` and `IFF_RUNNING` changed
-/// (`dev_close_many`), then with `RTM_DELLINK`.
+/// Takes the devices of `gone`, each out of its namespace, away as
+/// `unregister_netdevice_many_notify` does: each up is closed first, told
+/// of with `IFF_UP` and `IFF_RUNNING` changed (`netif_close_many`), and
+/// only then is each told of with `RTM_DELLINK`, in their order.
 fn unregister(
     own: &Arc<Network>,
-    network: &Arc<Network>,
-    mut device: Device,
+    mut gone: Vec<(Arc<Network>, Device)>,
     notices: &mut Vec<Notice>,
 ) {
-    let mut list = Vec::new();
-    if let Some(v) = device.veth.as_mut() {
-        v.peer = None;
-        if v.up {
-            v.up = false;
-            v.oper_up = false;
-            if v.carrier {
-                v.carrier = false;
-                v.carrier_down += 1;
+    for (network, device) in &mut gone {
+        if let Some(v) = device.veth.as_mut() {
+            v.peer = None;
+            if v.up {
+                v.up = false;
+                v.oper_up = false;
+                if v.carrier {
+                    v.carrier = false;
+                    v.carrier_down += 1;
+                }
+                let list = told_of(network, device, RTM_NEWLINK, CLOSED, false);
+                tell(own, network, notices, list);
             }
-            list.extend(told_of(network, &device, RTM_NEWLINK, CLOSED, false));
         }
     }
-    list.extend(told_of(network, &device, RTM_DELLINK, u32::MAX, true));
-    tell(own, network, notices, list);
+    for (network, device) in &gone {
+        let list = told_of(network, device, RTM_DELLINK, u32::MAX, true);
+        tell(own, network, notices, list);
+    }
 }
 /// `RTM_DELLINK` of `network`'s veth end `index` (`veth_dellink`): it
 /// goes, and its peer with it, each told of in its namespace.
@@ -627,31 +682,110 @@ pub(super) fn delete(
     notices: &mut Vec<Notice>,
 ) {
     let peer = peer_of(network, index);
-    // `veth_dellink` forgets the peers first.
-    let first = network.devices().remove(index);
-    let second = peer.as_ref().and_then(|(n, i)| n.devices().remove(*i));
-    if let Some(first) = first {
-        unregister(own, network, first, notices);
+    // `veth_dellink` forgets the peers first, and queues the end, then
+    // its peer.
+    let mut gone = Vec::new();
+    if let Some(first) = network.devices().remove(index) {
+        gone.push((Arc::clone(network), first));
     }
-    if let (Some((n, _)), Some(second)) = (&peer, second) {
-        unregister(own, n, second, notices);
+    if let Some((n, i)) = peer {
+        let second = n.devices().remove(i);
+        if let Some(second) = second {
+            gone.push((n, second));
+        }
+    }
+    unregister(own, gone, notices);
+}
+/// The peers, each `index` of its namespace, of the veth ends of a
+/// namespace that goes (`default_device_exit_batch`, one
+/// `unregister_netdevice_many` for them all): they go too, each told of
+/// there.
+pub(crate) fn peers_gone(peers: Vec<(Arc<Network>, i32)>) {
+    let gone: Vec<(Arc<Network>, Device)> = peers
+        .into_iter()
+        .filter_map(|(network, index)| {
+            let device = network.devices().remove(index)?;
+            Some((network, device))
+        })
+        .collect();
+    let Some(own) = gone.first().map(|(network, _)| Arc::clone(network)) else {
+        return;
+    };
+    let mut notices = Vec::new();
+    unregister(&own, gone, &mut notices);
+    // Those of `own` have no `to`; give them it, for one list.
+    let notices = notices
+        .into_iter()
+        .map(|notice| Notice {
+            to: Some(notice.to.unwrap_or_else(|| Arc::clone(&own))),
+            ..notice
+        })
+        .collect::<Vec<_>>();
+    let mut run: Vec<Notice> = Vec::new();
+    for notice in notices {
+        if let Some(last) = run.last()
+            && !same_place(last, &notice)
+        {
+            send_going(core::mem::take(&mut run));
+        }
+        run.push(notice);
+    }
+    send_going(run);
+}
+/// Whether two notices go to one namespace.
+fn same_place(a: &Notice, b: &Notice) -> bool {
+    match (&a.to, &b.to) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
     }
 }
-/// The peer `index` of `network`, whose own namespace is going
-/// (`default_device_exit_batch`): it goes too, told of there.
-pub(crate) fn peer_gone(network: &Arc<Network>, index: i32) {
-    let gone = network.devices().remove(index);
-    if let Some(gone) = gone {
-        let mut notices = Vec::new();
-        unregister(network, network, gone, &mut notices);
-        super::notify(network, notices, None);
+/// [`super::notify_going`] of a run of notices for one namespace.
+fn send_going(mut run: Vec<Notice>) {
+    let Some(to) = run.first_mut().and_then(|n| n.to.clone()) else {
+        return;
+    };
+    for notice in &mut run {
+        notice.to = None;
     }
+    super::notify_going(&to, run);
+}
+/// A move's `RTM_DELLINK` (`rtmsg_ifinfo_newnet`), with `IFLA_NEW_NETNSID`
+/// and `IFLA_NEW_IFINDEX` after `IFLA_LINKINFO`, as `rtnl_fill_ifinfo`
+/// puts them.
+fn with_new_netns(mut message: Vec<u8>, nsid: i32, new_index: i32) -> Vec<u8> {
+    let mut at = 16 + 16;
+    while at + 4 <= message.len() {
+        let len = usize::from(u16::from_le_bytes([message[at], message[at + 1]]));
+        let kind = u16::from_le_bytes([message[at + 2], message[at + 3]]) & 0x3fff;
+        if len < 4 {
+            break;
+        }
+        at += len.next_multiple_of(4);
+        if kind == IFLA_LINKINFO {
+            let mut added = Vec::new();
+            attribute(&mut added, IFLA_NEW_NETNSID, &nsid.to_le_bytes());
+            attribute(
+                &mut added,
+                super::IFLA_NEW_IFINDEX,
+                &new_index.to_le_bytes(),
+            );
+            let at = at.min(message.len());
+            message.splice(at..at, added);
+            let total = u32::try_from(message.len()).unwrap_or(u32::MAX);
+            message[..4].copy_from_slice(&total.to_le_bytes());
+            break;
+        }
+    }
+    message
 }
 /// Moves `network`'s veth end `index` to `to` (`__dev_change_net_namespace`):
-/// `EEXIST` where `to` has a device of its name; down first, it is told
-/// of with `RTM_DELLINK` where it was, then keeps its index in `to`, or
-/// takes the next free, loses its queueing discipline and is told of with
-/// `RTM_NEWLINK` there; its peer names it there.
+/// `EEXIST` where `to` has a device of its name. It keeps its index in
+/// `to`, or takes the next free (`dev_index_reserve`); closed first if up
+/// (`netif_close`, told of with `IFF_UP` and `IFF_RUNNING` changed), it
+/// gives `to` an ID where it is (`peernet2id_alloc`), is told of there
+/// with `RTM_DELLINK`, carrying that ID and its new index, loses its
+/// queueing discipline and is told of with `RTM_NEWLINK` in `to`; its
+/// peer names it there.
 pub(super) fn move_to(
     own: &Arc<Network>,
     network: &Arc<Network>,
@@ -665,13 +799,6 @@ pub(super) fn move_to(
     if to.devices().by_name(&device.name).is_some() {
         return Err(Errno::EEXIST);
     }
-    set_up(own, network, index, false, notices);
-    let Some(mut device) = network.devices().by_index(index).cloned() else {
-        return Err(super::ENODEV);
-    };
-    let list = told_of(network, &device, RTM_DELLINK, u32::MAX, true);
-    tell(own, network, notices, list);
-    network.devices().remove(index);
     let new_index = {
         let devices = to.devices();
         if devices.by_index(index).is_none() {
@@ -680,6 +807,31 @@ pub(super) fn move_to(
             devices.index_for(0)?
         }
     };
+    switch(own, network, index, false, CLOSED, notices);
+    let Some(mut device) = network.devices().by_index(index).cloned() else {
+        return Err(super::ENODEV);
+    };
+    let mut list = Vec::new();
+    let nsid = nsid::link_netnsid(network, to, &mut list).unwrap_or(-1);
+    let (message, more) = link_message(
+        network,
+        network,
+        &device,
+        RTM_DELLINK,
+        u32::MAX,
+        (0, 0, 0),
+        0,
+        true,
+    );
+    list.extend(more);
+    list.push(Notice {
+        to: None,
+        group: RTNLGRP_LINK,
+        origin: 0,
+        bytes: with_new_netns(message, nsid, new_index),
+    });
+    tell(own, network, notices, list);
+    network.devices().remove(index);
     device.index = new_index;
     if let Some(v) = device.veth.as_mut() {
         v.opened = false;
@@ -880,14 +1032,15 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!((vb.carrier, vb.carrier_up, vb.carrier_down), (false, 1, 2));
-        // Deleting one end takes both: the one still up closed first.
+        // Deleting one end takes both: every one still up is closed
+        // before either is told gone (`unregister_netdevice_many_notify`).
         let mut notices = Vec::new();
         delete(&network, &network, 1000, &mut notices);
         assert_eq!(
             heard(&notices),
             [
-                (RTM_DELLINK, 1000, down, all),
                 (RTM_NEWLINK, 1001, down, CLOSED),
+                (RTM_DELLINK, 1000, down, all),
                 (RTM_DELLINK, 1001, down, all),
             ]
         );
@@ -934,5 +1087,94 @@ mod tests {
         assert_eq!(found[&IFLA_LINK], 1001u32.to_le_bytes());
         drop(b);
         assert!(a.devices().by_index(1000).is_none());
+    }
+
+    #[test]
+    fn a_namespace_that_goes_while_a_request_is_taken_tells_after_it() {
+        let a = Arc::new(Network::isolated(crate::users::first()));
+        let b = Arc::new(Network::isolated(crate::users::first()));
+        let (made, _) = create(&a, &pair(b"va", 1000, b"vb", 1001, &[]));
+        assert_eq!(made, Ok(Some(())));
+        move_to(&a, &a, 1001, &b, &mut Vec::new()).unwrap();
+        // B goes within the request: A's peer end stays until it ends,
+        // and what B's going tells A is kept for after it.
+        let kept = super::super::deferring(|| drop(b));
+        assert!(a.devices().by_index(1000).is_none());
+        assert_eq!(
+            heard(&kept),
+            [(RTM_DELLINK, 1000, IFF_BROADCAST | IFF_MULTICAST, u32::MAX)]
+        );
+        assert!(
+            kept.iter()
+                .all(|n| n.to.as_ref().is_some_and(|to| Arc::ptr_eq(to, &a)))
+        );
+    }
+
+    #[test]
+    fn a_peer_without_its_own_attributes_is_the_requesters_and_random() {
+        let a = Arc::new(Network::isolated(crate::users::first()));
+        // No `VETH_INFO_PEER`: the peer takes the request's MTU, but
+        // neither its name nor its address.
+        let mut payload = vec![0; 16];
+        attribute(&mut payload, IFLA_IFNAME, b"va\0");
+        attribute(&mut payload, IFLA_ADDRESS, &[2, 0, 0, 0, 0, 0x0a]);
+        attribute(&mut payload, IFLA_MTU, &1400u32.to_le_bytes());
+        let mut info = Vec::new();
+        attribute(&mut info, IFLA_INFO_KIND, b"veth\0");
+        attribute(&mut payload, IFLA_LINKINFO, &info);
+        let (made, _) = create(&a, &payload);
+        assert_eq!(made, Ok(Some(())));
+        let devices = a.devices();
+        let peer = devices
+            .iter()
+            .find(|d| d.name.starts_with(b"veth"))
+            .cloned()
+            .unwrap();
+        let v = peer.veth.unwrap();
+        assert_ne!(v.mac, [2, 0, 0, 0, 0, 0x0a]);
+        assert_eq!(v.mtu, 1400);
+    }
+
+    #[test]
+    fn a_move_closes_the_end_and_tells_where_it_went() {
+        let a = Arc::new(Network::isolated(crate::users::first()));
+        let b = Arc::new(Network::isolated(crate::users::first()));
+        let (made, _) = create(&a, &pair(b"va", 1000, b"vb", 1001, &[]));
+        assert_eq!(made, Ok(Some(())));
+        set_up(&a, &a, 1001, true, &mut Vec::new());
+        let mut notices = Vec::new();
+        move_to(&a, &a, 1001, &b, &mut notices).unwrap();
+        let down = IFF_BROADCAST | IFF_MULTICAST;
+        // Closed as `netif_close` tells it, A's ID for B first, gone from
+        // A with where it went, then in B.
+        assert_eq!(
+            heard(&notices),
+            [
+                (RTM_NEWLINK, 1001, down, CLOSED),
+                (RTM_DELLINK, 1001, down, u32::MAX),
+                (RTM_NEWLINK, 1001, down, u32::MAX),
+            ]
+        );
+        let first_nsid = notices
+            .iter()
+            .position(|n| n.group != RTNLGRP_LINK)
+            .unwrap();
+        let gone = notices
+            .iter()
+            .position(|n| n.group == RTNLGRP_LINK && n.bytes[4] == RTM_DELLINK as u8)
+            .unwrap();
+        assert!(first_nsid < gone);
+        let kinds = super::super::attribute_kinds(&notices[gone].bytes[32..]);
+        let at = |kind: u16| kinds.iter().position(|&k| k == kind).unwrap();
+        assert_eq!(at(IFLA_NEW_NETNSID), at(IFLA_LINKINFO) + 1);
+        assert_eq!(at(super::super::IFLA_NEW_IFINDEX), at(IFLA_NEW_NETNSID) + 1);
+        assert!(
+            notices
+                .last()
+                .unwrap()
+                .to
+                .as_ref()
+                .is_some_and(|to| Arc::ptr_eq(to, &b))
+        );
     }
 }

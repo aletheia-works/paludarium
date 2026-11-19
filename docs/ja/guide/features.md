@@ -1876,29 +1876,39 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     何もなければ `EINVAL` です。
   - **veth の組:** 種類が `veth` の `RTM_NEWLINK`（`IFLA_LINKINFO`）は、`rtnl_newlink` と
     `veth_newlink` と同じく組を作ります。まず `VETH_INFO_PEER` の名前、アドレス、MTU、
-    名前空間（`IFLA_NET_NS_PID` か `IFLA_NET_NS_FD`）で相手を、次に要求のもので最初の端を
-    作ります。名前がなければ `veth%d`、アドレスがなければ乱数のアドレスで、要求が指す
-    インデックスを取ります（相手のインデックスは、最初の端のものを指したときだけです）。
+    名前空間（`IFLA_NET_NS_PID` か `IFLA_NET_NS_FD`。なければ要求した名前空間）で相手を、
+    次に要求のもので最初の端を作ります。名前がなければ `veth%d`、アドレスがなければ乱数の
+    アドレスで、要求が指すインデックスを取ります（相手のインデックスは、最初の端のものを
+    指したときだけです）。`VETH_INFO_PEER` がなければ、相手は要求の MTU と名前空間を取り、
+    名前とアドレスは自分のものになります。
     調べる順は Linux と同じです。6 バイトでないアドレスか 68 から 65535 の外の MTU
     （`EINVAL`）、マルチキャストのアドレス（`EADDRNOTAVAIL`）、使われている名前か
     インデックス（`EEXIST`、`EBUSY`）、要求が指すリンクがすでにあるとき（`NLM_F_EXCL`
     なら `EEXIST`）です。どちらの端も Ethernet のデバイスで、それぞれの名前空間に
     `RTM_NEWLINK` で伝えます。両端が上がっている間はキャリアを持ち（`IFF_LOWER_UP`、
-    それから `IFF_RUNNING` と動作状態の up）、それぞれがそれを伝えます。リンクの
+    それから `IFF_RUNNING` と動作状態の up）、それぞれがそれを伝えます（上がっていて
+    キャリアのない端は、`default_operstate` と同じく、自分の名前空間で相手のインデックスの
+    デバイスが up でなければ lower layer down です）。リンクの
     メッセージには種類、相手（`IFLA_LINK`）と、相手が別の名前空間にあればその名前空間の
     ID（`IFLA_LINK_NETNSID`。伝える名前空間がまず `RTM_NEWNSID` でその ID を与えます）が
-    入ります。`RTM_SETLINK` か `RTM_NEWLINK` は端を上げ下げし、別の名前空間へ移します
-    （移る前の名前空間には `RTM_DELLINK`、移った先には `RTM_NEWLINK` で伝えます）。
-    `SIOCGIFFLAGS`、`SIOCSIFFLAGS`、`SIOCGIFINDEX`、`SIOCGIFNAME` も同じです。どちらかの
-    端の `RTM_DELLINK` は両端を消し、どちらかの名前空間がなくなるときも両端が消えます。
+    入ります。`RTM_SETLINK` か `RTM_NEWLINK` は、`SIOCSIFFLAGS` と同じく端を上げ下げし
+    （`SIOCGIFFLAGS`、`SIOCGIFINDEX`、`SIOCGIFNAME` もあります）、
+    `__dev_change_net_namespace` と同じく別の名前空間へ移します。上がっていればまず閉じ
+    （`IFF_UP` と `IFF_RUNNING` が変わったと伝えます）、移る前の名前空間に `RTM_DELLINK`
+    で伝えます。その名前空間は移る先に ID を与え、その ID と移った先のインデックス
+    （`IFLA_NEW_NETNSID`、`IFLA_NEW_IFINDEX`）を付けます。それから移った先に
+    `RTM_NEWLINK` で伝えます。インデックスは、移る先で使われていなければそのままです。
+    どちらかの端の `RTM_DELLINK` は両端を消し、どちらかの名前空間がなくなるときも
+    （その `RTM_DELNSID` の後で）両端が消えます。`unregister_netdevice_many_notify` と
+    同じく、上がっている端をすべて閉じてから、それぞれが消えたことを伝えます。
   - **名前空間の ID:** Linux の `net_namespace.c` と同じく、`RTM_NEWNSID` は、
     プロセス（`NETNSA_PID`、なければ `ESRCH`）か `/proc/<pid>/ns/net` の記述子
     （`NETNSA_FD`、`EBADF`、ほかのファイルなら `EINVAL`）のネットワーク名前空間に
     ID `NETNSA_NSID` を、負の値なら空いている一番小さい ID を与えます。どちらもなければ
     `EINVAL`、すでに ID がある名前空間や使われている ID は `EEXIST` で、それぞれ Linux の
     拡張 ACK のメッセージを付けます。相手が別の名前空間にある veth の端を伝えるときも、
-    `peernet2id_alloc` と同じく、その名前空間に空いている一番小さい ID を与えます（上の
-    veth の組）。`RTNLGRP_NSID` のメンバーは新しい ID を知らされます
+    `peernet2id_alloc` と同じく、その名前空間に空いている一番小さい ID を与えます。そこへ
+    veth の端を移すときも同じです（上の veth の組）。`RTNLGRP_NSID` のメンバーは新しい ID を知らされます
     （`NLM_F_ECHO` なら、そのうちリクエストした側だけが受け取ります）。名前空間が
     なくなって ID が消えるときも、`unhash_nsid` と同じく `RTM_DELNSID` で知らされます。
     なくなるのは、それを持つプロセス、記述子、ソケットがなくなったときで、その ID は

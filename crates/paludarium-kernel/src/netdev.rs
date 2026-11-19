@@ -288,16 +288,16 @@ impl Devices {
 impl Drop for Devices {
     /// The namespace goes (`default_device_exit_batch`): each veth end goes
     /// with its peer in another namespace, which is told of there
-    /// ([`crate::netlink::peer_gone`]).
+    /// ([`crate::netlink::peers_gone`]).
     fn drop(&mut self) {
-        for device in std::mem::take(&mut self.list) {
-            let Some(peer) = device.veth.and_then(|v| v.peer) else {
-                continue;
-            };
-            if let Some(network) = peer.network.upgrade() {
-                crate::netlink::peer_gone(&network, peer.index);
-            }
-        }
+        let peers = std::mem::take(&mut self.list)
+            .into_iter()
+            .filter_map(|device| {
+                let peer = device.veth?.peer?;
+                Some((peer.network.upgrade()?, peer.index))
+            })
+            .collect();
+        crate::netlink::peers_gone(peers);
     }
 }
 

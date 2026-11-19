@@ -138,6 +138,8 @@ static void show_attribute(unsigned short type, const unsigned char *v, int len)
     case 33: printf(" carrier=%u", v[0]); break;
     case 35: printf(" carrier-changes=%u", value); break;
     case 37: printf(" link-netnsid=%d", (int)value); break;
+    case 45: printf(" new-netnsid=%d", (int)value); break;
+    case 49: printf(" new-ifindex=%d", (int)value); break;
     case 18:
         for (int at = 0; at + 4 <= len;) {
             unsigned short alen, kind;
@@ -392,13 +394,17 @@ int main(int argc, char **argv) {
     dump(ctl, "dump deleted");
     ioctls(ctl, "va", A_INDEX);
     B_DOES("p");
-    /* A pair within A, then its end vd moved to B (IFLA_NET_NS_PID of a
-       link there is), and deleted from A. */
+    /* A pair within A (its peer of no namespace is the requester's), then
+       its end vd, up, moved to B (IFLA_NET_NS_PID of a link there is):
+       closed first, and gone from A with its new ID and index. vc stays
+       down, so neither has a carrier to lose. Then deleted from A. */
     m = (struct body){0};
     veth(&m, "vc", A_INDEX + 2, "vd", A_INDEX + 3, 0, NULL, 0);
     request(ctl, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &m, "make within");
     heard(mon, "heard", 300, 300);
     dump(ctl, "dump within");
+    set_up(ctl, A_INDEX + 3, 1, "up vd");
+    heard(mon, "heard", 300, 300);
     m = (struct body){0};
     info(&m, A_INDEX + 3, 0, 0);
     put32(&m, IFLA_NET_NS_PID, (unsigned)b);
@@ -411,6 +417,20 @@ int main(int argc, char **argv) {
     request(ctl, RTM_DELLINK, 0, &m, "delete vc");
     heard(mon, "heard", 300, 300);
     B_DOES("p");
+    /* A pair within A with vd up, deleted by vc: every end up is closed
+       before either is told gone. */
+    m = (struct body){0};
+    veth(&m, "vc", A_INDEX + 2, "vd", A_INDEX + 3, 0, NULL, 0);
+    request(ctl, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, &m, "make within again");
+    /* Linux's link watch finds each end's operational state (vd's lower
+       layer down once up, as vc is down) as it runs after the make. */
+    heard(mon, "heard", 300, 300);
+    set_up(ctl, A_INDEX + 3, 1, "up vd again");
+    heard(mon, "heard", 300, 300);
+    m = (struct body){0};
+    info(&m, A_INDEX + 2, 0, 0);
+    request(ctl, RTM_DELLINK, 0, &m, "delete vc within");
+    heard(mon, "heard", 300, 300);
     /* Made again, and taken when B's namespace goes. */
     m = (struct body){0};
     veth(&m, "va", A_INDEX, "vb", B_INDEX, b, NULL, 0);

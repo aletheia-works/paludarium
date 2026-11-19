@@ -819,7 +819,7 @@ verified.
   only `IFF_UP` and its namespace. A veth end's address without one asked
   comes from a sequence of the emulator's own, not the kernel's random
   numbers; its link watch comes at once, where Linux's may come a second
-  later; it has one queue each way, where Linux's has one for each
+  later, and so its operational state is found as it is told of; it has one queue each way, where Linux's has one for each
   possible CPU, no `IFLA_AF_SPEC`, and statistics of zero. The interface
   requests and netlink change no other flag than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`,
@@ -938,8 +938,8 @@ verified.
   where Linux's count every namespace's; its own parameters' references
   are 1.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
-  ID is given by `RTM_NEWNSID` and by telling of a veth end whose peer is
-  in another namespace: Linux's `peernet2id_alloc` gives one on its own
+  ID is given by `RTM_NEWNSID`, by telling of a veth end whose peer is in
+  another namespace and by moving a veth end there: Linux's `peernet2id_alloc` gives one on its own
   for a queue lease, a devlink instance, a PSP device, an ovpn peer and
   an openvswitch vport too, none of which is here; the `RTM_DELNSID` of a
   namespace that goes is sent as its last holder lets it go, where

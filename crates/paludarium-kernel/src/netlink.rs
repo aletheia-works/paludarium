@@ -56,7 +56,7 @@ mod generic;
 mod inet_diag;
 mod nsid;
 mod veth;
-pub(crate) use veth::{ioctl_flags as veth_ioctl_flags, peer_gone, set_up as veth_set_up};
+pub(crate) use veth::{ioctl_flags as veth_ioctl_flags, peers_gone, set_up as veth_set_up};
 
 const AF_NETLINK: u16 = 16;
 const NETLINK_ROUTE: u32 = 0;
@@ -768,6 +768,21 @@ impl NetlinkSocket {
     fn deliver_from_peer(&self, s: &mut State, group: u32, bytes: Vec<u8>, nsid: i32) {
         self.offer(s, (0, group, bytes), true, Some(nsid));
     }
+    /// Gives this socket, a member of their groups, the notifications
+    /// filling an answer told, before the answer, as Linux's
+    /// `rtnl_notify` from within the fill does (an `RTM_NEWNSID` of
+    /// `peernet2id_alloc`), and leaves them for the others alone.
+    fn heard_now(&self, s: &mut State, port: u32, mut told: Vec<Notice>) -> Vec<Notice> {
+        for notice in &mut told {
+            if notice.to.is_none() && notice.origin != port {
+                if s.groups & (1u64 << (notice.group - 1)) != 0 {
+                    self.deliver(s, 0, notice.group, notice.bytes.clone());
+                }
+                notice.origin = port;
+            }
+        }
+        told
+    }
     /// Queues a part of a dump, as `netlink_dump` does without looking at
     /// congestion: one that finds the receive buffer full is dropped, with
     /// `ENOBUFS` for the next receive.
@@ -969,9 +984,10 @@ impl NetlinkSocket {
             return Ok(bytes.len());
         }
         let mut notices = Vec::new();
-        self.take(&mut s, bytes, port, sender, &mut notices);
+        let deferred = deferring(|| self.take(&mut s, bytes, port, sender, &mut notices));
         let unicasts = core::mem::take(&mut s.unicasts);
         drop(s);
+        notices.extend(deferred);
         for (socket, bytes) in unicasts {
             let mut t = socket.lock();
             socket.deliver(&mut t, 0, 0, bytes);
@@ -1026,11 +1042,21 @@ impl NetlinkSocket {
                 // This socket hears of what it changed as it happens, before
                 // its acknowledgement; the others once it is unlocked.
                 for notice in &told {
-                    if notice.to.is_none()
-                        && s.groups & (1u64 << (notice.group - 1)) != 0
-                        && port != notice.origin
-                    {
-                        self.deliver(s, 0, notice.group, notice.bytes.clone());
+                    if s.groups & (1u64 << (notice.group - 1)) == 0 || port == notice.origin {
+                        continue;
+                    }
+                    match &notice.to {
+                        None => self.deliver(s, 0, notice.group, notice.bytes.clone()),
+                        // Another namespace's, as `do_one_broadcast` gives
+                        // it a socket with `NETLINK_LISTEN_ALL_NSID` here.
+                        Some(other) => {
+                            if let Some(id) = self.network.netlink.ids.id_of(other)
+                                && s.listen_all_nsid
+                                && self.opener.capable_in(CAP_NET_BROADCAST, other.owner())
+                            {
+                                self.deliver_from_peer(s, notice.group, notice.bytes.clone(), id);
+                            }
+                        }
                     }
                 }
                 notices.extend(told);
@@ -1084,6 +1110,7 @@ impl NetlinkSocket {
             // carries the flags (`answer_flags`) the checks set by then.
             let strict = s.strict;
             let mut answer = 0;
+            let before = notices.len();
             let (seq, network) = (header.seq, &*self.network);
             let target = |id| nsid::target(&self.network, &self.opener, id);
             let dump = match (header.kind, family) {
@@ -1185,6 +1212,8 @@ impl NetlinkSocket {
                 || (header.kind == RTM_GETNEIGH && family != AF_MCTP);
             let first = messages.is_empty() || joined;
             let done = done_message(s, header, payload, port, answer, error, first);
+            let told = notices.split_off(before);
+            notices.extend(self.heard_now(s, port, told));
             self.start_dump_as(s, messages, done, joined);
             return Ok(true);
         }
@@ -1324,7 +1353,7 @@ impl NetlinkSocket {
                         mask,
                         false,
                     );
-                    notices.extend(told);
+                    notices.extend(self.heard_now(s, port, told));
                     link
                 } else {
                     link_message(network, header.seq, port, 0, mask)
@@ -5603,15 +5632,50 @@ pub(crate) fn set_ipv6(network: &Network, on: bool, now: u64) {
     }
     notify(network, notices, None);
 }
+thread_local! {
+    /// What a namespace going while a request is taken tells, kept until
+    /// the requester's socket is unlocked ([`deferring`]).
+    static DEFERRED: core::cell::RefCell<Option<Vec<Notice>>> =
+        const { core::cell::RefCell::new(None) };
+}
+/// Runs `take` with what a namespace that goes meanwhile tells
+/// ([`notify_going`]) kept, and gives it: the last process of a peer's
+/// namespace may leave as a request holds it, and its `RTM_DELNSID` and
+/// veth peer's `RTM_DELLINK` must not reach the locked requester.
+fn deferring(take: impl FnOnce()) -> Vec<Notice> {
+    let outer = DEFERRED.with(|d| d.borrow_mut().replace(Vec::new()));
+    take();
+    DEFERRED
+        .with(|d| core::mem::replace(&mut *d.borrow_mut(), outer))
+        .unwrap_or_default()
+}
+/// Tells `network`'s members of what a namespace that goes takes from it
+/// (`unhash_nsid`, `default_device_exit_batch`): at once, or once the
+/// request being taken has unlocked its socket ([`deferring`]).
+pub(crate) fn notify_going(network: &Arc<Network>, notices: Vec<Notice>) {
+    let notices = DEFERRED.with(|d| match d.borrow_mut().as_mut() {
+        Some(kept) => {
+            kept.extend(notices.into_iter().map(|notice| Notice {
+                to: Some(Arc::clone(network)),
+                ..notice
+            }));
+            None
+        }
+        None => Some(notices),
+    });
+    if let Some(notices) = notices {
+        notify(network, notices, None);
+    }
+}
 /// Sends `notices` to `network`'s members of their groups, from no socket
 /// (an interface ioctl's change).
 pub(crate) fn notify_link(network: &Network, notices: Vec<Notice>) {
     broadcast(network, notices, None);
 }
 /// Sends `notices` in their order, each run to its namespace: `network`'s
-/// (but `except`, which has had them already) for those without a `to`,
-/// and `to`'s for the others, which `except` hears as any socket there
-/// does, as it is unlocked by now.
+/// for those without a `to`, and `to`'s for the others; never to
+/// `except`, the requester, which has heard them in their order before
+/// its acknowledgement, as Linux's are sent as they happen.
 fn broadcast(network: &Network, notices: Vec<Notice>, except: Option<&NetlinkSocket>) {
     let mut run: Vec<Notice> = Vec::new();
     let mut to: Option<Arc<Network>> = None;
@@ -5622,7 +5686,7 @@ fn broadcast(network: &Network, notices: Vec<Notice>, except: Option<&NetlinkSoc
     };
     let send = |to: Option<Arc<Network>>, run: Vec<Notice>| match to {
         None => notify(network, run, except),
-        Some(other) => notify(&other, run, None),
+        Some(other) => notify(&other, run, except),
     };
     for mut notice in notices {
         let target = notice.to.take();
@@ -5695,6 +5759,9 @@ fn notify(network: &Network, notices: Vec<Notice>, except: Option<&NetlinkSocket
         }
         for (id, listening) in &peers {
             for socket in listening {
+                if except.is_some_and(|except| core::ptr::eq(except, Arc::as_ptr(socket))) {
+                    continue;
+                }
                 let mut s = socket.lock();
                 if s.listen_all_nsid && s.groups & bit != 0 && s.port.unwrap_or(0) != notice.origin
                 {

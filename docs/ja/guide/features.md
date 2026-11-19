@@ -920,7 +920,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `UFFD_FEATURE_WP_UNPOPULATED` を伴います）では、書き込み保護されたページへの
   書き込みは、命令のものもシステムコールのものもフォールトせず、`do_wp_page` と
   同じくページの保護を外して進みます。そのため `/proc/<pid>/pagemap` のビット 57 で、
-  `UFFDIO_WRITEPROTECT` から書き込まれたページがわかります。ファイルのプライベートな
+  `UFFDIO_WRITEPROTECT` から書き込まれたページがわかり、`PAGEMAP_SCAN`（後述）で
+  それらを探して保護し直せます。ファイルのプライベートな
   マッピングの `MADV_DONTNEED` は、shmem と同じく、まだ保護されているページに
   マーカーを残します。そこを埋める操作は、anonymous メモリでも shmem でもないので
   `EINVAL` です。`UFFDIO_COPY` と
@@ -2890,6 +2891,29 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   返しません。`lseek` は Linux の `mem_lseek` と同じく、始めか今の位置からどの位置にも
   動かせ、負の位置にもなります。そこからの `read` は `EINVAL` です。終わりからは
   `EINVAL` です。書き込めません（`EINVAL`。読むためだけに開いたディスクリプタでは `EBADF`）。
+  その ioctl の `PAGEMAP_SCAN` は、Linux master の `do_pagemap_scan` と同じく、範囲の
+  ページを種類で探します。
+  - 種類は `PAGE_IS_WPALLOWED`、`WRITTEN`、`FILE`、`PRESENT`、`SWAPPED`（ガード、
+    ポイズン、uffd-wp のマーカー）、`PFNZERO`、`SOFT_DIRTY`、`GUARD` で、エントリーと
+    同じ状態から決まります。
+    - `PAGE_IS_WPALLOWED`：VMA が `UFFD_FEATURE_WP_ASYNC` を持つ `userfaultfd` に
+      書き込み保護で登録されていて、プライベートな匿名メモリでないか、
+      `UFFD_FEATURE_WP_UNPOPULATED` を持ちます。
+    - `PAGE_IS_WRITTEN`：書き込み保護に登録された VMA の中で、書き込み保護されて
+      いないページです。空のページも含みます。
+  - ページは `category_mask`、`category_anyof_mask`、`category_inverted` で選ばれ、
+    `return_mask` の種類で知らされます。同じ種類で接するページは 1 つの領域に
+    まとまります。
+  - スキャンは `vec_len` 個の領域か `max_pages` 個のページで早めに止まります。
+    止まった場所は `walk_end` でわかり、結果は領域の数です。
+  - `PM_SCAN_WP_MATCHING` では、選ばれた書き込まれたページを `UFFDIO_WRITEPROTECT`
+    と同じく保護し直し、保護できない VMA は飛ばします。バッファーがなければ、Linux
+    ならページテーブルがあるところのページをすべて保護します。
+  - `PM_SCAN_CHECK_WPASYNC` では、そうした VMA でスキャンが止まります（`EPERM`）。
+  - 要求は `pagemap_scan_get_args` と同じく確かめます。大きさ、フラグ、種類
+    （`EINVAL`）、ページの区切りから始まること（`EINVAL`）、範囲とバッファーが
+    ユーザー空間にあること（`EFAULT`）、長さがあればバッファーがあること（`EINVAL`）です。
+  - ほかの ioctl は `ENOTTY` で、アドレス空間がなくなったあとのスキャンは `ESRCH` です。
 - `/proc/<pid>/clear_refs`（モード 0200、大きさ 0。スレッドのものも）は、Linux の
   `clear_refs_write` と同じく、書き込みの先頭の多くて 12 バイト（書き込みはこれを返します）を、
   `kstrtoint` が 10 進で読むとおりに数として読みます（前後の空白を除き、符号と改行 1 つまで。

@@ -1450,6 +1450,10 @@ impl PagemapFile {
             owner,
         }
     }
+    /// The address space it was opened on, which `PAGEMAP_SCAN` walks.
+    pub(crate) fn memory(&self) -> &MemoryView {
+        &self.memory
+    }
 }
 impl FileHandle for PagemapFile {
     fn as_any(&self) -> Option<&dyn std::any::Any> {

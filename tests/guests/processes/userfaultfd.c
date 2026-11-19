@@ -36,7 +36,15 @@
    registration, and the unmaps it gives; MADV_DONTNEED's remove; the
    unmaps of munmap and a MAP_FIXED mmap; a context without the features,
    which is told nothing; and the fills that are EAGAIN while an unmap
-   waits for its event to be read.
+   waits for its event to be read; and PAGEMAP_SCAN, the ioctl of
+   /proc/self/pagemap: its errors, the categories of present, zero, file,
+   shared, guard and empty pages, the regions it joins, a buffer or a page
+   limit that stops it short, inverted and any-of masks, and with
+   WP_ASYNC the written pages it finds and write-protects, the fast path
+   without a buffer, and the VMAs it may not protect. It asks only for
+   categories on which Linux 7.0 and master agree: WRITTEN only in VMAs
+   registered for write protection whose pages all have entries or
+   markers.
 
    Addresses are printed as offsets from the mapping, and thread IDs as
    whether they are the faulting thread's. Of what UFFDIO_API and
@@ -1450,6 +1458,201 @@ static int case_wp_async(void) {
     return 0;
 }
 
+#define PAGEMAP_SCAN 0xc0606610
+#define PAGE_IS_WPALLOWED (1 << 0)
+#define PAGE_IS_WRITTEN (1 << 1)
+#define PAGE_IS_FILE (1 << 2)
+#define PAGE_IS_PRESENT (1 << 3)
+#define PAGE_IS_SWAPPED (1 << 4)
+#define PAGE_IS_PFNZERO (1 << 5)
+#define PAGE_IS_GUARD (1 << 8)
+#define PM_SCAN_WP_MATCHING 1
+#define PM_SCAN_CHECK_WPASYNC 2
+
+struct page_region {
+    uint64_t start, end, categories;
+};
+
+struct pm_scan_arg {
+    uint64_t size, flags, start, end, walk_end, vec, vec_len, max_pages, category_inverted,
+        category_mask, category_anyof_mask, return_mask;
+};
+
+/* A request over `len` bytes at `at` for `vec_len` regions. */
+static struct pm_scan_arg scan_arg(void *at, size_t len, struct page_region *vec,
+                                   uint64_t vec_len) {
+    struct pm_scan_arg a = {sizeof a, 0, (uintptr_t)at, (uintptr_t)at + len, 0x5a5a,
+                            (uintptr_t)vec, vec_len, 0, 0, 0, 0, 0};
+    return a;
+}
+
+/* PAGEMAP_SCAN of `a` on `pm`: its result, walk_end and the regions, as
+   offsets from `base` in pages; a buffer out of reach is not written. */
+static void scan_show(const char *what, int pm, char *base, struct pm_scan_arg *a) {
+    struct page_region *vec = (struct page_region *)(uintptr_t)a->vec;
+    if (a->vec == (uintptr_t)-4096)
+        vec = NULL;
+    for (uint64_t i = 0; vec && i < a->vec_len; i++)
+        vec[i] = (struct page_region){1, 1, 0x5a5a};
+    long r = ioctl(pm, PAGEMAP_SCAN, a);
+    if (a->walk_end == 0x5a5a)
+        printf("%s: %s walk_end unset", what, err(r));
+    else
+        printf("%s: %s walk_end=%ld", what, err(r), (long)(a->walk_end - (uintptr_t)base) / PAGE);
+    for (long i = 0; vec && i < r; i++)
+        printf(" [%ld,%ld)%#llx", (long)(vec[i].start - (uintptr_t)base) / PAGE,
+               (long)(vec[i].end - (uintptr_t)base) / PAGE, (unsigned long long)vec[i].categories);
+    printf("\n");
+}
+
+static int case_scan(void) {
+    int pm = open("/proc/self/pagemap", O_RDONLY);
+    struct page_region vec[8];
+    const uint64_t kinds =
+        PAGE_IS_PRESENT | PAGE_IS_FILE | PAGE_IS_PFNZERO | PAGE_IS_SWAPPED | PAGE_IS_GUARD;
+    /* Private anonymous memory: written, read, empty and a guard. */
+    char *a = anon(5 * PAGE);
+    a[0] = 'a';
+    a[PAGE] = 'b';
+    volatile char c = a[2 * PAGE];
+    (void)c;
+    printf("guard: %s\n", err(madvise(a + 4 * PAGE, PAGE, MADV_GUARD_INSTALL)));
+
+    struct pm_scan_arg r = scan_arg(a, 5 * PAGE, vec, 8);
+    r.size = 88;
+    scan_show("size", pm, a, &r);
+    r = scan_arg(a, 5 * PAGE, vec, 8);
+    r.flags = 4;
+    scan_show("flags", pm, a, &r);
+    r = scan_arg(a, 5 * PAGE, vec, 8);
+    r.return_mask = 1 << 10;
+    scan_show("category", pm, a, &r);
+    r = scan_arg(a + 1, 5 * PAGE, vec, 8);
+    scan_show("unaligned", pm, a, &r);
+    r = scan_arg(a, 5 * PAGE, NULL, 8);
+    scan_show("no buffer", pm, a, &r);
+    r = scan_arg(a + PAGE, 0, vec, 8);
+    r.end = (uintptr_t)a;
+    scan_show("end before start", pm, a, &r);
+    r = scan_arg(a, 5 * PAGE, (struct page_region *)(uintptr_t)-4096, 8);
+    scan_show("buffer out of reach", pm, a, &r);
+    r = scan_arg(a, 0, vec, 8);
+    scan_show("empty", pm, a, &r);
+    r = scan_arg(a, 5 * PAGE, vec, 0);
+    r.return_mask = kinds;
+    scan_show("no regions", pm, a, &r);
+
+    r = scan_arg(a, 5 * PAGE, vec, 8);
+    r.category_anyof_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED;
+    r.return_mask = kinds;
+    scan_show("kinds", pm, a, &r);
+    r.return_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED;
+    scan_show("joined", pm, a, &r);
+    r.return_mask = kinds;
+    r.end = (uintptr_t)a + 5 * PAGE - 100;
+    scan_show("end within a page", pm, a, &r);
+    r = scan_arg(a, 5 * PAGE, vec, 1);
+    r.category_anyof_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED;
+    r.return_mask = kinds;
+    scan_show("one region", pm, a, &r);
+    r = scan_arg(a, 5 * PAGE, vec, 8);
+    r.category_mask = PAGE_IS_PRESENT;
+    r.return_mask = PAGE_IS_PRESENT;
+    r.max_pages = 1;
+    scan_show("one page", pm, a, &r);
+    r.max_pages = 2;
+    scan_show("two pages", pm, a, &r);
+    r = scan_arg(a, 5 * PAGE, vec, 8);
+    r.category_inverted = PAGE_IS_PRESENT;
+    r.category_mask = PAGE_IS_PRESENT;
+    r.return_mask = kinds;
+    scan_show("not present", pm, a, &r);
+    r = scan_arg(a - PAGE, 7 * PAGE, vec, 8);
+    r.category_mask = PAGE_IS_PFNZERO;
+    r.return_mask = kinds;
+    scan_show("zero", pm, a, &r);
+
+    /* A file's private mapping, read and written, and shared memory. */
+    char path[] = "/tmp/uffd-scan-XXXXXX";
+    int file = mkstemp(path);
+    unlink(path);
+    char bytes[2 * PAGE];
+    memset(bytes, 'f', sizeof bytes);
+    write(file, bytes, sizeof bytes);
+    char *f = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, file, 0);
+    c = f[0];
+    f[PAGE] = 'g';
+    r = scan_arg(f, 2 * PAGE, vec, 8);
+    r.category_mask = PAGE_IS_PRESENT;
+    r.return_mask = kinds;
+    scan_show("private file", pm, f, &r);
+    char *s = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    s[0] = 's';
+    c = s[PAGE];
+    r = scan_arg(s, 2 * PAGE, vec, 8);
+    r.category_mask = PAGE_IS_PRESENT;
+    r.return_mask = kinds;
+    scan_show("shared", pm, s, &r);
+    r.flags = PM_SCAN_WP_MATCHING;
+    scan_show("protect unregistered", pm, s, &r);
+    r.flags = PM_SCAN_CHECK_WPASYNC;
+    scan_show("check unregistered", pm, s, &r);
+
+    /* With WP_ASYNC and WP_UNPOPULATED, every page of the range has an
+       entry or a marker once protected. */
+    int fd = ready(O_NONBLOCK, UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED);
+    if (fd < 0)
+        return 0;
+    char *w = anon(4 * PAGE);
+    w[0] = 'w';
+    printf("register: %s\n", err(reg(fd, w, 4 * PAGE, UFFDIO_REGISTER_MODE_WP, NULL)));
+    printf("protect: %s\n", err(protect(fd, w, 4 * PAGE, UFFDIO_WRITEPROTECT_MODE_WP)));
+    struct pm_scan_arg written = scan_arg(w, 4 * PAGE, vec, 8);
+    written.category_mask = PAGE_IS_WRITTEN;
+    written.return_mask = PAGE_IS_WRITTEN;
+    scan_show("none written", pm, w, &written);
+    w[0] = 'x';
+    w[2 * PAGE] = 'y';
+    r = scan_arg(w, 4 * PAGE, vec, 8);
+    r.return_mask = PAGE_IS_WPALLOWED | PAGE_IS_WRITTEN | PAGE_IS_PRESENT | PAGE_IS_SWAPPED;
+    scan_show("all", pm, w, &r);
+    scan_show("written", pm, w, &written);
+    written.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+    scan_show("protect written", pm, w, &written);
+    pagemap_show("protected again", w);
+    written.flags = 0;
+    scan_show("after", pm, w, &written);
+    w[PAGE] = 'z';
+    w[3 * PAGE] = 'z';
+    written.flags = PM_SCAN_WP_MATCHING;
+    written.vec_len = 1;
+    scan_show("protect one region", pm, w, &written);
+    written.flags = 0;
+    written.vec_len = 8;
+    scan_show("one left", pm, w, &written);
+    w[0] = 'q';
+    r = scan_arg(w, 4 * PAGE, NULL, 0);
+    r.flags = PM_SCAN_WP_MATCHING;
+    r.category_mask = PAGE_IS_WRITTEN;
+    scan_show("protect without regions", pm, w, &r);
+    scan_show("none left", pm, w, &written);
+    r = scan_arg(w, 4 * PAGE, vec, 8);
+    r.category_mask = PAGE_IS_WPALLOWED;
+    r.return_mask = PAGE_IS_WPALLOWED;
+    scan_show("allowed", pm, w, &r);
+    r = scan_arg(w - PAGE, 6 * PAGE, vec, 8);
+    r.category_mask = PAGE_IS_WRITTEN;
+    r.return_mask = PAGE_IS_WRITTEN;
+    w[PAGE] = 'r';
+    r.flags = PM_SCAN_CHECK_WPASYNC;
+    scan_show("check beyond", pm, w, &r);
+    r.flags = PM_SCAN_WP_MATCHING;
+    scan_show("protect beyond", pm, w, &r);
+    close(fd);
+    close(pm);
+    return 0;
+}
+
 /* A thread that reads `want` messages of `fd`, which blocks. */
 struct events {
     int fd, want;
@@ -1609,6 +1812,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "userfaultfd-wp-async")) return case_wp_async();
     if (!strcmp(mode, "userfaultfd-move")) return case_move();
     if (!strcmp(mode, "userfaultfd-events")) return case_events();
+    if (!strcmp(mode, "userfaultfd-scan")) return case_scan();
     printf("unknown mode %s\n", mode);
     return 2;
 }

@@ -70,6 +70,26 @@ verified.
   none, or a uffd-wp marker, until an access. The frame number is 0 for every reader, also one
   with `CAP_SYS_ADMIN`, to whom Linux shows the physical frame; and
   user space ends at 2^47 bytes, as with 4-level page tables.
+- **`PAGEMAP_SCAN`, in part**:
+  - It follows Linux master where the CI runners' Linux 7.0 differs:
+    - A page is written (`PAGE_IS_WRITTEN`) only in a VMA registered for
+      write protection, where an empty page is written too. Linux 7.0
+      calls every present page and marker that is not write-protected
+      written, and no empty one.
+    - `PAGE_IS_ACCESSED` is taken. No page has it, as there is no read
+      protection.
+    - An unknown ioctl is `ENOTTY`, where Linux 7.0 gives `EINVAL`.
+    - A scan once the address space is gone is `ESRCH`, where Linux 7.0
+      finds no pages.
+  - No page is `PAGE_IS_HUGE`, as there are no huge pages.
+  - Protecting a guard or poison marker's page leaves it written. Linux
+    sets the marker's uffd-wp bit.
+  - A 2 MiB block has a page table while one of its pages has an entry or
+    a marker. Linux keeps page tables otherwise. This matters only for
+    `PM_SCAN_WP_MATCHING` without a buffer, which protects every page
+    where there is a page table.
+  - User space ends at 2^47 bytes for its checks, as with 4-level page
+    tables.
 - **`/proc/<pid>/clear_refs`, in part**: only 4 (soft-dirty) and 5 (the
   peak resident size) change anything. 1, 2 and 3 are taken, but no
   referenced bits are kept, so `smaps`' `Referenced` stays the resident
@@ -766,10 +786,7 @@ verified.
   system's. Changes the host makes to a mounted directory are not seen, and
   a descriptor's place does not follow them.
 - **userfaultfd, in part**: missing pages, write protection and the minor
-  faults of shmem are registered. Not offered is `PAGEMAP_SCAN`, the
-  `/proc/<pid>/pagemap` ioctl that finds and protects again the pages
-  `UFFD_FEATURE_WP_ASYNC` saw written; their bit 57 in
-  `/proc/<pid>/pagemap` tells them. A discard tells of all its ranges
+  faults of shmem are registered. A discard tells of all its ranges
   before it drops the pages of any, where Linux tells and drops VMA by VMA,
   and registered mappings of one `userfaultfd` that meet are one range of
   `UFFD_EVENT_REMOVE`, as when Linux's VMAs merge; `MADV_REMOVE` tells of

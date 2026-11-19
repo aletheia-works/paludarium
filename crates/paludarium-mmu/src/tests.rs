@@ -1758,3 +1758,195 @@ fn a_child_and_a_moved_mapping_keep_the_registrations_whose_events_they_give() {
         Some((7, UserfaultReason::Protected))
     );
 }
+
+/// One `PAGEMAP_SCAN` walk of `[start, end)` for at most `capacity`
+/// regions, with the request `ask` makes.
+fn scan_walk(
+    view: &MemoryView,
+    start: u64,
+    end: u64,
+    capacity: Option<usize>,
+    ask: impl FnOnce(&mut Scan),
+) -> (ScanWalk, Scan) {
+    let mut request = Scan {
+        end,
+        max_pages: u64::MAX,
+        ..Scan::default()
+    };
+    ask(&mut request);
+    let walk = view.pagemap_scan(start, &mut request, capacity).unwrap();
+    (walk, request)
+}
+
+#[test]
+fn pagemap_scan_reports_the_pages_of_each_category_as_regions() {
+    let mut m = AddressSpace::new();
+    let view = m.view();
+    let at = m
+        .map(
+            None,
+            5 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap()
+        .0;
+    let end = at + 5 * PAGE_SIZE;
+    let page = |n: u64| at + n * PAGE_SIZE;
+    m.write(GuestAddr(page(0)), b"a").unwrap();
+    m.write(GuestAddr(page(1)), b"b").unwrap();
+    let mut b = [0];
+    m.read(GuestAddr(page(2)), &mut b).unwrap();
+    m.guard(GuestAddr(page(4)), page(5), true).unwrap();
+    let kinds = scan::PRESENT | scan::FILE | scan::PFNZERO | scan::SWAPPED | scan::GUARD;
+    let any = |s: &mut Scan| {
+        s.any_of = scan::PRESENT | scan::SWAPPED;
+        s.returned = kinds;
+    };
+    let (walk, _) = scan_walk(&view, at, end, Some(8), any);
+    assert_eq!(
+        walk.regions,
+        [
+            [page(0), page(2), scan::PRESENT],
+            [page(2), page(3), scan::PRESENT | scan::PFNZERO],
+            [page(4), page(5), scan::SWAPPED | scan::GUARD],
+        ]
+    );
+    assert_eq!(walk.stop, None);
+    // Without a VMA registered for write protection nothing is written,
+    // and categories it does not return join regions.
+    let (walk, _) = scan_walk(&view, at, end, Some(8), |s| {
+        s.returned = scan::WRITTEN | scan::PRESENT;
+    });
+    assert_eq!(
+        walk.regions,
+        [[page(0), page(3), scan::PRESENT], [page(3), page(5), 0]]
+    );
+    // One region of room: the walk stops where the next would start.
+    let (walk, request) = scan_walk(&view, at, end, Some(1), any);
+    assert_eq!(walk.regions, [[page(0), page(2), scan::PRESENT]]);
+    assert_eq!(
+        (walk.stop, request.walk_end),
+        (Some(ScanStop::Full), page(2))
+    );
+    // A page limit cuts a region short, and stops at the next page that
+    // matches.
+    let (walk, request) = scan_walk(&view, at, end, Some(8), |s| {
+        s.required = scan::PRESENT;
+        s.returned = scan::PRESENT;
+        s.max_pages = 1;
+    });
+    assert_eq!(walk.regions, [[page(0), page(1), scan::PRESENT]]);
+    assert_eq!(
+        (walk.stop, request.walk_end, request.found),
+        (Some(ScanStop::Full), page(1), 1)
+    );
+    // Inverted: the pages that are not present.
+    let (walk, _) = scan_walk(&view, at, end, Some(8), |s| {
+        s.inverted = scan::PRESENT;
+        s.required = scan::PRESENT;
+        s.returned = kinds;
+    });
+    assert_eq!(
+        walk.regions,
+        [
+            [page(3), page(4), 0],
+            [page(4), page(5), scan::SWAPPED | scan::GUARD]
+        ]
+    );
+    // Nothing may be write-protected: passed over, or refused.
+    let (walk, _) = scan_walk(&view, at, end, Some(8), |s| s.write_protect = true);
+    assert_eq!(walk, ScanWalk::default());
+    let (walk, _) = scan_walk(&view, at, end, Some(8), |s| s.check_wp_async = true);
+    assert_eq!(walk.stop, Some(ScanStop::Refused));
+}
+
+#[test]
+fn pagemap_scan_write_protects_the_written_pages_for_wp_async() {
+    let mut m = AddressSpace::new();
+    let view = m.view();
+    let at = m
+        .map(
+            None,
+            4 * PAGE_SIZE,
+            Prot::READ_WRITE,
+            MappingKind::Anonymous,
+        )
+        .unwrap()
+        .0;
+    let end = at + 4 * PAGE_SIZE;
+    let page = |n: u64| at + n * PAGE_SIZE;
+    let wp = |n: u64| view.pagemap(page(n), 1).unwrap()[0] & pagemap::UFFD_WP != 0;
+    m.write(GuestAddr(page(0)), b"a").unwrap();
+    // Without markers for the pages with no entry, it may not.
+    view.userfault_register(at, end, 7, Userfault::WP | Userfault::WP_ASYNC)
+        .unwrap();
+    let (walk, _) = scan_walk(&view, at, end, Some(8), |s| s.check_wp_async = true);
+    assert_eq!(walk.stop, Some(ScanStop::Refused));
+    // Not write-protected, an empty page is written as well.
+    let written = |s: &mut Scan| {
+        s.required = scan::WRITTEN;
+        s.returned = scan::WRITTEN;
+    };
+    let (walk, _) = scan_walk(&view, at, end, Some(8), written);
+    assert_eq!(walk.regions, [[page(0), page(4), scan::WRITTEN]]);
+    view.userfault_register(
+        at,
+        end,
+        7,
+        Userfault::WP | Userfault::WP_ASYNC | Userfault::WP_UNPOPULATED,
+    )
+    .unwrap();
+    view.userfault_write_protect(at, end, true).unwrap();
+    let (walk, _) = scan_walk(&view, at, end, Some(8), written);
+    assert_eq!(walk, ScanWalk::default());
+    m.write(GuestAddr(page(0)), b"b").unwrap();
+    m.write(GuestAddr(page(2)), b"c").unwrap();
+    let (walk, _) = scan_walk(&view, at, end, Some(8), |s| {
+        s.returned = scan::WPALLOWED | scan::WRITTEN | scan::PRESENT | scan::SWAPPED;
+    });
+    let both = scan::WPALLOWED | scan::WRITTEN | scan::PRESENT;
+    assert_eq!(
+        walk.regions,
+        [
+            [page(0), page(1), both],
+            [page(1), page(2), scan::WPALLOWED | scan::SWAPPED],
+            [page(2), page(3), both],
+            [page(3), page(4), scan::WPALLOWED | scan::SWAPPED],
+        ]
+    );
+    // It protects what it reports, and only that.
+    let (walk, _) = scan_walk(&view, at, end, Some(8), |s| {
+        written(s);
+        s.write_protect = true;
+        s.check_wp_async = true;
+    });
+    assert_eq!(
+        walk.regions,
+        [
+            [page(0), page(1), scan::WRITTEN],
+            [page(2), page(3), scan::WRITTEN]
+        ]
+    );
+    assert!(wp(0) && wp(2));
+    m.write(GuestAddr(page(1)), b"d").unwrap();
+    m.write(GuestAddr(page(3)), b"e").unwrap();
+    let (walk, request) = scan_walk(&view, at, end, Some(1), |s| {
+        written(s);
+        s.write_protect = true;
+    });
+    assert_eq!(walk.regions, [[page(1), page(2), scan::WRITTEN]]);
+    assert_eq!(request.walk_end, page(3));
+    assert!(wp(1) && !wp(3));
+    // Without a buffer, every page of a page table.
+    m.write(GuestAddr(page(0)), b"f").unwrap();
+    let (walk, _) = scan_walk(&view, at, end, None, |s| {
+        s.required = scan::PRESENT | scan::FILE;
+        s.write_protect = true;
+    });
+    assert_eq!(walk, ScanWalk::default());
+    assert!((0..4).all(wp));
+    // A write still clears the protection of what it protected.
+    m.write(GuestAddr(page(3)), b"g").unwrap();
+    assert!(!wp(3));
+}

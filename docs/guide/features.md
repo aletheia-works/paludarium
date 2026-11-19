@@ -1025,7 +1025,8 @@ kernel.
   to a write-protected page, an instruction's or a system call's, does not
   fault: it clears the page's protection and goes on, as `do_wp_page`
   does, so that bit 57 of `/proc/<pid>/pagemap` tells which pages were
-  written since `UFFDIO_WRITEPROTECT`. `MADV_DONTNEED` of a file's private
+  written since `UFFDIO_WRITEPROTECT`, and `PAGEMAP_SCAN` (below) finds
+  and protects them again. `MADV_DONTNEED` of a file's private
   mapping leaves a marker for each page still protected, as for shmem; a
   fill there is `EINVAL`, as the memory is neither anonymous nor shmem's.
   `UFFDIO_COPY` and `UFFDIO_ZEROPAGE` fill page by page as `mfill_atomic`
@@ -3336,6 +3337,33 @@ kernel.
   as Linux's `mem_lseek`, a negative one too, from which a read is `EINVAL`;
   from the end it is `EINVAL`. It cannot be written (`EINVAL`, `EBADF` on a
   descriptor open only for reading).
+  Its ioctl `PAGEMAP_SCAN` finds the pages of a range by their categories, as
+  Linux master's `do_pagemap_scan` does:
+  - The categories are `PAGE_IS_WPALLOWED`, `WRITTEN`, `FILE`, `PRESENT`,
+    `SWAPPED` (a guard, poison or uffd-wp marker), `PFNZERO`, `SOFT_DIRTY`
+    and `GUARD`, from the same state as the entries.
+    - `PAGE_IS_WPALLOWED`: the VMA is registered for write protection by a
+      `userfaultfd` with `UFFD_FEATURE_WP_ASYNC`, and is not private
+      anonymous memory or has `UFFD_FEATURE_WP_UNPOPULATED`.
+    - `PAGE_IS_WRITTEN`: in a VMA registered for write protection, a page
+      that is not write-protected, an empty one too.
+  - A page is matched by `category_mask`, `category_anyof_mask` and
+    `category_inverted`, and reported with the categories of `return_mask`.
+    Pages that meet with the same categories are joined into one region.
+  - The scan stops early for `vec_len` regions or `max_pages` pages.
+    `walk_end` tells where it stopped, and the result is the number of
+    regions.
+  - With `PM_SCAN_WP_MATCHING`, the written pages it matches are
+    write-protected again, as `UFFDIO_WRITEPROTECT` does, and VMAs that
+    cannot be protected are passed over. Without a buffer, every page
+    where Linux would have a page table is protected.
+  - With `PM_SCAN_CHECK_WPASYNC`, such a VMA stops the scan (`EPERM`).
+  - The request is checked as `pagemap_scan_get_args` does: its size, flags
+    and categories (`EINVAL`), a start on a page boundary (`EINVAL`), the
+    range and the buffer in user space (`EFAULT`), and a buffer for a
+    length (`EINVAL`).
+  - Any other ioctl is `ENOTTY`, and a scan once the address space is gone
+    is `ESRCH`.
 - `/proc/<pid>/clear_refs` (mode 0200, size 0, a thread's too), as Linux's
   `clear_refs_write`: a write's first 12 bytes at most, which is what it
   returns, are a number as `kstrtoint` reads one in base 10 (spaces

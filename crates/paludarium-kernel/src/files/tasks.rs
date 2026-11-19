@@ -362,6 +362,15 @@ fn render_stat(task: &Task, permitted: bool) -> Vec<u8> {
         blocked: task.public.blocked,
         ignored,
         caught,
+        // As Linux's `do_task_stat`: the process's group exit or stop code
+        // for its own `stat` (`group_exit_code`, a stop's until a wait
+        // reports it), a thread's own otherwise, the same wait status once
+        // it has ended.
+        exit_code: match task.view.stop_report {
+            _ if task.view.zombie => task.view.exit_code,
+            Some(signal) if !task.thread => signal,
+            _ => 0,
+        },
     })
 }
 

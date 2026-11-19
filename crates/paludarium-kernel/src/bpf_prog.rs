@@ -382,8 +382,9 @@ pub(crate) fn load(c: &mut Context<'_>, attr: &[u8], at: u64, size: u32) -> Resu
         strict_alignment: prog_flags & flag::STRICT_ALIGNMENT != 0
             && prog_flags & flag::ANY_ALIGNMENT == 0,
         test_reg_invariants: prog_flags & flag::TEST_REG_INVARIANTS != 0,
+        fd_array: word(attr, 120) != 0,
     };
-    let verified = verify(c, attr, &log, &insns, options, at, size)?;
+    let (verified, maps) = verify(c, attr, &log, &insns, options, at, size)?;
     let program = c.processes.bpf_progs.publish(|id| Program {
         id,
         kind,
@@ -393,6 +394,7 @@ pub(crate) fn load(c: &mut Context<'_>, attr: &[u8], at: u64, size: u32) -> Resu
         gpl,
         name,
         insns,
+        maps,
         ids: Arc::clone(&c.processes.bpf_progs),
     })?;
     // bpf_prog_new_fd: read and write, close-on-exec.
@@ -402,7 +404,8 @@ pub(crate) fn load(c: &mut Context<'_>, attr: &[u8], at: u64, size: u32) -> Resu
 }
 
 /// `bpf_check` from the log on: the arguments only the verifier reads,
-/// the verifier, and the log with `log_true_size`.
+/// the verifier, and the log with `log_true_size`. Gives the maps the
+/// program uses, which it keeps.
 fn verify(
     c: &Context<'_>,
     attr: &[u8],
@@ -411,10 +414,16 @@ fn verify(
     options: Options,
     at: u64,
     size: u32,
-) -> Result<bpf_verifier::Verified, Errno> {
+) -> Result<(bpf_verifier::Verified, Vec<Arc<crate::bpf::Map>>), Errno> {
     let mut lines: Vec<String> = Vec::new();
+    let mut named: Vec<(u32, Arc<crate::bpf::Map>)> = Vec::new();
+    let mut maps = |fd: i32| {
+        let (map, shape) = crate::bpf::program_map(c, fd as u32)?;
+        named.push((shape.id, map));
+        Ok(shape)
+    };
     let result = early(c, attr, insns)
-        .and_then(|()| bpf_verifier::check(insns, options))
+        .and_then(|()| bpf_verifier::check(insns, options, &mut maps))
         .inspect_err(|rejection| {
             if !rejection.line.is_empty() {
                 lines.push(rejection.line.clone());
@@ -442,6 +451,19 @@ fn verify(
     if let Err(e) = logged {
         outcome = Err(e);
     }
+    let outcome = outcome.map(|v| {
+        let used = v
+            .maps
+            .iter()
+            .filter_map(|id| {
+                named
+                    .iter()
+                    .find(|(i, _)| i == id)
+                    .map(|(_, m)| Arc::clone(m))
+            })
+            .collect();
+        (v, used)
+    });
     if size as usize >= LOG_TRUE_SIZE + 4
         && c.mem
             .write(
@@ -606,6 +628,9 @@ pub(crate) struct Program {
     /// The instructions, for the interpreter.
     #[allow(dead_code)]
     insns: Vec<Insn>,
+    /// `aux->used_maps`, which the program keeps while it is there.
+    #[allow(dead_code)]
+    maps: Vec<Arc<crate::bpf::Map>>,
     ids: Arc<Ids>,
 }
 

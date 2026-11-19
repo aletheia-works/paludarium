@@ -530,13 +530,16 @@ pub(crate) struct ProcessStat<'a> {
     pub blocked: u64,
     pub ignored: u64,
     pub caught: u64,
+    /// `exit_code`: the wait status of a process that has ended, or the
+    /// signal of its group stop not yet reported to a wait.
+    pub exit_code: i32,
 }
 /// `/proc/<pid>/stat` as Linux's `do_task_stat` prints it: 52 fields, and
 /// 0 for what nothing measures (page faults, resident memory, start time
 /// and the scheduler's figures). A reader that may not see the task's
 /// memory gets 1 for `start_code` and `end_code` and 0 for `start_stack`,
-/// `wchan` and the addresses from `start_data` on, as Linux hides them;
-/// without memory they are all 0.
+/// `wchan`, the addresses from `start_data` on and `exit_code`, as Linux
+/// hides them; without memory the addresses are all 0.
 pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
     /// USER_HZ, the unit of the times, as on x86-64 Linux.
     const TICKS: u64 = 100;
@@ -600,7 +603,7 @@ pub(crate) fn render_stat(s: &ProcessStat<'_>) -> Vec<u8> {
         address(s.arguments.1).to_string(),
         address(s.environment.0).to_string(),
         address(s.environment.1).to_string(),
-        "0".into(), // exit_code
+        if s.permitted { s.exit_code } else { 0 }.to_string(),
     ];
     // The name's bytes as they are, as `comm` gives them.
     let mut line = format!("{} (", s.pid).into_bytes();
@@ -2515,6 +2518,7 @@ mod generated_tests {
             blocked: 512,
             ignored: 2048,
             caught: 1,
+            exit_code: 0,
         });
         // The name's bytes stay as they are, not UTF-8 encoded.
         assert!(line.starts_with(b"5 (a b) \xe9) R 1 5 1 0 -1 "));
@@ -2566,18 +2570,20 @@ mod generated_tests {
                 blocked: 0,
                 ignored: 0,
                 caught: 0,
+                exit_code: 12,
             });
             let line = String::from_utf8(line).unwrap();
             let fields: Vec<String> = line.split_whitespace().map(String::from).collect();
-            // start_code, end_code, start_stack; wchan; 45 to 51.
+            // start_code, end_code, start_stack; wchan; 45 to 52.
             let mut shown = fields[25..28].to_vec();
             shown.push(fields[34].clone());
-            shown.extend_from_slice(&fields[44..51]);
+            shown.extend_from_slice(&fields[44..52]);
             shown.join(" ")
         };
-        assert_eq!(stat(true, true), "2 3 6 1 4 5 7 8 9 10 11");
-        assert_eq!(stat(true, false), "1 1 0 0 0 0 0 0 0 0 0");
-        assert_eq!(stat(false, true), "0 0 0 1 0 0 0 0 0 0 0");
+        assert_eq!(stat(true, true), "2 3 6 1 4 5 7 8 9 10 11 12");
+        assert_eq!(stat(true, false), "1 1 0 0 0 0 0 0 0 0 0 0");
+        // A zombie's exit code stays, as its memory goes.
+        assert_eq!(stat(false, true), "0 0 0 1 0 0 0 0 0 0 0 12");
     }
     #[test]
     fn system_files_have_linux_s_formats() {

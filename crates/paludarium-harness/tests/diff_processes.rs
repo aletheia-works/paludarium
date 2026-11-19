@@ -29,7 +29,7 @@ fn runner_ready() {
         Some(124),
         "watchdog must interrupt blocked guests"
     );
-    support::bounded("runner_ready", || {});
+    support::bounded("runner_ready", 60, || {});
 }
 
 /// The tests below run exactly the cases of `tests/guests/processes/cases.json`,
@@ -68,9 +68,9 @@ fn every_listed_case_runs() {
 mod linux {
     use super::support;
     use paludarium::{Config, Session, testing::RecordingHost};
-    use paludarium_harness::{Outcome, compare, run_native, workspace_root};
+    use paludarium_harness::{Outcome, TIMEOUT, compare, run_native_within, workspace_root};
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn running_as_root() -> bool {
         use std::os::unix::fs::MetadataExt;
@@ -122,7 +122,8 @@ mod linux {
                 "the unix-datagram case needs `sysctl net.unix.max_dgram_qlen=10`"
             );
         }
-        support::bounded(test, || {
+        let watchdog = if mode == "neighbour-ageing" { 150 } else { 60 };
+        support::bounded(test, watchdog, || {
             let program = dir.join(binary);
             let self_path = program.to_str().unwrap().to_owned();
             let args = [mode.to_owned(), self_path.clone()];
@@ -133,7 +134,7 @@ mod linux {
             // pid-namespace and pid-set-tid make PID namespaces, so Linux runs
             // them as root, through sudo when the tests do not run as root; so
             // do the unshare, namespaces, *-namespaces, netlink, unix-interfaces,
-            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links and msg cases, whose checks depend on
+            // sysvipc-proc, addresses, monitor, routes, route-dump, route-metrics, route-selectors, route-input, address-lifetimes, neighbours, neighbour-requests, neighbour-changes, neighbour-ageing, mctp-sockets, link-attributes, generic-netlink, sock-diag, inet-diag, ext-ack-*, netlink-option-flags, netlink-pktinfo, netlink-no-enobufs, netlink-nsid, netlink-listen-all-nsid, netlink-nsid-gone, netlink-nsid-write, netlink-target-netnsid, netlink-link-netns, netlink-write-credentials, veth-links and msg cases, whose checks depend on
             // CAP_SYS_ADMIN and which make namespaces (msg an IPC namespace of
             // its own, for its counts, and sysvipc-proc IPC and PID namespaces,
             // for its IDs and PIDs), the fanotify cases, whose groups and
@@ -156,7 +157,8 @@ mod linux {
             // the proc-other-fd-paths case, which goes through a process's
             // descriptors as another user, the proc-personality-wchan case,
             // which reads them as other users, the proc-syscall case, which
-            // reads a child's as another user, and the pagemap
+            // reads a child's as another user, the proc-stat-exit-code case,
+            // which reads a child's stat as another user, and the pagemap
             // and proc-owners cases, which become an unprivileged user, and
             // the mount-flags case, which runs a program of another user's
             // on its own mounts, as the emulator's guest starts as root.
@@ -184,6 +186,7 @@ mod linux {
                     | "proc-other-fd-paths"
                     | "proc-personality-wchan"
                     | "proc-syscall"
+                    | "proc-stat-exit-code"
                     | "proc-fd-links"
                     | "dynamic-exec"
                     | "pty-vhangup"
@@ -246,6 +249,7 @@ mod linux {
                     | "perf-mmap"
                     | "perf-output"
                     | "perf-sample"
+                    | "perf-wakeup"
                     | "bpf-calls"
                     | "bpf-elements"
                     | "bpf-batch"
@@ -258,6 +262,7 @@ mod linux {
                     | "bpf-maps"
                     | "bpf-prog-load"
                     | "bpf-prog-verify"
+                    | "bpf-prog-maps"
                     | "keys-calls"
                     | "keys-keyrings"
                     | "keys-threads"
@@ -276,6 +281,7 @@ mod linux {
                     | "neighbours"
                     | "neighbour-requests"
                     | "neighbour-changes"
+                    | "neighbour-ageing"
                     | "mctp-sockets"
                     | "netlink-strict"
                     | "link-attributes"
@@ -317,12 +323,20 @@ mod linux {
                     | "admin"
                     | "mount-flags"
             );
+            // The neighbour-ageing case waits out Linux's reachable time,
+            // which may be 45 seconds.
+            let limit = if mode == "neighbour-ageing" {
+                Duration::from_secs(70)
+            } else {
+                TIMEOUT
+            };
             let native = if as_root && !running_as_root() {
                 let mut sudo = vec!["-n".to_owned(), self_path.clone()];
                 sudo.extend(args.iter().cloned());
-                run_native(std::path::Path::new("/usr/bin/sudo"), "sudo", &sudo).unwrap()
+                run_native_within(std::path::Path::new("/usr/bin/sudo"), "sudo", &sudo, limit)
+                    .unwrap()
             } else {
-                run_native(&program, binary, &args).unwrap()
+                run_native_within(&program, binary, &args, limit).unwrap()
             };
             let bytes = std::fs::read(&program).unwrap();
             let config = Config::new(
@@ -464,6 +478,7 @@ mod linux {
         processes_neighbours => ("neighbours","process"),
         processes_neighbour_requests => ("neighbour-requests","process"),
         processes_neighbour_changes => ("neighbour-changes","process"),
+        processes_neighbour_ageing => ("neighbour-ageing","process"),
         processes_mctp_sockets => ("mctp-sockets","process"),
         processes_netlink_strict => ("netlink-strict","process"),
         processes_link_attributes => ("link-attributes","process"),
@@ -565,6 +580,7 @@ mod linux {
         perf_mmap => ("perf-mmap","perf"),
         perf_output => ("perf-output","perf"),
         perf_sample => ("perf-sample","perf"),
+        perf_wakeup => ("perf-wakeup","perf"),
         bpf_calls => ("bpf-calls","bpf"),
         bpf_elements => ("bpf-elements","bpf"),
         bpf_batch => ("bpf-batch","bpf"),
@@ -577,6 +593,7 @@ mod linux {
         bpf_maps => ("bpf-maps","bpf"),
         bpf_prog_load => ("bpf-prog-load","bpf"),
         bpf_prog_verify => ("bpf-prog-verify","bpf-prog"),
+        bpf_prog_maps => ("bpf-prog-maps","bpf-prog"),
         inotify_calls => ("inotify-calls","inotify"),
         inotify_directory => ("inotify-directory","inotify"),
         inotify_files => ("inotify-files","inotify"),
@@ -843,6 +860,7 @@ mod linux {
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_changes => ("generated-changes","process"),
         processes_tmpfs_limits => ("tmpfs-limits","process"),
+        processes_generated_noexec => ("generated-noexec","process"),
         processes_beneath => ("beneath","process"),
         processes_propagation => ("propagation","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),
@@ -855,6 +873,7 @@ mod linux {
         processes_proc_other_fd_paths => ("proc-other-fd-paths","process"),
         processes_proc_personality_wchan => ("proc-personality-wchan","process"),
         processes_proc_syscall => ("proc-syscall","process"),
+        processes_proc_stat_exit_code => ("proc-stat-exit-code","process"),
         processes_proc_fd_links => ("proc-fd-links","process"),
         processes_modify_ldt => ("modify-ldt","process"),
         processes_port_access => ("port-access","process"),

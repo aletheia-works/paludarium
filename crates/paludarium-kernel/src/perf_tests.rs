@@ -32,6 +32,7 @@ const PERF_FORMAT_GROUP: u64 = 8;
 const PERF_FORMAT_LOST: u64 = 16;
 /// `disabled`, `freq` and `exclude_kernel` of the attribute's bit field.
 const DISABLED: u64 = 1;
+const INHERIT: u64 = 1 << 1;
 const FREQ: u64 = 1 << 10;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
 
@@ -268,9 +269,7 @@ fn period_takes_only_a_sampling_event_and_refresh_no_counting_one() {
         period(&mut k, &mut t, counting, Some(1000)),
         errno(Errno::EINVAL)
     );
-    // `_perf_event_refresh`: EINVAL for an event that does not sample. (A
-    // sampling event's refresh, which Linux takes, is not tested: it is
-    // EINVAL here until overflow records are.)
+    // `_perf_event_refresh`: EINVAL for an event that does not sample.
     assert_eq!(
         syscall(
             &mut k,
@@ -294,6 +293,40 @@ fn period_takes_only_a_sampling_event_and_refresh_no_counting_one() {
         -1,
     );
     assert!(sampling < 1024, "{sampling:#x}");
+    // A sampling event takes a refresh, which enables it; one with
+    // `inherit` does not.
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            IOCTL,
+            [sampling, PERF_EVENT_IOC_REFRESH, 2, 0, 0, 0]
+        ),
+        0
+    );
+    let inherited = open(
+        &mut k,
+        &mut t,
+        &m,
+        &Spec {
+            period: 100_000,
+            flags: DISABLED | INHERIT,
+            ..Spec::default()
+        },
+        -1,
+    );
+    assert!(inherited < 1024, "{inherited:#x}");
+    assert_eq!(
+        syscall(
+            &mut k,
+            &mut t,
+            &m,
+            IOCTL,
+            [inherited, PERF_EVENT_IOC_REFRESH, 1, 0, 0, 0]
+        ),
+        errno(Errno::EINVAL)
+    );
     assert_eq!(period(&mut k, &mut t, sampling, Some(5000)), 0);
     assert_eq!(
         period(&mut k, &mut t, sampling, Some(0)),

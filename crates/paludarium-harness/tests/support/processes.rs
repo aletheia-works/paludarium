@@ -1,8 +1,8 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Isolate both executions in a process group and reap it on timeout.
-pub fn bounded(name: &str, run: impl FnOnce()) {
+/// Isolate both executions in a process group and reap it after `seconds`.
+pub fn bounded(name: &str, seconds: u64, run: impl FnOnce()) {
     if std::env::var("PALUDARIUM_PROCESSES_CHILD").as_deref() == Ok(name) {
         run();
         return;
@@ -24,14 +24,14 @@ pub fn bounded(name: &str, run: impl FnOnce()) {
             assert!(status.success(), "isolated {name}: {status}");
             return;
         }
-        if start.elapsed() >= Duration::from_secs(60) {
+        if start.elapsed() >= Duration::from_secs(seconds) {
             #[cfg(unix)]
             let _ = Command::new("kill")
                 .args(["-KILL", "--", &format!("-{}", child.id())])
                 .status();
             let _ = child.kill();
             let _ = child.wait();
-            panic!("{name}: outer 60-second process-group watchdog expired");
+            panic!("{name}: outer {seconds}-second process-group watchdog expired");
         }
         std::thread::sleep(Duration::from_millis(5));
     }

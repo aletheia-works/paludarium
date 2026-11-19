@@ -3294,8 +3294,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
   は `EINVAL` で、サンプリングするイベントには新しい周期（`freq` なら新しい頻度）を
-  与え、周期は初めからになります。`REFRESH` はどのイベントでも `EINVAL` です
-  （[制限](./limitations) を参照）。`enable_on_exec` は、`perf stat` が使うように、無効な
+  与え、周期は初めからになります。`REFRESH` は、サンプリングしないか、新しい
+  タスクが引き継ぐイベントでは `EINVAL` で、そうでなければその数だけオーバーフローを
+  許してイベントを有効にします（`event_limit`）。その最後でイベントは無効になり、
+  `POLL_HUP` を知らせます。`enable_on_exec` は、`perf stat` が使うように、無効な
   イベントをそのタスクの `execve` で有効にし、`remove_on_exec` は、Linux master と同じく、そのとき
   イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
   持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで
@@ -3365,7 +3367,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   バッファは中身を上書きし、何も失いません。`PERF_EVENT_IOC_PAUSE_OUTPUT` はバッファを
   止め、また動かし（バッファがないか、データページがなければ `EINVAL`）、止まっている
   バッファは受け取らない記録を失ったものと数えます。引き継いだイベントは、元のイベントの
-  バッファへ書きます。ディスクリプタのリンクは
+  バッファへ書きます。`wakeup_events` 回のサンプルごと、`watermark` なら
+  `wakeup_watermark` バイトごと（ないときはデータの半分）に、バッファは `poll` や
+  `epoll` で待つものを起こします。そのとき一度だけ読める（`POLLIN`）ようになり、
+  `perf_poll` が起こされた状態を取るので、次まではまた読めません。バッファのない
+  イベントと、タスクが終わり引き継いだイベントも残っていないイベントは、切れています
+  （`POLLHUP`）。`O_ASYNC` では、オーバーフローのたびに、バッファがあってもなくても、
+  ファイルの持ち主（`F_SETOWN`）へ `POLL_IN` を知らせ、`F_SETSIG` のシグナルは
+  `si_code`、`si_band`、`si_fd` を持ちます。`sigtrap` では、オーバーフローはスレッドに
+  `TRAP_PERF` の SIGTRAP を送り、`si_perf_data` と `si_perf_type` に `sig_data` と
+  イベントの型を、スレッドがそれをブロックしていれば `TRAP_PERF_FLAG_ASYNC` を
+  持たせます。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c`、`bpf_lru_list.c`、

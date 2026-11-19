@@ -18,8 +18,10 @@
 //! ring buffer ([`buffer`]), whose user page shows the count and times as
 //! of the event's `mmap`, its enabling and its reset. A sampling event
 //! writes its samples there ([`sample`]), taken as its thread makes a
-//! system call. `SET_OUTPUT` and `PERF_FLAG_FD_OUTPUT` make an event write
-//! to another's buffer ([`buffer::set_output`]).
+//! system call; its wakeups make the buffer readable for `poll`, and its
+//! overflows signal through `O_ASYNC` and `sigtrap`. `SET_OUTPUT` and
+//! `PERF_FLAG_FD_OUTPUT` make an event write to another's buffer
+//! ([`buffer::set_output`]).
 mod buffer;
 mod sample;
 
@@ -129,6 +131,7 @@ mod bit {
     pub const EXCLUDE_USER: u32 = 4;
     pub const EXCLUDE_KERNEL: u32 = 5;
     pub const FREQ: u32 = 10;
+    pub const WATERMARK: u32 = 14;
     pub const SAMPLE_ID_ALL: u32 = 18;
     pub const ENABLE_ON_EXEC: u32 = 12;
     pub const EXCLUDE_CALLCHAIN_KERNEL: u32 = 21;
@@ -154,6 +157,8 @@ struct Attr {
     sample_type: u64,
     read_format: u64,
     flags: u64,
+    /// `wakeup_events`, or with `watermark` `wakeup_watermark`.
+    wakeup: u32,
     branch_sample_type: u64,
     sample_regs_user: u64,
     sample_stack_user: u32,
@@ -163,6 +168,8 @@ struct Attr {
     /// `kernel.perf_event_max_stack` for a callchain without one.
     sample_max_stack: u16,
     aux_action: u32,
+    /// `sig_data`, which a `sigtrap` signal carries.
+    sig_data: u64,
     reserved_2: u16,
     simd_enabled: u16,
     /// `sample_simd_pred_reg_qwords` and `sample_simd_vec_reg_qwords`.
@@ -258,6 +265,7 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
         sample_type: word(&b, 24),
         read_format: word(&b, 32),
         flags: word(&b, 40),
+        wakeup: half(&b, 48),
         branch_sample_type: word(&b, 72),
         sample_regs_user: word(&b, 80),
         sample_stack_user: half(&b, 88),
@@ -266,6 +274,7 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
         sample_max_stack: quarter(&b, 108),
         reserved_2: quarter(&b, 110),
         aux_action: half(&b, 116),
+        sig_data: word(&b, 120),
         simd_enabled: quarter(&b, 144),
         pred_qwords: quarter(&b, 146),
         vec_qwords: quarter(&b, 148),
@@ -486,6 +495,15 @@ pub(crate) struct Event {
     mmap_mutex: Mutex<()>,
     /// Its period and where it is in it, and the samples it lost.
     sampler: Mutex<sample::Sampler>,
+    /// What wakes those who wait in `poll` or `epoll` for it (`waitq`): the
+    /// readiness of the files of the process that opened it.
+    hub: Arc<crate::events::ReadinessHub>,
+    /// Where `O_ASYNC` sends its signals (`fasync`), and its file, whose
+    /// owner `F_SETOWN` gave.
+    fasync: Mutex<Option<sample::Fasync>>,
+    /// `event_limit`: the overflows `PERF_EVENT_IOC_REFRESH` allows before
+    /// it is disabled, 0 for no limit.
+    event_limit: std::sync::atomic::AtomicI32,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -759,6 +777,9 @@ impl Event {
             mapped: Mutex::default(),
             mmap_mutex: Mutex::default(),
             sampler: Mutex::new(sampler),
+            hub: Arc::clone(&top.hub),
+            fasync: Mutex::default(),
+            event_limit: Default::default(),
         });
         if let Some(leader) = leader {
             lock(&leader.siblings).push(Arc::downgrade(&child));
@@ -941,6 +962,17 @@ impl Event {
 /// The open file: Linux's `[perf_event]`.
 pub(crate) struct EventFile {
     event: Arc<Event>,
+    /// What `F_SETFL` set of `O_NONBLOCK` and `O_ASYNC`.
+    status: std::sync::atomic::AtomicU32,
+}
+
+impl EventFile {
+    fn new(event: Arc<Event>) -> Self {
+        Self {
+            event,
+            status: Default::default(),
+        }
+    }
 }
 
 fn of(file: &Arc<dyn FileHandle>) -> Option<&Arc<Event>> {
@@ -1146,6 +1178,9 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         mapped: Mutex::default(),
         mmap_mutex: Mutex::default(),
         sampler: Mutex::new(sample::Sampler::new(&attr, counter)),
+        hub: Arc::clone(&c.files.readiness),
+        fasync: Mutex::default(),
+        event_limit: Default::default(),
     });
     // `PERF_FLAG_FD_OUTPUT`: it writes to the group's event's buffer.
     if let Some(output) = &output {
@@ -1163,7 +1198,7 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
     c.processes.perf_events.add(&event, &own, c.tid);
     let cloexec = flags & PERF_FLAG_FD_CLOEXEC != 0;
     c.files
-        .install(Arc::new(EventFile { event }), cloexec, c.group.nofile())
+        .install(Arc::new(EventFile::new(event)), cloexec, c.group.nofile())
         .map(u64::from)
 }
 
@@ -1242,6 +1277,8 @@ pub(crate) fn exit_thread(events: &Events, group: &ThreadGroup, tid: u32) {
         } else {
             event.disable();
             event.settle().removed = true;
+            // `perf_event_wakeup`: its readers see it hung up.
+            event.wake_readers();
         }
     }
 }
@@ -1346,6 +1383,7 @@ pub(crate) fn exec(events: &Events, group: &ThreadGroup, tid: u32, new_tid: u32)
                     event.disable();
                     event.settle().removed = true;
                     event.detach();
+                    event.wake_readers();
                     removed.push(Arc::as_ptr(&event));
                 } else {
                     event.enable();
@@ -1391,8 +1429,9 @@ pub(crate) fn mmap(
 /// An event's ioctls, as Linux's `_perf_ioctl`: `ENABLE`, `DISABLE` and
 /// `RESET` of the event or, with `PERF_IOC_FLAG_GROUP`, its whole group;
 /// `ID`; `PERIOD`, which only a sampling event takes (`EINVAL`), a new
-/// period or frequency; `REFRESH`, `EINVAL` for every event here (Linux
-/// takes it for a sampling event that does not inherit); `SET_OUTPUT` to
+/// period or frequency; `REFRESH`, `EINVAL` for one that does not sample
+/// or that new tasks inherit, more overflows for one that does
+/// ([`Event::refresh`]); `SET_OUTPUT` to
 /// another event's buffer ([`buffer::set_output`]), whose descriptor must
 /// be an event's (`EBADF`), or to none for -1; `PAUSE_OUTPUT` of the
 /// event's buffer (`EINVAL` without one); every other request is `ENOTTY`
@@ -1419,7 +1458,7 @@ pub(crate) fn ioctl(
         IOC_ENABLE => each(Event::enable),
         IOC_DISABLE => each(Event::disable),
         IOC_RESET => each(Event::reset),
-        IOC_REFRESH => Err(Errno::EINVAL),
+        IOC_REFRESH => event.refresh(argument as i32).map(|()| 0),
         IOC_PERIOD => (|| {
             let mut value = [0; 8];
             c.mem
@@ -1464,10 +1503,31 @@ pub(crate) fn ioctl(
     })
 }
 
+/// Whether `file` is an event's (`perf_fops`), which takes `O_ASYNC`.
+pub(crate) fn is_event(file: &Arc<dyn FileHandle>) -> bool {
+    of(file).is_some()
+}
+
+/// `perf_fasync`: `F_SETFL` turning `O_ASYNC` on for `file`, with its
+/// registration, or off.
+pub(crate) fn set_async(
+    file: &Arc<dyn FileHandle>,
+    registration: Option<crate::fasync::Registration>,
+) {
+    if let Some(event) = of(file) {
+        *lock(&event.fasync) = registration.map(|to| sample::Fasync {
+            to,
+            file: Arc::downgrade(file),
+        });
+    }
+}
+
 impl FileHandle for EventFile {
-    /// Linux's `perf_poll` finds nothing in a ring buffer there is none of.
+    /// Linux's `perf_poll`: `POLLHUP` without a buffer, or for an event
+    /// whose task has ended and that has no inherited events left; else
+    /// what the buffer's last wakeup left (`POLLIN`), which this takes.
     fn readiness(&self) -> Result<(u32, u64, u64), Errno> {
-        Ok((0, 0, 0))
+        Ok(self.event.poll())
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
@@ -1506,10 +1566,15 @@ impl FileHandle for EventFile {
     fn flock(&self, _: u32) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
     }
+    /// Open for reading and writing, with what `F_SETFL` set.
     fn flags(&self) -> u32 {
-        O_RDWR
+        O_RDWR | self.status.load(Ordering::Relaxed)
     }
-    fn set_flags(&self, _: u32) -> Result<(), Errno> {
+    fn set_flags(&self, flags: u32) -> Result<(), Errno> {
+        self.status.store(
+            flags & (crate::events::NONBLOCK | crate::fasync::O_ASYNC),
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 }
@@ -1602,6 +1667,9 @@ mod tests {
             mapped: Mutex::default(),
             mmap_mutex: Mutex::default(),
             sampler: Mutex::new(sample::Sampler::new(&attr, counter)),
+            hub: Arc::default(),
+            fasync: Mutex::default(),
+            event_limit: Default::default(),
         });
         if let Some(leader) = leader {
             lock(&leader.siblings).push(Arc::downgrade(&event));

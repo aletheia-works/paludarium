@@ -3804,8 +3804,10 @@ kernel.
   `RESET`, each of the event or with `PERF_IOC_FLAG_GROUP` of its group,
   and `PERF_EVENT_IOC_ID` are there; `PERIOD` is `EINVAL` for an event
   that does not sample, and gives a sampling event a new period (or with
-  `freq` a new frequency) that starts over; `REFRESH` is `EINVAL` for
-  every event (see [limitations](./limitations)). `enable_on_exec` enables a disabled
+  `freq` a new frequency) that starts over; `REFRESH` is `EINVAL` for an
+  event that does not sample or that new tasks inherit, and else allows
+  that many more overflows and enables the event (`event_limit`): the
+  last of them disables it and signals `POLL_HUP`. `enable_on_exec` enables a disabled
   event when its task runs `execve`, as `perf stat` uses it, and
   `remove_on_exec` takes one out then for good, as Linux master does: it
   counts no more, keeps its last count and times to be read, has no owner
@@ -3887,7 +3889,18 @@ kernel.
   overwrites what it holds and loses nothing. `PERF_EVENT_IOC_PAUSE_OUTPUT`
   pauses and resumes the buffer (`EINVAL` without one, or for one of no
   data pages), which counts what it does not take as lost. An inherited
-  event writes to the buffer of the one it comes from. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
+  event writes to the buffer of the one it comes from. Every
+  `wakeup_events` samples, or with `watermark` every `wakeup_watermark`
+  bytes (half the data without one), the buffer wakes those who wait for
+  it in `poll` or `epoll`: it is readable (`POLLIN`) once, as
+  `perf_poll` takes what the wakeup left, until the next. An event
+  without a buffer, and one whose task has ended with no inherited events
+  left, is hung up (`POLLHUP`). With `O_ASYNC`, each overflow signals the
+  file's owner (`F_SETOWN`) with `POLL_IN`, `F_SETSIG`'s signal carrying
+  `si_code`, `si_band` and `si_fd`, with or without a buffer; and with
+  `sigtrap`, an overflow sends the thread SIGTRAP of `TRAP_PERF` with
+  `sig_data` and the event's type in `si_perf_data` and `si_perf_type`,
+  and `TRAP_PERF_FLAG_ASYNC` if the thread blocks it. The descriptor's link is `anon_inode:[perf_event]`, it is open for reading
   and writing, and a write is `EINVAL`. See [limitations](./limitations)
   for what is not there.
 - `bpf` has maps, as Linux's `kernel/bpf/syscall.c`, `arraymap.c`,

@@ -279,10 +279,12 @@ verified.
   address 0 and no kernel frames. `freq` follows the rate at those points,
   not at each tick. A sample is never throttled (no `PERF_RECORD_THROTTLE`
   or `UNTHROTTLE`), an event of a CPU takes none, and no other record
-  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. Nothing wakes a
-  reader: an overflow sends no signal, and `poll` never finds an event
-  readable, and `PERF_EVENT_IOC_REFRESH` is `EINVAL` for every event,
-  where Linux takes it for a sampling event that does not inherit. Its user page shows the count and times as of the
+  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. The overflows
+  of one such point send one SIGTRAP for `sigtrap`, where Linux sends one
+  each time the thread returns to its code, and its `si_addr` is 0, where
+  Linux gives a fault's address. When `REFRESH`'s last overflow disables
+  the event, the occurrences after it up to that point are still counted,
+  where Linux stops the count at it. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the

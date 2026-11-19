@@ -1379,16 +1379,21 @@ impl Kernel {
 
     /// The samples the perf events that count the thread take of what it
     /// has done since its last system call or checkpoint
-    /// ([`perf::overflow`]).
-    fn perf_samples(&self, thread: &Thread, mem: &AddressSpace) {
+    /// ([`perf::overflow`]), and the SIGTRAP of those with `sigtrap`.
+    fn perf_samples(&self, thread: &mut Thread, mem: &AddressSpace) {
+        const SIGTRAP: u64 = 1 << 4;
         let task = perf::Task {
             pid: thread.state.pid,
             tid: thread.tid,
             cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
             regs: &thread.cpu,
             mem,
+            blocks_sigtrap: thread.state.signal_mask & SIGTRAP != 0,
         };
-        perf::overflow(&self.processes.perf_events, &self.group, &task);
+        // The `sigtrap` of an event that overflowed, for the thread.
+        for signal in perf::overflow(&self.processes.perf_events, &self.group, &task) {
+            signals::queue(&mut thread.state, signal);
+        }
     }
 
     fn syscall(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {

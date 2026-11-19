@@ -72,3 +72,33 @@ fn native_wait_checks_cancellation() {
         Ok(WaitOutcome::Interrupted)
     );
 }
+/// On Linux the host's NTP state is read without privilege: a tick within
+/// the range Linux takes (90% to 110% of USER_TICK_USEC) and Linux's
+/// tolerance; elsewhere the native host tells none.
+#[test]
+fn native_ntp_state_is_the_hosts() {
+    let state = NativeHost::new().ntp_state();
+    #[cfg(target_os = "linux")]
+    {
+        let state = state.expect("adjtimex reads without privilege");
+        assert!((0..=5).contains(&state.result), "{state:?}");
+        assert!((9_000..=11_000).contains(&state.tick), "{state:?}");
+        assert_eq!(state.tolerance, 32_768_000);
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(state, None);
+}
+/// A recording host gives the state it was set to in place of the
+/// machine's, `None` included.
+#[test]
+fn recorded_ntp_state_overrides_the_machines() {
+    let h = RecordingHost::new();
+    let state = NtpState {
+        tick: 9_999,
+        ..NtpState::default()
+    };
+    h.set_ntp_state(Some(state));
+    assert_eq!(h.ntp_state(), Some(state));
+    h.set_ntp_state(None);
+    assert_eq!(h.ntp_state(), None);
+}

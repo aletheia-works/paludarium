@@ -3878,10 +3878,14 @@ kernel.
   measure it, they count wall time.
 
 - `adjtimex` and `clock_adjtime` on `CLOCK_REALTIME` read the clock's NTP
-  state as Linux starts with it, without revealing the host's:
-  unsynchronised (`STA_UNSYNC`, so the result is `TIME_ERROR`), the errors at
-  16 s, no offset or frequency correction, a time constant of 2, a 10,000 µs
-  tick and no PPS or TAI offset, with the real-time clock's time. They take
+  state. On native Linux the real-time clock is the host's, and so is its
+  state: the host's result, status, errors, corrections, tick and TAI
+  offset, as the host's own `adjtimex` reads them. Elsewhere (WebAssembly,
+  macOS, Windows) it is the state Linux starts with: unsynchronised
+  (`STA_UNSYNC`, so the result is `TIME_ERROR`), the errors at 16 s, no
+  offset or frequency correction, a time constant of 2, a 10,000 µs tick and
+  no PPS or TAI offset. The time is the real-time clock's, in nanoseconds
+  when the status has `STA_NANO`. They take
   only reads (no mode, or adjtime's `ADJ_OFFSET_SS_READ`), after Linux's
   checks of the modes; `adjtimex` writes the structure back whatever the
   result, and `clock_adjtime` reads it before it looks at the clock (other

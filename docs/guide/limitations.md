@@ -508,8 +508,12 @@ verified.
   - The time cannot be set: `settimeofday`, `clock_settime` and an
     `adjtimex` or `clock_adjtime` that changes something give `EPERM` even
     to a caller with `CAP_SYS_TIME`, where Linux sets the clock, its time
-    zone or its NTP state, so the NTP state is always the one Linux starts
-    with. `clock_settime` on a CPU clock named by a negative clock ID gives
+    zone or its NTP state, so the NTP state is only ever read: the host's on
+    native Linux, and elsewhere the one Linux starts with. The host's state
+    is read at each call, so two reads can differ when the host's time
+    daemon changes it in between (chrony, for one, moves the tick by a few
+    microseconds); a comparison with a native run therefore matches only
+    while the host leaves it as it is. `clock_settime` on a CPU clock named by a negative clock ID gives
     `EINVAL` without reading the time, where Linux reads it, finds the task
     and gives `EPERM`, and the auxiliary clocks (`CLOCK_AUX`) are not there.
   - The host's I/O ports cannot be used: `iopl` above level 0 and `ioperm`

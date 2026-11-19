@@ -1179,10 +1179,12 @@ fn port_access_and_accounting_are_refused_after_linux_checks() {
     assert_eq!(f.ret(ports, &[0, 1, 0]), 0);
     assert_eq!(f.ret(ports, &[0, 1, 1]), errno(Errno::EPERM));
 }
-/// adjtimex reads Linux's state at boot and refuses to change it.
+/// adjtimex reads Linux's state at boot where the host tells none, and
+/// refuses to change it.
 #[test]
 fn adjtimex_reads_an_unsynchronised_clock() {
     let mut f = fixture();
+    f.host.set_ntp_state(None);
     f.host
         .set_clock(paludarium_host::ClockId::Realtime, 1_700_000_000_123_456_789);
     let timex = DATA + 0x100;
@@ -1235,6 +1237,84 @@ fn adjtimex_reads_an_unsynchronised_clock() {
     ] {
         assert_eq!(f.ret(305, &[clock, timex]), errno(e));
     }
+}
+/// adjtimex reads the host's NTP state where it tells one, with the time
+/// in nanoseconds under STA_NANO, and in microseconds otherwise.
+#[test]
+fn adjtimex_reads_the_hosts_state() {
+    let mut f = fixture();
+    let mut state = paludarium_host::NtpState {
+        result: 0, // TIME_OK
+        offset: -12,
+        freq: 345,
+        maxerror: 6789,
+        esterror: 10,
+        status: 0x2001, // STA_NANO | STA_PLL
+        constant: 7,
+        precision: 1,
+        tolerance: 32_768_000,
+        tick: 9_999,
+        ppsfreq: 11,
+        jitter: 12,
+        shift: 13,
+        stabil: 14,
+        jitcnt: 15,
+        calcnt: 16,
+        errcnt: 17,
+        stbcnt: 18,
+        tai: 37,
+    };
+    f.host.set_ntp_state(Some(state));
+    f.host
+        .set_clock(paludarium_host::ClockId::Realtime, 1_700_000_000_123_456_789);
+    let timex = DATA + 0x100;
+    f.mem.write(GuestAddr(timex), &[0x5a; 208]).unwrap();
+    f.mem.write(GuestAddr(timex), &[0; 4]).unwrap(); // modes
+    assert_eq!(f.ret(159, &[timex]), 0);
+    let word = |f: &Fixture, at: u64| f.mem.read_u64(GuestAddr(timex + at)).unwrap();
+    let fields: Vec<u64> = [
+        8, 16, 24, 32, 48, 56, 64, 72, 80, 88, 96, 104, 120, 128, 136, 144, 152,
+    ]
+    .iter()
+    .map(|&at| word(&f, at))
+    .collect();
+    assert_eq!(
+        fields,
+        [
+            -12i64 as u64,
+            345,
+            6789,
+            10,
+            7,
+            1,
+            32_768_000,
+            1_700_000_000,
+            123_456_789,
+            9_999,
+            11,
+            12,
+            14,
+            15,
+            16,
+            17,
+            18
+        ]
+    );
+    assert_eq!(word(&f, 40) as u32, 0x2001); // status
+    assert_eq!(word(&f, 112) as u32, 13); // shift
+    assert_eq!(word(&f, 160) as u32, 37); // tai
+    assert_eq!(word(&f, 200), 0x5a5a_5a5a_5a5a_5a5a);
+    // Without STA_NANO the time is in microseconds, and the result is the
+    // host's state too.
+    state.status = 0x40; // STA_UNSYNC
+    state.result = 5; // TIME_ERROR
+    f.host.set_ntp_state(Some(state));
+    f.mem.write_u64(GuestAddr(timex), 0).unwrap();
+    assert_eq!(f.ret(305, &[0, timex]), 5);
+    assert_eq!(word(&f, 80), 123_456);
+    // A change is still refused.
+    f.mem.write_u64(GuestAddr(timex), 0x0001).unwrap();
+    assert_eq!(f.ret(159, &[timex]), errno(Errno::EPERM));
 }
 /// modify_ldt keeps the address space's table as Linux's ldt.c does, and
 /// gives its result as an unsigned int.

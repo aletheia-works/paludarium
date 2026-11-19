@@ -691,12 +691,14 @@ const TIMEX_SIZE: usize = 208;
 /// Reads the real-time clock's NTP state into `timex`, as Linux's
 /// `do_adjtimex`, after checking its `modes` as `timekeeping_validate_timex`
 /// does: only reads are taken (no mode, or `ADJ_OFFSET_SS_READ`), and the
-/// others give `EPERM` ([`set_time_of_day`]). The state is the one Linux
-/// starts with, as nothing here disciplines the clock and the host's is not
-/// revealed: unsynchronised (`STA_UNSYNC`, so the result is `TIME_ERROR`),
-/// with the errors at `NTP_PHASE_LIMIT`, no offset or frequency correction,
-/// a time constant of 2, a tick of `USER_TICK_USEC`, no PPS and no TAI
-/// offset. The time is the real-time clock's, in microseconds.
+/// others give `EPERM` ([`set_time_of_day`]). Where the host tells its own
+/// ([`Host::ntp_state`]), the state is the host's, as the real-time clock
+/// is the host's. Elsewhere it is the one Linux starts with, as nothing
+/// disciplines the clock: unsynchronised (`STA_UNSYNC`, so the result is
+/// `TIME_ERROR`), with the errors at `NTP_PHASE_LIMIT`, no offset or
+/// frequency correction, a time constant of 2, a tick of `USER_TICK_USEC`,
+/// no PPS and no TAI offset. The time is the real-time clock's, in
+/// nanoseconds under `STA_NANO` and in microseconds otherwise.
 fn read_timex(c: &Context<'_>, timex: &mut [u8; TIMEX_SIZE]) -> Result<u64, Errno> {
     const ADJ_OFFSET_SINGLESHOT: u32 = 0x0001;
     const ADJ_FREQUENCY: u32 = 0x0002;
@@ -705,6 +707,9 @@ fn read_timex(c: &Context<'_>, timex: &mut [u8; TIMEX_SIZE]) -> Result<u64, Errn
     const ADJ_ADJTIME: u32 = 0x8000;
     // Linux's PPM_SCALE: 1000 << (NTP_SCALE_SHIFT - SHIFT_USEC).
     const PPM_SCALE: i64 = 1000 << 16;
+    const STA_UNSYNC: i32 = 0x0040;
+    const STA_NANO: i32 = 0x2000;
+    const TIME_ERROR: i32 = 5;
     let word = |at: usize| i64::from_le_bytes(timex[at..at + 8].try_into().unwrap_or_default());
     let modes = u32::from_le_bytes(timex[..4].try_into().unwrap_or_default());
     if modes & ADJ_ADJTIME != 0 {
@@ -725,34 +730,51 @@ fn read_timex(c: &Context<'_>, timex: &mut [u8; TIMEX_SIZE]) -> Result<u64, Errn
     {
         return Err(Errno::EINVAL);
     }
+    let state = c.host.ntp_state().unwrap_or(paludarium_host::NtpState {
+        result: TIME_ERROR,
+        maxerror: 16_000_000, // NTP_PHASE_LIMIT
+        esterror: 16_000_000,
+        status: STA_UNSYNC,
+        constant: 2,
+        precision: 1,
+        tolerance: 32_768_000, // MAXFREQ_SCALED / PPM_SCALE
+        tick: 10_000,          // USER_TICK_USEC
+        ..paludarium_host::NtpState::default()
+    });
     let now = c.host.clock(ClockId::Realtime)?;
+    let fraction = now % 1_000_000_000;
+    let fraction = if state.status & STA_NANO != 0 {
+        fraction
+    } else {
+        fraction / 1000
+    };
     let mut put = |at: usize, value: i64| timex[at..at + 8].copy_from_slice(&value.to_le_bytes());
-    let longs: [(usize, i64); 16] = [
-        (8, 0),           // offset
-        (16, 0),          // freq
-        (24, 16_000_000), // maxerror: NTP_PHASE_LIMIT
-        (32, 16_000_000), // esterror
-        (48, 2),          // constant
-        (56, 1),          // precision
-        (64, 32_768_000), // tolerance: MAXFREQ_SCALED / PPM_SCALE
+    let longs: [(usize, i64); 17] = [
+        (8, state.offset),
+        (16, state.freq),
+        (24, state.maxerror),
+        (32, state.esterror),
+        (48, state.constant),
+        (56, state.precision),
+        (64, state.tolerance),
         (72, (now / 1_000_000_000) as i64),
-        (80, (now % 1_000_000_000 / 1000) as i64),
-        (88, 10_000), // tick: USER_TICK_USEC
-        (96, 0),      // ppsfreq
-        (104, 0),     // jitter
-        (120, 0),     // stabil
-        (128, 0),     // jitcnt
-        (136, 0),     // calcnt
-        (144, 0),     // errcnt
+        (80, fraction as i64),
+        (88, state.tick),
+        (96, state.ppsfreq),
+        (104, state.jitter),
+        (120, state.stabil),
+        (128, state.jitcnt),
+        (136, state.calcnt),
+        (144, state.errcnt),
+        (152, state.stbcnt),
     ];
     for (at, value) in longs {
         put(at, value);
     }
-    put(152, 0); // stbcnt
-    timex[40..44].copy_from_slice(&0x40i32.to_le_bytes()); // status: STA_UNSYNC
-    timex[112..116].fill(0); // shift
-    timex[160..164].fill(0); // tai
-    Ok(5) // TIME_ERROR
+    timex[40..44].copy_from_slice(&state.status.to_le_bytes());
+    timex[112..116].copy_from_slice(&state.shift.to_le_bytes());
+    timex[160..164].copy_from_slice(&state.tai.to_le_bytes());
+    Ok(u64::from(state.result.cast_unsigned()))
 }
 
 /// `adjtimex(buf)` ([`read_timex`]). As Linux's, it writes the structure

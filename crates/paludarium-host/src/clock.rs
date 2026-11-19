@@ -106,6 +106,46 @@ pub(crate) fn native_scheduler_slice() -> Option<crate::SchedulerSlice> {
 pub(crate) fn native_scheduler_slice() -> Option<crate::SchedulerSlice> {
     None
 }
+/// The host's NTP state, from `adjtimex` with no mode, which only reads
+/// and needs no privilege. The kernel's `struct __kernel_timex` is read
+/// as the bytes it is, so the C library's `struct timex` plays no part.
+#[cfg(target_os = "linux")]
+pub(crate) fn native_ntp_state() -> Option<crate::NtpState> {
+    // 208 bytes, aligned for its longs; `modes` (the first four) is 0.
+    let mut timex = [0i64; 26];
+    // SAFETY: `timex` is a live, aligned buffer of the 208 bytes the call
+    // reads and writes.
+    let result = unsafe { libc::syscall(libc::SYS_adjtimex, timex.as_mut_ptr()) };
+    let result = i32::try_from(result).ok().filter(|r| *r >= 0)?;
+    let word = |at: usize| timex[at / 8];
+    // An int field is the low half of its long-sized slot.
+    let int = |at: usize| word(at) as i32;
+    Some(crate::NtpState {
+        result,
+        offset: word(8),
+        freq: word(16),
+        maxerror: word(24),
+        esterror: word(32),
+        status: int(40),
+        constant: word(48),
+        precision: word(56),
+        tolerance: word(64),
+        tick: word(88),
+        ppsfreq: word(96),
+        jitter: word(104),
+        shift: int(112),
+        stabil: word(120),
+        jitcnt: word(128),
+        calcnt: word(136),
+        errcnt: word(144),
+        stbcnt: word(152),
+        tai: int(160),
+    })
+}
+#[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
+pub(crate) fn native_ntp_state() -> Option<crate::NtpState> {
+    None
+}
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn native_wait(
     clock: ClockId,

@@ -270,6 +270,12 @@ pub trait Host: Send + Sync {
     fn scheduler_slice(&self) -> Option<SchedulerSlice> {
         None
     }
+    /// The NTP state of the host's real-time clock, as a read-only
+    /// `adjtimex` gives it; `None` where the host does not tell, and the
+    /// kernel then gives the state Linux starts with.
+    fn ntp_state(&self) -> Option<NtpState> {
+        None
+    }
     /// Waits until a deadline while polling cancellation outside guest memory locks.
     fn wait_until(
         &self,
@@ -342,6 +348,32 @@ pub struct SchedulerSlice {
     pub tick: u64,
 }
 
+/// The NTP state of a real-time clock, as Linux's `adjtimex` reports it in
+/// `struct __kernel_timex` (without its `modes` and `time`), and the call's
+/// result (the clock's state, `TIME_OK` to `TIME_ERROR`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NtpState {
+    pub result: i32,
+    pub offset: i64,
+    pub freq: i64,
+    pub maxerror: i64,
+    pub esterror: i64,
+    pub status: i32,
+    pub constant: i64,
+    pub precision: i64,
+    pub tolerance: i64,
+    pub tick: i64,
+    pub ppsfreq: i64,
+    pub jitter: i64,
+    pub shift: i32,
+    pub stabil: i64,
+    pub jitcnt: i64,
+    pub calcnt: i64,
+    pub errcnt: i64,
+    pub stbcnt: i64,
+    pub tai: i32,
+}
+
 /// The native host (Linux, and the portable parts for macOS and Windows).
 /// Writes are unbuffered from the guest's point of view: every guest
 /// `write` is flushed before it returns.
@@ -375,6 +407,11 @@ impl Host for NativeHost {
     /// slice for this thread is the guest thread's.
     fn scheduler_slice(&self) -> Option<SchedulerSlice> {
         clock::native_scheduler_slice()
+    }
+    /// On Linux, the guest's real-time clock is the host's, so its NTP
+    /// state is the host's too.
+    fn ntp_state(&self) -> Option<NtpState> {
+        clock::native_ntp_state()
     }
     fn wait_until(
         &self,

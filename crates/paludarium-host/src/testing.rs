@@ -28,6 +28,9 @@ struct Streams {
     /// Whether a thread's CPU time is the host thread's, not the virtual
     /// monotonic clock ([`RecordingHost::measure_cpu_time`]).
     cpu_time: bool,
+    /// The NTP state [`Host::ntp_state`] gives in place of the machine's
+    /// ([`RecordingHost::set_ntp_state`]).
+    ntp: Option<Option<crate::NtpState>>,
 }
 
 impl Default for Streams {
@@ -46,6 +49,7 @@ impl Default for Streams {
             output_full: [false; 2],
             network: false,
             cpu_time: false,
+            ntp: None,
         }
     }
 }
@@ -140,6 +144,11 @@ impl RecordingHost {
     /// the virtual clock alone does not make pass.
     pub fn measure_cpu_time(&self) {
         self.lock().cpu_time = true;
+    }
+    /// Gives `state` as the real-time clock's NTP state (`None`: the host
+    /// tells none) in place of the machine's.
+    pub fn set_ntp_state(&self, state: Option<crate::NtpState>) {
+        self.lock().ntp = Some(state);
     }
     /// Makes standard output (`channel` 1) or standard error (2) full, or
     /// gives it room again, for [`Host::output_writable`]; writes still go.
@@ -319,6 +328,17 @@ impl Host for RecordingHost {
     fn scheduler_slice(&self) -> Option<crate::SchedulerSlice> {
         #[cfg(not(target_arch = "wasm32"))]
         return crate::clock::native_scheduler_slice();
+        #[cfg(target_arch = "wasm32")]
+        None
+    }
+    /// The machine's own too, as [`Self::scheduler_slice`], unless
+    /// [`RecordingHost::set_ntp_state`] gave another.
+    fn ntp_state(&self) -> Option<crate::NtpState> {
+        if let Some(state) = self.lock().ntp {
+            return state;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        return crate::clock::native_ntp_state();
         #[cfg(target_arch = "wasm32")]
         None
     }

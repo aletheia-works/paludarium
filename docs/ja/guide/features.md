@@ -3380,10 +3380,13 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   と同じく負の秒数に見えます。`fork` の子はどちらも持たずに始まり、`execve` は引き継ぎます。
   CPU 時間は CPU の時計と同じく数えるので、それを測れない WebAssembly では経過時間を数えます。
 
-- `CLOCK_REALTIME` での `adjtimex` と `clock_adjtime` は、時計の NTP の状態を、ホストのものは
-  見せずに、Linux が起動したときのまま読みます。同期しておらず（`STA_UNSYNC` なので結果は
-  `TIME_ERROR`）、誤差は 16 秒、オフセットと周波数の補正はなく、時定数は 2、ティックは
-  10,000 µs、PPS と TAI のオフセットはなく、時刻は実時間の時計のものです。Linux と同じく
+- `CLOCK_REALTIME` での `adjtimex` と `clock_adjtime` は、時計の NTP の状態を読みます。
+  ネイティブの Linux では実時間の時計はホストのものなので、状態もホストのものです。結果、
+  ステータス、誤差、補正、ティック、TAI のオフセットを、ホスト自身の `adjtimex` が読むとおりに
+  返します。それ以外（WebAssembly、macOS、Windows）では、Linux が起動したときの状態です。
+  同期しておらず（`STA_UNSYNC` なので結果は `TIME_ERROR`）、誤差は 16 秒、オフセットと
+  周波数の補正はなく、時定数は 2、ティックは 10,000 µs、PPS と TAI のオフセットはありません。
+  時刻は実時間の時計のもので、ステータスに `STA_NANO` があればナノ秒です。Linux と同じく
   モードを確かめたうえで、読むこと（モードなし、または adjtime の `ADJ_OFFSET_SS_READ`）
   だけを受けます。`adjtimex` は結果にかかわらず構造体を書き戻し、`clock_adjtime` は時計を
   見る前に構造体を読みます（ほかの時計は `EOPNOTSUPP`、知らない時計は `EINVAL`）。

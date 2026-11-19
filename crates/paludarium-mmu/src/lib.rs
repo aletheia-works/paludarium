@@ -2004,8 +2004,12 @@ impl Default for Tlb {
 /// protection, which is what [`Page::cached_access`] gives, so with no
 /// write while `UFFDIO_WRITEPROTECT` protects the page or its soft-dirty
 /// bit is clear, allows writing, it is no copy on write, and it shows no
-/// shared mapping. It must also not be executable, so that a store never
-/// changes code that was or may be fetched.
+/// shared mapping. It must also not be executable code that an instruction
+/// was fetched from ([`FrameCell::fetched`]), so that a store never changes
+/// code that may be decoded: such a store bumps the code generation. Data on
+/// a page that is also executable, as the heap of SBCL, is written through
+/// the slot until a fetch from the page marks it, which moves the epoch on
+/// first ([`AddressSpaceData::mark_fetched`]).
 ///
 /// A store says it is under way in [`ThreadTlb::storing`], and reads the
 /// epoch again, as [`AddressSpace::write_value`] does.
@@ -2076,8 +2080,12 @@ impl JitSlot {
         let (read, write, words) = match (&entry.frame, &entry.file) {
             (TlbFrame::Bytes(data), None) => {
                 let read = entry.prot.allows_read().then_some(entry.page);
+                // `Relaxed`, as in `AddressSpace::writable`: a page marked
+                // fetched since this entry was remembered moved the epoch
+                // on first, so the slot no longer holds.
+                let code = entry.prot.contains(Prot::EXEC) && entry.fetched.load(Ordering::Relaxed);
                 let write = (entry.prot.contains(Prot::WRITE)
-                    && !entry.prot.contains(Prot::EXEC)
+                    && !code
                     && !entry.cow
                     && entry.shared.is_none())
                 .then_some(entry.page);

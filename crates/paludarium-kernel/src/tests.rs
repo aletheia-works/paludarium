@@ -3041,6 +3041,32 @@ fn getrusage_checks_who_and_the_pointer() {
     assert_eq!(f.ret(98, &[0, 0x10]), errno(Errno::EFAULT));
 }
 #[test]
+fn getrusage_gives_the_peak_resident_size_of_the_process_and_of_its_children() {
+    let mut f = fixture();
+    let maxrss = |f: &mut Fixture, who: u64| {
+        assert_eq!(f.ret(98, &[who, DATA]), 0);
+        let mut bytes = [0u8; 8];
+        f.mem.read(GuestAddr(DATA + 32), &mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
+    };
+    // The address space's own peak, in KiB, for the process and the thread,
+    // once the first call has written the page it fills.
+    maxrss(&mut f, 0);
+    let (peak, _) = f.mem.resident_pages();
+    assert!(peak > 0);
+    assert_eq!(maxrss(&mut f, 0), peak * 4);
+    assert_eq!(maxrss(&mut f, 1), peak * 4);
+    assert_eq!(maxrss(&mut f, u64::MAX), 0);
+    // A peak kept from an address space it left counts while larger.
+    f.kernel.group.keep_peak(peak + 100);
+    assert_eq!(maxrss(&mut f, 0), (peak + 100) * 4);
+    // The children's is the largest reaped one.
+    f.kernel.group.reaped_peak(7);
+    f.kernel.group.reaped_peak(5);
+    assert_eq!(maxrss(&mut f, u64::MAX), 28);
+    assert_eq!(f.kernel.group.waited_peak(), peak + 100);
+}
+#[test]
 fn poll_waits_for_its_timeout_and_dup2_replaces_stdin() {
     let mut f = fixture();
     assert_eq!(f.ret(22, &[DATA + 0x100]), 0);

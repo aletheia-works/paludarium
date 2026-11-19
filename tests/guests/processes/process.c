@@ -6495,6 +6495,129 @@ static int hiwater_case(void) {
     return 0;
 }
 
+/* The maxrss case: getrusage's ru_maxrss is the peak resident size, as
+   VmHWM shows it (kernel/sys.c getrusage, kernel/exit.c wait_task_zombie).
+   Everything runs in forked children: a fork starts with no kept peak,
+   where the process the harness started keeps its launcher's from before
+   its execve. Linux's resident counts are per-CPU and approximate, so the
+   case stays on one CPU, touches whole MiBs and prints differences in MiB. */
+static long mr_get(int who) {
+    struct rusage usage;
+    if (getrusage(who, &usage)) return -1;
+    return usage.ru_maxrss;
+}
+/* Maps `mib` MiB, writes each page and unmaps it: the peak grows by that
+   much and the resident size comes back. */
+static void mr_touch(long mib) {
+    const long page = sysconf(_SC_PAGESIZE);
+    size_t length = (size_t)(mib << 20);
+    char *map = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) _exit(70);
+    madvise(map, length, MADV_NOHUGEPAGE);
+    for (size_t at = 0; at < length; at += (size_t)page) map[at] = 1;
+    munmap(map, length);
+}
+/* Forks a child that sends its starting peak down a pipe, touches `mib`
+   MiB and exits; the parent gets that peak in `start`. With `nested`, the
+   child forks the one that does it and waits for it. */
+static pid_t mr_child(long mib, int nested, long *start) {
+    int pipes[2];
+    if (pipe(pipes)) return -1;
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pipes[0]);
+        if (nested) {
+            pid_t inner = fork();
+            if (inner != 0) {
+                waitpid(inner, NULL, 0);
+                _exit(0);
+            }
+        }
+        long now = mr_get(RUSAGE_SELF);
+        write(pipes[1], &now, sizeof now);
+        mr_touch(mib);
+        _exit(0);
+    }
+    close(pipes[1]);
+    if (read(pipes[0], start, sizeof *start) != sizeof *start) *start = 0;
+    close(pipes[0]);
+    return pid;
+}
+static int maxrss_exec(const char *start, const char *children) {
+    long kept = mr_get(RUSAGE_SELF);
+    printf("after exec: self+%ld children-same=%d\n", hw_mib(kept - atol(start)),
+           mr_get(RUSAGE_CHILDREN) == atol(children));
+    return 0;
+}
+static int maxrss_case(const char *self) {
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(sched_getcpu() < 0 ? 0 : sched_getcpu(), &one);
+    sched_setaffinity(0, sizeof one, &one);
+    fflush(stdout);
+    pid_t measuring = fork();
+    if (measuring != 0) {
+        int status;
+        waitpid(measuring, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+    long hwm, rss;
+    /* Once before, so that what reading takes is there from the start. */
+    hw_read("/proc/self/status", &hwm, &rss);
+    long start = mr_get(RUSAGE_SELF);
+    printf("children at first: %ld\n", mr_get(RUSAGE_CHILDREN));
+    mr_touch(8);
+    long self_peak = mr_get(RUSAGE_SELF);
+    hw_read("/proc/self/status", &hwm, &rss);
+    printf("touched: self+%ld thread-self=%ld hwm-self=%ld\n", hw_mib(self_peak - start),
+           hw_mib(mr_get(1) - self_peak), hw_mib(hwm - self_peak));
+
+    long child_start;
+    pid_t child = mr_child(16, 0, &child_start);
+    struct rusage usage;
+    siginfo_t info;
+    /* A zombie waited for with WNOWAIT reports it too. */
+    memset(&usage, 0, sizeof usage);
+    syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, &usage);
+    printf("zombie: +%ld\n", hw_mib(usage.ru_maxrss - child_start));
+    memset(&usage, 0, sizeof usage);
+    wait4(child, NULL, 0, &usage);
+    printf("waited: +%ld children+%ld self+%ld\n", hw_mib(usage.ru_maxrss - child_start),
+           hw_mib(mr_get(RUSAGE_CHILDREN) - child_start), hw_mib(mr_get(RUSAGE_SELF) - self_peak));
+
+    /* A grandchild's peak comes through the child that waited for it. */
+    long inner_start;
+    child = mr_child(24, 1, &inner_start);
+    memset(&usage, 0, sizeof usage);
+    wait4(child, NULL, 0, &usage);
+    printf("nested: +%ld children+%ld\n", hw_mib(usage.ru_maxrss - inner_start),
+           hw_mib(mr_get(RUSAGE_CHILDREN) - inner_start));
+
+    /* An execve keeps the peak of the address space it leaves, and the
+       children's. */
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        pid_t small = fork();
+        if (small == 0) _exit(0);
+        waitpid(small, NULL, 0);
+        long before = mr_get(RUSAGE_SELF);
+        mr_touch(32);
+        char start_text[24], children_text[24];
+        snprintf(start_text, sizeof start_text, "%ld", before);
+        snprintf(children_text, sizeof children_text, "%ld", mr_get(RUSAGE_CHILDREN));
+        char *arguments[] = {(char *)self, "maxrss-exec", start_text, children_text, NULL};
+        execv(self, arguments);
+        _exit(71);
+    }
+    int status;
+    waitpid(child, &status, 0);
+    printf("exec child: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    fflush(stdout);
+    _exit(0);
+}
+
 /* Writes `text` to clear_refs at `fd`: what write returned, and errno. */
 static void cr_write(int fd, const char *label, const char *text, size_t len) {
     errno = 0;
@@ -32177,6 +32300,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "clear-refs")) return clear_refs_case();
     if (!strcmp(mode, "map-count")) return map_count_case();
     if (!strcmp(mode, "hiwater")) return hiwater_case();
+    if (!strcmp(mode, "maxrss")) return maxrss_case(self);
+    if (!strcmp(mode, "maxrss-exec")) return argc < 4 ? 98 : maxrss_exec(argv[2], argv[3]);
     if (!strcmp(mode, "proc-owners")) return proc_owners_case();
     if (!strcmp(mode, "memory-locks")) return lock_cases();
     if (!strcmp(mode, "x87-arithmetic")) {

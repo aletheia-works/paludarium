@@ -4228,28 +4228,51 @@ fn sys_sched_yield(_c: &mut Context<'_>, _a: [u64; 6]) -> Outcome {
 /// Memory a guest is told it has; like `uname`, the host's is not revealed.
 pub(crate) const SYSINFO_RAM: u64 = 4 << 30;
 
-/// A `struct rusage` with `cpu` nanoseconds as user time. The emulator's
-/// own work for the guest's system calls happens in user space on the host,
-/// so the system time is 0, and memory use is not measured.
-pub(crate) fn rusage(cpu: u64) -> [u8; 144] {
+/// What a `struct rusage` tells: CPU time in nanoseconds and the peak
+/// resident size in pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResourceUsage {
+    pub cpu: u64,
+    pub peak: u64,
+}
+
+/// A `struct rusage` with `usage.cpu` nanoseconds as user time and
+/// `usage.peak` pages as `ru_maxrss` in KiB. The emulator's own work for the
+/// guest's system calls happens in user space on the host, so the system
+/// time is 0, and the other counts are not kept.
+pub(crate) fn rusage(usage: ResourceUsage) -> [u8; 144] {
     let mut bytes = [0u8; 144];
-    bytes[..8].copy_from_slice(&(cpu / 1_000_000_000).to_le_bytes());
-    bytes[8..16].copy_from_slice(&(cpu % 1_000_000_000 / 1000).to_le_bytes());
+    bytes[..8].copy_from_slice(&(usage.cpu / 1_000_000_000).to_le_bytes());
+    bytes[8..16].copy_from_slice(&(usage.cpu % 1_000_000_000 / 1000).to_le_bytes());
+    bytes[32..40].copy_from_slice(&(usage.peak * 4).to_le_bytes());
     bytes
 }
 
 /// `getrusage(who, usage)`: the CPU time of the process (RUSAGE_SELF), the
 /// thread (RUSAGE_THREAD) or the children waited for (RUSAGE_CHILDREN), as
-/// [`rusage`] lays it out; any other `who` is `EINVAL`.
+/// [`rusage`] lays it out; any other `who` is `EINVAL`. `ru_maxrss` is the
+/// process's peak resident size for the first two, as Linux takes
+/// `signal->maxrss` and the address space's high-water mark for both, and
+/// the largest of the reaped children's for RUSAGE_CHILDREN.
 fn sys_getrusage(c: &mut Context<'_>, a: [u64; 6]) -> Outcome {
     let thread = crate::account_cpu(c.host, c.group, c.process, c.tid);
-    let cpu = match a[0] as i32 {
-        0 => c.group.process_cpu(),
-        1 => thread,
-        -1 => c.processes.children_cpu(c.process.pid),
+    let own = || c.group.peak(c.mem.resident_pages().0);
+    let usage = match a[0] as i32 {
+        0 => ResourceUsage {
+            cpu: c.group.process_cpu(),
+            peak: own(),
+        },
+        1 => ResourceUsage {
+            cpu: thread,
+            peak: own(),
+        },
+        -1 => ResourceUsage {
+            cpu: c.processes.children_cpu(c.process.pid),
+            peak: c.group.children_peak(),
+        },
         _ => return err(Errno::EINVAL),
     };
-    match c.mem.write(GuestAddr(a[1]), &rusage(cpu)) {
+    match c.mem.write(GuestAddr(a[1]), &rusage(usage)) {
         Ok(()) => ok(0),
         Err(_) => err(Errno::EFAULT),
     }

@@ -627,6 +627,14 @@ impl crate::Processes {
         }
         self.changed().notify();
     }
+    /// What a tracer's wait reports of a tracee's process: its CPU time,
+    /// and the peak resident size as Linux's `getrusage(RUSAGE_BOTH)` gives.
+    fn usage(group: &crate::ThreadGroup) -> crate::syscalls::ResourceUsage {
+        crate::syscalls::ResourceUsage {
+            cpu: group.process_cpu(),
+            peak: group.waited_peak(),
+        }
+    }
     /// The ptrace stop or exit of a task traced by `waiter` that a wait
     /// for `wanted` reports, as Linux's `ptrace_do_wait` finds it, and
     /// whether any task it traces is wanted at all. A stop is reported
@@ -639,7 +647,10 @@ impl crate::Processes {
         space: &crate::namespaces::Namespace,
         wanted: Wanted,
         wait: WaitFor,
-    ) -> (Option<(u32, ChildEvent, u64, u32)>, bool) {
+    ) -> (
+        Option<(u32, ChildEvent, crate::syscalls::ResourceUsage, u32)>,
+        bool,
+    ) {
         let groups = self.traced_groups();
         let mut released = None;
         let found = {
@@ -679,7 +690,7 @@ impl crate::Processes {
                         ExitStatus::Signaled(signal) if dumped => ChildEvent::Dumped(signal),
                         status => ChildEvent::Exited(status),
                     };
-                    found = Some((tid, event, group.process_cpu(), uid, !wait.keep));
+                    found = Some((tid, event, Self::usage(group), uid, !wait.keep));
                     break;
                 }
                 any = true;
@@ -695,7 +706,7 @@ impl crate::Processes {
                     found = Some((
                         tid,
                         ChildEvent::Trapped(code),
-                        group.process_cpu(),
+                        Self::usage(group),
                         uid,
                         false,
                     ));

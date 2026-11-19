@@ -48,10 +48,24 @@ fn mprotect_empties_the_slots_and_a_read_only_page_is_only_read() {
 }
 
 #[test]
-fn an_executable_page_is_never_written_through_its_slot() {
+fn an_executable_page_is_written_through_its_slot_until_a_fetch_from_it() {
     let m = space(Prot::from_bits(7).unwrap());
     m.jit_write_value(GuestAddr(AT), 8, 5).unwrap();
+    assert_eq!(m.jit_slot(AT), (true, AT, AT));
+    let generation = m.code_generation();
+    m.fetch(GuestAddr(AT), &mut [0]).unwrap();
+    assert!(!m.jit_slot(AT).0);
+    m.jit_write_value(GuestAddr(AT), 8, 6).unwrap();
     assert_eq!(m.jit_slot(AT), (true, AT, NO_PAGE));
+    assert_ne!(m.code_generation(), generation);
+}
+
+#[test]
+fn a_fetch_from_another_page_leaves_the_slot_of_this_one_writing() {
+    let m = space(Prot::from_bits(7).unwrap());
+    m.fetch(GuestAddr(AT + PAGE_SIZE), &mut [0]).unwrap();
+    m.jit_write_value(GuestAddr(AT), 8, 5).unwrap();
+    assert_eq!(m.jit_slot(AT), (true, AT, AT));
 }
 
 #[test]

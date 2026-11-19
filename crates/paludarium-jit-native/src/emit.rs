@@ -361,9 +361,9 @@ impl Emitter<'_, '_> {
             _ => self.b.ins().load(I64, flags, at, 0),
         };
         // An access the code makes itself changes no code: a slot never
-        // lets it write an executable page. A change another thread makes
-        // shows at the next call or after the block, as the interpreter
-        // sees it after the instruction.
+        // lets it write a page an instruction was fetched from. A change
+        // another thread makes shows at the next call or after the block,
+        // as the interpreter sees it after the instruction.
         let fast_status = self.constant(DONE);
         self.b
             .ins()

@@ -3738,7 +3738,14 @@ kernel.
   child starts from zero, and its time joins its parent's children's when it
   is waited for. `getrusage`, `times` and the rusage of `wait4` and `waitid`
   report it all as user time, as the emulator's work for system calls runs
-  in the host's user space; memory use is not measured.
+  in the host's user space. Their `ru_maxrss` is the peak resident size in
+  KiB, the same peak `VmHWM` shows: for the process (`RUSAGE_SELF`, and
+  `RUSAGE_THREAD` too), the largest of its address space's and of those it
+  left by `execve` or exited in; for `RUSAGE_CHILDREN`, the largest of the
+  children waited for and of their own children; and a wait's rusage gives
+  the child's and its children's together, as Linux's `RUSAGE_BOTH`. A
+  forked child starts from zero, and an `execve` keeps both. The other
+  counts (faults, context switches, blocks) are 0.
 
 - A negative clock ID names a task's CPU clock, as Linux's `pid_for_clock`
   takes it apart: the task's number in the caller's PID namespace

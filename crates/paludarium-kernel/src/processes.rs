@@ -1477,7 +1477,7 @@ impl Processes {
         space: &Namespace,
         wanted: Wanted,
         wait: WaitFor,
-    ) -> Result<Option<(u32, ChildEvent, u64, u32)>, Errno> {
+    ) -> Result<Option<(u32, ChildEvent, crate::syscalls::ResourceUsage, u32)>, Errno> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let matching = |pid: u32, entry: &Entry| {
             entry.parent == parent
@@ -1514,21 +1514,29 @@ impl Processes {
                     _ => (wait.continues && entry.continue_report).then_some(ChildEvent::Continued),
                 },
             }?;
-            let cpu = entry.group.process_cpu().saturating_add(entry.children_cpu);
-            Some((pid, event, cpu, entry.group.task_ids(pid, pid).uid))
+            // What `getrusage(RUSAGE_BOTH)` gives of the child: its CPU time
+            // and its children's, and the largest peak among them.
+            let usage = crate::syscalls::ResourceUsage {
+                cpu: entry.group.process_cpu().saturating_add(entry.children_cpu),
+                peak: entry.group.waited_peak(),
+            };
+            Some((pid, event, usage, entry.group.task_ids(pid, pid).uid))
         });
         let number = ready.map(|(pid, ..)| space.number(pid));
-        if let Some((pid, event, cpu, _)) = ready
+        if let Some((pid, event, usage, _)) = ready
             && !wait.keep
         {
             match event {
-                // A reaped child's CPU time joins its parent's children's.
-                // So do its read and write counts, to its parent's process.
+                // A reaped child's CPU time joins its parent's children's,
+                // and its peak (its own or its children's) is kept as theirs
+                // if it is the largest. So do its read and write counts join
+                // its parent's process's.
                 ChildEvent::Exited(_) | ChildEvent::Dumped(_) => {
                     let io = entries.get(&pid).map(|child| child.group.io(None));
                     self.release(&mut entries, pid);
                     if let Some(parent) = entries.get_mut(&parent) {
-                        parent.children_cpu = parent.children_cpu.saturating_add(cpu);
+                        parent.children_cpu = parent.children_cpu.saturating_add(usage.cpu);
+                        parent.group.reaped_peak(usage.peak);
                         if let Some(io) = io {
                             parent.group.reaped_io(io);
                         }
@@ -1549,7 +1557,7 @@ impl Processes {
         }
         Ok(ready
             .zip(number)
-            .map(|((_, event, cpu, uid), number)| (number, event, cpu, uid)))
+            .map(|((_, event, usage, uid), number)| (number, event, usage, uid)))
     }
     /// Stops `group` (process `pid`) on `signal`. A new group stop is
     /// recorded for the parent's wait, and the parent gets SIGCHLD unless it
@@ -3495,7 +3503,7 @@ impl Kernel {
         };
         loop {
             let ticket = self.processes.changed().value();
-            if let Some((pid, event, cpu, _)) =
+            if let Some((pid, event, usage, _)) =
                 self.reap_any(thread, &space, wanted, wait, a[2] & WNOTHREAD != 0)?
             {
                 let raw = match event {
@@ -3515,7 +3523,7 @@ impl Kernel {
                         .map_err(|_| Errno::EFAULT)?;
                 }
                 if a[3] != 0 {
-                    mem.write(GuestAddr(a[3]), &crate::syscalls::rusage(cpu))
+                    mem.write(GuestAddr(a[3]), &crate::syscalls::rusage(usage))
                         .map_err(|_| Errno::EFAULT)?;
                 }
                 return Ok(u64::from(pid));
@@ -3545,7 +3553,7 @@ impl Kernel {
         wanted: Wanted,
         wait: WaitFor,
         only_thread: bool,
-    ) -> Result<Option<(u32, ChildEvent, u64, u32)>, Errno> {
+    ) -> Result<Option<(u32, ChildEvent, crate::syscalls::ResourceUsage, u32)>, Errno> {
         let own = self.processes.reap(self.process.pid, space, wanted, wait);
         if matches!(own, Ok(Some(_))) || !self.processes.traces.any() {
             return own;
@@ -3569,10 +3577,10 @@ impl Kernel {
     /// with a child.
     fn waitid(&self, thread: &mut Thread, mem: &AddressSpace, a: [u64; 6]) -> Result<u64, Errno> {
         let found = self.waitid_child(thread, a);
-        if let Ok(Some((_, _, cpu, _))) = found
+        if let Ok(Some((_, _, usage, _))) = found
             && a[4] != 0
         {
-            mem.write(GuestAddr(a[4]), &crate::syscalls::rusage(cpu))
+            mem.write(GuestAddr(a[4]), &crate::syscalls::rusage(usage))
                 .map_err(|_| Errno::EFAULT)?;
         }
         if a[2] != 0 {
@@ -3618,7 +3626,7 @@ impl Kernel {
         &self,
         thread: &mut Thread,
         a: [u64; 6],
-    ) -> Result<Option<(u32, ChildEvent, u64, u32)>, Errno> {
+    ) -> Result<Option<(u32, ChildEvent, crate::syscalls::ResourceUsage, u32)>, Errno> {
         const KNOWN: u64 =
             WNOHANG | 2 | WEXITED | 8 | WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
         let options = u64::from(a[3] as u32);
@@ -4956,6 +4964,8 @@ impl Kernel {
         self.group.reset_namespaces(self.process.pid, namespaces);
         thread.state.credentials = credentials;
         self.processes.mark_executed(self.process.pid);
+        // The address space it leaves keeps its peak (`exec_mm_put_old`).
+        self.group.keep_peak(mem.resident_pages().0);
         self.exec_memory = Some(Arc::new(memory));
         self.release_vfork();
         Ok(closed)

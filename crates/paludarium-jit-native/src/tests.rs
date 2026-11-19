@@ -801,3 +801,28 @@ fn a_store_after_clear_refs_makes_the_page_soft_dirty_again() {
     assert_eq!((ran, word, cleared), (2, 0x5555, Some(0)));
     assert_eq!(soft_dirty(&memory), 1);
 }
+
+#[test]
+fn a_store_to_an_executable_page_nothing_was_fetched_from_keeps_the_code() {
+    let mut generation = 0;
+    let (ran, word, memory) = store_after(|m| {
+        m.protect(GuestAddr(DATA), PAGE_SIZE, Prot::from_bits(7).unwrap())
+            .unwrap();
+        generation = m.code_generation();
+    });
+    assert_eq!((ran, word), (2, 0x5555));
+    assert_eq!(memory.code_generation(), generation);
+}
+
+#[test]
+fn a_store_to_an_executable_page_an_instruction_was_fetched_from_moves_the_code() {
+    let mut generation = 0;
+    let (ran, word, memory) = store_after(|m| {
+        m.protect(GuestAddr(DATA), PAGE_SIZE, Prot::from_bits(7).unwrap())
+            .unwrap();
+        m.fetch(GuestAddr(DATA), &mut [0]).unwrap();
+        generation = m.code_generation();
+    });
+    assert_eq!((ran, word), (2, 0x5555));
+    assert_ne!(memory.code_generation(), generation);
+}

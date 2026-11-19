@@ -329,13 +329,15 @@ struct Superblock {
     minor: u64,
     numbers: Arc<Numbers>,
     settings: Mutex<Settings>,
+    /// What its files take, held to the settings' size and inodes.
+    usage: Arc<crate::Usage>,
     owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 /// What a tmpfs superblock was mounted or last remounted with.
 #[derive(Clone)]
 pub struct Settings {
     /// Its size in 4 KiB blocks and its inodes, 0 for no limit, which
-    /// `statfs` reports (and nothing enforces).
+    /// `statfs` reports and its files are held to (`ENOSPC`).
     pub blocks: u64,
     pub inodes: u64,
     /// What mountinfo shows of the superblock after `rw`: the common
@@ -1375,10 +1377,13 @@ impl NamespacedFs {
         let minor = Numbers::take(&numbers.minors, 1);
         let state = Arc::new(SuperState::default());
         state.read_only.store(new.read_only, Ordering::SeqCst);
+        let usage = new.fs.usage();
+        usage.set_limits(new.settings.blocks, new.settings.inodes);
         let sb = Arc::new(Superblock {
             fs: Arc::new(new.fs),
             minor,
             numbers: Arc::clone(numbers),
+            usage,
             settings: Mutex::new(new.settings),
             owner: new.owner,
         });
@@ -2442,6 +2447,7 @@ impl NamespacedFs {
                     let files = stats.files.saturating_sub(stats.files_free);
                     let mut settings = lock(&sb.settings);
                     if let Some(new) = configure(Some((&settings, used, files)))? {
+                        sb.usage.set_limits(new.blocks, new.inodes);
                         *settings = new;
                     }
                 }

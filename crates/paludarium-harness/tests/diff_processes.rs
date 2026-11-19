@@ -832,6 +832,7 @@ mod linux {
         processes_listings => ("listings","process"),
         processes_generated_binds => ("generated-binds","process"),
         processes_generated_changes => ("generated-changes","process"),
+        processes_tmpfs_limits => ("tmpfs-limits","process"),
         processes_beneath => ("beneath","process"),
         processes_propagation => ("propagation","process"),
         processes_proc_other_mounts => ("proc-other-mounts","process"),

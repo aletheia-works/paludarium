@@ -25,6 +25,7 @@
 #include <sys/sendfile.h>
 #include <sys/resource.h>
 #include <sys/vfs.h>
+#include <sys/statvfs.h>
 #include <sys/xattr.h>
 #include <sys/prctl.h>
 #include <sys/time.h>
@@ -11235,6 +11236,145 @@ static int generated_binds_case(void) {
     gb_path(path, "d");
     rmdir(path);
     printf("cleaned=%d\n", rmdir(gb_base) == 0);
+    return 0;
+}
+
+/* The tmpfs-limits case: a tmpfs mount's size and inodes hold its files,
+   in a mount namespace of a user namespace of its own, and the statfs
+   flags of /proc and /dev. Only errno values, counts and flags are
+   printed. */
+static char tl_base[] = "/tmp/paludarium-tmpfs-limits-XXXXXX";
+static int tl_err(long r) { return r < 0 ? -errno : (int)r; }
+static void tl_statfs(const char *what, const char *m) {
+    struct statfs fs;
+    if (statfs(m, &fs)) {
+        printf("%s statfs=%d\n", what, -errno);
+        return;
+    }
+    printf("%s blocks=%ld free=%ld avail=%ld files=%ld ffree=%ld\n", what, (long)fs.f_blocks, (long)fs.f_bfree,
+           (long)fs.f_bavail, (long)fs.f_files, (long)fs.f_ffree);
+}
+static int tl_inner(const char *m) {
+    char a[320], b[320], d[320], s[320];
+    snprintf(a, sizeof a, "%s/a", m);
+    snprintf(b, sizeof b, "%s/b", m);
+    snprintf(d, sizeof d, "%s/d", m);
+    snprintf(s, sizeof s, "%s/s", m);
+    printf("mount=%d\n", tl_err(mount("none", m, "tmpfs", 0, "size=8k,nr_inodes=4,huge=never")));
+    tl_statfs("fresh", m);
+    static char page[8192];
+    memset(page, 'p', sizeof page);
+    int fd = open(a, O_RDWR | O_CREAT, 0600);
+    printf("write=%d short=%d full=%d\n", tl_err(write(fd, page, 4096)), tl_err(write(fd, page, 8192)),
+           tl_err(write(fd, page, 1)));
+    struct stat st;
+    fstat(fd, &st);
+    printf("size=%ld blocks=%ld\n", (long)st.st_size, (long)st.st_blocks);
+    tl_statfs("full", m);
+    printf("overwrite=%d append=%d\n", tl_err(pwrite(fd, page, 4096, 0)),
+           tl_err(pwrite(fd, page, 1, 8192)));
+    printf("truncate=%d\n", tl_err(ftruncate(fd, 4096)));
+    printf("fallocate big=%d\n", tl_err(fallocate(fd, 0, 0, 12288)));
+    tl_statfs("after big", m);
+    printf("fallocate=%d\n", tl_err(fallocate(fd, 0, 4096, 4096)));
+    tl_statfs("allocated", m);
+    printf("mkdir=%d symlink=%d\n", tl_err(mkdir(d, 0755)), tl_err(symlink("a", s)));
+    tl_statfs("inodes", m);
+    printf("no inode: create=%d mkdir=%d link=%d symlink=%d mknod=%d exists=%d\n",
+           tl_err(open(b, O_RDWR | O_CREAT, 0600)), tl_err(mkdir(b, 0755)), tl_err(link(a, b)),
+           tl_err(symlink("a", b)), tl_err(mknod(b, S_IFIFO | 0600, 0)), tl_err(mkdir(d, 0755)));
+    printf("unlink=%d link=%d\n", tl_err(unlink(s)), tl_err(link(a, b)));
+    tl_statfs("linked", m);
+    printf("unlink second=%d\n", tl_err(unlink(b)));
+    tl_statfs("unlinked", m);
+    char longer[201];
+    memset(longer, 'x', 200);
+    longer[200] = 0;
+    printf("long symlink=%d there=%d\n", tl_err(symlink(longer, s)), tl_err(lstat(s, &st)));
+    tl_statfs("no page", m);
+    printf("unlink open=%d\n", tl_err(unlink(a)));
+    tl_statfs("open", m);
+    close(fd);
+    tl_statfs("closed", m);
+    printf("remount small=%d\n", tl_err(mount(NULL, m, NULL, MS_REMOUNT, "size=0k")));
+    printf("remount=%d\n", tl_err(mount(NULL, m, NULL, MS_REMOUNT, "size=16k")));
+    printf("long symlink=%d\n", tl_err(symlink(longer, s)));
+    tl_statfs("remounted", m);
+    fd = open(a, O_RDWR | O_CREAT | O_APPEND, 0600);
+    printf("write=%d more=%d\n", tl_err(write(fd, page, 8192)), tl_err(write(fd, page, 8192)));
+    tl_statfs("again", m);
+    close(fd);
+    unlink(a);
+    unlink(s);
+    rmdir(d);
+    printf("umount=%d\n", tl_err(umount2(m, 0)));
+    return 0;
+}
+/* statfs's f_flags of a file of the kernel's own mounts: ST_NOSUID,
+   ST_NODEV, ST_NOEXEC and ST_RDONLY, with ST_RELATIME where `relatime` is
+   asked for (a container's /dev, a tmpfs, may not have it). */
+static void tl_flags(const char *what, const char *path, int relatime) {
+    struct statfs fs;
+    long mask = ST_NOSUID | ST_NODEV | ST_NOEXEC | ST_RDONLY | (relatime ? ST_RELATIME : 0);
+    if (statfs(path, &fs)) {
+        printf("%s=%d", what, -errno);
+        return;
+    }
+    printf("%s=%#lx", what, (long)fs.f_flags & mask);
+}
+static int tmpfs_limits_case(void) {
+    printf("flags");
+    tl_flags(" proc", "/proc", 1);
+    tl_flags(" status", "/proc/self/status", 1);
+    tl_flags(" pts", "/dev/pts", 1);
+    tl_flags(" ptmx", "/dev/pts/ptmx", 1);
+    tl_flags(" mqueue", "/dev/mqueue", 1);
+    tl_flags(" null", "/dev/null", 0);
+    tl_flags(" dev", "/dev", 0);
+    int pipes[2];
+    char link[64];
+    if (pipe(pipes)) return 91;
+    snprintf(link, sizeof link, "/proc/self/fd/%d", pipes[0]);
+    tl_flags(" pipe-link", link, 1);
+    struct statfs fs, tmp;
+    int fd = open("/proc/self/status", O_RDONLY);
+    printf(" fd-status=%#lx", fstatfs(fd, &fs) ? -1L : (long)fs.f_flags & (ST_NOSUID | ST_NODEV | ST_NOEXEC | ST_RELATIME));
+    close(fd);
+    if (!mkdtemp(tl_base)) return 93;
+    char file[300];
+    snprintf(file, sizeof file, "%s/f", tl_base);
+    fd = open(file, O_RDWR | O_CREAT, 0600);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    printf(" file-link=%d\n", !statfs(link, &fs) && !statfs(tl_base, &tmp) && fs.f_flags == tmp.f_flags);
+    close(fd);
+    unlink(file);
+    close(pipes[0]);
+    close(pipes[1]);
+    chmod(tl_base, 0755);
+    char m[300];
+    snprintf(m, sizeof m, "%s/m", tl_base);
+    mkdir(m, 0755);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) {
+            printf("unshare errno=%d\n", errno);
+            _exit(90);
+        }
+        char map[64];
+        snprintf(map, sizeof map, "0 %d 1", (int)uid);
+        int setgroups = mt_write("/proc/self/setgroups", "deny");
+        int uids = mt_write("/proc/self/uid_map", map);
+        snprintf(map, sizeof map, "0 %d 1", (int)gid);
+        printf("maps=%d %d %d\n", setgroups, uids, mt_write("/proc/self/gid_map", map));
+        _exit(tl_inner(m));
+    }
+    printf("status=%d\n", reaped(child));
+    rmdir(m);
+    printf("cleaned=%d\n", rmdir(tl_base) == 0);
     return 0;
 }
 
@@ -31389,6 +31529,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
     if (!strcmp(mode, "generated-changes")) return generated_changes_case();
+    if (!strcmp(mode, "tmpfs-limits")) return tmpfs_limits_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
     if (!strcmp(mode, "propagation")) return propagation_case();
     if (!strcmp(mode, "mount-flags-id")) {

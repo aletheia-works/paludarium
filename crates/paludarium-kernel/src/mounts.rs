@@ -3,7 +3,8 @@
 //! ([`paludarium_vfs::MountTable`]).
 //!
 //! `mount` makes new tmpfs mounts (`shmem_parse_one`'s options, sizes and
-//! modes as `statfs` and `stat` report them, with nothing enforced), bind
+//! modes as `statfs` and `stat` report them, the size and inodes holding
+//! its files to them with `ENOSPC`), bind
 //! mounts (`MS_BIND`, with `MS_REC` the mounts below too), remounts a
 //! superblock (`MS_REMOUNT`) or a mount's flags alone (`MS_REMOUNT |
 //! MS_BIND`), and changes a mount's propagation type (`MS_SHARED`,

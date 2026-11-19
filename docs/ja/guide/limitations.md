@@ -536,9 +536,12 @@ paludarium は、まだ若いプロジェクトです。次のことは、今は
   グループの番号はこのマシンのマウントの中だけで 1 から数えます。Linux ではホストのものと
   共通です。`propagate_from:` は名前空間のルートから求め、`chroot` のあとの読み手の
   ルートからではありません。`MS_RDONLY`（`EROFS`）、`noexec`、`nodev`、`nosuid` は
-  効かせますが、tmpfs のマウントの `size`、`nr_blocks`、`nr_inodes` は返すだけで効かせ
-  ません（メモリ上のファイルシステムが埋まるまで埋まらず、その大きさで `ENOSPC` には
-  なりません）。atime のフラグ、`sync`、`dirsync`、`mand` も効きません。ここのマウントが
+  効かせ、tmpfs のマウントの `size`、`nr_blocks`、`nr_inodes` も効かせますが、
+  マッピングが書くものには効きません（大きさを超える書き込みのフォールトは `SIGBUS` に
+  ならず、ページは大きさにかかわらずファイルに戻ります）。拡張属性は inode の分を
+  使いません（`shmem_xattr_handler_set` のように数えて、超えたときの `setxattr` の
+  `ENOSPC` にはなりません）。起動したときからあるルートには、`fallocate` の上限（返す
+  メモリーの大きさ）のほかに上限がありません。atime のフラグ、`sync`、`dirsync`、`mand` も効きません。ここのマウントが
   持つデバイスノードはホストのディレクトリのものだけなので（その `mknod` は `EPERM`）、
   `nodev` が断るのもそれだけです。
   `huge`、`mpol`、`noswap`、クォータのオプションは受け取り、Linux と同じように確かめて

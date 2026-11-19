@@ -1610,7 +1610,15 @@ kernel.
   its root is a directory of mode 01777 owned by the caller's filesystem
   IDs, unless `mode`, `uid` and `gid` say otherwise. `statfs` gives it
   `TMPFS_MAGIC` and the size and inodes it was mounted with (half the
-  memory `sysinfo` reports by default, 0 for no limit), and
+  memory `sysinfo` reports by default, 0 for no limit), against what its
+  files take, which they are held to as tmpfs holds them: a write stops
+  at the first page past the size (a short write, `ENOSPC` when nothing
+  fits), `fallocate` allocates all of its range or none (`ENOSPC`), a
+  long symbolic link (past 127 bytes) takes a page, and each new inode and
+  each further name of a file (`link`) takes one of the inodes (`ENOSPC`
+  for none left), which an unlinked file still open keeps until its last
+  close; a remount changes the limits. The files are held as `shmem`
+  counts them (`shmem_inode_acct_blocks`, `shmem_reserve_inode`), and
   `/proc/self/mountinfo` and `/proc/self/mounts` list it with its source,
   its `nosuid`, `nodev`, `noexec`, `noatime`, `nodiratime` and `relatime`,
   and tmpfs's options as Linux's `shmem_show_options` prints them. A path
@@ -1711,7 +1719,13 @@ kernel.
   writing a regular file, a directory or a symbolic link before its
   permission is checked (`sb_permission`). `statfs`'s `f_flags` gives the
   mount's flags (`ST_RDONLY`, `ST_NOSUID`, `ST_NODEV`, `ST_NOEXEC`,
-  `ST_NOATIME`, `ST_NODIRATIME`, `ST_RELATIME`), as `flags_by_mnt` does.
+  `ST_NOATIME`, `ST_NODIRATIME`, `ST_RELATIME`), as `flags_by_mnt` does;
+  for `/proc` and `/dev` those Linux mounts them with: `/proc` and
+  `/dev/mqueue` `nosuid`, `nodev`, `noexec` and `relatime`, `/dev/pts`
+  `nosuid`, `noexec` and `relatime`, and the rest of `/dev` (a devtmpfs)
+  `nosuid` and `relatime`. A link in `/proc/self/fd` gives its file's, and
+  the kernel's internal mounts (pipes, sockets, anonymous inodes, pidfs,
+  memfd, secretmem, a queue `mq_open` opened) `ST_VALID` alone.
 - `mount` with `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` or `MS_UNBINDABLE` (and
   `MS_REC` for the mounts on the target too) changes a mount's propagation
   type, after `do_change_type`'s checks: the root of a mount (`EINVAL`),

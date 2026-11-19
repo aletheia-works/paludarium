@@ -632,10 +632,14 @@ verified.
   count from 1 among this machine's mounts alone, where Linux's are
   shared with the host's. `propagate_from:` is found from the namespace's
   root, not the reader's after `chroot`. `MS_RDONLY` (`EROFS`), `noexec`,
-  `nodev` and `nosuid` are enforced, but a tmpfs mount's `size`,
-  `nr_blocks` and `nr_inodes` are reported and not enforced (it fills up
-  only as the in-memory filesystem does, never `ENOSPC` at its size), nor
-  are the atime flags, `sync`, `dirsync` and `mand`; no mount here holds a
+  `nodev` and `nosuid` are enforced, and so are a tmpfs mount's `size`,
+  `nr_blocks` and `nr_inodes`, but not for what a mapping writes (a write
+  fault past the size is no `SIGBUS`, and the pages go back to the file
+  whatever its size), and its extended attributes take none of the inodes'
+  room (`ENOSPC` from `setxattr` past it, as `shmem_xattr_handler_set`
+  counts them, does not happen); the root from start-up has no limit but
+  `fallocate`'s, the memory reported. Not enforced either are the atime
+  flags, `sync`, `dirsync` and `mand`; no mount here holds a
   device node but a host directory's (`mknod` of one is `EPERM`), so
   `nodev` only refuses those;
   `huge`, `mpol`, `noswap` and the quota options are taken, checked as

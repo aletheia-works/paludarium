@@ -1416,7 +1416,15 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   Linux と同じく空いているいちばん小さいデバイスと ID を持ちます。ルートは、`mode`、`uid`、
   `gid` で変えなければ、呼び出し元のファイルシステム ID が持つモード 01777 のディレクトリ
   です。`statfs` は `TMPFS_MAGIC` と、マウントしたときの大きさと inode の数（既定は
-  `sysinfo` が返すメモリーの半分、0 は上限なし）を返し、`/proc/self/mountinfo` と
+  `sysinfo` が返すメモリーの半分、0 は上限なし）と、ファイルが使っている分を返します。
+  ファイルは tmpfs と同じくその大きさと inode の数に収めます。書き込みは大きさを
+  超える最初のページで止まり（短い書き込み。何も入らなければ `ENOSPC`）、`fallocate` は
+  範囲をすべて割り当てるか何も割り当てません（`ENOSPC`）。長いシンボリックリンク
+  （127 バイトを超えるもの）は 1 ページを使い、新しい inode とファイルの 2 つめ以降の
+  名前（`link`）はそれぞれ inode を 1 つ使います（残っていなければ `ENOSPC`）。消した
+  けれどまだ開いているファイルは、最後に閉じるまでその分を持ちます。マウントし直すと
+  上限が変わります。数え方は `shmem` の `shmem_inode_acct_blocks` と
+  `shmem_reserve_inode` と同じです。`/proc/self/mountinfo` と
   `/proc/self/mounts` は、ソース、`nosuid`・`nodev`・`noexec`・`noatime`・`nodiratime`・
   `relatime`、Linux の `shmem_show_options` が出す tmpfs のオプションとともにそれを並べ
   ます。パスは通るディレクトリごとにいちばん上のマウントに入り、マウントのルートでの
@@ -1507,7 +1515,12 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   ディレクトリ、シンボリックリンクに書くことも許可を確かめる前に断ります
   （`sb_permission`）。`statfs` の `f_flags` は、`flags_by_mnt` と同じくマウントの
   フラグ（`ST_RDONLY`、`ST_NOSUID`、`ST_NODEV`、`ST_NOEXEC`、`ST_NOATIME`、
-  `ST_NODIRATIME`、`ST_RELATIME`）を返します。
+  `ST_NODIRATIME`、`ST_RELATIME`）を返します。`/proc` と `/dev` では Linux がそれを
+  マウントするときのフラグです。`/proc` と `/dev/mqueue` は `nosuid`・`nodev`・
+  `noexec`・`relatime`、`/dev/pts` は `nosuid`・`noexec`・`relatime`、ほかの `/dev`
+  （devtmpfs）は `nosuid`・`relatime` です。`/proc/self/fd` のリンクはそのファイルの
+  ものを返し、カーネルの内部のマウント（パイプ、ソケット、匿名 inode、pidfs、memfd、
+  secretmem、`mq_open` で開いたキュー）は `ST_VALID` だけです。
 - `MS_SHARED`、`MS_PRIVATE`、`MS_SLAVE`、`MS_UNBINDABLE` 付きの `mount`（`MS_REC` が
   あればターゲットの上のマウントも）は、`do_change_type` の確認のあと、マウントの伝播の
   種類を変えます。マウントのルートであること（`EINVAL`）、種類が 1 つでほかのフラグが

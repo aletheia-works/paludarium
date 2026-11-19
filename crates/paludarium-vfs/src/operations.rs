@@ -154,14 +154,20 @@ impl HostFs for MemFs {
         set_node_mtime(&mut lock(&node), mtime);
         Ok(())
     }
-    /// A tmpfs of [`MEMORY_BYTES`]: the blocks and inodes used are what the
-    /// tree holds.
+    /// A tmpfs of [`MEMORY_BYTES`], or of the size and inodes a mount
+    /// gave it: the blocks and inodes used are what the files take.
     fn statfs(&self, path: &[u8]) -> Result<FsStats, Errno> {
         let t = lock(&self.tree);
         t.resolve(path, true)?;
         let used = t.used_blocks();
-        let blocks = MEMORY_BYTES / BLOCK;
-        let files = 1 << 20;
+        let blocks = match t.usage.max_pages() {
+            0 => MEMORY_BYTES / BLOCK,
+            max => max,
+        };
+        let files = match t.usage.max_inodes() {
+            0 => 1 << 20,
+            max => max,
+        };
         Ok(FsStats {
             kind: TMPFS_MAGIC,
             block_size: BLOCK,
@@ -169,7 +175,7 @@ impl HostFs for MemFs {
             blocks_free: blocks.saturating_sub(used),
             blocks_available: blocks.saturating_sub(used),
             files,
-            files_free: files.saturating_sub(t.nodes.len() as u64),
+            files_free: files.saturating_sub(t.usage.inodes()),
             name_max: NAME_MAX as u64,
         })
     }
@@ -216,6 +222,11 @@ impl HostFs for MemFs {
             n.links -= 1;
             child.links = 0;
         } else {
+            // `shmem_unlink`: a name of a file that has more gives back
+            // the inode its link took.
+            if child.links > 1 {
+                t.usage.free_inode();
+            }
             child.links = child.links.saturating_sub(1);
         }
         let orphan = child.links == 0;
@@ -242,6 +253,8 @@ impl HostFs for MemFs {
         if children.contains_key(&name) {
             return Err(Errno::EEXIST);
         }
+        // `shmem_link`: each new name takes an inode, `ENOSPC` past them.
+        t.usage.take_inode()?;
         children.insert(name, id);
         lock(&arc).links += 1;
         Ok(())
@@ -351,6 +364,9 @@ impl HostFs for MemFs {
             if dst_dir {
                 removed.links = 0;
             } else {
+                if removed.links > 1 {
+                    t.usage.free_inode();
+                }
                 removed.links -= 1;
             }
             let orphan = removed.links == 0;

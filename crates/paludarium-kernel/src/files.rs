@@ -1260,7 +1260,31 @@ fn lookup(
         false => p,
     };
     let found = crate::permissions::search(c.files, &c.process.credentials, dir, &raw, follow)?;
+    Ok((p, found))
+}
+/// [`lookup`], going on at the generated path when a symbolic link on the
+/// way leads into `/dev` or `/proc` ([`linked_generated_path`]), for the
+/// calls that take the path no further themselves when the file system has
+/// no file there. It looks the path up on the file system once more, so
+/// the calls that `stat` paths often find their own way there after their
+/// own lookup failed.
+fn lookup_linked(
+    c: &Context<'_>,
+    dir: u64,
+    raw: Vec<u8>,
+    follow: bool,
+) -> Result<(Vec<u8>, crate::permissions::Found), Errno> {
+    let (p, found) = lookup(c, dir, raw, follow)?;
     Ok((linked_generated_path(c, p, follow)?, found))
+}
+/// [`lookup_linked`] of the path at `ptr`.
+fn looked_up_linked(
+    c: &Context<'_>,
+    dir: u64,
+    ptr: u64,
+    follow: bool,
+) -> Result<(Vec<u8>, crate::permissions::Found), Errno> {
+    lookup_linked(c, dir, path(c, ptr)?, follow)
 }
 /// `p`, or, when the file system has no file there because a symbolic link
 /// on the way leads into `/dev` or `/proc` ([`generated_target`]), the
@@ -1522,6 +1546,53 @@ fn child_of(dir: &[u8], name: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(name);
     out
+}
+/// What `readlink` reads at the resolved `p`: the link the kernel generates
+/// there, or the file system's.
+fn read_link(c: &mut Context<'_>, p: Vec<u8>) -> Result<Vec<u8>, Errno> {
+    // `/proc/self` is a link to this process's directory, and each
+    // entry of its `fd` to a descriptor's file.
+    let p = crate::devices::through_link(&p).unwrap_or(p);
+    Ok(if p == b"/proc/self" {
+        c.process.pid.to_string().into_bytes()
+    } else if let Some(path) = crate::proc::task_path(&p, c.process.pid, c.tid) {
+        let task = tasks::find(c, &path)?;
+        match tasks::link(&task, path.entry) {
+            // Only a link is checked: another file is `EINVAL`.
+            Some(target) => {
+                tasks::check(c, &task, path.entry)?;
+                from_reader(c, target?)
+            }
+            None if path.entry == crate::proc::TaskEntry::Missing => {
+                return Err(Errno::ENOENT);
+            }
+            None => return Err(Errno::EINVAL),
+        }
+    } else if let Some(entry) = crate::devices::entry(&p) {
+        let crate::devices::Entry::Link(target) = entry else {
+            return Err(Errno::EINVAL);
+        };
+        target.to_vec()
+    } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
+        if let Some(target) = own_link(c, entry) {
+            from_reader(c, target)
+        } else {
+            let crate::proc::OwnEntry::Descriptor(n) = entry else {
+                return Err(Errno::EINVAL);
+            };
+            let d = c
+                .files
+                .descriptor(u64::from(n))
+                .map_err(|_| Errno::ENOENT)?;
+            from_reader(c, link_target(&Holder::of(c), &d)?)
+        }
+    } else {
+        // A link on the way to a link the kernel generates.
+        match c.files.fs().readlink(&p) {
+            Err(e) => return read_link(c, generated_target(c, &p, false, e)?),
+            Ok(b) => b,
+        }
+    })
 }
 /// [`lookup`] of the path at `ptr`.
 fn looked_up(
@@ -1838,7 +1909,7 @@ fn set_times_at(
         return file.set_times(atime, mtime).map(|()| 0);
     }
     let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
-    let (p, found) = looked_up(c, a[0], a[1], follow)?;
+    let (p, found) = looked_up_linked(c, a[0], a[1], follow)?;
     match reached(c, &p, follow)? {
         Some(Followed::Path { path, follow }) => {
             let stat = c.files.fs().metadata(&path, follow)?;
@@ -2023,7 +2094,7 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         (cwd, stat)
     } else {
         let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
-        let (p, _) = lookup(c, a[0], raw, follow)?;
+        let (p, _) = lookup_linked(c, a[0], raw, follow)?;
         if let Some(target) = reached(c, &p, follow)? {
             return chmod_followed(c, target, a[2] as u32);
         }
@@ -2127,7 +2198,7 @@ fn link(c: &Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno> {
             descriptor_followed(c.files, c.files.descriptor(old_dir)?)?
         }
     } else {
-        let (old, _) = lookup(c, old_dir, old_raw, follow)?;
+        let (old, _) = lookup_linked(c, old_dir, old_raw, follow)?;
         match followed(c, &old, follow)? {
             Some(target) => target,
             // A dangling symbolic link leads nowhere (ENOENT).
@@ -2367,7 +2438,7 @@ fn fchownat(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return chown_path(c, &cwd, true, a[2], a[3]);
     }
     let follow = a[4] & AT_SYMLINK_NOFOLLOW == 0;
-    let (p, _) = lookup(c, a[0], raw, follow)?;
+    let (p, _) = lookup_linked(c, a[0], raw, follow)?;
     chown_path(c, &p, follow, a[2], a[3])
 }
 fn output(c: &Context<'_>, addr: u64, b: &[u8]) -> Result<(), Errno> {
@@ -3898,7 +3969,7 @@ fn name_to_handle_at(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         }
     } else {
         let follow = flags & AT_SYMLINK_FOLLOW != 0;
-        let (p, _) = lookup(c, dir, raw, follow)?;
+        let (p, _) = lookup_linked(c, dir, raw, follow)?;
         let (stat, device, kind) = named(c, &p, follow)?;
         (stat, device, kind, p)
     };
@@ -4990,7 +5061,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 }
                 file
             } else {
-                let (p, found) = looked_up(c, (-100i32) as u64, a[0], true)?;
+                let (p, found) = looked_up_linked(c, (-100i32) as u64, a[0], true)?;
                 // Landlock's TRUNCATE on the file (`hook_path_truncate`).
                 if let Some(target) = landlock_target(c, &p, true) {
                     crate::landlock::check(c, &target, crate::landlock::TRUNCATE)?;
@@ -5088,7 +5159,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         shown
                     }
                     None => {
-                        let p = lookup(c, (-100i32) as u64, raw, true)?.0;
+                        let p = lookup_linked(c, (-100i32) as u64, raw, true)?.0;
                         match followed(c, &p, true)? {
                             // A symbolic link an `O_PATH | O_NOFOLLOW` descriptor
                             // holds is not followed again: it is no directory.
@@ -5133,7 +5204,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             // then search permission on it (EACCES), then CAP_SYS_CHROOT in
             // the caller's user namespace (EPERM). The working directory
             // stays where it is.
-            let p = looked_up(c, (-100i32) as u64, a[0], true)?.0;
+            let p = looked_up_linked(c, (-100i32) as u64, a[0], true)?.0;
             let p = match followed(c, &p, true)? {
                 Some(Followed::Path { path, follow }) => {
                     if c.files.fs().metadata(&path, follow)?.mode & 0o170000 != 0o040000 {
@@ -5395,45 +5466,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             if len == 0 {
                 return Err(Errno::EINVAL);
             }
-            // `/proc/self` is a link to this process's directory, and each
-            // entry of its `fd` to a descriptor's file.
-            let p = crate::devices::through_link(&p).unwrap_or(p);
-            let b = if p == b"/proc/self" {
-                c.process.pid.to_string().into_bytes()
-            } else if let Some(path) = crate::proc::task_path(&p, c.process.pid, c.tid) {
-                let task = tasks::find(c, &path)?;
-                match tasks::link(&task, path.entry) {
-                    // Only a link is checked: another file is `EINVAL`.
-                    Some(target) => {
-                        tasks::check(c, &task, path.entry)?;
-                        from_reader(c, target?)
-                    }
-                    None if path.entry == crate::proc::TaskEntry::Missing => {
-                        return Err(Errno::ENOENT);
-                    }
-                    None => return Err(Errno::EINVAL),
-                }
-            } else if let Some(entry) = crate::devices::entry(&p) {
-                let crate::devices::Entry::Link(target) = entry else {
-                    return Err(Errno::EINVAL);
-                };
-                target.to_vec()
-            } else if let Some(entry) = crate::proc::own_entry(&p, c.process.pid) {
-                if let Some(target) = own_link(c, entry) {
-                    from_reader(c, target)
-                } else {
-                    let crate::proc::OwnEntry::Descriptor(n) = entry else {
-                        return Err(Errno::EINVAL);
-                    };
-                    let d = c
-                        .files
-                        .descriptor(u64::from(n))
-                        .map_err(|_| Errno::ENOENT)?;
-                    from_reader(c, link_target(&Holder::of(c), &d)?)
-                }
-            } else {
-                c.files.fs().readlink(&p)?
-            };
+            let b = read_link(c, p)?;
             let count = b
                 .len()
                 .min(usize::try_from(len).map_err(|_| Errno::EINVAL)?);
@@ -5451,9 +5484,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         // chmod, fchmod, fchmodat (which has no flags argument)
         90 | 268 => {
             let (p, mode) = if n == 90 {
-                (looked_up(c, (-100i32) as u64, a[0], true)?, a[1])
+                (looked_up_linked(c, (-100i32) as u64, a[0], true)?, a[1])
             } else {
-                (looked_up(c, a[0], a[1], true)?, a[2])
+                (looked_up_linked(c, a[0], a[1], true)?, a[2])
             };
             let (p, found) = p;
             if let Some(target) = reached(c, &p, true)? {
@@ -5481,7 +5514,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         468 | 469 => attributes::call(c, n, a),
         // chown, fchown, lchown, fchownat
         92 | 94 => {
-            let (p, _) = looked_up(c, (-100i32) as u64, a[0], n == 92)?;
+            let (p, _) = looked_up_linked(c, (-100i32) as u64, a[0], n == 92)?;
             chown_path(c, &p, n == 92, a[1], a[2])
         }
         93 => chown_file(
@@ -5498,7 +5531,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
         261 => futimesat(c, a[0], a[1], a[2]),
         // statfs, fstatfs
         137 => {
-            let (p, _) = looked_up(c, (-100i32) as u64, a[0], true)?;
+            let (p, _) = looked_up_linked(c, (-100i32) as u64, a[0], true)?;
             let stats = path_statfs(c, &p)?;
             let flags = mount_statfs_flags(c, &stats, &p);
             write_statfs(c, a[1], stats, watched_device(c, &p, true), flags)
@@ -7771,7 +7804,7 @@ fn link_queue(
             }
         }
         None => {
-            let (old, _) = lookup(c, old_dir, old_raw, follow)?;
+            let (old, _) = lookup_linked(c, old_dir, old_raw, follow)?;
             if generated_stat(c, &old, follow)?.is_none() {
                 c.files.fs().metadata(&old, follow)?;
             }

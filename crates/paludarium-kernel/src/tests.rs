@@ -9428,7 +9428,8 @@ fn a_symbolic_link_leads_into_the_files_the_kernel_generates() {
 
 /// The calls that take a path go on through a symbolic link into `/dev`
 /// or `/proc` as they do for the path it leads to: `readlink` reads the
-/// generated link, and each other call gives what it gives there.
+/// generated link, and each other call gives what it gives there, those
+/// that make a name there too.
 #[test]
 fn the_path_calls_go_through_a_link_into_the_generated_files() {
     let mut f = fixture();
@@ -9480,6 +9481,10 @@ fn the_path_calls_go_through_a_link_into_the_generated_files() {
                 call(&mut f, 188, &[p, name, name, 1, 0]),
                 call(&mut f, 137, &[p, buf]),
                 call(&mut f, 86, &[p, other]),
+                // The calls that make a name there.
+                call(&mut f, 83, &[p, 0o755]),
+                call(&mut f, 133, &[p, 0o10644, 0]),
+                call(&mut f, 88, &[other, p]),
             ]);
             let _ = f.ret(87, &[other]);
         }

@@ -118,7 +118,14 @@ impl Target {
         // A walk leaves out the last name's status when it does not need it.
         let stat = match walked {
             Some(stat) => stat,
-            None => c.files.fs().metadata(&path, follow)?,
+            None => match c.files.fs().metadata(&path, follow) {
+                // A link on the way to a file the kernel generates.
+                Err(e) => {
+                    let target = super::generated_target(c, &path, follow, e)?;
+                    return Self::found(c, target, follow, None);
+                }
+                Ok(stat) => stat,
+            },
         };
         if super::in_proc(&path) {
             return Ok(Self::Generated { stat });

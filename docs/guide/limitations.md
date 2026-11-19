@@ -893,7 +893,7 @@ verified.
   neighbour table dump: setting a neighbour table (`RTM_SETNEIGHTBL`), MCTP's
   neighbours (an `AF_MCTP` `RTM_NEWNEIGH` or `RTM_DELNEIGH`), a bridge's
   forwarding database (an `AF_BRIDGE` `RTM_GETNEIGH`, `RTM_NEWNEIGH` or
-  `RTM_DELNEIGH`), rules, the settings' (`RTM_GETNETCONF`), queueing disciplines and the rest are
+  `RTM_DELNEIGH`), rules, netconf requests (`RTM_GETNETCONF`), queueing disciplines and the rest are
   `EOPNOTSUPP`, as are renaming `lo` and setting any other attribute of
   it. An input route lookup (`RTA_IIF`) starts with forwarding and
   reverse path filtering off, as Linux is built, where a new namespace of

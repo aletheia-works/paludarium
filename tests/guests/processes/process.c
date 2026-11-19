@@ -6231,8 +6231,13 @@ static int pagemap_case(void) {
 
     /* MADV_DONTNEED of a shared mapping of the file, and of System V shared
        memory, takes the entries away and keeps the pages. Writes fault
-       them in, as Linux's write fault maps no pages around one. */
-    char *sf = mmap(base + 30 * page, 2 * page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, file, 0);
+       them in, as Linux's write fault maps no pages around one. The shared
+       mapping maps pages past the private one's, which Linux's read fault
+       there may have mapped around the page it read. */
+    for (int i = 0; i < 2; i++)
+        if (write(file, block, sizeof block) != (ssize_t)sizeof block) return 86;
+    char *sf = mmap(base + 30 * page, 2 * page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, file,
+                    3 * page);
     if (sf == MAP_FAILED) return 88;
     sf[0] = 'h';
     sf[page] = 'i';
@@ -6242,8 +6247,8 @@ static int pagemap_case(void) {
     sf[0] = 'j';
     pm_show(fd, "shared-file-again", sf, 2);
     char kept = 0;
-    printf("shared-file-kept=%c", pread(file, &kept, 1, page) == 1 ? kept : '?');
-    printf("%c\n", pread(file, &kept, 1, 0) == 1 ? kept : '?');
+    printf("shared-file-kept=%c", pread(file, &kept, 1, 4 * page) == 1 ? kept : '?');
+    printf("%c\n", pread(file, &kept, 1, 3 * page) == 1 ? kept : '?');
     int id = shmget(IPC_PRIVATE, (size_t)(2 * page), IPC_CREAT | 0600);
     char *segment = id < 0 ? (char *)-1 : shmat(id, base + 40 * page, 0);
     if (id >= 0) shmctl(id, IPC_RMID, NULL);

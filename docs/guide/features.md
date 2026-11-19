@@ -1081,8 +1081,9 @@ kernel.
   always protected. Such a page gets Linux's uffd-wp marker, which
   `/proc/<pid>/pagemap` shows as a swap entry with bit 57, and the entry
   an access makes for it is write-protected, so that a write faults once
-  the page is in. `MADV_DONTNEED` takes shmem's entries away, the page
-  cache keeping the pages, and leaves a marker for each protected one, as
+  the page is in. `MADV_DONTNEED` takes shmem's entries away, as any shared
+  mapping's, the page cache keeping the pages, and leaves a marker for
+  each protected one, as
   `zap_install_uffd_wp_if_needed` does; that of private anonymous memory
   drops the markers. A fill or `UFFDIO_CONTINUE` takes a marker's place,
   protected only by its own mode, and a `UFFDIO_ZEROPAGE` of private

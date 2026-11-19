@@ -859,9 +859,14 @@ impl Kernel {
             self.group.job_continue();
         }
         // The CPU-time interval timers count what this thread has run since
-        // its last system call too, as Linux's tick does.
-        if self.group.cpu_timers_armed() {
+        // its last system call too, as Linux's tick does, and so do the
+        // sampling perf events, whose clocks overflow as it runs.
+        let sampling = perf::sampling(&self.processes.perf_events);
+        if self.group.cpu_timers_armed() || sampling {
             account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
+        }
+        if sampling {
+            self.perf_samples(thread, mem);
         }
         if let Ok(now) = self.host.clock(paludarium_host::ClockId::Monotonic) {
             self.group.expire_timer(&mut thread.state, now);
@@ -1372,6 +1377,20 @@ impl Kernel {
         }
     }
 
+    /// The samples the perf events that count the thread take of what it
+    /// has done since its last system call or checkpoint
+    /// ([`perf::overflow`]).
+    fn perf_samples(&self, thread: &Thread, mem: &AddressSpace) {
+        let task = perf::Task {
+            pid: thread.state.pid,
+            tid: thread.tid,
+            cpu: thread.state.cpu.on.map_or(0, |(cpu, _)| cpu),
+            regs: &thread.cpu,
+            mem,
+        };
+        perf::overflow(&self.processes.perf_events, &self.group, &task);
+    }
+
     fn syscall(&mut self, thread: &mut Thread, mem: &AddressSpace) -> Next {
         self.sync_actions(thread);
         self.group.take_landlock(&mut thread.state.credentials);
@@ -1380,6 +1399,9 @@ impl Kernel {
         self.group.apply_discards(&mut thread.state);
         self.group.sync_timer(&mut thread.state);
         account_cpu(&*self.host, &self.group, &mut thread.state, thread.tid);
+        if perf::sampling(&self.processes.perf_events) {
+            self.perf_samples(thread, mem);
+        }
         thread.state.ptrace.in_syscall = true;
         // The tracer may see and change the call first, or skip it.
         if self.group.traced() && !self.ptrace_syscall_entry(thread) {

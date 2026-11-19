@@ -16,11 +16,14 @@
 //! and `ENABLE` disable and enable those the calling thread opened. The
 //! machine keeps both lists ([`Events`]). An event of a task maps its
 //! ring buffer ([`buffer`]), whose user page shows the count and times as
-//! of the event's `mmap`, its enabling and its reset; a sampling event
-//! takes no samples yet, and the buffer stays empty. `SET_OUTPUT` and
-//! `PERF_FLAG_FD_OUTPUT` make an event write to another's buffer
-//! ([`buffer::set_output`]).
+//! of the event's `mmap`, its enabling and its reset. A sampling event
+//! writes its samples there ([`sample`]), taken as its thread makes a
+//! system call. `SET_OUTPUT` and `PERF_FLAG_FD_OUTPUT` make an event write
+//! to another's buffer ([`buffer::set_output`]).
 mod buffer;
+mod sample;
+
+pub(crate) use sample::{Task, overflow, sampling};
 
 use crate::ThreadGroup;
 use crate::syscalls::{Context, Outcome};
@@ -126,8 +129,10 @@ mod bit {
     pub const EXCLUDE_USER: u32 = 4;
     pub const EXCLUDE_KERNEL: u32 = 5;
     pub const FREQ: u32 = 10;
+    pub const SAMPLE_ID_ALL: u32 = 18;
     pub const ENABLE_ON_EXEC: u32 = 12;
     pub const EXCLUDE_CALLCHAIN_KERNEL: u32 = 21;
+    pub const EXCLUDE_CALLCHAIN_USER: u32 = 22;
     pub const USE_CLOCKID: u32 = 25;
     pub const WRITE_BACKWARD: u32 = 27;
     pub const NAMESPACES: u32 = 28;
@@ -154,6 +159,9 @@ struct Attr {
     sample_stack_user: u32,
     clockid: i32,
     sample_regs_intr: u64,
+    /// `sample_max_stack`, which `perf_event_open` makes
+    /// `kernel.perf_event_max_stack` for a callchain without one.
+    sample_max_stack: u16,
     aux_action: u32,
     reserved_2: u16,
     simd_enabled: u16,
@@ -255,6 +263,7 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
         sample_stack_user: half(&b, 88),
         clockid: half(&b, 92) as i32,
         sample_regs_intr: word(&b, 96),
+        sample_max_stack: quarter(&b, 108),
         reserved_2: quarter(&b, 110),
         aux_action: half(&b, 116),
         simd_enabled: quarter(&b, 144),
@@ -305,6 +314,10 @@ fn copy_attr(c: &Context<'_>, at: u64) -> Result<Attr, Errno> {
             || !attr.sample_stack_user.is_multiple_of(8))
     {
         return Err(Errno::EINVAL);
+    }
+    let mut attr = attr;
+    if attr.sample_max_stack == 0 {
+        attr.sample_max_stack = sample::MAX_STACK;
     }
     if attr.sample_type & SAMPLE_REGS_INTR != 0 {
         regs(&attr, attr.sample_regs_intr, attr.vec_intr, attr.pred_intr)?;
@@ -418,8 +431,13 @@ struct State {
     running_time: u64,
     /// The clock when these were last brought up to date.
     since: u64,
-    /// For a counter of the thread's [`crate::Usage`], its value then.
-    tally: u64,
+    /// For a counter of the thread's [`crate::Usage`], its values then, in
+    /// the thread's own code and in system calls.
+    tally: (u64, u64),
+    /// What it has counted in each of those, and for a clock the time,
+    /// in the first: the occurrences its samples are taken of
+    /// ([`sample`]), which a reset leaves.
+    occurred: [u64; 2],
     /// What inherited events of tasks that have ended gave back
     /// (`child_count`, `child_total_time_enabled`, `_running`).
     child_count: u64,
@@ -436,7 +454,13 @@ struct State {
 
 /// One event: Linux's `struct perf_event`.
 pub(crate) struct Event {
+    /// The opened event's ID, which those inherited from it share
+    /// (`primary_event_id`), and its own (`id`, a sample's `stream_id`).
     id: u64,
+    stream_id: u64,
+    /// The PID namespace of the task that opened it (`ns`), which numbers
+    /// the tasks its samples show.
+    ns: Arc<crate::namespaces::Namespace>,
     attr: Attr,
     counter: Counter,
     target: Target,
@@ -460,6 +484,8 @@ pub(crate) struct Event {
     mapped: Mutex<Weak<buffer::Mapped>>,
     /// Held while the event's buffer is mapped (`mmap_mutex`).
     mmap_mutex: Mutex<()>,
+    /// Its period and where it is in it, and the samples it lost.
+    sampler: Mutex<sample::Sampler>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -474,6 +500,9 @@ pub(crate) struct Events {
     lists: Mutex<Lists>,
     /// What users and address spaces have locked of ring buffers.
     accounts: Arc<buffer::Accounts>,
+    /// Whether an event of a task has sampled, so that the system calls
+    /// look for samples to take ([`sample::overflow`]) only then.
+    sampling: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -524,6 +553,9 @@ impl Events {
         lists.counting.retain(|event| event.strong_count() > 0);
         if matches!(event.target, Target::Thread { .. }) {
             lists.counting.push(erase(event));
+            if event.attr.sampling() {
+                self.sampling.store(true, Ordering::Relaxed);
+            }
         }
         lists.owned.push(Owned {
             group: erase(group),
@@ -587,20 +619,26 @@ impl Event {
         let now = self.now(&mut state);
         let passed = now.saturating_sub(state.since);
         state.since = now;
-        let tallied = self.used().map_or(0, |value| {
-            let more = value.saturating_sub(state.tally);
-            state.tally = value;
+        let tallied = self.used().map_or((0, 0), |(user, kernel)| {
+            let more = (
+                user.saturating_sub(state.tally.0),
+                kernel.saturating_sub(state.tally.1),
+            );
+            state.tally = (user, kernel);
             more
         });
         if state.enabled {
             state.enabled_time += passed;
             if !state.paused {
                 state.running_time += passed;
-                state.count += if self.counter == Counter::Clock {
-                    passed
+                let (user, kernel) = if self.counter == Counter::Clock {
+                    (passed, 0)
                 } else {
                     tallied
                 };
+                state.count += user + kernel;
+                state.occurred[0] += user;
+                state.occurred[1] += kernel;
             }
         }
         state
@@ -612,7 +650,7 @@ impl Event {
     /// of the thread's code are left out with `exclude_user` and those of
     /// system calls with `exclude_kernel`, which leaves out the switches and
     /// migrations too, as the kernel makes them.
-    fn used(&self) -> Option<u64> {
+    fn used(&self) -> Option<(u64, u64)> {
         let Target::Thread { group, tid } = &self.target else {
             return None;
         };
@@ -639,7 +677,7 @@ impl Event {
         } else {
             kernel
         };
-        Some(user + kernel)
+        Some((user, kernel))
     }
     /// The count, the time enabled and the time running now.
     fn values(&self) -> (u64, u64, u64) {
@@ -697,8 +735,11 @@ impl Event {
             let state = lock(&self.state);
             state.enabled && !state.removed
         };
+        let sampler = lock(&top.sampler).inherited(top.counter);
         let child = Arc::new(Event {
             id: top.id,
+            stream_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            ns: Arc::clone(&top.ns),
             attr: top.attr,
             counter: top.counter,
             target,
@@ -717,6 +758,7 @@ impl Event {
             rb: Mutex::default(),
             mapped: Mutex::default(),
             mmap_mutex: Mutex::default(),
+            sampler: Mutex::new(sampler),
         });
         if let Some(leader) = leader {
             lock(&leader.siblings).push(Arc::downgrade(&child));
@@ -861,7 +903,7 @@ impl Event {
                 values.push(event.id);
             }
             if format & FORMAT_LOST != 0 {
-                values.push(0);
+                values.push(lock(&event.sampler).lost);
             }
         };
         if format & FORMAT_GROUP != 0 {
@@ -889,7 +931,7 @@ impl Event {
                 values.push(self.id);
             }
             if format & FORMAT_LOST != 0 {
-                values.push(0);
+                values.push(lock(&self.sampler).lost);
             }
         }
         Ok(values)
@@ -1026,16 +1068,26 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let counter = init(&attr)?;
+    // No software PMU takes AUX output or `aux_start_paused`, and an event
+    // may not both pause and resume AUX output.
+    if attr.flag(bit::AUX_OUTPUT) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if attr.aux_action & 6 == 6 {
+        return Err(Errno::EINVAL);
+    }
+    if attr.aux_action & 1 != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     // `perf_cgroup_connect` needs a cgroup directory, which there is none
     // of.
     if cgroup {
         return Err(EBADF);
     }
-    if attr.flag(bit::AUX_OUTPUT) || attr.aux_action & 1 != 0 {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    if attr.aux_action & 6 == 6 {
-        return Err(Errno::EINVAL);
+    // `get_callchain_buffers`: no more frames than
+    // `kernel.perf_event_max_stack`.
+    if attr.sample_type & SAMPLE_CALLCHAIN != 0 && attr.sample_max_stack > sample::MAX_STACK {
+        return Err(Errno::EOVERFLOW);
     }
     let clockid = if attr.flag(bit::USE_CLOCKID) {
         // perf_event_set_clock.
@@ -1074,8 +1126,11 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
             return Err(Errno::EINVAL);
         }
     }
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let event = Arc::new(Event {
-        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        id,
+        stream_id: id,
+        ns: c.pid_space(),
         attr,
         counter,
         target,
@@ -1090,6 +1145,7 @@ fn open(c: &mut Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         rb: Mutex::default(),
         mapped: Mutex::default(),
         mmap_mutex: Mutex::default(),
+        sampler: Mutex::new(sample::Sampler::new(&attr, counter)),
     });
     // `PERF_FLAG_FD_OUTPUT`: it writes to the group's event's buffer.
     if let Some(output) = &output {
@@ -1314,6 +1370,7 @@ const IOC_RESET: u64 = 0x2403;
 const IOC_PERIOD: u64 = 0x4008_2404;
 const IOC_SET_OUTPUT: u64 = 0x2405;
 const IOC_ID: u64 = 0x8008_2407;
+const IOC_PAUSE_OUTPUT: u64 = 0x4004_2409;
 const IOC_FLAG_GROUP: u64 = 1;
 
 /// `mmap` of an event's file: its ring buffer ([`buffer`]), at
@@ -1333,10 +1390,13 @@ pub(crate) fn mmap(
 
 /// An event's ioctls, as Linux's `_perf_ioctl`: `ENABLE`, `DISABLE` and
 /// `RESET` of the event or, with `PERF_IOC_FLAG_GROUP`, its whole group;
-/// `ID`; `PERIOD` and `REFRESH`, which only a sampling event takes
-/// (`EINVAL`); `SET_OUTPUT` to another event's buffer
-/// ([`buffer::set_output`]), whose descriptor must be an event's
-/// (`EBADF`), or to none for -1; every other request is `ENOTTY` here.
+/// `ID`; `PERIOD`, which only a sampling event takes (`EINVAL`), a new
+/// period or frequency; `REFRESH`, `EINVAL` for every event here (Linux
+/// takes it for a sampling event that does not inherit); `SET_OUTPUT` to
+/// another event's buffer ([`buffer::set_output`]), whose descriptor must
+/// be an event's (`EBADF`), or to none for -1; `PAUSE_OUTPUT` of the
+/// event's buffer (`EINVAL` without one); every other request is `ENOTTY`
+/// here.
 pub(crate) fn ioctl(
     c: &mut Context<'_>,
     file: &Arc<dyn FileHandle>,
@@ -1369,9 +1429,12 @@ pub(crate) fn ioctl(
             if !event.attr.sampling() || value == 0 {
                 return Err(Errno::EINVAL);
             }
-            if event.attr.flag(bit::FREQ) && value > MAX_SAMPLE_RATE || value >> 63 != 0 {
+            // A clock's `freq` is a period from its start.
+            let mut sampler = lock(&event.sampler);
+            if sampler.freq() && value > MAX_SAMPLE_RATE || !sampler.freq() && value >> 63 != 0 {
                 return Err(Errno::EINVAL);
             }
+            sampler.set_period(value, event.counter);
             Ok(0)
         })(),
         IOC_SET_OUTPUT => (|| {
@@ -1387,6 +1450,11 @@ pub(crate) fn ioctl(
             let output = Arc::clone(of(&file).ok_or(EBADF)?);
             buffer::set_output(&event, Some(&output)).map(|()| 0)
         })(),
+        IOC_PAUSE_OUTPUT => lock(&event.rb)
+            .clone()
+            .ok_or(Errno::EINVAL)
+            .and_then(|rb| rb.pause(argument as u32 != 0))
+            .map(|()| 0),
         IOC_ID => c
             .mem
             .write(GuestAddr(argument), &event.id.to_le_bytes())
@@ -1517,6 +1585,8 @@ mod tests {
     ) -> Arc<Event> {
         let event = Arc::new(Event {
             id: 0,
+            stream_id: 0,
+            ns: crate::namespaces::Namespaces::default().pid,
             attr,
             counter,
             target,
@@ -1531,6 +1601,7 @@ mod tests {
             rb: Mutex::default(),
             mapped: Mutex::default(),
             mmap_mutex: Mutex::default(),
+            sampler: Mutex::new(sample::Sampler::new(&attr, counter)),
         });
         if let Some(leader) = leader {
             lock(&leader.siblings).push(Arc::downgrade(&event));

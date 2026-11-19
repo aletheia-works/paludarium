@@ -795,6 +795,157 @@ static int case_output(void) {
     return 0;
 }
 
+#define SAMPLE_CALLCHAIN (1ULL << 5)
+#define SAMPLE_ID (1ULL << 6)
+#define SAMPLE_PERIOD (1ULL << 8)
+#define SAMPLE_STREAM_ID (1ULL << 9)
+#define SAMPLE_IDENTIFIER (1ULL << 16)
+#define SAMPLE_ID_ALL (1ULL << 18)
+#define EXCLUDE_CALLCHAIN_KERNEL (1ULL << 21)
+#define FORMAT_LOST 16
+#define IOC_PAUSE_OUTPUT _IOW('$', 9, uint32_t)
+#define RECORD_LOST 2
+#define RECORD_SAMPLE 9
+#define CONTEXT_USER ((uint64_t)-512)
+
+/* A disabled page-fault event of this thread that samples each fault. */
+static int open_sampling(uint64_t sample_type, uint64_t flags) {
+    struct attr a = software(2);
+    a.sample_period = 1;
+    a.sample_type = sample_type;
+    a.read_format = FORMAT_LOST;
+    a.flags |= DISABLED | flags;
+    return (int)open_event(&a, 0, -1, -1, 0);
+}
+
+/* The samples it lost, from a read with PERF_FORMAT_LOST. */
+static uint64_t lost_samples(int fd) {
+    uint64_t values[2] = {0, (uint64_t)-1};
+    if (read(fd, values, sizeof values) != sizeof values) return (uint64_t)-1;
+    return values[1];
+}
+
+/* Copies the record at `at` of a buffer of `size` data bytes out, round
+   the end of the data pages. */
+static void copy_record(void *page, uint64_t size, uint64_t at, uint64_t *out, size_t words) {
+    unsigned char *data = (unsigned char *)page + 4096, *to = (unsigned char *)out;
+    for (size_t i = 0; i < words * 8; i++) to[i] = data[(at + i) & (size - 1)];
+}
+
+static void faults_while_enabled(int fd, int pages) {
+    ioctl(fd, IOC_ENABLE, 0);
+    touch(pages);
+    ioctl(fd, IOC_DISABLE, 0);
+}
+
+static int case_sample(void) {
+    /* Each fault is a sample of the fields asked for, in Linux's order. */
+    int fd = open_sampling(SAMPLE_IDENTIFIER | SAMPLE_TID | SAMPLE_PERIOD | SAMPLE_ID | SAMPLE_STREAM_ID, 0);
+    void *page = NULL;
+    long mapped = map_event(fd, 3, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    uint64_t id = 0;
+    ioctl(fd, IOC_ID, &id);
+    say("open %d mapped %ld", fd >= 0, mapped);
+    if (mapped) return 1;
+    faults_while_enabled(fd, 5);
+    uint64_t head = PAGE_U64(page, 1024);
+    int samples = 0, alike = 1;
+    for (uint64_t at = 0; at < head; at += 48) {
+        uint64_t r[6];
+        copy_record(page, 8192, at, r, 6);
+        uint32_t type = (uint32_t)r[0];
+        uint16_t misc = (uint16_t)(r[0] >> 32), size = (uint16_t)(r[0] >> 48);
+        alike &= type == RECORD_SAMPLE && misc == 2 && size == 48 && r[1] == id;
+        alike &= (uint32_t)r[2] == (uint32_t)getpid() && (uint32_t)(r[2] >> 32) == (uint32_t)gettid();
+        /* PERF_SAMPLE_PERIOD comes after the IDs. */
+        alike &= r[3] == id && r[4] == id && r[5] == 1;
+        samples++;
+    }
+    say("samples>=5 %d alike %d whole %d", samples >= 5, alike, head % 48 == 0);
+    say("lost %llu", (unsigned long long)lost_samples(fd));
+    munmap(page, 3 * 4096);
+    close(fd);
+
+    /* A full buffer loses samples, and the next record after room is made
+       tells how many, with its sample_id. */
+    fd = open_sampling(SAMPLE_TID | SAMPLE_PERIOD, SAMPLE_ID_ALL);
+    ioctl(fd, IOC_ID, &id);
+    mapped = map_event(fd, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    faults_while_enabled(fd, 400);
+    head = PAGE_U64(page, 1024);
+    uint64_t lost = lost_samples(fd);
+    say("full: mapped %ld fits %d lost>0 %d", mapped, head == 4080, lost > 0 && lost != (uint64_t)-1);
+    PAGE_U64(page, 1032) = head;
+    faults_while_enabled(fd, 1);
+    uint64_t r[4];
+    copy_record(page, 4096, head, r, 4);
+    say("lost record %d size %d id %d count %d", (uint32_t)r[0] == RECORD_LOST, (int)(r[0] >> 48),
+        r[1] == id, r[2] == lost);
+    say("pid %d", (uint32_t)r[3] == (uint32_t)getpid());
+    copy_record(page, 4096, head + 32, r, 1);
+    say("then sample %d", (uint32_t)r[0] == RECORD_SAMPLE);
+
+    /* Paused, it takes nothing and counts it lost. */
+    PAGE_U64(page, 1032) = PAGE_U64(page, 1024);
+    head = PAGE_U64(page, 1024);
+    long paused = TRY(ioctl(fd, IOC_PAUSE_OUTPUT, 1));
+    faults_while_enabled(fd, 3);
+    say("paused %ld kept %d lost more %d", paused, PAGE_U64(page, 1024) == head, lost_samples(fd) >= lost + 3);
+    long resumed = TRY(ioctl(fd, IOC_PAUSE_OUTPUT, 0));
+    faults_while_enabled(fd, 1);
+    copy_record(page, 4096, head, r, 1);
+    say("resumed %ld lost record %d", resumed, (uint32_t)r[0] == RECORD_LOST);
+    munmap(page, 2 * 4096);
+    say("pause unmapped %ld", TRY(ioctl(fd, IOC_PAUSE_OUTPUT, 1)));
+    close(fd);
+
+    /* Read-only, the buffer overwrites what it holds and loses nothing. */
+    fd = open_sampling(SAMPLE_TID | SAMPLE_PERIOD, 0);
+    map_event(fd, 2, PROT_READ, MAP_SHARED, 0, &page);
+    faults_while_enabled(fd, 400);
+    head = PAGE_U64(page, 1024);
+    say("overwrite past %d whole %d lost %llu", head > 4096, head % 24 == 0,
+        (unsigned long long)lost_samples(fd));
+    munmap(page, 2 * 4096);
+    close(fd);
+
+    /* Backward, the head goes down from 0. */
+    fd = open_sampling(SAMPLE_TID | SAMPLE_PERIOD, WRITE_BACKWARD);
+    map_event(fd, 2, PROT_READ, MAP_SHARED, 0, &page);
+    faults_while_enabled(fd, 3);
+    head = PAGE_U64(page, 1024);
+    copy_record(page, 4096, head, r, 1);
+    say("backward below %d whole %d sample %d", (int64_t)head < 0, (0 - head) % 24 == 0,
+        (uint32_t)r[0] == RECORD_SAMPLE);
+    munmap(page, 2 * 4096);
+    close(fd);
+
+    /* The callchain of user mode starts with its context. */
+    fd = open_sampling(SAMPLE_CALLCHAIN, EXCLUDE_CALLCHAIN_KERNEL);
+    map_event(fd, 2, PROT_READ | PROT_WRITE, MAP_SHARED, 0, &page);
+    faults_while_enabled(fd, 1);
+    copy_record(page, 4096, 0, r, 3);
+    say("callchain sample %d context %d frames %d", (uint32_t)r[0] == RECORD_SAMPLE, r[2] == CONTEXT_USER,
+        r[1] >= 2 && r[1] <= 128);
+    munmap(page, 2 * 4096);
+    close(fd);
+
+    struct attr a = software(2);
+    a.sample_period = 1;
+    a.sample_type = SAMPLE_CALLCHAIN;
+    a.flags |= EXCLUDE_CALLCHAIN_KERNEL;
+    a.sample_max_stack = 128;
+    attempt("max stack 128", a, 0, -1, -1, 0);
+    a.sample_max_stack = 127;
+    attempt("max stack 127", a, 0, -1, -1, 0);
+    a = software(2);
+    a.aux_action = 7;
+    attempt("aux start paused pause resume", a, 0, -1, -1, 0);
+    a.aux_action = 1;
+    attempt("aux start paused", a, 0, -1, -1, 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     alarm(20);
@@ -805,6 +956,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "perf-software")) return case_software();
     if (!strcmp(mode, "perf-mmap")) return case_mmap();
     if (!strcmp(mode, "perf-output")) return case_output();
+    if (!strcmp(mode, "perf-sample")) return case_sample();
     if (!strcmp(mode, "perf-exec")) return case_exec(argc > 2 ? argv[2] : argv[0]);
     if (!strcmp(mode, "perf-spin")) {
         spin();

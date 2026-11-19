@@ -1,8 +1,11 @@
 //! The network devices of a network namespace, as Linux keeps its
-//! `net_device`s in a `struct net`: for now its loopback alone, which every
-//! namespace has from the start, of index 1 (`LOOPBACK_IFINDEX`) and named
-//! `lo`. Netlink, the interface ioctls and the routes find a device here by
-//! its index or name.
+//! `net_device`s in a `struct net`: its loopback, which every namespace has
+//! from the start, of index 1 (`LOOPBACK_IFINDEX`) and named `lo`, and the
+//! ends of veth pairs ([`Veth`]), which netlink makes and removes
+//! ([`crate::netlink`]). Netlink, the interface ioctls and the routes find
+//! a device here by its index or name. A namespace that goes takes its
+//! veth ends with it, and their peers in other namespaces too
+//! ([`Devices`]' `Drop`).
 //!
 //! Each device carries its own settings (Linux's `ipv4_devconf` and
 //! `ipv6_devconf` of its `in_device` and `inet6_dev`), and the namespace
@@ -17,12 +20,63 @@ pub(crate) const LOOPBACK_INDEX: i32 = 1;
 /// [`LOOPBACK_INDEX`] as the attributes of a `u32` carry it.
 pub(crate) const LOOPBACK_OIF: u32 = 1;
 
+use std::sync::Weak;
+
 /// What a device is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceKind {
     /// The namespace's loopback (`loopback_dev`).
     Loopback,
+    /// An end of a veth pair.
+    Veth,
 }
+
+/// A veth end's own state (`struct net_device` and `struct veth_priv`).
+#[derive(Clone, Debug)]
+pub(crate) struct Veth {
+    /// Its Ethernet address (`dev_addr`).
+    pub mac: [u8; 6],
+    pub mtu: u32,
+    /// `IFF_UP`.
+    pub up: bool,
+    /// Whether it has its carrier (`netif_carrier_ok`), which it has while
+    /// it and its peer are up (`veth_open`, `veth_close`).
+    pub carrier: bool,
+    /// Whether the link watch has made its operational state up
+    /// (`IF_OPER_UP`, and so `IFF_RUNNING`), which Linux's does a little
+    /// after the carrier comes, and here at once.
+    pub oper_up: bool,
+    /// How often its carrier came and went (`carrier_up_count`,
+    /// `carrier_down_count`).
+    pub carrier_up: u32,
+    pub carrier_down: u32,
+    /// Whether it has opened, and so has its queueing discipline,
+    /// `noqueue` (`dev_activate`), until it goes.
+    pub opened: bool,
+    /// Its peer: the other end's namespace and index; `None` once that has
+    /// gone, as `veth_dellink` and `veth_newlink` leave it.
+    pub peer: Option<Peer>,
+}
+
+/// The other end of a veth pair.
+#[derive(Clone, Debug)]
+pub(crate) struct Peer {
+    pub network: Weak<crate::inet::Network>,
+    pub index: i32,
+}
+
+impl PartialEq for Peer {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && Weak::ptr_eq(&self.network, &other.network)
+    }
+}
+impl Eq for Peer {}
+impl PartialEq for Veth {
+    fn eq(&self, other: &Self) -> bool {
+        self.mac == other.mac && self.peer == other.peer && self.up == other.up
+    }
+}
+impl Eq for Veth {}
 
 /// A device's IPv4 settings, or those of `all` or `default`
 /// (`struct ipv4_devconf`), as Linux is built: all 0.
@@ -55,6 +109,8 @@ pub(crate) struct Device {
     pub kind: DeviceKind,
     pub conf4: Conf4,
     pub conf6: Conf6,
+    /// A veth end's state; `None` for the loopback.
+    pub veth: Option<Veth>,
 }
 
 impl Device {
@@ -66,6 +122,38 @@ impl Device {
             kind: DeviceKind::Loopback,
             conf4: Conf4::default(),
             conf6: Conf6::default(),
+            veth: None,
+        }
+    }
+    /// A veth end of `index` named `name`, of Ethernet address `mac` and
+    /// MTU `mtu`, as `veth_setup` and `rtnl_create_link` make it, down and
+    /// without its carrier (`netif_carrier_off`, which counts), with the
+    /// settings `conf` (`default`'s, as `inetdev_init` and `ipv6_add_dev`
+    /// copy them).
+    pub(crate) fn veth(
+        index: i32,
+        name: Vec<u8>,
+        mac: [u8; 6],
+        mtu: u32,
+        conf: (Conf4, Conf6),
+    ) -> Self {
+        Self {
+            index,
+            name,
+            kind: DeviceKind::Veth,
+            conf4: conf.0,
+            conf6: conf.1,
+            veth: Some(Veth {
+                mac,
+                mtu,
+                up: false,
+                carrier: false,
+                oper_up: false,
+                carrier_up: 0,
+                carrier_down: 1,
+                opened: false,
+                peer: None,
+            }),
         }
     }
 }
@@ -73,9 +161,12 @@ impl Device {
 /// The devices of a namespace, in the order of their indices, as a link
 /// dump goes through them, with the namespace's `all` and `default`
 /// settings.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Devices {
     list: Vec<Device>,
+    /// Where the next index a device takes without asking one is looked
+    /// for (`net->ifindex`, `xa_alloc_cyclic`).
+    next: i32,
     pub all4: Conf4,
     pub default4: Conf4,
     pub all6: Conf6,
@@ -93,6 +184,7 @@ impl Devices {
     pub(crate) fn new() -> Self {
         Self {
             list: vec![Device::loopback()],
+            next: LOOPBACK_INDEX + 1,
             all4: Conf4::default(),
             default4: Conf4::default(),
             all6: Conf6::default(),
@@ -129,6 +221,83 @@ impl Devices {
     /// The device of `index`, to change its settings.
     pub(crate) fn by_index_mut(&mut self, index: i32) -> Option<&mut Device> {
         self.list.iter_mut().find(|d| d.index == index)
+    }
+    /// The index a new device takes (`dev_index_reserve`): `asked`, if
+    /// positive, which another has (`EBUSY`); else the next free from where
+    /// the last one taken so was, round to 1 past the largest.
+    pub(crate) fn index_for(&self, asked: i32) -> Result<i32, paludarium_types::Errno> {
+        if asked > 0 {
+            return if self.by_index(asked).is_some() {
+                Err(paludarium_types::Errno(16))
+            } else {
+                Ok(asked)
+            };
+        }
+        let free = |i: &i32| self.by_index(*i).is_none();
+        (self.next..=i32::MAX)
+            .find(free)
+            .or_else(|| (1..self.next).find(free))
+            .ok_or(paludarium_types::Errno(105))
+    }
+    /// The name a new device takes from `name` (`dev_get_valid_name`):
+    /// `EINVAL` for one empty, of 16 bytes or more, `.` or `..`, or with
+    /// `/`, `:` or white space (`dev_valid_name`); one with `%d` takes the
+    /// least number no device's name has (`dev_alloc_name`, `ENFILE` past
+    /// 32767); `EEXIST` for one a device has.
+    pub(crate) fn name_for(&self, name: &[u8]) -> Result<Vec<u8>, paludarium_types::Errno> {
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        let name = &name[..end];
+        if name.is_empty()
+            || name.len() >= 16
+            || name == b"."
+            || name == b".."
+            || name
+                .iter()
+                .any(|&b| b == b'/' || b == b':' || b.is_ascii_whitespace())
+        {
+            return Err(paludarium_types::Errno::EINVAL);
+        }
+        if let Some(at) = name.windows(2).position(|w| w == b"%d") {
+            let (before, after) = (&name[..at], &name[at + 2..]);
+            return (0..32768)
+                .map(|n: u32| [before, n.to_string().as_bytes(), after].concat())
+                .find(|candidate| candidate.len() < 16 && self.by_name(candidate).is_none())
+                .ok_or(paludarium_types::Errno(23));
+        }
+        if self.by_name(name).is_some() {
+            return Err(paludarium_types::Errno::EEXIST);
+        }
+        Ok(name.to_vec())
+    }
+    /// Adds `device`, in the order of the indices, and moves where the next
+    /// unasked index is looked for past one it took so.
+    pub(crate) fn add(&mut self, device: Device, asked: bool) {
+        if !asked {
+            self.next = device.index.saturating_add(1);
+        }
+        let at = self.list.partition_point(|d| d.index < device.index);
+        self.list.insert(at, device);
+    }
+    /// Removes the device of `index`.
+    pub(crate) fn remove(&mut self, index: i32) -> Option<Device> {
+        let at = self.list.iter().position(|d| d.index == index)?;
+        Some(self.list.remove(at))
+    }
+}
+
+impl Drop for Devices {
+    /// The namespace goes (`default_device_exit_batch`): each veth end goes
+    /// with its peer in another namespace, which is told of there
+    /// ([`crate::netlink::peers_gone`]).
+    fn drop(&mut self) {
+        let peers = std::mem::take(&mut self.list)
+            .into_iter()
+            .filter_map(|device| {
+                let peer = device.veth?.peer?;
+                Some((peer.network.upgrade()?, peer.index))
+            })
+            .collect();
+        crate::netlink::peers_gone(peers);
     }
 }
 

@@ -11,13 +11,13 @@
 //! may name a peer by its ID (`IFLA_TARGET_NETNSID`,
 //! `IFA_TARGET_NETNSID`), as [`target`] finds it.
 //!
-//! A request gives an ID. [`link_netnsid`] is Linux's
+//! A request gives an ID, and so does [`link_netnsid`], Linux's
 //! `peernet2id_alloc`, which gives one on its own for what lies in another
-//! namespace than the one telling of it, for a device whose link is there
-//! (a veth pair's other end); no device here calls it yet, so no ID is
-//! given that way. Its other callers (a device that moves, a queue lease,
-//! a devlink instance, a PSP device, an ovpn peer, an openvswitch vport)
-//! have no counterpart here.
+//! namespace than the one telling of it: a veth end whose peer is there,
+//! as its link messages tell of it (`IFLA_LINK_NETNSID`), when it is made,
+//! moved, dumped or got ([`super::veth`]). Its other callers (a queue
+//! lease, a devlink instance, a PSP device, an ovpn peer, an openvswitch
+//! vport) have no counterpart here.
 use super::{
     Errno, Header, NLM_F_MULTI, Nla, Notice, Policy, attribute, extack, message, parse_policy,
 };
@@ -116,12 +116,14 @@ impl Drop for Ids {
             let notices = gone
                 .into_iter()
                 .map(|id| Notice {
+                    to: None,
+                    heard: false,
                     group: RTNLGRP_NSID,
                     origin: 0,
                     bytes: fill(RTM_DELNSID, 0, 0, 0, id, None),
                 })
                 .collect();
-            super::notify(&peer, notices, None);
+            super::notify_going(&peer, notices);
         }
     }
 }
@@ -358,7 +360,6 @@ pub(super) fn link_target(
 /// [`resolve`] found it (`ESRCH`, `EBADF`, `EINVAL`), with
 /// `CAP_NET_ADMIN` over it as [`link_target`] asks (`EPERM`); `None` for a
 /// peer that names none, which is the pair's own.
-#[expect(dead_code, reason = "a veth pair's creation calls it")]
 pub(super) fn peer_target(
     network: &Network,
     opener: &Credentials,
@@ -473,6 +474,8 @@ pub(super) fn new_id(
     // `rtnl_net_notifyid`, which `rtnl_notify` sends to the requester
     // alone of the members with `NLM_F_ECHO`.
     Ok(Notice {
+        to: None,
+        heard: false,
         group: RTNLGRP_NSID,
         origin: if echo { port } else { 0 },
         bytes: fill(RTM_NEWNSID, 0, header.seq, port, id, None),
@@ -507,10 +510,6 @@ fn heard(network: &Arc<Network>, peer: &Arc<Network>) {
 /// new ID is told to `this` namespace's `RTNLGRP_NSID` (`rtnl_net_notifyid`)
 /// through `notices`, before what the caller tells next. `None`
 /// (`NETNSA_NSID_NOT_ASSIGNED`) when no ID is free.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "a veth pair's link message calls it")
-)]
 pub(super) fn link_netnsid(
     this: &Arc<Network>,
     peer: &Arc<Network>,
@@ -530,6 +529,8 @@ pub(super) fn link_netnsid(
     };
     heard(this, peer);
     notices.push(Notice {
+        to: None,
+        heard: false,
         group: RTNLGRP_NSID,
         origin: 0,
         bytes: fill(RTM_NEWNSID, 0, 0, 0, id, None),

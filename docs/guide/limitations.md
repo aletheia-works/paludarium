@@ -271,9 +271,18 @@ verified.
   sleep of the thread, not a preemption (but for a thread with `rseq` that
   gives its virtual CPU to another); and a thread without `rseq` moves to
   another CPU only when a new CPU mask changes the lowest CPU it allows.
-  An event's ring buffer maps, but nothing writes records to it yet: a
-  sampling event takes no samples and sends no signal, and `poll` never
-  finds one readable. Its user page shows the count and times as of the
+  A sampling event's samples are taken as its thread enters a system call,
+  or reaches the emulator's checkpoint, of what it did since then, where
+  Linux takes each at its occurrence: they show the thread's address,
+  registers, stack and frames as of then, a fault's address is 0, and one
+  of the kernel (a fault in a system call, a switch or a migration) has the
+  address 0 and no kernel frames. `freq` follows the rate at those points,
+  not at each tick. A sample is never throttled (no `PERF_RECORD_THROTTLE`
+  or `UNTHROTTLE`), an event of a CPU takes none, and no other record
+  (`MMAP`, `COMM`, `TASK` and the rest) is written yet. Nothing wakes a
+  reader: an overflow sends no signal, and `poll` never finds an event
+  readable, and `PERF_EVENT_IOC_REFRESH` is `EINVAL` for every event,
+  where Linux takes it for a sampling event that does not inherit. Its user page shows the count and times as of the
   `mmap`, the event's enabling and its reset, where Linux updates them
   each time the event is scheduled in, and `cap_user_time` is never set.
   Where Linux's checks of a mapping and of where it goes both fail, the
@@ -287,8 +296,7 @@ verified.
   inherited event's end sends no read record, as nothing is recorded. An
   event of a task on one CPU counts on any, and the cgroup mode
   (`PERF_FLAG_PID_CGROUP`) is `EBADF`. The ioctls `SET_FILTER`,
-  `SET_BPF`, `PAUSE_OUTPUT`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are
-  `ENOTTY`. `remove_on_exec`
+  `SET_BPF`, `QUERY_BPF` and `MODIFY_ATTRIBUTES` are `ENOTTY`. `remove_on_exec`
   takes the event out of its group as Linux master has done since 7.2
   (037a3c43edfb), and such an event leads no new group (`ENODEV`,
   fa091f46c383); the test machines' Linux 7.0 leaves it in its group and
@@ -849,9 +857,17 @@ verified.
   `CAP_SETUID` and `CAP_SETGID` it needs in the parent; and the `/proc` files
   of a process that is not dumpable belong to root of the first namespace,
   where Linux gives them to root of the process's own when it maps one. A network
-  namespace has no interface but its loopback (no `veth` pairs to reach
-  another), and the interface requests and netlink change no other flag
-  than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
+  namespace has no interface but its loopback and the veth ends requests
+  make, and nothing goes through a pair yet: a veth end takes no address,
+  route or neighbour (`EOPNOTSUPP`), and no traffic. Making one takes
+  only a name, an address and an MTU for each end (`EOPNOTSUPP` for the
+  other attributes) and none of the `ifinfomsg`s' flags; changing one,
+  only `IFF_UP` and its namespace. A veth end's address without one asked
+  comes from a sequence of the emulator's own, not the kernel's random
+  numbers; its link watch comes at once, where Linux's may come a second
+  later, and so its operational state is found as it is told of; it has one queue each way, where Linux's has one for each
+  possible CPU, no `IFLA_AF_SPEC`, and statistics of zero. The interface
+  requests and netlink change no other flag than `IFF_UP`. The first namespace shows `lo` alone too, where Linux
   shows the host's interfaces. Netlink has only `NETLINK_ROUTE`,
   `NETLINK_SOCK_DIAG` and `NETLINK_GENERIC` (`EPROTONOSUPPORT` for the
   rest). Socket diagnostics tell only of AF_UNIX, TCP and UDP sockets:
@@ -972,11 +988,10 @@ verified.
   where Linux's count every namespace's; its own parameters' references
   are 1.
   The options not listed in the features are `ENOPROTOOPT`. A namespace
-  ID is given only by `RTM_NEWNSID`: Linux's `peernet2id_alloc` gives one
-  on its own only for what lies in another namespace than the one
-  telling of it (a device's link or a device that moves there, a queue
-  lease, a devlink instance, a PSP device, an ovpn peer, an openvswitch
-  vport), none of which is here, and `lo` may not move; the `RTM_DELNSID` of a
+  ID is given by `RTM_NEWNSID`, by telling of a veth end whose peer is in
+  another namespace and by moving a veth end there: Linux's `peernet2id_alloc` gives one on its own
+  for a queue lease, a devlink instance, a PSP device, an ovpn peer and
+  an openvswitch vport too, none of which is here; the `RTM_DELNSID` of a
   namespace that goes is sent as its last holder lets it go, where
   Linux sends it a little later, from a work queue. MCTP is as Ubuntu's kernel,
   built with `CONFIG_MCTP`, has it: a link's `IFLA_AF_SPEC` carries

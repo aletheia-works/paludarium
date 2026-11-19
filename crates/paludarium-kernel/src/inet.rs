@@ -293,8 +293,9 @@ pub(crate) struct Network {
     /// The loopback connections whose handshake a full queue dropped, to be
     /// tried again. Taken out before any socket's state is locked.
     syns: Mutex<Vec<Syn>>,
-    /// A nested network namespace's, which has nothing but its loopback:
-    /// no route to the host, and no DNS stub.
+    /// A nested network namespace's, which has nothing but its loopback
+    /// and veth ends that carry nothing yet: no route to the host, and no
+    /// DNS stub.
     isolated: bool,
     /// Whether its loopback interface is up.
     up: AtomicBool,
@@ -308,11 +309,14 @@ pub(crate) struct Network {
     /// ([`Self::addresses_at`]), for netlink to tell of
     /// ([`crate::netlink::expire`]); locked after the addresses.
     expired: Mutex<Vec<crate::interface::Event>>,
+    /// The netlink sockets bound in it ([`crate::netlink`]), with its
+    /// namespace IDs. Dropped before the devices, as `cleanup_net` tells
+    /// `RTM_DELNSID` (`unhash_nsid`) before `default_device_exit_batch`
+    /// takes a veth peer's end with `RTM_DELLINK`.
+    pub(crate) netlink: crate::netlink::Ports,
     /// Its network devices ([`crate::netdev`]), each taken out alone:
     /// none of the other locks is taken while it is held.
     devices: Mutex<crate::netdev::Devices>,
-    /// The netlink sockets bound in it ([`crate::netlink`]).
-    pub(crate) netlink: crate::netlink::Ports,
     /// Its MCTP sockets' binds and tags ([`crate::mctp`]).
     pub(crate) mctp: crate::mctp::Endpoints,
     /// Its TCP and UDP sockets, oldest first, which `sock_diag` lists.
@@ -516,13 +520,15 @@ impl Network {
     }
     /// `SIOCGIFFLAGS`, `SIOCSIFFLAGS` and `SIOCGIFINDEX` on the interface
     /// `name` (the `ifr_name` of a `struct ifreq`): the loopback `lo`, index
-    /// 1, is the only one (`ENODEV` for another). Setting flags needs
-    /// CAP_NET_ADMIN (`EPERM`, before the name is looked at) and takes only
-    /// `IFF_UP`, with what that does to the loopback's addresses
-    /// ([`Self::set_up`]): down, it loses every IPv6 address; up, it has
-    /// `127.0.0.1/8` and `::1` back, made at `now`.
+    /// 1, or a veth end ([`crate::netdev`]); `ENODEV` for another. Setting
+    /// flags needs CAP_NET_ADMIN (`EPERM`, before the name is looked at) and
+    /// takes only `IFF_UP`: a veth end comes up or goes down as
+    /// `RTM_SETLINK` has it ([`crate::netlink::veth_set_up`]); the loopback
+    /// with what that does to its addresses ([`Self::set_up`]): down, it
+    /// loses every IPv6 address; up, it has `127.0.0.1/8` and `::1` back,
+    /// made at `now`.
     pub(crate) fn interface(
-        &self,
+        self: &Arc<Self>,
         name: &[u8],
         request: u64,
         flags: u16,
@@ -533,9 +539,30 @@ impl Network {
         if request == SIOCSIFFLAGS && !may_administer {
             return Err(Errno::EPERM);
         }
-        let Some(index) = self.devices().by_name(name).map(|d| d.index) else {
+        let Some(device) = self.devices().by_name(name).cloned() else {
             return Err(ENODEV);
         };
+        let index = device.index;
+        // A veth end's own flags; bringing it up or down tells both its
+        // namespace and its peer's.
+        if device.kind == crate::netdev::DeviceKind::Veth {
+            return match request {
+                SIOCGIFFLAGS => Ok(u32::from(crate::netlink::veth_ioctl_flags(&device))),
+                SIOCSIFFLAGS => {
+                    let mut notices = Vec::new();
+                    crate::netlink::veth_set_up(
+                        self,
+                        self,
+                        index,
+                        flags & IFF_UP != 0,
+                        &mut notices,
+                    );
+                    crate::netlink::notify_link(self, notices);
+                    Ok(0)
+                }
+                _ => Ok(index.unsigned_abs()),
+            };
+        }
         match request {
             SIOCGIFFLAGS => Ok(u32::from(if self.up.load(Ordering::SeqCst) {
                 IFF_UP | IFF_LOOPBACK | IFF_RUNNING
@@ -1141,7 +1168,7 @@ impl InetSocket {
         *self.cookie.get_or_init(crate::sockets::new_cookie)
     }
     /// The network it was made in.
-    pub(crate) fn network(&self) -> &Network {
+    pub(crate) fn network(&self) -> &Arc<Network> {
         &self.network
     }
     /// `F_GETOWN` and `F_GETSIG`.

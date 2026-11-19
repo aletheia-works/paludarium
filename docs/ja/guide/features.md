@@ -78,7 +78,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 | 管理 | `reboot`、`swapon`／`swapoff`、`init_module`／`finit_module`／`delete_module`、`kexec_load`／`kexec_file_load`、`quotactl`／`quotactl_fd` |
 | seccomp | `seccomp`（下に書きます） |
 | BPF | `bpf`、マップと、検証器つきのソケットフィルターの `BPF_PROG_LOAD`（下を参照） |
-| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックの `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
+| 入出力 | `poll`、`ppoll`、`select`、`pselect6`、`vhangup`、`ioctl`（`TCGETS`、`TIOCGWINSZ`、`FIOCLEX`、`FIONCLEX`、`FIONBIO`、`FIOASYNC`、`FIOQSIZE`、`FIGETBSZ`、`SIOCATMARK`、`FIONREAD`/`SIOCINQ`、`SIOCOUTQ`、ループバックと veth の端の `SIOCGIFFLAGS`・`SIOCSIFFLAGS`・`SIOCGIFINDEX`・`SIOCGIFNAME`、`INOTIFY_IOC_SETNEXTWD`、seccomp のリスナーの `SECCOMP_IOCTL_NOTIF_*`（後述の seccomp を見てください）、`FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS`、`FS_IOC_FSGETXATTR`、`FS_IOC_FSSETXATTR`、後述の疑似端末のリクエスト） |
 | イベント | `eventfd`／`eventfd2`、`timerfd_create`／`timerfd_settime`／`timerfd_gettime`、`signalfd`／`signalfd4`、`inotify_init`／`inotify_init1`、`inotify_add_watch`、`inotify_rm_watch`、`fanotify_init`、`fanotify_mark`、`epoll_create`／`epoll_create1`、`epoll_ctl`、`epoll_wait`、`epoll_pwait`、`epoll_pwait2`、`io_uring_setup`、`io_uring_enter`、`io_uring_register`（下を参照） |
 | 非同期 I/O | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`（下を参照） |
 | ソケット | `socket`（AF_UNIX のストリーム、パケット、データグラムのソケット。[ネットワーク](#network)があるか新しいネットワーク名前空間の中なら `AF_INET`、`AF_INET6`、`AF_NETLINK`（`NETLINK_ROUTE`、`NETLINK_SOCK_DIAG`、`NETLINK_GENERIC`）、`AF_MCTP` のデータグラム、なければ `EAFNOSUPPORT`）、`connect`、`getsockname`、`getpeername`、`bind`、`listen`、`accept`、`accept4`（AF_UNIX のストリームとパケットのソケット、ゲスト自身の[ループバック](#loopback-servers)の上の TCP）、`socketpair`（AF_UNIX、`SOCK_STREAM`、`SOCK_SEQPACKET`、`SOCK_DGRAM`）、`sendto`、`recvfrom`、`sendmsg` と `recvmsg`（`SCM_RIGHTS` でのディスクリプタ、`SCM_CREDENTIALS` での資格情報、`SCM_PIDFD` での送り手の pidfd の受け渡し）、`sendmmsg` と `recvmmsg`、`setsockopt` と `getsockopt`（`SOL_SOCKET`）、`shutdown` |
@@ -1780,15 +1780,17 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   どの名前空間からも届きます。どのファミリーのソケットへの `SIOCGIFFLAGS` と
   `SIOCGIFINDEX` も（glibc と musl の `if_nametoindex` が使う AF_UNIX のものも）、
   Linux の `dev_ioctl` が `sock_net` を取るのと同じく、ソケットが作られた名前空間の
-  ループバックを読みます（上がっている間は最初の名前空間でも
-  `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）。accept した AF_UNIX のソケットは、
+  デバイスを読みます。ループバック（上がっている間は最初の名前空間でも
+  `IFF_UP | IFF_LOOPBACK | IFF_RUNNING`）と veth の端（下の veth の組）です。accept した AF_UNIX のソケットは、
   クライアントの名前空間のものです。`SIOCSIFFLAGS` には、呼び出し元がどこにいても、
   その名前空間を持つユーザーの名前空間での CAP_NET_ADMIN が要ります。ネットワークの
   ない最初の名前空間の AF_UNIX のソケットには、ネットワークがありません（`ENOTTY`）。
   ほかのインターフェースの名前は `ENODEV` です。`SIOCGIFNAME`
-  （`if_indextoname`）は、インデックス 1 を `lo` と答えます（ほかは `ENODEV`）。
+  （`if_indextoname`）は、そのインデックスのデバイスの名前を答えます（なければ
+  `ENODEV`）。
 - netlink のソケット（`AF_NETLINK`、`SOCK_RAW` か `SOCK_DGRAM`、プロトコル
-  `NETLINK_ROUTE`）は、作られたネットワーク名前空間のループバックを見せ、変えます。
+  `NETLINK_ROUTE`）は、作られたネットワーク名前空間のデバイス（ループバックと、下の veth の組の
+  端）を見せ、変えます。
   そのため glibc と musl の `getifaddrs`、`ip link`、`ip addr`（`ip addr add` と `del` も）、
   `ip route`（`ip route add`、`del`、`replace`、`append` も）、`ip route get`、
   `ip link set lo up`、`ip monitor` が動きます。
@@ -1888,15 +1890,45 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     自分の名前空間を指すのは移動ではありません。`RTM_DELLINK` は、`rtnl_dellink` と同じく
     ID だけを取り（はじめの二つは `EOPNOTSUPP`）、`rtnl_get_net_ns_capable` と同じく
     その名前空間を探して（`EINVAL`、`EACCES`）、そこでインデックスか名前で `lo` を探します。
-    `lo` は消せません（`rtnl_link_ops` がないので `EOPNOTSUPP`）。ほかのリンクは `ENODEV` で、
+    `lo` は消せません（`rtnl_link_ops` がないので `EOPNOTSUPP`）。veth の端は消せます（下）。
+    ほかのリンクは `ENODEV` で、
     どちらもなければ、`IFLA_GROUP` がグループ 0 なら `EPERM`、ほかなら `ENODEV`、
     何もなければ `EINVAL` です。
+  - **veth の組:** 種類が `veth` の `RTM_NEWLINK`（`IFLA_LINKINFO`）は、`rtnl_newlink` と
+    `veth_newlink` と同じく組を作ります。まず `VETH_INFO_PEER` の名前、アドレス、MTU、
+    名前空間（`IFLA_NET_NS_PID` か `IFLA_NET_NS_FD`。なければ要求した名前空間）で相手を、
+    次に要求のもので最初の端を作ります。名前がなければ `veth%d`、アドレスがなければ乱数の
+    アドレスで、要求が指すインデックスを取ります（相手のインデックスは、最初の端のものを
+    指したときだけです）。`VETH_INFO_PEER` がなければ、相手は要求の MTU と名前空間を取り、
+    名前とアドレスは自分のものになります。
+    調べる順は Linux と同じです。6 バイトでないアドレスか 68 から 65535 の外の MTU
+    （`EINVAL`）、マルチキャストのアドレス（`EADDRNOTAVAIL`）、使われている名前か
+    インデックス（`EEXIST`、`EBUSY`）、要求が指すリンクがすでにあるとき（`NLM_F_EXCL`
+    なら `EEXIST`）です。どちらの端も Ethernet のデバイスで、それぞれの名前空間に
+    `RTM_NEWLINK` で伝えます。両端が上がっている間はキャリアを持ち（`IFF_LOWER_UP`、
+    それから `IFF_RUNNING` と動作状態の up）、それぞれがそれを伝えます（上がっていて
+    キャリアのない端は、`default_operstate` と同じく、自分の名前空間で相手のインデックスの
+    デバイスが up でなければ lower layer down です）。リンクの
+    メッセージには種類、相手（`IFLA_LINK`）と、相手が別の名前空間にあればその名前空間の
+    ID（`IFLA_LINK_NETNSID`。伝える名前空間がまず `RTM_NEWNSID` でその ID を与えます）が
+    入ります。`RTM_SETLINK` か `RTM_NEWLINK` は、`SIOCSIFFLAGS` と同じく端を上げ下げし
+    （`SIOCGIFFLAGS`、`SIOCGIFINDEX`、`SIOCGIFNAME` もあります）、
+    `__dev_change_net_namespace` と同じく別の名前空間へ移します。上がっていればまず閉じ
+    （`IFF_UP` と `IFF_RUNNING` が変わったと伝えます）、移る前の名前空間に `RTM_DELLINK`
+    で伝えます。その名前空間は移る先に ID を与え、その ID と移った先のインデックス
+    （`IFLA_NEW_NETNSID`、`IFLA_NEW_IFINDEX`）を付けます。それから移った先に
+    `RTM_NEWLINK` で伝えます。インデックスは、移る先で使われていなければそのままです。
+    どちらかの端の `RTM_DELLINK` は両端を消し、どちらかの名前空間がなくなるときも
+    （その `RTM_DELNSID` の後で）両端が消えます。`unregister_netdevice_many_notify` と
+    同じく、上がっている端をすべて閉じてから、それぞれが消えたことを伝えます。
   - **名前空間の ID:** Linux の `net_namespace.c` と同じく、`RTM_NEWNSID` は、
     プロセス（`NETNSA_PID`、なければ `ESRCH`）か `/proc/<pid>/ns/net` の記述子
     （`NETNSA_FD`、`EBADF`、ほかのファイルなら `EINVAL`）のネットワーク名前空間に
     ID `NETNSA_NSID` を、負の値なら空いている一番小さい ID を与えます。どちらもなければ
     `EINVAL`、すでに ID がある名前空間や使われている ID は `EEXIST` で、それぞれ Linux の
-    拡張 ACK のメッセージを付けます。`RTNLGRP_NSID` のメンバーは新しい ID を知らされます
+    拡張 ACK のメッセージを付けます。相手が別の名前空間にある veth の端を伝えるときも、
+    `peernet2id_alloc` と同じく、その名前空間に空いている一番小さい ID を与えます。そこへ
+    veth の端を移すときも同じです（上の veth の組）。`RTNLGRP_NSID` のメンバーは新しい ID を知らされます
     （`NLM_F_ECHO` なら、そのうちリクエストした側だけが受け取ります）。名前空間が
     なくなって ID が消えるときも、`unhash_nsid` と同じく `RTM_DELNSID` で知らされます。
     なくなるのは、それを持つプロセス、記述子、ソケットがなくなったときで、その ID は
@@ -3253,12 +3285,14 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   キャッシュ、raw のイベントは、PMU のないマシンと同じく `ENOENT` です。ほかのプロセスの
   イベントには `CAP_PERFMON` か、それを読めること（`ptrace_may_access`、`EACCES`）が
   要ります。`read` は、読み込みの形式に従って、数に有効な時間と動いた時間、ID、失った
-  サンプル（0）を付けて返し、`PERF_FORMAT_GROUP` ではグループ全体を返します。バッファが
+  サンプルを付けて返し、`PERF_FORMAT_GROUP` ではグループ全体を返します。バッファが
   小さすぎると `ENOSPC` です。グループのメンバーはリーダーと同じタスク、CPU、クロックで、
   pinned でも exclusive でもないこと（`EINVAL`）が要り、リーダーが有効な間だけ数えます。
   ioctl は `PERF_EVENT_IOC_ENABLE`、`DISABLE`、`RESET`（イベントか、`PERF_IOC_FLAG_GROUP`
   ならそのグループ）と `PERF_EVENT_IOC_ID` があり、サンプリングしないイベントでは `PERIOD`
-  と `REFRESH` は `EINVAL` です。`enable_on_exec` は、`perf stat` が使うように、無効な
+  は `EINVAL` で、サンプリングするイベントには新しい周期（`freq` なら新しい頻度）を
+  与え、周期は初めからになります。`REFRESH` はどのイベントでも `EINVAL` です
+  （[制限](./limitations) を参照）。`enable_on_exec` は、`perf stat` が使うように、無効な
   イベントをそのタスクの `execve` で有効にし、`remove_on_exec` は、Linux master と同じく、そのとき
   イベントを以後ずっと取り除きます。イベントは数えなくなり、最後の数と時間は読めるまま残り、
   持ち主がなくなり、グループを離れます。それがグループを率いていたなら、メンバーはそれぞれで
@@ -3308,7 +3342,27 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   いるときも断ります（`EINVAL`）。-1（`SET_OUTPUT` だけ）は出力先をなくします。こうした
   イベントはユーザーページを共有しますが、マップすると `EBUSY`（大きさが違えば
   `EINVAL`）で、バッファの最後のマッピングがなくなると、書き込んでいたイベントは
-  どれも自由になります。ディスクリプタのリンクは
+  どれも自由になります。サンプリングするイベントは、Linux の `perf_swevent_event` と
+  `perf_swevent_hrtimer` と同じく、オーバーフローのたびに `PERF_RECORD_SAMPLE` を
+  バッファへ書きます。`sample_period` 回ごと、`PERF_SAMPLE_PERIOD` ならそれぞれ（周期 1）、
+  `cpu-clock` と `task-clock` は数えたナノ秒の周期ごとで、少なくとも 10 µs ごとです。
+  `freq` では、クロックの周期は 1 秒を頻度で割ったもので、ほかのイベントの周期は 1 から
+  始まり、数える速さへ 8 分の 1 ずつ近づきます（`perf_adjust_period`）。サンプルは
+  `sample_type` の求めるフィールドを `perf_output_sample` の順に持ちます。識別子、
+  アドレス、開いたタスクの PID 名前空間でのプロセスとスレッド、イベントの時計での時刻、
+  ID とストリーム ID、CPU、周期、`PERF_SAMPLE_READ` の読む値（`PERF_FORMAT_GROUP`
+  ならグループのもの）、コールチェーン（`PERF_CONTEXT_USER`、アドレス、`rbp` の
+  連なりがたどる戻りアドレスで、`sample_max_stack` まで。0 なら `perf_event_max_stack`
+  （127）で、それより多いと `EOVERFLOW`）、空の raw データ、マスクのユーザーレジスタ、
+  ページがメモリにある限りのユーザースタックの写し、そして残りはソフトウェアイベントの
+  とおりです（重みなし、データソースは `PERF_MEM_NA`、ルートの cgroup）。記録は読み手が
+  空けたところ（`data_tail`）まで、前へ、`write_backward` なら 0 から後ろへ書かれます。
+  入らない記録は失われて数えられ、次に入る記録の前に、それらの数の `PERF_RECORD_LOST`
+  が、`sample_id_all` の足す `sample_id` を付けて書かれます。読み取り専用でマップした
+  バッファは中身を上書きし、何も失いません。`PERF_EVENT_IOC_PAUSE_OUTPUT` はバッファを
+  止め、また動かし（バッファがないか、データページがなければ `EINVAL`）、止まっている
+  バッファは受け取らない記録を失ったものと数えます。引き継いだイベントは、元のイベントの
+  バッファへ書きます。ディスクリプタのリンクは
   `anon_inode:[perf_event]` で、読み書きで開かれ、書き込みは `EINVAL` です。ないものは
   [制限](./limitations) を参照してください。
 - `bpf` は、Linux の `kernel/bpf/syscall.c`、`arraymap.c`、`hashtab.c`、`bpf_lru_list.c`、

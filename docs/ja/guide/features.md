@@ -2135,7 +2135,10 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
     渡したアドレスを取るか、持っているものが要ります（`EINVAL`）。変わるたびに、
     求めたソケットのポートを付けて `RTNLGRP_NEIGH` に伝えます。`NTF_USE` と
     `NTF_MANAGED` は `NUD_PERMANENT` だけを外し、それから近隣を使います
-    （`neigh_event_send`）。`NTF_EXT_MANAGED` の永続の近隣と、有効でない状態の
+    （`neigh_event_send`）。到達可能な近隣のタイマーは `neigh_timer_handler` と同じく
+    動きます。確認から到達可能時間（30 秒）が過ぎると、その前の 5 秒のうちに使われて
+    いれば遅延中になり、そうでなければ古くなって、ポートを付けずに `RTNLGRP_NEIGH` に
+    伝えます。`NTF_EXT_MANAGED` の永続の近隣と、有効でない状態の
     `NTF_EXT_VALIDATED` は `EINVAL` です。削除は近隣をまず失敗させ（`NUD_FAILED`。
     有効だったなら伝えます）、それから `RTM_DELNEIGH` で消えたと伝えます。`NTF_PROXY`
     のリクエストは、代わりに `lo` かデバイスのない代理のエントリを足し、変え、消します

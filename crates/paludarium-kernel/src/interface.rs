@@ -576,7 +576,8 @@ pub(crate) struct Neighbour {
     pub unconfirmed: bool,
     /// Whether its timer is pending, which holds a reference to it
     /// (`neigh_add_timer`): one that a state of `NUD_REACHABLE`,
-    /// `NUD_DELAY` or `NUD_PROBE` sets. It never runs here.
+    /// `NUD_DELAY` or `NUD_PROBE` sets. Only a reachable one's runs here
+    /// ([`Self::age`]).
     pub timer: bool,
 }
 /// The `NUD_*` states.
@@ -602,6 +603,11 @@ pub(crate) const NTF_EXT_VALIDATED: u32 = 0x400;
 const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
+/// A neighbour table's reachable time, its base one (`REACHABLE_TIME`,
+/// 30 seconds), and its delay before a probe (`DELAY_PROBE_TIME`, 5
+/// seconds).
+const REACHABLE_TIME: u64 = 30 * SECOND;
+const DELAY_PROBE_TIME: u64 = 5 * SECOND;
 /// `ENOBUFS`.
 const ENOBUFS: Errno = Errno(105);
 /// A neighbour a request adds or changes (`RTM_NEWNEIGH`), as `neigh_add`
@@ -768,6 +774,33 @@ impl Neighbour {
             told = true;
         }
         (told, Ok(()))
+    }
+    /// `neigh_timer_handler` for a reachable neighbour by `now`: when its
+    /// reachable time since it was confirmed has passed, it delays if it
+    /// was used within the delay before a probe of that moment, untold,
+    /// and its timer stays (but never runs here); otherwise it is stale,
+    /// without a timer. When it went stale, which is told of.
+    fn age(&mut self, now: u64) -> Option<u64> {
+        if self.state & NUD_REACHABLE == 0 || !self.timer {
+            return None;
+        }
+        let confirmed = if self.unconfirmed {
+            self.confirmed.saturating_sub(2 * REACHABLE_TIME)
+        } else {
+            self.confirmed
+        };
+        let at = confirmed + REACHABLE_TIME;
+        if now <= at {
+            return None;
+        }
+        self.updated = at;
+        if at <= self.used + DELAY_PROBE_TIME {
+            self.state = NUD_DELAY;
+            return None;
+        }
+        self.state = NUD_STALE;
+        self.timer = false;
+        Some(at)
     }
     /// `neigh_event_send` at `now`, which a request with `NTF_USE` or
     /// `NTF_MANAGED` makes: it is used; one connected, delaying or probing
@@ -1576,7 +1609,9 @@ impl Addresses {
     /// lifetime goes, as on a removal, and one past its preferred lifetime
     /// is `IFA_F_DEPRECATED`, and told of; an IPv6 route past its own goes,
     /// and is told of. A permanent IPv4 address never runs out, nor an IPv6
-    /// one whose preferred lifetime never ends.
+    /// one whose preferred lifetime never ends. Last, a reachable neighbour
+    /// whose reachable time has passed delays or goes stale, and the stale
+    /// ones are told of ([`Neighbour::age`]).
     pub(crate) fn expire(&mut self, now: u64) -> Vec<Event> {
         let mut events = Vec::new();
         let mut i = 0;
@@ -1619,6 +1654,15 @@ impl Addresses {
         for route in expired {
             self.kernel_del6(&route, &mut events);
         }
+        // Then the neighbours that have gone stale, in the order their
+        // timers ran (`neigh_timer_handler`).
+        let mut stale: Vec<(u64, Neighbour)> = self
+            .neighbours
+            .iter_mut()
+            .filter_map(|n| n.age(now).map(|at| (at, *n)))
+            .collect();
+        stale.sort_by_key(|&(at, _)| at);
+        events.extend(stale.into_iter().map(|(_, n)| Event::NewNeighbour(n)));
         events
     }
     /// The primary address whose subnet `secondary` is in, or itself.
@@ -3092,6 +3136,61 @@ mod tests {
                 "-route 254 2001:db8:5::/64 Unicast 256",
             ]
         );
+    }
+
+    #[test]
+    fn a_reachable_neighbour_goes_stale_or_delays_as_its_timer_runs() {
+        let mut a = Addresses::first();
+        let ask = |ip: &str, state, flags| NeighbourAsk {
+            ip: ip.parse().unwrap(),
+            state,
+            flags,
+            lladdr: Some([2, 0, 0, 0, 0, 1]),
+            protocol: 0,
+            request: NLM_F_CREATE,
+        };
+        let start = 100 * SECOND;
+        let _ = a.add_neighbour(ask("2001:db8::1", NUD_REACHABLE, 0), start);
+        let _ = a.add_neighbour(ask("2001:db8::2", NUD_REACHABLE, 0), start + SECOND);
+        let _ = a.add_neighbour(ask("2001:db8::3", NUD_PERMANENT, 0), start);
+        // Confirmed again: its time starts over.
+        let _ = a.add_neighbour(ask("2001:db8::1", NUD_REACHABLE, 0), start + 2 * SECOND);
+        // Used just before its time is out: it delays.
+        let _ = a.add_neighbour(ask("2001:db8::4", NUD_REACHABLE, 0), start);
+        let _ = a.add_neighbour(ask("2001:db8::4", 0, NTF_USE), start + 26 * SECOND);
+        let stale = |events: &[Event]| -> Vec<String> {
+            events
+                .iter()
+                .map(|e| match e {
+                    Event::NewNeighbour(n) => format!("{} {:#x} {}", n.ip, n.state, n.timer),
+                    _ => panic!("{e:?}"),
+                })
+                .collect()
+        };
+        assert!(a.expire(start + REACHABLE_TIME).is_empty());
+        assert!(stale(&a.expire(start + REACHABLE_TIME + SECOND)).is_empty());
+        let state = |a: &Addresses, ip: &str| {
+            let n = a
+                .neighbours()
+                .iter()
+                .find(|n| n.ip == ip.parse::<IpAddr>().unwrap())
+                .unwrap();
+            (n.state, n.timer, n.updated)
+        };
+        assert_eq!(
+            state(&a, "2001:db8::4"),
+            (NUD_DELAY, true, start + REACHABLE_TIME)
+        );
+        assert_eq!(
+            stale(&a.expire(start + REACHABLE_TIME + 3 * SECOND)),
+            ["2001:db8::2 0x4 false", "2001:db8::1 0x4 false"]
+        );
+        assert_eq!(
+            state(&a, "2001:db8::1"),
+            (NUD_STALE, false, start + 2 * SECOND + REACHABLE_TIME)
+        );
+        assert_eq!(state(&a, "2001:db8::3").0, NUD_PERMANENT);
+        assert!(a.expire(start + 100 * REACHABLE_TIME).is_empty());
     }
 
     #[test]

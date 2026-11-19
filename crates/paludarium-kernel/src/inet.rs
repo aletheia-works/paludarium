@@ -440,7 +440,8 @@ impl Network {
     /// The address a connection or datagram to `to` on the loopback leaves
     /// from at `now`: its route's preferred source.
     pub(crate) fn source(&self, to: SocketAddr, now: Option<u64>) -> IpAddr {
-        self.addresses_at(now).source(to.ip())
+        let order = self.devices().order();
+        self.addresses_at(now).source(to.ip(), &order)
     }
     /// Whether a socket may bind to `ip`: the unspecified address, an IPv4
     /// multicast or limited broadcast one, one a local or broadcast route

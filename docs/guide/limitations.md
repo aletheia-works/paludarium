@@ -858,8 +858,13 @@ verified.
   of a process that is not dumpable belong to root of the first namespace,
   where Linux gives them to root of the process's own when it maps one. A network
   namespace has no interface but its loopback and the veth ends requests
-  make, and nothing goes through a pair yet: a veth end takes no address,
-  route or neighbour (`EOPNOTSUPP`), and no traffic. Making one takes
+  make, and nothing goes through a pair yet. A veth end takes IPv4
+  addresses and routes, but no IPv6 address (it makes no link-local one
+  as it comes up, where Linux does), no neighbour, no route through a
+  gateway and no route lookup in through it (`RTA_IIF`), each
+  `EOPNOTSUPP`, and no traffic. The addresses of an end that goes tell
+  their lifetimes as of the last netlink request, read or poll in its
+  namespace, where Linux takes the time it goes. Making one takes
   only a name, an address and an MTU for each end (`EOPNOTSUPP` for the
   other attributes) and none of the `ifinfomsg`s' flags; changing one,
   only `IFF_UP` and its namespace. A veth end's address without one asked
@@ -907,7 +912,7 @@ verified.
   change of them sends no `RTM_NEWNETCONF`, and IPv6's `forwarding` joins
   no router multicast or anycast address.
   A
-  route goes through `lo` or rejects: IPv6 gateways, multipath routes,
+  route goes through `lo`, a veth end (IPv4, without a gateway) or rejects: IPv6 gateways, multipath routes,
   encapsulations, nexthop objects, realms, expiries, source prefixes, router preferences
   and the anycast, multicast and NAT kinds (and broadcast for IPv6) are
   `EOPNOTSUPP`, and so are policy rules (`RTM_NEWRULE`), so no lookup

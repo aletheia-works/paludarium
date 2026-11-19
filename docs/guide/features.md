@@ -2307,6 +2307,27 @@ kernel.
     takes both, and so does the namespace of either going (after its
     `RTM_DELNSID`); as `unregister_netdevice_many_notify` does, every end
     that is up is closed before either is told gone.
+    An end takes IPv4 addresses as `lo` does (`inet_rtm_newaddr`), each
+    among its own, so one in a subnet another device's address has is no
+    secondary; its name is their label. An address brings its local route
+    at once and, while the end is up, its broadcast routes and a unicast
+    prefix route in the main table, of link scope (`fib_add_ifaddr`), all
+    through the end (`RTA_OIF`); coming up brings them for its addresses
+    after its link message, going down takes all but the local ones
+    without a word, and while it is up without its carrier they are
+    `RTNH_F_LINKDOWN` (`fib_check_nh_nongw`, `NETDEV_CHANGE`). A route the
+    guest adds through an end without a gateway is taken as well
+    (`ENETDOWN` while the end is down, `ENODEV` for a device there is
+    not). An output lookup that goes through an end leaves from its first
+    primary address, else from the first of the other devices' in the
+    order they were made (`inet_select_addr`), and names it as `RTA_OIF`,
+    without `RTCF_LOCAL`; one forwarded there from `lo` names it too, with
+    its source checked as `__fib_validate_source` does (strict reverse
+    path filtering drops one whose route goes out through another device).
+    An end that goes, or moves to another namespace, first tells of each
+    of its addresses and their local routes going, as `inetdev_destroy`
+    does, before its `RTM_DELLINK`. Address and route dumps take an end's
+    index (the `ifaddrmsg`'s, `RTA_OIF`).
   - **Namespace IDs:** as Linux's `net_namespace.c`, `RTM_NEWNSID` gives
     the network namespace of a process (`NETNSA_PID`, `ESRCH` for none) or
     of a `/proc/<pid>/ns/net` descriptor (`NETNSA_FD`, `EBADF`, or `EINVAL`
@@ -2449,7 +2470,7 @@ kernel.
     table and, from the first time `lo` is up with it (for one added while
     down, if it is permanent), a unicast prefix route in the main table, of
     its priority or else metric 256, but for `::1`. `RTM_NEWROUTE` adds a route
-    through `lo` or of a kind without a device (`blackhole`, `unreachable`,
+    through `lo` (or, for IPv4 without a gateway, a veth end) or of a kind without a device (`blackhole`, `unreachable`,
     `prohibit`, `throw`) to any table, with its metric, protocol, scope,
     TOS, preferred source and an IPv4 gateway (on link too), as
     `inet_rtm_newroute` and `inet6_rtm_newroute` do: `NLM_F_EXCL`,
@@ -2457,13 +2478,13 @@ kernel.
     place, or Linux's error refuses it (`EEXIST`, `ENOENT`; `EINVAL` for a
     bad prefix, scope, kind, gateway or preferred source, and for an IPv6
     route with `RTA_FLOWLABEL`, `RTA_VIA` or `RTM_F_CLONED`; `ENODEV` for
-    another device; `ENETDOWN` while `lo` is down, but for an IPv4 route of
-    host scope). `RTM_DELROUTE` removes the first route that matches what it
+    another device, for IPv4 one there is not; `ENETDOWN` while its device
+    is down, but for an IPv4 route of host scope). `RTM_DELROUTE` removes the first route that matches what it
     names (`ESRCH` for none), a kernel's too, which a change of an address
     or `lo` coming up brings back. Taking `lo` down removes IPv4's routes
     through it but those of host scope, and every IPv6 route. Removing an
     IPv4 address removes the main table's routes from it, and the last one
-    every route through `lo`; removing an IPv6 address removes the first
+    of a device every route through that device; removing an IPv6 address removes the first
     main table route to its prefix, whoever's, as `cleanup_prefix_route`
     does. `RTM_GETROUTE` with `NLM_F_DUMP` gives the routes table by table,
     in the order of Linux's table hash, IPv4's in their trie's order and
@@ -2526,14 +2547,16 @@ kernel.
     `forwarding` off (`/proc/sys/net`), it is `EHOSTUNREACH`; on, a
     destination no route takes gives the lookup's error, a route of a
     kind other than unicast `EINVAL`, and a unicast one the route it is
-    forwarded on (`__mkroute_input`): unicast, out through `lo`, with the
-    route's gateway and metrics, and `RTCF_DOREDIRECT` where the source's
-    own route is a unicast one through `lo` without a gateway, as a packet
-    that goes out where it came in asks to redirect. Reverse path
+    forwarded on (`__mkroute_input`): unicast, out through the route's
+    device (`RTA_OIF`), with the route's gateway and metrics, and, out
+    through `lo`, `RTCF_DOREDIRECT` where the source's own route is a
+    unicast one through `lo` without a gateway, as a packet that goes out
+    where it came in asks to redirect. Reverse path
     filtering (`rp_filter`, `all`'s or `lo`'s, the larger) checks every
     source by a lookup of it (`__fib_validate_source`): with it on, a
-    source no route takes is dropped too; strict and loose filtering ask
-    the same, as every route goes through `lo`. IPv6 gives the route the
+    source no route takes is dropped too, and so, strictly, is one whose
+    route goes through another device than `lo` while `lo` has an address;
+    loosely, a lookup of it through `lo` decides. IPv6 gives the route the
     tables do, whatever its source and its `forwarding`. The mark, the user ID, the protocol and the ports choose among
     policy rules and multipath routes, which there are none of, so they
     change nothing.

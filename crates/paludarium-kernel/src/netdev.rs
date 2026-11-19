@@ -164,6 +164,10 @@ impl Device {
 #[derive(Debug)]
 pub(crate) struct Devices {
     list: Vec<Device>,
+    /// Their indices in the order they were registered in the namespace
+    /// (`dev_base_head`), the loopback first, which `inet_select_addr`
+    /// goes through.
+    made: Vec<i32>,
     /// Where the next index a device takes without asking one is looked
     /// for (`net->ifindex`, `xa_alloc_cyclic`).
     next: i32,
@@ -184,6 +188,7 @@ impl Devices {
     pub(crate) fn new() -> Self {
         Self {
             list: vec![Device::loopback()],
+            made: vec![LOOPBACK_INDEX],
             next: LOOPBACK_INDEX + 1,
             all4: Conf4::default(),
             default4: Conf4::default(),
@@ -275,13 +280,20 @@ impl Devices {
         if !asked {
             self.next = device.index.saturating_add(1);
         }
+        self.made.push(device.index);
         let at = self.list.partition_point(|d| d.index < device.index);
         self.list.insert(at, device);
     }
     /// Removes the device of `index`.
     pub(crate) fn remove(&mut self, index: i32) -> Option<Device> {
         let at = self.list.iter().position(|d| d.index == index)?;
+        self.made.retain(|&i| i != index);
         Some(self.list.remove(at))
+    }
+    /// The devices' indices in the order they were registered in the
+    /// namespace (`for_each_netdev`), the loopback first.
+    pub(crate) fn order(&self) -> Vec<i32> {
+        self.made.clone()
     }
 }
 

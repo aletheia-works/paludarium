@@ -20,7 +20,7 @@
 //! then the default table's (253) where they have no answer. IPv6 looks in
 //! the local table, then the main one. The other tables are kept and shown,
 //! but no lookup reaches them.
-use crate::netdev::LOOPBACK_OIF;
+use crate::netdev::{LOOPBACK_INDEX, LOOPBACK_OIF};
 use crate::netlink::extack;
 use core::cmp::{Ordering, Reverse};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -86,9 +86,11 @@ const NEXTHOP_DEAD: u32 = 0x1 | 0x10;
 const METRIC_USER: u32 = 1024;
 const METRIC_ADDRCONF: u32 = 256;
 
-/// An IPv4 address of `lo` (Linux's `in_ifaddr`).
+/// An IPv4 address of a device (Linux's `in_ifaddr`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct V4 {
+    /// The index of the device it is on (`ifa_dev`).
+    pub index: i32,
     pub local: Ipv4Addr,
     pub address: Ipv4Addr,
     pub prefix: u8,
@@ -157,10 +159,11 @@ impl Lifetimes {
     };
 }
 impl V4 {
-    /// An address the guest asks for: `local`, `address` (its peer, or the
-    /// same), `prefix` and `scope`.
+    /// An address the guest asks for on `lo`: `local`, `address` (its
+    /// peer, or the same), `prefix` and `scope`.
     pub(crate) fn new(local: Ipv4Addr, address: Ipv4Addr, prefix: u8, scope: u8) -> Self {
         Self {
+            index: LOOPBACK_INDEX,
             local,
             address,
             prefix,
@@ -208,6 +211,24 @@ impl V4 {
     }
     fn secondary(&self) -> bool {
         self.flags & SECONDARY != 0
+    }
+    /// Its device's index as a route's device names it.
+    fn oif(&self) -> u32 {
+        self.index.unsigned_abs()
+    }
+    /// The kind of its prefix route: local on the loopback
+    /// (`IFF_LOOPBACK`), else unicast.
+    fn prefix_kind(&self) -> Kind {
+        if self.index == LOOPBACK_INDEX {
+            Kind::Local
+        } else {
+            Kind::Unicast
+        }
+    }
+    /// Whether `other` is in the same subnet of the same device, as a
+    /// primary address and its secondaries are.
+    fn same_subnet(&self, other: &Self) -> bool {
+        self.index == other.index && self.mask() == other.mask() && self.covers(other.address)
     }
 }
 /// An IPv6 address of `lo` (Linux's `inet6_ifaddr`).
@@ -354,7 +375,13 @@ fn prefix_route4(address: &V4) -> Option<Route4> {
     (!prefix.is_unspecified() && !(prefix == address.local && address.prefix == 32)).then(|| {
         Route4 {
             priority: address.priority,
-            ..Route4::kernel(prefix, address.prefix, Kind::Local, address.local)
+            ..Route4::kernel(
+                prefix,
+                address.prefix,
+                address.prefix_kind(),
+                address.local,
+                address.oif(),
+            )
         }
     })
 }
@@ -431,10 +458,16 @@ pub(crate) struct Route4 {
     pub scope: u8,
     pub prefsrc: Option<Ipv4Addr>,
     pub gateway: Option<Ipv4Addr>,
-    /// Whether it goes through `lo`; the kinds that reject have no device.
-    pub device: bool,
+    /// The index of the device it goes through (`fib_nh_oif`); 0 for the
+    /// kinds that reject, which have none.
+    pub oif: u32,
     /// `RTNH_F_ONLINK`.
     pub onlink: bool,
+    /// `RTNH_F_LINKDOWN`: its device, up, has no carrier, as
+    /// `fib_check_nh_nongw` finds it and `fib_sync_down_dev` and
+    /// `fib_sync_up` change it for `NETDEV_CHANGE`; a route of host scope
+    /// (`RT_SCOPE_NOWHERE`'s next hop) is never so.
+    pub linkdown: bool,
     /// Whether its gateway is reached by a route of link scope, so that a
     /// lookup's answer names it (`rt_uses_gateway`).
     pub uses_gateway: bool,
@@ -443,26 +476,34 @@ pub(crate) struct Route4 {
     pub metrics: Metrics,
 }
 impl Route4 {
-    /// One of the kernel's routes for an address, in the local table, with
-    /// the preferred source `source`.
-    fn kernel(dst: Ipv4Addr, len: u8, kind: Kind, source: Ipv4Addr) -> Self {
+    /// One of the kernel's routes for an address through the device of
+    /// `oif`, with the preferred source `source`, as `fib_magic` makes it:
+    /// a unicast one in the main table, of link scope; the others in the
+    /// local table, a local one of host scope, a broadcast one of link
+    /// scope.
+    fn kernel(dst: Ipv4Addr, len: u8, kind: Kind, source: Ipv4Addr, oif: u32) -> Self {
         Self {
-            table: TABLE_LOCAL,
+            table: if kind == Kind::Unicast {
+                TABLE_MAIN
+            } else {
+                TABLE_LOCAL
+            },
             dst,
             len,
             tos: 0,
             priority: 0,
             kind,
             proto: PROTO_KERNEL,
-            scope: if kind == Kind::Broadcast {
-                SCOPE_LINK
-            } else {
+            scope: if kind == Kind::Local {
                 SCOPE_HOST
+            } else {
+                SCOPE_LINK
             },
             prefsrc: Some(source),
             gateway: None,
-            device: true,
+            oif,
             onlink: false,
+            linkdown: false,
             uses_gateway: false,
             metrics: NO_METRICS,
         }
@@ -841,6 +882,8 @@ pub(crate) struct Ask4 {
     pub prefsrc: Option<Ipv4Addr>,
     pub gateway: Option<Ipv4Addr>,
     pub oif: u32,
+    /// Whether the namespace has a device of `oif`.
+    pub device: bool,
     /// `rtm_flags`.
     pub flags: u32,
     /// The request's `NLM_F_*`.
@@ -915,6 +958,14 @@ pub(crate) struct Addresses {
     /// source is then checked by a lookup of it
     /// ([`Self::valid_source4`]).
     custom_local4: bool,
+    /// The devices, up, without their carrier (`netif_carrier_ok`), by the
+    /// index a route names them by: the routes through them are
+    /// `RTNH_F_LINKDOWN`.
+    no_carrier: Vec<u32>,
+    /// The latest time [`Self::expire`] was called at, in nanoseconds of
+    /// the monotonic clock: a netlink request's, which a device going
+    /// tells its addresses' lifetimes by.
+    seen: u64,
     /// The loopback's neighbours, the oldest first.
     neighbours: Vec<Neighbour>,
     /// The proxy entries of the namespace, the oldest first.
@@ -960,6 +1011,8 @@ impl Addresses {
             mctp: Vec::new(),
             mctp_routes: Vec::new(),
             custom_local4: false,
+            no_carrier: Vec::new(),
+            seen: 0,
             neighbours: Vec::new(),
             proxies: Vec::new(),
         }
@@ -1199,15 +1252,73 @@ impl Addresses {
         if let Ok(added) = added {
             events.extend(added);
         }
-        for address in self.v4.clone() {
-            for route in self.candidates(&address, true) {
-                self.kernel_add4(route, &mut events);
-            }
-        }
+        events.extend(self.device_up4(LOOPBACK_INDEX));
         if v6 {
             events.extend(self.up6(now));
         }
         events
+    }
+    /// IPv4's part of a device of `index` coming up (`fib_netdev_event`'s
+    /// `NETDEV_UP`): the routes each of its addresses has then that are not
+    /// there, in the addresses' order (`fib_add_ifaddr`).
+    pub(crate) fn device_up4(&mut self, index: i32) -> Vec<Event> {
+        let mut events = Vec::new();
+        let addresses: Vec<V4> = self
+            .v4
+            .iter()
+            .filter(|a| a.index == index)
+            .cloned()
+            .collect();
+        for address in addresses {
+            for route in self.candidates(&address, true) {
+                self.kernel_add4(route, &mut events);
+            }
+        }
+        events
+    }
+    /// The device of `index`, up, has its carrier or loses it
+    /// (`fib_netdev_event`'s `NETDEV_CHANGE`): the routes through it but
+    /// those of host scope stop or start being `RTNH_F_LINKDOWN`
+    /// (`fib_sync_up`, `fib_sync_down_dev`), without a word. A device
+    /// coming up takes its carrier so before [`Self::device_up4`].
+    pub(crate) fn set_carrier(&mut self, index: i32, carrier: bool) {
+        let oif = index.unsigned_abs();
+        self.no_carrier.retain(|&o| o != oif);
+        if !carrier {
+            self.no_carrier.push(oif);
+        }
+        for route in self
+            .routes4
+            .iter_mut()
+            .filter(|r| r.oif == oif && r.scope != SCOPE_HOST)
+        {
+            route.linkdown = !carrier;
+        }
+    }
+    /// IPv4's part of the device of `index` going (`NETDEV_UNREGISTER`),
+    /// once closed ([`Self::device_down4`]): `inetdev_destroy` removes each of its addresses, the
+    /// first first, as [`Self::remove_v4`] does, which tells of each and
+    /// of its local route; `fib_disable_ip` then takes what is left of
+    /// its routes without a word. The time it is told at.
+    pub(crate) fn device_gone4(&mut self, index: i32) -> (Vec<Event>, u64) {
+        // Closed: what is not of host scope has gone without a word.
+        self.device_down4(index);
+        let mut events = Vec::new();
+        while let Some(first) = self.v4.iter().position(|a| a.index == index) {
+            events.extend(self.remove_v4(first));
+        }
+        let oif = index.unsigned_abs();
+        self.routes4.retain(|r| r.oif != oif);
+        self.no_carrier.retain(|&o| o != oif);
+        (events, self.seen)
+    }
+    /// IPv4's part of a device of `index` going down (`fib_disable_ip`):
+    /// its routes but those of host scope go, without a word
+    /// (`fib_sync_down_dev`, `fib_flush`).
+    pub(crate) fn device_down4(&mut self, index: i32) {
+        let oif = index.unsigned_abs();
+        self.routes4
+            .retain(|r| !(r.oif == oif && r.scope != SCOPE_HOST));
     }
     /// IPv6's part of [`Self::up`], as `addrconf_notify` does it for
     /// `NETDEV_UP`: the prefix route of each permanent address
@@ -1239,8 +1350,7 @@ impl Addresses {
     /// a dump (`rt6_disable_ip`), then of the addresses
     /// (`addrconf_ifdown`).
     pub(crate) fn down(&mut self) -> Vec<Event> {
-        self.routes4
-            .retain(|r| !(r.device && r.scope != SCOPE_HOST));
+        self.device_down4(LOOPBACK_INDEX);
         // `fib_disable_ip` flushes IPv4's neighbours (`arp_ifdown`); then
         // `addrconf_ifdown` takes IPv6's routes, its neighbours
         // (`rt6_disable_ip`) and its addresses.
@@ -1259,14 +1369,16 @@ impl Addresses {
         events.extend(self.v6.drain(..).map(Event::DelAddr6));
         events
     }
-    /// Adds an IPv4 address with `lifetimes` at `now`, as
-    /// `inet_rtm_newaddr` and `__inet_insert_ifa` do: the same local
-    /// address and subnet again is `EEXIST`, unless `replace`; one in a
-    /// subnet an address of another scope has is `EINVAL`; one in a
-    /// subnet a primary address has is secondary, and goes last; a primary
-    /// goes after the primaries of a scope as wide or wider. What Linux
-    /// tells: the address, then the routes it brings (`fib_add_ifaddr`),
-    /// those while `up` too. One replaced takes the new one's protocol,
+    /// Adds an IPv4 address with `lifetimes` at `now` to its device, as
+    /// `inet_rtm_newaddr` and `__inet_insert_ifa` do among the device's
+    /// own: the same local address and subnet again is `EEXIST`, unless
+    /// `replace`; one in a subnet an address of another scope has is
+    /// `EINVAL`; one in a subnet a primary address has is secondary, and
+    /// goes last; a primary goes after the primaries of a scope as wide or
+    /// wider. The devices' addresses are kept in the order of their
+    /// indices, as a dump goes through them. What Linux tells: the
+    /// address, then the routes it brings (`fib_add_ifaddr`), those while
+    /// the device is `up` too. One replaced takes the new one's protocol,
     /// priority (its prefix route, while `up`, again with it, then the old
     /// one gone: `fib_modify_prefix_metric`) and lifetimes, and is told of.
     pub(crate) fn add_v4(
@@ -1280,8 +1392,10 @@ impl Addresses {
         new.flags &= !SECONDARY;
         new.set_life(lifetimes, now);
         new.life.created = now;
-        let mut last_primary = 0;
-        for (i, old) in self.v4.iter().enumerate() {
+        let start = self.v4.partition_point(|a| a.index < new.index);
+        let end = self.v4.partition_point(|a| a.index <= new.index);
+        let mut last_primary = start;
+        for (i, old) in self.v4.iter().enumerate().take(end).skip(start) {
             if !old.secondary() && new.scope <= old.scope {
                 last_primary = i + 1;
             }
@@ -1304,7 +1418,7 @@ impl Addresses {
         }
         let mut events = vec![Event::NewAddr4(new.clone())];
         if new.secondary() {
-            self.v4.push(new.clone());
+            self.v4.insert(end, new.clone());
         } else {
             self.v4.insert(last_primary, new.clone());
         }
@@ -1346,11 +1460,13 @@ impl Addresses {
         events.push(Event::NewAddr4(address.clone()));
         events
     }
-    /// Removes the first IPv4 address that has `local`, `label`, and
-    /// `address` in a subnet of `prefix`, each as given, as
-    /// `inet_rtm_deladdr`: `EADDRNOTAVAIL` for none ([`Self::remove_v4`]).
+    /// Removes the first IPv4 address of the device of `index` that has
+    /// `local`, `label`, and `address` in a subnet of `prefix`, each as
+    /// given, as `inet_rtm_deladdr`: `EADDRNOTAVAIL` for none
+    /// ([`Self::remove_v4`]).
     pub(crate) fn del_v4(
         &mut self,
+        index: i32,
         local: Option<Ipv4Addr>,
         address: Option<Ipv4Addr>,
         prefix: u8,
@@ -1360,7 +1476,8 @@ impl Addresses {
             .v4
             .iter()
             .position(|a| {
-                local.is_none_or(|local| a.local == local)
+                a.index == index
+                    && local.is_none_or(|local| a.local == local)
                     && label.is_none_or(|label| a.label == label)
                     && address.is_none_or(|address| a.prefix == prefix && a.covers(address))
             })
@@ -1382,9 +1499,7 @@ impl Addresses {
             gone.extend(
                 self.v4
                     .iter()
-                    .filter(|a| {
-                        a.secondary() && a.mask() == target.mask() && target.covers(a.address)
-                    })
+                    .filter(|a| a.secondary() && target.same_subnet(a))
                     .cloned(),
             );
         }
@@ -1397,9 +1512,10 @@ impl Addresses {
             let (local, rest) = candidates
                 .split_first()
                 .map_or((None, &[][..]), |(l, r)| (Some(*l), r));
+            // The prefix route is local on `lo`, unicast elsewhere.
             let mut order: Vec<Route4> = rest
                 .iter()
-                .filter(|r| r.kind == Kind::Local)
+                .filter(|r| r.kind != Kind::Broadcast)
                 .map(|r| Route4 { priority: 0, ..*r })
                 .collect();
             order.extend(rest.iter().filter(|r| r.kind == Kind::Broadcast));
@@ -1407,9 +1523,11 @@ impl Addresses {
             if let Some(i) = self.v4.iter().position(|a| *a == address) {
                 self.v4.remove(i);
             }
+            // `fib_del_ifaddr` looks at the device's other addresses.
             let wanted: Vec<Route4> = self
                 .v4
                 .iter()
+                .filter(|a| a.index == address.index)
                 .flat_map(|a| self.candidates(a, true))
                 .collect();
             events.push(Event::DelAddr4(address.clone()));
@@ -1431,11 +1549,14 @@ impl Addresses {
                     self.kernel_del4(&route, &mut events);
                 }
             }
-            // The last address gone, `fib_disable_ip` takes every route
-            // through the loopback, and its neighbours (`arp_ifdown`).
-            if self.v4.is_empty() {
-                self.routes4.retain(|r| !r.device);
-                self.flush(false, &mut events);
+            // The device's last address gone, `fib_disable_ip` takes every
+            // route through it, and its neighbours (`arp_ifdown`): only
+            // the loopback has any.
+            if !self.v4.iter().any(|a| a.index == address.index) {
+                self.routes4.retain(|r| r.oif != address.oif());
+                if address.index == LOOPBACK_INDEX {
+                    self.flush(false, &mut events);
+                }
             }
         }
         events
@@ -1613,6 +1734,7 @@ impl Addresses {
     /// whose reachable time has passed delays or goes stale, and the stale
     /// ones are told of ([`Neighbour::age`]).
     pub(crate) fn expire(&mut self, now: u64) -> Vec<Event> {
+        self.seen = self.seen.max(now);
         let mut events = Vec::new();
         let mut i = 0;
         while i < self.v4.len() {
@@ -1672,15 +1794,16 @@ impl Addresses {
         }
         self.v4
             .iter()
-            .find(|a| !a.secondary() && a.mask() == address.mask() && a.covers(address.address))
+            .find(|a| !a.secondary() && a.same_subnet(address))
             .map_or(address.local, |a| a.local)
     }
     /// The routes `fib_add_ifaddr` gives `address`, in its order: the local
-    /// one; and while up, the broadcast one it names, its prefix route,
-    /// `local` on a loopback, and its subnet's broadcast route.
+    /// one; and while its device is `up`, the broadcast one it names, its
+    /// prefix route, `local` on a loopback, and its subnet's broadcast
+    /// route.
     fn candidates(&self, address: &V4, up: bool) -> Vec<Route4> {
         let source = self.primary_of(address);
-        let route = |dst, len, kind| Route4::kernel(dst, len, kind, source);
+        let route = |dst, len, kind| Route4::kernel(dst, len, kind, source, address.oif());
         let mut routes = vec![route(address.local, 32, Kind::Local)];
         if !up {
             return routes;
@@ -1701,7 +1824,7 @@ impl Addresses {
         if address.flags & NO_PREFIX_ROUTE == 0 {
             routes.push(Route4 {
                 priority: address.priority,
-                ..route(prefix, address.prefix, Kind::Local)
+                ..route(prefix, address.prefix, address.prefix_kind())
             });
         }
         if address.prefix < 31 {
@@ -1839,7 +1962,8 @@ impl Addresses {
     }
     /// One of the kernel's IPv4 routes (`fib_magic`), told of unless the
     /// same is there.
-    fn kernel_add4(&mut self, route: Route4, events: &mut Vec<Event>) {
+    fn kernel_add4(&mut self, mut route: Route4, events: &mut Vec<Event>) {
+        route.linkdown = route.scope != SCOPE_HOST && self.no_carrier.contains(&route.oif);
         self.create4(route.table);
         if let Ok(Some(flags)) = self.insert4(route, F_CREATE | F_APPEND) {
             events.push(Event::NewRoute4(route, flags));
@@ -1858,7 +1982,7 @@ impl Addresses {
                 && r.scope == route.scope
                 && r.prefsrc == route.prefsrc
                 && r.proto == route.proto
-                && r.device == route.device
+                && r.oif == route.oif
                 && (route.priority == 0 || r.priority == route.priority)
         };
         if let Some(i) = self.routes4.iter().position(same) {
@@ -1884,11 +2008,13 @@ impl Addresses {
     /// kind's, a kind without a device that names one or a gateway, an
     /// unknown kind, the scope `RT_SCOPE_NOWHERE`, a gateway of host
     /// scope, an on-link route without a gateway, an invalid gateway or a
-    /// preferred source that is not the loopback's; `ENODEV` for a device
-    /// not `lo`; `ENETDOWN` while it is down, but for a route of host
-    /// scope. Anycast, multicast and NAT routes are `EOPNOTSUPP`. The
-    /// metrics' error comes after the scope's, as `fib_create_info` makes
-    /// them.
+    /// preferred source that is not local; `ENODEV` for none but a
+    /// gateway's; `ENETDOWN` while the device it names (`up`), or else
+    /// `lo`, is down, but for a route of host scope. A route through a
+    /// veth end without its carrier is `RTNH_F_LINKDOWN`. Anycast,
+    /// multicast and NAT routes are `EOPNOTSUPP`, as is a gateway through a
+    /// veth end, which is not taken yet. The metrics' error comes after
+    /// the scope's, as `fib_create_info` makes them.
     pub(crate) fn add_route4(&mut self, ask: &Ask4, up: bool) -> Result<Vec<Event>, Errno> {
         let added = self.insert_route4(ask, up);
         if added.is_ok() && ask.kind == Kind::Local.code() {
@@ -1941,8 +2067,9 @@ impl Addresses {
             scope: ask.scope,
             prefsrc: ask.prefsrc,
             gateway: ask.gateway,
-            device: true,
+            oif: ask.oif,
             onlink,
+            linkdown: false,
             uses_gateway: false,
             metrics,
         };
@@ -1953,7 +2080,7 @@ impl Addresses {
                     "Gateway, device and multipath can not be specified for this route type",
                 ));
             }
-            route.device = false;
+            route.oif = 0;
         } else if ask.scope > SCOPE_HOST {
             return Err(extack::message(Errno::EINVAL, "Invalid scope"));
         } else if ask.scope == SCOPE_HOST {
@@ -1963,20 +2090,29 @@ impl Addresses {
                     "Route with host scope can not have a gateway",
                 ));
             }
-            if ask.oif != LOOPBACK_OIF {
+            if !ask.device {
                 return Err(Errno::ENODEV);
             }
         } else if let Some(gateway) = ask.gateway {
+            // A route the guest adds through a gateway goes through `lo`
+            // alone: one through a veth end is not taken yet.
+            if ask.device && ask.oif != LOOPBACK_OIF {
+                return Err(EOPNOTSUPP);
+            }
             route.uses_gateway = self.gateway4(gateway, ask, table, up)?;
+            route.oif = LOOPBACK_OIF;
         } else if onlink {
             return Err(extack::message(
                 Errno::EINVAL,
                 "Invalid flags for nexthop - PERVASIVE and ONLINK can not be set",
             ));
-        } else if ask.oif != LOOPBACK_OIF {
+        } else if !ask.device {
             return Err(Errno::ENODEV);
         } else if !up {
             return Err(extack::message(ENETDOWN, "Device for nexthop is not up"));
+        } else {
+            // `fib_check_nh_nongw`.
+            route.linkdown = self.no_carrier.contains(&route.oif);
         }
         if let Some(source) = ask.prefsrc
             && !self.valid_prefsrc4(source, &route)
@@ -2026,6 +2162,11 @@ impl Addresses {
         let via = found.map_err(invalid)?;
         if !matches!(via.kind, Kind::Unicast | Kind::Local) {
             return Err(invalid(Errno::EINVAL));
+        }
+        // A route the guest adds goes through `lo` alone: a gateway
+        // reached through a veth end is not taken yet.
+        if via.oif != LOOPBACK_OIF {
+            return Err(EOPNOTSUPP);
         }
         if !up {
             return Err(ENETDOWN);
@@ -2077,7 +2218,7 @@ impl Addresses {
                     && (select.scope == SCOPE_NOWHERE || r.scope == select.scope)
                     && select.prefsrc.is_none_or(|s| r.prefsrc == Some(s))
                     && (select.proto == 0 || r.proto == select.proto)
-                    && (select.oif == 0 || (r.device && select.oif == LOOPBACK_OIF))
+                    && (select.oif == 0 || r.oif == select.oif)
                     && select.gateway.is_none_or(|g| r.gateway == Some(g))
                     && select
                         .metrics
@@ -2231,7 +2372,7 @@ impl Addresses {
                 if let Some(e) = r.kind.error() {
                     return Err(e);
                 }
-                if oif != 0 && !(r.device && oif == LOOPBACK_OIF) {
+                if oif != 0 && r.oif != oif {
                     continue;
                 }
                 return Ok(*r);
@@ -2279,13 +2420,15 @@ impl Addresses {
     /// goes out where it came in asks to redirect.
     /// - With `rpf` 0 and a route that is not out through `lo`, as
     ///   [`Self::valid_source4`].
-    /// - Else as `__fib_validate_source`, looking `src` up: every route is
-    ///   `lo`'s, so the device always matches, and strict (1) and loose
-    ///   (2) filtering ask the same. None found is dropped with `rpf`, and
-    ///   taken without; a local one is dropped (`accept_local` is 0), as
-    ///   is one of another kind than unicast; a unicast one is taken,
-    ///   `true` but for one through a gateway, whose next hop is of link
-    ///   scope.
+    /// - Else as `__fib_validate_source`, looking `src` up. None found is
+    ///   dropped with `rpf`, and taken without; a local one is dropped
+    ///   (`accept_local` is 0), as is one of another kind than unicast. A
+    ///   unicast one through `lo` is taken, `true` but for one through a
+    ///   gateway, whose next hop is of link scope. One through another
+    ///   device is taken without `rpf`, or loosely (2), when `lo` has no
+    ///   address, else dropped strictly (1); loosely, a lookup through `lo`
+    ///   decides, as the first one did, and gives `false` where it finds
+    ///   no unicast route.
     pub(crate) fn validate_source4(
         &self,
         src: Ipv4Addr,
@@ -2293,18 +2436,23 @@ impl Addresses {
         oif: u32,
         rpf: i32,
     ) -> Result<bool, ()> {
-        if rpf == 0 && oif != crate::netdev::LOOPBACK_OIF {
+        if rpf == 0 && oif != LOOPBACK_OIF {
             return if self.valid_source4(src) {
                 Ok(false)
             } else {
                 Err(())
             };
         }
+        let last_resort = if rpf != 0 { Err(()) } else { Ok(false) };
         match self.lookup4_flow(src, tos, 0) {
-            Err(_) if rpf != 0 => Err(()),
-            Err(_) => Ok(false),
-            Ok(route) if route.kind == Kind::Unicast => Ok(route.gateway.is_none()),
-            Ok(_) => Err(()),
+            Err(_) => last_resort,
+            Ok(route) if route.kind != Kind::Unicast => Err(()),
+            Ok(route) if route.oif == LOOPBACK_OIF => Ok(route.gateway.is_none()),
+            Ok(_) if !self.v4.iter().any(|a| a.index == LOOPBACK_INDEX) => last_resort,
+            Ok(_) if rpf == 1 => Err(()),
+            Ok(_) => Ok(self
+                .lookup4_flow(src, tos, LOOPBACK_OIF)
+                .is_ok_and(|r| r.kind == Kind::Unicast && r.gateway.is_none())),
         }
     }
     /// Whether `ip` is the loopback's (`__ip_dev_find`): one of its
@@ -2326,28 +2474,40 @@ impl Addresses {
         self.table_lookup4(tables, ip, SCOPE_UNIVERSE, 0, 0)
             .map_or(Kind::Unicast, |r| r.kind)
     }
-    /// The address a route through `lo` to `ip` leaves from
-    /// (`fib_select_path`): a local route's preferred source or `ip`;
-    /// another's preferred source, else the first primary address of a
-    /// scope as narrow as the route's, one whose subnet has its gateway
-    /// before the others (`inet_select_addr`); `None` for none.
-    pub(crate) fn source4(&self, route: &Route4, ip: Ipv4Addr) -> Option<Ipv4Addr> {
+    /// The address a route to `ip` leaves from (`fib_select_path`): a
+    /// local route's preferred source or `ip`; another's preferred source,
+    /// else [`Self::select4`] on its device for its gateway and scope, the
+    /// devices in the order they were made, `order`.
+    pub(crate) fn source4(&self, route: &Route4, ip: Ipv4Addr, order: &[i32]) -> Option<Ipv4Addr> {
         if route.kind == Kind::Local {
             return Some(route.prefsrc.unwrap_or(ip));
         }
         if route.prefsrc.is_some() {
             return route.prefsrc;
         }
-        self.select4(route.gateway, route.scope)
+        let index = i32::try_from(route.oif).unwrap_or(LOOPBACK_INDEX);
+        self.select4(index, route.gateway, route.scope, order)
     }
-    /// The address `inet_select_addr` picks on `lo` for `dst` (any for
-    /// `None`) of `scope`: the first primary address of a scope as narrow
-    /// (host at most, as `lo` does not route its local net), one in
-    /// `dst`'s subnet before the others; else the first primary one not of
-    /// link scope; `None` for none.
-    pub(crate) fn select4(&self, dst: Option<Ipv4Addr>, scope: u8) -> Option<Ipv4Addr> {
+    /// The address `inet_select_addr` picks on the device of `index` for
+    /// `dst` (any for `None`) of `scope`: the first of its primary
+    /// addresses of a scope as narrow (host at most, as no device routes
+    /// its local net), one in `dst`'s subnet before the others; else the
+    /// first primary one not of link scope of the devices in `order`, the
+    /// order they were made in (`dev_base_head`'s, `lo` first); `None` for
+    /// none.
+    pub(crate) fn select4(
+        &self,
+        index: i32,
+        dst: Option<Ipv4Addr>,
+        scope: u8,
+        order: &[i32],
+    ) -> Option<Ipv4Addr> {
         let mut first = None;
-        for a in self.v4.iter().filter(|a| !a.secondary()) {
+        for a in self
+            .v4
+            .iter()
+            .filter(|a| a.index == index && !a.secondary())
+        {
             if a.scope.min(SCOPE_HOST) > scope {
                 continue;
             }
@@ -2357,10 +2517,17 @@ impl Addresses {
             first.get_or_insert(a.local);
         }
         first.or_else(|| {
-            self.v4
-                .iter()
-                .find(|a| !a.secondary() && a.scope != SCOPE_LINK && a.scope <= scope)
-                .map(|a| a.local)
+            order.iter().find_map(|&device| {
+                self.v4
+                    .iter()
+                    .find(|a| {
+                        a.index == device
+                            && !a.secondary()
+                            && a.scope != SCOPE_LINK
+                            && a.scope <= scope
+                    })
+                    .map(|a| a.local)
+            })
         })
     }
     /// A lookup in one IPv6 table: the route of the longest prefix that has
@@ -2446,12 +2613,12 @@ impl Addresses {
     /// The address a connection to `to` on the loopback leaves from: its
     /// route's ([`Self::source4`], [`Self::source6`]), `127.0.0.1` or `::1`
     /// where there is none.
-    pub(crate) fn source(&self, to: IpAddr) -> IpAddr {
+    pub(crate) fn source(&self, to: IpAddr, order: &[i32]) -> IpAddr {
         match to {
             IpAddr::V4(ip) => IpAddr::V4(
                 self.lookup4(ip)
                     .ok()
-                    .and_then(|r| self.source4(&r, ip))
+                    .and_then(|r| self.source4(&r, ip, order))
                     .unwrap_or(Ipv4Addr::LOCALHOST),
             ),
             IpAddr::V6(ip) => IpAddr::V6(
@@ -2539,6 +2706,7 @@ mod tests {
             prefsrc: None,
             gateway: None,
             oif: u32::from(kind == 1),
+            device: kind == 1,
             flags: 0,
             request,
             metrics: Ok(NO_METRICS),
@@ -2619,7 +2787,7 @@ mod tests {
         )
         .unwrap();
         let gone = a
-            .del_v4(Some("10.5.5.5".parse().unwrap()), None, 24, None)
+            .del_v4(1, Some("10.5.5.5".parse().unwrap()), None, 24, None)
             .unwrap();
         assert_eq!(
             told(&gone),
@@ -2735,7 +2903,7 @@ mod tests {
         assert!(a.local4("10.1.2.77".parse().unwrap()));
         assert!(!a.bindable4("10.2.0.1".parse().unwrap()));
         assert_eq!(
-            a.source("10.1.2.77".parse().unwrap()),
+            a.source("10.1.2.77".parse().unwrap(), &[1]),
             "10.1.2.3".parse::<IpAddr>().unwrap()
         );
         // IPv6: global first, newest first; the prefix route in the main
@@ -2776,6 +2944,7 @@ mod tests {
         // A primary takes its secondary; 127.0.0.1 comes back with the next
         // up.
         a.del_v4(
+            1,
             Some("10.1.2.3".parse().unwrap()),
             Some("10.1.2.3".parse().unwrap()),
             24,
@@ -2784,10 +2953,11 @@ mod tests {
         .unwrap();
         assert_eq!(a.v4.len(), 2);
         assert_eq!(
-            a.del_v4(None, Some("10.1.2.3".parse().unwrap()), 24, None),
+            a.del_v4(1, None, Some("10.1.2.3".parse().unwrap()), 24, None),
             Err(EADDRNOTAVAIL)
         );
-        a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();
+        a.del_v4(1, Some(Ipv4Addr::LOCALHOST), None, 8, None)
+            .unwrap();
         assert!(!a.bindable4(Ipv4Addr::LOCALHOST));
         a.up(0, true);
         assert!(a.bindable4(Ipv4Addr::LOCALHOST));
@@ -2876,10 +3046,11 @@ mod tests {
         local.table = TABLE_LOCAL;
         local.scope = SCOPE_HOST;
         local.oif = 1;
+        local.device = true;
         a.add_route4(&local, true).unwrap();
         assert!(a.bindable4("10.7.1.1".parse().unwrap()));
         assert_eq!(
-            a.source("10.7.1.1".parse().unwrap()),
+            a.source("10.7.1.1".parse().unwrap(), &[1]),
             "10.7.1.1".parse::<IpAddr>().unwrap()
         );
         // Down: the routes of link scope go, the default table's too; host
@@ -3139,6 +3310,167 @@ mod tests {
     }
 
     #[test]
+    fn a_veth_ends_addresses_bring_unicast_routes_that_follow_its_state() {
+        let mut a = Addresses::isolated();
+        let on = |index: i32, s: &str, prefix: u8| V4 {
+            index,
+            label: b"va".to_vec(),
+            ..v4(s, prefix)
+        };
+        let mut first = on(1000, "10.77.0.1", 24);
+        first.broadcast = Some("10.77.0.255".parse().unwrap());
+        // Down, an address has its local route alone, through its device.
+        assert_eq!(
+            told(
+                &a.add_v4(first, Lifetimes::FOREVER, false, false, 0)
+                    .unwrap()
+            ),
+            ["+addr 10.77.0.1/24", "+route 255 10.77.0.1/32 Local 0x600"]
+        );
+        // The same subnet on another device is no secondary there.
+        a.add_v4(
+            on(1002, "10.77.0.5", 24),
+            Lifetimes::FOREVER,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        let second = on(1000, "10.77.0.9", 24);
+        a.add_v4(second, Lifetimes::FOREVER, false, false, 0)
+            .unwrap();
+        let shown: Vec<_> =
+            a.v4.iter()
+                .map(|x| (x.index, x.local.to_string(), x.secondary()))
+                .collect();
+        assert_eq!(
+            shown,
+            [
+                (1000, "10.77.0.1".into(), false),
+                (1000, "10.77.0.9".into(), true),
+                (1002, "10.77.0.5".into(), false)
+            ]
+        );
+        // Up without a carrier: a unicast prefix route in the main table,
+        // of link scope, and broadcast ones, all but the local ones
+        // `RTNH_F_LINKDOWN`; the broadcast address it names once.
+        a.set_carrier(1000, false);
+        assert_eq!(
+            told(&a.device_up4(1000)),
+            [
+                "+route 255 10.77.0.255/32 Broadcast 0x600",
+                "+route 254 10.77.0.0/24 Unicast 0x600"
+            ]
+        );
+        let through: Vec<_> = a
+            .dump4()
+            .into_iter()
+            .filter(|r| r.oif == 1000)
+            .map(|r| {
+                (
+                    short4(&r),
+                    r.scope,
+                    r.linkdown,
+                    r.prefsrc.unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            through,
+            [
+                (
+                    "254 10.77.0.0/24 Unicast".into(),
+                    SCOPE_LINK,
+                    true,
+                    "10.77.0.1".into()
+                ),
+                (
+                    "255 10.77.0.1/32 Local".into(),
+                    SCOPE_HOST,
+                    false,
+                    "10.77.0.1".into()
+                ),
+                (
+                    "255 10.77.0.9/32 Local".into(),
+                    SCOPE_HOST,
+                    false,
+                    "10.77.0.1".into()
+                ),
+                (
+                    "255 10.77.0.255/32 Broadcast".into(),
+                    SCOPE_LINK,
+                    true,
+                    "10.77.0.1".into()
+                )
+            ]
+        );
+        // Its carrier comes: they are no longer.
+        a.set_carrier(1000, true);
+        assert!(a.dump4().iter().all(|r| !r.linkdown));
+        // A lookup goes out through it, from its first address; through
+        // another device, its own, else the first of the devices in order.
+        let route = a.lookup4("10.77.0.2".parse().unwrap()).unwrap();
+        assert_eq!((route.oif, route.kind), (1000, Kind::Unicast));
+        let order = [1, 1002, 1000];
+        assert_eq!(
+            a.source4(&route, "10.77.0.2".parse().unwrap(), &order),
+            Some("10.77.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            a.select4(1002, None, SCOPE_UNIVERSE, &order),
+            Some("10.77.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            a.select4(1, None, SCOPE_UNIVERSE, &order),
+            Some("10.77.0.5".parse().unwrap())
+        );
+        // Removing the primary takes its secondary first; another device's
+        // address in the subnet stays.
+        assert_eq!(
+            told(
+                &a.del_v4(1000, Some("10.77.0.1".parse().unwrap()), None, 24, None)
+                    .unwrap()
+            ),
+            [
+                "-addr 10.77.0.9/24",
+                "-route 255 10.77.0.9/32 Local",
+                "-addr 10.77.0.1/24",
+                "-route 254 10.77.0.0/24 Unicast",
+                "-route 255 10.77.0.255/32 Broadcast",
+                "-route 255 10.77.0.1/32 Local"
+            ]
+        );
+        assert_eq!(
+            a.del_v4(1000, Some("10.77.0.5".parse().unwrap()), None, 24, None),
+            Err(EADDRNOTAVAIL)
+        );
+        // Down, a device keeps its local routes alone, without a word; gone,
+        // it tells of its addresses and their local routes.
+        a.add_v4(
+            on(1000, "10.77.0.1", 24),
+            Lifetimes::FOREVER,
+            false,
+            true,
+            0,
+        )
+        .unwrap();
+        a.device_down4(1000);
+        let kept: Vec<_> = a
+            .dump4()
+            .iter()
+            .filter(|r| r.oif == 1000)
+            .map(short4)
+            .collect();
+        assert_eq!(kept, ["255 10.77.0.1/32 Local"]);
+        let (gone, _) = a.device_gone4(1000);
+        assert_eq!(
+            told(&gone),
+            ["-addr 10.77.0.1/24", "-route 255 10.77.0.1/32 Local"]
+        );
+        assert!(a.dump4().iter().all(|r| r.oif != 1000));
+        assert_eq!(a.v4.len(), 1);
+    }
+    #[test]
     fn a_reachable_neighbour_goes_stale_or_delays_as_its_timer_runs() {
         let mut a = Addresses::first();
         let ask = |ip: &str, state, flags| NeighbourAsk {
@@ -3235,7 +3567,9 @@ mod tests {
         let _ = a.up(10, true);
         a.output(IpAddr::V4(Ipv4Addr::LOCALHOST), 11);
         a.output(IpAddr::V6("ff02::1".parse().unwrap()), 12);
-        let last = a.del_v4(Some(Ipv4Addr::LOCALHOST), None, 8, None).unwrap();
+        let last = a
+            .del_v4(1, Some(Ipv4Addr::LOCALHOST), None, 8, None)
+            .unwrap();
         assert_eq!(gone(&last), vec![(zero, RTN_BROADCAST, 11)]);
         assert!(matches!(last.last(), Some(Event::DelNeighbour(_))));
         // A multicast one is of its own type, and stays.

@@ -209,6 +209,7 @@ const RT_TABLE_DEFAULT: u32 = 253;
 const RT6_TABLE_DFLT: u32 = 254;
 /// `RTNH_F_ONLINK`.
 const RTNH_F_ONLINK: u32 = 4;
+const RTNH_F_LINKDOWN: u32 = 16;
 /// A table past 255, as an `rtmsg` names it.
 const RT_TABLE_COMPAT: u8 = 252;
 /// The last route kind (`RTN_MAX`).
@@ -2567,6 +2568,7 @@ fn address_dump(
 ) -> Result<Vec<Vec<u8>>, Errno> {
     let mut flags = 0;
     let mut shown = None;
+    let mut only = 0;
     if strict {
         // `rtnl_dump_all` asks IPv4's first, whose error ends the dump.
         let (policy, messages) = if family == AF_INET6 {
@@ -2610,16 +2612,19 @@ fn address_dump(
             let peer = target(id).map_err(|e| extack::message(e, messages[2]))?;
             shown = Some((id, peer));
         }
-        if index > 1 {
+        let of = shown.as_ref().map_or(network, |(_, peer)| &**peer);
+        if index != 0 && !of.has_device(index) {
             return Err(ENODEV);
         }
+        only = index;
     }
     let mut messages = Vec::new();
     let of = shown.as_ref().map_or(network, |(_, peer)| &**peer);
     if family != AF_INET6 {
-        messages.extend(ipv4_message(of, seq, port, now));
+        messages.extend(ipv4_messages(of, only, seq, port, now));
     }
-    if family != AF_INET {
+    // Only `lo` has IPv6 addresses here.
+    if family != AF_INET && only <= LOOPBACK_OIF {
         messages.extend(ipv6_message(of, seq, port, now));
     }
     if let Some((id, _)) = shown {
@@ -2983,8 +2988,9 @@ struct RouteFilter {
     protocol: u8,
     kind: u8,
     table: u32,
-    /// Only the routes through `lo` (`RTA_OIF`).
-    device: bool,
+    /// Only the routes through the device of this index (`RTA_OIF`), or
+    /// any for 0.
+    oif: u32,
     /// Whether the messages carry `NLM_F_DUMP_FILTERED`, as every message
     /// of a strict dump does, whose routes or exceptions are left out.
     marked: bool,
@@ -2995,9 +3001,15 @@ struct RouteFilter {
 /// length, a TOS or a scope, for flags but `RTM_F_CLONED` and
 /// `RTM_F_PREFIX`, then `rtm_ipv4_policy`'s errors (for IPv6's too), and
 /// for attributes but `RTA_TABLE` and `RTA_OIF`,
-/// whose device is `ENODEV` but `lo`'s; the table, protocol and type, and
-/// those, narrow it, as `NLM_F_DUMP_FILTERED` in `NLMSG_DONE` too.
-fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteFilter, Errno> {
+/// whose device is `ENODEV` where `network` has none of its index; the
+/// table, protocol and type, and those, narrow it, as
+/// `NLM_F_DUMP_FILTERED` in `NLMSG_DONE` too.
+fn route_filter(
+    network: &Network,
+    payload: &[u8],
+    strict: bool,
+    answer: &mut u16,
+) -> Result<RouteFilter, Errno> {
     let flags = payload.get(8..12).map_or(0, |raw| {
         u32::from_le_bytes(raw.try_into().unwrap_or_default())
     });
@@ -3031,7 +3043,7 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
         protocol: payload[5],
         kind: payload[7],
         table: u32::from(payload[4]),
-        device: false,
+        oif: 0,
         marked: true,
     };
     // `rtm_ipv4_policy`, for IPv6's too.
@@ -3039,8 +3051,13 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
     for (&kind, &value) in &attributes {
         match kind {
             RTA_TABLE => filter.table = u32_value(value)?,
-            RTA_OIF if u32_value(value)? == LOOPBACK_OIF => filter.device = true,
-            RTA_OIF => return Err(ENODEV),
+            RTA_OIF => {
+                let oif = u32_value(value)?;
+                if !network.has_device(oif) {
+                    return Err(ENODEV);
+                }
+                filter.oif = oif;
+            }
             _ => {
                 return Err(extack::message(
                     Errno::EINVAL,
@@ -3049,7 +3066,11 @@ fn route_filter(payload: &[u8], strict: bool, answer: &mut u16) -> Result<RouteF
             }
         }
     }
-    if flags != 0 || filter.protocol != 0 || filter.kind != 0 || filter.table != 0 || filter.device
+    if flags != 0
+        || filter.protocol != 0
+        || filter.kind != 0
+        || filter.table != 0
+        || filter.oif != 0
     {
         *answer = NLM_F_DUMP_FILTERED;
     }
@@ -3076,20 +3097,20 @@ fn route_dump(
     answer: &mut u16,
     now: u64,
 ) -> Result<Vec<Vec<u8>>, Errno> {
-    let filter = route_filter(payload, strict, answer)?;
+    let filter = route_filter(network, payload, strict, answer)?;
     let flags = NLM_F_MULTI
         | if filter.marked {
             NLM_F_DUMP_FILTERED
         } else {
             0
         };
-    let taken = |table: u32, kind: u8, proto: u8, device: bool| {
+    let taken = |table: u32, kind: u8, proto: u8, oif: u32| {
         !filter.cloned
             && !filter.prefix
             && (filter.table == 0 || filter.table == table)
             && (filter.kind == 0 || filter.kind == kind)
             && (filter.protocol == 0 || filter.protocol == proto)
-            && (!filter.device || device)
+            && (filter.oif == 0 || filter.oif == oif)
     };
     if matches!(family, RTNL_FAMILY_IPMR | RTNL_FAMILY_IP6MR) {
         let only = if family == RTNL_FAMILY_IPMR {
@@ -3125,7 +3146,7 @@ fn route_dump(
                 addresses
                     .dump4()
                     .iter()
-                    .filter(|r| taken(r.table, r.kind.code(), r.proto, r.device))
+                    .filter(|r| taken(r.table, r.kind.code(), r.proto, r.oif))
                     .map(|r| ipv4_route_of(RTM_NEWROUTE, r, r.table, seq, port, flags)),
             );
         }
@@ -3143,7 +3164,7 @@ fn route_dump(
                 addresses
                     .dump6()
                     .iter()
-                    .filter(|r| taken(r.table, r.kind.code(), r.proto, true))
+                    .filter(|r| taken(r.table, r.kind.code(), r.proto, LOOPBACK_OIF))
                     .map(|r| ipv6_route_of(RTM_NEWROUTE, r, seq, port, flags, now)),
             );
         }
@@ -3302,6 +3323,17 @@ fn acknowledgement(
 }
 /// The flags of `lo`, as `dev_get_flags`: `IFF_LOOPBACK`, with `IFF_UP`,
 /// `IFF_RUNNING` and `IFF_LOWER_UP` while it is up.
+/// The name of `network`'s device of `index`, and whether it is up
+/// (`IFF_UP`); `None` for none.
+fn device_state(network: &Network, index: u32) -> Option<(Vec<u8>, bool)> {
+    let index = i32::try_from(index).ok()?;
+    let (name, up) = {
+        let devices = network.devices();
+        let device = devices.by_index(index)?;
+        (device.name.clone(), device.veth.as_ref().map(|v| v.up))
+    };
+    Some((name, up.unwrap_or_else(|| network.is_up())))
+}
 fn link_flags(network: &Network) -> u32 {
     if network.is_up() {
         IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP
@@ -3542,12 +3574,14 @@ fn cacheinfo(life: &crate::interface::Life, (preferred, valid): (u32, u32)) -> [
     raw[12..].copy_from_slice(&hundredths(life.changed).to_le_bytes());
     raw
 }
-/// `RTM_NEWADDR` for each IPv4 address of `lo`, in its order, as
-/// `inet_fill_ifaddr` gives them.
-fn ipv4_message(network: &Network, seq: u32, port: u32, now: u64) -> Vec<Vec<u8>> {
+/// `RTM_NEWADDR` for each IPv4 address of the device of `index`, or of
+/// every device for 0, in the order of their indices, as
+/// `inet_dump_ifaddr` gives them.
+fn ipv4_messages(network: &Network, index: u32, seq: u32, port: u32, now: u64) -> Vec<Vec<u8>> {
     let addresses = network.addresses().v4.clone();
     addresses
         .iter()
+        .filter(|address| index == 0 || address.index.unsigned_abs() == index)
         .map(|address| ipv4_address(address, RTM_NEWADDR, NLM_F_MULTI, seq, port, now))
         .collect()
 }
@@ -3562,7 +3596,7 @@ fn ipv4_address(
 ) -> Vec<u8> {
     {
         let mut body = vec![AF_INET, address.prefix, address.flags as u8, address.scope];
-        body.extend_from_slice(&LOOPBACK_OIF.to_le_bytes());
+        body.extend_from_slice(&address.index.to_le_bytes());
         if !address.address.is_unspecified() {
             attribute(&mut body, IFA_ADDRESS, &address.address.octets());
         }
@@ -3750,27 +3784,24 @@ fn change_address(
         if add && local.is_some_and(|l| l.is_unspecified()) {
             return Ok(Vec::new());
         }
-        if !network.has_device(index) {
+        let Some((name, up)) = device_state(network, index) else {
             return Err(extack::message(ENODEV, "ipv4: Device not found"));
-        }
-        // Only `lo` has addresses, routes and neighbours here, not a veth end.
-        if index != LOOPBACK_OIF {
-            return Err(EOPNOTSUPP);
-        }
+        };
+        let index = index.cast_signed();
         if !add {
             return network
                 .addresses()
-                .del_v4(local, address, prefix, label.as_deref());
+                .del_v4(index, local, address, prefix, label.as_deref());
         }
         let local = local.unwrap_or(Ipv4Addr::UNSPECIFIED);
         let mut new = crate::interface::V4::new(local, address.unwrap_or(local), prefix, scope);
+        new.index = index;
         new.broadcast = broadcast.map(Ipv4Addr::from);
         new.flags = flags;
         new.proto = proto;
         new.priority = priority;
-        if let Some(label) = label {
-            new.label = label;
-        }
+        // `rtm_to_ifaddr`: the device's name unless one is given.
+        new.label = label.unwrap_or(name);
         return network.addresses().add_v4(new, lifetimes, replace, up, now);
     }
     let ip = local
@@ -3890,7 +3921,8 @@ fn ipv4_route_of(
         route.scope,
         route.kind.code(),
     ];
-    let nexthop: u32 = if route.onlink { RTNH_F_ONLINK } else { 0 };
+    let nexthop: u32 = if route.onlink { RTNH_F_ONLINK } else { 0 }
+        | if route.linkdown { RTNH_F_LINKDOWN } else { 0 };
     body.extend_from_slice(&nexthop.to_le_bytes());
     attribute(&mut body, RTA_TABLE, &table.to_le_bytes());
     if route.len != 0 {
@@ -3906,8 +3938,8 @@ fn ipv4_route_of(
     if let Some(gateway) = route.gateway {
         attribute(&mut body, RTA_GATEWAY, &gateway.octets());
     }
-    if route.device {
-        attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+    if route.oif != 0 {
+        attribute(&mut body, RTA_OIF, &route.oif.to_le_bytes());
     }
     message(kind, flags, seq, port, &body)
 }
@@ -3972,28 +4004,33 @@ fn route_expires(expires: Option<u64>, now: u64) -> i32 {
 /// `ERANGE`), and a longer one counts as its first bytes; `EOPNOTSUPP` for
 /// an `RTA_IP_PROTO` but TCP, UDP and the family's ICMP
 /// (`rtm_getroute_parse_ip_proto`); then `ENODEV` for an input route
-/// (`RTA_IIF`) of another device than `lo`, and one of `lo` is looked up
-/// as a packet coming in on it would be ([`input4`], [`input6`]).
+/// (`RTA_IIF`) of a device there is not, `EOPNOTSUPP` for one of a veth
+/// end, and one of `lo` is looked up as a packet coming in on it would be
+/// ([`input4`], [`input6`]).
 ///
 /// IPv4, as `ip_route_output_key_hash_rcu`: a source (`RTA_SRC`) is
 /// `EINVAL` when multicast or the limited broadcast address and
 /// `ENETUNREACH` when not the loopback's
-/// ([`crate::interface::Addresses::is_local4`]); an output device (`RTA_OIF`) is `ENODEV` but for `lo`, and
-/// `ENETUNREACH` while it is down. `0.0.0.0` goes to the loopback, from
-/// the source, or else from `127.0.0.1` (with a device, from the address
-/// `inet_select_addr` picks of host scope). The tables are looked in by the
+/// ([`crate::interface::Addresses::is_local4`]); an output device (`RTA_OIF`) is `ENODEV`
+/// for one there is not, and `ENETUNREACH` while it is down. `0.0.0.0`
+/// goes to the loopback, from the source, or else from `127.0.0.1` (with
+/// a device, from the address `inet_select_addr` picks of host scope). The tables are looked in by the
 /// request's TOS; where they give an error and a device is named, the
 /// route is on link through it instead, from an address of link scope. To
 /// a multicast or the limited broadcast address from a source and no
-/// device, or through `lo` to a local group (224.0.0.0/24) or the limited
-/// broadcast address (from an address of link scope where none is named),
+/// device, or through a device to a local group (224.0.0.0/24) or the
+/// limited broadcast address (from an address of link scope where none is
+/// named),
 /// the route is made with no table looked in: of TOS 0 and no table, and
 /// `EHOSTUNREACH` with `RTM_F_FIB_MATCH`. As `__mkroute_output` makes it,
 /// the answer for the limited broadcast address is of the broadcast type,
 /// with no gateway or metrics, and for a multicast one of the multicast
-/// type, local only for a group of `lo`'s, and without them through a
-/// route shorter than 224.0.0.0/4's prefix. The answer gives the TOS of
-/// the route that matched, the source as `RTA_SRC`
+/// type, local only for a group of the device's, and without them through
+/// a route shorter than 224.0.0.0/4's prefix. The answer names the device
+/// it goes out through (`RTA_OIF`): the device named or the route's, `lo`
+/// for a local one, and without `RTCF_LOCAL` for a unicast one through a
+/// veth end. It gives the TOS of the route
+/// that matched, the source as `RTA_SRC`
 /// where the request names one, and else the source the route leaves from
 /// as `RTA_PREFSRC`; the `RTA_MARK` it names, but 0 (`ERANGE` when shorter
 /// than 4 bytes); and the `RTA_UID` it names (`ERANGE` when shorter than 4
@@ -4163,6 +4200,10 @@ fn lookup(
     let ip = Ipv4Addr::from(address);
     let named = Ipv4Addr::from(asked_source);
     let mut source = named;
+    let order = network.devices().order();
+    // The device the route goes out through (`dev_out`): the one named, a
+    // table's route's, or `lo` for a local one.
+    let mut out = LOOPBACK_OIF;
     // Whether the route is made at once, with no table looked in: to a
     // multicast or the limited broadcast address from a source of the
     // loopback's and no device, or through a device to a local multicast
@@ -4178,16 +4219,13 @@ fn lookup(
         direct = oif == 0 && (ip.is_multicast() || ip.is_broadcast());
     }
     if oif != 0 {
-        if !network.has_device(oif) {
+        let Some((_, up)) = device_state(network, oif) else {
             return Err(ENODEV);
-        }
-        // Only `lo` has addresses, routes and neighbours here, not a veth end.
-        if oif != LOOPBACK_OIF {
-            return Err(EOPNOTSUPP);
-        }
-        if !network.is_up() {
+        };
+        if !up {
             return Err(ENETUNREACH);
         }
+        out = oif;
         direct = u32::from(ip) & 0xffff_ff00 == 0xe000_0000 || ip.is_broadcast();
         if source.is_unspecified() {
             let scope = if direct {
@@ -4199,7 +4237,10 @@ fn lookup(
             } else {
                 None
             };
-            if let Some(picked) = scope.and_then(|scope| addresses.select4(None, scope)) {
+            let index = oif.cast_signed();
+            if let Some(picked) =
+                scope.and_then(|scope| addresses.select4(index, None, scope, &order))
+            {
                 source = picked;
             }
         }
@@ -4221,6 +4262,7 @@ fn lookup(
         if source.is_unspecified() {
             source = Ipv4Addr::LOCALHOST;
         }
+        out = LOOPBACK_OIF;
         (kind, matched_tos, gateway, table, metrics) = (Kind::Local, 0, None, None, NO_METRICS);
     } else if direct {
         // No table gave it, so `RTM_F_FIB_MATCH` has no entry to give.
@@ -4249,10 +4291,15 @@ fn lookup(
                     return Ok(answer);
                 }
                 if source.is_unspecified()
-                    && let Some(picked) = addresses.source4(&route, ip)
+                    && let Some(picked) = addresses.source4(&route, ip, &order)
                 {
                     source = picked;
                 }
+                out = if route.kind == Kind::Local {
+                    LOOPBACK_OIF
+                } else {
+                    route.oif
+                };
                 // `__mkroute_output` drops the route's `fib_info`, and so
                 // its metrics and gateway, for the limited broadcast
                 // address, and for a multicast one when the route is
@@ -4270,7 +4317,8 @@ fn lookup(
                     return Err(EHOSTUNREACH);
                 }
                 if source.is_unspecified()
-                    && let Some(picked) = addresses.select4(None, SCOPE_LINK)
+                    && let Some(picked) =
+                        addresses.select4(oif.cast_signed(), None, SCOPE_LINK, &order)
                 {
                     source = picked;
                 }
@@ -4286,21 +4334,25 @@ fn lookup(
         TABLE_MAIN
     };
     // `rt_fill_info` of the route `__mkroute_output` made, which is local as
-    // it goes through `lo`. Its type is broadcast for the limited broadcast
-    // address, multicast for a multicast one, and else the table's; a
-    // multicast one is local only to a group `lo` is a member of
-    // (`ip_check_mc_rcu`).
+    // it goes through `lo`, and through a veth end only for a broadcast.
+    // Its type is broadcast for the limited broadcast address, multicast
+    // for a multicast one, and else the table's; a multicast one is local
+    // only to a group the device is a member of (`ip_check_mc_rcu`), as
+    // each is of 224.0.0.1 while up (`ip_mc_up`).
+    let out_up = device_state(network, out).is_some_and(|(_, up)| up);
     let (code, mut flags) = if ip.is_broadcast() {
         (
             Kind::Broadcast.code(),
             RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST,
         )
     } else if ip.is_multicast() {
-        let member = ip == ALL_HOSTS && network.is_up();
+        let member = ip == ALL_HOSTS && out_up;
         let local = if member { RTCF_LOCAL } else { 0 };
         (RTN_MULTICAST, RTM_F_CLONED | RTCF_MULTICAST | local)
     } else if kind == Kind::Broadcast {
         (kind.code(), RTM_F_CLONED | RTCF_LOCAL | RTCF_BROADCAST)
+    } else if out != LOOPBACK_OIF {
+        (kind.code(), RTM_F_CLONED)
     } else {
         (kind.code(), RTM_F_CLONED | RTCF_LOCAL)
     };
@@ -4323,7 +4375,7 @@ fn lookup(
     if !named.is_unspecified() {
         attribute(&mut body, RTA_SRC, &asked_source);
     }
-    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+    attribute(&mut body, RTA_OIF, &out.to_le_bytes());
     if source != named {
         attribute(&mut body, RTA_PREFSRC, &source.octets());
     }
@@ -4375,14 +4427,15 @@ struct Input {
 /// is one no route takes; with it on, one no route takes is `fib_lookup`'s
 /// error, one of a route of another kind than unicast `EINVAL`, and a
 /// unicast one is forwarded (`__mkroute_input`), checked by its source as
-/// it goes out through `lo` again: the answer is a unicast route of no
-/// local flag, with `RTCF_DOREDIRECT` where the source's route is one of
-/// host scope, the route's gateway as `RTA_GATEWAY` where it uses one, and
+/// it goes out through the route's device: the answer is a unicast route
+/// of no local flag, out through that device, with `RTCF_DOREDIRECT` where
+/// it is `lo` again and the source's route is one of host scope, the route's gateway as `RTA_GATEWAY` where it uses one, and
 /// its metrics. The answer, as
 /// `rt_fill_info` gives an input route: of the route's type (or broadcast
 /// or multicast), with `RTCF_LOCAL` and `RTCF_BROADCAST` or
 /// `RTCF_MULTICAST`, of the TOS of the route that matched, the source as
-/// `RTA_SRC` where there is one, `lo` as `RTA_OIF` and `RTA_IIF`, no
+/// `RTA_SRC` where there is one, `lo` as `RTA_IIF` and, but for one
+/// forwarded, as `RTA_OIF`, no
 /// metrics, and the mark and user ID it names. With `RTM_F_LOOKUP_TABLE`
 /// it names the table the route came from, 0 for none; with
 /// `RTM_F_FIB_MATCH` it is the route that matched, of the type made, and
@@ -4450,12 +4503,17 @@ fn input4(
             _ if !input.forwarding => return Err(EHOSTUNREACH),
             // `martian_destination`.
             kind if kind != Kind::Unicast => return Err(Errno::EINVAL),
-            // `__mkroute_input`, out through `lo`, where it came in.
+            // `__mkroute_input`, out through the route's device: a redirect
+            // is asked only out through `lo`, where it came in.
             _ => {
                 let redirect = addresses
-                    .validate_source4(src, input.tos, LOOPBACK_OIF, input.rp_filter)
+                    .validate_source4(src, input.tos, route.oif, input.rp_filter)
                     .map_err(|()| Errno::EINVAL)?;
-                let flags = if redirect { RTCF_DOREDIRECT } else { 0 };
+                let flags = if redirect && route.oif == LOOPBACK_OIF {
+                    RTCF_DOREDIRECT
+                } else {
+                    0
+                };
                 (route.kind.code(), flags, Some(route))
             }
         }
@@ -4502,7 +4560,12 @@ fn input4(
     if !src.is_unspecified() {
         attribute(&mut body, RTA_SRC, &asked_source);
     }
-    attribute(&mut body, RTA_OIF, &LOOPBACK_OIF.to_le_bytes());
+    // A forwarded one goes out through its route's device, the rest
+    // through `lo`.
+    let out = route
+        .filter(|r| r.kind == Kind::Unicast)
+        .map_or(LOOPBACK_OIF, |r| r.oif);
+    attribute(&mut body, RTA_OIF, &out.to_le_bytes());
     // A forwarded one has its route's next hop (`rt_set_nexthop`).
     if let Some(route) = route.filter(|r| r.kind == Kind::Unicast) {
         if let Some(gateway) = route.gateway.filter(|_| route.uses_gateway) {
@@ -4719,7 +4782,13 @@ fn change_route(
     if unsupported {
         return Err(EOPNOTSUPP);
     }
-    let up = network.is_up();
+    // Whether the device named is up, or else `lo`, which IPv6's routes
+    // and the gateways go through.
+    let up = if !v6 && oif != 0 {
+        device_state(network, oif).is_some_and(|(_, up)| up)
+    } else {
+        network.is_up()
+    };
     let mut addresses = network.addresses();
     // Linux converts the metrics later, where the error is told of
     // ([`extack::raise`]).
@@ -4766,6 +4835,7 @@ fn change_route(
                 prefsrc,
                 gateway,
                 oif,
+                device: oif != 0 && device_state(network, oif).is_some(),
                 flags,
                 request: header.flags,
                 metrics: converted,
@@ -5632,6 +5702,38 @@ fn link_change(network: &Network, up: bool, now: u64) -> Vec<Notice> {
 /// members of what went or came; coming on while `lo` is up, last, IPv6's
 /// own `RTM_NEWLINK` for `RTNLGRP_IPV6_IFINFO`, as `addrconf_notify` sends
 /// it at the end of `NETDEV_UP` (`inet6_ifinfo_notify`).
+/// What `network` tells of IPv4 as its device of `index` goes, closed
+/// (`inetdev_event`'s `NETDEV_UNREGISTER`): each of its addresses removed,
+/// with its routes ([`crate::interface::Addresses::device_gone4`]), before
+/// the device's `RTM_DELLINK`.
+pub(crate) fn addresses_gone(network: &Network, index: i32) -> Vec<Notice> {
+    let (events, now) = network.addresses().device_gone4(index);
+    told(events, 0, 0, false, false, now)
+}
+/// What `network` tells of IPv4 as its device of `index` comes up
+/// (`NETDEV_UP`) with or without its `carrier`: the routes of its
+/// addresses ([`crate::interface::Addresses::device_up4`]), whose
+/// messages carry no time.
+pub(crate) fn device_up4(network: &Network, index: i32, carrier: bool) -> Vec<Notice> {
+    let events = {
+        let mut addresses = network.addresses();
+        addresses.set_carrier(index, carrier);
+        addresses.device_up4(index)
+    };
+    told(events, 0, 0, false, false, 0)
+}
+/// `network`'s device of `index` goes down (`NETDEV_DOWN`), or, up, has
+/// its carrier or loses it (`NETDEV_CHANGE`): IPv4 tells nothing of it
+/// ([`crate::interface::Addresses::device_down4`],
+/// [`crate::interface::Addresses::set_carrier`]).
+pub(crate) fn device_changed4(network: &Network, index: i32, up: bool, carrier: bool) {
+    let mut addresses = network.addresses();
+    if up {
+        addresses.set_carrier(index, carrier);
+    } else {
+        addresses.device_down4(index);
+    }
+}
 pub(crate) fn set_ipv6(network: &Network, on: bool, now: u64) {
     let events = network.set_ipv6(on, now);
     let mut notices = told(events, 0, 0, false, false, now);
@@ -7120,7 +7222,7 @@ mod tests {
     fn messages_take_linux_layouts() {
         let network = Network::isolated(crate::users::first());
         // Down, a new namespace's loopback has no address.
-        assert!(ipv4_message(&network, 1, 7, 0).is_empty());
+        assert!(ipv4_messages(&network, 0, 1, 7, 0).is_empty());
         assert!(ipv6_message(&network, 1, 7, 0).is_empty());
         let link = link_message(&network, 1, 7, NLM_F_MULTI, 0);
         assert_eq!(link.len() % 4, 0);
@@ -7169,7 +7271,7 @@ mod tests {
         );
         // Up, it has both; down again, it keeps 127.0.0.1 alone.
         network.set_up(true, 0);
-        let v4 = ipv4_message(&network, 2, 7, 0).concat();
+        let v4 = ipv4_messages(&network, 0, 2, 7, 0).concat();
         assert_eq!(&v4[16..24], &[2, 8, 0x80, 254, 1, 0, 0, 0]);
         let v6 = ipv6_message(&network, 2, 7, 0).concat();
         assert_eq!(&v6[16..24], &[10, 128, 0x80, 254, 1, 0, 0, 0]);
@@ -7181,7 +7283,7 @@ mod tests {
             )
         );
         network.set_up(false, 0);
-        assert!(!ipv4_message(&network, 3, 7, 0).is_empty());
+        assert!(!ipv4_messages(&network, 0, 3, 7, 0).is_empty());
         assert!(ipv6_message(&network, 3, 7, 0).is_empty());
     }
 
@@ -7716,7 +7818,7 @@ mod tests {
         let addresses = request(true).unwrap();
         assert_eq!(addresses.len(), 1);
         assert_eq!(attribute_kinds(&addresses[0][24..])[0], IFA_TARGET_NETNSID);
-        assert_eq!(request(false), Ok(ipv4_message(&network, 1, 7, 0)));
+        assert_eq!(request(false), Ok(ipv4_messages(&network, 0, 1, 7, 0)));
     }
     #[test]
     fn strict_link_dumps_take_only_their_filters() {
@@ -7950,6 +8052,115 @@ mod tests {
         assert_eq!(group_mask(RTNLGRP_MCTP_IFADDR), 0);
     }
 
+    fn set_veth_up(network: &Network, up: bool) {
+        if let Some(v) = network
+            .devices()
+            .by_index_mut(1000)
+            .and_then(|d| d.veth.as_mut())
+        {
+            v.up = up;
+        }
+    }
+    #[test]
+    fn a_veth_ends_ipv4_addresses_are_its_own_in_dumps_and_lookups() {
+        let network = Network::isolated(crate::users::first());
+        network.devices().add(
+            crate::netdev::Device::veth(
+                1000,
+                b"va".to_vec(),
+                [2, 0, 0, 0, 0, 10],
+                1500,
+                Default::default(),
+            ),
+            true,
+        );
+        let add = |index: u32, ip: [u8; 4]| {
+            let mut payload = vec![AF_INET, 24, 0, 0];
+            payload.extend_from_slice(&index.to_le_bytes());
+            attribute(&mut payload, IFA_LOCAL, &ip);
+            let header = Header {
+                len: 0,
+                kind: RTM_NEWADDR,
+                flags: NLM_F_CREATE | NLM_F_EXCL,
+                seq: 3,
+            };
+            change_address(&network, &header, &payload, 0)
+        };
+        // Down: its local route alone, labelled with the end's name.
+        let told = add(1000, [10, 77, 0, 1]).unwrap();
+        assert_eq!(told.len(), 2);
+        assert_eq!(add(1001, [10, 77, 0, 1]).map(|_| ()), Err(ENODEV));
+        let address = network.addresses().v4[0].clone();
+        assert_eq!(
+            (address.index, address.label.as_slice()),
+            (1000, &b"va"[..])
+        );
+        // A strict dump of the end's index gives it; of lo's, nothing.
+        let mut by_index = vec![AF_INET, 0, 0, 0];
+        by_index.extend_from_slice(&1000u32.to_le_bytes());
+        let mut answer = 0;
+        let dumped = address_dump(
+            &network,
+            &by_index,
+            AF_INET,
+            (1, 7),
+            true,
+            &mut answer,
+            0,
+            &no_ids,
+        )
+        .unwrap();
+        assert_eq!(dumped.len(), 1);
+        assert_eq!(dumped[0][20..24], 1000i32.to_le_bytes());
+        by_index[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let lo = address_dump(
+            &network,
+            &by_index,
+            AF_INET,
+            (1, 7),
+            true,
+            &mut answer,
+            0,
+            &no_ids,
+        );
+        assert_eq!(lo.map(|m| m.len()), Ok(0));
+        // Up without a carrier: the prefix route goes through it, and a
+        // lookup leaves from its address, out through it, of no local flag.
+        let notices = device_up4(&network, 1000, false);
+        assert_eq!(notices.len(), 2);
+        let route = network
+            .addresses()
+            .lookup4("10.77.0.2".parse().unwrap())
+            .unwrap();
+        assert!(route.linkdown);
+        let message = ipv4_route_of(RTM_NEWROUTE, &route, route.table, 0, 0, 0);
+        assert_eq!(message[24..28], RTNH_F_LINKDOWN.to_le_bytes());
+        // An end that is down leaves a lookup through it unreachable.
+        let mut ask = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        attribute(&mut ask, RTA_DST, &[10, 77, 0, 2]);
+        let up_answer = {
+            set_veth_up(&network, true);
+            lookup(&network, &ask, 1, 7, 0, 0).unwrap()
+        };
+        let attributes = attributes(&up_answer[28..]);
+        let oif = attributes
+            .iter()
+            .find(|(k, _)| *k == RTA_OIF)
+            .map(|(_, v)| s32_value(v));
+        let prefsrc = attributes
+            .iter()
+            .find(|(k, _)| *k == RTA_PREFSRC)
+            .map(|(_, v)| v.to_vec());
+        assert_eq!((oif, prefsrc), (Some(1000), Some(vec![10, 77, 0, 1])));
+        assert_eq!(up_answer[24..28], RTM_F_CLONED.to_le_bytes());
+        let mut through = ask.clone();
+        attribute(&mut through, RTA_OIF, &1000u32.to_le_bytes());
+        set_veth_up(&network, false);
+        assert_eq!(lookup(&network, &through, 1, 7, 0, 0), Err(ENETUNREACH));
+        // Gone: its address and local route are told of.
+        assert_eq!(addresses_gone(&network, 1000).len(), 2);
+        assert!(network.addresses().v4.is_empty());
+    }
     #[test]
     fn addresses_take_lifetimes_and_a_priority_and_show_them() {
         use crate::interface::FOREVER;
@@ -8049,7 +8260,7 @@ mod tests {
             )
             .is_ok()
         );
-        let dumped = ipv4_message(&network, 1, 7, 5 * second + second / 2);
+        let dumped = ipv4_messages(&network, 0, 1, 7, 5 * second + second / 2);
         let found = |message: &[u8], kind: u16| {
             attributes(&message[24..])
                 .into_iter()

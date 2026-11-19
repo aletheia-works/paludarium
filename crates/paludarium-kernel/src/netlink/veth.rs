@@ -610,8 +610,12 @@ fn switch(
         });
         if peer_up && let Some((n, i)) = &peer {
             change(n, *i, |v| carrier(v, true));
+            super::device_changed4(n, *i, true, true);
         }
         let list = told(network, index, RTM_NEWLINK, IFF_UP, false);
+        tell(own, network, notices, list);
+        // `NETDEV_UP`, after `__dev_notify_flags` has told of the change.
+        let list = super::device_up4(network, index, peer_up);
         tell(own, network, notices, list);
         if peer_up {
             change(network, index, |v| v.oper_up = true);
@@ -628,6 +632,7 @@ fn switch(
             v.up = false;
             carrier(v, false);
         });
+        super::device_changed4(network, index, false, false);
         let peer_was_running = peer.as_ref().is_some_and(|(n, i)| {
             n.devices()
                 .by_index(*i)
@@ -636,6 +641,7 @@ fn switch(
         });
         if let Some((n, i)) = &peer {
             change(n, *i, |v| carrier(v, false));
+            super::device_changed4(n, *i, true, false);
         }
         let list = told(network, index, RTM_NEWLINK, told_change, false);
         tell(own, network, notices, list);
@@ -670,6 +676,9 @@ fn unregister(
         }
     }
     for (network, device) in &gone {
+        // `NETDEV_UNREGISTER`: IPv4 takes its addresses first.
+        let list = super::addresses_gone(network, device.index);
+        tell(own, network, notices, list);
         let list = told_of(network, device, RTM_DELLINK, u32::MAX, true);
         tell(own, network, notices, list);
     }
@@ -814,6 +823,9 @@ pub(super) fn move_to(
     let Some(mut device) = network.devices().by_index(index).cloned() else {
         return Err(super::ENODEV);
     };
+    // `NETDEV_UNREGISTER` in the old namespace: IPv4 takes its addresses.
+    let list = super::addresses_gone(network, index);
+    tell(own, network, notices, list);
     let mut list = Vec::new();
     let nsid = nsid::link_netnsid(network, to, &mut list).unwrap_or(-1);
     let (message, more) = link_message(

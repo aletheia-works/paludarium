@@ -3351,7 +3351,7 @@ impl AddressSpaceData {
     /// room for, as nothing faults for it. Nothing is mapped around in a
     /// VMA that `userfaultfd` watches for writes or minor faults
     /// (`uffd_disable_fault_around`), nor in one whose memory has no
-    /// `map_pages`: private memory, a loaded program's segments (made
+    /// `map_pages`: anonymous private memory, a loaded program's segments (made
     /// whole at load), System V shared memory ([`PageSource::merges`], as
     /// `shm_vm_ops` has neither `map_pages` nor merging) and secret memory.
     /// Like `mincore` here, every page of a file within its size is taken

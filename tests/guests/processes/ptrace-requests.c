@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
@@ -175,19 +176,42 @@ static long state_of(pid_t pid) {
     return state;
 }
 
+/* The calls a child has gone into that its parent waits for it to block
+ * in, which the child counts just before it makes each: a page that the
+ * fork leaves shared. /proc's 'S' alone does not tell which call a task
+ * sleeps in, and under an emulator that shows a task asleep in every call
+ * it is in it can be the call before, such as the write of a ready byte or
+ * the rt_sigreturn of a handler. */
+static int *entered;
+
+static int share_entered(void) {
+    entered = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (entered == MAP_FAILED) return -1;
+    *entered = 0;
+    return 0;
+}
+
+static void enter(void) { __atomic_add_fetch(entered, 1, __ATOMIC_SEQ_CST); }
+
+/* Waits until `child` sleeps in the `nth` call it counted. */
+static void sleeping_in(pid_t child, int nth) {
+    while (__atomic_load_n(entered, __ATOMIC_SEQ_CST) < nth) usleep(1000);
+    while (state_of(child) != 'S') usleep(1000);
+}
+
 static int listen_case(void) {
     int ready[2];
-    if (pipe(ready)) return 80;
+    if (pipe(ready) || share_entered()) return 80;
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
         write(ready[1], "x", 1);
+        enter();
         for (;;) pause();
     }
     char byte;
     read(ready[0], &byte, 1);
-    do usleep(10000);
-    while (state_of(child) != 'S');
+    sleeping_in(child, 1);
     printf("seize=%ld\n", pt(REQ_SEIZE, child, 0, 0));
     kill(child, SIGSTOP);
     int status = wait_status(child, 0);
@@ -470,15 +494,17 @@ static void restart_handler(int number) { (void)number; }
 
 static long blocked_read(void) {
     char byte;
+    enter();
     long r = syscall(SYS_read, restart_pipe[0], &byte, 1);
     return r < 0 ? -errno : r;
 }
 
-/* Waits until the child sleeps, then sends it `number`, and stops it there;
- * shows rax, and leaves `rax` and `orig_rax` as asked (`keep` for none). */
-static void interrupt(pid_t child, int number, long rax, long orig, int resume) {
-    do usleep(10000);
-    while (state_of(child) != 'S');
+/* Waits until the child sleeps in its `nth` read, then sends it `number`,
+ * and stops it there; shows rax, and leaves `rax` and `orig_rax` as asked
+ * (`keep` for none). A read restarted after a handler is still the same
+ * read, so the next signal waits for the read after it. */
+static void interrupt(pid_t child, int nth, int number, long rax, long orig, int resume) {
+    sleeping_in(child, nth);
     kill(child, number);
     int status = wait_status(child, 0);
     struct user_regs_struct regs;
@@ -492,7 +518,7 @@ static void interrupt(pid_t child, int number, long rax, long orig, int resume) 
 }
 
 static int restart_codes_case(void) {
-    if (pipe(restart_pipe)) return 80;
+    if (pipe(restart_pipe) || share_entered()) return 80;
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -514,15 +540,15 @@ static int restart_codes_case(void) {
     pt(PTRACE_CONT, child, 0, 0);
     /* -ERESTARTSYS made -ERESTARTNOINTR: it runs again after the handler,
      * and reads the byte written meanwhile. */
-    interrupt(child, SIGUSR1, -513, 0, SIGUSR1);
+    interrupt(child, 1, SIGUSR1, -513, 0, SIGUSR1);
     write(restart_pipe[1], "x", 1);
     /* -ERESTARTNOHAND: EINTR after a handler, even an SA_RESTART one. */
-    interrupt(child, SIGUSR2, -514, 0, SIGUSR2);
+    interrupt(child, 2, SIGUSR2, -514, 0, SIGUSR2);
     /* orig_rax -1: no call to restart, and rax is what the read returns. */
-    interrupt(child, SIGUSR1, -512, -1, SIGUSR1);
+    interrupt(child, 3, SIGUSR1, -512, -1, SIGUSR1);
     /* -ERESTART_RESTARTBLOCK, the signal taken back so no handler runs:
      * restart_syscall, with nothing to resume, gives EINTR. */
-    interrupt(child, SIGUSR1, -516, 0, 0);
+    interrupt(child, 4, SIGUSR1, -516, 0, 0);
     int status = wait_status(child, 0);
     printf("exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return 0;

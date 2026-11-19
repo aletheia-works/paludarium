@@ -184,6 +184,13 @@ pub(crate) struct ProcessView {
     pub dumpable: bool,
     /// It has ended and waits to be reaped.
     pub zombie: bool,
+    /// The wait status of a process that has ended (`exit_code` in Linux's
+    /// `stat`): its code in the second byte, or its signal with 0x80 for a
+    /// core dumped; 0 while it runs.
+    pub exit_code: i32,
+    /// The signal of a group stop its parent's wait has not yet reported
+    /// (Linux's `group_exit_code` while `SIGNAL_STOP_STOPPED`).
+    pub stop_report: Option<i32>,
     pub exit_signal: i32,
     pub group: Arc<ThreadGroup>,
     /// The controlling terminal.
@@ -1049,6 +1056,13 @@ impl Processes {
             no_new_privs: entry.no_new_privs,
             dumpable: entry.dumpable,
             zombie: entry.status.is_some(),
+            exit_code: match entry.status {
+                Some(ExitStatus::Exited(code)) => (code & 255) << 8,
+                Some(ExitStatus::Signaled(signal)) if entry.dumped => signal & 127 | 0x80,
+                Some(ExitStatus::Signaled(signal)) => signal & 127,
+                _ => 0,
+            },
+            stop_report: entry.stop_report,
             exit_signal: entry.exit_signal,
             group: Arc::clone(&entry.group),
             terminal: entry.terminal.clone(),

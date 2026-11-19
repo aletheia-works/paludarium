@@ -3277,6 +3277,10 @@ kernel.
   `ptrace_may_access` decides with its filesystem IDs, gets 1 for
   `start_code` and `end_code` and 0 for the start of the stack, `wchan` and
   every field from `start_data` on, as Linux's `do_task_stat` hides them.
+  The last of those, `exit_code`, is the wait status of a process that has
+  ended (its code times 256, or its signal, with 0x80 for a core dumped), and
+  a stopped process's signal in its own `stat` until a wait reports the stop
+  (Linux's `group_exit_code`); a thread's `stat` under `task` has no stop's.
   `stat` is made at each read from its start, as Linux's is, so a descriptor
   shows what the task and the reader are then: one that drops its rights
   sees the addresses hidden, and a task that has been reaped is `ESRCH`.

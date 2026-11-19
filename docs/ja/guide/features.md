@@ -2860,7 +2860,11 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   数値）は 0 です。Linux の `ptrace_may_access` がファイルシステムの ID で決めるとおり、
   タスクのメモリを見てはいけない読み手には、Linux の `do_task_stat` と同じく、
   `start_code` と `end_code` を 1、スタックの始まり、`wchan`、`start_data` から後の
-  項目をすべて 0 として隠します。`stat` は Linux と同じく先頭から読むたびに作るので、
+  項目をすべて 0 として隠します。その最後の `exit_code` は、終わったプロセスでは wait の
+  ステータス（終了コードの 256 倍か、シグナル。コアダンプしたものは 0x80 を足します）で、
+  止まったプロセスでは、wait がその停止を報告するまで、プロセス自身の `stat` に止めた
+  シグナルが出ます（Linux の `group_exit_code`）。`task` の下のスレッドの `stat` には
+  停止のものは出ません。`stat` は Linux と同じく先頭から読むたびに作るので、
   同じディスクリプターでもそのときのタスクと読み手で決まります。権限を手放した読み手には
   アドレスが隠れ、回収されたタスクは `ESRCH` です。ほかのプロセスの `status`、`statm`、
   `limits`、`cmdline` も、Linux の `proc_single_show` と `proc_pid_cmdline_read` と同じく

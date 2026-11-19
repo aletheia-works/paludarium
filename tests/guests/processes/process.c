@@ -11238,6 +11238,91 @@ static int generated_binds_case(void) {
     return 0;
 }
 
+/* The generated-changes case: the path calls that change or go to a file
+   the kernel generates in /dev or /proc, by its own path. chdir and fchdir
+   make a directory there the working directory, which relative paths and
+   getcwd then take; procfs refuses a new mode of this process's files and
+   of a sysctl's (EPERM); chown that changes nothing, utimensat to now of a
+   device anyone may write, utimensat and truncate of this process's comm
+   succeed; truncate of a directory is EISDIR, of a device EINVAL; statfs
+   gives devtmpfs's (a tmpfs's), procfs's or devpts's type; the owner of a
+   pseudo-terminal's slave changes its mode and owner by its path. Only
+   results that are the same for root and for another user are printed. */
+static long gc_e(long r) { return r < 0 ? -errno : r; }
+static int generated_changes_case(void) {
+    char cwd[256];
+    int home = open(".", O_PATH | O_DIRECTORY);
+    printf("chdir proc=%ld", gc_e(chdir("/proc")));
+    printf(" cwd=%s", getcwd(cwd, sizeof cwd) ? cwd : "?");
+    int f = open("self/comm", O_RDONLY);
+    printf(" rel=%d", f >= 0);
+    if (f >= 0) close(f);
+    printf(" self=%ld", gc_e(chdir("self")));
+    struct stat st;
+    printf(" comm=%ld", gc_e(stat("comm", &st)));
+    printf(" dev=%ld", gc_e(chdir("/dev")));
+    printf(" cwd=%s", getcwd(cwd, sizeof cwd) ? cwd : "?");
+    printf(" null=%ld", gc_e(stat("null", &st)));
+    printf(" fd=%ld", gc_e(chdir("/dev/fd")));
+    printf(" notdir=%ld %ld", gc_e(chdir("/dev/null")), gc_e(chdir("/proc/self/comm")));
+    int proc = open("/proc", O_RDONLY | O_DIRECTORY);
+    fchdir(home);
+    printf(" fchdir=%ld", gc_e(fchdir(proc)));
+    printf(" cwd=%s\n", getcwd(cwd, sizeof cwd) ? cwd : "?");
+    close(proc);
+    fchdir(home);
+    close(home);
+    printf("chmod self=%ld comm=%ld fd=%ld sysctl=%ld\n", gc_e(chmod("/proc/self", 0755)),
+           gc_e(chmod("/proc/self/comm", 0644)), gc_e(chmod("/dev/fd", 0500)),
+           gc_e(chmod("/proc/sys/kernel", 0555)));
+    printf("chown null=%ld dev=%ld proc=%ld comm=%ld sysctl=%ld lfd=%ld\n",
+           gc_e(chown("/dev/null", -1, -1)), gc_e(chown("/dev", -1, -1)),
+           gc_e(chown("/proc", -1, -1)), gc_e(chown("/proc/self/comm", -1, -1)),
+           gc_e(chown("/proc/sys/kernel", -1, -1)), gc_e(lchown("/dev/fd", -1, -1)));
+    struct timespec times[2] = {{1, 0}, {1, 0}};
+    printf("times null=%ld comm=%ld set=%ld utimes=%ld\n",
+           gc_e(utimensat(AT_FDCWD, "/dev/null", NULL, 0)),
+           gc_e(utimensat(AT_FDCWD, "/proc/self/comm", NULL, 0)),
+           gc_e(utimensat(AT_FDCWD, "/proc/self/comm", times, 0)), gc_e(utimes("/dev/zero", NULL)));
+    printf("truncate comm=%ld dev=%ld null=%ld proc=%ld negative=%ld\n",
+           gc_e(truncate("/proc/self/comm", 0)), gc_e(truncate("/dev", 0)),
+           gc_e(truncate("/dev/null", 0)), gc_e(truncate("/proc", 0)),
+           gc_e(truncate("/proc/self/comm", -1)));
+    struct statfs fs;
+    memset(&fs, 0, sizeof fs);
+    printf("statfs dev=%ld", gc_e(statfs("/dev", &fs)));
+    printf(" tmpfs=%d", fs.f_type == 0x01021994);
+    statfs("/dev/null", &fs);
+    printf(" null=%d", fs.f_type == 0x01021994);
+    statfs("/dev/fd", &fs);
+    printf(" fd=%d", fs.f_type == 0x9fa0);
+    int null = open("/dev/null", O_RDONLY);
+    fstatfs(null, &fs);
+    printf(" fstatfs=%d", fs.f_type == 0x01021994);
+    close(null);
+    printf(" nosuch=%ld\n", gc_e(statfs("/dev/nosuch", &fs)));
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || unlockpt(master)) {
+        printf("pts errno=%d\n", errno);
+        return 0;
+    }
+    const char *slave = ptsname(master);
+    printf("pts chmod=%ld", gc_e(chmod(slave, 0600)));
+    stat(slave, &st);
+    printf(" mode=%o", st.st_mode & 07777);
+    printf(" chmod=%ld", gc_e(chmod(slave, 0620)));
+    stat(slave, &st);
+    printf(" mode=%o", st.st_mode & 07777);
+    printf(" chown=%ld", gc_e(chown(slave, getuid(), getgid())));
+    stat(slave, &st);
+    printf(" owner=%d", st.st_uid == getuid() && st.st_gid == getgid());
+    printf(" truncate=%ld", gc_e(truncate(slave, 0)));
+    statfs(slave, &fs);
+    printf(" devpts=%d\n", fs.f_type == 0x1cd1);
+    close(master);
+    return 0;
+}
+
 /* The beneath case: move_mount with MOVE_MOUNT_BENEATH (Linux master's
    do_move_mount and can_move_mount_beneath) of tmpfs mounts in a temporary
    directory, in a mount namespace of a user namespace of its own: the moved
@@ -31168,6 +31253,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "mount-flags")) return mount_flags_case(self);
     if (!strcmp(mode, "listings")) return listings_case();
     if (!strcmp(mode, "generated-binds")) return generated_binds_case();
+    if (!strcmp(mode, "generated-changes")) return generated_changes_case();
     if (!strcmp(mode, "beneath")) return beneath_case();
     if (!strcmp(mode, "mount-flags-id")) {
         printf("euid=%d egid=%d\n", (int)geteuid(), (int)getegid());

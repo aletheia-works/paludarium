@@ -1429,6 +1429,23 @@ pub(crate) fn slave_stat(c: &Context<'_>, index: u32) -> Result<FileStat, Errno>
         .ok_or(Errno::ENOENT)?
         .slave_stat())
 }
+/// `chmod` or `chown` of `/dev/pts/<index>` by its path: the slave's
+/// permission bits (the low 12 of `mode`), owner and group, as `fchmod` and
+/// `fchown` of its open files set them; `None` leaves one as it is.
+pub(crate) fn set_slave(
+    c: &Context<'_>,
+    index: u32,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), Errno> {
+    let terminal = c.files.devpts.named(index).ok_or(Errno::ENOENT)?;
+    let mut state = terminal.lock();
+    state.mode = mode.map_or(state.mode, |mode| mode & 0o7777);
+    state.uid = uid.unwrap_or(state.uid);
+    state.gid = gid.unwrap_or(state.gid);
+    Ok(())
+}
 
 /// An open file description of a master.
 pub(crate) struct Master {

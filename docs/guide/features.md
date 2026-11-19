@@ -2864,7 +2864,7 @@ kernel.
   slave and a terminal on standard input, output or error (devpts), and 4096
   for the rest,
   pipes, sockets, `memfd` and `/dev` included. `statfs` there gives
-  procfs's or devpts's type with a 4096 `f_bsize`, as Linux's
+  procfs's, devpts's or (for the rest of `/dev`, a devtmpfs) tmpfs's type with a 4096 `f_bsize`, as Linux's
   `simple_statfs` does. A link in `/proc/self/fd` is procfs's, but a call
   that follows it reaches the descriptor's file, as Linux's magic link does,
   whatever its access (an `O_PATH` descriptor's too): `stat`, `statfs`,
@@ -4716,6 +4716,17 @@ one only with an `--allow-net`.
   calls, `statfs`, `link` and `name_to_handle_at`, with their `*at`
   forms, take the generated file), and a descriptor opened through it
   names that file in `/proc/self/fd`.
+- The files the kernel generates in `/dev` and `/proc` take the path calls
+  that change a file, by their own path or through such a link, as Linux's
+  `notify_change` makes them there: `chmod`, `chown`, `utimensat` and the
+  other time calls check the file's owner and mode as on any file, and
+  procfs refuses a new mode of a process's file (`proc_setattr`) and a new
+  mode or owner of a sysctl's (`proc_sys_setattr`), `EPERM`; a
+  pseudo-terminal's slave in `/dev/pts` takes a new mode and owner from its
+  owner. `truncate` of a regular file there that the caller may write
+  succeeds and changes nothing, of a directory is `EISDIR` and of a device
+  `EINVAL`. `chdir` and `fchdir` make a directory there the working
+  directory, which `getcwd` names and relative paths start from.
 - `linkat` takes `AT_SYMLINK_FOLLOW`, which follows a symbolic link the old
   path ends in (a dangling one is `ENOENT`) and a link in `/proc/self/fd` to
   the descriptor's file, and `AT_EMPTY_PATH`, which with an empty old path

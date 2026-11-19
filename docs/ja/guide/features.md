@@ -2489,8 +2489,8 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
 - ファイルのブロックの大きさ（`st_blksize`、`stx_blksize`、`FIGETBSZ`）は、Linux と
   同じくそのファイルシステムのものです。`/proc`（procfs）と、疑似端末のスレーブ、
   標準入力・出力・エラーの端末（devpts）は 1024 で、ほかは、パイプ、ソケット、`memfd`、`/dev` も含めて 4096
-  です。そこでの `statfs` は、Linux の `simple_statfs` と同じく、procfs や devpts の
-  種類と 4096 の `f_bsize` を返します。
+  です。そこでの `statfs` は、Linux の `simple_statfs` と同じく、procfs や devpts、
+  （ほかの `/dev` は devtmpfs なので）tmpfs の種類と 4096 の `f_bsize` を返します。
   `/proc/self/fd` のリンクは procfs のものですが、Linux のマジックリンクと同じく、
   それをたどる呼び出しはディスクリプタのファイルそのものに届きます。アクセスモードは
   問いません（`O_PATH` のディスクリプタも）。`stat`、`statfs`、`open`、`access`、
@@ -4088,6 +4088,16 @@ TCP のソケットは、ゲスト自身のループバックの上で Linux と
   `/dev/fd` のようなそこのリンクを読み、`xattr` の呼び出し、`statfs`、`link`、
   `name_to_handle_at` は、その `*at` の形も、生成されるファイルを扱います）。それを
   通して開いたディスクリプタは、`/proc/self/fd` でそのファイルを指します。
+- カーネルが `/dev` と `/proc` に生成するファイルは、そのパスでもそうしたリンクを
+  通しても、ファイルを変えるパスの呼び出しを、Linux の `notify_change` と同じように
+  受けます。`chmod`、`chown`、`utimensat` とほかの時刻の呼び出しは、ほかのファイルと
+  同じく所有者とモードを確かめます。procfs は、プロセスのファイルの新しいモード
+  （`proc_setattr`）と、sysctl のファイルの新しいモードや所有者（`proc_sys_setattr`）を
+  `EPERM` で断ります。`/dev/pts` の疑似端末のスレーブは、所有者から新しいモードと
+  所有者を受けます。そこの通常のファイルへの `truncate` は、書き込めるなら成功して
+  何も変えず、ディレクトリなら `EISDIR`、デバイスなら `EINVAL` です。`chdir` と
+  `fchdir` はそこのディレクトリを作業ディレクトリにし、`getcwd` はそれを返し、相対
+  パスはそこから始まります。
 - `linkat` は `AT_SYMLINK_FOLLOW` と `AT_EMPTY_PATH` に対応しています。
   `AT_SYMLINK_FOLLOW` は古いパスの最後のシンボリックリンク（リンク先がなければ
   `ENOENT`）と、`/proc/self/fd` のリンクをディスクリプタのファイルまでたどります。

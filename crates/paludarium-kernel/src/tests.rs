@@ -9497,6 +9497,61 @@ fn the_path_calls_go_through_a_link_into_the_generated_files() {
     }
 }
 
+/// The path calls that change a file the kernel generates in `/dev` or
+/// `/proc`, by its own path, as `notify_change` makes them there: root may
+/// keep a mode or owner as it is but gets `EPERM` for a new one, which no
+/// file here keeps; procfs refuses a new mode of a process's file; another
+/// user is held to the owner's checks; `chdir` goes there and `statfs`
+/// gives devtmpfs's type.
+#[test]
+fn the_path_calls_change_the_generated_files() {
+    let mut f = fixture();
+    let dev = put(&mut f, 0, b"/dev");
+    let null = put(&mut f, 0x10, b"/dev/null");
+    let comm = put(&mut f, 0x20, b"/proc/self/comm");
+    let proc_dir = put(&mut f, 0x40, b"/proc");
+    let buf = DATA + 0x800;
+    assert_eq!(f.ret(80, &[dev]), 0);
+    assert_eq!(f.ret(79, &[buf, 64]), 5);
+    let mut got = [0; 5];
+    f.mem.read(GuestAddr(buf), &mut got).unwrap();
+    assert_eq!(&got, b"/dev\0");
+    assert_eq!(f.ret(80, &[null]), errno(Errno::ENOTDIR));
+    assert_eq!(f.ret(80, &[proc_dir]), 0);
+    assert_eq!(f.ret(90, &[null, 0o666]), 0);
+    assert_eq!(f.ret(90, &[null, 0o600]), errno(Errno::EPERM));
+    assert_eq!(f.ret(90, &[comm, 0o644]), errno(Errno::EPERM));
+    assert_eq!(f.ret(92, &[null, 0, 0]), 0);
+    assert_eq!(
+        f.ret(92, &[null, 1, u64::from(u32::MAX)]),
+        errno(Errno::EPERM)
+    );
+    assert_eq!(f.ret(92, &[comm, 1, 1]), 0);
+    assert_eq!(f.ret(76, &[null, 0]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(76, &[dev, 0]), errno(Errno::EISDIR));
+    assert_eq!(f.ret(76, &[comm, 0]), 0);
+    assert_eq!(f.ret(76, &[comm, u64::MAX]), errno(Errno::EINVAL));
+    assert_eq!(f.ret(137, &[null, buf]), 0);
+    let mut kind = [0; 8];
+    f.mem.read(GuestAddr(buf), &mut kind).unwrap();
+    assert_eq!(u64::from_le_bytes(kind), 0x0102_1994);
+    let missing = put(&mut f, 0x60, b"/dev/nosuch");
+    assert_eq!(f.ret(137, &[missing, buf]), errno(Errno::ENOENT));
+    // Another user: the owner's checks of root's files.
+    assert_eq!(f.ret(117, &[1000, 1000, 1000]), 0);
+    assert_eq!(f.ret(90, &[null, 0o666]), errno(Errno::EPERM));
+    assert_eq!(f.ret(92, &[null, u64::MAX, u64::MAX]), 0);
+    assert_eq!(f.ret(92, &[null, 1000, u64::MAX]), errno(Errno::EPERM));
+    let times = DATA + 0x900;
+    f.mem.write(GuestAddr(times), &[0; 32]).unwrap();
+    assert_eq!(f.ret(280, &[(-100i64) as u64, null, 0, 0]), 0);
+    assert_eq!(
+        f.ret(280, &[(-100i64) as u64, null, times, 0]),
+        errno(Errno::EPERM)
+    );
+    assert_eq!(f.ret(80, &[proc_dir]), 0);
+}
+
 /// A bind of `/proc`, `/dev` or a directory in them onto a directory of a
 /// new root shows the files the kernel generates there after `chroot`, as
 /// on Linux.

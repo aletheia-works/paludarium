@@ -377,6 +377,7 @@
     {"name":"mount-flags","binary":"process"},
     {"name":"listings","binary":"process"},
     {"name":"generated-binds","binary":"process"},
+    {"name":"generated-changes","binary":"process"},
     {"name":"beneath","binary":"process"},
     {"name":"proc-other-mounts","binary":"process"},
     {"name":"proc-other-maps","binary":"process"},

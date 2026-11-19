@@ -126,13 +126,11 @@ verified.
   remove a name through it (`mkdir`, `mknod`, `unlink`, `rename` and the
   like), which give `ENOENT`, and under a root of its own no such link is
   followed.
-- **Changing the generated files**: `chmod`, `chown`, `truncate`,
-  `utimensat` and `chdir` of `/dev`, `/proc` or a file in them give
-  `ENOENT`, by their own path or through a link, where Linux changes
-  their mode, owner and times (or gives `EPERM` or `EINVAL`) and makes a
-  directory there the working directory; so does `statfs` of `/dev` and
-  its files. A bind mount of a generated directory is a working directory
-  of its own.
+- **Changing the generated files, in part**: a new mode or owner of
+  `/dev`, its devices, `/proc` or /proc's system-wide files, which only
+  root may give these files of root's, is `EPERM`, where Linux keeps it;
+  a pseudo-terminal's slave keeps its own. Times set on a generated file
+  are not kept either: its `stat` shows the times it had.
 - **Device nodes and FIFOs on the host**: `mknod` of a character or block
   device is `EPERM`, although the guest runs as root, since paludarium has
   no device for it to stand for. A FIFO in a mounted host directory can be

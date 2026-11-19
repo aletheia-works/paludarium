@@ -1303,6 +1303,113 @@ fn linked_generated_path(c: &Context<'_>, p: Vec<u8>, follow: bool) -> Result<Ve
         Err(e) => Err(e),
     }
 }
+/// The `stat` of the directory `chdir` or `chroot` goes to at `p`, its
+/// links followed: one in `/dev` or `/proc` the kernel's own.
+fn directory_stat(c: &Context<'_>, p: &[u8]) -> Result<FileStat, Errno> {
+    if (generated(p) || p == b"/proc")
+        && let Some((stat, ..)) = generated_stat(c, p, true)?
+    {
+        return Ok(stat);
+    }
+    c.files.fs().metadata(p, true)
+}
+/// Where `p` leads through the links in `/dev` on its way (its last one
+/// only with `follow`), as `/dev/fd` leads to `/proc/self/fd`.
+fn dev_followed(p: &[u8], follow: bool) -> Vec<u8> {
+    let mut target = p.to_vec();
+    while let Some(next) =
+        crate::devices::through_link(&target).or_else(|| match crate::devices::entry(&target) {
+            Some(crate::devices::Entry::Link(next)) if follow => Some(next.to_vec()),
+            _ => None,
+        })
+    {
+        target = next;
+    }
+    target
+}
+/// What a path call changes of a file it does not open.
+#[derive(Clone, Copy)]
+enum Change {
+    /// `chmod`'s new mode.
+    Mode(u32),
+    /// `chown`'s owner and group, as kernel IDs; `None` leaves one as it is.
+    Owner(Option<u32>, Option<u32>),
+    /// `utimensat`'s times: now (`touch`), or times given (`set`).
+    Times { touch: bool, set: bool },
+    /// `truncate`'s new size.
+    Size,
+}
+/// The change `change` of `p` when it is a file the kernel generates in
+/// `/dev` or `/proc` (none otherwise), as Linux's `notify_change` makes it
+/// there: the call's own checks against the file's `stat`, then the file
+/// system's `setattr`. Procfs refuses a new mode of a process's file
+/// (`proc_setattr`) and a new mode or owner of a sysctl's
+/// (`proc_sys_setattr`) with `EPERM`. A slave in `/dev/pts` keeps a new
+/// mode and owner; times, a size and the owner a process's file takes again
+/// at its next lookup (`pid_revalidate`) leave nothing to keep, nor does a
+/// mode or owner that stays. Any other new mode or owner, which only root
+/// may give these files of root's, is `EPERM`: no other file here keeps
+/// one.
+fn change_generated(
+    c: &Context<'_>,
+    p: &[u8],
+    follow: bool,
+    change: Change,
+) -> Option<Result<u64, Errno>> {
+    (generated(p) || p == b"/proc").then(|| change_generated_file(c, p, follow, change))
+}
+/// [`change_generated`] of a generated `p`.
+fn change_generated_file(
+    c: &Context<'_>,
+    p: &[u8],
+    follow: bool,
+    change: Change,
+) -> Result<u64, Errno> {
+    let (stat, ..) = generated_stat(c, p, follow)?.ok_or(Errno::ENOENT)?;
+    let creds = &c.process.credentials;
+    let target = dev_followed(p, follow);
+    let slave = match crate::devices::entry(&target) {
+        Some(crate::devices::Entry::Slave(number)) => number,
+        _ => None,
+    };
+    // `/proc/self` and `/proc/thread-self` not followed are procfs's own
+    // links, not a process's files.
+    let own_link = !follow && matches!(&target[..], b"/proc/self" | b"/proc/thread-self");
+    let task = !own_link && crate::proc::dentry(&target, c.process.pid, c.tid).is_some();
+    let sysctl = crate::sysctl::entry(c, &target).is_some();
+    match change {
+        Change::Mode(mode) => {
+            if stat.mode & 0o170000 == 0o120000 {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            if task || sysctl {
+                return Err(Errno::EPERM);
+            }
+            let mode = crate::permissions::chmod(creds, &stat, mode)?;
+            if let Some(number) = slave {
+                crate::pty::set_slave(c, number, Some(mode), None, None)?;
+            } else if (mode ^ stat.mode) & 0o7777 != 0 {
+                return Err(Errno::EPERM);
+            }
+        }
+        Change::Owner(uid, gid) => {
+            if sysctl && (uid.is_some() || gid.is_some()) {
+                return Err(Errno::EPERM);
+            }
+            crate::permissions::chown(creds, &stat, uid, gid)?;
+            let stays =
+                uid.is_none_or(|uid| uid == stat.uid) && gid.is_none_or(|gid| gid == stat.gid);
+            if let Some(number) = slave {
+                crate::pty::set_slave(c, number, None, uid, gid)?;
+            } else if !task && !stays {
+                return Err(Errno::EPERM);
+            }
+        }
+        Change::Times { touch, set } => crate::permissions::times(creds, &stat, touch, set)?,
+        Change::Size => crate::permissions::truncate(creds, &stat, || Ok(()))?,
+    }
+    Ok(0)
+}
 /// [`lookup`] of the place `raw` names, a bind mount's own and not the
 /// file it shows, as `mount` and `umount2` find a mount
 /// ([`Files::named`]).
@@ -1757,6 +1864,9 @@ fn descriptor_statfs(c: &Context<'_>, d: &Descriptor) -> Result<paludarium_host:
     if crate::mqueue::is_queue(&*d.file) || d.path == b"/dev/mqueue" {
         return Ok(pseudo_fs(MQUEUE_MAGIC));
     }
+    if crate::devices::entry(&d.path).is_some() {
+        return Ok(pseudo_fs(paludarium_vfs::TMPFS_MAGIC));
+    }
     if d.file
         .as_any()
         .and_then(|v| v.downcast_ref::<crate::memfd::Memfd>())
@@ -1928,6 +2038,9 @@ fn set_times_at(
         }
         None => {}
     }
+    if let Some(changed) = change_generated(c, &p, follow, Change::Times { touch, set }) {
+        return changed;
+    }
     crate::permissions::want_write(c.files, &p, follow)?;
     if let Some(stat) = found.file {
         crate::permissions::times(&c.process.credentials, &stat, touch, set)?;
@@ -2053,6 +2166,10 @@ fn chown_path(
         Some(Followed::File(d)) => return chown_file(c, &d.file, &d.path, uid, gid),
         None => {}
     }
+    if generated(path) || path == b"/proc" {
+        let (uid, gid) = owner_ids(c, uid, gid)?;
+        return change_generated_file(c, path, follow, Change::Owner(uid, gid));
+    }
     let stat = c.files.fs().metadata(path, follow)?;
     crate::permissions::want_write(c.files, path, follow)?;
     let (uid, gid) = owner_ids(c, uid, gid)?;
@@ -2097,6 +2214,9 @@ fn fchmodat2(c: &Context<'_>, a: [u64; 6]) -> Result<u64, Errno> {
         let (p, _) = lookup_linked(c, a[0], raw, follow)?;
         if let Some(target) = reached(c, &p, follow)? {
             return chmod_followed(c, target, a[2] as u32);
+        }
+        if let Some(changed) = change_generated(c, &p, follow, Change::Mode(a[2] as u32)) {
+            return changed;
         }
         // A link in `/proc` or `/dev` not followed is a symbolic link too.
         let stat = match generated_stat(c, &p, follow)? {
@@ -4254,6 +4374,19 @@ fn path_statfs(c: &Context<'_>, p: &[u8]) -> Result<paludarium_host::FsStats, Er
             crate::mqueue::mounted_file(c, name)?;
         }
         pseudo_fs(MQUEUE_MAGIC)
+    } else if let Some(entry) = crate::devices::entry(p) {
+        let target = dev_followed(p, true);
+        if target != p {
+            return path_statfs(c, &target);
+        }
+        generated_stat(c, p, true)?.ok_or(Errno::ENOENT)?;
+        // `/dev` is a devtmpfs, which is a tmpfs, and `/dev/pts` devpts.
+        match entry {
+            crate::devices::Entry::Pts
+            | crate::devices::Entry::Slave(_)
+            | crate::devices::Entry::Ptmx { devpts: true } => pseudo_fs(DEVPTS_SUPER_MAGIC),
+            _ => pseudo_fs(paludarium_vfs::TMPFS_MAGIC),
+        }
     } else {
         c.files.fs().statfs(p)?
     })
@@ -5086,6 +5219,14 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                         crate::inotify::unnoticed(|| d.file.reopen(1))?
                     }
                     None => {
+                        if let Some(changed) = change_generated(c, &p, true, Change::Size) {
+                            // A negative length is `EINVAL` before all else.
+                            return if a[1] > i64::MAX as u64 {
+                                Err(Errno::EINVAL)
+                            } else {
+                                changed
+                            };
+                        }
                         let writable = || crate::permissions::want_write(c.files, &p, true);
                         match found.file {
                             Some(stat) => {
@@ -5184,7 +5325,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 let d = c.files.descriptor(a[0])?;
                 d.shown.unwrap_or(d.path)
             };
-            let stat = c.files.fs().metadata(&p, true)?;
+            let stat = directory_stat(c, &p)?;
             if stat.mode & 0o170000 != 0o040000 {
                 return Err(Errno::ENOTDIR);
             }
@@ -5218,7 +5359,7 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
                 Some(Followed::File(d)) => d.path,
                 None => p,
             };
-            let stat = c.files.fs().metadata(&p, true)?;
+            let stat = directory_stat(c, &p)?;
             if stat.mode & 0o170000 != 0o040000 {
                 return Err(Errno::ENOTDIR);
             }
@@ -5491,6 +5632,9 @@ pub(crate) fn run(c: &mut Context<'_>, n: u64, a: [u64; 6]) -> Result<u64, Errno
             let (p, found) = p;
             if let Some(target) = reached(c, &p, true)? {
                 return chmod_followed(c, target, mode as u32);
+            }
+            if let Some(changed) = change_generated(c, &p, true, Change::Mode(mode as u32)) {
+                return changed;
             }
             crate::permissions::want_write(c.files, &p, true)?;
             let mode = match found.file {

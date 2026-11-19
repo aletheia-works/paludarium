@@ -4055,6 +4055,26 @@ kernel.
   A conditional jump whose operands it knows goes one way; any other is
   walked both ways. It gives up as Linux does after 1,000,000 instructions
   or 8,192 jumps waiting to be walked (`E2BIG`).
+- Programs use maps as Linux's verifier lets them. A `BPF_LD_IMM64` of a
+  map's descriptor (`BPF_PSEUDO_MAP_FD`) gives the map, and one of its
+  value (`BPF_PSEUDO_MAP_VALUE`) a pointer into the value of an array of
+  one element: a descriptor of no map is `EBADF` or `EINVAL` ("fd %d is
+  not pointing to valid bpf_map"), a value of another type `EINVAL`, of an
+  array of more elements `ENOTSUPP`, and past the value `EINVAL`; a map
+  named twice is one, and a program uses 64 at most (`E2BIG`). It may call
+  `bpf_map_lookup_elem`, `bpf_map_update_elem` and `bpf_map_delete_elem`
+  with the map in R1 ("R1 type=%s expected=map_ptr", `EACCES`) and the key
+  and value on the stack or in a map's value, their sizes within it; R1 to
+  R5 are gone after a call, and R0 is its result. An update or delete of
+  a map made with `BPF_F_RDONLY_PROG` is "write into map forbidden"
+  (`EACCES`). A lookup's result may be null: nothing may be read or
+  written through it, nor added to it, until a 64-bit `BPF_JEQ` or `BPF_JNE` compares it with 0, which
+  makes it, and every copy of it in a register or on the stack, a pointer
+  to the value on one side and 0 on the other ("R%d invalid mem access
+  'map_value_or_null'", `EACCES`). A value is read and written within its
+  size ("invalid access to map value", `EACCES`), not written when the
+  map has `BPF_F_RDONLY_PROG` and not read when it has
+  `BPF_F_WRONLY_PROG` (`EACCES`). The program keeps the maps it uses.
 - The log (`log_level`, `log_buf`, `log_size`) gets the line that says
   why a program was refused, in 7.0's words where the two kernels word it
   differently, and the "processed %d insns" line, in a fixed

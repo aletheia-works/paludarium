@@ -326,20 +326,28 @@ verified.
   `EINVAL`, as on a kernel built without it. The verifier refuses, where
   Linux may take them, with a log line of its own ("paludarium: ... are
   not verified yet", `EINVAL`; a helper call's starts "unknown func #%d",
-  so that libbpf and bpftool take the helper as missing): helper calls, bpf-to-bpf calls and
-  kfuncs, the context's fields (`struct __sk_buff`), `BPF_LD_IMM64` of
-  maps, of BTF IDs and of functions, `BPF_LD_ABS` and `BPF_LD_IND`,
-  atomics, `may_goto`, indirect jumps, a pointer with a variable offset,
-  and `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
+  so that libbpf and bpftool take the helper as missing): helpers other
+  than `bpf_map_lookup_elem`, `bpf_map_update_elem` and
+  `bpf_map_delete_elem`, and those for maps of maps, queues, stacks and
+  bloom filters, a helper's argument that is neither on the stack nor in
+  a map's value, bpf-to-bpf calls and kfuncs, the context's fields
+  (`struct __sk_buff`) and a map's own (`struct bpf_map`), maps from
+  `fd_array` and maps made with `excl_prog_hash`, `BPF_LD_IMM64` of BTF IDs
+  and of functions, `BPF_LD_ABS` and `BPF_LD_IND`, atomics, `may_goto`,
+  indirect jumps, a pointer with a variable offset, and
+  `BPF_F_TEST_REG_INVARIANTS` with a conditional jump; and with
   Linux's line, a back-edge ("back-edge from insn %d to %d", where Linux
   takes a bounded loop from a privileged loader). A scalar is a value the
   verifier knows or nothing at all, where Linux keeps its bounds, so it
   walks both ways of a jump Linux knows goes one way, and it prunes no
-  states, so a program with many branches may reach the limits sooner.
+  states, so a program with many branches may reach the limits sooner. A
+  lookup's result may be null until a 64-bit `BPF_JEQ` or `BPF_JNE` with
+  the immediate 0 tells, where Linux also knows that an array's element
+  of a constant key is there and learns from comparing two pointers.
   Where master and the test machines' Linux 7.0 decide differently, it
   refuses: master takes a larger stack where its JIT can, makes a number
   of a pointer that any operator is applied to, and takes an exit for
-  unwinding, and 7.0 takes a `BPF_LD_IMM64` with a non-zero `off`. It has
+  unwinding. It has
   only a privileged loader's rules (pointers may leak, the stack may be
   read before it is written, no Spectre sanitizing), so a loader without
   `CAP_PERFMON` gets `EPERM` once the type is known. With no BTF objects

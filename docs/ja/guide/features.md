@@ -3504,6 +3504,22 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `EACCES`）、exit のときの R0（値は何でもかまいません）です。オペランドを知っている
   条件ジャンプは一方へだけ進み、ほかは両方をたどります。Linux と同じく、1,000,000 命令か、
   たどるのを待つジャンプが 8,192 個を超えるとあきらめます（`E2BIG`）。
+- プログラムは、Linux の検証器が許すとおりにマップを使えます。マップのディスクリプタの
+  `BPF_LD_IMM64`（`BPF_PSEUDO_MAP_FD`）はマップを、その値の `BPF_LD_IMM64`
+  （`BPF_PSEUDO_MAP_VALUE`）は要素が一つの配列の値へのポインタを与えます。マップでない
+  ディスクリプタは `EBADF` か `EINVAL`（"fd %d is not pointing to valid bpf_map"）、ほかの型の
+  値は `EINVAL`、要素が二つ以上の配列の値は `ENOTSUPP`、値の先は `EINVAL` です。同じマップを
+  二度名指しても一つで、一つのプログラムが使えるのは 64 個までです（`E2BIG`）。呼べるのは
+  `bpf_map_lookup_elem`、`bpf_map_update_elem`、`bpf_map_delete_elem` で、R1 にマップ
+  （"R1 type=%s expected=map_ptr"、`EACCES`）、キーと値はスタックかマップの値に、その大きさに
+  収まるように置きます。呼び出しのあと R1 から R5 はなくなり、R0 が結果です。
+  `BPF_F_RDONLY_PROG` を付けて作ったマップの更新と削除は "write into map forbidden"
+  （`EACCES`）です。検索の結果は null かもしれません。64 ビットの `BPF_JEQ` か `BPF_JNE` で
+  0 と比べるまで、それを通した読み書きもオフセットの足し算もできません。比べると、その結果と、レジスタや
+  スタックにあるそのすべての写しが、一方では値へのポインタ、もう一方では 0 になります
+  （"R%d invalid mem access 'map_value_or_null'"、`EACCES`）。値の読み書きはその大きさに
+  収まり（"invalid access to map value"、`EACCES`）、マップが `BPF_F_RDONLY_PROG` なら書けず、
+  `BPF_F_WRONLY_PROG` なら読めません（`EACCES`）。プログラムは使うマップを持ち続けます。
 - ログ（`log_level`、`log_buf`、`log_size`）には、プログラムを断った理由の行（二つの
   カーネルで言い方が違うときは 7.0 の言い方）と "processed %d insns" の行を、固定
   （`BPF_LOG_FIXED`）か回転するバッファに書きます。小さすぎるログは `ENOSPC`、書けないログは

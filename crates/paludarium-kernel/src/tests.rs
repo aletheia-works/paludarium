@@ -8566,8 +8566,8 @@ fn the_kernels_own_mounts_give_their_statfs_flags() {
     assert_eq!(flags(&mut f, b"/proc/self/status"), 0x102e);
     assert_eq!(flags(&mut f, b"/dev/pts"), 0x102a);
     assert_eq!(flags(&mut f, b"/dev/mqueue"), 0x102e);
-    assert_eq!(flags(&mut f, b"/dev/null"), 0x1022);
-    assert_eq!(flags(&mut f, b"/dev"), 0x1022);
+    assert_eq!(flags(&mut f, b"/dev/null"), 0x102a);
+    assert_eq!(flags(&mut f, b"/dev"), 0x102a);
     let tmp = flags(&mut f, b"/tmp");
     assert_eq!(f.ret(22, &[DATA + 0x300]), 0);
     let read = f.mem.read_u64(GuestAddr(DATA + 0x300)).unwrap() as u32;

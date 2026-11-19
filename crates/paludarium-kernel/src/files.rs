@@ -1504,7 +1504,8 @@ pub(crate) fn generated_source(
 /// Linux mounts each: its type, where it is, and its flags
 /// ([`paludarium_vfs::mount_flags`]), `/proc` and `/dev/mqueue` `nosuid`,
 /// `nodev`, `noexec` and `relatime`, `/dev/pts` `nosuid`, `noexec` and
-/// `relatime`, and `/dev` (a devtmpfs) `nosuid` and `relatime`.
+/// `relatime`, and `/dev` (a devtmpfs) `nosuid`, `noexec` and `relatime`,
+/// as systemd mounts it.
 fn generated_mount(p: &[u8]) -> Option<(&'static str, &'static [u8], u32)> {
     use paludarium_vfs::mount_flags as mnt;
     let quiet = mnt::NOSUID | mnt::NOEXEC | mnt::RELATIME;
@@ -1512,7 +1513,7 @@ fn generated_mount(p: &[u8]) -> Option<(&'static str, &'static [u8], u32)> {
         ("proc", &b"/proc"[..], quiet | mnt::NODEV),
         ("devpts", b"/dev/pts", quiet),
         ("mqueue", b"/dev/mqueue", quiet | mnt::NODEV),
-        ("devtmpfs", b"/dev", mnt::NOSUID | mnt::RELATIME),
+        ("devtmpfs", b"/dev", quiet),
     ]
     .into_iter()
     .find(|(_, base, _)| {

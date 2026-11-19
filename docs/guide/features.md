@@ -1723,7 +1723,7 @@ kernel.
   for `/proc` and `/dev` those Linux mounts them with: `/proc` and
   `/dev/mqueue` `nosuid`, `nodev`, `noexec` and `relatime`, `/dev/pts`
   `nosuid`, `noexec` and `relatime`, and the rest of `/dev` (a devtmpfs)
-  `nosuid` and `relatime`. A link in `/proc/self/fd` gives its file's, and
+  `nosuid`, `noexec` and `relatime`, as systemd mounts it. A link in `/proc/self/fd` gives its file's, and
   the kernel's internal mounts (pipes, sockets, anonymous inodes, pidfs,
   memfd, secretmem, a queue `mq_open` opened) `ST_VALID` alone.
 - `mount` with `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` or `MS_UNBINDABLE` (and

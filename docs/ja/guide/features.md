@@ -1518,7 +1518,7 @@ paludarium が目指すのは、実際のプログラムを本物の Linux と�
   `ST_NODIRATIME`、`ST_RELATIME`）を返します。`/proc` と `/dev` では Linux がそれを
   マウントするときのフラグです。`/proc` と `/dev/mqueue` は `nosuid`・`nodev`・
   `noexec`・`relatime`、`/dev/pts` は `nosuid`・`noexec`・`relatime`、ほかの `/dev`
-  （devtmpfs）は `nosuid`・`relatime` です。`/proc/self/fd` のリンクはそのファイルの
+  （devtmpfs）は systemd がマウントするのと同じく `nosuid`・`noexec`・`relatime` です。`/proc/self/fd` のリンクはそのファイルの
   ものを返し、カーネルの内部のマウント（パイプ、ソケット、匿名 inode、pidfs、memfd、
   secretmem、`mq_open` で開いたキュー）は `ST_VALID` だけです。
 - `MS_SHARED`、`MS_PRIVATE`、`MS_SLAVE`、`MS_UNBINDABLE` 付きの `mount`（`MS_REC` が

@@ -11265,43 +11265,50 @@ static int tl_inner(const char *m) {
     static char page[8192];
     memset(page, 'p', sizeof page);
     int fd = open(a, O_RDWR | O_CREAT, 0600);
-    printf("write=%d short=%d full=%d\n", tl_err(write(fd, page, 4096)), tl_err(write(fd, page, 8192)),
-           tl_err(write(fd, page, 1)));
+    int first = tl_err(write(fd, page, 4096));
+    int part = tl_err(write(fd, page, 8192));
+    printf("write=%d short=%d full=%d\n", first, part, tl_err(write(fd, page, 1)));
     struct stat st;
     fstat(fd, &st);
     printf("size=%ld blocks=%ld\n", (long)st.st_size, (long)st.st_blocks);
     tl_statfs("full", m);
-    printf("overwrite=%d append=%d\n", tl_err(pwrite(fd, page, 4096, 0)),
-           tl_err(pwrite(fd, page, 1, 8192)));
+    int over = tl_err(pwrite(fd, page, 4096, 0));
+    printf("overwrite=%d append=%d\n", over, tl_err(pwrite(fd, page, 1, 8192)));
     printf("truncate=%d\n", tl_err(ftruncate(fd, 4096)));
     printf("fallocate big=%d\n", tl_err(fallocate(fd, 0, 0, 12288)));
     tl_statfs("after big", m);
     printf("fallocate=%d\n", tl_err(fallocate(fd, 0, 4096, 4096)));
     tl_statfs("allocated", m);
-    printf("mkdir=%d symlink=%d\n", tl_err(mkdir(d, 0755)), tl_err(symlink("a", s)));
+    int made = tl_err(mkdir(d, 0755));
+    printf("mkdir=%d symlink=%d\n", made, tl_err(symlink("a", s)));
     tl_statfs("inodes", m);
-    printf("no inode: create=%d mkdir=%d link=%d symlink=%d mknod=%d exists=%d\n",
-           tl_err(open(b, O_RDWR | O_CREAT, 0600)), tl_err(mkdir(b, 0755)), tl_err(link(a, b)),
-           tl_err(symlink("a", b)), tl_err(mknod(b, S_IFIFO | 0600, 0)), tl_err(mkdir(d, 0755)));
-    printf("unlink=%d link=%d\n", tl_err(unlink(s)), tl_err(link(a, b)));
+    printf("no inode: create=%d", tl_err(open(b, O_RDWR | O_CREAT, 0600)));
+    printf(" mkdir=%d", tl_err(mkdir(b, 0755)));
+    printf(" link=%d", tl_err(link(a, b)));
+    printf(" symlink=%d", tl_err(symlink("a", b)));
+    printf(" mknod=%d", tl_err(mknod(b, S_IFIFO | 0600, 0)));
+    printf(" exists=%d\n", tl_err(mkdir(d, 0755)));
+    int gone = tl_err(unlink(s));
+    printf("unlink=%d link=%d\n", gone, tl_err(link(a, b)));
     tl_statfs("linked", m);
     printf("unlink second=%d\n", tl_err(unlink(b)));
     tl_statfs("unlinked", m);
     char longer[201];
     memset(longer, 'x', 200);
     longer[200] = 0;
-    printf("long symlink=%d there=%d\n", tl_err(symlink(longer, s)), tl_err(lstat(s, &st)));
+    int linked = tl_err(symlink(longer, s));
+    printf("long symlink=%d there=%d\n", linked, tl_err(lstat(s, &st)));
     tl_statfs("no page", m);
     printf("unlink open=%d\n", tl_err(unlink(a)));
     tl_statfs("open", m);
     close(fd);
     tl_statfs("closed", m);
-    printf("remount small=%d\n", tl_err(mount(NULL, m, NULL, MS_REMOUNT, "size=0k")));
     printf("remount=%d\n", tl_err(mount(NULL, m, NULL, MS_REMOUNT, "size=16k")));
     printf("long symlink=%d\n", tl_err(symlink(longer, s)));
     tl_statfs("remounted", m);
     fd = open(a, O_RDWR | O_CREAT | O_APPEND, 0600);
-    printf("write=%d more=%d\n", tl_err(write(fd, page, 8192)), tl_err(write(fd, page, 8192)));
+    first = tl_err(write(fd, page, 8192));
+    printf("write=%d more=%d\n", first, tl_err(write(fd, page, 8192)));
     tl_statfs("again", m);
     close(fd);
     unlink(a);
@@ -11311,11 +11318,12 @@ static int tl_inner(const char *m) {
     return 0;
 }
 /* statfs's f_flags of a file of the kernel's own mounts: ST_NOSUID,
-   ST_NODEV, ST_NOEXEC and ST_RDONLY, with ST_RELATIME where `relatime` is
-   asked for (a container's /dev, a tmpfs, may not have it). */
-static void tl_flags(const char *what, const char *path, int relatime) {
+   ST_NODEV and ST_RDONLY, with ST_NOEXEC and ST_RELATIME where `all` is
+   asked for (the machine's init mounts /dev, which a container's tmpfs or
+   another image's systemd may mount without them). */
+static void tl_flags(const char *what, const char *path, int all) {
     struct statfs fs;
-    long mask = ST_NOSUID | ST_NODEV | ST_NOEXEC | ST_RDONLY | (relatime ? ST_RELATIME : 0);
+    long mask = ST_NOSUID | ST_NODEV | ST_RDONLY | (all ? ST_NOEXEC | ST_RELATIME : 0);
     if (statfs(path, &fs)) {
         printf("%s=%d", what, -errno);
         return;

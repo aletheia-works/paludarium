@@ -123,6 +123,17 @@ static void sysctl_write(const char *path, const char *value) {
     if (fd >= 0) close(fd);
     printf("%s: write %s=%s: %ld\n", side, path, value, got < 0 ? got : 0);
 }
+/* A new namespace takes the first one's IPv4 all and default settings,
+   which the host may have changed (Docker turns forwarding on, Ubuntu
+   rp_filter to 2): sets them, and lo's, to 0 as Linux is built, before
+   anything hears of them. */
+static void settings_as_built(void) {
+    static const char *const paths[] = {
+        "ipv4/conf/all/forwarding", "ipv4/conf/default/forwarding", "ipv4/conf/lo/forwarding",
+        "ipv4/conf/all/rp_filter",  "ipv4/conf/default/rp_filter",  "ipv4/conf/lo/rp_filter",
+    };
+    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++) sysctl_write(paths[i], "0");
+}
 static int route_socket(unsigned groups) {
     int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE_);
     struct nl_address at = {.family = AF_NETLINK, .groups = groups};
@@ -330,6 +341,7 @@ static void veth(struct body *b, const char *name, int index, const char *peer_n
 static void child(int in, int out) {
     side = "B";
     if (unshare(CLONE_NEWNET) < 0) printf("B: unshare=%d\n", -errno);
+    settings_as_built();
     int ctl = route_socket(0), mon = route_socket(1);
     join_netconf(mon);
     fflush(stdout);
@@ -377,6 +389,7 @@ int main(int argc, char **argv) {
             printf("A: B gone\n");                                            \
     } while (0)
     printf("A: unshare=%ld\n", result(unshare(CLONE_NEWNET)));
+    settings_as_built();
     int ctl = route_socket(0), mon = route_socket(1);
     /* RTNLGRP_NSID too, to hear B's ID go before its end of the pair. */
     int nsid_group = RTNLGRP_NSID_;
